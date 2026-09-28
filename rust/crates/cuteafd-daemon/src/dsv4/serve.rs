@@ -233,11 +233,15 @@ fn schedule(
                 }));
                 let embed = embed_rows(&loaded.catalog, &tokens, hidden)?;
                 let mut logits = Vec::new();
+                let started = Instant::now();
+                *engine.profile.borrow_mut() = super::engine::Profile::default();
                 let chunks = tokens.len().div_ceil(limit);
                 for (index, (chunk, rows)) in tokens.chunks(limit).zip(embed.chunks(limit * hidden * 2)).enumerate() {
                     let logit_rows = usize::from(index + 1 == chunks);
                     logits = engine.prefill(&mut placement, chunk, rows, transport, runtime, logit_rows, None)?;
                 }
+                tracing::debug!(tokens = tokens.len(), elapsed_ms = started.elapsed().as_millis() as u64,
+                    phases = %engine.profile.borrow().report(), "prefill");
                 let last = logits.len() / vocab - 1;
                 let mut request = Active {
                     decoder: cuteafd_loader::streaming_token_decoder(&loaded.snapshot, false)?,
