@@ -142,7 +142,7 @@ pub(super) fn load_exl3<'a>(
         "an implicit Spark TP2/TP3 group cannot use paired TP4 artifacts");
     let workspace = Exl3Worker::plan(&exl3_directory, config.capacity)
         .context("EXL3 checkpoint requires matching native AOT artifacts; set --exl3-aot-dir for a custom export")?;
-    let plans = (config.first_layer..40)
+    let plans = (config.first_layer..catalog.routed_experts().layers)
         .map(|layer| {
             Exl3Weights::plan_with_layout(
                 catalog,

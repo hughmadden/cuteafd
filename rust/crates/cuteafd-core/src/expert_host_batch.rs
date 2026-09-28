@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use crate::{
     owner_for_expert, DType, CuteafdError, ExpertBatch, ExpertOwnerLookup, GraphBucket, LayerId,
     PlacementPolicy, PlacementVersion, PositionId, RequestId, RowSourceKind,
-    DS4_EXPERT_TP_WORLD_SIZE,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

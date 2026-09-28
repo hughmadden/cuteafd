@@ -1,7 +1,7 @@
 //! Bounded chunks carry compact BF16 rank partials in token order.
 use super::{
     V41BackboneRequest, V41SparkTopology, V41Tp4Planes, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
-    V41_HIDDEN, V41_NATIVE_GROUP_REQUEST_FLAG, V41_PARTIAL_ROW_BYTES,
+    V41_NATIVE_GROUP_REQUEST_FLAG,
 };
 use crate::{
     ExpertProtocolV2ResponseHeader, ExpertProtocolV2ResponseRef, ExpertProtocolV2ResponseView,
@@ -24,7 +24,7 @@ impl V41BackboneRequest<'_> {
         let payload = max_frame_bytes
             .checked_sub(self.response_header_bytes())
             .context("response frame cannot fit header")?;
-        let rows = payload / (V41_PARTIAL_ROW_BYTES as usize + 4);
+        let rows = payload / (cuteafd_core::expert_geometry().row_bytes() as usize + 4);
         ensure!(rows > 0, "response frame cannot fit one native token row");
         Ok(rows.min(self.rows() as usize) as u32)
     }
@@ -43,10 +43,10 @@ impl V41BackboneRequest<'_> {
             "native response needs an executor identity"
         );
         ensure!(
-            partials.len() % V41_PARTIAL_ROW_BYTES as usize == 0,
+            partials.len() % cuteafd_core::expert_geometry().row_bytes() as usize == 0,
             "native response chunk has a partial token row"
         );
-        let rows = u32::try_from(partials.len() / V41_PARTIAL_ROW_BYTES as usize)?;
+        let rows = u32::try_from(partials.len() / cuteafd_core::expert_geometry().row_bytes() as usize)?;
         ensure!(
             rows > 0 && rows <= self.response_chunk_rows(max_frame_bytes)?,
             "native response chunk exceeds frame budget"
@@ -72,9 +72,9 @@ impl V41BackboneRequest<'_> {
                 placement_version: request.placement_version,
                 layer_id: request.layer_id,
                 row_count: rows,
-                output_dim: V41_HIDDEN,
+                output_dim: cuteafd_core::expert_geometry().hidden,
                 output_dtype: ExpertV2Dtype::Bf16,
-                output_row_stride_bytes: V41_PARTIAL_ROW_BYTES,
+                output_row_stride_bytes: cuteafd_core::expert_geometry().row_bytes(),
                 output_payload_bytes: partials.len() as u64,
                 status: ExpertProtocolV2Status::Ok,
                 flags: (request.flags
@@ -189,7 +189,7 @@ impl V41Tp4ChunkReceiver {
         } else {
             EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN
         };
-        ensure!(max_frame_bytes >= header_bytes + V41_PARTIAL_ROW_BYTES as usize + 4,
+        ensure!(max_frame_bytes >= header_bytes + cuteafd_core::expert_geometry().row_bytes() as usize + 4,
             "response frame cannot fit one native token row");
         Ok(Self {
             identity: V41Tp4Planes::from_header_ranks(&request.header, executors)?,
@@ -225,7 +225,7 @@ impl V41Tp4ChunkReceiver {
             EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN
         };
         ensure!(
-            max_frame_bytes >= header_bytes + V41_PARTIAL_ROW_BYTES as usize + 4,
+            max_frame_bytes >= header_bytes + cuteafd_core::expert_geometry().row_bytes() as usize + 4,
             "response frame cannot fit one native token row"
         );
         Ok(Self {

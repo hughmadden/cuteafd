@@ -1,0 +1,82 @@
+# Routed-expert kernel families beyond DeepSeek V4.1 (SM121 Spark shards).
+#
+# Each CUTEAFD_EXPERT_FAMILIES entry is FAMILY:ROLE, for example `dsv4f:spark`
+# (DeepSeek V4 Flash TP4 shard) or `dsv4f:spark_tp2`. The exporter derives the
+# role's slice from the family geometry and names every symbol
+# `cuteafd_{family}[_{role}]_expert_*`; the runtime selects the family from the
+# checkpoint's routed-expert geometry (`ExpertGeometry::family`).
+if(NOT CUTEAFD_ENABLE_V41_EXPERT_AOT OR NOT CUTEAFD_V41_EXPERT_ROLE STREQUAL "spark")
+  message(FATAL_ERROR "Expert families require the native SM121 Spark expert build")
+endif()
+
+set(CUTEAFD_EXPERT_FAMILY_TARGETS)
+set(CUTEAFD_EXPERT_FAMILY_INCLUDE_DIRS)
+set(CUTEAFD_EXPERT_FAMILY_ROWS 1 16 80 256 1024 4096)
+# 192-wide slices do not tile these 128-aligned extents (512, 1024); capacity 1
+# keeps the narrow decode tile.
+set(CUTEAFD_EXPERT_FAMILY_WIDTH "1:64,16:128,80:128,256:128,1024:128,4096:128" CACHE STRING
+  "Slice width map for non-V4.1 expert families")
+set(expert_ops info initialize output_kind bind_scratch initialize_scratch_async launch)
+
+foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
+  if(NOT entry MATCHES "^(dsv4f|dsv4p):(spark|spark_tp2)$")
+    message(FATAL_ERROR "CUTEAFD_EXPERT_FAMILIES entry ${entry} must be (dsv4f|dsv4p):(spark|spark_tp2)")
+  endif()
+  set(family "${CMAKE_MATCH_1}")
+  set(role "${CMAKE_MATCH_2}")
+  # The TP4 shard keeps the historical unsuffixed name, as for V4.1.
+  if(role STREQUAL "spark")
+    set(symbol "cuteafd_${family}")
+  else()
+    set(symbol "cuteafd_${family}_${role}")
+  endif()
+  set(dir "${CMAKE_CURRENT_BINARY_DIR}/${family}_${role}_experts")
+  set(variant_header "${family}_${role}_expert_variants.h")
+  set(stamp "${CMAKE_CURRENT_BINARY_DIR}/${family}_${role}_width.stamp")
+  file(GENERATE OUTPUT "${stamp}"
+    CONTENT "family=${family}\nrole=${role}\nwidth=${CUTEAFD_EXPERT_FAMILY_WIDTH}\natomic_min_capacity=256\n")
+  set(renames "")
+  foreach(op IN LISTS expert_ops)
+    string(APPEND renames "#define cuteafd_v41_expert_${op} ${symbol}_expert_${op}\n")
+  endforeach()
+  set(wrapper "${dir}/${family}_${role}_experts.cc")
+  file(GENERATE OUTPUT "${wrapper}" CONTENT
+"// Generated: ${family} ${role} routed-expert family (native FP8 K32, SM121).
+#define CUTEAFD_EXPERT_VARIANTS_HEADER \"${variant_header}\"
+${renames}#include \"${CMAKE_CURRENT_SOURCE_DIR}/src/v41_experts.cc\"
+")
+  set(objects)
+  set(headers)
+  foreach(rows IN LISTS CUTEAFD_EXPERT_FAMILY_ROWS)
+    list(APPEND objects "${dir}/${family}_${role}_m${rows}.o")
+    list(APPEND headers "${dir}/${family}_${role}_m${rows}.h")
+  endforeach()
+  list(JOIN CUTEAFD_EXPERT_FAMILY_ROWS "," rows_arg)
+  add_custom_command(
+    OUTPUT "${dir}/v41_experts.json" "${dir}/${variant_header}" ${objects} ${headers}
+    COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
+    COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
+      "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/export_b12x_v41_slices_aot.py"
+      --output-dir "${dir}" --geometry "${family}" --role "${role}"
+      --rows "${rows_arg}" --width "${CUTEAFD_EXPERT_FAMILY_WIDTH}"
+      --atomic-min-capacity 256 --standard-names
+    COMMAND "${CMAKE_COMMAND}" -E copy
+      "${dir}/v41_expert_variants.h" "${dir}/${variant_header}"
+    DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/export_b12x_v41_slices_aot.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/v41_experts.cc"
+      "${stamp}"
+      ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
+    COMMENT "Exporting ${family} ${role} routed-expert kernels"
+    VERBATIM
+  )
+  add_custom_target(cuteafd_${family}_${role}_experts_export DEPENDS
+    "${dir}/${variant_header}" "${dir}/v41_experts.json" ${objects} ${headers})
+  add_dependencies(cuteafd_${family}_${role}_experts_export cuteafd_verify_sparkinfer_source)
+  set_source_files_properties(${objects} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+  set_source_files_properties("${wrapper}" PROPERTIES GENERATED TRUE)
+  list(APPEND CUTEAFD_EXPERT_FAMILY_INCLUDE_DIRS "${dir}")
+  list(APPEND CUTEAFD_EXPERT_FAMILY_TARGETS "cuteafd_${family}_${role}_experts_export")
+  list(APPEND CUTEAFD_NATIVE_SOURCES ${objects} "${wrapper}")
+endforeach()

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 use crate::{
-    DType, CuteafdError, ExpertHostBatch, ExpertHostBatchSet, GraphBucket, LayerId, LayerWaveMode,
+    DType, CuteafdError, ExpertHostBatch, GraphBucket, LayerId, LayerWaveMode,
     ModelFacts,
 };
 

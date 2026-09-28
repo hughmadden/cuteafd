@@ -28,12 +28,20 @@ pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()>
         matches!(config.capacity, 1 | 16 | 80 | 256 | 1024 | 4096),
         "unsupported native capacity"
     );
+    // The checkpoint fixes the process expert geometry before the native
+    // library loads, so its helpers and every wire size agree with it.
+    let catalog = cuteafd_loader::read_expert_catalog(&config.snapshot)?;
+    let geometry = catalog.routed_experts().geometry()?;
+    cuteafd_core::set_expert_geometry(geometry).map_err(|fixed| {
+        anyhow::anyhow!("expert geometry is already {fixed:?}; the checkpoint needs {geometry:?}")
+    })?;
+    let minimum_frame = 128 + geometry.row_bytes() as usize + 40 + geometry.topk as usize * 12;
     ensure!(
-        (128 + 10240 + 40 + 6 * 12..=64 * 1024 * 1024).contains(&config.max_frame_bytes),
+        (minimum_frame..=64 * 1024 * 1024).contains(&config.max_frame_bytes),
         "invalid native frame budget"
     );
     let library = unsafe { NativeLibrary::load(&config.library) }?;
-    let (weights, remaining) = load_weights(&library, &config)?;
+    let (weights, remaining) = load_weights(&library, &catalog, &config)?;
     let mut execution = weights.execution(&library, &config, remaining)?;
     let mut exchange = HostExpertExchange::new(config.capacity)?;
     let mut row_indices = vec![0; config.capacity as usize];

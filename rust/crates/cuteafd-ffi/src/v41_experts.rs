@@ -23,7 +23,7 @@ impl V41ExpertOutputKind {
         }
     }
     pub fn row_bytes(self, topk: u32) -> usize {
-        5120 * match self {
+        cuteafd_core::expert_geometry().hidden as usize * match self {
             Self::Fp32Routes => topk as usize * 4,
             Self::Fp32Tokens => 4,
             Self::Bf16Routes => topk as usize * 2,
@@ -167,11 +167,27 @@ type LaunchFn = unsafe extern "C" fn(*mut c_void, *const V41ExpertLaunchArgs) ->
 type PackedSizesFn = unsafe extern "C" fn(u32, *mut u64) -> i32;
 type PackFn = unsafe extern "C" fn(*const *const u8, *const *mut u8, u32, *mut c_void) -> i32;
 
-/// Native packer accept-list. Every accepted extent is a multiple of 32 so the
-/// K/32 UE8M0 scale axis is exact; 576 (Spark TP4) is storage-padded to 640.
-/// 384 (pure `TP6EP1`) needs no padding: it is already 128-aligned.
+/// Rewrites a `cuteafd_v41_*` expert-family symbol for the process geometry:
+/// each model shape ships its AOT expert kernels as `cuteafd_{family}_*`.
+fn family_symbol(name: &[u8]) -> Result<Vec<u8>> {
+    let geometry = cuteafd_core::expert_geometry();
+    let family = geometry.family().with_context(|| {
+        format!(
+            "no native expert kernel family for geometry {}; name one in ExpertGeometry::family \
+             and export it through CUTEAFD_EXPERT_FAMILIES",
+            geometry.key()
+        )
+    })?;
+    let rest = name
+        .strip_prefix(b"cuteafd_v41")
+        .context("expert family symbols start with cuteafd_v41")?;
+    Ok([b"cuteafd_", family.as_bytes(), rest].concat())
+}
+
+/// Per-rank intermediate extents the native packer accepts: a multiple of 32
+/// so the K/32 UE8M0 scale axis is exact (V4.1 TP4 576 is storage-padded to 640).
 pub fn v41_pack_intermediate_supported(intermediate: u32) -> bool {
-    matches!(intermediate, 384 | 576 | 768 | 1152 | 2304)
+    intermediate > 0 && intermediate % 32 == 0 && intermediate <= 8192
 }
 
 /// Physical-rank counts the compact reduction contract defines: legacy 2 and 4
@@ -182,33 +198,32 @@ pub fn v41_rank_count_supported(ranks: u32) -> bool {
     matches!(ranks, 2 | 3 | 4 | 6)
 }
 
-/// Official geometry for one `(family, role)` pair. `kernel_intermediate`
-/// distinguishes the padded and exact Spark TP4 AOT exports.
+/// Expected `(experts, logical, kernel, topk)` for one `(family, role)` pair
+/// under the process geometry. Each role is one tensor-parallel slice of the
+/// routed experts; kernels store it padded to 128, and the NVFP4 Spark TP4
+/// family also accepts the exact extent. Roles 0 and 4 are the dSpark draft
+/// experts (128 experts, top-3), whose shape does not follow the target model.
 fn expected_expert_geometry(
+    geometry: cuteafd_core::ExpertGeometry,
     nvfp4: bool,
     role: u32,
     kernel_intermediate: u32,
 ) -> Option<(u32, u32, u32, u32)> {
-    match (nvfp4, role) {
-        // Both exact source layout and zero-padded Spark AOTs are valid.
-        (true, 1) if kernel_intermediate == 640 => Some((384, 576, 640, 6)),
-        (true, 1) => Some((384, 576, 576, 6)),
-        (true, 2) => Some((384, 2304, 2304, 6)),
-        (true, 3) => Some((384, 1152, 1152, 6)),
-        (false, 0) => Some((128, 2304, 2304, 3)),
-        (false, 1) => Some((384, 576, 640, 6)),
-        (false, 2) => Some((384, 2304, 2304, 6)),
-        (false, 3) => Some((384, 1152, 1152, 6)),
-        (false, 4) => Some((128, 1152, 1152, 3)),
-        // Replicated-group Spark shards: TP2 has no storage padding, TP3's 768
-        // is already 128-aligned.
-        (false, 5) => Some((384, 1152, 1152, 6)),
-        (false, 6) => Some((384, 768, 768, 6)),
-        // Pure TP6EP1: one disjoint 384-column intermediate slice per rank with
-        // no storage padding (384 is already 128-aligned).
-        (false, 7) if kernel_intermediate == 384 => Some((384, 384, 384, 6)),
-        _ => None,
-    }
+    let draft = |intermediate: u32| Some((128, intermediate, intermediate, 3));
+    let tp = match (nvfp4, role) {
+        (false, 0) => return draft(2304),
+        (false, 4) => return draft(1152),
+        (_, 1) => 4,
+        (_, 2) => 1,
+        (_, 3) | (false, 5) => 2,
+        (false, 6) => 3,
+        (false, 7) => 6,
+        _ => return None,
+    };
+    let logical = geometry.slice(tp).filter(|value| value % 32 == 0)?;
+    let padded = logical.div_ceil(128) * 128;
+    let kernel = if nvfp4 && kernel_intermediate == logical { logical } else { padded };
+    Some((geometry.experts, logical, kernel, geometry.topk))
 }
 
 /// Per-expert checkpoint staging avoids a second full layer of logical weights.
@@ -523,7 +538,7 @@ impl NativeLibrary {
     pub fn v41_expert_packer(&self, intermediate: u32) -> Result<V41ExpertPacker<'_>> {
         ensure!(
             v41_pack_intermediate_supported(intermediate),
-            "unsupported V4.1 pack intermediate {intermediate}; expected 384 (Spark TP6), 576 (Spark TP4), 768 (Spark TP3), 1152 (TP2) or 2304 (full)"
+            "unsupported pack intermediate {intermediate}; per-rank slices must be a nonzero multiple of 32"
         );
         let sizes = unsafe {
             self.lib
@@ -605,8 +620,13 @@ impl NativeLibrary {
             11 => b"cuteafd_v41_spark_tp6_expert_info",
             _ => b"cuteafd_v41_expert_info",
         };
-        let function = unsafe { self.lib.get::<InfoFn>(name) }
-            .with_context(|| format!("native library lacks expert interface {interface}; enable its AOT build"))?;
+        let name = family_symbol(name)?;
+        let function = unsafe { self.lib.get::<InfoFn>(&name) }.with_context(|| {
+            format!(
+                "native library lacks {} (expert interface {interface}); enable its AOT build",
+                String::from_utf8_lossy(&name)
+            )
+        })?;
         let mut info = V41ExpertInfo::default();
         let status = unsafe { function(i32::try_from(capacity)?, &mut info) };
         ensure!(
@@ -614,8 +634,15 @@ impl NativeLibrary {
             "V4.1 expert metadata failed with CUDA status {status}"
         );
         ensure!(
-            matches!(info.abi_version, 2 | 3) && info.hidden_size == 5120,
-            "unsupported V4.1 native expert ABI"
+            matches!(info.abi_version, 2 | 3),
+            "unsupported native expert ABI {}", info.abi_version
+        );
+        let geometry = cuteafd_core::expert_geometry();
+        ensure!(
+            info.hidden_size == geometry.hidden,
+            "native expert library is built for hidden size {}, the model has {}",
+            info.hidden_size,
+            geometry.hidden
         );
         let nvfp4 = matches!(interface, 5 | 6 | 7);
         ensure!(
@@ -637,7 +664,7 @@ impl NativeLibrary {
                 "Spark TP2/TP3/TP6 require the native FP8 K32 input representation"
             );
         }
-        let expected = expected_expert_geometry(nvfp4, info.role, info.kernel_intermediate)
+        let expected = expected_expert_geometry(geometry, nvfp4, info.role, info.kernel_intermediate)
             .ok_or_else(|| anyhow::anyhow!("unknown V4.1 expert role {} for interface {interface}", info.role))?;
         ensure!(
             (
@@ -646,7 +673,8 @@ impl NativeLibrary {
                 info.kernel_intermediate,
                 info.topk
             ) == expected,
-            "native V4.1 expert geometry does not match the official checkpoint"
+            "native expert geometry {:?} does not match the model's {expected:?}",
+            (info.experts, info.logical_intermediate, info.kernel_intermediate, info.topk)
         );
         ensure!(
             info.capacity_rows == capacity && info.scratch_bytes > 0,
@@ -747,6 +775,7 @@ impl NativeLibrary {
             11 => "cuteafd_v41_spark_tp6",
             _ => "cuteafd_v41",
         };
+        let prefix = String::from_utf8(family_symbol(prefix.as_bytes())?)?;
         let symbol = |operation: &str| format!("{prefix}_expert_{operation}").into_bytes();
         let initialize = unsafe {
             self.lib
@@ -865,6 +894,7 @@ impl V41ExpertKernel<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const V41: cuteafd_core::ExpertGeometry = cuteafd_core::ExpertGeometry::DEEPSEEK_V41;
 
     #[test]
     fn output_kind_preserves_route_axis_and_dtype() {
@@ -884,7 +914,7 @@ mod tests {
         for intermediate in [384u32, 576, 768, 1152, 2304] {
             assert!(v41_pack_intermediate_supported(intermediate));
         }
-        for intermediate in [0u32, 1, 128, 385, 577, 640, 2303, 4096] {
+        for intermediate in [0u32, 1, 385, 577, 2303, 8224] {
             assert!(!v41_pack_intermediate_supported(intermediate));
         }
     }
@@ -893,19 +923,33 @@ mod tests {
     fn expected_geometry_covers_spark_tp2_tp3_tp6_without_touching_rtx_tp2() {
         // Replicated-group Spark shards: TP2 1152 and TP3 768 are unpadded, and
         // pure TP6 384 stores exactly its 2304/6 slice with no padding.
-        assert_eq!(expected_expert_geometry(false, 5, 1152), Some((384, 1152, 1152, 6)));
-        assert_eq!(expected_expert_geometry(false, 6, 768), Some((384, 768, 768, 6)));
-        assert_eq!(expected_expert_geometry(false, 7, 384), Some((384, 384, 384, 6)));
+        assert_eq!(expected_expert_geometry(V41, false, 5, 1152), Some((384, 1152, 1152, 6)));
+        assert_eq!(expected_expert_geometry(V41, false, 6, 768), Some((384, 768, 768, 6)));
+        assert_eq!(expected_expert_geometry(V41, false, 7, 384), Some((384, 384, 384, 6)));
         // Role 7 exists only in the native FP8 family: the W4A4 table and an
         // unknown role id both fail closed instead of matching by accident.
-        assert_eq!(expected_expert_geometry(true, 7, 384), None);
-        assert_eq!(expected_expert_geometry(false, 9, 384), None);
+        assert_eq!(expected_expert_geometry(V41, true, 7, 384), None);
+        assert_eq!(expected_expert_geometry(V41, false, 9, 384), None);
         // Historical Spark TP4 padding and RTX TP2 role semantics are unchanged.
-        assert_eq!(expected_expert_geometry(false, 1, 640), Some((384, 576, 640, 6)));
-        assert_eq!(expected_expert_geometry(false, 3, 1152), Some((384, 1152, 1152, 6)));
+        assert_eq!(expected_expert_geometry(V41, false, 1, 640), Some((384, 576, 640, 6)));
+        assert_eq!(expected_expert_geometry(V41, false, 3, 1152), Some((384, 1152, 1152, 6)));
         // Unknown or cross-family pairs still fail closed.
-        assert_eq!(expected_expert_geometry(false, 7, 768), None);
-        assert_eq!(expected_expert_geometry(true, 5, 1152), None);
+        // A role-7 artifact with a 768 kernel cannot match the 384 expectation.
+        assert_eq!(expected_expert_geometry(V41, false, 7, 768), Some((384, 384, 384, 6)));
+        assert_eq!(expected_expert_geometry(V41, true, 5, 1152), None);
+    }
+
+    #[test]
+    fn expected_geometry_follows_deepseek_v4_flash() {
+        let flash = cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH;
+        assert_eq!(expected_expert_geometry(flash, false, 1, 512), Some((256, 512, 512, 6)));
+        assert_eq!(expected_expert_geometry(flash, false, 5, 1024), Some((256, 1024, 1024, 6)));
+        assert_eq!(expected_expert_geometry(flash, false, 2, 2048), Some((256, 2048, 2048, 6)));
+        // 2048 does not split into three or six K/32-exact slices.
+        assert_eq!(expected_expert_geometry(flash, false, 6, 0), None);
+        assert_eq!(expected_expert_geometry(flash, false, 7, 0), None);
+        // The dSpark draft shape does not follow the target geometry.
+        assert_eq!(expected_expert_geometry(flash, false, 0, 2304), Some((128, 2304, 2304, 3)));
     }
 
     #[test]

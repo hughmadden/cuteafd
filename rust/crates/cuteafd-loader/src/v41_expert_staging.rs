@@ -209,7 +209,7 @@ impl OfficialV41Catalog {
                 "source-precision drafts are the only native experts in an EXL3 checkpoint"
             );
         }
-        let config = self.config().text();
+        let config = self.routed_experts();
         let (prefix, rank, intermediate, geometry) = match selection {
             V41ExpertSelection::BackboneTp {
                 layer,
@@ -217,15 +217,15 @@ impl OfficialV41Catalog {
                 rank,
                 world,
             } => {
-                ensure!(layer < config.num_hidden_layers, "backbone layer out of range");
-                ensure!(expert < config.n_routed_experts, "backbone expert out of range");
+                ensure!(layer < config.layers, "backbone layer out of range");
+                ensure!(expert < config.experts, "backbone expert out of range");
                 ensure!(
                     self.exl3().is_none() && self.nvfp4().is_none(),
                     "generic backbone TP staging covers only the native FP4/E8M0 official checkpoint"
                 );
                 let geometry = V41BackboneTpGeometry::new(
-                    config.moe_intermediate_size,
-                    config.hidden_size,
+                    config.intermediate,
+                    config.hidden,
                     world,
                     rank,
                 )?;
@@ -237,13 +237,13 @@ impl OfficialV41Catalog {
                 )
             }
             V41ExpertSelection::BackboneTp2 { layer, expert, rank } => {
-                ensure!(layer < config.num_hidden_layers, "backbone layer out of range");
-                ensure!(expert < config.n_routed_experts, "backbone expert out of range");
+                ensure!(layer < config.layers, "backbone layer out of range");
+                ensure!(expert < config.experts, "backbone expert out of range");
                 ensure!(rank < 2, "backbone TP2 rank must be in 0..2");
                 (
                     format!("layers.{layer}.ffn.experts.{expert}"),
                     Some(rank),
-                    config.moe_intermediate_size / 2,
+                    config.intermediate / 2,
                     None,
                 )
             }
@@ -253,50 +253,50 @@ impl OfficialV41Catalog {
                 rank,
             } => {
                 ensure!(
-                    layer < config.num_hidden_layers,
+                    layer < config.layers,
                     "backbone layer out of range"
                 );
                 ensure!(
-                    expert < config.n_routed_experts,
+                    expert < config.experts,
                     "backbone expert out of range"
                 );
                 ensure!(rank < 4, "backbone TP rank must be in 0..4");
                 (
                     format!("layers.{layer}.ffn.experts.{expert}"),
                     Some(rank),
-                    config.moe_intermediate_size / 4,
+                    config.intermediate / 4,
                     None,
                 )
             }
             V41ExpertSelection::BackboneFull { layer, expert } => {
-                ensure!(layer < config.num_hidden_layers, "backbone layer out of range");
-                ensure!(expert < config.n_routed_experts, "backbone expert out of range");
+                ensure!(layer < config.layers, "backbone layer out of range");
+                ensure!(expert < config.experts, "backbone expert out of range");
                 (
                     format!("layers.{layer}.ffn.experts.{expert}"),
                     None,
-                    config.moe_intermediate_size,
+                    config.intermediate,
                     None,
                 )
             }
             V41ExpertSelection::DsparkTp2 { stage, expert, rank } => {
-                ensure!(stage < config.num_nextn_predict_layers,"dSpark stage out of range");
-                ensure!(expert < config.dspark_n_routed_experts,"dSpark expert out of range");
+                ensure!(stage < config.draft_stages,"dSpark stage out of range");
+                ensure!(expert < config.draft_experts,"dSpark expert out of range");
                 ensure!(rank < 2,"dSpark TP2 rank must be in 0..2");
-                (format!("mtp.{stage}.ffn.experts.{expert}"),Some(rank),config.moe_intermediate_size/2,None)
+                (format!("mtp.{stage}.ffn.experts.{expert}"),Some(rank),config.intermediate/2,None)
             }
             V41ExpertSelection::Dspark { stage, expert } => {
                 ensure!(
-                    stage < config.num_nextn_predict_layers,
+                    stage < config.draft_stages,
                     "dSpark stage out of range"
                 );
                 ensure!(
-                    expert < config.dspark_n_routed_experts,
+                    expert < config.draft_experts,
                     "dSpark expert out of range"
                 );
                 (
                     format!("mtp.{stage}.ffn.experts.{expert}"),
                     None,
-                    config.moe_intermediate_size,
+                    config.intermediate,
                     None,
                 )
             }
@@ -354,7 +354,7 @@ impl OfficialV41Catalog {
             };
             if geometry.is_none() {
                 let expected = intermediate
-                    .checked_mul(config.hidden_size)
+                    .checked_mul(config.hidden)
                     .context("expert staging size overflow")?
                     / if slot < 3 { 2 } else { 32 };
                 ensure!(
@@ -372,7 +372,7 @@ impl OfficialV41Catalog {
             ranges[slot] = start..bytes;
             if rank.is_some() && (slot == 2 || slot == 5) {
                 let tensor = self.tensor(name)?;
-                let row_bytes = tensor.metadata.byte_length / config.hidden_size as u64;
+                let row_bytes = tensor.metadata.byte_length / config.hidden as u64;
                 scratch_bytes = scratch_bytes.max(usize::try_from(row_bytes)?);
             }
         }

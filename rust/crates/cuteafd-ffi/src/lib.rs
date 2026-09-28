@@ -1497,12 +1497,34 @@ impl Drop for NativeLibrary {
     }
 }
 
+/// Hands the process expert hidden size to the native pack and route-reduce
+/// helpers, which instantiate their indexing per supported size.
+fn sync_expert_hidden(lib: &Library) -> Result<()> {
+    type SetExpertHiddenFn = unsafe extern "C" fn(u32) -> i32;
+    let hidden = cuteafd_core::expert_geometry().hidden;
+    match unsafe { lib.get::<SetExpertHiddenFn>(b"cuteafd_set_expert_hidden") } {
+        Ok(set) => {
+            let status = unsafe { set(hidden) };
+            anyhow::ensure!(
+                status == 0,
+                "native expert helpers have no instantiation for hidden size {hidden}; add it to native/cuda/kernels/expert_hidden.cuh"
+            );
+        }
+        Err(_) => anyhow::ensure!(
+            hidden == 5120,
+            "native library predates geometry-aware expert helpers; rebuild it to serve hidden size {hidden}"
+        ),
+    }
+    Ok(())
+}
+
 impl NativeLibrary {
     pub unsafe fn load(path: impl AsRef<Path>) -> Result<Self> {
         let lib = unsafe { Library::new(path.as_ref()) }
             .with_context(|| format!("loading native library {}", path.as_ref().display()))?;
         let rdma_rc_endpoint_try_poll_fn =
             unsafe { *lib.get::<RdmaRcEndpointTryPollFn>(b"cuteafd_rdma_rc_endpoint_try_poll")? };
+        sync_expert_hidden(&lib)?;
         Ok(Self {
             lib,
             sync_h2d_staging: Mutex::new(SyncH2DStagingBuffer::default()),

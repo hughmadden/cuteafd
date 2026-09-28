@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DType, CuteafdError, GraphBucket, LayerId, LayerWaveMode, GLM52_FIRST_K_DENSE_REPLACE,
-    GLM52_TOTAL_LAYERS_WITH_MTP,
+    DType, CuteafdError, GraphBucket, LayerWaveMode,
 };
 
 pub const COORDINATOR_GRAPH_DECODE_BUCKET_ROWS: usize = 1;

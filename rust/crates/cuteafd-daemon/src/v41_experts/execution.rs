@@ -119,7 +119,7 @@ impl<'library> ExpertWeights<'library> {
             hidden_bytes: hidden,
             routing_bytes: routing,
             output_and_shared_bytes: (capacity as usize)
-                .checked_mul(5120 * 2 * if info.role == 0 { 2 } else { 1 })
+                .checked_mul(cuteafd_core::expert_geometry().row_bytes() as usize * if info.role == 0 { 2 } else { 1 })
                 .context("output buffer overflow")?,
         })
     }
@@ -331,7 +331,7 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
             "expert output is not FP32 route planes");
         Ok(CuteafdDeviceBuffer {
             ptr: slots[41],
-            bytes: rows as usize * kernel.info().topk as usize * 5120 * 4,
+            bytes: rows as usize * kernel.info().topk as usize * cuteafd_core::expert_geometry().hidden as usize * 4,
             device_id: scratch.buffer.device_id,
             flags: 0,
         })
@@ -580,10 +580,11 @@ impl HostExpertExchange {
             capacity > 0 && capacity <= 4096,
             "unsupported native host exchange capacity"
         );
-        let routes = capacity as usize * 6;
+        let geometry = cuteafd_core::expert_geometry();
+        let routes = capacity as usize * geometry.topk as usize;
         routes
             .checked_mul(8)
-            .and_then(|routes| routes.checked_add(capacity as usize * 5120 * 2))
+            .and_then(|routes| routes.checked_add(capacity as usize * geometry.row_bytes() as usize))
             .context("native host exchange size overflow")
     }
     pub fn new(capacity: u32) -> Result<Self> {
@@ -619,7 +620,7 @@ impl ExpertExecution<'_, '_> {
             "response row-index scratch is too short"
         );
         let response = self.execute_host_request(request, executor_id, exchange)?;
-        let stride = cuteafd_transport::v41_expert::V41_PARTIAL_ROW_BYTES as usize;
+        let stride = cuteafd_core::expert_geometry().row_bytes() as usize;
         for start in (0..request.rows()).step_by(chunk_rows as usize) {
             let end = start.saturating_add(chunk_rows).min(request.rows());
             let payload =
@@ -792,7 +793,7 @@ impl ExpertExecution<'_, '_> {
         if let (Some(timing), Some(started)) = (&self.timing, started) {
             let total_us = started.elapsed().as_micros() as u64;
             let (kernel_us, compact_us) = unsafe { timing.elapsed_us()? };
-            let mut histogram = [0u32; 384];
+            let mut histogram = vec![0u32; cuteafd_core::expert_geometry().experts as usize];
             for &expert in &exchange.ids[..routes] {
                 // Ownership-masked routes carry the out-of-range sentinel and
                 // are not real expert work.
@@ -814,7 +815,7 @@ impl ExpertExecution<'_, '_> {
                 }
             }
             let unique_expert_weight_bytes =
-                self._weights.budget().resident_bytes / 384 * active_experts;
+                self._weights.budget().resident_bytes / histogram.len() * active_experts;
             tracing::debug!(target: "cuteafd::expert_timing",
                 layer, executor_id, rows=request.rows(), active_experts, direct_registered_output=destination.is_some(),
                 kernel_capacity=self.execution_state(request.rows()).0.info().capacity_rows,

@@ -5,7 +5,7 @@ mod backend;
 use super::{ExpertLayer, ExpertWeights, HostExpertExchange};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::{read_official_v41_catalog, OfficialV41Catalog, OFFICIAL_V41_MODEL_ID};
+use cuteafd_loader::OfficialV41Catalog;
 use cuteafd_transport::v41_expert::{V41BackboneRequest, V41SparkTopology};
 use std::{path::PathBuf, sync::mpsc, thread};
 
@@ -59,12 +59,13 @@ pub(crate) struct NativeExpertServiceConfig {
 
 fn load_weights<'a>(
     library: &'a NativeLibrary,
+    catalog: &OfficialV41Catalog,
     config: &NativeExpertServiceConfig,
 ) -> Result<(backend::Weights<'a>, usize)> {
-    let catalog = read_official_v41_catalog(OFFICIAL_V41_MODEL_ID, &config.snapshot)?;
-    ensure!(config.first_layer < 40, "native first layer must be 0..39");
-    validate_topology(config, &catalog)?;
-    if catalog.exl3().is_some() { return backend::load_exl3(library, &catalog, config); }
+    let layers = catalog.routed_experts().layers;
+    ensure!(config.first_layer < layers, "native first layer must be below {layers}");
+    validate_topology(config, catalog)?;
+    if catalog.exl3().is_some() { return backend::load_exl3(library, catalog, config); }
     log_spark_memory_if_enabled(library, config, "worker startup", None, None);
     // NVFP4 backbone experts load through the format-aware ExpertWeights path.
     let nvfp4 = catalog.nvfp4().is_some();
@@ -72,8 +73,8 @@ fn load_weights<'a>(
     let mut staging = 0usize;
     let mut pinned_host = 0usize;
     let mut read_scratch = 0usize;
-    for layer in config.first_layer..40 {
-        let plan = ExpertWeights::plan(library, &catalog, config.selection(layer)?)?;
+    for layer in config.first_layer..layers {
+        let plan = ExpertWeights::plan(library, catalog, config.selection(layer)?)?;
         resident = resident
             .checked_add(plan.resident_bytes)
             .context("resident budget overflow")?;
@@ -156,13 +157,13 @@ fn load_weights<'a>(
             "explicit Spark replicas admission"
         );
     }
-    let mut weights = Vec::with_capacity(40 - config.first_layer);
+    let mut weights = Vec::with_capacity(layers - config.first_layer);
     let mut remaining = config.device_budget;
-    for layer in config.first_layer..40 {
+    for layer in config.first_layer..layers {
         let started = std::time::Instant::now();
         let weight = ExpertWeights::load(
             library,
-            &catalog,
+            catalog,
             config.selection(layer)?,
             remaining,
         )?;
@@ -241,9 +242,11 @@ fn spark_ring_bytes(
     ensure!(slot_bytes > 0, "RDMA ring slot bytes must be non-zero");
     ensure!(max_frame_bytes > 0, "native frame budget must be non-zero");
     let rows = capacity as usize;
+    let geometry = cuteafd_core::expert_geometry();
+    let hidden = geometry.hidden as usize;
     let request_per_row = EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN
-        .checked_add(6 * EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN)
-        .and_then(|per_row| per_row.checked_add(5280))
+        .checked_add(geometry.topk as usize * EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN)
+        .and_then(|per_row| per_row.checked_add(hidden + hidden / 32))
         .context("native request row wire size overflow")?;
     let request_wire = EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN
         .checked_add(
@@ -251,11 +254,11 @@ fn spark_ring_bytes(
                 .context("native request wire size overflow")?,
         )
         .context("native request wire size overflow")?;
-    // Ingress K32 rows are 5280 bytes; the compact-BF16 rank partial is
-    // 5120 * 2 bytes and dominates the negotiated response row.
+    // Ingress FP8 K32 rows carry hidden + hidden/32 bytes; the compact-BF16
+    // rank partial is hidden * 2 bytes and dominates the negotiated response row.
     let response_wire = EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN
         .checked_add(
-            rows.checked_mul(4 + 5120 * 2)
+            rows.checked_mul(4 + hidden * 2)
                 .context("native response wire size overflow")?,
         )
         .context("native response wire size overflow")?;

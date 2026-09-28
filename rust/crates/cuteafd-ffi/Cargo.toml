@@ -8,10 +8,5 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 libloading.workspace = true
-
-[dev-dependencies]
-# The chunk-1 device test compares the FFI-driven kernel against the production
-# CPU sampler, which is the frozen correctness oracle
-# (`cuteafd_core::TargetSamplingParams`). `cuteafd-core` does not depend on
-# `cuteafd-ffi`, so this is not a dependency cycle, and it is test-only.
+# Process-wide expert geometry. `cuteafd-core` does not depend on `cuteafd-ffi`.
 cuteafd-core = { path = "../cuteafd-core" }

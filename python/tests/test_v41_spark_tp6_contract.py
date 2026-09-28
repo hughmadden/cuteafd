@@ -196,7 +196,6 @@ def test_native_role_ids_and_packer_extent_are_declared() -> None:
         assert symbol in header, symbol
 
     pack = PACK.read_text(encoding="utf-8")
-    assert "intermediate != 384" in pack
     assert "intermediate % 32 != 0" in pack
 
     wrapper = WRAPPER_TP6.read_text(encoding="utf-8")

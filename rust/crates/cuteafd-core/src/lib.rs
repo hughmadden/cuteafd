@@ -1,3 +1,5 @@
+pub mod expert_geometry;
+pub use expert_geometry::{expert_geometry, set_expert_geometry, ExpertGeometry};
 mod dspark_policy;
 pub use dspark_policy::{
     dspark_expected_tokens, DsparkCandidate, DsparkCostSnapshot, DsparkLayerClass, DsparkObservedRequest,

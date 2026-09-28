@@ -477,7 +477,7 @@ impl<'a> ExpertWeights<'a> {
     pub fn intermediate(&self) -> usize {
         let w2_bytes = self.buffers[2].buffer.bytes;
         let per_expert = w2_bytes / self.experts.max(1);
-        per_expert * 2 / cuteafd_transport::v41_expert::V41_HIDDEN as usize
+        per_expert * 2 / cuteafd_core::expert_geometry().hidden as usize
     }
 
     pub fn budget(&self) -> ExpertLoadBudget {

@@ -5,6 +5,11 @@ extern "C" {
 #endif
 
 #define CUTEAFD_V41_EXPERT_POINTERS 44
+/* Process-wide routed-expert hidden size for the pack and route-reduce helpers.
+ * Defaults to 5120 (DeepSeek V4.1). Set it once, before any launch; sizes
+ * without a compiled instantiation return cudaErrorInvalidValue. */
+int32_t cuteafd_set_expert_hidden(uint32_t hidden);
+uint32_t cuteafd_expert_hidden(void);
 /* Per-expert prepared sizes in bytes: W13, W13 scales, W2, W2 scales.
  * Logical intermediate must be 2304 (full RTX / coordinator), 1152 (RTX TP2 or
  * Spark TP2), 768 (Spark TP3), 576 (backbone TP4), or 384 (pure Spark TP6).

@@ -3,7 +3,6 @@
 #include <cstdint>
 
 namespace {
-constexpr uint32_t hidden = 5120;
 
 // N256/K128 lane-major representation consumed by b12x W4A8.
 template<bool Gated, bool Scales>
@@ -51,13 +50,10 @@ bool overlaps(const void* a, uint64_t an, const void* b, uint64_t bn) {
 
 extern "C" int32_t cuteafd_v41_expert_packed_sizes(uint32_t intermediate,
     uint64_t bytes[4]) {
-  // Official native extents: 384 (pure Spark TP6), 576 (Spark TP4, padded to
-  // 640), 768 (Spark TP3), 1152 (Spark/RTX TP2), 2304 (full). Every value is a
-  // multiple of 32 so the K/32 scale axis is exact; the 128 padding below is
-  // storage-only, and 384/768 are already 128-aligned.
-  if (!bytes || intermediate % 32 != 0 ||
-      (intermediate != 384 && intermediate != 576 && intermediate != 768 &&
-       intermediate != 1152 && intermediate != 2304))
+  // Per-rank intermediate extents are multiples of 32 so the K/32 scale axis is
+  // exact; the 128 padding below is storage-only (V4.1 TP4 576 -> 640).
+  const uint64_t hidden = cuteafd_expert_hidden();
+  if (!bytes || !intermediate || intermediate % 32 != 0 || intermediate > 8192)
     return cudaErrorInvalidValue;
   const uint64_t padded = (intermediate + 127) / 128 * 128;
   bytes[0] = padded * hidden;
@@ -72,6 +68,7 @@ extern "C" int32_t cuteafd_v41_pack_expert_async(const uint8_t* const sources[6]
   uint64_t sizes[4];
   if (!sources || !destinations || cuteafd_v41_expert_packed_sizes(intermediate, sizes))
     return cudaErrorInvalidValue;
+  const uint32_t hidden = cuteafd_expert_hidden();
   const uint64_t weight_bytes = uint64_t(intermediate) * hidden / 2;
   const uint64_t source_sizes[] = {weight_bytes, weight_bytes, weight_bytes,
     weight_bytes / 16, weight_bytes / 16, weight_bytes / 16};

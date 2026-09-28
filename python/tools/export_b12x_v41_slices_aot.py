@@ -57,8 +57,32 @@ ROLE_NATIVE_ID = {
 }
 SPARK_TP_DEGREE = {"spark": 4, "spark_tp2": 2, "spark_tp3": 3, "spark_tp6": 6}
 
+# Routed-expert shapes that share the V4.1 storage (packed FP4, E8M0 K32 scales)
+# and slice pipeline. The family names the exported symbols (`cuteafd_{family}_*`)
+# and must match `ExpertGeometry::family` in cuteafd-core. Other families derive
+# each role's slice from the TP degree; draft and coordinator roles are V4.1-only.
+FAMILY_GEOMETRY = {
+    "v41": {"hidden": 5120, "experts": 384, "topk": 6, "intermediate": 2304},
+    "dsv4f": {"hidden": 4096, "experts": 256, "topk": 6, "intermediate": 2048},
+    "dsv4p": {"hidden": 7168, "experts": 384, "topk": 6, "intermediate": 3072},
+}
+ROLE_TP_DEGREE = {"spark": 4, "spark_tp2": 2, "spark_tp3": 3, "spark_tp6": 6,
+                  "rtx_backbone": 1, "rtx_tp2": 2}
 
-def export(output, capacities, width, atomic_min_capacity=None, role="spark", *, standard_names=False, compact_max_capacity=None, compact_live_rows=None):
+
+def role_geometry(family, role):
+    """(experts, intermediate, kernel_intermediate, topk) for one family role."""
+    if family == "v41":
+        return ROLE_GEOMETRY[role]
+    shape = FAMILY_GEOMETRY[family]
+    tp = ROLE_TP_DEGREE.get(role)
+    if tp is None or shape["intermediate"] % tp or (shape["intermediate"] // tp) % 32:
+        raise ValueError(f"{family} has no {role} expert slice")
+    intermediate = shape["intermediate"] // tp
+    return shape["experts"], intermediate, (intermediate + 127) // 128 * 128, shape["topk"]
+
+
+def export(output, capacities, width, atomic_min_capacity=None, role="spark", *, standard_names=False, compact_max_capacity=None, compact_live_rows=None, family="v41"):
     import torch
     import cutlass
     import cutlass.cute as cute
@@ -89,7 +113,11 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
     # The role fixes the Spark TP degree at plan time and it is baked into this
     # AOT artifact; live rows are never part of the compile key.
     spark_tp_degree = SPARK_TP_DEGREE.get(role)
-    experts, intermediate, kernel_intermediate, topk = ROLE_GEOMETRY[role]
+    experts, intermediate, kernel_intermediate, topk = role_geometry(family, role)
+    hidden = FAMILY_GEOMETRY[family]["hidden"]
+    wire = hidden + hidden // 32  # FP8 E4M3 row, then one UE8M0 scale per 32 values
+    if family != "v41" and (compact_max_capacity is not None or role == "spark_tp3"):
+        raise ValueError("compact and TP3 launch-geometry exports are V4.1-only")
     if compact_max_capacity is not None:
         if role not in ("spark", "rtx_tp2") or compact_max_capacity < 1:
             raise ValueError("compact specialization requires Spark/TP2 and positive capacity")
@@ -104,6 +132,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         schema=1,
         experimental=not standard_names,
         role=role,
+        family=family,
         spark_tp_degree=spark_tp_degree,
         input_format="bf16" if coordinator else "fp8_k32",
         sparkinfer_revision=_pinned_sparkinfer.REVISION,
@@ -112,7 +141,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         width=width,
         compact_max_capacity=compact_max_capacity,
         compact_live_rows=compact_live_rows,
-        geometry=dict(experts=experts, hidden=5120, intermediate=intermediate,
+        geometry=dict(experts=experts, hidden=hidden, intermediate=intermediate,
                       kernel_intermediate=kernel_intermediate, topk=topk),
         variants=[],
     )
@@ -141,11 +170,12 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             else None
         )
         specs = [
-            (cutlass.Uint32, (capacity, 1280), (1320, 1)),
-            (cutlass.Uint8, (capacity, 160), (5280, 1)),
+            (cutlass.Uint32, (capacity, hidden // 4), (wire // 4, 1)),
+            (cutlass.Uint8, (capacity, hidden // 32), (wire, 1)),
+            # Per-expert packed W13, S13, W2 and S2 in 32-bit words.
             *[
-                (cutlass.Uint32, (experts * n,), (1,))
-                for n in (kernel_intermediate * 1280, kernel_intermediate * 80, kernel_intermediate * 640, kernel_intermediate * 40)
+                (cutlass.Uint32, (experts * kernel_intermediate * hidden // words,), (1,))
+                for words in (4, 64, 8, 128)
             ],
             (cutlass.Int32, (routes,), (1,)),
             (cutlass.Float32, (routes,), (1,)),
@@ -157,19 +187,20 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             (cutlass.Float32, (routes,), (1,)),
             (cutlass.Int32, (routes,), (1,)),
             (cutlass.Float32, (1,), (1,)) if atomic else
-                (cutlass.Float32, (planes, routes, 5120), (routes * 5120, 5120, 1)),
-            (cutlass.Float32, (capacity * 5120,), (1,)) if atomic else
-                (cutlass.Float32, (routes, 5120), (5120, 1)),
+                (cutlass.Float32, (planes, routes, hidden), (routes * hidden, hidden, 1)),
+            (cutlass.Float32, (capacity * hidden,), (1,)) if atomic else
+                (cutlass.Float32, (routes, hidden), (hidden, 1)),
         ]
         args = [
             make_fake_tensor(dtype, shape, stride, assumed_align=16)
             for dtype, shape, stride in specs
         ]
-        label = (f"v41_{role}_m{capacity}" if standard_names
+        label = (f"{family}_{role}_m{capacity}" if standard_names
                  else f"v41_slices_m{capacity}_w{selected_width}")
         pipeline = (V41DraftSlicePipeline(capacity, selected_width, props.multi_processor_count)
                     if coordinator else V41SlicePipeline(capacity, selected_width, atomic_tokens=atomic,
-                                               experts=experts, topk=topk, intermediate=intermediate))
+                                               experts=experts, topk=topk, intermediate=intermediate,
+                                               hidden=hidden))
         if compact:
             from b12x.moe._shared.kernels.v41_compact_pipeline import V41HybridPipeline
             pipeline = V41HybridPipeline(capacity, selected_width, props.multi_processor_count,
@@ -276,7 +307,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             [
                 f"static void {label}_bridge(void** args, int32_t count) {{",
                 "  if (count != 53) { *static_cast<int32_t*>(args[52]) = 1; return; }",
-                f"  void* scales = static_cast<char*>(*static_cast<void**>(args[{input_slot}])) + 5120;",
+                f"  void* scales = static_cast<char*>(*static_cast<void**>(args[{input_slot}])) + {hidden};",
                 f"  void* mapped[] = {{{', '.join(mapped)}, args[44], args[51], args[52]}};",
                 f"  {symbol[0]}(mapped, {argument_count});",
                 "}",
@@ -286,7 +317,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             3 if atomic else 2,
             ROLE_NATIVE_ID[role],
             experts,
-            5120,
+            hidden,
             intermediate,
             kernel_intermediate,
             topk,
@@ -345,7 +376,9 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             ]
         )
     )
-    export_input_quantizer(output, manifest)
+    if family == "v41":
+        # Other families receive rows the coordinator already quantized.
+        export_input_quantizer(output, manifest)
     manifest["artifact_sha256"] = {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
         for path in output.iterdir()
@@ -358,6 +391,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--role", choices=("spark", "spark_tp2", "spark_tp3", "spark_tp6", "coordinator", "rtx_backbone", "rtx_tp2", "dspark_tp2"), default="spark")
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--geometry", choices=sorted(FAMILY_GEOMETRY), default="v41",
+                        help="routed-expert family; names the exported symbols")
     parser.add_argument("--rows", default="1,16,80")
     parser.add_argument(
         "--width",
@@ -392,4 +427,5 @@ if __name__ == "__main__":
     except (ValueError, TypeError) as error:
         parser.error(str(error))
     export(args.output_dir, capacities, width, args.atomic_min_capacity, args.role,
-           standard_names=args.standard_names, compact_max_capacity=args.compact_max_capacity, compact_live_rows=args.compact_live_rows)
+           standard_names=args.standard_names, compact_max_capacity=args.compact_max_capacity, compact_live_rows=args.compact_live_rows,
+           family=args.geometry)

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{CuteafdError, KvBlockDescriptor, LayerId, LayerWave, PositionId};
+use crate::{CuteafdError, KvBlockDescriptor, LayerId, PositionId};
 
 use super::{KvCacheAllocator, KvCacheConfig, KvCacheSnapshot, KvWriteState};
 

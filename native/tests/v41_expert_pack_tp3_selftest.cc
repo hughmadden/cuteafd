@@ -116,9 +116,18 @@ int main() {
   require(sizes[1] == uint64_t(kIntermediate) * kHidden / 16, "S13 extent");
   require(sizes[2] == uint64_t(kHidden) * kIntermediate / 2, "W2 extent");
   require(sizes[3] == uint64_t(kHidden) * kIntermediate / 32, "S2 extent");
-  for (uint32_t rejected : {0u, 1u, 640u, 577u, 800u, 2303u, 4096u})
-    require(cuteafd_v41_expert_packed_sizes(rejected, sizes) != cudaSuccess,
+  uint64_t scratch[4] = {};
+  for (uint32_t rejected : {0u, 1u, 577u, 2303u, 8224u})
+    require(cuteafd_v41_expert_packed_sizes(rejected, scratch) != cudaSuccess,
             "packed sizes accepted an unsupported extent");
+  // Geometry follows the process hidden size (DeepSeek V4 Flash TP4 here).
+  require(cuteafd_set_expert_hidden(1234) != cudaSuccess, "accepted an uncompiled hidden size");
+  require(cuteafd_set_expert_hidden(4096) == cudaSuccess && cuteafd_expert_hidden() == 4096,
+          "rejected hidden 4096");
+  uint64_t flash[4] = {};
+  require(cuteafd_v41_expert_packed_sizes(512, flash) == cudaSuccess &&
+          flash[0] == 512ull * 4096 && flash[3] == 4096ull * 512 / 32, "V4 Flash TP4 extents");
+  require(cuteafd_set_expert_hidden(kHidden) == cudaSuccess, "restore hidden");
 
   const uint64_t weight_bytes = uint64_t(kIntermediate) * kHidden / 2;
   const uint64_t scale_bytes = weight_bytes / 16;

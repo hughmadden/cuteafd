@@ -133,8 +133,8 @@ def test_native_role_ids_and_reducer_abi_are_declared() -> None:
 
 
 def test_packer_accepts_tp3_extent_and_requires_scale_alignment() -> None:
+    # The packer accepts any K32-aligned per-rank extent, including TP3's 768.
     pack = PACK.read_text(encoding="utf-8")
-    assert "intermediate != 768" in pack
     assert "intermediate % 32 != 0" in pack
 
 
@@ -288,6 +288,7 @@ def _run_exporter_cli(argv: list[str]) -> list:
         "Path": Path,
         "export": lambda *args, **kwargs: calls.append((args, kwargs)),
         "__doc__": "cli test",
+        **_literal_assignments(SLICES, {"FAMILY_GEOMETRY"}),
     }
     module = ast.Module(body=_exporter_main_block(), type_ignores=[])
     code = compile(ast.fix_missing_locations(module), str(SLICES), "exec")
@@ -320,6 +321,7 @@ def test_exporter_cli_accepts_valid_width_maps_and_scalars() -> None:
     assert args[2] == {1: 64, 16: 192, 80: 192}
     assert args[3] == 256 and args[4] == "spark_tp2"
     assert kwargs["standard_names"] is True
+    assert kwargs["family"] == "v41"
 
     scalar = _run_exporter_cli(_exporter_argv("192"))
     assert scalar[0][0][2] == 192

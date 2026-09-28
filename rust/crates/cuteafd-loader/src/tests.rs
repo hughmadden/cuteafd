@@ -969,3 +969,29 @@ fn load_tensor_rows_rejects_out_of_bounds_window() {
         .to_string();
     assert!(err.contains("exceeds tensor matrix row count 3"));
 }
+
+/// Opens a local DeepSeek V4 Flash snapshot through the family dispatcher and
+/// stages one TP4 expert shard (`CUTEAFD_V4_FLASH_SNAPSHOT=<snapshot dir>`).
+#[test]
+#[ignore = "requires CUTEAFD_V4_FLASH_SNAPSHOT"]
+fn deepseek_v4_flash_expert_catalog_stages_tp4_shards() -> anyhow::Result<()> {
+    let snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_V4_FLASH_SNAPSHOT")?);
+    let catalog = crate::read_expert_catalog(&snapshot)?;
+    let shape = *catalog.routed_experts();
+    assert_eq!((shape.layers, shape.experts, shape.topk, shape.hidden, shape.intermediate), (43, 256, 6, 4096, 2048));
+    assert_eq!(shape.geometry()?, cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH);
+    let staging = catalog.expert_staging(crate::V41ExpertSelection::BackboneTp {
+        layer: 42,
+        expert: 255,
+        rank: 3,
+        world: 4,
+    })?;
+    assert_eq!(staging.intermediate_size(), 512);
+    // W1+W3 weights, W2 weight, then three E8M0 planes, for a 512 x 4096 shard.
+    assert_eq!(staging.staging_bytes(), 3 * 512 * 2048 + 3 * 512 * 128);
+    let mut buffer = vec![0u8; staging.staging_bytes()];
+    let mut scratch = vec![0u8; staging.minimum_read_scratch_bytes()];
+    staging.read_into(&mut buffer, &mut scratch)?;
+    assert!(buffer.iter().any(|&byte| byte != 0));
+    Ok(())
+}

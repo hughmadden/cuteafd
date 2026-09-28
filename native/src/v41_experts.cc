@@ -8,6 +8,9 @@
 /* W4A4 (ModelOpt NVFP4) variants carry their own bridge and consume BF16
  * hidden rows, so the FP8 input quantizer is not part of this family. */
 #include CUTEAFD_V41_NVFP4_VARIANTS_HEADER
+#elif defined(CUTEAFD_EXPERT_VARIANTS_HEADER)
+/* A non-V4.1 routed-expert family (cmake/expert_families.cmake). */
+#include CUTEAFD_EXPERT_VARIANTS_HEADER
 #elif defined(CUTEAFD_V41_SPARK_TP2_EXPERTS)
 /* Replicated-group Spark TP2 shards (native FP8 K32 family, SM121). */
 #include "v41_spark_tp2_expert_variants.h"
@@ -249,7 +252,7 @@ extern "C" int32_t cuteafd_v41_expert_launch(void* kernel, const cuteafd_v41_exp
 // Every role that needs it defines these entry points in exactly one member.
 #if !defined(CUTEAFD_V41_LOCAL_EXPERTS) && !defined(CUTEAFD_V41_NVFP4_VARIANTS_HEADER) && \
     !defined(CUTEAFD_V41_SPARK_TP2_EXPERTS) && !defined(CUTEAFD_V41_SPARK_TP3_EXPERTS) && \
-    !defined(CUTEAFD_V41_SPARK_TP6_EXPERTS)
+    !defined(CUTEAFD_V41_SPARK_TP6_EXPERTS) && !defined(CUTEAFD_EXPERT_VARIANTS_HEADER)
 namespace {
 struct InputQuantModule {
   cudaLibrary_t library = nullptr;

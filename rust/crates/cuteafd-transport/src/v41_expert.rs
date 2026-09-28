@@ -67,13 +67,13 @@ fn validate_canonical_body(
     );
     ensure!(header.layer_id < 40, "native backbone layer out of range");
     ensure!(
-        header.hidden_dim == V41_HIDDEN
+        header.hidden_dim == cuteafd_core::expert_geometry().hidden
             && matches!(
                 header.hidden_dtype,
                 ExpertV2Dtype::Bf16 | ExpertV2Dtype::Fp8E4m3Ue8m0K32
             )
             && header.hidden_row_stride_bytes as usize
-                == header.hidden_dtype.row_bytes(V41_HIDDEN as usize)?,
+                == header.hidden_dtype.row_bytes(cuteafd_core::expert_geometry().hidden as usize)?,
         "native backbone needs contiguous BF16 or E4M3/UE8M0 K32 hidden rows"
     );
     ensure!(
@@ -268,7 +268,7 @@ impl<'a> V41BackboneRequest<'a> {
     }
     pub fn plane_bytes(&self) -> Result<usize> {
         (self.rows() as usize)
-            .checked_mul(V41_PARTIAL_ROW_BYTES as usize)
+            .checked_mul(cuteafd_core::expert_geometry().row_bytes() as usize)
             .context("route plane byte overflow")
     }
     /// Fill caller-owned GPU-upload arrays without reordering or rounding routes.
@@ -344,9 +344,9 @@ impl<'a> V41BackboneRequest<'a> {
                 placement_version: header.placement_version,
                 layer_id: header.layer_id,
                 row_count: self.rows(),
-                output_dim: V41_HIDDEN,
+                output_dim: cuteafd_core::expert_geometry().hidden,
                 output_dtype: ExpertV2Dtype::Bf16,
-                output_row_stride_bytes: V41_PARTIAL_ROW_BYTES,
+                output_row_stride_bytes: cuteafd_core::expert_geometry().row_bytes(),
                 output_payload_bytes: self.plane_bytes()? as u64,
                 status: ExpertProtocolV2Status::Ok,
                 // Request-only admission flags never appear in a response.
@@ -505,9 +505,9 @@ impl<'a> V41Tp4Planes<'a> {
             "native expert execution failed"
         );
         ensure!(
-            h.output_dim == V41_HIDDEN
+            h.output_dim == cuteafd_core::expert_geometry().hidden
                 && h.output_dtype == ExpertV2Dtype::Bf16
-                && h.output_row_stride_bytes == V41_PARTIAL_ROW_BYTES,
+                && h.output_row_stride_bytes == cuteafd_core::expert_geometry().row_bytes(),
             "native TP route plane geometry mismatch"
         );
         self.executors

@@ -41,9 +41,51 @@ pub struct V41Tensor {
     pub placement: V41TensorPlacement,
 }
 
+/// Routed-expert extents every expert path reads, independent of the model
+/// family's full configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutedExpertShape {
+    pub layers: usize,
+    pub experts: usize,
+    pub topk: usize,
+    pub hidden: usize,
+    pub intermediate: usize,
+    /// MTP draft stages and their routed experts (0 when the draft is dense).
+    pub draft_stages: usize,
+    pub draft_experts: usize,
+}
+
+impl RoutedExpertShape {
+    fn of_v41(config: &OfficialV41Config) -> Self {
+        let text = config.text();
+        Self {
+            layers: text.num_hidden_layers,
+            experts: text.n_routed_experts,
+            topk: text.num_experts_per_tok,
+            hidden: text.hidden_size,
+            intermediate: text.moe_intermediate_size,
+            draft_stages: text.num_nextn_predict_layers,
+            draft_experts: text.dspark_n_routed_experts,
+        }
+    }
+
+    pub fn geometry(&self) -> Result<cuteafd_core::ExpertGeometry> {
+        let narrow = |value: usize| u32::try_from(value).context("routed expert extent overflow");
+        Ok(cuteafd_core::ExpertGeometry {
+            hidden: narrow(self.hidden)?,
+            experts: narrow(self.experts)?,
+            topk: narrow(self.topk)?,
+            intermediate: narrow(self.intermediate)?,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct OfficialV41Catalog {
-    config: OfficialV41Config,
+    /// The strict V4.1 contract; `None` for other families, which only expose
+    /// their routed experts through this catalog.
+    config: Option<OfficialV41Config>,
+    experts: RoutedExpertShape,
     snapshot: PathBuf,
     tensors: Vec<V41Tensor>,
     exl3: Option<crate::V41Exl3Manifest>,
@@ -107,8 +149,15 @@ impl OfficialV41Catalog {
             bytes: tensor.metadata.byte_length,
         })
     }
+    /// The V4.1 configuration. Catalogs of other families carry only their
+    /// routed experts; V4.1-only callers never receive one.
     pub fn config(&self) -> &OfficialV41Config {
-        &self.config
+        self.config
+            .as_ref()
+            .expect("only DeepSeek V4.1 catalogs carry the official configuration")
+    }
+    pub fn routed_experts(&self) -> &RoutedExpertShape {
+        &self.experts
     }
     pub fn snapshot(&self) -> &Path {
         &self.snapshot
@@ -276,7 +325,7 @@ impl OfficialV41Catalog {
     /// Checkpoint files must remain immutable for the lifetime of the returned maps.
     pub unsafe fn map_engram(&self, layer: usize) -> Result<crate::EngramTable> {
         ensure!(
-            self.config.text().engram_layer_ids.contains(&layer),
+            self.config().text().engram_layer_ids.contains(&layer),
             "no engram table at layer {layer}"
         );
         let map = |suffix: &str| -> Result<crate::MappedRows> {
@@ -628,11 +677,118 @@ pub fn read_official_v41_catalog(model_id: &str, snapshot: &Path) -> Result<Offi
     }
     tensors.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
     Ok(OfficialV41Catalog {
-        config,
+        experts: RoutedExpertShape::of_v41(&config),
+        config: Some(config),
         snapshot: snapshot.to_path_buf(),
         tensors,
         exl3,
         nvfp4,
+    })
+}
+
+/// Opens the routed experts of any supported checkpoint: the strict V4.1
+/// contract, or a DeepSeek V4 (Flash/Pro) checkpoint whose experts share the
+/// V4.1 storage (packed FP4 in I8, E8M0 scales per 32 values).
+pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
+    let config: serde_json::Value =
+        crate::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
+    if config.get("text_config").is_some() {
+        return read_official_v41_catalog(crate::OFFICIAL_V41_MODEL_ID, snapshot);
+    }
+    match config.get("model_type").and_then(serde_json::Value::as_str) {
+        Some("deepseek_v4") => read_deepseek_v4_expert_catalog(snapshot),
+        other => anyhow::bail!(
+            "the Spark expert service does not know model_type {other:?}; add a family \
+             reader next to read_deepseek_v4_expert_catalog that maps its routed expert \
+             tensors onto the six-region W1,W3,W2,S1,S3,S2 staging plan"
+        ),
+    }
+}
+
+/// DeepSeek V4 routed experts; every other tensor stays with the coordinator
+/// and is not validated here.
+fn read_deepseek_v4_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
+    let v4 = crate::deepseek_v4::DeepseekV4Config::read(snapshot, 0)?;
+    #[derive(Deserialize)]
+    struct Index {
+        weight_map: BTreeMap<String, String>,
+    }
+    let index: Index = crate::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)
+        .and_then(|value| Ok(serde_json::from_value(value)?))?;
+    let (hidden, intermediate) = (v4.dim, v4.moe_inter_dim);
+    ensure!(
+        hidden % 32 == 0 && intermediate % 32 == 0,
+        "DeepSeek V4 expert extents {hidden}x{intermediate} are not K32-aligned"
+    );
+    let draft_stages = index.weight_map.keys()
+        .filter_map(|name| name.strip_prefix("mtp.")?.split('.').next()?.parse::<usize>().ok())
+        .max()
+        .map_or(0, |stage| stage + 1);
+    let draft_experts = index.weight_map.keys()
+        .filter(|name| name.starts_with("mtp.0.ffn.experts.") && name.ends_with(".w1.weight"))
+        .count();
+    let expect = |name: &str| -> Option<(DType, [usize; 2])> {
+        let parts: Vec<_> = name.split('.').collect();
+        let routed = parts.len() == 7 && parts[0] == "layers" && parts[2] == "ffn" && parts[3] == "experts";
+        if !routed {
+            return None;
+        }
+        let (rows, cols) = if parts[5] == "w2" { (hidden, intermediate) } else { (intermediate, hidden) };
+        match parts[6] {
+            "weight" => Some((DType::I8, [rows, cols / 2])),
+            "scale" => Some((DType::F8E8M0, [rows, cols / 32])),
+            _ => None,
+        }
+    };
+    let mut shards: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for (name, shard) in &index.weight_map {
+        shards.entry(shard).or_default().insert(name);
+    }
+    let mut tensors = Vec::with_capacity(index.weight_map.len());
+    let mut routed = 0usize;
+    for (shard, names) in shards {
+        let metadata = read_safetensors_metadata(&snapshot.join(shard))
+            .with_context(|| format!("reading {shard}"))?;
+        ensure!(metadata.len() == names.len(), "index/header tensor count mismatch in {shard}");
+        for tensor in metadata {
+            ensure!(names.contains(tensor.name.as_str()), "tensor {} appears in unexpected shard {shard}", tensor.name);
+            let placement = match expect(&tensor.name) {
+                Some((dtype, shape)) => {
+                    ensure!(
+                        tensor.dtype == dtype && tensor.shape == shape,
+                        "routed expert {} is {:?} {:?}, expected {dtype:?} {shape:?} (packed FP4 with E8M0 K32 scales)",
+                        tensor.name, tensor.dtype, tensor.shape
+                    );
+                    routed += 1;
+                    placement(&tensor.name)
+                }
+                None => V41TensorPlacement::CoordinatorRtx,
+            };
+            tensors.push(V41Tensor { shard: shard.to_string(), metadata: tensor, placement });
+        }
+    }
+    ensure!(
+        routed == v4.n_layers * v4.n_routed_experts * 6,
+        "checkpoint has {routed} routed expert tensors, expected {} layers x {} experts x 6",
+        v4.n_layers,
+        v4.n_routed_experts
+    );
+    tensors.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+    Ok(OfficialV41Catalog {
+        config: None,
+        experts: RoutedExpertShape {
+            layers: v4.n_layers,
+            experts: v4.n_routed_experts,
+            topk: v4.n_activated_experts,
+            hidden,
+            intermediate,
+            draft_stages,
+            draft_experts,
+        },
+        snapshot: snapshot.to_path_buf(),
+        tensors,
+        exl3: None,
+        nvfp4: None,
     })
 }
 
@@ -760,6 +916,10 @@ fn apply_nvfp4_expert_contract(
 #[cfg(test)]
 mod tests {
     use super::*;
+    pub(super) fn official_config() -> OfficialV41Config {
+        OfficialV41Config::from_json(crate::OFFICIAL_V41_MODEL_ID, include_bytes!("official-v41-config.json"))
+            .unwrap()
+    }
     #[test]
     fn checkpoint_contract_keeps_native_types_and_local_draft_experts() {
         let tensors = expected_tensors().unwrap();
@@ -824,11 +984,8 @@ mod tests {
             .unwrap();
         let name = "layers.0.ffn.experts.0.w2.weight";
         let mut catalog = OfficialV41Catalog {
-            config: OfficialV41Config::from_json(
-                crate::OFFICIAL_V41_MODEL_ID,
-                include_bytes!("official-v41-config.json"),
-            )
-            .unwrap(),
+            config: Some(official_config()),
+            experts: RoutedExpertShape::of_v41(&official_config()),
             exl3: None,
             nvfp4: None,
             snapshot: dir.path().into(),
@@ -969,6 +1126,7 @@ mod tests {
 
 #[cfg(test)]
 mod expert_staging_tests {
+    use super::tests::official_config;
     use super::*;
     use crate::V41ExpertSelection;
     use std::os::unix::fs::FileExt;
@@ -1016,11 +1174,8 @@ mod expert_staging_tests {
         }
         tensors.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
         let catalog = OfficialV41Catalog {
-            config: OfficialV41Config::from_json(
-                crate::OFFICIAL_V41_MODEL_ID,
-                include_bytes!("official-v41-config.json"),
-            )
-            .unwrap(),
+            config: Some(official_config()),
+            experts: RoutedExpertShape::of_v41(&official_config()),
             exl3: None,
             nvfp4: None,
             snapshot: dir.path().into(),
