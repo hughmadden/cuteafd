@@ -127,6 +127,17 @@ impl<'a> Dsv4Programs<'a> {
         Ok(self)
     }
 
+    /// Loads every program's kernels on the current device (startup, before
+    /// the first request pays for it).
+    pub fn load_all(&self) -> Result<()> {
+        for (name, (index, _)) in &self.programs {
+            // SAFETY: loading reads the static table and loads a CUDA library.
+            let status = unsafe { (self.load)(*index) };
+            ensure!(status == 0, "loading {name} failed with CUDA status {status}");
+        }
+        Ok(())
+    }
+
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.programs.keys().map(String::as_str)
     }

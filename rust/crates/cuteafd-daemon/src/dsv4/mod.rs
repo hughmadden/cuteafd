@@ -129,6 +129,9 @@ pub(crate) fn with_engine<T>(
     body: impl FnOnce(&engine::Engine<'_>, &mut V41Tp4Roce, &tokio::runtime::Runtime) -> Result<T>,
 ) -> Result<T> {
     let programs = loaded.library.dsv4_programs()?.with_manifest(&args.manifest)?;
+    let started = Instant::now();
+    programs.load_all()?;
+    tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 programs loaded");
     let caps = &loaded.manifest["capacities"];
     let stream = loaded.library.cuda_stream_create()?;
     let started = Instant::now();
