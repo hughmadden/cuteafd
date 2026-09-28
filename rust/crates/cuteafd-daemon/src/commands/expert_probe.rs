@@ -7,6 +7,7 @@
 //! Inputs are random FP8 K32 wire rows, so the oracle sees exactly the values
 //! the kernels do. EXL3 checkpoints use the trellis oracle in `exl3`.
 mod exl3;
+mod local;
 
 use crate::cli::ExpertProbeArgs;
 use anyhow::{ensure, Context, Result};
@@ -26,6 +27,7 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
     cuteafd_core::set_expert_geometry(geometry)
         .map_err(|fixed| anyhow::anyhow!("expert geometry already {fixed:?}"))?;
     ensure!(args.layer < shape.layers, "layer {} is outside 0..{}", args.layer, shape.layers);
+    ensure!(args.stage.is_none() || catalog.exl3().is_some(), "--stage probes EXL3 dSpark stages only");
     let (hidden, topk, rows) = (shape.hidden, shape.topk, args.rows as usize);
     ensure!(rows > 0 && rows <= 4096, "rows must be 1..=4096");
 
@@ -67,6 +69,19 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
             routes.push(ExpertProtocolV2RouteEntry { row_index: row as u32, expert_id: expert, gate_weight: weight });
         }
     }
+    let exl3 = catalog.exl3().is_some();
+    if args.local {
+        let (actual, elapsed) = local::run(&args, &catalog, &wire, &routes)?;
+        let (what, index) = match args.stage { Some(stage) => ("stage", stage), None => ("layer", args.layer) };
+        let started = Instant::now();
+        let expected = if exl3 {
+            exl3::oracle(&catalog, args.stage.is_some(), index, &input, &routes, rows)?
+        } else {
+            ensure!(args.stage.is_none(), "native dSpark stage oracle is not implemented");
+            oracle(&catalog, args.layer, hidden, &input, &routes, rows)?
+        };
+        return report(&format!("{what} {index} rows {rows} local"), exl3, &actual, &expected, elapsed, started.elapsed());
+    }
     let mut request = ExpertProtocolV2Request::new(
         args.seed,
         17,
@@ -90,6 +105,8 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
 
     let peers = args
         .peers
+        .as_deref()
+        .context("--peers is required without --local")?
         .split(',')
         .map(str::parse)
         .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()
@@ -124,15 +141,19 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
     }
 
     let started = Instant::now();
-    let exl3 = catalog.exl3().is_some();
     let expected = if exl3 {
-        exl3::oracle(&catalog, args.layer, &input, &routes, rows)?
+        exl3::oracle(&catalog, false, args.layer, &input, &routes, rows)?
     } else {
         oracle(&catalog, args.layer, hidden, &input, &routes, rows)?
     };
-    let oracle_elapsed = started.elapsed();
+    report(&format!("layer {} rows {rows} ranks {}", args.layer, peers.len()), exl3, &actual, &expected,
+        remote, started.elapsed())
+}
+
+fn report(what: &str, exl3: bool, actual: &[f32], expected: &[f32], remote: Duration, oracle_elapsed: Duration)
+    -> Result<()> {
     let (mut dot, mut na, mut nb, mut diff) = (0f64, 0f64, 0f64, 0f64);
-    for (a, e) in actual.iter().zip(&expected) {
+    for (a, e) in actual.iter().zip(expected) {
         let (a, e) = (f64::from(*a), f64::from(*e));
         dot += a * e;
         na += a * a;
@@ -150,16 +171,13 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
         cosine > 0.9999 && rel_l2 < 0.01
     };
     println!(
-        "{} layer {} rows {} ranks {}{}: cosine {cosine:.6} rel_l2 {rel_l2:.2e} remote {:.2} ms oracle {:.1} s",
+        "{} {what}{}: cosine {cosine:.6} rel_l2 {rel_l2:.2e} remote {:.2} ms oracle {:.1} s",
         if pass { "PASS" } else { "FAIL" },
-        args.layer,
-        rows,
-        peers.len(),
         if exl3 { " exl3" } else { "" },
         remote.as_secs_f64() * 1e3,
         oracle_elapsed.as_secs_f64(),
     );
-    ensure!(pass, "Spark experts disagree with the CPU oracle");
+    ensure!(pass, "experts disagree with the CPU oracle");
     Ok(())
 }
 

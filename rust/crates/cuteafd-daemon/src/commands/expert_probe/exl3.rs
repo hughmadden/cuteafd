@@ -12,8 +12,10 @@ use std::os::unix::fs::FileExt;
 const MCG_MULTIPLIER: u32 = 0xcbac_1fed;
 const SWIGLU_LIMIT: f32 = 10.0;
 
+/// `draft` selects dSpark stage `layer` (`mtp.{layer}`) instead of backbone layer `layer`.
 pub(super) fn oracle(
     catalog: &OfficialV41Catalog,
+    draft: bool,
     layer: usize,
     input: &[f32],
     routes: &[ExpertProtocolV2RouteEntry],
@@ -34,7 +36,7 @@ pub(super) fn oracle(
                 scope.spawn(move || -> Result<Vec<f32>> {
                     let mut out = vec![0f32; rows * hidden];
                     for (expert, routes) in experts.iter().skip(worker).step_by(threads) {
-                        let name = |kind| manifest.naming.projection(false, layer, *expert as usize, kind);
+                        let name = |kind| manifest.naming.projection(draft, layer, *expert as usize, kind);
                         let gate = Projection::read(catalog, &name(V41Exl3ProjectionKind::Gate))?;
                         let up = Projection::read(catalog, &name(V41Exl3ProjectionKind::Up))?;
                         let down = Projection::read(catalog, &name(V41Exl3ProjectionKind::Down))?;

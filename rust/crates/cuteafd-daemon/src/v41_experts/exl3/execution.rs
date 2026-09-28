@@ -331,9 +331,11 @@ impl<'a> Exl3Execution<'a> {
                     && meta.swiglu_limit == 10.0,
                 "EXL3 export/residency geometry mismatch"
             );
-            // V4.1 dSpark drafts route top-3; every backbone follows the model.
+            // V4.1 dSpark drafts route top-3; DeepSeek V4 stages and every
+            // backbone follow the model.
             let expected_topk =
-                if matches!(weight.layout.layer, cuteafd_loader::V41Exl3Layer::Dspark(_)) {
+                if matches!(weight.layout.layer, cuteafd_loader::V41Exl3Layer::Dspark(_))
+                    && cuteafd_core::expert_geometry().family() == Some("v41") {
                     3
                 } else {
                     cuteafd_core::expert_geometry().topk as usize

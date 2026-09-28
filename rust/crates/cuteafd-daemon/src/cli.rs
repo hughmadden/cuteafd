@@ -39,8 +39,18 @@ pub(crate) struct ExpertProbeArgs {
     #[arg(long)]
     pub(crate) snapshot: PathBuf,
     /// Spark ranks in TP order, comma-separated HOST:PORT.
+    #[arg(long, required_unless_present = "local")]
+    pub(crate) peers: Option<String>,
+    /// Run the experts on this GPU through the coordinator's resident-layer
+    /// path (DeepSeek V4 `LocalExperts`) instead of the Sparks.
+    #[arg(long, requires = "native_lib")]
+    pub(crate) local: bool,
+    /// Native library whose coordinator kernels/packages serve `--local`.
     #[arg(long)]
-    pub(crate) peers: String,
+    pub(crate) native_lib: Option<PathBuf>,
+    /// With `--local`, probe dSpark stage S (`mtp.S`) instead of `--layer`.
+    #[arg(long, requires = "local")]
+    pub(crate) stage: Option<usize>,
     #[arg(long, default_value_t = 3)]
     pub(crate) layer: usize,
     #[arg(long, default_value_t = 16)]

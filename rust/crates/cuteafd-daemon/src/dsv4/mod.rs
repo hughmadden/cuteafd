@@ -185,7 +185,7 @@ pub(crate) fn with_engine<T>(
     let budget = free.saturating_sub(args.reserve_gib << 30);
     let started = Instant::now();
     let stages = if args.dspark { engine.weights.dspark.as_ref().map_or(0, |d| d.stages.len()) } else { 0 };
-    let local = local::LocalExperts::load(&loaded.library, &loaded.catalog, stages,
+    let local = local::LocalExperts::load(&loaded.library, &args.native_lib, &loaded.catalog, stages,
         args.local_expert_layers.unwrap_or(usize::MAX), engine.decode_rows.max(engine.prefill_rows), budget, stream)?;
     tracing::info!(layers = local.as_ref().map_or(0, |l| l.layers()), elapsed_ms = started.elapsed().as_millis() as u64,
         "DeepSeek V4 expert layers resident on the coordinator");
