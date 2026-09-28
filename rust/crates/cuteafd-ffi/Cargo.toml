@@ -8,5 +8,6 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 libloading.workspace = true
+serde_json.workspace = true
 # Process-wide expert geometry. `cuteafd-core` does not depend on `cuteafd-ffi`.
 cuteafd-core = { path = "../cuteafd-core" }

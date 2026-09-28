@@ -634,6 +634,7 @@ dependencies = [
  "anyhow",
  "cuteafd-core",
  "libloading",
+ "serde_json",
 ]
 
 [[package]]
