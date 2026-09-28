@@ -8,7 +8,7 @@ kernels from our b12x fork, hand CUDA where it pays. Load any checkpoint of a
 supported family directly from the HF snapshot. Say precisely what is missing
 when something is not supported. Never slower than the engine it replaces.
 
-Companion notes for agents: `AGENTS.md` (written in Phase 0). Code is king;
+Companion notes for agents: `AGENTS.md`. Code is king;
 measurements are short tables in commit messages and `docs/` stays tiny.
 
 ## What we start from (survey 2026-09-28)
@@ -147,17 +147,54 @@ tool-call parsers and xgrammar tag grammars; console made model-agnostic.
 
 Each phase ends with: V4.1 Flash parity table (C1 code decode 1/2 RTX,
 8K prefill, tool eval) unchanged or better, plus the phase's own table.
-Commit small, push often. Phase 0 is Fable; Opus takes over from Phase 1.
+Commit small, push often. Opus executes all phases; Fable wrote the specs.
 
-**Phase 0 — skeleton and anchor (Fable).**
-Import ds41rt at HEAD into this repo (fresh history, provenance recorded),
-rename crates/prefixes, delete `real_full` and legacy commands, split
-`native/` into shared + families, move v41 modules under
-`afd-families/deepseek_v41`, carve `afd-engine` from `v41_native_serve`.
-Generalize config (`cuteafd.config`: MODEL, REVISION, TOPOLOGY; family
-auto-detected). Add `plan` with the capability registry and hint output.
-Add sparknest placement awareness. Write `AGENTS.md` from ds41rt's hints.
-Build both images, serve V4.1 Flash on 2×RTX + 4 Sparks, record parity.
+**Phase 0 — skeleton and anchor.**
+Import, purge, restructure, and prove V4.1 parity on the new tree before
+any new model work. Concrete recipe:
+
+1. Import: `git -C ../ds41rt archive 3067d06 | tar -x -C .` then remove
+   `.gitmodules` and re-add the four submodules at the same commits:
+   sparkinfer `7fcc094e` (tpurtell/sparkinfer-glmrt, master),
+   xgrammar `557becfb` (mlc-ai, v0.2.3), gptqmodel `5340775d`
+   (tpurtell/GPTQModel, main), transformers `62d7ebd7` (malaiwah fork).
+   Keep the `*.lock.json` tree locks and `verify-*-source.py`.
+2. Purge in the import commit: `docs/` (940 evidence files), `runs/`,
+   `ds41rt.build-v*.config`, `scripts/render-*`, `scripts/summarize-*`,
+   `scripts/bench/` campaign files, `assemble-release-v2.py`,
+   `update-ds41-v6-release-docs.py`, `release_semantic_quality.py`,
+   `release_throughput_checks.py`, `migrate-layer-boundary-*`,
+   `scripts/fixtures/release-*`, the matching `scripts/tests/test_v*` and
+   `test_*release*` tests, and the legacy TCP scripts
+   (`real-full-*`, `real-slice-*`, `start-spark-experts-tcp.sh`,
+   `phase0-*`). Drop `README.md`, `DEVELOPER.md`, `AGENT_DEV_HINTS.md`,
+   `architecture.md` (replaced by `AGENTS.md` here). Keep `LICENSE`,
+   `THIRD_PARTY_NOTICES.md`, `docker/`, `examples/configs/`,
+   `build.sh`/`wip.sh`/`run.sh`/`stop.sh`, `justfile`, `quantization/`,
+   `python/`, `native/`, `rust/`.
+3. Delete `rust/crates/ds41rt-daemon/src/commands/real_full/` and the
+   legacy CLI commands (`Coordinator`, `Expertd`, real-full benches), then
+   the Python tools and fixtures that only they used
+   (`validate_ds4_*`, `validate_native_flash_*`, `tune_w8a16_*`,
+   `tune_mtp_*`, legacy sparse-lm-head tuners). Native `ds4_*_aot.cu`,
+   `mla_indexing.cu`, `packed_fp8_mla_exact.cu` stay for Phase 1.
+   Build must pass after this step.
+4. Rename: crates `ds41rt-*` → `afd-*`, binary `cuteafd`, native lib
+   `libcuteafd_native`, symbol prefix `cuteafd_`, env/config prefix
+   `CUTEAFD_`, image names `cuteafd-{coordinator,spark-expert}`, build
+   cache `~/.cache/cuteafd/builds`. Mechanical, one commit.
+5. Restructure: `native/{shared,families/deepseek_v41,families/deepseek_v4}`;
+   `v41_*` daemon modules → `afd-families/deepseek_v41`; carve
+   `afd-engine` (scheduler, lanes, prefix, memory, speculative transaction,
+   console state) out of `v41_native_serve` behind the traits in
+   Architecture. Do this incrementally with V4.1 serving between steps.
+6. Generalize: `cuteafd.config` takes MODEL (hf id or path), REVISION,
+   TOPOLOGY; the family reader replaces the embedded official config and
+   model-id check with schema validation. Add `cuteafd plan` with the kernel
+   capability registry and the unsupported-hint block. Add sparknest
+   placement awareness (`nest where`, optional `--place`).
+7. Serve V4.1 Flash on 2×RTX + 4 Sparks and on 1×RTX; record the parity
+   table against ds41rt v15 in the commit message. Tag `p0`.
 
 **Phase 1 — DeepSeek V4 family.**
 `deepseek_v4` family on the new engine: V4 Flash 0731 (native FP8/FP4) and
@@ -187,6 +224,19 @@ spark-expert}`, concise README with one headline table.
 
 Ongoing, any phase: engram/n-gram tables in host RAM now; Spark-RAM
 replicas and fabric-fed tables are explorations, kept behind options.
+
+## Decisions (2026-09-28)
+
+- Fresh copy of ds41rt at `3067d06` into this repo; no history import. The
+  import is also a purge: release evidence, perf traces, per-release configs,
+  render/summarize scripts and archived patches stay behind in ds41rt.
+  Keep qualification and bench tools that exercise live code.
+- Delete `real_full` and the legacy commands outright; DS4 Flash/Pro are
+  rebuilt as the `deepseek_v4` family.
+- All seven hosts and all storage are ours to manage. Replicate a model to
+  every rank while working on it, then shrink to one copy or 1/N when done.
+  `/mnt/scratch` archive is slow (150 MB/s write, 500 MB/s read).
+- Work on `main`, small commits, push often, tag phase boundaries.
 
 ## Cluster and rules
 
