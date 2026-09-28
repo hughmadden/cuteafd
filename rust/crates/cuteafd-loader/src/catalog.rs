@@ -409,7 +409,8 @@ pub(crate) fn resolve_model_quantization_config<'a>(
         .unwrap_or("unquantized");
     let is_compact_gptqmodel_exl3 = quant_method.eq_ignore_ascii_case("exl3")
         && embedded.get("tensor_storage").is_none()
-        && embedded.get("cuteafd").is_none();
+        && embedded.get("cuteafd").is_none()
+        && embedded.get("ds41rt").is_none();
     if !is_compact_gptqmodel_exl3 {
         return Ok(Some(Cow::Borrowed(embedded)));
     }

@@ -253,7 +253,33 @@ pub(crate) fn read_json(path: &Path, limit: u64) -> Result<Value> {
         "{} exceeds metadata size limit",
         path.display()
     );
-    serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
+    let mut value: Value = serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    normalize_legacy_names(&mut value);
+    Ok(value)
+}
+
+/// Checkpoints published before the ds41rt -> cuteafd rename carry `ds41rt`
+/// keys (`meta.ds41rt`, `ds41rt_*`) and `ds41rt.`-prefixed schema strings; read
+/// them under the current names.
+pub(crate) fn normalize_legacy_names(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let legacy: Vec<String> = map.keys().filter(|k| *k == "ds41rt" || k.starts_with("ds41rt_")).cloned().collect();
+            for key in legacy {
+                let renamed = format!("cuteafd{}", &key["ds41rt".len()..]);
+                if !map.contains_key(&renamed) {
+                    let entry = map.remove(&key).unwrap();
+                    map.insert(renamed, entry);
+                }
+            }
+            map.values_mut().for_each(normalize_legacy_names);
+        }
+        Value::Array(items) => items.iter_mut().for_each(normalize_legacy_names),
+        Value::String(text) if text.starts_with("ds41rt.") => {
+            *text = format!("cuteafd.{}", &text["ds41rt.".len()..]);
+        }
+        _ => {}
+    }
 }
 
 pub fn read_v41_exl3_manifest(snapshot: &Path) -> Result<V41Exl3Manifest> {
@@ -1078,5 +1104,18 @@ mod tests {
                 serde_json::json!([144, 320, 16 * bits]);
             assert!(parse(&bad).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod legacy_name_tests {
+    #[test]
+    fn ds41rt_publications_read_under_current_names() {
+        let mut value = serde_json::json!({"meta": {"ds41rt": {"schema": "ds41rt.v41-routed-exl3.v1"}},
+            "ds41rt_ple_quantization": {"schema": "ds41rt.nvfp4-ple.v1"}, "other": "ds41rt-free"});
+        super::normalize_legacy_names(&mut value);
+        assert_eq!(value["meta"]["cuteafd"]["schema"], super::V41_EXL3_SCHEMA);
+        assert_eq!(value["cuteafd_ple_quantization"]["schema"], "cuteafd.nvfp4-ple.v1");
+        assert_eq!(value["other"], "ds41rt-free");
     }
 }
