@@ -59,14 +59,17 @@ impl<'a> LocalExperts<'a> {
         let workspace = scratch_bytes + max_rows * (shape.hidden * 2 + shape.topk * 8);
         ensure!(budget > workspace, "local experts need {workspace} workspace bytes, budget is {budget}");
         let mut remaining = budget - workspace;
+        tracing::info!(budget, workspace, scratch_bytes, "loading coordinator expert layers");
         let mut layers = Vec::new();
         for layer in 0..max_layers.min(shape.layers) {
             let plan = ExpertWeights::plan(library, catalog, ExpertLayer::BackboneFull { layer })?;
             if plan.peak_device_bytes()? > remaining {
                 break;
             }
-            let weights = ExpertWeights::load(library, catalog, ExpertLayer::BackboneFull { layer }, remaining)?;
+            let weights = ExpertWeights::load(library, catalog, ExpertLayer::BackboneFull { layer }, remaining)
+                .with_context(|| format!("coordinator expert layer {layer} with {remaining} bytes left"))?;
             remaining -= weights.budget().resident_bytes;
+            tracing::debug!(layer, resident = weights.budget().resident_bytes, remaining, "coordinator expert layer resident");
             layers.push(weights);
         }
         if layers.is_empty() {
