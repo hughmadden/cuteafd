@@ -34,6 +34,11 @@ pub trait Family: Sync {
     }
     /// Implementation notes for components this build cannot execute yet.
     fn component_hint(&self, component: Component) -> Option<Hint>;
+
+    /// Components the engine can serve without (a speculator it does not run yet).
+    fn optional(&self, _component: Component) -> bool {
+        false
+    }
 }
 
 static REGISTRY: [&dyn Family; 6] = [

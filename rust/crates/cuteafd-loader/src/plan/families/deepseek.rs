@@ -23,7 +23,7 @@ pub static DEEPSEEK_V41: DeepSeek = DeepSeek {
 pub static DEEPSEEK_V4: DeepSeek = DeepSeek {
     id: "deepseek_v4",
     architecture: "DeepseekV4ForCausalLM",
-    runtime: RuntimeStatus::Planned,
+    runtime: RuntimeStatus::Serving,
 };
 
 fn usize_list(config: &Value, key: &str) -> Vec<usize> {
@@ -182,6 +182,16 @@ impl Family for DeepSeek {
             return false;
         }
         use WeightFormat::*;
+        if self.id == "deepseek_v4" {
+            // serve-dsv4: native MXFP4 routed experts on the Sparks, 128x128
+            // block-FP8 projections and BF16/F32 tensors on the RTX, integer
+            // hash-routing tables.
+            return match component {
+                Component::RoutedExpert => matches!(format, Mxfp4 { group: 32 }),
+                Component::Speculator | Component::SpeculatorExpert => false,
+                _ => matches!(format, Fp8Block { block: (128, 128) } | Bf16 | F32 | Int),
+            };
+        }
         match component {
             // Native MXFP4, EXL3 K2-K4 packages and ModelOpt W4A4 NVFP4.
             Component::RoutedExpert | Component::SpeculatorExpert => matches!(
@@ -194,7 +204,20 @@ impl Family for DeepSeek {
         }
     }
 
+    fn optional(&self, component: Component) -> bool {
+        self.id == "deepseek_v4" && matches!(component, Component::Speculator | Component::SpeculatorExpert)
+    }
+
     fn component_hint(&self, component: Component) -> Option<Hint> {
+        if self.id == "deepseek_v4" && component == Component::RoutedExpert {
+            return Some(Hint {
+                what: "DeepSeek V4 routed experts in EXL3 or NVFP4 (V4 Pro EXL3 K2)".into(),
+                how: "serve-dsv4 stages native MXFP4 experts through the geometry-aware Spark path \
+                      (ExpertGeometry, read_expert_catalog). Extend the V4.1 EXL3 worker \
+                      (daemon v41_experts/exl3, loader v41_exl3*) to take the process geometry and export \
+                      the EXL3 kernels for hidden 7168 / intermediate 3072.".into(),
+            });
+        }
         if self.runtime == RuntimeStatus::Serving {
             return None;
         }

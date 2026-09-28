@@ -46,6 +46,8 @@ pub enum Status {
     MissingKernel,
     /// The family's execution path is not written yet.
     Planned,
+    /// Optional for serving and not executed by this build (e.g. a speculator).
+    Unused,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -82,7 +84,7 @@ impl PlanReport {
         self.family.is_some()
             && self.missing_shards.is_empty()
             && self.unclassified.is_empty()
-            && self.components.iter().all(|c| c.status == Status::Ready)
+            && self.components.iter().all(|c| matches!(c.status, Status::Ready | Status::Unused))
             && self.fits
     }
 }
@@ -167,9 +169,10 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport> {
         let status = match family.runtime() {
             RuntimeStatus::Planned => Status::Planned,
             RuntimeStatus::Serving if all_ready => Status::Ready,
+            RuntimeStatus::Serving if family.optional(*component) => Status::Unused,
             RuntimeStatus::Serving => Status::MissingKernel,
         };
-        if status != Status::Ready && hinted.insert(*component) {
+        if !matches!(status, Status::Ready | Status::Unused) && hinted.insert(*component) {
             if let Some(hint) = family.component_hint(*component) {
                 if !report.hints.iter().any(|h| h.what == hint.what) {
                     report.hints.push(hint);
@@ -317,6 +320,7 @@ pub fn render(report: &PlanReport) -> String {
                 Status::Ready => "ready",
                 Status::MissingKernel => "MISSING",
                 Status::Planned => "planned",
+                Status::Unused => "unused",
             };
             let _ = writeln!(
                 out,
