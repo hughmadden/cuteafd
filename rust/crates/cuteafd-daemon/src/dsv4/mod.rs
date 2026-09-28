@@ -1,5 +1,6 @@
 //! DeepSeek V4 (Flash / Pro) coordinator engine over the exported b12x programs.
 pub(crate) mod engine;
+pub(crate) mod local;
 pub(crate) mod metadata;
 pub(crate) mod pool;
 pub(crate) mod serve;
@@ -38,6 +39,13 @@ pub(crate) struct EngineArgs {
     /// Total tokens the compressed-cache pools hold across sequences.
     #[arg(long, default_value_t = 262_144)]
     pub pool_tokens: usize,
+    /// Routed-expert layers to keep on the coordinator GPU (from layer 0);
+    /// they fill free memory by default. 0 sends every layer to the Sparks.
+    #[arg(long)]
+    pub local_expert_layers: Option<usize>,
+    /// GiB kept free on the coordinator GPU for workspaces and headroom.
+    #[arg(long, default_value_t = 10)]
+    pub reserve_gib: usize,
 }
 
 #[derive(Debug, clap::Args)]
@@ -162,6 +170,14 @@ pub(crate) fn with_engine<T>(
         sms: args.sms,
         shape,
     })?;
+    let (free, _) = loaded.library.cuda_memory_info()?;
+    let budget = free.saturating_sub(args.reserve_gib << 30);
+    let started = Instant::now();
+    let local = local::LocalExperts::load(&loaded.library, &loaded.catalog,
+        args.local_expert_layers.unwrap_or(usize::MAX), engine.decode_rows.max(engine.prefill_rows), budget, stream)?;
+    tracing::info!(layers = local.as_ref().map_or(0, |l| l.layers()), elapsed_ms = started.elapsed().as_millis() as u64,
+        "DeepSeek V4 expert layers resident on the coordinator");
+    *engine.local.borrow_mut() = local;
     let peers = args.peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
     let executors: Vec<u64> = (1..=peers.len() as u64).collect();
     let mut transport = V41Tp4Roce::new_ranks(&peers, &executors, 4096,

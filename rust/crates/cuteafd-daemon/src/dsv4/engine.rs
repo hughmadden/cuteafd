@@ -46,7 +46,12 @@ pub(crate) struct Engine<'a> {
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     pub profile: RefCell<Profile>,
     graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
+    /// Expert layers resident on this GPU (they skip the Spark exchange).
+    pub local: RefCell<Option<super::local::LocalExperts<'a>>>,
 }
+
+/// `exchange` result for a layer whose experts ran on this GPU.
+const LOCAL_EXPERTS: usize = usize::MAX;
 
 /// Everything a captured decode segment bakes in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -272,6 +277,7 @@ impl<'a> Engine<'a> {
             decode_workspace: RefCell::new(None),
             profile: RefCell::new(Profile::default()),
             graphs: RefCell::new(std::collections::HashMap::new()),
+            local: RefCell::new(None),
         })
     }
 
@@ -520,6 +526,13 @@ impl<'a> Engine<'a> {
     /// The layer's routed partials + shared expert, reduced, then mHC post
     /// into stream a.
     fn post(&self, w: &Workspace<'_>, ranks: usize, rows: Dsv4Scalar, layer: usize) -> Result<()> {
+        if ranks == LOCAL_EXPERTS {
+            let output = self.local.borrow().as_ref().context("local experts")?.output.buffer.ptr;
+            return self.run("mhc_post", &[
+                ("x", output), ("residual", w.stream_b.buffer.ptr), ("prev_post", w.post.buffer.ptr),
+                ("prev_comb", w.comb.buffer.ptr), ("out", w.stream_a.buffer.ptr),
+            ], &[rows]);
+        }
         let Dsv4Scalar::I32(count) = rows else { unreachable!() };
         let reducer = self.library.v41_compact_reducer()?;
         let mut pointers = [std::ptr::null::<u16>(); 6];
@@ -741,6 +754,19 @@ impl<'a> Engine<'a> {
                     gate_weight: scores[e] / total * self.cfg.route_scale as f32,
                 });
             }
+        }
+        let local_layers = self.local.borrow().as_ref().map_or(0, |l| l.layers());
+        if layer < local_layers {
+            let ids: Vec<u32> = routes.iter().map(|r| r.expert_id).collect();
+            let weights: Vec<f32> = routes.iter().map(|r| r.gate_weight).collect();
+            self.profile.borrow_mut().add(Phase::Routing, timer);
+            let timer = Instant::now();
+            let mut local = self.local.borrow_mut();
+            let local = local.as_mut().context("local experts")?;
+            // SAFETY: wire and shared rows are complete in stream order.
+            unsafe { local.run(layer, t, w.wire.buffer.ptr, &ids, &weights, w.shared.buffer.ptr, self.stream)? };
+            self.profile.borrow_mut().add(Phase::Experts, timer);
+            return Ok(LOCAL_EXPERTS);
         }
         let mut request = ExpertProtocolV2Request::new(
             layer as u64 + 1, 17, layer as u32, h as u32, ExpertV2Dtype::Fp8E4m3Ue8m0K32,
