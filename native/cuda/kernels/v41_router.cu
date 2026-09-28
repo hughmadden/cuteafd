@@ -189,7 +189,8 @@ extern "C" int32_t cuteafd_v41_router(const uint16_t* hidden,const uint16_t* wei
 extern "C" int32_t cuteafd_v41_router_select_logits(float* scores,const float* bias,
     const float* bias_vl,const uint8_t* image_mask,uint32_t* ids,float* routing,
     int32_t rows,int32_t experts,void* stream) {
-  if(rows<1 || rows>4096 || (experts!=128 && experts!=384)) return cudaErrorInvalidValue;
+  // 128: V4.1 dSpark (top-3); 256: DeepSeek V4 Flash; 384: V4.1 and V4 Pro.
+  if(rows<1 || rows>4096 || (experts!=128 && experts!=256 && experts!=384)) return cudaErrorInvalidValue;
   const int topk=experts==128?3:6;
   const void* p[]={bias,bias_vl,image_mask,scores,ids,routing};
   const uint64_t n[]={uint64_t(experts)*4,image_mask?uint64_t(experts)*4:0,
