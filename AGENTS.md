@@ -63,7 +63,9 @@ go in commit messages as short before → after tables with conditions.
   and can crawl while the WAN is busy; it is slow, not stuck.
 - Iterate with `./wip.sh --slot S` then `./run.sh --wip S --restart`; A/B two
   checkouts with `scripts/bench-ab.py`. `cuteafd plan MODEL` (any HF id or
-  snapshot dir) says what a checkpoint needs before any kernel work.
+  snapshot dir) says what a checkpoint needs before any kernel work;
+  `cuteafd fabric` shows ports, link/PCIe rates, subnets and the rail plan
+  (services log the same line at startup).
 
 ## Engineering rules
 

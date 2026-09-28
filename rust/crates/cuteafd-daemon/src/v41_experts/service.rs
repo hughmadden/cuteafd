@@ -10,6 +10,10 @@ use cuteafd_transport::v41_expert::{V41BackboneRequest, V41SparkTopology};
 use std::{path::PathBuf, sync::mpsc, thread};
 
 pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> {
+    match cuteafd_transport::fabric::discover() {
+        Ok(report) => tracing::info!(target: "cuteafd::fabric", rails = report.rails.use_rails, "{}", report.summary()),
+        Err(error) => tracing::warn!(target: "cuteafd::fabric", "fabric discovery failed: {error:#}"),
+    }
     let topology = crate::v41_spark_topology::resolve(
         args.spark_tp,
         args.spark_ep,

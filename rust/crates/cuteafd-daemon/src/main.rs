@@ -61,6 +61,29 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Doctor(args) => run_doctor(args),
         Commands::Plan(args) => run_plan(args),
+        Commands::Fabric(args) => {
+            let report = cuteafd_transport::fabric::discover()?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                for port in &report.ports {
+                    println!(
+                        "{} port {}: {} {} {:.0} Gb/s, PCIe {}, netdev {}, RoCE v2 {:?}, subnets {:?}",
+                        port.device,
+                        port.port,
+                        if port.active { "active" } else { "down" },
+                        port.link_layer,
+                        port.link_gbps,
+                        port.pci.as_ref().map_or("?".into(), |pci| format!("{} GT/s x{} ({:.0} Gb/s)", pci.gts, pci.width, pci.gbps())),
+                        port.netdev.as_deref().unwrap_or("-"),
+                        port.roce_v2.iter().map(|(_, address)| address).collect::<Vec<_>>(),
+                        port.subnets,
+                    );
+                }
+                println!("{}", report.summary());
+            }
+            Ok(())
+        }
         Commands::ExpertdNative(args) => v41_experts::service::run(args).await,
         Commands::ServeNative(args) => v41_native_serve::run(args).await,
         Commands::BenchRdma(args) => run_bench_rdma(args),

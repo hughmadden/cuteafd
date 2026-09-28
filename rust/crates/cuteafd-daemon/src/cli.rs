@@ -16,6 +16,8 @@ pub(crate) enum Commands {
     Doctor(DoctorArgs),
     /// Describe a checkpoint: family, placement, formats, and what this build lacks.
     Plan(PlanArgs),
+    /// Report RDMA ports, link and PCIe rates, subnets and the rail plan.
+    Fabric(FabricArgs),
     /// Serve official V4.1 native TP4 experts over RoCE.
     ExpertdNative(NativeExpertDaemonArgs),
     /// Serve the official V4.1 target text path.
@@ -23,6 +25,12 @@ pub(crate) enum Commands {
     BenchRdma(BenchRdmaArgs),
     BenchRdmaRing(BenchRdmaRingArgs),
     TransportCapabilities(TransportCapabilitiesArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct FabricArgs {
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, Args)]

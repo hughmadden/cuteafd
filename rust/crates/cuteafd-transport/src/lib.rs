@@ -4,6 +4,7 @@ use std::io::ErrorKind;
 use std::time::Duration;
 
 mod capabilities;
+pub mod fabric;
 mod debug_json;
 pub mod protocol_v2;
 pub mod v41_expert;
