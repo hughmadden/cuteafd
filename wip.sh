@@ -270,6 +270,8 @@ ensure_local_container() {
     -e NVIDIA_VISIBLE_DEVICES="$RELEASE_COORDINATOR_GPU_UUID"
   )
   [[ ! -e /dev/infiniband ]] || args+=(--device=/dev/infiniband)
+  # sparknest keeps hub/ as a symlink into its mount; expose it at the same path.
+  [[ ! -d /mnt/sparknest ]] || args+=(-v /mnt/sparknest:/mnt/sparknest:ro)
   docker "${args[@]}" "$COORDINATOR_DOCKER_DEV" sleep infinity >/dev/null
   docker exec "$coordinator_container" mkdir -p /wip/build /wip/output /wip/slots /wip/incoming /wip/run /wip/cache
 }
@@ -301,6 +303,7 @@ args=(
   -e HF_HOME="$hf_home"
 )
 [ ! -e /dev/infiniband ] || args+=(--device=/dev/infiniband)
+[ ! -d /mnt/sparknest ] || args+=(-v /mnt/sparknest:/mnt/sparknest:ro)
 docker "${args[@]}" "$image" sleep infinity >/dev/null
 docker exec "$container" mkdir -p /wip/build /wip/output /wip/slots /wip/incoming /wip/run /wip/cache
 REMOTE
