@@ -1,7 +1,7 @@
 //! Inspect one compressed layer plan; optionally read every bounded staging job.
 use anyhow::{Context, Result};
 use cuteafd_loader::{
-    read_official_v41_catalog, V41Exl3Layer, V41Exl3Partition, OFFICIAL_V41_MODEL_ID,
+    read_expert_catalog, V41Exl3Layer, V41Exl3Partition,
 };
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -23,7 +23,7 @@ fn main() -> Result<()> {
     } else {
         V41Exl3Partition::Disjoint
     };
-    let catalog = read_official_v41_catalog(OFFICIAL_V41_MODEL_ID, Path::new(&args[1]))?;
+    let catalog = read_expert_catalog(Path::new(&args[1]))?;
     let layer = if let Some(stage) = args[2].strip_prefix("mtp:") {
         V41Exl3Layer::Dspark(stage.parse()?)
     } else {

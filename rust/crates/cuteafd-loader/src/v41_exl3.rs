@@ -145,10 +145,51 @@ pub enum V41Exl3MtpExperts {
     Source,
 }
 
+/// How a checkpoint names its routed EXL3 projections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V41Exl3Naming {
+    /// DeepSeek V4.1: `layers.{L}.ffn.experts.{E}.w1|w3|w2` and `mtp.{S}.ffn.experts...`.
+    CheckpointNative,
+    /// Hugging Face module names (DeepSeek V4 EXL3 publications):
+    /// `model.layers.{L}.mlp.experts.{E}.gate_proj|up_proj|down_proj` and
+    /// `mtp.{S}.mlp.experts...`.
+    HfMlp,
+}
+
+impl V41Exl3Naming {
+    /// The projection name (without the `.trellis`/`.suh`/... suffix).
+    pub fn projection(self, draft: bool, layer: usize, expert: usize, kind: V41Exl3ProjectionKind) -> String {
+        match self {
+            Self::CheckpointNative => {
+                let stem = match kind {
+                    V41Exl3ProjectionKind::Gate => "w1",
+                    V41Exl3ProjectionKind::Up => "w3",
+                    V41Exl3ProjectionKind::Down => "w2",
+                };
+                let prefix = if draft { "mtp" } else { "layers" };
+                format!("{prefix}.{layer}.ffn.experts.{expert}.{stem}")
+            }
+            Self::HfMlp => {
+                let stem = match kind {
+                    V41Exl3ProjectionKind::Gate => "gate_proj",
+                    V41Exl3ProjectionKind::Up => "up_proj",
+                    V41Exl3ProjectionKind::Down => "down_proj",
+                };
+                let prefix = if draft { "mtp" } else { "model.layers" };
+                format!("{prefix}.{layer}.mlp.experts.{expert}.{stem}")
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct V41Exl3Manifest {
-    /// Validated original non-routed model geometry and quantization contract.
-    pub config: OfficialV41Config,
+    /// Validated original non-routed model geometry and quantization contract;
+    /// `None` for other families, whose catalogs carry only routed experts.
+    pub config: Option<OfficialV41Config>,
+    /// Routed-expert extents of every target and draft layer.
+    pub experts: crate::RoutedExpertShape,
+    pub naming: V41Exl3Naming,
     pub projections: BTreeMap<String, V41Exl3Projection>,
     /// One checkpoint-wide family, shared by all target and draft layers.
     pub(crate) decoder_tiers: Vec<usize>,
@@ -158,6 +199,23 @@ pub struct V41Exl3Manifest {
 }
 
 impl V41Exl3Manifest {
+    fn v41(
+        config: OfficialV41Config,
+        projections: BTreeMap<String, V41Exl3Projection>,
+        ple_quantization: Option<Value>,
+        mtp_experts: V41Exl3MtpExperts,
+    ) -> Result<Self> {
+        Ok(Self {
+            experts: crate::RoutedExpertShape::of_v41(&config),
+            config: Some(config),
+            naming: V41Exl3Naming::CheckpointNative,
+            decoder_tiers: decoder_family(&projections)?,
+            projections,
+            ple_quantization,
+            mtp_experts,
+        })
+    }
+
     pub fn decoder_tiers(&self) -> &[usize] {
         &self.decoder_tiers
     }
@@ -332,12 +390,139 @@ fn parse_raw_publication(mut config: Value) -> Result<V41Exl3Manifest> {
             }
         }
     }
+    V41Exl3Manifest::v41(validated, projections, None, V41Exl3MtpExperts::Source)
+}
+
+/// The only MCG multiplier the trellis decoders implement.
+pub(crate) const EXL3_MCG_MULTIPLIER: u64 = 0xcbac_1fed;
+
+/// DeepSeek V4 EXL3 publications (V4 Pro EXL3 K2): `config.json` carries a
+/// compact exllamav3 block, `quantize_config.json` the full per-projection
+/// storage map, and routed experts keep Hugging Face module names. Only routed
+/// experts (backbone and dSpark draft) are EXL3; every other tensor keeps its
+/// native format and stays with the coordinator.
+pub(crate) fn read_deepseek_v4_exl3_manifest(
+    snapshot: &Path,
+    backbone: crate::RoutedExpertShape,
+) -> Result<V41Exl3Manifest> {
+    let config = read_json(&snapshot.join("config.json"), 1024 * 1024)?;
+    let manifest = read_json(&snapshot.join("quantize_config.json"), MAX_MANIFEST_BYTES)
+        .context("DeepSeek V4 EXL3 publications carry their storage map in quantize_config.json")?;
+    parse_deepseek_v4_manifest(&config, &manifest, backbone)
+}
+
+fn parse_deepseek_v4_manifest(
+    config: &Value,
+    manifest: &Value,
+    backbone: crate::RoutedExpertShape,
+) -> Result<V41Exl3Manifest> {
+    for field in ["quant_method", "method", "format", "checkpoint_format"] {
+        ensure!(
+            manifest.get(field).and_then(Value::as_str) == Some("exl3"),
+            "EXL3 manifest requires {field}=exl3"
+        );
+    }
+    // `out_scales` only decides whether the quantizer folded output-channel
+    // scales into `svh`; the kernels always apply `svh` per channel.
+    ensure!(
+        manifest["codebook"] == "mcg"
+            && matches!(manifest["out_scales"].as_str(), Some("never" | "auto"))
+            && manifest["group_size"] == -1
+            && manifest["desc_act"] == false
+            && manifest["pack_dtype"] == "int32"
+            && manifest.get("lm_head").is_none_or(|v| v == false),
+        "unsupported EXL3 storage contract"
+    );
+    ensure!(
+        manifest["bits"]
+            .as_f64()
+            .is_some_and(|v| v.fract() == 0.0 && (2.0..=5.0).contains(&v)),
+        "EXL3 base bits must be an integer in 2..5"
+    );
+    let object = manifest.as_object().context("EXL3 manifest must be an object")?;
+    for key in object.keys() {
+        ensure!(
+            matches!(
+                key.as_str(),
+                "bits" | "checkpoint_format" | "codebook" | "desc_act" | "format" | "group_size"
+                    | "lm_head" | "meta" | "method" | "module_include" | "out_scales"
+                    | "pack_dtype" | "quant_method" | "tensor_storage"
+            ),
+            "EXL3 manifest has unexpected key {key}"
+        );
+    }
+    let compact = config["quantization_config"]
+        .as_object()
+        .context("missing compact EXL3 config")?;
+    ensure!(
+        compact.get("quant_method") == Some(&Value::from("exl3")),
+        "config must declare EXL3 quantization"
+    );
+    for (key, value) in compact {
+        ensure!(
+            manifest.get(key) == Some(value),
+            "compact/full EXL3 metadata disagree at {key}"
+        );
+    }
+    let storage = manifest["tensor_storage"]
+        .as_object()
+        .context("missing EXL3 tensor_storage")?;
+    let naming = V41Exl3Naming::HfMlp;
+    let draft_stages = storage
+        .keys()
+        .filter_map(|name| name.strip_prefix("mtp.")?.split('.').next()?.parse::<usize>().ok())
+        .max()
+        .map_or(0, |stage| stage + 1);
+    let draft_experts = storage
+        .keys()
+        .filter(|name| name.starts_with("mtp.0.mlp.experts.") && name.ends_with(".gate_proj"))
+        .count();
+    let (hidden, intermediate) = (backbone.hidden, backbone.intermediate);
+    let mut projections = BTreeMap::new();
+    for (draft, layers, experts) in [
+        (false, backbone.layers, backbone.experts),
+        (true, draft_stages, draft_experts),
+    ] {
+        for layer in 0..layers {
+            for expert in 0..experts {
+                for kind in [
+                    V41Exl3ProjectionKind::Gate,
+                    V41Exl3ProjectionKind::Up,
+                    V41Exl3ProjectionKind::Down,
+                ] {
+                    let name = naming.projection(draft, layer, expert, kind);
+                    let value = storage
+                        .get(&name)
+                        .with_context(|| format!("missing projection {name}"))?;
+                    if let Some(multiplier) = value.get("mcg_multiplier") {
+                        ensure!(
+                            multiplier.as_u64() == Some(EXL3_MCG_MULTIPLIER),
+                            "projection {name} uses an unsupported MCG multiplier {multiplier}"
+                        );
+                    }
+                    let (input, output) = if kind == V41Exl3ProjectionKind::Down {
+                        (intermediate, hidden)
+                    } else {
+                        (hidden, intermediate)
+                    };
+                    let projection = parse_projection(&name, kind, input, output, value)?;
+                    projections.insert(name, projection);
+                }
+            }
+        }
+    }
+    ensure!(
+        storage.len() == projections.len(),
+        "EXL3 manifest includes non-routed or unexpected projections"
+    );
     Ok(V41Exl3Manifest {
+        config: None,
+        experts: crate::RoutedExpertShape { draft_stages, draft_experts, ..backbone },
+        naming,
         decoder_tiers: decoder_family(&projections)?,
-        config: validated,
         projections,
         ple_quantization: None,
-        mtp_experts: V41Exl3MtpExperts::Source,
+        mtp_experts: V41Exl3MtpExperts::Exl3,
     })
 }
 
@@ -428,13 +613,7 @@ fn parse_manifest(mut config: Value, manifest: &Value) -> Result<V41Exl3Manifest
         storage.len() == projections.len(),
         "EXL3 manifest includes non-routed or unexpected projections"
     );
-    Ok(V41Exl3Manifest {
-        config: validated,
-        decoder_tiers: decoder_family(&projections)?,
-        projections,
-        ple_quantization,
-        mtp_experts: V41Exl3MtpExperts::Exl3,
-    })
+    V41Exl3Manifest::v41(validated, projections, ple_quantization, V41Exl3MtpExperts::Exl3)
 }
 
 fn parse_projection(
@@ -533,9 +712,138 @@ mod tests {
         assert_eq!(down.trellis_shape(), [144, 320, 32]);
         assert!(manifest
             .config
+            .as_ref()
+            .unwrap()
             .quantization()
             .quant_method
             .eq_ignore_ascii_case("fp8"));
+    }
+
+    /// A miniature DeepSeek V4 EXL3 publication: HF-named routed experts, one
+    /// draft stage, `out_scales=auto` and float `bits`, as V4 Pro EXL3 K2 ships.
+    fn deepseek_v4_publication() -> (Value, Value, crate::RoutedExpertShape) {
+        let shape = crate::RoutedExpertShape {
+            layers: 2,
+            experts: 3,
+            topk: 2,
+            hidden: 256,
+            intermediate: 384,
+            draft_stages: 0,
+            draft_experts: 0,
+        };
+        let compact = serde_json::json!({
+            "bits": 2.0, "checkpoint_format": "exl3", "codebook": "mcg", "desc_act": false,
+            "format": "exl3", "group_size": -1, "lm_head": false, "meta": {"fallback": null},
+            "method": "exl3", "out_scales": "auto", "pack_dtype": "int32", "quant_method": "exl3",
+            "module_include": ["^model\\.layers\\.\\d+\\.mlp\\.experts\\.\\d+\\.(?:gate_proj|up_proj|down_proj)$"],
+        });
+        let mut storage = serde_json::Map::new();
+        for (draft, layers) in [(false, 2), (true, 1)] {
+            for layer in 0..layers {
+                for expert in 0..3 {
+                    for kind in [V41Exl3ProjectionKind::Gate, V41Exl3ProjectionKind::Up, V41Exl3ProjectionKind::Down] {
+                        let name = V41Exl3Naming::HfMlp.projection(draft, layer, expert, kind);
+                        let (input, output) = if kind == V41Exl3ProjectionKind::Down { (384, 256) } else { (256, 384) };
+                        let tensors = serde_json::json!({
+                            format!("{name}.trellis"): {"shape": [input / 16, output / 16, 32], "torch_dtype": "int16"},
+                            format!("{name}.suh"): {"shape": [input], "torch_dtype": "float16"},
+                            format!("{name}.svh"): {"shape": [output], "torch_dtype": "float16"},
+                            format!("{name}.mcg"): {"shape": [], "torch_dtype": "int32"},
+                        });
+                        storage.insert(name, serde_json::json!({
+                            "bits_per_weight": 2, "mcg_multiplier": 3417055213u64,
+                            "quant_format": "exl3", "stored_tensors": tensors,
+                        }));
+                    }
+                }
+            }
+        }
+        let mut manifest = compact.clone();
+        manifest["tensor_storage"] = Value::Object(storage);
+        (serde_json::json!({"quantization_config": compact}), manifest, shape)
+    }
+
+    #[test]
+    fn deepseek_v4_publication_reads_hf_named_experts_and_drafts() {
+        let (config, manifest, shape) = deepseek_v4_publication();
+        let parsed = parse_deepseek_v4_manifest(&config, &manifest, shape).unwrap();
+        assert!(parsed.config.is_none());
+        assert_eq!(parsed.naming, V41Exl3Naming::HfMlp);
+        assert_eq!(parsed.experts.draft_stages, 1);
+        assert_eq!(parsed.experts.draft_experts, 3);
+        assert_eq!(parsed.projections.len(), (2 + 1) * 3 * 3);
+        assert_eq!(parsed.decoder_tiers(), &[2, 3]);
+        assert!(!parsed.mtp_experts_are_source());
+        let down = &parsed.projections["model.layers.1.mlp.experts.2.down_proj"];
+        assert_eq!(down.trellis_shape(), [24, 16, 32]);
+        assert_eq!(down.intermediate_partition(2, 1).unwrap(), 256..384);
+        let plan = parsed
+            .residency(crate::V41Exl3Layer::Backbone(1), 2, 0)
+            .unwrap();
+        assert_eq!((plan.experts, plan.intermediate, plan.intermediate_start), (3, 256, 0));
+        assert_eq!(plan.loads[0].tensor, "model.layers.1.mlp.experts.0.gate_proj.trellis");
+        assert!(parsed.residency(crate::V41Exl3Layer::Backbone(2), 2, 0).is_err());
+        let draft = parsed.residency(crate::V41Exl3Layer::Dspark(0), 1, 0).unwrap();
+        assert_eq!(draft.loads[0].tensor, "mtp.0.mlp.experts.0.gate_proj.trellis");
+    }
+
+    #[test]
+    fn deepseek_v4_publication_rejects_contract_drift() {
+        let (config, manifest, shape) = deepseek_v4_publication();
+        for (pointer, value, expected) in [
+            ("/out_scales", serde_json::json!("always"), "storage contract"),
+            ("/bits", serde_json::json!(2.5), "integer"),
+            ("/surprise", serde_json::json!(1), "unexpected key"),
+            (
+                "/tensor_storage/model.layers.0.mlp.experts.0.up_proj/mcg_multiplier",
+                serde_json::json!(1),
+                "MCG multiplier",
+            ),
+        ] {
+            let mut manifest = manifest.clone();
+            match manifest.pointer_mut(pointer) {
+                Some(slot) => *slot = value,
+                None => {
+                    manifest[pointer.trim_start_matches('/')] = value;
+                }
+            }
+            let error = parse_deepseek_v4_manifest(&config, &manifest, shape).unwrap_err().to_string();
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+        let mut missing = manifest.clone();
+        missing["tensor_storage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("model.layers.1.mlp.experts.1.gate_proj");
+        assert!(parse_deepseek_v4_manifest(&config, &missing, shape).is_err());
+        let mut compact = config.clone();
+        compact["quantization_config"]["bits"] = serde_json::json!(3.0);
+        assert!(parse_deepseek_v4_manifest(&compact, &manifest, shape)
+            .unwrap_err()
+            .to_string()
+            .contains("disagree"));
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_DSV4_EXL3_SNAPSHOT pointing to a DeepSeek V4 EXL3 publication"]
+    fn deepseek_v4_publication_checkpoint_catalog() {
+        let path = std::env::var_os("CUTEAFD_DSV4_EXL3_SNAPSHOT").expect("CUTEAFD_DSV4_EXL3_SNAPSHOT");
+        let catalog = crate::read_expert_catalog(Path::new(&path)).unwrap();
+        let manifest = catalog.exl3().unwrap();
+        let shape = catalog.routed_experts();
+        assert_eq!(manifest.decoder_tiers(), &[2, 3]);
+        assert_eq!(
+            manifest.projections.len(),
+            3 * (shape.layers * shape.experts + shape.draft_stages * shape.draft_experts)
+        );
+        println!(
+            "{} projections, {} layers x {} experts + {} draft stages; geometry {:?}",
+            manifest.projections.len(),
+            shape.layers,
+            shape.experts,
+            shape.draft_stages,
+            shape.geometry().unwrap()
+        );
     }
 
     #[test]
