@@ -116,7 +116,7 @@ def write_bridge(output: Path, manifest: dict) -> None:
 def export(output: Path, intermediate: int, experts: int, capacity: int,
            bits: tuple[int, ...], routing: str, topk: int = 6, output_dtype: str = "bf16",
            blocks_per_sm: int | None = None, paired_boundary: str | None = None,
-           tile: tuple[int, ...] | None = None, hidden: int = 5120) -> dict:
+           tile: tuple[int, ...] | None = None, hidden: int = 5120, route_block: int = 8) -> dict:
     if paired_boundary not in (None, "first", "last"):
         raise ValueError("paired boundary must be first, last, or None")
     if paired_boundary is not None and (intermediate != 640 or len(bits) != 2 or topk != 6
@@ -129,6 +129,13 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     # geometry vocabulary: _projection_mixed_tile_config()/the compile path reject a
     # thread-count mismatch or a tile that does not fit the problem, so the pinned
     # planner stays the single authority on what a legal tile is.
+    # Packed routes are grouped into M blocks of route_block rows per expert; each
+    # block decodes its expert's Trellis tiles once, so larger blocks amortize the
+    # decode over more rows once many rows share an expert (large prefill).
+    if route_block not in (8, 16, 32, 64):
+        raise ValueError("EXL3 route block must be 8, 16, 32 or 64 rows")
+    if route_block != 8 and paired_boundary is not None:
+        raise ValueError("paired exports keep the qualified 8-row route block")
     if output_dtype not in ("bf16", "fp32"):
         raise ValueError("EXL3 output must be bf16 or fp32")
     # Disk-loaded B12x executors omit the compiler IR required by export_to_c.
@@ -160,7 +167,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         direct = routing == "direct"
     if direct and len(bits) != 2:
         raise ValueError("three/four-tier export requires packed routing")
-    block_m = 8
+    block_m = 8 if direct else route_block
     route_slots = capacity * topk if direct else route_pack_capacity(capacity * topk, block_m, experts, topk=topk)[1]
     route_blocks = route_slots if direct else (route_slots + block_m - 1) // block_m
     options = dict(size_m=capacity, hidden_size=hidden, intermediate_size=intermediate,
@@ -232,12 +239,15 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         "trellis_lut": {"file": "trellis_lut.bin", "bytes": len(lut_bytes),
             "sha256": hashlib.sha256(lut_bytes).hexdigest()},
         "native_execution_verified": False}
+    if block_m != 8:
+        # Recorded only when it differs, so 8-row manifests stay byte-identical.
+        manifest["route_block"] = block_m
     if paired_boundary is not None:
         manifest.update(paired_boundary=paired_boundary, descriptor_rows=4, native_info_version=3)
     write_bridge(output, manifest)
     if not direct:
         from export_b12x_v41_exl3_routes_aot import export as export_routes
-        route_manifest = export_routes(output / 'routes', capacity, experts, topk)
+        route_manifest = export_routes(output / 'routes', capacity, experts, topk, block_m)
         for name in ('packed_route_indices', 'block_expert_ids', 'packed_route_count', 'expert_offsets', 'expert_counts'):
             if route_manifest['buffers'][name]['bytes'] > layouts[name]['bytes']:
                 raise ValueError(f'mixed execution buffer {name} cannot hold route preparation')
@@ -263,12 +273,15 @@ def main() -> None:
     parser.add_argument("--output-dtype", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument("--blocks-per-sm", type=int, choices=(1, 2), help="Offline residency override; default uses B12x policy")
     parser.add_argument("--paired-boundary", choices=("first", "last"), help="Candidate TP4 ownership-aware layout")
+    parser.add_argument("--route-block", type=int, choices=(8, 16, 32, 64), default=8,
+                        help="Packed-route M block (rows per expert block); direct routes ignore it")
     parser.add_argument("--tile", help="Offline disjoint-layout tile override fc1_k,fc1_n,fc2_k,fc2_n "
                                        "(for example 64,256,64,256 or 128,128,128,128); default is the "
                                        "B12x per-capacity policy")
     args = parser.parse_args()
     export(args.output, args.intermediate, args.experts, args.capacity, tuple(args.bits), args.routing, args.topk, args.output_dtype, args.blocks_per_sm, args.paired_boundary,
-           tile=None if args.tile is None else tuple(args.tile.split(",")), hidden=args.hidden)
+           tile=None if args.tile is None else tuple(args.tile.split(",")), hidden=args.hidden,
+           route_block=args.route_block)
 
 
 if __name__ == "__main__":

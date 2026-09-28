@@ -329,6 +329,29 @@ class PackageProfileTests(unittest.TestCase):
                             package.verify(copy, 'fixture-revision')
                     self.assertIn(expected, str(caught.exception))
 
+    def test_route_blocks_widen_only_for_dsv4p_spark_prefill(self):
+        """V4.1 and the coordinator keep 8-row blocks; V4 Pro Spark prefill widens."""
+        for capacity in (1, 16, 80, 256, 1024, 4096):
+            self.assertEqual(package.route_block('v41', 'spark', capacity), 8)
+            self.assertEqual(package.route_block('dsv4p', 'coordinator', capacity), 8)
+            self.assertEqual(package.route_block('dsv4f', 'spark', capacity), 8)
+        self.assertEqual([package.route_block('dsv4p', 'spark', c) for c in (1, 16, 80, 256, 1024, 4096)],
+                         [8, 8, 8, 8, 16, 32])
+
+    def test_verify_cross_checks_the_recorded_route_block(self):
+        """A variant's route block must be the one its export compiled."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.build_fixture(root, 'spark', (2, 3))
+            manifest = json.loads((root / 'package/manifest.json').read_text())
+            self.assertFalse(any('route_block' in v for v in manifest['variants']),
+                             'V4.1 manifests keep their 8-row records unchanged')
+            manifest['variants'][0]['route_block'] = 32
+            (root / 'package/manifest.json').write_text(json.dumps(manifest))
+            with self.assertRaises(ValueError) as caught:
+                package.verify(root / 'package', 'fixture-revision')
+            self.assertIn('route block mismatch', str(caught.exception))
+
     def test_verify_rejects_malformed_tile_fields_even_when_a_planner_is_absent(self):
         """A recorded tile is data, so it has to be shaped like one.
 
