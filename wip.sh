@@ -424,6 +424,7 @@ build_coordinator() {
   docker exec \
     -e "CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}" \
     -e "CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}" \
+    -e "CUTEAFD_WIP_DSV4_AOT=${CUTEAFD_WIP_DSV4_AOT:-OFF}" \
     "$coordinator_container" \
     /wip/source/scripts/build-wip-artifacts.sh \
     /wip/source coordinator 120 /wip/build/coordinator /wip/output/coordinator
