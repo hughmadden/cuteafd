@@ -28,6 +28,8 @@ PAGE_ROWS = 64
 def programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """(stem suffix, op, params, compile thunk) for every exported program."""
     from b12x.integration.cuteafd import dsv4_compressor as comp
+    from b12x.integration.cuteafd import dsv4_ffn as ffn
+    from b12x.integration.cuteafd import weights
     from b12x.integration.cuteafd import dsv4_indexer as idx
     from b12x.integration.cuteafd import dsv4_mhc as mhc
     from b12x.integration.cuteafd import dsv4_producer as prod
@@ -42,6 +44,13 @@ def programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         ("mhc_pre", "mhc_pre", {}, lambda: mhc.compile_dsv4_mhc_pre_aot(g)),
         ("mhc_post", "mhc_post", {}, lambda: mhc.compile_dsv4_mhc_post_aot(g)),
         ("mhc_head", "mhc_head", {}, lambda: mhc.compile_dsv4_mhc_head_aot(g)),
+        ("router_scores", "router_scores", {}, lambda: ffn.compile_dsv4_router_scores_aot(g)),
+        ("expert_input_quant", "expert_input_quant", {},
+         lambda: ffn.compile_dsv4_expert_input_quant_aot(g)),
+        # Load-time weight preparation (the rest of every weight is raw bytes).
+        ("block_fp8_scale_prep", "block_fp8_scale_prep", {},
+         lambda: weights.compile_dsv4_block_fp8_scale_prep_aot()),
+        ("i64_to_i32", "i64_to_i32", {}, lambda: weights.compile_dsv4_i64_to_i32_aot()),
     ]
     for rows in (decode_rows, prefill_rows):
         out += [
@@ -53,6 +62,8 @@ def programs(g, decode_rows: int, prefill_rows: int, max_context: int):
              lambda r=rows: prod.compile_dsv4_index_producer_aot(g, max_rows=r)),
             (f"wo_m{rows}", "wo", {"max_rows": rows},
              lambda r=rows: wo.compile_dsv4_wo_projection_aot(g, max_rows=r)),
+            (f"shared_ffn_m{rows}", "shared_ffn", {"max_rows": rows},
+             lambda r=rows: ffn.compile_dsv4_shared_ffn_aot(g, max_rows=r)),
         ]
     for ratio in (4, 128):
         for mode in ("decode", "prefill", "continuation"):
