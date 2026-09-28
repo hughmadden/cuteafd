@@ -576,7 +576,7 @@ impl<'a> Engine<'a> {
                         self.local_experts(layer, t, w, &w.lanes[lane], cap)?;
                         post(unit, LOCAL_EXPERTS)?;
                     } else {
-                        let request = self.stage_request(layer, t, w)?;
+                        let request = self.stage_request(layer, t, w, ExpertV2SourceKind::Prefill)?;
                         let slot = if pipelined { lane } else { 0 };
                         let wave = transports[slot].dispatch_wave(&request)?;
                         // The shared expert runs on the GPU while the Sparks compute.
@@ -837,13 +837,13 @@ impl<'a> Engine<'a> {
     /// and plane uploads; returns the Spark rank count.
     #[allow(clippy::too_many_arguments)]
     /// One Spark request for `rows` wire rows with `topk` routes each.
-    fn expert_request(&self, layer: usize, rows: usize, routes: Vec<ExpertProtocolV2RouteEntry>, wire: Vec<u8>)
-        -> Result<ExpertProtocolV2Request> {
+    fn expert_request(&self, layer: usize, rows: usize, routes: Vec<ExpertProtocolV2RouteEntry>, wire: Vec<u8>,
+        kind: ExpertV2SourceKind) -> Result<ExpertProtocolV2Request> {
         let topk = self.cfg.n_activated_experts as u32;
         let mut request = ExpertProtocolV2Request::new(
             layer as u64 + 1, 17, layer as u32, self.cfg.dim as u32, ExpertV2Dtype::Fp8E4m3Ue8m0K32,
             (0..rows as u32).map(|row| ExpertProtocolV2RowDescriptor {
-                row_id: u64::from(row), source_kind: ExpertV2SourceKind::Prefill, source_request_id: 1,
+                row_id: u64::from(row), source_kind: kind, source_request_id: 1,
                 token_position: u64::from(row), route_offset: row * topk, route_count: topk,
             }).collect(),
             routes, wire,
@@ -860,7 +860,8 @@ impl<'a> Engine<'a> {
         let routes = (0..rows * topk).map(|i| ExpertProtocolV2RouteEntry {
             row_index: (i / topk) as u32, expert_id: (i % experts) as u32, gate_weight: 0.0,
         }).collect();
-        let request = self.expert_request(self.cfg.n_layers - 1, rows, routes, vec![0; rows * (h + h / 32)])?;
+        let request = self.expert_request(self.cfg.n_layers - 1, rows, routes, vec![0; rows * (h + h / 32)],
+            ExpertV2SourceKind::Prefill)?;
         runtime.block_on(async { transport.execute(&request, |_, _, _| Ok(())).await })
     }
 
@@ -895,7 +896,8 @@ impl<'a> Engine<'a> {
     }
 
     /// Waits for the unit's routes and wire rows and builds its Spark request.
-    fn stage_request(&self, layer: usize, t: usize, w: &Workspace<'_>) -> Result<ExpertProtocolV2Request> {
+    fn stage_request(&self, layer: usize, t: usize, w: &Workspace<'_>, kind: ExpertV2SourceKind)
+        -> Result<ExpertProtocolV2Request> {
         let (h, topk) = (self.cfg.dim, self.cfg.n_activated_experts);
         let timer = Instant::now();
         let (route_bytes, wire_bytes) = (t * topk * 4, t * (h + h / 32));
@@ -923,7 +925,7 @@ impl<'a> Engine<'a> {
             gate_weight: f32::from_bits(word(route_bytes, i)),
         }).collect();
         let wire = staged[2 * route_bytes..2 * route_bytes + wire_bytes].to_vec();
-        let request = self.expert_request(layer, t, routes, wire);
+        let request = self.expert_request(layer, t, routes, wire, kind);
         self.profile.borrow_mut().add(Phase::Routing, timer);
         request
     }
@@ -978,7 +980,8 @@ impl<'a> Engine<'a> {
             self.local_experts(layer, t, w, lane, cap)?;
             return Ok(LOCAL_EXPERTS);
         }
-        let request = self.stage_request(layer, t, w)?;
+        // Decode rows poll without the prefill spin quantum.
+        let request = self.stage_request(layer, t, w, ExpertV2SourceKind::Decode)?;
         let wave = transport.dispatch_wave(&request)?;
         // The shared expert runs on the GPU while the Sparks compute.
         self.shared_ffn(layer, w, lane, Dsv4Scalar::I32(t as i32), cap)?;

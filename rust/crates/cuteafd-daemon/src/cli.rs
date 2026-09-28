@@ -50,6 +50,9 @@ pub(crate) struct ExpertProbeArgs {
     pub(crate) capacity: u32,
     #[arg(long, default_value_t = 20260929)]
     pub(crate) seed: u64,
+    /// Time this many more round trips after the checked one (median, min).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) repeat: usize,
 }
 
 #[derive(Debug, Args)]

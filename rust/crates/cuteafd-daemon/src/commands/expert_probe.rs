@@ -112,6 +112,16 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
         })
         .await?;
     let remote = started.elapsed();
+    if args.repeat > 0 {
+        let mut times = Vec::with_capacity(args.repeat);
+        for _ in 0..args.repeat {
+            let started = Instant::now();
+            client.execute(&request, |_, _, _| Ok(())).await?;
+            times.push(started.elapsed().as_secs_f64() * 1e6);
+        }
+        times.sort_by(f64::total_cmp);
+        println!("round trip over {} repeats: median {:.0} us, min {:.0} us", args.repeat, times[times.len() / 2], times[0]);
+    }
 
     let started = Instant::now();
     let exl3 = catalog.exl3().is_some();
