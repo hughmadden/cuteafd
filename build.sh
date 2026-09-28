@@ -512,7 +512,8 @@ release_ssh "$seed_host" bash -s -- \
   "$remote_dir" "$SPARK_EXPERT_DOCKER_DEV" "$SPARK_EXPERT_DOCKER_INFERENCE" \
   "$engine_commit" "$sparkinfer_commit" "$release_version" \
   "$EXL3_PAIRED_TP4" "${source_manifest_sha256:-__legacy__}" "$(r="${spark_tp_roles//;/,}"; echo "${r:-__legacy__}")" \
-  "${release_build_root:-__legacy__}" <<'REMOTE'
+  "${release_build_root:-__legacy__}" \
+  "$(f="${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}"; f="${f//;/,}"; echo "${f:-__legacy__}")" <<'REMOTE'
 set -euo pipefail
 remote_dir="$1"
 dev_image="$2"
@@ -532,6 +533,10 @@ spark_tp_roles="${9-__legacy__}"
 # The relocated build root is optional and travels last, for the same reason.
 # It is already created and filesystem-guarded by the caller, on this host.
 release_build_root="${10-__legacy__}"
+# Extra routed-expert kernel families (FAMILY:ROLE), comma-encoded like the roles.
+expert_families="${11-__legacy__}"
+[[ "$expert_families" != "__legacy__" ]] || expert_families=
+expert_families="${expert_families//,/;}"
 [[ "$source_manifest_sha256" != "__legacy__" ]] || source_manifest_sha256=
 [[ "$spark_tp_roles" != "__legacy__" ]] || spark_tp_roles=
 [[ "$release_build_root" != "__legacy__" ]] || release_build_root=
@@ -568,7 +573,7 @@ docker run --rm \
   --ulimit memlock=-1:-1 \
   -e "CUTEAFD_RELEASE_EXL3_PAIRED_TP4=$exl3_paired_tp4" \
   -e "CUTEAFD_RELEASE_SPARK_TP_ROLES=$spark_tp_roles" \
-  -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}" \
+  -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=$expert_families" \
   ${release_build_root_args[@]+"${release_build_root_args[@]}"} \
   -v "$remote_dir:/source:ro" \
   -v "$remote_dir/.cuteafd-release-image:/output" \
