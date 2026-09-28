@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import shlex
 import statistics
 import subprocess
 import sys
@@ -47,7 +48,8 @@ def session(arm: str, path: Path, arms: dict[str, Path], rtx: int, out: Path, ar
     log = out / "session.log"
     stop_all(arms, log)
     started = time.monotonic()
-    run(["./run.sh", "--rtx-gpus", str(rtx), "--restart", *args.run_arg], cwd=path, log=log, timeout=1800)
+    extra = [*args.run_arg, *[w for a in args.arm_arg if a.split("=", 1)[0] == arm for w in shlex.split(a.split("=", 1)[1])]]
+    run(["./run.sh", "--rtx-gpus", str(rtx), "--restart", *extra], cwd=path, log=log, timeout=1800)
     ready_s = time.monotonic() - started
     py = str(REPO / ".venv/bin/python")
     decode = [py, str(REPO / "scripts/bench-ds41-release-decode.py"), "--base-url", args.base_url,
@@ -96,6 +98,8 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--tokenizer", default=TOKENIZER_DEFAULT)
     parser.add_argument("--run-arg", action="append", default=[], help="extra run.sh argument (repeatable)")
+    parser.add_argument("--arm-arg", action="append", default=[],
+                        help="NAME=ARG: run.sh argument for one arm only, shell-split, e.g. 'prune=--config FILE' (repeatable)")
     args = parser.parse_args()
     arms = dict(item.split("=", 1) for item in args.arm)
     arms = {name: Path(path).resolve() for name, path in arms.items()}
