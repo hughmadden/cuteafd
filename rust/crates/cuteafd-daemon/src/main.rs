@@ -42,6 +42,7 @@ use cli::{Cli, Commands};
 use commands::bench_rdma::run_bench_rdma;
 use commands::bench_rdma_ring::run_bench_rdma_ring;
 use commands::doctor::run_doctor;
+use commands::plan::run_plan;
 use commands::transport_capabilities::run_transport_capabilities;
 
 #[derive(Debug, Serialize)]
@@ -59,6 +60,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Doctor(args) => run_doctor(args),
+        Commands::Plan(args) => run_plan(args),
         Commands::ExpertdNative(args) => v41_experts::service::run(args).await,
         Commands::ServeNative(args) => v41_native_serve::run(args).await,
         Commands::BenchRdma(args) => run_bench_rdma(args),

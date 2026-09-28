@@ -1,0 +1,54 @@
+//! Family registry: detection, spec derivation and tensor classification.
+use anyhow::Result;
+
+use super::checkpoint::Checkpoint;
+use super::format::WeightFormat;
+use super::spec::{Component, ModelSpec, TensorRole};
+
+/// Where a family's implementation stands in this build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeStatus {
+    /// Serves end to end.
+    Serving,
+    /// Recognized and planned; the execution path is not written yet.
+    Planned,
+}
+
+/// Guidance a code agent needs to make one requirement work.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Hint {
+    pub what: String,
+    pub how: String,
+}
+
+pub trait Family: Sync {
+    fn id(&self) -> &'static str;
+    fn detect(&self, checkpoint: &Checkpoint) -> bool;
+    fn runtime(&self) -> RuntimeStatus;
+    fn spec(&self, checkpoint: &Checkpoint) -> Result<ModelSpec>;
+    fn classify(&self, spec: &ModelSpec, name: &str) -> Option<TensorRole>;
+    /// Whether this build executes `component` stored as `format`.
+    fn executes(&self, _component: Component, _format: &WeightFormat) -> bool {
+        false
+    }
+    /// Implementation notes for components this build cannot execute yet.
+    fn component_hint(&self, component: Component) -> Option<Hint>;
+}
+
+static REGISTRY: [&dyn Family; 6] = [
+    &super::families::deepseek::DEEPSEEK_V41,
+    &super::families::deepseek::DEEPSEEK_V4,
+    &super::families::glm::GLM_DSA,
+    &super::families::glm::GLM_NEXT,
+    &super::families::mimo::MIMO_V2,
+    &super::families::qwen::QWEN4_EXP,
+];
+
+pub fn registry() -> &'static [&'static dyn Family] {
+    &REGISTRY
+}
+
+pub fn detect(checkpoint: &Checkpoint) -> Option<&'static dyn Family> {
+    registry().iter().copied().find(|family| family.detect(checkpoint))
+}

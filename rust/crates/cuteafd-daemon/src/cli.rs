@@ -14,6 +14,8 @@ pub(crate) struct Cli {
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
     Doctor(DoctorArgs),
+    /// Describe a checkpoint: family, placement, formats, and what this build lacks.
+    Plan(PlanArgs),
     /// Serve official V4.1 native TP4 experts over RoCE.
     ExpertdNative(NativeExpertDaemonArgs),
     /// Serve the official V4.1 target text path.
@@ -21,6 +23,27 @@ pub(crate) enum Commands {
     BenchRdma(BenchRdmaArgs),
     BenchRdmaRing(BenchRdmaRingArgs),
     TransportCapabilities(TransportCapabilitiesArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct PlanArgs {
+    /// Hugging Face model id (resolved under HF_HOME) or a snapshot directory.
+    pub(crate) model: String,
+    #[arg(long)]
+    pub(crate) revision: Option<String>,
+    #[arg(long)]
+    pub(crate) hf_home: Option<PathBuf>,
+    /// Spark ranks sharing the routed experts.
+    #[arg(long, default_value_t = 4)]
+    pub(crate) spark_ranks: usize,
+    /// Routed-expert weight budget per Spark rank, GiB.
+    #[arg(long, default_value_t = 100.0)]
+    pub(crate) spark_budget_gib: f64,
+    #[arg(long, default_value_t = false)]
+    pub(crate) json: bool,
+    /// Exit non-zero unless every part is servable.
+    #[arg(long, default_value_t = false)]
+    pub(crate) require_ready: bool,
 }
 
 #[derive(Debug, Args)]

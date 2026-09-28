@@ -1,0 +1,201 @@
+//! GLM 5.x: MLA + DeepSeek Sparse Attention indexers (glm_moe_dsa) and the
+//! hybrid Kimi-Delta-Attention + DSA variant with mHC (glm5_next). HF names,
+//! optionally under `model.language_model.`.
+use anyhow::Result;
+use serde_json::Value;
+
+use crate::plan::checkpoint::{opt_usize_field, usize_field, Checkpoint};
+use crate::plan::family::{Family, Hint, RuntimeStatus};
+use crate::plan::names::indexed;
+use crate::plan::spec::*;
+
+pub struct Glm {
+    id: &'static str,
+    architecture: &'static str,
+}
+
+pub static GLM_DSA: Glm = Glm { id: "glm_dsa", architecture: "GlmMoeDsaForCausalLM" };
+pub static GLM_NEXT: Glm = Glm { id: "glm_next", architecture: "Glm5NextForConditionalGeneration" };
+
+fn str_list(config: &Value, key: &str) -> Vec<String> {
+    config
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+        .unwrap_or_default()
+}
+
+fn strip_model_prefix(name: &str) -> Option<&str> {
+    name.strip_prefix("model.language_model.").or_else(|| name.strip_prefix("model."))
+}
+
+impl Family for Glm {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn runtime(&self) -> RuntimeStatus {
+        RuntimeStatus::Planned
+    }
+    fn detect(&self, checkpoint: &Checkpoint) -> bool {
+        checkpoint.architectures().iter().any(|arch| arch == self.architecture)
+    }
+
+    fn spec(&self, checkpoint: &Checkpoint) -> Result<ModelSpec> {
+        let text = checkpoint.text_config();
+        let layers = usize_field(text, "num_hidden_layers")?;
+        let mlp_types = str_list(text, "mlp_layer_types");
+        let layer_types = str_list(text, "layer_types");
+        let indexer_types = str_list(text, "indexer_types");
+        let first_dense = opt_usize_field(text, "first_k_dense_replace").unwrap_or(0);
+        let dense_intermediate = opt_usize_field(text, "intermediate_size").unwrap_or(0);
+        let layer_specs = (0..layers)
+            .map(|layer| {
+                let dense = mlp_types.get(layer).map_or(layer < first_dense, |t| t == "dense");
+                let kind = layer_types.get(layer).map(String::as_str).unwrap_or("deepseek_sparse_attention");
+                let attention = if kind == "linear_attention" {
+                    AttentionKind::Kda
+                } else {
+                    AttentionKind::MlaDsa {
+                        indexer: indexer_types.get(layer).map_or(true, |t| t == "full"),
+                    }
+                };
+                LayerSpec {
+                    attention,
+                    ffn: if dense {
+                        FfnKind::Dense { intermediate: dense_intermediate }
+                    } else {
+                        FfnKind::Moe
+                    },
+                }
+            })
+            .collect();
+        let mtp = opt_usize_field(text, "num_nextn_predict_layers").unwrap_or(0);
+        let mut notes = Vec::new();
+        if let Some(hc) = opt_usize_field(text, "hc_mult") {
+            notes.push(format!("mHC width {hc}"));
+        }
+        notes.push(format!(
+            "MLA q_lora {} kv_lora {} rope {}",
+            opt_usize_field(text, "q_lora_rank").unwrap_or(0),
+            opt_usize_field(text, "kv_lora_rank").unwrap_or(0),
+            opt_usize_field(text, "qk_rope_head_dim").unwrap_or(0),
+        ));
+        notes.push(format!("DSA index top-k {}", opt_usize_field(text, "index_topk").unwrap_or(0)));
+        Ok(ModelSpec {
+            family: self.id,
+            architecture: self.architecture.into(),
+            hidden: usize_field(text, "hidden_size")?,
+            vocab: usize_field(text, "vocab_size")?,
+            layers: layer_specs,
+            moe: Some(MoeSpec {
+                experts: usize_field(text, "n_routed_experts")?,
+                top_k: usize_field(text, "num_experts_per_tok")?,
+                intermediate: usize_field(text, "moe_intermediate_size")?,
+                shared_experts: opt_usize_field(text, "n_shared_experts").unwrap_or(0),
+                shared_intermediate: usize_field(text, "moe_intermediate_size")?,
+                scoring: text.get("scoring_func").and_then(Value::as_str).unwrap_or("sigmoid").into(),
+                routed_scaling: text.get("routed_scaling_factor").and_then(Value::as_f64),
+                groups: match (opt_usize_field(text, "n_group"), opt_usize_field(text, "topk_group")) {
+                    (Some(n), Some(k)) if n > 1 => Some((n, k)),
+                    _ => None,
+                },
+            }),
+            speculator: (mtp > 0).then_some(SpeculatorSpec::NativeMtp { layers: mtp }),
+            tables: Vec::new(),
+            vision: checkpoint.config.get("vision_config").is_some(),
+            notes,
+        })
+    }
+
+    fn classify(&self, spec: &ModelSpec, name: &str) -> Option<TensorRole> {
+        use Component::*;
+        if name == "lm_head.weight" {
+            return Some(TensorRole::new(LmHead));
+        }
+        if name.starts_with("model.visual.") || name.starts_with("visual.") || name.starts_with("model.vision") {
+            return Some(TensorRole::new(Vision));
+        }
+        let name = strip_model_prefix(name)?;
+        match name {
+            "embed_tokens.weight" => return Some(TensorRole::new(Embedding)),
+            "norm.weight" => return Some(TensorRole::new(Norm)),
+            _ => {}
+        }
+        let (layer, rest) = indexed(name, "layers.")?;
+        // The layer after the backbone is the native MTP layer.
+        if layer >= spec.layers.len() {
+            if let Some((expert, _)) = indexed(rest, "mlp.experts.") {
+                return Some(TensorRole::expert(SpeculatorExpert, layer, expert));
+            }
+            return Some(TensorRole::layer(Speculator, layer));
+        }
+        if let Some((expert, _)) = indexed(rest, "mlp.experts.") {
+            return Some(TensorRole::expert(RoutedExpert, layer, expert));
+        }
+        let component = if rest.starts_with("self_attn.indexer.") {
+            Indexer
+        } else if rest.starts_with("self_attn.") {
+            Attention
+        } else if rest.starts_with("mlp.gate.") {
+            Router
+        } else if rest.starts_with("mlp.shared_experts.") {
+            SharedExpert
+        } else if rest.starts_with("mlp.") {
+            DenseFfn
+        } else if rest.starts_with("hc_") {
+            HyperConnection
+        } else if rest.ends_with("layernorm.weight") {
+            Norm
+        } else {
+            Other
+        };
+        Some(TensorRole::layer(component, layer))
+    }
+
+    fn component_hint(&self, component: Component) -> Option<Hint> {
+        let glmrt = "../glmrt (the GLM-5.3 engine this family ports from)";
+        let (what, how) = match (self.id, component) {
+            ("glm_next", Component::Attention) => (
+                "hybrid attention: Kimi Delta Attention (linear) layers plus MLA+DSA layers".to_string(),
+                "KDA needs chunked prefill and recurrent decode kernels: b12x sequence/kda_prefill and \
+                 sequence/gdn_decode are the starting points. MLA layers use no RoPE (mla_use_nope) and \
+                 the indexer compresses keys (index_kpool). State for KDA layers is per-request \
+                 recurrent state, not a paged KV cache: add a state pool beside the KV allocator.".to_string(),
+            ),
+            (_, Component::Attention) | (_, Component::Indexer) => (
+                "MLA with DeepSeek Sparse Attention indexer".to_string(),
+                format!("Port from {glmrt}: native/cuda/kernels/dsa_indexer.cu and the real_full \
+                 attention/mla.rs + attention/residual/dsa_indexer.rs path. b12x: attention/sparse_mla, \
+                 dsa_indexer. Shared indexer layers reuse the previous full layer's selection \
+                 (indexer_types)."),
+            ),
+            (_, Component::RoutedExpert) => (
+                "top-8 sigmoid routed experts".to_string(),
+                format!("Spark expertd-native is specialized to V4.1 geometry. Export b12x fused_moe for \
+                 this geometry (see the model spec) and format; {glmrt} has mixed EXL3 K3/K4 top-8 \
+                 dispatch (native/cuda/kernels/b12x_mixed_aot.h, b12x_direct.cu) and loader layouts \
+                 (loader exl3_format.rs Glm53Exl3MixedTp4LayerLayout)."),
+            ),
+            (_, Component::Router) => (
+                "sigmoid noaux_tc router with e_score_correction_bias, routed scale 2.5".to_string(),
+                format!("{glmrt} native/cuda/kernels/router.cu implements the top-8 path."),
+            ),
+            (_, Component::Speculator) | (_, Component::SpeculatorExpert) => (
+                "native MTP layer; DFlash2 external drafter preferred".to_string(),
+                format!("{glmrt} commands/real_full/{{mtp,dflash*}}.rs. DFlash2 (incoai/GLM-5.3-DFlash2) \
+                 is the measured best speculator for GLM-5.3."),
+            ),
+            (_, Component::DenseFfn) | (_, Component::SharedExpert) => (
+                "FP8 dense and shared FFN on the coordinator".to_string(),
+                "b12x gemm block_fp8_linear covers 128x128 FP8 at M small; reuse V4.1's shared-expert \
+                 path with this geometry.".to_string(),
+            ),
+            (_, Component::HyperConnection) => (
+                "mHC hyper-connections".to_string(),
+                "V4.1 mHC kernels (v41_hc) apply at this width.".to_string(),
+            ),
+            _ => return None,
+        };
+        Some(Hint { what, how })
+    }
+}

@@ -48,6 +48,7 @@ mod expert_format;
 mod snapshot;
 mod tensors;
 mod tokenizer;
+pub mod plan;
 
 pub use attention_format::{
     native_deepseek_v4_attention_tensor_specs, validate_native_deepseek_v4_attention_catalog,
