@@ -14,7 +14,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::dsv4::{Dsv4Program, Dsv4Programs, Dsv4Scalar};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::deepseek_v4::DeepseekV4Config;
-use cuteafd_transport::v41_expert::{V41Tp4Roce, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
+use cuteafd_transport::v41_expert::{V41Tp4Roce, V41Tp4RoceWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
 use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype,
     ExpertV2SourceKind,
@@ -52,6 +52,18 @@ pub(crate) struct Engine<'a> {
 
 /// `exchange` result for a layer whose experts ran on this GPU.
 const LOCAL_EXPERTS: usize = usize::MAX;
+
+/// Lanes a long prefill chunk splits into, and the fewest rows per lane worth
+/// a second Spark exchange per layer.
+pub(crate) const PREFILL_LANES: usize = 2;
+const MIN_LANE_ROWS: usize = 256;
+
+/// One lane's inputs for a step.
+struct LaneStep<'s> {
+    tables: &'s StepTables,
+    tokens: &'s [u32],
+    embed: &'s [u8],
+}
 
 /// Everything a captured decode segment bakes in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -130,12 +142,25 @@ pub(crate) struct LayerCache<'a> {
     pub states: Vec<Dev<'a>>,
 }
 
-/// Prefill workspace sized for `tokens` rows.
-struct Workspace<'a> {
+/// What one lane of rows carries from layer to layer: the residual streams,
+/// the mHC post/comb of its current layer, its token ids and step tables.
+struct Lane<'a> {
     stream_a: Dev<'a>,
     stream_b: Dev<'a>,
     post: Dev<'a>,
     comb: Dev<'a>,
+    /// Token ids (hash-layer routing).
+    tokens: Dev<'a>,
+    /// Shared-expert output of the lane's current layer (its post reads it
+    /// after the other lane's shared expert ran).
+    shared: Dev<'a>,
+    tables: StepBuffers<'a>,
+}
+
+/// Step workspace sized for `rows` rows per lane; everything but the lanes is
+/// consumed within one (layer, lane) unit and shared.
+struct Workspace<'a> {
+    lanes: Vec<Lane<'a>>,
     y: Dev<'a>,
     query: Dev<'a>,
     q_rank: Dev<'a>,
@@ -146,18 +171,14 @@ struct Workspace<'a> {
     selected: Dev<'a>,
     topk_scratch: Dev<'a>,
     logits: Dev<'a>,
-    /// This step's token ids (hash-layer routing).
-    tokens: Dev<'a>,
     /// Routes: expert ids (U32) and weights (FP32), [rows, topk].
     route_ids: Dev<'a>,
     route_weights: Dev<'a>,
     wire: Dev<'a>,
-    shared: Dev<'a>,
     planes: Vec<Dev<'a>>,
     scratch: Dev<'a>,
     dummy: Dev<'a>,
     vocab_logits: Dev<'a>,
-    tables: StepBuffers<'a>,
     /// Pinned staging: routes + wire rows down, rank partials up.
     router_host: HostAllocation<'a>,
     planes_host: RefCell<HostAllocation<'a>>,
@@ -286,7 +307,7 @@ impl<'a> Engine<'a> {
         })
     }
 
-    fn workspace(&self, t: usize) -> Result<Workspace<'a>> {
+    fn workspace(&self, t: usize, lanes: usize) -> Result<Workspace<'a>> {
         let h = self.cfg.dim;
         let heads = self.cfg.n_heads;
         let (experts, topk) = (self.cfg.n_routed_experts, self.cfg.n_activated_experts);
@@ -296,11 +317,19 @@ impl<'a> Engine<'a> {
             let spec = self.programs.spec(&format!("{}_index_topk_{route}", self.family))?;
             topk_scratch = topk_scratch.max(spec.scratch.get("scratch").copied().unwrap_or(0) as usize);
         }
+        let lane = || -> Result<Lane<'a>> {
+            Ok(Lane {
+                stream_a: self.alloc(t * 4 * h * 2)?,
+                stream_b: self.alloc(t * 4 * h * 2)?,
+                post: self.alloc(t * 4 * 4)?,
+                comb: self.alloc(t * 16 * 4)?,
+                tokens: self.alloc(t * 4)?,
+                shared: self.alloc(t * h * 2)?,
+                tables: self.step_buffers(t)?,
+            })
+        };
         Ok(Workspace {
-            stream_a: self.alloc(t * 4 * h * 2)?,
-            stream_b: self.alloc(t * 4 * h * 2)?,
-            post: self.alloc(t * 4 * 4)?,
-            comb: self.alloc(t * 16 * 4)?,
+            lanes: (0..lanes).map(|_| lane()).collect::<Result<_>>()?,
             y: self.alloc(t * h * 2)?,
             query: self.alloc(t * heads * 512 * 2)?,
             q_rank: self.alloc(t * self.cfg.q_lora_rank * 2)?,
@@ -311,16 +340,13 @@ impl<'a> Engine<'a> {
             selected: self.alloc(t * self.cfg.index_topk * 4)?,
             topk_scratch: self.zeroed(topk_scratch)?,
             logits: self.alloc(t * experts * 4)?,
-            tokens: self.alloc(t * 4)?,
             route_ids: self.alloc(t * topk * 4)?,
             route_weights: self.alloc(t * topk * 4)?,
             wire: self.alloc(t * (h + h / 32))?,
-            shared: self.alloc(t * h * 2)?,
             planes: (0..4).map(|_| self.alloc(t * h * 2)).collect::<Result<_>>()?,
             scratch: self.alloc(self.scratch_bytes()?)?,
             dummy: self.zeroed(4096)?,
             vocab_logits: self.alloc(t * self.cfg.vocab_size * 4)?,
-            tables: self.step_buffers(t)?,
             router_host: HostAllocation::new(self.library, t * (topk * 8 + h + h / 32))?,
             planes_host: RefCell::new(HostAllocation::new(self.library, 4 * t * h * 2)?),
             // SAFETY: the workspace buffer lives in the same struct and drops
@@ -387,26 +413,46 @@ impl<'a> Engine<'a> {
         Ok(out)
     }
 
+    /// Longest chunk one [`Self::prefill`] call takes.
+    pub fn prefill_capacity(&self) -> usize {
+        PREFILL_LANES * self.prefill_rows
+    }
+
     /// Prefills the next chunk of a sequence (rows continue at its length) and
     /// returns FP32 logits of its last `logit_rows` rows [logit_rows, vocab].
     /// `on_layer` receives each layer's stream.
+    ///
+    /// A long chunk without `on_layer` runs as [`PREFILL_LANES`] lanes of
+    /// consecutive rows, so one lane's attention overlaps the other's experts.
+    #[allow(clippy::too_many_arguments)]
     pub fn prefill(
         &self,
         placement: &mut Placement,
         tokens: &[u32],
         embed: &[u8],
-        transport: &mut V41Tp4Roce,
+        transports: &mut [V41Tp4Roce],
         runtime: &tokio::runtime::Runtime,
         logit_rows: usize,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
     ) -> Result<Vec<f32>> {
         let start = placement.len;
-        ensure!(!tokens.is_empty() && tokens.len() <= self.prefill_rows && start + tokens.len() <= self.max_context,
-            "prefill chunk of {} tokens at {start} exceeds {} rows or the {}-token context",
-            tokens.len(), self.prefill_rows, self.max_context);
-        let tables = metadata::prefill_step(placement, &self.shape, start, tokens.len(), self.cfg.index_topk, self.c128_width)?;
-        let logits = self.step(&tables, tokens, embed, transport, runtime, logit_rows, on_layer)?;
-        placement.len += tokens.len();
+        let t = tokens.len();
+        let lanes = if on_layer.is_none() && t >= PREFILL_LANES * MIN_LANE_ROWS { PREFILL_LANES } else { 1 };
+        let per_lane = t.div_ceil(lanes);
+        ensure!(t > 0 && per_lane <= self.prefill_rows && start + t <= self.max_context,
+            "prefill chunk of {t} tokens at {start} exceeds {} rows per lane or the {}-token context",
+            self.prefill_rows, self.max_context);
+        let row = self.cfg.dim * 2;
+        let tables = (0..lanes).map(|lane| {
+            let (first, end) = (lane * per_lane, ((lane + 1) * per_lane).min(t));
+            metadata::prefill_step(placement, &self.shape, start + first, end - first, self.cfg.index_topk, self.c128_width)
+        }).collect::<Result<Vec<_>>>()?;
+        let steps: Vec<LaneStep<'_>> = tables.iter().enumerate().map(|(lane, tables)| {
+            let (first, end) = (lane * per_lane, ((lane + 1) * per_lane).min(t));
+            LaneStep { tables, tokens: &tokens[first..end], embed: &embed[first * row..end * row] }
+        }).collect();
+        let logits = self.step(&steps, transports, runtime, logit_rows, on_layer)?;
+        placement.len += t;
         Ok(logits)
     }
 
@@ -426,62 +472,71 @@ impl<'a> Engine<'a> {
         let tokens: Vec<u32> = rows.iter().map(|(_, token)| *token).collect();
         let steps: Vec<(&Placement, usize)> = rows.iter().map(|(p, _)| (&**p, p.len)).collect();
         let tables = metadata::decode_step(&steps, &self.shape, self.cfg.index_topk, self.c128_width)?;
-        let logits = self.step(&tables, &tokens, embed, transport, runtime, tokens.len(), None)?;
+        let step = LaneStep { tables: &tables, tokens: &tokens, embed };
+        let logits = self.step(&[step], std::slice::from_mut(transport), runtime, tokens.len(), None)?;
         for (placement, _) in rows.iter_mut() {
             placement.len += 1;
         }
         Ok(logits)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Runs every layer for `lanes` (one decode lane, or prefill lanes of
+    /// consecutive rows of one sequence) and returns the logits of the last
+    /// `logit_rows` rows across the lanes.
     fn step(
         &self,
-        tables: &StepTables,
-        tokens: &[u32],
-        embed: &[u8],
-        transport: &mut V41Tp4Roce,
+        lanes: &[LaneStep<'_>],
+        transports: &mut [V41Tp4Roce],
         runtime: &tokio::runtime::Runtime,
         logit_rows: usize,
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
     ) -> Result<Vec<f32>> {
-        let t = tables.rows;
         let h = self.cfg.dim;
-        ensure!(tokens.len() == t && embed.len() == t * h * 2 && logit_rows <= t, "step rows disagree");
-        let slot = if tables.decode { &self.decode_workspace } else { &self.prefill_workspace };
+        let decode = lanes[0].tables.decode;
+        ensure!(!lanes.is_empty(), "a step needs a lane");
+        let total: usize = lanes.iter().map(|l| l.tables.rows).sum();
+        ensure!(logit_rows <= total && (on_layer.is_none() || lanes.len() == 1)
+            && lanes.iter().all(|l| l.tokens.len() == l.tables.rows && l.embed.len() == l.tables.rows * h * 2)
+            && (!decode || lanes.len() == 1), "step lanes disagree");
+        let slot = if decode { &self.decode_workspace } else { &self.prefill_workspace };
         if slot.borrow().is_none() {
-            let rows = if tables.decode { self.decode_rows } else { self.prefill_rows };
-            *slot.borrow_mut() = Some(self.workspace(rows)?);
+            let (rows, count) = if decode { (self.decode_rows, 1) } else { (self.prefill_rows, PREFILL_LANES) };
+            *slot.borrow_mut() = Some(self.workspace(rows, count)?);
         }
         let workspace = slot.borrow();
         let w = workspace.as_ref().context("workspace")?;
+        ensure!(lanes.len() <= w.lanes.len(), "{} lanes exceed the workspace", lanes.len());
         // Tables are copied in only after the previous step's last read (the
         // head download synchronized the stream).
-        self.fill(&w.tables, tables)?;
-        let m = &w.tables;
-        let mut expanded = Vec::with_capacity(t * 4 * h * 2);
-        for row in embed.chunks_exact(h * 2) {
-            for _ in 0..4 {
-                expanded.extend_from_slice(row);
-            }
-        }
-        self.library.copy_h2d(w.stream_a.buffer, &expanded)?;
-        let token_bytes: Vec<u8> = tokens.iter().flat_map(|token| token.to_le_bytes()).collect();
-        self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: token_bytes.len(), ..w.tokens.buffer }, &token_bytes)?;
-        let rows = Dsv4Scalar::I32(t as i32);
-        let cap = if tables.decode { self.decode_rows } else { self.prefill_rows };
-        let mut ranks = 0usize;
-        for (layer, weights) in self.weights.layers.iter().enumerate() {
-            let previous = ranks;
-            // One segment: the previous layer's FFN reduce + mHC post, then this
-            // layer's attention, router and expert input quantization. Decode
-            // replays it as a CUDA graph keyed by everything it bakes in.
-            let segment = || -> Result<()> {
-                if previous > 0 {
-                    self.post(&w, previous, rows, layer - 1)?;
+        for (step, lane) in lanes.iter().zip(&w.lanes) {
+            self.fill(&lane.tables, step.tables)?;
+            let mut expanded = Vec::with_capacity(step.embed.len() * 4);
+            for row in step.embed.chunks_exact(h * 2) {
+                for _ in 0..4 {
+                    expanded.extend_from_slice(row);
                 }
-                self.attention(layer, weights, tables, m, &w, rows, cap)
-            };
-            if tables.decode {
+            }
+            self.library.copy_h2d(lane.stream_a.buffer, &expanded)?;
+            let token_bytes: Vec<u8> = step.tokens.iter().flat_map(|token| token.to_le_bytes()).collect();
+            self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: token_bytes.len(), ..lane.tokens.buffer }, &token_bytes)?;
+        }
+        let cap = if decode { self.decode_rows } else { self.prefill_rows };
+        let rows_of = |lane: usize| Dsv4Scalar::I32(lanes[lane].tables.rows as i32);
+        if decode {
+            let (tables, lane) = (lanes[0].tables, &w.lanes[0]);
+            let (t, rows) = (tables.rows, rows_of(0));
+            let mut ranks = 0usize;
+            for (layer, weights) in self.weights.layers.iter().enumerate() {
+                let previous = ranks;
+                // One segment: the previous layer's FFN reduce + mHC post, then
+                // this layer's attention, router and expert input quantization,
+                // replayed as a CUDA graph keyed by everything it bakes in.
+                let segment = || -> Result<()> {
+                    if previous > 0 {
+                        self.post(w, lane, previous, rows, layer - 1)?;
+                    }
+                    self.attention(layer, weights, tables, lane, w, rows, cap)
+                };
                 let key = GraphKey {
                     layer,
                     rows: t,
@@ -491,28 +546,85 @@ impl<'a> Engine<'a> {
                     previous,
                 };
                 self.replay(key, segment)?;
-            } else {
-                segment()?;
+                ranks = self.decode_experts(layer, t, w, lane, cap, transports.first_mut().context("no transport")?, runtime)?;
             }
-            ranks = self.exchange(layer, weights, tokens, &w, cap, transport, runtime)?;
-            if !tables.decode {
-                // The stream a layer hands on is complete only after its post.
-                self.post(&w, ranks, rows, layer)?;
-                if let Some(on_layer) = on_layer.as_mut() {
-                    on_layer(layer, &self.download(&w.stream_a, t * 4 * h * 2)?)?;
+            if ranks > 0 {
+                self.post(w, lane, ranks, rows, self.weights.layers.len() - 1)?;
+            }
+        } else {
+            // Units run layer-major. A unit's attention needs its own lane's
+            // previous layer posted and the previous lane's same layer (KV and
+            // compressor state) done. With a transport per lane, each Spark
+            // wave stays in flight while the next unit's attention runs and is
+            // received after the next wave is dispatched, so the Sparks always
+            // hold the next request when they finish one.
+            let units: Vec<(usize, usize)> = (0..self.weights.layers.len())
+                .flat_map(|layer| (0..lanes.len()).map(move |lane| (layer, lane))).collect();
+            let attention = |(layer, lane): (usize, usize)| {
+                self.attention(layer, &self.weights.layers[layer], lanes[lane].tables, &w.lanes[lane], w, rows_of(lane), cap)
+            };
+            let post = |(layer, lane): (usize, usize), ranks: usize| self.post(w, &w.lanes[lane], ranks, rows_of(lane), layer);
+            let local_layers = self.local_layers();
+            let pipelined = transports.len() >= lanes.len() && lanes.len() > 1;
+            runtime.block_on(async {
+                let mut inflight: Option<((usize, usize), V41Tp4RoceWave)> = None;
+                attention(units[0])?;
+                for (index, &unit) in units.iter().enumerate() {
+                    let (layer, lane) = unit;
+                    let t = lanes[lane].tables.rows;
+                    if layer < local_layers {
+                        self.local_experts(layer, t, w, &w.lanes[lane], cap)?;
+                        post(unit, LOCAL_EXPERTS)?;
+                    } else {
+                        let request = self.stage_request(layer, t, w)?;
+                        let slot = if pipelined { lane } else { 0 };
+                        let wave = transports[slot].dispatch_wave(&request)?;
+                        // The shared expert runs on the GPU while the Sparks compute.
+                        self.shared_ffn(layer, w, &w.lanes[lane], rows_of(lane), cap)?;
+                        if let Some((previous, wave)) = inflight.take() {
+                            let slot = if pipelined { previous.1 } else { 0 };
+                            let ranks = self.land(&mut transports[slot], wave, lanes[previous.1].tables.rows, w).await?;
+                            post(previous, ranks)?;
+                        }
+                        inflight = Some((unit, wave));
+                    }
+                    let next = units.get(index + 1).copied();
+                    // The next unit's input is this unit's post when both are
+                    // on one lane, or without a transport per lane.
+                    if !pipelined || next.is_none_or(|(_, next_lane)| next_lane == lane) {
+                        if let Some((current, wave)) = inflight.take() {
+                            let slot = if pipelined { current.1 } else { 0 };
+                            let ranks = self.land(&mut transports[slot], wave, lanes[current.1].tables.rows, w).await?;
+                            post(current, ranks)?;
+                        }
+                    }
+                    if let Some(on_layer) = on_layer.as_mut() {
+                        on_layer(layer, &self.download(&w.lanes[lane].stream_a, t * 4 * h * 2)?)?;
+                    }
+                    if let Some(next) = next {
+                        attention(next)?;
+                    }
                 }
-                ranks = 0;
-            }
-        }
-        if ranks > 0 {
-            self.post(&w, ranks, rows, self.weights.layers.len() - 1)?;
+                anyhow::Ok(())
+            })?;
         }
         if logit_rows == 0 {
             // The next step rewrites the tables only after this one drains.
             self.sync()?;
             return Ok(Vec::new());
         }
-        self.head(&w.stream_a, t, logit_rows, &w)
+        let mut logits = Vec::with_capacity(logit_rows * self.cfg.vocab_size);
+        let mut first = 0;
+        for (step, lane) in lanes.iter().zip(&w.lanes) {
+            let rows = step.tables.rows;
+            // Rows of this lane inside the last `logit_rows` of the step.
+            let wanted = (first + rows).saturating_sub((total - logit_rows).max(first));
+            if wanted > 0 {
+                logits.extend(self.head(&lane.stream_a, rows, wanted, w)?);
+            }
+            first += rows;
+        }
+        Ok(logits)
     }
 
     /// Which sparse attention a layer runs this step.
@@ -545,12 +657,12 @@ impl<'a> Engine<'a> {
 
     /// The layer's routed partials + shared expert, reduced, then mHC post
     /// into stream a.
-    fn post(&self, w: &Workspace<'_>, ranks: usize, rows: Dsv4Scalar, layer: usize) -> Result<()> {
+    fn post(&self, w: &Workspace<'_>, lane: &Lane<'_>, ranks: usize, rows: Dsv4Scalar, layer: usize) -> Result<()> {
         if ranks == LOCAL_EXPERTS {
             let output = self.local.borrow().as_ref().context("local experts")?.output.buffer.ptr;
             return self.run("mhc_post", &[
-                ("x", output), ("residual", w.stream_b.buffer.ptr), ("prev_post", w.post.buffer.ptr),
-                ("prev_comb", w.comb.buffer.ptr), ("out", w.stream_a.buffer.ptr),
+                ("x", output), ("residual", lane.stream_b.buffer.ptr), ("prev_post", lane.post.buffer.ptr),
+                ("prev_comb", lane.comb.buffer.ptr), ("out", lane.stream_a.buffer.ptr),
             ], &[rows]);
         }
         let Dsv4Scalar::I32(count) = rows else { unreachable!() };
@@ -562,13 +674,13 @@ impl<'a> Engine<'a> {
         // SAFETY: planes, shared and delta are live [rows, h] BF16 buffers on
         // this device, ordered after the plane uploads and shared FFN.
         unsafe {
-            reducer.reduce_planes(pointers, ranks as u32, w.shared.buffer.ptr.cast(),
+            reducer.reduce_planes(pointers, ranks as u32, lane.shared.buffer.ptr.cast(),
                 w.delta.buffer.ptr.cast(), count as u32, self.stream)
                 .with_context(|| format!("layer {layer} expert reduction"))?;
         }
         self.run("mhc_post", &[
-            ("x", w.delta.buffer.ptr), ("residual", w.stream_b.buffer.ptr), ("prev_post", w.post.buffer.ptr),
-            ("prev_comb", w.comb.buffer.ptr), ("out", w.stream_a.buffer.ptr),
+            ("x", w.delta.buffer.ptr), ("residual", lane.stream_b.buffer.ptr), ("prev_post", lane.post.buffer.ptr),
+            ("prev_comb", lane.comb.buffer.ptr), ("out", lane.stream_a.buffer.ptr),
         ], &[rows])
     }
 
@@ -580,20 +692,21 @@ impl<'a> Engine<'a> {
         layer: usize,
         weights: &LayerWeights<'_>,
         tables: &StepTables,
-        m: &StepBuffers<'_>,
+        lane: &Lane<'_>,
         w: &Workspace<'_>,
         rows: Dsv4Scalar,
         cap: usize,
     ) -> Result<()> {
+        let m = &lane.tables;
         let cache = &self.pools[layer];
         let ratio = weights.ratio;
         let rope = if ratio == 0 { &self.rope_window } else { &self.rope_compressed };
         let mode = if tables.decode { "decode" } else { "prefill" };
-        let (a, b) = (&w.stream_a, &w.stream_b);
+        let (a, b) = (&lane.stream_a, &lane.stream_b);
         self.run("mhc_pre", &[
             ("residual", a.buffer.ptr), ("fn", weights.ptr("attn.fn")?), ("scale", weights.ptr("attn.scale")?),
-            ("base", weights.ptr("attn.base")?), ("norm", weights.ptr("attn.norm")?), ("post", w.post.buffer.ptr),
-            ("comb", w.comb.buffer.ptr), ("y", w.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
+            ("base", weights.ptr("attn.base")?), ("norm", weights.ptr("attn.norm")?), ("post", lane.post.buffer.ptr),
+            ("comb", lane.comb.buffer.ptr), ("y", w.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
         ], &[rows])?;
         self.run(&format!("producer_m{cap}"), &[
             ("hidden", w.y.buffer.ptr), ("positions", m.positions.buffer.ptr), ("main_slots", m.main_slots.buffer.ptr),
@@ -617,10 +730,10 @@ impl<'a> Engine<'a> {
             ("wo_b_scale", weights.ptr("wo_b_scale")?), ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
         ], &[rows])?;
         self.run(&format!("mhc_post_pre_m{cap}"), &[
-            ("x", w.delta.buffer.ptr), ("residual", a.buffer.ptr), ("prev_post", w.post.buffer.ptr),
-            ("prev_comb", w.comb.buffer.ptr), ("fn", weights.ptr("ffn.fn")?), ("scale", weights.ptr("ffn.scale")?),
+            ("x", w.delta.buffer.ptr), ("residual", a.buffer.ptr), ("prev_post", lane.post.buffer.ptr),
+            ("prev_comb", lane.comb.buffer.ptr), ("fn", weights.ptr("ffn.fn")?), ("scale", weights.ptr("ffn.scale")?),
             ("base", weights.ptr("ffn.base")?), ("norm", weights.ptr("ffn.norm")?), ("residual_out", b.buffer.ptr),
-            ("post", w.post.buffer.ptr), ("comb", w.comb.buffer.ptr), ("y", w.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
+            ("post", lane.post.buffer.ptr), ("comb", lane.comb.buffer.ptr), ("y", w.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
         ], &[rows])?;
         let Dsv4Scalar::I32(t) = rows else { unreachable!() };
         let h = self.cfg.dim;
@@ -635,7 +748,7 @@ impl<'a> Engine<'a> {
         // SAFETY: logits, routing tables, tokens and route outputs are live
         // device buffers sized for this step's rows.
         unsafe {
-            self.library.dsv4_router_select(w.logits.buffer.ptr, bias, tid2eid, w.tokens.buffer.ptr,
+            self.library.dsv4_router_select(w.logits.buffer.ptr, bias, tid2eid, lane.tokens.buffer.ptr,
                 w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t as usize, self.cfg.n_routed_experts,
                 self.cfg.n_activated_experts, self.cfg.route_scale as f32, self.stream)?;
         }
@@ -751,40 +864,39 @@ impl<'a> Engine<'a> {
         runtime.block_on(async { transport.execute(&request, |_, _, _| Ok(())).await })
     }
 
-    fn exchange(
-        &self,
-        layer: usize,
-        weights: &LayerWeights<'_>,
-        tokens: &[u32],
-        w: &Workspace<'_>,
-        cap: usize,
-        transport: &mut V41Tp4Roce,
-        runtime: &tokio::runtime::Runtime,
-    ) -> Result<usize> {
-        let t = tokens.len();
-        let (h, topk) = (self.cfg.dim, self.cfg.n_activated_experts);
-        let rows = Dsv4Scalar::I32(t as i32);
-        let shared = |this: &Self| this.run(&format!("shared_ffn_m{cap}"), &[
+    fn local_layers(&self) -> usize {
+        self.local.borrow().as_ref().map_or(0, |l| l.layers())
+    }
+
+    /// The shared expert on the unit's FFN input `y` into the lane's `shared`.
+    fn shared_ffn(&self, layer: usize, w: &Workspace<'_>, lane: &Lane<'_>, rows: Dsv4Scalar, cap: usize) -> Result<()> {
+        let weights = &self.weights.layers[layer];
+        self.run(&format!("shared_ffn_m{cap}"), &[
             ("x", w.y.buffer.ptr), ("w13", weights.ptr("w13")?), ("w13_scale", weights.ptr("w13_scale")?),
-            ("w2", weights.ptr("w2")?), ("w2_scale", weights.ptr("w2_scale")?), ("out", w.shared.buffer.ptr),
+            ("w2", weights.ptr("w2")?), ("w2_scale", weights.ptr("w2_scale")?), ("out", lane.shared.buffer.ptr),
             ("scratch", w.scratch.buffer.ptr),
-        ], &[rows]);
-        let local_layers = self.local.borrow().as_ref().map_or(0, |l| l.layers());
-        if layer < local_layers {
-            // Routes, wire rows and the shared expert stay on the device; the
-            // host only enqueues.
-            shared(self)?;
-            let timer = Instant::now();
-            let mut local = self.local.borrow_mut();
-            let local = local.as_mut().context("local experts")?;
-            // SAFETY: wire, routes and shared rows are complete in stream order.
-            unsafe {
-                local.run(layer, t, w.wire.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
-                    w.shared.buffer.ptr, self.stream)?
-            };
-            self.profile.borrow_mut().add(Phase::Experts, timer);
-            return Ok(LOCAL_EXPERTS);
-        }
+        ], &[rows])
+    }
+
+    /// Shared and routed experts of a coordinator-resident layer: routes,
+    /// wire rows and results stay on the device, the host only enqueues.
+    fn local_experts(&self, layer: usize, t: usize, w: &Workspace<'_>, lane: &Lane<'_>, cap: usize) -> Result<()> {
+        self.shared_ffn(layer, w, lane, Dsv4Scalar::I32(t as i32), cap)?;
+        let timer = Instant::now();
+        let mut local = self.local.borrow_mut();
+        let local = local.as_mut().context("local experts")?;
+        // SAFETY: wire, routes and shared rows are complete in stream order.
+        unsafe {
+            local.run(layer, t, w.wire.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
+                lane.shared.buffer.ptr, self.stream)?
+        };
+        self.profile.borrow_mut().add(Phase::Experts, timer);
+        Ok(())
+    }
+
+    /// Waits for the unit's routes and wire rows and builds its Spark request.
+    fn stage_request(&self, layer: usize, t: usize, w: &Workspace<'_>) -> Result<ExpertProtocolV2Request> {
+        let (h, topk) = (self.cfg.dim, self.cfg.n_activated_experts);
         let timer = Instant::now();
         let (route_bytes, wire_bytes) = (t * topk * 4, t * (h + h / 32));
         let host = w.router_host.buffer;
@@ -802,8 +914,6 @@ impl<'a> Engine<'a> {
         }
         self.sync()?;
         self.profile.borrow_mut().add(Phase::RouterSync, timer);
-        // The shared expert runs on the GPU while the Sparks compute.
-        shared(self)?;
         let timer = Instant::now();
         let staged = w.router_host.bytes();
         let word = |offset: usize, i: usize| u32::from_le_bytes(staged[offset + i * 4..][..4].try_into().unwrap());
@@ -813,30 +923,30 @@ impl<'a> Engine<'a> {
             gate_weight: f32::from_bits(word(route_bytes, i)),
         }).collect();
         let wire = staged[2 * route_bytes..2 * route_bytes + wire_bytes].to_vec();
-        let request = self.expert_request(layer, t, routes, wire)?;
-        let row_bytes = h * 2;
+        let request = self.expert_request(layer, t, routes, wire);
+        self.profile.borrow_mut().add(Phase::Routing, timer);
+        request
+    }
+
+    /// Receives a unit's partial rows into the pinned staging and queues one
+    /// upload per rank plane. The reduce that reads the planes is ordered
+    /// after the uploads, and the next `stage_request` sync completes them
+    /// before the staging is rewritten.
+    async fn land(&self, transport: &mut V41Tp4Roce, wave: V41Tp4RoceWave, t: usize, w: &Workspace<'_>) -> Result<usize> {
+        let timer = Instant::now();
+        let row_bytes = self.cfg.dim * 2;
         let ranks = transport.world_size();
         ensure!(ranks <= w.planes.len(), "{ranks} Spark ranks exceed the reduction planes");
-        self.profile.borrow_mut().add(Phase::Routing, timer);
-        let timer = Instant::now();
-        // Each rank's partial rows land in its device plane straight from the
-        // pinned receive slot.
         let plane_bytes = t * row_bytes;
         let mut staging = w.planes_host.borrow_mut();
         ensure!(ranks * plane_bytes <= staging.buffer.bytes, "{ranks} rank planes exceed the pinned staging");
         let bytes = staging.bytes_mut();
-        runtime.block_on(async {
-            let pending = transport.dispatch(&request).await?;
-            pending.receive(|rank, first, payload| {
-                let offset = rank * plane_bytes + first as usize * row_bytes;
-                ensure!(first as usize * row_bytes + payload.len() <= plane_bytes, "partial rows exceed the step");
-                bytes[offset..offset + payload.len()].copy_from_slice(payload);
-                Ok(())
-            }).await
-        })?;
-        // One async upload per plane; the next segment's reduce is ordered
-        // after them, and the next router sync completes them before the
-        // staging is rewritten.
+        transport.receive_wave(wave, |rank, first, payload| {
+            let offset = rank * plane_bytes + first as usize * row_bytes;
+            ensure!(first as usize * row_bytes + payload.len() <= plane_bytes, "partial rows exceed the step");
+            bytes[offset..offset + payload.len()].copy_from_slice(payload);
+            Ok(())
+        }).await?;
         for rank in 0..ranks {
             let source = cuteafd_ffi::CuteafdHostBuffer {
                 // SAFETY: rank planes are disjoint slices of the staging buffer.
@@ -849,6 +959,30 @@ impl<'a> Engine<'a> {
         }
         self.profile.borrow_mut().add(Phase::Experts, timer);
         Ok(ranks)
+    }
+
+    /// A decode unit's experts; returns the rank count its post needs
+    /// ([`LOCAL_EXPERTS`] for a coordinator-resident layer).
+    #[allow(clippy::too_many_arguments)]
+    fn decode_experts(
+        &self,
+        layer: usize,
+        t: usize,
+        w: &Workspace<'_>,
+        lane: &Lane<'_>,
+        cap: usize,
+        transport: &mut V41Tp4Roce,
+        runtime: &tokio::runtime::Runtime,
+    ) -> Result<usize> {
+        if layer < self.local_layers() {
+            self.local_experts(layer, t, w, lane, cap)?;
+            return Ok(LOCAL_EXPERTS);
+        }
+        let request = self.stage_request(layer, t, w)?;
+        let wave = transport.dispatch_wave(&request)?;
+        // The shared expert runs on the GPU while the Sparks compute.
+        self.shared_ffn(layer, w, lane, Dsv4Scalar::I32(t as i32), cap)?;
+        runtime.block_on(self.land(transport, wave, t, w))
     }
 
     /// Logits of the last `n` of `t` rows.

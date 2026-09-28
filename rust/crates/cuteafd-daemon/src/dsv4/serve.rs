@@ -84,7 +84,7 @@ fn serve_loop(
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(&args.snapshot)?;
     let eos = eos_token(&args.snapshot)?;
     let mut ready = Some(ready);
-    let result = with_engine(&loaded, &args, |engine, transport, runtime| {
+    let result = with_engine(&loaded, &args, |engine, transports, runtime| {
         if max_context > engine.max_context {
             tracing::warn!(requested = max_context, supported = engine.max_context,
                 "--max-context exceeds the exported programs; requests are limited to the programs' context");
@@ -92,7 +92,7 @@ fn serve_loop(
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(()));
         }
-        schedule(engine, &loaded, &tokenizer, eos, &mut receive, transport, runtime, &stats)
+        schedule(engine, &loaded, &tokenizer, eos, &mut receive, transports, runtime, &stats)
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
@@ -173,7 +173,7 @@ fn schedule(
     tokenizer: &cuteafd_loader::LoadedTokenizer,
     eos: u32,
     receive: &mut mpsc::Receiver<NativeRequest>,
-    transport: &mut cuteafd_transport::v41_expert::V41Tp4Roce,
+    transports: &mut [cuteafd_transport::v41_expert::V41Tp4Roce],
     runtime: &tokio::runtime::Runtime,
     stats: &Mutex<serde_json::Value>,
 ) -> Result<()> {
@@ -184,7 +184,7 @@ fn schedule(
     let (mut requests, mut generated_total) = (0u64, 0u64);
     let hidden = engine.cfg.dim;
     let vocab = engine.cfg.vocab_size;
-    let limit = engine.prefill_rows.min(engine.max_context);
+    let chunk_limit = engine.prefill_capacity().min(engine.max_context);
     loop {
         // Admit while sequence slots and decode rows remain.
         while allocator.free_states() > 0 && active.len() < engine.decode_rows {
@@ -235,10 +235,12 @@ fn schedule(
                 let mut logits = Vec::new();
                 let started = Instant::now();
                 *engine.profile.borrow_mut() = super::engine::Profile::default();
-                let chunks = tokens.len().div_ceil(limit);
+                // Equal chunks, so no lane runs a tiny tail.
+                let chunks = tokens.len().div_ceil(chunk_limit);
+                let limit = tokens.len().div_ceil(chunks);
                 for (index, (chunk, rows)) in tokens.chunks(limit).zip(embed.chunks(limit * hidden * 2)).enumerate() {
                     let logit_rows = usize::from(index + 1 == chunks);
-                    logits = engine.prefill(&mut placement, chunk, rows, transport, runtime, logit_rows, None)?;
+                    logits = engine.prefill(&mut placement, chunk, rows, transports, runtime, logit_rows, None)?;
                 }
                 tracing::debug!(tokens = tokens.len(), elapsed_ms = started.elapsed().as_millis() as u64,
                     phases = %engine.profile.borrow().report(), "prefill");
@@ -272,7 +274,7 @@ fn schedule(
         let tokens: Vec<u32> = active.iter().map(|a| a.next).collect();
         let embed = embed_rows(&loaded.catalog, &tokens, hidden)?;
         let mut rows: Vec<(&mut Placement, u32)> = active.iter_mut().map(|a| (&mut a.placement, a.next)).collect();
-        let logits = match engine.decode(&mut rows, &embed, transport, runtime) {
+        let logits = match engine.decode(&mut rows, &embed, &mut transports[0], runtime) {
             Ok(logits) => logits,
             Err(error) => {
                 tracing::warn!("decode step failed: {error:#}");

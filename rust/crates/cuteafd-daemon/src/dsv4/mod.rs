@@ -134,7 +134,7 @@ pub(crate) fn load(args: &EngineArgs) -> Result<Loaded> {
 pub(crate) fn with_engine<T>(
     loaded: &Loaded,
     args: &EngineArgs,
-    body: impl FnOnce(&engine::Engine<'_>, &mut V41Tp4Roce, &tokio::runtime::Runtime) -> Result<T>,
+    body: impl FnOnce(&engine::Engine<'_>, &mut [V41Tp4Roce], &tokio::runtime::Runtime) -> Result<T>,
 ) -> Result<T> {
     let programs = loaded.library.dsv4_programs()?.with_manifest(&args.manifest)?;
     let started = Instant::now();
@@ -180,13 +180,18 @@ pub(crate) fn with_engine<T>(
     *engine.local.borrow_mut() = local;
     let peers = args.peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
     let executors: Vec<u64> = (1..=peers.len() as u64).collect();
-    let mut transport = V41Tp4Roce::new_ranks(&peers, &executors, 4096,
-        TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 })?;
+    // One transport (connection set) per prefill lane, so each lane can keep
+    // a Spark wave in flight; decode uses the first.
+    let mut transports = (0..engine::PREFILL_LANES).map(|_| V41Tp4Roce::new_ranks(&peers, &executors, 4096,
+        TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 }))
+        .collect::<Result<Vec<_>>>()?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let started = Instant::now();
-    engine.warm_transport(&mut transport, &runtime)?;
+    for transport in &mut transports {
+        engine.warm_transport(transport, &runtime)?;
+    }
     tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
-    let result = body(&engine, &mut transport, &runtime);
+    let result = body(&engine, &mut transports, &runtime);
     drop(engine);
     unsafe { loaded.library.cuda_stream_destroy(stream)? };
     result
@@ -195,7 +200,7 @@ pub(crate) fn with_engine<T>(
 fn golden(args: GoldenArgs) -> Result<()> {
     let loaded = load(&args.engine)?;
     let cfg = loaded.cfg.clone();
-    with_engine(&loaded, &args.engine, |engine, transport, runtime| golden_run(&args, &loaded.catalog, &cfg, engine, transport, runtime))
+    with_engine(&loaded, &args.engine, |engine, transports, runtime| golden_run(&args, &loaded.catalog, &cfg, engine, transports, runtime))
 }
 
 fn golden_run(
@@ -203,7 +208,7 @@ fn golden_run(
     catalog: &cuteafd_loader::OfficialV41Catalog,
     cfg: &DeepseekV4Config,
     engine: &engine::Engine<'_>,
-    transport: &mut V41Tp4Roce,
+    transports: &mut [V41Tp4Roce],
     runtime: &tokio::runtime::Runtime,
 ) -> Result<()> {
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
@@ -231,7 +236,7 @@ fn golden_run(
         };
         // Per-layer streams are compared only for a whole-prompt prefill.
         let whole = offset == 0 && end == tokens.len() && compare_layers > 0;
-        logits.extend(engine.prefill(&mut placement, &tokens[offset..end], &embed[offset * row..end * row], transport, runtime,
+        logits.extend(engine.prefill(&mut placement, &tokens[offset..end], &embed[offset * row..end * row], transports, runtime,
             end - offset, if whole { Some(&mut compare) } else { None })?);
         offset = end;
     }
@@ -241,7 +246,7 @@ fn golden_run(
     let decode_started = Instant::now();
     for position in prefill..tokens.len() {
         let token = tokens[position];
-        logits.extend(engine.decode(&mut [(&mut placement, token)], &embed[position * row..][..row], transport, runtime)?);
+        logits.extend(engine.decode(&mut [(&mut placement, token)], &embed[position * row..][..row], &mut transports[0], runtime)?);
     }
     let decode_steps = tokens.len() - prefill;
     if decode_steps > 0 {

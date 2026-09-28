@@ -26,7 +26,20 @@ pub struct V41Tp4Roce {
     capacity: u32,
     max_frame_bytes: usize,
     topology: Option<V41SparkTopology>,
+    /// A [`V41Tp4RoceWave`] was dispatched and not yet received.
+    wave_open: bool,
 }
+
+/// A dispatched wave that does not borrow its transport, so several
+/// transports can have waves in flight at once; complete it with
+/// [`V41Tp4Roce::receive_wave`] on the transport that dispatched it. A wave
+/// dropped without being received leaves its QPs mid-wave; the transport's
+/// next dispatch resets them first.
+pub struct V41Tp4RoceWave {
+    receiver: V41Tp4ChunkReceiver,
+    poll_quantum: std::time::Duration,
+}
+
 impl V41Tp4Roce {
     pub fn new(
         peers: [SocketAddr; 4],
@@ -121,6 +134,7 @@ impl V41Tp4Roce {
             capacity,
             max_frame_bytes: config.max_frame_bytes,
             topology,
+            wave_open: false,
         })
     }
     pub fn capacity(&self) -> u32 {
@@ -162,6 +176,43 @@ impl V41Tp4Roce {
         &'c mut self,
         request: &'r ExpertProtocolV2Request,
     ) -> Result<V41Tp4RocePending<'c, 'r>> {
+        let receiver = self.post(request)?;
+        Ok(V41Tp4RocePending {
+            receiver,
+            poll_quantum: poll_quantum(&request.rows),
+            owner: self,
+            _request: std::marker::PhantomData,
+            complete: false,
+        })
+    }
+
+    /// [`Self::dispatch`] returning an owned [`V41Tp4RoceWave`]. The clients
+    /// keep their own copy of the request, so it need not outlive the wave.
+    pub fn dispatch_wave(&mut self, request: &ExpertProtocolV2Request) -> Result<V41Tp4RoceWave> {
+        let receiver = self.post(request)?;
+        self.wave_open = true;
+        Ok(V41Tp4RoceWave { receiver, poll_quantum: poll_quantum(&request.rows) })
+    }
+
+    /// Accepts every row of `wave`, which this transport dispatched; the sink
+    /// contract is [`V41Tp4RocePending::receive`]'s.
+    pub async fn receive_wave<F>(&mut self, mut wave: V41Tp4RoceWave, mut sink: F) -> Result<()>
+    where
+        F: FnMut(usize, u32, &[u8]) -> Result<()>,
+    {
+        let result = drain(&mut self.clients, &mut wave.receiver, wave.poll_quantum,
+            |rank, start, payload| sink(rank, start, payload.as_ref())).await;
+        if result.is_err() {
+            self.reset_connections();
+        }
+        self.wave_open = false;
+        result
+    }
+
+    fn post(&mut self, request: &ExpertProtocolV2Request) -> Result<V41Tp4ChunkReceiver> {
+        if std::mem::take(&mut self.wave_open) {
+            self.reset_connections();
+        }
         let flagged = request.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG != 0;
         let receiver = match self.topology {
             Some(topology) => {
@@ -200,13 +251,7 @@ impl V41Tp4Roce {
             }
         };
         self.clients.dispatch(request)?;
-        Ok(V41Tp4RocePending {
-            receiver,
-            poll_quantum: poll_quantum(&request.rows),
-            owner: self,
-            _request: std::marker::PhantomData,
-            complete: false,
-        })
+        Ok(receiver)
     }
 }
 
@@ -229,51 +274,64 @@ impl V41Tp4RocePending<'_, '_> {
     /// Transfer validated payload ownership to the sink. Retain each payload
     /// until any asynchronous consumer completes, including on failure. A sink
     /// error abandons this whole wave and resets its QPs; it cannot be resumed.
-    pub async fn receive_owned<F>(mut self, mut sink: F) -> Result<()>
+    pub async fn receive_owned<F>(mut self, sink: F) -> Result<()>
     where
         F: FnMut(usize, u32, crate::VerbsHostProtocolV2ResponsePayload) -> Result<()>,
     {
-        // Give the other execution lane its first opportunity as soon as this
-        // wave must wait. A 250us initial spin can consume an entire small-row
-        // FFN and serialize two otherwise independent decode stacks. Subsequent
-        // decode polls yield after every unsuccessful poll so short GPU completions
-        // on the peer lane are not delayed by host-side receive spinning.
-        // Prefill/mixed waves retain 250us. Ready responses never yield.
-        let mut quantum = std::time::Instant::now();
-        let mut first_wait = true;
-        loop {
-            let receiver = &mut self.receiver;
-            if self.owner.clients.poll(|chunk| {
-                let mut location = None;
-                receiver.push_rdma(&chunk, |rank, start, _bytes| {
-                    ensure!(
-                        rank == chunk.stream_id,
-                        "native executor identity does not match its RoCE peer"
-                    );
-                    location = Some((rank, start));
-                    Ok(())
-                })?;
-                let (rank, start) = location.expect("validated chunk has a location");
-                sink(rank, start, chunk.partial_output_payload)
-            })? {
-                break;
-            }
-            if first_wait || quantum.elapsed() >= self.poll_quantum {
-                first_wait = false;
-                tokio::task::yield_now().await;
-                quantum = std::time::Instant::now();
-            } else {
-                std::hint::spin_loop();
-            }
-        }
-        ensure!(
-            self.receiver.complete(),
-            "native TP RoCE response coverage is incomplete"
-        );
+        drain(&mut self.owner.clients, &mut self.receiver, self.poll_quantum, sink).await?;
         self.complete = true;
         Ok(())
     }
 }
+/// Polls `clients` until `receiver` has every row, handing each payload to `sink`.
+async fn drain<F>(
+    clients: &mut LocalTp4Client,
+    receiver: &mut V41Tp4ChunkReceiver,
+    poll_quantum: std::time::Duration,
+    mut sink: F,
+) -> Result<()>
+where
+    F: FnMut(usize, u32, crate::VerbsHostProtocolV2ResponsePayload) -> Result<()>,
+{
+    // Give the other execution lane its first opportunity as soon as this
+    // wave must wait. A 250us initial spin can consume an entire small-row
+    // FFN and serialize two otherwise independent decode stacks. Subsequent
+    // decode polls yield after every unsuccessful poll so short GPU completions
+    // on the peer lane are not delayed by host-side receive spinning.
+    // Prefill/mixed waves retain 250us. Ready responses never yield.
+    let mut quantum = std::time::Instant::now();
+    let mut first_wait = true;
+    loop {
+        if clients.poll(|chunk| {
+            let mut location = None;
+            receiver.push_rdma(&chunk, |rank, start, _bytes| {
+                ensure!(
+                    rank == chunk.stream_id,
+                    "native executor identity does not match its RoCE peer"
+                );
+                location = Some((rank, start));
+                Ok(())
+            })?;
+            let (rank, start) = location.expect("validated chunk has a location");
+            sink(rank, start, chunk.partial_output_payload)
+        })? {
+            break;
+        }
+        if first_wait || quantum.elapsed() >= poll_quantum {
+            first_wait = false;
+            tokio::task::yield_now().await;
+            quantum = std::time::Instant::now();
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+    ensure!(
+        receiver.complete(),
+        "native TP RoCE response coverage is incomplete"
+    );
+    Ok(())
+}
+
 impl Drop for V41Tp4RocePending<'_, '_> {
     fn drop(&mut self) {
         if !self.complete {
