@@ -768,9 +768,14 @@ class DeepseekV4Layer:
         else:
             # sqrtsoftplus scores; select top-6 of (score + bias); weights = unbiased scores at
             # the selected ids, normalized (b12x adds 1e-20), x 1.5. Ties -> larger expert id.
-            plan = ops.route(T)
-            fused_moe.route_topk(plan, logits, torch.empty((T, k), dtype=torch.float32, device=dev),
-                                 topk_ids, topk_weights, correction_bias=w.gate_bias)
+            # TORCH FALLBACK: b12x fused_moe.route_topk's prepared launcher passes BLOCK_E to a
+            # compiled Triton kernel that no longer accepts it (sparkinfer 7fcc094e). model.py
+            # semantics: select on score + bias, weight with the unbiased score, normalize, scale.
+            scores = F.softplus(logits).sqrt()
+            ids = (scores + w.gate_bias.float()).topk(k, dim=-1).indices
+            wts = scores.gather(1, ids)
+            topk_weights.copy_(wts / wts.sum(dim=-1, keepdim=True) * cfg.route_scale)
+            topk_ids.copy_(ids.to(torch.int32))
 
         # 4b. routed experts: MXFP4 weights x MXFP8 activations (per-32 UE8M0), SwiGLU with
         #     clamp(up, +-10), clamp(gate, <=10), router weight applied (silu_v41: on the
