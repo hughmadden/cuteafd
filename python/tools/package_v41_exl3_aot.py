@@ -217,16 +217,17 @@ GEOMETRIES = {
 }
 
 
-def route_block(geometry: str, role: str, capacity: int) -> int:
+def route_block(geometry: str, capacity: int) -> int:
     """Packed-route M block per capacity: rows of one expert that share a Trellis decode.
 
     V4.1 keeps its qualified 8-row blocks everywhere. DeepSeek V4 Pro Spark prefill
     (H7168, 384 experts, top-6: ~64 rows per expert at 4096 rows) re-decodes every
     weight tile once per 8 rows, so wide prefill capacities use wider blocks
     (GB10, TP4 width 768, random top-6 routes: m4096 53 -> 25 ms, m1024 15 -> 11 ms;
-    m81..256 stays fastest at 8).
+    m81..256 stays fastest at 8). The coordinator's whole-intermediate rtx-tp1 package
+    gains the same way (RTX PRO 6000, width 3072: m4096 74 -> 35 ms, m1024 23 -> 16 ms).
     """
-    if geometry != 'dsv4p' or role != 'spark' or capacity <= 256:
+    if geometry != 'dsv4p' or capacity <= 256:
         return 8
     return 16 if capacity <= 1024 else 32
 
@@ -406,7 +407,7 @@ def build(args: argparse.Namespace) -> None:
                     options['tile'] = tile
                 if geometry != 'v41':
                     options['hidden'] = hidden
-                if (block := route_block(geometry, args.role, capacity)) != 8:
+                if (block := route_block(geometry, capacity)) != 8:
                     options['route_block'] = block
                 meta = export(raw, width, experts, capacity, tuple(args.bits), 'auto', topk, dtype, **options)
                 core = raw / 'libcuteafd_exl3.so'

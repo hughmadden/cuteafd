@@ -329,13 +329,12 @@ class PackageProfileTests(unittest.TestCase):
                             package.verify(copy, 'fixture-revision')
                     self.assertIn(expected, str(caught.exception))
 
-    def test_route_blocks_widen_only_for_dsv4p_spark_prefill(self):
-        """V4.1 and the coordinator keep 8-row blocks; V4 Pro Spark prefill widens."""
+    def test_route_blocks_widen_only_for_dsv4p_prefill(self):
+        """V4.1 and V4 Flash keep 8-row blocks; V4 Pro prefill widens (Spark and RTX)."""
         for capacity in (1, 16, 80, 256, 1024, 4096):
-            self.assertEqual(package.route_block('v41', 'spark', capacity), 8)
-            self.assertEqual(package.route_block('dsv4p', 'coordinator', capacity), 8)
-            self.assertEqual(package.route_block('dsv4f', 'spark', capacity), 8)
-        self.assertEqual([package.route_block('dsv4p', 'spark', c) for c in (1, 16, 80, 256, 1024, 4096)],
+            self.assertEqual(package.route_block('v41', capacity), 8)
+            self.assertEqual(package.route_block('dsv4f', capacity), 8)
+        self.assertEqual([package.route_block('dsv4p', c) for c in (1, 16, 80, 256, 1024, 4096)],
                          [8, 8, 8, 8, 16, 32])
 
     def test_verify_cross_checks_the_recorded_route_block(self):
