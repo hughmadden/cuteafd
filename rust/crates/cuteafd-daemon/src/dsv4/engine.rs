@@ -9,7 +9,7 @@ use super::metadata::{self, StepTables, INDEX_PAGE_BYTES, MAIN_PAGE_BYTES};
 use super::pool::{Placement, PoolShape};
 use std::cell::RefCell;
 use super::weights::{LayerWeights, ModelWeights};
-use crate::v41_memory::DeviceAllocation;
+use crate::v41_memory::{DeviceAllocation, HostAllocation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::dsv4::{Dsv4Program, Dsv4Programs, Dsv4Scalar};
 use cuteafd_ffi::NativeLibrary;
@@ -45,6 +45,27 @@ pub(crate) struct Engine<'a> {
     prefill_workspace: RefCell<Option<Workspace<'a>>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     pub profile: RefCell<Profile>,
+    graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
+}
+
+/// Everything a captured decode segment bakes in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct GraphKey {
+    layer: usize,
+    rows: usize,
+    attention: &'static str,
+    table_width: usize,
+    table_stride: usize,
+    previous: usize,
+}
+
+struct GraphExec<'a>(*mut c_void, &'a NativeLibrary);
+
+impl Drop for GraphExec<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the exec came from end_capture and is destroyed once.
+        let _ = unsafe { self.1.cuda_graph_exec_destroy(self.0) };
+    }
 }
 
 /// Host-visible phases of a step, for profiling.
@@ -127,6 +148,9 @@ struct Workspace<'a> {
     dummy: Dev<'a>,
     vocab_logits: Dev<'a>,
     tables: StepBuffers<'a>,
+    /// Pinned staging: router logits + wire rows down, rank partials up.
+    router_host: HostAllocation<'a>,
+    planes_host: RefCell<HostAllocation<'a>>,
     // Drops before its workspace below.
     head: cuteafd_ffi::dsv4::VocabularyHead<'a>,
     _head_workspace: Dev<'a>,
@@ -247,6 +271,7 @@ impl<'a> Engine<'a> {
             prefill_workspace: RefCell::new(None),
             decode_workspace: RefCell::new(None),
             profile: RefCell::new(Profile::default()),
+            graphs: RefCell::new(std::collections::HashMap::new()),
         })
     }
 
@@ -282,6 +307,8 @@ impl<'a> Engine<'a> {
             dummy: self.zeroed(4096)?,
             vocab_logits: self.alloc(t * self.cfg.vocab_size * 4)?,
             tables: self.step_buffers(t)?,
+            router_host: HostAllocation::new(self.library, t * (experts * 4 + h + h / 32))?,
+            planes_host: RefCell::new(HostAllocation::new(self.library, 4 * t * h * 2)?),
             // SAFETY: the workspace buffer lives in the same struct and drops
             // after the head (field order).
             head: unsafe { self.library.vocabulary_head(head_workspace.buffer.ptr, h as u32, t as u32)? },
@@ -423,63 +450,157 @@ impl<'a> Engine<'a> {
         self.library.copy_h2d(w.stream_a.buffer, &expanded)?;
         let rows = Dsv4Scalar::I32(t as i32);
         let cap = if tables.decode { self.decode_rows } else { self.prefill_rows };
-        let mode = if tables.decode { "decode" } else { "prefill" };
-        let (mut current, mut next) = (&w.stream_a, &w.stream_b);
+        let mut ranks = 0usize;
         for (layer, weights) in self.weights.layers.iter().enumerate() {
-            let cache = &self.pools[layer];
-            let ratio = weights.ratio;
-            let rope = if ratio == 0 { &self.rope_window } else { &self.rope_compressed };
-            // 1. mHC pre (attention) with attn_norm.
-            self.run("mhc_pre", &[
-                ("residual", current.buffer.ptr), ("fn", weights.ptr("attn.fn")?), ("scale", weights.ptr("attn.scale")?),
-                ("base", weights.ptr("attn.base")?), ("norm", weights.ptr("attn.norm")?), ("post", w.post.buffer.ptr),
-                ("comb", w.comb.buffer.ptr), ("y", w.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
-            ], &[rows])?;
-            // 2. producer: q/kv projections, window cache pack, query.
-            self.run(&format!("producer_m{cap}"), &[
-                ("hidden", w.y.buffer.ptr), ("positions", m.positions.buffer.ptr), ("main_slots", m.main_slots.buffer.ptr),
-                ("cos_sin", rope.buffer.ptr), ("w_qkv", weights.ptr("w_qkv")?), ("w_qkv_scale", weights.ptr("w_qkv_scale")?),
-                ("w_q", weights.ptr("w_q")?), ("w_q_scale", weights.ptr("w_q_scale")?), ("q_norm", weights.ptr("q_norm")?),
-                ("kv_norm", weights.ptr("kv_norm")?), ("main_kv_cache", cache.main.buffer.ptr), ("query", w.query.buffer.ptr),
-                ("q_rank", w.q_rank.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
-            ], &[rows])?;
-            // 3. compressor, index query and top-k.
-            let (attention, indexed_cache, indexed_indices, indexed_lengths) =
-                self.compress(layer, weights, cache, tables, &m, &w, rope, rows, cap)?;
-            // 4. sparse MLA over window + indexed slots with sink.
-            self.run(&format!("sparse_mla_{mode}_{attention}_m{cap}"), &[
-                ("q", w.query.buffer.ptr), ("swa_cache", cache.main.buffer.ptr), ("swa_indices", m.swa_indices.buffer.ptr),
-                ("swa_lengths", m.swa_lengths.buffer.ptr), ("indexed_cache", indexed_cache),
-                ("indexed_indices", indexed_indices), ("indexed_lengths", indexed_lengths),
-                ("attn_sink", weights.ptr("attn_sink")?), ("out", w.attn_out.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
-            ], &[rows])?;
-            // 5. wo with inverse RoPE.
-            self.run(&format!("wo_m{cap}"), &[
-                ("o", w.attn_out.buffer.ptr), ("positions", m.positions.buffer.ptr), ("cos_sin", rope.buffer.ptr),
-                ("wo_a", weights.ptr("wo_a")?), ("wo_a_scale", weights.ptr("wo_a_scale")?), ("wo_b", weights.ptr("wo_b")?),
-                ("wo_b_scale", weights.ptr("wo_b_scale")?), ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
-            ], &[rows])?;
-            // 6. mHC post (attention) fused with pre (FFN) + ffn_norm.
-            self.run(&format!("mhc_post_pre_m{cap}"), &[
-                ("x", w.delta.buffer.ptr), ("residual", current.buffer.ptr), ("prev_post", w.post.buffer.ptr),
-                ("prev_comb", w.comb.buffer.ptr), ("fn", weights.ptr("ffn.fn")?), ("scale", weights.ptr("ffn.scale")?),
-                ("base", weights.ptr("ffn.base")?), ("norm", weights.ptr("ffn.norm")?), ("residual_out", next.buffer.ptr),
-                ("post", w.post.buffer.ptr), ("comb", w.comb.buffer.ptr), ("y", w.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
-            ], &[rows])?;
-            std::mem::swap(&mut current, &mut next);
-            // 7. MoE: routed experts on the Sparks plus the shared expert.
-            self.ffn(layer, weights, tokens, &w, cap, transport, runtime)?;
-            // 8. mHC post (FFN) into the next layer's stream.
-            self.run("mhc_post", &[
-                ("x", w.delta.buffer.ptr), ("residual", current.buffer.ptr), ("prev_post", w.post.buffer.ptr),
-                ("prev_comb", w.comb.buffer.ptr), ("out", next.buffer.ptr),
-            ], &[rows])?;
-            std::mem::swap(&mut current, &mut next);
+            let previous = ranks;
+            // One segment: the previous layer's FFN reduce + mHC post, then this
+            // layer's attention, router and expert input quantization. Decode
+            // replays it as a CUDA graph keyed by everything it bakes in.
+            let segment = || -> Result<()> {
+                if previous > 0 {
+                    self.post(&w, previous, rows, layer - 1)?;
+                }
+                self.attention(layer, weights, tables, m, &w, rows, cap)
+            };
+            if tables.decode {
+                let key = GraphKey {
+                    layer,
+                    rows: t,
+                    attention: self.attention_kind(weights.ratio, tables),
+                    table_width: tables.c4_table_width,
+                    table_stride: tables.c4_table_stride,
+                    previous,
+                };
+                self.replay(key, segment)?;
+            } else {
+                segment()?;
+            }
+            ranks = self.exchange(layer, weights, tokens, &w, cap, transport, runtime)?;
             if !tables.decode {
-                on_layer(layer, &self.download(current, t * 4 * h * 2)?)?;
+                // The stream a layer hands on is complete only after its post.
+                self.post(&w, ranks, rows, layer)?;
+                on_layer(layer, &self.download(&w.stream_a, t * 4 * h * 2)?)?;
+                ranks = 0;
             }
         }
-        self.head(current, t, &w)
+        if ranks > 0 {
+            self.post(&w, ranks, rows, self.weights.layers.len() - 1)?;
+        }
+        self.head(&w.stream_a, t, &w)
+    }
+
+    /// Which sparse attention a layer runs this step.
+    fn attention_kind(&self, ratio: usize, tables: &StepTables) -> &'static str {
+        match ratio {
+            4 if tables.c4_groups > 0 => "c4",
+            128 if tables.c128_groups > 0 => "c128",
+            _ => "win",
+        }
+    }
+
+    /// Launches `segment` through a captured graph for `key`, capturing it the
+    /// first time.
+    fn replay(&self, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+        if let Some(graph) = self.graphs.borrow().get(&key) {
+            // SAFETY: the graph's pointers are persistent engine buffers.
+            return unsafe { self.library.cuda_graph_launch(graph.0, self.stream) };
+        }
+        // SAFETY: capture records launches on the engine stream; nothing in the
+        // segment synchronizes the host.
+        unsafe { self.library.cuda_graph_begin_capture(self.stream)? };
+        let captured = segment();
+        let exec = unsafe { self.library.cuda_graph_end_capture(self.stream) };
+        captured?;
+        let exec = exec?;
+        unsafe { self.library.cuda_graph_launch(exec, self.stream)? };
+        self.graphs.borrow_mut().insert(key, GraphExec(exec, self.library));
+        Ok(())
+    }
+
+    /// The layer's routed partials + shared expert, reduced, then mHC post
+    /// into stream a.
+    fn post(&self, w: &Workspace<'_>, ranks: usize, rows: Dsv4Scalar, layer: usize) -> Result<()> {
+        let Dsv4Scalar::I32(count) = rows else { unreachable!() };
+        let reducer = self.library.v41_compact_reducer()?;
+        let mut pointers = [std::ptr::null::<u16>(); 6];
+        for (slot, plane) in pointers.iter_mut().zip(&w.planes[..ranks]) {
+            *slot = plane.buffer.ptr.cast();
+        }
+        // SAFETY: planes, shared and delta are live [rows, h] BF16 buffers on
+        // this device, ordered after the plane uploads and shared FFN.
+        unsafe {
+            reducer.reduce_planes(pointers, ranks as u32, w.shared.buffer.ptr.cast(),
+                w.delta.buffer.ptr.cast(), count as u32, self.stream)
+                .with_context(|| format!("layer {layer} expert reduction"))?;
+        }
+        self.run("mhc_post", &[
+            ("x", w.delta.buffer.ptr), ("residual", w.stream_b.buffer.ptr), ("prev_post", w.post.buffer.ptr),
+            ("prev_comb", w.comb.buffer.ptr), ("out", w.stream_a.buffer.ptr),
+        ], &[rows])
+    }
+
+    /// mHC pre, producer, compressor/indexer, sparse MLA, wo, mHC post_pre,
+    /// router scores and expert input quantization (stream a -> stream b, y).
+    #[allow(clippy::too_many_arguments)]
+    fn attention(
+        &self,
+        layer: usize,
+        weights: &LayerWeights<'_>,
+        tables: &StepTables,
+        m: &StepBuffers<'_>,
+        w: &Workspace<'_>,
+        rows: Dsv4Scalar,
+        cap: usize,
+    ) -> Result<()> {
+        let cache = &self.pools[layer];
+        let ratio = weights.ratio;
+        let rope = if ratio == 0 { &self.rope_window } else { &self.rope_compressed };
+        let mode = if tables.decode { "decode" } else { "prefill" };
+        let (a, b) = (&w.stream_a, &w.stream_b);
+        self.run("mhc_pre", &[
+            ("residual", a.buffer.ptr), ("fn", weights.ptr("attn.fn")?), ("scale", weights.ptr("attn.scale")?),
+            ("base", weights.ptr("attn.base")?), ("norm", weights.ptr("attn.norm")?), ("post", w.post.buffer.ptr),
+            ("comb", w.comb.buffer.ptr), ("y", w.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
+        ], &[rows])?;
+        self.run(&format!("producer_m{cap}"), &[
+            ("hidden", w.y.buffer.ptr), ("positions", m.positions.buffer.ptr), ("main_slots", m.main_slots.buffer.ptr),
+            ("cos_sin", rope.buffer.ptr), ("w_qkv", weights.ptr("w_qkv")?), ("w_qkv_scale", weights.ptr("w_qkv_scale")?),
+            ("w_q", weights.ptr("w_q")?), ("w_q_scale", weights.ptr("w_q_scale")?), ("q_norm", weights.ptr("q_norm")?),
+            ("kv_norm", weights.ptr("kv_norm")?), ("main_kv_cache", cache.main.buffer.ptr), ("query", w.query.buffer.ptr),
+            ("q_rank", w.q_rank.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
+        ], &[rows])?;
+        let (attention, indexed_cache, indexed_indices, indexed_lengths) =
+            self.compress(layer, weights, cache, tables, m, w, rope, rows, cap)?;
+        debug_assert_eq!(attention, self.attention_kind(ratio, tables));
+        self.run(&format!("sparse_mla_{mode}_{attention}_m{cap}"), &[
+            ("q", w.query.buffer.ptr), ("swa_cache", cache.main.buffer.ptr), ("swa_indices", m.swa_indices.buffer.ptr),
+            ("swa_lengths", m.swa_lengths.buffer.ptr), ("indexed_cache", indexed_cache),
+            ("indexed_indices", indexed_indices), ("indexed_lengths", indexed_lengths),
+            ("attn_sink", weights.ptr("attn_sink")?), ("out", w.attn_out.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
+        ], &[rows])?;
+        self.run(&format!("wo_m{cap}"), &[
+            ("o", w.attn_out.buffer.ptr), ("positions", m.positions.buffer.ptr), ("cos_sin", rope.buffer.ptr),
+            ("wo_a", weights.ptr("wo_a")?), ("wo_a_scale", weights.ptr("wo_a_scale")?), ("wo_b", weights.ptr("wo_b")?),
+            ("wo_b_scale", weights.ptr("wo_b_scale")?), ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
+        ], &[rows])?;
+        self.run(&format!("mhc_post_pre_m{cap}"), &[
+            ("x", w.delta.buffer.ptr), ("residual", a.buffer.ptr), ("prev_post", w.post.buffer.ptr),
+            ("prev_comb", w.comb.buffer.ptr), ("fn", weights.ptr("ffn.fn")?), ("scale", weights.ptr("ffn.scale")?),
+            ("base", weights.ptr("ffn.base")?), ("norm", weights.ptr("ffn.norm")?), ("residual_out", b.buffer.ptr),
+            ("post", w.post.buffer.ptr), ("comb", w.comb.buffer.ptr), ("y", w.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
+        ], &[rows])?;
+        let Dsv4Scalar::I32(t) = rows else { unreachable!() };
+        let h = self.cfg.dim;
+        self.run("router_scores", &[
+            ("x", w.y.buffer.ptr), ("w", weights.ptr("gate")?), ("logits", w.logits.buffer.ptr),
+        ], &[rows])?;
+        let grid = (t as usize * h.div_ceil(256)).div_ceil(8).min(4 * self.sms as usize).max(1);
+        self.run("expert_input_quant", &[
+            ("source_ptr", w.y.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
+            // SAFETY: the scale rows follow the payload inside each wire row.
+            ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
+            ("scale_mma_ptr", w.dummy.buffer.ptr),
+        ], &[rows, Dsv4Scalar::I32(grid as i32)])
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -554,7 +675,10 @@ impl<'a> Engine<'a> {
         Ok(("c4", compressed, w.selected.buffer.ptr, m.c4_indexed_lengths.buffer.ptr))
     }
 
-    fn ffn(
+    /// Router download, shared expert launch, host routing, Spark exchange
+    /// and plane uploads; returns the Spark rank count.
+    #[allow(clippy::too_many_arguments)]
+    fn exchange(
         &self,
         layer: usize,
         weights: &LayerWeights<'_>,
@@ -563,24 +687,29 @@ impl<'a> Engine<'a> {
         cap: usize,
         transport: &mut V41Tp4Roce,
         runtime: &tokio::runtime::Runtime,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let t = tokens.len();
         let (h, experts, topk) = (self.cfg.dim, self.cfg.n_routed_experts, self.cfg.n_activated_experts);
         let rows = Dsv4Scalar::I32(t as i32);
-        self.run("router_scores", &[
-            ("x", w.y.buffer.ptr), ("w", weights.ptr("gate")?), ("logits", w.logits.buffer.ptr),
-        ], &[rows])?;
-        let grid = (t * h.div_ceil(256)).div_ceil(8).min(4 * self.sms as usize).max(1);
-        self.run("expert_input_quant", &[
-            ("source_ptr", w.y.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
-            // SAFETY: the scale rows follow the payload inside each wire row.
-            ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
-            ("scale_mma_ptr", w.dummy.buffer.ptr),
-        ], &[rows, Dsv4Scalar::I32(grid as i32)])?;
         let timer = Instant::now();
-        let logits: Vec<f32> = self.download(&w.logits, t * experts * 4)?
+        let (logit_bytes, wire_bytes) = (t * experts * 4, t * (h + h / 32));
+        let host = w.router_host.buffer;
+        let wire_host = cuteafd_ffi::CuteafdHostBuffer {
+            // SAFETY: the wire rows follow the logits inside the pinned buffer.
+            ptr: unsafe { host.ptr.cast::<u8>().add(logit_bytes) }.cast(),
+            bytes: host.bytes - logit_bytes,
+            ..host
+        };
+        // SAFETY: both pinned regions are large enough; the sync below completes them.
+        unsafe {
+            self.library.copy_d2h_host_buffer_async(host, w.logits.buffer, logit_bytes, self.stream)?;
+            self.library.copy_d2h_host_buffer_async(wire_host, w.wire.buffer, wire_bytes, self.stream)?;
+        }
+        self.sync()?;
+        let staged = w.router_host.bytes();
+        let logits: Vec<f32> = staged[..logit_bytes]
             .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-        let wire = self.download(&w.wire, t * (h + h / 32))?;
+        let wire = staged[logit_bytes..logit_bytes + wire_bytes].to_vec();
         self.profile.borrow_mut().add(Phase::RouterSync, timer);
         // The shared expert runs on the GPU while the Sparks compute.
         self.run(&format!("shared_ffn_m{cap}"), &[
@@ -629,31 +758,34 @@ impl<'a> Engine<'a> {
         let timer = Instant::now();
         // Each rank's partial rows land in its device plane straight from the
         // pinned receive slot.
+        let plane_bytes = t * row_bytes;
+        let mut staging = w.planes_host.borrow_mut();
+        ensure!(ranks * plane_bytes <= staging.buffer.bytes, "{ranks} rank planes exceed the pinned staging");
+        let bytes = staging.bytes_mut();
         runtime.block_on(async {
             let pending = transport.dispatch(&request).await?;
             pending.receive(|rank, first, payload| {
-                let offset = first as usize * row_bytes;
-                ensure!(offset + payload.len() <= t * row_bytes, "partial rows exceed the step");
-                let mut destination = w.planes[rank].buffer;
-                // SAFETY: the offset and length stay inside this plane (checked above).
-                destination.ptr = unsafe { destination.ptr.cast::<u8>().add(offset) }.cast();
-                destination.bytes = payload.len();
-                self.library.copy_h2d(destination, payload)
+                let offset = rank * plane_bytes + first as usize * row_bytes;
+                ensure!(first as usize * row_bytes + payload.len() <= plane_bytes, "partial rows exceed the step");
+                bytes[offset..offset + payload.len()].copy_from_slice(payload);
+                Ok(())
             }).await
         })?;
+        // One async upload per plane; the next segment's reduce is ordered
+        // after them, and the next router sync completes them before the
+        // staging is rewritten.
+        for rank in 0..ranks {
+            let source = cuteafd_ffi::CuteafdHostBuffer {
+                // SAFETY: rank planes are disjoint slices of the staging buffer.
+                ptr: unsafe { staging.buffer.ptr.cast::<u8>().add(rank * plane_bytes) }.cast(),
+                bytes: plane_bytes,
+                ..staging.buffer
+            };
+            // SAFETY: pinned source and device plane both hold `plane_bytes`.
+            unsafe { self.library.copy_host_buffer_h2d_async(w.planes[rank].buffer, source, plane_bytes, self.stream)? };
+        }
         self.profile.borrow_mut().add(Phase::Experts, timer);
-        let reducer = self.library.v41_compact_reducer()?;
-        let mut pointers = [std::ptr::null::<u16>(); 6];
-        for (slot, plane) in pointers.iter_mut().zip(&w.planes[..ranks]) {
-            *slot = plane.buffer.ptr.cast();
-        }
-        // SAFETY: planes, shared and delta are live [t, h] BF16 buffers on this
-        // device; the stream orders the shared FFN before the reduction.
-        unsafe {
-            reducer.reduce_planes(pointers, ranks as u32, w.shared.buffer.ptr.cast(),
-                w.delta.buffer.ptr.cast(), t as u32, self.stream)?;
-        }
-        Ok(())
+        Ok(ranks)
     }
 
     fn head(&self, stream: &Dev<'_>, t: usize, w: &Workspace<'_>) -> Result<Vec<f32>> {
