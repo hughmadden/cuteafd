@@ -16,7 +16,7 @@ args = parser.parse_args()
 torch.manual_seed(731)
 libs = [C.CDLL(args.baseline), C.CDLL(args.candidate)]
 for lib in libs:
-    lib.ds41rt_v41_hc_mixes.argtypes = [C.c_void_p] * 7 + [C.c_int32, C.c_void_p]
+    lib.cuteafd_v41_hc_mixes.argtypes = [C.c_void_p] * 7 + [C.c_int32, C.c_void_p]
 s = torch.cuda.Stream()
 results = []
 for rows in [1, 2, 6, 16, 17, 80, 256, 4096]:
@@ -33,10 +33,10 @@ for rows in [1, 2, 6, 16, 17, 80, 256, 4096]:
     for lib, out in zip(libs, outputs):
         graph = torch.cuda.CUDAGraph()
         ptrs = [t.data_ptr() for t in [r, fn, scale, base] + out]
-        assert lib.ds41rt_v41_hc_mixes(*ptrs, rows, s.cuda_stream) == 0
+        assert lib.cuteafd_v41_hc_mixes(*ptrs, rows, s.cuda_stream) == 0
         s.synchronize()
         with torch.cuda.graph(graph, stream=s):
-            assert lib.ds41rt_v41_hc_mixes(*ptrs, rows, s.cuda_stream) == 0
+            assert lib.cuteafd_v41_hc_mixes(*ptrs, rows, s.cuda_stream) == 0
         graphs.append(graph)
     for kind in ["random", "zero", "large", "small"]:
         with torch.cuda.stream(s):
@@ -103,7 +103,7 @@ if args.snapshot:
             torch.cuda.synchronize()
             for lib, out in zip(libs, outputs):
                 assert (
-                    lib.ds41rt_v41_hc_mixes(
+                    lib.cuteafd_v41_hc_mixes(
                         *[t.data_ptr() for t in [r, fn, scale, base] + out],
                         rows,
                         s.cuda_stream,

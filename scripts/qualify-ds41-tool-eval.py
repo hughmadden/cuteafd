@@ -44,7 +44,7 @@ def collect(directory):
                    output_cap=config['extra_params'].get('max_tokens', 4096),
                    output_cap_override=config['extra_params'].get('max_tokens'),
                    output_cap_source='explicit override' if 'max_tokens' in config['extra_params'] else 'benchmark default',
-                   backend_note='vllm is the compatibility adapter label; the server is ds41rt serve-native.')
+                   backend_note='vllm is the compatibility adapter label; the server is cuteafd serve-native.')
     (directory / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2) + '\n')
     return summary
 

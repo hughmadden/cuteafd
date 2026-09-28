@@ -24,7 +24,7 @@ QUALIFIER = ROOT / "python" / "tools" / "qualify_v41_replicated_native.py"
 WIP = ROOT / "wip.sh"
 CMAKE = ROOT / "native" / "CMakeLists.txt"
 CMAKE_TP = ROOT / "native" / "cmake" / "v41_spark_tp_experts.cmake"
-HEADER = ROOT / "native" / "include" / "ds41rt_v41_experts.h"
+HEADER = ROOT / "native" / "include" / "cuteafd_v41_experts.h"
 PACK = ROOT / "native" / "cuda" / "kernels" / "v41_expert_pack.cu"
 WRAPPER_TP6 = ROOT / "native" / "src" / "v41_spark_tp6_experts.cc"
 BUILD = ROOT / "build.sh"
@@ -161,7 +161,7 @@ def test_ordinary_exporter_routes_tp6_only_through_fp8_slices() -> None:
 
 def test_native_helper_selects_the_tp6_symbol_family() -> None:
     source = NATIVE_HELPER.read_text(encoding="utf-8")
-    assert '6: "ds41rt_v41_spark_tp6_expert_"' in source
+    assert '6: "cuteafd_v41_spark_tp6_expert_"' in source
     assert "assert spark_tp in (None, 2, 3, 6)" in source
     assert "(7, 384, 5120, 384, 384, 6, capacity, 7) if spark_tp == 6" in source
 
@@ -169,15 +169,15 @@ def test_native_helper_selects_the_tp6_symbol_family() -> None:
 def test_cmake_wiring_is_opt_in_and_precompiles_capacities() -> None:
     tp = CMAKE_TP.read_text(encoding="utf-8")
     assert "tp2, tp3 and tp6" in tp
-    assert 'set(DS41RT_V41_SPARK_TP6_SLICE_WIDTH' in tp
+    assert 'set(CUTEAFD_V41_SPARK_TP6_SLICE_WIDTH' in tp
     assert f'"{DEFAULT_WIDTH_MAP}"' in tp
     assert "v41_spark_tp6_experts.cc" in tp
     assert "v41_spark_tp6_expert_variants.h" in tp
     assert "src/v41_spark_tp6_experts.cc" in tp
     # The new role must not change the existing TP2/TP3 selector contract.
-    assert 'DS41RT_V41_SPARK_TP_EXPERT_ROWS_ARG "1,16,80,256,1024,4096"' in tp
+    assert 'CUTEAFD_V41_SPARK_TP_EXPERT_ROWS_ARG "1,16,80,256,1024,4096"' in tp
     assert "--atomic-min-capacity 256" in tp
-    assert 'if(NOT DS41RT_V41_SPARK_TP_ROLES STREQUAL "")' in CMAKE.read_text(
+    assert 'if(NOT CUTEAFD_V41_SPARK_TP_ROLES STREQUAL "")' in CMAKE.read_text(
         encoding="utf-8"
     )
 
@@ -186,12 +186,12 @@ def test_native_role_ids_and_packer_extent_are_declared() -> None:
     header = HEADER.read_text(encoding="utf-8")
     assert "7: Spark TP6 shard (intermediate 384, no padding)" in header
     for symbol in (
-        "ds41rt_v41_spark_tp6_expert_info",
-        "ds41rt_v41_spark_tp6_expert_initialize",
-        "ds41rt_v41_spark_tp6_expert_launch",
-        "ds41rt_v41_spark_tp6_expert_bind_scratch",
-        "ds41rt_v41_spark_tp6_expert_initialize_scratch_async",
-        "ds41rt_v41_spark_tp6_expert_output_kind",
+        "cuteafd_v41_spark_tp6_expert_info",
+        "cuteafd_v41_spark_tp6_expert_initialize",
+        "cuteafd_v41_spark_tp6_expert_launch",
+        "cuteafd_v41_spark_tp6_expert_bind_scratch",
+        "cuteafd_v41_spark_tp6_expert_initialize_scratch_async",
+        "cuteafd_v41_spark_tp6_expert_output_kind",
     ):
         assert symbol in header, symbol
 
@@ -200,15 +200,15 @@ def test_native_role_ids_and_packer_extent_are_declared() -> None:
     assert "intermediate % 32 != 0" in pack
 
     wrapper = WRAPPER_TP6.read_text(encoding="utf-8")
-    assert "#define DS41RT_V41_SPARK_TP6_EXPERTS 1" in wrapper
+    assert "#define CUTEAFD_V41_SPARK_TP6_EXPERTS 1" in wrapper
     for suffix in ("info", "initialize", "output_kind", "bind_scratch",
                    "initialize_scratch_async", "launch"):
-        assert f"#define ds41rt_v41_expert_{suffix} ds41rt_v41_spark_tp6_expert_{suffix}" in wrapper
+        assert f"#define cuteafd_v41_expert_{suffix} cuteafd_v41_spark_tp6_expert_{suffix}" in wrapper
     # The canonical FP8 quantizer stays in exactly one translation unit.
     experts_source = (ROOT / "native" / "src" / "v41_experts.cc").read_text(
         encoding="utf-8"
     )
-    assert "!defined(DS41RT_V41_SPARK_TP6_EXPERTS)" in experts_source
+    assert "!defined(CUTEAFD_V41_SPARK_TP6_EXPERTS)" in experts_source
     assert '#include "v41_spark_tp6_expert_variants.h"' in experts_source
 
 
@@ -219,18 +219,18 @@ def test_build_selectors_accept_a_tp6_role() -> None:
     # an explicit SUBSET override. The `${VAR-default}` spelling keeps an
     # empty override as the legacy TP4-only request.
     assert 'release_universal_spark_tp_roles="tp2;tp3;tp6"' in build
-    assert "${DS41RT_RELEASE_SPARK_TP_ROLES-$release_universal_spark_tp_roles}" in build
+    assert "${CUTEAFD_RELEASE_SPARK_TP_ROLES-$release_universal_spark_tp_roles}" in build
     assert "tp2|tp3|tp6)" in build
     assert "accepts only tp2, tp3 and tp6" in build
     assert "NON-UNIVERSAL expert role subset" in build
 
     release = RELEASE_ARTIFACTS.read_text(encoding="utf-8")
     assert "tp2|tp3|tp6)" in release
-    assert "DS41RT_RELEASE_SPARK_TP_ROLES accepts only tp2, tp3 and tp6" in release
+    assert "CUTEAFD_RELEASE_SPARK_TP_ROLES accepts only tp2, tp3 and tp6" in release
 
     wip = WIP_ARTIFACTS.read_text(encoding="utf-8")
     assert "tp2|tp3|tp6)" in wip
-    assert "DS41RT_WIP_SPARK_TP_ROLES accepts only tp2, tp3 and tp6" in wip
+    assert "CUTEAFD_WIP_SPARK_TP_ROLES accepts only tp2, tp3 and tp6" in wip
 
 
 def test_tp_manifest_writer_knows_the_tp6_geometry_and_symbols() -> None:
@@ -240,8 +240,8 @@ def test_tp_manifest_writer_knows_the_tp6_geometry_and_symbols() -> None:
     )
     assert tables["ROLE_TP_DEGREE"]["tp6"] == 6
     assert tables["ROLE_INTERMEDIATE"]["tp6"] == 384
-    assert tables["ROLE_INFO_SYMBOL"]["tp6"] == "ds41rt_v41_spark_tp6_expert_info"
-    assert tables["ROLE_LAUNCH_SYMBOL"]["tp6"] == "ds41rt_v41_spark_tp6_expert_launch"
+    assert tables["ROLE_INFO_SYMBOL"]["tp6"] == "cuteafd_v41_spark_tp6_expert_info"
+    assert tables["ROLE_LAUNCH_SYMBOL"]["tp6"] == "cuteafd_v41_spark_tp6_expert_launch"
     source = MANIFEST.read_text(encoding="utf-8")
     assert "expected tp2, tp3 or tp6" in source
 
@@ -533,7 +533,7 @@ def _load_qualifier(torch):
         sys.path.insert(0, str(TOOLS))
     import importlib.util as _u
 
-    spec = _u.spec_from_file_location("ds41rt_tp6_qualifier", QUALIFIER)
+    spec = _u.spec_from_file_location("cuteafd_tp6_qualifier", QUALIFIER)
     module = _u.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -570,7 +570,7 @@ class _FakeLibrary:
             C.memmove(out, (C.c_int32 * len(data))(*data), C.sizeof(_Info))
             return 0
 
-        self.ds41rt_v41_expert_info = _info_fn
+        self.cuteafd_v41_expert_info = _info_fn
 
 
 def test_qualifier_role_tables_cover_tp6() -> None:
@@ -631,7 +631,7 @@ def test_geometry_test_is_registered_with_the_real_name() -> None:
     """CMake, the gate wrapper and the packer test must agree on one name."""
     cmake = (ROOT / "native" / "CMakeLists.txt").read_text(encoding="utf-8")
     assert "tests/v41_expert_pack_geometry_selftest.cc" in cmake
-    assert "ds41rt_v41_expert_pack_geometry_selftest" in cmake
+    assert "cuteafd_v41_expert_pack_geometry_selftest" in cmake
     # The superseded per-degree file must not linger unreferenced.
     assert "v41_expert_pack_tp6_selftest" not in cmake
     assert not (ROOT / "native" / "tests" / "v41_expert_pack_tp6_selftest.cc").exists()
@@ -643,7 +643,7 @@ def test_geometry_test_is_registered_with_the_real_name() -> None:
     # missing oracle must.
     geometry = (ROOT / "native" / "tests" /
                 "v41_expert_pack_geometry_selftest.cc").read_text(encoding="utf-8")
-    for token in ("reference_pack", "DS41RT_REQUIRE_CUDA",
+    for token in ("reference_pack", "CUTEAFD_REQUIRE_CUDA",
                   '{"tp6", 384, 0}', '{"tp3", 768, 0}', '{"tp2", 1152, 0}',
                   '{"tp4", 576, 0}', '{"full", 2304, 0}'):
         assert token in geometry, token

@@ -97,7 +97,7 @@ def inspect_tiers(root):
                        for key in sorted(counts) for scope,projection,bits in [key]],
                 shapes=[dict(projection=p,bits=b,suh=list(a),svh=list(c),trellis=list(t),tensors=count)
                         for (p,b,a,c,t),count in sorted(shapes.items())],
-                metadata=config['meta']['ds41rt'])
+                metadata=config['meta']['cuteafd'])
 
 
 def main():

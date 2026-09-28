@@ -54,12 +54,12 @@ def main():
          device=torch.cuda.get_device_name(), scope=__doc__)
     lib = library(str(opt.native_lib))
     for name, types in {
-        'ds41rt_v41_expert_input_quant_initialize': [C.POINTER(P)],
-        'ds41rt_v41_expert_input_quantize_async': [P, P, P, U, P],
-        'ds41rt_v41_reduce_routes_async': [C.POINTER(P), P, P, U, U, U, P],
+        'cuteafd_v41_expert_input_quant_initialize': [C.POINTER(P)],
+        'cuteafd_v41_expert_input_quantize_async': [P, P, P, U, P],
+        'cuteafd_v41_reduce_routes_async': [C.POINTER(P), P, P, U, U, U, P],
     }.items():
         fn = getattr(lib, name); fn.argtypes = types; fn.restype = C.c_int32
-    quant = P(); check(lib.ds41rt_v41_expert_input_quant_initialize(C.byref(quant)))
+    quant = P(); check(lib.cuteafd_v41_expert_input_quant_initialize(C.byref(quant)))
     sizes = [n*h, n*h//16, n*h//2, n*h//32]
     weights = [torch.empty((experts, size), dtype=torch.uint8, device='cuda') for size in sizes]
     index = json.loads((opt.snapshot/'model.safetensors.index.json').read_text())['weight_map']
@@ -79,7 +79,7 @@ def main():
                     assert tuple(t.shape) == shape, (key, t.shape)
                     assert t.dtype == (torch.int8 if suffix == 'weight' else torch.float8_e8m0fnu), (key, t.dtype)
                     sources.append(t.view(torch.uint8).contiguous().cuda())
-            check(lib.ds41rt_v41_pack_expert_async((P*6)(*[t.data_ptr() for t in sources]),
+            check(lib.cuteafd_v41_pack_expert_async((P*6)(*[t.data_ptr() for t in sources]),
                 (P*4)(*[t[expert].data_ptr() for t in weights]), n, torch.cuda.current_stream().cuda_stream))
         torch.cuda.synchronize()
     emit('loaded', experts=experts, bytes=sum(t.numel() for t in weights))
@@ -121,7 +121,7 @@ def main():
     if candidate is not None:
         outputs['candidate'] = torch.empty_like(shared)
     def finish(route_output, out, rows):
-        check(lib.ds41rt_v41_reduce_routes_async((P*4)(route_output.data_ptr(), None, None, None),
+        check(lib.cuteafd_v41_reduce_routes_async((P*4)(route_output.data_ptr(), None, None, None),
               shared.data_ptr(), out.data_ptr(), rows, 1, topk, torch.cuda.current_stream().cuda_stream))
     for case in ('shared', 'dispersed'):
         for rows in opt.rows:
@@ -145,7 +145,7 @@ def main():
                         candidate.run(rows); result = candidate.output
                     else:
                         partial, result, args, fn, ra, reducer = variants[arm]
-                        check(lib.ds41rt_v41_expert_input_quantize_async(quant, x.data_ptr(), wire.data_ptr(), rows,
+                        check(lib.cuteafd_v41_expert_input_quantize_async(quant, x.data_ptr(), wire.data_ptr(), rows,
                               torch.cuda.current_stream().cuda_stream))
                         planner(*pa, current_cuda_stream())
                         fn(*args, rows, current_cuda_stream(), pa[6], min(rows*topk, experts + max(rows*topk-experts, 0)//16))

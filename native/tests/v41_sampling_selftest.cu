@@ -2,12 +2,12 @@
  *
  * Style follows `native/tests/cuda_selftest.cc`: plain `assert`-like checks with
  * `std::abort` on failure and a `passed` line on success. This file tests the
- * *shipped* entry point from the linked `ds41rt_native` library; it does not
+ * *shipped* entry point from the linked `cuteafd_native` library; it does not
  * compile the kernel itself, so it also pins the exported C ABI.
  *
  * The CPU oracle below is a faithful port of the production reference's greedy
  * branch and of the K1 scalar chain
- * (`rust/crates/ds41rt-core/src/target_sampling.rs`), which is the frozen
+ * (`rust/crates/cuteafd-core/src/target_sampling.rs`), which is the frozen
  * correctness oracle. The reviewer must diff this port against
  * `reference_select` line by line (design §12.1, §12.11): chunk 1's device scope
  * is exactly the greedy/constrained branch plus the K1 reductions, so only that
@@ -22,7 +22,7 @@
  * batch/order/peer independence.
  */
 
-#include "ds41rt_native.h"
+#include "cuteafd_native.h"
 
 #include <cuda_runtime_api.h>
 
@@ -96,8 +96,8 @@ struct RefGreedy {
   /* Expected per-row status, exactly as the CPU contract reports it
    * (`target_sampling.rs` / `scores.rs::argmax`). Tokens are only meaningful
    * when `ok`; `nonfinite_token` is the lowest offending id. */
-  uint32_t stochastic_status = DS41RT_V41_SAMPLER_STATUS_OK;
-  uint32_t nonfinite_token = DS41RT_V41_SAMPLER_NO_DETAIL;
+  uint32_t stochastic_status = CUTEAFD_V41_SAMPLER_STATUS_OK;
+  uint32_t nonfinite_token = CUTEAFD_V41_SAMPLER_NO_DETAIL;
   uint32_t token = 0;
   float maximum = -std::numeric_limits<float>::infinity();
   /* Scalars the stochastic K1 chain would report; only valid when is_greedy. */
@@ -120,12 +120,12 @@ RefGreedy cpu_reference(const float* logits, size_t vocab,
    * all-allowed and never reads the arena, exactly as `constraints.rs` passes
    * `None` for `needs_mask == false`. */
   const bool unconstrained =
-      mask_words == nullptr || (flags & DS41RT_V41_SAMPLER_FLAG_NO_MASK) != 0u;
+      mask_words == nullptr || (flags & CUTEAFD_V41_SAMPLER_FLAG_NO_MASK) != 0u;
   const auto allowed = [&](size_t token) {
     return unconstrained || ((mask_words[token / 32u] >> (token % 32u)) & 1u) != 0u;
   };
   const bool greedy = is_greedy(temperature, top_k) ||
-                      (flags & DS41RT_V41_SAMPLER_FLAG_GREEDY) != 0u;
+                      (flags & CUTEAFD_V41_SAMPLER_FLAG_GREEDY) != 0u;
   if (greedy) {
     float maximum = -std::numeric_limits<float>::infinity();
     bool have = false;
@@ -134,7 +134,7 @@ RefGreedy cpu_reference(const float* logits, size_t vocab,
       /* Strict whole-row finiteness first, then the mask test: exactly
        * `scores.rs::argmax` (`:160-163`). */
       if (!std::isfinite(logit)) {
-        out.stochastic_status = DS41RT_V41_SAMPLER_STATUS_NONFINITE_LOGIT;
+        out.stochastic_status = CUTEAFD_V41_SAMPLER_STATUS_NONFINITE_LOGIT;
         out.nonfinite_token = static_cast<uint32_t>(token);
         return out;
       }
@@ -150,7 +150,7 @@ RefGreedy cpu_reference(const float* logits, size_t vocab,
     out.ok = have;
     out.maximum = maximum;
     if (!have) {
-      out.stochastic_status = DS41RT_V41_SAMPLER_STATUS_EMPTY_CANDIDATES;
+      out.stochastic_status = CUTEAFD_V41_SAMPLER_STATUS_EMPTY_CANDIDATES;
     }
     return out;
   }
@@ -164,7 +164,7 @@ RefGreedy cpu_reference(const float* logits, size_t vocab,
     }
     const float logit = logits[token];
     if (!std::isfinite(logit)) {
-      out.stochastic_status = DS41RT_V41_SAMPLER_STATUS_NONFINITE_LOGIT;
+      out.stochastic_status = CUTEAFD_V41_SAMPLER_STATUS_NONFINITE_LOGIT;
       out.nonfinite_token = static_cast<uint32_t>(token);
       return out;
     }
@@ -173,11 +173,11 @@ RefGreedy cpu_reference(const float* logits, size_t vocab,
   }
   out.allowed_count = allowed_count;
   if (allowed_count == 0) {
-    out.stochastic_status = DS41RT_V41_SAMPLER_STATUS_EMPTY_CANDIDATES;
+    out.stochastic_status = CUTEAFD_V41_SAMPLER_STATUS_EMPTY_CANDIDATES;
     return out;
   }
   if (!std::isfinite(max_scaled)) {
-    out.stochastic_status = DS41RT_V41_SAMPLER_STATUS_INVALID_TEMPERATURE;
+    out.stochastic_status = CUTEAFD_V41_SAMPLER_STATUS_INVALID_TEMPERATURE;
     return out;
   }
   out.ok = true;
@@ -194,7 +194,7 @@ RefGreedy cpu_reference(const float* logits, size_t vocab,
 
 /* ---- device plumbing ---- */
 struct K1 {
-  ds41rt_v41_sampler_row_t* params = nullptr;
+  cuteafd_v41_sampler_row_t* params = nullptr;
   uint32_t* mask = nullptr;
   uint32_t* ids = nullptr;
   uint32_t* status = nullptr;
@@ -202,7 +202,7 @@ struct K1 {
   float* scores = nullptr;
   float* total = nullptr;
   uint32_t* nucleus = nullptr;
-  ds41rt_v41_sampler_scratch_t* scratch = nullptr;
+  cuteafd_v41_sampler_scratch_t* scratch = nullptr;
   float* logits = nullptr;
   size_t rows = 0;
   size_t vocab = 0;
@@ -233,12 +233,12 @@ K1 make_k1(size_t rows, size_t vocab, bool with_mask, bool diagnose) {
   k.vocab = vocab;
   k.words = with_mask ? (vocab + 31u) / 32u : 0u;
   alloc_device(&k.logits, rows * vocab * sizeof(float), "logits");
-  alloc_device(&k.params, rows * sizeof(ds41rt_v41_sampler_row_t), "params");
+  alloc_device(&k.params, rows * sizeof(cuteafd_v41_sampler_row_t), "params");
   alloc_device(&k.ids, rows * sizeof(uint32_t), "ids");
   alloc_device(&k.status, rows * sizeof(uint32_t), "status");
   alloc_device(&k.detail, rows * sizeof(uint32_t), "detail");
   alloc_device(&k.scores, rows * sizeof(float), "scores");
-  alloc_device(&k.scratch, rows * sizeof(ds41rt_v41_sampler_scratch_t), "scratch");
+  alloc_device(&k.scratch, rows * sizeof(cuteafd_v41_sampler_scratch_t), "scratch");
   if (with_mask) {
     alloc_device(&k.mask, rows * k.words * sizeof(uint32_t), "mask");
   }
@@ -258,10 +258,10 @@ void free_k1(K1* k) {
   *k = K1{};
 }
 
-ds41rt_v41_sampler_row_t row(uint32_t output_row, float temperature, uint32_t top_k,
+cuteafd_v41_sampler_row_t row(uint32_t output_row, float temperature, uint32_t top_k,
                              float min_p, float ln_min_p, uint32_t mask_row,
                              uint32_t flags) {
-  ds41rt_v41_sampler_row_t value = {};
+  cuteafd_v41_sampler_row_t value = {};
   value.seed = 0x7f4a7c159e3779b9ull;
   value.position = 17;
   value.temperature = temperature;
@@ -278,7 +278,7 @@ ds41rt_v41_sampler_row_t row(uint32_t output_row, float temperature, uint32_t to
 /* Runs one K1 configuration against the oracle and asserts exact agreement for
  * every greedy row and the exact K1 scalars for every stochastic row. */
 void run_case(const std::vector<float>& logits, size_t rows, size_t vocab,
-              const std::vector<ds41rt_v41_sampler_row_t>& params,
+              const std::vector<cuteafd_v41_sampler_row_t>& params,
               const std::vector<uint32_t>& mask, bool with_mask, bool strict_mask_bits,
               const char* label) {
   ++g_cases;
@@ -286,29 +286,29 @@ void run_case(const std::vector<float>& logits, size_t rows, size_t vocab,
   require_cuda(cudaMemcpy(k.logits, logits.data(), logits.size() * sizeof(float),
                           cudaMemcpyHostToDevice), "logits h2d");
   require_cuda(cudaMemcpy(k.params, params.data(),
-                          params.size() * sizeof(ds41rt_v41_sampler_row_t),
+                          params.size() * sizeof(cuteafd_v41_sampler_row_t),
                           cudaMemcpyHostToDevice), "params h2d");
   std::vector<uint32_t> device_mask = mask;
   if (with_mask) {
     if (strict_mask_bits) {
       for (size_t r = 0; r < rows; ++r) {
-        ds41rt_v41_sampler_clear_remainder(device_mask.data() + r * k.words, vocab);
+        cuteafd_v41_sampler_clear_remainder(device_mask.data() + r * k.words, vocab);
       }
     }
     require_cuda(cudaMemcpy(k.mask, device_mask.data(),
                             device_mask.size() * sizeof(uint32_t),
                             cudaMemcpyHostToDevice), "mask h2d");
   }
-  const ds41rt_status_t launch = ds41rt_cuda_v41_target_sample(
+  const cuteafd_status_t launch = cuteafd_cuda_v41_target_sample(
       k.logits, rows, vocab, vocab, k.params, with_mask ? k.mask : nullptr,
       with_mask ? k.words : 0u, k.ids, k.status, k.detail, k.scores, k.total,
       k.nucleus, k.scratch);
-  expect(launch == DS41RT_STATUS_OK, std::string(label) + ": launch status");
+  expect(launch == CUTEAFD_STATUS_OK, std::string(label) + ": launch status");
   require_cuda(cudaDeviceSynchronize(), "kernel");
 
   std::vector<uint32_t> ids(rows), status(rows), detail(rows), nucleus(rows);
   std::vector<float> scores(rows), total(rows);
-  std::vector<ds41rt_v41_sampler_scratch_t> scratch(rows);
+  std::vector<cuteafd_v41_sampler_scratch_t> scratch(rows);
   require_cuda(cudaMemcpy(ids.data(), k.ids, rows * 4, cudaMemcpyDeviceToHost), "ids");
   require_cuda(cudaMemcpy(status.data(), k.status, rows * 4, cudaMemcpyDeviceToHost), "status");
   require_cuda(cudaMemcpy(detail.data(), k.detail, rows * 4, cudaMemcpyDeviceToHost), "detail");
@@ -316,18 +316,18 @@ void run_case(const std::vector<float>& logits, size_t rows, size_t vocab,
   require_cuda(cudaMemcpy(total.data(), k.total, rows * 4, cudaMemcpyDeviceToHost), "total");
   require_cuda(cudaMemcpy(nucleus.data(), k.nucleus, rows * 4, cudaMemcpyDeviceToHost), "nucleus");
   require_cuda(cudaMemcpy(scratch.data(), k.scratch,
-                          rows * sizeof(ds41rt_v41_sampler_scratch_t),
+                          rows * sizeof(cuteafd_v41_sampler_scratch_t),
                           cudaMemcpyDeviceToHost), "scratch");
 
   for (size_t r = 0; r < rows; ++r) {
-    const ds41rt_v41_sampler_row_t& p = params[r];
+    const cuteafd_v41_sampler_row_t& p = params[r];
     const bool greedy = is_greedy(p.temperature, p.top_k) ||
-                        (p.flags & DS41RT_V41_SAMPLER_FLAG_GREEDY) != 0u;
+                        (p.flags & CUTEAFD_V41_SAMPLER_FLAG_GREEDY) != 0u;
     /* A NO_MASK row carries the 0xFFFFFFFF sentinel, so it must not be turned
      * into a host pointer at all. */
     const bool unconstrained =
-        (p.flags & DS41RT_V41_SAMPLER_FLAG_NO_MASK) != 0u ||
-        p.mask_row == DS41RT_V41_SAMPLER_NO_MASK_ROW;
+        (p.flags & CUTEAFD_V41_SAMPLER_FLAG_NO_MASK) != 0u ||
+        p.mask_row == CUTEAFD_V41_SAMPLER_NO_MASK_ROW;
     const uint32_t* row_mask = (with_mask && !unconstrained)
         ? device_mask.data() + static_cast<size_t>(p.mask_row) * k.words
         : nullptr;
@@ -345,7 +345,7 @@ void run_case(const std::vector<float>& logits, size_t rows, size_t vocab,
                 << " allowed=" << scratch[r].allowed_count << "\n";
     }
     expect(status[r] == expected.stochastic_status, tag + ": status");
-    if (expected.stochastic_status == DS41RT_V41_SAMPLER_STATUS_NONFINITE_LOGIT) {
+    if (expected.stochastic_status == CUTEAFD_V41_SAMPLER_STATUS_NONFINITE_LOGIT) {
       expect(detail[r] == expected.nonfinite_token, tag + ": nonfinite detail");
       expect(scratch[r].nonfinite_token == expected.nonfinite_token,
              tag + ": scratch nonfinite token");
@@ -357,19 +357,19 @@ void run_case(const std::vector<float>& logits, size_t rows, size_t vocab,
         expect(ids[r] == expected.token, tag + ": greedy id");
         expect(scores[r] == expected.maximum, tag + ": greedy raw max score");
       }
-    } else if (expected.stochastic_status == DS41RT_V41_SAMPLER_STATUS_OK) {
+    } else if (expected.stochastic_status == CUTEAFD_V41_SAMPLER_STATUS_OK) {
       /* Count-only K1 outputs must be exact: no accumulation is involved. */
       expect(scratch[r].max_scaled == expected.max_scaled, tag + ": max_scaled bits");
       expect(scratch[r].allowed_count == expected.allowed_count, tag + ": allowed_count");
       expect(scratch[r].survivor_count == expected.survivor_count, tag + ": survivor_count");
-      if ((p.flags & DS41RT_V41_SAMPLER_FLAG_DIAGNOSE) != 0u) {
+      if ((p.flags & CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE) != 0u) {
         expect(nucleus[r] == expected.survivor_count, tag + ": out_nucleus_count");
         expect(total[r] == expected.max_scaled, tag + ": out_total");
       }
       expect(scratch[r].inv_temperature == 1.0f / p.temperature, tag + ": inv_temperature");
-      expect(scratch[r].nonfinite_token == DS41RT_V41_SAMPLER_NO_DETAIL,
+      expect(scratch[r].nonfinite_token == CUTEAFD_V41_SAMPLER_NO_DETAIL,
              tag + ": no nonfinite");
-      expect(detail[r] == DS41RT_V41_SAMPLER_NO_DETAIL, tag + ": detail sentinel");
+      expect(detail[r] == CUTEAFD_V41_SAMPLER_NO_DETAIL, tag + ": detail sentinel");
     }
   }
   free_k1(&k);
@@ -391,41 +391,41 @@ void test_mask_first_and_empty_candidates() {
   std::vector<uint32_t> mask(rows * words, 0u);
   mask[0 * words + 0] = (1u << 0) | (1u << 2);   /* row 0 allows tokens 0 and 2 */
   /* row 1 is all-zero -> EMPTY_CANDIDATES */
-  std::vector<ds41rt_v41_sampler_row_t> params = {
+  std::vector<cuteafd_v41_sampler_row_t> params = {
       row(0, 0.0f, 0u, 0.0f, -std::numeric_limits<float>::infinity(), 0u,
-          DS41RT_V41_SAMPLER_FLAG_GREEDY | DS41RT_V41_SAMPLER_FLAG_STRICT_FINITE),
+          CUTEAFD_V41_SAMPLER_FLAG_GREEDY | CUTEAFD_V41_SAMPLER_FLAG_STRICT_FINITE),
       row(1, 0.0f, 0u, 0.0f, -std::numeric_limits<float>::infinity(), 1u,
-          DS41RT_V41_SAMPLER_FLAG_GREEDY | DS41RT_V41_SAMPLER_FLAG_STRICT_FINITE),
+          CUTEAFD_V41_SAMPLER_FLAG_GREEDY | CUTEAFD_V41_SAMPLER_FLAG_STRICT_FINITE),
   };
   run_case(logits, rows, vocab, params, mask, true, true, "mask first (greedy)");
   /* The oracle check inside run_case already pins both rows; re-run through the
    * full harness for the stochastic survivor shape too. */
-  std::vector<ds41rt_v41_sampler_row_t> stochastic = {
+  std::vector<cuteafd_v41_sampler_row_t> stochastic = {
       row(0, 0.7f, 0u, 0.0f, -std::numeric_limits<float>::infinity(), 0u,
-          DS41RT_V41_SAMPLER_FLAG_DIAGNOSE),
+          CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE),
       row(1, 0.7f, 0u, 0.0f, -std::numeric_limits<float>::infinity(), 1u,
-          DS41RT_V41_SAMPLER_FLAG_DIAGNOSE),
+          CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE),
   };
   K1 k = make_k1(rows, vocab, true, true);
   require_cuda(cudaMemcpy(k.logits, logits.data(), logits.size() * 4, cudaMemcpyHostToDevice),
                "h2d");
   require_cuda(cudaMemcpy(k.params, stochastic.data(),
-                          stochastic.size() * sizeof(ds41rt_v41_sampler_row_t),
+                          stochastic.size() * sizeof(cuteafd_v41_sampler_row_t),
                           cudaMemcpyHostToDevice), "params");
   require_cuda(cudaMemcpy(k.mask, mask.data(), mask.size() * 4, cudaMemcpyHostToDevice), "mask");
-  expect(ds41rt_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, k.mask, words,
+  expect(cuteafd_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, k.mask, words,
                                        k.ids, k.status, k.detail, k.scores, k.total, k.nucleus,
-                                       k.scratch) == DS41RT_STATUS_OK, "launch");
+                                       k.scratch) == CUTEAFD_STATUS_OK, "launch");
   std::vector<uint32_t> status(rows), nucleus(rows);
-  std::vector<ds41rt_v41_sampler_scratch_t> scratch(rows);
+  std::vector<cuteafd_v41_sampler_scratch_t> scratch(rows);
   require_cuda(cudaMemcpy(status.data(), k.status, rows * 4, cudaMemcpyDeviceToHost), "status");
   require_cuda(cudaMemcpy(nucleus.data(), k.nucleus, rows * 4, cudaMemcpyDeviceToHost), "nucleus");
   require_cuda(cudaMemcpy(scratch.data(), k.scratch, rows * sizeof(scratch[0]),
                           cudaMemcpyDeviceToHost), "scratch");
-  expect(status[0] == DS41RT_V41_SAMPLER_STATUS_OK, "row0 allowed");
+  expect(status[0] == CUTEAFD_V41_SAMPLER_STATUS_OK, "row0 allowed");
   expect(nucleus[0] == 2u, "row0 two allowed survivors with min_p disabled");
   expect(scratch[0].allowed_count == 2u, "row0 allowed_count");
-  expect(status[1] == DS41RT_V41_SAMPLER_STATUS_EMPTY_CANDIDATES, "row1 empty");
+  expect(status[1] == CUTEAFD_V41_SAMPLER_STATUS_EMPTY_CANDIDATES, "row1 empty");
   expect(scratch[1].allowed_count == 0u, "row1 allowed_count");
   free_k1(&k);
   std::cout << "ok  mask-first ordering and empty candidates\n";
@@ -445,39 +445,39 @@ void test_masked_nonfinite_is_mode_specific() {
   std::vector<uint32_t> mask(rows * words, 0u);
   mask[0 * words + 0] = 0b1101u;   /* token 1 (NaN) masked out, tokens 0,2,3 allowed */
   mask[1 * words + 0] = 0b1101u;   /* token 1 (+inf) masked out */
-  std::vector<ds41rt_v41_sampler_row_t> params = {
+  std::vector<cuteafd_v41_sampler_row_t> params = {
       row(0, 0.0f, 0u, 0.0f, -std::numeric_limits<float>::infinity(), 0u,
-          DS41RT_V41_SAMPLER_FLAG_GREEDY | DS41RT_V41_SAMPLER_FLAG_STRICT_FINITE),
+          CUTEAFD_V41_SAMPLER_FLAG_GREEDY | CUTEAFD_V41_SAMPLER_FLAG_STRICT_FINITE),
       row(1, 0.7f, 0u, 0.0f, -std::numeric_limits<float>::infinity(), 1u, 0u),
   };
   K1 k = make_k1(rows, vocab, true, true);
   require_cuda(cudaMemcpy(k.logits, logits.data(), logits.size() * 4, cudaMemcpyHostToDevice),
                "h2d");
   require_cuda(cudaMemcpy(k.params, params.data(),
-                          params.size() * sizeof(ds41rt_v41_sampler_row_t),
+                          params.size() * sizeof(cuteafd_v41_sampler_row_t),
                           cudaMemcpyHostToDevice), "params");
   require_cuda(cudaMemcpy(k.mask, mask.data(), mask.size() * 4, cudaMemcpyHostToDevice), "mask");
-  expect(ds41rt_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, k.mask, words,
+  expect(cuteafd_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, k.mask, words,
                                        k.ids, k.status, k.detail, k.scores, k.total, k.nucleus,
-                                       k.scratch) == DS41RT_STATUS_OK, "launch");
+                                       k.scratch) == CUTEAFD_STATUS_OK, "launch");
   std::vector<uint32_t> ids(rows), status(rows), detail(rows);
-  std::vector<ds41rt_v41_sampler_scratch_t> scratch(rows);
+  std::vector<cuteafd_v41_sampler_scratch_t> scratch(rows);
   require_cuda(cudaMemcpy(ids.data(), k.ids, rows * 4, cudaMemcpyDeviceToHost), "ids");
   require_cuda(cudaMemcpy(status.data(), k.status, rows * 4, cudaMemcpyDeviceToHost), "status");
   require_cuda(cudaMemcpy(detail.data(), k.detail, rows * 4, cudaMemcpyDeviceToHost), "detail");
   require_cuda(cudaMemcpy(scratch.data(), k.scratch, rows * sizeof(scratch[0]),
                           cudaMemcpyDeviceToHost), "scratch");
   /* Strict row: masked NaN still errors, with the offending id. */
-  expect(status[0] == DS41RT_V41_SAMPLER_STATUS_NONFINITE_LOGIT,
+  expect(status[0] == CUTEAFD_V41_SAMPLER_STATUS_NONFINITE_LOGIT,
          "strict row rejects masked NaN");
   expect(detail[0] == 1u, "strict row offending id is the masked token");
   expect(scratch[0].nonfinite_token == 1u, "strict scratch offending id");
   /* Permissive row: masked +inf is not read. The stochastic branch is
    * permissive by default; `STRICT_FINITE` is what opts a row into the
    * whole-row check, and it is absent here. */
-  expect((params[1].flags & DS41RT_V41_SAMPLER_FLAG_STRICT_FINITE) == 0u,
+  expect((params[1].flags & CUTEAFD_V41_SAMPLER_FLAG_STRICT_FINITE) == 0u,
          "permissive row must not carry STRICT_FINITE");
-  expect(status[1] == DS41RT_V41_SAMPLER_STATUS_OK, "stochastic row allows masked +inf");
+  expect(status[1] == CUTEAFD_V41_SAMPLER_STATUS_OK, "stochastic row allows masked +inf");
   expect(scratch[1].allowed_count == 3u, "stochastic allowed_count skips the masked token");
   expect(scratch[1].survivor_count == 3u, "stochastic survivors skip the masked token");
   (void)ids;
@@ -488,11 +488,11 @@ void test_masked_nonfinite_is_mode_specific() {
    * constrained row does. This is what makes the ABI flag functional rather
    * than decorative. */
   {
-    std::vector<ds41rt_v41_sampler_row_t> strict_stochastic = {
+    std::vector<cuteafd_v41_sampler_row_t> strict_stochastic = {
         row(0, 0.7f, 0u, 0.0f, -std::numeric_limits<float>::infinity(), 0u,
-            DS41RT_V41_SAMPLER_FLAG_STRICT_FINITE),
+            CUTEAFD_V41_SAMPLER_FLAG_STRICT_FINITE),
         row(1, 0.7f, 0u, 0.0f, -std::numeric_limits<float>::infinity(), 1u,
-            DS41RT_V41_SAMPLER_FLAG_STRICT_FINITE),
+            CUTEAFD_V41_SAMPLER_FLAG_STRICT_FINITE),
     };
     K1 strict = make_k1(rows, vocab, true, true);
     require_cuda(cudaMemcpy(strict.logits, logits.data(), logits.size() * 4,
@@ -502,20 +502,20 @@ void test_masked_nonfinite_is_mode_specific() {
                             cudaMemcpyHostToDevice), "strict params");
     require_cuda(cudaMemcpy(strict.mask, mask.data(), mask.size() * 4,
                             cudaMemcpyHostToDevice), "strict mask");
-    expect(ds41rt_cuda_v41_target_sample(strict.logits, rows, vocab, vocab, strict.params,
+    expect(cuteafd_cuda_v41_target_sample(strict.logits, rows, vocab, vocab, strict.params,
                                          strict.mask, words, strict.ids, strict.status,
                                          strict.detail, strict.scores, strict.total,
-                                         strict.nucleus, strict.scratch) == DS41RT_STATUS_OK,
+                                         strict.nucleus, strict.scratch) == CUTEAFD_STATUS_OK,
            "strict stochastic launch");
     std::vector<uint32_t> strict_status(rows), strict_detail(rows);
     require_cuda(cudaMemcpy(strict_status.data(), strict.status, rows * 4,
                             cudaMemcpyDeviceToHost), "strict status");
     require_cuda(cudaMemcpy(strict_detail.data(), strict.detail, rows * 4,
                             cudaMemcpyDeviceToHost), "strict detail");
-    expect(strict_status[0] == DS41RT_V41_SAMPLER_STATUS_NONFINITE_LOGIT,
+    expect(strict_status[0] == CUTEAFD_V41_SAMPLER_STATUS_NONFINITE_LOGIT,
            "STRICT_FINITE stochastic row rejects masked NaN");
     expect(strict_detail[0] == 1u, "STRICT_FINITE offending id is the masked token");
-    expect(strict_status[1] == DS41RT_V41_SAMPLER_STATUS_NONFINITE_LOGIT,
+    expect(strict_status[1] == CUTEAFD_V41_SAMPLER_STATUS_NONFINITE_LOGIT,
            "STRICT_FINITE stochastic row rejects masked +inf");
     expect(strict_detail[1] == 1u, "STRICT_FINITE offending id for +inf");
     free_k1(&strict);
@@ -531,13 +531,13 @@ void test_allowed_nonfinite_and_status_precedence() {
   const std::vector<Case> cases = {
       /* An allowed non-finite logit is NONFINITE_LOGIT with its own id. */
       {{std::numeric_limits<float>::quiet_NaN(), 1.0f, 2.0f, 3.0f},
-       DS41RT_V41_SAMPLER_STATUS_NONFINITE_LOGIT, 0u},
+       CUTEAFD_V41_SAMPLER_STATUS_NONFINITE_LOGIT, 0u},
       {{1.0f, 1.0f, 1.0f, -std::numeric_limits<float>::infinity()},
-       DS41RT_V41_SAMPLER_STATUS_NONFINITE_LOGIT, 3u},
+       CUTEAFD_V41_SAMPLER_STATUS_NONFINITE_LOGIT, 3u},
       /* All-zero mask: EMPTY_CANDIDATES, never a temperature error from the -inf
        * maximum (`empty_mask_is_reported_as_empty_candidates_in_every_mode`). */
-      {{1.0f, 2.0f, 3.0f, 4.0f}, DS41RT_V41_SAMPLER_STATUS_EMPTY_CANDIDATES, 0xFFFFFFFFu},
-      {{-0.0f, 0.0f, 0.0f, 0.0f}, DS41RT_V41_SAMPLER_STATUS_OK, 0xFFFFFFFFu},
+      {{1.0f, 2.0f, 3.0f, 4.0f}, CUTEAFD_V41_SAMPLER_STATUS_EMPTY_CANDIDATES, 0xFFFFFFFFu},
+      {{-0.0f, 0.0f, 0.0f, 0.0f}, CUTEAFD_V41_SAMPLER_STATUS_OK, 0xFFFFFFFFu},
   };
   for (size_t index = 0; index < cases.size(); ++index) {
     const size_t rows = 1;
@@ -548,7 +548,7 @@ void test_allowed_nonfinite_and_status_precedence() {
     if (index != 2) {
       mask[0] = 0xFu;
     }
-    std::vector<ds41rt_v41_sampler_row_t> params = {
+    std::vector<cuteafd_v41_sampler_row_t> params = {
         row(0, 0.7f, 0u, 0.0f, -std::numeric_limits<float>::infinity(), 0u, 0u),
     };
     K1 k = make_k1(rows, vocab, true, true);
@@ -557,9 +557,9 @@ void test_allowed_nonfinite_and_status_precedence() {
     require_cuda(cudaMemcpy(k.params, params.data(), sizeof(params[0]),
                             cudaMemcpyHostToDevice), "params");
     require_cuda(cudaMemcpy(k.mask, mask.data(), words * 4, cudaMemcpyHostToDevice), "mask");
-    expect(ds41rt_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, k.mask, words,
+    expect(cuteafd_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, k.mask, words,
                                          k.ids, k.status, k.detail, k.scores, k.total, k.nucleus,
-                                         k.scratch) == DS41RT_STATUS_OK, "launch");
+                                         k.scratch) == CUTEAFD_STATUS_OK, "launch");
     std::vector<uint32_t> status(rows), detail(rows);
     require_cuda(cudaMemcpy(status.data(), k.status, rows * 4, cudaMemcpyDeviceToHost), "status");
     require_cuda(cudaMemcpy(detail.data(), k.detail, rows * 4, cudaMemcpyDeviceToHost), "detail");
@@ -575,7 +575,7 @@ void test_allowed_nonfinite_and_status_precedence() {
     std::vector<float> logits = {std::numeric_limits<float>::max(),
                                  std::numeric_limits<float>::max()};
     std::vector<uint32_t> mask2(1, 0u);
-    std::vector<ds41rt_v41_sampler_row_t> params = {
+    std::vector<cuteafd_v41_sampler_row_t> params = {
         row(0, 1.0e-5f, 0u, 0.0f, -std::numeric_limits<float>::infinity(), 0u, 0u),
     };
     K1 k = make_k1(rows, vocab2, true, true);
@@ -583,12 +583,12 @@ void test_allowed_nonfinite_and_status_precedence() {
     require_cuda(cudaMemcpy(k.params, params.data(), sizeof(params[0]),
                             cudaMemcpyHostToDevice), "params");
     require_cuda(cudaMemcpy(k.mask, mask2.data(), 4, cudaMemcpyHostToDevice), "mask");
-    expect(ds41rt_cuda_v41_target_sample(k.logits, rows, vocab2, vocab2, k.params, k.mask, 1u,
+    expect(cuteafd_cuda_v41_target_sample(k.logits, rows, vocab2, vocab2, k.params, k.mask, 1u,
                                          k.ids, k.status, k.detail, k.scores, k.total, k.nucleus,
-                                         k.scratch) == DS41RT_STATUS_OK, "launch");
+                                         k.scratch) == CUTEAFD_STATUS_OK, "launch");
     std::vector<uint32_t> status(rows);
     require_cuda(cudaMemcpy(status.data(), k.status, rows * 4, cudaMemcpyDeviceToHost), "status");
-    expect(status[0] == DS41RT_V41_SAMPLER_STATUS_EMPTY_CANDIDATES,
+    expect(status[0] == CUTEAFD_V41_SAMPLER_STATUS_EMPTY_CANDIDATES,
            "EMPTY_CANDIDATES beats invalid temperature");
     free_k1(&k);
   }
@@ -601,7 +601,7 @@ void test_allowed_nonfinite_and_status_precedence() {
     const size_t vocab2 = 2;
     std::vector<float> logits = {std::numeric_limits<float>::max(), 0.0f};
     std::vector<uint32_t> mask2(1, 0x3u);
-    std::vector<ds41rt_v41_sampler_row_t> params = {
+    std::vector<cuteafd_v41_sampler_row_t> params = {
         row(0, 1.0e-5f, 0u, 0.0f, -std::numeric_limits<float>::infinity(), 0u, 0u),
     };
     K1 k = make_k1(rows, vocab2, true, true);
@@ -609,16 +609,16 @@ void test_allowed_nonfinite_and_status_precedence() {
     require_cuda(cudaMemcpy(k.params, params.data(), sizeof(params[0]),
                             cudaMemcpyHostToDevice), "params");
     require_cuda(cudaMemcpy(k.mask, mask2.data(), 4, cudaMemcpyHostToDevice), "mask");
-    expect(ds41rt_cuda_v41_target_sample(k.logits, rows, vocab2, vocab2, k.params, k.mask, 1u,
+    expect(cuteafd_cuda_v41_target_sample(k.logits, rows, vocab2, vocab2, k.params, k.mask, 1u,
                                          k.ids, k.status, k.detail, k.scores, k.total, k.nucleus,
-                                         k.scratch) == DS41RT_STATUS_OK, "launch");
+                                         k.scratch) == CUTEAFD_STATUS_OK, "launch");
     std::vector<uint32_t> status(rows), detail(rows);
-    std::vector<ds41rt_v41_sampler_scratch_t> scratch(rows);
+    std::vector<cuteafd_v41_sampler_scratch_t> scratch(rows);
     require_cuda(cudaMemcpy(status.data(), k.status, rows * 4, cudaMemcpyDeviceToHost), "status");
     require_cuda(cudaMemcpy(detail.data(), k.detail, rows * 4, cudaMemcpyDeviceToHost), "detail");
     require_cuda(cudaMemcpy(scratch.data(), k.scratch, rows * sizeof(scratch[0]),
                             cudaMemcpyDeviceToHost), "scratch");
-    expect(status[0] == DS41RT_V41_SAMPLER_STATUS_INVALID_TEMPERATURE,
+    expect(status[0] == CUTEAFD_V41_SAMPLER_STATUS_INVALID_TEMPERATURE,
            "invalid temperature");
     free_k1(&k);
   }
@@ -649,33 +649,33 @@ void test_min_p_boundary_is_inclusive() {
   /* Row 1: token 3 is one ULP below the threshold instead. */
   logits[1 * vocab + 0] = 0.0f;
   logits[1 * vocab + 3] = below_logit;
-  std::vector<ds41rt_v41_sampler_row_t> params = {
-      row(0, temperature, 0u, min_p, ln_min_p, DS41RT_V41_SAMPLER_NO_MASK_ROW,
-          DS41RT_V41_SAMPLER_FLAG_NO_MASK),
-      row(1, temperature, 0u, min_p, ln_min_p, DS41RT_V41_SAMPLER_NO_MASK_ROW,
-          DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+  std::vector<cuteafd_v41_sampler_row_t> params = {
+      row(0, temperature, 0u, min_p, ln_min_p, CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+          CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
+      row(1, temperature, 0u, min_p, ln_min_p, CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+          CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
   };
   run_case(logits, rows, vocab, params, {}, false, false, "min_p boundary");
   K1 k = make_k1(rows, vocab, false, true);
   require_cuda(cudaMemcpy(k.logits, logits.data(), logits.size() * 4, cudaMemcpyHostToDevice),
                "h2d");
   require_cuda(cudaMemcpy(k.params, params.data(),
-                          params.size() * sizeof(ds41rt_v41_sampler_row_t),
+                          params.size() * sizeof(cuteafd_v41_sampler_row_t),
                           cudaMemcpyHostToDevice), "params");
-  expect(ds41rt_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, nullptr, 0u,
+  expect(cuteafd_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, nullptr, 0u,
                                        k.ids, k.status, k.detail, k.scores, k.total, k.nucleus,
-                                       k.scratch) == DS41RT_STATUS_OK, "launch");
-  std::vector<ds41rt_v41_sampler_row_t> diagnose = params;
-  for (ds41rt_v41_sampler_row_t& p : diagnose) {
-    p.flags |= DS41RT_V41_SAMPLER_FLAG_DIAGNOSE;
+                                       k.scratch) == CUTEAFD_STATUS_OK, "launch");
+  std::vector<cuteafd_v41_sampler_row_t> diagnose = params;
+  for (cuteafd_v41_sampler_row_t& p : diagnose) {
+    p.flags |= CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE;
   }
   require_cuda(cudaMemcpy(k.params, diagnose.data(),
-                          diagnose.size() * sizeof(ds41rt_v41_sampler_row_t),
+                          diagnose.size() * sizeof(cuteafd_v41_sampler_row_t),
                           cudaMemcpyHostToDevice), "params");
-  expect(ds41rt_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, nullptr, 0u,
+  expect(cuteafd_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, nullptr, 0u,
                                        k.ids, k.status, k.detail, k.scores, k.total, k.nucleus,
-                                       k.scratch) == DS41RT_STATUS_OK, "launch diagnose");
-  std::vector<ds41rt_v41_sampler_scratch_t> scratch(rows);
+                                       k.scratch) == CUTEAFD_STATUS_OK, "launch diagnose");
+  std::vector<cuteafd_v41_sampler_scratch_t> scratch(rows);
   std::vector<uint32_t> nucleus(rows);
   require_cuda(cudaMemcpy(scratch.data(), k.scratch, rows * sizeof(scratch[0]),
                           cudaMemcpyDeviceToHost), "scratch");
@@ -706,25 +706,25 @@ void test_min_p_disabled_and_unity() {
       0.0f, 0.0f, neg_max, 0.0f,         /* row 1: min_p = 1 keeps every tied max */
       0.0f, -1.0f, -2.0f, -3.0f,         /* row 2: min_p = 1 keeps only the max */
   };
-  std::vector<ds41rt_v41_sampler_row_t> params = {
-      row(0, 1.0e-5f, 0u, 0.0f, neg_inf, DS41RT_V41_SAMPLER_NO_MASK_ROW,
-          DS41RT_V41_SAMPLER_FLAG_NO_MASK),
-      row(1, 1.0f, 0u, 1.0f, 0.0f, DS41RT_V41_SAMPLER_NO_MASK_ROW,
-          DS41RT_V41_SAMPLER_FLAG_NO_MASK),
-      row(2, 1.0f, 0u, 1.0f, 0.0f, DS41RT_V41_SAMPLER_NO_MASK_ROW,
-          DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+  std::vector<cuteafd_v41_sampler_row_t> params = {
+      row(0, 1.0e-5f, 0u, 0.0f, neg_inf, CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+          CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
+      row(1, 1.0f, 0u, 1.0f, 0.0f, CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+          CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
+      row(2, 1.0f, 0u, 1.0f, 0.0f, CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+          CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
   };
   run_case(logits, rows, vocab, params, {}, false, false, "min_p disabled/unity");
   K1 k = make_k1(rows, vocab, false, true);
   require_cuda(cudaMemcpy(k.logits, logits.data(), logits.size() * 4, cudaMemcpyHostToDevice),
                "h2d");
   require_cuda(cudaMemcpy(k.params, params.data(),
-                          params.size() * sizeof(ds41rt_v41_sampler_row_t),
+                          params.size() * sizeof(cuteafd_v41_sampler_row_t),
                           cudaMemcpyHostToDevice), "params");
-  expect(ds41rt_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, nullptr, 0u,
+  expect(cuteafd_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, nullptr, 0u,
                                        k.ids, k.status, k.detail, k.scores, k.total, k.nucleus,
-                                       k.scratch) == DS41RT_STATUS_OK, "launch");
-  std::vector<ds41rt_v41_sampler_scratch_t> scratch(rows);
+                                       k.scratch) == CUTEAFD_STATUS_OK, "launch");
+  std::vector<cuteafd_v41_sampler_scratch_t> scratch(rows);
   require_cuda(cudaMemcpy(scratch.data(), k.scratch, rows * sizeof(scratch[0]),
                           cudaMemcpyDeviceToHost), "scratch");
   expect(scratch[0].survivor_count == 4u, "min_p = 0 keeps -inf survivors");
@@ -745,31 +745,31 @@ void test_greedy_lowest_id_and_rederivation() {
       -3.0f, -2.0f, -1.0f, 0.0f, 1.0f, 2.0f,   /* row 2: unique max */
       2.0f, 2.0f, 2.0f, 2.0f, 2.0f, 2.0f,      /* row 3: all equal */
   };
-  std::vector<ds41rt_v41_sampler_row_t> params = {
+  std::vector<cuteafd_v41_sampler_row_t> params = {
       /* host greedy bit SET, T = 0.7 */
       row(0, 0.7f, 0u, 0.0f, -std::numeric_limits<float>::infinity(),
-          DS41RT_V41_SAMPLER_NO_MASK_ROW,
-          DS41RT_V41_SAMPLER_FLAG_GREEDY | DS41RT_V41_SAMPLER_FLAG_NO_MASK |
-              DS41RT_V41_SAMPLER_FLAG_STRICT_FINITE),
+          CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+          CUTEAFD_V41_SAMPLER_FLAG_GREEDY | CUTEAFD_V41_SAMPLER_FLAG_NO_MASK |
+              CUTEAFD_V41_SAMPLER_FLAG_STRICT_FINITE),
       /* host bit CLEAR but top_k == 1 -> still greedy by re-derivation */
       row(1, 0.7f, 1u, 0.0f, -std::numeric_limits<float>::infinity(),
-          DS41RT_V41_SAMPLER_NO_MASK_ROW, DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+          CUTEAFD_V41_SAMPLER_NO_MASK_ROW, CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
       /* host bit CLEAR but T < 1e-5 -> still greedy, and 1/T would be finite */
       row(2, 0.0f, 0u, 0.0f, -std::numeric_limits<float>::infinity(),
-          DS41RT_V41_SAMPLER_NO_MASK_ROW, DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+          CUTEAFD_V41_SAMPLER_NO_MASK_ROW, CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
       row(3, 1.0e-6f, 0u, 0.0f, -std::numeric_limits<float>::infinity(),
-          DS41RT_V41_SAMPLER_NO_MASK_ROW, DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+          CUTEAFD_V41_SAMPLER_NO_MASK_ROW, CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
   };
   run_case(logits, rows, vocab, params, {}, false, false, "greedy ties + rederivation");
   K1 k = make_k1(rows, vocab, false, false);
   require_cuda(cudaMemcpy(k.logits, logits.data(), logits.size() * 4, cudaMemcpyHostToDevice),
                "h2d");
   require_cuda(cudaMemcpy(k.params, params.data(),
-                          params.size() * sizeof(ds41rt_v41_sampler_row_t),
+                          params.size() * sizeof(cuteafd_v41_sampler_row_t),
                           cudaMemcpyHostToDevice), "params");
-  expect(ds41rt_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, nullptr, 0u,
+  expect(cuteafd_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, nullptr, 0u,
                                        k.ids, k.status, k.detail, k.scores, k.total, k.nucleus,
-                                       k.scratch) == DS41RT_STATUS_OK, "launch");
+                                       k.scratch) == CUTEAFD_STATUS_OK, "launch");
   std::vector<uint32_t> ids(rows);
   require_cuda(cudaMemcpy(ids.data(), k.ids, rows * 4, cudaMemcpyDeviceToHost), "ids");
   expect(ids[0] == 1u, "lowest-id tie wins (three-way)");
@@ -795,9 +795,9 @@ void test_vocab_remainder_bits() {
     logits[0] = 1.0f;
     logits[vocab - 1] = 2.0f;
     std::vector<uint32_t> mask(words, 0xFFFFFFFFu);
-    std::vector<ds41rt_v41_sampler_row_t> params = {
+    std::vector<cuteafd_v41_sampler_row_t> params = {
         row(0, 0.0f, 0u, 0.0f, -std::numeric_limits<float>::infinity(), 0u,
-            DS41RT_V41_SAMPLER_FLAG_GREEDY | DS41RT_V41_SAMPLER_FLAG_STRICT_FINITE),
+            CUTEAFD_V41_SAMPLER_FLAG_GREEDY | CUTEAFD_V41_SAMPLER_FLAG_STRICT_FINITE),
     };
     for (int strict = 0; strict < 2; ++strict) {
       run_case(logits, rows, vocab, params, mask, true, strict == 1,
@@ -808,17 +808,17 @@ void test_vocab_remainder_bits() {
                               cudaMemcpyHostToDevice), "params");
       std::vector<uint32_t> device_mask = mask;
       if (strict == 1) {
-        ds41rt_v41_sampler_clear_remainder(device_mask.data(), vocab);
+        cuteafd_v41_sampler_clear_remainder(device_mask.data(), vocab);
       }
       require_cuda(cudaMemcpy(k.mask, device_mask.data(), words * 4, cudaMemcpyHostToDevice),
                    "mask");
-      expect(ds41rt_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, k.mask, words,
+      expect(cuteafd_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, k.mask, words,
                                            k.ids, k.status, k.detail, k.scores, k.total,
-                                           k.nucleus, k.scratch) == DS41RT_STATUS_OK, "launch");
+                                           k.nucleus, k.scratch) == CUTEAFD_STATUS_OK, "launch");
       std::vector<uint32_t> ids(rows), status(rows);
       require_cuda(cudaMemcpy(ids.data(), k.ids, rows * 4, cudaMemcpyDeviceToHost), "ids");
       require_cuda(cudaMemcpy(status.data(), k.status, rows * 4, cudaMemcpyDeviceToHost), "status");
-      expect(status[0] == DS41RT_V41_SAMPLER_STATUS_OK, "remainder row status");
+      expect(status[0] == CUTEAFD_V41_SAMPLER_STATUS_OK, "remainder row status");
       expect(ids[0] < vocab, "id is inside the vocabulary");
       expect(ids[0] == static_cast<uint32_t>(vocab - 1), "last real token wins");
       free_k1(&k);
@@ -833,13 +833,13 @@ void test_vocab_remainder_bits() {
       require_cuda(cudaMemcpy(k.mask, device_mask.data(), words * 4, cudaMemcpyHostToDevice),
                    "mask");
       const size_t wrong = words + 1u;
-      expect(ds41rt_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, k.mask, wrong,
+      expect(cuteafd_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, k.mask, wrong,
                                            k.ids, k.status, k.detail, k.scores, k.total,
-                                           k.nucleus, k.scratch) == DS41RT_STATUS_OK, "launch");
+                                           k.nucleus, k.scratch) == CUTEAFD_STATUS_OK, "launch");
       std::vector<uint32_t> status(rows), detail(rows);
       require_cuda(cudaMemcpy(status.data(), k.status, rows * 4, cudaMemcpyDeviceToHost), "status");
       require_cuda(cudaMemcpy(detail.data(), k.detail, rows * 4, cudaMemcpyDeviceToHost), "detail");
-      expect(status[0] == DS41RT_V41_SAMPLER_STATUS_MASK_WIDTH, "mask width status");
+      expect(status[0] == CUTEAFD_V41_SAMPLER_STATUS_MASK_WIDTH, "mask width status");
       expect(detail[0] == static_cast<uint32_t>(wrong), "mask width detail");
       free_k1(&k);
     }
@@ -849,12 +849,12 @@ void test_vocab_remainder_bits() {
       require_cuda(cudaMemcpy(k.logits, logits.data(), vocab * 4, cudaMemcpyHostToDevice), "h2d");
       require_cuda(cudaMemcpy(k.params, params.data(), sizeof(params[0]),
                               cudaMemcpyHostToDevice), "params");
-      expect(ds41rt_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, nullptr, words,
+      expect(cuteafd_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, nullptr, words,
                                            k.ids, k.status, k.detail, k.scores, k.total,
-                                           k.nucleus, k.scratch) == DS41RT_STATUS_OK, "launch");
+                                           k.nucleus, k.scratch) == CUTEAFD_STATUS_OK, "launch");
       std::vector<uint32_t> status(rows);
       require_cuda(cudaMemcpy(status.data(), k.status, rows * 4, cudaMemcpyDeviceToHost), "status");
-      expect(status[0] == DS41RT_V41_SAMPLER_STATUS_MASK_WIDTH,
+      expect(status[0] == CUTEAFD_V41_SAMPLER_STATUS_MASK_WIDTH,
              "null mask with a word count is MASK_WIDTH");
       free_k1(&k);
     }
@@ -909,14 +909,14 @@ void test_greedy_parity_grid() {
             }
           }
         }
-        std::vector<ds41rt_v41_sampler_row_t> params(rows);
+        std::vector<cuteafd_v41_sampler_row_t> params(rows);
         for (size_t r = 0; r < rows; ++r) {
           const bool host_greedy = (r % 3) == 0;
           params[r] = row(static_cast<uint32_t>(r), temperature, top_k, 0.0f,
                           -std::numeric_limits<float>::infinity(),
                           static_cast<uint32_t>(r),
-                          DS41RT_V41_SAMPLER_FLAG_STRICT_FINITE |
-                              (host_greedy ? DS41RT_V41_SAMPLER_FLAG_GREEDY : 0u));
+                          CUTEAFD_V41_SAMPLER_FLAG_STRICT_FINITE |
+                              (host_greedy ? CUTEAFD_V41_SAMPLER_FLAG_GREEDY : 0u));
         }
         run_case(logits, rows, vocab, params, mask, true, true, "greedy parity grid");
         ++cases;
@@ -953,14 +953,14 @@ void test_batch_independence() {
     K1 k = make_k1(n, vocab, true, false);
     std::vector<float> wave_logits(n * vocab);
     std::vector<uint32_t> wave_mask(n * words);
-    std::vector<ds41rt_v41_sampler_row_t> params(n);
+    std::vector<cuteafd_v41_sampler_row_t> params(n);
     for (size_t i = 0; i < n; ++i) {
       const size_t src = selection[i];
       std::memcpy(&wave_logits[i * vocab], &logits[src * vocab], vocab * 4);
       std::memcpy(&wave_mask[i * words], &mask[src * words], words * 4);
       params[i] = row(static_cast<uint32_t>(i), 0.0f, 0u, 0.0f,
                       -std::numeric_limits<float>::infinity(), static_cast<uint32_t>(i),
-                      DS41RT_V41_SAMPLER_FLAG_GREEDY | DS41RT_V41_SAMPLER_FLAG_STRICT_FINITE);
+                      CUTEAFD_V41_SAMPLER_FLAG_GREEDY | CUTEAFD_V41_SAMPLER_FLAG_STRICT_FINITE);
     }
     require_cuda(cudaMemcpy(k.logits, wave_logits.data(), n * vocab * 4, cudaMemcpyHostToDevice),
                  "h2d");
@@ -968,9 +968,9 @@ void test_batch_independence() {
                             cudaMemcpyHostToDevice), "params");
     require_cuda(cudaMemcpy(k.mask, wave_mask.data(), n * words * 4, cudaMemcpyHostToDevice),
                  "mask");
-    expect(ds41rt_cuda_v41_target_sample(k.logits, n, vocab, vocab, k.params, k.mask, words,
+    expect(cuteafd_cuda_v41_target_sample(k.logits, n, vocab, vocab, k.params, k.mask, words,
                                          k.ids, k.status, k.detail, k.scores, k.total, k.nucleus,
-                                         k.scratch) == DS41RT_STATUS_OK, "launch");
+                                         k.scratch) == CUTEAFD_STATUS_OK, "launch");
     std::vector<uint32_t> ids(n);
     require_cuda(cudaMemcpy(ids.data(), k.ids, n * 4, cudaMemcpyDeviceToHost), "ids");
     free_k1(&k);
@@ -1051,13 +1051,13 @@ void test_out_of_range_mask_row_stays_memory_safe() {
   for (size_t r = 0; r < rows; ++r) {
     mask[r * words] = 0x1u;
   }
-  std::vector<ds41rt_v41_sampler_row_t> params = {
+  std::vector<cuteafd_v41_sampler_row_t> params = {
       /* Out-of-range arena index, no NO_MASK flag. */
       row(0, 1.0e-7f, 0u, 0.0f, -std::numeric_limits<float>::infinity(), 7u,
-          DS41RT_V41_SAMPLER_FLAG_GREEDY),
+          CUTEAFD_V41_SAMPLER_FLAG_GREEDY),
       /* The sentinel without NO_MASK. */
       row(1, 1.0e-7f, 0u, 0.0f, -std::numeric_limits<float>::infinity(),
-          DS41RT_V41_SAMPLER_NO_MASK_ROW, DS41RT_V41_SAMPLER_FLAG_GREEDY),
+          CUTEAFD_V41_SAMPLER_NO_MASK_ROW, CUTEAFD_V41_SAMPLER_FLAG_GREEDY),
   };
   K1 k = make_k1(rows, vocab, true, true);
   require_cuda(cudaMemcpy(k.logits, logits.data(), logits.size() * sizeof(float),
@@ -1067,16 +1067,16 @@ void test_out_of_range_mask_row_stays_memory_safe() {
                "oob params");
   require_cuda(cudaMemcpy(k.mask, mask.data(), mask.size() * sizeof(uint32_t),
                           cudaMemcpyHostToDevice), "oob mask");
-  expect(ds41rt_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, k.mask, words,
+  expect(cuteafd_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, k.mask, words,
                                        k.ids, k.status, k.detail, k.scores, k.total, k.nucleus,
-                                       k.scratch) == DS41RT_STATUS_OK, "oob launch");
+                                       k.scratch) == CUTEAFD_STATUS_OK, "oob launch");
   std::vector<uint32_t> ids(rows), status(rows);
   require_cuda(cudaMemcpy(ids.data(), k.ids, rows * 4, cudaMemcpyDeviceToHost), "oob ids");
   require_cuda(cudaMemcpy(status.data(), k.status, rows * 4, cudaMemcpyDeviceToHost), "oob status");
   /* Both rows are read as unconstrained: the plain argmax, never the masked 0. */
-  expect(status[0] == DS41RT_V41_SAMPLER_STATUS_OK, "out-of-range mask_row status");
+  expect(status[0] == CUTEAFD_V41_SAMPLER_STATUS_OK, "out-of-range mask_row status");
   expect(ids[0] == 1u, "out-of-range mask_row selects the unmasked argmax");
-  expect(status[1] == DS41RT_V41_SAMPLER_STATUS_OK, "sentinel-without-flag status");
+  expect(status[1] == CUTEAFD_V41_SAMPLER_STATUS_OK, "sentinel-without-flag status");
   expect(ids[1] == 3u, "sentinel-without-flag selects the unmasked argmax");
   free_k1(&k);
   std::cout << "ok  out-of-range mask_row and sentinel stay memory-safe\n";
@@ -1100,7 +1100,7 @@ void test_mixed_constrained_and_unconstrained_greedy_round() {
   const bool constrained[rows] = {false, true, false, true, false};
   std::vector<float> logits(rows * vocab);
   std::vector<uint32_t> mask(rows * words, 0u);
-  std::vector<ds41rt_v41_sampler_row_t> params(rows);
+  std::vector<cuteafd_v41_sampler_row_t> params(rows);
   for (size_t r = 0; r < rows; ++r) {
     for (size_t token = 0; token < vocab; ++token) {
       /* The unmasked winner alternates so a mask that is ignored changes it. */
@@ -1110,11 +1110,11 @@ void test_mixed_constrained_and_unconstrained_greedy_round() {
      * misplaced mask cannot coincidentally produce the right id. */
     const size_t allowed = (r * 3 + 2) % vocab;
     mask[r * words + allowed / 32] |= 1u << (allowed % 32);
-    const uint32_t flags = DS41RT_V41_SAMPLER_FLAG_GREEDY |
-        (constrained[r] ? 0u : DS41RT_V41_SAMPLER_FLAG_NO_MASK);
+    const uint32_t flags = CUTEAFD_V41_SAMPLER_FLAG_GREEDY |
+        (constrained[r] ? 0u : CUTEAFD_V41_SAMPLER_FLAG_NO_MASK);
     params[r] = row(static_cast<uint32_t>(r), 1.0e-7f, 0u, 0.0f,
                     -std::numeric_limits<float>::infinity(),
-                    constrained[r] ? static_cast<uint32_t>(r) : DS41RT_V41_SAMPLER_NO_MASK_ROW,
+                    constrained[r] ? static_cast<uint32_t>(r) : CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
                     flags);
   }
   run_case(logits, rows, vocab, params, mask, true, true,
@@ -1133,15 +1133,15 @@ void test_subnormal_and_nonfinite_grid() {
       0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f,          /* row 1 */
       -1.0f, -2.0f, -3.0f, -4.0f, -5.0f, -6.0f,    /* row 2 */
   };
-  std::vector<ds41rt_v41_sampler_row_t> params = {
+  std::vector<cuteafd_v41_sampler_row_t> params = {
       /* Subnormal logit is a legal survivor at min_p = 0. */
       row(0, 1.0f, 0u, 0.0f, -std::numeric_limits<float>::infinity(),
-          DS41RT_V41_SAMPLER_NO_MASK_ROW, DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+          CUTEAFD_V41_SAMPLER_NO_MASK_ROW, CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
       /* -f32::MAX at T = 1e-5 scales to -inf and is still legal at min_p = 0. */
       row(1, 1.0e-5f, 0u, 0.0f, -std::numeric_limits<float>::infinity(),
-          DS41RT_V41_SAMPLER_NO_MASK_ROW, DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+          CUTEAFD_V41_SAMPLER_NO_MASK_ROW, CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
       row(2, 1.0f, 0u, 0.0f, -std::numeric_limits<float>::infinity(),
-          DS41RT_V41_SAMPLER_NO_MASK_ROW, DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+          CUTEAFD_V41_SAMPLER_NO_MASK_ROW, CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
   };
   run_case(logits, rows, vocab, params, {}, false, false, "subnormal");
   /* A row whose scaled maximum is -inf (all logits -f32::MAX at a tiny T) is
@@ -1150,23 +1150,23 @@ void test_subnormal_and_nonfinite_grid() {
   const size_t vocab2 = 2;
   std::vector<float> huge = {-std::numeric_limits<float>::max(),
                              -std::numeric_limits<float>::max()};
-  std::vector<ds41rt_v41_sampler_row_t> params2 = {
+  std::vector<cuteafd_v41_sampler_row_t> params2 = {
       /* 1e-5 is the smallest non-greedy temperature; -MAX * 1e5 = -inf. */
       row(0, 1.0e-5f, 0u, 0.0f, -std::numeric_limits<float>::infinity(),
-          DS41RT_V41_SAMPLER_NO_MASK_ROW, DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+          CUTEAFD_V41_SAMPLER_NO_MASK_ROW, CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
   };
   K1 k = make_k1(rows2, vocab2, false, true);
   require_cuda(cudaMemcpy(k.logits, huge.data(), vocab2 * 4, cudaMemcpyHostToDevice), "h2d");
   require_cuda(cudaMemcpy(k.params, params2.data(), sizeof(params2[0]),
                           cudaMemcpyHostToDevice), "params");
-  expect(ds41rt_cuda_v41_target_sample(k.logits, rows2, vocab2, vocab2, k.params, nullptr, 0u,
+  expect(cuteafd_cuda_v41_target_sample(k.logits, rows2, vocab2, vocab2, k.params, nullptr, 0u,
                                        k.ids, k.status, k.detail, k.scores, k.total, k.nucleus,
-                                       k.scratch) == DS41RT_STATUS_OK, "launch");
+                                       k.scratch) == CUTEAFD_STATUS_OK, "launch");
   std::vector<uint32_t> status(rows2);
   std::vector<float> total(rows2);
   require_cuda(cudaMemcpy(status.data(), k.status, rows2 * 4, cudaMemcpyDeviceToHost), "status");
   require_cuda(cudaMemcpy(total.data(), k.total, rows2 * 4, cudaMemcpyDeviceToHost), "total");
-  expect(status[0] == DS41RT_V41_SAMPLER_STATUS_INVALID_TEMPERATURE,
+  expect(status[0] == CUTEAFD_V41_SAMPLER_STATUS_INVALID_TEMPERATURE,
          "-inf scaled max is invalid temperature");
   free_k1(&k);
   /* Per-token scaled bits at T = 2 (inv = 0.5), built from exact bit patterns
@@ -1206,12 +1206,12 @@ void test_subnormal_and_nonfinite_grid() {
         std::memcpy(&scale_logits[r * vocab3 + token], &logit_bits[r][token], 4);
       }
     }
-    std::vector<ds41rt_v41_sampler_row_t> scale_params(rows3);
+    std::vector<cuteafd_v41_sampler_row_t> scale_params(rows3);
     for (size_t r = 0; r < rows3; ++r) {
       scale_params[r] = row(static_cast<uint32_t>(r), 2.0f, 0u, 0.0f,
                             -std::numeric_limits<float>::infinity(),
-                            DS41RT_V41_SAMPLER_NO_MASK_ROW,
-                            DS41RT_V41_SAMPLER_FLAG_NO_MASK);
+                            CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+                            CUTEAFD_V41_SAMPLER_FLAG_NO_MASK);
     }
     float* device_logits = nullptr;
     float* device_scaled = nullptr;
@@ -1243,11 +1243,11 @@ void test_subnormal_and_nonfinite_grid() {
     require_cuda(cudaMemcpy(scale_k.params, scale_params.data(),
                             scale_params.size() * sizeof(scale_params[0]),
                             cudaMemcpyHostToDevice), "scale kernel params");
-    expect(ds41rt_cuda_v41_target_sample(scale_k.logits, rows3, vocab3, vocab3, scale_k.params,
+    expect(cuteafd_cuda_v41_target_sample(scale_k.logits, rows3, vocab3, vocab3, scale_k.params,
                                          nullptr, 0u, scale_k.ids, scale_k.status, scale_k.detail,
                                          scale_k.scores, scale_k.total, scale_k.nucleus,
-                                         scale_k.scratch) == DS41RT_STATUS_OK, "scale launch");
-    std::vector<ds41rt_v41_sampler_scratch_t> scale_scratch(rows3);
+                                         scale_k.scratch) == CUTEAFD_STATUS_OK, "scale launch");
+    std::vector<cuteafd_v41_sampler_scratch_t> scale_scratch(rows3);
     require_cuda(cudaMemcpy(scale_scratch.data(), scale_k.scratch,
                             rows3 * sizeof(scale_scratch[0]), cudaMemcpyDeviceToHost), "scale scratch");
     for (size_t r = 0; r < rows3; ++r) {
@@ -1298,14 +1298,14 @@ __global__ void v41_uniform_probe_kernel(const uint64_t* seeds, const uint64_t* 
                                          size_t count, float* out_uniforms) {
   const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index < count) {
-    out_uniforms[index] = ds41rt_v41_target_uniform(seeds[index], positions[index]);
+    out_uniforms[index] = cuteafd_v41_target_uniform(seeds[index], positions[index]);
   }
 }
 
 __global__ void v41_clamp_probe_kernel(const float* in, size_t count, float* out_clamped) {
   const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index < count) {
-    out_clamped[index] = ds41rt_v41_target_clamp_uniform(in[index]);
+    out_clamped[index] = cuteafd_v41_target_clamp_uniform(in[index]);
   }
 }
 
@@ -1313,7 +1313,7 @@ __global__ void v41_clamp_probe_kernel(const float* in, size_t count, float* out
  * `sample_categorical`, `:596-618`). Chunk 2's device scope is exactly this
  * branch, so this is the oracle the device draw must reproduce. */
 struct RefFast {
-  uint32_t status = DS41RT_V41_SAMPLER_STATUS_OK;
+  uint32_t status = CUTEAFD_V41_SAMPLER_STATUS_OK;
   uint32_t token = 0;
   float total = 0.0f;
   float max_scaled = 0.0f;
@@ -1342,18 +1342,18 @@ RefFast cpu_fast_reference(const float* logits, size_t vocab, const uint32_t* ma
     }
     const float logit = logits[token];
     if (!std::isfinite(logit)) {
-      out.status = DS41RT_V41_SAMPLER_STATUS_NONFINITE_LOGIT;
+      out.status = CUTEAFD_V41_SAMPLER_STATUS_NONFINITE_LOGIT;
       return out;
     }
     ++allowed_count;
     max_scaled = std::fmax(max_scaled, logit * inv);
   }
   if (allowed_count == 0) {
-    out.status = DS41RT_V41_SAMPLER_STATUS_EMPTY_CANDIDATES;
+    out.status = CUTEAFD_V41_SAMPLER_STATUS_EMPTY_CANDIDATES;
     return out;
   }
   if (!std::isfinite(max_scaled)) {
-    out.status = DS41RT_V41_SAMPLER_STATUS_INVALID_TEMPERATURE;
+    out.status = CUTEAFD_V41_SAMPLER_STATUS_INVALID_TEMPERATURE;
     return out;
   }
   out.max_scaled = max_scaled;
@@ -1407,7 +1407,7 @@ RefFast cpu_fast_reference(const float* logits, size_t vocab, const uint32_t* ma
  * token equality is asserted only where the crossing has a safe margin and
  * `total` is compared with a loose relative bound. */
 void run_fast_case(const std::vector<float>& logits, size_t rows, size_t vocab,
-                   const std::vector<ds41rt_v41_sampler_row_t>& params,
+                   const std::vector<cuteafd_v41_sampler_row_t>& params,
                    const std::vector<uint32_t>& mask, bool with_mask, bool strict_mask_bits,
                    bool exact, const char* label) {
   ++g_cases;
@@ -1415,33 +1415,33 @@ void run_fast_case(const std::vector<float>& logits, size_t rows, size_t vocab,
   require_cuda(cudaMemcpy(k.logits, logits.data(), logits.size() * sizeof(float),
                           cudaMemcpyHostToDevice), "k2 logits h2d");
   require_cuda(cudaMemcpy(k.params, params.data(),
-                          params.size() * sizeof(ds41rt_v41_sampler_row_t),
+                          params.size() * sizeof(cuteafd_v41_sampler_row_t),
                           cudaMemcpyHostToDevice), "k2 params h2d");
   std::vector<uint32_t> device_mask = mask;
   if (with_mask) {
     if (strict_mask_bits) {
       for (size_t r = 0; r < rows; ++r) {
-        ds41rt_v41_sampler_clear_remainder(device_mask.data() + r * k.words, vocab);
+        cuteafd_v41_sampler_clear_remainder(device_mask.data() + r * k.words, vocab);
       }
     }
     require_cuda(cudaMemcpy(k.mask, device_mask.data(),
                             device_mask.size() * sizeof(uint32_t),
                             cudaMemcpyHostToDevice), "k2 mask h2d");
   }
-  const ds41rt_status_t launch = ds41rt_cuda_v41_target_sample(
+  const cuteafd_status_t launch = cuteafd_cuda_v41_target_sample(
       k.logits, rows, vocab, vocab, k.params, with_mask ? k.mask : nullptr,
       with_mask ? k.words : 0u, k.ids, k.status, k.detail, k.scores, k.total,
       k.nucleus, k.scratch);
-  expect(launch == DS41RT_STATUS_OK, std::string(label) + ": launch status");
+  expect(launch == CUTEAFD_STATUS_OK, std::string(label) + ": launch status");
   std::vector<uint32_t> ids(rows), status(rows);
   std::vector<float> total(rows);
   require_cuda(cudaMemcpy(ids.data(), k.ids, rows * 4, cudaMemcpyDeviceToHost), "k2 ids");
   require_cuda(cudaMemcpy(status.data(), k.status, rows * 4, cudaMemcpyDeviceToHost), "k2 status");
   require_cuda(cudaMemcpy(total.data(), k.total, rows * 4, cudaMemcpyDeviceToHost), "k2 total");
   for (size_t r = 0; r < rows; ++r) {
-    const ds41rt_v41_sampler_row_t& p = params[r];
-    const bool unconstrained = (p.flags & DS41RT_V41_SAMPLER_FLAG_NO_MASK) != 0u ||
-                               p.mask_row == DS41RT_V41_SAMPLER_NO_MASK_ROW;
+    const cuteafd_v41_sampler_row_t& p = params[r];
+    const bool unconstrained = (p.flags & CUTEAFD_V41_SAMPLER_FLAG_NO_MASK) != 0u ||
+                               p.mask_row == CUTEAFD_V41_SAMPLER_NO_MASK_ROW;
     const uint32_t* row_mask = (with_mask && !unconstrained)
         ? device_mask.data() + static_cast<size_t>(p.mask_row) * k.words
         : nullptr;
@@ -1454,7 +1454,7 @@ void run_fast_case(const std::vector<float>& logits, size_t rows, size_t vocab,
                 << " device=" << status[r] << "\n";
     }
     expect(status[r] == expected.status, tag + ": status");
-    if (expected.status != DS41RT_V41_SAMPLER_STATUS_OK) {
+    if (expected.status != CUTEAFD_V41_SAMPLER_STATUS_OK) {
       continue;
     }
     /* The CPU port must have crossed, never taken its `last` fallback. */
@@ -1490,10 +1490,10 @@ void run_fast_case(const std::vector<float>& logits, size_t rows, size_t vocab,
   free_k1(&k);
 }
 
-ds41rt_v41_sampler_row_t fast_row(uint32_t output_row, float temperature, float min_p,
+cuteafd_v41_sampler_row_t fast_row(uint32_t output_row, float temperature, float min_p,
                                   float ln_min_p, uint64_t seed, uint64_t position,
                                   uint32_t mask_row, uint32_t flags) {
-  ds41rt_v41_sampler_row_t value = {};
+  cuteafd_v41_sampler_row_t value = {};
   value.seed = seed;
   value.position = position;
   value.temperature = temperature;
@@ -1503,7 +1503,7 @@ ds41rt_v41_sampler_row_t fast_row(uint32_t output_row, float temperature, float 
   value.mask_row = mask_row;
   /* DIAGNOSE is always set so K2's `out_total` (and K1's `out_nucleus_count`) are
    * observable; it changes no draw. */
-  value.flags = flags | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE;
+  value.flags = flags | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE;
   value.output_row = output_row;
   value.ln_min_p = ln_min_p;
   return value;
@@ -1644,7 +1644,7 @@ void test_k2_fast_path_grid() {
   const std::vector<std::pair<const char*, int>> masks = {
       {"all-allowed", 0}, {"token<5", 1}, {"token%3!=0", 2}};
   for (const auto& [name, kind] : masks) {
-    std::vector<ds41rt_v41_sampler_row_t> params;
+    std::vector<cuteafd_v41_sampler_row_t> params;
     for (size_t t = 0; t < temperatures.size(); ++t) {
       for (size_t m = 0; m < min_ps.size(); ++m) {
         const size_t r = params.size();
@@ -1652,8 +1652,8 @@ void test_k2_fast_path_grid() {
         const float ln_min_p = min_p > 0.0f ? std::log(min_p) : -inf();
         params.push_back(fast_row(
             static_cast<uint32_t>(r), temperatures[t], min_p, ln_min_p, 1000u + r, 37u * r + 1u,
-            kind == 0 ? DS41RT_V41_SAMPLER_NO_MASK_ROW : 0u,
-            kind == 0 ? DS41RT_V41_SAMPLER_FLAG_NO_MASK : 0u));
+            kind == 0 ? CUTEAFD_V41_SAMPLER_NO_MASK_ROW : 0u,
+            kind == 0 ? CUTEAFD_V41_SAMPLER_FLAG_NO_MASK : 0u));
       }
     }
     const std::vector<uint32_t> mask = build_mask(kind);
@@ -1681,11 +1681,11 @@ void test_k2_min_p_threshold_tokens() {
       0.0f, exact_logit, below_logit, -8.0f,   /* row 0: token 1 at the threshold */
       0.0f, below_logit, exact_logit, -8.0f,   /* row 1: token 2 at the threshold */
   };
-  std::vector<ds41rt_v41_sampler_row_t> params = {
+  std::vector<cuteafd_v41_sampler_row_t> params = {
       fast_row(0, temperature, min_p, ln_min_p, seed, position,
-               DS41RT_V41_SAMPLER_NO_MASK_ROW, DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+               CUTEAFD_V41_SAMPLER_NO_MASK_ROW, CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
       fast_row(1, temperature, min_p, ln_min_p, seed, position,
-               DS41RT_V41_SAMPLER_NO_MASK_ROW, DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+               CUTEAFD_V41_SAMPLER_NO_MASK_ROW, CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
   };
   /* Non-zero surviving weight, so the crossing is a real weight boundary. */
   expect(host_target_uniform(seed, position) * (1.0f + std::exp(ln_min_p)) > 1.0f,
@@ -1697,9 +1697,9 @@ void test_k2_min_p_threshold_tokens() {
                "threshold logits");
   require_cuda(cudaMemcpy(k.params, params.data(), params.size() * sizeof(params[0]),
                           cudaMemcpyHostToDevice), "threshold params");
-  expect(ds41rt_cuda_v41_target_sample(k.logits, 2, vocab, vocab, k.params, nullptr, 0u, k.ids,
+  expect(cuteafd_cuda_v41_target_sample(k.logits, 2, vocab, vocab, k.params, nullptr, 0u, k.ids,
                                        k.status, k.detail, k.scores, k.total, k.nucleus,
-                                       k.scratch) == DS41RT_STATUS_OK, "threshold launch");
+                                       k.scratch) == CUTEAFD_STATUS_OK, "threshold launch");
   std::vector<uint32_t> ids(2);
   require_cuda(cudaMemcpy(ids.data(), k.ids, 2 * 4, cudaMemcpyDeviceToHost), "threshold ids");
   expect(ids[0] == 1u, "at-threshold survivor on row 0 is drawn");
@@ -1719,11 +1719,11 @@ void test_k2_tied_and_edge_cases() {
   {
     const size_t vocab = 97;
     std::vector<float> logits = repeat_row(std::vector<float>(vocab, 0.25f), 4);
-    std::vector<ds41rt_v41_sampler_row_t> params;
+    std::vector<cuteafd_v41_sampler_row_t> params;
     for (size_t r = 0; r < 4; ++r) {
       params.push_back(fast_row(static_cast<uint32_t>(r), 0.7f, 0.0f, neg_inf, 1u + r, r * 11u,
-                                DS41RT_V41_SAMPLER_NO_MASK_ROW,
-                                DS41RT_V41_SAMPLER_FLAG_NO_MASK));
+                                CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+                                CUTEAFD_V41_SAMPLER_FLAG_NO_MASK));
     }
     run_fast_case(logits, params.size(), vocab, params, {}, false, false, true, "all-tied");
   }
@@ -1732,11 +1732,11 @@ void test_k2_tied_and_edge_cases() {
     const size_t vocab = 8;
     const std::vector<float> base = {0.5f, 2.0f, -1.0f, 0.0f, 0.25f, -3.0f, 1.0f, -0.5f};
     const std::vector<float> logits = repeat_row(base, 2);
-    std::vector<ds41rt_v41_sampler_row_t> params = {
-        fast_row(0, 1.0f, 1.0f, 0.0f, 42u, 0u, DS41RT_V41_SAMPLER_NO_MASK_ROW,
-                 DS41RT_V41_SAMPLER_FLAG_NO_MASK),
-        fast_row(1, 1.0f, 1.0f, 0.0f, 42u, 99u, DS41RT_V41_SAMPLER_NO_MASK_ROW,
-                 DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+    std::vector<cuteafd_v41_sampler_row_t> params = {
+        fast_row(0, 1.0f, 1.0f, 0.0f, 42u, 0u, CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+                 CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
+        fast_row(1, 1.0f, 1.0f, 0.0f, 42u, 99u, CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+                 CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
     };
     run_fast_case(logits, 2, vocab, params, {}, false, false, true, "single survivor");
   }
@@ -1745,9 +1745,9 @@ void test_k2_tied_and_edge_cases() {
   {
     const size_t vocab = 4;
     std::vector<float> logits = {neg_max, neg_max, neg_max, neg_max};
-    std::vector<ds41rt_v41_sampler_row_t> params = {
-        fast_row(0, 1.0e-5f, 0.0f, neg_inf, 7u, 5u, DS41RT_V41_SAMPLER_NO_MASK_ROW,
-                 DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+    std::vector<cuteafd_v41_sampler_row_t> params = {
+        fast_row(0, 1.0e-5f, 0.0f, neg_inf, 7u, 5u, CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+                 CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
     };
     run_fast_case(logits, 1, vocab, params, {}, false, false, true, "-inf survivors");
   }
@@ -1757,11 +1757,11 @@ void test_k2_tied_and_edge_cases() {
     const size_t vocab = 6;
     const std::vector<float> logits =
         repeat_row({1.0f, 1.0f, 1.0f, 0.0f, -1.0f, 1.0f}, 3);
-    std::vector<ds41rt_v41_sampler_row_t> params;
+    std::vector<cuteafd_v41_sampler_row_t> params;
     for (size_t r = 0; r < 3; ++r) {
       params.push_back(fast_row(static_cast<uint32_t>(r), 1.0f, 1.0f, 0.0f, 5u + r, 2u,
-                                DS41RT_V41_SAMPLER_NO_MASK_ROW,
-                                DS41RT_V41_SAMPLER_FLAG_NO_MASK));
+                                CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+                                CUTEAFD_V41_SAMPLER_FLAG_NO_MASK));
     }
     run_fast_case(logits, params.size(), vocab, params, {}, false, false, false,
                   "tied maximum with min_p=1");
@@ -1783,7 +1783,7 @@ void test_k2_seeded_replay() {
   const std::vector<uint64_t> positions = {0ull, 1ull << 31, (1ull << 32) - 1ull, 1ull << 63,
                                            std::numeric_limits<uint64_t>::max()};
   const std::vector<uint64_t> seeds = {0ull, 0xDEADBEEFull};
-  std::vector<ds41rt_v41_sampler_row_t> params;
+  std::vector<cuteafd_v41_sampler_row_t> params;
   for (uint64_t seed : seeds) {
     for (uint64_t position : positions) {
       const size_t r = params.size();
@@ -1805,9 +1805,9 @@ void test_k2_seeded_replay() {
                "replay mask");
   std::vector<uint32_t> first(rows), second(rows);
   for (int pass = 0; pass < 2; ++pass) {
-    expect(ds41rt_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, k.mask, words,
+    expect(cuteafd_cuda_v41_target_sample(k.logits, rows, vocab, vocab, k.params, k.mask, words,
                                          k.ids, k.status, k.detail, k.scores, k.total, k.nucleus,
-                                         k.scratch) == DS41RT_STATUS_OK, "replay launch");
+                                         k.scratch) == CUTEAFD_STATUS_OK, "replay launch");
     require_cuda(cudaMemcpy(pass == 0 ? first.data() : second.data(), k.ids, rows * 4,
                             cudaMemcpyDeviceToHost), "replay ids");
   }
@@ -1849,7 +1849,7 @@ void test_k2_batch_composition_independence() {
   };
 
   auto launch = [&](const std::vector<std::vector<float>>& rows,
-                    const std::vector<ds41rt_v41_sampler_row_t>& params) {
+                    const std::vector<cuteafd_v41_sampler_row_t>& params) {
     const size_t n = rows.size();
     std::vector<float> flat;
     flat.reserve(n * vocab);
@@ -1861,30 +1861,30 @@ void test_k2_batch_composition_independence() {
                  "wave logits");
     require_cuda(cudaMemcpy(k.params, params.data(), n * sizeof(params[0]),
                             cudaMemcpyHostToDevice), "wave params");
-    expect(ds41rt_cuda_v41_target_sample(k.logits, n, vocab, vocab, k.params, nullptr, 0u, k.ids,
+    expect(cuteafd_cuda_v41_target_sample(k.logits, n, vocab, vocab, k.params, nullptr, 0u, k.ids,
                                          k.status, k.detail, k.scores, k.total, k.nucleus,
-                                         k.scratch) == DS41RT_STATUS_OK, "wave launch");
+                                         k.scratch) == CUTEAFD_STATUS_OK, "wave launch");
     std::vector<uint32_t> ids(n);
     require_cuda(cudaMemcpy(ids.data(), k.ids, n * 4, cudaMemcpyDeviceToHost), "wave ids");
     free_k1(&k);
     return ids;
   };
   auto wave_params = [&](const std::vector<Cell>& cs, size_t focus) {
-    std::vector<ds41rt_v41_sampler_row_t> p;
+    std::vector<cuteafd_v41_sampler_row_t> p;
     for (size_t i = 0; i < cs.size(); ++i) {
       const bool is_focus = i == focus;
       p.push_back(fast_row(static_cast<uint32_t>(i), 0.7f, 0.0f, -inf(),
                            is_focus ? cs[i].seed : 1000ull + i,
-                           is_focus ? cs[i].position : i, DS41RT_V41_SAMPLER_NO_MASK_ROW,
-                           DS41RT_V41_SAMPLER_FLAG_NO_MASK));
+                           is_focus ? cs[i].position : i, CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+                           CUTEAFD_V41_SAMPLER_FLAG_NO_MASK));
     }
     return p;
   };
 
   for (const Cell& cell : cells) {
-    const ds41rt_v41_sampler_row_t solo = fast_row(
-        0, 0.7f, 0.0f, -inf(), cell.seed, cell.position, DS41RT_V41_SAMPLER_NO_MASK_ROW,
-        DS41RT_V41_SAMPLER_FLAG_NO_MASK);
+    const cuteafd_v41_sampler_row_t solo = fast_row(
+        0, 0.7f, 0.0f, -inf(), cell.seed, cell.position, CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+        CUTEAFD_V41_SAMPLER_FLAG_NO_MASK);
     const uint32_t token = launch({row_a}, {solo})[0];
 
     std::vector<std::vector<float>> wave8(8, row_b);
@@ -1920,11 +1920,11 @@ void test_k2_batch_composition_independence() {
       {0ull, 0ull}, {0ull, 4ull}, {0ull, 6ull}, {1ull, 0ull},
   };
   std::vector<std::vector<float>> wave4(4, row_onehot);
-  std::vector<ds41rt_v41_sampler_row_t> p4;
+  std::vector<cuteafd_v41_sampler_row_t> p4;
   for (size_t i = 0; i < 4; ++i) {
     p4.push_back(fast_row(static_cast<uint32_t>(i), 0.7f, 0.0f, -inf(), onehot_cells[i].seed,
-                          onehot_cells[i].position, DS41RT_V41_SAMPLER_NO_MASK_ROW,
-                          DS41RT_V41_SAMPLER_FLAG_NO_MASK));
+                          onehot_cells[i].position, CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+                          CUTEAFD_V41_SAMPLER_FLAG_NO_MASK));
   }
   const std::vector<uint32_t> r4 = launch(wave4, p4);
   for (size_t i = 0; i < 4; ++i) {
@@ -1944,30 +1944,30 @@ void test_k2_non_applicable_rows_untouched() {
   const size_t vocab = 8;
   const std::vector<float> logits =
       repeat_row({0.0f, 4.0f, 1.0f, 2.0f, 3.0f, -1.0f, 1.5f, 0.5f}, 4);
-  std::vector<ds41rt_v41_sampler_row_t> params = {
+  std::vector<cuteafd_v41_sampler_row_t> params = {
       /* top_k = 40: ordered path, not the fast path (even though it is a no-op). */
       [] {
-        ds41rt_v41_sampler_row_t p = fast_row(0, 0.7f, 0.0f, -inf(), 3u, 1u,
-                                              DS41RT_V41_SAMPLER_NO_MASK_ROW,
-                                              DS41RT_V41_SAMPLER_FLAG_NO_MASK);
+        cuteafd_v41_sampler_row_t p = fast_row(0, 0.7f, 0.0f, -inf(), 3u, 1u,
+                                              CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+                                              CUTEAFD_V41_SAMPLER_FLAG_NO_MASK);
         p.top_k = 40u;
         return p;
       }(),
       /* top_p = 0.9: ordered path. */
       [] {
-        ds41rt_v41_sampler_row_t p = fast_row(1, 0.7f, 0.0f, -inf(), 3u, 1u,
-                                              DS41RT_V41_SAMPLER_NO_MASK_ROW,
-                                              DS41RT_V41_SAMPLER_FLAG_NO_MASK);
+        cuteafd_v41_sampler_row_t p = fast_row(1, 0.7f, 0.0f, -inf(), 3u, 1u,
+                                              CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+                                              CUTEAFD_V41_SAMPLER_FLAG_NO_MASK);
         p.top_p = 0.9f;
         return p;
       }(),
       /* Greedy: K1 owns the id. */
-      fast_row(2, 0.0f, 0.0f, -inf(), 3u, 1u, DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_GREEDY | DS41RT_V41_SAMPLER_FLAG_STRICT_FINITE |
-                   DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+      fast_row(2, 0.0f, 0.0f, -inf(), 3u, 1u, CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_GREEDY | CUTEAFD_V41_SAMPLER_FLAG_STRICT_FINITE |
+                   CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
       /* Fast path: K2 owns the id. */
-      fast_row(3, 0.7f, 0.0f, -inf(), 3u, 1u, DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+      fast_row(3, 0.7f, 0.0f, -inf(), 3u, 1u, CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
   };
   K1 k = make_k1(4, vocab, false, true);
   require_cuda(cudaMemcpy(k.logits, logits.data(), logits.size() * 4, cudaMemcpyHostToDevice),
@@ -1977,9 +1977,9 @@ void test_k2_non_applicable_rows_untouched() {
   const std::vector<uint32_t> sentinel(4, 0xCAFEBABEu);
   require_cuda(cudaMemcpy(k.ids, sentinel.data(), 4 * 4, cudaMemcpyHostToDevice),
                "nonapp sentinel");
-  expect(ds41rt_cuda_v41_target_sample(k.logits, 4, vocab, vocab, k.params, nullptr, 0u, k.ids,
+  expect(cuteafd_cuda_v41_target_sample(k.logits, 4, vocab, vocab, k.params, nullptr, 0u, k.ids,
                                        k.status, k.detail, k.scores, k.total, k.nucleus,
-                                       k.scratch) == DS41RT_STATUS_OK, "nonapp launch");
+                                       k.scratch) == CUTEAFD_STATUS_OK, "nonapp launch");
   std::vector<uint32_t> ids(4);
   require_cuda(cudaMemcpy(ids.data(), k.ids, 4 * 4, cudaMemcpyDeviceToHost), "nonapp ids");
   expect(ids[0] == 0xCAFEBABEu, "top_k row untouched by K2");
@@ -2009,10 +2009,10 @@ K2TreeModel k2_tree_model(const float* logits, size_t vocab, float temperature, 
                           float ln_min_p) {
   K2TreeModel out;
   /* The sampler's CTA width, from the SAME header definition the kernel uses
-   * (`DS41RT_V41_SAMPLER_CTA`, `v41_sampling_gpu.h`). This host model mirrors
+   * (`CUTEAFD_V41_SAMPLER_CTA`, `v41_sampling_gpu.h`). This host model mirrors
    * the shipped segments; a hard-coded width here would model a kernel that is
    * not running (measured in chunk 6). */
-  constexpr int kBlockLocal = DS41RT_V41_SAMPLER_CTA;
+  constexpr int kBlockLocal = CUTEAFD_V41_SAMPLER_CTA;
   out.per_thread = (vocab + kBlockLocal - 1) / kBlockLocal;
   const float inv = 1.0f / temperature;
   float max_scaled = -std::numeric_limits<float>::infinity();
@@ -2062,7 +2062,7 @@ K2TreeModel k2_tree_model(const float* logits, size_t vocab, float temperature, 
     out.global_last_survivor = std::max(out.global_last_survivor, last_seg[s]);
   }
   float walk = 0.0f;
-  if (out.global_last_survivor != DS41RT_V41_SAMPLER_NO_DETAIL) {    const size_t owner = static_cast<size_t>(out.global_last_survivor) / out.per_thread;
+  if (out.global_last_survivor != CUTEAFD_V41_SAMPLER_NO_DETAIL) {    const size_t owner = static_cast<size_t>(out.global_last_survivor) / out.per_thread;
     float running = (owner == 0u) ? 0.0f : inclusive[owner - 1];
     const size_t owner_begin = owner * out.per_thread;
     for (size_t token = owner_begin; token <= static_cast<size_t>(out.global_last_survivor);
@@ -2119,18 +2119,18 @@ void test_k2_fallback_unreachable_like_cpu() {
   /* (a) MAX_UNIFORM-scale draw: the old kernel took the fallback here. */
   const uint64_t seed = 5020ull;
   const uint64_t position = 1ull;            /* u = 0.999993801 */
-  std::vector<ds41rt_v41_sampler_row_t> params = {
-      fast_row(0, 1.0f, 0.0f, -inf(), seed, position, DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+  std::vector<cuteafd_v41_sampler_row_t> params = {
+      fast_row(0, 1.0f, 0.0f, -inf(), seed, position, CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
   };
   K1 k = make_k1(1, vocab, false, true);
   require_cuda(cudaMemcpy(k.logits, logits.data(), logits.size() * 4, cudaMemcpyHostToDevice),
                "fallback logits");
   require_cuda(cudaMemcpy(k.params, params.data(), sizeof(params[0]), cudaMemcpyHostToDevice),
                "fallback params");
-  expect(ds41rt_cuda_v41_target_sample(k.logits, 1, vocab, vocab, k.params, nullptr, 0u, k.ids,
+  expect(cuteafd_cuda_v41_target_sample(k.logits, 1, vocab, vocab, k.params, nullptr, 0u, k.ids,
                                        k.status, k.detail, k.scores, k.total, k.nucleus,
-                                       k.scratch) == DS41RT_STATUS_OK, "fallback launch");
+                                       k.scratch) == CUTEAFD_STATUS_OK, "fallback launch");
   std::vector<uint32_t> ids(1);
   std::vector<float> total(1);
   require_cuda(cudaMemcpy(ids.data(), k.ids, 4, cudaMemcpyDeviceToHost), "fallback id");
@@ -2170,12 +2170,12 @@ void test_k2_fallback_unreachable_like_cpu() {
   const uint64_t mid_seed = 0ull;
   const uint64_t mid_position = 0ull;        /* u = 0.400835 */
   params[0] = fast_row(0, 1.0f, 0.0f, -inf(), mid_seed, mid_position,
-                       DS41RT_V41_SAMPLER_NO_MASK_ROW, DS41RT_V41_SAMPLER_FLAG_NO_MASK);
+                       CUTEAFD_V41_SAMPLER_NO_MASK_ROW, CUTEAFD_V41_SAMPLER_FLAG_NO_MASK);
   require_cuda(cudaMemcpy(k.params, params.data(), sizeof(params[0]), cudaMemcpyHostToDevice),
                "fallback params mid");
-  expect(ds41rt_cuda_v41_target_sample(k.logits, 1, vocab, vocab, k.params, nullptr, 0u, k.ids,
+  expect(cuteafd_cuda_v41_target_sample(k.logits, 1, vocab, vocab, k.params, nullptr, 0u, k.ids,
                                        k.status, k.detail, k.scores, k.total, k.nucleus,
-                                       k.scratch) == DS41RT_STATUS_OK, "fallback launch mid");
+                                       k.scratch) == CUTEAFD_STATUS_OK, "fallback launch mid");
   require_cuda(cudaMemcpy(ids.data(), k.ids, 4, cudaMemcpyDeviceToHost), "fallback id mid");
   const RefFast mid_cpu = cpu_fast_reference(logits.data(), vocab, nullptr, true, 1.0f, 0.0f,
                                              -inf(), mid_seed, mid_position);
@@ -2212,9 +2212,9 @@ void test_k2_zero_weight_invariant() {
   const uint64_t seed = 0x9216a62488dbaa7bull;
   const uint64_t position = 0ull;
   const uint32_t sentinel = 0xDEADBEEFu;
-  const std::vector<ds41rt_v41_sampler_row_t> params = {
-      fast_row(0, 1.0f, 0.0f, -inf(), seed, position, DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+  const std::vector<cuteafd_v41_sampler_row_t> params = {
+      fast_row(0, 1.0f, 0.0f, -inf(), seed, position, CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
   };
   K1 k = make_k1(1, vocab, false, true);
   require_cuda(cudaMemcpy(k.logits, logits.data(), logits.size() * sizeof(float),
@@ -2224,9 +2224,9 @@ void test_k2_zero_weight_invariant() {
   std::vector<uint32_t> host_ids(1u, sentinel);
   require_cuda(cudaMemcpy(k.ids, host_ids.data(), sizeof(uint32_t),
                           cudaMemcpyHostToDevice), "K2 witness ids h2d");
-  expect(ds41rt_cuda_v41_target_sample(k.logits, 1, vocab, vocab, k.params, nullptr, 0u,
+  expect(cuteafd_cuda_v41_target_sample(k.logits, 1, vocab, vocab, k.params, nullptr, 0u,
                                        k.ids, k.status, k.detail, k.scores, k.total,
-                                       k.nucleus, k.scratch) == DS41RT_STATUS_OK,
+                                       k.nucleus, k.scratch) == CUTEAFD_STATUS_OK,
          "K2 witness: launch");
   uint32_t id = sentinel;
   uint32_t status = sentinel;
@@ -2239,7 +2239,7 @@ void test_k2_zero_weight_invariant() {
   expect(cpu.crossed, "K2 witness: the CPU port crosses (its last fallback is unreachable)");
   expect(cpu.total == 1.0f, "K2 witness: the CPU sequential total loses every sub-half-ulp tail");
   expect(cpu.token == 0u, "K2 witness: the CPU crosses at token 0");
-  expect(status == DS41RT_V41_SAMPLER_STATUS_OK, "K2 witness: K2 reported OK");
+  expect(status == CUTEAFD_V41_SAMPLER_STATUS_OK, "K2 witness: K2 reported OK");
   expect(id != sentinel && id < vocab, "K2 witness: K2 wrote an in-vocab token");
   /* `T = 1` and `max_scaled = logits[0] = 0`, so the weight is `expf(logit)`.
    * Token 16 is the pre-fix zero-weight pick; its weight really is zero, so the
@@ -2307,11 +2307,11 @@ void test_k2_saturation_fallback_witness_pinned() {
          "saturation witness: tokens 4 and 5 have positive weights");
 
   const std::vector<float> rows = repeat_row(logits, 2);
-  const std::vector<ds41rt_v41_sampler_row_t> params = {
-      fast_row(0, 1.0f, 0.0f, -inf(), seed_low_u, 0ull, DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK),
-      fast_row(1, 1.0f, 0.0f, -inf(), seed_high_u, 0ull, DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+  const std::vector<cuteafd_v41_sampler_row_t> params = {
+      fast_row(0, 1.0f, 0.0f, -inf(), seed_low_u, 0ull, CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
+      fast_row(1, 1.0f, 0.0f, -inf(), seed_high_u, 0ull, CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
   };
   K1 k = make_k1(2, vocab, false, true);
   require_cuda(cudaMemcpy(k.logits, rows.data(), rows.size() * sizeof(float),
@@ -2321,16 +2321,16 @@ void test_k2_saturation_fallback_witness_pinned() {
   const std::vector<uint32_t> sentinels(2u, 0xDEADBEEFu);
   require_cuda(cudaMemcpy(k.ids, sentinels.data(), 2 * sizeof(uint32_t),
                           cudaMemcpyHostToDevice), "saturation witness ids h2d");
-  expect(ds41rt_cuda_v41_target_sample(k.logits, 2, vocab, vocab, k.params, nullptr, 0u,
+  expect(cuteafd_cuda_v41_target_sample(k.logits, 2, vocab, vocab, k.params, nullptr, 0u,
                                        k.ids, k.status, k.detail, k.scores, k.total,
-                                       k.nucleus, k.scratch) == DS41RT_STATUS_OK,
+                                       k.nucleus, k.scratch) == CUTEAFD_STATUS_OK,
          "saturation witness: launch");
   std::vector<uint32_t> ids(2), status(2);
   require_cuda(cudaMemcpy(ids.data(), k.ids, 2 * sizeof(uint32_t), cudaMemcpyDeviceToHost),
                "saturation witness ids d2h");
   require_cuda(cudaMemcpy(status.data(), k.status, 2 * sizeof(uint32_t),
                           cudaMemcpyDeviceToHost), "saturation witness status d2h");
-  expect(status[0] == DS41RT_V41_SAMPLER_STATUS_OK && status[1] == DS41RT_V41_SAMPLER_STATUS_OK,
+  expect(status[0] == CUTEAFD_V41_SAMPLER_STATUS_OK && status[1] == CUTEAFD_V41_SAMPLER_STATUS_OK,
          "saturation witness: both draws report OK");
   /* The v12 1024-thread geometry folds these weights into one segment. Both
    * uniforms select token 0, matching the production CPU on this witness. */
@@ -2363,7 +2363,7 @@ void test_k2_saturation_fallback_witness_pinned() {
 /* Chunk 3a: K3 pivot selection + K4 exact-k membership (design §4.3-4.4)  */
 /* ====================================================================== */
 
-/* Host port of the shipped `ds41rt_v41_order_key` (design §4.3): the standard
+/* Host port of the shipped `cuteafd_v41_order_key` (design §4.3): the standard
  * IEEE ascending u32 map, larger = better, with -0.0 canonicalized to +0.0. */
 uint32_t host_order_key(float scaled) {
   const float value = (scaled == 0.0f) ? 0.0f : scaled;
@@ -2379,7 +2379,7 @@ uint32_t host_order_key(float scaled) {
  * and order K4 must materialize. */
 struct RefTopk {
   bool greedy = false;
-  uint32_t status = DS41RT_V41_SAMPLER_STATUS_OK;
+  uint32_t status = CUTEAFD_V41_SAMPLER_STATUS_OK;
   uint32_t survivor_count = 0;
   bool runs = false; /* K3/K4 eligibility, `target_sampling.rs:477-501` */
   uint32_t above_count = 0;
@@ -2395,10 +2395,10 @@ RefTopk cpu_topk_reference(const float* logits, size_t vocab,
   const RefGreedy k1 = cpu_reference(logits, vocab, mask_words, mask_words_per_row,
                                      temperature, top_k, ln_min_p, min_p, flags);
   out.greedy = is_greedy(temperature, top_k) ||
-               (flags & DS41RT_V41_SAMPLER_FLAG_GREEDY) != 0u;
+               (flags & CUTEAFD_V41_SAMPLER_FLAG_GREEDY) != 0u;
   out.status = k1.stochastic_status;
   out.survivor_count = k1.survivor_count;
-  if (out.greedy || k1.stochastic_status != DS41RT_V41_SAMPLER_STATUS_OK ||
+  if (out.greedy || k1.stochastic_status != CUTEAFD_V41_SAMPLER_STATUS_OK ||
       k1.survivor_count == 0u || top_k == 0u || top_k >= k1.survivor_count) {
     return out;
   }
@@ -2469,7 +2469,7 @@ uint32_t host_bisection_pass_bound() {
     lo = 0u;
     hi = length;
     ++passes;
-    expect(passes <= DS41RT_V41_TOPK_MAX_PIVOT_STEPS,
+    expect(passes <= CUTEAFD_V41_TOPK_MAX_PIVOT_STEPS,
            "bisection bound is inside the defensive cap");
   }
   return passes;
@@ -2515,7 +2515,7 @@ void free_topk_buffers(TopkBuffers* buffers) {
  * no-op row that writes anything — or an eligible row whose ids were never
  * written — cannot pass. */
 void run_topk_case(const std::vector<float>& logits, size_t rows, size_t vocab,
-                   const std::vector<ds41rt_v41_sampler_row_t>& params,
+                   const std::vector<cuteafd_v41_sampler_row_t>& params,
                    const std::vector<uint32_t>& mask, bool with_mask, bool strict_mask_bits,
                    size_t capacity, const char* label) {
   ++g_cases;
@@ -2525,13 +2525,13 @@ void run_topk_case(const std::vector<float>& logits, size_t rows, size_t vocab,
   require_cuda(cudaMemcpy(k.logits, logits.data(), logits.size() * sizeof(float),
                           cudaMemcpyHostToDevice), "topk logits h2d");
   require_cuda(cudaMemcpy(k.params, params.data(),
-                          params.size() * sizeof(ds41rt_v41_sampler_row_t),
+                          params.size() * sizeof(cuteafd_v41_sampler_row_t),
                           cudaMemcpyHostToDevice), "topk params h2d");
   std::vector<uint32_t> device_mask = mask;
   if (with_mask) {
     if (strict_mask_bits) {
       for (size_t r = 0; r < rows; ++r) {
-        ds41rt_v41_sampler_clear_remainder(device_mask.data() + r * k.words, vocab);
+        cuteafd_v41_sampler_clear_remainder(device_mask.data() + r * k.words, vocab);
       }
     }
     require_cuda(cudaMemcpy(k.mask, device_mask.data(),
@@ -2540,10 +2540,10 @@ void run_topk_case(const std::vector<float>& logits, size_t rows, size_t vocab,
   }
   /* K1 first: K3/K4 read its `scratch` exactly as K2 does. K2 itself is a no-op
    * for every row here (`top_k != 0`). */
-  expect(ds41rt_cuda_v41_target_sample(
+  expect(cuteafd_cuda_v41_target_sample(
              k.logits, rows, vocab, vocab, k.params, with_mask ? k.mask : nullptr,
              with_mask ? k.words : 0u, k.ids, k.status, k.detail, k.scores, nullptr,
-             nullptr, k.scratch) == DS41RT_STATUS_OK,
+             nullptr, k.scratch) == CUTEAFD_STATUS_OK,
          tag + ": K1 launch");
   TopkBuffers buffers = make_topk_buffers(rows, capacity);
   const uint32_t sentinel = 0xDEADBEEFu;
@@ -2563,19 +2563,19 @@ void run_topk_case(const std::vector<float>& logits, size_t rows, size_t vocab,
                           cudaMemcpyHostToDevice), "topk retained h2d");
   require_cuda(cudaMemcpy(buffers.passes, host_passes.data(), rows * sizeof(uint32_t),
                           cudaMemcpyHostToDevice), "topk passes h2d");
-  expect(ds41rt_cuda_v41_topk_select(
+  expect(cuteafd_cuda_v41_topk_select(
              k.logits, rows, vocab, vocab, k.params, with_mask ? k.mask : nullptr,
              with_mask ? k.words : 0u, capacity > 0 ? buffers.rank_ids : nullptr,
              capacity > 0 ? buffers.rank_scratch : nullptr, capacity, buffers.retained,
-             buffers.passes, k.scratch) == DS41RT_STATUS_OK,
+             buffers.passes, k.scratch) == CUTEAFD_STATUS_OK,
          tag + ": topk launch");
   require_cuda(cudaDeviceSynchronize(), "topk kernel");
 
-  std::vector<ds41rt_v41_sampler_scratch_t> scratch(rows);
+  std::vector<cuteafd_v41_sampler_scratch_t> scratch(rows);
   std::vector<uint32_t> retained(rows);
   std::vector<uint32_t> passes(rows);
   require_cuda(cudaMemcpy(scratch.data(), k.scratch,
-                          rows * sizeof(ds41rt_v41_sampler_scratch_t),
+                          rows * sizeof(cuteafd_v41_sampler_scratch_t),
                           cudaMemcpyDeviceToHost), "topk scratch");
   require_cuda(cudaMemcpy(retained.data(), buffers.retained, rows * sizeof(uint32_t),
                           cudaMemcpyDeviceToHost), "topk retained");
@@ -2589,10 +2589,10 @@ void run_topk_case(const std::vector<float>& logits, size_t rows, size_t vocab,
   }
 
   for (size_t r = 0; r < rows; ++r) {
-    const ds41rt_v41_sampler_row_t& p = params[r];
+    const cuteafd_v41_sampler_row_t& p = params[r];
     const std::string row_tag = tag + " row " + std::to_string(r);
-    const bool unconstrained = (p.flags & DS41RT_V41_SAMPLER_FLAG_NO_MASK) != 0u ||
-                               p.mask_row == DS41RT_V41_SAMPLER_NO_MASK_ROW;
+    const bool unconstrained = (p.flags & CUTEAFD_V41_SAMPLER_FLAG_NO_MASK) != 0u ||
+                               p.mask_row == CUTEAFD_V41_SAMPLER_NO_MASK_ROW;
     const uint32_t* row_mask = (with_mask && !unconstrained)
         ? device_mask.data() + static_cast<size_t>(p.mask_row) * k.words
         : nullptr;
@@ -2603,7 +2603,7 @@ void run_topk_case(const std::vector<float>& logits, size_t rows, size_t vocab,
     if (!expected.runs) {
       expect(retained[r] == 0u, row_tag + ": no-op row retains nothing");
       expect(passes[r] == 0u, row_tag + ": no-op row runs no pivot pass");
-      expect(scratch[r].status == DS41RT_V41_SAMPLER_STATUS_OK,
+      expect(scratch[r].status == CUTEAFD_V41_SAMPLER_STATUS_OK,
              row_tag + ": no-op row keeps its K1 status");
       if (capacity > 0) {
         for (size_t i = 0; i < capacity; ++i) {
@@ -2613,13 +2613,13 @@ void run_topk_case(const std::vector<float>& logits, size_t rows, size_t vocab,
       }
       continue;
     }
-    expect(scratch[r].status == DS41RT_V41_SAMPLER_STATUS_OK,
+    expect(scratch[r].status == CUTEAFD_V41_SAMPLER_STATUS_OK,
            row_tag + ": K3 converged (status OK)");
     expect(retained[r] == p.top_k, row_tag + ": retained count is exactly k");
     expect(passes[r] >= 1u, row_tag + ": at least one pivot pass");
     expect(passes[r] <= 3u,
            row_tag + ": radix pivot resolves in at most three passes");
-    expect(passes[r] <= DS41RT_V41_TOPK_MAX_PIVOT_STEPS,
+    expect(passes[r] <= CUTEAFD_V41_TOPK_MAX_PIVOT_STEPS,
            row_tag + ": pivot passes within the defensive cap");
     if (passes[r] > g_max_pivot_passes) {
       g_max_pivot_passes = passes[r];
@@ -2714,9 +2714,9 @@ void test_k3_k4_k_grid() {
           static_cast<uint32_t>(vocab + 1u),
       };
       for (uint32_t k : ks) {
-        std::vector<ds41rt_v41_sampler_row_t> params = {
-            row(0, 0.7f, k, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-                DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+        std::vector<cuteafd_v41_sampler_row_t> params = {
+            row(0, 0.7f, k, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+                CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
         };
         const size_t capacity = k; /* one row: exactly its own k */
         const std::string label = "k3k4 grid " + std::string(shape_names[s]) +
@@ -2742,9 +2742,9 @@ void test_k3_k4_thousands_tied() {
     for (size_t t = 0; t < vocab; ++t) {
       logits[t] = (t % 2u == 0u) ? 1.0f : 0.5f;
     }
-    std::vector<ds41rt_v41_sampler_row_t> params = {
-        row(0, 1.0f, 3000u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-            DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+    std::vector<cuteafd_v41_sampler_row_t> params = {
+        row(0, 1.0f, 3000u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+            CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
     };
     run_topk_case(logits, 1, vocab, params, {}, false, false, 3000u,
                   "k3k4 thousands-tied half/half k=3000");
@@ -2757,9 +2757,9 @@ void test_k3_k4_thousands_tied() {
     logits[0] = 10.0f;
     logits[1] = 1.0f;
     logits[2] = 0.5f;
-    std::vector<ds41rt_v41_sampler_row_t> params = {
-        row(0, 1.0f, 2000u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-            DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+    std::vector<cuteafd_v41_sampler_row_t> params = {
+        row(0, 1.0f, 2000u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+            CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
     };
     run_topk_case(logits, 1, vocab, params, {}, false, false, 2000u,
                   "k3k4 thousands-tied flat tail k=2000");
@@ -2769,18 +2769,18 @@ void test_k3_k4_thousands_tied() {
                             cudaMemcpyHostToDevice), "tie logits");
     require_cuda(cudaMemcpy(k.params, params.data(), sizeof(params[0]),
                             cudaMemcpyHostToDevice), "tie params");
-    expect(ds41rt_cuda_v41_target_sample(k.logits, 1, vocab, vocab, k.params, nullptr,
+    expect(cuteafd_cuda_v41_target_sample(k.logits, 1, vocab, vocab, k.params, nullptr,
                                          0u, k.ids, k.status, k.detail, k.scores, nullptr,
-                                         nullptr, k.scratch) == DS41RT_STATUS_OK,
+                                         nullptr, k.scratch) == CUTEAFD_STATUS_OK,
            "tie K1 launch");
     TopkBuffers buffers = make_topk_buffers(1, 2000u);
-    expect(ds41rt_cuda_v41_topk_select(k.logits, 1, vocab, vocab, k.params, nullptr, 0u,
+    expect(cuteafd_cuda_v41_topk_select(k.logits, 1, vocab, vocab, k.params, nullptr, 0u,
                                        buffers.rank_ids, buffers.rank_scratch, 2000u,
                                        buffers.retained, buffers.passes, k.scratch) ==
-               DS41RT_STATUS_OK,
+               CUTEAFD_STATUS_OK,
            "tie topk launch");
     std::vector<uint32_t> ids(2000u);
-    std::vector<ds41rt_v41_sampler_scratch_t> scratch(1);
+    std::vector<cuteafd_v41_sampler_scratch_t> scratch(1);
     require_cuda(cudaMemcpy(ids.data(), buffers.rank_ids, 2000u * 4,
                             cudaMemcpyDeviceToHost), "tie ids");
     require_cuda(cudaMemcpy(scratch.data(), k.scratch, sizeof(scratch[0]),
@@ -2805,9 +2805,9 @@ void test_k3_k4_all_tied() {
   const std::vector<uint32_t> ks = {2u, 40u, 64u, 257u, 1000u};
   for (uint32_t k : ks) {
     std::vector<float> logits(vocab, 0.25f);
-    std::vector<ds41rt_v41_sampler_row_t> params = {
-        row(0, 1.0f, k, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-            DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+    std::vector<cuteafd_v41_sampler_row_t> params = {
+        row(0, 1.0f, k, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+            CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
     };
     const std::string label = "k3k4 all-tied k" + std::to_string(k);
     run_topk_case(logits, 1, vocab, params, {}, false, false, k, label.c_str());
@@ -2817,15 +2817,15 @@ void test_k3_k4_all_tied() {
                             cudaMemcpyHostToDevice), "all-tied logits");
     require_cuda(cudaMemcpy(dev.params, params.data(), sizeof(params[0]),
                             cudaMemcpyHostToDevice), "all-tied params");
-    expect(ds41rt_cuda_v41_target_sample(dev.logits, 1, vocab, vocab, dev.params, nullptr,
+    expect(cuteafd_cuda_v41_target_sample(dev.logits, 1, vocab, vocab, dev.params, nullptr,
                                          0u, dev.ids, dev.status, dev.detail, dev.scores,
-                                         nullptr, nullptr, dev.scratch) == DS41RT_STATUS_OK,
+                                         nullptr, nullptr, dev.scratch) == CUTEAFD_STATUS_OK,
            "all-tied K1");
     TopkBuffers buffers = make_topk_buffers(1, k);
-    expect(ds41rt_cuda_v41_topk_select(dev.logits, 1, vocab, vocab, dev.params, nullptr,
+    expect(cuteafd_cuda_v41_topk_select(dev.logits, 1, vocab, vocab, dev.params, nullptr,
                                        0u, buffers.rank_ids, buffers.rank_scratch, k,
                                        buffers.retained, buffers.passes, dev.scratch) ==
-               DS41RT_STATUS_OK,
+               CUTEAFD_STATUS_OK,
            "all-tied topk");
     std::vector<uint32_t> ids(k);
     require_cuda(cudaMemcpy(ids.data(), buffers.rank_ids, k * 4, cudaMemcpyDeviceToHost),
@@ -2848,9 +2848,9 @@ void test_k3_k4_all_tied() {
     const float neg_max = -std::numeric_limits<float>::max();
     std::vector<float> logits(vocab, neg_max);
     logits[0] = 0.0f;
-    std::vector<ds41rt_v41_sampler_row_t> params = {
-        row(0, 1.0e-5f, 64u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-            DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+    std::vector<cuteafd_v41_sampler_row_t> params = {
+        row(0, 1.0e-5f, 64u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+            CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
     };
     run_topk_case(logits, 1, vocab, params, {}, false, false, 64u,
                   "k3k4 -inf tie group");
@@ -2871,7 +2871,7 @@ void test_k3_k4_masks_and_inf() {
     for (uint32_t id : allowed_ids) {
       mask[id / 32u] |= (1u << (id % 32u));
     }
-    std::vector<ds41rt_v41_sampler_row_t> params = {
+    std::vector<cuteafd_v41_sampler_row_t> params = {
         row(0, 0.7f, 2u, 0.0f, -inf(), 0u, 0u),
     };
     run_topk_case(logits, 1, vocab, params, mask, true, true, 2u,
@@ -2885,7 +2885,7 @@ void test_k3_k4_masks_and_inf() {
     const size_t words = (vocab + 31u) / 32u;
     std::vector<float> logits = shape_periodic_ties(vocab);
     std::vector<uint32_t> mask(words, 0xFFFFFFFFu);
-    std::vector<ds41rt_v41_sampler_row_t> params = {
+    std::vector<cuteafd_v41_sampler_row_t> params = {
         row(0, 0.7f, 40u, 0.0f, -inf(), 0u, 0u),
     };
     run_topk_case(logits, 1, vocab, params, mask, true, false, 40u,
@@ -2907,7 +2907,7 @@ void test_k3_k4_masks_and_inf() {
         mask[t / 32u] |= (1u << (t % 32u));
       }
     }
-    std::vector<ds41rt_v41_sampler_row_t> params = {
+    std::vector<cuteafd_v41_sampler_row_t> params = {
         row(0, 1.0f, 4u, 0.0f, -inf(), 0u, 0u),
     };
     run_topk_case(logits, 1, vocab, params, mask, true, true, 4u,
@@ -2921,9 +2921,9 @@ void test_k3_k4_masks_and_inf() {
     std::vector<float> logits(vocab, neg_max);
     logits[7] = 0.0f;
     logits[9] = -1.0f;
-    std::vector<ds41rt_v41_sampler_row_t> params = {
-        row(0, 1.0e-5f, 10u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-            DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+    std::vector<cuteafd_v41_sampler_row_t> params = {
+        row(0, 1.0e-5f, 10u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+            CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
     };
     run_topk_case(logits, 1, vocab, params, {}, false, false, 10u,
                   "k3k4 -inf survivors k=10");
@@ -2936,7 +2936,7 @@ void test_k3_k4_masks_and_inf() {
     std::vector<uint32_t> mask(words, 0xFFFFFFFFu);
     const float min_p = 0.05f;
     const float ln_min_p = std::log(min_p);
-    std::vector<ds41rt_v41_sampler_row_t> params = {
+    std::vector<cuteafd_v41_sampler_row_t> params = {
         row(0, 1.0f, 4u, min_p, ln_min_p, 0u, 0u),
     };
     run_topk_case(logits, 1, vocab, params, mask, true, true, 4u,
@@ -2960,19 +2960,19 @@ void test_k3_k4_boundaries_and_termination() {
                                 (r == 5u ? 0.0f : static_cast<float>(r));
       }
     }
-    std::vector<ds41rt_v41_sampler_row_t> params = {
-        row(0, 0.7f, 1u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-            DS41RT_V41_SAMPLER_FLAG_NO_MASK), /* greedy */
-        row(1, 0.7f, 0u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-            DS41RT_V41_SAMPLER_FLAG_NO_MASK), /* disabled */
-        row(2, 0.7f, 400u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-            DS41RT_V41_SAMPLER_FLAG_NO_MASK), /* top_k > survivor_count no-op */
-        row(3, 0.7f, 17u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-            DS41RT_V41_SAMPLER_FLAG_NO_MASK),
-        row(4, 1.0e-6f, 5u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-            DS41RT_V41_SAMPLER_FLAG_NO_MASK), /* T < 1e-5 greedy */
-        row(5, 2.0f, 64u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-            DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+    std::vector<cuteafd_v41_sampler_row_t> params = {
+        row(0, 0.7f, 1u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+            CUTEAFD_V41_SAMPLER_FLAG_NO_MASK), /* greedy */
+        row(1, 0.7f, 0u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+            CUTEAFD_V41_SAMPLER_FLAG_NO_MASK), /* disabled */
+        row(2, 0.7f, 400u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+            CUTEAFD_V41_SAMPLER_FLAG_NO_MASK), /* top_k > survivor_count no-op */
+        row(3, 0.7f, 17u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+            CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
+        row(4, 1.0e-6f, 5u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+            CUTEAFD_V41_SAMPLER_FLAG_NO_MASK), /* T < 1e-5 greedy */
+        row(5, 2.0f, 64u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+            CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
     };
     run_topk_case(logits, 6, vocab, params, {}, false, false, 64u,
                   "k3k4 mixed no-op/greedy/selection batch");
@@ -2982,9 +2982,9 @@ void test_k3_k4_boundaries_and_termination() {
   {
     const size_t vocab = 500;
     std::vector<float> logits = shape_descending(vocab);
-    std::vector<ds41rt_v41_sampler_row_t> params = {
-        row(0, 0.7f, 37u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-            DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+    std::vector<cuteafd_v41_sampler_row_t> params = {
+        row(0, 0.7f, 37u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+            CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
     };
     run_topk_case(logits, 1, vocab, params, {}, false, false, 0u,
                   "k3k4 selection-only capacity 0");
@@ -3006,26 +3006,26 @@ void test_k3_k4_boundaries_and_termination() {
       logits[t] = -8.0f + 10.0f * splitmix_unit(static_cast<uint64_t>(t));
     }
     {
-      std::vector<ds41rt_v41_sampler_row_t> params = {
-          row(0, 0.7f, 40u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-              DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+      std::vector<cuteafd_v41_sampler_row_t> params = {
+          row(0, 0.7f, 40u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+              CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
       };
       run_topk_case(logits, 1, vocab, params, {}, false, false, 40u,
                     "k3k4 wide vocab 129280 k=40");
     }
     {
-      std::vector<ds41rt_v41_sampler_row_t> params = {
-          row(0, 0.7f, 1000u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-              DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+      std::vector<cuteafd_v41_sampler_row_t> params = {
+          row(0, 0.7f, 1000u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+              CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
       };
       run_topk_case(logits, 1, vocab, params, {}, false, false, 1000u,
                     "k3k4 wide vocab 129280 k=1000");
     }
     {
       const uint32_t k = static_cast<uint32_t>(vocab - 1u);
-      std::vector<ds41rt_v41_sampler_row_t> params = {
-          row(0, 0.7f, k, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-              DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+      std::vector<cuteafd_v41_sampler_row_t> params = {
+          row(0, 0.7f, k, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+              CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
       };
       run_topk_case(logits, 1, vocab, params, {}, false, false, 0u,
                     "k3k4 wide vocab 129280 k=survivor_count-1 (selection-only)");
@@ -3036,15 +3036,15 @@ void test_k3_k4_boundaries_and_termination() {
   {
     const size_t vocab = 64;
     std::vector<float> logits = shape_descending(vocab);
-    std::vector<ds41rt_v41_sampler_row_t> params = {
-        row(0, 0.7f, 1u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-            DS41RT_V41_SAMPLER_FLAG_NO_MASK),
-        row(1, 0.7f, 0u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-            DS41RT_V41_SAMPLER_FLAG_NO_MASK),
-        row(2, 0.7f, 64u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-            DS41RT_V41_SAMPLER_FLAG_NO_MASK),
-        row(3, 0.7f, 65u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-            DS41RT_V41_SAMPLER_FLAG_NO_MASK),
+    std::vector<cuteafd_v41_sampler_row_t> params = {
+        row(0, 0.7f, 1u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+            CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
+        row(1, 0.7f, 0u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+            CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
+        row(2, 0.7f, 64u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+            CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
+        row(3, 0.7f, 65u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+            CUTEAFD_V41_SAMPLER_FLAG_NO_MASK),
     };
     const std::vector<float> four = [&] {
       std::vector<float> all;
@@ -3082,7 +3082,7 @@ void test_k3_k4_length_two_interval() {
   const uint32_t top_key = host_order_key(1.0f);
   const uint32_t bottom_key = host_order_key(-1.0f);
   std::vector<float> logits(rows * 3);
-  std::vector<ds41rt_v41_sampler_row_t> params;
+  std::vector<cuteafd_v41_sampler_row_t> params;
   for (size_t r = 0; r < rows; ++r) {
     float middle = 0.0f;
     std::memcpy(&middle, &middle_bits[r], sizeof(middle));
@@ -3090,8 +3090,8 @@ void test_k3_k4_length_two_interval() {
     logits[r * 3 + 1] = middle;
     logits[r * 3 + 2] = -1.0f;
     params.push_back(row(static_cast<uint32_t>(r), 1.0f, 2u, 0.0f, -inf(),
-                         DS41RT_V41_SAMPLER_NO_MASK_ROW,
-                         DS41RT_V41_SAMPLER_FLAG_NO_MASK));
+                         CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+                         CUTEAFD_V41_SAMPLER_FLAG_NO_MASK));
     /* Host-side two-probe bisection with the OLD `>= 3` termination; it must
      * return `middle + 1`, which is what the fixed kernel must never return. */
     const uint32_t keys[3] = {top_key, host_order_key(middle), bottom_key};
@@ -3147,7 +3147,7 @@ void test_k3_k4_randomized_rows() {
   const uint32_t k_cycle[] = {2u, 3u, 5u, 17u, 40u, 64u, 100u, 256u, 300u};
   std::vector<float> logits(rows * vocab);
   std::vector<uint32_t> mask(rows * words, 0xFFFFFFFFu);
-  std::vector<ds41rt_v41_sampler_row_t> params;
+  std::vector<cuteafd_v41_sampler_row_t> params;
   size_t capacity = 0;
   for (size_t r = 0; r < rows; ++r) {
     for (size_t t = 0; t < vocab; ++t) {
@@ -3172,8 +3172,8 @@ void test_k3_k4_randomized_rows() {
     const float min_p = (r % 3u == 0u) ? 0.0f : ((r % 3u == 1u) ? 0.05f : 0.5f);
     const float ln_min_p = (min_p > 0.0f) ? std::log(min_p) : -inf();
     bool masked = (r % 5u == 0u);
-    uint32_t mask_row = masked ? static_cast<uint32_t>(r) : DS41RT_V41_SAMPLER_NO_MASK_ROW;
-    uint32_t flags = masked ? 0u : DS41RT_V41_SAMPLER_FLAG_NO_MASK;
+    uint32_t mask_row = masked ? static_cast<uint32_t>(r) : CUTEAFD_V41_SAMPLER_NO_MASK_ROW;
+    uint32_t flags = masked ? 0u : CUTEAFD_V41_SAMPLER_FLAG_NO_MASK;
     if (masked) {
       for (size_t t = 0; t < vocab; ++t) {
         const bool allowed = (t % 3u) != 0u;
@@ -3181,7 +3181,7 @@ void test_k3_k4_randomized_rows() {
             allowed ? (mask[r * words + t / 32u] | (1u << (t % 32u)))
                     : (mask[r * words + t / 32u] & ~(1u << (t % 32u)));
       }
-      ds41rt_v41_sampler_clear_remainder(mask.data() + r * words, vocab);
+      cuteafd_v41_sampler_clear_remainder(mask.data() + r * words, vocab);
     }
     const uint32_t k = k_cycle[r % (sizeof(k_cycle) / sizeof(k_cycle[0]))];
     capacity = std::max(capacity, static_cast<size_t>(k));
@@ -3275,7 +3275,7 @@ struct RefOrderedRow {
   bool greedy = false;
   bool k2_fast_path = false;
   bool ok = false;
-  uint32_t status = DS41RT_V41_SAMPLER_STATUS_OK;
+  uint32_t status = CUTEAFD_V41_SAMPLER_STATUS_OK;
   uint32_t survivor_count = 0;
   uint32_t domain_count = 0; /* K5's `S`: top_k when materialized, else survivors */
   uint32_t token = 0;
@@ -3329,7 +3329,7 @@ RefOrderedRow host_ordered_reference(const float* logits, size_t vocab,
     return unconstrained || ((mask_words[token / 32u] >> (token % 32u)) & 1u) != 0u;
   };
   out.greedy = is_greedy(temperature, top_k) ||
-               (flags & DS41RT_V41_SAMPLER_FLAG_GREEDY) != 0u;
+               (flags & CUTEAFD_V41_SAMPLER_FLAG_GREEDY) != 0u;
   if (out.greedy) {
     return out;
   }
@@ -3341,18 +3341,18 @@ RefOrderedRow host_ordered_reference(const float* logits, size_t vocab,
       continue;
     }
     if (!std::isfinite(logits[token])) {
-      out.status = DS41RT_V41_SAMPLER_STATUS_NONFINITE_LOGIT;
+      out.status = CUTEAFD_V41_SAMPLER_STATUS_NONFINITE_LOGIT;
       return out;
     }
     ++allowed_count;
     max_scaled = std::fmax(max_scaled, logits[token] * inv);
   }
   if (allowed_count == 0u) {
-    out.status = DS41RT_V41_SAMPLER_STATUS_EMPTY_CANDIDATES;
+    out.status = CUTEAFD_V41_SAMPLER_STATUS_EMPTY_CANDIDATES;
     return out;
   }
   if (!std::isfinite(max_scaled)) {
-    out.status = DS41RT_V41_SAMPLER_STATUS_INVALID_TEMPERATURE;
+    out.status = CUTEAFD_V41_SAMPLER_STATUS_INVALID_TEMPERATURE;
     return out;
   }
   const float min_scaled = min_p > 0.0f ? max_scaled + ln_min_p
@@ -3455,11 +3455,11 @@ RefOrderedRow host_ordered_reference(const float* logits, size_t vocab,
 
 /* A row block with an explicit `top_p` (the shared `row` helper fixes it at
  * 1.0, and K5's whole point is the ordered `top_p`). */
-ds41rt_v41_sampler_row_t k5_row(uint32_t output_row, float temperature, float top_p,
+cuteafd_v41_sampler_row_t k5_row(uint32_t output_row, float temperature, float top_p,
                                 uint32_t top_k, float min_p, float ln_min_p,
                                 uint32_t mask_row, uint32_t flags, uint64_t seed,
                                 uint64_t position) {
-  ds41rt_v41_sampler_row_t value = {};
+  cuteafd_v41_sampler_row_t value = {};
   value.seed = seed;
   value.position = position;
   value.temperature = temperature;
@@ -3584,7 +3584,7 @@ constexpr size_t kK5WideNucleusDeltaBound = 64u;
  * rows pass `false` for the exact-count assertion only; their token, rank and
  * CDF checks are the same as every other row. */
 void run_k5_case(const std::vector<float>& logits, size_t rows, size_t vocab,
-                 const std::vector<ds41rt_v41_sampler_row_t>& params,
+                 const std::vector<cuteafd_v41_sampler_row_t>& params,
                  const std::vector<uint32_t>& mask, bool with_mask,
                  bool strict_mask_bits, size_t capacity, const char* label,
                  K5Stats* stats, bool strict_nucleus = true,
@@ -3597,13 +3597,13 @@ void run_k5_case(const std::vector<float>& logits, size_t rows, size_t vocab,
   require_cuda(cudaMemcpy(run.k1.logits, logits.data(), logits.size() * sizeof(float),
                           cudaMemcpyHostToDevice), "k5 logits h2d");
   require_cuda(cudaMemcpy(run.k1.params, params.data(),
-                          params.size() * sizeof(ds41rt_v41_sampler_row_t),
+                          params.size() * sizeof(cuteafd_v41_sampler_row_t),
                           cudaMemcpyHostToDevice), "k5 params h2d");
   std::vector<uint32_t> device_mask = mask;
   if (with_mask) {
     if (strict_mask_bits) {
       for (size_t r = 0; r < rows; ++r) {
-        ds41rt_v41_sampler_clear_remainder(device_mask.data() + r * run.k1.words, vocab);
+        cuteafd_v41_sampler_clear_remainder(device_mask.data() + r * run.k1.words, vocab);
       }
     }
     require_cuda(cudaMemcpy(run.k1.mask, device_mask.data(),
@@ -3611,11 +3611,11 @@ void run_k5_case(const std::vector<float>& logits, size_t rows, size_t vocab,
                             cudaMemcpyHostToDevice), "k5 mask h2d");
   }
   /* K1 then K2 (K2 is a no-op for every ordered row here). */
-  expect(ds41rt_cuda_v41_target_sample(
+  expect(cuteafd_cuda_v41_target_sample(
              run.k1.logits, rows, vocab, vocab, run.k1.params,
              with_mask ? run.k1.mask : nullptr, with_mask ? run.k1.words : 0u,
              run.k1.ids, run.k1.status, run.k1.detail, run.k1.scores, nullptr, nullptr,
-             run.k1.scratch) == DS41RT_STATUS_OK,
+             run.k1.scratch) == CUTEAFD_STATUS_OK,
          tag + ": K1 launch");
   /* K3/K4 with a fully sentineled arena. */
   const uint32_t sentinel = 0xDEADBEEFu;
@@ -3637,12 +3637,12 @@ void run_k5_case(const std::vector<float>& logits, size_t rows, size_t vocab,
   require_cuda(cudaMemcpy(run.topk.passes, host_passes.data(), rows * sizeof(uint32_t),
                           cudaMemcpyHostToDevice),
                "k5 passes h2d");
-  expect(ds41rt_cuda_v41_topk_select(
+  expect(cuteafd_cuda_v41_topk_select(
              run.k1.logits, rows, vocab, vocab, run.k1.params,
              with_mask ? run.k1.mask : nullptr, with_mask ? run.k1.words : 0u,
              capacity > 0 ? run.topk.rank_ids : nullptr,
              capacity > 0 ? run.topk.rank_scratch : nullptr, capacity,
-             run.topk.retained, run.topk.passes, run.k1.scratch) == DS41RT_STATUS_OK,
+             run.topk.retained, run.topk.passes, run.k1.scratch) == CUTEAFD_STATUS_OK,
          tag + ": topk launch");
   /* K5 with sentineled outputs. */
   std::vector<uint32_t> host_out_ids(rows, sentinel);
@@ -3654,12 +3654,12 @@ void run_k5_case(const std::vector<float>& logits, size_t rows, size_t vocab,
                           cudaMemcpyHostToDevice), "k5 out total h2d");
   require_cuda(cudaMemcpy(run.nucleus, host_out_nucleus.data(), rows * sizeof(uint32_t),
                           cudaMemcpyHostToDevice), "k5 out nucleus h2d");
-  expect(ds41rt_cuda_v41_nucleus(
+  expect(cuteafd_cuda_v41_nucleus(
              run.k1.logits, rows, vocab, vocab, run.k1.params,
              with_mask ? run.k1.mask : nullptr, with_mask ? run.k1.words : 0u,
              capacity > 0 ? run.topk.rank_ids : nullptr, capacity, run.topk.retained,
              run.ids, run.k1.status, run.total, run.nucleus,
-             run.k1.scratch) == DS41RT_STATUS_OK,
+             run.k1.scratch) == CUTEAFD_STATUS_OK,
          tag + ": nucleus launch");
   require_cuda(cudaDeviceSynchronize(), "k5 kernel");
 
@@ -3684,10 +3684,10 @@ void run_k5_case(const std::vector<float>& logits, size_t rows, size_t vocab,
   }
 
   for (size_t r = 0; r < rows; ++r) {
-    const ds41rt_v41_sampler_row_t& p = params[r];
+    const cuteafd_v41_sampler_row_t& p = params[r];
     const std::string row_tag = tag + " row " + std::to_string(r);
-    const bool unconstrained = (p.flags & DS41RT_V41_SAMPLER_FLAG_NO_MASK) != 0u ||
-                               p.mask_row == DS41RT_V41_SAMPLER_NO_MASK_ROW;
+    const bool unconstrained = (p.flags & CUTEAFD_V41_SAMPLER_FLAG_NO_MASK) != 0u ||
+                               p.mask_row == CUTEAFD_V41_SAMPLER_NO_MASK_ROW;
     const uint32_t* row_mask = (with_mask && !unconstrained)
         ? device_mask.data() + static_cast<size_t>(p.mask_row) * run.k1.words
         : nullptr;
@@ -3938,7 +3938,7 @@ void test_k5_strict_prefix_at_top_p_one() {
     logits[0] = 0.0f;
     const RefOrderedRow witness = host_ordered_reference(
         logits.data(), vocab, nullptr, 0u, 1.0f, 1.0f, 8u, 0.0f, -inf(),
-        DS41RT_V41_SAMPLER_FLAG_NO_MASK, 1ull, 0ull);
+        CUTEAFD_V41_SAMPLER_FLAG_NO_MASK, 1ull, 0ull);
     expect(witness.ok, "strict-prefix witness (a): the ordered path runs");
     expect(witness.domain_count == 8u, "strict-prefix witness (a): eight ordered survivors");
     expect(witness.nucleus_count < witness.domain_count,
@@ -3946,23 +3946,23 @@ void test_k5_strict_prefix_at_top_p_one() {
     expect(witness.nucleus_count == 1u,
            "strict-prefix witness (a): the underflowed prefix breaks at rank 0");
     K5Stats stats;
-    std::vector<ds41rt_v41_sampler_row_t> params = {
-        k5_row(0, 1.0f, 1.0f, 8u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE, 1ull,
+    std::vector<cuteafd_v41_sampler_row_t> params = {
+        k5_row(0, 1.0f, 1.0f, 8u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE, 1ull,
                0ull),
     };
     run_k5_case(logits, 1, vocab, params, {}, false, false, 0u,
                 "K5 strict prefix top_p=1.0 survivor domain", &stats);
-    std::vector<ds41rt_v41_sampler_row_t> ranked = {
-        k5_row(0, 1.0f, 1.0f, 2u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE, 3ull,
+    std::vector<cuteafd_v41_sampler_row_t> ranked = {
+        k5_row(0, 1.0f, 1.0f, 2u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE, 3ull,
                1ull),
     };
     run_k5_case(logits, 1, vocab, ranked, {}, false, false, 2u,
                 "K5 strict prefix top_p=1.0 retained list", &stats);
-    std::vector<ds41rt_v41_sampler_row_t> tk = {
-        k5_row(0, 0.7f, 1.0f, 40u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE, 7ull,
+    std::vector<cuteafd_v41_sampler_row_t> tk = {
+        k5_row(0, 0.7f, 1.0f, 40u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE, 7ull,
                5ull),
     };
     run_k5_case(logits, 1, vocab, tk, {}, false, false, 40u,
@@ -3981,14 +3981,14 @@ void test_k5_strict_prefix_at_top_p_one() {
      * fires and records which. */
     const RefOrderedRow host = host_ordered_reference(
         logits.data(), vocab, nullptr, 0u, 1.0f, 1.0f, 8u, 0.0f, -inf(),
-        DS41RT_V41_SAMPLER_FLAG_NO_MASK, 1ull, 0ull);
+        CUTEAFD_V41_SAMPLER_FLAG_NO_MASK, 1ull, 0ull);
     expect(host.ok, "rounded top_p=1.0 witness: the ordered path runs");
     expect(host.nucleus_count < host.domain_count ||
                (host.nucleus_count == host.domain_count && host.nucleus_full_set),
            "rounded top_p=1.0 witness: the host prefix is one of the two shapes");
-    std::vector<ds41rt_v41_sampler_row_t> params = {
-        k5_row(0, 1.0f, 1.0f, 8u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE, 1ull,
+    std::vector<cuteafd_v41_sampler_row_t> params = {
+        k5_row(0, 1.0f, 1.0f, 8u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE, 1ull,
                0ull),
     };
     run_k5_case(logits, 1, vocab, params, {}, false, false, 0u,
@@ -4017,10 +4017,10 @@ void test_k5_top_p_grid_and_boundaries() {
     for (float top_p : top_ps) {
       for (uint32_t top_k : top_ks) {
         for (uint64_t seed : seeds) {
-          std::vector<ds41rt_v41_sampler_row_t> params = {
+          std::vector<cuteafd_v41_sampler_row_t> params = {
               k5_row(0, 0.7f, top_p, top_k, 0.0f, -inf(),
-                     DS41RT_V41_SAMPLER_NO_MASK_ROW,
-                     DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE,
+                     CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+                     CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE,
                      seed, 11ull),
           };
           const std::string label = "k5 grid " + std::string(shape_names[s]) + " p" +
@@ -4097,22 +4097,22 @@ void test_k5_boundary_uniforms() {
   expect(host_target_uniform(top.first, top.second) > 0.99f,
          "the largest drawable uniform found is near one");
   /* The `MAX_UNIFORM` *clamp* itself is pinned by `test_k2_max_uniform_clamp`
-   * (the same `ds41rt_v41_target_clamp_uniform` the device draw uses), so K5
+   * (the same `cuteafd_v41_target_clamp_uniform` the device draw uses), so K5
    * only needs the reachable ends of the stream. */
   K5Stats stats;
-  std::vector<ds41rt_v41_sampler_row_t> params;
+  std::vector<cuteafd_v41_sampler_row_t> params;
   if (bottom.first != 0u) {
     params.push_back(k5_row(0, 1.0f, 0.9f, 0u, 0.0f, -inf(),
-                            DS41RT_V41_SAMPLER_NO_MASK_ROW,
-                            DS41RT_V41_SAMPLER_FLAG_NO_MASK |
-                                DS41RT_V41_SAMPLER_FLAG_DIAGNOSE,
+                            CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+                            CUTEAFD_V41_SAMPLER_FLAG_NO_MASK |
+                                CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE,
                             bottom.first, bottom.second));
   }
   if (top.first != 0u) {
     params.push_back(k5_row(static_cast<uint32_t>(params.size()), 1.0f, 0.5f, 0u, 0.0f,
-                            -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-                            DS41RT_V41_SAMPLER_FLAG_NO_MASK |
-                                DS41RT_V41_SAMPLER_FLAG_DIAGNOSE,
+                            -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+                            CUTEAFD_V41_SAMPLER_FLAG_NO_MASK |
+                                CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE,
                             top.first, top.second));
   }
   /* A two-level row: scaled 0.0 and ln(2) give p = 1/3 and 2/3, so a uniform of
@@ -4128,14 +4128,14 @@ void test_k5_boundary_uniforms() {
     two[0] = static_cast<float>(std::log(2.0));
     two[3] = 0.0f;
     const std::vector<float> repeated = repeat_row(two, 1);
-    std::vector<ds41rt_v41_sampler_row_t> exact = {
-        k5_row(0, 1.0f, 1.0f, 2u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE, 5ull,
+    std::vector<cuteafd_v41_sampler_row_t> exact = {
+        k5_row(0, 1.0f, 1.0f, 2u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE, 5ull,
                0ull),
     };
     const RefOrderedRow expected = host_ordered_reference(
         two.data(), small, nullptr, 0u, 1.0f, 1.0f, 2u, 0.0f, -inf(),
-        DS41RT_V41_SAMPLER_FLAG_NO_MASK, 5ull, 0ull);
+        CUTEAFD_V41_SAMPLER_FLAG_NO_MASK, 5ull, 0ull);
     expect(expected.ok && !expected.k2_fast_path,
            "exact cumulative boundary: the host reference takes the ordered path");
     K5Stats exact_stats;
@@ -4188,13 +4188,13 @@ void test_k5_probe_association_invariance() {
   logits[2] = sub_ulp;
   const float top_ps[] = {0.9999f, 0.99999f, 0.999999f, 1.0f};
   const uint64_t seeds[] = {310147ull, 7ull}; /* u = 0 and a non-zero draw */
-  std::vector<ds41rt_v41_sampler_row_t> params;
+  std::vector<cuteafd_v41_sampler_row_t> params;
   for (uint64_t seed : seeds) {
     for (float top_p : top_ps) {
       params.push_back(k5_row(static_cast<uint32_t>(params.size()), 1.0f, top_p, 3u,
-                              0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-                              DS41RT_V41_SAMPLER_FLAG_NO_MASK |
-                                  DS41RT_V41_SAMPLER_FLAG_DIAGNOSE,
+                              0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+                              CUTEAFD_V41_SAMPLER_FLAG_NO_MASK |
+                                  CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE,
                               seed, 0ull));
     }
   }
@@ -4252,9 +4252,9 @@ void test_k5_zero_uniform_draw() {
     logits[5] = 0.0f;
     std::vector<uint32_t> mask(words, 0xFFFFFFFFu);
     mask[0] &= ~1u; /* clear token 0 */
-    std::vector<ds41rt_v41_sampler_row_t> params = {
+    std::vector<cuteafd_v41_sampler_row_t> params = {
         k5_row(0, 1.0f, 0.9f, 0u, 0.0f, -inf(), 0u,
-               DS41RT_V41_SAMPLER_FLAG_DIAGNOSE, zero_seed, 0ull),
+               CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE, zero_seed, 0ull),
     };
     const RefOrderedRow ref = host_ordered_reference(
         logits.data(), vocab, mask.data(), words, 1.0f, 0.9f, 0u, 0.0f, -inf(), 0u,
@@ -4269,14 +4269,14 @@ void test_k5_zero_uniform_draw() {
     const size_t vocab = 64;
     std::vector<float> logits(vocab, -30.0f);
     logits[5] = 0.0f;
-    std::vector<ds41rt_v41_sampler_row_t> params = {
-        k5_row(0, 1.0f, 0.9f, 0u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE,
+    std::vector<cuteafd_v41_sampler_row_t> params = {
+        k5_row(0, 1.0f, 0.9f, 0u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE,
                zero_seed, 0ull),
     };
     const RefOrderedRow ref = host_ordered_reference(
         logits.data(), vocab, nullptr, 0u, 1.0f, 0.9f, 0u, 0.0f, -inf(),
-        DS41RT_V41_SAMPLER_FLAG_NO_MASK, zero_seed, 0ull);
+        CUTEAFD_V41_SAMPLER_FLAG_NO_MASK, zero_seed, 0ull);
     expect(ref.token == 5u, "u=0 survivor draw's production answer is the best token (id 5)");
     run_k5_case(logits, 1, vocab, params, {}, false, false, 0u,
                 "K5 u=0 survivor draw, best id != 0", &stats);
@@ -4286,14 +4286,14 @@ void test_k5_zero_uniform_draw() {
     const size_t vocab = 300;
     std::vector<float> logits = shape_descending(vocab);
     logits[5] = 100.0f;
-    std::vector<ds41rt_v41_sampler_row_t> params = {
-        k5_row(0, 0.7f, 0.9f, 40u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE,
+    std::vector<cuteafd_v41_sampler_row_t> params = {
+        k5_row(0, 0.7f, 0.9f, 40u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE,
                zero_seed, 0ull),
     };
     const RefOrderedRow ref = host_ordered_reference(
         logits.data(), vocab, nullptr, 0u, 0.7f, 0.9f, 40u, 0.0f, -inf(),
-        DS41RT_V41_SAMPLER_FLAG_NO_MASK, zero_seed, 0ull);
+        CUTEAFD_V41_SAMPLER_FLAG_NO_MASK, zero_seed, 0ull);
     expect(ref.token == 5u, "u=0 retained draw's production answer is rank 0 (id 5)");
     run_k5_case(logits, 1, vocab, params, {}, false, false, 40u,
                 "K5 u=0 retained draw", &stats);
@@ -4325,13 +4325,13 @@ void test_k5_repeated_run_determinism() {
   K5Run run = make_k5_run(1, vocab, 0, false);
   require_cuda(cudaMemcpy(run.k1.logits, logits.data(), logits.size() * sizeof(float),
                           cudaMemcpyHostToDevice), "determinism logits h2d");
-  const std::vector<ds41rt_v41_sampler_row_t> params = {
-      k5_row(0, 1.0f, 0.9f, 0u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-             DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE, 17ull,
+  const std::vector<cuteafd_v41_sampler_row_t> params = {
+      k5_row(0, 1.0f, 0.9f, 0u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+             CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE, 17ull,
              3ull),
   };
   require_cuda(cudaMemcpy(run.k1.params, params.data(),
-                          params.size() * sizeof(ds41rt_v41_sampler_row_t),
+                          params.size() * sizeof(cuteafd_v41_sampler_row_t),
                           cudaMemcpyHostToDevice), "determinism params h2d");
   std::vector<uint32_t> host_retained(1u, 0u);
   std::vector<uint32_t> host_passes(1u, 0u);
@@ -4339,15 +4339,15 @@ void test_k5_repeated_run_determinism() {
                           cudaMemcpyHostToDevice), "determinism retained h2d");
   require_cuda(cudaMemcpy(run.topk.passes, host_passes.data(), sizeof(uint32_t),
                           cudaMemcpyHostToDevice), "determinism passes h2d");
-  expect(ds41rt_cuda_v41_target_sample(
+  expect(cuteafd_cuda_v41_target_sample(
              run.k1.logits, 1, vocab, vocab, run.k1.params, nullptr, 0u, run.k1.ids,
              run.k1.status, run.k1.detail, run.k1.scores, nullptr, nullptr,
-             run.k1.scratch) == DS41RT_STATUS_OK,
+             run.k1.scratch) == CUTEAFD_STATUS_OK,
          "determinism: K1 launch");
-  expect(ds41rt_cuda_v41_topk_select(
+  expect(cuteafd_cuda_v41_topk_select(
              run.k1.logits, 1, vocab, vocab, run.k1.params, nullptr, 0u, nullptr,
              nullptr, 0u, run.topk.retained, run.topk.passes,
-             run.k1.scratch) == DS41RT_STATUS_OK,
+             run.k1.scratch) == CUTEAFD_STATUS_OK,
          "determinism: topk launch");
   uint32_t first_token = 0xFFFFFFFFu;
   uint32_t first_status = 0xFFFFFFFFu;
@@ -4364,10 +4364,10 @@ void test_k5_repeated_run_determinism() {
                             cudaMemcpyHostToDevice), "determinism total h2d");
     require_cuda(cudaMemcpy(run.nucleus, host_nucleus.data(), sizeof(uint32_t),
                             cudaMemcpyHostToDevice), "determinism nucleus h2d");
-    expect(ds41rt_cuda_v41_nucleus(
+    expect(cuteafd_cuda_v41_nucleus(
                run.k1.logits, 1, vocab, vocab, run.k1.params, nullptr, 0u, nullptr, 0u,
                run.topk.retained, run.ids, run.k1.status, run.total, run.nucleus,
-               run.k1.scratch) == DS41RT_STATUS_OK,
+               run.k1.scratch) == CUTEAFD_STATUS_OK,
            "determinism: nucleus launch");
     require_cuda(cudaDeviceSynchronize(), "determinism K5 kernel");
     uint32_t token = 0u;
@@ -4382,7 +4382,7 @@ void test_k5_repeated_run_determinism() {
                  "determinism total d2h");
     require_cuda(cudaMemcpy(&nucleus, run.nucleus, sizeof(uint32_t),
                             cudaMemcpyDeviceToHost), "determinism nucleus d2h");
-    expect(status == DS41RT_V41_SAMPLER_STATUS_OK, "determinism: K5 row stayed OK");
+    expect(status == CUTEAFD_V41_SAMPLER_STATUS_OK, "determinism: K5 row stayed OK");
     if (rep == 0) {
       first_token = token;
       first_status = status;
@@ -4448,31 +4448,31 @@ void test_k5_loud_status_failures() {
     K5Run run = make_k5_run(1, vocab, c.capacity, false);
     require_cuda(cudaMemcpy(run.k1.logits, logits.data(), logits.size() * sizeof(float),
                             cudaMemcpyHostToDevice), "loud logits h2d");
-    const std::vector<ds41rt_v41_sampler_row_t> params = {
+    const std::vector<cuteafd_v41_sampler_row_t> params = {
         k5_row(0, 0.7f, c.top_p, c.top_k, c.min_p, c.ln_min_p,
-               DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE, 5ull,
+               CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE, 5ull,
                1ull),
     };
     require_cuda(cudaMemcpy(run.k1.params, params.data(),
-                            params.size() * sizeof(ds41rt_v41_sampler_row_t),
+                            params.size() * sizeof(cuteafd_v41_sampler_row_t),
                             cudaMemcpyHostToDevice), "loud params h2d");
     /* K1+K2-only entry point. For (c)/(d) K1 itself must already be loud: this
      * is the P1-4 invariant, observable with no K3/K4/K5 launch at all. */
-    expect(ds41rt_cuda_v41_target_sample(
+    expect(cuteafd_cuda_v41_target_sample(
                run.k1.logits, 1, vocab, vocab, run.k1.params, nullptr, 0u, run.k1.ids,
                run.k1.status, run.k1.detail, run.k1.scores, nullptr, nullptr,
-               run.k1.scratch) == DS41RT_STATUS_OK,
+               run.k1.scratch) == CUTEAFD_STATUS_OK,
            tag + ": K1 launch");
     uint32_t k1_status = sentinel;
-    ds41rt_v41_sampler_scratch_t k1_scratch = {};
+    cuteafd_v41_sampler_scratch_t k1_scratch = {};
     require_cuda(cudaMemcpy(&k1_status, run.k1.status, sizeof(uint32_t),
                             cudaMemcpyDeviceToHost), tag + ": K1 status d2h");
     require_cuda(cudaMemcpy(&k1_scratch, run.k1.scratch, sizeof(k1_scratch),
                             cudaMemcpyDeviceToHost), tag + ": K1 scratch d2h");
-    expect((k1_status == DS41RT_V41_SAMPLER_STATUS_INTERNAL) == c.k1_loud,
+    expect((k1_status == CUTEAFD_V41_SAMPLER_STATUS_INTERNAL) == c.k1_loud,
            tag + ": K1+K2-only entry point reports the loud status for this shape");
-    expect((k1_scratch.status == DS41RT_V41_SAMPLER_STATUS_INTERNAL) == c.k1_loud,
+    expect((k1_scratch.status == CUTEAFD_V41_SAMPLER_STATUS_INTERNAL) == c.k1_loud,
            tag + ": K1 scratch agrees with the K1+K2-only entry point");
     if (c.capacity > 0u) {
       std::vector<uint32_t> host_ids(c.capacity, sentinel);
@@ -4490,11 +4490,11 @@ void test_k5_loud_status_failures() {
                             cudaMemcpyHostToDevice), tag + ": retained h2d");
     require_cuda(cudaMemcpy(run.topk.passes, host_passes.data(), sizeof(uint32_t),
                             cudaMemcpyHostToDevice), tag + ": passes h2d");
-    expect(ds41rt_cuda_v41_topk_select(
+    expect(cuteafd_cuda_v41_topk_select(
                run.k1.logits, 1, vocab, vocab, run.k1.params, nullptr, 0u,
                c.capacity > 0u ? run.topk.rank_ids : nullptr,
                c.capacity > 0u ? run.topk.rank_scratch : nullptr, c.capacity,
-               run.topk.retained, run.topk.passes, run.k1.scratch) == DS41RT_STATUS_OK,
+               run.topk.retained, run.topk.passes, run.k1.scratch) == CUTEAFD_STATUS_OK,
            tag + ": topk launch");
     std::vector<uint32_t> host_ids(1u, sentinel);
     require_cuda(cudaMemcpy(run.ids, host_ids.data(), sizeof(uint32_t),
@@ -4505,25 +4505,25 @@ void test_k5_loud_status_failures() {
       require_cuda(cudaMemcpy(run.k1.status, host_ids.data(), sizeof(uint32_t),
                               cudaMemcpyHostToDevice), tag + ": status sentinel h2d");
     }
-    expect(ds41rt_cuda_v41_nucleus(
+    expect(cuteafd_cuda_v41_nucleus(
                run.k1.logits, 1, vocab, vocab, run.k1.params, nullptr, 0u,
                c.capacity > 0u ? run.topk.rank_ids : nullptr, c.capacity,
                run.topk.retained, run.ids, run.k1.status, run.total, run.nucleus,
-               run.k1.scratch) == DS41RT_STATUS_OK,
+               run.k1.scratch) == CUTEAFD_STATUS_OK,
            tag + ": nucleus launch still returns OK (per-row status)");
     require_cuda(cudaDeviceSynchronize(), "loud K5 kernel");
     uint32_t token = 0u;
     uint32_t status = 0u;
-    ds41rt_v41_sampler_scratch_t scratch = {};
+    cuteafd_v41_sampler_scratch_t scratch = {};
     require_cuda(cudaMemcpy(&token, run.ids, sizeof(uint32_t), cudaMemcpyDeviceToHost),
                  tag + ": ids d2h");
     require_cuda(cudaMemcpy(&status, run.k1.status, sizeof(uint32_t),
                             cudaMemcpyDeviceToHost), tag + ": status d2h");
     require_cuda(cudaMemcpy(&scratch, run.k1.scratch, sizeof(scratch),
                             cudaMemcpyDeviceToHost), tag + ": scratch d2h");
-    expect(status == DS41RT_V41_SAMPLER_STATUS_INTERNAL,
+    expect(status == CUTEAFD_V41_SAMPLER_STATUS_INTERNAL,
            tag + ": the caller-visible out_status is INTERNAL at the end of the chain");
-    expect(scratch.status == DS41RT_V41_SAMPLER_STATUS_INTERNAL,
+    expect(scratch.status == CUTEAFD_V41_SAMPLER_STATUS_INTERNAL,
            tag + ": scratch.status is INTERNAL at the end of the chain");
     expect(token == sentinel, tag + ": out_indices left unwritten");
     free_k5_run(&run);
@@ -4532,7 +4532,7 @@ void test_k5_loud_status_failures() {
             << (sizeof(cases) / sizeof(cases[0])) << " rows)\n";
 }
 
-/* P1-4, isolated: the K1+K2-only entry point (`ds41rt_cuda_v41_target_sample`)
+/* P1-4, isolated: the K1+K2-only entry point (`cuteafd_cuda_v41_target_sample`)
  * must never return OK while leaving `out_indices` unwritten. Both FFI-invalid
  * raw-C shapes -- a non-finite `top_p` and a non-greedy zero-survivor row -- are
  * checked with NO K3/K4/K5 launch in between, so the loud status can only have
@@ -4557,37 +4557,37 @@ void test_k1_only_entry_loud_status() {
     K5Run run = make_k5_run(1, vocab, 0u, false);
     require_cuda(cudaMemcpy(run.k1.logits, logits.data(), logits.size() * sizeof(float),
                             cudaMemcpyHostToDevice), tag + ": logits h2d");
-    const std::vector<ds41rt_v41_sampler_row_t> params = {
+    const std::vector<cuteafd_v41_sampler_row_t> params = {
         k5_row(0, 0.7f, s.top_p, 0u, s.min_p, s.ln_min_p,
-               DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE, 5ull,
+               CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE, 5ull,
                1ull),
     };
     require_cuda(cudaMemcpy(run.k1.params, params.data(),
-                            params.size() * sizeof(ds41rt_v41_sampler_row_t),
+                            params.size() * sizeof(cuteafd_v41_sampler_row_t),
                             cudaMemcpyHostToDevice), tag + ": params h2d");
     std::vector<uint32_t> host_ids(1u, sentinel);
     require_cuda(cudaMemcpy(run.k1.ids, host_ids.data(), sizeof(uint32_t),
                             cudaMemcpyHostToDevice), tag + ": ids h2d");
     require_cuda(cudaMemcpy(run.k1.status, host_ids.data(), sizeof(uint32_t),
                             cudaMemcpyHostToDevice), tag + ": status h2d");
-    expect(ds41rt_cuda_v41_target_sample(
+    expect(cuteafd_cuda_v41_target_sample(
                run.k1.logits, 1, vocab, vocab, run.k1.params, nullptr, 0u, run.k1.ids,
                run.k1.status, run.k1.detail, run.k1.scores, nullptr, nullptr,
-               run.k1.scratch) == DS41RT_STATUS_OK,
+               run.k1.scratch) == CUTEAFD_STATUS_OK,
            tag + ": entry returns OK (per-row status)");
     uint32_t token = 0u;
     uint32_t status = 0u;
-    ds41rt_v41_sampler_scratch_t scratch = {};
+    cuteafd_v41_sampler_scratch_t scratch = {};
     require_cuda(cudaMemcpy(&token, run.k1.ids, sizeof(uint32_t), cudaMemcpyDeviceToHost),
                  tag + ": ids d2h");
     require_cuda(cudaMemcpy(&status, run.k1.status, sizeof(uint32_t),
                             cudaMemcpyDeviceToHost), tag + ": status d2h");
     require_cuda(cudaMemcpy(&scratch, run.k1.scratch, sizeof(scratch),
                             cudaMemcpyDeviceToHost), tag + ": scratch d2h");
-    expect(status == DS41RT_V41_SAMPLER_STATUS_INTERNAL,
+    expect(status == CUTEAFD_V41_SAMPLER_STATUS_INTERNAL,
            tag + ": K1 wrote INTERNAL to the caller-visible out_status");
-    expect(scratch.status == DS41RT_V41_SAMPLER_STATUS_INTERNAL,
+    expect(scratch.status == CUTEAFD_V41_SAMPLER_STATUS_INTERNAL,
            tag + ": K1 wrote INTERNAL to scratch.status");
     expect(token == sentinel, tag + ": no token is observable with an OK return");
     free_k5_run(&run);
@@ -4616,18 +4616,18 @@ void test_k5_scattered_row_identity_guard() {
   K5Run run = make_k5_run(rows, vocab, capacity, false);
   require_cuda(cudaMemcpy(run.k1.logits, logits.data(), logits.size() * sizeof(float),
                           cudaMemcpyHostToDevice), "scatter logits h2d");
-  const std::vector<ds41rt_v41_sampler_row_t> params = {
+  const std::vector<cuteafd_v41_sampler_row_t> params = {
       /* block 0: output_row 1, top_k 2, top_p 0.9 */
-      k5_row(1u, 1.0f, 0.9f, 2u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-             DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE, 0ull,
+      k5_row(1u, 1.0f, 0.9f, 2u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+             CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE, 0ull,
              5ull),
       /* block 1: output_row 0, top_k 0, top_p 0.9 */
-      k5_row(0u, 1.0f, 0.9f, 0u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-             DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE, 0ull,
+      k5_row(0u, 1.0f, 0.9f, 0u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+             CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE, 0ull,
              5ull),
   };
   require_cuda(cudaMemcpy(run.k1.params, params.data(),
-                          params.size() * sizeof(ds41rt_v41_sampler_row_t),
+                          params.size() * sizeof(cuteafd_v41_sampler_row_t),
                           cudaMemcpyHostToDevice), "scatter params h2d");
   std::vector<uint32_t> host_ids(rows * capacity, sentinel);
   std::vector<uint64_t> host_scratch(rows * capacity, 0ull);
@@ -4644,25 +4644,25 @@ void test_k5_scattered_row_identity_guard() {
                "scatter retained h2d");
   require_cuda(cudaMemcpy(run.topk.passes, host_passes.data(), rows * sizeof(uint32_t),
                           cudaMemcpyHostToDevice), "scatter passes h2d");
-  expect(ds41rt_cuda_v41_target_sample(
+  expect(cuteafd_cuda_v41_target_sample(
              run.k1.logits, rows, vocab, vocab, run.k1.params, nullptr, 0u, run.k1.ids,
              run.k1.status, run.k1.detail, run.k1.scores, nullptr, nullptr,
-             run.k1.scratch) == DS41RT_STATUS_OK,
+             run.k1.scratch) == CUTEAFD_STATUS_OK,
          "scatter witness: K1 launch");
-  expect(ds41rt_cuda_v41_topk_select(
+  expect(cuteafd_cuda_v41_topk_select(
              run.k1.logits, rows, vocab, vocab, run.k1.params, nullptr, 0u,
              run.topk.rank_ids, run.topk.rank_scratch, capacity, run.topk.retained,
-             run.topk.passes, run.k1.scratch) == DS41RT_STATUS_OK,
+             run.topk.passes, run.k1.scratch) == CUTEAFD_STATUS_OK,
          "scatter witness: topk launch");
   std::vector<uint32_t> host_out_ids(rows, sentinel);
   require_cuda(cudaMemcpy(run.ids, host_out_ids.data(), rows * sizeof(uint32_t),
                           cudaMemcpyHostToDevice), "scatter out ids h2d");
   require_cuda(cudaMemcpy(run.k1.status, host_out_ids.data(), rows * sizeof(uint32_t),
                           cudaMemcpyHostToDevice), "scatter out status h2d");
-  expect(ds41rt_cuda_v41_nucleus(
+  expect(cuteafd_cuda_v41_nucleus(
              run.k1.logits, rows, vocab, vocab, run.k1.params, nullptr, 0u,
              run.topk.rank_ids, capacity, run.topk.retained, run.ids, run.k1.status,
-             run.total, run.nucleus, run.k1.scratch) == DS41RT_STATUS_OK,
+             run.total, run.nucleus, run.k1.scratch) == CUTEAFD_STATUS_OK,
          "scatter witness: nucleus launch");
   require_cuda(cudaDeviceSynchronize(), "scatter witness kernel");
   std::vector<uint32_t> ids(rows, sentinel);
@@ -4678,9 +4678,9 @@ void test_k5_scattered_row_identity_guard() {
    * 1's 0 -- the mispairing that made the old guard bypassable. */
   expect(retained[1] == 2u && retained[0] == 0u,
          "scatter witness: K4 counts are keyed by output_row (2 and 0)");
-  expect(status[1] == DS41RT_V41_SAMPLER_STATUS_INTERNAL,
+  expect(status[1] == CUTEAFD_V41_SAMPLER_STATUS_INTERNAL,
          "scatter witness: block 0 (output_row 1) reports INTERNAL");
-  expect(status[0] == DS41RT_V41_SAMPLER_STATUS_INTERNAL,
+  expect(status[0] == CUTEAFD_V41_SAMPLER_STATUS_INTERNAL,
          "scatter witness: block 1 (output_row 0) reports INTERNAL");
   expect(ids[1] == sentinel,
          "scatter witness: block 0 wrote no token (pre-fix wrote 3 with OK)");
@@ -4698,9 +4698,9 @@ void test_k5_single_survivor_and_inf() {
   {
     std::vector<float> logits = shape_descending(vocab);
     const float min_p = 0.5f;
-    std::vector<ds41rt_v41_sampler_row_t> params = {
-        k5_row(0, 1.0f, 0.9f, 0u, min_p, std::log(min_p), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE, 3ull,
+    std::vector<cuteafd_v41_sampler_row_t> params = {
+        k5_row(0, 1.0f, 0.9f, 0u, min_p, std::log(min_p), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE, 3ull,
                4ull),
     };
     run_k5_case(logits, 1, vocab, params, {}, false, false, 0u, "K5 single survivor",
@@ -4711,9 +4711,9 @@ void test_k5_single_survivor_and_inf() {
      * them); the nucleus must never be empty and the draw must stay in range. */
     std::vector<float> logits(vocab, neg_max);
     logits[7] = 0.0f;
-    std::vector<ds41rt_v41_sampler_row_t> params = {
-        k5_row(0, 1.0e-5f, 0.95f, 0u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE, 9ull,
+    std::vector<cuteafd_v41_sampler_row_t> params = {
+        k5_row(0, 1.0e-5f, 0.95f, 0u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE, 9ull,
                2ull),
     };
     run_k5_case(logits, 1, vocab, params, {}, false, false, 0u, "K5 -inf survivors",
@@ -4730,9 +4730,9 @@ void test_k5_combined_topk_top_p() {
   K5Stats stats;
   {
     std::vector<float> logits = shape_periodic_ties(vocab);
-    std::vector<ds41rt_v41_sampler_row_t> params = {
-        k5_row(0, 0.7f, 0.9f, 40u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE, 11ull,
+    std::vector<cuteafd_v41_sampler_row_t> params = {
+        k5_row(0, 0.7f, 0.9f, 40u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE, 11ull,
                3ull),
     };
     run_k5_case(logits, 1, vocab, params, {}, false, false, 40u, "K5 top_k40 + top_p0.9",
@@ -4747,9 +4747,9 @@ void test_k5_combined_topk_top_p() {
         mask[t / 32u] |= (1u << (t % 32u));
       }
     }
-    std::vector<ds41rt_v41_sampler_row_t> params = {
+    std::vector<cuteafd_v41_sampler_row_t> params = {
         k5_row(0, 1.0f, 0.5f, 17u, 0.0f, -inf(), 0u,
-               DS41RT_V41_SAMPLER_FLAG_DIAGNOSE, 13ull, 5ull),
+               CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE, 13ull, 5ull),
     };
     run_k5_case(logits, 1, vocab, params, mask, true, true, 17u,
                 "K5 sparse mask + top_k17 + top_p0.5", &stats);
@@ -4758,9 +4758,9 @@ void test_k5_combined_topk_top_p() {
     /* top_k >= survivor_count is a K3/K4 no-op: the survivor domain, with
      * top_p < 1 so K5 still runs. */
     std::vector<float> logits = shape_two_value(vocab);
-    std::vector<ds41rt_v41_sampler_row_t> params = {
-        k5_row(0, 1.0f, 0.95f, 500u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE, 17ull,
+    std::vector<cuteafd_v41_sampler_row_t> params = {
+        k5_row(0, 1.0f, 0.95f, 500u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE, 17ull,
                1ull),
     };
     run_k5_case(logits, 1, vocab, params, {}, false, false, 0u,
@@ -4774,9 +4774,9 @@ void test_k5_combined_topk_top_p() {
     for (size_t t = 0; t < wide; ++t) {
       logits[t] = -0.02f * static_cast<float>(t);
     }
-    std::vector<ds41rt_v41_sampler_row_t> params = {
-        k5_row(0, 0.7f, 1.0f, 40u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE, 19ull,
+    std::vector<cuteafd_v41_sampler_row_t> params = {
+        k5_row(0, 0.7f, 1.0f, 40u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE, 19ull,
                7ull),
     };
     run_k5_case(logits, 1, wide, params, {}, false, false, 40u,
@@ -4811,14 +4811,14 @@ void test_k5_unsatisfied_fallback() {
   {
     const size_t vocab = 13;
     const std::vector<float> row(vocab, 0.0f);
-    const std::vector<ds41rt_v41_sampler_row_t> params = {
-        k5_row(0, 1.0f, top_p, 12u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE, 23ull,
+    const std::vector<cuteafd_v41_sampler_row_t> params = {
+        k5_row(0, 1.0f, top_p, 12u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE, 23ull,
                0ull),
     };
     const RefOrderedRow expected = host_ordered_reference(
         row.data(), vocab, nullptr, 0u, 1.0f, top_p, 12u, 0.0f, -inf(),
-        DS41RT_V41_SAMPLER_FLAG_NO_MASK, 23ull, 0ull);
+        CUTEAFD_V41_SAMPLER_FLAG_NO_MASK, 23ull, 0ull);
     expect(expected.ok && expected.fallback_used && !expected.k2_fast_path,
            "retained fallback fixture reaches the CPU normalizing shortfall");
     std::vector<uint32_t> nucleus_trace;
@@ -4841,14 +4841,14 @@ void test_k5_unsatisfied_fallback() {
   {
     const size_t vocab = 71;
     const std::vector<float> row(vocab, 0.0f);
-    const std::vector<ds41rt_v41_sampler_row_t> params = {
-        k5_row(0, 1.0f, top_p, 71u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE, 29ull,
+    const std::vector<cuteafd_v41_sampler_row_t> params = {
+        k5_row(0, 1.0f, top_p, 71u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE, 29ull,
                0ull),
     };
     const RefOrderedRow expected = host_ordered_reference(
         row.data(), vocab, nullptr, 0u, 1.0f, top_p, 71u, 0.0f, -inf(),
-        DS41RT_V41_SAMPLER_FLAG_NO_MASK, 29ull, 0ull);
+        CUTEAFD_V41_SAMPLER_FLAG_NO_MASK, 29ull, 0ull);
     expect(expected.ok && !expected.k2_fast_path && expected.nucleus_count == 71u,
            "survivor fallback fixture: the CPU orders all 71 survivors");
     std::vector<uint32_t> nucleus_trace;
@@ -4872,14 +4872,14 @@ void test_k5_unsatisfied_fallback() {
     const size_t vocab = 32;
     std::vector<float> row(vocab, -30.0f);
     row[5] = 0.0f;
-    std::vector<ds41rt_v41_sampler_row_t> one = {
-        k5_row(0, 1.0f, 0.5f, 0u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE, 29ull,
+    std::vector<cuteafd_v41_sampler_row_t> one = {
+        k5_row(0, 1.0f, 0.5f, 0u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE, 29ull,
                3ull),
     };
     const RefOrderedRow expected = host_ordered_reference(
         row.data(), vocab, nullptr, 0u, 1.0f, 0.5f, 0u, 0.0f, -inf(),
-        DS41RT_V41_SAMPLER_FLAG_NO_MASK, 29ull, 3ull);
+        CUTEAFD_V41_SAMPLER_FLAG_NO_MASK, 29ull, 3ull);
     expect(expected.ok && expected.nucleus_count == 1u,
            "dominant-rank corner: the CPU nucleus is the single crossing rank");
     K5Stats corner;
@@ -4903,13 +4903,13 @@ void test_k5_seeded_replay() {
   const uint64_t seeds[] = {1ull, 0ull, 0xDEADBEEFull, 987654321ull};
   const uint64_t positions[] = {0ull, 1ull, 2048ull, (1ull << 63), ~0ull, 0x8000000000000001ull};
   K5Stats stats;
-  std::vector<ds41rt_v41_sampler_row_t> params;
+  std::vector<cuteafd_v41_sampler_row_t> params;
   for (uint64_t seed : seeds) {
     for (uint64_t position : positions) {
       params.push_back(k5_row(static_cast<uint32_t>(params.size()), 0.7f, 0.9f, 40u,
-                              0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-                              DS41RT_V41_SAMPLER_FLAG_NO_MASK |
-                                  DS41RT_V41_SAMPLER_FLAG_DIAGNOSE,
+                              0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+                              CUTEAFD_V41_SAMPLER_FLAG_NO_MASK |
+                                  CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE,
                               seed, position));
     }
   }
@@ -4939,9 +4939,9 @@ void test_k5_wide_served_profiles() {
   }
   K5Stats stats;
   {
-    std::vector<ds41rt_v41_sampler_row_t> params = {
-        k5_row(0, 0.7f, 0.9f, 0u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE, 31ull,
+    std::vector<cuteafd_v41_sampler_row_t> params = {
+        k5_row(0, 0.7f, 0.9f, 0u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE, 31ull,
                0ull),
     };
     run_k5_case(logits, 1, vocab, params, {}, false, false, 0u,
@@ -4949,9 +4949,9 @@ void test_k5_wide_served_profiles() {
                 /*strict_nucleus=*/false);
   }
   {
-    std::vector<ds41rt_v41_sampler_row_t> params = {
-        k5_row(0, 0.7f, 1.0f, 40u, 0.0f, -inf(), DS41RT_V41_SAMPLER_NO_MASK_ROW,
-               DS41RT_V41_SAMPLER_FLAG_NO_MASK | DS41RT_V41_SAMPLER_FLAG_DIAGNOSE, 37ull,
+    std::vector<cuteafd_v41_sampler_row_t> params = {
+        k5_row(0, 0.7f, 1.0f, 40u, 0.0f, -inf(), CUTEAFD_V41_SAMPLER_NO_MASK_ROW,
+               CUTEAFD_V41_SAMPLER_FLAG_NO_MASK | CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE, 37ull,
                2ull),
     };
     run_k5_case(logits, 1, vocab, params, {}, false, false, 40u,
@@ -5028,9 +5028,9 @@ int main() {
   test_k5_seeded_replay();
   test_k5_wide_served_profiles();
   std::cout << "K3 radix pass budget (measured): max " << g_max_pivot_passes
-            << " of 3 expected, " << DS41RT_V41_TOPK_MAX_PIVOT_STEPS
+            << " of 3 expected, " << CUTEAFD_V41_TOPK_MAX_PIVOT_STEPS
             << " defensive cap\n";
-  std::cout << "ds41rt_v41_sampling_selftest passed: " << g_cases << " cases, " << g_checks
+  std::cout << "cuteafd_v41_sampling_selftest passed: " << g_cases << " cases, " << g_checks
             << " assertions\n";
   return 0;
 }

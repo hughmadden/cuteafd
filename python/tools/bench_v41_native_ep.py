@@ -9,7 +9,7 @@ Example (DODO GB10, frozen lib):
 
     PYTHONPATH=python/tools:third_party/sparkinfer:python \\
     CUDA_VISIBLE_DEVICES=<uuid> python3 python/tools/bench_v41_native_ep.py \\
-      --native-lib <libds41rt_native.so> --spark-tp 2 --layer 20 --tp-rank 0 \\
+      --native-lib <libcuteafd_native.so> --spark-tp 2 --layer 20 --tp-rank 0 \\
       --expert-ids 0,1,2,3,4,5 --capacities 1,80 --active-counts 6,3,2 \\
       --no-repack-compare
 

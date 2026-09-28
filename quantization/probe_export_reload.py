@@ -32,7 +32,7 @@ def run(fixture):
                 state = _load_state(path, expected_sha256=record["sha256"], expected_provenance=provenance, kind="projection")
                 entries = packed_entries(path, provenance=provenance, bits=bits, projection=projection)
                 name = f"mtp.0.ffn.experts.0.{projection}"
-                with tempfile.TemporaryDirectory(prefix="ds41rt-export-reload-") as directory:
+                with tempfile.TemporaryDirectory(prefix="cuteafd-export-reload-") as directory:
                     root = Path(directory)
                     filename = "model-00001-of-00001.safetensors"
                     repack({name + "." + suffix: (entry["path"], entry["tensor"]) for suffix, entry in entries.items()}, root / filename)

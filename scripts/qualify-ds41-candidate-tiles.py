@@ -14,7 +14,7 @@ def main():
     p.add_argument('--device',type=int,required=True)
     p.add_argument('--output',type=Path,required=True)
     a=p.parse_args();torch.cuda.set_device(a.device)
-    lib=C.CDLL(str(a.native_lib));tile=lib.ds41rt_v41_candidate_tile
+    lib=C.CDLL(str(a.native_lib));tile=lib.cuteafd_v41_candidate_tile
     tile.argtypes=[C.c_void_p,C.c_void_p,C.c_int32,C.c_int32,C.c_uint64,C.c_void_p];tile.restype=C.c_int32
     stream=torch.cuda.Stream();results=[]
     with torch.cuda.stream(stream):

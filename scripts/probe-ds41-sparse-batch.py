@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare an isolated device-descriptor sparse probe with per-request split launches.
 
-The candidate exports ds41rt_probe_sparse_batch{,_initialize}; this unchecked
+The candidate exports cuteafd_probe_sparse_batch{,_initialize}; this unchecked
 experimental ABI is deliberately outside the serving library. Timing excludes
 metadata/descriptor upload and graph capture, and is not serving throughput.
 """
@@ -37,14 +37,14 @@ def main():
     torch.cuda.set_device(args.device)
     torch.manual_seed(7183)
     baseline, candidate = (C.CDLL(p) for p in (args.baseline, args.candidate))
-    assert baseline.ds41rt_v41_sparse_attention_initialize() == 0
-    assert (candidate.ds41rt_v41_sparse_attention_initialize() if args.serving_native else candidate.ds41rt_probe_sparse_batch_initialize()) == 0
-    old = baseline.ds41rt_v41_sparse_attention_bounded
+    assert baseline.cuteafd_v41_sparse_attention_initialize() == 0
+    assert (candidate.cuteafd_v41_sparse_attention_initialize() if args.serving_native else candidate.cuteafd_probe_sparse_batch_initialize()) == 0
+    old = baseline.cuteafd_v41_sparse_attention_bounded
     old.argtypes = [C.c_void_p]*5 + [C.c_int32, C.c_int32, C.POINTER(View), C.c_void_p,
         C.c_void_p, C.c_void_p, C.c_uint64, C.c_int32]
-    new = candidate.ds41rt_v41_sparse_attention_batch if args.serving_native else candidate.ds41rt_probe_sparse_batch
+    new = candidate.cuteafd_v41_sparse_attention_batch if args.serving_native else candidate.cuteafd_probe_sparse_batch
     new.argtypes = [C.c_void_p]*5 + [C.c_int32] + [C.c_void_p]*4 + [C.c_int32]*2
-    validator = candidate.ds41rt_v41_sparse_attention_batch_validate if args.serving_native else None
+    validator = candidate.cuteafd_v41_sparse_attention_batch_validate if args.serving_native else None
     if validator is not None:
         validator.argtypes = [C.c_void_p]*5 + [C.c_int32, C.POINTER(View)] + [C.c_void_p]*3 + [C.c_uint64, C.c_int32, C.c_int32]
     results, timings, rejections, capacity_checks = [], [], [], []

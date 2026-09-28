@@ -1,9 +1,9 @@
-# DS41RT example configurations
+# CUTEAFD example configurations
 
 These files are **opt-in, standalone `--config` files**. They overlay the
 launcher defaults in `scripts/release-common.sh`; every key they do not name
 keeps its default. They are never selected automatically and they do not change
-`ds41rt.config`, the release images or the default serving selection.
+`cuteafd.config`, the release images or the default serving selection.
 
 Select one explicitly:
 
@@ -62,7 +62,7 @@ checkpoint — bit family `[3,4]`, launcher tag `k34` — on one RTX under the h
 32 GiB ceiling, non-paired disjoint packages, KV 2 GiB and prefill 256) are the
 **v10 TP3 profiles**. The v10 promotion retargeted every example, these two
 included, onto the promoted `:v10` pair, so all of them are checked against
-`ds41rt.config` by the same published-pair equality. Packaging is not
+`cuteafd.config` by the same published-pair equality. Packaging is not
 qualification: neither file carries a memory, correctness, performance or
 readiness claim — see the
 [native TP3 status report](../../docs/release-v10-tp3-official-1x-3spark.md)
@@ -80,10 +80,10 @@ TP6 placement evidence, not TP3 qualification. Remote TP3 weight is
 `35 * 2,406,481,920 = 84,226,867,200 B`, leaving `24,892,452,864 B` under the
 `109,119,320,064 B` floor — admission arithmetic only, not a runtime fit.
 
-The `v10` pair is named by `ds41rt.config`, so a plain `./build.sh` now derives
-the `v10` tag from it. The explicit build config `ds41rt.build-v10.config`
-(`./build.sh --config ds41rt.build-v10.config`) is retained as the release
-**build** target and, after promotion, is identical to `ds41rt.config` including
+The `v10` pair is named by `cuteafd.config`, so a plain `./build.sh` now derives
+the `v10` tag from it. The explicit build config `cuteafd.build-v10.config`
+(`./build.sh --config cuteafd.build-v10.config`) is retained as the release
+**build** target and, after promotion, is identical to `cuteafd.config` including
 the release image pair. See
 [docs/release-v10-notes.md](../../docs/release-v10-notes.md).
 
@@ -93,10 +93,10 @@ paths are unchanged.
 
 ## Images and roles
 
-Every example names the **same promoted release pair** that `ds41rt.config`
+Every example names the **same promoted release pair** that `cuteafd.config`
 names. The Spark image is universal: it carries the default TP4 shard plus
 the `tp2`, `tp3` and `tp6` expert TP roles and advertises them as
-`io.ds41rt.v41.spark_tp_roles=tp2;tp3;tp6` (see
+`io.cuteafd.v41.spark_tp_roles=tp2;tp3;tp6` (see
 [docs/release-v10-notes.md](../../docs/release-v10-notes.md)). One published pair
 therefore serves every approved topology, and `run.sh` is what selects the mode:
 it derives the needed role from `SPARK_TP`, requires that role in the image label
@@ -104,7 +104,7 @@ of **every** rank, and refuses before any service is stopped or replaced. A
 topology that needs a role the image lacks is rejected even though the tag
 resolves; the legacy default TP4 path never probes the label.
 
-Do not pin a per-topology tag such as `ds41rt-coordinator:tp2ep3-candidate`.
+Do not pin a per-topology tag such as `cuteafd-coordinator:tp2ep3-candidate`.
 `build.sh` takes the tag from the config it is given, so a name like that exists
 only on a host where that exact file was built, and `run.sh` fails its image
 check on every other host — the launcher cannot infer a tag from a topology.

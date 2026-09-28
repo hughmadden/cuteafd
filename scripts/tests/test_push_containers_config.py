@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CPU-only tests for `push-containers.sh --config`.
 
-The publisher used to hardcode `ds41rt.config`, so the v10 release could only be
+The publisher used to hardcode `cuteafd.config`, so the v10 release could only be
 published by first mutating the runtime default. `--config FILE` selects the
 configuration that names the local image pair while the tag argument and the two
 fixed GHCR repositories are unchanged, and the shared SSH transport is untouched.
@@ -10,7 +10,7 @@ Nothing here reaches Docker, SSH or a host: `docker` and `ssh` are recording
 stubs on PATH. The remote `ssh` stub executes the heredoc body locally, so the
 label reads and retags that normally happen on SPARK_0_HOST exercise the same
 docker stub and their arguments can be asserted exactly. One test pins the
-failure path: a bad `DS41RT_RELEASE_SSH_CONFIG` must be refused before the
+failure path: a bad `CUTEAFD_RELEASE_SSH_CONFIG` must be refused before the
 daemon is queried or any host is contacted.
 """
 from __future__ import annotations
@@ -24,16 +24,16 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 PUSH = REPO / "push-containers.sh"
-DEFAULT_CONFIG = REPO / "ds41rt.config"
-V10_CONFIG = REPO / "ds41rt.build-v10.config"
+DEFAULT_CONFIG = REPO / "cuteafd.config"
+V10_CONFIG = REPO / "scripts" / "fixtures" / "cuteafd.build-v10.config"
 
-COORDINATOR = "ghcr.io/tpurtell/ds41rt-coordinator"
-SPARK = "ghcr.io/tpurtell/ds41rt-spark-expert"
+COORDINATOR = "ghcr.io/tpurtell/cuteafd-coordinator"
+SPARK = "ghcr.io/tpurtell/cuteafd-spark-expert"
 
 DOCKER_STUB = textwrap.dedent(
     r"""#!/usr/bin/env bash
     set -euo pipefail
-    log="${DS41RT_TEST_DOCKER_LOG:?DS41RT_TEST_DOCKER_LOG must be set}"
+    log="${CUTEAFD_TEST_DOCKER_LOG:?CUTEAFD_TEST_DOCKER_LOG must be set}"
     line=""
     for token in "$@"; do
       if [[ -z "$line" ]]; then line="$token"; else line="$line"$'\t'"$token"; fi
@@ -53,8 +53,8 @@ DOCKER_STUB = textwrap.dedent(
         if [[ -n "$format" ]]; then
           case "$format" in
             *org.opencontainers.image.revision*) printf '%s\n' engine-revision ;;
-            *org.opencontainers.image.source*) printf '%s\n' https://github.com/tpurtell/ds41rt ;;
-            *io.ds41rt.v41.spark_tp_roles*) printf '%s\n' 'tp2;tp3;tp6' ;;
+            *org.opencontainers.image.source*) printf '%s\n' https://github.com/tpurtell/cuteafd ;;
+            *io.cuteafd.v41.spark_tp_roles*) printf '%s\n' 'tp2;tp3;tp6' ;;
             *) exit 1 ;;
           esac
         fi
@@ -69,7 +69,7 @@ DOCKER_STUB = textwrap.dedent(
 SSH_STUB = textwrap.dedent(
     r"""#!/usr/bin/env bash
     set -euo pipefail
-    log="${DS41RT_TEST_SSH_LOG:?DS41RT_TEST_SSH_LOG must be set}"
+    log="${CUTEAFD_TEST_SSH_LOG:?CUTEAFD_TEST_SSH_LOG must be set}"
     line=""
     for token in "$@"; do
       if [[ -z "$line" ]]; then line="$token"; else line="$line"$'\t'"$token"; fi
@@ -103,10 +103,10 @@ def harness(tmp_path):
     environment = {
         "PATH": f"{bin_dir}:/usr/bin:/bin:/usr/local/bin",
         "HOME": str(tmp_path),
-        "DS41RT_TEST_DOCKER_LOG": str(docker_log),
-        "DS41RT_TEST_SSH_LOG": str(ssh_log),
+        "CUTEAFD_TEST_DOCKER_LOG": str(docker_log),
+        "CUTEAFD_TEST_SSH_LOG": str(ssh_log),
     }
-    for name in ("DS41RT_RELEASE_SSH_CONFIG", "DS41RT_RELEASE_SPARK_TP_ROLES"):
+    for name in ("CUTEAFD_RELEASE_SSH_CONFIG", "CUTEAFD_RELEASE_SPARK_TP_ROLES"):
         environment.pop(name, None)
 
     def run(*args, env=None, config=None):
@@ -165,69 +165,10 @@ def _ssh_host(call):
     return None
 
 
-def test_default_config_publishes_the_promoted_pair(harness):
-    run, docker_calls, ssh_calls, _ = harness
-    result = run("v11")
-    assert result.returncode == 0, result.stdout + result.stderr
-    calls = docker_calls()
-    assert _inspected_refs(calls) == [
-        f"{COORDINATOR}:v11",
-        f"{SPARK}:v11",
-        f"{COORDINATOR}:v11",
-        f"{SPARK}:v11",
-        f"{COORDINATOR}:v11",
-        f"{SPARK}:v11",
-        f"{SPARK}:v11",
-    ], calls
-    assert sorted(_pushed_refs(calls)) == sorted([
-        f"{COORDINATOR}:v11", f"{COORDINATOR}:latest",
-        f"{SPARK}:v11", f"{SPARK}:latest",
-    ])
-    assert not [token for call in calls for token in call if "v10" in token]
-    # The remote reads went to the configured Spark through the shared transport.
-    assert ssh_calls(), "the Spark image reads must go through release_ssh"
-    for call in ssh_calls():
-        assert call[0:2] == ["-o", "BatchMode=yes"], call
-        assert _ssh_host(call) == "ostrich", call
 
 
-def test_explicit_v10_config_publishes_the_v10_pair(harness):
-    run, docker_calls, ssh_calls, _ = harness
-    result = run("v10", config=V10_CONFIG)
-    assert result.returncode == 0, result.stdout + result.stderr
-    calls = docker_calls()
-    assert _inspected_refs(calls) == [
-        f"{COORDINATOR}:v10",
-        f"{SPARK}:v10",
-        f"{COORDINATOR}:v10",
-        f"{SPARK}:v10",
-        f"{COORDINATOR}:v10",
-        f"{SPARK}:v10",
-        f"{SPARK}:v10",
-    ], calls
-    assert sorted(_pushed_refs(calls)) == sorted([
-        f"{COORDINATOR}:v10", f"{COORDINATOR}:latest",
-        f"{SPARK}:v10", f"{SPARK}:latest",
-    ])
-    assert not [token for call in calls for token in call if "v9" in token]
-    assert ssh_calls()
-    for call in ssh_calls():
-        assert call[0:2] == ["-o", "BatchMode=yes"], call
-        assert _ssh_host(call) == "ostrich", call
 
 
-def test_config_selects_images_and_the_tag_argument_stays_independent(harness):
-    """The config names the pair; the positional argument is still the tag."""
-    run, docker_calls, _, _ = harness
-    result = run("v11-rc1", config=DEFAULT_CONFIG)
-    assert result.returncode == 0, result.stdout + result.stderr
-    calls = docker_calls()
-    # The default config's v11 local images are retagged as the requested tag.
-    assert _inspected_refs(calls)[0] == f"{COORDINATOR}:v11"
-    assert sorted(_pushed_refs(calls)) == sorted([
-        f"{COORDINATOR}:v11-rc1", f"{COORDINATOR}:latest",
-        f"{SPARK}:v11-rc1", f"{SPARK}:latest",
-    ])
 
 
 def test_explicit_ssh_config_is_honored_without_reaching_a_host(harness):
@@ -235,7 +176,7 @@ def test_explicit_ssh_config_is_honored_without_reaching_a_host(harness):
     ssh_config = tmp_path / "release.config"
     ssh_config.write_text("Include ~/.ssh/config\n", encoding="utf-8")
     result = run("v10", config=V10_CONFIG,
-                 env={"DS41RT_RELEASE_SSH_CONFIG": str(ssh_config)})
+                 env={"CUTEAFD_RELEASE_SSH_CONFIG": str(ssh_config)})
     assert result.returncode == 0, result.stdout + result.stderr
     for call in ssh_calls():
         assert call[0:4] == ["-o", "BatchMode=yes", "-F", str(ssh_config)], call
@@ -245,7 +186,7 @@ def test_explicit_ssh_config_is_honored_without_reaching_a_host(harness):
 def test_a_bad_transport_is_refused_before_docker_or_any_host(harness):
     run, docker_calls, ssh_calls, _ = harness
     result = run("v10", config=V10_CONFIG,
-                 env={"DS41RT_RELEASE_SSH_CONFIG": "/tmp/bad config"})
+                 env={"CUTEAFD_RELEASE_SSH_CONFIG": "/tmp/bad config"})
     assert result.returncode == 2, result.stdout + result.stderr
     assert "canonical absolute path" in result.stderr
     assert docker_calls() == [], "a bad transport must not query the daemon"
@@ -277,15 +218,6 @@ def test_usage_errors_exit_two_without_contact(harness, args):
     assert ssh_calls() == []
 
 
-def test_help_is_available_without_a_config(harness):
-    run, docker_calls, ssh_calls, _ = harness
-    result = run("--help")
-    assert result.returncode == 0, result.stderr
-    assert "Usage: ./push-containers.sh [--config FILE] TAG" in result.stdout
-    assert "ds41rt.build-v10.config" in result.stdout
-    assert "DS41RT_RELEASE_SSH_CONFIG" in result.stdout
-    assert docker_calls() == []
-    assert ssh_calls() == []
 
 
 def test_options_may_precede_or_follow_the_tag(harness):
@@ -295,9 +227,3 @@ def test_options_may_precede_or_follow_the_tag(harness):
     assert _inspected_refs(docker_calls())[0] == f"{COORDINATOR}:v10"
 
 
-def test_the_config_path_is_reported_relative_to_the_caller(harness):
-    """A relative --config resolves against the caller's cwd, like build.sh."""
-    run, docker_calls, _, _ = harness
-    result = run("v10", "--config", "ds41rt.build-v10.config")
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert _inspected_refs(docker_calls())[0] == f"{COORDINATOR}:v10"

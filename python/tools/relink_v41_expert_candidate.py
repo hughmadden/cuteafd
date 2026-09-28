@@ -39,7 +39,7 @@ def main():
         '-I', str(aot), str(args.source_root / 'native/src' / source_name), '-o', str(obj)]
     subprocess.run(compile_command, check=True)
     raw = subprocess.check_output(['ninja', '-C', str(build), '-t', 'commands',
-                                  'libds41rt_native.so'], text=True).splitlines()[-1]
+                                  'libcuteafd_native.so'], text=True).splitlines()[-1]
     assert raw.startswith(': && ') and raw.endswith(' && :'), raw
     command = shlex.split(raw[5:-5])
     command[command.index('-o') + 1] = str(output)
@@ -51,7 +51,7 @@ def main():
         path = Path(value)
         if path.parent.name == directory and path.name.startswith(stem) and path.suffix == '.o':
             replacement = aot / path.name
-        elif value == f'CMakeFiles/ds41rt_native.dir/src/{source_name}.o':
+        elif value == f'CMakeFiles/cuteafd_native.dir/src/{source_name}.o':
             replacement = obj
         else:
             continue
@@ -65,7 +65,7 @@ def main():
             path = Path(value)
             path = path if path.is_absolute() else build / path
             inputs.append({'path': str(path), 'sha256': digest(path)})
-    baseline = build / 'libds41rt_native.so'
+    baseline = build / 'libcuteafd_native.so'
     baseline_sha = digest(baseline)
     subprocess.run(command, cwd=build, check=True)
     assert digest(baseline) == baseline_sha

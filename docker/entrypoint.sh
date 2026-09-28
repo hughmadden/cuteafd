@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ -d /workspace/ds41rt ]]; then
-  export PATH="/workspace/ds41rt/scripts:$PATH"
-  cd /workspace/ds41rt
+if [[ -d /workspace/cuteafd ]]; then
+  export PATH="/workspace/cuteafd/scripts:$PATH"
+  cd /workspace/cuteafd
 fi
 exec "$@"

@@ -18,11 +18,11 @@ parser.add_argument("--output", type=Path, required=True)
 args = parser.parse_args()
 torch.manual_seed(731)
 lib = C.CDLL(str(args.native))
-old = lib.ds41rt_v41_hc_mixes
+old = lib.cuteafd_v41_hc_mixes
 old.argtypes = [C.c_void_p] * 7 + [C.c_int32, C.c_void_p]
-new = lib.ds41rt_v41_hc_mixes_workspace
+new = lib.cuteafd_v41_hc_mixes_workspace
 new.argtypes = [C.c_void_p] * 8 + [C.c_uint64, C.c_int32, C.c_void_p]
-initialize = lib.ds41rt_v41_hc_project_initialize
+initialize = lib.cuteafd_v41_hc_project_initialize
 initialize.argtypes = []
 assert initialize() == 0
 assert initialize() == 0

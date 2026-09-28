@@ -53,7 +53,7 @@ NONCE_BY_PROFILE = {profile: 79101 + index for index, profile in enumerate(PROFI
 SEGMENT_SECONDS = 0.9
 
 IDENTITY = {
-    "schema": "ds41rt.sampling-identity/1",
+    "schema": "cuteafd.sampling-identity/1",
     "model": {"id": MODEL, "revision": "dba1be0a40aa45a94ad051997016db3960a90277"},
     "topology": {"rtx_coordinators": 1, "spark_workers": 4, "dspark": True},
     "coordinator": {
@@ -73,7 +73,7 @@ IDENTITY_SHA = hashlib.sha256(IDENTITY_RAW).hexdigest()
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("ds41rt_validate_campaign", VALIDATOR)
+    spec = importlib.util.spec_from_file_location("cuteafd_validate_campaign", VALIDATOR)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

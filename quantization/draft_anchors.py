@@ -36,7 +36,7 @@ def select_anchors(records, *, count=327680, seed=20260809):
         position = ordinal - start + 1
         groups[record_index].append(position)
         digest.update(struct.pack("<QQ", record_index, position))
-    return dict(schema="ds41rt-dspark-stratified-anchors-v1", seed=seed, count=count,
+    return dict(schema="cuteafd-dspark-stratified-anchors-v1", seed=seed, count=count,
                 eligible=total, positions=tuple(tuple(group) for group in groups),
                 coordinate_sha256=digest.hexdigest(), proposal_rows=count * 5,
                 batching="all-selected-anchors-per-original-record", known_token="corpus-position-plus-one")

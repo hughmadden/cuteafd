@@ -29,7 +29,7 @@ def _load_qualifier():
     if str(TOOLS) not in sys.path:
         sys.path.insert(0, str(TOOLS))
     try:
-        spec = importlib.util.spec_from_file_location("ds41rt_qualifier_timing", QUALIFIER)
+        spec = importlib.util.spec_from_file_location("cuteafd_qualifier_timing", QUALIFIER)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     except Exception as error:  # pragma: no cover - environment dependent
@@ -141,8 +141,8 @@ def test_seeded_input_repeats_for_the_same_shape_and_seed():
 
 def test_file_hash_matches_hashlib(tmp_path):
     q = _load_qualifier()
-    path = tmp_path / "libds41rt_native.so"
-    path.write_bytes(b"ds41rt" * 1000)
+    path = tmp_path / "libcuteafd_native.so"
+    path.write_bytes(b"cuteafd" * 1000)
     assert q._sha256_file(path) == hashlib.sha256(path.read_bytes()).hexdigest()
 
 
@@ -416,9 +416,9 @@ def test_run_timing_branch_executes_with_mocks_and_emits_the_record_schema(tmp_p
         return 0
 
     lib = SimpleNamespace(
-        ds41rt_v41_expert_info=_record_capacity,
-        ds41rt_v41_compact_routes_bf16_async=lambda *a, **k: 0,
-        ds41rt_v41_compact_tokens_bf16_async=lambda *a, **k: 0)
+        cuteafd_v41_expert_info=_record_capacity,
+        cuteafd_v41_compact_routes_bf16_async=lambda *a, **k: 0,
+        cuteafd_v41_compact_tokens_bf16_async=lambda *a, **k: 0)
 
     options = SimpleNamespace(
         manifest=manifest_path, native_lib=tmp_path / "lib.so", width=None,

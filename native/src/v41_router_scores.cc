@@ -1,12 +1,12 @@
 #include <atomic>
 #include <mutex>
-#include "ds41rt_v41_router.h"
+#include "cuteafd_v41_router.h"
 #include "v41_router_e128.h"
 #include "v41_router_e384.h"
 
 namespace {
-ds41rt_v41_router_e128_Kernel_Module_t small{};
-ds41rt_v41_router_e384_Kernel_Module_t large{};
+cuteafd_v41_router_e128_Kernel_Module_t small{};
+cuteafd_v41_router_e384_Kernel_Module_t large{};
 std::atomic<int> loaded_device[2]{{-1},{-1}};
 std::mutex initialization;
 using ModuleFn = void (*)(void**);
@@ -21,7 +21,7 @@ int load(cudaLibrary_t& library, ModuleFn initialize, ModuleFn load_device, int 
 }
 }
 
-extern "C" int32_t ds41rt_v41_router_initialize() {
+extern "C" int32_t cuteafd_v41_router_initialize() {
   int device=-1;
   auto status=cudaGetDevice(&device);if(status)return status;
   for(auto& owner:loaded_device)if(owner.load(std::memory_order_acquire)==device)return 0;
@@ -39,10 +39,10 @@ extern "C" int32_t ds41rt_v41_router_initialize() {
   status=cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,device);if(status)return status;
   status=cudaDeviceGetAttribute(&minor,cudaDevAttrComputeCapabilityMinor,device);if(status)return status;
   if(major!=12 || minor!=0)return cudaErrorInvalidDevice;
-  int result=load(small.module,_mlir_ds41rt_v41_router_e128_cuda_init,
-      _mlir_ds41rt_v41_router_e128_cuda_load_to_device,device);
-  if(!result)result=load(large.module,_mlir_ds41rt_v41_router_e384_cuda_init,
-      _mlir_ds41rt_v41_router_e384_cuda_load_to_device,device);
+  int result=load(small.module,_mlir_cuteafd_v41_router_e128_cuda_init,
+      _mlir_cuteafd_v41_router_e128_cuda_load_to_device,device);
+  if(!result)result=load(large.module,_mlir_cuteafd_v41_router_e384_cuda_init,
+      _mlir_cuteafd_v41_router_e384_cuda_load_to_device,device);
   if(result)return result;
   loaded_device[slot].store(device,std::memory_order_release);
   return 0;
@@ -50,7 +50,7 @@ extern "C" int32_t ds41rt_v41_router_initialize() {
 
 // Internal projection entry: full buffer/alias validation is in v41_router.cu.
 // Never initialize modules or allocate during launch/capture.
-extern "C" int32_t ds41rt_v41_router_scores_aot(const uint16_t* input,
+extern "C" int32_t cuteafd_v41_router_scores_aot(const uint16_t* input,
     const uint16_t* weight,float* logits,int32_t rows,int32_t experts,void* stream) {
   if(rows<1 || rows>4096 || (experts!=128 && experts!=384))return cudaErrorInvalidValue;
   int device=-1;
@@ -62,8 +62,8 @@ extern "C" int32_t ds41rt_v41_router_scores_aot(const uint16_t* input,
     if(id==device) { ready=true;break; }
   }
   if(!ready)return initialized?cudaErrorInvalidDevice:cudaErrorNotReady;
-  if(experts==128)return cute_dsl_ds41rt_v41_router_e128_wrapper(
+  if(experts==128)return cute_dsl_cuteafd_v41_router_e128_wrapper(
       &small,(void*)input,(void*)weight,logits,rows,(cudaStream_t)stream);
-  return cute_dsl_ds41rt_v41_router_e384_wrapper(
+  return cute_dsl_cuteafd_v41_router_e384_wrapper(
       &large,(void*)input,(void*)weight,logits,rows,(cudaStream_t)stream);
 }

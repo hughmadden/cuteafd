@@ -42,9 +42,9 @@ def completed_frontiers(response):
     frontiers = [usage['total_tokens'] - 1]
     fingerprint = response['system_fingerprint']
     assert fingerprint in (
-        'ds41rt-native-fp4-kv', 'ds41rt-native-fp4-kv-dspark',
+        'cuteafd-native-fp4-kv', 'cuteafd-native-fp4-kv-dspark',
         # Preserve replay support for the pre-migration baseline evidence.
-        'ds41rt-native-fp8-kv', 'ds41rt-native-fp8-kv-dspark',
+        'cuteafd-native-fp8-kv', 'cuteafd-native-fp8-kv-dspark',
     )
     if fingerprint.endswith('-dspark'):
         frontiers.append(usage['total_tokens'])

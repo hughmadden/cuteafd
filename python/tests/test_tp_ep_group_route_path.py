@@ -27,7 +27,7 @@ HARNESS = ROOT / "python" / "tools" / "bench_tp_ep_kernel.py"
 # consolidator-dependent tests skip. The env override validates absence without
 # touching the live generated file.
 CONSOLIDATE = Path(os.environ.get(
-    "DS41RT_TP_EP_CONSOLIDATE_ARTIFACT",
+    "CUTEAFD_TP_EP_CONSOLIDATE_ARTIFACT",
     str(ROOT / "runs" / "tp-ep-kernel" / "timing" / "consolidate.py")))
 
 
@@ -41,7 +41,7 @@ def _load(name, path):
 def _load_consolidator_or_skip(path: Path = CONSOLIDATE):
     if not path.is_file():
         pytest.skip(f"timing consolidator artifact not present: {path}")
-    return _load("ds41rt_group_route_con", path)
+    return _load("cuteafd_group_route_con", path)
 
 
 @pytest.fixture(scope="module")
@@ -49,7 +49,7 @@ def con():
     return _load_consolidator_or_skip()
 
 
-timing = _load("ds41rt_group_route_path", HARNESS)
+timing = _load("cuteafd_group_route_path", HARNESS)
 
 
 def _group_body():
@@ -162,7 +162,7 @@ def test_missing_consolidator_artifact_skips_cleanly(tmp_path):
     """A clean checkout has no consolidator; the loader must skip, not crash.
 
     In-process simulation of the absent-artifact state. The end-to-end
-    collection check uses DS41RT_TP_EP_CONSOLIDATE_ARTIFACT instead of renaming
+    collection check uses CUTEAFD_TP_EP_CONSOLIDATE_ARTIFACT instead of renaming
     the live generated file.
     """
     with pytest.raises(pytest.skip.Exception):

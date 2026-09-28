@@ -25,7 +25,7 @@ class RecoveryIdentityTest(unittest.TestCase):
             current = copy.deepcopy(previous)
             for slot in current['coordinator_slots']:
                 slot.update(image_digest='queue-image', preflight_sha256='queue-code')
-            current['recovery'] = dict(schema='ds41rt-continuous-search-recovery-v1',
+            current['recovery'] = dict(schema='cuteafd-continuous-search-recovery-v1',
                 previous_manifest=str(root / 'previous.json'), search_report=str(root / 'search.log'),
                 search_report_sha256=hashlib.sha256(payload).hexdigest())
             preserved, evidence = resolve_identity(current)
@@ -65,7 +65,7 @@ class RecoveryIdentityTest(unittest.TestCase):
         current = copy.deepcopy(original)
         for slot in current["coordinator_slots"]:
             slot.update(image_digest="new-image", preflight_sha256="new-code")
-        current["recovery"] = dict(schema="ds41rt-input-serializer-recovery-v1",
+        current["recovery"] = dict(schema="cuteafd-input-serializer-recovery-v1",
             original_manifest=str(root / "original.json"), memory_report=str(root / "memory.log"),
             memory_report_sha256=hashlib.sha256(payload).hexdigest())
         return original, current

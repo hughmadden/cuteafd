@@ -23,10 +23,10 @@ def main():
     normalize=lambda value:re.sub(r'\s+','',value)
     for experts in (128,384):
         label=f'v41_router_e{experts}'
-        compile_v41_router_scores_aot(experts=experts).export_to_c(str(a.output_dir),label,'ds41rt_'+label)
+        compile_v41_router_scores_aot(experts=experts).export_to_c(str(a.output_dir),label,'cuteafd_'+label)
         h=(a.output_dir/(label+'.h')).read_text()
-        expected=[f'ds41rt_{label}_Kernel_Module_t *module','void *x','void *w','void *logits','int32_t live_rows','cudaStream_t stream']
-        signature=re.search(r'static inline int32_t cute_dsl_ds41rt_'+label+r'_wrapper\(([^)]*)\)',h)
+        expected=[f'cuteafd_{label}_Kernel_Module_t *module','void *x','void *w','void *logits','int32_t live_rows','cudaStream_t stream']
+        signature=re.search(r'static inline int32_t cute_dsl_cuteafd_'+label+r'_wrapper\(([^)]*)\)',h)
         if not signature or normalize(signature[1])!=normalize(','.join(expected)):
             raise ValueError(f'unexpected router C signature: {label}')
         args=re.search(r'void \*args\[6\] = \{([^}]*)\}',h)
@@ -38,7 +38,7 @@ def main():
         print(f'exported {label}',flush=True)
     lock=_pinned_sparkinfer.LOCK_DATA
     dispatch=a.output_dir/'v41_router_dispatch.h'
-    dispatch.write_text('#pragma once\n'+''.join(f"#define DS41RT_V41_ROUTER_E{v['experts']}_MIN_ROWS {v['min_rows']}\n" for v in variants))
+    dispatch.write_text('#pragma once\n'+''.join(f"#define CUTEAFD_V41_ROUTER_E{v['experts']}_MIN_ROWS {v['min_rows']}\n" for v in variants))
     manifest_path.write_text(json.dumps(dict(schema=1,sparkinfer=lock,variants=variants,dispatch_sha256=hashlib.sha256(dispatch.read_bytes()).hexdigest()),indent=2)+'\n')
 
 

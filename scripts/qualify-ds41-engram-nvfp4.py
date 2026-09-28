@@ -27,7 +27,7 @@ def main():
     parser.add_argument("--fixture-dir", type=Path)
     args = parser.parse_args()
     lib = ctypes.CDLL(args.native_lib)
-    fn = lib.ds41rt_cuda_engram_nvfp4_dequant_bf16_async
+    fn = lib.cuteafd_cuda_engram_nvfp4_dequant_bf16_async
     fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_float,
                    ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
     fn.restype = ctypes.c_int

@@ -95,12 +95,12 @@ printf 'ROLES=%s\\n' "${{{variable}}}"
 
 def _run_roles(spark_tp: str, override: str | None) -> subprocess.CompletedProcess:
     return _run(BUILD, spark_tp, override, variable="spark_tp_roles",
-                env_name="DS41RT_RELEASE_SPARK_TP_ROLES", block=_role_block())
+                env_name="CUTEAFD_RELEASE_SPARK_TP_ROLES", block=_role_block())
 
 
 def _run_wip_roles(spark_tp: str, override: str | None) -> subprocess.CompletedProcess:
     return _run(WIP, spark_tp, override, variable="wip_spark_tp_roles",
-                env_name="DS41RT_WIP_SPARK_TP_ROLES",
+                env_name="CUTEAFD_WIP_SPARK_TP_ROLES",
                 block=_role_block(WIP, variable="wip_spark_tp_roles", last=True,
                                   marker=WIP_START))
 
@@ -164,7 +164,7 @@ def test_wip_role_selection_matrix(spark_tp, override, expected) -> None:
 def test_wip_rejects_an_unknown_role_and_names_the_wip_variable() -> None:
     result = _run_wip_roles("", "tp5")
     assert result.returncode == 2, result.stdout
-    assert "DS41RT_WIP_SPARK_TP_ROLES accepts only tp2, tp3 and tp6" in result.stderr
+    assert "CUTEAFD_WIP_SPARK_TP_ROLES accepts only tp2, tp3 and tp6" in result.stderr
 
 
 def test_wip_subset_is_always_contained_in_the_release_default() -> None:
@@ -182,8 +182,8 @@ def test_wip_subset_is_always_contained_in_the_release_default() -> None:
 
 def test_release_and_wip_artifact_scripts_share_the_allowlist() -> None:
     for path, variable in (
-        (REPO / "scripts" / "build-release-artifacts.sh", "DS41RT_RELEASE_SPARK_TP_ROLES"),
-        (REPO / "scripts" / "build-wip-artifacts.sh", "DS41RT_WIP_SPARK_TP_ROLES"),
+        (REPO / "scripts" / "build-release-artifacts.sh", "CUTEAFD_RELEASE_SPARK_TP_ROLES"),
+        (REPO / "scripts" / "build-wip-artifacts.sh", "CUTEAFD_WIP_SPARK_TP_ROLES"),
     ):
         text = path.read_text(encoding="utf-8")
         assert "tp2|tp3|tp6)" in text, path
@@ -248,7 +248,7 @@ def test_manifest_writer_accepts_tp6_and_rejects_a_wrong_extent(tmp_path: Path) 
     output = tmp_path / "V41_EXPERT_TP_AOT.json"
     # The writer requires the built library whenever a role is requested; a stub
     # file exercises the hash/validation path without any native build.
-    library = tmp_path / "libds41rt_native.so"
+    library = tmp_path / "libcuteafd_native.so"
     library.write_bytes(b"\x7fELF-stub\n")
 
     def invoke() -> subprocess.CompletedProcess:

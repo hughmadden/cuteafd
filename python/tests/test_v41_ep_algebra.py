@@ -42,7 +42,7 @@ BENCH_PATH = ROOT / "python" / "tools" / "benchmark_v41_ep_groups.py"
 
 
 def _load_bench():
-    spec = importlib.util.spec_from_file_location("ds41rt_ep_bench", BENCH_PATH)
+    spec = importlib.util.spec_from_file_location("cuteafd_ep_bench", BENCH_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -506,7 +506,7 @@ def test_m_and_width_sweep(width, tp_degree, intermediate, experts, capacity,
 
 def _checkpoint_snapshot():
     import os
-    env = os.environ.get("DS41RT_TPEP_SNAPSHOT")
+    env = os.environ.get("CUTEAFD_TPEP_SNAPSHOT")
     if env:
         return Path(env)
     hub = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))

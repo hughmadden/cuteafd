@@ -242,7 +242,7 @@ def export(
         if not 0 < clusters <= 2 * properties.multi_processor_count:
             raise ValueError(f"invalid NVFP4 cooperative launch grid: {clusters}")
         label = f"v41_nvfp4_{role}_m{requested_rows}"
-        symbol = "ds41rt_" + label
+        symbol = "cuteafd_" + label
         compiled.export_to_c(str(output), label, symbol)
         header = (output / f"{label}.h").read_text()
         entry = re.findall(r"void (_mlir_\w+)\(void \*\*args, int32_t num_args\);", header)
@@ -379,11 +379,11 @@ def export(
             [
                 "#pragma once",
                 *includes,
-                f"#define DS41RT_V41_CC_MINOR {properties.minor}",
-                f"#define DS41RT_V41_SMS {properties.multi_processor_count}",
+                f"#define CUTEAFD_V41_CC_MINOR {properties.minor}",
+                f"#define CUTEAFD_V41_SMS {properties.multi_processor_count}",
                 "// Deterministic dynamic NVFP4 publishes BF16 per-route rows.",
-                "#define DS41RT_V41_OUTPUT_KIND(capacity) 2",
-                "#define DS41RT_V41_VARIANTS " + ",".join(entries),
+                "#define CUTEAFD_V41_OUTPUT_KIND(capacity) 2",
+                "#define CUTEAFD_V41_VARIANTS " + ",".join(entries),
                 "",
             ]
         )

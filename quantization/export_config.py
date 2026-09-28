@@ -28,8 +28,8 @@ def model_metadata(source_config, inventory, *, provenance):
         storage[name] = dict(quant_format="exl3", bits_per_weight=bits, stored_tensors=stored)
     external = EXL3Config(bits=3, codebook="mcg", out_scales="never", tensor_storage=storage, offload_to_disk=False,
                           module_include=[r"^(?:layers|mtp)\.\d+\.ffn\.experts\.\d+\.w[123]$"]).to_dict()
-    external.setdefault("meta", {})["ds41rt"] = dict(
-        schema="ds41rt.v41-routed-exl3.v1", tensor_naming="checkpoint-native",
+    external.setdefault("meta", {})["cuteafd"] = dict(
+        schema="cuteafd.v41-routed-exl3.v1", tensor_naming="checkpoint-native",
         routed_average_bpw="13/4", projection_ratio=dict(w1=3, w3=5, w2=8),
         native_quantization_config=copy.deepcopy(source_config.get("quantization_config")),
         provenance=copy.deepcopy(provenance),

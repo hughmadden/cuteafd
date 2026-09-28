@@ -1,6 +1,6 @@
 import pytest
 
-from ds41rt_reference.deepseek_v4_attention_output_capture import (
+from cuteafd_reference.deepseek_v4_attention_output_capture import (
     plan_deepseek_v4_attention_output,
     qualify_deepseek_v4_attention_output_contract,
 )

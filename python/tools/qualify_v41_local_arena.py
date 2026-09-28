@@ -16,7 +16,7 @@ capacities = (1, 16, 80, 256, 1024, 4096)
 sizes = []
 for capacity in capacities:
     info = Info()
-    check(lib.ds41rt_v41_expert_info(capacity, C.byref(info)))
+    check(lib.cuteafd_v41_expert_info(capacity, C.byref(info)))
     sizes.append(info.scratch_bytes)
 arena = torch.empty(max(sizes), dtype=torch.uint8, device='cuda')
 weights_full = None

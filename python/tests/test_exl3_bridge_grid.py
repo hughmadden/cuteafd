@@ -46,11 +46,11 @@ extern "C" int observed_grid() { return last_grid; }
                 objects = []
                 for role in ('core', 'sum'):
                     label = 'v41_exl3_' + role
-                    module_type = 'ds41rt_' + label + '_Kernel_Module_t'
+                    module_type = 'cuteafd_' + label + '_Kernel_Module_t'
                     (root / (label + '.h')).write_text(f'''#include "stub.h"
 struct {module_type} {{ void* module=nullptr; }};
-static void _mlir_ds41rt_{label}_cuda_init(void**) {{}}
-static void _mlir_ds41rt_{label}_cuda_load_to_device(void**) {{}}
+static void _mlir_cuteafd_{label}_cuda_init(void**) {{}}
+static void _mlir_cuteafd_{label}_cuda_load_to_device(void**) {{}}
 static int wrapper_{role}({module_type}*,void*,int32_t active_m,int32_t grid_x,cudaStream_t) {{
     last_grid=grid_x; return 0;
 }}
@@ -68,32 +68,32 @@ static int wrapper_{role}({module_type}*,void*,int32_t active_m,int32_t grid_x,c
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 lib = ct.CDLL(str(root / 'bridge.so'))
                 lib.set_device.argtypes = [ct.c_int] * 4
-                lib.ds41rt_exl3_create.argtypes = [ct.POINTER(ct.c_void_p)]
-                lib.ds41rt_exl3_destroy.argtypes = [ct.c_void_p]
-                lib.ds41rt_exl3_core.argtypes = [ct.c_void_p, ct.POINTER(ct.c_void_p),
+                lib.cuteafd_exl3_create.argtypes = [ct.POINTER(ct.c_void_p)]
+                lib.cuteafd_exl3_destroy.argtypes = [ct.c_void_p]
+                lib.cuteafd_exl3_core.argtypes = [ct.c_void_p, ct.POINTER(ct.c_void_p),
                                                 ct.POINTER(ct.c_int32), ct.c_void_p]
                 for sms in (170, 188, 200):
                     lib.set_device(12, 0, sms, 0)
                     context = ct.c_void_p()
-                    self.assertEqual(lib.ds41rt_exl3_create(ct.byref(context)), 0)
+                    self.assertEqual(lib.cuteafd_exl3_create(ct.byref(context)), 0)
                     pointers = (ct.c_void_p * 1)(1)
                     for requested in (1, 170 * blocks, 188 * blocks, 200 * blocks):
                         scalars = (ct.c_int32 * 2)(16, requested)
-                        self.assertEqual(lib.ds41rt_exl3_core(context, pointers, scalars, None), 0)
+                        self.assertEqual(lib.cuteafd_exl3_core(context, pointers, scalars, None), 0)
                         self.assertEqual(lib.observed_grid(), min(requested, min(sms, 188) * blocks))
                         self.assertEqual(list(scalars), [16, requested])
                     for rows, grid in ((0, 1), (17, 1), (1, 0), (1, -1)):
-                        self.assertNotEqual(lib.ds41rt_exl3_core(context, pointers,
+                        self.assertNotEqual(lib.cuteafd_exl3_core(context, pointers,
                                              (ct.c_int32 * 2)(rows, grid), None), 0)
                     lib.set_device(12, 0, sms, 1)
-                    self.assertNotEqual(lib.ds41rt_exl3_core(context, pointers,
+                    self.assertNotEqual(lib.cuteafd_exl3_core(context, pointers,
                                          (ct.c_int32 * 2)(1, 1), None), 0)
                     lib.set_device(12, 0, sms, 0)
-                    lib.ds41rt_exl3_destroy(context)
+                    lib.cuteafd_exl3_destroy(context)
                 for major, minor, sms in ((12, 1, 188), (11, 0, 188), (12, 0, 0)):
                     lib.set_device(major, minor, sms, 0)
                     context = ct.c_void_p()
-                    self.assertNotEqual(lib.ds41rt_exl3_create(ct.byref(context)), 0)
+                    self.assertNotEqual(lib.cuteafd_exl3_create(ct.byref(context)), 0)
                     self.assertFalse(context.value)
 
     def test_invalid_export_grid_rejected(self):

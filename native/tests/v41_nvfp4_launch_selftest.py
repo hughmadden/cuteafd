@@ -5,8 +5,8 @@ Pass LIB MANIFEST PREFIX [--rows 1] [--device 0]. Run each family separately.
 No compilation/export occurs. Requires exported positive resident-cluster counts.
 This checks zero-data output and ABI validation, not nonzero numerical accuracy.
 Example:
-  python native/tests/v41_nvfp4_launch_selftest.py libds41rt_native.so \
-    v41_nvfp4_experts.json ds41rt_v41_nvfp4_tp2_expert
+  python native/tests/v41_nvfp4_launch_selftest.py libcuteafd_native.so \
+    v41_nvfp4_experts.json cuteafd_v41_nvfp4_tp2_expert
 """
 import argparse
 import ctypes as C
@@ -103,7 +103,7 @@ def main():
                  h * (n // 2), ceil_to(h, 128) * ceil_to(n // 16, 4)]
         scale_byte = 0x38  # E4M3 1.0
     else:
-        sizes_fn = lib.ds41rt_v41_expert_packed_sizes
+        sizes_fn = lib.cuteafd_v41_expert_packed_sizes
         sizes_fn.argtypes = [C.c_uint32, C.POINTER(C.c_uint64)]
         sizes_fn.restype = C.c_int32
         packed = (C.c_uint64 * 4)()

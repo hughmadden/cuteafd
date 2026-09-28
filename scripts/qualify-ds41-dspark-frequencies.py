@@ -22,7 +22,7 @@ def main():
     nodes=[n for n in ast.parse(source.read_text()).body if isinstance(n,ast.FunctionDef) and n.name=='precompute_freqs_cis']
     ns={'torch':torch,'math':math,'lru_cache':lru_cache}
     exec(compile(ast.Module(body=nodes,type_ignores=[]),str(source),'exec'),ns)
-    lib=C.CDLL(str(args.native_lib));fn=lib.ds41rt_v41_dspark_frequencies
+    lib=C.CDLL(str(args.native_lib));fn=lib.cuteafd_v41_dspark_frequencies
     fn.argtypes=[C.c_void_p,C.c_void_p,C.c_int32,C.c_void_p];fn.restype=C.c_int32
     stream=torch.cuda.Stream()
     results=[]

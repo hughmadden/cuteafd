@@ -20,7 +20,7 @@ def main():
     from b12x.attention.dsa_indexer.tiled_topk import run_row_topk
     torch.cuda.set_device(a.device)
     lib = C.CDLL(a.native)
-    native = lib.ds41rt_v41_index_top512
+    native = lib.cuteafd_v41_index_top512
     native.argtypes = [C.c_void_p]*4 + [C.c_uint64, C.c_void_p] + [C.c_int32]*3 + [C.c_void_p]
     native.restype = C.c_int32
     results = []

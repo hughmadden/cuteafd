@@ -44,7 +44,7 @@ def run(snapshot, identity, url, token, device):
                 request = build_projection_request(module_full_name=name, layer_index=0,
                     input_weight=weight, hessian=hessian, sample_count=1024,
                     quantizer_contract=contract,
-                    family_join={"diagnostic": "ds41rt-real-weight-worker-qualification-v1"}, route_evidence=None)
+                    family_join={"diagnostic": "cuteafd-real-weight-worker-qualification-v1"}, route_evidence=None)
                 packed, result, transport = client.quantize(endpoint=endpoint, request_manifest=request,
                                                            input_weight=weight, hessian=hessian)
                 validate_exl3_hessian_metrics(result["quantizer_metrics"], sample_count=1024, sigma_reg=.025)

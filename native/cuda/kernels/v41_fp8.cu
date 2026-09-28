@@ -1,7 +1,7 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <cuda_bf16.h>
-#include "ds41rt_v41_fp8.h"
+#include "cuteafd_v41_fp8.h"
 namespace {
 __global__ void pack_scales(const uint8_t* source, uint8_t* output, uint64_t bytes, uint32_t scale_k) {
   const uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -35,15 +35,15 @@ static int32_t shared_swiglu_width(const uint16_t* gate, const uint16_t* up,
       reinterpret_cast<__nv_bfloat16*>(output), count);
   return cudaGetLastError();
 }
-extern "C" int32_t ds41rt_v41_shared_swiglu(const uint16_t* gate, const uint16_t* up,
+extern "C" int32_t cuteafd_v41_shared_swiglu(const uint16_t* gate, const uint16_t* up,
     uint16_t* output, int32_t rows, void* stream) {
   return shared_swiglu_width(gate, up, output, rows, 2304, stream);
 }
-extern "C" int32_t ds41rt_v41_shared_tp2_swiglu(const uint16_t* gate, const uint16_t* up,
+extern "C" int32_t cuteafd_v41_shared_tp2_swiglu(const uint16_t* gate, const uint16_t* up,
     uint16_t* output, int32_t rows, void* stream) {
   return shared_swiglu_width(gate, up, output, rows, 1152, stream);
 }
-extern "C" int32_t ds41rt_v41_fp8_matrix_pack_scales(
+extern "C" int32_t cuteafd_v41_fp8_matrix_pack_scales(
     const uint8_t* source, uint8_t* destination, int32_t k, int32_t n, void* stream) {
   if (!((k == 6144 && n == 25600) || (k == 5120 && n == 2304) || (k == 2304 && n == 5120) ||
         (k == 5120 && n == 1152) || (k == 1152 && n == 5120) ||
@@ -62,10 +62,10 @@ extern "C" int32_t ds41rt_v41_fp8_matrix_pack_scales(
       source, destination, dst_bytes, k / 32);
   return cudaGetLastError();
 }
-extern "C" int32_t ds41rt_v41_fp8_pack_scales(const uint8_t* source, uint8_t* destination, void* stream) {
-  return ds41rt_v41_fp8_matrix_pack_scales(source, destination, 6144, 25600, stream);
+extern "C" int32_t cuteafd_v41_fp8_pack_scales(const uint8_t* source, uint8_t* destination, void* stream) {
+  return cuteafd_v41_fp8_matrix_pack_scales(source, destination, 6144, 25600, stream);
 }
-extern "C" int32_t ds41rt_v41_fp8_initialize_storage(void* scratch, uint64_t bytes, float* alpha, void* stream) {
+extern "C" int32_t cuteafd_v41_fp8_initialize_storage(void* scratch, uint64_t bytes, float* alpha, void* stream) {
   auto status = cudaMemsetAsync(scratch, 0, bytes, reinterpret_cast<cudaStream_t>(stream));
   if (status != cudaSuccess) return status;
   alpha_one<<<1, 1, 0, reinterpret_cast<cudaStream_t>(stream)>>>(alpha);
@@ -81,7 +81,7 @@ __global__ void reduce_splits(const float* partials, __nv_bfloat16* output, uint
   output[i] = __float2bfloat16_rn(sum);
 }
 }
-extern "C" int32_t ds41rt_v41_fp8_reduce_splits(const float* partials, uint16_t* output,
+extern "C" int32_t cuteafd_v41_fp8_reduce_splits(const float* partials, uint16_t* output,
     int32_t rows, int32_t columns, int32_t slices, void* stream) {
   if (rows < 1 || rows > 4096 || columns < 1 || (slices != 2 && slices != 4))
     return cudaErrorInvalidValue;
@@ -99,7 +99,7 @@ __global__ void grouped_output_rows(const uint16_t* input,uint16_t* output,uint6
   output[i]=input[(group*rows+row)*1024+col];
 }
 }
-extern "C" int32_t ds41rt_v41_fp8_grouped_output(const uint16_t* input,uint16_t* output,
+extern "C" int32_t cuteafd_v41_fp8_grouped_output(const uint16_t* input,uint16_t* output,
     int32_t rows,void* stream) {
   if(rows<1 || rows>4096)return cudaErrorInvalidValue;
   grouped_output_rows<<<(uint64_t(rows)*8192+255)/256,256,0,reinterpret_cast<cudaStream_t>(stream)>>>(input,output,rows);

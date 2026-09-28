@@ -71,20 +71,20 @@ ds41rt `dspark_policy` and glmrt `dflash2_confidence`.
 
 ```
 rust/crates/
-  afd-core       ids, geometry, placement math, admission/lanes, KV allocator, sampling params
-  afd-ffi        libloading C ABI; one module per kernel family, family-namespaced symbols
-  afd-loader     checkpoint catalog, family readers (HF config -> ModelSpec), LoadPlan,
+  cuteafd-core       ids, geometry, placement math, admission/lanes, KV allocator, sampling params
+  cuteafd-ffi        libloading C ABI; one module per kernel family, family-namespaced symbols
+  cuteafd-loader     checkpoint catalog, family readers (HF config -> ModelSpec), LoadPlan,
                  capability check, fast sliced readers, mapped tables, sparknest placement
-  afd-transport  ExpertProtocolV2, verbs RoCE, TP x EP topology (unchanged from ds41rt)
-  afd-hostcache  pinned host RAM prefix snapshots (unchanged)
-  afd-engine     model-agnostic serve runtime: scheduler, lanes, prefix cache, memory,
+  cuteafd-transport  ExpertProtocolV2, verbs RoCE, TP x EP topology (unchanged from ds41rt)
+  cuteafd-hostcache  pinned host RAM prefix snapshots (unchanged)
+  cuteafd-engine     model-agnostic serve runtime: scheduler, lanes, prefix cache, memory,
                  speculative transaction framework, console state
-  afd-api        OpenAI chat + completions, constraints, tools, images, console
-  afd-families/  deepseek_v41, deepseek_v4, glm_dsa, glm_next, mimo_v2, qwen4_exp
+  cuteafd-api        OpenAI chat + completions, constraints, tools, images, console
+  cuteafd-families/  deepseek_v41, deepseek_v4, glm_dsa, glm_next, mimo_v2, qwen4_exp
                  each: spec reader, block execution, attention variants, speculator wiring,
                  chat template + tool parser + grammar generator
-  afd-spec/      speculators: nextn_mtp, dspark, dflash2
-  afd-daemon     CLI: serve, expertd, plan, inspect, doctor, bench-*
+  cuteafd-spec/      speculators: nextn_mtp, dspark, dflash2
+  cuteafd-daemon     CLI: serve, expertd, plan, inspect, doctor, bench-*
 native/
   shared/        norm, sampling_gpu, embedding, router/route_reduce, expert_pack, peer_copy,
                  kv, engram/mapped tables, verbs, xgrammar adapter
@@ -199,13 +199,13 @@ any new model work. Concrete recipe:
    `tune_mtp_*`, legacy sparse-lm-head tuners). Native `ds4_*_aot.cu`,
    `mla_indexing.cu`, `packed_fp8_mla_exact.cu` stay for Phase 1.
    Build must pass after this step.
-4. Rename: crates `ds41rt-*` → `afd-*`, binary `cuteafd`, native lib
+4. Rename: every `ds41rt` token → `cuteafd` (crates `cuteafd-*`, binary `cuteafd`, native lib
    `libcuteafd_native`, symbol prefix `cuteafd_`, env/config prefix
    `CUTEAFD_`, image names `cuteafd-{coordinator,spark-expert}`, build
-   cache `~/.cache/cuteafd/builds`. Mechanical, one commit.
+   cache `~/.cache/cuteafd/builds`). Mechanical, one commit.
 5. Restructure: `native/{shared,families/deepseek_v41,families/deepseek_v4}`;
-   `v41_*` daemon modules → `afd-families/deepseek_v41`; carve
-   `afd-engine` (scheduler, lanes, prefix, memory, speculative transaction,
+   `v41_*` daemon modules → `cuteafd-families/deepseek_v41`; carve
+   `cuteafd-engine` (scheduler, lanes, prefix, memory, speculative transaction,
    console state) out of `v41_native_serve` behind the traits in
    Architecture. Do this incrementally with V4.1 serving between steps.
 6. Generalize: `cuteafd.config` takes MODEL (hf id or path), REVISION,

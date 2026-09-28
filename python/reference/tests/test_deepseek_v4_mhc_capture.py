@@ -1,5 +1,5 @@
 import pytest
-from ds41rt_reference.deepseek_v4_mhc_capture import (
+from cuteafd_reference.deepseek_v4_mhc_capture import (
     capture_deepseek_v4_mhc_entry,
     capture_deepseek_v4_mhc_post_pre,
     capture_deepseek_v4_mhc_terminal,

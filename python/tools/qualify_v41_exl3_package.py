@@ -21,11 +21,11 @@ def main() -> None:
     args = parser.parse_args()
     manifest = verify(args.package, runtime=args.runtime)
     assert 'torch' not in sys.modules and 'b12x' not in sys.modules
-    with tempfile.TemporaryDirectory(prefix='ds41rt-exl3-relocation-') as temporary:
+    with tempfile.TemporaryDirectory(prefix='cuteafd-exl3-relocation-') as temporary:
         relocated = Path(temporary) / 'lib' / 'exl3'
         shutil.copytree(args.package, relocated)
         verify(relocated, manifest['sparkinfer_revision'], args.runtime, manifest['role'])
-        libraries = [relocated / v['directory'] / 'libds41rt_exl3.so' for v in manifest['variants']]
+        libraries = [relocated / v['directory'] / 'libcuteafd_exl3.so' for v in manifest['variants']]
         probe = subprocess.run([str(args.probe.resolve()), *map(str, libraries)],
                                check=True, text=True, capture_output=True)
         for variant, library in zip(manifest['variants'], libraries):

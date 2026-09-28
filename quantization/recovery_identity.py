@@ -18,10 +18,10 @@ def resolve_identity(manifest):
     recovery = manifest.get("recovery")
     if recovery is None:
         return manifest, None
-    if recovery.get("schema") == "ds41rt-continuous-search-recovery-v1":
+    if recovery.get("schema") == "cuteafd-continuous-search-recovery-v1":
         root = Path(manifest["run_root"])
         previous = json.loads(_bounded(recovery["previous_manifest"], root, 1024 * 1024))
-        if previous.get("recovery", {}).get("schema") != "ds41rt-input-serializer-recovery-v1":
+        if previous.get("recovery", {}).get("schema") != "cuteafd-input-serializer-recovery-v1":
             raise ValueError("continuous search recovery requires the prior serializer execution")
         original, previous_evidence = resolve_identity(previous)
         normalized = copy.deepcopy(manifest)
@@ -46,7 +46,7 @@ def resolve_identity(manifest):
             raise ValueError("search recovery lacks exact six-device qualification")
         return original, dict(schema=recovery["schema"], execution_manifest=manifest,
             previous_evidence=previous_evidence, search_report_sha256=recovery["search_report_sha256"])
-    if recovery.get("schema") != "ds41rt-input-serializer-recovery-v1":
+    if recovery.get("schema") != "cuteafd-input-serializer-recovery-v1":
         raise ValueError("unsupported recovery authorization")
     root = Path(manifest["run_root"])
     original = json.loads(_bounded(recovery["original_manifest"], root, 1024 * 1024))
@@ -81,7 +81,7 @@ def resolve_identity(manifest):
 def authorize_input_recovery(driver, evidence):
     if evidence is None:
         return
-    if evidence["schema"] == "ds41rt-continuous-search-recovery-v1":
+    if evidence["schema"] == "cuteafd-continuous-search-recovery-v1":
         previous_key = "recovery/input-serializer-release-v1"
         if driver._load(previous_key, "recovery") != evidence["previous_evidence"]:
             raise ValueError("search recovery differs from committed prior execution")

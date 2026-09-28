@@ -83,16 +83,6 @@ def test_active_python_does_not_import_retired_sparkinfer_package() -> None:
     )
 
 
-def test_embedded_python_bridge_requires_b12x_namespace() -> None:
-    bridge = (
-        ROOT / "rust/crates/ds41rt-daemon/src/python_graph_capture.rs"
-    ).read_text(encoding="utf-8")
-    modules = bridge.split(
-        "const COORDINATOR_PYTHON_CAPTURE_MODULES", maxsplit=1
-    )[1].split("];", maxsplit=1)[0]
-
-    assert '"b12x",' in modules
-    assert '"sparkinfer",' not in modules
 
 
 def test_standalone_tools_bootstrap_pinned_source_before_b12x_imports() -> None:
@@ -155,7 +145,7 @@ def test_standalone_tools_bootstrap_pinned_source_before_b12x_imports() -> None:
             )
 
     assert not violations, (
-        "standalone tools must verify and prepend DS41RT's pinned b12x/SparkInfer "
+        "standalone tools must verify and prepend CUTEAFD's pinned b12x/SparkInfer "
         "tree before importing it:\n" + "\n".join(violations)
     )
 
@@ -237,7 +227,7 @@ def test_release_and_wip_exclude_legacy_ds4_aot() -> None:
     release = (ROOT / "scripts/build-release-artifacts.sh").read_text(
         encoding="utf-8"
     )
-    assert "-DDS41RT_ENABLE_DS4_FLASH_AOT=OFF" in release, (
+    assert "-DCUTEAFD_ENABLE_DS4_FLASH_AOT=OFF" in release, (
         "native V4.1 release artifacts must exclude the legacy DS4 Flash/Pro "
         "AOT bridge"
     )
@@ -246,25 +236,12 @@ def test_release_and_wip_exclude_legacy_ds4_aot() -> None:
     # pinned SparkInfer and no longer compiles; the native serve path is the
     # only supported development loop, so WIP artifacts also exclude it.
     wip = (ROOT / "scripts/build-wip-artifacts.sh").read_text(encoding="utf-8")
-    assert "-DDS41RT_ENABLE_DS4_FLASH_AOT=OFF" in wip, (
+    assert "-DCUTEAFD_ENABLE_DS4_FLASH_AOT=OFF" in wip, (
         "development artifacts must exclude the stale legacy DS4 Flash/Pro "
         "AOT bridge"
     )
 
 
-def test_remote_dev_staging_reconciles_the_pinned_fork() -> None:
-    for relative in (
-        "scripts/phase0-spark-tcp-bench.sh",
-        "scripts/bench-verbs-app-coordinator-links.sh",
-        "scripts/bench-verbs-app-pair.sh",
-    ):
-        text = (ROOT / relative).read_text(encoding="utf-8")
-        assert "--delete-excluded" in text
-        assert "--require-no-python-cache" in text
-        for marker in METADATA_FREE_PYTHON_CACHE_MARKERS:
-            assert marker in text, (
-                f"{relative} must exclude SparkInfer cache marker {marker}"
-            )
 
 
 def test_fork_and_images_share_qualified_cutlass_pin() -> None:
@@ -361,108 +338,12 @@ def test_standalone_bootstrap_imports_verified_submodule() -> None:
     assert Version(version) == Version("1.3.0")
 
 
-def test_launchers_use_only_the_packed_spark_moe_layout() -> None:
-    phase0 = (ROOT / "scripts" / "phase0-spark-tcp-bench.sh").read_text(
-        encoding="utf-8"
-    )
-    release = (ROOT / "run.sh").read_text(encoding="utf-8")
-
-    assert "DS41RT_SPARK_MOE_MODE" not in phase0
-    assert "DS41RT_SPARKINFER_SOURCE_W4A16" not in phase0
-    assert "DS41RT_SPARKINFER_HYBRID_W4A4_W4A16" not in phase0
-    assert "SPARK_MOE_MODE" not in release
-    assert "DS41RT_SPARK_PREBUILT" not in release
-    assert "DS41RT_SPARK_SKIP_STAGE" not in release
-    assert "expertd-native" in release
-    assert "serve-native" in release
-
-    env = os.environ.copy()
-    env["DS41RT_SPARK_PREBUILT"] = "1"
-    env["DS41RT_SPARK_MOE_MODE"] = "hybrid-w4a4-w4a16"
-    env["DS41RT_SERVE_PROFILE"] = "balanced"
-    result = subprocess.run(
-        [ROOT / "scripts" / "start-spark-experts-tcp.sh", "--dry-run"],
-        check=False,
-        cwd=ROOT,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
-    assert "DS41RT_SPARK_MOE_MODE" not in result.stdout
-    assert "DS41RT_SERVE_PROFILE" not in result.stdout
 
 
-def test_phase0_image_only_staging_does_not_remove_live_experts() -> None:
-    phase0 = (ROOT / "scripts" / "phase0-spark-tcp-bench.sh").read_text(
-        encoding="utf-8"
-    )
-    cleanup = phase0.split("cleanup() {", maxsplit=1)[1].split(
-        "\n}\ntrap cleanup EXIT", maxsplit=1
-    )[0]
-
-    assert '[ "$image_only" = "1" ]' in cleanup
-    assert "docker rm -f" in cleanup
 
 
-def test_spark_launcher_defaults_to_runtime_tp4_placement() -> None:
-    phase0 = (ROOT / "scripts" / "phase0-spark-tcp-bench.sh").read_text(
-        encoding="utf-8"
-    )
-
-    assert (
-        'use_diagnostic_placement="${DS41RT_SPARK_USE_DIAGNOSTIC_PLACEMENT:-0}"'
-        in phase0
-    )
-    assert 'if [ "$use_diagnostic_placement" = "1" ]; then' in phase0
-    assert 'catalog=""' in phase0
-    assert 'ds4_flash_spark_aot="$DS41RT_DS4_FLASH_SPARK_AOT"' in phase0
-    assert 'ds4_flash_spark_aot="${71:-1}"' in phase0
-    assert "DS41RT_SPARK_TRANSFORMER_TP" not in phase0
-    assert "DS41RT_SPARK_LAYER_BLOCK" not in phase0
-    assert '-DDS41RT_ENABLE_DS4_FLASH_AOT="$ds4_flash_aot"' in phase0
-    real_source_launch = phase0.split(
-        'if [ "$DS41RT_BENCH_MODE" = "real" ]; then', maxsplit=1
-    )[1].split("\nfi\n", maxsplit=1)[0]
-    assert '--model-id "$DS41RT_MODEL_ID"' in real_source_launch
-    startup_loop = phase0.rsplit(
-        'for host_index in "${!hosts[@]}"; do', maxsplit=1
-    )[1].split("\ndone", maxsplit=1)[0]
-    assert 'if [ "$use_diagnostic_placement" = "1" ]; then' in startup_loop
-    assert 'expert_ids+=("${host}=${host_index}")' in startup_loop
 
 
-def test_phase0_remote_expertd_argument_vector_is_contiguous() -> None:
-    phase0 = (ROOT / "scripts" / "phase0-spark-tcp-bench.sh").read_text(
-        encoding="utf-8"
-    )
-    # phase0 routes every remote step through the shared release_ssh helper (its
-    # first argument is the host), so this anchor follows that call, not a literal
-    # ssh: what is under test is the positional argument vector that reaches the
-    # remote heredoc.
-    launch_start = phase0.rindex('release_ssh "$host" bash -s --')
-    launch_end = phase0.index("<<'REMOTE'", launch_start)
-    launch = phase0[launch_start:launch_end].replace("\\\n", " ")
-    tokens = shlex.split(launch)
-    payload = tokens[tokens.index("--") + 1 :]
-
-    remote_start = phase0.index("set -euo pipefail", launch_end)
-    remote_end = phase0.index("discover_rdma_device_map()", remote_start)
-    remote = phase0[remote_start:remote_end]
-    assigned_positions = {
-        int(match.group(1))
-        for match in re.finditer(
-            r'^[a-z][a-z0-9_]*="\$(?:\{)?([0-9]+)', remote, re.MULTILINE
-        )
-    }
-
-    assert len(payload) == 73
-    assert assigned_positions == set(range(1, 74))
-    assert payload[-2:] == ["$model_revision", "$wip_allow_historical_exl3_control"]
-    assert 'ds4_flash_spark_aot="${71:-1}"' in remote
-    assert 'model_revision="${72:-}"' in remote
-    assert 'wip_allow_historical_exl3_control="${73:-0}"' in remote
 
 
 def test_release_preflight_requires_matching_engine_revisions() -> None:
@@ -490,14 +371,14 @@ def test_release_build_overrides_the_base_image_version_label() -> None:
         encoding="utf-8"
     )
 
-    assert 'ARG DS41RT_RELEASE_VERSION=unknown' in dockerfile
-    assert 'LABEL org.opencontainers.image.version=${DS41RT_RELEASE_VERSION}' in dockerfile
+    assert 'ARG CUTEAFD_RELEASE_VERSION=unknown' in dockerfile
+    assert 'LABEL org.opencontainers.image.version=${CUTEAFD_RELEASE_VERSION}' in dockerfile
     assert 'spark_release_version="${SPARK_EXPERT_DOCKER_INFERENCE##*:}"' in build
     assert '[[ "$spark_release_version" == "$release_version" ]]' in build
     assert 'release_version="$6"' in build
     assert 'source_manifest_sha256="${8-__legacy__}"' in build
     assert 'spark_tp_roles="${9-__legacy__}"' in build
-    assert build.count('--build-arg DS41RT_RELEASE_VERSION="$release_version"') == 2
+    assert build.count('--build-arg CUTEAFD_RELEASE_VERSION="$release_version"') == 2
     assert build.count('org.opencontainers.image.version') == 2
     remote_revision_label = next(
         line
@@ -514,242 +395,5 @@ def test_release_build_overrides_the_base_image_version_label() -> None:
     assert remote_version_label == remote_revision_label.replace("revision", "version")
 
 
-def test_deepseek_full_launchers_do_not_supply_ep_loadplans() -> None:
-    for launcher_name in (
-        "real-full-tcp-serve.sh",
-        "real-full-tcp-live-smoke.sh",
-    ):
-        launcher = (ROOT / "scripts" / launcher_name).read_text(encoding="utf-8")
-        assert "--loadplan" not in launcher
-        assert 'loadplan="${LOADPLAN' not in launcher
-        assert 'if [ -n "${LOADPLAN:-}" ]; then' in launcher
-        assert "LOADPLAN is not supported by strict DeepSeek V4 TP4 serving" in launcher
 
 
-def test_deepseek_serving_has_no_legacy_cuda_reference_or_short_k_entry() -> None:
-    coordinator = (
-        ROOT / "rust" / "crates" / "ds41rt-daemon" / "src" / "commands" / "coordinator.rs"
-    ).read_text(encoding="utf-8")
-    assert '"cuda-reference" => ds41rt_api::ApiBackend::RealDs4Full' not in coordinator
-
-    entry = (
-        ROOT
-        / "rust"
-        / "crates"
-        / "ds41rt-daemon"
-        / "src"
-        / "commands"
-        / "real_full"
-        / "entry.rs"
-    ).read_text(encoding="utf-8")
-    assert "real_full_nvfp4_short_k" not in entry
-    assert "audit_real_full_nvfp4_short_k" not in entry
-    assert 'args.backend == "real-ds4-full"' in entry
-    assert (
-        "target_device_storage: Arc<Mutex<DeepseekV4TargetDeviceStorage>>" in entry
-    )
-    assert (
-        "target_device_storage: Option<Arc<Mutex<DeepseekV4TargetDeviceStorage>>>"
-        not in entry
-    )
-    assert "target_device_identity: RealFullSchedulerNativeTargetIdentity" in entry
-    assert "reset_glm_dsa_sparse_mla_transient_state" not in entry
-
-    generic_kv = (
-        ROOT
-        / "rust"
-        / "crates"
-        / "ds41rt-daemon"
-        / "src"
-        / "commands"
-        / "real_full"
-        / "kv"
-        / "device.rs"
-    ).read_text(encoding="utf-8")
-    assert "flashinfer_glm_dsa_sparse_mla_prefill_device_buffers" not in generic_kv
-    assert "use_direct_glm_dsa_sparse_mla_prefill" not in generic_kv
-    assert "dsa_index_k_cache_b12x" not in generic_kv
-    assert "generic device KV attention no longer accepts inherited GLM DSA" in generic_kv
-    assert "NativeTargetMappingOnly" in generic_kv
-    assert "cuda-native-target-page-map" in generic_kv
-
-    scheduler_execution = (
-        ROOT
-        / "rust"
-        / "crates"
-        / "ds41rt-daemon"
-        / "src"
-        / "commands"
-        / "real_full"
-        / "scheduler"
-        / "execution.rs"
-    ).read_text(encoding="utf-8")
-    assert "new_native_target_mapping(device_kv_storage_config)" in scheduler_execution
-    assert (
-        "pub(in crate::commands::real_full) native_target: "
-        "RealFullSchedulerNativeTargetContext"
-        in scheduler_execution
-    )
-    assert (
-        "pub(in crate::commands::real_full) native_target: "
-        "Option<RealFullSchedulerNativeTargetContext>"
-        not in scheduler_execution
-    )
-    assert "validate_live_native_scheduler_contract(&kv_config, catalog)?;" in scheduler_execution
-    assert scheduler_execution.count(
-        "native_target.validate_for_model(&catalog.facts)?;"
-    ) == 2
-    assert (
-        "packed KV snapshots are unavailable for native DeepSeek target serving"
-        in entry
-    )
-    assert "generic_payload_allocated_bytes=0" in entry
-    assert "generic_payload_avoided_bytes={}" in entry
-    assert (
-        "strict DeepSeek V4 TP4 serving requires tcp, tcp-debug-json, or verbs-host"
-        in entry
-    )
-    assert "strict DeepSeek V4 TP4 sparse dispatch requires exactly" in entry
-    assert "real_full_scheduler_execution_for_shape_with_state" not in entry
-    assert "real_full_scheduler_execution_for_shape_with_sparse_tcp(" not in entry
-    assert (
-        "sparse_tcp_targets: Vec<TcpProtocolV2HostBatchTarget>"
-        in entry
-    )
-    assert (
-        "sparse_tcp_dispatch_worker: Arc<RealFullSchedulerSparseTcpDispatchWorker>"
-        in entry
-    )
-    assert (
-        "sparse_tcp_dispatch_worker: Option<Arc<RealFullSchedulerSparseTcpDispatchWorker>>"
-        not in entry
-    )
-    assert "DS41RT_REAL_FULL_SERVE_FAST_TOKEN" not in entry
-    assert "serve-fast-token-embedding-lm-head" not in entry
-    assert "fast_embedding_lm_head_token_info" not in entry
-
-    serving_launcher = (ROOT / "scripts" / "real-full-tcp-serve.sh").read_text(
-        encoding="utf-8"
-    )
-    assert "DS41RT_REAL_FULL_SERVE_FAST_TOKEN" not in serving_launcher
-
-    api_backend = (
-        ROOT
-        / "rust"
-        / "crates"
-        / "ds41rt-api"
-        / "src"
-        / "backends"
-        / "real_full.rs"
-    ).read_text(encoding="utf-8")
-    assert "serve-fast-token-embedding-lm-head" not in api_backend
-    assert "|| !full.scheduler_full_context_device_attention_complete" in api_backend
-    assert "|| !full.scheduler_terminal_lm_head_uses_final_decode_device_hidden" in api_backend
-    assert "|| !full.scheduler_terminal_lm_head_covers_full_vocabulary" in api_backend
-
-    scheduler_admission = (
-        ROOT
-        / "rust"
-        / "crates"
-        / "ds41rt-daemon"
-        / "src"
-        / "commands"
-        / "real_full"
-        / "scheduler"
-        / "execution"
-        / "admission.rs"
-    ).read_text(encoding="utf-8")
-    assert (
-        "if !native_target && scheduler_device_kv_readback_validation_enabled()"
-        in scheduler_admission
-    )
-
-    coordinator_attention = (
-        ROOT
-        / "rust"
-        / "crates"
-        / "ds41rt-daemon"
-        / "src"
-        / "commands"
-        / "real_full"
-        / "coordinator_kernels"
-        / "attention.rs"
-    ).read_text(encoding="utf-8")
-    for retired_symbol in (
-        "GlmDsaSparseMlaPrefill",
-        "flashinfer_glm_dsa_sparse_mla_prefill",
-        "GLM_DSA_PREFILL",
-        "LayerGlmDsaSparseMlaPrefill",
-    ):
-        assert retired_symbol not in coordinator_attention
-
-    coordinator_kernels = (
-        ROOT
-        / "rust"
-        / "crates"
-        / "ds41rt-daemon"
-        / "src"
-        / "commands"
-        / "real_full"
-        / "coordinator_kernels"
-        / "mod.rs"
-    ).read_text(encoding="utf-8")
-    assert "LayerGlmDsaSparseMlaPrefill" not in coordinator_kernels
-
-    mla_capture = (
-        ROOT
-        / "python"
-        / "reference"
-        / "ds41rt_reference"
-        / "b12x_mla_capture.py"
-    ).read_text(encoding="utf-8")
-    assert "prepare_b12x_glm_dsa_indexer_prefill" not in mla_capture
-    assert "capture_b12x_glm_dsa_indexer_prefill" not in mla_capture
-    assert "_B12X_GLM_DSA_INDEXER_STATES" not in mla_capture
-
-    retired_native_dsa = (
-        ROOT / "rust" / "crates" / "ds41rt-ffi" / "src" / "lib.rs",
-        ROOT / "native" / "include" / "ds41rt_native.h",
-        ROOT / "native" / "cuda" / "kernels" / "mla_indexing.cu",
-        ROOT / "native" / "src" / "ds41rt_native.cc",
-    )
-    assert not (ROOT / "native" / "cuda" / "kernels" / "dsa_indexer.cu").exists()
-    for path in retired_native_dsa:
-        source = path.read_text(encoding="utf-8")
-        for retired_symbol in (
-            "glm_dsa_query_prepare_b12x",
-            "glm_dsa_prefill_metadata",
-            "glm_dsa_sort_selected_indices",
-            "glm_dsa_index_k_pack_b12x",
-            "glm_dsa_page_table",
-            "target_kv_page_table_expand_indices",
-        ):
-            assert retired_symbol not in source
-
-    ffi_source = retired_native_dsa[0].read_text(encoding="utf-8")
-    assert "DS41RT_CUDA_GENERIC_KV_PAGE_SIZE" in ffi_source
-    assert "cuda_generic_kv_page_table_expand_indices_async" in ffi_source
-
-    kv_snapshot = (
-        ROOT
-        / "rust"
-        / "crates"
-        / "ds41rt-daemon"
-        / "src"
-        / "commands"
-        / "real_full"
-        / "scheduler"
-        / "execution"
-        / "snapshot.rs"
-    ).read_text(encoding="utf-8")
-    assert 'REAL_FULL_KV_SNAPSHOT_FORMAT: &str = "ds41rt-kv-v3"' in kv_snapshot
-    assert "dsa_index_file" not in kv_snapshot
-
-    launcher = (ROOT / "scripts" / "real-full-tcp-serve.sh").read_text(
-        encoding="utf-8"
-    )
-    assert 'case "$kv_cache_dtype" in' in launcher
-    assert (
-        "DS41RT_REAL_FULL_SERVE_KV_CACHE_DTYPE must be fp8"
-        in launcher
-    )

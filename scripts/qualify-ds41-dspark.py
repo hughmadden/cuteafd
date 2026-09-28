@@ -59,25 +59,25 @@ def main():
             assert status == 0, (name, status)
         return checked, fn
 
-    router, raw_router = bind('ds41rt_v41_router', [P,P,P,P,P,P,P,P,I,I,P])
-    hc_mixes, raw_hc_mixes = bind('ds41rt_v41_hc_mixes', [P,P,P,P,P,P,P,I,P])
-    hc_pre, raw_hc_pre = bind('ds41rt_v41_hc_pre', [P,P,P,I,P])
-    hc_post, raw_hc_post = bind('ds41rt_v41_hc_post', [P,P,P,P,P,I,P])
-    confidence, raw_confidence = bind('ds41rt_v41_dspark_confidence', [P,P,P,P,I,P])
-    create, _ = bind('ds41rt_v41_markov_create', [P,C.c_uint64,C.POINTER(P)])
-    destroy, _ = bind('ds41rt_v41_markov_destroy', [P])
-    create_head, _ = bind('ds41rt_v41_vocabulary_head_create', [P,C.c_uint64,C.POINTER(P)])
-    head_projection, _ = bind('ds41rt_v41_vocabulary_head_launch', [P,P,P,P,I,P])
-    norm, _ = bind('ds41rt_cuda_ds4_rmsnorm_bf16_rne_async', [P,P,P,I,I,C.c_float,P])
-    markov, raw_markov = bind('ds41rt_v41_markov_launch', [P,P,P,P,I,P])
-    sample, raw_sample = bind('ds41rt_v41_draft_step_rng', [P,P,P,P,P,P,I,I,P])
-    gather, _ = bind('ds41rt_cuda_embedding_lookup_bf16_async', [P,P,P,Z,Z,Z,P])
+    router, raw_router = bind('cuteafd_v41_router', [P,P,P,P,P,P,P,P,I,I,P])
+    hc_mixes, raw_hc_mixes = bind('cuteafd_v41_hc_mixes', [P,P,P,P,P,P,P,I,P])
+    hc_pre, raw_hc_pre = bind('cuteafd_v41_hc_pre', [P,P,P,I,P])
+    hc_post, raw_hc_post = bind('cuteafd_v41_hc_post', [P,P,P,P,P,I,P])
+    confidence, raw_confidence = bind('cuteafd_v41_dspark_confidence', [P,P,P,P,I,P])
+    create, _ = bind('cuteafd_v41_markov_create', [P,C.c_uint64,C.POINTER(P)])
+    destroy, _ = bind('cuteafd_v41_markov_destroy', [P])
+    create_head, _ = bind('cuteafd_v41_vocabulary_head_create', [P,C.c_uint64,C.POINTER(P)])
+    head_projection, _ = bind('cuteafd_v41_vocabulary_head_launch', [P,P,P,P,I,P])
+    norm, _ = bind('cuteafd_cuda_ds4_rmsnorm_bf16_rne_async', [P,P,P,I,I,C.c_float,P])
+    markov, raw_markov = bind('cuteafd_v41_markov_launch', [P,P,P,P,I,P])
+    sample, raw_sample = bind('cuteafd_v41_draft_step_rng', [P,P,P,P,P,P,I,I,P])
+    gather, _ = bind('cuteafd_cuda_embedding_lookup_bf16_async', [P,P,P,Z,Z,Z,P])
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     results = []
     for device in map(int, args.devices.split(',')):
         torch.cuda.set_device(device)
-        initialize = getattr(lib, 'ds41rt_v41_router_initialize', None)
+        initialize = getattr(lib, 'cuteafd_v41_router_initialize', None)
         if initialize is not None:
             initialize.restype = I
             assert initialize() == 0

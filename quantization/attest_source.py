@@ -48,7 +48,7 @@ def attest(snapshot, output, workers=4):
             print(json.dumps(dict(event="source_file_hashed", name=name, **record)), flush=True)
     if records["model.safetensors.index.json"]["sha256"] != hashlib.sha256(index_bytes).hexdigest():
         raise ValueError("checkpoint index changed during source attestation")
-    core = dict(schema="ds41rt-v41-source-attestation-v1", source_snapshot=snapshot.name,
+    core = dict(schema="cuteafd-v41-source-attestation-v1", source_snapshot=snapshot.name,
                 tensor_count=len(index["weight_map"]), shard_count=len(shards), files=records)
     encoded = json.dumps(core, sort_keys=True, separators=(",", ":")).encode()
     result = {**core, "manifest_sha256": hashlib.sha256(encoded).hexdigest(), "status": "passed"}

@@ -25,7 +25,7 @@ A disposable x86-64 capability check (no model load):
 ```bash
 docker run --rm --network none \
   --security-opt "seccomp=$PWD/docker/seccomp-io-uring.json" \
-  --entrypoint python3 ds41rt-coordinator-dev:latest -c '
+  --entrypoint python3 cuteafd-coordinator-dev:latest -c '
 import ctypes, os
 libc = ctypes.CDLL(None, use_errno=True)
 params = ctypes.create_string_buffer(120)

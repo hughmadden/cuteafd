@@ -62,7 +62,7 @@ def recover(manifest, commit):
         raise ValueError('downloaded attributes differ from committed blob')
     recovery = state / 'hub-json-lfs-recovery-v1'
     recovery.mkdir(exist_ok=True)
-    _publish_json(recovery / 'authorization.json', dict(schema='ds41rt-hub-json-lfs-recovery-v1',
+    _publish_json(recovery / 'authorization.json', dict(schema='cuteafd-hub-json-lfs-recovery-v1',
         commit=commit, repo_id=repo, original_attributes=original.decode(),
         committed_attributes=attributes.decode(), unchanged_files=len(actual)-1,
         original_upload_attributes=prepared['.gitattributes']))
@@ -93,7 +93,7 @@ def recover(manifest, commit):
     validation = validate_export(output, recovery, Path(manifest['snapshot']))
     _publish_json(recovery / 'structure-validation.json', validation)
     prepared['.gitattributes'] = dict(local=_fingerprint(target), bytes=len(attributes), blob=blob)
-    receipt = dict(schema='ds41rt-upload-receipt-v1', status='uploaded', repo_id=repo,
+    receipt = dict(schema='cuteafd-upload-receipt-v1', status='uploaded', repo_id=repo,
                    commit=commit, files=prepared)
     _publish_json(state / 'upload-complete.json', receipt)
     cached = materialize_cache(output, manifest['publication']['cache_root'], receipt)

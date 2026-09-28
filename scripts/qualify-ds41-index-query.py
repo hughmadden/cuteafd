@@ -42,14 +42,14 @@ def main():
         def checked(*a):
             status=fn(*a);assert status==0,(name,status)
         return checked,fn
-    info,_=bind('ds41rt_v41_fp8_matrix_info',[I,I,I,P]);init,_=bind('ds41rt_v41_fp8_matrix_initialize',[I,I,I,P])
-    pack,_=bind('ds41rt_v41_fp8_matrix_pack_scales',[P,P,I,I,P])
-    scratch_init,_=bind('ds41rt_v41_fp8_initialize_scratch',[P,P,C.c_uint64,P,P])
-    launch,_=bind('ds41rt_v41_fp8_launch',[P,P,P,P,P,C.c_uint64,P,P,I,P])
-    create,_=bind('ds41rt_v41_compressor_create',[P,C.c_uint64,P]);destroy,_=bind('ds41rt_v41_compressor_destroy',[P])
-    heads,_=bind('ds41rt_v41_index_weights_project',[P,P,P,P,I,P])
-    prepare,prepare_raw=bind('ds41rt_v41_index_query_prepare',[P,P,P,P,P,P,I,P])
-    freq,_=bind('ds41rt_v41_backbone_frequencies',[P,P,I,I,P])
+    info,_=bind('cuteafd_v41_fp8_matrix_info',[I,I,I,P]);init,_=bind('cuteafd_v41_fp8_matrix_initialize',[I,I,I,P])
+    pack,_=bind('cuteafd_v41_fp8_matrix_pack_scales',[P,P,I,I,P])
+    scratch_init,_=bind('cuteafd_v41_fp8_initialize_scratch',[P,P,C.c_uint64,P,P])
+    launch,_=bind('cuteafd_v41_fp8_launch',[P,P,P,P,P,C.c_uint64,P,P,I,P])
+    create,_=bind('cuteafd_v41_compressor_create',[P,C.c_uint64,P]);destroy,_=bind('cuteafd_v41_compressor_destroy',[P])
+    heads,_=bind('cuteafd_v41_index_weights_project',[P,P,P,P,I,P])
+    prepare,prepare_raw=bind('cuteafd_v41_index_query_prepare',[P,P,P,P,P,P,I,P])
+    freq,_=bind('cuteafd_v41_backbone_frequencies',[P,P,I,I,P])
     index=json.loads((args.snapshot/'model.safetensors.index.json').read_text())['weight_map'];headers={};payloads={}
     def weight(name,dtype):
         path=args.snapshot/index[name]

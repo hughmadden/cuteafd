@@ -38,7 +38,7 @@ def run(snapshot, mixed_fixture=None):
         ids = torch.randint(adapter.embed.weight.shape[0], (1, 131))
         states.append(adapter.prepare_joint(features, ids, positions=torch.tensor([1, 7, 127, 129])))
     del adapter
-    with tempfile.TemporaryDirectory(prefix="ds41rt-parallel-probe-") as directory:
+    with tempfile.TemporaryDirectory(prefix="cuteafd-parallel-probe-") as directory:
         journal = RunStore(directory, {"diagnostic": "two-rtx-native-activation-v1"})
         try:
             driver = BlockDriver(source, journal, {"diagnostic": "two-rtx-native-activation-v1"}, device="cuda:0")

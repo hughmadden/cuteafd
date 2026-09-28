@@ -29,7 +29,7 @@ def _load_v41_exl3_family():
     """Import the shared pure family module by sibling path (works under spec loads)."""
     import importlib.util
     import sys
-    name = 'ds41rt_v41_exl3_family'
+    name = 'cuteafd_v41_exl3_family'
     if existing := sys.modules.get(name):
         return existing
     path = Path(__file__).resolve().with_name('v41_exl3_family.py')
@@ -392,18 +392,18 @@ def main() -> None:
         ownership=descriptor[-experts*2:]
     binding=bind_mixed_trellis(*prepared.tiers,prepared.global_to_combined,descriptor,prepared.rotations,launch,
         gate_experts=prepared.gate_counts,up_experts=prepared.up_counts)
-    lib=ct.CDLL(str(args.aot/'libds41rt_exl3.so'))
+    lib=ct.CDLL(str(args.aot/'libcuteafd_exl3.so'))
     info_verified=False
-    if hasattr(lib,'ds41rt_exl3_info'):
-        lib.ds41rt_exl3_info.argtypes=[ct.POINTER(ct.c_uint32),ct.c_uint32]
-        lib.ds41rt_exl3_info.restype=ct.c_int
+    if hasattr(lib,'cuteafd_exl3_info'):
+        lib.cuteafd_exl3_info.argtypes=[ct.POINTER(ct.c_uint32),ct.c_uint32]
+        lib.cuteafd_exl3_info.restype=ct.c_int
         if paired is not None:
-            assert lib.ds41rt_exl3_info((ct.c_uint32*16)(),16)!=0
-            query=lib.ds41rt_exl3_paired_info
+            assert lib.cuteafd_exl3_info((ct.c_uint32*16)(),16)!=0
+            query=lib.cuteafd_exl3_paired_info
             query.argtypes=[ct.POINTER(ct.c_uint32),ct.c_uint32];query.restype=ct.c_int
             count=18
         else:
-            query=lib.ds41rt_exl3_info;count=16
+            query=lib.cuteafd_exl3_info;count=16
         native_info=(ct.c_uint32*count)()
         assert query(native_info,count)==0
         expected_info=[3 if paired else 2,hidden,width,experts,capacity,topk,2,
@@ -412,12 +412,12 @@ def main() -> None:
         if paired: expected_info += [1 if paired=='first' else 2,4]
         assert list(native_info)==expected_info
         info_verified=True
-    lib.ds41rt_exl3_create.argtypes=[ct.POINTER(ct.c_void_p)];lib.ds41rt_exl3_create.restype=ct.c_int
-    lib.ds41rt_exl3_destroy.argtypes=[ct.c_void_p]
+    lib.cuteafd_exl3_create.argtypes=[ct.POINTER(ct.c_void_p)];lib.cuteafd_exl3_create.restype=ct.c_int
+    lib.cuteafd_exl3_destroy.argtypes=[ct.c_void_p]
     for role in ['core','sum']:
-        fn=getattr(lib,'ds41rt_exl3_'+role)
+        fn=getattr(lib,'cuteafd_exl3_'+role)
         fn.argtypes=[ct.c_void_p,ct.POINTER(ct.c_void_p),ct.POINTER(ct.c_int32),ct.c_void_p];fn.restype=ct.c_int
-    context=ct.c_void_p();assert lib.ds41rt_exl3_create(ct.byref(context))==0
+    context=ct.c_void_p();assert lib.cuteafd_exl3_create(ct.byref(context))==0
     torch.manual_seed(4105)
     x=torch.randn(capacity,hidden,device='cuda',dtype=torch.bfloat16)
     ids=(torch.arange(capacity*topk,device='cuda',dtype=torch.int32).reshape(capacity,topk) % experts)
@@ -442,27 +442,27 @@ def main() -> None:
         assert hashlib.sha256(route_path.read_bytes()).hexdigest()==meta['route_preparation']['sha256']
         route_meta=json.loads(route_path.read_text())
         route_lib=ct.CDLL(str(route_path.parent/'libv41_exl3_routes.so'))
-        route_lib.ds41rt_exl3_routes_create.argtypes=[ct.POINTER(ct.c_void_p)]
-        route_lib.ds41rt_exl3_routes_create.restype=ct.c_int
-        route_lib.ds41rt_exl3_routes_destroy.argtypes=[ct.c_void_p]
-        route_lib.ds41rt_exl3_routes_destroy.restype=ct.c_int
-        route_lib.ds41rt_exl3_routes_launch.argtypes=[ct.c_void_p,ct.POINTER(ct.c_void_p),ct.POINTER(ct.c_uint64),ct.c_int32,ct.c_void_p]
-        route_lib.ds41rt_exl3_routes_launch.restype=ct.c_int
+        route_lib.cuteafd_exl3_routes_create.argtypes=[ct.POINTER(ct.c_void_p)]
+        route_lib.cuteafd_exl3_routes_create.restype=ct.c_int
+        route_lib.cuteafd_exl3_routes_destroy.argtypes=[ct.c_void_p]
+        route_lib.cuteafd_exl3_routes_destroy.restype=ct.c_int
+        route_lib.cuteafd_exl3_routes_launch.argtypes=[ct.c_void_p,ct.POINTER(ct.c_void_p),ct.POINTER(ct.c_uint64),ct.c_int32,ct.c_void_p]
+        route_lib.cuteafd_exl3_routes_launch.restype=ct.c_int
         route_tensors=dict(topk_ids=ids,expert_map=binding.global_to_combined,
             **{name:getattr(buffers,name) for name in list(route_meta['buffers'])[2:]})
         route_p=(ct.c_void_p*7)(*[t.data_ptr() for t in route_tensors.values()])
         route_bytes=(ct.c_uint64*7)(*[t.numel()*t.element_size() for t in route_tensors.values()])
-        assert route_lib.ds41rt_exl3_routes_create(ct.byref(route_context))==0
+        assert route_lib.cuteafd_exl3_routes_create(ct.byref(route_context))==0
     def native(rows):
         scalars['active_m']=rows
         if route_lib is not None:
-            assert route_lib.ds41rt_exl3_routes_launch(route_context,route_p,route_bytes,rows,
+            assert route_lib.cuteafd_exl3_routes_launch(route_context,route_p,route_bytes,rows,
                 ct.c_void_p(torch.cuda.current_stream().cuda_stream))==0
         for entry in meta['objects']:
             role=entry['label'].rsplit('_',1)[1]
             p=(ct.c_void_p*len(entry['pointer_slots']))(*(pointers[n].data_ptr() for n in entry['pointer_slots']))
             s=(ct.c_int32*len(entry['scalar_slots']))(*(scalars[n] for n in entry['scalar_slots']))
-            status=getattr(lib,'ds41rt_exl3_'+role)(context,p,s,ct.c_void_p(torch.cuda.current_stream().cuda_stream))
+            status=getattr(lib,'cuteafd_exl3_'+role)(context,p,s,ct.c_void_p(torch.cuda.current_stream().cuda_stream))
             assert status==0,(role,status)
     def poison_metadata():
         if route_lib is not None:
@@ -617,15 +617,15 @@ def main() -> None:
             'snapshot_revision':args.snapshot.name,
             'projection_tiers':[[bitmaps[e,p] for p in ['w1','w3','w2']] for e in range(experts)],
             'aot_manifest_sha256':hashlib.sha256((args.aot/'v41_exl3.json').read_bytes()).hexdigest(),
-            'bridge_sha256':hashlib.sha256((args.aot/'libds41rt_exl3.so').read_bytes()).hexdigest(),
+            'bridge_sha256':hashlib.sha256((args.aot/'libcuteafd_exl3.so').read_bytes()).hexdigest(),
             'checks':results,'graph_changed_inputs_and_routes':True,
             'packed_metadata_poisoned_before_native':route_lib is not None},indent=2)+'\n')
         print(args.output.read_text(),flush=True)
     finally:
         torch.cuda.synchronize()
         if graph is not None: del graph
-        if route_lib is not None: assert route_lib.ds41rt_exl3_routes_destroy(route_context)==0
-        lib.ds41rt_exl3_destroy(context)
+        if route_lib is not None: assert route_lib.cuteafd_exl3_routes_destroy(route_context)==0
+        lib.cuteafd_exl3_destroy(context)
 
 
 if __name__=='__main__': main()

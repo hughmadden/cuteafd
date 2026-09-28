@@ -50,9 +50,9 @@ assert C.sizeof(View) == 120
 libs = [C.CDLL(args.baseline), C.CDLL(args.candidate)]
 launches = []
 for i, lib in enumerate(libs):
-    assert lib.ds41rt_v41_sparse_attention_initialize() == 0
+    assert lib.cuteafd_v41_sparse_attention_initialize() == 0
     split = args.split_parts is not None and (i == 1 or args.baseline_split)
-    fn = lib.ds41rt_v41_sparse_attention_split if split else lib.ds41rt_v41_sparse_attention
+    fn = lib.cuteafd_v41_sparse_attention_split if split else lib.cuteafd_v41_sparse_attention
     fn.argtypes = [C.c_void_p] * 5 + [C.c_int32, C.c_int32, C.POINTER(View), C.c_void_p]
     if split:
         fn.argtypes += [C.c_void_p, C.c_uint64, C.c_int32]

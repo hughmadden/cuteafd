@@ -565,6 +565,126 @@ dependencies = [
 ]
 
 [[package]]
+name = "cuteafd-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "axum",
+ "base64 0.22.1",
+ "cuteafd-core",
+ "cuteafd-loader",
+ "deepseek-recipe",
+ "deepseek-recipe-core",
+ "deepseek-recipe-encoding",
+ "futures",
+ "jsonschema",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "ureq",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "cuteafd-core"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "cuteafd-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bincode",
+ "bytes",
+ "clap",
+ "cuteafd-api",
+ "cuteafd-core",
+ "cuteafd-ffi",
+ "cuteafd-hostcache",
+ "cuteafd-loader",
+ "cuteafd-transport",
+ "io-uring",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "cuteafd-ffi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cuteafd-core",
+ "libloading",
+]
+
+[[package]]
+name = "cuteafd-hostcache"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "criterion",
+ "cuteafd-core",
+ "proptest",
+ "serde",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
+name = "cuteafd-loader"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cuteafd-core",
+ "image",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokenizers",
+ "tracing",
+ "turbojpeg",
+]
+
+[[package]]
+name = "cuteafd-transport"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "cuteafd-core",
+ "cuteafd-ffi",
+ "futures",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "daachorse"
 version = "3.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -739,126 +859,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.5",
-]
-
-[[package]]
-name = "ds41rt-api"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "axum",
- "base64 0.22.1",
- "deepseek-recipe",
- "deepseek-recipe-core",
- "deepseek-recipe-encoding",
- "ds41rt-core",
- "ds41rt-loader",
- "futures",
- "jsonschema",
- "percent-encoding",
- "serde",
- "serde_json",
- "tokio",
- "tower",
- "tracing",
- "ureq",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "ds41rt-core"
-version = "0.1.0"
-dependencies = [
- "libc",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "ds41rt-daemon"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "bincode",
- "bytes",
- "clap",
- "ds41rt-api",
- "ds41rt-core",
- "ds41rt-ffi",
- "ds41rt-hostcache",
- "ds41rt-loader",
- "ds41rt-transport",
- "io-uring",
- "libc",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "ds41rt-ffi"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ds41rt-core",
- "libloading",
-]
-
-[[package]]
-name = "ds41rt-hostcache"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "criterion",
- "ds41rt-core",
- "proptest",
- "serde",
- "thiserror 1.0.69",
- "tracing",
-]
-
-[[package]]
-name = "ds41rt-loader"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ds41rt-core",
- "image",
- "libc",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 1.0.69",
- "tokenizers",
- "tracing",
- "turbojpeg",
-]
-
-[[package]]
-name = "ds41rt-transport"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "ds41rt-core",
- "ds41rt-ffi",
- "futures",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
 ]
 
 [[package]]

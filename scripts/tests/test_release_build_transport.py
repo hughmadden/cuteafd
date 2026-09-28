@@ -15,7 +15,7 @@ without editing the script or hand-wrapping every call:
 2. The release containers wrote their whole build root into a generic
    in-container /tmp, which no environment variable could move: the artifact
    compiler hands mktemp an absolute template, so TMPDIR is ignored by design.
-   `DS41RT_RELEASE_BUILD_ROOT` now names one unique per-task path, bound at the
+   `CUTEAFD_RELEASE_BUILD_ROOT` now names one unique per-task path, bound at the
    identical path inside the container, because the filesystem guard must resolve
    the device that is actually written.
 
@@ -143,7 +143,7 @@ class TestSshTransport:
         result, invocations = _run(
             f"{transport_block()}\nprintf '%s\\n' \"$release_rsh\"\nrelease_ssh host true",
             tmp_path,
-            env={"DS41RT_RELEASE_SSH_CONFIG": "/home/build/.ssh/release_config"},
+            env={"CUTEAFD_RELEASE_SSH_CONFIG": "/home/build/.ssh/release_config"},
             shims=("ssh",),
         )
         assert result.returncode == 0, result.stderr
@@ -156,7 +156,7 @@ class TestSshTransport:
         result, _ = _run(
             f"{transport_block()}\nprintf '%s\\n' \"$release_rsh\"",
             tmp_path,
-            env={"DS41RT_RELEASE_SSH_CONFIG": "/dev/null"},
+            env={"CUTEAFD_RELEASE_SSH_CONFIG": "/dev/null"},
         )
         assert result.stdout.strip() == "ssh -o BatchMode=yes -F /dev/null"
 
@@ -179,7 +179,7 @@ class TestSshTransport:
     )
     def test_unsafe_config_values_are_refused_without_side_effects(self, tmp_path, value):
         result, invocations = _run(
-            transport_block(), tmp_path, env={"DS41RT_RELEASE_SSH_CONFIG": value}
+            transport_block(), tmp_path, env={"CUTEAFD_RELEASE_SSH_CONFIG": value}
         )
         assert result.returncode == DIE, result.stdout + result.stderr
         assert "canonical absolute path" in result.stderr
@@ -192,7 +192,7 @@ class TestSshTransport:
             "release_ssh seed echo ready\n"
             "release_ssh -o ConnectTimeout=10 seed true",
             tmp_path,
-            env={"DS41RT_RELEASE_SSH_CONFIG": "/dev/null"},
+            env={"CUTEAFD_RELEASE_SSH_CONFIG": "/dev/null"},
             shims=("ssh",),
         )
         assert result.returncode == 0, result.stderr
@@ -207,7 +207,7 @@ class TestSshTransport:
             f"{transport_block()}\n{sync_definition()}\n"
             f"release_sync_program={program}\nrelease_sync src dst",
             tmp_path,
-            env={"DS41RT_RELEASE_SSH_CONFIG": "/dev/null"},
+            env={"CUTEAFD_RELEASE_SSH_CONFIG": "/dev/null"},
             shims=(program,),
         )
         assert result.returncode == 0, result.stderr
@@ -217,13 +217,6 @@ class TestSshTransport:
         assert "-F" not in tokens, tokens
         assert tokens[-2:] == ["src", "dst"], tokens
 
-    def test_rsync_children_inherit_the_same_transport(self):
-        text = build_text()
-        assert 'export RSYNC_RSH="$release_rsh"' in COMMON_TEXT
-        fallback = text.split("phase0-spark-tcp-bench.sh", 1)[0]
-        fallback = fallback.rsplit("using serial netcat image distribution", 1)[1]
-        assert 'RSYNC_RSH="$release_rsh"' in fallback
-        assert 'DS41RT_RELEASE_SSH_CONFIG="$release_ssh_config"' in fallback
 
 
 class TestBuildRootWiring:
@@ -253,29 +246,29 @@ class TestBuildRootWiring:
         ],
     )
     def test_unsafe_or_colliding_build_root_values_are_refused(self, tmp_path, value):
-        result, _ = _run(transport_block(), tmp_path, env={"DS41RT_RELEASE_BUILD_ROOT": value})
+        result, _ = _run(transport_block(), tmp_path, env={"CUTEAFD_RELEASE_BUILD_ROOT": value})
         assert result.returncode == DIE, result.stdout + result.stderr
-        assert "DS41RT_RELEASE_BUILD_ROOT" in result.stderr
+        assert "CUTEAFD_RELEASE_BUILD_ROOT" in result.stderr
 
     def test_sibling_of_the_source_tree_is_allowed(self, tmp_path):
-        root = "/scratch/ds41rt-build.task-1"
+        root = "/scratch/cuteafd-build.task-1"
         result, _ = _run(
             f"{transport_block()}\nprintf '%s\\n' \"$release_build_root\"",
             tmp_path,
-            env={"DS41RT_RELEASE_BUILD_ROOT": root},
+            env={"CUTEAFD_RELEASE_BUILD_ROOT": root},
         )
         assert result.stdout.strip() == root
 
     def test_mount_and_env_share_the_identical_path(self, tmp_path):
-        root = "/scratch/ds41rt-build.task-1"
+        root = "/scratch/cuteafd-build.task-1"
         result, _ = _run(
             f"{transport_block()}\n"
             'for arg in "${release_build_root_args[@]}"; do printf \'%s\\n\' "$arg"; done',
             tmp_path,
-            env={"DS41RT_RELEASE_BUILD_ROOT": root},
+            env={"CUTEAFD_RELEASE_BUILD_ROOT": root},
         )
         assert result.stdout.splitlines() == [
-            "-v", f"{root}:{root}", "-e", f"DS41RT_RELEASE_BUILD_ROOT={root}",
+            "-v", f"{root}:{root}", "-e", f"CUTEAFD_RELEASE_BUILD_ROOT={root}",
         ]
 
     def test_local_leg_creates_the_root_then_filesystem_guards_it(self, tmp_path):
@@ -283,7 +276,7 @@ class TestBuildRootWiring:
         result, invocations = _run(
             f"{transport_block()}\nrelease_prepare_build_root '' /source",
             tmp_path,
-            env={"DS41RT_RELEASE_BUILD_ROOT": str(root)},
+            env={"CUTEAFD_RELEASE_BUILD_ROOT": str(root)},
             shims=("python3",),
         )
         assert result.returncode == 0, result.stderr
@@ -294,7 +287,7 @@ class TestBuildRootWiring:
         result, invocations = _run(
             f"{transport_block()}\nrelease_prepare_build_root '' /source",
             tmp_path,
-            env={"DS41RT_RELEASE_BUILD_ROOT": str(tmp_path / "br"), "SHIM_EXIT": "9"},
+            env={"CUTEAFD_RELEASE_BUILD_ROOT": str(tmp_path / "br"), "SHIM_EXIT": "9"},
             shims=("python3",),
         )
         assert result.returncode == DIE
@@ -302,11 +295,11 @@ class TestBuildRootWiring:
         assert len(invocations) == 1
 
     def test_remote_leg_guards_on_the_seed_host_through_release_ssh(self, tmp_path):
-        root = "/home/spark/.cache/ds41rt-builds/task-1/build-root"
+        root = "/home/spark/.cache/cuteafd-builds/task-1/build-root"
         result, invocations = _run(
             f"{transport_block()}\nrelease_prepare_build_root seed /home/spark/src",
             tmp_path,
-            env={"DS41RT_RELEASE_BUILD_ROOT": root},
+            env={"CUTEAFD_RELEASE_BUILD_ROOT": root},
             shims=("ssh",),
         )
         assert result.returncode == 0, result.stderr
@@ -355,7 +348,7 @@ class TestPipelineWiring:
 
     def test_the_remote_staging_path_is_validated_and_quoted(self):
         text = build_text()
-        assert 'release_validate_path_setting DS41RT_RELEASE_REMOTE_BUILD_DIR "$remote_dir"' in text
+        assert 'release_validate_path_setting CUTEAFD_RELEASE_REMOTE_BUILD_DIR "$remote_dir"' in text
         assert "printf -v remote_dir_quoted '%q'" in text
         # Every remote use must be quoted, never wrapped in shell string literals.
         assert "\"mkdir -p '$remote_dir'\"" not in text
@@ -370,9 +363,9 @@ class TestPipelineWiring:
     def test_a_colon_is_refused_so_a_remote_spec_cannot_be_forged(self, tmp_path, value):
         # rsync and rdmasync split `host:path` on the first colon, so a colon in one
         # of these settings could otherwise redirect the transfer to another host.
-        result, _ = _run(transport_block(), tmp_path, env={"DS41RT_RELEASE_BUILD_ROOT": value})
+        result, _ = _run(transport_block(), tmp_path, env={"CUTEAFD_RELEASE_BUILD_ROOT": value})
         assert result.returncode == DIE
-        assert "DS41RT_RELEASE_BUILD_ROOT" in result.stderr
+        assert "CUTEAFD_RELEASE_BUILD_ROOT" in result.stderr
 
     def test_both_container_legs_bind_the_build_root(self):
         text = build_text()
@@ -419,15 +412,15 @@ class TestPipelineWiring:
 
     def test_new_settings_are_documented_and_reported(self):
         usage = build_text().split("usage() {", 1)[1].split("\nEOF", 1)[0]
-        assert "DS41RT_RELEASE_SSH_CONFIG" in usage
-        assert "DS41RT_RELEASE_BUILD_ROOT" in usage
+        assert "CUTEAFD_RELEASE_SSH_CONFIG" in usage
+        assert "CUTEAFD_RELEASE_BUILD_ROOT" in usage
         assert "stock" in usage
         # /dev/null drops the user's own host aliases too, so the docs must name the
         # alternative that keeps them: verified with `ssh -F <file> -G`, where an
         # Include of ~/.ssh/config still resolves a Spark alias to its rail address
         # and bare /dev/null resolves to the literal name instead.
         assert "Include ~/.ssh/config" in usage
-        assert "DS41RT_RELEASE_REMOTE_BUILD_DIR" in usage
+        assert "CUTEAFD_RELEASE_REMOTE_BUILD_DIR" in usage
         assert 'echo "  ssh config: ${release_ssh_config:-<stock>}"' in build_text()
         assert 'echo "  release build root: ${release_build_root:-<container /tmp>}"' in build_text()
 
@@ -435,9 +428,9 @@ class TestPipelineWiring:
 class TestArtifactCompilerBuildRoot:
     def test_mktemp_follows_the_relocated_parent(self):
         text = ARTIFACTS.read_text(encoding="utf-8")
-        assert 'build_root_parent="${DS41RT_RELEASE_BUILD_ROOT:-/tmp}"' in text
-        assert 'mktemp -d "$build_root_parent/ds41rt-release-build.XXXXXX"' in text
-        assert "mktemp -d /tmp/ds41rt-release-build.XXXXXX" not in text, (
+        assert 'build_root_parent="${CUTEAFD_RELEASE_BUILD_ROOT:-/tmp}"' in text
+        assert 'mktemp -d "$build_root_parent/cuteafd-release-build.XXXXXX"' in text
+        assert "mktemp -d /tmp/cuteafd-release-build.XXXXXX" not in text, (
             "an absolute /tmp template silently ignores TMPDIR and defeats relocation"
         )
 

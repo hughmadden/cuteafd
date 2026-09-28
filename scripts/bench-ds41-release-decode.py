@@ -112,7 +112,7 @@ DSPARK_EVIDENCE = {
     'usage_block_counters': False,
     'stats_endpoint_counters': False,
     'requires_runtime_log_debug_pass': True,
-    'debug_pass_env': "RUST_LOG='info,ds41rt::timing=debug,ds41rt::cost_model=debug'",
+    'debug_pass_env': "RUST_LOG='info,cuteafd::timing=debug,cuteafd::cost_model=debug'",
     'debug_pass_perturbs_timing': True,
     'debug_pass_is_performance_evidence': False,
     'adaptive_gate_may_suppress_drafts': True,

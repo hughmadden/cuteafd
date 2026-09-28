@@ -34,34 +34,34 @@ def test_abi_struct_layout_is_unchanged() -> None:
 
 def test_symbol_prefix_selects_new_spark_families() -> None:
     module = _load()
-    assert module.expert_symbol_prefix() == "ds41rt_v41_expert_"
-    assert module.expert_symbol_prefix(local=True) == "ds41rt_v41_local_expert_"
-    assert module.expert_symbol_prefix(tp2=True) == "ds41rt_v41_tp2_expert_"
-    assert module.expert_symbol_prefix(spark_tp=2) == "ds41rt_v41_spark_tp2_expert_"
-    assert module.expert_symbol_prefix(spark_tp=3) == "ds41rt_v41_spark_tp3_expert_"
-    assert module.expert_symbol_prefix(spark_tp=6) == "ds41rt_v41_spark_tp6_expert_"
+    assert module.expert_symbol_prefix() == "cuteafd_v41_expert_"
+    assert module.expert_symbol_prefix(local=True) == "cuteafd_v41_local_expert_"
+    assert module.expert_symbol_prefix(tp2=True) == "cuteafd_v41_tp2_expert_"
+    assert module.expert_symbol_prefix(spark_tp=2) == "cuteafd_v41_spark_tp2_expert_"
+    assert module.expert_symbol_prefix(spark_tp=3) == "cuteafd_v41_spark_tp3_expert_"
+    assert module.expert_symbol_prefix(spark_tp=6) == "cuteafd_v41_spark_tp6_expert_"
     assert module.SPARK_TP_PREFIX == {
-        2: "ds41rt_v41_spark_tp2_expert_",
-        3: "ds41rt_v41_spark_tp3_expert_",
-        6: "ds41rt_v41_spark_tp6_expert_",
+        2: "cuteafd_v41_spark_tp2_expert_",
+        3: "cuteafd_v41_spark_tp3_expert_",
+        6: "cuteafd_v41_spark_tp6_expert_",
     }
 
 
 def test_only_launch_abi_symbols_are_namespaced() -> None:
     module = _load()
-    prefix = "ds41rt_v41_spark_tp2_expert_"
-    assert module.namespaced_symbol("ds41rt_v41_expert_launch", prefix) == \
-        "ds41rt_v41_spark_tp2_expert_launch"
-    assert module.namespaced_symbol("ds41rt_v41_expert_info", prefix) == \
-        "ds41rt_v41_spark_tp2_expert_info"
+    prefix = "cuteafd_v41_spark_tp2_expert_"
+    assert module.namespaced_symbol("cuteafd_v41_expert_launch", prefix) == \
+        "cuteafd_v41_spark_tp2_expert_launch"
+    assert module.namespaced_symbol("cuteafd_v41_expert_info", prefix) == \
+        "cuteafd_v41_spark_tp2_expert_info"
     # The packer size query and the packer are canonical for every family.
-    assert module.namespaced_symbol("ds41rt_v41_expert_packed_sizes", prefix) == \
-        "ds41rt_v41_expert_packed_sizes"
-    assert module.namespaced_symbol("ds41rt_v41_pack_expert_async", prefix) == \
-        "ds41rt_v41_pack_expert_async"
+    assert module.namespaced_symbol("cuteafd_v41_expert_packed_sizes", prefix) == \
+        "cuteafd_v41_expert_packed_sizes"
+    assert module.namespaced_symbol("cuteafd_v41_pack_expert_async", prefix) == \
+        "cuteafd_v41_pack_expert_async"
     # The canonical prefix is an identity mapping.
-    assert module.namespaced_symbol("ds41rt_v41_expert_launch",
-                                    "ds41rt_v41_expert_") == "ds41rt_v41_expert_launch"
+    assert module.namespaced_symbol("cuteafd_v41_expert_launch",
+                                    "cuteafd_v41_expert_") == "cuteafd_v41_expert_launch"
 
 
 def test_symbol_families_are_mutually_exclusive() -> None:
@@ -80,5 +80,5 @@ def test_symbol_families_are_mutually_exclusive() -> None:
     for unsupported in (4, 5, 7):
         with pytest.raises(AssertionError):
             module.expert_symbol_prefix(spark_tp=unsupported)
-    assert module.expert_symbol_prefix(spark_tp=2) == "ds41rt_v41_spark_tp2_expert_"
-    assert module.expert_symbol_prefix(spark_tp=6) == "ds41rt_v41_spark_tp6_expert_"
+    assert module.expert_symbol_prefix(spark_tp=2) == "cuteafd_v41_spark_tp2_expert_"
+    assert module.expert_symbol_prefix(spark_tp=6) == "cuteafd_v41_spark_tp6_expert_"

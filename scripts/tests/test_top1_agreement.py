@@ -27,7 +27,7 @@ def test_corpus_is_frozen_diverse_and_teacher_forced():
 
 
 def test_trace_parser_uses_exact_token_ids_and_rejects_missing_fields():
-    trace = (b'2026-09-17 INFO ds41rt::top1_agreement: native prompt top-1 '
+    trace = (b'2026-09-17 INFO cuteafd::top1_agreement: native prompt top-1 '
              b'request_id=41 prompt_tokens=309 token_id=1287\n')
     assert COLLECT['parse_top1'](trace) == [dict(request_id=41, prompt_tokens=309,
         token_id=1287, line=trace.decode().strip())]

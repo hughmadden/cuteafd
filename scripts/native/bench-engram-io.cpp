@@ -133,7 +133,7 @@ int main(int argc, char** argv) { try {
         pid_t child=fork(); require(child>=0,"fork cache helper");
         if(child==0) {
             if(dup2(STDERR_FILENO,STDOUT_FILENO)<0) _exit(126);
-            execl("/usr/local/libexec/ds41rt-bench/drop-page-cache", "drop-page-cache", nullptr);
+            execl("/usr/local/libexec/cuteafd-bench/drop-page-cache", "drop-page-cache", nullptr);
             _exit(127);
         }
         int status=0; pid_t waited;

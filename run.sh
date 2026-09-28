@@ -15,7 +15,7 @@ An optional expert-group topology is selected in the configuration with
 SPARK_TP and SPARK_EP (all-or-none, native checkpoint only); at SPARK_COUNT=3
 the explicit SPARK_TP=3 SPARK_EP=1 form is one unreplicated three-rank group.
 See docs/tp-ep-configuration.md.
-Command-line values override ds41rt.config for this launch.
+Command-line values override cuteafd.config for this launch.
 
   --config FILE                 alternate complete configuration
   --listen HOST:PORT            API address (default 0.0.0.0:8000)
@@ -42,12 +42,12 @@ Command-line values override ds41rt.config for this launch.
   --dry-run                     validate without changing services
 
 Optional RDMA tuning env values are forwarded to both roles only when set:
-  DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP (local-ip=device,...),
-  DS41RT_VERBS_APP_IB_PORT_NUM, DS41RT_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES.
+  CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP (local-ip=device,...),
+  CUTEAFD_VERBS_APP_IB_PORT_NUM, CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES.
 This is how a multi-homed six-rank launch pins the rail per host.
 
 Every remote step shares one SSH option set with the release build scripts:
-  DS41RT_RELEASE_SSH_CONFIG       ssh config file to use (default empty: stock
+  CUTEAFD_RELEASE_SSH_CONFIG       ssh config file to use (default empty: stock
                                   OpenSSH resolution; BatchMode is always forced so
                                   a poll or cleanup can never wait on a prompt).
                                   /dev/null discards a broken system include but
@@ -56,7 +56,7 @@ Every remote step shares one SSH option set with the release build scripts:
 EOF
 }
 
-config="$repo_root/ds41rt.config"
+config="$repo_root/cuteafd.config"
 restart=0
 dry_run=0
 dspark_draft_limit=""
@@ -142,7 +142,7 @@ fi
 
 # Resolve the one SSH option set used by every remote step below: preflight reads,
 # expert launch, readiness polling and the EXIT cleanup. Placed after argument,
-# config and value validation so a mistyped DS41RT_RELEASE_SSH_CONFIG fails before
+# config and value validation so a mistyped CUTEAFD_RELEASE_SSH_CONFIG fails before
 # any host is contacted, and before the daemon/image checks so --dry-run and every
 # action share one answer. Stock resolution stays the default.
 release_configure_ssh_transport
@@ -278,7 +278,7 @@ fi
 
 sparkinfer_commit="$(python3 "$repo_root/scripts/verify-sparkinfer-source.py" --source "$repo_root/third_party/sparkinfer" --lock "$repo_root/third_party/sparkinfer.lock.json" --print-revision)"
 engine_commit="$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$COORDINATOR_DOCKER_INFERENCE")"
-image_sparkinfer="$(docker image inspect -f '{{index .Config.Labels "io.ds41rt.sparkinfer.revision"}}' "$COORDINATOR_DOCKER_INFERENCE")"
+image_sparkinfer="$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.sparkinfer.revision"}}' "$COORDINATOR_DOCKER_INFERENCE")"
 [[ -n "$engine_commit" && "$engine_commit" != '<no value>' ]] || release_die "coordinator image has no engine revision"
 [[ "$image_sparkinfer" == "$sparkinfer_commit" ]] || release_die "coordinator image uses another SparkInfer revision (run ./build.sh)"
 
@@ -308,7 +308,7 @@ docker info >/dev/null 2>&1 || die "the Docker daemon is unavailable"
 docker image inspect "$image" >/dev/null 2>&1 || die "inference image is missing: $image (pull or distribute it)"
 [[ "$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" == "$engine" ]] ||
   die "$image has another engine revision"
-[[ "$(docker image inspect -f '{{index .Config.Labels "io.ds41rt.sparkinfer.revision"}}' "$image")" == "$sparkinfer" ]] ||
+[[ "$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.sparkinfer.revision"}}' "$image")" == "$sparkinfer" ]] ||
   die "$image uses another SparkInfer revision"
 hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
 [[ -d "$hf_home/$snapshot_rel" ]] || die "model snapshot is missing: $snapshot_rel"
@@ -317,7 +317,7 @@ if find "$hf_home/$snapshot_rel" -xtype l -print -quit | grep -q .; then
 fi
 if [[ "$exl3" == true ]]; then
   docker run --rm --network none --entrypoint /bin/sh "$image" -c \
-    'if [ -f "/opt/ds41rt/lib/exl3/exl3-'"$exl3_family"'/manifest.json" ]; then cat "/opt/ds41rt/lib/exl3/exl3-'"$exl3_family"'/manifest.json"; else cat /opt/ds41rt/lib/exl3/manifest.json; fi'
+    'if [ -f "/opt/cuteafd/lib/exl3/exl3-'"$exl3_family"'/manifest.json" ]; then cat "/opt/cuteafd/lib/exl3/exl3-'"$exl3_family"'/manifest.json"; else cat /opt/cuteafd/lib/exl3/manifest.json; fi'
 fi
 REMOTE
 )" || release_die "Spark host preflight failed on $host (see the messages above)"
@@ -336,7 +336,7 @@ done
 
 # An explicit TP2/TP3/TP6 topology needs the matching SM121 expert role baked
 # into the Spark image. The published universal release pair advertises every
-# extra role at once (label `io.ds41rt.v41.spark_tp_roles=tp2;tp3;tp6`), so one
+# extra role at once (label `io.cuteafd.v41.spark_tp_roles=tp2;tp3;tp6`), so one
 # published image pair serves all approved topologies and this launch selects the
 # role it needs. A prebuilt legacy image carries no role label and keeps working
 # for the default TP4EP1 path; an explicit topology is refused here, before any
@@ -346,10 +346,10 @@ if [[ -n "$spark_tp_roles_required" ]]; then
   for host in "${hosts[@]}"; do
     advertised_roles="$(
       release_ssh -o ConnectTimeout=10 "$host" \
-        "docker image inspect -f '{{index .Config.Labels \"io.ds41rt.v41.spark_tp_roles\"}}' '$SPARK_EXPERT_DOCKER_INFERENCE'"
+        "docker image inspect -f '{{index .Config.Labels \"io.cuteafd.v41.spark_tp_roles\"}}' '$SPARK_EXPERT_DOCKER_INFERENCE'"
     )" || release_die "$host cannot report the role label of $SPARK_EXPERT_DOCKER_INFERENCE; is the Spark image present on that host?"
     [[ ";$advertised_roles;" == *";$spark_tp_roles_required;"* ]] ||
-      release_die "$host Spark image does not advertise required expert role $spark_tp_roles_required (advertised: ${advertised_roles:-<none>}); refusing an unbuilt TP$spark_tp topology: use the published universal release pair, or rebuild with DS41RT_RELEASE_SPARK_TP_ROLES=$spark_tp_roles_required"
+      release_die "$host Spark image does not advertise required expert role $spark_tp_roles_required (advertised: ${advertised_roles:-<none>}); refusing an unbuilt TP$spark_tp topology: use the published universal release pair, or rebuild with CUTEAFD_RELEASE_SPARK_TP_ROLES=$spark_tp_roles_required"
     [[ -n "$spark_advertised_roles" ]] || spark_advertised_roles="$advertised_roles"
   done
 fi
@@ -363,7 +363,7 @@ else
   for lane in "${lanes[@]}"; do peer_addresses+=("$lane:$EXPERT_PORT"); done
   peers="$(IFS=,; echo "${peer_addresses[*]}")"
 fi
-fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "$KV_POOL_SIZE" "$MEMORY_RESERVATION" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "$DSPARK" "$DSPARK_DRAFT_POLICY" "${dspark_draft_limit:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${DS41RT_VERBS_APP_IB_PORT_NUM:-}" "${DS41RT_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "$SPARK_DEVICE_BUDGET_BYTES" "$spark_first_layer" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "$spark_exl3_identity" "spark-topology=${spark_tp}x${spark_ep}:explicit=${topology_explicit}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
+fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "$KV_POOL_SIZE" "$MEMORY_RESERVATION" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "$DSPARK" "$DSPARK_DRAFT_POLICY" "${dspark_draft_limit:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "$SPARK_DEVICE_BUDGET_BYTES" "$spark_first_layer" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "$spark_exl3_identity" "spark-topology=${spark_tp}x${spark_ep}:explicit=${topology_explicit}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
 spark_prefix="$RELEASE_SPARK_CONTAINER_PREFIX"
 
 if ((dry_run)); then
@@ -386,9 +386,9 @@ if ((dry_run)); then
   echo "  coordinator memory reservation: ${MEMORY_RESERVATION:-runtime default}"
   echo "  prefill batch tokens: $PREFILL_BATCH_TOKENS; expert capacity: $expert_capacity"
   echo "  dSpark draft: policy=$DSPARK_DRAFT_POLICY limit=${dspark_draft_limit:-5}"
-  [[ -z "${DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" ]] || echo "  RDMA device map: $DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP"
-  [[ -z "${DS41RT_VERBS_APP_IB_PORT_NUM:-}" ]] || echo "  RDMA IB port: $DS41RT_VERBS_APP_IB_PORT_NUM"
-  [[ -z "${DS41RT_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" ]] || echo "  RDMA execution lanes: $DS41RT_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES"
+  [[ -z "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" ]] || echo "  RDMA device map: $CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP"
+  [[ -z "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" ]] || echo "  RDMA IB port: $CUTEAFD_VERBS_APP_IB_PORT_NUM"
+  [[ -z "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" ]] || echo "  RDMA execution lanes: $CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES"
   echo "  release identity: $fingerprint"
   [[ -z "$spark_exl3_identity" ]] || echo "  Spark EXL3 package: $spark_exl3_identity"
   exit 0
@@ -428,7 +428,7 @@ placement_directory=
 release_local_expert_count=""
 if [[ "$RTX_EXPERT_LAYERS" =~ ^([1-9]|[1-3][0-9])$ ]]; then release_local_expert_count="$RTX_EXPERT_LAYERS"; fi
 if ((RELEASE_RTX_GPUS == 2)) || { ((topology_explicit)) && [[ -n "$release_local_expert_count" ]]; }; then
-  placement_directory=/run/ds41rt-placement
+  placement_directory=/run/cuteafd-placement
 fi
 
 # Optional RDMA tuning values travel to both roles only when the operator sets
@@ -436,16 +436,16 @@ fi
 # default. Values were format-checked above by release_validate_verbs_device_map.
 rdma_env_args=()
 # Optional coordinator switches, forwarded only when set.
-for switch_name in DS41RT_STAGE_CHAIN DS41RT_WINDOW_BATCH DS41RT_TP2_TOKEN_SUMS DS41RT_CONSOLE_TEXT; do
+for switch_name in CUTEAFD_STAGE_CHAIN CUTEAFD_WINDOW_BATCH CUTEAFD_TP2_TOKEN_SUMS CUTEAFD_CONSOLE_TEXT; do
   [[ -z "${!switch_name:-}" ]] || rdma_env_args+=(-e "$switch_name=${!switch_name}")
 done
-for rdma_env_name in DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP DS41RT_VERBS_APP_IB_PORT_NUM DS41RT_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES; do
+for rdma_env_name in CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP CUTEAFD_VERBS_APP_IB_PORT_NUM CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES; do
   [[ -n "${!rdma_env_name:-}" ]] && rdma_env_args+=(-e "$rdma_env_name=${!rdma_env_name}")
 done
 
 start_coordinator() {
 echo "== starting native RTX coordinator =="
-local -a args=(serve-native --snapshot "/root/.cache/huggingface/$snapshot_rel" --native-lib /opt/ds41rt/lib/libds41rt_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS")
+local -a args=(serve-native --snapshot "/root/.cache/huggingface/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS")
 args+=(--http-queue-depth "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" --http-queue-wait-ms "$HTTP_QUEUE_WAIT_MS")
 [[ "$RTX_EXPERT_LAYERS" == auto ]] || args+=(--rtx-expert-layers "$RTX_EXPERT_LAYERS")
 [[ "$HOST_CACHE_BYTES" == 0 ]] || args+=(--host-cache-bytes "$HOST_CACHE_BYTES")
@@ -467,11 +467,11 @@ fi
 [[ -z "$placement_directory" ]] || args+=(--placement-directory "$placement_directory")
 docker run -d --name "$coordinator" --restart no --gpus "$gpu_request" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \
   -e "CUDA_VISIBLE_DEVICES=$gpu_uuid_csv" \
-  -e "DS41RT_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=${RUST_LOG:-info}" \
+  -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=${RUST_LOG:-info}" \
   "${rdma_env_args[@]}" \
-  -v "$hf_home:/root/.cache/huggingface:ro" "$COORDINATOR_DOCKER_INFERENCE" ds41rt "${args[@]}" >/dev/null
+  -v "$hf_home:/root/.cache/huggingface:ro" "$COORDINATOR_DOCKER_INFERENCE" cuteafd "${args[@]}" >/dev/null
 }
-deadline=$((SECONDS + ${DS41RT_RELEASE_READY_TIMEOUT_SECONDS:-900}))
+deadline=$((SECONDS + ${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}))
 if [[ -n "$placement_directory" ]]; then
   start_coordinator
   until placement_plan="$(docker exec "$coordinator" cat "$placement_directory/plan.json" 2>/dev/null)"; do
@@ -504,7 +504,7 @@ for i in "${!hosts[@]}"; do
   host="${hosts[$i]}"; remote="${spark_prefix}-${host}-${EXPERT_PORT}"
   # ssh joins its arguments into one remote command line, which drops empty
   # arguments and shifts every later position; quote each one explicitly.
-  remote_args=("$SPARK_EXPERT_DOCKER_INFERENCE" "$remote" "$i" "$expert_capacity" "$SPARK_DEVICE_BUDGET_BYTES" "$EXPERT_PORT" "$snapshot_rel" "$fingerprint" "$spark_first_layer" "$SPARK_COUNT" "$topology_explicit" "$spark_tp" "$spark_ep" "${DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${DS41RT_VERBS_APP_IB_PORT_NUM:-}" "${DS41RT_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${RUST_LOG:-info}")
+  remote_args=("$SPARK_EXPERT_DOCKER_INFERENCE" "$remote" "$i" "$expert_capacity" "$SPARK_DEVICE_BUDGET_BYTES" "$EXPERT_PORT" "$snapshot_rel" "$fingerprint" "$spark_first_layer" "$SPARK_COUNT" "$topology_explicit" "$spark_tp" "$spark_ep" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${RUST_LOG:-info}")
   release_ssh "$host" "bash -s -- $(printf '%q ' "${remote_args[@]}")" <<'REMOTE' &
 set -euo pipefail
 image="$1"; name="$2"; rank="$3"; capacity="$4"; budget="$5"; port="$6"; snapshot_rel="$7"; fingerprint="$8"; first_layer="$9"; world="${10}"
@@ -518,15 +518,15 @@ rdma_env="${14:-}"; ib_port="${15:-}"; execution_lanes="${16:-}"
 # see the caller's environment).
 rust_log="${17:-info}"
 rdma_args=()
-[[ -z "$rdma_env" ]] || rdma_args+=(-e "DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$rdma_env")
-[[ -z "$ib_port" ]] || rdma_args+=(-e "DS41RT_VERBS_APP_IB_PORT_NUM=$ib_port")
-[[ -z "$execution_lanes" ]] || rdma_args+=(-e "DS41RT_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES=$execution_lanes")
+[[ -z "$rdma_env" ]] || rdma_args+=(-e "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$rdma_env")
+[[ -z "$ib_port" ]] || rdma_args+=(-e "CUTEAFD_VERBS_APP_IB_PORT_NUM=$ib_port")
+[[ -z "$execution_lanes" ]] || rdma_args+=(-e "CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES=$execution_lanes")
 hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
 # A fixed INFO default makes the worker's structured startup evidence
 # (`rank`/`world`/`role`/`intermediate`) observable; without it EnvFilter is
 # ERROR and the readiness line never reaches the container log. This adds no
 # positional argument, so the worker argument contract is unchanged.
-docker run -d --name "$name" --restart no --gpus all --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "DS41RT_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" -v "$hf_home:/root/.cache/huggingface:ro" "$image" ds41rt expertd-native --snapshot "/root/.cache/huggingface/$snapshot_rel" --native-lib /opt/ds41rt/lib/libds41rt_native.so --rank "$rank" --world "$world" --capacity "$capacity" --device-budget-bytes "$budget" --first-layer "$first_layer" --listen "0.0.0.0:$port" "${topology_args[@]}" >/dev/null
+docker run -d --name "$name" --restart no --gpus all --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" -v "$hf_home:/root/.cache/huggingface:ro" "$image" cuteafd expertd-native --snapshot "/root/.cache/huggingface/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --rank "$rank" --world "$world" --capacity "$capacity" --device-budget-bytes "$budget" --first-layer "$first_layer" --listen "0.0.0.0:$port" "${topology_args[@]}" >/dev/null
 REMOTE
   pids+=("$!")
 done
@@ -556,7 +556,7 @@ until curl -fsS "$api_url/health" >/dev/null 2>&1 &&
   sleep 1
 done
 trap - EXIT
-echo "DS41RT native API is ready at $api_url/v1/"
+echo "CUTEAFD native API is ready at $api_url/v1/"
 echo "  API model: $RELEASE_NATIVE_API_MODEL_ID"
 echo "  checkpoint: $RELEASE_MODEL_ID@$RELEASE_MODEL_REVISION"
 echo "  RTX layout: $RELEASE_RTX_GPUS GPU(s), host indices $gpu_index_csv ($gpu_uuid_csv)"

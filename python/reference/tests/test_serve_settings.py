@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from ds41rt_reference.serve_settings import (
+from cuteafd_reference.serve_settings import (
     DEFAULT_MODEL_ID,
     EXL3_RECIPE,
     find_hf_snapshot,
@@ -31,20 +31,20 @@ def test_flash_native_defaults_are_gpu0_only(tmp_path):
     assert settings.fixed_reserve_gib == 45.0
     assert settings.kv_bytes_per_source_page == 7_437_888
     assert settings.kv_pool_tokens == 1_573_888
-    assert settings.environment["DS41RT_REAL_FULL_KV_POOL_TOKENS"] == "1573888"
+    assert settings.environment["CUTEAFD_REAL_FULL_KV_POOL_TOKENS"] == "1573888"
     assert settings.environment["CUDA_VISIBLE_DEVICES"] == "0"
     assert settings.environment["NVIDIA_VISIBLE_DEVICES"] == "0"
-    assert settings.environment["DS41RT_DSPARK_ENABLED"] == "1"
+    assert settings.environment["CUTEAFD_DSPARK_ENABLED"] == "1"
     assert settings.dspark_draft_policy == "adaptive"
-    assert "DS41RT_REAL_FULL_DSPARK_FIXED_DRAFTS" not in settings.environment
-    assert settings.environment["DS41RT_EXPERT_INTERMEDIATE_SHARDS"] == "4"
-    assert settings.environment["DS41RT_EXPERT_INTERMEDIATE_REDUCTION"] == "spark-rdma"
-    assert settings.environment["DS41RT_EXPERT_INTERMEDIATE_REDUCTION_MIN_ROWS"] == (
+    assert "CUTEAFD_REAL_FULL_DSPARK_FIXED_DRAFTS" not in settings.environment
+    assert settings.environment["CUTEAFD_EXPERT_INTERMEDIATE_SHARDS"] == "4"
+    assert settings.environment["CUTEAFD_EXPERT_INTERMEDIATE_REDUCTION"] == "spark-rdma"
+    assert settings.environment["CUTEAFD_EXPERT_INTERMEDIATE_REDUCTION_MIN_ROWS"] == (
         "16"
     )
-    assert settings.environment["DS41RT_EXPERT_INTERMEDIATE_REDUCTION_DTYPE"] == "fp8"
-    assert settings.environment["DS41RT_EXPERT_INTERMEDIATE_ROW_SHARDED_REDUCTION"] == "1"
-    assert "DS41RT_DSPARK_MODEL_ID" not in settings.environment
+    assert settings.environment["CUTEAFD_EXPERT_INTERMEDIATE_REDUCTION_DTYPE"] == "fp8"
+    assert settings.environment["CUTEAFD_EXPERT_INTERMEDIATE_ROW_SHARDED_REDUCTION"] == "1"
+    assert "CUTEAFD_DSPARK_MODEL_ID" not in settings.environment
 
 
 def test_flash_exl3_selects_versioned_trellis_recipe(tmp_path):
@@ -55,15 +55,15 @@ def test_flash_exl3_selects_versioned_trellis_recipe(tmp_path):
         coordinator_gpu_uuid=uuid,
         coordinator_gpu_pci_bus_id="00000000:11:00.0",
     )
-    assert settings.environment["DS41RT_EXL3_RECIPE"] == EXL3_RECIPE
+    assert settings.environment["CUTEAFD_EXL3_RECIPE"] == EXL3_RECIPE
     assert settings.coordinator_gpu == 0
     assert settings.coordinator_gpu_uuid == uuid
     assert settings.coordinator_gpu_pci_bus_id == "00000000:11:00.0"
     assert settings.environment["CUDA_VISIBLE_DEVICES"] == uuid
     assert settings.environment["NVIDIA_VISIBLE_DEVICES"] == uuid
-    assert settings.environment["DS41RT_COORDINATOR_GPU"] == "0"
-    assert settings.environment["DS41RT_COORDINATOR_GPU_UUID"] == uuid
-    assert settings.environment["DS41RT_COORDINATOR_GPU_PCI_BUS_ID"] == (
+    assert settings.environment["CUTEAFD_COORDINATOR_GPU"] == "0"
+    assert settings.environment["CUTEAFD_COORDINATOR_GPU_UUID"] == uuid
+    assert settings.environment["CUTEAFD_COORDINATOR_GPU_PCI_BUS_ID"] == (
         "00000000:11:00.0"
     )
 
@@ -123,7 +123,7 @@ def test_shared_kv_pool_is_memory_budgeted_not_multiplied_by_concurrency(tmp_pat
 def test_full_dspark_draft_policy_is_an_explicit_diagnostic_control(tmp_path):
     full = resolve(tmp_path, dspark_draft_policy="full")
     assert full.dspark_draft_policy == "full"
-    assert full.environment["DS41RT_REAL_FULL_DSPARK_FIXED_DRAFTS"] == "5"
+    assert full.environment["CUTEAFD_REAL_FULL_DSPARK_FIXED_DRAFTS"] == "5"
 
     with pytest.raises(ValueError, match="must be full or adaptive"):
         resolve(tmp_path, dspark_draft_policy="unknown")

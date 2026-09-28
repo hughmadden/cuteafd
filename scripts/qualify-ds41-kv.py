@@ -25,7 +25,7 @@ def main():
     nodes=[n for n in ast.parse(source.read_text()).body if isinstance(n,ast.FunctionDef) and n.name in ('apply_rotary_emb','precompute_freqs_cis')]
     ns={'torch':torch,'math':math,'lru_cache':lru_cache};exec(compile(ast.Module(body=nodes,type_ignores=[]),str(source),'exec'),ns)
     torch.cuda.set_device(a.device);torch.manual_seed(41512528)
-    lib=C.CDLL(str(a.native_lib));pack=lib.ds41rt_v41_kv_pack;store=lib.ds41rt_v41_kv_store
+    lib=C.CDLL(str(a.native_lib));pack=lib.cuteafd_v41_kv_pack;store=lib.cuteafd_v41_kv_store
     pack.argtypes=[C.c_void_p]*4+[C.c_int32,C.c_void_p];pack.restype=C.c_int32
     store.argtypes=[C.c_void_p]*5+[C.c_int32,C.c_uint64,C.c_void_p];store.restype=C.c_int32
     stream=torch.cuda.Stream();results=[]

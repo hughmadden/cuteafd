@@ -4,7 +4,7 @@
 #include <cublas_v2.h>
 #include <stdint.h>
 #include <new>
-#include "ds41rt_v41_compressor.h"
+#include "cuteafd_v41_compressor.h"
 namespace {
 constexpr uint64_t workspace_bytes=4*1024*1024;
 bool valid(const void* p,uint64_t bytes,uint64_t alignment) {
@@ -107,7 +107,7 @@ __global__ void pool_kernel(const float* kv,const float* scores,const float* pen
   }
 }
 }
-extern "C" int32_t ds41rt_v41_compressor_create(void* workspace,uint64_t bytes,void** output) {
+extern "C" int32_t cuteafd_v41_compressor_create(void* workspace,uint64_t bytes,void** output) {
   if(!output)return cudaErrorInvalidValue;
   *output=nullptr;
   if(bytes<workspace_bytes || !valid(workspace,workspace_bytes,256))return cudaErrorInvalidValue;
@@ -121,7 +121,7 @@ extern "C" int32_t ds41rt_v41_compressor_create(void* workspace,uint64_t bytes,v
   if(status!=CUBLAS_STATUS_SUCCESS){cublasDestroy(h->blas);delete h;return bs(status);}
   h->workspace=workspace;*output=h;return 0;
 }
-extern "C" int32_t ds41rt_v41_compressor_destroy(void* opaque) {
+extern "C" int32_t cuteafd_v41_compressor_destroy(void* opaque) {
   if(!opaque)return cudaErrorInvalidValue;
   auto* h=static_cast<Handle*>(opaque);auto status=cublasDestroy(h->blas);delete h;return bs(status);
 }
@@ -145,15 +145,15 @@ static int32_t project(void* opaque,const uint16_t* input,
       weight,CUDA_R_16BF,k,input,CUDA_R_16BF,k,&beta,output,ratio==2?CUDA_R_32F:CUDA_R_16BF,
       n,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
-extern "C" int32_t ds41rt_v41_compressor_project(void* handle,const uint16_t* input,
+extern "C" int32_t cuteafd_v41_compressor_project(void* handle,const uint16_t* input,
     const uint16_t* weight,void* output,int32_t rows,int32_t ratio,void* stream) {
   return project(handle,input,weight,output,rows,ratio,stream,512,5120);
 }
-extern "C" int32_t ds41rt_v41_index_key_project(void* handle,const uint16_t* input,
+extern "C" int32_t cuteafd_v41_index_key_project(void* handle,const uint16_t* input,
     const uint16_t* weight,uint16_t* output,int32_t rows,void* stream) {
   return project(handle,input,weight,output,rows,1,stream,128,512);
 }
-extern "C" int32_t ds41rt_v41_index_pack(const uint16_t* input,uint8_t* packed,
+extern "C" int32_t cuteafd_v41_index_pack(const uint16_t* input,uint8_t* packed,
     uint8_t* scales,int32_t rows,void* stream) {
   if(rows<1 || rows>131072)return cudaErrorInvalidValue;
   const uint64_t x=uint64_t(rows)*256,p=uint64_t(rows)*64,s=uint64_t(rows)*4;
@@ -164,7 +164,7 @@ extern "C" int32_t ds41rt_v41_index_pack(const uint16_t* input,uint8_t* packed,
       reinterpret_cast<const __nv_bfloat16*>(input),packed,scales,uint64_t(rows)*4);
   return cudaGetLastError();
 }
-extern "C" int32_t ds41rt_v41_index_store(const uint8_t* packed,const uint8_t* scales,
+extern "C" int32_t cuteafd_v41_index_store(const uint8_t* packed,const uint8_t* scales,
     const uint64_t* destinations,uint8_t* cache,uint8_t* cache_scales,
     int32_t rows,uint64_t capacity,void* stream) {
   if(rows<1 || rows>4096 || capacity<1 || capacity>64*1048576ull)return cudaErrorInvalidValue;
@@ -178,7 +178,7 @@ extern "C" int32_t ds41rt_v41_index_store(const uint8_t* packed,const uint8_t* s
       packed,scales,destinations,cache,cache_scales,capacity);
   return cudaGetLastError();
 }
-extern "C" int32_t ds41rt_v41_compressor_pool(const float* kv,const float* scores,
+extern "C" int32_t cuteafd_v41_compressor_pool(const float* kv,const float* scores,
     const float* pending_kv,const float* pending_scores,const uint64_t* predecessors,
     const uint16_t* norm_weight,uint16_t* output,int32_t rows,int32_t slots,void* stream) {
   if(rows<1 || rows>4096 || slots<1 || slots>16)return cudaErrorInvalidValue;
@@ -193,11 +193,11 @@ extern "C" int32_t ds41rt_v41_compressor_pool(const float* kv,const float* score
   return cudaGetLastError();
 }
 
-extern "C" int32_t ds41rt_v41_index_weights_project(void* handle,const uint16_t* input,
+extern "C" int32_t cuteafd_v41_index_weights_project(void* handle,const uint16_t* input,
     const uint16_t* weight,uint16_t* output,int32_t rows,void* stream) {
   return project(handle,input,weight,output,rows,1,stream,32,5120);
 }
-extern "C" int32_t ds41rt_v41_index_query_prepare(const uint16_t* input,const float* frequencies,
+extern "C" int32_t cuteafd_v41_index_query_prepare(const uint16_t* input,const float* frequencies,
     const uint16_t* weights,uint8_t* packed,uint8_t* scales,uint16_t* scaled_weights,int32_t rows,void* stream) {
   if(rows<1 || rows>4096)return cudaErrorInvalidValue;
   const uint64_t r=rows;

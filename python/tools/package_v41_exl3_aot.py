@@ -36,7 +36,7 @@ def residency_overrides(values: list[str], capacities: list[int], paired: bool) 
 
 def verify(package: Path, revision: str | None = None, runtime: Path | None = None, role: str | None = None) -> dict:
     manifest = json.loads((package / 'manifest.json').read_text())
-    if manifest['schema'] != 'ds41rt.exl3-package.v1':
+    if manifest['schema'] != 'cuteafd.exl3-package.v1':
         raise ValueError('unsupported EXL3 package schema')
     if revision is not None and manifest['sparkinfer_revision'] != revision:
         raise ValueError('EXL3 package/source revision mismatch')
@@ -105,7 +105,7 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
         if meta['sparkinfer_revision'] != manifest['sparkinfer_revision']:
             raise ValueError('EXL3 variant/source revision mismatch')
         required.update(f'{directory}/{name}' for name in
-                        ('v41_exl3.json', 'trellis_lut.bin', 'libds41rt_exl3.so'))
+                        ('v41_exl3.json', 'trellis_lut.bin', 'libcuteafd_exl3.so'))
         if meta['requires_route_preparation']:
             required.update(f'{directory}/routes/{name}' for name in
                             ('v41_exl3_routes.json', 'libv41_exl3_routes.so'))
@@ -177,7 +177,7 @@ def validate_destination(output: Path) -> None:
     # Symlinks are never treated as empty scaffolding, including dangling ones.
     if output.exists() and any(p.is_symlink() or not p.is_dir() for p in output.rglob('*')):
         marker = output / 'manifest.json'
-        if not marker.is_file() or json.loads(marker.read_text()).get('schema') != 'ds41rt.exl3-package.v1':
+        if not marker.is_file() or json.loads(marker.read_text()).get('schema') != 'cuteafd.exl3-package.v1':
             raise ValueError('refusing to replace a non-package directory')
 
 
@@ -338,14 +338,14 @@ def build(args: argparse.Namespace) -> None:
                 if tile is not None:
                     options['tile'] = tile
                 meta = export(raw, width, experts, capacity, tuple(args.bits), 'auto', topk, dtype, **options)
-                core = raw / 'libds41rt_exl3.so'
+                core = raw / 'libcuteafd_exl3.so'
                 subprocess.run([args.cxx, '-shared', '-fPIC', '-std=c++17',
                     f'-I{args.cuda_include}', str(raw / 'v41_exl3_bridge.cc'),
                     str(raw / 'v41_exl3_core.o'), str(raw / 'v41_exl3_sum.o'),
                     f'-L{args.cuda_libdir}', '-lcudart', f'-L{args.runtime.parent}',
                     '-lcute_dsl_runtime', '-Wl,-z,defs',
                     '-o', str(core)], check=True)
-                runtime_files = ['v41_exl3.json', 'trellis_lut.bin', 'libds41rt_exl3.so']
+                runtime_files = ['v41_exl3.json', 'trellis_lut.bin', 'libcuteafd_exl3.so']
                 if meta['requires_route_preparation']:
                     routes = raw / 'routes'
                     subprocess.run([args.cxx, '-shared', '-fPIC', '-std=c++17',
@@ -376,7 +376,7 @@ def build(args: argparse.Namespace) -> None:
                 torch.cuda.empty_cache()
         files = {str(p.relative_to(stage)): {'bytes': p.stat().st_size, 'sha256': digest(p)}
                  for p in sorted(stage.rglob('*')) if p.is_file()}
-        manifest = {'schema': 'ds41rt.exl3-package.v1', 'role': args.role,
+        manifest = {'schema': 'cuteafd.exl3-package.v1', 'role': args.role,
                     'sparkinfer_revision': _pinned_sparkinfer.REVISION,
                     'compute': [props.major, props.minor], 'sms': props.multi_processor_count,
                     'variants': variants, 'files': files,

@@ -3,7 +3,7 @@
 #include <cuda_fp8.h>
 #include <cuda_fp4.h>
 #include <stdint.h>
-#include "ds41rt_v41_kv.h"
+#include "cuteafd_v41_kv.h"
 namespace {
 bool valid(const void* p,uint64_t n,int alignment) {
   auto a=reinterpret_cast<uintptr_t>(p);return a && a%alignment==0 && a<=UINTPTR_MAX-n;
@@ -58,7 +58,7 @@ __global__ void store(const uint8_t* values,const uint8_t* scales,const uint64_t
 namespace {
 // One launch stores every window layer's accepted rows and publishes the
 // per-slot ends. Row copies match `store<false>` byte for byte.
-__global__ void store_layers(const ds41rt_v41_kv_store_layer_t* layers,int chunks) {
+__global__ void store_layers(const cuteafd_v41_kv_store_layer_t* layers,int chunks) {
   const auto layer=layers[blockIdx.y];
   const uint64_t row=blockIdx.x,dst=layer.destinations[row];const int t=threadIdx.x;
   if(dst<layer.capacity) {
@@ -69,16 +69,16 @@ __global__ void store_layers(const ds41rt_v41_kv_store_layer_t* layers,int chunk
   if(row==0 && t<chunks)layer.ends[layer.end_pairs[2*t]]=layer.end_pairs[2*t+1];
 }
 }
-extern "C" int32_t ds41rt_v41_kv_store_layers(const void* table,int32_t layers,int32_t rows,
+extern "C" int32_t cuteafd_v41_kv_store_layers(const void* table,int32_t layers,int32_t rows,
     int32_t chunks,void* stream) {
   if(!table || reinterpret_cast<uintptr_t>(table)%16 || layers<1 || layers>64 || rows<1 || rows>4096
       || chunks<1 || chunks>256)
     return cudaErrorInvalidValue;
   store_layers<<<dim3(rows,layers),256,0,reinterpret_cast<cudaStream_t>(stream)>>>(
-      reinterpret_cast<const ds41rt_v41_kv_store_layer_t*>(table),chunks);
+      reinterpret_cast<const cuteafd_v41_kv_store_layer_t*>(table),chunks);
   return cudaGetLastError();
 }
-extern "C" int32_t ds41rt_v41_kv_pack(const uint16_t* input,const float* frequencies,
+extern "C" int32_t cuteafd_v41_kv_pack(const uint16_t* input,const float* frequencies,
     uint8_t* values,uint8_t* scales,int32_t rows,void* stream) {
   if(rows<1 || rows>4096)return cudaErrorInvalidValue;
   const uint64_t r=rows,in=r*1024,out=r*512,s=r*16,f=r*256;
@@ -89,7 +89,7 @@ extern "C" int32_t ds41rt_v41_kv_pack(const uint16_t* input,const float* frequen
   pack<false><<<rows,256,0,reinterpret_cast<cudaStream_t>(stream)>>>(reinterpret_cast<const __nv_bfloat16*>(input),frequencies,values,scales);
   return cudaGetLastError();
 }
-extern "C" int32_t ds41rt_v41_kv_store(const uint8_t* values,const uint8_t* scales,
+extern "C" int32_t cuteafd_v41_kv_store(const uint8_t* values,const uint8_t* scales,
     const uint64_t* destinations,uint8_t* cache,uint8_t* cache_scales,
     int32_t rows,uint64_t capacity,void* stream) {
   if(rows<1 || rows>4096 || capacity<1 || capacity>67108864ull)return cudaErrorInvalidValue;
@@ -102,7 +102,7 @@ extern "C" int32_t ds41rt_v41_kv_store(const uint8_t* values,const uint8_t* scal
   store<false><<<rows,256,0,reinterpret_cast<cudaStream_t>(stream)>>>(values,scales,destinations,cache,cache_scales,capacity);
   return cudaGetLastError();
 }
-extern "C" int32_t ds41rt_v41_compressed_kv_pack(const uint16_t* input,const float* frequencies,
+extern "C" int32_t cuteafd_v41_compressed_kv_pack(const uint16_t* input,const float* frequencies,
     uint8_t* values,uint8_t* scales,int32_t rows,void* stream) {
   if(rows<1 || rows>4096)return cudaErrorInvalidValue;
   const uint64_t r=rows,in=r*1024,out=r*256,s=r*32,f=r*256;
@@ -113,7 +113,7 @@ extern "C" int32_t ds41rt_v41_compressed_kv_pack(const uint16_t* input,const flo
   pack<true><<<rows,256,0,reinterpret_cast<cudaStream_t>(stream)>>>(reinterpret_cast<const __nv_bfloat16*>(input),frequencies,values,scales);
   return cudaGetLastError();
 }
-extern "C" int32_t ds41rt_v41_compressed_kv_store(const uint8_t* values,const uint8_t* scales,
+extern "C" int32_t cuteafd_v41_compressed_kv_store(const uint8_t* values,const uint8_t* scales,
     const uint64_t* destinations,uint8_t* cache,uint8_t* cache_scales,
     int32_t rows,uint64_t capacity,void* stream) {
   if(rows<1 || rows>4096 || capacity<1 || capacity>67108864ull)return cudaErrorInvalidValue;

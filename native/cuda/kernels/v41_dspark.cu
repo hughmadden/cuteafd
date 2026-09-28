@@ -3,9 +3,9 @@
 #include <curand_kernel.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
-#include "ds41rt_v41_dspark.h"
+#include "cuteafd_v41_dspark.h"
 namespace {
-#if defined(DS41RT_V41_VOCAB_ROW_EXPERIMENT)
+#if defined(CUTEAFD_V41_VOCAB_ROW_EXPERIMENT)
 // Upstream's vocabulary row-reduction strategy, retaining native FP32 logits.
 // One block per vocabulary row; only selected for a single input row.
 __global__ void vocabulary_row(const __nv_bfloat16* input,
@@ -65,7 +65,7 @@ bool disjoint(const void* a, uint64_t na, const void* b, uint64_t nb) {
   return x + na <= y || y + nb <= x;
 }
 }
-extern "C" int32_t ds41rt_v41_dspark_confidence(const uint16_t* hidden,
+extern "C" int32_t cuteafd_v41_dspark_confidence(const uint16_t* hidden,
     const uint16_t* markov, const uint16_t* weight, float* output,
     int32_t rows, void* stream) {
   if (rows <= 0 || rows > 4096) return cudaErrorInvalidValue;
@@ -107,17 +107,17 @@ static int32_t create_head(void* workspace, uint64_t bytes, void** output, int w
   *output = handle;
   return 0;
 }
-extern "C" int32_t ds41rt_v41_markov_create(void* workspace, uint64_t bytes, void** output) {
+extern "C" int32_t cuteafd_v41_markov_create(void* workspace, uint64_t bytes, void** output) {
   return create_head(workspace, bytes, output, 256, 16);
 }
-extern "C" int32_t ds41rt_v41_vocabulary_head_create(void* workspace, uint64_t bytes, void** output) {
+extern "C" int32_t cuteafd_v41_vocabulary_head_create(void* workspace, uint64_t bytes, void** output) {
   return create_head(workspace, bytes, output, 5120, 128);
 }
-extern "C" int32_t ds41rt_v41_vocabulary_shard_create(void* workspace, uint64_t bytes,
+extern "C" int32_t cuteafd_v41_vocabulary_shard_create(void* workspace, uint64_t bytes,
     int32_t vocab_rows, void** output) {
   return create_head(workspace, bytes, output, 5120, 128, vocab_rows);
 }
-extern "C" int32_t ds41rt_v41_markov_destroy(void* opaque) {
+extern "C" int32_t cuteafd_v41_markov_destroy(void* opaque) {
   if (!opaque) return cudaErrorInvalidValue;
   auto* handle = static_cast<MarkovHandle*>(opaque);
   const auto status = cublasDestroy(handle->blas);
@@ -140,7 +140,7 @@ static int32_t launch_head(void* opaque, const uint16_t* embedding,
       !disjoint(handle->workspace, kMarkovWorkspace, embedding, e) ||
       !disjoint(handle->workspace, kMarkovWorkspace, weight, w) ||
       !disjoint(handle->workspace, kMarkovWorkspace, logits, o)) return cudaErrorInvalidValue;
-#if defined(DS41RT_V41_VOCAB_ROW_EXPERIMENT)
+#if defined(CUTEAFD_V41_VOCAB_ROW_EXPERIMENT)
   if (width == 5120 && rows == 1) {
     vocabulary_row<<<handle->vocab_rows, 256, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
         reinterpret_cast<const __nv_bfloat16*>(embedding),
@@ -165,11 +165,11 @@ static int32_t launch_head(void* opaque, const uint16_t* embedding,
       compute, algorithm));
 }
 
-extern "C" int32_t ds41rt_v41_markov_launch(void* handle, const uint16_t* input,
+extern "C" int32_t cuteafd_v41_markov_launch(void* handle, const uint16_t* input,
     const uint16_t* weight, float* output, int32_t rows, void* stream) {
   return launch_head(handle, input, weight, output, rows, stream, 256);
 }
-extern "C" int32_t ds41rt_v41_vocabulary_head_launch(void* handle, const uint16_t* input,
+extern "C" int32_t cuteafd_v41_vocabulary_head_launch(void* handle, const uint16_t* input,
     const uint16_t* weight, float* output, int32_t rows, void* stream) {
   return launch_head(handle, input, weight, output, rows, stream, 5120);
 }
@@ -192,7 +192,7 @@ __global__ void vocabulary_merge_greedy(const uint32_t* ids0, const float* score
   }
 }
 }
-extern "C" int32_t ds41rt_v41_vocabulary_merge_greedy(const uint32_t* ids0,
+extern "C" int32_t cuteafd_v41_vocabulary_merge_greedy(const uint32_t* ids0,
     const float* scores0, const uint32_t* ids1, const float* scores1,
     uint32_t* ids, float* scores, int32_t rows, int32_t split, void* stream) {
   if (rows < 1 || rows > 128 || split < 1 || split >= 129280) return cudaErrorInvalidValue;
@@ -290,7 +290,7 @@ __global__ void draft_step_finish(const float* shared, const float* bias,
 }
 
 }
-extern "C" int32_t ds41rt_v41_draft_step_rng(const float* shared, const float* bias,
+extern "C" int32_t cuteafd_v41_draft_step_rng(const float* shared, const float* bias,
     const uint64_t* rng, const float* temperatures, float* adjusted, uint32_t* tokens,
     int32_t rows, int32_t position, void* stream) {
   if (rows < 1 || rows > 16 || position < 0 || position > 6) return cudaErrorInvalidValue;

@@ -228,7 +228,7 @@ nvtx = [
 ]
 
 [[package]]
-name = "ds41rt-reference"
+name = "cuteafd-reference"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

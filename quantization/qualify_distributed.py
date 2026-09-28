@@ -69,7 +69,7 @@ def run(snapshot, reports, token_file, image_digest):
         identity = passed[0]["identity"]
         endpoints.append(RemoteEndpoint(host, f"http://172.22.2.{ordinal}:17841", identity["preflight_sha256"], identity["image_digest"]))
     local, slots = coordinator_identity(image_digest)
-    identity = dict(diagnostic="ds41rt-six-device-search-v1", coordinator=local)
+    identity = dict(diagnostic="cuteafd-six-device-search-v1", coordinator=local)
     source = V41Source(snapshot)
     jobs = [(f"{('layers' if i < 5 else 'mtp')}.0.ffn.experts.{i}.w{(1, 3, 2)[i % 3]}", 3 + i % 2) for i in range(10)]
     def hessian(name):
@@ -77,7 +77,7 @@ def run(snapshot, reports, token_file, image_digest):
         return dict(H=torch.eye(width, dtype=torch.float32) * 512, count=1024, finalized=False)
     token = token_file.read_bytes().strip()
     started = time.monotonic()
-    with tempfile.TemporaryDirectory(prefix="ds41rt-six-device-search-") as directory:
+    with tempfile.TemporaryDirectory(prefix="cuteafd-six-device-search-") as directory:
         first = None
         for wave in range(2):
             client = DiagnosticClient(endpoints=endpoints, coordinator_slots=slots, token=token,

@@ -53,7 +53,7 @@ def run(snapshot, device, bits=3, recover=False):
     quantized, error, tensors = quantize_exl3(weight, hessian, args, return_weight_q=True)
     if not torch.isfinite(quantized).all():
         raise AssertionError("nonfinite reconstructed projection")
-    with tempfile.TemporaryDirectory(prefix="ds41rt-packed-probe-") as directory:
+    with tempfile.TemporaryDirectory(prefix="cuteafd-packed-probe-") as directory:
         path = str(Path(directory) / "candidate.safetensors")
         save_file({key: value.cpu().contiguous() for key, value in tensors.items()}, path)
         packed = load_file(path)

@@ -2,12 +2,12 @@
 #include <cuda_bf16.h>
 #include <math_constants.h>
 #include <stdint.h>
-#include "ds41rt_v41_router.h"
-#ifdef DS41RT_HAVE_V41_ROUTER_AOT
+#include "cuteafd_v41_router.h"
+#ifdef CUTEAFD_HAVE_V41_ROUTER_AOT
 #include "v41_router_dispatch.h"
-extern "C" int32_t ds41rt_v41_router_scores_aot(const uint16_t*,const uint16_t*,float*,int32_t,int32_t,void*);
+extern "C" int32_t cuteafd_v41_router_scores_aot(const uint16_t*,const uint16_t*,float*,int32_t,int32_t,void*);
 #else
-extern "C" int32_t ds41rt_v41_router_initialize() { return 0; }
+extern "C" int32_t cuteafd_v41_router_initialize() { return 0; }
 #endif
 namespace {
 __global__ void score_kernel(const __nv_bfloat16* hidden,const __nv_bfloat16* weight,float* scores,int experts) {
@@ -150,7 +150,7 @@ bool disjoint(const void* a,uint64_t n,const void* b,uint64_t m) {
   auto x=reinterpret_cast<uintptr_t>(a),y=reinterpret_cast<uintptr_t>(b);return x+n<=y || y+m<=x;
 }
 }
-extern "C" int32_t ds41rt_v41_router(const uint16_t* hidden,const uint16_t* weight,
+extern "C" int32_t cuteafd_v41_router(const uint16_t* hidden,const uint16_t* weight,
     const float* bias,const float* bias_vl,const uint8_t* image_mask,float* scores,
     uint32_t* ids,float* routing,int32_t rows,int32_t experts,void* stream) {
   if(rows<1 || rows>4096 || (experts!=128 && experts!=384)) return cudaErrorInvalidValue;
@@ -162,12 +162,12 @@ extern "C" int32_t ds41rt_v41_router(const uint16_t* hidden,const uint16_t* weig
   for(int i=0;i<8;++i) if(n[i] && !span(p[i],n[i],i<2?2:i==4?1:4)) return cudaErrorInvalidValue;
   for(int i=5;i<8;++i) for(int j=0;j<i;++j) if(n[j] && !disjoint(p[i],n[i],p[j],n[j])) return cudaErrorInvalidValue;
   auto s=reinterpret_cast<cudaStream_t>(stream);
-#ifdef DS41RT_HAVE_V41_ROUTER_AOT
-  const int threshold=experts==384?DS41RT_V41_ROUTER_E384_MIN_ROWS:DS41RT_V41_ROUTER_E128_MIN_ROWS;
+#ifdef CUTEAFD_HAVE_V41_ROUTER_AOT
+  const int threshold=experts==384?CUTEAFD_V41_ROUTER_E384_MIN_ROWS:CUTEAFD_V41_ROUTER_E128_MIN_ROWS;
   // Preserve the original ABI's weaker alignment contract for direct callers.
   if(rows>=threshold && reinterpret_cast<uintptr_t>(hidden)%16==0 &&
       reinterpret_cast<uintptr_t>(weight)%16==0 && reinterpret_cast<uintptr_t>(scores)%16==0) {
-    auto status=ds41rt_v41_router_scores_aot(hidden,weight,scores,rows,experts,stream);
+    auto status=cuteafd_v41_router_scores_aot(hidden,weight,scores,rows,experts,stream);
     if(status)return status;
     select_fast_kernel<true><<<rows,512,0,s>>>(scores,bias,bias_vl,image_mask,ids,routing,experts,topk);
     return cudaGetLastError();
@@ -186,7 +186,7 @@ extern "C" int32_t ds41rt_v41_router(const uint16_t* hidden,const uint16_t* weig
   select_fast_kernel<false><<<rows,512,0,s>>>(scores,bias,bias_vl,image_mask,ids,routing,experts,topk);
   return cudaGetLastError();
 }
-extern "C" int32_t ds41rt_v41_router_select_logits(float* scores,const float* bias,
+extern "C" int32_t cuteafd_v41_router_select_logits(float* scores,const float* bias,
     const float* bias_vl,const uint8_t* image_mask,uint32_t* ids,float* routing,
     int32_t rows,int32_t experts,void* stream) {
   if(rows<1 || rows>4096 || (experts!=128 && experts!=384)) return cudaErrorInvalidValue;

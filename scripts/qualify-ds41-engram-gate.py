@@ -28,13 +28,13 @@ def main():
     namespace = {'torch': torch}
     exec(compile(ast.Module(body=[forward], type_ignores=[]), str(source), 'exec'), namespace)
     lib = ctypes.CDLL(str(args.library.resolve()))
-    kernel = lib.ds41rt_cuda_engram_gate_bf16_async
+    kernel = lib.cuteafd_cuda_engram_gate_bf16_async
     kernel.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int, ctypes.c_void_p]
     kernel.restype = ctypes.c_int
     torch.cuda.set_device(args.device)
     torch.manual_seed(4101)
     evidence = []
-    dequant = lib.ds41rt_cuda_engram_dequant_bf16_async
+    dequant = lib.cuteafd_cuda_engram_dequant_bf16_async
     dequant.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int, ctypes.c_void_p]
     dequant.restype = ctypes.c_int
     for hash_rows in (1, 24, 384, 1920):

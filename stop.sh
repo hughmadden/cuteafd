@@ -8,7 +8,7 @@ usage() {
   cat <<'EOF'
 Usage: ./stop.sh [--config FILE]
 
-Gracefully stops release and WIP DS41RT processes on the coordinator and every
+Gracefully stops release and WIP CUTEAFD processes on the coordinator and every
 configured Spark rank, regardless of SPARK_COUNT. Cleanup is a superset of the
 active ranks: a previous six-rank run can leave release or WIP containers on the
 fifth/sixth hosts even when the configuration currently selects a smaller
@@ -27,7 +27,7 @@ example six hosts without SPARK_TP/SPARK_EP) still stops every host it names.
 EOF
 }
 
-config="$repo_root/ds41rt.config"
+config="$repo_root/cuteafd.config"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --config)
@@ -61,7 +61,7 @@ release_need ps
 docker info >/dev/null 2>&1 ||
   release_die "local Docker daemon is unavailable"
 
-echo "== stopping DS41RT release services =="
+echo "== stopping CUTEAFD release services =="
 echo "  Spark cleanup hosts: $(release_stop_hosts | paste -sd, -)"
 failed=0
 release_stop_wip_services || failed=1
@@ -70,5 +70,5 @@ release_stop_services \
   "$RELEASE_COORDINATOR_CONTAINER_NAME" \
   "$RELEASE_SPARK_CONTAINER_PREFIX" || failed=1
 ((failed == 0)) ||
-  release_die "one or more DS41RT services or containers could not be stopped"
-echo "DS41RT release and WIP services are stopped."
+  release_die "one or more CUTEAFD services or containers could not be stopped"
+echo "CUTEAFD release and WIP services are stopped."

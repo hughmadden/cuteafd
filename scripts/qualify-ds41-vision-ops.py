@@ -34,7 +34,7 @@ def main():
     }
     functions = {}
     for name, types in signatures.items():
-        fn = getattr(lib, 'ds41rt_v41_vision_'+name)
+        fn = getattr(lib, 'cuteafd_v41_vision_'+name)
         fn.argtypes, fn.restype = types, C.c_int
         functions[name] = fn
     torch.manual_seed(841)

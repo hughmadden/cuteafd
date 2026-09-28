@@ -8,8 +8,8 @@
 #
 # Run it from a MANAGED background job (the harness job manager), not from a
 # detached `nohup`:
-#   ./scripts/release/run-release-build.sh --config ds41rt.build-v11.config \
-#     --source /home/tj/.cache/ds41rt/builds/v11-release-clone \
+#   ./scripts/release/run-release-build.sh --config cuteafd.build-v11.config \
+#     --source /home/tj/.cache/cuteafd/builds/v11-release-clone \
 #     --evidence runs/v11-release/build
 #
 # A single `git worktree` cannot host the coordinator build leg: build.sh bind
@@ -39,9 +39,9 @@ Usage: scripts/release/run-release-build.sh --config FILE --source DIR --evidenc
   --label NAME    evidence prefix (default: the release tag)
 
 Build root (root NVMe, never /mnt/scratch):
-  DS41RT_RELEASE_BUILD_ROOT         (default ~/.cache/ds41rt/builds/<tag>-build-root)
-  DS41RT_RELEASE_REMOTE_BUILD_DIR   (default ~/ds41rt-release-build-<tag>)
-  DS41RT_RELEASE_SSH_CONFIG         unset by default so ~/.ssh/config aliases resolve
+  CUTEAFD_RELEASE_BUILD_ROOT         (default ~/.cache/cuteafd/builds/<tag>-build-root)
+  CUTEAFD_RELEASE_REMOTE_BUILD_DIR   (default ~/cuteafd-release-build-<tag>)
+  CUTEAFD_RELEASE_SSH_CONFIG         unset by default so ~/.ssh/config aliases resolve
 EOF
 }
 
@@ -76,7 +76,7 @@ done
 config="$(realpath "$config")" || die "cannot canonicalize config path: $config"
 source_dir="$(realpath "$source_dir")" || die "cannot canonicalize source path: $source_dir"
 [[ -f "$config" ]] || die "build config not found after canonicalization: $config"
-[[ -f "$source_dir/build.sh" ]] || die "source directory is not a DS41RT tree (no build.sh): $source_dir"
+[[ -f "$source_dir/build.sh" ]] || die "source directory is not a CUTEAFD tree (no build.sh): $source_dir"
 
 # Resolve the release tag exactly as build.sh does.
 source "$repo_root/scripts/release-common.sh"
@@ -91,14 +91,14 @@ release_version="${COORDINATOR_DOCKER_INFERENCE##*:}"
 evidence="$(realpath -m "$evidence")" || die "cannot canonicalize evidence path: $evidence"
 mkdir -p "$evidence" || die "cannot create evidence directory: $evidence"
 
-# DS41RT_RELEASE_REMOTE_BUILD_DIR is validated by build.sh against
+# CUTEAFD_RELEASE_REMOTE_BUILD_DIR is validated by build.sh against
 # release_canonical_path: it must be an absolute path. Default it under $HOME on
 # the seed Spark rather than a bare name, or build.sh refuses to start.
-build_root="${DS41RT_RELEASE_BUILD_ROOT:-$HOME/.cache/ds41rt/builds/${release_version}-build-root}"
-remote_dir="${DS41RT_RELEASE_REMOTE_BUILD_DIR:-$HOME/ds41rt-release-build-${release_version}}"
-export DS41RT_RELEASE_BUILD_ROOT="$build_root"
-export DS41RT_RELEASE_REMOTE_BUILD_DIR="$remote_dir"
-export DS41RT_RELEASE_SPARK_TP_ROLES="$roles"
+build_root="${CUTEAFD_RELEASE_BUILD_ROOT:-$HOME/.cache/cuteafd/builds/${release_version}-build-root}"
+remote_dir="${CUTEAFD_RELEASE_REMOTE_BUILD_DIR:-$HOME/cuteafd-release-build-${release_version}}"
+export CUTEAFD_RELEASE_BUILD_ROOT="$build_root"
+export CUTEAFD_RELEASE_REMOTE_BUILD_DIR="$remote_dir"
+export CUTEAFD_RELEASE_SPARK_TP_ROLES="$roles"
 
 log="$evidence/${label}-build.log"
 rc_file="$evidence/${label}-build.rc"
@@ -166,10 +166,10 @@ fi
   echo "dependency_preflight=$preflight_note"
   echo "config=$config"
   echo "release_version=$release_version"
-  echo "DS41RT_RELEASE_SPARK_TP_ROLES=$DS41RT_RELEASE_SPARK_TP_ROLES"
-  echo "DS41RT_RELEASE_BUILD_ROOT=$DS41RT_RELEASE_BUILD_ROOT"
-  echo "DS41RT_RELEASE_REMOTE_BUILD_DIR=$DS41RT_RELEASE_REMOTE_BUILD_DIR"
-  echo "DS41RT_RELEASE_SSH_CONFIG=${DS41RT_RELEASE_SSH_CONFIG-<unset: stock OpenSSH>}"
+  echo "CUTEAFD_RELEASE_SPARK_TP_ROLES=$CUTEAFD_RELEASE_SPARK_TP_ROLES"
+  echo "CUTEAFD_RELEASE_BUILD_ROOT=$CUTEAFD_RELEASE_BUILD_ROOT"
+  echo "CUTEAFD_RELEASE_REMOTE_BUILD_DIR=$CUTEAFD_RELEASE_REMOTE_BUILD_DIR"
+  echo "CUTEAFD_RELEASE_SSH_CONFIG=${CUTEAFD_RELEASE_SSH_CONFIG-<unset: stock OpenSSH>}"
   echo "----- ./build.sh --config $config -----"
 } | tee -a "$log"
 

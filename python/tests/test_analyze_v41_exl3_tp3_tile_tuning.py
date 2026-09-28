@@ -57,7 +57,7 @@ def write_lane(temp, records, manifest=True):
         (lane / name).write_text(json.dumps(record))
     if manifest:
         (lane / 'manifest.json').write_text(json.dumps(
-            {'schema': 'ds41rt.tp3-tile-tuning-lane-v1', 'ds41rt_commit': 'c' * 40,
+            {'schema': 'cuteafd.tp3-tile-tuning-lane-v1', 'cuteafd_commit': 'c' * 40,
              'status': 'complete'}))
     return lane
 
@@ -242,7 +242,7 @@ class LaneManifestStatusTests(unittest.TestCase):
             analyzer.main([str(lane)])
             summary = json.loads((lane / 'summary.json').read_text())
             self.assertEqual(summary['lane_status'], 'aborted')
-            self.assertEqual(summary['ds41rt_commit'], 'c' * 40)   # never None on abort now
+            self.assertEqual(summary['cuteafd_commit'], 'c' * 40)   # never None on abort now
             self.assertFalse(summary['clean'])
             self.assertTrue(any('did not complete' in x and 'throttle' in x
                                 for x in summary['problems']))

@@ -25,7 +25,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("library")
     parser.add_argument("manifest")
-    parser.add_argument("--prefix", default="ds41rt_v41_nvfp4_tp2_expert")
+    parser.add_argument("--prefix", default="cuteafd_v41_nvfp4_tp2_expert")
     parser.add_argument("--rows", type=int, default=1)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--sparkinfer", type=Path, default=None)
@@ -109,7 +109,7 @@ def main():
     routes = routes.reshape(capacity, k, h)[:m]
     stream = torch.cuda.current_stream().cuda_stream
     check(k == 6 and h == 5120, "native BF16 reducer requires six 5120-wide routes")
-    reduce_routes = lib.ds41rt_v41_compact_bf16_routes_async
+    reduce_routes = lib.cuteafd_v41_compact_bf16_routes_async
     reduce_routes.argtypes = [C.c_void_p, C.c_void_p, C.c_uint32, C.c_void_p]
     reduce_routes.restype = C.c_int32
     actual = torch.empty_like(x)

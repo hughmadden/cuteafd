@@ -25,7 +25,7 @@ def main():
     assert capacities and all(value in (1, 16, 80, 256, 1024, 4096) for value in capacities)
     assert torch.cuda.device_count() >= 2
     lib = library(args.native_lib, tp2=True)
-    reduce = lib.ds41rt_v41_reduce_tp2_experts_async
+    reduce = lib.cuteafd_v41_reduce_tp2_experts_async
     reduce.argtypes = [P, P, P, C.c_uint32, C.c_uint32, P]
     torch.manual_seed(41152)
     experts, hidden, width = 8, 5120, 2304
@@ -47,7 +47,7 @@ def main():
                         value = table[name][expert]
                         axis = 1 if name == "w2" else 0
                         source.append(value.chunk(2, dim=axis)[rank].contiguous().cuda())
-                check(lib.ds41rt_v41_pack_expert_async(
+                check(lib.cuteafd_v41_pack_expert_async(
                     (P*6)(*[t.data_ptr() for t in source]),
                     (P*4)(*[t[expert].data_ptr() for t in packed]), 1152,
                     torch.cuda.current_stream().cuda_stream))

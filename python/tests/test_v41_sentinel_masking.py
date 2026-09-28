@@ -36,7 +36,7 @@ BENCH_PATH = ROOT / "python" / "tools" / "benchmark_v41_ep_groups.py"
 
 
 def _load_bench():
-    spec = importlib.util.spec_from_file_location("ds41rt_ep_bench", BENCH_PATH)
+    spec = importlib.util.spec_from_file_location("cuteafd_ep_bench", BENCH_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

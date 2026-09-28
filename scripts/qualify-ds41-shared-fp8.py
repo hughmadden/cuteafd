@@ -34,12 +34,12 @@ def main():
             status = fn(*values)
             assert status == 0,(name,status)
         return checked,fn
-    get_info,raw_info = bind('ds41rt_v41_fp8_matrix_info',[I,I,I,C.POINTER(Info)])
-    initialize,_ = bind('ds41rt_v41_fp8_matrix_initialize',[I,I,I,C.POINTER(P)])
-    init_scratch,_ = bind('ds41rt_v41_fp8_initialize_scratch',[P,P,C.c_uint64,P,P])
-    pack,raw_pack = bind('ds41rt_v41_fp8_matrix_pack_scales',[P,P,I,I,P])
-    launch,raw_launch = bind('ds41rt_v41_fp8_launch',[P,P,P,P,P,C.c_uint64,P,P,I,P])
-    swiglu,raw_swiglu = bind('ds41rt_v41_shared_swiglu',[P,P,P,I,P])
+    get_info,raw_info = bind('cuteafd_v41_fp8_matrix_info',[I,I,I,C.POINTER(Info)])
+    initialize,_ = bind('cuteafd_v41_fp8_matrix_initialize',[I,I,I,C.POINTER(P)])
+    init_scratch,_ = bind('cuteafd_v41_fp8_initialize_scratch',[P,P,C.c_uint64,P,P])
+    pack,raw_pack = bind('cuteafd_v41_fp8_matrix_pack_scales',[P,P,I,I,P])
+    launch,raw_launch = bind('cuteafd_v41_fp8_launch',[P,P,P,P,P,C.c_uint64,P,P,I,P])
+    swiglu,raw_swiglu = bind('cuteafd_v41_shared_swiglu',[P,P,P,I,P])
     stream = torch.cuda.Stream()
     evidence = []
     def ptr(t): return t.data_ptr()

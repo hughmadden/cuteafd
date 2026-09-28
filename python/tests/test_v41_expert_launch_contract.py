@@ -28,8 +28,8 @@ inline int cudaDeviceGetAttribute(int* p, int attr, int) {
 """)
             (root / "v41_local_expert_variants.h").write_text("""
 #pragma once
-#define DS41RT_V41_CC_MINOR 0
-#define DS41RT_V41_SMS 188
+#define CUTEAFD_V41_CC_MINOR 0
+#define CUTEAFD_V41_SMS 188
 static int launches=0;
 static void initialize(void**) {}
 static void load(void**) {}
@@ -37,53 +37,53 @@ static void launch(void** args, int count) {
   ++launches;
   *static_cast<int*>(args[52]) = count == 53 ? 0 : 1;
 }
-#define DS41RT_V41_VARIANTS {{2,3,384,5120,1152,1152,6,16,4096,32,32,64,64,188,1},initialize,load,launch,{0}}
+#define CUTEAFD_V41_VARIANTS {{2,3,384,5120,1152,1152,6,16,4096,32,32,64,64,188,1},initialize,load,launch,{0}}
 """)
             (root / "test.cc").write_text(f"""
-#define DS41RT_V41_LOCAL_EXPERTS 1
+#define CUTEAFD_V41_LOCAL_EXPERTS 1
 #ifdef TEST_NVFP4
-#define DS41RT_V41_NVFP4_VARIANTS_HEADER "v41_local_expert_variants.h"
+#define CUTEAFD_V41_NVFP4_VARIANTS_HEADER "v41_local_expert_variants.h"
 #endif
 #include "{ROOT / 'native/src/v41_experts.cc'}"
 #include <cassert>
-extern "C" int32_t ds41rt_v41_initialize_scratch_storage_async(
+extern "C" int32_t cuteafd_v41_initialize_scratch_storage_async(
     void*, uint64_t, uint64_t, uint64_t, uint32_t, void*) {{ return 0; }}
 int main() {{
   void* kernel=nullptr;
-  assert(ds41rt_v41_expert_initialize(16, &kernel) == 0);
-  ds41rt_v41_expert_launch_t args{{}};
+  assert(cuteafd_v41_expert_initialize(16, &kernel) == 0);
+  cuteafd_v41_expert_launch_t args{{}};
   for (auto& p : args.tensors) p = &args;
   args.num_tokens=1; args.scatter_rows=6;
   args.max_rows=32; args.rows_padded=32;
   args.max_tasks=64; args.max_phys_tiles=64;
   for (int cap : {{1,188,376}}) {{
     args.max_active_clusters=cap;
-    assert(ds41rt_v41_expert_launch(kernel, &args) == 0);
+    assert(cuteafd_v41_expert_launch(kernel, &args) == 0);
   }}
   int before=launches;
   for (int cap : {{-2,0,377}}) {{
     args.max_active_clusters=cap;
-    assert(ds41rt_v41_expert_launch(kernel, &args) == 1);
+    assert(cuteafd_v41_expert_launch(kernel, &args) == 1);
   }}
   assert(launches == before);
   args.max_active_clusters=-1;
-  assert(ds41rt_v41_expert_launch(kernel, &args) == 1);
+  assert(cuteafd_v41_expert_launch(kernel, &args) == 1);
   args.max_active_clusters=188;
   before=launches;
   for (auto& p : args.tensors) {{
     p=nullptr;
-    assert(ds41rt_v41_expert_launch(kernel, &args) == 1);
+    assert(cuteafd_v41_expert_launch(kernel, &args) == 1);
     p=&args;
   }}
   for (auto* scalar : {{&args.max_rows, &args.rows_padded,
                         &args.max_tasks, &args.max_phys_tiles, &args.scatter_rows}}) {{
     ++*scalar;
-    assert(ds41rt_v41_expert_launch(kernel, &args) == 1);
+    assert(cuteafd_v41_expert_launch(kernel, &args) == 1);
     --*scalar;
   }}
   for (int rows : {{-1,0,17}}) {{
     args.num_tokens=rows; args.scatter_rows=rows*6;
-    assert(ds41rt_v41_expert_launch(kernel, &args) == 1);
+    assert(cuteafd_v41_expert_launch(kernel, &args) == 1);
   }}
   assert(launches == before);
 }}

@@ -4,10 +4,10 @@ set -euo pipefail
 host_a="${1:?HOST_A required}"
 host_b="${2:?HOST_B required}"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-remote_repo="${DS41RT_REMOTE_REPO:-$repo_root}"
-port="${DS41RT_RDMA_PORT:-18515}"
-duration="${DS41RT_RDMA_DURATION_SECS:-2}"
-payloads="${DS41RT_RDMA_PAYLOAD_BYTES:-4096,8192,12288,16384,32768,65536}"
+remote_repo="${CUTEAFD_REMOTE_REPO:-$repo_root}"
+port="${CUTEAFD_RDMA_PORT:-18515}"
+duration="${CUTEAFD_RDMA_DURATION_SECS:-2}"
+payloads="${CUTEAFD_RDMA_PAYLOAD_BYTES:-4096,8192,12288,16384,32768,65536}"
 log_dir="$repo_root/reports/phase0_artifacts/logs"
 mkdir -p "$log_dir"
 
@@ -16,7 +16,7 @@ client_log="$log_dir/bench-rdma-${host_a}-${host_b}-client.log"
 
 server_cmd=(
   "cd '$remote_repo' &&"
-  "scripts/ds41rt bench-rdma"
+  "scripts/cuteafd bench-rdma"
   "--mode server"
   "--port '$port'"
   "--duration-secs '$duration'"
@@ -24,7 +24,7 @@ server_cmd=(
 )
 client_cmd=(
   "cd '$remote_repo' &&"
-  "scripts/ds41rt bench-rdma"
+  "scripts/cuteafd bench-rdma"
   "--mode client"
   "--peer '$host_b'"
   "--port '$port'"

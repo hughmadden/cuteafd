@@ -109,7 +109,7 @@ def write_native_bridge(output_dir: Path, manifest: dict) -> None:
         tensor_slots = (
             set(POINTER_SLOTS[8:15]) | {"b_w13", "b_down"} | set(POINTER_SLOTS[34:41])
         )
-        prefix = "ds41rt_" + name
+        prefix = "cuteafd_" + name
         expected_declarations = [f"{prefix}_Kernel_Module_t*module"]
         expected_declarations += [
             f"{prefix}_Tensor_{slot}_t*{slot}"
@@ -188,7 +188,7 @@ def write_native_bridge(output_dir: Path, manifest: dict) -> None:
             "{{"
             + ", ".join(map(str, info))
             + "}, "
-            + f"_mlir_ds41rt_{name}_cuda_init, _mlir_ds41rt_{name}_cuda_load_to_device, "
+            + f"_mlir_cuteafd_{name}_cuda_init, _mlir_cuteafd_{name}_cuda_load_to_device, "
             + entry[1]
             + ", {" + ", ".join(offsets) + "}}"
         )
@@ -198,9 +198,9 @@ def write_native_bridge(output_dir: Path, manifest: dict) -> None:
     lines = [
         "#pragma once",
         *includes,
-        f"#define DS41RT_V41_CC_MINOR {manifest['capability'][1]}",
-        f"#define DS41RT_V41_SMS {manifest['physical_sms']}",
-        "#define DS41RT_V41_VARIANTS " + ", ".join(entries),
+        f"#define CUTEAFD_V41_CC_MINOR {manifest['capability'][1]}",
+        f"#define CUTEAFD_V41_SMS {manifest['physical_sms']}",
+        "#define CUTEAFD_V41_VARIANTS " + ", ".join(entries),
     ]
     (output_dir / "v41_expert_variants.h").write_text("\n".join(lines) + "\n")
 
@@ -214,13 +214,13 @@ def export_input_quantizer(output_dir: Path, manifest: dict) -> None:
     compiled = compile_mxfp8_rows_quant_aot(
         size_k=5120, expected_m=80, amax_floor=1e-4, wire_rows=True,
     )
-    compiled.export_to_c(str(output_dir), label, "ds41rt_" + label)
+    compiled.export_to_c(str(output_dir), label, "cuteafd_" + label)
     abi = validate_abi(output_dir / (label + ".h"), label, "quant")
     grids = [mxfp8_rows_quant_aot_grid(size_k=5120, rows=m, expected_m=80,
              sm_count=manifest["physical_sms"]) for m in range(1, 4097)]
     header = ["#pragma once", f'#include "{label}.h"',
-              f"#define DS41RT_V41_INPUT_QUANT_ENTRY {abi['symbol']}",
-              "static const uint32_t ds41rt_v41_input_quant_grids[] = {" +
+              f"#define CUTEAFD_V41_INPUT_QUANT_ENTRY {abi['symbol']}",
+              "static const uint32_t cuteafd_v41_input_quant_grids[] = {" +
               ",".join(map(str, grids)) + "};"]
     (output_dir / "v41_input_quant_dispatch.h").write_text("\n".join(header) + "\n")
     manifest["input_quantizer"] = {"format": "row E4M3 payload then UE8M0 K32 scales",
@@ -357,7 +357,7 @@ def export(output_dir: Path, role: str, rows: tuple[int, ...], input_format: str
             swiglu_limit=10,
         )
         name = f"v41_{role}_m{requested_rows}"
-        compiled.export_to_c(str(output_dir), name, f"ds41rt_{name}")
+        compiled.export_to_c(str(output_dir), name, f"cuteafd_{name}")
         tensors = []
         offset = 0
         for spec in core.tensor_specs:

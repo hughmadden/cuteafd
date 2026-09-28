@@ -127,7 +127,7 @@ class ReuseFixtureTest(unittest.TestCase):
         mutations["tail aggregate mismatch"] = bad_tail
 
         bad_schema = copy.deepcopy(FIXTURE_DATA)
-        bad_schema["schema"] = "ds41rt.tp-ep-reuse-fixture.v0"
+        bad_schema["schema"] = "cuteafd.tp-ep-reuse-fixture.v0"
         mutations["schema mismatch"] = bad_schema
 
         fractional_rows = copy.deepcopy(FIXTURE_DATA)

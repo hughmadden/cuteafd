@@ -53,8 +53,8 @@ class View(C.Structure):
 assert C.sizeof(View) == 120
 libs = [C.CDLL(args.baseline), C.CDLL(args.candidate)]
 for i,lib in enumerate(libs):
-    assert lib.ds41rt_v41_sparse_attention_initialize() == 0
-    fn = lib.ds41rt_v41_sparse_attention_bounded if args.window_begin is not None else (lib.ds41rt_v41_sparse_attention if args.parts==0 else lib.ds41rt_v41_sparse_attention_split)
+    assert lib.cuteafd_v41_sparse_attention_initialize() == 0
+    fn = lib.cuteafd_v41_sparse_attention_bounded if args.window_begin is not None else (lib.cuteafd_v41_sparse_attention if args.parts==0 else lib.cuteafd_v41_sparse_attention_split)
     fn.argtypes = [C.c_void_p]*5+[C.c_int32,C.c_int32,C.POINTER(View),C.c_void_p]+([C.c_void_p,C.c_void_p,C.c_uint64,C.c_int32] if args.window_begin is not None else ([] if args.parts==0 else [C.c_void_p,C.c_uint64,C.c_int32]))
 torch.manual_seed(731)
 results = []
@@ -121,7 +121,7 @@ for rows in args.rows:
         reference_view.values[3]=decoded[1].data_ptr()
 
     def launch(i):
-        fn=libs[i].ds41rt_v41_sparse_attention_bounded if args.window_begin is not None else (libs[i].ds41rt_v41_sparse_attention if args.parts==0 else libs[i].ds41rt_v41_sparse_attention_split)
+        fn=libs[i].cuteafd_v41_sparse_attention_bounded if args.window_begin is not None else (libs[i].cuteafd_v41_sparse_attention if args.parts==0 else libs[i].cuteafd_v41_sparse_attention_split)
         tail=([bounds.data_ptr(),scratch.data_ptr() if args.parts else None,scratch.numel()*4 if args.parts else 0,max(args.parts,1)] if args.window_begin is not None else ([] if args.parts==0 else [scratch.data_ptr(),scratch.numel()*4,args.parts]))
         status = fn(
             q.data_ptr(),

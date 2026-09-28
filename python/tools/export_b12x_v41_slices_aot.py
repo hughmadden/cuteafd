@@ -44,7 +44,7 @@ ROLE_SM = {
     "spark_tp3": (12, 1),
     "spark_tp6": (12, 1),
 }
-# Native `ds41rt_v41_expert_info_t.role` values (see native/include/ds41rt_v41_experts.h).
+# Native `cuteafd_v41_expert_info_t.role` values (see native/include/cuteafd_v41_experts.h).
 ROLE_NATIVE_ID = {
     "coordinator": 0,
     "spark": 1,
@@ -182,7 +182,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             cutlass.Int32(capacity),
             current_cuda_stream(),
         )
-        compiled.export_to_c(str(output), label, "ds41rt_" + label)
+        compiled.export_to_c(str(output), label, "cuteafd_" + label)
         header = (output / f"{label}.h").read_text()
         symbol = re.findall(
             r"void (_mlir_\w+)\(void \*\*args, int32_t num_args\);", header
@@ -214,7 +214,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         signature = re.search(
             r"static inline int32_t cute_dsl_\w+_wrapper\(([^)]*)\)", header
         )
-        prefix = "ds41rt_" + label
+        prefix = "cuteafd_" + label
         declarations = (
             [f"{prefix}_Kernel_Module_t*module"]
             + [f"{prefix}_Tensor_{name}_t*{name}" for name in names]
@@ -299,7 +299,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             props.multi_processor_count,
             1 if coordinator else 7,
         ]
-        prefix = "_mlir_ds41rt_" + label
+        prefix = "_mlir_cuteafd_" + label
         entries.append(
             "{{"
             + ",".join(map(str, info))
@@ -335,10 +335,10 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             [
                 "#pragma once",
                 *includes,
-                f"#define DS41RT_V41_CC_MINOR {props.minor}",
-                f"#define DS41RT_V41_SMS {props.multi_processor_count}",
-                "#define DS41RT_V41_VARIANTS " + ",".join(entries),
-                "#define DS41RT_V41_OUTPUT_KIND(capacity) (" +
+                f"#define CUTEAFD_V41_CC_MINOR {props.minor}",
+                f"#define CUTEAFD_V41_SMS {props.multi_processor_count}",
+                "#define CUTEAFD_V41_VARIANTS " + ",".join(entries),
+                "#define CUTEAFD_V41_OUTPUT_KIND(capacity) (" +
                 (" || ".join(f"((capacity)=={v['capacity_rows']})" for v in manifest['variants']
                              if v['output_kind'] == 'fp32_tokens') or "0") + " ? 1u : 0u)",
                 "",

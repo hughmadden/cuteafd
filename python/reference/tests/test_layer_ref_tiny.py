@@ -2,8 +2,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from ds41rt_reference.layer_ref import tiny_attention_block, tiny_moe_layer
-from ds41rt_reference.moe_ref import ExpertWeights
+from cuteafd_reference.layer_ref import tiny_attention_block, tiny_moe_layer
+from cuteafd_reference.moe_ref import ExpertWeights
 
 
 def test_tiny_attention_block_preserves_hidden_shape():

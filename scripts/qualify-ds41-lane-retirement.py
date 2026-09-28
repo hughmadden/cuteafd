@@ -72,7 +72,7 @@ def main():
             short, long = short.result(), long.result()
         assert short['start'] + short['result']['finish_seconds'] < long['start'] + long['result']['finish_seconds']
         report = dict(scope=__doc__, long=long, short=short, responses_passed=True, passed=False,
-                      requires='fresh server with RUST_LOG=info,ds41rt::lane_schedule=debug; verify saved trace next')
+                      requires='fresh server with RUST_LOG=info,cuteafd::lane_schedule=debug; verify saved trace next')
     args.output.write_text(json.dumps(report, indent=2) + '\n')
     print('PASS retirement trace' if args.trace_log else 'PASS overlapping counting responses; trace verification pending')
 

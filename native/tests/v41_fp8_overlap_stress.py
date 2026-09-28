@@ -48,11 +48,11 @@ def bind(name,types):
   status=fn(*args)
   if status: raise RuntimeError(name,status)
  return checked
-infofn=bind('ds41rt_v41_fp8_matrix_info',[I,I,I,C.POINTER(Info)])
-init=bind('ds41rt_v41_fp8_matrix_initialize',[I,I,I,C.POINTER(P)])
-init_scratch=bind('ds41rt_v41_fp8_initialize_scratch',[P,P,C.c_uint64,P,P])
-pack=bind('ds41rt_v41_fp8_matrix_pack_scales',[P,P,I,I,P])
-launch=bind('ds41rt_v41_fp8_launch',[P,P,P,P,P,C.c_uint64,P,P,I,P])
+infofn=bind('cuteafd_v41_fp8_matrix_info',[I,I,I,C.POINTER(Info)])
+init=bind('cuteafd_v41_fp8_matrix_initialize',[I,I,I,C.POINTER(P)])
+init_scratch=bind('cuteafd_v41_fp8_initialize_scratch',[P,P,C.c_uint64,P,P])
+pack=bind('cuteafd_v41_fp8_matrix_pack_scales',[P,P,I,I,P])
+launch=bind('cuteafd_v41_fp8_launch',[P,P,P,P,P,C.c_uint64,P,P,I,P])
 
 capacities=[1 if meta['rows']==1 else 16, args.competitor_capacity]
 infos=[];handles=[]

@@ -40,8 +40,8 @@
 //   band4/3  576   offset 1728
 //
 // Requires a CUDA device; exits 77 (ctest SKIP) when none is present, or 1 when
-// DS41RT_REQUIRE_CUDA is set (so a scheduled gate cannot pass by skipping).
-#include "ds41rt_v41_experts.h"
+// CUTEAFD_REQUIRE_CUDA is set (so a scheduled gate cannot pass by skipping).
+#include "cuteafd_v41_experts.h"
 
 #include <cuda_runtime.h>
 
@@ -362,11 +362,11 @@ void check_padding(const std::array<std::vector<uint8_t>, 4>& actual,
 
 int main() {
   int devices = 0;
-  const bool required = std::getenv("DS41RT_REQUIRE_CUDA") != nullptr;
+  const bool required = std::getenv("CUTEAFD_REQUIRE_CUDA") != nullptr;
   if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 1) {
     if (required) {
       std::fprintf(stderr,
-                   "v41 expert pack geometry selftest: DS41RT_REQUIRE_CUDA is set "
+                   "v41 expert pack geometry selftest: CUTEAFD_REQUIRE_CUDA is set "
                    "but no CUDA device is present\n");
       return 1;
     }
@@ -393,7 +393,7 @@ int main() {
     const uint32_t intermediate = item.intermediate;
     const std::string name = item.name;
     uint64_t sizes[4] = {};
-    require(ds41rt_v41_expert_packed_sizes(intermediate, sizes) == cudaSuccess,
+    require(cuteafd_v41_expert_packed_sizes(intermediate, sizes) == cudaSuccess,
             name + ": packer rejected the extent");
 
     const uint64_t weight_bytes = uint64_t(intermediate) * kHidden / 2;
@@ -415,7 +415,7 @@ int main() {
     for (int i = 0; i < 4; ++i)
       check_cuda(cudaMalloc(reinterpret_cast<void**>(&destinations[i]), sizes[i]),
                  "cudaMalloc destination");
-    require(ds41rt_v41_pack_expert_async(sources, destinations, intermediate,
+    require(cuteafd_v41_pack_expert_async(sources, destinations, intermediate,
                                          nullptr) == cudaSuccess,
             name + ": pack launch failed");
     check_cuda(cudaStreamSynchronize(nullptr), "synchronize");

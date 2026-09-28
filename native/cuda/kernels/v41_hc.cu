@@ -1,7 +1,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
-#include "ds41rt_v41_hc.h"
+#include "cuteafd_v41_hc.h"
 namespace {
 __global__ void pre_kernel(const __nv_bfloat16* residual, const float* pre,
     __nv_bfloat16* output, uint64_t values) {
@@ -36,7 +36,7 @@ bool disjoint(const void* a, uint64_t na, const void* b, uint64_t nb) {
   return x+na <= y || y+nb <= x;
 }
 }
-extern "C" int32_t ds41rt_v41_hc_pre(const uint16_t* residual, const float* pre,
+extern "C" int32_t cuteafd_v41_hc_pre(const uint16_t* residual, const float* pre,
     uint16_t* collapsed, int32_t rows, void* stream) {
   if (rows < 1 || rows > 4096) return cudaErrorInvalidValue;
   const uint64_t r = uint64_t(rows)*40960, p = uint64_t(rows)*16, c = uint64_t(rows)*10240;
@@ -47,7 +47,7 @@ extern "C" int32_t ds41rt_v41_hc_pre(const uint16_t* residual, const float* pre,
       reinterpret_cast<__nv_bfloat16*>(collapsed),c/2);
   return cudaGetLastError();
 }
-extern "C" int32_t ds41rt_v41_hc_post(const uint16_t* sublayer, const uint16_t* residual,
+extern "C" int32_t cuteafd_v41_hc_post(const uint16_t* sublayer, const uint16_t* residual,
     const float* post, const float* comb, uint16_t* output, int32_t rows, void* stream) {
   if (rows < 1 || rows > 4096) return cudaErrorInvalidValue;
   const uint64_t r = uint64_t(rows)*40960, p = uint64_t(rows)*16, c = uint64_t(rows)*10240;
@@ -195,7 +195,7 @@ __global__ void finish_mixes_kernel(const float* partials,
 }
 
 }
-extern "C" int32_t ds41rt_v41_hc_mixes(const uint16_t* residual, const float* fn,
+extern "C" int32_t cuteafd_v41_hc_mixes(const uint16_t* residual, const float* fn,
     const float* scale, const float* base, float* pre, float* post, float* comb,
     int32_t rows, void* stream) {
   if(rows<1 || rows>4096) return cudaErrorInvalidValue;
@@ -222,21 +222,21 @@ extern "C" int32_t ds41rt_v41_hc_mixes(const uint16_t* residual, const float* fn
 
 // AOT loading belongs to planning, before any stream capture. The fallback
 // keeps CUDA-only builds usable without exporting coordinator CuTe kernels.
-#ifdef DS41RT_HAVE_V41_HC_AOT
-extern "C" int32_t ds41rt_v41_hc_project_launch(
+#ifdef CUTEAFD_HAVE_V41_HC_AOT
+extern "C" int32_t cuteafd_v41_hc_project_launch(
     const uint16_t*, const float*, float*, int32_t, void*);
 #else
-extern "C" int32_t ds41rt_v41_hc_project_initialize() { return 0; }
+extern "C" int32_t cuteafd_v41_hc_project_initialize() { return 0; }
 #endif
-extern "C" int32_t ds41rt_v41_hc_mixes_workspace(const uint16_t* residual,
+extern "C" int32_t cuteafd_v41_hc_mixes_workspace(const uint16_t* residual,
     const float* fn, const float* scale, const float* base,
     float* pre, float* post, float* comb, void* scratch, uint64_t scratch_bytes,
     int32_t rows, void* stream) {
-#ifndef DS41RT_HAVE_V41_HC_AOT
-  return ds41rt_v41_hc_mixes(residual,fn,scale,base,pre,post,comb,rows,stream);
+#ifndef CUTEAFD_HAVE_V41_HC_AOT
+  return cuteafd_v41_hc_mixes(residual,fn,scale,base,pre,post,comb,rows,stream);
 #else
   if(rows<1 || rows>4096) return cudaErrorInvalidValue;
-  if(rows>16) return ds41rt_v41_hc_mixes(residual,fn,scale,base,pre,post,comb,rows,stream);
+  if(rows>16) return cuteafd_v41_hc_mixes(residual,fn,scale,base,pre,post,comb,rows,stream);
   const uint64_t small=uint64_t(rows)*16, needed=uint64_t(rows)*1536;
   if(scratch_bytes<needed) return cudaErrorInvalidValue;
   const void* pointers[]={residual,fn,scale,base,pre,post,comb,scratch};
@@ -247,7 +247,7 @@ extern "C" int32_t ds41rt_v41_hc_mixes_workspace(const uint16_t* residual,
   for(int i=4;i<8;++i) for(int j=0;j<i;++j)
     if(!disjoint(pointers[i],sizes[i],pointers[j],sizes[j])) return cudaErrorInvalidValue;
   auto* partials=static_cast<float*>(scratch);
-  int status=ds41rt_v41_hc_project_launch(residual,fn,partials,rows,stream);
+  int status=cuteafd_v41_hc_project_launch(residual,fn,partials,rows,stream);
   if(status) return status;
   finish_mixes_kernel<8><<<rows,32,0,reinterpret_cast<cudaStream_t>(stream)>>>(
       partials,scale,base,pre,post,comb);

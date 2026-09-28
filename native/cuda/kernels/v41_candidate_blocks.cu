@@ -1,7 +1,7 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
 #include <stdint.h>
-#include "ds41rt_v41_candidate_blocks.h"
+#include "cuteafd_v41_candidate_blocks.h"
 namespace {
 bool valid(const void* p,uint64_t n,int align) {
   auto a=reinterpret_cast<uintptr_t>(p);return a && a%align==0 && a<=UINTPTR_MAX-n;
@@ -43,7 +43,7 @@ __global__ void expand(const int32_t* blocks,const uint64_t* lengths,uint64_t* o
   out[row*16384+col]=block>=0 && block<131072 && end<=1048576 && pos<end?pos:UINT64_MAX;
 }
 }
-extern "C" int32_t ds41rt_v41_candidate_block_max(const float* scores,const uint64_t* first,
+extern "C" int32_t cuteafd_v41_candidate_block_max(const float* scores,const uint64_t* first,
     const uint64_t* lengths,float* maxima,uint64_t* ids,int32_t queries,int32_t width,void* stream) {
   if(queries<1 || queries>4096 || width<1 || width>16384)return cudaErrorInvalidValue;
   const int blocks=(width+7)/8;const uint64_t q=queries;
@@ -58,7 +58,7 @@ extern "C" int32_t ds41rt_v41_candidate_block_max(const float* scores,const uint
       scores,first,lengths,maxima,ids,width,blocks);
   return cudaGetLastError();
 }
-extern "C" int32_t ds41rt_v41_candidate_expand(const int32_t* blocks,const uint64_t* lengths,
+extern "C" int32_t cuteafd_v41_candidate_expand(const int32_t* blocks,const uint64_t* lengths,
     uint64_t* positions,int32_t queries,void* stream) {
   if(queries<1 || queries>4096)return cudaErrorInvalidValue;
   const uint64_t q=queries;
@@ -68,7 +68,7 @@ extern "C" int32_t ds41rt_v41_candidate_expand(const int32_t* blocks,const uint6
   return cudaGetLastError();
 }
 
-extern "C" int32_t ds41rt_v41_candidate_tile(uint64_t* positions,uint64_t* first,
+extern "C" int32_t cuteafd_v41_candidate_tile(uint64_t* positions,uint64_t* first,
     int32_t queries,int32_t width,uint64_t begin,void* stream) {
   if(queries<1 || queries>4096 || width<1 || width>16384 || begin>=1048576 || begin%8)
     return cudaErrorInvalidValue;

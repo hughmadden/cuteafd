@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve or launch one DS41RT production configuration."""
+"""Resolve or launch one CUTEAFD production configuration."""
 
 from __future__ import annotations
 
@@ -9,14 +9,14 @@ import os
 from pathlib import Path
 import sys
 
-from ds41rt_reference.serve_settings import (
+from cuteafd_reference.serve_settings import (
     resolve_serve_settings,
 )
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(
-        description="Resolve DS41RT launch settings with FP8 target KV."
+        description="Resolve CUTEAFD launch settings with FP8 target KV."
     )
     parser.add_argument("--dspark", choices=("on", "off"), default="on")
     parser.add_argument(

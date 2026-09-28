@@ -22,7 +22,7 @@ CORPUS = ROOT / "scripts" / "fixtures" / "tp-ep-e2e-corpus.jsonl"
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("ds41rt_tp_ep_e2e", RUNNER)
+    spec = importlib.util.spec_from_file_location("cuteafd_tp_ep_e2e", RUNNER)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

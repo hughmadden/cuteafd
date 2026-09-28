@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Replay a saved request and summarize independent-lane debug timing.
 
-Use an otherwise idle server with RUST_LOG=info,ds41rt::timing=debug.
+Use an otherwise idle server with RUST_LOG=info,cuteafd::timing=debug.
 Timing includes logging overhead; this is an acceptance diagnostic, not a TPS
 qualification. The saved request is replayed without changing its prompt.
 """

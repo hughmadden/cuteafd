@@ -25,7 +25,7 @@ DEVICE_MAP = "10.55.0.22=mlx5_0,10.55.0.5=rocep1s0f0,10.55.0.11=roceP2p1s0f0,10.
 
 FAKE_DOCKER = """#!/usr/bin/env bash
 log="${FAKE_LOG:?}"; { printf 'docker'; printf ' %q' "$@"; printf '\\n'; } >> "$log"
-[[ "$*" == *"DS41RT_PROTOCOL_V2_TCP_TIMING="* ]] && touch "${log}.timing"
+[[ "$*" == *"CUTEAFD_PROTOCOL_V2_TCP_TIMING="* ]] && touch "${log}.timing"
 [[ "${1:-}" == "inspect" ]] && { echo true; exit 0; }
 if [[ "${1:-}" == "exec" ]]; then
   args=("$@"); i=1
@@ -55,7 +55,7 @@ exit 0
 
 FAKE_SSH = """#!/usr/bin/env bash
 log="${FAKE_LOG:?}"; { printf 'ssh'; printf ' %q' "$@"; printf '\\n'; } >> "$log"
-[[ "$*" == *"DS41RT_PROTOCOL_V2_TCP_TIMING="* ]] && touch "${log}.timing"
+[[ "$*" == *"CUTEAFD_PROTOCOL_V2_TCP_TIMING="* ]] && touch "${log}.timing"
 args=("$@"); i=0; host=""
 while (( i < ${#args[@]} )); do
   case "${args[$i]}" in
@@ -76,7 +76,7 @@ case "$remote" in
     esac
     # Structured startup evidence, ANSI-decorated like the real log, plus the
     # stale-line variants that must NOT satisfy the readiness wait.
-    printf 'INFO ds41rt: \033[2mnative local RoCE expert worker ready\033[0m rank=%s world=6 \033[3mrole\033[0m=%s \033[3mintermediate\033[0m=%s first_layer=%s\n' \
+    printf 'INFO cuteafd: \033[2mnative local RoCE expert worker ready\033[0m rank=%s world=6 \033[3mrole\033[0m=%s \033[3mintermediate\033[0m=%s first_layer=%s\n' \
       "$rank" "${FAKE_WORKER_ROLE:-7}" "${FAKE_WORKER_INTERMEDIATE:-384}" "${FAKE_WORKER_LOG_FIRST:-20}"
     echo "native local RoCE expert worker ready rank=$rank world=6 first_layer=0"
     # Real behaviour: the endpoint (and its GID line) exists only after a client
@@ -119,10 +119,10 @@ def _start_env(bin_dir: Path, log: Path, rtx_gpus: int = 2, layers: int = 20, fi
                                          rtx_expert_layers=layers, spark_first_layer=first)))
     env["FAKE_PLAN_FILE"] = str(plan_file)
     env["FAKE_WORKER_LOG_FIRST"] = str(first)
-    env["DS41RT_TPEP_L3_GRANT"] = "1"
-    env["DS41RT_TPEP_WORKER_READY_TIMEOUT_SECONDS"] = "20"
-    env["DS41RT_SPARKINFER_SOURCE_DIR"] = "/workspace/ds41rt/third_party/sparkinfer"
-    env["PYTHONPATH"] = "/workspace/ds41rt/third_party/sparkinfer"
+    env["CUTEAFD_TPEP_L3_GRANT"] = "1"
+    env["CUTEAFD_TPEP_WORKER_READY_TIMEOUT_SECONDS"] = "20"
+    env["CUTEAFD_SPARKINFER_SOURCE_DIR"] = "/workspace/cuteafd/third_party/sparkinfer"
+    env["PYTHONPATH"] = "/workspace/cuteafd/third_party/sparkinfer"
     return env
 
 
@@ -145,7 +145,7 @@ def test_plan_renders_ordered_six_rank_lifecycle() -> None:
         ["STEP worker-ready", "STEP plan-ack", "STEP readiness-gate",
          "STEP first-request", "STEP gid-capture"], steps
     assert "dspark=on dspark_draft_limit=7 (coordinator only)" in dual
-    assert "tcp_timing=DS41RT_PROTOCOL_V2_TCP_TIMING=unset" in dual
+    assert "tcp_timing=CUTEAFD_PROTOCOL_V2_TCP_TIMING=unset" in dual
     assert "PREREQ stage-0:" in dual and "NOT performed" in dual
     experts = [line for line in dual.splitlines() if line.startswith("CMD expert-")]
     assert len(experts) == 6
@@ -224,8 +224,8 @@ def test_mock_start_dual_orders_ack_health_request_gid(tmp_path) -> None:
         assert f"--rank {index} " in line and "--world 6" in line and "--first-layer 20" in line
         assert f"--device-budget-bytes {BUDGET}" in line
     for line in launches:
-        assert f"DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP={DEVICE_MAP}" in line, line
-        assert "DS41RT_PROTOCOL_V2_TCP_TIMING=1" in line, line
+        assert f"CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP={DEVICE_MAP}" in line, line
+        assert "CUTEAFD_PROTOCOL_V2_TCP_TIMING=1" in line, line
         assert "docker run" not in line and "build.sh" not in line
     ack = calls.index(next(line for line in calls if "ready.json" in line))
     health = calls.index(next(line for line in calls if "/health" in line))

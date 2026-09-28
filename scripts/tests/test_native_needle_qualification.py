@@ -14,7 +14,7 @@ def run(text='', reasoning=''):
         'text': text,
         'reasoning_content': reasoning,
         'usage': {'prompt_tokens': 100, 'prompt_tokens_details': {'cached_tokens': 0}},
-        'system_fingerprint': 'ds41rt-native-fp4-kv-dspark',
+        'system_fingerprint': 'cuteafd-native-fp4-kv-dspark',
     }
 
 

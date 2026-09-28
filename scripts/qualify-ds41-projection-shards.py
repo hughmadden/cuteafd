@@ -33,11 +33,11 @@ def main():
                 raise RuntimeError(f'{name}: CUDA status {status}')
         return checked
 
-    info = bind('ds41rt_v41_fp8_matrix_info', [I, I, I, P])
-    init = bind('ds41rt_v41_fp8_matrix_initialize', [I, I, I, P])
-    pack = bind('ds41rt_v41_fp8_matrix_pack_scales', [P, P, I, I, P])
-    initialize = bind('ds41rt_v41_fp8_initialize_scratch', [P, P, C.c_uint64, P, P])
-    launch = bind('ds41rt_v41_fp8_launch', [P, P, P, P, P, C.c_uint64, P, P, I, P])
+    info = bind('cuteafd_v41_fp8_matrix_info', [I, I, I, P])
+    init = bind('cuteafd_v41_fp8_matrix_initialize', [I, I, I, P])
+    pack = bind('cuteafd_v41_fp8_matrix_pack_scales', [P, P, I, I, P])
+    initialize = bind('cuteafd_v41_fp8_initialize_scratch', [P, P, C.c_uint64, P, P])
+    launch = bind('cuteafd_v41_fp8_launch', [P, P, P, P, P, C.c_uint64, P, P, I, P])
     index = json.loads((args.snapshot / 'model.safetensors.index.json').read_text())['weight_map']
 
     def weight(name):

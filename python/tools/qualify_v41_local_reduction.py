@@ -9,7 +9,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--native-lib', required=True)
 args = parser.parse_args()
 lib = C.CDLL(args.native_lib)
-finish = lib.ds41rt_v41_finish_local_experts_async
+finish = lib.cuteafd_v41_finish_local_experts_async
 finish.argtypes = [C.c_void_p, C.c_void_p, C.c_void_p, C.c_uint32, C.c_uint32, C.c_void_p]
 finish.restype = C.c_int32
 torch.manual_seed(4193)

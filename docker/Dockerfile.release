@@ -6,9 +6,9 @@ ENV HF_HUB_OFFLINE=1
 ENV TRANSFORMERS_OFFLINE=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV UV_SYSTEM_PYTHON=1
-ENV PATH=/opt/ds41rt/bin:${PATH}
-ENV PYTHONPATH=/opt/ds41rt/third_party/sparkinfer:/opt/ds41rt/python/reference/ds41rt_reference:/opt/ds41rt/python/reference
-ENV DS41RT_NATIVE_LIB=/opt/ds41rt/lib/libds41rt_native.so
+ENV PATH=/opt/cuteafd/bin:${PATH}
+ENV PYTHONPATH=/opt/cuteafd/third_party/sparkinfer:/opt/cuteafd/python/reference/cuteafd_reference:/opt/cuteafd/python/reference
+ENV CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -44,112 +44,112 @@ RUN uv pip install --system --break-system-packages --no-cache pytest
 # Keep source/revision metadata after the expensive immutable dependency
 # layers. Rapid SparkInfer iteration should invalidate only the pinned-source
 # and release-material tail of this image.
-ARG DS41RT_ROLE
+ARG CUTEAFD_ROLE
 ARG CUDA_ARCH
-ARG DS41RT_ENGINE_COMMIT=unknown
-ARG DS41RT_SPARKINFER_COMMIT=unknown
-ARG DS41RT_RELEASE_VERSION=unknown
+ARG CUTEAFD_ENGINE_COMMIT=unknown
+ARG CUTEAFD_SPARKINFER_COMMIT=unknown
+ARG CUTEAFD_RELEASE_VERSION=unknown
 # Replicated-group SM121 expert roles compiled into this image (semicolon list
 # `tp2`/`tp3`/`tp6`). ./build.sh resolves them, universal by default, and passes an
 # empty value for the coordinator: the verification below rejects any role label the
 # built manifest and shipped library do not corroborate.
-ARG DS41RT_V41_SPARK_TP_ROLES=
+ARG CUTEAFD_V41_SPARK_TP_ROLES=
 
-ENV DS41RT_ROLE=${DS41RT_ROLE}
-ENV DS41RT_CUDA_ARCH=${CUDA_ARCH}
-ENV DS41RT_ENGINE_COMMIT=${DS41RT_ENGINE_COMMIT}
-ENV DS41RT_SPARKINFER_COMMIT=${DS41RT_SPARKINFER_COMMIT}
-ENV DS41RT_RELEASE_VERSION=${DS41RT_RELEASE_VERSION}
-ENV DS41RT_V41_SPARK_TP_ROLES=${DS41RT_V41_SPARK_TP_ROLES}
+ENV CUTEAFD_ROLE=${CUTEAFD_ROLE}
+ENV CUTEAFD_CUDA_ARCH=${CUDA_ARCH}
+ENV CUTEAFD_ENGINE_COMMIT=${CUTEAFD_ENGINE_COMMIT}
+ENV CUTEAFD_SPARKINFER_COMMIT=${CUTEAFD_SPARKINFER_COMMIT}
+ENV CUTEAFD_RELEASE_VERSION=${CUTEAFD_RELEASE_VERSION}
+ENV CUTEAFD_V41_SPARK_TP_ROLES=${CUTEAFD_V41_SPARK_TP_ROLES}
 
-LABEL org.opencontainers.image.title="DS41RT inference"
-LABEL org.opencontainers.image.source="https://github.com/tpurtell/ds41rt"
+LABEL org.opencontainers.image.title="CUTEAFD inference"
+LABEL org.opencontainers.image.source="https://github.com/tpurtell/cuteafd"
 LABEL org.opencontainers.image.description="DeepSeek V4.1 Flash inference for one or two RTX PRO 6000 GPUs and four DGX Spark expert workers"
 LABEL org.opencontainers.image.licenses="MIT"
-LABEL org.opencontainers.image.revision=${DS41RT_ENGINE_COMMIT}
-LABEL org.opencontainers.image.version=${DS41RT_RELEASE_VERSION}
-LABEL io.ds41rt.role=${DS41RT_ROLE}
-LABEL io.ds41rt.cuda_arch=${CUDA_ARCH}
-LABEL io.ds41rt.sparkinfer.revision=${DS41RT_SPARKINFER_COMMIT}
-LABEL io.ds41rt.v41.spark_tp_roles=${DS41RT_V41_SPARK_TP_ROLES}
+LABEL org.opencontainers.image.revision=${CUTEAFD_ENGINE_COMMIT}
+LABEL org.opencontainers.image.version=${CUTEAFD_RELEASE_VERSION}
+LABEL io.cuteafd.role=${CUTEAFD_ROLE}
+LABEL io.cuteafd.cuda_arch=${CUDA_ARCH}
+LABEL io.cuteafd.sparkinfer.revision=${CUTEAFD_SPARKINFER_COMMIT}
+LABEL io.cuteafd.v41.spark_tp_roles=${CUTEAFD_V41_SPARK_TP_ROLES}
 
-COPY scripts/verify-sparkinfer-source.py /opt/ds41rt/scripts/verify-sparkinfer-source.py
-COPY scripts/sparkinfer-release-provenance.py /opt/ds41rt/scripts/sparkinfer-release-provenance.py
-COPY third_party/sparkinfer.lock.json /opt/ds41rt/third_party/sparkinfer.lock.json
-COPY third_party/sparkinfer /opt/ds41rt/third_party/sparkinfer
+COPY scripts/verify-sparkinfer-source.py /opt/cuteafd/scripts/verify-sparkinfer-source.py
+COPY scripts/sparkinfer-release-provenance.py /opt/cuteafd/scripts/sparkinfer-release-provenance.py
+COPY third_party/sparkinfer.lock.json /opt/cuteafd/third_party/sparkinfer.lock.json
+COPY third_party/sparkinfer /opt/cuteafd/third_party/sparkinfer
 
-RUN python3 /opt/ds41rt/scripts/verify-sparkinfer-source.py \
-      --source /opt/ds41rt/third_party/sparkinfer \
-      --lock /opt/ds41rt/third_party/sparkinfer.lock.json && \
-    locked_revision="$(python3 /opt/ds41rt/scripts/verify-sparkinfer-source.py \
-      --source /opt/ds41rt/third_party/sparkinfer \
-      --lock /opt/ds41rt/third_party/sparkinfer.lock.json \
+RUN python3 /opt/cuteafd/scripts/verify-sparkinfer-source.py \
+      --source /opt/cuteafd/third_party/sparkinfer \
+      --lock /opt/cuteafd/third_party/sparkinfer.lock.json && \
+    locked_revision="$(python3 /opt/cuteafd/scripts/verify-sparkinfer-source.py \
+      --source /opt/cuteafd/third_party/sparkinfer \
+      --lock /opt/cuteafd/third_party/sparkinfer.lock.json \
       --print-revision)" && \
-    [ "${DS41RT_SPARKINFER_COMMIT}" != unknown ] && \
-    [ "${DS41RT_SPARKINFER_COMMIT}" = "$locked_revision" ] && \
+    [ "${CUTEAFD_SPARKINFER_COMMIT}" != unknown ] && \
+    [ "${CUTEAFD_SPARKINFER_COMMIT}" = "$locked_revision" ] && \
     uv pip install --system --break-system-packages --no-cache --no-deps \
-      --editable /opt/ds41rt/third_party/sparkinfer && \
+      --editable /opt/cuteafd/third_party/sparkinfer && \
     uv pip check && \
-    python3 -c 'import importlib.metadata, pathlib, b12x; source = pathlib.Path("/opt/ds41rt/third_party/sparkinfer").resolve(); module = pathlib.Path(b12x.__file__).resolve(); assert module.is_relative_to(source), (module, source); print(importlib.metadata.version("b12x"), module)' && \
-    python3 /opt/ds41rt/scripts/verify-sparkinfer-source.py \
-      --source /opt/ds41rt/third_party/sparkinfer \
-      --lock /opt/ds41rt/third_party/sparkinfer.lock.json \
+    python3 -c 'import importlib.metadata, pathlib, b12x; source = pathlib.Path("/opt/cuteafd/third_party/sparkinfer").resolve(); module = pathlib.Path(b12x.__file__).resolve(); assert module.is_relative_to(source), (module, source); print(importlib.metadata.version("b12x"), module)' && \
+    python3 /opt/cuteafd/scripts/verify-sparkinfer-source.py \
+      --source /opt/cuteafd/third_party/sparkinfer \
+      --lock /opt/cuteafd/third_party/sparkinfer.lock.json \
       --require-no-python-cache
 
-COPY .ds41rt-release-image/ds41rt /opt/ds41rt/bin/ds41rt
-COPY .ds41rt-release-image/libds41rt_native.so /opt/ds41rt/lib/libds41rt_native.so
-COPY .ds41rt-release-image/exl3 /opt/ds41rt/lib/exl3
-COPY .ds41rt-release-image/V41_EXPERT_AOT.json /opt/ds41rt/share/V41_EXPERT_AOT.json
-COPY .ds41rt-release-image/V41_EXPERT_TP_AOT.json /opt/ds41rt/share/V41_EXPERT_TP_AOT.json
-COPY .ds41rt-release-image/V41_FP8_AOT.json /opt/ds41rt/share/V41_FP8_AOT.json
-COPY .ds41rt-release-image/THIRD_PARTY_NOTICES.md /opt/ds41rt/share/THIRD_PARTY_NOTICES.md
-COPY .ds41rt-release-image/SPARKINFER_PROVENANCE.json /opt/ds41rt/share/SPARKINFER_PROVENANCE.json
-COPY .ds41rt-release-image/SPARKINFER_LICENSE /opt/ds41rt/share/SPARKINFER_LICENSE
-COPY .ds41rt-release-image/SPARKINFER_SHA256SUMS /opt/ds41rt/share/SPARKINFER_SHA256SUMS
-COPY .ds41rt-release-image/XGRAMMAR_PROVENANCE.json /opt/ds41rt/share/XGRAMMAR_PROVENANCE.json
-COPY .ds41rt-release-image/XGRAMMAR_LICENSE /opt/ds41rt/share/XGRAMMAR_LICENSE
-COPY .ds41rt-release-image/XGRAMMAR_SHA256SUMS /opt/ds41rt/share/XGRAMMAR_SHA256SUMS
-COPY python /opt/ds41rt/python
-COPY scripts/real-full-tcp-serve.sh /opt/ds41rt/scripts/real-full-tcp-serve.sh
-COPY scripts/kernel-cache-identity.py /opt/ds41rt/scripts/kernel-cache-identity.py
-COPY docker/release-entrypoint.sh /usr/local/bin/ds41rt-release-entrypoint
+COPY .cuteafd-release-image/cuteafd /opt/cuteafd/bin/cuteafd
+COPY .cuteafd-release-image/libcuteafd_native.so /opt/cuteafd/lib/libcuteafd_native.so
+COPY .cuteafd-release-image/exl3 /opt/cuteafd/lib/exl3
+COPY .cuteafd-release-image/V41_EXPERT_AOT.json /opt/cuteafd/share/V41_EXPERT_AOT.json
+COPY .cuteafd-release-image/V41_EXPERT_TP_AOT.json /opt/cuteafd/share/V41_EXPERT_TP_AOT.json
+COPY .cuteafd-release-image/V41_FP8_AOT.json /opt/cuteafd/share/V41_FP8_AOT.json
+COPY .cuteafd-release-image/THIRD_PARTY_NOTICES.md /opt/cuteafd/share/THIRD_PARTY_NOTICES.md
+COPY .cuteafd-release-image/SPARKINFER_PROVENANCE.json /opt/cuteafd/share/SPARKINFER_PROVENANCE.json
+COPY .cuteafd-release-image/SPARKINFER_LICENSE /opt/cuteafd/share/SPARKINFER_LICENSE
+COPY .cuteafd-release-image/SPARKINFER_SHA256SUMS /opt/cuteafd/share/SPARKINFER_SHA256SUMS
+COPY .cuteafd-release-image/XGRAMMAR_PROVENANCE.json /opt/cuteafd/share/XGRAMMAR_PROVENANCE.json
+COPY .cuteafd-release-image/XGRAMMAR_LICENSE /opt/cuteafd/share/XGRAMMAR_LICENSE
+COPY .cuteafd-release-image/XGRAMMAR_SHA256SUMS /opt/cuteafd/share/XGRAMMAR_SHA256SUMS
+COPY python /opt/cuteafd/python
+COPY scripts/real-full-tcp-serve.sh /opt/cuteafd/scripts/real-full-tcp-serve.sh
+COPY scripts/kernel-cache-identity.py /opt/cuteafd/scripts/kernel-cache-identity.py
+COPY docker/release-entrypoint.sh /usr/local/bin/cuteafd-release-entrypoint
 
 # Bake-time artifact corroboration, inside the existing verification layer: the
 # role manifest is written by scripts/write-v41-expert-tp-manifest.py from the AOT
 # export that was actually built, never from a build-arg, so a library the
 # manifest does not name, or a role set it does not record, is a stale or partial
-# .ds41rt-release-image directory rather than a built image. Existing manifest
+# .cuteafd-release-image directory rather than a built image. Existing manifest
 # schema only, no new verifier. Kernel execution and numerical/device
 # qualification remain the hardware gate the release checklist records.
-RUN for exl3_family in /opt/ds41rt/lib/exl3/exl3-k*/; do \
-      python3 /opt/ds41rt/python/tools/package_v41_exl3_aot.py verify \
-        --package "$exl3_family" --sparkinfer-revision "$DS41RT_SPARKINFER_COMMIT" \
-        --role "$DS41RT_ROLE" --runtime "$(python3 -m cutlass.cute.export.aot_config --libdir)/libcute_dsl_runtime.so"; \
+RUN for exl3_family in /opt/cuteafd/lib/exl3/exl3-k*/; do \
+      python3 /opt/cuteafd/python/tools/package_v41_exl3_aot.py verify \
+        --package "$exl3_family" --sparkinfer-revision "$CUTEAFD_SPARKINFER_COMMIT" \
+        --role "$CUTEAFD_ROLE" --runtime "$(python3 -m cutlass.cute.export.aot_config --libdir)/libcute_dsl_runtime.so"; \
     done && \
-    jq -e --arg role "$DS41RT_ROLE" --arg claimed "$DS41RT_V41_SPARK_TP_ROLES" --arg lib "$(sha256sum /opt/ds41rt/lib/libds41rt_native.so | cut -d" " -f1)" '($claimed | split(";") | map(select(. != "")) | sort) as $want | . as $doc | $doc.role == $role and $doc.native_library_sha256 == $lib and (($doc.spark_tp_roles // []) | sort) == $want and (($doc.manifests // {}) | keys | sort) == $want' /opt/ds41rt/share/V41_EXPERT_TP_AOT.json && \
+    jq -e --arg role "$CUTEAFD_ROLE" --arg claimed "$CUTEAFD_V41_SPARK_TP_ROLES" --arg lib "$(sha256sum /opt/cuteafd/lib/libcuteafd_native.so | cut -d" " -f1)" '($claimed | split(";") | map(select(. != "")) | sort) as $want | . as $doc | $doc.role == $role and $doc.native_library_sha256 == $lib and (($doc.spark_tp_roles // []) | sort) == $want and (($doc.manifests // {}) | keys | sort) == $want' /opt/cuteafd/share/V41_EXPERT_TP_AOT.json && \
     cmp -s \
-      /opt/ds41rt/third_party/sparkinfer/LICENSE \
-      /opt/ds41rt/share/SPARKINFER_LICENSE && \
-    (cd /opt/ds41rt/share && sha256sum -c SPARKINFER_SHA256SUMS) && \
-    (cd /opt/ds41rt/share && sha256sum -c XGRAMMAR_SHA256SUMS) && \
-    python3 /opt/ds41rt/scripts/sparkinfer-release-provenance.py \
-      --source /opt/ds41rt/third_party/sparkinfer \
-      --lock /opt/ds41rt/third_party/sparkinfer.lock.json \
-      --license /opt/ds41rt/share/SPARKINFER_LICENSE \
-      --notices /opt/ds41rt/share/THIRD_PARTY_NOTICES.md \
-      --verify /opt/ds41rt/share/SPARKINFER_PROVENANCE.json && \
+      /opt/cuteafd/third_party/sparkinfer/LICENSE \
+      /opt/cuteafd/share/SPARKINFER_LICENSE && \
+    (cd /opt/cuteafd/share && sha256sum -c SPARKINFER_SHA256SUMS) && \
+    (cd /opt/cuteafd/share && sha256sum -c XGRAMMAR_SHA256SUMS) && \
+    python3 /opt/cuteafd/scripts/sparkinfer-release-provenance.py \
+      --source /opt/cuteafd/third_party/sparkinfer \
+      --lock /opt/cuteafd/third_party/sparkinfer.lock.json \
+      --license /opt/cuteafd/share/SPARKINFER_LICENSE \
+      --notices /opt/cuteafd/share/THIRD_PARTY_NOTICES.md \
+      --verify /opt/cuteafd/share/SPARKINFER_PROVENANCE.json && \
     install -D -m 0644 \
-      /opt/ds41rt/share/SPARKINFER_LICENSE \
-      /opt/ds41rt/share/licenses/sparkinfer/LICENSE && \
+      /opt/cuteafd/share/SPARKINFER_LICENSE \
+      /opt/cuteafd/share/licenses/sparkinfer/LICENSE && \
     install -D -m 0644 \
-      /opt/ds41rt/share/XGRAMMAR_LICENSE \
-      /opt/ds41rt/share/licenses/xgrammar/LICENSE && \
+      /opt/cuteafd/share/XGRAMMAR_LICENSE \
+      /opt/cuteafd/share/licenses/xgrammar/LICENSE && \
     chmod +x \
-      /opt/ds41rt/bin/ds41rt \
-      /opt/ds41rt/scripts/real-full-tcp-serve.sh \
-      /usr/local/bin/ds41rt-release-entrypoint && \
+      /opt/cuteafd/bin/cuteafd \
+      /opt/cuteafd/scripts/real-full-tcp-serve.sh \
+      /usr/local/bin/cuteafd-release-entrypoint && \
     python3 -c 'import b12x_mla_capture, b12x_spark_capture, triton_kv_pack_capture, triton_mlp_capture, triton_router_capture, triton_sampling_capture'
 
-WORKDIR /opt/ds41rt
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/ds41rt-release-entrypoint"]
-CMD ["ds41rt", "--help"]
+WORKDIR /opt/cuteafd
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/cuteafd-release-entrypoint"]
+CMD ["cuteafd", "--help"]

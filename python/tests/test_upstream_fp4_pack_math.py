@@ -1,6 +1,6 @@
-"""CPU oracle for ds41rt FP4/FP8 pack-and-scale reference math (component C10).
+"""CPU oracle for cuteafd FP4/FP8 pack-and-scale reference math (component C10).
 
-ds41rt's KV/weights use FP4 E2M1 values with group-16 E4M3 scales, and FP8
+cuteafd's KV/weights use FP4 E2M1 values with group-16 E4M3 scales, and FP8
 for local 128-token windows (see repo README, "Compressed global KV uses FP4
 E2M1 values with group-16 E4M3 scales. The 128-token sliding windows remain
 FP8"). This file is the executable numpy-only reference those formats are
@@ -31,7 +31,7 @@ Reference math ported from upstream:
   style/tolerances (hand-written references, ``fp8_max = 448``,
   ``float4_e2m1 max = 6.0``).
 
-Upstream expectation notes (ds41rt-documented behavior asserted instead):
+Upstream expectation notes (cuteafd-documented behavior asserted instead):
 
 - E2M1 NaN handling: OCP E2M1 / MXFP4 gives the 4-bit payload NO NaN and
   NO infinity encoding — all 16 nibbles are finite (verified against the
@@ -41,16 +41,16 @@ Upstream expectation notes (ds41rt-documented behavior asserted instead):
   0b111 -> 6.0. Per the OCP saturating-convert convention (AMD CK
   sat_convert_to_type<f4_t>), NaN input saturates to the max-magnitude
   nibble (0x7 / 0xF); in MXFP4 containers NaN is instead signaled via the
-  E8M0 scale byte, which ds41rt's group-16 E4M3 scale slots do not use.
+  E8M0 scale byte, which cuteafd's group-16 E4M3 scale slots do not use.
 - Tail groups: upstream ``per_token_group_quant_fp8`` asserts
-  ``hidden_dim % group_size == 0`` and never sees a partial group. ds41rt's
+  ``hidden_dim % group_size == 0`` and never sees a partial group. cuteafd's
   format implies windows/tensors whose length is not necessarily a multiple
   of the group size, so the oracle's per-token-group quant implements
   upstream's group math with a tail extension: the partial last group keeps
   its own scale computed over only the elements present (never reads past
   the end of the tensor).
 COVERAGE CLASS: standalone reference oracle. These cases document upstream
-behavior with no ds41rt dependency; they cannot detect product regressions by
+behavior with no cuteafd dependency; they cannot detect product regressions by
 themselves. They are the comparison references for the deferred GPU parity
 tests (docs/test-coverage/DEFERRED.md), counted separately from product
 regression coverage (review MAJOR 4/6, 2026-09-15).
@@ -322,7 +322,7 @@ def nvfp4_dequantize_packed(packed: np.ndarray, scales_e4m3: np.ndarray, global_
 
 # ---------------------------------------------------------------------------
 # Per-token-group FP8 quantize (port of _per_token_group_quant_fp8 triton
-# reference math) with ds41rt tail-group semantics
+# reference math) with cuteafd tail-group semantics
 # ---------------------------------------------------------------------------
 
 
@@ -340,7 +340,7 @@ def per_token_group_quant_fp8(x: np.ndarray, group_size: int, eps: float = FP8_Q
     2^-33, UE8M0 byte 0x5E. The plain Triton reference omits the floor and
     would give 2^-42; the packed contract is what upstream pins.)
 
-    Tail semantics (ds41rt-documented; upstream asserts divisibility and
+    Tail semantics (cuteafd-documented; upstream asserts divisibility and
     never sees a partial group — see module docstring): the partial last
     group keeps its own scale computed over only the elements present and
     never reads past the end of the row.
@@ -463,7 +463,7 @@ def test_e2m1_magnitude_table_matches_upstream_pinned_vector():
 def test_e2m1_decode_all_16_nibbles_ocp_convention():
     # OCP E2M1 / MXFP4 has NO NaN or Inf payload encoding: all 16 nibbles
     # are finite, 0b111 -> 6.0 (AMD CK ocp_e2m1_mxfp4 reference; both
-    # upstream tables pin the same 8 magnitudes). ds41rt documents plain
+    # upstream tables pin the same 8 magnitudes). cuteafd documents plain
     # "FP4 E2M1 values", so the oracle asserts the full finite decode.
     nibbles = np.arange(16, dtype=np.uint8)
     decoded = decode_e2m1(nibbles)
@@ -671,7 +671,7 @@ def test_per_token_group_quant_fp8_group64_128_contract(shape, group_size, use_u
 
 @pytest.mark.parametrize("use_ue8m0", [False, True])
 def test_per_token_group_quant_fp8_tail_group_semantics(use_ue8m0):
-    # ds41rt tail-group contract (upstream asserts divisibility and never
+    # cuteafd tail-group contract (upstream asserts divisibility and never
     # sees a partial group; see module docstring): hidden=200 with
     # group_size=128 -> one full group + a 72-element tail with its own
     # scale, computed only over the elements present.

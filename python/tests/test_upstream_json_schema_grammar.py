@@ -1,7 +1,7 @@
-"""Upstream-ported JSON-schema -> grammar semantics pins (ds41rt component C2).
+"""Upstream-ported JSON-schema -> grammar semantics pins (cuteafd component C2).
 
 Ports llama.cpp's JSON-schema test corpus as *acceptance semantics* against
-xgrammar (the constrained-output engine ds41rt uses natively via its pinned
+xgrammar (the constrained-output engine cuteafd uses natively via its pinned
 third_party/xgrammar submodule):
 
 - ``llama.cpp/tests/test-json-schema.cpp`` — the 14 schema-semantics pin areas
@@ -16,7 +16,7 @@ third_party/xgrammar submodule):
 
 Parity note: llama.cpp's goldens pin GBNF *text*; this port pins the
 engine-independent contract (compiled grammar accepts valid documents and
-rejects invalid ones), because ds41rt consumes xgrammar, not llama.cpp's
+rejects invalid ones), because cuteafd consumes xgrammar, not llama.cpp's
 GBNF output. Where xgrammar 0.2.6 intentionally diverges from llama.cpp
 semantics (documented inline) the case is marked skip.
 

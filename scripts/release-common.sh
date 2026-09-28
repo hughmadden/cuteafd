@@ -3,11 +3,11 @@
 # The native API uses the recipe model identity for every supported checkpoint.
 # MODEL_ID selects Hugging Face storage and may name a routed-only quant.
 RELEASE_NATIVE_API_MODEL_ID=deepseek-ai/DeepSeek-V4.1-Flash
-RELEASE_COORDINATOR_CONTAINER_NAME=ds41rt-coordinator
-RELEASE_SPARK_CONTAINER_PREFIX=ds41rt-spark-expert
+RELEASE_COORDINATOR_CONTAINER_NAME=cuteafd-coordinator
+RELEASE_SPARK_CONTAINER_PREFIX=cuteafd-spark-expert
 
 release_die() {
-  echo "ds41rt release: $*" >&2
+  echo "cuteafd release: $*" >&2
   exit 2
 }
 
@@ -22,7 +22,7 @@ release_need() {
 # A wrong-owner or world-writable drop-in under /etc/ssh/ssh_config.d/ makes
 # OpenSSH abort with "Bad owner or permissions" before any host is contacted, and
 # an operator cannot fix that by wrapping only their own interactive ssh: the
-# internal calls are made by these scripts. DS41RT_RELEASE_SSH_CONFIG therefore
+# internal calls are made by these scripts. CUTEAFD_RELEASE_SSH_CONFIG therefore
 # resolves one option set that every site shares. Stock resolution is the default
 # because a build or serving host's ~/.ssh/config legitimately carries the host
 # aliases and identity files that reach the Sparks; BatchMode is always forced so a
@@ -34,9 +34,8 @@ release_need() {
 #   ./run.sh                          preflight, launch, readiness, EXIT teardown
 #   ./stop.sh, release_stop_*         container teardown
 #   ./push-containers.sh              publishing the Spark image from SPARK_0_HOST
-#   scripts/phase0-spark-tcp-bench.sh release benchmark driver
-# The standalone NOT-LAUNCH-READY harnesses - scripts/run-tp-ep-native-candidate.sh,
-# wip.sh and scripts/run-wip.sh - are deliberately outside this contract. They keep
+# The standalone NOT-LAUNCH-READY harnesses - scripts/run-tp-ep-native-candidate.sh
+# and wip.sh - are deliberately outside this contract. They keep
 # their own ssh forms (per-host bind addresses, argv rendered into a command string)
 # and are not release-pipeline-verified; they join when integrated, not before.
 #
@@ -97,8 +96,8 @@ _release_ssh_transport_configured=''
 # halfway through a build or a readiness poll would send later calls somewhere else.
 release_configure_ssh_transport() {
   [[ -z "$_release_ssh_transport_configured" ]] || return 0
-  release_ssh_config="${DS41RT_RELEASE_SSH_CONFIG-}"
-  release_validate_path_setting DS41RT_RELEASE_SSH_CONFIG "$release_ssh_config"
+  release_ssh_config="${CUTEAFD_RELEASE_SSH_CONFIG-}"
+  release_validate_path_setting CUTEAFD_RELEASE_SSH_CONFIG "$release_ssh_config"
   release_ssh_opts=(-o BatchMode=yes)
   if [[ -n "$release_ssh_config" ]]; then
     release_ssh_opts+=(-F "$release_ssh_config")
@@ -127,7 +126,7 @@ release_exl3_package_identity() {
   local revision="$1" manifest layout digest
   manifest="$(cat)"
   layout="$(jq -er --arg revision "$revision" '
-    if .schema == "ds41rt.exl3-package.v1" and .role == "spark"
+    if .schema == "cuteafd.exl3-package.v1" and .role == "spark"
       and .sparkinfer_revision == $revision
       and ((has("paired_tp4") | not) or (.paired_tp4 | type) == "boolean")
     then (if .paired_tp4 == true then "paired" else "disjoint" end)
@@ -285,10 +284,10 @@ release_load_config() {
   SPARK_EP=
   ADDR=0.0.0.0:8000
   EXPERT_PORT=19441
-  COORDINATOR_DOCKER_DEV=ds41rt-coordinator-dev
-  COORDINATOR_DOCKER_INFERENCE=ds41rt-coordinator
-  SPARK_EXPERT_DOCKER_DEV=ds41rt-spark-expert-dev
-  SPARK_EXPERT_DOCKER_INFERENCE=ds41rt-spark-expert
+  COORDINATOR_DOCKER_DEV=cuteafd-coordinator-dev
+  COORDINATOR_DOCKER_INFERENCE=cuteafd-coordinator
+  SPARK_EXPERT_DOCKER_DEV=cuteafd-spark-expert-dev
+  SPARK_EXPERT_DOCKER_INFERENCE=cuteafd-spark-expert
   for release_i in 0 1 2 3 4 5; do
     printf -v "SPARK_${release_i}_HOST" '%s' ""
     printf -v "SPARK_${release_i}_LANE_A" '%s' ""
@@ -558,7 +557,7 @@ release_validate_compact_spark() {
     ((PREFILL_BATCH_TOKENS >= 80 && PREFILL_BATCH_TOKENS <= 4096)) ||
     release_die "PREFILL_BATCH_TOKENS must be in 80..4096"
   if ((PREFILL_BATCH_TOKENS > 256)); then
-    echo "ds41rt release: compact Spark TP$SPARK_COUNT caps PREFILL_BATCH_TOKENS=$PREFILL_BATCH_TOKENS to 256 to fit the 32GiB ceiling" >&2
+    echo "cuteafd release: compact Spark TP$SPARK_COUNT caps PREFILL_BATCH_TOKENS=$PREFILL_BATCH_TOKENS to 256 to fit the 32GiB ceiling" >&2
     PREFILL_BATCH_TOKENS=256
   fi
   python3 - "$MEMORY_RESERVATION" <<'PY' || release_die "SPARK_COUNT=$SPARK_COUNT requires a positive absolute MEMORY_RESERVATION no greater than 32GiB (percentages are not allowed)"
@@ -679,21 +678,21 @@ release_lane_b_csv() {
 # `local-ip=device` comma-separated and must name unique IPv4 sources, which is
 # what multi-homed six-rank hosts (rhea/moa) need to pin a rail.
 release_validate_verbs_device_map() {
-  local map="${DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}"
+  local map="${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}"
   [[ -n "$map" ]] || return 0
   local -a entries=() seen_ips=()
   local entry ip dev prior
   IFS=',' read -ra entries <<<"$map"
   for entry in "${entries[@]}"; do
     [[ "$entry" == *=* ]] ||
-      release_die "invalid DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP entry: '$entry' (expected local-ip=device)"
+      release_die "invalid CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP entry: '$entry' (expected local-ip=device)"
     ip="${entry%%=*}"
     dev="${entry#*=}"
     [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && -n "$dev" ]] ||
-      release_die "invalid DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP entry: '$entry' (expected local-ip=device)"
+      release_die "invalid CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP entry: '$entry' (expected local-ip=device)"
     for prior in ${seen_ips[@]+"${seen_ips[@]}"}; do
       [[ "$ip" != "$prior" ]] ||
-        release_die "duplicate DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP ip: $ip"
+        release_die "duplicate CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP ip: $ip"
     done
     seen_ips+=("$ip")
   done
@@ -790,8 +789,8 @@ release_stop_host_api() {
   local pid command
   for pid in $pids; do
     command="$(ps -p "$pid" -o args= 2>/dev/null || true)"
-    [[ "$command" == *ds41rt*coordinator* ]] ||
-      release_die "port $port is owned by a non-DS41RT process: pid=$pid $command"
+    [[ "$command" == *cuteafd*coordinator* ]] ||
+      release_die "port $port is owned by a non-CUTEAFD process: pid=$pid $command"
     echo "  coordinator: stopping host API pid=$pid"
     kill -TERM "$pid"
   done
@@ -841,7 +840,7 @@ release_stop_services() {
   for host in "${active_hosts[@]}"; do
     [[ -n "$host" ]] || continue
     release_container="${spark_container_prefix}-${host}-${EXPERT_PORT}"
-    legacy_container="ds41rt-phase0-tcp-expertd-${host}-${EXPERT_PORT}"
+    legacy_container="cuteafd-phase0-tcp-expertd-${host}-${EXPERT_PORT}"
     release_stop_remote_containers \
       "$host" "$release_container" "$legacy_container" &
     stop_hosts+=("$host")
@@ -850,7 +849,7 @@ release_stop_services() {
   local index
   for index in "${!stop_pids[@]}"; do
     if ! wait "${stop_pids[$index]}"; then
-      echo "  ${stop_hosts[$index]}: failed to stop one or more DS41RT containers" >&2
+      echo "  ${stop_hosts[$index]}: failed to stop one or more CUTEAFD containers" >&2
       failed=1
     fi
   done
@@ -890,8 +889,8 @@ REMOTE
 }
 
 release_stop_wip_containers() {
-  local coordinator_container="${1:-ds41rt-coordinator-wip}"
-  local spark_container="${2:-ds41rt-spark-expert-wip}"
+  local coordinator_container="${1:-cuteafd-coordinator-wip}"
+  local spark_container="${2:-cuteafd-spark-expert-wip}"
   local failed=0
 
   release_stop_persistent_local_container "$coordinator_container" || failed=1
@@ -947,7 +946,7 @@ CONTAINER
 
 release_stop_wip_coordinator() {
   local coordinator_process="${1:-coordinator-${ADDR##*:}}"
-  local coordinator_container=ds41rt-coordinator-wip
+  local coordinator_container=cuteafd-coordinator-wip
 
   if docker container inspect "$coordinator_container" >/dev/null 2>&1 &&
     [[ "$(docker inspect -f '{{.State.Running}}' "$coordinator_container")" == true ]]; then
@@ -960,8 +959,8 @@ release_stop_wip_coordinator() {
 release_stop_wip_services() {
   local coordinator_process="${1:-coordinator-${ADDR##*:}}"
   local expert_process="${2:-expert-$EXPERT_PORT}"
-  local coordinator_container=ds41rt-coordinator-wip
-  local spark_container=ds41rt-spark-expert-wip
+  local coordinator_container=cuteafd-coordinator-wip
+  local spark_container=cuteafd-spark-expert-wip
   local failed=0
 
   release_stop_wip_coordinator "$coordinator_process" || failed=1

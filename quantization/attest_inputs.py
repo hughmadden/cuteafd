@@ -78,7 +78,7 @@ def attest(snapshot, corpus):
             actual = candidate(ids.to(device), mask, None)
             if not torch.equal(actual, expected):
                 raise AssertionError(f"PLE hashes differ on {device}, masked={masked}")
-    return dict(schema="ds41rt-input-attestation-v1", status="passed",
+    return dict(schema="cuteafd-input-attestation-v1", status="passed",
                 contract="raw-text-add-special-tokens-no-chat-no-truncation-v1",
                 corpus_sha256=digest(corpus), records=records, tokens=tokens, longest=longest,
                 token_stream_sha256=stream.hexdigest(), samples=samples,

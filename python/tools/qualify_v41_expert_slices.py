@@ -60,7 +60,7 @@ def main():
             options.native_lib,
             *(
                 [
-                    options.candidate_dir / f"w{width}" / "libds41rt_native.so"
+                    options.candidate_dir / f"w{width}" / "libcuteafd_native.so"
                     for width in (64, 128, 192)
                 ]
                 if options.candidate_dir
@@ -162,7 +162,7 @@ def main():
             src = (P * 6)(*[x.data_ptr() for x in sources])
             dst = (P * 4)(*[x[expert].data_ptr() for x in weights])
             check(
-                lib.ds41rt_v41_pack_expert_async(
+                lib.cuteafd_v41_pack_expert_async(
                     src, dst, 576, torch.cuda.current_stream().cuda_stream
                 )
             )
@@ -189,7 +189,7 @@ def main():
     if options.candidate_dir:
         for width in (64, 128, 192):
             candidate_lib = library(
-                str(options.candidate_dir / f"w{width}" / "libds41rt_native.so")
+                str(options.candidate_dir / f"w{width}" / "libcuteafd_native.so")
             )
             for capacity in (1, 16, 80):
                 native_variants[capacity, width] = Native(
@@ -352,7 +352,7 @@ def main():
                 ac = torch.empty(rows, 5120, device="cuda", dtype=torch.bfloat16)
                 bc = torch.empty_like(ac)
                 check(
-                    lib.ds41rt_v41_compact_routes_bf16_async(
+                    lib.cuteafd_v41_compact_routes_bf16_async(
                         base.data_ptr(),
                         ac.data_ptr(),
                         rows,
@@ -360,7 +360,7 @@ def main():
                     )
                 )
                 check(
-                    lib.ds41rt_v41_compact_routes_bf16_async(
+                    lib.cuteafd_v41_compact_routes_bf16_async(
                         candidate.data_ptr(),
                         bc.data_ptr(),
                         rows,

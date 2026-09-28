@@ -14,10 +14,10 @@ out. Keep this document current as implementation and execution advance.
   `tpurtell/GPTQModel` main for a new run, not a sister project's older checkout;
   pin the selected commit and subsequent qualified changes for reproducibility.
 - Vendor the fork under `third_party`, develop a separate V4.1 definition,
-  commit incrementally, and push the fork and ds41rt changes to their `main`
+  commit incrementally, and push the fork and cuteafd changes to their `main`
   branches. This checkout currently uses local branch `dev`; publish its
   commits with an explicit `HEAD:main` fast-forward, not the stale local `main`.
-- Build ds41rt's own documentation and scripts. `../glmrt` and `../ds4rt` are
+- Build cuteafd's own documentation and scripts. `../glmrt` and `../ds4rt` are
   references for the established corpus, calibration policy, checkpointing,
   mixed-tier allocation, and distributed trellis machinery.
 - Quantize only routed experts in BOTH the 40-block main model and three-block
@@ -59,7 +59,7 @@ out. Keep this document current as implementation and execution advance.
 ## Persistent run records and reconnection
 
 Planned stable run root on NVMe:
-`/home/tj/.cache/ds41rt/quantization/deepseek-v41-exl3-k325-v1/`.
+`/home/tj/.cache/cuteafd/quantization/deepseek-v41-exl3-k325-v1/`.
 The following layout is a required implementation contract, not a claim that
 these records or the launcher already exist:
 
@@ -131,7 +131,7 @@ then bind that same payload to the published commit without redownload.
 Recheck peak space including K3 candidates, selected K4, export and both PLE
 tables before launch; scratch is available if a full intermediate is necessary.
 
-Current state: no quantizer running. The user stopped the ds41rt server and
+Current state: no quantizer running. The user stopped the cuteafd server and
 released both GPUs on 2026-09-14; free memory was verified at approximately
 95 GiB per GPU. Build this repository's own workflow and documentation;
 the sister projects are implementation references, not this run's artifacts.
@@ -226,7 +226,7 @@ The real block 0 native comparison now passes exactly at both 32 and 129 tokens:
 zero output error, zero mHC pre-mix error, and zero error at every recorded
 attention/FFN input and output. The harness now fails on a nonzero output/carry
 difference. The final run exited 0; its persistent log is
-`/home/tj/.cache/ds41rt/quantization/deepseek-v41-exl3-k325-v1/reports/native-block0-parity.log`.
+`/home/tj/.cache/cuteafd/quantization/deepseek-v41-exl3-k325-v1/reports/native-block0-parity.log`.
 All seven existing component/source tests also pass.
 
 Additional discrepancies resolved in our separate GPTQModel implementation:
@@ -252,14 +252,14 @@ quantization qualification. The checkpoint's `inference/model.py` remains the
 architecture oracle. Preserve necessary arithmetic while measuring allocation
 and conversion costs; reference implementation inefficiencies are not required.
 
-Development container: `ds41rt-quant-dev`, based on local image
+Development container: `cuteafd-quant-dev`, based on local image
 `sha256:6213ea40c79617373562d7f2d3cc5fa25ca9d03e27dd213361b216c3e315e9f4`.
 It mounts this checkout at `/workspace`, source HF cache read-only at `/hf`,
 and uses both vendored Python source trees through PYTHONPATH. It is a development
 environment, not yet a reproducible production image. Run component gates with:
 
 ```bash
-docker exec -w /workspace ds41rt-quant-dev python -m unittest discover -s quantization/tests -v
+docker exec -w /workspace cuteafd-quant-dev python -m unittest discover -s quantization/tests -v
 ```
 
 ### Additional real-block gates (2026-09-14)
@@ -609,8 +609,8 @@ qualification.
 
 A real full dSpark block-0 diagnostic was started with `probe_block.py` using
 64 synthetic FFN rows, all 128 experts, and the exact 18/30/48 quotas. Its durable
-root is `/home/tj/Developer/ds41rt/.ds41rt-cache/quantization-diagnostics/mtp0-phase-v1`
-(container `/workspace/.ds41rt-cache/quantization-diagnostics/mtp0-phase-v1`).
+root is `/home/tj/Developer/cuteafd/.cuteafd-cache/quantization-diagnostics/mtp0-phase-v1`
+(container `/workspace/.cuteafd-cache/quantization-diagnostics/mtp0-phase-v1`).
 Persistent log: `reports/full-mtp0-phase-probe.log` under the standard run report
 root. Initial K3 gate/up candidates are committing successfully. Inspect the
 live process/journal before any restart; completion has not yet been established.
@@ -726,7 +726,7 @@ component tests pass (`reports/component-tests-worker.log`).
 `gptqmodel_ext` CUDA sources, onto the existing platform-local quantization base.
 The inspected base on ostrich is
 `sha256:a70e6af77cd323ae2fe507fbeb5f6353a6fdce3e9247d2d5b9632bf4c92a55ae`,
-bound locally to `ds41rt-quant-base:a70e6af77cd3` for Docker builds. Deployment
+bound locally to `cuteafd-quant-base:a70e6af77cd3` for Docker builds. Deployment
 must inspect/verify that binding; the tag alone is not sufficient identity.
 Current worker image on ostrich:
 `sha256:a555eaf016eeb9ddec333215a9dbc3c97b4e83733cf765cdfbd5340651a4319a`.
@@ -745,7 +745,7 @@ the initial image, before producing a candidate; its failure is preserved in
 `reports/spark-worker-search-probe.log`. The corrected image's probe is recorded
 separately in `reports/spark-worker-search-probe-ext.log`. It uses a synthetic
 5120x2304 weight and raw diagonal Hessian at count 1024, not production weights.
-The JIT cache uses the named Docker volume `ds41rt-quant-jit` on ostrich.
+The JIT cache uses the named Docker volume `cuteafd-quant-jit` on ostrich.
 The corrected K3 probe completed successfully in 31.49 seconds including JIT
 compilation, returning the expected 320x144x48 trellis and finite error metrics.
 The probe container exited normally; no worker service is running yet. Authenticated
@@ -754,9 +754,9 @@ required, as does the complete detached coordinator workflow.
 
 ### Four live authenticated workers and real-weight execution qualification
 
-All four hosts now run a detached container named `ds41rt-quant-worker`, serving
-port 17841 with authentication and persistent `ds41rt-quant-worker-state` and
-`ds41rt-quant-jit` Docker volumes. Restart policy is `no`: failure recovery remains
+All four hosts now run a detached container named `cuteafd-quant-worker`, serving
+port 17841 with authentication and persistent `cuteafd-quant-worker-state` and
+`cuteafd-quant-jit` Docker volumes. Restart policy is `no`: failure recovery remains
 explicit. No production quantization coordinator is running. Container/image IDs
 are saved in the run root's `workers.json`; inspect these containers and preserve
 their state rather than starting duplicates. Their Docker logs remain on each
@@ -1138,7 +1138,7 @@ serializer. The embedded discovery declaration contains only `quant_method`,
 The standalone `quantize_config.json` holds storage descriptors and actual K3/K4
 widths for all 47,232 routed projections, checked against the exact recipe and
 buffer geometry. The original source FP8/FP4 declaration is retained under
-`meta.ds41rt.native_quantization_config`; it is not incorrectly left as the active
+`meta.cuteafd.native_quantization_config`; it is not incorrectly left as the active
 declaration for the newly EXL3 routed weights. Architecture fields remain copied
 unchanged. Source-native naming and the requirement for loader validation are
 explicit; this metadata does not itself confer compatibility on an unmodified
@@ -1169,7 +1169,7 @@ host peak RSS alongside coordinator progress. Standard output repeats events for
 the eventual detached container log. Its terminal state is still
 weights-index-complete/model-validation-pending, not goal completion.
 
-Required manifest fields are schema `ds41rt-quantization-runtime-v1`, `identity`,
+Required manifest fields are schema `cuteafd-quantization-runtime-v1`, `identity`,
 absolute `snapshot`, `source_attestation`, `corpus`, `input_attestation`, `run_root`,
 `output`, `export_state`, `token_file`, and the fork's exact `RemoteEndpoint` and
 `CoordinatorSlot` records in `endpoints`/`coordinator_slots`. A production manifest
@@ -1224,7 +1224,7 @@ production quantization has not started. All 52 component tests pass again in
 
 `docker/Dockerfile.quant-coordinator` now derives from the inspected immutable
 coordinator base `sha256:6213ea40c79617373562d7f2d3cc5fa25ca9d03e27dd213361b216c3e315e9f4`.
-Before building, bind the local tag `ds41rt-quant-coordinator-base:6213ea40c796`
+Before building, bind the local tag `cuteafd-quant-coordinator-base:6213ea40c796`
 to that exact image ID. `coordinator-overlay.lock` pins the six additions/changes
 against that base (TileLang, TVM FFI, Tokenizers, cloudpickle, ml-dtypes, z3-solver),
 installed with `--no-deps` to preserve the remaining tested environment. The
@@ -1243,7 +1243,7 @@ the final one-shot launcher.
 The coordinator build completed and the final bundled-code layout is available
 as image ID
 `sha256:bc6237fda65dbd570985bd8b8d8325a18b52a96fcad88140632f49ff53413ee2`
-(`ds41rt-quant-coordinator:integration-v1`). Evidence:
+(`cuteafd-quant-coordinator:integration-v1`). Evidence:
 `reports/coordinator-image-build-final.log`. Its build-time imports verify
 Transformers 5.18.0.dev0 code/distribution agreement and the bundled GPTQModel
 path. `uv pip check` reports all 98 installed packages compatible. All 52
@@ -1267,7 +1267,7 @@ TileLang emitted a ThreadSync barrier-hoisting warning while compiling the nativ
 kernel; preserve this warning for review rather than implying this small numerical
 probe proves absence of all possible kernel races. Both qualification containers
 exited 0 and are retained for inspection. The persistent JIT volume is
-`ds41rt-quant-coordinator-jit`. These are diagnostics, not production quantization.
+`cuteafd-quant-coordinator-jit`. These are diagnostics, not production quantization.
 
 ### Sparse-attention ThreadSync warning review
 
@@ -1494,10 +1494,10 @@ removed automatically; no model payloads were modified. Before launch both RTX
 GPUs were idle, RAM available was 174 GiB, and NVMe free space was 1,002 GiB.
 
 Production was launched through the detached one-shot entry point with manifest
-`/home/tj/.cache/ds41rt/quantization/deepseek-v41-exl3-k325-v1/production-manifest.json`.
+`/home/tj/.cache/cuteafd/quantization/deepseek-v41-exl3-k325-v1/production-manifest.json`.
 Attempt `20a7062c30244474aead819b422f57af` uses container
 `48b9c21b0ee41b6f48bde92863a01fe3defcb1a3eb0385eecb772c740bb8a384`
-(`ds41rt-quant-20a7062c30244474aead819b422f57af`). Its full log is under the run
+(`cuteafd-quant-20a7062c30244474aead819b422f57af`). Its full log is under the run
 root at `attempts/20a7062c30244474aead819b422f57af.log`. Launch is not evidence of
 committed layers or completion; inspect runtime events and Docker state for
 current progress. Stay on close monitoring until several blocks commit safely
@@ -1591,7 +1591,7 @@ The explicit `--resume` launch uses run-root `production-recovery-manifest.json`
 which references the unchanged original manifest and checksum-pinned memory
 report. New attempt `e8983b98e3c54311b6da645aef4a0cbc` is container
 `217cc7704799839ffbbca240f28f3a064490adfc317c5436bdd2225f4b6683a7`
-(`ds41rt-quant-e8983b98e3c54311b6da645aef4a0cbc`). Its log is
+(`cuteafd-quant-e8983b98e3c54311b6da645aef4a0cbc`). Its log is
 `attempts/e8983b98e3c54311b6da645aef4a0cbc.log` under the run root. Preserve the
 original stopped attempt and all committed inputs. Launch does not establish
 stable production memory; monitor input reuse and subsequent blocks closely
@@ -1659,7 +1659,7 @@ correctness are established; further performance benchmarking is not a launch
 gate. The already-running warm probe may finish, but do not launch more probes
 just to refine performance numbers.
 
-The new `ds41rt-continuous-search-recovery-v1` authorization references the prior
+The new `cuteafd-continuous-search-recovery-v1` authorization references the prior
 serializer recovery manifest and checksum-pinned exact six-device report.
 Only coordinator image/preflight may change; data identity, recipe, model,
 corpus, GPU topology and remote workers remain unchanged. The prior serializer
@@ -1687,7 +1687,7 @@ starting.
 The detached `--resume` launch uses run-local
 `production-continuous-manifest.json`. Attempt `175fe546bf71472fa12d79e5d64980ad`
 is container `e3860a0a92da54bb5555e759ce2f363786ed64ad9ff091d16d53947085c10e62`
-(`ds41rt-quant-175fe546bf71472fa12d79e5d64980ad`). Its full log is
+(`cuteafd-quant-175fe546bf71472fa12d79e5d64980ad`). Its full log is
 `attempts/175fe546bf71472fa12d79e5d64980ad.log`. Initial Docker inspection shows
 running, OOM false. This launch record alone does not establish successful
 recovery or stable layer throughput/memory; inspect subsequent durable events.
@@ -1848,12 +1848,12 @@ not rewritten. See README for the exact migration arguments. The first local
 preparation attempt as uid 1000 stopped at the root-owned export-state directory
 before any remote writes; preparation and publication then ran through the
 existing root coordinator environment, with final new files restored to uid
-1000. `ds41rt-numbered-shards-publish` exited 0 and retains persistent logs.
+1000. `cuteafd-numbered-shards-publish` exited 0 and retains persistent logs.
 
 Cache `refs/main` now points to the new revision. The materializer supports an
 explicit previous-commit guard, creates the complete snapshot first, and then
 atomically advances the ref; it never renames entries inside the old snapshot.
-`ds41rt-numbered-shards-offline-audit` passed with networking disabled as uid
+`cuteafd-numbered-shards-offline-audit` passed with networking disabled as uid
 1000: all 94 files resolve, all 52 weight inodes and blob IDs match the original,
 all old snapshot fingerprints are unchanged, and the index names exactly the
 52 new shards with PLE tensors in the final four. Anonymous Hub inspection

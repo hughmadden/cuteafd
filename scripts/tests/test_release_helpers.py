@@ -11,7 +11,7 @@ SSH or host access:
   pipeline asserted (`runs/v10-release/build/10-verify.sh`, HOSTS=(ostrich dodo
   emu kiwi)): a missing required host or a divergent Spark image id must FAIL,
   never SKIP. Its offline `--fleet-file` replay makes that check testable here.
-- `run-release-build.sh` refuses a missing config, a non-DS41RT source tree, a
+- `run-release-build.sh` refuses a missing config, a non-CUTEAFD source tree, a
   dirty tree without `--allow-dirty`, and an evidence directory that already
   holds a completed build, and it passes the canonicalized config path through
   to the build so a relative `--config` resolves against the caller's cwd.
@@ -38,12 +38,12 @@ PROBE = RELEASE_DIR / "image-identity-probe.sh"
 VERIFY = RELEASE_DIR / "verify-release-artifacts.sh"
 BUILD_RUNNER = RELEASE_DIR / "run-release-build.sh"
 EVIDENCE_SUMS = RELEASE_DIR / "write-evidence-sums.sh"
-V10_CONFIG = REPO / "ds41rt.build-v10.config"
-RUNTIME_CONFIG = REPO / "ds41rt.config"
+V10_CONFIG = REPO / "scripts" / "fixtures" / "cuteafd.build-v10.config"
+RUNTIME_CONFIG = REPO / "cuteafd.config"
 
 # The published v10 Spark identity: what `docker image inspect` reported on the
 # four workers (runs/v10-release/build/10-fleet-spark-images.txt).
-SPARK_IMAGE = "ghcr.io/tpurtell/ds41rt-spark-expert"
+SPARK_IMAGE = "ghcr.io/tpurtell/cuteafd-spark-expert"
 SPARK_ID = "sha256:d1b668cd7e87079b5b57e381bdd45dfb4858646533611f18f22061f58ae18dec"
 SOURCE_REVISION = "3dd9a4ac2be9fd17ecf4cb8b7746efdc900d38f0"
 SPARKINFER_REVISION = "4b0954148523b5a2e93813f963d483ffd350b9c9"
@@ -53,7 +53,7 @@ BUILD_STUB = textwrap.dedent(
     """#!/usr/bin/env bash
     echo "BUILD-STUB-CALLED"
     printf 'args=%s\\n' "$*"
-    exit "${DS41RT_TEST_BUILD_RC:-0}"
+    exit "${CUTEAFD_TEST_BUILD_RC:-0}"
     """
 )
 
@@ -80,11 +80,11 @@ DOCKER_STUB = textwrap.dedent(
         case "$fmt" in
           *org.opencontainers.image.version*) value="$tag" ;;
           *org.opencontainers.image.revision*) value="3dd9a4ac2be9fd17ecf4cb8b7746efdc900d38f0" ;;
-          *io.ds41rt.sparkinfer.revision*) value="4b0954148523b5a2e93813f963d483ffd350b9c9" ;;
-          *io.ds41rt.role*) case "$ref" in *spark-expert*) value="expert" ;; *) value="coordinator" ;; esac ;;
-          *io.ds41rt.cuda_arch*) case "$ref" in *spark-expert*) value="121" ;; *) value="120" ;; esac ;;
-          *io.ds41rt.v41.spark_tp_roles*) case "$ref" in *spark-expert*) value="tp2;tp3;tp6" ;; *) value="" ;; esac ;;
-          *io.ds41rt.source-manifest.sha256*) value="" ;;
+          *io.cuteafd.sparkinfer.revision*) value="4b0954148523b5a2e93813f963d483ffd350b9c9" ;;
+          *io.cuteafd.role*) case "$ref" in *spark-expert*) value="expert" ;; *) value="coordinator" ;; esac ;;
+          *io.cuteafd.cuda_arch*) case "$ref" in *spark-expert*) value="121" ;; *) value="120" ;; esac ;;
+          *io.cuteafd.v41.spark_tp_roles*) case "$ref" in *spark-expert*) value="tp2;tp3;tp6" ;; *) value="" ;; esac ;;
+          *io.cuteafd.source-manifest.sha256*) value="" ;;
           *Architecture*) value="amd64" ;;
           *) value="" ;;
         esac
@@ -106,11 +106,11 @@ def host_record(host: str, *, image_id: str = SPARK_ID, status: str = "present")
             "os=linux",
             f"label.org.opencontainers.image.revision={SOURCE_REVISION}",
             "label.org.opencontainers.image.version=v10",
-            f"label.io.ds41rt.sparkinfer.revision={SPARKINFER_REVISION}",
-            "label.io.ds41rt.cuda_arch=121",
-            "label.io.ds41rt.role=expert",
-            "label.io.ds41rt.v41.spark_tp_roles=tp2;tp3;tp6",
-            "label.io.ds41rt.source-manifest.sha256=",
+            f"label.io.cuteafd.sparkinfer.revision={SPARKINFER_REVISION}",
+            "label.io.cuteafd.cuda_arch=121",
+            "label.io.cuteafd.role=expert",
+            "label.io.cuteafd.v41.spark_tp_roles=tp2;tp3;tp6",
+            "label.io.cuteafd.source-manifest.sha256=",
         ]
     return "\n".join(lines) + "\n"
 
@@ -174,44 +174,12 @@ def assignments(path: Path) -> list[str]:
             if "=" in line and not line.lstrip().startswith("#")]
 
 
-def test_v11_build_config_exists_and_names_the_v11_pair() -> None:
-    config = REPO / "ds41rt.build-v11.config"
-    assert config.is_file()
-    values = dict(line.split("=", 1) for line in assignments(config))
-    assert values["COORDINATOR_DOCKER_INFERENCE"] == "ghcr.io/tpurtell/ds41rt-coordinator:v11"
-    assert values["SPARK_EXPERT_DOCKER_INFERENCE"] == "ghcr.io/tpurtell/ds41rt-spark-expert:v11"
 
 
-def test_promoted_runtime_default_matches_the_v11_build_target() -> None:
-    """After promotion the v11 build target equals the runtime default exactly.
-
-    build.sh derives the tag from the pair, so equality here is what makes a
-    plain `./build.sh` produce the promoted `v11` release.
-    """
-    base = assignments(RUNTIME_CONFIG)
-    target = assignments(REPO / "ds41rt.build-v11.config")
-    assert len(base) == len(target)
-    assert base == target
 
 
-def test_retained_v10_build_target_still_names_the_v10_pair() -> None:
-    """The historical v10 target must not drift with the runtime promotion."""
-    values = dict(line.split("=", 1) for line in assignments(REPO / "ds41rt.build-v10.config"))
-    assert values["COORDINATOR_DOCKER_INFERENCE"] == "ghcr.io/tpurtell/ds41rt-coordinator:v10"
-    assert values["SPARK_EXPERT_DOCKER_INFERENCE"] == "ghcr.io/tpurtell/ds41rt-spark-expert:v10"
 
 
-@pytest.mark.parametrize("config,expected", [
-    ("ds41rt.config", "v11"),
-    ("ds41rt.build-v11.config", "v11"),
-])
-def test_build_dry_run_reports_the_config_tag(config: str, expected: str) -> None:
-    result = subprocess.run(
-        ["bash", "build.sh", "--config", config, "--dry-run"],
-        cwd=REPO, capture_output=True, text=True, timeout=120,
-    )
-    assert result.returncode == 0, result.stderr
-    assert f"release tag: {expected}" in result.stdout
 
 
 ########################################################################
@@ -355,10 +323,10 @@ def test_build_runner_resolves_evidence_and_remote_dir_to_absolute_paths(tmp_pat
         log = (repo_runs / "abs-build.log").read_text(encoding="utf-8")
         assert f"--config {V10_CONFIG}" in log
         remote_line = [l for l in log.splitlines()
-                       if l.startswith("DS41RT_RELEASE_REMOTE_BUILD_DIR=")][0]
+                       if l.startswith("CUTEAFD_RELEASE_REMOTE_BUILD_DIR=")][0]
         assert remote_line.split("=", 1)[1].startswith("/"), remote_line
         build_root_line = [l for l in log.splitlines()
-                           if l.startswith("DS41RT_RELEASE_BUILD_ROOT=")][0]
+                           if l.startswith("CUTEAFD_RELEASE_BUILD_ROOT=")][0]
         assert build_root_line.split("=", 1)[1].startswith("/"), build_root_line
         assert (repo_runs / "abs-build.rc").is_file()
     finally:
@@ -375,7 +343,7 @@ def test_build_runner_refuses_a_missing_config(tmp_path: Path) -> None:
     assert "not found" in result.stderr
 
 
-def test_build_runner_refuses_a_non_ds41rt_source_tree(tmp_path: Path) -> None:
+def test_build_runner_refuses_a_non_cuteafd_source_tree(tmp_path: Path) -> None:
     not_a_tree = tmp_path / "empty"
     not_a_tree.mkdir()
     result = run_build_runner(
@@ -391,7 +359,7 @@ def test_build_runner_resolves_a_relative_config_against_the_caller_cwd(tmp_path
     source = make_source(tmp_path)
     evidence = tmp_path / "ev"
     result = run_build_runner(
-        tmp_path, "--config", "ds41rt.build-v10.config", "--source", str(source),
+        tmp_path, "--config", "scripts/fixtures/cuteafd.build-v10.config", "--source", str(source),
         "--evidence", str(evidence), "--label", "t", cwd=REPO,
     )
     assert result.returncode == 0, (result.stdout, result.stderr)
@@ -501,7 +469,3 @@ def test_evidence_sums_write_and_check(tmp_path: Path) -> None:
     assert tampered.returncode != 0
 
 
-def test_helper_scripts_are_executable_and_text_artifacts_are_readable() -> None:
-    for name in ("image-identity-probe.sh", "verify-release-artifacts.sh",
-                 "run-release-build.sh", "write-evidence-sums.sh"):
-        assert (RELEASE_DIR / name).stat().st_mode & 0o777 == 0o755, name

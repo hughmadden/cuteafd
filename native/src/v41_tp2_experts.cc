@@ -1,10 +1,10 @@
 // TP2 modules and handles are independent of dSpark and full-width RTX experts.
-#define DS41RT_V41_LOCAL_EXPERTS 1
-#define DS41RT_V41_TP2_EXPERTS 1
-#define ds41rt_v41_expert_info ds41rt_v41_tp2_expert_info
-#define ds41rt_v41_expert_initialize ds41rt_v41_tp2_expert_initialize
-#define ds41rt_v41_expert_output_kind ds41rt_v41_tp2_expert_output_kind
-#define ds41rt_v41_expert_bind_scratch ds41rt_v41_tp2_expert_bind_scratch
-#define ds41rt_v41_expert_initialize_scratch_async ds41rt_v41_tp2_expert_initialize_scratch_async
-#define ds41rt_v41_expert_launch ds41rt_v41_tp2_expert_launch
+#define CUTEAFD_V41_LOCAL_EXPERTS 1
+#define CUTEAFD_V41_TP2_EXPERTS 1
+#define cuteafd_v41_expert_info cuteafd_v41_tp2_expert_info
+#define cuteafd_v41_expert_initialize cuteafd_v41_tp2_expert_initialize
+#define cuteafd_v41_expert_output_kind cuteafd_v41_tp2_expert_output_kind
+#define cuteafd_v41_expert_bind_scratch cuteafd_v41_tp2_expert_bind_scratch
+#define cuteafd_v41_expert_initialize_scratch_async cuteafd_v41_tp2_expert_initialize_scratch_async
+#define cuteafd_v41_expert_launch cuteafd_v41_tp2_expert_launch
 #include "v41_experts.cc"

@@ -3,16 +3,16 @@
 #
 # STATUS: NOT LAUNCH-READY. Plan/dry-run and the CPU tests may be used now. A
 # live start additionally needs the ARM64 `expertd-native` daemon build, the
-# uniform `/scratch/candidate/libds41rt_native.so` staged on every rank, a clear
+# uniform `/scratch/candidate/libcuteafd_native.so` staged on every rank, a clear
 # uniform-artifact copy, and an L3 grant. Do not treat a plan pass as readiness.
 #
 # Confirmed official snapshot inside every Spark container:
 # /root/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277
 #
-# Runs already-built, frozen `ds41rt` daemon + native libraries inside the
-# isolated `ds41rt-tpep-*` development containers. It never creates, renames or
+# Runs already-built, frozen `cuteafd` daemon + native libraries inside the
+# isolated `cuteafd-tpep-*` development containers. It never creates, renames or
 # removes a container, never touches a production name
-# (`ds41rt-coordinator` / `ds41rt-spark-expert-*`) and never builds an image.
+# (`cuteafd-coordinator` / `cuteafd-spark-expert-*`) and never builds an image.
 #
 # The v8 release fleet is currently stopped by the TP×EP preflight leases; this
 # launcher does not restore it. Baseline restoration is the separate explicit
@@ -32,7 +32,7 @@
 #   * readiness is the real API health + native model advertisement plus a
 #     running candidate process on every rank, never just a live container;
 #   * `plan` (default / --dry-run) prints the exact command vectors and changes
-#     nothing; `start` additionally requires DS41RT_TPEP_L3_GRANT=1.
+#     nothing; `start` additionally requires CUTEAFD_TPEP_L3_GRANT=1.
 #
 # Requires scripts/release-common.sh for config parsing and admission only.
 set -euo pipefail
@@ -53,9 +53,9 @@ usage() {
 Usage: scripts/run-tp-ep-native-candidate.sh [plan|start|status|stop] [OPTIONS]
 
 plan (default, same as --dry-run) prints the exact commands and exits.
-start runs them; it fails closed unless DS41RT_TPEP_L3_GRANT=1 is exported.
+start runs them; it fails closed unless CUTEAFD_TPEP_L3_GRANT=1 is exported.
 
-  --config FILE                    configuration (default ds41rt.config)
+  --config FILE                    configuration (default cuteafd.config)
   --rtx-gpus 1|2                   RTX layout (default: config RTX_GPUS when 1|2)
   --first-layer N                  expected Spark first layer; 2 RTX must match
                                    the published plan, 1 RTX must be 0
@@ -65,9 +65,9 @@ start runs them; it fails closed unless DS41RT_TPEP_L3_GRANT=1 is exported.
   --api-port N                     candidate API port (default 18000)
   --expert-port N                  candidate expert port (default 29441)
   --listen HOST                    API bind host (default 127.0.0.1)
-  --coordinator-container NAME     default ds41rt-tpep-nvme-dev
-  --spark-container NAME           default ds41rt-tpep-dev
-  --daemon-bin PATH                in-container ds41rt binary
+  --coordinator-container NAME     default cuteafd-tpep-nvme-dev
+  --spark-container NAME           default cuteafd-tpep-dev
+  --daemon-bin PATH                in-container cuteafd binary
   --coordinator-native-lib PATH    in-container coordinator native library
   --spark-native-lib PATH          in-container Spark native library
   --spark-lib-source PATH          in-container built Spark library to stage
@@ -84,19 +84,19 @@ start runs them; it fails closed unless DS41RT_TPEP_L3_GRANT=1 is exported.
   --wip-runtime-root PATH          candidate PID/log root (default /scratch/candidate/run)
   --coordinator-cuda-visible-devices UUID,UUID
                                    ordered coordinator GPU UUIDs; coordinator
-                                   container only. Env: DS41RT_TPEP_COORDINATOR_CUDA_VISIBLE_DEVICES
+                                   container only. Env: CUTEAFD_TPEP_COORDINATOR_CUDA_VISIBLE_DEVICES
   --placement-root PATH            candidate placement root
   --host-artifact-root PATH        local ext4 artifact root for the fs guard
   --dspark-draft-limit N           coordinator dSpark draft limit (default 7 for
                                    2 RTX, 5 for 1 RTX; must match corpus config)
-  --host-device-map VALUE          DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP for
+  --host-device-map VALUE          CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP for
                                    both roles (all-local-IP union is accepted;
                                    the native parser selects this host's IP)
   --spark-ssh RANK=DEST            repeatable: ssh destination for one rank
                                    (e.g. 4=172.22.2.5 for rhea over MGMT)
   --spark-ssh-bind IP              pin every ssh source to this local address
   --tcp-timing VALUE               startup diagnostic (forwarded to BOTH roles as
-                                   DS41RT_PROTOCOL_V2_TCP_TIMING) that makes the
+                                   CUTEAFD_PROTOCOL_V2_TCP_TIMING) that makes the
                                    transport emit the selected device/GID line.
                                    No production default: unset means no RC proof
                                    line and the six-rank GID capture fails closed.
@@ -118,7 +118,7 @@ case "${1:-}" in
   *) release_die "unknown mode: $1 (expected plan, start, status or stop)" ;;
 esac
 
-config="$repo_root/ds41rt.config"
+config="$repo_root/cuteafd.config"
 rtx_gpus_override=""
 first_layer=""
 run_id=""
@@ -127,17 +127,17 @@ qualified=0
 api_port=18000
 expert_port=29441
 listen_host=127.0.0.1
-coordinator_container="ds41rt-tpep-nvme-dev"
-spark_container="ds41rt-tpep-dev"
-daemon_bin="/scratch/candidate/ds41rt"
-coordinator_native_lib="/scratch/coord-native/libds41rt_native.so"
+coordinator_container="cuteafd-tpep-nvme-dev"
+spark_container="cuteafd-tpep-dev"
+daemon_bin="/scratch/candidate/cuteafd"
+coordinator_native_lib="/scratch/coord-native/libcuteafd_native.so"
 # Uniform per-rank contract: every Spark container reads its own
-# /scratch/candidate/libds41rt_native.so (Spark /scratch is the local
-# /home/tj/ds41rt-tpep bind). The dodo L4 build output is staged from here.
-spark_native_lib="/scratch/candidate/libds41rt_native.so"
-spark_lib_source="/scratch/spark-tp-aot-dodo/native/libds41rt_native.so"
-spark_lib_source_host="/home/tj/ds41rt-tpep/l4/spark-tp-aot-dodo/native/libds41rt_native.so"
-spark_lib_stage_host="/home/tj/ds41rt-tpep/candidate/libds41rt_native.so"
+# /scratch/candidate/libcuteafd_native.so (Spark /scratch is the local
+# /home/tj/cuteafd-tpep bind). The dodo L4 build output is staged from here.
+spark_native_lib="/scratch/candidate/libcuteafd_native.so"
+spark_lib_source="/scratch/spark-tp-aot-dodo/native/libcuteafd_native.so"
+spark_lib_source_host="/home/tj/cuteafd-tpep/l4/spark-tp-aot-dodo/native/libcuteafd_native.so"
+spark_lib_stage_host="/home/tj/cuteafd-tpep/candidate/libcuteafd_native.so"
 snapshot_override=""
 role_manifest=""
 expect_coordinator_lib_sha256=""
@@ -150,11 +150,11 @@ spark_wip_process=""
 # under the artifact bind instead of the container's /wip/run.
 wip_runtime_root="/scratch/candidate/run"
 placement_root="/scratch/candidate/placement"
-host_artifact_root="/home/tj/.cache/ds41rt/builds/tp-ep"
+host_artifact_root="/home/tj/.cache/cuteafd/builds/tp-ep"
 # Optional coordinator-only GPU pin. The config's COORDINATOR_GPU is a single
 # index and cannot express the ordered RTX pair, so the candidate takes the
 # exact ordered UUID CSV explicitly; it is never inferred from a hidden lookup.
-coordinator_cuda_visible_devices="${DS41RT_TPEP_COORDINATOR_CUDA_VISIBLE_DEVICES:-}"
+coordinator_cuda_visible_devices="${CUTEAFD_TPEP_COORDINATOR_CUDA_VISIBLE_DEVICES:-}"
 capacity_override=""
 dspark_draft_limit=""
 host_device_map=""
@@ -303,22 +303,22 @@ if [[ -n "$ssh_bind_ip" ]]; then
   [[ "$ssh_bind_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
     release_die "--spark-ssh-bind must be an IPv4 address, got: $ssh_bind_ip"
 fi
-[[ -z "$host_device_map" ]] || export DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP="$host_device_map"
+[[ -z "$host_device_map" ]] || export CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP="$host_device_map"
 # Explicit startup diagnostic only; never a production default. When set it is
 # forwarded to both roles so the transport emits the client/server GID lines.
-[[ -z "$tcp_timing" ]] || export DS41RT_PROTOCOL_V2_TCP_TIMING="$tcp_timing"
+[[ -z "$tcp_timing" ]] || export CUTEAFD_PROTOCOL_V2_TCP_TIMING="$tcp_timing"
 
 if [[ -z "$wip_process" ]]; then
-  [[ "$coordinator_container" == "ds41rt-tpep-nvme-dev" ]] ||
+  [[ "$coordinator_container" == "cuteafd-tpep-nvme-dev" ]] ||
     release_die "coordinator container '$coordinator_container' is not the known layout; pass --wip-process explicitly (no silent fallback)"
   wip_process="/scratch/coord-native-source/scripts/wip-process.sh"
 fi
 if [[ -z "$spark_wip_process" ]]; then
-  # The Spark containers mount the staged source at /workspace/ds41rt; the
+  # The Spark containers mount the staged source at /workspace/cuteafd; the
   # frozen coordinator source is not present there.
-  [[ "$spark_container" == "ds41rt-tpep-dev" ]] ||
+  [[ "$spark_container" == "cuteafd-tpep-dev" ]] ||
     release_die "Spark container '$spark_container' is not the known layout; pass --spark-wip-process explicitly (no silent fallback)"
-  spark_wip_process="/workspace/ds41rt/scripts/wip-process.sh"
+  spark_wip_process="/workspace/cuteafd/scripts/wip-process.sh"
 fi
 
 expert_capacity="${capacity_override}"
@@ -403,26 +403,26 @@ fi
 render() { printf '%q ' "$@"; }
 
 # NUL-separated `-e KEY=VALUE` args carrying the candidate runtime environment.
-# DS41RT_NATIVE_LIB is the transport's only native-library path: verbs falls
+# CUTEAFD_NATIVE_LIB is the transport's only native-library path: verbs falls
 # back to a relative native/build* candidate otherwise, which would load a
 # wrong or missing RDMA library. It must match --native-lib exactly. Only the
 # native/RDMA runtime keys are forwarded; release quant env is not cloned.
 candidate_env_args() {
   local native_lib="$1" forward
-  printf '%s\0' -e "DS41RT_NATIVE_LIB=$native_lib"
-  printf '%s\0' -e "DS41RT_WIP_RUNTIME_ROOT=$wip_runtime_root"
+  printf '%s\0' -e "CUTEAFD_NATIVE_LIB=$native_lib"
+  printf '%s\0' -e "CUTEAFD_WIP_RUNTIME_ROOT=$wip_runtime_root"
   # main.rs uses EnvFilter::from_default_env(), which is ERROR when unset, so
   # the readiness/placement tracing::info lines are invisible without this.
   # A user filter that hides them makes the readiness waits time out (nonzero).
   printf '%s\0' -e "RUST_LOG=${RUST_LOG:-info}"
   for forward in \
-    DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP \
-    DS41RT_VERBS_APP_IB_PORT_NUM \
-    DS41RT_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES \
-    DS41RT_PROTOCOL_V2_TCP_TIMING \
-    DS41RT_SPARKINFER_SOURCE_DIR \
+    CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP \
+    CUTEAFD_VERBS_APP_IB_PORT_NUM \
+    CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES \
+    CUTEAFD_PROTOCOL_V2_TCP_TIMING \
+    CUTEAFD_SPARKINFER_SOURCE_DIR \
     PYTHONPATH \
-    DS41RT_PYTHON; do
+    CUTEAFD_PYTHON; do
     [[ -z "${!forward:-}" ]] || printf '%s\0' -e "$forward=${!forward}"
   done
 }
@@ -430,12 +430,12 @@ candidate_env_args() {
 # d129 device map: `local-ip=device` entries, required on BOTH roles so the
 # verbs host layer binds the intended HCA instead of guessing. Fail closed on a
 # malformed or duplicate local IP rather than forwarding a broken map.
-if [[ -n "${DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" ]]; then
+if [[ -n "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" ]]; then
   declare -A device_map_seen=()
-  IFS=',' read -ra device_map_entries <<<"$DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP"
+  IFS=',' read -ra device_map_entries <<<"$CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP"
   for entry in "${device_map_entries[@]}"; do
     [[ "$entry" == *"="* && -n "${entry%%=*}" && -n "${entry#*=}" ]] ||
-      release_die "invalid DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP entry: '$entry' (expected local-ip=device)"
+      release_die "invalid CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP entry: '$entry' (expected local-ip=device)"
     device_map_ip="${entry%%=*}"
     [[ "$device_map_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
       release_die "invalid device-map local IP: '$device_map_ip'"
@@ -547,8 +547,8 @@ start_expert() {
 # Live helpers. Only reachable through an explicit L3 grant.
 # ---------------------------------------------------------------------------
 require_l3_grant() {
-  [[ "${DS41RT_TPEP_L3_GRANT:-0}" == "1" ]] ||
-    release_die "live start is gated: export DS41RT_TPEP_L3_GRANT=1 after the parent records an L3 lease"
+  [[ "${CUTEAFD_TPEP_L3_GRANT:-0}" == "1" ]] ||
+    release_die "live start is gated: export CUTEAFD_TPEP_L3_GRANT=1 after the parent records an L3 lease"
 }
 
 # Print running|stopped|absent|unreachable for a container on a host. An absent
@@ -575,7 +575,7 @@ require_candidate_containers() {
   local container
   for container in "$coordinator_container" "$spark_container"; do
     case "$container" in
-      ds41rt-coordinator|ds41rt-coordinator-wip|ds41rt-spark-expert|ds41rt-spark-expert-wip|ds41rt-spark-expert-*)
+      cuteafd-coordinator|cuteafd-coordinator-wip|cuteafd-spark-expert|cuteafd-spark-expert-wip|cuteafd-spark-expert-*)
         release_die "container '$container' is a production/shared name; the candidate launcher refuses to start or stop it" ;;
     esac
   done
@@ -587,10 +587,10 @@ require_candidate_containers() {
 candidate_process_running() {
   local host="$1" container="$2" process="$3" wip="$4" status
   if [[ "$host" == "$(hostname)" || "$host" == "localhost" ]]; then
-    status="$(docker exec -e "DS41RT_WIP_RUNTIME_ROOT=$wip_runtime_root" "$container" "$wip" status "$process" 2>/dev/null || true)"
+    status="$(docker exec -e "CUTEAFD_WIP_RUNTIME_ROOT=$wip_runtime_root" "$container" "$wip" status "$process" 2>/dev/null || true)"
   else
     status="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" \
-      "docker exec -e 'DS41RT_WIP_RUNTIME_ROOT=$wip_runtime_root' '$container' '$wip' status '$process'" 2>/dev/null || true)"
+      "docker exec -e 'CUTEAFD_WIP_RUNTIME_ROOT=$wip_runtime_root' '$container' '$wip' status '$process'" 2>/dev/null || true)"
   fi
   [[ "$status" == running\ * ]]
 }
@@ -598,10 +598,10 @@ candidate_process_running() {
 candidate_log_tail() {
   local host="$1" container="$2" process="$3" wip="$4"
   if [[ "$host" == "$(hostname)" || "$host" == "localhost" ]]; then
-    docker exec -e "DS41RT_WIP_RUNTIME_ROOT=$wip_runtime_root" "$container" "$wip" log "$process" 80 2>/dev/null || true
+    docker exec -e "CUTEAFD_WIP_RUNTIME_ROOT=$wip_runtime_root" "$container" "$wip" log "$process" 80 2>/dev/null || true
   else
     ssh -o BatchMode=yes "$host" \
-      "docker exec -e 'DS41RT_WIP_RUNTIME_ROOT=$wip_runtime_root' '$container' '$wip' log '$process' 80" 2>/dev/null || true
+      "docker exec -e 'CUTEAFD_WIP_RUNTIME_ROOT=$wip_runtime_root' '$container' '$wip' log '$process' 80" 2>/dev/null || true
   fi
 }
 
@@ -662,12 +662,12 @@ worker_log_offset() {
   # previous run's log after a transient failure.
   probe='if [ -e "$1" ]; then stat -c %s "$1"; else echo 0; fi'
   if [[ "$host" == "$(hostname)" || "$host" == "localhost" ]]; then
-    output="$(docker exec -e "DS41RT_WIP_RUNTIME_ROOT=$wip_runtime_root" "$spark_container" \
+    output="$(docker exec -e "CUTEAFD_WIP_RUNTIME_ROOT=$wip_runtime_root" "$spark_container" \
       sh -c "$probe" sh "$log")" ||
       release_die "failed to read worker log size on $host (container/stat error)"
   else
     output="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" \
-      "docker exec -e 'DS41RT_WIP_RUNTIME_ROOT=$wip_runtime_root' '$spark_container' sh -c '$probe' sh '$log'")" ||
+      "docker exec -e 'CUTEAFD_WIP_RUNTIME_ROOT=$wip_runtime_root' '$spark_container' sh -c '$probe' sh '$log'")" ||
       release_die "failed to read worker log size on $host (ssh/container/stat error)"
   fi
   [[ "$output" =~ ^[0-9]+$ ]] ||
@@ -679,11 +679,11 @@ worker_log_since() {
   local host="$1" offset="$2" log
   log="$(worker_log_file)"
   if [[ "$host" == "$(hostname)" || "$host" == "localhost" ]]; then
-    docker exec -e "DS41RT_WIP_RUNTIME_ROOT=$wip_runtime_root" "$spark_container" \
+    docker exec -e "CUTEAFD_WIP_RUNTIME_ROOT=$wip_runtime_root" "$spark_container" \
       tail -c "+$((offset + 1))" "$log" 2>/dev/null || true
   else
     ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" \
-      "docker exec -e 'DS41RT_WIP_RUNTIME_ROOT=$wip_runtime_root' '$spark_container' tail -c '+$((offset + 1))' '$log'" 2>/dev/null || true
+      "docker exec -e 'CUTEAFD_WIP_RUNTIME_ROOT=$wip_runtime_root' '$spark_container' tail -c '+$((offset + 1))' '$log'" 2>/dev/null || true
   fi
 }
 
@@ -715,7 +715,7 @@ worker_ready_line_matches() {
 # process-death detection.
 wait_for_worker_ready() {
   local resolved="$1"
-  local deadline=$((SECONDS + ${DS41RT_TPEP_WORKER_READY_TIMEOUT_SECONDS:-900}))
+  local deadline=$((SECONDS + ${CUTEAFD_TPEP_WORKER_READY_TIMEOUT_SECONDS:-900}))
   local -a pending=()
   local rank host slice_text
   for rank in "${!hosts[@]}"; do pending+=("$rank"); done
@@ -738,14 +738,14 @@ wait_for_worker_ready() {
     pending=("${still[@]}")
     ((${#pending[@]})) || break
     if ((!announced)); then
-      echo "== waiting for candidate worker readiness ($spark_world rank(s), timeout ${DS41RT_TPEP_WORKER_READY_TIMEOUT_SECONDS:-900}s) =="
+      echo "== waiting for candidate worker readiness ($spark_world rank(s), timeout ${CUTEAFD_TPEP_WORKER_READY_TIMEOUT_SECONDS:-900}s) =="
       announced=1
     fi
     ((SECONDS < deadline)) || {
       for rank in "${pending[@]}"; do
         candidate_log_tail "${hosts[$rank]}" "$spark_container" "$expert_process" "$spark_wip_process" >&2 || true
       done
-      release_die "candidate worker readiness timed out (set RUST_LOG to include daemon info, or raise DS41RT_TPEP_WORKER_READY_TIMEOUT_SECONDS)"
+      release_die "candidate worker readiness timed out (set RUST_LOG to include daemon info, or raise CUTEAFD_TPEP_WORKER_READY_TIMEOUT_SECONDS)"
     }
     sleep 1
   done
@@ -801,7 +801,7 @@ prepare_placement_directory() {
 }
 
 wait_for_candidate_ready() {
-  local deadline=$((SECONDS + ${DS41RT_TPEP_READY_TIMEOUT_SECONDS:-900}))
+  local deadline=$((SECONDS + ${CUTEAFD_TPEP_READY_TIMEOUT_SECONDS:-900}))
   local probe_host="$listen_host"
   [[ "$probe_host" != "0.0.0.0" ]] || probe_host=127.0.0.1
   local api_url="http://$probe_host:$api_port"
@@ -810,7 +810,7 @@ wait_for_candidate_ready() {
     candidate_process_running localhost "$coordinator_container" "$coordinator_process" "$wip_process" ||
       release_die "candidate coordinator process exited during startup"
     ((SECONDS < deadline)) ||
-      release_die "candidate API did not become ready within ${DS41RT_TPEP_READY_TIMEOUT_SECONDS:-900}s"
+      release_die "candidate API did not become ready within ${CUTEAFD_TPEP_READY_TIMEOUT_SECONDS:-900}s"
     sleep 1
   done
   local rank host
@@ -827,7 +827,7 @@ first_bounded_request() {
   [[ "$probe_host" != "0.0.0.0" ]] || probe_host=127.0.0.1
   api_url="http://$probe_host:$api_port"
   payload="{\"model\":\"$RELEASE_NATIVE_API_MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"1+1\"}],\"max_tokens\":1,\"temperature\":0,\"stream\":false}"
-  curl -fsS -m "${DS41RT_TPEP_FIRST_REQUEST_TIMEOUT_SECONDS:-120}" -o /dev/null \
+  curl -fsS -m "${CUTEAFD_TPEP_FIRST_REQUEST_TIMEOUT_SECONDS:-120}" -o /dev/null \
     -H 'Content-Type: application/json' -d "$payload" "$api_url/v1/chat/completions" ||
     release_die "bounded first request failed; the lazy RDMA connections were not initialized"
   echo "  first bounded request accepted (lazy RDMA connections initialized)"
@@ -873,7 +873,7 @@ start_candidate() {
     prepare_placement_directory
     echo "== starting candidate coordinator (plan handshake, run $run_id) =="
     start_coordinator
-    local deadline=$((SECONDS + ${DS41RT_TPEP_PLAN_TIMEOUT_SECONDS:-300})) plan
+    local deadline=$((SECONDS + ${CUTEAFD_TPEP_PLAN_TIMEOUT_SECONDS:-300})) plan
     while ! plan="$(docker exec "$coordinator_container" cat "$placement_dir/plan.json" 2>/dev/null)"; do
       if ! candidate_process_running localhost "$coordinator_container" "$coordinator_process" "$wip_process"; then
         candidate_log_tail localhost "$coordinator_container" "$coordinator_process" "$wip_process" >&2 || true
@@ -951,7 +951,7 @@ process_action() {
   state="$(container_state localhost "$coordinator_container")"
   case "$state" in
     running)
-      docker exec -e "DS41RT_WIP_RUNTIME_ROOT=$wip_runtime_root" "$coordinator_container" "$wip_process" "$action" "$coordinator_process" || failed=1 ;;
+      docker exec -e "CUTEAFD_WIP_RUNTIME_ROOT=$wip_runtime_root" "$coordinator_container" "$wip_process" "$action" "$coordinator_process" || failed=1 ;;
     absent|stopped)
       echo "coordinator $coordinator_container: $state (no candidate process to $action)" ;;
     unreachable)
@@ -963,10 +963,10 @@ process_action() {
     case "$state" in
       running)
         if [[ "$host" == "$(hostname)" || "$host" == "localhost" ]]; then
-          docker exec -e "DS41RT_WIP_RUNTIME_ROOT=$wip_runtime_root" "$spark_container" "$spark_wip_process" "$action" "$expert_process" || failed=1
+          docker exec -e "CUTEAFD_WIP_RUNTIME_ROOT=$wip_runtime_root" "$spark_container" "$spark_wip_process" "$action" "$expert_process" || failed=1
         else
           ssh -o BatchMode=yes "$host" \
-            "docker exec -e 'DS41RT_WIP_RUNTIME_ROOT=$wip_runtime_root' '$spark_container' '$spark_wip_process' '$action' '$expert_process'" || failed=1
+            "docker exec -e 'CUTEAFD_WIP_RUNTIME_ROOT=$wip_runtime_root' '$spark_container' '$spark_wip_process' '$action' '$expert_process'" || failed=1
         fi ;;
       absent|stopped)
         echo "$host $spark_container: $state (no candidate process to $action)" ;;

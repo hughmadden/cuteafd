@@ -24,18 +24,18 @@ def main():
 
     torch.manual_seed(91641)
     lib = C.CDLL(str(args.native_lib.resolve()))
-    create = lib.ds41rt_v41_vocabulary_shard_create
+    create = lib.cuteafd_v41_vocabulary_shard_create
     create.argtypes = [C.c_void_p, C.c_uint64, C.c_int32, C.POINTER(C.c_void_p)]
-    launch = lib.ds41rt_v41_vocabulary_head_launch
+    launch = lib.cuteafd_v41_vocabulary_head_launch
     launch.argtypes = [C.c_void_p] * 4 + [C.c_int32, C.c_void_p]
-    destroy = lib.ds41rt_v41_markov_destroy
+    destroy = lib.cuteafd_v41_markov_destroy
     destroy.argtypes = [C.c_void_p]
     candidate_lib = None
     if args.candidate_native_lib:
         candidate_lib = C.CDLL(str(args.candidate_native_lib.resolve()))
-        candidate_lib.ds41rt_v41_vocabulary_shard_create.argtypes = create.argtypes
-        candidate_lib.ds41rt_v41_vocabulary_head_launch.argtypes = launch.argtypes
-        candidate_lib.ds41rt_v41_markov_destroy.argtypes = destroy.argtypes
+        candidate_lib.cuteafd_v41_vocabulary_shard_create.argtypes = create.argtypes
+        candidate_lib.cuteafd_v41_vocabulary_head_launch.argtypes = launch.argtypes
+        candidate_lib.cuteafd_v41_markov_destroy.argtypes = destroy.argtypes
     report = dict(scope=__doc__, command=sys.argv,
         revision=subprocess.check_output(['git', '-C', str(args.b12x_root), 'rev-parse', 'HEAD'], text=True).strip(),
         native_sha256=hashlib.sha256(args.native_lib.read_bytes()).hexdigest(),
@@ -66,7 +66,7 @@ def main():
         assert create(workspace.data_ptr(), workspace.numel(), vocab, C.byref(handle)) == 0
         candidate_handle = C.c_void_p()
         if candidate_lib:
-            assert candidate_lib.ds41rt_v41_vocabulary_shard_create(
+            assert candidate_lib.cuteafd_v41_vocabulary_shard_create(
                 workspace.data_ptr(), workspace.numel(), vocab, C.byref(candidate_handle)) == 0
         try:
             for rows in (1, 4, 16):
@@ -85,7 +85,7 @@ def main():
                 functions = {'native': native_run, 'upstream_fp32': upstream_run}
                 if candidate_lib:
                     def candidate_run():
-                        assert candidate_lib.ds41rt_v41_vocabulary_head_launch(
+                        assert candidate_lib.cuteafd_v41_vocabulary_head_launch(
                             candidate_handle, x.data_ptr(), weight.data_ptr(), candidate.data_ptr(),
                             rows, torch.cuda.current_stream().cuda_stream) == 0
                     functions['candidate_native'] = candidate_run
@@ -145,7 +145,7 @@ def main():
             torch.cuda.synchronize()
             assert destroy(handle) == 0
             if candidate_lib:
-                assert candidate_lib.ds41rt_v41_markov_destroy(candidate_handle) == 0
+                assert candidate_lib.cuteafd_v41_markov_destroy(candidate_handle) == 0
 
 
 if __name__ == '__main__':

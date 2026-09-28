@@ -2,14 +2,14 @@
 """CPU-only behavioural proof that the release build root really moves.
 
 `build.sh` binds one unique per-task path into both release container legs and
-exports it as `DS41RT_RELEASE_BUILD_ROOT`; `build-release-artifacts.sh` creates its
+exports it as `CUTEAFD_RELEASE_BUILD_ROOT`; `build-release-artifacts.sh` creates its
 writable staging copy beneath that parent and builds the daemon and the native
 library there. Relocating it cannot be done with `TMPDIR`, because mktemp is handed
 an absolute template, so this test drives the real script twice with stub
 `cargo`/`cmake`/`python3` on PATH and reads back every directory those stages were
 asked to write:
 
-* unset -> the historical `/tmp/ds41rt-release-build.XXXXXX` scratch, removed after;
+* unset -> the historical `/tmp/cuteafd-release-build.XXXXXX` scratch, removed after;
 * set   -> only paths beneath the requested parent, and that parent is what the
   filesystem guard was asked about.
 
@@ -33,8 +33,8 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 SIBLING = REPO / "scripts" / "tests" / "test_release_artifact_build_paths.py"
 # Root NVMe, workspace-local and excluded from the release source inventory
-# (.ds41rt-cache is in the manifest tool's ignored names).
-SCRATCH = REPO / ".ds41rt-cache" / "test-release-build-root"
+# (.cuteafd-cache is in the manifest tool's ignored names).
+SCRATCH = REPO / ".cuteafd-cache" / "test-release-build-root"
 
 
 def _load_harness():
@@ -61,8 +61,8 @@ def _recording_shims(log: Path, guard_log: Path) -> dict[str, str]:
             set -euo pipefail
             printf '%s\\n' "$CARGO_TARGET_DIR" >>{log}
             mkdir -p "$CARGO_TARGET_DIR/release"
-            printf 'daemon\\n' >"$CARGO_TARGET_DIR/release/ds41rt"
-            chmod +x "$CARGO_TARGET_DIR/release/ds41rt"
+            printf 'daemon\\n' >"$CARGO_TARGET_DIR/release/cuteafd"
+            chmod +x "$CARGO_TARGET_DIR/release/cuteafd"
             """,
         "cmake": f"""
             #!/usr/bin/env bash
@@ -77,7 +77,7 @@ def _recording_shims(log: Path, guard_log: Path) -> dict[str, str]:
             [[ -n "$build_dir" ]] || exit 0
             printf '%s\\n' "$build_dir" >>{log}
             mkdir -p "$build_dir/v41_experts" "$build_dir/v41_fp8"
-            printf 'native\\n' >"$build_dir/libds41rt_native.so"
+            printf 'native\\n' >"$build_dir/libcuteafd_native.so"
             printf '{{}}\\n' >"$build_dir/v41_experts/v41_experts.json"
             printf '{{}}\\n' >"$build_dir/v41_fp8/v41_fp8.json"
             """,
@@ -139,12 +139,12 @@ def _recorded_dirs(
     env = dict(os.environ)
     env["PATH"] = f"{shims}:{env['PATH']}"
     env.pop("CARGO_TARGET_DIR", None)
-    env.pop("DS41RT_RELEASE_SPARK_TP_ROLES", None)
-    env.pop("DS41RT_RELEASE_BUILD_ROOT", None)
+    env.pop("CUTEAFD_RELEASE_SPARK_TP_ROLES", None)
+    env.pop("CUTEAFD_RELEASE_BUILD_ROOT", None)
     if build_root is not None:
         if create:
             build_root.mkdir(parents=True, exist_ok=True)
-        env["DS41RT_RELEASE_BUILD_ROOT"] = str(build_root)
+        env["CUTEAFD_RELEASE_BUILD_ROOT"] = str(build_root)
 
     result = subprocess.run(
         ["bash", str(HARNESS.SCRIPT), str(src), "coordinator", "120", str(output)],
@@ -163,8 +163,8 @@ def _recorded_dirs(
 def test_default_build_root_is_the_container_tmp_scratch_and_is_removed(tmp_path):
     written, guarded, _ = _recorded_dirs(tmp_path, None)
     for path in written:
-        assert str(path).startswith("/tmp/ds41rt-release-build."), path
-    roots = {part for path in written for part in path.parts if part.startswith("ds41rt-release-build.")}
+        assert str(path).startswith("/tmp/cuteafd-release-build."), path
+    roots = {part for path in written for part in path.parts if part.startswith("cuteafd-release-build.")}
     assert len(roots) == 1, f"one build root per invocation, saw {roots}"
     survivor = Path("/tmp") / roots.pop()
     assert not survivor.exists(), f"{survivor} survived the build"
@@ -178,7 +178,7 @@ def test_relocated_root_covers_every_write_and_replaces_the_tmp_probe(tmp_path):
     written, guarded, _ = _recorded_dirs(tmp_path, build_root)
     for path in written:
         assert path.is_relative_to(build_root), path
-    assert all("/tmp/ds41rt-release-build." not in str(path) for path in written), written
+    assert all("/tmp/cuteafd-release-build." not in str(path) for path in written), written
     probes = [arguments for arguments in guarded if str(build_root) in arguments]
     assert probes, f"the relocated parent must be what the guard probes: {guarded}"
     assert not any("/tmp" in arguments for arguments in guarded), (
@@ -199,7 +199,7 @@ def test_a_requested_root_the_container_cannot_write_reports_the_cause(tmp_path)
         HARNESS._write_stub(shims / name, body)
     env = dict(os.environ)
     env["PATH"] = f"{shims}:{env['PATH']}"
-    env["DS41RT_RELEASE_BUILD_ROOT"] = str(missing)
+    env["CUTEAFD_RELEASE_BUILD_ROOT"] = str(missing)
     result = subprocess.run(
         ["bash", str(HARNESS.SCRIPT), str(src), "coordinator", "120", str(tmp_path / "output")],
         capture_output=True,

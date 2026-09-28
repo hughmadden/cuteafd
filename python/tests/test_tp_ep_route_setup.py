@@ -24,7 +24,7 @@ FIXTURE = ROOT / "scripts" / "fixtures" / "tp-ep-reuse-m64-e384.json"
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("ds41rt_route_setup", HARNESS)
+    spec = importlib.util.spec_from_file_location("cuteafd_route_setup", HARNESS)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -94,7 +94,7 @@ def test_fixture_partial_rows_select_a_prefix_not_a_suffix():
 def test_multiple_rows_request_fails_closed_before_loading(tmp_path):
     """A malformed multi-row fixture must be rejected, not silently mis-selected."""
     bad = tmp_path / "bad.json"
-    bad.write_text(json.dumps({"schema": "ds41rt.tp-ep-reuse-fixture.v1",
+    bad.write_text(json.dumps({"schema": "cuteafd.tp-ep-reuse-fixture.v1",
                                "routes": [[0, 1, 2, 3, 4, 5]]}))
     with pytest.raises(ValueError):
         timing.build_route_table(opts(bad), 384, rows=8, capacity=80)
@@ -216,7 +216,7 @@ def test_measure_group_no_longer_references_a_preloop_rows_binding():
 def _bench():
     import importlib.util
     spec = importlib.util.spec_from_file_location(
-        "ds41rt_bank_label_bench", ROOT / "python" / "tools" /
+        "cuteafd_bank_label_bench", ROOT / "python" / "tools" /
         "benchmark_v41_ep_groups.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -254,7 +254,7 @@ def test_operand_identity_uses_the_shared_label():
 def _parse(args):
     import importlib.util
     spec = importlib.util.spec_from_file_location(
-        "ds41rt_parse_args", ROOT / "python" / "tools" / "bench_tp_ep_kernel.py")
+        "cuteafd_parse_args", ROOT / "python" / "tools" / "bench_tp_ep_kernel.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.parse_args(args)
@@ -262,7 +262,7 @@ def _parse(args):
 
 BASE = ["--topologies", "tp4", "--ep-degree", "1", "--widths", "192",
         "--capacity", "80", "--operands", "synthetic",
-        "--output", "/tmp/ds41rt-parse-args-test.json"]
+        "--output", "/tmp/cuteafd-parse-args-test.json"]
 
 
 def test_parse_args_rejects_empty_rows_gracefully():

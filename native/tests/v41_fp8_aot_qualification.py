@@ -46,7 +46,7 @@ def main():
         ]
 
     def bind(name, signature):
-        fn = getattr(lib, "ds41rt_v41_fp8_" + name)
+        fn = getattr(lib, "cuteafd_v41_fp8_" + name)
         fn.argtypes, fn.restype = signature, i32
 
         def checked(*values):

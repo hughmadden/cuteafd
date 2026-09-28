@@ -15,19 +15,19 @@ The Spark image must advertise the V41 expert roles it carries (./build.sh bakes
 the universal tp2;tp3;tp6 set by default); a role-less legacy build is rejected.
 
 --config FILE selects the configuration that names the local image pair to
-publish (default: ./ds41rt.config, which after the v10 runtime promotion names
+publish (default: ./cuteafd.config, which after the v10 runtime promotion names
 the v10 pair). The explicit v10 BUILD target is retained and is now identical
 to the runtime default:
-  ./push-containers.sh --config ds41rt.build-v10.config v10
+  ./push-containers.sh --config cuteafd.build-v10.config v10
 The tag argument is unchanged and is still what both images are published as;
 the two GHCR repositories are fixed.
 
 Examples:
   ./push-containers.sh v10
-  ./push-containers.sh --config ds41rt.build-v10.config v10
+  ./push-containers.sh --config cuteafd.build-v10.config v10
 
 Every remote step shares one SSH option set with ./build.sh and ./run.sh:
-  DS41RT_RELEASE_SSH_CONFIG       ssh config file to use (default empty: stock
+  CUTEAFD_RELEASE_SSH_CONFIG       ssh config file to use (default empty: stock
                                   OpenSSH resolution; BatchMode is always forced so
                                   a publish can never wait on a prompt).
                                   /dev/null discards a broken system include but
@@ -36,7 +36,7 @@ Every remote step shares one SSH option set with ./build.sh and ./run.sh:
 EOF
 }
 
-config="$repo_root/ds41rt.config"
+config="$repo_root/cuteafd.config"
 tag=
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -78,15 +78,15 @@ release_need ssh
 
 # One SSH option set for the whole release pipeline: scripts/release-common.sh owns
 # it. Resolved here, after the tag and configuration validation, so a mistyped
-# DS41RT_RELEASE_SSH_CONFIG is reported as itself before the daemon is queried and
+# CUTEAFD_RELEASE_SSH_CONFIG is reported as itself before the daemon is queried and
 # before any Spark is contacted. The Spark image was placed on $SPARK_0_HOST through
 # that same transport, so publishing it from that host has to use it as well.
 release_configure_ssh_transport
 
-coordinator_repository="ghcr.io/tpurtell/ds41rt-coordinator"
-spark_repository="ghcr.io/tpurtell/ds41rt-spark-expert"
+coordinator_repository="ghcr.io/tpurtell/cuteafd-coordinator"
+spark_repository="ghcr.io/tpurtell/cuteafd-spark-expert"
 spark_host="$SPARK_0_HOST"
-expected_source="https://github.com/tpurtell/ds41rt"
+expected_source="https://github.com/tpurtell/cuteafd"
 
 # The published pair is universal: ./build.sh bakes the TP2/TP3/TP6 Spark expert
 # shards by default on top of the always-built TP4 shard, and the release launcher
@@ -156,13 +156,13 @@ spark_roles="$(
     "$SPARK_EXPERT_DOCKER_INFERENCE" <<'REMOTE'
 set -euo pipefail
 docker image inspect \
-  -f '{{index .Config.Labels "io.ds41rt.v41.spark_tp_roles"}}' "$1"
+  -f '{{index .Config.Labels "io.cuteafd.v41.spark_tp_roles"}}' "$1"
 REMOTE
 )"
 [[ "$spark_roles" != "<no value>" ]] || spark_roles=
 push_require_universal_roles "$spark_roles" "$SPARK_EXPERT_DOCKER_INFERENCE"
 
-echo "Publishing DS41RT containers"
+echo "Publishing CUTEAFD containers"
 echo "  revision:    $coordinator_revision"
 echo "  expert roles: $spark_roles"
 echo "  coordinator: $coordinator_repository:$tag"

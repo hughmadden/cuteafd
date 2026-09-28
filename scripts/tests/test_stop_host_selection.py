@@ -164,7 +164,7 @@ class StopHostScopeTest(StopHarness):
         self.assertEqual(result.returncode, 0, result.stderr)
         for host in SIX_HOSTS:
             self.assertTrue(
-                any(f"host={host}" in line and "ds41rt-spark-expert-wip" in line
+                any(f"host={host}" in line and "cuteafd-spark-expert-wip" in line
                     for line in lines),
                 f"WIP container not stopped on {host}: {lines}",
             )
@@ -270,7 +270,7 @@ class StopFailureAggregationTest(StopHarness):
         for host in SIX_HOSTS:
             self.assertTrue(
                 any(f"host={host}" in line and
-                    f"ds41rt-spark-expert-{host}-19441" in line for line in lines),
+                    f"cuteafd-spark-expert-{host}-19441" in line for line in lines),
                 f"release phase skipped for {host}: {lines}",
             )
         self.assertIn("could not be stopped", result.stderr)

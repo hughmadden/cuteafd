@@ -2,11 +2,11 @@
 #include <mutex>
 #include "v41_index_score.h"
 namespace {
-ds41rt_v41_index_score_Kernel_Module_t module{};
+cuteafd_v41_index_score_Kernel_Module_t module{};
 std::atomic<int> loaded_device[2]{{-1},{-1}};
 std::mutex initialization;
 }
-extern "C" int32_t ds41rt_v41_index_scores_initialize() {
+extern "C" int32_t cuteafd_v41_index_scores_initialize() {
   int device=-1;
   auto status=cudaGetDevice(&device); if(status)return status;
   for(auto& owner:loaded_device)if(owner.load(std::memory_order_acquire)==device)return 0;
@@ -22,8 +22,8 @@ extern "C" int32_t ds41rt_v41_index_scores_initialize() {
   // library on both devices rather than overwriting them with a second library.
   const bool existing=module.module!=nullptr;
   void* init[]={&ptr,&status};
-  if(!existing)_mlir_ds41rt_v41_index_score_cuda_init(init);
-  if(!status) {void* load[]={&ptr,&device,&status}; _mlir_ds41rt_v41_index_score_cuda_load_to_device(load);}
+  if(!existing)_mlir_cuteafd_v41_index_score_cuda_init(init);
+  if(!status) {void* load[]={&ptr,&device,&status}; _mlir_cuteafd_v41_index_score_cuda_load_to_device(load);}
   if(status) {
     if(!existing) {if(module.module)cudaLibraryUnload(module.module);module.module=nullptr;}
     return status;
@@ -31,7 +31,7 @@ extern "C" int32_t ds41rt_v41_index_scores_initialize() {
   loaded_device[slot].store(device,std::memory_order_release);
   return 0;
 }
-extern "C" int32_t ds41rt_v41_index_scores_overlay_aot(
+extern "C" int32_t cuteafd_v41_index_scores_overlay_aot(
     const uint8_t* q,const uint8_t* qs,const uint16_t* weights,const uint8_t* keys,
     const uint8_t* ks,const uint32_t* pages,const uint64_t* lengths,
     const uint64_t* metadata,const uint64_t* positions,float* output,
@@ -39,8 +39,8 @@ extern "C" int32_t ds41rt_v41_index_scores_overlay_aot(
     int32_t slots,int32_t stride,uint64_t capacity,uint64_t proposal_capacity,void* stream) {
   // Normal serving initializes during planning. Direct ABI users must prewarm
   // outside graph capture, as for the existing native projection kernels.
-  auto status=ds41rt_v41_index_scores_initialize();if(status)return status;
-  return cute_dsl_ds41rt_v41_index_score_wrapper(&module,
+  auto status=cuteafd_v41_index_scores_initialize();if(status)return status;
+  return cute_dsl_cuteafd_v41_index_score_wrapper(&module,
       (void*)q,(void*)qs,(void*)weights,(void*)keys,(void*)ks,(void*)pages,
       (void*)lengths,(void*)metadata,(void*)positions,output,(void*)proposals,(void*)ps,
       rows,width,slots,stride,int64_t(capacity),int64_t(proposal_capacity),(cudaStream_t)stream);

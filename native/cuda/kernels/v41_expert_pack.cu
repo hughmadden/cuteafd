@@ -1,4 +1,4 @@
-#include "ds41rt_v41_experts.h"
+#include "cuteafd_v41_experts.h"
 #include <cuda_runtime.h>
 #include <cstdint>
 
@@ -49,7 +49,7 @@ bool overlaps(const void* a, uint64_t an, const void* b, uint64_t bn) {
 }
 }
 
-extern "C" int32_t ds41rt_v41_expert_packed_sizes(uint32_t intermediate,
+extern "C" int32_t cuteafd_v41_expert_packed_sizes(uint32_t intermediate,
     uint64_t bytes[4]) {
   // Official native extents: 384 (pure Spark TP6), 576 (Spark TP4, padded to
   // 640), 768 (Spark TP3), 1152 (Spark/RTX TP2), 2304 (full). Every value is a
@@ -67,10 +67,10 @@ extern "C" int32_t ds41rt_v41_expert_packed_sizes(uint32_t intermediate,
   return cudaSuccess;
 }
 
-extern "C" int32_t ds41rt_v41_pack_expert_async(const uint8_t* const sources[6],
+extern "C" int32_t cuteafd_v41_pack_expert_async(const uint8_t* const sources[6],
     uint8_t* const destinations[4], uint32_t intermediate, void* stream) {
   uint64_t sizes[4];
-  if (!sources || !destinations || ds41rt_v41_expert_packed_sizes(intermediate, sizes))
+  if (!sources || !destinations || cuteafd_v41_expert_packed_sizes(intermediate, sizes))
     return cudaErrorInvalidValue;
   const uint64_t weight_bytes = uint64_t(intermediate) * hidden / 2;
   const uint64_t source_sizes[] = {weight_bytes, weight_bytes, weight_bytes,

@@ -23,7 +23,7 @@ SOURCE = SCRIPT.read_text()
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("ds41rt_retained_bench", SCRIPT)
+    spec = importlib.util.spec_from_file_location("cuteafd_retained_bench", SCRIPT)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

@@ -22,13 +22,13 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 HELPER = REPO / "scripts" / "release-digests.sh"
-DEFAULT_CONFIG = REPO / "ds41rt.config"
-V10_CONFIG = REPO / "ds41rt.build-v10.config"
+DEFAULT_CONFIG = REPO / "cuteafd.config"
+V10_CONFIG = REPO / "scripts" / "fixtures" / "cuteafd.build-v10.config"
 
-COORDINATOR_REPO = "ghcr.io/tpurtell/ds41rt-coordinator"
-SPARK_REPO = "ghcr.io/tpurtell/ds41rt-spark-expert"
-COORDINATOR_PATH = "tpurtell/ds41rt-coordinator"
-SPARK_PATH = "tpurtell/ds41rt-spark-expert"
+COORDINATOR_REPO = "ghcr.io/tpurtell/cuteafd-coordinator"
+SPARK_REPO = "ghcr.io/tpurtell/cuteafd-spark-expert"
+COORDINATOR_PATH = "tpurtell/cuteafd-coordinator"
+SPARK_PATH = "tpurtell/cuteafd-spark-expert"
 
 COORDINATOR_DIGEST = "sha256:" + "a" * 64
 SPARK_DIGEST = "sha256:" + "b" * 64
@@ -37,13 +37,13 @@ OTHER_DIGEST = "sha256:" + "c" * 64
 CURL_STUB = textwrap.dedent(
     r"""#!/usr/bin/env bash
     set -euo pipefail
-    log="${DS41RT_TEST_CURL_LOG:?DS41RT_TEST_CURL_LOG must be set}"
+    log="${CUTEAFD_TEST_CURL_LOG:?CUTEAFD_TEST_CURL_LOG must be set}"
     line=""
     for token in "$@"; do
       if [[ -z "$line" ]]; then line="$token"; else line="$line"$'\t'"$token"; fi
     done
     printf '%s\n' "$line" >>"$log"
-    [[ "${DS41RT_TEST_CURL_FAIL:-0}" != 1 ]] || exit 22
+    [[ "${CUTEAFD_TEST_CURL_FAIL:-0}" != 1 ]] || exit 22
     url=""
     for token in "$@"; do
       case "$token" in
@@ -58,7 +58,7 @@ CURL_STUB = textwrap.dedent(
       https://ghcr.io/v2/*/manifests/*)
         path="${url#https://ghcr.io/v2/}"
         path="${path%%/manifests/*}"
-        digest="$(awk -F= -v key="$path" '$1 == key { print $2 }' "${DS41RT_TEST_DIGESTS:?}" | tail -n1)"
+        digest="$(awk -F= -v key="$path" '$1 == key { print $2 }' "${CUTEAFD_TEST_DIGESTS:?}" | tail -n1)"
         if [[ -z "$digest" ]]; then
           printf 'HTTP/2 200\r\ncontent-type: application/vnd.oci.image.index.v1+json\r\n\r\n'
           exit 0
@@ -75,13 +75,13 @@ CURL_STUB = textwrap.dedent(
 DOCKER_STUB = textwrap.dedent(
     r"""#!/usr/bin/env bash
     set -euo pipefail
-    log="${DS41RT_TEST_PULL_LOG:?DS41RT_TEST_PULL_LOG must be set}"
+    log="${CUTEAFD_TEST_PULL_LOG:?CUTEAFD_TEST_PULL_LOG must be set}"
     line=""
     for token in "$@"; do
       if [[ -z "$line" ]]; then line="$token"; else line="$line"$'\t'"$token"; fi
     done
     printf 'DOCKER_CONFIG=%s\t%s\n' "${DOCKER_CONFIG:-<unset>}" "$line" >>"$log"
-    if [[ "${DS41RT_TEST_WRITES_CREDENTIAL:-0}" == 1 ]]; then
+    if [[ "${CUTEAFD_TEST_WRITES_CREDENTIAL:-0}" == 1 ]]; then
       : >"${DOCKER_CONFIG}/config.json"
     fi
     ref=""
@@ -90,7 +90,7 @@ DOCKER_STUB = textwrap.dedent(
         ghcr.io/*) ref="$token" ;;
       esac
     done
-    digest="$(awk -F= -v key="$ref" '$1 == key { print $2 }' "${DS41RT_TEST_PULL_DIGESTS:?}" | tail -n1)"
+    digest="$(awk -F= -v key="$ref" '$1 == key { print $2 }' "${CUTEAFD_TEST_PULL_DIGESTS:?}" | tail -n1)"
     printf 'Digest: %s\n' "${digest:-sha256:0000000000000000000000000000000000000000000000000000000000000000}"
     """
 )
@@ -119,10 +119,10 @@ def harness(tmp_path):
     environment = {
         "PATH": f"{bin_dir}:/usr/bin:/bin:/usr/local/bin",
         "HOME": str(tmp_path),
-        "DS41RT_TEST_CURL_LOG": str(curl_log),
-        "DS41RT_TEST_PULL_LOG": str(pull_log),
-        "DS41RT_TEST_DIGESTS": str(digests),
-        "DS41RT_TEST_PULL_DIGESTS": str(pull_digests),
+        "CUTEAFD_TEST_CURL_LOG": str(curl_log),
+        "CUTEAFD_TEST_PULL_LOG": str(pull_log),
+        "CUTEAFD_TEST_DIGESTS": str(digests),
+        "CUTEAFD_TEST_PULL_DIGESTS": str(pull_digests),
     }
 
     def run(*args, env=None):
@@ -243,7 +243,7 @@ def test_capture_fails_closed_when_the_registry_is_unreachable(harness):
     evidence = harness.tmp_path / "digests.env"
     result = harness.run(
         "capture", "--config", str(V10_CONFIG), "--evidence", str(evidence),
-        env={"DS41RT_TEST_CURL_FAIL": "1"},
+        env={"CUTEAFD_TEST_CURL_FAIL": "1"},
     )
     assert result.returncode == 2, result.stdout + result.stderr
     assert not evidence.exists()
@@ -263,7 +263,7 @@ def test_verify_uses_a_fresh_anonymous_config_and_matches(harness):
     ], calls
     for config_dir, _ in calls:
         assert config_dir != str(harness.tmp_path / ".docker"), config_dir
-        assert Path(config_dir).name.startswith("ds41rt-anon-pull."), config_dir
+        assert Path(config_dir).name.startswith("cuteafd-anon-pull."), config_dir
         assert not (Path(config_dir) / "config.json").exists(), config_dir
 
 
@@ -284,7 +284,7 @@ def test_verify_rejects_a_pull_that_wrote_a_credential_file(harness):
     evidence = _captured_evidence(harness)
     result = harness.run(
         "verify", "--config", str(V10_CONFIG), "--evidence", str(evidence),
-        env={"DS41RT_TEST_WRITES_CREDENTIAL": "1"},
+        env={"CUTEAFD_TEST_WRITES_CREDENTIAL": "1"},
     )
     assert result.returncode == 2, result.stdout + result.stderr
     assert "was not anonymous" in result.stderr

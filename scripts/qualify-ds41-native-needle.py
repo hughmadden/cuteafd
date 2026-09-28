@@ -39,7 +39,7 @@ def validate_report(report):
                 run['retrieved'] = field is not None
                 run['retrieval_field'] = field
                 assert run['retrieved'], (mode, case['context_source_tokens'], name, code)
-                expected = f'ds41rt-native-fp4-kv{"-dspark" if mode == "dspark" else ""}'
+                expected = f'cuteafd-native-fp4-kv{"-dspark" if mode == "dspark" else ""}'
                 assert run['system_fingerprint'] == expected
             cold, exact = pair['cold'], pair['exact']
             assert cold['usage']['prompt_tokens_details']['cached_tokens'] <= 32
@@ -157,7 +157,7 @@ def main():
                 run['retrieved'] = field is not None
                 run['retrieval_field'] = field
                 assert run['retrieved'], (mode, context, name, code)
-                assert run['system_fingerprint'] == f'ds41rt-native-fp4-kv{"-dspark" if mode == "dspark" else ""}'
+                assert run['system_fingerprint'] == f'cuteafd-native-fp4-kv{"-dspark" if mode == "dspark" else ""}'
             assert cold['usage']['prompt_tokens_details']['cached_tokens'] <= 32
             assert exact['usage']['prompt_tokens_details']['cached_tokens'] == exact['usage']['prompt_tokens']
             save()

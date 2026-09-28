@@ -30,17 +30,17 @@ HARNESS = ROOT / "python" / "tools" / "bench_tp_ep_kernel.py"
 # The env overrides exist so the absent-artifact path can be validated without
 # renaming the live files.
 SCHEDULE = Path(os.environ.get(
-    "DS41RT_TP_EP_SCHEDULE_ARTIFACT",
+    "CUTEAFD_TP_EP_SCHEDULE_ARTIFACT",
     str(ROOT / "runs" / "tp-ep-kernel" / "timing" / "schedule_remaining.py")))
 MANIFEST = Path(os.environ.get(
-    "DS41RT_TP_EP_SCHEDULE_MANIFEST",
+    "CUTEAFD_TP_EP_SCHEDULE_MANIFEST",
     str(ROOT / "runs" / "tp-ep-kernel" / "timing" / "schedule" / "MANIFEST.json")))
 FIXTURE = ROOT / "scripts" / "fixtures" / "tp-ep-reuse-m64-e384.json"
 
 
 def load_harness():
     """Import the benchmark harness module for behavioural route-setup checks."""
-    spec = importlib.util.spec_from_file_location("ds41rt_sched_final_harness", HARNESS)
+    spec = importlib.util.spec_from_file_location("cuteafd_sched_final_harness", HARNESS)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -56,7 +56,7 @@ def _load(name, path):
 def _load_schedule_or_skip(path: Path = SCHEDULE):
     if not path.is_file():
         pytest.skip(f"schedule artifact not present: {path}")
-    return _load("ds41rt_sched_remaining", path)
+    return _load("cuteafd_sched_remaining", path)
 
 
 @pytest.fixture(scope="module")
@@ -64,7 +64,7 @@ def sched():
     return _load_schedule_or_skip()
 
 
-timing = _load("ds41rt_sched_timing", HARNESS)
+timing = _load("cuteafd_sched_timing", HARNESS)
 
 
 def test_fixture_loader_uses_live_rows_not_capacity():
@@ -152,7 +152,7 @@ def test_missing_schedule_artifact_skips_cleanly(tmp_path):
     """A clean checkout has no schedule artifact; the loader must skip, not crash.
 
     This is the in-process simulation of the absent-artifact state. The
-    end-to-end collection check uses DS41RT_TP_EP_SCHEDULE_ARTIFACT instead of
+    end-to-end collection check uses CUTEAFD_TP_EP_SCHEDULE_ARTIFACT instead of
     renaming the live generated files.
     """
     with pytest.raises(pytest.skip.Exception):

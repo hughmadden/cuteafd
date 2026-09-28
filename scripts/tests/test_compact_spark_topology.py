@@ -15,7 +15,7 @@ class CompactSparkTopologyTest(unittest.TestCase):
     def config(self, settings, command='printf "%s\\n" "$MEMORY_RESERVATION" "$KV_POOL_SIZE"'):
         with tempfile.TemporaryDirectory() as temporary:
             config = Path(temporary) / 'config'
-            config.write_text((ROOT / 'ds41rt.config').read_text() + '\n' + settings + '\n')
+            config.write_text((ROOT / 'cuteafd.config').read_text() + '\n' + settings + '\n')
             return subprocess.run(['bash', '-euc',
                 'source scripts/release-common.sh; release_load_config "$1"; ' + command,
                 'test', str(config)], cwd=ROOT, text=True, capture_output=True)

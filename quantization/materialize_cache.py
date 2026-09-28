@@ -42,7 +42,7 @@ def materialize_cache(output, cache_root, receipt, *, owner=None, previous_commi
         blob_sources.setdefault(record["blob"], []).append(path)
     repo_root = asset_target(cache_root, "models--" + repo.replace("/", "--"))
     repo_root.mkdir(parents=True, exist_ok=True)
-    lock_path = asset_target(repo_root, ".ds41rt-materialize.lock")
+    lock_path = asset_target(repo_root, ".cuteafd-materialize.lock")
     with lock_path.open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         ref = asset_target(repo_root, 'refs/main')

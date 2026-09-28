@@ -29,11 +29,11 @@ def main():
         def run(*values):
             result=fn(*values);assert result==0,(name,result)
         return run
-    initialize=bind('ds41rt_v41_fp8_matrix_initialize',[I,I,I,C.POINTER(P)])
-    pack=bind('ds41rt_v41_fp8_matrix_pack_scales',[P,P,I,I,P])
-    init_scratch=bind('ds41rt_v41_fp8_initialize_scratch',[P,P,U,P,P])
-    full=bind('ds41rt_v41_fp8_launch',[P,P,P,P,P,U,P,P,I,P])
-    reduce=bind('ds41rt_v41_fp8_reduce_splits',[P,P,I,I,I,P])
+    initialize=bind('cuteafd_v41_fp8_matrix_initialize',[I,I,I,C.POINTER(P)])
+    pack=bind('cuteafd_v41_fp8_matrix_pack_scales',[P,P,I,I,P])
+    init_scratch=bind('cuteafd_v41_fp8_initialize_scratch',[P,P,U,P,P])
+    full=bind('cuteafd_v41_fp8_launch',[P,P,P,P,P,U,P,P,I,P])
+    reduce=bind('cuteafd_v41_fp8_reduce_splits',[P,P,I,I,I,P])
     weight_map=json.loads((args.snapshot/'model.safetensors.index.json').read_text())['weight_map']
     def load(name):
         with safe_open(args.snapshot/weight_map[name],framework='pt',device='cpu') as f:return f.get_tensor(name).cuda()

@@ -105,15 +105,15 @@ def main():
     torch.manual_seed(41512640)
     torch.backends.cuda.matmul.allow_tf32 = False
     lib = C.CDLL(str(a.native_lib))
-    init = lib.ds41rt_v41_sparse_attention_initialize
+    init = lib.cuteafd_v41_sparse_attention_initialize
     init.restype = C.c_int32
     assert init() == 0
-    launch = lib.ds41rt_v41_sparse_attention
+    launch = lib.cuteafd_v41_sparse_attention
     launch.argtypes = [C.c_void_p] * 5 + [C.c_int32, C.c_int32, C.POINTER(View), C.c_void_p]
     launch.restype = C.c_int32
     if a.split_parts is not None:
         original_launch = launch
-        split_launch = lib.ds41rt_v41_sparse_attention_split
+        split_launch = lib.cuteafd_v41_sparse_attention_split
         split_launch.argtypes = launch.argtypes + [C.c_void_p, C.c_uint64, C.c_int32]
         split_launch.restype = C.c_int32
         scratch_storage = torch.full((16 * a.split_parts * 64 * 514 + 128,), 19.,
@@ -125,7 +125,7 @@ def main():
             return original_launch(*args)
     if a.bounded_replay:
         assert not a.large_only, 'bounded replay uses the ordinary reference corpus'
-        bounded_launch = lib.ds41rt_v41_sparse_attention_bounded
+        bounded_launch = lib.cuteafd_v41_sparse_attention_bounded
         bounded_launch.argtypes = [C.c_void_p] * 5 + [C.c_int32, C.c_int32, C.POINTER(View), C.c_void_p,
             C.c_void_p, C.c_void_p, C.c_uint64, C.c_int32]
         bounded_launch.restype = C.c_int32

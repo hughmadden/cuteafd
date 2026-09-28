@@ -68,7 +68,7 @@ from v41_spark_tp3_launch_geometry import LaunchGeometryError, manifest_geometry
 # (I=384). TP2/TP3/TP6 are unpadded; the legacy TP4 shard stores 640 for a 576
 # logical intermediate.
 SPARK_TP_INTERMEDIATE = {2: 1152, 3: 768, 6: 384}
-# Native `ds41rt_v41_expert_info_t.role` per TP degree, and the per-rank storage
+# Native `cuteafd_v41_expert_info_t.role` per TP degree, and the per-rank storage
 # extent that role's exported variants must declare.
 SPARK_TP_ROLE = {2: 5, 3: 6, 6: 7}
 SPARK_TP_KERNEL_INTERMEDIATE = {2: 1152, 3: 768, 6: 384}
@@ -101,7 +101,7 @@ def assert_native_role_geometry(lib, capacity, *, tp_degree=None, tp4_legacy=Fal
     measuring another topology's kernel.
     """
     meta = Info()
-    check(lib.ds41rt_v41_expert_info(capacity, C.byref(meta)))
+    check(lib.cuteafd_v41_expert_info(capacity, C.byref(meta)))
     if tp4_legacy:
         expected = (LEGACY_TP4_ROLE, LEGACY_TP4_LOGICAL, LEGACY_TP4_STORAGE)
     else:
@@ -471,12 +471,12 @@ def _oracle_compact_mask_checks(torch_module, lib, native, wire, x, weights, sca
     bf16_expected = expected.bfloat16().float()
     compact = torch_module.empty((rows, 5120), device="cuda", dtype=torch_module.bfloat16)
     if native.token_accumulation:
-        check(lib.ds41rt_v41_compact_tokens_bf16_async(
+        check(lib.cuteafd_v41_compact_tokens_bf16_async(
             native.output[:rows].data_ptr(), compact.data_ptr(), rows,
             torch_module.cuda.current_stream().cuda_stream))
     else:
         routes = native.output[:rows * topk].contiguous()
-        check(lib.ds41rt_v41_compact_routes_bf16_async(
+        check(lib.cuteafd_v41_compact_routes_bf16_async(
             routes.data_ptr(), compact.data_ptr(), rows,
             torch_module.cuda.current_stream().cuda_stream))
     torch_module.cuda.synchronize()
@@ -725,7 +725,7 @@ def _run_timing(options, torch_module, lib, arena, intermediate, role, gids, bas
             lib, capacity, tp_degree=options.spark_tp,
             tp4_legacy=options.tp4_legacy)
         meta = Info()
-        check(lib.ds41rt_v41_expert_info(capacity, C.byref(meta)))
+        check(lib.cuteafd_v41_expert_info(capacity, C.byref(meta)))
         assert meta.role == role, (capacity, meta.role)
         verify_loaded_meta(meta, manifest, capacity, degree)
         generator = torch_module.Generator(device="cuda").manual_seed(seed)
@@ -756,11 +756,11 @@ def _run_timing(options, torch_module, lib, arena, intermediate, role, gids, bas
         def compact_launch(rows):
             """The worker's production BF16 compaction on the native FP32 output."""
             if native.token_accumulation:
-                check(lib.ds41rt_v41_compact_tokens_bf16_async(
+                check(lib.cuteafd_v41_compact_tokens_bf16_async(
                     native.output[:rows].data_ptr(), compact.data_ptr(), rows,
                     torch_module.cuda.current_stream().cuda_stream))
             else:
-                check(lib.ds41rt_v41_compact_routes_bf16_async(
+                check(lib.cuteafd_v41_compact_routes_bf16_async(
                     native.output[:rows * topk].data_ptr(), compact.data_ptr(), rows,
                     torch_module.cuda.current_stream().cuda_stream))
         # Every (capacity, rows) pair this variant covers; rows are never clamped.
@@ -982,7 +982,7 @@ def run_checkpoint(options, torch_module, lib):
         scales[name] = torch_module.stack(scale_rows)
 
     sizes = (L * 4)()
-    check(lib.ds41rt_v41_expert_packed_sizes(intermediate, sizes))
+    check(lib.cuteafd_v41_expert_packed_sizes(intermediate, sizes))
     per = [int(sizes[i]) for i in range(4)]
     arena = [torch_module.zeros(ARENA_EXPERTS * per[i], dtype=torch_module.uint8,
                                 device="cuda") for i in range(4)]
@@ -994,7 +994,7 @@ def run_checkpoint(options, torch_module, lib):
             weights["w2"][k].data_ptr(), scales["w1"][k].data_ptr(),
             scales["w3"][k].data_ptr(), scales["w2"][k].data_ptr()])
         dst = (P * 4)(*[arena[i].data_ptr() + slot * per[i] for i in range(4)])
-        check(lib.ds41rt_v41_pack_expert_async(src, dst, intermediate, stream))
+        check(lib.cuteafd_v41_pack_expert_async(src, dst, intermediate, stream))
     torch_module.cuda.synchronize()
 
     # Cross-check the native packer against the b12x repack the Python pipeline
@@ -1036,7 +1036,7 @@ def run_checkpoint(options, torch_module, lib):
     for capacity in capacities:
         # Confirm the library actually exposes this AOT variant and its ABI.
         meta = Info()
-        check(lib.ds41rt_v41_expert_info(capacity, C.byref(meta)))
+        check(lib.cuteafd_v41_expert_info(capacity, C.byref(meta)))
         assert meta.role == role
         expect_abi = 2 if capacity <= 80 else 3
         assert meta.abi_version == expect_abi, (capacity, meta.abi_version)
@@ -1322,7 +1322,7 @@ def aggregate_results(options):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--native-lib",
-                        help="built libds41rt_native.so (not needed with --aggregate)")
+                        help="built libcuteafd_native.so (not needed with --aggregate)")
     parser.add_argument("--aggregate", type=Path, nargs="+", metavar="RESULT",
                         help="CPU only: compare repeated TIMING result files by "
                              "width; requires --aggregate-repeats records per cell "

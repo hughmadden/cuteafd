@@ -34,7 +34,7 @@ def _load_qualifier():
     if str(TOOLS) not in sys.path:
         sys.path.insert(0, str(TOOLS))
     try:
-        spec = importlib.util.spec_from_file_location("ds41rt_qualifier_roles", QUALIFIER)
+        spec = importlib.util.spec_from_file_location("cuteafd_qualifier_roles", QUALIFIER)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     except Exception as error:  # pragma: no cover - environment dependent
@@ -107,7 +107,7 @@ def test_role_gate_rejects_the_legacy_tp6_mapping() -> None:
             data = [2, role, 384, 5120, 384, 384, 6, capacity, 4096, 32, 32, 64, 64, 188, 7]
             C.memmove(out, (C.c_int32 * len(data))(*data), C.sizeof(_Info))
             return 0
-        return type("L", (), {"ds41rt_v41_expert_info": staticmethod(fn)})()
+        return type("L", (), {"cuteafd_v41_expert_info": staticmethod(fn)})()
 
     # role 9 is what the legacy formula would have expected: must be rejected.
     with pytest.raises(AssertionError):

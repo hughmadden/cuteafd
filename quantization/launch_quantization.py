@@ -51,8 +51,8 @@ def command(manifest_path, manifest, image, hf_home, attempt, *, resume=False):
     if not token.is_file() or token.stat().st_mode & 0o077:
         raise ValueError("HF token must exist with private permissions")
     label = hashlib.sha256(str(root).encode()).hexdigest()
-    args = ["docker", "run", "--detach", "--name", "ds41rt-quant-" + attempt,
-            "--label", "ds41rt.quant.run=" + label, "--restart=no", "--gpus", "all",
+    args = ["docker", "run", "--detach", "--name", "cuteafd-quant-" + attempt,
+            "--label", "cuteafd.quant.run=" + label, "--restart=no", "--gpus", "all",
             "--network=host", "--shm-size=16g", "--memory=170g", "--memory-swap=170g",
             "--log-driver=local", "--log-opt=max-size=20m", "--log-opt=max-file=5",
             "--env", "PYTHONDONTWRITEBYTECODE=1", "--env", "HF_HOME=" + str(hf_home),
@@ -62,9 +62,9 @@ def command(manifest_path, manifest, image, hf_home, attempt, *, resume=False):
             "--mount", f"type=bind,src={snapshot.parent.parent},dst={snapshot.parent.parent},readonly",
             "--mount", f"type=bind,src={token},dst={token},readonly",
             "--mount", f"type=bind,src={manifest_path},dst={manifest_path},readonly",
-            "--mount", "type=volume,src=ds41rt-quant-coordinator-jit,dst=/root/.cache/gptqmodel",
+            "--mount", "type=volume,src=cuteafd-quant-coordinator-jit,dst=/root/.cache/gptqmodel",
             "--entrypoint", "/usr/bin/tini", image, "--", "/opt/glmrt/quant-venv/bin/python",
-            "/opt/ds41rt/quantization/session_runner.py", str(manifest_path), "--attempt", attempt]
+            "/opt/cuteafd/quantization/session_runner.py", str(manifest_path), "--attempt", attempt]
     if resume:
         args.append("--resume")
     return args, label
@@ -81,7 +81,7 @@ def launch(manifest_path, image, hf_home, *, resume=False, execute=subprocess.ch
         actual_image = execute(["docker", "image", "inspect", image, "--format", "{{.Id}}"], text=True).strip()
         if actual_image != image:
             raise ValueError("Docker image identity differs")
-        ids = execute(["docker", "ps", "--all", "--quiet", "--filter", "label=ds41rt.quant.run=" + label], text=True).split()
+        ids = execute(["docker", "ps", "--all", "--quiet", "--filter", "label=cuteafd.quant.run=" + label], text=True).split()
         if ids:
             containers = json.loads(execute(["docker", "inspect", *ids], text=True))
             if any(item["State"]["Status"] not in {"exited", "dead"} for item in containers):

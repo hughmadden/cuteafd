@@ -1,4 +1,4 @@
-/* GPU target-sampler device ABI (ds41rt v4.1, `serve-native`).
+/* GPU target-sampler device ABI (cuteafd v4.1, `serve-native`).
  *
  * This header is the single definition of the sampler's device-side contract:
  * the 64-byte per-row parameter block of `docs/gpu-sampling-design.md` §5.1,
@@ -6,13 +6,13 @@
  * the per-row status codes of §5.4, and the C ABI entry-point declarations.
  *
  * It is included by `native/cuda/kernels/v41_sampling_gpu.cu` (the kernel) and
- * by `native/include/ds41rt_native.h` (the public ABI), so the two can never
- * disagree; it is mirrored by `rust/crates/ds41rt-ffi/src/lib.rs`, which
- * test-pins `sizeof`/offsets/alignment of `ds41rt_v41_sampler_row_t`.
+ * by `native/include/cuteafd_native.h` (the public ABI), so the two can never
+ * disagree; it is mirrored by `rust/crates/cuteafd-ffi/src/lib.rs`, which
+ * test-pins `sizeof`/offsets/alignment of `cuteafd_v41_sampler_row_t`.
  *
  * Algorithm provenance: the mask predicate, the scale-then-compare order, the
  * `min_p` threshold and the lowest-id tie rule are ports of the frozen CPU
- * filter chain (`rust/crates/ds41rt-core/src/target_sampling.rs`), which is the
+ * filter chain (`rust/crates/cuteafd-core/src/target_sampling.rs`), which is the
  * correctness oracle. The argmax/block-reduce structure is ported from the
  * legacy device argmax (`native/cuda/kernels/sampling.cu`,
  * `logits_argmax_f32_kernel`), which itself cites TRT-LLM; the FlashInfer
@@ -34,13 +34,13 @@
  * ascending-token-order crossing scan with the `cumulative_before < target`
  * minimality rule, and the CPU's no-crossing `last`-survivor fallback. Both
  * accumulation orders are compiled: the shipped default is the sequential
- * segment prefix above, and `DS41RT_V41_K2_SEQUENTIAL_COMBINE` selects the
+ * segment prefix above, and `CUTEAFD_V41_K2_SEQUENTIAL_COMBINE` selects the
  * strictly sequential token-order combine evaluated by the chunk-2 measurement.
  */
-#ifndef DS41RT_V41_SAMPLING_GPU_H
-#define DS41RT_V41_SAMPLING_GPU_H
+#ifndef CUTEAFD_V41_SAMPLING_GPU_H
+#define CUTEAFD_V41_SAMPLING_GPU_H
 
-#include "ds41rt_native.h"
+#include "cuteafd_native.h"
 
 #include <stdint.h>
 
@@ -52,9 +52,9 @@ extern "C" {
 /* bit0: greedy row. The host resolves `temperature < 1e-5 || top_k == 1`; the
  *       kernel re-derives it and ORs the two, so a host bug cannot silently
  *       turn a stochastic row greedy. */
-#define DS41RT_V41_SAMPLER_FLAG_GREEDY 0x1u
+#define CUTEAFD_V41_SAMPLER_FLAG_GREEDY 0x1u
 /* bit1: diagnose. Optional `out_total`/`out_nucleus_count` are written. */
-#define DS41RT_V41_SAMPLER_FLAG_DIAGNOSE 0x2u
+#define CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE 0x2u
 /* bit2: the mask row has no meaningful bits -- an unconstrained row
  *       (`fill_bitmask` reported `needs_mask == false`, or no mask at all).
  *       The kernel then treats every token `t < vocab` as allowed and never
@@ -68,11 +68,11 @@ extern "C" {
  *       false` is the production signal (`constraints.rs`). The remainder rule
  *       stays unconditional and host-enforced: the host always zeroes bits
  *       `>= vocab` of the final word before upload
- *       (`ds41rt_v41_sampler_clear_remainder`), so a whole-word reader is safe
+ *       (`cuteafd_v41_sampler_clear_remainder`), so a whole-word reader is safe
  *       regardless of this bit. */
-#define DS41RT_V41_SAMPLER_FLAG_NO_MASK 0x4u
+#define CUTEAFD_V41_SAMPLER_FLAG_NO_MASK 0x4u
 /* bit3: CPU-oracle cross-check (diagnostic only; unused in production). */
-#define DS41RT_V41_SAMPLER_FLAG_ORACLE_CROSSCHECK 0x8u
+#define CUTEAFD_V41_SAMPLER_FLAG_ORACLE_CROSSCHECK 0x8u
 /* bit4: strict whole-row finiteness for a row that would otherwise take the
  *       permissive stochastic branch. Greedy rows are strict unconditionally
  *       (the kernel derives strictness from `greedy`), so the host sets this bit
@@ -81,15 +81,15 @@ extern "C" {
  *       `ensure!(value.is_finite())`, which runs before the mask test for
  *       greedy/constrained rows, so such a row rejects a non-finite logit even
  *       when that token is masked out. */
-#define DS41RT_V41_SAMPLER_FLAG_STRICT_FINITE 0x10u
+#define CUTEAFD_V41_SAMPLER_FLAG_STRICT_FINITE 0x10u
 
 /* ---- Per-row status codes (§5.4). Host-side rank = the integer value. ---- */
-#define DS41RT_V41_SAMPLER_STATUS_OK 0u
-#define DS41RT_V41_SAMPLER_STATUS_EMPTY_CANDIDATES 1u
-#define DS41RT_V41_SAMPLER_STATUS_NONFINITE_LOGIT 2u
-#define DS41RT_V41_SAMPLER_STATUS_INVALID_TEMPERATURE 3u
-#define DS41RT_V41_SAMPLER_STATUS_MASK_WIDTH 4u
-#define DS41RT_V41_SAMPLER_STATUS_INTERNAL 5u
+#define CUTEAFD_V41_SAMPLER_STATUS_OK 0u
+#define CUTEAFD_V41_SAMPLER_STATUS_EMPTY_CANDIDATES 1u
+#define CUTEAFD_V41_SAMPLER_STATUS_NONFINITE_LOGIT 2u
+#define CUTEAFD_V41_SAMPLER_STATUS_INVALID_TEMPERATURE 3u
+#define CUTEAFD_V41_SAMPLER_STATUS_MASK_WIDTH 4u
+#define CUTEAFD_V41_SAMPLER_STATUS_INTERNAL 5u
 
 /* `out_status_detail` for status 2 carries the offending token id; the design
  * text writes a plain `0` when there is none, but token 0 is a real token, so a
@@ -97,17 +97,17 @@ extern "C" {
  * UINT32_MAX sentinel instead and the host normalizes it to 0 before it is
  * observable. APPROVED design deviation (recorded in the chunk-1 report so the
  * design doc can be updated). */
-#define DS41RT_V41_SAMPLER_NO_DETAIL 0xFFFFFFFFu
+#define CUTEAFD_V41_SAMPLER_NO_DETAIL 0xFFFFFFFFu
 
 /* `mask_row` sentinel: an unconstrained row. The kernel treats this sentinel as
  * unconstrained even when `FLAG_NO_MASK` is absent, so a raw-C caller that only
  * follows `docs/gpu-sampling-design.md` §5.2 (which names the sentinel but not
  * the flag) still cannot index the arena out of bounds. The host-side validator
  * is stricter and requires the flag to agree with the sentinel. */
-#define DS41RT_V41_SAMPLER_NO_MASK_ROW 0xFFFFFFFFu
+#define CUTEAFD_V41_SAMPLER_NO_MASK_ROW 0xFFFFFFFFu
 
 /* ---- 64-byte per-row parameter block (§5.1), natural alignment ---- */
-typedef struct ds41rt_v41_sampler_row_s {
+typedef struct cuteafd_v41_sampler_row_s {
   uint64_t seed;        /* +0  served request seed, two's complement */
   uint64_t position;    /* +8  absolute emitted-token index */
   float    temperature; /* +16 validated range 0..=2 */
@@ -117,18 +117,18 @@ typedef struct ds41rt_v41_sampler_row_s {
                                k > vocab = no-op */
   uint32_t mask_row;    /* +32 index into the mask arena; 0xFFFFFFFF =
                                unconstrained */
-  uint32_t flags;       /* +36 DS41RT_V41_SAMPLER_FLAG_* */
+  uint32_t flags;       /* +36 CUTEAFD_V41_SAMPLER_FLAG_* */
   uint32_t output_row;  /* +40 row index into logits/out_* */
   float    ln_min_p;    /* +44 HOST-precomputed ln(min_p); -inf when min_p == 0.
                                Hard requirement: the device never calls logf. */
   uint32_t reserved0;   /* +48 must be 0 */
   uint32_t reserved1;   /* +52 must be 0 */
   uint64_t reserved2;   /* +56 must be 0 */
-} ds41rt_v41_sampler_row_t; /* exactly 64 B */
+} cuteafd_v41_sampler_row_t; /* exactly 64 B */
 
 /* ---- `params` residency ---- */
 /* `params` MUST point at device memory holding `rows` consecutive
- * `ds41rt_v41_sampler_row_t` blocks: the kernel dereferences
+ * `cuteafd_v41_sampler_row_t` blocks: the kernel dereferences
  * `params[blockIdx.x]` on device. A pageable host address is not
  * device-addressable under CUDA's documented model, even on a platform whose
  * driver happens to expose it, so the host must H2D-copy the block first. The
@@ -137,7 +137,7 @@ typedef struct ds41rt_v41_sampler_row_s {
  * slice it validates. */
 
 /* ---- Per-row K1 scratch, 64-byte stride (§11.1) ---- */
-typedef struct ds41rt_v41_sampler_scratch_s {
+typedef struct cuteafd_v41_sampler_scratch_s {
   float    max_scaled;        /* +0  max over ALLOWED tokens (stochastic) */
   float    inv_temperature;   /* +4  1.0f / temperature, exactly as the CPU */
   uint32_t allowed_count;     /* +8  allowed tokens (0 -> EMPTY_CANDIDATES) */
@@ -145,14 +145,14 @@ typedef struct ds41rt_v41_sampler_scratch_s {
   uint32_t kth_value_bits;    /* +16 K3, later chunk */
   uint32_t above_count;       /* +20 K3, later chunk */
   uint32_t nonfinite_token;   /* +24 lowest offending id, or NO_DETAIL */
-  uint32_t status;            /* +28 one of DS41RT_V41_SAMPLER_STATUS_* */
+  uint32_t status;            /* +28 one of CUTEAFD_V41_SAMPLER_STATUS_* */
   uint32_t status_detail;     /* +32 token id / actual width / NO_DETAIL */
   uint32_t reserved0;         /* +36 must be 0 */
   uint64_t reserved1;         /* +40 must be 0 */
   uint32_t reserved2;         /* +48 must be 0 */
   uint32_t reserved3;         /* +52 must be 0 */
   uint64_t reserved4;         /* +56 must be 0 */
-} ds41rt_v41_sampler_scratch_t; /* exactly 64 B */
+} cuteafd_v41_sampler_scratch_t; /* exactly 64 B */
 
 /* Byte layout of one row's scratch region. Exposed as macros so the Rust
  * planner and the C ABI test can pin the same numbers. */
@@ -172,25 +172,25 @@ typedef struct ds41rt_v41_sampler_scratch_s {
  * It lives in the header so the sampler TU and the device selftest's host model
  * read ONE definition: the selftest models the kernel's segments, and a
  * mismatch between the two silently invalidates tests (measured in chunk 6). */
-#ifndef DS41RT_V41_SAMPLER_BLOCK
-#define DS41RT_V41_SAMPLER_BLOCK 1024
+#ifndef CUTEAFD_V41_SAMPLER_BLOCK
+#define CUTEAFD_V41_SAMPLER_BLOCK 1024
 #endif
-#define DS41RT_V41_SAMPLER_CTA DS41RT_V41_SAMPLER_BLOCK
+#define CUTEAFD_V41_SAMPLER_CTA CUTEAFD_V41_SAMPLER_BLOCK
 
-#define DS41RT_V41_SAMPLER_SCRATCH_BYTES 64u
-#define DS41RT_V41_SAMPLER_PARAM_BYTES 64u
+#define CUTEAFD_V41_SAMPLER_SCRATCH_BYTES 64u
+#define CUTEAFD_V41_SAMPLER_PARAM_BYTES 64u
 
 /* Number of packed u32 mask words for a vocabulary: `ceil(vocab / 32)` (§5.2).
  * The host must additionally zero the bits `>= vocab` of the final word before
  * upload (§5.3 rule 2); every kernel loop is bounded by `vocab` (rule 1), so a
  * token id `>= vocab` can never be produced (rule 3). */
-static inline size_t ds41rt_v41_sampler_mask_words(size_t vocab) {
+static inline size_t cuteafd_v41_sampler_mask_words(size_t vocab) {
   return (vocab + 31u) / 32u;
 }
 
 /* Apply §5.3 rule 2 to a host mask row in place: clear every bit `>= vocab` of
- * the final word. `words` must be `ds41rt_v41_sampler_mask_words(vocab)`. */
-static inline void ds41rt_v41_sampler_clear_remainder(uint32_t* words, size_t vocab) {
+ * the final word. `words` must be `cuteafd_v41_sampler_mask_words(vocab)`. */
+static inline void cuteafd_v41_sampler_clear_remainder(uint32_t* words, size_t vocab) {
   const size_t remainder = vocab % 32u;
   if (remainder == 0u || vocab == 0u) {
     return;
@@ -201,28 +201,28 @@ static inline void ds41rt_v41_sampler_clear_remainder(uint32_t* words, size_t vo
 /* ---- Device draw: SplitMix64, ported bit-identically (design §6.1) ----
  *
  * The target draw is `TargetSamplingParams::random_uniform`
- * (`rust/crates/ds41rt-core/src/target_sampling.rs:187-199`) reproduced exactly,
+ * (`rust/crates/cuteafd-core/src/target_sampling.rs:187-199`) reproduced exactly,
  * so the `(seed, position)` -> uniform mapping is unchanged from the CPU. The
  * mantissa is truncated to 24 bits and scaled by the exact `2^-24`, so the
  * product is a single exact f32 operation and the device value is bit-identical
  * to the host for every `(seed, position)`.
  *
- * `DS41RT_V41_SAMPLER_MAX_UNIFORM_BITS` is the `0x3F7FFFFF` (= 0.99999994) clamp
+ * `CUTEAFD_V41_SAMPLER_MAX_UNIFORM_BITS` is the `0x3F7FFFFF` (= 0.99999994) clamp
  * of `target_sampling.rs:51-52`, applied after the draw and before the CDF
  * comparison (`:459`). It is a bit pattern, never a decimal literal.
  *
  * These live in the header (under `__CUDACC__`, so host C++ that includes
- * `ds41rt_native.h` never sees them) because the device tests must call the
+ * `cuteafd_native.h` never sees them) because the device tests must call the
  * *shipped* function from a probe kernel, not a copy of it.
  */
-#define DS41RT_V41_SAMPLER_MAX_UNIFORM_BITS 0x3F7FFFFFu
-#define DS41RT_V41_SAMPLER_RNG_DOMAIN 0x7f4a7c159e3779b9ull
-#define DS41RT_V41_SAMPLER_RNG_MUL 0x9e3779b97f4a7c15ull
+#define CUTEAFD_V41_SAMPLER_MAX_UNIFORM_BITS 0x3F7FFFFFu
+#define CUTEAFD_V41_SAMPLER_RNG_DOMAIN 0x7f4a7c159e3779b9ull
+#define CUTEAFD_V41_SAMPLER_RNG_MUL 0x9e3779b97f4a7c15ull
 
 #if defined(__CUDACC__)
-__device__ __forceinline__ float ds41rt_v41_target_uniform(uint64_t seed, uint64_t position) {
-  uint64_t mixed = seed + DS41RT_V41_SAMPLER_RNG_DOMAIN +
-                   position * DS41RT_V41_SAMPLER_RNG_MUL + DS41RT_V41_SAMPLER_RNG_MUL;
+__device__ __forceinline__ float cuteafd_v41_target_uniform(uint64_t seed, uint64_t position) {
+  uint64_t mixed = seed + CUTEAFD_V41_SAMPLER_RNG_DOMAIN +
+                   position * CUTEAFD_V41_SAMPLER_RNG_MUL + CUTEAFD_V41_SAMPLER_RNG_MUL;
   mixed = (mixed ^ (mixed >> 30)) * 0xbf58476d1ce4e5b9ull;
   mixed = (mixed ^ (mixed >> 27)) * 0x94d049bb133111ebull;
   mixed ^= mixed >> 31;
@@ -232,8 +232,8 @@ __device__ __forceinline__ float ds41rt_v41_target_uniform(uint64_t seed, uint64
 
 /* The clamp of design §4.8 / §6.1, in the exact CPU order
  * (`MAX_UNIFORM.min(uniform.max(0.0))`). */
-__device__ __forceinline__ float ds41rt_v41_target_clamp_uniform(float uniform) {
-  return fminf(fmaxf(uniform, 0.0f), __uint_as_float(DS41RT_V41_SAMPLER_MAX_UNIFORM_BITS));
+__device__ __forceinline__ float cuteafd_v41_target_clamp_uniform(float uniform) {
+  return fminf(fmaxf(uniform, 0.0f), __uint_as_float(CUTEAFD_V41_SAMPLER_MAX_UNIFORM_BITS));
 }
 
 /* ---- Chunk 3a: the order-key primitive (design §4.3) ----
@@ -253,7 +253,7 @@ __device__ __forceinline__ float ds41rt_v41_target_clamp_uniform(float uniform) 
  *
  * These live in the header (under `__CUDACC__`) because the device tests and
  * any later chunk (K5) must call the *shipped* primitive, never a copy. */
-__device__ __forceinline__ uint32_t ds41rt_v41_order_key(float scaled) {
+__device__ __forceinline__ uint32_t cuteafd_v41_order_key(float scaled) {
   /* Canonicalize -0.0 so both zeroes map to one key, exactly as
    * `descending_radix_key` does (`target_sampling.rs:336`). */
   const float value = (scaled == 0.0f) ? 0.0f : scaled;
@@ -261,33 +261,33 @@ __device__ __forceinline__ uint32_t ds41rt_v41_order_key(float scaled) {
   return ((bits & 0x80000000u) != 0u) ? ~bits : (bits ^ 0x80000000u);
 }
 
-/* Inverse of `ds41rt_v41_order_key` on the canonical f32 bit patterns: the float
+/* Inverse of `cuteafd_v41_order_key` on the canonical f32 bit patterns: the float
  * whose order key is `key`. Used only to publish `scratch.kth_value_bits` in the
  * design's §4.3 spelling (the *value bits* of the k-th value) and to feed K4's
  * tie predicate; `order_key(ordered_value(key)) == key` for every key produced
  * by `order_key`, and the k-th value is always a survivor's scaled value. */
-__device__ __forceinline__ float ds41rt_v41_ordered_value(uint32_t key) {
+__device__ __forceinline__ float cuteafd_v41_ordered_value(uint32_t key) {
   const uint32_t bits =
       ((key & 0x80000000u) != 0u) ? (key ^ 0x80000000u) : ~key;
   return __uint_as_float(bits);
 }
 #endif
 
-/* Lower `16 * DS41RT_V41_SAMPLER_ROW_PARAM_OFFSET_<field>` is the field's byte
- * offset inside `ds41rt_v41_sampler_row_t`; the Rust ABI test pins these. */
-#define DS41RT_V41_SAMPLER_ROW_PARAM_OFFSET_SEED 0u
-#define DS41RT_V41_SAMPLER_ROW_PARAM_OFFSET_POSITION 8u
-#define DS41RT_V41_SAMPLER_ROW_PARAM_OFFSET_TEMPERATURE 16u
-#define DS41RT_V41_SAMPLER_ROW_PARAM_OFFSET_TOP_P 20u
-#define DS41RT_V41_SAMPLER_ROW_PARAM_OFFSET_MIN_P 24u
-#define DS41RT_V41_SAMPLER_ROW_PARAM_OFFSET_TOP_K 28u
-#define DS41RT_V41_SAMPLER_ROW_PARAM_OFFSET_MASK_ROW 32u
-#define DS41RT_V41_SAMPLER_ROW_PARAM_OFFSET_FLAGS 36u
-#define DS41RT_V41_SAMPLER_ROW_PARAM_OFFSET_OUTPUT_ROW 40u
-#define DS41RT_V41_SAMPLER_ROW_PARAM_OFFSET_LN_MIN_P 44u
-#define DS41RT_V41_SAMPLER_ROW_PARAM_OFFSET_RESERVED0 48u
-#define DS41RT_V41_SAMPLER_ROW_PARAM_OFFSET_RESERVED1 52u
-#define DS41RT_V41_SAMPLER_ROW_PARAM_OFFSET_RESERVED2 56u
+/* Lower `16 * CUTEAFD_V41_SAMPLER_ROW_PARAM_OFFSET_<field>` is the field's byte
+ * offset inside `cuteafd_v41_sampler_row_t`; the Rust ABI test pins these. */
+#define CUTEAFD_V41_SAMPLER_ROW_PARAM_OFFSET_SEED 0u
+#define CUTEAFD_V41_SAMPLER_ROW_PARAM_OFFSET_POSITION 8u
+#define CUTEAFD_V41_SAMPLER_ROW_PARAM_OFFSET_TEMPERATURE 16u
+#define CUTEAFD_V41_SAMPLER_ROW_PARAM_OFFSET_TOP_P 20u
+#define CUTEAFD_V41_SAMPLER_ROW_PARAM_OFFSET_MIN_P 24u
+#define CUTEAFD_V41_SAMPLER_ROW_PARAM_OFFSET_TOP_K 28u
+#define CUTEAFD_V41_SAMPLER_ROW_PARAM_OFFSET_MASK_ROW 32u
+#define CUTEAFD_V41_SAMPLER_ROW_PARAM_OFFSET_FLAGS 36u
+#define CUTEAFD_V41_SAMPLER_ROW_PARAM_OFFSET_OUTPUT_ROW 40u
+#define CUTEAFD_V41_SAMPLER_ROW_PARAM_OFFSET_LN_MIN_P 44u
+#define CUTEAFD_V41_SAMPLER_ROW_PARAM_OFFSET_RESERVED0 48u
+#define CUTEAFD_V41_SAMPLER_ROW_PARAM_OFFSET_RESERVED1 52u
+#define CUTEAFD_V41_SAMPLER_ROW_PARAM_OFFSET_RESERVED2 56u
 
 /* ---- C ABI entry points (§5.4) ----
  *
@@ -295,7 +295,7 @@ __device__ __forceinline__ float ds41rt_v41_ordered_value(uint32_t key) {
  * `logits_stride` floats (>= vocab). `params` is `rows` 64-byte blocks.
  * `mask_words` is nullable; when non-null it is `rows * mask_words_per_row`
  * packed u32 words and `mask_words_per_row` must equal
- * `ds41rt_v41_sampler_mask_words(vocab)`.
+ * `cuteafd_v41_sampler_mask_words(vocab)`.
  *
  * `out_indices`, `out_status`, `out_status_detail`, `out_scores` and
  * `scratch` are required; `out_total` and `out_nucleus_count` may be null.
@@ -303,25 +303,25 @@ __device__ __forceinline__ float ds41rt_v41_ordered_value(uint32_t key) {
  *
  * `out_status_detail` reports the offending token id for
  * `NONFINITE_LOGIT`, the provided word count for `MASK_WIDTH`, and the
- * `DS41RT_V41_SAMPLER_NO_DETAIL` sentinel otherwise.
+ * `CUTEAFD_V41_SAMPLER_NO_DETAIL` sentinel otherwise.
  *
  * The kernel is graph-capture legal: one CTA per row, intra-CTA
  * `__syncthreads()` only, no grid sync, no host callback, no per-call
  * allocation. It must be compiled without `-use_fast_math` and without FTZ.
  */
-ds41rt_status_t ds41rt_cuda_v41_target_sample_async(
+cuteafd_status_t cuteafd_cuda_v41_target_sample_async(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const ds41rt_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, uint32_t* out_indices, uint32_t* out_status,
     uint32_t* out_status_detail, float* out_scores, float* out_total,
-    uint32_t* out_nucleus_count, ds41rt_v41_sampler_scratch_t* scratch,
+    uint32_t* out_nucleus_count, cuteafd_v41_sampler_scratch_t* scratch,
     void* cuda_stream);
-ds41rt_status_t ds41rt_cuda_v41_target_sample(
+cuteafd_status_t cuteafd_cuda_v41_target_sample(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const ds41rt_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, uint32_t* out_indices, uint32_t* out_status,
     uint32_t* out_status_detail, float* out_scores, float* out_total,
-    uint32_t* out_nucleus_count, ds41rt_v41_sampler_scratch_t* scratch);
+    uint32_t* out_nucleus_count, cuteafd_v41_sampler_scratch_t* scratch);
 
 /* ====================================================================== */
 /* Chunk 3a: K3 pivot selection + K4 exact-k membership (design §4.3-§4.4) */
@@ -366,37 +366,37 @@ ds41rt_status_t ds41rt_cuda_v41_target_sample(
  * `out_retained_count[r]` is `params[r].top_k` for an eligible row and 0
  * otherwise (so a caller can tell a real selection from a no-op).
  * `out_pivot_passes[r]` is the number of K3 bisection passes that row used
- * (`<= DS41RT_V41_TOPK_MAX_PIVOT_STEPS`, 0 for a no-op row). A bisection that
- * cannot converge inside the cap writes `DS41RT_V41_SAMPLER_STATUS_INTERNAL`
+ * (`<= CUTEAFD_V41_TOPK_MAX_PIVOT_STEPS`, 0 for a no-op row). A bisection that
+ * cannot converge inside the cap writes `CUTEAFD_V41_SAMPLER_STATUS_INTERNAL`
  * into `scratch[r].status` and materializes nothing.
  *
  * `scratch[r].kth_value_bits` receives the f32 bits of the k-th largest scaled
  * value and `scratch[r].above_count` receives `C_gt(kth) = #{survivors :
  * order_key(scaled) > order_key(kth)}`. Membership is then exactly
  * `{order_key > kth} ∪ {the lowest-id (k - above_count) survivors whose
- * order_key == kth}` — ds41rt's documented deviation from vLLM/FlashInfer,
+ * order_key == kth}` — cuteafd's documented deviation from vLLM/FlashInfer,
  * which keep every k-th-value tie (`target_sampling.rs:30-33`; risk R2).
  *
- * These entry points are additive: `ds41rt_cuda_v41_target_sample[_async]` is
+ * These entry points are additive: `cuteafd_cuda_v41_target_sample[_async]` is
  * byte-for-byte unchanged, so the chunk-1/chunk-2 production path and its
  * daemon caller are untouched. K5 lands in chunk 3b on top of this contract.
  */
-#define DS41RT_V41_TOPK_MAX_PIVOT_STEPS 32u
+#define CUTEAFD_V41_TOPK_MAX_PIVOT_STEPS 32u
 
-ds41rt_status_t ds41rt_cuda_v41_topk_select_async(
+cuteafd_status_t cuteafd_cuda_v41_topk_select_async(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const ds41rt_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, uint32_t* rank_order_ids,
     uint64_t* rank_order_scratch, size_t rank_order_capacity,
     uint32_t* out_retained_count, uint32_t* out_pivot_passes,
-    ds41rt_v41_sampler_scratch_t* scratch, void* cuda_stream);
-ds41rt_status_t ds41rt_cuda_v41_topk_select(
+    cuteafd_v41_sampler_scratch_t* scratch, void* cuda_stream);
+cuteafd_status_t cuteafd_cuda_v41_topk_select(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const ds41rt_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, uint32_t* rank_order_ids,
     uint64_t* rank_order_scratch, size_t rank_order_capacity,
     uint32_t* out_retained_count, uint32_t* out_pivot_passes,
-    ds41rt_v41_sampler_scratch_t* scratch);
+    cuteafd_v41_sampler_scratch_t* scratch);
 
 /* ====================================================================== */
 /* Chunk 3b: K5 inclusive-prefix top-p nucleus + rank-order draw          */
@@ -434,13 +434,13 @@ ds41rt_status_t ds41rt_cuda_v41_topk_select(
  * `v41_target_head.rs`).
  *
  * `out_total[r]` and `out_nucleus_count[r]` are written only when
- * `params[r].flags` has `DS41RT_V41_SAMPLER_FLAG_DIAGNOSE`; both may be null.
+ * `params[r].flags` has `CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE`; both may be null.
  * `out_total` is the CPU's `RankedSample.total` (the floored, un-normalized
  * weight total over `S`), `out_nucleus_count` is the CPU's `nucleus_count`.
  *
  * `out_status` is the SAME per-row status channel K1 uses and may be null. K5
  * writes `INTERNAL` there, for a K5-class row that cannot produce a defined
- * token: a retained list wider than `DS41RT_V41_SAMPLER_CTA` or not materialized
+ * token: a retained list wider than `CUTEAFD_V41_SAMPLER_CTA` or not materialized
  * (`rank_order_ids == nullptr`), ANY non-identity `output_row` (checked
  * unconditionally before the retained count is read), a non-finite `top_p`, or a
  * `survivor_count == 0` row. `scratch[r].status` carries the same value; the
@@ -448,12 +448,12 @@ ds41rt_status_t ds41rt_cuda_v41_topk_select(
  * caller that passes `out_status` therefore cannot mistake a silent no-token for
  * success. **K1 additionally reports `INTERNAL` for a non-finite `top_p` and for
  * a non-greedy zero-survivor row**, so even the K1+K2-only
- * `ds41rt_cuda_v41_target_sample[_async]` entry point -- which never launches
+ * `cuteafd_cuda_v41_target_sample[_async]` entry point -- which never launches
  * K3/K4/K5 -- cannot return OK with an unwritten `out_indices` for those two
  * shapes (the FFI validator rejects them on the host; this is the raw-C path).
  *
  * Both boundaries find the CPU's boundaries. The mass arithmetic defaults to the
- * CPU's literal per-token normalization (`DS41RT_V41_K5_NORMALIZED_MASS=1`): one
+ * CPU's literal per-token normalization (`CUTEAFD_V41_K5_NORMALIZED_MASS=1`): one
  * f32 division `w_t / total` per token, accumulated in the kernel's own order,
  * with the `top_p` / `uniform * nucleus_mass` thresholds. The `=0` build uses
  * the algebraically equivalent `Sum w >= threshold * total` form instead. The
@@ -479,7 +479,7 @@ ds41rt_status_t ds41rt_cuda_v41_topk_select(
  * (`target == 0`) still selects the best actual survivor instead of an empty
  * prefix. The no-crossing fallback reports the full survivor set.
  *
- * `DS41RT_V41_NUCLEUS_MAX_PASSES` is the documented cap for the *retained*
+ * `CUTEAFD_V41_NUCLEUS_MAX_PASSES` is the documented cap for the *retained*
  * domain's `ceil(log2(k))` search; the wider survivor-domain key search is
  * bounded by `2 + 32 + 32` passes per boundary and is the cost the design's
  * chunk-6/7 pass-reduction work targets. `rank_order_capacity`/
@@ -504,26 +504,26 @@ ds41rt_status_t ds41rt_cuda_v41_topk_select(
  * Like K3/K4 these entry points are additive: K1, K2 and K3/K4 are
  * byte-for-byte unchanged.
  */
-#define DS41RT_V41_NUCLEUS_MAX_PASSES 32u
+#define CUTEAFD_V41_NUCLEUS_MAX_PASSES 32u
 
-ds41rt_status_t ds41rt_cuda_v41_nucleus_async(
+cuteafd_status_t cuteafd_cuda_v41_nucleus_async(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const ds41rt_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, const uint32_t* rank_order_ids,
     size_t rank_order_capacity, const uint32_t* rank_retained_count,
     uint32_t* out_indices, uint32_t* out_status, float* out_total,
-    uint32_t* out_nucleus_count, ds41rt_v41_sampler_scratch_t* scratch,
+    uint32_t* out_nucleus_count, cuteafd_v41_sampler_scratch_t* scratch,
     void* cuda_stream);
-ds41rt_status_t ds41rt_cuda_v41_nucleus(
+cuteafd_status_t cuteafd_cuda_v41_nucleus(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const ds41rt_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, const uint32_t* rank_order_ids,
     size_t rank_order_capacity, const uint32_t* rank_retained_count,
     uint32_t* out_indices, uint32_t* out_status, float* out_total,
-    uint32_t* out_nucleus_count, ds41rt_v41_sampler_scratch_t* scratch);
+    uint32_t* out_nucleus_count, cuteafd_v41_sampler_scratch_t* scratch);
 
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
 
-#endif /* DS41RT_V41_SAMPLING_GPU_H */
+#endif /* CUTEAFD_V41_SAMPLING_GPU_H */

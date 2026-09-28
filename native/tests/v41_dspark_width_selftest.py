@@ -15,12 +15,12 @@ def main():
     torch.manual_seed(701)
     torch.backends.cuda.matmul.allow_tf32 = False
     lib = C.CDLL(sys.argv[1])
-    initialize = lib.ds41rt_v41_dspark_attention_initialize_width
+    initialize = lib.cuteafd_v41_dspark_attention_initialize_width
     initialize.argtypes, initialize.restype = [C.c_int32], C.c_int32
-    attend = function(lib, "ds41rt_v41_dspark_attention_fp8_width", 6, 3)
-    legacy = function(lib, "ds41rt_v41_dspark_attention_fp8", 6, 2)
-    layout = function(lib, "ds41rt_v41_dspark_terminal_layout_width", 4, 2)
-    old_layout = function(lib, "ds41rt_v41_dspark_terminal_layout", 4, 1)
+    attend = function(lib, "cuteafd_v41_dspark_attention_fp8_width", 6, 3)
+    legacy = function(lib, "cuteafd_v41_dspark_attention_fp8", 6, 2)
+    layout = function(lib, "cuteafd_v41_dspark_terminal_layout_width", 4, 2)
+    old_layout = function(lib, "cuteafd_v41_dspark_terminal_layout", 4, 1)
     assert initialize(6) != 0
     worst = 0.0
     for gpu in range(torch.cuda.device_count()):

@@ -3,7 +3,7 @@
 No GPU, no torch tensors on device: this pins the cost arithmetic that the
 replicated-group scheduling comparison depends on, so a wrong formula cannot
 reach a timing table. The authoritative form is
-``ds41rt-core``'s ``ReplicatedExpertCostModel``:
+``cuteafd-core``'s ``ReplicatedExpertCostModel``:
 
     active   -> expert_weight_cost + ceil(routed_rows / tile_rows) * tile_cost
     inactive -> 0
@@ -24,7 +24,7 @@ HARNESS = ROOT / "python" / "tools" / "bench_tp_ep_kernel.py"
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("ds41rt_ep_timing", HARNESS)
+    spec = importlib.util.spec_from_file_location("cuteafd_ep_timing", HARNESS)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

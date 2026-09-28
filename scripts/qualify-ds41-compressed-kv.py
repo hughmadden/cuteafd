@@ -36,11 +36,11 @@ def main():
     ref.act_quant_kernel.pass_configs = {**ref.act_quant_kernel.pass_configs, 'tir.disable_vectorize': True}
     lib = ctypes.CDLL(str(a.native_lib.resolve()))
     ptr = ctypes.c_void_p
-    for name in ('ds41rt_v41_compressed_kv_pack', 'ds41rt_v41_kv_pack'):
+    for name in ('cuteafd_v41_compressed_kv_pack', 'cuteafd_v41_kv_pack'):
         fn = getattr(lib, name)
         fn.argtypes = [ptr, ptr, ptr, ptr, ctypes.c_int, ptr]
         fn.restype = ctypes.c_int
-    store = lib.ds41rt_v41_compressed_kv_store
+    store = lib.cuteafd_v41_compressed_kv_store
     store.argtypes = [ptr] * 5 + [ctypes.c_int, ctypes.c_uint64, ptr]
     store.restype = ctypes.c_int
     torch.cuda.set_device(a.device)
@@ -54,7 +54,7 @@ def main():
             x = x.reshape(1, rows, 512)
             values = torch.empty((rows, 256), dtype=torch.uint8, device='cuda')
             scales = torch.empty((rows, 32), dtype=torch.uint8, device='cuda')
-            assert lib.ds41rt_v41_compressed_kv_pack(x.data_ptr(), None if freq is None else freq.data_ptr(), values.data_ptr(), scales.data_ptr(), rows, stream.cuda_stream) == 0
+            assert lib.cuteafd_v41_compressed_kv_pack(x.data_ptr(), None if freq is None else freq.data_ptr(), values.data_ptr(), scales.data_ptr(), rows, stream.cuda_stream) == 0
             expected = x.clone()
             if freq is not None:
                 ns['apply_rotary_emb'](expected[..., -64:], torch.view_as_complex(freq))
@@ -70,7 +70,7 @@ def main():
             # The unchanged window pack remains byte-identical to its reference.
             wv = torch.empty((rows, 512), dtype=torch.uint8, device='cuda')
             ws = torch.empty((rows, 16), dtype=torch.uint8, device='cuda')
-            assert lib.ds41rt_v41_kv_pack(x.data_ptr(), None if freq is None else freq.data_ptr(), wv.data_ptr(), ws.data_ptr(), rows, stream.cuda_stream) == 0
+            assert lib.cuteafd_v41_kv_pack(x.data_ptr(), None if freq is None else freq.data_ptr(), wv.data_ptr(), ws.data_ptr(), rows, stream.cuda_stream) == 0
             wq, wscale = ref.act_quant(expected, 32, 'ue8m0', torch.float8_e8m0fnu)
             assert torch.equal(wv, wq.view(torch.uint8).reshape(rows, 512)), name + ': window values'
             assert torch.equal(ws, wscale.view(torch.uint8).reshape(rows, 16)), name + ': window scales'

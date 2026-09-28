@@ -47,7 +47,7 @@ def main(argv: list[str]) -> int:
         for value in argv:
             check_path(value)
     except (ValueError, OSError, subprocess.SubprocessError) as error:
-        print(f"unsafe build filesystem: {error}\nUse ~/.cache/ds41rt/builds on root NVMe; never build on /mnt/scratch.", file=sys.stderr)
+        print(f"unsafe build filesystem: {error}\nUse ~/.cache/cuteafd/builds on root NVMe; never build on /mnt/scratch.", file=sys.stderr)
         return 2
     return 0
 

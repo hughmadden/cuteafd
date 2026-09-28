@@ -177,7 +177,7 @@ class CheckpointIdentityTests(unittest.TestCase):
     not that manifest hash, so identity there rests on the exact field
     equality instead. All deviations fail closed."""
 
-    SCHEMA = 'ds41rt-hf-staged-snapshot-v1'
+    SCHEMA = 'cuteafd-hf-staged-snapshot-v1'
 
     def _snapshot(self, root: Path, files: dict[str, str] | None = None):
         root.mkdir(parents=True, exist_ok=True)
@@ -192,7 +192,7 @@ class CheckpointIdentityTests(unittest.TestCase):
         snap = model_root / 'snapshots' / revision
         self._snapshot(snap)
         if write_manifest:
-            manifests = model_root / 'ds41rt-manifests'
+            manifests = model_root / 'cuteafd-manifests'
             manifests.mkdir(exist_ok=True)
             payload = {'schema': self.SCHEMA if schema is None else schema,
                        'model_id': model_id, 'files': [
@@ -260,7 +260,7 @@ class CheckpointIdentityTests(unittest.TestCase):
             revision = self._content_revision(files)
             snap = self._staged(temp, revision, files=files)
             record = harness.checkpoint_identity(snap, TARGET)
-            self.assertEqual(record['confirmed_via'], 'ds41rt-manifest-verified')
+            self.assertEqual(record['confirmed_via'], 'cuteafd-manifest-verified')
             self.assertTrue(record['manifest_verified'])
             self.assertEqual(record['manifest_revision_scheme'], 'content-sha256')
             self.assertEqual(record['manifest_content_sha256'], revision)
@@ -282,7 +282,7 @@ class CheckpointIdentityTests(unittest.TestCase):
                     revision = self._content_revision(files)
                     kwargs = {'files': files}
                     if case == 'schema':
-                        kwargs['schema'] = 'ds41rt.staged-artifact.v1'
+                        kwargs['schema'] = 'cuteafd.staged-artifact.v1'
                     elif case == 'revision':
                         # 40-hex (git-commit) dir so the scheme check cannot
                         # mask this one: only the field mismatch may fire.
@@ -581,7 +581,7 @@ class FamilyLoaderFailureTests(unittest.TestCase):
     registration behind in either tool's loader — while a successful load is
     never popped.  Both loaders share this contract; both are exercised."""
 
-    NAME = 'ds41rt_v41_exl3_family'
+    NAME = 'cuteafd_v41_exl3_family'
 
     def _exercise(self, tool, tool_filename):
         saved_file = tool.__file__

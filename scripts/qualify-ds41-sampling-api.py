@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Production native-API sampling acceptance harness.
 
-Targets the released ``serve-native`` path (``ds41rt-api`` ``native_v41``
+Targets the released ``serve-native`` path (``cuteafd-api`` ``native_v41``
 router), not the legacy ``real_full`` sampler. It talks to one already-running
 deployment over HTTP and never launches a model, container, Docker or SSH, so it
 is safe to run before a cluster booking. The sampling matrix is *five sampling

@@ -1,11 +1,11 @@
-# DS41RT containers
+# CUTEAFD containers
 
 The V4.1 topology needs two native development/build roles:
 
 | Development image | Platform | CUDA target | Role |
 | --- | --- | --- | --- |
-| `ds41rt-coordinator-dev` | `linux/amd64` | `sm_120` | Attention, vision, engram projections, shared experts, all dSpark, API and sampling |
-| `ds41rt-spark-expert-dev` | `linux/arm64` | `sm_121` | Backbone routed-expert TP4 worker |
+| `cuteafd-coordinator-dev` | `linux/amd64` | `sm_120` | Attention, vision, engram projections, shared experts, all dSpark, API and sampling |
+| `cuteafd-spark-expert-dev` | `linux/arm64` | `sm_121` | Backbone routed-expert TP4 worker |
 
 `docker-bake.hcl` contains only these two targets. Build each on its native
 machine. There is no checkpoint conversion image: the V4.1 release uses the
@@ -18,10 +18,10 @@ and source identity, builds coordinator artifacts locally, stages matching
 source on the first selected Spark, builds ARM64 artifacts there, and
 distributes the expert image. Exported artifacts live under ignored `dist/`.
 
-Dirty checkouts receive an automatic source manifest under `.ds41rt-release/`.
+Dirty checkouts receive an automatic source manifest under `.cuteafd-release/`.
 The build checks local and staged source against that manifest, so keep source
 files unchanged until it finishes. An existing manifest can be supplied via
-`DS41RT_RELEASE_SOURCE_MANIFEST`; ordinary dirty-tree builds do not require
+`CUTEAFD_RELEASE_SOURCE_MANIFEST`; ordinary dirty-tree builds do not require
 creating one manually.
 
 For a subset of available build hosts:
@@ -36,7 +36,7 @@ workflow. Use each script's `--help` for its current options.
 
 ## Runtime
 
-[`../ds41rt.config`](../ds41rt.config) selects the official V4.1 Flash
+[`../cuteafd.config`](../cuteafd.config) selects the official V4.1 Flash
 checkpoint and the v6 coordinator/worker images. `./run.sh` validates image,
 source, dependency, model, host and device identity before starting all five
 containers. The standard launch uses port 8000, concurrency 16, dSpark, the
@@ -62,8 +62,8 @@ qualification evidence and recovery policy are in [the quantization plan](../qua
 Build the bundled-code coordinator from its pinned local base:
 
 ```bash
-docker tag sha256:6213ea40c79617373562d7f2d3cc5fa25ca9d03e27dd213361b216c3e315e9f4 ds41rt-quant-coordinator-base:6213ea40c796
-docker build -f docker/Dockerfile.quant-coordinator -t ds41rt-quant-coordinator:integration-v1 .
+docker tag sha256:6213ea40c79617373562d7f2d3cc5fa25ca9d03e27dd213361b216c3e315e9f4 cuteafd-quant-coordinator-base:6213ea40c796
+docker build -f docker/Dockerfile.quant-coordinator -t cuteafd-quant-coordinator:integration-v1 .
 ```
 
 The base must already be available; do not substitute an unrelated tag. The

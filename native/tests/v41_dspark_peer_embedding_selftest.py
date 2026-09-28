@@ -19,9 +19,9 @@ def main():
     width = args.width
     lib = C.CDLL(args.library)
     helpers = C.CDLL(args.helpers) if args.helpers else lib
-    peer = helpers.ds41rt_cuda_enable_peer
+    peer = helpers.cuteafd_cuda_enable_peer
     peer.argtypes, peer.restype = [C.c_int32], C.c_int32
-    embed = lib.ds41rt_v41_dspark_embed_width
+    embed = lib.cuteafd_v41_dspark_embed_width
     embed.argtypes = [C.c_void_p] * 4 + [C.c_int32, C.c_int32, C.c_void_p]
     embed.restype = C.c_int32
     seed_ids = [0, 129279, 128799, 42, 500, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]

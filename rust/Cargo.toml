@@ -1,19 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/ds41rt-api",
-  "crates/ds41rt-core",
-  "crates/ds41rt-daemon",
-  "crates/ds41rt-ffi",
-  "crates/ds41rt-loader",
-  "crates/ds41rt-transport",
-    "crates/ds41rt-hostcache",
+  "crates/cuteafd-api",
+  "crates/cuteafd-core",
+  "crates/cuteafd-daemon",
+  "crates/cuteafd-ffi",
+  "crates/cuteafd-loader",
+  "crates/cuteafd-transport",
+    "crates/cuteafd-hostcache",
 ]
 
 [workspace.package]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/tpurtell/ds41rt"
+repository = "https://github.com/tpurtell/cuteafd"
 
 [workspace.dependencies]
 anyhow = "1"

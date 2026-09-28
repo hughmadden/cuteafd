@@ -55,7 +55,7 @@ PINNED_ANCHORS = {
         "sparkinfer", "b12x/moe/_shared/kernels/w4a8_v41_slice.py",
         "assert width in (64, 128, 192)"),
     "spark_tp3.geometry": (
-        "ds41rt", "python/tools/export_b12x_v41_slices_aot.py",
+        "cuteafd", "python/tools/export_b12x_v41_slices_aot.py",
         '"spark_tp3": (384, 768, 768, 6)'),
 }
 
@@ -169,7 +169,7 @@ def test_pinned_source_anchors_still_hold() -> None:
 
 def test_cmake_default_width_map_matches_the_reviewed_widths() -> None:
     match = re.search(
-        r'set\(DS41RT_V41_SPARK_TP3_SLICE_WIDTH "([^"]+)"',
+        r'set\(CUTEAFD_V41_SPARK_TP3_SLICE_WIDTH "([^"]+)"',
         CMAKE_TP.read_text(encoding="utf-8"))
     assert match is not None
     parsed = {}
@@ -264,7 +264,7 @@ def test_manifest_geometry_requires_capacity_width_and_hidden() -> None:
 def _load_qualifier():
     pytest.importorskip("torch")
     try:
-        spec = importlib.util.spec_from_file_location("ds41rt_tp3_qualifier", QUALIFIER)
+        spec = importlib.util.spec_from_file_location("cuteafd_tp3_qualifier", QUALIFIER)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     except Exception as error:  # pragma: no cover - environment dependent
@@ -555,7 +555,7 @@ def test_exporter_records_geometry_from_the_shared_identity() -> None:
 
 
 def test_exporter_module_resolves_tp3_geometry() -> None:
-    spec = importlib.util.spec_from_file_location("ds41rt_slices_export_probe", SLICES)
+    spec = importlib.util.spec_from_file_location("cuteafd_slices_export_probe", SLICES)
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)

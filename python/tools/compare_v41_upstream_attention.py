@@ -59,7 +59,7 @@ def compare(lib, rows, candidate=None, native_abi=False):
     view = View((C.c_void_p*4)(*[v.data_ptr() for v in values]),
                 (C.c_void_p*4)(*[s.data_ptr() for s in scales]), end.data_ptr(),
                 pages.data_ptr(), source_end.data_ptr(), rows, 512, 1, 2, 2)
-    fn = lib.ds41rt_v41_sparse_attention_split
+    fn = lib.cuteafd_v41_sparse_attention_split
     fn.argtypes = [C.c_void_p]*5 + [C.c_int32, C.c_int32, C.POINTER(View),
                                   C.c_void_p, C.c_void_p, C.c_uint64, C.c_int32]
 
@@ -108,7 +108,7 @@ def compare(lib, rows, candidate=None, native_abi=False):
             partials = torch.empty(rows, 64, 10, 512, dtype=torch.bfloat16, device="cuda")
             lses = torch.empty(rows, 64, 10, dtype=torch.float32, device="cuda")
             upstream_output = outputs[1].clone()
-            candidate_fn = candidate.ds41rt_v41_sparse_attention_split if native_abi else candidate.ds41rt_attention_probe
+            candidate_fn = candidate.cuteafd_v41_sparse_attention_split if native_abi else candidate.cuteafd_attention_probe
             candidate_fn.argtypes = fn.argtypes if native_abi else [C.c_void_p]*9 + [C.c_int32, C.c_void_p]
 
             def upstream():
@@ -190,7 +190,7 @@ def main():
     args = parser.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
     lib = C.CDLL(args.native_library)
-    assert lib.ds41rt_v41_sparse_attention_initialize() == 0
+    assert lib.cuteafd_v41_sparse_attention_initialize() == 0
     candidate = C.CDLL(args.candidate_library) if args.candidate_library else None
     if candidate is not None:
         manifest_path = args.candidate_manifest or Path(args.candidate_library).parent / "v41_attention.json"
@@ -198,9 +198,9 @@ def main():
         for name, expected_hash in manifest["artifacts"].items():
             assert hashlib.sha256((manifest_path.parent/name).read_bytes()).hexdigest() == expected_hash, name
         if args.candidate_native_abi:
-            assert candidate.ds41rt_v41_sparse_attention_initialize() == 0
+            assert candidate.cuteafd_v41_sparse_attention_initialize() == 0
         else:
-            candidate.ds41rt_attention_probe_initialize()
+            candidate.cuteafd_attention_probe_initialize()
     source = Path(b12x.__file__).resolve().parent.parent
     provenance = dict(
         candidate_revision=subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip(),

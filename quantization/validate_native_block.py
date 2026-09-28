@@ -158,7 +158,7 @@ def validate(snapshot, device, layer_index=0, lengths=(32, 129), frontier=None, 
                 from gptqmodel.utils.v41_checkpoint import save_frontier, save_routed_batch, load_routed_batch
                 from run_store import RunStore
                 routed = V41RoutedBatch.from_replay(block, state, device)
-                with tempfile.TemporaryDirectory(prefix="ds41rt-routed-gate-") as directory:
+                with tempfile.TemporaryDirectory(prefix="cuteafd-routed-gate-") as directory:
                     root = Path(directory)
                     provenance = dict(diagnostic="routed-roundtrip", layer=layer_index, length=length,
                                       snapshot=snapshot.name)

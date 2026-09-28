@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-time sudo installation; subsequent cache drops use a fixed-function helper.
 set -euo pipefail
-readonly helper=/usr/local/libexec/ds41rt-bench/drop-page-cache
+readonly helper=/usr/local/libexec/cuteafd-bench/drop-page-cache
 readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly self="$script_dir/drop-page-cache.sh"
 
@@ -14,7 +14,7 @@ Install the fixed-function helper with sudo first if it is missing.
 --install: install/update the helper; do not drop caches.
 --check: verify the installed helper and current user's execute access.
 
-Installation: root-owned /usr/local/libexec/ds41rt-bench/drop-page-cache,
+Installation: root-owned /usr/local/libexec/cuteafd-bench/drop-page-cache,
 mode 4750, executable by the installing user's primary group. The writable
 checkout is never made setuid. A C compiler and sudo are needed only to install.
 Active or dirty pages may remain; verify residency for cold-cache benchmarks.
@@ -23,7 +23,7 @@ HELP
 
 check_parents() {
     local path owner mode
-    for path in /usr /usr/local /usr/local/libexec /usr/local/libexec/ds41rt-bench; do
+    for path in /usr /usr/local /usr/local/libexec /usr/local/libexec/cuteafd-bench; do
         [[ -d "$path" && ! -L "$path" ]] || return 1
         owner=$(stat -c '%u' -- "$path")
         mode=$(stat -c '%a' -- "$path")
@@ -42,7 +42,7 @@ if [[ ${1:-} == --install-helper ]]; then
     [[ $# == 3 && $EUID == 0 && $3 =~ ^[0-9]+$ && -f $2 && ! -L $2 ]] || {
         echo 'Invalid privileged installation invocation.' >&2; exit 1;
     }
-    for path in /usr /usr/local /usr/local/libexec /usr/local/libexec/ds41rt-bench; do
+    for path in /usr /usr/local /usr/local/libexec /usr/local/libexec/cuteafd-bench; do
         if [[ ! -e "$path" && ! -L "$path" ]]; then
             /usr/bin/install -d -o root -g root -m 0755 -- "$path"
         fi
@@ -55,7 +55,7 @@ if [[ ${1:-} == --install-helper ]]; then
         }
     done
     # Install a new inode, then rename: never alter an executing setuid binary.
-    pending=$(mktemp /usr/local/libexec/ds41rt-bench/.drop-page-cache.XXXXXXXX)
+    pending=$(mktemp /usr/local/libexec/cuteafd-bench/.drop-page-cache.XXXXXXXX)
     trap 'rm -f -- "$pending"' EXIT
     /usr/bin/install -o root -g "$3" -m 0750 -- "$2" "$pending"
     # Set privilege only after copying and ownership changes, which can clear it.

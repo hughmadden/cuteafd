@@ -54,7 +54,7 @@ def main():
     profile = None
     if args.cost_profile is not None:
         profile = json.loads(args.cost_profile.read_text())
-        assert profile['schema'] == 'ds41rt.exl3-paired-cost.v1'
+        assert profile['schema'] == 'cuteafd.exl3-paired-cost.v1'
         profile = profile['layers'][args.layer]
         assert len(profile) == 384
     props = torch.cuda.get_device_properties(0)

@@ -42,12 +42,12 @@ def main():
             code = fn(*values)
             assert code == 0, (name, code)
         return call
-    info_fn = bind("ds41rt_v41_fp8_matrix_info", [I, I, I, C.POINTER(Info)])
-    initialize = bind("ds41rt_v41_fp8_matrix_initialize", [I, I, I, C.POINTER(P)])
-    scratch_init = bind("ds41rt_v41_fp8_initialize_scratch", [P, P, C.c_uint64, P, P])
-    pack = bind("ds41rt_v41_fp8_matrix_pack_scales", [P, P, I, I, P])
-    linear = bind("ds41rt_v41_fp8_launch", [P, P, P, P, P, C.c_uint64, P, P, I, P])
-    activation = bind("ds41rt_v41_shared_tp2_swiglu", [P, P, P, I, P])
+    info_fn = bind("cuteafd_v41_fp8_matrix_info", [I, I, I, C.POINTER(Info)])
+    initialize = bind("cuteafd_v41_fp8_matrix_initialize", [I, I, I, C.POINTER(P)])
+    scratch_init = bind("cuteafd_v41_fp8_initialize_scratch", [P, P, C.c_uint64, P, P])
+    pack = bind("cuteafd_v41_fp8_matrix_pack_scales", [P, P, I, I, P])
+    linear = bind("cuteafd_v41_fp8_launch", [P, P, P, P, P, C.c_uint64, P, P, I, P])
+    activation = bind("cuteafd_v41_shared_tp2_swiglu", [P, P, P, I, P])
     index = json.loads((args.snapshot / "model.safetensors.index.json").read_text())["weight_map"]
     raw = {}
     for name in ("w1", "w3", "w2"):

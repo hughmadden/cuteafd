@@ -40,7 +40,7 @@ def main():
     def native(example, *extra):
         return json.loads(subprocess.check_output([
             "cargo", "run", "--quiet", "--manifest-path", str(ROOT / "rust/Cargo.toml"),
-            "-p", "ds41rt-loader", "--example", example, "--",
+            "-p", "cuteafd-loader", "--example", example, "--",
             str(reference / "tokenizer.json"), *map(str, extra),
         ], cwd=ROOT))
 

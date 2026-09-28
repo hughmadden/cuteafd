@@ -19,7 +19,7 @@ tags:
 Routed-expert-only mixed EXL3 K3/K4 quantization of
 `deepseek-ai/DeepSeek-V4.1-Flash`, source revision `{source_revision}`.
 Built with the custom V4.1 support in [our GPTQModel fork](https://github.com/tpurtell/GPTQModel)
-and the reproducible [ds41rt quantization workflow](https://github.com/tpurtell/ds41rt/tree/main/quantization).
+and the reproducible [cuteafd quantization workflow](https://github.com/tpurtell/cuteafd/tree/main/quantization).
 
 ## Quantization recipe
 

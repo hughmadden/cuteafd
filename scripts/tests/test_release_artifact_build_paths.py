@@ -96,10 +96,10 @@ def test_cargo_build_and_daemon_install_share_one_target_dir():
     assert 'CARGO_TARGET_DIR="$cargo_target_dir" cargo build' in text, (
         "cargo must build into the selected target directory"
     )
-    assert 'install -m 0755 "$cargo_target_dir/release/ds41rt"' in text, (
+    assert 'install -m 0755 "$cargo_target_dir/release/cuteafd"' in text, (
         "the daemon install must read from the same selected target directory"
     )
-    assert "$build_root/source/rust/target/release/ds41rt" not in text, (
+    assert "$build_root/source/rust/target/release/cuteafd" not in text, (
         "no install may hardcode the default target path"
     )
 
@@ -178,7 +178,7 @@ def scratch():
     the behaviour under test is reached. This checkout's cache directory is on the
     root filesystem and is ignored by the release source inventory.
     """
-    root = REPO / ".ds41rt-cache" / "test-release-artifact-build-paths"
+    root = REPO / ".cuteafd-cache" / "test-release-artifact-build-paths"
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True, exist_ok=True)
     try:
@@ -202,8 +202,8 @@ def test_relocated_cargo_target_is_where_the_daemon_is_installed(scratch):
         #!/usr/bin/env bash
         set -euo pipefail
         mkdir -p "$CARGO_TARGET_DIR/release"
-        printf 'daemon\\n' >"$CARGO_TARGET_DIR/release/ds41rt"
-        chmod +x "$CARGO_TARGET_DIR/release/ds41rt"
+        printf 'daemon\\n' >"$CARGO_TARGET_DIR/release/cuteafd"
+        chmod +x "$CARGO_TARGET_DIR/release/cuteafd"
         """,
     )
     _write_stub(
@@ -220,7 +220,7 @@ def test_relocated_cargo_target_is_where_the_daemon_is_installed(scratch):
         done
         [[ -n "$build_dir" ]] || exit 0
         mkdir -p "$build_dir/v41_experts" "$build_dir/v41_fp8"
-        printf 'native\\n' >"$build_dir/libds41rt_native.so"
+        printf 'native\\n' >"$build_dir/libcuteafd_native.so"
         printf '{}\\n' >"$build_dir/v41_experts/v41_experts.json"
         printf '{}\\n' >"$build_dir/v41_fp8/v41_fp8.json"
         exit 0
@@ -253,14 +253,14 @@ def test_relocated_cargo_target_is_where_the_daemon_is_installed(scratch):
     env = dict(os.environ)
     env["PATH"] = f"{shims}:{env['PATH']}"
     env["CARGO_TARGET_DIR"] = str(relocated)
-    env.pop("DS41RT_RELEASE_SPARK_TP_ROLES", None)
+    env.pop("CUTEAFD_RELEASE_SPARK_TP_ROLES", None)
     # The build root parent is relocated to the same probeable filesystem: with the
     # hook unset the script guards its literal /tmp default, which a private or
     # sandboxed /tmp cannot resolve, and that would mask the target-directory
     # behaviour this test exists to prove.
     build_root = tmp_path / "build-root"
     build_root.mkdir(parents=True, exist_ok=True)
-    env["DS41RT_RELEASE_BUILD_ROOT"] = str(build_root)
+    env["CUTEAFD_RELEASE_BUILD_ROOT"] = str(build_root)
     # The script guards CARGO_HOME too, and a user's default may sit on a
     # read-only mount in a sandboxed runner.
     env["CARGO_HOME"] = str(tmp_path / "cargo-home")
@@ -274,10 +274,10 @@ def test_relocated_cargo_target_is_where_the_daemon_is_installed(scratch):
     assert result.returncode == 0, result.stdout + result.stderr
 
     # The stub only ever wrote into the relocated target...
-    assert (relocated / "release" / "ds41rt").exists()
+    assert (relocated / "release" / "cuteafd").exists()
     # ...and the daemon still reached the output, because build and install
     # read the same selected target rather than a hardcoded default.
-    assert (output / "ds41rt").read_text() == "daemon\n"
+    assert (output / "cuteafd").read_text() == "daemon\n"
     assert not (output / "cargo-target").exists()
 
 

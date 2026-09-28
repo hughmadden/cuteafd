@@ -16,7 +16,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-CONFIG = ROOT / "ds41rt.config"
+CONFIG = ROOT / "cuteafd.config"
 EXAMPLES = ROOT / "examples" / "configs"
 
 
@@ -631,9 +631,9 @@ SPARK_COUNT={spark_count}
             spark_count=6,
             hosts=["a", "b", "c", "d", "e", "f"],
             extra_env={
-                "DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP": device_map,
-                "DS41RT_VERBS_APP_IB_PORT_NUM": "1",
-                "DS41RT_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES": "2",
+                "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP": device_map,
+                "CUTEAFD_VERBS_APP_IB_PORT_NUM": "1",
+                "CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES": "2",
             },
             extra_setup="DSPARK_DRAFT_POLICY=full\ndspark_draft_limit=7\n",
         )
@@ -641,7 +641,7 @@ SPARK_COUNT={spark_count}
         coordinator = next(args for tool, args in events if tool == "docker" and args[0] == "run")
         self.assertIn("--dspark-fixed", coordinator)
         self.assertEqual(coordinator[coordinator.index("--dspark-draft-limit") + 1], "7")
-        self.assertIn(f"DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP={device_map}", coordinator)
+        self.assertIn(f"CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP={device_map}", coordinator)
         starts = [args for tool, args in events if tool == "ssh" and "-s" in args]
         self.assertEqual(len(starts), 6)
         for args in starts:
@@ -655,7 +655,7 @@ class VerbsDeviceMapTest(unittest.TestCase):
         return subprocess.run(
             ["bash", "-euc", "source scripts/release-common.sh; release_validate_verbs_device_map", "test"],
             cwd=ROOT, text=True, capture_output=True,
-            env=dict(os.environ, DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=value),
+            env=dict(os.environ, CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=value),
         )
 
     def test_accepts_unique_ipv4_device_entries(self) -> None:
@@ -667,7 +667,7 @@ class VerbsDeviceMapTest(unittest.TestCase):
             with self.subTest(bad=bad):
                 result = self.validate(bad)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP", result.stderr)
+                self.assertIn("CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP", result.stderr)
 
 
 class StopScriptTest(unittest.TestCase):
@@ -758,8 +758,8 @@ class ManifestWriterTest(unittest.TestCase):
             "--output", str(root / output),
         ]
         if library:
-            (root / "libds41rt_native.so").write_bytes(b"fake-library")
-            command += ["--native-library", str(root / "libds41rt_native.so")]
+            (root / "libcuteafd_native.so").write_bytes(b"fake-library")
+            command += ["--native-library", str(root / "libcuteafd_native.so")]
         return subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
 
     def test_valid_role_manifest_binds_geometry_and_library(self) -> None:
@@ -859,8 +859,8 @@ class BuildScopeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             env, marker = self.stub_path(root)
-            env["DS41RT_WIP_EXL3_AOT"] = "OFF"
-            env["DS41RT_WIP_NVFP4_AOT"] = "OFF"
+            env["CUTEAFD_WIP_EXL3_AOT"] = "OFF"
+            env["CUTEAFD_WIP_NVFP4_AOT"] = "OFF"
             result = subprocess.run(
                 ["./wip.sh", "--config", str(EXAMPLES / "tp2ep3-native.config"), "--dry-run"],
                 cwd=ROOT, text=True, capture_output=True, env=env,
@@ -875,12 +875,12 @@ class BuildScopeTest(unittest.TestCase):
         release_helper = (ROOT / "scripts/build-release-artifacts.sh").read_text()
         wip_helper = (ROOT / "scripts/build-wip-artifacts.sh").read_text()
         dockerfile = (ROOT / "docker/Dockerfile.release").read_text()
-        self.assertIn('-DDS41RT_V41_SPARK_TP_ROLES="$spark_tp_roles"', release_helper)
-        self.assertIn('-DDS41RT_V41_SPARK_TP_ROLES="$spark_tp_roles"', wip_helper)
-        self.assertIn("exl3_aot=\"${DS41RT_WIP_EXL3_AOT:-ON}\"", wip_helper)
-        self.assertIn('-DDS41RT_ENABLE_V41_EXL3_AOT="$exl3_aot"', wip_helper)
+        self.assertIn('-DCUTEAFD_V41_SPARK_TP_ROLES="$spark_tp_roles"', release_helper)
+        self.assertIn('-DCUTEAFD_V41_SPARK_TP_ROLES="$spark_tp_roles"', wip_helper)
+        self.assertIn("exl3_aot=\"${CUTEAFD_WIP_EXL3_AOT:-ON}\"", wip_helper)
+        self.assertIn('-DCUTEAFD_ENABLE_V41_EXL3_AOT="$exl3_aot"', wip_helper)
         self.assertIn('if [[ "$exl3_aot" == ON ]]; then', wip_helper)
-        self.assertIn("io.ds41rt.v41.spark_tp_roles", dockerfile)
+        self.assertIn("io.cuteafd.v41.spark_tp_roles", dockerfile)
         self.assertIn("V41_EXPERT_TP_AOT.json", dockerfile)
 
     def test_run_sh_accepts_actual_placement_gpus_and_opens_single_rtx_handoff(self) -> None:
@@ -924,12 +924,8 @@ class BuildScopeTest(unittest.TestCase):
 
     def test_removed_adaptive_cost_mode_is_not_forwarded(self) -> None:
         # The online length policy has no offline cost profile or mode switch.
-        self.assertNotIn("DS41RT_ADAPTIVE_COST_MODE", (ROOT / "run.sh").read_text())
+        self.assertNotIn("CUTEAFD_ADAPTIVE_COST_MODE", (ROOT / "run.sh").read_text())
 
-    def test_run_wip_rejects_replicated_wire_on_the_legacy_backend(self) -> None:
-        launcher = (ROOT / "scripts/run-wip.sh").read_text()
-        self.assertIn("does not implement the replicated", launcher)
-        self.assertNotIn('"$SPARK_COUNT" == 4 || "$SPARK_COUNT" == 6', launcher)
 
 
 CANDIDATE = ROOT / "scripts" / "run-tp-ep-native-candidate.sh"
@@ -1038,7 +1034,7 @@ OPS_GPU_UUIDS = (
 # inserts ANSI dim/italic codes between a field name and its `=`.
 ANSI_READY_LINE = (
     "\x1b[2m2026-09-20T07:13:46.765350Z\x1b[0m \x1b[32m INFO\x1b[0m "
-    "\x1b[2mds41rt::v41_experts::service::local\x1b[0m\x1b[2m:\x1b[0m "
+    "\x1b[2mcuteafd::v41_experts::service::local\x1b[0m\x1b[2m:\x1b[0m "
     "native local RoCE expert worker ready "
     "\x1b[3mrank\x1b[0m\x1b[2m=\x1b[0m{rank} "
     "\x1b[3mworld\x1b[0m\x1b[2m=\x1b[0m4 "
@@ -1069,9 +1065,9 @@ class CandidateLauncherTest(unittest.TestCase):
         self.assertIn("--spark-tp 2", coordinator)
         self.assertIn("--spark-ep 2", coordinator)
         self.assertIn("--placement-directory", coordinator)
-        # DS41RT_NATIVE_LIB must be present before the container and match --native-lib.
-        self.assertIn("-e DS41RT_NATIVE_LIB=/scratch/coord-native/libds41rt_native.so", coordinator)
-        self.assertIn("-e DS41RT_WIP_RUNTIME_ROOT=/scratch/candidate/run", coordinator)
+        # CUTEAFD_NATIVE_LIB must be present before the container and match --native-lib.
+        self.assertIn("-e CUTEAFD_NATIVE_LIB=/scratch/coord-native/libcuteafd_native.so", coordinator)
+        self.assertIn("-e CUTEAFD_WIP_RUNTIME_ROOT=/scratch/candidate/run", coordinator)
         self.assertIn("-e RUST_LOG=info", coordinator)
         # The plan render escapes the CSV comma; both UUIDs and the CSV order
         # still appear in the coordinator command.
@@ -1081,15 +1077,15 @@ class CandidateLauncherTest(unittest.TestCase):
         )
         self.assertIn("GPU-95f8f212-9131-df99-fd53-7535965197d7", coordinator)
         self.assertLess(
-            coordinator.index("DS41RT_NATIVE_LIB=/scratch/coord-native/libds41rt_native.so"),
-            coordinator.index("ds41rt-tpep-nvme-dev"),
+            coordinator.index("CUTEAFD_NATIVE_LIB=/scratch/coord-native/libcuteafd_native.so"),
+            coordinator.index("cuteafd-tpep-nvme-dev"),
         )
         self.assertLess(
             coordinator.index("CUDA_VISIBLE_DEVICES="),
-            coordinator.index("ds41rt-tpep-nvme-dev"),
+            coordinator.index("cuteafd-tpep-nvme-dev"),
         )
         self.assertIn(f"coordinator_cuda_visible_devices={OPS_GPU_UUIDS}", result.stdout)
-        self.assertIn("--native-lib /scratch/coord-native/libds41rt_native.so", coordinator)
+        self.assertIn("--native-lib /scratch/coord-native/libcuteafd_native.so", coordinator)
         self.assertIn("expert_capacity=4096", result.stdout)
         # Plan handshake before any worker, worker readiness before ack, gate last.
         order = [line for line in lines if line.startswith("STEP")]
@@ -1103,10 +1099,10 @@ class CandidateLauncherTest(unittest.TestCase):
             self.assertIn(f"--rank {rank}", line)
             self.assertIn("--world 4", line)
             self.assertIn(f"--rank {rank} --world 4 --spark-tp 2 --spark-ep 2", line)
-            self.assertIn("-e DS41RT_NATIVE_LIB=/scratch/candidate/libds41rt_native.so", line)
+            self.assertIn("-e CUTEAFD_NATIVE_LIB=/scratch/candidate/libcuteafd_native.so", line)
             self.assertIn("-e RUST_LOG=info", line)
-            self.assertIn("--native-lib /scratch/candidate/libds41rt_native.so", line)
-            self.assertLess(line.index("DS41RT_NATIVE_LIB="), line.index("ds41rt-tpep-dev"))
+            self.assertIn("--native-lib /scratch/candidate/libcuteafd_native.so", line)
+            self.assertLess(line.index("CUTEAFD_NATIVE_LIB="), line.index("cuteafd-tpep-dev"))
             # The GPU pin is coordinator-only.
             self.assertNotIn("CUDA_VISIBLE_DEVICES", line)
 
@@ -1203,7 +1199,7 @@ class CandidateLauncherTest(unittest.TestCase):
             os.environ,
             PATH=f"{stub_bin}{os.pathsep}{os.environ['PATH']}",
             STUB_SCENARIO=scenario,
-            DS41RT_TPEP_L3_GRANT="1",
+            CUTEAFD_TPEP_L3_GRANT="1",
         )
         if env_extra:
             env.update(env_extra)
@@ -1240,7 +1236,7 @@ class CandidateLauncherTest(unittest.TestCase):
                 "--host-artifact-root", str(root), "--run-id", "stale-log-run",
                 env_extra={"STUB_PLAN": self.READY_PLAN, "STUB_LOG_OFFSET": offset,
                            "STUB_LOG_FULL": self.READY_PREFIX,
-                           "DS41RT_TPEP_WORKER_READY_TIMEOUT_SECONDS": "1"},
+                           "CUTEAFD_TPEP_WORKER_READY_TIMEOUT_SECONDS": "1"},
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("worker readiness timed out", result.stderr)
@@ -1248,7 +1244,7 @@ class CandidateLauncherTest(unittest.TestCase):
     def test_wrong_rank_and_split_line_do_not_satisfy_ready(self) -> None:
         wrong_rank = ANSI_READY_LINE.format(rank=10)  # rank=10 must not match rank=1
         split_line = (
-            "\x1b[2m ds41rt: native local RoCE expert worker ready\x1b[0m\n"
+            "\x1b[2m cuteafd: native local RoCE expert worker ready\x1b[0m\n"
             "\x1b[3mrank\x1b[0m\x1b[2m=\x1b[0m1 \x1b[3mworld\x1b[0m\x1b[2m=\x1b[0m4 "
             "\x1b[3mfirst_layer\x1b[0m\x1b[2m=\x1b[0m20\n"
         )
@@ -1262,7 +1258,7 @@ class CandidateLauncherTest(unittest.TestCase):
                         env_extra={"STUB_PLAN": self.READY_PLAN,
                                    "STUB_LOG_OFFSET": str(len(self.READY_PREFIX)),
                                    "STUB_LOG_FULL": self.READY_PREFIX + body,
-                                   "DS41RT_TPEP_WORKER_READY_TIMEOUT_SECONDS": "1"},
+                                   "CUTEAFD_TPEP_WORKER_READY_TIMEOUT_SECONDS": "1"},
                     )
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("worker readiness timed out", result.stderr)
@@ -1339,7 +1335,7 @@ class PublishedImageReferenceTest(unittest.TestCase):
     """
 
     # The v10 promotion retargeted every example onto the promoted pair, so no
-    # exemption remains: all of them are checked against `ds41rt.config`.
+    # exemption remains: all of them are checked against `cuteafd.config`.
     def published_pair(self) -> tuple[str, str]:
         values = {}
         for line in CONFIG.read_text().splitlines():
@@ -1402,12 +1398,12 @@ if [[ "$1" == info ]]; then exit 0; fi
 if [[ "$1" == image && "$2" == inspect ]]; then
   if [[ "$*" == *"-f "* ]]; then
     case "$*" in
-      *image.revision*) printf '%s\\n' "$DS41RT_STUB_ENGINE"; exit 0 ;;
-      *sparkinfer.revision*) printf '%s\\n' "$DS41RT_STUB_SPARKINFER"; exit 0 ;;
+      *image.revision*) printf '%s\\n' "$CUTEAFD_STUB_ENGINE"; exit 0 ;;
+      *sparkinfer.revision*) printf '%s\\n' "$CUTEAFD_STUB_SPARKINFER"; exit 0 ;;
       *) printf '\\n'; exit 0 ;;
     esac
   fi
-  if [[ "${DS41RT_STUB_MISSING:-0}" == 1 ]]; then exit 1; fi
+  if [[ "${CUTEAFD_STUB_MISSING:-0}" == 1 ]]; then exit 1; fi
   echo present
   exit 0
 fi
@@ -1458,9 +1454,9 @@ unset HF_HOME
             return subprocess.run(
                 ["bash", "-c", script], cwd=ROOT, text=True, capture_output=True, timeout=20,
                 env=dict(os.environ, PATH=f"{stub}{os.pathsep}{os.environ['PATH']}",
-                         DS41RT_STUB_ENGINE="engine-revision",
-                         DS41RT_STUB_SPARKINFER="sparkinfer-revision",
-                         DS41RT_STUB_MISSING=str(missing)),
+                         CUTEAFD_STUB_ENGINE="engine-revision",
+                         CUTEAFD_STUB_SPARKINFER="sparkinfer-revision",
+                         CUTEAFD_STUB_MISSING=str(missing)),
             )
 
     def test_native_empty_family_tag_completes_without_shifting_arguments(self) -> None:

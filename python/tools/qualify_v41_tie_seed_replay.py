@@ -4,7 +4,7 @@
 Two stages:
 
 1. CPU (always runnable): validate the owners/route-word export produced by
-   ``rust/crates/ds41rt-transport/examples/v41_tp_ep_tie_seed_owners.rs`` and
+   ``rust/crates/cuteafd-transport/examples/v41_tp_ep_tie_seed_owners.rs`` and
    reproduce the production reduction arithmetic exactly on the CPU:
    per-rank ordered FP32 sum over the six route slots with one BF16 rounding
    (``compact_routes``), then the coordinator's ordered FP32 rank-plane add with
@@ -321,7 +321,7 @@ def _build_rank_arena(snapshot, layer, intermediate, tp_rank, gids, lib, torch):
         sliced[name] = (torch.stack(weight_rows), torch.stack(scale_rows))
 
     sizes = (L * 4)()
-    check(lib.ds41rt_v41_expert_packed_sizes(intermediate, sizes))
+    check(lib.cuteafd_v41_expert_packed_sizes(intermediate, sizes))
     per_bytes = [int(sizes[i]) for i in range(4)]
     arena = [torch.zeros(384 * per_bytes[i], dtype=torch.uint8, device="cuda") for i in range(4)]
     stream = torch.cuda.current_stream().cuda_stream
@@ -333,7 +333,7 @@ def _build_rank_arena(snapshot, layer, intermediate, tp_rank, gids, lib, torch):
             sliced["w3"][1][k].data_ptr(), sliced["w2"][1][k].data_ptr(),
         )
         dst = (P * 4)(*[arena[i].data_ptr() + slot * per_bytes[i] for i in range(4)])
-        check(lib.ds41rt_v41_pack_expert_async(src, dst, intermediate, stream))
+        check(lib.cuteafd_v41_pack_expert_async(src, dst, intermediate, stream))
     torch.cuda.synchronize()
     digest = hashlib.sha256(b"".join(digests)).hexdigest()
     return arena, digest
@@ -349,9 +349,9 @@ def abi_layout(token_accumulation: bool, abi_version: int) -> tuple[str, str, tu
     """
     if token_accumulation:
         assert abi_version == 3, abi_version
-        return ("fp32_tokens", "ds41rt_v41_compact_tokens_bf16_async", (1, HIDDEN))
+        return ("fp32_tokens", "cuteafd_v41_compact_tokens_bf16_async", (1, HIDDEN))
     assert abi_version == 2, abi_version
-    return ("fp32_routes", "ds41rt_v41_compact_routes_bf16_async", (1, TOPK, HIDDEN))
+    return ("fp32_routes", "cuteafd_v41_compact_routes_bf16_async", (1, TOPK, HIDDEN))
 
 
 def quantize_wire(x, capacity: int, torch_module):

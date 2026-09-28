@@ -1,4 +1,4 @@
-#include "ds41rt_v41_experts.h"
+#include "cuteafd_v41_experts.h"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstddef>
@@ -135,7 +135,7 @@ bool valid_compact_planes(const uint16_t* const planes[6], const uint16_t* share
 }
 }
 
-extern "C" int32_t ds41rt_v41_compact_bf16_routes_async(const uint16_t* routes,
+extern "C" int32_t cuteafd_v41_compact_bf16_routes_async(const uint16_t* routes,
     uint16_t* output, uint32_t rows, void* stream) {
   const uint64_t count = uint64_t(rows) * hidden;
   if (!rows || rows > 4096 || !valid_bf16_routes(routes, output, count))
@@ -147,7 +147,7 @@ extern "C" int32_t ds41rt_v41_compact_bf16_routes_async(const uint16_t* routes,
   return cudaGetLastError();
 }
 
-extern "C" int32_t ds41rt_v41_reduce_tp2_bf16_routes_async(const uint16_t* rank0,
+extern "C" int32_t cuteafd_v41_reduce_tp2_bf16_routes_async(const uint16_t* rank0,
     const uint16_t* rank1, uint16_t* output, uint32_t rows, void* stream) {
   const uint64_t count = uint64_t(rows) * hidden;
   if (!rows || rows > 4096 || !valid_bf16_routes(rank0, output, count) ||
@@ -160,7 +160,7 @@ extern "C" int32_t ds41rt_v41_reduce_tp2_bf16_routes_async(const uint16_t* rank0
   return cudaGetLastError();
 }
 
-extern "C" int32_t ds41rt_v41_compact_routes_bf16_async(const float* routes,
+extern "C" int32_t cuteafd_v41_compact_routes_bf16_async(const float* routes,
     uint16_t* output, uint32_t rows, void* stream) {
   const uint64_t count = uint64_t(rows) * hidden;
   if (!rows || !routes || !output || reinterpret_cast<uintptr_t>(routes) % 4 ||
@@ -173,7 +173,7 @@ extern "C" int32_t ds41rt_v41_compact_routes_bf16_async(const float* routes,
   return cudaGetLastError();
 }
 
-extern "C" int32_t ds41rt_v41_compact_tokens_bf16_async(const float* tokens,
+extern "C" int32_t cuteafd_v41_compact_tokens_bf16_async(const float* tokens,
     uint16_t* output, uint32_t rows, void* stream) {
   const uint64_t count = uint64_t(rows) * hidden;
   if (!rows || rows > 4096 || !tokens || !output ||
@@ -187,7 +187,7 @@ extern "C" int32_t ds41rt_v41_compact_tokens_bf16_async(const float* tokens,
   return cudaGetLastError();
 }
 
-extern "C" int32_t ds41rt_v41_reduce_compact_bf16_async(
+extern "C" int32_t cuteafd_v41_reduce_compact_bf16_async(
     const uint16_t* const planes[4], const uint16_t* shared, uint16_t* output,
     uint32_t rows, void* stream) {
   const uint64_t count = uint64_t(rows) * hidden;
@@ -211,7 +211,7 @@ extern "C" int32_t ds41rt_v41_reduce_compact_bf16_async(
   return cudaGetLastError();
 }
 
-extern "C" int32_t ds41rt_v41_reduce_tp2_compact_bf16_async(
+extern "C" int32_t cuteafd_v41_reduce_tp2_compact_bf16_async(
     const uint16_t* const planes[2], const uint16_t* shared, uint16_t* output,
     uint32_t rows, void* stream) {
   const uint64_t count = uint64_t(rows) * hidden;
@@ -239,7 +239,7 @@ extern "C" int32_t ds41rt_v41_reduce_tp2_compact_bf16_async(
   return cudaGetLastError();
 }
 
-extern "C" int32_t ds41rt_v41_reduce_compact_bf16_planes_async(
+extern "C" int32_t cuteafd_v41_reduce_compact_bf16_planes_async(
     const uint16_t* const planes[6], const uint16_t* shared, uint16_t* output,
     uint32_t rows, uint32_t ranks, void* stream) {
   if (!valid_compact_planes(planes, shared, output, rows, ranks))
@@ -276,7 +276,7 @@ extern "C" int32_t ds41rt_v41_reduce_compact_bf16_planes_async(
   return cudaGetLastError();
 }
 
-extern "C" int32_t ds41rt_v41_initialize_scratch_storage_async(void* storage,
+extern "C" int32_t cuteafd_v41_initialize_scratch_storage_async(void* storage,
     uint64_t bytes, uint64_t input_offset, uint64_t down_offset,
     uint32_t experts, void* stream) {
   auto cuda_stream = static_cast<cudaStream_t>(stream);
@@ -289,7 +289,7 @@ extern "C" int32_t ds41rt_v41_initialize_scratch_storage_async(void* storage,
   return cudaGetLastError();
 }
 
-extern "C" int32_t ds41rt_v41_reduce_routes_async(const float* const planes[4],
+extern "C" int32_t cuteafd_v41_reduce_routes_async(const float* const planes[4],
     const uint16_t* shared, uint16_t* output, uint32_t rows,
     uint32_t ranks, uint32_t topk, void* stream) {
   if (!planes || !output || !rows ||
@@ -368,7 +368,7 @@ __global__ void finish_local(const T* routed, const __nv_bfloat16* shared,
   }
 }
 }
-extern "C" int32_t ds41rt_v41_add_tp2_shared_async(const uint16_t* a,
+extern "C" int32_t cuteafd_v41_add_tp2_shared_async(const uint16_t* a,
     const uint16_t* b, uint16_t* output, size_t count, void* stream) {
   if (!count || count > uint64_t(4096) * hidden || !a || !b || !output ||
       reinterpret_cast<uintptr_t>(a) % 2 || reinterpret_cast<uintptr_t>(b) % 2 ||
@@ -385,7 +385,7 @@ extern "C" int32_t ds41rt_v41_add_tp2_shared_async(const uint16_t* a,
       reinterpret_cast<__nv_bfloat16*>(output), count);
   return cudaGetLastError();
 }
-extern "C" int32_t ds41rt_v41_reduce_tp2_experts_async(const float* rank0,
+extern "C" int32_t cuteafd_v41_reduce_tp2_experts_async(const float* rank0,
     const float* rank1, uint16_t* output, uint32_t rows, uint32_t token_sums,
     void* stream) {
   if (!rows || rows > 4096 || token_sums > 1 || !rank0 || !rank1 || !output ||
@@ -423,7 +423,7 @@ __global__ void sum_tp2_routes(const float* routes, float* sums, uint64_t count)
   }
 }
 }
-extern "C" int32_t ds41rt_v41_sum_tp2_routes_async(const float* routes, float* sums,
+extern "C" int32_t cuteafd_v41_sum_tp2_routes_async(const float* routes, float* sums,
     uint32_t rows, void* stream) {
   if (!rows || rows > 4096 || !routes || !sums || reinterpret_cast<uintptr_t>(routes) % 4 ||
       reinterpret_cast<uintptr_t>(sums) % 4) return cudaErrorInvalidValue;
@@ -436,7 +436,7 @@ extern "C" int32_t ds41rt_v41_sum_tp2_routes_async(const float* routes, float* s
   return cudaGetLastError();
 }
 
-extern "C" int32_t ds41rt_v41_finish_local_bf16_routes_async(const uint16_t* routed,
+extern "C" int32_t cuteafd_v41_finish_local_bf16_routes_async(const uint16_t* routed,
     const uint16_t* shared, uint16_t* output, uint32_t rows, void* stream) {
   const uint64_t count = uint64_t(rows) * hidden;
   const uint64_t output_bytes = count * 2;
@@ -452,7 +452,7 @@ extern "C" int32_t ds41rt_v41_finish_local_bf16_routes_async(const uint16_t* rou
   return cudaGetLastError();
 }
 
-extern "C" int32_t ds41rt_v41_finish_local_experts_async(const float* routed,
+extern "C" int32_t cuteafd_v41_finish_local_experts_async(const float* routed,
     const uint16_t* shared, uint16_t* output, uint32_t rows,
     uint32_t token_sums, void* stream) {
   const uint64_t count = uint64_t(rows) * hidden;

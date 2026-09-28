@@ -33,7 +33,7 @@ def documented_tile_examples():
     A help example is a promise: if it does not configure and parse, the knob ships
     looking usable while being invalid.
     """
-    doc = re.search(r'DS41RT_V41_EXL3_TILES[^)]*CACHE STRING "([^"]+)"',
+    doc = re.search(r'CUTEAFD_V41_EXL3_TILES[^)]*CACHE STRING "([^"]+)"',
                     RULES.read_text()).group(1)
     # Match the grammar shape itself so the count cannot drift with the wording.
     # Loose token scan: finding the candidates is this test's job, validating them
@@ -46,15 +46,15 @@ def harness(architecture='121'):
     return f'''
 cmake_minimum_required(VERSION 3.24)
 project(exl3_options NONE)
-set(DS41RT_ENABLE_CUDA ON)
-set(DS41RT_CUDA_ARCHITECTURES {architecture} CACHE STRING "test architecture")
+set(CUTEAFD_ENABLE_CUDA ON)
+set(CUTEAFD_CUDA_ARCHITECTURES {architecture} CACHE STRING "test architecture")
 set(CUDAToolkit_INCLUDE_DIRS "${{CMAKE_CURRENT_SOURCE_DIR}}")
 set(Python3_EXECUTABLE python3)
 add_library(CUDA::cudart SHARED IMPORTED)
 set_target_properties(CUDA::cudart PROPERTIES IMPORTED_LOCATION /unused/libcudart.so)
 add_library(CUDA::cuda_driver SHARED IMPORTED)
 set_target_properties(CUDA::cuda_driver PROPERTIES IMPORTED_LOCATION /unused/libcuda.so)
-add_custom_target(ds41rt_verify_sparkinfer_source)
+add_custom_target(cuteafd_verify_sparkinfer_source)
 include("{RULES}")
 '''
 
@@ -76,16 +76,16 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
             return result, rules.read_text() if rules.exists() else ''
 
     def test_explicit_paired_residency_reaches_export_command(self):
-        result, rules = self.configure('-DDS41RT_V41_EXL3_PAIRED_TP4=ON',
-                                       '-DDS41RT_V41_EXL3_BITS=3;4',
-                                       '-DDS41RT_V41_EXL3_RESIDENCY=80=2;16=1')
+        result, rules = self.configure('-DCUTEAFD_V41_EXL3_PAIRED_TP4=ON',
+                                       '-DCUTEAFD_V41_EXL3_BITS=3;4',
+                                       '-DCUTEAFD_V41_EXL3_RESIDENCY=80=2;16=1')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('--paired-tp4 --residency 80=2 --residency 16=1', rules)
 
     def test_default_keeps_disjoint_export(self):
         for architecture in ('120', '121'):
             with self.subTest(architecture=architecture):
-                result, rules = self.configure(f'-DDS41RT_CUDA_ARCHITECTURES={architecture}')
+                result, rules = self.configure(f'-DCUTEAFD_CUDA_ARCHITECTURES={architecture}')
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertNotIn('--paired-tp4', rules)
                 self.assertNotIn('--residency', rules)
@@ -97,13 +97,13 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
             ('120f', ['rtx-tp1', 'rtx-tp2', 'dspark']),
         ):
             with self.subTest(architecture=architecture):
-                result, rules = self.configure(f'-DDS41RT_CUDA_ARCHITECTURES={architecture}')
+                result, rules = self.configure(f'-DCUTEAFD_CUDA_ARCHITECTURES={architecture}')
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 for family, bits in (('23', '2 3'), ('34', '3 4')):
                     self.assertIn(f'--bits {bits}', rules)
                     for layout in layouts:
                         for capacity in (1, 16, 80, 256, 1024, 4096):
-                            for name in ('v41_exl3.json', 'trellis_lut.bin', 'libds41rt_exl3.so'):
+                            for name in ('v41_exl3.json', 'trellis_lut.bin', 'libcuteafd_exl3.so'):
                                 self.assertIn(f'exl3-k{family}/{layout}/m{capacity}/{name}', rules)
                 if architecture != '121':
                     self.assertNotIn('/tp2-rank', rules)
@@ -122,15 +122,15 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
         }
         for architecture, layouts in expected.items():
             with self.subTest(architecture=architecture):
-                result, rules = self.configure(f'-DDS41RT_CUDA_ARCHITECTURES={architecture}')
+                result, rules = self.configure(f'-DCUTEAFD_CUDA_ARCHITECTURES={architecture}')
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 requests = re.findall(r'--require-layout +(\S+)', rules)
                 self.assertEqual(requests, [layouts, layouts], 'one request per tier family')
                 self.assertNotIn('--require-layout tp4-rank0 tp4-rank1', rules)
 
     def test_paired_package_requests_only_tp4(self):
-        result, rules = self.configure('-DDS41RT_V41_EXL3_PAIRED_TP4=ON',
-                                       '-DDS41RT_V41_EXL3_BITS=3;4')
+        result, rules = self.configure('-DCUTEAFD_V41_EXL3_PAIRED_TP4=ON',
+                                       '-DCUTEAFD_V41_EXL3_BITS=3;4')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(set(re.findall(r'--require-layout +(\S+)', rules)),
                          {'tp4-rank0,tp4-rank1,tp4-rank2,tp4-rank3'})
@@ -141,7 +141,7 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
         Make never restates a custom command's line, so a changed capacity/tile
         selection has to move a file the export depends on.
         """
-        result, rules = self.configure('-DDS41RT_V41_EXL3_TILES=tp3-width768=16+80:64,256,64,256')
+        result, rules = self.configure('-DCUTEAFD_V41_EXL3_TILES=tp3-width768=16+80:64,256,64,256')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('--tile tp3-width768=16+80:64,256,64,256', rules)
         for family in ('k23', 'k34'):
@@ -166,7 +166,7 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
             self.assertEqual(self.cmake(root, build, []).returncode, 0)
             self.assertEqual(stamps(), before)
             changed = self.cmake(root, build,
-                                 ['-DDS41RT_V41_EXL3_TILES=tp3-width768=all:128,128,128,128'])
+                                 ['-DCUTEAFD_V41_EXL3_TILES=tp3-width768=all:128,128,128,128'])
             self.assertEqual(changed.returncode, 0, changed.stdout + changed.stderr)
             after = stamps()
             self.assertNotEqual(after, before, 'a tile change must invalidate the export')
@@ -174,8 +174,8 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
             self.assertTrue(before['v41_exl3_k23_config.stamp'].endswith('tiles=\n'),
                             'a default configuration records no tiles')
             # Capacities and layouts move the stamp for both families too.
-            narrowed = self.cmake(root, build, ['-DDS41RT_V41_EXL3_CAPACITIES=1;16;80',
-                                                '-DDS41RT_V41_EXL3_TILES=tp3-width768=all:128,128,128,128'])
+            narrowed = self.cmake(root, build, ['-DCUTEAFD_V41_EXL3_CAPACITIES=1;16;80',
+                                                '-DCUTEAFD_V41_EXL3_TILES=tp3-width768=all:128,128,128,128'])
             self.assertEqual(narrowed.returncode, 0, narrowed.stdout + narrowed.stderr)
             self.assertNotEqual(stamps(), after)
 
@@ -190,7 +190,7 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
         for example in documented:
             example = example.rstrip(',').strip('()')
             with self.subTest(example=example):
-                result, rules = self.configure(f'-DDS41RT_V41_EXL3_TILES={example}')
+                result, rules = self.configure(f'-DCUTEAFD_V41_EXL3_TILES={example}')
                 self.assertEqual(result.returncode, 0, result.stdout[-500:] + result.stderr[-500:])
                 self.assertIn(f'--tile {example}', rules)
 
@@ -209,40 +209,40 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
         for value in ('tp3-width768=16:64,256,64', 'tp3-width768:64,256,64,256',
                       'tp3 width768 all:64,256,64,256', 'nonsense'):
             with self.subTest(value=value):
-                result, _ = self.configure(f'-DDS41RT_V41_EXL3_TILES={value}')
+                result, _ = self.configure(f'-DCUTEAFD_V41_EXL3_TILES={value}')
                 self.assertNotEqual(result.returncode, 0, value)
                 self.assertIn('EXL3 tile override must be PROFILE=CAPACITIES', result.stderr)
 
     def test_paired_families_remain_tp4_only(self):
         for bits, family in (('2;3', '23'), ('3;4', '34')):
             with self.subTest(family=family):
-                result, rules = self.configure('-DDS41RT_V41_EXL3_PAIRED_TP4=ON',
-                                               f'-DDS41RT_V41_EXL3_BITS={bits}')
+                result, rules = self.configure('-DCUTEAFD_V41_EXL3_PAIRED_TP4=ON',
+                                               f'-DCUTEAFD_V41_EXL3_BITS={bits}')
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn('--paired-tp4', rules)
                 self.assertNotIn('/tp2-rank', rules)
                 self.assertNotIn('/tp3-rank', rules)
                 for rank in range(4):
-                    self.assertIn(f'exl3-k{family}/tp4-rank{rank}/m16/libds41rt_exl3.so', rules)
+                    self.assertIn(f'exl3-k{family}/tp4-rank{rank}/m16/libcuteafd_exl3.so', rules)
 
     def test_paired_default_rejects_multiple_families(self):
-        result, _ = self.configure('-DDS41RT_V41_EXL3_PAIRED_TP4=ON')
+        result, _ = self.configure('-DCUTEAFD_V41_EXL3_PAIRED_TP4=ON')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('exactly one decoder tier family', result.stderr)
 
     def test_invalid_layouts_fail_during_configuration(self):
-        paired = '-DDS41RT_V41_EXL3_PAIRED_TP4=ON'
+        paired = '-DCUTEAFD_V41_EXL3_PAIRED_TP4=ON'
         cases = [
-            (['-DDS41RT_V41_EXL3_RESIDENCY=80=2'], 'require paired TP4'),
-            ([paired, '-DDS41RT_CUDA_ARCHITECTURES=120'], 'requires SM121'),
-            ([paired, '-DDS41RT_V41_EXL3_BITS=2;3;4'], 'exactly two decoder tiers'),
-            ([paired, '-DDS41RT_V41_EXL3_RESIDENCY=80=3'], 'capacity=1 or capacity=2'),
-            ([paired, '-DDS41RT_V41_EXL3_RESIDENCY=17=2'], 'selected, nonduplicate'),
-            ([paired, '-DDS41RT_V41_EXL3_RESIDENCY=80=1;80=2'], 'selected, nonduplicate'),
+            (['-DCUTEAFD_V41_EXL3_RESIDENCY=80=2'], 'require paired TP4'),
+            ([paired, '-DCUTEAFD_CUDA_ARCHITECTURES=120'], 'requires SM121'),
+            ([paired, '-DCUTEAFD_V41_EXL3_BITS=2;3;4'], 'exactly two decoder tiers'),
+            ([paired, '-DCUTEAFD_V41_EXL3_RESIDENCY=80=3'], 'capacity=1 or capacity=2'),
+            ([paired, '-DCUTEAFD_V41_EXL3_RESIDENCY=17=2'], 'selected, nonduplicate'),
+            ([paired, '-DCUTEAFD_V41_EXL3_RESIDENCY=80=1;80=2'], 'selected, nonduplicate'),
         ]
         for options, error in cases:
             with self.subTest(options=options):
-                result, _ = self.configure('-DDS41RT_V41_EXL3_BITS=3;4', *options)
+                result, _ = self.configure('-DCUTEAFD_V41_EXL3_BITS=3;4', *options)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(error, result.stderr)
 

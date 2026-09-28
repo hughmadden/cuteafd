@@ -26,7 +26,7 @@ def main():
     assert hashlib.sha256(config_path.read_bytes()).hexdigest()==lock['files']['inference/config.json']
     config=json.loads(config_path.read_text())
     assert (config['rope_head_dim'],config['original_seq_len'],config['compress_rope_theta'],config['rope_theta'],config['rope_factor'],config['beta_fast'],config['beta_slow'])==(64,65536,160000,10000,16,32,1)
-    lib=C.CDLL(str(args.native_lib));fn=lib.ds41rt_v41_backbone_frequencies
+    lib=C.CDLL(str(args.native_lib));fn=lib.cuteafd_v41_backbone_frequencies
     fn.argtypes=[C.c_void_p,C.c_void_p,C.c_int32,C.c_int32,C.c_void_p];fn.restype=C.c_int32
     stream=torch.cuda.Stream()
     results=[]

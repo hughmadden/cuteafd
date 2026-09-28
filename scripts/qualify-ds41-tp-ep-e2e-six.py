@@ -544,7 +544,7 @@ def worker_role_in_log(text: str, rank: int):
 # the daemon refuses to serve with that configuration, so a report claiming it
 # describes a run that could not have served. `auto` may legitimately resolve to
 # `explicit-profile` when the operator supplied a readable
-# DS41RT_ADAPTIVE_COST_PROFILE path, or to `legacy-heuristic` otherwise.
+# CUTEAFD_ADAPTIVE_COST_PROFILE path, or to `legacy-heuristic` otherwise.
 COST_MODEL_LABELS = (
     "legacy-heuristic",
     "builtin-calibration",

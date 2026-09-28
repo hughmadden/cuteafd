@@ -36,31 +36,31 @@ case "$role" in
     exit 2
     ;;
 esac
-spark_tp_roles="${DS41RT_WIP_SPARK_TP_ROLES:-}"
+spark_tp_roles="${CUTEAFD_WIP_SPARK_TP_ROLES:-}"
 if [[ -n "$spark_tp_roles" ]]; then
   IFS=';' read -ra spark_tp_role_list <<<"$spark_tp_roles"
   for spark_tp_role in "${spark_tp_role_list[@]}"; do
     case "$spark_tp_role" in
       tp2|tp3|tp6) ;;
-      *) echo "DS41RT_WIP_SPARK_TP_ROLES accepts only tp2, tp3 and tp6, got: $spark_tp_role" >&2; exit 2 ;;
+      *) echo "CUTEAFD_WIP_SPARK_TP_ROLES accepts only tp2, tp3 and tp6, got: $spark_tp_role" >&2; exit 2 ;;
     esac
   done
   [[ "$role" == expert ]] ||
-    { echo "DS41RT_WIP_SPARK_TP_ROLES is only valid for the expert role" >&2; exit 2; }
+    { echo "CUTEAFD_WIP_SPARK_TP_ROLES is only valid for the expert role" >&2; exit 2; }
 fi
 # Official-only WIP builds may skip the EXL3 quantization AOT entirely. The
 # default stays ON so every existing slot and script is byte-compatible; the
 # native expert path does not require the EXL3 package.
-exl3_aot="${DS41RT_WIP_EXL3_AOT:-ON}"
-nvfp4_aot="${DS41RT_WIP_NVFP4_AOT:-ON}"
-case "$exl3_aot" in ON|OFF) ;; *) echo "DS41RT_WIP_EXL3_AOT must be ON or OFF, got: $exl3_aot" >&2; exit 2 ;; esac
-case "$nvfp4_aot" in ON|OFF) ;; *) echo "DS41RT_WIP_NVFP4_AOT must be ON or OFF, got: $nvfp4_aot" >&2; exit 2 ;; esac
+exl3_aot="${CUTEAFD_WIP_EXL3_AOT:-ON}"
+nvfp4_aot="${CUTEAFD_WIP_NVFP4_AOT:-ON}"
+case "$exl3_aot" in ON|OFF) ;; *) echo "CUTEAFD_WIP_EXL3_AOT must be ON or OFF, got: $exl3_aot" >&2; exit 2 ;; esac
+case "$nvfp4_aot" in ON|OFF) ;; *) echo "CUTEAFD_WIP_NVFP4_AOT must be ON or OFF, got: $nvfp4_aot" >&2; exit 2 ;; esac
 [[ "$cuda_arch" =~ ^[0-9]+$ ]] || {
   echo "CUDA_ARCH must be numeric" >&2
   exit 2
 }
 [[ -f "$source_dir/rust/Cargo.toml" && -f "$source_dir/native/CMakeLists.txt" ]] || {
-  echo "SOURCE_DIR is not a DS41RT source tree: $source_dir" >&2
+  echo "SOURCE_DIR is not a CUTEAFD source tree: $source_dir" >&2
   exit 2
 }
 
@@ -75,7 +75,7 @@ fi
 
 mkdir -p "$build_dir" "$output_dir"
 export PYO3_PYTHON=python3
-export PYTHONPATH="$source_dir/third_party/sparkinfer:$source_dir/python/reference/ds41rt_reference:$source_dir/python/reference${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$source_dir/third_party/sparkinfer:$source_dir/python/reference/cuteafd_reference:$source_dir/python/reference${PYTHONPATH:+:$PYTHONPATH}"
 export CARGO_TARGET_DIR="$build_dir/cargo-target"
 
 # The WIP sync chain (rsync -a + docker cp) can leave source mtimes older
@@ -105,7 +105,7 @@ wip_current_fingerprint="$wip_rust_fingerprint $wip_native_fingerprint"
 cargo build \
   --quiet \
   --manifest-path "$source_dir/rust/Cargo.toml" \
-  -p ds41rt-daemon \
+  -p cuteafd-daemon \
   --release
 
 cmake \
@@ -113,41 +113,41 @@ cmake \
   -B "$build_dir/native" \
   -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
-  -DDS41RT_ENABLE_CUDA=ON \
-  -DDS41RT_ENABLE_V41_EXPERT_AOT=ON \
-  -DDS41RT_V41_SPARK_TP_ROLES="$spark_tp_roles" \
-  -DDS41RT_ENABLE_V41_NVFP4_AOT="$nvfp4_aot" \
-  -DDS41RT_ENABLE_V41_EXL3_AOT="$exl3_aot" \
-  -DDS41RT_V41_EXL3_BITS="${DS41RT_WIP_EXL3_BITS:-2;3}" \
-  -DDS41RT_ENABLE_V41_LOCAL_EXPERT_AOT="$coordinator_aot" \
-  -DDS41RT_ENABLE_V41_TP2_EXPERT_AOT="$coordinator_aot" \
-  -DDS41RT_ENABLE_V41_FP8_AOT="$coordinator_aot" \
-  -DDS41RT_ENABLE_V41_ATTENTION_AOT="$coordinator_aot" \
-  -DDS41RT_ENABLE_V41_HC_LAGGED_AOT="$coordinator_aot" \
-  -DDS41RT_ENABLE_V41_NARROW_AOT="$coordinator_aot" \
-  -DDS41RT_ENABLE_RDMA=ON \
-  -DDS41RT_ENABLE_SPARKINFER_AOT="$sparkinfer_aot" \
-  -DDS41RT_ENABLE_SPARKINFER_COORDINATOR_AOT="$coordinator_aot" \
-  -DDS41RT_ENABLE_DS4_FLASH_AOT=OFF \
-  -DDS41RT_ENABLE_W8A16_AOT="$w8a16_aot" \
-  -DDS41RT_SPARKINFER_SOURCE_DIR="$source_dir/third_party/sparkinfer" \
-  -DDS41RT_SPARKINFER_LOCK_FILE="$source_dir/third_party/sparkinfer.lock.json" \
-  -DDS41RT_ENABLE_NCCL="$nccl" \
-  -DDS41RT_ENABLE_XGRAMMAR="$xgrammar" \
-  -DDS41RT_XGRAMMAR_SOURCE_DIR="$source_dir/third_party/xgrammar" \
-  -DDS41RT_XGRAMMAR_LOCK_FILE="$source_dir/third_party/xgrammar.lock.json" \
+  -DCUTEAFD_ENABLE_CUDA=ON \
+  -DCUTEAFD_ENABLE_V41_EXPERT_AOT=ON \
+  -DCUTEAFD_V41_SPARK_TP_ROLES="$spark_tp_roles" \
+  -DCUTEAFD_ENABLE_V41_NVFP4_AOT="$nvfp4_aot" \
+  -DCUTEAFD_ENABLE_V41_EXL3_AOT="$exl3_aot" \
+  -DCUTEAFD_V41_EXL3_BITS="${CUTEAFD_WIP_EXL3_BITS:-2;3}" \
+  -DCUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT="$coordinator_aot" \
+  -DCUTEAFD_ENABLE_V41_TP2_EXPERT_AOT="$coordinator_aot" \
+  -DCUTEAFD_ENABLE_V41_FP8_AOT="$coordinator_aot" \
+  -DCUTEAFD_ENABLE_V41_ATTENTION_AOT="$coordinator_aot" \
+  -DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$coordinator_aot" \
+  -DCUTEAFD_ENABLE_V41_NARROW_AOT="$coordinator_aot" \
+  -DCUTEAFD_ENABLE_RDMA=ON \
+  -DCUTEAFD_ENABLE_SPARKINFER_AOT="$sparkinfer_aot" \
+  -DCUTEAFD_ENABLE_SPARKINFER_COORDINATOR_AOT="$coordinator_aot" \
+  -DCUTEAFD_ENABLE_DS4_FLASH_AOT=OFF \
+  -DCUTEAFD_ENABLE_W8A16_AOT="$w8a16_aot" \
+  -DCUTEAFD_SPARKINFER_SOURCE_DIR="$source_dir/third_party/sparkinfer" \
+  -DCUTEAFD_SPARKINFER_LOCK_FILE="$source_dir/third_party/sparkinfer.lock.json" \
+  -DCUTEAFD_ENABLE_NCCL="$nccl" \
+  -DCUTEAFD_ENABLE_XGRAMMAR="$xgrammar" \
+  -DCUTEAFD_XGRAMMAR_SOURCE_DIR="$source_dir/third_party/xgrammar" \
+  -DCUTEAFD_XGRAMMAR_LOCK_FILE="$source_dir/third_party/xgrammar.lock.json" \
   -DPython3_EXECUTABLE="$(command -v python3)" \
-  -DDS41RT_CUDA_ARCHITECTURES="$cuda_arch"
+  -DCUTEAFD_CUDA_ARCHITECTURES="$cuda_arch"
 cmake --build "$build_dir/native"
 printf '%s' "$wip_current_fingerprint" >"$wip_fingerprint_marker"
 
-install -m 0755 "$CARGO_TARGET_DIR/release/ds41rt" "$output_dir/ds41rt"
-install -m 0755 "$build_dir/native/libds41rt_native.so" "$output_dir/libds41rt_native.so"
+install -m 0755 "$CARGO_TARGET_DIR/release/cuteafd" "$output_dir/cuteafd"
+install -m 0755 "$build_dir/native/libcuteafd_native.so" "$output_dir/libcuteafd_native.so"
 # The EXL3 package is only built and installed when the opt-in is ON. An
-# official-only WIP build (DS41RT_WIP_EXL3_AOT=OFF) has no exl3/ directory and
+# official-only WIP build (CUTEAFD_WIP_EXL3_AOT=OFF) has no exl3/ directory and
 # the native launch path never references one.
 if [[ "$exl3_aot" == ON ]]; then
-  wip_exl3_bits="${DS41RT_WIP_EXL3_BITS:-2;3}"
+  wip_exl3_bits="${CUTEAFD_WIP_EXL3_BITS:-2;3}"
   wip_exl3_tag="k${wip_exl3_bits//[;]/}"
   wip_exl3_tag="${wip_exl3_tag//,/}"
   python3 "$source_dir/python/tools/package_v41_exl3_aot.py" install \
@@ -163,7 +163,7 @@ python3 "$source_dir/scripts/write-v41-expert-tp-manifest.py" \
   --role "$role" \
   --requested "$spark_tp_roles" \
   --native-build-dir "$build_dir/native" \
-  --native-library "$build_dir/native/libds41rt_native.so" \
+  --native-library "$build_dir/native/libcuteafd_native.so" \
   --output "$output_dir/V41_EXPERT_TP_AOT.json"
 if [[ "$coordinator_aot" == ON ]]; then
   install -m 0644 "$build_dir/native/v41_fp8/v41_fp8.json" "$output_dir/V41_FP8_AOT.json"
@@ -172,6 +172,6 @@ else
 fi
 (
   cd "$output_dir"
-  sha256sum ds41rt libds41rt_native.so V41_EXPERT_AOT.json V41_EXPERT_TP_AOT.json V41_FP8_AOT.json >ARTIFACT_SHA256SUMS
+  sha256sum cuteafd libcuteafd_native.so V41_EXPERT_AOT.json V41_EXPERT_TP_AOT.json V41_FP8_AOT.json >ARTIFACT_SHA256SUMS
   sha256sum -c ARTIFACT_SHA256SUMS
 )

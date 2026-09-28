@@ -38,7 +38,7 @@ if tool == 'docker':
         assert '--gpus' not in args and '--network' in args
         if entry == '/bin/cat':
             # Legacy single-family image: read the package manifest directly.
-            assert args[-1] == '/opt/ds41rt/lib/exl3/manifest.json'
+            assert args[-1] == '/opt/cuteafd/lib/exl3/manifest.json'
         else:
             # Multi-family image: a shell probes the tier family first and
             # falls back to the legacy package manifest.
@@ -51,7 +51,7 @@ if tool == 'docker':
                          intermediate=1152, experts=384, top_k=6, output_dtype='bf16', bits=[2,3])
                     for rank in range(2) for capacity in [1,16,80,256,1024,4096]]
         if os.environ.get('MOCK_LEGACY') == '1': variants = []
-        print(json.dumps(dict(schema='ds41rt.exl3-package.v1', role='spark', variants=variants, compute=[12,1],
+        print(json.dumps(dict(schema='cuteafd.exl3-package.v1', role='spark', variants=variants, compute=[12,1],
                               sparkinfer_revision=os.environ['MOCK_REVISION'], paired_tp4=paired)))
         sys.exit(0)
 raise SystemExit('Unexpected external action: ' + tool + ' ' + repr(args))
@@ -80,7 +80,7 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
                        MOCK_LEGACY='1' if legacy else '', MOCK_GPU_MIB=str(gpu_mib),
                        MOCK_MISMATCH='dodo' if mismatch else '')
             config = directory / 'release.config'
-            config.write_text((ROOT / 'ds41rt.config').read_text()
+            config.write_text((ROOT / 'cuteafd.config').read_text()
                               + f'\nSPARK_COUNT={spark_count}\n'
                               + ('EXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto\n' if spark_count == 2 else '')
                               + (f'MEMORY_RESERVATION={reservation}\n' if reservation else ''))

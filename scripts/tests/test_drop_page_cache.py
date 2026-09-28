@@ -54,7 +54,7 @@ class CacheDropUtility(unittest.TestCase):
             old_fd = os.open(destination, os.O_RDONLY)
             try:
                 transaction = transaction.replace(
-                    '/usr/local/libexec/ds41rt-bench', directory)
+                    '/usr/local/libexec/cuteafd-bench', directory)
                 transaction = transaction.replace('-o root', f'-o {uid}')
                 transaction = transaction.replace('/usr/bin/install', shlex.quote(str(installer)))
                 transaction = transaction.replace('"0:$3:4750"', f'"{uid}:$3:4750"')

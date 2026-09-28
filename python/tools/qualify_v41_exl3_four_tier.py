@@ -92,17 +92,17 @@ def main():
                 pointers[f't{i}_{key}_ptr'] = torch.zeros(4, dtype=torch.int32, device=device)
             for key in ('fc2_experts', 'gate_experts', 'up_experts'):
                 scalars[f'tier{i}_{key}'] = 0
-    lib = ct.CDLL(str(args.aot/'libds41rt_exl3.so'))
-    lib.ds41rt_exl3_create.argtypes = [ct.POINTER(ct.c_void_p)]
-    lib.ds41rt_exl3_destroy.argtypes = [ct.c_void_p]
+    lib = ct.CDLL(str(args.aot/'libcuteafd_exl3.so'))
+    lib.cuteafd_exl3_create.argtypes = [ct.POINTER(ct.c_void_p)]
+    lib.cuteafd_exl3_destroy.argtypes = [ct.c_void_p]
     context = ct.c_void_p()
-    assert lib.ds41rt_exl3_create(ct.byref(context)) == 0
+    assert lib.cuteafd_exl3_create(ct.byref(context)) == 0
     route = ct.CDLL(str(args.aot/'routes/libv41_exl3_routes.so'))
-    route.ds41rt_exl3_routes_create.argtypes = [ct.POINTER(ct.c_void_p)]
-    route.ds41rt_exl3_routes_destroy.argtypes = [ct.c_void_p]
-    route.ds41rt_exl3_routes_launch.argtypes = [ct.c_void_p, ct.POINTER(ct.c_void_p), ct.POINTER(ct.c_uint64), ct.c_int32, ct.c_void_p]
+    route.cuteafd_exl3_routes_create.argtypes = [ct.POINTER(ct.c_void_p)]
+    route.cuteafd_exl3_routes_destroy.argtypes = [ct.c_void_p]
+    route.cuteafd_exl3_routes_launch.argtypes = [ct.c_void_p, ct.POINTER(ct.c_void_p), ct.POINTER(ct.c_uint64), ct.c_int32, ct.c_void_p]
     route_context = ct.c_void_p()
-    assert route.ds41rt_exl3_routes_create(ct.byref(route_context)) == 0
+    assert route.cuteafd_exl3_routes_create(ct.byref(route_context)) == 0
     route_meta = json.loads((args.aot/'routes/v41_exl3_routes.json').read_text())
     route_tensors = dict(topk_ids=ids, expert_map=identity,
         **{name:buffers[name] for name in list(route_meta['buffers'])[2:]})
@@ -110,14 +110,14 @@ def main():
     rb = (ct.c_uint64*7)(*[t.numel()*t.element_size() for t in route_tensors.values()])
     calls = []
     for entry in meta['objects']:
-        fn = getattr(lib, 'ds41rt_exl3_'+entry['label'].rsplit('_',1)[1])
+        fn = getattr(lib, 'cuteafd_exl3_'+entry['label'].rsplit('_',1)[1])
         fn.argtypes = [ct.c_void_p, ct.POINTER(ct.c_void_p), ct.POINTER(ct.c_int32), ct.c_void_p]
         p = (ct.c_void_p*len(entry['pointer_slots']))(*[pointers[n].data_ptr() for n in entry['pointer_slots']])
         s = (ct.c_int32*len(entry['scalar_slots']))(*[(1 if n == 'active_m' else scalars[n]) for n in entry['scalar_slots']])
         calls.append((fn, p, s, entry['scalar_slots'].index('active_m')))
     def native(rows):
         stream = ct.c_void_p(torch.cuda.current_stream().cuda_stream)
-        assert route.ds41rt_exl3_routes_launch(route_context, rp, rb, rows, stream) == 0
+        assert route.cuteafd_exl3_routes_launch(route_context, rp, rb, rows, stream) == 0
         for fn, p, s, index in calls:
             s[index] = rows
             assert fn(context, p, s, stream) == 0
@@ -212,8 +212,8 @@ def main():
         print(json.dumps(report), flush=True)
     finally:
         torch.cuda.synchronize()
-        route.ds41rt_exl3_routes_destroy(route_context)
-        lib.ds41rt_exl3_destroy(context)
+        route.cuteafd_exl3_routes_destroy(route_context)
+        lib.cuteafd_exl3_destroy(context)
 
 
 if __name__ == '__main__':

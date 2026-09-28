@@ -64,7 +64,7 @@ def upload_artifact(output, state_root, repo_id, *, resume=False, api=None, prog
         plan_path = state_root / "upload-plan.json"
         if plan_path.exists() and not resume:
             raise ValueError("existing upload requires explicit resume")
-        _publish_json(plan_path, dict(schema="ds41rt-upload-plan-v1", repo_id=repo_id,
+        _publish_json(plan_path, dict(schema="cuteafd-upload-plan-v1", repo_id=repo_id,
                                      output=str(output), files=files))
         receipt_path = state_root / "upload-complete.json"
         receipt = _read(receipt_path)
@@ -143,7 +143,7 @@ def upload_artifact(output, state_root, repo_id, *, resume=False, api=None, prog
             raise ValueError("committed remote inventory differs from uploaded files")
         if any(_fingerprint(output / name) != local for name, local in files.items()):
             raise ValueError("export changed before upload receipt")
-        receipt = dict(schema="ds41rt-upload-receipt-v1", status="uploaded", repo_id=repo_id,
+        receipt = dict(schema="cuteafd-upload-receipt-v1", status="uploaded", repo_id=repo_id,
                        commit=commit, files=prepared)
         _publish_json(receipt_path, receipt)
         progress(dict(event="model_uploaded", repo_id=repo_id, commit=commit, files=len(prepared)))

@@ -34,11 +34,11 @@ def main():
     norm_eps,hc_eps=config['norm_eps'],config['hc_eps']
     assert norm_eps == 1e-20 and hc_eps == 1e-6
     lib = C.CDLL(str(args.native_lib))
-    norm, rope = lib.ds41rt_v41_attention_norm, lib.ds41rt_v41_attention_rope
+    norm, rope = lib.cuteafd_v41_attention_norm, lib.cuteafd_v41_attention_rope
     P, I = C.c_void_p, C.c_int32
     norm.argtypes = [P,P,P,P,I,I,P]
     rope.argtypes = [P,P,P,I,I,I,P]
-    kv=lib.ds41rt_v41_attention_kv
+    kv=lib.cuteafd_v41_attention_kv
     kv.argtypes=[P,P,P,P,I,P]
     norm.restype = rope.restype = kv.restype = I
     torch.cuda.set_device(args.device)

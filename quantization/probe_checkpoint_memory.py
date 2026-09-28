@@ -40,7 +40,7 @@ def run(journal_root):
     finally:
         db.close()
     checked = []
-    with tempfile.TemporaryDirectory(prefix="ds41rt-checkpoint-memory-") as directory:
+    with tempfile.TemporaryDirectory(prefix="cuteafd-checkpoint-memory-") as directory:
         root = Path(directory)
         state = None
         for key, encoded in (rows[0], rows[len(rows) // 2], rows[-1]):

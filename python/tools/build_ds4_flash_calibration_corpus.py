@@ -22,7 +22,7 @@ from deepseek_v4_benchmark import (
 )
 
 
-SCHEMA = "ds41rt-flash-exl3-calibration-corpus-v3"
+SCHEMA = "cuteafd-flash-exl3-calibration-corpus-v3"
 DEFAULT_CALIBRATION_TOKENS = 1_080_000
 DEFAULT_HELDOUT_TOKENS = 65_536
 DEFAULT_RECORD_TARGET_TOKENS = 768

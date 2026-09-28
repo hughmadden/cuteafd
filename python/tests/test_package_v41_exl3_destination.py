@@ -32,14 +32,14 @@ class PackageDestinationTests(unittest.TestCase):
                         requires_route_preparation=False, paired_boundary='last',
                         descriptor_rows=4, native_info_version=3, blocks_per_sm=2)
             (directory / 'v41_exl3.json').write_text(json.dumps(meta))
-            for name in ('trellis_lut.bin', 'libds41rt_exl3.so'):
+            for name in ('trellis_lut.bin', 'libcuteafd_exl3.so'):
                 (directory / name).write_bytes(b'fixture')
             variant = {key: meta[key] for key in
                        ('capacity', 'intermediate', 'experts', 'top_k', 'output_dtype', 'bits', 'paired_boundary')}
             variant['directory'] = 'tp4-rank0/m80'
             files = {str(p.relative_to(root)): dict(bytes=p.stat().st_size, sha256=package.digest(p))
                      for p in root.rglob('*') if p.is_file()}
-            manifest = dict(schema='ds41rt.exl3-package.v1', role='spark', paired_tp4=True,
+            manifest = dict(schema='cuteafd.exl3-package.v1', role='spark', paired_tp4=True,
                             sparkinfer_revision='test', variants=[variant], files=files)
             def write():
                 (root / 'manifest.json').write_text(json.dumps(manifest))
@@ -98,7 +98,7 @@ class PackageDestinationTests(unittest.TestCase):
     def test_marked_package_remains_replaceable(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
-            (output / 'manifest.json').write_text(json.dumps({'schema':'ds41rt.exl3-package.v1'}))
+            (output / 'manifest.json').write_text(json.dumps({'schema':'cuteafd.exl3-package.v1'}))
             package.validate_destination(output)
 
 

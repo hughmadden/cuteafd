@@ -5,8 +5,8 @@ Ported from upstream llama.cpp ``tests/test-sampling.cpp`` (MIT) and
 This is a numpy-only reference implementation of the temperature, top-k,
 top-p, min-p and repetition-penalty samplers applied to llama.cpp's exact
 test vectors, asserting the same expected probability outputs. It is the CPU
-oracle that the deferred GPU parity test will later run the native ds41rt
-sampler against; it has no dependency on any ds41rt module.
+oracle that the deferred GPU parity test will later run the native cuteafd
+sampler against; it has no dependency on any cuteafd module.
 
 Semantics mirrored from llama-sampler.cpp (as of the upstream test):
 
@@ -35,7 +35,7 @@ Semantics mirrored from llama-sampler.cpp (as of the upstream test):
 """
 """
 COVERAGE CLASS: standalone reference oracle. These cases document upstream
-behavior with no ds41rt dependency; they cannot detect product regressions by
+behavior with no cuteafd dependency; they cannot detect product regressions by
 themselves. They are the comparison references for the deferred GPU parity
 tests (docs/test-coverage/DEFERRED.md), counted separately from product
 regression coverage (review MAJOR 4/6, 2026-09-15).

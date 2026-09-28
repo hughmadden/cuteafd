@@ -1,49 +1,49 @@
-#include "ds41rt_v41_experts.h"
+#include "cuteafd_v41_experts.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <mutex>
-#ifdef DS41RT_V41_NVFP4_VARIANTS_HEADER
+#ifdef CUTEAFD_V41_NVFP4_VARIANTS_HEADER
 /* W4A4 (ModelOpt NVFP4) variants carry their own bridge and consume BF16
  * hidden rows, so the FP8 input quantizer is not part of this family. */
-#include DS41RT_V41_NVFP4_VARIANTS_HEADER
-#elif defined(DS41RT_V41_SPARK_TP2_EXPERTS)
+#include CUTEAFD_V41_NVFP4_VARIANTS_HEADER
+#elif defined(CUTEAFD_V41_SPARK_TP2_EXPERTS)
 /* Replicated-group Spark TP2 shards (native FP8 K32 family, SM121). */
 #include "v41_spark_tp2_expert_variants.h"
-#elif defined(DS41RT_V41_SPARK_TP3_EXPERTS)
+#elif defined(CUTEAFD_V41_SPARK_TP3_EXPERTS)
 /* Replicated-group Spark TP3 shards (native FP8 K32 family, SM121). */
 #include "v41_spark_tp3_expert_variants.h"
-#elif defined(DS41RT_V41_SPARK_TP6_EXPERTS)
+#elif defined(CUTEAFD_V41_SPARK_TP6_EXPERTS)
 /* Pure TP6 Spark shards (native FP8 K32 family, SM121). */
 #include "v41_spark_tp6_expert_variants.h"
-#elif defined(DS41RT_V41_DSPARK_TP2_EXPERTS)
+#elif defined(CUTEAFD_V41_DSPARK_TP2_EXPERTS)
 #include "v41_dspark_tp2_expert_variants.h"
-#elif defined(DS41RT_V41_TP2_EXPERTS)
+#elif defined(CUTEAFD_V41_TP2_EXPERTS)
 #include "v41_tp2_expert_variants.h"
-#elif defined(DS41RT_V41_LOCAL_EXPERTS)
+#elif defined(CUTEAFD_V41_LOCAL_EXPERTS)
 #include "v41_local_expert_variants.h"
 #else
 #include "v41_expert_variants.h"
 #include "v41_input_quant_dispatch.h"
 #endif
-#ifndef DS41RT_V41_OUTPUT_KIND
-#define DS41RT_V41_OUTPUT_KIND(capacity) 0
+#ifndef CUTEAFD_V41_OUTPUT_KIND
+#define CUTEAFD_V41_OUTPUT_KIND(capacity) 0
 #endif
 
-static_assert(sizeof(ds41rt_v41_expert_info_t) == 64);
-static_assert(sizeof(ds41rt_v41_expert_launch_t) == 392);
-static_assert(offsetof(ds41rt_v41_expert_launch_t, stream) == 384);
+static_assert(sizeof(cuteafd_v41_expert_info_t) == 64);
+static_assert(sizeof(cuteafd_v41_expert_launch_t) == 392);
+static_assert(offsetof(cuteafd_v41_expert_launch_t, stream) == 384);
 
 namespace {
 using ModuleFn = void (*)(void**);
 using LaunchFn = void (*)(void**, int32_t);
 struct Variant {
-  ds41rt_v41_expert_info_t info;
+  cuteafd_v41_expert_info_t info;
   ModuleFn initialize;
   ModuleFn load;
   LaunchFn launch;
-  uint64_t scratch_offsets[DS41RT_V41_EXPERT_POINTERS];
+  uint64_t scratch_offsets[CUTEAFD_V41_EXPERT_POINTERS];
   cudaLibrary_t library = nullptr;
   int device = -1;
   // The export host's SM count is a ceiling on the cooperative grid, not a
@@ -52,16 +52,16 @@ struct Variant {
   int device_sms = 0;
   ~Variant() { if (library) cudaLibraryUnload(library); }
 };
-Variant variants[] = {DS41RT_V41_VARIANTS};
-#ifdef DS41RT_V41_TP2_EXPERTS
+Variant variants[] = {CUTEAFD_V41_VARIANTS};
+#ifdef CUTEAFD_V41_TP2_EXPERTS
 // The dual coordinator exposes exactly two selected GPUs as CUDA devices 0/1.
 // Each owns a separate loaded module and immutable handle per capacity.
-Variant peer_variants[] = {DS41RT_V41_VARIANTS};
+Variant peer_variants[] = {CUTEAFD_V41_VARIANTS};
 #endif
 std::mutex initialization_mutex;
 Variant* by_handle(void* handle) {
   for (auto& variant : variants) if (&variant == handle) return &variant;
-#ifdef DS41RT_V41_TP2_EXPERTS
+#ifdef CUTEAFD_V41_TP2_EXPERTS
   for (auto& variant : peer_variants) if (&variant == handle) return &variant;
 #endif
   return nullptr;
@@ -72,7 +72,7 @@ bool valid_scratch(Variant* variant, void* storage, uint64_t bytes) {
     reinterpret_cast<uintptr_t>(storage) <= UINTPTR_MAX - variant->info.scratch_bytes;
 }
 Variant* by_capacity(int32_t capacity) {
-#ifdef DS41RT_V41_TP2_EXPERTS
+#ifdef CUTEAFD_V41_TP2_EXPERTS
   int device = -1;
   if (cudaGetDevice(&device) != cudaSuccess || device < 0 || device > 1) return nullptr;
   if (device == 1) {
@@ -87,26 +87,26 @@ Variant* by_capacity(int32_t capacity) {
 }
 }
 
-extern "C" int32_t ds41rt_v41_initialize_scratch_storage_async(
+extern "C" int32_t cuteafd_v41_initialize_scratch_storage_async(
     void*, uint64_t, uint64_t, uint64_t, uint32_t, void*);
 
-extern "C" int32_t ds41rt_v41_expert_bind_scratch(void* kernel, void* storage,
-    uint64_t bytes, void* tensors[DS41RT_V41_EXPERT_POINTERS]) {
+extern "C" int32_t cuteafd_v41_expert_bind_scratch(void* kernel, void* storage,
+    uint64_t bytes, void* tensors[CUTEAFD_V41_EXPERT_POINTERS]) {
   auto* variant = by_handle(kernel);
   if (!valid_scratch(variant, storage, bytes) || !tensors) return cudaErrorInvalidValue;
-#ifdef DS41RT_V41_TP2_EXPERTS
+#ifdef CUTEAFD_V41_TP2_EXPERTS
   int device = -1;
   const auto status = cudaGetDevice(&device);
   if (status != cudaSuccess) return status;
   if (device != variant->device) return cudaErrorInvalidDevice;
 #endif
-  for (int slot = 0; slot < DS41RT_V41_EXPERT_POINTERS; ++slot)
+  for (int slot = 0; slot < CUTEAFD_V41_EXPERT_POINTERS; ++slot)
     if (variant->scratch_offsets[slot] != UINT64_MAX)
       tensors[slot] = static_cast<char*>(storage) + variant->scratch_offsets[slot];
   return cudaSuccess;
 }
 
-extern "C" int32_t ds41rt_v41_expert_initialize_scratch_async(void* kernel,
+extern "C" int32_t cuteafd_v41_expert_initialize_scratch_async(void* kernel,
     void* storage, uint64_t bytes, void* stream) {
   auto* variant = by_handle(kernel);
   if (!valid_scratch(variant, storage, bytes)) return cudaErrorInvalidValue;
@@ -114,22 +114,22 @@ extern "C" int32_t ds41rt_v41_expert_initialize_scratch_async(void* kernel,
   auto status = cudaGetDevice(&device);
   if (status != cudaSuccess) return status;
   if (device != variant->device) return cudaErrorInvalidDevice;
-  return ds41rt_v41_initialize_scratch_storage_async(storage, variant->info.scratch_bytes,
+  return cuteafd_v41_initialize_scratch_storage_async(storage, variant->info.scratch_bytes,
       variant->scratch_offsets[37], variant->scratch_offsets[40],
       variant->info.experts, stream);
 }
 
-extern "C" int32_t ds41rt_v41_expert_info(int32_t capacity, ds41rt_v41_expert_info_t* out) {
+extern "C" int32_t cuteafd_v41_expert_info(int32_t capacity, cuteafd_v41_expert_info_t* out) {
   auto* variant = by_capacity(capacity);
   if (!variant || !out) return cudaErrorInvalidValue;
   *out = variant->info;
   return cudaSuccess;
 }
 
-extern "C" int32_t ds41rt_v41_expert_output_kind(int32_t capacity, uint32_t* out) {
+extern "C" int32_t cuteafd_v41_expert_output_kind(int32_t capacity, uint32_t* out) {
   auto* variant = by_capacity(capacity);
   if (!variant || !out) return cudaErrorInvalidValue;
-  *out = DS41RT_V41_OUTPUT_KIND(capacity);
+  *out = CUTEAFD_V41_OUTPUT_KIND(capacity);
   return cudaSuccess;
 }
 
@@ -139,14 +139,14 @@ namespace {
 // bare cudaErrorInvalidDevice (101).
 int32_t reject_expert_device(const char* what, int device, int major, int minor, int sms) {
   std::fprintf(stderr,
-               "ds41rt: %s AOT kernels were exported for compute 12.%d with %d SMs, but device "
+               "cuteafd: %s AOT kernels were exported for compute 12.%d with %d SMs, but device "
                "%d is compute %d.%d with %d SMs; rebuild the AOT export on the target GPU "
                "(cudaErrorInvalidDevice)\n",
-               what, int(DS41RT_V41_CC_MINOR), int(DS41RT_V41_SMS), device, major, minor, sms);
+               what, int(CUTEAFD_V41_CC_MINOR), int(CUTEAFD_V41_SMS), device, major, minor, sms);
   return cudaErrorInvalidDevice;
 }
 }  // namespace
-extern "C" int32_t ds41rt_v41_expert_initialize(int32_t capacity, void** out) {
+extern "C" int32_t cuteafd_v41_expert_initialize(int32_t capacity, void** out) {
   if (!out) return cudaErrorInvalidValue;
   *out = nullptr;
   auto* variant = by_capacity(capacity);
@@ -160,13 +160,13 @@ extern "C" int32_t ds41rt_v41_expert_initialize(int32_t capacity, void** out) {
   if (status != cudaSuccess) return status;
   status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
   if (status != cudaSuccess) return status;
-  if (major != 12 || minor != DS41RT_V41_CC_MINOR)
+  if (major != 12 || minor != CUTEAFD_V41_CC_MINOR)
     return reject_expert_device("v41 expert", device, major, minor, sms);
-  if (sms != DS41RT_V41_SMS)
+  if (sms != CUTEAFD_V41_SMS)
     std::fprintf(stderr,
-                 "ds41rt: v41 expert AOT was exported on a %d-SM part but device %d has %d SMs; "
+                 "cuteafd: v41 expert AOT was exported on a %d-SM part but device %d has %d SMs; "
                  "using the same kernels with the launch cluster cap clamped to %d\n",
-                 int(DS41RT_V41_SMS), device, sms, sms);
+                 int(CUTEAFD_V41_SMS), device, sms, sms);
   std::lock_guard<std::mutex> lock(initialization_mutex);
   if (variant->device >= 0) {
     if (variant->device != device) return cudaErrorInvalidDevice;
@@ -175,7 +175,7 @@ extern "C" int32_t ds41rt_v41_expert_initialize(int32_t capacity, void** out) {
   }
   variant->device_sms = sms;
   auto* module_owner = variant;
-#ifdef DS41RT_V41_TP2_EXPERTS
+#ifdef CUTEAFD_V41_TP2_EXPERTS
   // Generated launch symbols are shared process-wide. Keep one library per
   // exported variant and configure it on both devices; handles remain distinct.
   for (auto& entry : variants)
@@ -206,7 +206,7 @@ extern "C" int32_t ds41rt_v41_expert_initialize(int32_t capacity, void** out) {
   return cudaSuccess;
 }
 
-extern "C" int32_t ds41rt_v41_expert_launch(void* kernel, const ds41rt_v41_expert_launch_t* args) {
+extern "C" int32_t cuteafd_v41_expert_launch(void* kernel, const cuteafd_v41_expert_launch_t* args) {
   Variant* variant = by_handle(kernel);
   if (!variant || !args || variant->device < 0) return cudaErrorInvalidValue;
   const auto& info = variant->info;
@@ -214,7 +214,7 @@ extern "C" int32_t ds41rt_v41_expert_launch(void* kernel, const ds41rt_v41_exper
       args->scatter_rows != args->num_tokens * static_cast<int32_t>(info.topk) ||
       args->max_rows != info.max_rows || args->rows_padded != info.rows_padded ||
       args->max_tasks != info.max_tasks || args->max_phys_tiles != info.max_phys_tiles ||
-      args->max_active_clusters <= 0 || args->max_active_clusters > 2 * DS41RT_V41_SMS)
+      args->max_active_clusters <= 0 || args->max_active_clusters > 2 * CUTEAFD_V41_SMS)
     return cudaErrorInvalidValue;
   for (auto* pointer : args->tensors) if (!pointer) return cudaErrorInvalidValue;
   int device = -1;
@@ -247,9 +247,9 @@ extern "C" int32_t ds41rt_v41_expert_launch(void* kernel, const ds41rt_v41_exper
 // are BF16, and the replicated-group Spark TP2/TP3/TP6 families share the
 // canonical quantizer compiled by the primary native expert translation unit.
 // Every role that needs it defines these entry points in exactly one member.
-#if !defined(DS41RT_V41_LOCAL_EXPERTS) && !defined(DS41RT_V41_NVFP4_VARIANTS_HEADER) && \
-    !defined(DS41RT_V41_SPARK_TP2_EXPERTS) && !defined(DS41RT_V41_SPARK_TP3_EXPERTS) && \
-    !defined(DS41RT_V41_SPARK_TP6_EXPERTS)
+#if !defined(CUTEAFD_V41_LOCAL_EXPERTS) && !defined(CUTEAFD_V41_NVFP4_VARIANTS_HEADER) && \
+    !defined(CUTEAFD_V41_SPARK_TP2_EXPERTS) && !defined(CUTEAFD_V41_SPARK_TP3_EXPERTS) && \
+    !defined(CUTEAFD_V41_SPARK_TP6_EXPERTS)
 namespace {
 struct InputQuantModule {
   cudaLibrary_t library = nullptr;
@@ -261,7 +261,7 @@ struct InputQuantModule {
   ~InputQuantModule() { if (library) cudaLibraryUnload(library); }
 } input_quant, peer_input_quant;
 }
-extern "C" int32_t ds41rt_v41_expert_input_quant_initialize(void** out) {
+extern "C" int32_t cuteafd_v41_expert_input_quant_initialize(void** out) {
   if (!out) return cudaErrorInvalidValue;
   *out = nullptr;
   int device, major, minor, sms;
@@ -269,7 +269,7 @@ extern "C" int32_t ds41rt_v41_expert_input_quant_initialize(void** out) {
   status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device); if (status) return status;
   status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device); if (status) return status;
   status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device); if (status) return status;
-  if (major != 12 || minor != DS41RT_V41_CC_MINOR || sms != DS41RT_V41_SMS)
+  if (major != 12 || minor != CUTEAFD_V41_CC_MINOR || sms != CUTEAFD_V41_SMS)
     return reject_expert_device("v41 expert input-quant", device, major, minor, sms);
   std::lock_guard<std::mutex> lock(initialization_mutex);
   auto* owner = input_quant.device == device ? &input_quant :
@@ -281,10 +281,10 @@ extern "C" int32_t ds41rt_v41_expert_input_quant_initialize(void** out) {
   const bool existing = input_quant.library != nullptr;
   auto* library = &input_quant.library;
   void* init[] = {&library, &status};
-  if (!existing) _mlir_ds41rt_v41_expert_input_quant_cuda_init(init);
+  if (!existing) _mlir_cuteafd_v41_expert_input_quant_cuda_init(init);
   if (!status) {
     void* load[] = {&library, &device, &status};
-    _mlir_ds41rt_v41_expert_input_quant_cuda_load_to_device(load);
+    _mlir_cuteafd_v41_expert_input_quant_cuda_load_to_device(load);
   }
   if (status) {
     if (!existing) { if (input_quant.library) cudaLibraryUnload(input_quant.library); input_quant.library = nullptr; }
@@ -294,7 +294,7 @@ extern "C" int32_t ds41rt_v41_expert_input_quant_initialize(void** out) {
   *out = owner;
   return cudaSuccess;
 }
-extern "C" int32_t ds41rt_v41_expert_input_quantize_async(void* kernel,
+extern "C" int32_t cuteafd_v41_expert_input_quantize_async(void* kernel,
     const uint16_t* input, uint8_t* output, uint32_t rows, void* stream) {
   auto* owner = kernel == &input_quant ? &input_quant : (kernel == &peer_input_quant ? &peer_input_quant : nullptr);
   if (!owner || owner->device < 0 || !input || !output ||
@@ -310,10 +310,10 @@ extern "C" int32_t ds41rt_v41_expert_input_quantize_async(void* kernel,
   void* values = output;
   void* scales = output + 5120;
   void* unused_mma = output; // wire specialization does not write MMA scales
-  int32_t m = rows, grid = ds41rt_v41_input_quant_grids[rows-1];
+  int32_t m = rows, grid = cuteafd_v41_input_quant_grids[rows-1];
   int32_t result = 0;
   void* args[] = {&source, &values, &scales, &unused_mma, &m, &grid, &stream, &result};
-  DS41RT_V41_INPUT_QUANT_ENTRY(args, 8);
+  CUTEAFD_V41_INPUT_QUANT_ENTRY(args, 8);
   return result;
 }
 

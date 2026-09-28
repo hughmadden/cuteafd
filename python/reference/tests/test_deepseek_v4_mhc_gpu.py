@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from ds41rt_reference.deepseek_v4_mhc_capture import (
+from cuteafd_reference.deepseek_v4_mhc_capture import (
     capture_deepseek_v4_mhc_terminal,
     plan_deepseek_v4_mhc,
     prepare_deepseek_v4_mhc_terminal,

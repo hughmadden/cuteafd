@@ -12,12 +12,12 @@ Usage: scripts/release-digests.sh capture [--config FILE] [--tag TAG]
                                          --evidence FILE
                                          [--role coordinator|spark|all]
 
-Records and re-checks the registry digests of one published DS41RT image pair.
+Records and re-checks the registry digests of one published CUTEAFD image pair.
 It is read-only and never tags, pushes or edits a configuration: publication
 stays in ./push-containers.sh.
 
 capture  Resolve the coordinator and Spark image references from --config
-         (default: ds41rt.config), obtain one anonymous GHCR pull token per
+         (default: cuteafd.config), obtain one anonymous GHCR pull token per
          repository, and record the Docker-Content-Digest of the tag. The
          coordinator is an OCI image index and the Spark expert is a single
          manifest, so each role's own digest is recorded. --evidence writes the
@@ -34,11 +34,11 @@ verify   Pull the same references with a throwaway empty DOCKER_CONFIG, so no
          another tag.
 
 The two GHCR repositories are the ones ./push-containers.sh publishes to. The
-tag comes from the configuration; after the v10 runtime promotion ds41rt.config
+tag comes from the configuration; after the v10 runtime promotion cuteafd.config
 itself names the v10 pair, and the explicit build target is identical:
-  scripts/release-digests.sh capture --config ds41rt.config \
+  scripts/release-digests.sh capture --config cuteafd.config \
       --evidence /path/to/v10-evidence/digests.env
-  scripts/release-digests.sh verify  --config ds41rt.config \
+  scripts/release-digests.sh verify  --config cuteafd.config \
       --evidence /path/to/v10-evidence/digests.env
 EOF
 }
@@ -161,7 +161,7 @@ release_digests_evidence_value() {
 # point of the exercise is that no host credential was consulted.
 release_digests_anonymous_pull() {
   local ref="$1" config_dir output digest
-  config_dir="$(mktemp -d "${TMPDIR:-/tmp}/ds41rt-anon-pull.XXXXXX")"
+  config_dir="$(mktemp -d "${TMPDIR:-/tmp}/cuteafd-anon-pull.XXXXXX")"
   chmod 700 "$config_dir"
   if ! output="$(DOCKER_CONFIG="$config_dir" docker pull "$ref" 2>&1)"; then
     rm -rf "$config_dir"
@@ -223,7 +223,7 @@ case "$mode" in
     ;;
 esac
 
-config="$repo_root/ds41rt.config"
+config="$repo_root/cuteafd.config"
 evidence=
 force=0
 role=all

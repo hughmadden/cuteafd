@@ -23,7 +23,7 @@ def main():
     torch.manual_seed(410916)
     h, n, active = 5120, 576, 8
     lib = library(str(args.native_lib))
-    sizes_fn = lib.ds41rt_v41_expert_packed_sizes
+    sizes_fn = lib.cuteafd_v41_expert_packed_sizes
     sizes_fn.argtypes = [C.c_uint32, C.POINTER(C.c_uint64)]
     sizes_fn.restype = C.c_int32
     sizes = (C.c_uint64 * 4)()
@@ -37,7 +37,7 @@ def main():
                                      device='cuda', dtype=torch.uint8)
     for expert in range(active):
         source = [bank[name][expert] for bank in (weights, scales) for name in ('w1','w3','w2')]
-        check(lib.ds41rt_v41_pack_expert_async(
+        check(lib.cuteafd_v41_pack_expert_async(
             (P*6)(*[v.data_ptr() for v in source]),
             (P*4)(*[v[expert].data_ptr() for v in pools]), n,
             torch.cuda.current_stream().cuda_stream))

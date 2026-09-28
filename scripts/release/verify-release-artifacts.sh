@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Read-only release-artifact verification for one DS41RT release.
+# Read-only release-artifact verification for one CUTEAFD release.
 #
 # This is the reusable form of the throwaway `runs/vN-release/build/10-verify.sh`
 # used for v10. It records expected image labels, per-host fleet identity, the
@@ -8,7 +8,7 @@
 # hard check fails. It never builds, tags, pushes, pulls or edits a config.
 #
 # Usage:
-#   scripts/release/verify-release-artifacts.sh --config ds41rt.build-v11.config \
+#   scripts/release/verify-release-artifacts.sh --config cuteafd.build-v11.config \
 #     --evidence runs/v11-release/build [--dist PATH] [--require-hosts CSV]
 #
 # Required checks are never skipped: the v10 pipeline asserted the pair identity
@@ -139,12 +139,12 @@ else
     coordinator.arch "expected amd64 got $(coord_field architecture)"
   record "$([[ "$(coord_field label.org.opencontainers.image.version)" == "$release_version" ]] && echo PASS || echo FAIL)" \
     coordinator.version "expected $release_version got $(coord_field label.org.opencontainers.image.version)"
-  record "$([[ "$(coord_field label.io.ds41rt.role)" == coordinator ]] && echo PASS || echo FAIL)" \
-    coordinator.role "expected coordinator got $(coord_field label.io.ds41rt.role)"
-  record "$([[ "$(coord_field label.io.ds41rt.cuda_arch)" == 120 ]] && echo PASS || echo FAIL)" \
-    coordinator.cuda_arch "expected 120 got $(coord_field label.io.ds41rt.cuda_arch)"
-  record "$([[ -z "$(coord_field label.io.ds41rt.v41.spark_tp_roles)" ]] && echo PASS || echo FAIL)" \
-    coordinator.spark_tp_roles "expected empty got $(coord_field label.io.ds41rt.v41.spark_tp_roles)"
+  record "$([[ "$(coord_field label.io.cuteafd.role)" == coordinator ]] && echo PASS || echo FAIL)" \
+    coordinator.role "expected coordinator got $(coord_field label.io.cuteafd.role)"
+  record "$([[ "$(coord_field label.io.cuteafd.cuda_arch)" == 120 ]] && echo PASS || echo FAIL)" \
+    coordinator.cuda_arch "expected 120 got $(coord_field label.io.cuteafd.cuda_arch)"
+  record "$([[ -z "$(coord_field label.io.cuteafd.v41.spark_tp_roles)" ]] && echo PASS || echo FAIL)" \
+    coordinator.spark_tp_roles "expected empty got $(coord_field label.io.cuteafd.v41.spark_tp_roles)"
 fi
 
 ########################################################################
@@ -201,10 +201,10 @@ if [[ -n "$anchor_host" ]]; then
   spark_exec_rev="$(fleet_field "$anchor_host" label.org.opencontainers.image.revision)"
   spark_arch="$(fleet_field "$anchor_host" architecture)"
   spark_version_label="$(fleet_field "$anchor_host" label.org.opencontainers.image.version)"
-  spark_role_label="$(fleet_field "$anchor_host" label.io.ds41rt.role)"
-  spark_cuda_label="$(fleet_field "$anchor_host" label.io.ds41rt.cuda_arch)"
-  spark_roles="$(fleet_field "$anchor_host" label.io.ds41rt.v41.spark_tp_roles)"
-  spark_manifest_label="$(fleet_field "$anchor_host" label.io.ds41rt.source-manifest.sha256)"
+  spark_role_label="$(fleet_field "$anchor_host" label.io.cuteafd.role)"
+  spark_cuda_label="$(fleet_field "$anchor_host" label.io.cuteafd.cuda_arch)"
+  spark_roles="$(fleet_field "$anchor_host" label.io.cuteafd.v41.spark_tp_roles)"
+  spark_manifest_label="$(fleet_field "$anchor_host" label.io.cuteafd.source-manifest.sha256)"
   # The coordinator block always records a status line, so its revision is set
   # even when the local image is missing.
   record "$([[ "$spark_exec_rev" == "$exec_rev" ]] && echo PASS || echo FAIL)" \
@@ -273,7 +273,7 @@ if [[ -n "$dist" ]]; then
   record "$([[ -d "$dist" ]] && echo PASS || echo FAIL)" dist.present "$dist"
 
   if [[ -d "$dist" ]]; then
-    sparkinfer_rev="$(coord_field label.io.ds41rt.sparkinfer.revision)"
+    sparkinfer_rev="$(coord_field label.io.cuteafd.sparkinfer.revision)"
     {
       echo "# dist artifact verification"
       for role in coordinator spark-expert; do
@@ -298,7 +298,7 @@ if [[ -n "$dist" ]]; then
         echo "shipped_checksums_rc=$?"
         echo "-- V41_EXPERT_TP_AOT.json native_library_sha256 --"
         echo "manifest=$(python3 -c "import json,sys;print(json.load(open('$dist/$role/V41_EXPERT_TP_AOT.json')).get('native_library_sha256'))" 2>/dev/null)"
-        echo "actual=$(sha256sum "$dist/$role/libds41rt_native.so" 2>/dev/null | awk '{print $1}')"
+        echo "actual=$(sha256sum "$dist/$role/libcuteafd_native.so" 2>/dev/null | awk '{print $1}')"
       done
     } >"$evidence/10-dist-artifact-verification.txt" 2>&1
     bad_rc="$(grep -c '_rc=[1-9]' "$evidence/10-dist-artifact-verification.txt")"
@@ -306,7 +306,7 @@ if [[ -n "$dist" ]]; then
       dist.artifact_verification "$bad_rc failing step(s); see 10-dist-artifact-verification.txt"
     for role in coordinator spark-expert; do
       manifest="$(python3 -c "import json;print(json.load(open('$dist/$role/V41_EXPERT_TP_AOT.json')).get('native_library_sha256',''))" 2>/dev/null)"
-      actual="$(sha256sum "$dist/$role/libds41rt_native.so" 2>/dev/null | awk '{print $1}')"
+      actual="$(sha256sum "$dist/$role/libcuteafd_native.so" 2>/dev/null | awk '{print $1}')"
       record "$([[ -n "$manifest" && "$manifest" == "$actual" ]] && echo PASS || echo FAIL)" \
         "$role.native_library_sha256" "manifest=${manifest:-<none>} actual=${actual:-<none>}"
       roles_json="$(python3 -c "import json;print(';'.join(json.load(open('$dist/$role/V41_EXPERT_TP_AOT.json')).get('spark_tp_roles',[])))" 2>/dev/null)"
@@ -334,7 +334,7 @@ if [[ -n "$dist" && -x "$repo_root/scripts/bench/verify_exl3_tp3.py" ]]; then
   {
     echo "# EXL3 TP3 k23/k34 rank geometry"
     python3 "$repo_root/scripts/bench/verify_exl3_tp3.py" --dist "$dist" \
-      --role spark-expert --sparkinfer-revision "$(coord_field label.io.ds41rt.sparkinfer.revision)"
+      --role spark-expert --sparkinfer-revision "$(coord_field label.io.cuteafd.sparkinfer.revision)"
     echo "verify_exl3_tp3_rc=$?"
   } >"$evidence/10-exl3-tp3-verification.txt" 2>&1
   record "$([[ "$(tail -1 "$evidence/10-exl3-tp3-verification.txt")" == "verify_exl3_tp3_rc=0" ]] && echo PASS || echo FAIL)" \

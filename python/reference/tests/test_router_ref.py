@@ -2,7 +2,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from ds41rt_reference.router_ref import route_topk
+from cuteafd_reference.router_ref import route_topk
 
 
 def test_router_returns_normalized_topk_weights():

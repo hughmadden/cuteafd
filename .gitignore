@@ -7,8 +7,8 @@ native/build-cuda-*/
 native/build-rdma/
 build/
 dist/
-.ds41rt-release/
-.ds41rt-release-image/
+.cuteafd-release/
+.cuteafd-release-image/
 __pycache__/
 *.py[cod]
 *.so
@@ -22,7 +22,7 @@ __pycache__/
 .coverage
 htmlcov/
 .env
-.ds41rt-cache/
+.cuteafd-cache/
 # Tool-evaluation output generated in the repository root.
 data/benchmarks.sqlite
 runs/
@@ -42,7 +42,7 @@ reports/phase0_artifacts/smoke/
 # commit their manifests and hashes, not raw activation rows.
 reports/quantization/router-replay-inputs/*.bf16
 reports/quantization/router-replay-inputs/*.bin
-.ds41rt-wip/
+.cuteafd-wip/
 run-agent.sh
 native/build-nvfp4-share/
 runs/

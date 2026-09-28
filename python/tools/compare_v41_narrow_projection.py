@@ -38,7 +38,7 @@ def main():
     class Info(C.Structure):
         _fields_ = [(name,C.c_uint32) for name in ('abi','capacity','k','n')] + [(name,u64) for name in ('scratch','values','row_scales','mma_scales','weight_scales')]
     def bind(name,types):
-        fn = getattr(lib,'ds41rt_v41_fp8_'+name); fn.argtypes=types; fn.restype=i32
+        fn = getattr(lib,'cuteafd_v41_fp8_'+name); fn.argtypes=types; fn.restype=i32
         def run(*values):
             result = fn(*values)
             assert result == 0,(name,result)

@@ -38,13 +38,13 @@ def bind(name, types):
     return f
 
 
-rope = bind("ds41rt_v41_attention_rope", [P, P, P, I32, I32, I32, P])
-info_fn = bind("ds41rt_v41_fp8_matrix_info", [I32, I32, I32, C.POINTER(Info)])
-init = bind("ds41rt_v41_fp8_matrix_initialize", [I32, I32, I32, C.POINTER(P)])
-pack = bind("ds41rt_v41_fp8_matrix_pack_scales", [P, P, I32, I32, P])
-scratch_init = bind("ds41rt_v41_fp8_initialize_scratch", [P, P, C.c_uint64, P, P])
+rope = bind("cuteafd_v41_attention_rope", [P, P, P, I32, I32, I32, P])
+info_fn = bind("cuteafd_v41_fp8_matrix_info", [I32, I32, I32, C.POINTER(Info)])
+init = bind("cuteafd_v41_fp8_matrix_initialize", [I32, I32, I32, C.POINTER(P)])
+pack = bind("cuteafd_v41_fp8_matrix_pack_scales", [P, P, I32, I32, P])
+scratch_init = bind("cuteafd_v41_fp8_initialize_scratch", [P, P, C.c_uint64, P, P])
 launch = bind(
-    "ds41rt_v41_fp8_launch_rope", [P, P, P, P, P, P, C.c_uint64, P, P, I32, P]
+    "cuteafd_v41_fp8_launch_rope", [P, P, P, P, P, P, C.c_uint64, P, P, I32, P]
 )
 weight_map = json.loads((args.snapshot / "model.safetensors.index.json").read_text())[
     "weight_map"

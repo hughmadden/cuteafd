@@ -31,11 +31,11 @@ def main():
     reference=ns['select_candidate_blocks']
     torch.cuda.set_device(args.device);torch.manual_seed(412048)
     lib=C.CDLL(str(args.native_lib))
-    maximum=lib.ds41rt_v41_candidate_block_max
+    maximum=lib.cuteafd_v41_candidate_block_max
     maximum.argtypes=[C.c_void_p]*5+[C.c_int32]*2+[C.c_void_p];maximum.restype=C.c_int32
-    top=lib.ds41rt_v41_index_top2048_blocks
+    top=lib.cuteafd_v41_index_top2048_blocks
     top.argtypes=[C.c_void_p]*4+[C.c_uint64,C.c_void_p]+[C.c_int32]*3+[C.c_void_p];top.restype=C.c_int32
-    expand=lib.ds41rt_v41_candidate_expand
+    expand=lib.cuteafd_v41_candidate_expand
     expand.argtypes=[C.c_void_p]*3+[C.c_int32,C.c_void_p];expand.restype=C.c_int32
     stream=torch.cuda.Stream();results=[]
     with torch.cuda.stream(stream),torch.no_grad():

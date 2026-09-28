@@ -39,7 +39,7 @@ class ExportConfigTest(unittest.TestCase):
         self.assertEqual(config["quantization_config"]["quant_method"], "exl3")
         self.assertEqual(len(external["tensor_storage"]), 47232)
         self.assertEqual(sum(entry["bits_per_weight"] == 4 for entry in external["tensor_storage"].values()), 11808)
-        self.assertEqual(external["meta"]["ds41rt"]["native_quantization_config"], source["quantization_config"])
+        self.assertEqual(external["meta"]["cuteafd"]["native_quantization_config"], source["quantization_config"])
         self.assertEqual(source["quantization_config"]["quant_method"], "fp8")
         self.assertEqual(config["text_config"], source["text_config"])
         tensors["mtp.2.ffn.experts.127.w2.trellis"]["shape"][-1] = 64

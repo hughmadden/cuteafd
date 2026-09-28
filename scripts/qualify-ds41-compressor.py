@@ -45,11 +45,11 @@ def main():
     lib=C.CDLL(str(args.native_lib));P=C.c_void_p;I=C.c_int32
     def bind(name,types):
         fn=getattr(lib,name);fn.argtypes=types;fn.restype=I;return fn
-    create=bind('ds41rt_v41_compressor_create',[P,C.c_uint64,C.POINTER(P)])
-    destroy=bind('ds41rt_v41_compressor_destroy',[P])
-    project=bind('ds41rt_v41_compressor_project',[P,P,P,P,I,I,P])
-    pool=bind('ds41rt_v41_compressor_pool',[P,P,P,P,P,P,P,I,I,P])
-    norm=bind('ds41rt_v41_attention_norm',[P,P,P,P,I,I,P])
+    create=bind('cuteafd_v41_compressor_create',[P,C.c_uint64,C.POINTER(P)])
+    destroy=bind('cuteafd_v41_compressor_destroy',[P])
+    project=bind('cuteafd_v41_compressor_project',[P,P,P,P,I,I,P])
+    pool=bind('cuteafd_v41_compressor_pool',[P,P,P,P,P,P,P,I,I,P])
+    norm=bind('cuteafd_v41_attention_norm',[P,P,P,P,I,I,P])
     ptr=lambda t:t.data_ptr()
     def check(status):assert status==0,status
     workspace=torch.empty(4*1024*1024,device='cuda',dtype=torch.uint8);handle=P()

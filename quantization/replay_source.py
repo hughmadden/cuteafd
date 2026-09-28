@@ -46,7 +46,7 @@ def run(snapshot, device, batch_size):
     del inputs
     identity = dict(diagnostic="native-main-draft-smoke", snapshot=snapshot.name,
                     token_sha256=hashlib.sha256(ids.numpy().tobytes()).hexdigest())
-    with tempfile.TemporaryDirectory(prefix="ds41rt-replay-") as directory:
+    with tempfile.TemporaryDirectory(prefix="cuteafd-replay-") as directory:
         path = Path(directory) / "frontier.safetensors"
         def advance(namespace, layer, state):
             tick = time.monotonic()

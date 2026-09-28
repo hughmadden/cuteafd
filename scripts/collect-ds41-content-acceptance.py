@@ -2,7 +2,7 @@
 """Collect C1 adaptive draft acceptance by release content type, separately from TPS.
 
 Run against an otherwise idle server with
-RUST_LOG=info,ds41rt::draft_policy=debug,ds41rt::timing=debug,ds41rt::lane_schedule=debug
+RUST_LOG=info,cuteafd::draft_policy=debug,cuteafd::timing=debug,cuteafd::lane_schedule=debug
 and continuously
 capture its logs to --trace. This script does not launch or alter the server.
 """

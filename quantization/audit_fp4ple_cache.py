@@ -8,11 +8,11 @@ from write_export import _fingerprint, _publish_json
 
 
 def audit():
-    root = Path('/home/tj/.cache/ds41rt/quantization/deepseek-v41-exl3-k325-fp4ple-v1')
+    root = Path('/home/tj/.cache/cuteafd/quantization/deepseek-v41-exl3-k325-fp4ple-v1')
     base_state = root.parent / 'deepseek-v41-exl3-k325-v1/export-state/numbered-shards-v1'
     hf = Path('/home/tj/.cache/huggingface')
-    output = hf / 'ds41rt-exports/DeepSeek-V4.1-EXL3-K3.25-FP4PLE-v1'
-    base_output = hf / 'ds41rt-exports/DeepSeek-V4.1-EXL3-K3.25-v1-numbered'
+    output = hf / 'cuteafd-exports/DeepSeek-V4.1-EXL3-K3.25-FP4PLE-v1'
+    base_output = hf / 'cuteafd-exports/DeepSeek-V4.1-EXL3-K3.25-v1-numbered'
     pub = json.loads((root/'publication-complete.json').read_text())
     receipt = json.loads((root/'upload-complete.json').read_text())
     base = json.loads((base_state/'upload-complete.json').read_text())

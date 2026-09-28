@@ -38,7 +38,7 @@ The original revision `076c0dcf88436e1d6f69ca50f3557c307439f2ef` remains intact.
 The numbered revision was published with server-side shard copies/deletions and
 one updated 13,398,375-byte index. No weight uploads or weight hashing occurred.
 Both local snapshots reuse the same weight inodes. The numbered export is
-`/home/tj/.cache/huggingface/ds41rt-exports/DeepSeek-V4.1-EXL3-K3.25-v1-numbered`.
+`/home/tj/.cache/huggingface/cuteafd-exports/DeepSeek-V4.1-EXL3-K3.25-v1-numbered`.
 The current receipts and revised plan are under the original run root's
 `export-state/numbered-shards-v1/`; the older top-level receipts describe the
 original revision and are deliberately preserved. The export planner now uses
@@ -65,7 +65,7 @@ The manifest must enable `publication`, pin both RTX UUIDs/image/preflight IDs
 and all four Spark endpoints, and point to the passed source/input attestations
 and unchanged calibration corpus. Put manifest, corpus, attestations, worker
 token, journal and export state under `run_root`. Store the export under
-`HF_HOME/ds41rt-exports/`, outside `HF_HOME/hub`; both share one container mount
+`HF_HOME/cuteafd-exports/`, outside `HF_HOME/hub`; both share one container mount
 so materialization can hard-link the weights. The source model's cache directory
 is overmounted read-only. The existing HF credential is mounted read-only and is
 never embedded in the manifest or printed. Do not edit hard-linked model files
@@ -102,7 +102,7 @@ After several production layers commit with stable memory, monitor every
 30 minutes and report current progress plus completion ETA.
 
 The continuous-search repair uses the explicit
-`ds41rt-continuous-search-recovery-v1` manifest authorization documented in
+`cuteafd-continuous-search-recovery-v1` manifest authorization documented in
 `PLAN.md`. Keep its referenced previous manifest and qualification report.
 Old assignment files and completed candidates remain intact; new assignments
 are recorded separately in `search-assignments-continuous-v1.json`. Only
@@ -122,16 +122,16 @@ Future exports predeclare the rules and assign cache ownership to the run user.
 The executed recovery command (already completed; not a pending step) was:
 
 ```bash
-docker run --name ds41rt-publication-recovery --network host \
-  -v /home/tj/Developer/ds41rt/quantization:/recovery-code:ro \
-  -v /home/tj/.cache/ds41rt/quantization/deepseek-v41-exl3-k325-v1:/home/tj/.cache/ds41rt/quantization/deepseek-v41-exl3-k325-v1 \
+docker run --name cuteafd-publication-recovery --network host \
+  -v /home/tj/Developer/cuteafd/quantization:/recovery-code:ro \
+  -v /home/tj/.cache/cuteafd/quantization/deepseek-v41-exl3-k325-v1:/home/tj/.cache/cuteafd/quantization/deepseek-v41-exl3-k325-v1 \
   -v /home/tj/.cache/huggingface:/home/tj/.cache/huggingface \
   -e HF_TOKEN_PATH=/home/tj/.cache/huggingface/token \
-  -e PYTHONPATH=/recovery-code:/opt/ds41rt/third_party/gptqmodel \
+  -e PYTHONPATH=/recovery-code:/opt/cuteafd/third_party/gptqmodel \
   --entrypoint /opt/glmrt/quant-venv/bin/python \
   sha256:bdd15949d70120fa42e4f9188da727f288ca0617e58b04f4ec97fdc5aa6f88f9 \
   /recovery-code/recover_publication.py \
-  /home/tj/.cache/ds41rt/quantization/deepseek-v41-exl3-k325-v1/production-continuous-manifest.json \
+  /home/tj/.cache/cuteafd/quantization/deepseek-v41-exl3-k325-v1/production-continuous-manifest.json \
   --commit 076c0dcf88436e1d6f69ca50f3557c307439f2ef
 ```
 
@@ -158,16 +158,16 @@ Arguments used with the same qualified image/mounts as the recovery above:
 
 ```text
 /recovery-code/rename_shards.py
-  /home/tj/.cache/ds41rt/quantization/deepseek-v41-exl3-k325-v1/production-continuous-manifest.json
-  --source-state /home/tj/.cache/ds41rt/quantization/deepseek-v41-exl3-k325-v1/export-state/hub-json-lfs-recovery-v1
-  --state /home/tj/.cache/ds41rt/quantization/deepseek-v41-exl3-k325-v1/export-state/numbered-shards-v1
-  --output /home/tj/.cache/huggingface/ds41rt-exports/DeepSeek-V4.1-EXL3-K3.25-v1-numbered
+  /home/tj/.cache/cuteafd/quantization/deepseek-v41-exl3-k325-v1/production-continuous-manifest.json
+  --source-state /home/tj/.cache/cuteafd/quantization/deepseek-v41-exl3-k325-v1/export-state/hub-json-lfs-recovery-v1
+  --state /home/tj/.cache/cuteafd/quantization/deepseek-v41-exl3-k325-v1/export-state/numbered-shards-v1
+  --output /home/tj/.cache/huggingface/cuteafd-exports/DeepSeek-V4.1-EXL3-K3.25-v1-numbered
   --parent 076c0dcf88436e1d6f69ca50f3557c307439f2ef
   --publish
 ```
 
-The detached `ds41rt-numbered-shards-publish` container exited 0. Its Docker
-logs retain the commit/upload record. `ds41rt-numbered-shards-offline-audit`
+The detached `cuteafd-numbered-shards-publish` container exited 0. Its Docker
+logs retain the commit/upload record. `cuteafd-numbered-shards-offline-audit`
 also exited 0: all 94 files resolve offline through `main` as uid 1000, all
 52 weights share inodes/blob IDs with the old revision, and every old snapshot
 fingerprint is unchanged. The updated component suite passed 83 tests.

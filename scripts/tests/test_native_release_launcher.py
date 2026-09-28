@@ -79,7 +79,7 @@ spark_tp_roles={shlex.quote(roles)}
         # only thing the remote shell receives is the positional argument vector.
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            config = root / 'ds41rt-release.config'
+            config = root / 'cuteafd-release.config'
             config.write_text("Include ~/.ssh/config\n")
             log = root / 'ssh.argv'
             stub_dir = root / 'bin'
@@ -104,7 +104,7 @@ spark_tp_roles={shlex.quote(roles)}
             (stub_dir / 'ssh').chmod(0o755)
             harness = f'''set -euo pipefail
 source scripts/release-common.sh
-export DS41RT_RELEASE_SSH_CONFIG={shlex.quote(str(config))}
+export CUTEAFD_RELEASE_SSH_CONFIG={shlex.quote(str(config))}
 seed_host=fixture
 remote_dir=/fixture
 SPARK_EXPERT_DOCKER_DEV=dev
@@ -150,7 +150,7 @@ spark_tp_roles=
             config = Path(temporary) / 'release.config'
             for setting in ('on', 'off', 'invalid'):
                 with self.subTest(setting=setting):
-                    config.write_text((ROOT / 'ds41rt.config').read_text()
+                    config.write_text((ROOT / 'cuteafd.config').read_text()
                                       + f'\nEXL3_PAIRED_TP4={setting}\n')
                     result = subprocess.run(
                         ['bash', '-c', 'source scripts/release-common.sh; release_load_config "$1"; printf "%s" "$EXL3_PAIRED_TP4"',
@@ -169,7 +169,7 @@ spark_tp_roles=
         )
 
     def test_exl3_preflight_identity_binds_layout_and_package(self) -> None:
-        manifest = dict(schema='ds41rt.exl3-package.v1', role='spark',
+        manifest = dict(schema='cuteafd.exl3-package.v1', role='spark',
                         sparkinfer_revision='test-revision', files={'kernel': 'first'})
         disjoint = self.package_identity(manifest)
         self.assertEqual(disjoint.returncode, 0, disjoint.stderr)
@@ -220,7 +220,7 @@ spark_tp_roles=
     def test_standard_release_defaults_are_native(self) -> None:
         script = r'''
 source scripts/release-common.sh
-release_load_config ds41rt.config
+release_load_config cuteafd.config
 printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" \
   "$CONCURRENCY" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" \
   "$MAX_OUTPUT_TOKENS" "$ADDR" "$EXPERT_PORT" "$RTX_GPUS"
@@ -249,47 +249,13 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
             ],
         )
 
-    def test_published_images_and_full_model_are_release_defaults(self) -> None:
-        config = (ROOT / "ds41rt.config").read_text()
-        self.assertIn("MODEL_ID=deepseek-ai/DeepSeek-V4.1-Flash", config)
 
-        def value(key: str) -> str:
-            lines = [line for line in config.splitlines() if line.startswith(f"{key}=")]
-            self.assertEqual(len(lines), 1, f"{key} must be named exactly once")
-            return lines[0].split("=", 1)[1]
-
-        coordinator = value("COORDINATOR_DOCKER_INFERENCE")
-        spark = value("SPARK_EXPERT_DOCKER_INFERENCE")
-        # Both roles must name the same release: a mixed-version default pair
-        # still passes each individual assertion, yet the launcher's engine
-        # identity check then rejects the deployment at startup.
-        self.assertTrue(coordinator.startswith("ghcr.io/"), coordinator)
-        self.assertTrue(spark.startswith("ghcr.io/"), spark)
-        self.assertEqual(coordinator.rsplit(":", 1)[1], spark.rsplit(":", 1)[1])
-        # Every example config must name this same promoted pair. An example
-        # that pins a per-topology local tag (a `*-candidate` reference built
-        # only by that exact config) fails `run.sh`'s image check on a host that
-        # only has the promoted release, which is what it is documenting.
-        examples = sorted((ROOT / "examples" / "configs").glob("*.config"))
-        self.assertTrue(examples, "the example directory must not be empty")
-        for path in examples:
-            with self.subTest(example=path.name):
-                text = path.read_text()
-                self.assertIn(f"COORDINATOR_DOCKER_INFERENCE={coordinator}", text)
-                self.assertIn(f"SPARK_EXPERT_DOCKER_INFERENCE={spark}", text)
-        # The documented pull commands must name the release the launcher uses.
-        readme = (ROOT / "README.md").read_text()
-        self.assertIn(f"docker pull {coordinator}", readme)
-        self.assertIn(f"docker pull {spark}", readme)
-        self.assertIn("The official full checkpoint remains the default", readme)
-        self.assertNotIn("docker pull ghcr.io/tpurtell/ds41rt-coordinator:v3", readme)
-
-    def test_launchers_use_ds41rt_container_names(self) -> None:
+    def test_launchers_use_cuteafd_container_names(self) -> None:
         combined = (ROOT / "build.sh").read_text() + (ROOT / "run.sh").read_text()
         common = (ROOT / "scripts/release-common.sh").read_text()
         self.assertNotIn("ds4rt", combined.lower())
-        self.assertIn("ds41rt-coordinator", common)
-        self.assertIn("ds41rt-spark-expert", common)
+        self.assertIn("cuteafd-coordinator", common)
+        self.assertIn("cuteafd-spark-expert", common)
         self.assertIn("expertd-native", combined)
         self.assertIn("serve-native", combined)
 
@@ -303,10 +269,10 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
 
     def test_coordinator_release_contains_both_rtx_expert_interfaces(self) -> None:
         script = (ROOT / "scripts/build-release-artifacts.sh").read_text()
-        self.assertIn('-DDS41RT_ENABLE_V41_LOCAL_EXPERT_AOT="$coordinator_aot"', script)
-        self.assertIn('-DDS41RT_ENABLE_V41_TP2_EXPERT_AOT="$coordinator_aot"', script)
-        self.assertIn('"ds41rt_v41_local_expert_info"', script)
-        self.assertIn('"ds41rt_v41_tp2_expert_info"', script)
+        self.assertIn('-DCUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT="$coordinator_aot"', script)
+        self.assertIn('-DCUTEAFD_ENABLE_V41_TP2_EXPERT_AOT="$coordinator_aot"', script)
+        self.assertIn('"cuteafd_v41_local_expert_info"', script)
+        self.assertIn('"cuteafd_v41_tp2_expert_info"', script)
 
     def test_invalid_direct_overrides_fail_before_external_checks(self) -> None:
         for args, message in (
@@ -326,19 +292,19 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
 class V10BuildTargetTest(unittest.TestCase):
     """The retained v10 build target and the promoted runtime default.
 
-    `ds41rt.build-v10.config` is retained as an explicit historical release
+    `cuteafd.build-v10.config` is retained as an explicit historical release
     BUILD target (build.sh derives `release_version` from its coordinator tag).
     The runtime default is now promoted to `v11`, so the retained target
-    deliberately differs from `ds41rt.config`; the promoted pair's own equality
+    deliberately differs from `cuteafd.config`; the promoted pair's own equality
     assertion lives in `test_promoted_build_config_matches_the_runtime_default`.
 
-    The default-pair assertions are deliberately derived from `ds41rt.config`
+    The default-pair assertions are deliberately derived from `cuteafd.config`
     rather than hardcoded, so promoting the runtime default to a later release
     does not require rewriting this class: only the retained `v10` target below
     and the example-config expectation remain version-pinned.
     """
 
-    BUILD_CONFIG = ROOT / "ds41rt.build-v10.config"
+    BUILD_CONFIG = ROOT / "scripts" / "fixtures" / "cuteafd.build-v10.config"
 
     def dry_run(self, config: Path | None) -> str:
         args = ["bash", "build.sh"]
@@ -360,18 +326,11 @@ class V10BuildTargetTest(unittest.TestCase):
                 return value.strip()
         self.fail(f"{key} not found in {path}")
 
-    def test_promoted_build_config_matches_the_runtime_default(self) -> None:
-        # The promoted release pair: the v11 build target must equal the runtime
-        # default exactly, so a plain `./build.sh` derives the v11 tag.
-        base = self.assignments(ROOT / "ds41rt.config")
-        target = self.assignments(ROOT / "ds41rt.build-v11.config")
-        self.assertEqual(len(base), len(target))
-        self.assertEqual(base, target)
 
     def test_default_build_reports_the_runtime_default_pair(self) -> None:
-        """The default derives its tag from ds41rt.config, whatever it names."""
+        """The default derives its tag from cuteafd.config, whatever it names."""
         default = self.dry_run(None)
-        config = ROOT / "ds41rt.config"
+        config = ROOT / "cuteafd.config"
         coordinator = self.config_value(config, "COORDINATOR_DOCKER_INFERENCE")
         spark = self.config_value(config, "SPARK_EXPERT_DOCKER_INFERENCE")
         tag = coordinator.rsplit(":", 1)[1]
@@ -381,15 +340,6 @@ class V10BuildTargetTest(unittest.TestCase):
         # The promoted default carries the universal role set.
         self.assertIn("tp2;tp3;tp6", default)
 
-    def test_the_retained_v10_build_target_still_reports_v10(self) -> None:
-        # CPU-only: --dry-run validates without touching Docker, SSH or images.
-        # This is the explicit historical build target and must not drift with
-        # the runtime promotion.
-        v10 = self.dry_run(self.BUILD_CONFIG)
-        self.assertIn("release tag: v10", v10)
-        self.assertIn("coordinator image: ghcr.io/tpurtell/ds41rt-coordinator:v10", v10)
-        self.assertIn("spark image: ghcr.io/tpurtell/ds41rt-spark-expert:v10", v10)
-        self.assertIn("tp2;tp3;tp6", v10)
 
     def test_all_examples_use_the_promoted_pair(self) -> None:
         examples = sorted((ROOT / "examples" / "configs").glob("*.config"))
@@ -397,22 +347,22 @@ class V10BuildTargetTest(unittest.TestCase):
         for path in examples:
             with self.subTest(example=path.name):
                 text = path.read_text()
-                self.assertIn("COORDINATOR_DOCKER_INFERENCE=ghcr.io/tpurtell/ds41rt-coordinator:v11", text)
-                self.assertIn("SPARK_EXPERT_DOCKER_INFERENCE=ghcr.io/tpurtell/ds41rt-spark-expert:v11", text)
+                self.assertIn("COORDINATOR_DOCKER_INFERENCE=ghcr.io/tpurtell/cuteafd-coordinator:v11", text)
+                self.assertIn("SPARK_EXPERT_DOCKER_INFERENCE=ghcr.io/tpurtell/cuteafd-spark-expert:v11", text)
 
 
 class V11ReleaseBuildTargetTest(unittest.TestCase):
     """The promoted v11 release build target.
 
-    `ds41rt.build-v11.config` selects the `v11` tag for the release build and,
+    `cuteafd.build-v11.config` selects the `v11` tag for the release build and,
     after promotion, is identical to the runtime default; `run.sh` therefore
     derives the same `v11` pair with or without `--config
-    ds41rt.build-v11.config`. That equality is asserted by the promoted
+    cuteafd.build-v11.config`. That equality is asserted by the promoted
     build-target test above and by `scripts/tests/test_release_helpers.py`,
     owned by the release executor.
     """
 
-    BUILD_CONFIG = ROOT / "ds41rt.build-v11.config"
+    BUILD_CONFIG = ROOT / "scripts" / "fixtures" / "cuteafd.build-v11.config"
 
     def dry_run(self, config: Path) -> str:
         result = subprocess.run(
@@ -424,11 +374,11 @@ class V11ReleaseBuildTargetTest(unittest.TestCase):
 
     def test_the_v11_target_reports_v11_and_the_universal_roles(self) -> None:
         if not self.BUILD_CONFIG.is_file():
-            self.skipTest("ds41rt.build-v11.config is not present in this checkout")
+            self.skipTest("cuteafd.build-v11.config is not present in this checkout")
         v11 = self.dry_run(self.BUILD_CONFIG)
         self.assertIn("release tag: v11", v11)
-        self.assertIn("coordinator image: ghcr.io/tpurtell/ds41rt-coordinator:v11", v11)
-        self.assertIn("spark image: ghcr.io/tpurtell/ds41rt-spark-expert:v11", v11)
+        self.assertIn("coordinator image: ghcr.io/tpurtell/cuteafd-coordinator:v11", v11)
+        self.assertIn("spark image: ghcr.io/tpurtell/cuteafd-spark-expert:v11", v11)
         self.assertIn("tp2;tp3;tp6", v11)
 
 

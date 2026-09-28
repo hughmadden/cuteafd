@@ -17,7 +17,7 @@ def main():
     torch.cuda.set_device(args.device)
     torch.manual_seed(41512)
     lib=C.CDLL(str(args.native_lib))
-    top=lib.ds41rt_v41_index_top512
+    top=lib.cuteafd_v41_index_top512
     top.argtypes=[C.c_void_p]*4+[C.c_uint64,C.c_void_p]+[C.c_int32]*3+[C.c_void_p]
     top.restype=C.c_int32
     stream=torch.cuda.Stream()

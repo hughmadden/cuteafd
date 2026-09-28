@@ -17,8 +17,8 @@ def main():
     args = parser.parse_args()
     lib = C.CDLL(args.native_lib)
     ptr = C.c_void_p
-    lib.ds41rt_v41_expert_packed_sizes.argtypes = [C.c_uint32, C.POINTER(C.c_uint64)]
-    lib.ds41rt_v41_pack_expert_async.argtypes = [C.POINTER(ptr), C.POINTER(ptr), C.c_uint32, ptr]
+    lib.cuteafd_v41_expert_packed_sizes.argtypes = [C.c_uint32, C.POINTER(C.c_uint64)]
+    lib.cuteafd_v41_pack_expert_async.argtypes = [C.POINTER(ptr), C.POINTER(ptr), C.c_uint32, ptr]
     results = []
     for device in range(min(2, torch.cuda.device_count())):
         with torch.cuda.device(device):
@@ -33,7 +33,7 @@ def main():
                 source += [torch.randint(0, 248, (*s[:-1], s[-1] // 16), device="cuda", dtype=torch.uint8)
                            for s in shapes]
                 sizes = (C.c_uint64 * 4)()
-                assert lib.ds41rt_v41_expert_packed_sizes(n, sizes) == 0
+                assert lib.cuteafd_v41_expert_packed_sizes(n, sizes) == 0
                 expected = [
                     pack_weight(torch.cat([source[1], source[0]], 1), size_k=h, size_n=2*n, gated_half_rows=n),
                     pack_scale(torch.cat([source[4], source[3]], 1), weight_E=1, rows=2*n, k_dim=h, gated_half_rows=n),
@@ -41,7 +41,7 @@ def main():
                     pack_scale(source[5].clone(), weight_E=1, rows=h, k_dim=n),
                 ]
                 output = [torch.full((size + 32,), 205, device="cuda", dtype=torch.uint8) for size in sizes]
-                assert lib.ds41rt_v41_pack_expert_async(
+                assert lib.cuteafd_v41_pack_expert_async(
                     (ptr * 6)(*[s.data_ptr() for s in source]),
                     (ptr * 4)(*[s.data_ptr() for s in output]), n,
                     torch.cuda.current_stream().cuda_stream) == 0

@@ -1,5 +1,5 @@
 {
-  "schema": "ds41rt.tp-ep-reuse-fixture.v1",
+  "schema": "cuteafd.tp-ep-reuse-fixture.v1",
   "label": "M64 E384 deterministic reuse fixture (distribution-representative, not expert-ID faithful)",
   "provenance": {
     "observed_source": "runs/tp-ep-preflight/g2-live/profile/tp4 counting segment M=64 (PROFILE-INTERPRETATION.md)",

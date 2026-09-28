@@ -21,10 +21,10 @@ BASE_REPO = 'wrldsuksgo2mars/DeepSeek-V4.1-EXL3-K3.25-v1'
 BASE_COMMIT = 'cfd4ca1d1934a8e81dd2d7515598d4ce288e8b88'
 REPO = 'wrldsuksgo2mars/DeepSeek-V4.1-EXL3-K3.25-FP4PLE-v1'
 HF = Path('/home/tj/.cache/huggingface')
-BASE = HF / 'ds41rt-exports/DeepSeek-V4.1-EXL3-K3.25-v1-numbered'
-BASE_STATE = Path('/home/tj/.cache/ds41rt/quantization/deepseek-v41-exl3-k325-v1/export-state/numbered-shards-v1')
-ROOT = Path('/home/tj/.cache/ds41rt/quantization/deepseek-v41-exl3-k325-fp4ple-v1')
-OUTPUT = HF / 'ds41rt-exports/DeepSeek-V4.1-EXL3-K3.25-FP4PLE-v1'
+BASE = HF / 'cuteafd-exports/DeepSeek-V4.1-EXL3-K3.25-v1-numbered'
+BASE_STATE = Path('/home/tj/.cache/cuteafd/quantization/deepseek-v41-exl3-k325-v1/export-state/numbered-shards-v1')
+ROOT = Path('/home/tj/.cache/cuteafd/quantization/deepseek-v41-exl3-k325-fp4ple-v1')
+OUTPUT = HF / 'cuteafd-exports/DeepSeek-V4.1-EXL3-K3.25-FP4PLE-v1'
 CHUNK_ROWS = 262144  # 64 MiB source weights; total chunk storage < 128 MiB.
 
 
@@ -250,7 +250,7 @@ def assemble(receipt, tables):
             total += item['data_offsets'][1]-item['data_offsets'][0]
     index['metadata']['total_size'] = total
     _publish_json(OUTPUT/'model.safetensors.index.json',index)
-    description = dict(schema='ds41rt.nvfp4-ple.v1',format='nvfp4',block_size=16,
+    description = dict(schema='cuteafd.nvfp4-ple.v1',format='nvfp4',block_size=16,
         packing='even-element-low-nibble',scale_layout='row-major',
         reconstruction='E2M1(weight) * FP8_E4M3(weight_scale) * FP32(weight_scale_2)',
         source_repo=BASE_REPO,source_revision=BASE_COMMIT,
@@ -259,8 +259,8 @@ def assemble(receipt, tables):
             weight_dtype='uint8',weight_scale_dtype='float8_e4m3fn',weight_scale_2_dtype='float32',
             global_scale=t['global_scale']) for t in tables},
         numerical_validation='one-row-per-table-only; whole-model validation deferred')
-    config=load(BASE/'config.json'); config['ds41rt_ple_quantization']=description
-    external=load(BASE/'quantize_config.json'); external['meta']['ds41rt']['ple_quantization']=description
+    config=load(BASE/'config.json'); config['cuteafd_ple_quantization']=description
+    external=load(BASE/'quantize_config.json'); external['meta']['cuteafd']['ple_quantization']=description
     _publish_json(OUTPUT/'config.json',config); _publish_json(OUTPUT/'quantize_config.json',external)
     card = f'''---
 license: mit
@@ -287,7 +287,7 @@ Each PLE has packed E2M1 `weight` [rows,128] uint8 (even element low nibble),
 `weight_scale` [rows,16] FP8 E4M3, and scalar FP32 `weight_scale_2`.
 The original logical shape is [rows,256], with contiguous 16-element blocks.
 Decode as E2M1 times the block scale times the global scale. Scales are stored
-row-major, not GPU-kernel-swizzled. Config `ds41rt_ple_quantization` and
+row-major, not GPU-kernel-swizzled. Config `cuteafd_ple_quantization` and
 `quantize_config.json` metadata describe this representation explicitly.
 No other non-routed tensors were changed. Source code/license/tokenizer assets
 are retained from the base model; `README.source.md` is the original source card.
@@ -306,7 +306,7 @@ alongside the base EXL3/native formats; standard safetensors is not a claim of
 stock-engine execution support.
 
 Conversion implementation and reproducible process:
-https://github.com/tpurtell/ds41rt/tree/main/quantization
+https://github.com/tpurtell/cuteafd/tree/main/quantization
 '''
     path=OUTPUT/'README.md'
     if path.exists() and path.read_text()!=card:
@@ -390,7 +390,7 @@ def publish(base_receipt,reused,changed):
             parent_commit=parent['commit'],commit_message='Publish CPU-quantized NVFP4 PLE variant; reuse base weights server-side').oid
     if _remote(api,REPO,commit)!=expected:
         raise ValueError('published variant differs')
-    receipt=dict(schema='ds41rt-upload-receipt-v1',status='uploaded',repo_id=REPO,commit=commit,files=prepared)
+    receipt=dict(schema='cuteafd-upload-receipt-v1',status='uploaded',repo_id=REPO,commit=commit,files=prepared)
     _publish_json(ROOT/'upload-complete.json',receipt)
     owner=ROOT.stat()
     cached=materialize_cache(OUTPUT,HF/'hub',receipt,owner=(owner.st_uid,owner.st_gid))

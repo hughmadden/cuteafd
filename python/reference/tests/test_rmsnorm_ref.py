@@ -2,7 +2,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from ds41rt_reference.rmsnorm_ref import rmsnorm
+from cuteafd_reference.rmsnorm_ref import rmsnorm
 
 
 def test_rmsnorm_matches_manual_formula():

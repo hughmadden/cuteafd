@@ -19,7 +19,7 @@ def main():
     torch.cuda.set_device(a.device)
     libraries = [C.CDLL(x) for x in (a.baseline, a.candidate)]
     results = []
-    for k, limit, name in [(512, 1048576, 'ds41rt_v41_index_top512'), (2048, 131072, 'ds41rt_v41_index_top2048_blocks')]:
+    for k, limit, name in [(512, 1048576, 'cuteafd_v41_index_top512'), (2048, 131072, 'cuteafd_v41_index_top2048_blocks')]:
         fns = [getattr(lib, name) for lib in libraries]
         for fn in fns:
             fn.argtypes = [C.c_void_p]*4+[C.c_uint64, C.c_void_p]+[C.c_int32]*3+[C.c_void_p]

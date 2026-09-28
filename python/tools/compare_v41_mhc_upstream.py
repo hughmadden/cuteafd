@@ -31,15 +31,15 @@ def main():
     torch.cuda.set_device(args.device)
     torch.manual_seed(731)
     lib = C.CDLL(str(args.native.resolve()))
-    lib.ds41rt_v41_hc_mixes_workspace.argtypes = [C.c_void_p]*8 + [C.c_uint64, C.c_int32, C.c_void_p]
-    lib.ds41rt_v41_hc_pre.argtypes = [C.c_void_p]*3 + [C.c_int32, C.c_void_p]
-    lib.ds41rt_cuda_ds4_rmsnorm_bf16_rne_async.argtypes = [C.c_void_p]*3 + [C.c_int, C.c_int, C.c_float, C.c_void_p]
-    assert lib.ds41rt_v41_hc_project_initialize() == 0
+    lib.cuteafd_v41_hc_mixes_workspace.argtypes = [C.c_void_p]*8 + [C.c_uint64, C.c_int32, C.c_void_p]
+    lib.cuteafd_v41_hc_pre.argtypes = [C.c_void_p]*3 + [C.c_int32, C.c_void_p]
+    lib.cuteafd_cuda_ds4_rmsnorm_bf16_rne_async.argtypes = [C.c_void_p]*3 + [C.c_int, C.c_int, C.c_float, C.c_void_p]
+    assert lib.cuteafd_v41_hc_project_initialize() == 0
     aot = C.CDLL(str(args.aot.resolve())) if args.aot else None
     if aot:
-        aot_launch = aot.ds41rt_v41_hc_begin if args.native_bridge else aot.launch
+        aot_launch = aot.cuteafd_v41_hc_begin if args.native_bridge else aot.launch
         aot_launch.argtypes = [C.c_void_p]*11 + ([C.c_uint64] if args.native_bridge else []) + [C.c_int32,C.c_void_p]
-        initialize = aot.ds41rt_v41_hc_project_initialize if args.native_bridge else aot.initialize
+        initialize = aot.cuteafd_v41_hc_project_initialize if args.native_bridge else aot.initialize
         assert initialize() == 0
         assert initialize() == 0
     report = {'scope': 'Native begin versus upstream prepared lagged pre; warm component diagnostic, not serving',
@@ -89,11 +89,11 @@ def main():
                 return mhc.run_pre(residual,fn,scale,bias,binding=binding,**opts)
             def native():
                 stream = torch.cuda.current_stream().cuda_stream
-                assert lib.ds41rt_v41_hc_mixes_workspace(
+                assert lib.cuteafd_v41_hc_mixes_workspace(
                     *[t.data_ptr() for t in (residual,fn,scale,bias,native_pre,native_post,native_comb,collapsed)],
                     collapsed.numel()*2, rows, stream) == 0
-                assert lib.ds41rt_v41_hc_pre(residual.data_ptr(),incoming.data_ptr(),collapsed.data_ptr(),rows,stream) == 0
-                assert lib.ds41rt_cuda_ds4_rmsnorm_bf16_rne_async(collapsed.data_ptr(),weight.data_ptr(),normalized.data_ptr(),rows,5120,1e-20,stream) == 0
+                assert lib.cuteafd_v41_hc_pre(residual.data_ptr(),incoming.data_ptr(),collapsed.data_ptr(),rows,stream) == 0
+                assert lib.cuteafd_cuda_ds4_rmsnorm_bf16_rne_async(collapsed.data_ptr(),weight.data_ptr(),normalized.data_ptr(),rows,5120,1e-20,stream) == 0
             actual = upstream()
             torch.cuda.synchronize()
             graphs = {}

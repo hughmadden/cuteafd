@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the DS41RT replicated-expert-group tests or benchmark against the pinned
+# Run the CUTEAFD replicated-expert-group tests or benchmark against the pinned
 # SparkInfer source WITHOUT dirtying it or importing an unverified copy.
 #
 # Why this exists
@@ -21,16 +21,16 @@
 #
 #   scripts/run-tp-ep-kernel-checks.sh test  [pytest args...]
 #   scripts/run-tp-ep-kernel-checks.sh bench [benchmark args...]
-#   DS41RT_NATIVE_BUILD_DIR=<dir> scripts/run-tp-ep-kernel-checks.sh gpu-check
+#   CUTEAFD_NATIVE_BUILD_DIR=<dir> scripts/run-tp-ep-kernel-checks.sh gpu-check
 #
 # `test` runs the CPU contract tests (including the TP6 exporter/pack oracle)
 # against the verified pinned tree. `gpu-check` runs the native CMake selftests
-# on a real CUDA device with DS41RT_REQUIRE_CUDA=1, so a pass is `Passed` and a
+# on a real CUDA device with CUTEAFD_REQUIRE_CUDA=1, so a pass is `Passed` and a
 # missing device is a failure rather than a skip.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-pin="${DS41RT_SPARKINFER_SOURCE_DIR:-$repo_root/third_party/sparkinfer}"
+pin="${CUTEAFD_SPARKINFER_SOURCE_DIR:-$repo_root/third_party/sparkinfer}"
 lock="$repo_root/third_party/sparkinfer.lock.json"
 
 [[ -d "$pin" ]] || { echo "SparkInfer checkout missing at $pin" >&2; exit 2; }
@@ -41,7 +41,7 @@ lock="$repo_root/third_party/sparkinfer.lock.json"
 # Fail closed on source drift before importing anything. The release build runs
 # this same check, so the harness stays on the same contract. Verification is
 # never skipped and never weakened; to run against a different copy, point
-# DS41RT_SPARKINFER_SOURCE_DIR at a complete, lock-matching tree.
+# CUTEAFD_SPARKINFER_SOURCE_DIR at a complete, lock-matching tree.
 echo "== verifying SparkInfer at $pin against $(basename "$lock")"
 python3 "$repo_root/scripts/verify-sparkinfer-source.py" \
   --source "$pin" --lock "$lock"
@@ -51,7 +51,7 @@ python3 "$repo_root/scripts/verify-sparkinfer-source.py" \
 # anywhere else -- so python/tools must be importable and the pin is no longer
 # load-bearing by convention. It is still listed first so tests.moe cannot be
 # shadowed by python/reference/tests before the resolver runs.
-export DS41RT_SPARKINFER_SOURCE_DIR="$pin"
+export CUTEAFD_SPARKINFER_SOURCE_DIR="$pin"
 export PYTHONPATH="$pin:$repo_root/python/tools:$repo_root/python/reference:$repo_root/python${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONDONTWRITEBYTECODE=1
 
@@ -98,20 +98,20 @@ case "$mode" in
     ;;
   gpu-check)
     # Device-level native checks. These MUST run on a CUDA host and must not
-    # skip: DS41RT_REQUIRE_CUDA turns a missing device into a failure, so the
+    # skip: CUTEAFD_REQUIRE_CUDA turns a missing device into a failure, so the
     # ctest result is "Passed", never "Skipped (77)".
-    build_dir="${DS41RT_NATIVE_BUILD_DIR:-}"
+    build_dir="${CUTEAFD_NATIVE_BUILD_DIR:-}"
     [[ -n "$build_dir" && -d "$build_dir" ]] || {
-      echo "DS41RT_NATIVE_BUILD_DIR must name a configured native build dir" >&2
+      echo "CUTEAFD_NATIVE_BUILD_DIR must name a configured native build dir" >&2
       exit 2; }
-    export DS41RT_REQUIRE_CUDA=1
+    export CUTEAFD_REQUIRE_CUDA=1
     # Run ctest in this shell (not via exec) so its status is the script's
     # status, and fail when the filter matches nothing instead of reporting a
     # vacuous success. ctest's "no tests matched" status varies by version, so
     # the selected-test count is checked explicitly rather than inferred.
     set +e
     output="$(ctest --test-dir "$build_dir" --output-on-failure \
-      -R 'ds41rt_v41_(expert_pack_geometry|expert_pack_tp3|route_reduce_planes)_selftest' 2>&1)"
+      -R 'cuteafd_v41_(expert_pack_geometry|expert_pack_tp3|route_reduce_planes)_selftest' 2>&1)"
     status=$?
     set -e
     printf '%s\n' "$output"

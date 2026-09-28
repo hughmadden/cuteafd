@@ -44,12 +44,12 @@ def main():
             status = fn(*values)
             assert status == 0, (name,status)
         return call
-    info_fn = bind('ds41rt_v41_fp8_matrix_info',[I,I,I,C.POINTER(Info)])
-    init = bind('ds41rt_v41_fp8_matrix_initialize',[I,I,I,C.POINTER(P)])
-    pack = bind('ds41rt_v41_fp8_matrix_pack_scales',[P,P,I,I,P])
-    storage = bind('ds41rt_v41_fp8_initialize_scratch',[P,P,C.c_uint64,P,P])
-    linear = bind('ds41rt_v41_fp8_launch',[P,P,P,P,P,C.c_uint64,P,P,I,P])
-    reduce = bind('ds41rt_v41_fp8_reduce_splits',[P,P,I,I,I,P])
+    info_fn = bind('cuteafd_v41_fp8_matrix_info',[I,I,I,C.POINTER(Info)])
+    init = bind('cuteafd_v41_fp8_matrix_initialize',[I,I,I,C.POINTER(P)])
+    pack = bind('cuteafd_v41_fp8_matrix_pack_scales',[P,P,I,I,P])
+    storage = bind('cuteafd_v41_fp8_initialize_scratch',[P,P,C.c_uint64,P,P])
+    linear = bind('cuteafd_v41_fp8_launch',[P,P,P,P,P,C.c_uint64,P,P,I,P])
+    reduce = bind('cuteafd_v41_fp8_reduce_splits',[P,P,I,I,I,P])
     def stream(): return torch.cuda.current_stream().cuda_stream
     def ptr(address,dtype): return make_ptr(dtype,address,cute.AddressSpace.gmem,assumed_align=16)
     mapping = json.loads((args.snapshot/'model.safetensors.index.json').read_text())['weight_map']

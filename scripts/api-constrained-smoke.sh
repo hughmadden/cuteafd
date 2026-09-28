@@ -7,7 +7,7 @@
 # exact-output assertions below fail even though constrained decoding is working.
 # That behaviour was observed on the published v8 images for both the 1x and 2x
 # official layouts (retained as a negative result in the v9 baseline evidence,
-# ~/.cache/ds41rt-v9-baseline/raw/CONTAMINATED/ and clean-*/api-constrained-smoke.txt).
+# ~/.cache/cuteafd-v9-baseline/raw/CONTAMINATED/ and clean-*/api-constrained-smoke.txt).
 # The checks themselves are unchanged: exact structured output, exact streamed
 # tool arguments and the strict-schema 400 rejection are all still enforced.
 set -euo pipefail

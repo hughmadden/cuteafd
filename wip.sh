@@ -15,7 +15,7 @@ runs coordinator slots. The first configured Spark builds Spark slots, which
 are copied directly and concurrently to the other persistent Spark WIP
 containers.
 An explicit SPARK_TP=2/3/6 topology builds the matching opt-in SM121 expert role;
-DS41RT_WIP_SPARK_TP_ROLES=tp2;tp3;tp6 overrides that selection. The default
+CUTEAFD_WIP_SPARK_TP_ROLES=tp2;tp3;tp6 overrides that selection. The default
 configuration builds no extra role and keeps the historical Spark TP4 shard.
 --dry-run prints the resolved hosts, role plan and build invocations without
 touching Docker, SSH or any container.
@@ -29,7 +29,7 @@ creating them again from the configured development images.
 EOF
 }
 
-config="$repo_root/ds41rt.config"
+config="$repo_root/cuteafd.config"
 slot=current
 role=both
 from_slot=
@@ -97,7 +97,7 @@ wip_target_hosts=("${wip_hosts[@]:1}")
 # Opt-in replicated-group Spark expert roles for the WIP slot. The default and
 # explicit TP4xEP1 build no extra role; an explicit TP2/TP3/TP6 topology selects
 # the matching SM121 role.
-wip_spark_tp_roles="${DS41RT_WIP_SPARK_TP_ROLES:-}"
+wip_spark_tp_roles="${CUTEAFD_WIP_SPARK_TP_ROLES:-}"
 if [[ -z "$wip_spark_tp_roles" ]] && release_spark_topology_explicit; then
   case "$SPARK_TP" in
     2) wip_spark_tp_roles=tp2 ;;
@@ -111,7 +111,7 @@ if [[ -n "$wip_spark_tp_roles" ]]; then
   for wip_spark_tp_role in "${wip_spark_tp_role_list[@]}"; do
     case "$wip_spark_tp_role" in
       tp2|tp3|tp6) ;;
-      *) release_die "DS41RT_WIP_SPARK_TP_ROLES accepts only tp2, tp3 and tp6, got: $wip_spark_tp_role" ;;
+      *) release_die "CUTEAFD_WIP_SPARK_TP_ROLES accepts only tp2, tp3 and tp6, got: $wip_spark_tp_role" ;;
     esac
   done
   unset wip_spark_tp_role wip_spark_tp_role_list
@@ -125,17 +125,17 @@ if ((dry_run)); then
   echo "  seed host: $seed_host"
   echo "  topology: tp=$(release_spark_tp) ep=$(release_spark_ep) explicit=$(release_spark_topology_explicit && echo 1 || echo 0)"
   echo "  V41 Spark expert roles: ${wip_spark_tp_roles:-<legacy TP4 only>}"
-  echo "  EXL3 AOT: ${DS41RT_WIP_EXL3_AOT:-ON}; NVFP4 AOT: ${DS41RT_WIP_NVFP4_AOT:-ON}"
+  echo "  EXL3 AOT: ${CUTEAFD_WIP_EXL3_AOT:-ON}; NVFP4 AOT: ${CUTEAFD_WIP_NVFP4_AOT:-ON}"
   exit 0
 fi
 
 docker info >/dev/null 2>&1 || release_die "local Docker daemon is unavailable"
 release_resolve_coordinator_gpu_identity
 
-coordinator_container=ds41rt-coordinator-wip
-spark_container=ds41rt-spark-expert-wip
+coordinator_container=cuteafd-coordinator-wip
+spark_container=cuteafd-spark-expert-wip
 seed_host="$SPARK_0_HOST"
-state_dir="$repo_root/.ds41rt-wip"
+state_dir="$repo_root/.cuteafd-wip"
 staging_dir="$state_dir/source-staging"
 hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
 mkdir -p "$state_dir" "$hf_home"
@@ -144,9 +144,9 @@ snapshot_args=(
   -a --delete --delete-excluded
   --exclude .git --exclude '.venv*/' --exclude .mypy_cache/
   --exclude .pytest_cache/ --exclude .ruff_cache/ --exclude __pycache__/
-  --exclude '*.pyc' --exclude '*.pyo' --exclude .ds41rt-cache/
-  --exclude .ds41rt-release/ --exclude .ds41rt-release-image/
-  --exclude .ds41rt-wip/ --exclude dist/ --exclude rust/target/
+  --exclude '*.pyc' --exclude '*.pyo' --exclude .cuteafd-cache/
+  --exclude .cuteafd-release/ --exclude .cuteafd-release-image/
+  --exclude .cuteafd-wip/ --exclude dist/ --exclude rust/target/
   --exclude 'native/build*/'
 )
 
@@ -154,8 +154,8 @@ echo "== freezing current checkout for WIP slot $slot =="
 mkdir -p "$staging_dir"
 rsync "${snapshot_args[@]}" "$repo_root/" "$staging_dir/"
 # The selected complete configuration is part of the slot, even when the
-# caller chose a file other than the repository's default ds41rt.config.
-install -m 0644 "$RELEASE_CONFIG" "$staging_dir/ds41rt.config"
+# caller chose a file other than the repository's default cuteafd.config.
+install -m 0644 "$RELEASE_CONFIG" "$staging_dir/cuteafd.config"
 python3 "$staging_dir/scripts/verify-sparkinfer-source.py" \
   --source "$staging_dir/third_party/sparkinfer" \
   --lock "$staging_dir/third_party/sparkinfer.lock.json"
@@ -354,7 +354,7 @@ if [[ "$role" == coordinator && -n "$from_slot" ]]; then
     echo "== preserving resident Spark experts during coordinator-only build =="
   fi
 elif wip_coordinator_processes_active || wip_expert_processes_active; then
-  release_die "a WIP DS41RT process is active; stop it before synchronizing or building"
+  release_die "a WIP CUTEAFD process is active; stop it before synchronizing or building"
 fi
 
 if [[ -n "$from_slot" ]]; then
@@ -398,7 +398,7 @@ sync_local_source() {
 
 sync_seed_source() {
   local remote_staging
-  remote_staging="$(ssh -o BatchMode=yes "$seed_host" 'printf "%s/.ds41rt-wip-source-staging" "$HOME"')"
+  remote_staging="$(ssh -o BatchMode=yes "$seed_host" 'printf "%s/.cuteafd-wip-source-staging" "$HOME"')"
   local sync=rsync
   if command -v rdmasync >/dev/null 2>&1 && ssh -o BatchMode=yes "$seed_host" 'command -v rdmasync >/dev/null'; then
     sync=rdmasync
@@ -419,8 +419,8 @@ build_coordinator() {
   local image_id
   image_id="$(docker image inspect -f '{{.Id}}' "$COORDINATOR_DOCKER_DEV")"
   docker exec \
-    -e "DS41RT_WIP_EXL3_AOT=${DS41RT_WIP_EXL3_AOT:-ON}" \
-    -e "DS41RT_WIP_NVFP4_AOT=${DS41RT_WIP_NVFP4_AOT:-ON}" \
+    -e "CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}" \
+    -e "CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}" \
     "$coordinator_container" \
     /wip/source/scripts/build-wip-artifacts.sh \
     /wip/source coordinator 120 /wip/build/coordinator /wip/output/coordinator
@@ -438,7 +438,7 @@ build_expert() {
   # The role list and build-scope opt-ins travel inside a single quoted remote
   # command so a `tp2;tp3` value is never split by the remote shell.
   ssh -o BatchMode=yes "$seed_host" \
-    "docker exec -e 'DS41RT_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'DS41RT_WIP_EXL3_AOT=${DS41RT_WIP_EXL3_AOT:-ON}' -e 'DS41RT_WIP_NVFP4_AOT=${DS41RT_WIP_NVFP4_AOT:-ON}' '$spark_container' /wip/source/scripts/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
+    "docker exec -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' '$spark_container' /wip/source/scripts/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
   ssh -o BatchMode=yes "$seed_host" docker exec "$spark_container" \
     /wip/source/scripts/finalize-wip-slot.sh \
     /wip/source spark-expert "$slot" /wip/output/expert \
@@ -490,13 +490,13 @@ docker exec -i "$coordinator_container" bash -s -- "$slot" <<'CONTAINER'
 set -euo pipefail
 slot="$1"
 test -s "/wip/slots/$slot/coordinator/FINGERPRINT"
-test -s "/wip/slots/$slot/coordinator/workspace/ds41rt.config"
+test -s "/wip/slots/$slot/coordinator/workspace/cuteafd.config"
 CONTAINER
 ssh -o BatchMode=yes "$seed_host" docker exec -i "$spark_container" bash -s -- "$slot" <<'CONTAINER'
 set -euo pipefail
 slot="$1"
 test -s "/wip/slots/$slot/spark-expert/FINGERPRINT"
-test -s "/wip/slots/$slot/spark-expert/workspace/ds41rt.config"
+test -s "/wip/slots/$slot/spark-expert/workspace/cuteafd.config"
 CONTAINER
 
 distribute_expert_slot() {

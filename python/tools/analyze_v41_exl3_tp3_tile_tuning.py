@@ -188,13 +188,13 @@ def summarize(lane: Path):
                           rule=f'wins every cell by >{REQUIRED_MARGIN_PCT}% with rep spread <={NOISE_FLOOR_PCT}%',
                           default_holds=consistent is None,
                           note='no promotion: this is tuning evidence, never a serving-config change')
-    summary = dict(schema='ds41rt.tp3-tile-tuning-summary-v1', lane=str(lane),
-                   ds41rt_commit=manifest.get('ds41rt_commit'), lane_status=lane_status,
+    summary = dict(schema='cuteafd.tp3-tile-tuning-summary-v1', lane=str(lane),
+                   cuteafd_commit=manifest.get('cuteafd_commit'), lane_status=lane_status,
                    runs=len(runs),
                    problems=problems, clean=not problems, cells=table, recommendation=recommendation)
     (lane / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     lines = [f'# TP3 tile tuning — {lane.name}', '',
-             f'- runs: {len(runs)}  clean: **{summary["clean"]}**  commit: `{manifest.get("ds41rt_commit")}`',
+             f'- runs: {len(runs)}  clean: **{summary["clean"]}**  commit: `{manifest.get("cuteafd_commit")}`',
              f'- recommendation: {recommendation["candidate"] or "keep production planner default"}', '']
     for row in table:
         lines.append(f"## cell {row['cell']['intermediate']}/{row['cell']['slice_start']} cap{row['cell']['capacity']}"

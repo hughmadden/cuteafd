@@ -28,7 +28,7 @@ def main():
     reference = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(reference)
     lib = C.CDLL(str(args.native_lib))
-    pack = lib.ds41rt_v41_index_pack
+    pack = lib.cuteafd_v41_index_pack
     pack.argtypes = [C.c_void_p, C.c_void_p, C.c_void_p, C.c_int32, C.c_void_p]
     pack.restype = C.c_int32
     torch.cuda.set_device(args.device)

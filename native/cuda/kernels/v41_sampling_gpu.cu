@@ -1,11 +1,11 @@
-/* ds41rt v4.1 GPU target-sampler, chunk 1: mask application, finiteness
+/* cuteafd v4.1 GPU target-sampler, chunk 1: mask application, finiteness
  * discipline, temperature scaling, scaled maximum, min_p survivor count and the
  * greedy / constrained-greedy device argmax (K1).
  *
  * See `v41_sampling_gpu.h` for the device ABI and
  * `docs/gpu-sampling-design.md` §4.0-§4.1, §5, §11, §12.1-§12.2, §14 chunk 1 for
  * the contract. The CPU sampler in
- * `rust/crates/ds41rt-core/src/target_sampling.rs` is the correctness oracle and
+ * `rust/crates/cuteafd-core/src/target_sampling.rs` is the correctness oracle and
  * is deliberately untouched.
  *
  * Shared invariants honoured here (design §4.0):
@@ -39,34 +39,34 @@
 
 /* Chunk 2 selects the K2 cross-segment combine. The shipped default is the
  * fixed-tree segmented scan of design §4.2/§4.8; defining
- * `DS41RT_V41_K2_SEQUENTIAL_COMBINE=1` compiles/launches the strictly sequential
+ * `CUTEAFD_V41_K2_SEQUENTIAL_COMBINE=1` compiles/launches the strictly sequential
  * token-order combine of §6.5.3 instead. Both kernels are always compiled; the
  * macro only chooses which one the entry point launches, so the chunk-2
  * measurement can build the same source both ways. This is a build-time knob,
  * never an ABI field: the parameter block stays exactly 64 B and the flag bits
  * are unchanged. */
-#ifndef DS41RT_V41_K2_SEQUENTIAL_COMBINE
-#define DS41RT_V41_K2_SEQUENTIAL_COMBINE 0
+#ifndef CUTEAFD_V41_K2_SEQUENTIAL_COMBINE
+#define CUTEAFD_V41_K2_SEQUENTIAL_COMBINE 0
 #endif
 
 /* Chunk 2's expf experiment also measures a double-precision `exp`-then-round
  * weight. It is a *measurement* variant only: the shipped default is CUDA
- * `expf`. `DS41RT_V41_K2_WEIGHT_DOUBLE=1` selects the double path so its token
+ * `expf`. `CUTEAFD_V41_K2_WEIGHT_DOUBLE=1` selects the double path so its token
  * and latency can be compared against the host's glibc `expf` (design §6.3b). */
-#ifndef DS41RT_V41_K2_WEIGHT_DOUBLE
-#define DS41RT_V41_K2_WEIGHT_DOUBLE 0
+#ifndef CUTEAFD_V41_K2_WEIGHT_DOUBLE
+#define CUTEAFD_V41_K2_WEIGHT_DOUBLE 0
 #endif
 
-/* Measurement-only, now VESTIGIAL: `DS41RT_V41_K2_NO_WALK_TOTAL=1` used to
+/* Measurement-only, now VESTIGIAL: `CUTEAFD_V41_K2_NO_WALK_TOTAL=1` used to
  * reinstate the pre-fix K2 `total` (the tree scan's inclusive prefix) so the
  * chunk-2 latency harness could isolate the owner walk. Chunk 3b's fix removes
  * the owner walk and the tree scan together and derives `total` from the
  * sequential segment prefix `C(kSamplerBlock)`, so the macro no longer selects any
  * code path. It is kept defined only so existing measurement build scripts that
- * pass `-DDS41RT_V41_K2_NO_WALK_TOTAL=1` still compile; the shipped default is
+ * pass `-DCUTEAFD_V41_K2_NO_WALK_TOTAL=1` still compile; the shipped default is
  * and always was 0. */
-#ifndef DS41RT_V41_K2_NO_WALK_TOTAL
-#define DS41RT_V41_K2_NO_WALK_TOTAL 0
+#ifndef CUTEAFD_V41_K2_NO_WALK_TOTAL
+#define CUTEAFD_V41_K2_NO_WALK_TOTAL 0
 #endif
 
 /* Chunk-3b mass arithmetic selector. The **shipped default is 1**: K5 performs
@@ -79,23 +79,23 @@
  * 25.903 %, because the retained prefix becomes bit-identical to the CPU's
  * `nucleus_mass` accumulation.
  *
- * Defining `DS41RT_V41_K5_NORMALIZED_MASS=0` selects the algebraic rewrite
+ * Defining `CUTEAFD_V41_K5_NORMALIZED_MASS=0` selects the algebraic rewrite
  * instead: the search predicates run on the **un-normalized** weight sums and
  * the threshold is `fl(top_p * total)`, so no probe performs a per-token
  * division. The two forms are equal in real arithmetic but not in f32; the 0
  * variant is kept for the report's A/B measurement and for a caller that wants
  * the division-free form. It is a build-time knob, never an ABI field. */
-#ifndef DS41RT_V41_K5_NORMALIZED_MASS
-#define DS41RT_V41_K5_NORMALIZED_MASS 1
+#ifndef CUTEAFD_V41_K5_NORMALIZED_MASS
+#define CUTEAFD_V41_K5_NORMALIZED_MASS 1
 #endif
 
 namespace {
 
 /* `kSamplerBlock` is the sampler's per-row CTA width; the knob, its shipped
  * default and the reason for it live in `v41_sampling_gpu.h`
- * (`DS41RT_V41_SAMPLER_BLOCK`) so the device selftest's host model reads the
+ * (`CUTEAFD_V41_SAMPLER_BLOCK`) so the device selftest's host model reads the
  * same definition. */
-constexpr int kSamplerBlock = DS41RT_V41_SAMPLER_CTA;
+constexpr int kSamplerBlock = CUTEAFD_V41_SAMPLER_CTA;
 static_assert(kSamplerBlock % 32 == 0, "sampler CTA width must be a warp multiple");
 
 /* One CTA per row. Per-thread state lives in registers; the reductions use
@@ -110,7 +110,7 @@ struct Shared {
   uint32_t nonfinite[kSamplerBlock];/* lowest offending token id, or NO_DETAIL */
 };
 
-__device__ __forceinline__ bool row_allowed(const ds41rt_v41_sampler_row_t& row,
+__device__ __forceinline__ bool row_allowed(const cuteafd_v41_sampler_row_t& row,
                                             const uint32_t* mask_words,
                                             size_t mask_words_per_row, size_t mask_rows,
                                             size_t token) {
@@ -123,8 +123,8 @@ __device__ __forceinline__ bool row_allowed(const ds41rt_v41_sampler_row_t& row,
    * values cannot be reported through the frozen status codes, so the kernel
    * chooses the memory-safe fallback instead of reading `mask_row * words` past
    * the arena. The host-side validator still rejects such a row outright. */
-  if ((row.flags & DS41RT_V41_SAMPLER_FLAG_NO_MASK) != 0u ||
-      row.mask_row == DS41RT_V41_SAMPLER_NO_MASK_ROW || mask_words == nullptr ||
+  if ((row.flags & CUTEAFD_V41_SAMPLER_FLAG_NO_MASK) != 0u ||
+      row.mask_row == CUTEAFD_V41_SAMPLER_NO_MASK_ROW || mask_words == nullptr ||
       static_cast<size_t>(row.mask_row) >= mask_rows) {
     return true;
   }
@@ -237,10 +237,10 @@ __device__ __forceinline__ void tree_argmax(float* scores, uint32_t* ids, int ti
  */
 __global__ void v41_sample_prepare_kernel(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const ds41rt_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, uint32_t* out_indices, uint32_t* out_status,
     uint32_t* out_status_detail, float* out_scores, float* out_total,
-    uint32_t* out_nucleus_count, ds41rt_v41_sampler_scratch_t* scratch) {
+    uint32_t* out_nucleus_count, cuteafd_v41_sampler_scratch_t* scratch) {
   __shared__ Shared shared;
 
   const size_t block_row = blockIdx.x;
@@ -249,7 +249,7 @@ __global__ void v41_sample_prepare_kernel(
     return;
   }
 
-  const ds41rt_v41_sampler_row_t row = params[block_row];
+  const cuteafd_v41_sampler_row_t row = params[block_row];
   const size_t output_row = static_cast<size_t>(row.output_row);
   const float* row_logits = logits + block_row * logits_stride;
 
@@ -257,7 +257,7 @@ __global__ void v41_sample_prepare_kernel(
    * silently turn a stochastic row greedy. `top_k == 1` is greedy even at a
    * sampling temperature (contract §7.1.2). */
   const bool greedy = (row.temperature < 1e-5f) || (row.top_k == 1u) ||
-      ((row.flags & DS41RT_V41_SAMPLER_FLAG_GREEDY) != 0u);
+      ((row.flags & CUTEAFD_V41_SAMPLER_FLAG_GREEDY) != 0u);
   const float inv_temperature = greedy ? 0.0f : (1.0f / row.temperature);
   /* `STRICT_FINITE` adds a whole-row finiteness precondition to a row that
    * would otherwise take the permissive stochastic branch. It is an *addition*,
@@ -266,24 +266,24 @@ __global__ void v41_sample_prepare_kernel(
    * matters for the shared reduction below, which selects
    * `greedy ? argmax_allowed : allowed_count` — a flag-driven second writer of
    * `argmax_allowed` on a stochastic row would reduce a zero count. */
-  const bool strict = (row.flags & DS41RT_V41_SAMPLER_FLAG_STRICT_FINITE) != 0u;
+  const bool strict = (row.flags & CUTEAFD_V41_SAMPLER_FLAG_STRICT_FINITE) != 0u;
 
   /* Mask width is validated once, before any logit is read, mirroring
    * `target_sampling.rs:222-230` and the FFI validator. */
-  uint32_t mask_status = DS41RT_V41_SAMPLER_STATUS_OK;
+  uint32_t mask_status = CUTEAFD_V41_SAMPLER_STATUS_OK;
   if (mask_words == nullptr) {
     if (mask_words_per_row != 0u) {
-      mask_status = DS41RT_V41_SAMPLER_STATUS_MASK_WIDTH;
+      mask_status = CUTEAFD_V41_SAMPLER_STATUS_MASK_WIDTH;
     }
   } else if (mask_words_per_row != ((vocab + 31u) / 32u)) {
-    mask_status = DS41RT_V41_SAMPLER_STATUS_MASK_WIDTH;
+    mask_status = CUTEAFD_V41_SAMPLER_STATUS_MASK_WIDTH;
   }
-  if (mask_status != DS41RT_V41_SAMPLER_STATUS_OK) {
+  if (mask_status != CUTEAFD_V41_SAMPLER_STATUS_OK) {
     if (tid == 0) {
-      ds41rt_v41_sampler_scratch_t value = {};
+      cuteafd_v41_sampler_scratch_t value = {};
       value.status = mask_status;
       value.status_detail = static_cast<uint32_t>(mask_words_per_row);
-      value.nonfinite_token = DS41RT_V41_SAMPLER_NO_DETAIL;
+      value.nonfinite_token = CUTEAFD_V41_SAMPLER_NO_DETAIL;
       scratch[block_row] = value;
       out_status[output_row] = mask_status;
       out_status_detail[output_row] = static_cast<uint32_t>(mask_words_per_row);
@@ -300,7 +300,7 @@ __global__ void v41_sample_prepare_kernel(
    * as EMPTY_CANDIDATES, so the argmax branch still counts the allowed tokens
    * separately. */
   uint32_t argmax_allowed = 0u;
-  uint32_t nonfinite = DS41RT_V41_SAMPLER_NO_DETAIL;
+  uint32_t nonfinite = CUTEAFD_V41_SAMPLER_NO_DETAIL;
 
   if (greedy) {
     /* Strict whole-row scan: finiteness first, then the mask test. A greedy or
@@ -395,53 +395,53 @@ __global__ void v41_sample_prepare_kernel(
   }
 
   if (tid == 0) {
-    ds41rt_v41_sampler_scratch_t value = {};
+    cuteafd_v41_sampler_scratch_t value = {};
     value.max_scaled = row_max_scaled;
     value.inv_temperature = shared.inv_temperature[0];
     value.allowed_count = greedy ? 0u : row_allowed_count;
     value.survivor_count = survivor_count;
     value.nonfinite_token = lowest_nonfinite;
 
-    uint32_t status = DS41RT_V41_SAMPLER_STATUS_OK;
-    uint32_t detail = DS41RT_V41_SAMPLER_NO_DETAIL;
-    if (lowest_nonfinite != DS41RT_V41_SAMPLER_NO_DETAIL) {
-      status = DS41RT_V41_SAMPLER_STATUS_NONFINITE_LOGIT;
+    uint32_t status = CUTEAFD_V41_SAMPLER_STATUS_OK;
+    uint32_t detail = CUTEAFD_V41_SAMPLER_NO_DETAIL;
+    if (lowest_nonfinite != CUTEAFD_V41_SAMPLER_NO_DETAIL) {
+      status = CUTEAFD_V41_SAMPLER_STATUS_NONFINITE_LOGIT;
       detail = lowest_nonfinite;
     } else if (row_allowed_count == 0u) {
       /* A grammar that allows no token is reported as such, not as a
        * temperature error from the -inf maximum (`target_sampling.rs:440-444`). */
-      status = DS41RT_V41_SAMPLER_STATUS_EMPTY_CANDIDATES;
+      status = CUTEAFD_V41_SAMPLER_STATUS_EMPTY_CANDIDATES;
     } else if (!greedy && !isfinite(row_max_scaled)) {
-      status = DS41RT_V41_SAMPLER_STATUS_INVALID_TEMPERATURE;
+      status = CUTEAFD_V41_SAMPLER_STATUS_INVALID_TEMPERATURE;
     } else if (!greedy && !isfinite(row.top_p)) {
       /* `top_p = NaN` (or any non-finite value) makes K2's `top_p >= 1.0` and
        * K5's `top_p < 1.0` both false, so without this the row would keep the
        * caller's sentinel while the entry point returned OK -- the K1+K2-only
-       * `ds41rt_cuda_v41_target_sample` cannot otherwise tell "sampled" from
+       * `cuteafd_cuda_v41_target_sample` cannot otherwise tell "sampled" from
        * "never ran". The FFI validator rejects a non-finite `top_p` on the host;
        * this closes the raw-C gap for every entry point that launches K1. */
-      status = DS41RT_V41_SAMPLER_STATUS_INTERNAL;
+      status = CUTEAFD_V41_SAMPLER_STATUS_INTERNAL;
     } else if (!greedy && survivor_count == 0u) {
       /* A non-greedy row with no surviving token cannot be sampled by any stage
        * (K2 and K5 both require a survivor). On a valid row the best allowed
        * token always survives (`min_p <= 1`), so this is the raw-C shape; make
        * it loud rather than leaving `out_indices` at the caller's sentinel with
        * an OK status. */
-      status = DS41RT_V41_SAMPLER_STATUS_INTERNAL;
+      status = CUTEAFD_V41_SAMPLER_STATUS_INTERNAL;
     }
     value.status = status;
     value.status_detail = detail;
     scratch[block_row] = value;
     out_status[output_row] = status;
     out_status_detail[output_row] = detail;
-    if (status == DS41RT_V41_SAMPLER_STATUS_OK) {
+    if (status == CUTEAFD_V41_SAMPLER_STATUS_OK) {
       if (greedy) {
         out_indices[output_row] = shared.id[0];
         /* The raw maximum logit, so the retained-frontier cross-check in
          * `scores.rs::from_greedy` still sees a finite score. */
         out_scores[output_row] = shared.score[0];
       }
-      if ((row.flags & DS41RT_V41_SAMPLER_FLAG_DIAGNOSE) != 0u) {
+      if ((row.flags & CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE) != 0u) {
         if (out_total != nullptr) {
           out_total[output_row] = row_max_scaled;
         }
@@ -462,20 +462,20 @@ __global__ void v41_sample_prepare_kernel(
  * K1 status is OK. A `top_k >= survivor_count` row whose top-p search still runs
  * on the CPU (`target_sampling.rs:499-522`) is deliberately NOT a fast-path row,
  * because with `top_p = 1.0` the CPU nucleus can still be a strict f32 prefix. */
-__device__ __forceinline__ bool k2_applicable(const ds41rt_v41_sampler_row_t& row,
-                                              const ds41rt_v41_sampler_scratch_t& state) {
-  if (state.status != DS41RT_V41_SAMPLER_STATUS_OK || state.survivor_count == 0u) {
+__device__ __forceinline__ bool k2_applicable(const cuteafd_v41_sampler_row_t& row,
+                                              const cuteafd_v41_sampler_scratch_t& state) {
+  if (state.status != CUTEAFD_V41_SAMPLER_STATUS_OK || state.survivor_count == 0u) {
     return false;
   }
   const bool greedy = (row.temperature < 1e-5f) || (row.top_k == 1u) ||
-      ((row.flags & DS41RT_V41_SAMPLER_FLAG_GREEDY) != 0u);
+      ((row.flags & CUTEAFD_V41_SAMPLER_FLAG_GREEDY) != 0u);
   return !greedy && row.top_k == 0u && row.top_p >= 1.0f;
 }
 
 /* The CPU's survivor predicate (`target_sampling.rs:456-458`):
  * `allowed(t) && logits[t] * inv >= min_scaled`. `logits[t] * inv` is a single
  * f32 multiply, so it is bit-identical to the CPU and to K1's own pass. */
-__device__ __forceinline__ bool k2_survivor(const ds41rt_v41_sampler_row_t& row,
+__device__ __forceinline__ bool k2_survivor(const cuteafd_v41_sampler_row_t& row,
                                             const uint32_t* mask_words,
                                             size_t mask_words_per_row, size_t mask_rows,
                                             const float* row_logits, size_t token,
@@ -494,7 +494,7 @@ __device__ __forceinline__ bool k2_survivor(const ds41rt_v41_sampler_row_t& row,
 __device__ __forceinline__ float k2_weight(const float* row_logits, size_t token,
                                            float inv_temperature, float max_scaled) {
   const float delta = __fsub_rn(__fmul_rn(row_logits[token], inv_temperature), max_scaled);
-#if DS41RT_V41_K2_WEIGHT_DOUBLE
+#if CUTEAFD_V41_K2_WEIGHT_DOUBLE
   return static_cast<float>(exp(static_cast<double>(delta)));
 #else
   return expf(delta);
@@ -522,9 +522,9 @@ __device__ __forceinline__ float k2_weight(const float* row_logits, size_t token
  * comparison is inclusive (`target <= cumulative`), matching the CPU. */
 [[maybe_unused]] __global__ void v41_sample_categorical_kernel(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const ds41rt_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, uint32_t* out_indices, float* out_total,
-    ds41rt_v41_sampler_scratch_t* scratch) {
+    cuteafd_v41_sampler_scratch_t* scratch) {
   __shared__ float inclusive[kSamplerBlock];
   __shared__ uint32_t hits[kSamplerBlock];
   __shared__ uint32_t lasts[kSamplerBlock];
@@ -535,8 +535,8 @@ __device__ __forceinline__ float k2_weight(const float* row_logits, size_t token
   if (block_row >= rows) {
     return;
   }
-  const ds41rt_v41_sampler_row_t row = params[block_row];
-  const ds41rt_v41_sampler_scratch_t state = scratch[block_row];
+  const cuteafd_v41_sampler_row_t row = params[block_row];
+  const cuteafd_v41_sampler_scratch_t state = scratch[block_row];
   if (!k2_applicable(row, state)) {
     return;
   }
@@ -552,8 +552,8 @@ __device__ __forceinline__ float k2_weight(const float* row_logits, size_t token
 
   /* The draw: the same `(seed, position)`-keyed SplitMix64 uniform as the CPU,
    * then the same `[0, MAX_UNIFORM]` clamp (design §6.1/§4.8). */
-  const float uniform = ds41rt_v41_target_clamp_uniform(
-      ds41rt_v41_target_uniform(row.seed, row.position));
+  const float uniform = cuteafd_v41_target_clamp_uniform(
+      cuteafd_v41_target_uniform(row.seed, row.position));
 
   /* Contiguous `[begin, end)` segment for this thread, in the fixed row shape. */
   const size_t per_thread = (vocab + kSamplerBlock - 1) / kSamplerBlock;
@@ -656,8 +656,8 @@ __device__ __forceinline__ float k2_weight(const float* row_logits, size_t token
   const bool zero_target = (target == 0.0f);
   const bool may_report = zero_target || (start < target);
   float cumulative = start;
-  uint32_t first_hit = DS41RT_V41_SAMPLER_NO_DETAIL;
-  uint32_t first_positive = DS41RT_V41_SAMPLER_NO_DETAIL;
+  uint32_t first_hit = CUTEAFD_V41_SAMPLER_NO_DETAIL;
+  uint32_t first_positive = CUTEAFD_V41_SAMPLER_NO_DETAIL;
   if (may_report) {
     for (size_t token = begin; token < end; ++token) {
       if (!k2_survivor(row, mask_words, mask_words_per_row, rows, row_logits, token,
@@ -667,15 +667,15 @@ __device__ __forceinline__ float k2_weight(const float* row_logits, size_t token
       const float weight = k2_weight(row_logits, token, inv_temperature, max_scaled);
       const float before = cumulative;
       cumulative += weight;
-      if (weight > 0.0f && first_positive == DS41RT_V41_SAMPLER_NO_DETAIL) {
+      if (weight > 0.0f && first_positive == CUTEAFD_V41_SAMPLER_NO_DETAIL) {
         first_positive = static_cast<uint32_t>(token);
       }
-      if (first_hit == DS41RT_V41_SAMPLER_NO_DETAIL && target <= cumulative &&
+      if (first_hit == CUTEAFD_V41_SAMPLER_NO_DETAIL && target <= cumulative &&
           (zero_target || before < target)) {
         first_hit = static_cast<uint32_t>(token);
       }
     }
-    if (first_hit == DS41RT_V41_SAMPLER_NO_DETAIL && !zero_target &&
+    if (first_hit == CUTEAFD_V41_SAMPLER_NO_DETAIL && !zero_target &&
         start < target && end_prefix >= target) {
       first_hit = first_positive;
     }
@@ -683,35 +683,35 @@ __device__ __forceinline__ float k2_weight(const float* row_logits, size_t token
   hits[tid] = first_hit;
   __syncthreads();
   const uint32_t crossing = tree_min_u32(hits, tid);
-  const uint32_t selected = (crossing != DS41RT_V41_SAMPLER_NO_DETAIL)
+  const uint32_t selected = (crossing != CUTEAFD_V41_SAMPLER_NO_DETAIL)
       ? crossing
       : global_last_survivor;
 
-  if (tid == 0 && selected != DS41RT_V41_SAMPLER_NO_DETAIL) {
+  if (tid == 0 && selected != CUTEAFD_V41_SAMPLER_NO_DETAIL) {
     out_indices[output_row] = selected;
-    if ((row.flags & DS41RT_V41_SAMPLER_FLAG_DIAGNOSE) != 0u && out_total != nullptr) {
+    if ((row.flags & CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE) != 0u && out_total != nullptr) {
       out_total[output_row] = total;
     }
   }
 }
 
 /* K2, strictly sequential token-order combine (design §6.5.3 option, selected
- * only by `DS41RT_V41_K2_SEQUENTIAL_COMBINE=1`). One thread walks the whole row
+ * only by `CUTEAFD_V41_K2_SEQUENTIAL_COMBINE=1`). One thread walks the whole row
  * twice in ascending token order with the exact CPU expression, so with
  * bit-identical weights it reproduces the CPU's cumulative comparison bit for
  * bit and `expf` (§6.3b) is the only remaining residual. This exists to be
  * measured against the tree combine; it is deliberately serial. */
 [[maybe_unused]] __global__ void v41_sample_categorical_sequential_kernel(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const ds41rt_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, uint32_t* out_indices, float* out_total,
-    ds41rt_v41_sampler_scratch_t* scratch) {
+    cuteafd_v41_sampler_scratch_t* scratch) {
   const size_t block_row = blockIdx.x;
   if (block_row >= rows || threadIdx.x != 0) {
     return;
   }
-  const ds41rt_v41_sampler_row_t row = params[block_row];
-  const ds41rt_v41_sampler_scratch_t state = scratch[block_row];
+  const cuteafd_v41_sampler_row_t row = params[block_row];
+  const cuteafd_v41_sampler_scratch_t state = scratch[block_row];
   if (!k2_applicable(row, state)) {
     return;
   }
@@ -722,8 +722,8 @@ __device__ __forceinline__ float k2_weight(const float* row_logits, size_t token
   const float min_scaled = (row.min_p > 0.0f)
       ? max_scaled + row.ln_min_p
       : -CUDART_INF_F;
-  const float uniform = ds41rt_v41_target_clamp_uniform(
-      ds41rt_v41_target_uniform(row.seed, row.position));
+  const float uniform = cuteafd_v41_target_clamp_uniform(
+      cuteafd_v41_target_uniform(row.seed, row.position));
 
   float total = 0.0f;
   for (size_t token = 0; token < vocab; ++token) {
@@ -735,8 +735,8 @@ __device__ __forceinline__ float k2_weight(const float* row_logits, size_t token
   total = fmaxf(total, 1.0e-20f);
   const float target = uniform * total;
   float cumulative = 0.0f;
-  uint32_t selected = DS41RT_V41_SAMPLER_NO_DETAIL;
-  uint32_t last_survivor = DS41RT_V41_SAMPLER_NO_DETAIL;
+  uint32_t selected = CUTEAFD_V41_SAMPLER_NO_DETAIL;
+  uint32_t last_survivor = CUTEAFD_V41_SAMPLER_NO_DETAIL;
   for (size_t token = 0; token < vocab; ++token) {
     if (!k2_survivor(row, mask_words, mask_words_per_row, rows, row_logits, token,
                      inv_temperature, min_scaled)) {
@@ -749,12 +749,12 @@ __device__ __forceinline__ float k2_weight(const float* row_logits, size_t token
       break;
     }
   }
-  if (selected == DS41RT_V41_SAMPLER_NO_DETAIL) {
+  if (selected == CUTEAFD_V41_SAMPLER_NO_DETAIL) {
     selected = last_survivor;
   }
-  if (selected != DS41RT_V41_SAMPLER_NO_DETAIL) {
+  if (selected != CUTEAFD_V41_SAMPLER_NO_DETAIL) {
     out_indices[output_row] = selected;
-    if ((row.flags & DS41RT_V41_SAMPLER_FLAG_DIAGNOSE) != 0u && out_total != nullptr) {
+    if ((row.flags & CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE) != 0u && out_total != nullptr) {
       out_total[output_row] = total;
     }
   }
@@ -794,7 +794,7 @@ __device__ __forceinline__ float k3_scaled(const float* row_logits, size_t token
  * `target_sampling.rs:456-458`: `allowed(t) && scaled(t) >= min_scaled`. A
  * masked-out token is never read, so a masked non-finite logit stays legal on a
  * stochastic row (§4.0/§12.6). */
-__device__ __forceinline__ bool k3_survivor(const ds41rt_v41_sampler_row_t& row,
+__device__ __forceinline__ bool k3_survivor(const cuteafd_v41_sampler_row_t& row,
                                             const uint32_t* mask_words,
                                             size_t mask_words_per_row, size_t mask_rows,
                                             const float* row_logits, size_t token,
@@ -811,20 +811,20 @@ __device__ __forceinline__ bool k3_survivor(const ds41rt_v41_sampler_row_t& row,
  *   - `top_k >= survivor_count` truncates nothing and is a no-op, so K5 must
  *     treat the retained set as all survivors there.
  * A greedy row never reaches here: the CPU short-circuits it at `:234-236`. */
-__device__ __forceinline__ bool k3_eligible(const ds41rt_v41_sampler_row_t& row,
-                                            const ds41rt_v41_sampler_scratch_t& state) {
-  if (state.status != DS41RT_V41_SAMPLER_STATUS_OK || state.survivor_count == 0u) {
+__device__ __forceinline__ bool k3_eligible(const cuteafd_v41_sampler_row_t& row,
+                                            const cuteafd_v41_sampler_scratch_t& state) {
+  if (state.status != CUTEAFD_V41_SAMPLER_STATUS_OK || state.survivor_count == 0u) {
     return false;
   }
   const bool greedy = (row.temperature < 1e-5f) || (row.top_k == 1u) ||
-      ((row.flags & DS41RT_V41_SAMPLER_FLAG_GREEDY) != 0u);
+      ((row.flags & CUTEAFD_V41_SAMPLER_FLAG_GREEDY) != 0u);
   return !greedy && row.top_k != 0u && row.top_k < state.survivor_count;
 }
 
 /* Exactly the `k3_survivor` predicate K1, K2, K4 and K5 use. */
 __device__ __forceinline__ uint32_t k3_masked_key(const float* row_logits, size_t token,
                                                   float inv_temperature) {
-  return ds41rt_v41_order_key(k3_scaled(row_logits, token, inv_temperature));
+  return cuteafd_v41_order_key(k3_scaled(row_logits, token, inv_temperature));
 }
 
 /* One histogram pass over the row's survivors, binning `(key >> shift)`.
@@ -838,7 +838,7 @@ __device__ __forceinline__ uint32_t k3_masked_key(const float* row_logits, size_
  * `lo`/`hi` are an inclusive-exclusive key interval: only survivors whose key is
  * inside it are binned, which is what lets a later pass refine the interval. */
 __device__ __forceinline__ void k3_hist_pass(
-    const ds41rt_v41_sampler_row_t& row, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t& row, const uint32_t* mask_words,
     size_t mask_words_per_row, size_t mask_rows, const float* row_logits, size_t vocab,
     float inv_temperature, float min_scaled, uint32_t lo, uint32_t hi, uint32_t shift,
     uint32_t bin_mask, uint32_t* bins, int tid) {
@@ -854,7 +854,7 @@ __device__ __forceinline__ void k3_hist_pass(
       continue;
     }
     const uint32_t key =
-        ds41rt_v41_order_key(k3_scaled(row_logits, token, inv_temperature));
+        cuteafd_v41_order_key(k3_scaled(row_logits, token, inv_temperature));
     if (key < lo || key >= hi) {
       continue;
     }
@@ -920,9 +920,9 @@ __device__ __forceinline__ bool k3_hist_localize(
  * tie cut admits the lowest-id equals. */
 __global__ void v41_sample_topk_pivot_kernel(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const ds41rt_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, uint32_t* out_pivot_passes,
-    ds41rt_v41_sampler_scratch_t* scratch) {
+    cuteafd_v41_sampler_scratch_t* scratch) {
   __shared__ uint32_t bins[4096];
 
   const size_t block_row = blockIdx.x;
@@ -930,8 +930,8 @@ __global__ void v41_sample_topk_pivot_kernel(
   if (block_row >= rows) {
     return;
   }
-  const ds41rt_v41_sampler_row_t row = params[block_row];
-  const ds41rt_v41_sampler_scratch_t state = scratch[block_row];
+  const cuteafd_v41_sampler_row_t row = params[block_row];
+  const cuteafd_v41_sampler_scratch_t state = scratch[block_row];
   if (!k3_eligible(row, state)) {
     if (tid == 0 && out_pivot_passes != nullptr) {
       out_pivot_passes[row.output_row] = 0u;
@@ -999,13 +999,13 @@ __global__ void v41_sample_topk_pivot_kernel(
   }
 
   if (tid == 0) {
-    ds41rt_v41_sampler_scratch_t value = state;
+    cuteafd_v41_sampler_scratch_t value = state;
     if (!ok || !exact || kth_key == 0xFFFFFFFFu) {
-      value.status = DS41RT_V41_SAMPLER_STATUS_INTERNAL;
+      value.status = CUTEAFD_V41_SAMPLER_STATUS_INTERNAL;
       value.kth_value_bits = 0u;
       value.above_count = 0u;
     } else {
-      value.kth_value_bits = __float_as_uint(ds41rt_v41_ordered_value(kth_key));
+      value.kth_value_bits = __float_as_uint(cuteafd_v41_ordered_value(kth_key));
       value.above_count = above;
     }
     scratch[block_row] = value;
@@ -1016,7 +1016,7 @@ __global__ void v41_sample_topk_pivot_kernel(
 }
 /* K4, `v41_sample_topk_membership_kernel` (design §4.4, Appendix A.2).
  *
- * Membership is ds41rt's exact-k rule (`target_sampling.rs:30-33`):
+ * Membership is cuteafd's exact-k rule (`target_sampling.rs:30-33`):
  *   `{order_key > kth} ∪ {the lowest-id (k - above_count) survivors with
  *    order_key == kth}`.
  * A single pass over `[0, vocab)` in `kSamplerBlock` contiguous segments gives each
@@ -1045,10 +1045,10 @@ __global__ void v41_sample_topk_pivot_kernel(
  * raw-C-caller safety net. */
 __global__ void v41_sample_topk_membership_kernel(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const ds41rt_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, uint32_t* rank_order_ids,
     uint64_t* rank_order_scratch, size_t rank_order_capacity,
-    uint32_t* out_retained_count, ds41rt_v41_sampler_scratch_t* scratch) {
+    uint32_t* out_retained_count, cuteafd_v41_sampler_scratch_t* scratch) {
   __shared__ uint32_t equal_counts[kSamplerBlock];
   __shared__ uint32_t above_counts[kSamplerBlock];
   __shared__ uint32_t retained_counts[kSamplerBlock];
@@ -1058,8 +1058,8 @@ __global__ void v41_sample_topk_membership_kernel(
   if (block_row >= rows) {
     return;
   }
-  const ds41rt_v41_sampler_row_t row = params[block_row];
-  const ds41rt_v41_sampler_scratch_t state = scratch[block_row];
+  const cuteafd_v41_sampler_row_t row = params[block_row];
+  const cuteafd_v41_sampler_scratch_t state = scratch[block_row];
   if (!k3_eligible(row, state)) {
     if (tid == 0 && out_retained_count != nullptr) {
       out_retained_count[row.output_row] = 0u;
@@ -1071,7 +1071,7 @@ __global__ void v41_sample_topk_membership_kernel(
   const float min_scaled = (row.min_p > 0.0f)
       ? state.max_scaled + row.ln_min_p
       : -CUDART_INF_F;
-  const uint32_t kth_key = ds41rt_v41_order_key(__uint_as_float(state.kth_value_bits));
+  const uint32_t kth_key = cuteafd_v41_order_key(__uint_as_float(state.kth_value_bits));
   const float* row_logits = logits + block_row * logits_stride;
 
   /* Contiguous `[begin, end)` segment, the shape the tie prefix's token order
@@ -1091,7 +1091,7 @@ __global__ void v41_sample_topk_membership_kernel(
       continue;
     }
     const uint32_t key =
-        ds41rt_v41_order_key(k3_scaled(row_logits, token, inv_temperature));
+        cuteafd_v41_order_key(k3_scaled(row_logits, token, inv_temperature));
     if (key > kth_key) {
       ++local_above;
     } else if (key == kth_key) {
@@ -1132,7 +1132,7 @@ __global__ void v41_sample_topk_membership_kernel(
         continue;
       }
       const uint32_t key =
-          ds41rt_v41_order_key(k3_scaled(row_logits, token, inv_temperature));
+          cuteafd_v41_order_key(k3_scaled(row_logits, token, inv_temperature));
       if (key > kth_key) {
         row_entries[write] = (static_cast<uint64_t>(key) << 32) |
                              static_cast<uint32_t>(token);
@@ -1168,7 +1168,7 @@ __global__ void v41_sample_topk_membership_kernel(
   }
 
   if (tid == 0) {
-    ds41rt_v41_sampler_scratch_t value = state;
+    cuteafd_v41_sampler_scratch_t value = state;
     /* K4 recomputes `C_gt(kth)` from its own pass, so the published
      * `above_count` is self-consistent with the materialized membership even if
      * K3's probe count and this pass were to disagree. */
@@ -1206,13 +1206,13 @@ __device__ __forceinline__ float k5_weight(const float* row_logits, size_t token
  *     `top_k == 0 && top_p < 1.0` is the ordered top-p-only branch. The only
  *     row left out is the disjoint K2 fast path (`top_k == 0 && top_p >= 1.0`,
  *     `target_sampling.rs:463-466`), which K2 already sampled. */
-__device__ __forceinline__ bool k5_ordered(const ds41rt_v41_sampler_row_t& row,
-                                           const ds41rt_v41_sampler_scratch_t& state) {
-  if (state.status != DS41RT_V41_SAMPLER_STATUS_OK || state.survivor_count == 0u) {
+__device__ __forceinline__ bool k5_ordered(const cuteafd_v41_sampler_row_t& row,
+                                           const cuteafd_v41_sampler_scratch_t& state) {
+  if (state.status != CUTEAFD_V41_SAMPLER_STATUS_OK || state.survivor_count == 0u) {
     return false;
   }
   const bool greedy = (row.temperature < 1.0e-5f) || (row.top_k == 1u) ||
-      ((row.flags & DS41RT_V41_SAMPLER_FLAG_GREEDY) != 0u);
+      ((row.flags & CUTEAFD_V41_SAMPLER_FLAG_GREEDY) != 0u);
   return !greedy && (row.top_k != 0u || row.top_p < 1.0f);
 }
 
@@ -1248,7 +1248,7 @@ __device__ __forceinline__ bool k5_ordered(const ds41rt_v41_sampler_row_t& row,
  * Ids are 32-bit in the key, but only ids `< vocab` exist, so the tie search
  * only ever probes ids below `vocab`. */
 __device__ __forceinline__ float k5_key_mass(
-    const ds41rt_v41_sampler_row_t& row, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t& row, const uint32_t* mask_words,
     size_t mask_words_per_row, size_t mask_rows, const float* row_logits, size_t vocab,
     float inv_temperature, float max_scaled, float min_scaled, uint32_t value,
     uint32_t id_bound, float divisor, float* phase, uint32_t* count_scratch,
@@ -1262,10 +1262,10 @@ __device__ __forceinline__ float k5_key_mass(
       continue;
     }
     const uint32_t key =
-        ds41rt_v41_order_key(k3_scaled(row_logits, token, inv_temperature));
+        cuteafd_v41_order_key(k3_scaled(row_logits, token, inv_temperature));
     if (key > value || (key == value && static_cast<uint32_t>(token) <= id_bound)) {
       const float weight = k5_weight(row_logits, token, inv_temperature, max_scaled);
-#if DS41RT_V41_K5_NORMALIZED_MASS
+#if CUTEAFD_V41_K5_NORMALIZED_MASS
       /* The CPU's per-token normalization (`target_sampling.rs:540-542`): one f32
        * division per in-set token. The caller passes `divisor == 1.0f` for the
        * pass that *derives* the total and `divisor == total` for every later
@@ -1315,7 +1315,7 @@ __device__ __forceinline__ float k5_key_mass(
  * caller never reaches this pass in that case: K1 publishes
  * `survivor_count == 0`). */
 __device__ __forceinline__ void k5_key_range(
-    const ds41rt_v41_sampler_row_t& row, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t& row, const uint32_t* mask_words,
     size_t mask_words_per_row, size_t mask_rows, const float* row_logits, size_t vocab,
     float inv_temperature, float min_scaled, uint32_t* min_max, int tid) {
   uint32_t local_min = 0xFFFFFFFFu;
@@ -1328,7 +1328,7 @@ __device__ __forceinline__ void k5_key_range(
       continue;
     }
     const uint32_t key =
-        ds41rt_v41_order_key(k3_scaled(row_logits, token, inv_temperature));
+        cuteafd_v41_order_key(k3_scaled(row_logits, token, inv_temperature));
     if (key < local_min) {
       local_min = key;
       local_worst_id = static_cast<uint32_t>(token);
@@ -1422,7 +1422,7 @@ __device__ __forceinline__ void k5_warp_add_count(
  * The three radix digits use an 11/11/10 split. `state` and `bins` are
  * shared across the CTA; every exit is uniform. */
 __device__ __forceinline__ bool k5_radix_value(
-    const ds41rt_v41_sampler_row_t& row, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t& row, const uint32_t* mask_words,
     size_t mask_words_per_row, size_t rows, const float* row_logits, size_t vocab,
     float inv_temperature, float max_scaled, float min_scaled, float top_p,
     unsigned long long requested_target, unsigned long long* bins,
@@ -1497,7 +1497,7 @@ __device__ __forceinline__ bool k5_radix_value(
  * ascending token-id order with three count histograms, including sparse masks
  * and arbitrary vocab widths. */
 __device__ __forceinline__ bool k5_radix_tie_id(
-    const ds41rt_v41_sampler_row_t& row, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t& row, const uint32_t* mask_words,
     size_t mask_words_per_row, size_t rows, const float* row_logits, size_t vocab,
     float inv_temperature, float min_scaled, uint32_t value, unsigned long long nth,
     unsigned long long* bins, unsigned long long* state, int tid, uint32_t* out_id) {
@@ -1562,7 +1562,7 @@ __device__ __forceinline__ bool k5_radix_tie_id(
  * fallback and for the draw is unreachable (`M(K_p) = nucleus_mass >= target`,
  * and both are read from the same accumulation). */
 __device__ __forceinline__ void k5_largest_key_with_mass(
-    const ds41rt_v41_sampler_row_t& row, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t& row, const uint32_t* mask_words,
     size_t mask_words_per_row, size_t mask_rows, const float* row_logits, size_t vocab,
     float inv_temperature, float max_scaled, float min_scaled, float threshold,
     float divisor, uint32_t value_lo, uint32_t value_hi, uint32_t id_hi, uint32_t tie_value,
@@ -1644,14 +1644,14 @@ __device__ __forceinline__ void k5_largest_key_with_mass(
  * documented channel; `out_status[output_row]` is the SAME channel K1 uses, so a
  * caller that only reads the returned status now sees the failure too. */
 __device__ __forceinline__ void k5_mark_internal(
-    ds41rt_v41_sampler_scratch_t* scratch, size_t block_row, size_t output_row,
+    cuteafd_v41_sampler_scratch_t* scratch, size_t block_row, size_t output_row,
     uint32_t* out_status, int tid) {
   if (tid == 0) {
-    ds41rt_v41_sampler_scratch_t value = scratch[block_row];
-    value.status = DS41RT_V41_SAMPLER_STATUS_INTERNAL;
+    cuteafd_v41_sampler_scratch_t value = scratch[block_row];
+    value.status = CUTEAFD_V41_SAMPLER_STATUS_INTERNAL;
     scratch[block_row] = value;
     if (out_status != nullptr) {
-      out_status[output_row] = DS41RT_V41_SAMPLER_STATUS_INTERNAL;
+      out_status[output_row] = CUTEAFD_V41_SAMPLER_STATUS_INTERNAL;
     }
   }
 }
@@ -1661,7 +1661,7 @@ __device__ __forceinline__ void k5_mark_internal(
  * Weights `w_r = expf(scaled_r - max_scaled)` over `S`; `total = max(Σ w_r,
  * 1e-20f)`; the top-p boundary and the draw both run on the CPU's per-token
  * normalized masses `p_r = w_r / total` (`target_sampling.rs:540-542`). The
- * default build (`DS41RT_V41_K5_NORMALIZED_MASS=1`) accumulates those quotients
+ * default build (`CUTEAFD_V41_K5_NORMALIZED_MASS=1`) accumulates those quotients
  * directly; the `=0` build instead uses the algebraically equivalent
  * un-normalized form `Σ w_r >= threshold * total` so no probe divides. The two
  * are equal in real arithmetic only; the report's A/B measurement is why the
@@ -1700,11 +1700,11 @@ __device__ __forceinline__ void k5_mark_internal(
  * D3). */
 __global__ void v41_sample_nucleus_kernel(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const ds41rt_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, const uint32_t* rank_order_ids,
     size_t rank_order_capacity, const uint32_t* rank_retained_count,
     uint32_t* out_indices, uint32_t* out_status, float* out_total,
-    uint32_t* out_nucleus_count, ds41rt_v41_sampler_scratch_t* scratch) {
+    uint32_t* out_nucleus_count, cuteafd_v41_sampler_scratch_t* scratch) {
   union K5Workspace {
     struct {
       float weights[kSamplerBlock];
@@ -1730,12 +1730,12 @@ __global__ void v41_sample_nucleus_kernel(
   if (block_row >= rows) {
     return;
   }
-  const ds41rt_v41_sampler_row_t row = params[block_row];
-  const ds41rt_v41_sampler_scratch_t state = scratch[block_row];
+  const cuteafd_v41_sampler_row_t row = params[block_row];
+  const cuteafd_v41_sampler_scratch_t state = scratch[block_row];
   const size_t output_row = static_cast<size_t>(row.output_row);
   const bool greedy = (row.temperature < 1.0e-5f) || (row.top_k == 1u) ||
-      ((row.flags & DS41RT_V41_SAMPLER_FLAG_GREEDY) != 0u);
-  if (greedy || state.status != DS41RT_V41_SAMPLER_STATUS_OK) {
+      ((row.flags & CUTEAFD_V41_SAMPLER_FLAG_GREEDY) != 0u);
+  if (greedy || state.status != CUTEAFD_V41_SAMPLER_STATUS_OK) {
     /* Not a K5 row: K1 (or K2) already produced the token or the error status,
      * and K5 must not touch it. */
     return;
@@ -1783,8 +1783,8 @@ __global__ void v41_sample_nucleus_kernel(
       ? max_scaled + row.ln_min_p
       : -CUDART_INF_F;
   const float top_p = fminf(fmaxf(row.top_p, 1.0e-6f), 1.0f);
-  const float uniform = ds41rt_v41_target_clamp_uniform(
-      ds41rt_v41_target_uniform(row.seed, row.position));
+  const float uniform = cuteafd_v41_target_clamp_uniform(
+      cuteafd_v41_target_uniform(row.seed, row.position));
 
   /* Domain selection. K3/K4 publish `out_retained_count[r] == top_k` exactly
    * when they materialized a rank-ordered list; a no-op row (and every
@@ -1842,7 +1842,7 @@ __global__ void v41_sample_nucleus_kernel(
     (void)min_key; /* read only by the normalized-mass fallback below */
     const uint32_t worst_id = rank_counts[2];
     /* The pass that derives the total never divides (`divisor == 1.0f`); every
-     * later pass divides by it when `DS41RT_V41_K5_NORMALIZED_MASS` is set. */
+     * later pass divides by it when `CUTEAFD_V41_K5_NORMALIZED_MASS` is set. */
     const float raw_total =
         k5_key_mass(row, mask_words, mask_words_per_row, rows, row_logits, vocab,
                     inv_temperature, max_scaled, min_scaled, 0u, 0xFFFFFFFFu, 1.0f,
@@ -1852,7 +1852,7 @@ __global__ void v41_sample_nucleus_kernel(
     }
     __syncthreads();
     const float total = shared_f32;
-#if DS41RT_V41_K5_NORMALIZED_MASS
+#if CUTEAFD_V41_K5_NORMALIZED_MASS
     const float top_p_mass = top_p;
     const float divisor = total;
 #else
@@ -1891,7 +1891,7 @@ __global__ void v41_sample_nucleus_kernel(
       if (!s_found) s_id = p_id;
       if (tid == 0) {
         out_indices[output_row] = s_id;
-        if ((row.flags & DS41RT_V41_SAMPLER_FLAG_DIAGNOSE) != 0u) {
+        if ((row.flags & CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE) != 0u) {
           if (out_total != nullptr) out_total[output_row] = total;
           if (out_nucleus_count != nullptr) out_nucleus_count[output_row] = nucleus_count;
         }
@@ -1916,7 +1916,7 @@ __global__ void v41_sample_nucleus_kernel(
     }
 
     const unsigned long long p_weight = k5_fixed_weight(
-        expf(ds41rt_v41_ordered_value(p_value) - max_scaled));
+        expf(cuteafd_v41_ordered_value(p_value) - max_scaled));
     const unsigned long long p_need = p_target > p_above ? p_target - p_above : 0ull;
     const unsigned long long p_nth = p_weight == 0ull ? 0ull :
         max(1ull, (p_need + p_weight - 1ull) / p_weight);
@@ -1953,7 +1953,7 @@ __global__ void v41_sample_nucleus_kernel(
       return;
     }
     const unsigned long long s_weight = k5_fixed_weight(
-        expf(ds41rt_v41_ordered_value(s_value) - max_scaled));
+        expf(cuteafd_v41_ordered_value(s_value) - max_scaled));
     const unsigned long long s_need = s_target > s_above ? s_target - s_above : 0ull;
     const unsigned long long s_nth = s_weight == 0ull ? 0ull :
         max(1ull, (s_need + s_weight - 1ull) / s_weight);
@@ -1966,7 +1966,7 @@ __global__ void v41_sample_nucleus_kernel(
     }
     if (tid == 0) {
       out_indices[output_row] = s_id;
-      if ((row.flags & DS41RT_V41_SAMPLER_FLAG_DIAGNOSE) != 0u) {
+      if ((row.flags & CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE) != 0u) {
         if (out_total != nullptr) {
           out_total[output_row] = total;
         }
@@ -1995,7 +1995,7 @@ __global__ void v41_sample_nucleus_kernel(
    * lower bound, so the binary search's "one fixed monotone predicate"
    * assumption did not hold bit-exactly, and the crossing search and the draw
    * could read different masses for the same rank. With
-   * `DS41RT_V41_K5_NORMALIZED_MASS` the walk is the CPU's own `Sigma (w/total)`
+   * `CUTEAFD_V41_K5_NORMALIZED_MASS` the walk is the CPU's own `Sigma (w/total)`
    * in rank order, which makes the prefix bit-identical to
    * `sample_from_ranked`'s `nucleus_mass` accumulation.
    * --------------------------------------------------------------------- */
@@ -2006,7 +2006,7 @@ __global__ void v41_sample_nucleus_kernel(
     }
     raw_total = fmaxf(raw_total, 1.0e-20f);
     float running = 0.0f;
-#if DS41RT_V41_K5_NORMALIZED_MASS
+#if CUTEAFD_V41_K5_NORMALIZED_MASS
     for (uint32_t rank = 0; rank < count; ++rank) {
       running += weights[rank] / raw_total;
       prefix[rank] = running;
@@ -2021,7 +2021,7 @@ __global__ void v41_sample_nucleus_kernel(
   }
   __syncthreads();
   const float total = shared_f32;
-#if DS41RT_V41_K5_NORMALIZED_MASS
+#if CUTEAFD_V41_K5_NORMALIZED_MASS
   const float top_p_mass = top_p;
 #else
   const float top_p_mass = top_p * total;
@@ -2079,7 +2079,7 @@ __global__ void v41_sample_nucleus_kernel(
 
   if (tid == 0) {
     out_indices[output_row] = rank_ids[chosen];
-    if ((row.flags & DS41RT_V41_SAMPLER_FLAG_DIAGNOSE) != 0u) {
+    if ((row.flags & CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE) != 0u) {
       if (out_total != nullptr) {
         out_total[output_row] = total;
       }
@@ -2090,101 +2090,101 @@ __global__ void v41_sample_nucleus_kernel(
   }
 }
 
-ds41rt_status_t validate_topk_select_args(
+cuteafd_status_t validate_topk_select_args(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const ds41rt_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, uint32_t* rank_order_ids,
     uint64_t* rank_order_scratch, size_t rank_order_capacity,
     uint32_t* out_retained_count, uint32_t* out_pivot_passes,
-    ds41rt_v41_sampler_scratch_t* scratch) {
+    cuteafd_v41_sampler_scratch_t* scratch) {
   if (logits == nullptr || params == nullptr || out_retained_count == nullptr ||
       out_pivot_passes == nullptr || scratch == nullptr) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   if (rows == 0 || vocab == 0 ||
       rows > static_cast<size_t>(std::numeric_limits<int>::max()) ||
       vocab > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   if (logits_stride < vocab) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   if (mask_words != nullptr && mask_words_per_row == 0) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   if (rank_order_capacity > 0u &&
       (rank_order_ids == nullptr || rank_order_scratch == nullptr)) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
-ds41rt_status_t validate_nucleus_args(
+cuteafd_status_t validate_nucleus_args(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const ds41rt_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, const uint32_t* rank_order_ids,
     size_t rank_order_capacity, const uint32_t* rank_retained_count,
-    uint32_t* out_indices, ds41rt_v41_sampler_scratch_t* scratch) {
+    uint32_t* out_indices, cuteafd_v41_sampler_scratch_t* scratch) {
   if (logits == nullptr || params == nullptr || out_indices == nullptr ||
       rank_retained_count == nullptr || scratch == nullptr) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   if (rows == 0 || vocab == 0 ||
       rows > static_cast<size_t>(std::numeric_limits<int>::max()) ||
       vocab > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   if (logits_stride < vocab) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   if (mask_words != nullptr && mask_words_per_row == 0) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   if (rank_order_capacity > 0u && rank_order_ids == nullptr) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
-ds41rt_status_t validate_args(const float* logits, size_t rows, size_t vocab,
+cuteafd_status_t validate_args(const float* logits, size_t rows, size_t vocab,
                               size_t logits_stride,
-                              const ds41rt_v41_sampler_row_t* params,
+                              const cuteafd_v41_sampler_row_t* params,
                               const uint32_t* mask_words, size_t mask_words_per_row,
                               uint32_t* out_indices, uint32_t* out_status,
                               uint32_t* out_status_detail, float* out_scores,
-                              ds41rt_v41_sampler_scratch_t* scratch) {
+                              cuteafd_v41_sampler_scratch_t* scratch) {
   if (logits == nullptr || params == nullptr || out_indices == nullptr ||
       out_status == nullptr || out_status_detail == nullptr || out_scores == nullptr ||
       scratch == nullptr) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   if (rows == 0 || vocab == 0 ||
       rows > static_cast<size_t>(std::numeric_limits<int>::max()) ||
       vocab > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   if (logits_stride < vocab) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   if (mask_words != nullptr && mask_words_per_row == 0) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
 }  // namespace
 
-extern "C" ds41rt_status_t ds41rt_cuda_v41_target_sample_async(
+extern "C" cuteafd_status_t cuteafd_cuda_v41_target_sample_async(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const ds41rt_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, uint32_t* out_indices, uint32_t* out_status,
     uint32_t* out_status_detail, float* out_scores, float* out_total,
-    uint32_t* out_nucleus_count, ds41rt_v41_sampler_scratch_t* scratch,
+    uint32_t* out_nucleus_count, cuteafd_v41_sampler_scratch_t* scratch,
     void* cuda_stream) {
-  const ds41rt_status_t valid = validate_args(
+  const cuteafd_status_t valid = validate_args(
       logits, rows, vocab, logits_stride, params, mask_words, mask_words_per_row,
       out_indices, out_status, out_status_detail, out_scores, scratch);
-  if (valid != DS41RT_STATUS_OK) {
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
@@ -2192,14 +2192,14 @@ extern "C" ds41rt_status_t ds41rt_cuda_v41_target_sample_async(
       logits, rows, vocab, logits_stride, params, mask_words, mask_words_per_row,
       out_indices, out_status, out_status_detail, out_scores, out_total,
       out_nucleus_count, scratch);
-  const ds41rt_status_t prepare = status_from_cuda(cudaGetLastError());
-  if (prepare != DS41RT_STATUS_OK) {
+  const cuteafd_status_t prepare = status_from_cuda(cudaGetLastError());
+  if (prepare != CUTEAFD_STATUS_OK) {
     return prepare;
   }
   /* K2 reads K1's `scratch` and, for fast-path rows only, publishes
    * `out_indices` (and the diagnostic `out_total`). Same stream, so K1's
    * scratch write is visible; no host synchronization is added. */
-#if DS41RT_V41_K2_SEQUENTIAL_COMBINE
+#if CUTEAFD_V41_K2_SEQUENTIAL_COMBINE
   v41_sample_categorical_sequential_kernel<<<static_cast<unsigned int>(rows), kSamplerBlock, 0,
                                              stream>>>(
       logits, rows, vocab, logits_stride, params, mask_words, mask_words_per_row,
@@ -2212,17 +2212,17 @@ extern "C" ds41rt_status_t ds41rt_cuda_v41_target_sample_async(
   return status_from_cuda(cudaGetLastError());
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_v41_target_sample(
+extern "C" cuteafd_status_t cuteafd_cuda_v41_target_sample(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const ds41rt_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, uint32_t* out_indices, uint32_t* out_status,
     uint32_t* out_status_detail, float* out_scores, float* out_total,
-    uint32_t* out_nucleus_count, ds41rt_v41_sampler_scratch_t* scratch) {
-  const ds41rt_status_t status = ds41rt_cuda_v41_target_sample_async(
+    uint32_t* out_nucleus_count, cuteafd_v41_sampler_scratch_t* scratch) {
+  const cuteafd_status_t status = cuteafd_cuda_v41_target_sample_async(
       logits, rows, vocab, logits_stride, params, mask_words, mask_words_per_row,
       out_indices, out_status, out_status_detail, out_scores, out_total,
       out_nucleus_count, scratch, nullptr);
-  if (status != DS41RT_STATUS_OK) {
+  if (status != CUTEAFD_STATUS_OK) {
     return status;
   }
   return status_from_cuda(cudaStreamSynchronize(nullptr));
@@ -2232,26 +2232,26 @@ extern "C" ds41rt_status_t ds41rt_cuda_v41_target_sample(
  * exactly as K2 does. Purely additive — the K1/K2 entry points above are
  * unchanged, so the chunk-1/chunk-2 production path and its daemon caller do not
  * move. See the rank-order contract in `v41_sampling_gpu.h`. */
-extern "C" ds41rt_status_t ds41rt_cuda_v41_topk_select_async(
+extern "C" cuteafd_status_t cuteafd_cuda_v41_topk_select_async(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const ds41rt_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, uint32_t* rank_order_ids,
     uint64_t* rank_order_scratch, size_t rank_order_capacity,
     uint32_t* out_retained_count, uint32_t* out_pivot_passes,
-    ds41rt_v41_sampler_scratch_t* scratch, void* cuda_stream) {
-  const ds41rt_status_t valid = validate_topk_select_args(
+    cuteafd_v41_sampler_scratch_t* scratch, void* cuda_stream) {
+  const cuteafd_status_t valid = validate_topk_select_args(
       logits, rows, vocab, logits_stride, params, mask_words, mask_words_per_row,
       rank_order_ids, rank_order_scratch, rank_order_capacity, out_retained_count,
       out_pivot_passes, scratch);
-  if (valid != DS41RT_STATUS_OK) {
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   v41_sample_topk_pivot_kernel<<<static_cast<unsigned int>(rows), kSamplerBlock, 0, stream>>>(
       logits, rows, vocab, logits_stride, params, mask_words, mask_words_per_row,
       out_pivot_passes, scratch);
-  const ds41rt_status_t pivot = status_from_cuda(cudaGetLastError());
-  if (pivot != DS41RT_STATUS_OK) {
+  const cuteafd_status_t pivot = status_from_cuda(cudaGetLastError());
+  if (pivot != CUTEAFD_STATUS_OK) {
     return pivot;
   }
   v41_sample_topk_membership_kernel<<<static_cast<unsigned int>(rows), kSamplerBlock, 0,
@@ -2262,18 +2262,18 @@ extern "C" ds41rt_status_t ds41rt_cuda_v41_topk_select_async(
   return status_from_cuda(cudaGetLastError());
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_v41_topk_select(
+extern "C" cuteafd_status_t cuteafd_cuda_v41_topk_select(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const ds41rt_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, uint32_t* rank_order_ids,
     uint64_t* rank_order_scratch, size_t rank_order_capacity,
     uint32_t* out_retained_count, uint32_t* out_pivot_passes,
-    ds41rt_v41_sampler_scratch_t* scratch) {
-  const ds41rt_status_t status = ds41rt_cuda_v41_topk_select_async(
+    cuteafd_v41_sampler_scratch_t* scratch) {
+  const cuteafd_status_t status = cuteafd_cuda_v41_topk_select_async(
       logits, rows, vocab, logits_stride, params, mask_words, mask_words_per_row,
       rank_order_ids, rank_order_scratch, rank_order_capacity, out_retained_count,
       out_pivot_passes, scratch, nullptr);
-  if (status != DS41RT_STATUS_OK) {
+  if (status != CUTEAFD_STATUS_OK) {
     return status;
   }
   return status_from_cuda(cudaStreamSynchronize(nullptr));
@@ -2284,18 +2284,18 @@ extern "C" ds41rt_status_t ds41rt_cuda_v41_topk_select(
  * K1's scratch. Purely additive -- K1, K2 and K3/K4 above are unchanged, so the
  * chunk-1..3a paths and their daemon caller do not move. See the K5 contract in
  * `v41_sampling_gpu.h`. */
-extern "C" ds41rt_status_t ds41rt_cuda_v41_nucleus_async(
+extern "C" cuteafd_status_t cuteafd_cuda_v41_nucleus_async(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const ds41rt_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, const uint32_t* rank_order_ids,
     size_t rank_order_capacity, const uint32_t* rank_retained_count,
     uint32_t* out_indices, uint32_t* out_status, float* out_total,
-    uint32_t* out_nucleus_count, ds41rt_v41_sampler_scratch_t* scratch,
+    uint32_t* out_nucleus_count, cuteafd_v41_sampler_scratch_t* scratch,
     void* cuda_stream) {
-  const ds41rt_status_t valid = validate_nucleus_args(
+  const cuteafd_status_t valid = validate_nucleus_args(
       logits, rows, vocab, logits_stride, params, mask_words, mask_words_per_row,
       rank_order_ids, rank_order_capacity, rank_retained_count, out_indices, scratch);
-  if (valid != DS41RT_STATUS_OK) {
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
@@ -2306,18 +2306,18 @@ extern "C" ds41rt_status_t ds41rt_cuda_v41_nucleus_async(
   return status_from_cuda(cudaGetLastError());
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_v41_nucleus(
+extern "C" cuteafd_status_t cuteafd_cuda_v41_nucleus(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const ds41rt_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, const uint32_t* rank_order_ids,
     size_t rank_order_capacity, const uint32_t* rank_retained_count,
     uint32_t* out_indices, uint32_t* out_status, float* out_total,
-    uint32_t* out_nucleus_count, ds41rt_v41_sampler_scratch_t* scratch) {
-  const ds41rt_status_t status = ds41rt_cuda_v41_nucleus_async(
+    uint32_t* out_nucleus_count, cuteafd_v41_sampler_scratch_t* scratch) {
+  const cuteafd_status_t status = cuteafd_cuda_v41_nucleus_async(
       logits, rows, vocab, logits_stride, params, mask_words, mask_words_per_row,
       rank_order_ids, rank_order_capacity, rank_retained_count, out_indices, out_status,
       out_total, out_nucleus_count, scratch, nullptr);
-  if (status != DS41RT_STATUS_OK) {
+  if (status != CUTEAFD_STATUS_OK) {
     return status;
   }
   return status_from_cuda(cudaStreamSynchronize(nullptr));

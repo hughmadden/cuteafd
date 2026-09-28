@@ -2,7 +2,7 @@
 #include <math_constants.h>
 #include <cub/block/block_radix_sort.cuh>
 #include <stdint.h>
-#include "ds41rt_v41_index_topk.h"
+#include "cuteafd_v41_index_topk.h"
 namespace {
 bool valid(const void* p,uint64_t n,uint64_t alignment) {
   const auto a=reinterpret_cast<uintptr_t>(p);
@@ -112,12 +112,12 @@ static int32_t select(const float* scores,const uint64_t* positions,
   return cudaGetLastError();
 }
 
-extern "C" int32_t ds41rt_v41_index_top512(const float* scores,const uint64_t* positions,
+extern "C" int32_t cuteafd_v41_index_top512(const float* scores,const uint64_t* positions,
     uint64_t* carry,void* scratch,uint64_t scratch_bytes,int32_t* output,
     int32_t queries,int32_t candidates,int32_t reset,void* stream) {
   return select<512,1048576>(scores,positions,carry,scratch,scratch_bytes,output,queries,candidates,reset,stream);
 }
-extern "C" int32_t ds41rt_v41_index_top2048_blocks(const float* scores,const uint64_t* positions,
+extern "C" int32_t cuteafd_v41_index_top2048_blocks(const float* scores,const uint64_t* positions,
     uint64_t* carry,void* scratch,uint64_t scratch_bytes,int32_t* output,
     int32_t queries,int32_t candidates,int32_t reset,void* stream) {
   return select<2048,131072>(scores,positions,carry,scratch,scratch_bytes,output,queries,candidates,reset,stream);

@@ -2,7 +2,7 @@
 # Serialize the authorized EXL3 TP3 tile-tuning matrix on ONE SM121 lane.
 #
 # This runner launches the COMMITTED, review-accepted harness
-# (ds41rt 309e9e817975d5eab51576ffae84303d786cc99b, bench_v41_exl3_tiles.py)
+# (cuteafd 309e9e817975d5eab51576ffae84303d786cc99b, bench_v41_exl3_tiles.py)
 # and enforces the freeze conditions that are deliberately NOT in the harness
 # itself:
 #   * primary matrix: ranks slice 0/768/1536 x capacity 16/80, one cell at a
@@ -77,10 +77,10 @@ for rel in ('python/tools/bench_v41_exl3_tiles.py', 'python/tools/v41_exl3_famil
     if path.is_file():
         tools[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
 files = sorted(p for p in out.iterdir() if p.suffix == '.json' and p.name != 'manifest.json')
-manifest = dict(schema='ds41rt.tp3-tile-tuning-lane-v1',
+manifest = dict(schema='cuteafd.tp3-tile-tuning-lane-v1',
                 generated_at=datetime.now(timezone.utc).isoformat(),
                 status=status, abort_reason=reason or None, aborted_cell=cell or None,
-                ds41rt_commit=commit, tools_sha256=tools, snapshot=snap,
+                cuteafd_commit=commit, tools_sha256=tools, snapshot=snap,
                 checkpoint='wrldsuksgo2mars/DeepSeek-V4.1-EXL3-K3.25-v1',
                 tier_mode='derived-no-override', repetitions_per_cell=3, serialized=True,
                 files=[dict(name=p.name, sha256=hashlib.sha256(p.read_bytes()).hexdigest())

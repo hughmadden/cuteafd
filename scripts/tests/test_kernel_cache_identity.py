@@ -82,17 +82,7 @@ def test_release_image_packages_cache_identity_helper() -> None:
     dockerfile = (ROOT / "docker" / "Dockerfile.release").read_text(encoding="utf-8")
     assert (
         "COPY scripts/kernel-cache-identity.py "
-        "/opt/ds41rt/scripts/kernel-cache-identity.py"
+        "/opt/cuteafd/scripts/kernel-cache-identity.py"
     ) in dockerfile
 
 
-def test_remote_release_launch_preserves_empty_optional_arguments() -> None:
-    launcher = (ROOT / "scripts" / "phase0-spark-tcp-bench.sh").read_text(
-        encoding="utf-8"
-    )
-    assert 'existing_container_arg="${existing_container:-__unset__}"' in launcher
-    assert 'runtime_cache_dir_arg="${runtime_cache_dir:-__unset__}"' in launcher
-    assert '"$existing_container_arg" "$prebuilt_bin"' in launcher
-    assert '"$prebuilt_native_lib" "$runtime_cache_dir_arg"' in launcher
-    assert 'if [ "$existing_container" = "__unset__" ]; then' in launcher
-    assert 'if [ "$runtime_cache_dir" = "__unset__" ]; then' in launcher

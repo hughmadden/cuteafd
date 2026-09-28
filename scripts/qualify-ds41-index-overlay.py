@@ -35,7 +35,7 @@ def main():
     torch.cuda.set_device(args.device)
     torch.manual_seed(4132128)
     lib = C.CDLL(str(args.native_lib))
-    score = lib.ds41rt_v41_index_scores_overlay
+    score = lib.cuteafd_v41_index_scores_overlay
     score.argtypes = [C.c_void_p] * 12 + [C.c_int32] * 4 + [C.c_uint64, C.c_uint64, C.c_void_p]
     score.restype = C.c_int32
     stream = torch.cuda.Stream()

@@ -17,11 +17,11 @@ Release images are universal by default: the ARM64 (SM121) Spark expert image
 carries the TP2, TP3 and TP6 replicated-group shards on top of the always-built
 TP4 shard, so one pair serves every approved native topology and ./run.sh selects
 the mode with SPARK_TP/SPARK_EP. The x86_64 coordinator image needs no Spark role.
-Set DS41RT_RELEASE_SPARK_TP_ROLES to an explicit subset (for example tp6, or empty
+Set CUTEAFD_RELEASE_SPARK_TP_ROLES to an explicit subset (for example tp6, or empty
 for the historical TP4-only shard) for a bounded topology A/B or a legacy rebuild.
 --dry-run validates the configuration, host set and role plan without touching
 Docker, SSH, submodules or any image.
-Set DS41RT_RELEASE_SSH_CONFIG to an ssh config file that every remote step should
+Set CUTEAFD_RELEASE_SSH_CONFIG to an ssh config file that every remote step should
 use (default empty: stock OpenSSH resolution, so a build host's ~/.ssh/config keeps
 working, with BatchMode forced either way). Pass /dev/null to discard a system
 ssh_config that OpenSSH refuses to read - but -F replaces the whole config chain, so
@@ -29,30 +29,30 @@ that also drops your own host aliases; prefer a file containing just
     Include ~/.ssh/config
 and pass that instead. The setting reaches ssh, rsync and rdmasync alike, and is
 exported to child build scripts.
-Set DS41RT_RELEASE_BUILD_ROOT to one unique absolute path, on a real writable
+Set CUTEAFD_RELEASE_BUILD_ROOT to one unique absolute path, on a real writable
 filesystem with room for a source copy plus objects, to hold the container build
 roots of both roles instead of their default /tmp scratch. The same path is bound
 into each container, created and filesystem-guarded on the coordinator host and the
 seed Spark before any compile, and it is per-task: never share one between builds.
-DS41RT_RELEASE_REMOTE_BUILD_DIR selects where the Spark seed host stages the source
-tree and builds the expert images (default: a ds41rt-release-build directory in the
+CUTEAFD_RELEASE_REMOTE_BUILD_DIR selects where the Spark seed host stages the source
+tree and builds the expert images (default: a cuteafd-release-build directory in the
 seed host's own home). Use a fresh one per release so a previous staging tree cannot
 be reused.
-DS41RT_RELEASE_SSH_CONFIG, DS41RT_RELEASE_BUILD_ROOT and
-DS41RT_RELEASE_REMOTE_BUILD_DIR must each be a canonical absolute path built from
+CUTEAFD_RELEASE_SSH_CONFIG, CUTEAFD_RELEASE_BUILD_ROOT and
+CUTEAFD_RELEASE_REMOTE_BUILD_DIR must each be a canonical absolute path built from
 letters, digits, dot, underscore, plus and minus - no spaces, dot segments, trailing
 slashes or shell metacharacters - because they reach remote shells and bind mounts.
 
 Images are labelled with the checkout's Git revision (HEAD), even when the
 tree has local changes. Dirty checkouts still get an automatic source manifest
-under .ds41rt-release/ so local and remote inventories can be verified; keep
-source files unchanged during the build. DS41RT_RELEASE_SOURCE_MANIFEST can
+under .cuteafd-release/ so local and remote inventories can be verified; keep
+source files unchanged during the build. CUTEAFD_RELEASE_SOURCE_MANIFEST can
 supply an existing manifest. Source archives without .git must provide
-DS41RT_RELEASE_ENGINE_REVISION (a 40-hex Git revision).
+CUTEAFD_RELEASE_ENGINE_REVISION (a 40-hex Git revision).
 EOF
 }
 
-config="$repo_root/ds41rt.config"
+config="$repo_root/cuteafd.config"
 build_hosts_csv=""
 dry_run=0
 while [[ $# -gt 0 ]]; do
@@ -101,7 +101,7 @@ spark_release_version="${SPARK_EXPERT_DOCKER_INFERENCE##*:}"
 # so one published pair serves every approved native topology (TP4EP1, TP2EP2,
 # TP2EP3, TP3EP2, TP6EP1) and ./run.sh selects the mode. The x86_64 coordinator
 # needs no Spark role: roles are expert-only, so it is topology-independent.
-# DS41RT_RELEASE_SPARK_TP_ROLES is an explicit SUBSET override for a bounded
+# CUTEAFD_RELEASE_SPARK_TP_ROLES is an explicit SUBSET override for a bounded
 # topology A/B or a legacy TP4-only rebuild (empty).
 # release-spark-tp-roles:start
 release_spark_tp_roles_canonical() {
@@ -109,7 +109,7 @@ release_spark_tp_roles_canonical() {
   # element, an embedded newline or a duplicate would advertise a topology the
   # image cannot serve. The wholly empty list is the explicit legacy TP4-only
   # request. $2 names the source in diagnostics: the build override or the label.
-  local raw="$1" source_name="${2:-DS41RT_RELEASE_SPARK_TP_ROLES}"
+  local raw="$1" source_name="${2:-CUTEAFD_RELEASE_SPARK_TP_ROLES}"
   local entry prior
   local -a parts=() selected=()
   [[ -n "$raw" ]] || return 0
@@ -134,7 +134,7 @@ release_universal_spark_tp_roles="tp2;tp3;tp6"
 # `${VAR-default}`, not `:-`, so an explicitly empty override stays the legacy
 # TP4-only request rather than falling back to the universal set.
 spark_tp_roles="$(release_spark_tp_roles_canonical \
-  "${DS41RT_RELEASE_SPARK_TP_ROLES-$release_universal_spark_tp_roles}")"
+  "${CUTEAFD_RELEASE_SPARK_TP_ROLES-$release_universal_spark_tp_roles}")"
 [[ "$spark_tp_roles" == "$release_universal_spark_tp_roles" ]] ||
   echo "== NON-UNIVERSAL expert role subset '${spark_tp_roles:-<none>}'; this pair cannot serve every approved native topology =="
 # Repeated by --dry-run and the build summary so a subset build is never mistaken
@@ -147,7 +147,7 @@ spark_tp_roles_note='universal, covers every approved native topology'
 # release-build-transport:start
 # The SSH option set and the canonical-path validator live in
 # scripts/release-common.sh, so a release build and the Spark-facing helpers cannot
-# drift apart: stock resolution unless DS41RT_RELEASE_SSH_CONFIG names a config file,
+# drift apart: stock resolution unless CUTEAFD_RELEASE_SSH_CONFIG names a config file,
 # BatchMode forced always, and a bad value refused here before any host is reached.
 # What stays here is the release-only setting: where a container leg keeps its
 # writable build root.
@@ -158,17 +158,17 @@ release_configure_ssh_transport
 # inside the container and on the host, because the artifact compiler guards the
 # path it writes and that guard resolves the filesystem behind the string it is
 # given. It is per-task: two concurrent builds must never share one root.
-release_build_root="${DS41RT_RELEASE_BUILD_ROOT:-}"
-release_validate_path_setting DS41RT_RELEASE_BUILD_ROOT "$release_build_root"
+release_build_root="${CUTEAFD_RELEASE_BUILD_ROOT:-}"
+release_validate_path_setting CUTEAFD_RELEASE_BUILD_ROOT "$release_build_root"
 if [[ -n "$release_build_root" ]]; then
   # A root inside the source tree would be staged into its own copy and then
   # guarded as if it were the source, so the two must stay disjoint. The remote
   # value is still unknown here; the leg that knows it repeats this check.
   release_path_within "$release_build_root" "$repo_root" &&
-    release_die "DS41RT_RELEASE_BUILD_ROOT must not be $repo_root or inside it"
+    release_die "CUTEAFD_RELEASE_BUILD_ROOT must not be $repo_root or inside it"
   release_build_root_args=(
     -v "$release_build_root:$release_build_root"
-    -e "DS41RT_RELEASE_BUILD_ROOT=$release_build_root"
+    -e "CUTEAFD_RELEASE_BUILD_ROOT=$release_build_root"
   )
 else
   release_build_root_args=()
@@ -245,13 +245,13 @@ if [[ -n "$detected_engine_commit" &&
   -n "$(git -C "$repo_root" status --porcelain 2>/dev/null || true)" ]]; then
   engine_source_dirty=1
 fi
-source_manifest="${DS41RT_RELEASE_SOURCE_MANIFEST:-}"
+source_manifest="${CUTEAFD_RELEASE_SOURCE_MANIFEST:-}"
 source_manifest_sha256=""
 if [[ -z "$source_manifest" ]] && ((engine_source_dirty)); then
   # Build provenance is generated by the build, not an extra manual prerequisite.
   # This directory is excluded from both the inventory and remote source sync.
-  mkdir -p "$repo_root/.ds41rt-release/source-manifests"
-  source_manifest="$(mktemp "$repo_root/.ds41rt-release/source-manifests/source.XXXXXXXX.sha256")"
+  mkdir -p "$repo_root/.cuteafd-release/source-manifests"
+  source_manifest="$(mktemp "$repo_root/.cuteafd-release/source-manifests/source.XXXXXXXX.sha256")"
   python3 "$repo_root/scripts/verify-release-source-manifest.py" \
     --source "$repo_root" --write "$source_manifest"
   echo "== recorded current checkout: $source_manifest =="
@@ -306,15 +306,15 @@ sparkinfer_commit="$(
 python3 "$repo_root/scripts/verify-xgrammar-source.py" \
   --source "$repo_root/third_party/xgrammar" \
   --lock "$repo_root/third_party/xgrammar.lock.json"
-engine_revision_override="${DS41RT_RELEASE_ENGINE_REVISION:-}"
+engine_revision_override="${CUTEAFD_RELEASE_ENGINE_REVISION:-}"
 if [[ -n "$engine_revision_override" ]]; then
   [[ "$engine_revision_override" =~ ^[0-9a-f]{40}(-dirty-[0-9a-f]{12})?$ ]] ||
-    release_die "DS41RT_RELEASE_ENGINE_REVISION must be REVISION or REVISION-dirty-MANIFEST12"
+    release_die "CUTEAFD_RELEASE_ENGINE_REVISION must be REVISION or REVISION-dirty-MANIFEST12"
   [[ -n "$source_manifest_sha256" ]] ||
-    release_die "DS41RT_RELEASE_ENGINE_REVISION requires DS41RT_RELEASE_SOURCE_MANIFEST"
+    release_die "CUTEAFD_RELEASE_ENGINE_REVISION requires CUTEAFD_RELEASE_SOURCE_MANIFEST"
   engine_commit="$engine_revision_override"
 elif [[ -z "$detected_engine_commit" ]]; then
-  release_die "source snapshot has no Git metadata; set DS41RT_RELEASE_ENGINE_REVISION and DS41RT_RELEASE_SOURCE_MANIFEST"
+  release_die "source snapshot has no Git metadata; set CUTEAFD_RELEASE_ENGINE_REVISION and CUTEAFD_RELEASE_SOURCE_MANIFEST"
 elif ((engine_source_dirty)); then
   # Label the Git revision; the build does not encode local changes.
   echo "== note: building $detected_engine_commit with uncommitted local changes =="
@@ -324,21 +324,21 @@ else
 fi
 if [[ "$engine_commit" == *-dirty-* ]]; then
   [[ -n "$source_manifest_sha256" ]] ||
-    release_die "dirty engine revision requires DS41RT_RELEASE_SOURCE_MANIFEST"
+    release_die "dirty engine revision requires CUTEAFD_RELEASE_SOURCE_MANIFEST"
   [[ "$engine_commit" == *"-dirty-${source_manifest_sha256:0:12}" ]] ||
     release_die "dirty engine revision suffix does not match the source manifest"
 fi
 release_source_label_args=()
 if [[ -n "$source_manifest_sha256" ]]; then
   release_source_label_args+=(
-    --label "io.ds41rt.source-manifest.sha256=$source_manifest_sha256"
+    --label "io.cuteafd.source-manifest.sha256=$source_manifest_sha256"
   )
 fi
 
 hosts_csv="$(IFS=,; echo "${RELEASE_BUILD_HOSTS[*]}")"
 seed_host="${RELEASE_BUILD_HOSTS[0]}"
-remote_dir="${DS41RT_RELEASE_REMOTE_BUILD_DIR:-}"
-artifact_dir="$repo_root/.ds41rt-release-image"
+remote_dir="${CUTEAFD_RELEASE_REMOTE_BUILD_DIR:-}"
+artifact_dir="$repo_root/.cuteafd-release-image"
 
 echo "== validating native Spark build hosts =="
 for host in "${RELEASE_BUILD_HOSTS[@]}"; do
@@ -373,7 +373,7 @@ release_sync() {
 if [[ -z "$remote_dir" ]]; then
   remote_dir="$(
     release_ssh "$seed_host" \
-      'printf "%s/ds41rt-release-build" "$HOME"'
+      'printf "%s/cuteafd-release-build" "$HOME"'
   )"
 fi
 
@@ -381,15 +381,15 @@ fi
 # Docker bind sources, so it gets the same canonical treatment as every other
 # setting; the default derived from the seed host's own $HOME is checked too rather
 # than assumed to be simple.
-release_validate_path_setting DS41RT_RELEASE_REMOTE_BUILD_DIR "$remote_dir"
+release_validate_path_setting CUTEAFD_RELEASE_REMOTE_BUILD_DIR "$remote_dir"
 if [[ -n "$release_build_root" ]]; then
   # The remote source tree and the remote scratch must stay disjoint: a build root
   # inside the staged source would be copied into its own build directory, and a
   # source tree inside the scratch would be deleted with it.
   release_path_within "$release_build_root" "$remote_dir" &&
-    release_die "DS41RT_RELEASE_BUILD_ROOT must not be $remote_dir or inside it"
+    release_die "CUTEAFD_RELEASE_BUILD_ROOT must not be $remote_dir or inside it"
   release_path_within "$remote_dir" "$release_build_root" &&
-    release_die "the Spark staging directory must not be inside DS41RT_RELEASE_BUILD_ROOT"
+    release_die "the Spark staging directory must not be inside CUTEAFD_RELEASE_BUILD_ROOT"
 fi
 
 local_free_kib="$(df -Pk "$repo_root" | awk 'NR==2 {print $4}')"
@@ -424,10 +424,10 @@ fi
 
 echo "== building coordinator development image: $COORDINATOR_DOCKER_DEV =="
 docker build \
-  --build-arg DS41RT_ROLE=coordinator \
+  --build-arg CUTEAFD_ROLE=coordinator \
   --build-arg CUDA_ARCH=120 \
   --build-arg TARGET_PLATFORM=linux/amd64 \
-  --build-arg DS41RT_SPARKINFER_COMMIT="$sparkinfer_commit" \
+  --build-arg CUTEAFD_SPARKINFER_COMMIT="$sparkinfer_commit" \
   -f "$repo_root/docker/Dockerfile.dev" \
   -t "$COORDINATOR_DOCKER_DEV" \
   "$repo_root"
@@ -450,12 +450,12 @@ docker run --rm \
 echo "== building coordinator inference image: $COORDINATOR_DOCKER_INFERENCE =="
 docker build \
   "${release_source_label_args[@]}" \
-  --build-arg DS41RT_ROLE=coordinator \
+  --build-arg CUTEAFD_ROLE=coordinator \
   --build-arg CUDA_ARCH=120 \
-  --build-arg DS41RT_ENGINE_COMMIT="$engine_commit" \
-  --build-arg DS41RT_SPARKINFER_COMMIT="$sparkinfer_commit" \
-  --build-arg DS41RT_RELEASE_VERSION="$release_version" \
-  --build-arg DS41RT_V41_SPARK_TP_ROLES= \
+  --build-arg CUTEAFD_ENGINE_COMMIT="$engine_commit" \
+  --build-arg CUTEAFD_SPARKINFER_COMMIT="$sparkinfer_commit" \
+  --build-arg CUTEAFD_RELEASE_VERSION="$release_version" \
+  --build-arg CUTEAFD_V41_SPARK_TP_ROLES= \
   -f "$repo_root/docker/Dockerfile.release" \
   -t "$COORDINATOR_DOCKER_INFERENCE" \
   "$repo_root"
@@ -472,10 +472,10 @@ release_sync --delete \
   --exclude '__pycache__/' \
   --exclude '*.pyc' \
   --exclude '*.pyo' \
-  --exclude '.ds41rt-cache/' \
-  --exclude '.ds41rt-release/' \
-  --exclude '.ds41rt-release-image/' \
-  --exclude '.ds41rt-wip/' \
+  --exclude '.cuteafd-cache/' \
+  --exclude '.cuteafd-release/' \
+  --exclude '.cuteafd-release-image/' \
+  --exclude '.cuteafd-wip/' \
   --exclude 'dist/' \
   --exclude 'rust/target/' \
   --exclude 'native/build*/' \
@@ -540,13 +540,13 @@ release_build_root_args=()
 if [[ -n "$release_build_root" ]]; then
   release_build_root_args=(
     -v "$release_build_root:$release_build_root"
-    -e "DS41RT_RELEASE_BUILD_ROOT=$release_build_root"
+    -e "CUTEAFD_RELEASE_BUILD_ROOT=$release_build_root"
   )
 fi
 release_source_label_args=()
 if [[ -n "$source_manifest_sha256" ]]; then
   release_source_label_args+=(
-    --label "io.ds41rt.source-manifest.sha256=$source_manifest_sha256"
+    --label "io.cuteafd.source-manifest.sha256=$source_manifest_sha256"
   )
 fi
 cd "$remote_dir"
@@ -555,32 +555,32 @@ python3 scripts/verify-sparkinfer-source.py \
   --lock third_party/sparkinfer.lock.json \
   --require-no-python-cache
 docker build \
-  --build-arg DS41RT_ROLE=expert \
+  --build-arg CUTEAFD_ROLE=expert \
   --build-arg CUDA_ARCH=121 \
   --build-arg TARGET_PLATFORM=linux/arm64 \
-  --build-arg DS41RT_SPARKINFER_COMMIT="$sparkinfer_commit" \
+  --build-arg CUTEAFD_SPARKINFER_COMMIT="$sparkinfer_commit" \
   -f docker/Dockerfile.dev \
   -t "$dev_image" .
-mkdir -p .ds41rt-release-image
+mkdir -p .cuteafd-release-image
 docker run --rm \
   --gpus all \
   --ipc=host \
   --ulimit memlock=-1:-1 \
-  -e "DS41RT_RELEASE_EXL3_PAIRED_TP4=$exl3_paired_tp4" \
-  -e "DS41RT_RELEASE_SPARK_TP_ROLES=$spark_tp_roles" \
+  -e "CUTEAFD_RELEASE_EXL3_PAIRED_TP4=$exl3_paired_tp4" \
+  -e "CUTEAFD_RELEASE_SPARK_TP_ROLES=$spark_tp_roles" \
   ${release_build_root_args[@]+"${release_build_root_args[@]}"} \
   -v "$remote_dir:/source:ro" \
-  -v "$remote_dir/.ds41rt-release-image:/output" \
+  -v "$remote_dir/.cuteafd-release-image:/output" \
   "$dev_image" \
   /source/scripts/build-release-artifacts.sh /source expert 121 /output
 docker build \
   "${release_source_label_args[@]}" \
-  --build-arg DS41RT_ROLE=expert \
+  --build-arg CUTEAFD_ROLE=expert \
   --build-arg CUDA_ARCH=121 \
-  --build-arg DS41RT_ENGINE_COMMIT="$engine_commit" \
-  --build-arg DS41RT_SPARKINFER_COMMIT="$sparkinfer_commit" \
-  --build-arg DS41RT_RELEASE_VERSION="$release_version" \
-  --build-arg DS41RT_V41_SPARK_TP_ROLES="$spark_tp_roles" \
+  --build-arg CUTEAFD_ENGINE_COMMIT="$engine_commit" \
+  --build-arg CUTEAFD_SPARKINFER_COMMIT="$sparkinfer_commit" \
+  --build-arg CUTEAFD_RELEASE_VERSION="$release_version" \
+  --build-arg CUTEAFD_V41_SPARK_TP_ROLES="$spark_tp_roles" \
   -f docker/Dockerfile.release \
   -t "$inference_image" .
 REMOTE
@@ -592,32 +592,32 @@ find "$repo_root/dist/coordinator" "$repo_root/dist/spark-expert" \
   -mindepth 1 -delete
 coordinator_container="$(docker create "$COORDINATOR_DOCKER_INFERENCE")"
 trap 'docker rm -f "$coordinator_container" >/dev/null 2>&1 || true' EXIT
-docker cp "$coordinator_container:/opt/ds41rt/bin/ds41rt" "$repo_root/dist/coordinator/ds41rt"
-docker cp "$coordinator_container:/opt/ds41rt/lib/libds41rt_native.so" "$repo_root/dist/coordinator/libds41rt_native.so"
-docker cp "$coordinator_container:/opt/ds41rt/lib/exl3" "$repo_root/dist/coordinator/exl3"
-docker cp "$coordinator_container:/opt/ds41rt/share/V41_EXPERT_AOT.json" "$repo_root/dist/coordinator/V41_EXPERT_AOT.json"
-docker cp "$coordinator_container:/opt/ds41rt/share/V41_EXPERT_TP_AOT.json" "$repo_root/dist/coordinator/V41_EXPERT_TP_AOT.json"
-docker cp "$coordinator_container:/opt/ds41rt/share/V41_FP8_AOT.json" "$repo_root/dist/coordinator/V41_FP8_AOT.json"
+docker cp "$coordinator_container:/opt/cuteafd/bin/cuteafd" "$repo_root/dist/coordinator/cuteafd"
+docker cp "$coordinator_container:/opt/cuteafd/lib/libcuteafd_native.so" "$repo_root/dist/coordinator/libcuteafd_native.so"
+docker cp "$coordinator_container:/opt/cuteafd/lib/exl3" "$repo_root/dist/coordinator/exl3"
+docker cp "$coordinator_container:/opt/cuteafd/share/V41_EXPERT_AOT.json" "$repo_root/dist/coordinator/V41_EXPERT_AOT.json"
+docker cp "$coordinator_container:/opt/cuteafd/share/V41_EXPERT_TP_AOT.json" "$repo_root/dist/coordinator/V41_EXPERT_TP_AOT.json"
+docker cp "$coordinator_container:/opt/cuteafd/share/V41_FP8_AOT.json" "$repo_root/dist/coordinator/V41_FP8_AOT.json"
 docker cp \
-  "$coordinator_container:/opt/ds41rt/share/THIRD_PARTY_NOTICES.md" \
+  "$coordinator_container:/opt/cuteafd/share/THIRD_PARTY_NOTICES.md" \
   "$repo_root/dist/coordinator/THIRD_PARTY_NOTICES.md"
 docker cp \
-  "$coordinator_container:/opt/ds41rt/share/SPARKINFER_PROVENANCE.json" \
+  "$coordinator_container:/opt/cuteafd/share/SPARKINFER_PROVENANCE.json" \
   "$repo_root/dist/coordinator/SPARKINFER_PROVENANCE.json"
 docker cp \
-  "$coordinator_container:/opt/ds41rt/share/licenses/sparkinfer/LICENSE" \
+  "$coordinator_container:/opt/cuteafd/share/licenses/sparkinfer/LICENSE" \
   "$repo_root/dist/coordinator/SPARKINFER_LICENSE"
 docker cp \
-  "$coordinator_container:/opt/ds41rt/share/SPARKINFER_SHA256SUMS" \
+  "$coordinator_container:/opt/cuteafd/share/SPARKINFER_SHA256SUMS" \
   "$repo_root/dist/coordinator/SPARKINFER_SHA256SUMS"
 docker cp \
-  "$coordinator_container:/opt/ds41rt/share/XGRAMMAR_PROVENANCE.json" \
+  "$coordinator_container:/opt/cuteafd/share/XGRAMMAR_PROVENANCE.json" \
   "$repo_root/dist/coordinator/XGRAMMAR_PROVENANCE.json"
 docker cp \
-  "$coordinator_container:/opt/ds41rt/share/licenses/xgrammar/LICENSE" \
+  "$coordinator_container:/opt/cuteafd/share/licenses/xgrammar/LICENSE" \
   "$repo_root/dist/coordinator/XGRAMMAR_LICENSE"
 docker cp \
-  "$coordinator_container:/opt/ds41rt/share/XGRAMMAR_SHA256SUMS" \
+  "$coordinator_container:/opt/cuteafd/share/XGRAMMAR_SHA256SUMS" \
   "$repo_root/dist/coordinator/XGRAMMAR_SHA256SUMS"
 docker rm "$coordinator_container" >/dev/null
 trap - EXIT
@@ -631,32 +631,32 @@ mkdir -p "$destination"
 find "$destination" -mindepth 1 -delete
 container="$(docker create "$image")"
 trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
-docker cp "$container:/opt/ds41rt/bin/ds41rt" "$destination/ds41rt"
-docker cp "$container:/opt/ds41rt/lib/libds41rt_native.so" "$destination/libds41rt_native.so"
-docker cp "$container:/opt/ds41rt/lib/exl3" "$destination/exl3"
-docker cp "$container:/opt/ds41rt/share/V41_EXPERT_AOT.json" "$destination/V41_EXPERT_AOT.json"
-docker cp "$container:/opt/ds41rt/share/V41_EXPERT_TP_AOT.json" "$destination/V41_EXPERT_TP_AOT.json"
-docker cp "$container:/opt/ds41rt/share/V41_FP8_AOT.json" "$destination/V41_FP8_AOT.json"
+docker cp "$container:/opt/cuteafd/bin/cuteafd" "$destination/cuteafd"
+docker cp "$container:/opt/cuteafd/lib/libcuteafd_native.so" "$destination/libcuteafd_native.so"
+docker cp "$container:/opt/cuteafd/lib/exl3" "$destination/exl3"
+docker cp "$container:/opt/cuteafd/share/V41_EXPERT_AOT.json" "$destination/V41_EXPERT_AOT.json"
+docker cp "$container:/opt/cuteafd/share/V41_EXPERT_TP_AOT.json" "$destination/V41_EXPERT_TP_AOT.json"
+docker cp "$container:/opt/cuteafd/share/V41_FP8_AOT.json" "$destination/V41_FP8_AOT.json"
 docker cp \
-  "$container:/opt/ds41rt/share/THIRD_PARTY_NOTICES.md" \
+  "$container:/opt/cuteafd/share/THIRD_PARTY_NOTICES.md" \
   "$destination/THIRD_PARTY_NOTICES.md"
 docker cp \
-  "$container:/opt/ds41rt/share/SPARKINFER_PROVENANCE.json" \
+  "$container:/opt/cuteafd/share/SPARKINFER_PROVENANCE.json" \
   "$destination/SPARKINFER_PROVENANCE.json"
 docker cp \
-  "$container:/opt/ds41rt/share/licenses/sparkinfer/LICENSE" \
+  "$container:/opt/cuteafd/share/licenses/sparkinfer/LICENSE" \
   "$destination/SPARKINFER_LICENSE"
 docker cp \
-  "$container:/opt/ds41rt/share/SPARKINFER_SHA256SUMS" \
+  "$container:/opt/cuteafd/share/SPARKINFER_SHA256SUMS" \
   "$destination/SPARKINFER_SHA256SUMS"
 docker cp \
-  "$container:/opt/ds41rt/share/XGRAMMAR_PROVENANCE.json" \
+  "$container:/opt/cuteafd/share/XGRAMMAR_PROVENANCE.json" \
   "$destination/XGRAMMAR_PROVENANCE.json"
 docker cp \
-  "$container:/opt/ds41rt/share/licenses/xgrammar/LICENSE" \
+  "$container:/opt/cuteafd/share/licenses/xgrammar/LICENSE" \
   "$destination/XGRAMMAR_LICENSE"
 docker cp \
-  "$container:/opt/ds41rt/share/XGRAMMAR_SHA256SUMS" \
+  "$container:/opt/cuteafd/share/XGRAMMAR_SHA256SUMS" \
   "$destination/XGRAMMAR_SHA256SUMS"
 docker rm "$container" >/dev/null
 trap - EXIT
@@ -700,7 +700,7 @@ done
 (
   cd "$repo_root/dist"
   sha256sum \
-    coordinator/ds41rt coordinator/libds41rt_native.so coordinator/V41_EXPERT_AOT.json coordinator/V41_EXPERT_TP_AOT.json coordinator/V41_FP8_AOT.json \
+    coordinator/cuteafd coordinator/libcuteafd_native.so coordinator/V41_EXPERT_AOT.json coordinator/V41_EXPERT_TP_AOT.json coordinator/V41_FP8_AOT.json \
     coordinator/THIRD_PARTY_NOTICES.md \
     coordinator/SPARKINFER_PROVENANCE.json \
     coordinator/SPARKINFER_LICENSE \
@@ -708,7 +708,7 @@ done
     coordinator/XGRAMMAR_PROVENANCE.json \
     coordinator/XGRAMMAR_LICENSE \
     coordinator/XGRAMMAR_SHA256SUMS \
-    spark-expert/ds41rt spark-expert/libds41rt_native.so spark-expert/V41_EXPERT_AOT.json spark-expert/V41_EXPERT_TP_AOT.json spark-expert/V41_FP8_AOT.json \
+    spark-expert/cuteafd spark-expert/libcuteafd_native.so spark-expert/V41_EXPERT_AOT.json spark-expert/V41_EXPERT_TP_AOT.json spark-expert/V41_FP8_AOT.json \
     spark-expert/THIRD_PARTY_NOTICES.md \
     spark-expert/SPARKINFER_PROVENANCE.json \
     spark-expert/SPARKINFER_LICENSE \
@@ -764,16 +764,7 @@ if ((rdmapipe_ready)); then
   done
   ((image_copy_failed == 0)) || release_die "concurrent RDMA Spark image distribution failed"
 else
-  echo "== rdmapipe unavailable on one or more Sparks; using serial netcat image distribution =="
-  DS41RT_SPARK_HOSTS="$hosts_csv" \
-  DS41RT_SPARK_IMAGE="$SPARK_EXPERT_DOCKER_INFERENCE" \
-  DS41RT_SPARK_IMAGE_SEED_HOST="$seed_host" \
-  DS41RT_SPARK_IMAGE_COPY_METHOD=spark-netcat \
-  DS41RT_SPARK_IMAGE_ONLY=1 \
-  DS41RT_SPARK_SKIP_STAGE=1 \
-  RSYNC_RSH="$release_rsh" \
-  DS41RT_RELEASE_SSH_CONFIG="$release_ssh_config" \
-  "$repo_root/scripts/phase0-spark-tcp-bench.sh"
+  release_die "rdmapipe is required on every Spark build host to distribute the Spark image"
 fi
 
 coordinator_revision="$(
@@ -787,14 +778,14 @@ coordinator_version="$(
 )"
 [[ "$coordinator_version" == "$release_version" ]] || release_die "coordinator image version mismatch"
 coordinator_sparkinfer_revision="$(
-  docker image inspect -f '{{index .Config.Labels "io.ds41rt.sparkinfer.revision"}}' \
+  docker image inspect -f '{{index .Config.Labels "io.cuteafd.sparkinfer.revision"}}' \
     "$COORDINATOR_DOCKER_INFERENCE"
 )"
 [[ "$coordinator_sparkinfer_revision" == "$sparkinfer_commit" ]] ||
   release_die "coordinator image SparkInfer revision mismatch"
 if [[ -n "$source_manifest_sha256" ]]; then
   coordinator_source_manifest="$(
-    docker image inspect -f '{{index .Config.Labels "io.ds41rt.source-manifest.sha256"}}' \
+    docker image inspect -f '{{index .Config.Labels "io.cuteafd.source-manifest.sha256"}}' \
       "$COORDINATOR_DOCKER_INFERENCE"
   )"
   [[ "$coordinator_source_manifest" == "$source_manifest_sha256" ]] ||
@@ -814,14 +805,14 @@ for host in "${RELEASE_BUILD_HOSTS[@]}"; do
     release_die "$host Spark image version mismatch: $spark_version"
   spark_sparkinfer_revision="$(
     release_ssh "$host" \
-      "docker image inspect -f '{{index .Config.Labels \"io.ds41rt.sparkinfer.revision\"}}' '$SPARK_EXPERT_DOCKER_INFERENCE'"
+      "docker image inspect -f '{{index .Config.Labels \"io.cuteafd.sparkinfer.revision\"}}' '$SPARK_EXPERT_DOCKER_INFERENCE'"
   )"
   [[ "$spark_sparkinfer_revision" == "$sparkinfer_commit" ]] ||
     release_die "$host Spark image SparkInfer revision mismatch: $spark_sparkinfer_revision"
   if [[ -n "$source_manifest_sha256" ]]; then
     spark_source_manifest="$(
       release_ssh "$host" \
-        "docker image inspect -f '{{index .Config.Labels \"io.ds41rt.source-manifest.sha256\"}}' '$SPARK_EXPERT_DOCKER_INFERENCE'"
+        "docker image inspect -f '{{index .Config.Labels \"io.cuteafd.source-manifest.sha256\"}}' '$SPARK_EXPERT_DOCKER_INFERENCE'"
     )"
     [[ "$spark_source_manifest" == "$source_manifest_sha256" ]] ||
       release_die "$host Spark image source manifest mismatch: $spark_source_manifest"
@@ -831,14 +822,14 @@ for host in "${RELEASE_BUILD_HOSTS[@]}"; do
   # topology launch, so a mismatch is a hard build failure.
   spark_role_label="$(
     release_ssh "$host" \
-      "docker image inspect -f '{{index .Config.Labels \"io.ds41rt.v41.spark_tp_roles\"}}' '$SPARK_EXPERT_DOCKER_INFERENCE'"
+      "docker image inspect -f '{{index .Config.Labels \"io.cuteafd.v41.spark_tp_roles\"}}' '$SPARK_EXPERT_DOCKER_INFERENCE'"
   )"
   [[ "$spark_role_label" != "<no value>" ]] || spark_role_label=
   # release-spark-tp-roles-postcheck:start
   # One canonicalizer for both sides of the comparison, so a permutation or a
   # stray separator cannot make an equal set look unequal (or the reverse).
   [[ "$(release_spark_tp_roles_canonical "$spark_role_label" \
-    "io.ds41rt.v41.spark_tp_roles")" == "$spark_tp_roles" ]] ||
+    "io.cuteafd.v41.spark_tp_roles")" == "$spark_tp_roles" ]] ||
     release_die "$host Spark image advertises expert roles '$spark_role_label', expected exactly '$spark_tp_roles'"
   # release-spark-tp-roles-postcheck:end
 done

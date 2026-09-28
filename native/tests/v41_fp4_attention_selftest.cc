@@ -1,4 +1,4 @@
-#include "ds41rt_v41_sparse_attention.h"
+#include "cuteafd_v41_sparse_attention.h"
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstring>
@@ -33,8 +33,8 @@ static uint16_t BFloat16(float value) {
 }
 
 int main() {
-  Check(static_cast<cudaError_t>(ds41rt_v41_sparse_attention_initialize()));
-  Check(static_cast<cudaError_t>(ds41rt_v41_sparse_attention_heads32_initialize()));
+  Check(static_cast<cudaError_t>(cuteafd_v41_sparse_attention_initialize()));
+  Check(static_cast<cudaError_t>(cuteafd_v41_sparse_attention_heads32_initialize()));
   cudaStream_t test_stream;
   Check(cudaStreamCreateWithFlags(&test_stream,cudaStreamNonBlocking));
   int checks = 0;
@@ -53,7 +53,7 @@ int main() {
     source_scales.Fill(format==2?0x38:127); private_scales.Fill(format==2?0x38:127); // Scale one.
     window_end.Copy<uint64_t>({2048}); source_end.Copy<uint64_t>({512});
     pages.Copy<uint32_t>({1, 0});
-    ds41rt_v41_sparse_kv_t view{};
+    cuteafd_v41_sparse_kv_t view{};
     view.values[0]=window.data; view.values[1]=proposal.data;
     view.values[2]=source.data; view.values[3]=private_source.data;
     view.scales[0]=window_scales.data; view.scales[1]=proposal_scales.data;
@@ -81,12 +81,12 @@ int main() {
       const auto* s=reinterpret_cast<const int32_t*>(selected.data);
       const auto* sk=reinterpret_cast<const float*>(sink.data);
       int status;
-      if (begin>=0) status=ds41rt_v41_sparse_attention_bounded(q,sk,m,s,out,rows,0,&view,nullptr,
+      if (begin>=0) status=cuteafd_v41_sparse_attention_bounded(q,sk,m,s,out,rows,0,&view,nullptr,
           reinterpret_cast<const uint64_t*>(bounds.data),parts?reinterpret_cast<float*>(scratch.data):nullptr,
           parts?scratch.bytes:0,parts?parts:1);
-      else if (parts) status=ds41rt_v41_sparse_attention_split(q,sk,m,s,out,rows,0,&view,nullptr,
+      else if (parts) status=cuteafd_v41_sparse_attention_split(q,sk,m,s,out,rows,0,&view,nullptr,
           reinterpret_cast<float*>(scratch.data),scratch.bytes,parts);
-      else status=ds41rt_v41_sparse_attention(q,sk,m,s,out,rows,0,&view,nullptr);
+      else status=cuteafd_v41_sparse_attention(q,sk,m,s,out,rows,0,&view,nullptr);
       Check(static_cast<cudaError_t>(status));
       Check(cudaDeviceSynchronize());
       std::vector<uint16_t> actual(output.bytes/2);
@@ -110,7 +110,7 @@ int main() {
       for(int head=0;head<64;++head)varied_sink[head]=float(head-32)/16.0f;
       query.Copy(varied_query);sink.Copy(varied_sink);
       const auto* wb=reinterpret_cast<const uint64_t*>(bounds.data);
-      Check(static_cast<cudaError_t>(ds41rt_v41_sparse_attention_bounded(q,sk,m,s,out,rows,0,
+      Check(static_cast<cudaError_t>(cuteafd_v41_sparse_attention_bounded(q,sk,m,s,out,rows,0,
           &view,nullptr,wb,parts?reinterpret_cast<float*>(scratch.data):nullptr,
           parts?scratch.bytes:0,parts?parts:1)));
       Check(cudaMemcpy(actual.data(),output.data,output.bytes,cudaMemcpyDeviceToHost));
@@ -125,7 +125,7 @@ int main() {
         local_sink.Copy(std::vector<float>(varied_sink.begin()+rank*32,varied_sink.begin()+(rank+1)*32));
         local_output.Fill(0xcd);local_scratch.Fill(0xcd);
         auto launch=[&](uint64_t bytes) {
-          return ds41rt_v41_sparse_attention_heads32_bounded(
+          return cuteafd_v41_sparse_attention_heads32_bounded(
               reinterpret_cast<const uint16_t*>(local_query.data),reinterpret_cast<const float*>(local_sink.data),
               m,s,reinterpret_cast<uint16_t*>(local_output.data),rows,0,&view,test_stream,wb,
               parts?reinterpret_cast<float*>(local_scratch.data):nullptr,bytes,parts?parts:1);
@@ -159,21 +159,21 @@ int main() {
         const int batch_parts=format?10:2;
         Buffer device_views(rows*sizeof(view)),bad_end(8);
         bad_end.Copy<uint64_t>({0});
-        std::vector<ds41rt_v41_sparse_kv_t> views(rows,view);
+        std::vector<cuteafd_v41_sparse_kv_t> views(rows,view);
         for(int row=1;row<rows;row+=2)
           views[row].window_end=reinterpret_cast<const uint64_t*>(bad_end.data);
         device_views.Copy(views);
-        auto* dv=reinterpret_cast<const ds41rt_v41_sparse_kv_t*>(device_views.data);
+        auto* dv=reinterpret_cast<const cuteafd_v41_sparse_kv_t*>(device_views.data);
         Buffer batch_scratch(size_t(rows)*batch_parts*64*514*4);
         auto* bs=reinterpret_cast<float*>(batch_scratch.data);
-        Check(static_cast<cudaError_t>(ds41rt_v41_sparse_attention_batch_validate(
+        Check(static_cast<cudaError_t>(cuteafd_v41_sparse_attention_batch_validate(
             q,sk,m,s,out,rows,views.data(),dv,wb,bs,batch_scratch.bytes,batch_parts,format)));
-        auto batch_launch=ds41rt_v41_sparse_attention_batch;
-        auto half_batch_launch=ds41rt_v41_sparse_attention_heads32_batch;
-#ifdef DS41RT_TEST_ATTENTION_AOT
+        auto batch_launch=cuteafd_v41_sparse_attention_batch;
+        auto half_batch_launch=cuteafd_v41_sparse_attention_heads32_batch;
+#ifdef CUTEAFD_TEST_ATTENTION_AOT
         if(format==2) {
-          batch_launch=ds41rt_v41_sparse_attention_batch_aot;
-          half_batch_launch=ds41rt_v41_sparse_attention_heads32_batch_aot;
+          batch_launch=cuteafd_v41_sparse_attention_batch_aot;
+          half_batch_launch=cuteafd_v41_sparse_attention_heads32_batch_aot;
         }
 #endif
         Check(static_cast<cudaError_t>(batch_launch(
@@ -193,13 +193,13 @@ int main() {
           auto* hs=reinterpret_cast<const float*>(half_sink.data);
           auto* ho=reinterpret_cast<uint16_t*>(half_output.data);
           auto* hp=reinterpret_cast<float*>(half_scratch.data);
-          auto validate=[&](uint64_t bytes,const ds41rt_v41_sparse_kv_t* descriptors) {
-            return ds41rt_v41_sparse_attention_heads32_batch_validate(hq,hs,m,s,ho,rows,
+          auto validate=[&](uint64_t bytes,const cuteafd_v41_sparse_kv_t* descriptors) {
+            return cuteafd_v41_sparse_attention_heads32_batch_validate(hq,hs,m,s,ho,rows,
                 views.data(),descriptors,wb,hp,bytes,batch_parts,format);
           };
           Check(static_cast<cudaError_t>(validate(half_scratch.bytes,dv)));
           if(validate(half_scratch.bytes-1,dv)!=cudaErrorInvalidValue ||
-              validate(half_scratch.bytes,reinterpret_cast<const ds41rt_v41_sparse_kv_t*>(half_output.data))!=cudaErrorInvalidValue)
+              validate(half_scratch.bytes,reinterpret_cast<const cuteafd_v41_sparse_kv_t*>(half_output.data))!=cudaErrorInvalidValue)
             throw std::runtime_error("compact batch validation missed scratch/descriptor overlap");
           cudaGraph_t graph;cudaGraphExec_t executable;
           Check(cudaStreamBeginCapture(test_stream,cudaStreamCaptureModeThreadLocal));
@@ -218,7 +218,7 @@ int main() {
             if(replay==0) {
               auto invalid=views;
               for(auto& v:invalid)v.window_end=reinterpret_cast<const uint64_t*>(bad_end.data);
-              Check(static_cast<cudaError_t>(ds41rt_v41_sparse_attention_heads32_batch_validate(
+              Check(static_cast<cudaError_t>(cuteafd_v41_sparse_attention_heads32_batch_validate(
                   hq,hs,m,s,ho,rows,invalid.data(),dv,wb,hp,half_scratch.bytes,batch_parts,format)));
               device_views.Copy(invalid);
             }

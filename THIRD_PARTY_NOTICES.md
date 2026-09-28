@@ -2,7 +2,7 @@
 
 ## XGrammar
 
-DS41RT statically links a pinned XGrammar release for JSON Schema and strict
+CUTEAFD statically links a pinned XGrammar release for JSON Schema and strict
 tool-call constrained decoding: <https://github.com/mlc-ai/xgrammar>. The
 exact revision, nested DLPack revision, and source-tree digest are recorded in
 `third_party/xgrammar.lock.json` and distributed as
@@ -14,7 +14,7 @@ SPDX-License-Identifier: Apache-2.0
 
 XGrammar is distributed under the Apache License, Version 2.0. The complete
 root license text is distributed as `XGRAMMAR_LICENSE` in standalone
-artifacts and as `/opt/ds41rt/share/licenses/xgrammar/LICENSE` in inference
+artifacts and as `/opt/cuteafd/share/licenses/xgrammar/LICENSE` in inference
 images. XGrammar's vendored DLPack headers retain their own Apache-2.0
 copyright and license notices in the pinned source tree.
 
@@ -57,7 +57,7 @@ POSSIBILITY OF SUCH DAMAGE.
 
 ## SparkInfer
 
-DS41RT builds CuTe kernels from a pinned fork of SparkInfer, formerly `b12x`:
+CUTEAFD builds CuTe kernels from a pinned fork of SparkInfer, formerly `b12x`:
 <https://github.com/tpurtell/sparkinfer-glmrt>. The pinned fork revision and
 source digest are recorded in `third_party/sparkinfer.lock.json`.
 `SPARKINFER_PROVENANCE.json` carries those exact locked values plus hashes of
@@ -73,12 +73,12 @@ The SparkInfer project is distributed under the Apache License, Version 2.0,
 subject to the per-file notices retained in its source. You may obtain the
 Apache License at <https://www.apache.org/licenses/LICENSE-2.0>. The complete
 root license text is distributed as `SPARKINFER_LICENSE` in standalone
-artifacts and as `/opt/ds41rt/share/licenses/sparkinfer/LICENSE` in inference
+artifacts and as `/opt/cuteafd/share/licenses/sparkinfer/LICENSE` in inference
 images.
 
 ### NVIDIA dense GEMM component in SparkInfer
 
-SparkInfer's `b12x/_lib/dense_gemm.py`, which DS41RT uses to generate
+SparkInfer's `b12x/_lib/dense_gemm.py`, which CUTEAFD uses to generate
 Spark-side AOT kernels, is adapted from an NVIDIA CUTLASS dense block-scaled
 GEMM example and carries this notice:
 
@@ -548,7 +548,7 @@ PERFORMANCE OF THIS SOFTWARE.
 ## Test-Case Provenance
 
 The upstream-derived test suites under `rust/**/tests/upstream_*.rs`,
-`rust/crates/ds41rt-api/src/tests/upstream_*.rs`, and
+`rust/crates/cuteafd-api/src/tests/upstream_*.rs`, and
 `python/tests/test_upstream_*.py` were rewritten from published test
 *behavior* (invariants, test vectors, golden cases) from:
 
@@ -560,7 +560,7 @@ The upstream-derived test suites under `rust/**/tests/upstream_*.rs`,
   no NOTICE file, revision `6011c34ce6099646ccdf0d39a61c6e681477c178`
 
 No upstream code is distributed in these suites: each test re-expresses the
-upstream invariant against ds41rt implementations and cites its source file
+upstream invariant against cuteafd implementations and cites its source file
 and test name in a comment. Numeric test vectors and schema golden cases are
 facts from the referenced revisions. Neither Apache-2.0 nor MIT requires
 notice preservation for this manner of use; this entry is provided for

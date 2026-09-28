@@ -10,11 +10,11 @@ new file there would break AOT source verification for the native build.
 Scope of THIS revision: the true production Python path only.
 
 * ``--phase full`` compiles and times ``V41SlicePipeline`` end to end. That is
-  the kernel path the DS41RT AOT entry is generated from.
+  the kernel path the CUTEAFD AOT entry is generated from.
 * ``--phase split`` additionally compiles the plan and reduce stages from the
   *same* pipeline instance on the same buffers, so phase-0 decomposition is
   directly comparable to ``full``.
-* ``--phase native`` drives the real C ABI (``ds41rt_v41_expert_info`` /
+* ``--phase native`` drives the real C ABI (``cuteafd_v41_expert_info`` /
   ``initialize`` / ``bind_scratch`` / ``launch``). Its geometry comes from the
   library's own emitted info, which is authoritative for the new TP2/TP3 roles.
 
@@ -61,8 +61,8 @@ import sys
 import time
 from pathlib import Path
 
-# The canonical DS41RT resolver: it verifies the pinned SparkInfer tree and its
-# lock (honouring DS41RT_SPARKINFER_SOURCE_DIR), puts that tree first on
+# The canonical CUTEAFD resolver: it verifies the pinned SparkInfer tree and its
+# lock (honouring CUTEAFD_SPARKINFER_SOURCE_DIR), puts that tree first on
 # sys.path, and fails closed if `b12x` does not import from it. Import it before
 # anything from SparkInfer so an unverified copy can never be used.
 import _pinned_sparkinfer  # noqa: F401  (import side effect is the point)
@@ -759,7 +759,7 @@ def exporter_weight_elements(experts: int, kernel_intermediate: int):
 def native_packer_bytes(intermediate: int, experts: int, hidden: int = HIDDEN):
     """Per-expert bytes from the native packer's own size function.
 
-    Source: native/cuda/kernels/v41_expert_pack.cu, `ds41rt_v41_expert_packed_sizes`:
+    Source: native/cuda/kernels/v41_expert_pack.cu, `cuteafd_v41_expert_packed_sizes`:
         padded = align_up(intermediate, 128)
         bytes  = [padded*hidden, padded*hidden/16, hidden*padded/2,
                   hidden*padded/32]
@@ -1051,7 +1051,7 @@ def main(argv=None):
         source_mode="checkpoint" if options.snapshot else "synthetic",
         notes=[
             "Python leg compiles the true V41SlicePipeline.",
-            "Native leg drives the ds41rt_v41_expert_launch AOT entry.",
+            "Native leg drives the cuteafd_v41_expert_launch AOT entry.",
             "Masked routes are sentinel id 384 with weight exactly 0.",
             "Cold = one timed replay immediately after a device flush.",
             "weak correctness is not qualified evidence.",

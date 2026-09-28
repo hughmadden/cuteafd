@@ -17,13 +17,13 @@ raw=compile_kernel(V41OverlayScore(),
     *[make_ptr(t,16,cute.AddressSpace.gmem,assumed_align=1) for t in types],
     Int32(1),Int32(1),Int32(1),Int32(1),Int64(256),Int64(1),current_cuda_stream(),
     compile_spec=KernelCompileSpec.from_key('attention.indexer.v41_overlay',1,()))
-raw.export_to_c(str(a.output_dir),'v41_index_score','ds41rt_v41_index_score')
+raw.export_to_c(str(a.output_dir),'v41_index_score','cuteafd_v41_index_score')
 h=(a.output_dir/'v41_index_score.h').read_text()
 pointers='q qs weights keys ks pages lengths metadata positions output proposals ps'.split()
 i32='rows width slots stride'.split();i64='capacity proposal_capacity'.split()
-expected=['ds41rt_v41_index_score_Kernel_Module_t *module']
+expected=['cuteafd_v41_index_score_Kernel_Module_t *module']
 expected += ['void *'+x for x in pointers]+['int32_t '+x for x in i32]+['int64_t '+x for x in i64]+['cudaStream_t stream']
-sig=re.search(r'static inline int32_t cute_dsl_ds41rt_v41_index_score_wrapper\(([^)]*)\)',h)
+sig=re.search(r'static inline int32_t cute_dsl_cuteafd_v41_index_score_wrapper\(([^)]*)\)',h)
 normalize=lambda x:re.sub(r'\s+','',x)
 if not sig or normalize(sig[1])!=normalize(','.join(expected)):
     raise ValueError('unexpected V4.1 index generated signature')

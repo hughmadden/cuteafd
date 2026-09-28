@@ -13,10 +13,10 @@
   ],
   "_provenance": {
     "source_commit": "coordinator/expert image label org.opencontainers.image.revision",
-    "source_artifact": "coordinator and expert image RepoDigests plus label io.ds41rt.source-manifest.sha256 (a full manifest string is acceptable)",
+    "source_artifact": "coordinator and expert image RepoDigests plus label io.cuteafd.source-manifest.sha256 (a full manifest string is acceptable)",
     "source_snapshots": "the daemon and native source trees those images were built from (source identity, not artifact-role-dependent manifest hashes; equal source means the same binaries plus the candidate's family superset)",
-    "sparkinfer_revision": "image label io.ds41rt.sparkinfer.revision",
-    "expert_tp_manifests": "scripts/write-v41-expert-tp-manifest.py per-family output (native library sha256, tp_degree, intermediate); io.ds41rt.v41.spark_tp_roles names the built families",
+    "sparkinfer_revision": "image label io.cuteafd.sparkinfer.revision",
+    "expert_tp_manifests": "scripts/write-v41-expert-tp-manifest.py per-family output (native library sha256, tp_degree, intermediate); io.cuteafd.v41.spark_tp_roles names the built families",
     "requested_rtx_expert_layers": "the requested value: 'auto' when --rtx-expert-layers is absent, else the explicit integer",
     "resolved_rtx_expert_layers": "the ACTUAL integer boundary from the coordinator plan.json (or the single-RTX resolved value), never 'auto'",
     "spark_first_layer": "min(resolved_rtx_expert_layers, 39), the value passed to the workers as --first-layer",
@@ -65,7 +65,7 @@
   "coordinator_argv": [
     "serve-native",
     "--snapshot", "REPLACE-ME",
-    "--native-lib", "/opt/ds41rt/lib/libds41rt_native.so",
+    "--native-lib", "/opt/cuteafd/lib/libcuteafd_native.so",
     "--peers", "REPLACE-ME",
     "--rtx-gpus", "2",
     "--listen", "0.0.0.0:8000",
@@ -82,25 +82,25 @@
   ],
   "worker_argv": [
     [
-      "expertd-native", "--snapshot", "REPLACE-ME", "--native-lib", "/opt/ds41rt/lib/libds41rt_native.so",
+      "expertd-native", "--snapshot", "REPLACE-ME", "--native-lib", "/opt/cuteafd/lib/libcuteafd_native.so",
       "--rank", "0", "--world", "4", "--capacity", "REPLACE-ME",
       "--device-budget-bytes", "107374182400", "--first-layer", "REPLACE-ME",
       "--listen", "0.0.0.0:19441", "--spark-tp", "4", "--spark-ep", "1"
     ],
     [
-      "expertd-native", "--snapshot", "REPLACE-ME", "--native-lib", "/opt/ds41rt/lib/libds41rt_native.so",
+      "expertd-native", "--snapshot", "REPLACE-ME", "--native-lib", "/opt/cuteafd/lib/libcuteafd_native.so",
       "--rank", "1", "--world", "4", "--capacity", "REPLACE-ME",
       "--device-budget-bytes", "107374182400", "--first-layer", "REPLACE-ME",
       "--listen", "0.0.0.0:19441", "--spark-tp", "4", "--spark-ep", "1"
     ],
     [
-      "expertd-native", "--snapshot", "REPLACE-ME", "--native-lib", "/opt/ds41rt/lib/libds41rt_native.so",
+      "expertd-native", "--snapshot", "REPLACE-ME", "--native-lib", "/opt/cuteafd/lib/libcuteafd_native.so",
       "--rank", "2", "--world", "4", "--capacity", "REPLACE-ME",
       "--device-budget-bytes", "107374182400", "--first-layer", "REPLACE-ME",
       "--listen", "0.0.0.0:19441", "--spark-tp", "4", "--spark-ep", "1"
     ],
     [
-      "expertd-native", "--snapshot", "REPLACE-ME", "--native-lib", "/opt/ds41rt/lib/libds41rt_native.so",
+      "expertd-native", "--snapshot", "REPLACE-ME", "--native-lib", "/opt/cuteafd/lib/libcuteafd_native.so",
       "--rank", "3", "--world", "4", "--capacity", "REPLACE-ME",
       "--device-budget-bytes", "107374182400", "--first-layer", "REPLACE-ME",
       "--listen", "0.0.0.0:19441", "--spark-tp", "4", "--spark-ep", "1"

@@ -71,12 +71,12 @@ def export(output: Path, capacity: int, experts: int, topk: int) -> dict:
             shared_bytes=kernel.metadata.shared, pointer_slots=indices,
             live_numel=live, grid_x=grid, trailing_null_scratch_pointers=2))
     source += [f'struct Context {{ CUcontext owner; CUmodule modules[{len(objects)}]{{}}; CUfunction functions[{len(objects)}]{{}}; }};',
-        'extern "C" int ds41rt_exl3_routes_destroy(void* opaque) {',
+        'extern "C" int cuteafd_exl3_routes_destroy(void* opaque) {',
         'auto* ctx = static_cast<Context*>(opaque); if (!ctx) return CUDA_SUCCESS;',
         'CUcontext current; CUresult error = cuCtxGetCurrent(&current); if (error) return error;',
         'if (current != ctx->owner) return CUDA_ERROR_INVALID_CONTEXT;',
         'for (auto module : ctx->modules) if (module) cuModuleUnload(module); delete ctx; return CUDA_SUCCESS; }',
-        'extern "C" int ds41rt_exl3_routes_create(void** output) {',
+        'extern "C" int cuteafd_exl3_routes_create(void** output) {',
         'if (!output) return CUDA_ERROR_INVALID_VALUE; *output = nullptr;',
         'auto* ctx = new(std::nothrow) Context; if (!ctx) return CUDA_ERROR_OUT_OF_MEMORY;',
         'CUresult error = cuCtxGetCurrent(&ctx->owner);',
@@ -91,8 +91,8 @@ def export(output: Path, capacity: int, experts: int, topk: int) -> dict:
             f'if (!error) error = cuModuleGetFunction(&ctx->functions[{i}], ctx->modules[{i}], "{obj["symbol"]}");']
         if obj['shared_bytes'] > 49152:
             source += [f'if (!error) error = cuFuncSetAttribute(ctx->functions[{i}], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, {obj["shared_bytes"]});']
-    source += ['if (error) { ds41rt_exl3_routes_destroy(ctx); return error; } *output = ctx; return CUDA_SUCCESS; }',
-        'extern "C" int ds41rt_exl3_routes_launch(void* opaque, void* const* pointers, const uint64_t* bytes, int32_t rows, void* stream) {',
+    source += ['if (error) { cuteafd_exl3_routes_destroy(ctx); return error; } *output = ctx; return CUDA_SUCCESS; }',
+        'extern "C" int cuteafd_exl3_routes_launch(void* opaque, void* const* pointers, const uint64_t* bytes, int32_t rows, void* stream) {',
         f'if (!opaque || !pointers || !bytes || rows < 1 || rows > {capacity}) return CUDA_ERROR_INVALID_VALUE;',
         'auto* ctx = static_cast<Context*>(opaque); CUcontext current;',
         'CUresult error = cuCtxGetCurrent(&current); if (error) return error;',
@@ -120,7 +120,7 @@ def export(output: Path, capacity: int, experts: int, topk: int) -> dict:
             'if (error) return error; }']
     source += ['return CUDA_SUCCESS; }']
     (output/'v41_exl3_routes.cc').write_text('\n'.join(source)+'\n')
-    manifest = dict(schema='ds41rt.v41-exl3-routes-aot.v1',
+    manifest = dict(schema='cuteafd.v41-exl3-routes-aot.v1',
         sparkinfer_revision=_pinned_sparkinfer.REVISION,
         compute=[props.major,props.minor], capacity=capacity, topk=topk,
         experts=experts, block_size=8, small_prefix=plan.use_small_prefix,

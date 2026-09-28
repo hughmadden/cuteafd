@@ -27,7 +27,7 @@ def swizzle(plain):
 
 def main():
     library = C.CDLL(sys.argv[1])
-    fn = library.ds41rt_cuda_nvfp4_pad_expert_async
+    fn = library.cuteafd_cuda_nvfp4_pad_expert_async
     fn.argtypes = [C.POINTER(Buffer), C.POINTER(Buffer), C.c_size_t, C.c_size_t, C.c_void_p]
     fn.restype = C.c_int
     torch.manual_seed(72)

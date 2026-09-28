@@ -5,22 +5,22 @@ Ported from:
   argument parsing/validation invariant classes (unknown method rejected,
   group-size bounds, bits-per-weight validation, mutually exclusive options).
 - ``llama.cpp/tests/test-quant-type-selection.cpp``: per-arch tensor-type
-  selection goldens, ported as ds41rt's EXL3 format/role selection table
+  selection goldens, ported as cuteafd's EXL3 format/role selection table
   (projection tensor dtypes/shapes per integer tier, per-stem name routing).
 
-ds41rt's quant-config validation surface is ``ds41rt_runtime.exl3_quantizer``
+cuteafd's quant-config validation surface is ``cuteafd_runtime.exl3_quantizer``
 (source-checkpoint and artifact-plan validation),
-``ds41rt_runtime.exl3_artifact_contract`` (GPTQModel-native EXL3 publication
+``cuteafd_runtime.exl3_artifact_contract`` (GPTQModel-native EXL3 publication
 and inline mixed-tier policy validation), and
-``ds41rt_runtime.exl3_experts.validate_exl3_expert_snapshot`` (fail-closed
+``cuteafd_runtime.exl3_experts.validate_exl3_expert_snapshot`` (fail-closed
 calibrated-snapshot validation). The invariants are ported against those.
 
 Mapping notes / gaps:
 - vLLM's ``QuantSpec`` name registry and ``targets`` pattern matching have no
-  ds41rt analog (ds41rt has no online-quantization target surface); those
+  cuteafd analog (cuteafd has no online-quantization target surface); those
   upstream tests are recorded as unmapped rather than approximated.
 - llama.cpp's remote per-arch snapshot goldens require fetching upstream GGUF
-  metadata; the ds41rt analog is the deterministic projection selection table
+  metadata; the cuteafd analog is the deterministic projection selection table
   in ``_generated_projection_tensors`` plus the checkpoint-native/GPTQModel
   name-routing helpers, which are pinned as local goldens.
 """
@@ -33,7 +33,7 @@ from pathlib import Path
 
 import pytest
 
-from ds41rt_runtime.exl3_artifact_contract import (
+from cuteafd_runtime.exl3_artifact_contract import (
     INLINE_MIXED_SCHEMA,
     INLINE_MIXED_SCORE,
     RECIPE as CONTRACT_RECIPE,
@@ -42,8 +42,8 @@ from ds41rt_runtime.exl3_artifact_contract import (
     _recipe_for_bits,
     validate_inline_mixed_policy,
 )
-from ds41rt_runtime.exl3_experts import validate_exl3_expert_snapshot
-from ds41rt_runtime.exl3_quantizer import (
+from cuteafd_runtime.exl3_experts import validate_exl3_expert_snapshot
+from cuteafd_runtime.exl3_quantizer import (
     EXL3_BITS,
     EXL3_CODEBOOK,
     EXL3_RECIPE,
@@ -105,7 +105,7 @@ def _exl3_quant_config(*, recipe: str = EXL3_RECIPE) -> dict:
             "gate_clamp": [None, 1.0],
             "up_clamp": [-1.0, 1.0],
         },
-        "ds41rt": {
+        "cuteafd": {
             "schema": EXL3_SCHEMA,
             "schema_version": EXL3_SCHEMA_VERSION,
             "recipe": recipe,
@@ -149,7 +149,7 @@ def _shape() -> ModelShape:
 
 def test_unknown_source_quant_method_rejected(tmp_path: Path) -> None:
     # Ported invariant: an unknown quantization method must be rejected, not
-    # silently mapped to a fallback. ds41rt's EXL3 converter only accepts the
+    # silently mapped to a fallback. cuteafd's EXL3 converter only accepts the
     # native FP4/FP8 source checkpoint.
     config = _source_config()
     config["quantization_config"] = {"quant_method": "marlin"}
@@ -183,7 +183,7 @@ def test_unknown_expert_dtype_rejected(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Group-size bounds (vLLM group-size invariants mapped onto ds41rt's EXL3
+# Group-size bounds (vLLM group-size invariants mapped onto cuteafd's EXL3
 # H128 / TP4 alignment requirements)
 # ---------------------------------------------------------------------------
 
@@ -396,7 +396,7 @@ def _valid_inline_mixed_policy() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Fail-closed calibrated-snapshot validation (ds41rt's own contract, in the
+# Fail-closed calibrated-snapshot validation (cuteafd's own contract, in the
 # spirit of vLLM's resolve/validate invariants)
 # ---------------------------------------------------------------------------
 
@@ -434,17 +434,17 @@ def test_wrong_codebook_rejected(tmp_path: Path) -> None:
 def test_wrong_schema_version_rejected(tmp_path: Path) -> None:
     config = _source_config()
     quant = _exl3_quant_config()
-    quant["ds41rt"]["schema_version"] = 2
+    quant["cuteafd"]["schema_version"] = 2
     config["quantization_config"] = quant
     snapshot = _write_config(tmp_path, config)
-    with pytest.raises(ValueError, match="ds41rt.schema_version"):
+    with pytest.raises(ValueError, match="cuteafd.schema_version"):
         validate_exl3_expert_snapshot(snapshot)
 
 
 def test_tampered_quantizer_provenance_rejected(tmp_path: Path) -> None:
     config = _source_config()
     quant = _exl3_quant_config()
-    quant["ds41rt"]["quantizer_source"]["revision"] = "f" * 40
+    quant["cuteafd"]["quantizer_source"]["revision"] = "f" * 40
     config["quantization_config"] = quant
     snapshot = _write_config(tmp_path, config)
     with pytest.raises(ValueError, match="provenance"):

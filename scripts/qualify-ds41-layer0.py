@@ -97,7 +97,7 @@ def main():
             assert case['positions'] == list(range(5))*16
             raw = (a.rank_dir/f'rank0/l0-c{number}-request.bin').read_bytes()
             payloads[f'case{number}-request'] = hashlib.sha256(raw).hexdigest()
-            assert raw[:8] == b'DS41RTE3' and struct.unpack_from('<I',raw,12)[0] == 96
+            assert raw[:8] == b'CUTEAFD3' and struct.unpack_from('<I',raw,12)[0] == 96
             assert struct.unpack_from('<III',raw,32) == (0,80,5120)
             assert len(raw) == 96+3200+5760+819200
             for rank in range(1,4): assert (a.rank_dir/f'rank{rank}/l0-c{number}-request.bin').read_bytes() == raw

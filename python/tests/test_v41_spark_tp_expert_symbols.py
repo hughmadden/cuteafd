@@ -37,8 +37,8 @@ inline int cudaDeviceGetAttribute(int* value, int attribute, int) {
 # Placeholders avoid brace escaping so the C aggregate stays literal.
 VARIANT = """
 #pragma once
-#define DS41RT_V41_CC_MINOR 1
-#define DS41RT_V41_SMS 188
+#define CUTEAFD_V41_CC_MINOR 1
+#define CUTEAFD_V41_SMS 188
 static int launches = 0;
 static void initialize(void**) {}
 static void load(void**) {}
@@ -46,7 +46,7 @@ static void launch(void** args, int count) {
   ++launches;
   *static_cast<int*>(args[52]) = count == 53 ? 0 : 1;
 }
-#define DS41RT_V41_VARIANTS {{2,__ROLE__,384,5120,__LOGICAL__,__KERNEL__,6,16,4096,32,32,64,64,188,7},initialize,load,launch,{0}}
+#define CUTEAFD_V41_VARIANTS {{2,__ROLE__,384,5120,__LOGICAL__,__KERNEL__,6,16,4096,32,32,64,64,188,7},initialize,load,launch,{0}}
 """
 
 
@@ -58,18 +58,18 @@ def _variant(role: int, logical: int, kernel: int) -> str:
     )
 
 PROGRAM = """
-#include "ds41rt_v41_experts.h"
+#include "cuteafd_v41_experts.h"
 #include <cassert>
 #include <cstdio>
 
-extern "C" int32_t ds41rt_v41_initialize_scratch_storage_async(
+extern "C" int32_t cuteafd_v41_initialize_scratch_storage_async(
     void*, uint64_t, uint64_t, uint64_t, uint32_t, void*) {{ return 0; }}
 
-static void check(int32_t (*info)(int32_t, ds41rt_v41_expert_info_t*),
+static void check(int32_t (*info)(int32_t, cuteafd_v41_expert_info_t*),
                   int32_t (*initialize)(int32_t, void**),
-                  int32_t (*launch)(void*, const ds41rt_v41_expert_launch_t*),
+                  int32_t (*launch)(void*, const cuteafd_v41_expert_launch_t*),
                   uint32_t role, uint32_t intermediate) {{
-  ds41rt_v41_expert_info_t metadata{{}};
+  cuteafd_v41_expert_info_t metadata{{}};
   assert(info(16, &metadata) == 0);
   assert(metadata.role == role);
   assert(metadata.experts == 384 && metadata.topk == 6 && metadata.hidden_size == 5120);
@@ -79,7 +79,7 @@ static void check(int32_t (*info)(int32_t, ds41rt_v41_expert_info_t*),
   assert(metadata.capacity_rows == 16 && metadata.scratch_bytes > 0);
   void* kernel = nullptr;
   assert(initialize(16, &kernel) == 0 && kernel != nullptr);
-  ds41rt_v41_expert_launch_t args{{}};
+  cuteafd_v41_expert_launch_t args{{}};
   for (auto& pointer : args.tensors) pointer = &args;
   args.num_tokens = 1;
   args.scatter_rows = 6;
@@ -92,14 +92,14 @@ static void check(int32_t (*info)(int32_t, ds41rt_v41_expert_info_t*),
 }}
 
 int main() {{
-  check(ds41rt_v41_spark_tp2_expert_info, ds41rt_v41_spark_tp2_expert_initialize,
-        ds41rt_v41_spark_tp2_expert_launch, 5, 1152);
-  check(ds41rt_v41_spark_tp3_expert_info, ds41rt_v41_spark_tp3_expert_initialize,
-        ds41rt_v41_spark_tp3_expert_launch, 6, 768);
+  check(cuteafd_v41_spark_tp2_expert_info, cuteafd_v41_spark_tp2_expert_initialize,
+        cuteafd_v41_spark_tp2_expert_launch, 5, 1152);
+  check(cuteafd_v41_spark_tp3_expert_info, cuteafd_v41_spark_tp3_expert_initialize,
+        cuteafd_v41_spark_tp3_expert_launch, 6, 768);
   // The two families must be distinct symbols with distinct role ids.
-  ds41rt_v41_expert_info_t tp2{{}}, tp3{{}};
-  assert(ds41rt_v41_spark_tp2_expert_info(16, &tp2) == 0);
-  assert(ds41rt_v41_spark_tp3_expert_info(16, &tp3) == 0);
+  cuteafd_v41_expert_info_t tp2{{}}, tp3{{}};
+  assert(cuteafd_v41_spark_tp2_expert_info(16, &tp2) == 0);
+  assert(cuteafd_v41_spark_tp3_expert_info(16, &tp3) == 0);
   assert(tp2.role != tp3.role);
   assert(tp2.logical_intermediate != tp3.logical_intermediate);
   std::printf("spark tp2/tp3 symbol contract ok\\n");

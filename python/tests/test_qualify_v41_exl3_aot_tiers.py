@@ -3,7 +3,7 @@
 The oracle compares a compiled AOT module against B12x on real checkpoint tiles.
 These tests cover only its pure contract logic: which serving family a checkpoint's
 real trellis widths form, and whether an export may claim it. The family rule mirrors
-`decoder_family` in `rust/crates/ds41rt-loader/src/v41_exl3.rs`, so one test reads
+`decoder_family` in `rust/crates/cuteafd-loader/src/v41_exl3.rs`, so one test reads
 that source and fails if the loader's rule moves underneath us.
 """
 from __future__ import annotations
@@ -21,7 +21,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location(
     'exl3_aot_oracle', ROOT / 'python' / 'tools' / 'qualify_v41_exl3_aot.py')
-LOADER_SOURCE = ROOT / 'rust' / 'crates' / 'ds41rt-loader' / 'src' / 'v41_exl3.rs'
+LOADER_SOURCE = ROOT / 'rust' / 'crates' / 'cuteafd-loader' / 'src' / 'v41_exl3.rs'
 ORACLE_SOURCE = ROOT / 'python' / 'tools' / 'qualify_v41_exl3_aot.py'
 
 PROJECTIONS = ('w1', 'w3', 'w2')

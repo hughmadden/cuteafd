@@ -269,7 +269,7 @@ def main() -> int:
         }))
         return 0
     except SelectionError as error:
-        print(f"ds41rt release: {error}", file=sys.stderr)
+        print(f"cuteafd release: {error}", file=sys.stderr)
         return 2
 
 

@@ -54,12 +54,12 @@ def run(libs, requests, per_request):
     selected[:, :5] = torch.tensor([0, 255, 256, 512, 513], device="cuda")
     calls = []
     for i, lib in enumerate(libs):
-        validate = lib.ds41rt_v41_sparse_attention_batch_validate
+        validate = lib.cuteafd_v41_sparse_attention_batch_validate
         validate.argtypes = [C.c_void_p]*5 + [C.c_int32] + [C.c_void_p]*4 + [C.c_uint64, C.c_int32, C.c_int32]
         status = validate(q.data_ptr(), sink.data_ptr(), meta.data_ptr(), selected.data_ptr(), outputs[i].data_ptr(),
             rows, C.cast(host_views, C.c_void_p), desc.data_ptr(), begin.data_ptr(), scratch.data_ptr(), scratch.numel()*4, 10, 2)
         assert status == 0, status
-        fn = lib.ds41rt_v41_sparse_attention_batch if i == 0 else lib.ds41rt_v41_sparse_attention_batch_aot
+        fn = lib.cuteafd_v41_sparse_attention_batch if i == 0 else lib.cuteafd_v41_sparse_attention_batch_aot
         fn.argtypes = [C.c_void_p]*5 + [C.c_int32] + [C.c_void_p]*4 + [C.c_int32, C.c_int32]
 
         def launch(fn=fn, output=outputs[i]):
@@ -130,7 +130,7 @@ def main():
     args = parser.parse_args()
     libs = [C.CDLL(args.baseline), C.CDLL(args.candidate)]
     for lib in libs:
-        assert lib.ds41rt_v41_sparse_attention_initialize() == 0
+        assert lib.cuteafd_v41_sparse_attention_initialize() == 0
     results = []
     provenance = dict(gpu=torch.cuda.get_device_name(), torch_version=torch.__version__,
         main_revision=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),

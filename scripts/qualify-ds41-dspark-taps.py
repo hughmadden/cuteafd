@@ -17,7 +17,7 @@ def main():
     lock=json.loads((Path(__file__).resolve().parents[1]/'scripts/fixtures/ds41-reference-lock.json').read_text())
     assert hashlib.sha256(reference.read_bytes()).hexdigest()==lock['files']['inference/model.py']
     assert 'main_hiddens.append(h.mean(dim=2))' in reference.read_text()
-    lib=C.CDLL(str(args.native_lib));fn=lib.ds41rt_v41_dspark_tap
+    lib=C.CDLL(str(args.native_lib));fn=lib.cuteafd_v41_dspark_tap
     fn.argtypes=[C.c_void_p,C.c_void_p,C.c_int32,C.c_int32,C.c_void_p];fn.restype=C.c_int32
     torch.manual_seed(413);stream=torch.cuda.Stream();results=[]
     with torch.cuda.stream(stream),torch.no_grad():

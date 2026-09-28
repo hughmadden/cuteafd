@@ -45,7 +45,7 @@ def verify_source(snapshot, report_path):
     report = json.loads(Path(report_path).read_text())
     core = {key: value for key, value in report.items() if key not in {"manifest_sha256", "status"}}
     digest = hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    if (report.get("schema") != "ds41rt-v41-source-attestation-v1" or report.get("status") != "passed"
+    if (report.get("schema") != "cuteafd-v41-source-attestation-v1" or report.get("status") != "passed"
             or report.get("manifest_sha256") != digest or report.get("source_snapshot") != snapshot.name):
         raise ValueError("source attestation identity mismatch")
     paths = {str(path.relative_to(snapshot)): path for path in snapshot.rglob("*")
@@ -82,7 +82,7 @@ def read_attestation(path):
     except json.JSONDecodeError:
         standalone = None
     if isinstance(standalone, dict):
-        if standalone.get("schema") != "ds41rt-input-attestation-v1" or standalone.get("status") != "passed":
+        if standalone.get("schema") != "cuteafd-input-attestation-v1" or standalone.get("status") != "passed":
             raise ValueError("expected a passed input attestation")
         return standalone
     reports = []
@@ -91,7 +91,7 @@ def read_attestation(path):
             value = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict) and value.get("schema") == "ds41rt-input-attestation-v1":
+        if isinstance(value, dict) and value.get("schema") == "cuteafd-input-attestation-v1":
             reports.append(value)
     if len(reports) != 1 or reports[0].get("status") != "passed":
         raise ValueError("expected exactly one passed input attestation")
@@ -117,7 +117,7 @@ def prepare_inputs(snapshot, corpus, attestation):
 
 
 def validate_manifest(manifest):
-    if manifest.get("schema") != "ds41rt-quantization-runtime-v1":
+    if manifest.get("schema") != "cuteafd-quantization-runtime-v1":
         raise ValueError("unsupported runtime manifest")
     required = {"identity", "snapshot", "source_attestation", "corpus", "input_attestation", "run_root", "output",
                 "export_state", "token_file", "endpoints", "coordinator_slots"}
@@ -182,7 +182,7 @@ def run(manifest, *, resume=False):
                 if token_path.stat().st_mode & 0o077:
                     raise ValueError("worker token file must be private")
                 assignment_path = root / "search-assignments.json"
-                if recovery_evidence and recovery_evidence["schema"] == "ds41rt-continuous-search-recovery-v1":
+                if recovery_evidence and recovery_evidence["schema"] == "cuteafd-continuous-search-recovery-v1":
                     # Validate, but never rewrite or execute under, old identities.
                     # Completed candidates bypass search; only unfinished work
                     # gets a fresh auditable assignment under the new image.

@@ -30,18 +30,18 @@ def main():
     torch.manual_seed(731)
     torch.backends.cuda.matmul.allow_tf32 = False
     lib = C.CDLL(str(a.native_lib.resolve()))
-    old = lib.ds41rt_v41_router
+    old = lib.cuteafd_v41_router
     old.argtypes = [C.c_void_p]*8 + [C.c_int32, C.c_int32, C.c_void_p]
-    select = lib.ds41rt_v41_router_select_logits
+    select = lib.cuteafd_v41_router_select_logits
     select.argtypes = [C.c_void_p]*6 + [C.c_int32, C.c_int32, C.c_void_p]
     serving = None
     if a.serving_lib:
         serving_lib = C.CDLL(str(a.serving_lib.resolve()))
-        initialize = serving_lib.ds41rt_v41_router_initialize
+        initialize = serving_lib.cuteafd_v41_router_initialize
         initialize.restype = C.c_int32
         assert initialize() == 0
         assert initialize() == 0
-        serving = serving_lib.ds41rt_v41_router
+        serving = serving_lib.cuteafd_v41_router
         serving.argtypes = old.argtypes
     compiled = {n: compile_v41_router_scores_aot(experts=n) for n in (128, 384)}
     # Compile both model geometries once. Subsequent live rows only change launch args.

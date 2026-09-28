@@ -45,15 +45,15 @@ def bind(name, types):
     return call
 
 
-create = bind("ds41rt_v41_grouped_output_create", [P, C.c_uint64, C.POINTER(P)])
-group = bind("ds41rt_v41_grouped_output_launch", [P, P, P, P, I32, P])
-destroy = bind("ds41rt_v41_grouped_output_destroy", [P])
-dequant = bind("ds41rt_v41_grouped_output_dequant", [P, P, P, P])
-info_fn = bind("ds41rt_v41_fp8_matrix_info", [I32, I32, I32, C.POINTER(Info)])
-init = bind("ds41rt_v41_fp8_matrix_initialize", [I32, I32, I32, C.POINTER(P)])
-pack = bind("ds41rt_v41_fp8_matrix_pack_scales", [P, P, I32, I32, P])
-scratch_init = bind("ds41rt_v41_fp8_initialize_scratch", [P, P, C.c_uint64, P, P])
-linear = bind("ds41rt_v41_fp8_launch", [P, P, P, P, P, C.c_uint64, P, P, I32, P])
+create = bind("cuteafd_v41_grouped_output_create", [P, C.c_uint64, C.POINTER(P)])
+group = bind("cuteafd_v41_grouped_output_launch", [P, P, P, P, I32, P])
+destroy = bind("cuteafd_v41_grouped_output_destroy", [P])
+dequant = bind("cuteafd_v41_grouped_output_dequant", [P, P, P, P])
+info_fn = bind("cuteafd_v41_fp8_matrix_info", [I32, I32, I32, C.POINTER(Info)])
+init = bind("cuteafd_v41_fp8_matrix_initialize", [I32, I32, I32, C.POINTER(P)])
+pack = bind("cuteafd_v41_fp8_matrix_pack_scales", [P, P, I32, I32, P])
+scratch_init = bind("cuteafd_v41_fp8_initialize_scratch", [P, P, C.c_uint64, P, P])
+linear = bind("cuteafd_v41_fp8_launch", [P, P, P, P, P, C.c_uint64, P, P, I32, P])
 root = args.snapshot
 weight_map = json.loads((root / "model.safetensors.index.json").read_text())[
     "weight_map"

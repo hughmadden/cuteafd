@@ -42,8 +42,8 @@ from pathlib import Path
 
 import torch
 
-# Canonical DS41RT resolver: verifies the pinned SparkInfer tree and its lock
-# (honouring DS41RT_SPARKINFER_SOURCE_DIR), puts that tree first on sys.path, and
+# Canonical CUTEAFD resolver: verifies the pinned SparkInfer tree and its lock
+# (honouring CUTEAFD_SPARKINFER_SOURCE_DIR), puts that tree first on sys.path, and
 # fails closed if `b12x` does not import from it. Import it before anything from
 # SparkInfer so an unverified copy can never be used.
 import _pinned_sparkinfer  # noqa: F401  (import side effect is the point)
@@ -64,7 +64,7 @@ SUPPORTED_SLICE_WIDTHS = (64, 128, 192)
 
 def _load_bench():
     path = ROOT / "python" / "tools" / "benchmark_v41_ep_groups.py"
-    spec = importlib.util.spec_from_file_location("ds41rt_ep_bench", path)
+    spec = importlib.util.spec_from_file_location("cuteafd_ep_bench", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -233,7 +233,7 @@ def load_route_fixture(path, experts, topk, rows):
     """
     import json as _json
     payload = _json.loads(Path(path).read_text())
-    if payload.get("schema") != "ds41rt.tp-ep-reuse-fixture.v1":
+    if payload.get("schema") != "cuteafd.tp-ep-reuse-fixture.v1":
         raise ValueError(f"unsupported fixture schema {payload.get('schema')!r}")
     routes = payload["routes"]
     if len(routes) < rows:
@@ -339,8 +339,8 @@ def expert_route_counts(ids, experts):
 def expert_cost(rows, *, weight_cost=1.0, tile_cost=0.0, tile_rows=16):
     """Cost of serving one expert with ``rows`` routed rows.
 
-    Authoritative form, matching ``ds41rt-core``'s ``ReplicatedExpertCostModel``
-    (``rust/crates/ds41rt-core/src/replicated_expert_schedule.rs``):
+    Authoritative form, matching ``cuteafd-core``'s ``ReplicatedExpertCostModel``
+    (``rust/crates/cuteafd-core/src/replicated_expert_schedule.rs``):
 
         active   -> expert_weight_cost + ceil(rows / tile_rows) * tile_cost
         inactive -> 0
@@ -369,7 +369,7 @@ def lpt_owner(ids, groups, rank, experts, *, weight_cost=1.0, tile_cost=0.0,
     ``expert_weight_cost`` is a UNIFORM cost for serving the expert at all — it is
     charged ONCE per active expert, NOT per routed row. ``tile_cost`` prices each
     partially filled tile of ``tile_rows`` rows. This mirrors
-    ``ds41rt-core``'s ``ReplicatedExpertCostModel``. Inactive experts cost exactly
+    ``cuteafd-core``'s ``ReplicatedExpertCostModel``. Inactive experts cost exactly
     0 and are skipped, so a positive tile_cost never charges a group for an expert
     it does not serve.
 
@@ -955,7 +955,7 @@ def parse_args(argv=None):
                         help="use greedy LPT ownership instead of modulo")
     parser.add_argument("--weight-cost", type=float, default=1.0,
                         help="uniform cost per ACTIVE expert (charged once, not "
-                             "per row); matches ds41rt-core expert_weight_cost")
+                             "per row); matches cuteafd-core expert_weight_cost")
     parser.add_argument("--tile-cost", type=float, default=0.0,
                         help="cost per partially filled tile_rows work tile")
     parser.add_argument("--tile-rows", type=int, default=16,

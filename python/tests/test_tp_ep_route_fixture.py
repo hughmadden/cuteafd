@@ -23,7 +23,7 @@ FIXTURE = ROOT / "scripts" / "fixtures" / "tp-ep-reuse-m64-e384.json"
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("ds41rt_ep_timing_fx", HARNESS)
+    spec = importlib.util.spec_from_file_location("cuteafd_ep_timing_fx", HARNESS)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -32,7 +32,7 @@ def _load():
 timing = _load()
 
 
-def write_fixture(tmp_path, routes, schema="ds41rt.tp-ep-reuse-fixture.v1"):
+def write_fixture(tmp_path, routes, schema="cuteafd.tp-ep-reuse-fixture.v1"):
     payload = {"schema": schema, "routes": routes}
     path = tmp_path / "fixture.json"
     path.write_text(json.dumps(payload))
@@ -105,7 +105,7 @@ def test_fixture_hash_is_stable_and_content_bound(tmp_path):
 
     path = write_fixture(tmp_path, [[0, 1, 2, 3, 4, 5]] * 2)
     before = hashlib.sha256(path.read_bytes()).hexdigest()
-    path.write_text(json.dumps({"schema": "ds41rt.tp-ep-reuse-fixture.v1",
+    path.write_text(json.dumps({"schema": "cuteafd.tp-ep-reuse-fixture.v1",
                                 "routes": [[0, 1, 2, 3, 4, 6]] * 2}))
     after = hashlib.sha256(path.read_bytes()).hexdigest()
     assert before != after

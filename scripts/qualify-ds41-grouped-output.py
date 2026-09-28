@@ -23,10 +23,10 @@ def main():
     torch.backends.cuda.matmul.allow_tf32=False
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=False
     lib=C.CDLL(str(args.native_lib));P=C.c_void_p;I=C.c_int32
-    create=lib.ds41rt_v41_grouped_output_create; create.argtypes=[P,C.c_uint64,C.POINTER(P)];create.restype=I
-    destroy=lib.ds41rt_v41_grouped_output_destroy;destroy.argtypes=[P];destroy.restype=I
-    launch=lib.ds41rt_v41_grouped_output_launch;launch.argtypes=[P,P,P,P,I,P];launch.restype=I
-    dequant=lib.ds41rt_v41_grouped_output_dequant;dequant.argtypes=[P,P,P,P];dequant.restype=I
+    create=lib.cuteafd_v41_grouped_output_create; create.argtypes=[P,C.c_uint64,C.POINTER(P)];create.restype=I
+    destroy=lib.cuteafd_v41_grouped_output_destroy;destroy.argtypes=[P];destroy.restype=I
+    launch=lib.cuteafd_v41_grouped_output_launch;launch.argtypes=[P,P,P,P,I,P];launch.restype=I
+    dequant=lib.cuteafd_v41_grouped_output_dequant;dequant.argtypes=[P,P,P,P];dequant.restype=I
     results=[];stream=torch.cuda.Stream()
     with torch.cuda.stream(stream),torch.no_grad():
         workspace=torch.empty(4*1024*1024,device='cuda',dtype=torch.uint8);handle=P()

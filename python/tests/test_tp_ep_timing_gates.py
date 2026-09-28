@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[2]
 # rather than crashing during collection. The env override validates the absent
 # state without renaming the live generated file.
 CONSOLIDATE = Path(os.environ.get(
-    "DS41RT_TP_EP_CONSOLIDATE_ARTIFACT",
+    "CUTEAFD_TP_EP_CONSOLIDATE_ARTIFACT",
     str(ROOT / "runs" / "tp-ep-kernel" / "timing" / "consolidate.py")))
 if not CONSOLIDATE.is_file():
     pytest.skip(f"timing consolidator artifact not present: {CONSOLIDATE}",
@@ -32,7 +32,7 @@ if not CONSOLIDATE.is_file():
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("ds41rt_consolidate", CONSOLIDATE)
+    spec = importlib.util.spec_from_file_location("cuteafd_consolidate", CONSOLIDATE)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

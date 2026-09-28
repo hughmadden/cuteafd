@@ -17,7 +17,7 @@ def main():
     torch.cuda.set_device(0);torch.manual_seed(4191)
     lib=C.CDLL(str(a.native_lib.resolve()))
     baseline_lib=C.CDLL(str(a.baseline_lib.resolve()))
-    call=lib.ds41rt_v41_router;baseline=baseline_lib.ds41rt_v41_router
+    call=lib.cuteafd_v41_router;baseline=baseline_lib.cuteafd_v41_router
     call.argtypes=baseline.argtypes=[C.c_void_p]*8+[C.c_int32,C.c_int32,C.c_void_p]
     rows,experts=26,384
     x=torch.randn(rows,5120,device='cuda',dtype=torch.bfloat16)
@@ -27,8 +27,8 @@ def main():
     args=[t.data_ptr() for t in (x,w,bias,bias,mask,scores,ids,routing)]+[rows,experts,torch.cuda.current_stream().cuda_stream]
     # A launch must not implicitly load modules during graph preparation/replay.
     assert call(*args)==600  # cudaErrorNotReady
-    assert lib.ds41rt_v41_router_initialize()==0
-    assert lib.ds41rt_v41_router_initialize()==0
+    assert lib.cuteafd_v41_router_initialize()==0
+    assert lib.cuteafd_v41_router_initialize()==0
     checks=[]
     for slot,value in [(8,0),(8,-1),(8,4097),(9,127),(0,0),(1,0),(2,0),(3,0),(5,0),(6,0),(7,0),(5,x.data_ptr()),(5,(1<<64)-16)]:
         bad=args.copy();bad[slot]=value

@@ -17,7 +17,7 @@ class RuntimeTest(unittest.TestCase):
     def test_attestation_log_requires_one_passed_report(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "attestation.log"
-            report = dict(schema="ds41rt-input-attestation-v1", status="passed")
+            report = dict(schema="cuteafd-input-attestation-v1", status="passed")
             path.write_text("library banner\n" + json.dumps(report) + "\n")
             self.assertEqual(read_attestation(path), report)
             path.write_text(json.dumps(report) + "\n" + json.dumps(report))
@@ -36,7 +36,7 @@ class RuntimeTest(unittest.TestCase):
             (snapshot / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"weight": shard.name}}))
             files = {path.name: dict(bytes=path.stat().st_size, sha256=hashlib.sha256(path.read_bytes()).hexdigest())
                      for path in snapshot.iterdir()}
-            core = dict(schema="ds41rt-v41-source-attestation-v1", source_snapshot="snapshot", files=files,
+            core = dict(schema="cuteafd-v41-source-attestation-v1", source_snapshot="snapshot", files=files,
                         tensor_count=1, shard_count=1)
             digest = hashlib.sha256(json.dumps(core, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
             report = root / "source.json"
@@ -52,7 +52,7 @@ class RuntimeTest(unittest.TestCase):
                 verify_source(snapshot, report)
 
     def test_manifest_requires_complete_topology(self):
-        manifest = dict(schema="ds41rt-quantization-runtime-v1", identity={"run": "test"},
+        manifest = dict(schema="cuteafd-quantization-runtime-v1", identity={"run": "test"},
                         endpoints=[dict(name=name, url="http://" + name, preflight_sha256="test", image_digest="test")
                                    for name in ("ostrich", "dodo", "emu", "kiwi")],
                         coordinator_slots=[dict(device=f"cuda:{i}", gpu_uuid=str(i), preflight_sha256="test", image_digest="test")

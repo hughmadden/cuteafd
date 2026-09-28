@@ -31,10 +31,10 @@ def validate_abi(path: Path, label: str, kind: str) -> dict:
     if kind == 'hc_lagged':
         pointers = ('residual','fn','scale','bias','incoming','norm','predicted','post','comb','normalized','scratch')
         scalars, stream = ('rows',), 'stream'
-    expected = [f'ds41rt_{label}_Kernel_Module_t *module']
+    expected = [f'cuteafd_{label}_Kernel_Module_t *module']
     expected += [f'void *{name}' for name in pointers]
     expected += [f'int32_t {name}' for name in scalars] + [f'cudaStream_t {stream}']
-    signature = re.search(r'static inline int32_t cute_dsl_ds41rt_' + re.escape(label) + r'_wrapper\(([^)]*)\)', header)
+    signature = re.search(r'static inline int32_t cute_dsl_cuteafd_' + re.escape(label) + r'_wrapper\(([^)]*)\)', header)
     if not signature or re.sub(r'\s+', '', signature[1]) != re.sub(r'\s+', '', ','.join(expected)):
         raise ValueError(f'unexpected generated ABI: {path}')
     symbols = re.findall(r'void (_mlir_\w+)\(void \*\*args, int32_t num_args\);', header)
@@ -51,16 +51,16 @@ def validate_abi(path: Path, label: str, kind: str) -> dict:
 def dispatch_header(output: Path, manifest: dict) -> None:
     from b12x._lib.quant.mxfp8_rows import mxfp8_rows_quant_aot_grid
     lines = ['#pragma once', '#include <stdint.h>',
-             f"#define DS41RT_V41_FP8_SMS {manifest['physical_sms']}"]
+             f"#define CUTEAFD_V41_FP8_SMS {manifest['physical_sms']}"]
     lines.append('#include "v41_hc_project.h"')
-    prefix = '_mlir_ds41rt_v41_hc_project'
-    lines.append('#define DS41RT_V41_HC_PROJECT_MODULE {' + ','.join((
+    prefix = '_mlir_cuteafd_v41_hc_project'
+    lines.append('#define CUTEAFD_V41_HC_PROJECT_MODULE {' + ','.join((
         prefix + '_cuda_init', prefix + '_cuda_load_to_device',
         manifest['hc_project']['abi']['symbol'])) + '}')
     if 'hc_lagged' in manifest:
         lines.append('#include "v41_hc_lagged.h"')
-        prefix = '_mlir_ds41rt_v41_hc_lagged'
-        lines.append('#define DS41RT_V41_HC_LAGGED_MODULE {' + ','.join((prefix + '_cuda_init', prefix + '_cuda_load_to_device', manifest['hc_lagged']['abi']['symbol'])) + '}')
+        prefix = '_mlir_cuteafd_v41_hc_lagged'
+        lines.append('#define CUTEAFD_V41_HC_LAGGED_MODULE {' + ','.join((prefix + '_cuda_init', prefix + '_cuda_load_to_device', manifest['hc_lagged']['abi']['symbol'])) + '}')
     variants = []
     for variant in manifest['variants']:
         label, capacity = variant['label'], variant['capacity']
@@ -80,13 +80,13 @@ def dispatch_header(output: Path, manifest: dict) -> None:
                 variant['activation_mma_scales_offset'], n * k // groups // 32]
         modules = []
         for kind in ('quant', 'gemm', *(['quant_rope'] if groups > 1 else [])):
-            prefix = '_mlir_ds41rt_' + label + '_' + kind
+            prefix = '_mlir_cuteafd_' + label + '_' + kind
             modules.append('{' + ','.join((prefix + '_cuda_init', prefix + '_cuda_load_to_device',
                                            variant[kind + '_abi']['symbol'])) + '}')
         if groups == 1:
             modules.append('{nullptr,nullptr,nullptr}')
         variants.append('{{' + ','.join(map(str, info)) + '},' + ','.join(modules) + ',' + label + '_grids,' + str(variant['split_k_offset']) + ',' + str(variant['split_k_slices']) + ',' + str(groups) + ',' + str(variant.get('grouped_output_offset', 0)) + '}')
-    lines.append('#define DS41RT_V41_FP8_VARIANTS ' + ','.join(variants))
+    lines.append('#define CUTEAFD_V41_FP8_VARIANTS ' + ','.join(variants))
     (output / 'v41_fp8_variants.h').write_text('\n'.join(lines) + '\n')
 
 
@@ -118,21 +118,21 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
             label = f'v41_{name}_fp8_m{capacity}'
             groups = 8 if name == 'o_a' else 1
             expected_m = capacity
-            if os.environ.get('DS41RT_EXPORT_NARROW_AOT') == '1':
+            if os.environ.get('CUTEAFD_EXPORT_NARROW_AOT') == '1':
                 from b12x._lib.dense_gemm import v41_fp8_aot_expected_m
                 expected_m = v41_fp8_aot_expected_m(capacity=capacity, input_dim=k, output_dim=n,
                     sm_count=props.multi_processor_count, num_groups=groups)
             quant = (compile_wo_grouped_quant_aot(groups=groups, group_width=k // groups)
                      if groups > 1 else compile_mxfp8_rows_quant_aot(
                          size_k=k, scale_block_size=32, expected_m=expected_m, amax_floor=1e-4))
-            quant.export_to_c(str(output), label + '_quant', 'ds41rt_' + label + '_quant')
+            quant.export_to_c(str(output), label + '_quant', 'cuteafd_' + label + '_quant')
             if groups > 1:
                 rope_quant = compile_wo_grouped_quant_aot(groups=groups, group_width=k // groups, row_frequencies=True)
-                rope_quant.export_to_c(str(output), label + '_quant_rope', 'ds41rt_' + label + '_quant_rope')
+                rope_quant.export_to_c(str(output), label + '_quant_rope', 'cuteafd_' + label + '_quant_rope')
             gemm, split_k = compile_dense_gemm_mxfp8_aot(size_m=capacity, size_n=n // groups, size_k=k // groups, num_groups=groups,
                                               expected_m=expected_m, sfb_k_replicated=False, device=device,
                                               return_split_k_metadata=True)
-            gemm.export_to_c(str(output), label + '_gemm', 'ds41rt_' + label + '_gemm')
+            gemm.export_to_c(str(output), label + '_gemm', 'cuteafd_' + label + '_gemm')
             layout = _block_fp8_linear_scratch_layout(tokens=capacity, in_features=k,
                                                     out_features=n, output_dtype=torch.bfloat16)
             split_offset = ((layout.nbytes + 255) // 256) * 256 if split_k > 1 else 0
@@ -166,12 +166,12 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
                 manifest['variants'][-1]['quant_rope_abi'] = validate_abi(output / (label + '_quant_rope.h'), label + '_quant_rope', 'group_quant')
             print(f'exported {label}', flush=True)
     from b12x.norm.mhc._v41_project import compile_v41_mhc_project_aot
-    compile_v41_mhc_project_aot().export_to_c(str(output), 'v41_hc_project', 'ds41rt_v41_hc_project')
+    compile_v41_mhc_project_aot().export_to_c(str(output), 'v41_hc_project', 'cuteafd_v41_hc_project')
     manifest['hc_project'] = {'split_k': 8, 'scratch_bytes_per_row': 1536,
         'abi': validate_abi(output / 'v41_hc_project.h', 'v41_hc_project', 'hc_project')}
-    if os.environ.get('DS41RT_EXPORT_HC_LAGGED') == '1':
+    if os.environ.get('CUTEAFD_EXPORT_HC_LAGGED') == '1':
         from b12x.norm.mhc._v41_lagged_aot import compile_v41_lagged_aot
-        compile_v41_lagged_aot().export_to_c(str(output), 'v41_hc_lagged', 'ds41rt_v41_hc_lagged')
+        compile_v41_lagged_aot().export_to_c(str(output), 'v41_hc_lagged', 'cuteafd_v41_hc_lagged')
         manifest['hc_lagged'] = {'scratch_bytes_per_row': 8000, 'max_rows': 80,
             'abi': validate_abi(output / 'v41_hc_lagged.h', 'v41_hc_lagged', 'hc_lagged')}
     dispatch_header(output, manifest)

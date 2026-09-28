@@ -99,7 +99,7 @@ def test_subset_escape_hatch_stays_available(requested, expected):
     result = _bash(f"""
 set -euo pipefail
 source "{RELEASE_COMMON}"
-export DS41RT_RELEASE_SPARK_TP_ROLES="{requested}"
+export CUTEAFD_RELEASE_SPARK_TP_ROLES="{requested}"
 {_between(BUILD, ROLES_BLOCK)}
 printf 'ROLES=%s\\n' "$spark_tp_roles"
 """)
@@ -128,7 +128,7 @@ def test_malformed_role_lists_fail_closed(raw, fragment):
 set -euo pipefail
 source "{RELEASE_COMMON}"
 {_between(BUILD, ROLES_BLOCK)}
-release_spark_tp_roles_canonical "$1" DS41RT_RELEASE_SPARK_TP_ROLES
+release_spark_tp_roles_canonical "$1" CUTEAFD_RELEASE_SPARK_TP_ROLES
 """, positional=[raw])
     assert result.returncode == 2, (raw, result.stdout, result.stderr)
     assert fragment in result.stderr, (raw, result.stderr)
@@ -180,8 +180,8 @@ def test_docker_exported_role_manifest_is_checksummed_per_role():
     block = text.split("sha256sum \\", 1)[1].split(">SHA256SUMS")[0]
     for role in ("coordinator", "spark-expert"):
         assert f"{role}/V41_EXPERT_TP_AOT.json" in block, role
-    assert 'docker cp "$coordinator_container:/opt/ds41rt/share/V41_EXPERT_TP_AOT.json"' in text
-    assert 'docker cp "$container:/opt/ds41rt/share/V41_EXPERT_TP_AOT.json"' in text
+    assert 'docker cp "$coordinator_container:/opt/cuteafd/share/V41_EXPERT_TP_AOT.json"' in text
+    assert 'docker cp "$container:/opt/cuteafd/share/V41_EXPERT_TP_AOT.json"' in text
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +204,7 @@ def test_publisher_requires_the_universal_role_membership(advertised, publishabl
 set -euo pipefail
 source "{RELEASE_COMMON}"
 {_between(PUSH, GUARD_BLOCK)}
-push_require_universal_roles '{advertised}' ghcr.io/tpurtell/ds41rt-spark-expert:v10
+push_require_universal_roles '{advertised}' ghcr.io/tpurtell/cuteafd-spark-expert:v10
 echo PUBLISHABLE
 """)
     assert (result.returncode == 0) == publishable, (advertised, result.stdout, result.stderr)
@@ -218,7 +218,7 @@ def test_publisher_names_the_first_missing_role():
 set -euo pipefail
 source "{RELEASE_COMMON}"
 {_between(PUSH, GUARD_BLOCK)}
-push_require_universal_roles 'tp2;tp3' ghcr.io/tpurtell/ds41rt-spark-expert:v10
+push_require_universal_roles 'tp2;tp3' ghcr.io/tpurtell/cuteafd-spark-expert:v10
 """)
     assert result.returncode == 2
     assert "does not advertise Spark expert role 'tp6'" in result.stderr, result.stderr
@@ -236,12 +236,12 @@ def test_publisher_reads_spark_labels_over_ssh():
     text = PUSH.read_text(encoding="utf-8")
     read = text.split('spark_roles="$(')[1].split('\n)"')[0]
     # The call goes through the shared release transport, which owns the option set
-    # (BatchMode plus any configured DS41RT_RELEASE_SSH_CONFIG); the publisher must
+    # (BatchMode plus any configured CUTEAFD_RELEASE_SSH_CONFIG); the publisher must
     # not spell options out itself.
     assert "release_ssh" in read and "docker image inspect" in read
     assert '"$spark_host"' in read
     assert "BatchMode" not in read, "options belong to scripts/release-common.sh"
-    assert 'io.ds41rt.v41.spark_tp_roles' in read
+    assert 'io.cuteafd.v41.spark_tp_roles' in read
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +284,7 @@ def test_role_build_arg_keeps_its_empty_default():
     roles the coordinator build cannot contain, and would silently override an
     operator's explicit subset request.
     """
-    assert "ARG DS41RT_V41_SPARK_TP_ROLES=\n" in DOCKERFILE.read_text(encoding="utf-8")
+    assert "ARG CUTEAFD_V41_SPARK_TP_ROLES=\n" in DOCKERFILE.read_text(encoding="utf-8")
 
 
 def _corroboration_line() -> str:
@@ -296,7 +296,7 @@ def _corroboration_line() -> str:
         "the corroboration belongs in the existing verification layer, not a new one")
     # The expected hash comes from the manifest, the actual hash from the library
     # that ships, and both are compared inside one jq expression.
-    assert '--arg lib "$(sha256sum /opt/ds41rt/lib/libds41rt_native.so | cut -d" " -f1)"' in line
+    assert '--arg lib "$(sha256sum /opt/cuteafd/lib/libcuteafd_native.so | cut -d" " -f1)"' in line
     assert "$doc.native_library_sha256 == $lib" in line
     return line
 
@@ -369,6 +369,6 @@ def test_release_builds_label_only_the_expert_image():
     text = BUILD.read_text(encoding="utf-8")
     # One resolved set for the expert image, one explicit empty for the
     # coordinator, and nothing else that can drift.
-    assert text.count('--build-arg DS41RT_V41_SPARK_TP_ROLES="$spark_tp_roles"') == 1
-    assert text.count('--build-arg DS41RT_V41_SPARK_TP_ROLES= ' + chr(92)) == 1
-    assert text.count("DS41RT_V41_SPARK_TP_ROLES=") == 2
+    assert text.count('--build-arg CUTEAFD_V41_SPARK_TP_ROLES="$spark_tp_roles"') == 1
+    assert text.count('--build-arg CUTEAFD_V41_SPARK_TP_ROLES= ' + chr(92)) == 1
+    assert text.count("CUTEAFD_V41_SPARK_TP_ROLES=") == 2

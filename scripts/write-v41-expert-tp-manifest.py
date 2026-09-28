@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write the built-role manifest for a DS41RT expert image.
+"""Write the built-role manifest for a CUTEAFD expert image.
 
 The manifest is derived from the AOT export manifests that CMake actually
 produced, never from a caller-supplied claim, and it is only written after the
@@ -42,14 +42,14 @@ import sys
 ROLE_TP_DEGREE = {"tp2": 2, "tp3": 3, "tp6": 6}
 ROLE_INTERMEDIATE = {"tp2": 1152, "tp3": 768, "tp6": 384}
 ROLE_INFO_SYMBOL = {
-    "tp2": "ds41rt_v41_spark_tp2_expert_info",
-    "tp3": "ds41rt_v41_spark_tp3_expert_info",
-    "tp6": "ds41rt_v41_spark_tp6_expert_info",
+    "tp2": "cuteafd_v41_spark_tp2_expert_info",
+    "tp3": "cuteafd_v41_spark_tp3_expert_info",
+    "tp6": "cuteafd_v41_spark_tp6_expert_info",
 }
 ROLE_LAUNCH_SYMBOL = {
-    "tp2": "ds41rt_v41_spark_tp2_expert_launch",
-    "tp3": "ds41rt_v41_spark_tp3_expert_launch",
-    "tp6": "ds41rt_v41_spark_tp6_expert_launch",
+    "tp2": "cuteafd_v41_spark_tp2_expert_launch",
+    "tp3": "cuteafd_v41_spark_tp3_expert_launch",
+    "tp6": "cuteafd_v41_spark_tp6_expert_launch",
 }
 EXPECTED_EXPERTS = 384
 EXPECTED_HIDDEN = 5120
@@ -177,7 +177,7 @@ def main() -> int:
         "--native-library",
         type=Path,
         default=None,
-        help="built libds41rt_native.so; required when a role is requested",
+        help="built libcuteafd_native.so; required when a role is requested",
     )
     args = parser.parse_args()
 

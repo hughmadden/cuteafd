@@ -15,7 +15,7 @@ SLICES = ROOT / "python" / "tools" / "export_b12x_v41_slices_aot.py"
 EXPERTS = ROOT / "python" / "tools" / "export_b12x_v41_experts_aot.py"
 CMAKE = ROOT / "native" / "CMakeLists.txt"
 CMAKE_TP = ROOT / "native" / "cmake" / "v41_spark_tp_experts.cmake"
-HEADER = ROOT / "native" / "include" / "ds41rt_v41_experts.h"
+HEADER = ROOT / "native" / "include" / "cuteafd_v41_experts.h"
 REDUCE = ROOT / "native" / "cuda" / "kernels" / "v41_route_reduce.cu"
 PACK = ROOT / "native" / "cuda" / "kernels" / "v41_expert_pack.cu"
 
@@ -101,26 +101,26 @@ def test_ordinary_exporter_routes_new_roles_only_through_fp8_slices() -> None:
 
 def test_cmake_wiring_is_opt_in_and_precompiles_capacities() -> None:
     cmake = CMAKE.read_text(encoding="utf-8")
-    assert 'set(DS41RT_V41_SPARK_TP_ROLES "" CACHE STRING' in cmake
+    assert 'set(CUTEAFD_V41_SPARK_TP_ROLES "" CACHE STRING' in cmake
     assert "include(cmake/v41_spark_tp_experts.cmake)" in cmake
-    assert "DS41RT_V41_SPARK_TP_EXPERT_TARGETS" in cmake
+    assert "CUTEAFD_V41_SPARK_TP_EXPERT_TARGETS" in cmake
 
     tp = CMAKE_TP.read_text(encoding="utf-8")
     assert "SM121 Spark expert build" in tp
-    assert 'DS41RT_V41_SPARK_TP_EXPERT_ROWS_ARG "1,16,80,256,1024,4096"' in tp
+    assert 'CUTEAFD_V41_SPARK_TP_EXPERT_ROWS_ARG "1,16,80,256,1024,4096"' in tp
     assert "--atomic-min-capacity 256" in tp
     assert "--role \"${role}\"" in tp
     assert "v41_spark_tp2_experts.cc" in tp
     assert "v41_spark_tp3_experts.cc" in tp
     # The extra artifacts are opt-in: the include only runs for a non-empty list.
-    assert 'if(NOT DS41RT_V41_SPARK_TP_ROLES STREQUAL "")' in cmake
+    assert 'if(NOT CUTEAFD_V41_SPARK_TP_ROLES STREQUAL "")' in cmake
 
 
 def test_native_role_ids_and_reducer_abi_are_declared() -> None:
     header = HEADER.read_text(encoding="utf-8")
     assert "5: Spark TP2 shard (intermediate 1152)" in header
     assert "6: Spark TP3 shard (intermediate 768)" in header
-    assert "ds41rt_v41_reduce_compact_bf16_planes_async" in header
+    assert "cuteafd_v41_reduce_compact_bf16_planes_async" in header
     assert "const uint16_t* const planes[6]" in header
     assert "uint32_t ranks" in header
 
@@ -128,8 +128,8 @@ def test_native_role_ids_and_reducer_abi_are_declared() -> None:
     assert "if constexpr (Ranks >= 6)" in reduce_source
     assert "valid_compact_planes" in reduce_source
     # The two historical fixed entry points must remain.
-    assert "ds41rt_v41_reduce_compact_bf16_async" in reduce_source
-    assert "ds41rt_v41_reduce_tp2_compact_bf16_async" in reduce_source
+    assert "cuteafd_v41_reduce_compact_bf16_async" in reduce_source
+    assert "cuteafd_v41_reduce_tp2_compact_bf16_async" in reduce_source
 
 
 def test_packer_accepts_tp3_extent_and_requires_scale_alignment() -> None:
@@ -144,28 +144,28 @@ SPARK_WIDTH_DEFAULT = "1:64,16:192,80:192,256:192,1024:192,4096:192"
 def test_spark_tp_width_maps_are_per_role_cache_knobs_with_identical_defaults() -> None:
     tp = CMAKE_TP.read_text(encoding="utf-8")
     assert (
-        f'set(DS41RT_V41_SPARK_TP2_SLICE_WIDTH "{SPARK_WIDTH_DEFAULT}" CACHE STRING'
+        f'set(CUTEAFD_V41_SPARK_TP2_SLICE_WIDTH "{SPARK_WIDTH_DEFAULT}" CACHE STRING'
         in tp
     )
     assert (
-        f'set(DS41RT_V41_SPARK_TP3_SLICE_WIDTH "{SPARK_WIDTH_DEFAULT}" CACHE STRING'
+        f'set(CUTEAFD_V41_SPARK_TP3_SLICE_WIDTH "{SPARK_WIDTH_DEFAULT}" CACHE STRING'
         in tp
     )
     assert (
-        f'set(DS41RT_V41_SPARK_TP6_SLICE_WIDTH "{SPARK_WIDTH_DEFAULT}" CACHE STRING'
+        f'set(CUTEAFD_V41_SPARK_TP6_SLICE_WIDTH "{SPARK_WIDTH_DEFAULT}" CACHE STRING'
         in tp
     )
     # The previous shared normal variable is gone: a normal set would shadow -D
     # and re-couple the roles. Exactly one copy of the default remains per role.
-    assert "set(DS41RT_V41_SPARK_TP_SLICE_WIDTH" not in tp
-    assert "DS41RT_V41_SPARK_TP_SLICE_WIDTH" not in tp
+    assert "set(CUTEAFD_V41_SPARK_TP_SLICE_WIDTH" not in tp
+    assert "CUTEAFD_V41_SPARK_TP_SLICE_WIDTH" not in tp
     assert tp.count(SPARK_WIDTH_DEFAULT) == 3
 
 
 def test_each_role_forwards_its_own_width_map_to_the_exporter() -> None:
     tp = CMAKE_TP.read_text(encoding="utf-8")
-    assert 'set(width_map "${DS41RT_V41_SPARK_TP2_SLICE_WIDTH}")' in tp
-    assert 'set(width_map "${DS41RT_V41_SPARK_TP3_SLICE_WIDTH}")' in tp
+    assert 'set(width_map "${CUTEAFD_V41_SPARK_TP2_SLICE_WIDTH}")' in tp
+    assert 'set(width_map "${CUTEAFD_V41_SPARK_TP3_SLICE_WIDTH}")' in tp
     # One shared exporter invocation consumes the role-selected map, so a TP2
     # override cannot leak into the TP3 export or vice versa.
     assert tp.count('--width "${width_map}"') == 1
@@ -174,11 +174,11 @@ def test_each_role_forwards_its_own_width_map_to_the_exporter() -> None:
 
 def test_spark_tp_width_knobs_leave_the_generic_tp4_knob_untouched() -> None:
     tp = CMAKE_TP.read_text(encoding="utf-8")
-    assert "DS41RT_V41_EXPERT_SLICE_WIDTH" not in tp
+    assert "CUTEAFD_V41_EXPERT_SLICE_WIDTH" not in tp
     experts_cmake = (ROOT / "native" / "cmake" / "v41_experts.cmake").read_text(
         encoding="utf-8"
     )
-    assert 'set(DS41RT_V41_EXPERT_SLICE_WIDTH "" CACHE STRING' in experts_cmake
+    assert 'set(CUTEAFD_V41_EXPERT_SLICE_WIDTH "" CACHE STRING' in experts_cmake
 
 
 def test_invalid_width_maps_fail_in_the_existing_exporter_validator() -> None:

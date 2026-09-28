@@ -124,7 +124,7 @@ def validate(fixture: dict) -> dict:
     experts = _strict_int(fixture["experts"], "experts")
     rows = _strict_int(fixture["rows"], "rows")
     topk = _strict_int(fixture["topk"], "topk")
-    if fixture.get("schema") != "ds41rt.tp-ep-reuse-fixture.v1":
+    if fixture.get("schema") != "cuteafd.tp-ep-reuse-fixture.v1":
         raise ValueError("unsupported fixture schema")
     if experts != 384 or topk != 6:
         raise ValueError(f"fixture must use the official E=384/top-6 geometry, got E={experts} topk={topk}")

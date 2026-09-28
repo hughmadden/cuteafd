@@ -71,13 +71,13 @@ __global__ void engram_gate_kernel(const uint16_t* x, const uint16_t* kv,
 }
 }  // namespace
 
-extern "C" ds41rt_status_t ds41rt_cuda_engram_gate_bf16_async(
+extern "C" cuteafd_status_t cuteafd_cuda_engram_gate_bf16_async(
     const uint16_t* x, const uint16_t* kv, const uint16_t* q_weight,
     const uint16_t* k_weight, const uint8_t* text_mask, uint16_t* out,
     int rows, void* cuda_stream) {
   if (!x || !kv || !q_weight || !k_weight || !out || rows <= 0) {
-    ds41rt_set_last_error_message("engram gate requires non-null tensors and positive rows");
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    cuteafd_set_last_error_message("engram gate requires non-null tensors and positive rows");
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   engram_gate_kernel<<<dim3(rows, kEngramCopies), kEngramThreads, 0,
       reinterpret_cast<cudaStream_t>(cuda_stream)>>>(x, kv, q_weight, k_weight, text_mask, out);
@@ -96,11 +96,11 @@ __global__ void engram_dequant_kernel(const uint8_t* weights, const uint8_t* sca
   out[row * 256 + col] = __bfloat16_as_ushort(__float2bfloat16_rn(static_cast<float>(value) * scale));
 }
 }
-extern "C" ds41rt_status_t ds41rt_cuda_engram_dequant_bf16_async(
+extern "C" cuteafd_status_t cuteafd_cuda_engram_dequant_bf16_async(
     const uint8_t* weights, const uint8_t* scales, uint16_t* out, int hash_rows, void* cuda_stream) {
   if (!weights || !scales || !out || hash_rows <= 0) {
-    ds41rt_set_last_error_message("engram dequant requires non-null tensors and positive rows");
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    cuteafd_set_last_error_message("engram dequant requires non-null tensors and positive rows");
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   engram_dequant_kernel<<<hash_rows, 256, 0, reinterpret_cast<cudaStream_t>(cuda_stream)>>>(weights, scales, out);
   return status_from_cuda(cudaGetLastError());
@@ -121,12 +121,12 @@ __global__ void engram_nvfp4_dequant_kernel(const uint8_t* weights, const uint8_
       __fmul_rn(__fmul_rn(value, static_cast<float>(scale)), global_scale)));
 }
 }
-extern "C" ds41rt_status_t ds41rt_cuda_engram_nvfp4_dequant_bf16_async(
+extern "C" cuteafd_status_t cuteafd_cuda_engram_nvfp4_dequant_bf16_async(
     const uint8_t* weights, const uint8_t* scales, float global_scale,
     uint16_t* out, int hash_rows, void* cuda_stream) {
   if (!weights || !scales || !out || hash_rows <= 0 || !std::isfinite(global_scale) || global_scale <= 0.f) {
-    ds41rt_set_last_error_message("NVFP4 engram dequant requires tensors, positive rows and a finite positive global scale");
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    cuteafd_set_last_error_message("NVFP4 engram dequant requires tensors, positive rows and a finite positive global scale");
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   engram_nvfp4_dequant_kernel<<<hash_rows, 256, 0,
       reinterpret_cast<cudaStream_t>(cuda_stream)>>>(weights, scales, global_scale, out);

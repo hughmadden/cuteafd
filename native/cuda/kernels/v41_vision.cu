@@ -1,4 +1,4 @@
-#include "ds41rt_v41_vision.h"
+#include "cuteafd_v41_vision.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <math_constants.h>
@@ -122,7 +122,7 @@ __global__ void span_kernel(const B* features,const B* start,const B* newline,co
 }
 }
 
-extern "C" int32_t ds41rt_v41_vision_create(void* workspace,uint64_t bytes,void** output) {
+extern "C" int32_t cuteafd_v41_vision_create(void* workspace,uint64_t bytes,void** output) {
   if(!output)return cudaErrorInvalidValue;*output=nullptr;
   if(bytes<workspace_bytes || !valid(workspace,workspace_bytes,256))return cudaErrorInvalidValue;
   auto* h=new(std::nothrow)Handle{};if(!h)return cudaErrorMemoryAllocation;
@@ -132,11 +132,11 @@ extern "C" int32_t ds41rt_v41_vision_create(void* workspace,uint64_t bytes,void*
   if(s){cublasDestroy(h->blas);delete h;return status(s);}
   h->workspace=workspace;*output=h;return 0;
 }
-extern "C" int32_t ds41rt_v41_vision_destroy(void* opaque) {
+extern "C" int32_t cuteafd_v41_vision_destroy(void* opaque) {
   if(!opaque)return cudaErrorInvalidValue;auto* h=static_cast<Handle*>(opaque);
   auto s=cublasDestroy(h->blas);delete h;return status(s);
 }
-extern "C" int32_t ds41rt_v41_vision_linear(void* opaque,const uint16_t* x,const uint16_t* w,
+extern "C" int32_t cuteafd_v41_vision_linear(void* opaque,const uint16_t* x,const uint16_t* w,
     const uint16_t* bias,float* scratch,uint16_t* y,int rows,int in,int out,void* stream) {
   if(!opaque || rows<1 || rows>max_rows || in<1 || in>9216 || out<1 || out>5632)return cudaErrorInvalidValue;
   auto* h=static_cast<Handle*>(opaque);
@@ -156,14 +156,14 @@ extern "C" int32_t ds41rt_v41_vision_linear(void* opaque,const uint16_t* x,const
       reinterpret_cast<const B*>(bias),reinterpret_cast<B*>(y),out,uint64_t(rows)*out);
   return cudaGetLastError();
 }
-extern "C" int32_t ds41rt_v41_vision_norm(const uint16_t* x,const uint16_t* weight,uint16_t* y,int rows,void* stream) {
+extern "C" int32_t cuteafd_v41_vision_norm(const uint16_t* x,const uint16_t* weight,uint16_t* y,int rows,void* stream) {
   const uint64_t bytes=uint64_t(rows)*2048;
   if(rows<1 || rows>max_rows || !valid(x,bytes,2)||!valid(weight,2048,2)||!valid(y,bytes,2)||
       !apart(x,bytes,y,bytes)||!apart(weight,2048,y,bytes))return cudaErrorInvalidValue;
   norm_kernel<<<rows,256,0,reinterpret_cast<cudaStream_t>(stream)>>>(reinterpret_cast<const B*>(x),reinterpret_cast<const B*>(weight),reinterpret_cast<B*>(y));
   return cudaGetLastError();
 }
-extern "C" int32_t ds41rt_v41_vision_elementwise(const uint16_t* x,const uint16_t* other,uint16_t* y,int rows,int width,int mode,void* stream) {
+extern "C" int32_t cuteafd_v41_vision_elementwise(const uint16_t* x,const uint16_t* other,uint16_t* y,int rows,int width,int mode,void* stream) {
   if(rows<1 || rows>max_rows || mode<0 || mode>2 || width!=(mode==0?1024:(mode==1?2816:5120)))return cudaErrorInvalidValue;
   const uint64_t bytes=uint64_t(rows)*width*2,xb=bytes*(mode==1?2:1);
   if(!valid(x,xb,2)||!valid(y,bytes,2)||(!apart(x,xb,y,bytes) && !(mode!=1 && x==y)))return cudaErrorInvalidValue;
@@ -172,14 +172,14 @@ extern "C" int32_t ds41rt_v41_vision_elementwise(const uint16_t* x,const uint16_
       reinterpret_cast<const B*>(x),reinterpret_cast<const B*>(other),reinterpret_cast<B*>(y),uint64_t(rows)*width,width,mode);
   return cudaGetLastError();
 }
-extern "C" int32_t ds41rt_v41_vision_rope(const uint16_t* qkv,const float* inv,uint16_t* q,uint16_t* k,uint16_t* v,int height,int width,void* stream) {
+extern "C" int32_t cuteafd_v41_vision_rope(const uint16_t* qkv,const float* inv,uint16_t* q,uint16_t* k,uint16_t* v,int height,int width,void* stream) {
   const int64_t rows=int64_t(height)*width;if(height<1 || width<1 || rows>max_rows)return cudaErrorInvalidValue;
   const uint64_t bytes=rows*2048;const void* p[]={qkv,inv,q,k,v};const uint64_t sizes[]={bytes*3,64,bytes,bytes,bytes};
   for(int i=0;i<5;++i){if(!valid(p[i],sizes[i],i==1?4:2))return cudaErrorInvalidValue;for(int j=0;j<i;++j)if(!apart(p[i],sizes[i],p[j],sizes[j]))return cudaErrorInvalidValue;}
   rope_kernel<<<rows,256,0,reinterpret_cast<cudaStream_t>(stream)>>>(reinterpret_cast<const B*>(qkv),inv,
       reinterpret_cast<B*>(q),reinterpret_cast<B*>(k),reinterpret_cast<B*>(v),width);return cudaGetLastError();
 }
-extern "C" int32_t ds41rt_v41_vision_attention(void* opaque,const uint16_t* q,const uint16_t* k,
+extern "C" int32_t cuteafd_v41_vision_attention(void* opaque,const uint16_t* q,const uint16_t* k,
     const uint16_t* v,float* scores,float* values,float* output,uint16_t* y,int rows,int fp32_probabilities,void* stream) {
   if(!opaque || rows<1 || rows>max_rows || (fp32_probabilities!=0 && fp32_probabilities!=1))return cudaErrorInvalidValue;
   auto* h=static_cast<Handle*>(opaque);const uint64_t bytes=uint64_t(rows)*2048,sb=uint64_t(rows)*tile*heads*4;
@@ -214,14 +214,14 @@ extern "C" int32_t ds41rt_v41_vision_attention(void* opaque,const uint16_t* q,co
   if(fp32_probabilities)to_bf16<<<(uint64_t(rows)*1024+255)/256,256,0,reinterpret_cast<cudaStream_t>(stream)>>>(output,reinterpret_cast<B*>(y),uint64_t(rows)*1024);
   return cudaGetLastError();
 }
-extern "C" int32_t ds41rt_v41_vision_merge(const uint16_t* x,uint16_t* y,int height,int width,void* stream) {
+extern "C" int32_t cuteafd_v41_vision_merge(const uint16_t* x,uint16_t* y,int height,int width,void* stream) {
   if(height<1 || width<1 || height>max_rows || width>max_rows)return cudaErrorInvalidValue;
   const int64_t rows=int64_t(height)*width,merged=int64_t((height+2)/3)*((width+2)/3);
   if(rows>max_rows || merged>1024)return cudaErrorInvalidValue;
   if(!valid(x,rows*2048,2)||!valid(y,merged*18432,2)||!apart(x,rows*2048,y,merged*18432))return cudaErrorInvalidValue;
   merge_kernel<<<merged,256,0,reinterpret_cast<cudaStream_t>(stream)>>>(reinterpret_cast<const B*>(x),reinterpret_cast<B*>(y),height,width,(width+2)/3);return cudaGetLastError();
 }
-extern "C" int32_t ds41rt_v41_vision_span(const uint16_t* features,const uint16_t* start,const uint16_t* newline,const uint16_t* end,uint16_t* y,int height,int width,void* stream) {
+extern "C" int32_t cuteafd_v41_vision_span(const uint16_t* features,const uint16_t* start,const uint16_t* newline,const uint16_t* end,uint16_t* y,int height,int width,void* stream) {
   if(height<1 || width<1 || height>1024 || width>1024)return cudaErrorInvalidValue;
   const int tokens=height*(width+1)+2;if(tokens>1024)return cudaErrorInvalidValue;
   const uint64_t out=uint64_t(tokens)*10240;
@@ -232,7 +232,7 @@ extern "C" int32_t ds41rt_v41_vision_span(const uint16_t* features,const uint16_
       reinterpret_cast<const B*>(newline),reinterpret_cast<const B*>(end),reinterpret_cast<B*>(y),width,tokens);return cudaGetLastError();
 }
 
-extern "C" int32_t ds41rt_v41_vision_embed(const uint16_t* features,const uint32_t* indices,
+extern "C" int32_t cuteafd_v41_vision_embed(const uint16_t* features,const uint32_t* indices,
     uint16_t* residual,int image_rows,int rows,void* stream) {
   if(image_rows<1 || rows<1 || image_rows>rows || rows>4096)return cudaErrorInvalidValue;
   const uint64_t fb=uint64_t(image_rows)*10240,ib=uint64_t(image_rows)*4,rb=uint64_t(rows)*40960;

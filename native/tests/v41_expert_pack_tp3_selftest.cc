@@ -10,7 +10,7 @@
 // storage padding).
 //
 // Requires a CUDA device; exits 77 (ctest SKIP) when none is present.
-#include "ds41rt_v41_experts.h"
+#include "cuteafd_v41_experts.h"
 
 #include <cuda_runtime.h>
 
@@ -110,14 +110,14 @@ int main() {
 
   // Accepted extents and exact byte model for TP3 (padded == 768, no padding).
   uint64_t sizes[4] = {};
-  require(ds41rt_v41_expert_packed_sizes(kIntermediate, sizes) == cudaSuccess,
+  require(cuteafd_v41_expert_packed_sizes(kIntermediate, sizes) == cudaSuccess,
           "packed sizes rejected 768");
   require(sizes[0] == uint64_t(kIntermediate) * kHidden, "W13 extent");
   require(sizes[1] == uint64_t(kIntermediate) * kHidden / 16, "S13 extent");
   require(sizes[2] == uint64_t(kHidden) * kIntermediate / 2, "W2 extent");
   require(sizes[3] == uint64_t(kHidden) * kIntermediate / 32, "S2 extent");
   for (uint32_t rejected : {0u, 1u, 640u, 577u, 800u, 2303u, 4096u})
-    require(ds41rt_v41_expert_packed_sizes(rejected, sizes) != cudaSuccess,
+    require(cuteafd_v41_expert_packed_sizes(rejected, sizes) != cudaSuccess,
             "packed sizes accepted an unsupported extent");
 
   const uint64_t weight_bytes = uint64_t(kIntermediate) * kHidden / 2;
@@ -149,7 +149,7 @@ int main() {
       /*gated=*/false, /*scales=*/true, s2.data(), nullptr, kHidden, kIntermediate, 0,
       sizes[3]);
 
-  require(ds41rt_v41_pack_expert_async(sources, destinations, kIntermediate, nullptr) ==
+  require(cuteafd_v41_pack_expert_async(sources, destinations, kIntermediate, nullptr) ==
               cudaSuccess,
           "pack launch failed");
   check_cuda(cudaStreamSynchronize(nullptr), "synchronize");

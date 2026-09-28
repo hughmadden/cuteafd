@@ -12,7 +12,7 @@ args=parser.parse_args()
 paths=[str(args.baseline),str(args.candidate)]
 libs=[ctypes.CDLL(p) for p in paths];fns=[]
 for lib in libs:
- f=lib.ds41rt_cuda_ds4_rmsnorm_bf16_rne_async;f.argtypes=[ctypes.c_void_p]*3+[ctypes.c_int,ctypes.c_int,ctypes.c_float,ctypes.c_void_p];f.restype=ctypes.c_int;fns.append(f)
+ f=lib.cuteafd_cuda_ds4_rmsnorm_bf16_rne_async;f.argtypes=[ctypes.c_void_p]*3+[ctypes.c_int,ctypes.c_int,ctypes.c_float,ctypes.c_void_p];f.restype=ctypes.c_int;fns.append(f)
 stream=torch.cuda.Stream();torch.manual_seed(741)
 def call(f,x,w,y,eps=1e-20):
  status=f(x.data_ptr(),w.data_ptr(),y.data_ptr(),x.shape[0],x.shape[1],eps,stream.cuda_stream)

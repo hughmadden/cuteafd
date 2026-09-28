@@ -2,7 +2,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
-#include "ds41rt_v41_attention_ops.h"
+#include "cuteafd_v41_attention_ops.h"
 namespace {
 bool valid(const void* p, uint64_t bytes, uint64_t align) {
   const auto x = reinterpret_cast<uintptr_t>(p);
@@ -77,7 +77,7 @@ __global__ void rope_kernel(const __nv_bfloat16* input, const float* freq,
   }
 }
 }
-extern "C" int32_t ds41rt_v41_attention_norm(const uint16_t* input, const uint16_t* weight,
+extern "C" int32_t cuteafd_v41_attention_norm(const uint16_t* input, const uint16_t* weight,
     const float* freq, uint16_t* output, int32_t rows, int32_t dim, void* stream) {
   if (rows<1 || rows>4096 || (dim!=128 && dim!=512 && dim!=1280 && dim!=5120) || (freq && dim!=128 && dim!=512)) return cudaErrorInvalidValue;
   const uint64_t bytes=uint64_t(rows)*dim*2, w=uint64_t(dim)*2, f=uint64_t(rows)*256;
@@ -89,7 +89,7 @@ extern "C" int32_t ds41rt_v41_attention_norm(const uint16_t* input, const uint16
 #undef LAUNCH
   return cudaGetLastError();
 }
-extern "C" int32_t ds41rt_v41_attention_rope(const uint16_t* input, const float* freq,
+extern "C" int32_t cuteafd_v41_attention_rope(const uint16_t* input, const float* freq,
     uint16_t* output, int32_t rows, int32_t heads, int32_t inverse, void* stream) {
   if(rows<1 || rows>4096 || (heads!=1 && heads!=64) || (inverse!=0 && inverse!=1)) return cudaErrorInvalidValue;
   const uint64_t bytes=uint64_t(rows)*heads*1024, f=uint64_t(rows)*256;
@@ -107,7 +107,7 @@ constexpr uint64_t kGroupedWorkspace = 4*1024*1024;
 struct GroupedHandle { cublasHandle_t blas; void* workspace; int device; };
 int32_t blas_status(cublasStatus_t s) { return s==CUBLAS_STATUS_SUCCESS ? 0 : -int32_t(s); }
 }
-extern "C" int32_t ds41rt_v41_grouped_output_create(void* workspace, uint64_t bytes, void** out) {
+extern "C" int32_t cuteafd_v41_grouped_output_create(void* workspace, uint64_t bytes, void** out) {
   if (!out) return cudaErrorInvalidValue;
   *out=nullptr;
   if (bytes<kGroupedWorkspace || !valid(workspace,kGroupedWorkspace,256)) return cudaErrorInvalidValue;
@@ -122,12 +122,12 @@ extern "C" int32_t ds41rt_v41_grouped_output_create(void* workspace, uint64_t by
   if(result!=CUBLAS_STATUS_SUCCESS) {cublasDestroy(h->blas);delete h;return blas_status(result);}
   h->workspace=workspace;*out=h;return 0;
 }
-extern "C" int32_t ds41rt_v41_grouped_output_destroy(void* opaque) {
+extern "C" int32_t cuteafd_v41_grouped_output_destroy(void* opaque) {
   if(!opaque) return cudaErrorInvalidValue;
   auto* h=static_cast<GroupedHandle*>(opaque);
   auto status=cublasDestroy(h->blas);delete h;return blas_status(status);
 }
-extern "C" int32_t ds41rt_v41_grouped_output_launch(void* opaque, const uint16_t* input,
+extern "C" int32_t cuteafd_v41_grouped_output_launch(void* opaque, const uint16_t* input,
     const uint16_t* weight, uint16_t* output, int32_t rows, void* stream) {
   if(!opaque || rows<1 || rows>4096) return cudaErrorInvalidValue;
   auto* h=static_cast<GroupedHandle*>(opaque);
@@ -165,7 +165,7 @@ __global__ void grouped_dequant_kernel(const uint8_t* input, const uint8_t* scal
   output[i]=__float2bfloat16_rn(float(value)*exp2f(int(scale)-127));
 }
 }
-extern "C" int32_t ds41rt_v41_grouped_output_dequant(const uint8_t* input,
+extern "C" int32_t cuteafd_v41_grouped_output_dequant(const uint8_t* input,
     const uint8_t* scales, uint16_t* output, void* stream) {
   constexpr uint64_t w=uint64_t(8192)*4096,s=w/1024,o=w*2;
   if(!valid(input,w,1)||!valid(scales,s,1)||!valid(output,o,2)||
@@ -175,7 +175,7 @@ extern "C" int32_t ds41rt_v41_grouped_output_dequant(const uint8_t* input,
   return cudaGetLastError();
 }
 
-extern "C" int32_t ds41rt_v41_attention_kv(const uint16_t* input,const uint16_t* weight,
+extern "C" int32_t cuteafd_v41_attention_kv(const uint16_t* input,const uint16_t* weight,
     const float* freq,uint16_t* output,int32_t rows,void* stream) {
   if(rows<1||rows>4096)return cudaErrorInvalidValue;
   const uint64_t b=uint64_t(rows)*1024,f=uint64_t(rows)*256;
@@ -198,7 +198,7 @@ __global__ void dspark_frequencies_kernel(const uint64_t* positions, float* outp
   output[row*64+pair*2+1]=sinf(phase);
 }
 }
-extern "C" int32_t ds41rt_v41_dspark_frequencies(const uint64_t* positions,
+extern "C" int32_t cuteafd_v41_dspark_frequencies(const uint64_t* positions,
     float* output, int32_t rows, void* stream) {
   if(rows<1 || rows>4096) return cudaErrorInvalidValue;
   const uint64_t p=uint64_t(rows)*8, o=uint64_t(rows)*256;
@@ -221,7 +221,7 @@ __global__ void dspark_tap_kernel(const __nv_bfloat16* input,
   output[row*15360+uint64_t(tap)*5120+column]=__float2bfloat16_rn(__fmul_rn(sum,0.25f));
 }
 }
-extern "C" int32_t ds41rt_v41_dspark_tap(const uint16_t* input,
+extern "C" int32_t cuteafd_v41_dspark_tap(const uint16_t* input,
     uint16_t* output, int32_t rows, int32_t layer, void* stream) {
   if(rows<1 || rows>4096 || layer<37 || layer>39) return cudaErrorInvalidValue;
   const uint64_t in=uint64_t(rows)*40960,out=uint64_t(rows)*30720;
@@ -264,18 +264,18 @@ static int32_t launch_dspark_embed(const uint16_t* table, const int32_t* tokens,
   return cudaGetLastError();
 }
 
-extern "C" int32_t ds41rt_v41_dspark_embed_width(const uint16_t* table, const int32_t* tokens,
+extern "C" int32_t cuteafd_v41_dspark_embed_width(const uint16_t* table, const int32_t* tokens,
     uint16_t* residual, float* pre, int32_t requests, int32_t width, void* stream) {
   if(width==5)return launch_dspark_embed<5>(table,tokens,residual,pre,requests,stream);
   if(width==7)return launch_dspark_embed<7>(table,tokens,residual,pre,requests,stream);
   return cudaErrorInvalidValue;
 }
-extern "C" int32_t ds41rt_v41_dspark_embed(const uint16_t* table, const int32_t* tokens,
+extern "C" int32_t cuteafd_v41_dspark_embed(const uint16_t* table, const int32_t* tokens,
     uint16_t* residual, float* pre, int32_t requests, void* stream) {
   return launch_dspark_embed<5>(table,tokens,residual,pre,requests,stream);
 }
 
-extern "C" int32_t ds41rt_v41_target_embed(const uint16_t* table, const int32_t* tokens,
+extern "C" int32_t cuteafd_v41_target_embed(const uint16_t* table, const int32_t* tokens,
     uint16_t* residual, float* pre, int32_t rows, void* stream) {
   if(rows<1 || rows>4096)return cudaErrorInvalidValue;
   const uint64_t w=uint64_t(129280)*5120*2,t=uint64_t(rows)*4,
@@ -313,13 +313,13 @@ static int32_t launch_dspark_terminal_layout(const uint16_t* residual,
   return cudaGetLastError();
 }
 
-extern "C" int32_t ds41rt_v41_dspark_terminal_layout_width(const uint16_t* residual,
+extern "C" int32_t cuteafd_v41_dspark_terminal_layout_width(const uint16_t* residual,
     const float* pre, uint16_t* output, float* output_pre, int32_t requests,int32_t width,void* stream) {
   if(width==5)return launch_dspark_terminal_layout<5>(residual,pre,output,output_pre,requests,stream);
   if(width==7)return launch_dspark_terminal_layout<7>(residual,pre,output,output_pre,requests,stream);
   return cudaErrorInvalidValue;
 }
-extern "C" int32_t ds41rt_v41_dspark_terminal_layout(const uint16_t* residual,
+extern "C" int32_t cuteafd_v41_dspark_terminal_layout(const uint16_t* residual,
     const float* pre, uint16_t* output, float* output_pre, int32_t requests,void* stream) {
   return launch_dspark_terminal_layout<5>(residual,pre,output,output_pre,requests,stream);
 }
@@ -340,7 +340,7 @@ __global__ void backbone_frequencies_kernel(const uint64_t* positions,float* out
   output[row*64+pair*2]=cosf(phase);output[row*64+pair*2+1]=sinf(phase);
 }
 }
-extern "C" int32_t ds41rt_v41_backbone_frequencies(const uint64_t* positions,
+extern "C" int32_t cuteafd_v41_backbone_frequencies(const uint64_t* positions,
     float* output,int32_t rows,int32_t layer,void* stream) {
   if(rows<1 || rows>4096 || layer<0 || layer>=40)return cudaErrorInvalidValue;
   const uint64_t p=uint64_t(rows)*8,o=uint64_t(rows)*256;

@@ -1,15 +1,15 @@
-#include "ds41rt_v41_dspark_attention.h"
+#include "cuteafd_v41_dspark_attention.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
-#include "ds41rt_v41_dspark_cache.h"
+#include "cuteafd_v41_dspark_cache.h"
 #include <mma.h>
 #include <stdint.h>
 #include <math_constants.h>
 namespace {
 using namespace nvcuda;
 constexpr int kSharedBytes=65536+32768+2048+192;
-static_assert(sizeof(ds41rt_v41_attention_window_t)==8);
+static_assert(sizeof(cuteafd_v41_attention_window_t)==8);
 __device__ float warp_max(float x) {
   for(int n=16;n;n>>=1)x=fmaxf(x,__shfl_xor_sync(0xffffffffu,x,n));
   return x;
@@ -21,7 +21,7 @@ __device__ float warp_sum(float x) {
 template<int Width>
 __global__ void attend(const __nv_bfloat16* query, const uint8_t* ring,
     const __nv_bfloat16* draft, const float* sink,
-    const ds41rt_v41_attention_window_t* windows, __nv_bfloat16* output,int slots) {
+    const cuteafd_v41_attention_window_t* windows, __nv_bfloat16* output,int slots) {
   const int row=blockIdx.x, group=blockIdx.y, request=row/Width;
   const int tid=threadIdx.x,warp=tid/32,lane=tid%32;
   const auto window=windows[request];
@@ -51,7 +51,7 @@ __global__ void attend(const __nv_bfloat16* query, const uint8_t* ring,
       const int key=start+i/32,col=(i%32)*16;
       __align__(16) __nv_bfloat16 value[16];
       if(key<int(window.valid_rows)) {
-        const uint8_t* row=ring+(uint64_t(window.slot)*128+key)*DS41RT_V41_DSPARK_KV_ROW_BYTES;
+        const uint8_t* row=ring+(uint64_t(window.slot)*128+key)*CUTEAFD_V41_DSPARK_KV_ROW_BYTES;
         __align__(16) uint8_t packed[16];
         if(vector_ring) *reinterpret_cast<uint4*>(packed)=*reinterpret_cast<const uint4*>(row+col);
         else for(int j=0;j<16;++j)packed[j]=row[col+j];
@@ -139,11 +139,11 @@ bool disjoint(const void* a,uint64_t n,const void* b,uint64_t m) {
 namespace {
 template<int Width>
 int32_t launch_attention(const uint16_t* query,const uint8_t* ring,
-    const uint16_t* draft,const float* sink,const ds41rt_v41_attention_window_t* windows,
+    const uint16_t* draft,const float* sink,const cuteafd_v41_attention_window_t* windows,
     uint16_t* output,int32_t requests,int32_t slots,void* stream) {
   if(requests<1||requests>16||slots<1||slots>16)return cudaErrorInvalidValue;
   const uint64_t q=uint64_t(requests)*Width*64*512*2,
-      r=uint64_t(slots)*128*DS41RT_V41_DSPARK_KV_ROW_BYTES,d=uint64_t(requests)*Width*512*2;
+      r=uint64_t(slots)*128*CUTEAFD_V41_DSPARK_KV_ROW_BYTES,d=uint64_t(requests)*Width*512*2;
   if(!span(output,q,32))return cudaErrorInvalidValue;
   const void* inputs[]={query,ring,draft,sink,windows};const uint64_t sizes[]={q,r,d,256,uint64_t(requests)*8};
   const uint32_t align[]={32,1,2,4,4};
@@ -154,23 +154,23 @@ int32_t launch_attention(const uint16_t* query,const uint8_t* ring,
   return cudaGetLastError();
 }
 }
-extern "C" int32_t ds41rt_v41_dspark_attention_initialize(void) {
+extern "C" int32_t cuteafd_v41_dspark_attention_initialize(void) {
   return cudaFuncSetAttribute(attend<5>,cudaFuncAttributeMaxDynamicSharedMemorySize,kSharedBytes);
 }
-extern "C" int32_t ds41rt_v41_dspark_attention_initialize_width(int32_t width) {
-  if(width==5)return ds41rt_v41_dspark_attention_initialize();
+extern "C" int32_t cuteafd_v41_dspark_attention_initialize_width(int32_t width) {
+  if(width==5)return cuteafd_v41_dspark_attention_initialize();
   if(width==7)return cudaFuncSetAttribute(attend<7>,cudaFuncAttributeMaxDynamicSharedMemorySize,kSharedBytes);
   return cudaErrorInvalidValue;
 }
-extern "C" int32_t ds41rt_v41_dspark_attention_fp8_width(const uint16_t* query,const uint8_t* ring,
-    const uint16_t* draft,const float* sink,const ds41rt_v41_attention_window_t* windows,
+extern "C" int32_t cuteafd_v41_dspark_attention_fp8_width(const uint16_t* query,const uint8_t* ring,
+    const uint16_t* draft,const float* sink,const cuteafd_v41_attention_window_t* windows,
     uint16_t* output,int32_t requests,int32_t slots,int32_t width,void* stream) {
   if(width==5)return launch_attention<5>(query,ring,draft,sink,windows,output,requests,slots,stream);
   if(width==7)return launch_attention<7>(query,ring,draft,sink,windows,output,requests,slots,stream);
   return cudaErrorInvalidValue;
 }
-extern "C" int32_t ds41rt_v41_dspark_attention_fp8(const uint16_t* query,const uint8_t* ring,
-    const uint16_t* draft,const float* sink,const ds41rt_v41_attention_window_t* windows,
+extern "C" int32_t cuteafd_v41_dspark_attention_fp8(const uint16_t* query,const uint8_t* ring,
+    const uint16_t* draft,const float* sink,const cuteafd_v41_attention_window_t* windows,
     uint16_t* output,int32_t requests,int32_t slots,void* stream) {
   return launch_attention<5>(query,ring,draft,sink,windows,output,requests,slots,stream);
 }

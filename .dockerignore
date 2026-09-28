@@ -4,9 +4,9 @@
 **/.venv
 .venv-*
 **/.venv-*
-.ds41rt-cache
-.ds41rt-release
-.ds41rt-wip
+.cuteafd-cache
+.cuteafd-release
+.cuteafd-wip
 dist
 rust/target
 **/target

@@ -12,7 +12,7 @@
 #include <unordered_map>
 #include <vector>
 
-#if DS41RT_NATIVE_ENABLE_W8A16_AOT
+#if CUTEAFD_NATIVE_ENABLE_W8A16_AOT
 #include "w8a16_row_major_aot.h"
 #endif
 
@@ -864,8 +864,8 @@ __global__ __launch_bounds__(128) void linear_lossless_bf16_m1_kernel(
   }
 }
 
-ds41rt_status_t status_from_cublas(cublasStatus_t status) {
-  return status == CUBLAS_STATUS_SUCCESS ? DS41RT_STATUS_OK : DS41RT_STATUS_INTERNAL_ERROR;
+cuteafd_status_t status_from_cublas(cublasStatus_t status) {
+  return status == CUBLAS_STATUS_SUCCESS ? CUTEAFD_STATUS_OK : CUTEAFD_STATUS_INTERNAL_ERROR;
 }
 
 struct TritonDriverKernel {
@@ -884,25 +884,25 @@ triton_driver_kernel_cache() {
   return kernels;
 }
 
-ds41rt_status_t ensure_cuda_driver_context() {
+cuteafd_status_t ensure_cuda_driver_context() {
   if (cuInit(0) != CUDA_SUCCESS) {
-    return DS41RT_STATUS_INTERNAL_ERROR;
+    return CUTEAFD_STATUS_INTERNAL_ERROR;
   }
   CUcontext context = nullptr;
   if (cuCtxGetCurrent(&context) != CUDA_SUCCESS || context == nullptr) {
     if (cudaFree(nullptr) != cudaSuccess ||
         cuCtxGetCurrent(&context) != CUDA_SUCCESS || context == nullptr) {
-      return DS41RT_STATUS_INTERNAL_ERROR;
+      return CUTEAFD_STATUS_INTERNAL_ERROR;
     }
   }
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
-ds41rt_status_t triton_driver_kernel(const char* cubin_path,
+cuteafd_status_t triton_driver_kernel(const char* cubin_path,
                                     const char* kernel_name,
                                     CUfunction* out) {
   if (cubin_path == nullptr || kernel_name == nullptr || out == nullptr) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   const std::string key = std::string(cubin_path) + "\n" + kernel_name;
   std::lock_guard<std::mutex> lock(triton_driver_kernel_mutex());
@@ -910,10 +910,10 @@ ds41rt_status_t triton_driver_kernel(const char* cubin_path,
   const auto found = kernels.find(key);
   if (found != kernels.end()) {
     *out = found->second.function;
-    return DS41RT_STATUS_OK;
+    return CUTEAFD_STATUS_OK;
   }
-  if (ensure_cuda_driver_context() != DS41RT_STATUS_OK) {
-    return DS41RT_STATUS_INTERNAL_ERROR;
+  if (ensure_cuda_driver_context() != CUTEAFD_STATUS_OK) {
+    return CUTEAFD_STATUS_INTERNAL_ERROR;
   }
   TritonDriverKernel loaded;
   if (cuModuleLoad(&loaded.module, cubin_path) != CUDA_SUCCESS ||
@@ -922,30 +922,30 @@ ds41rt_status_t triton_driver_kernel(const char* cubin_path,
     if (loaded.module != nullptr) {
       cuModuleUnload(loaded.module);
     }
-    return DS41RT_STATUS_INTERNAL_ERROR;
+    return CUTEAFD_STATUS_INTERNAL_ERROR;
   }
   *out = loaded.function;
   kernels.emplace(key, loaded);
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
-ds41rt_status_t triton_driver_kernel_data(const char* cache_key,
+cuteafd_status_t triton_driver_kernel_data(const char* cache_key,
                                          const unsigned char* cubin,
                                          const char* kernel_name,
                                          CUfunction* out) {
   if (cache_key == nullptr || cubin == nullptr || kernel_name == nullptr ||
       out == nullptr) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   std::lock_guard<std::mutex> lock(triton_driver_kernel_mutex());
   auto& kernels = triton_driver_kernel_cache();
   const auto found = kernels.find(cache_key);
   if (found != kernels.end()) {
     *out = found->second.function;
-    return DS41RT_STATUS_OK;
+    return CUTEAFD_STATUS_OK;
   }
-  if (ensure_cuda_driver_context() != DS41RT_STATUS_OK) {
-    return DS41RT_STATUS_INTERNAL_ERROR;
+  if (ensure_cuda_driver_context() != CUTEAFD_STATUS_OK) {
+    return CUTEAFD_STATUS_INTERNAL_ERROR;
   }
   TritonDriverKernel loaded;
   if (cuModuleLoadData(&loaded.module, cubin) != CUDA_SUCCESS ||
@@ -954,16 +954,16 @@ ds41rt_status_t triton_driver_kernel_data(const char* cache_key,
     if (loaded.module != nullptr) {
       cuModuleUnload(loaded.module);
     }
-    return DS41RT_STATUS_INTERNAL_ERROR;
+    return CUTEAFD_STATUS_INTERNAL_ERROR;
   }
   *out = loaded.function;
   kernels.emplace(cache_key, loaded);
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
-ds41rt_status_t cublas_handle(cublasHandle_t* out) {
+cuteafd_status_t cublas_handle(cublasHandle_t* out) {
   if (out == nullptr) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   static thread_local cublasHandle_t handle = nullptr;
   if (handle == nullptr) {
@@ -973,54 +973,54 @@ ds41rt_status_t cublas_handle(cublasHandle_t* out) {
     }
   }
   *out = handle;
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
-ds41rt_status_t validate_linear_args(const float* input, const float* weight, const float* output,
+cuteafd_status_t validate_linear_args(const float* input, const float* weight, const float* output,
                                     size_t rows, size_t input_dim, size_t output_dim) {
   if (input == nullptr || weight == nullptr || output == nullptr) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   if (rows == 0 || input_dim == 0 || output_dim == 0) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   size_t ignored = 0;
   if (!checked_mul(rows, input_dim, &ignored) ||
       !checked_mul(output_dim, input_dim, &ignored) ||
       !checked_mul(rows, output_dim, &ignored)) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
-ds41rt_status_t validate_linear_bf16_args(const uint16_t* input, const uint16_t* weight,
+cuteafd_status_t validate_linear_bf16_args(const uint16_t* input, const uint16_t* weight,
                                          const uint16_t* output, size_t rows, size_t input_dim,
                                          size_t output_dim) {
   if (input == nullptr || weight == nullptr || output == nullptr) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   if (rows == 0 || input_dim == 0 || output_dim == 0) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   size_t ignored = 0;
   if (!checked_mul(rows, input_dim, &ignored) ||
       !checked_mul(output_dim, input_dim, &ignored) ||
       !checked_mul(rows, output_dim, &ignored)) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
-ds41rt_status_t validate_linear_bf16_strided_batched_args(
+cuteafd_status_t validate_linear_bf16_strided_batched_args(
     const uint16_t* input, const uint16_t* weight, const uint16_t* output,
     size_t batch_count, size_t rows, size_t input_dim, size_t output_dim,
     size_t input_batch_stride, size_t weight_batch_stride,
     size_t output_batch_stride) {
   if (input == nullptr || weight == nullptr || output == nullptr) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   if (batch_count == 0 || rows == 0 || input_dim == 0 || output_dim == 0) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   size_t matrix_values = 0;
   size_t batch_offset = 0;
@@ -1034,20 +1034,20 @@ ds41rt_status_t validate_linear_bf16_strided_batched_args(
       !checked_mul(rows, output_dim, &matrix_values) ||
       !checked_mul(batch_count - 1, output_batch_stride, &batch_offset) ||
       !checked_add(batch_offset, matrix_values, &ignored)) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
-ds41rt_status_t validate_bf16_graph_linear_buffers(ds41rt_device_buffer_t input,
-                                                  ds41rt_device_buffer_t weight,
-                                                  const ds41rt_device_buffer_t* bias,
-                                                  ds41rt_device_buffer_t output, size_t rows,
+cuteafd_status_t validate_bf16_graph_linear_buffers(cuteafd_device_buffer_t input,
+                                                  cuteafd_device_buffer_t weight,
+                                                  const cuteafd_device_buffer_t* bias,
+                                                  cuteafd_device_buffer_t output, size_t rows,
                                                   size_t input_dim, size_t output_dim) {
-  const ds41rt_status_t valid = validate_linear_bf16_args(
+  const cuteafd_status_t valid = validate_linear_bf16_args(
       static_cast<const uint16_t*>(input.ptr), static_cast<const uint16_t*>(weight.ptr),
       static_cast<const uint16_t*>(output.ptr), rows, input_dim, output_dim);
-  if (valid != DS41RT_STATUS_OK) {
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
   size_t input_values = 0;
@@ -1056,7 +1056,7 @@ ds41rt_status_t validate_bf16_graph_linear_buffers(ds41rt_device_buffer_t input,
   if (!checked_mul(rows, input_dim, &input_values) ||
       !checked_mul(output_dim, input_dim, &weight_values) ||
       !checked_mul(rows, output_dim, &output_values)) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   size_t input_bytes = 0;
   size_t weight_bytes = 0;
@@ -1066,39 +1066,39 @@ ds41rt_status_t validate_bf16_graph_linear_buffers(ds41rt_device_buffer_t input,
       !checked_mul(weight_values, sizeof(uint16_t), &weight_bytes) ||
       !checked_mul(output_values, sizeof(uint16_t), &output_bytes) ||
       !checked_mul(output_dim, sizeof(uint16_t), &bias_bytes)) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   if (input.bytes < input_bytes || weight.bytes < weight_bytes || output.bytes < output_bytes) {
-    return DS41RT_STATUS_BUFFER_TOO_SMALL;
+    return CUTEAFD_STATUS_BUFFER_TOO_SMALL;
   }
   if (bias != nullptr) {
     if (bias->ptr == nullptr) {
-      return DS41RT_STATUS_INVALID_ARGUMENT;
+      return CUTEAFD_STATUS_INVALID_ARGUMENT;
     }
     if (bias->bytes < bias_bytes) {
-      return DS41RT_STATUS_BUFFER_TOO_SMALL;
+      return CUTEAFD_STATUS_BUFFER_TOO_SMALL;
     }
   }
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
-ds41rt_status_t launch_linear_bf16_cublas(const uint16_t* input, const uint16_t* weight,
+cuteafd_status_t launch_linear_bf16_cublas(const uint16_t* input, const uint16_t* weight,
                                          const uint16_t* bias, uint16_t* output, size_t rows,
                                          size_t input_dim, size_t output_dim,
                                          cudaStream_t stream) {
-  const ds41rt_status_t valid =
+  const cuteafd_status_t valid =
       validate_linear_bf16_args(input, weight, output, rows, input_dim, output_dim);
-  if (valid != DS41RT_STATUS_OK) {
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
   if (rows > static_cast<size_t>(std::numeric_limits<int>::max()) ||
       input_dim > static_cast<size_t>(std::numeric_limits<int>::max()) ||
       output_dim > static_cast<size_t>(std::numeric_limits<int>::max())) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   cublasHandle_t handle = nullptr;
-  ds41rt_status_t handle_status = cublas_handle(&handle);
-  if (handle_status != DS41RT_STATUS_OK) {
+  cuteafd_status_t handle_status = cublas_handle(&handle);
+  if (handle_status != CUTEAFD_STATUS_OK) {
     return handle_status;
   }
   cublasStatus_t status = cublasSetStream(handle, stream);
@@ -1123,16 +1123,16 @@ ds41rt_status_t launch_linear_bf16_cublas(const uint16_t* input, const uint16_t*
     const size_t total = rows * output_dim;
     const size_t block_count = (total - 1) / threads + 1;
     if (block_count > static_cast<size_t>(std::numeric_limits<int>::max())) {
-      return DS41RT_STATUS_INVALID_ARGUMENT;
+      return CUTEAFD_STATUS_INVALID_ARGUMENT;
     }
     linear_bf16_add_bias_kernel<<<static_cast<int>(block_count), threads, 0, stream>>>(
         output, bias, rows, output_dim);
     return status_from_cuda(cudaGetLastError());
   }
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
-ds41rt_status_t launch_linear_bf16_f32_cublas(
+cuteafd_status_t launch_linear_bf16_f32_cublas(
     const uint16_t* input, const uint16_t* weight, float* output, size_t rows,
     size_t input_dim, size_t output_dim, cudaStream_t stream) {
   if (input == nullptr || weight == nullptr || output == nullptr || rows == 0 ||
@@ -1140,17 +1140,17 @@ ds41rt_status_t launch_linear_bf16_f32_cublas(
       rows > static_cast<size_t>(std::numeric_limits<int>::max()) ||
       input_dim > static_cast<size_t>(std::numeric_limits<int>::max()) ||
       output_dim > static_cast<size_t>(std::numeric_limits<int>::max())) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   size_t ignored = 0;
   if (!checked_mul(rows, input_dim, &ignored) ||
       !checked_mul(output_dim, input_dim, &ignored) ||
       !checked_mul(rows, output_dim, &ignored)) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   cublasHandle_t handle = nullptr;
-  ds41rt_status_t handle_status = cublas_handle(&handle);
-  if (handle_status != DS41RT_STATUS_OK) {
+  cuteafd_status_t handle_status = cublas_handle(&handle);
+  if (handle_status != CUTEAFD_STATUS_OK) {
     return handle_status;
   }
   cublasStatus_t status = cublasSetStream(handle, stream);
@@ -1347,18 +1347,18 @@ CublasLtM1ParityBatchedPlan* cublaslt_m1_parity_plan(
   return plan;
 }
 
-ds41rt_status_t launch_linear_bf16_recurrent_m1_rows(
+cuteafd_status_t launch_linear_bf16_recurrent_m1_rows(
     const uint16_t* input, const uint16_t* weight, uint16_t* output,
     size_t rows, size_t input_dim, size_t output_dim, cudaStream_t stream) {
   for (size_t row = 0; row < rows; ++row) {
-    const ds41rt_status_t status = launch_linear_bf16_cublas(
+    const cuteafd_status_t status = launch_linear_bf16_cublas(
         input + row * input_dim, weight, nullptr, output + row * output_dim, 1,
         input_dim, output_dim, stream);
-    if (status != DS41RT_STATUS_OK) {
+    if (status != CUTEAFD_STATUS_OK) {
       return status;
     }
   }
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
 cublasStatus_t launch_cublaslt_m1_parity_plan(
@@ -1374,17 +1374,17 @@ cublasStatus_t launch_cublaslt_m1_parity_plan(
       plan->workspace_bytes, stream);
 }
 
-ds41rt_status_t launch_linear_bf16_m1_parity_batched_cublaslt(
+cuteafd_status_t launch_linear_bf16_m1_parity_batched_cublaslt(
     const uint16_t* input, const uint16_t* weight, uint16_t* output,
     size_t rows, size_t input_dim, size_t output_dim, cudaStream_t stream) {
-  const ds41rt_status_t valid =
+  const cuteafd_status_t valid =
       validate_linear_bf16_args(input, weight, output, rows, input_dim,
                                 output_dim);
-  if (valid != DS41RT_STATUS_OK) {
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
   if (rows < 2 || rows > 16) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   CublasLtM1ParityBatchedPlan* plan =
       cublaslt_m1_parity_plan(rows, input_dim, output_dim);
@@ -1407,7 +1407,7 @@ ds41rt_status_t launch_linear_bf16_m1_parity_batched_cublaslt(
                                        stream) == CUBLAS_STATUS_SUCCESS &&
         launch_linear_bf16_recurrent_m1_rows(
             input, weight, reference, rows, input_dim, output_dim, stream) ==
-            DS41RT_STATUS_OK &&
+            CUTEAFD_STATUS_OK &&
         cudaStreamSynchronize(stream) == cudaSuccess) {
       std::vector<uint16_t> candidate_host(reference_values);
       std::vector<uint16_t> reference_host(reference_values);
@@ -1432,17 +1432,17 @@ ds41rt_status_t launch_linear_bf16_m1_parity_batched_cublaslt(
         // become pinned to the exact but multi-launch fallback.
         qualification_lock.unlock();
         for (size_t preload_rows = 2; preload_rows < rows; ++preload_rows) {
-          const ds41rt_status_t preload_status =
+          const cuteafd_status_t preload_status =
               launch_linear_bf16_m1_parity_batched_cublaslt(
                   input, weight, output, preload_rows, input_dim, output_dim,
                   stream);
-          if (preload_status != DS41RT_STATUS_OK) {
+          if (preload_status != CUTEAFD_STATUS_OK) {
             return preload_status;
           }
         }
         if (launch_cublaslt_m1_parity_plan(handle, plan, input, weight, output,
                                            stream) == CUBLAS_STATUS_SUCCESS) {
-          return DS41RT_STATUS_OK;
+          return CUTEAFD_STATUS_OK;
         }
         {
           std::lock_guard<std::mutex> lock(plan->qualification_mutex);
@@ -1451,7 +1451,7 @@ ds41rt_status_t launch_linear_bf16_m1_parity_batched_cublaslt(
         return launch_linear_bf16_recurrent_m1_rows(
             input, weight, output, rows, input_dim, output_dim, stream);
       }
-      return DS41RT_STATUS_OK;
+      return CUTEAFD_STATUS_OK;
     }
     return launch_linear_bf16_recurrent_m1_rows(
         input, weight, output, rows, input_dim, output_dim, stream);
@@ -1462,7 +1462,7 @@ ds41rt_status_t launch_linear_bf16_m1_parity_batched_cublaslt(
   if (use_cublaslt &&
       launch_cublaslt_m1_parity_plan(handle, plan, input, weight, output,
                                      stream) == CUBLAS_STATUS_SUCCESS) {
-    return DS41RT_STATUS_OK;
+    return CUTEAFD_STATUS_OK;
   }
   {
     std::lock_guard<std::mutex> lock(plan->qualification_mutex);
@@ -1472,15 +1472,15 @@ ds41rt_status_t launch_linear_bf16_m1_parity_batched_cublaslt(
       input, weight, output, rows, input_dim, output_dim, stream);
 }
 
-ds41rt_status_t launch_linear_bf16_strided_batched_cublas(
+cuteafd_status_t launch_linear_bf16_strided_batched_cublas(
     const uint16_t* input, const uint16_t* weight, uint16_t* output,
     size_t batch_count, size_t rows, size_t input_dim, size_t output_dim,
     size_t input_batch_stride, size_t weight_batch_stride,
     size_t output_batch_stride, cudaStream_t stream) {
-  const ds41rt_status_t valid = validate_linear_bf16_strided_batched_args(
+  const cuteafd_status_t valid = validate_linear_bf16_strided_batched_args(
       input, weight, output, batch_count, rows, input_dim, output_dim,
       input_batch_stride, weight_batch_stride, output_batch_stride);
-  if (valid != DS41RT_STATUS_OK) {
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
   constexpr size_t kMaxInt = static_cast<size_t>(std::numeric_limits<int>::max());
@@ -1488,11 +1488,11 @@ ds41rt_status_t launch_linear_bf16_strided_batched_cublas(
   if (batch_count > kMaxInt || rows > kMaxInt || input_dim > kMaxInt ||
       output_dim > kMaxInt || input_batch_stride > kMaxStride ||
       weight_batch_stride > kMaxStride || output_batch_stride > kMaxStride) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   cublasHandle_t handle = nullptr;
-  ds41rt_status_t handle_status = cublas_handle(&handle);
-  if (handle_status != DS41RT_STATUS_OK) {
+  cuteafd_status_t handle_status = cublas_handle(&handle);
+  if (handle_status != CUTEAFD_STATUS_OK) {
     return handle_status;
   }
   cublasStatus_t status = cublasSetStream(handle, stream);
@@ -1521,15 +1521,15 @@ ds41rt_status_t launch_linear_bf16_strided_batched_cublas(
   return status_from_cuda(cudaGetLastError());
 }
 
-ds41rt_status_t launch_matmul_bf16_strided_batched_cublas(
+cuteafd_status_t launch_matmul_bf16_strided_batched_cublas(
     const uint16_t* input, const uint16_t* right, uint16_t* output,
     size_t batch_count, size_t rows, size_t input_dim, size_t output_dim,
     size_t input_batch_stride, size_t right_batch_stride,
     size_t output_batch_stride, cudaStream_t stream) {
-  const ds41rt_status_t valid = validate_linear_bf16_strided_batched_args(
+  const cuteafd_status_t valid = validate_linear_bf16_strided_batched_args(
       input, right, output, batch_count, rows, input_dim, output_dim,
       input_batch_stride, right_batch_stride, output_batch_stride);
-  if (valid != DS41RT_STATUS_OK) {
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
   constexpr size_t kMaxInt = static_cast<size_t>(std::numeric_limits<int>::max());
@@ -1537,11 +1537,11 @@ ds41rt_status_t launch_matmul_bf16_strided_batched_cublas(
   if (batch_count > kMaxInt || rows > kMaxInt || input_dim > kMaxInt ||
       output_dim > kMaxInt || input_batch_stride > kMaxStride ||
       right_batch_stride > kMaxStride || output_batch_stride > kMaxStride) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   cublasHandle_t handle = nullptr;
-  ds41rt_status_t handle_status = cublas_handle(&handle);
-  if (handle_status != DS41RT_STATUS_OK) {
+  cuteafd_status_t handle_status = cublas_handle(&handle);
+  if (handle_status != CUTEAFD_STATUS_OK) {
     return handle_status;
   }
   cublasStatus_t status = cublasSetStream(handle, stream);
@@ -1571,32 +1571,32 @@ ds41rt_status_t launch_matmul_bf16_strided_batched_cublas(
 
 }  // namespace
 
-extern "C" ds41rt_status_t ds41rt_cuda_graph_update_linear_bf16_node(
-    void* cuda_graph, void* cuda_graph_exec, size_t kernel_node_index, ds41rt_device_buffer_t input,
-    ds41rt_device_buffer_t weight, const ds41rt_device_buffer_t* bias,
-    ds41rt_device_buffer_t output, size_t rows, size_t input_dim, size_t output_dim) {
+extern "C" cuteafd_status_t cuteafd_cuda_graph_update_linear_bf16_node(
+    void* cuda_graph, void* cuda_graph_exec, size_t kernel_node_index, cuteafd_device_buffer_t input,
+    cuteafd_device_buffer_t weight, const cuteafd_device_buffer_t* bias,
+    cuteafd_device_buffer_t output, size_t rows, size_t input_dim, size_t output_dim) {
   if (cuda_graph == nullptr || cuda_graph_exec == nullptr) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
-  const ds41rt_status_t valid =
+  const cuteafd_status_t valid =
       validate_bf16_graph_linear_buffers(input, weight, bias, output, rows, input_dim, output_dim);
-  if (valid != DS41RT_STATUS_OK) {
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
 
   cudaGraphNode_t node = nullptr;
-  const ds41rt_status_t node_status = find_kernel_node_by_index(cuda_graph, kernel_node_index, &node);
-  if (node_status != DS41RT_STATUS_OK) {
+  const cuteafd_status_t node_status = find_kernel_node_by_index(cuda_graph, kernel_node_index, &node);
+  if (node_status != CUTEAFD_STATUS_OK) {
     return node_status;
   }
 
   cudaKernelNodeParams existing = {};
   cudaError_t err = cudaGraphKernelNodeGetParams(node, &existing);
   if (err != cudaSuccess) {
-    return DS41RT_STATUS_INTERNAL_ERROR;
+    return CUTEAFD_STATUS_INTERNAL_ERROR;
   }
   if (existing.func != reinterpret_cast<void*>(linear_bf16_kernel)) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
 
   const uint16_t* input_ptr = static_cast<const uint16_t*>(input.ptr);
@@ -1617,7 +1617,7 @@ extern "C" ds41rt_status_t ds41rt_cuda_graph_update_linear_bf16_node(
   const size_t total = rows * output_dim;
   const size_t block_count = (total - 1) / threads + 1;
   if (block_count > static_cast<size_t>(std::numeric_limits<int>::max())) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
 
   cudaKernelNodeParams params = {};
@@ -1630,23 +1630,23 @@ extern "C" ds41rt_status_t ds41rt_cuda_graph_update_linear_bf16_node(
 
   err = cudaGraphKernelNodeSetParams(node, &params);
   if (err != cudaSuccess) {
-    return DS41RT_STATUS_INTERNAL_ERROR;
+    return CUTEAFD_STATUS_INTERNAL_ERROR;
   }
   err = cudaGraphExecKernelNodeSetParams(reinterpret_cast<cudaGraphExec_t>(cuda_graph_exec), node,
                                          &params);
   if (err != cudaSuccess) {
-    return DS41RT_STATUS_INTERNAL_ERROR;
+    return CUTEAFD_STATUS_INTERNAL_ERROR;
   }
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_linear_f32_async(const float* input, const float* weight,
+extern "C" cuteafd_status_t cuteafd_cuda_linear_f32_async(const float* input, const float* weight,
                                                       const float* bias, float* output,
                                                       size_t rows, size_t input_dim,
                                                       size_t output_dim, void* cuda_stream) {
-  const ds41rt_status_t valid =
+  const cuteafd_status_t valid =
       validate_linear_args(input, weight, output, rows, input_dim, output_dim);
-  if (valid != DS41RT_STATUS_OK) {
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
@@ -1654,7 +1654,7 @@ extern "C" ds41rt_status_t ds41rt_cuda_linear_f32_async(const float* input, cons
   const size_t total = rows * output_dim;
   const size_t block_count = (total - 1) / threads + 1;
   if (block_count > static_cast<size_t>(std::numeric_limits<int>::max())) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   const int blocks = static_cast<int>(block_count);
   linear_f32_kernel<<<blocks, threads, 0, stream>>>(input, weight, bias, output, rows, input_dim,
@@ -1662,26 +1662,26 @@ extern "C" ds41rt_status_t ds41rt_cuda_linear_f32_async(const float* input, cons
   return status_from_cuda(cudaGetLastError());
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_linear_f32(const float* input, const float* weight,
+extern "C" cuteafd_status_t cuteafd_cuda_linear_f32(const float* input, const float* weight,
                                                 const float* bias, float* output, size_t rows,
                                                 size_t input_dim, size_t output_dim) {
-  const ds41rt_status_t status =
-      ds41rt_cuda_linear_f32_async(input, weight, bias, output, rows, input_dim, output_dim,
+  const cuteafd_status_t status =
+      cuteafd_cuda_linear_f32_async(input, weight, bias, output, rows, input_dim, output_dim,
                                   nullptr);
-  if (status != DS41RT_STATUS_OK) {
+  if (status != CUTEAFD_STATUS_OK) {
     return status;
   }
   return status_from_cuda(cudaStreamSynchronize(nullptr));
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_linear_bf16_async(const uint16_t* input,
+extern "C" cuteafd_status_t cuteafd_cuda_linear_bf16_async(const uint16_t* input,
                                                        const uint16_t* weight,
                                                        const uint16_t* bias, uint16_t* output,
                                                        size_t rows, size_t input_dim,
                                                        size_t output_dim, void* cuda_stream) {
-  const ds41rt_status_t valid =
+  const cuteafd_status_t valid =
       validate_linear_bf16_args(input, weight, output, rows, input_dim, output_dim);
-  if (valid != DS41RT_STATUS_OK) {
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
@@ -1689,7 +1689,7 @@ extern "C" ds41rt_status_t ds41rt_cuda_linear_bf16_async(const uint16_t* input,
   const size_t total = rows * output_dim;
   const size_t block_count = (total - 1) / threads + 1;
   if (block_count > static_cast<size_t>(std::numeric_limits<int>::max())) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   const int blocks = static_cast<int>(block_count);
   linear_bf16_kernel<<<blocks, threads, 0, stream>>>(input, weight, bias, output, rows, input_dim,
@@ -1697,20 +1697,20 @@ extern "C" ds41rt_status_t ds41rt_cuda_linear_bf16_async(const uint16_t* input,
   return status_from_cuda(cudaGetLastError());
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_linear_bf16(const uint16_t* input, const uint16_t* weight,
+extern "C" cuteafd_status_t cuteafd_cuda_linear_bf16(const uint16_t* input, const uint16_t* weight,
                                                  const uint16_t* bias, uint16_t* output,
                                                  size_t rows, size_t input_dim,
                                                  size_t output_dim) {
-  const ds41rt_status_t status =
-      ds41rt_cuda_linear_bf16_async(input, weight, bias, output, rows, input_dim, output_dim,
+  const cuteafd_status_t status =
+      cuteafd_cuda_linear_bf16_async(input, weight, bias, output, rows, input_dim, output_dim,
                                    nullptr);
-  if (status != DS41RT_STATUS_OK) {
+  if (status != CUTEAFD_STATUS_OK) {
     return status;
   }
   return status_from_cuda(cudaStreamSynchronize(nullptr));
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_linear_bf16_cublas_async(
+extern "C" cuteafd_status_t cuteafd_cuda_linear_bf16_cublas_async(
     const uint16_t* input, const uint16_t* weight, const uint16_t* bias, uint16_t* output,
     size_t rows, size_t input_dim, size_t output_dim, void* cuda_stream) {
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
@@ -1718,7 +1718,7 @@ extern "C" ds41rt_status_t ds41rt_cuda_linear_bf16_cublas_async(
                                    stream);
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_linear_bf16_f32_cublas_async(
+extern "C" cuteafd_status_t cuteafd_cuda_linear_bf16_f32_cublas_async(
     const uint16_t* input, const uint16_t* weight, float* output, size_t rows,
     size_t input_dim, size_t output_dim, void* cuda_stream) {
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
@@ -1726,8 +1726,8 @@ extern "C" ds41rt_status_t ds41rt_cuda_linear_bf16_f32_cublas_async(
                                        output_dim, stream);
 }
 
-extern "C" ds41rt_status_t
-ds41rt_cuda_linear_bf16_m1_parity_batched_cublaslt_async(
+extern "C" cuteafd_status_t
+cuteafd_cuda_linear_bf16_m1_parity_batched_cublaslt_async(
     const uint16_t* input, const uint16_t* weight, uint16_t* output,
     size_t rows, size_t input_dim, size_t output_dim, void* cuda_stream) {
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
@@ -1735,7 +1735,7 @@ ds41rt_cuda_linear_bf16_m1_parity_batched_cublaslt_async(
       input, weight, output, rows, input_dim, output_dim, stream);
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_linear_lossless_bf16_m1_async(
+extern "C" cuteafd_status_t cuteafd_cuda_linear_lossless_bf16_m1_async(
     const uint16_t* input, const uint8_t* low, const uint8_t* codes,
     const uint32_t* metadata, uint16_t* output, size_t input_dim,
     size_t output_dim, size_t metadata_stride_words, void* cuda_stream) {
@@ -1744,7 +1744,7 @@ extern "C" ds41rt_status_t ds41rt_cuda_linear_lossless_bf16_m1_async(
       output == nullptr || input_dim == 0 || output_dim == 0 ||
       input_dim % kTileValues != 0 || metadata_stride_words < 2 ||
       output_dim > static_cast<size_t>(std::numeric_limits<int>::max())) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   const int blocks = static_cast<int>(output_dim);
@@ -1753,20 +1753,20 @@ extern "C" ds41rt_status_t ds41rt_cuda_linear_lossless_bf16_m1_async(
   return status_from_cuda(cudaGetLastError());
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_quantize_bf16_w8a16_group256_async(
+extern "C" cuteafd_status_t cuteafd_cuda_quantize_bf16_w8a16_group256_async(
     const uint16_t* source, int8_t* weight, float* scales, size_t input_dim,
     size_t output_dim, int k_major, void* cuda_stream) {
   constexpr size_t kGroupSize = 256;
   if (source == nullptr || weight == nullptr || scales == nullptr ||
       input_dim == 0 || output_dim == 0 || input_dim % kGroupSize != 0 ||
       output_dim > static_cast<size_t>(std::numeric_limits<int>::max())) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   size_t blocks = 0;
   if (!checked_mul(output_dim, input_dim / kGroupSize, &blocks) ||
       blocks > static_cast<size_t>(std::numeric_limits<int>::max()) ||
       (k_major != 0 && k_major != 1)) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   if (k_major != 0) {
@@ -1781,8 +1781,8 @@ extern "C" ds41rt_status_t ds41rt_cuda_quantize_bf16_w8a16_group256_async(
   return status_from_cuda(cudaGetLastError());
 }
 
-extern "C" ds41rt_status_t
-ds41rt_cuda_quantize_bf16_w8a16_group256_packed_async(
+extern "C" cuteafd_status_t
+cuteafd_cuda_quantize_bf16_w8a16_group256_packed_async(
     const uint16_t* source, int8_t* weight, float* scales, size_t input_dim,
     size_t output_dim, void* cuda_stream) {
   constexpr size_t kGroupSize = 256;
@@ -1790,13 +1790,13 @@ ds41rt_cuda_quantize_bf16_w8a16_group256_packed_async(
   if (source == nullptr || weight == nullptr || scales == nullptr ||
       input_dim == 0 || output_dim == 0 || input_dim % kGroupSize != 0 ||
       output_dim % kNTile != 0) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   const size_t groups = input_dim / kGroupSize;
   const size_t flat_groups = output_dim * groups;
   if (flat_groups >
       static_cast<size_t>(std::numeric_limits<unsigned int>::max())) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   quantize_bf16_w8a16_group256_kernel<2>
@@ -1805,7 +1805,7 @@ ds41rt_cuda_quantize_bf16_w8a16_group256_packed_async(
   return status_from_cuda(cudaGetLastError());
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_dequantize_w8a16_group256_bf16_async(
+extern "C" cuteafd_status_t cuteafd_cuda_dequantize_w8a16_group256_bf16_async(
     const int8_t* weight_k_major, const float* scales_group_major,
     uint16_t* weight_bf16, size_t input_dim, size_t output_dim,
     void* cuda_stream) {
@@ -1818,7 +1818,7 @@ extern "C" ds41rt_status_t ds41rt_cuda_dequantize_w8a16_group256_bf16_async(
           static_cast<size_t>(std::numeric_limits<unsigned int>::max()) ||
       (output_dim + kTile - 1) / kTile >
           static_cast<size_t>(std::numeric_limits<unsigned int>::max())) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   const dim3 blocks(
       static_cast<unsigned int>((output_dim + kTile - 1) / kTile),
@@ -1830,7 +1830,7 @@ extern "C" ds41rt_status_t ds41rt_cuda_dequantize_w8a16_group256_bf16_async(
   return status_from_cuda(cudaGetLastError());
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_linear_w8a16_group256_m1_simt_async(
+extern "C" cuteafd_status_t cuteafd_cuda_linear_w8a16_group256_m1_simt_async(
     const uint16_t* input, const int8_t* weight, const float* scales,
     uint16_t* output, size_t input_dim, size_t output_dim, int variant,
     void* cuda_stream) {
@@ -1839,10 +1839,10 @@ extern "C" ds41rt_status_t ds41rt_cuda_linear_w8a16_group256_m1_simt_async(
       output == nullptr || input_dim == 0 || output_dim == 0 ||
       input_dim % kGroupSize != 0 ||
       output_dim > static_cast<size_t>(std::numeric_limits<int>::max())) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-#define DS41RT_LAUNCH_W8_SIMT(ROWS, WARPS, NC)                                  \
+#define CUTEAFD_LAUNCH_W8_SIMT(ROWS, WARPS, NC)                                  \
   do {                                                                         \
     constexpr size_t rows_per_block = (ROWS) * (WARPS);                        \
     const size_t blocks = (output_dim + rows_per_block - 1) / rows_per_block;  \
@@ -1851,18 +1851,18 @@ extern "C" ds41rt_status_t ds41rt_cuda_linear_w8a16_group256_m1_simt_async(
             input, weight, scales, output, input_dim, output_dim);             \
   } while (false)
   switch (variant) {
-    case 0: DS41RT_LAUNCH_W8_SIMT(1, 4, false); break;
-    case 1: DS41RT_LAUNCH_W8_SIMT(2, 4, false); break;
-    case 2: DS41RT_LAUNCH_W8_SIMT(4, 4, false); break;
-    case 3: DS41RT_LAUNCH_W8_SIMT(1, 4, true); break;
-    case 4: DS41RT_LAUNCH_W8_SIMT(2, 4, true); break;
-    case 5: DS41RT_LAUNCH_W8_SIMT(4, 4, true); break;
-    case 6: DS41RT_LAUNCH_W8_SIMT(2, 8, false); break;
-    case 7: DS41RT_LAUNCH_W8_SIMT(4, 8, false); break;
-    case 8: DS41RT_LAUNCH_W8_SIMT(2, 8, true); break;
-    case 9: DS41RT_LAUNCH_W8_SIMT(4, 8, true); break;
-    case 10: DS41RT_LAUNCH_W8_SIMT(1, 8, false); break;
-    case 11: DS41RT_LAUNCH_W8_SIMT(1, 8, true); break;
+    case 0: CUTEAFD_LAUNCH_W8_SIMT(1, 4, false); break;
+    case 1: CUTEAFD_LAUNCH_W8_SIMT(2, 4, false); break;
+    case 2: CUTEAFD_LAUNCH_W8_SIMT(4, 4, false); break;
+    case 3: CUTEAFD_LAUNCH_W8_SIMT(1, 4, true); break;
+    case 4: CUTEAFD_LAUNCH_W8_SIMT(2, 4, true); break;
+    case 5: CUTEAFD_LAUNCH_W8_SIMT(4, 4, true); break;
+    case 6: CUTEAFD_LAUNCH_W8_SIMT(2, 8, false); break;
+    case 7: CUTEAFD_LAUNCH_W8_SIMT(4, 8, false); break;
+    case 8: CUTEAFD_LAUNCH_W8_SIMT(2, 8, true); break;
+    case 9: CUTEAFD_LAUNCH_W8_SIMT(4, 8, true); break;
+    case 10: CUTEAFD_LAUNCH_W8_SIMT(1, 8, false); break;
+    case 11: CUTEAFD_LAUNCH_W8_SIMT(1, 8, true); break;
     case 12:
       linear_w8a16_group256_m1_simt_shared_input_kernel<4, false>
           <<<static_cast<int>((output_dim + 3) / 4), 128,
@@ -1888,15 +1888,15 @@ extern "C" ds41rt_status_t ds41rt_cuda_linear_w8a16_group256_m1_simt_async(
               input, weight, scales, output, input_dim, output_dim);
       break;
     default:
-#undef DS41RT_LAUNCH_W8_SIMT
-      return DS41RT_STATUS_INVALID_ARGUMENT;
+#undef CUTEAFD_LAUNCH_W8_SIMT
+      return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
-#undef DS41RT_LAUNCH_W8_SIMT
+#undef CUTEAFD_LAUNCH_W8_SIMT
   return status_from_cuda(cudaGetLastError());
 }
 
-extern "C" ds41rt_status_t
-ds41rt_cuda_linear_w8a16_group256_m1_parity_batched_async(
+extern "C" cuteafd_status_t
+cuteafd_cuda_linear_w8a16_group256_m1_parity_batched_async(
     const uint16_t* input, const int8_t* weight, const float* scales,
     uint16_t* output, size_t rows, size_t input_dim, size_t output_dim,
     void* cuda_stream) {
@@ -1906,41 +1906,41 @@ ds41rt_cuda_linear_w8a16_group256_m1_parity_batched_async(
       output == nullptr || rows < 2 || rows > 16 || input_dim == 0 ||
       output_dim == 0 || input_dim % kGroupSize != 0 ||
       output_dim > static_cast<size_t>(std::numeric_limits<int>::max())) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   const size_t blocks =
       (output_dim + static_cast<size_t>(kWarpsPerBlock) - 1) /
       static_cast<size_t>(kWarpsPerBlock);
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-#define DS41RT_LAUNCH_W8_PARITY_BATCHED(ROWS)                                  \
+#define CUTEAFD_LAUNCH_W8_PARITY_BATCHED(ROWS)                                  \
   linear_w8a16_group256_m1_parity_batched_kernel<(ROWS), kWarpsPerBlock, true> \
       <<<static_cast<int>(blocks), kWarpsPerBlock * 32, 0, stream>>>(          \
           input, weight, scales, output, input_dim, output_dim)
   switch (rows) {
-    case 2: DS41RT_LAUNCH_W8_PARITY_BATCHED(2); break;
-    case 3: DS41RT_LAUNCH_W8_PARITY_BATCHED(3); break;
-    case 4: DS41RT_LAUNCH_W8_PARITY_BATCHED(4); break;
-    case 5: DS41RT_LAUNCH_W8_PARITY_BATCHED(5); break;
-    case 6: DS41RT_LAUNCH_W8_PARITY_BATCHED(6); break;
-    case 7: DS41RT_LAUNCH_W8_PARITY_BATCHED(7); break;
-    case 8: DS41RT_LAUNCH_W8_PARITY_BATCHED(8); break;
-    case 9: DS41RT_LAUNCH_W8_PARITY_BATCHED(9); break;
-    case 10: DS41RT_LAUNCH_W8_PARITY_BATCHED(10); break;
-    case 11: DS41RT_LAUNCH_W8_PARITY_BATCHED(11); break;
-    case 12: DS41RT_LAUNCH_W8_PARITY_BATCHED(12); break;
-    case 13: DS41RT_LAUNCH_W8_PARITY_BATCHED(13); break;
-    case 14: DS41RT_LAUNCH_W8_PARITY_BATCHED(14); break;
-    case 15: DS41RT_LAUNCH_W8_PARITY_BATCHED(15); break;
-    case 16: DS41RT_LAUNCH_W8_PARITY_BATCHED(16); break;
+    case 2: CUTEAFD_LAUNCH_W8_PARITY_BATCHED(2); break;
+    case 3: CUTEAFD_LAUNCH_W8_PARITY_BATCHED(3); break;
+    case 4: CUTEAFD_LAUNCH_W8_PARITY_BATCHED(4); break;
+    case 5: CUTEAFD_LAUNCH_W8_PARITY_BATCHED(5); break;
+    case 6: CUTEAFD_LAUNCH_W8_PARITY_BATCHED(6); break;
+    case 7: CUTEAFD_LAUNCH_W8_PARITY_BATCHED(7); break;
+    case 8: CUTEAFD_LAUNCH_W8_PARITY_BATCHED(8); break;
+    case 9: CUTEAFD_LAUNCH_W8_PARITY_BATCHED(9); break;
+    case 10: CUTEAFD_LAUNCH_W8_PARITY_BATCHED(10); break;
+    case 11: CUTEAFD_LAUNCH_W8_PARITY_BATCHED(11); break;
+    case 12: CUTEAFD_LAUNCH_W8_PARITY_BATCHED(12); break;
+    case 13: CUTEAFD_LAUNCH_W8_PARITY_BATCHED(13); break;
+    case 14: CUTEAFD_LAUNCH_W8_PARITY_BATCHED(14); break;
+    case 15: CUTEAFD_LAUNCH_W8_PARITY_BATCHED(15); break;
+    case 16: CUTEAFD_LAUNCH_W8_PARITY_BATCHED(16); break;
     default:
-#undef DS41RT_LAUNCH_W8_PARITY_BATCHED
-      return DS41RT_STATUS_INVALID_ARGUMENT;
+#undef CUTEAFD_LAUNCH_W8_PARITY_BATCHED
+      return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
-#undef DS41RT_LAUNCH_W8_PARITY_BATCHED
+#undef CUTEAFD_LAUNCH_W8_PARITY_BATCHED
   return status_from_cuda(cudaGetLastError());
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_linear_w8a16_group256_m1_warp_packed_async(
+extern "C" cuteafd_status_t cuteafd_cuda_linear_w8a16_group256_m1_warp_packed_async(
     const uint16_t* input, const int8_t* weight, const float* scales,
     uint16_t* output, size_t input_dim, size_t output_dim, void* cuda_stream) {
   constexpr size_t kGroupSize = 256;
@@ -1951,7 +1951,7 @@ extern "C" ds41rt_status_t ds41rt_cuda_linear_w8a16_group256_m1_warp_packed_asyn
       output_dim % kNTile != 0 ||
       output_dim / kNTile >
           static_cast<size_t>(std::numeric_limits<int>::max())) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   const int blocks = static_cast<int>(output_dim / kNTile);
@@ -1967,8 +1967,8 @@ extern "C" ds41rt_status_t ds41rt_cuda_linear_w8a16_group256_m1_warp_packed_asyn
   return status_from_cuda(cudaGetLastError());
 }
 
-extern "C" ds41rt_status_t
-ds41rt_cuda_linear_w8a16_group256_m1_warp_packed_parity_batched_async(
+extern "C" cuteafd_status_t
+cuteafd_cuda_linear_w8a16_group256_m1_warp_packed_parity_batched_async(
     const uint16_t* input, const int8_t* weight, const float* scales,
     uint16_t* output, size_t rows, size_t input_dim, size_t output_dim,
     void* cuda_stream) {
@@ -1980,50 +1980,50 @@ ds41rt_cuda_linear_w8a16_group256_m1_warp_packed_parity_batched_async(
       output_dim % kNTile != 0 ||
       output_dim / 16 >
           static_cast<size_t>(std::numeric_limits<int>::max())) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   const int blocks = static_cast<int>(output_dim / 16);
 
-#define DS41RT_LAUNCH_W8_PACKED_PARITY(ROWS, SPLITS, THREADS)                  \
+#define CUTEAFD_LAUNCH_W8_PACKED_PARITY(ROWS, SPLITS, THREADS)                  \
   linear_w8a16_group256_m1_warp_packed_parity_batched_kernel<                \
       (ROWS), (SPLITS), (THREADS) / 32, true>                                \
       <<<blocks, (THREADS), 0, stream>>>(                                    \
           input, weight, scales, output, input_dim, output_dim)
-#define DS41RT_DISPATCH_W8_PACKED_PARITY(SPLITS, THREADS)                     \
+#define CUTEAFD_DISPATCH_W8_PACKED_PARITY(SPLITS, THREADS)                     \
   switch (rows) {                                                             \
-    case 2: DS41RT_LAUNCH_W8_PACKED_PARITY(2, SPLITS, THREADS); break;         \
-    case 3: DS41RT_LAUNCH_W8_PACKED_PARITY(3, SPLITS, THREADS); break;         \
-    case 4: DS41RT_LAUNCH_W8_PACKED_PARITY(4, SPLITS, THREADS); break;         \
-    case 5: DS41RT_LAUNCH_W8_PACKED_PARITY(5, SPLITS, THREADS); break;         \
-    case 6: DS41RT_LAUNCH_W8_PACKED_PARITY(6, SPLITS, THREADS); break;         \
-    case 7: DS41RT_LAUNCH_W8_PACKED_PARITY(7, SPLITS, THREADS); break;         \
-    case 8: DS41RT_LAUNCH_W8_PACKED_PARITY(8, SPLITS, THREADS); break;         \
-    case 9: DS41RT_LAUNCH_W8_PACKED_PARITY(9, SPLITS, THREADS); break;         \
-    case 10: DS41RT_LAUNCH_W8_PACKED_PARITY(10, SPLITS, THREADS); break;       \
-    case 11: DS41RT_LAUNCH_W8_PACKED_PARITY(11, SPLITS, THREADS); break;       \
-    case 12: DS41RT_LAUNCH_W8_PACKED_PARITY(12, SPLITS, THREADS); break;       \
-    case 13: DS41RT_LAUNCH_W8_PACKED_PARITY(13, SPLITS, THREADS); break;       \
-    case 14: DS41RT_LAUNCH_W8_PACKED_PARITY(14, SPLITS, THREADS); break;       \
-    case 15: DS41RT_LAUNCH_W8_PACKED_PARITY(15, SPLITS, THREADS); break;       \
-    case 16: DS41RT_LAUNCH_W8_PACKED_PARITY(16, SPLITS, THREADS); break;       \
+    case 2: CUTEAFD_LAUNCH_W8_PACKED_PARITY(2, SPLITS, THREADS); break;         \
+    case 3: CUTEAFD_LAUNCH_W8_PACKED_PARITY(3, SPLITS, THREADS); break;         \
+    case 4: CUTEAFD_LAUNCH_W8_PACKED_PARITY(4, SPLITS, THREADS); break;         \
+    case 5: CUTEAFD_LAUNCH_W8_PACKED_PARITY(5, SPLITS, THREADS); break;         \
+    case 6: CUTEAFD_LAUNCH_W8_PACKED_PARITY(6, SPLITS, THREADS); break;         \
+    case 7: CUTEAFD_LAUNCH_W8_PACKED_PARITY(7, SPLITS, THREADS); break;         \
+    case 8: CUTEAFD_LAUNCH_W8_PACKED_PARITY(8, SPLITS, THREADS); break;         \
+    case 9: CUTEAFD_LAUNCH_W8_PACKED_PARITY(9, SPLITS, THREADS); break;         \
+    case 10: CUTEAFD_LAUNCH_W8_PACKED_PARITY(10, SPLITS, THREADS); break;       \
+    case 11: CUTEAFD_LAUNCH_W8_PACKED_PARITY(11, SPLITS, THREADS); break;       \
+    case 12: CUTEAFD_LAUNCH_W8_PACKED_PARITY(12, SPLITS, THREADS); break;       \
+    case 13: CUTEAFD_LAUNCH_W8_PACKED_PARITY(13, SPLITS, THREADS); break;       \
+    case 14: CUTEAFD_LAUNCH_W8_PACKED_PARITY(14, SPLITS, THREADS); break;       \
+    case 15: CUTEAFD_LAUNCH_W8_PACKED_PARITY(15, SPLITS, THREADS); break;       \
+    case 16: CUTEAFD_LAUNCH_W8_PACKED_PARITY(16, SPLITS, THREADS); break;       \
     default: break;                                                           \
   }
   if (input_dim % (kGroupSize * 32) == 0) {
     if (rows == 6) {
-      DS41RT_LAUNCH_W8_PACKED_PARITY(6, 32, 1024);
+      CUTEAFD_LAUNCH_W8_PACKED_PARITY(6, 32, 1024);
     } else {
-      DS41RT_DISPATCH_W8_PACKED_PARITY(32, 512);
+      CUTEAFD_DISPATCH_W8_PACKED_PARITY(32, 512);
     }
   } else {
-    DS41RT_DISPATCH_W8_PACKED_PARITY(8, 256);
+    CUTEAFD_DISPATCH_W8_PACKED_PARITY(8, 256);
   }
-#undef DS41RT_DISPATCH_W8_PACKED_PARITY
-#undef DS41RT_LAUNCH_W8_PACKED_PARITY
+#undef CUTEAFD_DISPATCH_W8_PACKED_PARITY
+#undef CUTEAFD_LAUNCH_W8_PACKED_PARITY
   return status_from_cuda(cudaGetLastError());
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_linear_w8a8_group256_wmma_async(
+extern "C" cuteafd_status_t cuteafd_cuda_linear_w8a8_group256_wmma_async(
     const int8_t* input, const float* input_scales, const int8_t* weight,
     const float* weight_scales, uint16_t* output, size_t rows,
     size_t input_dim, size_t output_dim, void* cuda_stream) {
@@ -2041,7 +2041,7 @@ extern "C" ds41rt_status_t ds41rt_cuda_linear_w8a8_group256_wmma_async(
           static_cast<size_t>(std::numeric_limits<unsigned int>::max()) ||
       output_dim / kTileN >
           static_cast<size_t>(std::numeric_limits<unsigned int>::max())) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   const dim3 blocks(
       static_cast<unsigned int>(output_dim / kTileN),
@@ -2053,7 +2053,7 @@ extern "C" ds41rt_status_t ds41rt_cuda_linear_w8a8_group256_wmma_async(
   return status_from_cuda(cudaGetLastError());
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_linear_w8a16_group256_triton_file_async(
+extern "C" cuteafd_status_t cuteafd_cuda_linear_w8a16_group256_triton_file_async(
     const uint16_t* input, const int8_t* weight, const float* scales,
     uint16_t* output, size_t rows, size_t input_dim, size_t output_dim,
     const char* cubin_path, const char* kernel_name, size_t block_m,
@@ -2068,19 +2068,19 @@ extern "C" ds41rt_status_t ds41rt_cuda_linear_w8a16_group256_triton_file_async(
           static_cast<size_t>(std::numeric_limits<unsigned int>::max()) ||
       output_dim / block_n >
           static_cast<size_t>(std::numeric_limits<unsigned int>::max())) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   CUfunction function = nullptr;
-  const ds41rt_status_t loaded =
+  const cuteafd_status_t loaded =
       triton_driver_kernel(cubin_path, kernel_name, &function);
-  if (loaded != DS41RT_STATUS_OK) {
+  if (loaded != CUTEAFD_STATUS_OK) {
     return loaded;
   }
   if (shared_bytes > 48 * 1024 &&
       cuFuncSetAttribute(
           function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
           static_cast<int>(shared_bytes)) != CUDA_SUCCESS) {
-    return DS41RT_STATUS_INTERNAL_ERROR;
+    return CUTEAFD_STATUS_INTERNAL_ERROR;
   }
   CUdeviceptr input_arg = reinterpret_cast<CUdeviceptr>(input);
   CUdeviceptr weight_arg = reinterpret_cast<CUdeviceptr>(weight);
@@ -2099,16 +2099,16 @@ extern "C" ds41rt_status_t ds41rt_cuda_linear_w8a16_group256_triton_file_async(
       static_cast<unsigned int>(threads), 1, 1,
       static_cast<unsigned int>(shared_bytes),
       reinterpret_cast<CUstream>(cuda_stream), arguments, nullptr);
-  return launched == CUDA_SUCCESS ? DS41RT_STATUS_OK
-                                  : DS41RT_STATUS_INTERNAL_ERROR;
+  return launched == CUDA_SUCCESS ? CUTEAFD_STATUS_OK
+                                  : CUTEAFD_STATUS_INTERNAL_ERROR;
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_preload_w8a16_group256_aot(
+extern "C" cuteafd_status_t cuteafd_cuda_preload_w8a16_group256_aot(
     size_t input_dim, size_t output_dim) {
-#if DS41RT_NATIVE_ENABLE_W8A16_AOT
+#if CUTEAFD_NATIVE_ENABLE_W8A16_AOT
   bool matched = false;
-  for (size_t index = 0; index < ds41rt_w8a16_aot::kernel_count; ++index) {
-    const auto& config = ds41rt_w8a16_aot::kernels[index];
+  for (size_t index = 0; index < cuteafd_w8a16_aot::kernel_count; ++index) {
+    const auto& config = cuteafd_w8a16_aot::kernels[index];
     if (config.input_dim != input_dim || config.output_dim != output_dim) {
       continue;
     }
@@ -2117,40 +2117,40 @@ extern "C" ds41rt_status_t ds41rt_cuda_preload_w8a16_group256_aot(
                             std::to_string(output_dim) + "-" +
                             std::to_string(config.max_rows);
     CUfunction function = nullptr;
-    const ds41rt_status_t loaded = triton_driver_kernel_data(
+    const cuteafd_status_t loaded = triton_driver_kernel_data(
         key.c_str(), config.cubin, config.symbol, &function);
-    if (loaded != DS41RT_STATUS_OK) {
+    if (loaded != CUTEAFD_STATUS_OK) {
       return loaded;
     }
     if (config.shared_bytes > 48 * 1024 &&
         cuFuncSetAttribute(
             function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
             static_cast<int>(config.shared_bytes)) != CUDA_SUCCESS) {
-      return DS41RT_STATUS_INTERNAL_ERROR;
+      return CUTEAFD_STATUS_INTERNAL_ERROR;
     }
   }
-  return matched ? DS41RT_STATUS_OK : DS41RT_STATUS_INVALID_ARGUMENT;
+  return matched ? CUTEAFD_STATUS_OK : CUTEAFD_STATUS_INVALID_ARGUMENT;
 #else
   (void)input_dim;
   (void)output_dim;
-  return DS41RT_STATUS_CUDA_UNAVAILABLE;
+  return CUTEAFD_STATUS_CUDA_UNAVAILABLE;
 #endif
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_linear_w8a16_group256_aot_async(
+extern "C" cuteafd_status_t cuteafd_cuda_linear_w8a16_group256_aot_async(
     const uint16_t* input, const int8_t* weight, const float* scales,
     uint16_t* output, size_t rows, size_t input_dim, size_t output_dim,
     void* cuda_stream) {
-#if DS41RT_NATIVE_ENABLE_W8A16_AOT
+#if CUTEAFD_NATIVE_ENABLE_W8A16_AOT
   if (input == nullptr || weight == nullptr || scales == nullptr ||
       output == nullptr || rows == 0 || rows > 2048 || input_dim == 0 ||
       output_dim == 0 || input_dim % 256 != 0 ||
       rows > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
-  const ds41rt_w8a16_aot::KernelConfig* selected = nullptr;
-  for (size_t index = 0; index < ds41rt_w8a16_aot::kernel_count; ++index) {
-    const auto& config = ds41rt_w8a16_aot::kernels[index];
+  const cuteafd_w8a16_aot::KernelConfig* selected = nullptr;
+  for (size_t index = 0; index < cuteafd_w8a16_aot::kernel_count; ++index) {
+    const auto& config = cuteafd_w8a16_aot::kernels[index];
     if (config.input_dim == input_dim && config.output_dim == output_dim &&
         rows <= config.max_rows) {
       selected = &config;
@@ -2158,22 +2158,22 @@ extern "C" ds41rt_status_t ds41rt_cuda_linear_w8a16_group256_aot_async(
     }
   }
   if (selected == nullptr) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   const std::string key = "w8a16-aot-" + std::to_string(input_dim) + "-" +
                           std::to_string(output_dim) + "-" +
                           std::to_string(selected->max_rows);
   CUfunction function = nullptr;
-  const ds41rt_status_t loaded = triton_driver_kernel_data(
+  const cuteafd_status_t loaded = triton_driver_kernel_data(
       key.c_str(), selected->cubin, selected->symbol, &function);
-  if (loaded != DS41RT_STATUS_OK) {
+  if (loaded != CUTEAFD_STATUS_OK) {
     return loaded;
   }
   if (selected->shared_bytes > 48 * 1024 &&
       cuFuncSetAttribute(
           function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
           static_cast<int>(selected->shared_bytes)) != CUDA_SUCCESS) {
-    return DS41RT_STATUS_INTERNAL_ERROR;
+    return CUTEAFD_STATUS_INTERNAL_ERROR;
   }
   CUdeviceptr input_arg = reinterpret_cast<CUdeviceptr>(input);
   CUdeviceptr weight_arg = reinterpret_cast<CUdeviceptr>(weight);
@@ -2193,8 +2193,8 @@ extern "C" ds41rt_status_t ds41rt_cuda_linear_w8a16_group256_aot_async(
       static_cast<unsigned int>(selected->threads), 1, 1,
       static_cast<unsigned int>(selected->shared_bytes),
       reinterpret_cast<CUstream>(cuda_stream), arguments, nullptr);
-  return launched == CUDA_SUCCESS ? DS41RT_STATUS_OK
-                                  : DS41RT_STATUS_INTERNAL_ERROR;
+  return launched == CUDA_SUCCESS ? CUTEAFD_STATUS_OK
+                                  : CUTEAFD_STATUS_INTERNAL_ERROR;
 #else
   (void)input;
   (void)weight;
@@ -2204,23 +2204,23 @@ extern "C" ds41rt_status_t ds41rt_cuda_linear_w8a16_group256_aot_async(
   (void)input_dim;
   (void)output_dim;
   (void)cuda_stream;
-  return DS41RT_STATUS_CUDA_UNAVAILABLE;
+  return CUTEAFD_STATUS_CUDA_UNAVAILABLE;
 #endif
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_linear_bf16_cublas(
+extern "C" cuteafd_status_t cuteafd_cuda_linear_bf16_cublas(
     const uint16_t* input, const uint16_t* weight, const uint16_t* bias, uint16_t* output,
     size_t rows, size_t input_dim, size_t output_dim) {
-  const ds41rt_status_t status =
-      ds41rt_cuda_linear_bf16_cublas_async(input, weight, bias, output, rows, input_dim,
+  const cuteafd_status_t status =
+      cuteafd_cuda_linear_bf16_cublas_async(input, weight, bias, output, rows, input_dim,
                                           output_dim, nullptr);
-  if (status != DS41RT_STATUS_OK) {
+  if (status != CUTEAFD_STATUS_OK) {
     return status;
   }
   return status_from_cuda(cudaStreamSynchronize(nullptr));
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_linear_bf16_strided_batched_cublas_async(
+extern "C" cuteafd_status_t cuteafd_cuda_linear_bf16_strided_batched_cublas_async(
     const uint16_t* input, const uint16_t* weight, uint16_t* output,
     size_t batch_count, size_t rows, size_t input_dim, size_t output_dim,
     size_t input_batch_stride, size_t weight_batch_stride,
@@ -2231,22 +2231,22 @@ extern "C" ds41rt_status_t ds41rt_cuda_linear_bf16_strided_batched_cublas_async(
       input_batch_stride, weight_batch_stride, output_batch_stride, stream);
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_linear_bf16_strided_batched_cublas(
+extern "C" cuteafd_status_t cuteafd_cuda_linear_bf16_strided_batched_cublas(
     const uint16_t* input, const uint16_t* weight, uint16_t* output,
     size_t batch_count, size_t rows, size_t input_dim, size_t output_dim,
     size_t input_batch_stride, size_t weight_batch_stride,
     size_t output_batch_stride) {
-  const ds41rt_status_t status =
-      ds41rt_cuda_linear_bf16_strided_batched_cublas_async(
+  const cuteafd_status_t status =
+      cuteafd_cuda_linear_bf16_strided_batched_cublas_async(
           input, weight, output, batch_count, rows, input_dim, output_dim,
           input_batch_stride, weight_batch_stride, output_batch_stride, nullptr);
-  if (status != DS41RT_STATUS_OK) {
+  if (status != CUTEAFD_STATUS_OK) {
     return status;
   }
   return status_from_cuda(cudaStreamSynchronize(nullptr));
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_matmul_bf16_strided_batched_cublas_async(
+extern "C" cuteafd_status_t cuteafd_cuda_matmul_bf16_strided_batched_cublas_async(
     const uint16_t* input, const uint16_t* right, uint16_t* output,
     size_t batch_count, size_t rows, size_t input_dim, size_t output_dim,
     size_t input_batch_stride, size_t right_batch_stride,

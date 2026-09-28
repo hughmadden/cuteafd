@@ -25,7 +25,7 @@ def _load():
     if tools not in sys.path:
         sys.path.insert(0, tools)
     try:
-        spec = importlib.util.spec_from_file_location("ds41rt_tp6_bench", HARNESS)
+        spec = importlib.util.spec_from_file_location("cuteafd_tp6_bench", HARNESS)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     except Exception as error:  # pragma: no cover - environment dependent
@@ -37,7 +37,7 @@ def _args(topology: str, widths: str, rows: str = "8"):
     return [
         "--topologies", topology, "--ep-degree", "1", "--widths", widths,
         "--capacity", "80", "--operands", "synthetic",
-        "--output", "/tmp/ds41rt-tp6-parse-test.json", "--rows", rows,
+        "--output", "/tmp/cuteafd-tp6-parse-test.json", "--rows", rows,
     ]
 
 
@@ -113,7 +113,7 @@ def _load_standalone():
     if tools not in sys.path:
         sys.path.insert(0, tools)
     try:
-        spec = importlib.util.spec_from_file_location("ds41rt_tp6_standalone", STANDALONE)
+        spec = importlib.util.spec_from_file_location("cuteafd_tp6_standalone", STANDALONE)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     except Exception as error:  # pragma: no cover - environment dependent
@@ -127,7 +127,7 @@ def test_standalone_benchmark_accepts_tp6_with_its_own_intermediate() -> None:
     assert module.OFFICIAL_INTERMEDIATE == 2304
     options = module.parse_args([
         "--phase", "full", "--tp-degree", "6", "--intermediate", "384",
-        "--output", "/tmp/ds41rt-tp6-standalone.json",
+        "--output", "/tmp/cuteafd-tp6-standalone.json",
     ])
     assert options.tp_degree == 6 and options.intermediate == 384
 
@@ -141,13 +141,13 @@ def test_standalone_benchmark_rejects_a_degree_intermediate_mismatch() -> None:
             module.parse_args([
                 "--phase", "full", "--tp-degree", str(degree),
                 "--intermediate", str(intermediate),
-                "--output", "/tmp/ds41rt-tp6-standalone.json",
+                "--output", "/tmp/cuteafd-tp6-standalone.json",
             ])
     # An unsupported degree is refused by argparse itself.
     with pytest.raises(SystemExit):
         module.parse_args([
             "--phase", "full", "--tp-degree", "5", "--intermediate", "384",
-            "--output", "/tmp/ds41rt-tp6-standalone.json",
+            "--output", "/tmp/cuteafd-tp6-standalone.json",
         ])
 
 

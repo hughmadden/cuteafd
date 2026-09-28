@@ -43,8 +43,8 @@ def main():
     torch.cuda.set_device(args.device);torch.manual_seed(41900+args.device)
     torch.backends.cuda.matmul.allow_tf32=False
     lib=C.CDLL(str(args.native_lib));P=C.c_void_p;I=C.c_int32
-    init=lib.ds41rt_v41_dspark_attention_initialize;init.argtypes=[];init.restype=I;assert init()==0
-    launch=lib.ds41rt_v41_dspark_attention_fp8;launch.argtypes=[P,P,P,P,P,P,I,I,P];launch.restype=I
+    init=lib.cuteafd_v41_dspark_attention_initialize;init.argtypes=[];init.restype=I;assert init()==0
+    launch=lib.cuteafd_v41_dspark_attention_fp8;launch.argtypes=[P,P,P,P,P,P,I,I,P];launch.restype=I
     stream=torch.cuda.Stream();results=[]
     lengths=[2,58,59,60,63,64,65,122,123,124,127,128,3,31,96,128]
     with torch.cuda.stream(stream),torch.no_grad():

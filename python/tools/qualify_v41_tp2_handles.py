@@ -12,13 +12,13 @@ def main():
     parser.add_argument("--native-lib", required=True)
     args = parser.parse_args()
     lib = C.CDLL(args.native_lib)
-    initialize = lib.ds41rt_v41_tp2_expert_initialize
+    initialize = lib.cuteafd_v41_tp2_expert_initialize
     initialize.argtypes = [C.c_int32, C.POINTER(P)]
-    info_fn = lib.ds41rt_v41_tp2_expert_info
+    info_fn = lib.cuteafd_v41_tp2_expert_info
     info_fn.argtypes = [C.c_int32, C.POINTER(Info)]
-    bind = lib.ds41rt_v41_tp2_expert_bind_scratch
+    bind = lib.cuteafd_v41_tp2_expert_bind_scratch
     bind.argtypes = [P, P, C.c_uint64, C.POINTER(P)]
-    init_scratch = lib.ds41rt_v41_tp2_expert_initialize_scratch_async
+    init_scratch = lib.cuteafd_v41_tp2_expert_initialize_scratch_async
     init_scratch.argtypes = [P, P, C.c_uint64, P]
     assert torch.cuda.device_count() >= 2
     results = []

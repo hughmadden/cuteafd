@@ -55,7 +55,7 @@ def main():
     (out / "v41_experts.json").write_text(
         json.dumps(dict(role=role, rows=rows, width=width,
                         atomic_min_capacity=atomic)) + "\\n", encoding="utf-8")
-    log = os.environ.get("DS41RT_WIDTH_EXPORT_LOG")
+    log = os.environ.get("CUTEAFD_WIDTH_EXPORT_LOG")
     if log:
         with open(log, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(dict(role=role, width=width,
@@ -67,17 +67,17 @@ main()
 
 _TOY_CMAKE = '''\
 cmake_minimum_required(VERSION 3.20)
-project(ds41rt_width_fixture NONE)
-set(DS41RT_ENABLE_V41_EXPERT_AOT ON)
-set(DS41RT_V41_EXPERT_ROLE spark)
-set(DS41RT_V41_SPARK_TP_ROLES "tp2;tp3" CACHE STRING "roles")
-set(DS41RT_SPARKINFER_VERIFY_COMMAND "${CMAKE_COMMAND}" -E true)
-set(DS41RT_SPARKINFER_PYTHON_ENV "")
-set(DS41RT_SPARKINFER_PROVENANCE_INPUTS "")
-set(DS41RT_SPARKINFER_EXPORT_INPUTS "")
-set(DS41RT_NATIVE_SOURCES "")
+project(cuteafd_width_fixture NONE)
+set(CUTEAFD_ENABLE_V41_EXPERT_AOT ON)
+set(CUTEAFD_V41_EXPERT_ROLE spark)
+set(CUTEAFD_V41_SPARK_TP_ROLES "tp2;tp3" CACHE STRING "roles")
+set(CUTEAFD_SPARKINFER_VERIFY_COMMAND "${CMAKE_COMMAND}" -E true)
+set(CUTEAFD_SPARKINFER_PYTHON_ENV "")
+set(CUTEAFD_SPARKINFER_PROVENANCE_INPUTS "")
+set(CUTEAFD_SPARKINFER_EXPORT_INPUTS "")
+set(CUTEAFD_NATIVE_SOURCES "")
 set(Python3_EXECUTABLE "__PYTHON__")
-add_custom_target(ds41rt_verify_sparkinfer_source)
+add_custom_target(cuteafd_verify_sparkinfer_source)
 include("__CMAKE_FILE__")
 '''
 
@@ -96,7 +96,7 @@ def run_width_override_scenario() -> dict:
     """
     base = Path(
         os.environ.get(
-            "DS41RT_WIDTH_TEST_TMPDIR", str(Path.home() / ".cache" / "ds41rt" / "tests")
+            "CUTEAFD_WIDTH_TEST_TMPDIR", str(Path.home() / ".cache" / "cuteafd" / "tests")
         )
     )
     base.mkdir(parents=True, exist_ok=True)
@@ -130,7 +130,7 @@ def run_width_override_scenario() -> dict:
         build.mkdir()
         log = tmp / "exports.log"
         log.touch()
-        env = dict(os.environ, DS41RT_WIDTH_EXPORT_LOG=str(log))
+        env = dict(os.environ, CUTEAFD_WIDTH_EXPORT_LOG=str(log))
 
         def configure(extra: list[str]) -> dict:
             proc = _run(
@@ -151,8 +151,8 @@ def run_width_override_scenario() -> dict:
                     "--build",
                     str(build),
                     "--target",
-                    "ds41rt_v41_spark_tp2_experts_export",
-                    "ds41rt_v41_spark_tp3_experts_export",
+                    "cuteafd_v41_spark_tp2_experts_export",
+                    "cuteafd_v41_spark_tp3_experts_export",
                 ],
                 tmp,
                 env,
@@ -181,7 +181,7 @@ def run_width_override_scenario() -> dict:
             role: manifest(role) for role in ("spark_tp2", "spark_tp3")
         }
 
-        override = [f"-DDS41RT_V41_SPARK_TP2_SLICE_WIDTH={TP2_CAP80_128}"]
+        override = [f"-DCUTEAFD_V41_SPARK_TP2_SLICE_WIDTH={TP2_CAP80_128}"]
         steps["override_configure"] = configure(override)
         steps["override_build"] = build_targets()
         steps["after_override"] = exports()
@@ -199,7 +199,7 @@ def run_width_override_scenario() -> dict:
         # override persists in the CMake cache, so the default is passed
         # explicitly rather than by omitting the flag.
         steps["restore_configure"] = configure(
-            [f"-DDS41RT_V41_SPARK_TP2_SLICE_WIDTH={DEFAULT_MAP}"]
+            [f"-DCUTEAFD_V41_SPARK_TP2_SLICE_WIDTH={DEFAULT_MAP}"]
         )
         steps["restore_build"] = build_targets()
         steps["after_restore"] = exports()

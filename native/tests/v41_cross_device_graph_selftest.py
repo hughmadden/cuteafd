@@ -29,15 +29,15 @@ for name,parameters in {
  f=getattr(r,name);f.argtypes=parameters;f.restype=c.c_int
 r.cudaGetErrorString.argtypes=[c.c_int];r.cudaGetErrorString.restype=c.c_char_p
 native=c.CDLL(str(args.native_lib))
-add=native.ds41rt_v41_add_tp2_shared_async
+add=native.cuteafd_v41_add_tp2_shared_async
 add.argtypes=[p,p,p,c.c_size_t,p];add.restype=c.c_int
 def kernel(a,b,out,stream):
  status=add(a,b,out,32,stream)
  if status:raise RuntimeError('add kernel: '+r.cudaGetErrorString(status).decode())
-copy=native.ds41rt_v41_peer_copy_async
+copy=native.cuteafd_v41_peer_copy_async
 copy.argtypes=[p,p,c.c_ulonglong,p];copy.restype=c.c_int
-native.ds41rt_v41_peer_copy_initialize.argtypes=[]
-native.ds41rt_v41_peer_copy_initialize.restype=c.c_int
+native.cuteafd_v41_peer_copy_initialize.argtypes=[]
+native.cuteafd_v41_peer_copy_initialize.restype=c.c_int
 def peer(dst,src,stream):
  status=copy(dst,src,64,stream)
  if status:raise RuntimeError('SM peer copy: '+r.cudaGetErrorString(status).decode())
@@ -53,7 +53,7 @@ try:
   call('cudaEventCreateWithFlags',c.byref(events[i]),2)
  ones=(c.c_ushort*32)(*([0x3f80]*32))
  for i in range(2):
-  call('cudaSetDevice',i);assert native.ds41rt_v41_peer_copy_initialize()==0;call('cudaMemcpy',inputs[i],ones,64,1);kernel(inputs[i],inputs[i],buffers[i],streams[i]);call('cudaStreamSynchronize',streams[i])
+  call('cudaSetDevice',i);assert native.cuteafd_v41_peer_copy_initialize()==0;call('cudaMemcpy',inputs[i],ones,64,1);kernel(inputs[i],inputs[i],buffers[i],streams[i]);call('cudaStreamSynchronize',streams[i])
  call('cudaSetDevice',0);call('cudaMalloc',c.byref(final),64);call('cudaStreamBeginCapture',streams[0],1)
  kernel(inputs[0],inputs[0],buffers[0],streams[0]);call('cudaEventRecord',events[0],streams[0])
  call('cudaSetDevice',1);call('cudaStreamWaitEvent',streams[1],events[0],0)

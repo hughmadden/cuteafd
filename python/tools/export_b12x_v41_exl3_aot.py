@@ -30,7 +30,7 @@ def write_bridge(output: Path, manifest: dict) -> None:
     # device replaces those globals and loses another device's launch attributes.
     lines = ['#include <new>', '#include <mutex>', '#include "v41_exl3_core.h"', '#include "v41_exl3_sum.h"',
         'struct Context { int device; int32_t grid_cap; };',
-        'struct Modules { std::mutex mutex; unsigned users = 0; ds41rt_v41_exl3_core_Kernel_Module_t core{}; ds41rt_v41_exl3_sum_Kernel_Module_t sum{}; };',
+        'struct Modules { std::mutex mutex; unsigned users = 0; cuteafd_v41_exl3_core_Kernel_Module_t core{}; cuteafd_v41_exl3_sum_Kernel_Module_t sum{}; };',
         'static Modules modules;',
         'static void unload_modules() { if (modules.sum.module) cudaLibraryUnload(modules.sum.module); if (modules.core.module) cudaLibraryUnload(modules.core.module); modules.sum.module = nullptr; modules.core.module = nullptr; }']
     for entry in manifest['objects']:
@@ -39,12 +39,12 @@ def write_bridge(output: Path, manifest: dict) -> None:
             f'cudaLibrary_t* library = &modules.{role}.module; cudaError_t status = cudaSuccess;',
             'if (!*library) {',
             'struct { cudaLibrary_t** library; cudaError_t* status; } init{&library, &status};',
-            f'_mlir_ds41rt_{label}_cuda_init(reinterpret_cast<void**>(&init));',
+            f'_mlir_cuteafd_{label}_cuda_init(reinterpret_cast<void**>(&init));',
             'if (status != cudaSuccess) return int(status); }',
             'struct { cudaLibrary_t** library; int32_t* device; cudaError_t* status; } load{&library, &device, &status};',
-            f'_mlir_ds41rt_{label}_cuda_load_to_device(reinterpret_cast<void**>(&load));',
+            f'_mlir_cuteafd_{label}_cuda_load_to_device(reinterpret_cast<void**>(&load));',
             'return int(status); }']
-    lines += ['extern "C" int ds41rt_exl3_create(void** out) {',
+    lines += ['extern "C" int cuteafd_exl3_create(void** out) {',
         'if (!out) return int(cudaErrorInvalidValue); *out = nullptr;',
         'Context* ctx = new(std::nothrow) Context; if (!ctx) return int(cudaErrorMemoryAllocation);',
         'cudaError_t status = cudaGetDevice(&ctx->device); cudaDeviceProp props{};',
@@ -55,7 +55,7 @@ def write_bridge(output: Path, manifest: dict) -> None:
         'int error = load_core(ctx->device); if (!error) error = load_sum(ctx->device);',
         'if (error) { if (!modules.users) unload_modules(); delete ctx; return error; }',
         '++modules.users; *out = ctx; return 0; }',
-        'extern "C" void ds41rt_exl3_destroy(void* opaque) { auto* ctx = static_cast<Context*>(opaque); if (!ctx) return; std::lock_guard<std::mutex> lock(modules.mutex); if (--modules.users == 0) unload_modules(); delete ctx; }']
+        'extern "C" void cuteafd_exl3_destroy(void* opaque) { auto* ctx = static_cast<Context*>(opaque); if (!ctx) return; std::lock_guard<std::mutex> lock(modules.mutex); if (--modules.users == 0) unload_modules(); delete ctx; }']
     for entry in manifest['objects']:
         role = entry['label'].rsplit('_', 1)[1]
         args = [f'&modules.{role}']; declarations = []; checks = []; pointers = []; scalars = []
@@ -72,7 +72,7 @@ def write_bridge(output: Path, manifest: dict) -> None:
                     checks.append(f'if (s[{index}] < 1) return int(cudaErrorInvalidValue);')
                     # Clamp a local argument, never mutate caller-owned launch tables.
                     args[-1] = f'(s[{index}] < ctx->grid_cap ? s[{index}] : ctx->grid_cap)'
-            elif type_name == 'void *' or re.fullmatch(r'ds41rt_v41_exl3_\w+_Tensor_\w+_t \*', type_name):
+            elif type_name == 'void *' or re.fullmatch(r'cuteafd_v41_exl3_\w+_Tensor_\w+_t \*', type_name):
                 index = len(pointers); pointers.append(name)
                 checks.append(f'if (!p[{index}]) return int(cudaErrorInvalidValue);')
                 if type_name == 'void *': args.append(f'p[{index}]')
@@ -84,7 +84,7 @@ def write_bridge(output: Path, manifest: dict) -> None:
                     declarations.append(f'{tensor_type} {name}{{p[{index}]}};'); args.append('&' + name)
             else: raise ValueError(f'unsupported native parameter {parameter}')
         entry['pointer_slots'] = pointers; entry['scalar_slots'] = scalars
-        lines += [f'extern "C" int ds41rt_exl3_{role}(void* opaque, void* const* p, const int32_t* s, void* stream) {{',
+        lines += [f'extern "C" int cuteafd_exl3_{role}(void* opaque, void* const* p, const int32_t* s, void* stream) {{',
             'if (!opaque || !p || !s) return int(cudaErrorInvalidValue); auto* ctx = static_cast<Context*>(opaque);',
             'int device = -1; if (cudaGetDevice(&device) != cudaSuccess || device != ctx->device) return int(cudaErrorInvalidDevice);',
             *checks, *declarations, f'return {entry["wrapper"]}({", ".join(args)});', '}']
@@ -97,16 +97,16 @@ def write_bridge(output: Path, manifest: dict) -> None:
         2 if manifest['output_dtype'] == 'bf16' else 4]
     boundary = manifest.get('paired_boundary')
     if boundary is None:
-        lines += ['extern "C" int ds41rt_exl3_info(uint32_t* out, uint32_t words) {',
+        lines += ['extern "C" int cuteafd_exl3_info(uint32_t* out, uint32_t words) {',
             'if (!out || words != 16) return int(cudaErrorInvalidValue);',
             'const uint32_t info[16] = {' + ','.join(map(str, info)) + '};',
             'for (int i = 0; i < 16; ++i) out[i] = info[i]; return 0; }']
     else:
         # Old consumers must fail instead of interpreting four-row descriptors
         # as the original three-row/disjoint contract.
-        lines += ['extern "C" int ds41rt_exl3_info(uint32_t*, uint32_t) { return int(cudaErrorInvalidValue); }']
+        lines += ['extern "C" int cuteafd_exl3_info(uint32_t*, uint32_t) { return int(cudaErrorInvalidValue); }']
         paired_info = [3, *info[1:], 1 if boundary == 'first' else 2, 4]
-        lines += ['extern "C" int ds41rt_exl3_paired_info(uint32_t* out, uint32_t words) {',
+        lines += ['extern "C" int cuteafd_exl3_paired_info(uint32_t* out, uint32_t words) {',
             'if (!out || words != 18) return int(cudaErrorInvalidValue);',
             'const uint32_t info[18] = {' + ','.join(map(str, paired_info)) + '};',
             'for (int i = 0; i < 18; ++i) out[i] = info[i]; return 0; }']
@@ -181,7 +181,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     output.mkdir(parents=True, exist_ok=True)
     objects = []
     for label, compiled in [("v41_exl3_core", launch.compiled), ("v41_exl3_sum", launch.topk_sum.compiled)]:
-        compiled.export_to_c(str(output), label, "ds41rt_" + label)
+        compiled.export_to_c(str(output), label, "cuteafd_" + label)
         header = (output / (label + ".h")).read_text()
         wrapper = re.search(r"static inline int32_t (cute_dsl_\w+_wrapper)\((.*?)\) \{", header, re.S)
         if wrapper is None:
@@ -215,7 +215,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
             if spec['bytes'] > count * 4:
                 raise ValueError(f'route metadata exceeds canonical capacity: {name}')
             spec.update(shape=[count], bytes=count * 4)
-    manifest = {"schema": "ds41rt.v41-exl3-aot.v1", "sparkinfer_revision": _pinned_sparkinfer.REVISION,
+    manifest = {"schema": "cuteafd.v41-exl3-aot.v1", "sparkinfer_revision": _pinned_sparkinfer.REVISION,
         "gpu": props.name, "compute": [props.major, props.minor], "sms": props.multi_processor_count,
         "hidden": 5120, "intermediate": intermediate, "experts": experts, "top_k": topk,
         "capacity": capacity, "output_dtype": output_dtype, "bits": list(bits), "swiglu_limit": 10.0,

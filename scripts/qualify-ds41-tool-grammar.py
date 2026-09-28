@@ -27,11 +27,11 @@ functions = {
     'matcher_destroy':[P], 'grammar_destroy':[P], 'compiler_destroy':[P],
 }
 for name,args in functions.items():
-    fn=getattr(lib,'ds41rt_xgrammar_'+name);fn.argtypes=args;fn.restype=c.c_int
+    fn=getattr(lib,'cuteafd_xgrammar_'+name);fn.argtypes=args;fn.restype=c.c_int
 
 def invoke(name,*args,error=True):
     buffer=c.create_string_buffer(8192)
-    status=getattr(lib,'ds41rt_xgrammar_'+name)(*args,*([buffer,len(buffer)] if error else []))
+    status=getattr(lib,'cuteafd_xgrammar_'+name)(*args,*([buffer,len(buffer)] if error else []))
     assert status==0,(name,status,buffer.value.decode())
 
 def parameter(name,value,flag=None):
@@ -215,7 +215,7 @@ try:
     ]:
         grammar=P();error=c.create_string_buffer(8192)
         spec=dict(type='structural_tag',format=dict(type='ds41_tool_schema',json_schema=schema,strict=True))
-        status=lib.ds41rt_xgrammar_compile(compiler,3,json.dumps(spec).encode(),1,c.byref(grammar),error,len(error))
+        status=lib.cuteafd_xgrammar_compile(compiler,3,json.dumps(spec).encode(),1,c.byref(grammar),error,len(error))
         report['compile_errors'].append(dict(schema=schema,status=status,error=error.value.decode()));save()
         assert status!=0 and not grammar.value,report['compile_errors'][-1]
     # The same compiler remains usable after unsatisfiable-name failures.

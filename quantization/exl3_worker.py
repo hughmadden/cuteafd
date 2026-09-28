@@ -38,7 +38,7 @@ def runtime_identity(name, image_digest):
             source.update(str(path.relative_to(root.parent)).encode() + b"\0")
             source.update(hashlib.sha256(path.read_bytes()).digest())
     props = torch.cuda.get_device_properties(0)
-    report = dict(schema="ds41rt-exl3-worker-runtime-v1", name=name, image_digest=image_digest,
+    report = dict(schema="cuteafd-exl3-worker-runtime-v1", name=name, image_digest=image_digest,
                   python=sys.version, gil_enabled=sys._is_gil_enabled(),
                   versions={key: importlib.metadata.version(key) for key in ("torch", "triton", "safetensors")},
                   gptqmodel_source_sha256=source.hexdigest(),
@@ -148,7 +148,7 @@ def main():
     print(json.dumps(identity, sort_keys=True), flush=True)
     if args.identity_only:
         return
-    token = os.environ.get("DS41RT_EXL3_WORKER_TOKEN", "").encode()
+    token = os.environ.get("CUTEAFD_EXL3_WORKER_TOKEN", "").encode()
     server = WorkerServer((args.host, args.port), identity=identity, token=token,
                           checkpoint_root=args.checkpoint_root)
     try:

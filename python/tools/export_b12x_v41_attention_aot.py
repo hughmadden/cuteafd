@@ -16,7 +16,7 @@ def main():
     parser.add_argument("--heads", type=int, choices=(32,64), default=64)
     args = parser.parse_args()
     stem = "v41_attention" if args.heads == 64 else "v41_attention_heads32"
-    symbol = "ds41rt_" + stem
+    symbol = "cuteafd_" + stem
     # Runtime cached modules omit the retained IR needed by export_to_c.
     os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
     os.environ["B12X_COMPILE_MEMORY_CACHE"] = "0"

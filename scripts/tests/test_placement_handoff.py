@@ -142,17 +142,17 @@ spark_first_layer=0
 
     def test_cli_tp2_overrides_and_invalid_config(self):
         source=(ROOT/'run.sh').read_text()
-        block=source[source.index('config="$repo_root/ds41rt.config"'):source.index('for tool in docker ssh')]
+        block=source[source.index('config="$repo_root/cuteafd.config"'):source.index('for tool in docker ssh')]
         setup='repo_root="$1"; shift; source "$repo_root/scripts/release-common.sh"\n'
         finish='\nprintf "%s\\n" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS"\n'
         with tempfile.TemporaryDirectory() as directory:
             config=Path(directory)/'recipe.config'
-            config.write_text((ROOT/'ds41rt.config').read_text()+'\nTP2_ATTENTION=on\nTP2_DSPARK_EXPERTS=on\n')
+            config.write_text((ROOT/'cuteafd.config').read_text()+'\nTP2_ATTENTION=on\nTP2_DSPARK_EXPERTS=on\n')
             args=['bash','-c',setup+block+finish,'test',str(ROOT),'--config',str(config)]
             result=subprocess.run(args+['--no-tp2-attention','--tp2-query-projection','--no-tp2-dspark-experts'],capture_output=True,text=True,cwd=ROOT)
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertEqual(result.stdout.splitlines(),['off','on','off','off'])
-            config.write_text((ROOT/'ds41rt.config').read_text()+'\nTP2_OUTPUT_PROJECTION=invalid\n')
+            config.write_text((ROOT/'cuteafd.config').read_text()+'\nTP2_OUTPUT_PROJECTION=invalid\n')
             result=subprocess.run(args,capture_output=True,text=True,cwd=ROOT)
             self.assertNotEqual(result.returncode,0)
             self.assertIn('TP2_OUTPUT_PROJECTION must be on or off',result.stderr)

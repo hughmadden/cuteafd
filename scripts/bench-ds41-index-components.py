@@ -14,9 +14,9 @@ parser.add_argument('--device',type=int,default=0)
 args=parser.parse_args()
 torch.cuda.set_device(args.device)
 lib=C.CDLL(str(args.native_lib))
-score=lib.ds41rt_v41_index_scores_overlay
+score=lib.cuteafd_v41_index_scores_overlay
 score.argtypes=[C.c_void_p]*12+[C.c_int32]*4+[C.c_uint64,C.c_uint64,C.c_void_p];score.restype=C.c_int32
-top=lib.ds41rt_v41_index_top512
+top=lib.cuteafd_v41_index_top512
 top.argtypes=[C.c_void_p]*4+[C.c_uint64,C.c_void_p]+[C.c_int32]*3+[C.c_void_p];top.restype=C.c_int32
 torch.manual_seed(4132)
 results=[]

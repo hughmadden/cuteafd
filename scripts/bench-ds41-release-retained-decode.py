@@ -12,7 +12,7 @@ not, the completed turn matches only partially, and the runtime's documented
 max-computation-saved rule deliberately prefers the exact prompt ancestor: a
 partial match must replay a 128-token encoder window, so it saves
 `(lcp // 2 * 2) - 128` tokens, less than the prompt snapshot's `context` tokens
-whenever the turn is short (`ds41rt_core::prefix::Reusable::skipped`).
+whenever the turn is short (`cuteafd_core::prefix::Reusable::skipped`).
 
 `prompt_cache_hit_tokens` is therefore the number of prompt tokens whose
 recomputation the runtime skipped, and a retained child legitimately reports:

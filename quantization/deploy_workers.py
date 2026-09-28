@@ -29,46 +29,46 @@ def ssh(host, command, **kwargs):
 def deploy(host, repo, root, token):
     reports = root / "reports"
     # Bind the known base ID locally. Missing bases fail; never pull a substitute.
-    ssh(host, f"docker image inspect {BASE} >/dev/null && docker tag {BASE} ds41rt-quant-base:a70e6af77cd3")
+    ssh(host, f"docker image inspect {BASE} >/dev/null && docker tag {BASE} cuteafd-quant-base:a70e6af77cd3")
     with (reports / f"{host}-worker-deploy-build.log").open("ab") as log:
         archive = subprocess.Popen(["tar", "-czf", "-", "--exclude=__pycache__", "--exclude=*.pyc",
             "docker/Dockerfile.quant-worker", "quantization/exl3_worker.py",
             "third_party/gptqmodel/gptqmodel", "third_party/gptqmodel/gptqmodel_ext"],
             cwd=repo, stdout=subprocess.PIPE, stderr=log)
         try:
-            ssh(host, "docker build -f docker/Dockerfile.quant-worker -t ds41rt-quant-worker:dev -",
+            ssh(host, "docker build -f docker/Dockerfile.quant-worker -t cuteafd-quant-worker:dev -",
                 stdin=archive.stdout, stdout=log, stderr=log)
         finally:
             archive.stdout.close()
             code = archive.wait()
         if code:
             raise RuntimeError(f"{host}: build context archive failed")
-    image = ssh(host, "docker image inspect ds41rt-quant-worker:dev --format '{{.Id}}'",
+    image = ssh(host, "docker image inspect cuteafd-quant-worker:dev --format '{{.Id}}'",
                 capture_output=True, text=True).stdout.strip()
-    existing = ssh(host, "docker ps -a --filter name='^/ds41rt-quant-worker$' --format '{{.ID}}'",
+    existing = ssh(host, "docker ps -a --filter name='^/cuteafd-quant-worker$' --format '{{.ID}}'",
                    capture_output=True, text=True).stdout.strip()
     if existing:
-        status = json.loads(ssh(host, "docker inspect ds41rt-quant-worker --format '{{json .}}'",
+        status = json.loads(ssh(host, "docker inspect cuteafd-quant-worker --format '{{json .}}'",
                                 capture_output=True, text=True).stdout)
         # Do not print inspect output: it contains the private token environment.
         if status["Image"] != image or not status["State"]["Running"]:
             raise RuntimeError(f"{host}: existing worker requires explicit recovery")
-        if f"DS41RT_EXL3_WORKER_TOKEN={token}" not in status["Config"]["Env"]:
+        if f"CUTEAFD_EXL3_WORKER_TOKEN={token}" not in status["Config"]["Env"]:
             raise RuntimeError(f"{host}: existing worker uses a different authentication token")
     else:
-        command = ("read -r ds41rt_worker_token; docker run -d --name ds41rt-quant-worker --gpus all "
-                   "--restart=no -p 17841:17841 -v ds41rt-quant-jit:/root/.cache/gptqmodel "
-                   "-v ds41rt-quant-worker-state:/state "
-                   '-e DS41RT_EXL3_WORKER_TOKEN="$ds41rt_worker_token" '
+        command = ("read -r cuteafd_worker_token; docker run -d --name cuteafd-quant-worker --gpus all "
+                   "--restart=no -p 17841:17841 -v cuteafd-quant-jit:/root/.cache/gptqmodel "
+                   "-v cuteafd-quant-worker-state:/state "
+                   '-e CUTEAFD_EXL3_WORKER_TOKEN="$cuteafd_worker_token" '
                    f"{shlex.quote(image)} --name {host} --image-digest {shlex.quote(image)} "
                    "--checkpoint-root /state/checkpoints")
         ssh(host, command, input=token + "\n", capture_output=True, text=True)
     # The service logs its immutable runtime identity after imports. Docker's
     # running state alone is not readiness; callers must authenticate/qualify it.
-    container = ssh(host, "docker inspect ds41rt-quant-worker --format '{{.Id}}'",
+    container = ssh(host, "docker inspect cuteafd-quant-worker --format '{{.Id}}'",
                     capture_output=True, text=True).stdout.strip()
     return dict(host=host, image_digest=image, container_id=container, port=17841,
-                checkpoint_volume="ds41rt-quant-worker-state", jit_volume="ds41rt-quant-jit")
+                checkpoint_volume="cuteafd-quant-worker-state", jit_volume="cuteafd-quant-jit")
 
 
 def main():
@@ -100,7 +100,7 @@ def main():
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = [pool.submit(deploy, host, repo, root, token) for host in HOSTS]
         workers = [future.result() for future in futures]
-    manifest = dict(schema="ds41rt-worker-deployment-v1", workers=workers,
+    manifest = dict(schema="cuteafd-worker-deployment-v1", workers=workers,
                     status="deployed-not-numerically-qualified")
     with tempfile.NamedTemporaryFile(mode="w", dir=root, prefix="workers-", delete=False) as stream:
         json.dump(manifest, stream, sort_keys=True, indent=2)

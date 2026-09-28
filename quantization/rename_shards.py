@@ -104,7 +104,7 @@ def run(manifest, source_state, state, output, parent, *, publish=False):
         commit = info.sha  # Recover a lost response only after exact inventory comparison.
     if _remote(api, repo, commit) != expected:
         raise ValueError('renamed remote inventory differs')
-    updated = dict(schema='ds41rt-upload-receipt-v1', status='uploaded', repo_id=repo, commit=commit,
+    updated = dict(schema='cuteafd-upload-receipt-v1', status='uploaded', repo_id=repo, commit=commit,
         files={name: dict(**record, local=_fingerprint(output / name)) for name, record in expected.items()})
     _publish_json(state / 'upload-complete.json', updated)
     owner = Path(manifest['run_root']).stat()

@@ -56,7 +56,7 @@ import _pinned_sparkinfer
 def _load_v41_exl3_family():
     """Import the shared pure family module by sibling path (works under spec loads)."""
     import importlib.util
-    name = 'ds41rt_v41_exl3_family'
+    name = 'cuteafd_v41_exl3_family'
     if existing := sys.modules.get(name):
         return existing
     path = Path(__file__).resolve().with_name('v41_exl3_family.py')
@@ -187,7 +187,7 @@ def resolve_tier_family(declared, observed, global_family=None, global_audit=Non
                   derived_family=list(expected), declared=None if declared is None
                   else [int(value) for value in declared],
                   rule='shared v41_exl3_family.expected_decoder_family mirroring '
-                       'rust/crates/ds41rt-loader/src/v41_exl3.rs decoder_family')
+                       'rust/crates/cuteafd-loader/src/v41_exl3.rs decoder_family')
     if global_family is not None:
         global_family = list(global_family)
         if global_family != expected:
@@ -253,7 +253,7 @@ def is_tile_legality_error(message):
     return any(marker in lowered for marker in TILE_LEGALITY_MARKERS)
 
 
-STAGED_MANIFEST_SCHEMA = 'ds41rt-hf-staged-snapshot-v1'
+STAGED_MANIFEST_SCHEMA = 'cuteafd-hf-staged-snapshot-v1'
 # A staged revision is either a git commit (40-hex, e.g. the HF snapshot
 # directory name) or a content-addressed manifest hash (64-hex, the
 # sync_ds4_hf_snapshot contract).  Both are admitted; the manifest must echo
@@ -265,7 +265,7 @@ def checkpoint_identity(snapshot, expected_checkpoint=None):
     """Bind the run to explicit checkpoint identity; never to a name guess.
 
     Records the resolved path, staged revision directory, and the SHA-256 of
-    the weight index.  When a ``ds41rt-manifests/<revision>.json`` is present
+    the weight index.  When a ``cuteafd-manifests/<revision>.json`` is present
     the snapshot is verified against the same fields `sync_ds4_hf_snapshot`
     checks: exact ``schema``, exact ``model_id``, and a manifest revision
     (``revision``, or its ``commit`` field where a publisher used that name)
@@ -314,7 +314,7 @@ def checkpoint_identity(snapshot, expected_checkpoint=None):
                     f'revision {revision!r} under test; refusing to benchmark a '
                     'stale ref')
             record['refs_main_matches'] = True
-        manifest = resolved.parent.parent / 'ds41rt-manifests' / f'{revision}.json'
+        manifest = resolved.parent.parent / 'cuteafd-manifests' / f'{revision}.json'
         if manifest.is_file():
             payload = json.loads(manifest.read_text())
             if payload.get('schema') != STAGED_MANIFEST_SCHEMA:
@@ -371,7 +371,7 @@ def checkpoint_identity(snapshot, expected_checkpoint=None):
             raise ValueError(
                 f'staged snapshot is {manifest_model_id!r}, not the requested '
                 f'checkpoint {expected_checkpoint!r}')
-        record['confirmed_via'] = 'ds41rt-manifest-verified'
+        record['confirmed_via'] = 'cuteafd-manifest-verified'
     else:
         slug = 'models--' + expected_checkpoint.replace('/', '--')
         # No manifest to verify against: only the exact staged cache structure
@@ -379,7 +379,7 @@ def checkpoint_identity(snapshot, expected_checkpoint=None):
         if not (staged and resolved.parent.parent.name == slug):
             raise ValueError(
                 f'cannot confirm snapshot {resolved} as checkpoint '
-                f'{expected_checkpoint!r}: no ds41rt manifest and no exact '
+                f'{expected_checkpoint!r}: no cuteafd manifest and no exact '
                 f'{slug}/snapshots/<revision> staging path')
         record['confirmed_via'] = 'hf-cache-dir-name'
     return record

@@ -1,6 +1,6 @@
 """Opt-in exact-AOT grid qualification; no export, JIT, or service startup.
 
-On an idle 188-SM SM120 host, point DS41RT_EXL3_GRID_AOT at one or more
+On an idle 188-SM SM120 host, point CUTEAFD_EXL3_GRID_AOT at one or more
 path-separated shipping variant directories (rtx-tp1, rtx-tp2, dspark; k23/k34).
 Run: python3 -m unittest discover -s python/tests -p test_exl3_grid_numerics.py -v
 Synthetic packed weights exercise six experts across both tiers. This compares
@@ -14,7 +14,7 @@ from pathlib import Path
 import unittest
 
 
-@unittest.skipUnless(os.environ.get('DS41RT_EXL3_GRID_AOT'), 'opt-in exact-AOT GPU qualification')
+@unittest.skipUnless(os.environ.get('CUTEAFD_EXL3_GRID_AOT'), 'opt-in exact-AOT GPU qualification')
 class Exl3GridNumericsTests(unittest.TestCase):
     def test_export_grid_vs_170_and_changed_input_graph(self):
         import torch
@@ -22,7 +22,7 @@ class Exl3GridNumericsTests(unittest.TestCase):
         props = torch.cuda.get_device_properties(0)
         self.assertEqual((props.major, props.minor, props.multi_processor_count), (12, 0, 188))
         torch.cuda.set_device(0)
-        for directory in os.environ['DS41RT_EXL3_GRID_AOT'].split(os.pathsep):
+        for directory in os.environ['CUTEAFD_EXL3_GRID_AOT'].split(os.pathsep):
             with self.subTest(aot=directory):
                 self.qualify(Path(directory), torch)
 
@@ -92,15 +92,15 @@ class Exl3GridNumericsTests(unittest.TestCase):
                 pointers[f't{tier}_{key}_ptr'] = torch.ones(experts, device='cuda', dtype=torch.float32)
             scalars.update({f'tier{tier}_num_experts': experts, f'tier{tier}_fc2_experts': 3,
                             f'tier{tier}_gate_experts': 3, f'tier{tier}_up_experts': 3})
-        lib = ct.CDLL(str(root / 'libds41rt_exl3.so'))
-        lib.ds41rt_exl3_create.argtypes = [ct.POINTER(ct.c_void_p)]
-        lib.ds41rt_exl3_destroy.argtypes = [ct.c_void_p]
+        lib = ct.CDLL(str(root / 'libcuteafd_exl3.so'))
+        lib.cuteafd_exl3_create.argtypes = [ct.POINTER(ct.c_void_p)]
+        lib.cuteafd_exl3_destroy.argtypes = [ct.c_void_p]
         for role in ('core', 'sum'):
-            fn = getattr(lib, 'ds41rt_exl3_' + role)
+            fn = getattr(lib, 'cuteafd_exl3_' + role)
             fn.argtypes = [ct.c_void_p, ct.POINTER(ct.c_void_p), ct.POINTER(ct.c_int32), ct.c_void_p]
             fn.restype = ct.c_int
         context = ct.c_void_p()
-        self.assertEqual(lib.ds41rt_exl3_create(ct.byref(context)), 0)
+        self.assertEqual(lib.cuteafd_exl3_create(ct.byref(context)), 0)
         route_lib, route_context, graph = None, ct.c_void_p(), None
         try:
             if meta['requires_route_preparation']:
@@ -108,15 +108,15 @@ class Exl3GridNumericsTests(unittest.TestCase):
                 self.assertEqual(hashlib.sha256(route_path.read_bytes()).hexdigest(),
                                  meta['route_preparation']['sha256'])
                 route_lib = ct.CDLL(str(route_path.parent / 'libv41_exl3_routes.so'))
-                route_lib.ds41rt_exl3_routes_create.argtypes = [ct.POINTER(ct.c_void_p)]
-                route_lib.ds41rt_exl3_routes_destroy.argtypes = [ct.c_void_p]
-                route_lib.ds41rt_exl3_routes_launch.argtypes = [ct.c_void_p, ct.POINTER(ct.c_void_p),
+                route_lib.cuteafd_exl3_routes_create.argtypes = [ct.POINTER(ct.c_void_p)]
+                route_lib.cuteafd_exl3_routes_destroy.argtypes = [ct.c_void_p]
+                route_lib.cuteafd_exl3_routes_launch.argtypes = [ct.c_void_p, ct.POINTER(ct.c_void_p),
                     ct.POINTER(ct.c_uint64), ct.c_int32, ct.c_void_p]
                 route_tensors = [ids, expert_map] + [buffers[name] for name in
                     ('packed_route_indices', 'block_expert_ids', 'packed_route_count', 'expert_offsets', 'expert_counts')]
                 route_p = (ct.c_void_p * 7)(*[t.data_ptr() for t in route_tensors])
                 route_bytes = (ct.c_uint64 * 7)(*[t.numel() * t.element_size() for t in route_tensors])
-                self.assertEqual(route_lib.ds41rt_exl3_routes_create(ct.byref(route_context)), 0)
+                self.assertEqual(route_lib.cuteafd_exl3_routes_create(ct.byref(route_context)), 0)
 
             def poison():
                 # A reduced grid must produce every live value itself, not reuse
@@ -136,13 +136,13 @@ class Exl3GridNumericsTests(unittest.TestCase):
                 if route_lib is not None:
                     # Match the daemon's live ID view, not its larger allocation.
                     route_bytes[0] = rows * topk * ids.element_size()
-                    self.assertEqual(route_lib.ds41rt_exl3_routes_launch(
+                    self.assertEqual(route_lib.cuteafd_exl3_routes_launch(
                         route_context, route_p, route_bytes, rows, stream), 0)
                 for entry in meta['objects']:
                     p = (ct.c_void_p * len(entry['pointer_slots']))(*[pointers[n].data_ptr() for n in entry['pointer_slots']])
                     s = (ct.c_int32 * len(entry['scalar_slots']))(*[scalars[n] for n in entry['scalar_slots']])
                     role = entry['label'].rsplit('_', 1)[1]
-                    self.assertEqual(getattr(lib, 'ds41rt_exl3_' + role)(context, p, s, stream), 0)
+                    self.assertEqual(getattr(lib, 'cuteafd_exl3_' + role)(context, p, s, stream), 0)
 
             for rows in sorted({1, min(3, capacity), max(1, capacity - 1), capacity}):
                 poison()
@@ -173,15 +173,15 @@ class Exl3GridNumericsTests(unittest.TestCase):
             print(json.dumps(dict(aot=str(root), passed=True, export_sms=188, simulated_sms=170,
                 bits=meta['bits'], intermediate=width, capacity=capacity, top_k=topk,
                 manifest_sha256=hashlib.sha256(meta_path.read_bytes()).hexdigest(),
-                library_sha256=hashlib.sha256((root / 'libds41rt_exl3.so').read_bytes()).hexdigest(),
+                library_sha256=hashlib.sha256((root / 'libcuteafd_exl3.so').read_bytes()).hexdigest(),
                 bitwise_equal=True, changed_input_graph=True, scope='synthetic exact-object grid invariance only')))
         finally:
             torch.cuda.synchronize()
             if graph is not None:
                 del graph
             if route_context.value:
-                self.assertEqual(route_lib.ds41rt_exl3_routes_destroy(route_context), 0)
-            lib.ds41rt_exl3_destroy(context)
+                self.assertEqual(route_lib.cuteafd_exl3_routes_destroy(route_context), 0)
+            lib.cuteafd_exl3_destroy(context)
 
 
 if __name__ == '__main__':

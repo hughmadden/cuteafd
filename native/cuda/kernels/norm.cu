@@ -215,140 +215,140 @@ __global__ void layernorm_affine_bf16_kernel(const uint16_t* x, const uint16_t* 
   }
 }
 
-ds41rt_status_t validate_rmsnorm_args(const float* x, const float* weight, const float* out,
+cuteafd_status_t validate_rmsnorm_args(const float* x, const float* weight, const float* out,
                                      int rows, int hidden) {
   if (x == nullptr || weight == nullptr || out == nullptr) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   if (rows <= 0 || hidden <= 0) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
-ds41rt_status_t validate_rmsnorm_bf16_args(const uint16_t* x, const uint16_t* weight,
+cuteafd_status_t validate_rmsnorm_bf16_args(const uint16_t* x, const uint16_t* weight,
                                           const uint16_t* out, int rows, int hidden) {
   if (x == nullptr || weight == nullptr || out == nullptr) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   if (rows <= 0 || hidden <= 0) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
-ds41rt_status_t validate_layernorm_affine_f32_bf16_args(const float* x, const uint16_t* weight,
+cuteafd_status_t validate_layernorm_affine_f32_bf16_args(const float* x, const uint16_t* weight,
                                                        const uint16_t* bias, const float* out,
                                                        int rows, int hidden) {
   if (x == nullptr || weight == nullptr || bias == nullptr || out == nullptr) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   if (rows <= 0 || hidden <= 0) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
-ds41rt_status_t validate_layernorm_affine_bf16_args(const uint16_t* x, const uint16_t* weight,
+cuteafd_status_t validate_layernorm_affine_bf16_args(const uint16_t* x, const uint16_t* weight,
                                                    const uint16_t* bias, const uint16_t* out,
                                                    int rows, int hidden) {
   if (x == nullptr || weight == nullptr || bias == nullptr || out == nullptr) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   if (rows <= 0 || hidden <= 0) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
-ds41rt_status_t validate_bf16_graph_rmsnorm_buffers(ds41rt_device_buffer_t x,
-                                                   ds41rt_device_buffer_t weight,
-                                                   ds41rt_device_buffer_t out, int rows,
+cuteafd_status_t validate_bf16_graph_rmsnorm_buffers(cuteafd_device_buffer_t x,
+                                                   cuteafd_device_buffer_t weight,
+                                                   cuteafd_device_buffer_t out, int rows,
                                                    int hidden) {
-  const ds41rt_status_t valid = validate_rmsnorm_bf16_args(
+  const cuteafd_status_t valid = validate_rmsnorm_bf16_args(
       static_cast<const uint16_t*>(x.ptr), static_cast<const uint16_t*>(weight.ptr),
       static_cast<const uint16_t*>(out.ptr), rows, hidden);
-  if (valid != DS41RT_STATUS_OK) {
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
   size_t row_values = 0;
   if (!checked_mul(static_cast<size_t>(rows), static_cast<size_t>(hidden), &row_values)) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   size_t row_bytes = 0;
   if (!checked_mul(row_values, sizeof(uint16_t), &row_bytes)) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   size_t weight_bytes = 0;
   if (!checked_mul(static_cast<size_t>(hidden), sizeof(uint16_t), &weight_bytes)) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   if (x.bytes < row_bytes || out.bytes < row_bytes || weight.bytes < weight_bytes) {
-    return DS41RT_STATUS_BUFFER_TOO_SMALL;
+    return CUTEAFD_STATUS_BUFFER_TOO_SMALL;
   }
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
-ds41rt_status_t validate_graph_layernorm_affine_f32_bf16_buffers(
-    ds41rt_device_buffer_t x, ds41rt_device_buffer_t weight, ds41rt_device_buffer_t bias,
-    ds41rt_device_buffer_t out, int rows, int hidden) {
-  const ds41rt_status_t valid = validate_layernorm_affine_f32_bf16_args(
+cuteafd_status_t validate_graph_layernorm_affine_f32_bf16_buffers(
+    cuteafd_device_buffer_t x, cuteafd_device_buffer_t weight, cuteafd_device_buffer_t bias,
+    cuteafd_device_buffer_t out, int rows, int hidden) {
+  const cuteafd_status_t valid = validate_layernorm_affine_f32_bf16_args(
       static_cast<const float*>(x.ptr), static_cast<const uint16_t*>(weight.ptr),
       static_cast<const uint16_t*>(bias.ptr), static_cast<const float*>(out.ptr), rows, hidden);
-  if (valid != DS41RT_STATUS_OK) {
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
   size_t row_values = 0;
   if (!checked_mul(static_cast<size_t>(rows), static_cast<size_t>(hidden), &row_values)) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   size_t row_bytes = 0;
   size_t vector_bytes = 0;
   if (!checked_mul(row_values, sizeof(float), &row_bytes) ||
       !checked_mul(static_cast<size_t>(hidden), sizeof(uint16_t), &vector_bytes)) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   if (x.bytes < row_bytes || out.bytes < row_bytes || weight.bytes < vector_bytes ||
       bias.bytes < vector_bytes) {
-    return DS41RT_STATUS_BUFFER_TOO_SMALL;
+    return CUTEAFD_STATUS_BUFFER_TOO_SMALL;
   }
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
-ds41rt_status_t validate_graph_layernorm_affine_bf16_buffers(
-    ds41rt_device_buffer_t x, ds41rt_device_buffer_t weight, ds41rt_device_buffer_t bias,
-    ds41rt_device_buffer_t out, int rows, int hidden) {
-  const ds41rt_status_t valid = validate_layernorm_affine_bf16_args(
+cuteafd_status_t validate_graph_layernorm_affine_bf16_buffers(
+    cuteafd_device_buffer_t x, cuteafd_device_buffer_t weight, cuteafd_device_buffer_t bias,
+    cuteafd_device_buffer_t out, int rows, int hidden) {
+  const cuteafd_status_t valid = validate_layernorm_affine_bf16_args(
       static_cast<const uint16_t*>(x.ptr), static_cast<const uint16_t*>(weight.ptr),
       static_cast<const uint16_t*>(bias.ptr), static_cast<const uint16_t*>(out.ptr), rows,
       hidden);
-  if (valid != DS41RT_STATUS_OK) {
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
   size_t row_values = 0;
   if (!checked_mul(static_cast<size_t>(rows), static_cast<size_t>(hidden), &row_values)) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   size_t row_bytes = 0;
   size_t vector_bytes = 0;
   if (!checked_mul(row_values, sizeof(uint16_t), &row_bytes) ||
       !checked_mul(static_cast<size_t>(hidden), sizeof(uint16_t), &vector_bytes)) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   if (x.bytes < row_bytes || out.bytes < row_bytes || weight.bytes < vector_bytes ||
       bias.bytes < vector_bytes) {
-    return DS41RT_STATUS_BUFFER_TOO_SMALL;
+    return CUTEAFD_STATUS_BUFFER_TOO_SMALL;
   }
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
 }  // namespace
 
-extern "C" ds41rt_status_t ds41rt_cuda_rmsnorm_f32_async(const float* x, const float* weight,
+extern "C" cuteafd_status_t cuteafd_cuda_rmsnorm_f32_async(const float* x, const float* weight,
                                                        float* out, int rows, int hidden,
                                                        float eps, void* cuda_stream) {
-  const ds41rt_status_t valid = validate_rmsnorm_args(x, weight, out, rows, hidden);
-  if (valid != DS41RT_STATUS_OK) {
+  const cuteafd_status_t valid = validate_rmsnorm_args(x, weight, out, rows, hidden);
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
@@ -357,22 +357,22 @@ extern "C" ds41rt_status_t ds41rt_cuda_rmsnorm_f32_async(const float* x, const f
   return status_from_cuda(cudaGetLastError());
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_rmsnorm_f32(const float* x, const float* weight, float* out,
+extern "C" cuteafd_status_t cuteafd_cuda_rmsnorm_f32(const float* x, const float* weight, float* out,
                                                  int rows, int hidden, float eps) {
-  const ds41rt_status_t status = ds41rt_cuda_rmsnorm_f32_async(x, weight, out, rows, hidden, eps,
+  const cuteafd_status_t status = cuteafd_cuda_rmsnorm_f32_async(x, weight, out, rows, hidden, eps,
                                                             nullptr);
-  if (status != DS41RT_STATUS_OK) {
+  if (status != CUTEAFD_STATUS_OK) {
     return status;
   }
   return status_from_cuda(cudaStreamSynchronize(nullptr));
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_rmsnorm_bf16_async(const uint16_t* x,
+extern "C" cuteafd_status_t cuteafd_cuda_rmsnorm_bf16_async(const uint16_t* x,
                                                         const uint16_t* weight, uint16_t* out,
                                                         int rows, int hidden, float eps,
                                                         void* cuda_stream) {
-  const ds41rt_status_t valid = validate_rmsnorm_bf16_args(x, weight, out, rows, hidden);
-  if (valid != DS41RT_STATUS_OK) {
+  const cuteafd_status_t valid = validate_rmsnorm_bf16_args(x, weight, out, rows, hidden);
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
@@ -381,16 +381,16 @@ extern "C" ds41rt_status_t ds41rt_cuda_rmsnorm_bf16_async(const uint16_t* x,
   return status_from_cuda(cudaGetLastError());
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_ds4_flash_rmsnorm_bf16_async(
+extern "C" cuteafd_status_t cuteafd_cuda_ds4_flash_rmsnorm_bf16_async(
     const uint16_t* x, const uint16_t* weight, uint16_t* out, int rows,
     int hidden, float eps, void* cuda_stream) {
-  const ds41rt_status_t valid =
+  const cuteafd_status_t valid =
       validate_rmsnorm_bf16_args(x, weight, out, rows, hidden);
-  if (valid != DS41RT_STATUS_OK) {
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
   if (hidden != 4096 || !isfinite(eps) || eps <= 0.0f) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   (void)cudaGetLastError();
@@ -399,16 +399,16 @@ extern "C" ds41rt_status_t ds41rt_cuda_ds4_flash_rmsnorm_bf16_async(
   return status_from_cuda(cudaGetLastError());
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_ds4_rmsnorm_bf16_rne_async(
+extern "C" cuteafd_status_t cuteafd_cuda_ds4_rmsnorm_bf16_rne_async(
     const uint16_t* x, const uint16_t* weight, uint16_t* out, int rows,
     int hidden, float eps, void* cuda_stream) {
-  const ds41rt_status_t valid =
+  const cuteafd_status_t valid =
       validate_rmsnorm_bf16_args(x, weight, out, rows, hidden);
-  if (valid != DS41RT_STATUS_OK) {
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
   if (!isfinite(eps) || eps <= 0.0f) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   (void)cudaGetLastError();
@@ -422,7 +422,7 @@ extern "C" ds41rt_status_t ds41rt_cuda_ds4_rmsnorm_bf16_rne_async(
   return status_from_cuda(cudaGetLastError());
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_mla_scalar_qa_batched_norm_candidate_async(
+extern "C" cuteafd_status_t cuteafd_cuda_mla_scalar_qa_batched_norm_candidate_async(
     const uint16_t* hidden, const uint16_t* input_norm_weight,
     uint16_t* normalized_hidden, const uint16_t* q_a_weight,
     uint16_t* q_a_projected, const uint16_t* q_a_norm_weight,
@@ -432,63 +432,63 @@ extern "C" ds41rt_status_t ds41rt_cuda_mla_scalar_qa_batched_norm_candidate_asyn
       q_a_weight == nullptr || q_a_projected == nullptr || q_a_norm_weight == nullptr ||
       q_a_normalized == nullptr || rows < 2 || rows > 16 || hidden_dim != 6144 ||
       q_lora_rank != 2048 || !isfinite(eps) || eps <= 0.0f) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
-  ds41rt_status_t status = ds41rt_cuda_rmsnorm_bf16_async(
+  cuteafd_status_t status = cuteafd_cuda_rmsnorm_bf16_async(
       hidden, input_norm_weight, normalized_hidden, static_cast<int>(rows),
       static_cast<int>(hidden_dim), eps, cuda_stream);
-  if (status != DS41RT_STATUS_OK) {
+  if (status != CUTEAFD_STATUS_OK) {
     return status;
   }
   for (size_t row = 0; row < rows; ++row) {
-    status = ds41rt_cuda_linear_bf16_cublas_async(
+    status = cuteafd_cuda_linear_bf16_cublas_async(
         normalized_hidden + row * hidden_dim, q_a_weight, nullptr,
         q_a_projected + row * q_lora_rank, 1, hidden_dim, q_lora_rank,
         cuda_stream);
-    if (status != DS41RT_STATUS_OK) {
+    if (status != CUTEAFD_STATUS_OK) {
       return status;
     }
   }
-  return ds41rt_cuda_rmsnorm_bf16_async(
+  return cuteafd_cuda_rmsnorm_bf16_async(
       q_a_projected, q_a_norm_weight, q_a_normalized, static_cast<int>(rows),
       static_cast<int>(q_lora_rank), eps, cuda_stream);
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_rmsnorm_bf16(const uint16_t* x,
+extern "C" cuteafd_status_t cuteafd_cuda_rmsnorm_bf16(const uint16_t* x,
                                                   const uint16_t* weight, uint16_t* out,
                                                   int rows, int hidden, float eps) {
-  const ds41rt_status_t status = ds41rt_cuda_rmsnorm_bf16_async(x, weight, out, rows, hidden, eps,
+  const cuteafd_status_t status = cuteafd_cuda_rmsnorm_bf16_async(x, weight, out, rows, hidden, eps,
                                                              nullptr);
-  if (status != DS41RT_STATUS_OK) {
+  if (status != CUTEAFD_STATUS_OK) {
     return status;
   }
   return status_from_cuda(cudaStreamSynchronize(nullptr));
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_graph_update_rmsnorm_bf16_node(
-    void* cuda_graph, void* cuda_graph_exec, size_t kernel_node_index, ds41rt_device_buffer_t x,
-    ds41rt_device_buffer_t weight, ds41rt_device_buffer_t out, int rows, int hidden, float eps) {
+extern "C" cuteafd_status_t cuteafd_cuda_graph_update_rmsnorm_bf16_node(
+    void* cuda_graph, void* cuda_graph_exec, size_t kernel_node_index, cuteafd_device_buffer_t x,
+    cuteafd_device_buffer_t weight, cuteafd_device_buffer_t out, int rows, int hidden, float eps) {
   if (cuda_graph == nullptr || cuda_graph_exec == nullptr) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
-  const ds41rt_status_t valid = validate_bf16_graph_rmsnorm_buffers(x, weight, out, rows, hidden);
-  if (valid != DS41RT_STATUS_OK) {
+  const cuteafd_status_t valid = validate_bf16_graph_rmsnorm_buffers(x, weight, out, rows, hidden);
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
 
   cudaGraphNode_t node = nullptr;
-  const ds41rt_status_t node_status = find_kernel_node_by_index(cuda_graph, kernel_node_index, &node);
-  if (node_status != DS41RT_STATUS_OK) {
+  const cuteafd_status_t node_status = find_kernel_node_by_index(cuda_graph, kernel_node_index, &node);
+  if (node_status != CUTEAFD_STATUS_OK) {
     return node_status;
   }
 
   cudaKernelNodeParams existing = {};
   cudaError_t err = cudaGraphKernelNodeGetParams(node, &existing);
   if (err != cudaSuccess) {
-    return DS41RT_STATUS_INTERNAL_ERROR;
+    return CUTEAFD_STATUS_INTERNAL_ERROR;
   }
   if (existing.func != reinterpret_cast<void*>(rmsnorm_bf16_kernel)) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
 
   const uint16_t* x_ptr = static_cast<const uint16_t*>(x.ptr);
@@ -512,42 +512,42 @@ extern "C" ds41rt_status_t ds41rt_cuda_graph_update_rmsnorm_bf16_node(
 
   err = cudaGraphKernelNodeSetParams(node, &params);
   if (err != cudaSuccess) {
-    return DS41RT_STATUS_INTERNAL_ERROR;
+    return CUTEAFD_STATUS_INTERNAL_ERROR;
   }
   err = cudaGraphExecKernelNodeSetParams(reinterpret_cast<cudaGraphExec_t>(cuda_graph_exec), node,
                                          &params);
   if (err != cudaSuccess) {
-    return DS41RT_STATUS_INTERNAL_ERROR;
+    return CUTEAFD_STATUS_INTERNAL_ERROR;
   }
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_graph_update_layernorm_affine_f32_bf16_node(
-    void* cuda_graph, void* cuda_graph_exec, size_t kernel_node_index, ds41rt_device_buffer_t x,
-    ds41rt_device_buffer_t weight, ds41rt_device_buffer_t bias, ds41rt_device_buffer_t out,
+extern "C" cuteafd_status_t cuteafd_cuda_graph_update_layernorm_affine_f32_bf16_node(
+    void* cuda_graph, void* cuda_graph_exec, size_t kernel_node_index, cuteafd_device_buffer_t x,
+    cuteafd_device_buffer_t weight, cuteafd_device_buffer_t bias, cuteafd_device_buffer_t out,
     int rows, int hidden, float eps) {
   if (cuda_graph == nullptr || cuda_graph_exec == nullptr) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
-  const ds41rt_status_t valid =
+  const cuteafd_status_t valid =
       validate_graph_layernorm_affine_f32_bf16_buffers(x, weight, bias, out, rows, hidden);
-  if (valid != DS41RT_STATUS_OK) {
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
 
   cudaGraphNode_t node = nullptr;
-  const ds41rt_status_t node_status = find_kernel_node_by_index(cuda_graph, kernel_node_index, &node);
-  if (node_status != DS41RT_STATUS_OK) {
+  const cuteafd_status_t node_status = find_kernel_node_by_index(cuda_graph, kernel_node_index, &node);
+  if (node_status != CUTEAFD_STATUS_OK) {
     return node_status;
   }
 
   cudaKernelNodeParams existing = {};
   cudaError_t err = cudaGraphKernelNodeGetParams(node, &existing);
   if (err != cudaSuccess) {
-    return DS41RT_STATUS_INTERNAL_ERROR;
+    return CUTEAFD_STATUS_INTERNAL_ERROR;
   }
   if (existing.func != reinterpret_cast<void*>(layernorm_affine_f32_bf16_kernel)) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
 
   const float* x_ptr = static_cast<const float*>(x.ptr);
@@ -573,42 +573,42 @@ extern "C" ds41rt_status_t ds41rt_cuda_graph_update_layernorm_affine_f32_bf16_no
 
   err = cudaGraphKernelNodeSetParams(node, &params);
   if (err != cudaSuccess) {
-    return DS41RT_STATUS_INTERNAL_ERROR;
+    return CUTEAFD_STATUS_INTERNAL_ERROR;
   }
   err = cudaGraphExecKernelNodeSetParams(reinterpret_cast<cudaGraphExec_t>(cuda_graph_exec), node,
                                          &params);
   if (err != cudaSuccess) {
-    return DS41RT_STATUS_INTERNAL_ERROR;
+    return CUTEAFD_STATUS_INTERNAL_ERROR;
   }
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_graph_update_layernorm_affine_bf16_node(
-    void* cuda_graph, void* cuda_graph_exec, size_t kernel_node_index, ds41rt_device_buffer_t x,
-    ds41rt_device_buffer_t weight, ds41rt_device_buffer_t bias, ds41rt_device_buffer_t out,
+extern "C" cuteafd_status_t cuteafd_cuda_graph_update_layernorm_affine_bf16_node(
+    void* cuda_graph, void* cuda_graph_exec, size_t kernel_node_index, cuteafd_device_buffer_t x,
+    cuteafd_device_buffer_t weight, cuteafd_device_buffer_t bias, cuteafd_device_buffer_t out,
     int rows, int hidden, float eps) {
   if (cuda_graph == nullptr || cuda_graph_exec == nullptr) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
-  const ds41rt_status_t valid =
+  const cuteafd_status_t valid =
       validate_graph_layernorm_affine_bf16_buffers(x, weight, bias, out, rows, hidden);
-  if (valid != DS41RT_STATUS_OK) {
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
 
   cudaGraphNode_t node = nullptr;
-  const ds41rt_status_t node_status = find_kernel_node_by_index(cuda_graph, kernel_node_index, &node);
-  if (node_status != DS41RT_STATUS_OK) {
+  const cuteafd_status_t node_status = find_kernel_node_by_index(cuda_graph, kernel_node_index, &node);
+  if (node_status != CUTEAFD_STATUS_OK) {
     return node_status;
   }
 
   cudaKernelNodeParams existing = {};
   cudaError_t err = cudaGraphKernelNodeGetParams(node, &existing);
   if (err != cudaSuccess) {
-    return DS41RT_STATUS_INTERNAL_ERROR;
+    return CUTEAFD_STATUS_INTERNAL_ERROR;
   }
   if (existing.func != reinterpret_cast<void*>(layernorm_affine_bf16_kernel)) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
 
   const uint16_t* x_ptr = static_cast<const uint16_t*>(x.ptr);
@@ -634,22 +634,22 @@ extern "C" ds41rt_status_t ds41rt_cuda_graph_update_layernorm_affine_bf16_node(
 
   err = cudaGraphKernelNodeSetParams(node, &params);
   if (err != cudaSuccess) {
-    return DS41RT_STATUS_INTERNAL_ERROR;
+    return CUTEAFD_STATUS_INTERNAL_ERROR;
   }
   err = cudaGraphExecKernelNodeSetParams(reinterpret_cast<cudaGraphExec_t>(cuda_graph_exec), node,
                                          &params);
   if (err != cudaSuccess) {
-    return DS41RT_STATUS_INTERNAL_ERROR;
+    return CUTEAFD_STATUS_INTERNAL_ERROR;
   }
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_layernorm_affine_f32_bf16_async(
+extern "C" cuteafd_status_t cuteafd_cuda_layernorm_affine_f32_bf16_async(
     const float* x, const uint16_t* weight, const uint16_t* bias, float* out, int rows, int hidden,
     float eps, void* cuda_stream) {
-  const ds41rt_status_t valid =
+  const cuteafd_status_t valid =
       validate_layernorm_affine_f32_bf16_args(x, weight, bias, out, rows, hidden);
-  if (valid != DS41RT_STATUS_OK) {
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
@@ -658,23 +658,23 @@ extern "C" ds41rt_status_t ds41rt_cuda_layernorm_affine_f32_bf16_async(
   return status_from_cuda(cudaGetLastError());
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_layernorm_affine_f32_bf16(
+extern "C" cuteafd_status_t cuteafd_cuda_layernorm_affine_f32_bf16(
     const float* x, const uint16_t* weight, const uint16_t* bias, float* out, int rows, int hidden,
     float eps) {
-  const ds41rt_status_t status =
-      ds41rt_cuda_layernorm_affine_f32_bf16_async(x, weight, bias, out, rows, hidden, eps, nullptr);
-  if (status != DS41RT_STATUS_OK) {
+  const cuteafd_status_t status =
+      cuteafd_cuda_layernorm_affine_f32_bf16_async(x, weight, bias, out, rows, hidden, eps, nullptr);
+  if (status != CUTEAFD_STATUS_OK) {
     return status;
   }
   return status_from_cuda(cudaStreamSynchronize(nullptr));
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_layernorm_affine_bf16_async(
+extern "C" cuteafd_status_t cuteafd_cuda_layernorm_affine_bf16_async(
     const uint16_t* x, const uint16_t* weight, const uint16_t* bias, uint16_t* out, int rows,
     int hidden, float eps, void* cuda_stream) {
-  const ds41rt_status_t valid =
+  const cuteafd_status_t valid =
       validate_layernorm_affine_bf16_args(x, weight, bias, out, rows, hidden);
-  if (valid != DS41RT_STATUS_OK) {
+  if (valid != CUTEAFD_STATUS_OK) {
     return valid;
   }
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
@@ -683,12 +683,12 @@ extern "C" ds41rt_status_t ds41rt_cuda_layernorm_affine_bf16_async(
   return status_from_cuda(cudaGetLastError());
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_layernorm_affine_bf16(
+extern "C" cuteafd_status_t cuteafd_cuda_layernorm_affine_bf16(
     const uint16_t* x, const uint16_t* weight, const uint16_t* bias, uint16_t* out, int rows,
     int hidden, float eps) {
-  const ds41rt_status_t status =
-      ds41rt_cuda_layernorm_affine_bf16_async(x, weight, bias, out, rows, hidden, eps, nullptr);
-  if (status != DS41RT_STATUS_OK) {
+  const cuteafd_status_t status =
+      cuteafd_cuda_layernorm_affine_bf16_async(x, weight, bias, out, rows, hidden, eps, nullptr);
+  if (status != CUTEAFD_STATUS_OK) {
     return status;
   }
   return status_from_cuda(cudaStreamSynchronize(nullptr));

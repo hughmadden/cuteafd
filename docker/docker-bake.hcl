@@ -8,10 +8,10 @@ group "default" {
 
 target "coordinator" {
   dockerfile = "docker/Dockerfile.dev"
-  tags = ["ds41rt-coordinator-dev"]
+  tags = ["cuteafd-coordinator-dev"]
   args = {
     BASE_IMAGE = BASE_IMAGE
-    DS41RT_ROLE = "coordinator"
+    CUTEAFD_ROLE = "coordinator"
     CUDA_ARCH = "120"
     TARGET_PLATFORM = "linux/amd64"
   }
@@ -20,10 +20,10 @@ target "coordinator" {
 
 target "expert" {
   dockerfile = "docker/Dockerfile.dev"
-  tags = ["ds41rt-spark-expert-dev"]
+  tags = ["cuteafd-spark-expert-dev"]
   args = {
     BASE_IMAGE = BASE_IMAGE
-    DS41RT_ROLE = "expert"
+    CUTEAFD_ROLE = "expert"
     CUDA_ARCH = "121"
     TARGET_PLATFORM = "linux/arm64"
   }

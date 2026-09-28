@@ -24,8 +24,8 @@ torch.manual_seed(4931)
 libs = [C.CDLL(path) for path in (a.baseline, a.candidate)]
 fns = []
 for lib in libs:
-    assert lib.ds41rt_v41_sparse_attention_initialize() == 0
-    fn = lib.ds41rt_v41_sparse_attention
+    assert lib.cuteafd_v41_sparse_attention_initialize() == 0
+    fn = lib.cuteafd_v41_sparse_attention
     fn.argtypes = [C.c_void_p] * 5 + [C.c_int32, C.c_int32, C.POINTER(View), C.c_void_p]
     fns.append(fn)
 q = (torch.randn(6, 64, 512, device='cuda') * .2).bfloat16()

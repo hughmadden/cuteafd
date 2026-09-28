@@ -9,7 +9,7 @@
 
 namespace {
 
-bool nvfp4_buffer_has_bytes(ds41rt_device_buffer_t buffer, size_t required) {
+bool nvfp4_buffer_has_bytes(cuteafd_device_buffer_t buffer, size_t required) {
   return buffer.ptr != nullptr && buffer.bytes >= required;
 }
 
@@ -68,13 +68,13 @@ __global__ void pad_nvfp4_plane(const uint8_t* source, uint8_t* destination,
 }
 }  // namespace
 
-extern "C" ds41rt_status_t ds41rt_cuda_nvfp4_pad_expert_async(
-    const ds41rt_device_buffer_t* sources, const ds41rt_device_buffer_t* destinations,
+extern "C" cuteafd_status_t cuteafd_cuda_nvfp4_pad_expert_async(
+    const cuteafd_device_buffer_t* sources, const cuteafd_device_buffer_t* destinations,
     size_t source_n, size_t kernel_n, void* cuda_stream) {
   // Bounded model geometry also keeps all byte/grid arithmetic representable.
   if (!sources || !destinations || source_n == 0 || source_n % 64 != 0 ||
       kernel_n < source_n || kernel_n % 128 != 0 || kernel_n > 8192) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   const size_t source_bytes[] = {2 * source_n * 2560, 2 * source_n * 320,
                                  5120 * source_n / 2, 5120 * source_n / 16};
@@ -83,7 +83,7 @@ extern "C" ds41rt_status_t ds41rt_cuda_nvfp4_pad_expert_async(
   for (int i = 0; i < 4; ++i) {
     if (!nvfp4_buffer_has_bytes(sources[i], source_bytes[i]) ||
         !nvfp4_buffer_has_bytes(destinations[i], destination_bytes[i])) {
-      return DS41RT_STATUS_BUFFER_TOO_SMALL;
+      return CUTEAFD_STATUS_BUFFER_TOO_SMALL;
     }
   }
   auto stream = reinterpret_cast<cudaStream_t>(cuda_stream);
@@ -97,26 +97,26 @@ extern "C" ds41rt_status_t ds41rt_cuda_nvfp4_pad_expert_async(
   PAD_PLANE(2, false, false);
   PAD_PLANE(3, false, true);
 #undef PAD_PLANE
-  return DS41RT_STATUS_OK;
+  return CUTEAFD_STATUS_OK;
 }
 
-extern "C" ds41rt_status_t ds41rt_cuda_nvfp4_swizzle_scale_async(
-    ds41rt_device_buffer_t source, ds41rt_device_buffer_t destination, size_t rows,
+extern "C" cuteafd_status_t cuteafd_cuda_nvfp4_swizzle_scale_async(
+    cuteafd_device_buffer_t source, cuteafd_device_buffer_t destination, size_t rows,
     size_t cols, void* cuda_stream) {
   if (rows == 0 || cols == 0) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   const size_t rows_padded = ((rows + 127) / 128) * 128;
   const size_t columns_padded = ((cols + 3) / 4) * 4;
   if (rows > std::numeric_limits<size_t>::max() / cols ||
       rows_padded > std::numeric_limits<size_t>::max() / columns_padded) {
-    return DS41RT_STATUS_INVALID_ARGUMENT;
+    return CUTEAFD_STATUS_INVALID_ARGUMENT;
   }
   const size_t source_bytes = rows * cols;
   const size_t destination_bytes = rows_padded * columns_padded;
   if (!nvfp4_buffer_has_bytes(source, source_bytes) ||
       !nvfp4_buffer_has_bytes(destination, destination_bytes)) {
-    return DS41RT_STATUS_BUFFER_TOO_SMALL;
+    return CUTEAFD_STATUS_BUFFER_TOO_SMALL;
   }
   constexpr size_t threads = 256;
   const size_t blocks = (destination_bytes + threads - 1) / threads;

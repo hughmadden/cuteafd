@@ -129,13 +129,13 @@ def test_cmake_tile_validation(tmp_path, value):
     # Evaluate the real cache/default/validation declarations without needing
     # CUDA or invoking the custom export commands in this CPU-only test.
     source = CMAKE.read_text()
-    declarations = source.split("set(DS41RT_V41_NVFP4_INCLUDE_DIRS)")[0]
+    declarations = source.split("set(CUTEAFD_V41_NVFP4_INCLUDE_DIRS)")[0]
     script = tmp_path / "policy.cmake"
-    script.write_text('set(DS41RT_ENABLE_CUDA ON)\nset(DS41RT_CUDA_ARCHITECTURES 120)\n'
-                      + declarations + '\nmessage(STATUS "TILE=${DS41RT_V41_NVFP4_TILE_M}")\n')
+    script.write_text('set(CUTEAFD_ENABLE_CUDA ON)\nset(CUTEAFD_CUDA_ARCHITECTURES 120)\n'
+                      + declarations + '\nmessage(STATUS "TILE=${CUTEAFD_V41_NVFP4_TILE_M}")\n')
     args = ["cmake"]
     if value is not None:
-        args += [f"-DDS41RT_V41_NVFP4_TILE_M={value}"]
+        args += [f"-DCUTEAFD_V41_NVFP4_TILE_M={value}"]
     result = subprocess.run([*args, "-P", str(script)], capture_output=True, text=True)
     if value in ("8", "AUTO", ""):
         assert result.returncode != 0
@@ -143,5 +143,5 @@ def test_cmake_tile_validation(tmp_path, value):
     else:
         assert result.returncode == 0, result.stderr
         assert f"TILE={value or '16'}" in result.stdout
-    assert '--tile-m "${DS41RT_V41_NVFP4_TILE_M}"' in source
+    assert '--tile-m "${CUTEAFD_V41_NVFP4_TILE_M}"' in source
     assert "PROPERTY STRINGS auto 16 32 64 128" in source

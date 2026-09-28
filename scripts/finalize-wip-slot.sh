@@ -20,7 +20,7 @@ image_id="$6"
   echo "invalid WIP slot: $slot" >&2
   exit 2
 }
-[[ -x "$build_output/ds41rt" && -s "$build_output/libds41rt_native.so" ]] || {
+[[ -x "$build_output/cuteafd" && -s "$build_output/libcuteafd_native.so" ]] || {
   echo "WIP build output is incomplete: $build_output" >&2
   exit 2
 }
@@ -32,32 +32,32 @@ image_id="$6"
 slot_root="/wip/slots/$slot/$role"
 incoming="/wip/incoming/${slot}.${role}.$$"
 rm -rf "$incoming"
-mkdir -p "$incoming/workspace/.ds41rt-wip"
+mkdir -p "$incoming/workspace/.cuteafd-wip"
 cp -a "$source_dir/." "$incoming/workspace/"
-install -m 0755 "$build_output/ds41rt" "$incoming/workspace/.ds41rt-wip/ds41rt"
+install -m 0755 "$build_output/cuteafd" "$incoming/workspace/.cuteafd-wip/cuteafd"
 install -m 0755 \
-  "$build_output/libds41rt_native.so" \
-  "$incoming/workspace/.ds41rt-wip/libds41rt_native.so"
+  "$build_output/libcuteafd_native.so" \
+  "$incoming/workspace/.cuteafd-wip/libcuteafd_native.so"
 install -m 0644 \
   "$build_output/V41_EXPERT_AOT.json" \
-  "$incoming/workspace/.ds41rt-wip/V41_EXPERT_AOT.json"
+  "$incoming/workspace/.cuteafd-wip/V41_EXPERT_AOT.json"
 install -m 0644 \
   "$build_output/V41_EXPERT_TP_AOT.json" \
-  "$incoming/workspace/.ds41rt-wip/V41_EXPERT_TP_AOT.json"
-install -m 0644 "$build_output/V41_FP8_AOT.json" "$incoming/workspace/.ds41rt-wip/V41_FP8_AOT.json"
+  "$incoming/workspace/.cuteafd-wip/V41_EXPERT_TP_AOT.json"
+install -m 0644 "$build_output/V41_FP8_AOT.json" "$incoming/workspace/.cuteafd-wip/V41_FP8_AOT.json"
 if [[ -d "$build_output/exl3" ]]; then
-  mkdir -p "$incoming/workspace/.ds41rt-wip"
-  cp -a "$build_output/exl3" "$incoming/workspace/.ds41rt-wip/exl3"
+  mkdir -p "$incoming/workspace/.cuteafd-wip"
+  cp -a "$build_output/exl3" "$incoming/workspace/.cuteafd-wip/exl3"
 fi
 install -m 0644 \
   "$build_output/ARTIFACT_SHA256SUMS" \
-  "$incoming/workspace/.ds41rt-wip/ARTIFACT_SHA256SUMS"
+  "$incoming/workspace/.cuteafd-wip/ARTIFACT_SHA256SUMS"
 
 python3 "$source_dir/scripts/verify-release-source-manifest.py" \
   --source "$incoming/workspace" \
   --write "$incoming/SOURCE_SHA256SUMS"
 source_manifest_sha256="$(sha256sum "$incoming/SOURCE_SHA256SUMS" | awk '{print $1}')"
-artifact_sha256="$(sha256sum "$incoming/workspace/.ds41rt-wip/ARTIFACT_SHA256SUMS" | awk '{print $1}')"
+artifact_sha256="$(sha256sum "$incoming/workspace/.cuteafd-wip/ARTIFACT_SHA256SUMS" | awk '{print $1}')"
 sparkinfer_revision="$(
   python3 "$source_dir/scripts/verify-sparkinfer-source.py" \
     --source "$source_dir/third_party/sparkinfer" \
@@ -66,7 +66,7 @@ sparkinfer_revision="$(
 )"
 
 python3 - "$incoming/META.json" \
-  "$incoming/workspace/.ds41rt-wip/V41_EXPERT_TP_AOT.json" <<PY
+  "$incoming/workspace/.cuteafd-wip/V41_EXPERT_TP_AOT.json" <<PY
 import hashlib
 import json
 import pathlib

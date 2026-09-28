@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Screen upstream expert numerics at DS41RT geometry before native adaptation.
+"""Screen upstream expert numerics at CUTEAFD geometry before native adaptation.
 
 Supports prepared paths and actual native TP2 libraries. Reports local kernel
 cost, not whole-serving speedup.
@@ -106,19 +106,19 @@ def main():
         from _v41_expert_native import Native, Info, library, P, U, check
         lib = library(str(args.native_lib), tp2=n == 1152)
         for name, types in {
-            'ds41rt_v41_expert_input_quant_initialize': [C.POINTER(P)],
-            'ds41rt_v41_expert_input_quantize_async': [P, P, P, U, P],
-            'ds41rt_v41_finish_local_experts_async': [P, P, P, U, U, P],
+            'cuteafd_v41_expert_input_quant_initialize': [C.POINTER(P)],
+            'cuteafd_v41_expert_input_quantize_async': [P, P, P, U, P],
+            'cuteafd_v41_finish_local_experts_async': [P, P, P, U, U, P],
         }.items():
             fn = getattr(lib, name); fn.argtypes = types; fn.restype = C.c_int32
-        quant = P(); check(lib.ds41rt_v41_expert_input_quant_initialize(C.byref(quant)))
+        quant = P(); check(lib.cuteafd_v41_expert_input_quant_initialize(C.byref(quant)))
         padded_n = (n + 127) // 128 * 128
         native_weights = [torch.empty((e, size), device='cuda', dtype=torch.uint8)
                           for size in (padded_n*h, padded_n*h//16, padded_n*h//2, padded_n*h//32)]
         for expert in range(e):
             sources = [weights[name][expert] for name in ('w1', 'w3', 'w2')]
             sources += [scales[name][expert] for name in ('w1', 'w3', 'w2')]
-            check(lib.ds41rt_v41_pack_expert_async(
+            check(lib.cuteafd_v41_pack_expert_async(
                 (P*6)(*[v.data_ptr() for v in sources]),
                 (P*4)(*[v[expert].data_ptr() for v in native_weights]),
                 n, torch.cuda.current_stream().cuda_stream))
@@ -129,7 +129,7 @@ def main():
             assert capacity in (1, 16)
             infos = []
             for cap in (1,16):
-                info = Info(); check(selected_lib.ds41rt_v41_expert_info(cap,C.byref(info))); infos.append(info)
+                info = Info(); check(selected_lib.cuteafd_v41_expert_info(cap,C.byref(info))); infos.append(info)
             arena = torch.empty(max(info.scratch_bytes for info in infos),device='cuda',dtype=torch.uint8)
             variants = [Native(selected_lib, cap, native_weights, wire, ids, routing, tp2=n == 1152, storage=arena) for cap in (1,16)]
             return variants[0 if capacity == 1 else 1]
@@ -169,10 +169,10 @@ def main():
                 wire = torch.empty((rows, 5280), device='cuda', dtype=torch.uint8)
                 native = make_native(lib, 1 if rows == 1 else 16 if rows <= 16 else 80, wire, ids, routing)
                 def run_native():
-                    check(lib.ds41rt_v41_expert_input_quantize_async(
+                    check(lib.cuteafd_v41_expert_input_quantize_async(
                         quant, x.data_ptr(), wire.data_ptr(), rows, torch.cuda.current_stream().cuda_stream))
                     native.run(rows)
-                    check(lib.ds41rt_v41_finish_local_experts_async(native.output.data_ptr(), None, output.data_ptr(), rows, int(native.token_accumulation), torch.cuda.current_stream().cuda_stream))
+                    check(lib.cuteafd_v41_finish_local_experts_async(native.output.data_ptr(), None, output.data_ptr(), rows, int(native.token_accumulation), torch.cuda.current_stream().cuda_stream))
                     return output
                 context = nullcontext(SimpleNamespace(run=run_native, implementation='native_tp2' if n == 1152 else 'native_spark'))
             elif use_compact and args.candidate_native_lib:
@@ -181,10 +181,10 @@ def main():
                 scratch = candidate_native.storage
                 route_holder = [candidate_native.output[:rows*6]]
                 def run_candidate_native():
-                    check(lib.ds41rt_v41_expert_input_quantize_async(
+                    check(lib.cuteafd_v41_expert_input_quantize_async(
                         quant, x.data_ptr(), candidate_wire.data_ptr(), rows, torch.cuda.current_stream().cuda_stream))
                     candidate_native.run(rows)
-                    check(lib.ds41rt_v41_finish_local_experts_async(candidate_native.output.data_ptr(), None, output.data_ptr(), rows, int(candidate_native.token_accumulation), torch.cuda.current_stream().cuda_stream))
+                    check(lib.cuteafd_v41_finish_local_experts_async(candidate_native.output.data_ptr(), None, output.data_ptr(), rows, int(candidate_native.token_accumulation), torch.cuda.current_stream().cuda_stream))
                     return output
                 context = nullcontext(SimpleNamespace(run=run_candidate_native, implementation='native_compact_tp2' if n == 1152 else 'native_compact_spark', owners=(candidate_native, candidate_wire)))
             elif use_compact:
@@ -202,7 +202,7 @@ def main():
                         max_tokens=rows, num_topk=6, swiglu_limit=10, fast_math=False, native_v41=args.compact_native)
                     route_holder[:] = [routes]
                     if args.compact_native:
-                        check(lib.ds41rt_v41_finish_local_experts_async(routes.data_ptr(), None, output.data_ptr(), rows, 0, torch.cuda.current_stream().cuda_stream))
+                        check(lib.cuteafd_v41_finish_local_experts_async(routes.data_ptr(), None, output.data_ptr(), rows, 0, torch.cuda.current_stream().cuda_stream))
                     else:
                         _w4a16_topk_sum_launch_flat(routes, output, rows, 6, h, 'bf16', torch.cuda.current_stream().cuda_stream)
                     return output

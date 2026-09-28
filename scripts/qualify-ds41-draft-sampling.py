@@ -20,7 +20,7 @@ def main():
     libraries = [C.CDLL(str(path.resolve())) for path in (args.baseline, args.candidate)]
     functions = []
     for library in libraries:
-        fn = library.ds41rt_v41_draft_step_rng
+        fn = library.cuteafd_v41_draft_step_rng
         fn.argtypes = [C.c_void_p]*6 + [C.c_int32, C.c_int32, C.c_void_p]
         fn.restype = C.c_int32
         functions.append(fn)

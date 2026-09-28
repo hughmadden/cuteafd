@@ -22,7 +22,7 @@ V3 = ROOT / "scripts" / "fixtures" / "tp-ep-e2e-corpus.jsonl"
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("ds41rt_tp_ep_e2e_six", SIX)
+    spec = importlib.util.spec_from_file_location("cuteafd_tp_ep_e2e_six", SIX)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -68,7 +68,7 @@ def _metadata(config_id: str) -> dict:
     topology = ["--spark-tp", str(config["spark_tp"]), "--spark-ep", str(config["spark_ep"])]
     requested = config["requested_rtx_expert_layers"]
     rtx_argv = ["--rtx-expert-layers", str(requested)]
-    placement = ["--placement-directory", "/run/ds41rt-placement"] if config["require_placement_directory"] else []
+    placement = ["--placement-directory", "/run/cuteafd-placement"] if config["require_placement_directory"] else []
     workers = [["expertd-native", "--rank", str(rank), "--world", str(world), "--capacity", "4096",
                 "--device-budget-bytes", "109119320064", "--first-layer",
                 str(config["expected_spark_first_layer"])] + topology

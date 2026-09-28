@@ -57,7 +57,7 @@ def run(args):
     # Exclude extension compilation from measured search; serialize cold load.
     prewarm_exllamav3_extension()
     for variant in args.variants:
-        with tempfile.TemporaryDirectory(prefix='ds41rt-throughput-') as temporary:
+        with tempfile.TemporaryDirectory(prefix='cuteafd-throughput-') as temporary:
             client = EXL3RemoteClient(endpoints=endpoints, coordinator_slots=slots, token=token,
                 timeout_seconds=600, max_attempts=1, assignment_store_path=Path(temporary) / 'assignments')
             for endpoint in endpoints:

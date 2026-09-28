@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from ds41rt_reference.deepseek_v4_spark_rank_capture import (
+from cuteafd_reference.deepseek_v4_spark_rank_capture import (
     DS4_FLASH_SPARK_RESIDENT_WEIGHT_BYTES,
     DeepseekV4FlashSparkPrefillRoutePackBinding,
     DeepseekV4FlashSparkRankDecodeM1Binding,

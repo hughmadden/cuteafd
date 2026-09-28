@@ -19,8 +19,8 @@ are distinguished, and both the actual and the oracle side are characterised.
 
 Run:
     python -m pytest python/tests/test_tp_ep_real_smoke.py -q -s
-env: DS41RT_TPEP_SMOKE_LAYER, DS41RT_TPEP_SNAPSHOT, DS41RT_TPEP_TARGETS,
-     DS41RT_TPEP_ACTIVE (comma ids)
+env: CUTEAFD_TPEP_SMOKE_LAYER, CUTEAFD_TPEP_SNAPSHOT, CUTEAFD_TPEP_TARGETS,
+     CUTEAFD_TPEP_ACTIVE (comma ids)
 """
 
 from __future__ import annotations
@@ -38,15 +38,15 @@ BENCH_PATH = ROOT / "python" / "tools" / "benchmark_v41_ep_groups.py"
 
 REL_TOL, COS_TOL = 0.01, 0.9999
 
-LAYER = int(os.environ.get("DS41RT_TPEP_SMOKE_LAYER", "20"))
-SNAPSHOT = os.environ.get("DS41RT_TPEP_SNAPSHOT")
-TARGETS = os.environ.get("DS41RT_TPEP_TARGETS", "2:0,2:1,4:0")
+LAYER = int(os.environ.get("CUTEAFD_TPEP_SMOKE_LAYER", "20"))
+SNAPSHOT = os.environ.get("CUTEAFD_TPEP_SNAPSHOT")
+TARGETS = os.environ.get("CUTEAFD_TPEP_TARGETS", "2:0,2:1,4:0")
 ACTIVE = [int(x) for x in os.environ.get(
-    "DS41RT_TPEP_ACTIVE", "1,4,7,11,19,23").split(",") if x]
+    "CUTEAFD_TPEP_ACTIVE", "1,4,7,11,19,23").split(",") if x]
 
 
 def _load_bench():
-    spec = importlib.util.spec_from_file_location("ds41rt_ep_bench_smoke", BENCH_PATH)
+    spec = importlib.util.spec_from_file_location("cuteafd_ep_bench_smoke", BENCH_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

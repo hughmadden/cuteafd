@@ -32,7 +32,7 @@ def load_tool():
 
 
 def _manifest(path: Path, role: str = "coordinator") -> None:
-    path.write_text(json.dumps({"schema": "ds41rt.exl3-package.v1", "role": role}))
+    path.write_text(json.dumps({"schema": "cuteafd.exl3-package.v1", "role": role}))
 
 
 @pytest.fixture()

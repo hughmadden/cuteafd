@@ -26,21 +26,21 @@ def main() -> None:
     sizes=(ct.c_uint64*7)(*[value.numel()*4 for value in buffers.values()])
     library=args.aot/'libv41_exl3_routes.so'
     lib=ct.CDLL(str(library))
-    lib.ds41rt_exl3_routes_create.argtypes=[ct.POINTER(ct.c_void_p)]
-    lib.ds41rt_exl3_routes_create.restype=ct.c_int
-    lib.ds41rt_exl3_routes_destroy.argtypes=[ct.c_void_p]
-    lib.ds41rt_exl3_routes_destroy.restype=ct.c_int
-    lib.ds41rt_exl3_routes_launch.argtypes=[ct.c_void_p,ct.POINTER(ct.c_void_p),ct.POINTER(ct.c_uint64),ct.c_int32,ct.c_void_p]
-    lib.ds41rt_exl3_routes_launch.restype=ct.c_int
+    lib.cuteafd_exl3_routes_create.argtypes=[ct.POINTER(ct.c_void_p)]
+    lib.cuteafd_exl3_routes_create.restype=ct.c_int
+    lib.cuteafd_exl3_routes_destroy.argtypes=[ct.c_void_p]
+    lib.cuteafd_exl3_routes_destroy.restype=ct.c_int
+    lib.cuteafd_exl3_routes_launch.argtypes=[ct.c_void_p,ct.POINTER(ct.c_void_p),ct.POINTER(ct.c_uint64),ct.c_int32,ct.c_void_p]
+    lib.cuteafd_exl3_routes_launch.restype=ct.c_int
     context=ct.c_void_p()
-    assert lib.ds41rt_exl3_routes_create(ct.byref(context))==0
+    assert lib.cuteafd_exl3_routes_create(ct.byref(context))==0
     graph=None
 
     def launch(rows,byte_sizes=None):
         if byte_sizes is None:
             byte_sizes=(ct.c_uint64*7)(*sizes)
             byte_sizes[0]=max(0,rows)*topk*4
-        return lib.ds41rt_exl3_routes_launch(context,pointers,byte_sizes,rows,
+        return lib.cuteafd_exl3_routes_launch(context,pointers,byte_sizes,rows,
             ct.c_void_p(torch.cuda.current_stream().cuda_stream))
 
     def prepare(seed,invalid=False):
@@ -113,7 +113,7 @@ def main() -> None:
     finally:
         torch.cuda.synchronize()
         del graph
-        assert lib.ds41rt_exl3_routes_destroy(context)==0
+        assert lib.cuteafd_exl3_routes_destroy(context)==0
 
 
 if __name__=='__main__':

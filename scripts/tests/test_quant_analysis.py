@@ -44,7 +44,7 @@ def test_tier_parser_accounts_for_scale_overhead(tmp_path):
             name+'.svh':{'shape':[8],'torch_dtype':'float16'},
             name+'.trellis':{'shape':[1,1,6],'torch_dtype':'int16'}}
     config={'tensor_storage':{name:{'bits_per_weight':3,'quant_format':'exl3','stored_tensors':stored}},
-            'meta':{'ds41rt':{'schema':'test'}}}
+            'meta':{'cuteafd':{'schema':'test'}}}
     (tmp_path/'quantize_config.json').write_text(json.dumps(config))
     result=ANALYZE['inspect_tiers'](tmp_path)
     assert result['logical_weights']==32

@@ -12,15 +12,15 @@ import torch
 def main():
     lib = C.CDLL(sys.argv[1])
     ptr = C.c_void_p
-    create = lib.ds41rt_v41_vocabulary_shard_create
+    create = lib.cuteafd_v41_vocabulary_shard_create
     create.argtypes = [ptr, C.c_uint64, C.c_int32, C.POINTER(ptr)]
-    full_create = lib.ds41rt_v41_vocabulary_head_create
+    full_create = lib.cuteafd_v41_vocabulary_head_create
     full_create.argtypes = [ptr, C.c_uint64, C.POINTER(ptr)]
-    launch = lib.ds41rt_v41_vocabulary_head_launch
+    launch = lib.cuteafd_v41_vocabulary_head_launch
     launch.argtypes = [ptr, ptr, ptr, ptr, C.c_int32, ptr]
-    destroy = lib.ds41rt_v41_markov_destroy
+    destroy = lib.cuteafd_v41_markov_destroy
     destroy.argtypes = [ptr]
-    merge = lib.ds41rt_v41_vocabulary_merge_greedy
+    merge = lib.cuteafd_v41_vocabulary_merge_greedy
     merge.argtypes = [ptr, ptr, ptr, ptr, ptr, ptr, C.c_int32, C.c_int32, ptr]
     assert torch.cuda.device_count() >= 2, 'two CUDA GPUs required'
     torch.manual_seed(41)

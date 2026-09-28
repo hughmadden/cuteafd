@@ -52,7 +52,7 @@ EXPECTED_STOCHASTIC_BODIES = {
 
 def _load_module():
     pytest.importorskip("tokenizers")
-    spec = importlib.util.spec_from_file_location("ds41rt_bench_release_decode", SCRIPT)
+    spec = importlib.util.spec_from_file_location("cuteafd_bench_release_decode", SCRIPT)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -304,7 +304,7 @@ AGGREGATOR = REPO / "scripts" / "aggregate-sampling-decode.py"
 
 
 def _load_aggregator():
-    spec = importlib.util.spec_from_file_location("ds41rt_aggregate_sampling", AGGREGATOR)
+    spec = importlib.util.spec_from_file_location("cuteafd_aggregate_sampling", AGGREGATOR)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

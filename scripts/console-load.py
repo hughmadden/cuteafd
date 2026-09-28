@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drive varied traffic at a DS41RT server so the live console at `/` has something to show.
+"""Drive varied traffic at a CUTEAFD server so the live console at `/` has something to show.
 
 Each worker loops over a mix of request kinds: prose, code, a JSON-schema response,
 a tool call (both decoded under a grammar) and an occasional long prompt that

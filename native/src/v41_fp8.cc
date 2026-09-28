@@ -1,9 +1,9 @@
-#include "ds41rt_v41_fp8.h"
+#include "cuteafd_v41_fp8.h"
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <mutex>
 #include "v41_fp8_variants.h"
-static_assert(sizeof(ds41rt_v41_fp8_info_t) == 56);
+static_assert(sizeof(cuteafd_v41_fp8_info_t) == 56);
 namespace {
 using ModuleFn = void (*)(void**);
 using LaunchFn = void (*)(void**, int32_t);
@@ -15,7 +15,7 @@ struct Module {
   ~Module() { reset(); }
 };
 struct Variant {
-  ds41rt_v41_fp8_info_t info;
+  cuteafd_v41_fp8_info_t info;
   Module quant, gemm, quant_rope;
   const uint32_t* grids;
   uint64_t split_offset;
@@ -24,11 +24,11 @@ struct Variant {
   uint64_t grouped_output_offset;
   int device = -1;
 };
-Variant variants[] = {DS41RT_V41_FP8_VARIANTS};
-Variant peer_variants[] = {DS41RT_V41_FP8_VARIANTS};
-Module hc_project = DS41RT_V41_HC_PROJECT_MODULE;
-#ifdef DS41RT_V41_HC_LAGGED_MODULE
-Module hc_lagged = DS41RT_V41_HC_LAGGED_MODULE;
+Variant variants[] = {CUTEAFD_V41_FP8_VARIANTS};
+Variant peer_variants[] = {CUTEAFD_V41_FP8_VARIANTS};
+Module hc_project = CUTEAFD_V41_HC_PROJECT_MODULE;
+#ifdef CUTEAFD_V41_HC_LAGGED_MODULE
+Module hc_lagged = CUTEAFD_V41_HC_LAGGED_MODULE;
 #endif
 int hc_device[] = {-1, -1};
 int owner_device[] = {-1, -1};
@@ -75,10 +75,10 @@ bool span(const void* p, uint64_t bytes, uintptr_t& start, uintptr_t& end) {
 // cudaErrorInvalidDevice (101) gives the operator nothing to act on, so name the mismatch.
 int reject_device(int device, int major, int minor, int sms) {
   std::fprintf(stderr,
-               "ds41rt: v41 fp8 AOT kernels were exported for compute 12.0 with %d SMs, but "
+               "cuteafd: v41 fp8 AOT kernels were exported for compute 12.0 with %d SMs, but "
                "device %d is compute %d.%d with %d SMs; rebuild the coordinator AOT export on "
                "the target GPU (cudaErrorInvalidDevice)\n",
-               int(DS41RT_V41_FP8_SMS), device, major, minor, sms);
+               int(CUTEAFD_V41_FP8_SMS), device, major, minor, sms);
   return int(cudaErrorInvalidDevice);
 }
 int device_matches(Variant* v) {
@@ -87,14 +87,14 @@ int device_matches(Variant* v) {
   return status ? int(status) : (device == v->device ? 0 : int(cudaErrorInvalidDevice));
 }
 }
-extern "C" int32_t ds41rt_v41_fp8_grouped_output(const uint16_t*, uint16_t*, int32_t, void*);
-extern "C" int32_t ds41rt_v41_fp8_reduce_splits(const float*, uint16_t*, int32_t, int32_t, int32_t, void*);
-extern "C" int32_t ds41rt_v41_fp8_initialize_storage(void*, uint64_t, float*, void*);
-extern "C" int32_t ds41rt_v41_fp8_matrix_info(int32_t rows, int32_t k, int32_t n, ds41rt_v41_fp8_info_t* out) {
+extern "C" int32_t cuteafd_v41_fp8_grouped_output(const uint16_t*, uint16_t*, int32_t, void*);
+extern "C" int32_t cuteafd_v41_fp8_reduce_splits(const float*, uint16_t*, int32_t, int32_t, int32_t, void*);
+extern "C" int32_t cuteafd_v41_fp8_initialize_storage(void*, uint64_t, float*, void*);
+extern "C" int32_t cuteafd_v41_fp8_matrix_info(int32_t rows, int32_t k, int32_t n, cuteafd_v41_fp8_info_t* out) {
   auto* v = capacity(rows, k, n); if (!v || !out) return cudaErrorInvalidValue;
   *out = v->info; return 0;
 }
-extern "C" int32_t ds41rt_v41_fp8_matrix_initialize(int32_t rows, int32_t k, int32_t n, void** out) {
+extern "C" int32_t cuteafd_v41_fp8_matrix_initialize(int32_t rows, int32_t k, int32_t n, void** out) {
   if (!out) return cudaErrorInvalidValue; *out = nullptr;
   auto* v = capacity(rows, k, n); if (!v) return cudaErrorInvalidValue;
   int device, major, minor, sms;
@@ -102,7 +102,7 @@ extern "C" int32_t ds41rt_v41_fp8_matrix_initialize(int32_t rows, int32_t k, int
   status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device); if (status) return status;
   status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device); if (status) return status;
   status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device); if (status) return status;
-  if (major != 12 || minor != 0 || sms != DS41RT_V41_FP8_SMS) return reject_device(device, major, minor, sms);
+  if (major != 12 || minor != 0 || sms != CUTEAFD_V41_FP8_SMS) return reject_device(device, major, minor, sms);
   std::lock_guard<std::mutex> lock(mutex);
   const int slot=device_slot(device);
   if (slot<0) return cudaErrorInvalidDevice;
@@ -123,14 +123,14 @@ extern "C" int32_t ds41rt_v41_fp8_matrix_initialize(int32_t rows, int32_t k, int
   }
   *out = v; return 0;
 }
-extern "C" int32_t ds41rt_v41_fp8_initialize_scratch(void* kernel, void* scratch, uint64_t bytes, float* alpha, void* stream) {
+extern "C" int32_t cuteafd_v41_fp8_initialize_scratch(void* kernel, void* scratch, uint64_t bytes, float* alpha, void* stream) {
   auto* v = handle(kernel); int status = device_matches(v); if (status) return status;
   uintptr_t a,b,c,d;
   if (bytes < v->info.scratch_bytes || !span(scratch, v->info.scratch_bytes,a,b) ||
       !span(alpha,4,c,d) || (a<d && c<b)) return cudaErrorInvalidValue;
-  return ds41rt_v41_fp8_initialize_storage(scratch, v->info.scratch_bytes, alpha, stream);
+  return cuteafd_v41_fp8_initialize_storage(scratch, v->info.scratch_bytes, alpha, stream);
 }
-extern "C" int32_t ds41rt_v41_fp8_launch_rope(void* kernel, const uint16_t* source, const float* frequencies, const uint8_t* weight,
+extern "C" int32_t cuteafd_v41_fp8_launch_rope(void* kernel, const uint16_t* source, const float* frequencies, const uint8_t* weight,
     const uint8_t* packed_scales, void* scratch, uint64_t bytes, const float* alpha,
     uint16_t* output, int32_t rows, void* stream) {
   auto* v = handle(kernel); int status = device_matches(v); if (status) return status;
@@ -165,29 +165,29 @@ extern "C" int32_t ds41rt_v41_fp8_launch_rope(void* kernel, const uint16_t* sour
   void* gemm_args[] = {&a,&w,&sm,&s,&c,&c,&c,&c,&one,&rows,&stream,&status};
   v->gemm.launch(gemm_args,12);
   if (status) return status;
-  if (v->groups > 1) return ds41rt_v41_fp8_grouped_output(static_cast<const uint16_t*>(c),output,rows,stream);
+  if (v->groups > 1) return cuteafd_v41_fp8_grouped_output(static_cast<const uint16_t*>(c),output,rows,stream);
   if (v->split_slices == 1) return status;
-  return ds41rt_v41_fp8_reduce_splits(static_cast<const float*>(c), output,
+  return cuteafd_v41_fp8_reduce_splits(static_cast<const float*>(c), output,
       rows, v->info.output_dim, v->split_slices, stream);
 }
 
-extern "C" int32_t ds41rt_v41_fp8_launch(void* kernel, const uint16_t* source, const uint8_t* weight,
+extern "C" int32_t cuteafd_v41_fp8_launch(void* kernel, const uint16_t* source, const uint8_t* weight,
     const uint8_t* packed_scales, void* scratch, uint64_t bytes, const float* alpha,
     uint16_t* output, int32_t rows, void* stream) {
-  return ds41rt_v41_fp8_launch_rope(kernel,source,nullptr,weight,packed_scales,scratch,bytes,alpha,output,rows,stream);
+  return cuteafd_v41_fp8_launch_rope(kernel,source,nullptr,weight,packed_scales,scratch,bytes,alpha,output,rows,stream);
 }
 
 // Existing engram entry points retain their explicit geometry.
-extern "C" int32_t ds41rt_v41_fp8_info(int32_t rows, ds41rt_v41_fp8_info_t* out) {
-  return ds41rt_v41_fp8_matrix_info(rows, 6144, 25600, out);
+extern "C" int32_t cuteafd_v41_fp8_info(int32_t rows, cuteafd_v41_fp8_info_t* out) {
+  return cuteafd_v41_fp8_matrix_info(rows, 6144, 25600, out);
 }
-extern "C" int32_t ds41rt_v41_fp8_initialize(int32_t rows, void** out) {
-  return ds41rt_v41_fp8_matrix_initialize(rows, 6144, 25600, out);
+extern "C" int32_t cuteafd_v41_fp8_initialize(int32_t rows, void** out) {
+  return cuteafd_v41_fp8_matrix_initialize(rows, 6144, 25600, out);
 }
 
 
 // Loaded once during mHC planning; no module resolution or allocation on replay.
-extern "C" int32_t ds41rt_v41_hc_project_initialize() {
+extern "C" int32_t cuteafd_v41_hc_project_initialize() {
   int device, major, minor;
   auto status=cudaGetDevice(&device); if(status) return status;
   status=cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,device); if(status) return status;
@@ -198,14 +198,14 @@ extern "C" int32_t ds41rt_v41_hc_project_initialize() {
   if(slot<0) return cudaErrorInvalidDevice;
   if(hc_device[slot]>=0) return hc_device[slot]==device ? 0 : int(cudaErrorInvalidDevice);
   int result=load(hc_project,device);
-#ifdef DS41RT_V41_HC_LAGGED_MODULE
+#ifdef CUTEAFD_V41_HC_LAGGED_MODULE
   if(!result) result=load(hc_lagged,device);
 #endif
   if(!result) hc_device[slot]=device;
   return result;
 }
 // Internal launch: buffer validation is performed by hc_mixes_workspace.
-extern "C" int32_t ds41rt_v41_hc_project_launch(const uint16_t* residual,
+extern "C" int32_t cuteafd_v41_hc_project_launch(const uint16_t* residual,
     const float* weight, float* partials, int32_t rows, void* stream) {
   int device=-1;
   int status=cudaGetDevice(&device); if(status) return status;
@@ -219,8 +219,8 @@ extern "C" int32_t ds41rt_v41_hc_project_launch(const uint16_t* residual,
   return status;
 }
 
-#ifdef DS41RT_V41_HC_LAGGED_MODULE
-extern "C" int32_t ds41rt_v41_hc_begin(const void* residual, const void* fn,
+#ifdef CUTEAFD_V41_HC_LAGGED_MODULE
+extern "C" int32_t cuteafd_v41_hc_begin(const void* residual, const void* fn,
     const void* scale, const void* bias, const void* incoming, const void* norm,
     void* predicted, void* post, void* comb, void* normalized, void* scratch,
     uint64_t scratch_bytes, int32_t rows, void* stream) {
