@@ -18,6 +18,8 @@ pub(crate) enum Commands {
     Plan(PlanArgs),
     /// Report RDMA ports, link and PCIe rates, subnets and the rail plan.
     Fabric(FabricArgs),
+    /// Check live Spark expert ranks for one layer against a CPU oracle.
+    ExpertProbe(ExpertProbeArgs),
     /// Serve official V4.1 native TP4 experts over RoCE.
     ExpertdNative(NativeExpertDaemonArgs),
     /// Serve the official V4.1 target text path.
@@ -25,6 +27,25 @@ pub(crate) enum Commands {
     BenchRdma(BenchRdmaArgs),
     BenchRdmaRing(BenchRdmaRingArgs),
     TransportCapabilities(TransportCapabilitiesArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ExpertProbeArgs {
+    /// Checkpoint snapshot directory the Spark ranks serve.
+    #[arg(long)]
+    pub(crate) snapshot: PathBuf,
+    /// Spark ranks in TP order, comma-separated HOST:PORT.
+    #[arg(long)]
+    pub(crate) peers: String,
+    #[arg(long, default_value_t = 3)]
+    pub(crate) layer: usize,
+    #[arg(long, default_value_t = 16)]
+    pub(crate) rows: u32,
+    /// Transport capacity; must not exceed the ranks' --capacity.
+    #[arg(long, default_value_t = 4096)]
+    pub(crate) capacity: u32,
+    #[arg(long, default_value_t = 20260929)]
+    pub(crate) seed: u64,
 }
 
 #[derive(Debug, Args)]
