@@ -1,5 +1,16 @@
 # DeepSeek V4 port map (delete when deepseek_v4 serves)
 
+**Kernels already exist in the pinned b12x fork (third_party/sparkinfer):**
+`attention/dsv4_producer` (wq_a+wkv GEMM, Q norm and per-head RMS norm, RoPE,
+the 584-byte FP8/UE8M0 page record with BF16 RoPE tail, C=4 index query with
+randomized Hadamard), `attention/dsv4_compressor` (C=4 overlap and C=128
+pooling with ape, decode/prefill/continuation bindings, index cache),
+`attention/compressed_sparse_mla`, `attention/dsa_indexer`, `norm/mhc`
+(non-lagged `run_pre`/`run_post`/`run_post_pre`, and `run_head` for hc_head),
+`moe/fused_moe` (w4a8 MXFP4 experts). Tests: tests/attention/test_dsv4_*.py.
+The port is orchestration plus AOT export of these ops, as V4.1 does, not
+new kernel writing. The items below remain the numerical contract to check.
+
 I compared the two reference implementations line by line and checked the actual checkpoint tensor names, dtypes and shapes in all three snapshots. The short answer: **V4 shares nothing across layers.** Every V4 layer owns its window cache, compressor and indexer. Nothing in the V4.1 KV-source, index-source or candidate-block machinery carries over.
 
 Refs: `v4:` = V4-Flash-0731 `inference/model.py`, `v41:` = V4.1-Flash `inference/model.py`, `k4:`/`k41:` = the matching `kernel.py`.
