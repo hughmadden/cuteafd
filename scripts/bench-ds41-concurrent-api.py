@@ -11,6 +11,7 @@ parser.add_argument('--label', default='release-concurrency')
 parser.add_argument('--case', choices=['counting','code','code-reasoning','topic'], default='counting')
 parser.add_argument('--nonce', help='Use the same prompt nonce for controlled comparisons; defaults to a fresh UUID')
 parser.add_argument('--max-tokens', type=int, help='Override the corpus output budget for both arms of a controlled comparison')
+parser.add_argument('--allow-cold', action='store_true', help='Do not require prefix-cache hits (engines without a prefix cache)')
 args=parser.parse_args()
 if args.repeats < 1 or any(c < 1 or c > 16 for c in args.concurrency):
  parser.error('repeats must be positive and concurrency must be 1..16')
@@ -66,7 +67,7 @@ for c in args.concurrency:
    for row in rows:
     usage=row['result']['usage'];pair=[row['result']['text'],{k:usage[k] for k in ['prompt_tokens','completion_tokens','total_tokens']}]
     if args.case=='counting':assert pair==reference,(c,repeat,'counting output changed')
-    assert usage['prompt_cache_hit_tokens']==usage['prompt_tokens'],(c,repeat,'prompt was not warm')
+    assert args.allow_cold or usage['prompt_cache_hit_tokens']==usage['prompt_tokens'],(c,repeat,'prompt was not warm')
   except Exception as error:fail(phase,rows,error)
   # Inclusive span from earliest reasoning/answer delta to finish, including admission gaps.
   begin=min(r['start']+r['result']['first_output_seconds'] for r in rows)
