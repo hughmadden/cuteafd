@@ -15,7 +15,7 @@ use deepseek_recipe::{
     stream::StreamProcessor,
     util::append_delta::AppendDelta,
 };
-use deepseek_recipe_encoding::{v4::dsv41::DeepseekV41Encoding, PromptEncoding};
+use deepseek_recipe_encoding::{v4::dsv4::DeepseekV4Encoding, v4::dsv41::DeepseekV41Encoding, PromptEncoding};
 use cuteafd_core::TargetSamplingParams;
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -24,6 +24,26 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 pub const MODEL: &str = "deepseek-ai/DeepSeek-V4.1-Flash";
+
+/// Prompt rendering a served model uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelEncoding {
+    DeepseekV4,
+    DeepseekV41,
+}
+
+/// The served model's public id and prompt encoding.
+#[derive(Debug, Clone)]
+pub struct ModelProfile {
+    pub id: String,
+    pub encoding: ModelEncoding,
+}
+
+impl Default for ModelProfile {
+    fn default() -> Self {
+        Self { id: MODEL.into(), encoding: ModelEncoding::DeepseekV41 }
+    }
+}
 mod limits;
 mod admission;
 mod constraints;
@@ -72,6 +92,7 @@ struct NativeState {
     images: images::ImageDecoder,
     stats: SharedStats,
     admission: admission::Admission,
+    profile: Arc<ModelProfile>,
 }
 pub fn router(queue: mpsc::Sender<NativeRequest>) -> Router {
     router_with_limits(queue, NativeLimits::default())
@@ -89,6 +110,11 @@ pub fn router_with_admission(queue: mpsc::Sender<NativeRequest>, limits: NativeL
 /// The serving router plus the live console at `/` fed by `console`.
 pub fn router_with_console(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits,
     stats: SharedStats, wait: std::time::Duration, console: Arc<ConsoleHub>) -> Router {
+    router_for_model(queue, limits, stats, wait, console, ModelProfile::default())
+}
+/// The serving router for `profile` (its model id and prompt encoding).
+pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits,
+    stats: SharedStats, wait: std::time::Duration, console: Arc<ConsoleHub>, profile: ModelProfile) -> Router {
     let admission = admission::Admission::new(queue.max_capacity(), wait);
     let images = images::ImageDecoder::new(queue.max_capacity());
     let console_routes = Router::new()
@@ -102,7 +128,7 @@ pub fn router_with_console(queue: mpsc::Sender<NativeRequest>, limits: NativeLim
         .route("/v1/stats", get(stats_route))
         .route("/v1/chat/completions", post(chat))
         .layer(axum::extract::DefaultBodyLimit::max(images::BODY_BYTES))
-        .with_state(NativeState { queue, limits, images, stats, admission })
+        .with_state(NativeState { queue, limits, images, stats, admission, profile: Arc::new(profile) })
         .merge(console_routes)
 }
 async fn stats_route(State(state): State<NativeState>) -> Json<Value> {
@@ -114,7 +140,7 @@ async fn stats_route(State(state): State<NativeState>) -> Json<Value> {
     Json(value)
 }
 async fn models(State(state): State<NativeState>) -> Json<Value> {
-    Json(json!({"object":"list","data":[{"id":MODEL,"object":"model","owned_by":"deepseek-ai",
+    Json(json!({"object":"list","data":[{"id":state.profile.id,"object":"model","owned_by":"deepseek-ai",
         "max_context_tokens":state.limits.context(),"max_output_tokens":state.limits.output()}]}))
 }
 async fn health(State(state): State<NativeState>) -> StatusCode {
@@ -265,8 +291,9 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> 
     if let Err(e) = selection.apply(&mut converted.conversation.tools) {
         return error(StatusCode::BAD_REQUEST, e);
     }
-    if converted.model.as_deref() != Some(MODEL) {
-        return error(StatusCode::BAD_REQUEST, format!("model must be {MODEL}"));
+    let model = state.profile.id.clone();
+    if converted.model.as_deref() != Some(model.as_str()) {
+        return error(StatusCode::BAD_REQUEST, format!("model must be {model}"));
     }
     let max_tokens = match state.limits.requested_output(converted.inference_options.max_tokens) {
         Ok(limit) => limit,
@@ -287,10 +314,13 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> 
         Err(e) => return error(StatusCode::BAD_REQUEST, e),
     };
     let mut validator = tools::CompletionValidator::new(response_validator, tool_constraints);
-    let rendered = DeepseekV41Encoding::new().render_conversation(&converted.conversation);
+    let rendered = match state.profile.encoding {
+        ModelEncoding::DeepseekV41 => DeepseekV41Encoding::new().render_conversation(&converted.conversation),
+        ModelEncoding::DeepseekV4 => DeepseekV4Encoding::new().render_conversation(&converted.conversation),
+    };
     let streaming = converted.stream;
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
-    let generator = ChatCompletionRequest::chunk_generator(&converted, id.clone(), MODEL.into())
+    let generator = ChatCompletionRequest::chunk_generator(&converted, id.clone(), model.clone())
         .with_include_usage(!streaming || include_usage);
     let processor = StreamProcessor::new(generator, converted.parsing_options);
     // Rendered sources own the image payloads needed by preprocessing. Do not
@@ -419,7 +449,7 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> 
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let mut response = ChatResponse::new(id, MODEL.into(), created, 0, 0);
+    let mut response = ChatResponse::new(id, model, created, 0, 0);
     futures::pin_mut!(chunks);
     while let Some(chunk) = chunks.next().await {
         match chunk {
