@@ -75,17 +75,12 @@ pub(crate) struct CompressorPrefill {
     pub visible: Vec<i32>,
     /// Lengths the sparse attention reads from the indexed (compressed) cache.
     pub indexed_lengths: Vec<i32>,
-    /// C4: shared index page table. C128: dense causal indices [T, width].
-    pub index_page_table: Vec<i32>,
+    /// C128: dense causal indices [T, width].
     pub indexed_indices: Vec<i32>,
 }
 
 pub(crate) struct PrefillMetadata {
-    pub tokens: usize,
     pub positions: Vec<i64>,
-    pub positions_i32: Vec<i32>,
-    pub main_pages: usize,
-    pub main_slots: Vec<i64>,
     pub swa_indices: Vec<i32>,
     pub swa_lengths: Vec<i32>,
     pub c4: CompressorPrefill,
@@ -108,12 +103,8 @@ pub(crate) fn prefill(tokens: usize, index_topk: usize, c128_width: usize) -> Pr
         let pages = groups.div_ceil(compressed_page_rows(ratio)).max(1);
         let visible: Vec<i32> = (0..tokens).map(|t| ((t + 1) / ratio) as i32).collect();
         let starts: Vec<i32> = (0..groups).map(|j| (j * ratio) as i32).collect();
-        let (index_page_table, indexed_lengths, indexed_indices) = if ratio == 4 {
-            (
-                (0..pages as i32).collect(),
-                visible.iter().map(|&v| v.min(index_topk as i32)).collect(),
-                Vec::new(),
-            )
+        let (indexed_lengths, indexed_indices) = if ratio == 4 {
+            (visible.iter().map(|&v| v.min(index_topk as i32)).collect(), Vec::new())
         } else {
             let mut indices = vec![-1i32; tokens * c128_width];
             for t in 0..tokens {
@@ -121,7 +112,7 @@ pub(crate) fn prefill(tokens: usize, index_topk: usize, c128_width: usize) -> Pr
                     indices[t * c128_width + j] = j as i32;
                 }
             }
-            (Vec::new(), visible.clone(), indices)
+            (visible.clone(), indices)
         };
         CompressorPrefill {
             groups,
@@ -135,15 +126,10 @@ pub(crate) fn prefill(tokens: usize, index_topk: usize, c128_width: usize) -> Pr
             state_sequence_ids: vec![0],
             visible,
             indexed_lengths,
-            index_page_table,
             indexed_indices,
         }
     };
     PrefillMetadata {
-        tokens,
-        positions_i32: positions.iter().map(|&p| p as i32).collect(),
-        main_pages: tokens.div_ceil(SOURCE_PAGE_TOKENS),
-        main_slots: positions.clone(),
         positions,
         swa_indices,
         swa_lengths: (0..tokens).map(|t| (t + 1).min(WINDOW) as i32).collect(),
@@ -168,5 +154,106 @@ mod tests {
         assert_eq!(&meta.c128.indexed_indices[255 * 1024..255 * 1024 + 3], &[0, 1, -1]);
         assert_eq!(compressed_page_bytes(4), 37_440);
         assert_eq!(compressed_page_bytes(128), 1_728);
+    }
+}
+
+/// Host tables for one step of one sequence: its rows start at `start`
+/// (0 for the initial prefill) and the caches already hold `start` tokens.
+/// Prefill steps must start at 0; decode steps are one row.
+pub(crate) struct StepTables {
+    pub decode: bool,
+    pub rows: usize,
+    pub positions: Vec<i64>,
+    pub swa_indices: Vec<i32>,
+    pub swa_lengths: Vec<i32>,
+    /// Compressor metadata in program pointer order, per ratio.
+    pub c4_tables: Vec<(&'static str, Vec<i32>)>,
+    pub c128_tables: Vec<(&'static str, Vec<i32>)>,
+    /// Completed groups after this step (grid bound for prefill programs).
+    pub c4_groups: usize,
+    pub c128_groups: usize,
+    /// C4 index top-k: page table (shared row for prefill, [rows, stride] for decode).
+    pub c4_page_table: Vec<i32>,
+    pub c4_table_width: usize,
+    pub c4_table_stride: usize,
+    pub c4_visible: Vec<i32>,
+    pub c4_indexed_lengths: Vec<i32>,
+    pub c128_indices: Vec<i32>,
+    pub c128_lengths: Vec<i32>,
+}
+
+/// Cache pages a sequence of `capacity` tokens needs, per cache.
+pub(crate) fn cache_pages(capacity: usize) -> (usize, usize, usize) {
+    (
+        capacity.div_ceil(SOURCE_PAGE_TOKENS).max(1),
+        (capacity / 4).div_ceil(compressed_page_rows(4)).max(1),
+        (capacity / 128).div_ceil(compressed_page_rows(128)).max(1),
+    )
+}
+
+pub(crate) fn prefill_step(tokens: usize, index_topk: usize, c128_width: usize, capacity: usize) -> StepTables {
+    let meta = prefill(tokens, index_topk, c128_width);
+    let c4 = &meta.c4;
+    let c128 = &meta.c128;
+    let nonempty = |v: &Vec<i32>| if v.is_empty() { vec![0] } else { v.clone() };
+    let tables = |c: &CompressorPrefill| vec![
+        ("active_groups", c.active_groups.clone()),
+        ("group_source_starts", nonempty(&c.group_source_starts)),
+        ("group_rope_positions", nonempty(&c.group_rope_positions)),
+        ("compressed_slots", nonempty(&c.compressed_slots)),
+        ("active_sequences", c.active_sequences.clone()),
+        ("sequence_offsets", c.sequence_offsets.clone()),
+        ("state_sequence_ids", c.state_sequence_ids.clone()),
+    ];
+    let (_, c4_pages, _) = cache_pages(capacity);
+    StepTables {
+        decode: false,
+        rows: tokens,
+        positions: meta.positions.clone(),
+        swa_indices: meta.swa_indices.clone(),
+        swa_lengths: meta.swa_lengths.clone(),
+        c4_tables: tables(c4),
+        c128_tables: tables(c128),
+        c4_groups: c4.groups,
+        c128_groups: c128.groups,
+        c4_page_table: (0..c4_pages as i32).collect(),
+        c4_table_width: c4.pages,
+        c4_table_stride: 0,
+        c4_visible: c4.visible.clone(),
+        c4_indexed_lengths: c4.indexed_lengths.clone(),
+        c128_indices: c128.indexed_indices.clone(),
+        c128_lengths: c128.indexed_lengths.clone(),
+    }
+}
+
+pub(crate) fn decode_step(position: usize, index_topk: usize, c128_width: usize, capacity: usize) -> StepTables {
+    let start = position.saturating_sub(WINDOW - 1);
+    let swa_indices = (0..WINDOW).map(|j| if start + j <= position { (start + j) as i32 } else { -1 }).collect();
+    let visible4 = (position + 1) / 4;
+    let visible128 = (position + 1) / 128;
+    let decode_tables = |ratio: usize| vec![
+        ("positions", vec![position as i32]),
+        ("sequence_ids", vec![0]),
+        ("compressed_slots", vec![(position / ratio) as i32]),
+    ];
+    let (_, c4_pages, _) = cache_pages(capacity);
+    let used_pages = visible4.div_ceil(INDEX_PAGE_ROWS).max(1);
+    StepTables {
+        decode: true,
+        rows: 1,
+        positions: vec![position as i64],
+        swa_indices,
+        swa_lengths: vec![(position + 1).min(WINDOW) as i32],
+        c4_tables: decode_tables(4),
+        c128_tables: decode_tables(128),
+        c4_groups: visible4,
+        c128_groups: visible128,
+        c4_page_table: (0..c4_pages as i32).collect(),
+        c4_table_width: used_pages,
+        c4_table_stride: c4_pages,
+        c4_visible: vec![visible4 as i32],
+        c4_indexed_lengths: vec![visible4.min(index_topk) as i32],
+        c128_indices: (0..c128_width).map(|j| if j < visible128 { j as i32 } else { -1 }).collect(),
+        c128_lengths: vec![visible128 as i32],
     }
 }

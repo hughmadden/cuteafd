@@ -49,7 +49,7 @@ pub(crate) struct ModelWeights<'a> {
     pub norm: DeviceAllocation<'a>,
 }
 
-fn layer_sources(cfg: &DeepseekV4Config, ratio: usize, hash: bool) -> Vec<Source> {
+fn layer_sources(cfg: &DeepseekV4Config, ratio: usize) -> Vec<Source> {
     let (h, q, heads, g, r) = (cfg.dim, cfg.q_lora_rank, cfg.n_heads, cfg.o_groups, cfg.o_lora_rank);
     let w = heads * 512 / g;
     let inter = cfg.moe_inter_dim;
@@ -158,7 +158,7 @@ impl<'a> WeightLoader<'a, '_> {
         let ratio = cfg.compress_ratios[layer];
         let hash = cfg.is_hash_layer(layer);
         let mut operands = HashMap::new();
-        for source in layer_sources(cfg, ratio, hash) {
+        for source in layer_sources(cfg, ratio) {
             let names: Vec<String> = source.tensors.iter().map(|t| format!("layers.{layer}.{t}")).collect();
             let raw = self.read(&names)?;
             let allocation = match source.prep {
@@ -190,8 +190,4 @@ impl<'a> WeightLoader<'a, '_> {
         })
     }
 
-    /// Host copy of layer tensors (routing tables read on the CPU).
-    pub fn host(&self, name: &str) -> Result<Vec<u8>> {
-        self.read(&[name.to_string()])
-    }
 }

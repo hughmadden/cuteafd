@@ -5,7 +5,7 @@
 //! runs the prototype's op sequence (mHC pre, producer, compressor, index
 //! top-k, sparse MLA, wo, mHC post_pre, router, experts + shared FFN, mHC
 //! post) and each stage's buffers are sized for the prompt.
-use super::metadata::{self, PrefillMetadata, INDEX_PAGE_BYTES, MAIN_PAGE_BYTES, WINDOW};
+use super::metadata::{self, StepTables, INDEX_PAGE_BYTES, MAIN_PAGE_BYTES};
 use super::weights::{LayerWeights, ModelWeights};
 use crate::v41_memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
@@ -70,22 +70,27 @@ struct Workspace<'a> {
     dummy: Dev<'a>,
 }
 
-/// Device copies of the prefill metadata.
-struct MetaBuffers<'a> {
+/// Device copies of one step's tables.
+struct StepBuffers<'a> {
     positions: Dev<'a>,
-    positions_i32: Dev<'a>,
-    main_slots: Dev<'a>,
     swa_indices: Dev<'a>,
     swa_lengths: Dev<'a>,
-    rope_window: Dev<'a>,
-    rope_compressed: Dev<'a>,
-    c4: Vec<Dev<'a>>,
+    c4: Vec<(&'static str, Dev<'a>)>,
+    c128: Vec<(&'static str, Dev<'a>)>,
     c4_page_table: Dev<'a>,
     c4_visible: Dev<'a>,
     c4_indexed_lengths: Dev<'a>,
-    c128: Vec<Dev<'a>>,
     c128_indices: Dev<'a>,
     c128_lengths: Dev<'a>,
+}
+
+/// One sequence's caches, sized for `capacity` tokens, and its tokens so far.
+pub(crate) struct Sequence<'a> {
+    caches: Vec<LayerCache<'a>>,
+    rope_window: Dev<'a>,
+    rope_compressed: Dev<'a>,
+    capacity: usize,
+    pub tokens: Vec<u32>,
 }
 
 impl<'a> Engine<'a> {
@@ -136,13 +141,14 @@ impl<'a> Engine<'a> {
         Ok(bytes)
     }
 
-    pub fn layer_cache(&self, layer: usize, meta: &PrefillMetadata) -> Result<LayerCache<'a>> {
+    fn layer_cache(&self, layer: usize, capacity: usize) -> Result<LayerCache<'a>> {
         let ratio = self.cfg.compress_ratios[layer];
-        let main = self.zeroed(meta.main_pages.max(1) * MAIN_PAGE_BYTES)?;
+        let (main_pages, c4_pages, c128_pages) = metadata::cache_pages(capacity);
+        let main = self.zeroed(main_pages * MAIN_PAGE_BYTES)?;
         let (compressed, index, states) = match ratio {
             4 => (
-                Some(self.zeroed(meta.c4.pages * metadata::compressed_page_bytes(4))?),
-                Some(self.zeroed(meta.c4.pages * INDEX_PAGE_BYTES)?),
+                Some(self.zeroed(c4_pages * metadata::compressed_page_bytes(4))?),
+                Some(self.zeroed(c4_pages * INDEX_PAGE_BYTES)?),
                 vec![
                     self.zeroed(16 * 1024 * 4)?,
                     self.zeroed(16 * 1024 * 4)?,
@@ -151,7 +157,7 @@ impl<'a> Engine<'a> {
                 ],
             ),
             128 => (
-                Some(self.zeroed(meta.c128.pages * metadata::compressed_page_bytes(128))?),
+                Some(self.zeroed(c128_pages * metadata::compressed_page_bytes(128))?),
                 None,
                 vec![self.zeroed(256 * 512 * 4)?, self.zeroed(256 * 512 * 4)?],
             ),
@@ -160,17 +166,27 @@ impl<'a> Engine<'a> {
         Ok(LayerCache { main, compressed, index, states })
     }
 
+    /// A new sequence with caches for `capacity` tokens (prompt + generation).
+    pub fn sequence(&self, capacity: usize) -> Result<Sequence<'a>> {
+        let table = capacity.max(metadata::WINDOW);
+        Ok(Sequence {
+            caches: (0..self.cfg.n_layers).map(|l| self.layer_cache(l, capacity)).collect::<Result<_>>()?,
+            rope_window: self.upload(&metadata::rope_table(&self.cfg, false, table))?,
+            rope_compressed: self.upload(&metadata::rope_table(&self.cfg, true, table))?,
+            capacity,
+            tokens: Vec::new(),
+        })
+    }
+
     fn workspace(&self, t: usize) -> Result<Workspace<'a>> {
         let h = self.cfg.dim;
         let heads = self.cfg.n_heads;
         let experts = self.cfg.n_routed_experts;
-        let topk_scratch = self
-            .programs
-            .spec(&format!("{}_index_topk_prefill_m{}", self.family, self.prefill_rows))?
-            .scratch
-            .get("scratch")
-            .copied()
-            .unwrap_or(0) as usize;
+        let mut topk_scratch = 0usize;
+        for route in [format!("decode_m{}", self.decode_rows), format!("prefill_m{}", self.prefill_rows)] {
+            let spec = self.programs.spec(&format!("{}_index_topk_{route}", self.family))?;
+            topk_scratch = topk_scratch.max(spec.scratch.get("scratch").copied().unwrap_or(0) as usize);
+        }
         Ok(Workspace {
             stream_a: self.alloc(t * 4 * h * 2)?,
             stream_b: self.alloc(t * 4 * h * 2)?,
@@ -194,42 +210,21 @@ impl<'a> Engine<'a> {
         })
     }
 
-    fn meta_buffers(&self, meta: &PrefillMetadata) -> Result<MetaBuffers<'a>> {
-        let positions = meta.tokens.max(WINDOW);
-        let c4 = &meta.c4;
-        let c128 = &meta.c128;
-        let groups = |values: &[i32]| if values.is_empty() { vec![0i32] } else { values.to_vec() };
-        Ok(MetaBuffers {
-            positions: self.upload(&meta.positions)?,
-            positions_i32: self.upload(&meta.positions_i32)?,
-            main_slots: self.upload(&meta.main_slots)?,
-            swa_indices: self.upload(&meta.swa_indices)?,
-            swa_lengths: self.upload(&meta.swa_lengths)?,
-            rope_window: self.upload(&metadata::rope_table(&self.cfg, false, positions))?,
-            rope_compressed: self.upload(&metadata::rope_table(&self.cfg, true, positions))?,
-            c4: vec![
-                self.upload(&c4.active_groups)?,
-                self.upload(&groups(&c4.group_source_starts))?,
-                self.upload(&groups(&c4.group_rope_positions))?,
-                self.upload(&groups(&c4.compressed_slots))?,
-                self.upload(&c4.active_sequences)?,
-                self.upload(&c4.sequence_offsets)?,
-                self.upload(&c4.state_sequence_ids)?,
-            ],
-            c4_page_table: self.upload(&c4.index_page_table)?,
-            c4_visible: self.upload(&c4.visible)?,
-            c4_indexed_lengths: self.upload(&c4.indexed_lengths)?,
-            c128: vec![
-                self.upload(&c128.active_groups)?,
-                self.upload(&groups(&c128.group_source_starts))?,
-                self.upload(&groups(&c128.group_rope_positions))?,
-                self.upload(&groups(&c128.compressed_slots))?,
-                self.upload(&c128.active_sequences)?,
-                self.upload(&c128.sequence_offsets)?,
-                self.upload(&c128.state_sequence_ids)?,
-            ],
-            c128_indices: self.upload(&c128.indexed_indices)?,
-            c128_lengths: self.upload(&c128.indexed_lengths)?,
+    fn step_buffers(&self, tables: &StepTables) -> Result<StepBuffers<'a>> {
+        let list = |entries: &[(&'static str, Vec<i32>)]| -> Result<Vec<(&'static str, Dev<'a>)>> {
+            entries.iter().map(|(name, values)| Ok((*name, self.upload(values)?))).collect()
+        };
+        Ok(StepBuffers {
+            positions: self.upload(&tables.positions)?,
+            swa_indices: self.upload(&tables.swa_indices)?,
+            swa_lengths: self.upload(&tables.swa_lengths)?,
+            c4: list(&tables.c4_tables)?,
+            c128: list(&tables.c128_tables)?,
+            c4_page_table: self.upload(&tables.c4_page_table)?,
+            c4_visible: self.upload(&tables.c4_visible)?,
+            c4_indexed_lengths: self.upload(&tables.c4_indexed_lengths)?,
+            c128_indices: self.upload(&tables.c128_indices)?,
+            c128_lengths: self.upload(&tables.c128_lengths)?,
         })
     }
 
@@ -245,25 +240,59 @@ impl<'a> Engine<'a> {
         Ok(out)
     }
 
-    /// Prefills `tokens` and returns FP32 logits [T, vocab]. `on_layer`
-    /// receives each layer's output stream [T, 4, dim] as BF16 bytes.
+    /// Prefills `tokens` into an empty sequence and returns FP32 logits
+    /// [T, vocab]. `on_layer` receives each layer's output stream [T, 4, dim].
     pub fn prefill(
         &self,
+        sequence: &mut Sequence<'_>,
+        tokens: &[u32],
+        embed: &[u8],
+        transport: &mut V41Tp4Roce,
+        runtime: &tokio::runtime::Runtime,
+        on_layer: impl FnMut(usize, &[u8]) -> Result<()>,
+    ) -> Result<Vec<f32>> {
+        ensure!(sequence.tokens.is_empty(), "prefill continues only from an empty sequence");
+        ensure!(tokens.len() <= self.prefill_rows && tokens.len() <= sequence.capacity,
+            "prefill of {} tokens exceeds capacity", tokens.len());
+        let tables = metadata::prefill_step(tokens.len(), self.cfg.index_topk, self.c128_width, sequence.capacity);
+        let logits = self.step(sequence, &tables, tokens, embed, transport, runtime, on_layer)?;
+        sequence.tokens.extend_from_slice(tokens);
+        Ok(logits)
+    }
+
+    /// Appends one token and returns its FP32 logits row.
+    pub fn decode(
+        &self,
+        sequence: &mut Sequence<'_>,
+        token: u32,
+        embed: &[u8],
+        transport: &mut V41Tp4Roce,
+        runtime: &tokio::runtime::Runtime,
+    ) -> Result<Vec<f32>> {
+        let position = sequence.tokens.len();
+        ensure!(position > 0 && position < sequence.capacity, "decode at {position} outside the sequence capacity");
+        let tables = metadata::decode_step(position, self.cfg.index_topk, self.c128_width, sequence.capacity);
+        let logits = self.step(sequence, &tables, &[token], embed, transport, runtime, |_, _| Ok(()))?;
+        sequence.tokens.push(token);
+        Ok(logits)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn step(
+        &self,
+        sequence: &Sequence<'_>,
+        tables: &StepTables,
         tokens: &[u32],
         embed: &[u8],
         transport: &mut V41Tp4Roce,
         runtime: &tokio::runtime::Runtime,
         mut on_layer: impl FnMut(usize, &[u8]) -> Result<()>,
     ) -> Result<Vec<f32>> {
-        let t = tokens.len();
+        let t = tables.rows;
         let h = self.cfg.dim;
-        ensure!(t > 0 && t <= self.prefill_rows, "prefill of {t} tokens exceeds program capacity {}", self.prefill_rows);
-        let meta = metadata::prefill(t, self.cfg.index_topk, self.c128_width);
-        let m = self.meta_buffers(&meta)?;
+        ensure!(tokens.len() == t && embed.len() == t * h * 2, "step rows disagree");
+        let m = self.step_buffers(tables)?;
         let w = self.workspace(t)?;
-        let caches = (0..self.cfg.n_layers).map(|l| self.layer_cache(l, &meta)).collect::<Result<Vec<_>>>()?;
-        // Embedding rows expanded to the four mHC lanes.
-        ensure!(embed.len() == t * h * 2, "embedding rows do not match the prompt");
         let mut expanded = Vec::with_capacity(t * 4 * h * 2);
         for row in embed.chunks_exact(h * 2) {
             for _ in 0..4 {
@@ -272,12 +301,13 @@ impl<'a> Engine<'a> {
         }
         self.library.copy_h2d(w.stream_a.buffer, &expanded)?;
         let rows = Dsv4Scalar::I32(t as i32);
-        let p = self.prefill_rows;
+        let cap = if tables.decode { self.decode_rows } else { self.prefill_rows };
+        let mode = if tables.decode { "decode" } else { "prefill" };
         let (mut current, mut next) = (&w.stream_a, &w.stream_b);
         for (layer, weights) in self.weights.layers.iter().enumerate() {
-            let cache = &caches[layer];
+            let cache = &sequence.caches[layer];
             let ratio = weights.ratio;
-            let rope = if ratio == 0 { &m.rope_window } else { &m.rope_compressed };
+            let rope = if ratio == 0 { &sequence.rope_window } else { &sequence.rope_compressed };
             // 1. mHC pre (attention) with attn_norm.
             self.run("mhc_pre", &[
                 ("residual", current.buffer.ptr), ("fn", weights.ptr("attn.fn")?), ("scale", weights.ptr("attn.scale")?),
@@ -285,8 +315,8 @@ impl<'a> Engine<'a> {
                 ("comb", w.comb.buffer.ptr), ("y", w.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
             ], &[rows])?;
             // 2. producer: q/kv projections, window cache pack, query.
-            self.run(&format!("producer_m{p}"), &[
-                ("hidden", w.y.buffer.ptr), ("positions", m.positions.buffer.ptr), ("main_slots", m.main_slots.buffer.ptr),
+            self.run(&format!("producer_m{cap}"), &[
+                ("hidden", w.y.buffer.ptr), ("positions", m.positions.buffer.ptr), ("main_slots", m.positions.buffer.ptr),
                 ("cos_sin", rope.buffer.ptr), ("w_qkv", weights.ptr("w_qkv")?), ("w_qkv_scale", weights.ptr("w_qkv_scale")?),
                 ("w_q", weights.ptr("w_q")?), ("w_q_scale", weights.ptr("w_q_scale")?), ("q_norm", weights.ptr("q_norm")?),
                 ("kv_norm", weights.ptr("kv_norm")?), ("main_kv_cache", cache.main.buffer.ptr), ("query", w.query.buffer.ptr),
@@ -294,22 +324,22 @@ impl<'a> Engine<'a> {
             ], &[rows])?;
             // 3. compressor, index query and top-k.
             let (attention, indexed_cache, indexed_indices, indexed_lengths) =
-                self.compress(layer, weights, cache, &meta, &m, &w, rope, rows)?;
+                self.compress(layer, weights, cache, tables, &m, &w, rope, rows, cap)?;
             // 4. sparse MLA over window + indexed slots with sink.
-            self.run(&format!("sparse_mla_prefill_{attention}_m{p}"), &[
+            self.run(&format!("sparse_mla_{mode}_{attention}_m{cap}"), &[
                 ("q", w.query.buffer.ptr), ("swa_cache", cache.main.buffer.ptr), ("swa_indices", m.swa_indices.buffer.ptr),
                 ("swa_lengths", m.swa_lengths.buffer.ptr), ("indexed_cache", indexed_cache),
                 ("indexed_indices", indexed_indices), ("indexed_lengths", indexed_lengths),
                 ("attn_sink", weights.ptr("attn_sink")?), ("out", w.attn_out.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
             ], &[rows])?;
             // 5. wo with inverse RoPE.
-            self.run(&format!("wo_m{p}"), &[
+            self.run(&format!("wo_m{cap}"), &[
                 ("o", w.attn_out.buffer.ptr), ("positions", m.positions.buffer.ptr), ("cos_sin", rope.buffer.ptr),
                 ("wo_a", weights.ptr("wo_a")?), ("wo_a_scale", weights.ptr("wo_a_scale")?), ("wo_b", weights.ptr("wo_b")?),
                 ("wo_b_scale", weights.ptr("wo_b_scale")?), ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
             ], &[rows])?;
             // 6. mHC post (attention) fused with pre (FFN) + ffn_norm.
-            self.run(&format!("mhc_post_pre_m{p}"), &[
+            self.run(&format!("mhc_post_pre_m{cap}"), &[
                 ("x", w.delta.buffer.ptr), ("residual", current.buffer.ptr), ("prev_post", w.post.buffer.ptr),
                 ("prev_comb", w.comb.buffer.ptr), ("fn", weights.ptr("ffn.fn")?), ("scale", weights.ptr("ffn.scale")?),
                 ("base", weights.ptr("ffn.base")?), ("norm", weights.ptr("ffn.norm")?), ("residual_out", next.buffer.ptr),
@@ -317,14 +347,16 @@ impl<'a> Engine<'a> {
             ], &[rows])?;
             std::mem::swap(&mut current, &mut next);
             // 7. MoE: routed experts on the Sparks plus the shared expert.
-            self.ffn(layer, weights, tokens, &w, transport, runtime)?;
+            self.ffn(layer, weights, tokens, &w, cap, transport, runtime)?;
             // 8. mHC post (FFN) into the next layer's stream.
             self.run("mhc_post", &[
                 ("x", w.delta.buffer.ptr), ("residual", current.buffer.ptr), ("prev_post", w.post.buffer.ptr),
                 ("prev_comb", w.comb.buffer.ptr), ("out", next.buffer.ptr),
             ], &[rows])?;
             std::mem::swap(&mut current, &mut next);
-            on_layer(layer, &self.download(current, t * 4 * h * 2)?)?;
+            if !tables.decode {
+                on_layer(layer, &self.download(current, t * 4 * h * 2)?)?;
+            }
         }
         self.head(current, t, &w)
     }
@@ -335,11 +367,12 @@ impl<'a> Engine<'a> {
         layer: usize,
         weights: &LayerWeights<'_>,
         cache: &LayerCache<'_>,
-        meta: &PrefillMetadata,
-        m: &MetaBuffers<'_>,
+        tables: &StepTables,
+        m: &StepBuffers<'_>,
         w: &Workspace<'_>,
         rope: &Dev<'_>,
         rows: Dsv4Scalar,
+        cap: usize,
     ) -> Result<(&'static str, *mut c_void, *mut c_void, *mut c_void)> {
         let dummy = w.dummy.buffer.ptr;
         let window = ("win", dummy, dummy, dummy);
@@ -347,13 +380,10 @@ impl<'a> Engine<'a> {
         if ratio == 0 {
             return Ok(window);
         }
-        let (info, tables) = if ratio == 4 { (&meta.c4, &m.c4) } else { (&meta.c128, &m.c128) };
+        let (groups, metadata) = if ratio == 4 { (tables.c4_groups, &m.c4) } else { (tables.c128_groups, &m.c128) };
         let compressed = cache.compressed.as_ref().context("compressed cache")?.buffer.ptr;
         let mut pointers: Vec<(&str, *mut c_void)> = vec![("hidden", w.y.buffer.ptr)];
-        for (name, buffer) in ["active_groups", "group_source_starts", "group_rope_positions", "compressed_slots",
-            "active_sequences", "sequence_offsets", "state_sequence_ids"].into_iter().zip(tables) {
-            pointers.push((name, buffer.buffer.ptr));
-        }
+        pointers.extend(metadata.iter().map(|(name, buffer)| (*name, buffer.buffer.ptr)));
         pointers.extend([
             ("cos_sin", rope.buffer.ptr), ("joint_projection", weights.ptr("joint_projection")?),
             ("main_ape", weights.ptr("main_ape")?), ("main_norm", weights.ptr("main_norm")?),
@@ -368,28 +398,32 @@ impl<'a> Engine<'a> {
             ]);
         }
         pointers.push(("scratch", w.scratch.buffer.ptr));
-        let groups = Dsv4Scalar::I32(info.groups.max(1) as i32);
-        self.run(&format!("compressor_prefill_c{ratio}"), &pointers, &[rows, groups, Dsv4Scalar::I32(1)])
-            .with_context(|| format!("layer {layer} compressor"))?;
-        if info.groups == 0 {
+        if tables.decode {
+            self.run(&format!("compressor_decode_c{ratio}"), &pointers, &[rows])
+        } else {
+            let grid = Dsv4Scalar::I32(groups.max(1) as i32);
+            self.run(&format!("compressor_prefill_c{ratio}"), &pointers, &[rows, grid, Dsv4Scalar::I32(1)])
+        }
+        .with_context(|| format!("layer {layer} compressor"))?;
+        if groups == 0 {
             return Ok(window);
         }
         if ratio == 128 {
             return Ok(("c128", compressed, m.c128_indices.buffer.ptr, m.c128_lengths.buffer.ptr));
         }
-        let p = self.prefill_rows;
-        self.run(&format!("index_producer_m{p}"), &[
+        self.run(&format!("index_producer_m{cap}"), &[
             ("q_rank", w.q_rank.buffer.ptr), ("hidden", w.y.buffer.ptr), ("positions", m.positions.buffer.ptr),
             ("cos_sin", rope.buffer.ptr), ("w_q", weights.ptr("index_w_q")?), ("w_q_scale", weights.ptr("index_w_q_scale")?),
             ("w_proj", weights.ptr("index_w_proj")?), ("query", w.index_query.buffer.ptr),
             ("head_weights", w.index_weights.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
         ], &[rows])?;
-        self.run(&format!("index_topk_prefill_m{p}"), &[
+        let mode = if tables.decode { "decode" } else { "prefill" };
+        self.run(&format!("index_topk_{mode}_m{cap}"), &[
             ("q_fp8", w.index_query.buffer.ptr), ("weights", w.index_weights.buffer.ptr),
             ("index_k_cache", cache.index.as_ref().context("index cache")?.buffer.ptr),
             ("page_table", m.c4_page_table.buffer.ptr), ("cache_lengths", m.c4_visible.buffer.ptr),
             ("output_indices", w.selected.buffer.ptr), ("scratch", w.topk_scratch.buffer.ptr),
-        ], &[rows, Dsv4Scalar::I32(info.pages as i32), Dsv4Scalar::I32(0)])?;
+        ], &[rows, Dsv4Scalar::I32(tables.c4_table_width as i32), Dsv4Scalar::I32(tables.c4_table_stride as i32)])?;
         Ok(("c4", compressed, w.selected.buffer.ptr, m.c4_indexed_lengths.buffer.ptr))
     }
 
@@ -399,6 +433,7 @@ impl<'a> Engine<'a> {
         weights: &LayerWeights<'_>,
         tokens: &[u32],
         w: &Workspace<'_>,
+        cap: usize,
         transport: &mut V41Tp4Roce,
         runtime: &tokio::runtime::Runtime,
     ) -> Result<()> {
@@ -415,8 +450,7 @@ impl<'a> Engine<'a> {
             ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
             ("scale_mma_ptr", w.dummy.buffer.ptr),
         ], &[rows, Dsv4Scalar::I32(grid as i32)])?;
-        let p = self.prefill_rows;
-        self.run(&format!("shared_ffn_m{p}"), &[
+        self.run(&format!("shared_ffn_m{cap}"), &[
             ("x", w.y.buffer.ptr), ("w13", weights.ptr("w13")?), ("w13_scale", weights.ptr("w13_scale")?),
             ("w2", weights.ptr("w2")?), ("w2_scale", weights.ptr("w2_scale")?), ("out", w.shared.buffer.ptr),
             ("scratch", w.scratch.buffer.ptr),

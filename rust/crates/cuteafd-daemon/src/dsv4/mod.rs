@@ -35,6 +35,10 @@ pub(crate) struct GoldenArgs {
     /// Compare only the first N layers' streams (all logits still compared).
     #[arg(long)]
     pub layers: Option<usize>,
+    /// Prefill only the first N tokens and decode the rest one at a time
+    /// (teacher-forced), comparing every decode row with the golden logits.
+    #[arg(long)]
+    pub prefill: Option<usize>,
 }
 
 fn f32s(bytes: &[u8]) -> Vec<f32> {
@@ -115,16 +119,31 @@ fn golden(args: GoldenArgs) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let started = Instant::now();
     let compare_layers = args.layers.unwrap_or(cfg.n_layers);
-    let logits = engine.prefill(&tokens, &embed, &mut transport, &runtime, |layer, stream| {
-        if layer < compare_layers {
-            let golden = std::fs::read(args.golden.join(format!("layer{layer:02}.bin")))?;
-            ensure!(golden.len() == stream.len(), "golden layer {layer} has {} bytes, engine {}", golden.len(), stream.len());
-            let (cosine, rel) = similarity(&bf16s(stream), &bf16s(&golden));
-            println!("layer {layer:2}: cosine {cosine:.6} rel_l2 {rel:.3e}");
-        }
-        Ok(())
-    })?;
-    let elapsed = started.elapsed();
+    let prefill = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
+    let mut sequence = engine.sequence(tokens.len())?;
+    let row = cfg.dim * 2;
+    let mut logits = engine.prefill(&mut sequence, &tokens[..prefill], &embed[..prefill * row], &mut transport, &runtime,
+        |layer, stream| {
+            if layer < compare_layers && prefill == tokens.len() {
+                let golden = std::fs::read(args.golden.join(format!("layer{layer:02}.bin")))?;
+                ensure!(golden.len() == stream.len(), "golden layer {layer} has {} bytes, engine {}", golden.len(), stream.len());
+                let (cosine, rel) = similarity(&bf16s(stream), &bf16s(&golden));
+                println!("layer {layer:2}: cosine {cosine:.6} rel_l2 {rel:.3e}");
+            }
+            Ok(())
+        })?;
+    let prefill_elapsed = started.elapsed();
+    let decode_started = Instant::now();
+    for position in prefill..tokens.len() {
+        let token = tokens[position];
+        logits.extend(engine.decode(&mut sequence, token, &embed[position * row..][..row], &mut transport, &runtime)?);
+    }
+    let decode_steps = tokens.len() - prefill;
+    if decode_steps > 0 {
+        println!("decode: {decode_steps} steps in {:.2} s ({:.1} ms/token)", decode_started.elapsed().as_secs_f64(),
+            decode_started.elapsed().as_secs_f64() * 1e3 / decode_steps as f64);
+    }
+    println!("prefill: {prefill} tokens in {:.2} s", prefill_elapsed.as_secs_f64());
     let vocab = cfg.vocab_size;
     let golden = f32s(&std::fs::read(args.golden.join("logits.bin"))?);
     ensure!(golden.len() == logits.len(), "golden logits {} vs engine {}", golden.len(), logits.len());
@@ -141,13 +160,21 @@ fn golden(args: GoldenArgs) -> Result<()> {
     let t = tokens.len();
     let (cosine, rel) = similarity(&logits[(t - 1) * vocab..], &golden[(t - 1) * vocab..]);
     println!(
-        "logits: top-1 agreement {:.1}% | next-token accuracy engine {:.1}% golden {:.1}% | last row cosine {cosine:.6} rel_l2 {rel:.3e} | prefill {} tokens in {:.2} s",
+        "logits: top-1 agreement {:.1}% | next-token accuracy engine {:.1}% golden {:.1}% | last row cosine {cosine:.6} rel_l2 {rel:.3e}",
         100.0 * agree as f64 / t as f64,
         100.0 * next_ok as f64 / (t - 1) as f64,
         100.0 * golden_next_ok as f64 / (t - 1) as f64,
-        t,
-        elapsed.as_secs_f64(),
     );
+    if decode_steps > 0 {
+        let (mut decode_agree, mut worst) = (0usize, 1f64);
+        for row in prefill..t {
+            let (ours, theirs) = (&logits[row * vocab..][..vocab], &golden[row * vocab..][..vocab]);
+            decode_agree += usize::from(argmax(ours) == argmax(theirs));
+            worst = worst.min(similarity(ours, theirs).0);
+        }
+        println!("decode rows: top-1 agreement {:.1}% | worst row cosine {worst:.6}",
+            100.0 * decode_agree as f64 / decode_steps as f64);
+    }
     unsafe { library.cuda_stream_destroy(stream)? };
     let _ = Path::new("");
     Ok(())
