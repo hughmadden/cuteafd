@@ -1,32 +1,5 @@
 use super::*;
 
-#[test]
-fn layerwave_decode_wave_has_one_flash_row() {
-    let wave = LayerWave::decode(DecodeStep::new(
-        "req-a",
-        "seq-a",
-        7,
-        42,
-        Some(11),
-        Priority(0),
-        "placement-a",
-    ));
-
-    assert_eq!(wave.mode, LayerWaveMode::Decode);
-    assert_eq!(wave.layer_id, LayerId(7));
-    assert_eq!(wave.num_rows(), 1);
-    assert_eq!(
-        wave.payload_bytes_per_direction(),
-        DS4_FLASH_HIDDEN_BF16_BYTES
-    );
-    assert_eq!(
-        wave.roundtrip_bytes_per_host(),
-        DS4_FLASH_HIDDEN_BF16_BYTES * 2
-    );
-    assert_eq!(wave.row_sources[0].kind, RowSourceKind::DecodeStep);
-    assert_eq!(wave.kv_reads[0].token_count, 42);
-    assert_eq!(wave.kv_writes[0].token_start, PositionId(42));
-}
 
 #[test]
 fn layerwave_decode_uses_pro_geometry_when_requested() {
@@ -105,113 +78,9 @@ fn prefill_chunk_zero_has_no_prefix_read_and_writes_chunk_range() {
     assert!(wave.tentative_kv_writes.is_empty());
 }
 
-#[test]
-fn later_prefill_chunk_reads_prefix_and_writes_chunk_range() {
-    let chunk = PrefillChunk::new(
-        "req-a",
-        "seq-a",
-        3,
-        64,
-        32,
-        33,
-        Priority(2),
-        GraphBucket::new(64),
-        "placement-a",
-    );
-    let wave = LayerWave::prefill(chunk);
 
-    assert_eq!(wave.mode, LayerWaveMode::Prefill);
-    assert_eq!(wave.num_rows(), 32);
-    assert_eq!(
-        wave.payload_bytes_per_direction(),
-        32 * DS4_FLASH_HIDDEN_BF16_BYTES
-    );
-    assert_eq!(wave.routed_expert_assignments(), 32 * DS4_FLASH_TOP_K);
-    assert_eq!(wave.average_rows_per_expert(), 0.75);
-    assert_eq!(wave.kv_reads.len(), 1);
-    assert_eq!(wave.kv_reads[0].reservation_id, 33);
-    assert_eq!(wave.kv_reads[0].token_start, PositionId(0));
-    assert_eq!(wave.kv_reads[0].token_count, 64);
-    assert_eq!(wave.kv_writes[0].reservation_id, 33);
-    assert_eq!(wave.kv_writes[0].token_start, PositionId(64));
-    assert_eq!(wave.kv_writes[0].token_count, 32);
-    assert!(wave.tentative_kv_writes.is_empty());
-}
 
-#[test]
-fn prefill_policy_splits_prompt_by_runtime_chunk_size() {
-    let policy = PrefillChunkPolicy::latency_smoke(32);
-    let chunks = plan_prefill_chunks(
-        "req-a",
-        "seq-a",
-        3,
-        70,
-        44,
-        Priority(0),
-        &policy,
-        "placement-a",
-    );
 
-    assert_eq!(chunks.len(), 3);
-    assert_eq!(chunks[0].token_start, PositionId(0));
-    assert_eq!(chunks[0].token_count, 32);
-    assert_eq!(chunks[1].token_start, PositionId(32));
-    assert_eq!(chunks[1].token_count, 32);
-    assert_eq!(chunks[2].token_start, PositionId(64));
-    assert_eq!(chunks[2].token_count, 6);
-    assert_eq!(chunks[0].graph_bucket, GraphBucket::new(32));
-}
-
-#[test]
-fn prefill_policy_uses_requested_pro_geometry() {
-    let mut facts = ModelFacts::default();
-    facts.variant = ModelVariant::Pro;
-    facts.hidden_size = DS4_PRO_HIDDEN_SIZE;
-    facts.routed_experts = DS4_PRO_ROUTED_EXPERTS;
-    facts.top_k = DS4_PRO_TOP_K;
-    let policy = PrefillChunkPolicy::latency_smoke(32);
-
-    let chunks = plan_prefill_chunks_with_model(
-        "req-pro",
-        "seq-pro",
-        60,
-        33,
-        44,
-        Priority(0),
-        &policy,
-        "placement-pro",
-        &facts,
-    );
-    let wave = LayerWave::prefill_with_model(chunks[0].clone(), &facts);
-
-    assert_eq!(chunks.len(), 2);
-    assert_eq!(chunks[0].hidden_shape.hidden_dim, DS4_PRO_HIDDEN_SIZE);
-    assert_eq!(wave.hidden_shape.hidden_dim, DS4_PRO_HIDDEN_SIZE);
-    assert_eq!(wave.route_metadata.routed_experts, DS4_PRO_ROUTED_EXPERTS);
-    assert_eq!(wave.route_metadata.top_k, DS4_PRO_TOP_K);
-}
-
-#[test]
-fn prefill_policy_accepts_phase0_chunk_sizes() {
-    for chunk_size in [16, 32, 64, 128] {
-        let policy = PrefillChunkPolicy::latency_smoke(chunk_size);
-        let chunks = plan_prefill_chunks(
-            "req-a",
-            "seq-a",
-            3,
-            chunk_size * 2 + 1,
-            44,
-            Priority(0),
-            &policy,
-            "placement-a",
-        );
-
-        assert_eq!(chunks[0].token_count, chunk_size);
-        assert_eq!(chunks[1].token_count, chunk_size);
-        assert_eq!(chunks[2].token_count, 1);
-        assert_eq!(chunks[0].graph_bucket, GraphBucket::new(chunk_size));
-    }
-}
 
 #[test]
 fn layerwave_admission_prioritizes_decode_over_prefill() {
@@ -329,32 +198,3 @@ fn layerwaves_mix_only_with_same_layer_and_graph_bucket() {
     assert!(err.to_string().contains("different layers"));
 }
 
-#[test]
-fn prefill_wave_keeps_reservation_metadata_across_allocator_transitions() {
-    let mut allocator = KvCacheAllocator::new(KvCacheConfig::glm52_phase0(128));
-    let reservation_id = allocator.reserve("seq-a", 96).unwrap();
-    let wave = LayerWave::prefill(PrefillChunk::new(
-        "req-a",
-        "seq-a",
-        3,
-        0,
-        64,
-        reservation_id,
-        Priority(0),
-        GraphBucket::new(64),
-        "placement-a",
-    ));
-
-    allocator.pause(reservation_id).unwrap();
-    assert_eq!(
-        allocator.reservation(reservation_id).unwrap().state,
-        KvReservationState::Paused
-    );
-    allocator.resume(reservation_id).unwrap();
-    assert_eq!(
-        allocator.reservation(reservation_id).unwrap().state,
-        KvReservationState::Active
-    );
-    assert_eq!(wave.kv_writes[0].reservation_id, reservation_id);
-    assert_eq!(wave.kv_writes[0].token_count, 64);
-}

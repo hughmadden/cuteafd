@@ -57,34 +57,8 @@ pub struct ExpertOwnerLookup {
 }
 
 impl ExpertOwnerLookup {
-    pub fn from_pairs(pairs: impl IntoIterator<Item = ((usize, usize), String)>) -> Self {
-        Self {
-            owners_by_expert: pairs.into_iter().collect(),
-        }
-    }
 
-    pub fn from_assignments<'a>(
-        assignments: impl IntoIterator<Item = &'a TensorAssignment>,
-    ) -> Self {
-        let mut owners_by_expert = BTreeMap::new();
-        for assignment in assignments {
-            if assignment.role != TensorRole::RoutedExpert {
-                continue;
-            }
-            let (Some(layer_id), Some(expert_id)) = (assignment.layer_id, assignment.expert_id)
-            else {
-                continue;
-            };
-            owners_by_expert
-                .entry((layer_id as usize, expert_id as usize))
-                .or_insert_with(|| assignment.owner.clone());
-        }
-        Self { owners_by_expert }
-    }
 
-    pub fn from_load_plan(plan: &LoadPlan) -> Self {
-        Self::from_assignments(plan.assignments.iter())
-    }
 
     pub fn owner_for(&self, layer_id: usize, expert_id: usize) -> Option<&str> {
         self.owners_by_expert
@@ -112,9 +86,4 @@ pub struct LoadPlan {
 }
 
 impl LoadPlan {
-    pub fn readiness_hash(&self) -> String {
-        let encoded = serde_json::to_vec(self).expect("serializing load plan cannot fail");
-        let digest = Sha256::digest(encoded);
-        format!("{digest:x}")
-    }
 }

@@ -58,17 +58,6 @@ impl<'a> NativeFp4Expert<'a> {
         [self.up, self.gate]
     }
 
-    pub fn tp_shard(self, rank: usize) -> Result<NativeFp4TpExpertShard<'a>> {
-        Ok(NativeFp4TpExpertShard {
-            layer_id: self.layer_id,
-            expert_id: self.expert_id,
-            rank,
-            world_size: DS4_EXPERT_TP_WORLD_SIZE,
-            gate: native_fp4_tp_projection(self.gate, rank)?,
-            up: native_fp4_tp_projection(self.up, rank)?,
-            down: native_fp4_tp_projection(self.down, rank)?,
-        })
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -87,36 +76,7 @@ impl NativeFp4TpTensorWindow<'_> {
             .context("native FP4 TP tensor source byte count overflow")
     }
 
-    pub fn is_contiguous(self) -> bool {
-        self.column_start_bytes == 0
-            && self.tensor.shape.get(1).copied() == Some(self.row_width_bytes)
-    }
 
-    pub fn source_offset_for_row(self, local_row: usize) -> Result<u64> {
-        anyhow::ensure!(
-            local_row < self.row_count,
-            "native FP4 TP local row {local_row} exceeds {} rows",
-            self.row_count
-        );
-        let source_row_width = self
-            .tensor
-            .shape
-            .get(1)
-            .copied()
-            .context("native FP4 TP tensor has no packed row width")?;
-        let source_row = self
-            .row_start
-            .checked_add(local_row)
-            .context("native FP4 TP source row overflow")?;
-        let row_offset = source_row
-            .checked_mul(source_row_width)
-            .and_then(|offset| offset.checked_add(self.column_start_bytes))
-            .context("native FP4 TP source row byte offset overflow")?;
-        self.tensor
-            .byte_offset
-            .checked_add(row_offset as u64)
-            .context("native FP4 TP absolute source offset overflow")
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -286,108 +246,7 @@ pub fn validate_native_fp4_expert_catalog(
     })
 }
 
-fn native_fp4_tp_projection(
-    projection: NativeFp4Projection<'_>,
-    rank: usize,
-) -> Result<NativeFp4TpProjectionShard<'_>> {
-    anyhow::ensure!(
-        rank < DS4_EXPERT_TP_WORLD_SIZE,
-        "native FP4 expert TP rank {rank} exceeds world size {DS4_EXPERT_TP_WORLD_SIZE}"
-    );
-    let intermediate_size = match projection.kind {
-        NativeFp4ProjectionKind::Gate | NativeFp4ProjectionKind::Up => projection.logical_rows,
-        NativeFp4ProjectionKind::Down => projection.logical_columns,
-    };
-    let alignment = DS4_EXPERT_TP_WORLD_SIZE * NATIVE_FP4_K_BLOCK;
-    anyhow::ensure!(
-        intermediate_size % alignment == 0,
-        "native FP4 intermediate size {intermediate_size} must be divisible by TP4 K/32 alignment {alignment}"
-    );
-    let local_intermediate_size = intermediate_size / DS4_EXPERT_TP_WORLD_SIZE;
-    let intermediate_start = local_intermediate_size
-        .checked_mul(rank)
-        .context("native FP4 TP intermediate start overflow")?;
 
-    let (row_start, row_count, weight_column_start, weight_row_width) = match projection.kind {
-        NativeFp4ProjectionKind::Gate | NativeFp4ProjectionKind::Up => (
-            intermediate_start,
-            local_intermediate_size,
-            0,
-            projection.logical_columns / 2,
-        ),
-        NativeFp4ProjectionKind::Down => (
-            0,
-            projection.logical_rows,
-            intermediate_start / 2,
-            local_intermediate_size / 2,
-        ),
-    };
-    let (scale_column_start, scale_row_width) = match projection.kind {
-        NativeFp4ProjectionKind::Gate | NativeFp4ProjectionKind::Up => {
-            (0, projection.logical_columns / NATIVE_FP4_K_BLOCK)
-        }
-        NativeFp4ProjectionKind::Down => (
-            intermediate_start / NATIVE_FP4_K_BLOCK,
-            local_intermediate_size / NATIVE_FP4_K_BLOCK,
-        ),
-    };
-    let weight = NativeFp4TpTensorWindow {
-        tensor: projection.weight,
-        row_start,
-        row_count,
-        column_start_bytes: weight_column_start,
-        row_width_bytes: weight_row_width,
-    };
-    let scale = NativeFp4TpTensorWindow {
-        tensor: projection.scale,
-        row_start,
-        row_count,
-        column_start_bytes: scale_column_start,
-        row_width_bytes: scale_row_width,
-    };
-    validate_tp_window(weight)?;
-    validate_tp_window(scale)?;
-    Ok(NativeFp4TpProjectionShard {
-        kind: projection.kind,
-        weight,
-        scale,
-        local_intermediate_size,
-    })
-}
-
-fn validate_tp_window(window: NativeFp4TpTensorWindow<'_>) -> Result<()> {
-    let source_rows = window
-        .tensor
-        .shape
-        .first()
-        .copied()
-        .context("native FP4 TP tensor has no row count")?;
-    let source_row_width = window
-        .tensor
-        .shape
-        .get(1)
-        .copied()
-        .context("native FP4 TP tensor has no row width")?;
-    anyhow::ensure!(
-        window.row_start <= source_rows
-            && window.row_count <= source_rows.saturating_sub(window.row_start),
-        "native FP4 TP row window {}+{} exceeds {} rows for {}",
-        window.row_start,
-        window.row_count,
-        source_rows,
-        window.tensor.name
-    );
-    anyhow::ensure!(
-        window.column_start_bytes <= source_row_width
-            && window.row_width_bytes <= source_row_width.saturating_sub(window.column_start_bytes),
-        "native FP4 TP column window {}+{} exceeds {} bytes for {}",
-        window.column_start_bytes,
-        window.row_width_bytes,
-        source_row_width,
-        window.tensor.name
-    );
-    Ok(())
-}
 
 fn native_fp4_projection<'a>(
     catalog: &'a TensorCatalog,

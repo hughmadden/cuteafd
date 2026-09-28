@@ -488,22 +488,6 @@ impl ExpertHostBatch {
 }
 
 impl ExpertHostBatchSet {
-    /// Build the production DS4 expert TP=4 dispatch: every routed row and
-    /// route is sent to every Spark, where each rank evaluates its quarter of
-    /// the expert intermediate dimension before the four partials are reduced.
-    pub fn tp4_from_expert_batch(
-        batch: &ExpertBatch,
-        routes: &[ExpertBatchRoute],
-        expert_hosts: &[String],
-    ) -> Result<Self, Ds41rtError> {
-        if expert_hosts.len() != DS4_EXPERT_TP_WORLD_SIZE {
-            return Err(Ds41rtError::ExpertTensorParallelHostCountMismatch {
-                expected: DS4_EXPERT_TP_WORLD_SIZE,
-                actual: expert_hosts.len(),
-            });
-        }
-        Self::replicated_from_expert_batch(batch, routes, expert_hosts)
-    }
 
     pub fn replicated_from_expert_batch(
         batch: &ExpertBatch,
@@ -624,23 +608,8 @@ impl ExpertHostBatchSet {
         self.batches.iter().map(ExpertHostBatch::route_count).sum()
     }
 
-    pub fn host_row_count(&self) -> usize {
-        self.batches.iter().map(ExpertHostBatch::num_rows).sum()
-    }
 
-    pub fn touched_hosts(&self) -> impl Iterator<Item = &str> {
-        self.batches.iter().map(|batch| batch.host.as_str())
-    }
 
-    pub fn compact_hidden_payloads(
-        &self,
-        global_hidden_payload: &[u8],
-    ) -> Result<Vec<Vec<u8>>, Ds41rtError> {
-        self.batches
-            .iter()
-            .map(|batch| batch.compact_hidden_payload(global_hidden_payload, self.global_row_count))
-            .collect()
-    }
 
     pub fn accumulate_partial_outputs_f32<T: AsRef<[f32]>>(
         &self,

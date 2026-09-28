@@ -5,7 +5,6 @@ use std::time::Duration;
 
 mod capabilities;
 mod debug_json;
-mod host_batch_set;
 pub mod protocol_v2;
 pub mod v41_expert;
 mod protocol_v2_tcp;
@@ -25,22 +24,6 @@ pub use debug_json::{
 };
 #[cfg(test)]
 pub(crate) use debug_json::{encode_frame, handle_synthetic_connection, read_frame, FrameKind};
-pub use host_batch_set::{
-    protocol_v2_stream_ingress_rows, protocol_v2_verbs_host_execution_lanes,
-    tcp_protocol_v2_host_batch_set_bf16_dispatch,
-    tcp_protocol_v2_host_batch_set_bf16_dispatch_with_graph_pool,
-    tcp_protocol_v2_host_batch_set_bf16_payload_dispatch,
-    tcp_protocol_v2_host_batch_set_bf16_payload_dispatch_with_graph_pool,
-    verbs_host_protocol_v2_host_batch_set_bf16_dispatch,
-    verbs_host_protocol_v2_host_batch_set_bf16_payload_dispatch,
-    verbs_host_protocol_v2_host_batch_set_bf16_payload_dispatch_structural_stats,
-    TcpProtocolV2HostBatchSetBf16PayloadDispatch, TcpProtocolV2HostBatchSetDispatch,
-    TcpProtocolV2HostBatchSetDispatchStats, TcpProtocolV2HostBatchSetPersistentClient,
-    TcpProtocolV2HostBatchTarget, VerbsHostProtocolV2HostBatchSetBf16PayloadChunk,
-    VerbsHostProtocolV2HostBatchSetPayloadStart, VerbsHostProtocolV2HostBatchSetPersistentClient,
-    VerbsHostProtocolV2ReducedIdentityPayloadPending,
-    VerbsHostProtocolV2ReducedIdentityPayloadStart, MAX_VERBS_HOST_EXECUTION_LANES,
-};
 pub use protocol_v2::{
     expert_protocol_v2_compact_id, ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2FrameArena,
     ExpertProtocolV2FrameBuffer, ExpertProtocolV2Request, ExpertProtocolV2RequestHeader,

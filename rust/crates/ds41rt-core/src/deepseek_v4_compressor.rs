@@ -103,35 +103,6 @@ impl DeepseekV4CompressorLayerExecutionPlan {
             )
     }
 
-    pub fn decode_step(
-        &self,
-        logical_position: usize,
-    ) -> Result<Option<DeepseekV4CompressorDecodeStep>, Ds41rtError> {
-        let Some(main) = self.main.as_ref() else {
-            return Ok(None);
-        };
-        let lane = logical_position % main.compress_ratio;
-        let emits = lane + 1 == main.compress_ratio;
-        let rope_position = if emits {
-            Some(
-                logical_position
-                    .checked_add(1)
-                    .and_then(|end| end.checked_sub(main.compress_ratio))
-                    .ok_or_else(|| invalid_compressor("decode RoPE position overflow"))?,
-            )
-        } else {
-            None
-        };
-        Ok(Some(DeepseekV4CompressorDecodeStep {
-            logical_position,
-            ape_row: lane,
-            state_row: logical_position % main.state_rows,
-            emits,
-            compressed_slot: emits.then_some(logical_position / main.compress_ratio),
-            rope_position,
-            rolls_current_window_to_previous: false,
-        }))
-    }
 
     pub fn prefill(
         &self,
@@ -182,86 +153,6 @@ impl DeepseekV4CompressorLayerExecutionPlan {
         }))
     }
 
-    pub fn continuation_prefill(
-        &self,
-        logical_start: usize,
-        source_tokens: usize,
-    ) -> Result<Option<DeepseekV4CompressorContinuationPlan>, Ds41rtError> {
-        let Some(main) = self.main.as_ref() else {
-            return Ok(None);
-        };
-        if source_tokens == 0 {
-            return Err(invalid_compressor(
-                "compressor continuation must contain at least one source token",
-            ));
-        }
-        let logical_end = logical_start
-            .checked_add(source_tokens)
-            .ok_or_else(|| invalid_compressor("continuation logical end overflow"))?;
-        let ratio = main.compress_ratio;
-        let initial_group_index = logical_start / ratio;
-        let initial_group_start = initial_group_index
-            .checked_mul(ratio)
-            .ok_or_else(|| invalid_compressor("continuation group start overflow"))?;
-        let terminal_group_index = logical_end / ratio;
-        let terminal_group_start = terminal_group_index
-            .checked_mul(ratio)
-            .ok_or_else(|| invalid_compressor("continuation cutoff overflow"))?;
-        let complete_groups = terminal_group_index - initial_group_index;
-        let first_output_group_start = (complete_groups > 0).then_some(initial_group_start);
-        let carried_remainder = logical_start - initial_group_start;
-        let terminal_remainder = logical_end - terminal_group_start;
-        let carried_previous_window = if main.overlap && initial_group_start >= ratio {
-            Some(DeepseekV4CompressorStateFill {
-                source_start: initial_group_start - ratio,
-                rows: ratio,
-                state_row_start: 0,
-                ape_row_start: 0,
-            })
-        } else {
-            None
-        };
-        let carried_current_window =
-            (carried_remainder > 0).then_some(DeepseekV4CompressorStateFill {
-                source_start: initial_group_start,
-                rows: carried_remainder,
-                state_row_start: if main.overlap { ratio } else { 0 },
-                ape_row_start: 0,
-            });
-        let terminal_previous_window = if main.overlap && terminal_group_start >= ratio {
-            Some(DeepseekV4CompressorStateFill {
-                source_start: terminal_group_start - ratio,
-                rows: ratio,
-                state_row_start: 0,
-                ape_row_start: 0,
-            })
-        } else {
-            None
-        };
-        let terminal_current_window =
-            (terminal_remainder > 0).then_some(DeepseekV4CompressorStateFill {
-                source_start: terminal_group_start,
-                rows: terminal_remainder,
-                state_row_start: if main.overlap { ratio } else { 0 },
-                ape_row_start: 0,
-            });
-        Ok(Some(DeepseekV4CompressorContinuationPlan {
-            logical_start,
-            source_tokens,
-            logical_end,
-            compress_ratio: ratio,
-            complete_groups,
-            carried_remainder,
-            terminal_remainder,
-            first_output_group_start,
-            output_slot_start: first_output_group_start.map(|start| start / ratio),
-            output_rope_position_stride: ratio,
-            carried_previous_window,
-            carried_current_window,
-            terminal_previous_window,
-            terminal_current_window,
-        }))
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

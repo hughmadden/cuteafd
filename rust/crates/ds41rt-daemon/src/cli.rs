@@ -20,7 +20,6 @@ pub(crate) enum Commands {
     ServeNative(NativeServeArgs),
     BenchRdma(BenchRdmaArgs),
     BenchRdmaRing(BenchRdmaRingArgs),
-    BenchCudaKernels(BenchCudaKernelsArgs),
     TransportCapabilities(TransportCapabilitiesArgs),
 }
 
@@ -141,33 +140,6 @@ pub(crate) struct BenchRdmaRingArgs {
     pub(crate) timeout_ms: u64,
 }
 
-#[derive(Debug, Args)]
-pub(crate) struct BenchCudaKernelsArgs {
-    #[arg(long)]
-    pub(crate) native_lib: Option<PathBuf>,
-    #[arg(long = "kernel", value_delimiter = ',')]
-    pub(crate) kernels: Vec<String>,
-    #[arg(long, default_value_t = 16)]
-    pub(crate) rows: usize,
-    #[arg(long, default_value_t = 1024)]
-    pub(crate) hidden_dim: usize,
-    #[arg(long, default_value_t = 2048)]
-    pub(crate) intermediate_dim: usize,
-    #[arg(long, default_value_t = 1024)]
-    pub(crate) output_dim: usize,
-    #[arg(long, default_value_t = 4096)]
-    pub(crate) vocab: usize,
-    #[arg(long, default_value_t = 8)]
-    pub(crate) routes: usize,
-    #[arg(long, default_value_t = 8)]
-    pub(crate) top_k: usize,
-    #[arg(long, default_value_t = 3)]
-    pub(crate) warmup_iterations: usize,
-    #[arg(long, default_value_t = 10)]
-    pub(crate) iterations: usize,
-    #[arg(long, default_value_t = false)]
-    pub(crate) require_cuda: bool,
-}
 
 
 

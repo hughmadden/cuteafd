@@ -48,9 +48,6 @@ impl HiddenShape {
         Self::bf16_rows(rows, facts.hidden_size)
     }
 
-    pub fn ds4_flash_bf16_rows(rows: usize) -> Self {
-        Self::for_model_bf16(rows, &ModelFacts::default())
-    }
 
     pub fn payload_bytes(self) -> usize {
         self.rows * self.bytes_per_row

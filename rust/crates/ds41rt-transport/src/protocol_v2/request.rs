@@ -137,29 +137,6 @@ impl ExpertProtocolV2Request {
         Ok(request)
     }
 
-    pub fn new_stream_plan(
-        request_id: u64,
-        placement_version: u64,
-        layer_id: u32,
-        hidden_dim: u32,
-        hidden_dtype: ExpertV2Dtype,
-        rows: Vec<ExpertProtocolV2RowDescriptor>,
-        routes: Vec<ExpertProtocolV2RouteEntry>,
-        plan_payload: Vec<u8>,
-    ) -> Result<Self> {
-        let hidden_row_stride_bytes = default_hidden_row_stride_bytes(hidden_dim, hidden_dtype)?;
-        Self::new_stream_plan_with_hidden_stride(
-            request_id,
-            placement_version,
-            layer_id,
-            hidden_dim,
-            hidden_dtype,
-            hidden_row_stride_bytes,
-            rows,
-            routes,
-            plan_payload,
-        )
-    }
 
     #[allow(clippy::too_many_arguments)]
     pub fn new_stream_plan_with_hidden_stride(
@@ -343,11 +320,6 @@ impl ExpertProtocolV2Request {
         request_header_len_from_flags(self.header.flags)
     }
 
-    pub fn payload_offset(&self) -> usize {
-        self.header_len()
-            + self.rows.len() * EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN
-            + self.routes.len() * EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN
-    }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();

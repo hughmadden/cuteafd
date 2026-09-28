@@ -44,12 +44,6 @@ impl DeepseekV4KvCacheFormat {
         }
     }
 
-    pub fn kernel_label(self) -> &'static str {
-        match self {
-            Self::Fp8Ue8m0 => "fp8",
-            Self::Nvfp4 => "nvfp4",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,9 +120,6 @@ pub struct DeepseekV4KvRegionPlan {
 }
 
 impl DeepseekV4KvRegionPlan {
-    pub fn end_offset_bytes(&self) -> usize {
-        self.offset_bytes + self.length_bytes
-    }
 
     pub fn page_offset_bytes(&self, page_index: usize) -> Option<usize> {
         if page_index >= self.page_count {
@@ -160,60 +151,10 @@ impl DeepseekV4PhysicalKvLayerPlan {
         self.regions.iter().map(|region| region.length_bytes).sum()
     }
 
-    pub fn main_slot(&self, logical_position: usize) -> Option<DeepseekV4KvSlot> {
-        let slot = DeepseekV4KvSlot {
-            page_index: logical_position / DS4_KV_SOURCE_PAGE_TOKENS,
-            slot_index: logical_position % DS4_KV_SOURCE_PAGE_TOKENS,
-        };
-        if slot.page_index >= self.region(DeepseekV4KvRegionKind::Main)?.page_count {
-            return None;
-        }
-        Some(slot)
-    }
 
-    /// Return the compressed/index slot emitted after `logical_position`.
-    /// Incomplete compression groups intentionally return `None`.
-    pub fn completed_compressed_slot(&self, logical_position: usize) -> Option<DeepseekV4KvSlot> {
-        if self.compress_ratio == 0 || logical_position.checked_add(1)? % self.compress_ratio != 0 {
-            return None;
-        }
-        let slot = DeepseekV4KvSlot {
-            page_index: logical_position / DS4_KV_SOURCE_PAGE_TOKENS,
-            slot_index: (logical_position % DS4_KV_SOURCE_PAGE_TOKENS) / self.compress_ratio,
-        };
-        if slot.page_index >= self.region(DeepseekV4KvRegionKind::Compressed)?.page_count {
-            return None;
-        }
-        Some(slot)
-    }
 
-    /// Number of completed compressed blocks strictly before a rewind point.
-    /// A block containing the first discarded token must be recomputed.
-    pub fn compressed_blocks_before_rewind(&self, rewind_position: usize) -> usize {
-        if self.compress_ratio == 0 {
-            0
-        } else {
-            rewind_position / self.compress_ratio
-        }
-    }
 
-    pub fn sliding_replay_start(&self, rewind_position: usize) -> usize {
-        rewind_position.saturating_sub(self.sliding_window)
-    }
 
-    /// C=4 pooling overlaps the previous group, so rewind reconstruction starts
-    /// one complete group earlier. C=128 starts at the current group boundary.
-    pub fn compressor_replay_start(&self, rewind_position: usize) -> Option<usize> {
-        if self.compress_ratio == 0 {
-            return None;
-        }
-        let group_start = rewind_position / self.compress_ratio * self.compress_ratio;
-        Some(if self.compress_ratio == 4 {
-            group_start.saturating_sub(self.compress_ratio)
-        } else {
-            group_start
-        })
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,177 +271,12 @@ impl DeepseekV4PhysicalKvPlan {
         self.layers.get(logical_layer_id)
     }
 
-    pub fn persistent_bytes_per_logical_token(&self) -> f64 {
-        self.persistent_bytes as f64 / self.max_logical_tokens as f64
-    }
 
-    pub fn active_sequence_bytes(&self, active_sequences: usize) -> Option<usize> {
-        self.persistent_bytes.checked_add(
-            self.compressor_state_bytes_per_sequence
-                .checked_mul(active_sequences)?,
-        )
-    }
 
-    /// Describe a copy-on-write split inside one 256-source-token page.
-    /// Compressor state is sequence-local and therefore rebuilt by replay;
-    /// only completed compressed/index rows are copied from radix storage.
-    pub fn boundary_copy_plan(
-        &self,
-        valid_source_tokens: usize,
-    ) -> Result<DeepseekV4KvBoundaryCopyPlan, Ds41rtError> {
-        if valid_source_tokens == 0 || valid_source_tokens >= self.source_page_tokens {
-            return Err(invalid_kv(format!(
-                "boundary copy requires 1..{} valid source tokens, got {valid_source_tokens}",
-                self.source_page_tokens - 1
-            )));
-        }
-        let mut layers = Vec::with_capacity(self.layers.len());
-        for layer in &self.layers {
-            let mut spans = Vec::with_capacity(6);
-            let main = layer
-                .region(DeepseekV4KvRegionKind::Main)
-                .ok_or_else(|| invalid_kv("physical layer has no main KV region"))?;
-            push_mla_copy_spans(&mut spans, main, valid_source_tokens, self.cache_format)?;
-
-            let valid_compressed_rows = if layer.compress_ratio == 0 {
-                0
-            } else {
-                valid_source_tokens / layer.compress_ratio
-            };
-            if valid_compressed_rows > 0 {
-                let compressed = layer
-                    .region(DeepseekV4KvRegionKind::Compressed)
-                    .ok_or_else(|| invalid_kv("compressed layer has no compressed KV region"))?;
-                push_mla_copy_spans(
-                    &mut spans,
-                    compressed,
-                    valid_compressed_rows,
-                    self.cache_format,
-                )?;
-                if layer.compress_ratio == 4 {
-                    let indexer = layer
-                        .region(DeepseekV4KvRegionKind::Indexer)
-                        .ok_or_else(|| invalid_kv("C=4 layer has no index KV region"))?;
-                    push_index_copy_spans(&mut spans, indexer, valid_compressed_rows)?;
-                }
-            }
-            layers.push(DeepseekV4KvBoundaryLayerCopyPlan {
-                logical_layer_id: layer.logical_layer_id,
-                source: layer.source,
-                valid_main_rows: valid_source_tokens,
-                valid_compressed_rows,
-                compressor_replay_start_source_slot: layer
-                    .compressor_replay_start(valid_source_tokens),
-                spans,
-            });
-        }
-        Ok(DeepseekV4KvBoundaryCopyPlan {
-            valid_source_tokens,
-            layers,
-        })
-    }
 }
 
-fn push_mla_copy_spans(
-    spans: &mut Vec<DeepseekV4KvPageCopySpan>,
-    region: &DeepseekV4KvRegionPlan,
-    valid_rows: usize,
-    cache_format: DeepseekV4KvCacheFormat,
-) -> Result<(), Ds41rtError> {
-    if valid_rows > region.rows_per_page {
-        return Err(invalid_kv("MLA boundary copy exceeds page rows"));
-    }
-    if cache_format == DeepseekV4KvCacheFormat::Nvfp4 {
-        return push_copy_span(
-            spans,
-            region,
-            DeepseekV4KvPagePlane::Payload,
-            0,
-            valid_rows,
-            DS4_KV_NVFP4_BYTES_PER_ROW,
-        );
-    }
-    push_copy_span(
-        spans,
-        region,
-        DeepseekV4KvPagePlane::Payload,
-        0,
-        valid_rows,
-        DS4_KV_PAYLOAD_BYTES_PER_ROW,
-    )?;
-    push_copy_span(
-        spans,
-        region,
-        DeepseekV4KvPagePlane::Scale,
-        region
-            .rows_per_page
-            .checked_mul(DS4_KV_PAYLOAD_BYTES_PER_ROW)
-            .ok_or_else(|| invalid_kv("MLA scale-plane offset overflow"))?,
-        valid_rows,
-        DS4_KV_UE8M0_FOOTER_BYTES_PER_ROW,
-    )
-}
 
-fn push_index_copy_spans(
-    spans: &mut Vec<DeepseekV4KvPageCopySpan>,
-    region: &DeepseekV4KvRegionPlan,
-    valid_rows: usize,
-) -> Result<(), Ds41rtError> {
-    if valid_rows > region.rows_per_page {
-        return Err(invalid_kv("index boundary copy exceeds page rows"));
-    }
-    push_copy_span(
-        spans,
-        region,
-        DeepseekV4KvPagePlane::Payload,
-        0,
-        valid_rows,
-        DS4_INDEX_FP8_BYTES_PER_ROW,
-    )?;
-    push_copy_span(
-        spans,
-        region,
-        DeepseekV4KvPagePlane::Scale,
-        region
-            .rows_per_page
-            .checked_mul(DS4_INDEX_FP8_BYTES_PER_ROW)
-            .ok_or_else(|| invalid_kv("index scale-plane offset overflow"))?,
-        valid_rows,
-        DS4_INDEX_FP32_SCALE_BYTES_PER_ROW,
-    )
-}
 
-fn push_copy_span(
-    spans: &mut Vec<DeepseekV4KvPageCopySpan>,
-    region: &DeepseekV4KvRegionPlan,
-    plane: DeepseekV4KvPagePlane,
-    offset_within_page_bytes: usize,
-    valid_rows: usize,
-    bytes_per_row: usize,
-) -> Result<(), Ds41rtError> {
-    if valid_rows == 0 {
-        return Ok(());
-    }
-    let length_bytes = valid_rows
-        .checked_mul(bytes_per_row)
-        .ok_or_else(|| invalid_kv("boundary copy span byte count overflow"))?;
-    let end = offset_within_page_bytes
-        .checked_add(length_bytes)
-        .ok_or_else(|| invalid_kv("boundary copy span end overflow"))?;
-    if end > region.bytes_per_page {
-        return Err(invalid_kv("boundary copy span exceeds physical page"));
-    }
-    spans.push(DeepseekV4KvPageCopySpan {
-        region: region.kind,
-        plane,
-        region_offset_bytes: region.offset_bytes,
-        page_count: region.page_count,
-        bytes_per_page: region.bytes_per_page,
-        offset_within_page_bytes,
-        length_bytes,
-    });
-    Ok(())
-}
 
 fn push_region(
     regions: &mut Vec<DeepseekV4KvRegionPlan>,

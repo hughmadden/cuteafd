@@ -6,12 +6,7 @@ pub(crate) use local_client::LocalTp4Client;
 pub use local::{LocalVerbsExpertConnection, RingBudget, RingReservation};
 use anyhow::{bail, Context, Result};
 use ds41rt_core::{ExpertRequest, ExpertResponse};
-use ds41rt_ffi::{
-    c_char_array_to_string, Ds41rtDeviceBuffer, Ds41rtHostBuffer, Ds41rtRdmaRcCompletionStats,
-    Ds41rtRdmaRcEndpointBufferView, Ds41rtRdmaRcEndpointInfo, NativeLibrary,
-    DS41RT_DEVICE_BUFFER_FLAG_MAPPED_HOST, DS41RT_HOST_BUFFER_FLAG_MAPPED,
-    DS41RT_HOST_BUFFER_FLAG_PINNED,
-};
+use ds41rt_ffi::{c_char_array_to_string, Ds41rtDeviceBuffer, Ds41rtHostBuffer, Ds41rtRdmaRcCompletionStats, Ds41rtRdmaRcEndpointBufferView, Ds41rtRdmaRcEndpointInfo, NativeLibrary, DS41RT_DEVICE_BUFFER_FLAG_MAPPED_HOST, DS41RT_HOST_BUFFER_FLAG_MAPPED, DS41RT_HOST_BUFFER_FLAG_PINNED};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -25,25 +20,14 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::synthetic::{
-    expert_response_from_protocol_v2_response, protocol_v2_request_from_expert_request,
-    ProtocolV2ExecutorResponseRef, ProtocolV2ExpertExecutor, ProtocolV2RequestDevicePayload,
-    SyntheticRouteExecutor,
-};
-use crate::{
-    is_connection_closed, verbs_host_preflight, ExpertProtocolV2FrameBuffer,
-    ExpertProtocolV2Request, ExpertProtocolV2RequestView, ExpertProtocolV2Response,
-    ExpertProtocolV2ResponseHeader, ExpertProtocolV2ResponseView, ExpertProtocolV2Status,
-    ExpertV2Dtype, TcpTransportConfig, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN,
-    EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN,
-};
+use crate::synthetic::{expert_response_from_protocol_v2_response, protocol_v2_request_from_expert_request, ProtocolV2ExecutorResponseRef, ProtocolV2ExpertExecutor, ProtocolV2RequestDevicePayload, SyntheticRouteExecutor};
+use crate::{is_connection_closed, verbs_host_preflight, ExpertProtocolV2FrameBuffer, ExpertProtocolV2Request, ExpertProtocolV2RequestView, ExpertProtocolV2Response, ExpertProtocolV2ResponseHeader, ExpertProtocolV2ResponseView, ExpertProtocolV2Status, ExpertV2Dtype, TcpTransportConfig, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN};
 
 const VERBS_HOST_RECV_WR_ID: u64 = 0x7256_1001;
 const VERBS_HOST_SEND_WR_ID: u64 = 0x7256_1002;
 const VERBS_HOST_RDMA_RING_DEPTH: usize = 8;
 const VERBS_HOST_MAPPED_RDMA_RING_MAX_DEPTH: usize = 32;
 const VERBS_HOST_RDMA_RING_SLOT_BYTES: usize = 8 * 1024 * 1024;
-const VERBS_HOST_LANE_FANOUT_COMMAND_SPIN: Duration = Duration::from_millis(1);
 const PROTOCOL_V2_TCP_TIMING_ENV: &str = "DS41RT_PROTOCOL_V2_TCP_TIMING";
 const VERBS_HOST_RDMA_DEVICE_MAP_ENV: &str = "DS41RT_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP";
 static VERBS_HOST_PSN_COUNTER: AtomicU32 = AtomicU32::new(1);
@@ -682,21 +666,6 @@ pub(crate) struct VerbsHostProtocolV2CqHarvester {
 }
 
 impl VerbsHostProtocolV2CqHarvester {
-    pub(crate) fn new(execution_lane: u32) -> Result<Arc<Self>> {
-        let (tx, rx) = mpsc::channel();
-        let join = thread::Builder::new()
-            .name(format!("verbs-v2-cq-l{execution_lane}"))
-            .spawn(move || verbs_host_protocol_v2_cq_harvester_worker(execution_lane, rx))
-            .with_context(|| {
-                format!("spawning verbs-host CQ harvester for lane {execution_lane}")
-            })?;
-        Ok(Arc::new(Self {
-            execution_lane,
-            tx,
-            join: Mutex::new(Some(join)),
-        }))
-    }
-
     fn wait_for_response(
         &self,
         endpoint: &NativeRdmaEndpoint,
@@ -754,103 +723,6 @@ impl Drop for VerbsHostProtocolV2CqHarvester {
     }
 }
 
-fn verbs_host_protocol_v2_cq_harvester_worker(
-    execution_lane: u32,
-    rx: mpsc::Receiver<VerbsHostProtocolV2CqHarvesterCommand>,
-) {
-    let mut active = VecDeque::<VerbsHostProtocolV2CqPollRequest>::new();
-    let mut shutdown = false;
-    while !shutdown {
-        if active.is_empty() {
-            match rx.recv() {
-                Ok(VerbsHostProtocolV2CqHarvesterCommand::Poll(request)) => {
-                    active.push_back(request)
-                }
-                Ok(VerbsHostProtocolV2CqHarvesterCommand::Shutdown) | Err(_) => break,
-            }
-        }
-        loop {
-            match rx.try_recv() {
-                Ok(VerbsHostProtocolV2CqHarvesterCommand::Poll(request)) => {
-                    active.push_back(request)
-                }
-                Ok(VerbsHostProtocolV2CqHarvesterCommand::Shutdown) => {
-                    shutdown = true;
-                    break;
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    shutdown = true;
-                    break;
-                }
-            }
-        }
-
-        let scan_count = active.len();
-        let mut made_progress = false;
-        for _ in 0..scan_count {
-            let request = active
-                .pop_front()
-                .expect("verbs-host CQ harvester scan count matches active requests");
-            if Instant::now() >= request.deadline {
-                let _ = request.response_tx.send(Err(anyhow::anyhow!(
-                    "verbs-host lane {execution_lane} CQ harvester timed out waiting for a response completion"
-                )));
-                continue;
-            }
-            let result = request.library.rdma_rc_endpoint_try_poll(
-                request.endpoint_handle as *mut c_void,
-                request.max_send_completions,
-                request.max_recv_completions,
-            );
-            match result {
-                Ok(mut stats) if stats.recv_completions > 0 => {
-                    made_progress = true;
-                    stats.send_completions = stats
-                        .send_completions
-                        .saturating_add(request.completed_send_completions);
-                    stats.poll_iterations = stats
-                        .poll_iterations
-                        .saturating_add(request.poll_iterations);
-                    let _ = request.response_tx.send(Ok(stats));
-                }
-                Ok(stats) if stats.send_completions > 0 => {
-                    made_progress = true;
-                    let mut request = request;
-                    request.max_send_completions = request
-                        .max_send_completions
-                        .saturating_sub(stats.send_completions);
-                    request.completed_send_completions = request
-                        .completed_send_completions
-                        .saturating_add(stats.send_completions);
-                    request.poll_iterations = request
-                        .poll_iterations
-                        .saturating_add(stats.poll_iterations);
-                    active.push_back(request);
-                }
-                Ok(stats) => {
-                    let mut request = request;
-                    request.poll_iterations = request
-                        .poll_iterations
-                        .saturating_add(stats.poll_iterations);
-                    active.push_back(request);
-                }
-                Err(error) => {
-                    made_progress = true;
-                    let _ = request.response_tx.send(Err(error));
-                }
-            }
-        }
-        if !made_progress {
-            std::hint::spin_loop();
-        }
-    }
-    while let Some(request) = active.pop_front() {
-        let _ = request.response_tx.send(Err(anyhow::anyhow!(
-            "verbs-host lane {execution_lane} CQ harvester shut down with a response pending"
-        )));
-    }
-}
 
 struct VerbsHostProtocolV2PinnedResponseFrame {
     library: Arc<NativeLibrary>,
@@ -1171,41 +1043,11 @@ pub struct VerbsHostProtocolV2ResponseStreamStats {
     pub response_executor_id: u64,
 }
 
-pub(crate) struct VerbsHostProtocolV2LaneFanoutResponse {
-    pub response_stats_by_stream: Vec<VerbsHostProtocolV2ResponseStreamStats>,
-    pub chunks: Vec<VerbsHostProtocolV2ResponseChunk>,
-}
 
-pub(crate) struct VerbsHostProtocolV2LaneFanoutPending {
-    response_rx: tokio::sync::oneshot::Receiver<Result<VerbsHostProtocolV2LaneFanoutResponse>>,
-}
 
-impl VerbsHostProtocolV2LaneFanoutPending {
-    pub(crate) fn wait(self) -> Result<VerbsHostProtocolV2LaneFanoutResponse> {
-        self.response_rx
-            .blocking_recv()
-            .context("receiving verbs-host lane fanout completion")?
-    }
-}
 
-#[derive(Clone)]
-pub(crate) struct VerbsHostProtocolV2LaneFanoutClient {
-    inner: Arc<VerbsHostProtocolV2LaneFanoutClientInner>,
-}
 
-struct VerbsHostProtocolV2LaneFanoutClientInner {
-    tx: mpsc::Sender<VerbsHostProtocolV2LaneFanoutCommand>,
-    join: Mutex<Option<thread::JoinHandle<()>>>,
-}
 
-enum VerbsHostProtocolV2LaneFanoutCommand {
-    Roundtrip {
-        requests: Vec<ExpertProtocolV2Request>,
-        response_tx: tokio::sync::oneshot::Sender<Result<VerbsHostProtocolV2LaneFanoutResponse>>,
-    },
-    Reset,
-    Shutdown,
-}
 
 #[derive(Clone)]
 pub struct VerbsHostProtocolV2PersistentClient {
@@ -1477,254 +1319,9 @@ impl Drop for VerbsHostProtocolV2PersistentClientInner {
     }
 }
 
-impl VerbsHostProtocolV2LaneFanoutClient {
-    pub(crate) fn new(
-        addrs: Vec<SocketAddr>,
-        config: TcpTransportConfig,
-        execution_lane: u32,
-    ) -> Result<Self> {
-        anyhow::ensure!(
-            !addrs.is_empty(),
-            "verbs-host lane fanout requires at least one target"
-        );
-        let (tx, rx) = mpsc::channel();
-        let join = thread::Builder::new()
-            .name(format!("verbs-v2-fanout-lane-{execution_lane}"))
-            .spawn(move || {
-                verbs_host_protocol_v2_lane_fanout_worker(addrs, config, execution_lane, rx)
-            })
-            .with_context(|| format!("spawning verbs-host lane {execution_lane} fanout worker"))?;
-        Ok(Self {
-            inner: Arc::new(VerbsHostProtocolV2LaneFanoutClientInner {
-                tx,
-                join: Mutex::new(Some(join)),
-            }),
-        })
-    }
 
-    pub(crate) fn enqueue(
-        &self,
-        requests: Vec<ExpertProtocolV2Request>,
-    ) -> Result<VerbsHostProtocolV2LaneFanoutPending> {
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        self.inner
-            .tx
-            .send(VerbsHostProtocolV2LaneFanoutCommand::Roundtrip {
-                requests,
-                response_tx,
-            })
-            .context("submitting verbs-host lane fanout")?;
-        Ok(VerbsHostProtocolV2LaneFanoutPending { response_rx })
-    }
 
-    pub(crate) fn reset(&self) {
-        let _ = self
-            .inner
-            .tx
-            .send(VerbsHostProtocolV2LaneFanoutCommand::Reset);
-    }
-}
 
-impl Drop for VerbsHostProtocolV2LaneFanoutClientInner {
-    fn drop(&mut self) {
-        let _ = self.tx.send(VerbsHostProtocolV2LaneFanoutCommand::Shutdown);
-        let Some(join) = self.join.get_mut().ok().and_then(Option::take) else {
-            return;
-        };
-        if thread::current().id() != join.thread().id() {
-            let _ = join.join();
-        }
-    }
-}
-
-fn verbs_host_protocol_v2_lane_fanout_worker(
-    addrs: Vec<SocketAddr>,
-    config: TcpTransportConfig,
-    execution_lane: u32,
-    rx: mpsc::Receiver<VerbsHostProtocolV2LaneFanoutCommand>,
-) {
-    let mut sessions = (0..addrs.len()).map(|_| None).collect::<Vec<_>>();
-    let mut spin_until = None;
-    loop {
-        let command = loop {
-            match rx.try_recv() {
-                Ok(command) => break Some(command),
-                Err(mpsc::TryRecvError::Disconnected) => break None,
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-            if spin_until.is_some_and(|deadline| Instant::now() < deadline) {
-                std::hint::spin_loop();
-                continue;
-            }
-            break rx.recv().ok();
-        };
-        let Some(command) = command else {
-            break;
-        };
-        match command {
-            VerbsHostProtocolV2LaneFanoutCommand::Roundtrip {
-                requests,
-                response_tx,
-            } => {
-                let result = verbs_host_protocol_v2_lane_fanout_roundtrip(
-                    &addrs,
-                    &config,
-                    execution_lane,
-                    &mut sessions,
-                    requests,
-                );
-                if result.is_err() {
-                    sessions.iter_mut().for_each(|session| *session = None);
-                }
-                let _ = response_tx.send(result);
-                spin_until = Instant::now().checked_add(VERBS_HOST_LANE_FANOUT_COMMAND_SPIN);
-            }
-            VerbsHostProtocolV2LaneFanoutCommand::Reset => {
-                sessions.iter_mut().for_each(|session| *session = None);
-                spin_until = None;
-            }
-            VerbsHostProtocolV2LaneFanoutCommand::Shutdown => break,
-        }
-    }
-}
-
-fn verbs_host_protocol_v2_lane_fanout_roundtrip(
-    addrs: &[SocketAddr],
-    config: &TcpTransportConfig,
-    execution_lane: u32,
-    sessions: &mut [Option<VerbsHostProtocolV2PersistentClientSession>],
-    requests: Vec<ExpertProtocolV2Request>,
-) -> Result<VerbsHostProtocolV2LaneFanoutResponse> {
-    anyhow::ensure!(
-        requests.len() == addrs.len() && sessions.len() == addrs.len(),
-        "verbs-host lane fanout received {} requests for {} targets and {} sessions",
-        requests.len(),
-        addrs.len(),
-        sessions.len()
-    );
-    let host_count = requests.len();
-    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut response_receivers = Vec::with_capacity(host_count);
-    let mut pending_by_host = (0..host_count)
-        .map(|_| VecDeque::new())
-        .collect::<Vec<VecDeque<VerbsHostProtocolV2PendingChunkRoundtrip>>>();
-
-    for (host_index, request) in requests.into_iter().enumerate() {
-        if sessions[host_index]
-            .as_ref()
-            .map(|session| session.fits(&request))
-            .transpose()?
-            == Some(false)
-        {
-            sessions[host_index] = None;
-        }
-        if sessions[host_index].is_none() {
-            sessions[host_index] = Some(VerbsHostProtocolV2PersistentClientSession::connect(
-                addrs[host_index],
-                config,
-                &request,
-                execution_lane,
-                None,
-            )?);
-        }
-        let timing = sessions[host_index]
-            .as_mut()
-            .expect("verbs-host lane fanout session connected above")
-            .post_chunk_request(&request, config)?;
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        pending_by_host[host_index].push_back(VerbsHostProtocolV2PendingChunkRoundtrip::new(
-            VerbsHostProtocolV2QueuedChunkCommand {
-                request,
-                stream_id: host_index,
-                chunk_tx: chunk_tx.clone(),
-                response_tx,
-            },
-            timing,
-        ));
-        response_receivers.push(response_rx);
-    }
-    drop(chunk_tx);
-
-    let deadline = Instant::now()
-        .checked_add(config.timeout)
-        .context("verbs-host lane fanout deadline overflow")?;
-    let busy_poll_started = Instant::now();
-    let timing_enabled = config.timing;
-    while pending_by_host.iter().any(|pending| !pending.is_empty()) {
-        if Instant::now() >= deadline {
-            bail!(
-                "verbs-host lane {execution_lane} fanout timed out with {} hosts pending",
-                pending_by_host
-                    .iter()
-                    .filter(|pending| !pending.is_empty())
-                    .count()
-            );
-        }
-        let mut made_progress = false;
-        for host_index in 0..host_count {
-            if pending_by_host[host_index].is_empty() {
-                continue;
-            }
-            made_progress |= sessions[host_index]
-                .as_mut()
-                .context("verbs-host lane fanout lost an active session")?
-                .try_progress_chunk_requests_with_timing(
-                    &mut pending_by_host[host_index],
-                    config,
-                    timing_enabled,
-                )?;
-        }
-        if !made_progress {
-            if busy_poll_started.elapsed() < Duration::from_millis(1) {
-                std::hint::spin_loop();
-                continue;
-            }
-            let host_index = pending_by_host
-                .iter()
-                .position(|pending| !pending.is_empty())
-                .context("verbs-host lane fanout lost its pending host")?;
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let session = sessions[host_index]
-                .as_mut()
-                .context("verbs-host lane fanout lost its event-wait session")?;
-            let stats = session.endpoint.poll_stats(0, 1, remaining)?;
-            session.apply_chunk_completion_stats(
-                &mut pending_by_host[host_index],
-                config,
-                stats,
-            )?;
-        }
-    }
-
-    let response_stats_by_stream = response_receivers
-        .into_iter()
-        .map(|response_rx| {
-            response_rx
-                .blocking_recv()
-                .context("receiving verbs-host lane fanout stream completion")?
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let response_frames = response_stats_by_stream
-        .iter()
-        .map(|stats| stats.response_frames)
-        .sum::<usize>();
-    let mut chunks = Vec::with_capacity(response_frames);
-    for _ in 0..response_frames {
-        chunks.push(
-            chunk_rx
-                .try_recv()
-                .context("verbs-host lane fanout completed without its response chunk")?,
-        );
-    }
-    anyhow::ensure!(
-        chunk_rx.try_recv().is_err(),
-        "verbs-host lane fanout produced more chunks than its stream completions"
-    );
-    Ok(VerbsHostProtocolV2LaneFanoutResponse {
-        response_stats_by_stream,
-        chunks,
-    })
-}
 
 fn verbs_host_protocol_v2_persistent_client_worker(
     addr: SocketAddr,
@@ -4084,18 +3681,6 @@ impl VerbsHostMappedRdmaRing {
         Self::connect_inner(peer, transport, config, None)
     }
 
-    pub fn connect_on_device(
-        peer: &str,
-        transport: &TcpTransportConfig,
-        config: VerbsHostMappedRdmaRingConfig,
-        rdma_device: &str,
-    ) -> Result<Self> {
-        anyhow::ensure!(
-            !rdma_device.trim().is_empty(),
-            "mapped RDMA ring device name is empty"
-        );
-        Self::connect_inner(peer, transport, config, Some(rdma_device))
-    }
 
     fn connect_inner(
         peer: &str,
@@ -4318,24 +3903,7 @@ impl VerbsHostMappedRdmaRing {
         Ok(())
     }
 
-    pub fn send_copy(&mut self, bytes: &[u8]) -> Result<()> {
-        anyhow::ensure!(
-            !bytes.is_empty() && bytes.len() <= self.layout.slot_capacity_bytes,
-            "mapped RDMA ring payload bytes {} must be in 1..={}",
-            bytes.len(),
-            self.layout.slot_capacity_bytes
-        );
-        let slot = self.reserve_send_slot()?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), slot.host_ptr, bytes.len());
-        }
-        self.post_reserved_send(bytes.len())
-    }
 
-    pub fn reclaim_send_completions(&mut self) -> Result<usize> {
-        self.reclaim_send_completions_with_stats()
-            .map(|stats| stats.send_completions)
-    }
 
     pub fn reclaim_send_completions_with_stats(&mut self) -> Result<VerbsHostMappedRdmaPollStats> {
         if self.send_in_flight == 0 {
@@ -4370,9 +3938,6 @@ impl VerbsHostMappedRdmaRing {
         Ok(poll_stats)
     }
 
-    pub fn try_recv_slot(&mut self) -> Result<Option<VerbsHostMappedRdmaSlot>> {
-        self.try_recv_slot_with_stats().map(|(slot, _)| slot)
-    }
 
     pub fn try_recv_slot_with_stats(
         &mut self,
@@ -4399,13 +3964,6 @@ impl VerbsHostMappedRdmaRing {
         self.wait_recv_slot_with_timeout_and_stats(Duration::from_secs(1))
     }
 
-    pub fn wait_recv_slot_with_timeout(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<VerbsHostMappedRdmaSlot> {
-        self.wait_recv_slot_with_timeout_and_stats(timeout)
-            .map(|(slot, _)| slot)
-    }
 
     pub fn wait_recv_slot_with_timeout_and_stats(
         &mut self,
@@ -5155,10 +4713,6 @@ mod persistent_tests {
     use super::*;
     use crate::{ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind};
 
-    #[test]
-    fn shared_cq_harvester_starts_and_stops_without_registered_qps() {
-        drop(VerbsHostProtocolV2CqHarvester::new(3).unwrap());
-    }
 
     #[test]
     fn rdma_device_map_selects_device_by_control_destination_ip() {

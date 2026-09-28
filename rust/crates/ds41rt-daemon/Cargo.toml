@@ -23,7 +23,6 @@ ds41rt-loader = { path = "../ds41rt-loader" }
 ds41rt-transport = { path = "../ds41rt-transport" }
 io-uring.workspace = true
 libc.workspace = true
-pyo3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

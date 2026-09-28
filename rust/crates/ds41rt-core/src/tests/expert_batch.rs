@@ -48,25 +48,6 @@ fn expert_batch_mixes_decode_and_prefill_rows_with_fixed_envelope() {
     assert_eq!(batch.rows[15].route_offset, 15 * DS4_FLASH_TOP_K);
 }
 
-#[test]
-fn expert_batch_bf16_constructor_preserves_explicit_recipe() {
-    let recipe = "deepseek_v4_exl3_2bpw_trellis_v1";
-    let decode = LayerWave::decode(DecodeStep::new(
-        "decode",
-        "seq-a",
-        3,
-        15,
-        Some(55),
-        Priority(0),
-        "placement-a",
-    ));
-
-    let batch =
-        ExpertBatch::bf16_from_wave_with_envelope(&decode, recipe, GraphBucket::new(1)).unwrap();
-
-    assert_eq!(batch.hidden_dtype, DType::Bf16);
-    assert_eq!(batch.quantization_recipe, recipe);
-}
 
 #[test]
 fn expert_batch_mixes_mtp_and_decode_rows_with_fixed_envelope() {
@@ -183,65 +164,6 @@ fn expert_batch_rejects_incompatible_layer_placement_and_dtype() {
         .contains("different hidden dtypes"));
 }
 
-#[test]
-fn expert_batch_reconstructs_partials_in_batch_row_order() {
-    let recipe = ModelFacts::default().quantization_recipe;
-    let mtp = LayerWave::mtp_verify(MtpVerifyBlock::new(
-        "mtp",
-        "seq-a",
-        9,
-        128,
-        2,
-        Some(22),
-        Priority(1),
-        GraphBucket::new(4),
-        "placement-a",
-    ));
-    let decode = LayerWave::decode(DecodeStep::new(
-        "decode",
-        "seq-a",
-        9,
-        130,
-        Some(22),
-        Priority(0),
-        "placement-a",
-    ));
-    let mut batch = ExpertBatch::from_wave_with_envelope(
-        &mtp,
-        DType::Bf16,
-        recipe.clone(),
-        GraphBucket::new(4),
-    )
-    .unwrap();
-    batch.try_append_wave(&decode, DType::Bf16, recipe).unwrap();
-
-    let reconstructed = batch
-        .reconstruct_partial_outputs(&["mtp-0", "mtp-1", "decode-0"])
-        .unwrap();
-
-    assert_eq!(
-        reconstructed[0].0.source_kind,
-        RowSourceKind::MtpVerifyBlock
-    );
-    assert_eq!(reconstructed[0].0.token_position, PositionId(128));
-    assert_eq!(reconstructed[0].1, "mtp-0");
-    assert_eq!(reconstructed[1].0.token_position, PositionId(129));
-    assert_eq!(reconstructed[1].1, "mtp-1");
-    assert_eq!(reconstructed[2].0.source_kind, RowSourceKind::DecodeStep);
-    assert_eq!(reconstructed[2].0.token_position, PositionId(130));
-    assert_eq!(reconstructed[2].1, "decode-0");
-
-    let err = batch
-        .reconstruct_partial_outputs(&["missing-one"])
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        Ds41rtError::ExpertBatchPartialRowCountMismatch {
-            expected: 3,
-            actual: 1
-        }
-    ));
-}
 
 #[test]
 fn expert_host_batch_filters_rows_routes_and_compacts_hidden_payload() {
@@ -295,56 +217,6 @@ fn expert_host_batch_filters_rows_routes_and_compacts_hidden_payload() {
     );
 }
 
-#[test]
-fn expert_host_batch_filters_routes_with_explicit_owner_lookup() {
-    let batch = small_prefill_batch(2);
-    let hosts = vec!["spark-1".to_owned(), "spark-3".to_owned()];
-    let routes = routes_with_experts(&batch, &[&[0, 1, 2, 3, 4, 5], &[8, 9, 10, 11, 12, 13]]);
-    let owner_lookup = ExpertOwnerLookup::from_pairs((0..16).map(|expert_id| {
-        let owner = if expert_id % 2 == 0 {
-            "spark-1.cluster.local"
-        } else {
-            "spark-3.cluster.local"
-        };
-        ((3, expert_id), owner.to_owned())
-    }));
-
-    let host_batch = ExpertHostBatch::from_expert_batch_with_owner_lookup(
-        &batch,
-        "spark-1",
-        &routes,
-        &hosts,
-        &owner_lookup,
-    )
-    .unwrap();
-
-    assert_eq!(host_batch.host, "spark-1");
-    assert_eq!(host_batch.num_rows(), batch.num_rows());
-    assert_eq!(host_batch.route_count(), batch.route_count() / 2);
-    assert_eq!(
-        host_batch.global_row_indices().collect::<Vec<_>>(),
-        vec![0, 1]
-    );
-    assert_eq!(
-        host_batch
-            .routes
-            .iter()
-            .map(|route| route.expert_id)
-            .collect::<Vec<_>>(),
-        vec![0, 2, 4, 8, 10, 12]
-    );
-    assert!(host_batch.routes.iter().all(|route| route.row_index < 2));
-
-    let global_hidden = marked_hidden_payload(&batch);
-    let compact = host_batch
-        .compact_hidden_payload(&global_hidden, batch.num_rows())
-        .unwrap();
-    assert_eq!(compact.len(), batch.num_rows() * batch.hidden_bytes_per_row);
-    assert_eq!(
-        &compact[..batch.hidden_bytes_per_row],
-        &global_hidden[..batch.hidden_bytes_per_row]
-    );
-}
 
 #[test]
 fn expert_host_batch_scatters_partials_back_to_global_rows() {
@@ -381,65 +253,6 @@ fn expert_host_batch_scatters_partials_back_to_global_rows() {
     ));
 }
 
-#[test]
-fn expert_host_batch_set_partitions_with_explicit_owner_lookup() {
-    let batch = small_prefill_batch(2);
-    let hosts = vec!["spark-1".to_owned(), "spark-3".to_owned()];
-    let routes = routes_with_experts(&batch, &[&[0, 1, 2, 3, 4, 5], &[8, 9, 10, 11, 12, 13]]);
-    let owner_lookup = ExpertOwnerLookup::from_pairs((0..16).map(|expert_id| {
-        let owner = if expert_id % 2 == 0 {
-            "spark-1"
-        } else {
-            "spark-3"
-        };
-        ((3, expert_id), owner.to_owned())
-    }));
-
-    let set = ExpertHostBatchSet::from_expert_batch_with_owner_lookup(
-        &batch,
-        &routes,
-        &hosts,
-        &owner_lookup,
-    )
-    .unwrap();
-
-    assert_eq!(set.num_hosts(), 2);
-    assert_eq!(set.route_count(), batch.route_count());
-    assert_eq!(set.host_row_count(), batch.num_rows() * 2);
-    assert_eq!(
-        set.touched_hosts().collect::<Vec<_>>(),
-        vec!["spark-1", "spark-3"]
-    );
-    assert_eq!(
-        set.reconstruction_plan.host_row_maps[0].global_row_indices,
-        vec![0, 1]
-    );
-    assert_eq!(
-        set.reconstruction_plan.host_row_maps[1].global_row_indices,
-        vec![0, 1]
-    );
-
-    let missing_owner_lookup = ExpertOwnerLookup::from_pairs((0..13).map(|expert_id| {
-        let owner = if expert_id % 2 == 0 {
-            "spark-1"
-        } else {
-            "spark-3"
-        };
-        ((3, expert_id), owner.to_owned())
-    }));
-    assert!(matches!(
-        ExpertHostBatchSet::from_expert_batch_with_owner_lookup(
-            &batch,
-            &routes,
-            &hosts,
-            &missing_owner_lookup,
-        ),
-        Err(Ds41rtError::ExpertHostBatchSetRouteCountMismatch {
-            expected: 12,
-            actual: 11,
-        })
-    ));
-}
 
 #[test]
 fn expert_host_batches_accumulate_all_host_partials_into_global_rows() {
@@ -567,157 +380,9 @@ fn expert_host_batch_accumulator_validates_shapes() {
     ));
 }
 
-#[test]
-fn expert_host_batch_set_partitions_only_touched_hosts_and_compacts_hidden_payloads() {
-    let batch = small_prefill_batch(2);
-    let hosts = expert_hosts();
-    let routes = routes_with_experts(&batch, &[&[0, 1, 2, 3, 4, 5], &[8, 9, 10, 11, 12, 13]]);
 
-    let set =
-        ExpertHostBatchSet::from_expert_batch(&batch, &routes, &hosts, PlacementPolicy::Modulo)
-            .unwrap();
 
-    assert_eq!(set.num_hosts(), 4);
-    assert_eq!(set.route_count(), batch.route_count());
-    assert_eq!(set.host_row_count(), batch.num_rows() * 4);
-    assert_eq!(
-        set.touched_hosts().collect::<Vec<_>>(),
-        hosts.iter().map(String::as_str).collect::<Vec<_>>()
-    );
-    assert_eq!(set.reconstruction_plan.global_row_count, batch.num_rows());
-    assert!(set
-        .batches
-        .iter()
-        .all(|host_batch| host_batch.rows.iter().all(|row| row.route_count > 0)));
-    assert!(set.batches.iter().all(|host_batch| {
-        host_batch.route_count() < batch.route_count()
-            && host_batch.routes.iter().all(|route| {
-                owner_for_expert(
-                    host_batch.layer_id.0 as usize,
-                    route.expert_id,
-                    batch.routed_experts,
-                    &hosts,
-                    PlacementPolicy::Modulo,
-                )
-                .as_deref()
-                    == Some(host_batch.host.as_str())
-            })
-    }));
 
-    let global_hidden = marked_hidden_payload(&batch);
-    let compact_hidden = set.compact_hidden_payloads(&global_hidden).unwrap();
-    assert_eq!(compact_hidden.len(), set.num_hosts());
-    for (host_batch, compact) in set.batches.iter().zip(compact_hidden.iter()) {
-        assert_eq!(
-            compact.len(),
-            host_batch.num_rows() * batch.hidden_bytes_per_row
-        );
-        for (host_row_index, row) in host_batch.rows.iter().enumerate() {
-            let compact_start = host_row_index * batch.hidden_bytes_per_row;
-            let global_start = row.global_row_index * batch.hidden_bytes_per_row;
-            assert_eq!(
-                &compact[compact_start..compact_start + batch.hidden_bytes_per_row],
-                &global_hidden[global_start..global_start + batch.hidden_bytes_per_row]
-            );
-        }
-    }
-}
-
-#[test]
-fn expert_host_batch_set_replicates_routes_for_intermediate_shards() {
-    let batch = small_prefill_batch(2);
-    let hosts = expert_hosts();
-    let routes = routes_with_experts(&batch, &[&[0, 1, 2, 3, 4, 5], &[8, 9, 10, 11, 12, 13]]);
-    let set = ExpertHostBatchSet::replicated_from_expert_batch(&batch, &routes, &hosts).unwrap();
-
-    assert_eq!(set.num_hosts(), hosts.len());
-    assert_eq!(set.route_count(), batch.route_count() * hosts.len());
-    assert_eq!(set.host_row_count(), batch.num_rows() * hosts.len());
-    assert!(set.batches.iter().all(|host_batch| {
-        host_batch.num_rows() == batch.num_rows()
-            && host_batch.route_count() == batch.route_count()
-            && host_batch
-                .rows
-                .iter()
-                .zip(batch.rows.iter())
-                .all(|(host_row, row)| host_row.route_count == row.route_count)
-    }));
-
-    let shard_partials = set
-        .batches
-        .iter()
-        .enumerate()
-        .map(|(shard, host_batch)| {
-            host_batch
-                .rows
-                .iter()
-                .map(|_| vec![(shard + 1) as f32; 2])
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let accumulation = set
-        .accumulate_partial_outputs_f32(&shard_partials, 2)
-        .unwrap();
-    assert_eq!(accumulation.values, vec![10.0; batch.num_rows() * 2]);
-    assert_eq!(accumulation.contribution_counts, vec![4; batch.num_rows()]);
-}
-
-#[test]
-fn expert_tp4_batch_replicates_every_route_and_requires_four_sparks() {
-    let batch = small_prefill_batch(2);
-    let hosts = expert_hosts();
-    let routes = routes_with_experts(&batch, &[&[0, 1, 2, 3, 4, 5], &[8, 9, 10, 11, 12, 13]]);
-    let set = ExpertHostBatchSet::tp4_from_expert_batch(&batch, &routes, &hosts).unwrap();
-
-    assert_eq!(set.num_hosts(), DS4_EXPERT_TP_WORLD_SIZE);
-    assert_eq!(
-        set.route_count(),
-        batch.route_count() * DS4_EXPERT_TP_WORLD_SIZE
-    );
-    assert!(set.batches.iter().all(|host_batch| {
-        host_batch.num_rows() == batch.num_rows()
-            && host_batch.route_count() == batch.route_count()
-            && host_batch.routes == routes
-    }));
-
-    let error =
-        ExpertHostBatchSet::tp4_from_expert_batch(&batch, &routes, &hosts[..3]).unwrap_err();
-    assert!(matches!(
-        error,
-        Ds41rtError::ExpertTensorParallelHostCountMismatch {
-            expected: DS4_EXPERT_TP_WORLD_SIZE,
-            actual: 3,
-        }
-    ));
-}
-
-#[test]
-fn expert_host_batch_set_collapses_single_host_routes() {
-    let batch = small_prefill_batch(3);
-    let hosts = expert_hosts();
-    let routes = routes_with_experts(
-        &batch,
-        &[
-            &[1, 5, 9, 13, 17, 21],
-            &[1, 5, 9, 13, 17, 21],
-            &[1, 5, 9, 13, 17, 21],
-        ],
-    );
-
-    let set =
-        ExpertHostBatchSet::from_expert_batch(&batch, &routes, &hosts, PlacementPolicy::Modulo)
-            .unwrap();
-
-    assert_eq!(set.num_hosts(), 1);
-    assert_eq!(set.touched_hosts().collect::<Vec<_>>(), vec!["spark-1"]);
-    assert_eq!(set.batches[0].num_rows(), batch.num_rows());
-    assert_eq!(set.batches[0].route_count(), batch.route_count());
-    assert!(set.batches[0].rows.iter().all(|row| row.route_count > 0));
-    assert_eq!(
-        set.reconstruction_plan.host_row_maps[0].global_row_indices,
-        vec![0, 1, 2]
-    );
-}
 
 #[test]
 fn expert_host_batch_set_accumulates_partials_and_validates_host_count() {

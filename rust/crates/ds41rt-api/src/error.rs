@@ -54,15 +54,6 @@ pub(crate) fn invalid_request(
     }
 }
 
-pub(crate) fn runtime_error(message: impl std::fmt::Display) -> ApiError {
-    ApiError {
-        status: StatusCode::BAD_GATEWAY,
-        message: message.to_string(),
-        param: None,
-        code: Some("backend_error".to_owned()),
-    }
-}
-
 /// Bound an upstream parse/validation detail before it reaches the response
 /// body or logs. Long attacker-controlled inputs (e.g. a 100 KB string in a
 /// wrongly-typed field) must not be echoed back verbatim — the

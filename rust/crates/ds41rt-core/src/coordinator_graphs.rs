@@ -60,30 +60,7 @@ impl CoordinatorGraphShape {
         }
     }
 
-    pub fn accepts_layer(self, layer_id: LayerId) -> bool {
-        let layer = layer_id.0 as usize;
-        if layer >= GLM52_TOTAL_LAYERS_WITH_MTP {
-            return false;
-        }
-        match self {
-            Self::CoordAttention | Self::CoordCompressedAttention => true,
-            Self::CoordDense => layer < GLM52_FIRST_K_DENSE_REPLACE,
-            Self::CoordSparseA | Self::CoordSparseB => layer >= GLM52_FIRST_K_DENSE_REPLACE,
-        }
-    }
 
-    pub fn validate_layer(self, layer_id: LayerId) -> Result<(), Ds41rtError> {
-        if self.accepts_layer(layer_id) {
-            return Ok(());
-        }
-        Err(Ds41rtError::GraphBufferContractInvalid {
-            reason: format!(
-                "{} cannot be used for GLM-5.2 layer {}",
-                self.label(),
-                layer_id.0
-            ),
-        })
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -102,13 +79,6 @@ pub struct CoordinatorGraphKey {
 }
 
 impl CoordinatorGraphKey {
-    pub fn glm52_bf16(
-        shape: CoordinatorGraphShape,
-        mode: LayerWaveMode,
-        active_rows: usize,
-    ) -> Result<Self, Ds41rtError> {
-        Self::new(shape, mode, active_rows, DType::Bf16)
-    }
 
     pub fn new(
         shape: CoordinatorGraphShape,
@@ -132,30 +102,6 @@ pub struct CoordinatorGraphInstancePlan {
 }
 
 impl CoordinatorGraphInstancePlan {
-    pub fn glm52_bf16_all() -> Vec<Self> {
-        let mut plans = Vec::with_capacity(COORDINATOR_GRAPH_INSTANCE_COUNT);
-        for shape in COORDINATOR_GRAPH_SHAPES {
-            plans.push(Self::new(
-                CoordinatorGraphKey {
-                    shape,
-                    row_bucket: GraphBucket::decode(),
-                    dtype: DType::Bf16,
-                },
-                shape,
-            ));
-            for row_capacity in COORDINATOR_GRAPH_PREFILL_BUCKET_ROWS {
-                plans.push(Self::new(
-                    CoordinatorGraphKey {
-                        shape,
-                        row_bucket: GraphBucket::new(row_capacity),
-                        dtype: DType::Bf16,
-                    },
-                    shape,
-                ));
-            }
-        }
-        plans
-    }
 
     fn new(key: CoordinatorGraphKey, shape: CoordinatorGraphShape) -> Self {
         Self {

@@ -65,9 +65,6 @@ impl DeepseekV4AttentionLayerSource {
         }
     }
 
-    pub fn is_dspark(self) -> bool {
-        matches!(self, Self::Dspark { .. })
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,9 +99,6 @@ impl DeepseekV4AttentionLayerPlan {
         )
     }
 
-    pub fn uses_yarn(&self) -> bool {
-        self.uses_compressor()
-    }
 
     /// Position-indexed compressor ring. One history window is followed by an
     /// equally sized speculative guard, so rejected suffixes cannot overwrite
@@ -117,20 +111,7 @@ impl DeepseekV4AttentionLayerPlan {
         }
     }
 
-    pub fn completed_compressed_blocks(&self, logical_tokens: usize) -> usize {
-        if self.compress_ratio == 0 {
-            0
-        } else {
-            logical_tokens / self.compress_ratio
-        }
-    }
 
-    /// Persistent attention cache slots, excluding the compressor's FP32
-    /// incremental state. The sliding ring is always allocated at full width,
-    /// matching the native reference implementation.
-    pub fn persistent_kv_slots(&self, max_logical_tokens: usize) -> usize {
-        self.sliding_window + self.completed_compressed_blocks(max_logical_tokens)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -225,9 +206,6 @@ impl DeepseekV4AttentionPlan {
         &self.layers[..self.target_layer_count]
     }
 
-    pub fn dspark_layers(&self) -> &[DeepseekV4AttentionLayerPlan] {
-        &self.layers[self.target_layer_count..]
-    }
 
     /// Fail closed on the dimensions implemented by SparkInfer's unified DSV4
     /// sparse-MLA and mHC kernels. Flash and the current Pro preview both pass.

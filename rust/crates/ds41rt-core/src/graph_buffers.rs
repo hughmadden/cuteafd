@@ -191,168 +191,10 @@ impl ExpertGraphInstancePool {
         }
     }
 
-    pub fn register_contract(
-        &mut self,
-        contract: ExpertGraphBufferContract,
-        instances: usize,
-    ) -> Result<(), Ds41rtError> {
-        if instances == 0 {
-            return Err(Ds41rtError::GraphBufferContractInvalid {
-                reason: "graph pool registration requires at least one instance".to_owned(),
-            });
-        }
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.contract.key == contract.key)
-        {
-            if entry.contract != contract {
-                return Err(Ds41rtError::GraphBufferContractInvalid {
-                    reason: format!(
-                        "graph pool key {:?} registered with incompatible buffer contract",
-                        entry.contract.key
-                    ),
-                });
-            }
-            let start = entry.total_instances;
-            entry.total_instances += instances;
-            entry
-                .available_instance_indices
-                .extend(start..entry.total_instances);
-            return Ok(());
-        }
 
-        self.entries.push(ExpertGraphPoolEntry {
-            contract,
-            total_instances: instances,
-            acquisitions: 0,
-            reuses: 0,
-            available_instance_indices: (0..instances).collect(),
-        });
-        Ok(())
-    }
 
-    pub fn register_ds4_flash_bf16(
-        &mut self,
-        layer_id: LayerId,
-        mode: LayerWaveMode,
-        row_bucket: GraphBucket,
-        quantization_recipe: impl Into<String>,
-        instances: usize,
-    ) -> Result<ExpertGraphKey, Ds41rtError> {
-        self.register_for_model_bf16(
-            &ModelFacts::default(),
-            layer_id,
-            mode,
-            row_bucket,
-            quantization_recipe,
-            instances,
-        )
-    }
 
-    pub fn register_for_model_bf16(
-        &mut self,
-        facts: &ModelFacts,
-        layer_id: LayerId,
-        mode: LayerWaveMode,
-        row_bucket: GraphBucket,
-        quantization_recipe: impl Into<String>,
-        instances: usize,
-    ) -> Result<ExpertGraphKey, Ds41rtError> {
-        let contract = ExpertGraphBufferContract::for_model_bf16(
-            facts,
-            layer_id,
-            mode,
-            row_bucket,
-            quantization_recipe,
-        )?;
-        let key = contract.key.clone();
-        self.register_contract(contract, instances)?;
-        Ok(key)
-    }
 
-    pub fn acquire_for_host_batch(
-        &mut self,
-        batch: &ExpertHostBatch,
-    ) -> Result<ExpertGraphPoolLease, Ds41rtError> {
-        let Some((entry_index, counts)) = self.best_entry_for_host_batch(batch)? else {
-            return Err(Ds41rtError::GraphBufferContractInvalid {
-                reason: format!(
-                    "no registered graph pool entry accepts layer {} host {} rows {} dtype {:?} bucket {} recipe {}",
-                    batch.layer_id.0,
-                    batch.host,
-                    batch.num_rows(),
-                    batch.hidden_dtype,
-                    batch.graph_bucket.row_capacity,
-                    batch.quantization_recipe
-                ),
-            });
-        };
-        let entry = &mut self.entries[entry_index];
-        let Some(instance_index) = entry.available_instance_indices.pop() else {
-            return Err(Ds41rtError::GraphBufferContractInvalid {
-                reason: format!(
-                    "graph pool exhausted for layer {} bucket {} instances {} active {}",
-                    entry.contract.key.layer_id.0,
-                    entry.contract.key.row_bucket.row_capacity,
-                    entry.total_instances,
-                    entry.in_use_instances()
-                ),
-            });
-        };
-        if entry.acquisitions > 0 {
-            entry.reuses += 1;
-        }
-        entry.acquisitions += 1;
-        let lease = ExpertGraphPoolLease {
-            lease_id: self.next_lease_id,
-            key: entry.contract.key.clone(),
-            instance_index,
-            active_counts: counts,
-            fixed_buffer_bytes: entry.contract.fixed_buffer_bytes(),
-        };
-        self.next_lease_id += 1;
-        self.active_leases.push(lease.clone());
-        Ok(lease)
-    }
-
-    pub fn acquire_for_host_batch_set(
-        &mut self,
-        set: &ExpertHostBatchSet,
-    ) -> Result<ExpertGraphHostBatchSetLease, Ds41rtError> {
-        let mut host_leases = Vec::with_capacity(set.batches.len());
-        let mut total_fixed_buffer_bytes = 0_usize;
-        let mut active_counts = ExpertGraphActiveCounts {
-            rows: 0,
-            routes: 0,
-            expert_tiles: 0,
-        };
-        for batch in &set.batches {
-            match self.acquire_for_host_batch(batch) {
-                Ok(lease) => {
-                    total_fixed_buffer_bytes += lease.fixed_buffer_bytes;
-                    active_counts.rows += lease.active_counts.rows;
-                    active_counts.routes += lease.active_counts.routes;
-                    active_counts.expert_tiles += lease.active_counts.expert_tiles;
-                    host_leases.push(ExpertGraphHostBatchLease {
-                        host: batch.host.clone(),
-                        lease,
-                    });
-                }
-                Err(error) => {
-                    for host_lease in host_leases.into_iter().rev() {
-                        let _ = self.release(host_lease.lease);
-                    }
-                    return Err(error);
-                }
-            }
-        }
-        Ok(ExpertGraphHostBatchSetLease {
-            host_leases,
-            total_fixed_buffer_bytes,
-            active_counts,
-        })
-    }
 
     pub fn release(&mut self, lease: ExpertGraphPoolLease) -> Result<(), Ds41rtError> {
         let Some(active_index) = self
@@ -397,15 +239,6 @@ impl ExpertGraphInstancePool {
         Ok(())
     }
 
-    pub fn release_host_batch_set(
-        &mut self,
-        lease: ExpertGraphHostBatchSetLease,
-    ) -> Result<(), Ds41rtError> {
-        for host_lease in lease.host_leases.into_iter().rev() {
-            self.release(host_lease.lease)?;
-        }
-        Ok(())
-    }
 
     pub fn stats(&self) -> ExpertGraphPoolStats {
         let total_instances = self
@@ -477,20 +310,6 @@ pub struct ExpertGraphBufferContract {
 }
 
 impl ExpertGraphBufferContract {
-    pub fn ds4_flash_bf16(
-        layer_id: LayerId,
-        mode: LayerWaveMode,
-        row_bucket: GraphBucket,
-        quantization_recipe: impl Into<String>,
-    ) -> Result<Self, Ds41rtError> {
-        Self::for_model_bf16(
-            &ModelFacts::default(),
-            layer_id,
-            mode,
-            row_bucket,
-            quantization_recipe,
-        )
-    }
 
     pub fn for_model_bf16(
         facts: &ModelFacts,
@@ -560,13 +379,7 @@ impl ExpertGraphBufferContract {
         })
     }
 
-    pub fn request_payload_bytes(&self) -> usize {
-        self.hidden_rows.bytes()
-    }
 
-    pub fn response_payload_bytes(&self) -> usize {
-        self.partial_outputs.bytes()
-    }
 
     pub fn fixed_buffer_bytes(&self) -> usize {
         self.hidden_rows.bytes()

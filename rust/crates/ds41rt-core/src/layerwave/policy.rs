@@ -24,14 +24,6 @@ impl Default for PrefillChunkPolicy {
 }
 
 impl PrefillChunkPolicy {
-    pub fn latency_smoke(chunk_tokens: usize) -> Self {
-        Self {
-            chunk_tokens: chunk_tokens.max(1),
-            max_prefill_tokens_per_iteration: chunk_tokens.max(1),
-            max_active_prefill_chunks: 1,
-            decode_priority: true,
-        }
-    }
 
     pub fn graph_bucket(&self) -> GraphBucket {
         GraphBucket::new(self.chunk_tokens.max(1))

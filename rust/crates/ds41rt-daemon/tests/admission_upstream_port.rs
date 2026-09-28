@@ -771,10 +771,12 @@ mod http_503_mapping {
     }
 
     #[tokio::test]
-    async fn admission_queue_overflow_maps_to_503() {
+    async fn admission_queue_overflow_maps_to_429() {
         // vLLM: test_queue_overflow_maps_to_503 / test_max_queued_tokens_maps_to_503.
-        // The native router's bounded queue is the waiters' admission gate:
-        // a full queue rejects the chat request with HTTP 503.
+        // The native router's bounded queue is the waiters' admission gate. A
+        // full queue is transient back-pressure, so it answers 429 with
+        // Retry-After (pinned by native_queue_pressure_is_429_with_retry_after_and_stats);
+        // 503 is reserved for a closed queue.
         let (queue, _receive) = tokio::sync::mpsc::channel::<native_v41::NativeRequest>(2);
         for _ in 0..2 {
             queue.try_send(dummy_job()).unwrap();
@@ -783,7 +785,8 @@ mod http_503_mapping {
         let addr = serve(router).await;
         let (status, response) =
             http_request(addr, "POST", "/v1/chat/completions", &chat_body(1)).await;
-        assert_eq!(status, 503, "{response}");
+        assert_eq!(status, 429, "{response}");
+        assert!(response.to_ascii_lowercase().contains("retry-after:"), "{response}");
         assert!(response.contains("\"error\""), "{response}");
     }
 

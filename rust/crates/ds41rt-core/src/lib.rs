@@ -17,7 +17,6 @@ pub use engram::{EngramBatch, EngramError, EngramHashes, EngramHistory, EngramPr
 mod attention_geometry;
 mod constants;
 mod coordinator_graphs;
-mod cpu_affinity;
 mod debug_expert;
 mod deepseek_v4_compressor;
 mod deepseek_v4_kv;
@@ -38,7 +37,6 @@ mod model;
 mod node;
 mod placement;
 mod replicated_expert_schedule;
-mod tiny;
 mod transport_metrics;
 
 pub use attention_geometry::{
@@ -76,7 +74,6 @@ pub use coordinator_graphs::{
     COORDINATOR_GRAPH_INSTANCE_COUNT, COORDINATOR_GRAPH_PREFILL_BUCKET_ROWS,
     COORDINATOR_GRAPH_SHAPES,
 };
-pub use cpu_affinity::pin_current_thread_to_cpu;
 pub use debug_expert::{
     ExpertRequest, ExpertRequestHeader, ExpertResponse, ExpertResponseHeader, ExpertRow,
     ExpertWaveMetadata, RouteEntry,
@@ -142,7 +139,6 @@ pub use replicated_expert_schedule::{
     ReplicatedExpertScheduleConfig, ReplicatedExpertScheduler, ReplicatedExpertTieSeedMode,
     INACTIVE_REPLICATED_EXPERT_GROUP, MAX_REPLICATED_EXPERT_GROUPS, TIE_SEED_FIXED_REQUEST_ID,
 };
-pub use tiny::deterministic_tiny_completion;
 pub use transport_metrics::{
     TransportCapabilities, TransportPrefillBandwidthMeasurement, TransportRttMeasurement,
 };

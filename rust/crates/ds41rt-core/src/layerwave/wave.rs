@@ -196,17 +196,8 @@ impl LayerWave {
         self.hidden_shape.payload_bytes()
     }
 
-    pub fn roundtrip_bytes_per_host(&self) -> usize {
-        self.payload_bytes_per_direction() * 2
-    }
 
-    pub fn routed_expert_assignments(&self) -> usize {
-        self.num_rows() * self.route_metadata.top_k
-    }
 
-    pub fn average_rows_per_expert(&self) -> f64 {
-        self.routed_expert_assignments() as f64 / self.route_metadata.routed_experts as f64
-    }
 
     pub fn can_mix_with(&self, other: &Self) -> bool {
         self.mix_rejection_reason(other).is_none()

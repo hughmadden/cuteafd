@@ -19,21 +19,7 @@ pub enum KvCacheDType {
 }
 
 impl KvCacheDType {
-    pub fn parse_cache_dtype(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "bf16" | "bfloat16" => Some(Self::Bf16),
-            "f16" | "fp16" | "float16" => Some(Self::F16),
-            "fp8" | "f8" => Some(Self::Fp8),
-            "nvfp4" | "fp4" | "f4" => Some(Self::Nvfp4),
-            "f32" | "fp32" | "float32" => Some(Self::F32),
-            _ => None,
-        }
-    }
 
-    /// Compatibility alias for imported GLM runtime callers.
-    pub fn parse_glm52_cache_dtype(value: &str) -> Option<Self> {
-        Self::parse_cache_dtype(value)
-    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -115,48 +101,12 @@ pub struct KvCacheConfig {
 }
 
 impl KvCacheConfig {
-    pub fn deepseek_v4_hybrid_bf16(max_tokens: usize, facts: &ModelFacts) -> Self {
-        Self::try_deepseek_v4_hybrid_bf16(max_tokens, facts)
-            .expect("DeepSeek V4 KV cache requires valid model attention geometry")
-    }
 
-    pub fn try_deepseek_v4_hybrid_bf16(
-        max_tokens: usize,
-        facts: &ModelFacts,
-    ) -> Result<Self, Ds41rtError> {
-        let attention = DeepseekV4AttentionPlan::from_model_facts(facts)?;
-        let indexer_layer_ids = attention
-            .target_layers()
-            .iter()
-            .filter(|layer| layer.uses_indexer())
-            .map(|layer| layer.logical_layer_id)
-            .collect::<Vec<_>>();
-        Ok(Self {
-            layout: KvLayout::DeepseekV4HybridBf16,
-            layers: facts.num_hidden_layers,
-            key_value_width: facts.head_dim,
-            dtype: KvCacheDType::Bf16,
-            mla_representation: MlaKvCacheRepresentation::NormalizedRotated,
-            dsa_indexer_layers: indexer_layer_ids.len(),
-            indexer_layer_ids,
-            dsa_index_head_dim: facts.index_head_dim,
-            fp8_scale_metadata_bytes_per_token: 0,
-            max_tokens,
-        })
-    }
 
     pub fn glm52_phase0(max_tokens: usize) -> Self {
         Self::glm52_compressed_bf16(max_tokens)
     }
 
-    pub fn glm52_compressed(max_tokens: usize, dtype: KvCacheDType) -> Option<Self> {
-        match dtype {
-            KvCacheDType::Bf16 => Some(Self::glm52_compressed_bf16(max_tokens)),
-            KvCacheDType::Fp8 => Some(Self::glm52_compressed_fp8(max_tokens)),
-            KvCacheDType::Nvfp4 => Some(Self::glm52_compressed_nvfp4(max_tokens)),
-            KvCacheDType::F16 | KvCacheDType::F32 => None,
-        }
-    }
 
     pub fn glm52_compressed_bf16(max_tokens: usize) -> Self {
         Self {
@@ -173,90 +123,13 @@ impl KvCacheConfig {
         }
     }
 
-    pub fn glm52_compressed_fp8(max_tokens: usize) -> Self {
-        Self {
-            layout: KvLayout::Glm52CompressedFp8,
-            layers: GLM52_NUM_HIDDEN_LAYERS,
-            key_value_width: GLM52_MLA_KV_LORA_RANK + GLM52_MLA_QK_ROPE_HEAD_DIM,
-            dtype: KvCacheDType::Fp8,
-            mla_representation: MlaKvCacheRepresentation::RawProjected,
-            dsa_indexer_layers: GLM52_DSA_INDEXER_LAYERS,
-            indexer_layer_ids: GLM52_DSA_INDEXER_LAYER_IDS.to_vec(),
-            dsa_index_head_dim: GLM52_DSA_INDEX_HEAD_DIM,
-            fp8_scale_metadata_bytes_per_token: 0,
-            max_tokens,
-        }
-    }
 
-    pub fn glm52_compressed_nvfp4(max_tokens: usize) -> Self {
-        Self {
-            layout: KvLayout::Glm52CompressedNvfp4,
-            layers: GLM52_NUM_HIDDEN_LAYERS,
-            key_value_width: GLM52_MLA_KV_LORA_RANK + GLM52_MLA_QK_ROPE_HEAD_DIM,
-            dtype: KvCacheDType::Nvfp4,
-            mla_representation: MlaKvCacheRepresentation::RawProjected,
-            dsa_indexer_layers: GLM52_DSA_INDEXER_LAYERS,
-            indexer_layer_ids: GLM52_DSA_INDEXER_LAYER_IDS.to_vec(),
-            dsa_index_head_dim: GLM52_DSA_INDEX_HEAD_DIM,
-            fp8_scale_metadata_bytes_per_token: 0,
-            max_tokens,
-        }
-    }
 
-    pub fn glm52_expanded_debug_bf16(max_tokens: usize) -> Self {
-        Self {
-            layout: KvLayout::ExpandedDebugOnly,
-            layers: GLM52_NUM_HIDDEN_LAYERS,
-            key_value_width: GLM52_HIDDEN_SIZE,
-            dtype: KvCacheDType::Bf16,
-            mla_representation: MlaKvCacheRepresentation::RawProjected,
-            dsa_indexer_layers: 0,
-            indexer_layer_ids: Vec::new(),
-            dsa_index_head_dim: 0,
-            fp8_scale_metadata_bytes_per_token: 0,
-            max_tokens,
-        }
-    }
 
-    pub fn with_mla_representation(mut self, representation: MlaKvCacheRepresentation) -> Self {
-        self.mla_representation = representation;
-        self
-    }
 
-    pub fn with_deepseek_v4_dspark_layers(mut self, facts: &ModelFacts) -> Self {
-        if self.layout == KvLayout::DeepseekV4HybridBf16 {
-            self.layers = facts.total_transformer_blocks();
-        }
-        self
-    }
 
-    pub fn with_mtp_layer(mut self) -> Self {
-        self.layers = GLM52_TOTAL_LAYERS_WITH_MTP;
-        if matches!(
-            self.layout,
-            KvLayout::Glm52CompressedBf16
-                | KvLayout::Glm52CompressedFp8
-                | KvLayout::Glm52CompressedNvfp4
-        ) {
-            self.dsa_indexer_layers = GLM52_DSA_INDEXER_LAYER_IDS_WITH_MTP.len();
-            self.indexer_layer_ids = GLM52_DSA_INDEXER_LAYER_IDS_WITH_MTP.to_vec();
-        }
-        self
-    }
 
-    pub fn layout_label(&self) -> &'static str {
-        match self.layout {
-            KvLayout::DeepseekV4HybridBf16 => "deepseek-v4-hybrid-bf16",
-            KvLayout::Glm52CompressedBf16 => "glm52-compressed-bf16",
-            KvLayout::Glm52CompressedFp8 => "glm52-compressed-fp8",
-            KvLayout::Glm52CompressedNvfp4 => "glm52-compressed-nvfp4",
-            KvLayout::ExpandedDebugOnly => "expanded-debug-only",
-        }
-    }
 
-    pub fn dtype_label(&self) -> &'static str {
-        self.dtype.label()
-    }
 
     pub fn main_mla_bytes_per_token(&self) -> usize {
         if self.layout == KvLayout::Glm52CompressedFp8 {
@@ -340,42 +213,8 @@ impl KvCacheConfig {
         self.layer_bytes_per_token(layer_id) * token_count
     }
 
-    pub fn layer_base_offset_bytes(&self, layer_id: LayerId) -> Option<usize> {
-        let layer_index = usize::try_from(layer_id.0).ok()?;
-        if layer_index >= self.layers {
-            return None;
-        }
-        let mut offset = 0_usize;
-        for prior_layer in 0..layer_index {
-            let layer_span = self
-                .layer_bytes_per_token(LayerId(prior_layer as u32))
-                .checked_mul(self.max_tokens)?;
-            offset = offset.checked_add(layer_span)?;
-        }
-        Some(offset)
-    }
 
-    pub fn descriptor_payload_bytes(&self, descriptor: &KvBlockDescriptor) -> Option<usize> {
-        let layer_index = usize::try_from(descriptor.layer_id.0).ok()?;
-        if layer_index >= self.layers {
-            return None;
-        }
-        let token_start = usize::try_from(descriptor.token_start.0).ok()?;
-        let token_end = token_start.checked_add(descriptor.token_count)?;
-        if token_end > self.max_tokens {
-            return None;
-        }
-        Some(self.layer_payload_bytes(descriptor.layer_id, descriptor.token_count))
-    }
 
-    pub fn descriptor_offset_bytes(&self, descriptor: &KvBlockDescriptor) -> Option<usize> {
-        self.descriptor_payload_bytes(descriptor)?;
-        let layer_bytes = self.layer_bytes_per_token(descriptor.layer_id);
-        let token_start = usize::try_from(descriptor.token_start.0).ok()?;
-        let token_offset = layer_bytes.checked_mul(token_start)?;
-        self.layer_base_offset_bytes(descriptor.layer_id)?
-            .checked_add(token_offset)
-    }
 
     pub fn bytes_per_token(&self) -> usize {
         match self.layout {

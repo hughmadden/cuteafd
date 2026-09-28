@@ -113,9 +113,6 @@ impl KvCacheAllocator {
         Ok(id)
     }
 
-    pub fn pause(&mut self, id: u64) -> Result<(), Ds41rtError> {
-        self.transition(id, KvReservationState::Paused)
-    }
 
     pub fn resume(&mut self, id: u64) -> Result<(), Ds41rtError> {
         self.transition(id, KvReservationState::Active)
@@ -361,24 +358,12 @@ impl KvCacheAllocator {
         discarded
     }
 
-    pub fn pause_write(&mut self, id: u64) -> Result<(), Ds41rtError> {
-        self.transition_write(id, KvWriteState::Paused)
-    }
 
-    pub fn resume_write(&mut self, id: u64) -> Result<(), Ds41rtError> {
-        self.transition_write(id, KvWriteState::Pending)
-    }
 
     pub fn write(&self, id: u64) -> Option<&KvWriteRecord> {
         self.writes.get(&id)
     }
 
-    pub fn writes_for_reservation(&self, reservation_id: u64) -> Vec<&KvWriteRecord> {
-        self.writes
-            .values()
-            .filter(|write| write.reservation_id == reservation_id)
-            .collect()
-    }
 
     pub fn writes_for_reservation_layer(
         &self,

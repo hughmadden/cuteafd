@@ -69,11 +69,6 @@ pub struct TensorLoadOptions {
 }
 
 impl TensorLoadOptions {
-    pub fn verify_hashes() -> Self {
-        Self {
-            compute_sha256: true,
-        }
-    }
 }
 
 pub fn load_tensor_bytes(catalog: &TensorCatalog, tensor_name: &str) -> Result<LoadedTensor> {

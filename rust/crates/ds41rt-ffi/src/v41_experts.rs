@@ -206,7 +206,7 @@ fn expected_expert_geometry(
         (false, 6) => Some((384, 768, 768, 6)),
         // Pure TP6EP1: one disjoint 384-column intermediate slice per rank with
         // no storage padding (384 is already 128-aligned).
-        (false, 7) => Some((384, 384, 384, 6)),
+        (false, 7) if kernel_intermediate == 384 => Some((384, 384, 384, 6)),
         _ => None,
     }
 }

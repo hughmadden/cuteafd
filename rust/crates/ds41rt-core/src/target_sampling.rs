@@ -66,13 +66,6 @@ pub enum TargetSamplingError {
 }
 
 impl TargetSamplingError {
-    /// True when the error is the caller's request rather than a model failure.
-    pub fn is_bad_request(&self) -> bool {
-        matches!(
-            self,
-            Self::MaskWidth { .. } | Self::InvalidParameter(_)
-        )
-    }
 }
 
 /// Validated sampling parameters carried by one served request.
@@ -173,10 +166,6 @@ impl TargetSamplingParams {
         self.temperature < GREEDY_TEMPERATURE_EPS || self.top_k == Some(1)
     }
 
-    /// Any filter that narrows the distribution beyond raw temperature.
-    pub fn has_filters(self) -> bool {
-        self.top_k.is_some() || self.min_p > 0.0 || self.top_p < 1.0
-    }
 
     /// Deterministic uniform in `[0, 1)` for a request-local decode position.
     /// SplitMix64 over `(domain, seed, position)`, where `domain` separates the

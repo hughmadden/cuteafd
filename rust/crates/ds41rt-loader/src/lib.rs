@@ -45,7 +45,6 @@ mod catalog;
 mod dspark_format;
 mod exl3_format;
 mod expert_format;
-mod placement;
 mod snapshot;
 mod tensors;
 mod tokenizer;
@@ -79,7 +78,6 @@ pub use expert_format::{
     NativeFp4Expert, NativeFp4Projection, NativeFp4ProjectionKind, NativeFp4TpExpertShard,
     NativeFp4TpProjectionShard, NativeFp4TpTensorWindow, NATIVE_FP4_K_BLOCK,
 };
-pub use placement::{assignments_by_owner, build_load_plan};
 pub use snapshot::{
     default_hf_home, empty_catalog_for_snapshot, model_cache_dir, resolve_snapshot,
     resolve_snapshot_at_revision, SnapshotResolution,

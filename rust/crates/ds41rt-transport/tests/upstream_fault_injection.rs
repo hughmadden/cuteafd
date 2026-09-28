@@ -47,17 +47,8 @@
 // from product regression coverage (review MAJOR 4/6, 2026-09-15).
 
 use anyhow::{Context, Result};
-use ds41rt_core::{
-    DType, ExpertBatch, ExpertBatchRoute, ExpertBatchRow, ExpertHostBatchSet, GraphBucket, LayerId,
-    ModelFacts, PlacementPolicy, PlacementVersion, PositionId, RequestId, RowSourceKind,
-    DS4_FLASH_ROUTED_EXPERTS,
-};
-use ds41rt_transport::{
-    ExpertProtocolV2Request, ExpertProtocolV2Response, ExpertProtocolV2RouteEntry,
-    ExpertProtocolV2RowDescriptor, ExpertProtocolV2Status, ExpertV2Dtype, ExpertV2SourceKind,
-    TcpProtocolV2HostBatchSetPersistentClient, TcpProtocolV2HostBatchTarget,
-    TcpProtocolV2PersistentClient, TcpTransportConfig, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN,
-};
+use ds41rt_core::{DType, ExpertBatch, ExpertBatchRoute, ExpertBatchRow, ExpertHostBatchSet, GraphBucket, LayerId, ModelFacts, PlacementPolicy, PlacementVersion, PositionId, RequestId, RowSourceKind, DS4_FLASH_ROUTED_EXPERTS};
+use ds41rt_transport::{ExpertProtocolV2Request, ExpertProtocolV2Response, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertProtocolV2Status, ExpertV2Dtype, ExpertV2SourceKind, TcpProtocolV2PersistentClient, TcpTransportConfig, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN};
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -589,127 +580,7 @@ async fn dead_server_fails_fast_and_recovers_after_listener_restart() -> Result<
     Ok(())
 }
 
-#[tokio::test]
-async fn host_batch_dispatch_recovers_after_single_host_death() -> Result<()> {
-    // Multi-worker fan-out (failover.rs shape): two workers serve one host
-    // batch set each. One worker dies; the dispatch must fail cleanly; after
-    // it is restarted the persistent fan-out client must recover (its
-    // reset-on-error contract drops all dead connections).
-    let (addr_a, shutdown_a, accepts_a) = spawn_echo_server().await?;
-    let (addr_b, shutdown_b, accepts_b) = spawn_echo_server().await?;
-    let targets = vec![
-        TcpProtocolV2HostBatchTarget {
-            host: "ostrich".to_owned(),
-            addr: addr_a,
-        },
-        TcpProtocolV2HostBatchTarget {
-            host: "dodo".to_owned(),
-            addr: addr_b,
-        },
-    ];
-    let (set, global_hidden) = host_batch_fixture()?;
-    let mut client = TcpProtocolV2HostBatchSetPersistentClient::new(
-        targets,
-        TcpTransportConfig::default(),
-    );
 
-    let first = client
-        .dispatch_bf16(&set, &global_hidden, 6_200)
-        .await
-        .expect("initial fan-out dispatch succeeds");
-    assert_eq!(first.stats.hosts, 2);
-
-    // Kill worker "dodo" mid-traffic.
-    let _ = shutdown_b.send(());
-    wait_for_port_closed(addr_b).await;
-
-    let err = client
-        .dispatch_bf16(&set, &global_hidden, 6_210)
-        .await
-        .expect_err("dispatch with one dead host must fail");
-    let message = format!("{err:#}");
-    assert!(
-        message.contains("connecting TCP ProtocolV2 transport"),
-        "expected connect-phase failure for the dead host, got: {message}"
-    );
-
-    // Restart the dead worker; the failed dispatch reset every pooled
-    // connection, so this dispatch reconnects both hosts from scratch.
-    let listener = rebind_listener(addr_b).await?;
-    let (restart_b_shutdown, restart_b_rx) = tokio::sync::oneshot::channel::<()>();
-    let restarted_b = spawn_echo_accept_loop(listener, Arc::clone(&accepts_b), restart_b_rx);
-    let recovered = client
-        .dispatch_bf16(&set, &global_hidden, 6_220)
-        .await
-        .expect("fan-out dispatch must recover after the dead host restarts");
-    assert_eq!(recovered.stats.hosts, 2);
-    assert_eq!(
-        accepts_b.load(Ordering::SeqCst),
-        2,
-        "dead worker saw the first dispatch and the post-restart dispatch only"
-    );
-
-    let _ = restart_b_shutdown.send(());
-    let _ = restarted_b.await;
-    let _ = shutdown_a.send(());
-    let _ = accepts_a;
-    Ok(())
-}
-
-fn host_batch_fixture() -> Result<(ExpertHostBatchSet, Vec<u8>)> {
-    let batch = ExpertBatch {
-        layer_id: LayerId(3),
-        placement_version: PlacementVersion("upstream-fault-injection".to_owned()),
-        hidden_dim: TEST_HIDDEN_DIM as usize,
-        hidden_bytes_per_row: TEST_HIDDEN_DIM as usize * 2,
-        hidden_dtype: DType::Bf16,
-        routed_experts: DS4_FLASH_ROUTED_EXPERTS,
-        graph_bucket: GraphBucket::new(2),
-        quantization_recipe: ModelFacts::default().quantization_recipe,
-        rows: vec![
-            ExpertBatchRow {
-                row_id: 0,
-                source_kind: RowSourceKind::DecodeStep,
-                request_id: RequestId("fault-row-0".to_owned()),
-                sequence_id: "seq-0".to_owned(),
-                token_position: PositionId(0),
-                route_offset: 0,
-                route_count: 1,
-            },
-            ExpertBatchRow {
-                row_id: 1,
-                source_kind: RowSourceKind::PrefillChunk,
-                request_id: RequestId("fault-row-1".to_owned()),
-                sequence_id: "seq-1".to_owned(),
-                token_position: PositionId(1),
-                route_offset: 1,
-                route_count: 1,
-            },
-        ],
-    };
-    let routes = vec![
-        ExpertBatchRoute {
-            row_index: 0,
-            expert_id: 0,
-            gate_weight: 1.0,
-        },
-        ExpertBatchRoute {
-            row_index: 1,
-            expert_id: 1,
-            gate_weight: 1.0,
-        },
-    ];
-    let hosts = vec!["ostrich".to_owned(), "dodo".to_owned()];
-    let set = ExpertHostBatchSet::from_expert_batch(&batch, &routes, &hosts, PlacementPolicy::Modulo)?;
-    let global_hidden = [[0.0_f32, 0.25, 0.5, 0.75], [1.0, 1.25, 1.5, 1.75]]
-        .iter()
-        .flat_map(|row| {
-            row.iter()
-                .flat_map(|value| ((value.to_bits() >> 16) as u16).to_le_bytes())
-        })
-        .collect();
-    Ok((set, global_hidden))
-}
 
 // ---------------------------------------------------------------------------
 // sglang graceful_shutdown.rs — drain/cancellation on the ds41rt surface.

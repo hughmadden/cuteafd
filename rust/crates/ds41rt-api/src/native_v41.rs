@@ -224,7 +224,7 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> 
                 };
                 if strict {
                     if let Some(schema) = definition.get("schema") {
-                        if let Err(rejection) = crate::request::validate_strict_json_schema(
+                        if let Err(rejection) = crate::schema::validate_strict_json_schema(
                             schema,
                             "response_format.json_schema.schema",
                         ) {

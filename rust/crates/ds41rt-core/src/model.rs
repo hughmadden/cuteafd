@@ -279,13 +279,6 @@ pub struct TensorCatalog {
 }
 
 impl TensorCatalog {
-    pub fn summary_by_role(&self) -> BTreeMap<String, usize> {
-        let mut counts = BTreeMap::new();
-        for tensor in &self.tensors {
-            *counts.entry(format!("{:?}", tensor.role)).or_insert(0) += 1;
-        }
-        counts
-    }
 
     pub fn content_hash(&self) -> String {
         let encoded = serde_json::to_vec(self).expect("serializing catalog cannot fail");

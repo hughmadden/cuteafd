@@ -20,14 +20,11 @@ axum.workspace = true
 futures.workspace = true
 ds41rt-core = { path = "../ds41rt-core" }
 ds41rt-loader = { path = "../ds41rt-loader" }
-ds41rt-transport = { path = "../ds41rt-transport" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-tower-http.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 tower.workspace = true

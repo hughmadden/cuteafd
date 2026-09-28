@@ -5,7 +5,6 @@ use std::process::Command;
 
 mod cli;
 mod commands;
-mod python_graph_capture;
 mod v41_compressor;
 mod v41_vision;
 mod v41_index_query;
@@ -40,7 +39,6 @@ mod v41_tensors;
 mod v41_engram;
 
 use cli::{Cli, Commands};
-use commands::bench_cuda_kernels::run_bench_cuda_kernels;
 use commands::bench_rdma::run_bench_rdma;
 use commands::bench_rdma_ring::run_bench_rdma_ring;
 use commands::doctor::run_doctor;
@@ -65,7 +63,6 @@ async fn main() -> Result<()> {
         Commands::ServeNative(args) => v41_native_serve::run(args).await,
         Commands::BenchRdma(args) => run_bench_rdma(args),
         Commands::BenchRdmaRing(args) => run_bench_rdma_ring(args),
-        Commands::BenchCudaKernels(args) => run_bench_cuda_kernels(args),
         Commands::TransportCapabilities(args) => run_transport_capabilities(args),
     }
 }

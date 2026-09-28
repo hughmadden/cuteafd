@@ -96,13 +96,6 @@ impl ExpertBatch {
         })
     }
 
-    pub fn bf16_from_wave_with_envelope(
-        wave: &LayerWave,
-        quantization_recipe: impl Into<String>,
-        graph_bucket: GraphBucket,
-    ) -> Result<Self, Ds41rtError> {
-        Self::from_wave_with_envelope(wave, DType::Bf16, quantization_recipe, graph_bucket)
-    }
 
     pub fn num_rows(&self) -> usize {
         self.rows.len()
@@ -144,23 +137,6 @@ impl ExpertBatch {
         Ok(())
     }
 
-    pub fn reconstruct_partial_outputs<T: Clone>(
-        &self,
-        partial_outputs: &[T],
-    ) -> Result<Vec<(ExpertBatchRow, T)>, Ds41rtError> {
-        if partial_outputs.len() != self.rows.len() {
-            return Err(Ds41rtError::ExpertBatchPartialRowCountMismatch {
-                expected: self.rows.len(),
-                actual: partial_outputs.len(),
-            });
-        }
-        Ok(self
-            .rows
-            .iter()
-            .cloned()
-            .zip(partial_outputs.iter().cloned())
-            .collect())
-    }
 
     fn append_rows_from(&mut self, other: &Self) {
         let row_id_base = self.rows.len() as u64;

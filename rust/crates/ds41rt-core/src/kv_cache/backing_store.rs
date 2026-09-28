@@ -46,18 +46,6 @@ impl KvCacheBackingStore {
         self.allocator.snapshot()
     }
 
-    pub fn write_committed_block(
-        &mut self,
-        descriptor: KvBlockDescriptor,
-        payload: Vec<u8>,
-    ) -> Result<u64, Ds41rtError> {
-        self.validate_payload(&descriptor, payload.len())?;
-        self.invalidate_attention_metadata_layer(descriptor.reservation_id, descriptor.layer_id);
-        let write_id = self.allocator.record_prefill_write(descriptor)?;
-        self.blocks.insert(write_id, payload);
-        self.allocator.mark_write_written(write_id)?;
-        Ok(write_id)
-    }
 
     pub fn write_committed_block_metadata(
         &mut self,
@@ -70,42 +58,8 @@ impl KvCacheBackingStore {
         Ok(write_id)
     }
 
-    pub fn write_committed_blocks_for_wave(
-        &mut self,
-        wave: &LayerWave,
-        payloads: Vec<Vec<u8>>,
-    ) -> Result<Vec<u64>, Ds41rtError> {
-        self.validate_payload_count(wave.kv_writes.len(), payloads.len())?;
-        wave.kv_writes
-            .iter()
-            .cloned()
-            .zip(payloads)
-            .map(|(descriptor, payload)| self.write_committed_block(descriptor, payload))
-            .collect()
-    }
 
-    pub fn write_committed_block_metadata_for_wave(
-        &mut self,
-        wave: &LayerWave,
-    ) -> Result<Vec<u64>, Ds41rtError> {
-        wave.kv_writes
-            .iter()
-            .cloned()
-            .map(|descriptor| self.write_committed_block_metadata(descriptor))
-            .collect()
-    }
 
-    pub fn write_tentative_block(
-        &mut self,
-        descriptor: KvBlockDescriptor,
-        payload: Vec<u8>,
-    ) -> Result<u64, Ds41rtError> {
-        self.validate_payload(&descriptor, payload.len())?;
-        self.invalidate_attention_metadata_layer(descriptor.reservation_id, descriptor.layer_id);
-        let write_id = self.allocator.record_tentative_write(descriptor)?;
-        self.blocks.insert(write_id, payload);
-        Ok(write_id)
-    }
 
     pub fn write_tentative_block_metadata(
         &mut self,
@@ -116,30 +70,7 @@ impl KvCacheBackingStore {
         Ok(write_id)
     }
 
-    pub fn write_tentative_blocks_for_wave(
-        &mut self,
-        wave: &LayerWave,
-        payloads: Vec<Vec<u8>>,
-    ) -> Result<Vec<u64>, Ds41rtError> {
-        self.validate_payload_count(wave.tentative_kv_writes.len(), payloads.len())?;
-        wave.tentative_kv_writes
-            .iter()
-            .cloned()
-            .zip(payloads)
-            .map(|(descriptor, payload)| self.write_tentative_block(descriptor, payload))
-            .collect()
-    }
 
-    pub fn write_tentative_block_metadata_for_wave(
-        &mut self,
-        wave: &LayerWave,
-    ) -> Result<Vec<u64>, Ds41rtError> {
-        wave.tentative_kv_writes
-            .iter()
-            .cloned()
-            .map(|descriptor| self.write_tentative_block_metadata(descriptor))
-            .collect()
-    }
 
     pub fn resolve_mtp_tentative_writes(
         &mut self,
@@ -251,103 +182,8 @@ impl KvCacheBackingStore {
         blocks
     }
 
-    pub fn read_visible_blocks_for_descriptor(
-        &self,
-        descriptor: &KvBlockDescriptor,
-    ) -> Vec<KvBackedBlock> {
-        let read_start = descriptor.token_start.0;
-        let read_end = read_start + descriptor.token_count as u64;
-        let mut blocks = self
-            .allocator
-            .writes_for_reservation_layer(descriptor.reservation_id, descriptor.layer_id)
-            .into_iter()
-            .filter(|write| {
-                write.is_visible_to_attention()
-                    && write.token_start.0 >= read_start
-                    && write.token_end() <= read_end
-            })
-            .filter_map(|write| {
-                self.blocks.get(&write.id).map(|bytes| KvBackedBlock {
-                    write_id: write.id,
-                    descriptor: KvBlockDescriptor {
-                        reservation_id: write.reservation_id,
-                        sequence_id: write.sequence_id.clone(),
-                        layer_id: write.layer_id,
-                        token_start: write.token_start,
-                        token_count: write.token_count,
-                    },
-                    state: write.state,
-                    bytes: bytes.clone(),
-                })
-            })
-            .collect::<Vec<_>>();
-        blocks.sort_by_key(|block| (block.descriptor.token_start, block.write_id));
-        blocks
-    }
 
-    pub fn read_visible_blocks_for_wave(&self, wave: &LayerWave) -> Vec<KvBackedBlock> {
-        let mut blocks = wave
-            .kv_reads
-            .iter()
-            .flat_map(|descriptor| self.read_visible_blocks_for_descriptor(descriptor))
-            .collect::<Vec<_>>();
-        blocks.sort_by_key(|block| {
-            (
-                block.descriptor.layer_id,
-                block.descriptor.token_start,
-                block.write_id,
-            )
-        });
-        blocks
-    }
 
-    pub fn read_attention_blocks_for_wave(&self, wave: &LayerWave) -> Vec<KvBackedBlock> {
-        if wave.kv_reads.iter().any(|descriptor| {
-            self.attention_metadata_invalid_layers
-                .contains(&(descriptor.reservation_id, descriptor.layer_id))
-        }) {
-            return self.read_visible_blocks_for_wave(wave);
-        }
-
-        let mut blocks = wave
-            .kv_reads
-            .iter()
-            .flat_map(|read| {
-                let read_start = read.token_start.0;
-                let read_end = read_start + read.token_count as u64;
-                self.attention_metadata_runs
-                    .get(&(read.reservation_id, read.layer_id))
-                    .into_iter()
-                    .flatten()
-                    .filter_map(move |run| {
-                        let run_start = run.token_start.0;
-                        let run_end = run_start + run.token_count as u64;
-                        let token_start = read_start.max(run_start);
-                        let token_end = read_end.min(run_end);
-                        (token_start < token_end).then(|| KvBackedBlock {
-                            write_id: 0,
-                            descriptor: KvBlockDescriptor {
-                                reservation_id: read.reservation_id,
-                                sequence_id: read.sequence_id.clone(),
-                                layer_id: read.layer_id,
-                                token_start: PositionId(token_start),
-                                token_count: (token_end - token_start) as usize,
-                            },
-                            state: KvWriteState::Written,
-                            bytes: Vec::new(),
-                        })
-                    })
-            })
-            .collect::<Vec<_>>();
-        blocks.sort_by_key(|block| {
-            (
-                block.descriptor.layer_id,
-                block.descriptor.token_start,
-                block.write_id,
-            )
-        });
-        blocks
-    }
 
     pub fn backed_write_bytes(&self) -> usize {
         self.blocks.values().map(Vec::len).sum()
