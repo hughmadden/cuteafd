@@ -46,17 +46,11 @@ fi
 
 case "$role" in
   coordinator)
-    sparkinfer_aot=OFF
     coordinator_aot=ON
-    w8a16_aot=ON
-    nccl=OFF
     xgrammar=ON
     ;;
   expert)
-    sparkinfer_aot=ON
     coordinator_aot=OFF
-    w8a16_aot=OFF
-    nccl=ON
     xgrammar=OFF
     ;;
   *)
@@ -188,13 +182,13 @@ cmake \
   -DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_NARROW_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_RDMA=ON \
-  -DCUTEAFD_ENABLE_SPARKINFER_AOT="$sparkinfer_aot" \
-  -DCUTEAFD_ENABLE_SPARKINFER_COORDINATOR_AOT="$coordinator_aot" \
+  -DCUTEAFD_ENABLE_SPARKINFER_AOT=OFF \
+  -DCUTEAFD_ENABLE_SPARKINFER_COORDINATOR_AOT=OFF \
   -DCUTEAFD_ENABLE_DS4_FLASH_AOT=OFF \
-  -DCUTEAFD_ENABLE_W8A16_AOT="$w8a16_aot" \
+  -DCUTEAFD_ENABLE_W8A16_AOT=OFF \
   -DCUTEAFD_SPARKINFER_SOURCE_DIR="$build_root/source/third_party/sparkinfer" \
   -DCUTEAFD_SPARKINFER_LOCK_FILE="$build_root/source/third_party/sparkinfer.lock.json" \
-  -DCUTEAFD_ENABLE_NCCL="$nccl" \
+  -DCUTEAFD_ENABLE_NCCL=OFF \
   -DCUTEAFD_ENABLE_XGRAMMAR="$xgrammar" \
   -DCUTEAFD_XGRAMMAR_SOURCE_DIR="$build_root/source/third_party/xgrammar" \
   -DCUTEAFD_XGRAMMAR_LOCK_FILE="$build_root/source/third_party/xgrammar.lock.json" \

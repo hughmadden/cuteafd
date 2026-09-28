@@ -271,21 +271,18 @@ if(CUTEAFD_ENABLE_CUDA)
     cuda/kernels/v41_candidate_blocks.cu
     cuda/kernels/v41_attention_ops.cu
     cuda/kernels/norm.cu
-    cuda/kernels/mlp.cu
     cuda/kernels/residual.cu
-    cuda/kernels/kv_cache.cu
-    cuda/kernels/mla_indexing.cu
-    cuda/kernels/router.cu
-    cuda/kernels/linear.cu
-    cuda/kernels/attention.cu
     cuda/kernels/embedding.cu
     cuda/kernels/sampling.cu
     cuda/kernels/v41_sampling_gpu.cu
-    cuda/kernels/nibbles.cu
     cuda/kernels/nvfp4_payload.cu
     cuda/kernels/nvfp4_scale.cu
-    cuda/kernels/ds4_flash_direct.cu
   )
+  # SM120 builds use the family-specific target (sm_120f); every live AOT
+  # export and hand kernel is qualified with it.
+  if(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "120")
+    set(CUTEAFD_CUDA_ARCHITECTURES "120f")
+  endif()
 endif()
 
 set(CUTEAFD_BUILD_FLASHINFER_PACKED_MLA OFF)
