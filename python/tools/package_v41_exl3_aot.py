@@ -92,6 +92,9 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             raise ValueError(f'EXL3 variant tile mismatch: {directory}')
         if 'tile_requested' in variant and variant['tile_requested'] != meta.get('tile'):
             raise ValueError(f'EXL3 tile override was not applied as requested: {directory}')
+        # Absent means the original 8-row packed-route block.
+        if variant.get('route_block', 8) != meta.get('route_block', 8):
+            raise ValueError(f'EXL3 variant route block mismatch: {directory}')
         if meta['capacity'] in overrides and meta.get('blocks_per_sm') != overrides[meta['capacity']]:
             raise ValueError('EXL3 compiled residency differs from requested override')
         boundary = meta.get('paired_boundary')
@@ -212,6 +215,20 @@ GEOMETRIES = {
     'dsv4f': (4096, 2048, 256, 6),
     'dsv4p': (7168, 3072, 384, 6),
 }
+
+
+def route_block(geometry: str, role: str, capacity: int) -> int:
+    """Packed-route M block per capacity: rows of one expert that share a Trellis decode.
+
+    V4.1 keeps its qualified 8-row blocks everywhere. DeepSeek V4 Pro Spark prefill
+    (H7168, 384 experts, top-6: ~64 rows per expert at 4096 rows) re-decodes every
+    weight tile once per 8 rows, so wide prefill capacities use wider blocks
+    (GB10, TP4 width 768, random top-6 routes: m4096 53 -> 25 ms, m1024 15 -> 11 ms;
+    m81..256 stays fastest at 8).
+    """
+    if geometry != 'dsv4p' or role != 'spark' or capacity <= 256:
+        return 8
+    return 16 if capacity <= 1024 else 32
 
 
 def package_name(geometry: str, bits: list[int]) -> str:
@@ -389,6 +406,8 @@ def build(args: argparse.Namespace) -> None:
                     options['tile'] = tile
                 if geometry != 'v41':
                     options['hidden'] = hidden
+                if (block := route_block(geometry, args.role, capacity)) != 8:
+                    options['route_block'] = block
                 meta = export(raw, width, experts, capacity, tuple(args.bits), 'auto', topk, dtype, **options)
                 core = raw / 'libcuteafd_exl3.so'
                 subprocess.run([args.cxx, '-shared', '-fPIC', '-std=c++17',
@@ -420,6 +439,8 @@ def build(args: argparse.Namespace) -> None:
                         variant['tile'] = meta['tile']
                     if tile is not None:
                         variant['tile_requested'] = list(tile)
+                    if 'route_block' in meta:
+                        variant['route_block'] = meta['route_block']
                     variants.append(variant)
                     if paired:
                         variants[-1]['paired_boundary'] = meta['paired_boundary']

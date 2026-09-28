@@ -16,7 +16,7 @@ import re
 import _pinned_sparkinfer
 
 
-def export(output: Path, capacity: int, experts: int, topk: int) -> dict:
+def export(output: Path, capacity: int, experts: int, topk: int, block_size: int = 8) -> dict:
     import torch
     from b12x.moe._shared.kernels.w4a16.route_pack import compile_w4a16_route_pack_launches
 
@@ -26,7 +26,7 @@ def export(output: Path, capacity: int, experts: int, topk: int) -> dict:
     if (props.major, props.minor) not in ((12, 0), (12, 1)):
         raise ValueError('requires SM120 or SM121')
     plan = compile_w4a16_route_pack_launches(tokens=capacity, topk=topk,
-        block_size=8, num_experts=experts, ordinal=0)
+        block_size=block_size, num_experts=experts, ordinal=0)
     output.mkdir(parents=True, exist_ok=True)
     # The seven pointers follow the small-prefix ABI; larger plans reuse them.
     slots = dict(topk_ids=capacity*topk, expert_map=experts,
@@ -123,7 +123,7 @@ def export(output: Path, capacity: int, experts: int, topk: int) -> dict:
     manifest = dict(schema='cuteafd.v41-exl3-routes-aot.v1',
         sparkinfer_revision=_pinned_sparkinfer.REVISION,
         compute=[props.major,props.minor], capacity=capacity, topk=topk,
-        experts=experts, block_size=8, small_prefix=plan.use_small_prefix,
+        experts=experts, block_size=block_size, small_prefix=plan.use_small_prefix,
         buffers={k:dict(elements=v,bytes=v*4,dtype='int32') for k,v in slots.items()},
         objects=objects)
     (output/'v41_exl3_routes.json').write_text(json.dumps(manifest,indent=2)+'\n')
@@ -137,5 +137,6 @@ if __name__ == '__main__':
     parser.add_argument('--capacity', type=int, required=True)
     parser.add_argument('--experts', type=int, default=384)
     parser.add_argument('--topk', type=int, choices=(3,6), default=6)
+    parser.add_argument('--block-size', type=int, choices=(8,16,32,64), default=8)
     args = parser.parse_args()
-    export(args.output,args.capacity,args.experts,args.topk)
+    export(args.output,args.capacity,args.experts,args.topk,args.block_size)
