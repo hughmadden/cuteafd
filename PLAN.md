@@ -138,6 +138,26 @@ Loading:
   `nest replicate` of the shards a rank needs onto that rank so repeated
   starts hit NVMe passthrough.
 
+Fabric discovery (transport, at every startup, coordinator and ranks):
+
+- Probe and log per host: each RDMA device and port (`/sys/class/infiniband/
+  */ports/*/{rate,state}`), its netdev, negotiated speed and MTU, the rail
+  addresses/GIDs and whether rails sit on isolated subnets, and the PCIe
+  link generation and width of the NIC and of the GPU. Publish this in the
+  startup plan so every rank sees the whole fabric picture.
+- Choose the queue-pair strategy from that data, not from a constant:
+  rail count, which rail carries request/response vs. reduction traffic,
+  in-flight depth and chunk sizes. Lesson learned: dual rail at 100G links
+  with 200+ Gb/s of inbound PCIe traffic caused head-of-line blocking, so a
+  second rail is only used when link rate and PCIe ingress justify it.
+  Only one physical configuration exists at a time, but the engine records
+  the inputs and the chosen strategy so the choice can be revisited.
+- Today: Sparks negotiate 200 Gb/s on two ports (rail A 10.55.0.x, rail B
+  10.55.1.x, separate subnets); raptor has one 400 Gb/s port carrying both
+  rail subnets. The switch is moving from 100G to 200G; verify the
+  effective rate rather than trusting the port. NCCL is not required, so
+  its isolated-subnet rule is informational only.
+
 API and dashboard: keep ds41rt `native_v41` router; add `/v1/completions`;
 per-family chat templates (deepseek-recipe crates for DeepSeek; minijinja
 over `tokenizer_config.chat_template` as the generic path) with per-family

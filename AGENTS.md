@@ -12,6 +12,12 @@ go in commit messages as short before → after tables with conditions.
   N/A, measure with CUDA): ostrich, dodo, emu, kiwi, rhea, moa at
   10.55.0.1–6. Ranks 0–5 in that order. All six are the pool. TP4 on the
   first four is the qualified V4.1 default until a six-rank layout wins.
+- Fabric: Sparks have two RoCE ports at 200 Gb/s each on separate
+  subnets (rail A 10.55.0.x, rail B 10.55.1.x); raptor has one 400 Gb/s
+  port carrying both rail subnets. The switch is being raised from 100G to
+  200G. Read rates and states at startup (`rdma link`, sysfs `rate`); do
+  not assume them. Dual rail at 100G caused head-of-line blocking against
+  200+ Gb/s PCIe ingress, so rail use is a measured decision.
 - Passwordless SSH by hostname. Fan-out: `scripts/run-on-hosts.sh`.
 - Root: `agent-sudo --agent-context "why" CMD` (remote human approval).
 
