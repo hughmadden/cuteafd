@@ -568,6 +568,7 @@ docker run --rm \
   --ulimit memlock=-1:-1 \
   -e "CUTEAFD_RELEASE_EXL3_PAIRED_TP4=$exl3_paired_tp4" \
   -e "CUTEAFD_RELEASE_SPARK_TP_ROLES=$spark_tp_roles" \
+  -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}" \
   ${release_build_root_args[@]+"${release_build_root_args[@]}"} \
   -v "$remote_dir:/source:ro" \
   -v "$remote_dir/.cuteafd-release-image:/output" \

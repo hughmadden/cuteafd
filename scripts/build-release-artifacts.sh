@@ -75,6 +75,12 @@ if [[ -n "$spark_tp_roles" ]]; then
   [[ "$role" == expert ]] ||
     { echo "CUTEAFD_RELEASE_SPARK_TP_ROLES is only valid for the expert role" >&2; exit 2; }
 fi
+
+# Extra routed-expert kernel families (FAMILY:ROLE list, e.g. dsv4f:spark),
+# validated by native/cmake/expert_families.cmake. Empty keeps the V4.1 image.
+expert_families="${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}"
+[[ -z "$expert_families" || "$role" == expert ]] ||
+  { echo "CUTEAFD_RELEASE_EXPERT_FAMILIES is only valid for the expert role" >&2; exit 2; }
 # v7 ships both EXL3 decoder families by default: the uniform K=2 raw
 # publication family (2,3) and the staged K3.25 family (3,4). Paired TP4
 # builds remain single-family and stay on the v5 (3,4) family.
@@ -170,6 +176,7 @@ cmake \
   -DCUTEAFD_ENABLE_CUDA=ON \
   -DCUTEAFD_ENABLE_V41_EXPERT_AOT=ON \
   -DCUTEAFD_V41_SPARK_TP_ROLES="$spark_tp_roles" \
+  -DCUTEAFD_EXPERT_FAMILIES="$expert_families" \
   -DCUTEAFD_ENABLE_V41_NVFP4_AOT="${CUTEAFD_RELEASE_NVFP4_AOT:-ON}" \
   -DCUTEAFD_ENABLE_V41_EXL3_AOT=ON \
   -DCUTEAFD_V41_EXL3_BIT_FAMILIES="$exl3_bit_families" \

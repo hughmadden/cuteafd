@@ -42,6 +42,12 @@ if [[ -n "$spark_tp_roles" ]]; then
   [[ "$role" == expert ]] ||
     { echo "CUTEAFD_WIP_SPARK_TP_ROLES is only valid for the expert role" >&2; exit 2; }
 fi
+
+# Extra routed-expert kernel families (FAMILY:ROLE list, e.g. dsv4f:spark),
+# validated by native/cmake/expert_families.cmake. Empty keeps the V4.1 image.
+expert_families="${CUTEAFD_WIP_EXPERT_FAMILIES:-}"
+[[ -z "$expert_families" || "$role" == expert ]] ||
+  { echo "CUTEAFD_WIP_EXPERT_FAMILIES is only valid for the expert role" >&2; exit 2; }
 # Official-only WIP builds may skip the EXL3 quantization AOT entirely. The
 # default stays ON so every existing slot and script is byte-compatible; the
 # native expert path does not require the EXL3 package.
@@ -110,6 +116,7 @@ cmake \
   -DCUTEAFD_ENABLE_CUDA=ON \
   -DCUTEAFD_ENABLE_V41_EXPERT_AOT=ON \
   -DCUTEAFD_V41_SPARK_TP_ROLES="$spark_tp_roles" \
+  -DCUTEAFD_EXPERT_FAMILIES="$expert_families" \
   -DCUTEAFD_ENABLE_V41_NVFP4_AOT="$nvfp4_aot" \
   -DCUTEAFD_ENABLE_V41_EXL3_AOT="$exl3_aot" \
   -DCUTEAFD_V41_EXL3_BITS="${CUTEAFD_WIP_EXL3_BITS:-2;3}" \

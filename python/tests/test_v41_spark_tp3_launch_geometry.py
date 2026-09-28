@@ -45,9 +45,13 @@ PINNED_ANCHORS = {
     "fc1.k_mma_atom": (
         "sparkinfer", "b12x/moe/_shared/kernels/w4a8_v41_slice.py",
         "kt * 32 + kb * 8 + c * 2"),
+    # K stages are hidden // 128: 40 at the V4.1 hidden width of 5120.
     "fc1.k_stages": (
         "sparkinfer", "b12x/moe/_shared/kernels/w4a8_v41_slice.py",
-        "for kt in range(40):"),
+        "self.hidden_tiles = hidden // 128"),
+    "fc1.k_loop": (
+        "sparkinfer", "b12x/moe/_shared/kernels/w4a8_v41_slice.py",
+        "for kt in range(self.hidden_tiles):"),
     "grid.block_threads": (
         "sparkinfer", "b12x/moe/_shared/kernels/w4a8_v41_slice.py",
         "block=(128, 1, 1),"),
