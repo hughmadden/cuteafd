@@ -8,7 +8,7 @@ use std::{collections::{HashMap, VecDeque}, path::PathBuf, sync::Arc};
 /// The tokenizer's stop token, the only stop id the grammar compiler is given.
 const STOP_TOKEN: u32 = 1;
 
-pub(super) struct Compiler<'a> {
+pub(crate) struct Compiler<'a> {
     library: &'a NativeLibrary,
     tokenizer: PathBuf,
     compiler: Option<CuteafdXGrammarCompiler<'a>>,
@@ -60,7 +60,7 @@ where
     Ok(collected)
 }
 
-pub(super) struct State<'a> {
+pub(crate) struct State<'a> {
     matcher: CuteafdXGrammarMatcher<'a>,
     mask: Vec<u32>,
     stop: u32,

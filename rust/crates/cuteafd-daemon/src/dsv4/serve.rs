@@ -101,8 +101,10 @@ fn serve_loop(
 }
 
 /// One admitted request: its placement, stream state and next input token.
-struct Active {
+struct Active<'a> {
     job: NativeRequest,
+    /// Grammar for structured output and tool calls.
+    constraint: Option<crate::v41_native_serve::constraints::State<'a>>,
     placement: Placement,
     capacity: usize,
     next: u32,
@@ -112,7 +114,22 @@ struct Active {
     started: Instant,
 }
 
-impl Active {
+impl Active<'_> {
+    /// Masked selection for the row that produces this sequence's next token.
+    fn select(&mut self, logits: &[f32]) -> Result<u32> {
+        let position = self.placement.len as u64;
+        let mask = match self.constraint.as_mut() {
+            Some(state) => state.mask()?,
+            None => None,
+        };
+        let token = self.job.sampling.select_token(logits, mask, position)
+            .map_err(|e| anyhow::anyhow!("sampling: {e:?}"))? as u32;
+        if let Some(state) = self.constraint.as_mut() {
+            state.accept(token)?;
+        }
+        Ok(token)
+    }
+
     fn send(&self, chunk: InferenceChunk) -> Result<()> {
         self.job.events.blocking_send(Ok(chunk)).map_err(|_| anyhow::anyhow!("client went away"))
     }
@@ -161,7 +178,9 @@ fn schedule(
     stats: &Mutex<serde_json::Value>,
 ) -> Result<()> {
     let mut allocator = PoolAllocator::new(engine.shape);
-    let mut active: Vec<Active> = Vec::new();
+    let mut grammars = crate::v41_native_serve::constraints::Compiler::new(
+        &loaded.library, loaded.snapshot.join("tokenizer.json"));
+    let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
     let hidden = engine.cfg.dim;
     let vocab = engine.cfg.vocab_size;
@@ -183,10 +202,17 @@ fn schedule(
             let reject = |job: &NativeRequest, message: String| {
                 let _ = job.events.blocking_send(Err(NativeFailure::BadRequest(message)));
             };
-            if job.constraint.is_some() || !job.images.is_empty() {
-                reject(&job, "constrained decoding and images are not available for DeepSeek V4 yet".into());
+            if !job.images.is_empty() {
+                reject(&job, "this checkpoint takes no images".into());
                 continue;
             }
+            let constraint = match job.constraint.as_ref().map(|spec| grammars.matcher(spec)).transpose() {
+                Ok(constraint) => constraint,
+                Err(error) => {
+                    reject(&job, format!("{error:#}"));
+                    continue;
+                }
+            };
             let tokens = tokenizer.encode_text(&job.prompt, false)?.token_ids;
             if tokens.is_empty() || tokens.len() >= engine.max_context {
                 reject(&job, format!("prompt of {} tokens is outside 1..{}", tokens.len(), engine.max_context));
@@ -200,7 +226,7 @@ fn schedule(
                     continue;
                 }
             };
-            let admitted = (|| -> Result<Active> {
+            let admitted = (|| -> Result<Active<'_>> {
                 let _ = job.events.blocking_send(Ok(InferenceChunk::Ready {
                     system_fingerprint: None,
                     prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: 0 },
@@ -211,14 +237,13 @@ fn schedule(
                     logits = engine.prefill(&mut placement, chunk, rows, transport, runtime, |_, _| Ok(()))?;
                 }
                 let last = logits.len() / vocab - 1;
-                let row = &logits[last * vocab..];
-                let token = job.sampling.select_token(row, None, placement.len as u64)
-                    .map_err(|e| anyhow::anyhow!("sampling: {e:?}"))? as u32;
-                Ok(Active {
+                let mut request = Active {
                     decoder: cuteafd_loader::streaming_token_decoder(&loaded.snapshot, false)?,
-                    job, placement: placement.clone(), capacity, next: token, generated: 0, buffered: 0,
+                    job, constraint, placement: placement.clone(), capacity, next: 0, generated: 0, buffered: 0,
                     started: Instant::now(),
-                })
+                };
+                request.next = request.select(&logits[last * vocab..])?;
+                Ok(request)
             })();
             match admitted {
                 Ok(mut request) => {
@@ -254,10 +279,7 @@ fn schedule(
         };
         let finished: Vec<bool> = active.iter_mut().enumerate().map(|(row, request)| {
             let logits_row = &logits[row * vocab..][..vocab];
-            request.job.sampling.select_token(logits_row, None, request.placement.len as u64)
-                .map_err(|e| anyhow::anyhow!("sampling: {e:?}"))
-                .and_then(|token| request.emit(token as u32, eos))
-                .unwrap_or(true)
+            request.select(logits_row).and_then(|token| request.emit(token, eos)).unwrap_or(true)
         }).collect();
         for index in (0..active.len()).rev() {
             if !finished[index] {

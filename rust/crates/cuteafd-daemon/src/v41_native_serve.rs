@@ -7,7 +7,7 @@ pub(crate) mod console;
 mod distributed;
 mod placement;
 pub(crate) mod scores;
-mod constraints;
+pub(crate) mod constraints;
 use scores::TokenScores;
 mod prefix;
 pub(crate) mod memory;
