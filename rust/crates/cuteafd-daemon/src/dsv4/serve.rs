@@ -85,7 +85,10 @@ fn serve_loop(
     let eos = eos_token(&args.snapshot)?;
     let mut ready = Some(ready);
     let result = with_engine(&loaded, &args, |engine, transport, runtime| {
-        ensure!(max_context <= engine.max_context, "--max-context {max_context} exceeds the programs' {}", engine.max_context);
+        if max_context > engine.max_context {
+            tracing::warn!(requested = max_context, supported = engine.max_context,
+                "--max-context exceeds the exported programs; requests are limited to the programs' context");
+        }
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(()));
         }
