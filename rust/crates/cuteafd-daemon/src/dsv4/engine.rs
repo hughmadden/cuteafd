@@ -53,15 +53,15 @@ pub(crate) enum Phase {
     /// Waiting for the GPU through the router and input quantizer.
     RouterSync,
     Routing,
+    /// Dispatch, remote compute and partials landing in device planes.
     Experts,
-    PlaneUpload,
     /// Waiting for the head and downloading logits.
     Head,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct Profile {
-    pub seconds: [f64; 5],
+    pub seconds: [f64; 4],
 }
 
 impl Profile {
@@ -70,7 +70,7 @@ impl Profile {
     }
 
     pub fn report(&self) -> String {
-        let names = ["router_sync", "routing", "experts", "plane_upload", "head"];
+        let names = ["router_sync", "routing", "experts", "head"];
         names.iter().zip(self.seconds).map(|(n, s)| format!("{n} {:.1} ms", s * 1e3)).collect::<Vec<_>>().join(", ")
     }
 }
@@ -152,14 +152,6 @@ struct StepBuffers<'a> {
 impl<'a> Engine<'a> {
     fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
         DeviceAllocation::new(self.library, bytes.max(256))
-    }
-
-    fn upload<T: Copy>(&self, values: &[T]) -> Result<Dev<'a>> {
-        let allocation = self.alloc(std::mem::size_of_val(values))?;
-        if !values.is_empty() {
-            self.library.copy_h2d(allocation.buffer, bytes_of(values))?;
-        }
-        Ok(allocation)
     }
 
     fn zeroed(&self, bytes: usize) -> Result<Dev<'a>> {
