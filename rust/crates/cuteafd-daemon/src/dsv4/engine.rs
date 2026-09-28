@@ -631,29 +631,34 @@ impl<'a> Engine<'a> {
         )?;
         request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         let row_bytes = h * 2;
-        let mut planes = vec![vec![0u8; t * row_bytes]; transport.world_size()];
+        let ranks = transport.world_size();
+        ensure!(ranks <= w.planes.len(), "{ranks} Spark ranks exceed the reduction planes");
         self.profile.borrow_mut().add(Phase::Routing, timer);
         let timer = Instant::now();
-        runtime.block_on(transport.execute(&request, |rank, first, payload| {
-            let start = first as usize * row_bytes;
-            planes[rank][start..start + payload.len()].copy_from_slice(payload);
-            Ok(())
-        }))?;
+        // Each rank's partial rows land in its device plane straight from the
+        // pinned receive slot.
+        runtime.block_on(async {
+            let pending = transport.dispatch(&request).await?;
+            pending.receive(|rank, first, payload| {
+                let offset = first as usize * row_bytes;
+                ensure!(offset + payload.len() <= t * row_bytes, "partial rows exceed the step");
+                let mut destination = w.planes[rank].buffer;
+                // SAFETY: the offset and length stay inside this plane (checked above).
+                destination.ptr = unsafe { destination.ptr.cast::<u8>().add(offset) }.cast();
+                destination.bytes = payload.len();
+                self.library.copy_h2d(destination, payload)
+            }).await
+        })?;
         self.profile.borrow_mut().add(Phase::Experts, timer);
-        let timer = Instant::now();
-        for (plane, bytes) in w.planes.iter().zip(&planes) {
-            self.library.copy_h2d(plane.buffer, bytes)?;
-        }
-        self.profile.borrow_mut().add(Phase::PlaneUpload, timer);
         let reducer = self.library.v41_compact_reducer()?;
         let mut pointers = [std::ptr::null::<u16>(); 6];
-        for (slot, plane) in pointers.iter_mut().zip(&w.planes) {
+        for (slot, plane) in pointers.iter_mut().zip(&w.planes[..ranks]) {
             *slot = plane.buffer.ptr.cast();
         }
         // SAFETY: planes, shared and delta are live [t, h] BF16 buffers on this
         // device; the stream orders the shared FFN before the reduction.
         unsafe {
-            reducer.reduce_planes(pointers, planes.len() as u32, w.shared.buffer.ptr.cast(),
+            reducer.reduce_planes(pointers, ranks as u32, w.shared.buffer.ptr.cast(),
                 w.delta.buffer.ptr.cast(), t as u32, self.stream)?;
         }
         Ok(())
