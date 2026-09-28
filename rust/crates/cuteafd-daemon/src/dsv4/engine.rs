@@ -70,6 +70,7 @@ struct LaneStep<'s> {
 struct GraphKey {
     layer: usize,
     rows: usize,
+    chunked: bool,
     attention: &'static str,
     table_width: usize,
     table_stride: usize,
@@ -480,6 +481,34 @@ impl<'a> Engine<'a> {
         Ok(logits)
     }
 
+    /// Appends each sequence's tokens (one or more) at its length in one
+    /// decode-shaped step and returns the logits of every row in order. Each
+    /// length advances by its token count; a caller that rejects a suffix
+    /// sets the length back (compressor state is addressed by position, so
+    /// the rejected rows' writes are simply overwritten later).
+    pub fn verify(
+        &self,
+        sequences: &mut [(&mut Placement, &[u32])],
+        embed: &[u8],
+        transports: &mut [V41Tp4Roce],
+        runtime: &tokio::runtime::Runtime,
+    ) -> Result<Vec<f32>> {
+        let tokens: Vec<u32> = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect();
+        ensure!(!tokens.is_empty() && tokens.len() <= self.decode_rows, "verify step of {} rows", tokens.len());
+        for (placement, tokens) in sequences.iter() {
+            ensure!(!tokens.is_empty() && placement.len > 0 && placement.len + tokens.len() <= self.max_context,
+                "verify of {} rows at {} outside the context", tokens.len(), placement.len);
+        }
+        let spans: Vec<(&Placement, usize, usize)> = sequences.iter().map(|(p, t)| (&**p, p.len, t.len())).collect();
+        let tables = metadata::verify_step(&spans, &self.shape, self.cfg.index_topk, self.c128_width)?;
+        let step = LaneStep { tables: &tables, tokens: &tokens, embed };
+        let logits = self.step(&[step], transports, runtime, tokens.len(), None)?;
+        for (placement, tokens) in sequences.iter_mut() {
+            placement.len += tokens.len();
+        }
+        Ok(logits)
+    }
+
     /// Runs every layer for `lanes` (one decode lane, or prefill lanes of
     /// consecutive rows of one sequence) and returns the logits of the last
     /// `logit_rows` rows across the lanes.
@@ -540,6 +569,7 @@ impl<'a> Engine<'a> {
                 let key = GraphKey {
                     layer,
                     rows: t,
+                    chunked: tables.chunked,
                     attention: self.attention_kind(weights.ratio, tables),
                     table_width: tables.c4_table_width,
                     table_stride: tables.c4_table_stride,
@@ -802,7 +832,11 @@ impl<'a> Engine<'a> {
             ]);
         }
         pointers.push(("scratch", w.scratch.buffer.ptr));
-        if tables.decode {
+        if tables.chunked {
+            // Grid bounds: a row completes at most one group, and there are
+            // at most as many sequences as rows.
+            self.run(&format!("compressor_continuation_c{ratio}"), &pointers, &[rows, rows, rows])
+        } else if tables.decode {
             self.run(&format!("compressor_decode_c{ratio}"), &pointers, &[rows])
         } else {
             let completed = names[0].1[0].max(1);

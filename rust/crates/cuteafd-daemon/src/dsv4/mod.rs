@@ -62,6 +62,9 @@ pub(crate) struct GoldenArgs {
     /// (teacher-forced), comparing every decode row with the golden logits.
     #[arg(long)]
     pub prefill: Option<usize>,
+    /// Teacher-force decode in verify steps of this many rows per step.
+    #[arg(long)]
+    pub verify_rows: Option<usize>,
     /// Prefill in chunks of this many tokens (continuation compressor).
     #[arg(long)]
     pub chunk: Option<usize>,
@@ -244,9 +247,16 @@ fn golden_run(
     println!("prefill host phases: {}", engine.profile.borrow().report());
     *engine.profile.borrow_mut() = engine::Profile::default();
     let decode_started = Instant::now();
-    for position in prefill..tokens.len() {
-        let token = tokens[position];
-        logits.extend(engine.decode(&mut [(&mut placement, token)], &embed[position * row..][..row], &mut transports[0], runtime)?);
+    let mut position = prefill;
+    while position < tokens.len() {
+        let end = (position + args.verify_rows.unwrap_or(1)).min(tokens.len());
+        let rows = &embed[position * row..end * row];
+        logits.extend(if args.verify_rows.is_some() {
+            engine.verify(&mut [(&mut placement, &tokens[position..end])], rows, transports, runtime)?
+        } else {
+            engine.decode(&mut [(&mut placement, tokens[position])], rows, &mut transports[0], runtime)?
+        });
+        position = end;
     }
     let decode_steps = tokens.len() - prefill;
     if decode_steps > 0 {

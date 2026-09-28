@@ -64,6 +64,9 @@ pub(crate) fn rope_table(cfg: &DeepseekV4Config, compressed: bool, positions: us
 /// Prefill steps must start at 0; decode steps are one row.
 pub(crate) struct StepTables {
     pub decode: bool,
+    /// Decode-shaped step whose sequences contribute consecutive rows (a
+    /// speculative verify): decode programs, continuation compressor.
+    pub chunked: bool,
     /// First position of the rows (prefill chunks; 0 for decode).
     pub start: usize,
     pub rows: usize,
@@ -155,6 +158,7 @@ pub(crate) fn prefill_step(
     let c4_groups = end / 4;
     Ok(StepTables {
         decode: false,
+        chunked: false,
         start,
         rows: tokens,
         swa_indices,
@@ -185,6 +189,7 @@ pub(crate) fn decode_step(
     let n = rows.len();
     let mut tables = StepTables {
         decode: true,
+        chunked: false,
         start: 0,
         rows: n,
         positions: Vec::with_capacity(n),
@@ -285,4 +290,53 @@ mod tests {
         assert_eq!(compressed_page_bytes(128), 1_728);
         Ok(())
     }
+}
+
+/// Tables for a decode-shaped step in which each sequence contributes
+/// `count` consecutive rows from `start` (its current length): attention
+/// tables per row as in [`decode_step`], compressor tables for the
+/// continuation program (one ordered chunk per sequence). Grid bounds are the
+/// row count, so a captured step depends only on it.
+pub(crate) fn verify_step(
+    sequences: &[(&super::pool::Placement, usize, usize)],
+    shape: &super::pool::PoolShape,
+    index_topk: usize,
+    c128_width: usize,
+) -> anyhow::Result<StepTables> {
+    let rows: Vec<(&super::pool::Placement, usize)> = sequences.iter()
+        .flat_map(|&(placement, start, count)| (start..start + count).map(move |position| (placement, position)))
+        .collect();
+    let mut tables = decode_step(&rows, shape, index_topk, c128_width)?;
+    tables.chunked = true;
+    let n = rows.len();
+    let continuation = |ratio: usize| -> anyhow::Result<Vec<(&'static str, Vec<i32>)>> {
+        let (mut group_sequences, mut sources, mut slots) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut offsets, mut starts, mut states) = (vec![0i32], Vec::new(), Vec::new());
+        for (index, &(placement, start, count)) in sequences.iter().enumerate() {
+            for position in (start..start + count).filter(|p| p % ratio == ratio - 1) {
+                group_sequences.push(index as i32);
+                sources.push((position + 1 - ratio) as i32);
+                slots.push(placement.group_slot(ratio, position / ratio)?);
+            }
+            offsets.push(offsets.last().unwrap() + count as i32);
+            starts.push(start as i32);
+            states.push(placement.state as i32);
+        }
+        let groups = group_sequences.len() as i32;
+        let pad = |mut v: Vec<i32>, len: usize| { v.resize(len.max(v.len()).max(1), 0); v };
+        Ok(vec![
+            ("active_groups", vec![groups]),
+            ("group_sequence_slots", pad(group_sequences, n)),
+            ("group_source_positions", pad(sources.clone(), n)),
+            ("group_rope_positions", pad(sources, n)),
+            ("compressed_slots", pad(slots, n)),
+            ("active_sequences", vec![sequences.len() as i32]),
+            ("sequence_offsets", pad(offsets, n + 1)),
+            ("sequence_start_positions", pad(starts, n)),
+            ("state_sequence_ids", pad(states, n)),
+        ])
+    };
+    tables.c4_tables = continuation(4)?;
+    tables.c128_tables = continuation(128)?;
+    Ok(tables)
 }
