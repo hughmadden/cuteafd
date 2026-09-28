@@ -300,7 +300,7 @@ impl<'a> Engine<'a> {
     /// Persistent table buffers for up to `rows` rows.
     fn step_buffers(&self, rows: usize) -> Result<StepBuffers<'a>> {
         let ints = |count: usize| self.alloc(count * 4);
-        let metadata = |_: usize| -> Result<Vec<Dev<'a>>> { (0..7).map(|_| ints(rows + 2)).collect() };
+        let metadata = |_: usize| -> Result<Vec<Dev<'a>>> { (0..9).map(|_| ints(rows + 2)).collect() };
         Ok(StepBuffers {
             rows,
             positions: self.alloc(rows * 8)?,
@@ -354,8 +354,8 @@ impl<'a> Engine<'a> {
         Ok(out)
     }
 
-    /// Prefills `tokens` for a freshly admitted sequence and returns FP32
-    /// logits [T, vocab]. `on_layer` receives each layer's output stream.
+    /// Prefills the next chunk of a sequence (rows continue at its length) and
+    /// returns FP32 logits [T, vocab]. `on_layer` receives each layer's stream.
     pub fn prefill(
         &self,
         placement: &mut Placement,
@@ -365,12 +365,13 @@ impl<'a> Engine<'a> {
         runtime: &tokio::runtime::Runtime,
         on_layer: impl FnMut(usize, &[u8]) -> Result<()>,
     ) -> Result<Vec<f32>> {
-        ensure!(placement.len == 0, "prefill continues only from an empty sequence");
-        ensure!(!tokens.is_empty() && tokens.len() <= self.prefill_rows && tokens.len() <= self.max_context,
-            "prefill of {} tokens is outside 1..={}", tokens.len(), self.prefill_rows.min(self.max_context));
-        let tables = metadata::prefill_step(placement, &self.shape, tokens.len(), self.cfg.index_topk, self.c128_width)?;
+        let start = placement.len;
+        ensure!(!tokens.is_empty() && tokens.len() <= self.prefill_rows && start + tokens.len() <= self.max_context,
+            "prefill chunk of {} tokens at {start} exceeds {} rows or the {}-token context",
+            tokens.len(), self.prefill_rows, self.max_context);
+        let tables = metadata::prefill_step(placement, &self.shape, start, tokens.len(), self.cfg.index_topk, self.c128_width)?;
         let logits = self.step(&tables, tokens, embed, transport, runtime, on_layer)?;
-        placement.len = tokens.len();
+        placement.len += tokens.len();
         Ok(logits)
     }
 
@@ -533,8 +534,10 @@ impl<'a> Engine<'a> {
         if tables.decode {
             self.run(&format!("compressor_decode_c{ratio}"), &pointers, &[rows])
         } else {
-            let grid = Dsv4Scalar::I32(groups.max(1) as i32);
-            self.run(&format!("compressor_prefill_c{ratio}"), &pointers, &[rows, grid, Dsv4Scalar::I32(1)])
+            let completed = names[0].1[0].max(1);
+            let program = if tables.start == 0 { "prefill" } else { "continuation" };
+            self.run(&format!("compressor_{program}_c{ratio}"), &pointers,
+                &[rows, Dsv4Scalar::I32(completed), Dsv4Scalar::I32(1)])
         }
         .with_context(|| format!("layer {layer} compressor"))?;
         if groups == 0 {

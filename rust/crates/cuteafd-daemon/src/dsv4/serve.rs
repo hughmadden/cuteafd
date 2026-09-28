@@ -185,8 +185,8 @@ fn schedule(
                 continue;
             }
             let tokens = tokenizer.encode_text(&job.prompt, false)?.token_ids;
-            if tokens.is_empty() || tokens.len() > limit {
-                reject(&job, format!("prompt of {} tokens is outside 1..={limit} for single-chunk prefill", tokens.len()));
+            if tokens.is_empty() || tokens.len() >= engine.max_context {
+                reject(&job, format!("prompt of {} tokens is outside 1..{}", tokens.len(), engine.max_context));
                 continue;
             }
             let capacity = (tokens.len() + job.max_tokens).min(engine.max_context);
@@ -203,8 +203,12 @@ fn schedule(
                     prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: 0 },
                 }));
                 let embed = embed_rows(&loaded.catalog, &tokens, hidden)?;
-                let logits = engine.prefill(&mut placement, &tokens, &embed, transport, runtime, |_, _| Ok(()))?;
-                let row = &logits[(tokens.len() - 1) * vocab..];
+                let mut logits = Vec::new();
+                for (chunk, rows) in tokens.chunks(limit).zip(embed.chunks(limit * hidden * 2)) {
+                    logits = engine.prefill(&mut placement, chunk, rows, transport, runtime, |_, _| Ok(()))?;
+                }
+                let last = logits.len() / vocab - 1;
+                let row = &logits[last * vocab..];
                 let token = job.sampling.select_token(row, None, placement.len as u64)
                     .map_err(|e| anyhow::anyhow!("sampling: {e:?}"))? as u32;
                 Ok(Active {

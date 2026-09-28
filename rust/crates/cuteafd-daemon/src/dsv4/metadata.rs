@@ -64,6 +64,8 @@ pub(crate) fn rope_table(cfg: &DeepseekV4Config, compressed: bool, positions: us
 /// Prefill steps must start at 0; decode steps are one row.
 pub(crate) struct StepTables {
     pub decode: bool,
+    /// First position of the rows (prefill chunks; 0 for decode).
+    pub start: usize,
     pub rows: usize,
     pub positions: Vec<i64>,
     /// Physical window slots the producer writes, per row.
@@ -86,66 +88,89 @@ pub(crate) struct StepTables {
     pub c128_lengths: Vec<i32>,
 }
 
-/// Tables for a prefill chunk of one sequence that starts at position 0.
+/// Tables for a prefill chunk of one sequence: rows are positions
+/// `start..start + tokens`; the caches already hold `start` tokens. The first
+/// chunk uses the prefill compressor, later chunks its continuation.
 pub(crate) fn prefill_step(
     placement: &super::pool::Placement,
     shape: &super::pool::PoolShape,
+    start: usize,
     tokens: usize,
     index_topk: usize,
     c128_width: usize,
 ) -> anyhow::Result<StepTables> {
-    let positions: Vec<i64> = (0..tokens as i64).collect();
+    let end = start + tokens;
+    let positions: Vec<i64> = (start as i64..end as i64).collect();
     let slot = |p: usize| placement.window_slot(shape, p);
     let mut swa_indices = vec![-1i32; tokens * WINDOW];
-    for t in 0..tokens {
-        let start = t.saturating_sub(WINDOW - 1);
+    for (row, t) in (start..end).enumerate() {
+        let first = t.saturating_sub(WINDOW - 1);
         for j in 0..WINDOW {
-            if start + j <= t {
-                swa_indices[t * WINDOW + j] = slot(start + j) as i32;
+            if first + j <= t {
+                swa_indices[row * WINDOW + j] = slot(first + j) as i32;
             }
         }
     }
-    let prefill_tables = |ratio: usize| -> anyhow::Result<(Vec<(&'static str, Vec<i32>)>, usize)> {
-        let groups = tokens / ratio;
-        let starts: Vec<i32> = (0..groups).map(|j| (j * ratio) as i32).collect();
-        let slots = (0..groups).map(|j| placement.group_slot(ratio, j)).collect::<anyhow::Result<Vec<_>>>()?;
-        let nonempty = |v: Vec<i32>| if v.is_empty() { vec![0] } else { v };
-        Ok((vec![
-            ("active_groups", vec![groups as i32]),
-            ("group_source_starts", nonempty(starts.clone())),
-            ("group_rope_positions", nonempty(starts)),
-            ("compressed_slots", nonempty(slots)),
-            ("active_sequences", vec![1]),
-            ("sequence_offsets", vec![0, tokens as i32]),
-            ("state_sequence_ids", vec![placement.state as i32]),
-        ], groups))
+    let nonempty = |v: Vec<i32>| if v.is_empty() { vec![0] } else { v };
+    let compressor_tables = |ratio: usize| -> anyhow::Result<(Vec<(&'static str, Vec<i32>)>, usize)> {
+        // Groups completed by a row of this chunk, by their first position.
+        let group_starts: Vec<usize> = (start..end).filter(|p| p % ratio == ratio - 1).map(|p| p + 1 - ratio).collect();
+        let groups = group_starts.len();
+        let slots = group_starts.iter().map(|g| placement.group_slot(ratio, g / ratio)).collect::<anyhow::Result<Vec<_>>>()?;
+        let absolute: Vec<i32> = group_starts.iter().map(|&g| g as i32).collect();
+        let tables = if start == 0 {
+            vec![
+                ("active_groups", vec![groups as i32]),
+                ("group_source_starts", nonempty(absolute.clone())),
+                ("group_rope_positions", nonempty(absolute)),
+                ("compressed_slots", nonempty(slots)),
+                ("active_sequences", vec![1]),
+                ("sequence_offsets", vec![0, tokens as i32]),
+                ("state_sequence_ids", vec![placement.state as i32]),
+            ]
+        } else {
+            vec![
+                ("active_groups", vec![groups as i32]),
+                ("group_sequence_slots", nonempty(vec![0; groups])),
+                ("group_source_positions", nonempty(absolute.clone())),
+                ("group_rope_positions", nonempty(absolute)),
+                ("compressed_slots", nonempty(slots)),
+                ("active_sequences", vec![1]),
+                ("sequence_offsets", vec![0, tokens as i32]),
+                ("sequence_start_positions", vec![start as i32]),
+                ("state_sequence_ids", vec![placement.state as i32]),
+            ]
+        };
+        Ok((tables, groups))
     };
-    let (c4_tables, c4_groups) = prefill_tables(4)?;
-    let (c128_tables, c128_groups) = prefill_tables(128)?;
-    let visible4: Vec<i32> = (0..tokens).map(|t| ((t + 1) / 4) as i32).collect();
+    let (c4_tables, _) = compressor_tables(4)?;
+    let (c128_tables, _) = compressor_tables(128)?;
+    let visible4: Vec<i32> = (start..end).map(|t| ((t + 1) / 4) as i32).collect();
     let mut c128_indices = vec![-1i32; tokens * c128_width];
-    for t in 0..tokens {
+    for (row, t) in (start..end).enumerate() {
         for j in 0..((t + 1) / 128).min(c128_width) {
-            c128_indices[t * c128_width + j] = placement.group_slot(128, j)?;
+            c128_indices[row * c128_width + j] = placement.group_slot(128, j)?;
         }
     }
+    let c4_groups = end / 4;
     Ok(StepTables {
         decode: false,
+        start,
         rows: tokens,
         swa_indices,
-        swa_lengths: (0..tokens).map(|t| (t + 1).min(WINDOW) as i32).collect(),
+        swa_lengths: (start..end).map(|t| (t + 1).min(WINDOW) as i32).collect(),
         main_slots: positions.iter().map(|&p| slot(p as usize)).collect(),
         positions,
         c4_tables,
         c128_tables,
         c4_groups,
-        c128_groups,
+        c128_groups: end / 128,
         c4_page_table: placement.c4_pages.clone(),
         c4_table_width: c4_groups.div_ceil(compressed_page_rows(4)).max(1),
         c4_table_stride: 0,
         c4_indexed_lengths: visible4.iter().map(|&v| v.min(index_topk as i32)).collect(),
         c4_visible: visible4,
-        c128_lengths: (0..tokens).map(|t| ((t + 1) / 128) as i32).collect(),
+        c128_lengths: (start..end).map(|t| ((t + 1) / 128) as i32).collect(),
         c128_indices,
     })
 }
@@ -160,6 +185,7 @@ pub(crate) fn decode_step(
     let n = rows.len();
     let mut tables = StepTables {
         decode: true,
+        start: 0,
         rows: n,
         positions: Vec::with_capacity(n),
         main_slots: Vec::with_capacity(n),
@@ -225,7 +251,7 @@ mod tests {
         let _other = pool.admit(1000)?;
         let seq = pool.admit(1000)?;
         let base = (seq.state * shape.ring_pages * SOURCE_PAGE_TOKENS) as i32;
-        let pre = prefill_step(&seq, &shape, 300, 512, 1024)?;
+        let pre = prefill_step(&seq, &shape, 0, 300, 512, 1024)?;
         assert_eq!(&pre.swa_indices[..3], &[base, -1, -1]);
         assert_eq!(pre.swa_indices[200 * WINDOW], base + 73);
         assert_eq!((pre.c4_groups, pre.c128_groups), (75, 2));
@@ -233,6 +259,13 @@ mod tests {
         assert_eq!(pre.c4_tables[6].1, vec![seq.state as i32]);
         assert_eq!(&pre.c128_indices[255 * 1024..255 * 1024 + 3],
             &[seq.group_slot(128, 0)?, seq.group_slot(128, 1)?, -1]);
+        let cont = prefill_step(&seq, &shape, 300, 100, 512, 1024)?;
+        assert_eq!(cont.c4_tables.len(), 9);
+        // Positions 303, 307, ... complete groups 75, 76, ...
+        assert_eq!(cont.c4_tables[2].1[0], 300);
+        assert_eq!(cont.c4_tables[4].1[0], seq.group_slot(4, 75)?);
+        assert_eq!(cont.c4_tables[7].1, vec![300]);
+        assert_eq!(cont.swa_indices[0], base + 300 - 127);
         let dec = decode_step(&[(&seq, 300)], &shape, 512, 1024)?;
         assert_eq!(dec.main_slots, vec![i64::from(base) + 300]);
         assert_eq!(dec.c4_visible, vec![75]);
