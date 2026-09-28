@@ -14,12 +14,14 @@ pub struct ExpertGeometry {
     pub topk: u32,
     /// Full (un-sliced) expert intermediate size.
     pub intermediate: u32,
+    /// Backbone layers with routed experts.
+    pub layers: u32,
 }
 
 impl ExpertGeometry {
-    pub const DEEPSEEK_V41: Self = Self { hidden: 5120, experts: 384, topk: 6, intermediate: 2304 };
-    pub const DEEPSEEK_V4_FLASH: Self = Self { hidden: 4096, experts: 256, topk: 6, intermediate: 2048 };
-    pub const DEEPSEEK_V4_PRO: Self = Self { hidden: 7168, experts: 384, topk: 6, intermediate: 3072 };
+    pub const DEEPSEEK_V41: Self = Self { hidden: 5120, experts: 384, topk: 6, intermediate: 2304, layers: 40 };
+    pub const DEEPSEEK_V4_FLASH: Self = Self { hidden: 4096, experts: 256, topk: 6, intermediate: 2048, layers: 43 };
+    pub const DEEPSEEK_V4_PRO: Self = Self { hidden: 7168, experts: 384, topk: 6, intermediate: 3072, layers: 61 };
 
     /// BF16 bytes of one hidden-width row (a routed input or a rank partial).
     pub const fn row_bytes(&self) -> u32 {
@@ -44,7 +46,7 @@ impl ExpertGeometry {
 
     /// A short stable key for artifact and symbol names.
     pub fn key(&self) -> String {
-        format!("h{}e{}k{}i{}", self.hidden, self.experts, self.topk, self.intermediate)
+        format!("h{}e{}k{}i{}l{}", self.hidden, self.experts, self.topk, self.intermediate, self.layers)
     }
 }
 
@@ -77,7 +79,7 @@ mod tests {
         assert_eq!(ExpertGeometry::DEEPSEEK_V4_FLASH.slice(4), Some(512));
         assert_eq!(ExpertGeometry::DEEPSEEK_V4_PRO.slice(6), Some(512));
         assert_eq!(g.slice(5), None);
-        assert_eq!(g.key(), "h5120e384k6i2304");
+        assert_eq!(g.key(), "h5120e384k6i2304l40");
         assert_eq!(g.family(), Some("v41"));
         assert_eq!(ExpertGeometry::DEEPSEEK_V4_FLASH.family(), Some("dsv4f"));
     }

@@ -76,6 +76,7 @@ impl RoutedExpertShape {
             experts: narrow(self.experts)?,
             topk: narrow(self.topk)?,
             intermediate: narrow(self.intermediate)?,
+            layers: narrow(self.layers)?,
         })
     }
 }

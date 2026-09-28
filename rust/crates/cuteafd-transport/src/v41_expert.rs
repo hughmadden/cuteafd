@@ -65,7 +65,8 @@ fn validate_canonical_body(
         header.row_count > 0 && header.row_count <= max_rows,
         "native batch exceeds admitted row capacity"
     );
-    ensure!(header.layer_id < 40, "native backbone layer out of range");
+    let geometry = cuteafd_core::expert_geometry();
+    ensure!(header.layer_id < geometry.layers, "native backbone layer out of range");
     ensure!(
         header.hidden_dim == cuteafd_core::expert_geometry().hidden
             && matches!(
@@ -80,21 +81,23 @@ fn validate_canonical_body(
         header.route_count
             == header
                 .row_count
-                .checked_mul(6)
+                .checked_mul(geometry.topk)
                 .context("route count overflow")?,
-        "native backbone needs six routes per token"
+        "native backbone needs top-k routes per token"
     );
     for row_index in 0..header.row_count {
         let row = row_at(row_index as usize)?;
         ensure!(
-            row.route_offset == row_index * 6 && row.route_count == 6,
+            row.route_offset == row_index * geometry.topk && row.route_count == geometry.topk,
             "noncanonical native row route span"
         );
-        let mut ids = [u32::MAX; 6];
-        for slot in 0..6usize {
-            let route = route_at(row_index as usize * 6 + slot)?;
+        let topk = geometry.topk as usize;
+        ensure!(topk <= 16, "native backbone supports at most 16 routes per token");
+        let mut ids = [u32::MAX; 16];
+        for slot in 0..topk {
+            let route = route_at(row_index as usize * topk + slot)?;
             ensure!(
-                route.row_index == row_index && route.expert_id < 384,
+                route.row_index == row_index && route.expert_id < geometry.experts,
                 "invalid native expert route"
             );
             ensure!(
