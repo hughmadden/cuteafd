@@ -30,6 +30,8 @@ pub(crate) struct Engine<'a> {
     pub decode_rows: usize,
     pub prefill_rows: usize,
     pub c128_width: usize,
+    /// Longest sequence the exported programs' cache extents cover.
+    pub max_context: usize,
     pub stream: *mut c_void,
     pub sms: u32,
 }

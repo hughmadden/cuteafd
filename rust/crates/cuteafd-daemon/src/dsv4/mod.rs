@@ -1,6 +1,7 @@
 //! DeepSeek V4 (Flash / Pro) coordinator engine over the exported b12x programs.
 pub(crate) mod engine;
 pub(crate) mod metadata;
+pub(crate) mod serve;
 pub(crate) mod weights;
 
 use anyhow::{ensure, Context, Result};
@@ -9,29 +10,36 @@ use cuteafd_loader::deepseek_v4::DeepseekV4Config;
 use cuteafd_transport::v41_expert::V41Tp4Roce;
 use cuteafd_transport::TcpTransportConfig;
 use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-#[derive(Debug, clap::Args)]
-pub(crate) struct GoldenArgs {
+/// What every DeepSeek V4 command needs to stand up the engine.
+#[derive(Debug, Clone, clap::Args)]
+pub(crate) struct EngineArgs {
     /// Checkpoint snapshot directory.
     #[arg(long)]
     pub snapshot: PathBuf,
-    /// Directory with tokens.bin, layerNN.bin and logits.bin from golden.py.
-    #[arg(long)]
-    pub golden: PathBuf,
     /// Spark expert ranks in TP order, comma-separated HOST:PORT.
     #[arg(long)]
     pub peers: String,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
     pub native_lib: PathBuf,
     /// dsv4_programs.json written by the exporter next to the library.
-    #[arg(long)]
+    #[arg(long, default_value = "/opt/cuteafd/share/DSV4_PROGRAMS.json")]
     pub manifest: PathBuf,
     #[arg(long, default_value_t = 0)]
     pub device: i32,
     #[arg(long, default_value_t = 188)]
     pub sms: u32,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct GoldenArgs {
+    #[command(flatten)]
+    pub engine: EngineArgs,
+    /// Directory with tokens.bin, layerNN.bin and logits.bin from golden.py.
+    #[arg(long)]
+    pub golden: PathBuf,
     /// Compare only the first N layers' streams (all logits still compared).
     #[arg(long)]
     pub layers: Option<usize>,
@@ -61,7 +69,7 @@ fn similarity(a: &[f32], b: &[f32]) -> (f64, f64) {
     (dot / (na.sqrt() * nb.sqrt()).max(f64::MIN_POSITIVE), diff.sqrt() / nb.sqrt().max(f64::MIN_POSITIVE))
 }
 
-fn embed_rows(catalog: &cuteafd_loader::OfficialV41Catalog, tokens: &[u32], hidden: usize) -> Result<Vec<u8>> {
+pub(crate) fn embed_rows(catalog: &cuteafd_loader::OfficialV41Catalog, tokens: &[u32], hidden: usize) -> Result<Vec<u8>> {
     let tensor = catalog.tensor("embed.weight")?;
     let file = std::fs::File::open(catalog.snapshot().join(&tensor.shard))?;
     let row = hidden * 2;
@@ -76,7 +84,16 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     tokio::task::spawn_blocking(move || golden(args)).await?
 }
 
-fn golden(args: GoldenArgs) -> Result<()> {
+/// Everything the engine borrows, built on the calling (blocking) thread.
+pub(crate) struct Loaded {
+    pub catalog: cuteafd_loader::OfficialV41Catalog,
+    pub library: NativeLibrary,
+    pub cfg: DeepseekV4Config,
+    pub family: &'static str,
+    pub manifest: serde_json::Value,
+}
+
+pub(crate) fn load(args: &EngineArgs) -> Result<Loaded> {
     let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     let geometry = catalog.routed_experts().geometry()?;
     cuteafd_core::set_expert_geometry(geometry).map_err(|g| anyhow::anyhow!("geometry already {g:?}"))?;
@@ -88,41 +105,75 @@ fn golden(args: GoldenArgs) -> Result<()> {
     let cfg = DeepseekV4Config::read(&args.snapshot, 1)?;
     let library = unsafe { NativeLibrary::load(&args.native_lib) }?;
     library.cuda_set_device(args.device)?;
-    let programs = library.dsv4_programs()?.with_manifest(&args.manifest)?;
-    let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&args.manifest)?)?;
-    let caps = &manifest["capacities"];
-    let stream = library.cuda_stream_create()?;
+    let manifest = serde_json::from_str(&std::fs::read_to_string(&args.manifest)
+        .with_context(|| format!("reading {}", args.manifest.display()))?)?;
+    Ok(Loaded { catalog, library, cfg, family, manifest })
+}
+
+/// Builds the engine over `loaded` and hands it, with a Spark transport and a
+/// runtime for it, to `body`.
+pub(crate) fn with_engine<T>(
+    loaded: &Loaded,
+    args: &EngineArgs,
+    body: impl FnOnce(&engine::Engine<'_>, &mut V41Tp4Roce, &tokio::runtime::Runtime) -> Result<T>,
+) -> Result<T> {
+    let programs = loaded.library.dsv4_programs()?.with_manifest(&args.manifest)?;
+    let caps = &loaded.manifest["capacities"];
+    let stream = loaded.library.cuda_stream_create()?;
     let started = Instant::now();
-    let loader = weights::WeightLoader { library: &library, catalog: &catalog, programs: &programs, family, stream };
-    let model = loader.model(&cfg)?;
+    let loader = weights::WeightLoader {
+        library: &loaded.library, catalog: &loaded.catalog, programs: &programs, family: loaded.family, stream,
+    };
+    let model = loader.model(&loaded.cfg)?;
     tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 coordinator weights resident");
     let max_context = caps["max_context"].as_u64().context("manifest max_context")? as usize;
     let engine = engine::Engine {
-        library: &library,
+        library: &loaded.library,
         programs: &programs,
-        cfg: cfg.clone(),
+        cfg: loaded.cfg.clone(),
         weights: model,
-        family,
+        family: loaded.family,
         decode_rows: caps["decode_rows"].as_u64().context("decode_rows")? as usize,
         prefill_rows: caps["prefill_rows"].as_u64().context("prefill_rows")? as usize,
         c128_width: max_context.div_ceil(128).div_ceil(64) * 64,
+        max_context,
         stream,
         sms: args.sms,
     };
-    let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
-        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
-    let embed = embed_rows(&catalog, &tokens, cfg.dim)?;
     let peers = args.peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
     let executors: Vec<u64> = (1..=peers.len() as u64).collect();
     let mut transport = V41Tp4Roce::new_ranks(&peers, &executors, 4096,
         TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 })?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let result = body(&engine, &mut transport, &runtime);
+    drop(engine);
+    unsafe { loaded.library.cuda_stream_destroy(stream)? };
+    result
+}
+
+fn golden(args: GoldenArgs) -> Result<()> {
+    let loaded = load(&args.engine)?;
+    let cfg = loaded.cfg.clone();
+    with_engine(&loaded, &args.engine, |engine, transport, runtime| golden_run(&args, &loaded.catalog, &cfg, engine, transport, runtime))
+}
+
+fn golden_run(
+    args: &GoldenArgs,
+    catalog: &cuteafd_loader::OfficialV41Catalog,
+    cfg: &DeepseekV4Config,
+    engine: &engine::Engine<'_>,
+    transport: &mut V41Tp4Roce,
+    runtime: &tokio::runtime::Runtime,
+) -> Result<()> {
+    let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
+        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let embed = embed_rows(catalog, &tokens, cfg.dim)?;
     let started = Instant::now();
     let compare_layers = args.layers.unwrap_or(cfg.n_layers);
     let prefill = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
     let mut sequence = engine.sequence(tokens.len())?;
     let row = cfg.dim * 2;
-    let mut logits = engine.prefill(&mut sequence, &tokens[..prefill], &embed[..prefill * row], &mut transport, &runtime,
+    let mut logits = engine.prefill(&mut sequence, &tokens[..prefill], &embed[..prefill * row], transport, runtime,
         |layer, stream| {
             if layer < compare_layers && prefill == tokens.len() {
                 let golden = std::fs::read(args.golden.join(format!("layer{layer:02}.bin")))?;
@@ -136,7 +187,7 @@ fn golden(args: GoldenArgs) -> Result<()> {
     let decode_started = Instant::now();
     for position in prefill..tokens.len() {
         let token = tokens[position];
-        logits.extend(engine.decode(&mut sequence, token, &embed[position * row..][..row], &mut transport, &runtime)?);
+        logits.extend(engine.decode(&mut sequence, token, &embed[position * row..][..row], transport, runtime)?);
     }
     let decode_steps = tokens.len() - prefill;
     if decode_steps > 0 {
@@ -175,7 +226,5 @@ fn golden(args: GoldenArgs) -> Result<()> {
         println!("decode rows: top-1 agreement {:.1}% | worst row cosine {worst:.6}",
             100.0 * decode_agree as f64 / decode_steps as f64);
     }
-    unsafe { library.cuda_stream_destroy(stream)? };
-    let _ = Path::new("");
     Ok(())
 }

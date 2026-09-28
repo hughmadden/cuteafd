@@ -22,6 +22,8 @@ pub(crate) enum Commands {
     ExpertProbe(ExpertProbeArgs),
     /// Prefill a DeepSeek V4 golden prompt and compare layers and logits.
     Dsv4Golden(crate::dsv4::GoldenArgs),
+    /// Serve a DeepSeek V4 checkpoint (OpenAI API) with Spark experts.
+    ServeDsv4(crate::dsv4::serve::ServeArgs),
     /// Serve official V4.1 native TP4 experts over RoCE.
     ExpertdNative(NativeExpertDaemonArgs),
     /// Serve the official V4.1 target text path.
