@@ -2,7 +2,7 @@
 //!
 //! Layers `0..count` skip the Spark exchange: their experts run on the RTX
 //! through the geometry's `rtx_backbone` kernels (`cuteafd_{family}_local_*`),
-//! reading the same FP8 K32 wire rows and host routes the Sparks would get,
+//! reading the same FP8 K32 wire rows and device routes the Sparks would get,
 //! and the local reducer adds the shared expert.
 use crate::v41_experts::{ExpertLayer, ExpertWeights};
 use crate::v41_memory::DeviceAllocation;
@@ -20,13 +20,10 @@ struct State<'a> {
 }
 
 pub(crate) struct LocalExperts<'a> {
-    library: &'a NativeLibrary,
     layers: Vec<ExpertWeights<'a>>,
     states: Vec<State<'a>>,
     _scratch: DeviceAllocation<'a>,
     reducer: V41LocalExpertReducer<'a>,
-    ids: DeviceAllocation<'a>,
-    routing: DeviceAllocation<'a>,
     pub output: DeviceAllocation<'a>,
     topk: usize,
 }
@@ -95,13 +92,10 @@ impl<'a> LocalExperts<'a> {
             }
         }
         Ok(Some(Self {
-            library,
             layers,
             states,
             _scratch: scratch,
             reducer: library.v41_local_expert_reducer()?,
-            ids: DeviceAllocation::new(library, max_rows * shape.topk * 4)?,
-            routing: DeviceAllocation::new(library, max_rows * shape.topk * 4)?,
             output: DeviceAllocation::new(library, max_rows * shape.hidden * 2)?,
             topk: shape.topk,
         }))
@@ -111,34 +105,31 @@ impl<'a> LocalExperts<'a> {
         self.layers.len()
     }
 
-    /// Runs layer `layer`'s experts for `rows` wire rows with host routes and
-    /// writes routed + shared into [`Self::output`].
+    /// Runs layer `layer`'s experts for `rows` wire rows with device routes
+    /// and writes routed + shared into [`Self::output`].
     ///
     /// # Safety
-    /// `wire` holds `rows` FP8 K32 rows and `shared` `rows` BF16 rows on this
-    /// device, both complete in stream order and unchanged until it drains.
+    /// `wire` holds `rows` FP8 K32 rows, `ids`/`weights` `rows * topk` U32
+    /// expert ids and FP32 route weights, and `shared` `rows` BF16 rows on this
+    /// device, all complete in stream order and unchanged until it drains.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn run(
         &mut self,
         layer: usize,
         rows: usize,
         wire: *mut c_void,
-        ids: &[u32],
-        weights: &[f32],
+        ids: *mut c_void,
+        weights: *mut c_void,
         shared: *mut c_void,
         stream: *mut c_void,
     ) -> Result<()> {
-        ensure!(layer < self.layers.len() && ids.len() == rows * self.topk && weights.len() == ids.len(),
-            "local expert layer {layer} or routes out of range");
-        let bytes = |values: &[u32]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
-        let weight_bits: Vec<u32> = weights.iter().map(|w| w.to_bits()).collect();
-        self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: ids.len() * 4, ..self.ids.buffer }, &bytes(ids))?;
-        self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: ids.len() * 4, ..self.routing.buffer }, &bytes(&weight_bits))?;
+        ensure!(layer < self.layers.len(), "local expert layer {layer} out of range");
         let state = self.states.iter_mut().find(|s| s.kernel.info().capacity_rows as usize >= rows)
             .context("no local expert capacity for this many rows")?;
         self.layers[layer].bind(&state.kernel, &mut state.slots)?;
         state.slots[0] = wire;
-        state.slots[1] = self.ids.buffer.ptr;
-        state.slots[2] = self.routing.buffer.ptr;
+        state.slots[1] = ids;
+        state.slots[2] = weights;
         let info = state.kernel.info();
         let args = V41ExpertLaunchArgs {
             tensors: state.slots,

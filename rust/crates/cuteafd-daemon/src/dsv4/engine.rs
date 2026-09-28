@@ -146,6 +146,11 @@ struct Workspace<'a> {
     selected: Dev<'a>,
     topk_scratch: Dev<'a>,
     logits: Dev<'a>,
+    /// This step's token ids (hash-layer routing).
+    tokens: Dev<'a>,
+    /// Routes: expert ids (U32) and weights (FP32), [rows, topk].
+    route_ids: Dev<'a>,
+    route_weights: Dev<'a>,
     wire: Dev<'a>,
     shared: Dev<'a>,
     planes: Vec<Dev<'a>>,
@@ -153,7 +158,7 @@ struct Workspace<'a> {
     dummy: Dev<'a>,
     vocab_logits: Dev<'a>,
     tables: StepBuffers<'a>,
-    /// Pinned staging: router logits + wire rows down, rank partials up.
+    /// Pinned staging: routes + wire rows down, rank partials up.
     router_host: HostAllocation<'a>,
     planes_host: RefCell<HostAllocation<'a>>,
     // Drops before its workspace below.
@@ -284,7 +289,7 @@ impl<'a> Engine<'a> {
     fn workspace(&self, t: usize) -> Result<Workspace<'a>> {
         let h = self.cfg.dim;
         let heads = self.cfg.n_heads;
-        let experts = self.cfg.n_routed_experts;
+        let (experts, topk) = (self.cfg.n_routed_experts, self.cfg.n_activated_experts);
         let head_workspace = self.alloc(cuteafd_ffi::dsv4::VOCABULARY_HEAD_WORKSPACE)?;
         let mut topk_scratch = 0usize;
         for route in [format!("decode_m{}", self.decode_rows), format!("prefill_m{}", self.prefill_rows)] {
@@ -301,11 +306,14 @@ impl<'a> Engine<'a> {
             q_rank: self.alloc(t * self.cfg.q_lora_rank * 2)?,
             attn_out: self.alloc(t * heads * 512 * 2)?,
             delta: self.alloc(t * h * 2)?,
-            index_query: self.alloc(t * 64 * 128)?,
-            index_weights: self.alloc(t * 64 * 4)?,
+            index_query: self.alloc(t * self.cfg.index_n_heads * self.cfg.index_head_dim)?,
+            index_weights: self.alloc(t * self.cfg.index_n_heads * 4)?,
             selected: self.alloc(t * self.cfg.index_topk * 4)?,
             topk_scratch: self.zeroed(topk_scratch)?,
             logits: self.alloc(t * experts * 4)?,
+            tokens: self.alloc(t * 4)?,
+            route_ids: self.alloc(t * topk * 4)?,
+            route_weights: self.alloc(t * topk * 4)?,
             wire: self.alloc(t * (h + h / 32))?,
             shared: self.alloc(t * h * 2)?,
             planes: (0..4).map(|_| self.alloc(t * h * 2)).collect::<Result<_>>()?,
@@ -313,7 +321,7 @@ impl<'a> Engine<'a> {
             dummy: self.zeroed(4096)?,
             vocab_logits: self.alloc(t * self.cfg.vocab_size * 4)?,
             tables: self.step_buffers(t)?,
-            router_host: HostAllocation::new(self.library, t * (experts * 4 + h + h / 32))?,
+            router_host: HostAllocation::new(self.library, t * (topk * 8 + h + h / 32))?,
             planes_host: RefCell::new(HostAllocation::new(self.library, 4 * t * h * 2)?),
             // SAFETY: the workspace buffer lives in the same struct and drops
             // after the head (field order).
@@ -380,7 +388,8 @@ impl<'a> Engine<'a> {
     }
 
     /// Prefills the next chunk of a sequence (rows continue at its length) and
-    /// returns FP32 logits [T, vocab]. `on_layer` receives each layer's stream.
+    /// returns FP32 logits of its last `logit_rows` rows [logit_rows, vocab].
+    /// `on_layer` receives each layer's stream.
     pub fn prefill(
         &self,
         placement: &mut Placement,
@@ -388,6 +397,7 @@ impl<'a> Engine<'a> {
         embed: &[u8],
         transport: &mut V41Tp4Roce,
         runtime: &tokio::runtime::Runtime,
+        logit_rows: usize,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
     ) -> Result<Vec<f32>> {
         let start = placement.len;
@@ -395,7 +405,7 @@ impl<'a> Engine<'a> {
             "prefill chunk of {} tokens at {start} exceeds {} rows or the {}-token context",
             tokens.len(), self.prefill_rows, self.max_context);
         let tables = metadata::prefill_step(placement, &self.shape, start, tokens.len(), self.cfg.index_topk, self.c128_width)?;
-        let logits = self.step(&tables, tokens, embed, transport, runtime, on_layer)?;
+        let logits = self.step(&tables, tokens, embed, transport, runtime, logit_rows, on_layer)?;
         placement.len += tokens.len();
         Ok(logits)
     }
@@ -416,7 +426,7 @@ impl<'a> Engine<'a> {
         let tokens: Vec<u32> = rows.iter().map(|(_, token)| *token).collect();
         let steps: Vec<(&Placement, usize)> = rows.iter().map(|(p, _)| (&**p, p.len)).collect();
         let tables = metadata::decode_step(&steps, &self.shape, self.cfg.index_topk, self.c128_width)?;
-        let logits = self.step(&tables, &tokens, embed, transport, runtime, None)?;
+        let logits = self.step(&tables, &tokens, embed, transport, runtime, tokens.len(), None)?;
         for (placement, _) in rows.iter_mut() {
             placement.len += 1;
         }
@@ -431,11 +441,12 @@ impl<'a> Engine<'a> {
         embed: &[u8],
         transport: &mut V41Tp4Roce,
         runtime: &tokio::runtime::Runtime,
+        logit_rows: usize,
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
     ) -> Result<Vec<f32>> {
         let t = tables.rows;
         let h = self.cfg.dim;
-        ensure!(tokens.len() == t && embed.len() == t * h * 2, "step rows disagree");
+        ensure!(tokens.len() == t && embed.len() == t * h * 2 && logit_rows <= t, "step rows disagree");
         let slot = if tables.decode { &self.decode_workspace } else { &self.prefill_workspace };
         if slot.borrow().is_none() {
             let rows = if tables.decode { self.decode_rows } else { self.prefill_rows };
@@ -454,6 +465,8 @@ impl<'a> Engine<'a> {
             }
         }
         self.library.copy_h2d(w.stream_a.buffer, &expanded)?;
+        let token_bytes: Vec<u8> = tokens.iter().flat_map(|token| token.to_le_bytes()).collect();
+        self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: token_bytes.len(), ..w.tokens.buffer }, &token_bytes)?;
         let rows = Dsv4Scalar::I32(t as i32);
         let cap = if tables.decode { self.decode_rows } else { self.prefill_rows };
         let mut ranks = 0usize;
@@ -494,7 +507,12 @@ impl<'a> Engine<'a> {
         if ranks > 0 {
             self.post(&w, ranks, rows, self.weights.layers.len() - 1)?;
         }
-        self.head(&w.stream_a, t, &w)
+        if logit_rows == 0 {
+            // The next step rewrites the tables only after this one drains.
+            self.sync()?;
+            return Ok(Vec::new());
+        }
+        self.head(&w.stream_a, t, logit_rows, &w)
     }
 
     /// Which sparse attention a layer runs this step.
@@ -609,6 +627,18 @@ impl<'a> Engine<'a> {
         self.run("router_scores", &[
             ("x", w.y.buffer.ptr), ("w", weights.ptr("gate")?), ("logits", w.logits.buffer.ptr),
         ], &[rows])?;
+        let (bias, tid2eid) = if weights.hash {
+            (std::ptr::null_mut(), weights.ptr("gate.tid2eid")?)
+        } else {
+            (weights.ptr("gate.bias")?, std::ptr::null_mut())
+        };
+        // SAFETY: logits, routing tables, tokens and route outputs are live
+        // device buffers sized for this step's rows.
+        unsafe {
+            self.library.dsv4_router_select(w.logits.buffer.ptr, bias, tid2eid, w.tokens.buffer.ptr,
+                w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t as usize, self.cfg.n_routed_experts,
+                self.cfg.n_activated_experts, self.cfg.route_scale as f32, self.stream)?;
+        }
         let grid = (t as usize * h.div_ceil(256)).div_ceil(8).min(4 * self.sms as usize).max(1);
         self.run("expert_input_quant", &[
             ("source_ptr", w.y.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
@@ -693,6 +723,34 @@ impl<'a> Engine<'a> {
     /// Router download, shared expert launch, host routing, Spark exchange
     /// and plane uploads; returns the Spark rank count.
     #[allow(clippy::too_many_arguments)]
+    /// One Spark request for `rows` wire rows with `topk` routes each.
+    fn expert_request(&self, layer: usize, rows: usize, routes: Vec<ExpertProtocolV2RouteEntry>, wire: Vec<u8>)
+        -> Result<ExpertProtocolV2Request> {
+        let topk = self.cfg.n_activated_experts as u32;
+        let mut request = ExpertProtocolV2Request::new(
+            layer as u64 + 1, 17, layer as u32, self.cfg.dim as u32, ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+            (0..rows as u32).map(|row| ExpertProtocolV2RowDescriptor {
+                row_id: u64::from(row), source_kind: ExpertV2SourceKind::Prefill, source_request_id: 1,
+                token_position: u64::from(row), route_offset: row * topk, route_count: topk,
+            }).collect(),
+            routes, wire,
+        )?;
+        request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+        Ok(request)
+    }
+
+    /// Connects every Spark rank and registers full-size buffers with one
+    /// prefill-sized request of zero rows, so the first real request does not
+    /// pay for connection setup (about 0.6 s).
+    pub fn warm_transport(&self, transport: &mut V41Tp4Roce, runtime: &tokio::runtime::Runtime) -> Result<()> {
+        let (rows, h, experts, topk) = (self.prefill_rows, self.cfg.dim, self.cfg.n_routed_experts, self.cfg.n_activated_experts);
+        let routes = (0..rows * topk).map(|i| ExpertProtocolV2RouteEntry {
+            row_index: (i / topk) as u32, expert_id: (i % experts) as u32, gate_weight: 0.0,
+        }).collect();
+        let request = self.expert_request(self.cfg.n_layers - 1, rows, routes, vec![0; rows * (h + h / 32)])?;
+        runtime.block_on(async { transport.execute(&request, |_, _, _| Ok(())).await })
+    }
+
     fn exchange(
         &self,
         layer: usize,
@@ -704,81 +762,58 @@ impl<'a> Engine<'a> {
         runtime: &tokio::runtime::Runtime,
     ) -> Result<usize> {
         let t = tokens.len();
-        let (h, experts, topk) = (self.cfg.dim, self.cfg.n_routed_experts, self.cfg.n_activated_experts);
+        let (h, topk) = (self.cfg.dim, self.cfg.n_activated_experts);
         let rows = Dsv4Scalar::I32(t as i32);
-        let timer = Instant::now();
-        let (logit_bytes, wire_bytes) = (t * experts * 4, t * (h + h / 32));
-        let host = w.router_host.buffer;
-        let wire_host = cuteafd_ffi::CuteafdHostBuffer {
-            // SAFETY: the wire rows follow the logits inside the pinned buffer.
-            ptr: unsafe { host.ptr.cast::<u8>().add(logit_bytes) }.cast(),
-            bytes: host.bytes - logit_bytes,
-            ..host
-        };
-        // SAFETY: both pinned regions are large enough; the sync below completes them.
-        unsafe {
-            self.library.copy_d2h_host_buffer_async(host, w.logits.buffer, logit_bytes, self.stream)?;
-            self.library.copy_d2h_host_buffer_async(wire_host, w.wire.buffer, wire_bytes, self.stream)?;
-        }
-        self.sync()?;
-        let staged = w.router_host.bytes();
-        let logits: Vec<f32> = staged[..logit_bytes]
-            .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-        let wire = staged[logit_bytes..logit_bytes + wire_bytes].to_vec();
-        self.profile.borrow_mut().add(Phase::RouterSync, timer);
-        // The shared expert runs on the GPU while the Sparks compute.
-        self.run(&format!("shared_ffn_m{cap}"), &[
+        let shared = |this: &Self| this.run(&format!("shared_ffn_m{cap}"), &[
             ("x", w.y.buffer.ptr), ("w13", weights.ptr("w13")?), ("w13_scale", weights.ptr("w13_scale")?),
             ("w2", weights.ptr("w2")?), ("w2_scale", weights.ptr("w2_scale")?), ("out", w.shared.buffer.ptr),
             ("scratch", w.scratch.buffer.ptr),
-        ], &[rows])?;
-        let timer = Instant::now();
-        // Routing on the host: sqrtsoftplus scores; hash layers take ids from
-        // tid2eid[token], score layers the top-k of score + bias; weights are
-        // the unbiased scores at those ids, sum-normalized, times route_scale.
-        let mut routes = Vec::with_capacity(t * topk);
-        for (row, token) in tokens.iter().enumerate() {
-            let scores: Vec<f32> = logits[row * experts..][..experts].iter()
-                .map(|&x| (if x > 20.0 { x } else { x.exp().ln_1p() }).sqrt()).collect();
-            let ids: Vec<usize> = if weights.hash {
-                weights.tid2eid[*token as usize * topk..][..topk].iter().map(|&e| e as usize).collect()
-            } else {
-                let mut order: Vec<usize> = (0..experts).collect();
-                order.sort_by(|&a, &b| (scores[b] + weights.gate_bias[b]).total_cmp(&(scores[a] + weights.gate_bias[a])).then(a.cmp(&b)));
-                order.truncate(topk);
-                order
-            };
-            let total: f32 = ids.iter().map(|&e| scores[e]).sum();
-            for &e in &ids {
-                routes.push(ExpertProtocolV2RouteEntry {
-                    row_index: row as u32,
-                    expert_id: e as u32,
-                    gate_weight: scores[e] / total * self.cfg.route_scale as f32,
-                });
-            }
-        }
+        ], &[rows]);
         let local_layers = self.local.borrow().as_ref().map_or(0, |l| l.layers());
         if layer < local_layers {
-            let ids: Vec<u32> = routes.iter().map(|r| r.expert_id).collect();
-            let weights: Vec<f32> = routes.iter().map(|r| r.gate_weight).collect();
-            self.profile.borrow_mut().add(Phase::Routing, timer);
+            // Routes, wire rows and the shared expert stay on the device; the
+            // host only enqueues.
+            shared(self)?;
             let timer = Instant::now();
             let mut local = self.local.borrow_mut();
             let local = local.as_mut().context("local experts")?;
-            // SAFETY: wire and shared rows are complete in stream order.
-            unsafe { local.run(layer, t, w.wire.buffer.ptr, &ids, &weights, w.shared.buffer.ptr, self.stream)? };
+            // SAFETY: wire, routes and shared rows are complete in stream order.
+            unsafe {
+                local.run(layer, t, w.wire.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
+                    w.shared.buffer.ptr, self.stream)?
+            };
             self.profile.borrow_mut().add(Phase::Experts, timer);
             return Ok(LOCAL_EXPERTS);
         }
-        let mut request = ExpertProtocolV2Request::new(
-            layer as u64 + 1, 17, layer as u32, h as u32, ExpertV2Dtype::Fp8E4m3Ue8m0K32,
-            (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
-                row_id: u64::from(row), source_kind: ExpertV2SourceKind::Prefill, source_request_id: 1,
-                token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32,
-            }).collect(),
-            routes, wire,
-        )?;
-        request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+        let timer = Instant::now();
+        let (route_bytes, wire_bytes) = (t * topk * 4, t * (h + h / 32));
+        let host = w.router_host.buffer;
+        let at = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
+            // SAFETY: ids, weights and wire rows are consecutive inside the pinned buffer.
+            ptr: unsafe { host.ptr.cast::<u8>().add(offset) }.cast(),
+            bytes: host.bytes - offset,
+            ..host
+        };
+        // SAFETY: the pinned regions are large enough; the sync below completes them.
+        unsafe {
+            self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.stream)?;
+            self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.stream)?;
+            self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), w.wire.buffer, wire_bytes, self.stream)?;
+        }
+        self.sync()?;
+        self.profile.borrow_mut().add(Phase::RouterSync, timer);
+        // The shared expert runs on the GPU while the Sparks compute.
+        shared(self)?;
+        let timer = Instant::now();
+        let staged = w.router_host.bytes();
+        let word = |offset: usize, i: usize| u32::from_le_bytes(staged[offset + i * 4..][..4].try_into().unwrap());
+        let routes = (0..t * topk).map(|i| ExpertProtocolV2RouteEntry {
+            row_index: (i / topk) as u32,
+            expert_id: word(0, i),
+            gate_weight: f32::from_bits(word(route_bytes, i)),
+        }).collect();
+        let wire = staged[2 * route_bytes..2 * route_bytes + wire_bytes].to_vec();
+        let request = self.expert_request(layer, t, routes, wire)?;
         let row_bytes = h * 2;
         let ranks = transport.world_size();
         ensure!(ranks <= w.planes.len(), "{ranks} Spark ranks exceed the reduction planes");
@@ -816,7 +851,8 @@ impl<'a> Engine<'a> {
         Ok(ranks)
     }
 
-    fn head(&self, stream: &Dev<'_>, t: usize, w: &Workspace<'_>) -> Result<Vec<f32>> {
+    /// Logits of the last `n` of `t` rows.
+    fn head(&self, stream: &Dev<'_>, t: usize, n: usize, w: &Workspace<'_>) -> Result<Vec<f32>> {
         let h = self.cfg.dim;
         let vocab = self.cfg.vocab_size;
         self.run("mhc_head", &[
@@ -824,14 +860,14 @@ impl<'a> Engine<'a> {
             ("scale", self.weights.head_scale.buffer.ptr), ("base", self.weights.head_base.buffer.ptr),
             ("norm", self.weights.norm.buffer.ptr), ("collapsed", w.delta.buffer.ptr), ("out", w.y.buffer.ptr),
         ], &[Dsv4Scalar::I32(t as i32)])?;
-        let _ = h;
-        // SAFETY: input, weights and logits are live buffers of the head's shape.
+        // SAFETY: input, weights and logits are live buffers of the head's
+        // shape; the last `n` rows start `t - n` rows into `y`.
         unsafe {
-            w.head.launch(w.y.buffer.ptr.cast(), self.weights.head.buffer.ptr.cast(),
-                w.vocab_logits.buffer.ptr.cast(), t as u32, self.stream)?;
+            w.head.launch(w.y.buffer.ptr.cast::<u8>().add((t - n) * h * 2).cast(), self.weights.head.buffer.ptr.cast(),
+                w.vocab_logits.buffer.ptr.cast(), n as u32, self.stream)?;
         }
         let timer = Instant::now();
-        let logits = self.download(&w.vocab_logits, t * vocab * 4)?;
+        let logits = self.download(&w.vocab_logits, n * vocab * 4)?;
         self.profile.borrow_mut().add(Phase::Head, timer);
         Ok(logits
             .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())

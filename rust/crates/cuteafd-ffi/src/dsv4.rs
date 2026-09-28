@@ -246,6 +246,30 @@ impl NativeLibrary {
     }
 }
 
+impl NativeLibrary {
+    /// DeepSeek V4 routing from FP32 router logits (see
+    /// `cuteafd_dsv4_router_select`): exactly one of `bias` (score layers) and
+    /// `tid2eid` (hash layers, with `tokens`) is non-null.
+    ///
+    /// # Safety
+    /// Every pointer is live device memory of its documented shape on the
+    /// stream's device; `logits` may be rewritten in place.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn dsv4_router_select(&self, logits: *mut c_void, bias: *const c_void, tid2eid: *const c_void,
+        tokens: *const c_void, ids: *mut c_void, routing: *mut c_void, rows: usize, experts: usize, topk: usize,
+        route_scale: f32, stream: *mut c_void) -> Result<()> {
+        type Select = unsafe extern "C" fn(*mut c_void, *const c_void, *const c_void, *const c_void, *mut c_void,
+            *mut c_void, i32, i32, i32, f32, *mut c_void) -> i32;
+        let select = *unsafe { self.lib.get::<Select>(b"cuteafd_dsv4_router_select") }?;
+        let status = unsafe {
+            select(logits, bias, tid2eid, tokens, ids, routing, i32::try_from(rows)?, i32::try_from(experts)?,
+                i32::try_from(topk)?, route_scale, stream)
+        };
+        ensure!(status == 0, "DeepSeek V4 router select failed with {status}");
+        Ok(())
+    }
+}
+
 impl VocabularyHead<'_> {
     /// # Safety
     /// `input` BF16 [rows, width], `weight` BF16 [vocab, width] and `logits`

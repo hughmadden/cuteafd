@@ -27,11 +27,9 @@ struct Source {
 pub(crate) struct LayerWeights<'a> {
     pub ratio: usize,
     pub hash: bool,
+    /// Device operands; routing adds `gate.bias` (FP32, score layers) or
+    /// `gate.tid2eid` (I32 [vocab, topk], hash layers).
     operands: HashMap<&'static str, DeviceAllocation<'a>>,
-    /// Host routing tables: score-correction bias (score layers) and the
-    /// token -> expert table (hash layers, [vocab, topk]).
-    pub gate_bias: Vec<f32>,
-    pub tid2eid: Vec<i64>,
 }
 
 impl LayerWeights<'_> {
@@ -167,15 +165,16 @@ impl<'a> WeightLoader<'a, '_> {
             };
             operands.insert(source.operand, allocation);
         }
-        let (mut gate_bias, mut tid2eid) = (Vec::new(), Vec::new());
         if hash {
+            // The checkpoint stores I64 expert ids; the router reads I32.
             let raw = self.read(&[format!("layers.{layer}.ffn.gate.tid2eid")])?;
-            tid2eid = raw.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap())).collect();
+            let ids = raw.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+                .map(|id| i32::try_from(id).map(i32::to_le_bytes)).collect::<Result<Vec<_>, _>>()?;
+            operands.insert("gate.tid2eid", self.upload(ids.as_flattened())?);
         } else {
-            let raw = self.read(&[format!("layers.{layer}.ffn.gate.bias")])?;
-            gate_bias = raw.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+            operands.insert("gate.bias", self.tensor(&format!("layers.{layer}.ffn.gate.bias"))?);
         }
-        Ok(LayerWeights { ratio, hash, operands, gate_bias, tid2eid })
+        Ok(LayerWeights { ratio, hash, operands })
     }
 
     pub fn model(&self, cfg: &DeepseekV4Config) -> Result<ModelWeights<'a>> {

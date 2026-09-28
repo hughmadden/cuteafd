@@ -71,7 +71,7 @@ __global__ void __launch_bounds__(256) score_rows_kernel(const __nv_bfloat16* hi
 // the shared-memory tree of `select_kernel`, so selections are identical.
 template<bool TransformLogits = false>
 __global__ void __launch_bounds__(512) select_fast_kernel(float* scores,const float* bias,const float* bias_vl,
-    const uint8_t* image_mask,uint32_t* ids,float* routing,int experts,int topk) {
+    const uint8_t* image_mask,uint32_t* ids,float* routing,int experts,int topk,float scale=1.5f) {
   const uint64_t row=blockIdx.x;const int tid=threadIdx.x;const int lane=tid&31,warp=tid>>5;
   if constexpr (TransformLogits) {
     if(tid<experts) {
@@ -107,7 +107,25 @@ __global__ void __launch_bounds__(512) select_fast_kernel(float* scores,const fl
   __syncthreads();
   if(tid<topk) {
     float total=0;for(int j=0;j<topk;++j) total+=selected[j];
-    routing[row*topk+tid]=(selected[tid]/(total+1e-20f))*1.5f;
+    routing[row*topk+tid]=(selected[tid]/(total+1e-20f))*scale;
+  }
+}
+// DeepSeek V4 hash layers: experts come from tid2eid[token]; weights are the
+// sqrtsoftplus scores at those experts, normalized, times the route scale.
+__global__ void select_hash_kernel(const float* logits,const int32_t* tid2eid,const uint32_t* tokens,
+    uint32_t* ids,float* routing,int experts,int topk,float scale) {
+  const uint64_t row=blockIdx.x;const int tid=threadIdx.x;
+  __shared__ float selected[8];
+  if(tid<topk) {
+    const uint32_t id=uint32_t(tid2eid[uint64_t(tokens[row])*topk+tid]);
+    const float logit=logits[row*experts+id];
+    selected[tid]=sqrtf(logit>20.0f?logit:log1pf(expf(logit)));
+    ids[row*topk+tid]=id;
+  }
+  __syncthreads();
+  if(tid<topk) {
+    float total=0;for(int j=0;j<topk;++j) total+=selected[j];
+    routing[row*topk+tid]=(selected[tid]/(total+1e-20f))*scale;
   }
 }
 template<bool TransformLogits = false>
@@ -201,5 +219,22 @@ extern "C" int32_t cuteafd_v41_router_select_logits(float* scores,const float* b
     if(n[j] && !disjoint(p[i],n[i],p[j],n[j])) return cudaErrorInvalidValue;
   select_fast_kernel<true><<<rows,512,0,reinterpret_cast<cudaStream_t>(stream)>>>(
       scores,bias,bias_vl,image_mask,ids,routing,experts,topk);
+  return cudaGetLastError();
+}
+extern "C" int32_t cuteafd_dsv4_router_select(float* logits,const float* bias,const int32_t* tid2eid,
+    const uint32_t* tokens,uint32_t* ids,float* routing,int32_t rows,int32_t experts,int32_t topk,
+    float route_scale,void* stream) {
+  if(rows<1 || rows>4096 || experts<1 || experts>512 || topk<1 || topk>8 || topk>experts ||
+      (tid2eid==nullptr)==(bias==nullptr) || (tid2eid && !tokens)) return cudaErrorInvalidValue;
+  const void* p[]={logits,ids,routing};
+  const uint64_t n[]={uint64_t(rows)*experts*4,uint64_t(rows)*topk*4,uint64_t(rows)*topk*4};
+  for(int i=0;i<3;++i) if(!span(p[i],n[i],4)) return cudaErrorInvalidValue;
+  for(int i=1;i<3;++i) for(int j=0;j<i;++j) if(!disjoint(p[i],n[i],p[j],n[j])) return cudaErrorInvalidValue;
+  auto s=reinterpret_cast<cudaStream_t>(stream);
+  if(tid2eid) {
+    select_hash_kernel<<<rows,32,0,s>>>(logits,tid2eid,tokens,ids,routing,experts,topk,route_scale);
+  } else {
+    select_fast_kernel<true><<<rows,512,0,s>>>(logits,bias,bias,nullptr,ids,routing,experts,topk,route_scale);
+  }
   return cudaGetLastError();
 }

@@ -183,6 +183,9 @@ pub(crate) fn with_engine<T>(
     let mut transport = V41Tp4Roce::new_ranks(&peers, &executors, 4096,
         TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 })?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let started = Instant::now();
+    engine.warm_transport(&mut transport, &runtime)?;
+    tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
     let result = body(&engine, &mut transport, &runtime);
     drop(engine);
     unsafe { loaded.library.cuda_stream_destroy(stream)? };
@@ -229,10 +232,11 @@ fn golden_run(
         // Per-layer streams are compared only for a whole-prompt prefill.
         let whole = offset == 0 && end == tokens.len() && compare_layers > 0;
         logits.extend(engine.prefill(&mut placement, &tokens[offset..end], &embed[offset * row..end * row], transport, runtime,
-            if whole { Some(&mut compare) } else { None })?);
+            end - offset, if whole { Some(&mut compare) } else { None })?);
         offset = end;
     }
     let prefill_elapsed = started.elapsed();
+    println!("prefill host phases: {}", engine.profile.borrow().report());
     *engine.profile.borrow_mut() = engine::Profile::default();
     let decode_started = Instant::now();
     for position in prefill..tokens.len() {

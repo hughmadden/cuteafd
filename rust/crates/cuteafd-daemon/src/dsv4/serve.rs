@@ -233,8 +233,10 @@ fn schedule(
                 }));
                 let embed = embed_rows(&loaded.catalog, &tokens, hidden)?;
                 let mut logits = Vec::new();
-                for (chunk, rows) in tokens.chunks(limit).zip(embed.chunks(limit * hidden * 2)) {
-                    logits = engine.prefill(&mut placement, chunk, rows, transport, runtime, None)?;
+                let chunks = tokens.len().div_ceil(limit);
+                for (index, (chunk, rows)) in tokens.chunks(limit).zip(embed.chunks(limit * hidden * 2)).enumerate() {
+                    let logit_rows = usize::from(index + 1 == chunks);
+                    logits = engine.prefill(&mut placement, chunk, rows, transport, runtime, logit_rows, None)?;
                 }
                 let last = logits.len() / vocab - 1;
                 let mut request = Active {

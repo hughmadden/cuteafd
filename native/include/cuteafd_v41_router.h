@@ -17,6 +17,13 @@ int32_t cuteafd_v41_router(const uint16_t* hidden,const uint16_t* weight,
 int32_t cuteafd_v41_router_select_logits(float* scores,const float* bias,
     const float* bias_vl,const uint8_t* image_mask,uint32_t* ids,float* routing,
     int32_t rows,int32_t experts,void* stream);
+// DeepSeek V4 routing from caller-projected FP32 logits [rows,experts]
+// (rewritten in place for score layers): either bias top-k (`bias`) or hash
+// layers (`tid2eid` I32 [vocab,topk] indexed by `tokens`), exactly one of
+// them; weights are normalized sqrtsoftplus scores times `route_scale`.
+int32_t cuteafd_dsv4_router_select(float* logits,const float* bias,const int32_t* tid2eid,
+    const uint32_t* tokens,uint32_t* ids,float* routing,int32_t rows,int32_t experts,int32_t topk,
+    float route_scale,void* stream);
 #ifdef __cplusplus
 }
 #endif
