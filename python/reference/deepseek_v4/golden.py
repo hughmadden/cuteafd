@@ -53,15 +53,35 @@ class Weights:
         return [n for n in self.index if n.startswith(prefix)]
 
 
+def reference_name(name: str) -> str:
+    """The key the official convert.py would give a checkpoint tensor."""
+    if name.startswith("model."):
+        name = name[len("model."):]
+    return (name.replace("self_attn", "attn").replace("mlp", "ffn")
+            .replace("weight_scale_inv", "scale").replace("e_score_correction_bias", "bias"))
+
+
 def load_module(module: torch.nn.Module, weights: Weights, prefix: str) -> None:
+    """Load `prefix`* tensors into `module` with convert.py's transformations:
+    wo_a is dequantized to BF16 with its 128x128 scales (and the scale dropped),
+    packed FP4 is reinterpreted, everything else is copied (with dtype casts)."""
     params = dict(module.named_parameters())
     missing = set(params)
-    for name in weights.names(prefix):
-        key = name[len(prefix):]
+    by_reference = {reference_name(n): n for n in weights.index}
+    for ref, name in by_reference.items():
+        if not ref.startswith(prefix):
+            continue
+        key = ref[len(prefix):]
+        if key.endswith("wo_a.scale"):
+            continue
+        value = weights.get(name)
+        if key.endswith("wo_a.weight"):
+            scale = weights.get(name[: -len("weight")] + "scale").float()
+            value = (value.float().unflatten(0, (-1, 128)).unflatten(-1, (-1, 128))
+                     * scale[:, None, :, None]).flatten(2, 3).flatten(0, 1).bfloat16()
         if key not in params:
             raise KeyError(f"checkpoint tensor {name} has no parameter {key}")
         param = params[key]
-        value = weights.get(name)
         if value.dtype != param.dtype and value.element_size() == param.element_size() and value.shape == param.shape:
             value = value.view(param.dtype)  # packed fp4 (I8) and e8m0 bit patterns
         elif value.dtype in (torch.int8, torch.uint8) and param.dtype == torch.float4_e2m1fn_x2:
