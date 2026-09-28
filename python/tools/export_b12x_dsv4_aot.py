@@ -93,7 +93,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--geometry", default="flash",
                         help="comma-separated DeepSeek V4 geometries (flash, pro) in one table")
-    parser.add_argument("--decode-rows", type=int, default=128)
+    parser.add_argument("--decode-rows", type=int, default=64)
     parser.add_argument("--prefill-rows", type=int, default=4096)
     parser.add_argument("--max-context", type=int, default=131072)
     parser.add_argument("--only", help="comma-separated stem suffixes (diagnostics)")

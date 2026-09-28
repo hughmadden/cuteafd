@@ -32,7 +32,7 @@ option(CUTEAFD_ENABLE_V41_HC_LAGGED_AOT "Build candidate native lagged mHC begin
 option(CUTEAFD_ENABLE_V41_FP8_AOT "Build native V4.1 coordinator FP8 AOT kernels" OFF)
 option(CUTEAFD_ENABLE_DSV4_AOT "Build the DeepSeek V4 coordinator programs" OFF)
 set(CUTEAFD_DSV4_GEOMETRY "flash,pro" CACHE STRING "DeepSeek V4 program geometries, comma-separated: flash, pro")
-set(CUTEAFD_DSV4_DECODE_ROWS "128" CACHE STRING "DeepSeek V4 decode program capacity")
+set(CUTEAFD_DSV4_DECODE_ROWS "64" CACHE STRING "DeepSeek V4 decode program capacity (below 96 keeps mHC on its decode route)")
 set(CUTEAFD_DSV4_PREFILL_ROWS "4096" CACHE STRING "DeepSeek V4 prefill program capacity")
 set(CUTEAFD_DSV4_MAX_CONTEXT "131072" CACHE STRING "DeepSeek V4 cache extent compiled into programs")
 if((CUTEAFD_ENABLE_V41_HC_LAGGED_AOT OR CUTEAFD_ENABLE_V41_NARROW_AOT) AND NOT CUTEAFD_ENABLE_V41_FP8_AOT)
