@@ -388,7 +388,7 @@ impl<'a> Engine<'a> {
         embed: &[u8],
         transport: &mut V41Tp4Roce,
         runtime: &tokio::runtime::Runtime,
-        on_layer: impl FnMut(usize, &[u8]) -> Result<()>,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
     ) -> Result<Vec<f32>> {
         let start = placement.len;
         ensure!(!tokens.is_empty() && tokens.len() <= self.prefill_rows && start + tokens.len() <= self.max_context,
@@ -416,7 +416,7 @@ impl<'a> Engine<'a> {
         let tokens: Vec<u32> = rows.iter().map(|(_, token)| *token).collect();
         let steps: Vec<(&Placement, usize)> = rows.iter().map(|(p, _)| (&**p, p.len)).collect();
         let tables = metadata::decode_step(&steps, &self.shape, self.cfg.index_topk, self.c128_width)?;
-        let logits = self.step(&tables, &tokens, embed, transport, runtime, |_, _| Ok(()))?;
+        let logits = self.step(&tables, &tokens, embed, transport, runtime, None)?;
         for (placement, _) in rows.iter_mut() {
             placement.len += 1;
         }
@@ -431,7 +431,7 @@ impl<'a> Engine<'a> {
         embed: &[u8],
         transport: &mut V41Tp4Roce,
         runtime: &tokio::runtime::Runtime,
-        mut on_layer: impl FnMut(usize, &[u8]) -> Result<()>,
+        mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
     ) -> Result<Vec<f32>> {
         let t = tables.rows;
         let h = self.cfg.dim;
@@ -485,7 +485,9 @@ impl<'a> Engine<'a> {
             if !tables.decode {
                 // The stream a layer hands on is complete only after its post.
                 self.post(&w, ranks, rows, layer)?;
-                on_layer(layer, &self.download(&w.stream_a, t * 4 * h * 2)?)?;
+                if let Some(on_layer) = on_layer.as_mut() {
+                    on_layer(layer, &self.download(&w.stream_a, t * 4 * h * 2)?)?;
+                }
                 ranks = 0;
             }
         }

@@ -217,17 +217,19 @@ fn golden_run(
     let mut offset = 0;
     while offset < prefill {
         let end = (offset + chunk).min(prefill);
-        let whole = offset == 0 && end == tokens.len();
+        let mut compare = |layer: usize, stream: &[u8]| -> Result<()> {
+            if layer < compare_layers {
+                let golden = std::fs::read(args.golden.join(format!("layer{layer:02}.bin")))?;
+                ensure!(golden.len() == stream.len(), "golden layer {layer} has {} bytes, engine {}", golden.len(), stream.len());
+                let (cosine, rel) = similarity(&bf16s(stream), &bf16s(&golden));
+                println!("layer {layer:2}: cosine {cosine:.6} rel_l2 {rel:.3e}");
+            }
+            Ok(())
+        };
+        // Per-layer streams are compared only for a whole-prompt prefill.
+        let whole = offset == 0 && end == tokens.len() && compare_layers > 0;
         logits.extend(engine.prefill(&mut placement, &tokens[offset..end], &embed[offset * row..end * row], transport, runtime,
-            |layer, stream| {
-                if whole && layer < compare_layers {
-                    let golden = std::fs::read(args.golden.join(format!("layer{layer:02}.bin")))?;
-                    ensure!(golden.len() == stream.len(), "golden layer {layer} has {} bytes, engine {}", golden.len(), stream.len());
-                    let (cosine, rel) = similarity(&bf16s(stream), &bf16s(&golden));
-                    println!("layer {layer:2}: cosine {cosine:.6} rel_l2 {rel:.3e}");
-                }
-                Ok(())
-            })?);
+            if whole { Some(&mut compare) } else { None })?);
         offset = end;
     }
     let prefill_elapsed = started.elapsed();
