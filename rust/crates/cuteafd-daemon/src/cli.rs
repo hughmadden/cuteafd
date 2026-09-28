@@ -20,6 +20,8 @@ pub(crate) enum Commands {
     Fabric(FabricArgs),
     /// Check live Spark expert ranks for one layer against a CPU oracle.
     ExpertProbe(ExpertProbeArgs),
+    /// Prefill a DeepSeek V4 golden prompt and compare layers and logits.
+    Dsv4Golden(crate::dsv4::GoldenArgs),
     /// Serve official V4.1 native TP4 experts over RoCE.
     ExpertdNative(NativeExpertDaemonArgs),
     /// Serve the official V4.1 target text path.

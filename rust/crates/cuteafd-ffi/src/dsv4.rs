@@ -206,3 +206,53 @@ mod tests {
         assert_eq!(c_string(b"abc\0def"), "abc");
     }
 }
+
+/// cuBLAS vocabulary head at the model width with pedantic FP32 accumulation
+/// (the reference promotes the projection to FP32).
+pub struct VocabularyHead<'a> {
+    library: &'a NativeLibrary,
+    handle: *mut c_void,
+    launch: unsafe extern "C" fn(*mut c_void, *const u16, *const u16, *mut f32, i32, *mut c_void) -> i32,
+}
+
+/// Bytes of caller-owned cuBLAS workspace the head needs.
+pub const VOCABULARY_HEAD_WORKSPACE: usize = 4 << 20;
+
+impl NativeLibrary {
+    /// # Safety
+    /// `workspace` must be live device memory of at least
+    /// [`VOCABULARY_HEAD_WORKSPACE`] bytes that outlives the head.
+    pub unsafe fn vocabulary_head(&self, workspace: *mut c_void, width: u32, max_rows: u32) -> Result<VocabularyHead<'_>> {
+        type Create = unsafe extern "C" fn(*mut c_void, u64, i32, i32, *mut *mut c_void) -> i32;
+        let create = *unsafe { self.lib.get::<Create>(b"cuteafd_vocabulary_head_create") }?;
+        let launch = *unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_width") }?;
+        let mut handle = std::ptr::null_mut();
+        let status = unsafe {
+            create(workspace, VOCABULARY_HEAD_WORKSPACE as u64, i32::try_from(width)?, i32::try_from(max_rows)?, &mut handle)
+        };
+        ensure!(status == 0, "vocabulary head creation failed with {status}");
+        Ok(VocabularyHead { library: self, handle, launch })
+    }
+}
+
+impl VocabularyHead<'_> {
+    /// # Safety
+    /// `input` BF16 [rows, width], `weight` BF16 [vocab, width] and `logits`
+    /// FP32 [rows, vocab] must be live device memory on the head's device.
+    pub unsafe fn launch(&self, input: *const u16, weight: *const u16, logits: *mut f32, rows: u32,
+        stream: *mut c_void) -> Result<()> {
+        let status = unsafe { (self.launch)(self.handle, input, weight, logits, i32::try_from(rows)?, stream) };
+        ensure!(status == 0, "vocabulary head launch failed with {status}");
+        Ok(())
+    }
+}
+
+impl Drop for VocabularyHead<'_> {
+    fn drop(&mut self) {
+        type Destroy = unsafe extern "C" fn(*mut c_void) -> i32;
+        // SAFETY: the handle came from the matching create entry point.
+        if let Ok(destroy) = unsafe { self.library.lib.get::<Destroy>(b"cuteafd_v41_markov_destroy") } {
+            unsafe { destroy(self.handle) };
+        }
+    }
+}

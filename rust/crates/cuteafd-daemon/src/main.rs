@@ -5,6 +5,7 @@ use std::process::Command;
 
 mod cli;
 mod commands;
+mod dsv4;
 mod v41_compressor;
 mod v41_vision;
 mod v41_index_query;
@@ -63,6 +64,7 @@ async fn main() -> Result<()> {
         Commands::Doctor(args) => run_doctor(args),
         Commands::Plan(args) => run_plan(args),
         Commands::ExpertProbe(args) => run_expert_probe(args).await,
+        Commands::Dsv4Golden(args) => dsv4::run_golden(args).await,
         Commands::Fabric(args) => {
             let report = cuteafd_transport::fabric::discover()?;
             if args.json {

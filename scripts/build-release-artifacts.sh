@@ -185,6 +185,7 @@ cmake \
   -DCUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_TP2_EXPERT_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_FP8_AOT="$coordinator_aot" \
+  -DCUTEAFD_ENABLE_DSV4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_DSV4_AOT:-ON}" || echo OFF)" \
   -DCUTEAFD_ENABLE_V41_ATTENTION_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_NARROW_AOT="$coordinator_aot" \
@@ -242,6 +243,12 @@ PY_CHECK
   install -m 0644 "$build_root/native/v41_fp8/v41_fp8.json" "$output_dir/V41_FP8_AOT.json"
 else
   printf '%s\n' '{"schema":1,"role":"expert","enabled":false}' >"$output_dir/V41_FP8_AOT.json"
+fi
+# DeepSeek V4 coordinator program manifest (an empty table when not built).
+if [[ -s "$build_root/native/dsv4_programs/dsv4_programs.json" ]]; then
+  install -m 0644 "$build_root/native/dsv4_programs/dsv4_programs.json" "$output_dir/DSV4_PROGRAMS.json"
+else
+  printf '%s\n' '{"schema":1,"programs":[]}' >"$output_dir/DSV4_PROGRAMS.json"
 fi
 install -m 0644 \
   "$build_root/source/THIRD_PARTY_NOTICES.md" \
