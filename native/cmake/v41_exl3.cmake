@@ -133,5 +133,58 @@ foreach(family IN LISTS CUTEAFD_V41_EXL3_BIT_FAMILIES)
   list(APPEND CUTEAFD_EXL3_FAMILY_MANIFESTS "${CUTEAFD_EXL3_PACKAGE}/manifest.json")
   set(CUTEAFD_EXL3_FAMILY_CHAIN "${CUTEAFD_EXL3_PACKAGE}/manifest.json")
 endforeach()
+# Other expert geometries: CUTEAFD_EXPERT_FAMILIES entries FAMILY:exl3-kTIERS
+# (for example dsv4p:exl3-k23 for DeepSeek V4 Pro EXL3 K2) each build one
+# exl3-FAMILY-kTIERS package with the same layouts, sliced from the family's own
+# intermediate size; the daemon selects it from the checkpoint geometry.
+foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
+  if(NOT entry MATCHES ":exl3-k")
+    continue()
+  endif()
+  if(NOT entry MATCHES "^(dsv4f|dsv4p):exl3-k([2-5][2-5]+)$")
+    message(FATAL_ERROR "EXL3 expert family ${entry} must be (dsv4f|dsv4p):exl3-k<tiers>, for example dsv4p:exl3-k23")
+  endif()
+  if(CUTEAFD_V41_EXL3_PAIRED_TP4)
+    message(FATAL_ERROR "Paired EXL3 TP4 packages exist only for DeepSeek V4.1")
+  endif()
+  set(CUTEAFD_EXL3_GEOMETRY "${CMAKE_MATCH_1}")
+  set(CUTEAFD_EXL3_FAMILY_TAG "${CMAKE_MATCH_2}")
+  string(REGEX REPLACE "([2-5])" "\\1;" CUTEAFD_EXL3_FAMILY_TIERS "${CUTEAFD_EXL3_FAMILY_TAG}")
+  list(FILTER CUTEAFD_EXL3_FAMILY_TIERS EXCLUDE REGEX "^$")
+  set(CUTEAFD_EXL3_PACKAGE "${CMAKE_CURRENT_BINARY_DIR}/exl3-${CUTEAFD_EXL3_GEOMETRY}-k${CUTEAFD_EXL3_FAMILY_TAG}")
+  string(JOIN "|" CUTEAFD_EXL3_CONFIG_KEY "geometry=${CUTEAFD_EXL3_GEOMETRY}" "role=${CUTEAFD_EXL3_ROLE}"
+    "layouts=${CUTEAFD_EXL3_REQUIRE_LAYOUTS}" "capacities=${CUTEAFD_V41_EXL3_CAPACITIES}"
+    "tiers=${CUTEAFD_EXL3_FAMILY_TIERS}")
+  set(CUTEAFD_EXL3_CONFIG_STAMP "${CMAKE_CURRENT_BINARY_DIR}/exl3_${CUTEAFD_EXL3_GEOMETRY}_k${CUTEAFD_EXL3_FAMILY_TAG}_config.stamp")
+  file(GENERATE OUTPUT "${CUTEAFD_EXL3_CONFIG_STAMP}" CONTENT "${CUTEAFD_EXL3_CONFIG_KEY}\n")
+  set(CUTEAFD_EXL3_GEOMETRY_LAYOUTS ${CUTEAFD_EXL3_LAYOUTS})
+  list(REMOVE_ITEM CUTEAFD_EXL3_GEOMETRY_LAYOUTS dspark)
+  list(JOIN CUTEAFD_EXL3_GEOMETRY_LAYOUTS "," CUTEAFD_EXL3_GEOMETRY_REQUIRE)
+  add_custom_command(
+    OUTPUT "${CUTEAFD_EXL3_PACKAGE}/manifest.json"
+    COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
+    COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
+      "${Python3_EXECUTABLE}" "${CUTEAFD_EXL3_TOOL}" build
+      --role "${CUTEAFD_EXL3_ROLE}" --geometry "${CUTEAFD_EXL3_GEOMETRY}"
+      --capacities "${CUTEAFD_EXL3_CAPACITIES_ARG}"
+      --bits ${CUTEAFD_EXL3_FAMILY_TIERS}
+      --require-layout "${CUTEAFD_EXL3_GEOMETRY_REQUIRE}"
+      --build-dir "${CMAKE_CURRENT_BINARY_DIR}/exl3_exports/${CUTEAFD_EXL3_GEOMETRY}-k${CUTEAFD_EXL3_FAMILY_TAG}"
+      --output "${CUTEAFD_EXL3_PACKAGE}"
+      --cxx "${CMAKE_CXX_COMPILER}" --cuda-include "${CUTEAFD_EXL3_CUDA_INCLUDE}"
+      --cuda-libdir "$<TARGET_FILE_DIR:CUDA::cudart>"
+      --cuda-driver "$<TARGET_FILE:CUDA::cuda_driver>"
+      --runtime "${CUTEAFD_B12X_AOT_RUNTIME_LIBRARY}"
+    DEPENDS "${CUTEAFD_EXL3_TOOL}" "${CUTEAFD_EXL3_CONFIG_STAMP}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/export_b12x_v41_exl3_aot.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/export_b12x_v41_exl3_routes_aot.py"
+      ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
+      ${CUTEAFD_EXL3_FAMILY_CHAIN}
+    COMMENT "Building ${CUTEAFD_EXL3_GEOMETRY} EXL3 modules and verified runtime package (tiers ${CUTEAFD_EXL3_FAMILY_TIERS})"
+    VERBATIM
+  )
+  list(APPEND CUTEAFD_EXL3_FAMILY_MANIFESTS "${CUTEAFD_EXL3_PACKAGE}/manifest.json")
+  set(CUTEAFD_EXL3_FAMILY_CHAIN "${CUTEAFD_EXL3_PACKAGE}/manifest.json")
+endforeach()
 add_custom_target(cuteafd_v41_exl3_export DEPENDS ${CUTEAFD_EXL3_FAMILY_MANIFESTS})
 add_dependencies(cuteafd_v41_exl3_export cuteafd_verify_sparkinfer_source)

@@ -156,6 +156,16 @@ if [[ "$exl3_aot" == ON ]]; then
     --package "$build_dir/native/exl3-$wip_exl3_tag" --output "$output_dir/exl3/exl3-$wip_exl3_tag"
   python3 "$source_dir/python/tools/package_v41_exl3_aot.py" verify \
     --package "$output_dir/exl3/exl3-$wip_exl3_tag" --role "$role"
+  # Other expert geometries (FAMILY:exl3-kTIERS entries) ship as exl3-FAMILY-kTIERS.
+  IFS=';' read -ra wip_family_list <<<"$expert_families"
+  for wip_family in "${wip_family_list[@]}"; do
+    [[ "$wip_family" == *:exl3-k* ]] || continue
+    wip_package="exl3-${wip_family%%:*}-${wip_family#*:exl3-}"
+    python3 "$source_dir/python/tools/package_v41_exl3_aot.py" install \
+      --package "$build_dir/native/$wip_package" --output "$output_dir/exl3/$wip_package"
+    python3 "$source_dir/python/tools/package_v41_exl3_aot.py" verify \
+      --package "$output_dir/exl3/$wip_package" --role "$role"
+  done
 fi
 install -m 0644 "$build_dir/native/v41_experts/v41_experts.json" "$output_dir/V41_EXPERT_AOT.json"
 # Always emit the built-role manifest (empty for the legacy default). Roles are

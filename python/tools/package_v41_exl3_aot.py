@@ -69,6 +69,9 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             raise ValueError('duplicate EXL3 package variant')
         seen.add(directory)
         meta = json.loads((package / directory / 'v41_exl3.json').read_text())
+        # Records without a hidden size predate other geometries: they are V4.1.
+        if meta.get('hidden', GEOMETRIES['v41'][0]) != GEOMETRIES[manifest.get('geometry', 'v41')][0]:
+            raise ValueError(f'EXL3 variant hidden size does not match the package geometry: {directory}')
         for key in ('capacity', 'intermediate', 'experts', 'top_k', 'output_dtype', 'bits'):
             if meta[key] != variant[key]:
                 raise ValueError(f'EXL3 variant metadata mismatch: {directory}/{key}')
@@ -202,13 +205,51 @@ def install_package(source: Path, output: Path) -> None:
     verify(output)
 
 
-def profiles_for_role(role: str) -> list[tuple]:
+# Routed-expert geometries the EXL3 packages can target: (hidden, intermediate,
+# experts, top-k). The names match cuteafd_core::ExpertGeometry::family.
+GEOMETRIES = {
+    'v41': (5120, 2304, 384, 6),
+    'dsv4f': (4096, 2048, 256, 6),
+    'dsv4p': (7168, 3072, 384, 6),
+}
+
+
+def package_name(geometry: str, bits: list[int]) -> str:
+    """Package directory for one tier family; mirrors the daemon's resolver."""
+    tag = ''.join(map(str, bits))
+    return f'exl3-k{tag}' if geometry == 'v41' else f'exl3-{geometry}-k{tag}'
+
+
+def shard_profiles(geometry: str, role: str) -> list[tuple]:
+    """Profiles of a non-V4.1 geometry: whole H128 blocks of the intermediate per
+    rank (the first ranks own any extra block, as the Rust loader partitions),
+    one export per distinct width shared by the ranks that carry it."""
+    _hidden, intermediate, experts, topk = GEOMETRIES[geometry]
+    blocks = intermediate // 128
+    if role != 'spark':
+        return [('rtx-tp1', intermediate, experts, topk, 'fp32', ['rtx-tp1']),
+                ('rtx-tp2', intermediate // 2, experts, topk, 'fp32', ['rtx-tp2'])]
+    profiles = []
+    for world in (4, 2, 3):
+        widths: dict[int, list[str]] = {}
+        for rank in range(world):
+            width = (blocks // world + (rank < blocks % world)) * 128
+            widths.setdefault(width, []).append(f'tp{world}-rank{rank}')
+        for width, destinations in sorted(widths.items(), reverse=True):
+            profiles.append((f'tp{world}-width{width}', width, experts, topk, 'bf16', destinations))
+    return profiles
+
+
+def profiles_for_role(role: str, geometry: str = 'v41') -> list[tuple]:
     """(profile, width, experts, top-k, dtype, [layout destinations]) per role.
 
     TP4 keeps the padded 640/512 pair-split because I=2304/4 is not a whole number
     of 128-wide Trellis blocks; TP2 (9+9) and TP3 (6+6+6) split exactly, so each of
     those compiles one export per capacity that its ranks share byte-for-byte.
+    Other geometries derive the same H128 split from their own intermediate.
     """
+    if geometry != 'v41':
+        return shard_profiles(geometry, role)
     if role == 'spark':
         return [('tp4-width640', 640, 384, 6, 'bf16', ['tp4-rank0', 'tp4-rank1']),
                 ('tp4-width512', 512, 384, 6, 'bf16', ['tp4-rank2', 'tp4-rank3']),
@@ -220,7 +261,7 @@ def profiles_for_role(role: str) -> list[tuple]:
             ('dspark', 2304, 128, 3, 'bf16', ['dspark'])]
 
 
-def parse_requested_layouts(values: list[str], role: str) -> list[str]:
+def parse_requested_layouts(values: list[str], role: str, geometry: str = 'v41') -> list[str]:
     """`--require-layout tp3-rank0,tp3-rank1` (repeatable): layouts the package needs.
 
     Scoped to the role being built: a coordinator cannot produce Spark ranks, so
@@ -228,7 +269,7 @@ def parse_requested_layouts(values: list[str], role: str) -> list[str]:
     GPU compile.
     """
     requested: list[str] = []
-    known = {layout for _, _, _, _, _, destinations in profiles_for_role(role)
+    known = {layout for _, _, _, _, _, destinations in profiles_for_role(role, geometry)
              for layout in destinations}
     for value in values:
         for name in (part.strip() for part in value.split(',')):
@@ -242,7 +283,8 @@ def parse_requested_layouts(values: list[str], role: str) -> list[str]:
     return sorted(requested)
 
 
-def tile_overrides(values: list[str], capacities: list[int], role: str, paired: bool) -> dict[str, dict[int, tuple]]:
+def tile_overrides(values: list[str], capacities: list[int], role: str, paired: bool,
+                   geometry: str = 'v41') -> dict[str, dict[int, tuple]]:
     """Parse repeatable `--tile PROFILE=CAPACITIES:FC1_K,FC1_N,FC2_K,FC2_N`.
 
     Capacity scoping is the point: the pinned B12x policy already picks a wider
@@ -258,7 +300,7 @@ def tile_overrides(values: list[str], capacities: list[int], role: str, paired: 
     # Role-scoped for the same reason as --require-layout: an override naming a
     # profile this role does not build would otherwise be accepted and silently
     # ignored, which is a knob that ships looking effective.
-    widths = {profile: width for profile, width, *_ in profiles_for_role(role)}
+    widths = {profile: width for profile, width, *_ in profiles_for_role(role, geometry)}
     result: dict[str, dict[int, tuple]] = {}
     for value in values:
         profile, sep, rest = value.partition('=')
@@ -297,15 +339,23 @@ def tile_overrides(values: list[str], capacities: list[int], role: str, paired: 
 def build(args: argparse.Namespace) -> None:
     validate_destination(args.output)
     paired = getattr(args, 'paired_tp4', False)
-    if paired and (args.role != 'spark' or len(args.bits) != 2):
-        raise ValueError('paired TP4 package requires Spark role and two tiers')
+    geometry = getattr(args, 'geometry', 'v41')
+    hidden = GEOMETRIES[geometry][0]
+    if paired and (args.role != 'spark' or len(args.bits) != 2 or geometry != 'v41'):
+        raise ValueError('paired TP4 package requires V4.1 Spark role and two tiers')
     capacities = sorted(set(int(v) for v in args.capacities.split(',')))
     if not capacities or any(v < 1 or v > 4096 for v in capacities):
         raise ValueError('EXL3 capacities must be in 1..4096')
     overrides = residency_overrides(getattr(args, 'residency', []), capacities, paired)
-    profiles = profiles_for_role(args.role)
-    requested_layouts = parse_requested_layouts(getattr(args, 'require_layout', []), args.role)
-    tiles = tile_overrides(getattr(args, 'tile', []), capacities, args.role, paired)
+    profiles = profiles_for_role(args.role, geometry)
+    only = set(getattr(args, 'profile', None) or [])
+    if only:
+        unknown = only - {profile for profile, *_ in profiles}
+        if unknown:
+            raise ValueError(f'unknown EXL3 profiles for {geometry} {args.role}: {sorted(unknown)}')
+        profiles = [entry for entry in profiles if entry[0] in only]
+    requested_layouts = parse_requested_layouts(getattr(args, 'require_layout', []), args.role, geometry)
+    tiles = tile_overrides(getattr(args, 'tile', []), capacities, args.role, paired, geometry)
     # Import the source-pinned compiler only for builds, never package checks.
     import _pinned_sparkinfer
     from export_b12x_v41_exl3_aot import export
@@ -337,6 +387,8 @@ def build(args: argparse.Namespace) -> None:
                     options['blocks_per_sm'] = overrides[capacity]
                 if tile is not None:
                     options['tile'] = tile
+                if geometry != 'v41':
+                    options['hidden'] = hidden
                 meta = export(raw, width, experts, capacity, tuple(args.bits), 'auto', topk, dtype, **options)
                 core = raw / 'libcuteafd_exl3.so'
                 subprocess.run([args.cxx, '-shared', '-fPIC', '-std=c++17',
@@ -384,6 +436,8 @@ def build(args: argparse.Namespace) -> None:
                                 'provider': 'installed nvidia-cutlass-dsl CUDA runtime; release entrypoint sets its library path'}}
         if paired:
             manifest['paired_tp4'] = True
+        if geometry != 'v41':
+            manifest['geometry'] = geometry
         if overrides:
             manifest['residency_overrides'] = [f'{capacity}={blocks}' for capacity, blocks in sorted(overrides.items())]
         if requested_layouts:
@@ -408,6 +462,11 @@ def main() -> None:
     commands = parser.add_subparsers(dest='command', required=True)
     create = commands.add_parser('build')
     create.add_argument('--role', choices=('spark', 'coordinator'), required=True)
+    create.add_argument('--geometry', choices=sorted(GEOMETRIES), default='v41',
+                        help='Routed-expert geometry (cuteafd_core::ExpertGeometry::family)')
+    create.add_argument('--profile', action='append', default=[],
+                        help='Build only these profiles (repeatable), for bring-up; '
+                             'a release package builds every profile of its role')
     create.add_argument('--paired-tp4', action='store_true', help='Export explicit paired H128 ownership kernels for all four Spark ranks')
     create.add_argument('--residency', action='append', default=[], metavar='CAPACITY=BLOCKS',
                         help='Explicit paired-package blocks/SM override; repeat per capacity (for example 80=2). B12X validates resources.')

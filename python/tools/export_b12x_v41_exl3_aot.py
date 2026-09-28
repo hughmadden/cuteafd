@@ -116,10 +116,11 @@ def write_bridge(output: Path, manifest: dict) -> None:
 def export(output: Path, intermediate: int, experts: int, capacity: int,
            bits: tuple[int, ...], routing: str, topk: int = 6, output_dtype: str = "bf16",
            blocks_per_sm: int | None = None, paired_boundary: str | None = None,
-           tile: tuple[int, ...] | None = None) -> dict:
+           tile: tuple[int, ...] | None = None, hidden: int = 5120) -> dict:
     if paired_boundary not in (None, "first", "last"):
         raise ValueError("paired boundary must be first, last, or None")
-    if paired_boundary is not None and (intermediate != 640 or len(bits) != 2 or topk != 6):
+    if paired_boundary is not None and (intermediate != 640 or len(bits) != 2 or topk != 6
+                                        or hidden != 5120):
         raise ValueError("paired export requires width 640, two tiers and top-k 6")
     if paired_boundary is not None and tile is not None:
         raise ValueError("paired exports keep the qualified tile policy; the offline "
@@ -148,6 +149,9 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         raise ValueError("explicit residency is currently supported only for two-tier exports")
     if not 1 <= capacity <= 4096 or topk not in (3, 6) or experts < topk or experts > 384:
         raise ValueError("invalid V4.1 capacity or expert count")
+    # Whole H128 rotation blocks on both projection axes.
+    if hidden < 128 or hidden % 128 or intermediate < 128 or intermediate % 128:
+        raise ValueError("EXL3 hidden and intermediate must be positive multiples of 128")
     props = torch.cuda.get_device_properties(0)
     if (props.major, props.minor) not in ((12, 0), (12, 1)):
         raise ValueError("V4.1 export requires native SM120 or SM121")
@@ -159,11 +163,11 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     block_m = 8
     route_slots = capacity * topk if direct else route_pack_capacity(capacity * topk, block_m, experts, topk=topk)[1]
     route_blocks = route_slots if direct else (route_slots + block_m - 1) // block_m
-    options = dict(size_m=capacity, hidden_size=5120, intermediate_size=intermediate,
+    options = dict(size_m=capacity, hidden_size=hidden, intermediate_size=intermediate,
         tier0_num_experts=experts, tier1_num_experts=experts, top_k=topk,
         route_num_experts=experts, max_m_blocks=route_blocks,
         sms=props.multi_processor_count, max_shared_mem=props.shared_memory_per_block_optin,
-        force_tile_config=_projection_mixed_tile_config(tile, hidden_size=5120,
+        force_tile_config=_projection_mixed_tile_config(tile, hidden_size=hidden,
             intermediate_size=intermediate, token_count=capacity, direct_topk_routes=direct),
         tier0_bits=bits[0], tier1_bits=bits[1], trellis_codebook="mcg", swiglu_limit=10.0,
         moe_block_size=block_m, rotation_input_dtype="bf16", full_rotation_output_dtype=output_dtype,
@@ -217,7 +221,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
             spec.update(shape=[count], bytes=count * 4)
     manifest = {"schema": "cuteafd.v41-exl3-aot.v1", "sparkinfer_revision": _pinned_sparkinfer.REVISION,
         "gpu": props.name, "compute": [props.major, props.minor], "sms": props.multi_processor_count,
-        "hidden": 5120, "intermediate": intermediate, "experts": experts, "top_k": topk,
+        "hidden": hidden, "intermediate": intermediate, "experts": experts, "top_k": topk,
         "capacity": capacity, "output_dtype": output_dtype, "bits": list(bits), "swiglu_limit": 10.0,
         "direct": direct, "route_slots": route_slots, "route_blocks": route_blocks,
         "tile": list(options['force_tile_config']), "blocks_per_sm": launch.blocks_per_sm,
@@ -249,7 +253,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--intermediate", type=int, choices=(512, 640, 768, 1152, 2304), required=True)
+    parser.add_argument("--hidden", type=int, default=5120)
+    parser.add_argument("--intermediate", type=int, required=True)
     parser.add_argument("--experts", type=int, default=384)
     parser.add_argument("--capacity", type=int, default=16)
     parser.add_argument("--bits", type=int, nargs="+", default=[3, 4])
@@ -263,7 +268,7 @@ def main() -> None:
                                        "B12x per-capacity policy")
     args = parser.parse_args()
     export(args.output, args.intermediate, args.experts, args.capacity, tuple(args.bits), args.routing, args.topk, args.output_dtype, args.blocks_per_sm, args.paired_boundary,
-           tile=None if args.tile is None else tuple(args.tile.split(",")))
+           tile=None if args.tile is None else tuple(args.tile.split(",")), hidden=args.hidden)
 
 
 if __name__ == "__main__":
