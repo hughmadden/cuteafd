@@ -9,12 +9,14 @@ isolation) lives in ``scripts/qualify-ds41-sampling-api.py``.
 """
 import argparse
 import json
+import os
 import time
 import urllib.request
 import urllib.error
 from pathlib import Path
 
-MODEL = 'deepseek-ai/DeepSeek-V4.1-Flash'
+# CUTEAFD_API_MODEL selects another served model (e.g. a DeepSeek V4 checkpoint).
+MODEL = os.environ.get('CUTEAFD_API_MODEL', 'deepseek-ai/DeepSeek-V4.1-Flash')
 
 class IncompleteStreamError(AssertionError):
     def __init__(self, record):
