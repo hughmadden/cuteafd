@@ -20,6 +20,7 @@ use cuteafd_transport::{
     ExpertV2SourceKind,
 };
 use std::ffi::c_void;
+use std::time::Instant;
 
 type Dev<'a> = DeviceAllocation<'a>;
 
@@ -43,6 +44,35 @@ pub(crate) struct Engine<'a> {
     /// Prefill and decode workspaces, reused across steps.
     prefill_workspace: RefCell<Option<Workspace<'a>>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
+    pub profile: RefCell<Profile>,
+}
+
+/// Host-visible phases of a step, for profiling.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Phase {
+    /// Waiting for the GPU through the router and input quantizer.
+    RouterSync,
+    Routing,
+    Experts,
+    PlaneUpload,
+    /// Waiting for the head and downloading logits.
+    Head,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct Profile {
+    pub seconds: [f64; 5],
+}
+
+impl Profile {
+    fn add(&mut self, phase: Phase, since: Instant) {
+        self.seconds[phase as usize] += since.elapsed().as_secs_f64();
+    }
+
+    pub fn report(&self) -> String {
+        let names = ["router_sync", "routing", "experts", "plane_upload", "head"];
+        names.iter().zip(self.seconds).map(|(n, s)| format!("{n} {:.1} ms", s * 1e3)).collect::<Vec<_>>().join(", ")
+    }
 }
 
 /// Everything an [`Engine`] needs besides its pools and workspaces.
@@ -95,16 +125,23 @@ struct Workspace<'a> {
     planes: Vec<Dev<'a>>,
     scratch: Dev<'a>,
     dummy: Dev<'a>,
+    vocab_logits: Dev<'a>,
+    tables: StepBuffers<'a>,
+    // Drops before its workspace below.
+    head: cuteafd_ffi::dsv4::VocabularyHead<'a>,
+    _head_workspace: Dev<'a>,
 }
 
 /// Device copies of one step's tables.
 struct StepBuffers<'a> {
+    /// Rows these buffers hold; tables are copied in per step.
+    rows: usize,
     positions: Dev<'a>,
     main_slots: Dev<'a>,
     swa_indices: Dev<'a>,
     swa_lengths: Dev<'a>,
-    c4: Vec<(&'static str, Dev<'a>)>,
-    c128: Vec<(&'static str, Dev<'a>)>,
+    c4: Vec<Dev<'a>>,
+    c128: Vec<Dev<'a>>,
     c4_page_table: Dev<'a>,
     c4_visible: Dev<'a>,
     c4_indexed_lengths: Dev<'a>,
@@ -217,6 +254,7 @@ impl<'a> Engine<'a> {
             shape: parts.shape,
             prefill_workspace: RefCell::new(None),
             decode_workspace: RefCell::new(None),
+            profile: RefCell::new(Profile::default()),
         })
     }
 
@@ -224,6 +262,7 @@ impl<'a> Engine<'a> {
         let h = self.cfg.dim;
         let heads = self.cfg.n_heads;
         let experts = self.cfg.n_routed_experts;
+        let head_workspace = self.alloc(cuteafd_ffi::dsv4::VOCABULARY_HEAD_WORKSPACE)?;
         let mut topk_scratch = 0usize;
         for route in [format!("decode_m{}", self.decode_rows), format!("prefill_m{}", self.prefill_rows)] {
             let spec = self.programs.spec(&format!("{}_index_topk_{route}", self.family))?;
@@ -249,26 +288,58 @@ impl<'a> Engine<'a> {
             planes: (0..4).map(|_| self.alloc(t * h * 2)).collect::<Result<_>>()?,
             scratch: self.alloc(self.scratch_bytes()?)?,
             dummy: self.zeroed(4096)?,
+            vocab_logits: self.alloc(t * self.cfg.vocab_size * 4)?,
+            tables: self.step_buffers(t)?,
+            // SAFETY: the workspace buffer lives in the same struct and drops
+            // after the head (field order).
+            head: unsafe { self.library.vocabulary_head(head_workspace.buffer.ptr, h as u32, t as u32)? },
+            _head_workspace: head_workspace,
         })
     }
 
-    fn step_buffers(&self, tables: &StepTables) -> Result<StepBuffers<'a>> {
-        let list = |entries: &[(&'static str, Vec<i32>)]| -> Result<Vec<(&'static str, Dev<'a>)>> {
-            entries.iter().map(|(name, values)| Ok((*name, self.upload(values)?))).collect()
-        };
+    /// Persistent table buffers for up to `rows` rows.
+    fn step_buffers(&self, rows: usize) -> Result<StepBuffers<'a>> {
+        let ints = |count: usize| self.alloc(count * 4);
+        let metadata = |_: usize| -> Result<Vec<Dev<'a>>> { (0..7).map(|_| ints(rows + 2)).collect() };
         Ok(StepBuffers {
-            positions: self.upload(&tables.positions)?,
-            main_slots: self.upload(&tables.main_slots)?,
-            swa_indices: self.upload(&tables.swa_indices)?,
-            swa_lengths: self.upload(&tables.swa_lengths)?,
-            c4: list(&tables.c4_tables)?,
-            c128: list(&tables.c128_tables)?,
-            c4_page_table: self.upload(&tables.c4_page_table)?,
-            c4_visible: self.upload(&tables.c4_visible)?,
-            c4_indexed_lengths: self.upload(&tables.c4_indexed_lengths)?,
-            c128_indices: self.upload(&tables.c128_indices)?,
-            c128_lengths: self.upload(&tables.c128_lengths)?,
+            rows,
+            positions: self.alloc(rows * 8)?,
+            main_slots: self.alloc(rows * 8)?,
+            swa_indices: ints(rows * metadata::WINDOW)?,
+            swa_lengths: ints(rows)?,
+            c4: metadata(4)?,
+            c128: metadata(128)?,
+            c4_page_table: ints(rows.max(1) * self.shape.c4_pages)?,
+            c4_visible: ints(rows)?,
+            c4_indexed_lengths: ints(rows)?,
+            c128_indices: ints(rows * self.c128_width)?,
+            c128_lengths: ints(rows)?,
         })
+    }
+
+    fn fill(&self, m: &StepBuffers<'_>, tables: &StepTables) -> Result<()> {
+        ensure!(tables.rows <= m.rows, "step of {} rows exceeds its buffers ({})", tables.rows, m.rows);
+        let put = |buffer: &Dev<'_>, bytes: &[u8]| -> Result<()> {
+            ensure!(bytes.len() <= buffer.buffer.bytes, "step table exceeds its buffer");
+            if !bytes.is_empty() {
+                self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: bytes.len(), ..buffer.buffer }, bytes)?;
+            }
+            Ok(())
+        };
+        put(&m.positions, bytes_of(&tables.positions))?;
+        put(&m.main_slots, bytes_of(&tables.main_slots))?;
+        put(&m.swa_indices, bytes_of(&tables.swa_indices))?;
+        put(&m.swa_lengths, bytes_of(&tables.swa_lengths))?;
+        for (buffers, entries) in [(&m.c4, &tables.c4_tables), (&m.c128, &tables.c128_tables)] {
+            for (buffer, (_, values)) in buffers.iter().zip(entries) {
+                put(buffer, bytes_of(values))?;
+            }
+        }
+        put(&m.c4_page_table, bytes_of(&tables.c4_page_table))?;
+        put(&m.c4_visible, bytes_of(&tables.c4_visible))?;
+        put(&m.c4_indexed_lengths, bytes_of(&tables.c4_indexed_lengths))?;
+        put(&m.c128_indices, bytes_of(&tables.c128_indices))?;
+        put(&m.c128_lengths, bytes_of(&tables.c128_lengths))
     }
 
     fn sync(&self) -> Result<()> {
@@ -339,7 +410,6 @@ impl<'a> Engine<'a> {
         let t = tables.rows;
         let h = self.cfg.dim;
         ensure!(tokens.len() == t && embed.len() == t * h * 2, "step rows disagree");
-        let m = self.step_buffers(tables)?;
         let slot = if tables.decode { &self.decode_workspace } else { &self.prefill_workspace };
         if slot.borrow().is_none() {
             let rows = if tables.decode { self.decode_rows } else { self.prefill_rows };
@@ -347,6 +417,10 @@ impl<'a> Engine<'a> {
         }
         let workspace = slot.borrow();
         let w = workspace.as_ref().context("workspace")?;
+        // Tables are copied in only after the previous step's last read (the
+        // head download synchronized the stream).
+        self.fill(&w.tables, tables)?;
+        let m = &w.tables;
         let mut expanded = Vec::with_capacity(t * 4 * h * 2);
         for row in embed.chunks_exact(h * 2) {
             for _ in 0..4 {
@@ -434,10 +508,14 @@ impl<'a> Engine<'a> {
         if ratio == 0 {
             return Ok(window);
         }
-        let (groups, metadata) = if ratio == 4 { (tables.c4_groups, &m.c4) } else { (tables.c128_groups, &m.c128) };
+        let (groups, metadata, names) = if ratio == 4 {
+            (tables.c4_groups, &m.c4, &tables.c4_tables)
+        } else {
+            (tables.c128_groups, &m.c128, &tables.c128_tables)
+        };
         let compressed = cache.compressed.as_ref().context("compressed cache")?.buffer.ptr;
         let mut pointers: Vec<(&str, *mut c_void)> = vec![("hidden", w.y.buffer.ptr)];
-        pointers.extend(metadata.iter().map(|(name, buffer)| (*name, buffer.buffer.ptr)));
+        pointers.extend(names.iter().zip(metadata).map(|((name, _), buffer)| (*name, buffer.buffer.ptr)));
         pointers.extend([
             ("cos_sin", rope.buffer.ptr), ("joint_projection", weights.ptr("joint_projection")?),
             ("main_ape", weights.ptr("main_ape")?), ("main_norm", weights.ptr("main_norm")?),
@@ -504,16 +582,21 @@ impl<'a> Engine<'a> {
             ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
             ("scale_mma_ptr", w.dummy.buffer.ptr),
         ], &[rows, Dsv4Scalar::I32(grid as i32)])?;
+        let timer = Instant::now();
+        let logits: Vec<f32> = self.download(&w.logits, t * experts * 4)?
+            .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        let wire = self.download(&w.wire, t * (h + h / 32))?;
+        self.profile.borrow_mut().add(Phase::RouterSync, timer);
+        // The shared expert runs on the GPU while the Sparks compute.
         self.run(&format!("shared_ffn_m{cap}"), &[
             ("x", w.y.buffer.ptr), ("w13", weights.ptr("w13")?), ("w13_scale", weights.ptr("w13_scale")?),
             ("w2", weights.ptr("w2")?), ("w2_scale", weights.ptr("w2_scale")?), ("out", w.shared.buffer.ptr),
             ("scratch", w.scratch.buffer.ptr),
         ], &[rows])?;
+        let timer = Instant::now();
         // Routing on the host: sqrtsoftplus scores; hash layers take ids from
         // tid2eid[token], score layers the top-k of score + bias; weights are
         // the unbiased scores at those ids, sum-normalized, times route_scale.
-        let logits: Vec<f32> = self.download(&w.logits, t * experts * 4)?
-            .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
         let mut routes = Vec::with_capacity(t * topk);
         for (row, token) in tokens.iter().enumerate() {
             let scores: Vec<f32> = logits[row * experts..][..experts].iter()
@@ -535,7 +618,6 @@ impl<'a> Engine<'a> {
                 });
             }
         }
-        let wire = self.download(&w.wire, t * (h + h / 32))?;
         let mut request = ExpertProtocolV2Request::new(
             layer as u64 + 1, 17, layer as u32, h as u32, ExpertV2Dtype::Fp8E4m3Ue8m0K32,
             (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
@@ -547,14 +629,19 @@ impl<'a> Engine<'a> {
         request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         let row_bytes = h * 2;
         let mut planes = vec![vec![0u8; t * row_bytes]; transport.world_size()];
+        self.profile.borrow_mut().add(Phase::Routing, timer);
+        let timer = Instant::now();
         runtime.block_on(transport.execute(&request, |rank, first, payload| {
             let start = first as usize * row_bytes;
             planes[rank][start..start + payload.len()].copy_from_slice(payload);
             Ok(())
         }))?;
+        self.profile.borrow_mut().add(Phase::Experts, timer);
+        let timer = Instant::now();
         for (plane, bytes) in w.planes.iter().zip(&planes) {
             self.library.copy_h2d(plane.buffer, bytes)?;
         }
+        self.profile.borrow_mut().add(Phase::PlaneUpload, timer);
         let reducer = self.library.v41_compact_reducer()?;
         let mut pointers = [std::ptr::null::<u16>(); 6];
         for (slot, plane) in pointers.iter_mut().zip(&w.planes) {
@@ -577,15 +664,16 @@ impl<'a> Engine<'a> {
             ("scale", self.weights.head_scale.buffer.ptr), ("base", self.weights.head_base.buffer.ptr),
             ("norm", self.weights.norm.buffer.ptr), ("collapsed", w.delta.buffer.ptr), ("out", w.y.buffer.ptr),
         ], &[Dsv4Scalar::I32(t as i32)])?;
-        let workspace = self.alloc(cuteafd_ffi::dsv4::VOCABULARY_HEAD_WORKSPACE)?;
-        let logits = self.alloc(t * vocab * 4)?;
-        // SAFETY: workspace outlives the head, which drops at the end of scope.
-        let head = unsafe { self.library.vocabulary_head(workspace.buffer.ptr, h as u32, t as u32)? };
+        let _ = h;
+        // SAFETY: input, weights and logits are live buffers of the head's shape.
         unsafe {
-            head.launch(w.y.buffer.ptr.cast(), self.weights.head.buffer.ptr.cast(),
-                logits.buffer.ptr.cast(), t as u32, self.stream)?;
+            w.head.launch(w.y.buffer.ptr.cast(), self.weights.head.buffer.ptr.cast(),
+                w.vocab_logits.buffer.ptr.cast(), t as u32, self.stream)?;
         }
-        Ok(self.download(&logits, t * vocab * 4)?
+        let timer = Instant::now();
+        let logits = self.download(&w.vocab_logits, t * vocab * 4)?;
+        self.profile.borrow_mut().add(Phase::Head, timer);
+        Ok(logits
             .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
     }
 }

@@ -201,6 +201,7 @@ fn golden_run(
             Ok(())
         })?;
     let prefill_elapsed = started.elapsed();
+    *engine.profile.borrow_mut() = engine::Profile::default();
     let decode_started = Instant::now();
     for position in prefill..tokens.len() {
         let token = tokens[position];
@@ -208,6 +209,7 @@ fn golden_run(
     }
     let decode_steps = tokens.len() - prefill;
     if decode_steps > 0 {
+        println!("decode host phases: {}", engine.profile.borrow().report());
         println!("decode: {decode_steps} steps in {:.2} s ({:.1} ms/token)", decode_started.elapsed().as_secs_f64(),
             decode_started.elapsed().as_secs_f64() * 1e3 / decode_steps as f64);
     }
