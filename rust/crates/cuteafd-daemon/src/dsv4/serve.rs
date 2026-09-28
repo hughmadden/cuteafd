@@ -2,7 +2,7 @@
 //! the prefill/decode engine (the correctness baseline batching builds on).
 use super::pool::{Placement, PoolAllocator};
 use super::{embed_rows, with_engine, EngineArgs};
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result};
 use cuteafd_api::native_v41::{
     ConsoleHub, InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits,
     NativeRequest, PromptUsage,
