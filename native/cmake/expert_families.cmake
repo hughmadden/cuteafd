@@ -4,9 +4,12 @@
 # (DeepSeek V4 Flash TP4 shard) or `dsv4f:spark_tp2`. The exporter derives the
 # role's slice from the family geometry and names every symbol
 # `cuteafd_{family}[_{role}]_expert_*`; the runtime selects the family from the
-# checkpoint's routed-expert geometry (`ExpertGeometry::family`).
-if(NOT CUTEAFD_ENABLE_V41_EXPERT_AOT OR NOT CUTEAFD_V41_EXPERT_ROLE STREQUAL "spark")
-  message(FATAL_ERROR "Expert families require the native SM121 Spark expert build")
+# checkpoint's routed-expert geometry (`ExpertGeometry::family`). Spark roles
+# build into the SM121 image, `rtx_backbone` (complete experts resident on the
+# coordinator) into the SM120 one; entries for the other architecture are
+# skipped so one list serves both builds.
+if(NOT CUTEAFD_ENABLE_V41_EXPERT_AOT)
+  message(FATAL_ERROR "Expert families require the native expert AOT build")
 endif()
 
 set(CUTEAFD_EXPERT_FAMILY_TARGETS)
@@ -19,14 +22,25 @@ set(CUTEAFD_EXPERT_FAMILY_WIDTH "1:64,16:128,80:128,256:128,1024:128,4096:128" C
 set(expert_ops info initialize output_kind bind_scratch initialize_scratch_async launch)
 
 foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
-  if(NOT entry MATCHES "^(dsv4f|dsv4p):(spark|spark_tp2)$")
-    message(FATAL_ERROR "CUTEAFD_EXPERT_FAMILIES entry ${entry} must be (dsv4f|dsv4p):(spark|spark_tp2)")
+  if(NOT entry MATCHES "^(dsv4f|dsv4p):(spark|spark_tp2|rtx_backbone)$")
+    message(FATAL_ERROR "CUTEAFD_EXPERT_FAMILIES entry ${entry} must be (dsv4f|dsv4p):(spark|spark_tp2|rtx_backbone)")
   endif()
   set(family "${CMAKE_MATCH_1}")
   set(role "${CMAKE_MATCH_2}")
-  # The TP4 shard keeps the historical unsuffixed name, as for V4.1.
+  if(role STREQUAL "rtx_backbone")
+    set(wanted coordinator)
+  else()
+    set(wanted spark)
+  endif()
+  if(NOT CUTEAFD_V41_EXPERT_ROLE STREQUAL wanted)
+    continue()
+  endif()
+  # Symbol names follow the V4.1 roles: the Spark TP4 shard is unsuffixed and
+  # the resident coordinator experts are `local`.
   if(role STREQUAL "spark")
     set(symbol "cuteafd_${family}")
+  elseif(role STREQUAL "rtx_backbone")
+    set(symbol "cuteafd_${family}_local")
   else()
     set(symbol "cuteafd_${family}_${role}")
   endif()

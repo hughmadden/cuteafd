@@ -78,9 +78,8 @@ fi
 
 # Extra routed-expert kernel families (FAMILY:ROLE list, e.g. dsv4f:spark),
 # validated by native/cmake/expert_families.cmake. Empty keeps the V4.1 image.
+# Both builds take the same list; CMake keeps the entries for its architecture.
 expert_families="${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}"
-[[ -z "$expert_families" || "$role" == expert ]] ||
-  { echo "CUTEAFD_RELEASE_EXPERT_FAMILIES is only valid for the expert role" >&2; exit 2; }
 # v7 ships both EXL3 decoder families by default: the uniform K=2 raw
 # publication family (2,3) and the staged K3.25 family (3,4). Paired TP4
 # builds remain single-family and stay on the v5 (3,4) family.

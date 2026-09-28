@@ -45,9 +45,8 @@ fi
 
 # Extra routed-expert kernel families (FAMILY:ROLE list, e.g. dsv4f:spark),
 # validated by native/cmake/expert_families.cmake. Empty keeps the V4.1 image.
+# Both builds take the same list; CMake keeps the entries for its architecture.
 expert_families="${CUTEAFD_WIP_EXPERT_FAMILIES:-}"
-[[ -z "$expert_families" || "$role" == expert ]] ||
-  { echo "CUTEAFD_WIP_EXPERT_FAMILIES is only valid for the expert role" >&2; exit 2; }
 # Official-only WIP builds may skip the EXL3 quantization AOT entirely. The
 # default stays ON so every existing slot and script is byte-compatible; the
 # native expert path does not require the EXL3 package.
