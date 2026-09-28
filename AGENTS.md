@@ -30,6 +30,8 @@ go in commit messages as short before → after tables with conditions.
   @sparks --wait` places them; `nest evict` removes (never the last copy);
   `nest plan --free` when space is tight. Replicate a model to every rank
   while working on it, then shrink to one copy or 1/N. Manage space.
+- Each host's `~/.cache/huggingface/hub` is a symlink into `/mnt/sparknest`;
+  containers must mount the resolved hub (run.sh does) or `/mnt/sparknest`.
 - `/mnt/scratch` and `/mnt/models` are slow archive stores (150 MB/s
   write, 500 MB/s read). Never build on `/mnt/scratch` (NTFS kernel bug).
 
@@ -48,6 +50,20 @@ go in commit messages as short before → after tables with conditions.
 - Kernels: CuTe-DSL/Triton AOT exports from the b12x fork are the default;
   hand CUDA only where measured to pay. SM120 and SM121 are both targets.
 - Run CUDA/PyTorch checks inside the matching architecture's container.
+- Host checks: `cargo check/test --workspace` from `rust/` with
+  `CARGO_TARGET_DIR=~/.cache/cuteafd/builds/<task>/target` (no Python
+  needed). Script tests: `.venv/bin/python -m pytest -q scripts/tests`
+  (`uv venv --python 3.12 .venv` + pytest numpy tokenizers jsonschema pyyaml);
+  13 inherited ds41rt failures remain, add none.
+- `./build.sh` (release pair, ~15 min coordinator + Spark leg): set
+  `CUTEAFD_RELEASE_BUILD_ROOT` and `CUTEAFD_RELEASE_REMOTE_BUILD_DIR` under
+  `~/.cache/cuteafd/builds/`, and `CUTEAFD_RELEASE_SPARK_TP_ROLES=` for a
+  TP4-only pair. It reads the live checkout while assembling images: edit in
+  a git worktree until it finishes. Crates download from crates.io each build
+  and can crawl while the WAN is busy; it is slow, not stuck.
+- Iterate with `./wip.sh --slot S` then `./run.sh --wip S --restart`; A/B two
+  checkouts with `scripts/bench-ab.py`. `cuteafd plan MODEL` (any HF id or
+  snapshot dir) says what a checkpoint needs before any kernel work.
 
 ## Engineering rules
 
