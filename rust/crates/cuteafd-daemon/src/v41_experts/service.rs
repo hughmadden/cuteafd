@@ -36,6 +36,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         rank: args.rank as usize,
         world: args.world as usize,
         first_layer: args.first_layer as usize,
+        last_layer: args.last_layer.map(|layer| layer as usize),
         capacity: args.capacity,
         device_budget: args.device_budget_bytes,
         max_frame_bytes: args.max_frame_bytes,
@@ -53,6 +54,8 @@ pub(crate) struct NativeExpertServiceConfig {
     pub rank: usize,
     pub world: usize,
     pub first_layer: usize,
+    /// Inclusive last resident layer; `None` serves through the model's last.
+    pub last_layer: Option<usize>,
     pub capacity: u32,
     pub device_budget: usize,
     pub max_frame_bytes: usize,
@@ -66,8 +69,7 @@ fn load_weights<'a>(
     catalog: &OfficialV41Catalog,
     config: &NativeExpertServiceConfig,
 ) -> Result<(backend::Weights<'a>, usize)> {
-    let layers = catalog.routed_experts().layers;
-    ensure!(config.first_layer < layers, "native first layer must be below {layers}");
+    let layers = config.resident_layers(catalog.routed_experts().layers)?.end;
     validate_topology(config, catalog)?;
     if catalog.exl3().is_some() { return backend::load_exl3(library, catalog, config); }
     log_spark_memory_if_enabled(library, config, "worker startup", None, None);
@@ -434,6 +436,7 @@ mod tests {
             rank,
             world,
             first_layer: 0,
+            last_layer: None,
             capacity: 16,
             device_budget: 1 << 40,
             max_frame_bytes: 64 << 20,
@@ -721,6 +724,22 @@ fn validate_topology(config: &NativeExpertServiceConfig, catalog: &OfficialV41Ca
 }
 
 impl NativeExpertServiceConfig {
+    /// Resident backbone layers: `first_layer..=last_layer`, bounded by the model.
+    pub(super) fn resident_layers(&self, layers: usize) -> Result<std::ops::Range<usize>> {
+        let end = match self.last_layer {
+            Some(last) => {
+                ensure!(last < layers, "native last layer must be below {layers}");
+                last + 1
+            }
+            None => layers,
+        };
+        ensure!(
+            self.first_layer < end,
+            "native first layer {} must be below {layers} and not after the last layer",
+            self.first_layer
+        );
+        Ok(self.first_layer..end)
+    }
     /// Resident layer selection for the running checkpoint format. Explicit
     /// replicated topologies always select the native generic shard; the legacy
     /// path keeps the fixed TP4/EXL3-TP2 behavior byte-for-byte, and an

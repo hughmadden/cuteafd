@@ -100,8 +100,13 @@ pub(crate) struct DoctorArgs {
 #[derive(Debug, Args)]
 pub(crate) struct NativeExpertDaemonArgs {
     /// First resident backbone layer; use 20 when both RTX GPUs host the encoder.
-    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..40))]
+    /// Checked against the checkpoint's layer count at startup.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..256))]
     pub(crate) first_layer: u32,
+    /// Last resident backbone layer (inclusive); defaults to the model's last
+    /// layer. A partial range serves a subset of layers, for bring-up and probes.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..256))]
+    pub(crate) last_layer: Option<u32>,
     /// Official local snapshot directory, including all shard headers.
     #[arg(long)]
     pub(crate) snapshot: PathBuf,

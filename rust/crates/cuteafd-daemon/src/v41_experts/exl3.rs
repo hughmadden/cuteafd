@@ -11,6 +11,18 @@ const BANKS: usize = 2;
 pub(crate) mod execution;
 pub(crate) mod worker;
 
+/// EXL3 package directory name for one decoder-tier family: V4.1 keeps
+/// `exl3-k<tiers>`; other expert geometries ship as `exl3-<family>-k<tiers>`
+/// (for example `exl3-dsv4p-k23`), so one image can carry several models.
+pub(crate) fn package_name(family: &str, tiers: &[usize]) -> String {
+    let tag: String = tiers.iter().map(usize::to_string).collect();
+    if family == "v41" {
+        format!("exl3-k{tag}")
+    } else {
+        format!("exl3-{family}-k{tag}")
+    }
+}
+
 /// Resolve one EXL3 AOT layout directory for the running checkpoint.
 ///
 /// v7 images ship decoder-tier families side by side under
@@ -18,7 +30,8 @@ pub(crate) mod worker;
 /// family at the legacy `<libdir>/exl3/<layout>`. The checkpoint's decoder
 /// tiers select the matching family first; otherwise the legacy location
 /// is returned and the downstream module-info bits check reports any
-/// mismatch with the checkpoint.
+/// mismatch with the checkpoint. Other expert geometries resolve only their
+/// own `exl3-<family>-k<tiers>` package, never the legacy V4.1 location.
 pub(crate) fn aot_layout_directory(
     native_lib: &std::path::Path,
     tiers: &[usize],
@@ -28,11 +41,11 @@ pub(crate) fn aot_layout_directory(
         .parent()
         .unwrap_or(std::path::Path::new("."))
         .join("exl3");
+    let family = cuteafd_core::expert_geometry().family().unwrap_or("unknown");
     if !tiers.is_empty() {
-        let tag: String = tiers.iter().map(usize::to_string).collect();
-        let family = root.join(format!("exl3-k{tag}")).join(layout);
-        if family.is_dir() {
-            return family;
+        let package = root.join(package_name(family, tiers)).join(layout);
+        if package.is_dir() || family != "v41" {
+            return package;
         }
     }
     root.join(layout)

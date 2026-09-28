@@ -86,7 +86,7 @@ impl Manifest {
             bytes = bytes
                 .checked_add(
                     self.capacity
-                        .checked_mul(5120 * 2)
+                        .checked_mul(self.hidden * 2)
                         .context("EXL3 wire workspace overflow")?,
                 )
                 .context("EXL3 workspace budget overflow")?;
@@ -228,6 +228,7 @@ pub(crate) struct Exl3Execution<'a> {
     output: CuteafdDeviceBuffer,
     output_element_bytes: usize,
     device: i32,
+    hidden: usize,
     capacity: usize,
     topk: usize,
     library: &'a NativeLibrary,
@@ -323,18 +324,19 @@ impl<'a> Exl3Execution<'a> {
                 "EXL3 resident layers must share one device and TP rank"
             );
             ensure!(
-                meta.hidden == 5120
+                meta.hidden == cuteafd_core::expert_geometry().hidden as usize
                     && meta.intermediate == weight.layout.intermediate
                     && meta.experts == weight.layout.experts
                     && meta.bits == weight.layout.tiers
                     && meta.swiglu_limit == 10.0,
                 "EXL3 export/residency geometry mismatch"
             );
+            // V4.1 dSpark drafts route top-3; every backbone follows the model.
             let expected_topk =
                 if matches!(weight.layout.layer, cuteafd_loader::V41Exl3Layer::Dspark(_)) {
                     3
                 } else {
-                    6
+                    cuteafd_core::expert_geometry().topk as usize
                 };
             ensure!(meta.top_k == expected_topk, "EXL3 expert top-k mismatch");
         }
@@ -539,12 +541,12 @@ impl<'a> Exl3Execution<'a> {
             )?)
         };
         let wire = if format == Exl3InputFormat::Fp8K32 {
-            // The router's 5120-value wire row is replicated across TP ranks;
+            // The router's hidden-wide wire row is replicated across TP ranks;
             // only intermediate expert weights are sliced. Local RTX TP1/TP2
             // therefore use the same decoder as Spark TP4.
             Some((
                 library.v41_exl3_wire()?,
-                DeviceAllocation::new(library, meta.capacity * 5120 * 2)?,
+                DeviceAllocation::new(library, meta.capacity * meta.hidden * 2)?,
             ))
         } else {
             None
@@ -562,6 +564,7 @@ impl<'a> Exl3Execution<'a> {
             output_element_bytes: info.output_element_bytes,
             output: *pointers.get("output").context("missing EXL3 output")?,
             device,
+            hidden: meta.hidden,
             capacity: meta.capacity,
             topk: meta.top_k,
             library,
@@ -593,7 +596,7 @@ impl<'a> Exl3Execution<'a> {
     }
 
     /// # Safety
-    /// Inputs are BF16[rows,5120] or FP8 wire[rows,5280] as selected at setup,
+    /// Inputs are BF16[rows,H] or FP8 wire[rows,H+H/32] as selected at setup,
     /// int32[rows,topk], FP32[rows,topk], contiguous
     /// on this owner device and live through completion. No overlapping input /
     /// workspace storage or concurrent use of this lane, including graph replay.
@@ -652,7 +655,7 @@ impl<'a> Exl3Execution<'a> {
             "EXL3 execution on wrong device"
         );
         for (buffer, bytes) in inputs.iter().zip([
-            rows * if self.wire.is_some() { 5280 } else { 5120 * 2 },
+            rows * if self.wire.is_some() { self.hidden + self.hidden / 32 } else { self.hidden * 2 },
             rows * self.topk * 4,
             rows * self.topk * 4,
         ]) {
@@ -668,7 +671,7 @@ impl<'a> Exl3Execution<'a> {
             !output.ptr.is_null()
                 && output.ptr as usize % 16 == 0
                 && output.device_id == self.device
-                && output.bytes >= rows * 5120 * self.output_element_bytes,
+                && output.bytes >= rows * self.hidden * self.output_element_bytes,
             "EXL3 output buffer contract mismatch"
         );
         let binding = self.layers.get_mut(layer).context("EXL3 layer is not bound")?;
@@ -701,7 +704,7 @@ impl<'a> Exl3Execution<'a> {
             .launch_core(&binding.core.pointers, &binding.core.scalars, stream)?;
         self.kernel
             .launch_sum(&binding.sum.pointers, &binding.sum.scalars, stream)?;
-        output.bytes = rows * 5120 * self.output_element_bytes;
+        output.bytes = rows * self.hidden * self.output_element_bytes;
         Ok(output)
     }
 }
