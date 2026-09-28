@@ -22,6 +22,9 @@ use cuteafd_transport::{
 use std::ffi::c_void;
 use std::time::Instant;
 
+mod dspark;
+pub(crate) use dspark::DraftRequest;
+
 type Dev<'a> = DeviceAllocation<'a>;
 
 pub(crate) struct Engine<'a> {
@@ -57,6 +60,9 @@ const LOCAL_EXPERTS: usize = usize::MAX;
 /// a second Spark exchange per layer.
 pub(crate) const PREFILL_LANES: usize = 2;
 const MIN_LANE_ROWS: usize = 256;
+/// Rows of a step whose target taps feed the drafter's main KV: every row of
+/// a decode step, the last window of a prefill lane.
+const TAP_ROWS: usize = metadata::WINDOW;
 
 /// One lane's inputs for a step.
 struct LaneStep<'s> {
@@ -156,6 +162,9 @@ struct Lane<'a> {
     /// after the other lane's shared expert ran).
     shared: Dev<'a>,
     tables: StepBuffers<'a>,
+    /// dSpark target taps of the lane's last TAP_ROWS rows, BF16
+    /// [TAP_ROWS, taps * dim] (empty without a drafter).
+    taps: Dev<'a>,
 }
 
 /// Step workspace sized for `rows` rows per lane; everything but the lanes is
@@ -180,6 +189,13 @@ struct Workspace<'a> {
     scratch: Dev<'a>,
     dummy: Dev<'a>,
     vocab_logits: Dev<'a>,
+    /// dSpark: projected taps (BF16) and the projection's FP32 rows, first
+    /// tokens and drafts (U32), Markov argmax partials.
+    main_x: Dev<'a>,
+    main_work: Dev<'a>,
+    first_tokens: Dev<'a>,
+    drafts: Dev<'a>,
+    markov: Dev<'a>,
     /// Pinned staging: routes + wire rows down, rank partials up.
     router_host: HostAllocation<'a>,
     planes_host: RefCell<HostAllocation<'a>>,
@@ -254,7 +270,7 @@ impl<'a> Engine<'a> {
         let shape = parts.shape;
         let sequences = shape.sequences;
         let main = zeroed(shape.window_pages() * MAIN_PAGE_BYTES)?;
-        let (compressed, index, states) = match parts.cfg.compress_ratios[layer] {
+        let (compressed, index, states) = match parts.cfg.compress_ratios.get(layer).copied().unwrap_or(0) {
             4 => (
                 Some(zeroed(shape.c4_pages * metadata::compressed_page_bytes(4))?),
                 Some(zeroed(shape.c4_pages * INDEX_PAGE_BYTES)?),
@@ -277,7 +293,9 @@ impl<'a> Engine<'a> {
 
     /// Allocates the cache pools and RoPE tables for `parts.shape`.
     pub fn new(parts: EngineParts<'a>) -> Result<Self> {
-        let pools = (0..parts.cfg.n_layers).map(|l| Self::pool_layer(&parts, l)).collect::<Result<Vec<_>>>()?;
+        // Layers past the backbone are the dSpark stages' window caches.
+        let stages = parts.weights.dspark.as_ref().map_or(0, |d| d.stages.len());
+        let pools = (0..parts.cfg.n_layers + stages).map(|l| Self::pool_layer(&parts, l)).collect::<Result<Vec<_>>>()?;
         let table = |compressed: bool| -> Result<Dev<'a>> {
             let values = metadata::rope_table(&parts.cfg, compressed, parts.max_context.max(metadata::WINDOW));
             let allocation = DeviceAllocation::new(parts.library, values.len() * 4)?;
@@ -327,6 +345,7 @@ impl<'a> Engine<'a> {
                 tokens: self.alloc(t * 4)?,
                 shared: self.alloc(t * h * 2)?,
                 tables: self.step_buffers(t)?,
+                taps: self.alloc(t.min(TAP_ROWS) * self.cfg.dspark_target_layer_ids.len() * h * 2)?,
             })
         };
         Ok(Workspace {
@@ -348,6 +367,11 @@ impl<'a> Engine<'a> {
             scratch: self.alloc(self.scratch_bytes()?)?,
             dummy: self.zeroed(4096)?,
             vocab_logits: self.alloc(t * self.cfg.vocab_size * 4)?,
+            main_x: self.alloc(t.min(TAP_ROWS) * h * 2)?,
+            main_work: self.alloc(t.min(TAP_ROWS) * h * 4)?,
+            first_tokens: self.alloc(t * 4)?,
+            drafts: self.alloc(t * 4)?,
+            markov: self.alloc(self.library.dsv4_markov_workspace(t)?)?,
             router_host: HostAllocation::new(self.library, t * (topk * 8 + h + h / 32))?,
             planes_host: RefCell::new(HostAllocation::new(self.library, 4 * t * h * 2)?),
             // SAFETY: the workspace buffer lives in the same struct and drops
@@ -563,6 +587,7 @@ impl<'a> Engine<'a> {
                 let segment = || -> Result<()> {
                     if previous > 0 {
                         self.post(w, lane, previous, rows, layer - 1)?;
+                        self.tap(w, lane, layer - 1, t)?;
                     }
                     self.attention(layer, weights, tables, lane, w, rows, cap)
                 };
@@ -580,6 +605,7 @@ impl<'a> Engine<'a> {
             }
             if ranks > 0 {
                 self.post(w, lane, ranks, rows, self.weights.layers.len() - 1)?;
+                self.tap(w, lane, self.weights.layers.len() - 1, t)?;
             }
         } else {
             // Units run layer-major. A unit's attention needs its own lane's
@@ -593,7 +619,10 @@ impl<'a> Engine<'a> {
             let attention = |(layer, lane): (usize, usize)| {
                 self.attention(layer, &self.weights.layers[layer], lanes[lane].tables, &w.lanes[lane], w, rows_of(lane), cap)
             };
-            let post = |(layer, lane): (usize, usize), ranks: usize| self.post(w, &w.lanes[lane], ranks, rows_of(lane), layer);
+            let post = |(layer, lane): (usize, usize), ranks: usize| {
+                self.post(w, &w.lanes[lane], ranks, rows_of(lane), layer)?;
+                self.tap(w, &w.lanes[lane], layer, lanes[lane].tables.rows)
+            };
             let local_layers = self.local_layers();
             let pipelined = transports.len() >= lanes.len() && lanes.len() > 1;
             runtime.block_on(async {
@@ -610,7 +639,7 @@ impl<'a> Engine<'a> {
                         let slot = if pipelined { lane } else { 0 };
                         let wave = transports[slot].dispatch_wave(&request)?;
                         // The shared expert runs on the GPU while the Sparks compute.
-                        self.shared_ffn(layer, w, &w.lanes[lane], rows_of(lane), cap)?;
+                        self.shared_ffn(layer, w, &w.lanes[lane], rows_of(lane), cap, &self.weights.layers[layer])?;
                         if let Some((previous, wave)) = inflight.take() {
                             let slot = if pipelined { previous.1 } else { 0 };
                             let ranks = self.land(&mut transports[slot], wave, lanes[previous.1].tables.rows, w).await?;
@@ -637,6 +666,9 @@ impl<'a> Engine<'a> {
                 }
                 anyhow::Ok(())
             })?;
+        }
+        for (index, step) in lanes.iter().enumerate() {
+            self.write_draft_kv(w, &w.lanes[index], step.tables.rows, cap)?;
         }
         if logit_rows == 0 {
             // The next step rewrites the tables only after this one drains.
@@ -904,25 +936,25 @@ impl<'a> Engine<'a> {
     }
 
     /// The shared expert on the unit's FFN input `y` into the lane's `shared`.
-    fn shared_ffn(&self, layer: usize, w: &Workspace<'_>, lane: &Lane<'_>, rows: Dsv4Scalar, cap: usize) -> Result<()> {
-        let weights = &self.weights.layers[layer];
+    fn shared_ffn(&self, layer: usize, w: &Workspace<'_>, lane: &Lane<'_>, rows: Dsv4Scalar, cap: usize,
+        weights: &LayerWeights<'_>) -> Result<()> {
         self.run(&format!("shared_ffn_m{cap}"), &[
             ("x", w.y.buffer.ptr), ("w13", weights.ptr("w13")?), ("w13_scale", weights.ptr("w13_scale")?),
             ("w2", weights.ptr("w2")?), ("w2_scale", weights.ptr("w2_scale")?), ("out", lane.shared.buffer.ptr),
             ("scratch", w.scratch.buffer.ptr),
-        ], &[rows])
+        ], &[rows]).with_context(|| format!("layer {layer} shared expert"))
     }
 
     /// Shared and routed experts of a coordinator-resident layer: routes,
     /// wire rows and results stay on the device, the host only enqueues.
     fn local_experts(&self, layer: usize, t: usize, w: &Workspace<'_>, lane: &Lane<'_>, cap: usize) -> Result<()> {
-        self.shared_ffn(layer, w, lane, Dsv4Scalar::I32(t as i32), cap)?;
+        self.shared_ffn(layer, w, lane, Dsv4Scalar::I32(t as i32), cap, &self.weights.layers[layer])?;
         let timer = Instant::now();
         let mut local = self.local.borrow_mut();
         let local = local.as_mut().context("local experts")?;
         // SAFETY: wire, routes and shared rows are complete in stream order.
         unsafe {
-            local.run(layer, t, w.wire.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
+            local.run(super::local::LocalLayer::Backbone(layer), t, w.wire.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
                 lane.shared.buffer.ptr, self.stream)?
         };
         self.profile.borrow_mut().add(Phase::Experts, timer);
@@ -1018,7 +1050,7 @@ impl<'a> Engine<'a> {
         let request = self.stage_request(layer, t, w, ExpertV2SourceKind::Decode)?;
         let wave = transport.dispatch_wave(&request)?;
         // The shared expert runs on the GPU while the Sparks compute.
-        self.shared_ffn(layer, w, lane, Dsv4Scalar::I32(t as i32), cap)?;
+        self.shared_ffn(layer, w, lane, Dsv4Scalar::I32(t as i32), cap, &self.weights.layers[layer])?;
         runtime.block_on(self.land(transport, wave, t, w))
     }
 

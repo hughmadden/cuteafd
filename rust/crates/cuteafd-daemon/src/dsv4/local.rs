@@ -19,8 +19,17 @@ struct State<'a> {
     slots: [*mut c_void; V41_EXPERT_POINTER_COUNT],
 }
 
+/// A resident expert layer: backbone layer `n`, or dSpark stage `n`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LocalLayer {
+    Backbone(usize),
+    Stage(usize),
+}
+
 pub(crate) struct LocalExperts<'a> {
     layers: Vec<ExpertWeights<'a>>,
+    /// dSpark stage experts (same geometry), loaded before backbone layers.
+    stages: Vec<ExpertWeights<'a>>,
     states: Vec<State<'a>>,
     _scratch: DeviceAllocation<'a>,
     reducer: V41LocalExpertReducer<'a>,
@@ -29,17 +38,19 @@ pub(crate) struct LocalExperts<'a> {
 }
 
 impl<'a> LocalExperts<'a> {
-    /// Loads layers `0..` while they fit in `budget` bytes (leaving room for
-    /// the kernels' workspace), up to `max_layers`.
+    /// Loads the first `draft_stages` dSpark stages, then backbone layers
+    /// `0..` while they fit in `budget` bytes (leaving room for the kernels'
+    /// workspace), up to `max_layers`.
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
+        draft_stages: usize,
         max_layers: usize,
         max_rows: usize,
         budget: usize,
         stream: *mut c_void,
     ) -> Result<Option<Self>> {
-        if max_layers == 0 {
+        if max_layers == 0 && draft_stages == 0 {
             return Ok(None);
         }
         let shape = *catalog.routed_experts();
@@ -67,6 +78,14 @@ impl<'a> LocalExperts<'a> {
         ensure!(budget > workspace, "local experts need {workspace} workspace bytes, budget is {budget}");
         let mut remaining = budget - workspace;
         tracing::info!(budget, workspace, scratch_bytes, "loading coordinator expert layers");
+        let mut stages = Vec::new();
+        for stage in 0..draft_stages {
+            let layer = ExpertLayer::BackboneFull { layer: shape.layers + stage };
+            let weights = ExpertWeights::load(library, catalog, layer, remaining)
+                .with_context(|| format!("dSpark stage {stage} experts with {remaining} bytes left"))?;
+            remaining -= weights.budget().resident_bytes;
+            stages.push(weights);
+        }
         let mut layers = Vec::new();
         for layer in 0..max_layers.min(shape.layers) {
             let plan = ExpertWeights::plan(library, catalog, ExpertLayer::BackboneFull { layer })?;
@@ -79,7 +98,7 @@ impl<'a> LocalExperts<'a> {
             tracing::debug!(layer, resident = weights.budget().resident_bytes, remaining, "coordinator expert layer resident");
             layers.push(weights);
         }
-        if layers.is_empty() {
+        if layers.is_empty() && stages.is_empty() {
             return Ok(None);
         }
         let scratch = DeviceAllocation::new(library, scratch_bytes.max(256))?;
@@ -93,6 +112,7 @@ impl<'a> LocalExperts<'a> {
         }
         Ok(Some(Self {
             layers,
+            stages,
             states,
             _scratch: scratch,
             reducer: library.v41_local_expert_reducer()?,
@@ -105,6 +125,10 @@ impl<'a> LocalExperts<'a> {
         self.layers.len()
     }
 
+    pub fn stages(&self) -> usize {
+        self.stages.len()
+    }
+
     /// Runs layer `layer`'s experts for `rows` wire rows with device routes
     /// and writes routed + shared into [`Self::output`].
     ///
@@ -115,7 +139,7 @@ impl<'a> LocalExperts<'a> {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn run(
         &mut self,
-        layer: usize,
+        layer: LocalLayer,
         rows: usize,
         wire: *mut c_void,
         ids: *mut c_void,
@@ -123,10 +147,13 @@ impl<'a> LocalExperts<'a> {
         shared: *mut c_void,
         stream: *mut c_void,
     ) -> Result<()> {
-        ensure!(layer < self.layers.len(), "local expert layer {layer} out of range");
+        let resident = match layer {
+            LocalLayer::Backbone(n) => self.layers.get(n),
+            LocalLayer::Stage(n) => self.stages.get(n),
+        }.with_context(|| format!("local expert layer {layer:?} is not resident"))?;
         let state = self.states.iter_mut().find(|s| s.kernel.info().capacity_rows as usize >= rows)
             .context("no local expert capacity for this many rows")?;
-        self.layers[layer].bind(&state.kernel, &mut state.slots)?;
+        resident.bind(&state.kernel, &mut state.slots)?;
         state.slots[0] = wire;
         state.slots[1] = ids;
         state.slots[2] = weights;

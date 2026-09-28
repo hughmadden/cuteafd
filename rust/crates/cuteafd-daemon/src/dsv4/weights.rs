@@ -38,8 +38,26 @@ impl LayerWeights<'_> {
     }
 }
 
+/// The dSpark drafter (`mtp.*`): three window-only blocks, the target-tap
+/// projection of stage 0 and the head extras of the last stage.
+pub(crate) struct DsparkWeights<'a> {
+    pub stages: Vec<LayerWeights<'a>>,
+    /// Block-FP8 [dim, taps * dim] and its raw UE8M0 128x128 block scales.
+    pub main_proj: DeviceAllocation<'a>,
+    pub main_proj_scale: DeviceAllocation<'a>,
+    pub main_norm: DeviceAllocation<'a>,
+    pub head_fn: DeviceAllocation<'a>,
+    pub head_scale: DeviceAllocation<'a>,
+    pub head_base: DeviceAllocation<'a>,
+    pub norm: DeviceAllocation<'a>,
+    /// Markov head, BF16 [vocab, rank] each.
+    pub markov_w1: DeviceAllocation<'a>,
+    pub markov_w2: DeviceAllocation<'a>,
+}
+
 pub(crate) struct ModelWeights<'a> {
     pub layers: Vec<LayerWeights<'a>>,
+    pub dspark: Option<DsparkWeights<'a>>,
     pub head: DeviceAllocation<'a>,
     pub head_fn: DeviceAllocation<'a>,
     pub head_scale: DeviceAllocation<'a>,
@@ -153,11 +171,14 @@ impl<'a> WeightLoader<'a, '_> {
     }
 
     pub fn layer(&self, cfg: &DeepseekV4Config, layer: usize) -> Result<LayerWeights<'a>> {
-        let ratio = cfg.compress_ratios[layer];
-        let hash = cfg.is_hash_layer(layer);
+        self.block(cfg, &format!("layers.{layer}"), cfg.compress_ratios[layer], cfg.is_hash_layer(layer))
+    }
+
+    /// One block's operands from the checkpoint names under `prefix`.
+    fn block(&self, cfg: &DeepseekV4Config, prefix: &str, ratio: usize, hash: bool) -> Result<LayerWeights<'a>> {
         let mut operands = HashMap::new();
         for source in layer_sources(cfg, ratio) {
-            let names: Vec<String> = source.tensors.iter().map(|t| format!("layers.{layer}.{t}")).collect();
+            let names: Vec<String> = source.tensors.iter().map(|t| format!("{prefix}.{t}")).collect();
             let raw = self.read(&names)?;
             let allocation = match source.prep {
                 Prep::Raw => self.upload(&raw)?,
@@ -167,20 +188,43 @@ impl<'a> WeightLoader<'a, '_> {
         }
         if hash {
             // The checkpoint stores I64 expert ids; the router reads I32.
-            let raw = self.read(&[format!("layers.{layer}.ffn.gate.tid2eid")])?;
+            let raw = self.read(&[format!("{prefix}.ffn.gate.tid2eid")])?;
             let ids = raw.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap()))
                 .map(|id| i32::try_from(id).map(i32::to_le_bytes)).collect::<Result<Vec<_>, _>>()?;
             operands.insert("gate.tid2eid", self.upload(ids.as_flattened())?);
         } else {
-            operands.insert("gate.bias", self.tensor(&format!("layers.{layer}.ffn.gate.bias"))?);
+            operands.insert("gate.bias", self.tensor(&format!("{prefix}.ffn.gate.bias"))?);
         }
         Ok(LayerWeights { ratio, hash, operands })
+    }
+
+    /// The drafter, when the checkpoint carries one (`mtp.0.main_proj`).
+    fn dspark(&self, cfg: &DeepseekV4Config) -> Result<Option<DsparkWeights<'a>>> {
+        if cfg.dspark_block_size == 0 || self.catalog.tensor("mtp.0.main_proj.weight").is_err() {
+            return Ok(None);
+        }
+        let stages = (0..3).map(|stage| self.block(cfg, &format!("mtp.{stage}"), 0, false))
+            .collect::<Result<Vec<_>>>()?;
+        let last = stages.len() - 1;
+        Ok(Some(DsparkWeights {
+            stages,
+            main_proj: self.tensor("mtp.0.main_proj.weight")?,
+            main_proj_scale: self.tensor("mtp.0.main_proj.scale")?,
+            main_norm: self.tensor("mtp.0.main_norm.weight")?,
+            head_fn: self.tensor(&format!("mtp.{last}.hc_head_fn"))?,
+            head_scale: self.tensor(&format!("mtp.{last}.hc_head_scale"))?,
+            head_base: self.tensor(&format!("mtp.{last}.hc_head_base"))?,
+            norm: self.tensor(&format!("mtp.{last}.norm.weight"))?,
+            markov_w1: self.tensor(&format!("mtp.{last}.markov_head.markov_w1.weight"))?,
+            markov_w2: self.tensor(&format!("mtp.{last}.markov_head.markov_w2.weight"))?,
+        }))
     }
 
     pub fn model(&self, cfg: &DeepseekV4Config) -> Result<ModelWeights<'a>> {
         let layers = (0..cfg.n_layers).map(|layer| self.layer(cfg, layer)).collect::<Result<_>>()?;
         Ok(ModelWeights {
             layers,
+            dspark: self.dspark(cfg)?,
             head: self.tensor("head.weight")?,
             head_fn: self.tensor("hc_head_fn")?,
             head_scale: self.tensor("hc_head_scale")?,

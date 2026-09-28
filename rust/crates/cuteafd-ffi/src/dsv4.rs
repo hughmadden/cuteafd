@@ -270,6 +270,74 @@ impl NativeLibrary {
     }
 }
 
+/// dSpark drafter kernels (native/cuda/kernels/dsv4_dspark.cu).
+impl NativeLibrary {
+    /// Mean over the four mHC copies of `rows` stream rows [rows, 4, hidden]
+    /// into columns `offset..offset + hidden` of `out` [rows, stride], BF16.
+    ///
+    /// # Safety
+    /// Both buffers are live device memory of those shapes on the stream's device.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn dsv4_hc_mean(&self, stream: *const c_void, out: *mut c_void, rows: usize, hidden: usize,
+        stride: usize, offset: usize, cuda_stream: *mut c_void) -> Result<()> {
+        type HcMean = unsafe extern "C" fn(*const c_void, *mut c_void, i32, i32, i32, i32, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<HcMean>(b"cuteafd_dsv4_hc_mean") }?;
+        let status = unsafe {
+            f(stream, out, i32::try_from(rows)?, i32::try_from(hidden)?, i32::try_from(stride)?,
+                i32::try_from(offset)?, cuda_stream)
+        };
+        ensure!(status == 0, "dSpark hc mean failed with {status}");
+        Ok(())
+    }
+
+    /// `out` [rows, n] BF16 = RMSNorm(x [rows, k] BF16 @ w^T) * norm, `w` FP8
+    /// E4M3 [n, k] with UE8M0 128x128 block `scale`; `work` holds rows * n FP32.
+    ///
+    /// # Safety
+    /// Every pointer is live device memory of its shape on the stream's device.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn dsv4_fp8_linear_rmsnorm(&self, x: *const c_void, w: *const c_void, scale: *const c_void,
+        norm: *const c_void, out: *mut c_void, work: *mut c_void, rows: usize, n: usize, k: usize, eps: f32,
+        cuda_stream: *mut c_void) -> Result<()> {
+        type Linear = unsafe extern "C" fn(*const c_void, *const c_void, *const c_void, *const c_void, *mut c_void,
+            *mut c_void, i32, i32, i32, f32, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Linear>(b"cuteafd_dsv4_fp8_linear_rmsnorm") }?;
+        let status = unsafe {
+            f(x, w, scale, norm, out, work, i32::try_from(rows)?, i32::try_from(n)?, i32::try_from(k)?, eps, cuda_stream)
+        };
+        ensure!(status == 0, "dSpark main projection failed with {status}");
+        Ok(())
+    }
+
+    /// Workspace bytes [`Self::dsv4_markov_drafts`] needs for `sequences`.
+    pub fn dsv4_markov_workspace(&self, sequences: usize) -> Result<usize> {
+        type Workspace = unsafe extern "C" fn(i32) -> u64;
+        let f = *unsafe { self.lib.get::<Workspace>(b"cuteafd_dsv4_markov_workspace") }?;
+        Ok(usize::try_from(unsafe { f(i32::try_from(sequences)?) })?)
+    }
+
+    /// Greedy dSpark drafts [sequences, block] U32 from head `logits`
+    /// [sequences * block, vocab] FP32 and the Markov head (`w1`, `w2` BF16
+    /// [vocab, rank]); step 0 conditions on `first` [sequences] U32.
+    ///
+    /// # Safety
+    /// Every pointer is live device memory of its shape on the stream's device.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn dsv4_markov_drafts(&self, logits: *const c_void, w1: *const c_void, w2: *const c_void,
+        first: *const c_void, drafts: *mut c_void, workspace: *mut c_void, sequences: usize, block: usize,
+        vocab: usize, rank: usize, cuda_stream: *mut c_void) -> Result<()> {
+        type Drafts = unsafe extern "C" fn(*const c_void, *const c_void, *const c_void, *const c_void, *mut c_void,
+            *mut c_void, i32, i32, i32, i32, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Drafts>(b"cuteafd_dsv4_markov_drafts") }?;
+        let status = unsafe {
+            f(logits, w1, w2, first, drafts, workspace, i32::try_from(sequences)?, i32::try_from(block)?,
+                i32::try_from(vocab)?, i32::try_from(rank)?, cuda_stream)
+        };
+        ensure!(status == 0, "dSpark Markov drafts failed with {status}");
+        Ok(())
+    }
+}
+
 impl VocabularyHead<'_> {
     /// # Safety
     /// `input` BF16 [rows, width], `weight` BF16 [vocab, width] and `logits`

@@ -269,14 +269,18 @@ impl OfficialV41Catalog {
                 )
             }
             V41ExpertSelection::BackboneFull { layer, expert } => {
-                ensure!(layer < config.layers, "backbone layer out of range");
+                // Layers past the backbone are the dSpark stages of a checkpoint
+                // whose draft experts share the backbone geometry (DeepSeek V4).
+                let prefix = if layer < config.layers {
+                    format!("layers.{layer}.ffn.experts.{expert}")
+                } else {
+                    let stage = layer - config.layers;
+                    ensure!(stage < config.draft_stages && config.draft_experts == config.experts,
+                        "backbone layer out of range");
+                    format!("mtp.{stage}.ffn.experts.{expert}")
+                };
                 ensure!(expert < config.experts, "backbone expert out of range");
-                (
-                    format!("layers.{layer}.ffn.experts.{expert}"),
-                    None,
-                    config.intermediate,
-                    None,
-                )
+                (prefix, None, config.intermediate, None)
             }
             V41ExpertSelection::DsparkTp2 { stage, expert, rank } => {
                 ensure!(stage < config.draft_stages,"dSpark stage out of range");

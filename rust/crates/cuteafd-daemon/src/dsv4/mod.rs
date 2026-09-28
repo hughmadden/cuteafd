@@ -43,6 +43,10 @@ pub(crate) struct EngineArgs {
     /// they fill free memory by default. 0 sends every layer to the Sparks.
     #[arg(long)]
     pub local_expert_layers: Option<usize>,
+    /// Keep the dSpark drafter's stage experts on the coordinator GPU (before
+    /// backbone layers) so the engine can draft.
+    #[arg(long)]
+    pub dspark: bool,
     /// GiB kept free on the coordinator GPU for workspaces and headroom.
     #[arg(long, default_value_t = 10)]
     pub reserve_gib: usize,
@@ -62,6 +66,10 @@ pub(crate) struct GoldenArgs {
     /// (teacher-forced), comparing every decode row with the golden logits.
     #[arg(long)]
     pub prefill: Option<usize>,
+    /// Before each decode step, draft with dSpark after the true next token
+    /// and report how many drafts match the golden continuation.
+    #[arg(long)]
+    pub draft: bool,
     /// Teacher-force decode in verify steps of this many rows per step.
     #[arg(long)]
     pub verify_rows: Option<usize>,
@@ -176,7 +184,8 @@ pub(crate) fn with_engine<T>(
     let (free, _) = loaded.library.cuda_memory_info()?;
     let budget = free.saturating_sub(args.reserve_gib << 30);
     let started = Instant::now();
-    let local = local::LocalExperts::load(&loaded.library, &loaded.catalog,
+    let stages = if args.dspark { engine.weights.dspark.as_ref().map_or(0, |d| d.stages.len()) } else { 0 };
+    let local = local::LocalExperts::load(&loaded.library, &loaded.catalog, stages,
         args.local_expert_layers.unwrap_or(usize::MAX), engine.decode_rows.max(engine.prefill_rows), budget, stream)?;
     tracing::info!(layers = local.as_ref().map_or(0, |l| l.layers()), elapsed_ms = started.elapsed().as_millis() as u64,
         "DeepSeek V4 expert layers resident on the coordinator");
@@ -248,7 +257,23 @@ fn golden_run(
     *engine.profile.borrow_mut() = engine::Profile::default();
     let decode_started = Instant::now();
     let mut position = prefill;
+    let (mut drafted, mut matched, mut draft_steps) = (0usize, vec![0usize; engine.draft_block() + 1], 0usize);
+    let mut draft_seconds = 0f64;
     while position < tokens.len() {
+        if args.draft {
+            let block = engine.draft_block();
+            let mut inputs = vec![tokens[position]];
+            inputs.resize(block, cfg.dspark_noise_token_id as u32);
+            let rows = embed_rows(catalog, &inputs, cfg.dim)?;
+            let started = Instant::now();
+            let drafts = engine.draft(&[engine::DraftRequest { placement: &placement, token: tokens[position] }], &rows)?;
+            draft_seconds += started.elapsed().as_secs_f64();
+            let truth = &tokens[(position + 1).min(tokens.len())..(position + 1 + block).min(tokens.len())];
+            let accepted = drafts[0].iter().zip(truth).take_while(|(d, t)| d == t).count();
+            matched[accepted] += 1;
+            drafted += truth.len();
+            draft_steps += 1;
+        }
         let end = (position + args.verify_rows.unwrap_or(1)).min(tokens.len());
         let rows = &embed[position * row..end * row];
         logits.extend(if args.verify_rows.is_some() {
@@ -257,6 +282,12 @@ fn golden_run(
             engine.decode(&mut [(&mut placement, tokens[position])], rows, &mut transports[0], runtime)?
         });
         position = end;
+    }
+    if args.draft && draft_steps > 0 {
+        let accepted: usize = matched.iter().enumerate().map(|(n, count)| n * count).sum();
+        println!("drafts: {draft_steps} steps, {accepted} of {drafted} drafted tokens accepted as a prefix \
+            ({:.2} per step), histogram {matched:?}, {:.2} ms/draft", accepted as f64 / draft_steps as f64,
+            draft_seconds * 1e3 / draft_steps as f64);
     }
     let decode_steps = tokens.len() - prefill;
     if decode_steps > 0 {
@@ -291,6 +322,11 @@ fn golden_run(
         for row in prefill..t {
             let (ours, theirs) = (&logits[row * vocab..][..vocab], &golden[row * vocab..][..vocab]);
             decode_agree += usize::from(argmax(ours) == argmax(theirs));
+            if argmax(ours) != argmax(theirs) {
+                let margin = |l: &[f32]| { let mut v = l.to_vec(); v.sort_by(|a, b| b.total_cmp(a)); v[0] - v[1] };
+                println!("decode row {row}: engine {} golden {} (golden top-2 margin {:.3}, cosine {:.6})",
+                    argmax(ours), argmax(theirs), margin(theirs), similarity(ours, theirs).0);
+            }
             worst = worst.min(similarity(ours, theirs).0);
         }
         println!("decode rows: top-1 agreement {:.1}% | worst row cosine {worst:.6}",

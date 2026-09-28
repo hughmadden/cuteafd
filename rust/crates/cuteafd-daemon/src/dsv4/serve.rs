@@ -26,6 +26,10 @@ pub(crate) struct ServeArgs {
     /// Public model id; defaults to the snapshot's Hugging Face id.
     #[arg(long)]
     pub model_id: Option<String>,
+    /// With --dspark, speculate while at most this many sequences decode
+    /// (and their verify rows fit the decode programs).
+    #[arg(long, default_value_t = 10)]
+    pub speculate_max_sequences: usize,
 }
 
 /// "…/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/<rev>" -> "deepseek-ai/DeepSeek-V4-Flash-0731".
@@ -53,8 +57,9 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let engine_args = args.engine.clone();
     let worker_stats = stats.clone();
-    let max_context = args.max_context as usize;
-    let worker = tokio::task::spawn_blocking(move || serve_loop(engine_args, receive, ready_tx, worker_stats, max_context));
+    let (max_context, speculate_max) = (args.max_context as usize, args.speculate_max_sequences);
+    let worker = tokio::task::spawn_blocking(move ||
+        serve_loop(engine_args, receive, ready_tx, worker_stats, max_context, speculate_max));
     ready_rx.await.context("engine failed before it was ready")??;
     let router = cuteafd_api::native_v41::router_for_model(queue, limits, stats, Duration::from_secs(25),
         ConsoleHub::disabled(), profile.clone());
@@ -73,6 +78,7 @@ fn serve_loop(
     ready: tokio::sync::oneshot::Sender<Result<()>>,
     stats: Arc<Mutex<serde_json::Value>>,
     max_context: usize,
+    speculate_max: usize,
 ) -> Result<()> {
     let loaded = match super::load(&args) {
         Ok(loaded) => loaded,
@@ -92,7 +98,7 @@ fn serve_loop(
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(()));
         }
-        schedule(engine, &loaded, &tokenizer, eos, &mut receive, transports, runtime, &stats)
+        schedule(engine, &loaded, &tokenizer, eos, &mut receive, transports, runtime, &stats, speculate_max)
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
@@ -164,6 +170,64 @@ impl Active<'_> {
     }
 }
 
+/// Drafts after every active sequence's next token, verifies `[next, drafts]`
+/// in one step and accepts each sequence's longest matching prefix plus the
+/// verifier's own token after it. Returns which requests finished.
+#[allow(clippy::too_many_arguments)]
+fn speculative_step(
+    engine: &super::engine::Engine<'_>,
+    loaded: &super::Loaded,
+    active: &mut [Active<'_>],
+    block: usize,
+    hidden: usize,
+    vocab: usize,
+    eos: u32,
+    transports: &mut [cuteafd_transport::v41_expert::V41Tp4Roce],
+    runtime: &tokio::runtime::Runtime,
+) -> Result<Vec<bool>> {
+    let noise = engine.cfg.dspark_noise_token_id as u32;
+    let inputs: Vec<u32> = active.iter()
+        .flat_map(|a| std::iter::once(a.next).chain(std::iter::repeat_n(noise, block - 1))).collect();
+    let requests: Vec<super::engine::DraftRequest<'_>> = active.iter()
+        .map(|a| super::engine::DraftRequest { placement: &a.placement, token: a.next }).collect();
+    let drafts = engine.draft(&requests, &embed_rows(&loaded.catalog, &inputs, hidden)?)?;
+    // Verify no more rows than the request may still produce or hold.
+    let sequences: Vec<Vec<u32>> = active.iter().zip(&drafts).map(|(a, draft)| {
+        let room = (a.job.max_tokens - a.generated).min(a.capacity - a.placement.len - 1);
+        std::iter::once(a.next).chain(draft.iter().copied().take(room.saturating_sub(1).min(block))).collect()
+    }).collect();
+    let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
+    let tokens: Vec<u32> = sequences.iter().flatten().copied().collect();
+    let embed = embed_rows(&loaded.catalog, &tokens, hidden)?;
+    let mut rows: Vec<(&mut Placement, &[u32])> = active.iter_mut().zip(&sequences)
+        .map(|(a, tokens)| (&mut a.placement, tokens.as_slice())).collect();
+    let logits = engine.verify(&mut rows, &embed, transports, runtime)?;
+    let mut offset = 0;
+    Ok(active.iter_mut().zip(&sequences).zip(starts).map(|((request, rows), start)| {
+        let mut finished = false;
+        for (j, _) in rows.iter().enumerate() {
+            // Rows 0..=j are committed; the token row j produces is next.
+            request.placement.len = start + j + 1;
+            let result = request.select(&logits[(offset + j) * vocab..][..vocab])
+                .and_then(|token| Ok((token, request.emit(token, eos)?)));
+            match result {
+                Ok((token, done)) => {
+                    finished = done;
+                    if done || rows.get(j + 1) != Some(&token) {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        offset += rows.len();
+        finished
+    }).collect())
+}
+
 /// Continuous batching: prefill each new request (one sequence per prefill),
 /// then advance every active sequence by one token in a single decode step.
 #[allow(clippy::too_many_arguments)]
@@ -176,6 +240,7 @@ fn schedule(
     transports: &mut [cuteafd_transport::v41_expert::V41Tp4Roce],
     runtime: &tokio::runtime::Runtime,
     stats: &Mutex<serde_json::Value>,
+    speculate_max: usize,
 ) -> Result<()> {
     let mut allocator = PoolAllocator::new(engine.shape);
     let mut grammars = crate::v41_native_serve::constraints::Compiler::new(
@@ -270,12 +335,26 @@ fn schedule(
         if active.is_empty() {
             continue;
         }
-        // One decode step over every active sequence.
-        let tokens: Vec<u32> = active.iter().map(|a| a.next).collect();
-        let embed = embed_rows(&loaded.catalog, &tokens, hidden)?;
-        let mut rows: Vec<(&mut Placement, u32)> = active.iter_mut().map(|a| (&mut a.placement, a.next)).collect();
-        let logits = match engine.decode(&mut rows, &embed, &mut transports[0], runtime) {
-            Ok(logits) => logits,
+        // One decode step over every active sequence; with the drafter and a
+        // small batch, each sequence verifies its next token plus a draft.
+        let block = engine.draft_block();
+        let speculate = block > 0 && active.len() <= speculate_max
+            && active.len() * (block + 1) <= engine.decode_rows;
+        let step = if speculate {
+            speculative_step(engine, loaded, &mut active, block, hidden, vocab, eos, transports, runtime)
+        } else {
+            let tokens: Vec<u32> = active.iter().map(|a| a.next).collect();
+            let embed = embed_rows(&loaded.catalog, &tokens, hidden)?;
+            let mut rows: Vec<(&mut Placement, u32)> = active.iter_mut().map(|a| (&mut a.placement, a.next)).collect();
+            engine.decode(&mut rows, &embed, &mut transports[0], runtime).map(|logits| {
+                active.iter_mut().enumerate().map(|(row, request)| {
+                    let logits_row = &logits[row * vocab..][..vocab];
+                    request.select(logits_row).and_then(|token| request.emit(token, eos)).unwrap_or(true)
+                }).collect::<Vec<bool>>()
+            })
+        };
+        let finished = match step {
+            Ok(finished) => finished,
             Err(error) => {
                 tracing::warn!("decode step failed: {error:#}");
                 for request in active.drain(..) {
@@ -285,10 +364,6 @@ fn schedule(
                 continue;
             }
         };
-        let finished: Vec<bool> = active.iter_mut().enumerate().map(|(row, request)| {
-            let logits_row = &logits[row * vocab..][..vocab];
-            request.select(logits_row).and_then(|token| request.emit(token, eos)).unwrap_or(true)
-        }).collect();
         for index in (0..active.len()).rev() {
             if !finished[index] {
                 continue;
