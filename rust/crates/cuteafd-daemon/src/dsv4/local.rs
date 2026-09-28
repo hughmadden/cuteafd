@@ -50,9 +50,19 @@ impl<'a> LocalExperts<'a> {
             .chain(CAPACITIES.iter().copied().find(|&c| c as usize >= max_rows)).collect();
         let mut states = Vec::new();
         let mut scratch_bytes = 0usize;
+        if catalog.exl3().is_some() {
+            tracing::warn!("EXL3 routed experts are not served from the coordinator yet; every layer uses the Sparks");
+            return Ok(None);
+        }
         for &capacity in &capacities {
-            let kernel = library.v41_local_expert_kernel(capacity)
-                .context("coordinator expert kernels for this geometry are not in the library (CUTEAFD_*_EXPERT_FAMILIES=<family>:rtx_backbone)")?;
+            let kernel = match library.v41_local_expert_kernel(capacity) {
+                Ok(kernel) => kernel,
+                Err(error) => {
+                    tracing::warn!("no coordinator expert kernels for this geometry ({error:#}); \
+                        build with CUTEAFD_*_EXPERT_FAMILIES=<family>:rtx_backbone to keep layers local");
+                    return Ok(None);
+                }
+            };
             scratch_bytes = scratch_bytes.max(usize::try_from(kernel.info().scratch_bytes)?);
             states.push(State { kernel, slots: [std::ptr::null_mut(); V41_EXPERT_POINTER_COUNT] });
         }
