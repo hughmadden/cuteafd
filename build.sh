@@ -511,7 +511,7 @@ echo "== building Spark development and inference images natively on $seed_host 
 release_ssh "$seed_host" bash -s -- \
   "$remote_dir" "$SPARK_EXPERT_DOCKER_DEV" "$SPARK_EXPERT_DOCKER_INFERENCE" \
   "$engine_commit" "$sparkinfer_commit" "$release_version" \
-  "$EXL3_PAIRED_TP4" "${source_manifest_sha256:-__legacy__}" "${spark_tp_roles//;/,}" \
+  "$EXL3_PAIRED_TP4" "${source_manifest_sha256:-__legacy__}" "$(r="${spark_tp_roles//;/,}"; echo "${r:-__legacy__}")" \
   "${release_build_root:-__legacy__}" <<'REMOTE'
 set -euo pipefail
 remote_dir="$1"
