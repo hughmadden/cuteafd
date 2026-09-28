@@ -8,6 +8,20 @@
 # build into the SM121 image, `rtx_backbone` (complete experts resident on the
 # coordinator) into the SM120 one; entries for the other architecture are
 # skipped so one list serves both builds.
+#
+# FAMILY:exl3-kTIERS entries (for example `dsv4p:exl3-k23`) are EXL3 packages,
+# built by cmake/v41_exl3.cmake; this file builds only the native families.
+set(CUTEAFD_NATIVE_EXPERT_FAMILIES)
+foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
+  if(NOT entry MATCHES ":exl3-k")
+    list(APPEND CUTEAFD_NATIVE_EXPERT_FAMILIES "${entry}")
+  elseif(NOT CUTEAFD_ENABLE_V41_EXL3_AOT)
+    message(FATAL_ERROR "EXL3 expert family ${entry} requires CUTEAFD_ENABLE_V41_EXL3_AOT=ON")
+  endif()
+endforeach()
+if(NOT CUTEAFD_NATIVE_EXPERT_FAMILIES)
+  return()
+endif()
 if(NOT CUTEAFD_ENABLE_V41_EXPERT_AOT)
   message(FATAL_ERROR "Expert families require the native expert AOT build")
 endif()
@@ -21,7 +35,7 @@ set(CUTEAFD_EXPERT_FAMILY_WIDTH "1:64,16:128,80:128,256:128,1024:128,4096:128" C
   "Slice width map for non-V4.1 expert families")
 set(expert_ops info initialize output_kind bind_scratch initialize_scratch_async launch)
 
-foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
+foreach(entry IN LISTS CUTEAFD_NATIVE_EXPERT_FAMILIES)
   if(NOT entry MATCHES "^(dsv4f|dsv4p):(spark|spark_tp2|rtx_backbone)$")
     message(FATAL_ERROR "CUTEAFD_EXPERT_FAMILIES entry ${entry} must be (dsv4f|dsv4p):(spark|spark_tp2|rtx_backbone)")
   endif()

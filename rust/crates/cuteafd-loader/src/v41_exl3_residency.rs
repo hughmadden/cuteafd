@@ -1,6 +1,6 @@
 //! Compressed layer residency matching B12x projection-native Trellis storage.
 //! No weight dequantization or tier-wide temporary payload is required.
-use crate::{OfficialV41Catalog, V41Exl3Manifest, V41Exl3Partition};
+use crate::{OfficialV41Catalog, V41Exl3Manifest, V41Exl3Partition, V41Exl3ProjectionKind};
 use anyhow::{ensure, Context, Result};
 use serde::Serialize;
 
@@ -138,36 +138,28 @@ impl V41Exl3Manifest {
         rank: usize,
         layout: V41Exl3Partition,
     ) -> Result<V41Exl3Residency> {
-        let config = self.config.text();
-        let (prefix, experts) = match layer {
+        let shape = self.experts;
+        let (draft, index, experts) = match layer {
             V41Exl3Layer::Backbone(layer) => {
-                ensure!(
-                    layer < config.num_hidden_layers,
-                    "EXL3 backbone layer out of range"
-                );
-                (
-                    format!("layers.{layer}.ffn.experts"),
-                    config.n_routed_experts,
-                )
+                ensure!(layer < shape.layers, "EXL3 backbone layer out of range");
+                (false, layer, shape.experts)
             }
             V41Exl3Layer::Dspark(stage) => {
-                ensure!(
-                    stage < config.num_nextn_predict_layers,
-                    "EXL3 dSpark stage out of range"
-                );
-                (
-                    format!("mtp.{stage}.ffn.experts"),
-                    config.dspark_n_routed_experts,
-                )
+                ensure!(stage < shape.draft_stages, "EXL3 dSpark stage out of range");
+                (true, stage, shape.draft_experts)
             }
         };
         let mut projections = Vec::with_capacity(experts);
         for expert in 0..experts {
             let mut row = Vec::new();
-            for projection in ["w1", "w3", "w2"] {
+            for kind in [
+                V41Exl3ProjectionKind::Gate,
+                V41Exl3ProjectionKind::Up,
+                V41Exl3ProjectionKind::Down,
+            ] {
                 let p = self
                     .projections
-                    .get(&format!("{prefix}.{expert}.{projection}"))
+                    .get(&self.naming.projection(draft, index, expert, kind))
                     .context("missing EXL3 resident projection")?;
                 ensure!(
                     (2..=5).contains(&p.bits),
@@ -182,7 +174,7 @@ impl V41Exl3Manifest {
         let partition =
             projections[0][0].intermediate_partition_with_layout(world, rank, layout)?;
         let width = partition.end - partition.start;
-        let hidden = config.hidden_size;
+        let hidden = shape.hidden;
         let mut counts = vec![[0; 3]; tiers.len()];
         let stride = experts * tiers.len();
         let descriptor_rows = if layout == V41Exl3Partition::PairedTp4 { 4 } else { 3 };
@@ -311,9 +303,7 @@ impl V41Exl3Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        OfficialV41Config, V41Exl3Projection, V41Exl3ProjectionKind, OFFICIAL_V41_MODEL_ID,
-    };
+    use crate::{OfficialV41Config, V41Exl3Projection, OFFICIAL_V41_MODEL_ID};
     use std::collections::BTreeMap;
 
     fn fixture(tiers: &[usize]) -> V41Exl3Manifest {
@@ -346,7 +336,9 @@ mod tests {
             }
         }
         V41Exl3Manifest {
-            config,
+            experts: crate::RoutedExpertShape::of_v41(&config),
+            config: Some(config),
+            naming: crate::V41Exl3Naming::CheckpointNative,
             decoder_tiers: crate::v41_exl3::decoder_family(&projections).unwrap(),
             projections,
             ple_quantization: None,

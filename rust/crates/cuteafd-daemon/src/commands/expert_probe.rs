@@ -5,7 +5,9 @@
 //! CPU: FP4 (E2M1) weights with E8M0 K32 scales, BF16 gate/up with the SwiGLU
 //! clamp, route weight, MXFP8 re-quantization of the intermediate, then W2.
 //! Inputs are random FP8 K32 wire rows, so the oracle sees exactly the values
-//! the kernels do.
+//! the kernels do. EXL3 checkpoints use the trellis oracle in `exl3`.
+mod exl3;
+
 use crate::cli::ExpertProbeArgs;
 use anyhow::{ensure, Context, Result};
 use cuteafd_transport::{
@@ -93,7 +95,10 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
         .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()
         .context("--peers takes comma-separated HOST:PORT addresses")?;
     let config = TcpTransportConfig { timing: false, timeout: Duration::from_secs(60), max_frame_bytes: 64 << 20 };
-    let executors: Vec<u64> = (1..=peers.len() as u64).collect();
+    // Implicit Spark worlds: TP4 ranks are executors 1..=4, TP2 5..=6, TP3 7..=9.
+    let executors = (0..peers.len())
+        .map(|rank| cuteafd_transport::v41_expert::v41_spark_executor_id(peers.len(), rank))
+        .collect::<Result<Vec<u64>>>()?;
     let mut client = V41Tp4Roce::new_ranks(&peers, &executors, args.capacity, config)?;
     let mut actual = vec![0f32; rows * hidden];
     let started = Instant::now();
@@ -108,7 +113,14 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
         .await?;
     let remote = started.elapsed();
 
-    let expected = oracle(&catalog, args.layer, hidden, &input, &routes, rows)?;
+    let started = Instant::now();
+    let exl3 = catalog.exl3().is_some();
+    let expected = if exl3 {
+        exl3::oracle(&catalog, args.layer, &input, &routes, rows)?
+    } else {
+        oracle(&catalog, args.layer, hidden, &input, &routes, rows)?
+    };
+    let oracle_elapsed = started.elapsed();
     let (mut dot, mut na, mut nb, mut diff) = (0f64, 0f64, 0f64, 0f64);
     for (a, e) in actual.iter().zip(&expected) {
         let (a, e) = (f64::from(*a), f64::from(*e));
@@ -119,14 +131,23 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
     }
     let cosine = dot / (na.sqrt() * nb.sqrt()).max(f64::MIN_POSITIVE);
     let rel_l2 = diff.sqrt() / nb.sqrt().max(f64::MIN_POSITIVE);
-    let pass = cosine > 0.9999 && rel_l2 < 0.01;
+    // The native oracle reproduces the kernel's MXFP8 intermediate; the EXL3
+    // oracle is FP32 over the dequantized weights while the kernels keep FP16
+    // intermediates, so it is held to a looser bound.
+    let pass = if exl3 {
+        cosine > 0.999 && rel_l2 < 0.05
+    } else {
+        cosine > 0.9999 && rel_l2 < 0.01
+    };
     println!(
-        "{} layer {} rows {} ranks {}: cosine {cosine:.6} rel_l2 {rel_l2:.2e} remote {:.2} ms",
+        "{} layer {} rows {} ranks {}{}: cosine {cosine:.6} rel_l2 {rel_l2:.2e} remote {:.2} ms oracle {:.1} s",
         if pass { "PASS" } else { "FAIL" },
         args.layer,
         rows,
         peers.len(),
+        if exl3 { " exl3" } else { "" },
         remote.as_secs_f64() * 1e3,
+        oracle_elapsed.as_secs_f64(),
     );
     ensure!(pass, "Spark experts disagree with the CPU oracle");
     Ok(())

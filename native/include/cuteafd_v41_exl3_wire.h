@@ -3,8 +3,9 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* Input rows: 5120 E4M3 bytes followed by 160 UE8M0 K32 scale bytes.
- * Output: contiguous BF16[rows,5120], rounded after reconstructing FP32 values.
+/* Input rows: H E4M3 bytes followed by H/32 UE8M0 K32 scale bytes, where H is
+ * the process expert hidden size (cuteafd_set_expert_hidden; 5120 for V4.1).
+ * Output: contiguous BF16[rows,H], rounded after reconstructing FP32 values.
  * Uses CUDA's E4M3/UE8M0 conversion semantics (including subnormal/NaN codes).
  * Initialize before capture, on the owning device. Caller retains distinct,
  * 16-byte-aligned buffers and this handle through completion/graph destruction.

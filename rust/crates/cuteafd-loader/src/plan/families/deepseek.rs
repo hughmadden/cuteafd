@@ -183,11 +183,12 @@ impl Family for DeepSeek {
         }
         use WeightFormat::*;
         if self.id == "deepseek_v4" {
-            // serve-dsv4: native MXFP4 routed experts on the Sparks, 128x128
-            // block-FP8 projections and BF16/F32 tensors on the RTX, integer
+            // serve-dsv4: native MXFP4 or EXL3 (expertd-native, packages
+            // exl3-dsv4*-k*) routed experts on the Sparks, 128x128 block-FP8
+            // projections and BF16/F32 tensors on the RTX, integer
             // hash-routing tables.
             return match component {
-                Component::RoutedExpert => matches!(format, Mxfp4 { group: 32 }),
+                Component::RoutedExpert => matches!(format, Mxfp4 { group: 32 } | Exl3 { bits: 2..=4 }),
                 Component::Speculator | Component::SpeculatorExpert => false,
                 _ => matches!(format, Fp8Block { block: (128, 128) } | Bf16 | F32 | Int),
             };
@@ -211,11 +212,11 @@ impl Family for DeepSeek {
     fn component_hint(&self, component: Component) -> Option<Hint> {
         if self.id == "deepseek_v4" && component == Component::RoutedExpert {
             return Some(Hint {
-                what: "DeepSeek V4 routed experts in EXL3 or NVFP4 (V4 Pro EXL3 K2)".into(),
-                how: "serve-dsv4 stages native MXFP4 experts through the geometry-aware Spark path \
-                      (ExpertGeometry, read_expert_catalog). Extend the V4.1 EXL3 worker \
-                      (daemon v41_experts/exl3, loader v41_exl3*) to take the process geometry and export \
-                      the EXL3 kernels for hidden 7168 / intermediate 3072.".into(),
+                what: "DeepSeek V4 routed experts in NVFP4".into(),
+                how: "Spark expertd-native serves native MXFP4 and EXL3 K2-K4 experts at the checkpoint \
+                      geometry (ExpertGeometry, read_expert_catalog; EXL3 packages exl3-dsv4f|dsv4p-k<tiers> \
+                      from CUTEAFD_EXPERT_FAMILIES=dsv4p:exl3-k23). ModelOpt NVFP4 needs the V4.1 NVFP4 \
+                      contract (loader v41_nvfp4) generalized the same way.".into(),
             });
         }
         if self.runtime == RuntimeStatus::Serving {

@@ -56,7 +56,7 @@ pub struct RoutedExpertShape {
 }
 
 impl RoutedExpertShape {
-    fn of_v41(config: &OfficialV41Config) -> Self {
+    pub(crate) fn of_v41(config: &OfficialV41Config) -> Self {
         let text = config.text();
         Self {
             layers: text.num_hidden_layers,
@@ -534,7 +534,10 @@ pub fn read_official_v41_catalog(model_id: &str, snapshot: &Path) -> Result<Offi
         crate::read_v41_nvfp4_contract(snapshot)?
     } else { None };
     let config = match (&exl3, &nvfp4) {
-        (Some(manifest), _) => manifest.config.clone(),
+        (Some(manifest), _) => manifest
+            .config
+            .clone()
+            .context("V4.1 EXL3 manifest lacks the official configuration")?,
         (None, Some(contract)) => contract.config.clone(),
         (None, None) => read_official_v41_config(model_id, snapshot)?,
     };
@@ -721,6 +724,20 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog
         hidden % 32 == 0 && intermediate % 32 == 0,
         "DeepSeek V4 expert extents {hidden}x{intermediate} are not K32-aligned"
     );
+    let backbone = RoutedExpertShape {
+        layers: v4.n_layers,
+        experts: v4.n_routed_experts,
+        topk: v4.n_activated_experts,
+        hidden,
+        intermediate,
+        draft_stages: 0,
+        draft_experts: 0,
+    };
+    let raw_config = crate::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
+    if raw_config["quantization_config"]["quant_method"] == "exl3" {
+        let manifest = crate::v41_exl3::read_deepseek_v4_exl3_manifest(snapshot, backbone)?;
+        return deepseek_v4_exl3_catalog(snapshot, &index.weight_map, manifest);
+    }
     let draft_stages = index.weight_map.keys()
         .filter_map(|name| name.strip_prefix("mtp.")?.split('.').next()?.parse::<usize>().ok())
         .max()
@@ -789,6 +806,68 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog
         snapshot: snapshot.to_path_buf(),
         tensors,
         exl3: None,
+        nvfp4: None,
+    })
+}
+
+/// DeepSeek V4 EXL3 routed experts: every projection's trellis/suh/svh/mcg is
+/// checked against its safetensors header; backbone projections are sliced
+/// onto the Sparks, draft projections stay with the coordinator.
+fn deepseek_v4_exl3_catalog(
+    snapshot: &Path,
+    weight_map: &BTreeMap<String, String>,
+    manifest: crate::V41Exl3Manifest,
+) -> Result<OfficialV41Catalog> {
+    let mut shards: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for (name, shard) in weight_map {
+        shards.entry(shard).or_default().insert(name);
+    }
+    let mut tensors = Vec::with_capacity(weight_map.len());
+    let mut routed = 0usize;
+    for (shard, names) in shards {
+        let metadata = read_safetensors_metadata(&snapshot.join(shard))
+            .with_context(|| format!("reading {shard}"))?;
+        ensure!(metadata.len() == names.len(), "index/header tensor count mismatch in {shard}");
+        for tensor in metadata {
+            ensure!(names.contains(tensor.name.as_str()), "tensor {} appears in unexpected shard {shard}", tensor.name);
+            let projection = tensor
+                .name
+                .rsplit_once('.')
+                .and_then(|(prefix, _)| manifest.projections.get(prefix));
+            let placement = match projection {
+                Some(projection) => {
+                    projection.validate_tensor(&tensor)?;
+                    routed += 1;
+                    if tensor.name.starts_with("model.layers.") {
+                        V41TensorPlacement::BackboneExl3
+                    } else {
+                        V41TensorPlacement::CoordinatorRtx
+                    }
+                }
+                None => {
+                    ensure!(
+                        !tensor.name.contains(".mlp.experts.") && !tensor.name.contains(".ffn.experts."),
+                        "routed expert tensor {} is not in the EXL3 storage map",
+                        tensor.name
+                    );
+                    V41TensorPlacement::CoordinatorRtx
+                }
+            };
+            tensors.push(V41Tensor { shard: shard.to_string(), metadata: tensor, placement });
+        }
+    }
+    ensure!(
+        routed == 4 * manifest.projections.len(),
+        "checkpoint has {routed} EXL3 expert tensors, the storage map declares {} projections x 4",
+        manifest.projections.len()
+    );
+    tensors.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+    Ok(OfficialV41Catalog {
+        config: None,
+        experts: manifest.experts,
+        snapshot: snapshot.to_path_buf(),
+        tensors,
+        exl3: Some(manifest),
         nvfp4: None,
     })
 }

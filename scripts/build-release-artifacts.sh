@@ -220,6 +220,16 @@ for exl3_tag in "${exl3_family_tags[@]}"; do
   python3 "$build_root/source/python/tools/package_v41_exl3_aot.py" verify \
     --package "$output_dir/exl3/exl3-$exl3_tag" --role "$role"
 done
+# Other expert geometries (FAMILY:exl3-kTIERS entries) ship as exl3-FAMILY-kTIERS.
+IFS=';' read -ra release_family_list <<<"$expert_families"
+for release_family in "${release_family_list[@]}"; do
+  [[ "$release_family" == *:exl3-k* ]] || continue
+  release_package="exl3-${release_family%%:*}-${release_family#*:exl3-}"
+  python3 "$build_root/source/python/tools/package_v41_exl3_aot.py" install \
+    --package "$build_root/native/$release_package" --output "$output_dir/exl3/$release_package"
+  python3 "$build_root/source/python/tools/package_v41_exl3_aot.py" verify \
+    --package "$output_dir/exl3/$release_package" --role "$role"
+done
 install -m 0644 "$build_root/native/v41_experts/v41_experts.json" "$output_dir/V41_EXPERT_AOT.json"
 # Always write the built-role manifest, including the empty-role default, so
 # the release Dockerfile can COPY it unconditionally. Every listed role is

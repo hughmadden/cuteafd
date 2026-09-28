@@ -62,12 +62,22 @@ impl<'a> Exl3Worker<'a> {
             else { V41Exl3Partition::PairedTp4 })
     }
 
+    /// FP8 E4M3 wire row: hidden values then hidden/32 UE8M0 K32 scales.
+    fn wire_row_bytes() -> usize {
+        let hidden = cuteafd_core::expert_geometry().hidden as usize;
+        hidden + hidden / 32
+    }
+
+    fn topk() -> usize {
+        cuteafd_core::expert_geometry().topk as usize
+    }
+
     pub(crate) fn plan(directory: &Path, capacity: u32) -> Result<usize> {
         let directories: Vec<_> = Self::capacities(capacity)?.into_iter()
             .map(|c| directory.join(format!("m{c}"))).collect();
         let ownership_bytes = Exl3Execution::ownership_bytes(&directories[0])?;
         Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32)?
-            .checked_add(capacity as usize * (5280 + 6 * 8))
+            .checked_add(capacity as usize * (Self::wire_row_bytes() + Self::topk() * 8))
             .and_then(|bytes| bytes.checked_add(ownership_bytes))
             .context("EXL3 worker workspace budget overflow")
     }
@@ -124,11 +134,12 @@ impl<'a> Exl3Worker<'a> {
         let ownership_words = if first.layout.layout == cuteafd_loader::V41Exl3Partition::PairedTp4 {
             first.layout.experts * first.layout.tiers.len()
         } else { 0 };
-        let paired_upload = (ownership_words > 0).then(|| vec![0; capacity as usize * 6 + ownership_words]);
+        let topk = Self::topk();
+        let paired_upload = (ownership_words > 0).then(|| vec![0; capacity as usize * topk + ownership_words]);
         let inputs = [
-            DeviceAllocation::new(library, capacity as usize * 5280)?,
-            DeviceAllocation::new(library, (capacity as usize * 6 + ownership_words) * 4)?,
-            DeviceAllocation::new(library, capacity as usize * 6 * 4)?,
+            DeviceAllocation::new(library, capacity as usize * Self::wire_row_bytes())?,
+            DeviceAllocation::new(library, (capacity as usize * topk + ownership_words) * 4)?,
+            DeviceAllocation::new(library, capacity as usize * topk * 4)?,
         ];
         ensure!(
             executions
@@ -210,7 +221,7 @@ impl<'a> Exl3Worker<'a> {
             "EXL3 host exchange is too small"
         );
         let started = self.timing.as_ref().map(|_| std::time::Instant::now());
-        let routes = request.rows() as usize * 6;
+        let routes = request.rows() as usize * Self::topk();
         if let Some(upload) = &mut self.paired_upload {
             let (ids, tail) = upload.split_at_mut(routes);
             request.copy_paired_routes_into(ids, &mut exchange.routing, self.executor_id as usize - 1,
@@ -291,7 +302,7 @@ impl<'a> Exl3Worker<'a> {
             // This interval overlaps host enqueue/wait and includes all stream work,
             // including routing and output reduction, not just the expert kernel.
             let gpu_us = unsafe { self.library.cuda_event_elapsed_ms(start.raw, end.raw)? } * 1000.;
-            let mut seen = [false; 384];
+            let mut seen = vec![false; cuteafd_core::expert_geometry().experts as usize];
             let ids = self.paired_upload.as_deref().unwrap_or(&exchange.ids);
             for &id in &ids[..routes] {
                 if let Some(value) = seen.get_mut(id as usize) { *value = true; }
@@ -349,7 +360,7 @@ impl<'a> Exl3Worker<'a> {
             "response row-index scratch is too short"
         );
         self.execute(request, executor_id, exchange, None)?;
-        let stride = cuteafd_transport::v41_expert::V41_PARTIAL_ROW_BYTES as usize;
+        let stride = cuteafd_core::expert_geometry().row_bytes() as usize;
         for start in (0..request.rows()).step_by(chunk_rows as usize) {
             let end = start.saturating_add(chunk_rows).min(request.rows());
             sink(request.response_chunk(
