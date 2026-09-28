@@ -217,8 +217,17 @@ pub(crate) fn decode_step(
         tables.swa_lengths.push((position + 1).min(WINDOW) as i32);
         positions4.push(position as i32);
         states.push(placement.state as i32);
-        slots4.push(placement.group_slot(4, position / 4)?);
-        slots128.push(placement.group_slot(128, position / 128)?);
+        // The compressor reads a row's slot only when the row completes its
+        // group; a group that cannot complete within capacity has no page.
+        let slot = |ratio: usize| -> anyhow::Result<i32> {
+            if (position + 1) % ratio == 0 {
+                placement.group_slot(ratio, position / ratio)
+            } else {
+                Ok(placement.group_slot(ratio, position / ratio).unwrap_or(0))
+            }
+        };
+        slots4.push(slot(4)?);
+        slots128.push(slot(128)?);
         let visible4 = (position + 1) / 4;
         let visible128 = (position + 1) / 128;
         tables.c4_groups = tables.c4_groups.max(visible4);
@@ -267,6 +276,8 @@ mod tests {
         assert_eq!(cont.c4_tables[7].1, vec![300]);
         assert_eq!(cont.swa_indices[0], base + 300 - 127);
         let dec = decode_step(&[(&seq, 300)], &shape, 512, 1024)?;
+        // Capacity 1000 has no C128 page for group 7; position 998 does not complete it.
+        assert!(decode_step(&[(&seq, 998)], &shape, 512, 1024).is_ok());
         assert_eq!(dec.main_slots, vec![i64::from(base) + 300]);
         assert_eq!(dec.c4_visible, vec![75]);
         assert_eq!(dec.c4_tables[1].1, vec![seq.state as i32]);
