@@ -1132,3 +1132,24 @@ release_tp2_enabled() {
   [[ "$TP2_ATTENTION" == on || "$TP2_QUERY_PROJECTION" == on ||
      "$TP2_OUTPUT_PROJECTION" == on || "$TP2_DSPARK_EXPERTS" == on ]]
 }
+
+# Copies a WIP slot's artifacts out of a persistent WIP container into a
+# release-shaped layout (bin/, lib/, share/) on this host for ./run.sh --wip.
+release_stage_wip_layout() {
+  local container="$1" slot="$2" role="$3" layout="$4"
+  local raw="$layout.tmp/raw"
+  docker container inspect "$container" >/dev/null 2>&1 ||
+    release_die "WIP container $container is missing; build the slot with ./wip.sh first"
+  rm -rf "$layout.tmp" && mkdir -p "$raw" "$layout.tmp/bin" "$layout.tmp/lib" "$layout.tmp/share"
+  docker cp "$container:/wip/slots/$slot/$role/workspace/.cuteafd-wip/." "$raw/" ||
+    release_die "WIP slot $slot has no $role artifacts in $container"
+  docker cp "$container:/wip/slots/$slot/$role/workspace/docker/release-entrypoint.sh" "$raw/" ||
+    release_die "WIP slot $slot lacks docker/release-entrypoint.sh"
+  mv "$raw/cuteafd" "$layout.tmp/bin/cuteafd"
+  mv "$raw/libcuteafd_native.so" "$layout.tmp/lib/"
+  [[ ! -d "$raw/exl3" ]] || mv "$raw/exl3" "$layout.tmp/lib/exl3"
+  mv "$raw/"* "$layout.tmp/share/"
+  rm -rf "$raw" "$layout"
+  mv "$layout.tmp" "$layout"
+}
+

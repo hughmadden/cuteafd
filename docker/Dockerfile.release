@@ -110,7 +110,6 @@ COPY .cuteafd-release-image/XGRAMMAR_PROVENANCE.json /opt/cuteafd/share/XGRAMMAR
 COPY .cuteafd-release-image/XGRAMMAR_LICENSE /opt/cuteafd/share/XGRAMMAR_LICENSE
 COPY .cuteafd-release-image/XGRAMMAR_SHA256SUMS /opt/cuteafd/share/XGRAMMAR_SHA256SUMS
 COPY python /opt/cuteafd/python
-COPY scripts/real-full-tcp-serve.sh /opt/cuteafd/scripts/real-full-tcp-serve.sh
 COPY scripts/kernel-cache-identity.py /opt/cuteafd/scripts/kernel-cache-identity.py
 COPY docker/release-entrypoint.sh /usr/local/bin/cuteafd-release-entrypoint
 
@@ -146,7 +145,6 @@ RUN for exl3_family in /opt/cuteafd/lib/exl3/exl3-k*/; do \
       /opt/cuteafd/share/licenses/xgrammar/LICENSE && \
     chmod +x \
       /opt/cuteafd/bin/cuteafd \
-      /opt/cuteafd/scripts/real-full-tcp-serve.sh \
       /usr/local/bin/cuteafd-release-entrypoint && \
     python3 -c 'import b12x_mla_capture, b12x_spark_capture, triton_kv_pack_capture, triton_mlp_capture, triton_router_capture, triton_sampling_capture'
 

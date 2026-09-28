@@ -38,6 +38,7 @@ Command-line values override cuteafd.config for this launch.
   --tp2-output-projection       split output-B projection (default off)
   --tp2-dspark-experts          split native draft routed experts (default off)
   --no-tp2-<option>             disable the corresponding configured TP2 option
+  --wip SLOT                     serve a ./wip.sh slot's artifacts in the dev images
   --restart                     replace the current release deployment
   --dry-run                     validate without changing services
 
@@ -60,6 +61,7 @@ config="$repo_root/cuteafd.config"
 restart=0
 dry_run=0
 dspark_draft_limit=""
+wip_slot=""
 declare -A overrides=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -88,6 +90,7 @@ while [[ $# -gt 0 ]]; do
     --no-tp2-output-projection) overrides[TP2_OUTPUT_PROJECTION]=off; shift ;;
     --tp2-dspark-experts) overrides[TP2_DSPARK_EXPERTS]=on; shift ;;
     --no-tp2-dspark-experts) overrides[TP2_DSPARK_EXPERTS]=off; shift ;;
+    --wip) wip_slot="${2:?$1 requires SLOT}"; shift 2 ;;
     --restart) restart=1; shift ;;
     --dry-run) dry_run=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -97,6 +100,13 @@ done
 
 release_load_config "$config"
 for name in "${!overrides[@]}"; do printf -v "$name" '%s' "${overrides[$name]}"; done
+if [[ -n "$wip_slot" ]]; then
+  [[ "$wip_slot" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || release_die "invalid WIP slot name: $wip_slot"
+  # WIP artifacts run inside the development images with a release-shaped
+  # /opt/cuteafd layout bind-mounted from a per-host staging directory.
+  COORDINATOR_DOCKER_INFERENCE="$COORDINATOR_DOCKER_DEV"
+  SPARK_EXPERT_DOCKER_INFERENCE="$SPARK_EXPERT_DOCKER_DEV"
+fi
 release_validate_tp2_options
 # RTX_GPUS can be overridden above, so re-check the explicit topology layout.
 release_validate_spark_topology
@@ -277,10 +287,17 @@ else
 fi
 
 sparkinfer_commit="$(python3 "$repo_root/scripts/verify-sparkinfer-source.py" --source "$repo_root/third_party/sparkinfer" --lock "$repo_root/third_party/sparkinfer.lock.json" --print-revision)"
-engine_commit="$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$COORDINATOR_DOCKER_INFERENCE")"
-image_sparkinfer="$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.sparkinfer.revision"}}' "$COORDINATOR_DOCKER_INFERENCE")"
-[[ -n "$engine_commit" && "$engine_commit" != '<no value>' ]] || release_die "coordinator image has no engine revision"
-[[ "$image_sparkinfer" == "$sparkinfer_commit" ]] || release_die "coordinator image uses another SparkInfer revision (run ./build.sh)"
+wip_layout=""
+if [[ -n "$wip_slot" ]]; then
+  wip_layout="$HOME/.cache/cuteafd/wip-run/$wip_slot"
+  release_stage_wip_layout cuteafd-coordinator-wip "$wip_slot" coordinator "$wip_layout"
+  engine_commit="wip-$wip_slot-$(sha256sum "$wip_layout/lib/libcuteafd_native.so" | cut -c1-12)"
+else
+  engine_commit="$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$COORDINATOR_DOCKER_INFERENCE")"
+  image_sparkinfer="$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.sparkinfer.revision"}}' "$COORDINATOR_DOCKER_INFERENCE")"
+  [[ -n "$engine_commit" && "$engine_commit" != '<no value>' ]] || release_die "coordinator image has no engine revision"
+  [[ "$image_sparkinfer" == "$sparkinfer_commit" ]] || release_die "coordinator image uses another SparkInfer revision (run ./build.sh)"
+fi
 
 expert_capacity=4096
 if ((PREFILL_BATCH_TOKENS <= 80)); then expert_capacity=80
@@ -295,10 +312,10 @@ for host in "${hosts[@]}"; do
   # arguments into one remote shell line, so an empty argument is elided and
   # every later positional shifts; the optional EXL3 family tag therefore
   # travels as a sentinel and the host name sits ahead of it.
-  spark_manifest="$(release_ssh -o ConnectTimeout=10 "$host" bash -s -- "$SPARK_EXPERT_DOCKER_INFERENCE" "$engine_commit" "$sparkinfer_commit" "$snapshot_rel" "$host" "$model_is_exl3" "${exl3_family_tag:-__none__}" <<'REMOTE'
+  spark_manifest="$(release_ssh -o ConnectTimeout=10 "$host" bash -s -- "$SPARK_EXPERT_DOCKER_INFERENCE" "$engine_commit" "$sparkinfer_commit" "$snapshot_rel" "$host" "$model_is_exl3" "${exl3_family_tag:-__none__}" "${wip_slot:-__none__}" <<'REMOTE'
 set -euo pipefail
 image="$1"; engine="$2"; sparkinfer="$3"; snapshot_rel="$4"; host="$5"
-exl3="$6"; exl3_family="${7:-__none__}"
+exl3="$6"; exl3_family="${7:-__none__}"; wip_slot="${8:-__none__}"
 [[ "$exl3_family" == __none__ ]] && exl3_family=
 # Every failure names the host and the check: this block runs over SSH, so a
 # bare nonzero exit would otherwise surface as an unexplained transport error.
@@ -306,8 +323,10 @@ exl3="$6"; exl3_family="${7:-__none__}"
 die() { echo "spark preflight on $host: $*" >&2; exit 1; }
 docker info >/dev/null 2>&1 || die "the Docker daemon is unavailable"
 docker image inspect "$image" >/dev/null 2>&1 || die "inference image is missing: $image (pull or distribute it)"
+if [[ "$wip_slot" == __none__ ]]; then
 [[ "$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" == "$engine" ]] ||
   die "$image has another engine revision"
+fi
 [[ "$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.sparkinfer.revision"}}' "$image")" == "$sparkinfer" ]] ||
   die "$image uses another SparkInfer revision"
 hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
@@ -315,7 +334,23 @@ hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
 if find "$hf_home/$snapshot_rel" -xtype l -print -quit | grep -q .; then
   die "model snapshot has dangling links: $snapshot_rel"
 fi
-if [[ "$exl3" == true ]]; then
+if [[ "$wip_slot" != __none__ ]]; then
+  layout="$HOME/.cache/cuteafd/wip-run/$wip_slot"
+  rm -rf "$layout.tmp" && mkdir -p "$layout.tmp/raw"
+  docker cp "cuteafd-spark-expert-wip:/wip/slots/$wip_slot/spark-expert/workspace/.cuteafd-wip/." "$layout.tmp/raw/" ||
+    die "WIP slot $wip_slot has no spark-expert artifacts in cuteafd-spark-expert-wip"
+  docker cp "cuteafd-spark-expert-wip:/wip/slots/$wip_slot/spark-expert/workspace/docker/release-entrypoint.sh" "$layout.tmp/raw/"
+  mkdir -p "$layout.tmp/bin" "$layout.tmp/lib" "$layout.tmp/share"
+  mv "$layout.tmp/raw/cuteafd" "$layout.tmp/bin/cuteafd"
+  mv "$layout.tmp/raw/libcuteafd_native.so" "$layout.tmp/lib/"
+  [[ ! -d "$layout.tmp/raw/exl3" ]] || mv "$layout.tmp/raw/exl3" "$layout.tmp/lib/exl3"
+  mv "$layout.tmp/raw/"* "$layout.tmp/share/"
+  rm -rf "$layout.tmp/raw" "$layout" && mv "$layout.tmp" "$layout"
+fi
+if [[ "$exl3" == true && "$wip_slot" != __none__ ]]; then
+  layout="$HOME/.cache/cuteafd/wip-run/$wip_slot"
+  if [ -f "$layout/lib/exl3/exl3-$exl3_family/manifest.json" ]; then cat "$layout/lib/exl3/exl3-$exl3_family/manifest.json"; else cat "$layout/lib/exl3/manifest.json"; fi
+elif [[ "$exl3" == true ]]; then
   docker run --rm --network none --entrypoint /bin/sh "$image" -c \
     'if [ -f "/opt/cuteafd/lib/exl3/exl3-'"$exl3_family"'/manifest.json" ]; then cat "/opt/cuteafd/lib/exl3/exl3-'"$exl3_family"'/manifest.json"; else cat /opt/cuteafd/lib/exl3/manifest.json; fi'
 fi
@@ -443,6 +478,16 @@ for rdma_env_name in CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP CUTEAFD_VERBS_APP
   [[ -n "${!rdma_env_name:-}" ]] && rdma_env_args+=(-e "$rdma_env_name=${!rdma_env_name}")
 done
 
+wip_mount_args=()
+if [[ -n "$wip_layout" ]]; then
+  wip_mount_args=(
+    -v "$wip_layout/bin:/opt/cuteafd/bin:ro" -v "$wip_layout/lib:/opt/cuteafd/lib:ro"
+    -v "$wip_layout/share:/opt/cuteafd/share:ro"
+    -e "PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    --entrypoint /opt/cuteafd/share/release-entrypoint.sh
+  )
+fi
+
 start_coordinator() {
 echo "== starting native RTX coordinator =="
 local -a args=(serve-native --snapshot "/root/.cache/huggingface/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS")
@@ -469,6 +514,7 @@ docker run -d --name "$coordinator" --restart no --gpus "$gpu_request" --network
   -e "CUDA_VISIBLE_DEVICES=$gpu_uuid_csv" \
   -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=${RUST_LOG:-info}" \
   "${rdma_env_args[@]}" \
+  "${wip_mount_args[@]}" \
   -v "$hf_home:/root/.cache/huggingface:ro" "$COORDINATOR_DOCKER_INFERENCE" cuteafd "${args[@]}" >/dev/null
 }
 deadline=$((SECONDS + ${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}))
@@ -504,7 +550,7 @@ for i in "${!hosts[@]}"; do
   host="${hosts[$i]}"; remote="${spark_prefix}-${host}-${EXPERT_PORT}"
   # ssh joins its arguments into one remote command line, which drops empty
   # arguments and shifts every later position; quote each one explicitly.
-  remote_args=("$SPARK_EXPERT_DOCKER_INFERENCE" "$remote" "$i" "$expert_capacity" "$SPARK_DEVICE_BUDGET_BYTES" "$EXPERT_PORT" "$snapshot_rel" "$fingerprint" "$spark_first_layer" "$SPARK_COUNT" "$topology_explicit" "$spark_tp" "$spark_ep" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${RUST_LOG:-info}")
+  remote_args=("$SPARK_EXPERT_DOCKER_INFERENCE" "$remote" "$i" "$expert_capacity" "$SPARK_DEVICE_BUDGET_BYTES" "$EXPERT_PORT" "$snapshot_rel" "$fingerprint" "$spark_first_layer" "$SPARK_COUNT" "$topology_explicit" "$spark_tp" "$spark_ep" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${RUST_LOG:-info}" "${wip_slot:-__none__}")
   release_ssh "$host" "bash -s -- $(printf '%q ' "${remote_args[@]}")" <<'REMOTE' &
 set -euo pipefail
 image="$1"; name="$2"; rank="$3"; capacity="$4"; budget="$5"; port="$6"; snapshot_rel="$7"; fingerprint="$8"; first_layer="$9"; world="${10}"
@@ -517,6 +563,15 @@ rdma_env="${14:-}"; ib_port="${15:-}"; execution_lanes="${16:-}"
 # The operator's RUST_LOG reaches the worker too (a quoted heredoc does not
 # see the caller's environment).
 rust_log="${17:-info}"
+wip_slot="${18:-__none__}"
+wip_args=()
+if [[ "$wip_slot" != __none__ ]]; then
+  layout="$HOME/.cache/cuteafd/wip-run/$wip_slot"
+  wip_args=(-v "$layout/bin:/opt/cuteafd/bin:ro" -v "$layout/lib:/opt/cuteafd/lib:ro"
+    -v "$layout/share:/opt/cuteafd/share:ro"
+    -e "PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    --entrypoint /opt/cuteafd/share/release-entrypoint.sh)
+fi
 rdma_args=()
 [[ -z "$rdma_env" ]] || rdma_args+=(-e "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$rdma_env")
 [[ -z "$ib_port" ]] || rdma_args+=(-e "CUTEAFD_VERBS_APP_IB_PORT_NUM=$ib_port")
@@ -526,7 +581,7 @@ hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
 # (`rank`/`world`/`role`/`intermediate`) observable; without it EnvFilter is
 # ERROR and the readiness line never reaches the container log. This adds no
 # positional argument, so the worker argument contract is unchanged.
-docker run -d --name "$name" --restart no --gpus all --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" -v "$hf_home:/root/.cache/huggingface:ro" "$image" cuteafd expertd-native --snapshot "/root/.cache/huggingface/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --rank "$rank" --world "$world" --capacity "$capacity" --device-budget-bytes "$budget" --first-layer "$first_layer" --listen "0.0.0.0:$port" "${topology_args[@]}" >/dev/null
+docker run -d --name "$name" --restart no --gpus all --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" "${wip_args[@]}" -v "$hf_home:/root/.cache/huggingface:ro" "$image" cuteafd expertd-native --snapshot "/root/.cache/huggingface/$snapshot_rel" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --rank "$rank" --world "$world" --capacity "$capacity" --device-budget-bytes "$budget" --first-layer "$first_layer" --listen "0.0.0.0:$port" "${topology_args[@]}" >/dev/null
 REMOTE
   pids+=("$!")
 done
