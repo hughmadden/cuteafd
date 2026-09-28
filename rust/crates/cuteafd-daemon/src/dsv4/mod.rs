@@ -86,6 +86,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
 
 /// Everything the engine borrows, built on the calling (blocking) thread.
 pub(crate) struct Loaded {
+    pub snapshot: PathBuf,
     pub catalog: cuteafd_loader::OfficialV41Catalog,
     pub library: NativeLibrary,
     pub cfg: DeepseekV4Config,
@@ -107,7 +108,7 @@ pub(crate) fn load(args: &EngineArgs) -> Result<Loaded> {
     library.cuda_set_device(args.device)?;
     let manifest = serde_json::from_str(&std::fs::read_to_string(&args.manifest)
         .with_context(|| format!("reading {}", args.manifest.display()))?)?;
-    Ok(Loaded { catalog, library, cfg, family, manifest })
+    Ok(Loaded { snapshot: args.snapshot.clone(), catalog, library, cfg, family, manifest })
 }
 
 /// Builds the engine over `loaded` and hands it, with a Spark transport and a

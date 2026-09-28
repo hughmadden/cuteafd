@@ -150,18 +150,33 @@ fn serve_one(
     let embed = embed_rows(&loaded.catalog, &tokens, hidden)?;
     let logits = engine.prefill(&mut sequence, &tokens, &embed, transport, runtime, |_, _| Ok(()))?;
     let mut row = logits[(tokens.len() - 1) * vocab..].to_vec();
-    let mut generated = 0usize;
+    let mut decoder = cuteafd_loader::streaming_token_decoder(&loaded.snapshot, false)?;
+    let (mut generated, mut buffered) = (0usize, 0usize);
     let finish = loop {
         let position = sequence.tokens.len() as u64;
         let token = job.sampling.select_token(&row, None, position)
             .map_err(|e| anyhow::anyhow!("sampling: {e:?}"))? as u32;
-        send(InferenceChunk::Token { token_id: token })?;
         generated += 1;
-        if token == eos {
-            break InferenceFinishReason::Stop;
+        buffered += 1;
+        if token != eos {
+            if let Some(content) = decoder.step(token)? {
+                send(InferenceChunk::Text { content, content_tokens: buffered })?;
+                buffered = 0;
+            }
         }
-        if generated >= job.max_tokens || sequence.tokens.len() + 1 >= capacity {
-            break InferenceFinishReason::Length;
+        let finish = if token == eos {
+            Some(InferenceFinishReason::Stop)
+        } else if generated >= job.max_tokens || sequence.tokens.len() + 1 >= capacity {
+            Some(InferenceFinishReason::Length)
+        } else {
+            None
+        };
+        if let Some(finish) = finish {
+            let content = decoder.finish()?.unwrap_or_default();
+            if !content.is_empty() || buffered > 0 {
+                send(InferenceChunk::Text { content, content_tokens: buffered })?;
+            }
+            break finish;
         }
         let embed = embed_rows(&loaded.catalog, &[token], hidden)?;
         row = engine.decode(&mut sequence, token, &embed, transport, runtime)?;
