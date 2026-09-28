@@ -6,6 +6,8 @@
 //! top-k, sparse MLA, wo, mHC post_pre, router, experts + shared FFN, mHC
 //! post) and each stage's buffers are sized for the prompt.
 use super::metadata::{self, StepTables, INDEX_PAGE_BYTES, MAIN_PAGE_BYTES};
+use super::pool::{Placement, PoolShape};
+use std::cell::RefCell;
 use super::weights::{LayerWeights, ModelWeights};
 use crate::v41_memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
@@ -34,6 +36,29 @@ pub(crate) struct Engine<'a> {
     pub max_context: usize,
     pub stream: *mut c_void,
     pub sms: u32,
+    pub shape: PoolShape,
+    pools: Vec<LayerCache<'a>>,
+    rope_window: Dev<'a>,
+    rope_compressed: Dev<'a>,
+    /// Prefill and decode workspaces, reused across steps.
+    prefill_workspace: RefCell<Option<Workspace<'a>>>,
+    decode_workspace: RefCell<Option<Workspace<'a>>>,
+}
+
+/// Everything an [`Engine`] needs besides its pools and workspaces.
+pub(crate) struct EngineParts<'a> {
+    pub library: &'a NativeLibrary,
+    pub programs: &'a Dsv4Programs<'a>,
+    pub cfg: DeepseekV4Config,
+    pub weights: ModelWeights<'a>,
+    pub family: &'static str,
+    pub decode_rows: usize,
+    pub prefill_rows: usize,
+    pub c128_width: usize,
+    pub max_context: usize,
+    pub stream: *mut c_void,
+    pub sms: u32,
+    pub shape: PoolShape,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -75,6 +100,7 @@ struct Workspace<'a> {
 /// Device copies of one step's tables.
 struct StepBuffers<'a> {
     positions: Dev<'a>,
+    main_slots: Dev<'a>,
     swa_indices: Dev<'a>,
     swa_lengths: Dev<'a>,
     c4: Vec<(&'static str, Dev<'a>)>,
@@ -84,15 +110,6 @@ struct StepBuffers<'a> {
     c4_indexed_lengths: Dev<'a>,
     c128_indices: Dev<'a>,
     c128_lengths: Dev<'a>,
-}
-
-/// One sequence's caches, sized for `capacity` tokens, and its tokens so far.
-pub(crate) struct Sequence<'a> {
-    caches: Vec<LayerCache<'a>>,
-    rope_window: Dev<'a>,
-    rope_compressed: Dev<'a>,
-    capacity: usize,
-    pub tokens: Vec<u32>,
 }
 
 impl<'a> Engine<'a> {
@@ -143,40 +160,63 @@ impl<'a> Engine<'a> {
         Ok(bytes)
     }
 
-    fn layer_cache(&self, layer: usize, capacity: usize) -> Result<LayerCache<'a>> {
-        let ratio = self.cfg.compress_ratios[layer];
-        let (main_pages, c4_pages, c128_pages) = metadata::cache_pages(capacity);
-        let main = self.zeroed(main_pages * MAIN_PAGE_BYTES)?;
-        let (compressed, index, states) = match ratio {
+    fn pool_layer(parts: &EngineParts<'a>, layer: usize) -> Result<LayerCache<'a>> {
+        let zeroed = |bytes: usize| -> Result<Dev<'a>> {
+            let allocation = DeviceAllocation::new(parts.library, bytes.max(256))?;
+            parts.library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
+            Ok(allocation)
+        };
+        let shape = parts.shape;
+        let sequences = shape.sequences;
+        let main = zeroed(shape.window_pages() * MAIN_PAGE_BYTES)?;
+        let (compressed, index, states) = match parts.cfg.compress_ratios[layer] {
             4 => (
-                Some(self.zeroed(c4_pages * metadata::compressed_page_bytes(4))?),
-                Some(self.zeroed(c4_pages * INDEX_PAGE_BYTES)?),
+                Some(zeroed(shape.c4_pages * metadata::compressed_page_bytes(4))?),
+                Some(zeroed(shape.c4_pages * INDEX_PAGE_BYTES)?),
                 vec![
-                    self.zeroed(16 * 1024 * 4)?,
-                    self.zeroed(16 * 1024 * 4)?,
-                    self.zeroed(16 * 256 * 4)?,
-                    self.zeroed(16 * 256 * 4)?,
+                    zeroed(sequences * 16 * 1024 * 4)?,
+                    zeroed(sequences * 16 * 1024 * 4)?,
+                    zeroed(sequences * 16 * 256 * 4)?,
+                    zeroed(sequences * 16 * 256 * 4)?,
                 ],
             ),
             128 => (
-                Some(self.zeroed(c128_pages * metadata::compressed_page_bytes(128))?),
+                Some(zeroed(shape.c128_pages * metadata::compressed_page_bytes(128))?),
                 None,
-                vec![self.zeroed(256 * 512 * 4)?, self.zeroed(256 * 512 * 4)?],
+                vec![zeroed(sequences * 256 * 512 * 4)?, zeroed(sequences * 256 * 512 * 4)?],
             ),
             _ => (None, None, Vec::new()),
         };
         Ok(LayerCache { main, compressed, index, states })
     }
 
-    /// A new sequence with caches for `capacity` tokens (prompt + generation).
-    pub fn sequence(&self, capacity: usize) -> Result<Sequence<'a>> {
-        let table = capacity.max(metadata::WINDOW);
-        Ok(Sequence {
-            caches: (0..self.cfg.n_layers).map(|l| self.layer_cache(l, capacity)).collect::<Result<_>>()?,
-            rope_window: self.upload(&metadata::rope_table(&self.cfg, false, table))?,
-            rope_compressed: self.upload(&metadata::rope_table(&self.cfg, true, table))?,
-            capacity,
-            tokens: Vec::new(),
+    /// Allocates the cache pools and RoPE tables for `parts.shape`.
+    pub fn new(parts: EngineParts<'a>) -> Result<Self> {
+        let pools = (0..parts.cfg.n_layers).map(|l| Self::pool_layer(&parts, l)).collect::<Result<Vec<_>>>()?;
+        let table = |compressed: bool| -> Result<Dev<'a>> {
+            let values = metadata::rope_table(&parts.cfg, compressed, parts.max_context.max(metadata::WINDOW));
+            let allocation = DeviceAllocation::new(parts.library, values.len() * 4)?;
+            parts.library.copy_h2d(allocation.buffer, bytes_of(&values))?;
+            Ok(allocation)
+        };
+        Ok(Self {
+            rope_window: table(false)?,
+            rope_compressed: table(true)?,
+            pools,
+            library: parts.library,
+            programs: parts.programs,
+            cfg: parts.cfg,
+            weights: parts.weights,
+            family: parts.family,
+            decode_rows: parts.decode_rows,
+            prefill_rows: parts.prefill_rows,
+            c128_width: parts.c128_width,
+            max_context: parts.max_context,
+            stream: parts.stream,
+            sms: parts.sms,
+            shape: parts.shape,
+            prefill_workspace: RefCell::new(None),
+            decode_workspace: RefCell::new(None),
         })
     }
 
@@ -218,6 +258,7 @@ impl<'a> Engine<'a> {
         };
         Ok(StepBuffers {
             positions: self.upload(&tables.positions)?,
+            main_slots: self.upload(&tables.main_slots)?,
             swa_indices: self.upload(&tables.swa_indices)?,
             swa_lengths: self.upload(&tables.swa_lengths)?,
             c4: list(&tables.c4_tables)?,
@@ -242,47 +283,52 @@ impl<'a> Engine<'a> {
         Ok(out)
     }
 
-    /// Prefills `tokens` into an empty sequence and returns FP32 logits
-    /// [T, vocab]. `on_layer` receives each layer's output stream [T, 4, dim].
+    /// Prefills `tokens` for a freshly admitted sequence and returns FP32
+    /// logits [T, vocab]. `on_layer` receives each layer's output stream.
     pub fn prefill(
         &self,
-        sequence: &mut Sequence<'_>,
+        placement: &mut Placement,
         tokens: &[u32],
         embed: &[u8],
         transport: &mut V41Tp4Roce,
         runtime: &tokio::runtime::Runtime,
         on_layer: impl FnMut(usize, &[u8]) -> Result<()>,
     ) -> Result<Vec<f32>> {
-        ensure!(sequence.tokens.is_empty(), "prefill continues only from an empty sequence");
-        ensure!(tokens.len() <= self.prefill_rows && tokens.len() <= sequence.capacity,
-            "prefill of {} tokens exceeds capacity", tokens.len());
-        let tables = metadata::prefill_step(tokens.len(), self.cfg.index_topk, self.c128_width, sequence.capacity);
-        let logits = self.step(sequence, &tables, tokens, embed, transport, runtime, on_layer)?;
-        sequence.tokens.extend_from_slice(tokens);
+        ensure!(placement.len == 0, "prefill continues only from an empty sequence");
+        ensure!(!tokens.is_empty() && tokens.len() <= self.prefill_rows && tokens.len() <= self.max_context,
+            "prefill of {} tokens is outside 1..={}", tokens.len(), self.prefill_rows.min(self.max_context));
+        let tables = metadata::prefill_step(placement, &self.shape, tokens.len(), self.cfg.index_topk, self.c128_width)?;
+        let logits = self.step(&tables, tokens, embed, transport, runtime, on_layer)?;
+        placement.len = tokens.len();
         Ok(logits)
     }
 
-    /// Appends one token and returns its FP32 logits row.
+    /// One decode row per sequence: appends each token and returns the
+    /// logits rows [rows, vocab] in order.
     pub fn decode(
         &self,
-        sequence: &mut Sequence<'_>,
-        token: u32,
+        rows: &mut [(&mut Placement, u32)],
         embed: &[u8],
         transport: &mut V41Tp4Roce,
         runtime: &tokio::runtime::Runtime,
     ) -> Result<Vec<f32>> {
-        let position = sequence.tokens.len();
-        ensure!(position > 0 && position < sequence.capacity, "decode at {position} outside the sequence capacity");
-        let tables = metadata::decode_step(position, self.cfg.index_topk, self.c128_width, sequence.capacity);
-        let logits = self.step(sequence, &tables, &[token], embed, transport, runtime, |_, _| Ok(()))?;
-        sequence.tokens.push(token);
+        ensure!(!rows.is_empty() && rows.len() <= self.decode_rows, "decode batch of {} rows", rows.len());
+        for (placement, _) in rows.iter() {
+            ensure!(placement.len > 0 && placement.len < self.max_context, "decode at {} outside the context", placement.len);
+        }
+        let tokens: Vec<u32> = rows.iter().map(|(_, token)| *token).collect();
+        let steps: Vec<(&Placement, usize)> = rows.iter().map(|(p, _)| (&**p, p.len)).collect();
+        let tables = metadata::decode_step(&steps, &self.shape, self.cfg.index_topk, self.c128_width)?;
+        let logits = self.step(&tables, &tokens, embed, transport, runtime, |_, _| Ok(()))?;
+        for (placement, _) in rows.iter_mut() {
+            placement.len += 1;
+        }
         Ok(logits)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn step(
         &self,
-        sequence: &Sequence<'_>,
         tables: &StepTables,
         tokens: &[u32],
         embed: &[u8],
@@ -294,7 +340,13 @@ impl<'a> Engine<'a> {
         let h = self.cfg.dim;
         ensure!(tokens.len() == t && embed.len() == t * h * 2, "step rows disagree");
         let m = self.step_buffers(tables)?;
-        let w = self.workspace(t)?;
+        let slot = if tables.decode { &self.decode_workspace } else { &self.prefill_workspace };
+        if slot.borrow().is_none() {
+            let rows = if tables.decode { self.decode_rows } else { self.prefill_rows };
+            *slot.borrow_mut() = Some(self.workspace(rows)?);
+        }
+        let workspace = slot.borrow();
+        let w = workspace.as_ref().context("workspace")?;
         let mut expanded = Vec::with_capacity(t * 4 * h * 2);
         for row in embed.chunks_exact(h * 2) {
             for _ in 0..4 {
@@ -307,9 +359,9 @@ impl<'a> Engine<'a> {
         let mode = if tables.decode { "decode" } else { "prefill" };
         let (mut current, mut next) = (&w.stream_a, &w.stream_b);
         for (layer, weights) in self.weights.layers.iter().enumerate() {
-            let cache = &sequence.caches[layer];
+            let cache = &self.pools[layer];
             let ratio = weights.ratio;
-            let rope = if ratio == 0 { &sequence.rope_window } else { &sequence.rope_compressed };
+            let rope = if ratio == 0 { &self.rope_window } else { &self.rope_compressed };
             // 1. mHC pre (attention) with attn_norm.
             self.run("mhc_pre", &[
                 ("residual", current.buffer.ptr), ("fn", weights.ptr("attn.fn")?), ("scale", weights.ptr("attn.scale")?),
@@ -318,7 +370,7 @@ impl<'a> Engine<'a> {
             ], &[rows])?;
             // 2. producer: q/kv projections, window cache pack, query.
             self.run(&format!("producer_m{cap}"), &[
-                ("hidden", w.y.buffer.ptr), ("positions", m.positions.buffer.ptr), ("main_slots", m.positions.buffer.ptr),
+                ("hidden", w.y.buffer.ptr), ("positions", m.positions.buffer.ptr), ("main_slots", m.main_slots.buffer.ptr),
                 ("cos_sin", rope.buffer.ptr), ("w_qkv", weights.ptr("w_qkv")?), ("w_qkv_scale", weights.ptr("w_qkv_scale")?),
                 ("w_q", weights.ptr("w_q")?), ("w_q_scale", weights.ptr("w_q_scale")?), ("q_norm", weights.ptr("q_norm")?),
                 ("kv_norm", weights.ptr("kv_norm")?), ("main_kv_cache", cache.main.buffer.ptr), ("query", w.query.buffer.ptr),

@@ -1,6 +1,7 @@
 //! DeepSeek V4 (Flash / Pro) coordinator engine over the exported b12x programs.
 pub(crate) mod engine;
 pub(crate) mod metadata;
+pub(crate) mod pool;
 pub(crate) mod serve;
 pub(crate) mod weights;
 
@@ -31,6 +32,12 @@ pub(crate) struct EngineArgs {
     pub device: i32,
     #[arg(long, default_value_t = 188)]
     pub sms: u32,
+    /// Sequences that can be resident at once (compressor state slots).
+    #[arg(long, default_value_t = 8)]
+    pub max_sequences: usize,
+    /// Total tokens the compressed-cache pools hold across sequences.
+    #[arg(long, default_value_t = 262_144)]
+    pub pool_tokens: usize,
 }
 
 #[derive(Debug, clap::Args)]
@@ -128,7 +135,14 @@ pub(crate) fn with_engine<T>(
     let model = loader.model(&loaded.cfg)?;
     tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 coordinator weights resident");
     let max_context = caps["max_context"].as_u64().context("manifest max_context")? as usize;
-    let engine = engine::Engine {
+    let shape = pool::PoolShape::new(
+        args.max_sequences,
+        max_context,
+        caps["prefill_rows"].as_u64().context("prefill_rows")? as usize,
+        (args.pool_tokens / 4).div_ceil(64) + args.max_sequences,
+        (args.pool_tokens / 128).div_ceil(2) + args.max_sequences,
+    );
+    let engine = engine::Engine::new(engine::EngineParts {
         library: &loaded.library,
         programs: &programs,
         cfg: loaded.cfg.clone(),
@@ -140,7 +154,8 @@ pub(crate) fn with_engine<T>(
         max_context,
         stream,
         sms: args.sms,
-    };
+        shape,
+    })?;
     let peers = args.peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
     let executors: Vec<u64> = (1..=peers.len() as u64).collect();
     let mut transport = V41Tp4Roce::new_ranks(&peers, &executors, 4096,
@@ -172,9 +187,10 @@ fn golden_run(
     let started = Instant::now();
     let compare_layers = args.layers.unwrap_or(cfg.n_layers);
     let prefill = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
-    let mut sequence = engine.sequence(tokens.len())?;
+    let mut allocator = pool::PoolAllocator::new(engine.shape);
+    let mut placement = allocator.admit(tokens.len())?;
     let row = cfg.dim * 2;
-    let mut logits = engine.prefill(&mut sequence, &tokens[..prefill], &embed[..prefill * row], transport, runtime,
+    let mut logits = engine.prefill(&mut placement, &tokens[..prefill], &embed[..prefill * row], transport, runtime,
         |layer, stream| {
             if layer < compare_layers && prefill == tokens.len() {
                 let golden = std::fs::read(args.golden.join(format!("layer{layer:02}.bin")))?;
@@ -188,7 +204,7 @@ fn golden_run(
     let decode_started = Instant::now();
     for position in prefill..tokens.len() {
         let token = tokens[position];
-        logits.extend(engine.decode(&mut sequence, token, &embed[position * row..][..row], transport, runtime)?);
+        logits.extend(engine.decode(&mut [(&mut placement, token)], &embed[position * row..][..row], transport, runtime)?);
     }
     let decode_steps = tokens.len() - prefill;
     if decode_steps > 0 {

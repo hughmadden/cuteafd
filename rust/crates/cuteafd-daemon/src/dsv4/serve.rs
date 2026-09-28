@@ -1,5 +1,6 @@
 //! OpenAI-compatible serving for DeepSeek V4: one request at a time through
 //! the prefill/decode engine (the correctness baseline batching builds on).
+use super::pool::{Placement, PoolAllocator};
 use super::{embed_rows, with_engine, EngineArgs};
 use anyhow::{ensure, Context, Result};
 use cuteafd_api::native_v41::{
@@ -88,28 +89,7 @@ fn serve_loop(
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(()));
         }
-        let (mut requests, mut generated) = (0u64, 0u64);
-        while let Some(job) = receive.blocking_recv() {
-            let started = Instant::now();
-            let events = job.events.clone();
-            let outcome = serve_one(engine, &loaded, &tokenizer, eos, job, transport, runtime);
-            match outcome {
-                Ok(tokens) => {
-                    requests += 1;
-                    generated += tokens as u64;
-                    let seconds = started.elapsed().as_secs_f64();
-                    tracing::info!(tokens, seconds, tok_s = tokens as f64 / seconds, "request complete");
-                    if let Ok(mut stats) = stats.lock() {
-                        *stats = serde_json::json!({"requests": requests, "generated_tokens": generated});
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!("request failed: {error:#}");
-                    let _ = events.blocking_send(Err(NativeFailure::Worker(format!("{error:#}"))));
-                }
-            }
-        }
-        Ok(())
+        schedule(engine, &loaded, &tokenizer, eos, &mut receive, transport, runtime, &stats)
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
@@ -117,72 +97,177 @@ fn serve_loop(
     result
 }
 
-fn serve_one(
-    engine: &super::engine::Engine<'_>,
-    loaded: &super::Loaded,
-    tokenizer: &cuteafd_loader::LoadedTokenizer,
-    eos: u32,
+/// One admitted request: its placement, stream state and next input token.
+struct Active {
     job: NativeRequest,
-    transport: &mut cuteafd_transport::v41_expert::V41Tp4Roce,
-    runtime: &tokio::runtime::Runtime,
-) -> Result<usize> {
-    let send = |chunk: InferenceChunk| job.events.blocking_send(Ok(chunk)).map_err(|_| anyhow::anyhow!("client went away"));
-    if job.constraint.is_some() || !job.images.is_empty() {
-        let _ = job.events.blocking_send(Err(NativeFailure::BadRequest(
-            "constrained decoding and images are not available for DeepSeek V4 yet".into())));
-        return Ok(0);
+    placement: Placement,
+    capacity: usize,
+    next: u32,
+    decoder: cuteafd_loader::StreamingTokenDecoder,
+    generated: usize,
+    buffered: usize,
+    started: Instant,
+}
+
+impl Active {
+    fn send(&self, chunk: InferenceChunk) -> Result<()> {
+        self.job.events.blocking_send(Ok(chunk)).map_err(|_| anyhow::anyhow!("client went away"))
     }
-    let tokens = tokenizer.encode_text(&job.prompt, false)?.token_ids;
-    let limit = engine.prefill_rows.min(engine.max_context);
-    if tokens.is_empty() || tokens.len() > limit {
-        let _ = job.events.blocking_send(Err(NativeFailure::BadRequest(
-            format!("prompt of {} tokens is outside 1..={limit} for single-chunk prefill", tokens.len()))));
-        return Ok(0);
-    }
-    send(InferenceChunk::Ready {
-        system_fingerprint: None,
-        prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: 0 },
-    })?;
-    let hidden = engine.cfg.dim;
-    let vocab = engine.cfg.vocab_size;
-    let capacity = (tokens.len() + job.max_tokens).min(engine.max_context);
-    let mut sequence = engine.sequence(capacity)?;
-    let embed = embed_rows(&loaded.catalog, &tokens, hidden)?;
-    let logits = engine.prefill(&mut sequence, &tokens, &embed, transport, runtime, |_, _| Ok(()))?;
-    let mut row = logits[(tokens.len() - 1) * vocab..].to_vec();
-    let mut decoder = cuteafd_loader::streaming_token_decoder(&loaded.snapshot, false)?;
-    let (mut generated, mut buffered) = (0usize, 0usize);
-    let finish = loop {
-        let position = sequence.tokens.len() as u64;
-        let token = job.sampling.select_token(&row, None, position)
-            .map_err(|e| anyhow::anyhow!("sampling: {e:?}"))? as u32;
-        generated += 1;
-        buffered += 1;
+
+    /// Streams `token`; returns true when the request is finished.
+    fn emit(&mut self, token: u32, eos: u32) -> Result<bool> {
+        self.generated += 1;
+        self.buffered += 1;
         if token != eos {
-            if let Some(content) = decoder.step(token)? {
-                send(InferenceChunk::Text { content, content_tokens: buffered })?;
-                buffered = 0;
+            if let Some(content) = self.decoder.step(token)? {
+                self.send(InferenceChunk::Text { content, content_tokens: self.buffered })?;
+                self.buffered = 0;
             }
         }
         let finish = if token == eos {
             Some(InferenceFinishReason::Stop)
-        } else if generated >= job.max_tokens || sequence.tokens.len() + 1 >= capacity {
+        } else if self.generated >= self.job.max_tokens || self.placement.len + 1 >= self.capacity {
             Some(InferenceFinishReason::Length)
         } else {
             None
         };
-        if let Some(finish) = finish {
-            let content = decoder.finish()?.unwrap_or_default();
-            if !content.is_empty() || buffered > 0 {
-                send(InferenceChunk::Text { content, content_tokens: buffered })?;
-            }
-            break finish;
+        let Some(finish) = finish else {
+            self.next = token;
+            return Ok(false);
+        };
+        let content = self.decoder.finish()?.unwrap_or_default();
+        if !content.is_empty() || self.buffered > 0 {
+            self.send(InferenceChunk::Text { content, content_tokens: self.buffered })?;
         }
-        let embed = embed_rows(&loaded.catalog, &[token], hidden)?;
-        row = engine.decode(&mut sequence, token, &embed, transport, runtime)?;
-    };
-    send(InferenceChunk::Finish { finish_reason: finish })?;
-    Ok(generated)
+        self.send(InferenceChunk::Finish { finish_reason: finish })?;
+        Ok(true)
+    }
+}
+
+/// Continuous batching: prefill each new request (one sequence per prefill),
+/// then advance every active sequence by one token in a single decode step.
+#[allow(clippy::too_many_arguments)]
+fn schedule(
+    engine: &super::engine::Engine<'_>,
+    loaded: &super::Loaded,
+    tokenizer: &cuteafd_loader::LoadedTokenizer,
+    eos: u32,
+    receive: &mut mpsc::Receiver<NativeRequest>,
+    transport: &mut cuteafd_transport::v41_expert::V41Tp4Roce,
+    runtime: &tokio::runtime::Runtime,
+    stats: &Mutex<serde_json::Value>,
+) -> Result<()> {
+    let mut allocator = PoolAllocator::new(engine.shape);
+    let mut active: Vec<Active> = Vec::new();
+    let (mut requests, mut generated_total) = (0u64, 0u64);
+    let hidden = engine.cfg.dim;
+    let vocab = engine.cfg.vocab_size;
+    let limit = engine.prefill_rows.min(engine.max_context);
+    loop {
+        // Admit while sequence slots and decode rows remain.
+        while allocator.free_states() > 0 && active.len() < engine.decode_rows {
+            let job = if active.is_empty() {
+                match receive.blocking_recv() {
+                    Some(job) => job,
+                    None => return Ok(()),
+                }
+            } else {
+                match receive.try_recv() {
+                    Ok(job) => job,
+                    Err(_) => break,
+                }
+            };
+            let reject = |job: &NativeRequest, message: String| {
+                let _ = job.events.blocking_send(Err(NativeFailure::BadRequest(message)));
+            };
+            if job.constraint.is_some() || !job.images.is_empty() {
+                reject(&job, "constrained decoding and images are not available for DeepSeek V4 yet".into());
+                continue;
+            }
+            let tokens = tokenizer.encode_text(&job.prompt, false)?.token_ids;
+            if tokens.is_empty() || tokens.len() > limit {
+                reject(&job, format!("prompt of {} tokens is outside 1..={limit} for single-chunk prefill", tokens.len()));
+                continue;
+            }
+            let capacity = (tokens.len() + job.max_tokens).min(engine.max_context);
+            let mut placement = match allocator.admit(capacity) {
+                Ok(placement) => placement,
+                Err(error) => {
+                    reject(&job, format!("{error:#}"));
+                    continue;
+                }
+            };
+            let admitted = (|| -> Result<Active> {
+                let _ = job.events.blocking_send(Ok(InferenceChunk::Ready {
+                    system_fingerprint: None,
+                    prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: 0 },
+                }));
+                let embed = embed_rows(&loaded.catalog, &tokens, hidden)?;
+                let logits = engine.prefill(&mut placement, &tokens, &embed, transport, runtime, |_, _| Ok(()))?;
+                let row = &logits[(tokens.len() - 1) * vocab..];
+                let token = job.sampling.select_token(row, None, placement.len as u64)
+                    .map_err(|e| anyhow::anyhow!("sampling: {e:?}"))? as u32;
+                Ok(Active {
+                    decoder: cuteafd_loader::streaming_token_decoder(&loaded.snapshot, false)?,
+                    job, placement: placement.clone(), capacity, next: token, generated: 0, buffered: 0,
+                    started: Instant::now(),
+                })
+            })();
+            match admitted {
+                Ok(mut request) => {
+                    let token = request.next;
+                    match request.emit(token, eos) {
+                        Ok(false) => active.push(request),
+                        Ok(true) | Err(_) => allocator.release(request.placement),
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("prefill failed: {error:#}");
+                    allocator.release(placement);
+                }
+            }
+        }
+        if active.is_empty() {
+            continue;
+        }
+        // One decode step over every active sequence.
+        let tokens: Vec<u32> = active.iter().map(|a| a.next).collect();
+        let embed = embed_rows(&loaded.catalog, &tokens, hidden)?;
+        let mut rows: Vec<(&mut Placement, u32)> = active.iter_mut().map(|a| (&mut a.placement, a.next)).collect();
+        let logits = match engine.decode(&mut rows, &embed, transport, runtime) {
+            Ok(logits) => logits,
+            Err(error) => {
+                tracing::warn!("decode step failed: {error:#}");
+                for request in active.drain(..) {
+                    let _ = request.job.events.blocking_send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                    allocator.release(request.placement);
+                }
+                continue;
+            }
+        };
+        let finished: Vec<bool> = active.iter_mut().enumerate().map(|(row, request)| {
+            let logits_row = &logits[row * vocab..][..vocab];
+            request.job.sampling.select_token(logits_row, None, request.placement.len as u64)
+                .map_err(|e| anyhow::anyhow!("sampling: {e:?}"))
+                .and_then(|token| request.emit(token as u32, eos))
+                .unwrap_or(true)
+        }).collect();
+        for index in (0..active.len()).rev() {
+            if !finished[index] {
+                continue;
+            }
+            let request = active.remove(index);
+            requests += 1;
+            generated_total += request.generated as u64;
+            let seconds = request.started.elapsed().as_secs_f64();
+            tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
+                active = active.len(), "request complete");
+            allocator.release(request.placement);
+        }
+        if let Ok(mut stats) = stats.lock() {
+            *stats = serde_json::json!({"requests": requests, "generated_tokens": generated_total, "active": active.len()});
+        }
+    }
 }
 
 #[cfg(test)]
