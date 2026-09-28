@@ -62,7 +62,7 @@ docker run -d --name cuteafd-coordinator --restart no --gpus "device=$gpu" --net
   "$coordinator_image" cuteafd serve-dsv4 --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peer_csv" --listen "$addr" \
   --max-sequences "$(get CONCURRENCY 8)" --max-context "$(get MAX_CONTEXT_TOKENS 8192)" \
-  --max-output "$(get MAX_OUTPUT_TOKENS 4096)" >/dev/null
+  --max-output "$(get MAX_OUTPUT_TOKENS 4096)" $([[ "$(get DSPARK off)" == on ]] && echo --dspark) >/dev/null
 url="http://127.0.0.1:${addr##*:}"
 until curl -sf "$url/health" >/dev/null; do
   docker ps -q -f name=cuteafd-coordinator | grep -q . ||
