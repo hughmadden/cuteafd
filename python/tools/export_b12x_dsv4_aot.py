@@ -91,7 +91,8 @@ def programs(g, decode_rows: int, prefill_rows: int, max_context: int):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--geometry", choices=("flash", "pro"), default="flash")
+    parser.add_argument("--geometry", default="flash",
+                        help="comma-separated DeepSeek V4 geometries (flash, pro) in one table")
     parser.add_argument("--decode-rows", type=int, default=128)
     parser.add_argument("--prefill-rows", type=int, default=4096)
     parser.add_argument("--max-context", type=int, default=131072)
@@ -101,8 +102,9 @@ def main() -> None:
     import torch
     from b12x.integration.cuteafd import FLASH, PRO, exportable_compilation, validate_exported_header
 
-    g = {"flash": FLASH, "pro": PRO}[args.geometry]
-    family = {"flash": "dsv4f", "pro": "dsv4p"}[args.geometry]
+    geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
+    if not geometries or any(name not in ("flash", "pro") for name in geometries):
+        raise SystemExit("--geometry takes flash and/or pro")
     props = torch.cuda.get_device_properties(0)
     if (props.major, props.minor) != (12, 0):
         raise SystemExit("DeepSeek V4 coordinator programs export on SM120")
@@ -111,8 +113,7 @@ def main() -> None:
     selected = set(args.only.split(",")) if args.only else None
     manifest = {
         "schema": 1,
-        "family": family,
-        "geometry": {k: v for k, v in vars(g).items()},
+        "families": {},
         "capacities": {"decode_rows": args.decode_rows, "prefill_rows": args.prefill_rows,
                        "max_context": args.max_context},
         "sparkinfer_revision": _pinned_sparkinfer.REVISION,
@@ -120,8 +121,13 @@ def main() -> None:
         "programs": [],
     }
     entries, includes = [], []
-    for suffix, op, params, thunk in programs(g, args.decode_rows, args.prefill_rows,
-                                              args.max_context):
+    work = []
+    for name in geometries:
+        g = {"flash": FLASH, "pro": PRO}[name]
+        family = {"flash": "dsv4f", "pro": "dsv4p"}[name]
+        manifest["families"][family] = {k: v for k, v in vars(g).items()}
+        work += [(family, *item) for item in programs(g, args.decode_rows, args.prefill_rows, args.max_context)]
+    for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
             continue
         stem = f"{family}_{suffix}"
@@ -137,6 +143,7 @@ def main() -> None:
         capacity = int(params.get("max_rows", args.prefill_rows))
         manifest["programs"].append({
             "name": stem,
+            "family": family,
             "op": op,
             "params": params,
             "pointers": [dict(zip(("name", "dtype", "shape", "role"), p)) for p in abi["pointers"]],
