@@ -163,6 +163,24 @@ per-family chat templates (deepseek-recipe crates for DeepSeek; minijinja
 over `tokenizer_config.chat_template` as the generic path) with per-family
 tool-call parsers and xgrammar tag grammars; console made model-agnostic.
 
+## Execution engines (decided 2026-09-29)
+
+V4.1's execution stack is specialized to its causal encoder/decoder: KV and
+index sources [2,8,14,20], engram gates at layers 1 and 14, dSpark taps from
+layer 37, encoder/replay stages. Other families share none of that, so there
+are two engines under one scheduler, API, transport, host cache and sampler:
+
+- `deepseek_v41` keeps its specialized path; nothing regresses it.
+- A generic per-layer engine runs every other family: each layer is a block
+  (norm/HC in, family attention with its own window/compressed/index/state
+  cache, router, shared expert, routed experts on Sparks, HC/residual out),
+  plus head and native speculator. DeepSeek V4 is its first tenant, then GLM,
+  MiMo, Qwen. It adopts V4.1's proven optimizations (chained stages, lanes,
+  dual RTX, route packing) as it matures.
+
+Kernels are shared by parameterizing dimensions; `cuteafd plan` feeds the
+AOT exporters the geometry each image must carry.
+
 ## Phases
 
 Each phase ends with: V4.1 Flash parity table (C1 code decode 1/2 RTX,
