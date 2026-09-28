@@ -150,6 +150,7 @@ def main() -> None:
         text = " | ".join(f"{k}: {fmt(v)}" for k, v in row.items() if isinstance(v, dict))
         print(f"layer {layer:2d} C{row['ratio']:<3d}{'H' if row['hash'] else ' '} {row['seconds']:6.1f}s {text}",
               flush=True)
+        block.release()
         del block
         torch.cuda.empty_cache()
 
@@ -157,8 +158,15 @@ def main() -> None:
     if logits_path.exists():
         ref_logits = torch.load(logits_path, map_location="cpu")[0]
         if chain is not None and layers[-1] == cfg.n_layers - 1:
-            results["logits_chain"] = logits_metrics(model.head(chain), ref_logits.to(dev))
+            chain_logits = model.head(chain)
+            results["logits_chain"] = logits_metrics(chain_logits, ref_logits.to(dev))
             print("logits chain :", results["logits_chain"])
+            torch.save(chain_logits.float().cpu(), a.golden / "logits_b12x_chain.pt")
+            # Teacher-forced next-token accuracy of both paths on the prompt itself.
+            nxt = torch.tensor(tokens[1:], device=dev)
+            acc = lambda lg: float((lg[:-1].argmax(-1).to(dev) == nxt).float().mean())  # noqa: E731
+            results["next_token_acc"] = {"golden": acc(ref_logits), "b12x_chain": acc(chain_logits)}
+            print("next-token accuracy:", results["next_token_acc"])
         last = golden_stream(cfg.n_layers - 1)
         if "golden" in feeds and last is not None:
             results["logits_golden_feed"] = logits_metrics(model.head(last.to(torch.bfloat16)), ref_logits.to(dev))

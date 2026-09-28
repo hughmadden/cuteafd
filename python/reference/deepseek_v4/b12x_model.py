@@ -576,6 +576,19 @@ class DeepseekV4Layer:
 
     # ------------------------------------------------------------------ forward
     @torch.inference_mode()
+    def release(self) -> None:
+        """Drop this layer's prepared fused_moe plans (they retain the layer's
+        expert weights in b12x's lazy preparation session until released)."""
+        from b12x.preparation.session import _LAZY_SESSIONS
+
+        for plan in self._moe_plans.values():
+            for session in list(_LAZY_SESSIONS.values()):
+                try:
+                    session.release(plan)
+                except Exception:
+                    pass
+        self._moe_plans.clear()
+
     def forward(self, stream: torch.Tensor, token_ids: torch.Tensor, meta: PrefillMetadata,
                 cos_sin: torch.Tensor, debug: dict | None = None) -> torch.Tensor:
         """stream [T, 4, dim] bf16 -> [T, 4, dim] bf16 (model.py Block.forward)."""
