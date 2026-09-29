@@ -83,14 +83,14 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
         if args.local {
             let (actual, elapsed) = fp8::run_local(&args, &catalog, &wire, &input, &routes)?;
             let started = Instant::now();
-            let expected = fp8::oracle(&catalog, args.layer, &input, &routes, &sampled)?;
+            let expected = fp8::oracle(&catalog, args.layer, &input, &routes, &sampled, fp8::swiglu_limit(&args.snapshot))?;
             return report(&format!("layer {} rows {rows} local fp8 tp{} ({} rows checked)", args.layer, args.local_tp,
                 sampled.len()),
                 false, &pick(&actual), &expected, elapsed, started.elapsed());
         }
         let (actual, remote) = remote_partials(&args, rows, hidden, topk, &routes, wire).await?;
         let started = Instant::now();
-        let expected = fp8::oracle(&catalog, args.layer, &input, &routes, &sampled)?;
+        let expected = fp8::oracle(&catalog, args.layer, &input, &routes, &sampled, fp8::swiglu_limit(&args.snapshot))?;
         return report(&format!("layer {} rows {rows} fp8 ({} rows checked)", args.layer, sampled.len()), false,
             &pick(&actual), &expected, remote, started.elapsed());
     }
