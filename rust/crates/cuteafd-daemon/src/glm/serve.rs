@@ -442,10 +442,12 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         let distinct_rows: usize = active.iter().zip(&sequences).map(|(a, rows)| (key(a), rows))
             .collect::<std::collections::HashSet<_>>().iter().map(|(_, rows)| rows.len()).sum();
         let tokens: Vec<u32> = sequences.iter().flatten().copied().collect();
-        phases[1] += timer.elapsed().as_secs_f64();
+        let mut cycle_host = timer.elapsed().as_secs_f64();
+        phases[1] += cycle_host;
         let timer = Instant::now();
         let embed = embed_rows(&opened.catalog, &tokens, hidden)?;
         phases[2] += timer.elapsed().as_secs_f64();
+        cycle_host += timer.elapsed().as_secs_f64();
         let mut rows: Vec<(&mut GlmPlacement, usize)> = active.iter_mut().zip(&sequences)
             .map(|(a, s)| (&mut a.placement, s.len())).collect();
         let timer = Instant::now();
@@ -529,11 +531,13 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             finished
         }).collect();
         phases[4] += timer.elapsed().as_secs_f64();
+        cycle_host += timer.elapsed().as_secs_f64();
         let timer = Instant::now();
         if let Some(drafter) = drafter {
             drafter.update(&context)?;
         }
         phases[5] += timer.elapsed().as_secs_f64();
+        cost.observe_host(1e3 * (cycle_host + timer.elapsed().as_secs_f64()));
         for index in (0..active.len()).rev() {
             if !finished[index] {
                 continue;

@@ -1,7 +1,7 @@
 //! How many DFlash2 drafts each sequence verifies (glmrt v9's adaptive K1-K7).
 //!
-//! Each sequence keeps its last 16 (proposed, accepted) outcomes; a Beta(3, 4)
-//! prior per draft position turns them into conditional acceptance rates
+//! Each sequence keeps its last 16 (proposed, accepted) outcomes; a prior of
+//! 3 successes in 4 trials per draft position turns them into conditional acceptance rates
 //! (a position is observed only when every earlier draft was accepted). The
 //! frozen logistic calibration from glmrt (fit on 32 fixed-K7 GLM-5.3 K4
 //! requests) refines those rates with the selector's margin, best
@@ -105,6 +105,9 @@ pub(crate) struct StepCost {
     prior: Vec<f64>,
     ratio: f64,
     draft_ms: f64,
+    /// Host time per cycle outside the draft and verify steps (embedding,
+    /// sampling and streaming, the drafter's context update).
+    host_ms: f64,
 }
 
 /// Coordinator-side cost of a row whose routes another row already reads
@@ -120,7 +123,7 @@ impl StepCost {
             let ((r0, m0), (r1, m1)) = (points[upper - 1], points[upper]);
             m0 + (m1 - m0) * (rows as f64 - r0 as f64) / (r1 as f64 - r0 as f64)
         }).collect();
-        Self { prior, ratio: 1.0, draft_ms: 5.0 }
+        Self { prior, ratio: 1.0, draft_ms: 5.0, host_ms: 0.3 }
     }
 
     fn model(&self, rows: usize, distinct: usize) -> f64 {
@@ -128,9 +131,16 @@ impl StepCost {
         self.prior[distinct.min(self.prior.len() - 1)] + DUPLICATE_ROW_MS * (rows - distinct) as f64
     }
 
-    /// Cycle ms (draft + verify) of `rows` rows, `distinct` of them distinct.
+    /// Cycle ms (draft + verify + host) of `rows` rows, `distinct` of them distinct.
     pub fn ms(&self, rows: usize, distinct: usize) -> f64 {
-        self.ratio * self.model(rows, distinct) + self.draft_ms
+        self.ratio * self.model(rows, distinct) + self.draft_ms + self.host_ms
+    }
+
+    /// Folds one cycle's host time outside the draft and verify steps in.
+    pub fn observe_host(&mut self, ms: f64) {
+        if ms.is_finite() && ms >= 0.0 {
+            self.host_ms += 0.1 * (ms.min(20.0) - self.host_ms);
+        }
     }
 
     /// Folds one observed draft-step time in.
@@ -310,10 +320,15 @@ pub(crate) fn plan(groups: &[Group<'_>], base: (usize, usize), cost: &StepCost) 
         .map(|g| if g.history.cold() { START_DRAFTS.min(g.room).min(g.confidence.len()) } else { 0 }).collect();
     let (lengths, rate) = schedule(groups, &minimum, base, cost);
     if groups.len() == 1 && groups[0].members == 1 && base.0 == 0 && !groups[0].history.cold() {
-        let reference = [START_DRAFTS.min(groups[0].room).min(groups[0].confidence.len())];
-        let (fixed, fixed_rate) = schedule(groups, &reference, base, cost);
-        if lengths[0] != reference[0] && rate < fixed_rate * REFERENCE_MARGIN {
-            return vec![fixed[0].min(reference[0])];
+        // The reference is exactly START_DRAFTS drafts (glmrt prices K5 alone):
+        // a schedule free to extend past them would equal any longer best plan
+        // and cap every warm sequence at five.
+        let n = START_DRAFTS.min(groups[0].room).min(groups[0].confidence.len());
+        let capped = [Group { history: groups[0].history, confidence: groups[0].confidence[..n].to_vec(), room: n,
+            members: 1 }];
+        let (_, fixed_rate) = schedule(&capped, &[n], base, cost);
+        if lengths[0] != n && rate < fixed_rate * REFERENCE_MARGIN {
+            return vec![n];
         }
     }
     lengths
@@ -360,6 +375,19 @@ mod tests {
         // The better sequence gets rows first.
         let (lengths, _) = schedule(&[group(&history, 0.95, 1), group(&history, 0.3, 1)], &[0, 0], (0, 0), c);
         assert!(lengths[0] > lengths[1]);
+    }
+
+    #[test]
+    fn warm_confident_sequence_verifies_seven() {
+        // glmrt compares the best plan with exactly five drafts; a reference
+        // schedule that may extend past five capped warm sequences at five.
+        let cost = StepCost::new(&K4_TP4_STEP_MS, 64);
+        let mut history = DraftHistory::default();
+        for _ in 0..8 {
+            history.observe(7, 7);
+        }
+        assert_eq!(plan(&[group(&history, 0.97, 1)], (0, 0), &cost), vec![7]);
+        assert_eq!(plan(&[group(&history, 0.5, 1)], (0, 0), &cost)[0] < 5, true);
     }
 
     #[test]
