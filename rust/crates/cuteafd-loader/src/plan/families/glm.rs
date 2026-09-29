@@ -16,7 +16,9 @@ pub struct Glm {
     runtime: RuntimeStatus,
 }
 
-pub static GLM_DSA: Glm = Glm { id: "glm_dsa", architecture: "GlmMoeDsaForCausalLM", runtime: RuntimeStatus::Planned };
+/// GLM 5.x: serve-glm / glm-golden on the glm coordinator programs.
+pub static GLM_DSA: Glm =
+    Glm { id: "glm_dsa", architecture: "GlmMoeDsaForCausalLM", runtime: RuntimeStatus::Serving };
 /// GLM 5.3 Flash: serve-glmf / glmf-golden on the glmf coordinator programs.
 pub static GLM_NEXT: Glm =
     Glm { id: "glm_next", architecture: "Glm5NextForConditionalGeneration", runtime: RuntimeStatus::Serving };
@@ -46,19 +48,24 @@ impl Family for Glm {
             return false;
         }
         use WeightFormat::*;
-        // glmf: BF16/F32 coordinator tensors (FP8 128x128 blocks dequantized at
-        // load); routed experts from EXL3 K3/K4 packages (exl3-glmf-k34) or the
-        // checkpoint's FP8 (fp8-glmf).
+        // BF16/F32 coordinator tensors (FP8 128x128 blocks with FP32 scales read
+        // as they are); routed experts from EXL3 packages (glm: exl3-glm-k45,
+        // glmf: exl3-glmf-k34) or the checkpoint's FP8 (fp8-glm, fp8-glmf).
+        let exl3_bits = if self.id == "glm_dsa" { 4..=5 } else { 3..=4 };
         match component {
-            Component::RoutedExpert => matches!(format, Exl3 { bits: 3..=4 } | Fp8Block { block: (128, 128) }),
+            Component::RoutedExpert => {
+                matches!(format, Fp8Block { block: (128, 128) })
+                    || matches!(format, Exl3 { bits } if exl3_bits.contains(bits))
+            }
             Component::Speculator | Component::SpeculatorExpert | Component::Vision => false,
             _ => matches!(format, Fp8Block { block: (128, 128) } | Bf16 | F32),
         }
     }
 
     fn optional(&self, component: Component) -> bool {
-        // Text serving runs without the native MTP layer and the vision tower.
-        self.id == "glm_next" && matches!(component, Component::Speculator | Component::SpeculatorExpert | Component::Vision)
+        // Text serving runs without the native MTP layer and the vision tower
+        // (speculation uses a DFlash2 drafter checkpoint).
+        matches!(component, Component::Speculator | Component::SpeculatorExpert | Component::Vision)
     }
     fn detect(&self, checkpoint: &Checkpoint) -> bool {
         checkpoint.architectures().iter().any(|arch| arch == self.architecture)
