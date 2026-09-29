@@ -87,12 +87,15 @@ struct Policy {
     fixed: Option<usize>,
 }
 
-/// Verify-step ms by rows for MiMo V2.6 Pro, RTX PRO 6000 + six Sparks (TP6
-/// MXFP4): an estimate from the coordinator's measured decode (21.4 ms at one
-/// row with FP8 qkv, +0.6 ms per row) and GB10 weight bandwidth for the
-/// distinct experts a step reads; serving rescales it by what it observes.
-const PRO_TP6_STEP_MS: [(usize, f64); 8] = [(1, 50.0), (2, 60.0), (4, 75.0), (8, 100.0), (16, 140.0), (24, 170.0),
-    (32, 200.0), (64, 300.0)];
+/// Verify-step ms by rows for MiMo V2.6 Pro, RTX PRO 6000 (GPU0, 325 W) + six
+/// Sparks (TP6 MXFP4, FP8 wire rows): teacher-forced decode steps of one
+/// sequence (`mimo-golden --timing --prefill 1000 --step-rows N`, 571 rows).
+/// The coordinator alone (`--skip-experts`) takes 18.2 / 19.2 / 23.3 / 33.8 /
+/// 37.2 ms at 1 / 4 / 16 / 24 / 32 rows (E4M3 decode weights up to 32 rows)
+/// and 56.7 ms at 48; the rest is the Spark exchange. Serving rescales it by
+/// what it observes.
+const PRO_TP6_STEP_MS: [(usize, f64); 9] = [(1, 31.6), (2, 39.5), (4, 54.1), (8, 77.1), (16, 114.4), (24, 166.7),
+    (32, 197.8), (48, 258.3), (64, 304.4)];
 
 fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: tokio::sync::oneshot::Sender<Result<()>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
