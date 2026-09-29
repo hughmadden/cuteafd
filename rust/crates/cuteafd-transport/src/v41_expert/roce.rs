@@ -4,7 +4,8 @@ use super::V41BackboneRequest;
 use super::{V41SparkTopology, V41Tp4ChunkReceiver, V41_NATIVE_GROUP_REQUEST_FLAG};
 use crate::verbs::LocalTp4Client;
 use crate::{
-    ExpertProtocolV2Request, ExpertProtocolV2RowDescriptor, ExpertV2SourceKind, TcpTransportConfig,
+    DeviceLanding, ExpertProtocolV2Request, ExpertProtocolV2RowDescriptor, ExpertV2SourceKind,
+    TcpTransportConfig, VerbsHostProtocolV2ResponsePayload,
 };
 use anyhow::{ensure, Result};
 use std::net::SocketAddr;
@@ -38,6 +39,14 @@ pub struct V41Tp4Roce {
 pub struct V41Tp4RoceWave {
     receiver: V41Tp4ChunkReceiver,
     poll_quantum: std::time::Duration,
+}
+
+/// How a received wave's rank planes arrived.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct V41WaveReceipt {
+    /// Bit r: rank r's whole plane landed in its device range (GPU landing);
+    /// the sink saw none of its rows. Other ranks' rows all went to the sink.
+    pub landed: u8,
 }
 
 impl V41Tp4Roce {
@@ -153,6 +162,38 @@ impl V41Tp4Roce {
         self.clients.reset();
     }
 
+    /// Receive each rank's response payloads straight into its device range
+    /// (`planes[rank]`, registered with the NIC over dma-buf) from the next
+    /// connection on; `None` returns to pinned host receives. A rank whose
+    /// registration fails keeps host receives; [`V41WaveReceipt`] says which
+    /// ranks landed. Only waves received with [`Self::receive_wave`] or
+    /// [`Self::receive_wave_owned`] accept landed planes.
+    ///
+    /// # Safety
+    /// Every range must stay allocated until this transport is dropped or its
+    /// landing is replaced, and hold a whole wave (`capacity` rows). A wave's
+    /// planes are written from its dispatch until its receive returns; the
+    /// caller must not read them before that, and must finish every read
+    /// (including queued GPU work) before dispatching the next wave.
+    pub unsafe fn set_gpu_landing(&mut self, planes: Option<Vec<DeviceLanding>>) -> Result<()> {
+        let world = self.world_size();
+        let landing = match planes {
+            Some(planes) => {
+                ensure!(planes.len() == world, "GPU landing needs one device range per rank");
+                planes.into_iter().map(Some).collect()
+            }
+            None => vec![None; world],
+        };
+        self.wave_open = false;
+        self.clients.set_landing(landing)
+    }
+
+    /// Ranks whose current connection lands payloads in device memory
+    /// (connections open on the first dispatch after a reset).
+    pub fn gpu_landing_ranks(&self) -> Vec<bool> {
+        self.clients.landing_ranks()
+    }
+
     /// Send the same canonical request to all ranks and accept every route row.
     /// The synchronous sink must consume/copy its frame slice before returning.
     /// It runs on the polling thread, allowing CUDA owners to stay thread-local.
@@ -195,13 +236,23 @@ impl V41Tp4Roce {
     }
 
     /// Accepts every row of `wave`, which this transport dispatched; the sink
-    /// contract is [`V41Tp4RocePending::receive`]'s.
-    pub async fn receive_wave<F>(&mut self, mut wave: V41Tp4RoceWave, mut sink: F) -> Result<()>
+    /// contract is [`V41Tp4RocePending::receive`]'s. Ranks that landed in
+    /// device memory ([`Self::set_gpu_landing`]) bypass the sink.
+    pub async fn receive_wave<F>(&mut self, wave: V41Tp4RoceWave, mut sink: F) -> Result<V41WaveReceipt>
     where
         F: FnMut(usize, u32, &[u8]) -> Result<()>,
     {
-        let result = drain(&mut self.clients, &mut wave.receiver, wave.poll_quantum,
-            |rank, start, payload| sink(rank, start, payload.as_ref())).await;
+        self.receive_wave_owned(wave, |rank, start, payload| sink(rank, start, payload.as_ref())).await
+    }
+
+    /// [`Self::receive_wave`] handing the sink each payload's owner, as
+    /// [`V41Tp4RocePending::receive_owned`] does: a retained receive slot must
+    /// be released before this transport's next dispatch.
+    pub async fn receive_wave_owned<F>(&mut self, mut wave: V41Tp4RoceWave, sink: F) -> Result<V41WaveReceipt>
+    where
+        F: FnMut(usize, u32, VerbsHostProtocolV2ResponsePayload) -> Result<()>,
+    {
+        let result = drain(&mut self.clients, &mut wave.receiver, wave.poll_quantum, sink).await;
         if result.is_err() {
             self.reset_connections();
         }
@@ -322,10 +373,11 @@ async fn drain<F>(
     receiver: &mut V41Tp4ChunkReceiver,
     poll_quantum: std::time::Duration,
     mut sink: F,
-) -> Result<()>
+) -> Result<V41WaveReceipt>
 where
     F: FnMut(usize, u32, crate::VerbsHostProtocolV2ResponsePayload) -> Result<()>,
 {
+    let mut receipt = V41WaveReceipt::default();
     // Give the other execution lane its first opportunity as soon as this
     // wave must wait. A 250us initial spin can consume an entire small-row
     // FFN and serialize two otherwise independent decode stacks. Subsequent
@@ -336,6 +388,12 @@ where
     let mut first_wait = true;
     loop {
         if clients.poll(|chunk| {
+            if chunk.landed {
+                let rank = receiver.push_landed(&chunk)?;
+                ensure!(rank == chunk.stream_id, "native executor identity does not match its RoCE peer");
+                receipt.landed |= 1 << rank;
+                return Ok(());
+            }
             let mut location = None;
             receiver.push_rdma(&chunk, |rank, start, _bytes| {
                 ensure!(
@@ -362,7 +420,7 @@ where
         receiver.complete(),
         "native TP RoCE response coverage is incomplete"
     );
-    Ok(())
+    Ok(receipt)
 }
 
 impl Drop for V41Tp4RocePending<'_, '_> {
@@ -612,6 +670,51 @@ mod tests {
     }
 
     #[test]
+    fn gpu_landed_headers_complete_whole_rank_planes_only() -> Result<()> {
+        let request = super::super::tests::request(2);
+        let frame = request.encode()?;
+        let native = V41BackboneRequest::parse(&frame, 2)?;
+        let mut receiver = V41Tp4ChunkReceiver::new(&native, [1, 2, 3, 4], 200_000)?;
+        let plane = vec![7u8; 2 * super::super::V41_PARTIAL_ROW_BYTES as usize];
+        let header_len = crate::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
+        let landed = |executor: u64| -> Result<VerbsHostProtocolV2ResponseChunk> {
+            let encoded = native.response(executor, &plane)?.to_owned()?.encode()?;
+            let header = crate::ExpertProtocolV2ResponseView::parse_landed_header(&encoded[..header_len])?;
+            Ok(VerbsHostProtocolV2ResponseChunk {
+                stream_id: executor as usize - 1,
+                header,
+                row_indices: None,
+                partial_output_payload: VerbsHostProtocolV2ResponsePayload::from_owned(Vec::new()),
+                wire_bytes: encoded.len(),
+                landed: true,
+            })
+        };
+        // A row-indexed (chunked) frame cannot land: its indices would be
+        // scattered into device memory ahead of the rows.
+        let mut indices = [0];
+        let chunked = native.response_chunk(1, 0, &plane[..plane.len() / 2], &mut indices, 200_000)?
+            .to_owned()?.encode()?;
+        assert!(crate::ExpertProtocolV2ResponseView::parse_landed_header(&chunked[..header_len]).is_err());
+        // A header whose payload extent disagrees with its rows is rejected.
+        let mut bad = native.response(1, &plane)?.to_owned()?.encode()?;
+        bad[44..52].copy_from_slice(&1u64.to_le_bytes());
+        assert!(crate::ExpertProtocolV2ResponseView::parse_landed_header(&bad[..header_len]).is_err());
+        for executor in [3, 1, 4, 2] {
+            let chunk = landed(executor)?;
+            assert!(receiver.push_rdma(&chunk, |_, _, _| panic!("landed rows reached the sink")).is_err());
+            assert_eq!(receiver.push_landed(&chunk)?, executor as usize - 1);
+            assert!(receiver.push_landed(&chunk).is_err(), "a rank lands once per wave");
+        }
+        assert!(receiver.complete());
+        // A host chunk is not a landed one.
+        let mut host = landed(1)?;
+        host.landed = false;
+        let mut fresh = V41Tp4ChunkReceiver::new(&native, [1, 2, 3, 4], 200_000)?;
+        assert!(fresh.push_landed(&host).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn rdma_chunks_preserve_rank_rows_and_reject_stale_or_reordered_data() -> Result<()> {
         let request = super::super::tests::request(2);
         let frame = request.encode()?;
@@ -633,6 +736,7 @@ mod tests {
                         bytes.clone(),
                     ),
                     wire_bytes,
+                    landed: false,
                 };
                 chunk.header.request_id += 1;
                 assert!(receiver

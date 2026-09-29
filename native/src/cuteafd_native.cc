@@ -13,12 +13,14 @@
 #include <vector>
 
 #if CUTEAFD_NATIVE_ENABLE_CUDA
+#include <cuda.h>
 #include <cuda_runtime_api.h>
 #endif
 
 #if CUTEAFD_NATIVE_ENABLE_RDMA
 #include <infiniband/verbs.h>
 #include <poll.h>
+#include <unistd.h>
 #endif
 
 #if CUTEAFD_NATIVE_ENABLE_NCCL
@@ -439,6 +441,12 @@ struct CuteafdRdmaRcEndpointHandle {
   size_t send_registered_span_bytes = 0;
   size_t recv_registered_span_bytes = 0;
   uint64_t host_buffer_flags = CUTEAFD_HOST_BUFFER_FLAG_NONE;
+  // GPU landing: receives scatter the first `landing_header_bytes` into the
+  // host slot and the rest into this dma-buf registered device range.
+  ibv_mr* landing_mr = nullptr;
+  unsigned char* landing_ptr = nullptr;
+  size_t landing_bytes = 0;
+  size_t landing_header_bytes = 0;
   uint32_t pending_send_completions = 0;
   uint32_t pending_recv_completions = 0;
   std::chrono::steady_clock::time_point busy_poll_until = {};
@@ -480,6 +488,9 @@ void destroy_rdma_rc_endpoint(CuteafdRdmaRcEndpointHandle* endpoint) {
   }
   if (endpoint->recv_mr != nullptr) {
     ibv_dereg_mr(endpoint->recv_mr);
+  }
+  if (endpoint->landing_mr != nullptr) {
+    ibv_dereg_mr(endpoint->landing_mr);
   }
   if (endpoint->send_mr != nullptr) {
     ibv_dereg_mr(endpoint->send_mr);
@@ -3361,14 +3372,22 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv_at(
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
                 "RDMA RC endpoint recv slot exceeds registered span");
   }
-  ibv_sge recv_sge = {};
-  recv_sge.addr = reinterpret_cast<uintptr_t>(endpoint->recv_buffer + offset_bytes);
-  recv_sge.length = static_cast<uint32_t>(bytes);
-  recv_sge.lkey = endpoint->recv_mr->lkey;
+  ibv_sge recv_sge[2] = {};
+  recv_sge[0].addr = reinterpret_cast<uintptr_t>(endpoint->recv_buffer + offset_bytes);
+  recv_sge[0].length = static_cast<uint32_t>(bytes);
+  recv_sge[0].lkey = endpoint->recv_mr->lkey;
   ibv_recv_wr recv_wr = {};
   recv_wr.wr_id = wr_id;
-  recv_wr.sg_list = &recv_sge;
+  recv_wr.sg_list = recv_sge;
   recv_wr.num_sge = 1;
+  if (endpoint->landing_mr != nullptr) {
+    // Header to the host slot, payload straight into device memory.
+    recv_sge[0].length = static_cast<uint32_t>(std::min(bytes, endpoint->landing_header_bytes));
+    recv_sge[1].addr = reinterpret_cast<uintptr_t>(endpoint->landing_ptr);
+    recv_sge[1].length = static_cast<uint32_t>(endpoint->landing_bytes);
+    recv_sge[1].lkey = endpoint->landing_mr->lkey;
+    recv_wr.num_sge = 2;
+  }
   ibv_recv_wr* bad_recv = nullptr;
   if (ibv_post_recv(endpoint->qp, &recv_wr, &bad_recv) != 0) {
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "ibv_post_recv failed for RC endpoint");
@@ -3380,6 +3399,299 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv_at(
   (void)wr_id;
   return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
               "RDMA RC endpoint recv requires CUTEAFD_ENABLE_RDMA=ON");
+#endif
+}
+
+#if CUTEAFD_NATIVE_ENABLE_RDMA && CUTEAFD_NATIVE_ENABLE_CUDA
+namespace {
+// Registers device memory with the NIC through a dma-buf export of its whole
+// allocation (no nvidia-peermem needed); the MR keeps the export alive.
+cuteafd_status_t register_device_dmabuf_current(ibv_pd* pd, void* ptr, size_t bytes, ibv_mr** out);
+
+// The export needs the owning device's context current; sessions may connect
+// on a thread (a prefill lane) that never selected it.
+cuteafd_status_t register_device_dmabuf(ibv_pd* pd, void* ptr, size_t bytes, ibv_mr** out) {
+  int ordinal = -1;
+  if (cuPointerGetAttribute(&ordinal, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+                            reinterpret_cast<CUdeviceptr>(ptr)) != CUDA_SUCCESS || ordinal < 0) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "GPU landing range is not device memory");
+  }
+  int previous = -1;
+  if (cudaGetDevice(&previous) != cudaSuccess) {
+    previous = -1;
+  }
+  if (ordinal != previous && cudaSetDevice(ordinal) != cudaSuccess) {
+    return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "cannot select the GPU landing range's device");
+  }
+  const cuteafd_status_t status = register_device_dmabuf_current(pd, ptr, bytes, out);
+  const std::string message = g_last_error;
+  if (ordinal != previous && previous >= 0) {
+    cudaSetDevice(previous);
+  }
+  return status == CUTEAFD_STATUS_OK ? ok() : fail(status, message);
+}
+
+cuteafd_status_t register_device_dmabuf_current(ibv_pd* pd, void* ptr, size_t bytes, ibv_mr** out) {
+  CUdeviceptr base = 0;
+  size_t size = 0;
+  CUresult result = cuMemGetAddressRange(&base, &size, reinterpret_cast<CUdeviceptr>(ptr));
+  if (result != CUDA_SUCCESS) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                "cuMemGetAddressRange failed for the GPU landing range (" +
+                    std::to_string(static_cast<int>(result)) + ")");
+  }
+  const uint64_t offset = reinterpret_cast<uint64_t>(ptr) - static_cast<uint64_t>(base);
+  if (offset > size || bytes > size - offset) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "GPU landing range exceeds its allocation");
+  }
+  int fd = -1;
+  result = cuMemGetHandleForAddressRange(&fd, base, size, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+  if (result != CUDA_SUCCESS || fd < 0) {
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
+                "cuMemGetHandleForAddressRange(DMA_BUF_FD) failed (" +
+                    std::to_string(static_cast<int>(result)) + ")");
+  }
+  ibv_mr* mr = ibv_reg_dmabuf_mr(pd, offset, bytes, reinterpret_cast<uint64_t>(ptr), fd,
+                                 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_RELAXED_ORDERING);
+  const int saved_errno = errno;
+  close(fd);
+  if (mr == nullptr) {
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
+                std::string("ibv_reg_dmabuf_mr failed: ") + std::strerror(saved_errno));
+  }
+  *out = mr;
+  return ok();
+}
+}  // namespace
+#endif
+
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_set_recv_landing(
+    void* handle, void* device_ptr, size_t bytes, size_t header_bytes) {
+  if (handle == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint handle is null");
+  }
+#if CUTEAFD_NATIVE_ENABLE_RDMA && CUTEAFD_NATIVE_ENABLE_CUDA
+  auto* endpoint = static_cast<CuteafdRdmaRcEndpointHandle*>(handle);
+  if (endpoint->landing_mr != nullptr) {
+    ibv_dereg_mr(endpoint->landing_mr);
+    endpoint->landing_mr = nullptr;
+    endpoint->landing_ptr = nullptr;
+    endpoint->landing_bytes = 0;
+    endpoint->landing_header_bytes = 0;
+  }
+  if (device_ptr == nullptr || bytes == 0) {
+    return ok();
+  }
+  if (bytes > std::numeric_limits<uint32_t>::max() || header_bytes == 0 ||
+      header_bytes > endpoint->recv_frame_bytes) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "GPU landing extent is invalid");
+  }
+  ibv_mr* mr = nullptr;
+  const cuteafd_status_t status = register_device_dmabuf(endpoint->pd, device_ptr, bytes, &mr);
+  if (status != CUTEAFD_STATUS_OK) {
+    return status;
+  }
+  endpoint->landing_mr = mr;
+  endpoint->landing_ptr = static_cast<unsigned char*>(device_ptr);
+  endpoint->landing_bytes = bytes;
+  endpoint->landing_header_bytes = header_bytes;
+  return ok();
+#else
+  (void)device_ptr;
+  (void)bytes;
+  (void)header_bytes;
+  return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
+              "GPU landing requires CUTEAFD_ENABLE_RDMA=ON and CUDA");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_rdma_gpu_landing_probe(
+    const char* device_name, uint32_t port_num, size_t bytes, uint32_t iterations,
+    cuteafd_rdma_gpu_landing_probe_t* out) {
+  if (out == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "GPU landing probe output is null");
+  }
+  std::memset(out, 0, sizeof(*out));
+  out->cuda_device = -1;
+  out->writes_ordering = -1;
+#if CUTEAFD_NATIVE_ENABLE_RDMA && CUTEAFD_NATIVE_ENABLE_CUDA
+  auto finish = [&](cuteafd_status_t status, const std::string& message) {
+    set_fixed_string(out->status, sizeof(out->status), message.c_str());
+    return status == CUTEAFD_STATUS_OK ? ok() : fail(status, message);
+  };
+  int cuda_device = 0;
+  if (cudaGetDevice(&cuda_device) != cudaSuccess || cudaFree(nullptr) != cudaSuccess) {
+    return finish(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "no CUDA device for the GPU landing probe");
+  }
+  out->cuda_device = cuda_device;
+  CUdevice dev = 0;
+  if (cuDeviceGet(&dev, cuda_device) == CUDA_SUCCESS) {
+    cuDeviceGetAttribute(&out->dma_buf_supported, CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED, dev);
+    cuDeviceGetAttribute(&out->gpudirect_rdma_supported,
+                         CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED, dev);
+    cuDeviceGetAttribute(&out->writes_ordering,
+                         CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WRITES_ORDERING, dev);
+  }
+  if (!out->dma_buf_supported) {
+    return finish(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "CUDA reports no dma-buf support");
+  }
+  if (port_num == 0 || port_num > 255 || bytes == 0 || bytes > (size_t{1} << 30)) {
+    return finish(CUTEAFD_STATUS_INVALID_ARGUMENT, "GPU landing probe arguments are invalid");
+  }
+  constexpr size_t kHeader = 96;
+  const size_t frame = kHeader + bytes;
+  int device_count = 0;
+  ibv_device** devices = ibv_get_device_list(&device_count);
+  ibv_device* device = nullptr;
+  for (int index = 0; devices != nullptr && index < device_count; ++index) {
+    const char* name = ibv_get_device_name(devices[index]);
+    if (device_name == nullptr || device_name[0] == '\0' ||
+        (name != nullptr && std::strcmp(name, device_name) == 0)) {
+      device = devices[index];
+      break;
+    }
+  }
+  if (device == nullptr) {
+    if (devices != nullptr) {
+      ibv_free_device_list(devices);
+    }
+    return finish(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "no RDMA device for the GPU landing probe");
+  }
+  set_fixed_string(out->device_name, sizeof(out->device_name), ibv_get_device_name(device));
+  ibv_context* context = ibv_open_device(device);
+  ibv_free_device_list(devices);
+  ibv_pd* pd = nullptr;
+  ibv_cq* cq = nullptr;
+  ibv_qp* qps[2] = {};
+  ibv_mr *send_mr = nullptr, *recv_mr = nullptr, *gpu_mr = nullptr;
+  unsigned char *send = nullptr, *recv = nullptr;
+  void* gpu = nullptr;
+  auto cleanup = [&]() {
+    for (ibv_qp* qp : qps) {
+      if (qp != nullptr) ibv_destroy_qp(qp);
+    }
+    for (ibv_mr* mr : {send_mr, recv_mr, gpu_mr}) {
+      if (mr != nullptr) ibv_dereg_mr(mr);
+    }
+    if (cq != nullptr) ibv_destroy_cq(cq);
+    if (pd != nullptr) ibv_dealloc_pd(pd);
+    if (context != nullptr) ibv_close_device(context);
+    if (send != nullptr) cudaFreeHost(send);
+    if (recv != nullptr) cudaFreeHost(recv);
+    if (gpu != nullptr) cudaFree(gpu);
+  };
+  auto bail = [&](cuteafd_status_t status, const std::string& message) {
+    cleanup();
+    return finish(status, message);
+  };
+  ibv_port_attr port_attr = {};
+  if (context == nullptr || ibv_query_port(context, static_cast<uint8_t>(port_num), &port_attr) != 0 ||
+      (pd = ibv_alloc_pd(context)) == nullptr ||
+      (cq = ibv_create_cq(context, 16, nullptr, nullptr, 0)) == nullptr) {
+    return bail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "RDMA device setup failed for the landing probe");
+  }
+  if (cudaMalloc(&gpu, bytes) != cudaSuccess ||
+      cudaHostAlloc(reinterpret_cast<void**>(&send), frame, cudaHostAllocPortable) != cudaSuccess ||
+      cudaHostAlloc(reinterpret_cast<void**>(&recv), frame, cudaHostAllocPortable) != cudaSuccess) {
+    return bail(CUTEAFD_STATUS_ALLOCATION_FAILED, "GPU landing probe allocation failed");
+  }
+  const cuteafd_status_t registered = register_device_dmabuf(pd, gpu, bytes, &gpu_mr);
+  if (registered != CUTEAFD_STATUS_OK) {
+    const std::string message = g_last_error;
+    return bail(registered, message);
+  }
+  out->registered = 1;
+  for (size_t index = 0; index < frame; ++index) {
+    send[index] = static_cast<unsigned char>(index * 131 + 7);
+  }
+  send_mr = ibv_reg_mr(pd, send, frame, IBV_ACCESS_LOCAL_WRITE);
+  recv_mr = ibv_reg_mr(pd, recv, frame, IBV_ACCESS_LOCAL_WRITE);
+  ibv_qp_init_attr qp_attr = {};
+  qp_attr.send_cq = cq;
+  qp_attr.recv_cq = cq;
+  qp_attr.qp_type = IBV_QPT_RC;
+  qp_attr.cap.max_send_wr = 4;
+  qp_attr.cap.max_recv_wr = 4;
+  qp_attr.cap.max_send_sge = 2;
+  qp_attr.cap.max_recv_sge = 2;
+  if (send_mr == nullptr || recv_mr == nullptr ||
+      (qps[0] = ibv_create_qp(pd, &qp_attr)) == nullptr ||
+      (qps[1] = ibv_create_qp(pd, &qp_attr)) == nullptr) {
+    return bail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "GPU landing probe QP setup failed");
+  }
+  ibv_gid gid = {};
+  uint32_t gid_index = 0;
+  if (select_rc_gid(context, port_attr, port_num, &gid, &gid_index) != CUTEAFD_STATUS_OK) {
+    return bail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "GPU landing probe found no GID");
+  }
+  for (int side = 0; side < 2; ++side) {
+    if (modify_rc_qp_to_init(qps[side], port_num) != CUTEAFD_STATUS_OK ||
+        modify_rc_qp_to_rtr(context, qps[side], port_attr, port_num, qps[1 - side]->qp_num, 0,
+                            port_attr.lid, &gid, gid_index) != CUTEAFD_STATUS_OK ||
+        modify_rc_qp_to_rts(qps[side], 0) != CUTEAFD_STATUS_OK) {
+      return bail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "GPU landing probe QP connect failed");
+    }
+  }
+  // One SEND per round, received as [header -> host][payload -> host or GPU].
+  auto round = [&](bool land, double* seconds) -> bool {
+    ibv_sge recv_sge[2] = {};
+    recv_sge[0] = {reinterpret_cast<uint64_t>(recv), static_cast<uint32_t>(kHeader), recv_mr->lkey};
+    recv_sge[1] = land ? ibv_sge{reinterpret_cast<uint64_t>(gpu), static_cast<uint32_t>(bytes), gpu_mr->lkey}
+                       : ibv_sge{reinterpret_cast<uint64_t>(recv + kHeader), static_cast<uint32_t>(bytes),
+                                 recv_mr->lkey};
+    ibv_recv_wr recv_wr = {};
+    recv_wr.sg_list = recv_sge;
+    recv_wr.num_sge = 2;
+    ibv_recv_wr* bad_recv = nullptr;
+    ibv_sge send_sge = {reinterpret_cast<uint64_t>(send), static_cast<uint32_t>(frame), send_mr->lkey};
+    ibv_send_wr send_wr = {};
+    send_wr.sg_list = &send_sge;
+    send_wr.num_sge = 1;
+    send_wr.opcode = IBV_WR_SEND;
+    send_wr.send_flags = IBV_SEND_SIGNALED;
+    ibv_send_wr* bad_send = nullptr;
+    if (ibv_post_recv(qps[1], &recv_wr, &bad_recv) != 0) return false;
+    const auto started = std::chrono::steady_clock::now();
+    if (ibv_post_send(qps[0], &send_wr, &bad_send) != 0) return false;
+    int completions = 0;
+    while (completions < 2) {
+      ibv_wc wc = {};
+      const int polled = ibv_poll_cq(cq, 1, &wc);
+      if (polled < 0 || (polled == 1 && wc.status != IBV_WC_SUCCESS)) return false;
+      completions += polled;
+      if (std::chrono::steady_clock::now() - started > std::chrono::seconds(5)) return false;
+    }
+    *seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    return true;
+  };
+  const uint32_t rounds = std::max<uint32_t>(1, iterations);
+  for (int land = 0; land < 2; ++land) {
+    std::vector<double> times;
+    for (uint32_t index = 0; index <= rounds; ++index) {
+      double seconds = 0.0;
+      if (!round(land != 0, &seconds)) {
+        return bail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "GPU landing probe transfer failed");
+      }
+      if (index > 0) times.push_back(seconds);  // the first round warms up
+    }
+    std::sort(times.begin(), times.end());
+    const double gbps = static_cast<double>(bytes) / times[times.size() / 2] / 1e9;
+    (land ? out->gpu_gbps : out->host_gbps) = gbps;
+  }
+  std::vector<unsigned char> check(bytes);
+  if (cudaMemcpy(check.data(), gpu, bytes, cudaMemcpyDeviceToHost) != cudaSuccess ||
+      std::memcmp(check.data(), send + kHeader, bytes) != 0) {
+    return bail(CUTEAFD_STATUS_INTERNAL_ERROR, "GPU landing probe payload mismatch");
+  }
+  cleanup();
+  return finish(CUTEAFD_STATUS_OK, "dma-buf landing verified");
+#else
+  (void)device_name;
+  (void)port_num;
+  (void)bytes;
+  (void)iterations;
+  set_fixed_string(out->status, sizeof(out->status), "built without RDMA or CUDA");
+  return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "GPU landing requires CUTEAFD_ENABLE_RDMA=ON and CUDA");
 #endif
 }
 
