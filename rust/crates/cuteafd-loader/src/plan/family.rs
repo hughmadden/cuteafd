@@ -41,13 +41,14 @@ pub trait Family: Sync {
     }
 }
 
-static REGISTRY: [&dyn Family; 6] = [
+static REGISTRY: [&dyn Family; 7] = [
     &super::families::deepseek::DEEPSEEK_V41,
     &super::families::deepseek::DEEPSEEK_V4,
     &super::families::glm::GLM_DSA,
     &super::families::glm::GLM_NEXT,
     &super::families::mimo::MIMO_V2,
     &super::families::qwen::QWEN4_EXP,
+    &super::families::dflash::DFLASH2,
 ];
 
 pub fn registry() -> &'static [&'static dyn Family] {

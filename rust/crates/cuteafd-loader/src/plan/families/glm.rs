@@ -72,15 +72,61 @@ impl Family for Glm {
         let mtp = opt_usize_field(text, "num_nextn_predict_layers").unwrap_or(0);
         let mut notes = Vec::new();
         if let Some(hc) = opt_usize_field(text, "hc_mult") {
-            notes.push(format!("mHC width {hc}"));
+            notes.push(format!(
+                "mHC width {hc}, Sinkhorn {} iterations, final collapse {}",
+                opt_usize_field(text, "hc_sinkhorn_iters").unwrap_or(0),
+                if self.id == "glm_next" { "unweighted mean" } else { "hc_head" },
+            ));
         }
+        let rope = opt_usize_field(text, "qk_rope_head_dim").unwrap_or(0);
+        let kv_lora = opt_usize_field(text, "kv_lora_rank").unwrap_or(0);
         notes.push(format!(
-            "MLA q_lora {} kv_lora {} rope {}",
+            "MLA q_lora {} kv_lora {kv_lora} rope {rope}, qk nope {} v {} (absorbed query {}; FP8 latent record \
+             {} B: E4M3 + 4 FP32 group scales{})",
             opt_usize_field(text, "q_lora_rank").unwrap_or(0),
-            opt_usize_field(text, "kv_lora_rank").unwrap_or(0),
-            opt_usize_field(text, "qk_rope_head_dim").unwrap_or(0),
+            opt_usize_field(text, "qk_nope_head_dim").unwrap_or(0),
+            opt_usize_field(text, "v_head_dim").unwrap_or(0),
+            kv_lora + rope,
+            kv_lora + 4 * (kv_lora / 128) + 2 * rope,
+            if rope > 0 { " + BF16 RoPE" } else { ", no RoPE" },
         ));
-        notes.push(format!("DSA index top-k {}", opt_usize_field(text, "index_topk").unwrap_or(0)));
+        let kpool = opt_usize_field(text, "index_kpool").unwrap_or(1);
+        notes.push(format!(
+            "DSA index top-k {}{}",
+            opt_usize_field(text, "index_topk").unwrap_or(0),
+            if kpool > 1 {
+                format!(
+                    " tokens = {} pools of {kpool} (gated softmax pool keys + learned position bias){}; \
+                     dense causal up to {} tokens",
+                    opt_usize_field(text, "index_topk").unwrap_or(0) / kpool,
+                    if text.get("index_kpool_always_select_tail").and_then(Value::as_bool) == Some(true) {
+                        ", plus the open tail pool"
+                    } else {
+                        ""
+                    },
+                    opt_usize_field(text, "index_topk").unwrap_or(0) + kpool - 1,
+                )
+            } else {
+                String::new()
+            },
+        ));
+        if let Some(linear) = text.get("linear_attn_config") {
+            let heads = opt_usize_field(linear, "num_heads").unwrap_or(0);
+            let dim = opt_usize_field(linear, "head_dim").unwrap_or(0);
+            let kda = layer_types.iter().filter(|t| *t == "linear_attention").count();
+            notes.push(format!(
+                "KDA {heads} heads x {dim}, short conv {}, gate lower bound {}; recurrent state {:.1} MiB per \
+                 sequence ({kda} layers x FP32 {heads}x{dim}x{dim}) plus conv state",
+                opt_usize_field(linear, "short_conv_kernel_size").unwrap_or(0),
+                linear.get("gate_lower_bound").and_then(Value::as_f64).unwrap_or(0.0),
+                (kda * heads * dim * dim * 4) as f64 / (1u64 << 20) as f64,
+            ));
+        }
+        if let Some(limit) = text.get("swiglu_limit").and_then(Value::as_f64) {
+            notes.push(format!(
+                "SwiGLU clamp {limit} (gate <= {limit}, |up| <= {limit}) in dense, shared and routed experts"
+            ));
+        }
         Ok(ModelSpec {
             family: self.id,
             architecture: self.architecture.into(),
@@ -161,6 +207,19 @@ impl Family for Glm {
                  sequence/gdn_decode are the starting points. MLA layers use no RoPE (mla_use_nope) and \
                  the indexer compresses keys (index_kpool). State for KDA layers is per-request \
                  recurrent state, not a paged KV cache: add a state pool beside the KV allocator.".to_string(),
+            ),
+            ("glm_next", Component::Indexer) => (
+                "DSA indexer over 4-token key pools".to_string(),
+                "Pool keys are a per-channel softmax over each complete pool of LayerNorm(wk x) weighted by \
+                 index_kpool_compress_gate x + ape; score = sum_h w_h relu(q_h . k_pool) / sqrt(128); top \
+                 index_topk/kpool pools expand to tokens, plus the open tail pool. Up to index_topk + kpool - 1 \
+                 tokens every token is selected, so short contexts are dense causal MLA.".to_string(),
+            ),
+            ("glm_next", Component::RoutedExpert) | ("glm_next", Component::SpeculatorExpert) => (
+                "top-8 of 288 sigmoid routed experts with SwiGLU clamp 10".to_string(),
+                "EXL3 K3/K4 checkpoints: the glm:exl3 recipe at hidden 4096 / inter 2048 / 288 experts with \
+                 the clamp enabled (python/tools/package_v41_exl3_aot.py, exl3_cross_sm121.py for Sparks). \
+                 FP8 checkpoints: the fp8 routed family (native/cmake/fp8_moe.cmake) at this geometry.".to_string(),
             ),
             (_, Component::Attention) | (_, Component::Indexer) => (
                 "MLA with DeepSeek Sparse Attention indexer".to_string(),
