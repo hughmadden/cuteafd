@@ -1185,3 +1185,15 @@ mod legacy_name_tests {
         assert_eq!(value["other"], "ds41rt-free");
     }
 }
+#[cfg(test)]
+mod qwen_naming_tests {
+    use super::*;
+
+    #[test]
+    fn qwen_mtp_experts_live_under_mtp_layers() {
+        let naming = V41Exl3Naming::HfLanguageModelMtp;
+        assert_eq!(naming.projection(false, 47, 511, V41Exl3ProjectionKind::Down),
+            "model.language_model.layers.47.mlp.experts.511.down_proj");
+        assert_eq!(naming.projection(true, 0, 3, V41Exl3ProjectionKind::Gate), "mtp.layers.0.mlp.experts.3.gate_proj");
+    }
+}

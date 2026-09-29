@@ -444,6 +444,7 @@ mod info_tests {
         assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V41), [512, 640, 768, 1152, 2304]);
         assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V4_PRO), [512, 768, 1024, 1536, 3072]);
         assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V4_FLASH), [512, 640, 768, 1024, 2048]);
+        assert_eq!(exl3_shard_widths(ExpertGeometry::QWEN4_EXP), [128, 256, 384, 640]);
     }
 
     #[test]

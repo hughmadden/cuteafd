@@ -6,6 +6,7 @@ import argparse
 import gc
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -244,6 +245,12 @@ def route_block(geometry: str, capacity: int) -> int:
     fragments (b12x 4d7cb455), so they beat 32 from about 2048 rows up. The coordinator's whole-intermediate rtx-tp1 package
     gains the same way (RTX PRO 6000, width 3072: m4096 74 -> 35 ms, m1024 23 -> 16 ms).
     """
+    # Build-time A/B knob: CUTEAFD_EXL3_ROUTE_BLOCKS=CAPACITY=BLOCK[,...].
+    override = dict(item.split('=') for item in os.environ.get('CUTEAFD_EXL3_ROUTE_BLOCKS', '').split(',') if item)
+    if str(capacity) in override:
+        return int(override[str(capacity)])
+    if geometry == 'qwen4':
+        return qwen4_route_block(capacity)
     if geometry in ('glm', 'glmf'):
         return glm_route_block(capacity)
     if geometry != 'dsv4p' or capacity <= 256:
@@ -263,13 +270,23 @@ def glm_route_block(capacity: int) -> int:
     return 8 if capacity <= 256 else 64
 
 
+def qwen4_route_block(capacity: int) -> int:
+    """Qwen 3.8 Flash Next (512 experts, top-10): 10 * capacity routes, capacity / 51
+    rows per expert on average. Coordinator rtx-tp1 package (RTX PRO 6000, width
+    640, random top-10 routes, layer 23, median us): 8-row blocks m1024 2315,
+    m4096 11626; 64: m1024 1401, m4096 3489; 32: m256 1002 (8: 1023), m1024 1168,
+    m4096 3273 (min 3176 vs 3451). m256 with 16 fails the cooperative grid check.
+    """
+    return 8 if capacity <= 80 else 32
+
+
 def token_major_rotation(geometry: str, capacity: int) -> bool:
     """Whether a capacity rotates each token's input once for all of its routes.
 
     Bit-identical to per-route rotation. It pays where the rotation phase is
     large (V4 Pro m2048..4096 prefill); at m1024 and below it is neutral.
     """
-    if geometry in ('glm', 'glmf'):
+    if geometry in ('glm', 'glmf', 'qwen4'):
         # GLM top-8 (rtx-tp1): m1024 3910 -> 3830 us, m4096 11790 -> 11470 us.
         return capacity > 256
     return geometry == 'dsv4p' and capacity > 1024
