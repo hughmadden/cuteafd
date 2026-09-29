@@ -41,7 +41,7 @@ first, last = 0, -1
 if kind in ("glm_moe_dsa", "glm5_next"):
     types = c.get("mlp_layer_types")
     first = types.index("sparse") if types else c.get("first_k_dense_replace", 0)
-elif kind == "mimo_v2_flash":
+elif kind in ("mimo_v2_flash", "mimo_v2"):
     first = c["moe_layer_freq"].index(1)
 if kind in ("glm5_next", "qwen4_exp"):
     last = c["num_hidden_layers"] - 1
@@ -52,9 +52,9 @@ case "$model_type" in
   deepseek_v4) serve=serve-dsv4 ;;
   glm_moe_dsa) serve=serve-glm ;;
   glm5_next) serve=serve-glmf ;;
-  mimo_v2_flash) serve=serve-mimo ;;
+  mimo_v2_flash|mimo_v2) serve=serve-mimo ;;
   qwen4_exp) serve=serve-qwen4 ;;
-  *) echo "run-dsv4.sh serves deepseek_v4, glm_moe_dsa, glm5_next, mimo_v2_flash and qwen4_exp checkpoints, not $model_type" >&2; exit 2 ;;
+  *) echo "run-dsv4.sh serves deepseek_v4, glm_moe_dsa, glm5_next, mimo_v2_flash, mimo_v2 and qwen4_exp checkpoints, not $model_type" >&2; exit 2 ;;
 esac
 layer_args="--first-layer $first_layer"
 [[ "$last_layer" == -1 ]] || layer_args+=" --last-layer $last_layer"
@@ -80,6 +80,12 @@ fi
 # as per-row FP8 (GLMF_KDA_FP8: row128, channel or off) and optionally an FP8
 # LM head (GLMF_FP8_HEAD=on); its MLA pools hold POOL_TOKENS tokens.
 family_args=()
+# serve-mimo on MiMo V2.6 Pro (mimo_v2): decode rows project qkv from the
+# checkpoint's FP8 weight (MIMO_FP8_QKV=off keeps BF16); its experts need six
+# Spark ranks (SPARK_COUNT=6, TP6 MXFP4 slices, ~93 GiB each).
+if [[ $model_type == mimo_v2 && "$(get MIMO_FP8_QKV on)" == on ]]; then
+  family_args+=(--fp8-qkv)
+fi
 if [[ $serve == serve-glmf ]]; then
   fp8_model="$(get GLMF_FP8_MODEL_ID zai-org/GLM-5.3-Flash)"
   if [[ "$fp8_model" != off ]]; then
