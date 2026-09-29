@@ -162,7 +162,6 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """GLM 5.3 Flash programs, same (stem suffix, op, params, thunk) shape as ``programs``.
     mHC is the DeepSeek V4 program set at this model's width and epsilons."""
     from b12x.integration.cuteafd import dsv4_mhc as mhc
-    from b12x.integration.cuteafd import glm_attention as attn
     from b12x.integration.cuteafd import glm_sparse_mla as mla
     from b12x.integration.cuteafd import glmf
 
@@ -178,7 +177,10 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         ("expert_input_quant", "expert_input_quant", {}, lambda: glmf.compile_glmf_expert_input_quant_aot(g)),
         ("index_expand", "index_expand", {}, lambda: glmf.compile_glmf_index_expand_aot(g)),
     ]
+    # Decode programs also take FP8 weights (checkpoint 128x128 blocks, or
+    # per-row scales for the KDA projections) behind an ``fp8_rows`` scalar.
     for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
+        f8 = mode == "decode"
         out += [
             (f"index_producer_m{rows}", "index_producer", {"max_rows": rows},
              lambda r=rows: glmf.compile_glmf_index_producer_aot(g, max_rows=r)),
@@ -186,16 +188,18 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
              lambda m=mode, r=rows: glmf.compile_glmf_index_topk_aot(g, max_rows=r, max_pages=pool_pages, mode=m)),
             (f"mhc_post_pre_m{rows}", "mhc_post_pre", {"max_rows": rows},
              lambda r=rows: mhc.compile_dsv4_mhc_post_pre_aot(mg, max_rows=r)),
-            (f"kda_m{rows}", "kda", {"max_rows": rows}, lambda r=rows: glmf.compile_glmf_kda_aot(g, max_rows=r)),
-            (f"mla_producer_m{rows}", "mla_producer", {"max_rows": rows},
-             lambda r=rows: glmf.compile_glmf_mla_producer_aot(g, max_rows=r)),
-            (f"o_m{rows}", "o", {"max_rows": rows}, lambda r=rows: attn.compile_glm_o_aot(g, max_rows=r)),
+            (f"kda_m{rows}", "kda", {"max_rows": rows, "fp8": f8},
+             lambda r=rows, f=f8: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8=f)),
+            (f"mla_producer_m{rows}", "mla_producer", {"max_rows": rows, "fp8": f8},
+             lambda r=rows, f=f8: glmf.compile_glmf_mla_producer_aot(g, max_rows=r, fp8=f)),
+            (f"o_m{rows}", "o", {"max_rows": rows, "fp8": f8},
+             lambda r=rows, f=f8: glmf.compile_glmf_o_aot(g, max_rows=r, fp8=f)),
             (f"sparse_mla_{mode}_m{rows}", "sparse_mla", {"route": mode, "max_rows": rows},
              lambda m=mode, r=rows: mla.compile_glm_sparse_mla_aot(g, route=m, max_rows=r, name="glmf_sparse_mla")),
         ]
         for inter in (g.moe_inter, g.dense_inter):
-            out.append((f"ffn_i{inter}_m{rows}", "ffn", {"max_rows": rows, "inter": inter},
-                        lambda r=rows, i=inter: glmf.compile_glmf_ffn_aot(g, inter=i, max_rows=r)))
+            out.append((f"ffn_i{inter}_m{rows}", "ffn", {"max_rows": rows, "inter": inter, "fp8": f8},
+                        lambda r=rows, i=inter, f=f8: glmf.compile_glmf_ffn_aot(g, inter=i, max_rows=r, fp8=f)))
     return out
 
 
