@@ -216,6 +216,12 @@ async fn remote_partials(args: &ExpertProbeArgs, rows: usize, hidden: usize, top
 
 fn report(what: &str, exl3: bool, actual: &[f32], expected: &[f32], remote: Duration, oracle_elapsed: Duration)
     -> Result<()> {
+    // Diagnostics: the checked rows (FP32) for cross-format comparisons, e.g.
+    // the same seed through an FP8 and an EXL3 checkpoint.
+    if let Ok(path) = std::env::var("CUTEAFD_PROBE_DUMP") {
+        std::fs::write(&path, actual.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())
+            .with_context(|| format!("writing {path}"))?;
+    }
     let (mut dot, mut na, mut nb, mut diff) = (0f64, 0f64, 0f64, 0f64);
     for (a, e) in actual.iter().zip(expected) {
         let (a, e) = (f64::from(*a), f64::from(*e));
