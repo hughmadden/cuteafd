@@ -1,0 +1,616 @@
+[
+ {
+  "name": "single_user",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2 + 2?"
+    }
+   ]
+  },
+  "expected": {
+   "exl3_k4": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>What is 2 + 2?<|assistant|><think>",
+   "zai": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>What is 2 + 2?<|assistant|><think>"
+  }
+ },
+ {
+  "name": "system_high_effort",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "reasoning_effort": "high"
+  },
+  "expected": {
+   "exl3_k4": "[gMASK]<sop><|system|>Reasoning Effort: High<|system|>You are terse.<|user|>Hi<|assistant|><think>",
+   "zai": "[gMASK]<sop><|system|>Reasoning Effort: High<|system|>You are terse.<|user|>Hi<|assistant|><think>"
+  }
+ },
+ {
+  "name": "low_effort_multi_turn_reasoning",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Pick a number."
+    },
+    {
+     "role": "assistant",
+     "content": " 7 ",
+     "reasoning_content": "Any number works."
+    },
+    {
+     "role": "user",
+     "content": "Another?"
+    }
+   ],
+   "reasoning_effort": "low"
+  },
+  "expected": {
+   "exl3_k4": "[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>Pick a number.<|assistant|><think>Any number works.</think>7<|user|>Another?<|assistant|><think>",
+   "zai": "[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>Pick a number.<|assistant|><think>Any number works.</think>7<|user|>Another?<|assistant|><think>"
+  }
+ },
+ {
+  "name": "clear_thinking_drops_old_reasoning",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "First"
+    },
+    {
+     "role": "assistant",
+     "content": "One",
+     "reasoning_content": "old thought"
+    },
+    {
+     "role": "user",
+     "content": "Second"
+    },
+    {
+     "role": "assistant",
+     "content": "Two",
+     "reasoning_content": "new thought"
+    }
+   ],
+   "clear_thinking": true
+  },
+  "expected": {
+   "exl3_k4": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>First<|assistant|><think></think>One<|user|>Second<|assistant|><think>new thought</think>Two<|assistant|><think>",
+   "zai": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>First<|assistant|><think></think>One<|user|>Second<|assistant|><think>new thought</think>Two<|assistant|><think>"
+  }
+ },
+ {
+  "name": "inline_think_in_content",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>hidden</think>\n\nvisible answer\n"
+    },
+    {
+     "role": "user",
+     "content": "q2"
+    }
+   ]
+  },
+  "expected": {
+   "exl3_k4": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>q<|assistant|><think>hidden</think>visible answer<|user|>q2<|assistant|><think>",
+   "zai": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>q<|assistant|><think>hidden</think>visible answer<|user|>q2<|assistant|><think>"
+  }
+ },
+ {
+  "name": "reasoning_scope_across_assistants",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "assistant",
+     "content": "A",
+     "reasoning_content": "thinking about a"
+    },
+    {
+     "role": "user",
+     "content": "b"
+    },
+    {
+     "role": "assistant",
+     "content": "B"
+    },
+    {
+     "role": "user",
+     "content": "c"
+    }
+   ]
+  },
+  "expected": {
+   "exl3_k4": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>a<|assistant|><think>thinking about a</think>A<|user|>b<|assistant|><think></think>B<|user|>c<|assistant|><think>",
+   "zai": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>a<|assistant|><think>thinking about a</think>A<|user|>b<|assistant|><think></think>B<|user|>c<|assistant|><think>"
+  }
+ },
+ {
+  "name": "text_parts_and_image_reminder",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "system",
+     "content": [
+      {
+       "type": "text",
+       "text": "sys "
+      },
+      {
+       "type": "text",
+       "text": "parts"
+      }
+     ]
+    },
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Look: "
+      },
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "https://example.com/a.png"
+       }
+      },
+      {
+       "type": "text",
+       "text": " then answer."
+      }
+     ]
+    }
+   ]
+  },
+  "expected": {
+   "exl3_k4": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>sys parts<|user|>Look: <reminder>You are unable to process this image because you don't have multi-modal input ability. Try different methods.</reminder> then answer.<|assistant|><think>",
+   "zai": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>sys parts<|user|>Look: <reminder>You are unable to process this image because you don't have multi-modal input ability. Try different methods.</reminder> then answer.<|assistant|><think>"
+  }
+ },
+ {
+  "name": "tools_declared",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Taipei?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city (°C).",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name, e.g. 台北"
+        },
+        "days": {
+         "type": "integer",
+         "minimum": 1,
+         "maximum": 7
+        },
+        "threshold": {
+         "type": "number",
+         "default": 0.5,
+         "exclusiveMinimum": 1e-07
+        },
+        "units": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      },
+      "strict": true
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "refresh"
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "search_docs",
+      "defer_loading": true,
+      "parameters": {
+       "type": "object",
+       "properties": {}
+      }
+     }
+    }
+   ]
+  },
+  "expected": {
+   "exl3_k4": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city (°C).\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. 台北\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 7}, \"threshold\": {\"type\": \"number\", \"default\": 0.5, \"exclusiveMinimum\": 1e-07}, \"units\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"refresh\"}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Weather in Taipei?<|assistant|><think>",
+   "zai": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city (°C).\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. 台北\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 7}, \"threshold\": {\"type\": \"number\", \"default\": 0.5, \"exclusiveMinimum\": 1e-07}, \"units\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"refresh\"}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Weather in Taipei?<|assistant|><think>"
+  }
+ },
+ {
+  "name": "tool_round_trip",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "system",
+     "content": "Use tools when helpful."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Taipei and Oslo, then save it."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "Two lookups.",
+     "tool_calls": [
+      {
+       "id": "call_a",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Taipei",
+         "days": 2,
+         "threshold": 1.0,
+         "units": "c"
+        }
+       }
+      },
+      {
+       "id": "call_b",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Oslo",
+         "days": 1,
+         "threshold": 1e-07
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_b",
+     "content": "{\"temp\": -3}"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_a",
+     "content": "{\"temp\": 31}"
+    },
+    {
+     "role": "assistant",
+     "content": "Saving.",
+     "tool_calls": [
+      {
+       "id": "call_c",
+       "type": "function",
+       "function": {
+        "name": "write_file",
+        "arguments": {
+         "path": "/tmp/w.txt",
+         "text": "Taipei 31 \"hot\"\nOslo -3 ❄",
+         "mode": {
+          "append": false
+         },
+         "tags": [
+          "天气",
+          "weather"
+         ]
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_c",
+     "content": [
+      {
+       "type": "text",
+       "text": "ok"
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "content": "Done: Taipei 31°C, Oslo -3°C.",
+     "reasoning_content": "Report."
+    },
+    {
+     "role": "user",
+     "content": "Thanks, and now Paris?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city (°C).",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name, e.g. 台北"
+        },
+        "days": {
+         "type": "integer",
+         "minimum": 1,
+         "maximum": 7
+        },
+        "threshold": {
+         "type": "number",
+         "default": 0.5,
+         "exclusiveMinimum": 1e-07
+        },
+        "units": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ]
+        }
+       },
+       "required": [
+        "city"
+       ]
+      },
+      "strict": true
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "write_file",
+      "description": "Write \"text\" to a path.\nOverwrites.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "text": {
+         "type": "string"
+        },
+        "mode": {
+         "type": "object",
+         "properties": {
+          "append": {
+           "type": "boolean"
+          }
+         }
+        },
+        "tags": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         }
+        }
+       },
+       "required": [
+        "path",
+        "text"
+       ],
+       "additionalProperties": false
+      }
+     }
+    }
+   ],
+   "reasoning_effort": "high"
+  },
+  "expected": {
+   "exl3_k4": "[gMASK]<sop><|system|>Reasoning Effort: High<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city (°C).\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. 台北\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 7}, \"threshold\": {\"type\": \"number\", \"default\": 0.5, \"exclusiveMinimum\": 1e-07}, \"units\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"write_file\", \"description\": \"Write \\\"text\\\" to a path.\\nOverwrites.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"text\": {\"type\": \"string\"}, \"mode\": {\"type\": \"object\", \"properties\": {\"append\": {\"type\": \"boolean\"}}}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}, \"required\": [\"path\", \"text\"], \"additionalProperties\": false}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>Use tools when helpful.<|user|>Weather in Taipei and Oslo, then save it.<|assistant|><think>Two lookups.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>days</arg_key><arg_value>2</arg_value><arg_key>threshold</arg_key><arg_value>1.0</arg_value><arg_key>units</arg_key><arg_value>c</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value><arg_key>days</arg_key><arg_value>1</arg_value><arg_key>threshold</arg_key><arg_value>1e-07</arg_value></tool_call><|observation|><tool_response>{\"temp\": 31}</tool_response><tool_response>{\"temp\": -3}</tool_response><|assistant|><think></think>Saving.<tool_call>write_file<arg_key>path</arg_key><arg_value>/tmp/w.txt</arg_value><arg_key>text</arg_key><arg_value>Taipei 31 \"hot\"\nOslo -3 ❄</arg_value><arg_key>mode</arg_key><arg_value>{\"append\": false}</arg_value><arg_key>tags</arg_key><arg_value>[\"天气\", \"weather\"]</arg_value></tool_call><|observation|><tool_response>ok</tool_response><|assistant|><think>Report.</think>Done: Taipei 31°C, Oslo -3°C.<|user|>Thanks, and now Paris?<|assistant|><think>",
+   "zai": "[gMASK]<sop><|system|>Reasoning Effort: High<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city (°C).\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. 台北\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 7}, \"threshold\": {\"type\": \"number\", \"default\": 0.5, \"exclusiveMinimum\": 1e-07}, \"units\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"]}}, \"required\": [\"city\"]}}\n{\"name\": \"write_file\", \"description\": \"Write \\\"text\\\" to a path.\\nOverwrites.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"text\": {\"type\": \"string\"}, \"mode\": {\"type\": \"object\", \"properties\": {\"append\": {\"type\": \"boolean\"}}}, \"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}, \"required\": [\"path\", \"text\"], \"additionalProperties\": false}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|system|>Use tools when helpful.<|user|>Weather in Taipei and Oslo, then save it.<|assistant|><think>Two lookups.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>days</arg_key><arg_value>2</arg_value><arg_key>threshold</arg_key><arg_value>1.0</arg_value><arg_key>units</arg_key><arg_value>c</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value><arg_key>days</arg_key><arg_value>1</arg_value><arg_key>threshold</arg_key><arg_value>1e-07</arg_value></tool_call><|observation|><tool_response>{\"temp\": 31}</tool_response><tool_response>{\"temp\": -3}</tool_response><|assistant|><think></think>Saving.<tool_call>write_file<arg_key>path</arg_key><arg_value>/tmp/w.txt</arg_value><arg_key>text</arg_key><arg_value>Taipei 31 \"hot\"\nOslo -3 ❄</arg_value><arg_key>mode</arg_key><arg_value>{\"append\": false}</arg_value><arg_key>tags</arg_key><arg_value>[\"天气\", \"weather\"]</arg_value></tool_call><|observation|><tool_response>ok</tool_response><|assistant|><think>Report.</think>Done: Taipei 31°C, Oslo -3°C.<|user|>Thanks, and now Paris?<|assistant|><think>"
+  }
+ },
+ {
+  "name": "tool_results_unsortable",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Refresh twice."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "r1",
+       "type": "function",
+       "function": {
+        "name": "refresh",
+        "arguments": {}
+       }
+      },
+      {
+       "id": "r2",
+       "type": "function",
+       "function": {
+        "name": "refresh",
+        "arguments": {}
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "r2",
+     "content": "second"
+    },
+    {
+     "role": "tool",
+     "content": "no id"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "refresh"
+     }
+    }
+   ]
+  },
+  "expected": {
+   "exl3_k4": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"refresh\"}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Refresh twice.<|assistant|><think></think><tool_call>refresh</tool_call><tool_call>refresh</tool_call><|observation|><tool_response>second</tool_response><tool_response>no id</tool_response><|assistant|><think>",
+   "zai": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"refresh\"}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Refresh twice.<|assistant|><think></think><tool_call>refresh</tool_call><tool_call>refresh</tool_call><|observation|><tool_response>second</tool_response><tool_response>no id</tool_response><|assistant|><think>"
+  }
+ },
+ {
+  "name": "tool_reference_result",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Find the docs tool."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "t1",
+       "type": "function",
+       "function": {
+        "name": "refresh",
+        "arguments": {}
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "t1",
+     "content": [
+      {
+       "type": "tool_reference",
+       "name": "search_docs"
+      }
+     ]
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "refresh"
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "search_docs",
+      "defer_loading": true,
+      "parameters": {
+       "type": "object",
+       "properties": {}
+      }
+     }
+    }
+   ]
+  },
+  "expected": {
+   "exl3_k4": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"refresh\"}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Find the docs tool.<|assistant|><think></think><tool_call>refresh</tool_call><|observation|><tool_response><tools>\n{\"name\": \"search_docs\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}\n</tools></tool_response><|assistant|><think>",
+   "zai": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"refresh\"}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>Find the docs tool.<|assistant|><think></think><tool_call>refresh</tool_call><|observation|><tool_response><tools>\n{\"name\": \"search_docs\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}\n</tools></tool_response><|assistant|><think>"
+  }
+ },
+ {
+  "name": "numbers_and_escapes",
+  "context": {
+   "add_generation_prompt": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Numbers"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "n1",
+       "type": "function",
+       "function": {
+        "name": "calc",
+        "arguments": {
+         "a": 1e+16,
+         "b": 1.5e-05,
+         "c": 0.0001,
+         "d": -0.0,
+         "e": 123456789.125,
+         "f": 12345678901234567890,
+         "g": null,
+         "h": [
+          1,
+          2.5,
+          "x\ty\u0001 "
+         ],
+         "i": {
+          "k": "💡"
+         }
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "n1",
+     "content": "ok"
+    }
+   ]
+  },
+  "expected": {
+   "exl3_k4": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Numbers<|assistant|><think></think><tool_call>calc<arg_key>a</arg_key><arg_value>1e+16</arg_value><arg_key>b</arg_key><arg_value>1.5e-05</arg_value><arg_key>c</arg_key><arg_value>0.0001</arg_value><arg_key>d</arg_key><arg_value>-0.0</arg_value><arg_key>e</arg_key><arg_value>123456789.125</arg_value><arg_key>f</arg_key><arg_value>12345678901234567890</arg_value><arg_key>g</arg_key><arg_value>null</arg_value><arg_key>h</arg_key><arg_value>[1, 2.5, \"x\\ty\\u0001 \"]</arg_value><arg_key>i</arg_key><arg_value>{\"k\": \"💡\"}</arg_value></tool_call><|observation|><tool_response>ok</tool_response><|assistant|><think>",
+   "zai": "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Numbers<|assistant|><think></think><tool_call>calc<arg_key>a</arg_key><arg_value>1e+16</arg_value><arg_key>b</arg_key><arg_value>1.5e-05</arg_value><arg_key>c</arg_key><arg_value>0.0001</arg_value><arg_key>d</arg_key><arg_value>-0.0</arg_value><arg_key>e</arg_key><arg_value>123456789.125</arg_value><arg_key>f</arg_key><arg_value>12345678901234567890</arg_value><arg_key>g</arg_key><arg_value>null</arg_value><arg_key>h</arg_key><arg_value>[1, 2.5, \"x\\ty\\u0001 \"]</arg_value><arg_key>i</arg_key><arg_value>{\"k\": \"💡\"}</arg_value></tool_call><|observation|><tool_response>ok</tool_response><|assistant|><think>"
+  }
+ }
+]
