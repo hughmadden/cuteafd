@@ -43,6 +43,17 @@ case "$model_type" in
   glm_moe_dsa) serve=serve-glm ;;
   *) echo "run-dsv4.sh serves deepseek_v4 and glm_moe_dsa checkpoints, not $model_type" >&2; exit 2 ;;
 esac
+# DRAFT_MODEL_ID (serve-glm): a DFlash2 drafter checkpoint, e.g. incoai/GLM-5.3-DFlash2.
+draft_args=()
+draft="$(get DRAFT_MODEL_ID)"
+if [[ -n "$draft" ]]; then
+  [[ $serve == serve-glm ]] || { echo "DRAFT_MODEL_ID applies to GLM checkpoints (DeepSeek V4 uses DSPARK=on)" >&2; exit 2; }
+  draft_root="$hub/models--${draft//\//--}"
+  draft_revision="$(get DRAFT_MODEL_REVISION)"
+  [[ -n "$draft_revision" ]] || draft_revision="$(<"$draft_root/refs/main")"
+  [[ -d "$draft_root/snapshots/$draft_revision" ]] || { echo "missing snapshot $draft@$draft_revision" >&2; exit 1; }
+  draft_args=(--draft "/root/.cache/huggingface/hub/models--${draft//\//--}/snapshots/$draft_revision")
+fi
 coordinator_image="$(get COORDINATOR_DOCKER_INFERENCE)"
 spark_image="$(get SPARK_EXPERT_DOCKER_INFERENCE)"
 port="$(get EXPERT_PORT 19441)"
@@ -78,11 +89,11 @@ docker run -d --name cuteafd-coordinator --restart no --gpus "device=$gpu" --net
   "$coordinator_image" cuteafd $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peer_csv" --listen "$addr" \
   --max-sequences "$(get CONCURRENCY 8)" --max-context "$(get MAX_CONTEXT_TOKENS 8192)" \
-  --max-output "$(get MAX_OUTPUT_TOKENS 4096)" $([[ $serve == serve-dsv4 && "$(get DSPARK off)" == on ]] && echo --dspark) >/dev/null
+  --max-output "$(get MAX_OUTPUT_TOKENS 4096)" $([[ $serve == serve-dsv4 && "$(get DSPARK off)" == on ]] && echo --dspark) "${draft_args[@]}" >/dev/null
 url="http://127.0.0.1:${addr##*:}"
 until curl -sf "$url/health" >/dev/null; do
   docker ps -q -f name=cuteafd-coordinator | grep -q . ||
     { echo "coordinator exited:" >&2; docker logs --tail 30 cuteafd-coordinator >&2; exit 1; }
   sleep 2
 done
-echo "DeepSeek V4 API ready at $url/v1/ ($(curl -s "$url/v1/models" | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"][0]["id"])'))"
+echo "API ready at $url/v1/ ($(curl -s "$url/v1/models" | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"][0]["id"])'))"
