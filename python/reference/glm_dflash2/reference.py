@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
-"""DFlash2 drafter for GLM 5.3 (incoai/GLM-5.3-DFlash2) in plain PyTorch.
+"""DFlash2 drafters for GLM 5.3 (incoai/GLM-5.3-DFlash2) and GLM 5.3 Flash
+(incoai/GLM-5.3-Flash-DFlash2) in plain PyTorch.
 
 The oracle the engine's drafter is compared with. Semantics are those of the
 upstream DFlash2DraftModel as glmrt reproduced them bit for bit
 (python/reference/glmrt_reference/{dspark_update,dspark_body,dflash_head}_capture.py
 in ../glmrt-release), written as BF16 torch statements:
 
-  context  fused = RMSNorm(fc(concat(target layer outputs 5,19,33,47,61,75)))
+  context  fused = RMSNorm(fc(concat(target layer outputs, target_layer_ids)))
+           (GLM 5.3 Flash: each output is the BF16 mean of the four mHC
+           streams, the golden's layerNN.bin [T, 4, hidden])
            per draft layer: K = rope(k_norm(k_proj(fused))), V = v_proj(fused)
   block    [anchor, mask x 7] embeddings at positions p..p+7; per layer:
            n = RMSNorm(h); dyn = attention_conv.kernel_projection(n)
            qkv(conv0(n)) -> q/k norm, rope; non-causal attention over the
-           last <= 2048 context entries and the whole block; o_proj;
+           last <= 2048 context entries and the whole block (with
+           --row-window, the Flash default, block row r at p + r sees only
+           context positions q with p + r - q < 2048, upstream's sliding
+           window); o_proj;
            h += conv1(o); n = RMSNorm(h); the MLP likewise with mlp_conv.
            conv_s(x)[r] = base[s,0]*x[r] + dyn[r,s,0]*x[r] + base[s,1]*x[r-1]
            + dyn[r,s,1]*x[r-1] (per 16-channel group, x[-1] = 0 in the block),
@@ -24,7 +30,7 @@ Writes, for every anchor position p in --positions (context = golden taps of
 rows 0..p-1, anchor = tokens[p]):
   drafts.bin    u32 [N, 7]
   features.bin  f32 [N, 7, 4]  margin, best probability, entropy, rank among the 16
-  hidden.bin    bf16 [N, 8, 6144] final-norm output
+  hidden.bin    bf16 [N, 8, hidden] final-norm output
   meta.json
 
   reference.py --draft SNAP --target SNAP --golden DIR --positions 64:1500:16 --out DIR
@@ -96,7 +102,10 @@ class Drafter:
                 self.target_files[shard] = safe_open(str(target / shard), framework="pt", device="cpu")
             return self.target_files[shard].get_tensor(name)
 
-        self.embed = target_tensor("model.embed_tokens.weight")
+        target_cfg = json.loads((target / "config.json").read_text())
+        self.mhc = target_cfg.get("model_type") == "glm5_next"
+        prefix = "model.language_model." if self.mhc else "model."
+        self.embed = target_tensor(prefix + "embed_tokens.weight")
         self.lm_head = target_tensor("lm_head.weight").to(device)
 
     def context(self, taps: torch.Tensor, positions: torch.Tensor) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -110,8 +119,17 @@ class Drafter:
             out.append((rope(rms(k, self.w[p + "k_norm.weight"]), positions, self.theta), v))
         return out
 
-    def body(self, anchor: int, position: int, ctx: list[tuple[torch.Tensor, torch.Tensor]]) -> torch.Tensor:
-        """Final-norm output [block, hidden] of one block at `position`."""
+    def body(self, anchor: int, position: int, ctx: list[tuple[torch.Tensor, torch.Tensor]],
+             row_window: bool = False) -> torch.Tensor:
+        """Final-norm output [block, hidden] of one block at `position` (the
+        context holds positions position - len(ctx) .. position - 1)."""
+        mask = None
+        if row_window:
+            n = ctx[0][0].shape[0]
+            q = torch.arange(position, position + self.block, device=self.device)[:, None]
+            k = torch.cat([torch.arange(position - n, position, device=self.device),
+                           torch.arange(position, position + self.block, device=self.device)])[None]
+            mask = (q - k).abs() < self.window
         tokens = torch.tensor([anchor] + [self.mask] * (self.block - 1))
         h = self.embed[tokens].to(self.device)
         positions = torch.arange(position, position + self.block, device=self.device)
@@ -130,7 +148,8 @@ class Drafter:
             kc, vc = ctx[l]
             keys, values = torch.cat([kc, k]), torch.cat([vc, v])
             attn = F.scaled_dot_product_attention(q.transpose(0, 1)[None], keys.transpose(0, 1)[None],
-                values.transpose(0, 1)[None], is_causal=False, enable_gqa=True, scale=1.0 / math.sqrt(self.head_dim))
+                values.transpose(0, 1)[None], attn_mask=mask, is_causal=False, enable_gqa=True,
+                scale=1.0 / math.sqrt(self.head_dim))
             attn = attn[0].transpose(0, 1).reshape(self.block, -1)
             o = F.linear(attn, self.w[a + "o_proj.weight"])
             h = h + conv(o, dyn, base, 1, self.group)
@@ -192,6 +211,8 @@ def main() -> None:
     parser.add_argument("--positions", required=True, help="anchor positions, e.g. 64:1500:16,1510")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--row-window", type=int, choices=(0, 1), help="per-row sliding window (default: 1 for a "
+                        "glm5_next target, else 0)")
     args = parser.parse_args()
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     drafter = Drafter(args.draft, args.target, args.device)
@@ -200,17 +221,23 @@ def main() -> None:
     taps = []
     for layer in drafter.taps:
         raw = torch.frombuffer(bytearray((args.golden / f"layer{layer:02d}.bin").read_bytes()), dtype=torch.bfloat16)
+        if drafter.mhc:
+            # FP32 sum of the four streams in order, then the division, rounded to BF16.
+            streams = raw.view(-1, 4, hidden_size).float()
+            raw = (((streams[:, 0] + streams[:, 1]) + streams[:, 2]) + streams[:, 3]) / 4
+            raw = raw.to(torch.bfloat16)
         taps.append(raw.view(-1, hidden_size))
     taps = torch.cat(taps, -1).to(args.device)
     positions = parse_positions(args.positions)
     rows = torch.arange(taps.shape[0], device=args.device)
+    row_window = bool(drafter.mhc if args.row_window is None else args.row_window)
     with torch.no_grad():
         ctx = drafter.context(taps, rows)
         drafts, features, hidden = [], [], []
         for p in positions:
             first = max(0, p - drafter.window)
             window = [(k[first:p], v[first:p]) for k, v in ctx]
-            h = drafter.body(int(tokens[p]), p, window)
+            h = drafter.body(int(tokens[p]), p, window, row_window)
             t, f = drafter.select(int(tokens[p]), h)
             drafts.append(t)
             features.append(f)

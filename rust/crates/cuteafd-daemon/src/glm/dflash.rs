@@ -1,12 +1,15 @@
-//! DFlash2 block drafter for GLM 5.3 (incoai/GLM-5.3-DFlash2).
+//! DFlash2 block drafter for GLM 5.3 (incoai/GLM-5.3-DFlash2: six layers,
+//! 64 query heads) and GLM 5.3 Flash (incoai/GLM-5.3-Flash-DFlash2: five
+//! layers, 32 query heads over 8 KV heads).
 //!
-//! Every target step taps the outputs of target layers 5, 19, 33, 47, 61 and
-//! 75 (0-based; the checkpoint's `target_layer_ids` index transformers'
-//! `hidden_states` after the embedding) into [`GlmDrafter::taps`]. Once a
+//! Every target step taps the outputs of the `target_layer_ids` layers
+//! (GLM 5.3: 5, 19, 33, 47, 61, 75; Flash: 5, 14, 24, 33, 42, where the tap is
+//! the mean of the four mHC streams, [`GlmDrafter::tap_streams`]) into
+//! [`GlmDrafter::taps`]. Once a
 //! step's rows are committed, [`GlmDrafter::update`] projects their taps
 //! (`hidden_norm(fc(taps))`) into every draft layer's context K/V, a ring of
 //! the sequence's last 2048 positions. [`GlmDrafter::draft`] then runs the
-//! six Qwen3-style layers (two-tap dynamic convolutions around attention and
+//! Qwen3-style layers (two-tap dynamic convolutions around attention and
 //! MLP) over the block `[anchor, mask x 7]` at the anchor's position,
 //! non-causally against the ring, takes the top 16 of the target head's
 //! logits per drafted row and walks the candidate selector greedily, all on
@@ -77,6 +80,12 @@ pub(crate) struct DflashConfig {
     pub rank: usize,
     pub taps: Vec<usize>,
     pub vocab: usize,
+    /// The sliding window (the ring's length).
+    pub window: usize,
+    /// Mask each block row's context to its own window (upstream's
+    /// `|p - q| < window`); off, every block row sees the last `window`
+    /// context entries (the GLM 5.3 port's measured behavior).
+    pub row_window: bool,
 }
 
 impl DflashConfig {
@@ -84,9 +93,11 @@ impl DflashConfig {
         let raw: RawConfig = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)
             .context("parsing the DFlash2 config.json")?;
         let d = &raw.dflash_config;
-        ensure!(raw.head_dim == 128 && raw.num_attention_heads / raw.num_key_value_heads * d.block_size == 64,
-            "DFlash2 kernels take 128-wide heads and 64 queries per kv head and block (got {} heads, {} kv, block {})",
-            raw.num_attention_heads, raw.num_key_value_heads, d.block_size);
+        ensure!(raw.head_dim == 128 && raw.num_key_value_heads > 0
+            && raw.num_attention_heads % raw.num_key_value_heads == 0
+            && raw.num_attention_heads / raw.num_key_value_heads * d.block_size <= 64,
+            "DFlash2 kernels take 128-wide heads and at most 64 queries per kv head and block \
+             (got {} heads, {} kv, block {})", raw.num_attention_heads, raw.num_key_value_heads, d.block_size);
         ensure!(d.conv_kernel_size == 2 && d.selector_rank == 256 && d.selector_top_k == 16,
             "DFlash2 kernels take two-tap convolutions and a rank-256 top-16 selector");
         ensure!(raw.sliding_window == RING, "DFlash2 window {} (the ring holds {RING})", raw.sliding_window);
@@ -105,6 +116,8 @@ impl DflashConfig {
             rank: d.selector_rank,
             taps: d.target_layer_ids.clone(),
             vocab: raw.vocab_size,
+            window: raw.sliding_window,
+            row_window: false,
         })
     }
 
@@ -264,8 +277,8 @@ impl<'a> GlmDrafter<'a> {
     /// the mask token.
     #[allow(clippy::too_many_arguments)]
     pub fn load(library: &'a NativeLibrary, snapshot: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
-        max_sequences: usize, mask_row: Vec<u8>) -> Result<Self> {
-        let cfg = DflashConfig::read(snapshot)?;
+        max_sequences: usize, mask_row: Vec<u8>, row_window: bool) -> Result<Self> {
+        let cfg = DflashConfig { row_window, ..DflashConfig::read(snapshot)? };
         let path = snapshot.join("model.safetensors");
         let checkpoint = Checkpoint {
             data: file,
@@ -357,6 +370,20 @@ impl<'a> GlmDrafter<'a> {
         unsafe {
             self.library.glm_dflash_tap(hidden.cast::<u8>().add(first * h * 2).cast(), self.taps.buffer.ptr, n, h,
                 self.cfg.taps.len() * h, index * h, self.stream)
+        }
+    }
+
+    /// Taps the mean of the `hc` streams of rows `[first, first + n)` of
+    /// `streams` ([rows, hc, hidden] BF16) into tap rows `0..n` when `layer`
+    /// is tapped (GLM 5.3 Flash: the mHC contraction upstream captures).
+    pub fn tap_streams(&self, layer: usize, streams: *const c_void, hc: usize, first: usize, n: usize) -> Result<()> {
+        let Some(index) = self.tap_index(layer) else { return Ok(()) };
+        let h = self.cfg.hidden;
+        ensure!(n <= TAP_ROWS, "{n} tapped rows exceed {TAP_ROWS}");
+        // SAFETY: `streams` holds first + n rows of hc streams; the tap buffer TAP_ROWS rows.
+        unsafe {
+            self.library.glm_dflash_tap_mean(streams.cast::<u8>().add(first * hc * h * 2).cast(), self.taps.buffer.ptr,
+                n, h, hc, self.cfg.taps.len() * h, index * h, self.stream)
         }
     }
 
@@ -493,7 +520,7 @@ impl<'a> GlmDrafter<'a> {
                 l.glm_dflash_attention(w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr, layer.k_ring.buffer.ptr,
                     layer.v_ring.buffer.ptr, w.tables.buffer.ptr, at(&w.tables, s_count * 4), at(&w.tables, 2 * s_count * 4),
                     w.attn.buffer.ptr, w.attention_workspace.buffer.ptr, s_count, block, c.heads, c.kv_heads, RING,
-                    RING + block, 1.0 / (c.head_dim as f32).sqrt(), s)?;
+                    RING + block, if c.row_window { c.window } else { 0 }, 1.0 / (c.head_dim as f32).sqrt(), s)?;
                 l.linear_bf16(w.attn.buffer.ptr, layer.o.buffer.ptr, w.delta.buffer.ptr, rows, attention_width, h, s)?;
                 l.glm_dflash_conv_residual_norm(w.delta.buffer.ptr, w.dynamic.buffer.ptr, layer.attn_base.buffer.ptr,
                     w.h.buffer.ptr, layer.post_norm.buffer.ptr, w.h.buffer.ptr, w.n.buffer.ptr, rows, block, h, group, eps, s)?;

@@ -2,7 +2,8 @@
 //! the CPU oracle and the `--local` coordinator run.
 //!
 //! The oracle is the checkpoint math at full width: weights `bf16(w * s)`,
-//! BF16 gate and up, `bf16(bf16(silu(g)) * u)`, BF16 down output, FP32 route
+//! BF16 gate and up (clamped at the config's `swiglu_limit` when it has one:
+//! gate from above, up both ways), `bf16(bf16(silu(g)) * u)`, BF16 down output, FP32 route
 //! sum. Above 256 rows it checks a deterministic sample of 256 rows (every
 //! output row depends only on its own input row and routes); experts run on
 //! every core.
@@ -57,8 +58,16 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Expected BF16-valued rows `sampled` (FP32 `[sampled.len(), H]`).
+/// The checkpoint config's SwiGLU clamp (`swiglu_limit`, top level or
+/// `text_config`), if any.
+pub(super) fn swiglu_limit(snapshot: &std::path::Path) -> Option<f32> {
+    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json")).ok()?).ok()?;
+    let limit = config.get("swiglu_limit").or_else(|| config.get("text_config")?.get("swiglu_limit"))?.as_f64()?;
+    (limit > 0.0).then_some(limit as f32)
+}
+
 pub(super) fn oracle(catalog: &OfficialV41Catalog, layer: usize, input: &[f32], routes: &[ExpertProtocolV2RouteEntry],
-    sampled: &[usize]) -> Result<Vec<f32>> {
+    sampled: &[usize], limit: Option<f32>) -> Result<Vec<f32>> {
     let tensors = catalog.fp8().context("the FP8 oracle needs the checkpoint's FP8 experts")?;
     let shape = *tensors.shape();
     let (hidden, inter) = (shape.hidden, shape.intermediate);
@@ -82,8 +91,12 @@ pub(super) fn oracle(catalog: &OfficialV41Catalog, layer: usize, input: &[f32], 
                 for route in routes {
                     let x = &input[route.row_index as usize * hidden..][..hidden];
                     let act: Vec<f32> = (0..inter).map(|n| {
-                        let gate = bf16(dot(x, &w1[n * hidden..][..hidden]));
-                        let up = bf16(dot(x, &w3[n * hidden..][..hidden]));
+                        let mut gate = bf16(dot(x, &w1[n * hidden..][..hidden]));
+                        let mut up = bf16(dot(x, &w3[n * hidden..][..hidden]));
+                        if let Some(limit) = limit {
+                            gate = gate.min(limit);
+                            up = up.clamp(-limit, limit);
+                        }
                         bf16(bf16(gate / (1.0 + (-gate).exp())) * up)
                     }).collect();
                     let row = &mut out[slot[&(route.row_index as usize)] * hidden..][..hidden];

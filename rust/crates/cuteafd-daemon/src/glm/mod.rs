@@ -127,7 +127,7 @@ impl Opened {
             let file = draft_file.context("drafter prefetch")?.join()
                 .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
             engine.drafter = Some(dflash::GlmDrafter::load(&self.library, snapshot, file, stream, args.draft_sequences,
-                args.draft_sequences, mask)?);
+                args.draft_sequences, mask, false)?);
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash2 drafter resident");
         }
         let mut transport = match args.peers.as_deref() {

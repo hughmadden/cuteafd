@@ -177,6 +177,7 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         ("router_scores", "router_scores", {}, lambda: glmf.compile_glmf_router_scores_aot(g)),
         ("expert_input_quant", "expert_input_quant", {}, lambda: glmf.compile_glmf_expert_input_quant_aot(g)),
         ("index_expand", "index_expand", {}, lambda: glmf.compile_glmf_index_expand_aot(g)),
+        ("kda_commit", "kda_commit", {}, lambda: glmf.compile_glmf_kda_commit_aot(g)),
     ]
     # Decode programs also take FP8 weights (checkpoint 128x128 blocks, or
     # per-row scales for the KDA projections) behind an ``fp8_rows`` scalar.

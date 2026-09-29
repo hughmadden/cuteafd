@@ -10,8 +10,6 @@ use super::engine::{GlmEngine, GlmPlacement, PageAllocator, DECODE_ROWS};
 
 /// Most copy-window draft tokens verified per sequence and step.
 const COPY_DRAFT: usize = 7;
-/// Longest run of steps without a draft step after plans that verified none.
-const MAX_DRAFT_SKIP: usize = 8;
 use super::{embed_rows, open, Opened};
 use anyhow::{Context, Result};
 use cuteafd_api::native_v41::glm::GlmEncoding;
@@ -229,9 +227,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
     let mut cost = StepCost::new(&dflash_policy::K4_TP4_STEP_MS, DECODE_ROWS);
-    // After plans that verify no drafts, skip drafting for a while (doubling
-    // up to MAX_DRAFT_SKIP steps): the draft step costs a verified row's worth.
-    let (mut skip, mut skip_next) = (0usize, 1usize);
+    let mut skip = dflash_policy::DraftSkip::default();
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
     let (hidden, vocab) = (engine.cfg.hidden, engine.cfg.vocab_size);
@@ -334,7 +330,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             .min(a.capacity - a.placement.len - 1)).collect();
         // DFlash2 drafts after every next token, then the policy's counts.
         let drafted: Vec<Option<super::dflash::Draft>> = match drafter {
-            Some(drafter) if skip == 0 && active.iter().any(|a| a.slot.is_some()) => {
+            Some(drafter) if skip.drafts() && active.iter().any(|a| a.slot.is_some()) => {
                 let seqs: Vec<(usize, DraftSeq)> = active.iter().enumerate()
                     .filter_map(|(i, a)| a.slot.map(|slot| (i, DraftSeq { slot, anchor: a.next, position: a.placement.len })))
                     .collect();
@@ -360,47 +356,13 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         // Identical sequences (same tokens at the same position) route alike
         // and draft alike: the policy prices and plans them as one group.
         let key = |a: &Active<'_>| (a.placement.len, a.digest);
-        let planned: Vec<usize> = {
-            let indices: Vec<usize> = (0..active.len()).filter(|&i| drafted[i].is_some()).collect();
-            let mut counts = vec![0; active.len()];
-            if let Some(fixed) = policy.fixed {
-                for &i in &indices {
-                    counts[i] = fixed.min(limits[i]).min(drafted[i].as_ref().map_or(0, |d| d.tokens.len()));
-                }
-            } else if !indices.is_empty() {
-                let mut members: Vec<Vec<usize>> = Vec::new();
-                for &i in &indices {
-                    match members.iter_mut().find(|m| key(&active[m[0]]) == key(&active[i])) {
-                        Some(group) => group.push(i),
-                        None => members.push(vec![i]),
-                    }
-                }
-                let groups: Vec<dflash_policy::Group<'_>> = members.iter().map(|m| dflash_policy::Group {
-                    history: &active[m[0]].drafts,
-                    confidence: active[m[0]].drafts.confidence(&drafted[m[0]].as_ref().unwrap().features),
-                    room: m.iter().map(|&i| limits[i]).min().unwrap_or(0),
-                    members: m.len(),
-                }).collect();
-                let others: Vec<_> = (0..active.len()).filter(|i| drafted[*i].is_none()).map(|i| key(&active[i])).collect();
-                let distinct = others.iter().collect::<std::collections::HashSet<_>>().len();
-                for (m, n) in members.iter().zip(dflash_policy::plan(&groups, (others.len(), distinct), &cost)) {
-                    for &i in m {
-                        counts[i] = n;
-                    }
-                }
-            }
-            counts
-        };
-        if skip > 0 {
-            skip -= 1;
-        } else if drafted.iter().any(Option::is_some) && policy.fixed.is_none() {
-            if planned.iter().all(|&n| n == 0) {
-                skip = skip_next;
-                skip_next = (skip_next * 2).min(MAX_DRAFT_SKIP);
-            } else {
-                skip_next = 1;
-            }
-        }
+        let inputs: Vec<dflash_policy::PlanInput<'_>> = active.iter().enumerate().map(|(i, a)| dflash_policy::PlanInput {
+            key: key(a), history: &a.drafts, features: drafted[i].as_ref().map(|d| d.features.as_slice()),
+            limit: limits[i],
+        }).collect();
+        let planned = dflash_policy::plan_counts(&inputs, policy.fixed, &cost);
+        drop(inputs);
+        skip.after(drafted.iter().any(Option::is_some) && policy.fixed.is_none(), planned.iter().all(|&n| n == 0));
         // Each sequence verifies its next token, then its DFlash2 drafts, or
         // a copy-window draft when it agrees with them and runs longer.
         let mut used_copy = vec![false; active.len()];
