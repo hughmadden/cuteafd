@@ -90,6 +90,10 @@ budget="$(get SPARK_DEVICE_BUDGET_BYTES 107374182400)"
 gpu="$(get COORDINATOR_GPU 0)"
 peers=()
 [[ "$restart" == 0 ]] || "$repo_root/stop.sh" --config "$config" >/dev/null
+# GB10 CUDA allocations cannot reclaim page cache: drop it on the expert hosts first.
+spark_hosts=()
+for ((rank = 0; rank < ranks; rank++)); do spark_hosts+=(--host "$(get "SPARK_${rank}_HOST")"); done
+nest drop-caches "${spark_hosts[@]}" >/dev/null || echo "warning: could not drop Spark page caches" >&2
 for ((rank = 0; rank < ranks; rank++)); do
   host="$(get "SPARK_${rank}_HOST")"
   lane="$(get "SPARK_${rank}_LANE_A")"
