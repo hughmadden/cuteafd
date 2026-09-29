@@ -30,6 +30,12 @@ pub(crate) struct GoldenArgs {
     pub layers: Option<usize>,
     #[arg(long, default_value_t = 32768)]
     pub max_context: usize,
+    /// Prefill only the first N tokens, then feed the rest through decode
+    /// steps of --step-rows rows (teacher-forced), comparing their rows.
+    #[arg(long)]
+    pub prefill: Option<usize>,
+    #[arg(long, default_value_t = 1)]
+    pub step_rows: usize,
     /// Spark expert ranks in TP order (HOST:PORT,...), for MoE layers.
     #[arg(long)]
     pub peers: Option<String>,
@@ -88,13 +94,22 @@ fn golden(args: GoldenArgs) -> Result<()> {
         tokens.len().max(1), pages)?;
     let mut placement = engine::GlmPlacement { pages: (0..pages as i32).collect(), len: 0 };
     let embed = embed_rows(&catalog, &tokens, cfg.hidden)?;
+    let row = cfg.hidden * 2;
+    let prefill = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
     let started = Instant::now();
-    let mut compare = |layer: usize, stream: &[u8]| -> Result<()> {
+    // Rows [first, first + n) of layer `layer`'s golden output.
+    let compare = |layer: usize, first: usize, stream: &[u8], worst: &mut Vec<f64>| -> Result<()> {
         let path = args.golden.join(format!("layer{layer:02}.bin"));
         if let Ok(golden) = std::fs::read(&path) {
-            ensure!(golden.len() == stream.len(), "golden layer {layer} has {} bytes, engine {}", golden.len(), stream.len());
-            let (cosine, rel) = similarity(&bf16s(stream), &bf16s(&golden));
-            println!("layer {layer:2}: cosine {cosine:.6} rel_l2 {rel:.3e}");
+            let golden = &golden[first * row..][..stream.len()];
+            let (cosine, rel) = similarity(&bf16s(stream), &bf16s(golden));
+            if worst.len() <= layer {
+                worst.resize(layer + 1, 1.0);
+            }
+            worst[layer] = worst[layer].min(cosine);
+            if first == 0 {
+                println!("layer {layer:2}: cosine {cosine:.6} rel_l2 {rel:.3e}");
+            }
         }
         Ok(())
     };
@@ -111,13 +126,32 @@ fn golden(args: GoldenArgs) -> Result<()> {
         None => None,
     };
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let experts = transport.as_mut().map(|t| (t, &runtime));
-    let logits = engine.prefill(&mut placement, &embed, experts, Some(&mut compare))?;
-    println!("prefill: {} tokens through {layers} layers in {:.2} s", tokens.len(), started.elapsed().as_secs_f64());
+    let mut worst = Vec::new();
+    let logits = engine.prefill(&mut placement, &embed[..prefill * row], transport.as_mut().map(|t| (t, &runtime)),
+        Some(&mut |layer, stream| compare(layer, 0, stream, &mut worst)))?;
+    let prefill_seconds = started.elapsed().as_secs_f64();
+    let started = Instant::now();
+    let mut decode_worst = Vec::new();
+    let mut position = prefill;
+    while position < tokens.len() {
+        let n = args.step_rows.min(tokens.len() - position);
+        let first = position;
+        engine.verify(&mut [(&mut placement, n)], &embed[position * row..(position + n) * row],
+            transport.as_mut().map(|t| (t, &runtime)),
+            Some(&mut |layer, stream| compare(layer, first, stream, &mut decode_worst)))?;
+        position += n;
+    }
+    if prefill < tokens.len() {
+        println!("decode: {} rows in steps of {} in {:.2} s; worst row-block cosine per layer {:?}", tokens.len() - prefill,
+            args.step_rows, started.elapsed().as_secs_f64(),
+            decode_worst.iter().map(|c| format!("{c:.6}")).collect::<Vec<_>>());
+    }
+    let _ = prefill_seconds;
+    println!("prefill: {prefill} tokens through {layers} layers in {prefill_seconds:.2} s");
     if let Some(logits) = logits {
         let golden: Vec<f32> = std::fs::read(args.golden.join("logits.bin"))?
             .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-        let last = &golden[(tokens.len() - 1) * cfg.vocab_size..][..cfg.vocab_size];
+        let last = &golden[(prefill - 1) * cfg.vocab_size..][..cfg.vocab_size];
         let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i).context("empty");
         let (cosine, _) = similarity(&logits, last);
         println!("last-row logits: argmax engine {} golden {} cosine {cosine:.6}", argmax(&logits)?, argmax(last)?);

@@ -26,6 +26,20 @@ const RECORD_PAGE_BYTES: usize = PAGE_ROWS * 656;
 const INDEX_PAGE_BYTES: usize = 8448;
 /// Most Spark ranks a step's partials come from (the compact reducer's limit).
 const MAX_RANKS: usize = 6;
+/// Rows of the decode-route programs (`_m64`).
+pub(crate) const DECODE_ROWS: usize = 64;
+
+/// Host tables of one step.
+struct StepTables {
+    decode: bool,
+    positions: Vec<i64>,
+    slots: Vec<i64>,
+    /// Prefill: the sequence's pages; decode: one padded row per step row.
+    page_table: Vec<i32>,
+    table_width: usize,
+    table_stride: usize,
+    cache_lengths: Vec<i32>,
+}
 
 /// A sequence's pages (shared by the latent and index caches) and length.
 #[derive(Debug, Clone)]
@@ -87,6 +101,7 @@ pub(crate) struct GlmEngine<'a> {
     index: Vec<Option<Dev<'a>>>,
     cos_sin: Dev<'a>,
     workspace: RefCell<Option<Workspace<'a>>>,
+    decode_workspace: RefCell<Option<Workspace<'a>>>,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -123,7 +138,7 @@ impl<'a> GlmEngine<'a> {
         let cos_sin = DeviceAllocation::new(library, table.len() * 4)?;
         library.copy_h2d(cos_sin.buffer, bytes_of(&table))?;
         Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
-            workspace: RefCell::new(None) })
+            workspace: RefCell::new(None), decode_workspace: RefCell::new(None) })
     }
 
     fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
@@ -143,17 +158,17 @@ impl<'a> GlmEngine<'a> {
         Ok(self.programs.spec(name)?.scratch.get("scratch").copied().unwrap_or(0) as usize)
     }
 
-    fn workspace(&self, t: usize) -> Result<Workspace<'a>> {
+    fn workspace(&self, t: usize, decode: bool) -> Result<Workspace<'a>> {
         let (h, heads) = (self.cfg.hidden, self.cfg.heads);
-        let cap = "m4096";
+        let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
         let mut scratch = 0usize;
         for name in [format!("glm_producer_{cap}"), format!("glm_index_producer_{cap}"),
-            format!("glm_sparse_mla_prefill_{cap}"), format!("glm_o_{cap}"), format!("glm_ffn_i2048_{cap}"),
+            format!("glm_sparse_mla_{mode}_{cap}"), format!("glm_o_{cap}"), format!("glm_ffn_i2048_{cap}"),
             format!("glm_ffn_i12288_{cap}")] {
             scratch = scratch.max(self.scratch(&name)?);
         }
         let head_workspace = self.alloc(VOCABULARY_HEAD_WORKSPACE)?;
-        let topk = self.alloc(self.scratch(&format!("glm_index_topk_prefill_{cap}"))?)?;
+        let topk = self.alloc(self.scratch(&format!("glm_index_topk_{mode}_{cap}"))?)?;
         self.library.cuda_zero_bytes(topk.buffer, topk.buffer.bytes)?;
         let lengths: Vec<i32> = vec![self.cfg.index_topk as i32; t];
         let lengths_dev = self.alloc(t * 4)?;
@@ -172,7 +187,7 @@ impl<'a> GlmEngine<'a> {
             delta: self.alloc(t * h * 2)?,
             positions: self.alloc(t * 8)?,
             slots: self.alloc(t * 8)?,
-            page_table: self.alloc(self.pages * 4)?,
+            page_table: self.alloc(if decode { t * self.pages * 4 } else { self.pages * 4 })?,
             cache_lengths: self.alloc(t * 4)?,
             scratch: self.alloc(scratch)?,
             topk_scratch: topk,
@@ -210,31 +225,78 @@ impl<'a> GlmEngine<'a> {
     /// returns the last row's logits when all layers are resident.
     /// `on_layer` receives each layer's output rows (BF16 [t, hidden]).
     pub fn prefill(&self, placement: &mut GlmPlacement, embed: &[u8],
+        experts: Option<(&mut V41Tp4Roce, &tokio::runtime::Runtime)>,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<Vec<f32>>> {
+        let (t, start) = (embed.len() / (self.cfg.hidden * 2), placement.len);
+        ensure!(t > 0 && t <= self.prefill_rows && start + t <= self.max_context, "prefill of {t} rows at {start}");
+        let used = (start + t).div_ceil(PAGE_ROWS);
+        let tables = StepTables {
+            decode: false,
+            positions: (start..start + t).map(|p| p as i64).collect(),
+            slots: (start..start + t).map(|p| placement.slot(p)).collect::<Result<_>>()?,
+            page_table: placement.pages[..used].to_vec(),
+            table_width: used,
+            table_stride: 0,
+            cache_lengths: (start..start + t).map(|p| (p + 1) as i32).collect(),
+        };
+        let logits = self.step(&tables, embed, 1, experts, on_layer)?;
+        placement.len += t;
+        Ok(logits)
+    }
+
+    /// Appends each sequence's tokens (one for decode, several for a
+    /// speculative verify) at its length in one decode-shaped step; returns
+    /// every row's logits. A caller that rejects a suffix sets `len` back:
+    /// GLM keeps no recurrent state, and rejected records are overwritten.
+    pub fn verify(&self, sequences: &mut [(&mut GlmPlacement, usize)], embed: &[u8],
+        experts: Option<(&mut V41Tp4Roce, &tokio::runtime::Runtime)>,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<Vec<f32>>> {
+        let rows: usize = sequences.iter().map(|(_, n)| n).sum();
+        ensure!(rows > 0 && rows <= DECODE_ROWS && embed.len() == rows * self.cfg.hidden * 2, "decode step of {rows} rows");
+        let stride = sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1);
+        let mut tables = StepTables { decode: true, positions: Vec::new(), slots: Vec::new(), page_table: Vec::new(),
+            table_width: 1, table_stride: stride, cache_lengths: Vec::new() };
+        for (placement, count) in sequences.iter() {
+            for position in placement.len..placement.len + count {
+                ensure!(position < self.max_context, "decode at {position} past the context");
+                tables.positions.push(position as i64);
+                tables.slots.push(placement.slot(position)?);
+                tables.cache_lengths.push((position + 1) as i32);
+                tables.table_width = tables.table_width.max((position + 1).div_ceil(PAGE_ROWS));
+                let mut pages = placement.pages.clone();
+                pages.resize(stride, 0);
+                tables.page_table.extend(pages);
+            }
+        }
+        let logits = self.step(&tables, embed, rows, experts, on_layer)?;
+        for (placement, count) in sequences.iter_mut() {
+            placement.len += *count;
+        }
+        Ok(logits)
+    }
+
+    fn step(&self, tables: &StepTables, embed: &[u8], logit_rows: usize,
         mut experts: Option<(&mut V41Tp4Roce, &tokio::runtime::Runtime)>,
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<Vec<f32>>> {
-        let (h, t, start) = (self.cfg.hidden, embed.len() / (self.cfg.hidden * 2), placement.len);
-        ensure!(t > 0 && t <= self.prefill_rows && start + t <= self.max_context, "prefill of {t} rows at {start}");
-        if self.workspace.borrow().is_none() {
-            *self.workspace.borrow_mut() = Some(self.workspace(self.prefill_rows)?);
+        let (h, t) = (self.cfg.hidden, tables.positions.len());
+        let (slot, capacity) = if tables.decode { (&self.decode_workspace, DECODE_ROWS) } else { (&self.workspace, self.prefill_rows) };
+        if slot.borrow().is_none() {
+            *slot.borrow_mut() = Some(self.workspace(capacity, tables.decode)?);
         }
-        let workspace = self.workspace.borrow();
+        let workspace = slot.borrow();
         let w = workspace.as_ref().context("workspace")?;
-        ensure!(t <= w.rows, "prefill exceeds the workspace");
-        let positions: Vec<i64> = (start..start + t).map(|p| p as i64).collect();
-        let slots = (start..start + t).map(|p| placement.slot(p)).collect::<Result<Vec<_>>>()?;
-        let used = (start + t).div_ceil(PAGE_ROWS);
-        let lengths: Vec<i32> = (start..start + t).map(|p| (p + 1) as i32).collect();
-        self.put(&w.positions, &positions)?;
-        self.put(&w.slots, &slots)?;
-        self.put(&w.page_table, &placement.pages[..used])?;
-        self.put(&w.cache_lengths, &lengths)?;
+        ensure!(t <= w.rows && logit_rows <= t, "step exceeds the workspace");
+        self.put(&w.positions, &tables.positions)?;
+        self.put(&w.slots, &tables.slots)?;
+        self.put(&w.page_table, &tables.page_table)?;
+        self.put(&w.cache_lengths, &tables.cache_lengths)?;
         self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: embed.len(), ..w.h.buffer }, embed)?;
         let rows = Dsv4Scalar::I32(t as i32);
-        let cap = "m4096";
+        let cap = if tables.decode { "m64" } else { "m4096" };
         let layers = &self.weights.layers;
         self.norm(w, &layers[0], "input_norm", 0, rows)?;
         for (index, layer) in layers.iter().enumerate() {
-            self.attention(w, index, layer, rows, cap, used)?;
+            self.attention(w, index, layer, rows, cap, tables)?;
             // h += attention; x = post_attention_layernorm(h)
             self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                 ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
@@ -246,7 +308,7 @@ impl<'a> GlmEngine<'a> {
             } else {
                 let (transport, runtime) = experts.as_mut()
                     .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
-                self.moe(w, index, layer, t, cap, transport, runtime)?;
+                self.moe(w, index, layer, t, cap, tables.decode, transport, runtime)?;
             }
             // h += ffn; x = next input_layernorm(h) (or the final norm).
             let weight = match layers.get(index + 1) {
@@ -260,7 +322,6 @@ impl<'a> GlmEngine<'a> {
                 on_layer(index, &self.download(&w.h, t * h * 2)?)?;
             }
         }
-        placement.len += t;
         if layers.len() < self.cfg.layers {
             // SAFETY: the engine owns this stream.
             unsafe { self.library.cuda_stream_synchronize(self.stream)? };
@@ -268,18 +329,19 @@ impl<'a> GlmEngine<'a> {
         }
         // SAFETY: the final norm's output and the head operands are live buffers of these shapes.
         unsafe {
-            w.head.launch(w.x.buffer.ptr.cast::<u8>().add((t - 1) * h * 2).cast(), self.weights.head.buffer.ptr.cast(),
-                w.logits.buffer.ptr.cast(), 1, self.stream)?;
+            w.head.launch(w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2).cast(),
+                self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), logit_rows as u32, self.stream)?;
         }
-        let logits = self.download(&w.logits, self.cfg.vocab_size * 4)?;
+        let logits = self.download(&w.logits, logit_rows * self.cfg.vocab_size * 4)?;
         Ok(Some(logits.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()))
     }
 
     /// Router, shared expert and the Spark routed experts; leaves
     /// routed + shared in `delta` for the next norm's residual add.
     #[allow(clippy::too_many_arguments)]
-    fn moe(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str,
+    fn moe(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str, decode: bool,
         transport: &mut V41Tp4Roce, runtime: &tokio::runtime::Runtime) -> Result<()> {
+        let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let rows = Dsv4Scalar::I32(t as i32);
         self.run("glm_router_scores", &[("x", w.x.buffer.ptr), ("w", layer.ptr("gate")?),
@@ -326,7 +388,7 @@ impl<'a> GlmEngine<'a> {
         let mut request = ExpertProtocolV2Request::new(index as u64 + 1, 17, index as u32, h as u32,
             ExpertV2Dtype::Fp8E4m3Ue8m0K32,
             (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
-                row_id: u64::from(row), source_kind: ExpertV2SourceKind::Prefill, source_request_id: 1,
+                row_id: u64::from(row), source_kind: kind, source_request_id: 1,
                 token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32,
             }).collect(),
             routes, wire)?;
@@ -372,7 +434,8 @@ impl<'a> GlmEngine<'a> {
     }
 
     fn attention(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, rows: Dsv4Scalar, cap: &str,
-        used_pages: usize) -> Result<()> {
+        tables: &StepTables) -> Result<()> {
+        let mode = if tables.decode { "decode" } else { "prefill" };
         let kv = &self.kv[index];
         self.run(&format!("glm_producer_{cap}"), &[
             ("x", w.x.buffer.ptr), ("positions", w.positions.buffer.ptr), ("kv_slots", w.slots.buffer.ptr),
@@ -387,15 +450,15 @@ impl<'a> GlmEngine<'a> {
                 ("w_ik", layer.ptr("w_ik")?), ("k_norm_w", layer.ptr("k_norm_w")?), ("k_norm_b", layer.ptr("k_norm_b")?),
                 ("index_cache", index_cache.buffer.ptr), ("q_fp8", w.q_fp8.buffer.ptr),
                 ("head_weights", w.head_weights.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])?;
-            self.run(&format!("glm_index_topk_prefill_{cap}"), &[
+            self.run(&format!("glm_index_topk_{mode}_{cap}"), &[
                 ("q_fp8", w.q_fp8.buffer.ptr), ("weights", w.head_weights.buffer.ptr),
                 ("index_k_cache", index_cache.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
                 ("cache_lengths", w.cache_lengths.buffer.ptr), ("output_indices", w.indices.buffer.ptr),
                 ("scratch", w.topk_scratch.buffer.ptr)],
-                &[rows, Dsv4Scalar::I32(used_pages as i32), Dsv4Scalar::I32(0)])?;
+                &[rows, Dsv4Scalar::I32(tables.table_width as i32), Dsv4Scalar::I32(tables.table_stride as i32)])?;
         }
         // Shared-indexer layers read the previous full layer's `indices`.
-        self.run(&format!("glm_sparse_mla_prefill_{cap}"), &[
+        self.run(&format!("glm_sparse_mla_{mode}_{cap}"), &[
             ("q", w.query.buffer.ptr), ("kv_cache", kv.buffer.ptr), ("indices", w.indices.buffer.ptr),
             ("lengths", w.lengths.buffer.ptr), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])?;
         self.run(&format!("glm_o_{cap}"), &[
