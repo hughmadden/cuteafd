@@ -24,6 +24,15 @@ pub(crate) fn package_directory(native_lib: &Path, tp: usize) -> PathBuf {
     native_lib.parent().unwrap_or(Path::new(".")).join("fp8").join(format!("fp8-{family}")).join(format!("tp{tp}"))
 }
 
+/// The BF16-input sibling of an FP8 package directory:
+/// `.../fp8-<family>/tp<n>` -> `.../fp8-<family>-bf16/tp<n>`.
+pub(crate) fn bf16_sibling(directory: &Path) -> Option<PathBuf> {
+    let layout = directory.file_name()?;
+    let package = directory.parent()?;
+    let name = package.file_name()?.to_str()?;
+    Some(package.with_file_name(format!("{name}-bf16")).join(layout))
+}
+
 /// One layer's resident slice: per projection the E4M3 weights of every
 /// expert (`[E, rows, cols]`) and their FP32 block-scale grids.
 pub(crate) struct Fp8Layer<'a> {
@@ -86,6 +95,10 @@ pub(crate) struct Fp8Experts<'a> {
     // Drop order: the module goes last; callers drain their streams first.
     pub layers: Vec<Fp8Layer<'a>>,
     scratch: DeviceAllocation<'a>,
+    /// A second package over the same weights taking BF16 rows (a Spark
+    /// rank whose coordinator sends unquantized expert input); it shares
+    /// `scratch`, sized for both.
+    pub bf16_module: Option<Fp8MoeModule>,
     pub module: Fp8MoeModule,
     pub tp: usize,
     pub rank: usize,
@@ -121,7 +134,27 @@ impl<'a> Fp8Experts<'a> {
             Ok(loaded)
         }).collect::<Result<Vec<_>>>()?;
         let scratch = DeviceAllocation::new(library, scratch_bytes.max(256))?;
-        Ok(Self { layers, scratch, module, tp, rank })
+        Ok(Self { layers, scratch, bf16_module: None, module, tp, rank })
+    }
+
+    /// Adds the BF16-input package at `directory` (same geometry and TP
+    /// slice), growing the shared scratch when it needs more.
+    pub fn add_bf16_module(&mut self, library: &'a NativeLibrary, directory: &Path, capacity: usize) -> Result<()> {
+        // SAFETY: a trusted package for the current device; dropped with this object.
+        let module = unsafe { Fp8MoeModule::load(directory) }
+            .with_context(|| format!("BF16-input FP8 expert package {}", directory.display()))?;
+        let (info, main) = (module.info().clone(), self.module.info());
+        ensure!(!info.wire_input && info.hidden == main.hidden && info.experts == main.experts
+            && info.topk == main.topk && info.intermediate == main.intermediate && info.tp == main.tp,
+            "{} ({info:?}) is not the BF16-input form of this FP8 package", directory.display());
+        let top = info.capacity_for(capacity)
+            .with_context(|| format!("BF16-input FP8 package has no capacity for {capacity} rows"))?;
+        let bytes = module.scratch_bytes(top)?;
+        if bytes > self.scratch.buffer.bytes {
+            self.scratch = DeviceAllocation::new(library, bytes)?;
+        }
+        self.bf16_module = Some(module);
+        Ok(())
     }
 
     pub fn index_of(&self, layer: usize) -> Result<usize> {
@@ -143,10 +176,26 @@ impl<'a> Fp8Experts<'a> {
     /// any of them, or this object, is released.
     pub unsafe fn run(&self, index: usize, rows: usize, wire: *mut c_void, ids: *mut c_void, weights: *mut c_void,
         out: *mut c_void, stream: *mut c_void) -> Result<()> {
+        self.run_with(&self.module, index, rows, wire, ids, weights, out, stream)
+    }
+
+    /// `run` over BF16 input rows through the BF16-input package.
+    ///
+    /// # Safety
+    /// As `run`, with `rows` BF16 `[rows, H]` input rows.
+    pub unsafe fn run_bf16(&self, index: usize, rows: usize, input: *mut c_void, ids: *mut c_void,
+        weights: *mut c_void, out: *mut c_void, stream: *mut c_void) -> Result<()> {
+        let module = self.bf16_module.as_ref().context("no BF16-input FP8 expert package is loaded")?;
+        self.run_with(module, index, rows, input, ids, weights, out, stream)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run_with(&self, module: &Fp8MoeModule, index: usize, rows: usize, input: *mut c_void,
+        ids: *mut c_void, weights: *mut c_void, out: *mut c_void, stream: *mut c_void) -> Result<()> {
         let layer = self.layers.get(index).context("FP8 expert layer index out of range")?;
         let [w1, s1, w3, s3, w2, s2] = layer.pointers();
         let pointers: [*mut c_void; FP8_MOE_POINTERS] =
-            [wire, ids, weights, w1, s1, w3, s3, w2, s2, out, self.scratch.buffer.ptr];
-        self.module.launch(&pointers, rows, stream)
+            [input, ids, weights, w1, s1, w3, s3, w2, s2, out, self.scratch.buffer.ptr];
+        module.launch(&pointers, rows, stream)
     }
 }

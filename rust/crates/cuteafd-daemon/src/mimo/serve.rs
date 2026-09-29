@@ -7,7 +7,7 @@
 //! step's rows, so a verify whose drafts are rejected just sets the
 //! sequence length back.
 use super::engine::{Allocator, MimoEngine, MimoPlacement, DECODE_ROWS};
-use super::{embed_rows, open, Opened};
+use super::{open, Opened};
 use anyhow::{Context, Result};
 use cuteafd_api::native_v41::qwen::QwenEncoding;
 use cuteafd_api::native_v41::{
@@ -175,12 +175,13 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let mut grammars = crate::v41_native_serve::constraints::Compiler::with_vocab(
         &opened.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, QwenEncoding::from_snapshot(snapshot)?.tokens().eos.clone());
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
+    let embeddings = super::Embeddings::open(&opened.checkpoint, engine.cfg.hidden)?;
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
     // Verify steps since the last completed request, and host seconds in
     // them (engine) and in token selection + streaming.
     let mut steps = 0u64;
-    let (mut verify_s, mut emit_s) = (0f64, 0f64);
+    let (mut verify_s, mut emit_s, mut embed_s) = (0f64, 0f64, 0f64);
     let (hidden, vocab) = (engine.cfg.hidden, engine.cfg.vocab_size);
     loop {
         while active.len() < max_sequences {
@@ -226,7 +227,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 let started = Instant::now();
                 let mut logits = None;
                 for chunk in tokens.chunks(engine.prefill_rows) {
-                    let embed = embed_rows(&opened.checkpoint, chunk, hidden)?;
+                    let embed = embeddings.rows(chunk)?;
                     logits = engine.prefill(&mut placement, &embed, None)?;
                 }
                 let elapsed = started.elapsed().as_secs_f64();
@@ -279,7 +280,9 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         }).collect();
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
         let tokens: Vec<u32> = sequences.iter().flatten().copied().collect();
-        let embed = embed_rows(&opened.checkpoint, &tokens, hidden)?;
+        let timer = Instant::now();
+        let embed = embeddings.rows(&tokens)?;
+        embed_s += timer.elapsed().as_secs_f64();
         let mut rows: Vec<(&mut MimoPlacement, usize)> = active.iter_mut().zip(&sequences)
             .map(|(a, s)| (&mut a.placement, s.len())).collect();
         steps += 1;
@@ -342,9 +345,9 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let seconds = request.started.elapsed().as_secs_f64();
             let phases = std::mem::take(&mut *engine.profile.borrow_mut());
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
-                active = active.len(), steps, verify_s, emit_s, gpu_wait_s = phases[0], experts_s = phases[1],
+                active = active.len(), steps, verify_s, emit_s, embed_s, gpu_wait_s = phases[0], experts_s = phases[1],
                 "request complete");
-            (steps, verify_s, emit_s) = (0, 0.0, 0.0);
+            (steps, verify_s, emit_s, embed_s) = (0, 0.0, 0.0, 0.0);
             allocator.release(request.placement);
         }
         if let Ok(mut stats) = stats.lock() {

@@ -28,10 +28,11 @@ pub(crate) struct Fp8Worker<'a> {
 
 impl<'a> Fp8Worker<'a> {
     /// Device bytes the worker adds to its resident layers for `capacity`.
+    /// (Input rows are sized for BF16, the larger of the two representations.)
     pub(crate) fn workspace_bytes(capacity: usize) -> usize {
         let geometry = cuteafd_core::expert_geometry();
         let (hidden, topk) = (geometry.hidden as usize, geometry.topk as usize);
-        capacity * (hidden + hidden / 32 + topk * 8 + hidden * 2)
+        capacity * (hidden * 2 + topk * 8 + hidden * 2)
     }
 
     pub(crate) fn new(library: &'a NativeLibrary, experts: Rc<Fp8Experts<'a>>, capacity: u32) -> Result<Self> {
@@ -42,7 +43,8 @@ impl<'a> Fp8Worker<'a> {
         ensure!(experts.module.info().capacity_for(capacity).is_some(), "FP8 package lacks capacity {capacity}");
         ensure!(experts.wire_input(), "Spark workers need an FP8 package built for wire rows (the spark role)");
         let inputs = [
-            DeviceAllocation::new(library, capacity * (hidden + hidden / 32))?,
+            DeviceAllocation::new(library, capacity * if experts.bf16_module.is_some() { hidden * 2 }
+                else { hidden + hidden / 32 })?,
             DeviceAllocation::new(library, capacity * topk * 4)?,
             DeviceAllocation::new(library, capacity * topk * 4)?,
         ];
@@ -74,7 +76,14 @@ impl<'a> Fp8Worker<'a> {
         let rows = request.rows() as usize;
         ensure!(rows > 0 && rows <= self.capacity, "FP8 request exceeds capacity");
         ensure!(!request.is_paired(), "FP8 experts have no paired layout");
-        request.require_input_dtype(ExpertV2Dtype::Fp8E4m3Ue8m0K32 as u32)?;
+        // FP8 K32 wire rows, or BF16 rows when the BF16-input package is loaded.
+        let bf16 = request.require_input_dtype(ExpertV2Dtype::Fp8E4m3Ue8m0K32 as u32).is_err();
+        if bf16 {
+            ensure!(self.experts.bf16_module.is_some(),
+                "BF16 expert input needs the BF16-input FP8 package (fp8-<family>-bf16) on this rank");
+            request.require_input_dtype(ExpertV2Dtype::Bf16 as u32)?;
+        }
+        ensure!(request.hidden().len() <= self.inputs[0].buffer.bytes, "FP8 request rows exceed the input buffer");
         let bytes = request.plane_bytes()?;
         let routes = rows * cuteafd_core::expert_geometry().topk as usize;
         request.copy_routes_into(&mut exchange.ids, &mut exchange.routing)?;
@@ -96,8 +105,13 @@ impl<'a> Fp8Worker<'a> {
         // SAFETY: inputs, output and the resident layer are live device memory of
         // the documented extents; the stream is synchronized below.
         unsafe {
-            self.experts.run(self.layer, rows, self.inputs[0].buffer.ptr, self.inputs[1].buffer.ptr,
-                self.inputs[2].buffer.ptr, output.ptr, self.stream.raw)?;
+            if bf16 {
+                self.experts.run_bf16(self.layer, rows, self.inputs[0].buffer.ptr, self.inputs[1].buffer.ptr,
+                    self.inputs[2].buffer.ptr, output.ptr, self.stream.raw)?;
+            } else {
+                self.experts.run(self.layer, rows, self.inputs[0].buffer.ptr, self.inputs[1].buffer.ptr,
+                    self.inputs[2].buffer.ptr, output.ptr, self.stream.raw)?;
+            }
             self.library.cuda_stream_synchronize(self.stream.raw)?;
         }
         if destination.is_none() {
