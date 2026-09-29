@@ -89,6 +89,11 @@ pub(crate) struct ExpertProbeArgs {
     /// BF16 rank partials in FP32, as the coordinator does.
     #[arg(long, default_value_t = 1, requires = "local")]
     pub(crate) local_tp: usize,
+    /// With `--local --local-tp N` on an EXL3 checkpoint: the Spark-role EXL3
+    /// package root (`tp<N>-rank<R>/m<capacity>` layouts, e.g. a `--loopback`
+    /// build) whose rank slices run on this GPU in turn, BF16 partials summed.
+    #[arg(long, requires = "local")]
+    pub(crate) exl3_package: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

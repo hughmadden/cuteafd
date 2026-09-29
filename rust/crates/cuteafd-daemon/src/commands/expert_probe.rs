@@ -94,6 +94,14 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
         return report(&format!("layer {} rows {rows} fp8 ({} rows checked)", args.layer, sampled.len()), false,
             &pick(&actual), &expected, remote, started.elapsed());
     }
+    if args.local && args.exl3_package.is_some() {
+        ensure!(exl3 && args.stage.is_none(), "--exl3-package probes backbone layers of an EXL3 checkpoint");
+        let (actual, elapsed) = local::run_exl3_ranks(&args, &catalog, &wire, &routes)?;
+        let started = Instant::now();
+        let expected = exl3::oracle(&catalog, false, args.layer, &input, &routes, rows)?;
+        return report(&format!("layer {} rows {rows} local exl3 tp{}", args.layer, args.local_tp), true, &actual,
+            &expected, elapsed, started.elapsed());
+    }
     if args.local {
         let (actual, elapsed) = local::run(&args, &catalog, &wire, &routes)?;
         let (what, index) = match args.stage { Some(stage) => ("stage", stage), None => ("layer", args.layer) };
