@@ -336,12 +336,30 @@ impl<'a> MimoLoader<'a> {
     }
 
     pub fn layer(&self, cfg: &MimoV2Config, layer: usize) -> Result<MimoLayer<'a>> {
-        let p = format!("model.layers.{layer}");
-        let attention = cfg.attention[layer];
-        let dense = cfg.dense[layer];
+        self.block(cfg, &format!("model.layers.{layer}"), cfg.attention[layer], cfg.dense[layer],
+            "post_attention_layernorm")
+    }
+
+    /// MTP layer `k` (`model.mtp.layers.{k}`): an SWA decoder layer with a
+    /// dense MLP (`pre_mlp_layernorm` is its post-attention norm).
+    pub fn mtp_layer(&self, cfg: &MimoV2Config, k: usize) -> Result<MimoLayer<'a>> {
+        self.block(cfg, &format!("model.mtp.layers.{k}"), MimoAttention::Sliding, true, "pre_mlp_layernorm")
+    }
+
+    /// One MTP block's extra weights: `eh_proj` (BF16 [H, 2H]), `enorm`,
+    /// `hnorm` and `final_layernorm`.
+    pub fn mtp_extras(&self, k: usize) -> Result<[DeviceAllocation<'a>; 4]> {
+        let p = format!("model.mtp.layers.{k}");
+        Ok([self.one(&format!("{p}.eh_proj.weight"))?, self.one(&format!("{p}.enorm.weight"))?,
+            self.one(&format!("{p}.hnorm.weight"))?, self.one(&format!("{p}.final_layernorm.weight"))?])
+    }
+
+    fn block(&self, cfg: &MimoV2Config, p: &str, attention: MimoAttention, dense: bool, post: &str)
+        -> Result<MimoLayer<'a>> {
+        let layer = p;
         let mut ops: HashMap<&'static str, DeviceAllocation<'a>> = HashMap::new();
         ops.insert("input_norm", self.one(&format!("{p}.input_layernorm.weight"))?);
-        ops.insert("post_norm", self.one(&format!("{p}.post_attention_layernorm.weight"))?);
+        ops.insert("post_norm", self.one(&format!("{p}.{post}.weight"))?);
         let fused = format!("{p}.self_attn.qkv_proj.weight");
         let qkv = [format!("{p}.self_attn.q_proj.weight"), format!("{p}.self_attn.k_proj.weight"),
             format!("{p}.self_attn.v_proj.weight")];

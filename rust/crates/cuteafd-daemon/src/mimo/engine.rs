@@ -79,6 +79,10 @@ pub(crate) enum Experts<'a> {
 /// Most rows a decode program reads the FP8 weight copies for (MmaFp8Gemv's M tile).
 pub(crate) const FP8_ROWS: i32 = 16;
 
+/// Most rows of one sequence an MTP drafting pass takes (older true rows
+/// catch up in passes of their own first).
+const MTP_STEP_ROWS: usize = 16;
+
 /// KV splits of the full-attention decode program (its compiled maximum is 32).
 const DECODE_SPLITS: i32 = 16;
 
@@ -196,6 +200,8 @@ pub(crate) struct MimoEngine<'a> {
     pub profile: RefCell<[f64; 2]>,
     /// The DFlash drafter (V2.6 Pro's dflash/): every step taps its target layers.
     pub drafter: Option<super::dflash::MimoDrafter<'a>>,
+    /// The native MTP drafter: every step taps the last layer's rows.
+    pub mtp: Option<super::mtp::MtpDrafter<'a>>,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -260,7 +266,7 @@ impl<'a> MimoEngine<'a> {
         Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, rings, family, kv, cos_sin_full,
             cos_sin_swa, workspace: RefCell::new(None), decode_workspace: RefCell::new(None), experts: None,
             expert_input: ExpertInput::Fp8,
-            profile: RefCell::new([0.0; 2]), drafter: None })
+            profile: RefCell::new([0.0; 2]), drafter: None, mtp: None })
     }
 
     /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
@@ -449,7 +455,7 @@ impl<'a> MimoEngine<'a> {
         let layers = &self.weights.layers;
         self.norm(w, layers[0].ptr("input_norm")?, 0, rows)?;
         for (index, layer) in layers.iter().enumerate() {
-            self.attention(w, index, layer, rows, cap, tables)?;
+            self.attention(w, self.kv[index].buffer.ptr, layer, rows, cap, tables)?;
             // h += attention; x = post_attention_layernorm(h)
             self.norm(w, layer.ptr("post_norm")?, 1, rows)?;
             if layer.dense {
@@ -479,6 +485,9 @@ impl<'a> MimoEngine<'a> {
                 // context row later drafts can see).
                 let n = t.min(super::dflash::TAP_ROWS);
                 drafter.tap(index, w.h.buffer.ptr, t - n, n)?;
+            }
+            if let (Some(mtp), true) = (&self.mtp, index + 1 == self.cfg.layers) {
+                self.mtp_tap(mtp, w, tables)?;
             }
             if let Some(on_layer) = on_layer.as_mut() {
                 on_layer(index, &self.download(&w.h, t * h * 2)?)?;
@@ -519,7 +528,224 @@ impl<'a> MimoEngine<'a> {
             &[rows, Dsv4Scalar::I32(deltas)])
     }
 
-    fn attention(&self, w: &Workspace<'_>, index: usize, layer: &MimoLayer<'_>, rows: Dsv4Scalar, cap: &str,
+    /// Copies this step's last-layer rows (pre-norm) into the MTP hidden ring
+    /// at (ring, position % 256); a prefill's last 256 rows.
+    fn mtp_tap(&self, mtp: &super::mtp::MtpDrafter<'_>, w: &Workspace<'_>, tables: &StepTables) -> Result<()> {
+        use super::mtp::HIDDEN_ROWS;
+        let (h, t) = (self.cfg.hidden, tables.positions.len());
+        let row = h * 2;
+        let first = t.saturating_sub(HIDDEN_ROWS);
+        let mut r = first;
+        while r < t {
+            // A run of rows whose ring slots advance by one (one sequence, no wrap).
+            let slot = tables.ring_slots[r] as usize;
+            let mut n = 1;
+            while r + n < t && tables.ring_slots[r + n] as usize == slot + n && (slot + n) % HIDDEN_ROWS != 0 {
+                n += 1;
+            }
+            let ring = slot / RING_ROWS;
+            let dest = (ring * HIDDEN_ROWS + slot % RING_ROWS % HIDDEN_ROWS) * row;
+            // SAFETY: rows r..r+n of `w.h` and ring rows dest.. lie inside their buffers; stream-ordered.
+            unsafe {
+                self.library.copy_d2d_async(
+                    cuteafd_ffi::CuteafdDeviceBuffer { ptr: mtp.hidden.buffer.ptr.cast::<u8>().add(dest).cast(),
+                        bytes: n * row, ..mtp.hidden.buffer },
+                    cuteafd_ffi::CuteafdDeviceBuffer { ptr: w.h.buffer.ptr.cast::<u8>().add(r * row).cast(),
+                        bytes: n * row, ..w.h.buffer },
+                    n * row, self.stream)?;
+            }
+            r += n;
+        }
+        Ok(())
+    }
+
+    /// A new sequence in `ring` whose first `len` tokens are processed: MTP
+    /// stages start their true rows within a window of the end.
+    pub fn mtp_reset(&self, ring: usize, len: usize) {
+        if let Some(mtp) = &self.mtp {
+            let mut ext = mtp.ext.borrow_mut();
+            let start = len.saturating_sub(self.cfg.window + mtp.stages.len() + 1);
+            ext[ring] = vec![start; mtp.stages.len()];
+        }
+    }
+
+    /// Up to `stages` MTP drafts after each sequence's next token (see
+    /// `mtp`); `embed` maps tokens to BF16 embedding rows.
+    pub fn mtp_draft(&self, seqs: &[super::mtp::MtpSeq<'_>], stages: usize,
+        embed: &dyn Fn(&[u32]) -> Result<Vec<u8>>) -> Result<Vec<Vec<u32>>> {
+        let mtp = self.mtp.as_ref().context("no MTP drafter")?;
+        let stages = stages.min(mtp.stages.len());
+        let mut drafts: Vec<Vec<u32>> = vec![Vec::new(); seqs.len()];
+        for k in 0..stages {
+            // Catch-up passes over true rows while a sequence's rows exceed the step.
+            loop {
+                let mut groups = Vec::new();
+                let mut rows = 0;
+                for seq in seqs {
+                    let ext = mtp.ext.borrow()[seq.ring][k];
+                    ensure!(ext <= seq.len, "MTP ring {} is ahead of its sequence (reset it at admission)", seq.ring);
+                    // True rows are those whose token t_{j+k+1} is known (j <= len - k - 1).
+                    let true_end = seq.len.saturating_sub(k);
+                    if seq.len - ext > MTP_STEP_ROWS && ext < true_end && rows < DECODE_ROWS {
+                        let n = (true_end - ext).min(DECODE_ROWS - rows);
+                        groups.push((seq.ring, ext, (ext..ext + n).map(|j| seq.tokens[j + k + 1]).collect::<Vec<_>>()));
+                        rows += n;
+                    }
+                }
+                if groups.is_empty() {
+                    break;
+                }
+                self.mtp_pass(mtp, k, &groups, embed, false)?;
+                let mut ext = mtp.ext.borrow_mut();
+                for (ring, first, tokens) in &groups {
+                    ext[*ring][k] = ext[*ring][k].max(first + tokens.len());
+                }
+            }
+            // The drafting pass: rows ext..len of every sequence (in groups within the step).
+            let mut index = 0;
+            while index < seqs.len() {
+                let mut groups = Vec::new();
+                let mut members = Vec::new();
+                let mut rows = 0;
+                while index < seqs.len() {
+                    let seq = &seqs[index];
+                    let ext = mtp.ext.borrow()[seq.ring][k];
+                    ensure!(seq.tokens.len() > seq.len, "MTP sequence needs its next token");
+                    let n = seq.len - ext;
+                    if rows + n > DECODE_ROWS && !groups.is_empty() {
+                        break;
+                    }
+                    ensure!(n <= DECODE_ROWS, "MTP stage {k}: {n} pending rows");
+                    let tokens: Vec<u32> = (ext..seq.len).map(|j| {
+                        let at = j + k + 1;
+                        if at <= seq.len { seq.tokens[at] } else { drafts[index][at - seq.len - 1] }
+                    }).collect();
+                    groups.push((seq.ring, ext, tokens));
+                    members.push(index);
+                    rows += n;
+                    index += 1;
+                }
+                let tops = self.mtp_pass(mtp, k, &groups, embed, true)?;
+                let mut ext = mtp.ext.borrow_mut();
+                for ((&i, (ring, _, _)), top) in members.iter().zip(&groups).zip(tops) {
+                    drafts[i].push(top);
+                    ext[*ring][k] = ext[*ring][k].max(seqs[i].len.saturating_sub(k));
+                }
+            }
+        }
+        Ok(drafts)
+    }
+
+    /// One MTP stage over `groups` of (ring, first row, tokens t_{j+k+1});
+    /// with `logits`, returns the argmax of each group's last row.
+    fn mtp_pass(&self, mtp: &super::mtp::MtpDrafter<'_>, k: usize, groups: &[(usize, usize, Vec<u32>)],
+        embed: &dyn Fn(&[u32]) -> Result<Vec<u8>>, logits: bool) -> Result<Vec<u32>> {
+        use super::mtp::HIDDEN_ROWS;
+        let stage = &mtp.stages[k];
+        let (h, vocab) = (self.cfg.hidden, self.cfg.vocab_size);
+        let mut tables = StepTables { decode: true, positions: Vec::new(), slots: Vec::new(), ring_slots: Vec::new(),
+            seq_first: Vec::new(), page_table: vec![0], table_stride: 1 };
+        let mut all_tokens = Vec::new();
+        for (ring, first, tokens) in groups {
+            ensure!(*ring < self.rings, "MTP ring {ring} of {}", self.rings);
+            let start = tables.positions.len() as i32;
+            for j in *first..first + tokens.len() {
+                tables.positions.push(j as i64);
+                tables.slots.push(-1);
+                tables.ring_slots.push((ring * RING_ROWS + j % RING_ROWS) as i64);
+                tables.seq_first.push(start);
+            }
+            all_tokens.extend_from_slice(tokens);
+        }
+        let t = tables.positions.len();
+        ensure!(t > 0 && t <= DECODE_ROWS, "MTP pass of {t} rows");
+        if self.decode_workspace.borrow().is_none() {
+            *self.decode_workspace.borrow_mut() = Some(self.workspace(DECODE_ROWS, true)?);
+        }
+        let workspace = self.decode_workspace.borrow();
+        let w = workspace.as_ref().context("workspace")?;
+        self.put(&w.positions, &tables.positions)?;
+        self.put(&w.ring_slots, &tables.ring_slots)?;
+        self.put(&w.seq_first, &tables.seq_first)?;
+        self.put(&w.page_table, &tables.page_table)?;
+        let row = h * 2;
+        self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: t * row, ..mtp.embed.buffer },
+            &embed(&all_tokens)?)?;
+        // The target's hidden rows of the same positions.
+        let mut at = 0;
+        for (ring, first, tokens) in groups {
+            for j in *first..first + tokens.len() {
+                let src = (ring * HIDDEN_ROWS + j % HIDDEN_ROWS) * row;
+                // SAFETY: one row inside each buffer; stream-ordered.
+                unsafe {
+                    self.library.copy_d2d_async(
+                        cuteafd_ffi::CuteafdDeviceBuffer { ptr: mtp.rows_h.buffer.ptr.cast::<u8>().add(at * row).cast(),
+                            bytes: row, ..mtp.rows_h.buffer },
+                        cuteafd_ffi::CuteafdDeviceBuffer { ptr: mtp.hidden.buffer.ptr.cast::<u8>().add(src).cast(),
+                            bytes: row, ..mtp.hidden.buffer }, row, self.stream)?;
+                }
+                at += 1;
+            }
+        }
+        let rows = Dsv4Scalar::I32(t as i32);
+        for (source, weight, out) in [(&mtp.embed, &stage.enorm, &mtp.normed_e), (&mtp.rows_h, &stage.hnorm, &mtp.normed_h)] {
+            self.run("mimo_norm", &[("residual", source.buffer.ptr), ("delta0", source.buffer.ptr),
+                ("delta1", source.buffer.ptr), ("weight", weight.buffer.ptr), ("out", out.buffer.ptr)],
+                &[rows, Dsv4Scalar::I32(0)])?;
+        }
+        // SAFETY: [t, H] sources into [t, 2H] halves, then eh_proj into the residual stream.
+        unsafe {
+            self.library.glm_dflash_tap(mtp.normed_e.buffer.ptr, mtp.cat.buffer.ptr, t, h, 2 * h, 0, self.stream)?;
+            self.library.glm_dflash_tap(mtp.normed_h.buffer.ptr, mtp.cat.buffer.ptr, t, h, 2 * h, h, self.stream)?;
+            self.library.linear_bf16(mtp.cat.buffer.ptr, stage.eh.buffer.ptr, w.h.buffer.ptr, t, 2 * h, h, self.stream)?;
+        }
+        let layer = &stage.layer;
+        self.norm(w, layer.ptr("input_norm")?, 0, rows)?;
+        self.attention(w, stage.ring.buffer.ptr, layer, rows, "m64", &tables)?;
+        self.norm(w, layer.ptr("post_norm")?, 1, rows)?;
+        let mut pointers = vec![("x", w.x.buffer.ptr), ("w_gate_up", layer.ptr("w_gate_up")?),
+            ("w_gate_up_fp8", layer.ptr_or("w_gate_up_fp8", "w_gate_up")?),
+            ("w_gate_up_scale", layer.ptr_or("w_gate_up_scale", "w_gate_up")?), ("w_down", layer.ptr("w_down")?),
+            ("w_down_fp8", layer.ptr_or("w_down_fp8", "w_down")?), ("w_down_scale", layer.ptr_or("w_down_scale", "w_down")?)];
+        pointers.extend([("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
+        self.run("mimo_ffn_m64", &pointers, &fp8_scalars(rows, true, layer.has("w_down_fp8")))?;
+        self.norm(w, stage.final_norm.buffer.ptr, 1, rows)?;
+        if !logits {
+            // SAFETY: the engine owns this stream.
+            unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+            return Ok(Vec::new());
+        }
+        match &self.weights.head_fp8 {
+            Some((q, scale)) if t <= FP8_ROWS as usize => {
+                self.run("mimo_head_fp8", &[("x", w.x.buffer.ptr), ("w_fp8", q.buffer.ptr), ("scale", scale.buffer.ptr),
+                    ("logits", w.logits.buffer.ptr)], &[rows])?;
+            }
+            // SAFETY: the final norm's output and the head operands are live buffers of these shapes.
+            _ => unsafe {
+                w.head.launch(w.x.buffer.ptr.cast(), self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(),
+                    t as u32, self.stream)?;
+            },
+        }
+        // SAFETY: the engine owns this stream.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        let mut tops = Vec::with_capacity(groups.len());
+        let mut end = 0;
+        let mut bytes = vec![0u8; vocab * 4];
+        for (_, _, tokens) in groups {
+            end += tokens.len();
+            self.library.copy_d2h(&mut bytes, cuteafd_ffi::CuteafdDeviceBuffer {
+                // SAFETY: row end - 1 lies inside the logits buffer.
+                ptr: unsafe { w.logits.buffer.ptr.cast::<u8>().add((end - 1) * vocab * 4) }.cast(),
+                bytes: vocab * 4, ..w.logits.buffer })?;
+            let best = bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).enumerate()
+                .max_by(|a, b| a.1.total_cmp(&b.1)).map_or(0, |(i, _)| i);
+            tops.push(best as u32);
+        }
+        Ok(tops)
+    }
+
+    /// `kv`: the layer's paged record pool (full) or its rings (SWA).
+    fn attention(&self, w: &Workspace<'_>, kv: *mut c_void, layer: &MimoLayer<'_>, rows: Dsv4Scalar, cap: &str,
         tables: &StepTables) -> Result<()> {
         let mode = if tables.decode { "decode" } else { "prefill" };
         let k = kind(layer.attention);
@@ -528,7 +754,7 @@ impl<'a> MimoEngine<'a> {
             MimoAttention::Sliding => (w.step_slots.buffer.ptr, self.cos_sin_swa.buffer.ptr),
         };
         let records = match layer.attention {
-            MimoAttention::Full => self.kv[index].buffer.ptr,
+            MimoAttention::Full => kv,
             MimoAttention::Sliding => w.kv_step.buffer.ptr,
         };
         let decode = tables.decode;
@@ -547,13 +773,13 @@ impl<'a> MimoEngine<'a> {
                 if tables.decode {
                     scalars.push(Dsv4Scalar::I32(DECODE_SPLITS));
                 }
-                self.run(&name, &[("q", w.query.buffer.ptr), ("kv_cache", self.kv[index].buffer.ptr),
+                self.run(&name, &[("q", w.query.buffer.ptr), ("kv_cache", kv),
                     ("positions", w.positions.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
                     ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &scalars)?;
             }
             MimoAttention::Sliding => {
                 self.run(&name, &[("q", w.query.buffer.ptr), ("kv_step", w.kv_step.buffer.ptr),
-                    ("ring", self.kv[index].buffer.ptr), ("positions", w.positions.buffer.ptr),
+                    ("ring", kv), ("positions", w.positions.buffer.ptr),
                     ("ring_slots", w.ring_slots.buffer.ptr), ("seq_first", w.seq_first.buffer.ptr),
                     ("sinks", layer.ptr("sinks")?), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
                     &[rows])?;

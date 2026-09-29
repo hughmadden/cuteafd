@@ -7,6 +7,7 @@
 //! step's rows, so a verify whose drafts are rejected just sets the
 //! sequence length back.
 use super::dflash::{ContextRow, DraftSeq};
+use super::mtp::MtpSeq;
 use super::engine::{Allocator, MimoEngine, MimoPlacement, DECODE_ROWS};
 use crate::glm::dflash_policy::{self, DraftHistory, Group, StepCost};
 use super::{open, Opened};
@@ -276,6 +277,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 tracing::info!(tokens = tokens.len(), elapsed_ms = (1e3 * elapsed) as u64,
                     tok_s = tokens.len() as f64 / elapsed, gpu_wait_ms = (1e3 * phases[0]) as u64,
                     experts_ms = (1e3 * phases[1]) as u64, "prefill");
+                engine.mtp_reset(placement.ring as usize, placement.len);
                 let mut request = Active {
                     slot,
                     drafts: DraftHistory::default(),
@@ -341,6 +343,28 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 }
                 out
             }
+            // Native MTP drafts (MiMo V2 Flash; V2.6 Pro prefers DFlash).
+            None if skip.drafts() && engine.mtp.is_some() => {
+                let seqs: Vec<MtpSeq<'_>> = active.iter()
+                    .map(|a| MtpSeq { ring: a.placement.ring as usize, len: a.placement.len, tokens: &a.history })
+                    .collect();
+                let stages = engine.mtp.as_ref().map_or(0, |m| m.stages.len());
+                let timer = Instant::now();
+                let drafts = engine.mtp_draft(&seqs, stages, &|ids: &[u32]| embeddings.rows(ids));
+                let ms = timer.elapsed().as_secs_f64() * 1e3;
+                cost.observe_draft(ms);
+                draft_s += ms / 1e3;
+                match drafts {
+                    Ok(drafts) => drafts.into_iter().map(|tokens| {
+                        let features = vec![[0.0, 1.0, 0.0, 0.0]; tokens.len()];
+                        Some(super::dflash::Draft { tokens, features })
+                    }).collect(),
+                    Err(error) => {
+                        tracing::warn!("MTP draft failed: {error:#}");
+                        vec![None; active.len()]
+                    }
+                }
+            }
             _ => vec![None; active.len()],
         };
         let planned = plan_drafts(&active, &drafted, &limits, policy.fixed, &cost);
@@ -352,7 +376,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             if a.draft_pause > 0 {
                 a.draft_pause -= 1;
                 if a.draft_pause == 0 {
-                    a.draft_limit = 1;
+                    a.draft_limit = draft.min(1);
                 }
             }
             let dflash: &[u32] = drafted[i].as_ref().map_or(&[], |d| &d.tokens[..planned[i]]);
@@ -433,14 +457,14 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 request.drafts.observe(planned[i], accepted);
             }
             // Adapt the copy-draft length to how much of it the model reproduced.
-            if used_copy[i] || request.slot.is_none() {
+            if used_copy[i] || (drafted > 0 && drafter.is_none() && engine.mtp.is_none()) {
                 if drafted > 0 && accepted == 0 {
                     request.draft_limit /= 2;
                     if request.draft_limit == 0 {
                         request.draft_pause = 8;
                     }
                 } else if drafted > 0 && accepted == drafted {
-                    request.draft_limit = (request.draft_limit * 2).clamp(1, draft.max(1));
+                    request.draft_limit = (request.draft_limit * 2).clamp(draft.min(1), draft);
                 }
             }
             finished

@@ -86,6 +86,11 @@ family_args=()
 if [[ $model_type == mimo_v2 && "$(get DFLASH off)" == on ]]; then
   draft_args=(--draft "$snapshot")
 fi
+# MTP=N: serve-mimo drafts with the checkpoint's first N native MTP layers
+# (MiMo V2 Flash; V2.6 Pro drafts better with DFLASH=on).
+if [[ $serve == serve-mimo && "$(get MTP 0)" != 0 ]]; then
+  family_args+=(--mtp "$(get MTP 0)")
+fi
 if [[ $serve == serve-glmf ]]; then
   fp8_model="$(get GLMF_FP8_MODEL_ID zai-org/GLM-5.3-Flash)"
   if [[ "$fp8_model" != off ]]; then

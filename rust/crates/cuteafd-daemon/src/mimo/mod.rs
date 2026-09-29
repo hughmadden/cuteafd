@@ -2,6 +2,7 @@
 //! programs' layer chain, and the golden comparison command.
 pub(crate) mod dflash;
 pub(crate) mod engine;
+pub(crate) mod mtp;
 pub(crate) mod serve;
 pub(crate) mod weights;
 
@@ -51,6 +52,10 @@ pub(crate) struct EngineArgs {
     /// layers and drafts on this GPU.
     #[arg(long)]
     pub draft: Option<PathBuf>,
+    /// Native MTP drafter: run this many of the checkpoint's MTP stages
+    /// (`model.mtp.layers.*`, 0 = off) after each next token.
+    #[arg(long, default_value_t = 0)]
+    pub mtp: usize,
     /// Sequences the drafter keeps a context for and drafts for at once.
     #[arg(long, default_value_t = 4)]
     pub draft_sequences: usize,
@@ -119,6 +124,11 @@ pub(crate) struct GoldenArgs {
     /// drafts, and score them against the golden text and greedy targets.
     #[arg(long, requires = "draft")]
     pub draft_oracle: Option<PathBuf>,
+    /// With --mtp: run only the MTP drafter on the golden's last-layer rows at
+    /// the anchors of python/reference/mimo_mtp/reference.py's output
+    /// directory, compare with its predictions and score acceptance.
+    #[arg(long)]
+    pub mtp_oracle: Option<PathBuf>,
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -158,10 +168,38 @@ impl Opened {
             checkpoint_tp: cuteafd_loader::mimo_v2::checkpoint_tp(&args.snapshot)?, fp8_decode: args.fp8_decode,
             fp8_head: args.fp8_head, fp8_o_proj: args.fp8_o_proj };
         let model = loader.model(&self.cfg, layers)?;
+        let mtp = if args.mtp > 0 {
+            let started = Instant::now();
+            let available = self.checkpoint.tensors.iter()
+                .filter(|t| t.meta.name.starts_with("model.mtp.layers.") && t.meta.name.ends_with(".eh_proj.weight"))
+                .count();
+            ensure!(args.mtp <= available, "--mtp {} but the checkpoint has {available} MTP layers", args.mtp);
+            let zeroed = |bytes: usize| -> Result<crate::v41_memory::DeviceAllocation<'_>> {
+                let allocation = crate::v41_memory::DeviceAllocation::new(&self.library, bytes.max(256))?;
+                self.library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
+                Ok(allocation)
+            };
+            let (h, record) = (self.cfg.hidden, self.cfg.record_elems(cuteafd_loader::mimo_v2::MimoAttention::Sliding));
+            let stages = (0..args.mtp).map(|k| -> Result<mtp::MtpStage<'_>> {
+                let [eh, enorm, hnorm, final_norm] = loader.mtp_extras(k)?;
+                Ok(mtp::MtpStage { layer: loader.mtp_layer(&self.cfg, k)?, eh, enorm, hnorm, final_norm,
+                    ring: zeroed(args.rings * engine::RING_ROWS * record * 2)? })
+            }).collect::<Result<Vec<_>>>()?;
+            let rows = engine::DECODE_ROWS;
+            let drafter = mtp::MtpDrafter { stages, hidden: zeroed(args.rings * mtp::HIDDEN_ROWS * h * 2)?,
+                embed: zeroed(rows * h * 2)?, rows_h: zeroed(rows * h * 2)?, normed_e: zeroed(rows * h * 2)?,
+                normed_h: zeroed(rows * h * 2)?, cat: zeroed(rows * 2 * h * 2)?,
+                ext: std::cell::RefCell::new(vec![vec![0; args.mtp]; args.rings]) };
+            tracing::info!(stages = args.mtp, elapsed_ms = started.elapsed().as_millis() as u64, "MTP drafter resident");
+            Some(drafter)
+        } else {
+            None
+        };
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64, "MiMo coordinator weights resident");
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::MimoEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages, args.rings)?;
+        engine.mtp = mtp;
         if let Some(dir) = &draft_dir {
             let started = Instant::now();
             let cfg = dflash::DflashConfig::read(dir)?;
@@ -332,6 +370,9 @@ fn golden(args: GoldenArgs) -> Result<()> {
 fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_>) -> Result<()> {
     if let Some(dir) = &args.draft_oracle {
         return draft_oracle(args, opened, engine, dir);
+    }
+    if let Some(dir) = &args.mtp_oracle {
+        return mtp_oracle(args, opened, engine, dir);
     }
     let cfg = &opened.cfg;
     let layers = engine.weights.layers.len();
@@ -577,5 +618,68 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<
         println!("draft step, {sequences} sequences: {per:.2} ms; context update of 8 rows {:.2} ms",
             timer.elapsed().as_secs_f64() * 1e2);
     }
+    Ok(())
+}
+
+/// Runs the MTP drafter alone on the golden's last-layer rows at the
+/// reference's anchors (DFlash's convention: the anchor p is the next token,
+/// context 0..p-1) and compares stage k's draft with the reference's
+/// teacher-forced prediction at row p - 1 while every earlier draft equals
+/// the golden token (then the two chains are the same computation).
+fn mtp_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_>, dir: &std::path::Path)
+    -> Result<()> {
+    let mtp = engine.mtp.as_ref().context("--mtp-oracle needs --mtp N")?;
+    let (hidden, vocab) = (opened.cfg.hidden, opened.cfg.vocab_size);
+    let stages = mtp.stages.len();
+    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)?;
+    let anchors: Vec<usize> = meta["anchors"].as_array().context("anchors")?.iter()
+        .map(|p| p.as_u64().map(|p| p as usize).context("anchor")).collect::<Result<_>>()?;
+    let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
+        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let t = tokens.len();
+    let predictions: Vec<u32> = std::fs::read(dir.join("predictions.bin"))?
+        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let ref_stages = meta["stages"].as_u64().unwrap_or(0) as usize;
+    ensure!(ref_stages >= stages && predictions.len() == ref_stages * t, "reference predictions do not cover {stages} stages");
+    let greedy: Vec<u32> = std::fs::read(args.golden.join("logits.bin"))?.chunks_exact(vocab * 4).map(|row| {
+        let values = row.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap()));
+        values.enumerate().max_by(|a, b| a.1.total_cmp(&b.1)).map_or(0, |(i, _)| i as u32)
+    }).collect();
+    let last = std::fs::read(args.golden.join(format!("layer{:02}.bin", opened.cfg.layers - 1)))?;
+    let row = hidden * 2;
+    let embed = |ids: &[u32]| embed_rows(&opened.checkpoint, ids, hidden);
+    engine.mtp_reset(0, anchors[0]);
+    let (mut compared, mut matched, mut text, mut target) = (vec![0usize; stages], vec![0usize; stages], 0usize, 0usize);
+    let mut seconds = 0f64;
+    let mut filled = 0usize;
+    for &p in &anchors {
+        // Golden last-layer rows of positions < p into ring 0 of the hidden ring.
+        for j in filled.max(p.saturating_sub(mtp::HIDDEN_ROWS))..p {
+            let at = (j % mtp::HIDDEN_ROWS) * row;
+            opened.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer {
+                // SAFETY: one row inside the hidden ring.
+                ptr: unsafe { mtp.hidden.buffer.ptr.cast::<u8>().add(at) }.cast(), bytes: row, ..mtp.hidden.buffer },
+                &last[j * row..(j + 1) * row])?;
+        }
+        filled = p;
+        let timer = Instant::now();
+        let drafts = engine.mtp_draft(&[mtp::MtpSeq { ring: 0, len: p, tokens: &tokens[..=p] }], stages, &embed)?
+            .remove(0);
+        seconds += timer.elapsed().as_secs_f64();
+        for k in 0..stages {
+            if (0..k).all(|m| tokens.get(p + 1 + m) == Some(&drafts[m])) {
+                compared[k] += 1;
+                matched[k] += usize::from(drafts[k] == predictions[k * t + p - 1]);
+            }
+        }
+        text += drafts.iter().enumerate().take_while(|&(k, &d)| tokens.get(p + 1 + k) == Some(&d)).count();
+        target += drafts.iter().enumerate().take_while(|&(k, &d)| {
+            greedy.get(p + k) == Some(&d) && (k == 0 || tokens.get(p + k) == Some(&drafts[k - 1]))
+        }).count();
+    }
+    let n = anchors.len();
+    println!("MTP oracle: {n} anchors, {stages} stages; drafts equal to the reference (where comparable) {:?} of {:?}; \
+        accepted prefix vs text {:.2}, vs target greedy {:.2}; {:.2} ms/draft (incl. true-row catch-up)",
+        matched, compared, text as f64 / n as f64, target as f64 / n as f64, seconds * 1e3 / n as f64);
     Ok(())
 }
