@@ -80,9 +80,8 @@ struct StepTables {
     table_width: usize,
     table_stride: usize,
     cache_lengths: Vec<i32>,
-    /// Prefill: selected entries per row the sparse MLA reads (every earlier
-    /// token below the index top-k; the selection leads each indices row).
-    /// Decode rows keep the workspace's constant index top-k.
+    /// Selected entries per row the sparse MLA reads (every earlier token
+    /// below the index top-k; the selection leads each indices row).
     lengths: Vec<i32>,
 }
 
@@ -401,6 +400,9 @@ impl<'a> GlmEngine<'a> {
                 tables.positions.push(position as i64);
                 tables.slots.push(placement.slot(position)?);
                 tables.cache_lengths.push((position + 1) as i32);
+                // The index top-k selects every earlier token up to its k,
+                // leading the row: the sparse MLA reads only those.
+                tables.lengths.push((position + 1).min(self.cfg.index_topk) as i32);
                 // Power-of-two widths bound the graphs a growing context captures.
                 tables.table_width = tables.table_width.max((position + 1).div_ceil(PAGE_ROWS).next_power_of_two().min(stride));
                 let mut pages = placement.pages.clone();
@@ -436,9 +438,7 @@ impl<'a> GlmEngine<'a> {
         self.put(&w.slots, &tables.slots)?;
         self.put(&w.page_table, &tables.page_table)?;
         self.put(&w.cache_lengths, &tables.cache_lengths)?;
-        if !tables.decode {
-            self.put(&w.lengths, &tables.lengths)?;
-        }
+        self.put(&w.lengths, &tables.lengths)?;
         self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: embed.len(), ..w.h.buffer }, embed)?;
         let rows = Dsv4Scalar::I32(t as i32);
         let cap = if tables.decode { "m64" } else { "m4096" };
