@@ -31,6 +31,73 @@ pub(crate) fn e4m3(x: f32) -> u8 {
     sign | (((exponent + 7) as u8) << 3) | mantissa
 }
 
+/// The value of an E4M3 (fn) byte.
+pub(crate) fn e4m3_value(q: u8) -> f32 {
+    let sign = if q & 0x80 != 0 { -1.0 } else { 1.0 };
+    let (e, m) = (((q >> 3) & 0xF) as i32, (q & 7) as f32);
+    sign * if e == 0 { m / 8.0 * 2f32.powi(-6) } else { (1.0 + m / 8.0) * 2f32.powi(e - 7) }
+}
+
+/// Nearest E2M1 magnitude (0, 0.5, 1, 1.5, 2, 3, 4, 6; ties to the even code).
+fn e2m1(a: f32) -> f32 {
+    match a {
+        a if a <= 0.25 => 0.0,
+        a if a < 0.75 => 0.5,
+        a if a <= 1.25 => 1.0,
+        a if a < 1.75 => 1.5,
+        a if a <= 2.5 => 2.0,
+        a if a < 3.5 => 3.0,
+        a if a <= 5.0 => 4.0,
+        _ => 6.0,
+    }
+}
+
+/// A BF16 `[n, k]` weight quantized to NVFP4 (E2M1 values, one E4M3 scale per
+/// 16 values along K, no global scale) and dequantized back to BF16 (exact:
+/// every E2M1 x E4M3 product fits BF16), for numerics gates before a kernel
+/// exists. `search`: per group, the scale among 0.70..1.30 x amax/6 (E4M3
+/// rounded) with the least squared error, instead of amax/6.
+pub(crate) fn nvfp4_roundtrip(weight: &[u8], n: usize, k: usize, search: bool) -> Vec<u8> {
+    assert!(weight.len() == n * k * 2 && k % 16 == 0);
+    let mut out = vec![0u8; weight.len()];
+    let threads = std::thread::available_parallelism().map_or(8, |p| p.get()).min(32);
+    let per = n.div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        for (chunk, first) in out.chunks_mut(per * k * 2).zip((0..n).step_by(per)) {
+            scope.spawn(move || {
+                for row in first..(first + per).min(n) {
+                    for g in 0..k / 16 {
+                        let xs: Vec<f32> = (0..16).map(|i| bf16(weight, row * k + g * 16 + i)).collect();
+                        let amax = xs.iter().fold(0f32, |m, x| m.max(x.abs()));
+                        let quant = |s: f32| -> (f32, Vec<f32>) {
+                            let ys: Vec<f32> = xs.iter().map(|x| x.signum() * e2m1(x.abs() / s) * s).collect();
+                            (xs.iter().zip(&ys).map(|(x, y)| (x - y) * (x - y)).sum(), ys)
+                        };
+                        let scale = |f: f32| e4m3_value(e4m3(amax / 6.0 * f)).max(f32::MIN_POSITIVE);
+                        let mut best = quant(scale(1.0));
+                        if search && amax > 0.0 {
+                            for step in 0..=24 {
+                                let candidate = quant(scale(0.70 + 0.025 * step as f32));
+                                if candidate.0 < best.0 {
+                                    best = candidate;
+                                }
+                            }
+                        }
+                        if amax == 0.0 {
+                            best.1 = vec![0.0; 16];
+                        }
+                        for (i, y) in best.1.iter().enumerate() {
+                            let at = ((row - first) * k + g * 16 + i) * 2;
+                            chunk[at..at + 2].copy_from_slice(&((y.to_bits() >> 16) as u16).to_le_bytes());
+                        }
+                    }
+                }
+            });
+        }
+    });
+    out
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum KdaFp8 {
     /// BF16 KDA projections (the checkpoint's own precision).
@@ -106,9 +173,7 @@ mod tests {
     use super::*;
 
     fn decode(q: u8) -> f32 {
-        let sign = if q & 0x80 != 0 { -1.0 } else { 1.0 };
-        let (e, m) = (((q >> 3) & 0xF) as i32, (q & 7) as f32);
-        sign * if e == 0 { m / 8.0 * 2f32.powi(-6) } else { (1.0 + m / 8.0) * 2f32.powi(e - 7) }
+        e4m3_value(q)
     }
 
     #[test]

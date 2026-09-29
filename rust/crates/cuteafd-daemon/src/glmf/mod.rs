@@ -68,6 +68,10 @@ pub(crate) struct EngineArgs {
     /// FP8 KDA projections for decode rows, quantized per row at load.
     #[arg(long, value_enum, default_value = "off")]
     pub kda_fp8: fp8::KdaFp8,
+    /// Numerics gate only: round the KDA projections through NVFP4 (group 16,
+    /// E4M3 scales) at load and run them as BF16: `rtn` (amax/6) or `search`.
+    #[arg(long, hide = true)]
+    pub kda_nvfp4_gate: Option<String>,
     /// Keep every prefill row's logits (glmf-golden --nll; 2.5 GiB at 4096 rows).
     #[arg(long, hide = true)]
     pub full_prefill_logits: bool,
@@ -164,7 +168,8 @@ impl Opened {
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::GlmfLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
-            fp8_dense: args.fp8_decode, fp8_source: self.fp8_checkpoint.as_ref(), kda_fp8: args.kda_fp8 };
+            fp8_dense: args.fp8_decode, fp8_source: self.fp8_checkpoint.as_ref(), kda_fp8: args.kda_fp8,
+            kda_nvfp4: args.kda_nvfp4_gate.as_deref().map(|mode| mode == "search") };
         let model = loader.model(&self.cfg, layers)?;
         let resident: usize = model.layers.iter().map(weights::GlmfLayer::bytes).sum();
         tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64, fp8_decode = args.fp8_decode,

@@ -65,6 +65,8 @@ pub(crate) struct GlmfLoader<'a> {
     pub fp8_dense: bool,
     pub fp8_source: Option<&'a Checkpoint>,
     pub kda_fp8: super::fp8::KdaFp8,
+    /// Numerics gate only: KDA projections rounded through NVFP4 (Some(search)) and kept in BF16.
+    pub kda_nvfp4: Option<bool>,
 }
 
 fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
@@ -263,14 +265,33 @@ impl<'a> GlmfLoader<'a> {
                     ops.insert("w_o_fp8", q);
                     ops.insert("w_o_scale", s);
                 }
-                ops.insert("w_in", self.rows(&w_in)?);
+                if let Some(search) = self.kda_nvfp4 {
+                    let mut bytes = Vec::new();
+                    for name in w_in.iter().chain([a("o_proj.weight")].iter()) {
+                        let (raw, dtype, shape) = self.raw(name)?;
+                        ensure!(dtype == DType::Bf16, "{name}: NVFP4 gate needs BF16");
+                        let rounded = super::fp8::nvfp4_roundtrip(&raw, shape[0], shape[1], search);
+                        if name.ends_with("o_proj.weight") {
+                            ops.insert("w_o_nvfp4", self.upload(&rounded)?);
+                        } else {
+                            bytes.extend(rounded);
+                        }
+                    }
+                    ops.insert("w_in", self.upload(&bytes)?);
+                } else {
+                    ops.insert("w_in", self.rows(&w_in)?);
+                }
                 ops.insert("w_fg", self.rows(&[a("f_b_proj.weight"), a("g_b_proj.weight")])?);
                 // [3D, 1, 4] each -> FP32 [3D, 4].
                 ops.insert("conv_w", self.f32(&["q", "k", "v"].map(|n| a(&format!("{n}_conv1d.weight"))))?);
                 ops.insert("a_log", self.f32(&[a("A_log")])?);
                 ops.insert("dt_bias", self.f32(&[a("dt_bias")])?);
                 ops.insert("o_norm", self.one(&a("o_norm.weight"))?);
-                ops.insert("w_o", self.one(&a("o_proj.weight"))?);
+                let w_o = match ops.remove("w_o_nvfp4") {
+                    Some(rounded) => rounded,
+                    None => self.one(&a("o_proj.weight"))?,
+                };
+                ops.insert("w_o", w_o);
             }
             GlmNextAttention::Mla => {
                 ops.insert("w_qkv_a", self.rows(&[a("q_a_proj.weight"), a("kv_a_proj_with_mqa.weight")])?);
