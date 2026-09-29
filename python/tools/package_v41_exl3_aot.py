@@ -95,6 +95,8 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
         # Absent means the original 8-row packed-route block.
         if variant.get('route_block', 8) != meta.get('route_block', 8):
             raise ValueError(f'EXL3 variant route block mismatch: {directory}')
+        if variant.get('token_major_rotation', False) != meta.get('token_major_rotation', False):
+            raise ValueError(f'EXL3 variant input rotation mismatch: {directory}')
         if meta['capacity'] in overrides and meta.get('blocks_per_sm') != overrides[meta['capacity']]:
             raise ValueError('EXL3 compiled residency differs from requested override')
         boundary = meta.get('paired_boundary')
@@ -224,12 +226,22 @@ def route_block(geometry: str, capacity: int) -> int:
     (H7168, 384 experts, top-6: ~64 rows per expert at 4096 rows) re-decodes every
     weight tile once per 8 rows, so wide prefill capacities use wider blocks
     (GB10, TP4 width 768, random top-6 routes: m4096 53 -> 25 ms, m1024 15 -> 11 ms;
-    m81..256 stays fastest at 8). The coordinator's whole-intermediate rtx-tp1 package
+    m81..256 stays fastest at 8). At m4096, 64-row blocks skip their empty M16
+    fragments (b12x 4d7cb455), so they beat 32 from about 2048 rows up. The coordinator's whole-intermediate rtx-tp1 package
     gains the same way (RTX PRO 6000, width 3072: m4096 74 -> 35 ms, m1024 23 -> 16 ms).
     """
     if geometry != 'dsv4p' or capacity <= 256:
         return 8
-    return 16 if capacity <= 1024 else 32
+    return 16 if capacity <= 1024 else 64
+
+
+def token_major_rotation(geometry: str, capacity: int) -> bool:
+    """Whether a capacity rotates each token's input once for all of its routes.
+
+    Bit-identical to per-route rotation. It pays where the rotation phase is
+    large (V4 Pro m2048..4096 prefill); at m1024 and below it is neutral.
+    """
+    return geometry == 'dsv4p' and capacity > 1024
 
 
 def package_name(geometry: str, bits: list[int]) -> str:
@@ -409,6 +421,8 @@ def build(args: argparse.Namespace) -> None:
                     options['hidden'] = hidden
                 if (block := route_block(geometry, capacity)) != 8:
                     options['route_block'] = block
+                if token_major_rotation(geometry, capacity):
+                    options['token_major_rotation'] = True
                 meta = export(raw, width, experts, capacity, tuple(args.bits), 'auto', topk, dtype, **options)
                 core = raw / 'libcuteafd_exl3.so'
                 subprocess.run([args.cxx, '-shared', '-fPIC', '-std=c++17',
@@ -442,6 +456,8 @@ def build(args: argparse.Namespace) -> None:
                         variant['tile_requested'] = list(tile)
                     if 'route_block' in meta:
                         variant['route_block'] = meta['route_block']
+                    if meta.get('token_major_rotation'):
+                        variant['token_major_rotation'] = True
                     variants.append(variant)
                     if paired:
                         variants[-1]['paired_boundary'] = meta['paired_boundary']
