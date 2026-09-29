@@ -73,10 +73,15 @@ pub(crate) struct ExpertProbeArgs {
     /// Time this many more round trips after the checked one (median, min).
     #[arg(long, default_value_t = 0)]
     pub(crate) repeat: usize,
-    /// With `--local` on an FP8 checkpoint: the TP1 package layout directory
-    /// (default `<libdir>/fp8/fp8-<family>/tp1`).
+    /// With `--local` on an FP8 checkpoint: the package layout directory
+    /// (default `<libdir>/fp8/fp8-<family>/tp<local-tp>`).
     #[arg(long)]
     pub(crate) fp8_package: Option<PathBuf>,
+    /// With `--local` on an FP8 checkpoint: run every rank slice of TP degree
+    /// N on this GPU in turn (a Spark package's tp2/tp4 layout) and sum the
+    /// BF16 rank partials in FP32, as the coordinator does.
+    #[arg(long, default_value_t = 1, requires = "local")]
+    pub(crate) local_tp: usize,
 }
 
 #[derive(Debug, Args)]

@@ -41,22 +41,30 @@ impl ExpertGeometry {
 
     /// Native expert kernel family: the symbol prefix (`cuteafd_{family}_*`)
     /// and exporter `--geometry` name of the AOT kernels built for this shape.
+    /// The layer-id bound is not part of the kernel shape: an FP8 GLM catalog
+    /// also serves its MTP layer (id 78, bound 79) with the `glm` kernels.
     pub fn family(&self) -> Option<&'static str> {
-        match *self {
-            Self::DEEPSEEK_V41 => Some("v41"),
-            Self::DEEPSEEK_V4_FLASH => Some("dsv4f"),
-            Self::DEEPSEEK_V4_PRO => Some("dsv4p"),
-            Self::GLM_DSA => Some("glm"),
-            Self::MIMO_V2_FLASH => Some("mimo"),
-            Self::GLM_NEXT => Some("glmf"),
-            _ => None,
-        }
+        [
+            (Self::DEEPSEEK_V41, "v41"),
+            (Self::DEEPSEEK_V4_FLASH, "dsv4f"),
+            (Self::DEEPSEEK_V4_PRO, "dsv4p"),
+            (Self::GLM_DSA, "glm"),
+            (Self::MIMO_V2_FLASH, "mimo"),
+            (Self::GLM_NEXT, "glmf"),
+        ]
+        .into_iter()
+        .find_map(|(shape, family)| self.same_shape(&shape).then_some(family))
     }
 
     /// Routed-expert SwiGLU clamp: DeepSeek and GLM 5.3 Flash clamp gate/up at
     /// 10; GLM 5.x's and MiMo's SwiGLU are unclamped (`None`).
     pub fn swiglu_limit(&self) -> Option<f32> {
-        (*self != Self::GLM_DSA && *self != Self::MIMO_V2_FLASH).then_some(10.0)
+        (!self.same_shape(&Self::GLM_DSA) && !self.same_shape(&Self::MIMO_V2_FLASH)).then_some(10.0)
+    }
+
+    /// Equal kernel shape (hidden, experts, top-k, intermediate), any layer bound.
+    pub fn same_shape(&self, other: &Self) -> bool {
+        Self { layers: other.layers, ..*self } == *other
     }
 
     /// A short stable key for artifact and symbol names.
@@ -102,5 +110,8 @@ mod tests {
         assert_eq!(ExpertGeometry::MIMO_V2_FLASH.family(), Some("mimo"));
         assert_eq!(ExpertGeometry::MIMO_V2_FLASH.swiglu_limit(), None);
         assert_eq!(ExpertGeometry::MIMO_V2_FLASH.slice(4), Some(512));
+        let glm_with_mtp = ExpertGeometry { layers: 79, ..ExpertGeometry::GLM_DSA };
+        assert_eq!(glm_with_mtp.family(), Some("glm"));
+        assert_eq!(glm_with_mtp.swiglu_limit(), None);
     }
 }

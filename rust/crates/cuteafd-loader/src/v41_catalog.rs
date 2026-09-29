@@ -751,8 +751,10 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> R
     };
     if config["quantization_config"]["quant_method"] == "fp8" {
         // The official FP8 experts (~675 GiB) do not fit the Spark pool; the
-        // catalog serves coordinator-resident FP8 layers (the MTP layer).
-        return fp8_catalog(snapshot, shape);
+        // catalog serves selected layers, above all the MTP layer, whose ids
+        // follow the backbone (num_hidden_layers..): the id bound includes them.
+        let mtp = text["num_nextn_predict_layers"].as_u64().unwrap_or(0) as usize;
+        return fp8_catalog(snapshot, RoutedExpertShape { layers: layers + mtp, ..shape });
     }
     ensure!(
         config["quantization_config"]["quant_method"] == "exl3",
