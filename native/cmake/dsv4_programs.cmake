@@ -1,10 +1,23 @@
-# DeepSeek V4 coordinator programs (SM120): b12x.integration.cuteafd exports
-# launched through the generic table in src/dsv4_programs.cc.
+# Coordinator programs (SM120): b12x.integration.cuteafd exports launched
+# through the generic table in src/dsv4_programs.cc. DeepSeek V4
+# (CUTEAFD_ENABLE_DSV4_AOT, CUTEAFD_DSV4_GEOMETRY) and GLM 5.x
+# (CUTEAFD_ENABLE_GLM_AOT, geometry "glm") share one table and manifest.
 if(NOT CUTEAFD_CUDA_ARCHITECTURES MATCHES "^120")
-  message(FATAL_ERROR "DeepSeek V4 coordinator programs require the SM120 build")
+  message(FATAL_ERROR "coordinator programs require the SM120 build")
+endif()
+set(CUTEAFD_PROGRAM_GEOMETRY "")
+if(CUTEAFD_ENABLE_DSV4_AOT)
+  set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_DSV4_GEOMETRY}")
+endif()
+if(CUTEAFD_ENABLE_GLM_AOT)
+  if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
+    set(CUTEAFD_PROGRAM_GEOMETRY "glm")
+  else()
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},glm")
+  endif()
 endif()
 set(CUTEAFD_DSV4_DIR "${CMAKE_CURRENT_BINARY_DIR}/dsv4_programs")
-set(CUTEAFD_DSV4_EXPORT_ARGS --geometry "${CUTEAFD_DSV4_GEOMETRY}"
+set(CUTEAFD_DSV4_EXPORT_ARGS --geometry "${CUTEAFD_PROGRAM_GEOMETRY}"
   --decode-rows "${CUTEAFD_DSV4_DECODE_ROWS}" --prefill-rows "${CUTEAFD_DSV4_PREFILL_ROWS}"
   --max-context "${CUTEAFD_DSV4_MAX_CONTEXT}")
 set(stamp "${CMAKE_CURRENT_BINARY_DIR}/dsv4_programs.stamp")
@@ -23,7 +36,7 @@ add_custom_command(
   COMMAND sh -c "${CMAKE_AR} qcs '${CUTEAFD_DSV4_ARCHIVE}' '${CUTEAFD_DSV4_DIR}'/*.o"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/export_b12x_dsv4_aot.py" "${stamp}"
     ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
-  COMMENT "Exporting DeepSeek V4 coordinator programs"
+  COMMENT "Exporting coordinator programs (${CUTEAFD_PROGRAM_GEOMETRY})"
   VERBATIM)
 add_custom_target(cuteafd_dsv4_programs_export DEPENDS
   "${CUTEAFD_DSV4_DIR}/dsv4_programs.h" "${CUTEAFD_DSV4_ARCHIVE}")

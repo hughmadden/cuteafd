@@ -442,6 +442,7 @@ docker run --rm \
   -e CUDA_VISIBLE_DEVICES=0 \
   -e NVIDIA_VISIBLE_DEVICES=0 \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}" \
+  -e "CUTEAFD_RELEASE_GLM_AOT=${CUTEAFD_RELEASE_GLM_AOT:-OFF}" \
   ${release_build_root_args[@]+"${release_build_root_args[@]}"} \
   -v "$repo_root:/source:ro" \
   -v "$artifact_dir:/output" \

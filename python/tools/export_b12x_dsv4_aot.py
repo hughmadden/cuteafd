@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Export the DeepSeek V4 coordinator programs (b12x.integration.cuteafd).
+"""Export the coordinator programs (b12x.integration.cuteafd): DeepSeek V4
+(``--geometry flash,pro``, families ``dsv4f``/``dsv4p``) and GLM 5.x
+(``--geometry glm``, family ``glm``), in any combination, into one table.
 
 One object and header per program, a manifest with every program's pointer
 ABI and scratch sizes at its capacity, and ``dsv4_programs.h``: the table the
@@ -88,11 +90,47 @@ def programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     return out
 
 
+def glm_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
+    """GLM 5.x programs, same (stem suffix, op, params, thunk) shape as ``programs``."""
+    from b12x.integration.cuteafd import glm_attention as attn
+    from b12x.integration.cuteafd import glm_ffn as ffn
+    from b12x.integration.cuteafd import glm_indexer as idx
+    from b12x.integration.cuteafd import glm_sparse_mla as mla
+
+    # Index and latent caches: one row per token, 64 rows per page.
+    index_pages = -(-max_context // PAGE_ROWS)
+    out = [
+        ("norm", "norm", {}, lambda: ffn.compile_glm_norm_aot(g)),
+        ("router_scores", "router_scores", {}, lambda: ffn.compile_glm_router_scores_aot(g)),
+        ("expert_input_quant", "expert_input_quant", {}, lambda: ffn.compile_glm_expert_input_quant_aot(g)),
+    ]
+    for rows in (decode_rows, prefill_rows):
+        out += [
+            (f"producer_m{rows}", "producer", {"max_rows": rows},
+             lambda r=rows: attn.compile_glm_producer_aot(g, max_rows=r)),
+            (f"index_producer_m{rows}", "index_producer", {"max_rows": rows},
+             lambda r=rows: attn.compile_glm_index_producer_aot(g, max_rows=r)),
+            (f"o_m{rows}", "o", {"max_rows": rows},
+             lambda r=rows: attn.compile_glm_o_aot(g, max_rows=r)),
+        ]
+        for inter in (g.moe_inter, g.dense_inter):
+            out.append((f"ffn_i{inter}_m{rows}", "ffn", {"max_rows": rows, "inter": inter},
+                        lambda r=rows, i=inter: ffn.compile_glm_ffn_aot(g, inter=i, max_rows=r)))
+    for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
+        out.append((f"index_topk_{mode}_m{rows}", "index_topk",
+                    {"mode": mode, "max_rows": rows, "max_pages": index_pages},
+                    lambda mode=mode, rows=rows: idx.compile_glm_index_topk_aot(
+                        g, max_rows=rows, max_pages=index_pages, mode=mode)))
+        out.append((f"sparse_mla_{mode}_m{rows}", "sparse_mla", {"route": mode, "max_rows": rows},
+                    lambda mode=mode, rows=rows: mla.compile_glm_sparse_mla_aot(g, route=mode, max_rows=rows)))
+    return out
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--geometry", default="flash",
-                        help="comma-separated DeepSeek V4 geometries (flash, pro) in one table")
+                        help="comma-separated geometries in one table: flash, pro (DeepSeek V4), glm (GLM 5.x)")
     parser.add_argument("--decode-rows", type=int, default=64)
     parser.add_argument("--prefill-rows", type=int, default=4096)
     parser.add_argument("--max-context", type=int, default=131072)
@@ -100,14 +138,14 @@ def main() -> None:
     args = parser.parse_args()
 
     import torch
-    from b12x.integration.cuteafd import FLASH, PRO, exportable_compilation, validate_exported_header
+    from b12x.integration.cuteafd import FLASH, GLM53, PRO, exportable_compilation, validate_exported_header
 
     geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
-    if not geometries or any(name not in ("flash", "pro") for name in geometries):
-        raise SystemExit("--geometry takes flash and/or pro")
+    if not geometries or any(name not in ("flash", "pro", "glm") for name in geometries):
+        raise SystemExit("--geometry takes flash, pro and/or glm")
     props = torch.cuda.get_device_properties(0)
     if (props.major, props.minor) != (12, 0):
-        raise SystemExit("DeepSeek V4 coordinator programs export on SM120")
+        raise SystemExit("coordinator programs export on SM120")
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
     selected = set(args.only.split(",")) if args.only else None
@@ -123,10 +161,11 @@ def main() -> None:
     entries, includes = [], []
     work = []
     for name in geometries:
-        g = {"flash": FLASH, "pro": PRO}[name]
-        family = {"flash": "dsv4f", "pro": "dsv4p"}[name]
+        g = {"flash": FLASH, "pro": PRO, "glm": GLM53}[name]
+        family = {"flash": "dsv4f", "pro": "dsv4p", "glm": "glm"}[name]
         manifest["families"][family] = {k: v for k, v in vars(g).items()}
-        work += [(family, *item) for item in programs(g, args.decode_rows, args.prefill_rows, args.max_context)]
+        make = glm_programs if name == "glm" else programs
+        work += [(family, *item) for item in make(g, args.decode_rows, args.prefill_rows, args.max_context)]
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
             continue
