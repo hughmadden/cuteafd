@@ -766,6 +766,7 @@ mod http_503_mapping {
             images: Vec::new(),
             max_tokens: 1,
             sampling: Default::default(),
+            stop_token_ids: Vec::new(),
             events,
         }
     }

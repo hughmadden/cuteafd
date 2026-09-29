@@ -280,3 +280,188 @@ fn turn_markers_and_client_stop_sequences_end_output() {
     assert_eq!((projection.calls.len(), projection.stop), (1, None));
 }
 
+// ---------------------------------------------------------------- router
+
+mod router {
+    use super::*;
+    use crate::native_v41::{router_for_model, ConsoleHub, InferenceChunk, InferenceFinishReason, ModelEncoding,
+        ModelProfile, NativeLimits, NativeRequest, PromptUsage};
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
+    use tower::ServiceExt;
+
+    const MODEL: &str = "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1";
+
+    fn app(queue: mpsc::Sender<NativeRequest>) -> axum::Router {
+        let profile = ModelProfile::new(MODEL, ModelEncoding::Glm(Arc::new(encoding())));
+        router_for_model(queue, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+            std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile)
+    }
+
+    /// Serve one request whose worker streams `text` a character at a time.
+    async fn serve(body: Value, text: &'static str, check: impl FnOnce(&NativeRequest) + Send + 'static)
+        -> (StatusCode, Vec<u8>) {
+        let (queue, mut receive) = mpsc::channel::<NativeRequest>(1);
+        let worker = tokio::spawn(async move {
+            let job = receive.recv().await.unwrap();
+            check(&job);
+            let _ = job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
+                prompt_usage: PromptUsage { prompt_tokens: 9, prompt_cache_hit_tokens: 0 } })).await;
+            for character in text.chars() {
+                if job.events.send(Ok(InferenceChunk::Text { content: character.to_string(), content_tokens: 1 })).await.is_err() {
+                    return;
+                }
+            }
+            let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop })).await;
+        });
+        let request = Request::post("/v1/chat/completions").header("content-type", "application/json")
+            .body(Body::from(body.to_string())).unwrap();
+        let response = app(queue).oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec();
+        worker.await.unwrap();
+        (status, bytes)
+    }
+
+    fn sse_events(bytes: &[u8]) -> Vec<Value> {
+        let text = std::str::from_utf8(bytes).unwrap();
+        assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+        text.split("\n\n").filter_map(|event| event.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]").map(|data| serde_json::from_str(data).unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn answer_with_reasoning_in_both_response_modes() {
+        for streaming in [false, true] {
+            let body = json!({"model": MODEL, "messages": [{"role": "user", "content": "2+2?"}], "stream": streaming});
+            let (status, bytes) = serve(body, "Add them.</think>\n4", |job| {
+                assert_eq!(job.prompt, "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>2+2?<|assistant|><think>");
+                assert!(job.constraint.is_none());
+                assert!(job.stop_token_ids.contains(&154_843) && job.stop_token_ids.contains(&154_829));
+            }).await;
+            assert_eq!(status, StatusCode::OK);
+            if streaming {
+                let events = sse_events(&bytes);
+                let field = |name: &str| events.iter()
+                    .filter_map(|event| event["choices"][0]["delta"][name].as_str()).collect::<String>();
+                assert_eq!((field("reasoning_content").as_str(), field("content").as_str()), ("Add them.", "4"));
+                assert_eq!(events.last().unwrap()["choices"][0]["finish_reason"], "stop");
+            } else {
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                let message = &value["choices"][0]["message"];
+                assert_eq!((message["reasoning_content"].as_str(), message["content"].as_str()), (Some("Add them."), Some("4")));
+                assert_eq!(value["choices"][0]["finish_reason"], "stop");
+                assert_eq!(value["usage"]["completion_tokens"], 19);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_calls_stream_and_aggregate_with_tool_calls_finish() {
+        let tools = json!([{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object",
+            "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}}}}]);
+        for streaming in [false, true] {
+            let body = json!({"model": MODEL, "stream": streaming, "tools": tools,
+                "messages": [{"role": "user", "content": "Weather in Taipei for 2 days?"}]});
+            let (status, bytes) = serve(body,
+                "Use lookup.</think>\n<tool_call>lookup<arg_key>city</arg_key><arg_value>Taipei</arg_value><arg_key>days</arg_key><arg_value>2</arg_value></tool_call>",
+                |job| {
+                    assert!(job.prompt.contains("<tools>\n{\"name\": \"lookup\", \"parameters\": {\"type\": \"object\""));
+                    // Auto choice without strict tools is unconstrained (glmrt default).
+                    assert!(job.constraint.is_none());
+                    assert!(!job.stop_token_ids.contains(&154_843));
+                }).await;
+            assert_eq!(status, StatusCode::OK);
+            let (name, arguments, finish) = if streaming {
+                let events = sse_events(&bytes);
+                let deltas: Vec<&Value> = events.iter()
+                    .flat_map(|event| event["choices"][0]["delta"]["tool_calls"].as_array().into_iter().flatten()).collect();
+                assert!(deltas.len() > 2, "arguments stream incrementally");
+                let name = deltas[0]["function"]["name"].as_str().unwrap().to_owned();
+                let arguments: String = deltas.iter().filter_map(|d| d["function"]["arguments"].as_str()).collect();
+                (name, arguments, events.last().unwrap()["choices"][0]["finish_reason"].clone())
+            } else {
+                let value: Value = serde_json::from_slice(&bytes).unwrap();
+                let call = &value["choices"][0]["message"]["tool_calls"][0];
+                assert_eq!(call["type"], "function");
+                (call["function"]["name"].as_str().unwrap().to_owned(),
+                    call["function"]["arguments"].as_str().unwrap().to_owned(), value["choices"][0]["finish_reason"].clone())
+            };
+            assert_eq!(name, "lookup");
+            assert_eq!(serde_json::from_str::<Value>(&arguments).unwrap(), json!({"city": "Taipei", "days": 2}));
+            assert_eq!(finish, "tool_calls");
+        }
+    }
+
+    #[tokio::test]
+    async fn required_strict_tool_uses_the_glm_xml_grammar_after_reasoning() {
+        let tools = json!([{"type": "function", "function": {"name": "lookup", "strict": true, "parameters": {
+            "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"], "additionalProperties": false}}},
+            {"type": "function", "function": {"name": "other"}}]);
+        for (choice, valid) in [(json!("required"), true), (json!({"type": "function", "function": {"name": "lookup"}}), true),
+            (json!("required"), false)] {
+            let body = json!({"model": MODEL, "tools": tools, "tool_choice": choice, "parallel_tool_calls": false,
+                "messages": [{"role": "user", "content": "Weather?"}]});
+            let named = body["tool_choice"].is_object();
+            let text = if valid { "Must call.</think><tool_call>lookup<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>" }
+                else { "Must call.</think>No." };
+            let (status, _) = serve(body, text, move |job| {
+                let grammar: Value = serde_json::from_str(&job.constraint.as_ref().unwrap().0).unwrap();
+                let format = &grammar["format"];
+                assert_eq!((format["type"].as_str(), format["elements"][1]["token"].as_u64()), (Some("sequence"), Some(154_842)));
+                assert_eq!(format["elements"][0]["exclude_tokens"], json!([154_842]));
+                let calls = &format["elements"][2];
+                assert_eq!((calls["type"].as_str(), calls["at_least_one"].as_bool(), calls["stop_after_first"].as_bool()),
+                    (Some("tags_with_separator"), Some(true), Some(true)));
+                assert_eq!(calls["tags"][0]["begin"], "<tool_call>lookup");
+                assert_eq!(calls["tags"][0]["content"]["style"], "glm_xml");
+                assert_eq!(calls["tags"].as_array().unwrap().len(), if named { 1 } else { 2 });
+                let instruction = if named { "<|system|>You must call the function lookup." }
+                    else { "<|system|>You must call at least one provided function." };
+                assert!(job.prompt.contains(instruction), "{}", job.prompt);
+            }).await;
+            assert_eq!(status, if valid { StatusCode::OK } else { StatusCode::INTERNAL_SERVER_ERROR });
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_turn_tool_round_trip_prompt_matches_transformers() {
+        let case = goldens().into_iter().find(|case| case["name"] == "tool_round_trip").unwrap();
+        let mut body = request_for(&case["context"]);
+        body["model"] = json!(MODEL);
+        let expected = case["expected"]["exl3_k4"].as_str().unwrap().to_owned();
+        let (status, _) = serve(body, "Paris.</think>Checking Paris next.", move |job| {
+            assert_eq!(job.prompt, expected);
+        }).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn thinking_toggles_and_model_metadata() {
+        for (options, suffix) in [
+            (json!({"thinking": {"type": "disabled"}}), "<|assistant|><think></think>"),
+            (json!({"reasoning_effort": "none"}), "<|assistant|><think></think>"),
+            (json!({"chat_template_kwargs": {"enable_thinking": false}}), "<|assistant|><think></think>"),
+            (json!({"reasoning_effort": "low"}), "<|assistant|><think>"),
+        ] {
+            let mut body = json!({"model": MODEL, "messages": [{"role": "user", "content": "Hi"}]});
+            body.as_object_mut().unwrap().extend(options.as_object().unwrap().clone());
+            let low = options.get("reasoning_effort") == Some(&json!("low"));
+            let (status, bytes) = serve(body, "Hello.", move |job| {
+                assert!(job.prompt.ends_with(suffix), "{}", job.prompt);
+                assert_eq!(job.prompt.contains("Reasoning Effort: Low"), low);
+            }).await;
+            assert_eq!(status, StatusCode::OK);
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            let expected = if suffix.ends_with("</think>") { ("Hello.", None) } else { ("", Some("Hello.")) };
+            let message = &value["choices"][0]["message"];
+            assert_eq!((message["content"].as_str().unwrap_or(""), message["reasoning_content"].as_str()), expected);
+        }
+        let (queue, _receive) = mpsc::channel::<NativeRequest>(1);
+        let response = app(queue).oneshot(Request::get("/v1/models").body(Body::empty()).unwrap()).await.unwrap();
+        let value: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 16).await.unwrap()).unwrap();
+        assert_eq!((value["data"][0]["id"].as_str(), value["data"][0]["owned_by"].as_str()), (Some(MODEL), Some("wrldsuksgo2mars")));
+    }
+}

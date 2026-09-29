@@ -5,7 +5,10 @@ use serde_json::{json, Value};
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NativeConstraint(pub String);
 
-pub(super) fn response_constraint(format: Option<Value>, thinking: bool, tools: Option<&super::tools::ToolConstraints>) -> Result<Option<NativeConstraint>> {
+/// Compose the answer format, tool calls and (when thinking) a reasoning
+/// prefix ending at `think_close_token`.
+pub(super) fn response_constraint(format: Option<Value>, thinking: bool, tools: Option<&super::tools::ToolConstraints>,
+    think_close_token: u32) -> Result<Option<NativeConstraint>> {
     let content = match format.as_ref().and_then(|v| v.get("type")).and_then(Value::as_str) {
         None if format.is_none() => None,
         Some("text") => None,
@@ -29,18 +32,17 @@ pub(super) fn response_constraint(format: Option<Value>, thinking: bool, tools: 
         }
         _ => anyhow::bail!("unsupported response_format type"),
     };
-    let content = match (content, tools.and_then(|t| t.format.as_ref())) {
-        (Some(answer), Some(calls)) if !tools.unwrap().required => json!({"type":"or", "elements":[answer,calls]}),
-        (_, Some(calls)) if tools.unwrap().required => calls.clone(),
-        (None, Some(calls)) => json!({"type":"triggered_tags", "triggers":["<｜DSML｜ calls>"],
-            "tags":[calls], "at_least_one":false, "stop_after_first":true}),
+    let content = match (content, tools.filter(|t| t.format.is_some())) {
+        (Some(answer), Some(tools)) if !tools.required => json!({"type":"or", "elements":[answer, tools.format.clone()]}),
+        (_, Some(tools)) if tools.required => tools.format.clone().expect("filtered"),
+        (None, Some(tools)) => tools.triggered.clone().expect("tool formats come in pairs"),
         (Some(answer), _) => answer,
         (None, None) => return Ok(None),
     };
     let format = if thinking {
         json!({"type":"sequence", "elements":[
-            {"type":"any_tokens", "exclude_tokens":[128822]},
-            {"type":"token", "token":128822}, content]})
+            {"type":"any_tokens", "exclude_tokens":[think_close_token]},
+            {"type":"token", "token":think_close_token}, content]})
     } else { content };
     Ok(Some(NativeConstraint(serde_json::to_string(&json!({"type":"structural_tag", "format":format}))?)))
 }
@@ -77,14 +79,14 @@ mod tests {
     fn schema_survives_conversion_and_reasoning_wrap() {
         let schema = json!({"type":"object", "properties":{"value":{"const":"allowed"}}, "required":["value"]});
         for thinking in [false, true] {
-            let result = response_constraint(Some(json!({"type":"json_schema", "json_schema":{"schema":schema,"strict":false}})), thinking, None).unwrap().unwrap();
+            let result = response_constraint(Some(json!({"type":"json_schema", "json_schema":{"schema":schema,"strict":false}})), thinking, None, 128822).unwrap().unwrap();
             let encoded: Value = serde_json::from_str(&result.0).unwrap();
             let content = if thinking { &encoded["format"]["elements"][2] } else { &encoded["format"] };
             assert_eq!(content["json_schema"], schema);
             assert_eq!(content["strict"], false);
         }
-        assert!(response_constraint(Some(json!({"type":"json_schema"})), false, None).is_err());
-        assert!(response_constraint(Some(json!({"type":"json_schema","json_schema":{"schema":{"type":"invalid"}}})), false, None).is_err());
+        assert!(response_constraint(Some(json!({"type":"json_schema"})), false, None, 128822).is_err());
+        assert!(response_constraint(Some(json!({"type":"json_schema","json_schema":{"schema":{"type":"invalid"}}})), false, None, 128822).is_err());
     }
     #[test]
     fn validation_respects_modern_and_declared_legacy_tuple_dialects() {

@@ -25,23 +25,72 @@ use tokio::sync::mpsc;
 
 pub const MODEL: &str = "deepseek-ai/DeepSeek-V4.1-Flash";
 
-/// Prompt rendering a served model uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// DeepSeek V4/V4.1 `<｜end▁of▁sentence｜>`.
+pub const DEEPSEEK_EOS_TOKEN_ID: u32 = 1;
+/// DeepSeek V4/V4.1 `</think>`.
+const DEEPSEEK_THINK_CLOSE_TOKEN_ID: u32 = 128_822;
+
+/// Prompt rendering and output parsing a served model uses.
+#[derive(Debug, Clone)]
 pub enum ModelEncoding {
     DeepseekV4,
     DeepseekV41,
+    /// GLM 5.x: the checkpoint's chat template and GLM XML tool calls.
+    Glm(Arc<glm::GlmEncoding>),
 }
 
-/// The served model's public id and prompt encoding.
+impl ModelEncoding {
+    /// The checkpoint's end-of-sequence token ids.
+    pub fn eos_token_ids(&self) -> Vec<u32> {
+        match self {
+            Self::DeepseekV4 | Self::DeepseekV41 => vec![DEEPSEEK_EOS_TOKEN_ID],
+            Self::Glm(encoding) => encoding.tokens().eos.clone(),
+        }
+    }
+
+    fn think_close_token_id(&self) -> u32 {
+        match self {
+            Self::DeepseekV4 | Self::DeepseekV41 => DEEPSEEK_THINK_CLOSE_TOKEN_ID,
+            Self::Glm(encoding) => encoding.tokens().think_close,
+        }
+    }
+}
+
+/// The served model's public id, prompt encoding and EOS token ids.
 #[derive(Debug, Clone)]
 pub struct ModelProfile {
     pub id: String,
     pub encoding: ModelEncoding,
+    /// Token ids that end generation. Requests carry these (plus any
+    /// family turn markers) in `NativeRequest::stop_token_ids`.
+    pub eos_token_ids: Vec<u32>,
+}
+
+impl ModelProfile {
+    /// A profile whose EOS ids come from `encoding`.
+    pub fn new(id: impl Into<String>, encoding: ModelEncoding) -> Self {
+        let eos_token_ids = encoding.eos_token_ids();
+        Self { id: id.into(), encoding, eos_token_ids }
+    }
+
+    /// Token ids that end generation for one request.
+    fn stop_token_ids(&self, tools_declared: bool) -> Vec<u32> {
+        match &self.encoding {
+            ModelEncoding::Glm(encoding) => {
+                let mut ids = encoding.stop_token_ids(tools_declared);
+                ids.extend(&self.eos_token_ids);
+                ids.sort_unstable();
+                ids.dedup();
+                ids
+            }
+            ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 => self.eos_token_ids.clone(),
+        }
+    }
 }
 
 impl Default for ModelProfile {
     fn default() -> Self {
-        Self { id: MODEL.into(), encoding: ModelEncoding::DeepseekV41 }
+        Self::new(MODEL, ModelEncoding::DeepseekV41)
     }
 }
 mod limits;
@@ -82,6 +131,10 @@ pub struct NativeRequest {
     /// keeps the legacy device-argmax route; anything else selects from the
     /// full vocabulary through the shared exact sampler.
     pub sampling: TargetSamplingParams,
+    /// Token ids that end generation: the profile's EOS ids plus, for GLM,
+    /// its turn markers (and `<tool_call>` when no tools are declared).
+    /// DeepSeek engines keep their built-in EOS handling.
+    pub stop_token_ids: Vec<u32>,
     pub events: mpsc::Sender<Result<InferenceChunk, NativeFailure>>,
 }
 /// Serving statistics the CUDA owner publishes (a JSON object; `null` until the first publish).
@@ -141,7 +194,8 @@ async fn stats_route(State(state): State<NativeState>) -> Json<Value> {
     Json(value)
 }
 async fn models(State(state): State<NativeState>) -> Json<Value> {
-    Json(json!({"object":"list","data":[{"id":state.profile.id,"object":"model","owned_by":"deepseek-ai",
+    let owner = state.profile.id.split_once('/').map_or("cuteafd", |(owner, _)| owner);
+    Json(json!({"object":"list","data":[{"id":state.profile.id,"object":"model","owned_by":owner,
         "max_context_tokens":state.limits.context(),"max_output_tokens":state.limits.output()}]}))
 }
 async fn health(State(state): State<NativeState>) -> StatusCode {
@@ -226,9 +280,33 @@ fn request_target_sampling(body: &Value) -> Result<TargetSamplingParams, String>
     TargetSamplingParams::new(temperature, top_p, top_k, min_p, seed)
         .map_err(|error| error.to_string())
 }
+type ChatGenerator = <<ChatCompletionRequest as ProtocolRequest>::Response as ProtocolResponse>::ChunkGenerator;
+type ChatChunk = <ChatGenerator as deepseek_recipe::stream::ChunkGenerator>::Chunk;
+type ChatChunks = std::pin::Pin<Box<dyn futures::Stream<Item = Result<ChatChunk, deepseek_recipe::stream::StreamError>> + Send>>;
+
+/// The family's generated-text parser in front of the OpenAI chunk generator.
+enum OutputProcessor {
+    Deepseek(StreamProcessor<ChatGenerator>),
+    Glm(glm::GlmStreamProcessor<ChatGenerator>),
+}
+
+impl OutputProcessor {
+    fn process(self, input: impl futures::Stream<Item = InferenceChunk> + Send + 'static) -> ChatChunks {
+        match self {
+            Self::Deepseek(processor) => Box::pin(processor.process(input)),
+            Self::Glm(processor) => Box::pin(processor.process(input)),
+        }
+    }
+}
+
 async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> Response {
+    let glm = match &state.profile.encoding {
+        ModelEncoding::Glm(encoding) => Some(encoding.clone()),
+        ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 => None,
+    };
     let assistance = match body.get("tool_decoding_assistance") {
-        None | Some(Value::Null) => true,
+        // glmrt constrained GLM tool calls only when strict or required.
+        None | Some(Value::Null) => glm.is_none(),
         Some(Value::Bool(value)) => *value,
         _ => return error(StatusCode::BAD_REQUEST, "tool_decoding_assistance must be boolean"),
     };
@@ -276,6 +354,13 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> 
     if let Some(object) = body.as_object_mut() {
         object.remove("seed");
     }
+    // GLM renders the checkpoint template from the request itself; the
+    // adapter below still validates it and owns tools and sampling options.
+    let glm_request = match glm.map(|encoding| (glm::resolve_thinking(&body), encoding)) {
+        None => None,
+        Some((Ok(thinking), encoding)) => Some((encoding, body.clone(), thinking)),
+        Some((Err(message), _)) => return error(StatusCode::BAD_REQUEST, message),
+    };
     let mut parsed: ChatCompletionRequest = match serde_json::from_value(body) {
         Ok(r) => r,
         Err(e) => return error(StatusCode::BAD_REQUEST, e),
@@ -292,6 +377,9 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> 
     if let Err(e) = selection.apply(&mut converted.conversation.tools) {
         return error(StatusCode::BAD_REQUEST, e);
     }
+    if let Some((_, _, thinking)) = &glm_request {
+        converted.conversation.thinking_mode = *thinking;
+    }
     let model = state.profile.id.clone();
     if converted.model.as_deref() != Some(model.as_str()) {
         return error(StatusCode::BAD_REQUEST, format!("model must be {model}"));
@@ -304,30 +392,58 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> 
         Ok(validator) => validator,
         Err(e) => return error(StatusCode::BAD_REQUEST, e),
     };
+    let syntax = if glm_request.is_some() { tools::ToolSyntax::GlmXml } else { tools::ToolSyntax::Dsml };
     let tool_constraints = match tools::ToolConstraints::new(&converted.conversation.tools,
         converted.conversation.tool_choice, selection.required, parallel,
-        assistance || response_format.as_ref().is_some_and(|v| v["type"] != "text")) {
+        assistance || response_format.as_ref().is_some_and(|v| v["type"] != "text"), syntax) {
         Ok(tools) => tools,
         Err(e) => return error(StatusCode::BAD_REQUEST, e),
     };
-    let constraint = match constraints::response_constraint(response_format, converted.conversation.thinking_mode, tool_constraints.as_ref()) {
+    let constraint = match constraints::response_constraint(response_format.clone(), converted.conversation.thinking_mode,
+        tool_constraints.as_ref(), state.profile.encoding.think_close_token_id()) {
         Ok(constraint) => constraint,
         Err(e) => return error(StatusCode::BAD_REQUEST, e),
     };
     let mut validator = tools::CompletionValidator::new(response_validator, tool_constraints);
-    let rendered = match state.profile.encoding {
-        ModelEncoding::DeepseekV41 => DeepseekV41Encoding::new().render_conversation(&converted.conversation),
-        ModelEncoding::DeepseekV4 => DeepseekV4Encoding::new().render_conversation(&converted.conversation),
-    };
+    let tools_declared = !converted.conversation.tools.is_empty();
+    let stop_token_ids = state.profile.stop_token_ids(tools_declared);
     let streaming = converted.stream;
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let generator = ChatCompletionRequest::chunk_generator(&converted, id.clone(), model.clone())
         .with_include_usage(!streaming || include_usage);
-    let processor = StreamProcessor::new(generator, converted.parsing_options);
+    let (prompt, image_sources, processor) = match glm_request {
+        Some((encoding, raw, thinking)) => {
+            let tool_choice = match (selection.name(), selection.required) {
+                (Some(name), _) => glm::GlmToolChoice::Named(name.to_owned()),
+                (None, true) => glm::GlmToolChoice::Required,
+                (None, false) => glm::GlmToolChoice::Auto,
+            };
+            let options = glm::GlmPromptOptions { thinking,
+                tool_names: converted.conversation.tools.iter().map(|tool| tool.name.clone()).collect(),
+                tool_choice, response_format };
+            let prompt = match encoding.render(&raw, &options) {
+                Ok(prompt) => prompt,
+                Err(message) => return error(StatusCode::BAD_REQUEST, message),
+            };
+            let parser = glm::GlmOutputParser::new(glm::GlmParserOptions { thinking,
+                tools: tools_declared.then(|| converted.conversation.tools.clone()),
+                stop_sequences: converted.parsing_options.stop_sequences.clone() });
+            (prompt, Vec::new(), OutputProcessor::Glm(glm::GlmStreamProcessor::new(generator, parser)))
+        }
+        None => {
+            let rendered = if matches!(state.profile.encoding, ModelEncoding::DeepseekV4) {
+                DeepseekV4Encoding::new().render_conversation(&converted.conversation)
+            } else {
+                DeepseekV41Encoding::new().render_conversation(&converted.conversation)
+            };
+            (rendered.prompt, rendered.image_sources,
+                OutputProcessor::Deepseek(StreamProcessor::new(generator, converted.parsing_options)))
+        }
+    };
     // Rendered sources own the image payloads needed by preprocessing. Do not
     // retain another copy of their data URLs throughout the generated response.
     drop(converted.conversation);
-    if rendered.image_sources.len() > cuteafd_loader::V41_MAX_IMAGES {
+    if image_sources.len() > cuteafd_loader::V41_MAX_IMAGES {
         return error(StatusCode::BAD_REQUEST, "at most 16 images are supported");
     }
     let permit = match state.admission.reserve(state.queue.clone()).await {
@@ -339,7 +455,7 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> 
             return response;
         }
     };
-    let prepared = if rendered.image_sources.is_empty() { Vec::new() } else {
+    let prepared = if image_sources.is_empty() { Vec::new() } else {
         // The queue permit bounds waiters while up to four decoders run. A C16
         // burst should wait here instead of imposing a hidden C4 image limit.
         let slot = match state.images.slots.clone().acquire_owned().await {
@@ -349,7 +465,7 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> 
         let decoder = state.images.clone();
         let result = tokio::task::spawn_blocking(move || {
             let _slot = slot;
-            decoder.decode(rendered.image_sources)
+            decoder.decode(image_sources)
         }).await;
         match result {
             Ok(Ok(images)) => images,
@@ -360,14 +476,15 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> 
     let (events, mut receive) = mpsc::channel(16);
     // Recipe 0.1.0 uses a protocol placeholder; the pinned model tokenizer
     // spells token 129264 differently. Preserve the text-only prompt verbatim.
-    let prompt = if prepared.is_empty() { rendered.prompt }
-        else { rendered.prompt.replace("<｜image｜>", "<｜deepseek_image｜>") };
+    let prompt = if prepared.is_empty() { prompt }
+        else { prompt.replace("<｜image｜>", "<｜deepseek_image｜>") };
     let job = NativeRequest {
         prompt,
         constraint,
         images: prepared,
         max_tokens,
         sampling,
+        stop_token_ids,
         events,
     };
     permit.send(job);

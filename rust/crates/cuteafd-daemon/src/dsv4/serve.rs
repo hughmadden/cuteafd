@@ -48,10 +48,10 @@ fn eos_token(snapshot: &Path) -> Result<u32> {
 
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let limits = NativeLimits::new(args.max_context, args.max_output)?;
-    let profile = ModelProfile {
-        id: args.model_id.clone().or_else(|| model_id(&args.engine.snapshot)).context("model id")?,
-        encoding: ModelEncoding::DeepseekV4,
-    };
+    let profile = ModelProfile::new(
+        args.model_id.clone().or_else(|| model_id(&args.engine.snapshot)).context("model id")?,
+        ModelEncoding::DeepseekV4,
+    );
     let (queue, receive) = mpsc::channel::<NativeRequest>(16);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();

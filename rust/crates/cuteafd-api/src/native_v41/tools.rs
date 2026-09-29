@@ -17,6 +17,8 @@ impl Selection {
         if required { request.tool_choice = Some(Choice::Mode(Mode::Auto)); }
         Self { required, name }
     }
+    /// The tool a named `tool_choice` selected.
+    pub fn name(&self) -> Option<&str> { self.name.as_deref() }
     pub fn apply(&self, tools: &mut Vec<ToolDefinition>) -> Result<()> {
         if let Some(name) = &self.name {
             ensure!(tools.iter().any(|tool| &tool.name == name), "tool_choice: no tool named '{name}' was specified");
@@ -27,15 +29,30 @@ impl Selection {
     }
 }
 
+/// Tool-call markup a model family emits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ToolSyntax {
+    /// DeepSeek V4/V4.1 `<｜DSML｜ calls>` blocks (engine-side schema grammar).
+    Dsml,
+    /// GLM `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`
+    /// (XGrammar's native `glm_xml` JSON-schema style, as glmrt served it).
+    GlmXml,
+}
+
 pub(super) struct ToolConstraints {
     pub required: bool,
+    /// At least one tool call: the required branch, or the tool alternative
+    /// to a response format.
     pub format: Option<Value>,
+    /// Free text until a call trigger, then tool calls only.
+    pub triggered: Option<Value>,
     parallel: bool,
     validators: BTreeMap<String, Option<jsonschema::JSONSchema>>,
 }
 
 impl ToolConstraints {
-    pub fn new(tools: &[ToolDefinition], choice: ToolChoice, required: bool, parallel: bool, assistance: bool) -> Result<Option<Self>> {
+    pub fn new(tools: &[ToolDefinition], choice: ToolChoice, required: bool, parallel: bool, assistance: bool,
+        syntax: ToolSyntax) -> Result<Option<Self>> {
         if tools.is_empty() || choice == ToolChoice::None { return Ok(None); }
         let mut validators = BTreeMap::new();
         let mut tags = Vec::new();
@@ -48,18 +65,46 @@ impl ToolConstraints {
             let validator = if strict { Some(super::constraints::compile_schema(&schema)
                 .with_context(|| format!("invalid parameters for tool {}", tool.name))?) } else { None };
             validators.insert(tool.name.clone(), validator);
-            tags.push(json!({"type":"tag", "begin":format!("<｜DSML｜ invoke name=\"{}\">", tool.name),
-                "content":{"type":"ds41_tool_schema", "strict":strict, "json_schema":schema},
-                "end":"</｜DSML｜ invoke>"}));
+            tags.push(match syntax {
+                ToolSyntax::Dsml => json!({"type":"tag", "begin":format!("<｜DSML｜ invoke name=\"{}\">", tool.name),
+                    "content":{"type":"ds41_tool_schema", "strict":strict, "json_schema":schema},
+                    "end":"</｜DSML｜ invoke>"}),
+                ToolSyntax::GlmXml => {
+                    // An absent parameter schema converts to `{}`; glmrt
+                    // constrained such tools to zero arguments.
+                    let schema = if strict && schema.as_object().is_some_and(|object| object.is_empty()) {
+                        json!({"type":"object", "properties":{}, "required":[], "additionalProperties":false})
+                    } else { schema };
+                    json!({"type":"tag", "begin":format!("<tool_call>{}", tool.name),
+                        "content":{"type":"json_schema", "json_schema":schema, "style":"glm_xml", "any_order":false},
+                        "end":"</tool_call>"})
+                }
+            });
         }
-        let format = (assistance || strict_requested || required).then(|| json!({"type":"tag",
-            "begin":"<｜DSML｜ calls>",
-            "content":{"type":"sequence", "elements":[
-                {"type":"regex", "pattern":"[ \\n\\t]{0,16}"},
-                {"type":"tags_with_separator", "tags":tags, "separator":"\n", "at_least_one":true, "stop_after_first":!parallel},
-                {"type":"regex", "pattern":"[ \\n\\t]{0,16}"}]},
-            "end":"</｜DSML｜ calls>"}));
-        Ok(Some(Self { required, format, parallel, validators }))
+        if !(assistance || strict_requested || required) {
+            return Ok(Some(Self { required, format: None, triggered: None, parallel, validators }));
+        }
+        let (format, triggered) = match syntax {
+            ToolSyntax::Dsml => {
+                let calls = json!({"type":"tag",
+                    "begin":"<｜DSML｜ calls>",
+                    "content":{"type":"sequence", "elements":[
+                        {"type":"regex", "pattern":"[ \\n\\t]{0,16}"},
+                        {"type":"tags_with_separator", "tags":tags, "separator":"\n", "at_least_one":true, "stop_after_first":!parallel},
+                        {"type":"regex", "pattern":"[ \\n\\t]{0,16}"}]},
+                    "end":"</｜DSML｜ calls>"});
+                let triggered = json!({"type":"triggered_tags", "triggers":["<｜DSML｜ calls>"],
+                    "tags":[calls.clone()], "at_least_one":false, "stop_after_first":true});
+                (calls, triggered)
+            }
+            ToolSyntax::GlmXml => (
+                json!({"type":"tags_with_separator", "tags":tags, "separator":"", "at_least_one":true,
+                    "stop_after_first":!parallel}),
+                json!({"type":"triggered_tags", "triggers":["<tool_call>"], "tags":tags, "at_least_one":false,
+                    "stop_after_first":!parallel}),
+            ),
+        };
+        Ok(Some(Self { required, format: Some(format), triggered: Some(triggered), parallel, validators }))
     }
 
     fn validate(&self, calls: &BTreeMap<u64, Call>, reason: &str) -> Result<()> {
@@ -185,10 +230,10 @@ mod tests {
     fn assistance_opt_out_cannot_disable_explicit_constraints() {
         let mut definitions = vec![ToolDefinition { name:"lookup".into(), description:None,
             parameters:json!({"type":"object","properties":{"s":{"type":"string","pattern":"^x+$","maxLength":1}}}), strict:Some(false) }];
-        assert!(ToolConstraints::new(&definitions,ToolChoice::Auto,false,true,false).unwrap().unwrap().format.is_none());
-        assert!(ToolConstraints::new(&definitions,ToolChoice::Auto,true,true,false).unwrap().unwrap().format.is_some());
+        assert!(ToolConstraints::new(&definitions,ToolChoice::Auto,false,true,false,ToolSyntax::Dsml).unwrap().unwrap().format.is_none());
+        assert!(ToolConstraints::new(&definitions,ToolChoice::Auto,true,true,false,ToolSyntax::Dsml).unwrap().unwrap().format.is_some());
         definitions[0].strict=Some(true);
-        let tools=ToolConstraints::new(&definitions,ToolChoice::Auto,false,true,false).unwrap().unwrap();
+        let tools=ToolConstraints::new(&definitions,ToolChoice::Auto,false,true,false,ToolSyntax::Dsml).unwrap().unwrap();
         assert!(tools.format.is_some());
         let mut calls=BTreeMap::new();
         calls.insert(0,Call { name:"lookup".into(),arguments:r#"{"s":"xx"}"#.into() });
