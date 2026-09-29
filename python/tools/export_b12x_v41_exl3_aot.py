@@ -118,7 +118,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
            blocks_per_sm: int | None = None, paired_boundary: str | None = None,
            tile: tuple[int, ...] | None = None, hidden: int = 5120, route_block: int = 8,
            token_major_rotation: bool = False, swiglu_limit: float | None = 10.0,
-           fused_input_rotation: bool = False) -> dict:
+           fused_input_rotation: bool = False, warp_specialized: bool = False) -> dict:
     if paired_boundary not in (None, "first", "last"):
         raise ValueError("paired boundary must be first, last, or None")
     if paired_boundary is not None and (intermediate != 640 or len(bits) != 2 or topk != 6
@@ -146,6 +146,13 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     # materialized per-route copies (bit-identical); wide packed blocks only.
     if fused_input_rotation and (paired_boundary is not None or len(bits) != 2 or route_block < 16):
         raise ValueError("fused input rotation requires a disjoint two-tier export with 16+ row blocks")
+    # Warp-specialized prefill: producer warps stream weights and input rows and
+    # rotate FC1 inputs; consumer warps decode and multiply (bit-identical to the
+    # cooperative kernel). FC1, SwiGLU and FC2 become three launches of the core.
+    if warp_specialized and (paired_boundary is not None or len(bits) != 2 or route_block < 16
+                             or fused_input_rotation or token_major_rotation):
+        raise ValueError("warp-specialized prefill requires a disjoint two-tier export with 16+ "
+                         "row blocks and brings its own input rotation")
     if output_dtype not in ("bf16", "fp32"):
         raise ValueError("EXL3 output must be bf16 or fp32")
     # Disk-loaded B12x executors omit the compiler IR required by export_to_c.
@@ -198,6 +205,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         rotation = {"token_major_rotation": True} if token_major_rotation and not direct else {}
         if fused_input_rotation and not direct:
             rotation = {"fused_input_rotation": True}
+        if warp_specialized and not direct:
+            rotation = {"warp_specialized": True}
         launch = compile_mixed_trellis(**options, direct_topk_routes=direct,
                                       force_blocks_per_sm=blocks_per_sm, **rotation)
     elif len(bits) == 3:
@@ -258,7 +267,9 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     if block_m != 8:
         # Recorded only when it differs, so 8-row manifests stay byte-identical.
         manifest["route_block"] = block_m
-    if fused_input_rotation and not direct:
+    if warp_specialized and not direct:
+        manifest["warp_specialized"] = True
+    elif fused_input_rotation and not direct:
         manifest["fused_input_rotation"] = True
     elif token_major_rotation and not direct:
         manifest["token_major_rotation"] = True
@@ -299,6 +310,8 @@ def main() -> None:
                         help="Packed-route M block (rows per expert block); direct routes ignore it")
     parser.add_argument("--fused-input-rotation", action="store_true",
                         help="FC1 rotates staged token rows itself (packed 16+ row blocks)")
+    parser.add_argument("--warp-specialized", action="store_true",
+                        help="Warp-specialized prefill kernels (packed 16+ row blocks)")
     parser.add_argument("--token-major-rotation", action="store_true",
                         help="Rotate each token's input once for all of its routes (packed routes)")
     parser.add_argument("--tile", help="Offline disjoint-layout tile override fc1_k,fc1_n,fc2_k,fc2_n "
@@ -309,6 +322,7 @@ def main() -> None:
            tile=None if args.tile is None else tuple(args.tile.split(",")), hidden=args.hidden,
            route_block=args.route_block, token_major_rotation=args.token_major_rotation,
            fused_input_rotation=args.fused_input_rotation,
+           warp_specialized=args.warp_specialized,
            swiglu_limit=None if args.swiglu_limit.lower() == "none" else float(args.swiglu_limit))
 
 
