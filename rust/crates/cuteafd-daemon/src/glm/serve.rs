@@ -255,8 +255,10 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             requests += 1;
             generated_total += request.generated as u64;
             let seconds = request.started.elapsed().as_secs_f64();
+            let phases = std::mem::take(&mut *engine.profile.borrow_mut());
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
-                active = active.len(), "request complete");
+                active = active.len(), gpu_wait_s = phases[0], experts_s = phases[1], head_s = phases[2],
+                "request complete");
             allocator.release(request.placement);
         }
         if let Ok(mut stats) = stats.lock() {

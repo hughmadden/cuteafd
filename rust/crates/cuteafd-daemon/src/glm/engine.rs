@@ -124,6 +124,9 @@ pub(crate) struct GlmEngine<'a> {
     cos_sin: Dev<'a>,
     workspace: RefCell<Option<Workspace<'a>>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
+    /// Host time per phase since the last reset: GPU wait before the expert
+    /// request, the Spark exchange, the logits download.
+    pub profile: RefCell<[f64; 3]>,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -160,7 +163,7 @@ impl<'a> GlmEngine<'a> {
         let cos_sin = DeviceAllocation::new(library, table.len() * 4)?;
         library.copy_h2d(cos_sin.buffer, bytes_of(&table))?;
         Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
-            workspace: RefCell::new(None), decode_workspace: RefCell::new(None) })
+            workspace: RefCell::new(None), decode_workspace: RefCell::new(None), profile: RefCell::new([0.0; 3]) })
     }
 
     fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
@@ -354,7 +357,9 @@ impl<'a> GlmEngine<'a> {
             w.head.launch(w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2).cast(),
                 self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), logit_rows as u32, self.stream)?;
         }
+        let timer = std::time::Instant::now();
         let logits = self.download(&w.logits, logit_rows * self.cfg.vocab_size * 4)?;
+        self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
         Ok(Some(logits.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()))
     }
 
@@ -389,6 +394,7 @@ impl<'a> GlmEngine<'a> {
             bytes: host.bytes - offset,
             ..host
         };
+        let timer = std::time::Instant::now();
         // SAFETY: the pinned regions are large enough; the sync completes them.
         unsafe {
             self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.stream)?;
@@ -396,6 +402,7 @@ impl<'a> GlmEngine<'a> {
             self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), w.wire.buffer, wire_bytes, self.stream)?;
             self.library.cuda_stream_synchronize(self.stream)?;
         }
+        self.profile.borrow_mut()[0] += timer.elapsed().as_secs_f64();
         // The shared expert runs on the GPU while the Sparks compute.
         self.run(&format!("glm_ffn_i{}_{cap}", self.cfg.moe_intermediate), &[
             ("x", w.x.buffer.ptr), ("w_gate_up", layer.ptr("w_gate_up")?), ("w_down", layer.ptr("w_down")?),
@@ -420,6 +427,7 @@ impl<'a> GlmEngine<'a> {
         let (row_bytes, plane_bytes) = (h * 2, t * h * 2);
         let mut staging = w.planes_host.borrow_mut();
         let bytes = staging.bytes_mut();
+        let timer = std::time::Instant::now();
         runtime.block_on(async {
             transport.execute(&request, |rank, first, payload| {
                 let offset = rank * plane_bytes + first as usize * row_bytes;
@@ -428,6 +436,7 @@ impl<'a> GlmEngine<'a> {
                 Ok(())
             }).await
         })?;
+        self.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
         let mut pointers = [std::ptr::null::<u16>(); MAX_RANKS];
         for rank in 0..ranks {
             let source = cuteafd_ffi::CuteafdHostBuffer {

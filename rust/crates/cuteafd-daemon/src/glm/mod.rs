@@ -104,6 +104,26 @@ impl Opened {
             None => None,
         };
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        if let Some(transport) = transport.as_mut() {
+            // Connect every rank and register full-size buffers now: the first
+            // request otherwise pays seconds of connection setup.
+            let started = Instant::now();
+            let (rows, h, topk) = (args.prefill_rows, self.cfg.hidden, self.cfg.topk);
+            let routes = (0..rows * topk).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
+                row_index: (i / topk) as u32, expert_id: (i % self.cfg.experts) as u32, gate_weight: 0.0,
+            }).collect();
+            let mut request = cuteafd_transport::ExpertProtocolV2Request::new(1, 17, self.cfg.first_moe_layer as u32,
+                h as u32, cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+                (0..rows as u32).map(|row| cuteafd_transport::ExpertProtocolV2RowDescriptor {
+                    row_id: u64::from(row), source_kind: cuteafd_transport::ExpertV2SourceKind::Prefill,
+                    source_request_id: 1, token_position: u64::from(row), route_offset: row * topk as u32,
+                    route_count: topk as u32,
+                }).collect(),
+                routes, vec![0; rows * (h + h / 32)])?;
+            request.header.flags |= cuteafd_transport::v41_expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+            runtime.block_on(async { transport.execute(&request, |_, _, _| Ok(())).await })?;
+            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
+        }
         let result = body(&engine, transport.as_mut(), &runtime);
         drop(engine);
         // SAFETY: the engine that used the stream is gone.
