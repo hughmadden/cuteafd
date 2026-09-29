@@ -42,7 +42,7 @@ export CUTEAFD_RELEASE_MIMO_AOT=ON CUTEAFD_RELEASE_QWEN4_AOT=ON CUTEAFD_RELEASE_
 export CUTEAFD_RELEASE_EXPERT_FAMILIES="${CUTEAFD_RELEASE_EXPERT_FAMILIES:-dsv4f:spark;dsv4f:rtx_backbone;dsv4p:exl3-k23;glm:exl3-k45;glm:fp8;glmf:exl3-k34;mimo:fp8;mimop:fp8;qwen4:exl3-k45}"
 
 clone() { # clone NAME REV: standalone clone (build containers cannot see worktree gitdirs)
-  local dir="$OUT/src-$1" rev="$2"
+  local dir="$OUT/src-$1" rev="$2" sub name
   if [[ ! -d "$dir/.git" ]]; then
     git clone -q "$repo" "$dir"
   fi
@@ -101,7 +101,8 @@ COPY libcuteafd_native.so /opt/cuteafd/lib/libcuteafd_native.so
 COPY exl3 /opt/cuteafd/lib/exl3
 COPY fp8 /opt/cuteafd/lib/fp8
 COPY *.json /opt/cuteafd/share/
-LABEL io.cuteafd.intake-ab.revision=$rev
+LABEL io.cuteafd.intake-ab.revision=$rev org.opencontainers.image.revision=$rev \
+  io.cuteafd.sparkinfer.revision=$(git -C "$src/third_party/sparkinfer" rev-parse HEAD)
 EOF
   docker build -q -t "cuteafd-coordinator:intake-$name" "$art" >/dev/null
   echo "== cuteafd-coordinator:intake-$name ready"
@@ -228,9 +229,20 @@ case "${1:-}" in
   glmf|pro) run_model "$1" "${2:-3}" ;;
   v41)
     : "${V41_CONFIG:?set V41_CONFIG to a working V4.1 cuteafd.config}"
+    # run.sh requires the Spark image to carry the coordinator's engine and
+    # SparkInfer revisions. The Spark side is SPARK_IMAGE unchanged for both
+    # arms; a per-arm local tag relabels it (its V4.1 kernels are not rebuilt).
+    for arm in base new; do
+      labels="$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}} {{index .Config.Labels "io.cuteafd.sparkinfer.revision"}}' "cuteafd-coordinator:intake-$arm")"
+      for host in $(sed -n 's/^SPARK_[0-3]_HOST=//p' "$V41_CONFIG"); do
+        printf 'FROM %s\nLABEL org.opencontainers.image.revision=%s io.cuteafd.sparkinfer.revision=%s io.cuteafd.intake-ab.spark-from=%s\n' \
+          "$SPARK_IMAGE" ${labels} "$SPARK_IMAGE" | ssh "$host" "docker build -q -t cuteafd-spark-expert:intake-$arm -" >/dev/null &
+      done
+      wait
+    done
     for arm in base new; do
       sed -e "s#^COORDINATOR_DOCKER_INFERENCE=.*#COORDINATOR_DOCKER_INFERENCE=cuteafd-coordinator:intake-$arm#" \
-          -e "s#^SPARK_EXPERT_DOCKER_INFERENCE=.*#SPARK_EXPERT_DOCKER_INFERENCE=$SPARK_IMAGE#" \
+          -e "s#^SPARK_EXPERT_DOCKER_INFERENCE=.*#SPARK_EXPERT_DOCKER_INFERENCE=cuteafd-spark-expert:intake-$arm#" \
           "$V41_CONFIG" > "$OUT/src-$arm/cuteafd.config"
     done
     "$repo/.venv/bin/python" "$repo/scripts/bench-ab.py" --label intake-v41 \
