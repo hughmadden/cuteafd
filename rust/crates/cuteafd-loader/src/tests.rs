@@ -1009,3 +1009,14 @@ fn glm53_exl3_k4_catalog() {
     assert_eq!(shape.geometry().unwrap().family(), Some("glm"));
     assert_eq!(catalog.exl3().unwrap().projections.len(), 75 * 256 * 3);
 }
+
+/// The official GLM 5.3 config reads (run with --ignored where sparknest is mounted).
+#[test]
+#[ignore]
+fn glm53_official_config() {
+    let snapshot = std::path::Path::new("/mnt/sparknest/hf-home/hub/models--zai-org--GLM-5.3/snapshots/935644c05e76fc198714f4cca449fd8b970ff6d7");
+    let cfg = crate::glm_dsa::GlmDsaConfig::read(snapshot).unwrap();
+    let full = cfg.indexers.iter().filter(|&&i| i == crate::glm_dsa::GlmIndexer::Full).count();
+    assert_eq!((cfg.layers, cfg.hidden, cfg.first_moe_layer, cfg.topk, full), (78, 6144, 3, 8, 21));
+    assert_eq!(cfg.rope_theta, 8.0e6);
+}
