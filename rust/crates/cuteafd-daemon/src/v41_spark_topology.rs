@@ -138,9 +138,11 @@ mod tests {
             assert_eq!(resolved.executor_id(rank).unwrap(), 27 + rank as u64);
         }
         assert!(group_of(Some(resolved), 6).is_err());
-        // The topology-free world-6 helper rejects six ranks; only the explicit
-        // topology may own them.
-        assert!(cuteafd_transport::v41_expert::v41_spark_executor_id(6, 0).is_err());
+        // The implicit six-rank EXL3 group shares the TP6EP1 namespace.
+        for rank in 0..6 {
+            assert_eq!(cuteafd_transport::v41_expert::v41_spark_executor_id(6, rank).unwrap(),
+                resolved.executor_id(rank).unwrap());
+        }
     }
 
     #[test]

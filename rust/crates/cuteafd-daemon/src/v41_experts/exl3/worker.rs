@@ -48,7 +48,7 @@ impl<'a> Exl3Worker<'a> {
     pub(crate) fn partition(directory: &Path, capacity: u32, rank: usize) -> Result<cuteafd_loader::V41Exl3Partition> {
         use cuteafd_ffi::V41Exl3Layout;
         use cuteafd_loader::V41Exl3Partition;
-        ensure!(rank < 4, "EXL3 worker rank must be 0..3");
+        ensure!(rank < 6, "EXL3 worker rank must be 0..5");
         let mut selected = None;
         for c in Self::capacities(capacity)? {
             let layout = Exl3Execution::artifact_layout(&directory.join(format!("m{c}")))?;
@@ -95,8 +95,8 @@ impl<'a> Exl3Worker<'a> {
         };
         let rank = first.layout.rank;
         ensure!(
-            matches!(first.layout.world, 2 | 3 | 4) && rank < first.layout.world,
-            "EXL3 worker requires implicit Spark TP2, TP3 or TP4 weights"
+            matches!(first.layout.world, 2 | 3 | 4 | 6) && rank < first.layout.world,
+            "EXL3 worker requires implicit Spark TP2, TP3, TP4 or TP6 weights"
         );
         for (index, weight) in weights.iter().enumerate() {
             ensure!(

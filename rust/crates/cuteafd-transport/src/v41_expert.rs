@@ -45,8 +45,11 @@ pub fn v41_spark_executor_id(world: usize, rank: usize) -> Result<u64> {
         4 => 1,
         2 => 5,
         3 => 7,
+        // The implicit six-rank EXL3 group is the same six disjoint
+        // intermediate slices as `TP6EP1`, so it shares that 27..=32 namespace.
+        6 => 27,
         _ => anyhow::bail!(
-            "native Spark executor requires an implicit world of 2, 3 or 4; \
+            "native Spark executor requires an implicit world of 2, 3, 4 or 6; \
              an explicit topology must use V41SparkTopology::executor_id"
         ),
     };
@@ -568,14 +571,15 @@ mod tests {
         assert_eq!(tp2, [5, 6]);
         assert_eq!(tp3, [7, 8, 9]);
         assert_eq!(tp3.to_vec(), V41SparkTopology::new(3, 1)?.executor_ids());
+        // The implicit six-rank EXL3 group is TP6EP1's namespace.
+        let tp6: Vec<u64> = (0..6).map(|rank| v41_spark_executor_id(6, rank)).collect::<Result<_>>()?;
+        assert_eq!(tp6, V41SparkTopology::new(6, 1)?.executor_ids());
         // Every implicit namespace stays disjoint from the other worlds'.
         for (world, rank) in [
             (0, 0),
             (1, 0),
-            // Explicit layouts (e.g. pure TP6EP1) must go through the topology
-            // namespace, never this implicit two/three/four-rank helper.
-            (6, 0),
-            (6, 5),
+            (6, 6),
+            (5, 0),
             (2, 2),
             (3, 3),
             (4, 4),

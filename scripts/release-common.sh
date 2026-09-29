@@ -416,8 +416,15 @@ release_load_config() {
         ;;
       4) ;;
       6)
-        release_spark_topology_explicit ||
-          release_die "SPARK_COUNT=6 requires explicit SPARK_TP and SPARK_EP (six Sparks are approved only as a pure TP6=6x1 or replicated native topology)"
+        # Six Sparks are a native explicit topology (pure TP6=6x1 or
+        # replicated), or the implicit EXL3 TP6 split of DeepSeek V4 Pro (no
+        # SPARK_TP/SPARK_EP keys).
+        if [[ "$EXPERT_FORMAT" == exl3 && -z "$SPARK_TP" && -z "$SPARK_EP" ]]; then
+          [[ "$EXL3_PAIRED_TP4" == off ]] || release_die "SPARK_COUNT=6 is incompatible with EXL3_PAIRED_TP4"
+        else
+          release_spark_topology_explicit ||
+            release_die "SPARK_COUNT=6 requires explicit SPARK_TP and SPARK_EP, or EXPERT_FORMAT=exl3 for the implicit EXL3 TP6 split"
+        fi
         ;;
       *) release_die "SPARK_COUNT must be 0, 2, 3, 4, or 6" ;;
     esac
