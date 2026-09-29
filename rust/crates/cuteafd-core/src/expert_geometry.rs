@@ -26,6 +26,8 @@ impl ExpertGeometry {
     pub const GLM_DSA: Self = Self { hidden: 6144, experts: 256, topk: 8, intermediate: 2048, layers: 78 };
     /// MiMo V2 Flash (mimo_v2_flash): routed layers 1..48, FP8 experts.
     pub const MIMO_V2_FLASH: Self = Self { hidden: 4096, experts: 256, topk: 8, intermediate: 2048, layers: 48 };
+    /// GLM 5.3 Flash (glm5_next): routed layers 3..45, SwiGLU clamped at 10.
+    pub const GLM_NEXT: Self = Self { hidden: 4096, experts: 288, topk: 8, intermediate: 2048, layers: 45 };
 
     /// BF16 bytes of one hidden-width row (a routed input or a rank partial).
     pub const fn row_bytes(&self) -> u32 {
@@ -46,12 +48,13 @@ impl ExpertGeometry {
             Self::DEEPSEEK_V4_PRO => Some("dsv4p"),
             Self::GLM_DSA => Some("glm"),
             Self::MIMO_V2_FLASH => Some("mimo"),
+            Self::GLM_NEXT => Some("glmf"),
             _ => None,
         }
     }
 
-    /// Routed-expert SwiGLU clamp: DeepSeek clamps gate/up at 10; GLM's and
-    /// MiMo's SwiGLU are unclamped (`None`).
+    /// Routed-expert SwiGLU clamp: DeepSeek and GLM 5.3 Flash clamp gate/up at
+    /// 10; GLM 5.x's and MiMo's SwiGLU are unclamped (`None`).
     pub fn swiglu_limit(&self) -> Option<f32> {
         (*self != Self::GLM_DSA && *self != Self::MIMO_V2_FLASH).then_some(10.0)
     }

@@ -1,8 +1,8 @@
 //! Routed experts kept as the checkpoint's FP8: E4M3 weights with one FP32
 //! scale per 128x128 block (`weight_scale_inv`), Hugging Face names
 //! `model.layers.{l}.mlp.experts.{e}.{gate,up,down}_proj.weight[_scale_inv]`
-//! (MiMo V2 Flash; GLM 5.x official FP8, whose MTP layer runs on the
-//! coordinator). The `fp8` expert family serves them without re-quantization.
+//! or, for multimodal checkpoints, under `model.language_model.` (MiMo V2
+//! Flash; GLM 5.x and GLM 5.3 Flash official FP8). The `fp8` expert family serves them without re-quantization.
 //!
 //! Tensor-parallel slices split the intermediate `I` over `tp` ranks in whole
 //! 128-row blocks: rank `r` owns gate/up rows and down columns
@@ -49,12 +49,14 @@ struct Located {
 pub struct Fp8ExpertTensors {
     snapshot: PathBuf,
     shape: RoutedExpertShape,
+    /// `model.` or `model.language_model.`: where the decoder layers live.
+    prefix: String,
     tensors: HashMap<String, Located>,
 }
 
 impl Fp8ExpertTensors {
-    pub fn name(layer: usize, expert: usize, projection: Fp8Projection) -> String {
-        format!("model.layers.{layer}.mlp.experts.{expert}.{}.weight", projection.stem())
+    pub fn name(&self, layer: usize, expert: usize, projection: Fp8Projection) -> String {
+        format!("{}layers.{layer}.mlp.experts.{expert}.{}.weight", self.prefix, projection.stem())
     }
 
     /// Reads the index and every shard header holding routed experts; checks
@@ -63,7 +65,13 @@ impl Fp8ExpertTensors {
         let index = crate::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)?;
         let weight_map: BTreeMap<String, String> = serde_json::from_value(
             index.get("weight_map").cloned().context("index has no weight_map")?)?;
-        let routed = |name: &str| name.starts_with("model.layers.") && name.contains(".mlp.experts.");
+        let prefix = if weight_map.keys().any(|name| name.starts_with("model.language_model.layers.")) {
+            "model.language_model."
+        } else {
+            "model."
+        };
+        let routed = |name: &str| name.starts_with(prefix) && name[prefix.len()..].starts_with("layers.")
+            && name.contains(".mlp.experts.");
         let shards: std::collections::BTreeSet<&String> =
             weight_map.iter().filter(|(name, _)| routed(name)).map(|(_, shard)| shard).collect();
         let mut tensors = HashMap::new();
@@ -82,7 +90,7 @@ impl Fp8ExpertTensors {
                 }
             }
         }
-        let catalog = Self { snapshot: snapshot.to_path_buf(), shape, tensors };
+        let catalog = Self { snapshot: snapshot.to_path_buf(), shape, prefix: prefix.to_string(), tensors };
         // One expert of the first routed layer fixes the format contract.
         for projection in Fp8Projection::ALL {
             catalog.check(shape.first_layer, 0, projection)?;
@@ -96,7 +104,7 @@ impl Fp8ExpertTensors {
 
     /// Whether `layer` has routed FP8 experts in this snapshot.
     pub fn has_layer(&self, layer: usize) -> bool {
-        self.tensors.contains_key(&Self::name(layer, 0, Fp8Projection::Gate))
+        self.tensors.contains_key(&self.name(layer, 0, Fp8Projection::Gate))
     }
 
     fn dims(&self, projection: Fp8Projection) -> (usize, usize) {
@@ -109,7 +117,7 @@ impl Fp8ExpertTensors {
     }
 
     fn check(&self, layer: usize, expert: usize, projection: Fp8Projection) -> Result<()> {
-        let name = Self::name(layer, expert, projection);
+        let name = self.name(layer, expert, projection);
         let (rows, cols) = self.dims(projection);
         let weight = self.located(&name)?;
         ensure!(weight.dtype == DType::F8E4M3 && weight.shape == [rows, cols],
@@ -144,7 +152,7 @@ impl Fp8ExpertTensors {
         weight: &mut [u8], scale: &mut [u8], staging: &mut Vec<u8>) -> Result<()> {
         ensure!(rank < tp, "rank {rank} of TP{tp}");
         self.check(layer, expert, projection)?;
-        let name = Self::name(layer, expert, projection);
+        let name = self.name(layer, expert, projection);
         let (rows, cols) = self.dims(projection);
         let slice = self.slice(tp)?;
         let (weight_bytes, scale_bytes) = self.slice_bytes(projection, tp)?;

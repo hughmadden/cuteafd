@@ -70,8 +70,10 @@ pub fn resolve_snapshot_at_revision(
         let selected = snapshots_root.join(revision);
         anyhow::ensure!(
             snapshots.iter().any(|snapshot| snapshot == &selected),
-            "{source} selects missing snapshot {}",
+            "{source} selects missing snapshot {}; present: [{}] (pass one as the model path, or \
+             repair the ref)",
             selected.display(),
+            snapshots.iter().filter_map(|s| s.file_name()).map(|s| s.to_string_lossy()).collect::<Vec<_>>().join(", "),
         );
         Ok(selected)
     };
