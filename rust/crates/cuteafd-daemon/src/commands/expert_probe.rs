@@ -26,7 +26,8 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
     let geometry = shape.geometry()?;
     cuteafd_core::set_expert_geometry(geometry)
         .map_err(|fixed| anyhow::anyhow!("expert geometry already {fixed:?}"))?;
-    ensure!(args.layer < shape.layers, "layer {} is outside 0..{}", args.layer, shape.layers);
+    ensure!((shape.first_layer..shape.layers).contains(&args.layer), "layer {} is outside {}..{}",
+        args.layer, shape.first_layer, shape.layers);
     ensure!(args.stage.is_none() || catalog.exl3().is_some(), "--stage probes EXL3 dSpark stages only");
     let (hidden, topk, rows) = (shape.hidden, shape.topk, args.rows as usize);
     ensure!(rows > 0 && rows <= 4096, "rows must be 1..=4096");

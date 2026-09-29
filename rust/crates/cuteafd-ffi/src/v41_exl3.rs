@@ -56,7 +56,7 @@ impl V41Exl3Info {
                 && words[3] <= 384
                 && words[3] >= words[5]
                 && words[4] > 0
-                && matches!(words[5], 3 | 6)
+                && matches!(words[5], 3 | 6 | 8)
                 && matches!(words[6], 2..=4),
             "invalid EXL3 native geometry: {words:?}"
         );

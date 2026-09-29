@@ -47,6 +47,12 @@ impl ExpertGeometry {
         }
     }
 
+    /// Routed-expert SwiGLU clamp: DeepSeek clamps gate/up at 10; GLM's
+    /// SwiGLU is unclamped (`None`).
+    pub fn swiglu_limit(&self) -> Option<f32> {
+        (*self != Self::GLM_DSA).then_some(10.0)
+    }
+
     /// A short stable key for artifact and symbol names.
     pub fn key(&self) -> String {
         format!("h{}e{}k{}i{}l{}", self.hidden, self.experts, self.topk, self.intermediate, self.layers)
@@ -85,5 +91,7 @@ mod tests {
         assert_eq!(g.key(), "h5120e384k6i2304l40");
         assert_eq!(g.family(), Some("v41"));
         assert_eq!(ExpertGeometry::DEEPSEEK_V4_FLASH.family(), Some("dsv4f"));
+        assert_eq!(g.swiglu_limit(), Some(10.0));
+        assert_eq!(ExpertGeometry::GLM_DSA.swiglu_limit(), None);
     }
 }
