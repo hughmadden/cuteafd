@@ -68,6 +68,10 @@ if [[ -n "$draft" ]]; then
   [[ -d "$draft_root/snapshots/$draft_revision" ]] || { echo "missing snapshot $draft@$draft_revision" >&2; exit 1; }
   draft_args=(--draft "/root/.cache/huggingface/hub/models--${draft//\//--}/snapshots/$draft_revision")
 fi
+# SERVED_MODEL_ID: the public model id (default: the checkpoint's Hugging Face id).
+served_args=()
+served="$(get SERVED_MODEL_ID)"
+[[ -z "$served" ]] || served_args=(--model-id "$served")
 coordinator_image="$(get COORDINATOR_DOCKER_INFERENCE)"
 spark_image="$(get SPARK_EXPERT_DOCKER_INFERENCE)"
 port="$(get EXPERT_PORT 19441)"
@@ -103,7 +107,7 @@ docker run -d --name cuteafd-coordinator --restart no --gpus "device=$gpu" --net
   "$coordinator_image" cuteafd $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peer_csv" --listen "$addr" \
   --max-sequences "$(get CONCURRENCY 8)" --max-context "$(get MAX_CONTEXT_TOKENS 8192)" \
-  --max-output "$(get MAX_OUTPUT_TOKENS 4096)" $([[ $serve == serve-dsv4 && "$(get DSPARK off)" == on ]] && echo --dspark) "${draft_args[@]}" >/dev/null
+  --max-output "$(get MAX_OUTPUT_TOKENS 4096)" $([[ $serve == serve-dsv4 && "$(get DSPARK off)" == on ]] && echo --dspark) "${draft_args[@]}" "${served_args[@]}" >/dev/null
 url="http://127.0.0.1:${addr##*:}"
 until curl -sf "$url/health" >/dev/null; do
   docker ps -q -f name=cuteafd-coordinator | grep -q . ||
