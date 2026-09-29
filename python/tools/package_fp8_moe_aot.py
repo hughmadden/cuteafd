@@ -17,7 +17,7 @@ Library ABI (``native/include/cuteafd_fp8_moe.h``)::
 
     int32_t cuteafd_fp8moe_info(uint32_t* words, uint32_t count);
         words: [0] ABI 1, [1] hidden, [2] slice, [3] experts, [4] top-k,
-        [5] intermediate, [6] tp, [7] input dtype (7 = FP8 K32 wire rows),
+        [5] intermediate, [6] tp, [7] input dtype (7 = FP8 K32 wire rows, 1 = BF16 rows),
         [8] SwiGLU limit (FP32 bits, 0 = none), [9] capacities n, [10..] capacities
     int32_t cuteafd_fp8moe_scratch_bytes(uint32_t capacity, uint64_t* bytes);
     int32_t cuteafd_fp8moe_create(void** context);           // loads every program on the current device
@@ -48,6 +48,9 @@ os.environ.setdefault("B12X_COMPILE_MEMORY_CACHE", "0")
 SCHEMA = "cuteafd.fp8moe-package.v1"
 ROLE_LAYOUTS = {"spark": ("tp4", "tp2"), "coordinator": ("tp1",)}
 ROLE_COMPUTE = {"spark": (12, 1), "coordinator": (12, 0)}
+# Spark ranks take the FP8 K32 wire rows of the expert protocol; coordinator
+# experts take the BF16 activations directly (no input quantization at all).
+ROLE_INPUT = {"spark": "wire", "coordinator": "bf16"}
 LIBRARY = "libcuteafd_fp8moe.so"
 POINTERS = 11
 INFO_WORDS = 16
@@ -157,9 +160,10 @@ extern "C" int32_t cuteafd_fp8moe_launch(void* context, uint32_t capacity, void*
 """
 
 
-def info_words(g, capacities: list[int]) -> list[int]:
+def info_words(g, capacities: list[int], wire: bool) -> list[int]:
     limit = struct.unpack("<I", struct.pack("<f", float(g.swiglu_limit)))[0]
-    words = [1, g.hidden, g.slice, g.experts, g.top_k, g.intermediate, g.tp, 7, limit, len(capacities), *capacities]
+    words = [1, g.hidden, g.slice, g.experts, g.top_k, g.intermediate, g.tp, 7 if wire else 1, limit,
+             len(capacities), *capacities]
     if len(words) > INFO_WORDS:
         raise ValueError(f"at most {INFO_WORDS - 10} capacities per package")
     return words + [0] * (INFO_WORDS - len(words))
@@ -182,6 +186,7 @@ def build(args: argparse.Namespace) -> None:
     base = GEOMETRIES[args.geometry]
     capacities = sorted({int(v) for v in args.capacities.split(",")})
     layouts = args.layouts.split(",") if args.layouts else list(ROLE_LAYOUTS[args.role])
+    wire = (args.input or ROLE_INPUT[args.role]) == "wire"
     if args.output.exists():
         raise SystemExit(f"{args.output} exists; remove it or choose another --output")
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -201,7 +206,7 @@ def build(args: argparse.Namespace) -> None:
             for capacity in capacities:
                 stem = f"fp8moe_{args.geometry}_{layout}_m{capacity}"
                 with exportable_compilation():
-                    program = compile_fp8_moe_aot(g, route="auto", max_rows=capacity)
+                    program = compile_fp8_moe_aot(g, route="auto", max_rows=capacity, wire=wire)
                 program.export_to_c(str(raw), stem, "cuteafd_" + stem)
                 checked = validate_exported_header(program, raw / f"{stem}.h", "cuteafd_" + stem)
                 if checked["argument_count"] != POINTERS + 2:
@@ -209,7 +214,7 @@ def build(args: argparse.Namespace) -> None:
                 programs.append({"stem": stem, "capacity": capacity, "entry": checked["symbol"],
                                  "scratch": fp8_moe_scratch_bytes(g, "auto", capacity)})
                 print(f"exported {stem} (scratch {programs[-1]['scratch']} B)", flush=True)
-            (raw / "fp8moe_bridge.cc").write_text(bridge_source(programs, info_words(g, capacities)))
+            (raw / "fp8moe_bridge.cc").write_text(bridge_source(programs, info_words(g, capacities, wire)))
             target = stage / layout / LIBRARY
             target.parent.mkdir(parents=True)
             subprocess.run([args.cxx, "-shared", "-fPIC", "-std=c++17", f"-I{args.cuda_include}", f"-I{raw}",
@@ -218,7 +223,7 @@ def build(args: argparse.Namespace) -> None:
                             "-Wl,-z,defs", "-o", str(target)], check=True)
             manifest["layouts"][layout] = {
                 "tp": tp, "hidden": g.hidden, "slice": g.slice, "experts": g.experts, "top_k": g.top_k,
-                "intermediate": g.intermediate, "swiglu_limit": g.swiglu_limit,
+                "intermediate": g.intermediate, "swiglu_limit": g.swiglu_limit, "input": "wire" if wire else "bf16",
                 "capacities": [{"capacity": p["capacity"], "scratch_bytes": p["scratch"]} for p in programs]}
         manifest["files"] = {str(p.relative_to(stage)): {"bytes": p.stat().st_size, "sha256": digest(p)}
                              for p in sorted(stage.rglob("*")) if p.is_file()}
@@ -257,6 +262,8 @@ def main() -> None:
     create.add_argument("--geometry", choices=("mimo", "glm"), required=True)
     create.add_argument("--layouts", help="comma list (default: tp4,tp2 for spark, tp1 for coordinator)")
     create.add_argument("--capacities", default="1,16,80,256,1024,4096")
+    create.add_argument("--input", choices=("wire", "bf16"),
+                        help="expert input rows (default: wire for spark, bf16 for coordinator)")
     create.add_argument("--cross-sm121", action="store_true", help="build a Spark package on an SM120 host")
     create.add_argument("--build-dir", type=Path, required=True)
     create.add_argument("--output", type=Path, required=True)

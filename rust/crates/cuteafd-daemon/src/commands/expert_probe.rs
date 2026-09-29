@@ -81,7 +81,7 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
             sampled.iter().flat_map(|&row| values[row * hidden..][..hidden].iter().copied()).collect()
         };
         if args.local {
-            let (actual, elapsed) = fp8::run_local(&args, &catalog, &wire, &routes)?;
+            let (actual, elapsed) = fp8::run_local(&args, &catalog, &wire, &input, &routes)?;
             let started = Instant::now();
             let expected = fp8::oracle(&catalog, args.layer, &input, &routes, &sampled)?;
             return report(&format!("layer {} rows {rows} local fp8 ({} rows checked)", args.layer, sampled.len()),

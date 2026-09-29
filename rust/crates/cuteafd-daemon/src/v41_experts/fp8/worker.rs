@@ -40,6 +40,7 @@ impl<'a> Fp8Worker<'a> {
         ensure!(!experts.layers.is_empty(), "FP8 worker has no layers");
         ensure!(experts.layers.windows(2).all(|w| w[1].layer == w[0].layer + 1), "FP8 worker layers must be contiguous");
         ensure!(experts.module.info().capacity_for(capacity).is_some(), "FP8 package lacks capacity {capacity}");
+        ensure!(experts.wire_input(), "Spark workers need an FP8 package built for wire rows (the spark role)");
         let inputs = [
             DeviceAllocation::new(library, capacity * (hidden + hidden / 32))?,
             DeviceAllocation::new(library, capacity * topk * 4)?,

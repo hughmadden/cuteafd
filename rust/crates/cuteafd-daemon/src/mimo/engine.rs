@@ -2,9 +2,11 @@
 //!
 //! One layer: input norm (fused with the previous layer's residual add),
 //! the QKV producer (RoPE, KV record), GQA attention, o_proj, the
-//! post-attention norm, then the dense MLP or the MoE (router scores, the
-//! native sigmoid top-8 select, expert input quantization, then the Spark
-//! routed experts, which no MiMo expert family serves yet).
+//! post-attention norm, then the dense MLP or the MoE: router scores (FP32
+//! weight as BF16 hi + lo), the native sigmoid top-8 select, FP8 K32 wire
+//! rows, then the routed experts in the checkpoint's own FP8 (the `fp8`
+//! family): on the Sparks (one BF16 partial per TP rank, summed on the GPU,
+//! as GLM) or, with local experts, on this GPU from the TP1 package.
 //!
 //! KV state: full layers keep BF16 records (keys then values of the 4 KV
 //! heads, 1280 elements) in a paged pool shared by sequences (64 rows per
@@ -13,7 +15,12 @@
 //! program reads in-step keys from it, older keys from the ring, and commits
 //! the step to the ring afterwards.
 use super::weights::{MimoLayer, MimoWeights};
-use crate::v41_memory::DeviceAllocation;
+use crate::v41_experts::fp8::Fp8Experts;
+use crate::v41_memory::{DeviceAllocation, HostAllocation};
+use cuteafd_transport::v41_expert::{V41Tp4Roce, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
+use cuteafd_transport::{
+    ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
+};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::dsv4::{Dsv4Programs, Dsv4Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::NativeLibrary;
@@ -27,6 +34,17 @@ pub(crate) const PAGE_ROWS: usize = 64;
 pub(crate) const RING_ROWS: usize = 256;
 /// Rows of the decode-route programs (`_m64`).
 pub(crate) const DECODE_ROWS: usize = 64;
+/// Most Spark ranks a step's partials come from (the compact reducer's limit).
+const MAX_RANKS: usize = 6;
+
+/// Where the routed experts run.
+pub(crate) enum Experts<'a> {
+    /// The TP1 FP8 package on the coordinator GPU (resident MoE layers).
+    Local(Fp8Experts<'a>),
+    /// Spark ranks serving the `fp8` family over RoCE.
+    Spark { transport: RefCell<V41Tp4Roce>, runtime: tokio::runtime::Runtime },
+}
+
 /// KV splits of the full-attention decode program (its compiled maximum is 32).
 const DECODE_SPLITS: i32 = 16;
 
@@ -104,6 +122,12 @@ struct Workspace<'a> {
     route_ids: Dev<'a>,
     route_weights: Dev<'a>,
     wire: Dev<'a>,
+    /// Spark exchange: rank partial planes, a zero shared-expert plane (MiMo
+    /// has none), and pinned staging for routes, wire rows and partials.
+    planes: Vec<Dev<'a>>,
+    zero_plane: Dev<'a>,
+    router_host: RefCell<HostAllocation<'a>>,
+    planes_host: RefCell<HostAllocation<'a>>,
     head: VocabularyHead<'a>,
     _head_workspace: Dev<'a>,
 }
@@ -124,6 +148,9 @@ pub(crate) struct MimoEngine<'a> {
     cos_sin_swa: Dev<'a>,
     workspace: RefCell<Option<Workspace<'a>>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
+    experts: Option<Experts<'a>>,
+    /// Host time per phase: GPU wait before the expert request, the Spark exchange.
+    pub profile: RefCell<[f64; 2]>,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -176,7 +203,13 @@ impl<'a> MimoEngine<'a> {
         };
         let (cos_sin_full, cos_sin_swa) = (table(cfg.full_rope_theta)?, table(cfg.swa_rope_theta)?);
         Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, rings, kv, cos_sin_full,
-            cos_sin_swa, workspace: RefCell::new(None), decode_workspace: RefCell::new(None) })
+            cos_sin_swa, workspace: RefCell::new(None), decode_workspace: RefCell::new(None), experts: None,
+            profile: RefCell::new([0.0; 2]) })
+    }
+
+    /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
+    pub fn set_experts(&mut self, experts: Experts<'a>) {
+        self.experts = Some(experts);
     }
 
     fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
@@ -206,6 +239,7 @@ impl<'a> MimoEngine<'a> {
             scratch = scratch.max(self.scratch(&name)?);
         }
         let head_workspace = self.alloc(VOCABULARY_HEAD_WORKSPACE)?;
+        let spark = matches!(self.experts, Some(Experts::Spark { .. }));
         let identity: Vec<i64> = (0..t as i64).collect();
         let step_slots = self.alloc(t * 8)?;
         self.library.copy_h2d(step_slots.buffer, bytes_of(&identity))?;
@@ -230,6 +264,15 @@ impl<'a> MimoEngine<'a> {
             route_ids: self.alloc(t * self.cfg.topk * 4)?,
             route_weights: self.alloc(t * self.cfg.topk * 4)?,
             wire: self.alloc(t * (h + h / 32))?,
+            planes: if spark { (0..MAX_RANKS).map(|_| self.alloc(t * h * 2)).collect::<Result<_>>()? } else { Vec::new() },
+            zero_plane: {
+                let zero = self.alloc(if spark { t * h * 2 } else { 256 })?;
+                self.library.cuda_zero_bytes(zero.buffer, zero.buffer.bytes)?;
+                zero
+            },
+            router_host: RefCell::new(HostAllocation::new(self.library,
+                if spark { t * (self.cfg.topk * 8 + h + h / 32) } else { 256 })?),
+            planes_host: RefCell::new(HostAllocation::new(self.library, if spark { MAX_RANKS * t * h * 2 } else { 256 })?),
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, t as u32,
                 self.cfg.vocab_size as u32)? },
@@ -256,6 +299,15 @@ impl<'a> MimoEngine<'a> {
     /// `on_layer` receives each layer's output rows (BF16 [t, hidden]).
     pub fn prefill(&self, placement: &mut MimoPlacement, embed: &[u8],
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<Vec<f32>>> {
+        self.prefill_forced(placement, embed, on_layer, None)
+    }
+
+    /// `prefill` with teacher forcing: after layer `l`, `forced(l)` (when it
+    /// returns rows) replaces the residual before layer `l + 1`, so each
+    /// layer's comparison measures that layer alone.
+    pub fn prefill_forced(&self, placement: &mut MimoPlacement, embed: &[u8],
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<Vec<f32>>> {
         let (t, start) = (embed.len() / (self.cfg.hidden * 2), placement.len);
         ensure!(t > 0 && t <= self.prefill_rows && start + t <= self.max_context, "prefill of {t} rows at {start}");
         let used = (start + t).div_ceil(PAGE_ROWS);
@@ -268,7 +320,7 @@ impl<'a> MimoEngine<'a> {
             page_table: placement.pages[..used].to_vec(),
             table_stride: 0,
         };
-        let logits = self.step(&tables, embed, 1, on_layer)?;
+        let logits = self.step(&tables, embed, 1, on_layer, forced)?;
         placement.len += t;
         Ok(logits)
     }
@@ -297,7 +349,7 @@ impl<'a> MimoEngine<'a> {
                 tables.page_table.extend(pages);
             }
         }
-        let logits = self.step(&tables, embed, rows, on_layer)?;
+        let logits = self.step(&tables, embed, rows, on_layer, None)?;
         for (placement, count) in sequences.iter_mut() {
             placement.len += *count;
         }
@@ -305,7 +357,8 @@ impl<'a> MimoEngine<'a> {
     }
 
     fn step(&self, tables: &StepTables, embed: &[u8], logit_rows: usize,
-        mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<Vec<f32>>> {
+        mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<Vec<f32>>> {
         let (h, t) = (self.cfg.hidden, tables.positions.len());
         let (slot, capacity) = if tables.decode { (&self.decode_workspace, DECODE_ROWS) } else { (&self.workspace, self.prefill_rows) };
         if slot.borrow().is_none() {
@@ -333,7 +386,7 @@ impl<'a> MimoEngine<'a> {
                     ("w_down", layer.ptr("w_down")?), ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
                     &[rows])?;
             } else {
-                self.moe(w, index, layer, t)?;
+                self.moe(w, index, layer, t, tables.decode)?;
             }
             // h += ffn; x = next input_layernorm(h) (or the final norm).
             let weight = match layers.get(index + 1) {
@@ -343,6 +396,12 @@ impl<'a> MimoEngine<'a> {
             self.norm(w, weight, 1, rows)?;
             if let Some(on_layer) = on_layer.as_mut() {
                 on_layer(index, &self.download(&w.h, t * h * 2)?)?;
+            }
+            if let Some(rows_forced) = forced.and_then(|f| f(index)) {
+                ensure!(rows_forced.len() == t * h * 2, "teacher-forced rows of the wrong size");
+                self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: rows_forced.len(), ..w.h.buffer },
+                    &rows_forced)?;
+                self.norm(w, weight, 0, rows)?;
             }
         }
         if layers.len() < self.cfg.layers {
@@ -404,10 +463,14 @@ impl<'a> MimoEngine<'a> {
             ("out", w.delta.buffer.ptr)], &[rows])
     }
 
-    /// Router scores, the sigmoid top-k select and the FP8 wire rows for the
-    /// routed experts. No Spark expert family serves MiMo's FP8 experts yet.
-    fn moe(&self, w: &Workspace<'_>, index: usize, layer: &MimoLayer<'_>, t: usize) -> Result<()> {
+    /// Router scores, the sigmoid top-k select and the FP8 wire rows, then the
+    /// routed experts (local or Spark); leaves their sum in `delta` for the
+    /// next norm's residual add.
+    fn moe(&self, w: &Workspace<'_>, index: usize, layer: &MimoLayer<'_>, t: usize, decode: bool) -> Result<()> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
+        let experts = self.experts.as_ref().with_context(|| format!(
+            "layer {index} is an MoE layer: pass Spark --peers serving the fp8 family, or --local-experts \
+             (run --layers 1 for the dense layer alone)"))?;
         let rows = Dsv4Scalar::I32(t as i32);
         self.run("mimo_router_scores", &[("x", w.x.buffer.ptr), ("w_hilo", layer.ptr("w_hilo")?),
             ("logits", w.router_logits.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])?;
@@ -422,10 +485,96 @@ impl<'a> MimoEngine<'a> {
             // SAFETY: the scale rows follow the payload inside each wire row.
             ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
             ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Dsv4Scalar::I32(grid as i32)])?;
-        anyhow::bail!(
-            "layer {index} is an MoE layer: MiMo's routed experts (256 x FP8 [2048, 4096] gate/up and [4096, 2048] \
-             down, FP32 128x128 block scales, top-8, no shared expert) need a Spark expert family at hidden 4096 / \
-             intermediate 2048; none is built yet (run --layers 1 for the dense layer)"
-        )
+        match experts {
+            Experts::Local(local) => {
+                let resident = local.index_of(index)?;
+                // Coordinator packages take the BF16 rows themselves (exact, no wire).
+                let input = if local.wire_input() { w.wire.buffer.ptr } else { w.x.buffer.ptr };
+                // SAFETY: input rows, route ids (u32 = i32 for ids < 256), weights and
+                // delta are live buffers of `t` rows on this engine's stream.
+                unsafe {
+                    local.run(resident, t, input, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
+                        w.delta.buffer.ptr, self.stream)
+                }
+            }
+            Experts::Spark { transport, runtime } => {
+                self.spark_moe(w, index, t, decode, &mut transport.borrow_mut(), runtime)
+            }
+        }
+    }
+
+    /// Routes and wire rows down, one request to every Spark rank, the BF16
+    /// rank partials summed into `delta` (GLM's exchange, no shared expert).
+    fn spark_moe(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, transport: &mut V41Tp4Roce,
+        runtime: &tokio::runtime::Runtime) -> Result<()> {
+        let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
+        let (h, topk) = (self.cfg.hidden, self.cfg.topk);
+        let (route_bytes, wire_bytes) = (t * topk * 4, t * (h + h / 32));
+        let staging = w.router_host.borrow_mut();
+        let host = staging.buffer;
+        let at = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
+            // SAFETY: ids, weights and wire rows are consecutive inside the pinned buffer.
+            ptr: unsafe { host.ptr.cast::<u8>().add(offset) }.cast(),
+            bytes: host.bytes - offset,
+            ..host
+        };
+        let timer = std::time::Instant::now();
+        // SAFETY: the pinned regions are large enough; the sync completes them.
+        unsafe {
+            self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.stream)?;
+            self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.stream)?;
+            self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), w.wire.buffer, wire_bytes, self.stream)?;
+            self.library.cuda_stream_synchronize(self.stream)?;
+        }
+        self.profile.borrow_mut()[0] += timer.elapsed().as_secs_f64();
+        let staged = staging.bytes();
+        let word = |offset: usize, i: usize| u32::from_le_bytes(staged[offset + i * 4..][..4].try_into().unwrap());
+        let routes = (0..t * topk).map(|i| ExpertProtocolV2RouteEntry {
+            row_index: (i / topk) as u32, expert_id: word(0, i), gate_weight: f32::from_bits(word(route_bytes, i)),
+        }).collect();
+        let wire = staged[2 * route_bytes..2 * route_bytes + wire_bytes].to_vec();
+        drop(staging);
+        let mut request = ExpertProtocolV2Request::new(index as u64 + 1, 17, index as u32, h as u32,
+            ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+            (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
+                row_id: u64::from(row), source_kind: kind, source_request_id: 1,
+                token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32,
+            }).collect(),
+            routes, wire)?;
+        request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+        let ranks = transport.world_size();
+        ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
+        let (row_bytes, plane_bytes) = (h * 2, t * h * 2);
+        let mut staging = w.planes_host.borrow_mut();
+        let bytes = staging.bytes_mut();
+        let timer = std::time::Instant::now();
+        runtime.block_on(async {
+            transport.execute(&request, |rank, first, payload| {
+                let offset = rank * plane_bytes + first as usize * row_bytes;
+                ensure!(first as usize * row_bytes + payload.len() <= plane_bytes, "partial rows exceed the step");
+                bytes[offset..offset + payload.len()].copy_from_slice(payload);
+                Ok(())
+            }).await
+        })?;
+        self.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
+        let mut pointers = [std::ptr::null::<u16>(); MAX_RANKS];
+        for rank in 0..ranks {
+            let source = cuteafd_ffi::CuteafdHostBuffer {
+                // SAFETY: rank planes are disjoint slices of the staging buffer.
+                ptr: unsafe { staging.buffer.ptr.cast::<u8>().add(rank * plane_bytes) }.cast(),
+                bytes: plane_bytes,
+                ..staging.buffer
+            };
+            // SAFETY: pinned source and device plane both hold `plane_bytes`.
+            unsafe { self.library.copy_host_buffer_h2d_async(w.planes[rank].buffer, source, plane_bytes, self.stream)? };
+            pointers[rank] = w.planes[rank].buffer.ptr.cast();
+        }
+        // SAFETY: planes, the zero plane and delta are live [t, h] BF16 buffers ordered after the uploads.
+        unsafe {
+            self.library.v41_compact_reducer()?.reduce_planes(pointers, ranks as u32, w.zero_plane.buffer.ptr.cast(),
+                w.delta.buffer.ptr.cast(), t as u32, self.stream)?;
+            // The staging is rewritten by the next layer only after this upload drains.
+            self.library.cuda_stream_synchronize(self.stream)
+        }
     }
 }

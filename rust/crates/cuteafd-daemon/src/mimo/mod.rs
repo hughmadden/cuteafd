@@ -3,7 +3,7 @@
 pub(crate) mod engine;
 pub(crate) mod weights;
 
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::mimo_v2::MimoV2Config;
 use cuteafd_loader::plan::checkpoint::Checkpoint;
@@ -37,6 +37,16 @@ pub(crate) struct EngineArgs {
     pub rings: usize,
     #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
+    /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family, for MoE layers.
+    #[arg(long, conflicts_with = "local_experts")]
+    pub peers: Option<String>,
+    /// Run the MoE layers' routed experts on this GPU (TP1 FP8 package; all
+    /// resident layers' experts must fit: 6.4 GiB each).
+    #[arg(long)]
+    pub local_experts: bool,
+    /// TP1 FP8 package layout for --local-experts (default `<libdir>/fp8/fp8-mimo/tp1`).
+    #[arg(long)]
+    pub fp8_package: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -53,10 +63,15 @@ pub(crate) struct GoldenArgs {
     pub prefill: Option<usize>,
     #[arg(long, default_value_t = 1)]
     pub step_rows: usize,
+    /// Feed each layer the golden output of the previous one (prefill only),
+    /// so every layer's cosine measures that layer alone.
+    #[arg(long)]
+    pub teacher_force: bool,
 }
 
 /// The checkpoint and native library, opened on the calling thread.
 pub(crate) struct Opened {
+    pub catalog: cuteafd_loader::OfficialV41Catalog,
     pub checkpoint: Checkpoint,
     pub cfg: MimoV2Config,
     pub library: NativeLibrary,
@@ -66,10 +81,15 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     let checkpoint = Checkpoint::open(&args.snapshot)?;
     ensure!(checkpoint.missing_shards.is_empty(), "checkpoint shards missing: {:?}", checkpoint.missing_shards);
     let cfg = MimoV2Config::read(&args.snapshot)?;
+    // The expert geometry is process-wide and must be fixed before the native
+    // library loads (its expert helpers size rows from it).
+    let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    cuteafd_core::set_expert_geometry(catalog.routed_experts().geometry()?)
+        .map_err(|g| anyhow::anyhow!("expert geometry already {g:?}"))?;
     // SAFETY: the library is the cuteafd native shim built for this engine.
     let library = unsafe { NativeLibrary::load(&args.native_lib) }?;
     library.cuda_set_device(args.device)?;
-    Ok(Opened { checkpoint, cfg, library })
+    Ok(Opened { catalog, checkpoint, cfg, library })
 }
 
 impl Opened {
@@ -84,13 +104,68 @@ impl Opened {
         let model = loader.model(&self.cfg, layers)?;
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64, "MiMo coordinator weights resident");
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
-        let engine = engine::MimoEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
+        let mut engine = engine::MimoEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages, args.rings)?;
+        let moe_layers = (0..layers).filter(|&l| !self.cfg.dense[l]).collect::<Vec<_>>();
+        if let Some(experts) = self.experts(args, &moe_layers)? {
+            engine.set_experts(experts);
+        }
         let result = body(&engine);
         drop(engine);
         // SAFETY: the engine that used the stream is gone.
         unsafe { self.library.cuda_stream_destroy(stream)? };
         result
+    }
+}
+
+impl Opened {
+    /// The routed-expert source for `moe_layers`: Spark ranks (`--peers`,
+    /// warmed with a full-capacity request) or the local TP1 package.
+    fn experts<'s>(&'s self, args: &EngineArgs, moe_layers: &[usize]) -> Result<Option<engine::Experts<'s>>> {
+        if moe_layers.is_empty() {
+            return Ok(None);
+        }
+        if args.local_experts {
+            let tensors = self.catalog.fp8().context("MiMo experts are the checkpoint's FP8 tensors")?;
+            let directory = args.fp8_package.clone()
+                .unwrap_or_else(|| crate::v41_experts::fp8::package_directory(&args.native_lib, 1));
+            let (free, _) = self.library.cuda_memory_info()?;
+            let started = Instant::now();
+            let local = crate::v41_experts::fp8::Fp8Experts::load(&self.library, tensors, &directory,
+                moe_layers[0]..moe_layers[moe_layers.len() - 1] + 1, 1, 0, args.prefill_rows,
+                free.saturating_sub(4 << 30))?;
+            tracing::info!(layers = moe_layers.len(), elapsed_ms = started.elapsed().as_millis() as u64,
+                "MiMo FP8 experts resident on this GPU");
+            return Ok(Some(engine::Experts::Local(local)));
+        }
+        let Some(peers) = args.peers.as_deref() else { return Ok(None) };
+        let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
+        let executors: Vec<u64> = (0..peers.len())
+            .map(|rank| cuteafd_transport::v41_expert::v41_spark_executor_id(peers.len(), rank))
+            .collect::<Result<_>>()?;
+        let mut transport = cuteafd_transport::v41_expert::V41Tp4Roce::new_ranks(&peers, &executors, u32::try_from(args.prefill_rows)?,
+            cuteafd_transport::TcpTransportConfig { timing: false, timeout: std::time::Duration::from_secs(120),
+                max_frame_bytes: 64 << 20 })?;
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        // Connect every rank and register full-size buffers now: the first
+        // request otherwise pays seconds of connection setup.
+        let started = Instant::now();
+        let (rows, h, topk) = (args.prefill_rows, self.cfg.hidden, self.cfg.topk);
+        let routes = (0..rows * topk).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
+            row_index: (i / topk) as u32, expert_id: (i % self.cfg.experts) as u32, gate_weight: 0.0,
+        }).collect();
+        let mut request = cuteafd_transport::ExpertProtocolV2Request::new(1, 17, moe_layers[0] as u32, h as u32,
+            cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+            (0..rows as u32).map(|row| cuteafd_transport::ExpertProtocolV2RowDescriptor {
+                row_id: u64::from(row), source_kind: cuteafd_transport::ExpertV2SourceKind::Prefill,
+                source_request_id: 1, token_position: u64::from(row), route_offset: row * topk as u32,
+                route_count: topk as u32,
+            }).collect(),
+            routes, vec![0; rows * (h + h / 32)])?;
+        request.header.flags |= cuteafd_transport::v41_expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+        runtime.block_on(async { transport.execute(&request, |_, _, _| Ok(())).await })?;
+        tracing::info!(ranks = peers.len(), elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
+        Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport), runtime }))
     }
 }
 
@@ -154,15 +229,28 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
             }
             worst[layer] = worst[layer].min(cosine);
             if first == 0 {
-                println!("layer {layer:2}: cosine {cosine:.6} rel_l2 {rel:.3e}");
+                // Per-row cosines: route flips show as a few bad rows with the
+                // median near 1; a systematic error moves the median.
+                let (ours, theirs) = (bf16s(stream), bf16s(golden));
+                let hidden = row / 2;
+                let mut rows: Vec<f64> = ours.chunks_exact(hidden).zip(theirs.chunks_exact(hidden))
+                    .map(|(a, b)| similarity(a, b).0).collect();
+                rows.sort_by(f64::total_cmp);
+                let bad = rows.iter().filter(|&&c| c < 0.999).count();
+                println!("layer {layer:2}: cosine {cosine:.6} rel_l2 {rel:.3e} | rows: median {:.6} p1 {:.4} worst {:.4}, \
+                    {bad} of {} below 0.999", rows[rows.len() / 2], rows[rows.len() / 100], rows[0], rows.len());
             }
         }
         Ok(())
     };
     let mut worst = Vec::new();
     let started = Instant::now();
-    let logits = engine.prefill(&mut placement, &embed[..prefill * row],
-        Some(&mut |layer, stream| compare(layer, 0, stream, &mut worst)))?;
+    let forced = |layer: usize| -> Option<Vec<u8>> {
+        std::fs::read(args.golden.join(format!("layer{layer:02}.bin"))).ok().map(|rows| rows[..prefill * row].to_vec())
+    };
+    let logits = engine.prefill_forced(&mut placement, &embed[..prefill * row],
+        Some(&mut |layer, stream| compare(layer, 0, stream, &mut worst)),
+        args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>))?;
     let prefill_seconds = started.elapsed().as_secs_f64();
     let started = Instant::now();
     let mut decode_worst = Vec::new();

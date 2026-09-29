@@ -17,6 +17,8 @@ pub struct Fp8MoeInfo {
     pub topk: usize,
     pub intermediate: usize,
     pub tp: usize,
+    /// Input rows are FP8 K32 wire rows (Spark) rather than BF16 (coordinator).
+    pub wire_input: bool,
     pub swiglu_limit: f32,
     pub capacities: Vec<usize>,
 }
@@ -24,7 +26,7 @@ pub struct Fp8MoeInfo {
 impl Fp8MoeInfo {
     fn from_words(words: [u32; 16]) -> Result<Self> {
         let count = words[9] as usize;
-        ensure!(words[0] == 1 && words[7] == 7 && (1..=6).contains(&count),
+        ensure!(words[0] == 1 && matches!(words[7], 1 | 7) && (1..=6).contains(&count),
             "unsupported FP8 expert package ABI {words:?}");
         let info = Self {
             hidden: words[1] as usize,
@@ -33,6 +35,7 @@ impl Fp8MoeInfo {
             topk: words[4] as usize,
             intermediate: words[5] as usize,
             tp: words[6] as usize,
+            wire_input: words[7] == 7,
             swiglu_limit: f32::from_bits(words[8]),
             capacities: words[10..10 + count].iter().map(|&c| c as usize).collect(),
         };

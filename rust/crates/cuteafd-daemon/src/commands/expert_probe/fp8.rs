@@ -107,7 +107,7 @@ pub(super) fn oracle(catalog: &OfficialV41Catalog, layer: usize, input: &[f32], 
 
 /// `--local`: the probe's wire rows and routes through the full-width (TP1)
 /// FP8 package on this GPU. Returns every row (FP32) and the checked launch time.
-pub(super) fn run_local(args: &ExpertProbeArgs, catalog: &OfficialV41Catalog, wire: &[u8],
+pub(super) fn run_local(args: &ExpertProbeArgs, catalog: &OfficialV41Catalog, wire: &[u8], input: &[f32],
     routes: &[ExpertProtocolV2RouteEntry]) -> Result<(Vec<f32>, Duration)> {
     let tensors = catalog.fp8().context("FP8 checkpoint")?;
     let shape = *catalog.routed_experts();
@@ -130,7 +130,13 @@ pub(super) fn run_local(args: &ExpertProbeArgs, catalog: &OfficialV41Catalog, wi
     };
     let ids: Vec<u8> = routes.iter().flat_map(|r| r.expert_id.to_le_bytes()).collect();
     let weights: Vec<u8> = routes.iter().flat_map(|r| r.gate_weight.to_le_bytes()).collect();
-    let (wire, ids, weights) = (upload(wire)?, upload(&ids)?, upload(&weights)?);
+    // A BF16-input (coordinator) package takes the wire rows' exact BF16 values.
+    let rows_in: Vec<u8> = if experts.wire_input() {
+        wire.to_vec()
+    } else {
+        input.iter().flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes()).collect()
+    };
+    let (wire, ids, weights) = (upload(&rows_in)?, upload(&ids)?, upload(&weights)?);
     let output = DeviceAllocation::new(&library, rows * hidden * 2)?;
     // SAFETY: every buffer is a live device allocation of the documented extent;
     // the stream is drained before any is released.

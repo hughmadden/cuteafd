@@ -129,8 +129,13 @@ impl<'a> Fp8Experts<'a> {
             .with_context(|| format!("FP8 expert layer {layer} is not resident"))
     }
 
-    /// Routed experts of resident layer `index` for `rows` wire rows into
-    /// `out` (BF16 `[rows, H]`).
+    /// Whether the package takes FP8 K32 wire rows (else BF16 rows).
+    pub fn wire_input(&self) -> bool {
+        self.module.info().wire_input
+    }
+
+    /// Routed experts of resident layer `index` for `rows` input rows (wire
+    /// or BF16, per `wire_input`) into `out` (BF16 `[rows, H]`).
     ///
     /// # Safety
     /// `wire`, `ids` (I32 `[rows, k]`), `weights` (F32 `[rows, k]`) and `out`
