@@ -506,10 +506,10 @@ fn parse_deepseek_v4_manifest(
     let (hidden, intermediate) = (backbone.hidden, backbone.intermediate);
     let mut projections = BTreeMap::new();
     for (draft, layers, experts) in [
-        (false, backbone.layers, backbone.experts),
-        (true, draft_stages, draft_experts),
+        (false, backbone.first_layer..backbone.layers, backbone.experts),
+        (true, 0..draft_stages, draft_experts),
     ] {
-        for layer in 0..layers {
+        for layer in layers {
             for expert in 0..experts {
                 for kind in [
                     V41Exl3ProjectionKind::Gate,
@@ -750,6 +750,7 @@ mod tests {
     fn deepseek_v4_publication() -> (Value, Value, crate::RoutedExpertShape) {
         let shape = crate::RoutedExpertShape {
             layers: 2,
+            first_layer: 0,
             experts: 3,
             topk: 2,
             hidden: 256,

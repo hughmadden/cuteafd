@@ -45,7 +45,10 @@ pub struct V41Tensor {
 /// family's full configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoutedExpertShape {
+    /// Layer id bound; routed experts live in `first_layer..layers` (earlier
+    /// layers are dense).
     pub layers: usize,
+    pub first_layer: usize,
     pub experts: usize,
     pub topk: usize,
     pub hidden: usize,
@@ -60,6 +63,7 @@ impl RoutedExpertShape {
         let text = config.text();
         Self {
             layers: text.num_hidden_layers,
+            first_layer: 0,
             experts: text.n_routed_experts,
             topk: text.num_experts_per_tok,
             hidden: text.hidden_size,
@@ -701,12 +705,52 @@ pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
     }
     match config.get("model_type").and_then(serde_json::Value::as_str) {
         Some("deepseek_v4") => read_deepseek_v4_expert_catalog(snapshot),
+        Some("glm_moe_dsa") => read_glm_dsa_expert_catalog(snapshot, &config),
         other => anyhow::bail!(
             "the Spark expert service does not know model_type {other:?}; add a family \
              reader next to read_deepseek_v4_expert_catalog that maps its routed expert \
              tensors onto the six-region W1,W3,W2,S1,S3,S2 staging plan"
         ),
     }
+}
+
+/// GLM 5.x (glm_moe_dsa) routed experts. Only EXL3 publications serve from
+/// the Sparks today (the official FP8 experts need ~675 GiB); dense layers
+/// come first, and the MTP layer after the backbone keeps its experts on the
+/// coordinator.
+fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Result<OfficialV41Catalog> {
+    let text = config.get("text_config").unwrap_or(config);
+    let field = |key: &str| -> Result<usize> {
+        text[key].as_u64().map(|v| v as usize).with_context(|| format!("glm_moe_dsa config lacks {key}"))
+    };
+    let layers = field("num_hidden_layers")?;
+    let first_layer = match text["mlp_layer_types"].as_array() {
+        Some(types) => types.iter().position(|t| t == "sparse").context("no sparse layer in mlp_layer_types")?,
+        None => field("first_k_dense_replace").unwrap_or(0),
+    };
+    let shape = RoutedExpertShape {
+        layers,
+        first_layer,
+        experts: field("n_routed_experts")?,
+        topk: field("num_experts_per_tok")?,
+        hidden: field("hidden_size")?,
+        intermediate: field("moe_intermediate_size")?,
+        draft_stages: 0,
+        draft_experts: 0,
+    };
+    ensure!(
+        config["quantization_config"]["quant_method"] == "exl3",
+        "GLM routed experts serve from EXL3 publications (e.g. wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1); \
+         the official FP8 experts do not fit the Spark pool"
+    );
+    #[derive(Deserialize)]
+    struct Index {
+        weight_map: BTreeMap<String, String>,
+    }
+    let index: Index = crate::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)
+        .and_then(|value| Ok(serde_json::from_value(value)?))?;
+    let manifest = crate::v41_exl3::read_deepseek_v4_exl3_manifest(snapshot, shape)?;
+    deepseek_v4_exl3_catalog(snapshot, &index.weight_map, manifest)
 }
 
 /// DeepSeek V4 routed experts; every other tensor stays with the coordinator
@@ -726,6 +770,7 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog
     );
     let backbone = RoutedExpertShape {
         layers: v4.n_layers,
+        first_layer: 0,
         experts: v4.n_routed_experts,
         topk: v4.n_activated_experts,
         hidden,
@@ -796,6 +841,7 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog
         config: None,
         experts: RoutedExpertShape {
             layers: v4.n_layers,
+            first_layer: 0,
             experts: v4.n_routed_experts,
             topk: v4.n_activated_experts,
             hidden,
@@ -845,8 +891,13 @@ fn deepseek_v4_exl3_catalog(
                     }
                 }
                 None => {
+                    // Experts past the backbone (a native MTP layer) stay on the coordinator.
+                    let past_backbone = tensor.name.strip_prefix("model.layers.")
+                        .and_then(|rest| rest.split('.').next()?.parse::<usize>().ok())
+                        .is_some_and(|layer| layer >= manifest.experts.layers);
                     ensure!(
-                        !tensor.name.contains(".mlp.experts.") && !tensor.name.contains(".ffn.experts."),
+                        past_backbone
+                            || (!tensor.name.contains(".mlp.experts.") && !tensor.name.contains(".ffn.experts.")),
                         "routed expert tensor {} is not in the EXL3 storage map",
                         tensor.name
                     );

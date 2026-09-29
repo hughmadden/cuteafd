@@ -995,3 +995,17 @@ fn deepseek_v4_flash_expert_catalog_stages_tp4_shards() -> anyhow::Result<()> {
     assert!(buffer.iter().any(|&byte| byte != 0));
     Ok(())
 }
+
+/// The published GLM 5.3 EXL3 K4 checkpoint opens as a routed-expert catalog
+/// (run with --ignored on a host that mounts sparknest).
+#[test]
+#[ignore]
+fn glm53_exl3_k4_catalog() {
+    let snapshot = std::path::Path::new("/mnt/sparknest/hf-home/hub/models--wrldsuksgo2mars--GLM-5.3-EXL3-K4-v1/snapshots/47af23347db743b4666d952e2eb48f2b01c3fede");
+    let catalog = crate::read_expert_catalog(snapshot).unwrap();
+    let shape = *catalog.routed_experts();
+    assert_eq!((shape.first_layer, shape.layers, shape.experts, shape.topk, shape.hidden, shape.intermediate),
+        (3, 78, 256, 8, 6144, 2048));
+    assert_eq!(shape.geometry().unwrap().family(), Some("glm"));
+    assert_eq!(catalog.exl3().unwrap().projections.len(), 75 * 256 * 3);
+}

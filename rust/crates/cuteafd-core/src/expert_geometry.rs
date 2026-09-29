@@ -22,6 +22,8 @@ impl ExpertGeometry {
     pub const DEEPSEEK_V41: Self = Self { hidden: 5120, experts: 384, topk: 6, intermediate: 2304, layers: 40 };
     pub const DEEPSEEK_V4_FLASH: Self = Self { hidden: 4096, experts: 256, topk: 6, intermediate: 2048, layers: 43 };
     pub const DEEPSEEK_V4_PRO: Self = Self { hidden: 7168, experts: 384, topk: 6, intermediate: 3072, layers: 61 };
+    /// GLM 5.3 (glm_moe_dsa): routed layers 3..78 (layers is the id bound).
+    pub const GLM_DSA: Self = Self { hidden: 6144, experts: 256, topk: 8, intermediate: 2048, layers: 78 };
 
     /// BF16 bytes of one hidden-width row (a routed input or a rank partial).
     pub const fn row_bytes(&self) -> u32 {
@@ -40,6 +42,7 @@ impl ExpertGeometry {
             Self::DEEPSEEK_V41 => Some("v41"),
             Self::DEEPSEEK_V4_FLASH => Some("dsv4f"),
             Self::DEEPSEEK_V4_PRO => Some("dsv4p"),
+            Self::GLM_DSA => Some("glm"),
             _ => None,
         }
     }
