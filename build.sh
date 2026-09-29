@@ -443,6 +443,8 @@ docker run --rm \
   -e NVIDIA_VISIBLE_DEVICES=0 \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}" \
   -e "CUTEAFD_RELEASE_GLM_AOT=${CUTEAFD_RELEASE_GLM_AOT:-OFF}" \
+  -e "CUTEAFD_RELEASE_MIMO_AOT=${CUTEAFD_RELEASE_MIMO_AOT:-OFF}" \
+  -e "CUTEAFD_RELEASE_GLMF_AOT=${CUTEAFD_RELEASE_GLMF_AOT:-OFF}" \
   ${release_build_root_args[@]+"${release_build_root_args[@]}"} \
   -v "$repo_root:/source:ro" \
   -v "$artifact_dir:/output" \
@@ -603,6 +605,7 @@ trap 'docker rm -f "$coordinator_container" >/dev/null 2>&1 || true' EXIT
 docker cp "$coordinator_container:/opt/cuteafd/bin/cuteafd" "$repo_root/dist/coordinator/cuteafd"
 docker cp "$coordinator_container:/opt/cuteafd/lib/libcuteafd_native.so" "$repo_root/dist/coordinator/libcuteafd_native.so"
 docker cp "$coordinator_container:/opt/cuteafd/lib/exl3" "$repo_root/dist/coordinator/exl3"
+docker cp "$coordinator_container:/opt/cuteafd/lib/fp8" "$repo_root/dist/coordinator/fp8"
 docker cp "$coordinator_container:/opt/cuteafd/share/V41_EXPERT_AOT.json" "$repo_root/dist/coordinator/V41_EXPERT_AOT.json"
 docker cp "$coordinator_container:/opt/cuteafd/share/V41_EXPERT_TP_AOT.json" "$repo_root/dist/coordinator/V41_EXPERT_TP_AOT.json"
 docker cp "$coordinator_container:/opt/cuteafd/share/V41_FP8_AOT.json" "$repo_root/dist/coordinator/V41_FP8_AOT.json"
@@ -642,6 +645,7 @@ trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
 docker cp "$container:/opt/cuteafd/bin/cuteafd" "$destination/cuteafd"
 docker cp "$container:/opt/cuteafd/lib/libcuteafd_native.so" "$destination/libcuteafd_native.so"
 docker cp "$container:/opt/cuteafd/lib/exl3" "$destination/exl3"
+docker cp "$container:/opt/cuteafd/lib/fp8" "$destination/fp8"
 docker cp "$container:/opt/cuteafd/share/V41_EXPERT_AOT.json" "$destination/V41_EXPERT_AOT.json"
 docker cp "$container:/opt/cuteafd/share/V41_EXPERT_TP_AOT.json" "$destination/V41_EXPERT_TP_AOT.json"
 docker cp "$container:/opt/cuteafd/share/V41_FP8_AOT.json" "$destination/V41_FP8_AOT.json"

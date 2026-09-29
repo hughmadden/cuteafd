@@ -340,6 +340,17 @@ class PackageProfileTests(unittest.TestCase):
         coordinator = [name for name, *_ in package.shard_profiles('dsv4p', 'coordinator')]
         self.assertFalse([name for name in coordinator if name.startswith('tp6')])
 
+    def test_fused_input_rotation_only_where_few_tiles_share_a_half(self):
+        """Spark V4 Pro <= 768 at m4096 and GLM <= 1024 above m256; never V4.1,
+        the coordinator, or widths that are not whole 256 tiles."""
+        f = package.fused_input_rotation
+        self.assertTrue(f('dsv4p', 'spark', 768, 4096) and f('dsv4p', 'spark', 512, 4096))
+        self.assertFalse(f('dsv4p', 'spark', 768, 1024) or f('dsv4p', 'spark', 1024, 4096))
+        self.assertTrue(f('glm', 'spark', 512, 1024) and f('glm', 'spark', 1024, 4096))
+        self.assertFalse(f('glm', 'spark', 640, 4096) or f('glm', 'spark', 512, 256))
+        for capacity in (1, 16, 80, 256, 1024, 4096):
+            self.assertFalse(f('v41', 'spark', 512, capacity) or f('dsv4p', 'coordinator', 768, capacity))
+
     def test_route_blocks_widen_only_for_dsv4p_prefill(self):
         """V4.1 and V4 Flash keep 8-row blocks; V4 Pro prefill widens (Spark and RTX)."""
         for capacity in (1, 16, 80, 256, 1024, 4096):

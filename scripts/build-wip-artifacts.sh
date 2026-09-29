@@ -124,6 +124,8 @@ cmake \
   -DCUTEAFD_ENABLE_V41_FP8_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_DSV4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_DSV4_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_GLM_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_GLM_AOT:-OFF}" || echo OFF)" \
+  -DCUTEAFD_ENABLE_MIMO_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_MIMO_AOT:-OFF}" || echo OFF)" \
+  -DCUTEAFD_ENABLE_GLMF_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_GLMF_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_V41_ATTENTION_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_NARROW_AOT="$coordinator_aot" \
@@ -167,6 +169,16 @@ if [[ "$exl3_aot" == ON ]]; then
       --package "$output_dir/exl3/$wip_package" --role "$role"
   done
 fi
+# Exact FP8 expert packages (FAMILY:fp8 entries) ship as fp8/fp8-FAMILY.
+IFS=';' read -ra wip_fp8_list <<<"$expert_families"
+for wip_family in "${wip_fp8_list[@]}"; do
+  [[ "$wip_family" == *:fp8 ]] || continue
+  wip_package="fp8-${wip_family%%:*}"
+  mkdir -p "$output_dir/fp8"
+  rm -rf "$output_dir/fp8/$wip_package"
+  cp -a "$build_dir/native/fp8/$wip_package" "$output_dir/fp8/$wip_package"
+  python3 "$source_dir/python/tools/package_fp8_moe_aot.py" verify --package "$output_dir/fp8/$wip_package"
+done
 install -m 0644 "$build_dir/native/v41_experts/v41_experts.json" "$output_dir/V41_EXPERT_AOT.json"
 # Always emit the built-role manifest (empty for the legacy default). Roles are
 # derived from the AOT export manifests CMake actually produced and bound to the

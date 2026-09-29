@@ -1,4 +1,5 @@
 pub mod dsv4;
+pub mod fp8_moe;
 mod glm_dflash;
 mod v41_candidate_blocks;
 mod v41_device_ops;

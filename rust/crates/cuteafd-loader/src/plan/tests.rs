@@ -136,3 +136,36 @@ fn capacity_suggests_a_supported_rank_count() {
     assert_eq!(report.min_spark_ranks, 6);
     assert!(!report.fits);
 }
+
+#[test]
+fn glm_next_facts_and_dflash2_drafter_are_described() {
+    let dir = snapshot(
+        json!({"architectures": ["Glm5NextForConditionalGeneration"], "text_config": {
+            "hidden_size": 64, "vocab_size": 8, "num_hidden_layers": 2, "n_routed_experts": 2,
+            "num_experts_per_tok": 1, "moe_intermediate_size": 32, "kv_lora_rank": 512, "qk_rope_head_dim": 0,
+            "qk_nope_head_dim": 256, "v_head_dim": 256, "index_topk": 2048, "index_kpool": 4,
+            "index_kpool_always_select_tail": true, "hc_mult": 4, "hc_sinkhorn_iters": 20, "swiglu_limit": 10.0,
+            "layer_types": ["linear_attention", "deepseek_sparse_attention"],
+            "mlp_layer_types": ["dense", "sparse"],
+            "linear_attn_config": {"num_heads": 64, "head_dim": 128, "short_conv_kernel_size": 4,
+                                   "gate_lower_bound": -5.0}}}),
+        &[("model.language_model.layers.0.self_attn.A_log", "F32", vec![64])],
+    );
+    let report = plan(dir.path(), &PlanOptions::default()).unwrap();
+    let notes = report.spec.as_ref().unwrap().notes.join("\n");
+    assert!(notes.contains("record 528 B"), "{notes}");
+    assert!(notes.contains("dense causal up to 2051 tokens"), "{notes}");
+    assert!(notes.contains("recurrent state 4.0 MiB"), "{notes}");
+    assert!(notes.contains("SwiGLU clamp 10"), "{notes}");
+
+    let draft = snapshot(
+        json!({"architectures": ["DFlash2DraftModel"], "hidden_size": 64, "vocab_size": 8,
+               "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 1, "head_dim": 16,
+               "sliding_window": 2048, "intermediate_size": 128, "num_target_layers": 45,
+               "dflash_config": {"block_size": 8, "target_layer_ids": [5, 14]}}),
+        &[("fc.weight", "BF16", vec![64, 128])],
+    );
+    let report = plan(draft.path(), &PlanOptions::default()).unwrap();
+    assert_eq!(report.family.as_deref(), Some("dflash2"));
+    assert!(report.spec.unwrap().notes[0].contains("taps [5, 14] of a 45-layer target"));
+}

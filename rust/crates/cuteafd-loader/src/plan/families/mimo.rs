@@ -136,22 +136,25 @@ impl Family for MiMo {
         let (what, how) = match component {
             Component::Attention => (
                 "GQA full attention plus 128-token sliding-window GQA with learned sink bias",
-                "b12x attention/paged (FP8 KV) and varlen cover GQA; add sink-bias support to the \
-                 softmax (it is a per-head additive logit, like V4.1 attn_sink). Head dims differ for \
-                 QK (192) and V (128); partial rotary 0.334. Sliding layers need only a 128-token ring.",
+                "Coordinator programs exist (b12x integration mimo_{full,swa}_{producer,attention}, mimo_o): \
+                 BF16 KV records, paged full layers, 256-slot SWA rings, sinks, QK 192 / V 128, NeoX RoPE on \
+                 64 dims. Full-layer k_proj scales are per KV head (128 + 64 rows). Next: FP8 decode weights, \
+                 multi-row decode tiles for verify steps, FP8 KV.",
             ),
             Component::RoutedExpert => (
                 "sigmoid top-8 routed experts, no shared expert",
-                "Export b12x fused_moe at this geometry. MiMo V2 Flash is FP8 128x128 block \
-                 (w8a8 or dequantize-on-load to MXFP4); V2.6 Pro stores MXFP4 with E8M0 scales typed U8.",
+                "Needs a Spark expert family at hidden 4096 / intermediate 2048 / 256 experts / top-8: FP8 \
+                 E4M3 weights with FP32 128x128 block scales (UE8M0 requantization costs +0.011 nats mean NLL), \
+                 or EXL3 quantization. V2.6 Pro stores MXFP4 with E8M0 scales typed U8.",
             ),
             Component::Router => (
                 "sigmoid noaux_tc router with e_score_correction_bias (router weight FP32 on Flash)",
-                "GLM's top-8 sigmoid router path covers this; no routed scaling factor.",
+                "mimo_router_scores (FP32 weight as BF16 hi + lo, FP32 sums) then cuteafd_router_select \
+                 (sigmoid, normalized, no routed scaling).",
             ),
             Component::Speculator => (
-                "three dense-FFN MTP layers",
-                "Each MTP layer is a full attention block plus dense FP8 FFN (eh_proj/enorm/hnorm).",
+                "three MTP layers (SWA attention with sinks, dense FFN, eh_proj/enorm/hnorm)",
+                "Reuse the mimo SWA programs and mimo_ffn; add the eh_proj fusion (BF16 [4096, 8192]).",
             ),
             _ => return None,
         };

@@ -10,9 +10,14 @@
 # skipped so one list serves both builds.
 #
 # FAMILY:exl3-kTIERS entries (for example `dsv4p:exl3-k23`, `glm:exl3-k45`) are EXL3 packages,
-# built by cmake/v41_exl3.cmake; this file builds only the native families.
+# built by cmake/v41_exl3.cmake; FAMILY:fp8 entries (`mimo:fp8`, `glm:fp8`) are
+# exact FP8 packages built by cmake/fp8_moe.cmake; this file builds only the
+# native families.
 set(CUTEAFD_NATIVE_EXPERT_FAMILIES)
 foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
+  if(entry MATCHES ":fp8$")
+    continue()
+  endif()
   if(NOT entry MATCHES ":exl3-k")
     list(APPEND CUTEAFD_NATIVE_EXPERT_FAMILIES "${entry}")
   elseif(NOT CUTEAFD_ENABLE_V41_EXL3_AOT)

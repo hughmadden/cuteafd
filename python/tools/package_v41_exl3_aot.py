@@ -95,6 +95,8 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
         # Absent means the original 8-row packed-route block.
         if variant.get('route_block', 8) != meta.get('route_block', 8):
             raise ValueError(f'EXL3 variant route block mismatch: {directory}')
+        if variant.get('fused_input_rotation', False) != meta.get('fused_input_rotation', False):
+            raise ValueError(f'EXL3 variant fused input rotation mismatch: {directory}')
         if variant.get('token_major_rotation', False) != meta.get('token_major_rotation', False):
             raise ValueError(f'EXL3 variant input rotation mismatch: {directory}')
         if meta['capacity'] in overrides and meta.get('blocks_per_sm') != overrides[meta['capacity']]:
@@ -217,6 +219,8 @@ GEOMETRIES = {
     'dsv4f': (4096, 2048, 256, 6),
     'dsv4p': (7168, 3072, 384, 6),
     'glm': (6144, 2048, 256, 8),
+    # GLM 5.3 Flash (glm5_next): 288 experts, SwiGLU clamped at 10.
+    'glmf': (4096, 2048, 288, 8),
 }
 # SwiGLU clamp per geometry; None is the unclamped SwiGLU (b12x const-expr
 # elides the clamp). DeepSeek clamps at 10.
@@ -238,7 +242,7 @@ def route_block(geometry: str, capacity: int) -> int:
     fragments (b12x 4d7cb455), so they beat 32 from about 2048 rows up. The coordinator's whole-intermediate rtx-tp1 package
     gains the same way (RTX PRO 6000, width 3072: m4096 74 -> 35 ms, m1024 23 -> 16 ms).
     """
-    if geometry == 'glm':
+    if geometry in ('glm', 'glmf'):
         return glm_route_block(capacity)
     if geometry != 'dsv4p' or capacity <= 256:
         return 8
@@ -263,10 +267,29 @@ def token_major_rotation(geometry: str, capacity: int) -> bool:
     Bit-identical to per-route rotation. It pays where the rotation phase is
     large (V4 Pro m2048..4096 prefill); at m1024 and below it is neutral.
     """
-    if geometry == 'glm':
+    if geometry in ('glm', 'glmf'):
         # GLM top-8 (rtx-tp1): m1024 3910 -> 3830 us, m4096 11790 -> 11470 us.
         return capacity > 256
     return geometry == 'dsv4p' and capacity > 1024
+
+
+def fused_input_rotation(geometry: str, role: str, width: int, capacity: int) -> bool:
+    """Whether FC1 rotates staged token rows in shared memory (no per-route
+    rotated copies). Bit-identical; every FC1 N tile of a block rotates it
+    again, so it pays only while few 256-wide tiles share a projection half.
+    GB10, TP4 random routes, per layer (b12x ccf9e3cd): V4 Pro width 512
+    m4096 19.1 -> 16.5 ms, 768 22.7 -> 21.9, 1024 neutral, 1536 +10%;
+    GLM width 512 m1024 8.9 -> 7.3, m4096 22.6 -> 18.3, 768 -11%, 1024 -6%,
+    640 (128-wide tiles) +16%. V4 Pro m1024 (16-row blocks) is neutral.
+    The coordinator's full-width packages are not measured and stay off.
+    """
+    if role != 'spark' or width % 256:
+        return False
+    if geometry == 'dsv4p':
+        return width <= 768 and capacity > 1024
+    if geometry == 'glm':
+        return width <= 1024 and capacity > 256
+    return False
 
 
 def package_name(geometry: str, bits: list[int]) -> str:
@@ -419,7 +442,9 @@ def build(args: argparse.Namespace) -> None:
     import torch
 
     props = torch.cuda.get_device_properties(0)
-    expected_compute = (12, 1) if args.role == 'spark' else (12, 0)
+    # --loopback: Spark layouts compiled for this coordinator GPU, for worker
+    # tests on raptor; the manifest records compute 12.0, so no Spark takes it.
+    expected_compute = (12, 1) if args.role == 'spark' and not getattr(args, 'loopback', False) else (12, 0)
     if (props.major, props.minor) != expected_compute:
         raise ValueError(f'{args.role} package requires GPU {expected_compute}')
     if paired:
@@ -448,7 +473,9 @@ def build(args: argparse.Namespace) -> None:
                     options['hidden'] = hidden
                 if (block := route_block(geometry, capacity)) != 8:
                     options['route_block'] = block
-                if token_major_rotation(geometry, capacity):
+                if tile is None and fused_input_rotation(geometry, args.role, width, capacity):
+                    options['fused_input_rotation'] = True
+                elif token_major_rotation(geometry, capacity):
                     options['token_major_rotation'] = True
                 if (limit := swiglu_limit(geometry)) != 10.0:
                     options['swiglu_limit'] = limit
@@ -487,6 +514,8 @@ def build(args: argparse.Namespace) -> None:
                         variant['route_block'] = meta['route_block']
                     if meta.get('token_major_rotation'):
                         variant['token_major_rotation'] = True
+                    if meta.get('fused_input_rotation'):
+                        variant['fused_input_rotation'] = True
                     variants.append(variant)
                     if paired:
                         variants[-1]['paired_boundary'] = meta['paired_boundary']
@@ -545,6 +574,8 @@ def main() -> None:
                         help='Opt-in tile override PROFILE=CAPACITIES:FC1_K,FC1_N,FC2_K,FC2_N '
                              '(CAPACITIES is all or 16+80) for a controlled A/B, for example '
                              'tp3-width768=16:64,256,64,256; default is the B12x per-capacity policy')
+    create.add_argument('--loopback', action='store_true',
+                        help='Build Spark-role layouts for the SM120 coordinator GPU (loopback worker tests)')
     create.add_argument('--capacities', default='1,16,80,256,1024,4096')
     create.add_argument('--bits', type=int, nargs='+', default=[3, 4])
     create.add_argument('--build-dir', type=Path, required=True)

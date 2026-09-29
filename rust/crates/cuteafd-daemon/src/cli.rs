@@ -24,6 +24,12 @@ pub(crate) enum Commands {
     Dsv4Golden(crate::dsv4::GoldenArgs),
     /// Run GLM 5.x layers through the exported programs and compare with golden.py outputs.
     GlmGolden(crate::glm::GoldenArgs),
+    /// Compare the MiMo V2 coordinator programs layer by layer with python/reference/mimo_v2/golden.py outputs.
+    MimoGolden(crate::mimo::GoldenArgs),
+    /// Compare the GLM 5.3 Flash coordinator programs layer by layer with python/reference/glm5_next/golden.py outputs.
+    GlmfGolden(crate::glmf::GoldenArgs),
+    /// Serve GLM 5.3 Flash (glm5_next) through the OpenAI API on the glmf engine.
+    ServeGlmf(crate::glmf::serve::ServeArgs),
     /// Serve a GLM 5.x checkpoint (OpenAI-compatible API) over the glm_* programs and Spark experts.
     ServeGlm(crate::glm::serve::ServeArgs),
     /// Serve a DeepSeek V4 checkpoint (OpenAI API) with Spark experts.
@@ -67,6 +73,15 @@ pub(crate) struct ExpertProbeArgs {
     /// Time this many more round trips after the checked one (median, min).
     #[arg(long, default_value_t = 0)]
     pub(crate) repeat: usize,
+    /// With `--local` on an FP8 checkpoint: the package layout directory
+    /// (default `<libdir>/fp8/fp8-<family>/tp<local-tp>`).
+    #[arg(long)]
+    pub(crate) fp8_package: Option<PathBuf>,
+    /// With `--local` on an FP8 checkpoint: run every rank slice of TP degree
+    /// N on this GPU in turn (a Spark package's tp2/tp4 layout) and sum the
+    /// BF16 rank partials in FP32, as the coordinator does.
+    #[arg(long, default_value_t = 1, requires = "local")]
+    pub(crate) local_tp: usize,
 }
 
 #[derive(Debug, Args)]
@@ -133,6 +148,9 @@ pub(crate) struct NativeExpertDaemonArgs {
     /// Override the native EXL3 rank directory containing m1, m16 and larger capacities.
     #[arg(long)]
     pub(crate) exl3_aot_dir: Option<PathBuf>,
+    /// Override the FP8 expert package layout directory (`fp8-<family>/tp<world>`).
+    #[arg(long)]
+    pub(crate) fp8_package: Option<PathBuf>,
     #[arg(long, value_parser = clap::value_parser!(u32).range(0..6))]
     pub(crate) rank: u32,
     /// Spark tensor-parallel world; two ranks require an EXL3 checkpoint.

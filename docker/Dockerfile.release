@@ -99,6 +99,7 @@ RUN python3 /opt/cuteafd/scripts/verify-sparkinfer-source.py \
 COPY .cuteafd-release-image/cuteafd /opt/cuteafd/bin/cuteafd
 COPY .cuteafd-release-image/libcuteafd_native.so /opt/cuteafd/lib/libcuteafd_native.so
 COPY .cuteafd-release-image/exl3 /opt/cuteafd/lib/exl3
+COPY .cuteafd-release-image/fp8 /opt/cuteafd/lib/fp8
 COPY .cuteafd-release-image/V41_EXPERT_AOT.json /opt/cuteafd/share/V41_EXPERT_AOT.json
 COPY .cuteafd-release-image/V41_EXPERT_TP_AOT.json /opt/cuteafd/share/V41_EXPERT_TP_AOT.json
 COPY .cuteafd-release-image/V41_FP8_AOT.json /opt/cuteafd/share/V41_FP8_AOT.json
@@ -125,6 +126,10 @@ RUN for exl3_family in /opt/cuteafd/lib/exl3/exl3-*/; do \
       python3 /opt/cuteafd/python/tools/package_v41_exl3_aot.py verify \
         --package "$exl3_family" --sparkinfer-revision "$CUTEAFD_SPARKINFER_COMMIT" \
         --role "$CUTEAFD_ROLE" --runtime "$(python3 -m cutlass.cute.export.aot_config --libdir)/libcute_dsl_runtime.so"; \
+    done && \
+    for fp8_family in /opt/cuteafd/lib/fp8/fp8-*/; do \
+      [ -d "$fp8_family" ] || continue; \
+      python3 /opt/cuteafd/python/tools/package_fp8_moe_aot.py verify --package "$fp8_family"; \
     done && \
     jq -e --arg role "$CUTEAFD_ROLE" --arg claimed "$CUTEAFD_V41_SPARK_TP_ROLES" --arg lib "$(sha256sum /opt/cuteafd/lib/libcuteafd_native.so | cut -d" " -f1)" '($claimed | split(";") | map(select(. != "")) | sort) as $want | . as $doc | $doc.role == $role and $doc.native_library_sha256 == $lib and (($doc.spark_tp_roles // []) | sort) == $want and (($doc.manifests // {}) | keys | sort) == $want' /opt/cuteafd/share/V41_EXPERT_TP_AOT.json && \
     cmp -s \

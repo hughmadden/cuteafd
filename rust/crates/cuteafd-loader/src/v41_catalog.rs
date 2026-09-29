@@ -95,6 +95,7 @@ pub struct OfficialV41Catalog {
     tensors: Vec<V41Tensor>,
     exl3: Option<crate::V41Exl3Manifest>,
     nvfp4: Option<crate::V41Nvfp4Contract>,
+    fp8: Option<crate::fp8_experts::Fp8ExpertTensors>,
 }
 
 /// Bounded range reads for a validated, unsharded coordinator tensor.
@@ -129,6 +130,11 @@ impl V41CoordinatorTensorReader {
 impl OfficialV41Catalog {
     pub fn exl3(&self) -> Option<&crate::V41Exl3Manifest> {
         self.exl3.as_ref()
+    }
+    /// The checkpoint's own FP8 routed experts (E4M3 + FP32 128x128 block
+    /// scales), served without re-quantization by the `fp8` family.
+    pub fn fp8(&self) -> Option<&crate::fp8_experts::Fp8ExpertTensors> {
+        self.fp8.as_ref()
     }
     /// Validated ModelOpt NVFP4 expert contract, when the checkpoint has one.
     pub fn nvfp4(&self) -> Option<&crate::V41Nvfp4Contract> {
@@ -691,6 +697,7 @@ pub fn read_official_v41_catalog(model_id: &str, snapshot: &Path) -> Result<Offi
         tensors,
         exl3,
         nvfp4,
+        fp8: None,
     })
 }
 
@@ -700,12 +707,16 @@ pub fn read_official_v41_catalog(model_id: &str, snapshot: &Path) -> Result<Offi
 pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
     let config: serde_json::Value =
         crate::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
+    if config.get("model_type").and_then(serde_json::Value::as_str) == Some("glm5_next") {
+        return read_glm_dsa_expert_catalog(snapshot, &config);
+    }
     if config.get("text_config").is_some() {
         return read_official_v41_catalog(crate::OFFICIAL_V41_MODEL_ID, snapshot);
     }
     match config.get("model_type").and_then(serde_json::Value::as_str) {
         Some("deepseek_v4") => read_deepseek_v4_expert_catalog(snapshot),
         Some("glm_moe_dsa") => read_glm_dsa_expert_catalog(snapshot, &config),
+        Some("mimo_v2_flash") => read_mimo_v2_expert_catalog(snapshot, &config),
         other => anyhow::bail!(
             "the Spark expert service does not know model_type {other:?}; add a family \
              reader next to read_deepseek_v4_expert_catalog that maps its routed expert \
@@ -714,7 +725,7 @@ pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
     }
 }
 
-/// GLM 5.x (glm_moe_dsa) routed experts. Only EXL3 publications serve from
+/// GLM 5.x (glm_moe_dsa) and GLM 5.3 Flash (glm5_next) routed experts. Only EXL3 publications serve from
 /// the Sparks today (the official FP8 experts need ~675 GiB); dense layers
 /// come first, and the MTP layer after the backbone keeps its experts on the
 /// coordinator.
@@ -738,10 +749,17 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> R
         draft_stages: 0,
         draft_experts: 0,
     };
+    if config["quantization_config"]["quant_method"] == "fp8" {
+        // The official FP8 experts (~675 GiB) do not fit the Spark pool; the
+        // catalog serves selected layers, above all the MTP layer, whose ids
+        // follow the backbone (num_hidden_layers..): the id bound includes them.
+        let mtp = text["num_nextn_predict_layers"].as_u64().unwrap_or(0) as usize;
+        return fp8_catalog(snapshot, RoutedExpertShape { layers: layers + mtp, ..shape });
+    }
     ensure!(
         config["quantization_config"]["quant_method"] == "exl3",
-        "GLM routed experts serve from EXL3 publications (e.g. wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1); \
-         the official FP8 experts do not fit the Spark pool"
+        "GLM routed experts serve from EXL3 publications (e.g. wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1) \
+         or, coordinator-local, from the official FP8 checkpoint"
     );
     #[derive(Deserialize)]
     struct Index {
@@ -751,6 +769,42 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> R
         .and_then(|value| Ok(serde_json::from_value(value)?))?;
     let manifest = crate::v41_exl3::read_deepseek_v4_exl3_manifest(snapshot, shape)?;
     deepseek_v4_exl3_catalog(snapshot, &index.weight_map, manifest)
+}
+
+/// MiMo V2 (mimo_v2_flash) routed experts: the checkpoint's FP8 E4M3 weights
+/// with FP32 128x128 block scales (`model.layers.{l}.mlp.experts.{e}.
+/// {gate,up,down}_proj.weight[_scale_inv]`); layer 0 is dense.
+fn read_mimo_v2_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Result<OfficialV41Catalog> {
+    let cfg = crate::mimo_v2::MimoV2Config::from_hf(config)?;
+    let first_layer = cfg.dense.iter().position(|dense| !dense).context("MiMo config has no MoE layer")?;
+    ensure!(cfg.dense[first_layer..].iter().all(|dense| !dense), "MiMo MoE layers must follow the dense ones");
+    ensure!(cfg.routed_scale == 1.0, "MiMo routed scaling must be 1");
+    ensure!(config["quantization_config"]["quant_method"] == "fp8"
+        && config["quantization_config"]["weight_block_size"] == serde_json::json!([128, 128]),
+        "MiMo routed experts serve from the checkpoint's FP8 128x128 block weights");
+    fp8_catalog(snapshot, RoutedExpertShape {
+        layers: cfg.layers,
+        first_layer,
+        experts: cfg.experts,
+        topk: cfg.topk,
+        hidden: cfg.hidden,
+        intermediate: cfg.moe_intermediate,
+        draft_stages: 0,
+        draft_experts: 0,
+    })
+}
+
+fn fp8_catalog(snapshot: &Path, shape: RoutedExpertShape) -> Result<OfficialV41Catalog> {
+    let fp8 = crate::fp8_experts::Fp8ExpertTensors::read(snapshot, shape)?;
+    Ok(OfficialV41Catalog {
+        config: None,
+        experts: shape,
+        snapshot: snapshot.to_path_buf(),
+        tensors: Vec::new(),
+        exl3: None,
+        nvfp4: None,
+        fp8: Some(fp8),
+    })
 }
 
 /// DeepSeek V4 routed experts; every other tensor stays with the coordinator
@@ -853,7 +907,15 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog
         tensors,
         exl3: None,
         nvfp4: None,
+        fp8: None,
     })
+}
+
+/// The decoder layer of a Hugging Face tensor name (`model.layers.{L}.` or
+/// `model.language_model.layers.{L}.`).
+fn hf_layer(name: &str) -> Option<usize> {
+    name.strip_prefix("model.layers.").or_else(|| name.strip_prefix("model.language_model.layers."))?
+        .split('.').next()?.parse().ok()
 }
 
 /// DeepSeek V4 EXL3 routed experts: every projection's trellis/suh/svh/mcg is
@@ -884,7 +946,8 @@ fn deepseek_v4_exl3_catalog(
                 Some(projection) => {
                     projection.validate_tensor(&tensor)?;
                     routed += 1;
-                    if tensor.name.starts_with("model.layers.") {
+                    let backbone = hf_layer(&tensor.name).is_some_and(|layer| layer < manifest.experts.layers);
+                    if backbone {
                         V41TensorPlacement::BackboneExl3
                     } else {
                         V41TensorPlacement::CoordinatorRtx
@@ -892,9 +955,7 @@ fn deepseek_v4_exl3_catalog(
                 }
                 None => {
                     // Experts past the backbone (a native MTP layer) stay on the coordinator.
-                    let past_backbone = tensor.name.strip_prefix("model.layers.")
-                        .and_then(|rest| rest.split('.').next()?.parse::<usize>().ok())
-                        .is_some_and(|layer| layer >= manifest.experts.layers);
+                    let past_backbone = hf_layer(&tensor.name).is_some_and(|layer| layer >= manifest.experts.layers);
                     ensure!(
                         past_backbone
                             || (!tensor.name.contains(".mlp.experts.") && !tensor.name.contains(".ffn.experts.")),
@@ -920,6 +981,7 @@ fn deepseek_v4_exl3_catalog(
         tensors,
         exl3: Some(manifest),
         nvfp4: None,
+        fp8: None,
     })
 }
 
@@ -1119,6 +1181,7 @@ mod tests {
             experts: RoutedExpertShape::of_v41(&official_config()),
             exl3: None,
             nvfp4: None,
+            fp8: None,
             snapshot: dir.path().into(),
             tensors: vec![V41Tensor {
                 shard: "fixture".into(),
@@ -1309,6 +1372,7 @@ mod expert_staging_tests {
             experts: RoutedExpertShape::of_v41(&official_config()),
             exl3: None,
             nvfp4: None,
+            fp8: None,
             snapshot: dir.path().into(),
             tensors,
         };

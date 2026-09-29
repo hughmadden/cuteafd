@@ -49,6 +49,10 @@ if [[ -d "$build_output/exl3" ]]; then
   mkdir -p "$incoming/workspace/.cuteafd-wip"
   cp -a "$build_output/exl3" "$incoming/workspace/.cuteafd-wip/exl3"
 fi
+if [[ -d "$build_output/fp8" ]]; then
+  mkdir -p "$incoming/workspace/.cuteafd-wip"
+  cp -a "$build_output/fp8" "$incoming/workspace/.cuteafd-wip/fp8"
+fi
 install -m 0644 \
   "$build_output/ARTIFACT_SHA256SUMS" \
   "$incoming/workspace/.cuteafd-wip/ARTIFACT_SHA256SUMS"

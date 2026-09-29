@@ -24,6 +24,10 @@ impl ExpertGeometry {
     pub const DEEPSEEK_V4_PRO: Self = Self { hidden: 7168, experts: 384, topk: 6, intermediate: 3072, layers: 61 };
     /// GLM 5.3 (glm_moe_dsa): routed layers 3..78 (layers is the id bound).
     pub const GLM_DSA: Self = Self { hidden: 6144, experts: 256, topk: 8, intermediate: 2048, layers: 78 };
+    /// MiMo V2 Flash (mimo_v2_flash): routed layers 1..48, FP8 experts.
+    pub const MIMO_V2_FLASH: Self = Self { hidden: 4096, experts: 256, topk: 8, intermediate: 2048, layers: 48 };
+    /// GLM 5.3 Flash (glm5_next): routed layers 3..45, SwiGLU clamped at 10.
+    pub const GLM_NEXT: Self = Self { hidden: 4096, experts: 288, topk: 8, intermediate: 2048, layers: 45 };
 
     /// BF16 bytes of one hidden-width row (a routed input or a rank partial).
     pub const fn row_bytes(&self) -> u32 {
@@ -37,20 +41,30 @@ impl ExpertGeometry {
 
     /// Native expert kernel family: the symbol prefix (`cuteafd_{family}_*`)
     /// and exporter `--geometry` name of the AOT kernels built for this shape.
+    /// The layer-id bound is not part of the kernel shape: an FP8 GLM catalog
+    /// also serves its MTP layer (id 78, bound 79) with the `glm` kernels.
     pub fn family(&self) -> Option<&'static str> {
-        match *self {
-            Self::DEEPSEEK_V41 => Some("v41"),
-            Self::DEEPSEEK_V4_FLASH => Some("dsv4f"),
-            Self::DEEPSEEK_V4_PRO => Some("dsv4p"),
-            Self::GLM_DSA => Some("glm"),
-            _ => None,
-        }
+        [
+            (Self::DEEPSEEK_V41, "v41"),
+            (Self::DEEPSEEK_V4_FLASH, "dsv4f"),
+            (Self::DEEPSEEK_V4_PRO, "dsv4p"),
+            (Self::GLM_DSA, "glm"),
+            (Self::MIMO_V2_FLASH, "mimo"),
+            (Self::GLM_NEXT, "glmf"),
+        ]
+        .into_iter()
+        .find_map(|(shape, family)| self.same_shape(&shape).then_some(family))
     }
 
-    /// Routed-expert SwiGLU clamp: DeepSeek clamps gate/up at 10; GLM's
-    /// SwiGLU is unclamped (`None`).
+    /// Routed-expert SwiGLU clamp: DeepSeek and GLM 5.3 Flash clamp gate/up at
+    /// 10; GLM 5.x's and MiMo's SwiGLU are unclamped (`None`).
     pub fn swiglu_limit(&self) -> Option<f32> {
-        (*self != Self::GLM_DSA).then_some(10.0)
+        (!self.same_shape(&Self::GLM_DSA) && !self.same_shape(&Self::MIMO_V2_FLASH)).then_some(10.0)
+    }
+
+    /// Equal kernel shape (hidden, experts, top-k, intermediate), any layer bound.
+    pub fn same_shape(&self, other: &Self) -> bool {
+        Self { layers: other.layers, ..*self } == *other
     }
 
     /// A short stable key for artifact and symbol names.
@@ -93,5 +107,11 @@ mod tests {
         assert_eq!(ExpertGeometry::DEEPSEEK_V4_FLASH.family(), Some("dsv4f"));
         assert_eq!(g.swiglu_limit(), Some(10.0));
         assert_eq!(ExpertGeometry::GLM_DSA.swiglu_limit(), None);
+        assert_eq!(ExpertGeometry::MIMO_V2_FLASH.family(), Some("mimo"));
+        assert_eq!(ExpertGeometry::MIMO_V2_FLASH.swiglu_limit(), None);
+        assert_eq!(ExpertGeometry::MIMO_V2_FLASH.slice(4), Some(512));
+        let glm_with_mtp = ExpertGeometry { layers: 79, ..ExpertGeometry::GLM_DSA };
+        assert_eq!(glm_with_mtp.family(), Some("glm"));
+        assert_eq!(glm_with_mtp.swiglu_limit(), None);
     }
 }

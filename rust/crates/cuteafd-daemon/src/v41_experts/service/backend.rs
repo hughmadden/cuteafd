@@ -2,6 +2,7 @@
 use super::*;
 use crate::v41_experts::{
     exl3::{worker::Exl3Worker, Exl3Weights},
+    fp8::{worker::Fp8Worker, Fp8Experts},
     ExpertExecution,
 };
 use cuteafd_ffi::CuteafdDeviceBuffer;
@@ -12,6 +13,7 @@ use std::rc::Rc;
 pub(super) enum Weights<'a> {
     Full(Vec<ExpertWeights<'a>>),
     Exl3(Rc<Vec<Exl3Weights<'a>>>),
+    Fp8(Rc<Fp8Experts<'a>>),
 }
 
 impl<'a> Weights<'a> {
@@ -19,6 +21,7 @@ impl<'a> Weights<'a> {
         match self {
             Self::Full(weights) => weights.len(),
             Self::Exl3(weights) => weights.len(),
+            Self::Fp8(experts) => experts.layers.len(),
         }
     }
     /// Logical intermediate values this worker loaded per expert, reported as
@@ -30,6 +33,7 @@ impl<'a> Weights<'a> {
             // EXL3 packs its own tiered layout; the logical intermediate is the
             // checkpoint's own value, reported by the EXL3 weights themselves.
             Self::Exl3(_) => None,
+            Self::Fp8(experts) => Some(experts.module.info().slice),
         }
     }
     pub(super) fn execution(
@@ -56,6 +60,11 @@ impl<'a> Weights<'a> {
                 config.capacity,
                 remaining,
             )?),
+            Self::Fp8(experts) => {
+                ensure!(Fp8Worker::workspace_bytes(config.capacity as usize) <= remaining,
+                    "FP8 worker workspace exceeds the device budget");
+                Execution::Fp8(Fp8Worker::new(library, experts.clone(), config.capacity)?)
+            }
         })
     }
 }
@@ -63,6 +72,7 @@ impl<'a> Weights<'a> {
 pub(super) enum Execution<'w, 'a> {
     Full(ExpertExecution<'w, 'a>),
     Exl3(Exl3Worker<'a>),
+    Fp8(Fp8Worker<'a>),
 }
 impl<'w, 'a> Execution<'w, 'a> {
     pub(super) fn is_paired(&self) -> bool { matches!(self, Self::Exl3(worker) if worker.is_paired()) }
@@ -74,6 +84,7 @@ impl<'w, 'a> Execution<'w, 'a> {
                     .context("requested expert layer is not resident on this Spark")?,
             ),
             (Self::Exl3(execution), Weights::Exl3(_)) => execution.bind_layer(index),
+            (Self::Fp8(execution), Weights::Fp8(_)) => execution.bind_layer(index),
             _ => anyhow::bail!("expert backend/weight mismatch"),
         }
     }
@@ -92,6 +103,7 @@ impl<'w, 'a> Execution<'w, 'a> {
             Self::Exl3(execution) => {
                 execution.execute_mapped_request(request, executor_id, exchange, slot)
             }
+            Self::Fp8(execution) => execution.execute_mapped_request(request, executor_id, exchange, slot),
         }
     }
     pub(super) fn execute_host_chunks<F>(
@@ -123,8 +135,35 @@ impl<'w, 'a> Execution<'w, 'a> {
                 max_frame_bytes,
                 sink,
             ),
+            Self::Fp8(execution) => {
+                execution.execute_host_chunks(request, executor_id, exchange, row_indices, max_frame_bytes, sink)
+            }
         }
     }
+}
+
+/// The checkpoint's own FP8 experts (E4M3 + FP32 128x128 block scales) for
+/// this rank's intermediate slice, run by the `fp8-<family>` package.
+pub(super) fn load_fp8<'a>(
+    library: &'a NativeLibrary,
+    catalog: &OfficialV41Catalog,
+    config: &NativeExpertServiceConfig,
+) -> Result<(Weights<'a>, usize)> {
+    let tensors = catalog.fp8().context("FP8 residency requires the checkpoint's FP8 experts")?;
+    ensure!(config.topology.is_none() && matches!(config.world, 2 | 4),
+        "FP8 experts serve implicit Spark TP2 or TP4 groups (whole 128-row intermediate blocks)");
+    let directory = config.fp8_package.clone()
+        .unwrap_or_else(|| crate::v41_experts::fp8::package_directory(&config.library, config.world));
+    let layers = config.resident_layers(catalog.routed_experts().layers)?;
+    let workspace = Fp8Worker::workspace_bytes(config.capacity as usize);
+    let budget = config.device_budget.checked_sub(workspace).context("FP8 worker workspace exceeds the budget")?;
+    tracing::info!(rank = config.rank, world = config.world, first_layer = layers.start, layer_count = layers.len(),
+        package = %directory.display(), "FP8 Spark residency plan");
+    let experts = Fp8Experts::load(library, tensors, &directory, layers, config.world, config.rank,
+        config.capacity as usize, budget)?;
+    let resident: usize = experts.layers.len() * crate::v41_experts::fp8::Fp8Layer::bytes(tensors, config.world)?;
+    let remaining = config.device_budget.saturating_sub(resident);
+    Ok((Weights::Fp8(Rc::new(experts)), remaining))
 }
 
 pub(super) fn load_exl3<'a>(
