@@ -41,6 +41,8 @@ pub(crate) const PAGE_ROWS: usize = 64;
 pub(crate) const DECODE_ROWS: usize = 64;
 /// Selected-slot row width of the sparse MLA programs (2048 + 3, padded to 64).
 pub(crate) const SPARSE_TOPK: usize = 2112;
+/// Most decode rows the FP8 GEMVs take (the programs' FP8_ROWS).
+const FP8_ROWS: i32 = 16;
 /// FP8 latent record bytes (512 E4M3 + 4 FP32 group scales).
 const RECORD_BYTES: usize = 528;
 const MAX_RANKS: usize = 6;
@@ -300,6 +302,8 @@ pub(crate) struct GlmfEngine<'a> {
     /// Captured decode segments (CUTEAFD_GLMF_GRAPHS=0 runs decode eagerly).
     graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
     use_graphs: bool,
+    /// Recorded after a layer's routes and wire rows reach the host staging.
+    routes_ready: *mut c_void,
 }
 
 /// What a captured decode segment baked in.
@@ -362,7 +366,7 @@ impl<'a> GlmfEngine<'a> {
             pool_logical, pool_pages, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
             experts: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(std::collections::HashMap::new()),
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
-            full_prefill_logits: false })
+            full_prefill_logits: false, routes_ready: library.cuda_event_create_ordering()? })
     }
 
     /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
@@ -657,9 +661,7 @@ impl<'a> GlmfEngine<'a> {
             self.post_pre(w, cur, layer, "ffn", "post_norm", rows, cap)?;
             cur ^= 1;
             if layer.dense {
-                self.run(&format!("ffn_i{}_{cap}", self.cfg.dense_intermediate), &[("x", w.x.buffer.ptr),
-                    ("w_gate_up", layer.ptr("w_gate_up")?), ("w_down", layer.ptr("w_down")?),
-                    ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])?;
+                self.ffn(w, layer, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)?;
             } else {
                 self.moe(w, index, layer, t, rows, cap, tables.decode)?;
             }
@@ -695,11 +697,7 @@ impl<'a> GlmfEngine<'a> {
         let timer = std::time::Instant::now();
         self.run("head", &[("streams", w.streams[cur].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
             ("out", w.x.buffer.ptr)], &[rows])?;
-        // SAFETY: the head's input and operands are live buffers of these shapes.
-        unsafe {
-            w.head.launch(w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2).cast(),
-                self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), logit_rows as u32, self.stream)?;
-        }
+        self.logits(w, t, logit_rows, tables.decode)?;
         let logits = self.download(&w.logits, logit_rows * self.cfg.vocab_size * 4)?;
         self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
         Ok(Some(logits.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()))
@@ -732,15 +730,13 @@ impl<'a> GlmfEngine<'a> {
                 }
                 self.post_pre(w, 0, layer, "ffn", "post_norm", rows, "m64")?;
                 if layer.dense {
-                    self.run(&format!("ffn_i{}_m64", self.cfg.dense_intermediate), &[("x", w.x.buffer.ptr),
-                        ("w_gate_up", layer.ptr("w_gate_up")?), ("w_down", layer.ptr("w_down")?),
-                        ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])
+                    self.ffn(w, layer, self.cfg.dense_intermediate, "m64", w.delta.buffer.ptr, rows)
                 } else {
                     self.moe_front(w, index, layer, t, rows, "m64")
                 }
             })?;
             if layers.get(index).is_some_and(|layer| !layer.dense) {
-                self.moe_experts(w, index, t, rows, true)?;
+                self.moe_experts(w, index, &layers[index], t, rows, "m64", true)?;
             }
         }
         if layers.len() < self.cfg.layers {
@@ -752,14 +748,27 @@ impl<'a> GlmfEngine<'a> {
         let timer = std::time::Instant::now();
         self.run("head", &[("streams", w.streams[0].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
             ("out", w.x.buffer.ptr)], &[rows])?;
-        // SAFETY: the head's input and operands are live buffers of these shapes.
-        unsafe {
-            w.head.launch(w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2).cast(),
-                self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), logit_rows as u32, self.stream)?;
-        }
+        self.logits(w, t, logit_rows, tables.decode)?;
         let logits = self.download(&w.logits, logit_rows * self.cfg.vocab_size * 4)?;
         self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
         Ok(Some(logits.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()))
+    }
+
+    /// The vocabulary projection of the last `logit_rows` normalized rows into
+    /// `w.logits`: the FP8 head for up to 16 decode rows (--fp8-head), else BF16.
+    fn logits(&self, w: &Workspace<'_>, t: usize, logit_rows: usize, decode: bool) -> Result<()> {
+        let h = self.cfg.hidden;
+        // SAFETY: rows t - logit_rows.. of the normalized rows lie inside `w.x`.
+        let x = unsafe { w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2) }.cast::<c_void>();
+        if let (Some((q, scale)), true) = (&self.weights.head_fp8, decode && logit_rows <= FP8_ROWS as usize) {
+            return self.run("head_fp8", &[("x", x), ("w_fp8", q.buffer.ptr), ("scale", scale.buffer.ptr),
+                ("logits", w.logits.buffer.ptr)], &[Dsv4Scalar::I32(logit_rows as i32)]);
+        }
+        // SAFETY: the head's input and operands are live buffers of these shapes.
+        unsafe {
+            w.head.launch(x.cast(), self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), logit_rows as u32,
+                self.stream)
+        }
     }
 
     /// Launches `segment` through a graph captured the first time `key` is seen.
@@ -806,12 +815,48 @@ impl<'a> GlmfEngine<'a> {
 
     fn kda(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Dsv4Scalar, cap: &str) -> Result<()> {
         let state = self.state[index].as_ref().context("KDA layer without a state pool")?;
-        self.run(&format!("kda_{cap}"), &[("x", w.x.buffer.ptr), ("w_in", layer.ptr("w_in")?),
-            ("w_fg", layer.ptr("w_fg")?), ("conv_w", layer.ptr("conv_w")?), ("a_log", layer.ptr("a_log")?),
-            ("dt_bias", layer.ptr("dt_bias")?), ("o_norm", layer.ptr("o_norm")?), ("w_o", layer.ptr("w_o")?),
-            ("conv_state", self.kv[index].buffer.ptr), ("state", state.buffer.ptr),
+        let mut pointers = vec![("x", w.x.buffer.ptr), ("w_in", layer.ptr("w_in")?)];
+        let decode = cap == "m64";
+        if decode {
+            pointers.extend([("w_in_fp8", layer.ptr_or("w_in_fp8", "w_in")?),
+                ("w_in_scale", layer.ptr_or("w_in_scale", "w_in")?)]);
+        }
+        pointers.extend([("w_fg", layer.ptr("w_fg")?), ("conv_w", layer.ptr("conv_w")?), ("a_log", layer.ptr("a_log")?),
+            ("dt_bias", layer.ptr("dt_bias")?), ("o_norm", layer.ptr("o_norm")?), ("w_o", layer.ptr("w_o")?)]);
+        if decode {
+            pointers.extend([("w_o_fp8", layer.ptr_or("w_o_fp8", "w_o")?), ("w_o_scale", layer.ptr_or("w_o_scale", "w_o")?)]);
+        }
+        pointers.extend([("conv_state", self.kv[index].buffer.ptr), ("state", state.buffer.ptr),
             ("slots", w.kda_slots.buffer.ptr), ("seq_first", w.seq_first.buffer.ptr), ("out", w.delta.buffer.ptr),
-            ("scratch", w.scratch.buffer.ptr)], &[rows])
+            ("scratch", w.scratch.buffer.ptr)]);
+        self.run(&format!("kda_{cap}"), &pointers, &self.fp8_scalars(rows, decode, layer.has("w_in_fp8")))
+    }
+
+    /// `[rows]`, plus the decode programs' `fp8_rows` (16 when the layer has the FP8 copy, else 0).
+    fn fp8_scalars(&self, rows: Dsv4Scalar, decode: bool, fp8: bool) -> Vec<Dsv4Scalar> {
+        let mut scalars = vec![rows];
+        if decode {
+            scalars.push(Dsv4Scalar::I32(if fp8 { FP8_ROWS } else { 0 }));
+        }
+        scalars
+    }
+
+    /// SwiGLU MLP (dense layer or shared expert) of intermediate `inter` into `out`.
+    fn ffn(&self, w: &Workspace<'_>, layer: &GlmfLayer<'_>, inter: usize, cap: &str, out: *mut c_void, rows: Dsv4Scalar)
+        -> Result<()> {
+        let decode = cap == "m64";
+        let mut pointers = vec![("x", w.x.buffer.ptr), ("w_gate_up", layer.ptr("w_gate_up")?)];
+        if decode {
+            pointers.extend([("w_gate_up_fp8", layer.ptr_or("w_gate_up_fp8", "w_gate_up")?),
+                ("w_gate_up_scale", layer.ptr_or("w_gate_up_scale", "w_gate_up")?)]);
+        }
+        pointers.push(("w_down", layer.ptr("w_down")?));
+        if decode {
+            pointers.extend([("w_down_fp8", layer.ptr_or("w_down_fp8", "w_down")?),
+                ("w_down_scale", layer.ptr_or("w_down_scale", "w_down")?)]);
+        }
+        pointers.extend([("out", out), ("scratch", w.scratch.buffer.ptr)]);
+        self.run(&format!("ffn_i{inter}_{cap}"), &pointers, &self.fp8_scalars(rows, decode, layer.has("w_down_fp8")))
     }
 
     fn mla(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Dsv4Scalar, cap: &str,
@@ -819,11 +864,23 @@ impl<'a> GlmfEngine<'a> {
         let mode = if tables.decode { "decode" } else { "prefill" };
         let cache = self.kv[index].buffer.ptr;
         let (keys, pool_cache) = self.index[index].as_ref().context("MLA layer without an index cache")?;
-        self.run(&format!("mla_producer_{cap}"), &[("x", w.x.buffer.ptr), ("kv_slots", w.kv_slots.buffer.ptr),
-            ("w_qkv_a", layer.ptr("w_qkv_a")?), ("q_a_norm", layer.ptr("q_a_norm")?),
-            ("kv_a_norm", layer.ptr("kv_a_norm")?), ("w_q_b", layer.ptr("w_q_b")?), ("w_uk", layer.ptr("w_uk")?),
-            ("kv_cache", cache), ("query", w.query.buffer.ptr), ("q_resid", w.q_resid.buffer.ptr),
-            ("scratch", w.scratch.buffer.ptr)], &[rows])?;
+        let decode = tables.decode;
+        let fp8 = layer.has("w_qkv_a_fp8");
+        let mut pointers = vec![("x", w.x.buffer.ptr), ("kv_slots", w.kv_slots.buffer.ptr),
+            ("w_qkv_a", layer.ptr("w_qkv_a")?)];
+        if decode {
+            pointers.extend([("w_qkv_a_fp8", layer.ptr_or("w_qkv_a_fp8", "w_qkv_a")?),
+                ("w_qkv_a_scale", layer.ptr_or("w_qkv_a_scale", "w_qkv_a")?)]);
+        }
+        pointers.extend([("q_a_norm", layer.ptr("q_a_norm")?), ("kv_a_norm", layer.ptr("kv_a_norm")?),
+            ("w_q_b", layer.ptr("w_q_b")?)]);
+        if decode {
+            pointers.extend([("w_q_b_fp8", layer.ptr_or("w_q_b_fp8", "w_q_b")?),
+                ("w_q_b_scale", layer.ptr_or("w_q_b_scale", "w_q_b")?)]);
+        }
+        pointers.extend([("w_uk", layer.ptr("w_uk")?), ("kv_cache", cache), ("query", w.query.buffer.ptr),
+            ("q_resid", w.q_resid.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
+        self.run(&format!("mla_producer_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))?;
         self.run(&format!("index_producer_{cap}"), &[("x", w.x.buffer.ptr), ("q_resid", w.q_resid.buffer.ptr),
             ("slots", w.kv_slots.buffer.ptr), ("pool_slots", w.pool_slots.buffer.ptr), ("w_iq", layer.ptr("w_iq")?),
             ("w_ik", layer.ptr("w_ik")?), ("k_norm_w", layer.ptr("k_norm_w")?), ("k_norm_b", layer.ptr("k_norm_b")?),
@@ -844,8 +901,12 @@ impl<'a> GlmfEngine<'a> {
         self.run(&format!("sparse_mla_{mode}_{cap}"), &[("q", w.query.buffer.ptr), ("kv_cache", cache),
             ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr), ("out", w.latent.buffer.ptr),
             ("scratch", w.scratch.buffer.ptr)], &[rows])?;
-        self.run(&format!("o_{cap}"), &[("attn", w.latent.buffer.ptr), ("w_uv", layer.ptr("w_uv")?),
-            ("w_o", layer.ptr("w_o")?), ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])
+        let mut pointers = vec![("attn", w.latent.buffer.ptr), ("w_uv", layer.ptr("w_uv")?), ("w_o", layer.ptr("w_o")?)];
+        if decode {
+            pointers.extend([("w_o_fp8", layer.ptr_or("w_o_fp8", "w_o")?), ("w_o_scale", layer.ptr_or("w_o_scale", "w_o")?)]);
+        }
+        pointers.extend([("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
+        self.run(&format!("o_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))
     }
 
     /// Router, shared expert and routed experts; leaves `bf16(routed + shared)` in `delta`.
@@ -853,7 +914,7 @@ impl<'a> GlmfEngine<'a> {
     fn moe(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, t: usize, rows: Dsv4Scalar, cap: &str,
         decode: bool) -> Result<()> {
         self.moe_front(w, index, layer, t, rows, cap)?;
-        self.moe_experts(w, index, t, rows, decode)
+        self.moe_experts(w, index, layer, t, rows, cap, decode)
     }
 
     /// Router logits, the sigmoid top-8, the shared expert (into `shared`)
@@ -872,9 +933,6 @@ impl<'a> GlmfEngine<'a> {
                 std::ptr::null(), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t, self.cfg.experts, topk,
                 self.cfg.routed_scale as f32, true, self.stream)?;
         }
-        self.run(&format!("ffn_i{}_{cap}", self.cfg.moe_intermediate), &[("x", w.x.buffer.ptr),
-            ("w_gate_up", layer.ptr("w_gate_up")?), ("w_down", layer.ptr("w_down")?),
-            ("out", w.shared.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])?;
         if !matches!(experts, Experts::Local(_)) {
             let grid = (t * h.div_ceil(256)).div_ceil(8).clamp(1, 4 * 188);
             self.run("expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
@@ -887,11 +945,17 @@ impl<'a> GlmfEngine<'a> {
 
     /// The routed experts of layer `index` (the front ran); leaves
     /// `bf16(routed + shared)` in `delta`.
-    fn moe_experts(&self, w: &Workspace<'_>, index: usize, t: usize, rows: Dsv4Scalar, decode: bool) -> Result<()> {
+    /// The shared expert runs here, after the routes are on their way (on the
+    /// Spark path while the ranks compute).
+    #[allow(clippy::too_many_arguments)]
+    fn moe_experts(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, t: usize, rows: Dsv4Scalar, cap: &str,
+        decode: bool) -> Result<()> {
         let h = self.cfg.hidden;
         let experts = self.experts.as_ref().context("MoE layer without experts")?;
+        let shared = || self.ffn(w, layer, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, rows);
         match experts {
             Experts::Local(local) => {
+                shared()?;
                 let resident = local.index_of(index)?;
                 let fp8 = local.experts.borrow();
                 ensure!(!fp8.wire_input(), "the coordinator FP8 package takes BF16 rows");
@@ -906,6 +970,7 @@ impl<'a> GlmfEngine<'a> {
                 unsafe { self.library.cuda_stream_synchronize(self.stream)? };
             }
             Experts::LocalExl3(local) => {
+                shared()?;
                 local.ensure(index, self.stream)?;
                 let mut resident = local.resident.borrow_mut();
                 let (_, experts) = resident.as_mut().context("EXL3 window")?;
@@ -920,7 +985,7 @@ impl<'a> GlmfEngine<'a> {
             }
             Experts::Spark { transport, runtime } => {
                 // The compact reducer adds the shared expert plane to the rank partials.
-                return self.spark_moe(w, index, t, decode, &mut transport.borrow_mut(), runtime);
+                return self.spark_moe(w, index, t, decode, &mut transport.borrow_mut(), runtime, shared);
             }
         }
         self.run("add", &[("a", w.routed.buffer.ptr), ("b", w.shared.buffer.ptr), ("out", w.delta.buffer.ptr)], &[rows])
@@ -928,8 +993,9 @@ impl<'a> GlmfEngine<'a> {
 
     /// Routes and wire rows down, one request to every Spark rank, the BF16
     /// rank partials and the shared expert summed into `delta`.
+    #[allow(clippy::too_many_arguments)]
     fn spark_moe(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, transport: &mut V41Tp4Roce,
-        runtime: &tokio::runtime::Runtime) -> Result<()> {
+        runtime: &tokio::runtime::Runtime, shared: impl FnOnce() -> Result<()>) -> Result<()> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let (route_bytes, wire_bytes) = (t * topk * 4, t * (h + h / 32));
@@ -947,8 +1013,14 @@ impl<'a> GlmfEngine<'a> {
             self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.stream)?;
             self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.stream)?;
             self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), w.wire.buffer, wire_bytes, self.stream)?;
-            self.library.cuda_stream_synchronize(self.stream)?;
+            self.library.cuda_event_record(self.routes_ready, self.stream)?;
         }
+        // The shared expert queues behind the copies and runs during the exchange;
+        // the host waits for the copies only (they also order after the previous
+        // layer's plane uploads, which frees the pinned plane staging).
+        shared()?;
+        // SAFETY: the event was recorded on this engine's stream above.
+        unsafe { self.library.cuda_event_synchronize(self.routes_ready)? };
         self.profile.borrow_mut()[0] += timer.elapsed().as_secs_f64();
         let staged = staging.bytes();
         let word = |offset: usize, i: usize| u32::from_le_bytes(staged[offset + i * 4..][..4].try_into().unwrap());
@@ -1000,5 +1072,12 @@ impl<'a> GlmfEngine<'a> {
             self.library.v41_compact_reducer()?.reduce_planes(pointers, ranks as u32, w.shared.buffer.ptr.cast(),
                 w.delta.buffer.ptr.cast(), t as u32, self.stream)
         }
+    }
+}
+
+impl Drop for GlmfEngine<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the engine's stream is drained by its owner before the engine drops.
+        let _ = unsafe { self.library.cuda_event_destroy(self.routes_ready) };
     }
 }

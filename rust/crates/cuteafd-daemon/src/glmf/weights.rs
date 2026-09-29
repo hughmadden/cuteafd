@@ -31,6 +31,19 @@ impl GlmfLayer<'_> {
         Ok(self.operands.get(operand).with_context(|| format!("layer has no weight {operand}"))?.buffer.ptr)
     }
 
+    /// An FP8 operand, or `fallback`'s pointer when the layer has none (the
+    /// program then runs with `fp8_rows` 0 and never reads it).
+    pub fn ptr_or(&self, operand: &str, fallback: &str) -> Result<*mut c_void> {
+        match self.operands.get(operand) {
+            Some(allocation) => Ok(allocation.buffer.ptr),
+            None => self.ptr(fallback),
+        }
+    }
+
+    pub fn has(&self, operand: &str) -> bool {
+        self.operands.contains_key(operand)
+    }
+
     pub fn bytes(&self) -> usize {
         self.operands.values().map(|a| a.buffer.bytes).sum()
     }
@@ -40,12 +53,23 @@ pub(crate) struct GlmfWeights<'a> {
     pub layers: Vec<GlmfLayer<'a>>,
     pub norm: DeviceAllocation<'a>,
     pub head: DeviceAllocation<'a>,
+    /// E4M3 LM head with per-row x 128-K scales, for decode rows (--fp8-head).
+    pub head_fp8: Option<(DeviceAllocation<'a>, DeviceAllocation<'a>)>,
 }
 
 pub(crate) struct GlmfLoader<'a> {
     pub library: &'a NativeLibrary,
     pub checkpoint: &'a Checkpoint,
     pub stream: *mut c_void,
+    /// FP8 decode copies: MLA/dense/shared at 128x128 blocks (from `fp8_source`,
+    /// the official FP8 release, when given; else quantized from BF16) and the
+    /// KDA projections per row.
+    pub fp8_dense: bool,
+    pub fp8_source: Option<&'a Checkpoint>,
+    pub kda_fp8: super::fp8::KdaFp8,
+    pub fp8_head: bool,
+    /// Numerics gate only: KDA projections rounded through NVFP4 (Some(search)) and kept in BF16.
+    pub kda_nvfp4: Option<bool>,
 }
 
 fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
@@ -114,6 +138,51 @@ impl<'a> GlmfLoader<'a> {
             row += shape[0];
         }
         Ok(out)
+    }
+
+    /// The row-concatenation of 2-D `names` as E4M3 bytes and FP32 scales in
+    /// `layout`: the FP8 source checkpoint's own blocks when it stores the
+    /// tensors as FP8 (block layout), else quantized from BF16.
+    fn fp8(&self, names: &[String], layout: super::fp8::Layout) -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
+        use super::fp8::{quantize, Layout};
+        let source = |name: &str| -> Result<(Vec<u8>, DType, Vec<usize>)> {
+            match self.fp8_source {
+                Some(checkpoint) => {
+                    let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
+                        .map_err(|_| anyhow::anyhow!("FP8 checkpoint has no tensor {name}"))?;
+                    let tensor = &checkpoint.tensors[at];
+                    let mut bytes = vec![0u8; tensor.meta.byte_length as usize];
+                    std::fs::File::open(checkpoint.snapshot.join(&tensor.shard))?
+                        .read_exact_at(&mut bytes, tensor.meta.byte_offset)?;
+                    Ok((bytes, tensor.meta.dtype.clone(), tensor.meta.shape.clone()))
+                }
+                None => self.raw(name),
+            }
+        };
+        let (mut values, mut scales) = (Vec::new(), Vec::<u8>::new());
+        let mut cols = None;
+        for name in names {
+            let (bytes, dtype, shape) = source(name)?;
+            ensure!(shape.len() == 2 && cols.is_none_or(|c| c == shape[1]), "{name}: FP8 rows must share columns");
+            cols = Some(shape[1]);
+            match dtype {
+                DType::F8E4M3 if layout == Layout::Block => {
+                    let (scale, scale_dtype, scale_shape) = source(&format!("{name}_scale_inv"))?;
+                    ensure!(scale_dtype == DType::F32 && shape[0] % 128 == 0
+                        && scale_shape == [shape[0] / 128, shape[1].div_ceil(128)],
+                        "{name}: expected FP32 128x128 block scales, found {scale_dtype:?} {scale_shape:?}");
+                    values.extend_from_slice(&bytes);
+                    scales.extend_from_slice(&scale);
+                }
+                DType::Bf16 => {
+                    let (q, s) = quantize(&bytes, shape[0], shape[1], layout);
+                    values.extend_from_slice(&q);
+                    scales.extend(s.iter().flat_map(|v| v.to_le_bytes()));
+                }
+                other => anyhow::bail!("{name}: cannot make an FP8 {layout:?} copy of {other:?}"),
+            }
+        }
+        Ok((self.upload(&values)?, self.upload(&scales)?))
     }
 
     fn one(&self, name: &str) -> Result<DeviceAllocation<'a>> {
@@ -185,15 +254,47 @@ impl<'a> GlmfLoader<'a> {
         let a = |name: &str| format!("{p}.self_attn.{name}");
         match attention {
             GlmNextAttention::Kda => {
-                ops.insert("w_in", self.rows(&["q_proj", "k_proj", "v_proj", "f_a_proj", "g_a_proj", "b_proj"]
-                    .map(|n| a(&format!("{n}.weight"))))?);
+                let w_in = ["q_proj", "k_proj", "v_proj", "f_a_proj", "g_a_proj", "b_proj"].map(|n| a(&format!("{n}.weight")));
+                let kda_layout = match self.kda_fp8 {
+                    super::fp8::KdaFp8::Off => None,
+                    super::fp8::KdaFp8::Channel => Some(super::fp8::Layout::Channel),
+                    super::fp8::KdaFp8::Row128 => Some(super::fp8::Layout::Row128),
+                };
+                if let Some(layout) = kda_layout {
+                    let (q, s) = self.fp8(&w_in, layout)?;
+                    ops.insert("w_in_fp8", q);
+                    ops.insert("w_in_scale", s);
+                    let (q, s) = self.fp8(&[a("o_proj.weight")], layout)?;
+                    ops.insert("w_o_fp8", q);
+                    ops.insert("w_o_scale", s);
+                }
+                if let Some(search) = self.kda_nvfp4 {
+                    let mut bytes = Vec::new();
+                    for name in w_in.iter().chain([a("o_proj.weight")].iter()) {
+                        let (raw, dtype, shape) = self.raw(name)?;
+                        ensure!(dtype == DType::Bf16, "{name}: NVFP4 gate needs BF16");
+                        let rounded = super::fp8::nvfp4_roundtrip(&raw, shape[0], shape[1], search);
+                        if name.ends_with("o_proj.weight") {
+                            ops.insert("w_o_nvfp4", self.upload(&rounded)?);
+                        } else {
+                            bytes.extend(rounded);
+                        }
+                    }
+                    ops.insert("w_in", self.upload(&bytes)?);
+                } else {
+                    ops.insert("w_in", self.rows(&w_in)?);
+                }
                 ops.insert("w_fg", self.rows(&[a("f_b_proj.weight"), a("g_b_proj.weight")])?);
                 // [3D, 1, 4] each -> FP32 [3D, 4].
                 ops.insert("conv_w", self.f32(&["q", "k", "v"].map(|n| a(&format!("{n}_conv1d.weight"))))?);
                 ops.insert("a_log", self.f32(&[a("A_log")])?);
                 ops.insert("dt_bias", self.f32(&[a("dt_bias")])?);
                 ops.insert("o_norm", self.one(&a("o_norm.weight"))?);
-                ops.insert("w_o", self.one(&a("o_proj.weight"))?);
+                let w_o = match ops.remove("w_o_nvfp4") {
+                    Some(rounded) => rounded,
+                    None => self.one(&a("o_proj.weight"))?,
+                };
+                ops.insert("w_o", w_o);
             }
             GlmNextAttention::Mla => {
                 ops.insert("w_qkv_a", self.rows(&[a("q_a_proj.weight"), a("kv_a_proj_with_mqa.weight")])?);
@@ -204,6 +305,18 @@ impl<'a> GlmfLoader<'a> {
                 ops.insert("w_uk", uk);
                 ops.insert("w_uv", uv);
                 ops.insert("w_o", self.one(&a("o_proj.weight"))?);
+                if self.fp8_dense {
+                    let block = super::fp8::Layout::Block;
+                    let (q, s) = self.fp8(&[a("q_a_proj.weight"), a("kv_a_proj_with_mqa.weight")], block)?;
+                    ops.insert("w_qkv_a_fp8", q);
+                    ops.insert("w_qkv_a_scale", s);
+                    let (q, s) = self.fp8(&[a("q_b_proj.weight")], block)?;
+                    ops.insert("w_q_b_fp8", q);
+                    ops.insert("w_q_b_scale", s);
+                    let (q, s) = self.fp8(&[a("o_proj.weight")], block)?;
+                    ops.insert("w_o_fp8", q);
+                    ops.insert("w_o_scale", s);
+                }
                 let i = |name: &str| a(&format!("indexer.{name}"));
                 ops.insert("w_iq", self.one(&i("wq_b.weight"))?);
                 ops.insert("w_ik", self.rows(&[i("wk.weight"), i("weights_proj.weight"),
@@ -212,6 +325,16 @@ impl<'a> GlmfLoader<'a> {
                 ops.insert("k_norm_b", self.one(&i("k_norm.bias"))?);
                 ops.insert("ape", self.one(&i("index_kpool_compress_ape"))?);
             }
+        }
+        let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
+        if self.fp8_dense {
+            let block = super::fp8::Layout::Block;
+            let (q, s) = self.fp8(&[format!("{mlp}.gate_proj.weight"), format!("{mlp}.up_proj.weight")], block)?;
+            ops.insert("w_gate_up_fp8", q);
+            ops.insert("w_gate_up_scale", s);
+            let (q, s) = self.fp8(&[format!("{mlp}.down_proj.weight")], block)?;
+            ops.insert("w_down_fp8", q);
+            ops.insert("w_down_scale", s);
         }
         if dense {
             ops.insert("w_gate_up", self.rows(&[format!("{p}.mlp.gate_proj.weight"), format!("{p}.mlp.up_proj.weight")])?);
@@ -232,6 +355,11 @@ impl<'a> GlmfLoader<'a> {
             layers: (0..layers.min(cfg.layers)).map(|l| self.layer(cfg, l)).collect::<Result<_>>()?,
             norm: self.one(&format!("{PREFIX}norm.weight"))?,
             head: self.one("lm_head.weight")?,
+            head_fp8: if self.fp8_head {
+                Some(self.fp8(&["lm_head.weight".to_string()], super::fp8::Layout::Row128)?)
+            } else {
+                None
+            },
         })
     }
 }

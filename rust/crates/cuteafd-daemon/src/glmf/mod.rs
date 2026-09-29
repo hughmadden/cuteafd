@@ -1,6 +1,7 @@
 //! GLM 5.3 Flash (glm5_next) on the generic engine: weights, the coordinator
 //! programs' layer chain, and the golden comparison command.
 pub(crate) mod engine;
+pub(crate) mod fp8;
 pub(crate) mod serve;
 pub(crate) mod weights;
 
@@ -56,6 +57,25 @@ pub(crate) struct EngineArgs {
     /// FP8 expert layers resident at once with --local-experts (7.25 GiB each).
     #[arg(long, default_value_t = 6)]
     pub expert_window: usize,
+    /// Decode rows (<= 16 per step) read FP8 copies of the MLA, dense and
+    /// shared-expert projections: the official FP8 release's own E4M3 blocks
+    /// with --fp8-snapshot, else 128x128 blocks quantized from BF16.
+    #[arg(long)]
+    pub fp8_decode: bool,
+    /// The official FP8 checkpoint (zai-org/GLM-5.3-Flash) for --fp8-decode.
+    #[arg(long)]
+    pub fp8_snapshot: Option<PathBuf>,
+    /// FP8 KDA projections for decode rows, quantized per row at load.
+    #[arg(long, value_enum, default_value = "off")]
+    pub kda_fp8: fp8::KdaFp8,
+    /// Decode rows (<= 16) project to the vocabulary through an FP8 copy of the
+    /// LM head (per row x 128-K scales, quantized at load).
+    #[arg(long)]
+    pub fp8_head: bool,
+    /// Numerics gate only: round the KDA projections through NVFP4 (group 16,
+    /// E4M3 scales) at load and run them as BF16: `rtn` (amax/6) or `search`.
+    #[arg(long, hide = true)]
+    pub kda_nvfp4_gate: Option<String>,
     /// Keep every prefill row's logits (glmf-golden --nll; 2.5 GiB at 4096 rows).
     #[arg(long, hide = true)]
     pub full_prefill_logits: bool,
@@ -86,6 +106,9 @@ pub(crate) struct GoldenArgs {
     /// Score every prefill row's logits against the golden (mean NLL, top-1).
     #[arg(long)]
     pub nll: bool,
+    /// Decode steps compare logits only (no per-layer downloads; graphs run).
+    #[arg(long)]
+    pub logits_only: bool,
     /// After the comparison, time this many greedy single-row decode steps
     /// (no layer downloads) from the prefilled sequence.
     #[arg(long, default_value_t = 0)]
@@ -99,6 +122,7 @@ pub(crate) struct GoldenArgs {
 /// The checkpoint and native library, opened on the calling thread.
 pub(crate) struct Opened {
     pub checkpoint: Checkpoint,
+    pub fp8_checkpoint: Option<Checkpoint>,
     pub cfg: GlmNextConfig,
     pub library: NativeLibrary,
     /// The FP8 expert catalog for --local-experts.
@@ -134,7 +158,8 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     // SAFETY: the library is the cuteafd native shim built for this engine.
     let library = unsafe { NativeLibrary::load(&args.native_lib) }?;
     library.cuda_set_device(args.device)?;
-    Ok(Opened { checkpoint, cfg, library, experts })
+    let fp8_checkpoint = args.fp8_snapshot.as_deref().map(Checkpoint::open).transpose()?;
+    Ok(Opened { checkpoint, fp8_checkpoint, cfg, library, experts })
 }
 
 impl Opened {
@@ -146,10 +171,13 @@ impl Opened {
         let stream = self.library.cuda_stream_create()?;
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
-        let loader = weights::GlmfLoader { library: &self.library, checkpoint: &self.checkpoint, stream };
+        let loader = weights::GlmfLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
+            fp8_dense: args.fp8_decode, fp8_source: self.fp8_checkpoint.as_ref(), kda_fp8: args.kda_fp8,
+            fp8_head: args.fp8_head, kda_nvfp4: args.kda_nvfp4_gate.as_deref().map(|mode| mode == "search") };
         let model = loader.model(&self.cfg, layers)?;
         let resident: usize = model.layers.iter().map(weights::GlmfLayer::bytes).sum();
-        tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64,
+        tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64, fp8_decode = args.fp8_decode,
+            fp8_source = self.fp8_checkpoint.is_some(), kda_fp8 = ?args.kda_fp8,
             elapsed_ms = started.elapsed().as_millis() as u64, "GLM 5.3 Flash coordinator weights resident");
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
@@ -244,6 +272,22 @@ fn golden(args: GoldenArgs) -> Result<()> {
 }
 
 /// Mean NLL of `logits` rows against the next tokens, and top-1 agreements.
+/// Mean KL(golden || engine) over rows, in float64 (the golden's next-token
+/// distribution against the engine's, as the published KL gates compute it).
+fn mean_kl(logits: &[f32], golden: &[f32], first: usize, vocab: usize) -> f64 {
+    let log_softmax = |l: &[f32]| -> Vec<f64> {
+        let top = l.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let lse = top + l.iter().map(|&x| (x as f64 - top).exp()).sum::<f64>().ln();
+        l.iter().map(|&x| x as f64 - lse).collect()
+    };
+    let rows = logits.len() / vocab;
+    let total: f64 = logits.chunks_exact(vocab).enumerate().map(|(r, ours)| {
+        let (p, q) = (log_softmax(&golden[(first + r) * vocab..][..vocab]), log_softmax(ours));
+        p.iter().zip(&q).map(|(lp, lq)| lp.exp() * (lp - lq)).sum::<f64>()
+    }).sum();
+    total / rows.max(1) as f64
+}
+
 fn score(logits: &[f32], golden: &[f32], tokens: &[u32], first: usize, vocab: usize) -> (usize, usize, usize, f64, usize) {
     let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
     let (mut agree, mut next_ok, mut golden_next, mut nll, mut scored) = (0, 0, 0, 0f64, 0);
@@ -329,8 +373,11 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
     while position < tokens.len() {
         let n = args.step_rows.min(tokens.len() - position);
         let first = position;
+        let mut compare_layer = |layer, streams: &[u8]| compare(layer, first, streams, &mut decode_worst);
+        let on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>> =
+            if args.logits_only { None } else { Some(&mut compare_layer) };
         if let Some(logits) = engine.verify(&mut [(&mut placement, n)], &embed[position * row..(position + n) * row],
-            Some(&mut |layer, streams| compare(layer, first, streams, &mut decode_worst)))? {
+            on_layer)? {
             decode_logits.extend(logits);
         }
         position += n;
@@ -345,13 +392,16 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
             tokens.len() - prefill, args.step_rows, started.elapsed().as_secs_f64(),
             decode_worst.iter().map(|c| format!("{c:.6}")).collect::<Vec<_>>());
         if !decode_logits.is_empty() {
-            let (agree, next_ok, golden_next, nll, scored) =
-                score(&decode_logits, &golden_logits()?, &tokens, prefill, vocab);
+            let golden = golden_logits()?;
+            let (agree, next_ok, golden_next, nll, scored) = score(&decode_logits, &golden, &tokens, prefill, vocab);
+            let (_, _, _, golden_nll, _) =
+                score(&golden[prefill * vocab..(prefill * vocab + decode_logits.len())], &golden, &tokens, prefill, vocab);
             let rows = decode_logits.len() / vocab;
-            println!("decode logits: top-1 agreement {:.1}% over {rows} rows | next-token accuracy engine {:.1}% \
-                golden {:.1}% | mean NLL {:.4}", 100.0 * agree as f64 / rows as f64,
-                100.0 * next_ok as f64 / scored.max(1) as f64, 100.0 * golden_next as f64 / scored.max(1) as f64,
-                nll / scored.max(1) as f64);
+            println!("decode logits: top-1 agreement {:.2}% over {rows} rows | next-token accuracy engine {:.1}% \
+                golden {:.1}% | mean NLL engine {:.4} golden {:.4} | mean KL(golden||engine) {:.5}",
+                100.0 * agree as f64 / rows as f64, 100.0 * next_ok as f64 / scored.max(1) as f64,
+                100.0 * golden_next as f64 / scored.max(1) as f64, nll / scored.max(1) as f64,
+                golden_nll / scored.max(1) as f64, mean_kl(&decode_logits, &golden, prefill, vocab));
         }
     }
     if args.bench_prefill > 0 {
@@ -415,6 +465,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
                 golden {:.1}% | mean NLL engine {:.4} golden {:.4}", 100.0 * agree as f64 / prefill as f64,
                 100.0 * next_ok as f64 / scored.max(1) as f64, 100.0 * golden_next as f64 / scored.max(1) as f64,
                 nll / scored.max(1) as f64, golden_nll / scored.max(1) as f64);
+            println!("prefill logits: mean KL(golden||engine) {:.5}", mean_kl(&logits, &golden, 0, vocab));
         }
         let logits = &logits[logits.len() - vocab..];
         let last = &golden[(prefill - 1) * vocab..][..vocab];
