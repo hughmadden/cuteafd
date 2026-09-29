@@ -13,6 +13,8 @@ mod chunks;
 pub use chunks::V41Tp4ChunkReceiver;
 mod roce;
 pub use roce::{V41Tp4Roce, V41Tp4RocePending, V41Tp4RoceWave};
+mod lane;
+pub use lane::{V41LaneBuild, V41LaneSink, V41LaneTimes, V41Tp4RoceLane};
 mod tcp;
 pub use tcp::{V41Tp4Pending, V41Tp4Tcp};
 mod paired;

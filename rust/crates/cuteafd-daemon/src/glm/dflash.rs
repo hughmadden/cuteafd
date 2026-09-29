@@ -363,13 +363,18 @@ impl<'a> GlmDrafter<'a> {
     /// Copies target layer output rows `[first, first + n)` of `hidden`
     /// ([rows, hidden] BF16) into tap rows `0..n` when `layer` is tapped.
     pub fn tap(&self, layer: usize, hidden: *const c_void, first: usize, n: usize) -> Result<()> {
+        self.tap_at(layer, hidden, first, n, 0)
+    }
+
+    /// [`Self::tap`] into tap rows `to..to + n`.
+    pub fn tap_at(&self, layer: usize, hidden: *const c_void, first: usize, n: usize, to: usize) -> Result<()> {
         let Some(index) = self.tap_index(layer) else { return Ok(()) };
-        let h = self.cfg.hidden;
-        ensure!(n <= TAP_ROWS, "{n} tapped rows exceed {TAP_ROWS}");
+        let (h, width) = (self.cfg.hidden, self.cfg.taps.len() * self.cfg.hidden);
+        ensure!(to + n <= TAP_ROWS, "tap rows {to}..{} exceed {TAP_ROWS}", to + n);
         // SAFETY: `hidden` holds first + n rows; the tap buffer TAP_ROWS rows.
         unsafe {
-            self.library.glm_dflash_tap(hidden.cast::<u8>().add(first * h * 2).cast(), self.taps.buffer.ptr, n, h,
-                self.cfg.taps.len() * h, index * h, self.stream)
+            self.library.glm_dflash_tap(hidden.cast::<u8>().add(first * h * 2).cast(),
+                self.taps.buffer.ptr.cast::<u8>().add(to * width * 2).cast(), n, h, width, index * h, self.stream)
         }
     }
 
