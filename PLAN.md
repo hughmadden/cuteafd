@@ -260,6 +260,32 @@ mixed) on the gptqmodel fork; extend to new families; publish quants under
 wrldsuksgo2mars. Official images `ghcr.io/tpurtell/cuteafd-{coordinator,
 spark-expert}`, concise README with one headline table.
 
+**Phase 5 — NVIDIA ModelOpt NVFP4 checkpoints (queued; after the families
+above reach their performance targets).** nvidia/{DeepSeek-V4.1-Flash,
+GLM-5.3, GLM-5.3-Flash, Qwen3.8-Flash-Next}-NVFP4. Common contract: U8
+`[N,K/2]` E2M1 low nibble first, E4M3 per-16 scales in linear layout,
+F32 `weight_scale_2`, static `input_scale` (W4A4 spec); routed experts are
+FP4, most other weights BF16/FP8 as released. Design (study 2026-09-30):
+- One `QuantOperand` descriptor in the loader, read from
+  `hf_quant_config.json`/`config.json` by one ModelOpt reader; model code
+  and engines never see the format.
+- Routed experts: `ExpertFormat::Nvfp4` in the existing `fp8-<geom>`
+  package (ABI word 3), W4A16 by default (E2M1×E4M3 is exact in BF16, so
+  it reproduces NVIDIA's weights with unquantized activations); scale
+  swizzle, when a kernel wants it, runs on the GPU at load
+  (`nvfp4_scale.cu`, parameterized); no offline repack.
+- Dense NVFP4/per-tensor-FP8 parts dequantize to BF16 at load.
+- V4.1: its NVFP4 release has exactly the official MXFP4 weights
+  (power-of-two scales) → lossless downcast at load onto the existing W4A8
+  path; the W4A4 44-slot family stays opt-in (ds41rt measured it slower).
+- W4A4 prefill (MmaMXF4NVF4Op, in-kernel per-16 quantization) only if it
+  measures faster and stays within 0.005 nats KL of W4A16.
+Stages: S0 loader + `plan`; S1 W4A16 experts (GLM 5.3 Flash first, then
+Qwen on one RTX: 68 GB); S2 dense + MTP dispositions; S3 V4.1
+convergence; S4 W4A4 prefill experiment. Gates per stage: oracle cosine,
+KL vs golden within 0.005 of the FP8-expert path, tok/s ≥ it, readiness
+not worse, V4.1 parity. GLM 5.3 NVFP4 experts (~407 GB) need TP6.
+
 Ongoing, any phase: engram/n-gram tables in host RAM now; Spark-RAM
 replicas and fabric-fed tables are explorations, kept behind options.
 
