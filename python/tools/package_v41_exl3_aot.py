@@ -300,6 +300,10 @@ def fused_input_rotation(geometry: str, role: str, width: int, capacity: int) ->
     m4096 19.1 -> 16.5 ms, 768 22.7 -> 21.9, 1024 neutral, 1536 +10%;
     GLM width 512 m1024 8.9 -> 7.3, m4096 22.6 -> 18.3, 768 -11%, 1024 -6%,
     640 (128-wide tiles) +16%. V4 Pro m1024 (16-row blocks) is neutral.
+    GLM 5.3 Flash (b12x be78fa4c, m1024 / m2048 / m4096 ms): width 512
+    5.41 -> 4.49, 7.93 -> 6.60, 13.77 -> 11.22; 768 7.01 -> 6.60,
+    9.93 -> 8.92, 16.42 -> 15.71; 1024 8.47 -> 8.27, 11.74 -> 11.41,
+    19.36 -> 19.64, so width 1024 keeps its m4096 package on token-major.
     The coordinator's full-width packages are not measured and stay off.
     """
     if role != 'spark' or width % 256:
@@ -308,6 +312,8 @@ def fused_input_rotation(geometry: str, role: str, width: int, capacity: int) ->
         return width <= 768 and capacity > 1024
     if geometry == 'glm':
         return width <= 1024 and capacity > 256
+    if geometry == 'glmf':
+        return capacity > 256 and (width <= 768 or (width == 1024 and capacity <= 1024))
     return False
 
 
