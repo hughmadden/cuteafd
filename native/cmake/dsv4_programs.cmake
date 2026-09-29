@@ -2,7 +2,7 @@
 # through the generic table in src/dsv4_programs.cc. DeepSeek V4
 # (CUTEAFD_ENABLE_DSV4_AOT, CUTEAFD_DSV4_GEOMETRY), GLM 5.x
 # (CUTEAFD_ENABLE_GLM_AOT, geometry "glm") and MiMo V2 Flash
-# (CUTEAFD_ENABLE_MIMO_AOT, geometry "mimo") and GLM 5.3 Flash
+# (CUTEAFD_ENABLE_MIMO_AOT, geometries CUTEAFD_MIMO_GEOMETRIES: "mimo", V2.6 Pro "mimop") and GLM 5.3 Flash
 # (CUTEAFD_ENABLE_GLMF_AOT, geometry "glmf") and Qwen 3.8 Flash Next
 # (CUTEAFD_ENABLE_QWEN4_AOT, geometry "qwen4") share one table and manifest.
 if(NOT CUTEAFD_CUDA_ARCHITECTURES MATCHES "^120")
@@ -20,10 +20,12 @@ if(CUTEAFD_ENABLE_GLM_AOT)
   endif()
 endif()
 if(CUTEAFD_ENABLE_MIMO_AOT)
+  # mimo = MiMo V2 Flash, mimop = MiMo V2.6 Pro (family `mimop`).
+  string(REPLACE ";" "," mimo_geometries "${CUTEAFD_MIMO_GEOMETRIES}")
   if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
-    set(CUTEAFD_PROGRAM_GEOMETRY "mimo")
+    set(CUTEAFD_PROGRAM_GEOMETRY "${mimo_geometries}")
   else()
-    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},mimo")
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},${mimo_geometries}")
   endif()
 endif()
 if(CUTEAFD_ENABLE_GLMF_AOT)

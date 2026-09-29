@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""Golden activations for MiMo V2.6 Pro (``mimo_v2``, MiMoV2ForCausalLM) from the
+snapshot's own modeling code (``modeling_mimo_v2.py``, trust_remote_code).
+
+Runs one ``MiMoV2DecoderLayer`` at a time on one GPU (the model is 535 GB),
+eager attention with explicit additive masks (causal for the 10 full layers,
+causal and 128-token sliding window for the 60 SWA layers: key k is visible
+to query q when ``q - 128 < k <= q``), exactly as ``MiMoV2Model.forward``
+chains them. Only the checkpoint layout is decoded here; the arithmetic is the
+reference module's:
+
+* ``qkv_proj`` (FP8 E4M3, FP32 ``weight_scale_inv``) is stored TP-interleaved
+  for the checkpoint's ``tp_size`` (8, index metadata): each of the 8 row
+  shards is ``[q (16 heads x 192) | k (1 x 192) | v (1 x 128)]`` with its own
+  128x128 block grid (24 + 2 + 1 row blocks; the 192-row key is a 128-row
+  block then a 64-row block). The shards are dequantized one by one and
+  de-interleaved into the ``[q; k; v]`` the modeling code splits, as SGLang's
+  ``load_mimo_v2_qkv_proj_weight`` / ``_deinterleave_qkv_shards`` do. (Every
+  128x128 block of layers 0 and 7 then has max |e4m3| = 448; a global
+  ``[q; k; v]`` reading fails 7% of the blocks.)
+* Other FP8 tensors: 128x128 blocks. ``o_proj`` is BF16.
+* Routed experts are MXFP4: ``weight`` U8 ``[N, K/2]`` (two E2M1 codes per
+  byte, the even element in the low nibble) and ``weight_scale`` U8 ``[N,
+  K/32]`` (UE8M0, value ``2^(s - 127)``, SGLang's reading). They are widened
+  exactly to BF16 (every E2M1 value times a power of two is a BF16 number).
+* The router weight is BF16 and ``e_score_correction_bias`` FP32, as stored
+  (the gate promotes both to FP32). The MoE sums routes in FP32 and rounds
+  once (the module's own ``moe``).
+
+The NVIDIA torch image defaults FP32 matmuls to TF32: turned off here (the
+router's FP32 logits pick the routes). Writes the files the golden commands
+read:
+
+  tokens.bin      i32  [T]
+  layerNN.bin     bf16 [T, hidden]   output of layer NN
+  logits.bin      f32  [T, vocab]
+  meta.json
+
+  golden.py --snapshot SNAP --text-file prompt.txt --out DIR [--layers 0 1 ...]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+import torch
+from safetensors import safe_open
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from mimo_v2.golden import masks  # noqa: E402
+
+E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def mxfp4_to_bf16(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """U8 ``[N, K/2]`` E2M1 pairs (even element low) and U8 ``[N, K/32]`` UE8M0 -> BF16 ``[N, K]``."""
+    table = torch.tensor(E2M1 + tuple(-v for v in E2M1), dtype=torch.float32, device=packed.device)
+    codes = torch.stack([packed & 0xF, packed >> 4], -1).reshape(packed.shape[0], -1).long()
+    values = table[codes]
+    power = torch.exp2(scale.float() - 127.0).repeat_interleave(32, 1)
+    return (values * power).bfloat16()
+
+
+def fp8_blocks_to_bf16(value: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """E4M3 ``[R, C]`` times FP32 128x128 block scales ``[ceil(R/128), ceil(C/128)]``."""
+    rows, cols = value.shape
+    assert scale.shape == (-(-rows // 128), -(-cols // 128)), (value.shape, scale.shape)
+    grown = scale.repeat_interleave(128, 0)[:rows].repeat_interleave(128, 1)[:, :cols]
+    return (value.float() * grown).bfloat16()
+
+
+class Weights:
+    def __init__(self, snapshot: Path, config):
+        self.snapshot = snapshot
+        index = json.loads((snapshot / "model.safetensors.index.json").read_text())
+        self.index = index["weight_map"]
+        self.ckpt_tp = int(index.get("metadata", {}).get("tp_size", 1))
+        self.config = config
+        self.files: dict[str, object] = {}
+
+    def raw(self, name: str, device: str = "cuda") -> torch.Tensor:
+        shard = self.index[name]
+        if shard not in self.files:
+            self.files[shard] = safe_open(str(self.snapshot / shard), framework="pt", device="cpu")
+        return self.files[shard].get_tensor(name).to(device)
+
+    def qkv_shards(self, layer: int) -> tuple[int, int, int]:
+        """(q, k, v) rows of one checkpoint TP shard of ``qkv_proj``."""
+        c = self.config
+        swa = layer >= 0 and c.hybrid_layer_pattern[layer] == 1
+        nh = c.swa_num_attention_heads if swa else c.num_attention_heads
+        nkv = c.swa_num_key_value_heads if swa else c.num_key_value_heads
+        hd = c.swa_head_dim if swa else c.head_dim
+        vhd = c.swa_v_head_dim if swa else c.v_head_dim
+        tp = self.ckpt_tp
+        return nh // tp * hd, max(1, nkv // tp) * hd, max(1, nkv // tp) * vhd
+
+    def get(self, name: str, layer: int = -1) -> torch.Tensor:
+        """BF16/FP32 tensors as stored; FP8 and MXFP4 weights widened to BF16."""
+        value = self.raw(name)
+        if value.dtype == torch.uint8 and ".mlp.experts." in name:
+            return mxfp4_to_bf16(value, self.raw(name + "_scale"))
+        if value.dtype != torch.float8_e4m3fn:
+            return value
+        scale = self.raw(name + "_scale_inv").float()
+        if not name.endswith("qkv_proj.weight"):
+            return fp8_blocks_to_bf16(value, scale)
+        q, k, v = self.qkv_shards(layer)
+        rows = q + k + v
+        blocks = [-(-q // 128), -(-k // 128), -(-v // 128)]
+        assert value.shape[0] == rows * self.ckpt_tp and scale.shape[0] == sum(blocks) * self.ckpt_tp, \
+            (name, value.shape, scale.shape)
+        parts: list[list[torch.Tensor]] = [[], [], []]
+        for s in range(self.ckpt_tp):
+            w = value[s * rows:(s + 1) * rows]
+            g = scale[s * sum(blocks):(s + 1) * sum(blocks)]
+            first, block = 0, 0
+            for i, size in enumerate((q, k, v)):
+                parts[i].append(fp8_blocks_to_bf16(w[first:first + size], g[block:block + blocks[i]]))
+                first += size
+                block += blocks[i]
+        return torch.cat([torch.cat(p, 0) for p in parts], 0)
+
+
+def load_layer(layer: torch.nn.Module, weights: Weights, prefix: str, layer_id: int) -> None:
+    for key, param in layer.named_parameters():
+        name = prefix + key
+        if name not in weights.index:
+            raise KeyError(f"{name}: no checkpoint tensor")
+        with torch.no_grad():
+            param.copy_(weights.get(name, layer_id).to(param.dtype))
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--snapshot", type=Path, required=True)
+    p.add_argument("--text", help="prompt text (tokenized with the snapshot tokenizer)")
+    p.add_argument("--text-file", type=Path, help="prompt text from a file")
+    p.add_argument("--max-tokens", type=int, help="keep the first N tokens")
+    p.add_argument("--layers", type=int, nargs="*", help="layers whose outputs to save (default all)")
+    p.add_argument("--stop-after", type=int, help="run only layers 0..N (no logits)")
+    p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--device", type=int, default=0)
+    a = p.parse_args()
+
+    from tokenizers import Tokenizer
+    from transformers import AutoConfig
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    torch.cuda.set_device(a.device)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    config = AutoConfig.from_pretrained(a.snapshot, trust_remote_code=True)
+    config._attn_implementation = "eager"
+    cls = lambda name: get_class_from_dynamic_module(f"modeling_mimo_v2.{name}", str(a.snapshot))  # noqa: E731
+    Layer, Rotary, Norm = cls("MiMoV2DecoderLayer"), cls("MiMoV2RotaryEmbedding"), cls("MiMoV2RMSNorm")
+    text = a.text_file.read_text() if a.text_file else a.text
+    tokens = Tokenizer.from_file(str(a.snapshot / "tokenizer.json")).encode(text, add_special_tokens=False).ids
+    tokens = tokens[:a.max_tokens] if a.max_tokens else tokens
+    weights = Weights(a.snapshot, config)
+    a.out.mkdir(parents=True, exist_ok=True)
+    (a.out / "tokens.bin").write_bytes(torch.tensor(tokens, dtype=torch.int32).numpy().tobytes())
+    n = config.num_hidden_layers
+    layers = n if a.stop_after is None else min(a.stop_after + 1, n)
+    save = set(range(layers)) if not a.layers else set(a.layers)
+    ids = torch.tensor([tokens], device="cuda")
+    positions = torch.arange(len(tokens), device="cuda")[None]
+    mask = masks(len(tokens), config.sliding_window)
+    mask = {"full_attention": mask["full_attention"], "sliding_window_attention": mask["sliding_attention"]}
+    started = time.time()
+    with torch.inference_mode():
+        h = torch.nn.functional.embedding(ids, weights.get("model.embed_tokens.weight"))
+        cos_sin = {"full_attention": Rotary(config=config, is_swa=False).cuda()(h, positions),
+                   "sliding_window_attention": Rotary(config=config, is_swa=True).cuda()(h, positions)}
+        for layer_id in range(layers):
+            start = time.time()
+            torch.set_default_dtype(torch.bfloat16)
+            with torch.device("meta"):
+                layer = Layer(config, layer_id, attention_projection_layout=config.attention_projection_layout)
+            torch.set_default_dtype(torch.float32)
+            layer = layer.to_empty(device="cuda").eval()
+            gate = getattr(layer.mlp, "gate", None)
+            if gate is not None:
+                # e_score_correction_bias is FP32 in the checkpoint (the weight is BF16).
+                gate.e_score_correction_bias.data = gate.e_score_correction_bias.data.float()
+            load_layer(layer, weights, f"model.layers.{layer_id}.", layer_id)
+            kind = layer.attention_type
+            h = layer(h, attention_mask=mask[kind], position_ids=positions, position_embeddings=cos_sin[kind])
+            if layer_id in save:
+                (a.out / f"layer{layer_id:02d}.bin").write_bytes(
+                    h[0].contiguous().view(torch.int16).cpu().numpy().tobytes())
+            del layer
+            torch.cuda.empty_cache()
+            print(f"layer {layer_id} ({kind}) {time.time() - start:.1f}s", flush=True)
+        if layers < n:
+            return
+        norm = Norm(config.hidden_size, eps=config.layernorm_epsilon).cuda().to(torch.bfloat16)
+        norm.weight.copy_(weights.get("model.norm.weight"))
+        logits = norm(h).float() @ weights.get("lm_head.weight").float().T
+        (a.out / "logits.bin").write_bytes(logits[0].contiguous().cpu().numpy().tobytes())
+    argmax = logits[0].argmax(-1)
+    next_ok = (argmax[:-1] == ids[0, 1:]).float().mean().item()
+    nll = -torch.log_softmax(logits[0, :-1].double(), -1).gather(1, ids[0, 1:, None]).mean().item()
+    (a.out / "meta.json").write_text(json.dumps({
+        "tokens": len(tokens), "snapshot": str(a.snapshot),
+        "reference": "snapshot modeling_mimo_v2.py (trust_remote_code, eager); qkv de-interleaved from TP8 shards; "
+                     "MXFP4 experts widened exactly",
+        "argmax_last": int(argmax[-1]), "next_token_accuracy": next_ok, "mean_nll": nll,
+        "seconds": time.time() - started,
+    }, indent=1))
+    print(f"argmax of last position: {int(argmax[-1])}; next-token accuracy {next_ok:.3f}; mean NLL {nll:.4f}")
+
+
+if __name__ == "__main__":
+    main()

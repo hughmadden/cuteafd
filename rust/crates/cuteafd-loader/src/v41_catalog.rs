@@ -719,7 +719,7 @@ pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
     match config.get("model_type").and_then(serde_json::Value::as_str) {
         Some("deepseek_v4") => read_deepseek_v4_expert_catalog(snapshot),
         Some("glm_moe_dsa") => read_glm_dsa_expert_catalog(snapshot, &config),
-        Some("mimo_v2_flash") => read_mimo_v2_expert_catalog(snapshot, &config),
+        Some("mimo_v2_flash" | "mimo_v2") => read_mimo_v2_expert_catalog(snapshot, &config),
         other => anyhow::bail!(
             "the Spark expert service does not know model_type {other:?}; add a family \
              reader next to read_deepseek_v4_expert_catalog that maps its routed expert \
@@ -824,7 +824,9 @@ fn read_qwen4_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Res
 
 /// MiMo V2 (mimo_v2_flash) routed experts: the checkpoint's FP8 E4M3 weights
 /// with FP32 128x128 block scales (`model.layers.{l}.mlp.experts.{e}.
-/// {gate,up,down}_proj.weight[_scale_inv]`); layer 0 is dense.
+/// {gate,up,down}_proj.weight[_scale_inv]`); layer 0 is dense. V2.6 Pro
+/// (mimo_v2) stores them MXFP4 (`weight` + UE8M0 `weight_scale`, quantization
+/// `store_dtype: mxfp4`); the same catalog detects the format.
 fn read_mimo_v2_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Result<OfficialV41Catalog> {
     let cfg = crate::mimo_v2::MimoV2Config::from_hf(config)?;
     let first_layer = cfg.dense.iter().position(|dense| !dense).context("MiMo config has no MoE layer")?;

@@ -1,4 +1,5 @@
-//! MiMo V2 (mimo_v2_flash) coordinator over the exported mimo_* programs.
+//! MiMo V2 (mimo_v2_flash, V2.6 Pro mimo_v2) coordinator over the exported
+//! mimo_* (Flash) or mimop_* (V2.6 Pro) programs.
 //!
 //! One layer: input norm (fused with the previous layer's residual add),
 //! the QKV producer (RoPE, KV record), GQA attention, o_proj, the
@@ -142,6 +143,8 @@ pub(crate) struct MimoEngine<'a> {
     pub prefill_rows: usize,
     pub pages: usize,
     pub rings: usize,
+    /// Program family of the checkpoint's geometry (`mimo`, `mimop`).
+    family: &'static str,
     /// Per layer: the paged record pool (full) or the rings (SWA).
     kv: Vec<Dev<'a>>,
     cos_sin_full: Dev<'a>,
@@ -170,6 +173,7 @@ impl<'a> MimoEngine<'a> {
     pub fn new(library: &'a NativeLibrary, programs: &'a Dsv4Programs<'a>, cfg: MimoV2Config,
         weights: MimoWeights<'a>, stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize,
         rings: usize) -> Result<Self> {
+        let family = cfg.program_family()?;
         ensure!(cfg.rope_dim == 64 && cfg.head_dim == 192 && cfg.v_head_dim == 128 && cfg.window <= RING_ROWS - DECODE_ROWS,
             "the mimo programs are built for 192/128 heads, 64 RoPE dims and a window of at most {}",
             RING_ROWS - DECODE_ROWS);
@@ -202,7 +206,7 @@ impl<'a> MimoEngine<'a> {
             Ok(allocation)
         };
         let (cos_sin_full, cos_sin_swa) = (table(cfg.full_rope_theta)?, table(cfg.swa_rope_theta)?);
-        Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, rings, kv, cos_sin_full,
+        Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, rings, family, kv, cos_sin_full,
             cos_sin_swa, workspace: RefCell::new(None), decode_workspace: RefCell::new(None), experts: None,
             profile: RefCell::new([0.0; 2]) })
     }
@@ -216,7 +220,17 @@ impl<'a> MimoEngine<'a> {
         DeviceAllocation::new(self.library, bytes.max(256))
     }
 
+    /// `mimo_*` program names of this checkpoint's program family (`mimo` for
+    /// V2 Flash, `mimop` for V2.6 Pro).
+    fn program_name(&self, name: &str) -> String {
+        match name.strip_prefix("mimo_") {
+            Some(rest) => format!("{}_{rest}", self.family),
+            None => name.to_string(),
+        }
+    }
+
     fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Dsv4Scalar]) -> Result<()> {
+        let name = &self.program_name(name);
         let names: Vec<&str> = pointers.iter().map(|(n, _)| *n).collect();
         let program = self.programs.program(name, &names)?;
         let raw: Vec<*mut c_void> = pointers.iter().map(|(_, p)| *p).collect();
@@ -226,7 +240,7 @@ impl<'a> MimoEngine<'a> {
     }
 
     fn scratch(&self, name: &str) -> Result<usize> {
-        Ok(self.programs.spec(name)?.scratch.get("scratch").copied().unwrap_or(0) as usize)
+        Ok(self.programs.spec(&self.program_name(name))?.scratch.get("scratch").copied().unwrap_or(0) as usize)
     }
 
     fn workspace(&self, t: usize, decode: bool) -> Result<Workspace<'a>> {
@@ -472,7 +486,7 @@ impl<'a> MimoEngine<'a> {
             "layer {index} is an MoE layer: pass Spark --peers serving the fp8 family, or --local-experts \
              (run --layers 1 for the dense layer alone)"))?;
         let rows = Dsv4Scalar::I32(t as i32);
-        self.run("mimo_router_scores", &[("x", w.x.buffer.ptr), ("w_hilo", layer.ptr("w_hilo")?),
+        self.run("mimo_router_scores", &[("x", w.x.buffer.ptr), layer.router_operand()?,
             ("logits", w.router_logits.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])?;
         // SAFETY: logits, bias and route outputs are live buffers of `t` rows.
         unsafe {

@@ -1,4 +1,5 @@
-//! MiMo V2 (mimo_v2_flash) model arguments from the Hugging Face `config.json`.
+//! MiMo V2 (mimo_v2_flash) and V2.6 Pro (mimo_v2) model arguments from the
+//! Hugging Face `config.json`.
 //!
 //! The hub config uses the checkpoint's own keys (`hybrid_layer_pattern`,
 //! `moe_layer_freq`, `swa_*`, `layernorm_epsilon`); transformers' native
@@ -130,6 +131,18 @@ impl MimoV2Config {
         })
     }
 
+    /// The coordinator program family built for this attention geometry
+    /// (`b12x.integration.cuteafd` MiMoGeometry): `mimo` (V2 Flash: hidden 4096,
+    /// 64 heads, 4/8 KV heads) or `mimop` (V2.6 Pro: hidden 6144, 128 heads, 8/8).
+    pub fn program_family(&self) -> Result<&'static str> {
+        match (self.hidden, self.heads, self.full_kv_heads, self.swa_kv_heads, self.experts) {
+            (4096, 64, 4, 8, 256) => Ok("mimo"),
+            (6144, 128, 8, 8, 384) => Ok("mimop"),
+            other => anyhow::bail!("no mimo program geometry for (hidden, heads, full KV, SWA KV, experts) {other:?}: \
+                add a MiMoGeometry to b12x.integration.cuteafd._common and an exporter entry"),
+        }
+    }
+
     pub fn kv_heads(&self, attention: MimoAttention) -> usize {
         match attention {
             MimoAttention::Full => self.full_kv_heads,
@@ -177,6 +190,30 @@ mod tests {
         assert_eq!(cfg.dense.iter().filter(|d| **d).count(), 1);
         assert_eq!((cfg.record_elems(MimoAttention::Full), cfg.record_elems(MimoAttention::Sliding)), (1280, 2560));
         assert!((cfg.routed_scale - 1.0).abs() < 1e-12 && !cfg.full_sinks && cfg.swa_sinks);
+        Ok(())
+    }
+
+    #[test]
+    fn mimo_v26_pro_hub_config() -> Result<()> {
+        let pattern: Vec<u64> = (0..70).map(|l| u64::from(![0, 7, 15, 23, 31, 39, 47, 55, 62, 69].contains(&l))).collect();
+        let freq: Vec<u64> = (0..70).map(|l| u64::from(l != 0)).collect();
+        let v = serde_json::json!({
+            "model_type": "mimo_v2", "vocab_size": 152576, "hidden_size": 6144, "num_hidden_layers": 70,
+            "num_attention_heads": 128, "num_key_value_heads": 8, "head_dim": 192, "v_head_dim": 128,
+            "swa_num_attention_heads": 128, "swa_num_key_value_heads": 8, "swa_head_dim": 192,
+            "swa_v_head_dim": 128, "partial_rotary_factor": 0.334, "rope_theta": 10000000,
+            "swa_rope_theta": 10000, "sliding_window": 128, "sliding_window_size": 128,
+            "hybrid_layer_pattern": pattern, "moe_layer_freq": freq, "add_swa_attention_sink_bias": true,
+            "add_full_attention_sink_bias": false, "intermediate_size": 16384, "n_routed_experts": 384,
+            "num_experts_per_tok": 8, "moe_intermediate_size": 2048, "routed_scaling_factor": null,
+            "scoring_func": "sigmoid", "topk_method": "noaux_tc", "n_group": 1, "norm_topk_prob": true,
+            "layernorm_epsilon": 1e-5, "attention_value_scale": 0.612,
+        });
+        let cfg = MimoV2Config::from_hf(&v)?;
+        assert_eq!((cfg.rope_dim, cfg.full_kv_heads, cfg.swa_kv_heads), (64, 8, 8));
+        assert_eq!(cfg.attention.iter().filter(|a| **a == MimoAttention::Full).count(), 10);
+        assert_eq!(cfg.record_elems(MimoAttention::Full), 2560);
+        assert_eq!(cfg.program_family()?, "mimop");
         Ok(())
     }
 }

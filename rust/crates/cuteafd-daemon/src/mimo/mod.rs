@@ -100,7 +100,8 @@ impl Opened {
         let stream = self.library.cuda_stream_create()?;
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
-        let loader = weights::MimoLoader { library: &self.library, checkpoint: &self.checkpoint, stream };
+        let loader = weights::MimoLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
+            checkpoint_tp: cuteafd_loader::mimo_v2::checkpoint_tp(&args.snapshot)? };
         let model = loader.model(&self.cfg, layers)?;
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64, "MiMo coordinator weights resident");
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);

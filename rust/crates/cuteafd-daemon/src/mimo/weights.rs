@@ -6,14 +6,16 @@
 //! Scale grids are 128x128 blocks except the full-attention `k_proj`
 //! [768, 4096], whose [8, 32] grid is per KV head: each 192-row head is a
 //! 128-row block then a 64-row block, so it is dequantized head by head.
-//! `w_qkv` is `[q_proj; k_proj; v_proj]` written in place; the FP32 router
-//! weight becomes `w_hilo = [bf16(w); bf16(w - bf16(w))]` for the router
-//! program's two FP32-accumulated BF16 products.
+//! `w_qkv` is `[q_proj; k_proj; v_proj]` written in place (V2.6 Pro: the
+//! fused, TP-interleaved `qkv_proj` de-interleaved, see `FusedQkvLayout`); the
+//! FP32 router weight (Flash) becomes `w_hilo = [bf16(w); bf16(w - bf16(w))]`
+//! for the router program's two FP32-accumulated BF16 products, a BF16 one
+//! (V2.6 Pro) is `w_router` as stored.
 use crate::v41_memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
-use cuteafd_loader::mimo_v2::{MimoAttention, MimoV2Config};
+use cuteafd_loader::mimo_v2::{FusedQkvLayout, MimoAttention, MimoV2Config};
 use cuteafd_loader::plan::checkpoint::{Checkpoint, CheckpointTensor};
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -29,6 +31,17 @@ impl MimoLayer<'_> {
     pub fn ptr(&self, operand: &str) -> Result<*mut c_void> {
         Ok(self.operands.get(operand).with_context(|| format!("layer has no weight {operand}"))?.buffer.ptr)
     }
+
+    /// The router scores program's weight operand: `w_hilo` (FP32 weight split
+    /// into BF16 hi + lo, Flash) or `w_router` (BF16 as stored, V2.6 Pro).
+    pub fn router_operand(&self) -> Result<(&'static str, *mut c_void)> {
+        for name in ["w_hilo", "w_router"] {
+            if let Some(weight) = self.operands.get(name) {
+                return Ok((name, weight.buffer.ptr));
+            }
+        }
+        anyhow::bail!("layer has no router weight")
+    }
 }
 
 pub(crate) struct MimoWeights<'a> {
@@ -41,6 +54,8 @@ pub(crate) struct MimoLoader<'a> {
     pub library: &'a NativeLibrary,
     pub checkpoint: &'a Checkpoint,
     pub stream: *mut c_void,
+    /// The checkpoint's tensor-parallel degree (fused `qkv_proj` row shards).
+    pub checkpoint_tp: usize,
 }
 
 impl<'a> MimoLoader<'a> {
@@ -117,6 +132,40 @@ impl<'a> MimoLoader<'a> {
         Ok(out)
     }
 
+    fn has(&self, name: &str) -> bool {
+        self.checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name)).is_ok()
+    }
+
+    /// V2.6 Pro's fused `qkv_proj` (FP8, TP-interleaved row shards with their
+    /// own 128x128 grids) dequantized into the de-interleaved `[q; k; v]`.
+    fn fused_qkv(&self, cfg: &MimoV2Config, attention: MimoAttention, name: &str) -> Result<DeviceAllocation<'a>> {
+        let layout = FusedQkvLayout::new(cfg, attention, self.checkpoint_tp)?;
+        let (bytes, dtype, shape) = self.raw(name)?;
+        let (scale, scale_dtype, scale_shape) = self.raw(&format!("{name}_scale_inv"))?;
+        let cols = shape[1];
+        ensure!(dtype == DType::F8E4M3 && shape == [layout.rows(), cols] && scale_dtype == DType::F32
+            && scale_shape == [layout.scale_rows(), cols.div_ceil(128)],
+            "{name}: expected E4M3 [{}, {cols}] with FP32 [{}, {}] scales for checkpoint TP {}, found {dtype:?} {shape:?} / \
+             {scale_dtype:?} {scale_shape:?}", layout.rows(), layout.scale_rows(), cols.div_ceil(128), self.checkpoint_tp);
+        let out = DeviceAllocation::new(self.library, layout.rows() * cols * 2)?;
+        let (w, s) = (self.upload(&bytes)?, self.upload(&scale)?);
+        let k_blocks = cols.div_ceil(128);
+        for segment in layout.segments() {
+            // SAFETY: the segment's source rows, their scale rows and the destination
+            // rows lie inside `w`, `s` and `out`; the stream drains before `w`/`s` drop.
+            unsafe {
+                self.library.fp8_block_dequant(
+                    w.buffer.ptr.cast::<u8>().add(segment.source_row * cols).cast(),
+                    s.buffer.ptr.cast::<u8>().add(segment.scale_row * k_blocks * 4).cast(),
+                    out.buffer.ptr.cast::<u8>().add(segment.dest_row * cols * 2).cast(),
+                    segment.rows, cols, self.stream)?;
+            }
+        }
+        // SAFETY: the engine owns this stream.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        Ok(out)
+    }
+
     fn one(&self, name: &str) -> Result<DeviceAllocation<'a>> {
         let (bytes, dtype, shape) = self.raw(name)?;
         if shape.len() == 2 && dtype == DType::F8E4M3 {
@@ -153,8 +202,13 @@ impl<'a> MimoLoader<'a> {
         let mut ops: HashMap<&'static str, DeviceAllocation<'a>> = HashMap::new();
         ops.insert("input_norm", self.one(&format!("{p}.input_layernorm.weight"))?);
         ops.insert("post_norm", self.one(&format!("{p}.post_attention_layernorm.weight"))?);
-        ops.insert("w_qkv", self.rows(&[format!("{p}.self_attn.q_proj.weight"), format!("{p}.self_attn.k_proj.weight"),
-            format!("{p}.self_attn.v_proj.weight")])?);
+        let fused = format!("{p}.self_attn.qkv_proj.weight");
+        ops.insert("w_qkv", if self.has(&fused) {
+            self.fused_qkv(cfg, attention, &fused)?
+        } else {
+            self.rows(&[format!("{p}.self_attn.q_proj.weight"), format!("{p}.self_attn.k_proj.weight"),
+                format!("{p}.self_attn.v_proj.weight")])?
+        });
         ops.insert("w_o", self.one(&format!("{p}.self_attn.o_proj.weight"))?);
         let sinks = match attention {
             MimoAttention::Full => cfg.full_sinks,
@@ -169,7 +223,12 @@ impl<'a> MimoLoader<'a> {
             ops.insert("w_gate_up", self.rows(&[format!("{p}.mlp.gate_proj.weight"), format!("{p}.mlp.up_proj.weight")])?);
             ops.insert("w_down", self.one(&format!("{p}.mlp.down_proj.weight"))?);
         } else {
-            ops.insert("w_hilo", self.router_hilo(&format!("{p}.mlp.gate.weight"))?);
+            let router = format!("{p}.mlp.gate.weight");
+            if self.tensor(&router)?.meta.dtype == DType::Bf16 {
+                ops.insert("w_router", self.one(&router)?);
+            } else {
+                ops.insert("w_hilo", self.router_hilo(&router)?);
+            }
             ops.insert("gate.bias", self.one(&format!("{p}.mlp.gate.e_score_correction_bias"))?);
         }
         Ok(MimoLayer { attention, dense, operands: ops })
