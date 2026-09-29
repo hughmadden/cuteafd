@@ -43,7 +43,10 @@ impl Fp8MoeInfo {
             capacities: words[10..10 + count].iter().map(|&c| c as usize).collect(),
             mxfp4: words[0] == 2,
         };
-        let sliced = if info.mxfp4 { info.slice * info.tp >= info.intermediate } else { info.slice * info.tp == info.intermediate };
+        // Slices are the widest rank range, zero-padded to 128 (MXFP4 32-blocks
+        // or FP8 128-blocks split unevenly, TP6 of 2048: 384).
+        let sliced = info.slice % 128 == 0 && info.slice * info.tp >= info.intermediate
+            && (info.slice - 128) * info.tp < info.intermediate;
         ensure!(info.tp > 0 && sliced && info.capacities.windows(2).all(|w| w[0] < w[1]),
             "inconsistent FP8 expert package info {info:?}");
         Ok(info)

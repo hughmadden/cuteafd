@@ -6,9 +6,12 @@
 //! Flash; GLM 5.x and GLM 5.3 Flash official FP8). The `fp8` expert family serves them without re-quantization.
 //!
 //! Tensor-parallel slices split the intermediate `I` over `tp` ranks in whole
-//! 128-row blocks: rank `r` owns gate/up rows and down columns
-//! `[r * I/tp, (r + 1) * I/tp)`, with the matching block-scale rows (gate/up
-//! `[I/128, H/128]`) or columns (down `[H/128, I/128]`).
+//! 128-row blocks, as evenly as the blocks allow (the first ranks own any
+//! extra block): rank `r` owns gate/up rows and down columns `[first, first +
+//! len)`, with the matching block-scale rows (gate/up `[I/128, H/128]`) or
+//! columns (down `[H/128, I/128]`). Every rank stores its slice zero-padded
+//! to the widest (TP6 of 2048: 3, 3, 3, 3, 2, 2 blocks stored as 384); where
+//! `tp` divides the blocks this is the plain `[r * I/tp, (r + 1) * I/tp)`.
 //!
 //! MiMo V2.6 Pro stores its experts as MXFP4 instead (`ExpertFormat::Mxfp4`):
 //! `weight` U8 `[N, K/2]` (two E2M1 codes per byte, the even element in the
@@ -176,30 +179,31 @@ impl Fp8ExpertTensors {
         Ok(())
     }
 
-    /// The stored intermediate slice width of every rank of `tp`: `I / tp` in
-    /// whole 128-row blocks (FP8), or the widest MXFP4 rank range padded to 128.
+    /// Rows of one slice block: the 128x128 scale block (FP8) or the 32-wide
+    /// UE8M0 block (MXFP4).
+    fn block(&self) -> usize {
+        if self.format == ExpertFormat::Mxfp4 { 32 } else { 128 }
+    }
+
+    /// The stored intermediate slice width of every rank of `tp`: the widest
+    /// rank range in whole blocks, padded to 128.
     pub fn slice(&self, tp: usize) -> Result<usize> {
-        let i = self.shape.intermediate;
-        if self.format == ExpertFormat::Mxfp4 {
-            ensure!(tp > 0 && i % 32 == 0 && i / 32 >= tp, "intermediate {i} does not split over {tp} ranks");
-            return Ok((i / 32).div_ceil(tp) * 32).map(|widest| widest.div_ceil(128) * 128);
-        }
-        ensure!(tp > 0 && i % (128 * tp) == 0, "intermediate {i} does not split into {tp} whole 128-row blocks");
-        Ok(i / tp)
+        let (i, block) = (self.shape.intermediate, self.block());
+        ensure!(tp > 0 && i % block == 0 && i / block >= tp,
+            "intermediate {i} does not split into whole {block}-row blocks over {tp} ranks");
+        Ok(((i / block).div_ceil(tp) * block).div_ceil(128) * 128)
     }
 
     /// The intermediate rows `[first, first + len)` rank `rank` of `tp` computes
     /// (the rest of its stored slice is zero padding).
     pub fn rank_range(&self, tp: usize, rank: usize) -> Result<(usize, usize)> {
         ensure!(rank < tp, "rank {rank} of TP{tp}");
-        let slice = self.slice(tp)?;
-        if self.format == ExpertFormat::Fp8Block128 {
-            return Ok((rank * slice, slice));
-        }
-        let (blocks, tp_blocks) = (self.shape.intermediate / 32, tp);
-        let (base, extra) = (blocks / tp_blocks, blocks % tp_blocks);
+        self.slice(tp)?;
+        let block = self.block();
+        let blocks = self.shape.intermediate / block;
+        let (base, extra) = (blocks / tp, blocks % tp);
         let first = rank * base + rank.min(extra);
-        Ok((first * 32, (base + usize::from(rank < extra)) * 32))
+        Ok((first * block, (base + usize::from(rank < extra)) * block))
     }
 
     /// Bytes of one expert projection's slice: (weight, scales) as stored
@@ -249,7 +253,7 @@ impl Fp8ExpertTensors {
     }
 
     /// Reads rank `rank`'s slice of one expert projection: the E4M3 weight
-    /// (gate/up `[I/tp, H]`, down `[H, I/tp]`) and its FP32 block scales.
+    /// (gate/up `[slice, H]`, down `[H, slice]`, zero past the rank's range) and its FP32 block scales.
     /// `staging` is reused scratch for the down projection's column window.
     #[allow(clippy::too_many_arguments)]
     pub fn read_slice(&self, layer: usize, expert: usize, projection: Fp8Projection, tp: usize, rank: usize,
@@ -268,6 +272,7 @@ impl Fp8ExpertTensors {
         let s = self.located(&format!("{name}_scale_inv"))?;
         let open = |shard: &str| std::fs::File::open(self.snapshot.join(shard));
         let (w_file, s_file) = (open(&w.shard)?, open(&s.shard)?);
+        let (first, len) = self.rank_range(tp, rank)?;
         let (scale_rows, scale_cols) = (rows.div_ceil(128), cols.div_ceil(128));
         // The whole block-scale grid (at most a few hundred entries), widened to
         // FP32: Qwen 3.8 Flash Next stores BF16 scales, which FP32 holds exactly.
@@ -280,24 +285,71 @@ impl Fp8ExpertTensors {
             _ => raw,
         };
         ensure!(grid.len() == scale_rows * scale_cols * 4, "{name}_scale_inv: unexpected grid size");
+        // A rank owning fewer blocks than the stored slice keeps zero padding
+        // past `len` (zero weights, zero scales).
+        if len < slice {
+            weight.fill(0);
+            scale.fill(0);
+        }
         if projection == Fp8Projection::Down {
-            // Column window [rank*slice, +slice) of every row: read the whole
+            // Column window [first, first + len) of every row: read the whole
             // tensor once and gather (down is a third of an expert's bytes).
             staging.resize(w.bytes as usize, 0);
             w_file.read_exact_at(staging, w.offset).with_context(|| format!("reading {name}"))?;
             for (row, out) in weight.chunks_exact_mut(slice).enumerate() {
-                out.copy_from_slice(&staging[row * cols + rank * slice..][..slice]);
+                out[..len].copy_from_slice(&staging[row * cols + first..][..len]);
             }
-            let (window, first) = (slice / 128 * 4, rank * slice / 128 * 4);
+            let (window, taken, at) = (slice / 128 * 4, len / 128 * 4, first / 128 * 4);
             for (row, out) in scale.chunks_exact_mut(window).enumerate().take(scale_rows) {
-                out.copy_from_slice(&grid[row * scale_cols * 4 + first..][..window]);
+                out[..taken].copy_from_slice(&grid[row * scale_cols * 4 + at..][..taken]);
             }
         } else {
-            w_file.read_exact_at(weight, w.offset + (rank * slice * cols) as u64)
+            w_file.read_exact_at(&mut weight[..len * cols], w.offset + (first * cols) as u64)
                 .with_context(|| format!("reading {name}"))?;
-            let first = rank * slice / 128 * scale_cols * 4;
-            scale.copy_from_slice(&grid[first..first + scale.len()]);
+            let (at, taken) = (first / 128 * scale_cols * 4, len / 128 * scale_cols * 4);
+            scale[..taken].copy_from_slice(&grid[at..at + taken]);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn catalog(format: ExpertFormat, intermediate: usize) -> Fp8ExpertTensors {
+        let shape = RoutedExpertShape { layers: 78, first_layer: 3, experts: 256, topk: 8, hidden: 6144, intermediate,
+            draft_stages: 0, draft_experts: 0 };
+        Fp8ExpertTensors { snapshot: PathBuf::new(), shape, prefix: "model.".into(), mtp_layers: false, format,
+            tensors: HashMap::new() }
+    }
+
+    fn ranges(tensors: &Fp8ExpertTensors, tp: usize) -> Vec<(usize, usize)> {
+        (0..tp).map(|rank| tensors.rank_range(tp, rank).unwrap()).collect()
+    }
+
+    #[test]
+    fn fp8_slices_split_whole_blocks_and_pad_to_the_widest() {
+        let fp8 = catalog(ExpertFormat::Fp8Block128, 2048);
+        assert_eq!(fp8.slice(4).unwrap(), 512);
+        assert_eq!(ranges(&fp8, 4), [(0, 512), (512, 512), (1024, 512), (1536, 512)]);
+        // TP6 of 16 blocks: 3, 3, 3, 3, 2, 2, stored 384 wide.
+        assert_eq!(fp8.slice(6).unwrap(), 384);
+        assert_eq!(ranges(&fp8, 6), [(0, 384), (384, 384), (768, 384), (1152, 384), (1536, 256), (1792, 256)]);
+        assert_eq!(fp8.slice_bytes(Fp8Projection::Gate, 6).unwrap(), (384 * 6144, 3 * 48 * 4));
+        assert_eq!(fp8.slice_bytes(Fp8Projection::Down, 6).unwrap(), (6144 * 384, 48 * 3 * 4));
+        assert!(fp8.slice(17).is_err());
+        // Qwen's 640 (5 blocks) over 3: 2, 2, 1 in 256.
+        let qwen = catalog(ExpertFormat::Fp8Block128, 640);
+        assert_eq!(ranges(&qwen, 3), [(0, 256), (256, 256), (512, 128)]);
+        assert_eq!(qwen.slice(3).unwrap(), 256);
+    }
+
+    #[test]
+    fn mxfp4_slices_keep_their_32_blocks() {
+        let mxfp4 = catalog(ExpertFormat::Mxfp4, 2048);
+        assert_eq!(mxfp4.slice(6).unwrap(), 384);
+        assert_eq!(ranges(&mxfp4, 6), [(0, 352), (352, 352), (704, 352), (1056, 352), (1408, 320), (1728, 320)]);
+        assert_eq!(mxfp4.slice(2).unwrap(), 1024);
     }
 }
