@@ -144,28 +144,37 @@ impl Opened {
                 args.draft_sequences, mask, false)?);
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash2 drafter resident");
         }
-        let connect = |peers: &str| -> Result<V41Tp4Roce> {
+        let ranks = |peers: &str| -> Result<(Vec<std::net::SocketAddr>, Vec<u64>)> {
             let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             let executors: Vec<u64> = (0..peers.len())
                 .map(|rank| cuteafd_transport::v41_expert::v41_spark_executor_id(peers.len(), rank))
                 .collect::<Result<_>>()?;
-            V41Tp4Roce::new_ranks(&peers, &executors, 4096,
-                cuteafd_transport::TcpTransportConfig { timing: false, timeout: std::time::Duration::from_secs(120),
-                    max_frame_bytes: 64 << 20 })
+            Ok((peers, executors))
         };
-        let mut transport = args.peers.as_deref().map(connect).transpose()?;
-        // The second prefill lane's transport (its waves fly beside the first lane's).
-        let mut lane_transport = args.peers.as_deref().map(connect).transpose()?;
+        let config = cuteafd_transport::TcpTransportConfig { timing: false,
+            timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 };
+        let mut transport = args.peers.as_deref().map(|peers| -> Result<V41Tp4Roce> {
+            let (peers, executors) = ranks(peers)?;
+            V41Tp4Roce::new_ranks(&peers, &executors, 4096, config.clone())
+        }).transpose()?;
+        // One transport thread per prefill lane (their waves fly beside each other's).
+        let mut lanes = match args.peers.as_deref() {
+            Some(peers) => (0..engine::configured_lanes()).filter(|_| engine::configured_lanes() > 1).map(|_| {
+                let (peers, executors) = ranks(peers)?;
+                cuteafd_transport::v41_expert::V41Tp4RoceLane::spawn(peers, executors, 4096, config.clone())
+            }).collect::<Result<Vec<_>>>()?,
+            None => Vec::new(),
+        };
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        for transport in transport.iter_mut().chain(lane_transport.iter_mut()) {
-            // Connect every rank and register full-size buffers now: the first
-            // request otherwise pays seconds of connection setup.
-            let started = Instant::now();
-            let (rows, h, topk) = (args.prefill_rows, self.cfg.hidden, self.cfg.topk);
+        // Connect every rank and register full-size buffers now: the first
+        // request otherwise pays seconds of connection setup.
+        let (rows, h, topk, experts, layer) =
+            (args.prefill_rows, self.cfg.hidden, self.cfg.topk, self.cfg.experts, self.cfg.first_moe_layer as u32);
+        let warm = move || -> Result<cuteafd_transport::ExpertProtocolV2Request> {
             let routes = (0..rows * topk).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
-                row_index: (i / topk) as u32, expert_id: (i % self.cfg.experts) as u32, gate_weight: 0.0,
+                row_index: (i / topk) as u32, expert_id: (i % experts) as u32, gate_weight: 0.0,
             }).collect();
-            let mut request = cuteafd_transport::ExpertProtocolV2Request::new(1, 17, self.cfg.first_moe_layer as u32,
+            let mut request = cuteafd_transport::ExpertProtocolV2Request::new(1, 17, layer,
                 h as u32, cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32,
                 (0..rows as u32).map(|row| cuteafd_transport::ExpertProtocolV2RowDescriptor {
                     row_id: u64::from(row), source_kind: cuteafd_transport::ExpertV2SourceKind::Prefill,
@@ -174,10 +183,24 @@ impl Opened {
                 }).collect(),
                 routes, vec![0; rows * (h + h / 32)])?;
             request.header.flags |= cuteafd_transport::v41_expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+            Ok(request)
+        };
+        let started = Instant::now();
+        if let Some(transport) = transport.as_mut() {
+            let request = warm()?;
             runtime.block_on(async { transport.execute(&request, |_, _, _| Ok(())).await })?;
-            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
         }
-        *engine.lane_transport.borrow_mut() = lane_transport.take();
+        for lane in &mut lanes {
+            lane.submit(Box::new(warm), Box::new(|_, _, _| Ok(())))?;
+        }
+        for lane in &mut lanes {
+            lane.wait(std::time::Duration::from_secs(120))?;
+        }
+        if transport.is_some() {
+            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, lanes = lanes.len(),
+                "Spark expert transports warm");
+        }
+        *engine.lanes.borrow_mut() = lanes;
         let result = body(&engine, transport.as_mut(), &runtime);
         drop(engine);
         // SAFETY: the engine that used the stream is gone.
