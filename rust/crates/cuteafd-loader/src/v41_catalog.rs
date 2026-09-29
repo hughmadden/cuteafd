@@ -710,6 +710,9 @@ pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
     if config.get("model_type").and_then(serde_json::Value::as_str) == Some("glm5_next") {
         return read_glm_dsa_expert_catalog(snapshot, &config);
     }
+    if config.get("model_type").and_then(serde_json::Value::as_str) == Some("qwen4_exp") {
+        return read_qwen4_expert_catalog(snapshot, &config);
+    }
     if config.get("text_config").is_some() {
         return read_official_v41_catalog(crate::OFFICIAL_V41_MODEL_ID, snapshot);
     }
@@ -767,6 +770,54 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> R
         .and_then(|value| Ok(serde_json::from_value(value)?))?;
     let manifest = crate::v41_exl3::read_deepseek_v4_exl3_manifest(snapshot, shape)?;
     deepseek_v4_exl3_catalog(snapshot, &index.weight_map, manifest)
+}
+
+/// Qwen 3.8 Flash Next (qwen4_exp) routed experts: every layer is MoE (512
+/// experts, top-10). The official FP8 checkpoint stores E4M3 experts with BF16
+/// 128x128 block scales; the EXL3 publications (wrldsuksgo2mars
+/// Qwen3.8-Flash-Next-EXL3-K4.25-*) mixed K4/K5 Trellis projections with the
+/// MTP experts under `mtp.layers.0`. The BF16 release fuses each layer's
+/// experts into `[512, ...]` tensors and NVIDIA's release is NVFP4: neither
+/// has an expert package.
+fn read_qwen4_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Result<OfficialV41Catalog> {
+    let text = config.get("text_config").unwrap_or(config);
+    let field = |key: &str| -> Result<usize> {
+        text[key].as_u64().map(|v| v as usize).with_context(|| format!("qwen4_exp config lacks {key}"))
+    };
+    let shape = RoutedExpertShape {
+        layers: field("num_hidden_layers")?,
+        first_layer: 0,
+        experts: field("num_experts")?,
+        topk: field("num_experts_per_tok")?,
+        hidden: field("hidden_size")?,
+        intermediate: field("moe_intermediate_size")?,
+        draft_stages: 0,
+        draft_experts: 0,
+    };
+    let quant = &config["quantization_config"];
+    if quant["quant_method"] == "fp8" {
+        ensure!(quant["weight_block_size"] == serde_json::json!([128, 128]),
+            "Qwen FP8 routed experts must use 128x128 weight blocks");
+        return fp8_catalog(snapshot, shape);
+    }
+    if quant["quant_method"] == "exl3" {
+        #[derive(Deserialize)]
+        struct Index {
+            weight_map: BTreeMap<String, String>,
+        }
+        let index: Index =
+            crate::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)
+                .and_then(|value| Ok(serde_json::from_value(value)?))?;
+        let manifest = crate::v41_exl3::read_deepseek_v4_exl3_manifest(snapshot, shape)?;
+        return deepseek_v4_exl3_catalog(snapshot, &index.weight_map, manifest);
+    }
+    if quant.get("config_groups").is_some() || quant["quant_method"] == "modelopt" {
+        anyhow::bail!("Qwen NVFP4 (ModelOpt) routed experts have no expert package: serve the FP8 \
+            (Qwen/Qwen3.8-Flash-Next-FP8) or EXL3 (wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-*) release, \
+            or add an nvfp4 qwen4 family (W4A16 over the packed E2M1 weights and E4M3 group-16 scales)");
+    }
+    anyhow::bail!("Qwen BF16 routed experts are fused [512, ...] tensors with no expert package: serve the \
+        FP8 (Qwen/Qwen3.8-Flash-Next-FP8) or EXL3 (wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-*) release")
 }
 
 /// MiMo V2 (mimo_v2_flash) routed experts: the checkpoint's FP8 E4M3 weights

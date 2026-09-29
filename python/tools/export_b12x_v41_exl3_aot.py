@@ -167,8 +167,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     # swiglu_limit None is b12x's unclamped SwiGLU (GLM); DeepSeek clamps at 10.
     if swiglu_limit is not None and not swiglu_limit > 0:
         raise ValueError("SwiGLU limit must be positive or None (no clamp)")
-    if not 1 <= capacity <= 4096 or topk not in (3, 6, 8) or experts < topk or experts > 384:
-        raise ValueError("invalid V4.1 capacity or expert count")
+    if not 1 <= capacity <= 4096 or not 1 <= topk <= 16 or experts < topk or experts > 512:
+        raise ValueError("invalid EXL3 capacity, top-k or expert count")
     # Whole H128 rotation blocks on both projection axes.
     if hidden < 128 or hidden % 128 or intermediate < 128 or intermediate % 128:
         raise ValueError("EXL3 hidden and intermediate must be positive multiples of 128")
@@ -289,7 +289,7 @@ def main() -> None:
     parser.add_argument("--capacity", type=int, default=16)
     parser.add_argument("--bits", type=int, nargs="+", default=[3, 4])
     parser.add_argument("--routing", choices=("auto", "direct", "packed"), default="auto")
-    parser.add_argument("--topk", type=int, choices=(3, 6, 8), default=6)
+    parser.add_argument("--topk", type=int, choices=range(1, 17), metavar="1..16", default=6)
     parser.add_argument("--swiglu-limit", default="10",
                         help="SwiGLU clamp limit, or none for an unclamped SwiGLU (GLM)")
     parser.add_argument("--output-dtype", choices=("bf16", "fp32"), default="bf16")

@@ -162,6 +162,10 @@ pub enum V41Exl3Naming {
     /// `model.language_model.layers.{L}.mlp.experts.{E}.gate_proj|up_proj|down_proj`,
     /// the native MTP layer after the `layers` backbone layers as draft stage 0.
     HfLanguageModel { layers: usize },
+    /// Multimodal Hugging Face checkpoints with a separate MTP module (Qwen 3.8
+    /// Flash Next): backbone as [`Self::HfLanguageModel`], draft stage `S` at
+    /// `mtp.layers.{S}.mlp.experts.{E}.gate_proj|up_proj|down_proj`.
+    HfLanguageModelMtp,
 }
 
 impl V41Exl3Naming {
@@ -194,6 +198,15 @@ impl V41Exl3Naming {
                 };
                 let layer = if draft { layers + layer } else { layer };
                 format!("model.language_model.layers.{layer}.mlp.experts.{expert}.{stem}")
+            }
+            Self::HfLanguageModelMtp => {
+                let stem = match kind {
+                    V41Exl3ProjectionKind::Gate => "gate_proj",
+                    V41Exl3ProjectionKind::Up => "up_proj",
+                    V41Exl3ProjectionKind::Down => "down_proj",
+                };
+                let prefix = if draft { "mtp" } else { "model.language_model" };
+                format!("{prefix}.layers.{layer}.mlp.experts.{expert}.{stem}")
             }
         }
     }
@@ -511,14 +524,20 @@ fn parse_deepseek_v4_manifest(
         .as_object()
         .context("missing EXL3 tensor_storage")?;
     let language_model = storage.keys().any(|name| name.starts_with("model.language_model.layers."));
-    let naming = if language_model {
+    let mtp_layers = language_model && storage.keys().any(|name| name.starts_with("mtp.layers."));
+    let naming = if mtp_layers {
+        V41Exl3Naming::HfLanguageModelMtp
+    } else if language_model {
         V41Exl3Naming::HfLanguageModel { layers: backbone.layers }
     } else {
         V41Exl3Naming::HfMlp
     };
-    // Draft stages: `mtp.{S}` names, or language-model layers past the backbone.
+    // Draft stages: `mtp.{S}` or `mtp.layers.{S}` names, or language-model
+    // layers past the backbone.
     let stage_of = |name: &str| -> Option<usize> {
-        if language_model {
+        if mtp_layers {
+            name.strip_prefix("mtp.layers.")?.split('.').next()?.parse().ok()
+        } else if language_model {
             let layer: usize = name.strip_prefix("model.language_model.layers.")?.split('.').next()?.parse().ok()?;
             layer.checked_sub(backbone.layers)
         } else {
