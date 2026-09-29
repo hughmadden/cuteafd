@@ -71,6 +71,7 @@ async fn main() -> Result<()> {
         Commands::Dsv4Golden(args) => dsv4::run_golden(args).await,
         Commands::GlmGolden(args) => glm::run_golden(args).await,
         Commands::MimoGolden(args) => mimo::run_golden(args).await,
+        Commands::ServeMimo(args) => mimo::serve::run_serve(args).await,
         Commands::GlmfGolden(args) => glmf::run_golden(args).await,
         Commands::Qwen4Golden(args) => qwen4::run_golden(args).await,
         Commands::ServeQwen4(args) => qwen4::serve::run_serve(args).await,

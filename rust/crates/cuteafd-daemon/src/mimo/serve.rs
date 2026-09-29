@@ -1,16 +1,15 @@
-//! OpenAI-compatible API over the GLM 5.3 Flash engine: continuous batching
-//! with one prefill per admitted request and one decode-shaped step for
-//! every active sequence, verifying copy-window drafts.
+//! OpenAI-compatible API over the MiMo V2 engine: continuous batching with
+//! one prefill per admitted request and one decode-shaped step for every
+//! active sequence, verifying copy-window drafts.
 //!
-//! KDA layers advance their recurrent state in place, so a verify whose
-//! drafts are rejected cannot just shorten the sequence as MLA records can:
-//! a sequence that drafts backs its KDA state up to a spare slot first, and
-//! after a partial acceptance restores it and replays the accepted rows
-//! (their logits were already taken from the verify).
-use super::engine::{Allocator, GlmfEngine, GlmfPlacement, DECODE_ROWS};
+//! MiMo keeps no recurrent state: full layers write paged records and SWA
+//! layers a 256-slot ring that outlives the 128-token window by more than a
+//! step's rows, so a verify whose drafts are rejected just sets the
+//! sequence length back.
+use super::engine::{Allocator, MimoEngine, MimoPlacement, DECODE_ROWS};
 use super::{embed_rows, open, Opened};
 use anyhow::{Context, Result};
-use cuteafd_api::native_v41::glm::GlmEncoding;
+use cuteafd_api::native_v41::qwen::QwenEncoding;
 use cuteafd_api::native_v41::{
     ConsoleHub, InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits, NativeRequest,
     PromptUsage,
@@ -31,7 +30,7 @@ pub(crate) struct ServeArgs {
     pub listen: String,
     #[arg(long, default_value_t = 4096)]
     pub max_output: u32,
-    /// Sequences decoding at once (each holds two KDA state slots).
+    /// Sequences decoding at once (each holds an SWA ring).
     #[arg(long, default_value_t = 4)]
     pub max_sequences: usize,
     /// Public model id; defaults to the snapshot's Hugging Face id.
@@ -42,28 +41,21 @@ pub(crate) struct ServeArgs {
     pub no_copy_drafts: bool,
 }
 
-pub(crate) fn model_id(snapshot: &std::path::Path) -> Option<String> {
-    snapshot.ancestors().find_map(|dir| {
-        let name = dir.file_name()?.to_str()?.strip_prefix("models--")?;
-        let (org, model) = name.split_once("--")?;
-        Some(format!("{org}/{model}"))
-    })
-}
-
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let snapshot: PathBuf = args.engine.snapshot.clone();
     let limits = NativeLimits::new(args.engine.max_context as u32, args.max_output)?;
-    let encoding = GlmEncoding::from_snapshot(&snapshot)?;
+    // MiMo's template and tool calls follow Qwen3-Coder's XML (`<tool_call>
+    // <function=NAME><parameter=KEY>VALUE</parameter>`), its reasoning `<think>`.
+    let encoding = QwenEncoding::from_snapshot(&snapshot)?;
     let profile = ModelProfile::new(
-        args.model_id.clone().or_else(|| model_id(&snapshot)).context("model id")?,
-        ModelEncoding::Glm(Arc::new(encoding)),
+        args.model_id.clone().or_else(|| crate::glmf::serve::model_id(&snapshot)).context("model id")?,
+        ModelEncoding::Qwen(Arc::new(encoding)),
     );
     let (queue, receive) = mpsc::channel::<NativeRequest>(16);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
-    // Two KDA slots per sequence: its state and a verify backup.
-    engine_args.slots = engine_args.slots.max(2 * args.max_sequences);
+    engine_args.rings = engine_args.rings.max(args.max_sequences);
     let (worker_stats, max_sequences) = (stats.clone(), args.max_sequences);
     let draft = if args.no_copy_drafts { 0 } else { COPY_DRAFT };
     let worker = tokio::task::spawn_blocking(move ||
@@ -72,7 +64,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let router = cuteafd_api::native_v41::router_for_model(queue, limits, stats, Duration::from_secs(25),
         ConsoleHub::disabled(), profile.clone());
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
-    tracing::info!(listen = %args.listen, model = %profile.id, "GLM 5.3 Flash API is ready");
+    tracing::info!(listen = %args.listen, model = %profile.id, "MiMo V2 API is ready");
     tokio::select! {
         served = axum::serve(listener, router) => served?,
         finished = worker => finished??,
@@ -92,8 +84,8 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
     };
     let mut ready = Some(ready);
     let result = opened.with_engine(&args, |engine| {
-        anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-glmf needs every layer");
-        anyhow::ensure!(engine.experts().is_some(), "serve-glmf needs --peers (or --local-experts) for the routed experts");
+        anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-mimo needs every layer");
+        anyhow::ensure!(engine.has_experts(), "serve-mimo needs --peers (or --local-experts) for the routed experts");
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(()));
         }
@@ -115,9 +107,7 @@ struct Active<'a> {
     draft_limit: usize,
     draft_pause: usize,
     constraint: Option<crate::v41_native_serve::constraints::State<'a>>,
-    placement: GlmfPlacement,
-    /// Spare KDA slot backing the state up across a verify.
-    backup: i32,
+    placement: MimoPlacement,
     capacity: usize,
     next: u32,
     decoder: cuteafd_loader::StreamingTokenDecoder,
@@ -145,8 +135,8 @@ impl Active<'_> {
         self.job.events.blocking_send(Ok(chunk)).map_err(|_| anyhow::anyhow!("client went away"))
     }
 
-    /// Streams `token` (special tokens stay text for the GLM parser); returns
-    /// true when the request is finished.
+    /// Streams `token` (special tokens stay text for the output parser);
+    /// returns true when the request is finished.
     fn emit(&mut self, token: u32) -> Result<bool> {
         self.history.push(token);
         self.generated += 1;
@@ -178,37 +168,18 @@ impl Active<'_> {
     }
 }
 
-/// Longest n-gram (from 8 down to 4 tokens) that ends the history and occurred
-/// earlier; proposes up to `limit` tokens that followed its latest earlier
-/// occurrence (a copy window). Exact: the verify step accepts only tokens the
-/// model itself produces.
-pub(crate) fn copy_drafts(history: &[u32], limit: usize) -> Vec<u32> {
-    let len = history.len();
-    for n in (4..=8).rev() {
-        if len <= n {
-            continue;
-        }
-        let tail = &history[len - n..];
-        if let Some(start) = (0..len - n).rev().find(|&i| &history[i..i + n] == tail) {
-            let from = start + n;
-            return history[from..(from + limit).min(len)].to_vec();
-        }
-    }
-    Vec::new()
-}
-
-fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
+fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
     draft: usize) -> Result<()> {
-    let mut allocator = Allocator::new(engine.pages, engine.slots);
+    let mut allocator = Allocator::new(engine.pages, engine.rings);
     let mut grammars = crate::v41_native_serve::constraints::Compiler::with_vocab(
-        &opened.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, engine.cfg.eos.clone());
+        &opened.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, QwenEncoding::from_snapshot(snapshot)?.tokens().eos.clone());
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
     let mut active: Vec<Active<'_>> = Vec::new();
-    let (mut requests, mut generated_total, mut replays) = (0u64, 0u64, 0u64);
-    // Verify steps (and replay steps) since the last completed request.
-    let (mut steps, mut replay_steps) = (0u64, 0u64);
-    // Host seconds in verify steps (engine) and in token selection + streaming.
+    let (mut requests, mut generated_total) = (0u64, 0u64);
+    // Verify steps since the last completed request, and host seconds in
+    // them (engine) and in token selection + streaming.
+    let mut steps = 0u64;
     let (mut verify_s, mut emit_s) = (0f64, 0f64);
     let (hidden, vocab) = (engine.cfg.hidden, engine.cfg.vocab_size);
     loop {
@@ -240,9 +211,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 continue;
             }
             let capacity = (tokens.len() + job.max_tokens).min(engine.max_context);
-            let (mut placement, backup) = match allocator.admit(capacity)
-                .and_then(|p| Ok((p, allocator.spare_slot()?))) {
-                Ok(admitted) => admitted,
+            let mut placement = match allocator.admit(capacity) {
+                Ok(placement) => placement,
                 Err(error) => {
                     reject(&job, format!("{error:#}"));
                     continue;
@@ -259,16 +229,17 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     let embed = embed_rows(&opened.checkpoint, chunk, hidden)?;
                     logits = engine.prefill(&mut placement, &embed, None)?;
                 }
+                let elapsed = started.elapsed().as_secs_f64();
                 let phases = std::mem::take(&mut *engine.profile.borrow_mut());
-                tracing::info!(tokens = tokens.len(), elapsed_ms = started.elapsed().as_millis() as u64,
-                    gpu_wait_ms = (1e3 * phases[0]) as u64, experts_ms = (1e3 * phases[1]) as u64,
-                    head_ms = (1e3 * phases[2]) as u64, "prefill");
+                tracing::info!(tokens = tokens.len(), elapsed_ms = (1e3 * elapsed) as u64,
+                    tok_s = tokens.len() as f64 / elapsed, gpu_wait_ms = (1e3 * phases[0]) as u64,
+                    experts_ms = (1e3 * phases[1]) as u64, "prefill");
                 let mut request = Active {
                     history: tokens.clone(),
                     draft_limit: draft,
                     draft_pause: 0,
                     decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?,
-                    job, constraint, placement: placement.clone(), backup, capacity, next: 0, generated: 0,
+                    job, constraint, placement: placement.clone(), capacity, next: 0, generated: 0,
                     buffered: 0, started: Instant::now(),
                 };
                 request.next = request.select(&logits.context("prefill produced no logits")?)?;
@@ -279,15 +250,11 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     let token = request.next;
                     match request.emit(token) {
                         Ok(false) => active.push(request),
-                        Ok(true) | Err(_) => {
-                            allocator.release_slot(request.backup);
-                            allocator.release(request.placement);
-                        }
+                        Ok(true) | Err(_) => allocator.release(request.placement),
                     }
                 }
                 Err(error) => {
                     tracing::warn!("prefill failed: {error:#}");
-                    allocator.release_slot(backup);
                     allocator.release(placement);
                 }
             }
@@ -308,18 +275,12 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let limit = room.min(a.draft_limit).min(a.job.max_tokens - a.generated - 1)
                 .min(a.capacity - a.placement.len - 1);
             // `emit` already appended `next` to the history.
-            std::iter::once(a.next).chain(copy_drafts(&a.history, limit)).collect()
+            std::iter::once(a.next).chain(crate::glmf::serve::copy_drafts(&a.history, limit)).collect()
         }).collect();
-        // Back up the KDA state of every sequence that drafts.
-        for (request, rows) in active.iter().zip(&sequences) {
-            if rows.len() > 1 {
-                engine.copy_slot(request.placement.slot, request.backup)?;
-            }
-        }
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
         let tokens: Vec<u32> = sequences.iter().flatten().copied().collect();
         let embed = embed_rows(&opened.checkpoint, &tokens, hidden)?;
-        let mut rows: Vec<(&mut GlmfPlacement, usize)> = active.iter_mut().zip(&sequences)
+        let mut rows: Vec<(&mut MimoPlacement, usize)> = active.iter_mut().zip(&sequences)
             .map(|(a, s)| (&mut a.placement, s.len())).collect();
         steps += 1;
         let timer = Instant::now();
@@ -332,7 +293,6 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 tracing::warn!("decode step failed: {error:#}");
                 for request in active.drain(..) {
                     let _ = request.job.events.blocking_send(Err(NativeFailure::Worker(format!("{error:#}"))));
-                    allocator.release_slot(request.backup);
                     allocator.release(request.placement);
                 }
                 continue;
@@ -372,29 +332,6 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             finished
         }).collect();
         emit_s += timer.elapsed().as_secs_f64();
-        // Sequences that kept fewer rows than they verified: restore the KDA
-        // state and replay the kept rows (one step for all of them).
-        let mut replay: Vec<(usize, usize)> = Vec::new();
-        for (index, ((request, rows), &start)) in active.iter().zip(&sequences).zip(&starts).enumerate() {
-            let kept = request.placement.len - start;
-            if !finished[index] && kept < rows.len() {
-                engine.copy_slot(request.backup, request.placement.slot)?;
-                replay.push((index, kept));
-            }
-        }
-        if !replay.is_empty() {
-            replays += 1;
-            replay_steps += 1;
-            let tokens: Vec<u32> = replay.iter().flat_map(|&(i, kept)| sequences[i][..kept].iter().copied()).collect();
-            let embed = embed_rows(&opened.checkpoint, &tokens, hidden)?;
-            let mut placements: Vec<(GlmfPlacement, usize)> = replay.iter().map(|&(i, kept)| {
-                let mut placement = active[i].placement.clone();
-                placement.len = starts[i];
-                (placement, kept)
-            }).collect();
-            let mut rows: Vec<(&mut GlmfPlacement, usize)> = placements.iter_mut().map(|(p, n)| (p, *n)).collect();
-            engine.verify(&mut rows, &embed, None)?;
-        }
         for index in (0..active.len()).rev() {
             if !finished[index] {
                 continue;
@@ -405,15 +342,14 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let seconds = request.started.elapsed().as_secs_f64();
             let phases = std::mem::take(&mut *engine.profile.borrow_mut());
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
-                active = active.len(), steps, replay_steps, verify_s, emit_s, gpu_wait_s = phases[0],
-                experts_s = phases[1], head_s = phases[2], "request complete");
-            (steps, replay_steps, verify_s, emit_s) = (0, 0, 0.0, 0.0);
-            allocator.release_slot(request.backup);
+                active = active.len(), steps, verify_s, emit_s, gpu_wait_s = phases[0], experts_s = phases[1],
+                "request complete");
+            (steps, verify_s, emit_s) = (0, 0.0, 0.0);
             allocator.release(request.placement);
         }
         if let Ok(mut stats) = stats.lock() {
             *stats = serde_json::json!({"requests": requests, "generated_tokens": generated_total,
-                "active": active.len(), "replays": replays});
+                "active": active.len()});
         }
     }
 }

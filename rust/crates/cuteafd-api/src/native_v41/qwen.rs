@@ -64,20 +64,26 @@ impl QwenEncoding {
                 _ => bail!("{} has no chat template", snapshot.display()),
             },
         };
-        let generation = read_json(&snapshot.join("generation_config.json"))
-            .or_else(|_| read_json(&snapshot.join("config.json")))?;
-        let eos = match &generation["eos_token_id"] {
-            Value::Number(id) => vec![id.as_u64().context("eos_token_id")? as u32],
-            Value::Array(ids) => ids.iter().map(|id| id.as_u64().map(|id| id as u32))
-                .collect::<Option<Vec<_>>>().context("eos_token_id must be integers")?,
-            _ => bail!("{} has no eos_token_id", snapshot.display()),
-        };
         let tokenizer = read_json(&snapshot.join("tokenizer.json"))?;
         let added = tokenizer["added_tokens"].as_array().context("tokenizer.json added_tokens")?;
         let id = |content: &str| -> Result<u32> {
             added.iter().find(|token| token["content"] == content)
                 .and_then(|token| token["id"].as_u64()).map(|id| id as u32)
                 .with_context(|| format!("tokenizer.json has no {content} token"))
+        };
+        // generation_config.json, else config.json; checkpoints with neither
+        // (MiMo V2) name the EOS token in tokenizer_config.json.
+        let generation = read_json(&snapshot.join("generation_config.json"))
+            .or_else(|_| read_json(&snapshot.join("config.json")))?;
+        let eos = match &generation["eos_token_id"] {
+            Value::Number(id) => vec![id.as_u64().context("eos_token_id")? as u32],
+            Value::Array(ids) => ids.iter().map(|id| id.as_u64().map(|id| id as u32))
+                .collect::<Option<Vec<_>>>().context("eos_token_id must be integers")?,
+            _ => match &read_json(&snapshot.join("tokenizer_config.json"))?["eos_token"] {
+                Value::String(eos) => std::iter::once(eos.as_str()).chain(["<|endoftext|>"])
+                    .filter_map(|content| id(content).ok()).collect(),
+                _ => bail!("{} has no eos_token_id", snapshot.display()),
+            },
         };
         let tokens = QwenTokenIds {
             eos,
