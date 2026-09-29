@@ -204,6 +204,13 @@ impl<'a> GlmfLoader<'a> {
                 ops.insert("w_uk", uk);
                 ops.insert("w_uv", uv);
                 ops.insert("w_o", self.one(&a("o_proj.weight"))?);
+                let i = |name: &str| a(&format!("indexer.{name}"));
+                ops.insert("w_iq", self.one(&i("wq_b.weight"))?);
+                ops.insert("w_ik", self.rows(&[i("wk.weight"), i("weights_proj.weight"),
+                    i("index_kpool_compress_gate")])?);
+                ops.insert("k_norm_w", self.one(&i("k_norm.weight"))?);
+                ops.insert("k_norm_b", self.one(&i("k_norm.bias"))?);
+                ops.insert("ape", self.one(&i("index_kpool_compress_ape"))?);
             }
         }
         if dense {

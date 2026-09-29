@@ -167,6 +167,8 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     from b12x.integration.cuteafd import glmf
 
     mg = glmf.mhc_geometry(g)
+    # Pool index cache: 64 pools (256 tokens) per page.
+    pool_pages = -(-max_context // (g.index_kpool * PAGE_ROWS))
     out = [
         ("mhc_pre", "mhc_pre", {}, lambda: mhc.compile_dsv4_mhc_pre_aot(mg)),
         ("mhc_post", "mhc_post", {}, lambda: mhc.compile_dsv4_mhc_post_aot(mg)),
@@ -174,9 +176,14 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         ("add", "add", {}, lambda: glmf.compile_glmf_add_aot(g)),
         ("router_scores", "router_scores", {}, lambda: glmf.compile_glmf_router_scores_aot(g)),
         ("expert_input_quant", "expert_input_quant", {}, lambda: glmf.compile_glmf_expert_input_quant_aot(g)),
+        ("index_expand", "index_expand", {}, lambda: glmf.compile_glmf_index_expand_aot(g)),
     ]
     for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
         out += [
+            (f"index_producer_m{rows}", "index_producer", {"max_rows": rows},
+             lambda r=rows: glmf.compile_glmf_index_producer_aot(g, max_rows=r)),
+            (f"index_topk_{mode}_m{rows}", "index_topk", {"mode": mode, "max_rows": rows, "max_pages": pool_pages},
+             lambda m=mode, r=rows: glmf.compile_glmf_index_topk_aot(g, max_rows=r, max_pages=pool_pages, mode=m)),
             (f"mhc_post_pre_m{rows}", "mhc_post_pre", {"max_rows": rows},
              lambda r=rows: mhc.compile_dsv4_mhc_post_pre_aot(mg, max_rows=r)),
             (f"kda_m{rows}", "kda", {"max_rows": rows}, lambda r=rows: glmf.compile_glmf_kda_aot(g, max_rows=r)),

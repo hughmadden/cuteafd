@@ -217,6 +217,8 @@ GEOMETRIES = {
     'dsv4f': (4096, 2048, 256, 6),
     'dsv4p': (7168, 3072, 384, 6),
     'glm': (6144, 2048, 256, 8),
+    # GLM 5.3 Flash (glm5_next): 288 experts, SwiGLU clamped at 10.
+    'glmf': (4096, 2048, 288, 8),
 }
 # SwiGLU clamp per geometry; None is the unclamped SwiGLU (b12x const-expr
 # elides the clamp). DeepSeek clamps at 10.
@@ -238,7 +240,7 @@ def route_block(geometry: str, capacity: int) -> int:
     fragments (b12x 4d7cb455), so they beat 32 from about 2048 rows up. The coordinator's whole-intermediate rtx-tp1 package
     gains the same way (RTX PRO 6000, width 3072: m4096 74 -> 35 ms, m1024 23 -> 16 ms).
     """
-    if geometry == 'glm':
+    if geometry in ('glm', 'glmf'):
         return glm_route_block(capacity)
     if geometry != 'dsv4p' or capacity <= 256:
         return 8
@@ -263,7 +265,7 @@ def token_major_rotation(geometry: str, capacity: int) -> bool:
     Bit-identical to per-route rotation. It pays where the rotation phase is
     large (V4 Pro m2048..4096 prefill); at m1024 and below it is neutral.
     """
-    if geometry == 'glm':
+    if geometry in ('glm', 'glmf'):
         # GLM top-8 (rtx-tp1): m1024 3910 -> 3830 us, m4096 11790 -> 11470 us.
         return capacity > 256
     return geometry == 'dsv4p' and capacity > 1024

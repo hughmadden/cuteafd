@@ -158,6 +158,10 @@ pub enum V41Exl3Naming {
     /// `model.layers.{L}.mlp.experts.{E}.gate_proj|up_proj|down_proj` and
     /// `mtp.{S}.mlp.experts...`.
     HfMlp,
+    /// Multimodal Hugging Face checkpoints (GLM 5.3 Flash):
+    /// `model.language_model.layers.{L}.mlp.experts.{E}.gate_proj|up_proj|down_proj`,
+    /// the native MTP layer after the `layers` backbone layers as draft stage 0.
+    HfLanguageModel { layers: usize },
 }
 
 impl V41Exl3Naming {
@@ -181,6 +185,15 @@ impl V41Exl3Naming {
                 };
                 let prefix = if draft { "mtp" } else { "model.layers" };
                 format!("{prefix}.{layer}.mlp.experts.{expert}.{stem}")
+            }
+            Self::HfLanguageModel { layers } => {
+                let stem = match kind {
+                    V41Exl3ProjectionKind::Gate => "gate_proj",
+                    V41Exl3ProjectionKind::Up => "up_proj",
+                    V41Exl3ProjectionKind::Down => "down_proj",
+                };
+                let layer = if draft { layers + layer } else { layer };
+                format!("model.language_model.layers.{layer}.mlp.experts.{expert}.{stem}")
             }
         }
     }
@@ -497,15 +510,25 @@ fn parse_deepseek_v4_manifest(
     let storage = manifest["tensor_storage"]
         .as_object()
         .context("missing EXL3 tensor_storage")?;
-    let naming = V41Exl3Naming::HfMlp;
-    let draft_stages = storage
-        .keys()
-        .filter_map(|name| name.strip_prefix("mtp.")?.split('.').next()?.parse::<usize>().ok())
-        .max()
-        .map_or(0, |stage| stage + 1);
+    let language_model = storage.keys().any(|name| name.starts_with("model.language_model.layers."));
+    let naming = if language_model {
+        V41Exl3Naming::HfLanguageModel { layers: backbone.layers }
+    } else {
+        V41Exl3Naming::HfMlp
+    };
+    // Draft stages: `mtp.{S}` names, or language-model layers past the backbone.
+    let stage_of = |name: &str| -> Option<usize> {
+        if language_model {
+            let layer: usize = name.strip_prefix("model.language_model.layers.")?.split('.').next()?.parse().ok()?;
+            layer.checked_sub(backbone.layers)
+        } else {
+            name.strip_prefix("mtp.")?.split('.').next()?.parse().ok()
+        }
+    };
+    let draft_stages = storage.keys().filter_map(|name| stage_of(name)).max().map_or(0, |stage| stage + 1);
     let draft_experts = storage
         .keys()
-        .filter(|name| name.starts_with("mtp.0.mlp.experts.") && name.ends_with(".gate_proj"))
+        .filter(|name| stage_of(name) == Some(0) && name.contains(".mlp.experts.") && name.ends_with(".gate_proj"))
         .count();
     let (hidden, intermediate) = (backbone.hidden, backbone.intermediate);
     let mut projections = BTreeMap::new();

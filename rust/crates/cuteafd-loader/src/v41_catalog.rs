@@ -909,6 +909,13 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog
     })
 }
 
+/// The decoder layer of a Hugging Face tensor name (`model.layers.{L}.` or
+/// `model.language_model.layers.{L}.`).
+fn hf_layer(name: &str) -> Option<usize> {
+    name.strip_prefix("model.layers.").or_else(|| name.strip_prefix("model.language_model.layers."))?
+        .split('.').next()?.parse().ok()
+}
+
 /// DeepSeek V4 EXL3 routed experts: every projection's trellis/suh/svh/mcg is
 /// checked against its safetensors header; backbone projections are sliced
 /// onto the Sparks, draft projections stay with the coordinator.
@@ -937,7 +944,8 @@ fn deepseek_v4_exl3_catalog(
                 Some(projection) => {
                     projection.validate_tensor(&tensor)?;
                     routed += 1;
-                    if tensor.name.starts_with("model.layers.") {
+                    let backbone = hf_layer(&tensor.name).is_some_and(|layer| layer < manifest.experts.layers);
+                    if backbone {
                         V41TensorPlacement::BackboneExl3
                     } else {
                         V41TensorPlacement::CoordinatorRtx
@@ -945,9 +953,7 @@ fn deepseek_v4_exl3_catalog(
                 }
                 None => {
                     // Experts past the backbone (a native MTP layer) stay on the coordinator.
-                    let past_backbone = tensor.name.strip_prefix("model.layers.")
-                        .and_then(|rest| rest.split('.').next()?.parse::<usize>().ok())
-                        .is_some_and(|layer| layer >= manifest.experts.layers);
+                    let past_backbone = hf_layer(&tensor.name).is_some_and(|layer| layer >= manifest.experts.layers);
                     ensure!(
                         past_backbone
                             || (!tensor.name.contains(".mlp.experts.") && !tensor.name.contains(".ffn.experts.")),

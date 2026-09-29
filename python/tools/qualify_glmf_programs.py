@@ -186,9 +186,53 @@ def main() -> None:
                 report("mla q_resid", q_resid, q_resid_ref)
                 k = g.sparse_topk
                 pos = torch.arange(t, device="cuda")
-                cols = torch.arange(k, device="cuda")
-                indices = torch.where(cols[None, :] <= pos[:, None], cols[None, :], -1).to(torch.int32).contiguous()
-                lengths = (pos + 1).clamp(max=k).to(torch.int32)
+                # Indexer: per-token keys, pool keys, pool top-k, expansion to record slots.
+                index_producer = program("index_producer",
+                                         lambda: glmf.compile_glmf_index_producer_aot(g, max_rows=rows_cap))
+                pool_pages = -(-t // (4 * 64))
+                topk = program("index_topk", lambda: glmf.compile_glmf_index_topk_aot(
+                    g, max_rows=rows_cap, max_pages=max(pool_pages, 1), mode="prefill"))
+                expand = program("index_expand", lambda: glmf.compile_glmf_index_expand_aot(g))
+                ix = layer.self_attn.indexer
+                w_ik = torch.cat([ix.wk.weight, ix.weights_proj.weight, ix.index_kpool_compress_gate], 0).contiguous()
+                pool_slots = torch.where(pos % 4 == 3, pos // 4, -1).to(torch.int64)
+                token_keys = torch.zeros(pages * 64, 256, dtype=torch.bfloat16, device="cuda")
+                index_cache = torch.zeros(pool_pages, 64 * 132, dtype=torch.uint8, device="cuda")
+                q_fp8 = torch.empty(t, g.index_heads, 128, dtype=torch.float8_e4m3fn, device="cuda")
+                head_w = torch.empty(t, g.index_heads, device="cuda")
+                ip_scratch = torch.empty(glmf.index_producer_scratch_bytes(g, rows_cap), dtype=torch.uint8,
+                                         device="cuda")
+                index_producer.launch(x_ref, q_resid, slots, pool_slots, ix.wq_b.weight.contiguous(), w_ik,
+                                      ix.k_norm.weight, ix.k_norm.bias, ix.index_kpool_compress_ape.contiguous(),
+                                      token_keys, index_cache, q_fp8, head_w, ip_scratch, scalars=[t])
+                pools = torch.full((t, g.index_topk // 4), -1, dtype=torch.int32, device="cuda")
+                if t > g.index_topk + 3:
+                    from b12x.integration.cuteafd.glm_indexer import glm_index_topk_scratch_bytes
+                    pt = glmf._PoolTopK(index_topk=g.index_topk // 4, index_heads=g.index_heads)
+                    tk_scratch = torch.zeros(glm_index_topk_scratch_bytes(pt, max_rows=rows_cap,
+                                             max_pages=max(pool_pages, 1), mode="prefill"),
+                                             dtype=torch.uint8, device="cuda")
+                    topk.launch(q_fp8, head_w, index_cache, torch.arange(pool_pages, dtype=torch.int32, device="cuda"),
+                                ((pos + 1) // 4).to(torch.int32), pools, tk_scratch, scalars=[t, pool_pages, 0])
+                indices = torch.empty(t, k, dtype=torch.int32, device="cuda")
+                lengths = torch.empty(t, dtype=torch.int32, device="cuda")
+                expand.launch(pos.to(torch.int64), pools, torch.arange(pool_pages, dtype=torch.int32, device="cuda"),
+                              torch.arange(pages, dtype=torch.int32, device="cuda"), indices, lengths,
+                              scalars=[t, 0])
+                ref_idx = ix(hidden_states=x_ref[None], q_resid=q_resid_ref[None], attention_mask=mask,
+                             past_key_values=None)[0]
+                same, jaccard, long_jaccard = 0, 0.0, 0.0
+                ours_l, ref_l = indices.cpu(), ref_idx.cpu()
+                for r in range(t):
+                    mine = set(ours_l[r, :int(lengths[r])].tolist())
+                    theirs = set(v for v in ref_l[r].tolist() if v >= 0)
+                    same += mine == theirs
+                    overlap = len(mine & theirs) / max(len(mine | theirs), 1)
+                    jaccard += overlap
+                    long_jaccard += overlap if r >= 2051 else 0.0
+                print(f"  {'index selection vs reference':28s} identical rows {same}/{t}, mean Jaccard "
+                      f"{jaccard / t:.5f}; rows past 2051: {max(t - 2051, 0)}, their Jaccard "
+                      f"{long_jaccard / max(t - 2051, 1):.5f}", flush=True)
                 latent = torch.empty(t, n, lat, dtype=torch.bfloat16, device="cuda")
                 mla_scratch = torch.empty(glm_sparse_mla.sparse_mla_scratch_bytes(g, route="prefill", rows=rows_cap),
                                           dtype=torch.uint8, device="cuda")

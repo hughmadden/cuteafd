@@ -27,8 +27,8 @@ pub(crate) struct EngineArgs {
     /// Run only the first N layers (layers 0-2 are the dense ones).
     #[arg(long)]
     pub layers: Option<usize>,
-    /// Longest sequence.
-    #[arg(long, default_value_t = 2051)]
+    /// Longest sequence (the exported index top-k covers up to 131072).
+    #[arg(long, default_value_t = 65_536)]
     pub max_context: usize,
     /// Tokens the MLA record pools hold across sequences.
     #[arg(long, default_value_t = 32_768)]
@@ -41,9 +41,10 @@ pub(crate) struct EngineArgs {
     /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family.
     #[arg(long, conflicts_with = "local_experts")]
     pub peers: Option<String>,
-    /// Run the routed experts on this GPU from the checkpoint's FP8 (the TP1
-    /// `fp8-glmf` package); `--experts-snapshot` names the FP8 checkpoint when
-    /// `--snapshot` holds EXL3 experts.
+    /// Run the routed experts on this GPU: EXL3 checkpoints through the
+    /// coordinator `exl3-glmf-k<tiers>/rtx-tp1` package, FP8 ones through the
+    /// TP1 `fp8-glmf` package. `--experts-snapshot` names another checkpoint
+    /// for the experts (the official FP8 one with EXL3 coordinator weights).
     #[arg(long)]
     pub local_experts: bool,
     #[arg(long)]
@@ -54,6 +55,10 @@ pub(crate) struct EngineArgs {
     /// FP8 expert layers resident at once with --local-experts (7.25 GiB each).
     #[arg(long, default_value_t = 6)]
     pub expert_window: usize,
+    /// Most EXL3 expert layers resident at once (about 3 GiB each; the free
+    /// memory decides first).
+    #[arg(long, default_value_t = 64)]
+    pub exl3_window: usize,
 }
 
 #[derive(Debug, clap::Args)]
@@ -108,7 +113,8 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     let experts = if args.local_experts {
         let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
         let catalog = cuteafd_loader::read_expert_catalog(source)?;
-        ensure!(catalog.fp8().is_some(), "--local-experts needs the official FP8 experts (--experts-snapshot)");
+        ensure!(catalog.fp8().is_some() || catalog.exl3().is_some(),
+            "--local-experts runs FP8 or EXL3 experts; {} has neither", source.display());
         Some(catalog)
     } else {
         None
@@ -159,6 +165,15 @@ impl Opened {
             return Ok(Some(engine::Experts::Local(engine::LocalExperts {
                 library: &self.library, tensors, experts: std::cell::RefCell::new(experts),
                 window: args.expert_window.max(1), loads: std::cell::RefCell::new(0),
+            })));
+        }
+        if let Some(catalog) = self.experts.as_ref().filter(|c| c.exl3().is_some()) {
+            let (free, _) = self.library.cuda_memory_info()?;
+            return Ok(Some(engine::Experts::LocalExl3(engine::LocalExl3 {
+                library: &self.library, native_lib: args.native_lib.clone(), catalog,
+                resident: std::cell::RefCell::new(None), window: args.exl3_window.max(1), max_rows: args.prefill_rows,
+                // Room for the step workspace (logits alone are 2.4 GiB at 4096 rows).
+                budget: free.saturating_sub(12 << 30), loads: std::cell::RefCell::new(0),
             })));
         }
         let Some(peers) = args.peers.as_deref() else { return Ok(None) };
@@ -271,9 +286,25 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
     let forced = |layer: usize| -> Option<Vec<u8>> {
         std::fs::read(args.golden.join(format!("layer{layer:02}.bin"))).ok().map(|rows| rows[..prefill * stream_row].to_vec())
     };
-    let logits = engine.prefill_forced(&mut placement, &embed[..prefill * row],
-        Some(&mut |layer, streams| compare(layer, 0, streams, &mut worst)),
-        args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>), args.nll)?;
+    // Prefill in chunks of the engine's prefill rows (teacher forcing needs one chunk).
+    ensure!(!args.teacher_force || prefill <= engine.prefill_rows, "teacher forcing takes one prefill chunk");
+    let mut logits: Option<Vec<f32>> = None;
+    let mut done = 0;
+    while done < prefill {
+        let n = engine.prefill_rows.min(prefill - done);
+        let first = done;
+        let chunk = engine.prefill_forced(&mut placement, &embed[done * row..(done + n) * row],
+            Some(&mut |layer, streams| compare(layer, first, streams, &mut worst)),
+            args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>), args.nll)?;
+        logits = match (logits, chunk) {
+            (Some(mut all), Some(more)) if args.nll => {
+                all.extend(more);
+                Some(all)
+            }
+            (_, chunk) => chunk,
+        };
+        done += n;
+    }
     let prefill_seconds = started.elapsed().as_secs_f64();
     let started = Instant::now();
     let mut decode_worst = Vec::new();
@@ -309,6 +340,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
     }
     let loads = match engine.experts() {
         Some(engine::Experts::Local(local)) => format!(", {} FP8 expert layer loads", local.loads.borrow()),
+        Some(engine::Experts::LocalExl3(local)) => format!(", {} EXL3 expert layer loads", local.loads.borrow()),
         _ => String::new(),
     };
     println!("prefill: {prefill} tokens through {layers} layers in {prefill_seconds:.2} s{loads}");
