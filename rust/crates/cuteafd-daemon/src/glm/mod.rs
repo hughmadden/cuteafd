@@ -10,6 +10,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::glm_dsa::GlmDsaConfig;
 use cuteafd_transport::v41_expert::V41Tp4Roce;
+use std::ffi::c_void;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -231,6 +232,28 @@ impl Opened {
         unsafe { self.library.cuda_stream_destroy(stream)? };
         result
     }
+}
+
+/// Vocabulary head of `rows` rows: 2..=16 rows on the few-row FP32 kernel
+/// (one read of the head per 8 rows), others on the pedantic cuBLAS head;
+/// CUTEAFD_GLM_HEAD=cublas keeps every row count on cuBLAS.
+///
+/// # Safety
+/// `x` [rows, width] BF16, `weight` [vocab, width] BF16 and `logits` [rows,
+/// vocab] FP32 are live device buffers on `stream`'s device; `head` was
+/// created for at least `rows` rows of this width and vocabulary.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn launch_head(library: &NativeLibrary, head: &cuteafd_ffi::dsv4::VocabularyHead<'_>,
+    x: *const c_void, weight: *const c_void, logits: *mut f32, rows: usize, width: usize, vocab: usize,
+    stream: *mut c_void) -> Result<()> {
+    static CUBLAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let cublas = *CUBLAS.get_or_init(|| std::env::var("CUTEAFD_GLM_HEAD").is_ok_and(|v| v == "cublas"));
+    if !cublas && (2..=cuteafd_ffi::VOCAB_HEAD_ROWS_MAX).contains(&rows) {
+        // SAFETY: the caller's contract.
+        return unsafe { library.vocab_head_rows(x, weight, logits, rows, width, vocab, stream) };
+    }
+    // SAFETY: the caller's contract.
+    unsafe { head.launch(x.cast(), weight.cast(), logits, rows as u32, stream) }
 }
 
 pub(crate) fn embed_rows(catalog: &cuteafd_loader::OfficialV41Catalog, tokens: &[u32], hidden: usize) -> Result<Vec<u8>> {

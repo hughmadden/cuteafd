@@ -2,6 +2,8 @@ pub mod dsv4;
 pub mod fp8_moe;
 mod glm_dflash;
 mod glm_mla;
+mod vocab_head;
+pub use vocab_head::VOCAB_HEAD_ROWS_MAX;
 mod mimo_dflash;
 mod v41_candidate_blocks;
 mod v41_device_ops;

@@ -494,8 +494,8 @@ impl<'a> GlmEngine<'a> {
         let h = self.cfg.hidden;
         // SAFETY: the final norm's output and the head operands are live buffers of these shapes.
         unsafe {
-            w.head.launch(w.x.buffer.ptr.cast::<u8>().add((t - n) * h * 2).cast(),
-                self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), n as u32, self.stream)?;
+            super::launch_head(self.library, &w.head, w.x.buffer.ptr.cast::<u8>().add((t - n) * h * 2).cast(),
+                self.weights.head.buffer.ptr, w.logits.buffer.ptr.cast(), n, h, self.cfg.vocab_size, self.stream)?;
         }
         let timer = std::time::Instant::now();
         let logits = self.download(&w.logits, n * self.cfg.vocab_size * 4)?;

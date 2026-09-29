@@ -545,7 +545,7 @@ impl<'a> GlmDrafter<'a> {
                 l.glm_dflash_conv_residual_norm(w.delta.buffer.ptr, w.dynamic.buffer.ptr, layer.mlp_base.buffer.ptr,
                     w.h.buffer.ptr, next, w.h.buffer.ptr, w.n.buffer.ptr, rows, block, h, group, eps, s)?;
             }
-            w.head.launch(w.n.buffer.ptr.cast(), head.cast(), w.logits.buffer.ptr.cast(), rows as u32, s)?;
+            super::launch_head(l, &w.head, w.n.buffer.ptr, head, w.logits.buffer.ptr.cast(), rows, h, c.vocab, s)?;
             l.glm_dflash_topk(w.logits.buffer.ptr, w.unary.buffer.ptr, w.candidates.buffer.ptr,
                 w.topk_workspace.buffer.ptr, s_count, block, c.drafts(), c.vocab, s)?;
             l.linear_bf16(w.n.buffer.ptr, self.projection.buffer.ptr, w.projected.buffer.ptr, rows, h, c.rank, s)?;

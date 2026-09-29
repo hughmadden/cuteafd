@@ -281,6 +281,7 @@ if(CUTEAFD_ENABLE_CUDA)
     cuda/kernels/dsv4_dspark.cu
     cuda/kernels/glm_dflash.cu
     cuda/kernels/glm_mla_prefill.cu
+    cuda/kernels/vocab_head_rows.cu
     cuda/kernels/mimo_dflash.cu
     cuda/kernels/fp8_block_dequant.cu
     cuda/kernels/v41_dspark_cache.cu
