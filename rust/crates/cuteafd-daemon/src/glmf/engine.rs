@@ -352,6 +352,20 @@ pub(crate) struct GlmfEngine<'a> {
     /// Recorded after a layer's routes and wire rows reach the host staging.
     routes_ready: *mut c_void,
     ops: Option<RefCell<OpTimes>>,
+    /// Prefill projections that run block-FP8 GEMMs (the layers need FP8 copies).
+    pub fp8_prefill: Fp8Prefill,
+}
+
+/// Which prefill projections run block-FP8 GEMMs (E4M3 activations per row
+/// and 128-K block): the MLA projections, the dense and shared-expert MLPs
+/// (the official FP8 weights), the KDA in-projection and o_proj (per-row x
+/// 128-K copies).
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Fp8Prefill {
+    pub mla: bool,
+    pub ffn: bool,
+    /// KDA projections that run FP8 (bit 0 the in-projection, bit 1 o_proj).
+    pub kda_bits: i32,
 }
 
 /// What a captured decode segment baked in.
@@ -424,7 +438,8 @@ impl<'a> GlmfEngine<'a> {
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
             lanes: std::env::var("CUTEAFD_GLMF_PREFILL_LANES").map_or(true, |v| v != "1"),
             full_prefill_logits: false, routes_ready: library.cuda_event_create_ordering()?,
-            ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default) })
+            ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
+            fp8_prefill: Fp8Prefill::default() })
     }
 
     /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
@@ -1070,18 +1085,19 @@ impl<'a> GlmfEngine<'a> {
         let replay = at(&self.kda_replay, replay_bytes(self.cfg.kda_heads, 3 * d));
         let mut pointers = vec![("x", w.x.buffer.ptr), ("w_in", layer.ptr("w_in")?)];
         let decode = cap == "m64";
-        if decode {
-            pointers.extend([("w_in_fp8", layer.ptr_or("w_in_fp8", "w_in")?),
-                ("w_in_scale", layer.ptr_or("w_in_scale", "w_in")?)]);
-        }
+        // Decode programs read per-row scales [N, K/128]; prefill ones K-block major.
+        let (in_scale, o_scale) = if decode { ("w_in_scale", "w_o_scale") } else { ("w_in_kscale", "w_o_kscale") };
+        pointers.extend([("w_in_fp8", layer.ptr_or("w_in_fp8", "w_in")?), (in_scale, layer.ptr_or(in_scale, "w_in")?)]);
         pointers.extend([("w_fg", layer.ptr("w_fg")?), ("conv_w", layer.ptr("conv_w")?), ("a_log", layer.ptr("a_log")?),
             ("dt_bias", layer.ptr("dt_bias")?), ("o_norm", layer.ptr("o_norm")?), ("w_o", layer.ptr("w_o")?)]);
-        if decode {
-            pointers.extend([("w_o_fp8", layer.ptr_or("w_o_fp8", "w_o")?), ("w_o_scale", layer.ptr_or("w_o_scale", "w_o")?)]);
-        }
+        pointers.extend([("w_o_fp8", layer.ptr_or("w_o_fp8", "w_o")?), (o_scale, layer.ptr_or(o_scale, "w_o")?)]);
         pointers.extend([("conv_state", conv_state), ("state", state), ("slots", w.kda_slots.buffer.ptr),
             ("seq_first", w.seq_first.buffer.ptr), ("out", w.delta.buffer.ptr)]);
-        let mut scalars = self.fp8_scalars(rows, decode, layer.has("w_in_fp8"));
+        let mut scalars = self.fp8_scalars(rows, decode, layer.has(if decode { "w_in_fp8" } else { "w_in_kscale" }));
+        if !decode && layer.has("w_in_kscale") {
+            // Prefill fp8_rows bits: 1 the in-projection, 2 o_proj.
+            scalars[1] = Dsv4Scalar::I32(self.fp8_prefill.kda_bits);
+        }
         if decode {
             pointers.push(("replay", replay));
             scalars.push(Dsv4Scalar::I32(i32::from(spec)));
@@ -1092,13 +1108,15 @@ impl<'a> GlmfEngine<'a> {
         self.run(&format!("kda_{cap}"), &pointers, &scalars)
     }
 
-    /// `[rows]`, plus the decode programs' `fp8_rows` (16 when the layer has the FP8 copy, else 0).
+    /// `[rows, fp8]`: the decode programs' `fp8_rows` (16 when the layer has
+    /// the FP8 copy, else 0), or the prefill programs' `fp8` switch (1: rows
+    /// past the skinny GEMV run the block-FP8 GEMMs).
     fn fp8_scalars(&self, rows: Dsv4Scalar, decode: bool, fp8: bool) -> Vec<Dsv4Scalar> {
-        let mut scalars = vec![rows];
-        if decode {
-            scalars.push(Dsv4Scalar::I32(if fp8 { FP8_ROWS } else { 0 }));
-        }
-        scalars
+        vec![rows, Dsv4Scalar::I32(match (fp8, decode) {
+            (false, _) => 0,
+            (true, true) => FP8_ROWS,
+            (true, false) => 1,
+        })]
     }
 
     /// SwiGLU MLP (dense layer or shared expert) of intermediate `inter` into `out`.
@@ -1106,17 +1124,14 @@ impl<'a> GlmfEngine<'a> {
         -> Result<()> {
         let decode = cap == "m64";
         let mut pointers = vec![("x", w.x.buffer.ptr), ("w_gate_up", layer.ptr("w_gate_up")?)];
-        if decode {
-            pointers.extend([("w_gate_up_fp8", layer.ptr_or("w_gate_up_fp8", "w_gate_up")?),
-                ("w_gate_up_scale", layer.ptr_or("w_gate_up_scale", "w_gate_up")?)]);
-        }
+        pointers.extend([("w_gate_up_fp8", layer.ptr_or("w_gate_up_fp8", "w_gate_up")?),
+            ("w_gate_up_scale", layer.ptr_or("w_gate_up_scale", "w_gate_up")?)]);
         pointers.push(("w_down", layer.ptr("w_down")?));
-        if decode {
-            pointers.extend([("w_down_fp8", layer.ptr_or("w_down_fp8", "w_down")?),
-                ("w_down_scale", layer.ptr_or("w_down_scale", "w_down")?)]);
-        }
+        pointers.extend([("w_down_fp8", layer.ptr_or("w_down_fp8", "w_down")?),
+            ("w_down_scale", layer.ptr_or("w_down_scale", "w_down")?)]);
         pointers.extend([("out", out), ("scratch", w.scratch.buffer.ptr)]);
-        self.run(&format!("ffn_i{inter}_{cap}"), &pointers, &self.fp8_scalars(rows, decode, layer.has("w_down_fp8")))
+        let fp8 = layer.has("w_down_fp8") && (decode || self.fp8_prefill.ffn);
+        self.run(&format!("ffn_i{inter}_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))
     }
 
     fn mla(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Dsv4Scalar, cap: &str,
@@ -1125,19 +1140,15 @@ impl<'a> GlmfEngine<'a> {
         let cache = self.kv[index].as_ref().context("MLA layer without a record pool")?.buffer.ptr;
         let (keys, pool_cache) = self.index[index].as_ref().context("MLA layer without an index cache")?;
         let decode = tables.decode;
-        let fp8 = layer.has("w_qkv_a_fp8");
+        let fp8 = layer.has("w_qkv_a_fp8") && (decode || self.fp8_prefill.mla);
         let mut pointers = vec![("x", w.x.buffer.ptr), ("kv_slots", w.kv_slots.buffer.ptr),
             ("w_qkv_a", layer.ptr("w_qkv_a")?)];
-        if decode {
-            pointers.extend([("w_qkv_a_fp8", layer.ptr_or("w_qkv_a_fp8", "w_qkv_a")?),
-                ("w_qkv_a_scale", layer.ptr_or("w_qkv_a_scale", "w_qkv_a")?)]);
-        }
+        pointers.extend([("w_qkv_a_fp8", layer.ptr_or("w_qkv_a_fp8", "w_qkv_a")?),
+            ("w_qkv_a_scale", layer.ptr_or("w_qkv_a_scale", "w_qkv_a")?)]);
         pointers.extend([("q_a_norm", layer.ptr("q_a_norm")?), ("kv_a_norm", layer.ptr("kv_a_norm")?),
             ("w_q_b", layer.ptr("w_q_b")?)]);
-        if decode {
-            pointers.extend([("w_q_b_fp8", layer.ptr_or("w_q_b_fp8", "w_q_b")?),
-                ("w_q_b_scale", layer.ptr_or("w_q_b_scale", "w_q_b")?)]);
-        }
+        pointers.extend([("w_q_b_fp8", layer.ptr_or("w_q_b_fp8", "w_q_b")?),
+            ("w_q_b_scale", layer.ptr_or("w_q_b_scale", "w_q_b")?)]);
         pointers.extend([("w_uk", layer.ptr("w_uk")?), ("kv_cache", cache), ("query", w.query.buffer.ptr),
             ("q_resid", w.q_resid.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
         self.run(&format!("mla_producer_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))?;
@@ -1162,9 +1173,7 @@ impl<'a> GlmfEngine<'a> {
             ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr), ("out", w.latent.buffer.ptr),
             ("scratch", w.scratch.buffer.ptr)], &[rows])?;
         let mut pointers = vec![("attn", w.latent.buffer.ptr), ("w_uv", layer.ptr("w_uv")?), ("w_o", layer.ptr("w_o")?)];
-        if decode {
-            pointers.extend([("w_o_fp8", layer.ptr_or("w_o_fp8", "w_o")?), ("w_o_scale", layer.ptr_or("w_o_scale", "w_o")?)]);
-        }
+        pointers.extend([("w_o_fp8", layer.ptr_or("w_o_fp8", "w_o")?), ("w_o_scale", layer.ptr_or("w_o_scale", "w_o")?)]);
         pointers.extend([("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
         self.run(&format!("o_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))
     }

@@ -185,16 +185,19 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         ("kda_commit", "kda_commit", {}, lambda: glmf.compile_glmf_kda_commit_aot(g)),
     ]
     # Decode programs also take FP8 weights (checkpoint 128x128 blocks, or
-    # per-row scales for the KDA projections) behind an ``fp8_rows`` scalar.
+    # per-row scales for the KDA projections) behind an ``fp8_rows`` scalar;
+    # prefill programs run block-FP8 GEMMs over them when ``fp8_rows`` is nonzero.
     for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
-        f8 = mode == "decode"
+        f8 = True if mode == "decode" else "prefill"
+        # Prefill mHC mixes run on TF32 tensor cores (split FP32 fn) from 384 rows.
+        route = None if mode == "decode" else "tf32"
         out += [
             (f"index_producer_m{rows}", "index_producer", {"max_rows": rows},
              lambda r=rows: glmf.compile_glmf_index_producer_aot(g, max_rows=r)),
             (f"index_topk_{mode}_m{rows}", "index_topk", {"mode": mode, "max_rows": rows, "max_pages": pool_pages},
              lambda m=mode, r=rows: glmf.compile_glmf_index_topk_aot(g, max_rows=r, max_pages=pool_pages, mode=m)),
-            (f"mhc_post_pre_m{rows}", "mhc_post_pre", {"max_rows": rows},
-             lambda r=rows: mhc.compile_dsv4_mhc_post_pre_aot(mg, max_rows=r)),
+            (f"mhc_post_pre_m{rows}", "mhc_post_pre", {"max_rows": rows, "route": route},
+             lambda r=rows, rt=route: mhc.compile_dsv4_mhc_post_pre_aot(mg, max_rows=r, route=rt)),
             (f"kda_m{rows}", "kda", {"max_rows": rows, "fp8": f8},
              lambda r=rows, f=f8: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8=f)),
             (f"mla_producer_m{rows}", "mla_producer", {"max_rows": rows, "fp8": f8},
