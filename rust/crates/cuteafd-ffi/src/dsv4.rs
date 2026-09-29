@@ -292,6 +292,20 @@ impl NativeLibrary {
 
 /// dSpark drafter kernels (native/cuda/kernels/dsv4_dspark.cu).
 impl NativeLibrary {
+    /// `out` BF16 [rows, cols] = FP8 E4M3 `w` [rows, cols] times its FP32
+    /// 128x128 block `scale` [ceil(rows/128), ceil(cols/128)].
+    ///
+    /// # Safety
+    /// Every pointer is live device memory of its shape on the stream's device.
+    pub unsafe fn fp8_block_dequant(&self, w: *const c_void, scale: *const c_void, out: *mut c_void, rows: usize,
+        cols: usize, stream: *mut c_void) -> Result<()> {
+        type Dequant = unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, i32, i32, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Dequant>(b"cuteafd_fp8_block_dequant") }?;
+        let status = unsafe { f(w, scale, out, i32::try_from(rows)?, i32::try_from(cols)?, stream) };
+        ensure!(status == 0, "FP8 block dequantization failed with {status}");
+        Ok(())
+    }
+
     /// Mean over the four mHC copies of `rows` stream rows [rows, 4, hidden]
     /// into columns `offset..offset + hidden` of `out` [rows, stride], BF16.
     ///
