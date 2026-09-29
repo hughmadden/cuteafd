@@ -1,0 +1,6 @@
+//! Qwen 3.8 Flash Next (qwen4_exp) family: configuration and the PLE n-gram
+//! hashing for the generic engine.
+pub mod config;
+pub mod ngram;
+pub use config::{Qwen4Attention, Qwen4Config};
+pub use ngram::{NgramHasher, NgramHistory};
