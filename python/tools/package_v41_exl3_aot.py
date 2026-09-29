@@ -324,13 +324,14 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> boo
     mixed_trellis_ws, 64-row route blocks): producer warps stream the Trellis
     weights and input rows and rotate FC1 inputs one block ahead, consumer
     warps decode and multiply. Bit-identical to the cooperative kernel.
-    Faster than the current exports at every measured Spark width and
-    prefill capacity (GB10, random routes, kernel + top-k sum, ms): V4 Pro
-    TP4 768 m256 7.64 -> 7.29, m1024 10.94 -> 8.23, m4096 21.46 -> 17.27;
-    TP6 512 m1024 8.43 -> 5.97, m4096 16.54 -> 12.77; GLM 5.3 TP4 512 m256
-    6.31 -> 5.46, m1024 7.24 -> 6.55, m4096 18.11 -> 14.33; TP3 640 m1024
-    10.68 -> 7.89. Decode capacities (<= 80 rows) keep the cooperative
-    kernel.
+    Faster than the cooperative exports at every Spark width and prefill
+    capacity measured (GB10, random routes, kernel + top-k sum, median of
+    three interleaved runs, ms): V4 Pro TP4 768 m1024 11.16 -> 8.36, m4096
+    21.98 -> 17.27; GLM 5.3 TP4 512 m1024 7.23 -> 6.67, m4096 18.24 ->
+    14.60; GLM 5.3 Flash TP4 512 m4096 11.03 -> 9.07, TP2 1024 m4096 19.32
+    -> 15.47; single runs 3-25% faster for TP2/TP3/TP6 widths (tile-128
+    GLM TP3 640 included) and at m128/m256. Decode capacities (<= 80 rows)
+    keep the cooperative kernel.
     """
     if role != 'spark' or geometry not in ('dsv4p', 'glm', 'glmf'):
         return False
