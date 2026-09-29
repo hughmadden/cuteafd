@@ -52,11 +52,19 @@ pub struct Fp8ExpertTensors {
     shape: RoutedExpertShape,
     /// `model.` or `model.language_model.`: where the decoder layers live.
     prefix: String,
+    /// Whether draft (MTP) experts live under `mtp.layers.{s}.` (Qwen 3.8 Flash
+    /// Next) rather than as decoder layers past the backbone: layer
+    /// `shape.layers + s` names them.
+    mtp_layers: bool,
     tensors: HashMap<String, Located>,
 }
 
 impl Fp8ExpertTensors {
     pub fn name(&self, layer: usize, expert: usize, projection: Fp8Projection) -> String {
+        if self.mtp_layers && layer >= self.shape.layers {
+            let stage = layer - self.shape.layers;
+            return format!("mtp.layers.{stage}.mlp.experts.{expert}.{}.weight", projection.stem());
+        }
         format!("{}layers.{layer}.mlp.experts.{expert}.{}.weight", self.prefix, projection.stem())
     }
 
@@ -71,8 +79,9 @@ impl Fp8ExpertTensors {
         } else {
             "model."
         };
-        let routed = |name: &str| name.starts_with(prefix) && name[prefix.len()..].starts_with("layers.")
-            && name.contains(".mlp.experts.");
+        let mtp_layers = weight_map.keys().any(|name| name.starts_with("mtp.layers.") && name.contains(".mlp.experts."));
+        let routed = |name: &str| ((name.starts_with(prefix) && name[prefix.len()..].starts_with("layers."))
+            || (mtp_layers && name.starts_with("mtp.layers."))) && name.contains(".mlp.experts.");
         let shards: std::collections::BTreeSet<&String> =
             weight_map.iter().filter(|(name, _)| routed(name)).map(|(_, shard)| shard).collect();
         let mut tensors = HashMap::new();
@@ -91,7 +100,7 @@ impl Fp8ExpertTensors {
                 }
             }
         }
-        let catalog = Self { snapshot: snapshot.to_path_buf(), shape, prefix: prefix.to_string(), tensors };
+        let catalog = Self { snapshot: snapshot.to_path_buf(), shape, prefix: prefix.to_string(), mtp_layers, tensors };
         // One expert of the first routed layer fixes the format contract.
         for projection in Fp8Projection::ALL {
             catalog.check(shape.first_layer, 0, projection)?;
