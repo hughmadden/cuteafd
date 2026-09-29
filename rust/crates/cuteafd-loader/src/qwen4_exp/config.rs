@@ -134,6 +134,21 @@ impl Qwen4Config {
         self.hc_count * self.hidden
     }
 
+    /// Short-conv channels of a GDN layer (`[q; k; v]`).
+    pub fn gdn_conv_width(&self) -> usize {
+        (2 * self.gdn_key_heads + self.gdn_value_heads) * self.gdn_head_dim
+    }
+
+    /// GDN value width (heads x dim).
+    pub fn gdn_value_width(&self) -> usize {
+        self.gdn_value_heads * self.gdn_head_dim
+    }
+
+    /// Rows of a full-attention layer's packed in-projection.
+    pub fn attn_in_width(&self) -> usize {
+        2 * self.heads * self.head_dim + 2 * self.kv_heads * self.head_dim + (self.index_heads + 1) * self.index_head_dim
+    }
+
     /// PLE n-gram rows per token.
     pub fn ple_rows(&self) -> usize {
         (self.ngram_size - 1) * self.heads_per_ngram

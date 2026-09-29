@@ -56,7 +56,7 @@ fn i64s(bytes: &[u8]) -> Vec<i64> {
 impl<'a> PleTable<'a> {
     pub fn load(library: &'a NativeLibrary, checkpoint: &Checkpoint, cfg: &Qwen4Config, layer: usize,
         placement: PlePlacement, threads: usize) -> Result<Self> {
-        let loader = super::weights::Qwen4Loader { library, checkpoint };
+        let loader = super::weights::Qwen4Loader { library, checkpoint, fp8_decode: false, stream: std::ptr::null_mut() };
         let prefix = format!("{}layers.{layer}.ple.ple_embedding.", super::weights::PREFIX);
         let multipliers = i64s(&loader.raw(&format!("{prefix}layer_multipliers"))?.0);
         let sizes = i64s(&loader.raw(&format!("{prefix}ngram_heads_vocab_sizes"))?.0);

@@ -850,27 +850,47 @@ impl<'a> Qwen4Engine<'a> {
             ("scratch", w.scratch.buffer.ptr)], &[rows])
     }
 
+    /// Decode-shaped steps use the E4M3 programs when the layer carries E4M3 copies.
+    fn fp8(&self, layer: &Qwen4Layer<'_>, cap: &str) -> bool {
+        cap == "m64" && layer.has("w_in_fp8")
+    }
+
     fn gdn(&self, w: &Workspace<'_>, index: usize, layer: &Qwen4Layer<'_>, rows: Dsv4Scalar, cap: &str) -> Result<()> {
         let state = self.state[index].as_ref().context("GDN layer without a state pool")?;
-        self.run(&format!("qwen4_gdn_{cap}"), &[("x", w.x.buffer.ptr), ("w_in", layer.ptr("w_in")?),
-            ("conv_w", layer.ptr("conv_w")?), ("a_log", layer.ptr("a_log")?), ("dt_bias", layer.ptr("dt_bias")?),
-            ("norm_w", layer.ptr("norm_w")?), ("w_out", layer.ptr("w_out")?),
-            ("conv_state", self.kv[index].buffer.ptr), ("state", state.buffer.ptr), ("slots", w.slots.buffer.ptr),
-            ("seq_first", w.seq_first.buffer.ptr), ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
-            &[rows])
+        let mut pointers = vec![("x", w.x.buffer.ptr), ("w_in", layer.ptr("w_in")?)];
+        let fp8 = self.fp8(layer, cap);
+        if fp8 {
+            pointers.extend([("w_in_fp8", layer.ptr("w_in_fp8")?), ("w_in_scale", layer.ptr("w_in_scale")?)]);
+        }
+        pointers.extend([("conv_w", layer.ptr("conv_w")?), ("a_log", layer.ptr("a_log")?),
+            ("dt_bias", layer.ptr("dt_bias")?), ("norm_w", layer.ptr("norm_w")?), ("w_out", layer.ptr("w_out")?)]);
+        if fp8 {
+            pointers.extend([("w_out_fp8", layer.ptr("w_out_fp8")?), ("w_out_scale", layer.ptr("w_out_scale")?)]);
+        }
+        pointers.extend([("conv_state", self.kv[index].buffer.ptr), ("state", state.buffer.ptr),
+            ("slots", w.slots.buffer.ptr), ("seq_first", w.seq_first.buffer.ptr), ("out", w.delta.buffer.ptr),
+            ("scratch", w.scratch.buffer.ptr)]);
+        let name = if fp8 { format!("qwen4_gdn_fp8_{cap}") } else { format!("qwen4_gdn_{cap}") };
+        self.run(&name, &pointers, &[rows])
     }
 
     fn full(&self, w: &Workspace<'_>, index: usize, layer: &Qwen4Layer<'_>, rows: Dsv4Scalar, cap: &str,
         tables: &StepTables) -> Result<()> {
         let cache = self.kv[index].buffer.ptr;
         let (keys, blocks) = self.index[index].as_ref().context("full attention layer without an index cache")?;
-        self.run(&format!("qwen4_attn_producer_{cap}"), &[("x", w.x.buffer.ptr), ("w_in", layer.ptr("w_in")?),
-            ("q_norm", layer.ptr("q_norm")?), ("k_norm", layer.ptr("k_norm")?), ("iq_norm", layer.ptr("iq_norm")?),
-            ("ik_norm", layer.ptr("ik_norm")?), ("positions", w.positions.buffer.ptr),
-            ("kv_slots", w.kv_slots.buffer.ptr), ("pool_slots", w.pool_slots.buffer.ptr), ("kv_cache", cache),
-            ("token_keys", keys.buffer.ptr), ("index_cache", blocks.buffer.ptr), ("query", w.query.buffer.ptr),
-            ("gate", w.gate.buffer.ptr), ("index_q", w.index_q.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
-            &[rows])?;
+        let fp8 = self.fp8(layer, cap);
+        let mut pointers = vec![("x", w.x.buffer.ptr), ("w_in", layer.ptr("w_in")?)];
+        if fp8 {
+            pointers.extend([("w_in_fp8", layer.ptr("w_in_fp8")?), ("w_in_scale", layer.ptr("w_in_scale")?)]);
+        }
+        pointers.extend([("q_norm", layer.ptr("q_norm")?), ("k_norm", layer.ptr("k_norm")?),
+            ("iq_norm", layer.ptr("iq_norm")?), ("ik_norm", layer.ptr("ik_norm")?),
+            ("positions", w.positions.buffer.ptr), ("kv_slots", w.kv_slots.buffer.ptr),
+            ("pool_slots", w.pool_slots.buffer.ptr), ("kv_cache", cache), ("token_keys", keys.buffer.ptr),
+            ("index_cache", blocks.buffer.ptr), ("query", w.query.buffer.ptr), ("gate", w.gate.buffer.ptr),
+            ("index_q", w.index_q.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
+        let name = if fp8 { format!("qwen4_attn_producer_fp8_{cap}") } else { format!("qwen4_attn_producer_{cap}") };
+        self.run(&name, &pointers, &[rows])?;
         if tables.long {
             self.run(&format!("qwen4_index_topk_{cap}"), &[("index_q", w.index_q.buffer.ptr),
                 ("positions", w.positions.buffer.ptr), ("index_cache", blocks.buffer.ptr),
@@ -883,8 +903,13 @@ impl<'a> Qwen4Engine<'a> {
             ("positions", w.positions.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
             ("indices", w.indices.buffer.ptr), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
             &[rows, Dsv4Scalar::I32(tables.page_width as i32), Dsv4Scalar::I32(tables.page_stride as i32)])?;
-        self.run(&format!("qwen4_attn_o_{cap}"), &[("attn", w.attn.buffer.ptr), ("gate", w.gate.buffer.ptr),
-            ("w_o", layer.ptr("w_o")?), ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])
+        let mut pointers = vec![("attn", w.attn.buffer.ptr), ("gate", w.gate.buffer.ptr), ("w_o", layer.ptr("w_o")?)];
+        if fp8 {
+            pointers.extend([("w_o_fp8", layer.ptr("w_o_fp8")?), ("w_o_scale", layer.ptr("w_o_scale")?)]);
+        }
+        pointers.extend([("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
+        let name = if fp8 { format!("qwen4_attn_o_fp8_{cap}") } else { format!("qwen4_attn_o_{cap}") };
+        self.run(&name, &pointers, &[rows])
     }
 
     /// Router, shared expert and routed experts; leaves `bf16(routed + shared)` in `delta`.

@@ -333,6 +333,21 @@ impl NativeLibrary {
         Ok(())
     }
 
+    /// BF16 `w` [rows, cols] -> E4M3 `q` [rows, cols] with FP32 128x128 block
+    /// `scale` [ceil(rows/128), ceil(cols/128)] (amax / 448 per block), the
+    /// inverse of [`Self::fp8_block_dequant`].
+    ///
+    /// # Safety
+    /// Every pointer is live device memory of its shape on the stream's device.
+    pub unsafe fn fp8_block_quant(&self, w: *const c_void, q: *mut c_void, scale: *mut c_void, rows: usize,
+        cols: usize, stream: *mut c_void) -> Result<()> {
+        type Quant = unsafe extern "C" fn(*const c_void, *mut c_void, *mut c_void, i32, i32, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Quant>(b"cuteafd_fp8_block_quant") }?;
+        let status = unsafe { f(w, q, scale, i32::try_from(rows)?, i32::try_from(cols)?, stream) };
+        ensure!(status == 0, "FP8 block quantization failed with {status}");
+        Ok(())
+    }
+
     /// Mean over the four mHC copies of `rows` stream rows [rows, 4, hidden]
     /// into columns `offset..offset + hidden` of `out` [rows, stride], BF16.
     ///

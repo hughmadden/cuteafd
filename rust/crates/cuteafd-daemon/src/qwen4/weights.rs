@@ -52,6 +52,10 @@ pub(crate) struct Qwen4Weights<'a> {
 pub(crate) struct Qwen4Loader<'a> {
     pub library: &'a NativeLibrary,
     pub checkpoint: &'a Checkpoint,
+    /// Also keep E4M3 copies (FP32 128x128 block scales) of the large GDN and
+    /// attention projections for the decode programs (`*_fp8_m64`).
+    pub fp8_decode: bool,
+    pub stream: *mut c_void,
 }
 
 fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
@@ -157,6 +161,7 @@ impl<'a> Qwen4Loader<'a> {
             }
             Qwen4Attention::Full => {
                 let a = |name: &str| format!("{p}.self_attn.{name}");
+                // (E4M3 copies of w_in / w_o are added below.)
                 ops.insert("w_in", self.rows(&[a("q_proj.weight"), a("k_proj.weight"), a("v_proj.weight"),
                     a("indexer.index_qk_proj.weight")], 0)?);
                 ops.insert("q_norm", self.one(&a("q_norm.weight"))?);
@@ -180,6 +185,36 @@ impl<'a> Qwen4Loader<'a> {
             ops.insert("ple.norm_query", self.one(&e("norm_query.weight"))?);
             ops.insert("ple.norm_conv", self.one(&e("norm_conv.weight"))?);
             ops.insert("ple.conv_w", self.f32(&e("conv1d.weight"))?);
+        }
+        if self.fp8_decode {
+            let (first, second): (&'static str, &'static str) = match attention {
+                Qwen4Attention::Gdn => ("w_in", "w_out"),
+                Qwen4Attention::Full => ("w_in", "w_o"),
+            };
+            for name in [first, second] {
+                let (rows, cols) = match (attention, name) {
+                    (Qwen4Attention::Gdn, "w_in") => (cfg.gdn_conv_width() + cfg.gdn_value_width() + 2 * cfg.gdn_value_heads, cfg.hidden),
+                    (Qwen4Attention::Gdn, _) => (cfg.hidden, cfg.gdn_value_width()),
+                    (Qwen4Attention::Full, "w_in") => (cfg.attn_in_width(), cfg.hidden),
+                    (Qwen4Attention::Full, _) => (cfg.hidden, cfg.heads * cfg.head_dim),
+                };
+                let weight = ops.get(name).context("projection to quantize")?.buffer.ptr;
+                let q = DeviceAllocation::new(self.library, rows * cols)?;
+                let scale = DeviceAllocation::new(self.library, rows.div_ceil(128) * cols.div_ceil(128) * 4)?;
+                // SAFETY: the BF16 weight, the E4M3 copy and the scales are live device
+                // buffers of these shapes; the stream drains before they are used.
+                unsafe {
+                    self.library.fp8_block_quant(weight, q.buffer.ptr, scale.buffer.ptr, rows, cols, self.stream)?;
+                    self.library.cuda_stream_synchronize(self.stream)?;
+                }
+                let (fp8, scales): (&'static str, &'static str) = match name {
+                    "w_in" => ("w_in_fp8", "w_in_scale"),
+                    "w_out" => ("w_out_fp8", "w_out_scale"),
+                    _ => ("w_o_fp8", "w_o_scale"),
+                };
+                ops.insert(fp8, q);
+                ops.insert(scales, scale);
+            }
         }
         Ok(Qwen4Layer { attention, operands: ops })
     }

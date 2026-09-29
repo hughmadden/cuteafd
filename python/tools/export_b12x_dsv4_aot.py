@@ -231,6 +231,16 @@ def qwen4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
              lambda r=rows: attn.compile_qwen4_sparse_gqa_aot(g, max_rows=r)),
             (f"attn_o_m{rows}", "attn_o", {"max_rows": rows}, lambda r=rows: attn.compile_qwen4_attn_o_aot(g, max_rows=r)),
         ]
+    # Decode programs over E4M3 copies of the large projections (<= 16 live rows).
+    rows = decode_rows
+    out += [
+        (f"gdn_fp8_m{rows}", "gdn", {"max_rows": rows, "fp8": True},
+         lambda: qwen4_gdn.compile_qwen4_gdn_aot(g, max_rows=rows, fp8=True)),
+        (f"attn_producer_fp8_m{rows}", "attn_producer", {"max_rows": rows, "fp8": True},
+         lambda: attn.compile_qwen4_attn_producer_aot(g, max_rows=rows, fp8=True)),
+        (f"attn_o_fp8_m{rows}", "attn_o", {"max_rows": rows, "fp8": True},
+         lambda: attn.compile_qwen4_attn_o_aot(g, max_rows=rows, fp8=True)),
+    ]
     return out
 
 

@@ -41,6 +41,10 @@ pub(crate) struct EngineArgs {
     pub slots: usize,
     #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
+    /// Decode steps of <= 16 rows read E4M3 copies (FP32 128x128 block scales,
+    /// quantized at load) of the GDN and attention in/out projections.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub fp8_decode: bool,
     /// Where the PLE n-gram table lives.
     #[arg(long, value_enum, default_value_t = ple::PlePlacement::Host)]
     pub ple: ple::PlePlacement,
@@ -157,7 +161,8 @@ impl Opened {
         let stream = self.library.cuda_stream_create()?;
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
-        let loader = weights::Qwen4Loader { library: &self.library, checkpoint: &self.checkpoint };
+        let loader = weights::Qwen4Loader { library: &self.library, checkpoint: &self.checkpoint,
+            fp8_decode: args.fp8_decode, stream };
         let model = loader.model(&self.cfg, layers)?;
         let resident: usize = model.layers.iter().map(weights::Qwen4Layer::bytes).sum();
         tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64,
