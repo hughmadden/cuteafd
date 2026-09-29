@@ -10,8 +10,6 @@ use super::engine::{GlmEngine, GlmPlacement, PageAllocator, DECODE_ROWS};
 
 /// Most copy-window draft tokens verified per sequence and step.
 const COPY_DRAFT: usize = 7;
-/// Drafting steps before a plain step re-prices a concurrency.
-const PLAIN_PROBE_STEPS: usize = 256;
 /// Longest run of steps without a draft step after plans that verified none.
 const MAX_DRAFT_SKIP: usize = 8;
 use super::{embed_rows, open, Opened};
@@ -129,6 +127,8 @@ struct Active<'a> {
     /// DFlash2 ring slot and draft outcomes (None without a drafter slot).
     slot: Option<usize>,
     drafts: DraftHistory,
+    /// Hash of `history` (identical sequences share it).
+    digest: u64,
     /// Steps, DFlash2 drafts verified and accepted, copy drafts verified and accepted.
     counts: [usize; 5],
     constraint: Option<crate::v41_native_serve::constraints::State<'a>>,
@@ -164,6 +164,7 @@ impl Active<'_> {
     /// true when the request is finished.
     fn emit(&mut self, token: u32) -> Result<bool> {
         self.history.push(token);
+        self.digest = digest(self.digest, token);
         self.generated += 1;
         self.buffered += 1;
         let stop = self.job.stop_token_ids.contains(&token);
@@ -191,6 +192,12 @@ impl Active<'_> {
         self.send(InferenceChunk::Finish { finish_reason: finish })?;
         Ok(true)
     }
+}
+
+const DIGEST_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+
+fn digest(state: u64, token: u32) -> u64 {
+    (state ^ u64::from(token)).wrapping_mul(0x0100_0000_01b3)
 }
 
 /// Longest n-gram (from 8 down to 4 tokens) that ends the history and occurred
@@ -222,8 +229,6 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
     let mut cost = StepCost::new(&dflash_policy::K4_TP4_STEP_MS, DECODE_ROWS);
-    // Steps since each concurrency last ran a plain step (one row per sequence).
-    let mut plain_age = vec![0usize; DECODE_ROWS + 1];
     // After plans that verify no drafts, skip drafting for a while (doubling
     // up to MAX_DRAFT_SKIP steps): the draft step costs a verified row's worth.
     let (mut skip, mut skip_next) = (0usize, 1usize);
@@ -289,6 +294,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 tracing::debug!(tokens = tokens.len(), elapsed_ms = started.elapsed().as_millis() as u64, "prefill");
                 let mut request = Active {
                     history: tokens.clone(),
+                    digest: tokens.iter().fold(DIGEST_SEED, |d, &t| digest(d, t)),
                     draft_limit: policy.copy,
                     draft_pause: 0,
                     slot,
@@ -351,34 +357,43 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             }
             _ => vec![None; active.len()],
         };
-        // With several sequences, a plain step now and then prices what not
-        // drafting costs (sequences that route alike share expert reads).
-        let concurrency = active.len();
-        plain_age[concurrency] += 1;
-        let probe = drafter.is_some() && policy.fixed.is_none() && concurrency > 1
-            && (cost.plain_unseen(concurrency) || plain_age[concurrency] > PLAIN_PROBE_STEPS);
+        // Identical sequences (same tokens at the same position) route alike
+        // and draft alike: the policy prices and plans them as one group.
+        let key = |a: &Active<'_>| (a.placement.len, a.digest);
         let planned: Vec<usize> = {
             let indices: Vec<usize> = (0..active.len()).filter(|&i| drafted[i].is_some()).collect();
             let mut counts = vec![0; active.len()];
-            if probe {
-            } else if let Some(fixed) = policy.fixed {
+            if let Some(fixed) = policy.fixed {
                 for &i in &indices {
                     counts[i] = fixed.min(limits[i]).min(drafted[i].as_ref().map_or(0, |d| d.tokens.len()));
                 }
             } else if !indices.is_empty() {
-                let histories: Vec<&DraftHistory> = indices.iter().map(|&i| &active[i].drafts).collect();
-                let confidence: Vec<Vec<f64>> = indices.iter()
-                    .map(|&i| active[i].drafts.confidence(&drafted[i].as_ref().unwrap().features)).collect();
-                let caps: Vec<usize> = indices.iter().map(|&i| limits[i]).collect();
-                for (&i, n) in indices.iter().zip(dflash_policy::plan(&histories, &confidence, &caps, concurrency, &cost)) {
-                    counts[i] = n;
+                let mut members: Vec<Vec<usize>> = Vec::new();
+                for &i in &indices {
+                    match members.iter_mut().find(|m| key(&active[m[0]]) == key(&active[i])) {
+                        Some(group) => group.push(i),
+                        None => members.push(vec![i]),
+                    }
+                }
+                let groups: Vec<dflash_policy::Group<'_>> = members.iter().map(|m| dflash_policy::Group {
+                    history: &active[m[0]].drafts,
+                    confidence: active[m[0]].drafts.confidence(&drafted[m[0]].as_ref().unwrap().features),
+                    room: m.iter().map(|&i| limits[i]).min().unwrap_or(0),
+                    members: m.len(),
+                }).collect();
+                let others: Vec<_> = (0..active.len()).filter(|i| drafted[*i].is_none()).map(|i| key(&active[i])).collect();
+                let distinct = others.iter().collect::<std::collections::HashSet<_>>().len();
+                for (m, n) in members.iter().zip(dflash_policy::plan(&groups, (others.len(), distinct), &cost)) {
+                    for &i in m {
+                        counts[i] = n;
+                    }
                 }
             }
             counts
         };
         if skip > 0 {
             skip -= 1;
-        } else if drafted.iter().any(Option::is_some) && !probe && policy.fixed.is_none() {
+        } else if drafted.iter().any(Option::is_some) && policy.fixed.is_none() {
             if planned.iter().all(|&n| n == 0) {
                 skip = skip_next;
                 skip_next = (skip_next * 2).min(MAX_DRAFT_SKIP);
@@ -399,7 +414,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             let dflash: &[u32] = drafted[i].as_ref().map_or(&[], |d| &d.tokens[..planned[i]]);
             let full: &[u32] = drafted[i].as_ref().map_or(&[], |d| &d.tokens);
             // `emit` already appended `next` to the history.
-            let copy = if probe { Vec::new() } else { copy_drafts(&a.history, limits[i].min(a.draft_limit)) };
+            let copy = copy_drafts(&a.history, limits[i].min(a.draft_limit));
             let agrees = copy.iter().zip(full).take_while(|(c, d)| c == d).count() >= dflash.len();
             let draft = if copy.len() > dflash.len() && agrees {
                 used_copy[i] = true;
@@ -410,6 +425,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             std::iter::once(a.next).chain(draft).collect()
         }).collect();
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
+        let distinct_rows: usize = active.iter().zip(&sequences).map(|(a, rows)| (key(a), rows))
+            .collect::<std::collections::HashSet<_>>().iter().map(|(_, rows)| rows.len()).sum();
         let tokens: Vec<u32> = sequences.iter().flatten().copied().collect();
         let embed = embed_rows(&opened.catalog, &tokens, hidden)?;
         let mut rows: Vec<(&mut GlmPlacement, usize)> = active.iter_mut().zip(&sequences)
@@ -429,10 +446,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 continue;
             }
         };
-        cost.observe(concurrency, tokens.len(), timer.elapsed().as_secs_f64() * 1e3);
-        if tokens.len() == concurrency {
-            plain_age[concurrency] = 0;
-        }
+        cost.observe(tokens.len(), distinct_rows, timer.elapsed().as_secs_f64() * 1e3);
         let mut offset = 0;
         let mut context = Vec::new();
         let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(starts).enumerate()

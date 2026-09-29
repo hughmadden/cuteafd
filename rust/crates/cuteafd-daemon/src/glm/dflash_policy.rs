@@ -95,18 +95,21 @@ impl DraftHistory {
     }
 }
 
-/// Cycle milliseconds by sequences and total verify rows: the verify step
-/// plus the draft step. Each (sequences, rows) cell starts from the measured
-/// single-sequence cost of that many rows (linear between points,
-/// extrapolated from the last two) and follows what serving observes, since
-/// sequences that route alike (the same prompt) share Spark expert reads.
+/// Cycle milliseconds of a verify step plus the draft step. Rows of
+/// identical sequences (same tokens at the same position) route alike and
+/// share their Spark expert reads, so a step costs the measured
+/// single-sequence cost of its distinct rows plus `DUPLICATE_ROW_MS` per
+/// duplicate row, scaled by a ratio that tracks what serving observes.
 #[derive(Debug, Clone)]
 pub(crate) struct StepCost {
     prior: Vec<f64>,
-    /// [sequences][rows] observed ms (NaN until seen).
-    seen: Vec<Vec<f64>>,
+    ratio: f64,
     draft_ms: f64,
 }
+
+/// Coordinator-side cost of a row whose routes another row already reads
+/// (4 identical sequences: 46 ms plain vs 35.6 ms for one).
+const DUPLICATE_ROW_MS: f64 = 3.5;
 
 impl StepCost {
     /// `points` are (rows, ms) with increasing rows, the first at one row.
@@ -117,24 +120,17 @@ impl StepCost {
             let ((r0, m0), (r1, m1)) = (points[upper - 1], points[upper]);
             m0 + (m1 - m0) * (rows as f64 - r0 as f64) / (r1 as f64 - r0 as f64)
         }).collect();
-        Self { prior, seen: vec![vec![f64::NAN; max_rows + 1]; max_rows + 1], draft_ms: 5.0 }
+        Self { prior, ratio: 1.0, draft_ms: 5.0 }
     }
 
-    /// Verify-step ms of `rows` rows over `sequences` sequences.
-    pub fn verify_ms(&self, sequences: usize, rows: usize) -> f64 {
-        let rows = rows.min(self.prior.len() - 1);
-        let seen = self.seen.get(sequences).map_or(f64::NAN, |r| r[rows]);
-        if seen.is_nan() { self.prior[rows] } else { seen }.max(1.0)
+    fn model(&self, rows: usize, distinct: usize) -> f64 {
+        let distinct = distinct.clamp(1, rows.max(1));
+        self.prior[distinct.min(self.prior.len() - 1)] + DUPLICATE_ROW_MS * (rows - distinct) as f64
     }
 
-    /// Cycle ms (draft + verify).
-    pub fn ms(&self, sequences: usize, rows: usize) -> f64 {
-        self.verify_ms(sequences, rows) + self.draft_ms
-    }
-
-    /// Whether plain steps (one row per sequence) at this concurrency are still unobserved.
-    pub fn plain_unseen(&self, sequences: usize) -> bool {
-        self.seen.get(sequences).is_some_and(|r| r[sequences.min(r.len() - 1)].is_nan())
+    /// Cycle ms (draft + verify) of `rows` rows, `distinct` of them distinct.
+    pub fn ms(&self, rows: usize, distinct: usize) -> f64 {
+        self.ratio * self.model(rows, distinct) + self.draft_ms
     }
 
     /// Folds one observed draft-step time in.
@@ -144,15 +140,12 @@ impl StepCost {
         }
     }
 
-    /// Folds one observed verify-step time into its cell.
-    pub fn observe(&mut self, sequences: usize, rows: usize, ms: f64) {
-        let prior = self.verify_ms(sequences, rows);
-        let Some(cell) = self.seen.get_mut(sequences).and_then(|r| r.get_mut(rows)) else { return };
-        if !ms.is_finite() || ms <= 0.0 {
-            return;
+    /// Folds one observed verify-step time in.
+    pub fn observe(&mut self, rows: usize, distinct: usize, ms: f64) {
+        if ms.is_finite() && ms > 0.0 {
+            let ratio = (ms / self.model(rows, distinct)).clamp(0.5, 2.0);
+            self.ratio += 0.1 * (ratio - self.ratio);
         }
-        let ms = ms.clamp(0.25 * prior, 4.0 * prior);
-        *cell = if cell.is_nan() { ms } else { *cell + 0.2 * (ms - *cell) };
     }
 }
 
@@ -161,38 +154,53 @@ pub(crate) const K4_TP4_STEP_MS: [(usize, f64); 15] = [(1, 35.6), (2, 50.5), (3,
     (6, 93.1), (7, 102.2), (8, 111.8), (10, 128.1), (12, 146.7), (16, 173.6), (24, 220.8), (32, 260.2), (48, 342.5),
     (64, 402.8)];
 
-/// Draft counts per sequence maximizing expected committed tokens per
-/// millisecond; `confidence[s]` are sequence s's conditional rates (its most
-/// drafts), `minimum[s]` drafts it must verify.
-/// `base_rows` counts the step's rows outside `confidence` (sequences that
-/// do not draft); `cost(rows)` is a cycle's ms.
-pub(crate) fn schedule(confidence: &[Vec<f64>], minimum: &[usize], base_rows: usize, cost: impl Fn(usize) -> f64)
-    -> (Vec<usize>, f64) {
+/// Sequences that draft together: identical ones (same tokens, same
+/// position) form one group of `members`, with one draft between them.
+pub(crate) struct Group<'h> {
+    pub history: &'h DraftHistory,
+    /// Conditional acceptance per draft position.
+    pub confidence: Vec<f64>,
+    /// Most drafts the group may verify.
+    pub room: usize,
+    pub members: usize,
+}
+
+/// Draft counts per group maximizing expected committed tokens per
+/// millisecond. `minimum[g]` drafts are mandatory; `base` is the (rows,
+/// distinct rows) of sequences that do not draft; `cost(rows, distinct)` a
+/// cycle's ms. Positions are admitted in order of survival probability.
+pub(crate) fn schedule(groups: &[Group<'_>], minimum: &[usize], base: (usize, usize),
+    cost: impl Fn(usize, usize) -> f64) -> (Vec<usize>, f64) {
     let mut lengths = minimum.to_vec();
-    let mut rows = base_rows + confidence.len() + minimum.iter().sum::<usize>();
-    let mut expected = confidence.len() as f64;
+    let (mut rows, mut distinct) = base;
+    let mut expected = base.0 as f64;
     let mut candidates = Vec::new();
-    for (s, rates) in confidence.iter().enumerate() {
+    for (g, group) in groups.iter().enumerate() {
+        let rates = &group.confidence[..group.confidence.len().min(group.room)];
+        rows += group.members * (1 + minimum[g]);
+        distinct += 1 + minimum[g];
+        expected += group.members as f64;
         let mut survival = 1.0;
         for (position, &rate) in rates.iter().enumerate() {
             survival *= rate.clamp(0.0, 1.0);
-            if position < minimum[s] {
-                expected += survival;
+            if position < minimum[g] {
+                expected += group.members as f64 * survival;
             } else if survival > 0.0 {
-                candidates.push((survival, position + 1, s));
+                candidates.push((survival, position + 1, g));
             }
         }
     }
     candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-    let mut best = (lengths.clone(), expected / cost(rows));
-    for (survival, length, s) in candidates {
-        if length != lengths[s] + 1 {
+    let mut best = (lengths.clone(), expected / cost(rows, distinct));
+    for (survival, length, g) in candidates {
+        if length != lengths[g] + 1 {
             continue;
         }
-        lengths[s] = length;
-        rows += 1;
-        expected += survival;
-        let rate = expected / cost(rows);
+        lengths[g] = length;
+        rows += groups[g].members;
+        distinct += 1;
+        expected += groups[g].members as f64 * survival;
+        let rate = expected / cost(rows, distinct);
         if rate > best.1 {
             best = (lengths.clone(), rate);
         }
@@ -200,20 +208,16 @@ pub(crate) fn schedule(confidence: &[Vec<f64>], minimum: &[usize], base_rows: us
     best
 }
 
-/// The draft count of every sequence: cold sequences verify
-/// `START_DRAFTS`; a lone warm sequence keeps them unless the schedule is 2%
-/// better. `room[s]` caps sequence s.
-pub(crate) fn plan(histories: &[&DraftHistory], confidence: &[Vec<f64>], room: &[usize], sequences: usize,
-    cost: &StepCost) -> Vec<usize> {
-    let base = sequences - histories.len();
-    let cost = |rows: usize| cost.ms(sequences, rows);
-    let rates: Vec<Vec<f64>> = confidence.iter().zip(room).map(|(c, &r)| c[..c.len().min(r)].to_vec()).collect();
-    let minimum: Vec<usize> = histories.iter().zip(&rates)
-        .map(|(h, r)| if h.cold() { START_DRAFTS.min(r.len()) } else { 0 }).collect();
-    let (lengths, rate) = schedule(&rates, &minimum, base, cost);
-    if histories.len() == 1 && !histories[0].cold() {
-        let reference = [START_DRAFTS.min(rates[0].len())];
-        let (fixed, fixed_rate) = schedule(&rates, &reference, base, cost);
+/// The draft count of every group: cold groups verify `START_DRAFTS`; a
+/// lone warm sequence keeps them unless the schedule is 2% better.
+pub(crate) fn plan(groups: &[Group<'_>], base: (usize, usize), cost: &StepCost) -> Vec<usize> {
+    let cost = |rows: usize, distinct: usize| cost.ms(rows, distinct);
+    let minimum: Vec<usize> = groups.iter()
+        .map(|g| if g.history.cold() { START_DRAFTS.min(g.room).min(g.confidence.len()) } else { 0 }).collect();
+    let (lengths, rate) = schedule(groups, &minimum, base, cost);
+    if groups.len() == 1 && groups[0].members == 1 && base.0 == 0 && !groups[0].history.cold() {
+        let reference = [START_DRAFTS.min(groups[0].room).min(groups[0].confidence.len())];
+        let (fixed, fixed_rate) = schedule(groups, &reference, base, cost);
         if lengths[0] != reference[0] && rate < fixed_rate * REFERENCE_MARGIN {
             return vec![fixed[0].min(reference[0])];
         }
@@ -248,16 +252,19 @@ mod tests {
         assert_eq!(rates, vec![4.0 / 5.0, 4.0 / 5.0, 3.0 / 5.0, 0.75, 0.75]);
     }
 
+    fn group<'h>(history: &'h DraftHistory, rate: f64, members: usize) -> Group<'h> {
+        Group { history, confidence: vec![rate; 7], room: 7, members }
+    }
+
     #[test]
     fn schedule_stops_where_throughput_peaks() {
         let cost = StepCost::new(&K4_TP4_STEP_MS, 64);
-        let sure = vec![vec![0.99; 7]];
-        let c1 = |rows| cost.ms(1, rows);
-        assert_eq!(schedule(&sure, &[0], 0, c1).0, vec![7]);
-        let unsure = vec![vec![0.2; 7]];
-        assert_eq!(schedule(&unsure, &[0], 0, c1).0, vec![0]);
+        let c = |rows, distinct| cost.ms(rows, distinct);
+        let history = DraftHistory::default();
+        assert_eq!(schedule(&[group(&history, 0.99, 1)], &[0], (0, 0), c).0, vec![7]);
+        assert_eq!(schedule(&[group(&history, 0.2, 1)], &[0], (0, 0), c).0, vec![0]);
         // The better sequence gets rows first.
-        let (lengths, _) = schedule(&[vec![0.95; 7], vec![0.3; 7]], &[0, 0], 0, |rows| cost.ms(2, rows));
+        let (lengths, _) = schedule(&[group(&history, 0.95, 1), group(&history, 0.3, 1)], &[0, 0], (0, 0), c);
         assert!(lengths[0] > lengths[1]);
     }
 
@@ -265,19 +272,21 @@ mod tests {
     fn cold_sequences_verify_five() {
         let cost = StepCost::new(&K4_TP4_STEP_MS, 64);
         let history = DraftHistory::default();
-        assert_eq!(plan(&[&history], &[vec![0.1; 7]], &[7], 1, &cost), vec![5]);
-        assert_eq!(plan(&[&history], &[vec![0.1; 7]], &[3], 1, &cost), vec![3]);
+        assert_eq!(plan(&[group(&history, 0.1, 1)], (0, 0), &cost), vec![5]);
+        let narrow = Group { room: 3, ..group(&history, 0.1, 1) };
+        assert_eq!(plan(&[narrow], (0, 0), &cost), vec![3]);
     }
 
     #[test]
-    fn cheap_observed_plain_steps_stop_drafting() {
-        let mut cost = StepCost::new(&K4_TP4_STEP_MS, 64);
-        let (warm, rates) = (DraftHistory { outcomes: [(3, 2); 8].into() }, vec![vec![0.7; 7]; 4]);
-        let histories = [&warm; 4];
-        assert!(plan(&histories, &rates, &[7; 4], 4, &cost).iter().sum::<usize>() > 0);
-        assert!(cost.plain_unseen(4));
-        cost.observe(4, 4, 40.0);
-        assert!(!cost.plain_unseen(4));
-        assert_eq!(plan(&histories, &rates, &[7; 4], 4, &cost), vec![0; 4]);
+    fn identical_sequences_share_their_rows() {
+        let cost = StepCost::new(&K4_TP4_STEP_MS, 64);
+        let warm = DraftHistory { outcomes: [(3, 2); 8].into() };
+        // Four identical sequences price a plain step near 46 ms, not 74.
+        let distinct: usize = plan(&[group(&warm, 0.6, 1), group(&warm, 0.6, 1), group(&warm, 0.6, 1),
+            group(&warm, 0.6, 1)], (0, 0), &cost).iter().sum::<usize>();
+        let shared = plan(&[group(&warm, 0.6, 4)], (0, 0), &cost)[0] * 4;
+        assert!(distinct > 0 && shared <= distinct, "{distinct} {shared}");
+        assert!((cost.ms(4, 1) - cost.ms(1, 1) - 3.0 * DUPLICATE_ROW_MS).abs() < 1e-9);
+        assert!(cost.ms(4, 4) > cost.ms(4, 1) + 20.0);
     }
 }
