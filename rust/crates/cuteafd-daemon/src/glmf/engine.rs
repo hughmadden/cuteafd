@@ -290,7 +290,13 @@ pub(crate) struct GlmfEngine<'a> {
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     experts: Option<Experts<'a>>,
     /// Host seconds: GPU wait before expert exchanges, the exchanges.
-    pub profile: RefCell<[f64; 2]>,
+    /// Host seconds per phase: GPU work until each expert exchange (waiting
+    /// for the routes and wire rows), the Spark exchanges, and the head (final
+    /// norm, vocabulary projection, logits download).
+    pub profile: RefCell<[f64; 3]>,
+    /// Prefill steps keep every row's logits (golden scoring); otherwise the
+    /// prefill workspace holds logits for at most `DECODE_ROWS` rows.
+    pub full_prefill_logits: bool,
     /// Captured decode segments (CUTEAFD_GLMF_GRAPHS=0 runs decode eagerly).
     graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
     use_graphs: bool,
@@ -354,8 +360,9 @@ impl<'a> GlmfEngine<'a> {
         let pool_logical = zeroed(pool_pages * 4)?;
         Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, slots, kv, state, index,
             pool_logical, pool_pages, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
-            experts: None, profile: RefCell::new([0.0; 2]), graphs: RefCell::new(std::collections::HashMap::new()),
-            use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0") })
+            experts: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(std::collections::HashMap::new()),
+            use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
+            full_prefill_logits: false })
     }
 
     /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
@@ -492,7 +499,8 @@ impl<'a> GlmfEngine<'a> {
                 self.library.cuda_zero_bytes(zero.buffer, zero.buffer.bytes)?;
                 zero
             },
-            logits: self.alloc(t * self.cfg.vocab_size * 4)?,
+            logits: self.alloc(if decode || self.full_prefill_logits { t } else { t.min(DECODE_ROWS) }
+                * self.cfg.vocab_size * 4)?,
             router_logits: self.alloc(t * self.cfg.experts * 4)?,
             route_ids: self.alloc(t * topk * 4)?,
             route_weights: self.alloc(t * topk * 4)?,
@@ -613,6 +621,8 @@ impl<'a> GlmfEngine<'a> {
         let workspace = slot.borrow();
         let w = workspace.as_ref().context("workspace")?;
         ensure!(t <= w.rows && logit_rows <= t, "step exceeds the workspace");
+        ensure!(tables.decode || self.full_prefill_logits || logit_rows <= DECODE_ROWS,
+            "prefill logits past {DECODE_ROWS} rows need full_prefill_logits");
         self.put(&w.positions, &tables.positions)?;
         self.put(&w.kv_slots, &tables.kv_slots)?;
         self.put(&w.kda_slots, &tables.kda_slots)?;
@@ -682,6 +692,7 @@ impl<'a> GlmfEngine<'a> {
             unsafe { self.library.cuda_stream_synchronize(self.stream)? };
             return Ok(None);
         }
+        let timer = std::time::Instant::now();
         self.run("head", &[("streams", w.streams[cur].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
             ("out", w.x.buffer.ptr)], &[rows])?;
         // SAFETY: the head's input and operands are live buffers of these shapes.
@@ -690,6 +701,7 @@ impl<'a> GlmfEngine<'a> {
                 self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), logit_rows as u32, self.stream)?;
         }
         let logits = self.download(&w.logits, logit_rows * self.cfg.vocab_size * 4)?;
+        self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
         Ok(Some(logits.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()))
     }
 
@@ -737,6 +749,7 @@ impl<'a> GlmfEngine<'a> {
             return Ok(None);
         }
         let h = self.cfg.hidden;
+        let timer = std::time::Instant::now();
         self.run("head", &[("streams", w.streams[0].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
             ("out", w.x.buffer.ptr)], &[rows])?;
         // SAFETY: the head's input and operands are live buffers of these shapes.
@@ -745,6 +758,7 @@ impl<'a> GlmfEngine<'a> {
                 self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), logit_rows as u32, self.stream)?;
         }
         let logits = self.download(&w.logits, logit_rows * self.cfg.vocab_size * 4)?;
+        self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
         Ok(Some(logits.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()))
     }
 
@@ -979,11 +993,12 @@ impl<'a> GlmfEngine<'a> {
             pointers[rank] = w.planes[rank].buffer.ptr.cast();
         }
         // SAFETY: planes, the shared-expert plane and `delta` are live [t, h] BF16
-        // buffers ordered after the uploads.
+        // buffers ordered after the uploads. No host sync: the next exchange
+        // rewrites the pinned staging only after its own stream sync, which
+        // follows these uploads in stream order.
         unsafe {
             self.library.v41_compact_reducer()?.reduce_planes(pointers, ranks as u32, w.shared.buffer.ptr.cast(),
-                w.delta.buffer.ptr.cast(), t as u32, self.stream)?;
-            self.library.cuda_stream_synchronize(self.stream)
+                w.delta.buffer.ptr.cast(), t as u32, self.stream)
         }
     }
 }

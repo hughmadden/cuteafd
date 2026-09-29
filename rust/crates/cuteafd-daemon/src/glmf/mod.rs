@@ -56,6 +56,9 @@ pub(crate) struct EngineArgs {
     /// FP8 expert layers resident at once with --local-experts (7.25 GiB each).
     #[arg(long, default_value_t = 6)]
     pub expert_window: usize,
+    /// Keep every prefill row's logits (glmf-golden --nll; 2.5 GiB at 4096 rows).
+    #[arg(long, hide = true)]
+    pub full_prefill_logits: bool,
     /// Most EXL3 expert layers resident at once (about 3 GiB each; the free
     /// memory decides first).
     #[arg(long, default_value_t = 64)]
@@ -151,6 +154,7 @@ impl Opened {
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages, args.slots)?;
+        engine.full_prefill_logits = args.full_prefill_logits;
         if (0..layers).any(|l| !self.cfg.dense[l]) {
             if let Some(experts) = self.experts(args)? {
                 engine.set_experts(experts);
@@ -229,7 +233,8 @@ fn similarity(a: &[f32], b: &[f32]) -> (f64, f64) {
     (dot / (na.sqrt() * nb.sqrt()).max(f64::MIN_POSITIVE), diff.sqrt() / nb.sqrt().max(f64::MIN_POSITIVE))
 }
 
-pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
+pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
+    args.engine.full_prefill_logits |= args.nll;
     tokio::task::spawn_blocking(move || golden(args)).await?
 }
 
@@ -260,6 +265,7 @@ fn score(logits: &[f32], golden: &[f32], tokens: &[u32], first: usize, vocab: us
 fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_>) -> Result<()> {
     let cfg = &opened.cfg;
     let layers = engine.weights.layers.len();
+    ensure!(!args.nll || engine.full_prefill_logits, "--nll needs full prefill logits");
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
     let mut placement = engine::Allocator::new(engine.pages, engine.slots).admit(tokens.len() + args.bench_decode)?;
@@ -349,6 +355,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         }
     }
     if args.bench_prefill > 0 {
+        *engine.profile.borrow_mut() = [0.0; 3];
         let n = prefill.min(engine.prefill_rows);
         let mut allocator = engine::Allocator::new(engine.pages, engine.slots);
         let _held = allocator.admit(tokens.len() + args.bench_decode)?;
@@ -362,10 +369,14 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         }
         times.sort_by(f64::total_cmp);
         let median = times[times.len() / 2];
+        let phases = std::mem::take(&mut *engine.profile.borrow_mut());
+        println!("prefill bench phases per prefill: GPU until the expert exchange {:.1} ms, Spark exchange {:.1} ms",
+            1e3 * phases[0] / times.len() as f64, 1e3 * phases[1] / times.len() as f64);
         println!("prefill bench: {n} tokens through {layers} layers, median {:.1} ms ({:.0} tok/s), min {:.1} ms",
             1e3 * median, n as f64 / median, 1e3 * times[0]);
     }
     if args.bench_decode > 0 {
+        *engine.profile.borrow_mut() = [0.0; 3];
         let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i as u32);
         let mut token = tokens[placement.len.min(tokens.len() - 1)];
         let mut times = Vec::new();
@@ -382,10 +393,12 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         }
         times.sort_by(f64::total_cmp);
         let profile = engine.profile.borrow();
+        let steps = times.len() as f64;
         println!("decode bench: {} steps through {layers} layers, median {:.2} ms (min {:.2}, max {:.2}); \
-            expert GPU wait {:.1} ms, exchange {:.1} ms total; tokens {:?}", times.len(),
-            1e3 * times[times.len() / 2], 1e3 * times[0], 1e3 * times[times.len() - 1], 1e3 * profile[0],
-            1e3 * profile[1], &produced[..produced.len().min(16)]);
+            per step: GPU until the expert exchanges {:.2} ms, Spark exchanges {:.2} ms, head {:.2} ms; \
+            tokens {:?}", times.len(),
+            1e3 * times[times.len() / 2], 1e3 * times[0], 1e3 * times[times.len() - 1], 1e3 * profile[0] / steps,
+            1e3 * profile[1] / steps, 1e3 * profile[2] / steps, &produced[..produced.len().min(16)]);
     }
     let loads = match engine.experts() {
         Some(engine::Experts::Local(local)) => format!(", {} FP8 expert layer loads", local.loads.borrow()),
