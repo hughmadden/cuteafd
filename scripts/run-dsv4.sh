@@ -79,6 +79,8 @@ fi
 # official FP8 release (GLMF_FP8_MODEL_ID, "off" for BF16), KDA projections
 # as per-row FP8 (GLMF_KDA_FP8: row128, channel or off) and optionally an FP8
 # LM head (GLMF_FP8_HEAD=on); its MLA pools hold POOL_TOKENS tokens.
+# GLMF_FP8_PREFILL (off, or a list of mla,ffn,kda-in,kda-o / all) runs those
+# prefill projections as block-FP8 GEMMs (E4M3 activations per 128-K block).
 family_args=()
 # serve-mimo on MiMo V2.6 Pro (mimo_v2): its experts need six Spark ranks
 # (SPARK_COUNT=6, TP6 MXFP4 slices, ~93 GiB each); DFLASH=on drafts with the
@@ -99,6 +101,8 @@ if [[ $serve == serve-glmf ]]; then
   fi
   family_args+=(--kda-fp8 "$(get GLMF_KDA_FP8 row128)" --pool-tokens "$(get POOL_TOKENS 65536)")
   [[ "$(get GLMF_FP8_HEAD off)" != on ]] || family_args+=(--fp8-head)
+  fp8_prefill="$(get GLMF_FP8_PREFILL off)"
+  [[ "$fp8_prefill" == off ]] || family_args+=(--fp8-prefill "$fp8_prefill")
 fi
 # COPY_DRAFTS=off: decode without copy-window drafts (serve-glm, serve-glmf, serve-mimo, serve-qwen4).
 if [[ "$(get COPY_DRAFTS on)" == off ]]; then

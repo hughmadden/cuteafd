@@ -144,6 +144,27 @@ impl<'a> GlmfLoader<'a> {
     /// `layout`: the FP8 source checkpoint's own blocks when it stores the
     /// tensors as FP8 (block layout), else quantized from BF16.
     fn fp8(&self, names: &[String], layout: super::fp8::Layout) -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
+        let (values, scales, _) = self.fp8_host(names, layout)?;
+        Ok((self.upload(&values)?, self.upload(&scales)?))
+    }
+
+    /// Per-row FP8 copy of `names` (Row128) plus its scales K-block major
+    /// (`[K/128, N]`, the prefill GEMMs' layout): (values, row scales, K-major scales).
+    fn fp8_rows_kmajor(&self, names: &[String])
+        -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>, DeviceAllocation<'a>)> {
+        let (values, scales, cols) = self.fp8_host(names, super::fp8::Layout::Row128)?;
+        let (kb, n) = (cols / 128, values.len() / cols);
+        let mut kmajor = vec![0u8; scales.len()];
+        for row in 0..n {
+            for b in 0..kb {
+                kmajor[(b * n + row) * 4..][..4].copy_from_slice(&scales[(row * kb + b) * 4..][..4]);
+            }
+        }
+        Ok((self.upload(&values)?, self.upload(&scales)?, self.upload(&kmajor)?))
+    }
+
+    /// Host bytes of [`Self::fp8`]: E4M3 values, FP32 scales, and the column count.
+    fn fp8_host(&self, names: &[String], layout: super::fp8::Layout) -> Result<(Vec<u8>, Vec<u8>, usize)> {
         use super::fp8::{quantize, Layout};
         let source = |name: &str| -> Result<(Vec<u8>, DType, Vec<usize>)> {
             match self.fp8_source {
@@ -182,7 +203,7 @@ impl<'a> GlmfLoader<'a> {
                 other => anyhow::bail!("{name}: cannot make an FP8 {layout:?} copy of {other:?}"),
             }
         }
-        Ok((self.upload(&values)?, self.upload(&scales)?))
+        Ok((values, scales, cols.context("no FP8 rows")?))
     }
 
     fn one(&self, name: &str) -> Result<DeviceAllocation<'a>> {
@@ -260,7 +281,17 @@ impl<'a> GlmfLoader<'a> {
                     super::fp8::KdaFp8::Channel => Some(super::fp8::Layout::Channel),
                     super::fp8::KdaFp8::Row128 => Some(super::fp8::Layout::Row128),
                 };
-                if let Some(layout) = kda_layout {
+                if kda_layout == Some(super::fp8::Layout::Row128) {
+                    // Per-row copies also serve the block-FP8 prefill GEMMs (K-major scales).
+                    let (q, s, k) = self.fp8_rows_kmajor(&w_in)?;
+                    ops.insert("w_in_fp8", q);
+                    ops.insert("w_in_scale", s);
+                    ops.insert("w_in_kscale", k);
+                    let (q, s, k) = self.fp8_rows_kmajor(&[a("o_proj.weight")])?;
+                    ops.insert("w_o_fp8", q);
+                    ops.insert("w_o_scale", s);
+                    ops.insert("w_o_kscale", k);
+                } else if let Some(layout) = kda_layout {
                     let (q, s) = self.fp8(&w_in, layout)?;
                     ops.insert("w_in_fp8", q);
                     ops.insert("w_in_scale", s);

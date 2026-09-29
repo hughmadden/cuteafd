@@ -84,6 +84,17 @@ pub(crate) struct EngineArgs {
     /// memory decides first).
     #[arg(long, default_value_t = 64)]
     pub exl3_window: usize,
+    /// Prefill projections that run block-FP8 GEMMs (E4M3 activations per row
+    /// and 128-K block, FP32 scales): `mla` (q_a|kv_a, q_b, o_proj) and `ffn`
+    /// (dense and shared-expert MLPs) over the official FP8 weights (needs
+    /// --fp8-decode --fp8-snapshot), `kda-in` / `kda-o` (the KDA in-projection
+    /// and o_proj over their per-row copies; needs --kda-fp8 row128).
+    #[arg(long, value_enum, value_delimiter = ',')]
+    pub fp8_prefill: Vec<Fp8PrefillGroup>,
+    /// Profiling only: MoE layers run the router, the expert wire rows and the
+    /// shared expert; the routed experts contribute nothing.
+    #[arg(long, hide = true)]
+    pub skip_experts: bool,
     /// DFlash2 drafter snapshot (incoai/GLM-5.3-Flash-DFlash2): taps the mHC
     /// stream mean after its target layers and drafts on this GPU.
     #[arg(long)]
@@ -91,6 +102,16 @@ pub(crate) struct EngineArgs {
     /// Sequences the drafter keeps a context for and drafts for at once.
     #[arg(long, default_value_t = 8)]
     pub draft_sequences: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum Fp8PrefillGroup {
+    Mla,
+    Ffn,
+    KdaIn,
+    KdaO,
+    /// Every group.
+    All,
 }
 
 #[derive(Debug, clap::Args)]
@@ -222,6 +243,13 @@ impl Opened {
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages, args.slots)?;
         engine.full_prefill_logits = args.full_prefill_logits;
+        let group = |g: Fp8PrefillGroup| args.fp8_prefill.iter().any(|&x| x == g || x == Fp8PrefillGroup::All);
+        engine.fp8_prefill = engine::Fp8Prefill { mla: group(Fp8PrefillGroup::Mla), ffn: group(Fp8PrefillGroup::Ffn),
+            kda_bits: i32::from(group(Fp8PrefillGroup::KdaIn)) | (i32::from(group(Fp8PrefillGroup::KdaO)) << 1) };
+        ensure!(!(engine.fp8_prefill.mla || engine.fp8_prefill.ffn) || args.fp8_decode,
+            "--fp8-prefill mla/ffn reads the FP8 copies --fp8-decode loads");
+        ensure!(engine.fp8_prefill.kda_bits == 0 || args.kda_fp8 == fp8::KdaFp8::Row128,
+            "--fp8-prefill kda reads the per-row FP8 copies --kda-fp8 row128 loads");
         if let Some(snapshot) = &args.draft {
             let started = Instant::now();
             let cfg = crate::glm::dflash::DflashConfig::read(snapshot)?;
@@ -247,6 +275,9 @@ impl Opened {
     }
 
     fn experts<'s>(&'s self, args: &EngineArgs) -> Result<Option<engine::Experts<'s>>> {
+        if args.skip_experts {
+            return Ok(Some(engine::Experts::Skip));
+        }
         if let Some(tensors) = self.fp8() {
             let directory = args.fp8_package.clone()
                 .unwrap_or_else(|| crate::v41_experts::fp8::package_directory(&args.native_lib, 1));
@@ -483,6 +514,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
     }
     if args.bench_prefill > 0 {
         *engine.profile.borrow_mut() = [0.0; 3];
+        engine.op_profile()?;
         let n = args.bench_prefill_tokens.unwrap_or(prefill.min(engine.prefill_capacity()));
         let long: Vec<u8> = embed.chunks_exact(row).cycle().take(n).flatten().copied().collect();
         let mut allocator = engine::Allocator::new(engine.pages, engine.slots);
@@ -504,6 +536,17 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
             1e3 * phases[0] / times.len() as f64, 1e3 * phases[1] / times.len() as f64);
         println!("prefill bench: {n} tokens through {layers} layers, median {:.1} ms ({:.0} tok/s), min {:.1} ms",
             1e3 * median, n as f64 / median, 1e3 * times[0]);
+        let ops = engine.op_profile()?;
+        if !ops.is_empty() {
+            let runs = times.len() as f64;
+            let total: f64 = ops.iter().filter(|(k, _)| !k.starts_with("host")).map(|(_, v)| v.0).sum();
+            println!("prefill ops per prefill (GPU ms between events, {total:.1} ms total per {runs} runs):");
+            let mut rows: Vec<_> = ops.into_iter().collect();
+            rows.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
+            for (label, (ms, count)) in rows {
+                println!("  {label:44} {:9.2} ms  {:6.1}%  x{}", ms / runs, 100.0 * ms / total, count as f64 / runs);
+            }
+        }
     }
     if args.bench_decode > 0 {
         *engine.profile.borrow_mut() = [0.0; 3];

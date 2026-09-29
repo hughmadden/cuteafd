@@ -142,6 +142,18 @@ pub(crate) enum Experts<'a> {
     /// Spark ranks serving the routed experts over RoCE (one BF16 partial per
     /// rank); one transport per prefill lane (decode uses the first).
     Spark { transports: RefCell<Vec<V41Tp4Roce>>, runtime: tokio::runtime::Runtime },
+    /// Profiling only: the router, the wire rows and the shared expert run,
+    /// the routed experts contribute nothing (the coordinator's own work).
+    Skip,
+}
+
+/// Per-program GPU times (CUTEAFD_GLMF_PROFILE_OPS=1): timing events around
+/// every launch, read back by [`GlmfEngine::op_profile`].
+#[derive(Default)]
+pub(crate) struct OpTimes {
+    pending: Vec<(String, *mut c_void, *mut c_void)>,
+    pool: Vec<*mut c_void>,
+    pub totals: std::collections::BTreeMap<String, (f64, usize)>,
 }
 
 /// Host tables of one step.
@@ -339,6 +351,21 @@ pub(crate) struct GlmfEngine<'a> {
     lanes: bool,
     /// Recorded after a layer's routes and wire rows reach the host staging.
     routes_ready: *mut c_void,
+    ops: Option<RefCell<OpTimes>>,
+    /// Prefill projections that run block-FP8 GEMMs (the layers need FP8 copies).
+    pub fp8_prefill: Fp8Prefill,
+}
+
+/// Which prefill projections run block-FP8 GEMMs (E4M3 activations per row
+/// and 128-K block): the MLA projections, the dense and shared-expert MLPs
+/// (the official FP8 weights), the KDA in-projection and o_proj (per-row x
+/// 128-K copies).
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Fp8Prefill {
+    pub mla: bool,
+    pub ffn: bool,
+    /// KDA projections that run FP8 (bit 0 the in-projection, bit 1 o_proj).
+    pub kda_bits: i32,
 }
 
 /// What a captured decode segment baked in.
@@ -410,7 +437,9 @@ impl<'a> GlmfEngine<'a> {
             experts: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(std::collections::HashMap::new()),
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
             lanes: std::env::var("CUTEAFD_GLMF_PREFILL_LANES").map_or(true, |v| v != "1"),
-            full_prefill_logits: false, routes_ready: library.cuda_event_create_ordering()? })
+            full_prefill_logits: false, routes_ready: library.cuda_event_create_ordering()?,
+            ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
+            fp8_prefill: Fp8Prefill::default() })
     }
 
     /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
@@ -526,9 +555,68 @@ impl<'a> GlmfEngine<'a> {
         let names: Vec<&str> = pointers.iter().map(|(n, _)| *n).collect();
         let program = self.programs.program(&name, &names)?;
         let raw: Vec<*mut c_void> = pointers.iter().map(|(_, p)| *p).collect();
-        // SAFETY: every pointer names a live allocation sized for the rows in
-        // `scalars`; the stream orders all launches of this engine.
-        unsafe { program.launch(&raw, scalars, self.stream) }.with_context(|| format!("{name} with {scalars:?}"))
+        self.timed(&name, || {
+            // SAFETY: every pointer names a live allocation sized for the rows in
+            // `scalars`; the stream orders all launches of this engine.
+            unsafe { program.launch(&raw, scalars, self.stream) }.with_context(|| format!("{name} with {scalars:?}"))
+        })
+    }
+
+    /// Runs `body` (stream work) between two timing events when profiling ops.
+    fn timed<T>(&self, label: &str, body: impl FnOnce() -> Result<T>) -> Result<T> {
+        let Some(ops) = &self.ops else { return body() };
+        let event = |ops: &mut OpTimes| -> Result<*mut c_void> {
+            match ops.pool.pop() {
+                Some(event) => Ok(event),
+                None => self.library.cuda_event_create(),
+            }
+        };
+        let (start, end) = {
+            let mut ops = ops.borrow_mut();
+            (event(&mut ops)?, event(&mut ops)?)
+        };
+        // SAFETY: both events are live timing events; the engine owns the stream.
+        unsafe { self.library.cuda_event_record(start, self.stream)? };
+        let out = body()?;
+        // SAFETY: as above.
+        unsafe { self.library.cuda_event_record(end, self.stream)? };
+        ops.borrow_mut().pending.push((label.to_owned(), start, end));
+        Ok(out)
+    }
+
+    /// Drains the stream and returns the per-label GPU milliseconds and
+    /// launches accumulated since the last call (empty unless profiling ops).
+    pub fn op_profile(&self) -> Result<std::collections::BTreeMap<String, (f64, usize)>> {
+        let Some(ops) = &self.ops else { return Ok(Default::default()) };
+        // SAFETY: the engine owns this stream.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        self.flush_ops()?;
+        Ok(std::mem::take(&mut ops.borrow_mut().totals))
+    }
+
+    /// Adds host wall time since `since` under `label` when profiling ops.
+    fn host_op(&self, label: &str, since: std::time::Instant) {
+        if let Some(ops) = &self.ops {
+            let mut ops = ops.borrow_mut();
+            let entry = ops.totals.entry(label.to_owned()).or_default();
+            entry.0 += since.elapsed().as_secs_f64() * 1e3;
+            entry.1 += 1;
+        }
+    }
+
+    fn flush_ops(&self) -> Result<()> {
+        let Some(ops) = &self.ops else { return Ok(()) };
+        let mut ops = ops.borrow_mut();
+        let pending = std::mem::take(&mut ops.pending);
+        for (label, start, end) in pending {
+            // SAFETY: both events were recorded on the drained stream.
+            let ms = unsafe { self.library.cuda_event_elapsed_ms(start, end)? };
+            let entry = ops.totals.entry(label).or_default();
+            entry.0 += f64::from(ms);
+            entry.1 += 1;
+            ops.pool.extend([start, end]);
+        }
+        Ok(())
     }
 
     fn scratch(&self, name: &str) -> Result<usize> {
@@ -595,6 +683,33 @@ impl<'a> GlmfEngine<'a> {
             head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, t as u32,
                 self.cfg.vocab_size as u32)? },
             _head_workspace: head_workspace,
+        })
+    }
+
+    /// Streams start as four copies of the embedding: the rows go up once
+    /// (into the second stream buffer) and are copied into each stream slot on
+    /// the device.
+    fn load_streams(&self, w: &Workspace<'_>, embed: &[u8]) -> Result<()> {
+        let row = self.cfg.hidden * 2;
+        let t = embed.len() / row;
+        ensure!(embed.len() == t * row && t <= w.rows, "embedding rows exceed the workspace");
+        let host = std::time::Instant::now();
+        let staged = cuteafd_ffi::CuteafdDeviceBuffer { bytes: embed.len(), ..w.streams[1].buffer };
+        self.library.copy_h2d(staged, embed)?;
+        self.host_op("host: embedding upload", host);
+        self.timed("stream expansion", || {
+            for s in 0..HC {
+                let dst = cuteafd_ffi::CuteafdDeviceBuffer {
+                    // SAFETY: slot `s` of row 0 lies inside the [t, 4, H] stream buffer.
+                    ptr: unsafe { w.streams[0].buffer.ptr.cast::<u8>().add(s * row) }.cast(),
+                    bytes: w.streams[0].buffer.bytes - s * row,
+                    ..w.streams[0].buffer
+                };
+                // SAFETY: both buffers are live workspace buffers of at least `t` pitched
+                // rows; the upload above completed before the copies are queued.
+                unsafe { self.library.copy_device_rows_async(dst, staged, row, t, HC * row, row, self.stream)? };
+            }
+            Ok(())
         })
     }
 
@@ -775,15 +890,8 @@ impl<'a> GlmfEngine<'a> {
         self.put(&w.cache_lengths, &tables.cache_lengths)?;
         self.put(&w.page_table, &tables.page_table)?;
         self.put(&w.pool_table, &tables.pool_table)?;
-        // Streams start as four copies of the embedding.
         let row = h * 2;
-        let mut streams = vec![0u8; t * HC * row];
-        for (r, e) in embed.chunks_exact(row).enumerate() {
-            for s in 0..HC {
-                streams[(r * HC + s) * row..][..row].copy_from_slice(e);
-            }
-        }
-        self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: streams.len(), ..w.streams[0].buffer }, &streams)?;
+        self.load_streams(w, embed)?;
         let rows = Dsv4Scalar::I32(t as i32);
         if self.use_graphs && tables.decode && on_layer.is_none() && forced.is_none() {
             return self.decode_graphed(w, tables, t, rows, logit_rows);
@@ -977,18 +1085,19 @@ impl<'a> GlmfEngine<'a> {
         let replay = at(&self.kda_replay, replay_bytes(self.cfg.kda_heads, 3 * d));
         let mut pointers = vec![("x", w.x.buffer.ptr), ("w_in", layer.ptr("w_in")?)];
         let decode = cap == "m64";
-        if decode {
-            pointers.extend([("w_in_fp8", layer.ptr_or("w_in_fp8", "w_in")?),
-                ("w_in_scale", layer.ptr_or("w_in_scale", "w_in")?)]);
-        }
+        // Decode programs read per-row scales [N, K/128]; prefill ones K-block major.
+        let (in_scale, o_scale) = if decode { ("w_in_scale", "w_o_scale") } else { ("w_in_kscale", "w_o_kscale") };
+        pointers.extend([("w_in_fp8", layer.ptr_or("w_in_fp8", "w_in")?), (in_scale, layer.ptr_or(in_scale, "w_in")?)]);
         pointers.extend([("w_fg", layer.ptr("w_fg")?), ("conv_w", layer.ptr("conv_w")?), ("a_log", layer.ptr("a_log")?),
             ("dt_bias", layer.ptr("dt_bias")?), ("o_norm", layer.ptr("o_norm")?), ("w_o", layer.ptr("w_o")?)]);
-        if decode {
-            pointers.extend([("w_o_fp8", layer.ptr_or("w_o_fp8", "w_o")?), ("w_o_scale", layer.ptr_or("w_o_scale", "w_o")?)]);
-        }
+        pointers.extend([("w_o_fp8", layer.ptr_or("w_o_fp8", "w_o")?), (o_scale, layer.ptr_or(o_scale, "w_o")?)]);
         pointers.extend([("conv_state", conv_state), ("state", state), ("slots", w.kda_slots.buffer.ptr),
             ("seq_first", w.seq_first.buffer.ptr), ("out", w.delta.buffer.ptr)]);
-        let mut scalars = self.fp8_scalars(rows, decode, layer.has("w_in_fp8"));
+        let mut scalars = self.fp8_scalars(rows, decode, layer.has(if decode { "w_in_fp8" } else { "w_in_kscale" }));
+        if !decode && layer.has("w_in_kscale") {
+            // Prefill fp8_rows bits: 1 the in-projection, 2 o_proj.
+            scalars[1] = Dsv4Scalar::I32(self.fp8_prefill.kda_bits);
+        }
         if decode {
             pointers.push(("replay", replay));
             scalars.push(Dsv4Scalar::I32(i32::from(spec)));
@@ -999,13 +1108,15 @@ impl<'a> GlmfEngine<'a> {
         self.run(&format!("kda_{cap}"), &pointers, &scalars)
     }
 
-    /// `[rows]`, plus the decode programs' `fp8_rows` (16 when the layer has the FP8 copy, else 0).
+    /// `[rows, fp8]`: the decode programs' `fp8_rows` (16 when the layer has
+    /// the FP8 copy, else 0), or the prefill programs' `fp8` switch (1: rows
+    /// past the skinny GEMV run the block-FP8 GEMMs).
     fn fp8_scalars(&self, rows: Dsv4Scalar, decode: bool, fp8: bool) -> Vec<Dsv4Scalar> {
-        let mut scalars = vec![rows];
-        if decode {
-            scalars.push(Dsv4Scalar::I32(if fp8 { FP8_ROWS } else { 0 }));
-        }
-        scalars
+        vec![rows, Dsv4Scalar::I32(match (fp8, decode) {
+            (false, _) => 0,
+            (true, true) => FP8_ROWS,
+            (true, false) => 1,
+        })]
     }
 
     /// SwiGLU MLP (dense layer or shared expert) of intermediate `inter` into `out`.
@@ -1013,17 +1124,14 @@ impl<'a> GlmfEngine<'a> {
         -> Result<()> {
         let decode = cap == "m64";
         let mut pointers = vec![("x", w.x.buffer.ptr), ("w_gate_up", layer.ptr("w_gate_up")?)];
-        if decode {
-            pointers.extend([("w_gate_up_fp8", layer.ptr_or("w_gate_up_fp8", "w_gate_up")?),
-                ("w_gate_up_scale", layer.ptr_or("w_gate_up_scale", "w_gate_up")?)]);
-        }
+        pointers.extend([("w_gate_up_fp8", layer.ptr_or("w_gate_up_fp8", "w_gate_up")?),
+            ("w_gate_up_scale", layer.ptr_or("w_gate_up_scale", "w_gate_up")?)]);
         pointers.push(("w_down", layer.ptr("w_down")?));
-        if decode {
-            pointers.extend([("w_down_fp8", layer.ptr_or("w_down_fp8", "w_down")?),
-                ("w_down_scale", layer.ptr_or("w_down_scale", "w_down")?)]);
-        }
+        pointers.extend([("w_down_fp8", layer.ptr_or("w_down_fp8", "w_down")?),
+            ("w_down_scale", layer.ptr_or("w_down_scale", "w_down")?)]);
         pointers.extend([("out", out), ("scratch", w.scratch.buffer.ptr)]);
-        self.run(&format!("ffn_i{inter}_{cap}"), &pointers, &self.fp8_scalars(rows, decode, layer.has("w_down_fp8")))
+        let fp8 = layer.has("w_down_fp8") && (decode || self.fp8_prefill.ffn);
+        self.run(&format!("ffn_i{inter}_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))
     }
 
     fn mla(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Dsv4Scalar, cap: &str,
@@ -1032,19 +1140,15 @@ impl<'a> GlmfEngine<'a> {
         let cache = self.kv[index].as_ref().context("MLA layer without a record pool")?.buffer.ptr;
         let (keys, pool_cache) = self.index[index].as_ref().context("MLA layer without an index cache")?;
         let decode = tables.decode;
-        let fp8 = layer.has("w_qkv_a_fp8");
+        let fp8 = layer.has("w_qkv_a_fp8") && (decode || self.fp8_prefill.mla);
         let mut pointers = vec![("x", w.x.buffer.ptr), ("kv_slots", w.kv_slots.buffer.ptr),
             ("w_qkv_a", layer.ptr("w_qkv_a")?)];
-        if decode {
-            pointers.extend([("w_qkv_a_fp8", layer.ptr_or("w_qkv_a_fp8", "w_qkv_a")?),
-                ("w_qkv_a_scale", layer.ptr_or("w_qkv_a_scale", "w_qkv_a")?)]);
-        }
+        pointers.extend([("w_qkv_a_fp8", layer.ptr_or("w_qkv_a_fp8", "w_qkv_a")?),
+            ("w_qkv_a_scale", layer.ptr_or("w_qkv_a_scale", "w_qkv_a")?)]);
         pointers.extend([("q_a_norm", layer.ptr("q_a_norm")?), ("kv_a_norm", layer.ptr("kv_a_norm")?),
             ("w_q_b", layer.ptr("w_q_b")?)]);
-        if decode {
-            pointers.extend([("w_q_b_fp8", layer.ptr_or("w_q_b_fp8", "w_q_b")?),
-                ("w_q_b_scale", layer.ptr_or("w_q_b_scale", "w_q_b")?)]);
-        }
+        pointers.extend([("w_q_b_fp8", layer.ptr_or("w_q_b_fp8", "w_q_b")?),
+            ("w_q_b_scale", layer.ptr_or("w_q_b_scale", "w_q_b")?)]);
         pointers.extend([("w_uk", layer.ptr("w_uk")?), ("kv_cache", cache), ("query", w.query.buffer.ptr),
             ("q_resid", w.q_resid.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
         self.run(&format!("mla_producer_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))?;
@@ -1067,22 +1171,22 @@ impl<'a> GlmfEngine<'a> {
             &[rows, Dsv4Scalar::I32(tables.page_stride as i32)])?;
         if !tables.decode && crate::glm::engine::native_mla_prefill() {
             let scale = (self.cfg.qk_nope_dim as f32).powf(-0.5);
-            // SAFETY: query, record cache, indices, lengths and the latent output
-            // are live buffers of the step's rows on the engine stream.
-            unsafe {
-                self.library.glm_mla_prefill(w.query.buffer.ptr, cache, w.indices.buffer.ptr, w.lengths.buffer.ptr,
-                    w.latent.buffer.ptr, tables.positions.len(), self.cfg.heads, SPARSE_TOPK, RECORD_BYTES,
-                    scale * std::f32::consts::LOG2_E, self.stream)?;
-            }
+            self.timed("glm_mla_prefill (native)", || {
+                // SAFETY: query, record cache, indices, lengths and the latent output
+                // are live buffers of the step's rows on the engine stream.
+                unsafe {
+                    self.library.glm_mla_prefill(w.query.buffer.ptr, cache, w.indices.buffer.ptr, w.lengths.buffer.ptr,
+                        w.latent.buffer.ptr, tables.positions.len(), self.cfg.heads, SPARSE_TOPK, RECORD_BYTES,
+                        scale * std::f32::consts::LOG2_E, self.stream)
+                }
+            })?;
         } else {
             self.run(&format!("sparse_mla_{mode}_{cap}"), &[("q", w.query.buffer.ptr), ("kv_cache", cache),
                 ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr), ("out", w.latent.buffer.ptr),
                 ("scratch", w.scratch.buffer.ptr)], &[rows])?;
         }
         let mut pointers = vec![("attn", w.latent.buffer.ptr), ("w_uv", layer.ptr("w_uv")?), ("w_o", layer.ptr("w_o")?)];
-        if decode {
-            pointers.extend([("w_o_fp8", layer.ptr_or("w_o_fp8", "w_o")?), ("w_o_scale", layer.ptr_or("w_o_scale", "w_o")?)]);
-        }
+        pointers.extend([("w_o_fp8", layer.ptr_or("w_o_fp8", "w_o")?), ("w_o_scale", layer.ptr_or("w_o_scale", "w_o")?)]);
         pointers.extend([("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
         self.run(&format!("o_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))
     }
@@ -1105,12 +1209,14 @@ impl<'a> GlmfEngine<'a> {
              (run --layers 3 for the dense layers alone)"))?;
         self.run("router_scores", &[("x", w.x.buffer.ptr), ("w", layer.ptr("gate")?),
             ("logits", w.router_logits.buffer.ptr)], &[rows])?;
-        // SAFETY: logits, bias and route outputs are live buffers of `t` rows.
-        unsafe {
-            self.library.router_select(w.router_logits.buffer.ptr, layer.ptr("gate.bias")?, std::ptr::null(),
-                std::ptr::null(), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t, self.cfg.experts, topk,
-                self.cfg.routed_scale as f32, true, self.stream)?;
-        }
+        self.timed("router_select", || {
+            // SAFETY: logits, bias and route outputs are live buffers of `t` rows.
+            unsafe {
+                self.library.router_select(w.router_logits.buffer.ptr, layer.ptr("gate.bias")?, std::ptr::null(),
+                    std::ptr::null(), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t, self.cfg.experts, topk,
+                    self.cfg.routed_scale as f32, true, self.stream)
+            }
+        })?;
         if !matches!(experts, Experts::Local(_)) {
             let grid = (t * h.div_ceil(256)).div_ceil(8).clamp(1, 4 * 188);
             self.run("expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
@@ -1132,6 +1238,7 @@ impl<'a> GlmfEngine<'a> {
         let experts = self.experts.as_ref().context("MoE layer without experts")?;
         let shared = || self.ffn(w, layer, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, rows);
         match experts {
+            Experts::Skip => return self.ffn(w, layer, self.cfg.moe_intermediate, cap, w.delta.buffer.ptr, rows),
             Experts::Local(local) => {
                 shared()?;
                 let resident = local.index_of(index)?;
@@ -1299,14 +1406,7 @@ impl<'a> GlmfEngine<'a> {
             self.put(&w.cache_lengths, &tables.cache_lengths)?;
             self.put(&w.page_table, &tables.page_table)?;
             self.put(&w.pool_table, &tables.pool_table)?;
-            let mut streams = vec![0u8; t * HC * row];
-            for (r, e) in embed.chunks_exact(row).enumerate() {
-                for k in 0..HC {
-                    streams[(r * HC + k) * row..][..row].copy_from_slice(e);
-                }
-            }
-            self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: streams.len(), ..w.streams[0].buffer },
-                &streams)?;
+            self.load_streams(w, embed)?;
         }
         let layers = &self.weights.layers;
         let cap = "m4096";
@@ -1421,5 +1521,12 @@ impl Drop for GlmfEngine<'_> {
     fn drop(&mut self) {
         // SAFETY: the engine's stream is drained by its owner before the engine drops.
         let _ = unsafe { self.library.cuda_event_destroy(self.routes_ready) };
+        if let Some(ops) = self.ops.take() {
+            let ops = ops.into_inner();
+            for event in ops.pool.into_iter().chain(ops.pending.into_iter().flat_map(|(_, a, b)| [a, b])) {
+                // SAFETY: as above; no launch references these events any more.
+                let _ = unsafe { self.library.cuda_event_destroy(event) };
+            }
+        }
     }
 }
