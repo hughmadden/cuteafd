@@ -1,6 +1,7 @@
 //! GLM 5.3 Flash (glm5_next) on the generic engine: weights, the coordinator
 //! programs' layer chain, and the golden comparison command.
 pub(crate) mod engine;
+pub(crate) mod serve;
 pub(crate) mod weights;
 
 use anyhow::{ensure, Result};
@@ -82,6 +83,14 @@ pub(crate) struct GoldenArgs {
     /// Score every prefill row's logits against the golden (mean NLL, top-1).
     #[arg(long)]
     pub nll: bool,
+    /// After the comparison, time this many greedy single-row decode steps
+    /// (no layer downloads) from the prefilled sequence.
+    #[arg(long, default_value_t = 0)]
+    pub bench_decode: usize,
+    /// Time this many more prefills of the golden prompt (up to --prefill-rows
+    /// tokens) on fresh sequences, without layer downloads.
+    #[arg(long, default_value_t = 0)]
+    pub bench_prefill: usize,
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -171,7 +180,8 @@ impl Opened {
             let (free, _) = self.library.cuda_memory_info()?;
             return Ok(Some(engine::Experts::LocalExl3(engine::LocalExl3 {
                 library: &self.library, native_lib: args.native_lib.clone(), catalog,
-                resident: std::cell::RefCell::new(None), window: args.exl3_window.max(1), max_rows: args.prefill_rows,
+                resident: std::cell::RefCell::new(None), window: args.exl3_window.max(1),
+                layers: args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers), max_rows: args.prefill_rows,
                 // Room for the step workspace (logits alone are 2.4 GiB at 4096 rows).
                 budget: free.saturating_sub(12 << 30), loads: std::cell::RefCell::new(0),
             })));
@@ -252,7 +262,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
     let layers = engine.weights.layers.len();
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
-    let mut placement = engine::Allocator::new(engine.pages, engine.slots).admit(tokens.len())?;
+    let mut placement = engine::Allocator::new(engine.pages, engine.slots).admit(tokens.len() + args.bench_decode)?;
     let embed = embed_rows(&opened.checkpoint, &tokens, cfg.hidden)?;
     let row = cfg.hidden * 2;
     let stream_row = row * 4;
@@ -337,6 +347,45 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
                 100.0 * next_ok as f64 / scored.max(1) as f64, 100.0 * golden_next as f64 / scored.max(1) as f64,
                 nll / scored.max(1) as f64);
         }
+    }
+    if args.bench_prefill > 0 {
+        let n = prefill.min(engine.prefill_rows);
+        let mut allocator = engine::Allocator::new(engine.pages, engine.slots);
+        let _held = allocator.admit(tokens.len() + args.bench_decode)?;
+        let mut times = Vec::new();
+        for _ in 0..args.bench_prefill {
+            let mut fresh = allocator.admit(n)?;
+            let started = Instant::now();
+            engine.prefill(&mut fresh, &embed[..n * row], None)?;
+            times.push(started.elapsed().as_secs_f64());
+            allocator.release(fresh);
+        }
+        times.sort_by(f64::total_cmp);
+        let median = times[times.len() / 2];
+        println!("prefill bench: {n} tokens through {layers} layers, median {:.1} ms ({:.0} tok/s), min {:.1} ms",
+            1e3 * median, n as f64 / median, 1e3 * times[0]);
+    }
+    if args.bench_decode > 0 {
+        let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i as u32);
+        let mut token = tokens[placement.len.min(tokens.len() - 1)];
+        let mut times = Vec::new();
+        let mut produced = Vec::new();
+        for _ in 0..args.bench_decode {
+            let started = Instant::now();
+            let row = embed_rows(&opened.checkpoint, &[token], cfg.hidden)?;
+            let logits = engine.verify(&mut [(&mut placement, 1)], &row, None)?;
+            times.push(started.elapsed().as_secs_f64());
+            if let Some(logits) = logits {
+                token = argmax(&logits);
+                produced.push(token);
+            }
+        }
+        times.sort_by(f64::total_cmp);
+        let profile = engine.profile.borrow();
+        println!("decode bench: {} steps through {layers} layers, median {:.2} ms (min {:.2}, max {:.2}); \
+            expert GPU wait {:.1} ms, exchange {:.1} ms total; tokens {:?}", times.len(),
+            1e3 * times[times.len() / 2], 1e3 * times[0], 1e3 * times[times.len() - 1], 1e3 * profile[0],
+            1e3 * profile[1], &produced[..produced.len().min(16)]);
     }
     let loads = match engine.experts() {
         Some(engine::Experts::Local(local)) => format!(", {} FP8 expert layer loads", local.loads.borrow()),

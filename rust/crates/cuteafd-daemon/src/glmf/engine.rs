@@ -85,6 +85,8 @@ pub(crate) struct LocalExl3<'a> {
     pub catalog: &'a cuteafd_loader::OfficialV41Catalog,
     pub resident: RefCell<Option<(std::ops::Range<usize>, crate::dsv4::local::LocalExperts<'a>)>>,
     pub window: usize,
+    /// Layers past the engine's last one never load.
+    pub layers: usize,
     pub max_rows: usize,
     pub budget: usize,
     pub loads: RefCell<usize>,
@@ -99,7 +101,7 @@ impl LocalExl3<'_> {
         // SAFETY: the engine owns this stream; the old window's launches drain first.
         unsafe { self.library.cuda_stream_synchronize(stream)? };
         *self.resident.borrow_mut() = None;
-        let range = layer..layer + self.window;
+        let range = layer..(layer + self.window).min(self.layers);
         let started = std::time::Instant::now();
         let local = crate::dsv4::local::LocalExperts::load_range(self.library, &self.native_lib, self.catalog, 0,
             range.clone(), self.max_rows, self.budget, stream)?
@@ -206,6 +208,15 @@ impl Allocator {
             slot,
             len: 0,
         })
+    }
+
+    /// A spare KDA state slot (a speculative verify's backup).
+    pub fn spare_slot(&mut self) -> Result<i32> {
+        self.slots.pop().context("KDA state slots exhausted")
+    }
+
+    pub fn release_slot(&mut self, slot: i32) {
+        self.slots.push(slot);
     }
 
     pub fn release(&mut self, placement: GlmfPlacement) {
@@ -346,6 +357,30 @@ impl<'a> GlmfEngine<'a> {
             self.library.copy_h2d(at, &(logical as i32).to_le_bytes())?;
         }
         self.reset_slot(placement.slot)
+    }
+
+    /// Copies a sequence's KDA recurrent and conv state from slot `from` to
+    /// slot `to` on the engine stream (the backup a speculative verify
+    /// restores before replaying its accepted rows).
+    pub fn copy_slot(&self, from: i32, to: i32) -> Result<()> {
+        let (from, to) = (usize::try_from(from)?, usize::try_from(to)?);
+        ensure!(from < self.slots && to < self.slots && from != to, "KDA slots {from} -> {to} out of range");
+        for (kv, state) in self.kv.iter().zip(&self.state) {
+            if let Some(state) = state {
+                for pool in [kv, state] {
+                    let per = pool.buffer.bytes / self.slots;
+                    let at = |slot: usize| cuteafd_ffi::CuteafdDeviceBuffer {
+                        // SAFETY: slot < slots, so the slot's bytes lie inside the pool.
+                        ptr: unsafe { pool.buffer.ptr.cast::<u8>().add(slot * per) }.cast(),
+                        bytes: per,
+                        ..pool.buffer
+                    };
+                    // SAFETY: both slot regions are live and disjoint; the stream orders the copy.
+                    unsafe { self.library.copy_d2d_async(at(to), at(from), per, self.stream)? };
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Zeroes a sequence's KDA recurrent and conv state (before its first step).
