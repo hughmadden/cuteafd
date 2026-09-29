@@ -26,6 +26,8 @@ pub(crate) enum Commands {
     GlmGolden(crate::glm::GoldenArgs),
     /// Compare the MiMo V2 coordinator programs layer by layer with python/reference/mimo_v2/golden.py outputs.
     MimoGolden(crate::mimo::GoldenArgs),
+    /// Compare the GLM 5.3 Flash coordinator programs layer by layer with python/reference/glm5_next/golden.py outputs.
+    GlmfGolden(crate::glmf::GoldenArgs),
     /// Serve a GLM 5.x checkpoint (OpenAI-compatible API) over the glm_* programs and Spark experts.
     ServeGlm(crate::glm::serve::ServeArgs),
     /// Serve a DeepSeek V4 checkpoint (OpenAI API) with Spark experts.

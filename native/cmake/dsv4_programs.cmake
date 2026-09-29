@@ -2,7 +2,8 @@
 # through the generic table in src/dsv4_programs.cc. DeepSeek V4
 # (CUTEAFD_ENABLE_DSV4_AOT, CUTEAFD_DSV4_GEOMETRY), GLM 5.x
 # (CUTEAFD_ENABLE_GLM_AOT, geometry "glm") and MiMo V2 Flash
-# (CUTEAFD_ENABLE_MIMO_AOT, geometry "mimo") share one table and manifest.
+# (CUTEAFD_ENABLE_MIMO_AOT, geometry "mimo") and GLM 5.3 Flash
+# (CUTEAFD_ENABLE_GLMF_AOT, geometry "glmf") share one table and manifest.
 if(NOT CUTEAFD_CUDA_ARCHITECTURES MATCHES "^120")
   message(FATAL_ERROR "coordinator programs require the SM120 build")
 endif()
@@ -22,6 +23,13 @@ if(CUTEAFD_ENABLE_MIMO_AOT)
     set(CUTEAFD_PROGRAM_GEOMETRY "mimo")
   else()
     set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},mimo")
+  endif()
+endif()
+if(CUTEAFD_ENABLE_GLMF_AOT)
+  if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
+    set(CUTEAFD_PROGRAM_GEOMETRY "glmf")
+  else()
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},glmf")
   endif()
 endif()
 set(CUTEAFD_DSV4_DIR "${CMAKE_CURRENT_BINARY_DIR}/dsv4_programs")

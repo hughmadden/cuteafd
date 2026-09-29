@@ -52,6 +52,7 @@ pub mod plan;
 pub mod deepseek_v4;
 pub mod fp8_experts;
 pub mod glm_dsa;
+pub mod glm_next;
 pub mod mimo_v2;
 
 pub use attention_format::{

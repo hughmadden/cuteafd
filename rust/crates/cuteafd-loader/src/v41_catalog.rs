@@ -707,6 +707,9 @@ pub fn read_official_v41_catalog(model_id: &str, snapshot: &Path) -> Result<Offi
 pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
     let config: serde_json::Value =
         crate::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
+    if config.get("model_type").and_then(serde_json::Value::as_str) == Some("glm5_next") {
+        return read_glm_dsa_expert_catalog(snapshot, &config);
+    }
     if config.get("text_config").is_some() {
         return read_official_v41_catalog(crate::OFFICIAL_V41_MODEL_ID, snapshot);
     }
@@ -722,7 +725,7 @@ pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
     }
 }
 
-/// GLM 5.x (glm_moe_dsa) routed experts. Only EXL3 publications serve from
+/// GLM 5.x (glm_moe_dsa) and GLM 5.3 Flash (glm5_next) routed experts. Only EXL3 publications serve from
 /// the Sparks today (the official FP8 experts need ~675 GiB); dense layers
 /// come first, and the MTP layer after the backbone keeps its experts on the
 /// coordinator.
