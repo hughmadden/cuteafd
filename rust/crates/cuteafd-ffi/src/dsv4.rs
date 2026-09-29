@@ -1,5 +1,7 @@
-//! DeepSeek V4 coordinator programs: the exported b12x programs behind the
-//! generic launcher in `native/src/dsv4_programs.cc`.
+//! Coordinator programs: the exported b12x programs behind the generic
+//! launcher in `native/src/dsv4_programs.cc`. DeepSeek V4 (`dsv4f_*`,
+//! `dsv4p_*`, `CUTEAFD_ENABLE_DSV4_AOT`) and GLM 5.x (`glm_*`,
+//! `CUTEAFD_ENABLE_GLM_AOT`) share the table and its manifest.
 //!
 //! Callers name each program and pass its pointers in the documented order;
 //! [`Dsv4Programs::with_manifest`] checks that order against the exporter's
@@ -75,7 +77,7 @@ impl NativeLibrary {
     /// The DeepSeek V4 programs this library was built with.
     pub fn dsv4_programs(&self) -> Result<Dsv4Programs<'_>> {
         let count = *unsafe { self.lib.get::<CountFn>(b"cuteafd_dsv4_program_count") }
-            .context("native library was built without the DeepSeek V4 programs (CUTEAFD_ENABLE_DSV4_AOT)")?;
+            .context("native library was built without coordinator programs (CUTEAFD_ENABLE_DSV4_AOT / CUTEAFD_ENABLE_GLM_AOT)")?;
         let info = unsafe { *self.lib.get::<InfoFn>(b"cuteafd_dsv4_program_info")? };
         let load = unsafe { *self.lib.get::<LoadFn>(b"cuteafd_dsv4_program_load")? };
         let launch = unsafe { *self.lib.get::<LaunchFn>(b"cuteafd_dsv4_program_launch")? };
