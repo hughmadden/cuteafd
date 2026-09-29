@@ -54,7 +54,7 @@ go in commit messages as short before → after tables with conditions.
   `CARGO_TARGET_DIR=~/.cache/cuteafd/builds/<task>/target` (no Python
   needed). Script tests: `.venv/bin/python -m pytest -q scripts/tests`
   (`uv venv --python 3.12 .venv` + pytest numpy tokenizers jsonschema pyyaml);
-  13 inherited ds41rt failures remain, add none.
+  43 inherited failures remain (work/p0 96edf07), add none.
 - `./build.sh` (release pair, ~15 min coordinator + Spark leg): set
   `CUTEAFD_RELEASE_BUILD_ROOT` and `CUTEAFD_RELEASE_REMOTE_BUILD_DIR` under
   `~/.cache/cuteafd/builds/`, and `CUTEAFD_RELEASE_SPARK_TP_ROLES=` for a
