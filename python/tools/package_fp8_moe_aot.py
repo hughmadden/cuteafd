@@ -2,11 +2,12 @@
 """Build or verify an exact FP8 routed-expert package (``fp8-<geometry>``).
 
 The checkpoint's E4M3 experts with FP32 128x128 block scales (or MXFP4
-experts, ``mimop``: packed E2M1 + UE8M0 per 32, grouped GEMV route only) run as
+experts, ``mimop``: packed E2M1 + UE8M0 per 32) run as
 ``b12x.integration.cuteafd.fp8_moe`` programs (route ``auto``: grouped GEMV
-up to 1024 live rows and the expert-stationary streaming GEMMs above on
-GB10 (spark packages, wire input); GEMV up to 2048 rows and the grouped TMA
-GEMM above for SM120 / BF16 input). A package holds one directory
+up to 1024 live rows (MXFP4 on GB10: 640) and the expert-stationary streaming
+GEMMs above on GB10 (spark packages, wire input; MXFP4 gate/up by
+block-scaled E4M3 x E2M1 MMAs); GEMV up to 2048 rows and the grouped TMA GEMM
+above for SM120 / BF16 input). A package holds one directory
 per layout, each with ``libcuteafd_fp8moe.so`` carrying one program per
 capacity, and a verified ``manifest.json``:
 

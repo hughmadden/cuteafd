@@ -76,8 +76,13 @@ pub(crate) enum Experts<'a> {
     Spark { transport: RefCell<V41Tp4Roce>, runtime: tokio::runtime::Runtime },
 }
 
-/// Most rows a decode program reads the FP8 weight copies for (MmaFp8Gemv's M tile).
+/// Most rows the FP8 LM head program takes (MmaFp8Gemv's M tile).
 pub(crate) const FP8_ROWS: i32 = 16;
+
+/// Most rows a decode program reads the E4M3 qkv / o / dense FFN copies for
+/// (sparkinfer `MIMO_FP8_ROWS`: one 16-row GEMV tile up to 16 rows, two above),
+/// so DFlash verify steps of up to 32 rows stay off the BF16 projections.
+pub(crate) const FP8_DECODE_ROWS: i32 = 32;
 
 /// Most rows of one sequence an MTP drafting pass takes (older true rows
 /// catch up in passes of their own first).
@@ -209,11 +214,11 @@ fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
 }
 
-/// `[rows]`, plus the decode programs' `fp8_rows` (16 when the layer has the FP8 copy, else 0).
+/// `[rows]`, plus the decode programs' `fp8_rows` (`FP8_DECODE_ROWS` when the layer has the FP8 copy, else 0).
 fn fp8_scalars(rows: Dsv4Scalar, decode: bool, fp8: bool) -> Vec<Dsv4Scalar> {
     let mut scalars = vec![rows];
     if decode {
-        scalars.push(Dsv4Scalar::I32(if fp8 { FP8_ROWS } else { 0 }));
+        scalars.push(Dsv4Scalar::I32(if fp8 { FP8_DECODE_ROWS } else { 0 }));
     }
     scalars
 }
