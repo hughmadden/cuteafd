@@ -421,7 +421,9 @@ def build(args: argparse.Namespace) -> None:
     import torch
 
     props = torch.cuda.get_device_properties(0)
-    expected_compute = (12, 1) if args.role == 'spark' else (12, 0)
+    # --loopback: Spark layouts compiled for this coordinator GPU, for worker
+    # tests on raptor; the manifest records compute 12.0, so no Spark takes it.
+    expected_compute = (12, 1) if args.role == 'spark' and not getattr(args, 'loopback', False) else (12, 0)
     if (props.major, props.minor) != expected_compute:
         raise ValueError(f'{args.role} package requires GPU {expected_compute}')
     if paired:
@@ -547,6 +549,8 @@ def main() -> None:
                         help='Opt-in tile override PROFILE=CAPACITIES:FC1_K,FC1_N,FC2_K,FC2_N '
                              '(CAPACITIES is all or 16+80) for a controlled A/B, for example '
                              'tp3-width768=16:64,256,64,256; default is the B12x per-capacity policy')
+    create.add_argument('--loopback', action='store_true',
+                        help='Build Spark-role layouts for the SM120 coordinator GPU (loopback worker tests)')
     create.add_argument('--capacities', default='1,16,80,256,1024,4096')
     create.add_argument('--bits', type=int, nargs='+', default=[3, 4])
     create.add_argument('--build-dir', type=Path, required=True)
