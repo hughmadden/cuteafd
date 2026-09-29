@@ -1,6 +1,7 @@
 //! GLM 5.x (glm_moe_dsa) on the generic engine: weights, the coordinator
 //! programs' layer chain, and the golden comparison command.
 pub(crate) mod dflash;
+pub(crate) mod dflash_policy;
 pub(crate) mod engine;
 pub(crate) mod serve;
 pub(crate) mod weights;

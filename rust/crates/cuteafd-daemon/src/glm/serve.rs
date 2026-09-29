@@ -1,6 +1,11 @@
 //! OpenAI-compatible API over the GLM engine: continuous batching with one
 //! prefill per admitted request and one decode-shaped step for every active
-//! sequence.
+//! sequence. With a DFlash2 drafter (--draft), every step first drafts after
+//! each sequence's next token on the GPU and verifies as many drafts as the
+//! adaptive policy (glm/dflash_policy.rs) prices worthwhile; copy-window
+//! drafts extend a DFlash2 draft they agree with.
+use super::dflash::{ContextRow, DraftSeq, TAP_ROWS};
+use super::dflash_policy::{self, DraftHistory, StepCost};
 use super::engine::{GlmEngine, GlmPlacement, PageAllocator, DECODE_ROWS};
 
 /// Most copy-window draft tokens verified per sequence and step.
@@ -35,6 +40,10 @@ pub(crate) struct ServeArgs {
     /// Decode one token per step (no copy-window drafts).
     #[arg(long)]
     pub no_copy_drafts: bool,
+    /// With --draft: verify exactly this many DFlash2 drafts per step
+    /// (within the rows) instead of the adaptive policy.
+    #[arg(long)]
+    pub draft_fixed: Option<usize>,
 }
 
 fn model_id(snapshot: &std::path::Path) -> Option<String> {
@@ -57,9 +66,9 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (engine_args, worker_stats, max_sequences) = (args.engine.clone(), stats.clone(), args.max_sequences);
-    let draft = if args.no_copy_drafts { 0 } else { COPY_DRAFT };
+    let policy = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed };
     let worker = tokio::task::spawn_blocking(move ||
-        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, draft));
+        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy));
     ready_rx.await.context("engine failed before it was ready")??;
     let router = cuteafd_api::native_v41::router_for_model(queue, limits, stats, Duration::from_secs(25),
         ConsoleHub::disabled(), profile.clone());
@@ -72,9 +81,17 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     Ok(())
 }
 
+/// Speculation settings: copy-window draft cap (0 disables) and a fixed
+/// DFlash2 draft count replacing the adaptive policy.
+#[derive(Debug, Clone, Copy)]
+struct Policy {
+    copy: usize,
+    fixed: Option<usize>,
+}
+
 fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: tokio::sync::oneshot::Sender<Result<()>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
-    draft: usize) -> Result<()> {
+    policy: Policy) -> Result<()> {
     let opened = match open(&args) {
         Ok(opened) => opened,
         Err(error) => {
@@ -88,7 +105,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(()));
         }
-        schedule(engine, &opened, &mut receive, transport, runtime, &stats, max_sequences.min(DECODE_ROWS), draft)
+        schedule(engine, &opened, &mut receive, transport, runtime, &stats, max_sequences.min(DECODE_ROWS), policy)
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
@@ -105,6 +122,11 @@ struct Active<'a> {
     /// resumes once it reached zero.
     draft_limit: usize,
     draft_pause: usize,
+    /// DFlash2 ring slot and draft outcomes (None without a drafter slot).
+    slot: Option<usize>,
+    drafts: DraftHistory,
+    /// Steps, DFlash2 drafts verified and accepted, copy drafts verified and accepted.
+    counts: [usize; 5],
     constraint: Option<crate::v41_native_serve::constraints::State<'a>>,
     placement: GlmPlacement,
     capacity: usize,
@@ -188,11 +210,14 @@ fn copy_drafts(history: &[u32], limit: usize) -> Vec<u32> {
 
 fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receiver<NativeRequest>,
     transport: &mut V41Tp4Roce, runtime: &tokio::runtime::Runtime, stats: &Mutex<serde_json::Value>,
-    max_sequences: usize, draft: usize) -> Result<()> {
+    max_sequences: usize, policy: Policy) -> Result<()> {
     let mut allocator = PageAllocator::new(engine.pages);
     let mut grammars = crate::v41_native_serve::constraints::Compiler::with_vocab(
         &opened.library, opened.snapshot.join("tokenizer.json"), engine.cfg.vocab_size, engine.cfg.eos_tokens.clone());
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(&opened.snapshot)?;
+    let drafter = engine.drafter.as_ref();
+    let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
+    let mut cost = StepCost::new(&dflash_policy::K4_TP4_STEP_MS, DECODE_ROWS);
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
     let (hidden, vocab) = (engine.cfg.hidden, engine.cfg.vocab_size);
@@ -232,6 +257,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     continue;
                 }
             };
+            let slot = free_slots.pop();
             let admitted = (|| -> Result<Active<'_>> {
                 let _ = job.events.blocking_send(Ok(InferenceChunk::Ready {
                     system_fingerprint: None,
@@ -241,13 +267,24 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 let mut logits = None;
                 for chunk in tokens.chunks(engine.prefill_rows) {
                     let embed = embed_rows(&opened.catalog, chunk, hidden)?;
+                    let start = placement.len;
                     logits = engine.prefill(&mut placement, &embed, Some((&mut *transport, runtime)), None)?;
+                    // The chunk's tapped tail becomes drafter context before the next step.
+                    if let (Some(drafter), Some(slot)) = (drafter, slot) {
+                        let n = chunk.len().min(TAP_ROWS);
+                        let first = start + chunk.len() - n;
+                        drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot, position: first + r })
+                            .collect::<Vec<_>>())?;
+                    }
                 }
                 tracing::debug!(tokens = tokens.len(), elapsed_ms = started.elapsed().as_millis() as u64, "prefill");
                 let mut request = Active {
                     history: tokens.clone(),
-                    draft_limit: draft,
+                    draft_limit: policy.copy,
                     draft_pause: 0,
+                    slot,
+                    drafts: DraftHistory::default(),
+                    counts: [0; 5],
                     decoder: cuteafd_loader::streaming_token_decoder(&opened.snapshot, false)?,
                     job, constraint, placement: placement.clone(), capacity, next: 0, generated: 0, buffered: 0,
                     started: Instant::now(),
@@ -260,11 +297,15 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     let token = request.next;
                     match request.emit(token) {
                         Ok(false) => active.push(request),
-                        Ok(true) | Err(_) => allocator.release(request.placement),
+                        Ok(true) | Err(_) => {
+                            free_slots.extend(request.slot);
+                            allocator.release(request.placement);
+                        }
                     }
                 }
                 Err(error) => {
                     tracing::warn!("prefill failed: {error:#}");
+                    free_slots.extend(slot);
                     allocator.release(placement);
                 }
             }
@@ -272,26 +313,74 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         if active.is_empty() {
             continue;
         }
-        // Each sequence verifies its next token plus a copy-window draft
-        // (none when nothing repeats), within the decode programs' rows.
+        // Rows each sequence may add after its next token.
         let room = (DECODE_ROWS / active.len()).max(1) - 1;
-        let sequences: Vec<Vec<u32>> = active.iter_mut().map(|a| {
+        let limits: Vec<usize> = active.iter().map(|a| room.min(a.job.max_tokens - a.generated - 1)
+            .min(a.capacity - a.placement.len - 1)).collect();
+        // DFlash2 drafts after every next token, then the policy's counts.
+        let drafted: Vec<Option<super::dflash::Draft>> = match drafter {
+            Some(drafter) if active.iter().any(|a| a.slot.is_some()) => {
+                let seqs: Vec<(usize, DraftSeq)> = active.iter().enumerate()
+                    .filter_map(|(i, a)| a.slot.map(|slot| (i, DraftSeq { slot, anchor: a.next, position: a.placement.len })))
+                    .collect();
+                let anchors: Vec<u32> = seqs.iter().map(|(_, s)| s.anchor).collect();
+                let drafts = drafter.draft(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(),
+                    &embed_rows(&opened.catalog, &anchors, hidden)?, engine.weights.head.buffer.ptr)?;
+                let mut out = vec![None; active.len()];
+                for ((i, _), draft) in seqs.into_iter().zip(drafts) {
+                    out[i] = Some(draft);
+                }
+                out
+            }
+            _ => vec![None; active.len()],
+        };
+        let planned: Vec<usize> = {
+            let indices: Vec<usize> = (0..active.len()).filter(|&i| drafted[i].is_some()).collect();
+            let mut counts = vec![0; active.len()];
+            if let Some(fixed) = policy.fixed {
+                for &i in &indices {
+                    counts[i] = fixed.min(limits[i]).min(drafted[i].as_ref().map_or(0, |d| d.tokens.len()));
+                }
+            } else if !indices.is_empty() {
+                let histories: Vec<&DraftHistory> = indices.iter().map(|&i| &active[i].drafts).collect();
+                let confidence: Vec<Vec<f64>> = indices.iter()
+                    .map(|&i| active[i].drafts.confidence(&drafted[i].as_ref().unwrap().features)).collect();
+                let caps: Vec<usize> = indices.iter().map(|&i| limits[i]).collect();
+                for (&i, n) in indices.iter().zip(dflash_policy::plan(&histories, &confidence, &caps, &cost)) {
+                    counts[i] = n;
+                }
+            }
+            counts
+        };
+        // Each sequence verifies its next token, then its DFlash2 drafts, or
+        // a copy-window draft when it agrees with them and runs longer.
+        let mut used_copy = vec![false; active.len()];
+        let sequences: Vec<Vec<u32>> = active.iter_mut().enumerate().map(|(i, a)| {
             if a.draft_pause > 0 {
                 a.draft_pause -= 1;
                 if a.draft_pause == 0 {
                     a.draft_limit = 1;
                 }
             }
-            let limit = room.min(a.draft_limit).min(a.job.max_tokens - a.generated - 1)
-                .min(a.capacity - a.placement.len - 1);
+            let dflash: &[u32] = drafted[i].as_ref().map_or(&[], |d| &d.tokens[..planned[i]]);
+            let full: &[u32] = drafted[i].as_ref().map_or(&[], |d| &d.tokens);
             // `emit` already appended `next` to the history.
-            std::iter::once(a.next).chain(copy_drafts(&a.history, limit)).collect()
+            let copy = copy_drafts(&a.history, limits[i].min(a.draft_limit));
+            let agrees = copy.iter().zip(full).take_while(|(c, d)| c == d).count() >= dflash.len();
+            let draft = if copy.len() > dflash.len() && agrees {
+                used_copy[i] = true;
+                copy
+            } else {
+                dflash.to_vec()
+            };
+            std::iter::once(a.next).chain(draft).collect()
         }).collect();
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
         let tokens: Vec<u32> = sequences.iter().flatten().copied().collect();
         let embed = embed_rows(&opened.catalog, &tokens, hidden)?;
         let mut rows: Vec<(&mut GlmPlacement, usize)> = active.iter_mut().zip(&sequences)
             .map(|(a, s)| (&mut a.placement, s.len())).collect();
+        let timer = Instant::now();
         let step = engine.verify(&mut rows, &embed, Some((&mut *transport, runtime)), None)
             .and_then(|logits| logits.context("decode needs every layer"));
         let logits = match step {
@@ -300,13 +389,17 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 tracing::warn!("decode step failed: {error:#}");
                 for request in active.drain(..) {
                     let _ = request.job.events.blocking_send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                    free_slots.extend(request.slot);
                     allocator.release(request.placement);
                 }
                 continue;
             }
         };
+        cost.observe(tokens.len(), timer.elapsed().as_secs_f64() * 1e3);
         let mut offset = 0;
-        let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(starts).map(|((request, rows), start)| {
+        let mut context = Vec::new();
+        let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(starts).enumerate()
+            .map(|(i, ((request, rows), start))| {
             let mut finished = false;
             for j in 0..rows.len() {
                 // Rows 0..=j are committed; the token row j produces is next.
@@ -324,20 +417,39 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     }
                 }
             }
+            let committed = request.placement.len - start;
+            if let Some(slot) = request.slot.filter(|_| !finished) {
+                context.extend((0..committed).map(|r| ContextRow { tap_row: offset + r, slot, position: start + r }));
+            }
             offset += rows.len();
-            // Adapt the draft length to how much of it the model reproduced.
-            let drafted = rows.len() - 1;
-            let accepted = (request.placement.len - start).saturating_sub(1);
-            if drafted > 0 && accepted == 0 {
-                request.draft_limit /= 2;
-                if request.draft_limit == 0 {
-                    request.draft_pause = 8;
+            let (drafted, accepted) = (rows.len() - 1, committed - 1);
+            request.counts[0] += 1;
+            if used_copy[i] {
+                request.counts[3] += drafted;
+                request.counts[4] += accepted;
+            } else {
+                request.counts[1] += drafted;
+                request.counts[2] += accepted;
+            }
+            if planned[i] > 0 {
+                request.drafts.observe(planned[i], accepted);
+            }
+            // Adapt the copy-draft length to how much of it the model reproduced.
+            if used_copy[i] || drafter.is_none() {
+                if drafted > 0 && accepted == 0 {
+                    request.draft_limit /= 2;
+                    if request.draft_limit == 0 {
+                        request.draft_pause = 8;
+                    }
+                } else if drafted > 0 && accepted == drafted {
+                    request.draft_limit = (request.draft_limit * 2).clamp(1, policy.copy.max(1));
                 }
-            } else if drafted > 0 && accepted == drafted {
-                request.draft_limit = (request.draft_limit * 2).clamp(1, draft);
             }
             finished
         }).collect();
+        if let Some(drafter) = drafter {
+            drafter.update(&context)?;
+        }
         for index in (0..active.len()).rev() {
             if !finished[index] {
                 continue;
@@ -347,9 +459,11 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             generated_total += request.generated as u64;
             let seconds = request.started.elapsed().as_secs_f64();
             let phases = std::mem::take(&mut *engine.profile.borrow_mut());
+            let [steps, dflash, dflash_ok, copy, copy_ok] = request.counts;
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
-                active = active.len(), gpu_wait_s = phases[0], experts_s = phases[1], head_s = phases[2],
-                "request complete");
+                active = active.len(), steps, dflash, dflash_ok, copy, copy_ok, gpu_wait_s = phases[0],
+                experts_s = phases[1], head_s = phases[2], "request complete");
+            free_slots.extend(request.slot);
             allocator.release(request.placement);
         }
         if let Ok(mut stats) = stats.lock() {
