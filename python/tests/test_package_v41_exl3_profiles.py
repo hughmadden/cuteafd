@@ -329,12 +329,19 @@ class PackageProfileTests(unittest.TestCase):
                             package.verify(copy, 'fixture-revision')
                     self.assertIn(expected, str(caught.exception))
 
-    def test_only_v4_pro_spark_packages_carry_a_six_rank_profile(self):
-        """24 H128 blocks split four apiece; V4.1 and V4 Flash stay at TP2/3/4."""
+    def test_six_rank_profiles_split_whole_blocks(self):
+        """V4 Pro's 24 H128 blocks split four apiece; a 2048 intermediate's 16
+        split 3, 3, 3, 3, 2, 2 (one export per width); V4.1 and Qwen (5
+        blocks) carry no TP6."""
         pro = {name: (width, dest) for name, width, _, _, _, dest in package.shard_profiles('dsv4p', 'spark')}
         self.assertEqual(pro['tp6-width512'], (512, [f'tp6-rank{rank}' for rank in range(6)]))
-        flash = [name for name, *_ in package.shard_profiles('dsv4f', 'spark')]
-        self.assertFalse([name for name in flash if name.startswith('tp6')])
+        for geometry in ('glm', 'glmf', 'dsv4f'):
+            six = {name: (width, dest) for name, width, _, _, _, dest in package.shard_profiles(geometry, 'spark')
+                   if name.startswith('tp6')}
+            self.assertEqual(six, {'tp6-width384': (384, [f'tp6-rank{rank}' for rank in range(4)]),
+                                   'tp6-width256': (256, ['tp6-rank4', 'tp6-rank5'])})
+        qwen = [name for name, *_ in package.shard_profiles('qwen4', 'spark')]
+        self.assertFalse([name for name in qwen if name.startswith('tp6')])
         v41 = [name for name, *_ in package.profiles_for_role('spark')]
         self.assertFalse([name for name in v41 if name.startswith('tp6')])
         coordinator = [name for name, *_ in package.shard_profiles('dsv4p', 'coordinator')]
