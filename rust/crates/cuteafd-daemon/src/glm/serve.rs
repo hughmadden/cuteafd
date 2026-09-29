@@ -100,6 +100,11 @@ struct Active<'a> {
     job: NativeRequest,
     /// Prompt and generated tokens, for copy-window drafts.
     history: Vec<u32>,
+    /// Current copy-draft length (halved after a fully rejected draft,
+    /// doubled after a fully accepted one) and steps left before drafting
+    /// resumes once it reached zero.
+    draft_limit: usize,
+    draft_pause: usize,
     constraint: Option<crate::v41_native_serve::constraints::State<'a>>,
     placement: GlmPlacement,
     capacity: usize,
@@ -162,13 +167,13 @@ impl Active<'_> {
     }
 }
 
-/// Longest n-gram (from 8 down to 3 tokens) that ends the history and occurred
+/// Longest n-gram (from 8 down to 4 tokens) that ends the history and occurred
 /// earlier; proposes up to `limit` tokens that followed its latest earlier
 /// occurrence (a copy window). Exact: the verify step accepts only tokens the
 /// model itself produces.
 fn copy_drafts(history: &[u32], limit: usize) -> Vec<u32> {
     let len = history.len();
-    for n in (3..=8).rev() {
+    for n in (4..=8).rev() {
         if len <= n {
             continue;
         }
@@ -241,6 +246,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 tracing::debug!(tokens = tokens.len(), elapsed_ms = started.elapsed().as_millis() as u64, "prefill");
                 let mut request = Active {
                     history: tokens.clone(),
+                    draft_limit: draft,
+                    draft_pause: 0,
                     decoder: cuteafd_loader::streaming_token_decoder(&opened.snapshot, false)?,
                     job, constraint, placement: placement.clone(), capacity, next: 0, generated: 0, buffered: 0,
                     started: Instant::now(),
@@ -268,12 +275,17 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         // Each sequence verifies its next token plus a copy-window draft
         // (none when nothing repeats), within the decode programs' rows.
         let room = (DECODE_ROWS / active.len()).max(1) - 1;
-        let sequences: Vec<Vec<u32>> = active.iter().map(|a| {
-            let limit = room.min(draft).min(a.job.max_tokens - a.generated - 1)
+        let sequences: Vec<Vec<u32>> = active.iter_mut().map(|a| {
+            if a.draft_pause > 0 {
+                a.draft_pause -= 1;
+                if a.draft_pause == 0 {
+                    a.draft_limit = 1;
+                }
+            }
+            let limit = room.min(a.draft_limit).min(a.job.max_tokens - a.generated - 1)
                 .min(a.capacity - a.placement.len - 1);
-            let mut next = a.history.clone();
-            next.push(a.next);
-            std::iter::once(a.next).chain(copy_drafts(&next, limit)).collect()
+            // `emit` already appended `next` to the history.
+            std::iter::once(a.next).chain(copy_drafts(&a.history, limit)).collect()
         }).collect();
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
         let tokens: Vec<u32> = sequences.iter().flatten().copied().collect();
@@ -313,6 +325,17 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 }
             }
             offset += rows.len();
+            // Adapt the draft length to how much of it the model reproduced.
+            let drafted = rows.len() - 1;
+            let accepted = (request.placement.len - start).saturating_sub(1);
+            if drafted > 0 && accepted == 0 {
+                request.draft_limit /= 2;
+                if request.draft_limit == 0 {
+                    request.draft_pause = 8;
+                }
+            } else if drafted > 0 && accepted == drafted {
+                request.draft_limit = (request.draft_limit * 2).clamp(1, draft);
+            }
             finished
         }).collect();
         for index in (0..active.len()).rev() {
