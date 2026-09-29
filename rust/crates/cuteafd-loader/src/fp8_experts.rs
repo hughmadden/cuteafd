@@ -1,5 +1,6 @@
 //! Routed experts kept as the checkpoint's FP8: E4M3 weights with one FP32
-//! scale per 128x128 block (`weight_scale_inv`), Hugging Face names
+//! (or BF16, Qwen 3.8 Flash Next; widened at read) scale per 128x128 block
+//! (`weight_scale_inv`), Hugging Face names
 //! `model.layers.{l}.mlp.experts.{e}.{gate,up,down}_proj.weight[_scale_inv]`
 //! or, for multimodal checkpoints, under `model.language_model.` (MiMo V2
 //! Flash; GLM 5.x and GLM 5.3 Flash official FP8). The `fp8` expert family serves them without re-quantization.
@@ -123,8 +124,8 @@ impl Fp8ExpertTensors {
         ensure!(weight.dtype == DType::F8E4M3 && weight.shape == [rows, cols],
             "{name}: expected E4M3 [{rows}, {cols}], found {:?} {:?}", weight.dtype, weight.shape);
         let scale = self.located(&format!("{name}_scale_inv"))?;
-        ensure!(scale.dtype == DType::F32 && scale.shape == [rows.div_ceil(128), cols.div_ceil(128)],
-            "{name}_scale_inv: expected FP32 [{}, {}] 128x128 block scales, found {:?} {:?}",
+        ensure!(matches!(scale.dtype, DType::F32 | DType::Bf16) && scale.shape == [rows.div_ceil(128), cols.div_ceil(128)],
+            "{name}_scale_inv: expected FP32 or BF16 [{}, {}] 128x128 block scales, found {:?} {:?}",
             rows.div_ceil(128), cols.div_ceil(128), scale.dtype, scale.shape);
         Ok(())
     }
@@ -162,6 +163,17 @@ impl Fp8ExpertTensors {
         let open = |shard: &str| std::fs::File::open(self.snapshot.join(shard));
         let (w_file, s_file) = (open(&w.shard)?, open(&s.shard)?);
         let (scale_rows, scale_cols) = (rows.div_ceil(128), cols.div_ceil(128));
+        // The whole block-scale grid (at most a few hundred entries), widened to
+        // FP32: Qwen 3.8 Flash Next stores BF16 scales, which FP32 holds exactly.
+        let mut raw = vec![0u8; s.bytes as usize];
+        s_file.read_exact_at(&mut raw, s.offset)?;
+        let grid: Vec<u8> = match s.dtype {
+            DType::Bf16 => raw.chunks_exact(2)
+                .flat_map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16).to_le_bytes())
+                .collect(),
+            _ => raw,
+        };
+        ensure!(grid.len() == scale_rows * scale_cols * 4, "{name}_scale_inv: unexpected grid size");
         if projection == Fp8Projection::Down {
             // Column window [rank*slice, +slice) of every row: read the whole
             // tensor once and gather (down is a third of an expert's bytes).
@@ -170,8 +182,6 @@ impl Fp8ExpertTensors {
             for (row, out) in weight.chunks_exact_mut(slice).enumerate() {
                 out.copy_from_slice(&staging[row * cols + rank * slice..][..slice]);
             }
-            let mut grid = vec![0u8; s.bytes as usize];
-            s_file.read_exact_at(&mut grid, s.offset)?;
             let (window, first) = (slice / 128 * 4, rank * slice / 128 * 4);
             for (row, out) in scale.chunks_exact_mut(window).enumerate().take(scale_rows) {
                 out.copy_from_slice(&grid[row * scale_cols * 4 + first..][..window]);
@@ -179,7 +189,8 @@ impl Fp8ExpertTensors {
         } else {
             w_file.read_exact_at(weight, w.offset + (rank * slice * cols) as u64)
                 .with_context(|| format!("reading {name}"))?;
-            s_file.read_exact_at(scale, s.offset + (rank * slice / 128 * scale_cols * 4) as u64)?;
+            let first = rank * slice / 128 * scale_cols * 4;
+            scale.copy_from_slice(&grid[first..first + scale.len()]);
         }
         Ok(())
     }

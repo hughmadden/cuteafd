@@ -221,10 +221,12 @@ GEOMETRIES = {
     'glm': (6144, 2048, 256, 8),
     # GLM 5.3 Flash (glm5_next): 288 experts, SwiGLU clamped at 10.
     'glmf': (4096, 2048, 288, 8),
+    # Qwen 3.8 Flash Next (qwen4_exp): 512 experts, softmax top-10, unclamped SiLU.
+    'qwen4': (2560, 640, 512, 10),
 }
 # SwiGLU clamp per geometry; None is the unclamped SwiGLU (b12x const-expr
 # elides the clamp). DeepSeek clamps at 10.
-SWIGLU_LIMITS = {'glm': None}
+SWIGLU_LIMITS = {'glm': None, 'qwen4': None}
 
 
 def swiglu_limit(geometry: str) -> float | None:
@@ -305,8 +307,11 @@ def shard_profiles(geometry: str, role: str) -> list[tuple]:
     _hidden, intermediate, experts, topk = GEOMETRIES[geometry]
     blocks = intermediate // 128
     if role != 'spark':
-        return [('rtx-tp1', intermediate, experts, topk, 'fp32', ['rtx-tp1']),
-                ('rtx-tp2', intermediate // 2, experts, topk, 'fp32', ['rtx-tp2'])]
+        profiles = [('rtx-tp1', intermediate, experts, topk, 'fp32', ['rtx-tp1'])]
+        # Dual-RTX halves only where they are whole H128 blocks (not Qwen's 640).
+        if blocks % 2 == 0:
+            profiles.append(('rtx-tp2', intermediate // 2, experts, topk, 'fp32', ['rtx-tp2']))
+        return profiles
     profiles = []
     # Six ranks only where they split the H128 blocks evenly (V4 Pro: 24 -> 4).
     worlds = (4, 2, 3, 6) if blocks % 6 == 0 else (4, 2, 3)
