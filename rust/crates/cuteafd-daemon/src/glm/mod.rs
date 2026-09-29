@@ -329,8 +329,8 @@ fn bench_prefill(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<
         and warm-up; build {:.1} ms, post {:.1} ms)", 1e3 * host[0] / (runs + 1.0), 1e3 * host[1] / (runs + 1.0),
         1e3 * host[2] / (runs + 1.0), 1e3 * host[3] / (runs + 1.0));
     println!("prefill bench: {n} tokens, median {:.1} ms ({:.0} tok/s), min {:.1} ms; per prefill GPU wait {:.1} ms, \
-        Spark wait {:.1} ms", 1e3 * median, n as f64 / median, 1e3 * times[0], 1e3 * phases[0] / runs,
-        1e3 * phases[1] / runs);
+        Spark wait {:.1} ms; runs {:?} ms", 1e3 * median, n as f64 / median, 1e3 * times[0], 1e3 * phases[0] / runs,
+        1e3 * phases[1] / runs, times.iter().map(|t| (t * 1e3).round() as u32).collect::<Vec<_>>());
     Ok(())
 }
 

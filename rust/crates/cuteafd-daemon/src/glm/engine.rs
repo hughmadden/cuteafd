@@ -933,9 +933,21 @@ impl<'a> GlmEngine<'a> {
                 &[rows, Dsv4Scalar::I32(tables.table_width as i32), Dsv4Scalar::I32(tables.table_stride as i32)])?;
         }
         // Shared-indexer layers read the previous full layer's `indices`.
-        self.run(&format!("glm_sparse_mla_{mode}_{cap}"), &[
-            ("q", w.query.buffer.ptr), ("kv_cache", kv.buffer.ptr), ("indices", w.indices.buffer.ptr),
-            ("lengths", w.lengths.buffer.ptr), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])?;
+        if !tables.decode && native_mla_prefill() {
+            let scale = ((self.cfg.qk_nope_head_dim + self.cfg.qk_rope_head_dim) as f32).powf(-0.5);
+            // SAFETY: query, cache, indices, lengths and the attention output are
+            // live buffers of the step's rows on the engine stream.
+            unsafe {
+                self.library.glm_mla_prefill(w.query.buffer.ptr, kv.buffer.ptr, w.indices.buffer.ptr,
+                    w.lengths.buffer.ptr, w.attn.buffer.ptr, tables.positions.len(), self.cfg.heads,
+                    self.cfg.index_topk, 656, scale * std::f32::consts::LOG2_E, self.stream)?;
+            }
+        } else {
+            self.run(&format!("glm_sparse_mla_{mode}_{cap}"), &[
+                ("q", w.query.buffer.ptr), ("kv_cache", kv.buffer.ptr), ("indices", w.indices.buffer.ptr),
+                ("lengths", w.lengths.buffer.ptr), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
+                &[rows])?;
+        }
         let mut o = vec![("attn", w.attn.buffer.ptr), ("w_uv", layer.ptr("w_uv")?)];
         o.extend(weight(layer, "w_o", cap)?);
         o.extend([("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
@@ -951,6 +963,13 @@ impl<'a> GlmEngine<'a> {
         pointers.extend([("out", out), ("scratch", w.scratch.buffer.ptr)]);
         self.run(&format!("glm_ffn_i{intermediate}_{cap}"), &pointers, &[rows])
     }
+}
+
+/// Prefill sparse MLA on the native F16 kernel (glm_mla_prefill.cu) unless
+/// CUTEAFD_MLA_PREFILL=b12x selects the b12x program.
+pub(crate) fn native_mla_prefill() -> bool {
+    static NATIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NATIVE.get_or_init(|| std::env::var("CUTEAFD_MLA_PREFILL").map_or(true, |v| v != "b12x"))
 }
 
 /// Prefill lanes: CUTEAFD_GLM_PREFILL_LANES (1 = serial), default [`DEFAULT_LANES`].
