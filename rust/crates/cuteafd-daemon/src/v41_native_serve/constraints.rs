@@ -11,17 +11,27 @@ const STOP_TOKEN: u32 = 1;
 pub(crate) struct Compiler<'a> {
     library: &'a NativeLibrary,
     tokenizer: PathBuf,
+    vocab: usize,
+    /// Stop ids the grammar accepts where it may end; the first is the one
+    /// speculation checks.
+    stops: Vec<u32>,
     compiler: Option<CuteafdXGrammarCompiler<'a>>,
     grammars: HashMap<NativeConstraint, Arc<CuteafdXGrammarGrammar<'a>>>,
     order: VecDeque<NativeConstraint>,
 }
 impl<'a> Compiler<'a> {
     pub fn new(library: &'a NativeLibrary, tokenizer: PathBuf) -> Self {
-        Self { library, tokenizer, compiler: None, grammars: HashMap::new(), order: VecDeque::new() }
+        Self::with_vocab(library, tokenizer, VOCAB, vec![STOP_TOKEN])
+    }
+
+    /// A compiler for another tokenizer: `vocab` logits per row and its stop ids.
+    pub fn with_vocab(library: &'a NativeLibrary, tokenizer: PathBuf, vocab: usize, stops: Vec<u32>) -> Self {
+        Self { library, tokenizer, vocab, stops, compiler: None, grammars: HashMap::new(), order: VecDeque::new() }
     }
     pub fn matcher(&mut self, spec: &NativeConstraint) -> Result<State<'a>> {
         if self.compiler.is_none() {
-            self.compiler = Some(self.library.xgrammar_compiler(&self.tokenizer, VOCAB, &[STOP_TOKEN as i32])?);
+            let stops: Vec<i32> = self.stops.iter().map(|&s| s as i32).collect();
+            self.compiler = Some(self.library.xgrammar_compiler(&self.tokenizer, self.vocab, &stops)?);
         }
         let grammar = if let Some(grammar) = self.grammars.get(spec) { grammar.clone() } else {
             let grammar = Arc::new(self.compiler.as_ref().unwrap().compile(
@@ -35,7 +45,7 @@ impl<'a> Compiler<'a> {
         };
         self.order.retain(|key| key != spec);
         self.order.push_back(spec.clone());
-        Ok(State { matcher: grammar.matcher()?, mask: vec![0; VOCAB.div_ceil(32)], stop: STOP_TOKEN })
+        Ok(State { matcher: grammar.matcher()?, mask: vec![0; self.vocab.div_ceil(32)], stop: self.stops[0] })
     }
 }
 

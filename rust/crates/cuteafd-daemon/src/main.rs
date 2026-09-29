@@ -67,6 +67,7 @@ async fn main() -> Result<()> {
         Commands::ExpertProbe(args) => run_expert_probe(args).await,
         Commands::Dsv4Golden(args) => dsv4::run_golden(args).await,
         Commands::GlmGolden(args) => glm::run_golden(args).await,
+        Commands::ServeGlm(args) => glm::serve::run_serve(args).await,
         Commands::ServeDsv4(args) => dsv4::serve::run_serve(args).await,
         Commands::Fabric(args) => {
             let report = cuteafd_transport::fabric::discover()?;

@@ -55,6 +55,28 @@ impl GlmPlacement {
     }
 }
 
+/// Free pages of the shared latent/index cache pool.
+pub(crate) struct PageAllocator {
+    free: Vec<i32>,
+}
+
+impl PageAllocator {
+    pub fn new(pages: usize) -> Self {
+        Self { free: (0..pages as i32).rev().collect() }
+    }
+
+    /// Reserves every page a sequence of up to `capacity` tokens needs.
+    pub fn admit(&mut self, capacity: usize) -> Result<GlmPlacement> {
+        let pages = capacity.div_ceil(PAGE_ROWS).max(1);
+        ensure!(self.free.len() >= pages, "cache pages exhausted ({pages} needed, {} free)", self.free.len());
+        Ok(GlmPlacement { pages: (0..pages).map(|_| self.free.pop().unwrap()).collect(), len: 0 })
+    }
+
+    pub fn release(&mut self, placement: GlmPlacement) {
+        self.free.extend(placement.pages);
+    }
+}
+
 struct Workspace<'a> {
     rows: usize,
     h: Dev<'a>,
@@ -359,7 +381,7 @@ impl<'a> GlmEngine<'a> {
             ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Dsv4Scalar::I32(grid as i32)])?;
         // Routes and wire rows down to the host for the request.
         let (route_bytes, wire_bytes) = (t * topk * 4, t * (h + h / 32));
-        let mut staging = w.router_host.borrow_mut();
+        let staging = w.router_host.borrow_mut();
         let host = staging.buffer;
         let at = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
             // SAFETY: ids, weights and wire rows are consecutive inside the pinned buffer.
