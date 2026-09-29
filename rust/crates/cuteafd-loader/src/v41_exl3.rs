@@ -104,17 +104,21 @@ impl V41Exl3Projection {
         rank: usize,
         layout: V41Exl3Partition,
     ) -> Result<Range<usize>> {
-        // Six-rank EXL3 partitioning is deliberately not admitted: the approved
-        // Spark six-rank layouts are native (`TP6EP1`) or replicated, and no
-        // EXL3 TP6 artifact family exists.
         ensure!(
-            matches!(world, 1 | 2 | 3 | 4) && rank < world,
+            matches!(world, 1 | 2 | 3 | 4 | 6) && rank < world,
             "invalid EXL3 TP rank/world"
         );
         let intermediate = match self.kind {
             V41Exl3ProjectionKind::Down => self.input_features,
             _ => self.output_features,
         };
+        // Six ranks are the implicit EXL3 TP6 split of checkpoints whose H128
+        // blocks divide evenly (V4 Pro: 24 -> 4 apiece). V4.1's 2304 keeps its
+        // six-rank Spark layouts native.
+        ensure!(
+            world != 6 || (intermediate % (6 * 128) == 0 && intermediate != 2304),
+            "EXL3 six-rank partition requires an even H128 split outside V4.1"
+        );
         ensure!(
             intermediate % 128 == 0,
             "EXL3 intermediate axis is not H128 aligned"
@@ -1014,6 +1018,25 @@ mod tests {
             counts,
             manifest.ple_quantization.is_some()
         );
+    }
+
+    #[test]
+    fn pro_intermediate_splits_six_ways_on_whole_blocks() {
+        for kind in [V41Exl3ProjectionKind::Gate, V41Exl3ProjectionKind::Down] {
+            let (input, output) = if kind == V41Exl3ProjectionKind::Down { (3072, 7168) } else { (7168, 3072) };
+            let p = V41Exl3Projection {
+                name: "test".into(),
+                kind,
+                bits: 3,
+                input_features: input,
+                output_features: output,
+            };
+            for rank in 0..6 {
+                assert_eq!(p.intermediate_partition(6, rank).unwrap(), rank * 512..(rank + 1) * 512);
+            }
+            assert!(p.intermediate_partition(6, 6).is_err());
+            assert!(p.intermediate_partition(5, 0).is_err());
+        }
     }
 
     #[test]

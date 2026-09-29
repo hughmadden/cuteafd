@@ -329,6 +329,17 @@ class PackageProfileTests(unittest.TestCase):
                             package.verify(copy, 'fixture-revision')
                     self.assertIn(expected, str(caught.exception))
 
+    def test_only_v4_pro_spark_packages_carry_a_six_rank_profile(self):
+        """24 H128 blocks split four apiece; V4.1 and V4 Flash stay at TP2/3/4."""
+        pro = {name: (width, dest) for name, width, _, _, _, dest in package.shard_profiles('dsv4p', 'spark')}
+        self.assertEqual(pro['tp6-width512'], (512, [f'tp6-rank{rank}' for rank in range(6)]))
+        flash = [name for name, *_ in package.shard_profiles('dsv4f', 'spark')]
+        self.assertFalse([name for name in flash if name.startswith('tp6')])
+        v41 = [name for name, *_ in package.profiles_for_role('spark')]
+        self.assertFalse([name for name in v41 if name.startswith('tp6')])
+        coordinator = [name for name, *_ in package.shard_profiles('dsv4p', 'coordinator')]
+        self.assertFalse([name for name in coordinator if name.startswith('tp6')])
+
     def test_route_blocks_widen_only_for_dsv4p_prefill(self):
         """V4.1 and V4 Flash keep 8-row blocks; V4 Pro prefill widens (Spark and RTX)."""
         for capacity in (1, 16, 80, 256, 1024, 4096):

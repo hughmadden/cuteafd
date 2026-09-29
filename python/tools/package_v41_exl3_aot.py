@@ -260,7 +260,9 @@ def shard_profiles(geometry: str, role: str) -> list[tuple]:
         return [('rtx-tp1', intermediate, experts, topk, 'fp32', ['rtx-tp1']),
                 ('rtx-tp2', intermediate // 2, experts, topk, 'fp32', ['rtx-tp2'])]
     profiles = []
-    for world in (4, 2, 3):
+    # Six ranks only where they split the H128 blocks evenly (V4 Pro: 24 -> 4).
+    worlds = (4, 2, 3, 6) if blocks % 6 == 0 else (4, 2, 3)
+    for world in worlds:
         widths: dict[int, list[str]] = {}
         for rank in range(world):
             width = (blocks // world + (rank < blocks % world)) * 128

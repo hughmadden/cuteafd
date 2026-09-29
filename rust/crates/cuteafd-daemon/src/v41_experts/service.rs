@@ -707,8 +707,8 @@ fn validate_topology(config: &NativeExpertServiceConfig, catalog: &OfficialV41Ca
         return Ok(());
     }
     ensure!(
-        matches!(config.world, 2 | 3 | 4) && config.rank < config.world,
-        "implicit Spark world must be 2, 3 or 4 with rank below world; \
+        matches!(config.world, 2 | 3 | 4 | 6) && config.rank < config.world,
+        "implicit Spark world must be 2, 3, 4 or 6 with rank below world; \
          an explicit TP x EP topology must pass --spark-tp/--spark-ep"
     );
     // The three-rank compact group is the single-RTX EXL3 profile only: a
@@ -717,8 +717,8 @@ fn validate_topology(config: &NativeExpertServiceConfig, catalog: &OfficialV41Ca
     // versa).
     ensure!(
         config.world == 4 || catalog.exl3().is_some(),
-        "a two or three rank implicit Spark group requires EXL3 experts; \
-         a native three-rank group must pass --spark-tp 3 --spark-ep 1"
+        "a two, three or six rank implicit Spark group requires EXL3 experts; \
+         a native group must pass --spark-tp/--spark-ep"
     );
     Ok(())
 }
@@ -750,7 +750,7 @@ impl NativeExpertServiceConfig {
                 2 => ExpertLayer::BackboneTp2 { layer, rank: self.rank },
                 // Admission above admits world 3 only for an EXL3 checkpoint, so
                 // this can never resolve to the native FP8 shard family.
-                3 => ExpertLayer::BackboneExl3Tp { layer, rank: self.rank, world: 3 },
+                3 | 6 => ExpertLayer::BackboneExl3Tp { layer, rank: self.rank, world: self.world },
                 _ => ExpertLayer::Backbone { layer, rank: self.rank },
             });
         };

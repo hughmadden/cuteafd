@@ -32,10 +32,14 @@ pub struct V41Exl3Info {
 /// Rank shard widths an EXL3 export may carry for `geometry`: whole H128
 /// rotation blocks of the intermediate split over one to four ranks, the
 /// first ranks owning any extra block. For V4.1 (2304) these are 2304 full
-/// (RTX local), 1152 (TP2), 768 (TP3) and 640/512 (TP4).
+/// (RTX local), 1152 (TP2), 768 (TP3) and 640/512 (TP4). Other geometries
+/// whose blocks split evenly over six ranks also carry TP6 (V4 Pro: 512).
 pub fn exl3_shard_widths(geometry: cuteafd_core::ExpertGeometry) -> Vec<u32> {
     let blocks = geometry.intermediate / 128;
-    let mut widths: Vec<u32> = (1..=4u32)
+    let six = geometry != cuteafd_core::ExpertGeometry::DEEPSEEK_V41 && blocks % 6 == 0;
+    let mut widths: Vec<u32> = [1u32, 2, 3, 4, 6]
+        .into_iter()
+        .filter(|&world| world != 6 || six)
         .filter(|&world| geometry.intermediate % 128 == 0 && blocks >= world)
         .flat_map(|world| [blocks / world, blocks.div_ceil(world)])
         .map(|count| count * 128)
@@ -438,7 +442,7 @@ mod info_tests {
     fn shard_widths_follow_the_expert_geometry() {
         use cuteafd_core::ExpertGeometry;
         assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V41), [512, 640, 768, 1152, 2304]);
-        assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V4_PRO), [768, 1024, 1536, 3072]);
+        assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V4_PRO), [512, 768, 1024, 1536, 3072]);
         assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V4_FLASH), [512, 640, 768, 1024, 2048]);
     }
 
