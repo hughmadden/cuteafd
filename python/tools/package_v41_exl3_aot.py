@@ -216,7 +216,15 @@ GEOMETRIES = {
     'v41': (5120, 2304, 384, 6),
     'dsv4f': (4096, 2048, 256, 6),
     'dsv4p': (7168, 3072, 384, 6),
+    'glm': (6144, 2048, 256, 8),
 }
+# SwiGLU clamp per geometry; None is the unclamped SwiGLU (b12x const-expr
+# elides the clamp). DeepSeek clamps at 10.
+SWIGLU_LIMITS = {'glm': None}
+
+
+def swiglu_limit(geometry: str) -> float | None:
+    return SWIGLU_LIMITS.get(geometry, 10.0)
 
 
 def route_block(geometry: str, capacity: int) -> int:
@@ -230,9 +238,23 @@ def route_block(geometry: str, capacity: int) -> int:
     fragments (b12x 4d7cb455), so they beat 32 from about 2048 rows up. The coordinator's whole-intermediate rtx-tp1 package
     gains the same way (RTX PRO 6000, width 3072: m4096 74 -> 35 ms, m1024 23 -> 16 ms).
     """
+    if geometry == 'glm':
+        return glm_route_block(capacity)
     if geometry != 'dsv4p' or capacity <= 256:
         return 8
     return 16 if capacity <= 1024 else 64
+
+
+def glm_route_block(capacity: int) -> int:
+    """GLM (256 experts, top-8): 8 * capacity routes, capacity / 32 rows per
+    expert on average. Measured on the coordinator rtx-tp1 package (RTX PRO
+    6000, width 2048, random top-8 routes, us): m80 8/16/32 = 2885/2905/2980;
+    m256 8/16/32/64 = 3265/3205/3260/3325; m1024 16/32/64 = 5650/4530/3910;
+    m4096 32/64 = 13820/11790 (64 with token-major rotation 11470). m256
+    keeps 8 rows (16 is 1.9% faster on the RTX, but its Spark TP3 width-640
+    kernel resolves a residency the native bridge does not take).
+    """
+    return 8 if capacity <= 256 else 64
 
 
 def token_major_rotation(geometry: str, capacity: int) -> bool:
@@ -241,6 +263,9 @@ def token_major_rotation(geometry: str, capacity: int) -> bool:
     Bit-identical to per-route rotation. It pays where the rotation phase is
     large (V4 Pro m2048..4096 prefill); at m1024 and below it is neutral.
     """
+    if geometry == 'glm':
+        # GLM top-8 (rtx-tp1): m1024 3910 -> 3830 us, m4096 11790 -> 11470 us.
+        return capacity > 256
     return geometry == 'dsv4p' and capacity > 1024
 
 
@@ -423,6 +448,8 @@ def build(args: argparse.Namespace) -> None:
                     options['route_block'] = block
                 if token_major_rotation(geometry, capacity):
                     options['token_major_rotation'] = True
+                if (limit := swiglu_limit(geometry)) != 10.0:
+                    options['swiglu_limit'] = limit
                 meta = export(raw, width, experts, capacity, tuple(args.bits), 'auto', topk, dtype, **options)
                 core = raw / 'libcuteafd_exl3.so'
                 subprocess.run([args.cxx, '-shared', '-fPIC', '-std=c++17',

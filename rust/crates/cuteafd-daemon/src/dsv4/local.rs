@@ -37,6 +37,8 @@ pub(crate) enum LocalLayer {
 
 enum Backend<'a> {
     Native {
+        /// Backbone layers `first..first + layers.len()`.
+        first: usize,
         layers: Vec<ExpertWeights<'a>>,
         /// dSpark stage experts (same geometry), loaded before backbone layers.
         stages: Vec<ExpertWeights<'a>>,
@@ -44,10 +46,11 @@ enum Backend<'a> {
         _scratch: DeviceAllocation<'a>,
     },
     /// One execution per package capacity over shared resident weights:
-    /// stages `0..stages` first, then backbone layers `0..layers`.
+    /// stages `0..stages` first, then backbone layers `first..first + layers`.
     Exl3 {
         executions: Vec<Exl3Execution<'a>>,
         stages: usize,
+        first: usize,
         layers: usize,
     },
 }
@@ -62,9 +65,9 @@ pub(crate) struct LocalExperts<'a> {
 }
 
 impl<'a> LocalExperts<'a> {
-    /// Loads the first `draft_stages` dSpark stages, then backbone layers
-    /// `0..` while they fit in `budget` bytes (leaving room for the kernels'
-    /// workspace), up to `max_layers`.
+    /// Loads the first `draft_stages` dSpark stages, then backbone layers from
+    /// the model's first routed layer while they fit in `budget` bytes
+    /// (leaving room for the kernels' workspace), below layer `max_layers`.
     #[allow(clippy::too_many_arguments)]
     pub fn load(
         library: &'a NativeLibrary,
@@ -76,15 +79,34 @@ impl<'a> LocalExperts<'a> {
         budget: usize,
         stream: *mut c_void,
     ) -> Result<Option<Self>> {
-        if max_layers == 0 && draft_stages == 0 {
+        let first = catalog.routed_experts().first_layer;
+        Self::load_range(library, native_lib, catalog, draft_stages, first..max_layers.max(first), max_rows,
+            budget, stream)
+    }
+
+    /// [`Self::load`] over the backbone layers `backbone` (clipped to the
+    /// model's routed layers); layers load in order while they fit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_range(
+        library: &'a NativeLibrary,
+        native_lib: &Path,
+        catalog: &OfficialV41Catalog,
+        draft_stages: usize,
+        backbone: std::ops::Range<usize>,
+        max_rows: usize,
+        budget: usize,
+        stream: *mut c_void,
+    ) -> Result<Option<Self>> {
+        let shape = *catalog.routed_experts();
+        let backbone = backbone.start.max(shape.first_layer)..backbone.end.min(shape.layers);
+        if backbone.is_empty() && draft_stages == 0 {
             return Ok(None);
         }
-        let shape = *catalog.routed_experts();
         let capacities: Vec<u32> = CAPACITIES.iter().copied().filter(|&c| c as usize <= max_rows.max(1))
             .chain(CAPACITIES.iter().copied().find(|&c| c as usize >= max_rows)).collect();
         if let Some(manifest) = catalog.exl3() {
             let directory = aot_layout_directory(native_lib, manifest.decoder_tiers(), "rtx-tp1");
-            return Self::load_exl3(library, catalog, &directory, &capacities, draft_stages, max_layers, max_rows, budget);
+            return Self::load_exl3(library, catalog, &directory, &capacities, draft_stages, backbone, max_rows, budget);
         }
         let mut states = Vec::new();
         let mut scratch_bytes = 0usize;
@@ -113,7 +135,7 @@ impl<'a> LocalExperts<'a> {
             stages.push(weights);
         }
         let mut layers = Vec::new();
-        for layer in 0..max_layers.min(shape.layers) {
+        for layer in backbone.clone() {
             let plan = ExpertWeights::plan(library, catalog, ExpertLayer::BackboneFull { layer })?;
             if plan.peak_device_bytes()? > remaining {
                 break;
@@ -137,7 +159,7 @@ impl<'a> LocalExperts<'a> {
             }
         }
         Ok(Some(Self {
-            backend: Backend::Native { layers, stages, states, _scratch: scratch },
+            backend: Backend::Native { first: backbone.start, layers, stages, states, _scratch: scratch },
             reducer: library.v41_local_expert_reducer()?,
             output: DeviceAllocation::new(library, max_rows * shape.hidden * 2)?,
             topk: shape.topk,
@@ -154,7 +176,7 @@ impl<'a> LocalExperts<'a> {
         directory: &Path,
         capacities: &[u32],
         draft_stages: usize,
-        max_layers: usize,
+        backbone: std::ops::Range<usize>,
         max_rows: usize,
         budget: usize,
     ) -> Result<Option<Self>> {
@@ -179,7 +201,7 @@ impl<'a> LocalExperts<'a> {
             weights.push(weight);
         }
         let mut layers = 0;
-        for layer in 0..max_layers.min(shape.layers) {
+        for layer in backbone.clone() {
             let selection = ExpertLayer::BackboneFull { layer };
             if Exl3Weights::plan(catalog, selection)?.peak_device_bytes()? > remaining {
                 break;
@@ -210,7 +232,7 @@ impl<'a> LocalExperts<'a> {
             executions.push(execution);
         }
         Ok(Some(Self {
-            backend: Backend::Exl3 { executions, stages: draft_stages, layers },
+            backend: Backend::Exl3 { executions, stages: draft_stages, first: backbone.start, layers },
             reducer: library.v41_local_expert_reducer()?,
             output: DeviceAllocation::new(library, output_bytes)?,
             topk: shape.topk,
@@ -250,12 +272,12 @@ impl<'a> LocalExperts<'a> {
         shared: *mut c_void,
         stream: *mut c_void,
     ) -> Result<()> {
-        let (layers, stages, states) = match &mut self.backend {
-            Backend::Native { layers, stages, states, .. } => (layers, stages, states),
-            Backend::Exl3 { executions, stages, layers } => {
+        let (first, layers, stages, states) = match &mut self.backend {
+            Backend::Native { first, layers, stages, states, .. } => (*first, layers, stages, states),
+            Backend::Exl3 { executions, stages, first, layers } => {
                 let index = match layer {
                     LocalLayer::Stage(n) if n < *stages => n,
-                    LocalLayer::Backbone(n) if n < *layers => *stages + n,
+                    LocalLayer::Backbone(n) if (*first..*first + *layers).contains(&n) => *stages + n - *first,
                     _ => anyhow::bail!("local expert layer {layer:?} is not resident"),
                 };
                 let execution = executions.iter_mut().find(|e| e.capacity() >= rows)
@@ -280,7 +302,7 @@ impl<'a> LocalExperts<'a> {
             }
         };
         let resident = match layer {
-            LocalLayer::Backbone(n) => layers.get(n),
+            LocalLayer::Backbone(n) => n.checked_sub(first).and_then(|n| layers.get(n)),
             LocalLayer::Stage(n) => stages.get(n),
         }.with_context(|| format!("local expert layer {layer:?} is not resident"))?;
         let state = states.iter_mut().find(|s| s.kernel.info().capacity_rows as usize >= rows)

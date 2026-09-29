@@ -70,6 +70,9 @@ fn load_weights<'a>(
     config: &NativeExpertServiceConfig,
 ) -> Result<(backend::Weights<'a>, usize)> {
     let layers = config.resident_layers(catalog.routed_experts().layers)?.end;
+    let first = catalog.routed_experts().first_layer;
+    ensure!(config.first_layer >= first,
+        "this checkpoint's routed experts start at layer {first}; pass --first-layer {first} or later");
     validate_topology(config, catalog)?;
     if catalog.exl3().is_some() { return backend::load_exl3(library, catalog, config); }
     log_spark_memory_if_enabled(library, config, "worker startup", None, None);

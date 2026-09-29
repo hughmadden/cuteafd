@@ -10,7 +10,7 @@ use cuteafd_transport::ExpertProtocolV2RouteEntry;
 use std::time::{Duration, Instant};
 
 /// Loads only what the probe needs (dSpark stages `0..=stage`, or backbone
-/// layers `0..=layer`), runs one checked launch and, with `--repeat`, times
+/// layer `layer` alone), runs one checked launch and, with `--repeat`, times
 /// back-to-back launches. Returns routed experts as FP32 rows and the time
 /// of the checked launch.
 pub(super) fn run(
@@ -27,12 +27,13 @@ pub(super) fn run(
     library.cuda_set_device(0)?;
     let stream = library.cuda_stream_create()?;
     let (free, _) = library.cuda_memory_info()?;
-    let (stages, layers, layer) = match args.stage {
-        Some(stage) => (stage + 1, 0, LocalLayer::Stage(stage)),
-        None => (0, args.layer + 1, LocalLayer::Backbone(args.layer)),
+    let (stages, backbone, layer) = match args.stage {
+        Some(stage) => (stage + 1, 0..0, LocalLayer::Stage(stage)),
+        None => (0, args.layer..args.layer + 1, LocalLayer::Backbone(args.layer)),
     };
+    let layers = backbone.len();
     let started = Instant::now();
-    let mut local = LocalExperts::load(&library, native_lib, catalog, stages, layers, rows,
+    let mut local = LocalExperts::load_range(&library, native_lib, catalog, stages, backbone, rows,
         free.saturating_sub(4 << 30), stream)?
         .context("no coordinator expert kernels or package for this checkpoint")?;
     anyhow::ensure!(local.stages() == stages && local.layers() == layers,

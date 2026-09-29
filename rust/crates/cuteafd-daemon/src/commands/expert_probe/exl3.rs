@@ -10,7 +10,6 @@ use std::collections::BTreeMap;
 use std::os::unix::fs::FileExt;
 
 const MCG_MULTIPLIER: u32 = 0xcbac_1fed;
-const SWIGLU_LIMIT: f32 = 10.0;
 
 /// `draft` selects dSpark stage `layer` (`mtp.{layer}`) instead of backbone layer `layer`.
 pub(super) fn oracle(
@@ -23,6 +22,8 @@ pub(super) fn oracle(
 ) -> Result<Vec<f32>> {
     let manifest = catalog.exl3().context("EXL3 oracle requires an EXL3 checkpoint")?;
     let hidden = catalog.routed_experts().hidden;
+    // DeepSeek clamps gate/up at 10; GLM's SwiGLU is unclamped.
+    let limit = cuteafd_core::expert_geometry().swiglu_limit().unwrap_or(f32::INFINITY);
     let mut by_expert: BTreeMap<u32, Vec<&ExpertProtocolV2RouteEntry>> = BTreeMap::new();
     for route in routes {
         by_expert.entry(route.expert_id).or_default().push(route);
@@ -53,8 +54,8 @@ pub(super) fn oracle(
                                 g.iter()
                                     .zip(u)
                                     .map(|(&g, &u)| {
-                                        let g = g.min(SWIGLU_LIMIT);
-                                        let u = u.clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT);
+                                        let g = g.min(limit);
+                                        let u = u.clamp(-limit, limit);
                                         g / (1.0 + (-g).exp()) * u
                                     })
                                     .collect()

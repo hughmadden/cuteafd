@@ -136,7 +136,7 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--capacity', type=int, required=True)
     parser.add_argument('--experts', type=int, default=384)
-    parser.add_argument('--topk', type=int, choices=(3,6), default=6)
+    parser.add_argument('--topk', type=int, choices=(3,6,8), default=6)
     parser.add_argument('--block-size', type=int, choices=(8,16,32,64), default=8)
     args = parser.parse_args()
     export(args.output,args.capacity,args.experts,args.topk,args.block_size)

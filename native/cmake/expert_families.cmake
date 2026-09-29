@@ -9,7 +9,7 @@
 # coordinator) into the SM120 one; entries for the other architecture are
 # skipped so one list serves both builds.
 #
-# FAMILY:exl3-kTIERS entries (for example `dsv4p:exl3-k23`) are EXL3 packages,
+# FAMILY:exl3-kTIERS entries (for example `dsv4p:exl3-k23`, `glm:exl3-k45`) are EXL3 packages,
 # built by cmake/v41_exl3.cmake; this file builds only the native families.
 set(CUTEAFD_NATIVE_EXPERT_FAMILIES)
 foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)

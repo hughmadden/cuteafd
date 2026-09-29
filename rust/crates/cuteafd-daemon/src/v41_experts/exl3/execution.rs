@@ -43,7 +43,8 @@ struct Manifest {
     capacity: usize,
     top_k: usize,
     bits: Vec<usize>,
-    swiglu_limit: f32,
+    /// `null` for an unclamped SwiGLU (GLM).
+    swiglu_limit: Option<f32>,
     direct: bool,
     sms: usize,
     blocks_per_sm: usize,
@@ -328,7 +329,7 @@ impl<'a> Exl3Execution<'a> {
                     && meta.intermediate == weight.layout.intermediate
                     && meta.experts == weight.layout.experts
                     && meta.bits == weight.layout.tiers
-                    && meta.swiglu_limit == 10.0,
+                    && meta.swiglu_limit == cuteafd_core::expert_geometry().swiglu_limit(),
                 "EXL3 export/residency geometry mismatch"
             );
             // V4.1 dSpark drafts route top-3; DeepSeek V4 stages and every
