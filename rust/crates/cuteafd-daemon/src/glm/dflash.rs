@@ -20,7 +20,6 @@ use cuteafd_loader::{read_safetensors_metadata, SafetensorsTensorMetadata};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 type Dev<'a> = DeviceAllocation<'a>;
@@ -238,8 +237,14 @@ fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
 }
 
 struct Checkpoint {
-    file: std::fs::File,
+    data: Vec<u8>,
     tensors: HashMap<String, SafetensorsTensorMetadata>,
+}
+
+/// Reads the drafter's safetensors file on a thread (while the target loads).
+pub(crate) fn prefetch(snapshot: &Path) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    let path = snapshot.join("model.safetensors");
+    std::thread::spawn(move || std::fs::read(path))
 }
 
 impl Checkpoint {
@@ -247,22 +252,23 @@ impl Checkpoint {
         let t = self.tensors.get(name).with_context(|| format!("DFlash2 checkpoint has no {name}"))?;
         ensure!(t.shape == shape && t.byte_length as usize == shape.iter().product::<usize>() * 2,
             "{name}: shape {:?}, expected BF16 {shape:?}", t.shape);
-        let mut bytes = vec![0u8; t.byte_length as usize];
-        self.file.read_exact_at(&mut bytes, t.byte_offset).with_context(|| format!("reading {name}"))?;
-        Ok(bytes)
+        let range = t.byte_offset as usize..(t.byte_offset + t.byte_length) as usize;
+        Ok(self.data.get(range).with_context(|| format!("{name} lies past the file"))?.to_vec())
     }
 }
 
 impl<'a> GlmDrafter<'a> {
-    /// Loads the drafter's weights and allocates `slots` ring contexts; draft
-    /// steps take up to `max_sequences` sequences. `mask_row` is the target
-    /// embedding of the mask token.
-    pub fn load(library: &'a NativeLibrary, snapshot: &Path, stream: *mut c_void, slots: usize,
+    /// Loads the drafter's weights from `file` (its safetensors bytes, see
+    /// [`prefetch`]) and allocates `slots` ring contexts; draft steps take up
+    /// to `max_sequences` sequences. `mask_row` is the target embedding of
+    /// the mask token.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load(library: &'a NativeLibrary, snapshot: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
         max_sequences: usize, mask_row: Vec<u8>) -> Result<Self> {
         let cfg = DflashConfig::read(snapshot)?;
         let path = snapshot.join("model.safetensors");
         let checkpoint = Checkpoint {
-            file: std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?,
+            data: file,
             tensors: read_safetensors_metadata(&path)?.into_iter().map(|t| (t.name.clone(), t)).collect(),
         };
         let upload = |bytes: &[u8]| -> Result<Dev<'a>> {

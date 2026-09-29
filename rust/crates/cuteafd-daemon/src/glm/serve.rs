@@ -10,6 +10,10 @@ use super::engine::{GlmEngine, GlmPlacement, PageAllocator, DECODE_ROWS};
 
 /// Most copy-window draft tokens verified per sequence and step.
 const COPY_DRAFT: usize = 7;
+/// Drafting steps before a plain step re-prices a concurrency.
+const PLAIN_PROBE_STEPS: usize = 256;
+/// Longest run of steps without a draft step after plans that verified none.
+const MAX_DRAFT_SKIP: usize = 8;
 use super::{embed_rows, open, Opened};
 use anyhow::{Context, Result};
 use cuteafd_api::native_v41::glm::GlmEncoding;
@@ -218,6 +222,11 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
     let mut cost = StepCost::new(&dflash_policy::K4_TP4_STEP_MS, DECODE_ROWS);
+    // Steps since each concurrency last ran a plain step (one row per sequence).
+    let mut plain_age = vec![0usize; DECODE_ROWS + 1];
+    // After plans that verify no drafts, skip drafting for a while (doubling
+    // up to MAX_DRAFT_SKIP steps): the draft step costs a verified row's worth.
+    let (mut skip, mut skip_next) = (0usize, 1usize);
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
     let (hidden, vocab) = (engine.cfg.hidden, engine.cfg.vocab_size);
@@ -319,25 +328,40 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             .min(a.capacity - a.placement.len - 1)).collect();
         // DFlash2 drafts after every next token, then the policy's counts.
         let drafted: Vec<Option<super::dflash::Draft>> = match drafter {
-            Some(drafter) if active.iter().any(|a| a.slot.is_some()) => {
+            Some(drafter) if skip == 0 && active.iter().any(|a| a.slot.is_some()) => {
                 let seqs: Vec<(usize, DraftSeq)> = active.iter().enumerate()
                     .filter_map(|(i, a)| a.slot.map(|slot| (i, DraftSeq { slot, anchor: a.next, position: a.placement.len })))
                     .collect();
                 let anchors: Vec<u32> = seqs.iter().map(|(_, s)| s.anchor).collect();
-                let drafts = drafter.draft(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(),
-                    &embed_rows(&opened.catalog, &anchors, hidden)?, engine.weights.head.buffer.ptr)?;
+                let timer = Instant::now();
+                let drafts = embed_rows(&opened.catalog, &anchors, hidden).and_then(|rows| drafter.draft(
+                    &seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &rows, engine.weights.head.buffer.ptr));
+                cost.observe_draft(timer.elapsed().as_secs_f64() * 1e3);
                 let mut out = vec![None; active.len()];
-                for ((i, _), draft) in seqs.into_iter().zip(drafts) {
-                    out[i] = Some(draft);
+                match drafts {
+                    Ok(drafts) => {
+                        for ((i, _), draft) in seqs.into_iter().zip(drafts) {
+                            out[i] = Some(draft);
+                        }
+                    }
+                    // Drafts only speed decoding up; the step verifies the next tokens alone.
+                    Err(error) => tracing::warn!("DFlash2 draft failed: {error:#}"),
                 }
                 out
             }
             _ => vec![None; active.len()],
         };
+        // With several sequences, a plain step now and then prices what not
+        // drafting costs (sequences that route alike share expert reads).
+        let concurrency = active.len();
+        plain_age[concurrency] += 1;
+        let probe = drafter.is_some() && policy.fixed.is_none() && concurrency > 1
+            && (cost.plain_unseen(concurrency) || plain_age[concurrency] > PLAIN_PROBE_STEPS);
         let planned: Vec<usize> = {
             let indices: Vec<usize> = (0..active.len()).filter(|&i| drafted[i].is_some()).collect();
             let mut counts = vec![0; active.len()];
-            if let Some(fixed) = policy.fixed {
+            if probe {
+            } else if let Some(fixed) = policy.fixed {
                 for &i in &indices {
                     counts[i] = fixed.min(limits[i]).min(drafted[i].as_ref().map_or(0, |d| d.tokens.len()));
                 }
@@ -346,12 +370,22 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 let confidence: Vec<Vec<f64>> = indices.iter()
                     .map(|&i| active[i].drafts.confidence(&drafted[i].as_ref().unwrap().features)).collect();
                 let caps: Vec<usize> = indices.iter().map(|&i| limits[i]).collect();
-                for (&i, n) in indices.iter().zip(dflash_policy::plan(&histories, &confidence, &caps, &cost)) {
+                for (&i, n) in indices.iter().zip(dflash_policy::plan(&histories, &confidence, &caps, concurrency, &cost)) {
                     counts[i] = n;
                 }
             }
             counts
         };
+        if skip > 0 {
+            skip -= 1;
+        } else if drafted.iter().any(Option::is_some) && !probe && policy.fixed.is_none() {
+            if planned.iter().all(|&n| n == 0) {
+                skip = skip_next;
+                skip_next = (skip_next * 2).min(MAX_DRAFT_SKIP);
+            } else {
+                skip_next = 1;
+            }
+        }
         // Each sequence verifies its next token, then its DFlash2 drafts, or
         // a copy-window draft when it agrees with them and runs longer.
         let mut used_copy = vec![false; active.len()];
@@ -365,7 +399,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             let dflash: &[u32] = drafted[i].as_ref().map_or(&[], |d| &d.tokens[..planned[i]]);
             let full: &[u32] = drafted[i].as_ref().map_or(&[], |d| &d.tokens);
             // `emit` already appended `next` to the history.
-            let copy = copy_drafts(&a.history, limits[i].min(a.draft_limit));
+            let copy = if probe { Vec::new() } else { copy_drafts(&a.history, limits[i].min(a.draft_limit)) };
             let agrees = copy.iter().zip(full).take_while(|(c, d)| c == d).count() >= dflash.len();
             let draft = if copy.len() > dflash.len() && agrees {
                 used_copy[i] = true;
@@ -395,7 +429,10 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 continue;
             }
         };
-        cost.observe(tokens.len(), timer.elapsed().as_secs_f64() * 1e3);
+        cost.observe(concurrency, tokens.len(), timer.elapsed().as_secs_f64() * 1e3);
+        if tokens.len() == concurrency {
+            plain_age[concurrency] = 0;
+        }
         let mut offset = 0;
         let mut context = Vec::new();
         let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(starts).enumerate()

@@ -12,6 +12,7 @@ parser.add_argument('--case', choices=['counting','code','code-reasoning','topic
 parser.add_argument('--nonce', help='Use the same prompt nonce for controlled comparisons; defaults to a fresh UUID')
 parser.add_argument('--max-tokens', type=int, help='Override the corpus output budget for both arms of a controlled comparison')
 parser.add_argument('--allow-cold', action='store_true', help='Do not require prefix-cache hits (engines without a prefix cache)')
+parser.add_argument('--distinct-prompts', action='store_true', help='Give each concurrent request its own nonce (requests stop sharing routes); implies --allow-cold')
 args=parser.parse_args()
 if args.repeats < 1 or any(c < 1 or c > 16 for c in args.concurrency):
  parser.error('repeats must be positive and concurrency must be 1..16')
@@ -35,7 +36,7 @@ def validate(result):
  assert checked['response_nonempty'] and checked['objective_checks_passed'] is not False,checked
  return checked
 def run(i):
- b=api['payload'](prompt,True);b['max_tokens']=definition['max_tokens']
+ b=api['payload'](prompt.replace('. ',f'-{i}. ',1) if args.distinct_prompts else prompt,True);b['max_tokens']=definition['max_tokens']
  b['thinking']={'type':definition.get('thinking','disabled')}
  if definition.get('reasoning_effort'):b['reasoning_effort']=definition['reasoning_effort']
  start=time.perf_counter();r=None
@@ -66,8 +67,8 @@ for c in args.concurrency:
   try:
    for row in rows:
     usage=row['result']['usage'];pair=[row['result']['text'],{k:usage[k] for k in ['prompt_tokens','completion_tokens','total_tokens']}]
-    if args.case=='counting':assert pair==reference,(c,repeat,'counting output changed')
-    assert args.allow_cold or usage['prompt_cache_hit_tokens']==usage['prompt_tokens'],(c,repeat,'prompt was not warm')
+    if args.case=='counting' and not args.distinct_prompts:assert pair==reference,(c,repeat,'counting output changed')
+    assert args.allow_cold or args.distinct_prompts or usage['prompt_cache_hit_tokens']==usage['prompt_tokens'],(c,repeat,'prompt was not warm')
   except Exception as error:fail(phase,rows,error)
   # Inclusive span from earliest reasoning/answer delta to finish, including admission gaps.
   begin=min(r['start']+r['result']['first_output_seconds'] for r in rows)

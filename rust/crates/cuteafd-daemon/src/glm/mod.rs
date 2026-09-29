@@ -75,6 +75,11 @@ pub(crate) struct GoldenArgs {
     /// python/reference/glm_dflash2/reference.py's output directory.
     #[arg(long)]
     pub draft_oracle: Option<PathBuf>,
+    /// Teacher-force this many copies of the sequence together (prefilled to
+    /// staggered lengths), --step-rows rows each per step, and compare every
+    /// copy's logits with the golden logits.
+    #[arg(long)]
+    pub sequences: Option<usize>,
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -104,6 +109,7 @@ impl Opened {
         let programs = self.library.dsv4_programs()?.with_manifest(&args.manifest)?;
         programs.load_all()?;
         let stream = self.library.cuda_stream_create()?;
+        let draft_file = args.draft.as_deref().map(dflash::prefetch);
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::GlmLoader { library: &self.library, catalog: &self.catalog, stream };
@@ -118,7 +124,9 @@ impl Opened {
             ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
                 && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash2 drafter does not fit this target");
             let mask = embed_rows(&self.catalog, &[cfg.mask_token], self.cfg.hidden)?;
-            engine.drafter = Some(dflash::GlmDrafter::load(&self.library, snapshot, stream, args.draft_sequences,
+            let file = draft_file.context("drafter prefetch")?.join()
+                .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
+            engine.drafter = Some(dflash::GlmDrafter::load(&self.library, snapshot, file, stream, args.draft_sequences,
                 args.draft_sequences, mask)?);
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash2 drafter resident");
         }
@@ -206,6 +214,9 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
     }
     if engine.drafter.is_some() {
         return draft_run(args, opened, engine, transport, runtime);
+    }
+    if let Some(copies) = args.sequences {
+        return multi_run(args, opened, engine, copies, transport, runtime);
     }
     let (catalog, cfg) = (&opened.catalog, &opened.cfg);
     let layers = engine.weights.layers.len();
@@ -424,5 +435,53 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
     println!("draft oracle: {n} anchors, identical drafts {exact}/{n}, first draft {first}/{n}, matching prefix \
         {:.2} of {drafts_per}, worst final-norm cosine {worst:.6}, first-margin max error {feature_error:.4}, \
         {:.2} ms/draft", matched as f64 / n as f64, draft_seconds * 1e3 / n as f64);
+    Ok(())
+}
+
+/// Several copies of the golden sequence verified in the same decode steps.
+fn multi_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, copies: usize,
+    mut transport: Option<&mut V41Tp4Roce>, runtime: &tokio::runtime::Runtime) -> Result<()> {
+    let (catalog, hidden, vocab) = (&opened.catalog, opened.cfg.hidden, opened.cfg.vocab_size);
+    let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
+        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let golden: Vec<f32> = std::fs::read(args.golden.join("logits.bin"))?
+        .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+    let prefill = args.prefill.unwrap_or(512);
+    let mut pages = engine::PageAllocator::new(engine.pages);
+    let mut placements = Vec::new();
+    for copy in 0..copies {
+        let mut placement = pages.admit(tokens.len())?;
+        let n = prefill - 37 * copy;
+        engine.prefill(&mut placement, &embed_rows(catalog, &tokens[..n], hidden)?,
+            transport.as_deref_mut().map(|t| (t, runtime)), None)?;
+        placements.push(placement);
+    }
+    let (mut agree, mut total) = (vec![0usize; copies], vec![0usize; copies]);
+    loop {
+        let counts: Vec<usize> = placements.iter().map(|p| args.step_rows.min(tokens.len() - p.len)).collect();
+        if counts.contains(&0) {
+            break;
+        }
+        let mut rows = Vec::new();
+        for (p, &n) in placements.iter().zip(&counts) {
+            rows.extend_from_slice(&tokens[p.len..p.len + n]);
+        }
+        let starts: Vec<usize> = placements.iter().map(|p| p.len).collect();
+        let mut step: Vec<(&mut engine::GlmPlacement, usize)> = placements.iter_mut().zip(&counts).map(|(p, &n)| (p, n)).collect();
+        let logits = engine.verify(&mut step, &embed_rows(catalog, &rows, hidden)?,
+            transport.as_deref_mut().map(|t| (t, runtime)), None)?.context("decode needs every layer")?;
+        let mut offset = 0;
+        for (copy, (&start, &n)) in starts.iter().zip(&counts).enumerate() {
+            for r in 0..n {
+                let ours = &logits[(offset + r) * vocab..][..vocab];
+                let theirs = &golden[(start + r) * vocab..][..vocab];
+                agree[copy] += usize::from(argmax(ours) == argmax(theirs));
+                total[copy] += 1;
+            }
+            offset += n;
+        }
+    }
+    println!("multi: {copies} copies, {} rows each per step: top-1 agreement per copy {:?}", args.step_rows,
+        agree.iter().zip(&total).map(|(a, t)| format!("{:.1}% of {t}", 100.0 * *a as f64 / *t as f64)).collect::<Vec<_>>());
     Ok(())
 }
