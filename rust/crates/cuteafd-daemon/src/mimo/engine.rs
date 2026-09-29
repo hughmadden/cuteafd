@@ -16,7 +16,8 @@
 //! program reads in-step keys from it, older keys from the ring, and commits
 //! the step to the ring afterwards.
 use super::weights::{MimoLayer, MimoWeights};
-use crate::v41_experts::fp8::Fp8Experts;
+use crate::v41_experts::fp8::{Fp8Experts, Fp8Layer};
+use cuteafd_loader::fp8_experts::Fp8ExpertTensors;
 use crate::v41_memory::{DeviceAllocation, HostAllocation};
 use cuteafd_transport::v41_expert::{V41Tp4Roce, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
 use cuteafd_transport::{
@@ -42,6 +43,11 @@ const MAX_RANKS: usize = 6;
 pub(crate) enum Experts<'a> {
     /// The TP1 FP8 package on the coordinator GPU (resident MoE layers).
     Local(Fp8Experts<'a>),
+    /// The TP1 package on the coordinator GPU with a window of resident MoE
+    /// layers, loading each missing layer over the oldest (the model's experts
+    /// do not fit: MiMo V2.6 Pro's are 495 GiB). For prefill checks; a decode
+    /// step would reload every layer.
+    Streamed { experts: RefCell<Fp8Experts<'a>>, tensors: &'a Fp8ExpertTensors, window: usize },
     /// Spark ranks serving the `fp8` family over RoCE.
     Spark { transport: RefCell<V41Tp4Roce>, runtime: tokio::runtime::Runtime },
 }
@@ -322,6 +328,13 @@ impl<'a> MimoEngine<'a> {
     pub fn prefill_forced(&self, placement: &mut MimoPlacement, embed: &[u8],
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<Vec<f32>>> {
+        self.prefill_rows_logits(placement, embed, on_layer, forced, false)
+    }
+
+    /// `prefill_forced` returning every row's logits (`all_rows`) or the last row's.
+    pub fn prefill_rows_logits(&self, placement: &mut MimoPlacement, embed: &[u8],
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, all_rows: bool) -> Result<Option<Vec<f32>>> {
         let (t, start) = (embed.len() / (self.cfg.hidden * 2), placement.len);
         ensure!(t > 0 && t <= self.prefill_rows && start + t <= self.max_context, "prefill of {t} rows at {start}");
         let used = (start + t).div_ceil(PAGE_ROWS);
@@ -334,7 +347,7 @@ impl<'a> MimoEngine<'a> {
             page_table: placement.pages[..used].to_vec(),
             table_stride: 0,
         };
-        let logits = self.step(&tables, embed, 1, on_layer, forced)?;
+        let logits = self.step(&tables, embed, if all_rows { t } else { 1 }, on_layer, forced)?;
         placement.len += t;
         Ok(logits)
     }
@@ -506,6 +519,28 @@ impl<'a> MimoEngine<'a> {
                 let input = if local.wire_input() { w.wire.buffer.ptr } else { w.x.buffer.ptr };
                 // SAFETY: input rows, route ids (u32 = i32 for ids < 256), weights and
                 // delta are live buffers of `t` rows on this engine's stream.
+                unsafe {
+                    local.run(resident, t, input, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
+                        w.delta.buffer.ptr, self.stream)
+                }
+            }
+            Experts::Streamed { experts, tensors, window } => {
+                let mut local = experts.borrow_mut();
+                if local.index_of(index).is_err() {
+                    // SAFETY: the engine owns this stream; draining it retires every
+                    // launch that read the layer about to be evicted.
+                    unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+                    if local.layers.len() >= (*window).max(1) {
+                        local.layers.remove(0);
+                    }
+                    let started = std::time::Instant::now();
+                    local.layers.push(Fp8Layer::load(self.library, tensors, index, 1, 0)?);
+                    self.profile.borrow_mut()[1] += started.elapsed().as_secs_f64();
+                }
+                let resident = local.index_of(index)?;
+                let input = if local.wire_input() { w.wire.buffer.ptr } else { w.x.buffer.ptr };
+                // SAFETY: as for `Local`; the layer stays resident until a later step evicts it
+                // after draining the stream.
                 unsafe {
                     local.run(resident, t, input, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
                         w.delta.buffer.ptr, self.stream)

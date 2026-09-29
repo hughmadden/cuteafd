@@ -1,5 +1,6 @@
-//! FP8 experts (the checkpoint's E4M3 weights with FP32 128x128 block scales):
-//! the CPU oracle and the `--local` coordinator run.
+//! FP8 experts (the checkpoint's E4M3 weights with FP32 128x128 block scales,
+//! or MXFP4: packed E2M1 with UE8M0 per 32): the CPU oracle and the `--local`
+//! coordinator run.
 //!
 //! The oracle is the checkpoint math at full width: weights `bf16(w * s)`,
 //! BF16 gate and up (clamped at the config's `swiglu_limit` when it has one:
@@ -12,7 +13,7 @@ use crate::v41_experts::fp8::{package_directory, Fp8Experts};
 use crate::v41_memory::DeviceAllocation;
 use anyhow::{Context, Result};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::fp8_experts::{Fp8ExpertTensors, Fp8Projection};
+use cuteafd_loader::fp8_experts::{ExpertFormat, Fp8ExpertTensors, Fp8Projection};
 use cuteafd_loader::OfficialV41Catalog;
 use cuteafd_transport::ExpertProtocolV2RouteEntry;
 use std::collections::BTreeMap;
@@ -45,6 +46,17 @@ fn dequantize(tensors: &Fp8ExpertTensors, layer: usize, expert: usize, projectio
     let (w_bytes, s_bytes) = tensors.slice_bytes(projection, 1)?;
     let (mut weight, mut scale, mut staging) = (vec![0u8; w_bytes], vec![0u8; s_bytes], Vec::new());
     tensors.read_slice(layer, expert, projection, 1, 0, &mut weight, &mut scale, &mut staging)?;
+    if tensors.format() == ExpertFormat::Mxfp4 {
+        // Packed E2M1 (even element in the low nibble) times 2^(s - 127) per 32 values.
+        const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+        let value = |code: u8| if code & 8 != 0 { -E2M1[usize::from(code & 7)] } else { E2M1[usize::from(code & 7)] };
+        return Ok((0..weight.len() * 2).map(|i| {
+            let (row, col) = (i / cols, i % cols);
+            let byte = weight[i / 2];
+            let code = if i % 2 == 0 { byte & 0xF } else { byte >> 4 };
+            bf16(value(code) * (f32::from(scale[row * (cols / 32) + col / 32]) - 127.0).exp2())
+        }).collect());
+    }
     let scale: Vec<f32> = scale.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
     let grid = cols.div_ceil(128);
     Ok(weight.iter().enumerate().map(|(i, &code)| {

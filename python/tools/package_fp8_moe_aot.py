@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Build or verify an exact FP8 routed-expert package (``fp8-<geometry>``).
 
-The checkpoint's E4M3 experts with FP32 128x128 block scales run as
+The checkpoint's E4M3 experts with FP32 128x128 block scales (or MXFP4
+experts, ``mimop``: packed E2M1 + UE8M0 per 32, grouped GEMV route only) run as
 ``b12x.integration.cuteafd.fp8_moe`` programs (route ``auto``: grouped GEMV
 up to 1024 live rows and the expert-stationary streaming GEMMs above on
 GB10 (spark packages, wire input); GEMV up to 2048 rows and the grouped TMA
@@ -18,7 +19,8 @@ capacity, and a verified ``manifest.json``:
 Library ABI (``native/include/cuteafd_fp8_moe.h``)::
 
     int32_t cuteafd_fp8moe_info(uint32_t* words, uint32_t count);
-        words: [0] ABI 1, [1] hidden, [2] slice, [3] experts, [4] top-k,
+        words: [0] ABI 1 (E4M3 + FP32 128x128 scales) or 2 (MXFP4: packed E2M1 +
+        UE8M0 per 32; slices zero-padded to a 128-aligned width), [1] hidden, [2] slice, [3] experts, [4] top-k,
         [5] intermediate, [6] tp, [7] input dtype (7 = FP8 K32 wire rows, 1 = BF16 rows),
         [8] SwiGLU limit (FP32 bits, 0 = none), [9] capacities n, [10..] capacities
     int32_t cuteafd_fp8moe_scratch_bytes(uint32_t capacity, uint64_t* bytes);
@@ -49,6 +51,7 @@ os.environ.setdefault("B12X_COMPILE_MEMORY_CACHE", "0")
 
 SCHEMA = "cuteafd.fp8moe-package.v1"
 ROLE_LAYOUTS = {"spark": ("tp4", "tp2"), "coordinator": ("tp1",)}
+MXFP4_ROLE_LAYOUTS = {"spark": ("tp6", "tp2"), "coordinator": ("tp1",)}
 ROLE_COMPUTE = {"spark": (12, 1), "coordinator": (12, 0)}
 # Spark ranks take the FP8 K32 wire rows of the expert protocol; coordinator
 # experts take the BF16 activations directly (no input quantization at all).
@@ -164,7 +167,7 @@ extern "C" int32_t cuteafd_fp8moe_launch(void* context, uint32_t capacity, void*
 
 def info_words(g, capacities: list[int], wire: bool) -> list[int]:
     limit = struct.unpack("<I", struct.pack("<f", float(g.swiglu_limit)))[0]
-    words = [1, g.hidden, g.slice, g.experts, g.top_k, g.intermediate, g.tp, 7 if wire else 1, limit,
+    words = [2 if g.weights == "mxfp4" else 1, g.hidden, g.slice, g.experts, g.top_k, g.intermediate, g.tp, 7 if wire else 1, limit,
              len(capacities), *capacities]
     if len(words) > INFO_WORDS:
         raise ValueError(f"at most {INFO_WORDS - 10} capacities per package")
@@ -188,9 +191,12 @@ def build(args: argparse.Namespace) -> None:
     base = GEOMETRIES[args.geometry]
     capacities = sorted({int(v) for v in args.capacities.split(",")})
     layouts = args.layouts.split(",") if args.layouts else list(ROLE_LAYOUTS[args.role])
+    if base.weights == "mxfp4" and not args.layouts:
+        # MXFP4 slices pad to 128 (MiMo V2.6 Pro: TP6 over all six Sparks, TP2 x EP3 shards).
+        layouts = list(MXFP4_ROLE_LAYOUTS[args.role])
     # Default Spark layouts keep only the TP degrees that split the intermediate
     # into whole 128-row blocks (Qwen 3.8 Flash Next's 640 splits into none).
-    if not args.layouts:
+    elif not args.layouts:
         layouts = [l for l in layouts if base.intermediate % (128 * int(l.removeprefix("tp"))) == 0]
         if not layouts:
             raise SystemExit(f"{args.geometry}: intermediate {base.intermediate} has no default {args.role} "
@@ -233,6 +239,7 @@ def build(args: argparse.Namespace) -> None:
             manifest["layouts"][layout] = {
                 "tp": tp, "hidden": g.hidden, "slice": g.slice, "experts": g.experts, "top_k": g.top_k,
                 "intermediate": g.intermediate, "swiglu_limit": g.swiglu_limit, "input": "wire" if wire else "bf16",
+                "weights": g.weights,
                 "capacities": [{"capacity": p["capacity"], "scratch_bytes": p["scratch"]} for p in programs]}
         manifest["files"] = {str(p.relative_to(stage)): {"bytes": p.stat().st_size, "sha256": digest(p)}
                              for p in sorted(stage.rglob("*")) if p.is_file()}
@@ -268,7 +275,7 @@ def main() -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     create = commands.add_parser("build")
     create.add_argument("--role", choices=sorted(ROLE_LAYOUTS), required=True)
-    create.add_argument("--geometry", choices=("mimo", "glm", "glmf", "qwen4"), required=True)
+    create.add_argument("--geometry", choices=("mimo", "mimop", "glm", "glmf", "qwen4"), required=True)
     create.add_argument("--layouts", help="comma list (default: tp4,tp2 for spark, tp1 for coordinator)")
     create.add_argument("--capacities", default="1,16,80,256,1024,4096")
     create.add_argument("--input", choices=("wire", "bf16"),

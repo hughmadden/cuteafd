@@ -44,6 +44,11 @@ pub(crate) struct EngineArgs {
     /// resident layers' experts must fit: 6.4 GiB each).
     #[arg(long)]
     pub local_experts: bool,
+    /// With --local-experts: keep only N MoE layers' experts resident and load
+    /// each missing layer over the oldest (prefill checks of models whose
+    /// experts do not fit one GPU, such as V2.6 Pro).
+    #[arg(long, requires = "local_experts")]
+    pub expert_window: Option<usize>,
     /// TP1 FP8 package layout for --local-experts (default `<libdir>/fp8/fp8-mimo/tp1`).
     #[arg(long)]
     pub fp8_package: Option<PathBuf>,
@@ -67,6 +72,10 @@ pub(crate) struct GoldenArgs {
     /// so every layer's cosine measures that layer alone.
     #[arg(long)]
     pub teacher_force: bool,
+    /// Prefill logits for every row (not only the last): top-1 agreement and
+    /// mean NLL over the whole prefill.
+    #[arg(long)]
+    pub all_logits: bool,
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -131,6 +140,11 @@ impl Opened {
             let directory = args.fp8_package.clone()
                 .unwrap_or_else(|| crate::v41_experts::fp8::package_directory(&args.native_lib, 1));
             let (free, _) = self.library.cuda_memory_info()?;
+            if let Some(window) = args.expert_window {
+                let experts = crate::v41_experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, 0..0, 1, 0,
+                    args.prefill_rows, free.saturating_sub(4 << 30))?;
+                return Ok(Some(engine::Experts::Streamed { experts: std::cell::RefCell::new(experts), tensors, window }));
+            }
             let started = Instant::now();
             let local = crate::v41_experts::fp8::Fp8Experts::load(&self.library, tensors, &directory,
                 moe_layers[0]..moe_layers[moe_layers.len() - 1] + 1, 1, 0, args.prefill_rows,
@@ -249,9 +263,9 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
     let forced = |layer: usize| -> Option<Vec<u8>> {
         std::fs::read(args.golden.join(format!("layer{layer:02}.bin"))).ok().map(|rows| rows[..prefill * row].to_vec())
     };
-    let logits = engine.prefill_forced(&mut placement, &embed[..prefill * row],
+    let logits = engine.prefill_rows_logits(&mut placement, &embed[..prefill * row],
         Some(&mut |layer, stream| compare(layer, 0, stream, &mut worst)),
-        args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>))?;
+        args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>), args.all_logits)?;
     let prefill_seconds = started.elapsed().as_secs_f64();
     let started = Instant::now();
     let mut decode_worst = Vec::new();
@@ -300,9 +314,39 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
     println!("prefill: {prefill} tokens through {layers} layers in {prefill_seconds:.2} s");
     if let Some(logits) = logits {
         let golden = golden_logits()?;
-        let last = &golden[(prefill - 1) * cfg.vocab_size..][..cfg.vocab_size];
-        let (cosine, _) = similarity(&logits, last);
-        println!("last-row logits: argmax engine {} golden {} cosine {cosine:.6}", argmax(&logits), argmax(last));
+        let vocab = cfg.vocab_size;
+        let rows = logits.len() / vocab;
+        let first = prefill - rows;
+        let last = &golden[(prefill - 1) * vocab..][..vocab];
+        let ours_last = &logits[(rows - 1) * vocab..];
+        let (cosine, _) = similarity(ours_last, last);
+        println!("last-row logits: argmax engine {} golden {} cosine {cosine:.6}", argmax(ours_last), argmax(last));
+        if rows > 1 {
+            let nll = |l: &[f32], next: usize| -> f64 {
+                let top = l.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+                top + l.iter().map(|&x| (x as f64 - top).exp()).sum::<f64>().ln() - l[next] as f64
+            };
+            let (mut agree, mut ours_nll, mut golden_nll, mut ours_ok, mut scored) = (0usize, 0f64, 0f64, 0usize, 0usize);
+            for r in 0..rows {
+                let (ours, theirs) = (&logits[r * vocab..][..vocab], &golden[(first + r) * vocab..][..vocab]);
+                agree += usize::from(argmax(ours) == argmax(theirs));
+                if let Some(&next) = tokens.get(first + r + 1) {
+                    ours_nll += nll(ours, next as usize);
+                    golden_nll += nll(theirs, next as usize);
+                    ours_ok += usize::from(argmax(ours) == next as usize);
+                    scored += 1;
+                }
+            }
+            let scored_f = scored.max(1) as f64;
+            println!("prefill logits over {rows} rows: top-1 agreement {:.1}% | next-token accuracy {:.1}% | \
+                mean NLL engine {:.4} golden {:.4}", 100.0 * agree as f64 / rows as f64,
+                100.0 * ours_ok as f64 / scored_f, ours_nll / scored_f, golden_nll / scored_f);
+        }
+    }
+    let profile = engine.profile.borrow();
+    if profile[1] > 0.0 {
+        println!("phases: GPU wait before expert requests {:.2} s, expert exchange / streamed loads {:.2} s",
+            profile[0], profile[1]);
     }
     Ok(())
 }

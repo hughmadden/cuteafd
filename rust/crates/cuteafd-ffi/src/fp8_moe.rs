@@ -21,12 +21,15 @@ pub struct Fp8MoeInfo {
     pub wire_input: bool,
     pub swiglu_limit: f32,
     pub capacities: Vec<usize>,
+    /// MXFP4 weights (packed E2M1 + UE8M0 per 32, ABI 2) rather than E4M3 +
+    /// FP32 128x128 scales (ABI 1). MXFP4 slices are zero-padded to 128.
+    pub mxfp4: bool,
 }
 
 impl Fp8MoeInfo {
     fn from_words(words: [u32; 16]) -> Result<Self> {
         let count = words[9] as usize;
-        ensure!(words[0] == 1 && matches!(words[7], 1 | 7) && (1..=6).contains(&count),
+        ensure!(matches!(words[0], 1 | 2) && matches!(words[7], 1 | 7) && (1..=6).contains(&count),
             "unsupported FP8 expert package ABI {words:?}");
         let info = Self {
             hidden: words[1] as usize,
@@ -38,8 +41,10 @@ impl Fp8MoeInfo {
             wire_input: words[7] == 7,
             swiglu_limit: f32::from_bits(words[8]),
             capacities: words[10..10 + count].iter().map(|&c| c as usize).collect(),
+            mxfp4: words[0] == 2,
         };
-        ensure!(info.tp > 0 && info.slice * info.tp == info.intermediate && info.capacities.windows(2).all(|w| w[0] < w[1]),
+        let sliced = if info.mxfp4 { info.slice * info.tp >= info.intermediate } else { info.slice * info.tp == info.intermediate };
+        ensure!(info.tp > 0 && sliced && info.capacities.windows(2).all(|w| w[0] < w[1]),
             "inconsistent FP8 expert package info {info:?}");
         Ok(info)
     }
