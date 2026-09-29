@@ -160,6 +160,26 @@ fn capacity_suggests_a_supported_rank_count() {
 }
 
 #[test]
+fn capacity_counts_the_widest_rank_of_an_uneven_split() {
+    // 2048 = 16 whole 128-blocks: six ranks hold 3, 3, 3, 3, 2, 2 of them, so the
+    // widest carries 3/16 of the routed bytes, not 1/6.
+    let config = json!({"architectures": ["Glm5NextForConditionalGeneration"], "text_config": {
+        "hidden_size": 64, "vocab_size": 8, "num_hidden_layers": 2, "n_routed_experts": 2,
+        "num_experts_per_tok": 1, "moe_intermediate_size": 2048, "kv_lora_rank": 512, "qk_rope_head_dim": 0,
+        "qk_nope_head_dim": 256, "v_head_dim": 256, "index_topk": 2048, "index_kpool": 4,
+        "index_kpool_always_select_tail": true, "hc_mult": 4, "hc_sinkhorn_iters": 20, "swiglu_limit": 10.0,
+        "layer_types": ["linear_attention", "deepseek_sparse_attention"], "mlp_layer_types": ["dense", "sparse"],
+        "linear_attn_config": {"num_heads": 64, "head_dim": 128, "short_conv_kernel_size": 4, "gate_lower_bound": -5.0}}});
+    let dir = snapshot(config, &[("model.language_model.layers.1.mlp.experts.0.gate_proj.weight", "F8_E4M3",
+        vec![1024, 1024])]);
+    let report = plan(dir.path(), &PlanOptions { spark_ranks: 6, spark_budget_bytes: 180 << 10 }).unwrap();
+    assert!((report.spark_rank_share - 3.0 / 16.0).abs() < 1e-12, "{}", report.spark_rank_share);
+    assert!(!report.fits, "192 KiB on the widest rank exceeds 180 KiB");
+    let report = plan(dir.path(), &PlanOptions { spark_ranks: 6, spark_budget_bytes: 200 << 10 }).unwrap();
+    assert!(report.fits && report.min_spark_ranks == 6);
+}
+
+#[test]
 fn glm_next_facts_and_dflash2_drafter_are_described() {
     let dir = snapshot(
         json!({"architectures": ["Glm5NextForConditionalGeneration"], "text_config": {
