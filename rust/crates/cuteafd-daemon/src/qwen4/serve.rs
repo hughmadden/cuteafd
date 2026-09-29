@@ -210,6 +210,8 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total, mut replays) = (0u64, 0u64, 0u64);
+    // Verify steps (and replay steps) since the last completed request, and host seconds in verifies.
+    let (mut steps, mut replay_steps, mut verify_s) = (0u64, 0u64, 0f64);
     let (hidden, vocab) = (engine.cfg.hidden, engine.cfg.vocab_size);
     loop {
         while active.len() < max_sequences {
@@ -259,7 +261,11 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                     let embed = embed_rows(&opened.checkpoint, chunk, hidden)?;
                     logits = engine.prefill(&mut placement, chunk, &embed)?;
                 }
-                tracing::debug!(tokens = tokens.len(), elapsed_ms = started.elapsed().as_millis() as u64, "prefill");
+                let elapsed = started.elapsed().as_secs_f64();
+                let phases = std::mem::take(&mut *engine.profile.borrow_mut());
+                tracing::info!(tokens = tokens.len(), elapsed_ms = (1e3 * elapsed) as u64,
+                    tok_s = tokens.len() as f64 / elapsed, gpu_wait_ms = (1e3 * phases[0]) as u64,
+                    experts_ms = (1e3 * phases[1]) as u64, "prefill");
                 let mut request = Active {
                     history: tokens.clone(),
                     draft_limit: draft,
@@ -319,7 +325,10 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
         let embed = embed_rows(&opened.checkpoint, &tokens, hidden)?;
         let mut rows: Vec<(&mut Qwen4Placement, &[u32])> = active.iter_mut().zip(&sequences)
             .map(|(a, s)| (&mut a.placement, s.as_slice())).collect();
+        steps += 1;
+        let timer = Instant::now();
         let step = engine.verify(&mut rows, &embed, None).and_then(|logits| logits.context("decode needs every layer"));
+        verify_s += timer.elapsed().as_secs_f64();
         let logits = match step {
             Ok(logits) => logits,
             Err(error) => {
@@ -377,6 +386,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
         }
         if !replay.is_empty() {
             replays += 1;
+            replay_steps += 1;
             let tokens: Vec<u32> = replay.iter().flat_map(|&(i, kept)| sequences[i][..kept].iter().copied()).collect();
             let embed = embed_rows(&opened.checkpoint, &tokens, hidden)?;
             let mut placements: Vec<(Qwen4Placement, &[u32])> = replay.iter().map(|&(i, kept)| {
@@ -402,8 +412,9 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             let seconds = request.started.elapsed().as_secs_f64();
             let phases = std::mem::take(&mut *engine.profile.borrow_mut());
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
-                active = active.len(), gpu_wait_s = phases[0], experts_s = phases[1], replays,
-                "request complete");
+                active = active.len(), steps, replay_steps, verify_s, gpu_wait_s = phases[0], experts_s = phases[1],
+                replays, "request complete");
+            (steps, replay_steps, verify_s) = (0, 0, 0.0);
             allocator.release_slot(request.backup);
             allocator.release(request.placement);
         }
