@@ -155,6 +155,8 @@ pub(crate) struct GlmEngine<'a> {
     /// request, the Spark exchange, the logits download.
     pub profile: RefCell<[f64; 3]>,
     graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
+    /// The DFlash2 drafter; every step taps its target layers.
+    pub drafter: Option<super::dflash::GlmDrafter<'a>>,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -192,7 +194,7 @@ impl<'a> GlmEngine<'a> {
         library.copy_h2d(cos_sin.buffer, bytes_of(&table))?;
         Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
             workspace: RefCell::new(None), decode_workspace: RefCell::new(None), profile: RefCell::new([0.0; 3]),
-            graphs: RefCell::new(std::collections::HashMap::new()) })
+            graphs: RefCell::new(std::collections::HashMap::new()), drafter: None })
     }
 
     fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
@@ -375,6 +377,10 @@ impl<'a> GlmEngine<'a> {
             self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                 ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
                 &[rows, Dsv4Scalar::I32(1)])?;
+            if let Some(drafter) = &self.drafter {
+                let n = t.min(super::dflash::TAP_ROWS);
+                drafter.tap(index, w.h.buffer.ptr, t - n, n)?;
+            }
             if let Some(on_layer) = on_layer.as_mut() {
                 on_layer(index, &self.download(&w.h, t * h * 2)?)?;
             }
@@ -425,6 +431,10 @@ impl<'a> GlmEngine<'a> {
                 self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                     ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
                     &[rows, Dsv4Scalar::I32(deltas)])?;
+                // `h` now holds the previous layer's output.
+                if let (Some(drafter), Some(previous)) = (&self.drafter, index.checked_sub(1)) {
+                    drafter.tap(previous, w.h.buffer.ptr, 0, t)?;
+                }
                 let Some(layer) = layer else { return Ok(()) };
                 self.attention(w, index, layer, rows, "m64", tables)?;
                 self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),

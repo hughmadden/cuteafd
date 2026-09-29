@@ -1,5 +1,6 @@
 //! GLM 5.x (glm_moe_dsa) on the generic engine: weights, the coordinator
 //! programs' layer chain, and the golden comparison command.
+pub(crate) mod dflash;
 pub(crate) mod engine;
 pub(crate) mod serve;
 pub(crate) mod weights;
@@ -38,6 +39,13 @@ pub(crate) struct EngineArgs {
     /// Spark expert ranks in TP order (HOST:PORT,...), for MoE layers.
     #[arg(long)]
     pub peers: Option<String>,
+    /// DFlash2 drafter snapshot (incoai/GLM-5.3-DFlash2); taps the target
+    /// layers and drafts on the coordinator GPU.
+    #[arg(long)]
+    pub draft: Option<PathBuf>,
+    /// Sequences the drafter keeps a context for and drafts for at once.
+    #[arg(long, default_value_t = 16)]
+    pub draft_sequences: usize,
 }
 
 #[derive(Debug, clap::Args)]
@@ -57,6 +65,15 @@ pub(crate) struct GoldenArgs {
     /// Compare only logits during decode (decode then runs its captured graphs).
     #[arg(long)]
     pub no_layer_compare: bool,
+    /// With --draft: after the prefill, decode N greedy tokens one row per
+    /// step, drafting before each, and report how many drafts the target
+    /// reproduced (without it, drafts are scored against tokens.bin).
+    #[arg(long)]
+    pub generate: Option<usize>,
+    /// With --draft: run only the drafter on the golden taps and compare with
+    /// python/reference/glm_dflash2/reference.py's output directory.
+    #[arg(long)]
+    pub draft_oracle: Option<PathBuf>,
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -92,8 +109,18 @@ impl Opened {
         let model = loader.model(&self.cfg, layers)?;
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64, "GLM coordinator weights resident");
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
-        let engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
+        let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages)?;
+        if let Some(snapshot) = &args.draft {
+            let started = Instant::now();
+            let cfg = dflash::DflashConfig::read(snapshot)?;
+            ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
+                && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash2 drafter does not fit this target");
+            let mask = embed_rows(&self.catalog, &[cfg.mask_token], self.cfg.hidden)?;
+            engine.drafter = Some(dflash::GlmDrafter::load(&self.library, snapshot, stream, args.draft_sequences,
+                args.draft_sequences, mask)?);
+            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash2 drafter resident");
+        }
         let mut transport = match args.peers.as_deref() {
             Some(peers) => {
                 let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
@@ -173,6 +200,12 @@ fn golden(args: GoldenArgs) -> Result<()> {
 
 fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, mut transport: Option<&mut V41Tp4Roce>,
     runtime: &tokio::runtime::Runtime) -> Result<()> {
+    if let Some(dir) = &args.draft_oracle {
+        return draft_oracle(args, opened, engine, dir);
+    }
+    if engine.drafter.is_some() {
+        return draft_run(args, opened, engine, transport, runtime);
+    }
     let (catalog, cfg) = (&opened.catalog, &opened.cfg);
     let layers = engine.weights.layers.len();
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
@@ -252,5 +285,143 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
         let (cosine, _) = similarity(&logits, last);
         println!("last-row logits: argmax engine {} golden {} cosine {cosine:.6}", argmax(&logits)?, argmax(last)?);
     }
+    Ok(())
+}
+
+fn argmax(logits: &[f32]) -> u32 {
+    logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i as u32)
+}
+
+/// Prefills the golden prompt, then decodes one row per step (teacher-forced
+/// on tokens.bin, or greedy with --generate), drafting with DFlash2 before
+/// every step; reports the accepted prefix per step against the sequence.
+fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, mut transport: Option<&mut V41Tp4Roce>,
+    runtime: &tokio::runtime::Runtime) -> Result<()> {
+    let drafter = engine.drafter.as_ref().context("--draft")?;
+    let (catalog, hidden) = (&opened.catalog, opened.cfg.hidden);
+    let mut sequence: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
+        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let prefill = args.prefill.unwrap_or(sequence.len() / 2).min(sequence.len() - 1);
+    let end = match args.generate {
+        Some(n) => {
+            sequence.truncate(prefill);
+            prefill + n
+        }
+        None => sequence.len(),
+    };
+    let mut placement = engine::PageAllocator::new(engine.pages).admit(end + 1)?;
+    let started = Instant::now();
+    let logits = engine.prefill(&mut placement, &embed_rows(catalog, &sequence[..prefill], hidden)?,
+        transport.as_deref_mut().map(|t| (t, runtime)), None)?.context("drafting needs every target layer")?;
+    let n = prefill.min(dflash::TAP_ROWS);
+    drafter.update(&(0..n).map(|r| dflash::ContextRow { tap_row: r, slot: 0, position: prefill - n + r })
+        .collect::<Vec<_>>())?;
+    if args.generate.is_some() {
+        sequence.push(argmax(&logits));
+    }
+    println!("prefill: {prefill} tokens in {:.2} s", started.elapsed().as_secs_f64());
+    let (mut drafts, mut draft_seconds) = (Vec::new(), 0f64);
+    let started = Instant::now();
+    for position in prefill..end {
+        let anchor = sequence[position];
+        let anchor_row = embed_rows(catalog, &[anchor], hidden)?;
+        let timer = Instant::now();
+        let draft = drafter.draft(&[dflash::DraftSeq { slot: 0, anchor, position }], &anchor_row,
+            engine.weights.head.buffer.ptr)?;
+        draft_seconds += timer.elapsed().as_secs_f64();
+        drafts.push((position, draft.into_iter().next().context("draft")?));
+        let logits = engine.verify(&mut [(&mut placement, 1)], &anchor_row, transport.as_deref_mut().map(|t| (t, runtime)),
+            None)?.context("decode needs every layer")?;
+        drafter.update(&[dflash::ContextRow { tap_row: 0, slot: 0, position }])?;
+        if args.generate.is_some() {
+            sequence.push(argmax(&logits));
+        }
+    }
+    let seconds = started.elapsed().as_secs_f64();
+    let block = drafter.cfg.drafts();
+    let mut histogram = vec![0usize; block + 1];
+    let mut first_rank = [0usize; 16];
+    for (position, draft) in &drafts {
+        let truth = &sequence[position + 1..];
+        if truth.len() < block {
+            continue;
+        }
+        let accepted = draft.tokens.iter().zip(truth).take_while(|(d, t)| d == t).count();
+        histogram[accepted] += 1;
+        first_rank[draft.features[0][3] as usize] += 1;
+    }
+    let steps: usize = histogram.iter().sum();
+    let accepted: usize = histogram.iter().enumerate().map(|(i, c)| i * c).sum();
+    println!("drafts: {steps} steps, {accepted} drafted tokens accepted as a prefix ({:.2} per step, {:.1}% of {}), \
+        histogram {histogram:?}, first-draft selector rank {first_rank:?}, {:.2} ms/draft, {:.1} ms/step",
+        accepted as f64 / steps.max(1) as f64, 100.0 * accepted as f64 / (steps * block).max(1) as f64, steps * block,
+        draft_seconds * 1e3 / drafts.len().max(1) as f64, seconds * 1e3 / drafts.len().max(1) as f64);
+    if args.generate.is_some() {
+        let text = cuteafd_loader::LoadedTokenizer::from_snapshot(&opened.snapshot)?
+            .decode_ids(&sequence[prefill..], false).map(|d| d.text).unwrap_or_default();
+        println!("generated: {text:?}");
+    }
+    Ok(())
+}
+
+/// Runs the drafter alone on the golden taps at reference.py's anchor
+/// positions and compares tokens, selector features and final-norm rows.
+fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, dir: &std::path::Path) -> Result<()> {
+    let drafter = engine.drafter.as_ref().context("--draft-oracle needs --draft")?;
+    let (hidden, block, drafts_per) = (opened.cfg.hidden, drafter.cfg.block, drafter.cfg.drafts());
+    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)?;
+    let positions: Vec<usize> = meta["positions"].as_array().context("positions")?.iter()
+        .map(|p| p.as_u64().map(|p| p as usize).context("position")).collect::<Result<_>>()?;
+    let words = |name: &str| -> Result<Vec<u32>> {
+        Ok(std::fs::read(dir.join(name))?.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect())
+    };
+    let (ref_tokens, ref_features) = (words("drafts.bin")?, words("features.bin")?);
+    let ref_hidden = bf16s(&std::fs::read(dir.join("hidden.bin"))?);
+    let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
+        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let layers: Vec<Vec<u8>> = drafter.cfg.taps.iter()
+        .map(|l| std::fs::read(args.golden.join(format!("layer{l:02}.bin")))).collect::<std::io::Result<_>>()?;
+    let row = hidden * 2;
+    let width = layers.len() * row;
+    let (mut done, mut exact, mut first, mut matched, mut worst, mut feature_error) = (0usize, 0, 0, 0, 1f64, 0f64);
+    let mut draft_seconds = 0f64;
+    for (index, &position) in positions.iter().enumerate() {
+        // Context rows done..position through the tap buffer.
+        while done < position {
+            let n = (position - done).min(dflash::TAP_ROWS);
+            let mut taps = vec![0u8; n * width];
+            for r in 0..n {
+                for (i, layer) in layers.iter().enumerate() {
+                    taps[r * width + i * row..][..row].copy_from_slice(&layer[(done + r) * row..][..row]);
+                }
+            }
+            drafter.put_taps(&taps)?;
+            drafter.update(&(0..n).map(|r| dflash::ContextRow { tap_row: r, slot: 0, position: done + r })
+                .collect::<Vec<_>>())?;
+            done += n;
+        }
+        let anchor = tokens[position];
+        let timer = Instant::now();
+        let draft = drafter.draft(&[dflash::DraftSeq { slot: 0, anchor, position }],
+            &embed_rows(&opened.catalog, &[anchor], hidden)?, engine.weights.head.buffer.ptr)?.remove(0);
+        draft_seconds += timer.elapsed().as_secs_f64();
+        let reference = &ref_tokens[index * drafts_per..][..drafts_per];
+        exact += usize::from(draft.tokens == reference);
+        first += usize::from(draft.tokens[0] == reference[0]);
+        matched += draft.tokens.iter().zip(reference).take_while(|(a, b)| a == b).count();
+        let (cosine, _) = similarity(&bf16s(&drafter.last_hidden(1)?), &ref_hidden[index * block * hidden..][..block * hidden]);
+        worst = worst.min(cosine);
+        if draft.tokens[0] == reference[0] {
+            let theirs = f32::from_bits(ref_features[index * drafts_per * 4]);
+            feature_error = feature_error.max(f64::from((draft.features[0][0] - theirs).abs()));
+        }
+        if draft.tokens != reference {
+            println!("position {position}: engine {:?} reference {reference:?}", draft.tokens);
+        }
+    }
+    let n = positions.len();
+    println!("draft oracle: {n} anchors, identical drafts {exact}/{n}, first draft {first}/{n}, matching prefix \
+        {:.2} of {drafts_per}, worst final-norm cosine {worst:.6}, first-margin max error {feature_error:.4}, \
+        {:.2} ms/draft", matched as f64 / n as f64, draft_seconds * 1e3 / n as f64);
     Ok(())
 }
