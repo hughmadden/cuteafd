@@ -12,8 +12,9 @@
 //! wave stays in flight while the other lane's GPU layers run.
 use super::weights::{GlmLayer, GlmWeights};
 use crate::v41_memory::{DeviceAllocation, HostAllocation};
+use crate::spark_intake::{copy_parallel, SparkLane, SparkLink};
 use cuteafd_transport::v41_expert::{
-    V41Tp4Roce, V41Tp4RoceLane, V41Tp4RoceWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
+    V41Tp4RoceWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
 };
 use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
@@ -146,9 +147,7 @@ struct Workspace<'a> {
     route_weights: Dev<'a>,
     wire: Dev<'a>,
     shared: Dev<'a>,
-    planes: Vec<Dev<'a>>,
     router_host: RefCell<HostAllocation<'a>>,
-    planes_host: RefCell<HostAllocation<'a>>,
     head: VocabularyHead<'a>,
     _head_workspace: Dev<'a>,
 }
@@ -174,7 +173,7 @@ pub(crate) struct GlmEngine<'a> {
     lane_workspaces: RefCell<Vec<Workspace<'a>>>,
     /// Lanes a long prefill chunk splits into.
     prefill_lanes: usize,
-    pub lanes: RefCell<Vec<V41Tp4RoceLane>>,
+    pub lanes: RefCell<Vec<SparkLane<'a>>>,
     /// Prefill steps keep every row's logits (golden scoring); otherwise the
     /// prefill workspace holds logits for at most `DECODE_ROWS` rows.
     pub full_prefill_logits: bool,
@@ -287,9 +286,7 @@ impl<'a> GlmEngine<'a> {
             route_weights: self.alloc(t * self.cfg.topk * 4)?,
             wire: self.alloc(t * (h + h / 32))?,
             shared: self.alloc(t * h * 2)?,
-            planes: (0..MAX_RANKS).map(|_| self.alloc(t * h * 2)).collect::<Result<_>>()?,
             router_host: RefCell::new(HostAllocation::new(self.library, t * (self.cfg.topk * 8 + h + h / 32))?),
-            planes_host: RefCell::new(HostAllocation::new(self.library, MAX_RANKS * t * h * 2)?),
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, t as u32,
                 self.cfg.vocab_size as u32)? },
@@ -315,7 +312,7 @@ impl<'a> GlmEngine<'a> {
     /// returns the last row's logits when all layers are resident.
     /// `on_layer` receives each layer's output rows (BF16 [t, hidden]).
     pub fn prefill(&self, placement: &mut GlmPlacement, embed: &[u8],
-        experts: Option<(&mut V41Tp4Roce, &tokio::runtime::Runtime)>,
+        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<Vec<f32>>> {
         self.prefill_rows_logits(placement, embed, experts, on_layer, 1)
     }
@@ -349,7 +346,7 @@ impl<'a> GlmEngine<'a> {
     /// Without `on_layer`, a Spark chunk of at least 2 x 256 rows runs as
     /// [`PREFILL_LANES`] lanes (see [`Self::step_lanes`]).
     pub fn prefill_rows_logits(&self, placement: &mut GlmPlacement, embed: &[u8],
-        experts: Option<(&mut V41Tp4Roce, &tokio::runtime::Runtime)>,
+        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>, logit_rows: usize) -> Result<Option<Vec<f32>>> {
         let (row, start) = (self.cfg.hidden * 2, placement.len);
         let t = embed.len() / row;
@@ -383,7 +380,7 @@ impl<'a> GlmEngine<'a> {
     /// every row's logits. A caller that rejects a suffix sets `len` back:
     /// GLM keeps no recurrent state, and rejected records are overwritten.
     pub fn verify(&self, sequences: &mut [(&mut GlmPlacement, usize)], embed: &[u8],
-        experts: Option<(&mut V41Tp4Roce, &tokio::runtime::Runtime)>,
+        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<Vec<f32>>> {
         let rows: usize = sequences.iter().map(|(_, n)| n).sum();
         ensure!(rows > 0 && rows <= DECODE_ROWS && embed.len() == rows * self.cfg.hidden * 2, "decode step of {rows} rows");
@@ -411,7 +408,7 @@ impl<'a> GlmEngine<'a> {
     }
 
     fn step(&self, tables: &StepTables, embed: &[u8], logit_rows: usize,
-        mut experts: Option<(&mut V41Tp4Roce, &tokio::runtime::Runtime)>,
+        mut experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<Vec<f32>>> {
         let (h, t) = (self.cfg.hidden, tables.positions.len());
         // Decode steps have their own workspace; a serial prefill uses the first lane's.
@@ -499,16 +496,18 @@ impl<'a> GlmEngine<'a> {
     /// post-attention norm, and the dense FFN or the MoE front (router,
     /// select, wire rows); the Spark exchange runs between segments.
     fn decode_layers(&self, w: &Workspace<'_>, tables: &StepTables, t: usize,
-        experts: &mut Option<(&mut V41Tp4Roce, &tokio::runtime::Runtime)>) -> Result<()> {
+        experts: &mut Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>) -> Result<()> {
         let rows = Dsv4Scalar::I32(t as i32);
         let layers = &self.weights.layers;
+        // The decode transport's intake planes; the replayed graphs bake them in.
+        let planes = experts.as_ref().map_or([std::ptr::null(); 6], |(transport, _)| transport.intake.pointers());
         // Previous layer's FFN output: none (first layer), in `delta`, or Spark planes.
         let mut previous = Previous::First;
         for index in 0..=layers.len() {
             let layer = layers.get(index);
             let segment = || -> Result<()> {
                 if let Previous::Planes(ranks) = previous {
-                    self.reduce(w, ranks, t)?;
+                    self.reduce(planes, w, ranks, t)?;
                 }
                 let weight = match layer {
                     Some(layer) => layer.ptr("input_norm")?,
@@ -572,10 +571,10 @@ impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn moe(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str, decode: bool,
-        transport: &mut V41Tp4Roce, runtime: &tokio::runtime::Runtime) -> Result<()> {
+        transport: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime) -> Result<()> {
         self.moe_front(w, layer, t)?;
         let ranks = self.moe_exchange(w, index, layer, t, cap, decode, transport, runtime)?;
-        self.reduce(w, ranks, t)
+        self.reduce(transport.intake.pointers(), w, ranks, t)
     }
 
     /// Router scores, the sigmoid top-k selection and the wire rows (device only).
@@ -603,10 +602,10 @@ impl<'a> GlmEngine<'a> {
     /// staging is rewritten.
     #[allow(clippy::too_many_arguments)]
     fn moe_exchange(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str, decode: bool,
-        transport: &mut V41Tp4Roce, runtime: &tokio::runtime::Runtime) -> Result<usize> {
+        transport: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime) -> Result<usize> {
         self.moe_stage(w, layer, t, cap)?;
         let wave = self.moe_send(w, index, t, decode, transport)?;
-        runtime.block_on(self.moe_land(w, t, transport, wave))
+        runtime.block_on(self.moe_land(t, transport, wave))
     }
 
     /// Routes and wire rows down to this workspace's pinned staging (the host
@@ -639,7 +638,7 @@ impl<'a> GlmEngine<'a> {
 
     /// One request to every Spark rank from the staged routes and wire rows
     /// ([`Self::moe_stage`]); complete it with [`Self::moe_land`].
-    fn moe_send(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, transport: &mut V41Tp4Roce)
+    fn moe_send(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, transport: &mut SparkLink<'_>)
         -> Result<V41Tp4RoceWave> {
         let timer = std::time::Instant::now();
         let request = {
@@ -648,7 +647,7 @@ impl<'a> GlmEngine<'a> {
         };
         self.exchange_host.borrow_mut()[2] += timer.elapsed().as_secs_f64();
         let post = std::time::Instant::now();
-        let wave = transport.dispatch_wave(&request)?;
+        let wave = transport.dispatch(&request)?;
         self.exchange_host.borrow_mut()[3] += post.elapsed().as_secs_f64();
         self.exchange_host.borrow_mut()[0] += timer.elapsed().as_secs_f64();
         Ok(wave)
@@ -656,18 +655,17 @@ impl<'a> GlmEngine<'a> {
 
     /// Hands a prefill unit's wave to its lane thread: the request is built
     /// from the staged routes and wire rows ([`Self::moe_stage`]), posted, and
-    /// its rank partials copied into this workspace's pinned plane staging,
-    /// all off this thread; [`Self::lane_land`] waits for it.
-    fn lane_send(&self, w: &Workspace<'_>, index: usize, t: usize, lane: &mut V41Tp4RoceLane) -> Result<()> {
+    /// its rank partials gathered into the lane's intake, all off this
+    /// thread; [`Self::lane_land`] waits for it.
+    fn lane_send(&self, w: &Workspace<'_>, index: usize, t: usize, lane: &mut SparkLane<'_>) -> Result<()> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let ranks = lane.world_size();
         ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
         let staged_bytes = t * topk * 8 + t * (h + h / 32);
-        let (row_bytes, plane_bytes) = (h * 2, t * h * 2);
-        let (staged, planes) = (w.router_host.borrow().buffer, w.planes_host.borrow().buffer);
-        ensure!(staged_bytes <= staged.bytes && ranks * plane_bytes <= planes.bytes, "lane wave exceeds its staging");
-        // Addresses cross to the lane thread as integers; see the SAFETY notes below.
-        let (staged, planes) = (staged.ptr as usize, planes.ptr as usize);
+        let staged = w.router_host.borrow().buffer;
+        ensure!(staged_bytes <= staged.bytes, "lane wave exceeds its staging");
+        // The address crosses to the lane thread as an integer; see the SAFETY note below.
+        let staged = staged.ptr as usize;
         let build = Box::new(move || {
             // SAFETY: the pinned router staging holds this unit's routes and
             // wire rows (the stage synchronized their copies) and nothing
@@ -676,78 +674,27 @@ impl<'a> GlmEngine<'a> {
             let staged = unsafe { std::slice::from_raw_parts(staged as *const u8, staged_bytes) };
             expert_request(staged, index, t, h, topk, false)
         });
-        let sink = Box::new(move |rank: usize, first: u32, payload: &[u8]| {
-            let offset = rank * plane_bytes + first as usize * row_bytes;
-            ensure!(rank < ranks && first as usize * row_bytes + payload.len() <= plane_bytes,
-                "partial rows exceed the step");
-            // SAFETY: rank planes are disjoint regions of the pinned plane
-            // staging, which the inference thread reads (for the uploads) only
-            // after the wait for this wave, and rewrites only after a stream
-            // sync that completes those uploads.
-            let target = unsafe { std::slice::from_raw_parts_mut((planes + offset) as *mut u8, payload.len()) };
-            copy_parallel(target, payload);
-            Ok(())
-        });
-        lane.submit(build, sink)
+        lane.submit(t, build)
     }
 
-    /// Waits for a lane's wave and queues its rank planes' uploads; returns
-    /// the rank count the reduce needs.
-    fn lane_land(&self, w: &Workspace<'_>, t: usize, lane: &mut V41Tp4RoceLane) -> Result<usize> {
+    /// Waits for a lane's wave and orders the stream after its intake;
+    /// returns the rank count the reduce needs.
+    fn lane_land(&self, t: usize, lane: &mut SparkLane<'_>) -> Result<usize> {
         let timer = std::time::Instant::now();
-        let times = lane.wait(std::time::Duration::from_secs(120))?;
+        let times = lane.wait(t, std::time::Duration::from_secs(120), self.stream)?;
         self.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
-        {
-            let mut host = self.exchange_host.borrow_mut();
-            host[0] += times.build_post;
-        }
-        let (ranks, plane_bytes) = (lane.world_size(), t * self.cfg.hidden * 2);
-        let staging = w.planes_host.borrow();
-        for rank in 0..ranks {
-            let source = cuteafd_ffi::CuteafdHostBuffer {
-                // SAFETY: rank planes are disjoint slices of the staging buffer.
-                ptr: unsafe { staging.buffer.ptr.cast::<u8>().add(rank * plane_bytes) }.cast(),
-                bytes: plane_bytes,
-                ..staging.buffer
-            };
-            // SAFETY: pinned source and device plane both hold `plane_bytes`.
-            unsafe { self.library.copy_host_buffer_h2d_async(w.planes[rank].buffer, source, plane_bytes, self.stream)? };
-        }
-        Ok(ranks)
+        self.exchange_host.borrow_mut()[0] += times.build_post;
+        Ok(lane.world_size())
     }
 
-    /// Receives `wave`'s BF16 rank partials into this workspace's pinned
-    /// staging and queues their uploads; returns the rank count the reduce needs.
-    async fn moe_land(&self, w: &Workspace<'_>, t: usize, transport: &mut V41Tp4Roce, wave: V41Tp4RoceWave)
-        -> Result<usize> {
-        let h = self.cfg.hidden;
+    /// Receives `wave`'s BF16 rank partials into the transport's intake
+    /// planes; returns the rank count the reduce needs.
+    async fn moe_land(&self, t: usize, transport: &mut SparkLink<'_>, wave: V41Tp4RoceWave) -> Result<usize> {
         let ranks = transport.world_size();
         ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
-        let (row_bytes, plane_bytes) = (h * 2, t * h * 2);
-        let mut staging = w.planes_host.borrow_mut();
-        let bytes = staging.bytes_mut();
         let timer = std::time::Instant::now();
-        let mut copying = 0f64;
-        transport.receive_wave(wave, |rank, first, payload| {
-            let offset = rank * plane_bytes + first as usize * row_bytes;
-            ensure!(first as usize * row_bytes + payload.len() <= plane_bytes, "partial rows exceed the step");
-            let copy = std::time::Instant::now();
-            copy_parallel(&mut bytes[offset..offset + payload.len()], payload);
-            copying += copy.elapsed().as_secs_f64();
-            Ok(())
-        }).await?;
-        self.exchange_host.borrow_mut()[1] += copying;
+        transport.receive(wave, t, self.stream).await?;
         self.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
-        for rank in 0..ranks {
-            let source = cuteafd_ffi::CuteafdHostBuffer {
-                // SAFETY: rank planes are disjoint slices of the staging buffer.
-                ptr: unsafe { staging.buffer.ptr.cast::<u8>().add(rank * plane_bytes) }.cast(),
-                bytes: plane_bytes,
-                ..staging.buffer
-            };
-            // SAFETY: pinned source and device plane both hold `plane_bytes`.
-            unsafe { self.library.copy_host_buffer_h2d_async(w.planes[rank].buffer, source, plane_bytes, self.stream)? };
-        }
         Ok(ranks)
     }
 
@@ -770,6 +717,7 @@ impl<'a> GlmEngine<'a> {
         let owned = self.lane_workspaces.borrow();
         let workspaces: Vec<&Workspace<'_>> = owned.iter().collect();
         let mut transports = self.lanes.borrow_mut();
+        let planes: Vec<[*const u16; 6]> = transports.iter().map(|lane| lane.intake.pointers()).collect();
         ensure!(transports.len() >= lanes.len(), "{} lanes need as many lane transports", lanes.len());
         let counts: Vec<usize> = lanes.iter().map(|l| l.positions.len()).collect();
         let starts: Vec<usize> = counts.iter().scan(0, |first, &n| {
@@ -814,7 +762,7 @@ impl<'a> GlmEngine<'a> {
         let post = |(index, lane): (usize, usize), ranks: Option<usize>| -> Result<()> {
             let (w, rows) = (workspaces[lane], rows_of(lane));
             if let Some(ranks) = ranks {
-                self.reduce(w, ranks, counts[lane])?;
+                self.reduce(planes[lane], w, ranks, counts[lane])?;
             }
             let weight = match layers.get(index + 1) {
                 Some(next) => next.ptr("input_norm")?,
@@ -839,8 +787,8 @@ impl<'a> GlmEngine<'a> {
         // unit's attention needs its lane's previous layer, so up to
         // `lanes - 1` waves overlap the GPU's other lanes.
         let mut inflight: std::collections::VecDeque<(usize, usize)> = std::collections::VecDeque::new();
-        let mut land = |unit: (usize, usize), transports: &mut Vec<V41Tp4RoceLane>| -> Result<()> {
-            let ranks = self.lane_land(workspaces[unit.1], counts[unit.1], &mut transports[unit.1])?;
+        let land = |unit: (usize, usize), transports: &mut Vec<SparkLane<'_>>| -> Result<()> {
+            let ranks = self.lane_land(counts[unit.1], &mut transports[unit.1])?;
             post(unit, Some(ranks))
         };
         attention(units[0])?;
@@ -884,15 +832,14 @@ impl<'a> GlmEngine<'a> {
         Ok(Some(logits))
     }
 
-    /// Rank partials + shared expert into `delta`.
-    fn reduce(&self, w: &Workspace<'_>, ranks: usize, t: usize) -> Result<()> {
-        let mut pointers = [std::ptr::null::<u16>(); MAX_RANKS];
-        for (slot, plane) in pointers.iter_mut().zip(&w.planes[..ranks]) {
-            *slot = plane.buffer.ptr.cast();
-        }
-        // SAFETY: planes, shared and delta are live [t, h] BF16 buffers ordered after the uploads.
+    /// A transport's rank planes + shared expert into `delta`. The next
+    /// wave on that transport is dispatched only after its stage's stream
+    /// sync, which follows this reduce.
+    fn reduce(&self, planes: [*const u16; 6], w: &Workspace<'_>, ranks: usize, t: usize) -> Result<()> {
+        // SAFETY: the transport's intake planes, shared and delta are live
+        // [t, h] BF16 buffers ordered after the wave's intake.
         unsafe {
-            self.library.v41_compact_reducer()?.reduce_planes(pointers, ranks as u32, w.shared.buffer.ptr.cast(),
+            self.library.v41_compact_reducer()?.reduce_planes(planes, ranks as u32, w.shared.buffer.ptr.cast(),
                 w.delta.buffer.ptr.cast(), t as u32, self.stream)
         }
     }
@@ -1001,23 +948,6 @@ fn expert_request(staged: &[u8], index: usize, t: usize, h: usize, topk: usize, 
         routes, wire)?;
     request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
     Ok(request)
-}
-
-/// `dst.copy_from_slice(src)`, split over threads for large payloads: a
-/// prefill wave lands 50 MB of BF16 partials per rank in the pinned staging,
-/// which one core copies at about 20 GB/s.
-fn copy_parallel(dst: &mut [u8], src: &[u8]) {
-    const THREADS: usize = 8;
-    if src.len() < 2 << 20 {
-        dst.copy_from_slice(src);
-        return;
-    }
-    let chunk = src.len().div_ceil(THREADS).next_multiple_of(4096);
-    std::thread::scope(|scope| {
-        for (d, s) in dst.chunks_mut(chunk).zip(src.chunks(chunk)) {
-            scope.spawn(move || d.copy_from_slice(s));
-        }
-    });
 }
 
 /// A weight's program pointers: its BF16 copy, plus the E4M3 copy and FP32

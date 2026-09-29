@@ -19,7 +19,8 @@ use super::weights::{MimoLayer, MimoWeights};
 use crate::v41_experts::fp8::{Fp8Experts, Fp8Layer};
 use cuteafd_loader::fp8_experts::Fp8ExpertTensors;
 use crate::v41_memory::{DeviceAllocation, HostAllocation};
-use cuteafd_transport::v41_expert::{V41Tp4Roce, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
+use crate::spark_intake::SparkLink;
+use cuteafd_transport::v41_expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
 use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
 };
@@ -73,7 +74,7 @@ pub(crate) enum Experts<'a> {
     /// outputs are not the model's).
     Skip,
     /// Spark ranks serving the `fp8` family over RoCE.
-    Spark { transport: RefCell<V41Tp4Roce>, runtime: tokio::runtime::Runtime },
+    Spark { transport: RefCell<SparkLink<'a>>, runtime: tokio::runtime::Runtime },
 }
 
 /// Most rows a decode program reads the FP8 weight copies for (MmaFp8Gemv's M tile).
@@ -168,10 +169,8 @@ struct Workspace<'a> {
     wire: Dev<'a>,
     /// Spark exchange: rank partial planes, a zero shared-expert plane (MiMo
     /// has none), and pinned staging for routes, wire rows and partials.
-    planes: Vec<Dev<'a>>,
     zero_plane: Dev<'a>,
     router_host: RefCell<HostAllocation<'a>>,
-    planes_host: RefCell<HostAllocation<'a>>,
     head: VocabularyHead<'a>,
     _head_workspace: Dev<'a>,
 }
@@ -340,7 +339,6 @@ impl<'a> MimoEngine<'a> {
             route_ids: self.alloc(t * self.cfg.topk * 4)?,
             route_weights: self.alloc(t * self.cfg.topk * 4)?,
             wire: self.alloc(t * (h + h / 32))?,
-            planes: if spark { (0..MAX_RANKS).map(|_| self.alloc(t * h * 2)).collect::<Result<_>>()? } else { Vec::new() },
             zero_plane: {
                 let zero = self.alloc(if spark { t * h * 2 } else { 256 })?;
                 self.library.cuda_zero_bytes(zero.buffer, zero.buffer.bytes)?;
@@ -348,7 +346,6 @@ impl<'a> MimoEngine<'a> {
             },
             router_host: RefCell::new(HostAllocation::new(self.library,
                 if spark { t * (self.cfg.topk * 8 + 2 * h) } else { 256 })?),
-            planes_host: RefCell::new(HostAllocation::new(self.library, if spark { MAX_RANKS * t * h * 2 } else { 256 })?),
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, t as u32,
                 self.cfg.vocab_size as u32)? },
@@ -866,7 +863,7 @@ impl<'a> MimoEngine<'a> {
     /// rank partials summed into `delta` (GLM's exchange, no shared expert).
     #[allow(clippy::too_many_arguments)]
     fn spark_moe(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, bf16_input: bool,
-        transport: &mut V41Tp4Roce, runtime: &tokio::runtime::Runtime) -> Result<()> {
+        transport: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime) -> Result<()> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let (route_bytes, wire_bytes) = (t * topk * 4, if bf16_input { t * h * 2 } else { t * (h + h / 32) });
@@ -904,36 +901,17 @@ impl<'a> MimoEngine<'a> {
         request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         let ranks = transport.world_size();
         ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
-        let (row_bytes, plane_bytes) = (h * 2, t * h * 2);
-        let mut staging = w.planes_host.borrow_mut();
-        let bytes = staging.bytes_mut();
         let timer = std::time::Instant::now();
         runtime.block_on(async {
-            transport.execute(&request, |rank, first, payload| {
-                let offset = rank * plane_bytes + first as usize * row_bytes;
-                ensure!(first as usize * row_bytes + payload.len() <= plane_bytes, "partial rows exceed the step");
-                bytes[offset..offset + payload.len()].copy_from_slice(payload);
-                Ok(())
-            }).await
+            let wave = transport.dispatch(&request)?;
+            transport.receive(wave, t, self.stream).await
         })?;
         self.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
-        let mut pointers = [std::ptr::null::<u16>(); MAX_RANKS];
-        for rank in 0..ranks {
-            let source = cuteafd_ffi::CuteafdHostBuffer {
-                // SAFETY: rank planes are disjoint slices of the staging buffer.
-                ptr: unsafe { staging.buffer.ptr.cast::<u8>().add(rank * plane_bytes) }.cast(),
-                bytes: plane_bytes,
-                ..staging.buffer
-            };
-            // SAFETY: pinned source and device plane both hold `plane_bytes`.
-            unsafe { self.library.copy_host_buffer_h2d_async(w.planes[rank].buffer, source, plane_bytes, self.stream)? };
-            pointers[rank] = w.planes[rank].buffer.ptr.cast();
-        }
-        // SAFETY: planes, the zero plane and delta are live [t, h] BF16 buffers ordered after the uploads.
+        // SAFETY: the zero plane and delta are live [t, h] BF16 buffers; the
+        // intake planes are ordered after the wave by `receive`.
         unsafe {
-            self.library.v41_compact_reducer()?.reduce_planes(pointers, ranks as u32, w.zero_plane.buffer.ptr.cast(),
-                w.delta.buffer.ptr.cast(), t as u32, self.stream)?;
-            // The staging is rewritten by the next layer only after this upload drains.
+            transport.reduce(w.zero_plane.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream)?;
+            // The next layer's request staging is rewritten only after this drains.
             self.library.cuda_stream_synchronize(self.stream)
         }
     }

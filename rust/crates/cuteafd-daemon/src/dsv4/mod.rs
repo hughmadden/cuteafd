@@ -9,7 +9,7 @@ pub(crate) mod weights;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::deepseek_v4::DeepseekV4Config;
-use cuteafd_transport::v41_expert::V41Tp4Roce;
+use crate::spark_intake::SparkLink;
 use cuteafd_transport::TcpTransportConfig;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
@@ -145,7 +145,7 @@ pub(crate) fn load(args: &EngineArgs) -> Result<Loaded> {
 pub(crate) fn with_engine<T>(
     loaded: &Loaded,
     args: &EngineArgs,
-    body: impl FnOnce(&engine::Engine<'_>, &mut [V41Tp4Roce], &tokio::runtime::Runtime) -> Result<T>,
+    body: impl FnOnce(&engine::Engine<'_>, &mut [SparkLink<'_>], &tokio::runtime::Runtime) -> Result<T>,
 ) -> Result<T> {
     let programs = loaded.library.dsv4_programs()?.with_manifest(&args.manifest)?;
     let started = Instant::now();
@@ -183,7 +183,6 @@ pub(crate) fn with_engine<T>(
         stream,
         sms: args.sms,
         shape,
-        spark_ranks: peers.len(),
     })?;
     let (free, _) = loaded.library.cuda_memory_info()?;
     let budget = free.saturating_sub(args.reserve_gib << 30);
@@ -200,8 +199,9 @@ pub(crate) fn with_engine<T>(
         .collect::<Result<Vec<u64>>>()?;
     // One transport (connection set) per prefill lane, so each lane can keep
     // a Spark wave in flight; decode uses the first.
-    let mut transports = (0..engine::PREFILL_LANES).map(|_| V41Tp4Roce::new_ranks(&peers, &executors, 4096,
-        TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 }))
+    let mut transports = (0..engine::PREFILL_LANES).map(|_| SparkLink::new(&loaded.library, &peers, &executors, 4096,
+        TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
+        loaded.cfg.dim * 2))
         .collect::<Result<Vec<_>>>()?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let started = Instant::now();
@@ -211,6 +211,7 @@ pub(crate) fn with_engine<T>(
     tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
     let result = body(&engine, &mut transports, &runtime);
     drop(engine);
+    drop(transports);
     unsafe { loaded.library.cuda_stream_destroy(stream)? };
     result
 }
@@ -226,7 +227,7 @@ fn golden_run(
     catalog: &cuteafd_loader::OfficialV41Catalog,
     cfg: &DeepseekV4Config,
     engine: &engine::Engine<'_>,
-    transports: &mut [V41Tp4Roce],
+    transports: &mut [SparkLink<'_>],
     runtime: &tokio::runtime::Runtime,
 ) -> Result<()> {
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
