@@ -25,6 +25,10 @@ from safetensors import safe_open
 
 
 class Weights:
+    # Re-quantize FP8 blocks to power-of-two (UE8M0) scales, as the b12x FP8
+    # linears require, instead of using the checkpoint's FP32 scales.
+    requant_ue8m0 = False
+
     def __init__(self, snapshot: Path):
         self.snapshot = snapshot
         self.index = json.loads((snapshot / "model.safetensors.index.json").read_text())["weight_map"]
@@ -43,8 +47,15 @@ class Weights:
             return value
         scale = self.raw(name.removesuffix("weight") + "weight_scale_inv").to(device).float()
         rows, cols = value.shape
-        expanded = scale.repeat_interleave(128, 0)[:rows].repeat_interleave(128, 1)[:, :cols]
-        return (value.float() * expanded).bfloat16()
+        grow = lambda t: t.repeat_interleave(128, 0)[:rows].repeat_interleave(128, 1)[:, :cols]
+        values = value.float()
+        # Routed experts are served as EXL3; only coordinator weights are re-quantized.
+        if self.requant_ue8m0 and ".mlp.experts." not in name:
+            # w * s = w' * 2^ceil(log2 s): w' = fp8(w * s / 2^ceil(log2 s)), never larger than w.
+            power = torch.exp2(torch.ceil(torch.log2(scale)))
+            values = (values * grow(scale / power)).to(torch.float8_e4m3fn).float()
+            scale = power
+        return (values * grow(scale)).bfloat16()
 
 
 def load_layer(layer: torch.nn.Module, weights: Weights, prefix: str) -> None:
@@ -84,6 +95,8 @@ def main() -> None:
     p.add_argument("--layers", type=int, nargs="*", help="layers whose outputs to save (default all)")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--device", type=int, default=0)
+    p.add_argument("--requant-ue8m0", action="store_true",
+                   help="re-quantize FP8 blocks to power-of-two scales (the b12x linear format)")
     a = p.parse_args()
 
     from tokenizers import Tokenizer
@@ -97,6 +110,7 @@ def main() -> None:
     text = a.text_file.read_text() if a.text_file else a.text
     tokens = Tokenizer.from_file(str(a.snapshot / "tokenizer.json")).encode(text, add_special_tokens=False).ids
     weights = Weights(a.snapshot)
+    weights.requant_ue8m0 = a.requant_ue8m0
     a.out.mkdir(parents=True, exist_ok=True)
     (a.out / "tokens.bin").write_bytes(torch.tensor(tokens, dtype=torch.int32).numpy().tobytes())
     layers = config.num_hidden_layers
