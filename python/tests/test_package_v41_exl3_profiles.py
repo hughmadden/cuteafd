@@ -361,6 +361,22 @@ class PackageProfileTests(unittest.TestCase):
         self.assertEqual([package.token_major_rotation(g, c) for g in ('v41', 'dsv4f', 'dsv4p')
                           for c in (1024, 4096)], [False, False, False, False, False, True])
 
+    def test_qwen4_uneven_blocks_and_route_policy(self):
+        """Qwen's 640 intermediate is five H128 blocks: no dual-RTX halves, the
+        first Spark ranks own the extra block, 32-row route blocks above m80."""
+        coordinator = [name for name, *_ in package.shard_profiles('qwen4', 'coordinator')]
+        self.assertEqual(coordinator, ['rtx-tp1'])
+        spark = {name: (width, dest) for name, width, _, _, _, dest in package.shard_profiles('qwen4', 'spark')}
+        self.assertEqual(spark['tp4-width256'], (256, ['tp4-rank0']))
+        self.assertEqual(spark['tp4-width128'], (128, ['tp4-rank1', 'tp4-rank2', 'tp4-rank3']))
+        self.assertEqual(spark['tp3-width256'], (256, ['tp3-rank0', 'tp3-rank1']))
+        self.assertEqual(spark['tp2-width384'], (384, ['tp2-rank0']))
+        self.assertTrue(all(topk == 10 and experts == 512
+                            for _, _, experts, topk, _, _ in package.shard_profiles('qwen4', 'spark')))
+        self.assertEqual([package.route_block('qwen4', c) for c in (1, 16, 80, 256, 1024, 4096)],
+                         [8, 8, 8, 32, 32, 32])
+        self.assertIsNone(package.swiglu_limit('qwen4'))
+
     def test_verify_cross_checks_the_recorded_route_block(self):
         """A variant's route block must be the one its export compiled."""
         with tempfile.TemporaryDirectory() as temporary:
