@@ -54,6 +54,9 @@ pub(crate) struct GoldenArgs {
     pub prefill: Option<usize>,
     #[arg(long, default_value_t = 1)]
     pub step_rows: usize,
+    /// Compare only logits during decode (decode then runs its captured graphs).
+    #[arg(long)]
+    pub no_layer_compare: bool,
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -207,9 +210,11 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
     while position < tokens.len() {
         let n = args.step_rows.min(tokens.len() - position);
         let first = position;
+        let mut layer_compare = |layer: usize, stream: &[u8]| compare(layer, first, stream, &mut decode_worst);
+        let on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>> =
+            if args.no_layer_compare { None } else { Some(&mut layer_compare) };
         if let Some(logits) = engine.verify(&mut [(&mut placement, n)], &embed[position * row..(position + n) * row],
-            transport.as_deref_mut().map(|t| (t, runtime)),
-            Some(&mut |layer, stream| compare(layer, first, stream, &mut decode_worst)))? {
+            transport.as_deref_mut().map(|t| (t, runtime)), on_layer)? {
             decode_logits.extend(logits);
         }
         position += n;

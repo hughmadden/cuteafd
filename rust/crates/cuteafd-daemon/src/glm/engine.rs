@@ -29,6 +29,33 @@ const MAX_RANKS: usize = 6;
 /// Rows of the decode-route programs (`_m64`).
 pub(crate) const DECODE_ROWS: usize = 64;
 
+/// What precedes a decode segment's residual norm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Previous {
+    First,
+    Delta,
+    Planes(usize),
+}
+
+/// Everything a captured decode segment bakes in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct GraphKey {
+    layer: usize,
+    rows: usize,
+    table_width: usize,
+    table_stride: usize,
+    previous: Previous,
+}
+
+struct GraphExec<'a>(*mut c_void, &'a NativeLibrary);
+
+impl Drop for GraphExec<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the exec came from end_capture and is destroyed once.
+        let _ = unsafe { self.1.cuda_graph_exec_destroy(self.0) };
+    }
+}
+
 /// Host tables of one step.
 struct StepTables {
     decode: bool,
@@ -127,6 +154,7 @@ pub(crate) struct GlmEngine<'a> {
     /// Host time per phase since the last reset: GPU wait before the expert
     /// request, the Spark exchange, the logits download.
     pub profile: RefCell<[f64; 3]>,
+    graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -163,7 +191,8 @@ impl<'a> GlmEngine<'a> {
         let cos_sin = DeviceAllocation::new(library, table.len() * 4)?;
         library.copy_h2d(cos_sin.buffer, bytes_of(&table))?;
         Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
-            workspace: RefCell::new(None), decode_workspace: RefCell::new(None), profile: RefCell::new([0.0; 3]) })
+            workspace: RefCell::new(None), decode_workspace: RefCell::new(None), profile: RefCell::new([0.0; 3]),
+            graphs: RefCell::new(std::collections::HashMap::new()) })
     }
 
     fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
@@ -287,7 +316,8 @@ impl<'a> GlmEngine<'a> {
                 tables.positions.push(position as i64);
                 tables.slots.push(placement.slot(position)?);
                 tables.cache_lengths.push((position + 1) as i32);
-                tables.table_width = tables.table_width.max((position + 1).div_ceil(PAGE_ROWS));
+                // Power-of-two widths bound the graphs a growing context captures.
+                tables.table_width = tables.table_width.max((position + 1).div_ceil(PAGE_ROWS).next_power_of_two().min(stride));
                 let mut pages = placement.pages.clone();
                 pages.resize(stride, 0);
                 tables.page_table.extend(pages);
@@ -319,6 +349,10 @@ impl<'a> GlmEngine<'a> {
         let rows = Dsv4Scalar::I32(t as i32);
         let cap = if tables.decode { "m64" } else { "m4096" };
         let layers = &self.weights.layers;
+        if tables.decode && on_layer.is_none() && layers.len() == self.cfg.layers {
+            self.decode_layers(w, tables, t, &mut experts)?;
+            return self.head(w, t, logit_rows).map(Some);
+        }
         self.norm(w, &layers[0], "input_norm", 0, rows)?;
         for (index, layer) in layers.iter().enumerate() {
             self.attention(w, index, layer, rows, cap, tables)?;
@@ -350,23 +384,105 @@ impl<'a> GlmEngine<'a> {
             unsafe { self.library.cuda_stream_synchronize(self.stream)? };
             return Ok(None);
         }
+        self.head(w, t, logit_rows).map(Some)
+    }
+
+    /// Logits of the last `n` of `t` rows of the final norm's output.
+    fn head(&self, w: &Workspace<'_>, t: usize, n: usize) -> Result<Vec<f32>> {
+        let h = self.cfg.hidden;
         // SAFETY: the final norm's output and the head operands are live buffers of these shapes.
         unsafe {
-            w.head.launch(w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2).cast(),
-                self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), logit_rows as u32, self.stream)?;
+            w.head.launch(w.x.buffer.ptr.cast::<u8>().add((t - n) * h * 2).cast(),
+                self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), n as u32, self.stream)?;
         }
         let timer = std::time::Instant::now();
-        let logits = self.download(&w.logits, logit_rows * self.cfg.vocab_size * 4)?;
+        let logits = self.download(&w.logits, n * self.cfg.vocab_size * 4)?;
         self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
-        Ok(Some(logits.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()))
+        Ok(logits.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
+    }
+
+    /// Decode layers as captured graph segments: each replays the previous
+    /// layer's reduce + residual norm, this layer's attention and
+    /// post-attention norm, and the dense FFN or the MoE front (router,
+    /// select, wire rows); the Spark exchange runs between segments.
+    fn decode_layers(&self, w: &Workspace<'_>, tables: &StepTables, t: usize,
+        experts: &mut Option<(&mut V41Tp4Roce, &tokio::runtime::Runtime)>) -> Result<()> {
+        let rows = Dsv4Scalar::I32(t as i32);
+        let layers = &self.weights.layers;
+        // Previous layer's FFN output: none (first layer), in `delta`, or Spark planes.
+        let mut previous = Previous::First;
+        for index in 0..=layers.len() {
+            let layer = layers.get(index);
+            let segment = || -> Result<()> {
+                if let Previous::Planes(ranks) = previous {
+                    self.reduce(w, ranks, t)?;
+                }
+                let weight = match layer {
+                    Some(layer) => layer.ptr("input_norm")?,
+                    None => self.weights.norm.buffer.ptr,
+                };
+                let deltas = if matches!(previous, Previous::First) { 0 } else { 1 };
+                self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                    ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
+                    &[rows, Dsv4Scalar::I32(deltas)])?;
+                let Some(layer) = layer else { return Ok(()) };
+                self.attention(w, index, layer, rows, "m64", tables)?;
+                self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                    ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
+                    &[rows, Dsv4Scalar::I32(1)])?;
+                if layer.dense {
+                    self.ffn(w, layer, self.cfg.dense_intermediate, "m64", w.delta.buffer.ptr, rows)
+                } else {
+                    self.moe_front(w, layer, t)
+                }
+            };
+            let key = GraphKey { layer: index, rows: t, table_width: tables.table_width,
+                table_stride: tables.table_stride, previous };
+            self.replay(key, segment)?;
+            previous = match layer {
+                None => break,
+                Some(layer) if layer.dense => Previous::Delta,
+                Some(layer) => {
+                    let (transport, runtime) = experts.as_mut()
+                        .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
+                    Previous::Planes(self.moe_exchange(w, index, layer, t, "m64", true, transport, runtime)?)
+                }
+            };
+        }
+        Ok(())
+    }
+
+    /// Launches `segment` through a graph captured the first time `key` is seen.
+    fn replay(&self, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+        if let Some(graph) = self.graphs.borrow().get(&key) {
+            // SAFETY: the graph's pointers are persistent engine buffers.
+            return unsafe { self.library.cuda_graph_launch(graph.0, self.stream) };
+        }
+        // SAFETY: capture records launches on the engine stream; nothing in the
+        // segment synchronizes the host.
+        unsafe { self.library.cuda_graph_begin_capture(self.stream)? };
+        let captured = segment();
+        let exec = unsafe { self.library.cuda_graph_end_capture(self.stream) };
+        captured?;
+        let exec = exec?;
+        unsafe { self.library.cuda_graph_launch(exec, self.stream)? };
+        self.graphs.borrow_mut().insert(key, GraphExec(exec, self.library));
+        Ok(())
     }
 
     /// Router, shared expert and the Spark routed experts; leaves
     /// routed + shared in `delta` for the next norm's residual add.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn moe(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str, decode: bool,
         transport: &mut V41Tp4Roce, runtime: &tokio::runtime::Runtime) -> Result<()> {
-        let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
+        self.moe_front(w, layer, t)?;
+        let ranks = self.moe_exchange(w, index, layer, t, cap, decode, transport, runtime)?;
+        self.reduce(w, ranks, t)
+    }
+
+    /// Router scores, the sigmoid top-k selection and the wire rows (device only).
+    fn moe_front(&self, w: &Workspace<'_>, layer: &GlmLayer<'_>, t: usize) -> Result<()> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let rows = Dsv4Scalar::I32(t as i32);
         self.run("glm_router_scores", &[("x", w.x.buffer.ptr), ("w", layer.ptr("gate")?),
@@ -381,7 +497,19 @@ impl<'a> GlmEngine<'a> {
         self.run("glm_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
             // SAFETY: the scale rows follow the payload inside each wire row.
             ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
-            ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Dsv4Scalar::I32(grid as i32)])?;
+            ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Dsv4Scalar::I32(grid as i32)])
+    }
+
+    /// Routes and wire rows down, the shared expert, the Spark exchange and
+    /// the rank planes' uploads; returns the rank count the reduce needs.
+    /// The next exchange's download sync completes the uploads before the
+    /// staging is rewritten.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_exchange(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str, decode: bool,
+        transport: &mut V41Tp4Roce, runtime: &tokio::runtime::Runtime) -> Result<usize> {
+        let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
+        let (h, topk) = (self.cfg.hidden, self.cfg.topk);
+        let rows = Dsv4Scalar::I32(t as i32);
         // Routes and wire rows down to the host for the request.
         let (route_bytes, wire_bytes) = (t * topk * 4, t * (h + h / 32));
         let staging = w.router_host.borrow_mut();
@@ -433,7 +561,6 @@ impl<'a> GlmEngine<'a> {
             }).await
         })?;
         self.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
-        let mut pointers = [std::ptr::null::<u16>(); MAX_RANKS];
         for rank in 0..ranks {
             let source = cuteafd_ffi::CuteafdHostBuffer {
                 // SAFETY: rank planes are disjoint slices of the staging buffer.
@@ -443,14 +570,20 @@ impl<'a> GlmEngine<'a> {
             };
             // SAFETY: pinned source and device plane both hold `plane_bytes`.
             unsafe { self.library.copy_host_buffer_h2d_async(w.planes[rank].buffer, source, plane_bytes, self.stream)? };
-            pointers[rank] = w.planes[rank].buffer.ptr.cast();
+        }
+        Ok(ranks)
+    }
+
+    /// Rank partials + shared expert into `delta`.
+    fn reduce(&self, w: &Workspace<'_>, ranks: usize, t: usize) -> Result<()> {
+        let mut pointers = [std::ptr::null::<u16>(); MAX_RANKS];
+        for (slot, plane) in pointers.iter_mut().zip(&w.planes[..ranks]) {
+            *slot = plane.buffer.ptr.cast();
         }
         // SAFETY: planes, shared and delta are live [t, h] BF16 buffers ordered after the uploads.
         unsafe {
             self.library.v41_compact_reducer()?.reduce_planes(pointers, ranks as u32, w.shared.buffer.ptr.cast(),
-                w.delta.buffer.ptr.cast(), t as u32, self.stream)?;
-            // The staging is rewritten by the next layer only after this upload drains.
-            self.library.cuda_stream_synchronize(self.stream)
+                w.delta.buffer.ptr.cast(), t as u32, self.stream)
         }
     }
 
