@@ -138,7 +138,7 @@ def main() -> None:
                 conv_w = torch.cat([w(f"self_attn.{n}_conv1d.weight") for n in "qkv"], 0)[:, 0, :].float().contiguous()
                 args = (w_in, w_fg, conv_w, w("self_attn.A_log").float(), w("self_attn.dt_bias").float(),
                         w("self_attn.o_norm.weight"), w("self_attn.o_proj.weight"))
-                scratch = torch.empty(glmf.kda_scratch_bytes(g, max(t, 64)), dtype=torch.uint8, device="cuda")
+                scratch = torch.empty(kda.scratch_bytes(max(t, 64))["scratch"], dtype=torch.uint8, device="cuda")
 
                 def run(rows_x, slots, seq_first, conv_state, state):
                     out = torch.empty(rows_x.shape[0], h, dtype=torch.bfloat16, device="cuda")
