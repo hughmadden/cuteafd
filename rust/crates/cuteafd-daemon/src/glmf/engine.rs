@@ -671,6 +671,33 @@ impl<'a> GlmfEngine<'a> {
         })
     }
 
+    /// Streams start as four copies of the embedding: the rows go up once
+    /// (into the second stream buffer) and are copied into each stream slot on
+    /// the device.
+    fn load_streams(&self, w: &Workspace<'_>, embed: &[u8]) -> Result<()> {
+        let row = self.cfg.hidden * 2;
+        let t = embed.len() / row;
+        ensure!(embed.len() == t * row && t <= w.rows, "embedding rows exceed the workspace");
+        let host = std::time::Instant::now();
+        let staged = cuteafd_ffi::CuteafdDeviceBuffer { bytes: embed.len(), ..w.streams[1].buffer };
+        self.library.copy_h2d(staged, embed)?;
+        self.host_op("host: embedding upload", host);
+        self.timed("stream expansion", || {
+            for s in 0..HC {
+                let dst = cuteafd_ffi::CuteafdDeviceBuffer {
+                    // SAFETY: slot `s` of row 0 lies inside the [t, 4, H] stream buffer.
+                    ptr: unsafe { w.streams[0].buffer.ptr.cast::<u8>().add(s * row) }.cast(),
+                    bytes: w.streams[0].buffer.bytes - s * row,
+                    ..w.streams[0].buffer
+                };
+                // SAFETY: both buffers are live workspace buffers of at least `t` pitched
+                // rows; the upload above completed before the copies are queued.
+                unsafe { self.library.copy_device_rows_async(dst, staged, row, t, HC * row, row, self.stream)? };
+            }
+            Ok(())
+        })
+    }
+
     fn put<T: Copy>(&self, dev: &Dev<'_>, values: &[T]) -> Result<()> {
         let bytes = bytes_of(values);
         ensure!(bytes.len() <= dev.buffer.bytes, "table exceeds its buffer");
@@ -848,17 +875,8 @@ impl<'a> GlmfEngine<'a> {
         self.put(&w.cache_lengths, &tables.cache_lengths)?;
         self.put(&w.page_table, &tables.page_table)?;
         self.put(&w.pool_table, &tables.pool_table)?;
-        // Streams start as four copies of the embedding.
         let row = h * 2;
-        let host = std::time::Instant::now();
-        let mut streams = vec![0u8; t * HC * row];
-        for (r, e) in embed.chunks_exact(row).enumerate() {
-            for s in 0..HC {
-                streams[(r * HC + s) * row..][..row].copy_from_slice(e);
-            }
-        }
-        self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: streams.len(), ..w.streams[0].buffer }, &streams)?;
-        self.host_op("host: stream expansion + upload", host);
+        self.load_streams(w, embed)?;
         let rows = Dsv4Scalar::I32(t as i32);
         if self.use_graphs && tables.decode && on_layer.is_none() && forced.is_none() {
             return self.decode_graphed(w, tables, t, rows, logit_rows);
@@ -1366,14 +1384,7 @@ impl<'a> GlmfEngine<'a> {
             self.put(&w.cache_lengths, &tables.cache_lengths)?;
             self.put(&w.page_table, &tables.page_table)?;
             self.put(&w.pool_table, &tables.pool_table)?;
-            let mut streams = vec![0u8; t * HC * row];
-            for (r, e) in embed.chunks_exact(row).enumerate() {
-                for k in 0..HC {
-                    streams[(r * HC + k) * row..][..row].copy_from_slice(e);
-                }
-            }
-            self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: streams.len(), ..w.streams[0].buffer },
-                &streams)?;
+            self.load_streams(w, embed)?;
         }
         let layers = &self.weights.layers;
         let cap = "m4096";
