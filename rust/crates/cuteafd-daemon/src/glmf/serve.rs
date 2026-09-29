@@ -61,7 +61,7 @@ struct Policy {
     fixed: Option<usize>,
 }
 
-fn model_id(snapshot: &std::path::Path) -> Option<String> {
+pub(crate) fn model_id(snapshot: &std::path::Path) -> Option<String> {
     snapshot.ancestors().find_map(|dir| {
         let name = dir.file_name()?.to_str()?.strip_prefix("models--")?;
         let (org, model) = name.split_once("--")?;
@@ -213,7 +213,7 @@ fn digest(state: u64, token: u32) -> u64 {
 /// earlier; proposes up to `limit` tokens that followed its latest earlier
 /// occurrence (a copy window). Exact: the verify step accepts only tokens the
 /// model itself produces.
-fn copy_drafts(history: &[u32], limit: usize) -> Vec<u32> {
+pub(crate) fn copy_drafts(history: &[u32], limit: usize) -> Vec<u32> {
     let len = history.len();
     for n in (4..=8).rev() {
         if len <= n {

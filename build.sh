@@ -43,6 +43,15 @@ CUTEAFD_RELEASE_REMOTE_BUILD_DIR must each be a canonical absolute path built fr
 letters, digits, dot, underscore, plus and minus - no spaces, dot segments, trailing
 slashes or shell metacharacters - because they reach remote shells and bind mounts.
 
+Families beyond V4.1 are opt-in. CUTEAFD_RELEASE_{DSV4,GLM,MIMO,GLMF,QWEN4}_AOT=ON
+put each family's coordinator programs in the coordinator image, and
+CUTEAFD_RELEASE_EXPERT_FAMILIES (FAMILY:ROLE list, ';'-separated) adds routed-expert
+packages to both images, each keeping its architecture's entries. p6's set plus
+Qwen 3.8 Flash Next, everything scripts/run-dsv4.sh serves (V4 Pro EXL3 K2, GLM 5.3
+EXL3 K4 and FP8, MiMo V2 Flash FP8, Qwen 3.8 Flash Next EXL3 K4.25):
+    CUTEAFD_RELEASE_GLM_AOT=ON CUTEAFD_RELEASE_MIMO_AOT=ON CUTEAFD_RELEASE_QWEN4_AOT=ON
+    CUTEAFD_RELEASE_EXPERT_FAMILIES='dsv4p:exl3-k23;glm:exl3-k45;glm:fp8;mimo:fp8;qwen4:exl3-k45'
+
 Images are labelled with the checkout's Git revision (HEAD), even when the
 tree has local changes. Dirty checkouts still get an automatic source manifest
 under .cuteafd-release/ so local and remote inventories can be verified; keep
