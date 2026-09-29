@@ -169,6 +169,8 @@ pub(crate) struct MimoEngine<'a> {
     experts: Option<Experts<'a>>,
     /// Host time per phase: GPU wait before the expert request, the Spark exchange.
     pub profile: RefCell<[f64; 2]>,
+    /// The DFlash drafter (V2.6 Pro's dflash/): every step taps its target layers.
+    pub drafter: Option<super::dflash::MimoDrafter<'a>>,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -223,7 +225,7 @@ impl<'a> MimoEngine<'a> {
         let (cos_sin_full, cos_sin_swa) = (table(cfg.full_rope_theta)?, table(cfg.swa_rope_theta)?);
         Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, rings, family, kv, cos_sin_full,
             cos_sin_swa, workspace: RefCell::new(None), decode_workspace: RefCell::new(None), experts: None,
-            profile: RefCell::new([0.0; 2]) })
+            profile: RefCell::new([0.0; 2]), drafter: None })
     }
 
     /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
@@ -428,6 +430,12 @@ impl<'a> MimoEngine<'a> {
                 None => self.weights.norm.buffer.ptr,
             };
             self.norm(w, weight, 1, rows)?;
+            if let Some(drafter) = &self.drafter {
+                // The step's last TAP_ROWS rows (a prefill's tail holds every
+                // context row later drafts can see).
+                let n = t.min(super::dflash::TAP_ROWS);
+                drafter.tap(index, w.h.buffer.ptr, t - n, n)?;
+            }
             if let Some(on_layer) = on_layer.as_mut() {
                 on_layer(index, &self.download(&w.h, t * h * 2)?)?;
             }

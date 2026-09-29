@@ -1,5 +1,6 @@
 //! MiMo V2 (mimo_v2_flash) on the generic engine: weights, the coordinator
 //! programs' layer chain, and the golden comparison command.
+pub(crate) mod dflash;
 pub(crate) mod engine;
 pub(crate) mod serve;
 pub(crate) mod weights;
@@ -45,6 +46,14 @@ pub(crate) struct EngineArgs {
     /// resident layers' experts must fit: 6.4 GiB each).
     #[arg(long)]
     pub local_experts: bool,
+    /// DFlash drafter: a directory with dflash_draft_model.safetensors, or a
+    /// snapshot with one under dflash/ (MiMo V2.6 Pro); taps the target
+    /// layers and drafts on this GPU.
+    #[arg(long)]
+    pub draft: Option<PathBuf>,
+    /// Sequences the drafter keeps a context for and drafts for at once.
+    #[arg(long, default_value_t = 4)]
+    pub draft_sequences: usize,
     /// Decode steps project qkv from the checkpoint's FP8 weight (V2.6 Pro;
     /// +170 MB per layer next to the BF16 copy prefill uses).
     #[arg(long)]
@@ -93,6 +102,11 @@ pub(crate) struct GoldenArgs {
     /// back), so prefill and decode times are the engine's.
     #[arg(long)]
     pub timing: bool,
+    /// With --draft: run only the drafter on the golden taps at the anchors of
+    /// python/reference/mimo_dflash/reference.py's output directory, compare
+    /// drafts, and score them against the golden text and greedy targets.
+    #[arg(long, requires = "draft")]
+    pub draft_oracle: Option<PathBuf>,
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -123,6 +137,8 @@ impl Opened {
     pub fn with_engine<T>(&self, args: &EngineArgs, body: impl FnOnce(&engine::MimoEngine<'_>) -> Result<T>) -> Result<T> {
         let programs = self.library.dsv4_programs()?.with_manifest(&args.manifest)?;
         programs.load_all()?;
+        let draft_dir = args.draft.as_deref().map(dflash::drafter_dir);
+        let draft_file = draft_dir.as_deref().map(dflash::prefetch);
         let stream = self.library.cuda_stream_create()?;
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
@@ -133,6 +149,21 @@ impl Opened {
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::MimoEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages, args.rings)?;
+        if let Some(dir) = &draft_dir {
+            let started = Instant::now();
+            let cfg = dflash::DflashConfig::read(dir)?;
+            ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
+                && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash drafter does not fit this target");
+            let mask = match dflash::mask_embedding(dir, cfg.hidden)? {
+                Some(row) => row,
+                None => embed_rows(&self.checkpoint, &[cfg.mask_token], cfg.hidden)?,
+            };
+            let file = draft_file.context("drafter prefetch")?.join()
+                .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
+            engine.drafter = Some(dflash::MimoDrafter::load(&self.library, dir, file, stream, args.draft_sequences,
+                args.draft_sequences, mask)?);
+            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash drafter resident");
+        }
         let moe_layers = (0..layers).filter(|&l| !self.cfg.dense[l]).collect::<Vec<_>>();
         if let Some(experts) = self.experts(args, &moe_layers)? {
             engine.set_experts(experts);
@@ -244,6 +275,9 @@ fn golden(args: GoldenArgs) -> Result<()> {
 }
 
 fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_>) -> Result<()> {
+    if let Some(dir) = &args.draft_oracle {
+        return draft_oracle(args, opened, engine, dir);
+    }
     let cfg = &opened.cfg;
     let layers = engine.weights.layers.len();
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
@@ -370,6 +404,115 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
     if profile[1] > 0.0 {
         println!("phases: GPU wait before expert requests {:.2} s, expert exchange / streamed loads {:.2} s",
             profile[0], profile[1]);
+    }
+    Ok(())
+}
+
+/// Runs the drafter alone on the golden taps at reference.py's anchors and
+/// compares drafts and final-norm rows; scores drafts against the golden text
+/// (accepted prefix) and against the target's greedy predictions along the
+/// text (`logits.bin` argmax, counted while the text follows the drafts); and
+/// times draft steps of 1..=draft_sequences sequences.
+fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_>, dir: &std::path::Path)
+    -> Result<()> {
+    let drafter = engine.drafter.as_ref().context("--draft-oracle needs --draft")?;
+    let (hidden, block, drafts_per, vocab) = (opened.cfg.hidden, drafter.cfg.block, drafter.cfg.drafts(),
+        opened.cfg.vocab_size);
+    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)?;
+    let positions: Vec<usize> = meta["positions"].as_array().context("positions")?.iter()
+        .map(|p| p.as_u64().map(|p| p as usize).context("position")).collect::<Result<_>>()?;
+    let ref_tokens: Vec<u32> = std::fs::read(dir.join("drafts.bin"))?
+        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let ref_hidden = bf16s(&std::fs::read(dir.join("hidden.bin"))?);
+    let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
+        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let greedy: Vec<u32> = std::fs::read(args.golden.join("logits.bin"))?.chunks_exact(vocab * 4).map(|row| {
+        let values = row.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap()));
+        values.enumerate().max_by(|a, b| a.1.total_cmp(&b.1)).map_or(0, |(i, _)| i as u32)
+    }).collect();
+    let layers: Vec<Vec<u8>> = drafter.cfg.taps.iter()
+        .map(|l| std::fs::read(args.golden.join(format!("layer{l:02}.bin")))).collect::<std::io::Result<_>>()?;
+    let row = hidden * 2;
+    let width = layers.len() * row;
+    let (mut done, mut exact, mut first, mut matched, mut worst) = (0usize, 0, 0, 0, 1f64);
+    let (mut text_accepted, mut greedy_accepted) = (0usize, 0usize);
+    let mut histogram = vec![0usize; block];
+    let mut draft_seconds = 0f64;
+    let update = |from: usize, to: usize, slot: usize| -> Result<()> {
+        let mut at = from;
+        while at < to {
+            let n = (to - at).min(dflash::TAP_ROWS);
+            let mut taps = vec![0u8; n * width];
+            for r in 0..n {
+                for (i, layer) in layers.iter().enumerate() {
+                    taps[r * width + i * row..][..row].copy_from_slice(&layer[(at + r) * row..][..row]);
+                }
+            }
+            drafter.put_taps(&taps)?;
+            drafter.update(&(0..n).map(|r| dflash::ContextRow { tap_row: r, slot, position: at + r })
+                .collect::<Vec<_>>())?;
+            at += n;
+        }
+        Ok(())
+    };
+    for (index, &position) in positions.iter().enumerate() {
+        // Only the last RING positions matter to a draft at `position`.
+        update(done.max(position.saturating_sub(dflash::RING)), position, 0)?;
+        done = position;
+        let anchor = tokens[position];
+        let timer = Instant::now();
+        let draft = drafter.draft(&[dflash::DraftSeq { slot: 0, anchor, position }],
+            &embed_rows(&opened.checkpoint, &[anchor], hidden)?, engine.weights.head.buffer.ptr)?.remove(0);
+        draft_seconds += timer.elapsed().as_secs_f64();
+        let reference = &ref_tokens[index * drafts_per..][..drafts_per];
+        exact += usize::from(draft.tokens == reference);
+        first += usize::from(draft.tokens[0] == reference[0]);
+        matched += draft.tokens.iter().zip(reference).take_while(|(a, b)| a == b).count();
+        let (cosine, _) = similarity(&bf16s(&drafter.last_hidden(1)?), &ref_hidden[index * block * hidden..][..block * hidden]);
+        worst = worst.min(cosine);
+        let text = draft.tokens.iter().enumerate()
+            .take_while(|&(j, &d)| tokens.get(position + 1 + j) == Some(&d)).count();
+        let target = draft.tokens.iter().enumerate().take_while(|&(j, &d)| {
+            greedy.get(position + j) == Some(&d) && (j == 0 || tokens.get(position + j) == Some(&draft.tokens[j - 1]))
+        }).count();
+        text_accepted += text;
+        greedy_accepted += target;
+        histogram[text] += 1;
+        if draft.tokens != reference {
+            println!("position {position}: engine {:?} reference {reference:?}", draft.tokens);
+        }
+    }
+    let n = positions.len();
+    println!("draft oracle: {n} anchors, identical drafts {exact}/{n}, first draft {first}/{n}, matching prefix \
+        {:.2} of {drafts_per}, worst final-norm cosine {worst:.6}, {:.2} ms/draft", matched as f64 / n as f64,
+        draft_seconds * 1e3 / n as f64);
+    println!("acceptance (teacher-forced on the golden text): accepted prefix vs text {:.2}, vs target greedy \
+        {:.2} per draft of {drafts_per}; text histogram {histogram:?}", text_accepted as f64 / n as f64,
+        greedy_accepted as f64 / n as f64);
+    // Draft-step cost by sequences (every slot holds the same context).
+    let position = *positions.last().context("no anchors")?;
+    for slot in 1..drafter.slots {
+        update(position.saturating_sub(dflash::RING), position, slot)?;
+    }
+    let anchor = embed_rows(&opened.checkpoint, &[tokens[position]], hidden)?;
+    for sequences in 1..=drafter.slots {
+        let seqs: Vec<_> = (0..sequences).map(|slot| dflash::DraftSeq { slot, anchor: tokens[position], position })
+            .collect();
+        let rows = anchor.repeat(sequences);
+        drafter.draft(&seqs, &rows, engine.weights.head.buffer.ptr)?;
+        let timer = Instant::now();
+        for _ in 0..10 {
+            drafter.draft(&seqs, &rows, engine.weights.head.buffer.ptr)?;
+        }
+        let per = timer.elapsed().as_secs_f64() * 1e2;
+        let timer = Instant::now();
+        for _ in 0..10 {
+            update(position - 8, position, 0)?;
+        }
+        // SAFETY: the engine owns this stream.
+        unsafe { opened.library.cuda_stream_synchronize(engine.stream)? };
+        println!("draft step, {sequences} sequences: {per:.2} ms; context update of 8 rows {:.2} ms",
+            timer.elapsed().as_secs_f64() * 1e2);
     }
     Ok(())
 }
