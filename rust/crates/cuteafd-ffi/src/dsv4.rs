@@ -374,6 +374,26 @@ impl NativeLibrary {
     }
 }
 
+impl NativeLibrary {
+    /// [`Self::vocabulary_head`] for a `vocab`-row head (GLM: 154880).
+    ///
+    /// # Safety
+    /// As [`Self::vocabulary_head`].
+    pub unsafe fn vocabulary_head_rows(&self, workspace: *mut c_void, width: u32, max_rows: u32, vocab: u32)
+        -> Result<VocabularyHead<'_>> {
+        type Create = unsafe extern "C" fn(*mut c_void, u64, i32, i32, i32, *mut *mut c_void) -> i32;
+        let create = *unsafe { self.lib.get::<Create>(b"cuteafd_vocabulary_head_create_vocab") }?;
+        let launch = *unsafe { self.lib.get(b"cuteafd_vocabulary_head_launch_width") }?;
+        let mut handle = std::ptr::null_mut();
+        let status = unsafe {
+            create(workspace, VOCABULARY_HEAD_WORKSPACE as u64, i32::try_from(width)?, i32::try_from(max_rows)?,
+                i32::try_from(vocab)?, &mut handle)
+        };
+        ensure!(status == 0, "vocabulary head creation failed with {status}");
+        Ok(VocabularyHead { library: self, handle, launch })
+    }
+}
+
 impl VocabularyHead<'_> {
     /// # Safety
     /// `input` BF16 [rows, width], `weight` BF16 [vocab, width] and `logits`

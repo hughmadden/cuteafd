@@ -92,7 +92,7 @@ int32_t blas_status(cublasStatus_t status) { return status == CUBLAS_STATUS_SUCC
 static int32_t create_head(void* workspace, uint64_t bytes, void** output, int width, int max_rows, int vocab_rows = 129280) {
   if (!output) return cudaErrorInvalidValue;
   *output = nullptr;
-  if (vocab_rows < 1 || vocab_rows > 129280) return cudaErrorInvalidValue;
+  if (vocab_rows < 1 || vocab_rows > 262144) return cudaErrorInvalidValue;
   if (bytes < kMarkovWorkspace || !span(workspace, kMarkovWorkspace, 256)) return cudaErrorInvalidValue;
   auto* handle = new (std::nothrow) MarkovHandle{};
   if (!handle) return cudaErrorMemoryAllocation;
@@ -176,6 +176,13 @@ extern "C" int32_t cuteafd_vocabulary_head_create(void* workspace, uint64_t byte
   if (width < 4096 || width > 16384 || width % 64 || max_rows < 1 || max_rows > 65536)
     return cudaErrorInvalidValue;
   return create_head(workspace, bytes, output, width, max_rows);
+}
+// Same, for a vocabulary other than DeepSeek's 129280 rows (GLM: 154880).
+extern "C" int32_t cuteafd_vocabulary_head_create_vocab(void* workspace, uint64_t bytes,
+    int32_t width, int32_t max_rows, int32_t vocab_rows, void** output) {
+  if (width < 4096 || width > 16384 || width % 64 || max_rows < 1 || max_rows > 65536)
+    return cudaErrorInvalidValue;
+  return create_head(workspace, bytes, output, width, max_rows, vocab_rows);
 }
 extern "C" int32_t cuteafd_vocabulary_head_launch_width(void* handle, const uint16_t* input,
     const uint16_t* weight, float* output, int32_t rows, void* stream) {
