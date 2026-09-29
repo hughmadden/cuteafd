@@ -30,6 +30,9 @@ pub(crate) struct GoldenArgs {
     pub layers: Option<usize>,
     #[arg(long, default_value_t = 32768)]
     pub max_context: usize,
+    /// Spark expert ranks in TP order (HOST:PORT,...), for MoE layers.
+    #[arg(long)]
+    pub peers: Option<String>,
 }
 
 pub(crate) fn embed_rows(catalog: &cuteafd_loader::OfficialV41Catalog, tokens: &[u32], hidden: usize) -> Result<Vec<u8>> {
@@ -65,6 +68,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
 
 fn golden(args: GoldenArgs) -> Result<()> {
     let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    cuteafd_core::set_expert_geometry(catalog.routed_experts().geometry()?)
+        .map_err(|g| anyhow::anyhow!("geometry already {g:?}"))?;
     let cfg = GlmDsaConfig::read(&args.snapshot)?;
     let library = unsafe { NativeLibrary::load(&args.native_lib) }?;
     library.cuda_set_device(args.device)?;
@@ -93,7 +98,21 @@ fn golden(args: GoldenArgs) -> Result<()> {
         }
         Ok(())
     };
-    let logits = engine.prefill(&mut placement, &embed, Some(&mut compare))?;
+    let mut transport = match args.peers.as_deref() {
+        Some(peers) => {
+            let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
+            let executors: Vec<u64> = (0..peers.len())
+                .map(|rank| cuteafd_transport::v41_expert::v41_spark_executor_id(peers.len(), rank))
+                .collect::<Result<_>>()?;
+            Some(cuteafd_transport::v41_expert::V41Tp4Roce::new_ranks(&peers, &executors, 4096,
+                cuteafd_transport::TcpTransportConfig { timing: false, timeout: std::time::Duration::from_secs(120),
+                    max_frame_bytes: 64 << 20 })?)
+        }
+        None => None,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let experts = transport.as_mut().map(|t| (t, &runtime));
+    let logits = engine.prefill(&mut placement, &embed, experts, Some(&mut compare))?;
     println!("prefill: {} tokens through {layers} layers in {:.2} s", tokens.len(), started.elapsed().as_secs_f64());
     if let Some(logits) = logits {
         let golden: Vec<f32> = std::fs::read(args.golden.join("logits.bin"))?

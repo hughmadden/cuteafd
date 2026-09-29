@@ -7,7 +7,11 @@
 //! the dense MLP or the MoE (router, expert input quantization, shared
 //! expert, routed experts). The latent and index caches share page ids.
 use super::weights::{GlmLayer, GlmWeights};
-use crate::v41_memory::DeviceAllocation;
+use crate::v41_memory::{DeviceAllocation, HostAllocation};
+use cuteafd_transport::v41_expert::{V41Tp4Roce, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
+use cuteafd_transport::{
+    ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
+};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::dsv4::{Dsv4Programs, Dsv4Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::NativeLibrary;
@@ -20,6 +24,8 @@ type Dev<'a> = DeviceAllocation<'a>;
 pub(crate) const PAGE_ROWS: usize = 64;
 const RECORD_PAGE_BYTES: usize = PAGE_ROWS * 656;
 const INDEX_PAGE_BYTES: usize = 8448;
+/// Most Spark ranks a step's partials come from (the compact reducer's limit).
+const MAX_RANKS: usize = 6;
 
 /// A sequence's pages (shared by the latent and index caches) and length.
 #[derive(Debug, Clone)]
@@ -54,6 +60,16 @@ struct Workspace<'a> {
     scratch: Dev<'a>,
     topk_scratch: Dev<'a>,
     logits: Dev<'a>,
+    /// MoE: router logits (FP32), routes, wire rows, shared-expert output,
+    /// rank partial planes, and their pinned staging.
+    router_logits: Dev<'a>,
+    route_ids: Dev<'a>,
+    route_weights: Dev<'a>,
+    wire: Dev<'a>,
+    shared: Dev<'a>,
+    planes: Vec<Dev<'a>>,
+    router_host: RefCell<HostAllocation<'a>>,
+    planes_host: RefCell<HostAllocation<'a>>,
     head: VocabularyHead<'a>,
     _head_workspace: Dev<'a>,
 }
@@ -161,6 +177,14 @@ impl<'a> GlmEngine<'a> {
             scratch: self.alloc(scratch)?,
             topk_scratch: topk,
             logits: self.alloc(t * self.cfg.vocab_size * 4)?,
+            router_logits: self.alloc(t * self.cfg.experts * 4)?,
+            route_ids: self.alloc(t * self.cfg.topk * 4)?,
+            route_weights: self.alloc(t * self.cfg.topk * 4)?,
+            wire: self.alloc(t * (h + h / 32))?,
+            shared: self.alloc(t * h * 2)?,
+            planes: (0..MAX_RANKS).map(|_| self.alloc(t * h * 2)).collect::<Result<_>>()?,
+            router_host: RefCell::new(HostAllocation::new(self.library, t * (self.cfg.topk * 8 + h + h / 32))?),
+            planes_host: RefCell::new(HostAllocation::new(self.library, MAX_RANKS * t * h * 2)?),
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, t as u32,
                 self.cfg.vocab_size as u32)? },
@@ -186,6 +210,7 @@ impl<'a> GlmEngine<'a> {
     /// returns the last row's logits when all layers are resident.
     /// `on_layer` receives each layer's output rows (BF16 [t, hidden]).
     pub fn prefill(&self, placement: &mut GlmPlacement, embed: &[u8],
+        mut experts: Option<(&mut V41Tp4Roce, &tokio::runtime::Runtime)>,
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<Vec<f32>>> {
         let (h, t, start) = (self.cfg.hidden, embed.len() / (self.cfg.hidden * 2), placement.len);
         ensure!(t > 0 && t <= self.prefill_rows && start + t <= self.max_context, "prefill of {t} rows at {start}");
@@ -219,7 +244,9 @@ impl<'a> GlmEngine<'a> {
                     ("x", w.x.buffer.ptr), ("w_gate_up", layer.ptr("w_gate_up")?), ("w_down", layer.ptr("w_down")?),
                     ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])?;
             } else {
-                anyhow::bail!("layer {index} is an MoE layer; routed experts are not wired into the GLM engine yet");
+                let (transport, runtime) = experts.as_mut()
+                    .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
+                self.moe(w, index, layer, t, cap, transport, runtime)?;
             }
             // h += ffn; x = next input_layernorm(h) (or the final norm).
             let weight = match layers.get(index + 1) {
@@ -246,6 +273,96 @@ impl<'a> GlmEngine<'a> {
         }
         let logits = self.download(&w.logits, self.cfg.vocab_size * 4)?;
         Ok(Some(logits.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()))
+    }
+
+    /// Router, shared expert and the Spark routed experts; leaves
+    /// routed + shared in `delta` for the next norm's residual add.
+    #[allow(clippy::too_many_arguments)]
+    fn moe(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str,
+        transport: &mut V41Tp4Roce, runtime: &tokio::runtime::Runtime) -> Result<()> {
+        let (h, topk) = (self.cfg.hidden, self.cfg.topk);
+        let rows = Dsv4Scalar::I32(t as i32);
+        self.run("glm_router_scores", &[("x", w.x.buffer.ptr), ("w", layer.ptr("gate")?),
+            ("logits", w.router_logits.buffer.ptr)], &[rows])?;
+        // SAFETY: logits, bias and route outputs are live buffers of `t` rows.
+        unsafe {
+            self.library.router_select(w.router_logits.buffer.ptr, layer.ptr("gate.bias")?, std::ptr::null(),
+                std::ptr::null(), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t, self.cfg.experts, topk,
+                self.cfg.routed_scale as f32, true, self.stream)?;
+        }
+        let grid = (t * h.div_ceil(256)).div_ceil(8).clamp(1, 4 * 188);
+        self.run("glm_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
+            // SAFETY: the scale rows follow the payload inside each wire row.
+            ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
+            ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Dsv4Scalar::I32(grid as i32)])?;
+        // Routes and wire rows down to the host for the request.
+        let (route_bytes, wire_bytes) = (t * topk * 4, t * (h + h / 32));
+        let mut staging = w.router_host.borrow_mut();
+        let host = staging.buffer;
+        let at = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
+            // SAFETY: ids, weights and wire rows are consecutive inside the pinned buffer.
+            ptr: unsafe { host.ptr.cast::<u8>().add(offset) }.cast(),
+            bytes: host.bytes - offset,
+            ..host
+        };
+        // SAFETY: the pinned regions are large enough; the sync completes them.
+        unsafe {
+            self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.stream)?;
+            self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.stream)?;
+            self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), w.wire.buffer, wire_bytes, self.stream)?;
+            self.library.cuda_stream_synchronize(self.stream)?;
+        }
+        // The shared expert runs on the GPU while the Sparks compute.
+        self.run(&format!("glm_ffn_i{}_{cap}", self.cfg.moe_intermediate), &[
+            ("x", w.x.buffer.ptr), ("w_gate_up", layer.ptr("w_gate_up")?), ("w_down", layer.ptr("w_down")?),
+            ("out", w.shared.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])?;
+        let staged = staging.bytes();
+        let word = |offset: usize, i: usize| u32::from_le_bytes(staged[offset + i * 4..][..4].try_into().unwrap());
+        let routes = (0..t * topk).map(|i| ExpertProtocolV2RouteEntry {
+            row_index: (i / topk) as u32, expert_id: word(0, i), gate_weight: f32::from_bits(word(route_bytes, i)),
+        }).collect();
+        let wire = staged[2 * route_bytes..2 * route_bytes + wire_bytes].to_vec();
+        drop(staging);
+        let mut request = ExpertProtocolV2Request::new(index as u64 + 1, 17, index as u32, h as u32,
+            ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+            (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
+                row_id: u64::from(row), source_kind: ExpertV2SourceKind::Prefill, source_request_id: 1,
+                token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32,
+            }).collect(),
+            routes, wire)?;
+        request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+        let ranks = transport.world_size();
+        ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
+        let (row_bytes, plane_bytes) = (h * 2, t * h * 2);
+        let mut staging = w.planes_host.borrow_mut();
+        let bytes = staging.bytes_mut();
+        runtime.block_on(async {
+            transport.execute(&request, |rank, first, payload| {
+                let offset = rank * plane_bytes + first as usize * row_bytes;
+                ensure!(first as usize * row_bytes + payload.len() <= plane_bytes, "partial rows exceed the step");
+                bytes[offset..offset + payload.len()].copy_from_slice(payload);
+                Ok(())
+            }).await
+        })?;
+        let mut pointers = [std::ptr::null::<u16>(); MAX_RANKS];
+        for rank in 0..ranks {
+            let source = cuteafd_ffi::CuteafdHostBuffer {
+                // SAFETY: rank planes are disjoint slices of the staging buffer.
+                ptr: unsafe { staging.buffer.ptr.cast::<u8>().add(rank * plane_bytes) }.cast(),
+                bytes: plane_bytes,
+                ..staging.buffer
+            };
+            // SAFETY: pinned source and device plane both hold `plane_bytes`.
+            unsafe { self.library.copy_host_buffer_h2d_async(w.planes[rank].buffer, source, plane_bytes, self.stream)? };
+            pointers[rank] = w.planes[rank].buffer.ptr.cast();
+        }
+        // SAFETY: planes, shared and delta are live [t, h] BF16 buffers ordered after the uploads.
+        unsafe {
+            self.library.v41_compact_reducer()?.reduce_planes(pointers, ranks as u32, w.shared.buffer.ptr.cast(),
+                w.delta.buffer.ptr.cast(), t as u32, self.stream)?;
+            // The staging is rewritten by the next layer only after this upload drains.
+            self.library.cuda_stream_synchronize(self.stream)
+        }
     }
 
     fn norm(&self, w: &Workspace<'_>, layer: &GlmLayer<'_>, weight: &str, deltas: i32, rows: Dsv4Scalar) -> Result<()> {
