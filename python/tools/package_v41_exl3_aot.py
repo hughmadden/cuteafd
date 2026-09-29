@@ -98,6 +98,8 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             raise ValueError(f'EXL3 variant route block mismatch: {directory}')
         if variant.get('fused_input_rotation', False) != meta.get('fused_input_rotation', False):
             raise ValueError(f'EXL3 variant fused input rotation mismatch: {directory}')
+        if variant.get('warp_specialized', False) != meta.get('warp_specialized', False):
+            raise ValueError(f'EXL3 variant warp specialization mismatch: {directory}')
         if variant.get('token_major_rotation', False) != meta.get('token_major_rotation', False):
             raise ValueError(f'EXL3 variant input rotation mismatch: {directory}')
         if meta['capacity'] in overrides and meta.get('blocks_per_sm') != overrides[meta['capacity']]:
@@ -317,6 +319,25 @@ def fused_input_rotation(geometry: str, role: str, width: int, capacity: int) ->
     return False
 
 
+def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> bool:
+    """Whether a capacity exports the warp-specialized prefill kernels (b12x
+    mixed_trellis_ws, 64-row route blocks): producer warps stream the Trellis
+    weights and input rows and rotate FC1 inputs one block ahead, consumer
+    warps decode and multiply. Bit-identical to the cooperative kernel.
+    Faster than the cooperative exports at every Spark width and prefill
+    capacity measured (GB10, random routes, kernel + top-k sum, median of
+    three interleaved runs, ms): V4 Pro TP4 768 m1024 11.16 -> 8.36, m4096
+    21.98 -> 17.27; GLM 5.3 TP4 512 m1024 7.23 -> 6.67, m4096 18.24 ->
+    14.60; GLM 5.3 Flash TP4 512 m4096 11.03 -> 9.07, TP2 1024 m4096 19.32
+    -> 15.47; single runs 3-25% faster for TP2/TP3/TP6 widths (tile-128
+    GLM TP3 640 included) and at m128/m256. Decode capacities (<= 80 rows)
+    keep the cooperative kernel.
+    """
+    if role != 'spark' or geometry not in ('dsv4p', 'glm', 'glmf'):
+        return False
+    return capacity >= 256
+
+
 def package_name(geometry: str, bits: list[int]) -> str:
     """Package directory for one tier family; mirrors the daemon's resolver."""
     tag = ''.join(map(str, bits))
@@ -499,9 +520,15 @@ def build(args: argparse.Namespace) -> None:
                     options['tile'] = tile
                 if geometry != 'v41':
                     options['hidden'] = hidden
-                if (block := route_block(geometry, capacity)) != 8:
+                block = route_block(geometry, capacity)
+                ws = tile is None and warp_specialized(geometry, args.role, width, capacity)
+                if ws:
+                    block = 64
+                if block != 8:
                     options['route_block'] = block
-                if tile is None and fused_input_rotation(geometry, args.role, width, capacity):
+                if ws:
+                    options['warp_specialized'] = True
+                elif tile is None and fused_input_rotation(geometry, args.role, width, capacity):
                     options['fused_input_rotation'] = True
                 elif token_major_rotation(geometry, capacity):
                     options['token_major_rotation'] = True
@@ -544,6 +571,8 @@ def build(args: argparse.Namespace) -> None:
                         variant['token_major_rotation'] = True
                     if meta.get('fused_input_rotation'):
                         variant['fused_input_rotation'] = True
+                    if meta.get('warp_specialized'):
+                        variant['warp_specialized'] = True
                     variants.append(variant)
                     if paired:
                         variants[-1]['paired_boundary'] = meta['paired_boundary']

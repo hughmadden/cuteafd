@@ -356,6 +356,19 @@ class PackageProfileTests(unittest.TestCase):
         for capacity in (1, 16, 80, 256, 1024, 4096):
             self.assertFalse(f('v41', 'spark', 512, capacity) or f('dsv4p', 'coordinator', 768, capacity))
 
+    def test_warp_specialized_prefill_only_for_spark_prefill_capacities(self):
+        """V4 Pro, GLM 5.3 and GLM 5.3 Flash Spark packages at m256 and above;
+        decode capacities (<= 80), V4.1, V4 Flash, Qwen and the coordinator's
+        packages keep the cooperative kernel."""
+        w = package.warp_specialized
+        for geometry in ('dsv4p', 'glm', 'glmf'):
+            for width in (512, 640, 768, 1024, 1536):
+                self.assertEqual([w(geometry, 'spark', width, c) for c in (1, 16, 80, 256, 1024, 4096)],
+                                 [False, False, False, True, True, True])
+                self.assertFalse(any(w(geometry, 'coordinator', width, c) for c in (256, 1024, 4096)))
+        for geometry in ('v41', 'dsv4f', 'qwen4'):
+            self.assertFalse(any(w(geometry, 'spark', 512, c) for c in (256, 1024, 4096)))
+
     def test_route_blocks_widen_only_for_dsv4p_prefill(self):
         """V4.1 and V4 Flash keep 8-row blocks; V4 Pro prefill widens (Spark and RTX)."""
         for capacity in (1, 16, 80, 256, 1024, 4096):
