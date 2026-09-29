@@ -8,6 +8,8 @@ use crate::plan::family::{Family, Hint, RuntimeStatus};
 use crate::plan::names::indexed;
 use crate::plan::spec::*;
 
+const GIB: f64 = (1u64 << 30) as f64;
+
 pub struct MiMo;
 pub static MIMO_V2: MiMo = MiMo;
 
@@ -90,11 +92,29 @@ impl Family for MiMo {
             speculator: (mtp > 0).then_some(SpeculatorSpec::NativeMtp { layers: mtp }),
             tables: Vec::new(),
             vision: checkpoint.config.get("vision_config").is_some(),
-            notes: vec![format!(
-                "partial rotary {}, attention value scale {}",
-                text.get("partial_rotary_factor").cloned().unwrap_or(Value::Null),
-                text.get("attention_value_scale").cloned().unwrap_or(Value::Null)
-            )],
+            notes: {
+                let mut notes = vec![format!(
+                    "partial rotary {}, attention value scale {}",
+                    text.get("partial_rotary_factor").cloned().unwrap_or(Value::Null),
+                    text.get("attention_value_scale").cloned().unwrap_or(Value::Null)
+                )];
+                if checkpoint.tensors.iter().any(|t| t.meta.name.ends_with("self_attn.qkv_proj.weight")) {
+                    let tp = crate::mimo_v2::checkpoint_tp(&checkpoint.snapshot).unwrap_or(1);
+                    notes.push(format!("fused qkv_proj stored TP{tp}-interleaved ([q|k|v] per row shard, \
+                        own 128x128 grid per shard); the engine de-interleaves it (FusedQkvLayout)"));
+                }
+                if let Some(router) = checkpoint.tensors.iter().find(|t| t.meta.name.ends_with("mlp.gate.weight")) {
+                    notes.push(format!("router weight {:?}", router.meta.dtype));
+                }
+                if checkpoint.snapshot.join("dflash").join("config.json").exists() {
+                    notes.push("dflash/: DFlash block drafter (not planned: its own qwen3-style config)".into());
+                }
+                if let Ok(family) = crate::mimo_v2::MimoV2Config::from_hf(text).and_then(|c| c.program_family().map(str::to_owned)) {
+                    notes.push(format!("coordinator programs: family {family} (CUTEAFD_ENABLE_MIMO_AOT, \
+                        CUTEAFD_MIMO_GEOMETRIES={family})"));
+                }
+                notes
+            },
         })
     }
 
@@ -132,14 +152,55 @@ impl Family for MiMo {
         Some(TensorRole::layer(component, layer))
     }
 
+    fn component_hint_for(&self, spec: &ModelSpec, component: Component, formats: &[String]) -> Option<Hint> {
+        let moe = spec.moe.as_ref()?;
+        let (h, i, e, k) = (spec.hidden, moe.intermediate, moe.experts, moe.top_k);
+        let mxfp4 = formats.iter().any(|f| f.starts_with("mxfp4"));
+        match component {
+            Component::RoutedExpert if mxfp4 => {
+                // TP6: whole 32-blocks per rank (352/320 of 2048), stored zero-padded to 128.
+                let widest = (i / 32).div_ceil(6) * 32;
+                let padded = widest.div_ceil(128) * 128;
+                let per_rank = |slice: usize| (spec.moe_layers() * e * 3 * slice * h) as f64 * (0.5 + 1.0 / 32.0) / GIB;
+                Some(Hint {
+                    what: format!("sigmoid top-{k} routed experts, no shared expert, MXFP4 (packed E2M1 U8 [N, K/2], \
+                        even element low nibble, UE8M0 U8 [N, K/32]): H {h}, I {i}, {e} experts"),
+                    how: format!("Exact family `mimop:fp8` (b12x fp8_moe weights=mxfp4: E2M1 x 2^(s-127) widened \
+                        to BF16, BF16 MMA; packages fp8-mimop tp1 coordinator, tp6/tp2 Spark, \
+                        python/tools/package_fp8_moe_aot.py --geometry mimop [--cross-sm121]). Spark layout TP6 \
+                        over six ranks: whole 32-blocks per rank ({widest}/{} rows) zero-padded to {padded}, \
+                        {:.1} GiB per rank (TP2xEP3: {:.1} GiB, but a decode step reads all of a row's experts \
+                        that land on one EP group). Missing: an MXFP4 streaming/TMA GEMM route for large \
+                        prefill steps (the grouped GEMV serves every row count).",
+                        widest - 32, per_rank(padded), per_rank(i / 2) / 3.0),
+                })
+            }
+            Component::RoutedExpert => Some(Hint {
+                what: format!("sigmoid top-{k} routed experts, no shared expert (H {h}, I {i}, {e} experts)"),
+                how: format!("Exact family `mimo:fp8` (b12x fp8_moe over E4M3 + FP32 128x128 scales; packages \
+                    fp8-mimo tp1/tp2/tp4) for H {h} / I {i} / {e} experts / top-{k}; UE8M0 requantization costs \
+                    +0.011 nats mean NLL (V2 Flash), EXL3 is the compact alternative."),
+            }),
+            // Pro's router weight is BF16 (the bias FP32); Flash's is FP32.
+            Component::Router if formats.iter().any(|f| f == "bf16") => Some(Hint {
+                what: "sigmoid noaux_tc router with FP32 e_score_correction_bias, BF16 router weight".into(),
+                how: "mimop_router_scores (BF16 weight, FP32 accumulation) then cuteafd_router_select \
+                    (sigmoid, normalized, no routed scaling).".into(),
+            }),
+            _ => self.component_hint(component),
+        }
+    }
+
     fn component_hint(&self, component: Component) -> Option<Hint> {
         let (what, how) = match component {
             Component::Attention => (
                 "GQA full attention plus 128-token sliding-window GQA with learned sink bias",
-                "Coordinator programs exist (b12x integration mimo_{full,swa}_{producer,attention}, mimo_o): \
-                 BF16 KV records, paged full layers, 256-slot SWA rings, sinks, QK 192 / V 128, NeoX RoPE on \
-                 64 dims. Full-layer k_proj scales are per KV head (128 + 64 rows). Next: FP8 decode weights, \
-                 multi-row decode tiles for verify steps, FP8 KV.",
+                "Coordinator programs exist (b12x integration mimo_{full,swa}_{producer,attention}, mimo_o; \
+                 family mimo for V2 Flash, mimop for V2.6 Pro): BF16 KV records, paged full layers, 256-slot SWA \
+                 rings, sinks, QK 192 / V 128, NeoX RoPE on 64 dims. FP8 scale grids restart per segment \
+                 (fp8-block128x128-segmented): Flash's full-layer k_proj per KV head (128 + 64 rows), Pro's fused \
+                 qkv_proj per checkpoint TP shard. Next: FP8 decode weights, multi-row decode tiles for verify \
+                 steps, FP8 KV.",
             ),
             Component::RoutedExpert => (
                 "sigmoid top-8 routed experts, no shared expert",
@@ -153,8 +214,9 @@ impl Family for MiMo {
                  (sigmoid, normalized, no routed scaling).",
             ),
             Component::Speculator => (
-                "three MTP layers (SWA attention with sinks, dense FFN, eh_proj/enorm/hnorm)",
-                "Reuse the mimo SWA programs and mimo_ffn; add the eh_proj fusion (BF16 [4096, 8192]).",
+                "MTP layers (SWA attention with sinks, dense FFN, eh_proj/enorm/hnorm)",
+                "Reuse the mimo/mimop SWA programs and the dense FFN program; add the eh_proj fusion \
+                 (BF16 [H, 2H]).",
             ),
             _ => return None,
         };

@@ -15,6 +15,10 @@ pub enum WeightFormat {
     F32,
     /// E4M3 weights with a block scale; `block` is (rows, cols) per scale.
     Fp8Block { block: (usize, usize) },
+    /// E4M3 weights with 128x128 blocks whose row blocks restart at segment
+    /// boundaries (per KV head, or per checkpoint TP shard of a fused
+    /// projection), so the grid has more rows than `ceil(rows / 128)`.
+    Fp8SegmentedBlock { block: (usize, usize) },
     /// E4M3 weights with one scale per output row or tensor.
     Fp8PerChannel,
     /// Packed E2M1 with E8M0 group scales (OCP MX, DeepSeek FP4 experts).
@@ -36,6 +40,7 @@ impl WeightFormat {
             WeightFormat::F16 => "f16".into(),
             WeightFormat::F32 => "f32".into(),
             WeightFormat::Fp8Block { block } => format!("fp8-block{}x{}", block.0, block.1),
+            WeightFormat::Fp8SegmentedBlock { block } => format!("fp8-block{}x{}-segmented", block.0, block.1),
             WeightFormat::Fp8PerChannel => "fp8-channel".into(),
             WeightFormat::Mxfp4 { group } => format!("mxfp4-g{group}"),
             WeightFormat::Nvfp4 => "nvfp4".into(),
@@ -127,8 +132,12 @@ pub fn detect(members: &BTreeMap<String, &CheckpointTensor>) -> WeightFormat {
                 Some(scale) if scale.shape.len() == 2 && weight.shape.len() == 2 => {
                     let rows = block_edge(weight.shape[0], scale.shape[0]);
                     let cols = block_edge(weight.shape[1], scale.shape[1]);
+                    let uniform = weight.shape[0].div_ceil(128);
                     if cols == weight.shape[1] {
                         WeightFormat::Fp8PerChannel
+                    } else if cols == 128 && scale.shape[0] > uniform && scale.shape[0] < weight.shape[0].div_ceil(64) {
+                        // More 128-row blocks than rows / 128: blocks restart per segment.
+                        WeightFormat::Fp8SegmentedBlock { block: (128, 128) }
                     } else {
                         WeightFormat::Fp8Block { block: (rows, cols) }
                     }

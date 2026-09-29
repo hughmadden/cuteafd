@@ -1,5 +1,6 @@
 //! Exact FP8 routed experts (the `fp8` family): the checkpoint's E4M3 expert
-//! weights with FP32 128x128 block scales, resident per TP slice and run by
+//! weights with FP32 128x128 block scales (or MXFP4, MiMo V2.6 Pro:
+//! `fp8-mimop` packages), resident per TP slice and run by
 //! an `fp8-<family>` package (`python/tools/package_fp8_moe_aot.py`,
 //! `native/include/cuteafd_fp8_moe.h`). Nothing is re-quantized. Output is
 //! the BF16 `[rows, H]` route sum of the slice: the Spark rank partial of the
@@ -103,8 +104,10 @@ impl<'a> Fp8Experts<'a> {
                 directory.display()))?;
         let info = module.info().clone();
         let shape = tensors.shape();
+        let mxfp4 = tensors.format() == cuteafd_loader::fp8_experts::ExpertFormat::Mxfp4;
         ensure!(info.hidden == shape.hidden && info.experts == shape.experts && info.topk == shape.topk
-            && info.intermediate == shape.intermediate && info.tp == tp,
+            && info.intermediate == shape.intermediate && info.tp == tp && info.mxfp4 == mxfp4
+            && info.slice == tensors.slice(tp)?,
             "FP8 package {} ({info:?}) does not serve this checkpoint at TP{tp}", directory.display());
         let top = info.capacity_for(capacity)
             .with_context(|| format!("FP8 package has no capacity for {capacity} rows"))?;

@@ -26,6 +26,8 @@ impl ExpertGeometry {
     pub const GLM_DSA: Self = Self { hidden: 6144, experts: 256, topk: 8, intermediate: 2048, layers: 78 };
     /// MiMo V2 Flash (mimo_v2_flash): routed layers 1..48, FP8 experts.
     pub const MIMO_V2_FLASH: Self = Self { hidden: 4096, experts: 256, topk: 8, intermediate: 2048, layers: 48 };
+    /// MiMo V2.6 Pro (mimo_v2): routed layers 1..70, MXFP4 experts.
+    pub const MIMO_V26_PRO: Self = Self { hidden: 6144, experts: 384, topk: 8, intermediate: 2048, layers: 70 };
     /// GLM 5.3 Flash (glm5_next): routed layers 3..45, SwiGLU clamped at 10.
     pub const GLM_NEXT: Self = Self { hidden: 4096, experts: 288, topk: 8, intermediate: 2048, layers: 45 };
     /// Qwen 3.8 Flash Next (qwen4_exp): 48 routed layers, softmax top-10, SiLU unclamped.
@@ -52,6 +54,7 @@ impl ExpertGeometry {
             (Self::DEEPSEEK_V4_PRO, "dsv4p"),
             (Self::GLM_DSA, "glm"),
             (Self::MIMO_V2_FLASH, "mimo"),
+            (Self::MIMO_V26_PRO, "mimop"),
             (Self::GLM_NEXT, "glmf"),
             (Self::QWEN4_EXP, "qwen4"),
         ]
@@ -63,7 +66,7 @@ impl ExpertGeometry {
     /// 10; GLM 5.x's, MiMo's and Qwen 3.8 Flash Next's SwiGLU are unclamped (`None`).
     pub fn swiglu_limit(&self) -> Option<f32> {
         (!self.same_shape(&Self::GLM_DSA) && !self.same_shape(&Self::MIMO_V2_FLASH)
-            && !self.same_shape(&Self::QWEN4_EXP)).then_some(10.0)
+            && !self.same_shape(&Self::MIMO_V26_PRO) && !self.same_shape(&Self::QWEN4_EXP)).then_some(10.0)
     }
 
     /// Equal kernel shape (hidden, experts, top-k, intermediate), any layer bound.

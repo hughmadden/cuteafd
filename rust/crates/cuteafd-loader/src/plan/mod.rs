@@ -173,7 +173,8 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport> {
             RuntimeStatus::Serving => Status::MissingKernel,
         };
         if !matches!(status, Status::Ready | Status::Unused) && hinted.insert(*component) {
-            if let Some(hint) = family.component_hint(*component) {
+            let labels: Vec<String> = formats.keys().cloned().collect();
+            if let Some(hint) = family.component_hint_for(&spec, *component, &labels) {
                 if !report.hints.iter().any(|h| h.what == hint.what) {
                     report.hints.push(hint);
                 }

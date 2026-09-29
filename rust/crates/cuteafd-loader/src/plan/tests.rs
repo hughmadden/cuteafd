@@ -129,6 +129,28 @@ fn exl3_bits_and_partial_fp8_blocks_are_detected() {
 }
 
 #[test]
+fn mimo_pro_segmented_fp8_grid_and_mxfp4_experts_are_described() {
+    let dir = snapshot(
+        json!({"architectures": ["MiMoV2ForCausalLM"], "model_type": "mimo_v2", "hidden_size": 256,
+               "vocab_size": 8, "num_hidden_layers": 1, "num_attention_heads": 4, "num_key_value_heads": 2,
+               "head_dim": 192, "v_head_dim": 128, "hybrid_layer_pattern": [0], "moe_layer_freq": [1],
+               "n_routed_experts": 2, "num_experts_per_tok": 1, "moe_intermediate_size": 64}),
+        &[
+            // Two row shards of [q (2 x 192) | k (1 x 192) | v (1 x 128)]: 3 + 2 + 1 blocks each.
+            ("model.layers.0.self_attn.qkv_proj.weight", "F8_E4M3", vec![1408, 256]),
+            ("model.layers.0.self_attn.qkv_proj.weight_scale_inv", "F32", vec![12, 2]),
+            ("model.layers.0.mlp.experts.0.gate_proj.weight", "U8", vec![64, 128]),
+            ("model.layers.0.mlp.experts.0.gate_proj.weight_scale", "U8", vec![64, 8]),
+        ],
+    );
+    let report = plan(dir.path(), &PlanOptions::default()).unwrap();
+    let find = |component| report.components.iter().find(|c| c.component == component).unwrap();
+    assert!(find(Component::Attention).formats.contains_key("fp8-block128x128-segmented"));
+    assert!(find(Component::RoutedExpert).formats.contains_key("mxfp4-g32"));
+    assert!(report.hints.iter().any(|h| h.how.contains("mimop:fp8")), "{:?}", report.hints);
+}
+
+#[test]
 fn capacity_suggests_a_supported_rank_count() {
     let dir = snapshot(v41_config(), &[("layers.0.ffn.experts.0.w1.weight", "I8", vec![1024, 1024])]);
     let report = plan(dir.path(), &PlanOptions { spark_ranks: 4, spark_budget_bytes: 200 << 10 }).unwrap();

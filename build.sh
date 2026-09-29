@@ -51,6 +51,8 @@ Qwen 3.8 Flash Next, everything scripts/run-dsv4.sh serves (V4 Pro EXL3 K2, GLM 
 EXL3 K4 and FP8, MiMo V2 Flash FP8, Qwen 3.8 Flash Next EXL3 K4.25):
     CUTEAFD_RELEASE_GLM_AOT=ON CUTEAFD_RELEASE_MIMO_AOT=ON CUTEAFD_RELEASE_QWEN4_AOT=ON
     CUTEAFD_RELEASE_EXPERT_FAMILIES='dsv4p:exl3-k23;glm:exl3-k45;glm:fp8;mimo:fp8;qwen4:exl3-k45'
+MiMo V2.6 Pro adds CUTEAFD_RELEASE_MIMO_GEOMETRIES=mimo,mimop (coordinator programs;
+default mimo) and the MXFP4 expert family mimop:fp8 (tp1 coordinator, tp6/tp2 Spark).
 
 Images are labelled with the checkout's Git revision (HEAD), even when the
 tree has local changes. Dirty checkouts still get an automatic source manifest
@@ -453,6 +455,7 @@ docker run --rm \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}" \
   -e "CUTEAFD_RELEASE_GLM_AOT=${CUTEAFD_RELEASE_GLM_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_MIMO_AOT=${CUTEAFD_RELEASE_MIMO_AOT:-OFF}" \
+  -e "CUTEAFD_RELEASE_MIMO_GEOMETRIES=${CUTEAFD_RELEASE_MIMO_GEOMETRIES:-mimo}" \
   -e "CUTEAFD_RELEASE_GLMF_AOT=${CUTEAFD_RELEASE_GLMF_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_QWEN4_AOT=${CUTEAFD_RELEASE_QWEN4_AOT:-OFF}" \
   ${release_build_root_args[@]+"${release_build_root_args[@]}"} \

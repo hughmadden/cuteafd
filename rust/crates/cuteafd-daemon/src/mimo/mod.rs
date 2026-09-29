@@ -45,6 +45,19 @@ pub(crate) struct EngineArgs {
     /// resident layers' experts must fit: 6.4 GiB each).
     #[arg(long)]
     pub local_experts: bool,
+    /// Decode steps project qkv from the checkpoint's FP8 weight (V2.6 Pro;
+    /// +170 MB per layer next to the BF16 copy prefill uses).
+    #[arg(long)]
+    pub fp8_qkv: bool,
+    /// With --local-experts: keep only N MoE layers' experts resident and load
+    /// each missing layer over the oldest (prefill checks of models whose
+    /// experts do not fit one GPU, such as V2.6 Pro).
+    #[arg(long, requires = "local_experts")]
+    pub expert_window: Option<usize>,
+    /// Skip the routed experts (MoE layers add zero): times the coordinator
+    /// path alone; logits and cosines are meaningless.
+    #[arg(long, conflicts_with_all = ["local_experts", "peers"])]
+    pub skip_experts: bool,
     /// TP1 FP8 package layout for --local-experts (default `<libdir>/fp8/fp8-mimo/tp1`).
     #[arg(long)]
     pub fp8_package: Option<PathBuf>,
@@ -76,6 +89,10 @@ pub(crate) struct GoldenArgs {
     /// golden's `mean_nll`).
     #[arg(long)]
     pub nll: bool,
+    /// Skip the per-layer comparison (each layer's rows are otherwise copied
+    /// back), so prefill and decode times are the engine's.
+    #[arg(long)]
+    pub timing: bool,
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -109,7 +126,8 @@ impl Opened {
         let stream = self.library.cuda_stream_create()?;
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
-        let loader = weights::MimoLoader { library: &self.library, checkpoint: &self.checkpoint, stream };
+        let loader = weights::MimoLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
+            checkpoint_tp: cuteafd_loader::mimo_v2::checkpoint_tp(&args.snapshot)?, fp8_qkv: args.fp8_qkv };
         let model = loader.model(&self.cfg, layers)?;
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64, "MiMo coordinator weights resident");
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
@@ -134,11 +152,19 @@ impl Opened {
         if moe_layers.is_empty() {
             return Ok(None);
         }
+        if args.skip_experts {
+            return Ok(Some(engine::Experts::Skip));
+        }
         if args.local_experts {
             let tensors = self.catalog.fp8().context("MiMo experts are the checkpoint's FP8 tensors")?;
             let directory = args.fp8_package.clone()
                 .unwrap_or_else(|| crate::v41_experts::fp8::package_directory(&args.native_lib, 1));
             let (free, _) = self.library.cuda_memory_info()?;
+            if let Some(window) = args.expert_window {
+                let experts = crate::v41_experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, 0..0, 1, 0,
+                    args.prefill_rows, free.saturating_sub(4 << 30))?;
+                return Ok(Some(engine::Experts::Streamed { experts: std::cell::RefCell::new(experts), tensors, window }));
+            }
             let started = Instant::now();
             let local = crate::v41_experts::fp8::Fp8Experts::load(&self.library, tensors, &directory,
                 moe_layers[0]..moe_layers[moe_layers.len() - 1] + 1, 1, 0, args.prefill_rows,
@@ -263,8 +289,9 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
     let mut prefill_logits: Vec<f32> = Vec::new();
     for first in (0..prefill).step_by(chunk) {
         let n = chunk.min(prefill - first);
+        let mut prefill_compare = |layer: usize, stream: &[u8]| compare(layer, first, stream, &mut worst);
         logits = engine.prefill_forced(&mut placement, &embed[first * row..(first + n) * row], args.nll,
-            Some(&mut |layer, stream| compare(layer, first, stream, &mut worst)),
+            (!args.timing).then_some(&mut prefill_compare as &mut dyn FnMut(usize, &[u8]) -> Result<()>),
             args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>))?;
         if args.nll {
             prefill_logits.extend(logits.as_deref().unwrap_or_default());
@@ -285,8 +312,9 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
     while position < tokens.len() {
         let n = args.step_rows.min(tokens.len() - position);
         let first = position;
+        let mut step_compare = |layer: usize, stream: &[u8]| compare(layer, first, stream, &mut decode_worst);
         if let Some(logits) = engine.verify(&mut [(&mut placement, n)], &embed[position * row..(position + n) * row],
-            Some(&mut |layer, stream| compare(layer, first, stream, &mut decode_worst)))? {
+            (!args.timing).then_some(&mut step_compare as &mut dyn FnMut(usize, &[u8]) -> Result<()>))? {
             decode_logits.extend(logits);
         }
         position += n;
@@ -337,6 +365,11 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
         let last = &golden[(prefill - 1) * cfg.vocab_size..][..cfg.vocab_size];
         let (cosine, _) = similarity(&logits, last);
         println!("last-row logits: argmax engine {} golden {} cosine {cosine:.6}", argmax(&logits), argmax(last));
+    }
+    let profile = engine.profile.borrow();
+    if profile[1] > 0.0 {
+        println!("phases: GPU wait before expert requests {:.2} s, expert exchange / streamed loads {:.2} s",
+            profile[0], profile[1]);
     }
     Ok(())
 }

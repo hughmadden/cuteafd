@@ -35,6 +35,13 @@ pub trait Family: Sync {
     /// Implementation notes for components this build cannot execute yet.
     fn component_hint(&self, component: Component) -> Option<Hint>;
 
+    /// `component_hint` knowing the checkpoint's spec and the component's
+    /// detected formats (labels); families whose checkpoints differ in
+    /// storage (MiMo V2 Flash FP8 vs V2.6 Pro MXFP4) override it.
+    fn component_hint_for(&self, _spec: &ModelSpec, component: Component, _formats: &[String]) -> Option<Hint> {
+        self.component_hint(component)
+    }
+
     /// Components the engine can serve without (a speculator it does not run yet).
     fn optional(&self, _component: Component) -> bool {
         false
