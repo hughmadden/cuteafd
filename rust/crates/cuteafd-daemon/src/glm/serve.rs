@@ -275,7 +275,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 }));
                 let started = Instant::now();
                 let mut logits = None;
-                for chunk in tokens.chunks(engine.prefill_rows) {
+                for chunk in tokens.chunks(engine.prefill_capacity()) {
                     let embed = embed_rows(&opened.catalog, chunk, hidden)?;
                     let start = placement.len;
                     logits = engine.prefill(&mut placement, &embed, Some((&mut *transport, runtime)), None)?;

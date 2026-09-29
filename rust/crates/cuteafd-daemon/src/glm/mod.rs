@@ -47,6 +47,9 @@ pub(crate) struct EngineArgs {
     /// Sequences the drafter keeps a context for and drafts for at once.
     #[arg(long, default_value_t = 16)]
     pub draft_sequences: usize,
+    /// Keep every prefill row's logits (glm-golden --nll; 2.5 GiB at 4096 rows).
+    #[arg(long, hide = true)]
+    pub full_prefill_logits: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -80,6 +83,16 @@ pub(crate) struct GoldenArgs {
     /// copy's logits with the golden logits.
     #[arg(long)]
     pub sequences: Option<usize>,
+    /// Score every prefill row's logits against the golden (mean NLL, top-1,
+    /// KL); the prefill runs without layer downloads (Spark lanes).
+    #[arg(long)]
+    pub nll: bool,
+    /// Time this many prefills of --bench-prefill-tokens tokens (the golden
+    /// prompt repeated, in chunks of the prefill capacity) on fresh sequences.
+    #[arg(long, default_value_t = 0)]
+    pub bench_prefill: usize,
+    #[arg(long, default_value_t = 4096)]
+    pub bench_prefill_tokens: usize,
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -118,6 +131,7 @@ impl Opened {
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages)?;
+        engine.full_prefill_logits = args.full_prefill_logits;
         if let Some(snapshot) = &args.draft {
             let started = Instant::now();
             let cfg = dflash::DflashConfig::read(snapshot)?;
@@ -130,20 +144,20 @@ impl Opened {
                 args.draft_sequences, mask, false)?);
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash2 drafter resident");
         }
-        let mut transport = match args.peers.as_deref() {
-            Some(peers) => {
-                let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
-                let executors: Vec<u64> = (0..peers.len())
-                    .map(|rank| cuteafd_transport::v41_expert::v41_spark_executor_id(peers.len(), rank))
-                    .collect::<Result<_>>()?;
-                Some(V41Tp4Roce::new_ranks(&peers, &executors, 4096,
-                    cuteafd_transport::TcpTransportConfig { timing: false, timeout: std::time::Duration::from_secs(120),
-                        max_frame_bytes: 64 << 20 })?)
-            }
-            None => None,
+        let connect = |peers: &str| -> Result<V41Tp4Roce> {
+            let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
+            let executors: Vec<u64> = (0..peers.len())
+                .map(|rank| cuteafd_transport::v41_expert::v41_spark_executor_id(peers.len(), rank))
+                .collect::<Result<_>>()?;
+            V41Tp4Roce::new_ranks(&peers, &executors, 4096,
+                cuteafd_transport::TcpTransportConfig { timing: false, timeout: std::time::Duration::from_secs(120),
+                    max_frame_bytes: 64 << 20 })
         };
+        let mut transport = args.peers.as_deref().map(connect).transpose()?;
+        // The second prefill lane's transport (its waves fly beside the first lane's).
+        let mut lane_transport = args.peers.as_deref().map(connect).transpose()?;
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        if let Some(transport) = transport.as_mut() {
+        for transport in transport.iter_mut().chain(lane_transport.iter_mut()) {
             // Connect every rank and register full-size buffers now: the first
             // request otherwise pays seconds of connection setup.
             let started = Instant::now();
@@ -163,6 +177,7 @@ impl Opened {
             runtime.block_on(async { transport.execute(&request, |_, _, _| Ok(())).await })?;
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
         }
+        *engine.lane_transport.borrow_mut() = lane_transport.take();
         let result = body(&engine, transport.as_mut(), &runtime);
         drop(engine);
         // SAFETY: the engine that used the stream is gone.
@@ -198,8 +213,102 @@ fn similarity(a: &[f32], b: &[f32]) -> (f64, f64) {
     (dot / (na.sqrt() * nb.sqrt()).max(f64::MIN_POSITIVE), diff.sqrt() / nb.sqrt().max(f64::MIN_POSITIVE))
 }
 
-pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
+pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
+    args.engine.full_prefill_logits |= args.nll;
     tokio::task::spawn_blocking(move || golden(args)).await?
+}
+
+/// Mean KL(golden || engine) of logits rows, in float64.
+fn mean_kl(logits: &[f32], golden: &[f32], vocab: usize) -> f64 {
+    let log_softmax = |l: &[f32]| -> Vec<f64> {
+        let top = l.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let lse = top + l.iter().map(|&x| (x as f64 - top).exp()).sum::<f64>().ln();
+        l.iter().map(|&x| x as f64 - lse).collect()
+    };
+    let rows = logits.len() / vocab;
+    (0..rows).map(|r| {
+        let (p, q) = (log_softmax(&golden[r * vocab..][..vocab]), log_softmax(&logits[r * vocab..][..vocab]));
+        p.iter().zip(&q).map(|(lp, lq)| lp.exp() * (lp - lq)).sum::<f64>()
+    }).sum::<f64>() / rows.max(1) as f64
+}
+
+/// --nll: the golden prompt through prefill chunks of the engine's capacity
+/// (Spark lanes when available), every row's logits scored against the
+/// golden: mean NLL of the next token, top-1 agreement, KL.
+fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, transport: &mut V41Tp4Roce,
+    runtime: &tokio::runtime::Runtime) -> Result<()> {
+    let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
+        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let (row, vocab) = (opened.cfg.hidden * 2, opened.cfg.vocab_size);
+    let embed = embed_rows(&opened.catalog, &tokens, opened.cfg.hidden)?;
+    let mut placement = engine::PageAllocator::new(engine.pages).admit(tokens.len())?;
+    let started = Instant::now();
+    let mut logits = Vec::new();
+    for chunk in embed.chunks(engine.prefill_capacity() * row) {
+        logits.extend(engine.prefill_rows_logits(&mut placement, chunk, Some((&mut *transport, runtime)), None,
+            chunk.len() / row)?.context("the prefill needs every layer")?);
+    }
+    let seconds = started.elapsed().as_secs_f64();
+    let golden: Vec<f32> = std::fs::read(args.golden.join("logits.bin"))?
+        .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+    let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
+    let nll_of = |l: &[f32], next: u32| {
+        let top = l.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+        top + l.iter().map(|&x| (x as f64 - top).exp()).sum::<f64>().ln() - l[next as usize] as f64
+    };
+    let rows = tokens.len();
+    let (mut agree, mut nll, mut golden_nll) = (0usize, 0f64, 0f64);
+    for r in 0..rows {
+        let (ours, theirs) = (&logits[r * vocab..][..vocab], &golden[r * vocab..][..vocab]);
+        agree += usize::from(argmax(ours) == argmax(theirs));
+        if let Some(&next) = tokens.get(r + 1) {
+            nll += nll_of(ours, next);
+            golden_nll += nll_of(theirs, next);
+        }
+    }
+    println!("prefill logits: {rows} tokens in {seconds:.2} s | top-1 agreement {:.2}% | mean NLL engine {:.4} golden \
+        {:.4} | mean KL(golden||engine) {:.5}", 100.0 * agree as f64 / rows as f64, nll / (rows - 1) as f64,
+        golden_nll / (rows - 1) as f64, mean_kl(&logits, &golden[..logits.len()], vocab));
+    Ok(())
+}
+
+/// --bench-prefill: fresh sequences of --bench-prefill-tokens tokens.
+fn bench_prefill(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, transport: &mut V41Tp4Roce,
+    runtime: &tokio::runtime::Runtime) -> Result<()> {
+    let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
+        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let row = opened.cfg.hidden * 2;
+    let n = args.bench_prefill_tokens;
+    let embed = embed_rows(&opened.catalog, &tokens, opened.cfg.hidden)?;
+    let long: Vec<u8> = embed.chunks_exact(row).cycle().take(n).flatten().copied().collect();
+    let mut allocator = engine::PageAllocator::new(engine.pages);
+    let mut times = Vec::new();
+    for round in 0..=args.bench_prefill {
+        if round == 1 {
+            *engine.profile.borrow_mut() = [0.0; 3];
+        }
+        let mut placement = allocator.admit(n)?;
+        let started = Instant::now();
+        for chunk in long.chunks(engine.prefill_capacity() * row) {
+            engine.prefill(&mut placement, chunk, Some((&mut *transport, runtime)), None)?;
+        }
+        // Round 0 warms the workspaces.
+        if round > 0 {
+            times.push(started.elapsed().as_secs_f64());
+        }
+        allocator.release(placement);
+    }
+    times.sort_by(f64::total_cmp);
+    let (median, runs) = (times[times.len() / 2], times.len() as f64);
+    let phases = *engine.profile.borrow();
+    let host = *engine.exchange_host.borrow();
+    println!("prefill bench host per prefill: request build + post {:.1} ms, partial copies {:.1} ms (measured runs \
+        and warm-up; build {:.1} ms, post {:.1} ms)", 1e3 * host[0] / (runs + 1.0), 1e3 * host[1] / (runs + 1.0),
+        1e3 * host[2] / (runs + 1.0), 1e3 * host[3] / (runs + 1.0));
+    println!("prefill bench: {n} tokens, median {:.1} ms ({:.0} tok/s), min {:.1} ms; per prefill GPU wait {:.1} ms, \
+        Spark wait {:.1} ms", 1e3 * median, n as f64 / median, 1e3 * times[0], 1e3 * phases[0] / runs,
+        1e3 * phases[1] / runs);
+    Ok(())
 }
 
 fn golden(args: GoldenArgs) -> Result<()> {
@@ -214,6 +323,16 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
     }
     if engine.drafter.is_some() {
         return draft_run(args, opened, engine, transport, runtime);
+    }
+    if args.nll || args.bench_prefill > 0 {
+        let transport = transport.context("--nll and --bench-prefill need Spark peers")?;
+        if args.nll {
+            nll_run(args, opened, engine, transport, runtime)?;
+        }
+        if args.bench_prefill > 0 {
+            bench_prefill(args, opened, engine, transport, runtime)?;
+        }
+        return Ok(());
     }
     if let Some(copies) = args.sequences {
         return multi_run(args, opened, engine, copies, transport, runtime);
