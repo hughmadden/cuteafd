@@ -95,6 +95,8 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
         # Absent means the original 8-row packed-route block.
         if variant.get('route_block', 8) != meta.get('route_block', 8):
             raise ValueError(f'EXL3 variant route block mismatch: {directory}')
+        if variant.get('fused_input_rotation', False) != meta.get('fused_input_rotation', False):
+            raise ValueError(f'EXL3 variant fused input rotation mismatch: {directory}')
         if variant.get('token_major_rotation', False) != meta.get('token_major_rotation', False):
             raise ValueError(f'EXL3 variant input rotation mismatch: {directory}')
         if meta['capacity'] in overrides and meta.get('blocks_per_sm') != overrides[meta['capacity']]:
@@ -267,6 +269,25 @@ def token_major_rotation(geometry: str, capacity: int) -> bool:
         # GLM top-8 (rtx-tp1): m1024 3910 -> 3830 us, m4096 11790 -> 11470 us.
         return capacity > 256
     return geometry == 'dsv4p' and capacity > 1024
+
+
+def fused_input_rotation(geometry: str, role: str, width: int, capacity: int) -> bool:
+    """Whether FC1 rotates staged token rows in shared memory (no per-route
+    rotated copies). Bit-identical; every FC1 N tile of a block rotates it
+    again, so it pays only while few 256-wide tiles share a projection half.
+    GB10, TP4 random routes, per layer (b12x ccf9e3cd): V4 Pro width 512
+    m4096 19.1 -> 16.5 ms, 768 22.7 -> 21.9, 1024 neutral, 1536 +10%;
+    GLM width 512 m1024 8.9 -> 7.3, m4096 22.6 -> 18.3, 768 -11%, 1024 -6%,
+    640 (128-wide tiles) +16%. V4 Pro m1024 (16-row blocks) is neutral.
+    The coordinator's full-width packages are not measured and stay off.
+    """
+    if role != 'spark' or width % 256:
+        return False
+    if geometry == 'dsv4p':
+        return width <= 768 and capacity > 1024
+    if geometry == 'glm':
+        return width <= 1024 and capacity > 256
+    return False
 
 
 def package_name(geometry: str, bits: list[int]) -> str:
@@ -448,7 +469,9 @@ def build(args: argparse.Namespace) -> None:
                     options['hidden'] = hidden
                 if (block := route_block(geometry, capacity)) != 8:
                     options['route_block'] = block
-                if token_major_rotation(geometry, capacity):
+                if tile is None and fused_input_rotation(geometry, args.role, width, capacity):
+                    options['fused_input_rotation'] = True
+                elif token_major_rotation(geometry, capacity):
                     options['token_major_rotation'] = True
                 if (limit := swiglu_limit(geometry)) != 10.0:
                     options['swiglu_limit'] = limit
@@ -487,6 +510,8 @@ def build(args: argparse.Namespace) -> None:
                         variant['route_block'] = meta['route_block']
                     if meta.get('token_major_rotation'):
                         variant['token_major_rotation'] = True
+                    if meta.get('fused_input_rotation'):
+                        variant['fused_input_rotation'] = True
                     variants.append(variant)
                     if paired:
                         variants[-1]['paired_boundary'] = meta['paired_boundary']
