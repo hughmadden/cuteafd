@@ -206,6 +206,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total, mut replays) = (0u64, 0u64, 0u64);
+    // Verify steps (and replay steps) since the last completed request.
+    let (mut steps, mut replay_steps) = (0u64, 0u64);
+    // Host seconds in verify steps (engine) and in token selection + streaming.
+    let (mut verify_s, mut emit_s) = (0f64, 0f64);
     let (hidden, vocab) = (engine.cfg.hidden, engine.cfg.vocab_size);
     loop {
         while active.len() < max_sequences {
@@ -255,7 +259,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     let embed = embed_rows(&opened.checkpoint, chunk, hidden)?;
                     logits = engine.prefill(&mut placement, &embed, None)?;
                 }
-                tracing::debug!(tokens = tokens.len(), elapsed_ms = started.elapsed().as_millis() as u64, "prefill");
+                let phases = std::mem::take(&mut *engine.profile.borrow_mut());
+                tracing::info!(tokens = tokens.len(), elapsed_ms = started.elapsed().as_millis() as u64,
+                    gpu_wait_ms = (1e3 * phases[0]) as u64, experts_ms = (1e3 * phases[1]) as u64,
+                    head_ms = (1e3 * phases[2]) as u64, "prefill");
                 let mut request = Active {
                     history: tokens.clone(),
                     draft_limit: draft,
@@ -314,7 +321,11 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let embed = embed_rows(&opened.checkpoint, &tokens, hidden)?;
         let mut rows: Vec<(&mut GlmfPlacement, usize)> = active.iter_mut().zip(&sequences)
             .map(|(a, s)| (&mut a.placement, s.len())).collect();
+        steps += 1;
+        let timer = Instant::now();
         let step = engine.verify(&mut rows, &embed, None).and_then(|logits| logits.context("decode needs every layer"));
+        verify_s += timer.elapsed().as_secs_f64();
+        let timer = Instant::now();
         let logits = match step {
             Ok(logits) => logits,
             Err(error) => {
@@ -360,6 +371,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             }
             finished
         }).collect();
+        emit_s += timer.elapsed().as_secs_f64();
         // Sequences that kept fewer rows than they verified: restore the KDA
         // state and replay the kept rows (one step for all of them).
         let mut replay: Vec<(usize, usize)> = Vec::new();
@@ -372,6 +384,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         }
         if !replay.is_empty() {
             replays += 1;
+            replay_steps += 1;
             let tokens: Vec<u32> = replay.iter().flat_map(|&(i, kept)| sequences[i][..kept].iter().copied()).collect();
             let embed = embed_rows(&opened.checkpoint, &tokens, hidden)?;
             let mut placements: Vec<(GlmfPlacement, usize)> = replay.iter().map(|&(i, kept)| {
@@ -392,8 +405,9 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let seconds = request.started.elapsed().as_secs_f64();
             let phases = std::mem::take(&mut *engine.profile.borrow_mut());
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
-                active = active.len(), gpu_wait_s = phases[0], experts_s = phases[1], replays,
-                "request complete");
+                active = active.len(), steps, replay_steps, verify_s, emit_s, gpu_wait_s = phases[0],
+                experts_s = phases[1], head_s = phases[2], "request complete");
+            (steps, replay_steps, verify_s, emit_s) = (0, 0, 0.0, 0.0);
             allocator.release_slot(request.backup);
             allocator.release(request.placement);
         }
