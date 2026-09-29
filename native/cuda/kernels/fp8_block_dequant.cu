@@ -47,7 +47,36 @@ __global__ void fp8_block_quant_kernel(const __nv_bfloat16* w, __nv_fp8_e4m3* q,
     }
   }
 }
+// One warp per (row, 128-wide K block): scale = amax / 448 (1 for an
+// all-zero block), E4M3 = rn_satfinite(w / scale). The per-row x 128-K layout
+// (`[rows, cols / 128]` scales) of the MmaFp8Gemv row_scales programs.
+__global__ void fp8_row_quant_kernel(const __nv_bfloat16* w, __nv_fp8_e4m3* q, float* scale, int rows, int cols) {
+  const int blocks = cols / 128;
+  const uint64_t unit = uint64_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+  if (unit >= uint64_t(rows) * blocks) return;
+  const int lane = threadIdx.x & 31;
+  const uint64_t base = (unit / blocks) * uint64_t(cols) + (unit % blocks) * 128 + lane * 4;
+  float x[4];
+  float amax = 0.0f;
+  for (int j = 0; j < 4; ++j) {
+    x[j] = __bfloat162float(w[base + j]);
+    amax = fmaxf(amax, fabsf(x[j]));
+  }
+  for (int offset = 16; offset; offset >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset));
+  const float s = amax > 0.0f ? amax / 448.0f : 1.0f;
+  if (lane == 0) scale[unit] = s;
+  for (int j = 0; j < 4; ++j) q[base + j] = __nv_fp8_e4m3(x[j] / s);
+}
 }  // namespace
+
+extern "C" int32_t cuteafd_fp8_row_quant(const void* w, void* q, void* scale, int32_t rows, int32_t cols,
+                                         void* stream) {
+  if (rows < 1 || cols < 128 || cols % 128) return cudaErrorInvalidValue;
+  const uint64_t units = uint64_t(rows) * (cols / 128);
+  fp8_row_quant_kernel<<<unsigned((units + 7) / 8), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const __nv_bfloat16*>(w), static_cast<__nv_fp8_e4m3*>(q), static_cast<float*>(scale), rows, cols);
+  return cudaGetLastError();
+}
 
 extern "C" int32_t cuteafd_fp8_block_quant(const void* w, void* q, void* scale, int32_t rows, int32_t cols,
                                            void* stream) {

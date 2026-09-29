@@ -348,6 +348,21 @@ impl NativeLibrary {
         Ok(())
     }
 
+    /// BF16 `w` [rows, cols] -> E4M3 `q` [rows, cols] with FP32 `scale`
+    /// [rows, cols / 128], one per row and 128-wide K block (amax / 448),
+    /// the layout of the MmaFp8Gemv row-scale programs. `cols % 128 == 0`.
+    ///
+    /// # Safety
+    /// Every pointer is live device memory of its shape on the stream's device.
+    pub unsafe fn fp8_row_quant(&self, w: *const c_void, q: *mut c_void, scale: *mut c_void, rows: usize,
+        cols: usize, stream: *mut c_void) -> Result<()> {
+        type Quant = unsafe extern "C" fn(*const c_void, *mut c_void, *mut c_void, i32, i32, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Quant>(b"cuteafd_fp8_row_quant") }?;
+        let status = unsafe { f(w, q, scale, i32::try_from(rows)?, i32::try_from(cols)?, stream) };
+        ensure!(status == 0, "FP8 row quantization failed with {status}");
+        Ok(())
+    }
+
     /// Mean over the four mHC copies of `rows` stream rows [rows, 4, hidden]
     /// into columns `offset..offset + hidden` of `out` [rows, stride], BF16.
     ///

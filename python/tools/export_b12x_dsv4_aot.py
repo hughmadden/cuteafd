@@ -133,7 +133,9 @@ def glm_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
 
 def mimo_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """MiMo V2 programs, same (stem suffix, op, params, thunk) shape as ``programs``.
-    BF16 weights throughout (FP8 decode weights are a later step)."""
+    Decode programs also take E4M3 copies (per-row x 128-K FP32 scales) of the
+    qkv, o and dense FFN weights behind an ``fp8_rows`` scalar; prefill programs
+    take BF16 only. ``head_fp8``: the LM head over an E4M3 copy for decode rows."""
     from b12x.integration.cuteafd import mimo_attention as attn
     from b12x.integration.cuteafd import mimo_ffn as ffn
 
@@ -141,24 +143,23 @@ def mimo_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         ("norm", "norm", {}, lambda: ffn.compile_mimo_norm_aot(g)),
         ("router_scores", "router_scores", {}, lambda: ffn.compile_mimo_router_scores_aot(g)),
         ("expert_input_quant", "expert_input_quant", {}, lambda: ffn.compile_mimo_expert_input_quant_aot(g)),
+        ("head_fp8", "head_fp8", {}, lambda: attn.compile_mimo_head_fp8_aot(g)),
     ]
     for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
+        f8 = mode == "decode"
         out += [
-            (f"o_m{rows}", "o", {"max_rows": rows}, lambda r=rows: attn.compile_mimo_o_aot(g, max_rows=r)),
-            (f"ffn_m{rows}", "ffn", {"max_rows": rows, "inter": g.dense_inter},
-             lambda r=rows: ffn.compile_mimo_ffn_aot(g, max_rows=r)),
+            (f"o_m{rows}", "o", {"max_rows": rows, "fp8": f8},
+             lambda r=rows, f=f8: attn.compile_mimo_o_aot(g, max_rows=r, fp8=f)),
+            (f"ffn_m{rows}", "ffn", {"max_rows": rows, "inter": g.dense_inter, "fp8": f8},
+             lambda r=rows, f=f8: ffn.compile_mimo_ffn_aot(g, max_rows=r, fp8=f)),
         ]
         for kind in ("full", "swa"):
             out += [
-                (f"{kind}_producer_m{rows}", "producer", {"kind": kind, "max_rows": rows},
-                 lambda k=kind, r=rows: attn.compile_mimo_producer_aot(g, kind=k, max_rows=r)),
+                (f"{kind}_producer_m{rows}", "producer", {"kind": kind, "max_rows": rows, "fp8": f8},
+                 lambda k=kind, r=rows, f=f8: attn.compile_mimo_producer_aot(g, kind=k, max_rows=r, fp8=f)),
                 (f"{kind}_attention_{mode}_m{rows}", "attention", {"kind": kind, "route": mode, "max_rows": rows},
                  lambda k=kind, m=mode, r=rows: attn.compile_mimo_attention_aot(g, kind=k, route=m, max_rows=r)),
             ]
-            if mode == "decode" and g.fp8_qkv:
-                # Decode rows read the checkpoint's FP8 qkv weight (half the BF16 bytes).
-                out.append((f"{kind}_producer_fp8_m{rows}", "producer", {"kind": kind, "max_rows": rows, "fp8": True},
-                            lambda k=kind, r=rows: attn.compile_mimo_producer_aot(g, kind=k, max_rows=r, fp8=True)))
     return out
 
 

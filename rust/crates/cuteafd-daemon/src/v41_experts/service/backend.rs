@@ -162,8 +162,13 @@ pub(super) fn load_fp8<'a>(
     let budget = config.device_budget.checked_sub(workspace).context("FP8 worker workspace exceeds the budget")?;
     tracing::info!(rank = config.rank, world = config.world, first_layer = layers.start, layer_count = layers.len(),
         package = %directory.display(), "FP8 Spark residency plan");
-    let experts = Fp8Experts::load(library, tensors, &directory, layers, config.world, config.rank,
+    let mut experts = Fp8Experts::load(library, tensors, &directory, layers, config.world, config.rank,
         config.capacity as usize, budget)?;
+    // The BF16-input sibling package, when built, lets the coordinator send unquantized rows.
+    if let Some(bf16) = crate::v41_experts::fp8::bf16_sibling(&directory).filter(|d| d.is_dir()) {
+        experts.add_bf16_module(library, &bf16, config.capacity as usize)?;
+        tracing::info!(package = %bf16.display(), "FP8 experts also take BF16 rows");
+    }
     let resident: usize = experts.layers.len() * crate::v41_experts::fp8::Fp8Layer::bytes(tensors, config.world)?;
     let remaining = config.device_budget.saturating_sub(resident);
     Ok((Weights::Fp8(Rc::new(experts)), remaining))

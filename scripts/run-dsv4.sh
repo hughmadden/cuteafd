@@ -80,11 +80,11 @@ fi
 # as per-row FP8 (GLMF_KDA_FP8: row128, channel or off) and optionally an FP8
 # LM head (GLMF_FP8_HEAD=on); its MLA pools hold POOL_TOKENS tokens.
 family_args=()
-# serve-mimo on MiMo V2.6 Pro (mimo_v2): decode rows project qkv from the
-# checkpoint's FP8 weight (MIMO_FP8_QKV=off keeps BF16); its experts need six
-# Spark ranks (SPARK_COUNT=6, TP6 MXFP4 slices, ~93 GiB each).
-if [[ $model_type == mimo_v2 && "$(get MIMO_FP8_QKV on)" == on ]]; then
-  family_args+=(--fp8-qkv)
+# serve-mimo on MiMo V2.6 Pro (mimo_v2): its experts need six Spark ranks
+# (SPARK_COUNT=6, TP6 MXFP4 slices, ~93 GiB each); DFLASH=on drafts with the
+# snapshot's own dflash/ drafter.
+if [[ $model_type == mimo_v2 && "$(get DFLASH off)" == on ]]; then
+  draft_args=(--draft "$snapshot")
 fi
 if [[ $serve == serve-glmf ]]; then
   fp8_model="$(get GLMF_FP8_MODEL_ID zai-org/GLM-5.3-Flash)"
@@ -94,6 +94,11 @@ if [[ $serve == serve-glmf ]]; then
   fi
   family_args+=(--kda-fp8 "$(get GLMF_KDA_FP8 row128)" --pool-tokens "$(get POOL_TOKENS 65536)")
   [[ "$(get GLMF_FP8_HEAD off)" != on ]] || family_args+=(--fp8-head)
+fi
+# COPY_DRAFTS=off: decode without copy-window drafts (serve-glm, serve-glmf, serve-mimo, serve-qwen4).
+if [[ "$(get COPY_DRAFTS on)" == off ]]; then
+  [[ $serve != serve-dsv4 ]] || { echo "COPY_DRAFTS applies to GLM, MiMo and Qwen checkpoints" >&2; exit 2; }
+  family_args+=(--no-copy-drafts)
 fi
 # SERVED_MODEL_ID: the public model id (default: the checkpoint's Hugging Face id).
 served_args=()
@@ -107,7 +112,15 @@ ranks="$(get SPARK_COUNT 4)"
 budget="$(get SPARK_DEVICE_BUDGET_BYTES 107374182400)"
 gpu="$(get COORDINATOR_GPU 0)"
 peers=()
-[[ "$restart" == 0 ]] || "$repo_root/stop.sh" --config "$config" >/dev/null
+# --restart removes this launcher's containers (stop.sh's release parser rejects
+# the keys above, e.g. DRAFT_MODEL_ID).
+if [[ "$restart" == 1 ]]; then
+  docker rm -f cuteafd-coordinator >/dev/null 2>&1 || true
+  for ((rank = 0; rank < ranks; rank++)); do
+    host="$(get "SPARK_${rank}_HOST")"
+    ssh "$host" "docker rm -f cuteafd-spark-expert-$host-$port >/dev/null 2>&1 || true"
+  done
+fi
 # GB10 CUDA allocations cannot reclaim page cache: drop it on the expert hosts first.
 spark_hosts=()
 for ((rank = 0; rank < ranks; rank++)); do spark_hosts+=(--host "$(get "SPARK_${rank}_HOST")"); done

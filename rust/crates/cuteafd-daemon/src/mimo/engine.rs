@@ -39,6 +39,27 @@ pub(crate) const DECODE_ROWS: usize = 64;
 /// Most Spark ranks a step's partials come from (the compact reducer's limit).
 const MAX_RANKS: usize = 6;
 
+/// What the coordinator sends the Spark ranks as expert input rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum ExpertInput {
+    /// FP8 K32 wire rows (E4M3 + UE8M0 per 32; `H + H/32` bytes per row).
+    Fp8,
+    /// The BF16 rows themselves (`2H` bytes; the ranks need the `-bf16` package).
+    Bf16,
+    /// BF16 for decode-shaped steps, FP8 wire rows for prefill.
+    Bf16Decode,
+}
+
+impl ExpertInput {
+    pub fn bf16(self, decode: bool) -> bool {
+        match self {
+            Self::Fp8 => false,
+            Self::Bf16 => true,
+            Self::Bf16Decode => decode,
+        }
+    }
+}
+
 /// Where the routed experts run.
 pub(crate) enum Experts<'a> {
     /// The TP1 FP8 package on the coordinator GPU (resident MoE layers).
@@ -54,6 +75,9 @@ pub(crate) enum Experts<'a> {
     /// Spark ranks serving the `fp8` family over RoCE.
     Spark { transport: RefCell<V41Tp4Roce>, runtime: tokio::runtime::Runtime },
 }
+
+/// Most rows a decode program reads the FP8 weight copies for (MmaFp8Gemv's M tile).
+pub(crate) const FP8_ROWS: i32 = 16;
 
 /// KV splits of the full-attention decode program (its compiled maximum is 32).
 const DECODE_SPLITS: i32 = 16;
@@ -167,6 +191,7 @@ pub(crate) struct MimoEngine<'a> {
     workspace: RefCell<Option<Workspace<'a>>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     experts: Option<Experts<'a>>,
+    pub expert_input: ExpertInput,
     /// Host time per phase: GPU wait before the expert request, the Spark exchange.
     pub profile: RefCell<[f64; 2]>,
     /// The DFlash drafter (V2.6 Pro's dflash/): every step taps its target layers.
@@ -176,6 +201,15 @@ pub(crate) struct MimoEngine<'a> {
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
     // SAFETY: plain-old-data slices viewed as bytes for host->device copies.
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
+}
+
+/// `[rows]`, plus the decode programs' `fp8_rows` (16 when the layer has the FP8 copy, else 0).
+fn fp8_scalars(rows: Dsv4Scalar, decode: bool, fp8: bool) -> Vec<Dsv4Scalar> {
+    let mut scalars = vec![rows];
+    if decode {
+        scalars.push(Dsv4Scalar::I32(if fp8 { FP8_ROWS } else { 0 }));
+    }
+    scalars
 }
 
 fn kind(attention: MimoAttention) -> &'static str {
@@ -225,6 +259,7 @@ impl<'a> MimoEngine<'a> {
         let (cos_sin_full, cos_sin_swa) = (table(cfg.full_rope_theta)?, table(cfg.swa_rope_theta)?);
         Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, rings, family, kv, cos_sin_full,
             cos_sin_swa, workspace: RefCell::new(None), decode_workspace: RefCell::new(None), experts: None,
+            expert_input: ExpertInput::Fp8,
             profile: RefCell::new([0.0; 2]), drafter: None })
     }
 
@@ -306,7 +341,7 @@ impl<'a> MimoEngine<'a> {
                 zero
             },
             router_host: RefCell::new(HostAllocation::new(self.library,
-                if spark { t * (self.cfg.topk * 8 + h + h / 32) } else { 256 })?),
+                if spark { t * (self.cfg.topk * 8 + 2 * h) } else { 256 })?),
             planes_host: RefCell::new(HostAllocation::new(self.library, if spark { MAX_RANKS * t * h * 2 } else { 256 })?),
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, t as u32,
@@ -418,9 +453,18 @@ impl<'a> MimoEngine<'a> {
             // h += attention; x = post_attention_layernorm(h)
             self.norm(w, layer.ptr("post_norm")?, 1, rows)?;
             if layer.dense {
-                self.run(&format!("mimo_ffn_{cap}"), &[("x", w.x.buffer.ptr), ("w_gate_up", layer.ptr("w_gate_up")?),
-                    ("w_down", layer.ptr("w_down")?), ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
-                    &[rows])?;
+                let mut pointers = vec![("x", w.x.buffer.ptr), ("w_gate_up", layer.ptr("w_gate_up")?)];
+                if tables.decode {
+                    pointers.extend([("w_gate_up_fp8", layer.ptr_or("w_gate_up_fp8", "w_gate_up")?),
+                        ("w_gate_up_scale", layer.ptr_or("w_gate_up_scale", "w_gate_up")?)]);
+                }
+                pointers.push(("w_down", layer.ptr("w_down")?));
+                if tables.decode {
+                    pointers.extend([("w_down_fp8", layer.ptr_or("w_down_fp8", "w_down")?),
+                        ("w_down_scale", layer.ptr_or("w_down_scale", "w_down")?)]);
+                }
+                pointers.extend([("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
+                self.run(&format!("mimo_ffn_{cap}"), &pointers, &fp8_scalars(rows, tables.decode, layer.has("w_down_fp8")))?;
             } else {
                 self.moe(w, index, layer, t, tables.decode)?;
             }
@@ -451,10 +495,18 @@ impl<'a> MimoEngine<'a> {
             unsafe { self.library.cuda_stream_synchronize(self.stream)? };
             return Ok(None);
         }
-        // SAFETY: the final norm's output and the head operands are live buffers of these shapes.
-        unsafe {
-            w.head.launch(w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2).cast(),
-                self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), logit_rows as u32, self.stream)?;
+        // SAFETY: the rows start inside the final norm's output.
+        let x = unsafe { w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2) }.cast::<c_void>();
+        match &self.weights.head_fp8 {
+            Some((q, scale)) if tables.decode && logit_rows <= FP8_ROWS as usize => {
+                self.run("mimo_head_fp8", &[("x", x), ("w_fp8", q.buffer.ptr), ("scale", scale.buffer.ptr),
+                    ("logits", w.logits.buffer.ptr)], &[Dsv4Scalar::I32(logit_rows as i32)])?;
+            }
+            // SAFETY: the final norm's output and the head operands are live buffers of these shapes.
+            _ => unsafe {
+                w.head.launch(x.cast(), self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(),
+                    logit_rows as u32, self.stream)?;
+            },
         }
         let logits = self.download(&w.logits, logit_rows * self.cfg.vocab_size * 4)?;
         Ok(Some(logits.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()))
@@ -479,17 +531,15 @@ impl<'a> MimoEngine<'a> {
             MimoAttention::Full => self.kv[index].buffer.ptr,
             MimoAttention::Sliding => w.kv_step.buffer.ptr,
         };
-        if tables.decode && layer.has("w_qkv_fp8") {
-            self.run(&format!("mimo_{k}_producer_fp8_{cap}"), &[("x", w.x.buffer.ptr),
-                ("positions", w.positions.buffer.ptr), ("kv_slots", slots), ("cos_sin", cos_sin),
-                ("w_qkv", layer.ptr("w_qkv")?), ("w_qkv_fp8", layer.ptr("w_qkv_fp8")?),
-                ("w_qkv_scale", layer.ptr("w_qkv_scale")?), ("kv_cache", records), ("query", w.query.buffer.ptr),
-                ("scratch", w.scratch.buffer.ptr)], &[rows])?;
-        } else {
-            self.run(&format!("mimo_{k}_producer_{cap}"), &[("x", w.x.buffer.ptr), ("positions", w.positions.buffer.ptr),
-                ("kv_slots", slots), ("cos_sin", cos_sin), ("w_qkv", layer.ptr("w_qkv")?), ("kv_cache", records),
-                ("query", w.query.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])?;
+        let decode = tables.decode;
+        let mut pointers = vec![("x", w.x.buffer.ptr), ("positions", w.positions.buffer.ptr), ("kv_slots", slots),
+            ("cos_sin", cos_sin), ("w_qkv", layer.ptr("w_qkv")?)];
+        if decode {
+            pointers.extend([("w_qkv_fp8", layer.ptr_or("w_qkv_fp8", "w_qkv")?),
+                ("w_qkv_scale", layer.ptr_or("w_qkv_scale", "w_qkv")?)]);
         }
+        pointers.extend([("kv_cache", records), ("query", w.query.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
+        self.run(&format!("mimo_{k}_producer_{cap}"), &pointers, &fp8_scalars(rows, decode, layer.has("w_qkv_fp8")))?;
         let name = format!("mimo_{k}_attention_{mode}_{cap}");
         match layer.attention {
             MimoAttention::Full => {
@@ -509,8 +559,12 @@ impl<'a> MimoEngine<'a> {
                     &[rows])?;
             }
         }
-        self.run(&format!("mimo_o_{cap}"), &[("attn", w.attn.buffer.ptr), ("w_o", layer.ptr("w_o")?),
-            ("out", w.delta.buffer.ptr)], &[rows])
+        let mut pointers = vec![("attn", w.attn.buffer.ptr), ("w_o", layer.ptr("w_o")?)];
+        if decode {
+            pointers.extend([("w_o_fp8", layer.ptr_or("w_o_fp8", "w_o")?), ("w_o_scale", layer.ptr_or("w_o_scale", "w_o")?)]);
+        }
+        pointers.push(("out", w.delta.buffer.ptr));
+        self.run(&format!("mimo_o_{cap}"), &pointers, &fp8_scalars(rows, decode, layer.has("w_o_fp8")))
     }
 
     /// Router scores, the sigmoid top-k select and the FP8 wire rows, then the
@@ -530,11 +584,14 @@ impl<'a> MimoEngine<'a> {
                 std::ptr::null(), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t, self.cfg.experts, topk,
                 self.cfg.routed_scale as f32, true, self.stream)?;
         }
+        let bf16_input = matches!(experts, Experts::Spark { .. }) && self.expert_input.bf16(decode);
         let grid = (t * h.div_ceil(256)).div_ceil(8).clamp(1, 4 * 188);
-        self.run("mimo_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
-            // SAFETY: the scale rows follow the payload inside each wire row.
-            ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
-            ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Dsv4Scalar::I32(grid as i32)])?;
+        if !bf16_input {
+            self.run("mimo_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
+                // SAFETY: the scale rows follow the payload inside each wire row.
+                ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
+                ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Dsv4Scalar::I32(grid as i32)])?;
+        }
         match experts {
             Experts::Local(local) => {
                 let resident = local.index_of(index)?;
@@ -574,18 +631,20 @@ impl<'a> MimoEngine<'a> {
                 self.library.cuda_zero_bytes_async(w.delta.buffer, t * h * 2, self.stream)
             },
             Experts::Spark { transport, runtime } => {
-                self.spark_moe(w, index, t, decode, &mut transport.borrow_mut(), runtime)
+                self.spark_moe(w, index, t, decode, bf16_input, &mut transport.borrow_mut(), runtime)
             }
         }
     }
 
     /// Routes and wire rows down, one request to every Spark rank, the BF16
     /// rank partials summed into `delta` (GLM's exchange, no shared expert).
-    fn spark_moe(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, transport: &mut V41Tp4Roce,
-        runtime: &tokio::runtime::Runtime) -> Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    fn spark_moe(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, bf16_input: bool,
+        transport: &mut V41Tp4Roce, runtime: &tokio::runtime::Runtime) -> Result<()> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
-        let (route_bytes, wire_bytes) = (t * topk * 4, t * (h + h / 32));
+        let (route_bytes, wire_bytes) = (t * topk * 4, if bf16_input { t * h * 2 } else { t * (h + h / 32) });
+        let (input, dtype) = if bf16_input { (&w.x, ExpertV2Dtype::Bf16) } else { (&w.wire, ExpertV2Dtype::Fp8E4m3Ue8m0K32) };
         let staging = w.router_host.borrow_mut();
         let host = staging.buffer;
         let at = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
@@ -599,7 +658,7 @@ impl<'a> MimoEngine<'a> {
         unsafe {
             self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.stream)?;
             self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.stream)?;
-            self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), w.wire.buffer, wire_bytes, self.stream)?;
+            self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), input.buffer, wire_bytes, self.stream)?;
             self.library.cuda_stream_synchronize(self.stream)?;
         }
         self.profile.borrow_mut()[0] += timer.elapsed().as_secs_f64();
@@ -610,8 +669,7 @@ impl<'a> MimoEngine<'a> {
         }).collect();
         let wire = staged[2 * route_bytes..2 * route_bytes + wire_bytes].to_vec();
         drop(staging);
-        let mut request = ExpertProtocolV2Request::new(index as u64 + 1, 17, index as u32, h as u32,
-            ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+        let mut request = ExpertProtocolV2Request::new(index as u64 + 1, 17, index as u32, h as u32, dtype,
             (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
                 row_id: u64::from(row), source_kind: kind, source_request_id: 1,
                 token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32,

@@ -54,10 +54,6 @@ pub(crate) struct EngineArgs {
     /// Sequences the drafter keeps a context for and drafts for at once.
     #[arg(long, default_value_t = 4)]
     pub draft_sequences: usize,
-    /// Decode steps project qkv from the checkpoint's FP8 weight (V2.6 Pro;
-    /// +170 MB per layer next to the BF16 copy prefill uses).
-    #[arg(long)]
-    pub fp8_qkv: bool,
     /// With --local-experts: keep only N MoE layers' experts resident and load
     /// each missing layer over the oldest (prefill checks of models whose
     /// experts do not fit one GPU, such as V2.6 Pro).
@@ -70,6 +66,22 @@ pub(crate) struct EngineArgs {
     /// TP1 FP8 package layout for --local-experts (default `<libdir>/fp8/fp8-mimo/tp1`).
     #[arg(long)]
     pub fp8_package: Option<PathBuf>,
+    /// Decode steps of <= 16 rows read E4M3 copies of the qkv, o and dense FFN
+    /// weights (the checkpoint's own FP8 bytes; o_proj quantized per row).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub fp8_decode: bool,
+    /// Decode steps of <= 16 rows read an E4M3 copy of the LM head (per row x 128-K scales).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub fp8_head: bool,
+    /// With --fp8-decode, also an E4M3 copy of o_proj (BF16 in the checkpoint,
+    /// quantized per row and 128-K block at load).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub fp8_o_proj: bool,
+    /// Expert input rows sent to the Spark ranks: FP8 K32 wire rows, BF16
+    /// (the ranks load the `fp8-mimo-bf16` package too), or BF16 for decode
+    /// steps only.
+    #[arg(long, value_enum, default_value_t = engine::ExpertInput::Fp8)]
+    pub expert_input: engine::ExpertInput,
 }
 
 #[derive(Debug, clap::Args)]
@@ -143,7 +155,8 @@ impl Opened {
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::MimoLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
-            checkpoint_tp: cuteafd_loader::mimo_v2::checkpoint_tp(&args.snapshot)?, fp8_qkv: args.fp8_qkv };
+            checkpoint_tp: cuteafd_loader::mimo_v2::checkpoint_tp(&args.snapshot)?, fp8_decode: args.fp8_decode,
+            fp8_head: args.fp8_head, fp8_o_proj: args.fp8_o_proj };
         let model = loader.model(&self.cfg, layers)?;
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64, "MiMo coordinator weights resident");
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
@@ -165,6 +178,7 @@ impl Opened {
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash drafter resident");
         }
         let moe_layers = (0..layers).filter(|&l| !self.cfg.dense[l]).collect::<Vec<_>>();
+        engine.expert_input = args.expert_input;
         if let Some(experts) = self.experts(args, &moe_layers)? {
             engine.set_experts(experts);
         }
@@ -216,22 +230,63 @@ impl Opened {
         // Connect every rank and register full-size buffers now: the first
         // request otherwise pays seconds of connection setup.
         let started = Instant::now();
-        let (rows, h, topk) = (args.prefill_rows, self.cfg.hidden, self.cfg.topk);
-        let routes = (0..rows * topk).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
-            row_index: (i / topk) as u32, expert_id: (i % self.cfg.experts) as u32, gate_weight: 0.0,
-        }).collect();
-        let mut request = cuteafd_transport::ExpertProtocolV2Request::new(1, 17, moe_layers[0] as u32, h as u32,
-            cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32,
-            (0..rows as u32).map(|row| cuteafd_transport::ExpertProtocolV2RowDescriptor {
-                row_id: u64::from(row), source_kind: cuteafd_transport::ExpertV2SourceKind::Prefill,
-                source_request_id: 1, token_position: u64::from(row), route_offset: row * topk as u32,
-                route_count: topk as u32,
-            }).collect(),
-            routes, vec![0; rows * (h + h / 32)])?;
-        request.header.flags |= cuteafd_transport::v41_expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-        runtime.block_on(async { transport.execute(&request, |_, _, _| Ok(())).await })?;
+        // The first request sizes the registered rings: the widest one first
+        // (BF16 rows when prefill sends them), then a one-row BF16 request
+        // when decode does, so a rank without the BF16 package fails here.
+        let (h, topk) = (self.cfg.hidden, self.cfg.topk);
+        let warm = |rows: usize, bf16: bool| -> Result<cuteafd_transport::ExpertProtocolV2Request> {
+            let routes = (0..rows * topk).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
+                row_index: (i / topk) as u32, expert_id: (i % self.cfg.experts) as u32, gate_weight: 0.0,
+            }).collect();
+            let (dtype, row_bytes) = if bf16 { (cuteafd_transport::ExpertV2Dtype::Bf16, 2 * h) }
+                else { (cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32, h + h / 32) };
+            let mut request = cuteafd_transport::ExpertProtocolV2Request::new(1, 17, moe_layers[0] as u32, h as u32,
+                dtype,
+                (0..rows as u32).map(|row| cuteafd_transport::ExpertProtocolV2RowDescriptor {
+                    row_id: u64::from(row), source_kind: cuteafd_transport::ExpertV2SourceKind::Prefill,
+                    source_request_id: 1, token_position: u64::from(row), route_offset: row * topk as u32,
+                    route_count: topk as u32,
+                }).collect(),
+                routes, vec![0; rows * row_bytes])?;
+            request.header.flags |= cuteafd_transport::v41_expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+            Ok(request)
+        };
+        let mut warmups = vec![warm(args.prefill_rows, args.expert_input.bf16(false))?];
+        if args.expert_input.bf16(true) && !args.expert_input.bf16(false) {
+            warmups.push(warm(1, true)?);
+        }
+        for request in &warmups {
+            runtime.block_on(async { transport.execute(request, |_, _, _| Ok(())).await })?;
+        }
         tracing::info!(ranks = peers.len(), elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
         Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport), runtime }))
+    }
+}
+
+/// The embedding table's shard, opened once (serving reads rows every step).
+pub(crate) struct Embeddings {
+    file: std::fs::File,
+    offset: u64,
+    row: usize,
+}
+
+impl Embeddings {
+    pub fn open(checkpoint: &Checkpoint, hidden: usize) -> Result<Self> {
+        let name = "model.embed_tokens.weight";
+        let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
+            .map_err(|_| anyhow::anyhow!("checkpoint has no {name}"))?;
+        let tensor = &checkpoint.tensors[at];
+        Ok(Self { file: std::fs::File::open(checkpoint.snapshot.join(&tensor.shard))?, offset: tensor.meta.byte_offset,
+            row: hidden * 2 })
+    }
+
+    /// BF16 rows of `tokens`.
+    pub fn rows(&self, tokens: &[u32]) -> Result<Vec<u8>> {
+        let mut out = vec![0u8; tokens.len() * self.row];
+        for (slot, token) in out.chunks_exact_mut(self.row).zip(tokens) {
+            self.file.read_exact_at(slot, self.offset + u64::from(*token) * self.row as u64)?;
+        }
+        Ok(out)
     }
 }
 
@@ -368,11 +423,19 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
     let score = |label: &str, ours_all: &[f32], first: usize| -> Result<()> {
         let golden = golden_logits()?;
         let vocab = cfg.vocab_size;
-        let (mut agree, mut next_ok, mut golden_next, mut nll) = (0usize, 0usize, 0usize, 0f64);
+        let (mut agree, mut next_ok, mut golden_next, mut nll, mut kl) = (0usize, 0usize, 0usize, 0f64, 0f64);
         let rows = ours_all.len() / vocab;
+        let log_softmax = |l: &[f32]| -> Vec<f64> {
+            let top = l.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let lse = top + l.iter().map(|&x| (x as f64 - top).exp()).sum::<f64>().ln();
+            l.iter().map(|&x| x as f64 - lse).collect()
+        };
         for r in 0..rows {
             let (ours, theirs) = (&ours_all[r * vocab..][..vocab], &golden[(first + r) * vocab..][..vocab]);
             agree += usize::from(argmax(ours) == argmax(theirs));
+            // KL(golden || engine) of the next-token distributions.
+            let (p, q) = (log_softmax(theirs), log_softmax(ours));
+            kl += p.iter().zip(&q).map(|(a, b)| a.exp() * (a - b)).sum::<f64>();
             if let Some(&next) = tokens.get(first + r + 1) {
                 next_ok += usize::from(argmax(ours) == next as usize);
                 golden_next += usize::from(argmax(theirs) == next as usize);
@@ -383,8 +446,8 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
         }
         let scored = tokens.len().saturating_sub(first + 1).min(rows).max(1) as f64;
         println!("{label} logits: top-1 agreement {:.1}% over {rows} rows | next-token accuracy engine {:.1}% \
-            golden {:.1}% | mean NLL {:.4}", 100.0 * agree as f64 / rows as f64, 100.0 * next_ok as f64 / scored,
-            100.0 * golden_next as f64 / scored, nll / scored);
+            golden {:.1}% | mean NLL {:.4} | mean KL(golden||engine) {:.5}", 100.0 * agree as f64 / rows as f64,
+            100.0 * next_ok as f64 / scored, 100.0 * golden_next as f64 / scored, nll / scored, kl / rows as f64);
         Ok(())
     };
     if !prefill_logits.is_empty() {
