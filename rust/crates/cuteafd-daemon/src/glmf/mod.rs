@@ -84,6 +84,10 @@ pub(crate) struct EngineArgs {
     /// memory decides first).
     #[arg(long, default_value_t = 64)]
     pub exl3_window: usize,
+    /// Profiling only: MoE layers run the router, the expert wire rows and the
+    /// shared expert; the routed experts contribute nothing.
+    #[arg(long, hide = true)]
+    pub skip_experts: bool,
     /// DFlash2 drafter snapshot (incoai/GLM-5.3-Flash-DFlash2): taps the mHC
     /// stream mean after its target layers and drafts on this GPU.
     #[arg(long)]
@@ -247,6 +251,9 @@ impl Opened {
     }
 
     fn experts<'s>(&'s self, args: &EngineArgs) -> Result<Option<engine::Experts<'s>>> {
+        if args.skip_experts {
+            return Ok(Some(engine::Experts::Skip));
+        }
         if let Some(tensors) = self.fp8() {
             let directory = args.fp8_package.clone()
                 .unwrap_or_else(|| crate::v41_experts::fp8::package_directory(&args.native_lib, 1));
@@ -483,6 +490,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
     }
     if args.bench_prefill > 0 {
         *engine.profile.borrow_mut() = [0.0; 3];
+        engine.op_profile()?;
         let n = args.bench_prefill_tokens.unwrap_or(prefill.min(engine.prefill_capacity()));
         let long: Vec<u8> = embed.chunks_exact(row).cycle().take(n).flatten().copied().collect();
         let mut allocator = engine::Allocator::new(engine.pages, engine.slots);
@@ -504,6 +512,17 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
             1e3 * phases[0] / times.len() as f64, 1e3 * phases[1] / times.len() as f64);
         println!("prefill bench: {n} tokens through {layers} layers, median {:.1} ms ({:.0} tok/s), min {:.1} ms",
             1e3 * median, n as f64 / median, 1e3 * times[0]);
+        let ops = engine.op_profile()?;
+        if !ops.is_empty() {
+            let runs = times.len() as f64;
+            let total: f64 = ops.iter().filter(|(k, _)| !k.starts_with("host")).map(|(_, v)| v.0).sum();
+            println!("prefill ops per prefill (GPU ms between events, {total:.1} ms total per {runs} runs):");
+            let mut rows: Vec<_> = ops.into_iter().collect();
+            rows.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
+            for (label, (ms, count)) in rows {
+                println!("  {label:44} {:9.2} ms  {:6.1}%  x{}", ms / runs, 100.0 * ms / total, count as f64 / runs);
+            }
+        }
     }
     if args.bench_decode > 0 {
         *engine.profile.borrow_mut() = [0.0; 3];

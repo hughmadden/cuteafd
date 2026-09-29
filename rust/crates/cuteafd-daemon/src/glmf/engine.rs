@@ -142,6 +142,18 @@ pub(crate) enum Experts<'a> {
     /// Spark ranks serving the routed experts over RoCE (one BF16 partial per
     /// rank); one transport per prefill lane (decode uses the first).
     Spark { transports: RefCell<Vec<V41Tp4Roce>>, runtime: tokio::runtime::Runtime },
+    /// Profiling only: the router, the wire rows and the shared expert run,
+    /// the routed experts contribute nothing (the coordinator's own work).
+    Skip,
+}
+
+/// Per-program GPU times (CUTEAFD_GLMF_PROFILE_OPS=1): timing events around
+/// every launch, read back by [`GlmfEngine::op_profile`].
+#[derive(Default)]
+pub(crate) struct OpTimes {
+    pending: Vec<(String, *mut c_void, *mut c_void)>,
+    pool: Vec<*mut c_void>,
+    pub totals: std::collections::BTreeMap<String, (f64, usize)>,
 }
 
 /// Host tables of one step.
@@ -339,6 +351,7 @@ pub(crate) struct GlmfEngine<'a> {
     lanes: bool,
     /// Recorded after a layer's routes and wire rows reach the host staging.
     routes_ready: *mut c_void,
+    ops: Option<RefCell<OpTimes>>,
 }
 
 /// What a captured decode segment baked in.
@@ -410,7 +423,8 @@ impl<'a> GlmfEngine<'a> {
             experts: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(std::collections::HashMap::new()),
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
             lanes: std::env::var("CUTEAFD_GLMF_PREFILL_LANES").map_or(true, |v| v != "1"),
-            full_prefill_logits: false, routes_ready: library.cuda_event_create_ordering()? })
+            full_prefill_logits: false, routes_ready: library.cuda_event_create_ordering()?,
+            ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default) })
     }
 
     /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
@@ -526,9 +540,68 @@ impl<'a> GlmfEngine<'a> {
         let names: Vec<&str> = pointers.iter().map(|(n, _)| *n).collect();
         let program = self.programs.program(&name, &names)?;
         let raw: Vec<*mut c_void> = pointers.iter().map(|(_, p)| *p).collect();
-        // SAFETY: every pointer names a live allocation sized for the rows in
-        // `scalars`; the stream orders all launches of this engine.
-        unsafe { program.launch(&raw, scalars, self.stream) }.with_context(|| format!("{name} with {scalars:?}"))
+        self.timed(&name, || {
+            // SAFETY: every pointer names a live allocation sized for the rows in
+            // `scalars`; the stream orders all launches of this engine.
+            unsafe { program.launch(&raw, scalars, self.stream) }.with_context(|| format!("{name} with {scalars:?}"))
+        })
+    }
+
+    /// Runs `body` (stream work) between two timing events when profiling ops.
+    fn timed<T>(&self, label: &str, body: impl FnOnce() -> Result<T>) -> Result<T> {
+        let Some(ops) = &self.ops else { return body() };
+        let event = |ops: &mut OpTimes| -> Result<*mut c_void> {
+            match ops.pool.pop() {
+                Some(event) => Ok(event),
+                None => self.library.cuda_event_create(),
+            }
+        };
+        let (start, end) = {
+            let mut ops = ops.borrow_mut();
+            (event(&mut ops)?, event(&mut ops)?)
+        };
+        // SAFETY: both events are live timing events; the engine owns the stream.
+        unsafe { self.library.cuda_event_record(start, self.stream)? };
+        let out = body()?;
+        // SAFETY: as above.
+        unsafe { self.library.cuda_event_record(end, self.stream)? };
+        ops.borrow_mut().pending.push((label.to_owned(), start, end));
+        Ok(out)
+    }
+
+    /// Drains the stream and returns the per-label GPU milliseconds and
+    /// launches accumulated since the last call (empty unless profiling ops).
+    pub fn op_profile(&self) -> Result<std::collections::BTreeMap<String, (f64, usize)>> {
+        let Some(ops) = &self.ops else { return Ok(Default::default()) };
+        // SAFETY: the engine owns this stream.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        self.flush_ops()?;
+        Ok(std::mem::take(&mut ops.borrow_mut().totals))
+    }
+
+    /// Adds host wall time since `since` under `label` when profiling ops.
+    fn host_op(&self, label: &str, since: std::time::Instant) {
+        if let Some(ops) = &self.ops {
+            let mut ops = ops.borrow_mut();
+            let entry = ops.totals.entry(label.to_owned()).or_default();
+            entry.0 += since.elapsed().as_secs_f64() * 1e3;
+            entry.1 += 1;
+        }
+    }
+
+    fn flush_ops(&self) -> Result<()> {
+        let Some(ops) = &self.ops else { return Ok(()) };
+        let mut ops = ops.borrow_mut();
+        let pending = std::mem::take(&mut ops.pending);
+        for (label, start, end) in pending {
+            // SAFETY: both events were recorded on the drained stream.
+            let ms = unsafe { self.library.cuda_event_elapsed_ms(start, end)? };
+            let entry = ops.totals.entry(label).or_default();
+            entry.0 += f64::from(ms);
+            entry.1 += 1;
+            ops.pool.extend([start, end]);
+        }
+        Ok(())
     }
 
     fn scratch(&self, name: &str) -> Result<usize> {
@@ -777,6 +850,7 @@ impl<'a> GlmfEngine<'a> {
         self.put(&w.pool_table, &tables.pool_table)?;
         // Streams start as four copies of the embedding.
         let row = h * 2;
+        let host = std::time::Instant::now();
         let mut streams = vec![0u8; t * HC * row];
         for (r, e) in embed.chunks_exact(row).enumerate() {
             for s in 0..HC {
@@ -784,6 +858,7 @@ impl<'a> GlmfEngine<'a> {
             }
         }
         self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: streams.len(), ..w.streams[0].buffer }, &streams)?;
+        self.host_op("host: stream expansion + upload", host);
         let rows = Dsv4Scalar::I32(t as i32);
         if self.use_graphs && tables.decode && on_layer.is_none() && forced.is_none() {
             return self.decode_graphed(w, tables, t, rows, logit_rows);
@@ -1094,12 +1169,14 @@ impl<'a> GlmfEngine<'a> {
              (run --layers 3 for the dense layers alone)"))?;
         self.run("router_scores", &[("x", w.x.buffer.ptr), ("w", layer.ptr("gate")?),
             ("logits", w.router_logits.buffer.ptr)], &[rows])?;
-        // SAFETY: logits, bias and route outputs are live buffers of `t` rows.
-        unsafe {
-            self.library.router_select(w.router_logits.buffer.ptr, layer.ptr("gate.bias")?, std::ptr::null(),
-                std::ptr::null(), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t, self.cfg.experts, topk,
-                self.cfg.routed_scale as f32, true, self.stream)?;
-        }
+        self.timed("router_select", || {
+            // SAFETY: logits, bias and route outputs are live buffers of `t` rows.
+            unsafe {
+                self.library.router_select(w.router_logits.buffer.ptr, layer.ptr("gate.bias")?, std::ptr::null(),
+                    std::ptr::null(), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t, self.cfg.experts, topk,
+                    self.cfg.routed_scale as f32, true, self.stream)
+            }
+        })?;
         if !matches!(experts, Experts::Local(_)) {
             let grid = (t * h.div_ceil(256)).div_ceil(8).clamp(1, 4 * 188);
             self.run("expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
@@ -1121,6 +1198,7 @@ impl<'a> GlmfEngine<'a> {
         let experts = self.experts.as_ref().context("MoE layer without experts")?;
         let shared = || self.ffn(w, layer, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, rows);
         match experts {
+            Experts::Skip => return self.ffn(w, layer, self.cfg.moe_intermediate, cap, w.delta.buffer.ptr, rows),
             Experts::Local(local) => {
                 shared()?;
                 let resident = local.index_of(index)?;
@@ -1410,5 +1488,12 @@ impl Drop for GlmfEngine<'_> {
     fn drop(&mut self) {
         // SAFETY: the engine's stream is drained by its owner before the engine drops.
         let _ = unsafe { self.library.cuda_event_destroy(self.routes_ready) };
+        if let Some(ops) = self.ops.take() {
+            let ops = ops.into_inner();
+            for event in ops.pool.into_iter().chain(ops.pending.into_iter().flat_map(|(_, a, b)| [a, b])) {
+                // SAFETY: as above; no launch references these events any more.
+                let _ = unsafe { self.library.cuda_event_destroy(event) };
+            }
+        }
     }
 }
