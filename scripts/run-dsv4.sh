@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Launch a DeepSeek V4 or GLM 5.x checkpoint (serve-dsv4 / serve-glm on one
+# Launch a DeepSeek V4, GLM 5.x, MiMo V2 or Qwen 3.8 Flash Next checkpoint
+# (serve-dsv4 / serve-glm / serve-mimo / serve-qwen4 on one
 # RTX, routed experts on the first SPARK_COUNT Sparks) from the release images
 # named in the config. The family comes from the snapshot's config.json.
 # Containers use run.sh's names, so ./stop.sh stops them.
@@ -28,21 +29,34 @@ root="$hub/models--${model//\//--}"
 [[ -n "$revision" ]] || revision="$(<"$root/refs/main")"
 snapshot="/root/.cache/huggingface/hub/models--${model//\//--}/snapshots/$revision"
 [[ -d "$root/snapshots/$revision" ]] || { echo "missing snapshot $model@$revision" >&2; exit 1; }
-# Family: the serving command and the first layer with routed experts.
-read -r model_type first_layer < <(python3 - "$root/snapshots/$revision/config.json" <<'PY'
+# Family: the serving command and the layers with routed experts (the Spark
+# ranks serve [first, last]; MTP/nextn layers past the decoder stay off them
+# for Qwen 3.8, whose serve path does not run its MTP head).
+read -r model_type first_layer last_layer < <(python3 - "$root/snapshots/$revision/config.json" <<'PY'
 import json, sys
-c = json.load(open(sys.argv[1]))
-c = c.get("text_config", c)
-types = c.get("mlp_layer_types")
-first = types.index("sparse") if types else c.get("first_k_dense_replace", 0)
-print(c.get("model_type", "?"), first if c.get("model_type") == "glm_moe_dsa" else 0)
+top = json.load(open(sys.argv[1]))
+c = top.get("text_config", top)
+kind = top.get("model_type", "?")
+first, last = 0, -1
+if kind == "glm_moe_dsa":
+    types = c.get("mlp_layer_types")
+    first = types.index("sparse") if types else c.get("first_k_dense_replace", 0)
+elif kind == "mimo_v2_flash":
+    first = c["moe_layer_freq"].index(1)
+elif kind == "qwen4_exp":
+    last = c["num_hidden_layers"] - 1
+print(kind, first, last)
 PY
 )
 case "$model_type" in
   deepseek_v4) serve=serve-dsv4 ;;
   glm_moe_dsa) serve=serve-glm ;;
-  *) echo "run-dsv4.sh serves deepseek_v4 and glm_moe_dsa checkpoints, not $model_type" >&2; exit 2 ;;
+  mimo_v2_flash) serve=serve-mimo ;;
+  qwen4_exp) serve=serve-qwen4 ;;
+  *) echo "run-dsv4.sh serves deepseek_v4, glm_moe_dsa, mimo_v2_flash and qwen4_exp checkpoints, not $model_type" >&2; exit 2 ;;
 esac
+layer_args="--first-layer $first_layer"
+[[ "$last_layer" == -1 ]] || layer_args+=" --last-layer $last_layer"
 # DRAFT_MODEL_ID (serve-glm): a DFlash2 drafter checkpoint, e.g. incoai/GLM-5.3-DFlash2.
 draft_args=()
 draft="$(get DRAFT_MODEL_ID)"
@@ -71,7 +85,7 @@ for ((rank = 0; rank < ranks; rank++)); do
     --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info \
     -v \$(readlink -f \$HOME/.cache/huggingface/hub):/root/.cache/huggingface/hub:ro '$spark_image' \
     cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
-    --rank $rank --world $ranks --capacity 4096 --device-budget-bytes $budget --first-layer $first_layer \
+    --rank $rank --world $ranks --capacity 4096 --device-budget-bytes $budget $layer_args \
     --listen 0.0.0.0:$port >/dev/null" &
 done
 wait
