@@ -4,9 +4,9 @@ use crate::NativeLibrary;
 use anyhow::{ensure, Result};
 use std::ffi::c_void;
 
-/// Most rows [`NativeLibrary::vocab_head_rows`] is used for (two passes);
+/// Most rows [`NativeLibrary::vocab_head_rows`] is used for (three passes;
 /// wider heads stay on cuBLAS.
-pub const VOCAB_HEAD_ROWS_MAX: usize = 16;
+pub const VOCAB_HEAD_ROWS_MAX: usize = 24;
 
 impl NativeLibrary {
     /// `logits` [rows, vocab] FP32 = `x` [rows, width] BF16 times `weight`
