@@ -116,7 +116,8 @@ def write_bridge(output: Path, manifest: dict) -> None:
 def export(output: Path, intermediate: int, experts: int, capacity: int,
            bits: tuple[int, ...], routing: str, topk: int = 6, output_dtype: str = "bf16",
            blocks_per_sm: int | None = None, paired_boundary: str | None = None,
-           tile: tuple[int, ...] | None = None, hidden: int = 5120, route_block: int = 8) -> dict:
+           tile: tuple[int, ...] | None = None, hidden: int = 5120, route_block: int = 8,
+           token_major_rotation: bool = False) -> dict:
     if paired_boundary not in (None, "first", "last"):
         raise ValueError("paired boundary must be first, last, or None")
     if paired_boundary is not None and (intermediate != 640 or len(bits) != 2 or topk != 6
@@ -136,6 +137,10 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         raise ValueError("EXL3 route block must be 8, 16, 32 or 64 rows")
     if route_block != 8 and paired_boundary is not None:
         raise ValueError("paired exports keep the qualified 8-row route block")
+    # Token-major input rotation reads each token's input block once for all of
+    # its routes (bit-identical); it applies to two-tier packed-route exports.
+    if token_major_rotation and (paired_boundary is not None or len(bits) != 2):
+        raise ValueError("token-major rotation requires a disjoint two-tier export")
     if output_dtype not in ("bf16", "fp32"):
         raise ValueError("EXL3 output must be bf16 or fp32")
     # Disk-loaded B12x executors omit the compiler IR required by export_to_c.
@@ -182,8 +187,9 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     if paired_boundary is not None:
         options['paired_boundary'] = paired_boundary
     if len(bits) == 2:
+        rotation = {"token_major_rotation": True} if token_major_rotation and not direct else {}
         launch = compile_mixed_trellis(**options, direct_topk_routes=direct,
-                                      force_blocks_per_sm=blocks_per_sm)
+                                      force_blocks_per_sm=blocks_per_sm, **rotation)
     elif len(bits) == 3:
         launch = compile_mixed_trellis3(**options, tier2_num_experts=experts, tier2_bits=bits[2])
     else:
@@ -242,6 +248,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     if block_m != 8:
         # Recorded only when it differs, so 8-row manifests stay byte-identical.
         manifest["route_block"] = block_m
+    if token_major_rotation and not direct:
+        manifest["token_major_rotation"] = True
     if paired_boundary is not None:
         manifest.update(paired_boundary=paired_boundary, descriptor_rows=4, native_info_version=3)
     write_bridge(output, manifest)
@@ -275,13 +283,15 @@ def main() -> None:
     parser.add_argument("--paired-boundary", choices=("first", "last"), help="Candidate TP4 ownership-aware layout")
     parser.add_argument("--route-block", type=int, choices=(8, 16, 32, 64), default=8,
                         help="Packed-route M block (rows per expert block); direct routes ignore it")
+    parser.add_argument("--token-major-rotation", action="store_true",
+                        help="Rotate each token's input once for all of its routes (packed routes)")
     parser.add_argument("--tile", help="Offline disjoint-layout tile override fc1_k,fc1_n,fc2_k,fc2_n "
                                        "(for example 64,256,64,256 or 128,128,128,128); default is the "
                                        "B12x per-capacity policy")
     args = parser.parse_args()
     export(args.output, args.intermediate, args.experts, args.capacity, tuple(args.bits), args.routing, args.topk, args.output_dtype, args.blocks_per_sm, args.paired_boundary,
            tile=None if args.tile is None else tuple(args.tile.split(",")), hidden=args.hidden,
-           route_block=args.route_block)
+           route_block=args.route_block, token_major_rotation=args.token_major_rotation)
 
 
 if __name__ == "__main__":

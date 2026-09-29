@@ -335,7 +335,9 @@ class PackageProfileTests(unittest.TestCase):
             self.assertEqual(package.route_block('v41', capacity), 8)
             self.assertEqual(package.route_block('dsv4f', capacity), 8)
         self.assertEqual([package.route_block('dsv4p', c) for c in (1, 16, 80, 256, 1024, 4096)],
-                         [8, 8, 8, 8, 16, 32])
+                         [8, 8, 8, 8, 16, 64])
+        self.assertEqual([package.token_major_rotation(g, c) for g in ('v41', 'dsv4f', 'dsv4p')
+                          for c in (1024, 4096)], [False, False, False, False, False, True])
 
     def test_verify_cross_checks_the_recorded_route_block(self):
         """A variant's route block must be the one its export compiled."""
