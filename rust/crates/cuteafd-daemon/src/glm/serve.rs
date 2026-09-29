@@ -2,6 +2,9 @@
 //! prefill per admitted request and one decode-shaped step for every active
 //! sequence.
 use super::engine::{GlmEngine, GlmPlacement, PageAllocator, DECODE_ROWS};
+
+/// Most copy-window draft tokens verified per sequence and step.
+const COPY_DRAFT: usize = 7;
 use super::{embed_rows, open, Opened};
 use anyhow::{Context, Result};
 use cuteafd_api::native_v41::glm::GlmEncoding;
@@ -29,6 +32,9 @@ pub(crate) struct ServeArgs {
     /// Public model id; defaults to the snapshot's Hugging Face id.
     #[arg(long)]
     pub model_id: Option<String>,
+    /// Decode one token per step (no copy-window drafts).
+    #[arg(long)]
+    pub no_copy_drafts: bool,
 }
 
 fn model_id(snapshot: &std::path::Path) -> Option<String> {
@@ -51,7 +57,9 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (engine_args, worker_stats, max_sequences) = (args.engine.clone(), stats.clone(), args.max_sequences);
-    let worker = tokio::task::spawn_blocking(move || serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences));
+    let draft = if args.no_copy_drafts { 0 } else { COPY_DRAFT };
+    let worker = tokio::task::spawn_blocking(move ||
+        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, draft));
     ready_rx.await.context("engine failed before it was ready")??;
     let router = cuteafd_api::native_v41::router_for_model(queue, limits, stats, Duration::from_secs(25),
         ConsoleHub::disabled(), profile.clone());
@@ -65,8 +73,8 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
 }
 
 fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
-    ready: tokio::sync::oneshot::Sender<Result<()>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize)
-    -> Result<()> {
+    ready: tokio::sync::oneshot::Sender<Result<()>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
+    draft: usize) -> Result<()> {
     let opened = match open(&args) {
         Ok(opened) => opened,
         Err(error) => {
@@ -74,16 +82,24 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
             return Ok(());
         }
     };
+    let mut ready = Some(ready);
     let result = opened.with_engine(&args, |engine, transport, runtime| {
         let transport = transport.context("serve-glm needs --peers for the routed experts")?;
-        let _ = ready.send(Ok(()));
-        schedule(engine, &opened, &mut receive, transport, runtime, &stats, max_sequences.min(DECODE_ROWS))
+        if let Some(ready) = ready.take() {
+            let _ = ready.send(Ok(()));
+        }
+        schedule(engine, &opened, &mut receive, transport, runtime, &stats, max_sequences.min(DECODE_ROWS), draft)
     });
+    if let Some(ready) = ready.take() {
+        let _ = ready.send(result.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
+    }
     result
 }
 
 struct Active<'a> {
     job: NativeRequest,
+    /// Prompt and generated tokens, for copy-window drafts.
+    history: Vec<u32>,
     constraint: Option<crate::v41_native_serve::constraints::State<'a>>,
     placement: GlmPlacement,
     capacity: usize,
@@ -116,6 +132,7 @@ impl Active<'_> {
     /// Streams `token` (special tokens stay text for the GLM parser); returns
     /// true when the request is finished.
     fn emit(&mut self, token: u32) -> Result<bool> {
+        self.history.push(token);
         self.generated += 1;
         self.buffered += 1;
         let stop = self.job.stop_token_ids.contains(&token);
@@ -145,9 +162,28 @@ impl Active<'_> {
     }
 }
 
+/// Longest n-gram (from 8 down to 3 tokens) that ends the history and occurred
+/// earlier; proposes up to `limit` tokens that followed its latest earlier
+/// occurrence (a copy window). Exact: the verify step accepts only tokens the
+/// model itself produces.
+fn copy_drafts(history: &[u32], limit: usize) -> Vec<u32> {
+    let len = history.len();
+    for n in (3..=8).rev() {
+        if len <= n {
+            continue;
+        }
+        let tail = &history[len - n..];
+        if let Some(start) = (0..len - n).rev().find(|&i| &history[i..i + n] == tail) {
+            let from = start + n;
+            return history[from..(from + limit).min(len)].to_vec();
+        }
+    }
+    Vec::new()
+}
+
 fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receiver<NativeRequest>,
     transport: &mut V41Tp4Roce, runtime: &tokio::runtime::Runtime, stats: &Mutex<serde_json::Value>,
-    max_sequences: usize) -> Result<()> {
+    max_sequences: usize, draft: usize) -> Result<()> {
     let mut allocator = PageAllocator::new(engine.pages);
     let mut grammars = crate::v41_native_serve::constraints::Compiler::with_vocab(
         &opened.library, opened.snapshot.join("tokenizer.json"), engine.cfg.vocab_size, engine.cfg.eos_tokens.clone());
@@ -204,6 +240,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 }
                 tracing::debug!(tokens = tokens.len(), elapsed_ms = started.elapsed().as_millis() as u64, "prefill");
                 let mut request = Active {
+                    history: tokens.clone(),
                     decoder: cuteafd_loader::streaming_token_decoder(&opened.snapshot, false)?,
                     job, constraint, placement: placement.clone(), capacity, next: 0, generated: 0, buffered: 0,
                     started: Instant::now(),
@@ -228,9 +265,21 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         if active.is_empty() {
             continue;
         }
-        let tokens: Vec<u32> = active.iter().map(|a| a.next).collect();
+        // Each sequence verifies its next token plus a copy-window draft
+        // (none when nothing repeats), within the decode programs' rows.
+        let room = (DECODE_ROWS / active.len()).max(1) - 1;
+        let sequences: Vec<Vec<u32>> = active.iter().map(|a| {
+            let limit = room.min(draft).min(a.job.max_tokens - a.generated - 1)
+                .min(a.capacity - a.placement.len - 1);
+            let mut next = a.history.clone();
+            next.push(a.next);
+            std::iter::once(a.next).chain(copy_drafts(&next, limit)).collect()
+        }).collect();
+        let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
+        let tokens: Vec<u32> = sequences.iter().flatten().copied().collect();
         let embed = embed_rows(&opened.catalog, &tokens, hidden)?;
-        let mut rows: Vec<(&mut GlmPlacement, usize)> = active.iter_mut().map(|a| (&mut a.placement, 1)).collect();
+        let mut rows: Vec<(&mut GlmPlacement, usize)> = active.iter_mut().zip(&sequences)
+            .map(|(a, s)| (&mut a.placement, s.len())).collect();
         let step = engine.verify(&mut rows, &embed, Some((&mut *transport, runtime)), None)
             .and_then(|logits| logits.context("decode needs every layer"));
         let logits = match step {
@@ -244,8 +293,27 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 continue;
             }
         };
-        let finished: Vec<bool> = active.iter_mut().enumerate().map(|(row, request)| {
-            request.select(&logits[row * vocab..][..vocab]).and_then(|token| request.emit(token)).unwrap_or(true)
+        let mut offset = 0;
+        let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(starts).map(|((request, rows), start)| {
+            let mut finished = false;
+            for j in 0..rows.len() {
+                // Rows 0..=j are committed; the token row j produces is next.
+                request.placement.len = start + j + 1;
+                match request.select(&logits[(offset + j) * vocab..][..vocab]).and_then(|t| Ok((t, request.emit(t)?))) {
+                    Ok((token, done)) => {
+                        finished = done;
+                        if done || rows.get(j + 1) != Some(&token) {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        finished = true;
+                        break;
+                    }
+                }
+            }
+            offset += rows.len();
+            finished
         }).collect();
         for index in (0..active.len()).rev() {
             if !finished[index] {

@@ -589,7 +589,7 @@ impl HostExpertExchange {
     }
     pub fn new(capacity: u32) -> Result<Self> {
         let bytes = Self::bytes_for(capacity)?;
-        let routes = capacity as usize * 6;
+        let routes = capacity as usize * cuteafd_core::expert_geometry().topk as usize;
         Ok(Self {
             ids: vec![0; routes],
             routing: vec![0.0; routes],
@@ -690,7 +690,7 @@ impl ExpertExecution<'_, '_> {
             "request exceeds native execution capacity"
         );
         request.require_input_dtype(self.kernel.info().input_dtype)?;
-        let routes = request.rows() as usize * 6;
+        let routes = request.rows() as usize * cuteafd_core::expert_geometry().topk as usize;
         let bytes = request.plane_bytes()?;
         ensure!(
             exchange.partials.len() >= bytes,
