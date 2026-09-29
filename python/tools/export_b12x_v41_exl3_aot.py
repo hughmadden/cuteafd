@@ -117,7 +117,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
            bits: tuple[int, ...], routing: str, topk: int = 6, output_dtype: str = "bf16",
            blocks_per_sm: int | None = None, paired_boundary: str | None = None,
            tile: tuple[int, ...] | None = None, hidden: int = 5120, route_block: int = 8,
-           token_major_rotation: bool = False) -> dict:
+           token_major_rotation: bool = False, swiglu_limit: float | None = 10.0) -> dict:
     if paired_boundary not in (None, "first", "last"):
         raise ValueError("paired boundary must be first, last, or None")
     if paired_boundary is not None and (intermediate != 640 or len(bits) != 2 or topk != 6
@@ -159,7 +159,10 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         raise ValueError("export requires two to four distinct K2..K5 decoder tiers")
     if blocks_per_sm is not None and len(bits) != 2:
         raise ValueError("explicit residency is currently supported only for two-tier exports")
-    if not 1 <= capacity <= 4096 or topk not in (3, 6) or experts < topk or experts > 384:
+    # swiglu_limit None is b12x's unclamped SwiGLU (GLM); DeepSeek clamps at 10.
+    if swiglu_limit is not None and not swiglu_limit > 0:
+        raise ValueError("SwiGLU limit must be positive or None (no clamp)")
+    if not 1 <= capacity <= 4096 or topk not in (3, 6, 8) or experts < topk or experts > 384:
         raise ValueError("invalid V4.1 capacity or expert count")
     # Whole H128 rotation blocks on both projection axes.
     if hidden < 128 or hidden % 128 or intermediate < 128 or intermediate % 128:
@@ -181,7 +184,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         sms=props.multi_processor_count, max_shared_mem=props.shared_memory_per_block_optin,
         force_tile_config=_projection_mixed_tile_config(tile, hidden_size=hidden,
             intermediate_size=intermediate, token_count=capacity, direct_topk_routes=direct),
-        tier0_bits=bits[0], tier1_bits=bits[1], trellis_codebook="mcg", swiglu_limit=10.0,
+        tier0_bits=bits[0], tier1_bits=bits[1], trellis_codebook="mcg", swiglu_limit=swiglu_limit,
         moe_block_size=block_m, rotation_input_dtype="bf16", full_rotation_output_dtype=output_dtype,
         route_ids_dtype=torch.int32)
     if paired_boundary is not None:
@@ -235,7 +238,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     manifest = {"schema": "cuteafd.v41-exl3-aot.v1", "sparkinfer_revision": _pinned_sparkinfer.REVISION,
         "gpu": props.name, "compute": [props.major, props.minor], "sms": props.multi_processor_count,
         "hidden": hidden, "intermediate": intermediate, "experts": experts, "top_k": topk,
-        "capacity": capacity, "output_dtype": output_dtype, "bits": list(bits), "swiglu_limit": 10.0,
+        "capacity": capacity, "output_dtype": output_dtype, "bits": list(bits), "swiglu_limit": swiglu_limit,
         "direct": direct, "route_slots": route_slots, "route_blocks": route_blocks,
         "tile": list(options['force_tile_config']), "blocks_per_sm": launch.blocks_per_sm,
         "shared_memory_bytes": launch.shared_memory_bytes, "buffers": layouts, "objects": objects,
@@ -277,7 +280,9 @@ def main() -> None:
     parser.add_argument("--capacity", type=int, default=16)
     parser.add_argument("--bits", type=int, nargs="+", default=[3, 4])
     parser.add_argument("--routing", choices=("auto", "direct", "packed"), default="auto")
-    parser.add_argument("--topk", type=int, choices=(3, 6), default=6)
+    parser.add_argument("--topk", type=int, choices=(3, 6, 8), default=6)
+    parser.add_argument("--swiglu-limit", default="10",
+                        help="SwiGLU clamp limit, or none for an unclamped SwiGLU (GLM)")
     parser.add_argument("--output-dtype", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument("--blocks-per-sm", type=int, choices=(1, 2), help="Offline residency override; default uses B12x policy")
     parser.add_argument("--paired-boundary", choices=("first", "last"), help="Candidate TP4 ownership-aware layout")
@@ -291,7 +296,8 @@ def main() -> None:
     args = parser.parse_args()
     export(args.output, args.intermediate, args.experts, args.capacity, tuple(args.bits), args.routing, args.topk, args.output_dtype, args.blocks_per_sm, args.paired_boundary,
            tile=None if args.tile is None else tuple(args.tile.split(",")), hidden=args.hidden,
-           route_block=args.route_block, token_major_rotation=args.token_major_rotation)
+           route_block=args.route_block, token_major_rotation=args.token_major_rotation,
+           swiglu_limit=None if args.swiglu_limit.lower() == "none" else float(args.swiglu_limit))
 
 
 if __name__ == "__main__":
