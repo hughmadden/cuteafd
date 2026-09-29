@@ -41,6 +41,8 @@ pub(crate) struct Engine<'a> {
     pub stream: *mut c_void,
     pub sms: u32,
     pub shape: PoolShape,
+    /// Spark ranks per exchange; one reduction plane each.
+    pub spark_ranks: usize,
     pools: Vec<LayerCache<'a>>,
     rope_window: Dev<'a>,
     rope_compressed: Dev<'a>,
@@ -134,6 +136,8 @@ pub(crate) struct EngineParts<'a> {
     pub stream: *mut c_void,
     pub sms: u32,
     pub shape: PoolShape,
+    /// Spark ranks whose partial rows land in reduction planes (2, 3, 4 or 6).
+    pub spark_ranks: usize,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -318,6 +322,7 @@ impl<'a> Engine<'a> {
             stream: parts.stream,
             sms: parts.sms,
             shape: parts.shape,
+            spark_ranks: parts.spark_ranks,
             prefill_workspace: RefCell::new(None),
             decode_workspace: RefCell::new(None),
             profile: RefCell::new(Profile::default()),
@@ -363,7 +368,7 @@ impl<'a> Engine<'a> {
             route_ids: self.alloc(t * topk * 4)?,
             route_weights: self.alloc(t * topk * 4)?,
             wire: self.alloc(t * (h + h / 32))?,
-            planes: (0..4).map(|_| self.alloc(t * h * 2)).collect::<Result<_>>()?,
+            planes: (0..self.spark_ranks).map(|_| self.alloc(t * h * 2)).collect::<Result<_>>()?,
             scratch: self.alloc(self.scratch_bytes()?)?,
             dummy: self.zeroed(4096)?,
             vocab_logits: self.alloc(t * self.cfg.vocab_size * 4)?,
@@ -373,7 +378,7 @@ impl<'a> Engine<'a> {
             drafts: self.alloc(t * 4)?,
             markov: self.alloc(self.library.dsv4_markov_workspace(t)?)?,
             router_host: HostAllocation::new(self.library, t * (topk * 8 + h + h / 32))?,
-            planes_host: RefCell::new(HostAllocation::new(self.library, 4 * t * h * 2)?),
+            planes_host: RefCell::new(HostAllocation::new(self.library, self.spark_ranks * t * h * 2)?),
             // SAFETY: the workspace buffer lives in the same struct and drops
             // after the head (field order).
             head: unsafe { self.library.vocabulary_head(head_workspace.buffer.ptr, h as u32, t as u32)? },

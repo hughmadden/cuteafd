@@ -167,6 +167,9 @@ pub(crate) fn with_engine<T>(
         (args.pool_tokens / 4).div_ceil(64) + args.max_sequences,
         (args.pool_tokens / 128).div_ceil(2) + args.max_sequences,
     );
+    let peers = args.peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
+    ensure!(matches!(peers.len(), 2 | 3 | 4 | 6), "DeepSeek V4 serves 2, 3, 4 or 6 Spark ranks, got {}", peers.len());
+    loaded.library.v41_compact_reducer()?.require_rank_count(peers.len() as u32)?;
     let engine = engine::Engine::new(engine::EngineParts {
         library: &loaded.library,
         programs: &programs,
@@ -180,6 +183,7 @@ pub(crate) fn with_engine<T>(
         stream,
         sms: args.sms,
         shape,
+        spark_ranks: peers.len(),
     })?;
     let (free, _) = loaded.library.cuda_memory_info()?;
     let budget = free.saturating_sub(args.reserve_gib << 30);
@@ -190,8 +194,10 @@ pub(crate) fn with_engine<T>(
     tracing::info!(layers = local.as_ref().map_or(0, |l| l.layers()), elapsed_ms = started.elapsed().as_millis() as u64,
         "DeepSeek V4 expert layers resident on the coordinator");
     *engine.local.borrow_mut() = local;
-    let peers = args.peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
-    let executors: Vec<u64> = (1..=peers.len() as u64).collect();
+    // Implicit Spark worlds: TP4 executors 1..=4, TP2 5..=6, TP3 7..=9, TP6 27..=32.
+    let executors = (0..peers.len())
+        .map(|rank| cuteafd_transport::v41_expert::v41_spark_executor_id(peers.len(), rank))
+        .collect::<Result<Vec<u64>>>()?;
     // One transport (connection set) per prefill lane, so each lane can keep
     // a Spark wave in flight; decode uses the first.
     let mut transports = (0..engine::PREFILL_LANES).map(|_| V41Tp4Roce::new_ranks(&peers, &executors, 4096,
