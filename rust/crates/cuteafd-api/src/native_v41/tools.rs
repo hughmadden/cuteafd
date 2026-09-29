@@ -37,6 +37,9 @@ pub(super) enum ToolSyntax {
     /// GLM `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`
     /// (XGrammar's native `glm_xml` JSON-schema style, as glmrt served it).
     GlmXml,
+    /// Qwen3-Coder `<tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n</function>\n</tool_call>`
+    /// (XGrammar's `qwen_xml` style, as its `qwen_3_5` structural tag).
+    QwenXml,
 }
 
 pub(super) struct ToolConstraints {
@@ -79,6 +82,9 @@ impl ToolConstraints {
                         "content":{"type":"json_schema", "json_schema":schema, "style":"glm_xml", "any_order":false},
                         "end":"</tool_call>"})
                 }
+                ToolSyntax::QwenXml => json!({"type":"tag", "begin":format!("<tool_call>\n<function={}>\n", tool.name),
+                    "content":{"type":"json_schema", "json_schema":schema, "style":"qwen_xml", "any_order":false},
+                    "end":"\n</function>\n</tool_call>"}),
             });
         }
         if !(assistance || strict_requested || required) {
@@ -102,6 +108,12 @@ impl ToolConstraints {
                     "stop_after_first":!parallel}),
                 json!({"type":"triggered_tags", "triggers":["<tool_call>"], "tags":tags, "at_least_one":false,
                     "stop_after_first":!parallel}),
+            ),
+            ToolSyntax::QwenXml => (
+                json!({"type":"tags_with_separator", "tags":tags, "separator":"\n", "at_least_one":true,
+                    "stop_after_first":!parallel}),
+                json!({"type":"triggered_tags", "triggers":["<tool_call>\n<function="], "tags":tags,
+                    "at_least_one":false, "stop_after_first":!parallel}),
             ),
         };
         Ok(Some(Self { required, format: Some(format), triggered: Some(triggered), parallel, validators }))

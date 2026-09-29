@@ -37,6 +37,8 @@ pub enum ModelEncoding {
     DeepseekV41,
     /// GLM 5.x: the checkpoint's chat template and GLM XML tool calls.
     Glm(Arc<glm::GlmEncoding>),
+    /// Qwen 3.8 Flash Next: the checkpoint's chat template and Qwen3-Coder XML tool calls.
+    Qwen(Arc<qwen::QwenEncoding>),
 }
 
 impl ModelEncoding {
@@ -45,6 +47,7 @@ impl ModelEncoding {
         match self {
             Self::DeepseekV4 | Self::DeepseekV41 => vec![DEEPSEEK_EOS_TOKEN_ID],
             Self::Glm(encoding) => encoding.tokens().eos.clone(),
+            Self::Qwen(encoding) => encoding.tokens().eos.clone(),
         }
     }
 
@@ -52,6 +55,7 @@ impl ModelEncoding {
         match self {
             Self::DeepseekV4 | Self::DeepseekV41 => DEEPSEEK_THINK_CLOSE_TOKEN_ID,
             Self::Glm(encoding) => encoding.tokens().think_close,
+            Self::Qwen(encoding) => encoding.tokens().think_close,
         }
     }
 }
@@ -76,8 +80,12 @@ impl ModelProfile {
     /// Token ids that end generation for one request.
     fn stop_token_ids(&self, tools_declared: bool) -> Vec<u32> {
         match &self.encoding {
-            ModelEncoding::Glm(encoding) => {
-                let mut ids = encoding.stop_token_ids(tools_declared);
+            ModelEncoding::Glm(_) | ModelEncoding::Qwen(_) => {
+                let mut ids = match &self.encoding {
+                    ModelEncoding::Glm(encoding) => encoding.stop_token_ids(tools_declared),
+                    ModelEncoding::Qwen(encoding) => encoding.stop_token_ids(tools_declared),
+                    _ => unreachable!(),
+                };
                 ids.extend(&self.eos_token_ids);
                 ids.sort_unstable();
                 ids.dedup();
@@ -98,6 +106,7 @@ mod admission;
 mod constraints;
 mod tools;
 pub mod glm;
+pub mod qwen;
 pub use constraints::NativeConstraint;
 mod images;
 pub mod console;
@@ -284,10 +293,17 @@ type ChatGenerator = <<ChatCompletionRequest as ProtocolRequest>::Response as Pr
 type ChatChunk = <ChatGenerator as deepseek_recipe::stream::ChunkGenerator>::Chunk;
 type ChatChunks = std::pin::Pin<Box<dyn futures::Stream<Item = Result<ChatChunk, deepseek_recipe::stream::StreamError>> + Send>>;
 
+/// A family whose prompt is the checkpoint's own chat template.
+enum Templated {
+    Glm(Arc<glm::GlmEncoding>),
+    Qwen(Arc<qwen::QwenEncoding>),
+}
+
 /// The family's generated-text parser in front of the OpenAI chunk generator.
 enum OutputProcessor {
     Deepseek(StreamProcessor<ChatGenerator>),
     Glm(glm::GlmStreamProcessor<ChatGenerator>),
+    Qwen(glm::GlmStreamProcessor<ChatGenerator, qwen::QwenOutputParser>),
 }
 
 impl OutputProcessor {
@@ -295,13 +311,16 @@ impl OutputProcessor {
         match self {
             Self::Deepseek(processor) => Box::pin(processor.process(input)),
             Self::Glm(processor) => Box::pin(processor.process(input)),
+            Self::Qwen(processor) => Box::pin(processor.process(input)),
         }
     }
 }
 
 async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> Response {
+    // Families rendered from the checkpoint's own chat template.
     let glm = match &state.profile.encoding {
-        ModelEncoding::Glm(encoding) => Some(encoding.clone()),
+        ModelEncoding::Glm(encoding) => Some(Templated::Glm(encoding.clone())),
+        ModelEncoding::Qwen(encoding) => Some(Templated::Qwen(encoding.clone())),
         ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 => None,
     };
     let assistance = match body.get("tool_decoding_assistance") {
@@ -392,7 +411,11 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> 
         Ok(validator) => validator,
         Err(e) => return error(StatusCode::BAD_REQUEST, e),
     };
-    let syntax = if glm_request.is_some() { tools::ToolSyntax::GlmXml } else { tools::ToolSyntax::Dsml };
+    let syntax = match &glm_request {
+        Some((Templated::Glm(_), _, _)) => tools::ToolSyntax::GlmXml,
+        Some((Templated::Qwen(_), _, _)) => tools::ToolSyntax::QwenXml,
+        None => tools::ToolSyntax::Dsml,
+    };
     let tool_constraints = match tools::ToolConstraints::new(&converted.conversation.tools,
         converted.conversation.tool_choice, selection.required, parallel,
         assistance || response_format.as_ref().is_some_and(|v| v["type"] != "text"), syntax) {
@@ -412,7 +435,7 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> 
     let generator = ChatCompletionRequest::chunk_generator(&converted, id.clone(), model.clone())
         .with_include_usage(!streaming || include_usage);
     let (prompt, image_sources, processor) = match glm_request {
-        Some((encoding, raw, thinking)) => {
+        Some((Templated::Glm(encoding), raw, thinking)) => {
             let tool_choice = match (selection.name(), selection.required) {
                 (Some(name), _) => glm::GlmToolChoice::Named(name.to_owned()),
                 (None, true) => glm::GlmToolChoice::Required,
@@ -429,6 +452,24 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> 
                 tools: tools_declared.then(|| converted.conversation.tools.clone()),
                 stop_sequences: converted.parsing_options.stop_sequences.clone() });
             (prompt, Vec::new(), OutputProcessor::Glm(glm::GlmStreamProcessor::new(generator, parser)))
+        }
+        Some((Templated::Qwen(encoding), raw, thinking)) => {
+            let tool_choice = match (selection.name(), selection.required) {
+                (Some(name), _) => qwen::prompt::QwenToolChoice::Named(name.to_owned()),
+                (None, true) => qwen::prompt::QwenToolChoice::Required,
+                (None, false) => qwen::prompt::QwenToolChoice::Auto,
+            };
+            let options = qwen::QwenPromptOptions { thinking,
+                tool_names: converted.conversation.tools.iter().map(|tool| tool.name.clone()).collect(),
+                tool_choice, response_format };
+            let prompt = match encoding.render(&raw, &options) {
+                Ok(prompt) => prompt,
+                Err(message) => return error(StatusCode::BAD_REQUEST, message),
+            };
+            let parser = qwen::QwenOutputParser::new(qwen::QwenParserOptions { thinking,
+                tools: tools_declared.then(|| converted.conversation.tools.clone()),
+                stop_sequences: converted.parsing_options.stop_sequences.clone() });
+            (prompt, Vec::new(), OutputProcessor::Qwen(glm::GlmStreamProcessor::new(generator, parser)))
         }
         None => {
             let rendered = if matches!(state.profile.encoding, ModelEncoding::DeepseekV4) {
