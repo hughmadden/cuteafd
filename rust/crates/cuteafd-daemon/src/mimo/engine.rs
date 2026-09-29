@@ -110,6 +110,12 @@ impl Allocator {
         let ring = self.rings.pop().context("SWA rings exhausted")?;
         Ok(MimoPlacement { pages: (0..pages).map(|_| self.pages.pop().unwrap()).collect(), ring, len: 0 })
     }
+
+    /// Returns a finished sequence's pages and ring.
+    pub fn release(&mut self, placement: MimoPlacement) {
+        self.pages.extend(placement.pages);
+        self.rings.push(placement.ring);
+    }
 }
 
 struct Workspace<'a> {
@@ -225,6 +231,10 @@ impl<'a> MimoEngine<'a> {
         self.experts = Some(experts);
     }
 
+    pub fn has_experts(&self) -> bool {
+        self.experts.is_some()
+    }
+
     fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
         DeviceAllocation::new(self.library, bytes.max(256))
     }
@@ -322,22 +332,16 @@ impl<'a> MimoEngine<'a> {
     /// `on_layer` receives each layer's output rows (BF16 [t, hidden]).
     pub fn prefill(&self, placement: &mut MimoPlacement, embed: &[u8],
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<Vec<f32>>> {
-        self.prefill_forced(placement, embed, on_layer, None)
+        self.prefill_forced(placement, embed, false, on_layer, None)
     }
 
     /// `prefill` with teacher forcing: after layer `l`, `forced(l)` (when it
     /// returns rows) replaces the residual before layer `l + 1`, so each
-    /// layer's comparison measures that layer alone.
-    pub fn prefill_forced(&self, placement: &mut MimoPlacement, embed: &[u8],
+    /// layer's comparison measures that layer alone. `all_logits` returns
+    /// every row's logits instead of the last row's.
+    pub fn prefill_forced(&self, placement: &mut MimoPlacement, embed: &[u8], all_logits: bool,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<Vec<f32>>> {
-        self.prefill_rows_logits(placement, embed, on_layer, forced, false)
-    }
-
-    /// `prefill_forced` returning every row's logits (`all_rows`) or the last row's.
-    pub fn prefill_rows_logits(&self, placement: &mut MimoPlacement, embed: &[u8],
-        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
-        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, all_rows: bool) -> Result<Option<Vec<f32>>> {
         let (t, start) = (embed.len() / (self.cfg.hidden * 2), placement.len);
         ensure!(t > 0 && t <= self.prefill_rows && start + t <= self.max_context, "prefill of {t} rows at {start}");
         let used = (start + t).div_ceil(PAGE_ROWS);
@@ -350,7 +354,7 @@ impl<'a> MimoEngine<'a> {
             page_table: placement.pages[..used].to_vec(),
             table_stride: 0,
         };
-        let logits = self.step(&tables, embed, if all_rows { t } else { 1 }, on_layer, forced)?;
+        let logits = self.step(&tables, embed, if all_logits { t } else { 1 }, on_layer, forced)?;
         placement.len += t;
         Ok(logits)
     }

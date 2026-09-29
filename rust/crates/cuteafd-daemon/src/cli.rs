@@ -26,6 +26,8 @@ pub(crate) enum Commands {
     GlmGolden(crate::glm::GoldenArgs),
     /// Compare the MiMo V2 coordinator programs layer by layer with python/reference/mimo_v2/golden.py outputs.
     MimoGolden(crate::mimo::GoldenArgs),
+    /// Serve MiMo V2 Flash (mimo_v2) through the OpenAI API with Spark FP8 experts.
+    ServeMimo(crate::mimo::serve::ServeArgs),
     /// Compare the GLM 5.3 Flash coordinator programs layer by layer with python/reference/glm5_next/golden.py outputs.
     GlmfGolden(crate::glmf::GoldenArgs),
     /// Compare the Qwen 3.8 Flash Next (qwen4_exp) engine layer by layer with

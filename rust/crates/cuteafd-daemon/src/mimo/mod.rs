@@ -1,6 +1,7 @@
 //! MiMo V2 (mimo_v2_flash) on the generic engine: weights, the coordinator
 //! programs' layer chain, and the golden comparison command.
 pub(crate) mod engine;
+pub(crate) mod serve;
 pub(crate) mod weights;
 
 use anyhow::{ensure, Context, Result};
@@ -76,10 +77,14 @@ pub(crate) struct GoldenArgs {
     /// so every layer's cosine measures that layer alone.
     #[arg(long)]
     pub teacher_force: bool,
-    /// Prefill logits for every row (not only the last): top-1 agreement and
-    /// mean NLL over the whole prefill.
+    /// Prefill in chunks of this many rows (checks prefill after cached rows).
     #[arg(long)]
-    pub all_logits: bool,
+    pub prefill_chunk: Option<usize>,
+    /// Score every prefill row against the golden logits: top-1 agreement,
+    /// next-token accuracy and mean NLL of the prompt's next tokens (the
+    /// golden's `mean_nll`).
+    #[arg(long)]
+    pub nll: bool,
     /// Skip the per-layer comparison (each layer's rows are otherwise copied
     /// back), so prefill and decode times are the engine's.
     #[arg(long)]
@@ -274,11 +279,28 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
     let forced = |layer: usize| -> Option<Vec<u8>> {
         std::fs::read(args.golden.join(format!("layer{layer:02}.bin"))).ok().map(|rows| rows[..prefill * row].to_vec())
     };
-    let mut prefill_compare = |layer: usize, stream: &[u8]| compare(layer, 0, stream, &mut worst);
-    let logits = engine.prefill_rows_logits(&mut placement, &embed[..prefill * row],
-        (!args.timing).then_some(&mut prefill_compare as &mut dyn FnMut(usize, &[u8]) -> Result<()>),
-        args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>), args.all_logits)?;
+    let chunk = args.prefill_chunk.unwrap_or(prefill).clamp(1, engine.prefill_rows);
+    ensure!(!args.teacher_force || chunk >= prefill, "--teacher-force needs a single prefill chunk");
+    let mut logits = None;
+    let mut prefill_logits: Vec<f32> = Vec::new();
+    for first in (0..prefill).step_by(chunk) {
+        let n = chunk.min(prefill - first);
+        let mut prefill_compare = |layer: usize, stream: &[u8]| compare(layer, first, stream, &mut worst);
+        logits = engine.prefill_forced(&mut placement, &embed[first * row..(first + n) * row], args.nll,
+            (!args.timing).then_some(&mut prefill_compare as &mut dyn FnMut(usize, &[u8]) -> Result<()>),
+            args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>))?;
+        if args.nll {
+            prefill_logits.extend(logits.as_deref().unwrap_or_default());
+        }
+    }
+    if args.nll {
+        logits = prefill_logits.len().checked_sub(cfg.vocab_size).map(|at| prefill_logits[at..].to_vec());
+    }
     let prefill_seconds = started.elapsed().as_secs_f64();
+    if chunk < prefill {
+        println!("prefill in chunks of {chunk}: worst cosine per layer {:?}",
+            worst.iter().map(|c| format!("{c:.6}")).collect::<Vec<_>>());
+    }
     let started = Instant::now();
     let mut decode_worst = Vec::new();
     let mut decode_logits: Vec<f32> = Vec::new();
@@ -303,15 +325,17 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
             .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
     };
     let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
-    if !decode_logits.is_empty() {
+    // Rows of `ours` are the logits of positions `first..`: top-1 agreement
+    // with the golden, next-token accuracy and mean NLL of the next tokens.
+    let score = |label: &str, ours_all: &[f32], first: usize| -> Result<()> {
         let golden = golden_logits()?;
         let vocab = cfg.vocab_size;
         let (mut agree, mut next_ok, mut golden_next, mut nll) = (0usize, 0usize, 0usize, 0f64);
-        let rows = decode_logits.len() / vocab;
+        let rows = ours_all.len() / vocab;
         for r in 0..rows {
-            let (ours, theirs) = (&decode_logits[r * vocab..][..vocab], &golden[(prefill + r) * vocab..][..vocab]);
+            let (ours, theirs) = (&ours_all[r * vocab..][..vocab], &golden[(first + r) * vocab..][..vocab]);
             agree += usize::from(argmax(ours) == argmax(theirs));
-            if let Some(&next) = tokens.get(prefill + r + 1) {
+            if let Some(&next) = tokens.get(first + r + 1) {
                 next_ok += usize::from(argmax(ours) == next as usize);
                 golden_next += usize::from(argmax(theirs) == next as usize);
                 let top = ours.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
@@ -319,42 +343,24 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
                 nll += top + sum.ln() - ours[next as usize] as f64;
             }
         }
-        let scored = (rows - 1).max(1) as f64;
-        println!("decode logits: top-1 agreement {:.1}% over {rows} rows | next-token accuracy engine {:.1}% \
+        let scored = tokens.len().saturating_sub(first + 1).min(rows).max(1) as f64;
+        println!("{label} logits: top-1 agreement {:.1}% over {rows} rows | next-token accuracy engine {:.1}% \
             golden {:.1}% | mean NLL {:.4}", 100.0 * agree as f64 / rows as f64, 100.0 * next_ok as f64 / scored,
             100.0 * golden_next as f64 / scored, nll / scored);
+        Ok(())
+    };
+    if !prefill_logits.is_empty() {
+        score("prefill", &prefill_logits, 0)?;
+    }
+    if !decode_logits.is_empty() {
+        score("decode", &decode_logits, prefill)?;
     }
     println!("prefill: {prefill} tokens through {layers} layers in {prefill_seconds:.2} s");
     if let Some(logits) = logits {
         let golden = golden_logits()?;
-        let vocab = cfg.vocab_size;
-        let rows = logits.len() / vocab;
-        let first = prefill - rows;
-        let last = &golden[(prefill - 1) * vocab..][..vocab];
-        let ours_last = &logits[(rows - 1) * vocab..];
-        let (cosine, _) = similarity(ours_last, last);
-        println!("last-row logits: argmax engine {} golden {} cosine {cosine:.6}", argmax(ours_last), argmax(last));
-        if rows > 1 {
-            let nll = |l: &[f32], next: usize| -> f64 {
-                let top = l.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
-                top + l.iter().map(|&x| (x as f64 - top).exp()).sum::<f64>().ln() - l[next] as f64
-            };
-            let (mut agree, mut ours_nll, mut golden_nll, mut ours_ok, mut scored) = (0usize, 0f64, 0f64, 0usize, 0usize);
-            for r in 0..rows {
-                let (ours, theirs) = (&logits[r * vocab..][..vocab], &golden[(first + r) * vocab..][..vocab]);
-                agree += usize::from(argmax(ours) == argmax(theirs));
-                if let Some(&next) = tokens.get(first + r + 1) {
-                    ours_nll += nll(ours, next as usize);
-                    golden_nll += nll(theirs, next as usize);
-                    ours_ok += usize::from(argmax(ours) == next as usize);
-                    scored += 1;
-                }
-            }
-            let scored_f = scored.max(1) as f64;
-            println!("prefill logits over {rows} rows: top-1 agreement {:.1}% | next-token accuracy {:.1}% | \
-                mean NLL engine {:.4} golden {:.4}", 100.0 * agree as f64 / rows as f64,
-                100.0 * ours_ok as f64 / scored_f, ours_nll / scored_f, golden_nll / scored_f);
-        }
+        let last = &golden[(prefill - 1) * cfg.vocab_size..][..cfg.vocab_size];
+        let (cosine, _) = similarity(&logits, last);
+        println!("last-row logits: argmax engine {} golden {} cosine {cosine:.6}", argmax(&logits), argmax(last));
     }
     let profile = engine.profile.borrow();
     if profile[1] > 0.0 {

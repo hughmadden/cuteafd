@@ -302,6 +302,9 @@ pub(crate) struct Qwen4Engine<'a> {
     pub profile: RefCell<[f64; 2]>,
     graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
     use_graphs: bool,
+    /// Recorded after a Spark exchange's device-to-host copies: the host
+    /// waits on it while the shared expert runs behind it.
+    routes_ready: *mut c_void,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -371,7 +374,8 @@ impl<'a> Qwen4Engine<'a> {
             index, ple_state, pool_logical, pool_pages, workspace: RefCell::new(None),
             decode_workspace: RefCell::new(None), experts: None, profile: RefCell::new([0.0; 2]),
             graphs: RefCell::new(std::collections::HashMap::new()),
-            use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0") })
+            use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0"),
+            routes_ready: library.cuda_event_create_ordering()? })
     }
 
     pub fn set_experts(&mut self, experts: Experts<'a>) {
@@ -933,9 +937,10 @@ impl<'a> Qwen4Engine<'a> {
             self.library.router_select_softmax(w.router_logits.buffer.ptr, w.route_ids.buffer.ptr,
                 w.route_weights.buffer.ptr, t, self.cfg.experts, self.cfg.topk, 1.0, true, self.stream)?;
         }
-        self.run("qwen4_shared", &[("x", w.x.buffer.ptr), ("w_gate_up", layer.ptr("shared.w_gate_up")?),
-            ("w_down", layer.ptr("shared.w_down")?), ("out", w.shared.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
-            &[rows])?;
+        // Spark layers run the shared expert during the exchange (spark_moe).
+        if !matches!(experts, Experts::Spark { .. }) {
+            self.shared(w, layer, rows)?;
+        }
         if matches!(experts, Experts::LocalExl3(_) | Experts::Spark { .. }) {
             let grid = (t * h.div_ceil(256)).div_ceil(8).clamp(1, 4 * 188);
             self.run("qwen4_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
@@ -944,6 +949,12 @@ impl<'a> Qwen4Engine<'a> {
                 ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Dsv4Scalar::I32(grid as i32)])?;
         }
         Ok(())
+    }
+
+    fn shared(&self, w: &Workspace<'_>, layer: &Qwen4Layer<'_>, rows: Dsv4Scalar) -> Result<()> {
+        self.run("qwen4_shared", &[("x", w.x.buffer.ptr), ("w_gate_up", layer.ptr("shared.w_gate_up")?),
+            ("w_down", layer.ptr("shared.w_down")?), ("out", w.shared.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
+            &[rows])
     }
 
     /// The routed experts of layer `index` (the front ran); leaves
@@ -979,7 +990,7 @@ impl<'a> Qwen4Engine<'a> {
                 return Ok(());
             }
             Experts::Spark { transport, runtime } => {
-                return self.spark_moe(w, index, t, decode, &mut transport.borrow_mut(), runtime);
+                return self.spark_moe(w, index, t, rows, decode, &mut transport.borrow_mut(), runtime);
             }
             Experts::SharedOnly => {
                 // SAFETY: both are live [t, H] BF16 buffers ordered on the stream.
@@ -993,7 +1004,9 @@ impl<'a> Qwen4Engine<'a> {
 
     /// Routes and wire rows down, one request to every Spark rank, the BF16
     /// rank partials and the shared expert summed into `delta`.
-    fn spark_moe(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, transport: &mut V41Tp4Roce,
+    #[allow(clippy::too_many_arguments)]
+    fn spark_moe(&self, w: &Workspace<'_>, index: usize, t: usize, rows: Dsv4Scalar, decode: bool,
+        transport: &mut V41Tp4Roce,
         runtime: &tokio::runtime::Runtime) -> Result<()> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
@@ -1012,8 +1025,13 @@ impl<'a> Qwen4Engine<'a> {
             self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.stream)?;
             self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.stream)?;
             self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), w.wire.buffer, wire_bytes, self.stream)?;
-            self.library.cuda_stream_synchronize(self.stream)?;
+            self.library.cuda_event_record(self.routes_ready, self.stream)?;
         }
+        // The shared expert queues behind the copies and runs during the
+        // exchange; the host waits for the copies only.
+        self.shared(w, &self.weights.layers[index], rows)?;
+        // SAFETY: the event was recorded on this engine's stream above.
+        unsafe { self.library.cuda_event_synchronize(self.routes_ready)? };
         self.profile.borrow_mut()[0] += timer.elapsed().as_secs_f64();
         let staged = staging.bytes();
         let word = |offset: usize, i: usize| u32::from_le_bytes(staged[offset + i * 4..][..4].try_into().unwrap());
@@ -1064,5 +1082,12 @@ impl<'a> Qwen4Engine<'a> {
                 w.delta.buffer.ptr.cast(), t as u32, self.stream)?;
             self.library.cuda_stream_synchronize(self.stream)
         }
+    }
+}
+
+impl Drop for Qwen4Engine<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the engine's stream is drained by its owner before the engine drops.
+        let _ = unsafe { self.library.cuda_event_destroy(self.routes_ready) };
     }
 }
