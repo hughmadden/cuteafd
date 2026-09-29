@@ -149,6 +149,95 @@ impl StepCost {
     }
 }
 
+/// One sequence's inputs to a step's draft plan.
+pub(crate) struct PlanInput<'h> {
+    /// Identical sequences (same position and token digest) share a key:
+    /// they route alike and draft alike, so the plan prices them as one group.
+    pub key: (usize, u64),
+    pub history: &'h DraftHistory,
+    /// Selector features of the sequence's DFlash2 draft (None: no draft).
+    pub features: Option<&'h [[f32; 4]]>,
+    /// Most drafts the sequence may verify this step.
+    pub limit: usize,
+}
+
+/// DFlash2 draft counts per sequence: `fixed` (within each limit), or the
+/// adaptive [`plan`] over groups of identical drafting sequences, priced with
+/// the sequences that do not draft.
+pub(crate) fn plan_counts(inputs: &[PlanInput<'_>], fixed: Option<usize>, cost: &StepCost) -> Vec<usize> {
+    let indices: Vec<usize> = (0..inputs.len()).filter(|&i| inputs[i].features.is_some()).collect();
+    let mut counts = vec![0; inputs.len()];
+    if let Some(fixed) = fixed {
+        for &i in &indices {
+            counts[i] = fixed.min(inputs[i].limit).min(inputs[i].features.map_or(0, <[_]>::len));
+        }
+        return counts;
+    }
+    if indices.is_empty() {
+        return counts;
+    }
+    let mut members: Vec<Vec<usize>> = Vec::new();
+    for &i in &indices {
+        match members.iter_mut().find(|m| inputs[m[0]].key == inputs[i].key) {
+            Some(group) => group.push(i),
+            None => members.push(vec![i]),
+        }
+    }
+    let groups: Vec<Group<'_>> = members.iter().map(|m| Group {
+        history: inputs[m[0]].history,
+        confidence: inputs[m[0]].history.confidence(inputs[m[0]].features.unwrap_or(&[])),
+        room: m.iter().map(|&i| inputs[i].limit).min().unwrap_or(0),
+        members: m.len(),
+    }).collect();
+    let others: Vec<_> = inputs.iter().filter(|i| i.features.is_none()).map(|i| i.key).collect();
+    let distinct = others.iter().collect::<std::collections::HashSet<_>>().len();
+    for (m, n) in members.iter().zip(plan(&groups, (others.len(), distinct), cost)) {
+        for &i in m {
+            counts[i] = n;
+        }
+    }
+    counts
+}
+
+/// Longest run of steps without a draft step after plans that verified none.
+const MAX_DRAFT_SKIP: usize = 8;
+
+/// After plans that verify no drafts, skip drafting for a while (doubling up
+/// to `MAX_DRAFT_SKIP` steps): a draft step costs about a verified row.
+#[derive(Debug, Clone)]
+pub(crate) struct DraftSkip {
+    skip: usize,
+    next: usize,
+}
+
+impl Default for DraftSkip {
+    fn default() -> Self {
+        Self { skip: 0, next: 1 }
+    }
+}
+
+impl DraftSkip {
+    /// Whether this step drafts.
+    pub fn drafts(&self) -> bool {
+        self.skip == 0
+    }
+
+    /// After planning a step: `drafted` when it drafted, `none_planned` when
+    /// the plan verifies no drafts (adaptive plans only).
+    pub fn after(&mut self, drafted: bool, none_planned: bool) {
+        if self.skip > 0 {
+            self.skip -= 1;
+        } else if drafted {
+            if none_planned {
+                self.skip = self.next;
+                self.next = (self.next * 2).min(MAX_DRAFT_SKIP);
+            } else {
+                self.next = 1;
+            }
+        }
+    }
+}
+
 /// GLM-5.3 EXL3 K4, 1 RTX PRO 6000 (325 W) + 4 Sparks TP4: verify step ms by rows.
 pub(crate) const K4_TP4_STEP_MS: [(usize, f64); 15] = [(1, 35.6), (2, 50.5), (3, 62.4), (4, 73.6), (5, 83.2),
     (6, 93.1), (7, 102.2), (8, 111.8), (10, 128.1), (12, 146.7), (16, 173.6), (24, 220.8), (32, 260.2), (48, 342.5),

@@ -1,4 +1,4 @@
-//! GLM 5.3 DFlash2 drafter kernels (`native/cuda/kernels/glm_dflash.cu`) and
+//! DFlash2 drafter kernels (GLM 5.3 and GLM 5.3 Flash) (`native/cuda/kernels/glm_dflash.cu`) and
 //! the cuBLAS BF16 linear its GEMMs use. Every pointer is device memory of
 //! the documented shape on the stream's device; the stream orders them.
 use crate::NativeLibrary;
@@ -91,19 +91,20 @@ impl NativeLibrary {
         Ok(usize::try_from(unsafe { f(i(sequences)?, i(kv_heads)?, i(max_keys)?) })?)
     }
 
-    /// Non-causal block attention over each sequence's ring context and block.
+    /// Non-causal block attention over each sequence's ring context and block;
+    /// `window` > 0 limits each block row to context positions within it.
     ///
     /// # Safety
     /// As [`Self::linear_bf16`]; the I32 tables hold one entry per sequence.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn glm_dflash_attention(&self, q: P, k_block: P, v_block: P, k_ring: P, v_ring: P, seq_slots: P,
         ctx_lengths: P, ctx_ends: P, out: M, workspace: M, sequences: usize, block_rows: usize, heads: usize,
-        kv_heads: usize, ring: usize, max_keys: usize, scale: f32, stream: M) -> Result<()> {
-        type F = unsafe extern "C" fn(P, P, P, P, P, P, P, P, M, M, i32, i32, i32, i32, i32, i32, f32, M) -> i32;
+        kv_heads: usize, ring: usize, max_keys: usize, window: usize, scale: f32, stream: M) -> Result<()> {
+        type F = unsafe extern "C" fn(P, P, P, P, P, P, P, P, M, M, i32, i32, i32, i32, i32, i32, i32, f32, M) -> i32;
         let f = *unsafe { self.lib.get::<F>(b"cuteafd_glm_dflash_attention") }?;
         check(unsafe {
             f(q, k_block, v_block, k_ring, v_ring, seq_slots, ctx_lengths, ctx_ends, out, workspace, i(sequences)?,
-                i(block_rows)?, i(heads)?, i(kv_heads)?, i(ring)?, i(max_keys)?, scale, stream)
+                i(block_rows)?, i(heads)?, i(kv_heads)?, i(ring)?, i(max_keys)?, i(window)?, scale, stream)
         }, "attention")
     }
 
@@ -166,5 +167,18 @@ impl NativeLibrary {
         type F = unsafe extern "C" fn(P, M, i32, i32, i32, i32, M) -> i32;
         let f = *unsafe { self.lib.get::<F>(b"cuteafd_glm_dflash_tap") }?;
         check(unsafe { f(src, dst, i(rows)?, i(width)?, i(stride)?, i(offset)?, stream) }, "tap")
+    }
+
+    /// `dst[row, offset..offset + width] = bf16(mean of the row's hc streams)`
+    /// for `src` [rows, hc, width] BF16 (the mHC contraction DFlash2 taps).
+    ///
+    /// # Safety
+    /// As [`Self::linear_bf16`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn glm_dflash_tap_mean(&self, src: P, dst: M, rows: usize, width: usize, hc: usize, stride: usize,
+        offset: usize, stream: M) -> Result<()> {
+        type F = unsafe extern "C" fn(P, M, i32, i32, i32, i32, i32, M) -> i32;
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_glm_dflash_tap_mean") }?;
+        check(unsafe { f(src, dst, i(rows)?, i(width)?, i(hc)?, i(stride)?, i(offset)?, stream) }, "tap mean")
     }
 }

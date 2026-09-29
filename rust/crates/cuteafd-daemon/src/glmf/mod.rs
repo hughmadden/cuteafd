@@ -3,6 +3,7 @@
 pub(crate) mod engine;
 pub(crate) mod fp8;
 pub(crate) mod serve;
+mod speculate;
 pub(crate) mod weights;
 
 use anyhow::{ensure, Result};
@@ -83,6 +84,13 @@ pub(crate) struct EngineArgs {
     /// memory decides first).
     #[arg(long, default_value_t = 64)]
     pub exl3_window: usize,
+    /// DFlash2 drafter snapshot (incoai/GLM-5.3-Flash-DFlash2): taps the mHC
+    /// stream mean after its target layers and drafts on this GPU.
+    #[arg(long)]
+    pub draft: Option<PathBuf>,
+    /// Sequences the drafter keeps a context for and drafts for at once.
+    #[arg(long, default_value_t = 8)]
+    pub draft_sequences: usize,
 }
 
 #[derive(Debug, clap::Args)]
@@ -99,6 +107,10 @@ pub(crate) struct GoldenArgs {
     pub prefill: Option<usize>,
     #[arg(long, default_value_t = 1)]
     pub step_rows: usize,
+    /// Decode steps run speculatively (KDA state untouched, replay rows
+    /// recorded) and then commit every row: the verify-by-replay path.
+    #[arg(long)]
+    pub spec_steps: bool,
     /// Feed each layer the golden output of the previous one (prefill only),
     /// so every layer's cosine measures that layer alone.
     #[arg(long)]
@@ -117,6 +129,28 @@ pub(crate) struct GoldenArgs {
     /// tokens) on fresh sequences, without layer downloads.
     #[arg(long, default_value_t = 0)]
     pub bench_prefill: usize,
+    /// With --draft: run only the drafter on the golden taps (the layers'
+    /// stream means) and compare with python/reference/glm_dflash2/reference.py's
+    /// output directory.
+    #[arg(long)]
+    pub draft_oracle: Option<PathBuf>,
+    /// With --draft: after the --prefill tokens, decode N greedy tokens one row
+    /// per step, drafting before each, and report how many drafts the target
+    /// reproduced (0: teacher-forced on tokens.bin, scoring against it).
+    #[arg(long)]
+    pub generate: Option<usize>,
+    /// Verify-by-replay check: after --prefill tokens, for every kept count k
+    /// in 1..=N, compare the KDA state after one speculative N-row verify
+    /// committing k rows with the state after k serial single-row steps (and
+    /// after a plain N-row verify for k = N); then time spec + commit.
+    #[arg(long)]
+    pub replay_check: Option<usize>,
+    /// Time verify steps of 1..=N rows per sequence (C sequences, see
+    /// --bench-sequences) after --prefill tokens: the step cost by rows.
+    #[arg(long)]
+    pub bench_verify: Option<usize>,
+    #[arg(long, default_value_t = 1)]
+    pub bench_sequences: usize,
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -183,6 +217,18 @@ impl Opened {
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages, args.slots)?;
         engine.full_prefill_logits = args.full_prefill_logits;
+        if let Some(snapshot) = &args.draft {
+            let started = Instant::now();
+            let cfg = crate::glm::dflash::DflashConfig::read(snapshot)?;
+            ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
+                && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash2 drafter does not fit this target");
+            let mask = embed_rows(&self.checkpoint, &[cfg.mask_token], self.cfg.hidden)?;
+            let file = crate::glm::dflash::prefetch(snapshot).join()
+                .map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
+            engine.drafter = Some(crate::glm::dflash::GlmDrafter::load(&self.library, snapshot, file, stream,
+                args.draft_sequences, args.draft_sequences, mask, true)?);
+            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash2 drafter resident");
+        }
         if (0..layers).any(|l| !self.cfg.dense[l]) {
             if let Some(experts) = self.experts(args)? {
                 engine.set_experts(experts);
@@ -307,6 +353,18 @@ fn score(logits: &[f32], golden: &[f32], tokens: &[u32], first: usize, vocab: us
 }
 
 fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_>) -> Result<()> {
+    if let Some(dir) = &args.draft_oracle {
+        return speculate::draft_oracle(args, opened, engine, dir);
+    }
+    if let Some(rows) = args.replay_check {
+        return speculate::replay_check(args, opened, engine, rows);
+    }
+    if let Some(rows) = args.bench_verify {
+        return speculate::bench_verify(args, opened, engine, rows);
+    }
+    if engine.drafter.is_some() {
+        return speculate::draft_run(args, opened, engine);
+    }
     let cfg = &opened.cfg;
     let layers = engine.weights.layers.len();
     ensure!(!args.nll || engine.full_prefill_logits, "--nll needs full prefill logits");
@@ -376,8 +434,15 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         let mut compare_layer = |layer, streams: &[u8]| compare(layer, first, streams, &mut decode_worst);
         let on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>> =
             if args.logits_only { None } else { Some(&mut compare_layer) };
-        if let Some(logits) = engine.verify(&mut [(&mut placement, n)], &embed[position * row..(position + n) * row],
-            on_layer)? {
+        let step = &embed[position * row..(position + n) * row];
+        let logits = if args.spec_steps {
+            let logits = engine.verify_spec(&mut [(&mut placement, n)], step)?;
+            engine.commit(&[(placement.slot, 0, n)])?;
+            logits
+        } else {
+            engine.verify(&mut [(&mut placement, n)], step, on_layer)?
+        };
+        if let Some(logits) = logits {
             decode_logits.extend(logits);
         }
         position += n;

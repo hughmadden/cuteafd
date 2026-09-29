@@ -8,7 +8,11 @@
 //!
 //! Attention: KDA layers keep per-sequence recurrent state (FP32
 //! `[64, 128, 128]`) and short-conv state (the last three q/k/v inputs) in
-//! slot pools, one slot per sequence shared by every KDA layer; MLA layers
+//! slot pools, one slot per sequence shared by every KDA layer (every KDA
+//! layer's pool back to back, so `glmf_kda_commit` reaches all of them in one
+//! launch). A speculative verify step (`verify_spec`) leaves that state alone
+//! and records each row's replay inputs; `commit` then applies the accepted
+//! rows with the recurrent step's own arithmetic. MLA layers
 //! keep FP8 528-byte latent records in 64-row pages, and their DSA indexer
 //! keeps per-token BF16 keys and gates beside the records and one FP8 key
 //! per completed 4-token pool in pool pages (64 pools per page). The
@@ -45,6 +49,15 @@ pub(crate) const SPARSE_TOPK: usize = 2112;
 const FP8_ROWS: i32 = 16;
 /// FP8 latent record bytes (512 E4M3 + 4 FP32 group scales).
 const RECORD_BYTES: usize = 528;
+/// Rows a speculative step records per KDA layer (`REPLAY_ROWS` of the fork's
+/// `_glmf_kernels.py`; the decode programs' rows).
+const REPLAY_ROWS: usize = DECODE_ROWS;
+
+/// Bytes of one KDA layer's replay record (`kda_replay_layout`): k | decay | v
+/// FP32 per row and head, beta FP32, the q/k/v in-projection row BF16.
+fn replay_bytes(heads: usize, channels: usize) -> usize {
+    REPLAY_ROWS * heads * 3 * 128 * 4 + REPLAY_ROWS * heads * 4 + REPLAY_ROWS * channels * 2
+}
 const MAX_RANKS: usize = 6;
 const HC: usize = 4;
 
@@ -149,6 +162,8 @@ struct StepTables {
     pool_width: usize,
     /// Whether any row sees more than 2051 tokens (the pool top-k runs).
     long: bool,
+    /// A speculative verify: KDA state stays, replay rows are recorded.
+    spec: bool,
 }
 
 /// Tokens per DSA index pool, and pools per pool-cache page.
@@ -278,10 +293,20 @@ pub(crate) struct GlmfEngine<'a> {
     pub prefill_rows: usize,
     pub pages: usize,
     pub slots: usize,
-    /// Per layer: the latent record pool (MLA) or the conv state pool (KDA).
-    kv: Vec<Dev<'a>>,
-    /// Per KDA layer (None for MLA): the FP32 recurrent state pool.
-    state: Vec<Option<Dev<'a>>>,
+    /// Per MLA layer (None for KDA): the latent record pool.
+    kv: Vec<Option<Dev<'a>>>,
+    /// Per layer: its index among the KDA layers (None for MLA).
+    kda_ordinal: Vec<Option<usize>>,
+    /// Every KDA layer's pools back to back: FP32 recurrent state
+    /// `[layers, slots, 64, 128, 128]`, BF16 conv state `[layers, slots, 3, 3D]`
+    /// and the speculative replay records (`replay_bytes` per layer).
+    kda_state: Dev<'a>,
+    kda_conv: Dev<'a>,
+    kda_replay: Dev<'a>,
+    /// `glmf_kda_commit` tables (slot, first row, kept rows per sequence).
+    commit_tables: Dev<'a>,
+    /// The DFlash2 drafter: every step taps its target layers.
+    pub drafter: Option<crate::glm::dflash::GlmDrafter<'a>>,
     /// Per MLA layer (None for KDA): per-token indexer keys | gates (BF16
     /// [record slots, 256]) and the FP8 pool-key cache.
     index: Vec<Option<(Dev<'a>, Dev<'a>)>>,
@@ -311,6 +336,7 @@ pub(crate) struct GlmfEngine<'a> {
 struct GraphKey {
     segment: usize,
     rows: usize,
+    spec: bool,
     long: bool,
     pool_width: usize,
     page_stride: usize,
@@ -345,24 +371,30 @@ impl<'a> GlmfEngine<'a> {
         let d = cfg.kda_heads * cfg.kda_head_dim;
         let pool_pages = pages.div_ceil(KPOOL);
         let mut kv = Vec::new();
-        let mut state = Vec::new();
+        let mut kda_ordinal = Vec::new();
         let mut index = Vec::new();
+        let mut kda_layers = 0;
         for layer in &weights.layers {
             match layer.attention {
                 GlmNextAttention::Mla => {
-                    kv.push(zeroed(pages * PAGE_ROWS * RECORD_BYTES)?);
-                    state.push(None);
+                    kv.push(Some(zeroed(pages * PAGE_ROWS * RECORD_BYTES)?));
+                    kda_ordinal.push(None);
                     index.push(Some((zeroed(pages * PAGE_ROWS * 512)?, zeroed(pool_pages * PAGE_ROWS * 132)?)));
                 }
                 GlmNextAttention::Kda => {
-                    kv.push(zeroed(slots * 3 * 3 * d * 2)?);
-                    state.push(Some(zeroed(slots * d * cfg.kda_head_dim * 4)?));
+                    kv.push(None);
+                    kda_ordinal.push(Some(kda_layers));
+                    kda_layers += 1;
                     index.push(None);
                 }
             }
         }
+        let kda_state = zeroed(kda_layers * slots * d * cfg.kda_head_dim * 4)?;
+        let kda_conv = zeroed(kda_layers * slots * 3 * 3 * d * 2)?;
+        let kda_replay = zeroed(kda_layers * replay_bytes(cfg.kda_heads, 3 * d))?;
         let pool_logical = zeroed(pool_pages * 4)?;
-        Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, slots, kv, state, index,
+        Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, slots, kv, kda_ordinal,
+            kda_state, kda_conv, kda_replay, commit_tables: zeroed(3 * DECODE_ROWS * 4)?, drafter: None, index,
             pool_logical, pool_pages, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
             experts: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(std::collections::HashMap::new()),
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
@@ -400,43 +432,77 @@ impl<'a> GlmfEngine<'a> {
     pub fn copy_slot(&self, from: i32, to: i32) -> Result<()> {
         let (from, to) = (usize::try_from(from)?, usize::try_from(to)?);
         ensure!(from < self.slots && to < self.slots && from != to, "KDA slots {from} -> {to} out of range");
-        for (kv, state) in self.kv.iter().zip(&self.state) {
-            if let Some(state) = state {
-                for pool in [kv, state] {
-                    let per = pool.buffer.bytes / self.slots;
-                    let at = |slot: usize| cuteafd_ffi::CuteafdDeviceBuffer {
-                        // SAFETY: slot < slots, so the slot's bytes lie inside the pool.
-                        ptr: unsafe { pool.buffer.ptr.cast::<u8>().add(slot * per) }.cast(),
-                        bytes: per,
-                        ..pool.buffer
-                    };
-                    // SAFETY: both slot regions are live and disjoint; the stream orders the copy.
-                    unsafe { self.library.copy_d2d_async(at(to), at(from), per, self.stream)? };
-                }
-            }
+        for (at_from, at_to) in self.slot_regions(from).into_iter().zip(self.slot_regions(to)) {
+            // SAFETY: both slot regions are live and disjoint; the stream orders the copy.
+            unsafe { self.library.copy_d2d_async(at_to, at_from, at_from.bytes, self.stream)? };
         }
         Ok(())
+    }
+
+    /// Every KDA layer's recurrent and conv state regions of `slot`.
+    fn slot_regions(&self, slot: usize) -> Vec<cuteafd_ffi::CuteafdDeviceBuffer> {
+        let layers = self.kda_ordinal.iter().flatten().count().max(1);
+        let mut out = Vec::new();
+        for pool in [&self.kda_state, &self.kda_conv] {
+            let per = pool.buffer.bytes / layers / self.slots;
+            for layer in 0..layers {
+                out.push(cuteafd_ffi::CuteafdDeviceBuffer {
+                    // SAFETY: layer < layers and slot < slots: the region lies inside the pool.
+                    ptr: unsafe { pool.buffer.ptr.cast::<u8>().add((layer * self.slots + slot) * per) }.cast(),
+                    bytes: per,
+                    ..pool.buffer
+                });
+            }
+        }
+        out
     }
 
     /// Zeroes a sequence's KDA recurrent and conv state (before its first step).
     pub fn reset_slot(&self, slot: i32) -> Result<()> {
         let slot = usize::try_from(slot)?;
         ensure!(slot < self.slots, "KDA slot {slot} out of range");
-        for (kv, state) in self.kv.iter().zip(&self.state) {
-            if let Some(state) = state {
-                for pool in [kv, state] {
-                    let per = pool.buffer.bytes / self.slots;
-                    let at = cuteafd_ffi::CuteafdDeviceBuffer {
-                        // SAFETY: slot < slots, so the slot's bytes lie inside the pool.
-                        ptr: unsafe { pool.buffer.ptr.cast::<u8>().add(slot * per) }.cast(),
-                        bytes: per,
-                        ..pool.buffer
-                    };
-                    self.library.cuda_zero_bytes(at, per)?;
-                }
-            }
+        for region in self.slot_regions(slot) {
+            self.library.cuda_zero_bytes(region, region.bytes)?;
         }
         Ok(())
+    }
+
+    /// Every KDA layer's recurrent then conv state of `slot` (host copy; checks).
+    pub fn slot_state(&self, slot: i32) -> Result<Vec<u8>> {
+        let slot = usize::try_from(slot)?;
+        ensure!(slot < self.slots, "KDA slot {slot} out of range");
+        // SAFETY: the engine owns this stream.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        let mut out = Vec::new();
+        for region in self.slot_regions(slot) {
+            let mut bytes = vec![0u8; region.bytes];
+            self.library.copy_d2h(&mut bytes, region)?;
+            out.extend(bytes);
+        }
+        Ok(out)
+    }
+
+    /// After a speculative verify step (`verify_spec`): applies each
+    /// sequence's first `keep` rows (from step row `first`) to the KDA state
+    /// of `slot` in every layer, as serial steps over those rows would have.
+    pub fn commit(&self, sequences: &[(i32, usize, usize)]) -> Result<()> {
+        if sequences.is_empty() {
+            return Ok(());
+        }
+        ensure!(sequences.len() <= DECODE_ROWS && sequences.iter().all(|&(slot, first, keep)|
+            slot >= 0 && (slot as usize) < self.slots && first + keep <= REPLAY_ROWS), "commit of {sequences:?}");
+        let n = sequences.len();
+        let mut tables = vec![0i32; 3 * n];
+        for (i, &(slot, first, keep)) in sequences.iter().enumerate() {
+            tables[i] = slot;
+            tables[n + i] = first as i32;
+            tables[2 * n + i] = keep as i32;
+        }
+        self.put(&self.commit_tables, &tables)?;
+        let layers = self.kda_ordinal.iter().flatten().count();
+        self.run("kda_commit", &[("state", self.kda_state.buffer.ptr), ("conv_state", self.kda_conv.buffer.ptr),
+            ("replay", self.kda_replay.buffer.ptr), ("tables", self.commit_tables.buffer.ptr)],
+            &[Dsv4Scalar::I32(n as i32), Dsv4Scalar::I32(layers as i32), Dsv4Scalar::I32(self.slots as i32)])
     }
 
     fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
@@ -580,9 +646,25 @@ impl<'a> GlmfEngine<'a> {
 
     /// Appends each sequence's tokens (one for decode, several for a verify)
     /// at its length in one decode-shaped step; returns every row's logits.
-    /// KDA state advances in place: a caller rejecting a suffix must replay.
+    /// KDA state advances in place: a caller rejecting a suffix must replay
+    /// (or verify with [`Self::verify_spec`] and commit what it keeps).
     pub fn verify(&self, sequences: &mut [(&mut GlmfPlacement, usize)], embed: &[u8],
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<Vec<f32>>> {
+        self.decode_step(sequences, embed, on_layer, false)
+    }
+
+    /// A speculative verify: as [`Self::verify`], but the KDA state stays at
+    /// every sequence's start and each row's replay inputs are recorded; the
+    /// caller then passes every sequence's kept rows to [`Self::commit`]
+    /// (MLA records past a sequence's kept length are rewritten by later
+    /// steps). Placements advance by all rows; callers set the kept length.
+    pub fn verify_spec(&self, sequences: &mut [(&mut GlmfPlacement, usize)], embed: &[u8])
+        -> Result<Option<Vec<f32>>> {
+        self.decode_step(sequences, embed, None, true)
+    }
+
+    fn decode_step(&self, sequences: &mut [(&mut GlmfPlacement, usize)], embed: &[u8],
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>, spec: bool) -> Result<Option<Vec<f32>>> {
         let rows: usize = sequences.iter().map(|(_, n)| n).sum();
         ensure!(rows > 0 && rows <= DECODE_ROWS && embed.len() == rows * self.cfg.hidden * 2, "decode step of {rows} rows");
         // Power-of-two strides and widths bound the graphs a growing batch captures.
@@ -590,7 +672,7 @@ impl<'a> GlmfEngine<'a> {
             .min(self.pages);
         let pool_stride = sequences.iter().map(|(p, _)| p.pool_pages.len()).max().unwrap_or(1).next_power_of_two()
             .min(self.pool_pages);
-        let mut tables = StepTables { decode: true, page_stride, pool_stride, ..Default::default() };
+        let mut tables = StepTables { decode: true, page_stride, pool_stride, spec, ..Default::default() };
         for (placement, count) in sequences.iter() {
             if placement.len == 0 {
                 self.start(placement)?;
@@ -654,7 +736,7 @@ impl<'a> GlmfEngine<'a> {
         self.pre(w, &w.streams[cur], &layers[0], rows)?;
         for (index, layer) in layers.iter().enumerate() {
             match layer.attention {
-                GlmNextAttention::Kda => self.kda(w, index, layer, rows, cap)?,
+                GlmNextAttention::Kda => self.kda(w, index, layer, rows, cap, tables.spec)?,
                 GlmNextAttention::Mla => self.mla(w, index, layer, rows, cap, tables)?,
             }
             // Attention back into the streams, then the FFN site's collapse + norm.
@@ -676,6 +758,10 @@ impl<'a> GlmfEngine<'a> {
                         ("out", w.streams[cur ^ 1].buffer.ptr)], &[rows])?;
                     cur ^= 1;
                 }
+            }
+            if let Some(drafter) = &self.drafter {
+                let n = t.min(crate::glm::dflash::TAP_ROWS);
+                drafter.tap_streams(index, w.streams[cur].buffer.ptr, HC, t - n, n)?;
             }
             if let Some(on_layer) = on_layer.as_mut() {
                 on_layer(index, &self.download(&w.streams[cur], t * HC * row)?)?;
@@ -711,21 +797,28 @@ impl<'a> GlmfEngine<'a> {
         -> Result<Option<Vec<f32>>> {
         let layers = &self.weights.layers;
         for index in 0..=layers.len() {
-            let key = GraphKey { segment: index, rows: t, long: tables.long, pool_width: tables.pool_width,
-                page_stride: tables.page_stride, pool_stride: tables.pool_stride };
+            let key = GraphKey { segment: index, rows: t, spec: tables.spec, long: tables.long,
+                pool_width: tables.pool_width, page_stride: tables.page_stride, pool_stride: tables.pool_stride };
             self.replay(key, || -> Result<()> {
+                // Layer `index - 1`'s output streams land in buffer 0 first thing.
+                let tap = || match (&self.drafter, index.checked_sub(1)) {
+                    (Some(drafter), Some(previous)) => drafter.tap_streams(previous, w.streams[0].buffer.ptr, HC, 0, t),
+                    _ => Ok(()),
+                };
                 let Some(layer) = layers.get(index) else {
-                    return self.run("mhc_post", &[("x", w.delta.buffer.ptr), ("residual", w.streams[1].buffer.ptr),
+                    self.run("mhc_post", &[("x", w.delta.buffer.ptr), ("residual", w.streams[1].buffer.ptr),
                         ("prev_post", w.post.buffer.ptr), ("prev_comb", w.comb.buffer.ptr),
-                        ("out", w.streams[0].buffer.ptr)], &[rows]);
+                        ("out", w.streams[0].buffer.ptr)], &[rows])?;
+                    return tap();
                 };
                 if index == 0 {
                     self.pre(w, &w.streams[0], layer, rows)?;
                 } else {
                     self.post_pre(w, 1, layer, "attn", "input_norm", rows, "m64")?;
+                    tap()?;
                 }
                 match layer.attention {
-                    GlmNextAttention::Kda => self.kda(w, index, layer, rows, "m64")?,
+                    GlmNextAttention::Kda => self.kda(w, index, layer, rows, "m64", tables.spec)?,
                     GlmNextAttention::Mla => self.mla(w, index, layer, rows, "m64", tables)?,
                 }
                 self.post_pre(w, 0, layer, "ffn", "post_norm", rows, "m64")?;
@@ -813,8 +906,17 @@ impl<'a> GlmfEngine<'a> {
             ("scratch", w.scratch.buffer.ptr)], &[rows])
     }
 
-    fn kda(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Dsv4Scalar, cap: &str) -> Result<()> {
-        let state = self.state[index].as_ref().context("KDA layer without a state pool")?;
+    fn kda(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Dsv4Scalar, cap: &str, spec: bool)
+        -> Result<()> {
+        let ordinal = self.kda_ordinal[index].context("KDA layer without a state pool")?;
+        let at = |pool: &Dev<'_>, per: usize| -> *mut c_void {
+            // SAFETY: ordinal < KDA layers, so the layer's region lies inside the pool.
+            unsafe { pool.buffer.ptr.cast::<u8>().add(ordinal * per) }.cast()
+        };
+        let d = self.cfg.kda_heads * self.cfg.kda_head_dim;
+        let conv_state = at(&self.kda_conv, self.slots * 3 * 3 * d * 2);
+        let state = at(&self.kda_state, self.slots * d * self.cfg.kda_head_dim * 4);
+        let replay = at(&self.kda_replay, replay_bytes(self.cfg.kda_heads, 3 * d));
         let mut pointers = vec![("x", w.x.buffer.ptr), ("w_in", layer.ptr("w_in")?)];
         let decode = cap == "m64";
         if decode {
@@ -826,10 +928,17 @@ impl<'a> GlmfEngine<'a> {
         if decode {
             pointers.extend([("w_o_fp8", layer.ptr_or("w_o_fp8", "w_o")?), ("w_o_scale", layer.ptr_or("w_o_scale", "w_o")?)]);
         }
-        pointers.extend([("conv_state", self.kv[index].buffer.ptr), ("state", state.buffer.ptr),
-            ("slots", w.kda_slots.buffer.ptr), ("seq_first", w.seq_first.buffer.ptr), ("out", w.delta.buffer.ptr),
-            ("scratch", w.scratch.buffer.ptr)]);
-        self.run(&format!("kda_{cap}"), &pointers, &self.fp8_scalars(rows, decode, layer.has("w_in_fp8")))
+        pointers.extend([("conv_state", conv_state), ("state", state), ("slots", w.kda_slots.buffer.ptr),
+            ("seq_first", w.seq_first.buffer.ptr), ("out", w.delta.buffer.ptr)]);
+        let mut scalars = self.fp8_scalars(rows, decode, layer.has("w_in_fp8"));
+        if decode {
+            pointers.push(("replay", replay));
+            scalars.push(Dsv4Scalar::I32(i32::from(spec)));
+        } else {
+            ensure!(!spec, "speculative steps are decode-shaped");
+        }
+        pointers.push(("scratch", w.scratch.buffer.ptr));
+        self.run(&format!("kda_{cap}"), &pointers, &scalars)
     }
 
     /// `[rows]`, plus the decode programs' `fp8_rows` (16 when the layer has the FP8 copy, else 0).
@@ -862,7 +971,7 @@ impl<'a> GlmfEngine<'a> {
     fn mla(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Dsv4Scalar, cap: &str,
         tables: &StepTables) -> Result<()> {
         let mode = if tables.decode { "decode" } else { "prefill" };
-        let cache = self.kv[index].buffer.ptr;
+        let cache = self.kv[index].as_ref().context("MLA layer without a record pool")?.buffer.ptr;
         let (keys, pool_cache) = self.index[index].as_ref().context("MLA layer without an index cache")?;
         let decode = tables.decode;
         let fp8 = layer.has("w_qkv_a_fp8");

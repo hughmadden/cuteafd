@@ -1,5 +1,6 @@
-// GLM 5.3 DFlash2 drafter (incoai/GLM-5.3-DFlash2): the non-GEMM pieces of
-// the context update, the six-layer block body and the candidate selector.
+// DFlash2 drafters (incoai/GLM-5.3-DFlash2, incoai/GLM-5.3-Flash-DFlash2): the
+// non-GEMM pieces of the context update, the block body and the candidate
+// selector.
 // GEMMs run through cuBLAS (cuteafd_cuda_linear_bf16_cublas_async); the
 // vocabulary head is the engine's.
 //
@@ -150,20 +151,24 @@ __global__ void qk_rope_kernel(const bf16* qkv, const bf16* q_norm, const bf16* 
 }
 
 // Block attention: every block row sees the sequence's last `ctx[s]` context
-// entries (ring slots) and the whole block (non-causal). One CTA per
-// (key chunk, kv head, sequence) handles the 8 query heads x block rows that
-// share the kv head; a second pass merges the chunks.
+// entries (ring slots) and the whole block (non-causal); with `window` > 0,
+// block row r at position end + r sees only context positions within
+// `window` of it (the sliding window's |p - q| < window). One CTA per
+// (key chunk, kv head, sequence) handles the query heads x block rows that
+// share the kv head (at most 64; fewer leave threads idle); a second pass
+// merges the chunks.
 constexpr int kAttnThreads = 256;
 constexpr int kChunk = 128;
 constexpr int kTile = 32;
-constexpr int kQueries = 64;  // query heads per kv head (8) x block rows (8)
+constexpr int kQueries = 64;  // most query heads per kv head x block rows
 
 __global__ void attention_partial_kernel(const bf16* q, const bf16* k_block, const bf16* v_block, const bf16* k_ring,
                                          const bf16* v_ring, const int32_t* seq_slots, const int32_t* ctx_lengths,
                                          const int32_t* ctx_ends, float* partial_o, float* partial_ml, int ring,
-                                         int heads, int kv_heads, int block_rows, int chunks, float scale) {
+                                         int heads, int kv_heads, int block_rows, int chunks, float scale,
+                                         int window) {
   const int chunk = blockIdx.x, kvh = blockIdx.y, s = blockIdx.z;
-  const int group = heads / kv_heads;
+  const int group = heads / kv_heads, queries = group * block_rows;
   const int ctx = ctx_lengths[s], end = ctx_ends[s], total = ctx + block_rows;
   const int first = chunk * kChunk, last = min(total, first + kChunk);
   const int t = threadIdx.x, query = t / 4, sub = t % 4;
@@ -185,8 +190,10 @@ __global__ void attention_partial_kernel(const bf16* q, const bf16* k_block, con
   for (int i = t; i < kQueries * kHeadDim; i += kAttnThreads) {
     const int qi = i / kHeadDim, d = i % kHeadDim;
     const int row = qi / group, head = kvh * group + qi % group;
-    qs[qi][d] = q[((uint64_t(s) * block_rows + row) * heads + head) * kHeadDim + d];
+    qs[qi][d] = qi < queries ? q[((uint64_t(s) * block_rows + row) * heads + head) * kHeadDim + d] : bf16(0.0f);
   }
+  // Context positions below `lowest` are outside this query row's window.
+  const int lowest = window > 0 ? end + min(query / group, block_rows - 1) - window + 1 : INT32_MIN;
   float m = -CUDART_INF_F, l = 0, acc[32];
 #pragma unroll
   for (int d = 0; d < 32; ++d) acc[d] = 0;
@@ -229,17 +236,20 @@ __global__ void attention_partial_kernel(const bf16* q, const bf16* k_block, con
         dot = fmaf(a.x, b.x, dot);
         dot = fmaf(a.y, b.y, dot);
       }
-      score[j] = key < n ? dot * scale : -CUDART_INF_F;
+      const int j_key = tile + key;
+      const bool visible = key < n && (j_key >= ctx || end - ctx + j_key >= lowest);
+      score[j] = visible ? dot * scale : -CUDART_INF_F;
       tile_max = fmaxf(tile_max, score[j]);
     }
     tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffffu, tile_max, 1));
     tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffffu, tile_max, 2));
     const float m_new = fmaxf(m, tile_max);
-    const float factor = expf(m - m_new);
+    // A tile the window hides entirely leaves m at -inf: nothing to scale or add.
+    const float factor = m_new == -CUDART_INF_F ? 1.0f : expf(m - m_new);
     float tile_sum = 0;
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-      const float p = expf(score[j] - m_new);
+      const float p = m_new == -CUDART_INF_F ? 0.0f : expf(score[j] - m_new);
       tile_sum += p;
       ps[query][sub * 8 + j] = r(p);
     }
@@ -274,6 +284,7 @@ __global__ void attention_merge_kernel(const float* partial_o, const float* part
   const int query = blockIdx.x, kvh = blockIdx.y, s = blockIdx.z, d = threadIdx.x;
   const int group = heads / kv_heads;
   const uint64_t base = (uint64_t(s) * kv_heads + kvh) * chunks;
+  // Every query sees its own block rows, so some chunk has a finite max.
   float m = -CUDART_INF_F;
   for (int c = 0; c < chunks; ++c) m = fmaxf(m, partial_ml[((base + c) * kQueries + query) * 2]);
   float l = 0, o = 0;
@@ -454,6 +465,17 @@ __global__ void tap_kernel(const bf16* src, bf16* dst, int width, int stride, in
     *reinterpret_cast<uint4*>(dst + row * stride + offset + i) = *reinterpret_cast<const uint4*>(src + row * width + i);
 }
 
+// dst[row, offset : offset + width] = bf16(mean over `hc` of src[row, i, :]) (the
+// mHC stream contraction; FP32 sum in stream order, then the division).
+__global__ void tap_mean_kernel(const bf16* src, bf16* dst, int width, int hc, int stride, int offset) {
+  const uint64_t row = blockIdx.y;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < width; i += gridDim.x * blockDim.x) {
+    float sum = 0;
+    for (int k = 0; k < hc; ++k) sum += f(src[(row * hc + k) * width + i]);
+    dst[row * stride + offset + i] = __float2bfloat16(sum / float(hc));
+  }
+}
+
 inline int grid_for(uint64_t total, int threads) {
   const uint64_t blocks = (total + threads - 1) / threads;
   return int(blocks < 8192 ? (blocks ? blocks : 1) : 8192);
@@ -520,17 +542,20 @@ extern "C" uint64_t cuteafd_glm_dflash_attention_workspace(int32_t sequences, in
 
 // out [sequences * block_rows, heads * 128] = softmax(q k^T * scale) v over each
 // sequence's context entries (ring slots seq_slots[s] * ring + position % ring
-// for positions ctx_ends[s] - ctx_lengths[s] .. ctx_ends[s] - 1) and its block
-// rows (k_block/v_block [rows, kv_heads, 128]). heads / kv_heads * block_rows
-// must be 64; max_keys bounds ctx_lengths + block_rows.
+// for positions ctx_ends[s] - ctx_lengths[s] .. ctx_ends[s] - 1; with window > 0
+// only those within `window` of the block row's position ctx_ends[s] + row) and
+// its block rows (k_block/v_block [rows, kv_heads, 128]). heads / kv_heads *
+// block_rows must be at most 64; max_keys bounds ctx_lengths + block_rows.
 extern "C" int32_t cuteafd_glm_dflash_attention(const void* q, const void* k_block, const void* v_block,
                                                 const void* k_ring, const void* v_ring, const void* seq_slots,
                                                 const void* ctx_lengths, const void* ctx_ends, void* out,
                                                 void* workspace, int32_t sequences, int32_t block_rows,
                                                 int32_t heads, int32_t kv_heads, int32_t ring, int32_t max_keys,
-                                                float scale, void* stream) {
-  if (sequences < 1 || kv_heads < 1 || heads % kv_heads || heads / kv_heads * block_rows != kQueries)
+                                                int32_t window, float scale, void* stream) {
+  if (sequences < 1 || kv_heads < 1 || heads % kv_heads || heads / kv_heads * block_rows > kQueries ||
+      window < 0)
     return cudaErrorInvalidValue;
+  const int queries = heads / kv_heads * block_rows;
   const int chunks = (max_keys + kChunk - 1) / kChunk;
   auto* o = static_cast<float*>(workspace);
   auto* ml = o + uint64_t(sequences) * kv_heads * chunks * kQueries * kHeadDim;
@@ -539,8 +564,8 @@ extern "C" int32_t cuteafd_glm_dflash_attention(const void* q, const void* k_blo
       static_cast<const bf16*>(q), static_cast<const bf16*>(k_block), static_cast<const bf16*>(v_block),
       static_cast<const bf16*>(k_ring), static_cast<const bf16*>(v_ring), static_cast<const int32_t*>(seq_slots),
       static_cast<const int32_t*>(ctx_lengths), static_cast<const int32_t*>(ctx_ends), o, ml, ring, heads, kv_heads,
-      block_rows, chunks, scale);
-  attention_merge_kernel<<<dim3(kQueries, kv_heads, sequences), kHeadDim, 0, s>>>(
+      block_rows, chunks, scale, window);
+  attention_merge_kernel<<<dim3(queries, kv_heads, sequences), kHeadDim, 0, s>>>(
       o, ml, static_cast<bf16*>(out), heads, kv_heads, block_rows, chunks);
   return cudaGetLastError();
 }
@@ -598,5 +623,15 @@ extern "C" int32_t cuteafd_glm_dflash_tap(const void* src, void* dst, int32_t ro
   if (rows < 1 || width % 8 || stride % 8 || offset % 8 || offset + width > stride) return cudaErrorInvalidValue;
   tap_kernel<<<dim3((width / 8 + 255) / 256, rows), 256, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const bf16*>(src), static_cast<bf16*>(dst), width, stride, offset);
+  return cudaGetLastError();
+}
+
+// dst[row, offset : offset + width] = bf16(mean_i src[row, i]) for `rows` rows of
+// `hc` BF16 streams of `width` (the mHC contraction DFlash2 taps).
+extern "C" int32_t cuteafd_glm_dflash_tap_mean(const void* src, void* dst, int32_t rows, int32_t width, int32_t hc,
+                                               int32_t stride, int32_t offset, void* stream) {
+  if (rows < 1 || hc < 1 || width < 1 || offset + width > stride) return cudaErrorInvalidValue;
+  tap_mean_kernel<<<dim3((width + 255) / 256, rows), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const bf16*>(src), static_cast<bf16*>(dst), width, hc, stride, offset);
   return cudaGetLastError();
 }
