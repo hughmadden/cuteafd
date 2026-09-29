@@ -9,6 +9,7 @@
   case value: { constexpr uint64_t kHidden = value; (void)kHidden; __VA_ARGS__; } break;
 #define CUTEAFD_WITH_HIDDEN(hidden, ...) do { switch (hidden) { \
   CUTEAFD_HIDDEN_CASE(2048, __VA_ARGS__) \
+  CUTEAFD_HIDDEN_CASE(2560, __VA_ARGS__) \
   CUTEAFD_HIDDEN_CASE(3072, __VA_ARGS__) \
   CUTEAFD_HIDDEN_CASE(4096, __VA_ARGS__) \
   CUTEAFD_HIDDEN_CASE(5120, __VA_ARGS__) \

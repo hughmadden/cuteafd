@@ -8,6 +8,7 @@ mod commands;
 mod dsv4;
 mod glm;
 mod glmf;
+mod qwen4;
 mod mimo;
 mod v41_compressor;
 mod v41_vision;
@@ -71,6 +72,8 @@ async fn main() -> Result<()> {
         Commands::GlmGolden(args) => glm::run_golden(args).await,
         Commands::MimoGolden(args) => mimo::run_golden(args).await,
         Commands::GlmfGolden(args) => glmf::run_golden(args).await,
+        Commands::Qwen4Golden(args) => qwen4::run_golden(args).await,
+        Commands::ServeQwen4(args) => qwen4::serve::run_serve(args).await,
         Commands::ServeGlmf(args) => glmf::serve::run_serve(args).await,
         Commands::ServeGlm(args) => glm::serve::run_serve(args).await,
         Commands::ServeDsv4(args) => dsv4::serve::run_serve(args).await,

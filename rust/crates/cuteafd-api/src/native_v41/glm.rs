@@ -16,7 +16,7 @@ use serde_json::Value;
 use std::path::Path;
 
 pub use parser::{GlmOutputParser, GlmParserOptions, GlmStop};
-pub use processor::GlmStreamProcessor;
+pub use processor::{GlmStreamProcessor, TextParser};
 pub use prompt::{resolve_thinking, template_context, GlmPromptOptions, GlmToolChoice};
 pub use template::ChatTemplate;
 

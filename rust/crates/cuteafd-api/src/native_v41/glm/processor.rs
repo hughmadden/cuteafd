@@ -1,4 +1,5 @@
-//! Backend inference chunks -> protocol chunks through the GLM parser.
+//! Backend inference chunks -> protocol chunks through a family's text parser
+//! (GLM, Qwen).
 //!
 //! Mirrors `deepseek_recipe::stream::StreamProcessor`: the same start, usage
 //! and finish contract, driving the same protocol `ChunkGenerator`, so the
@@ -11,13 +12,28 @@ use futures::{Stream, StreamExt};
 
 use super::parser::{GlmOutputParser, GlmStop};
 
-pub struct GlmStreamProcessor<G> {
-    generator: G,
-    parser: GlmOutputParser,
+/// An incremental generated-text parser the stream processor drives.
+pub trait TextParser: Send {
+    fn push(&mut self, text: &str) -> Vec<OutputChunk>;
+    fn finish(&mut self) -> Vec<OutputChunk>;
+    fn stop(&self) -> Option<&GlmStop>;
+    fn tool_calls(&self) -> usize;
 }
 
-impl<G: ChunkGenerator> GlmStreamProcessor<G> {
-    pub fn new(generator: G, parser: GlmOutputParser) -> Self {
+impl TextParser for GlmOutputParser {
+    fn push(&mut self, text: &str) -> Vec<OutputChunk> { GlmOutputParser::push(self, text) }
+    fn finish(&mut self) -> Vec<OutputChunk> { GlmOutputParser::finish(self) }
+    fn stop(&self) -> Option<&GlmStop> { GlmOutputParser::stop(self) }
+    fn tool_calls(&self) -> usize { GlmOutputParser::tool_calls(self) }
+}
+
+pub struct GlmStreamProcessor<G, P = GlmOutputParser> {
+    generator: G,
+    parser: P,
+}
+
+impl<G: ChunkGenerator, P: TextParser> GlmStreamProcessor<G, P> {
+    pub fn new(generator: G, parser: P) -> Self {
         Self { generator, parser }
     }
 
@@ -25,7 +41,7 @@ impl<G: ChunkGenerator> GlmStreamProcessor<G> {
     /// stop sequence in the text, or EOF. Completion usage sums the
     /// `content_tokens` of every processed text chunk. A stop by marker or
     /// backend `Stop` after a tool call finishes with `tool_calls`.
-    /// `InferenceChunk::Token` is unsupported (the GLM engine sends text).
+    /// `InferenceChunk::Token` is unsupported (the engines send text).
     pub fn process(
         self,
         inference: impl Stream<Item = InferenceChunk> + Send,

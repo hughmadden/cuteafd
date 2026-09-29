@@ -292,6 +292,31 @@ impl NativeLibrary {
     }
 }
 
+impl NativeLibrary {
+    /// Softmax top-`topk` routing (Qwen, `cuteafd_router_select_softmax`):
+    /// FP32 `logits` [rows, experts] (rounded to BF16 first with
+    /// `round_bf16`), U32 `ids` and FP32 `routing` [rows, topk] = the top-k
+    /// softmax probabilities renormalized over the top-k (BF16-rounded with
+    /// `round_bf16`) times `route_scale`.
+    ///
+    /// # Safety
+    /// Device pointers of those sizes, live until the stream drains.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn router_select_softmax(&self, logits: *const c_void, ids: *mut c_void, routing: *mut c_void,
+        rows: usize, experts: usize, topk: usize, route_scale: f32, round_bf16: bool, stream: *mut c_void)
+        -> Result<()> {
+        type Select = unsafe extern "C" fn(*const c_void, *mut c_void, *mut c_void, i32, i32, i32, f32, i32,
+            *mut c_void) -> i32;
+        let select = *unsafe { self.lib.get::<Select>(b"cuteafd_router_select_softmax") }?;
+        let status = unsafe {
+            select(logits, ids, routing, i32::try_from(rows)?, i32::try_from(experts)?, i32::try_from(topk)?,
+                route_scale, i32::from(round_bf16), stream)
+        };
+        ensure!(status == 0, "softmax router select failed with {status}");
+        Ok(())
+    }
+}
+
 /// dSpark drafter kernels (native/cuda/kernels/dsv4_dspark.cu).
 impl NativeLibrary {
     /// `out` BF16 [rows, cols] = FP8 E4M3 `w` [rows, cols] times its FP32
@@ -305,6 +330,21 @@ impl NativeLibrary {
         let f = *unsafe { self.lib.get::<Dequant>(b"cuteafd_fp8_block_dequant") }?;
         let status = unsafe { f(w, scale, out, i32::try_from(rows)?, i32::try_from(cols)?, stream) };
         ensure!(status == 0, "FP8 block dequantization failed with {status}");
+        Ok(())
+    }
+
+    /// BF16 `w` [rows, cols] -> E4M3 `q` [rows, cols] with FP32 128x128 block
+    /// `scale` [ceil(rows/128), ceil(cols/128)] (amax / 448 per block), the
+    /// inverse of [`Self::fp8_block_dequant`].
+    ///
+    /// # Safety
+    /// Every pointer is live device memory of its shape on the stream's device.
+    pub unsafe fn fp8_block_quant(&self, w: *const c_void, q: *mut c_void, scale: *mut c_void, rows: usize,
+        cols: usize, stream: *mut c_void) -> Result<()> {
+        type Quant = unsafe extern "C" fn(*const c_void, *mut c_void, *mut c_void, i32, i32, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Quant>(b"cuteafd_fp8_block_quant") }?;
+        let status = unsafe { f(w, q, scale, i32::try_from(rows)?, i32::try_from(cols)?, stream) };
+        ensure!(status == 0, "FP8 block quantization failed with {status}");
         Ok(())
     }
 

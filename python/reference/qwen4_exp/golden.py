@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""Golden activations for Qwen 3.8 Flash Next (qwen4_exp) from transformers' reference.
+
+Runs one Qwen4ExpTextDecoderLayer at a time on one GPU (the routed experts do
+not fit): the four hyper-connection streams (``[T, 4 * hidden]``) go in and
+out of every layer as a full-sequence prefill without a cache. Gated DeltaNet
+layers take the chunked path; full-attention layers run the real QSA indexer
+(every token is selected up to 2051 visible tokens, so shorter prompts are
+dense causal GQA) and eager attention. Positions, rotary embeddings and the
+causal mask are built as Qwen4ExpTextModel.forward builds them for a
+text-only prompt. The final collapse is ``hyper_connection_mixer``
+(Qwen4ExpTextGatedResidual without the injection); there is no final norm,
+``lm_head`` runs in FP32.
+
+PLE (layer 1): the n-gram ids come from the module's own hashing
+(Qwen4ExpTextNGramEmbedding.forward is unchanged); only the gathered rows
+are read from the 128 ``ngram_embedding.shard_N`` tensors (2,500,012 rows of
+160 each, row r in shard r // 2500012). FP8 tables are
+``bf16(bf16(e4m3) * weight_scale)`` (BF16 scale, round to nearest even),
+BF16 tables are used as stored. The rest of Qwen4ExpTextPLELayer is the real
+module code.
+
+Weights: coordinator tensors come from ``--snapshot`` (BF16 as stored; FP8
+tensors times their 128x128 block ``weight_scale_inv``). Routed experts come
+from ``--experts-snapshot`` (default the same snapshot): FP8 per-expert
+tensors (times their BF16 128x128 block scales) or BF16 fused
+``mlp.experts.gate_up_proj`` / ``down_proj``. EXL3 checkpoints cannot be
+expert sources (their dense tensors are usable as ``--snapshot``). Routed
+experts are summed in FP32 and rounded once (transformers' eager experts sum
+in BF16, which moves results on rounding-level changes: compare engines by
+NLL as well as agreement); the softmax top-10 router is the module as is.
+Run with ``PYTHONPATH=<cuteafd>/third_party/transformers/src`` (the pinned
+transformers carries qwen4_exp) and ``USE_HUB_KERNELS=0``.
+
+Writes the raw files ``qwen4-golden`` reads:
+
+  tokens.bin      i32  [T]
+  layerNN.bin     bf16 [T, 4, hidden]   hyper-connection streams after layer NN
+  logits.bin      f32  [T, vocab]
+  meta.json
+
+  golden.py --snapshot SNAP [--experts-snapshot SNAP] --text-file prompt.txt --out DIR
+            [--layers 0 1 ...] [--stop-after N] [--max-tokens T]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from pathlib import Path
+
+import torch
+from safetensors import safe_open
+
+PREFIX = "model.language_model."
+SHARD_ROWS = 2_500_012
+
+
+class Weights:
+    def __init__(self, snapshot: Path):
+        self.snapshot = snapshot
+        self.index = json.loads((snapshot / "model.safetensors.index.json").read_text())["weight_map"]
+        self.files: dict[str, object] = {}
+
+    def __contains__(self, name: str) -> bool:
+        return name in self.index
+
+    def handle(self, name: str):
+        shard = self.index[name]
+        if shard not in self.files:
+            self.files[shard] = safe_open(str(self.snapshot / shard), framework="pt", device="cpu")
+        return self.files[shard]
+
+    def raw(self, name: str) -> torch.Tensor:
+        return self.handle(name).get_tensor(name)
+
+    def get(self, name: str, device: str = "cuda") -> torch.Tensor:
+        """BF16/FP32/int tensors as stored; FP8 weights times their 128x128 block scales."""
+        value = self.raw(name).to(device)
+        if value.dtype != torch.float8_e4m3fn:
+            return value
+        scale = self.raw(name.removesuffix("weight") + "weight_scale_inv").to(device).float()
+        rows, cols = value.shape
+        grown = scale.repeat_interleave(128, 0)[:rows].repeat_interleave(128, 1)[:, :cols]
+        return (value.float() * grown).bfloat16()
+
+
+class LazyNgramTable(torch.nn.Module):
+    """Stands in for ``ngram_embedding`` (nn.Embedding): gathers only the requested rows."""
+
+    def __init__(self, weights: Weights, prefix: str, rows: int, dim: int):
+        super().__init__()
+        self.w, self.prefix, self.rows, self.dim = weights, prefix, rows, dim
+        scale_name = prefix + "weight_scale"
+        self.scale = weights.raw(scale_name) if scale_name in weights else None
+        self.weight = torch.empty(0, device="cuda")  # plain attribute: the module reads .weight.device
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        flat = ids.reshape(-1).cpu()
+        if int(flat.max()) >= self.rows or int(flat.min()) < 0:
+            raise ValueError("n-gram row id out of range")
+        unique, inverse = torch.unique(flat, return_inverse=True)
+        out = torch.empty(len(unique), self.dim, dtype=torch.bfloat16)
+        shard_of = unique // SHARD_ROWS
+        for shard in torch.unique(shard_of).tolist():
+            pick = (shard_of == shard).nonzero().flatten()
+            name = f"{self.prefix}shard_{shard}.weight"
+            view = self.w.handle(name).get_slice(name)
+            for i in pick.tolist():
+                r = int(unique[i]) - shard * SHARD_ROWS
+                row = view[r:r + 1]
+                if row.dtype == torch.float8_e4m3fn:
+                    if self.scale is None:
+                        raise KeyError(f"{self.prefix}weight_scale: FP8 table without its scale")
+                    row = row.to(torch.bfloat16) * self.scale.to(torch.bfloat16)
+                elif row.dtype != torch.bfloat16:
+                    raise TypeError(f"{name}: unsupported table dtype {row.dtype}")
+                out[i] = row[0]
+        return out[inverse].reshape(*ids.shape, self.dim).to(ids.device)
+
+
+def load_experts(experts, src: Weights, prefix: str) -> None:
+    fused = prefix + "mlp.experts.gate_up_proj"
+    with torch.no_grad():
+        if fused in src:
+            experts.gate_up_proj.copy_(src.get(fused).to(torch.bfloat16))
+            experts.down_proj.copy_(src.get(prefix + "mlp.experts.down_proj").to(torch.bfloat16))
+            return
+        first = prefix + "mlp.experts.0."
+        if first + "gate_proj.trellis" in src:
+            raise ValueError("EXL3 expert tensors cannot be a golden expert source (use FP8 or BF16)")
+        for e in range(experts.gate_up_proj.shape[0]):
+            base = f"{prefix}mlp.experts.{e}."
+            experts.gate_up_proj[e].copy_(torch.cat([src.get(base + "gate_proj.weight"),
+                                                     src.get(base + "up_proj.weight")], 0))
+            experts.down_proj[e].copy_(src.get(base + "down_proj.weight"))
+
+
+def load_module(module: torch.nn.Module, dense: Weights, prefix: str, skip: set[str]) -> None:
+    for key, param in list(module.named_parameters()) + list(module.named_buffers()):
+        if key in skip:
+            continue
+        name = prefix + key
+        if name not in dense:
+            raise KeyError(f"{name}: no checkpoint tensor for {key}")
+        with torch.no_grad():
+            param.copy_(dense.get(name).reshape(param.shape).to(param.dtype))
+
+
+def experts_fp32(self, hidden_states, top_k_index, top_k_weights):
+    """Qwen4ExpTextExperts.forward with the routed sum in FP32 and one BF16 rounding."""
+    final = torch.zeros_like(hidden_states, dtype=torch.float32)
+    mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
+    for expert in torch.greater(mask.sum(dim=(-1, -2)), 0).nonzero():
+        expert = expert[0]
+        slot, token = torch.where(mask[expert])
+        gate, up = torch.nn.functional.linear(hidden_states[token], self.gate_up_proj[expert]).chunk(2, dim=-1)
+        out = torch.nn.functional.linear(self.act_fn(gate) * up, self.down_proj[expert])
+        final.index_add_(0, token, out.float() * top_k_weights[token, slot, None].float())
+    return final.to(hidden_states.dtype)
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--snapshot", type=Path, required=True, help="coordinator weights, config and tokenizer")
+    p.add_argument("--experts-snapshot", type=Path,
+                   help="routed experts (FP8 per-expert or BF16 fused; not EXL3); default --snapshot")
+    p.add_argument("--text", help="prompt text (tokenized with the snapshot tokenizer)")
+    p.add_argument("--text-file", type=Path, help="prompt text from a file")
+    p.add_argument("--max-tokens", type=int, help="keep the first T tokens")
+    p.add_argument("--layers", type=int, nargs="*", help="layers whose streams to save (default all)")
+    p.add_argument("--stop-after", type=int, help="run only layers 0..N (no logits)")
+    p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--device", type=int, default=0)
+    a = p.parse_args()
+
+    from tokenizers import Tokenizer
+    from transformers import AutoConfig
+    from transformers.masking_utils import create_causal_mask
+    from transformers.models.qwen4_exp import modeling_qwen4_exp as ref
+
+    ref.Qwen4ExpTextExperts.forward = experts_fp32
+    torch.cuda.set_device(a.device)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    config = AutoConfig.from_pretrained(a.snapshot).text_config
+    config._attn_implementation = "eager"
+    text = a.text_file.read_text() if a.text_file else a.text
+    tokens = Tokenizer.from_file(str(a.snapshot / "tokenizer.json")).encode(text, add_special_tokens=False).ids
+    if a.max_tokens:
+        tokens = tokens[:a.max_tokens]
+    dense = Weights(a.snapshot)
+    experts_src = Weights(a.experts_snapshot) if a.experts_snapshot else dense
+    if PREFIX + "norm.weight" in dense:
+        raise ValueError("unexpected final norm: this model feeds the stream mixer straight into lm_head")
+    a.out.mkdir(parents=True, exist_ok=True)
+    (a.out / "tokens.bin").write_bytes(torch.tensor(tokens, dtype=torch.int32).numpy().tobytes())
+    n_layers = config.num_hidden_layers
+    layers = n_layers if a.stop_after is None else min(a.stop_after + 1, n_layers)
+    save = set(range(layers)) if not a.layers else set(a.layers)
+    t = len(tokens)
+    ids = torch.tensor([tokens], device="cuda")
+    timings = []
+    with torch.inference_mode():
+        embed = torch.nn.functional.embedding(ids, dense.get(PREFIX + "embed_tokens.weight"))
+        # Qwen4ExpTextModel.forward: 4 position rows (text, then the 3 mRoPE axes).
+        position_ids = torch.arange(t, device="cuda").view(1, 1, -1).expand(4, 1, -1)
+        text_positions, mrope_positions = position_ids[0], position_ids[1:]
+        causal = create_causal_mask(config=config, inputs_embeds=embed, attention_mask=None,
+                                    past_key_values=None, position_ids=text_positions,
+                                    allow_is_causal_skip=False)
+        conv_mask = None  # create_recurrent_attention_mask: None for an unpadded prompt
+        rotary = ref.Qwen4ExpTextRotaryEmbedding(config=config).cuda()
+        position_embeddings = rotary(embed, mrope_positions)
+        h = embed.repeat(1, 1, config.hc_count)
+        for layer_id in range(layers):
+            start = time.time()
+            kind = config.layer_types[layer_id]
+            torch.set_default_dtype(torch.bfloat16)
+            with torch.device("meta"):
+                layer = ref.Qwen4ExpTextDecoderLayer(config, layer_id)
+            torch.set_default_dtype(torch.float32)
+            skip = {"mlp.experts.gate_up_proj", "mlp.experts.down_proj"}
+            if layer.ple is not None:
+                emb = layer.ple.ple_embedding
+                rows, dim = emb.ngram_embedding.num_embeddings, emb.ngram_embedding.embedding_dim
+                if rows != 128 * SHARD_ROWS:
+                    raise ValueError(f"n-gram table has {rows} rows, expected 128 shards of {SHARD_ROWS}")
+                emb.ngram_embedding = torch.nn.Identity()  # dropped before allocation
+            layer = layer.to_empty(device="cuda")
+            if layer.ple is not None:
+                table_prefix = f"{PREFIX}layers.{layer_id}.ple.ple_embedding.ngram_embedding."
+                layer.ple.ple_embedding.ngram_embedding = LazyNgramTable(dense, table_prefix, rows, dim)
+            load_module(layer, dense, f"{PREFIX}layers.{layer_id}.", skip)
+            load_experts(layer.mlp.experts, experts_src, f"{PREFIX}layers.{layer_id}.")
+            if layer.ple is not None:
+                emb = layer.ple.ple_embedding
+                expected = ref._build_layer_multipliers(emb.unigram_vocab_size, emb.ngram_size,
+                                                        emb.ple_layer_index, emb.seed)
+                if not (torch.equal(emb.layer_multipliers.cpu(), expected)
+                        and emb.ngram_heads_vocab_sizes.tolist() == emb.head_vocab_sizes
+                        and emb.ngram_heads_offsets.tolist() == emb.head_offsets):
+                    raise ValueError("checkpoint n-gram hash buffers differ from the module's construction")
+            h = layer(h, position_embeddings=position_embeddings, attention_mask=causal, conv_mask=conv_mask,
+                      past_key_values=None, ple_input_ids=ids)
+            if layer_id in save:
+                (a.out / f"layer{layer_id:02d}.bin").write_bytes(
+                    h[0].contiguous().view(torch.int16).cpu().numpy().tobytes())
+            del layer
+            torch.cuda.empty_cache()
+            timings.append(time.time() - start)
+            print(f"layer {layer_id} ({kind}) {timings[-1]:.1f}s", flush=True)
+        if layers < n_layers:
+            return
+        torch.set_default_dtype(torch.bfloat16)
+        with torch.device("meta"):
+            mixer = ref.Qwen4ExpTextGatedResidual(config, use_combine=False)
+        torch.set_default_dtype(torch.float32)
+        mixer = mixer.to_empty(device="cuda")
+        load_module(mixer, dense, PREFIX + "hyper_connection_mixer.", set())
+        final = mixer(h)
+        head = dense.get("lm_head.weight").float()
+        logits = final[0].float() @ head.T
+        del head
+        (a.out / "logits.bin").write_bytes(logits.contiguous().cpu().numpy().tobytes())
+        argmax = logits.argmax(-1)
+        next_ok = (argmax[:-1] == ids[0, 1:]).float().mean().item()
+        nll_sum = 0.0
+        for first in range(0, t - 1, 512):
+            last = min(first + 512, t - 1)
+            lp = torch.log_softmax(logits[first:last].double(), -1)
+            nll_sum -= lp.gather(1, ids[0, first + 1:last + 1, None]).sum().item()
+        nll = nll_sum / max(t - 1, 1)
+    (a.out / "meta.json").write_text(json.dumps({
+        "tokens": t, "snapshot": str(a.snapshot), "experts_snapshot": str(a.experts_snapshot or a.snapshot),
+        "reference": "transformers qwen4_exp (pinned 62d7ebd7; eager, FP32 routed sum, lazy PLE rows)",
+        "argmax_last": int(argmax[-1]), "next_token_accuracy": next_ok, "mean_nll": nll,
+        "seconds_per_layer": [round(s, 2) for s in timings],
+    }, indent=1))
+    print(f"argmax of last position: {int(argmax[-1])}; next-token accuracy {next_ok:.3f}; mean NLL {nll:.4f}")
+
+
+if __name__ == "__main__":
+    main()

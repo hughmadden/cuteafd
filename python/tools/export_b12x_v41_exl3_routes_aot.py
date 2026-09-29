@@ -20,8 +20,8 @@ def export(output: Path, capacity: int, experts: int, topk: int, block_size: int
     import torch
     from b12x.moe._shared.kernels.w4a16.route_pack import compile_w4a16_route_pack_launches
 
-    if not 1 <= capacity <= 4096 or not topk <= experts <= 384:
-        raise ValueError('invalid V4.1 route capacity or expert count')
+    if not 1 <= capacity <= 4096 or not 1 <= topk <= min(experts, 16) or experts > 512:
+        raise ValueError('invalid EXL3 route capacity, top-k or expert count')
     props = torch.cuda.get_device_properties(0)
     if (props.major, props.minor) not in ((12, 0), (12, 1)):
         raise ValueError('requires SM120 or SM121')
@@ -136,7 +136,7 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--capacity', type=int, required=True)
     parser.add_argument('--experts', type=int, default=384)
-    parser.add_argument('--topk', type=int, choices=(3,6,8), default=6)
+    parser.add_argument('--topk', type=int, choices=range(1, 17), metavar='1..16', default=6)
     parser.add_argument('--block-size', type=int, choices=(8,16,32,64), default=8)
     args = parser.parse_args()
     export(args.output,args.capacity,args.experts,args.topk,args.block_size)

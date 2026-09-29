@@ -55,7 +55,7 @@ pub fn resolve_thinking(body: &Value) -> Result<bool, String> {
     Ok(reasoning_effort(body)?.as_deref() != Some("none"))
 }
 
-fn reasoning_effort(body: &Value) -> Result<Option<String>, String> {
+pub(crate) fn reasoning_effort(body: &Value) -> Result<Option<String>, String> {
     let value = body.get("reasoning_effort").filter(|v| !v.is_null())
         .or_else(|| body.get("chat_template_kwargs").and_then(|v| v.get("reasoning_effort")).filter(|v| !v.is_null()));
     match value {
@@ -121,7 +121,7 @@ pub fn template_context(body: &Value, options: &GlmPromptOptions) -> Result<Valu
 /// Copy the fields the template reads. `content: null` becomes `""` (the
 /// upstream template would print `None`), and tool-call arguments become
 /// objects because the template iterates `arguments.items()`.
-fn template_message(message: &Value, index: usize) -> Result<Value, String> {
+pub(crate) fn template_message(message: &Value, index: usize) -> Result<Value, String> {
     let object = message.as_object().ok_or_else(|| format!("messages[{index}] must be an object"))?;
     let mut out = Map::new();
     for key in ["role", "content", "reasoning_content", "tool_call_id", "name"] {
@@ -166,7 +166,7 @@ fn template_message(message: &Value, index: usize) -> Result<Value, String> {
 }
 
 /// glmrt's answer-format instruction (grammar enforcement is separate).
-fn response_format_instruction(format: &Value) -> Option<String> {
+pub(crate) fn response_format_instruction(format: &Value) -> Option<String> {
     match format.get("type")?.as_str()? {
         "json_object" => Some("Return only one valid JSON object with no surrounding prose or markdown.".into()),
         "json_schema" => {

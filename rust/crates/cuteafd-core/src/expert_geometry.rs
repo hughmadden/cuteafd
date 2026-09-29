@@ -28,6 +28,8 @@ impl ExpertGeometry {
     pub const MIMO_V2_FLASH: Self = Self { hidden: 4096, experts: 256, topk: 8, intermediate: 2048, layers: 48 };
     /// GLM 5.3 Flash (glm5_next): routed layers 3..45, SwiGLU clamped at 10.
     pub const GLM_NEXT: Self = Self { hidden: 4096, experts: 288, topk: 8, intermediate: 2048, layers: 45 };
+    /// Qwen 3.8 Flash Next (qwen4_exp): 48 routed layers, softmax top-10, SiLU unclamped.
+    pub const QWEN4_EXP: Self = Self { hidden: 2560, experts: 512, topk: 10, intermediate: 640, layers: 48 };
 
     /// BF16 bytes of one hidden-width row (a routed input or a rank partial).
     pub const fn row_bytes(&self) -> u32 {
@@ -51,15 +53,17 @@ impl ExpertGeometry {
             (Self::GLM_DSA, "glm"),
             (Self::MIMO_V2_FLASH, "mimo"),
             (Self::GLM_NEXT, "glmf"),
+            (Self::QWEN4_EXP, "qwen4"),
         ]
         .into_iter()
         .find_map(|(shape, family)| self.same_shape(&shape).then_some(family))
     }
 
     /// Routed-expert SwiGLU clamp: DeepSeek and GLM 5.3 Flash clamp gate/up at
-    /// 10; GLM 5.x's and MiMo's SwiGLU are unclamped (`None`).
+    /// 10; GLM 5.x's, MiMo's and Qwen 3.8 Flash Next's SwiGLU are unclamped (`None`).
     pub fn swiglu_limit(&self) -> Option<f32> {
-        (!self.same_shape(&Self::GLM_DSA) && !self.same_shape(&Self::MIMO_V2_FLASH)).then_some(10.0)
+        (!self.same_shape(&Self::GLM_DSA) && !self.same_shape(&Self::MIMO_V2_FLASH)
+            && !self.same_shape(&Self::QWEN4_EXP)).then_some(10.0)
     }
 
     /// Equal kernel shape (hidden, experts, top-k, intermediate), any layer bound.
@@ -113,5 +117,8 @@ mod tests {
         let glm_with_mtp = ExpertGeometry { layers: 79, ..ExpertGeometry::GLM_DSA };
         assert_eq!(glm_with_mtp.family(), Some("glm"));
         assert_eq!(glm_with_mtp.swiglu_limit(), None);
+        assert_eq!(ExpertGeometry::QWEN4_EXP.family(), Some("qwen4"));
+        assert_eq!(ExpertGeometry::QWEN4_EXP.swiglu_limit(), None);
+        assert_eq!(ExpertGeometry::QWEN4_EXP.slice(4), Some(160));
     }
 }

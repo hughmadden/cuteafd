@@ -57,10 +57,10 @@ impl V41Exl3Info {
                 && matches!(words[15], 2 | 4)
                 && words[1] == geometry.hidden
                 && exl3_shard_widths(geometry).contains(&words[2])
-                && words[3] <= 384
+                && words[3] <= 512
                 && words[3] >= words[5]
                 && words[4] > 0
-                && matches!(words[5], 3 | 6 | 8)
+                && (1..=16).contains(&words[5])
                 && matches!(words[6], 2..=4),
             "invalid EXL3 native geometry: {words:?}"
         );
@@ -444,6 +444,7 @@ mod info_tests {
         assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V41), [512, 640, 768, 1152, 2304]);
         assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V4_PRO), [512, 768, 1024, 1536, 3072]);
         assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V4_FLASH), [512, 640, 768, 1024, 2048]);
+        assert_eq!(exl3_shard_widths(ExpertGeometry::QWEN4_EXP), [128, 256, 384, 640]);
     }
 
     #[test]

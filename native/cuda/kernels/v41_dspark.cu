@@ -173,14 +173,14 @@ extern "C" int32_t cuteafd_v41_markov_launch(void* handle, const uint16_t* input
 // Model-width vocabulary head (DeepSeek V4: 4096, V4 Pro: 7168).
 extern "C" int32_t cuteafd_vocabulary_head_create(void* workspace, uint64_t bytes,
     int32_t width, int32_t max_rows, void** output) {
-  if (width < 4096 || width > 16384 || width % 64 || max_rows < 1 || max_rows > 65536)
+  if (width < 1024 || width > 16384 || width % 64 || max_rows < 1 || max_rows > 65536)
     return cudaErrorInvalidValue;
   return create_head(workspace, bytes, output, width, max_rows);
 }
 // Same, for a vocabulary other than DeepSeek's 129280 rows (GLM: 154880).
 extern "C" int32_t cuteafd_vocabulary_head_create_vocab(void* workspace, uint64_t bytes,
     int32_t width, int32_t max_rows, int32_t vocab_rows, void** output) {
-  if (width < 4096 || width > 16384 || width % 64 || max_rows < 1 || max_rows > 65536)
+  if (width < 1024 || width > 16384 || width % 64 || max_rows < 1 || max_rows > 65536)
     return cudaErrorInvalidValue;
   return create_head(workspace, bytes, output, width, max_rows, vocab_rows);
 }

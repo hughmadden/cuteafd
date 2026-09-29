@@ -3,7 +3,8 @@
 # (CUTEAFD_ENABLE_DSV4_AOT, CUTEAFD_DSV4_GEOMETRY), GLM 5.x
 # (CUTEAFD_ENABLE_GLM_AOT, geometry "glm") and MiMo V2 Flash
 # (CUTEAFD_ENABLE_MIMO_AOT, geometry "mimo") and GLM 5.3 Flash
-# (CUTEAFD_ENABLE_GLMF_AOT, geometry "glmf") share one table and manifest.
+# (CUTEAFD_ENABLE_GLMF_AOT, geometry "glmf") and Qwen 3.8 Flash Next
+# (CUTEAFD_ENABLE_QWEN4_AOT, geometry "qwen4") share one table and manifest.
 if(NOT CUTEAFD_CUDA_ARCHITECTURES MATCHES "^120")
   message(FATAL_ERROR "coordinator programs require the SM120 build")
 endif()
@@ -30,6 +31,13 @@ if(CUTEAFD_ENABLE_GLMF_AOT)
     set(CUTEAFD_PROGRAM_GEOMETRY "glmf")
   else()
     set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},glmf")
+  endif()
+endif()
+if(CUTEAFD_ENABLE_QWEN4_AOT)
+  if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
+    set(CUTEAFD_PROGRAM_GEOMETRY "qwen4")
+  else()
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},qwen4")
   endif()
 endif()
 set(CUTEAFD_DSV4_DIR "${CMAKE_CURRENT_BINARY_DIR}/dsv4_programs")

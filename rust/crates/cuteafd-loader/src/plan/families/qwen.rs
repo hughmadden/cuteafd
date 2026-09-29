@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use crate::plan::checkpoint::{opt_usize_field, usize_field, Checkpoint};
 use crate::plan::family::{Family, Hint, RuntimeStatus};
+use crate::plan::format::WeightFormat;
 use crate::plan::names::indexed;
 use crate::plan::spec::*;
 
@@ -17,7 +18,25 @@ impl Family for Qwen {
         "qwen4_exp"
     }
     fn runtime(&self) -> RuntimeStatus {
-        RuntimeStatus::Planned
+        RuntimeStatus::Serving
+    }
+
+    fn executes(&self, component: Component, format: &WeightFormat) -> bool {
+        use WeightFormat::*;
+        // qwen4 programs: BF16 coordinator tensors; the PLE table in BF16 or
+        // E4M3 with one scale; routed experts from EXL3 K4/K5 packages
+        // (qwen4:exl3-k45) or the checkpoint's FP8 128x128 blocks (qwen4:fp8).
+        match component {
+            Component::RoutedExpert => matches!(format, Exl3 { bits: 4..=5 } | Fp8Block { block: (128, 128) }),
+            Component::MappedTable => matches!(format, Bf16 | Fp8PerChannel | Int),
+            Component::Speculator | Component::SpeculatorExpert | Component::Vision => false,
+            _ => matches!(format, Bf16 | F32),
+        }
+    }
+
+    fn optional(&self, component: Component) -> bool {
+        // Text serving runs without the native MTP layer and the vision tower.
+        matches!(component, Component::Speculator | Component::SpeculatorExpert | Component::Vision)
     }
     fn detect(&self, checkpoint: &Checkpoint) -> bool {
         checkpoint
@@ -136,29 +155,41 @@ impl Family for Qwen {
     }
 
     fn component_hint(&self, component: Component) -> Option<Hint> {
-        let qflash = "../qflashrt (single-device Qwen3.8-Flash-Next runtime)";
         let (what, how) = match component {
-            Component::Attention => (
-                "Gated DeltaNet linear attention (36 layers) plus gated full attention every 4th layer".to_string(),
-                format!("b12x sequence/gdn_prefill + gdn_decode; per-request recurrent state pool. \
-                 {qflash} has a working port including the conv1d short convolution and output gate."),
-            ),
             Component::RoutedExpert => (
-                "512 experts top-10 stored as fused [experts, out, in] BF16 tensors".to_string(),
-                "The Spark reader must slice fused expert tensors along the expert axis before TP \
-                 slicing; quantize at load (MXFP4/NVFP4) or use a published EXL3 K4.25 build \
-                 (wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-*).".to_string(),
+                "512 experts top-10 (hidden 2560, intermediate 640, SiLU unclamped) in a format without a \
+                 routed kernel family"
+                    .to_string(),
+                "Executable: EXL3 K4/K5 (qwen4:exl3-k45, python/tools/package_v41_exl3_aot.py --geometry qwen4; \
+                 exl3_cross_sm121.py for Sparks) and FP8 128x128 blocks (qwen4:fp8, native/cmake/fp8_moe.cmake). \
+                 BF16 fused [512, 1280, 2560] experts: serve the FP8 or EXL3 K4.25 publication, or add a BF16 \
+                 routed family. NVFP4 (ModelOpt E2M1 + E4M3 per-16 scales + FP32 global): export b12x fused_moe \
+                 NVFP4 at this geometry (W4A16 for accuracy) and teach read_expert_catalog its tensors."
+                    .to_string(),
+            ),
+            Component::Speculator | Component::SpeculatorExpert => (
+                "native MTP layer (full attention + 512 experts, hyper-connection feedback) is not run".to_string(),
+                "serve-qwen4 verifies copy-window drafts only; MTP needs the mtp.* weights as one more qwen4 \
+                 layer fed by fc_hidden/fc_embedding (see ../qflashrt quantization/qwen_model.py mtp_feedback) \
+                 and its experts served (FP8/EXL3 packages)."
+                    .to_string(),
+            ),
+            Component::Vision => (
+                "the vision tower is not run".to_string(),
+                "Text only; images would need the Qwen4Exp vision encoder and mRoPE positions.".to_string(),
             ),
             Component::MappedTable | Component::TableProjection => (
-                "PLE n-gram embedding: 128 shards of 2.5M x 160 BF16 (~95 GB)".to_string(),
-                format!("Host-mapped table with prefetch, like V4.1 engram (loader engram_*). \
-                 b12x sequence/ple, ple_hash, ple_embedding; {qflash} has the hashing and gather."),
+                "PLE n-gram table in a format other than BF16 or E4M3 with one scale".to_string(),
+                "The qwen4_ple_{bf16,fp8} programs gather 16 rows of 160 per token from a pinned host (or GPU) \
+                 table; add a gather variant for the new format."
+                    .to_string(),
             ),
-            Component::HyperConnection => (
-                "low-rank hyper-connections (hc_count 4, rank 320)".to_string(),
-                "b12x norm/hyperconnection; differs from DeepSeek mHC (no Sinkhorn).".to_string(),
+            _ => (
+                format!("{} tensors in a format other than BF16", component.label()),
+                "The qwen4 coordinator programs take BF16 weights; dequantize at load (weights.rs) or add \
+                 an FP8 program variant."
+                    .to_string(),
             ),
-            _ => return None,
         };
         Some(Hint { what, how })
     }

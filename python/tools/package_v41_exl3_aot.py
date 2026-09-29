@@ -6,6 +6,7 @@ import argparse
 import gc
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -221,10 +222,12 @@ GEOMETRIES = {
     'glm': (6144, 2048, 256, 8),
     # GLM 5.3 Flash (glm5_next): 288 experts, SwiGLU clamped at 10.
     'glmf': (4096, 2048, 288, 8),
+    # Qwen 3.8 Flash Next (qwen4_exp): 512 experts, softmax top-10, unclamped SiLU.
+    'qwen4': (2560, 640, 512, 10),
 }
 # SwiGLU clamp per geometry; None is the unclamped SwiGLU (b12x const-expr
 # elides the clamp). DeepSeek clamps at 10.
-SWIGLU_LIMITS = {'glm': None}
+SWIGLU_LIMITS = {'glm': None, 'qwen4': None}
 
 
 def swiglu_limit(geometry: str) -> float | None:
@@ -242,6 +245,12 @@ def route_block(geometry: str, capacity: int) -> int:
     fragments (b12x 4d7cb455), so they beat 32 from about 2048 rows up. The coordinator's whole-intermediate rtx-tp1 package
     gains the same way (RTX PRO 6000, width 3072: m4096 74 -> 35 ms, m1024 23 -> 16 ms).
     """
+    # Build-time A/B knob: CUTEAFD_EXL3_ROUTE_BLOCKS=CAPACITY=BLOCK[,...].
+    override = dict(item.split('=') for item in os.environ.get('CUTEAFD_EXL3_ROUTE_BLOCKS', '').split(',') if item)
+    if str(capacity) in override:
+        return int(override[str(capacity)])
+    if geometry == 'qwen4':
+        return qwen4_route_block(capacity)
     if geometry in ('glm', 'glmf'):
         return glm_route_block(capacity)
     if geometry != 'dsv4p' or capacity <= 256:
@@ -261,13 +270,23 @@ def glm_route_block(capacity: int) -> int:
     return 8 if capacity <= 256 else 64
 
 
+def qwen4_route_block(capacity: int) -> int:
+    """Qwen 3.8 Flash Next (512 experts, top-10): 10 * capacity routes, capacity / 51
+    rows per expert on average. Coordinator rtx-tp1 package (RTX PRO 6000, width
+    640, random top-10 routes, layer 23, median us): 8-row blocks m1024 2315,
+    m4096 11626; 64: m1024 1401, m4096 3489; 32: m256 1002 (8: 1023), m1024 1168,
+    m4096 3273 (min 3176 vs 3451). m256 with 16 fails the cooperative grid check.
+    """
+    return 8 if capacity <= 80 else 32
+
+
 def token_major_rotation(geometry: str, capacity: int) -> bool:
     """Whether a capacity rotates each token's input once for all of its routes.
 
     Bit-identical to per-route rotation. It pays where the rotation phase is
     large (V4 Pro m2048..4096 prefill); at m1024 and below it is neutral.
     """
-    if geometry in ('glm', 'glmf'):
+    if geometry in ('glm', 'glmf', 'qwen4'):
         # GLM top-8 (rtx-tp1): m1024 3910 -> 3830 us, m4096 11790 -> 11470 us.
         return capacity > 256
     return geometry == 'dsv4p' and capacity > 1024
@@ -305,8 +324,11 @@ def shard_profiles(geometry: str, role: str) -> list[tuple]:
     _hidden, intermediate, experts, topk = GEOMETRIES[geometry]
     blocks = intermediate // 128
     if role != 'spark':
-        return [('rtx-tp1', intermediate, experts, topk, 'fp32', ['rtx-tp1']),
-                ('rtx-tp2', intermediate // 2, experts, topk, 'fp32', ['rtx-tp2'])]
+        profiles = [('rtx-tp1', intermediate, experts, topk, 'fp32', ['rtx-tp1'])]
+        # Dual-RTX halves only where they are whole H128 blocks (not Qwen's 640).
+        if blocks % 2 == 0:
+            profiles.append(('rtx-tp2', intermediate // 2, experts, topk, 'fp32', ['rtx-tp2']))
+        return profiles
     profiles = []
     # Six ranks only where they split the H128 blocks evenly (V4 Pro: 24 -> 4).
     worlds = (4, 2, 3, 6) if blocks % 6 == 0 else (4, 2, 3)

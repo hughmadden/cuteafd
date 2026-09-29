@@ -29,6 +29,12 @@ int32_t cuteafd_dsv4_router_select(float* logits,const float* bias,const int32_t
 int32_t cuteafd_router_select(float* logits,const float* bias,const int32_t* tid2eid,
     const uint32_t* tokens,uint32_t* ids,float* routing,int32_t rows,int32_t experts,int32_t topk,
     float route_scale,int32_t sigmoid,void* stream);
+// Softmax top-k (Qwen): `logits` FP32 [rows,experts] (read only; rounded to
+// BF16 first when `round_bf16`), top-k by logit, weights the top-k softmax
+// probabilities renormalized (rounded to BF16 when `round_bf16`) times
+// `route_scale`. experts <= 512, topk <= 16.
+int32_t cuteafd_router_select_softmax(const float* logits,uint32_t* ids,float* routing,int32_t rows,
+    int32_t experts,int32_t topk,float route_scale,int32_t round_bf16,void* stream);
 #ifdef __cplusplus
 }
 #endif

@@ -188,6 +188,13 @@ def build(args: argparse.Namespace) -> None:
     base = GEOMETRIES[args.geometry]
     capacities = sorted({int(v) for v in args.capacities.split(",")})
     layouts = args.layouts.split(",") if args.layouts else list(ROLE_LAYOUTS[args.role])
+    # Default Spark layouts keep only the TP degrees that split the intermediate
+    # into whole 128-row blocks (Qwen 3.8 Flash Next's 640 splits into none).
+    if not args.layouts:
+        layouts = [l for l in layouts if base.intermediate % (128 * int(l.removeprefix("tp"))) == 0]
+        if not layouts:
+            raise SystemExit(f"{args.geometry}: intermediate {base.intermediate} has no default {args.role} "
+                             "TP layout of whole 128-row blocks; pass --layouts")
     wire = (args.input or ROLE_INPUT[args.role]) == "wire"
     if args.output.exists():
         raise SystemExit(f"{args.output} exists; remove it or choose another --output")
@@ -261,7 +268,7 @@ def main() -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     create = commands.add_parser("build")
     create.add_argument("--role", choices=sorted(ROLE_LAYOUTS), required=True)
-    create.add_argument("--geometry", choices=("mimo", "glm", "glmf"), required=True)
+    create.add_argument("--geometry", choices=("mimo", "glm", "glmf", "qwen4"), required=True)
     create.add_argument("--layouts", help="comma list (default: tp4,tp2 for spark, tp1 for coordinator)")
     create.add_argument("--capacities", default="1,16,80,256,1024,4096")
     create.add_argument("--input", choices=("wire", "bf16"),

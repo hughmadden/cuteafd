@@ -11,7 +11,21 @@ pub(crate) fn run_plan(args: PlanArgs) -> Result<()> {
         PathBuf::from(&args.model)
     } else {
         let hf_home = args.hf_home.clone().unwrap_or_else(default_hf_home);
-        let resolved = resolve_snapshot_at_revision(&args.model, Some(&hf_home), args.revision.as_deref())?;
+        let resolved = match resolve_snapshot_at_revision(&args.model, Some(&hf_home), args.revision.as_deref()) {
+            Ok(resolved) => resolved,
+            // A stale main ref: describe the only snapshot present (serving still refuses it).
+            Err(error) if args.revision.is_none() => {
+                let snapshots = cuteafd_loader::model_cache_dir(&hf_home, &args.model).join("snapshots");
+                let present: Vec<PathBuf> = std::fs::read_dir(&snapshots).map(|entries| {
+                    entries.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_dir()).collect()
+                }).unwrap_or_default();
+                let [only] = present.as_slice() else { return Err(error) };
+                eprintln!("note: {error:#}; describing {}", only.display());
+                let revision = only.file_name().and_then(|n| n.to_str()).context("snapshot name")?.to_owned();
+                resolve_snapshot_at_revision(&args.model, Some(&hf_home), Some(&revision))?
+            }
+            Err(error) => return Err(error),
+        };
         resolved
             .snapshot_path
             .with_context(|| format!("no snapshot of {} under {}", args.model, hf_home.display()))?
