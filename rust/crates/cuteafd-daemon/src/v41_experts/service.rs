@@ -724,7 +724,7 @@ fn validate_topology(config: &NativeExpertServiceConfig, catalog: &OfficialV41Ca
     // it on the native shard family instead of an EXL3 substitution (and vice
     // versa).
     ensure!(
-        config.world == 4 || catalog.exl3().is_some() || (config.world == 2 && catalog.fp8().is_some()),
+        config.world == 4 || catalog.exl3().is_some() || (matches!(config.world, 2 | 6) && catalog.fp8().is_some()),
         "a two, three or six rank implicit Spark group requires EXL3 experts; \
          a native group must pass --spark-tp/--spark-ep"
     );

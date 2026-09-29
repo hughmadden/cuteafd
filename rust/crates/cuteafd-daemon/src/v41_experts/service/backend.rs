@@ -150,8 +150,11 @@ pub(super) fn load_fp8<'a>(
     config: &NativeExpertServiceConfig,
 ) -> Result<(Weights<'a>, usize)> {
     let tensors = catalog.fp8().context("FP8 residency requires the checkpoint's FP8 experts")?;
-    ensure!(config.topology.is_none() && matches!(config.world, 2 | 4),
-        "FP8 experts serve implicit Spark TP2 or TP4 groups (whole 128-row intermediate blocks)");
+    // FP8 slices are whole 128-row blocks (TP2/TP4 of 2048); MXFP4 slices are
+    // whole 32-blocks padded to 128 (MiMo V2.6 Pro: TP6, TP2). `slice` checks it.
+    ensure!(config.topology.is_none() && matches!(config.world, 2 | 4 | 6),
+        "FP8/MXFP4 experts serve implicit Spark TP2, TP4 or TP6 groups");
+    tensors.slice(config.world)?;
     let directory = config.fp8_package.clone()
         .unwrap_or_else(|| crate::v41_experts::fp8::package_directory(&config.library, config.world));
     let layers = config.resident_layers(catalog.routed_experts().layers)?;
