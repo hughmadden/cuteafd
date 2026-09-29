@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Export the coordinator programs (b12x.integration.cuteafd): DeepSeek V4
-(``--geometry flash,pro``, families ``dsv4f``/``dsv4p``) and GLM 5.x
-(``--geometry glm``, family ``glm``), in any combination, into one table.
+(``--geometry flash,pro``, families ``dsv4f``/``dsv4p``), GLM 5.x
+(``--geometry glm``, family ``glm``) and MiMo V2 Flash (``--geometry mimo``,
+family ``mimo``), in any combination, into one table.
 
 One object and header per program, a manifest with every program's pointer
 ABI and scratch sizes at its capacity, and ``dsv4_programs.h``: the table the
@@ -129,11 +130,39 @@ def glm_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     return out
 
 
+def mimo_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
+    """MiMo V2 programs, same (stem suffix, op, params, thunk) shape as ``programs``.
+    BF16 weights throughout (FP8 decode weights are a later step)."""
+    from b12x.integration.cuteafd import mimo_attention as attn
+    from b12x.integration.cuteafd import mimo_ffn as ffn
+
+    out = [
+        ("norm", "norm", {}, lambda: ffn.compile_mimo_norm_aot(g)),
+        ("router_scores", "router_scores", {}, lambda: ffn.compile_mimo_router_scores_aot(g)),
+        ("expert_input_quant", "expert_input_quant", {}, lambda: ffn.compile_mimo_expert_input_quant_aot(g)),
+    ]
+    for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
+        out += [
+            (f"o_m{rows}", "o", {"max_rows": rows}, lambda r=rows: attn.compile_mimo_o_aot(g, max_rows=r)),
+            (f"ffn_m{rows}", "ffn", {"max_rows": rows, "inter": g.dense_inter},
+             lambda r=rows: ffn.compile_mimo_ffn_aot(g, max_rows=r)),
+        ]
+        for kind in ("full", "swa"):
+            out += [
+                (f"{kind}_producer_m{rows}", "producer", {"kind": kind, "max_rows": rows},
+                 lambda k=kind, r=rows: attn.compile_mimo_producer_aot(g, kind=k, max_rows=r)),
+                (f"{kind}_attention_{mode}_m{rows}", "attention", {"kind": kind, "route": mode, "max_rows": rows},
+                 lambda k=kind, m=mode, r=rows: attn.compile_mimo_attention_aot(g, kind=k, route=m, max_rows=r)),
+            ]
+    return out
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--geometry", default="flash",
-                        help="comma-separated geometries in one table: flash, pro (DeepSeek V4), glm (GLM 5.x)")
+                        help="comma-separated geometries in one table: flash, pro (DeepSeek V4), glm (GLM 5.x), "
+                             "mimo (MiMo V2 Flash)")
     parser.add_argument("--decode-rows", type=int, default=64)
     parser.add_argument("--prefill-rows", type=int, default=4096)
     parser.add_argument("--max-context", type=int, default=131072)
@@ -141,11 +170,13 @@ def main() -> None:
     args = parser.parse_args()
 
     import torch
-    from b12x.integration.cuteafd import FLASH, GLM53, PRO, exportable_compilation, validate_exported_header
+    from b12x.integration.cuteafd import (
+        FLASH, GLM53, MIMO_V2_FLASH, PRO, exportable_compilation, validate_exported_header,
+    )
 
     geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
-    if not geometries or any(name not in ("flash", "pro", "glm") for name in geometries):
-        raise SystemExit("--geometry takes flash, pro and/or glm")
+    if not geometries or any(name not in ("flash", "pro", "glm", "mimo") for name in geometries):
+        raise SystemExit("--geometry takes flash, pro, glm and/or mimo")
     props = torch.cuda.get_device_properties(0)
     if (props.major, props.minor) != (12, 0):
         raise SystemExit("coordinator programs export on SM120")
@@ -164,10 +195,10 @@ def main() -> None:
     entries, includes = [], []
     work = []
     for name in geometries:
-        g = {"flash": FLASH, "pro": PRO, "glm": GLM53}[name]
-        family = {"flash": "dsv4f", "pro": "dsv4p", "glm": "glm"}[name]
+        g = {"flash": FLASH, "pro": PRO, "glm": GLM53, "mimo": MIMO_V2_FLASH}[name]
+        family = {"flash": "dsv4f", "pro": "dsv4p", "glm": "glm", "mimo": "mimo"}[name]
         manifest["families"][family] = {k: v for k, v in vars(g).items()}
-        make = glm_programs if name == "glm" else programs
+        make = {"glm": glm_programs, "mimo": mimo_programs}.get(name, programs)
         work += [(family, *item) for item in make(g, args.decode_rows, args.prefill_rows, args.max_context)]
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
