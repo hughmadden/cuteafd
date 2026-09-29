@@ -268,6 +268,26 @@ impl NativeLibrary {
         ensure!(status == 0, "DeepSeek V4 router select failed with {status}");
         Ok(())
     }
+
+    /// [`Self::dsv4_router_select`] with `sigmoid` selecting GLM's sigmoid
+    /// scores (noaux_tc) instead of sqrtsoftplus.
+    ///
+    /// # Safety
+    /// As [`Self::dsv4_router_select`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn router_select(&self, logits: *mut c_void, bias: *const c_void, tid2eid: *const c_void,
+        tokens: *const c_void, ids: *mut c_void, routing: *mut c_void, rows: usize, experts: usize, topk: usize,
+        route_scale: f32, sigmoid: bool, stream: *mut c_void) -> Result<()> {
+        type Select = unsafe extern "C" fn(*mut c_void, *const c_void, *const c_void, *const c_void, *mut c_void,
+            *mut c_void, i32, i32, i32, f32, i32, *mut c_void) -> i32;
+        let select = *unsafe { self.lib.get::<Select>(b"cuteafd_router_select") }?;
+        let status = unsafe {
+            select(logits, bias, tid2eid, tokens, ids, routing, i32::try_from(rows)?, i32::try_from(experts)?,
+                i32::try_from(topk)?, route_scale, i32::from(sigmoid), stream)
+        };
+        ensure!(status == 0, "DeepSeek V4 router select failed with {status}");
+        Ok(())
+    }
 }
 
 /// dSpark drafter kernels (native/cuda/kernels/dsv4_dspark.cu).

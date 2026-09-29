@@ -69,14 +69,15 @@ __global__ void __launch_bounds__(256) score_rows_kernel(const __nv_bfloat16* hi
 // Top-k with warp-shuffle argmax rounds. The winner of each round is the
 // largest corrected score with the lowest expert index on ties, exactly as in
 // the shared-memory tree of `select_kernel`, so selections are identical.
-template<bool TransformLogits = false>
+template<bool TransformLogits = false,bool Sigmoid = false>
 __global__ void __launch_bounds__(512) select_fast_kernel(float* scores,const float* bias,const float* bias_vl,
     const uint8_t* image_mask,uint32_t* ids,float* routing,int experts,int topk,float scale=1.5f) {
   const uint64_t row=blockIdx.x;const int tid=threadIdx.x;const int lane=tid&31,warp=tid>>5;
   if constexpr (TransformLogits) {
     if(tid<experts) {
       const float logit=scores[row*experts+tid];
-      scores[row*experts+tid]=sqrtf(logit>20.0f?logit:log1pf(expf(logit)));
+      // DeepSeek sqrtsoftplus, or GLM's sigmoid (noaux_tc).
+      scores[row*experts+tid]=Sigmoid?1.0f/(1.0f+expf(-logit)):sqrtf(logit>20.0f?logit:log1pf(expf(logit)));
     }
     __syncthreads();
   }
@@ -224,6 +225,11 @@ extern "C" int32_t cuteafd_v41_router_select_logits(float* scores,const float* b
 extern "C" int32_t cuteafd_dsv4_router_select(float* logits,const float* bias,const int32_t* tid2eid,
     const uint32_t* tokens,uint32_t* ids,float* routing,int32_t rows,int32_t experts,int32_t topk,
     float route_scale,void* stream) {
+  return cuteafd_router_select(logits,bias,tid2eid,tokens,ids,routing,rows,experts,topk,route_scale,0,stream);
+}
+extern "C" int32_t cuteafd_router_select(float* logits,const float* bias,const int32_t* tid2eid,
+    const uint32_t* tokens,uint32_t* ids,float* routing,int32_t rows,int32_t experts,int32_t topk,
+    float route_scale,int32_t sigmoid,void* stream) {
   if(rows<1 || rows>4096 || experts<1 || experts>512 || topk<1 || topk>8 || topk>experts ||
       (tid2eid==nullptr)==(bias==nullptr) || (tid2eid && !tokens)) return cudaErrorInvalidValue;
   const void* p[]={logits,ids,routing};
@@ -231,8 +237,11 @@ extern "C" int32_t cuteafd_dsv4_router_select(float* logits,const float* bias,co
   for(int i=0;i<3;++i) if(!span(p[i],n[i],4)) return cudaErrorInvalidValue;
   for(int i=1;i<3;++i) for(int j=0;j<i;++j) if(!disjoint(p[i],n[i],p[j],n[j])) return cudaErrorInvalidValue;
   auto s=reinterpret_cast<cudaStream_t>(stream);
+  if(tid2eid && sigmoid) return cudaErrorInvalidValue;
   if(tid2eid) {
     select_hash_kernel<<<rows,32,0,s>>>(logits,tid2eid,tokens,ids,routing,experts,topk,route_scale);
+  } else if(sigmoid) {
+    select_fast_kernel<true,true><<<rows,512,0,s>>>(logits,bias,bias,nullptr,ids,routing,experts,topk,route_scale);
   } else {
     select_fast_kernel<true><<<rows,512,0,s>>>(logits,bias,bias,nullptr,ids,routing,experts,topk,route_scale);
   }
