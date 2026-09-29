@@ -52,11 +52,24 @@ impl FusedQkvLayout {
 
     /// Every (shard, part) run, in checkpoint order.
     pub fn segments(&self) -> Vec<QkvSegment> {
-        let (q_all, k_all) = (self.shards * self.q, self.shards * self.k);
+        self.segments_with_key_stride(self.k)
+    }
+
+    /// Rows of the de-interleaved `[q; k; v]` whose keys sit `key_stride` rows
+    /// apart (`key_stride` >= a shard's key rows; the gap is zero padding).
+    pub fn padded_rows(&self, key_stride: usize) -> usize {
+        self.shards * (self.q + key_stride + self.v)
+    }
+
+    /// `segments` into the layout whose shard keys sit `key_stride` rows apart:
+    /// with one KV head per shard and `key_stride` a multiple of 128, every
+    /// checkpoint 128x128 block lands on a whole 128-row block (V2.6 Pro: 256).
+    pub fn segments_with_key_stride(&self, key_stride: usize) -> Vec<QkvSegment> {
+        let (q_all, k_all) = (self.shards * self.q, self.shards * key_stride);
         let mut out = Vec::with_capacity(3 * self.shards);
         let (mut source_row, mut scale_row) = (0, 0);
         for shard in 0..self.shards {
-            for (rows, dest_row) in [(self.q, shard * self.q), (self.k, q_all + shard * self.k),
+            for (rows, dest_row) in [(self.q, shard * self.q), (self.k, q_all + shard * key_stride),
                 (self.v, q_all + k_all + shard * self.v)] {
                 out.push(QkvSegment { source_row, scale_row, dest_row, rows });
                 source_row += rows;

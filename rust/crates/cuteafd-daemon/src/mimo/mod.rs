@@ -45,6 +45,10 @@ pub(crate) struct EngineArgs {
     /// resident layers' experts must fit: 6.4 GiB each).
     #[arg(long)]
     pub local_experts: bool,
+    /// Decode steps project qkv from the checkpoint's FP8 weight (V2.6 Pro;
+    /// +170 MB per layer next to the BF16 copy prefill uses).
+    #[arg(long)]
+    pub fp8_qkv: bool,
     /// With --local-experts: keep only N MoE layers' experts resident and load
     /// each missing layer over the oldest (prefill checks of models whose
     /// experts do not fit one GPU, such as V2.6 Pro).
@@ -123,7 +127,7 @@ impl Opened {
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::MimoLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
-            checkpoint_tp: cuteafd_loader::mimo_v2::checkpoint_tp(&args.snapshot)? };
+            checkpoint_tp: cuteafd_loader::mimo_v2::checkpoint_tp(&args.snapshot)?, fp8_qkv: args.fp8_qkv };
         let model = loader.model(&self.cfg, layers)?;
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64, "MiMo coordinator weights resident");
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);

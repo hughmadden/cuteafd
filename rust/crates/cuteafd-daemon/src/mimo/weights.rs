@@ -34,6 +34,10 @@ impl MimoLayer<'_> {
 
     /// The router scores program's weight operand: `w_hilo` (FP32 weight split
     /// into BF16 hi + lo, Flash) or `w_router` (BF16 as stored, V2.6 Pro).
+    pub fn has(&self, operand: &str) -> bool {
+        self.operands.contains_key(operand)
+    }
+
     pub fn router_operand(&self) -> Result<(&'static str, *mut c_void)> {
         for name in ["w_hilo", "w_router"] {
             if let Some(weight) = self.operands.get(name) {
@@ -56,6 +60,8 @@ pub(crate) struct MimoLoader<'a> {
     pub stream: *mut c_void,
     /// The checkpoint's tensor-parallel degree (fused `qkv_proj` row shards).
     pub checkpoint_tp: usize,
+    /// Keep V2.6 Pro's FP8 qkv rows for the decode producers (+170 MB per layer).
+    pub fp8_qkv: bool,
 }
 
 impl<'a> MimoLoader<'a> {
@@ -137,25 +143,64 @@ impl<'a> MimoLoader<'a> {
     }
 
     /// V2.6 Pro's fused `qkv_proj` (FP8, TP-interleaved row shards with their
-    /// own 128x128 grids) dequantized into the de-interleaved `[q; k; v]`.
-    fn fused_qkv(&self, cfg: &MimoV2Config, attention: MimoAttention, name: &str) -> Result<DeviceAllocation<'a>> {
+    /// own 128x128 grids) in the coordinator's `[q; k; v]` layout with keys
+    /// `cfg.qkv_key_stride()` rows apart (256: each 192-row key zero-padded so
+    /// every checkpoint block is a whole 128-row block). Returns the BF16
+    /// weight and, with `fp8`, the E4M3 rows and FP32 grid in that layout (the
+    /// decode producers' operands; exactly the checkpoint's values).
+    fn fused_qkv(&self, cfg: &MimoV2Config, attention: MimoAttention, name: &str, fp8: bool)
+        -> Result<(DeviceAllocation<'a>, Option<(DeviceAllocation<'a>, DeviceAllocation<'a>)>)> {
         let layout = FusedQkvLayout::new(cfg, attention, self.checkpoint_tp)?;
         let (bytes, dtype, shape) = self.raw(name)?;
         let (scale, scale_dtype, scale_shape) = self.raw(&format!("{name}_scale_inv"))?;
         let cols = shape[1];
-        ensure!(dtype == DType::F8E4M3 && shape == [layout.rows(), cols] && scale_dtype == DType::F32
-            && scale_shape == [layout.scale_rows(), cols.div_ceil(128)],
-            "{name}: expected E4M3 [{}, {cols}] with FP32 [{}, {}] scales for checkpoint TP {}, found {dtype:?} {shape:?} / \
-             {scale_dtype:?} {scale_shape:?}", layout.rows(), layout.scale_rows(), cols.div_ceil(128), self.checkpoint_tp);
-        let out = DeviceAllocation::new(self.library, layout.rows() * cols * 2)?;
-        let (w, s) = (self.upload(&bytes)?, self.upload(&scale)?);
         let k_blocks = cols.div_ceil(128);
-        for segment in layout.segments() {
-            // SAFETY: the segment's source rows, their scale rows and the destination
-            // rows lie inside `w`, `s` and `out`; the stream drains before `w`/`s` drop.
+        ensure!(dtype == DType::F8E4M3 && shape == [layout.rows(), cols] && scale_dtype == DType::F32
+            && scale_shape == [layout.scale_rows(), k_blocks] && cols % 128 == 0,
+            "{name}: expected E4M3 [{}, {cols}] with FP32 [{}, {}] scales for checkpoint TP {}, found {dtype:?} {shape:?} / \
+             {scale_dtype:?} {scale_shape:?}", layout.rows(), layout.scale_rows(), k_blocks, self.checkpoint_tp);
+        let stride = cfg.qkv_key_stride();
+        let segments = if stride == layout.k {
+            layout.segments()
+        } else {
+            ensure!(layout.k == cfg.head_dim && stride % 128 == 0 && layout.q % 128 == 0 && layout.v % 128 == 0,
+                "{name}: padded keys need one KV head per checkpoint shard and 128-row query/value shards");
+            layout.segments_with_key_stride(stride)
+        };
+        let width = layout.padded_rows(stride);
+        // The padded E4M3 rows and grid (unused rows and blocks stay zero).
+        let mut values = vec![0u8; width * cols];
+        let mut grid = vec![0u8; width.div_ceil(128) * k_blocks * 4];
+        let uniform = stride % 128 == 0;
+        for segment in &segments {
+            values[segment.dest_row * cols..][..segment.rows * cols]
+                .copy_from_slice(&bytes[segment.source_row * cols..][..segment.rows * cols]);
+            if uniform {
+                let blocks = segment.rows.div_ceil(128) * k_blocks * 4;
+                grid[segment.dest_row / 128 * k_blocks * 4..][..blocks]
+                    .copy_from_slice(&scale[segment.scale_row * k_blocks * 4..][..blocks]);
+            }
+        }
+        let out = DeviceAllocation::new(self.library, width * cols * 2)?;
+        self.library.cuda_zero_bytes(out.buffer, out.buffer.bytes)?;
+        let w = self.upload(&values)?;
+        if uniform {
+            let s = self.upload(&grid)?;
+            // SAFETY: `w`, `s` and `out` hold the padded layout; the stream drains before return.
+            unsafe {
+                self.library.fp8_block_dequant(w.buffer.ptr, s.buffer.ptr, out.buffer.ptr, width, cols, self.stream)?;
+                self.library.cuda_stream_synchronize(self.stream)?;
+            }
+            return Ok((out, fp8.then_some((w, s))));
+        }
+        ensure!(!fp8, "{name}: FP8 qkv needs keys padded to 128-row blocks");
+        let s = self.upload(&scale)?;
+        for segment in &segments {
+            // SAFETY: the segment's source rows (already at their destination in `w`),
+            // their scale rows and the destination rows lie inside `w`, `s` and `out`.
             unsafe {
                 self.library.fp8_block_dequant(
-                    w.buffer.ptr.cast::<u8>().add(segment.source_row * cols).cast(),
+                    w.buffer.ptr.cast::<u8>().add(segment.dest_row * cols).cast(),
                     s.buffer.ptr.cast::<u8>().add(segment.scale_row * k_blocks * 4).cast(),
                     out.buffer.ptr.cast::<u8>().add(segment.dest_row * cols * 2).cast(),
                     segment.rows, cols, self.stream)?;
@@ -163,7 +208,7 @@ impl<'a> MimoLoader<'a> {
         }
         // SAFETY: the engine owns this stream.
         unsafe { self.library.cuda_stream_synchronize(self.stream)? };
-        Ok(out)
+        Ok((out, None))
     }
 
     fn one(&self, name: &str) -> Result<DeviceAllocation<'a>> {
@@ -203,12 +248,18 @@ impl<'a> MimoLoader<'a> {
         ops.insert("input_norm", self.one(&format!("{p}.input_layernorm.weight"))?);
         ops.insert("post_norm", self.one(&format!("{p}.post_attention_layernorm.weight"))?);
         let fused = format!("{p}.self_attn.qkv_proj.weight");
-        ops.insert("w_qkv", if self.has(&fused) {
-            self.fused_qkv(cfg, attention, &fused)?
+        let w_qkv = if self.has(&fused) {
+            let (bf16, fp8) = self.fused_qkv(cfg, attention, &fused, self.fp8_qkv)?;
+            if let Some((values, grid)) = fp8 {
+                ops.insert("w_qkv_fp8", values);
+                ops.insert("w_qkv_scale", grid);
+            }
+            bf16
         } else {
             self.rows(&[format!("{p}.self_attn.q_proj.weight"), format!("{p}.self_attn.k_proj.weight"),
                 format!("{p}.self_attn.v_proj.weight")])?
-        });
+        };
+        ops.insert("w_qkv", w_qkv);
         ops.insert("w_o", self.one(&format!("{p}.self_attn.o_proj.weight"))?);
         let sinks = match attention {
             MimoAttention::Full => cfg.full_sinks,

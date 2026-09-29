@@ -471,9 +471,17 @@ impl<'a> MimoEngine<'a> {
             MimoAttention::Full => self.kv[index].buffer.ptr,
             MimoAttention::Sliding => w.kv_step.buffer.ptr,
         };
-        self.run(&format!("mimo_{k}_producer_{cap}"), &[("x", w.x.buffer.ptr), ("positions", w.positions.buffer.ptr),
-            ("kv_slots", slots), ("cos_sin", cos_sin), ("w_qkv", layer.ptr("w_qkv")?), ("kv_cache", records),
-            ("query", w.query.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])?;
+        if tables.decode && layer.has("w_qkv_fp8") {
+            self.run(&format!("mimo_{k}_producer_fp8_{cap}"), &[("x", w.x.buffer.ptr),
+                ("positions", w.positions.buffer.ptr), ("kv_slots", slots), ("cos_sin", cos_sin),
+                ("w_qkv", layer.ptr("w_qkv")?), ("w_qkv_fp8", layer.ptr("w_qkv_fp8")?),
+                ("w_qkv_scale", layer.ptr("w_qkv_scale")?), ("kv_cache", records), ("query", w.query.buffer.ptr),
+                ("scratch", w.scratch.buffer.ptr)], &[rows])?;
+        } else {
+            self.run(&format!("mimo_{k}_producer_{cap}"), &[("x", w.x.buffer.ptr), ("positions", w.positions.buffer.ptr),
+                ("kv_slots", slots), ("cos_sin", cos_sin), ("w_qkv", layer.ptr("w_qkv")?), ("kv_cache", records),
+                ("query", w.query.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])?;
+        }
         let name = format!("mimo_{k}_attention_{mode}_{cap}");
         match layer.attention {
             MimoAttention::Full => {

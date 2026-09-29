@@ -155,6 +155,10 @@ def mimo_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                 (f"{kind}_attention_{mode}_m{rows}", "attention", {"kind": kind, "route": mode, "max_rows": rows},
                  lambda k=kind, m=mode, r=rows: attn.compile_mimo_attention_aot(g, kind=k, route=m, max_rows=r)),
             ]
+            if mode == "decode" and g.fp8_qkv:
+                # Decode rows read the checkpoint's FP8 qkv weight (half the BF16 bytes).
+                out.append((f"{kind}_producer_fp8_m{rows}", "producer", {"kind": kind, "max_rows": rows, "fp8": True},
+                            lambda k=kind, r=rows: attn.compile_mimo_producer_aot(g, kind=k, max_rows=r, fp8=True)))
     return out
 
 

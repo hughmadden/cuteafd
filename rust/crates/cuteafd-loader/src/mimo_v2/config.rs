@@ -143,6 +143,12 @@ impl MimoV2Config {
         }
     }
 
+    /// Rows between key heads in the coordinator's qkv layout: 192, or 256 for
+    /// `mimop` (keys zero-padded to whole 128-row blocks; see `FusedQkvLayout`).
+    pub fn qkv_key_stride(&self) -> usize {
+        if self.program_family().ok() == Some("mimop") { 256 } else { self.head_dim }
+    }
+
     pub fn kv_heads(&self, attention: MimoAttention) -> usize {
         match attention {
             MimoAttention::Full => self.full_kv_heads,
