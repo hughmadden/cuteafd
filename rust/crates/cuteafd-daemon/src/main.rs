@@ -6,6 +6,7 @@ use std::process::Command;
 mod cli;
 mod commands;
 mod dsv4;
+mod glm;
 mod v41_compressor;
 mod v41_vision;
 mod v41_index_query;
@@ -65,6 +66,7 @@ async fn main() -> Result<()> {
         Commands::Plan(args) => run_plan(args),
         Commands::ExpertProbe(args) => run_expert_probe(args).await,
         Commands::Dsv4Golden(args) => dsv4::run_golden(args).await,
+        Commands::GlmGolden(args) => glm::run_golden(args).await,
         Commands::ServeDsv4(args) => dsv4::serve::run_serve(args).await,
         Commands::Fabric(args) => {
             let report = cuteafd_transport::fabric::discover()?;
