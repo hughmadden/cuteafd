@@ -6,16 +6,20 @@ use serde_json::Value;
 
 use crate::plan::checkpoint::{opt_usize_field, usize_field, Checkpoint};
 use crate::plan::family::{Family, Hint, RuntimeStatus};
+use crate::plan::format::WeightFormat;
 use crate::plan::names::indexed;
 use crate::plan::spec::*;
 
 pub struct Glm {
     id: &'static str,
     architecture: &'static str,
+    runtime: RuntimeStatus,
 }
 
-pub static GLM_DSA: Glm = Glm { id: "glm_dsa", architecture: "GlmMoeDsaForCausalLM" };
-pub static GLM_NEXT: Glm = Glm { id: "glm_next", architecture: "Glm5NextForConditionalGeneration" };
+pub static GLM_DSA: Glm = Glm { id: "glm_dsa", architecture: "GlmMoeDsaForCausalLM", runtime: RuntimeStatus::Planned };
+/// GLM 5.3 Flash: serve-glmf / glmf-golden on the glmf coordinator programs.
+pub static GLM_NEXT: Glm =
+    Glm { id: "glm_next", architecture: "Glm5NextForConditionalGeneration", runtime: RuntimeStatus::Serving };
 
 fn str_list(config: &Value, key: &str) -> Vec<String> {
     config
@@ -34,7 +38,27 @@ impl Family for Glm {
         self.id
     }
     fn runtime(&self) -> RuntimeStatus {
-        RuntimeStatus::Planned
+        self.runtime
+    }
+
+    fn executes(&self, component: Component, format: &WeightFormat) -> bool {
+        if self.runtime != RuntimeStatus::Serving {
+            return false;
+        }
+        use WeightFormat::*;
+        // glmf: BF16/F32 coordinator tensors (FP8 128x128 blocks dequantized at
+        // load); routed experts from EXL3 K3/K4 packages (exl3-glmf-k34) or the
+        // checkpoint's FP8 (fp8-glmf).
+        match component {
+            Component::RoutedExpert => matches!(format, Exl3 { bits: 3..=4 } | Fp8Block { block: (128, 128) }),
+            Component::Speculator | Component::SpeculatorExpert | Component::Vision => false,
+            _ => matches!(format, Fp8Block { block: (128, 128) } | Bf16 | F32),
+        }
+    }
+
+    fn optional(&self, component: Component) -> bool {
+        // Text serving runs without the native MTP layer and the vision tower.
+        self.id == "glm_next" && matches!(component, Component::Speculator | Component::SpeculatorExpert | Component::Vision)
     }
     fn detect(&self, checkpoint: &Checkpoint) -> bool {
         checkpoint.architectures().iter().any(|arch| arch == self.architecture)
@@ -203,10 +227,15 @@ impl Family for Glm {
         let (what, how) = match (self.id, component) {
             ("glm_next", Component::Attention) => (
                 "hybrid attention: Kimi Delta Attention (linear) layers plus MLA+DSA layers".to_string(),
-                "KDA needs chunked prefill and recurrent decode kernels: b12x sequence/kda_prefill and \
-                 sequence/gdn_decode are the starting points. MLA layers use no RoPE (mla_use_nope) and \
-                 the indexer compresses keys (index_kpool). State for KDA layers is per-request \
-                 recurrent state, not a paged KV cache: add a state pool beside the KV allocator.".to_string(),
+                "Runs as the glmf programs (b12x integration/cuteafd/glmf.py: token-sequential KDA \
+                 recurrence, no-RoPE MLA over 528-byte FP8 records, pooled indexer) in \
+                 cuteafd-daemon src/glmf. Faster prefill: b12x sequence/kda_prefill (chunked) for \
+                 the recurrence.".to_string(),
+            ),
+            ("glm_next", Component::Speculator) | ("glm_next", Component::SpeculatorExpert) => (
+                "native MTP layer 45 (not run); DFlash2 drafter incoai/GLM-5.3-Flash-DFlash2".to_string(),
+                "serve-glmf verifies copy-window drafts only. KDA state needs a rollback for any \
+                 speculator: serve-glmf backs it up per verify and replays kept rows (glmf/serve.rs).".to_string(),
             ),
             ("glm_next", Component::Indexer) => (
                 "DSA indexer over 4-token key pools".to_string(),

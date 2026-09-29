@@ -291,6 +291,29 @@ pub(crate) struct GlmfEngine<'a> {
     experts: Option<Experts<'a>>,
     /// Host seconds: GPU wait before expert exchanges, the exchanges.
     pub profile: RefCell<[f64; 2]>,
+    /// Captured decode segments (CUTEAFD_GLMF_GRAPHS=0 runs decode eagerly).
+    graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
+    use_graphs: bool,
+}
+
+/// What a captured decode segment baked in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct GraphKey {
+    segment: usize,
+    rows: usize,
+    long: bool,
+    pool_width: usize,
+    page_stride: usize,
+    pool_stride: usize,
+}
+
+struct GraphExec<'a>(*mut c_void, &'a NativeLibrary);
+
+impl Drop for GraphExec<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the executable graph is owned here and no longer launched.
+        let _ = unsafe { self.1.cuda_graph_exec_destroy(self.0) };
+    }
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -331,7 +354,8 @@ impl<'a> GlmfEngine<'a> {
         let pool_logical = zeroed(pool_pages * 4)?;
         Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, slots, kv, state, index,
             pool_logical, pool_pages, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
-            experts: None, profile: RefCell::new([0.0; 2]) })
+            experts: None, profile: RefCell::new([0.0; 2]), graphs: RefCell::new(std::collections::HashMap::new()),
+            use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0") })
     }
 
     /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
@@ -549,8 +573,11 @@ impl<'a> GlmfEngine<'a> {
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<Vec<f32>>> {
         let rows: usize = sequences.iter().map(|(_, n)| n).sum();
         ensure!(rows > 0 && rows <= DECODE_ROWS && embed.len() == rows * self.cfg.hidden * 2, "decode step of {rows} rows");
-        let page_stride = sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1);
-        let pool_stride = sequences.iter().map(|(p, _)| p.pool_pages.len()).max().unwrap_or(1);
+        // Power-of-two strides and widths bound the graphs a growing batch captures.
+        let page_stride = sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1).next_power_of_two()
+            .min(self.pages);
+        let pool_stride = sequences.iter().map(|(p, _)| p.pool_pages.len()).max().unwrap_or(1).next_power_of_two()
+            .min(self.pool_pages);
         let mut tables = StepTables { decode: true, page_stride, pool_stride, ..Default::default() };
         for (placement, count) in sequences.iter() {
             if placement.len == 0 {
@@ -567,6 +594,7 @@ impl<'a> GlmfEngine<'a> {
                 tables.pool_table.extend(pools);
             }
         }
+        tables.pool_width = tables.pool_width.next_power_of_two().min(pool_stride);
         let logits = self.step(&tables, embed, rows, on_layer, None)?;
         for (placement, count) in sequences.iter_mut() {
             placement.len += *count;
@@ -603,6 +631,9 @@ impl<'a> GlmfEngine<'a> {
         }
         self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: streams.len(), ..w.streams[0].buffer }, &streams)?;
         let rows = Dsv4Scalar::I32(t as i32);
+        if self.use_graphs && tables.decode && on_layer.is_none() && forced.is_none() {
+            return self.decode_graphed(w, tables, t, rows, logit_rows);
+        }
         let cap = if tables.decode { "m64" } else { "m4096" };
         let layers = &self.weights.layers;
         let mut cur = 0usize;
@@ -660,6 +691,81 @@ impl<'a> GlmfEngine<'a> {
         }
         let logits = self.download(&w.logits, logit_rows * self.cfg.vocab_size * 4)?;
         Ok(Some(logits.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()))
+    }
+
+    /// A decode step as captured segments: segment `i` posts layer `i - 1`'s
+    /// FFN output into the streams with layer `i`'s attention-site collapse,
+    /// then runs layer `i` up to its routed experts, which run (local or on
+    /// the Sparks) between segments. Streams start and end in buffer 0.
+    fn decode_graphed(&self, w: &Workspace<'_>, tables: &StepTables, t: usize, rows: Dsv4Scalar, logit_rows: usize)
+        -> Result<Option<Vec<f32>>> {
+        let layers = &self.weights.layers;
+        for index in 0..=layers.len() {
+            let key = GraphKey { segment: index, rows: t, long: tables.long, pool_width: tables.pool_width,
+                page_stride: tables.page_stride, pool_stride: tables.pool_stride };
+            self.replay(key, || -> Result<()> {
+                let Some(layer) = layers.get(index) else {
+                    return self.run("mhc_post", &[("x", w.delta.buffer.ptr), ("residual", w.streams[1].buffer.ptr),
+                        ("prev_post", w.post.buffer.ptr), ("prev_comb", w.comb.buffer.ptr),
+                        ("out", w.streams[0].buffer.ptr)], &[rows]);
+                };
+                if index == 0 {
+                    self.pre(w, &w.streams[0], layer, rows)?;
+                } else {
+                    self.post_pre(w, 1, layer, "attn", "input_norm", rows, "m64")?;
+                }
+                match layer.attention {
+                    GlmNextAttention::Kda => self.kda(w, index, layer, rows, "m64")?,
+                    GlmNextAttention::Mla => self.mla(w, index, layer, rows, "m64", tables)?,
+                }
+                self.post_pre(w, 0, layer, "ffn", "post_norm", rows, "m64")?;
+                if layer.dense {
+                    self.run(&format!("ffn_i{}_m64", self.cfg.dense_intermediate), &[("x", w.x.buffer.ptr),
+                        ("w_gate_up", layer.ptr("w_gate_up")?), ("w_down", layer.ptr("w_down")?),
+                        ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])
+                } else {
+                    self.moe_front(w, index, layer, t, rows, "m64")
+                }
+            })?;
+            if layers.get(index).is_some_and(|layer| !layer.dense) {
+                self.moe_experts(w, index, t, rows, true)?;
+            }
+        }
+        if layers.len() < self.cfg.layers {
+            // SAFETY: the engine owns this stream.
+            unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+            return Ok(None);
+        }
+        let h = self.cfg.hidden;
+        self.run("head", &[("streams", w.streams[0].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
+            ("out", w.x.buffer.ptr)], &[rows])?;
+        // SAFETY: the head's input and operands are live buffers of these shapes.
+        unsafe {
+            w.head.launch(w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2).cast(),
+                self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), logit_rows as u32, self.stream)?;
+        }
+        let logits = self.download(&w.logits, logit_rows * self.cfg.vocab_size * 4)?;
+        Ok(Some(logits.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()))
+    }
+
+    /// Launches `segment` through a graph captured the first time `key` is seen.
+    fn replay(&self, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+        if let Some(graph) = self.graphs.borrow().get(&key) {
+            // SAFETY: the graph's pointers are persistent engine buffers.
+            return unsafe { self.library.cuda_graph_launch(graph.0, self.stream) };
+        }
+        // SAFETY: capture records this stream's launches; nothing in a segment
+        // synchronizes the host or allocates.
+        unsafe { self.library.cuda_graph_begin_capture(self.stream)? };
+        let captured = segment();
+        // SAFETY: ends the capture begun above on the same stream.
+        let exec = unsafe { self.library.cuda_graph_end_capture(self.stream) };
+        captured?;
+        let exec = exec?;
+        // SAFETY: the new graph reads and writes persistent engine buffers.
+        unsafe { self.library.cuda_graph_launch(exec, self.stream)? };
+        self.graphs.borrow_mut().insert(key, GraphExec(exec, self.library));
+        Ok(())
     }
 
     /// Attention-site collapse and input norm of `layer` from `streams`.
@@ -732,6 +838,14 @@ impl<'a> GlmfEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn moe(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, t: usize, rows: Dsv4Scalar, cap: &str,
         decode: bool) -> Result<()> {
+        self.moe_front(w, index, layer, t, rows, cap)?;
+        self.moe_experts(w, index, t, rows, decode)
+    }
+
+    /// Router logits, the sigmoid top-8, the shared expert (into `shared`)
+    /// and, for wire-fed experts, the FP8 K32 wire rows. No host sync.
+    fn moe_front(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, t: usize, rows: Dsv4Scalar, cap: &str)
+        -> Result<()> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let experts = self.experts.as_ref().with_context(|| format!(
             "layer {index} is an MoE layer: pass --local-experts (FP8 package) or Spark --peers \
@@ -747,6 +861,21 @@ impl<'a> GlmfEngine<'a> {
         self.run(&format!("ffn_i{}_{cap}", self.cfg.moe_intermediate), &[("x", w.x.buffer.ptr),
             ("w_gate_up", layer.ptr("w_gate_up")?), ("w_down", layer.ptr("w_down")?),
             ("out", w.shared.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])?;
+        if !matches!(experts, Experts::Local(_)) {
+            let grid = (t * h.div_ceil(256)).div_ceil(8).clamp(1, 4 * 188);
+            self.run("expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
+                // SAFETY: the scale rows follow the payload inside each wire row.
+                ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
+                ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Dsv4Scalar::I32(grid as i32)])?;
+        }
+        Ok(())
+    }
+
+    /// The routed experts of layer `index` (the front ran); leaves
+    /// `bf16(routed + shared)` in `delta`.
+    fn moe_experts(&self, w: &Workspace<'_>, index: usize, t: usize, rows: Dsv4Scalar, decode: bool) -> Result<()> {
+        let h = self.cfg.hidden;
+        let experts = self.experts.as_ref().context("MoE layer without experts")?;
         match experts {
             Experts::Local(local) => {
                 let resident = local.index_of(index)?;
@@ -763,11 +892,6 @@ impl<'a> GlmfEngine<'a> {
                 unsafe { self.library.cuda_stream_synchronize(self.stream)? };
             }
             Experts::LocalExl3(local) => {
-                let grid = (t * h.div_ceil(256)).div_ceil(8).clamp(1, 4 * 188);
-                self.run("expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
-                    // SAFETY: the scale rows follow the payload inside each wire row.
-                    ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
-                    ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Dsv4Scalar::I32(grid as i32)])?;
                 local.ensure(index, self.stream)?;
                 let mut resident = local.resident.borrow_mut();
                 let (_, experts) = resident.as_mut().context("EXL3 window")?;
@@ -781,11 +905,6 @@ impl<'a> GlmfEngine<'a> {
                 return Ok(());
             }
             Experts::Spark { transport, runtime } => {
-                let grid = (t * h.div_ceil(256)).div_ceil(8).clamp(1, 4 * 188);
-                self.run("expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
-                    // SAFETY: the scale rows follow the payload inside each wire row.
-                    ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
-                    ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Dsv4Scalar::I32(grid as i32)])?;
                 // The compact reducer adds the shared expert plane to the rank partials.
                 return self.spark_moe(w, index, t, decode, &mut transport.borrow_mut(), runtime);
             }
