@@ -42,7 +42,7 @@ fn prefill_with_taps(opened: &Opened, engine: &GlmfEngine<'_>, placement: &mut G
     slot: usize) -> Result<Vec<f32>> {
     let hidden = opened.cfg.hidden;
     let mut logits = None;
-    for chunk in tokens.chunks(engine.prefill_rows) {
+    for chunk in tokens.chunks(engine.prefill_capacity()) {
         let start = placement.len;
         logits = engine.prefill(placement, &embed_rows(&opened.checkpoint, chunk, hidden)?, None)?;
         if let Some(drafter) = &engine.drafter {

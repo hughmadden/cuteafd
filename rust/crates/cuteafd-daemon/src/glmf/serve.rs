@@ -289,7 +289,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 }));
                 let started = Instant::now();
                 let mut logits = None;
-                for chunk in tokens.chunks(engine.prefill_rows) {
+                for chunk in tokens.chunks(engine.prefill_capacity()) {
                     let embed = embed_rows(&opened.checkpoint, chunk, hidden)?;
                     let start = placement.len;
                     logits = engine.prefill(&mut placement, &embed, None)?;

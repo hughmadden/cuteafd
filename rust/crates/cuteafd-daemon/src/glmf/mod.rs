@@ -129,6 +129,11 @@ pub(crate) struct GoldenArgs {
     /// tokens) on fresh sequences, without layer downloads.
     #[arg(long, default_value_t = 0)]
     pub bench_prefill: usize,
+    /// Prompt length of --bench-prefill (the golden tokens repeated), in
+    /// chunks of the engine's prefill capacity; default the golden prompt up
+    /// to one chunk.
+    #[arg(long)]
+    pub bench_prefill_tokens: Option<usize>,
     /// With --draft: run only the drafter on the golden taps (the layers'
     /// stream means) and compare with python/reference/glm_dflash2/reference.py's
     /// output directory.
@@ -269,11 +274,13 @@ impl Opened {
         let executors: Vec<u64> = (0..peers.len())
             .map(|rank| cuteafd_transport::v41_expert::v41_spark_executor_id(peers.len(), rank))
             .collect::<Result<_>>()?;
-        let transport = cuteafd_transport::v41_expert::V41Tp4Roce::new_ranks(&peers, &executors,
-            u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
-                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 })?;
+        // One transport per prefill lane: each lane's wave stays in flight on its own QPs.
+        let transports = (0..engine::PREFILL_LANES).map(|_| cuteafd_transport::v41_expert::V41Tp4Roce::new_ranks(
+            &peers, &executors, u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
+                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }))
+            .collect::<Result<Vec<_>>>()?;
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport), runtime }))
+        Ok(Some(engine::Experts::Spark { transports: std::cell::RefCell::new(transports), runtime }))
     }
 }
 
@@ -408,11 +415,16 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
     ensure!(!args.teacher_force || prefill <= engine.prefill_rows, "teacher forcing takes one prefill chunk");
     let mut logits: Option<Vec<f32>> = None;
     let mut done = 0;
+    // --logits-only prefills without layer downloads (Spark prefill then runs
+    // pipelined in lanes, chunks up to the engine's prefill capacity).
+    let chunk_rows = if args.logits_only && !args.teacher_force { engine.prefill_capacity() } else { engine.prefill_rows };
     while done < prefill {
-        let n = engine.prefill_rows.min(prefill - done);
+        let n = chunk_rows.min(prefill - done);
         let first = done;
-        let chunk = engine.prefill_forced(&mut placement, &embed[done * row..(done + n) * row],
-            Some(&mut |layer, streams| compare(layer, first, streams, &mut worst)),
+        let mut compare_layer = |layer, streams: &[u8]| compare(layer, first, streams, &mut worst);
+        let on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>> =
+            if args.logits_only && !args.teacher_force { None } else { Some(&mut compare_layer) };
+        let chunk = engine.prefill_forced(&mut placement, &embed[done * row..(done + n) * row], on_layer,
             args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>), args.nll)?;
         logits = match (logits, chunk) {
             (Some(mut all), Some(more)) if args.nll => {
@@ -471,14 +483,17 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
     }
     if args.bench_prefill > 0 {
         *engine.profile.borrow_mut() = [0.0; 3];
-        let n = prefill.min(engine.prefill_rows);
+        let n = args.bench_prefill_tokens.unwrap_or(prefill.min(engine.prefill_capacity()));
+        let long: Vec<u8> = embed.chunks_exact(row).cycle().take(n).flatten().copied().collect();
         let mut allocator = engine::Allocator::new(engine.pages, engine.slots);
         let _held = allocator.admit(tokens.len() + args.bench_decode)?;
         let mut times = Vec::new();
         for _ in 0..args.bench_prefill {
             let mut fresh = allocator.admit(n)?;
             let started = Instant::now();
-            engine.prefill(&mut fresh, &embed[..n * row], None)?;
+            for chunk in long.chunks(engine.prefill_capacity() * row) {
+                engine.prefill(&mut fresh, chunk, None)?;
+            }
             times.push(started.elapsed().as_secs_f64());
             allocator.release(fresh);
         }

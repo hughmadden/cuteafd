@@ -377,13 +377,19 @@ impl<'a> GlmDrafter<'a> {
     /// `streams` ([rows, hc, hidden] BF16) into tap rows `0..n` when `layer`
     /// is tapped (GLM 5.3 Flash: the mHC contraction upstream captures).
     pub fn tap_streams(&self, layer: usize, streams: *const c_void, hc: usize, first: usize, n: usize) -> Result<()> {
+        self.tap_streams_at(layer, streams, hc, first, n, 0)
+    }
+
+    /// [`Self::tap_streams`] into tap rows `to..to + n`.
+    pub fn tap_streams_at(&self, layer: usize, streams: *const c_void, hc: usize, first: usize, n: usize, to: usize)
+        -> Result<()> {
         let Some(index) = self.tap_index(layer) else { return Ok(()) };
-        let h = self.cfg.hidden;
-        ensure!(n <= TAP_ROWS, "{n} tapped rows exceed {TAP_ROWS}");
+        let (h, width) = (self.cfg.hidden, self.cfg.taps.len() * self.cfg.hidden);
+        ensure!(to + n <= TAP_ROWS, "tap rows {to}..{} exceed {TAP_ROWS}", to + n);
         // SAFETY: `streams` holds first + n rows of hc streams; the tap buffer TAP_ROWS rows.
         unsafe {
-            self.library.glm_dflash_tap_mean(streams.cast::<u8>().add(first * hc * h * 2).cast(), self.taps.buffer.ptr,
-                n, h, hc, self.cfg.taps.len() * h, index * h, self.stream)
+            self.library.glm_dflash_tap_mean(streams.cast::<u8>().add(first * hc * h * 2).cast(),
+                self.taps.buffer.ptr.cast::<u8>().add(to * width * 2).cast(), n, h, hc, width, index * h, self.stream)
         }
     }
 
