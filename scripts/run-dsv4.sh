@@ -114,6 +114,14 @@ served_args=()
 served="$(get SERVED_MODEL_ID)"
 [[ -z "$served" ]] || served_args=(--model-id "$served")
 coordinator_image="$(get COORDINATOR_DOCKER_INFERENCE)"
+# COORDINATOR_TRACE=/abs/host/file.jsonl: serve-glm's per-cycle speculation
+# trace (CUTEAFD_GLM_TRACE; scripts/glm-draft-trace.py reads it).
+trace_args=()
+trace="$(get COORDINATOR_TRACE)"
+if [[ -n "$trace" ]]; then
+  mkdir -p "$(dirname "$trace")"
+  trace_args=(-v "$(dirname "$trace"):$(dirname "$trace")" -e "CUTEAFD_GLM_TRACE=$trace")
+fi
 spark_image="$(get SPARK_EXPERT_DOCKER_INFERENCE)"
 port="$(get EXPERT_PORT 19441)"
 addr="$(get ADDR 0.0.0.0:8000)"
@@ -157,7 +165,7 @@ done
 peer_csv="$(IFS=,; echo "${peers[*]}")"
 docker run -d --name cuteafd-coordinator --restart no --gpus "device=$gpu" --network host --ipc host \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -v "$hub:/root/.cache/huggingface/hub:ro" \
-  "$coordinator_image" cuteafd $serve --snapshot "$snapshot" \
+  "${trace_args[@]}" "$coordinator_image" cuteafd $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peer_csv" --listen "$addr" \
   --max-sequences "$(get CONCURRENCY 8)" --max-context "$(get MAX_CONTEXT_TOKENS 8192)" \
   --max-output "$(get MAX_OUTPUT_TOKENS 4096)" $([[ $serve == serve-dsv4 && "$(get DSPARK off)" == on ]] && echo --dspark) \
