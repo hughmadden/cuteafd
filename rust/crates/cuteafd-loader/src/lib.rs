@@ -51,6 +51,7 @@ mod tokenizer;
 pub mod plan;
 pub mod deepseek_v4;
 pub mod glm_dsa;
+pub mod mimo_v2;
 
 pub use attention_format::{
     native_deepseek_v4_attention_tensor_specs, validate_native_deepseek_v4_attention_catalog,

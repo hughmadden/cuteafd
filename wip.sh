@@ -426,6 +426,7 @@ build_coordinator() {
     -e "CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}" \
     -e "CUTEAFD_WIP_DSV4_AOT=${CUTEAFD_WIP_DSV4_AOT:-OFF}" \
     -e "CUTEAFD_WIP_GLM_AOT=${CUTEAFD_WIP_GLM_AOT:-OFF}" \
+    -e "CUTEAFD_WIP_MIMO_AOT=${CUTEAFD_WIP_MIMO_AOT:-OFF}" \
     -e "CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}" \
     "$coordinator_container" \
     /wip/source/scripts/build-wip-artifacts.sh \

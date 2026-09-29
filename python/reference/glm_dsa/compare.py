@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Compare two golden directories (golden.py outputs): per-layer cosine for
-layers both saved, logits top-1 agreement and mean KL(a || b).
+layers both saved, logits top-1 agreement, mean KL(a || b), and each side's
+next-token accuracy and mean NLL on the prompt (the robust quality measure
+when routes flip on rounding-level changes).
 
   compare.py A_DIR B_DIR
 """
@@ -33,7 +35,10 @@ def main() -> None:
     kl = float((np.exp(pa) * (pa - pb)).sum(1).mean())
     next_a = float((la.argmax(1)[:-1] == tokens[1:]).mean())
     next_b = float((lb.argmax(1)[:-1] == tokens[1:]).mean())
-    print(f"logits: top-1 agreement {agree:.4f} | mean KL {kl:.5f} nats | next-token accuracy {next_a:.4f} vs {next_b:.4f}")
+    rows = np.arange(len(tokens) - 1)
+    nll_a, nll_b = float(-pa[rows, tokens[1:]].mean()), float(-pb[rows, tokens[1:]].mean())
+    print(f"logits: top-1 agreement {agree:.4f} | mean KL {kl:.5f} nats | next-token accuracy {next_a:.4f} vs {next_b:.4f}"
+          f" | mean NLL {nll_a:.4f} vs {nll_b:.4f}")
 
 
 if __name__ == "__main__":
