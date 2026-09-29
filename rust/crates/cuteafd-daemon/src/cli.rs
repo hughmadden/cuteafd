@@ -28,6 +28,9 @@ pub(crate) enum Commands {
     MimoGolden(crate::mimo::GoldenArgs),
     /// Compare the GLM 5.3 Flash coordinator programs layer by layer with python/reference/glm5_next/golden.py outputs.
     GlmfGolden(crate::glmf::GoldenArgs),
+    /// Compare the Qwen 3.8 Flash Next (qwen4_exp) engine layer by layer with
+    /// python/reference/qwen4_exp/golden.py outputs.
+    Qwen4Golden(crate::qwen4::GoldenArgs),
     /// Serve GLM 5.3 Flash (glm5_next) through the OpenAI API on the glmf engine.
     ServeGlmf(crate::glmf::serve::ServeArgs),
     /// Serve a GLM 5.x checkpoint (OpenAI-compatible API) over the glm_* programs and Spark experts.
