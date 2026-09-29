@@ -274,11 +274,44 @@ impl V41Tp4RocePending<'_, '_> {
     /// Transfer validated payload ownership to the sink. Retain each payload
     /// until any asynchronous consumer completes, including on failure. A sink
     /// error abandons this whole wave and resets its QPs; it cannot be resumed.
-    pub async fn receive_owned<F>(mut self, sink: F) -> Result<()>
+    pub async fn receive_owned<F>(mut self, mut sink: F) -> Result<()>
     where
         F: FnMut(usize, u32, crate::VerbsHostProtocolV2ResponsePayload) -> Result<()>,
     {
-        drain(&mut self.owner.clients, &mut self.receiver, self.poll_quantum, sink).await?;
+        // Kept inline rather than shared with `drain`: this is V4.1's decode
+        // hot path, and routing it through the generic helper measured ~3%
+        // slower at C1 (p2 153.5 -> p4 148.4 tok/s).
+        let mut quantum = std::time::Instant::now();
+        let mut first_wait = true;
+        loop {
+            let receiver = &mut self.receiver;
+            if self.owner.clients.poll(|chunk| {
+                let mut location = None;
+                receiver.push_rdma(&chunk, |rank, start, _bytes| {
+                    ensure!(
+                        rank == chunk.stream_id,
+                        "native executor identity does not match its RoCE peer"
+                    );
+                    location = Some((rank, start));
+                    Ok(())
+                })?;
+                let (rank, start) = location.expect("validated chunk has a location");
+                sink(rank, start, chunk.partial_output_payload)
+            })? {
+                break;
+            }
+            if first_wait || quantum.elapsed() >= self.poll_quantum {
+                first_wait = false;
+                tokio::task::yield_now().await;
+                quantum = std::time::Instant::now();
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+        ensure!(
+            self.receiver.complete(),
+            "native TP RoCE response coverage is incomplete"
+        );
         self.complete = true;
         Ok(())
     }
