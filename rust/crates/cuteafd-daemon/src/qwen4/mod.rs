@@ -3,6 +3,7 @@
 //! comparison command.
 pub(crate) mod engine;
 pub(crate) mod ple;
+pub(crate) mod serve;
 pub(crate) mod weights;
 
 use anyhow::{ensure, Result};
@@ -69,6 +70,10 @@ pub(crate) struct EngineArgs {
     /// Most EXL3 expert layers resident at once (the free memory decides first).
     #[arg(long, default_value_t = 48)]
     pub exl3_window: usize,
+    /// GPU memory (GiB) kept free of local experts for step workspaces
+    /// (logits alone are 4 GiB at 4096 rows).
+    #[arg(long, default_value_t = 12)]
+    pub expert_reserve_gib: usize,
 }
 
 #[derive(Debug, clap::Args)]
@@ -186,7 +191,7 @@ impl Opened {
             let (free, _) = self.library.cuda_memory_info()?;
             // An empty window: the package and its scratch; layers load on first use.
             let experts = crate::v41_experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, 0..0, 1, 0,
-                args.prefill_rows, free.saturating_sub(4 << 30))?;
+                args.prefill_rows, free.saturating_sub(args.expert_reserve_gib.min(4) << 30))?;
             return Ok(Some(engine::Experts::Local(engine::LocalExperts {
                 library: &self.library, tensors, experts: std::cell::RefCell::new(experts),
                 window: args.expert_window.max(1), loads: std::cell::RefCell::new(0),
@@ -198,8 +203,7 @@ impl Opened {
                 library: &self.library, native_lib: args.native_lib.clone(), catalog,
                 resident: std::cell::RefCell::new(None), window: args.exl3_window.max(1), layers,
                 max_rows: args.prefill_rows,
-                // Room for the step workspace (logits alone are 4 GiB at 4096 rows).
-                budget: free.saturating_sub(12 << 30), loads: std::cell::RefCell::new(0),
+                budget: free.saturating_sub(args.expert_reserve_gib << 30), loads: std::cell::RefCell::new(0),
             })));
         }
         let Some(peers) = args.peers.as_deref() else { return Ok(None) };
