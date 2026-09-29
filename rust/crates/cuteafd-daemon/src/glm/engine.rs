@@ -327,9 +327,7 @@ impl<'a> GlmEngine<'a> {
                 ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
                 &[rows, Dsv4Scalar::I32(1)])?;
             if layer.dense {
-                self.run(&format!("glm_ffn_i{}_{cap}", self.cfg.dense_intermediate), &[
-                    ("x", w.x.buffer.ptr), ("w_gate_up", layer.ptr("w_gate_up")?), ("w_down", layer.ptr("w_down")?),
-                    ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])?;
+                self.ffn(w, layer, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)?;
             } else {
                 let (transport, runtime) = experts.as_mut()
                     .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
@@ -404,9 +402,7 @@ impl<'a> GlmEngine<'a> {
         }
         self.profile.borrow_mut()[0] += timer.elapsed().as_secs_f64();
         // The shared expert runs on the GPU while the Sparks compute.
-        self.run(&format!("glm_ffn_i{}_{cap}", self.cfg.moe_intermediate), &[
-            ("x", w.x.buffer.ptr), ("w_gate_up", layer.ptr("w_gate_up")?), ("w_down", layer.ptr("w_down")?),
-            ("out", w.shared.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])?;
+        self.ffn(w, layer, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, rows)?;
         let staged = staging.bytes();
         let word = |offset: usize, i: usize| u32::from_le_bytes(staged[offset + i * 4..][..4].try_into().unwrap());
         let routes = (0..t * topk).map(|i| ExpertProtocolV2RouteEntry {
@@ -468,19 +464,24 @@ impl<'a> GlmEngine<'a> {
         tables: &StepTables) -> Result<()> {
         let mode = if tables.decode { "decode" } else { "prefill" };
         let kv = &self.kv[index];
-        self.run(&format!("glm_producer_{cap}"), &[
-            ("x", w.x.buffer.ptr), ("positions", w.positions.buffer.ptr), ("kv_slots", w.slots.buffer.ptr),
-            ("cos_sin", self.cos_sin.buffer.ptr), ("w_qkv_a", layer.ptr("w_qkv_a")?), ("q_a_norm", layer.ptr("q_a_norm")?),
-            ("kv_a_norm", layer.ptr("kv_a_norm")?), ("w_q_b", layer.ptr("w_q_b")?), ("w_uk", layer.ptr("w_uk")?),
-            ("kv_cache", kv.buffer.ptr), ("query", w.query.buffer.ptr), ("q_resid", w.q_resid.buffer.ptr),
-            ("scratch", w.scratch.buffer.ptr)], &[rows])?;
+        let mut producer = vec![("x", w.x.buffer.ptr), ("positions", w.positions.buffer.ptr),
+            ("kv_slots", w.slots.buffer.ptr), ("cos_sin", self.cos_sin.buffer.ptr)];
+        producer.extend(weight(layer, "w_qkv_a", cap)?);
+        producer.extend([("q_a_norm", layer.ptr("q_a_norm")?), ("kv_a_norm", layer.ptr("kv_a_norm")?)]);
+        producer.extend(weight(layer, "w_q_b", cap)?);
+        producer.extend([("w_uk", layer.ptr("w_uk")?), ("kv_cache", kv.buffer.ptr), ("query", w.query.buffer.ptr),
+            ("q_resid", w.q_resid.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
+        self.run(&format!("glm_producer_{cap}"), &producer, &[rows])?;
         if let Some(index_cache) = &self.index[index] {
-            self.run(&format!("glm_index_producer_{cap}"), &[
-                ("x", w.x.buffer.ptr), ("q_resid", w.q_resid.buffer.ptr), ("positions", w.positions.buffer.ptr),
-                ("index_slots", w.slots.buffer.ptr), ("cos_sin", self.cos_sin.buffer.ptr), ("w_iq", layer.ptr("w_iq")?),
-                ("w_ik", layer.ptr("w_ik")?), ("k_norm_w", layer.ptr("k_norm_w")?), ("k_norm_b", layer.ptr("k_norm_b")?),
-                ("index_cache", index_cache.buffer.ptr), ("q_fp8", w.q_fp8.buffer.ptr),
-                ("head_weights", w.head_weights.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])?;
+            let mut pointers = vec![("x", w.x.buffer.ptr), ("q_resid", w.q_resid.buffer.ptr),
+                ("positions", w.positions.buffer.ptr), ("index_slots", w.slots.buffer.ptr),
+                ("cos_sin", self.cos_sin.buffer.ptr)];
+            pointers.extend(weight(layer, "w_iq", cap)?);
+            pointers.extend([("w_ik", layer.ptr("w_ik")?), ("k_norm_w", layer.ptr("k_norm_w")?),
+                ("k_norm_b", layer.ptr("k_norm_b")?), ("index_cache", index_cache.buffer.ptr),
+                ("q_fp8", w.q_fp8.buffer.ptr), ("head_weights", w.head_weights.buffer.ptr),
+                ("scratch", w.scratch.buffer.ptr)]);
+            self.run(&format!("glm_index_producer_{cap}"), &pointers, &[rows])?;
             self.run(&format!("glm_index_topk_{mode}_{cap}"), &[
                 ("q_fp8", w.q_fp8.buffer.ptr), ("weights", w.head_weights.buffer.ptr),
                 ("index_k_cache", index_cache.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
@@ -492,8 +493,30 @@ impl<'a> GlmEngine<'a> {
         self.run(&format!("glm_sparse_mla_{mode}_{cap}"), &[
             ("q", w.query.buffer.ptr), ("kv_cache", kv.buffer.ptr), ("indices", w.indices.buffer.ptr),
             ("lengths", w.lengths.buffer.ptr), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])?;
-        self.run(&format!("glm_o_{cap}"), &[
-            ("attn", w.attn.buffer.ptr), ("w_uv", layer.ptr("w_uv")?), ("w_o", layer.ptr("w_o")?),
-            ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])
+        let mut o = vec![("attn", w.attn.buffer.ptr), ("w_uv", layer.ptr("w_uv")?)];
+        o.extend(weight(layer, "w_o", cap)?);
+        o.extend([("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
+        self.run(&format!("glm_o_{cap}"), &o, &[rows])
     }
+
+    /// SwiGLU MLP (dense layers, or the shared expert) into `out`.
+    fn ffn(&self, w: &Workspace<'_>, layer: &GlmLayer<'_>, intermediate: usize, cap: &str, out: *mut c_void,
+        rows: Dsv4Scalar) -> Result<()> {
+        let mut pointers = vec![("x", w.x.buffer.ptr)];
+        pointers.extend(weight(layer, "w_gate_up", cap)?);
+        pointers.extend(weight(layer, "w_down", cap)?);
+        pointers.extend([("out", out), ("scratch", w.scratch.buffer.ptr)]);
+        self.run(&format!("glm_ffn_i{intermediate}_{cap}"), &pointers, &[rows])
+    }
+}
+
+/// A weight's program pointers: its BF16 copy, plus the E4M3 copy and FP32
+/// block scales the decode (`m64`) programs read for their few-row GEMVs.
+fn weight(layer: &GlmLayer<'_>, name: &'static str, cap: &str) -> Result<Vec<(&'static str, *mut c_void)>> {
+    let mut pointers = vec![(name, layer.ptr(name)?)];
+    if cap == "m64" {
+        let (fp8, scale) = super::weights::fp8_operand_names(name);
+        pointers.extend([(fp8, layer.ptr(fp8)?), (scale, layer.ptr(scale)?)]);
+    }
+    Ok(pointers)
 }

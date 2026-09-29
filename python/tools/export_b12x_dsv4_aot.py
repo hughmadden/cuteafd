@@ -104,18 +104,21 @@ def glm_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         ("router_scores", "router_scores", {}, lambda: ffn.compile_glm_router_scores_aot(g)),
         ("expert_input_quant", "expert_input_quant", {}, lambda: ffn.compile_glm_expert_input_quant_aot(g)),
     ]
+    # Decode programs also take the FP8 checkpoint weights (E4M3 + FP32 block
+    # scales) for their few-row GEMVs; prefill programs take BF16 only.
     for rows in (decode_rows, prefill_rows):
+        f8 = rows == decode_rows
         out += [
-            (f"producer_m{rows}", "producer", {"max_rows": rows},
-             lambda r=rows: attn.compile_glm_producer_aot(g, max_rows=r)),
-            (f"index_producer_m{rows}", "index_producer", {"max_rows": rows},
-             lambda r=rows: attn.compile_glm_index_producer_aot(g, max_rows=r)),
-            (f"o_m{rows}", "o", {"max_rows": rows},
-             lambda r=rows: attn.compile_glm_o_aot(g, max_rows=r)),
+            (f"producer_m{rows}", "producer", {"max_rows": rows, "fp8": f8},
+             lambda r=rows, f=f8: attn.compile_glm_producer_aot(g, max_rows=r, fp8=f)),
+            (f"index_producer_m{rows}", "index_producer", {"max_rows": rows, "fp8": f8},
+             lambda r=rows, f=f8: attn.compile_glm_index_producer_aot(g, max_rows=r, fp8=f)),
+            (f"o_m{rows}", "o", {"max_rows": rows, "fp8": f8},
+             lambda r=rows, f=f8: attn.compile_glm_o_aot(g, max_rows=r, fp8=f)),
         ]
         for inter in (g.moe_inter, g.dense_inter):
-            out.append((f"ffn_i{inter}_m{rows}", "ffn", {"max_rows": rows, "inter": inter},
-                        lambda r=rows, i=inter: ffn.compile_glm_ffn_aot(g, inter=i, max_rows=r)))
+            out.append((f"ffn_i{inter}_m{rows}", "ffn", {"max_rows": rows, "inter": inter, "fp8": f8},
+                        lambda r=rows, i=inter, f=f8: ffn.compile_glm_ffn_aot(g, inter=i, max_rows=r, fp8=f)))
     for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
         out.append((f"index_topk_{mode}_m{rows}", "index_topk",
                     {"mode": mode, "max_rows": rows, "max_pages": index_pages},
