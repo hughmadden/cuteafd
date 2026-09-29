@@ -117,6 +117,10 @@ pub(crate) struct GoldenArgs {
     /// numerics checks between builds).
     #[arg(long)]
     pub bench_dump: Option<PathBuf>,
+    /// With --bench-verify: prefill this many tokens (the golden prompt
+    /// repeated) instead of --prefill, for long-context step costs.
+    #[arg(long)]
+    pub bench_context: Option<usize>,
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -257,8 +261,23 @@ pub(crate) unsafe fn launch_head(library: &NativeLibrary, head: &cuteafd_ffi::ds
 }
 
 pub(crate) fn embed_rows(catalog: &cuteafd_loader::OfficialV41Catalog, tokens: &[u32], hidden: usize) -> Result<Vec<u8>> {
+    // Every decode step embeds its rows: keep the shard open (an open through
+    // the sparknest mount costs more than the row reads).
+    static SHARDS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<std::fs::File>>>> =
+        std::sync::OnceLock::new();
     let tensor = catalog.tensor("model.embed_tokens.weight")?;
-    let file = std::fs::File::open(catalog.snapshot().join(&tensor.shard))?;
+    let path = catalog.snapshot().join(&tensor.shard);
+    let file = {
+        let mut shards = SHARDS.get_or_init(Default::default).lock().map_err(|_| anyhow::anyhow!("embed shards"))?;
+        match shards.get(&path) {
+            Some(file) => file.clone(),
+            None => {
+                let file = std::sync::Arc::new(std::fs::File::open(&path)?);
+                shards.insert(path, file.clone());
+                file
+            }
+        }
+    };
     let row = hidden * 2;
     let mut out = vec![0u8; tokens.len() * row];
     for (slot, token) in out.chunks_exact_mut(row).zip(tokens) {
@@ -350,10 +369,10 @@ fn bench_verify(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
     ensure!(max_rows >= 1 && max_rows <= engine::DECODE_ROWS, "--bench-verify takes 1..={} rows", engine::DECODE_ROWS);
     ensure!(transport.is_some() || engine.skip_routed, "--bench-verify needs Spark peers or --skip-routed-experts");
-    let prefill = args.prefill.unwrap_or(512);
-    ensure!(prefill + max_rows <= tokens.len(), "the golden prompt is shorter than --prefill + --bench-verify");
+    let prefill = args.bench_context.or(args.prefill).unwrap_or(512);
+    let tokens: Vec<u32> = tokens.iter().copied().cycle().take(prefill + max_rows).collect();
     let row = opened.cfg.hidden * 2;
-    let embed = embed_rows(&opened.catalog, &tokens[..prefill + max_rows], opened.cfg.hidden)?;
+    let embed = embed_rows(&opened.catalog, &tokens, opened.cfg.hidden)?;
     let mut placement = engine::PageAllocator::new(engine.pages).admit(prefill + max_rows)?;
     for chunk in embed[..prefill * row].chunks(engine.prefill_capacity() * row) {
         engine.prefill(&mut placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)), None)?;
