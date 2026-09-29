@@ -238,10 +238,15 @@ impl DraftSkip {
     }
 }
 
-/// GLM-5.3 EXL3 K4, 1 RTX PRO 6000 (325 W) + 4 Sparks TP4: verify step ms by rows.
-pub(crate) const K4_TP4_STEP_MS: [(usize, f64); 15] = [(1, 35.6), (2, 50.5), (3, 62.4), (4, 73.6), (5, 83.2),
-    (6, 93.1), (7, 102.2), (8, 111.8), (10, 128.1), (12, 146.7), (16, 173.6), (24, 220.8), (32, 260.2), (48, 342.5),
-    (64, 402.8)];
+/// GLM-5.3 EXL3 K4, 1 RTX PRO 6000 (325 W) + 4 Sparks TP4: verify step ms by
+/// rows. Measured on the Sparks before the sparse MLA read only selected
+/// tokens and the few-row head (35.6 / 111.8 / 260.2 ms at 1 / 8 / 32 rows),
+/// less the coordinator time those saved at each row count (glm-golden
+/// --bench-verify --skip-routed-experts, 512 tokens of context); re-measure
+/// with --bench-verify on the Sparks.
+pub(crate) const K4_TP4_STEP_MS: [(usize, f64); 15] = [(1, 34.5), (2, 48.9), (3, 59.5), (4, 69.4), (5, 77.4),
+    (6, 85.8), (7, 93.8), (8, 102.1), (10, 118.8), (12, 134.0), (16, 157.9), (24, 197.8), (32, 223.6), (48, 284.7),
+    (64, 327.1)];
 
 /// Sequences that draft together: identical ones (same tokens, same
 /// position) form one group of `members`, with one draft between them.
