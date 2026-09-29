@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Launch a DeepSeek V4 or GLM 5.x checkpoint (serve-dsv4 / serve-glm on one
-# RTX, routed experts on the first SPARK_COUNT Sparks) from the release images
+# Launch a DeepSeek V4, GLM 5.x or GLM 5.3 Flash checkpoint (serve-dsv4 /
+# serve-glm / serve-glmf on one RTX, routed experts on the first SPARK_COUNT
+# Sparks) from the release images
 # named in the config. The family comes from the snapshot's config.json.
 # Containers use run.sh's names, so ./stop.sh stops them.
 set -euo pipefail
@@ -28,31 +29,57 @@ root="$hub/models--${model//\//--}"
 [[ -n "$revision" ]] || revision="$(<"$root/refs/main")"
 snapshot="/root/.cache/huggingface/hub/models--${model//\//--}/snapshots/$revision"
 [[ -d "$root/snapshots/$revision" ]] || { echo "missing snapshot $model@$revision" >&2; exit 1; }
-# Family: the serving command and the first layer with routed experts.
-read -r model_type first_layer < <(python3 - "$root/snapshots/$revision/config.json" <<'PY'
+# Family: the serving command, the first layer with routed experts and the
+# backbone's layer count (GLM 5.3 Flash checkpoints also carry an MTP layer
+# after it, which the Spark workers do not serve).
+read -r model_type first_layer layers < <(python3 - "$root/snapshots/$revision/config.json" <<'PY'
 import json, sys
-c = json.load(open(sys.argv[1]))
-c = c.get("text_config", c)
+top = json.load(open(sys.argv[1]))
+c = top.get("text_config", top)
+kind = top.get("model_type", "?")
 types = c.get("mlp_layer_types")
 first = types.index("sparse") if types else c.get("first_k_dense_replace", 0)
-print(c.get("model_type", "?"), first if c.get("model_type") == "glm_moe_dsa" else 0)
+print(kind, first if kind in ("glm_moe_dsa", "glm5_next") else 0, c.get("num_hidden_layers", 0))
 PY
 )
 case "$model_type" in
   deepseek_v4) serve=serve-dsv4 ;;
   glm_moe_dsa) serve=serve-glm ;;
-  *) echo "run-dsv4.sh serves deepseek_v4 and glm_moe_dsa checkpoints, not $model_type" >&2; exit 2 ;;
+  glm5_next) serve=serve-glmf ;;
+  *) echo "run-dsv4.sh serves deepseek_v4, glm_moe_dsa and glm5_next checkpoints, not $model_type" >&2; exit 2 ;;
 esac
-# DRAFT_MODEL_ID (serve-glm): a DFlash2 drafter checkpoint, e.g. incoai/GLM-5.3-DFlash2.
+# Snapshot of a model id (and optional revision) inside the containers.
+snapshot_of() {
+  local id="$1" rev="$2" dir="$hub/models--${1//\//--}"
+  [[ -n "$rev" ]] || rev="$(<"$dir/refs/main")"
+  [[ -d "$dir/snapshots/$rev" ]] || { echo "missing snapshot $id@$rev" >&2; return 1; }
+  printf '%s' "/root/.cache/huggingface/hub/models--${id//\//--}/snapshots/$rev"
+}
+# DRAFT_MODEL_ID (serve-glm, serve-glmf): a DFlash2 drafter checkpoint, e.g.
+# incoai/GLM-5.3-DFlash2 or incoai/GLM-5.3-Flash-DFlash2.
 draft_args=()
 draft="$(get DRAFT_MODEL_ID)"
 if [[ -n "$draft" ]]; then
-  [[ $serve == serve-glm ]] || { echo "DRAFT_MODEL_ID applies to GLM checkpoints (DeepSeek V4 uses DSPARK=on)" >&2; exit 2; }
-  draft_root="$hub/models--${draft//\//--}"
-  draft_revision="$(get DRAFT_MODEL_REVISION)"
-  [[ -n "$draft_revision" ]] || draft_revision="$(<"$draft_root/refs/main")"
-  [[ -d "$draft_root/snapshots/$draft_revision" ]] || { echo "missing snapshot $draft@$draft_revision" >&2; exit 1; }
-  draft_args=(--draft "/root/.cache/huggingface/hub/models--${draft//\//--}/snapshots/$draft_revision")
+  [[ $serve == serve-glm || $serve == serve-glmf ]] ||
+    { echo "DRAFT_MODEL_ID applies to GLM checkpoints (DeepSeek V4 uses DSPARK=on)" >&2; exit 2; }
+  draft_snapshot="$(snapshot_of "$draft" "$(get DRAFT_MODEL_REVISION)")" || exit 1
+  draft_args=(--draft "$draft_snapshot")
+fi
+# serve-glmf: decode rows read FP8 copies of the dense projections from the
+# official FP8 release (GLMF_FP8_MODEL_ID, "off" for BF16), KDA projections
+# as per-row FP8 (GLMF_KDA_FP8: row128, channel or off) and optionally an FP8
+# LM head (GLMF_FP8_HEAD=on); its MLA pools hold POOL_TOKENS tokens.
+family_args=()
+worker_args=()
+if [[ $serve == serve-glmf ]]; then
+  fp8_model="$(get GLMF_FP8_MODEL_ID zai-org/GLM-5.3-Flash)"
+  if [[ "$fp8_model" != off ]]; then
+    fp8_snapshot="$(snapshot_of "$fp8_model" "$(get GLMF_FP8_MODEL_REVISION)")" || exit 1
+    family_args+=(--fp8-decode --fp8-snapshot "$fp8_snapshot")
+  fi
+  family_args+=(--kda-fp8 "$(get GLMF_KDA_FP8 row128)" --pool-tokens "$(get POOL_TOKENS 65536)")
+  [[ "$(get GLMF_FP8_HEAD off)" != on ]] || family_args+=(--fp8-head)
+  worker_args+=(--last-layer $((layers - 1)))
 fi
 coordinator_image="$(get COORDINATOR_DOCKER_INFERENCE)"
 spark_image="$(get SPARK_EXPERT_DOCKER_INFERENCE)"
@@ -72,7 +99,7 @@ for ((rank = 0; rank < ranks; rank++)); do
     -v \$(readlink -f \$HOME/.cache/huggingface/hub):/root/.cache/huggingface/hub:ro '$spark_image' \
     cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
     --rank $rank --world $ranks --capacity 4096 --device-budget-bytes $budget --first-layer $first_layer \
-    --listen 0.0.0.0:$port >/dev/null" &
+    ${worker_args[*]} --listen 0.0.0.0:$port >/dev/null" &
 done
 wait
 for ((rank = 0; rank < ranks; rank++)); do
@@ -89,7 +116,8 @@ docker run -d --name cuteafd-coordinator --restart no --gpus "device=$gpu" --net
   "$coordinator_image" cuteafd $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peer_csv" --listen "$addr" \
   --max-sequences "$(get CONCURRENCY 8)" --max-context "$(get MAX_CONTEXT_TOKENS 8192)" \
-  --max-output "$(get MAX_OUTPUT_TOKENS 4096)" $([[ $serve == serve-dsv4 && "$(get DSPARK off)" == on ]] && echo --dspark) "${draft_args[@]}" >/dev/null
+  --max-output "$(get MAX_OUTPUT_TOKENS 4096)" $([[ $serve == serve-dsv4 && "$(get DSPARK off)" == on ]] && echo --dspark) \
+  "${family_args[@]}" "${draft_args[@]}" >/dev/null
 url="http://127.0.0.1:${addr##*:}"
 until curl -sf "$url/health" >/dev/null; do
   docker ps -q -f name=cuteafd-coordinator | grep -q . ||
