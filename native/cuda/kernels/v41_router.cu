@@ -162,6 +162,58 @@ __global__ void select_kernel(float* scores,const float* bias,const float* bias_
     routing[row*topk+tid]=(selected[tid]/(total+1e-20f))*1.5f;
   }
 }
+// Qwen-style softmax routing: logits (optionally rounded to BF16 first, as a
+// BF16 router linear produces them), the top-k by logit (lowest expert on
+// ties), weights softmax(logits)[top-k] renormalized over the top-k (the full
+// softmax denominator is kept, as the reference computes it), optionally
+// rounded to BF16, times `scale`. One CTA of 512 threads per row.
+constexpr int kSoftmaxTopkMax=16;
+__global__ void __launch_bounds__(512) softmax_select_kernel(const float* logits,uint32_t* ids,float* routing,
+    int experts,int topk,float scale,int round_bf16) {
+  const uint64_t row=blockIdx.x;const int tid=threadIdx.x;const int lane=tid&31,warp=tid>>5;
+  float logit=-CUDART_INF_F;
+  if(tid<experts) {
+    logit=logits[row*experts+tid];
+    if(round_bf16) logit=__bfloat162float(__float2bfloat16_rn(logit));
+  }
+  __shared__ float warp_value[16],selected[kSoftmaxTopkMax],warp_sum[16];
+  __shared__ uint32_t warp_index[16],winner_index;
+  float candidate=logit;
+  for(int rank=0;rank<topk;++rank) {
+    float v=candidate;uint32_t i=tid<experts?uint32_t(tid):UINT32_MAX;
+    for(int offset=16;offset;offset>>=1) {
+      const float ov=__shfl_down_sync(0xffffffffu,v,offset);
+      const uint32_t oi=__shfl_down_sync(0xffffffffu,i,offset);
+      if(ov>v || (ov==v && oi<i)) {v=ov;i=oi;}
+    }
+    if(lane==0) {warp_value[warp]=v;warp_index[warp]=i;}
+    __syncthreads();
+    if(warp==0) {
+      v=lane<16?warp_value[lane]:-CUDART_INF_F;i=lane<16?warp_index[lane]:UINT32_MAX;
+      for(int offset=16;offset;offset>>=1) {
+        const float ov=__shfl_down_sync(0xffffffffu,v,offset);
+        const uint32_t oi=__shfl_down_sync(0xffffffffu,i,offset);
+        if(ov>v || (ov==v && oi<i)) {v=ov;i=oi;}
+      }
+      if(lane==0) {winner_index=i;ids[row*topk+rank]=i;selected[rank]=v;}
+    }
+    __syncthreads();
+    if(uint32_t(tid)==winner_index) candidate=-CUDART_INF_F;
+  }
+  // The softmax denominator over every expert (max = the first selection).
+  const float top=selected[0];
+  float e=tid<experts?expf(logit-top):0.0f;
+  for(int offset=16;offset;offset>>=1) e+=__shfl_down_sync(0xffffffffu,e,offset);
+  if(lane==0) warp_sum[warp]=e;
+  __syncthreads();
+  if(tid<topk) {
+    float z=0;for(int w=0;w<16;++w) z+=warp_sum[w];
+    float total=0;for(int j=0;j<topk;++j) total+=expf(selected[j]-top)/z;
+    float weight=(expf(selected[tid]-top)/z)/total;
+    if(round_bf16) weight=__bfloat162float(__float2bfloat16_rn(weight));
+    routing[row*topk+tid]=weight*scale;
+  }
+}
 bool span(const void* p,uint64_t n,int alignment) {
   auto a=reinterpret_cast<uintptr_t>(p);return a && a%alignment==0 && a<=UINTPTR_MAX-n;
 }
@@ -245,5 +297,17 @@ extern "C" int32_t cuteafd_router_select(float* logits,const float* bias,const i
   } else {
     select_fast_kernel<true><<<rows,512,0,s>>>(logits,bias,bias,nullptr,ids,routing,experts,topk,route_scale);
   }
+  return cudaGetLastError();
+}
+extern "C" int32_t cuteafd_router_select_softmax(const float* logits,uint32_t* ids,float* routing,
+    int32_t rows,int32_t experts,int32_t topk,float route_scale,int32_t round_bf16,void* stream) {
+  if(rows<1 || rows>65536 || experts<1 || experts>512 || topk<1 || topk>kSoftmaxTopkMax || topk>experts)
+    return cudaErrorInvalidValue;
+  const void* p[]={logits,ids,routing};
+  const uint64_t n[]={uint64_t(rows)*experts*4,uint64_t(rows)*topk*4,uint64_t(rows)*topk*4};
+  for(int i=0;i<3;++i) if(!span(p[i],n[i],4)) return cudaErrorInvalidValue;
+  for(int i=1;i<3;++i) for(int j=0;j<i;++j) if(!disjoint(p[i],n[i],p[j],n[j])) return cudaErrorInvalidValue;
+  softmax_select_kernel<<<rows,512,0,reinterpret_cast<cudaStream_t>(stream)>>>(logits,ids,routing,experts,topk,
+      route_scale,round_bf16);
   return cudaGetLastError();
 }

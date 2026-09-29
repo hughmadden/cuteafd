@@ -199,12 +199,47 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     return out
 
 
+def qwen4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
+    """Qwen 3.8 Flash Next programs, same (stem suffix, op, params, thunk) shape as ``programs``.
+    Hyper-connection, head, MoE-front and PLE programs serve any row count (their
+    scratch is sized from ``rows``); GDN and attention have decode/prefill capacities."""
+    from b12x.integration.cuteafd import qwen4, qwen4_gdn
+
+    out = [
+        ("hc_pre", "hc_pre", {}, lambda: qwen4.compile_qwen4_hc_pre_aot(g)),
+        ("hc_post_pre", "hc_post_pre", {}, lambda: qwen4.compile_qwen4_hc_post_pre_aot(g)),
+        ("hc_post", "hc_post", {}, lambda: qwen4.compile_qwen4_hc_post_aot(g)),
+        ("head", "head", {}, lambda: qwen4.compile_qwen4_head_aot(g)),
+        ("router_scores", "router_scores", {}, lambda: qwen4.compile_qwen4_router_scores_aot(g)),
+        ("shared", "shared", {}, lambda: qwen4.compile_qwen4_shared_aot(g)),
+        ("add", "add", {}, lambda: qwen4.compile_qwen4_add_aot(g)),
+        ("expert_input_quant", "expert_input_quant", {}, lambda: qwen4.compile_qwen4_expert_input_quant_aot(g)),
+        ("ple_bf16", "ple", {"fp8": False}, lambda: qwen4.compile_qwen4_ple_aot(g, fp8=False)),
+        ("ple_fp8", "ple", {"fp8": True}, lambda: qwen4.compile_qwen4_ple_aot(g, fp8=True)),
+    ]
+    from b12x.integration.cuteafd import qwen4_attention as attn
+
+    out.append(("index_expand", "index_expand", {}, lambda: attn.compile_qwen4_index_expand_aot(g)))
+    for rows in (decode_rows, prefill_rows):
+        out += [
+            (f"gdn_m{rows}", "gdn", {"max_rows": rows}, lambda r=rows: qwen4_gdn.compile_qwen4_gdn_aot(g, max_rows=r)),
+            (f"attn_producer_m{rows}", "attn_producer", {"max_rows": rows},
+             lambda r=rows: attn.compile_qwen4_attn_producer_aot(g, max_rows=r)),
+            (f"index_topk_m{rows}", "index_topk", {"max_rows": rows, "max_context": max_context},
+             lambda r=rows: attn.compile_qwen4_index_topk_aot(g, max_rows=r, max_context=max_context)),
+            (f"sparse_gqa_m{rows}", "sparse_gqa", {"max_rows": rows},
+             lambda r=rows: attn.compile_qwen4_sparse_gqa_aot(g, max_rows=r)),
+            (f"attn_o_m{rows}", "attn_o", {"max_rows": rows}, lambda r=rows: attn.compile_qwen4_attn_o_aot(g, max_rows=r)),
+        ]
+    return out
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--geometry", default="flash",
                         help="comma-separated geometries in one table: flash, pro (DeepSeek V4), glm (GLM 5.x), "
-                             "mimo (MiMo V2 Flash), glmf (GLM 5.3 Flash)")
+                             "mimo (MiMo V2 Flash), glmf (GLM 5.3 Flash), qwen4 (Qwen 3.8 Flash Next)")
     parser.add_argument("--decode-rows", type=int, default=64)
     parser.add_argument("--prefill-rows", type=int, default=4096)
     parser.add_argument("--max-context", type=int, default=131072)
@@ -213,12 +248,13 @@ def main() -> None:
 
     import torch
     from b12x.integration.cuteafd import (
-        FLASH, GLM53, GLM53_FLASH, MIMO_V2_FLASH, PRO, exportable_compilation, validate_exported_header,
+        FLASH, GLM53, GLM53_FLASH, MIMO_V2_FLASH, PRO, QWEN38_FLASH_NEXT, exportable_compilation,
+        validate_exported_header,
     )
 
     geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
-    if not geometries or any(name not in ("flash", "pro", "glm", "mimo", "glmf") for name in geometries):
-        raise SystemExit("--geometry takes flash, pro, glm, mimo and/or glmf")
+    if not geometries or any(name not in ("flash", "pro", "glm", "mimo", "glmf", "qwen4") for name in geometries):
+        raise SystemExit("--geometry takes flash, pro, glm, mimo, glmf and/or qwen4")
     props = torch.cuda.get_device_properties(0)
     if (props.major, props.minor) != (12, 0):
         raise SystemExit("coordinator programs export on SM120")
@@ -237,10 +273,13 @@ def main() -> None:
     entries, includes = [], []
     work = []
     for name in geometries:
-        g = {"flash": FLASH, "pro": PRO, "glm": GLM53, "mimo": MIMO_V2_FLASH, "glmf": GLM53_FLASH}[name]
-        family = {"flash": "dsv4f", "pro": "dsv4p", "glm": "glm", "mimo": "mimo", "glmf": "glmf"}[name]
+        g = {"flash": FLASH, "pro": PRO, "glm": GLM53, "mimo": MIMO_V2_FLASH, "glmf": GLM53_FLASH,
+             "qwen4": QWEN38_FLASH_NEXT}[name]
+        family = {"flash": "dsv4f", "pro": "dsv4p", "glm": "glm", "mimo": "mimo", "glmf": "glmf",
+                  "qwen4": "qwen4"}[name]
         manifest["families"][family] = {k: v for k, v in vars(g).items()}
-        make = {"glm": glm_programs, "mimo": mimo_programs, "glmf": glmf_programs}.get(name, programs)
+        make = {"glm": glm_programs, "mimo": mimo_programs, "glmf": glmf_programs,
+                "qwen4": qwen4_programs}.get(name, programs)
         work += [(family, *item) for item in make(g, args.decode_rows, args.prefill_rows, args.max_context)]
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
