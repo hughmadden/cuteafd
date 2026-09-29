@@ -1171,13 +1171,15 @@ impl<'a> GlmfEngine<'a> {
             &[rows, Dsv4Scalar::I32(tables.page_stride as i32)])?;
         if !tables.decode && crate::glm::engine::native_mla_prefill() {
             let scale = (self.cfg.qk_nope_dim as f32).powf(-0.5);
-            // SAFETY: query, record cache, indices, lengths and the latent output
-            // are live buffers of the step's rows on the engine stream.
-            unsafe {
-                self.library.glm_mla_prefill(w.query.buffer.ptr, cache, w.indices.buffer.ptr, w.lengths.buffer.ptr,
-                    w.latent.buffer.ptr, tables.positions.len(), self.cfg.heads, SPARSE_TOPK, RECORD_BYTES,
-                    scale * std::f32::consts::LOG2_E, self.stream)?;
-            }
+            self.timed("glm_mla_prefill (native)", || {
+                // SAFETY: query, record cache, indices, lengths and the latent output
+                // are live buffers of the step's rows on the engine stream.
+                unsafe {
+                    self.library.glm_mla_prefill(w.query.buffer.ptr, cache, w.indices.buffer.ptr, w.lengths.buffer.ptr,
+                        w.latent.buffer.ptr, tables.positions.len(), self.cfg.heads, SPARSE_TOPK, RECORD_BYTES,
+                        scale * std::f32::consts::LOG2_E, self.stream)
+                }
+            })?;
         } else {
             self.run(&format!("sparse_mla_{mode}_{cap}"), &[("q", w.query.buffer.ptr), ("kv_cache", cache),
                 ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr), ("out", w.latent.buffer.ptr),
