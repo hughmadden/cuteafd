@@ -10,7 +10,7 @@ and shared expert. KDA layers also run the prefix as a prefill and the last
 ``--decode`` rows as single-row steps (recurrent state and conv state carried
 in the program's pools).
 
-  PYTHONPATH=third_party/sparkinfer:third_party/transformers/src USE_HUB_KERNELS=0 \
+  PYTHONPATH=third_party/transformers/src USE_HUB_KERNELS=0 \
     qualify_glmf_programs.py --snapshot SNAP --golden runs/glmf-golden --layers 0 3 [--rows T]
 """
 from __future__ import annotations
@@ -22,6 +22,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+import _pinned_sparkinfer  # noqa: F401  (verifies and prepends the pinned b12x tree)
 
 ROOT = Path(__file__).resolve().parents[2]
 
