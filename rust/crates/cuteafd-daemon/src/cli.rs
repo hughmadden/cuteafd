@@ -69,6 +69,10 @@ pub(crate) struct ExpertProbeArgs {
     /// Time this many more round trips after the checked one (median, min).
     #[arg(long, default_value_t = 0)]
     pub(crate) repeat: usize,
+    /// With `--local` on an FP8 checkpoint: the TP1 package layout directory
+    /// (default `<libdir>/fp8/fp8-<family>/tp1`).
+    #[arg(long)]
+    pub(crate) fp8_package: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -135,6 +139,9 @@ pub(crate) struct NativeExpertDaemonArgs {
     /// Override the native EXL3 rank directory containing m1, m16 and larger capacities.
     #[arg(long)]
     pub(crate) exl3_aot_dir: Option<PathBuf>,
+    /// Override the FP8 expert package layout directory (`fp8-<family>/tp<world>`).
+    #[arg(long)]
+    pub(crate) fp8_package: Option<PathBuf>,
     #[arg(long, value_parser = clap::value_parser!(u32).range(0..6))]
     pub(crate) rank: u32,
     /// Spark tensor-parallel world; two ranks require an EXL3 checkpoint.

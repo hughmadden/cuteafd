@@ -1155,6 +1155,7 @@ release_stage_wip_layout() {
   mv "$raw/cuteafd" "$layout.tmp/bin/cuteafd"
   mv "$raw/libcuteafd_native.so" "$layout.tmp/lib/"
   [[ ! -d "$raw/exl3" ]] || mv "$raw/exl3" "$layout.tmp/lib/exl3"
+  [[ ! -d "$raw/fp8" ]] || mv "$raw/fp8" "$layout.tmp/lib/fp8"
   mv "$raw/"* "$layout.tmp/share/"
   rm -rf "$raw" "$layout"
   mv "$layout.tmp" "$layout"

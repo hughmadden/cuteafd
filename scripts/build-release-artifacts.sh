@@ -232,6 +232,17 @@ for release_family in "${release_family_list[@]}"; do
   python3 "$build_root/source/python/tools/package_v41_exl3_aot.py" verify \
     --package "$output_dir/exl3/$release_package" --role "$role"
 done
+# Exact FP8 expert packages (FAMILY:fp8 entries) ship as fp8/fp8-FAMILY; the
+# directory always exists so the release image can COPY it.
+mkdir -p "$output_dir/fp8"
+for release_family in "${release_family_list[@]}"; do
+  [[ "$release_family" == *:fp8 ]] || continue
+  release_package="fp8-${release_family%%:*}"
+  mkdir -p "$output_dir/fp8"
+  rm -rf "$output_dir/fp8/$release_package"
+  cp -a "$build_root/native/fp8/$release_package" "$output_dir/fp8/$release_package"
+  python3 "$build_root/source/python/tools/package_fp8_moe_aot.py" verify --package "$output_dir/fp8/$release_package"
+done
 install -m 0644 "$build_root/native/v41_experts/v41_experts.json" "$output_dir/V41_EXPERT_AOT.json"
 # Always write the built-role manifest, including the empty-role default, so
 # the release Dockerfile can COPY it unconditionally. Every listed role is

@@ -1,0 +1,147 @@
+//! Exact FP8 routed experts (the `fp8` family): the checkpoint's E4M3 expert
+//! weights with FP32 128x128 block scales, resident per TP slice and run by
+//! an `fp8-<family>` package (`python/tools/package_fp8_moe_aot.py`,
+//! `native/include/cuteafd_fp8_moe.h`). Nothing is re-quantized. Output is
+//! the BF16 `[rows, H]` route sum of the slice: the Spark rank partial of the
+//! compact BF16 response, or the whole layer at TP1 on the coordinator.
+pub(crate) mod worker;
+
+use crate::v41_memory::DeviceAllocation;
+use anyhow::{ensure, Context, Result};
+use cuteafd_ffi::fp8_moe::{Fp8MoeModule, FP8_MOE_POINTERS};
+use cuteafd_ffi::NativeLibrary;
+use cuteafd_loader::fp8_experts::{Fp8ExpertTensors, Fp8Projection};
+use std::ffi::c_void;
+use std::path::{Path, PathBuf};
+
+/// Parallel readers per layer load.
+const READERS: usize = 16;
+
+/// `<libdir>/fp8/fp8-<family>/tp<world>`: the package layout serving TP
+/// degree `tp` of the process expert geometry.
+pub(crate) fn package_directory(native_lib: &Path, tp: usize) -> PathBuf {
+    let family = cuteafd_core::expert_geometry().family().unwrap_or("unknown");
+    native_lib.parent().unwrap_or(Path::new(".")).join("fp8").join(format!("fp8-{family}")).join(format!("tp{tp}"))
+}
+
+/// One layer's resident slice: per projection the E4M3 weights of every
+/// expert (`[E, rows, cols]`) and their FP32 block-scale grids.
+pub(crate) struct Fp8Layer<'a> {
+    pub layer: usize,
+    regions: Vec<DeviceAllocation<'a>>,
+}
+
+impl<'a> Fp8Layer<'a> {
+    /// Device bytes of one layer's slice.
+    pub fn bytes(tensors: &Fp8ExpertTensors, tp: usize) -> Result<usize> {
+        let experts = tensors.shape().experts;
+        Fp8Projection::ALL.iter().try_fold(0usize, |total, &p| {
+            let (w, s) = tensors.slice_bytes(p, tp)?;
+            Ok(total + experts * (w + s))
+        })
+    }
+
+    pub fn load(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, layer: usize, tp: usize, rank: usize)
+        -> Result<Self> {
+        ensure!(tensors.has_layer(layer), "layer {layer} has no routed FP8 experts");
+        let experts = tensors.shape().experts;
+        let mut regions = Vec::with_capacity(6);
+        for projection in Fp8Projection::ALL {
+            let (w_bytes, s_bytes) = tensors.slice_bytes(projection, tp)?;
+            let mut weights = vec![0u8; experts * w_bytes];
+            let mut scales = vec![0u8; experts * s_bytes];
+            let mut jobs: Vec<(usize, &mut [u8], &mut [u8])> = weights.chunks_exact_mut(w_bytes)
+                .zip(scales.chunks_exact_mut(s_bytes)).enumerate().map(|(e, (w, s))| (e, w, s)).collect();
+            let per = jobs.len().div_ceil(READERS);
+            std::thread::scope(|scope| -> Result<()> {
+                let handles: Vec<_> = jobs.chunks_mut(per).map(|chunk| scope.spawn(move || -> Result<()> {
+                    let mut staging = Vec::new();
+                    for (expert, w, s) in chunk.iter_mut() {
+                        tensors.read_slice(layer, *expert, projection, tp, rank, w, s, &mut staging)?;
+                    }
+                    Ok(())
+                })).collect();
+                for handle in handles {
+                    handle.join().map_err(|_| anyhow::anyhow!("FP8 expert reader panicked"))??;
+                }
+                Ok(())
+            })?;
+            for bytes in [&weights, &scales] {
+                let region = DeviceAllocation::new(library, bytes.len())?;
+                library.copy_h2d(region.buffer, bytes)?;
+                regions.push(region);
+            }
+        }
+        // Regions in [w1, s1, w3, s3, w2, s2] order (gate, up, down).
+        Ok(Self { layer, regions })
+    }
+
+    fn pointers(&self) -> [*mut c_void; 6] {
+        std::array::from_fn(|i| self.regions[i].buffer.ptr)
+    }
+}
+
+/// Resident FP8 layers of one TP slice and the package that runs them.
+pub(crate) struct Fp8Experts<'a> {
+    // Drop order: the module goes last; callers drain their streams first.
+    pub layers: Vec<Fp8Layer<'a>>,
+    scratch: DeviceAllocation<'a>,
+    pub module: Fp8MoeModule,
+    pub tp: usize,
+    pub rank: usize,
+}
+
+impl<'a> Fp8Experts<'a> {
+    /// Loads the package at `directory` and layers `layers` of the slice
+    /// `rank` of `tp`, with scratch for `capacity` rows.
+    pub fn load(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
+        layers: std::ops::Range<usize>, tp: usize, rank: usize, capacity: usize, budget: usize) -> Result<Self> {
+        // SAFETY: a trusted package for the current device; the owner drains
+        // its streams before dropping.
+        let module = unsafe { Fp8MoeModule::load(directory) }
+            .with_context(|| format!("FP8 expert package {} (build it with package_fp8_moe_aot.py)",
+                directory.display()))?;
+        let info = module.info().clone();
+        let shape = tensors.shape();
+        ensure!(info.hidden == shape.hidden && info.experts == shape.experts && info.topk == shape.topk
+            && info.intermediate == shape.intermediate && info.tp == tp,
+            "FP8 package {} ({info:?}) does not serve this checkpoint at TP{tp}", directory.display());
+        let top = info.capacity_for(capacity)
+            .with_context(|| format!("FP8 package has no capacity for {capacity} rows"))?;
+        let scratch_bytes = module.scratch_bytes(top)?;
+        let resident = Fp8Layer::bytes(tensors, tp)? * layers.len();
+        ensure!(resident + scratch_bytes <= budget,
+            "FP8 experts need {} GiB resident + {} MiB scratch; budget {} GiB", resident >> 30, scratch_bytes >> 20,
+            budget >> 30);
+        let layers = layers.map(|layer| {
+            let started = std::time::Instant::now();
+            let loaded = Fp8Layer::load(library, tensors, layer, tp, rank)?;
+            tracing::info!(layer, tp, rank, elapsed_ms = started.elapsed().as_millis() as u64,
+                "FP8 expert layer resident");
+            Ok(loaded)
+        }).collect::<Result<Vec<_>>>()?;
+        let scratch = DeviceAllocation::new(library, scratch_bytes.max(256))?;
+        Ok(Self { layers, scratch, module, tp, rank })
+    }
+
+    pub fn index_of(&self, layer: usize) -> Result<usize> {
+        self.layers.iter().position(|l| l.layer == layer)
+            .with_context(|| format!("FP8 expert layer {layer} is not resident"))
+    }
+
+    /// Routed experts of resident layer `index` for `rows` wire rows into
+    /// `out` (BF16 `[rows, H]`).
+    ///
+    /// # Safety
+    /// `wire`, `ids` (I32 `[rows, k]`), `weights` (F32 `[rows, k]`) and `out`
+    /// are live device buffers of those extents; the stream is drained before
+    /// any of them, or this object, is released.
+    pub unsafe fn run(&self, index: usize, rows: usize, wire: *mut c_void, ids: *mut c_void, weights: *mut c_void,
+        out: *mut c_void, stream: *mut c_void) -> Result<()> {
+        let layer = self.layers.get(index).context("FP8 expert layer index out of range")?;
+        let [w1, s1, w3, s3, w2, s2] = layer.pointers();
+        let pointers: [*mut c_void; FP8_MOE_POINTERS] =
+            [wire, ids, weights, w1, s1, w3, s3, w2, s2, out, self.scratch.buffer.ptr];
+        self.module.launch(&pointers, rows, stream)
+    }
+}

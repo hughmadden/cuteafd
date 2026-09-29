@@ -32,6 +32,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
     let config = NativeExpertServiceConfig {
         library: args.native_lib,
         exl3_aot_dir: args.exl3_aot_dir,
+        fp8_package: args.fp8_package,
         snapshot: args.snapshot,
         rank: args.rank as usize,
         world: args.world as usize,
@@ -50,6 +51,8 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
 pub(crate) struct NativeExpertServiceConfig {
     pub library: PathBuf,
     pub exl3_aot_dir: Option<PathBuf>,
+    /// FP8 package layout directory (default `<libdir>/fp8/fp8-<family>/tp<world>`).
+    pub fp8_package: Option<PathBuf>,
     pub snapshot: PathBuf,
     pub rank: usize,
     pub world: usize,
@@ -75,6 +78,7 @@ fn load_weights<'a>(
         "this checkpoint's routed experts start at layer {first}; pass --first-layer {first} or later");
     validate_topology(config, catalog)?;
     if catalog.exl3().is_some() { return backend::load_exl3(library, catalog, config); }
+    if catalog.fp8().is_some() { return backend::load_fp8(library, catalog, config); }
     log_spark_memory_if_enabled(library, config, "worker startup", None, None);
     // NVFP4 backbone experts load through the format-aware ExpertWeights path.
     let nvfp4 = catalog.nvfp4().is_some();
@@ -435,6 +439,7 @@ mod tests {
         NativeExpertServiceConfig {
             library: PathBuf::from("/native.so"),
             exl3_aot_dir: None,
+            fp8_package: None,
             snapshot: PathBuf::from("/model"),
             rank,
             world,
@@ -719,7 +724,7 @@ fn validate_topology(config: &NativeExpertServiceConfig, catalog: &OfficialV41Ca
     // it on the native shard family instead of an EXL3 substitution (and vice
     // versa).
     ensure!(
-        config.world == 4 || catalog.exl3().is_some(),
+        config.world == 4 || catalog.exl3().is_some() || (config.world == 2 && catalog.fp8().is_some()),
         "a two, three or six rank implicit Spark group requires EXL3 experts; \
          a native group must pass --spark-tp/--spark-ep"
     );

@@ -7,6 +7,7 @@
 //! Inputs are random FP8 K32 wire rows, so the oracle sees exactly the values
 //! the kernels do. EXL3 checkpoints use the trellis oracle in `exl3`.
 mod exl3;
+mod fp8;
 mod local;
 
 use crate::cli::ExpertProbeArgs;
@@ -26,8 +27,10 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
     let geometry = shape.geometry()?;
     cuteafd_core::set_expert_geometry(geometry)
         .map_err(|fixed| anyhow::anyhow!("expert geometry already {fixed:?}"))?;
-    ensure!((shape.first_layer..shape.layers).contains(&args.layer), "layer {} is outside {}..{}",
-        args.layer, shape.first_layer, shape.layers);
+    // FP8 checkpoints also carry routed layers past the backbone (GLM's MTP layer).
+    ensure!((shape.first_layer..shape.layers).contains(&args.layer)
+        || catalog.fp8().is_some_and(|tensors| tensors.has_layer(args.layer)),
+        "layer {} is outside {}..{}", args.layer, shape.first_layer, shape.layers);
     ensure!(args.stage.is_none() || catalog.exl3().is_some(), "--stage probes EXL3 dSpark stages only");
     let (hidden, topk, rows) = (shape.hidden, shape.topk, args.rows as usize);
     ensure!(rows > 0 && rows <= 4096, "rows must be 1..=4096");
@@ -71,6 +74,25 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
         }
     }
     let exl3 = catalog.exl3().is_some();
+    if catalog.fp8().is_some() {
+        ensure!(args.stage.is_none(), "FP8 checkpoints have no dSpark stages");
+        let sampled = fp8::sampled_rows(rows);
+        let pick = |values: &[f32]| -> Vec<f32> {
+            sampled.iter().flat_map(|&row| values[row * hidden..][..hidden].iter().copied()).collect()
+        };
+        if args.local {
+            let (actual, elapsed) = fp8::run_local(&args, &catalog, &wire, &routes)?;
+            let started = Instant::now();
+            let expected = fp8::oracle(&catalog, args.layer, &input, &routes, &sampled)?;
+            return report(&format!("layer {} rows {rows} local fp8 ({} rows checked)", args.layer, sampled.len()),
+                false, &pick(&actual), &expected, elapsed, started.elapsed());
+        }
+        let (actual, remote) = remote_partials(&args, rows, hidden, topk, &routes, wire).await?;
+        let started = Instant::now();
+        let expected = fp8::oracle(&catalog, args.layer, &input, &routes, &sampled)?;
+        return report(&format!("layer {} rows {rows} fp8 ({} rows checked)", args.layer, sampled.len()), false,
+            &pick(&actual), &expected, remote, started.elapsed());
+    }
     if args.local {
         let (actual, elapsed) = local::run(&args, &catalog, &wire, &routes)?;
         let (what, index) = match args.stage { Some(stage) => ("stage", stage), None => ("layer", args.layer) };
@@ -149,6 +171,47 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
     };
     report(&format!("layer {} rows {rows} ranks {}", args.layer, peers.len()), exl3, &actual, &expected,
         remote, started.elapsed())
+}
+
+/// Sends the probe rows to every Spark rank and sums the BF16 rank partials.
+async fn remote_partials(args: &ExpertProbeArgs, rows: usize, hidden: usize, topk: usize,
+    routes: &[ExpertProtocolV2RouteEntry], wire: Vec<u8>) -> Result<(Vec<f32>, Duration)> {
+    let mut request = ExpertProtocolV2Request::new(
+        args.seed, 17, args.layer as u32, hidden as u32, ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+        (0..rows as u32).map(|row| ExpertProtocolV2RowDescriptor {
+            row_id: u64::from(row), source_kind: ExpertV2SourceKind::Prefill, source_request_id: args.seed,
+            token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32,
+        }).collect(),
+        routes.to_vec(), wire)?;
+    request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    let peers = args.peers.as_deref().context("--peers is required without --local")?
+        .split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()
+        .context("--peers takes comma-separated HOST:PORT addresses")?;
+    let config = TcpTransportConfig { timing: false, timeout: Duration::from_secs(60), max_frame_bytes: 64 << 20 };
+    let executors = (0..peers.len())
+        .map(|rank| cuteafd_transport::v41_expert::v41_spark_executor_id(peers.len(), rank))
+        .collect::<Result<Vec<u64>>>()?;
+    let mut client = V41Tp4Roce::new_ranks(&peers, &executors, args.capacity, config)?;
+    let mut actual = vec![0f32; rows * hidden];
+    let started = Instant::now();
+    client.execute(&request, |_rank, first, payload| {
+        for (index, pair) in payload.chunks_exact(2).enumerate() {
+            actual[first as usize * hidden + index] += f32::from_bits(u32::from(u16::from_le_bytes([pair[0], pair[1]])) << 16);
+        }
+        Ok(())
+    }).await?;
+    let remote = started.elapsed();
+    if args.repeat > 0 {
+        let mut times = Vec::with_capacity(args.repeat);
+        for _ in 0..args.repeat {
+            let started = Instant::now();
+            client.execute(&request, |_, _, _| Ok(())).await?;
+            times.push(started.elapsed().as_secs_f64() * 1e6);
+        }
+        times.sort_by(f64::total_cmp);
+        println!("round trip over {} repeats: median {:.0} us, min {:.0} us", args.repeat, times[times.len() / 2], times[0]);
+    }
+    Ok((actual, remote))
 }
 
 fn report(what: &str, exl3: bool, actual: &[f32], expected: &[f32], remote: Duration, oracle_elapsed: Duration)
