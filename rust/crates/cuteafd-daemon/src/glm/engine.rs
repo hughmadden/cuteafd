@@ -32,6 +32,8 @@ const RECORD_PAGE_BYTES: usize = PAGE_ROWS * 656;
 const INDEX_PAGE_BYTES: usize = 8448;
 /// Most Spark ranks a step's partials come from (the compact reducer's limit).
 const MAX_RANKS: usize = 6;
+/// Ranks whose (zero) partials a skipped exchange uploads: the TP4 layout.
+const SKIP_RANKS: usize = 4;
 /// Rows of the decode-route programs (`_m64`).
 pub(crate) const DECODE_ROWS: usize = 64;
 /// Most lanes a long Spark prefill chunk splits into (CUTEAFD_GLM_PREFILL_LANES,
@@ -178,6 +180,9 @@ pub(crate) struct GlmEngine<'a> {
     /// Prefill steps keep every row's logits (golden scoring); otherwise the
     /// prefill workspace holds logits for at most `DECODE_ROWS` rows.
     pub full_prefill_logits: bool,
+    /// Benchmarks: MoE layers skip the Spark exchange (see
+    /// `EngineArgs::skip_routed_experts`).
+    pub skip_routed: bool,
     /// Host time per phase since the last reset: GPU wait before the expert
     /// request, the Spark exchange, the logits download.
     pub profile: RefCell<[f64; 3]>,
@@ -225,7 +230,7 @@ impl<'a> GlmEngine<'a> {
         Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
             decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
             prefill_lanes: configured_lanes(),
-            lanes: RefCell::new(Vec::new()), full_prefill_logits: false, profile: RefCell::new([0.0; 3]),
+            lanes: RefCell::new(Vec::new()), full_prefill_logits: false, skip_routed: false, profile: RefCell::new([0.0; 3]),
             exchange_host: RefCell::new([0.0; 4]),
             graphs: RefCell::new(std::collections::HashMap::new()), drafter: None })
     }
@@ -451,6 +456,10 @@ impl<'a> GlmEngine<'a> {
                 &[rows, Dsv4Scalar::I32(1)])?;
             if layer.dense {
                 self.ffn(w, layer, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)?;
+            } else if self.skip_routed {
+                self.moe_front(w, layer, t)?;
+                let ranks = self.moe_skip(w, layer, t, cap)?;
+                self.reduce(w, ranks, t)?;
             } else {
                 let (transport, runtime) = experts.as_mut()
                     .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
@@ -539,6 +548,7 @@ impl<'a> GlmEngine<'a> {
             previous = match layer {
                 None => break,
                 Some(layer) if layer.dense => Previous::Delta,
+                Some(layer) if self.skip_routed => Previous::Planes(self.moe_skip(w, layer, t, "m64")?),
                 Some(layer) => {
                     let (transport, runtime) = experts.as_mut()
                         .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
@@ -607,6 +617,27 @@ impl<'a> GlmEngine<'a> {
         self.moe_stage(w, layer, t, cap)?;
         let wave = self.moe_send(w, index, t, decode, transport)?;
         runtime.block_on(self.moe_land(w, t, transport, wave))
+    }
+
+    /// [`Self::moe_exchange`] without the Spark request (benchmarks): the
+    /// stage, then zero partials of [`SKIP_RANKS`] ranks through the pinned
+    /// plane staging.
+    fn moe_skip(&self, w: &Workspace<'_>, layer: &GlmLayer<'_>, t: usize, cap: &str) -> Result<usize> {
+        self.moe_stage(w, layer, t, cap)?;
+        let plane_bytes = t * self.cfg.hidden * 2;
+        let mut staging = w.planes_host.borrow_mut();
+        staging.bytes_mut()[..SKIP_RANKS * plane_bytes].fill(0);
+        for rank in 0..SKIP_RANKS {
+            let source = cuteafd_ffi::CuteafdHostBuffer {
+                // SAFETY: rank planes are disjoint slices of the staging buffer.
+                ptr: unsafe { staging.buffer.ptr.cast::<u8>().add(rank * plane_bytes) }.cast(),
+                bytes: plane_bytes,
+                ..staging.buffer
+            };
+            // SAFETY: pinned source and device plane both hold `plane_bytes`.
+            unsafe { self.library.copy_host_buffer_h2d_async(w.planes[rank].buffer, source, plane_bytes, self.stream)? };
+        }
+        Ok(SKIP_RANKS)
     }
 
     /// Routes and wire rows down to this workspace's pinned staging (the host

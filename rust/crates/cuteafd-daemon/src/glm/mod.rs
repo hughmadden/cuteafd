@@ -50,6 +50,12 @@ pub(crate) struct EngineArgs {
     /// Keep every prefill row's logits (glm-golden --nll; 2.5 GiB at 4096 rows).
     #[arg(long, hide = true)]
     pub full_prefill_logits: bool,
+    /// Benchmarks only: MoE layers skip the Spark exchange (routed experts
+    /// contribute zero) but keep the route/wire download, the host sync, the
+    /// shared expert, the plane uploads and the reduce, timing the
+    /// coordinator alone. Outputs are not the model's.
+    #[arg(long, hide = true)]
+    pub skip_routed_experts: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -93,6 +99,23 @@ pub(crate) struct GoldenArgs {
     pub bench_prefill: usize,
     #[arg(long, default_value_t = 4096)]
     pub bench_prefill_tokens: usize,
+    /// Time teacher-forced verify steps of 1, 2, 4, ... up to N rows of one
+    /// sequence after --prefill tokens (default 512) of the golden prompt
+    /// (median of 7 after 2 warm-ups; the sequence rewinds between steps),
+    /// and with --draft the drafter step for 1, 2, 4, ... sequences.
+    #[arg(long)]
+    pub bench_verify: Option<usize>,
+    /// With --bench-verify: time only these row counts (comma-separated).
+    #[arg(long, value_delimiter = ',')]
+    pub bench_rows: Vec<usize>,
+    /// With --bench-verify and --draft: time only these sequence counts.
+    #[arg(long, value_delimiter = ',')]
+    pub bench_sequences: Vec<usize>,
+    /// With --bench-verify: write each row count's last logits (F32) and,
+    /// with --draft, each sequence count's drafts to this directory (A/B
+    /// numerics checks between builds).
+    #[arg(long)]
+    pub bench_dump: Option<PathBuf>,
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -132,6 +155,7 @@ impl Opened {
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages)?;
         engine.full_prefill_logits = args.full_prefill_logits;
+        engine.skip_routed = args.skip_routed_experts;
         if let Some(snapshot) = &args.draft {
             let started = Instant::now();
             let cfg = dflash::DflashConfig::read(snapshot)?;
@@ -295,6 +319,91 @@ fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, t
     Ok(())
 }
 
+/// --bench-verify: verify-step cost by rows (the DFlash2 policy's step
+/// table) with the host's phase split, then the drafter step by sequences.
+fn bench_verify(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
+    mut transport: Option<&mut V41Tp4Roce>, runtime: &tokio::runtime::Runtime, max_rows: usize) -> Result<()> {
+    let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
+        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    ensure!(max_rows >= 1 && max_rows <= engine::DECODE_ROWS, "--bench-verify takes 1..={} rows", engine::DECODE_ROWS);
+    ensure!(transport.is_some() || engine.skip_routed, "--bench-verify needs Spark peers or --skip-routed-experts");
+    let prefill = args.prefill.unwrap_or(512);
+    ensure!(prefill + max_rows <= tokens.len(), "the golden prompt is shorter than --prefill + --bench-verify");
+    let row = opened.cfg.hidden * 2;
+    let embed = embed_rows(&opened.catalog, &tokens[..prefill + max_rows], opened.cfg.hidden)?;
+    let mut placement = engine::PageAllocator::new(engine.pages).admit(prefill + max_rows)?;
+    for chunk in embed[..prefill * row].chunks(engine.prefill_capacity() * row) {
+        engine.prefill(&mut placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)), None)?;
+    }
+    let start = placement.len;
+    println!("verify cost after {prefill} tokens (teacher-forced, one sequence, median of 7; host phases per step: \
+        GPU wait before each exchange, exchange, logits download){}",
+        if engine.skip_routed { " [routed experts skipped]" } else { "" });
+    let mut counts: Vec<usize> = (0..).map(|i| 1usize << i).take_while(|&r| r < max_rows).chain([max_rows]).collect();
+    if !args.bench_rows.is_empty() {
+        ensure!(args.bench_rows.iter().all(|&r| r >= 1 && r <= max_rows), "--bench-rows past --bench-verify");
+        counts = args.bench_rows.clone();
+    }
+    for rows in counts {
+        let mut times = Vec::new();
+        for round in 0..9 {
+            placement.len = start;
+            if round == 2 {
+                *engine.profile.borrow_mut() = [0.0; 3];
+            }
+            let started = Instant::now();
+            let logits = engine.verify(&mut [(&mut placement, rows)], &embed[start * row..(start + rows) * row],
+                transport.as_deref_mut().map(|t| (t, runtime)), None)?;
+            if round >= 2 {
+                times.push(started.elapsed().as_secs_f64() * 1e3);
+            }
+            if let (Some(dir), Some(logits), 8) = (&args.bench_dump, logits, round) {
+                std::fs::create_dir_all(dir)?;
+                std::fs::write(dir.join(format!("logits-{rows}.bin")),
+                    logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+            }
+        }
+        let phases = std::mem::take(&mut *engine.profile.borrow_mut());
+        let n = times.len() as f64;
+        times.sort_by(f64::total_cmp);
+        println!("  {rows} rows: {:.2} ms (min {:.2}) | gpu wait {:.2} exchange {:.2} logits {:.2} ms", times[times.len() / 2],
+            times[0], 1e3 * phases[0] / n, 1e3 * phases[1] / n, 1e3 * phases[2] / n);
+    }
+    if let Some(drafter) = engine.drafter.as_ref() {
+        // The drafter reads its ring context of the prefilled taps; anchors at the prefill's end.
+        let n = start.min(dflash::TAP_ROWS);
+        drafter.update(&(0..n).map(|r| dflash::ContextRow { tap_row: r, slot: 0, position: start - n + r })
+            .collect::<Vec<_>>())?;
+        println!("drafter step (anchors at position {start}, median of 7):");
+        let mut counts: Vec<usize> = (0..).map(|i| 1usize << i).take_while(|&s| s < drafter.slots)
+            .chain([drafter.slots]).collect();
+        if !args.bench_sequences.is_empty() {
+            ensure!(args.bench_sequences.iter().all(|&s| s >= 1 && s <= drafter.slots), "--bench-sequences past the slots");
+            counts = args.bench_sequences.clone();
+        }
+        for sequences in counts {
+            let seqs: Vec<dflash::DraftSeq> = (0..sequences)
+                .map(|slot| dflash::DraftSeq { slot, anchor: tokens[start], position: start }).collect();
+            let anchors = embed_rows(&opened.catalog, &vec![tokens[start]; sequences], opened.cfg.hidden)?;
+            let mut times = Vec::new();
+            for round in 0..9 {
+                let started = Instant::now();
+                let drafts = drafter.draft(&seqs, &anchors, engine.weights.head.buffer.ptr)?;
+                if round >= 2 {
+                    times.push(started.elapsed().as_secs_f64() * 1e3);
+                }
+                if let (Some(dir), 8) = (&args.bench_dump, round) {
+                    std::fs::write(dir.join(format!("drafts-{sequences}.txt")),
+                        drafts.iter().map(|d| format!("{:?}\n", d.tokens)).collect::<String>())?;
+                }
+            }
+            times.sort_by(f64::total_cmp);
+            println!("  {sequences} sequences: {:.2} ms (min {:.2})", times[times.len() / 2], times[0]);
+        }
+    }
+    Ok(())
+}
+
 /// --bench-prefill: fresh sequences of --bench-prefill-tokens tokens.
 fn bench_prefill(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, transport: &mut V41Tp4Roce,
     runtime: &tokio::runtime::Runtime) -> Result<()> {
@@ -343,6 +452,9 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
     runtime: &tokio::runtime::Runtime) -> Result<()> {
     if let Some(dir) = &args.draft_oracle {
         return draft_oracle(args, opened, engine, dir);
+    }
+    if let Some(rows) = args.bench_verify {
+        return bench_verify(args, opened, engine, transport, runtime, rows);
     }
     if engine.drafter.is_some() {
         return draft_run(args, opened, engine, transport, runtime);
