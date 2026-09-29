@@ -93,6 +93,11 @@ pub(crate) struct GoldenArgs {
     pub bench_prefill: usize,
     #[arg(long, default_value_t = 4096)]
     pub bench_prefill_tokens: usize,
+    /// Time teacher-forced verify steps of 1, 2, 4, ... up to N rows of one
+    /// sequence after --prefill tokens (default 512) of the golden prompt
+    /// (median of 7 after 2 warm-ups; the sequence rewinds between steps).
+    #[arg(long)]
+    pub bench_verify: Option<usize>,
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -295,6 +300,40 @@ fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, t
     Ok(())
 }
 
+/// --bench-verify: verify-step cost by rows (the DFlash2 policy's step table).
+fn bench_verify(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, transport: &mut V41Tp4Roce,
+    runtime: &tokio::runtime::Runtime, max_rows: usize) -> Result<()> {
+    let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
+        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    ensure!(max_rows >= 1 && max_rows <= engine::DECODE_ROWS, "--bench-verify takes 1..={} rows", engine::DECODE_ROWS);
+    let prefill = args.prefill.unwrap_or(512);
+    ensure!(prefill + max_rows <= tokens.len(), "the golden prompt is shorter than --prefill + --bench-verify");
+    let row = opened.cfg.hidden * 2;
+    let embed = embed_rows(&opened.catalog, &tokens[..prefill + max_rows], opened.cfg.hidden)?;
+    let mut placement = engine::PageAllocator::new(engine.pages).admit(prefill + max_rows)?;
+    for chunk in embed[..prefill * row].chunks(engine.prefill_capacity() * row) {
+        engine.prefill(&mut placement, chunk, Some((&mut *transport, runtime)), None)?;
+    }
+    let start = placement.len;
+    println!("verify cost after {prefill} tokens (teacher-forced, one sequence, median of 7):");
+    let counts: Vec<usize> = (0..).map(|i| 1usize << i).take_while(|&r| r < max_rows).chain([max_rows]).collect();
+    for rows in counts {
+        let mut times = Vec::new();
+        for round in 0..9 {
+            placement.len = start;
+            let started = Instant::now();
+            engine.verify(&mut [(&mut placement, rows)], &embed[start * row..(start + rows) * row],
+                Some((&mut *transport, runtime)), None)?;
+            if round >= 2 {
+                times.push(started.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        times.sort_by(f64::total_cmp);
+        println!("  {rows} rows: {:.2} ms (min {:.2})", times[times.len() / 2], times[0]);
+    }
+    Ok(())
+}
+
 /// --bench-prefill: fresh sequences of --bench-prefill-tokens tokens.
 fn bench_prefill(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, transport: &mut V41Tp4Roce,
     runtime: &tokio::runtime::Runtime) -> Result<()> {
@@ -346,6 +385,10 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
     }
     if engine.drafter.is_some() {
         return draft_run(args, opened, engine, transport, runtime);
+    }
+    if let Some(rows) = args.bench_verify {
+        let transport = transport.context("--bench-verify needs Spark peers")?;
+        return bench_verify(args, opened, engine, transport, runtime, rows);
     }
     if args.nll || args.bench_prefill > 0 {
         let transport = transport.context("--nll and --bench-prefill need Spark peers")?;

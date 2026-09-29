@@ -242,6 +242,26 @@ impl DraftSkip {
 pub(crate) const K4_TP4_STEP_MS: [(usize, f64); 15] = [(1, 35.6), (2, 50.5), (3, 62.4), (4, 73.6), (5, 83.2),
     (6, 93.1), (7, 102.2), (8, 111.8), (10, 128.1), (12, 146.7), (16, 173.6), (24, 220.8), (32, 260.2), (48, 342.5),
     (64, 402.8)];
+/// Coordinator share of `K4_TP4_STEP_MS` at one row (35.6 ms = ~16.6 GPU +
+/// ~19 Spark exchange: 226 us x 75 layers).
+pub(crate) const K4_TP4_GPU_MS: f64 = 16.6;
+
+/// Widest intermediate slice of `ranks` Spark ranks splitting `intermediate`
+/// in whole 128-blocks (2048: TP4 512, TP6 384): it bounds how many expert
+/// bytes the busiest rank reads per step.
+pub(crate) fn widest_slice(intermediate: usize, ranks: usize) -> usize {
+    (intermediate / 128).div_ceil(ranks.max(1)) * 128
+}
+
+/// A step table measured with widest Spark slice `measured` re-priced for
+/// widest slice `widest`: the coordinator share `gpu_ms` stays, the Spark
+/// share (expert reads and exchange) scales with the slice. Serving still
+/// rescales the whole table by what it observes.
+pub(crate) fn rescale_spark(points: &[(usize, f64)], gpu_ms: f64, measured: usize, widest: usize)
+    -> Vec<(usize, f64)> {
+    let factor = widest as f64 / measured as f64;
+    points.iter().map(|&(rows, ms)| (rows, gpu_ms + (ms - gpu_ms).max(0.0) * factor)).collect()
+}
 
 /// Sequences that draft together: identical ones (same tokens, same
 /// position) form one group of `members`, with one draft between them.
@@ -317,6 +337,16 @@ pub(crate) fn plan(groups: &[Group<'_>], base: (usize, usize), cost: &StepCost) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spark_share_scales_with_the_widest_slice() {
+        assert_eq!((widest_slice(2048, 4), widest_slice(2048, 6), widest_slice(2048, 2)), (512, 384, 1024));
+        let same = rescale_spark(&K4_TP4_STEP_MS, K4_TP4_GPU_MS, 512, 512);
+        assert!(same.iter().zip(&K4_TP4_STEP_MS).all(|(a, b)| a.0 == b.0 && (a.1 - b.1).abs() < 1e-9));
+        let six = rescale_spark(&K4_TP4_STEP_MS, K4_TP4_GPU_MS, 512, 384);
+        assert!((six[0].1 - (16.6 + 19.0 * 0.75)).abs() < 1e-9);
+        assert!((six[7].1 - (16.6 + (111.8 - 16.6) * 0.75)).abs() < 1e-9);
+    }
 
     #[test]
     fn matches_frozen_glmrt_calibration() {

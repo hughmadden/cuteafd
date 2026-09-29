@@ -105,7 +105,9 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(()));
         }
-        schedule(engine, &opened, &mut receive, transport, runtime, &stats, max_sequences.min(DECODE_ROWS), policy)
+        let ranks = args.peers.as_deref().map_or(4, |peers| peers.split(',').count());
+        schedule(engine, &opened, &mut receive, transport, runtime, &stats, max_sequences.min(DECODE_ROWS), policy,
+            ranks)
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
@@ -219,14 +221,17 @@ fn copy_drafts(history: &[u32], limit: usize) -> Vec<u32> {
 
 fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receiver<NativeRequest>,
     transport: &mut V41Tp4Roce, runtime: &tokio::runtime::Runtime, stats: &Mutex<serde_json::Value>,
-    max_sequences: usize, policy: Policy) -> Result<()> {
+    max_sequences: usize, policy: Policy, ranks: usize) -> Result<()> {
     let mut allocator = PageAllocator::new(engine.pages);
     let mut grammars = crate::v41_native_serve::constraints::Compiler::with_vocab(
         &opened.library, opened.snapshot.join("tokenizer.json"), engine.cfg.vocab_size, engine.cfg.eos_tokens.clone());
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(&opened.snapshot)?;
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
-    let mut cost = StepCost::new(&dflash_policy::K4_TP4_STEP_MS, DECODE_ROWS);
+    // Measured at TP4; other Spark layouts scale its Spark share (TP6: 384 / 512).
+    let widest = dflash_policy::widest_slice(engine.cfg.moe_intermediate, ranks);
+    let table = dflash_policy::rescale_spark(&dflash_policy::K4_TP4_STEP_MS, dflash_policy::K4_TP4_GPU_MS, 512, widest);
+    let mut cost = StepCost::new(&table, DECODE_ROWS);
     let mut skip = dflash_policy::DraftSkip::default();
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
