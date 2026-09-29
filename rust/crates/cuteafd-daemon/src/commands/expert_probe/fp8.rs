@@ -105,24 +105,21 @@ pub(super) fn oracle(catalog: &OfficialV41Catalog, layer: usize, input: &[f32], 
     Ok(out)
 }
 
-/// `--local`: the probe's wire rows and routes through the full-width (TP1)
-/// FP8 package on this GPU. Returns every row (FP32) and the checked launch time.
+/// `--local`: the probe's wire rows and routes through the FP8 package on
+/// this GPU: the full-width (TP1) layout, or with `--local-tp N` every rank
+/// slice of a TP-N layout in turn, BF16 rank partials summed in FP32. Returns
+/// every row (FP32) and the checked launch time (the slowest rank).
 pub(super) fn run_local(args: &ExpertProbeArgs, catalog: &OfficialV41Catalog, wire: &[u8], input: &[f32],
     routes: &[ExpertProtocolV2RouteEntry]) -> Result<(Vec<f32>, Duration)> {
     let tensors = catalog.fp8().context("FP8 checkpoint")?;
     let shape = *catalog.routed_experts();
-    let (hidden, rows) = (shape.hidden, args.rows as usize);
+    let (hidden, rows, tp) = (shape.hidden, args.rows as usize, args.local_tp.max(1));
     let native_lib = args.native_lib.as_deref().context("--local needs --native-lib")?;
     // SAFETY: a trusted image library, loaded once for this process.
     let library = unsafe { NativeLibrary::load(native_lib) }?;
     library.cuda_set_device(0)?;
     let stream = library.cuda_stream_create()?;
-    let (free, _) = library.cuda_memory_info()?;
-    let directory = args.fp8_package.clone().unwrap_or_else(|| package_directory(native_lib, 1));
-    let started = Instant::now();
-    let experts = Fp8Experts::load(&library, tensors, &directory, args.layer..args.layer + 1, 1, 0, rows,
-        free.saturating_sub(2 << 30))?;
-    eprintln!("resident in {:.1} s", started.elapsed().as_secs_f64());
+    let directory = args.fp8_package.clone().unwrap_or_else(|| package_directory(native_lib, tp));
     let upload = |bytes: &[u8]| -> Result<DeviceAllocation<'_>> {
         let allocation = DeviceAllocation::new(&library, bytes.len().max(16))?;
         library.copy_h2d(allocation.buffer, bytes)?;
@@ -130,40 +127,68 @@ pub(super) fn run_local(args: &ExpertProbeArgs, catalog: &OfficialV41Catalog, wi
     };
     let ids: Vec<u8> = routes.iter().flat_map(|r| r.expert_id.to_le_bytes()).collect();
     let weights: Vec<u8> = routes.iter().flat_map(|r| r.gate_weight.to_le_bytes()).collect();
-    // A BF16-input (coordinator) package takes the wire rows' exact BF16 values.
-    let rows_in: Vec<u8> = if experts.wire_input() {
-        wire.to_vec()
-    } else {
-        input.iter().flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes()).collect()
-    };
-    let (wire, ids, weights) = (upload(&rows_in)?, upload(&ids)?, upload(&weights)?);
+    let (ids, weights) = (upload(&ids)?, upload(&weights)?);
     let output = DeviceAllocation::new(&library, rows * hidden * 2)?;
-    // SAFETY: every buffer is a live device allocation of the documented extent;
-    // the stream is drained before any is released.
-    let launch = || unsafe {
-        experts.run(0, rows, wire.buffer.ptr, ids.buffer.ptr, weights.buffer.ptr, output.buffer.ptr, stream)
-    };
+    // SAFETY: `stream` is this function's live stream until it is destroyed below.
     let sync = || unsafe { library.cuda_stream_synchronize(stream) };
-    launch()?;
-    sync()?;
-    let started = Instant::now();
-    launch()?;
-    sync()?;
-    let elapsed = started.elapsed();
-    if args.repeat > 0 {
+    let mut total = vec![0f32; rows * hidden];
+    let mut slowest = Duration::ZERO;
+    for rank in 0..tp {
+        let (free, _) = library.cuda_memory_info()?;
+        let free = free.max(unified_available());
         let started = Instant::now();
-        for _ in 0..args.repeat {
-            launch()?;
-        }
+        let experts = Fp8Experts::load(&library, tensors, &directory, args.layer..args.layer + 1, tp, rank, rows,
+            free.saturating_sub(2 << 30))?;
+        eprintln!("rank {rank}/{tp} resident in {:.1} s", started.elapsed().as_secs_f64());
+        // A BF16-input (coordinator) package takes the wire rows' exact BF16 values.
+        let rows_in: Vec<u8> = if experts.wire_input() {
+            wire.to_vec()
+        } else {
+            input.iter().flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes()).collect()
+        };
+        let rows_in = upload(&rows_in)?;
+        // SAFETY: every buffer is a live device allocation of the documented
+        // extent; the stream is drained before any is released.
+        let launch = || unsafe {
+            experts.run(0, rows, rows_in.buffer.ptr, ids.buffer.ptr, weights.buffer.ptr, output.buffer.ptr, stream)
+        };
+        launch()?;
         sync()?;
-        println!("local fp8 layer {} rows {rows}: back-to-back {:.1} us over {} launches", args.layer,
-            started.elapsed().as_secs_f64() * 1e6 / args.repeat as f64, args.repeat);
+        let started = Instant::now();
+        launch()?;
+        sync()?;
+        slowest = slowest.max(started.elapsed());
+        if args.repeat > 0 {
+            let started = Instant::now();
+            for _ in 0..args.repeat {
+                launch()?;
+            }
+            sync()?;
+            println!("local fp8 layer {} rows {rows} tp{tp} rank {rank}: back-to-back {:.1} us over {} launches",
+                args.layer, started.elapsed().as_secs_f64() * 1e6 / args.repeat as f64, args.repeat);
+        }
+        let mut bytes = vec![0u8; rows * hidden * 2];
+        library.copy_d2h(&mut bytes, output.buffer)?;
+        for (sum, pair) in total.iter_mut().zip(bytes.chunks_exact(2)) {
+            *sum += f32::from_bits(u32::from(u16::from_le_bytes([pair[0], pair[1]])) << 16);
+        }
+        drop(rows_in);
+        drop(experts);
     }
-    let mut bytes = vec![0u8; rows * hidden * 2];
-    library.copy_d2h(&mut bytes, output.buffer)?;
-    drop(experts);
     // SAFETY: nothing is queued on the drained stream.
     unsafe { library.cuda_stream_destroy(stream)? };
-    Ok((bytes.chunks_exact(2).map(|p| f32::from_bits(u32::from(u16::from_le_bytes([p[0], p[1]])) << 16)).collect(),
-        elapsed))
+    Ok((total, slowest))
+}
+
+/// `MemAvailable` on unified-memory hosts (GB10): `cudaMemGetInfo` there
+/// reports only `MemFree`, although device allocations reclaim the page cache
+/// (a probe right after reading a checkpoint would otherwise see ~no memory).
+fn unified_available() -> usize {
+    if !cfg!(target_arch = "aarch64") {
+        return 0;
+    }
+    std::fs::read_to_string("/proc/meminfo").ok()
+        .and_then(|text| text.lines().find_map(|line| line.strip_prefix("MemAvailable:").map(str::to_owned)))
+        .and_then(|value| value.trim().trim_end_matches("kB").trim().parse::<usize>().ok())
+        .map_or(0, |kib| kib << 10)
 }

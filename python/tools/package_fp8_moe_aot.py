@@ -3,7 +3,9 @@
 
 The checkpoint's E4M3 experts with FP32 128x128 block scales run as
 ``b12x.integration.cuteafd.fp8_moe`` programs (route ``auto``: grouped GEMV
-up to 2048 live rows, grouped TMA GEMM above). A package holds one directory
+up to 1024 live rows and the expert-stationary streaming GEMMs above on
+GB10 (spark packages, wire input); GEMV up to 2048 rows and the grouped TMA
+GEMM above for SM120 / BF16 input). A package holds one directory
 per layout, each with ``libcuteafd_fp8moe.so`` carrying one program per
 capacity, and a verified ``manifest.json``:
 
@@ -212,7 +214,7 @@ def build(args: argparse.Namespace) -> None:
                 if checked["argument_count"] != POINTERS + 2:
                     raise ValueError(f"{stem}: unexpected ABI arity {checked['argument_count']}")
                 programs.append({"stem": stem, "capacity": capacity, "entry": checked["symbol"],
-                                 "scratch": fp8_moe_scratch_bytes(g, "auto", capacity)})
+                                 "scratch": fp8_moe_scratch_bytes(g, "auto", capacity, wire)})
                 print(f"exported {stem} (scratch {programs[-1]['scratch']} B)", flush=True)
             (raw / "fp8moe_bridge.cc").write_text(bridge_source(programs, info_words(g, capacities, wire)))
             target = stage / layout / LIBRARY
