@@ -248,12 +248,12 @@ pub(crate) fn prefetch(snapshot: &Path) -> std::thread::JoinHandle<std::io::Resu
 }
 
 impl Checkpoint {
-    fn read(&self, name: &str, shape: &[usize]) -> Result<Vec<u8>> {
+    fn bytes(&self, name: &str, shape: &[usize]) -> Result<&[u8]> {
         let t = self.tensors.get(name).with_context(|| format!("DFlash2 checkpoint has no {name}"))?;
         ensure!(t.shape == shape && t.byte_length as usize == shape.iter().product::<usize>() * 2,
             "{name}: shape {:?}, expected BF16 {shape:?}", t.shape);
         let range = t.byte_offset as usize..(t.byte_offset + t.byte_length) as usize;
-        Ok(self.data.get(range).with_context(|| format!("{name} lies past the file"))?.to_vec())
+        self.data.get(range).with_context(|| format!("{name} lies past the file"))
     }
 }
 
@@ -282,13 +282,18 @@ impl<'a> GlmDrafter<'a> {
             Ok(allocation)
         };
         let (h, kv, inter) = (cfg.hidden, cfg.kv_width(), cfg.intermediate);
-        let tensor = |name: &str, shape: &[usize]| checkpoint.read(name, shape).and_then(|b| upload(&b));
+        let tensor = |name: &str, shape: &[usize]| checkpoint.bytes(name, shape).and_then(upload);
         let concat = |parts: &[(&str, usize)], cols: usize| -> Result<Dev<'a>> {
-            let mut bytes = Vec::new();
+            let total: usize = parts.iter().map(|(_, rows)| rows * cols * 2).sum();
+            let allocation = DeviceAllocation::new(library, total)?;
+            let mut offset = 0;
             for (name, rows) in parts {
-                bytes.extend(checkpoint.read(name, &[*rows, cols])?);
+                let bytes = checkpoint.bytes(name, &[*rows, cols])?;
+                library.copy_h2d(CuteafdDeviceBuffer { ptr: at(&allocation, offset), bytes: bytes.len(),
+                    ..allocation.buffer }, bytes)?;
+                offset += bytes.len();
             }
-            upload(&bytes)
+            Ok(allocation)
         };
         let layers = (0..cfg.layers).map(|l| -> Result<DraftLayer<'a>> {
             let p = format!("layers.{l}");
