@@ -172,6 +172,7 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         ("mhc_pre", "mhc_pre", {}, lambda: mhc.compile_dsv4_mhc_pre_aot(mg)),
         ("mhc_post", "mhc_post", {}, lambda: mhc.compile_dsv4_mhc_post_aot(mg)),
         ("head", "head", {}, lambda: glmf.compile_glmf_head_aot(g)),
+        ("head_fp8", "head_fp8", {}, lambda: glmf.compile_glmf_head_fp8_aot(g)),
         ("add", "add", {}, lambda: glmf.compile_glmf_add_aot(g)),
         ("router_scores", "router_scores", {}, lambda: glmf.compile_glmf_router_scores_aot(g)),
         ("expert_input_quant", "expert_input_quant", {}, lambda: glmf.compile_glmf_expert_input_quant_aot(g)),

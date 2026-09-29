@@ -53,6 +53,8 @@ pub(crate) struct GlmfWeights<'a> {
     pub layers: Vec<GlmfLayer<'a>>,
     pub norm: DeviceAllocation<'a>,
     pub head: DeviceAllocation<'a>,
+    /// E4M3 LM head with per-row x 128-K scales, for decode rows (--fp8-head).
+    pub head_fp8: Option<(DeviceAllocation<'a>, DeviceAllocation<'a>)>,
 }
 
 pub(crate) struct GlmfLoader<'a> {
@@ -65,6 +67,7 @@ pub(crate) struct GlmfLoader<'a> {
     pub fp8_dense: bool,
     pub fp8_source: Option<&'a Checkpoint>,
     pub kda_fp8: super::fp8::KdaFp8,
+    pub fp8_head: bool,
     /// Numerics gate only: KDA projections rounded through NVFP4 (Some(search)) and kept in BF16.
     pub kda_nvfp4: Option<bool>,
 }
@@ -352,6 +355,11 @@ impl<'a> GlmfLoader<'a> {
             layers: (0..layers.min(cfg.layers)).map(|l| self.layer(cfg, l)).collect::<Result<_>>()?,
             norm: self.one(&format!("{PREFIX}norm.weight"))?,
             head: self.one("lm_head.weight")?,
+            head_fp8: if self.fp8_head {
+                Some(self.fp8(&["lm_head.weight".to_string()], super::fp8::Layout::Row128)?)
+            } else {
+                None
+            },
         })
     }
 }

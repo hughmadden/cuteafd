@@ -697,11 +697,7 @@ impl<'a> GlmfEngine<'a> {
         let timer = std::time::Instant::now();
         self.run("head", &[("streams", w.streams[cur].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
             ("out", w.x.buffer.ptr)], &[rows])?;
-        // SAFETY: the head's input and operands are live buffers of these shapes.
-        unsafe {
-            w.head.launch(w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2).cast(),
-                self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), logit_rows as u32, self.stream)?;
-        }
+        self.logits(w, t, logit_rows, tables.decode)?;
         let logits = self.download(&w.logits, logit_rows * self.cfg.vocab_size * 4)?;
         self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
         Ok(Some(logits.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()))
@@ -752,14 +748,27 @@ impl<'a> GlmfEngine<'a> {
         let timer = std::time::Instant::now();
         self.run("head", &[("streams", w.streams[0].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
             ("out", w.x.buffer.ptr)], &[rows])?;
-        // SAFETY: the head's input and operands are live buffers of these shapes.
-        unsafe {
-            w.head.launch(w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2).cast(),
-                self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), logit_rows as u32, self.stream)?;
-        }
+        self.logits(w, t, logit_rows, tables.decode)?;
         let logits = self.download(&w.logits, logit_rows * self.cfg.vocab_size * 4)?;
         self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
         Ok(Some(logits.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()))
+    }
+
+    /// The vocabulary projection of the last `logit_rows` normalized rows into
+    /// `w.logits`: the FP8 head for up to 16 decode rows (--fp8-head), else BF16.
+    fn logits(&self, w: &Workspace<'_>, t: usize, logit_rows: usize, decode: bool) -> Result<()> {
+        let h = self.cfg.hidden;
+        // SAFETY: rows t - logit_rows.. of the normalized rows lie inside `w.x`.
+        let x = unsafe { w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2) }.cast::<c_void>();
+        if let (Some((q, scale)), true) = (&self.weights.head_fp8, decode && logit_rows <= FP8_ROWS as usize) {
+            return self.run("head_fp8", &[("x", x), ("w_fp8", q.buffer.ptr), ("scale", scale.buffer.ptr),
+                ("logits", w.logits.buffer.ptr)], &[Dsv4Scalar::I32(logit_rows as i32)]);
+        }
+        // SAFETY: the head's input and operands are live buffers of these shapes.
+        unsafe {
+            w.head.launch(x.cast(), self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), logit_rows as u32,
+                self.stream)
+        }
     }
 
     /// Launches `segment` through a graph captured the first time `key` is seen.
