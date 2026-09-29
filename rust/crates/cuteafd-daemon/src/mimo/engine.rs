@@ -48,6 +48,9 @@ pub(crate) enum Experts<'a> {
     /// do not fit: MiMo V2.6 Pro's are 495 GiB). For prefill checks; a decode
     /// step would reload every layer.
     Streamed { experts: RefCell<Fp8Experts<'a>>, tensors: &'a Fp8ExpertTensors, window: usize },
+    /// No routed experts: MoE layers add zero (coordinator timing only; the
+    /// outputs are not the model's).
+    Skip,
     /// Spark ranks serving the `fp8` family over RoCE.
     Spark { transport: RefCell<V41Tp4Roce>, runtime: tokio::runtime::Runtime },
 }
@@ -546,6 +549,10 @@ impl<'a> MimoEngine<'a> {
                         w.delta.buffer.ptr, self.stream)
                 }
             }
+            // SAFETY: `delta` holds `t` rows on this engine's stream.
+            Experts::Skip => unsafe {
+                self.library.cuda_zero_bytes_async(w.delta.buffer, t * h * 2, self.stream)
+            },
             Experts::Spark { transport, runtime } => {
                 self.spark_moe(w, index, t, decode, &mut transport.borrow_mut(), runtime)
             }

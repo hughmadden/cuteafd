@@ -49,6 +49,10 @@ pub(crate) struct EngineArgs {
     /// experts do not fit one GPU, such as V2.6 Pro).
     #[arg(long, requires = "local_experts")]
     pub expert_window: Option<usize>,
+    /// Skip the routed experts (MoE layers add zero): times the coordinator
+    /// path alone; logits and cosines are meaningless.
+    #[arg(long, conflicts_with_all = ["local_experts", "peers"])]
+    pub skip_experts: bool,
     /// TP1 FP8 package layout for --local-experts (default `<libdir>/fp8/fp8-mimo/tp1`).
     #[arg(long)]
     pub fp8_package: Option<PathBuf>,
@@ -76,6 +80,10 @@ pub(crate) struct GoldenArgs {
     /// mean NLL over the whole prefill.
     #[arg(long)]
     pub all_logits: bool,
+    /// Skip the per-layer comparison (each layer's rows are otherwise copied
+    /// back), so prefill and decode times are the engine's.
+    #[arg(long)]
+    pub timing: bool,
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -134,6 +142,9 @@ impl Opened {
     fn experts<'s>(&'s self, args: &EngineArgs, moe_layers: &[usize]) -> Result<Option<engine::Experts<'s>>> {
         if moe_layers.is_empty() {
             return Ok(None);
+        }
+        if args.skip_experts {
+            return Ok(Some(engine::Experts::Skip));
         }
         if args.local_experts {
             let tensors = self.catalog.fp8().context("MiMo experts are the checkpoint's FP8 tensors")?;
@@ -263,8 +274,9 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
     let forced = |layer: usize| -> Option<Vec<u8>> {
         std::fs::read(args.golden.join(format!("layer{layer:02}.bin"))).ok().map(|rows| rows[..prefill * row].to_vec())
     };
+    let mut prefill_compare = |layer: usize, stream: &[u8]| compare(layer, 0, stream, &mut worst);
     let logits = engine.prefill_rows_logits(&mut placement, &embed[..prefill * row],
-        Some(&mut |layer, stream| compare(layer, 0, stream, &mut worst)),
+        (!args.timing).then_some(&mut prefill_compare as &mut dyn FnMut(usize, &[u8]) -> Result<()>),
         args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>), args.all_logits)?;
     let prefill_seconds = started.elapsed().as_secs_f64();
     let started = Instant::now();
@@ -274,8 +286,9 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
     while position < tokens.len() {
         let n = args.step_rows.min(tokens.len() - position);
         let first = position;
+        let mut step_compare = |layer: usize, stream: &[u8]| compare(layer, first, stream, &mut decode_worst);
         if let Some(logits) = engine.verify(&mut [(&mut placement, n)], &embed[position * row..(position + n) * row],
-            Some(&mut |layer, stream| compare(layer, first, stream, &mut decode_worst)))? {
+            (!args.timing).then_some(&mut step_compare as &mut dyn FnMut(usize, &[u8]) -> Result<()>))? {
             decode_logits.extend(logits);
         }
         position += n;
