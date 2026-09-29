@@ -182,13 +182,16 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
     let prefill_seconds = started.elapsed().as_secs_f64();
     let started = Instant::now();
     let mut decode_worst = Vec::new();
+    let mut decode_logits: Vec<f32> = Vec::new();
     let mut position = prefill;
     while position < tokens.len() {
         let n = args.step_rows.min(tokens.len() - position);
         let first = position;
-        engine.verify(&mut [(&mut placement, n)], &embed[position * row..(position + n) * row],
+        if let Some(logits) = engine.verify(&mut [(&mut placement, n)], &embed[position * row..(position + n) * row],
             transport.as_deref_mut().map(|t| (t, runtime)),
-            Some(&mut |layer, stream| compare(layer, first, stream, &mut decode_worst)))?;
+            Some(&mut |layer, stream| compare(layer, first, stream, &mut decode_worst)))? {
+            decode_logits.extend(logits);
+        }
         position += n;
     }
     if prefill < tokens.len() {
@@ -196,7 +199,25 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
             args.step_rows, started.elapsed().as_secs_f64(),
             decode_worst.iter().map(|c| format!("{c:.6}")).collect::<Vec<_>>());
     }
-    let _ = prefill_seconds;
+    if !decode_logits.is_empty() {
+        let golden: Vec<f32> = std::fs::read(args.golden.join("logits.bin"))?
+            .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        let vocab = cfg.vocab_size;
+        let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
+        let (mut agree, mut next_ok, mut golden_next) = (0usize, 0usize, 0usize);
+        let rows = decode_logits.len() / vocab;
+        for r in 0..rows {
+            let (ours, theirs) = (&decode_logits[r * vocab..][..vocab], &golden[(prefill + r) * vocab..][..vocab]);
+            agree += usize::from(argmax(ours) == argmax(theirs));
+            if let Some(&next) = tokens.get(prefill + r + 1) {
+                next_ok += usize::from(argmax(ours) == next as usize);
+                golden_next += usize::from(argmax(theirs) == next as usize);
+            }
+        }
+        println!("decode logits: top-1 agreement {:.1}% over {rows} rows | next-token accuracy engine {:.1}% golden {:.1}%",
+            100.0 * agree as f64 / rows as f64, 100.0 * next_ok as f64 / (rows - 1).max(1) as f64,
+            100.0 * golden_next as f64 / (rows - 1).max(1) as f64);
+    }
     println!("prefill: {prefill} tokens through {layers} layers in {prefill_seconds:.2} s");
     if let Some(logits) = logits {
         let golden: Vec<f32> = std::fs::read(args.golden.join("logits.bin"))?
