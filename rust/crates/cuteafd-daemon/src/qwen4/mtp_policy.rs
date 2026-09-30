@@ -5,10 +5,11 @@
 //! row (the canonical history, plus each drafting sequence's first draft)
 //! and one chain step per further draft, then the target verifies every
 //! sequence's next token plus its drafts in one step. Acceptance is each
-//! sequence's conditional rate per draft position; the allocator prices a
+//! sequence's conditional rate per draft position, its history pooled with
+//! the other sequences' and recalibrated online; the allocator prices a
 //! cycle as the fitted verify step of its rows plus the MTP steps of its
 //! deepest sequence, both refit as the server runs.
-use crate::draft_policy::{self, Base, CycleCost, DraftHistory, Drafter, Group};
+use crate::draft_policy::{self, Base, Calibration, CycleCost, DraftHistory, Drafter, Group};
 
 /// Qwen 3.8 Flash Next EXL3 K4.25, experts local on one RTX PRO 6000 (325 W):
 /// speculative verify step ms by rows of one sequence after the 1634-token
@@ -30,9 +31,16 @@ pub(crate) fn cycle_cost(max_rows: usize) -> CycleCost {
 }
 
 /// Conditional acceptance per draft position of every sequence (up to its
-/// limit), from its own history.
-pub(crate) fn acceptance(histories: &[&DraftHistory], limits: &[usize]) -> Vec<Vec<f64>> {
-    histories.iter().zip(limits).map(|(history, &limit)| history.conditional(limit)).collect()
+/// limit): its own history under a prior pooled from the other sequences
+/// (`DraftHistory::pooled`), recalibrated by `calibration`. Returns the rates
+/// before and after calibration (the former feed the calibration back).
+pub(crate) fn acceptance(histories: &[&DraftHistory], limits: &[usize], calibration: &Calibration)
+    -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    let raw: Vec<Vec<f64>> = histories.iter().zip(limits).enumerate().map(|(i, (history, &limit))| {
+        history.pooled(limit, histories.iter().enumerate().filter(|&(j, _)| j != i).map(|(_, h)| *h))
+    }).collect();
+    let calibrated = raw.iter().map(|rates| rates.iter().map(|&r| calibration.apply(r)).collect()).collect();
+    (raw, calibrated)
 }
 
 /// Draft depths per sequence from its conditional acceptance per position
@@ -59,12 +67,17 @@ mod tests {
             good.observe(4, 4);
             bad.observe(4, 0);
         }
-        let plan = |h: &[&DraftHistory], limits: &[usize], fixed| plan(&acceptance(h, limits), fixed, &cost);
+        let calibration = Calibration::default();
+        let plan = |h: &[&DraftHistory], limits: &[usize], fixed| {
+            plan(&acceptance(h, limits, &calibration).1, fixed, &cost)
+        };
         let deep = plan(&[&good], &[7], None)[0];
         assert!(deep >= 4, "{deep}");
         assert_eq!(plan(&[&bad], &[7], None), vec![0]);
+        // Together, the bad sequence borrows the good one's deeper positions
+        // (it never reached them) but not its first.
         let both = plan(&[&good, &bad], &[7, 7], None);
-        assert!(both[0] > both[1], "{both:?}");
+        assert!(both[0] >= both[1] && both[0] >= 4, "{both:?}");
         assert_eq!(plan(&[&good, &bad], &[2, 7], Some(3)), vec![2, 3]);
     }
 }

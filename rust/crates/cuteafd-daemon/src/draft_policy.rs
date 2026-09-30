@@ -3,9 +3,10 @@
 //!
 //! Acceptance: each sequence keeps its last 16 (proposed, accepted) outcomes,
 //! which give conditional acceptance rates per draft position (a position is
-//! observed only when every earlier draft was accepted) under a prior of 3
-//! successes in 4 trials. Families may refine the rates (GLM's frozen
-//! selector calibration) before planning.
+//! observed only when every earlier draft was accepted) under a prior: 3
+//! successes in 4 trials, plus (`DraftHistory::pooled`) the other
+//! sequences' outcomes at that position, up to 8 trials. Families may
+//! refine the rates (GLM's frozen selector calibration) before planning.
 //!
 //! Cost: a cycle is one verify step over every sequence's next token and
 //! drafts, plus the draft work and host time. The verify step's cost is
@@ -73,6 +74,101 @@ impl DraftHistory {
             let (successes, trials) = self.counts(position);
             (PRIOR_SUCCESSES + successes) as f64 / (PRIOR_TRIALS + trials) as f64
         }).collect()
+    }
+
+    /// Conditional acceptance of positions 1..=max under a prior pooled
+    /// from `others` (the other sequences in the step): their outcomes at
+    /// each position on top of 3 in 4, weighing at most `POOL_TRIALS`
+    /// trials. Alone, this is [`Self::conditional`].
+    pub fn pooled<'h>(&self, max: usize, others: impl Iterator<Item = &'h DraftHistory> + Clone) -> Vec<f64> {
+        (1..=max).map(|position| {
+            let (pooled, trials) = others.clone().map(|h| h.counts(position))
+                .fold((PRIOR_SUCCESSES, PRIOR_TRIALS), |(s, t), (hs, ht)| (s + hs, t + ht));
+            let weight = (trials as f64).min(POOL_TRIALS);
+            let mean = pooled as f64 / trials as f64;
+            let (successes, own) = self.counts(position);
+            (weight * mean + successes as f64) / (weight + own as f64)
+        }).collect()
+    }
+}
+
+/// Most prior weight, in trials, the other sequences' outcomes get.
+///
+/// Served traces (Qwen 3.8 MTP, four sequences) show one sequence's
+/// 16-outcome history is a noisy estimate: positions it rated 0.4-0.5 were
+/// accepted 60-70% of the time and 0.8-0.9 ones 75-80%, so plans cut drafts
+/// that would have been kept. Borrowing the other sequences' outcomes shrinks
+/// both tails; a lone sequence keeps its own history (pooling a sequence
+/// with its own past made single-sequence plans slower to follow content).
+/// Half the history's weight keeps a sequence unlike the others its own.
+const POOL_TRIALS: f64 = 8.0;
+
+/// Observation weight decay per verified draft position (about 100
+/// outcomes of memory).
+const CALIBRATION_FORGET: f64 = 0.99;
+/// Range of the calibration's slope.
+const CALIBRATION_SLOPE: (f64, f64) = (0.25, 1.0);
+
+/// Online linear recalibration of conditional acceptance rates:
+/// `rate' = a + b * rate`, fit by forgotten least squares on the outcomes
+/// of the positions actually verified, regularized toward the identity.
+///
+/// Served traces (Qwen 3.8 MTP, 16-outcome histories) show the history
+/// rates are over-dispersed: positions rated 0.4-0.5 were accepted 60-70% of
+/// the time and 0.8-0.9 ones 75-80%, so plans cut drafts that would have
+/// been kept. Replayed causally on those traces, the fit (`b` mostly 0.3-0.6)
+/// cut the log loss of the verified positions by 1.5% (one sequence, four
+/// distinct) to 10% (four identical sequences).
+#[derive(Debug, Clone)]
+pub(crate) struct Calibration {
+    fit: Ridge<2>,
+}
+
+impl Default for Calibration {
+    fn default() -> Self {
+        // The slope's prior is weak: history rates spread over a few tenths.
+        let mut fit = Ridge::new([0.0, 1.0], [1.0, 0.1]);
+        fit.forget = CALIBRATION_FORGET;
+        Self { fit }
+    }
+}
+
+impl Calibration {
+    /// The calibrated rate of a history rate.
+    pub fn apply(&self, rate: f64) -> f64 {
+        self.fit.predict(&[1.0, rate]).clamp(0.02, 0.98)
+    }
+
+    /// Fitted (a, b).
+    pub fn fitted(&self) -> [f64; 2] {
+        self.fit.theta
+    }
+
+    /// Folds one verified position in: the rate it was planned with and
+    /// whether it was accepted.
+    pub fn observe(&mut self, rate: f64, accepted: bool) {
+        if !rate.is_finite() {
+            return;
+        }
+        let fit = &mut self.fit;
+        fit.observe(&[1.0, rate], if accepted { 1.0 } else { 0.0 });
+        // Rates concentrated in a narrow band leave the slope loose (served
+        // fits wandered below zero, inverting the plan's order): hold it in
+        // CALIBRATION_SLOPE and refit the intercept alone.
+        let slope = fit.theta[1].clamp(CALIBRATION_SLOPE.0, CALIBRATION_SLOPE.1);
+        if slope != fit.theta[1] {
+            let intercept = (fit.moment[0] - slope * fit.gram[0][1] + fit.penalty[0] * fit.prior[0])
+                / (fit.gram[0][0] + fit.penalty[0]);
+            fit.theta = [intercept, slope];
+        }
+    }
+
+    /// Folds a sequence's verify outcome in: `rates` it was planned with
+    /// (conditional, per draft position), `proposed` drafts, `accepted`.
+    pub fn observe_outcome(&mut self, rates: &[f64], proposed: usize, accepted: usize) {
+        for (index, &rate) in rates.iter().enumerate().take(proposed.min(accepted + 1)) {
+            self.observe(rate, accepted > index);
+        }
     }
 }
 
@@ -460,6 +556,56 @@ mod tests {
         history.observe(5, 2);
         // Positions 1, 2 accepted, 3 rejected, 4 and 5 unobserved.
         assert_eq!(history.conditional(5), vec![4.0 / 5.0, 4.0 / 5.0, 3.0 / 5.0, 0.75, 0.75]);
+    }
+
+    #[test]
+    fn pooled_rates_borrow_other_sequences() {
+        let mut me = DraftHistory::default();
+        for _ in 0..4 {
+            me.observe(3, 0);
+        }
+        // Alone: the 3-in-4 prior.
+        assert_eq!(me.pooled(2, std::iter::empty()), me.conditional(2));
+        let mut other = DraftHistory::default();
+        for _ in 0..16 {
+            other.observe(3, 3);
+        }
+        // Two others at 16/16 on position 1: prior (3 + 32) / (4 + 32) at 8 trials, then 0 of 4 own.
+        let rates = me.pooled(2, [&other, &other].into_iter());
+        let prior = 35.0 / 36.0;
+        assert!((rates[0] - 8.0 * prior / 12.0).abs() < 1e-12, "{rates:?}");
+        // Position 2 is unobserved for me: the prior itself.
+        assert!((rates[1] - prior).abs() < 1e-12, "{rates:?}");
+    }
+
+    #[test]
+    fn calibration_learns_over_dispersed_rates() {
+        let mut calibration = Calibration::default();
+        assert!((calibration.apply(0.4) - 0.4).abs() < 1e-12);
+        // History rates of 0.4 and 0.9 whose positions are accepted 65% and 85% of the time.
+        for step in 0..2000 {
+            // Spread over each 20 steps so the forgetting window sees the rates.
+            let low = (step * 7) % 20 < 13;
+            let high = (step * 3) % 20 < 17;
+            calibration.observe(0.4, low);
+            calibration.observe(0.9, high);
+        }
+        assert!((calibration.apply(0.4) - 0.65).abs() < 0.03, "{}", calibration.apply(0.4));
+        assert!((calibration.apply(0.9) - 0.85).abs() < 0.03, "{}", calibration.apply(0.9));
+        // A band of rates whose outcomes run against them keeps a positive slope.
+        let mut inverted = Calibration::default();
+        for step in 0..500 {
+            inverted.observe(0.7, step % 2 == 0);
+            inverted.observe(0.8, step % 4 == 0);
+        }
+        let [_, slope] = inverted.fitted();
+        assert_eq!(slope, CALIBRATION_SLOPE.0);
+        assert!(inverted.apply(0.8) > inverted.apply(0.7));
+        // Censoring: after 2 of 3 accepted, positions 1-3 were verified, not 4.
+        let mut outcome = Calibration::default();
+        outcome.observe_outcome(&[0.5, 0.5, 0.5, 0.5], 4, 2);
+        let (gram, _) = (outcome.fit.gram, ());
+        assert!((gram[0][0] - (1.0 + 0.99 + 0.99 * 0.99)).abs() < 1e-12, "{gram:?}");
     }
 
     #[test]

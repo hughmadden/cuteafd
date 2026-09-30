@@ -14,7 +14,7 @@ use super::engine::{Allocator, Qwen4Engine, Qwen4Placement, DECODE_ROWS};
 use super::mtp_policy;
 use super::speculate::{self, DraftSeq, DraftTiming, MtpSeq, Verified};
 use super::{embed_rows, open, Opened};
-use crate::draft_policy::{DraftHistory, Shape};
+use crate::draft_policy::{Calibration, DraftHistory, Shape};
 use anyhow::{Context, Result};
 use cuteafd_api::native_v41::qwen::QwenEncoding;
 use cuteafd_api::native_v41::{
@@ -268,6 +268,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
     let embed = |tokens: &[u32]| embed_rows(&opened.checkpoint, tokens, hidden);
     let mtp = matches!(drafts, Drafts::Mtp { .. });
     let mut cost = mtp_policy::cycle_cost(DECODE_ROWS);
+    let mut calibration = Calibration::default();
     let mut trace = Trace::open()?;
     loop {
         while active.len() < max_sequences {
@@ -382,8 +383,9 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             Drafts::Mtp { depth, fixed } => {
                 let limits: Vec<usize> = limits.iter().map(|&l| l.min(depth)).collect();
                 let histories: Vec<&DraftHistory> = active.iter().map(|a| &a.outcomes).collect();
-                rates = mtp_policy::acceptance(&histories, &limits);
-                let mut depths = mtp_policy::plan(&rates, fixed.then_some(depth), &cost);
+                let confidence;
+                (rates, confidence) = mtp_policy::acceptance(&histories, &limits, &calibration);
+                let mut depths = mtp_policy::plan(&confidence, fixed.then_some(depth), &cost);
                 for ((a, d), &limit) in active.iter_mut().zip(depths.iter_mut()).zip(&limits) {
                     // A sequence planned without drafts for a while probes one.
                     a.idle = if *d == 0 { a.idle + 1 } else { 0 };
@@ -442,7 +444,8 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
         };
         let mut offset = 0;
         let mut kept = Vec::with_capacity(active.len());
-        let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(&starts).map(|((request, rows), &start)| {
+        let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(&starts).enumerate()
+            .map(|(index, ((request, rows), &start))| {
             let mut finished = false;
             let mut last = None;
             for j in 0..rows.len() {
@@ -471,6 +474,9 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             request.accepted += accepted;
             if matches!(drafts, Drafts::Mtp { .. }) {
                 request.outcomes.observe(drafted, accepted);
+                if let Some(rates) = rates.get(index) {
+                    calibration.observe_outcome(rates, drafted, accepted);
+                }
             } else if drafted > 0 && accepted == 0 {
                 request.draft_limit /= 2;
                 if request.draft_limit == 0 {
@@ -500,7 +506,8 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 "kept": kept.iter().map(|k| k.map_or(0, |(n, _)| n)).collect::<Vec<_>>(),
                 "verify_ms": 1e3 * elapsed, "draft_steps": timing.steps - steps_before,
                 "draft_ms": 1e3 * (timing.seconds - draft_s_before), "cycle_ms": 1e3 * cycle.elapsed().as_secs_f64(),
-                "predicted_ms": predicted_ms, "fit": cost.fitted(), "rates": rates}));
+                "predicted_ms": predicted_ms, "fit": cost.fitted(), "rates": rates,
+                "calibration": calibration.fitted()}));
         }
         for index in (0..active.len()).rev() {
             if !finished[index] {

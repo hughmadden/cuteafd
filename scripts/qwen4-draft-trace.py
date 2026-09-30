@@ -4,13 +4,14 @@
 serve-qwen4 writes CUTEAFD_QWEN4_TRACE (JSON lines): one record per verify
 cycle with the request ids, rows, each sequence's drafts ("depths") and kept
 rows, the verify / MTP / whole-cycle ms, the cost model's verify prediction
-before it folded the step in, its fit, and the conditional acceptance rates
-the plan used. This prints, per number of sequences in the step:
+before it folded the step in, its fit, the conditional acceptance rates the
+plan started from (before the online calibration) and the calibration's
+fit. This prints, per number of sequences in the step:
 
 - verify ms observed vs predicted by rows (the online fit, draft_policy.rs),
 - MTP ms by chained steps and host ms by kept rows,
-- acceptance calibration: predicted conditional rate vs observed frequency,
-  binned (positions count when drafted and every earlier draft was kept),
+- acceptance: traced (uncalibrated) rate vs observed frequency, binned
+  (positions count when drafted and every earlier draft was kept),
 - emitted tokens per ms and the depth mix.
 """
 import argparse
@@ -75,6 +76,9 @@ def main():
             (a, b, c), (d, e) = cycles[-1]["fit"]
             print(f"  last fit: verify {a:.2f} ms + {b:.3f} x table + {c:.2f} ms per extra sequence; "
                   f"MTP {d:.2f} ms + {e:.2f} ms per step")
+        if cycles and "calibration" in cycles[-1]:
+            a, b = cycles[-1]["calibration"]
+            print(f"  last acceptance calibration: {a:.2f} + {b:.2f} x rate")
 
 
 if __name__ == "__main__":
