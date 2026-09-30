@@ -479,6 +479,10 @@ scripts/verify-sparkinfer-source.py	scripts/build/verify-sparkinfer-source.py
 scripts/verify-xgrammar-source.py	scripts/build/verify-xgrammar-source.py
 scripts/wip-process.sh	scripts/launch/wip-process.sh
 scripts/write-v41-expert-tp-manifest.py	scripts/build/write-v41-expert-tp-manifest.py
+rust/crates/cuteafd-api/src/native_v41/glm.rs	rust/crates/cuteafd-api/src/openai/chat/glm5.rs
+rust/crates/cuteafd-api/src/native_v41/glm/	rust/crates/cuteafd-api/src/openai/chat/glm5/
+rust/crates/cuteafd-api/src/native_v41/qwen.rs	rust/crates/cuteafd-api/src/openai/chat/qwen4.rs
+rust/crates/cuteafd-api/src/native_v41/qwen/	rust/crates/cuteafd-api/src/openai/chat/qwen4/
 # fallbacks for new files in split directories
 rust/crates/cuteafd-daemon/src/v41_*	rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_*
 rust/crates/cuteafd-ffi/src/v41_*	rust/crates/cuteafd-ffi/src/families/deepseek_v41/v41_*
