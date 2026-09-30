@@ -190,7 +190,7 @@ run_model() { # run_model glmf|pro ROUNDS
       "$repo/scripts/run-dsv4.sh" --config "$cfg" > "$dir/launch-$arm-$round.log" 2>&1 ||
         { tail -20 "$dir/launch-$arm-$round.log"; exit 1; }
       docker logs cuteafd-coordinator 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -i "intake" | head -5 |
-        sed "s/^/$arm r$round: /" | tee -a "$dir/results.txt"
+        sed "s/^/$arm r$round: /" | tee -a "$dir/results.txt" || true
       bench http://127.0.0.1:8600 "$arm" "$round" | tee -a "$dir/results.jsonl"
       docker logs cuteafd-coordinator 2>&1 | sed 's/\x1b\[[0-9;]*m//g' > "$dir/serve-$arm-$round.log"
     done
