@@ -303,6 +303,14 @@ embedding cache refcounted by the prefix cache; MTP layers are unused when a
 DFlash2 drafter drafts. Dual-GPU coordinator default is the layer-range split
 (memory, ~1.9× GPU-bound prefill); TP2 of dense layers only if a P2P probe
 shows it pays (GPU0/GPU1 cross the host bridge; ds41rt measured it a loss).
+Evaluate per family, not globally: GQA models with many KV heads (MiMo V2.6
+Pro: 128 q × 192, 8 KV heads, 16K-wide o_proj, ~18 GB streamed per token)
+can head-split attention across two GPUs with KV partitioned (4+4 KV heads,
+no replication) and one hidden all-reduce per layer — a possible C1 win the
+DeepSeek MLA models never showed. MLA models (V4.x, GLM) replicate the latent
+KV under a head split; their two-GPU KV option is decode context parallelism
+(DCP2: KV split by sequence, LSE merge). Order: P2P probe, then MiMo Pro head
+split vs layer-range split A/B, then DCP2 for long-context MLA pools.
 The drafter follows the GPU that owns the last backbone layers (taps and head
 live there); TP2 drafters are ≤1% on DFlash2 and not built unless the P2P
 probe shows ≤15 µs hops; the win is lane B drafting on GPU1 while lane A
