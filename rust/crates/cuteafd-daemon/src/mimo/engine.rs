@@ -615,7 +615,9 @@ impl<'a> MimoEngine<'a> {
                     let ext = mtp.ext.borrow()[seq.ring][k];
                     ensure!(ext <= seq.len, "MTP ring {} is ahead of its sequence (reset it at admission)", seq.ring);
                     // True rows are those whose token t_{j+k+1} is known (j <= len - k - 1).
-                    let true_end = seq.len.saturating_sub(k);
+                    // Catch-up stops before row len - 1: the drafting pass needs that row (its
+                    // argmax is the draft), so stage 0 must not consume it here.
+                    let true_end = seq.len.saturating_sub(k.max(1));
                     if seq.len - ext > MTP_STEP_ROWS && ext < true_end && rows < DECODE_ROWS {
                         let n = (true_end - ext).min(DECODE_ROWS - rows);
                         groups.push((seq.ring, ext, (ext..ext + n).map(|j| seq.tokens[j + k + 1]).collect::<Vec<_>>()));
