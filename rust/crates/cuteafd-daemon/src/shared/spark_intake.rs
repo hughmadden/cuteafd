@@ -32,7 +32,7 @@
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
-use cuteafd_transport::expert::{V41LaneBuild, V41Tp4Roce, V41Tp4RoceLane, V41Tp4RoceWave, V41WaveReceipt};
+use cuteafd_transport::expert::{LaneBuild, SparkExperts, SparkExpertLane, SparkExpertWave, WaveReceipt};
 use cuteafd_transport::{DeviceLanding, GpuLandingProbe, VerbsHostProtocolV2ResponsePayload};
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
@@ -311,7 +311,7 @@ impl<'a> SparkIntake<'a> {
     /// # Safety
     /// The intake must outlive `transport` (or its landing must be cleared
     /// first), and every dispatch on it must follow [`Self::before_dispatch`].
-    pub(crate) unsafe fn attach(&self, transport: &mut V41Tp4Roce) -> Result<()> {
+    pub(crate) unsafe fn attach(&self, transport: &mut SparkExperts) -> Result<()> {
         ensure!(transport.world_size() == self.ranks, "intake ranks differ from the transport's");
         // SAFETY: forwarded from this function's contract: the planes stay
         // allocated while the transport lives and are read only between a
@@ -324,10 +324,10 @@ impl<'a> SparkIntake<'a> {
     /// # Safety
     /// As [`Self::attach`], for the lane's thread and waves.
     pub(crate) unsafe fn spawn_lane(&self, peers: Vec<std::net::SocketAddr>, executors: Vec<u64>, capacity: u32,
-        config: cuteafd_transport::TcpTransportConfig) -> Result<V41Tp4RoceLane> {
+        config: cuteafd_transport::TcpTransportConfig) -> Result<SparkExpertLane> {
         ensure!(peers.len() == self.ranks, "intake ranks differ from the lane's");
         // SAFETY: forwarded from this function's contract.
-        unsafe { V41Tp4RoceLane::spawn_with_landing(peers, executors, capacity, config, self.landing()) }
+        unsafe { SparkExpertLane::spawn_with_landing(peers, executors, capacity, config, self.landing()) }
     }
 
     /// Before dispatching a wave on this intake's transport: the previous
@@ -366,8 +366,8 @@ impl<'a> SparkIntake<'a> {
 
     /// Receives `wave` into the planes and orders the compute `stream` after
     /// it; the reduce may follow on `stream` (then call [`Self::consumed`]).
-    pub(crate) async fn receive(&self, transport: &mut V41Tp4Roce, wave: V41Tp4RoceWave, t: usize,
-        stream: *mut c_void) -> Result<V41WaveReceipt> {
+    pub(crate) async fn receive(&self, transport: &mut SparkExperts, wave: SparkExpertWave, t: usize,
+        stream: *mut c_void) -> Result<WaveReceipt> {
         let plane_bytes = self.check(t, transport.world_size())?;
         let receipt = match self.stages(plane_bytes) {
             true => {
@@ -401,7 +401,7 @@ impl<'a> SparkIntake<'a> {
 
     /// Queues one lane wave: `build` makes its request on the lane thread
     /// and the rank rows are gathered there; finish with [`Self::after_lane`].
-    pub(crate) fn submit_lane(&self, lane: &mut V41Tp4RoceLane, t: usize, build: V41LaneBuild) -> Result<()> {
+    pub(crate) fn submit_lane(&self, lane: &mut SparkExpertLane, t: usize, build: LaneBuild) -> Result<()> {
         let plane_bytes = self.check(t, lane.world_size())?;
         match self.stages(plane_bytes) {
             true => {
@@ -580,18 +580,18 @@ pub(crate) fn copy_parallel(dst: &mut [u8], src: &[u8]) {
 
 /// A Spark transport and the intake its waves land in (dropped in that order).
 pub(crate) struct SparkLink<'a> {
-    pub(crate) transport: V41Tp4Roce,
+    pub(crate) transport: SparkExperts,
     pub(crate) intake: SparkIntake<'a>,
 }
 
 impl<'a> SparkLink<'a> {
-    /// Connects a [`V41Tp4Roce::new_ranks`] transport whose `capacity`-row
+    /// Connects a [`SparkExperts::new_ranks`] transport whose `capacity`-row
     /// waves land in an intake of the process-wide [`choose_mode`].
     pub(crate) fn new(library: &'a NativeLibrary, peers: &[std::net::SocketAddr], executors: &[u64], capacity: u32,
         config: cuteafd_transport::TcpTransportConfig, row_bytes: usize) -> Result<Self> {
         let mode = transport_mode(library, peers.len(), capacity as usize, row_bytes)?;
         let intake = SparkIntake::new(library, mode, peers.len(), capacity as usize, row_bytes)?;
-        let mut transport = V41Tp4Roce::new_ranks(peers, executors, capacity, config)?;
+        let mut transport = SparkExperts::new_ranks(peers, executors, capacity, config)?;
         // SAFETY: the link drops its transport before its intake, and every
         // dispatch goes through `dispatch`, which calls `before_dispatch`.
         unsafe { intake.attach(&mut transport)? };
@@ -603,14 +603,14 @@ impl<'a> SparkLink<'a> {
     }
 
     /// Posts `request` to every rank once the previous wave's planes are free.
-    pub(crate) fn dispatch(&mut self, request: &cuteafd_transport::ExpertProtocolV2Request) -> Result<V41Tp4RoceWave> {
+    pub(crate) fn dispatch(&mut self, request: &cuteafd_transport::ExpertProtocolV2Request) -> Result<SparkExpertWave> {
         self.intake.before_dispatch()?;
         self.transport.dispatch_wave(request)
     }
 
     /// Receives `wave` (`t` rows) into the planes, ordering `stream` after it.
-    pub(crate) async fn receive(&mut self, wave: V41Tp4RoceWave, t: usize, stream: *mut c_void)
-        -> Result<V41WaveReceipt> {
+    pub(crate) async fn receive(&mut self, wave: SparkExpertWave, t: usize, stream: *mut c_void)
+        -> Result<WaveReceipt> {
         self.intake.receive(&mut self.transport, wave, t, stream).await
     }
 
@@ -636,7 +636,7 @@ impl<'a> SparkLink<'a> {
 /// A prefill lane (transport on its own thread) and the intake its waves
 /// land in (dropped in that order: the lane joins its thread first).
 pub(crate) struct SparkLane<'a> {
-    pub(crate) lane: V41Tp4RoceLane,
+    pub(crate) lane: SparkExpertLane,
     pub(crate) intake: SparkIntake<'a>,
 }
 
@@ -656,14 +656,14 @@ impl<'a> SparkLane<'a> {
     }
 
     /// Queues a `t`-row wave whose request `build` makes on the lane thread.
-    pub(crate) fn submit(&mut self, t: usize, build: V41LaneBuild) -> Result<()> {
+    pub(crate) fn submit(&mut self, t: usize, build: LaneBuild) -> Result<()> {
         self.intake.before_dispatch()?;
         self.intake.submit_lane(&mut self.lane, t, build)
     }
 
     /// Waits for the submitted wave and orders `stream` after its planes.
     pub(crate) fn wait(&mut self, t: usize, timeout: std::time::Duration, stream: *mut c_void)
-        -> Result<cuteafd_transport::expert::V41LaneTimes> {
+        -> Result<cuteafd_transport::expert::LaneTimes> {
         let times = self.lane.wait(timeout)?;
         self.intake.after_lane(t, times.landed, stream)?;
         Ok(times)

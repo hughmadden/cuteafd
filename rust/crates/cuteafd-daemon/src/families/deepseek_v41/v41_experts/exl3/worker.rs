@@ -9,7 +9,7 @@ use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_transport::{
-    expert::V41BackboneRequest, ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2ResponseRef,
+    expert::BackboneRequest, ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2ResponseRef,
     ExpertV2Dtype, EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN,
 };
 use std::{path::Path, rc::Rc};
@@ -194,7 +194,7 @@ impl<'a> Exl3Worker<'a> {
 
     fn execute(
         &mut self,
-        request: &V41BackboneRequest<'_>,
+        request: &BackboneRequest<'_>,
         executor_id: u64,
         exchange: &mut HostExpertExchange,
         destination: Option<CuteafdDeviceBuffer>,
@@ -319,7 +319,7 @@ impl<'a> Exl3Worker<'a> {
     /// and retains it through the response send completion.
     pub(crate) unsafe fn execute_mapped_request(
         &mut self,
-        request: &V41BackboneRequest<'_>,
+        request: &BackboneRequest<'_>,
         executor_id: u64,
         exchange: &mut HostExpertExchange,
         slot: CuteafdDeviceBuffer,
@@ -342,7 +342,7 @@ impl<'a> Exl3Worker<'a> {
 
     pub(crate) fn execute_host_chunks<F>(
         &mut self,
-        request: &V41BackboneRequest<'_>,
+        request: &BackboneRequest<'_>,
         executor_id: u64,
         exchange: &mut HostExpertExchange,
         row_indices: &mut [u32],

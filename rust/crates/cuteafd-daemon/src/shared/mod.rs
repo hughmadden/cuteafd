@@ -8,3 +8,4 @@ pub(crate) mod l2_prefetch;
 pub(crate) mod memory;
 pub(crate) mod prefill_share;
 pub(crate) mod spark_intake;
+pub(crate) mod spark_topology;

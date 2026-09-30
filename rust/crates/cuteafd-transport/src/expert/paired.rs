@@ -174,14 +174,14 @@ mod tests {
 
     #[test]
     fn paired_chunked_responses_complete_all_ranks_without_request_flag() {
-        use crate::expert::{V41BackboneRequest, V41Tp4ChunkReceiver, V41_PARTIAL_ROW_BYTES};
+        use crate::expert::{BackboneRequest, V41Tp4ChunkReceiver, V41_PARTIAL_ROW_BYTES};
         let mut request = crate::expert::tests::request(3);
         request.header.flags |= V41_EXL3_PAIRED_REQUEST_FLAG;
         for route in &mut request.routes {
             route.expert_id = V41PairedRouteWord { expert_id: route.expert_id, owners: 3 }.encode().unwrap();
         }
         let frame = request.encode().unwrap();
-        let native = V41BackboneRequest::parse_paired(&frame, 3).unwrap();
+        let native = BackboneRequest::parse_paired(&frame, 3).unwrap();
         let budget = frame.len().max(2 * V41_PARTIAL_ROW_BYTES as usize + 256);
         let mut receiver = V41Tp4ChunkReceiver::from_owned(&request, 3, [1, 2, 3, 4], budget).unwrap();
         for rank in 0..4 {
@@ -207,10 +207,10 @@ mod tests {
 
     #[test]
     fn paired_frames_preserve_size_routes_and_responses_and_reject_conflicts() {
-        use crate::expert::V41BackboneRequest;
+        use crate::expert::BackboneRequest;
         let original = crate::expert::tests::request(3);
         let ordinary = original.encode().unwrap();
-        assert!(V41BackboneRequest::parse_paired(&ordinary, 3).is_err());
+        assert!(BackboneRequest::parse_paired(&ordinary, 3).is_err());
         for pattern in 0..4 {
             let mut request = original.clone();
             request.header.flags |= V41_EXL3_PAIRED_REQUEST_FLAG;
@@ -224,9 +224,9 @@ mod tests {
             }
             let frame = request.encode().unwrap();
             assert_eq!(frame.len(), ordinary.len());
-            assert!(V41BackboneRequest::parse(&frame, 3).is_err());
-            V41BackboneRequest::validate_owned_paired(&request, 3).unwrap();
-            let native = V41BackboneRequest::parse_paired(&frame, 3).unwrap();
+            assert!(BackboneRequest::parse(&frame, 3).is_err());
+            BackboneRequest::validate_owned_paired(&request, 3).unwrap();
+            let native = BackboneRequest::parse_paired(&frame, 3).unwrap();
             let mut ids = [0; 18];
             let mut weights = [0.; 18];
             assert!(native.copy_routes_into(&mut ids, &mut weights).is_err());
@@ -251,8 +251,8 @@ mod tests {
             assert_eq!(response.header.flags, original.header.flags);
             response.validate().unwrap();
             request.routes[6].expert_id ^= 1 << OWNERS_SHIFT;
-            assert!(V41BackboneRequest::validate_owned_paired(&request, 3).is_err());
-            assert!(V41BackboneRequest::parse_paired(&request.encode().unwrap(), 3).is_err());
+            assert!(BackboneRequest::validate_owned_paired(&request, 3).is_err());
+            assert!(BackboneRequest::parse_paired(&request.encode().unwrap(), 3).is_err());
         }
     }
 
@@ -266,11 +266,11 @@ mod tests {
             assert_eq!(decoded.owners, 0);
         }
         assert_eq!(request.encode().unwrap(), original);
-        assert!(crate::expert::V41BackboneRequest::validate_owned(&request, 2).is_ok());
+        assert!(crate::expert::BackboneRequest::validate_owned(&request, 2).is_ok());
         request.header.flags |= V41_EXL3_PAIRED_REQUEST_FLAG;
         let paired_frame = request.encode().unwrap();
-        assert!(crate::expert::V41BackboneRequest::parse(&paired_frame, 2).is_err());
-        assert!(crate::expert::V41BackboneRequest::parse_paired(&paired_frame, 2).is_ok());
-        assert!(crate::expert::V41BackboneRequest::validate_owned(&request, 2).is_err());
+        assert!(crate::expert::BackboneRequest::parse(&paired_frame, 2).is_err());
+        assert!(crate::expert::BackboneRequest::parse_paired(&paired_frame, 2).is_ok());
+        assert!(crate::expert::BackboneRequest::validate_owned(&request, 2).is_err());
     }
 }

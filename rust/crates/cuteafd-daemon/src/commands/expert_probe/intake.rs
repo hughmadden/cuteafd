@@ -8,7 +8,7 @@ use crate::shared::spark_intake::{self, IntakeMode, SparkIntake, SparkLane};
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_transport::{expert::V41Tp4Roce, ExpertProtocolV2Request, TcpTransportConfig};
+use cuteafd_transport::{expert::SparkExperts, ExpertProtocolV2Request, TcpTransportConfig};
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -23,7 +23,7 @@ pub(super) fn parse_modes(list: &str) -> Result<Vec<IntakeMode>> {
 
 enum Path<'a> {
     // Drops before the intake whose planes it lands in.
-    Inline { transport: V41Tp4Roce, intake: SparkIntake<'a> },
+    Inline { transport: SparkExperts, intake: SparkIntake<'a> },
     Lane(SparkLane<'a>),
 }
 
@@ -73,7 +73,7 @@ pub(super) async fn run(args: &ExpertProbeArgs, modes: &[IntakeMode], peers: &[S
             let lane = unsafe { intake.spawn_lane(peers.to_vec(), executors.to_vec(), args.capacity, config.clone())? };
             Path::Lane(SparkLane { lane, intake })
         } else {
-            let mut transport = V41Tp4Roce::new_ranks(peers, executors, args.capacity, config.clone())?;
+            let mut transport = SparkExperts::new_ranks(peers, executors, args.capacity, config.clone())?;
             // SAFETY: the arm drops its transport before its intake, and every
             // dispatch below follows `before_dispatch`.
             unsafe { intake.attach(&mut transport)? };

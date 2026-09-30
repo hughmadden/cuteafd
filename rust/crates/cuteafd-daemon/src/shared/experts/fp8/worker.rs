@@ -7,7 +7,7 @@ use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_transport::{
-    expert::V41BackboneRequest, ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2ResponseRef, ExpertV2Dtype,
+    expert::BackboneRequest, ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2ResponseRef, ExpertV2Dtype,
     EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN,
 };
 use std::rc::Rc;
@@ -66,7 +66,7 @@ impl<'a> Fp8Worker<'a> {
         Ok(())
     }
 
-    fn execute(&mut self, request: &V41BackboneRequest<'_>, executor_id: u64, exchange: &mut HostExpertExchange,
+    fn execute(&mut self, request: &BackboneRequest<'_>, executor_id: u64, exchange: &mut HostExpertExchange,
         destination: Option<CuteafdDeviceBuffer>) -> Result<CuteafdDeviceBuffer> {
         ensure!(request.layer() as usize == self.experts.layers[self.layer].layer,
             "request does not match the selected FP8 layer");
@@ -122,7 +122,7 @@ impl<'a> Fp8Worker<'a> {
     /// # Safety
     /// The transport exclusively owns a GPU-accessible send slot on this device
     /// and retains it through the response send completion.
-    pub(crate) unsafe fn execute_mapped_request(&mut self, request: &V41BackboneRequest<'_>, executor_id: u64,
+    pub(crate) unsafe fn execute_mapped_request(&mut self, request: &BackboneRequest<'_>, executor_id: u64,
         exchange: &mut HostExpertExchange, slot: CuteafdDeviceBuffer)
         -> Result<Option<ExpertProtocolV2DeviceResponseRef<'static>>> {
         let prefix = EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
@@ -137,7 +137,7 @@ impl<'a> Fp8Worker<'a> {
         Ok(Some(response))
     }
 
-    pub(crate) fn execute_host_chunks<F>(&mut self, request: &V41BackboneRequest<'_>, executor_id: u64,
+    pub(crate) fn execute_host_chunks<F>(&mut self, request: &BackboneRequest<'_>, executor_id: u64,
         exchange: &mut HostExpertExchange, row_indices: &mut [u32], max_frame_bytes: usize, mut sink: F) -> Result<()>
     where
         F: FnMut(ExpertProtocolV2ResponseRef<'_>) -> Result<()>,

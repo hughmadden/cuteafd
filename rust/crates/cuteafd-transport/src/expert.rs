@@ -12,16 +12,16 @@ pub use crate::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
 mod chunks;
 pub use chunks::V41Tp4ChunkReceiver;
 mod roce;
-pub use roce::{V41Tp4Roce, V41Tp4RocePending, V41Tp4RoceWave, V41WaveReceipt};
+pub use roce::{SparkExperts, SparkExpertPending, SparkExpertWave, WaveReceipt};
 mod lane;
-pub use lane::{V41LaneBuild, V41LaneOwnedSink, V41LaneSink, V41LaneTimes, V41Tp4RoceLane};
+pub use lane::{LaneBuild, LaneOwnedSink, LaneSink, LaneTimes, SparkExpertLane};
 mod tcp;
 pub use tcp::{V41Tp4Pending, V41Tp4Tcp};
 mod paired;
 pub use paired::{V41PairedOwnershipBatch, V41PairedRouteWord, V41_EXL3_PAIRED_REQUEST_FLAG};
 mod native_group;
 pub use native_group::{
-    V41NativeOwnerRouteWord, V41NativeOwnershipBatch, V41SparkTopology, V41_MAX_NATIVE_GROUPS,
+    V41NativeOwnerRouteWord, V41NativeOwnershipBatch, SparkTopology, V41_MAX_NATIVE_GROUPS,
     V41_NATIVE_GROUP_REQUEST_FLAG, V41_NATIVE_INACTIVE_OWNER, V41_NATIVE_UNASSIGNED_EXPERT_ID,
     V41_ROUTED_EXPERTS,
 };
@@ -38,9 +38,9 @@ pub const V41_PARTIAL_ROW_BYTES: u32 = V41_HIDDEN * 2;
 /// shares the `TP2EP1` namespace. This identifies topology and rank, not
 /// checkpoint or deployment identity.
 ///
-/// This helper covers only the implicit worlds that predate [`V41SparkTopology`].
+/// This helper covers only the implicit worlds that predate [`SparkTopology`].
 /// Every explicit layout — including pure `TP6EP1` — must use
-/// [`V41SparkTopology::executor_id`], which owns the wider disjoint
+/// [`SparkTopology::executor_id`], which owns the wider disjoint
 /// namespaces and rejects a legacy identity.
 pub fn v41_spark_executor_id(world: usize, rank: usize) -> Result<u64> {
     let base = match world {
@@ -52,7 +52,7 @@ pub fn v41_spark_executor_id(world: usize, rank: usize) -> Result<u64> {
         6 => 27,
         _ => anyhow::bail!(
             "native Spark executor requires an implicit world of 2, 3, 4 or 6; \
-             an explicit topology must use V41SparkTopology::executor_id"
+             an explicit topology must use SparkTopology::executor_id"
         ),
     };
     ensure!(rank < world, "native Spark executor rank {rank} is outside world {world}");
@@ -146,7 +146,7 @@ fn validate_canonical(
 fn validate_native_group(
     header: &crate::ExpertProtocolV2RequestHeader,
     max_rows: u32,
-    topology: V41SparkTopology,
+    topology: SparkTopology,
     row_at: impl Fn(usize) -> Result<crate::ExpertProtocolV2RowDescriptor>,
     mut route_at: impl FnMut(usize) -> Result<crate::ExpertProtocolV2RouteEntry>,
 ) -> Result<()> {
@@ -198,13 +198,13 @@ fn validate_paired(
 }
 
 /// Validated canonical row-major routing; the same request must reach every TP rank.
-pub struct V41BackboneRequest<'a> {
+pub struct BackboneRequest<'a> {
     view: ExpertProtocolV2RequestView<'a>,
     /// Present only for a request admitted under the native replicated-group
     /// contract, which binds the group count used to decode owner bits.
-    native_topology: Option<V41SparkTopology>,
+    native_topology: Option<SparkTopology>,
 }
-impl<'a> V41BackboneRequest<'a> {
+impl<'a> BackboneRequest<'a> {
     pub fn parse(frame: &'a [u8], max_rows: u32) -> Result<Self> {
         let view = ExpertProtocolV2RequestView::parse(frame)?;
         validate_canonical(&view.header, max_rows, |i| view.row(i), |i| view.route(i))?;
@@ -222,7 +222,7 @@ impl<'a> V41BackboneRequest<'a> {
     pub fn parse_native_group(
         frame: &'a [u8],
         max_rows: u32,
-        topology: V41SparkTopology,
+        topology: SparkTopology,
     ) -> Result<Self> {
         let view = ExpertProtocolV2RequestView::parse(frame)?;
         validate_native_group(&view.header, max_rows, topology, |i| view.row(i), |i| view.route(i))?;
@@ -231,7 +231,7 @@ impl<'a> V41BackboneRequest<'a> {
     pub fn is_paired(&self) -> bool { self.view.header.flags & V41_EXL3_PAIRED_REQUEST_FLAG != 0 }
     pub fn is_native_group(&self) -> bool { self.native_topology.is_some() }
     /// Topology this request was admitted under, if it carries native ownership.
-    pub fn native_topology(&self) -> Option<V41SparkTopology> { self.native_topology }
+    pub fn native_topology(&self) -> Option<SparkTopology> { self.native_topology }
 
     pub fn validate_owned_paired(request: &crate::ExpertProtocolV2Request, max_rows: u32) -> Result<()> {
         request.validate()?;
@@ -243,7 +243,7 @@ impl<'a> V41BackboneRequest<'a> {
     pub fn validate_owned_native_group(
         request: &crate::ExpertProtocolV2Request,
         max_rows: u32,
-        topology: V41SparkTopology,
+        topology: SparkTopology,
     ) -> Result<()> {
         request.validate()?;
         validate_native_group(&request.header, max_rows, topology,
@@ -441,11 +441,11 @@ pub struct V41Tp4Planes<'a> {
     planes: [Option<&'a [u8]>; 6],
 }
 impl<'a> V41Tp4Planes<'a> {
-    pub fn new(request: &V41BackboneRequest<'_>, executors: [u64; 4]) -> Result<Self> {
+    pub fn new(request: &BackboneRequest<'_>, executors: [u64; 4]) -> Result<Self> {
         Self::from_header(&request.view.header, executors)
     }
     /// Generic constructor for the validated physical rank counts 2, 3, 4 and 6.
-    pub fn new_ranks(request: &V41BackboneRequest<'_>, executors: &[u64]) -> Result<Self> {
+    pub fn new_ranks(request: &BackboneRequest<'_>, executors: &[u64]) -> Result<Self> {
         if let Some(topology) = request.native_topology() {
             ensure!(
                 executors.len() == topology.world_size(),
@@ -572,10 +572,10 @@ mod tests {
         assert_eq!(tp4, [1, 2, 3, 4]);
         assert_eq!(tp2, [5, 6]);
         assert_eq!(tp3, [7, 8, 9]);
-        assert_eq!(tp3.to_vec(), V41SparkTopology::new(3, 1)?.executor_ids());
+        assert_eq!(tp3.to_vec(), SparkTopology::new(3, 1)?.executor_ids());
         // The implicit six-rank EXL3 group is TP6EP1's namespace.
         let tp6: Vec<u64> = (0..6).map(|rank| v41_spark_executor_id(6, rank)).collect::<Result<_>>()?;
-        assert_eq!(tp6, V41SparkTopology::new(6, 1)?.executor_ids());
+        assert_eq!(tp6, SparkTopology::new(6, 1)?.executor_ids());
         // Every implicit namespace stays disjoint from the other worlds'.
         for (world, rank) in [
             (0, 0),
@@ -591,7 +591,7 @@ mod tests {
             assert!(v41_spark_executor_id(world, rank).is_err());
         }
         let frame = request(1).encode()?;
-        let native = V41BackboneRequest::parse(&frame, 1)?;
+        let native = BackboneRequest::parse(&frame, 1)?;
         let payload = vec![0; V41_PARTIAL_ROW_BYTES as usize];
         let mut two = V41Tp4ChunkReceiver::new_tp2(&native, tp2, 200_000)?;
         let mut four = V41Tp4ChunkReceiver::new(&native, tp4, 200_000)?;
@@ -670,7 +670,7 @@ mod tests {
             assert_eq!(owned.header.hidden_row_stride_bytes, 5280);
             assert_eq!(view.hidden_payload(), payload);
             assert_eq!(owned.hidden_payload.as_ref(), payload);
-            let native = V41BackboneRequest::parse(&frame, rows).unwrap();
+            let native = BackboneRequest::parse(&frame, rows).unwrap();
             assert!(native.require_input_dtype(1).is_err());
             native.require_input_dtype(7).unwrap();
             assert_eq!(native.hidden(), payload);
@@ -689,7 +689,7 @@ mod tests {
     fn native_routes_preserve_order_and_fp32_bits() {
         let owned = request(16).with_debug_checksum();
         let frame = owned.encode().unwrap();
-        let native = V41BackboneRequest::parse(&frame, 16).unwrap();
+        let native = BackboneRequest::parse(&frame, 16).unwrap();
         let (mut ids, mut weights) = (vec![-1; 100], vec![-1.; 100]);
         native.copy_routes_into(&mut ids, &mut weights).unwrap();
         for (i, route) in owned.routes.iter().enumerate() {
@@ -703,7 +703,7 @@ mod tests {
         assert!(native
             .copy_routes_into(&mut ids[..95], &mut weights)
             .is_err());
-        assert!(V41BackboneRequest::parse(&frame, 15).is_err());
+        assert!(BackboneRequest::parse(&frame, 15).is_err());
     }
     #[test]
     fn native_request_rejects_invalid_routing_and_legacy_modes() {
@@ -725,7 +725,7 @@ mod tests {
             }
             assert!(V41Tp4ChunkReceiver::from_owned(&owned, 16, [11,22,33,44], 1 << 20).is_err());
             match owned.encode() {
-                Ok(frame) => assert!(V41BackboneRequest::parse(&frame, 16).is_err()),
+                Ok(frame) => assert!(BackboneRequest::parse(&frame, 16).is_err()),
                 Err(_) => {}
             }
         }
@@ -737,7 +737,7 @@ mod tests {
         for rows in [1,80,1024,4096] {
             let owned = request(rows);
             let frame = owned.encode().unwrap();
-            let native = V41BackboneRequest::parse(&frame, 4096).unwrap();
+            let native = BackboneRequest::parse(&frame, 4096).unwrap();
             let mut receiver = V41Tp4ChunkReceiver::from_owned(&owned, 4096, executors, budget).unwrap();
             assert!(V41Tp4ChunkReceiver::from_owned(&owned, rows-1, executors, budget).is_err());
             assert!(V41Tp4ChunkReceiver::from_owned(&owned, 4096, executors, frame.len()-1).is_err());
@@ -758,7 +758,7 @@ mod tests {
     #[test]
     fn tp4_assembly_checks_identity_geometry_duplicates_and_arrival_order() {
         let frame = request(1).encode().unwrap();
-        let native = V41BackboneRequest::parse(&frame, 16).unwrap();
+        let native = BackboneRequest::parse(&frame, 16).unwrap();
         let executors = [11, 22, 33, 44];
         assert!(V41Tp4Planes::new(&native, [11, 11, 33, 44]).is_err());
         assert!(V41Tp4Planes::new(&native, [0, 22, 33, 44]).is_err());
@@ -812,3 +812,4 @@ mod tests {
         }
     }
 }
+

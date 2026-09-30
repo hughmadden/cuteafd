@@ -10,6 +10,7 @@ rust/crates/cuteafd-daemon/	\bcrate::v41_native_serve::constraints\b	crate::shar
 rust/crates/cuteafd-daemon/	\bcrate::v41_experts::(fp8|service)\b	crate::shared::experts::\1
 rust/crates/cuteafd-daemon/	\bcrate::(draft_policy|prefill_share|fp8_linear|l2_prefetch|spark_intake)\b	crate::shared::\1
 # daemon: families
+rust/crates/cuteafd-daemon/	\bcrate::v41_spark_topology\b	crate::shared::spark_topology
 rust/crates/cuteafd-daemon/	\bcrate::(v41_[a-z0-9_]+)\b	crate::families::deepseek_v41::\1
 rust/crates/cuteafd-daemon/	\bcrate::dsv4\b	crate::families::deepseek_v4
 rust/crates/cuteafd-daemon/	\bcrate::glmf\b	crate::families::glm5_flash
@@ -46,3 +47,14 @@ rust/crates/cuteafd-loader/	\bcrate::glm_dsa\b	crate::families::glm5
 rust/crates/cuteafd-loader/	\bcrate::glm_next\b	crate::families::glm5_flash
 rust/crates/cuteafd-loader/	\bcrate::qwen4_exp\b	crate::families::qwen4
 rust/crates/cuteafd-loader/	\bcrate::(deepseek_v4|mimo_v2)\b	crate::families::\1
+# transport: the Spark expert client serves every family
+rust/crates/	\bV41Tp4RoceWave\b	SparkExpertWave
+rust/crates/	\bV41Tp4RoceLane\b	SparkExpertLane
+rust/crates/	\bV41Tp4RocePending\b	SparkExpertPending
+rust/crates/	\bV41Tp4Roce\b	SparkExperts
+rust/crates/	\bV41WaveReceipt\b	WaveReceipt
+rust/crates/	\bV41Lane(Times|Build|Sink|OwnedSink)\b	Lane\1
+rust/crates/	\bV41SparkTopology\b	SparkTopology
+rust/crates/	\bV41BackboneRequest\b	BackboneRequest
+# daemon: Spark rank topology is shared
+rust/crates/cuteafd-daemon/	\bcrate::families::deepseek_v41::v41_spark_topology\b	crate::shared::spark_topology

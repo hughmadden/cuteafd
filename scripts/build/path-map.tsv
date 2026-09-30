@@ -56,7 +56,7 @@ rust/crates/cuteafd-daemon/src/v41_projection_tp2.rs	rust/crates/cuteafd-daemon/
 rust/crates/cuteafd-daemon/src/v41_requests/	rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_requests/
 rust/crates/cuteafd-daemon/src/v41_requests.rs	rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_requests.rs
 rust/crates/cuteafd-daemon/src/v41_shared_ffn.rs	rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_shared_ffn.rs
-rust/crates/cuteafd-daemon/src/v41_spark_topology.rs	rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_spark_topology.rs
+rust/crates/cuteafd-daemon/src/v41_spark_topology.rs	rust/crates/cuteafd-daemon/src/shared/spark_topology.rs
 rust/crates/cuteafd-daemon/src/v41_sparse_attention/	rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_sparse_attention/
 rust/crates/cuteafd-daemon/src/v41_sparse_attention.rs	rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_sparse_attention.rs
 rust/crates/cuteafd-daemon/src/v41_target_embedding/	rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_target_embedding/

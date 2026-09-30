@@ -878,7 +878,7 @@ mod tests {
     use crate::families::deepseek_v41::v41_target_head::TargetHeadWeights;
     use crate::families::deepseek_v41::v41_tensors::{NativeRtxTensors, VocabularyHead};
     use cuteafd_ffi::NativeLibrary;
-    use cuteafd_transport::{ExpertV2SourceKind, TcpTransportConfig, expert::V41Tp4Roce};
+    use cuteafd_transport::{ExpertV2SourceKind, TcpTransportConfig, expert::SparkExperts};
     use std::rc::Rc;
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT, CUTEAFD_DUAL_PEERS, two GPUs and live Sparks"]
@@ -1065,7 +1065,7 @@ mod tests {
             .try_into()
             .ok()
             .context("four Spark endpoints required")?;
-        let roce = V41Tp4Roce::new(
+        let roce = SparkExperts::new(
             peers,
             [1, 2, 3, 4],
             16,
@@ -1259,7 +1259,7 @@ mod tests {
         let mut other_transport = devices[1].own(|| {
             NativeTp4Wave::new(
                 &lib,
-                V41Tp4Roce::new(
+                SparkExperts::new(
                     peers,
                     [1, 2, 3, 4],
                     16,

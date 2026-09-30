@@ -26,7 +26,7 @@ use cuteafd_core::{
     ReplicatedExpertScheduler, INACTIVE_REPLICATED_EXPERT_GROUP,
 };
 use cuteafd_transport::expert::{
-    V41BackboneRequest, V41NativeOwnerRouteWord, V41NativeOwnershipBatch, V41SparkTopology,
+    BackboneRequest, V41NativeOwnerRouteWord, V41NativeOwnershipBatch, SparkTopology,
     V41_NATIVE_GROUP_REQUEST_FLAG, V41_NATIVE_UNASSIGNED_EXPERT_ID, V41_ROUTED_EXPERTS,
     EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
 };
@@ -41,11 +41,11 @@ const MAX_ROWS: u32 = 4096;
 const HIDDEN_BYTES: usize = 5120 * 2;
 const TOPK: usize = 6;
 
-fn parse_topology(name: &str) -> Result<V41SparkTopology> {
+fn parse_topology(name: &str) -> Result<SparkTopology> {
     Ok(match name {
-        "tp2ep2" => V41SparkTopology::NATIVE_TP2_EP2,
-        "tp4ep1" => V41SparkTopology::NATIVE_TP4_EP1,
-        "tp3ep2" => V41SparkTopology::NATIVE_TP3_EP2,
+        "tp2ep2" => SparkTopology::NATIVE_TP2_EP2,
+        "tp4ep1" => SparkTopology::NATIVE_TP4_EP1,
+        "tp3ep2" => SparkTopology::NATIVE_TP3_EP2,
         other => anyhow::bail!("unsupported topology {other} (want tp2ep2|tp3ep2|tp4ep1)"),
     })
 }
@@ -113,7 +113,7 @@ fn case_json(
     request: &ExpertProtocolV2Request,
     experts: &[u32],
     owners: &[u8],
-    topology: V41SparkTopology,
+    topology: SparkTopology,
     layer: u32,
     request_id: u64,
 ) -> Result<Value> {
@@ -150,7 +150,7 @@ fn case_json(
     let mut rank_mask = Vec::new();
     for rank in 0..topology.world_size() {
         let group = topology.group(rank)?;
-        let native = V41BackboneRequest::parse_native_group(&frame, MAX_ROWS, topology)?;
+        let native = BackboneRequest::parse_native_group(&frame, MAX_ROWS, topology)?;
         let mut ids = vec![-1i32; TOPK];
         let mut weights = vec![-1.0f32; TOPK];
         native.copy_native_group_routes_into(&mut ids, &mut weights, group)?;
@@ -199,7 +199,7 @@ fn case_json(
 }
 
 struct Args {
-    topology: V41SparkTopology,
+    topology: SparkTopology,
     layer: u32,
     experts: Vec<u32>,
     ids: Vec<u64>,

@@ -1,6 +1,6 @@
 //! Bounded chunks carry compact BF16 rank partials in token order.
 use super::{
-    V41BackboneRequest, V41SparkTopology, V41Tp4Planes, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
+    BackboneRequest, SparkTopology, V41Tp4Planes, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
     V41_NATIVE_GROUP_REQUEST_FLAG,
 };
 use crate::{
@@ -11,7 +11,7 @@ use crate::{
 };
 use anyhow::{ensure, Context, Result};
 
-impl V41BackboneRequest<'_> {
+impl BackboneRequest<'_> {
     fn response_header_bytes(&self) -> usize {
         if self.view.header.flags & EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM != 0 {
             EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN
@@ -111,7 +111,7 @@ pub struct V41Tp4ChunkReceiver {
 }
 impl V41Tp4ChunkReceiver {
     pub fn new(
-        request: &V41BackboneRequest<'_>,
+        request: &BackboneRequest<'_>,
         executors: [u64; 4],
         max_frame_bytes: usize,
     ) -> Result<Self> {
@@ -119,7 +119,7 @@ impl V41Tp4ChunkReceiver {
     }
     /// Collect exactly two complete rank planes while preserving TP4 APIs.
     pub fn new_tp2(
-        request: &V41BackboneRequest<'_>,
+        request: &BackboneRequest<'_>,
         executors: [u64; 2],
         max_frame_bytes: usize,
     ) -> Result<Self> {
@@ -130,7 +130,7 @@ impl V41Tp4ChunkReceiver {
     /// A request admitted under the native replicated-group contract must match
     /// its topology's world size; paired EXL3 keeps its four-rank requirement.
     pub fn new_ranks(
-        request: &V41BackboneRequest<'_>,
+        request: &BackboneRequest<'_>,
         executors: &[u64],
         max_frame_bytes: usize,
     ) -> Result<Self> {
@@ -178,9 +178,9 @@ impl V41Tp4ChunkReceiver {
         );
         if request.header.flags & super::V41_EXL3_PAIRED_REQUEST_FLAG != 0 {
             ensure!(executors.len() == 4, "paired EXL3 requires four ranks");
-            V41BackboneRequest::validate_owned_paired(request, max_rows)?;
+            BackboneRequest::validate_owned_paired(request, max_rows)?;
         } else {
-            V41BackboneRequest::validate_owned(request, max_rows)?;
+            BackboneRequest::validate_owned(request, max_rows)?;
         }
         ensure!(request.wire_stats().wire_bytes <= max_frame_bytes,
             "native request exceeds RoCE frame budget");
@@ -203,7 +203,7 @@ impl V41Tp4ChunkReceiver {
         request: &crate::ExpertProtocolV2Request,
         max_rows: u32,
         executors: &[u64],
-        topology: V41SparkTopology,
+        topology: SparkTopology,
         max_frame_bytes: usize,
     ) -> Result<Self> {
         ensure!(
@@ -214,7 +214,7 @@ impl V41Tp4ChunkReceiver {
             request.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG != 0,
             "topology-bound receiver requires a native group request"
         );
-        V41BackboneRequest::validate_owned_native_group(request, max_rows, topology)?;
+        BackboneRequest::validate_owned_native_group(request, max_rows, topology)?;
         ensure!(
             request.wire_stats().wire_bytes <= max_frame_bytes,
             "native request exceeds RoCE frame budget"

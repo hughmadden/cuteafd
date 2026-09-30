@@ -23,7 +23,6 @@ pub(crate) mod v41_native_serve;
 pub(crate) mod v41_projection_tp2;
 pub(crate) mod v41_requests;
 pub(crate) mod v41_shared_ffn;
-pub(crate) mod v41_spark_topology;
 pub(crate) mod v41_sparse_attention;
 pub(crate) mod v41_target_embedding;
 pub(crate) mod v41_target_head;

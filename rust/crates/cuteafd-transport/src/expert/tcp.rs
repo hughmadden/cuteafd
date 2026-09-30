@@ -1,6 +1,6 @@
 //! Concurrent TP2/TP3/TP4/TP6 TCP dispatch with bounded per-rank response storage.
 use super::{
-    V41BackboneRequest, V41SparkTopology, V41Tp4ChunkReceiver, V41_NATIVE_GROUP_REQUEST_FLAG,
+    BackboneRequest, SparkTopology, V41Tp4ChunkReceiver, V41_NATIVE_GROUP_REQUEST_FLAG,
 };
 use crate::{
     ExpertProtocolV2Request, TcpProtocolV2PendingChunks, TcpProtocolV2PersistentClient,
@@ -14,7 +14,7 @@ pub struct V41Tp4Tcp {
     executors: Vec<u64>,
     capacity: u32,
     max_frame_bytes: usize,
-    topology: Option<V41SparkTopology>,
+    topology: Option<SparkTopology>,
 }
 impl V41Tp4Tcp {
     pub fn new(
@@ -38,7 +38,7 @@ impl V41Tp4Tcp {
     /// Topology-bound constructor: canonical executor identities come from
     /// `topology`, and the transport then accepts native group requests.
     pub fn new_topology(
-        topology: V41SparkTopology,
+        topology: SparkTopology,
         peers: &[SocketAddr],
         capacity: u32,
         config: TcpTransportConfig,
@@ -55,7 +55,7 @@ impl V41Tp4Tcp {
         executors: &[u64],
         capacity: u32,
         config: TcpTransportConfig,
-        topology: Option<V41SparkTopology>,
+        topology: Option<SparkTopology>,
     ) -> Result<Self> {
         ensure!(
             peers.len() == executors.len() && matches!(peers.len(), 2 | 3 | 4 | 6),
@@ -107,7 +107,7 @@ impl V41Tp4Tcp {
         self.executors.len()
     }
     /// Topology this transport was bound to, if any.
-    pub fn topology(&self) -> Option<V41SparkTopology> {
+    pub fn topology(&self) -> Option<SparkTopology> {
         self.topology
     }
     /// Drop idle sockets before a new admission. Pending dispatches borrow this
@@ -153,7 +153,7 @@ impl V41Tp4Tcp {
                     flagged,
                     "topology-bound native transport requires a native group request"
                 );
-                V41BackboneRequest::parse_native_group(&frame, self.capacity, topology)?
+                BackboneRequest::parse_native_group(&frame, self.capacity, topology)?
             }
             None => {
                 ensure!(
@@ -161,9 +161,9 @@ impl V41Tp4Tcp {
                     "native group request requires a topology-bound transport"
                 );
                 if request.header.flags & super::V41_EXL3_PAIRED_REQUEST_FLAG != 0 {
-                    V41BackboneRequest::parse_paired(&frame, self.capacity)?
+                    BackboneRequest::parse_paired(&frame, self.capacity)?
                 } else {
-                    V41BackboneRequest::parse(&frame, self.capacity)?
+                    BackboneRequest::parse(&frame, self.capacity)?
                 }
             }
         };

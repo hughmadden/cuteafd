@@ -17,7 +17,7 @@
 //! payload are left byte-identical; only the route word's owner field is added.
 //!
 //! Topology is also bound into response identity: each supported `TP×EP` owns a
-//! disjoint executor-id namespace (see [`V41SparkTopology::executor_id`]), so a
+//! disjoint executor-id namespace (see [`SparkTopology::executor_id`]), so a
 //! stale worker from another topology cannot satisfy a receiver that was built
 //! for this one, including the same-world-size `TP3EP2` vs `TP2EP3` pair.
 //!
@@ -64,12 +64,12 @@ const WORD_MASK: u32 = 0xfff;
 /// `TP2EP2`, `TP3EP2`, `TP2EP3` and the pure `TP6EP1`; anything else is
 /// rejected. `TP×EP` is the physical rank count, with no dummy ranks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct V41SparkTopology {
+pub struct SparkTopology {
     tp: u8,
     ep: u8,
 }
 
-impl V41SparkTopology {
+impl SparkTopology {
     /// Two physical ranks, one group of TP2.
     pub const NATIVE_TP2_EP1: Self = Self { tp: 2, ep: 1 };
     /// Three physical ranks, one group of TP3.
@@ -296,7 +296,7 @@ impl crate::ExpertProtocolV2Request {
     pub fn with_native_group_owners(
         &mut self,
         owners: &[u8],
-        topology: V41SparkTopology,
+        topology: SparkTopology,
     ) -> Result<()> {
         ensure!(
             owners.len() == V41_ROUTED_EXPERTS,
@@ -321,7 +321,7 @@ impl crate::ExpertProtocolV2Request {
         // Fully validate the canonical shape *before* touching any route word, so
         // a malformed batch is returned byte-identical and can be corrected and
         // retried. 4096 is the largest native transport capacity.
-        super::V41BackboneRequest::validate_owned(self, 4096)?;
+        super::BackboneRequest::validate_owned(self, 4096)?;
         for route in &self.routes {
             let expert = route.expert_id;
             ensure!(
@@ -352,24 +352,24 @@ impl crate::ExpertProtocolV2Request {
 mod tests {
     use super::*;
     use crate::expert::{
-        tests::request, V41BackboneRequest, V41Tp4ChunkReceiver, V41Tp4Planes, V41Tp4Roce,
+        tests::request, BackboneRequest, V41Tp4ChunkReceiver, V41Tp4Planes, SparkExperts,
         V41Tp4Tcp, V41_EXL3_PAIRED_REQUEST_FLAG, V41_PARTIAL_ROW_BYTES,
     };
     use crate::{ExpertProtocolV2Request, ExpertProtocolV2Response, TcpTransportConfig};
     use std::collections::BTreeSet;
     use std::net::SocketAddr;
 
-    const ALL: [V41SparkTopology; 7] = [
-        V41SparkTopology::NATIVE_TP2_EP1,
-        V41SparkTopology::NATIVE_TP3_EP1,
-        V41SparkTopology::NATIVE_TP4_EP1,
-        V41SparkTopology::NATIVE_TP2_EP2,
-        V41SparkTopology::NATIVE_TP3_EP2,
-        V41SparkTopology::NATIVE_TP2_EP3,
-        V41SparkTopology::NATIVE_TP6_EP1,
+    const ALL: [SparkTopology; 7] = [
+        SparkTopology::NATIVE_TP2_EP1,
+        SparkTopology::NATIVE_TP3_EP1,
+        SparkTopology::NATIVE_TP4_EP1,
+        SparkTopology::NATIVE_TP2_EP2,
+        SparkTopology::NATIVE_TP3_EP2,
+        SparkTopology::NATIVE_TP2_EP3,
+        SparkTopology::NATIVE_TP6_EP1,
     ];
 
-    fn owners_for(topology: V41SparkTopology) -> Vec<u8> {
+    fn owners_for(topology: SparkTopology) -> Vec<u8> {
         (0..V41_ROUTED_EXPERTS)
             .map(|expert| (expert % topology.group_count() as usize) as u8)
             .collect()
@@ -377,7 +377,7 @@ mod tests {
 
     fn native_request(
         rows: u32,
-        topology: V41SparkTopology,
+        topology: SparkTopology,
         owners: &[u8],
     ) -> Result<ExpertProtocolV2Request> {
         let mut request = request(rows);
@@ -395,14 +395,14 @@ mod tests {
 
     #[test]
     fn topology_mapping_is_group_major_and_namespaces_are_disjoint() {
-        let expected: [(V41SparkTopology, usize, [u64; 6]); 7] = [
-            (V41SparkTopology::NATIVE_TP2_EP1, 2, [5, 6, 0, 0, 0, 0]),
-            (V41SparkTopology::NATIVE_TP3_EP1, 3, [7, 8, 9, 0, 0, 0]),
-            (V41SparkTopology::NATIVE_TP4_EP1, 4, [1, 2, 3, 4, 0, 0]),
-            (V41SparkTopology::NATIVE_TP2_EP2, 4, [17, 18, 19, 20, 0, 0]),
-            (V41SparkTopology::NATIVE_TP3_EP2, 6, [11, 12, 13, 14, 15, 16]),
-            (V41SparkTopology::NATIVE_TP2_EP3, 6, [21, 22, 23, 24, 25, 26]),
-            (V41SparkTopology::NATIVE_TP6_EP1, 6, [27, 28, 29, 30, 31, 32]),
+        let expected: [(SparkTopology, usize, [u64; 6]); 7] = [
+            (SparkTopology::NATIVE_TP2_EP1, 2, [5, 6, 0, 0, 0, 0]),
+            (SparkTopology::NATIVE_TP3_EP1, 3, [7, 8, 9, 0, 0, 0]),
+            (SparkTopology::NATIVE_TP4_EP1, 4, [1, 2, 3, 4, 0, 0]),
+            (SparkTopology::NATIVE_TP2_EP2, 4, [17, 18, 19, 20, 0, 0]),
+            (SparkTopology::NATIVE_TP3_EP2, 6, [11, 12, 13, 14, 15, 16]),
+            (SparkTopology::NATIVE_TP2_EP3, 6, [21, 22, 23, 24, 25, 26]),
+            (SparkTopology::NATIVE_TP6_EP1, 6, [27, 28, 29, 30, 31, 32]),
         ];
         let mut seen = BTreeSet::new();
         for (topology, world, ids) in expected {
@@ -440,16 +440,16 @@ mod tests {
             assert_eq!(topology.rank_of_executor(99), None);
         }
         // Same-size six-rank topologies never accept each other's workers.
-        assert_eq!(V41SparkTopology::NATIVE_TP3_EP2.rank_of_executor(20), None);
-        assert_eq!(V41SparkTopology::NATIVE_TP2_EP3.rank_of_executor(14), None);
+        assert_eq!(SparkTopology::NATIVE_TP3_EP2.rank_of_executor(20), None);
+        assert_eq!(SparkTopology::NATIVE_TP2_EP3.rank_of_executor(14), None);
         // Pure TP6EP1 shares the six-rank world size but not the identities of
         // either replicated six-rank layout, in both directions.
-        assert_eq!(V41SparkTopology::NATIVE_TP6_EP1.rank_of_executor(21), None);
-        assert_eq!(V41SparkTopology::NATIVE_TP6_EP1.rank_of_executor(11), None);
-        assert_eq!(V41SparkTopology::NATIVE_TP2_EP3.rank_of_executor(27), None);
-        assert_eq!(V41SparkTopology::NATIVE_TP3_EP2.rank_of_executor(27), None);
+        assert_eq!(SparkTopology::NATIVE_TP6_EP1.rank_of_executor(21), None);
+        assert_eq!(SparkTopology::NATIVE_TP6_EP1.rank_of_executor(11), None);
+        assert_eq!(SparkTopology::NATIVE_TP2_EP3.rank_of_executor(27), None);
+        assert_eq!(SparkTopology::NATIVE_TP3_EP2.rank_of_executor(27), None);
         // A four-rank TP2×EP2 receiver never accepts legacy TP4 identities.
-        assert_eq!(V41SparkTopology::NATIVE_TP2_EP2.rank_of_executor(1), None);
+        assert_eq!(SparkTopology::NATIVE_TP2_EP2.rank_of_executor(1), None);
     }
 
     #[test]
@@ -474,19 +474,19 @@ mod tests {
             (2, 255),
         ] {
             assert!(
-                V41SparkTopology::new(tp, ep).is_err(),
+                SparkTopology::new(tp, ep).is_err(),
                 "TP{tp}EP{ep} must be rejected"
             );
         }
         for (tp, ep) in [(2, 1), (3, 1), (4, 1), (2, 2), (3, 2), (2, 3), (6, 1)] {
-            assert!(V41SparkTopology::new(tp, ep).is_ok(), "TP{tp}EP{ep}");
+            assert!(SparkTopology::new(tp, ep).is_ok(), "TP{tp}EP{ep}");
         }
     }
 
     #[test]
     fn pure_tp6_is_one_unreplicated_group_over_six_ranks() {
-        let topology = V41SparkTopology::new(6, 1).unwrap();
-        assert_eq!(topology, V41SparkTopology::NATIVE_TP6_EP1);
+        let topology = SparkTopology::new(6, 1).unwrap();
+        assert_eq!(topology, SparkTopology::NATIVE_TP6_EP1);
         assert_eq!(topology.tp(), 6);
         assert_eq!(topology.ep(), 1);
         assert_eq!(topology.world_size(), 6);
@@ -512,10 +512,10 @@ mod tests {
         // The owned batch is validated by the native-group contract itself; the
         // canonical/paired consumers (and the float-plane reducer that stops at
         // four ranks) must keep rejecting it.
-        assert!(V41BackboneRequest::validate_owned_native_group(&request, 4096, topology).is_ok());
-        assert!(V41BackboneRequest::validate_owned(&request, 4096).is_err());
+        assert!(BackboneRequest::validate_owned_native_group(&request, 4096, topology).is_ok());
+        assert!(BackboneRequest::validate_owned(&request, 4096).is_err());
         let frame = request.encode().unwrap();
-        assert!(V41BackboneRequest::parse(&frame, 4096).is_err());
+        assert!(BackboneRequest::parse(&frame, 4096).is_err());
     }
 
     #[test]
@@ -588,7 +588,7 @@ mod tests {
             let frame = request.encode()?;
             // Only the owner bits change: the frame keeps its exact size.
             assert_eq!(frame.len(), canonical_frame.len());
-            let parsed = V41BackboneRequest::parse_native_group(&frame, 3, topology)?;
+            let parsed = BackboneRequest::parse_native_group(&frame, 3, topology)?;
             assert!(parsed.is_native_group());
             assert_eq!(parsed.native_topology(), Some(topology));
             assert_eq!(parsed.hidden(), canonical.hidden_payload.as_ref());
@@ -630,19 +630,19 @@ mod tests {
             );
 
             // Canonical and paired consumers reject the new flag.
-            assert!(V41BackboneRequest::parse(&frame, 3).is_err());
-            assert!(V41BackboneRequest::parse_paired(&frame, 3).is_err());
-            assert!(V41BackboneRequest::validate_owned(&request, 3).is_err());
-            assert!(V41BackboneRequest::validate_owned_paired(&request, 3).is_err());
+            assert!(BackboneRequest::parse(&frame, 3).is_err());
+            assert!(BackboneRequest::parse_paired(&frame, 3).is_err());
+            assert!(BackboneRequest::validate_owned(&request, 3).is_err());
+            assert!(BackboneRequest::validate_owned_paired(&request, 3).is_err());
             // The unowned canonical frame cannot be parsed as native group.
-            assert!(V41BackboneRequest::parse_native_group(&canonical_frame, 3, topology).is_err());
+            assert!(BackboneRequest::parse_native_group(&canonical_frame, 3, topology).is_err());
         }
         Ok(())
     }
 
     #[test]
     fn inactive_groups_and_inactive_experts_are_zero_weight_sentinels() -> Result<()> {
-        let topology = V41SparkTopology::NATIVE_TP2_EP2;
+        let topology = SparkTopology::NATIVE_TP2_EP2;
         let canonical = request(2);
         // Concentrate every routed expert in group 0 so group 1 is inactive.
         let mut owners = vec![V41_NATIVE_INACTIVE_OWNER; V41_ROUTED_EXPERTS];
@@ -651,7 +651,7 @@ mod tests {
         }
         let request = native_request(2, topology, &owners)?;
         let frame = request.encode()?;
-        let parsed = V41BackboneRequest::parse_native_group(&frame, 2, topology)?;
+        let parsed = BackboneRequest::parse_native_group(&frame, 2, topology)?;
         let count = request.routes.len();
         let mut idle_ids = vec![0i32; count];
         let mut idle_weights = vec![1.0f32; count];
@@ -663,7 +663,7 @@ mod tests {
 
     #[test]
     fn request_builder_rejects_missing_owner_conflicts_and_oversized_owners() -> Result<()> {
-        let topology = V41SparkTopology::NATIVE_TP2_EP2;
+        let topology = SparkTopology::NATIVE_TP2_EP2;
         let canonical = request(2);
 
         let mut short = canonical.clone();
@@ -703,33 +703,33 @@ mod tests {
         let mut conflict = native_request(3, topology, &vec![0u8; V41_ROUTED_EXPERTS])?;
         let first = conflict.routes[0].expert_id;
         conflict.routes[6].expert_id = (first & EXPERT_MASK) | (1 << (OWNER_SHIFT + 1));
-        assert!(V41BackboneRequest::parse_native_group(&conflict.encode()?, 3, topology).is_err());
+        assert!(BackboneRequest::parse_native_group(&conflict.encode()?, 3, topology).is_err());
         Ok(())
     }
 
     #[test]
     fn native_parser_rejects_owner_overflow_reserved_bits_duplicates_and_bad_weights() -> Result<()> {
-        let topology = V41SparkTopology::NATIVE_TP2_EP1; // EP=1: only owner 0 is legal.
+        let topology = SparkTopology::NATIVE_TP2_EP1; // EP=1: only owner 0 is legal.
         let owners = vec![0u8; V41_ROUTED_EXPERTS];
         let valid = native_request(2, topology, &owners)?;
 
         let mut overflow = valid.clone();
         overflow.routes[0].expert_id =
             (overflow.routes[0].expert_id & EXPERT_MASK) | (1 << (OWNER_SHIFT + 1));
-        assert!(V41BackboneRequest::parse_native_group(&overflow.encode()?, 2, topology).is_err());
+        assert!(BackboneRequest::parse_native_group(&overflow.encode()?, 2, topology).is_err());
 
         let mut reserved = valid.clone();
         reserved.routes[0].expert_id |= 1 << 12;
-        assert!(V41BackboneRequest::parse_native_group(&reserved.encode()?, 2, topology).is_err());
+        assert!(BackboneRequest::parse_native_group(&reserved.encode()?, 2, topology).is_err());
 
         let mut duplicate = valid.clone();
         duplicate.routes[1].expert_id =
             (duplicate.routes[0].expert_id & EXPERT_MASK) | (1 << OWNER_SHIFT);
-        assert!(V41BackboneRequest::parse_native_group(&duplicate.encode()?, 2, topology).is_err());
+        assert!(BackboneRequest::parse_native_group(&duplicate.encode()?, 2, topology).is_err());
 
         let mut negative = valid.clone();
         negative.routes[0].gate_weight = -0.5;
-        assert!(V41BackboneRequest::parse_native_group(&negative.encode()?, 2, topology).is_err());
+        assert!(BackboneRequest::parse_native_group(&negative.encode()?, 2, topology).is_err());
         Ok(())
     }
 
@@ -737,15 +737,15 @@ mod tests {
     /// topologies; only the topology-bound executor namespace distinguishes them.
     #[test]
     fn same_group_count_requests_are_separated_by_the_executor_namespace() -> Result<()> {
-        let tp2 = V41SparkTopology::NATIVE_TP2_EP1;
-        let tp3 = V41SparkTopology::NATIVE_TP3_EP1;
+        let tp2 = SparkTopology::NATIVE_TP2_EP1;
+        let tp3 = SparkTopology::NATIVE_TP3_EP1;
         let owners = owners_for(tp2);
         let request = native_request(2, tp2, &owners)?;
         let frame = request.encode()?;
         // The owner-only wire contract cannot tell the two same-EP topologies apart.
-        assert!(V41BackboneRequest::parse_native_group(&frame, 2, tp3).is_ok());
+        assert!(BackboneRequest::parse_native_group(&frame, 2, tp3).is_ok());
         // The receiver, bound to TP3's namespace, rejects the TP2 workers' ids.
-        let native = V41BackboneRequest::parse_native_group(&frame, 2, tp3)?;
+        let native = BackboneRequest::parse_native_group(&frame, 2, tp3)?;
         let mut receiver =
             V41Tp4ChunkReceiver::new_ranks(&native, &tp3.executor_ids(), 200_000)?;
         let payload = vec![0; native.plane_bytes()?];
@@ -761,15 +761,15 @@ mod tests {
     #[test]
     fn six_rank_receiver_covers_every_plane_and_rejects_stale_or_foreign_responses() -> Result<()> {
         for (topology, other) in [
-            (V41SparkTopology::NATIVE_TP3_EP2, V41SparkTopology::NATIVE_TP2_EP3),
-            (V41SparkTopology::NATIVE_TP2_EP3, V41SparkTopology::NATIVE_TP3_EP2),
-            (V41SparkTopology::NATIVE_TP6_EP1, V41SparkTopology::NATIVE_TP2_EP3),
-            (V41SparkTopology::NATIVE_TP2_EP3, V41SparkTopology::NATIVE_TP6_EP1),
+            (SparkTopology::NATIVE_TP3_EP2, SparkTopology::NATIVE_TP2_EP3),
+            (SparkTopology::NATIVE_TP2_EP3, SparkTopology::NATIVE_TP3_EP2),
+            (SparkTopology::NATIVE_TP6_EP1, SparkTopology::NATIVE_TP2_EP3),
+            (SparkTopology::NATIVE_TP2_EP3, SparkTopology::NATIVE_TP6_EP1),
         ] {
             let owners = owners_for(topology);
             let request = native_request(2, topology, &owners)?;
             let frame = request.encode()?;
-            let native = V41BackboneRequest::parse_native_group(&frame, 2, topology)?;
+            let native = BackboneRequest::parse_native_group(&frame, 2, topology)?;
             let executors = topology.executor_ids();
             let mut receiver = V41Tp4ChunkReceiver::new_ranks(&native, &executors, 200_000)?;
             assert_eq!(receiver.received_rows(), [0; 4]);
@@ -819,11 +819,11 @@ mod tests {
 
     #[test]
     fn six_rank_chunked_coverage_rejects_reordered_overlapping_and_bad_final_markers() -> Result<()> {
-        let topology = V41SparkTopology::NATIVE_TP2_EP3;
+        let topology = SparkTopology::NATIVE_TP2_EP3;
         let owners = owners_for(topology);
         let request = native_request(3, topology, &owners)?;
         let frame = request.encode()?;
-        let native = V41BackboneRequest::parse_native_group(&frame, 3, topology)?;
+        let native = BackboneRequest::parse_native_group(&frame, 3, topology)?;
         let executors = topology.executor_ids();
         let budget = 200_000;
         let mut receiver = V41Tp4ChunkReceiver::new_ranks(&native, &executors, budget)?;
@@ -875,11 +875,11 @@ mod tests {
 
     #[test]
     fn planes_collection_supports_three_and_six_ranks_but_legacy_accessor_stays_four() -> Result<()> {
-        for topology in [V41SparkTopology::NATIVE_TP3_EP1, V41SparkTopology::NATIVE_TP3_EP2] {
+        for topology in [SparkTopology::NATIVE_TP3_EP1, SparkTopology::NATIVE_TP3_EP2] {
             let owners = owners_for(topology);
             let request = native_request(1, topology, &owners)?;
             let frame = request.encode()?;
-            let native = V41BackboneRequest::parse_native_group(&frame, 1, topology)?;
+            let native = BackboneRequest::parse_native_group(&frame, 1, topology)?;
             let executors = topology.executor_ids();
             let world = topology.world_size();
             let payloads: Vec<Vec<u8>> = (0..world)
@@ -915,7 +915,7 @@ mod tests {
 
     #[test]
     fn owned_topology_receiver_requires_the_flag_and_the_matching_world() -> Result<()> {
-        let topology = V41SparkTopology::NATIVE_TP3_EP2;
+        let topology = SparkTopology::NATIVE_TP3_EP2;
         let owners = owners_for(topology);
         let owned = native_request(2, topology, &owners)?;
         let executors = topology.executor_ids();
@@ -945,7 +945,7 @@ mod tests {
         )
         .is_err());
         let owned_frame = owned.encode()?;
-        let native = V41BackboneRequest::parse_native_group(&owned_frame, 2, topology)?;
+        let native = BackboneRequest::parse_native_group(&owned_frame, 2, topology)?;
         let payload = vec![0; native.plane_bytes()?];
         for (rank, id) in executors.iter().enumerate() {
             let chunk = native.response(*id, &payload)?.to_owned()?.encode()?;
@@ -967,37 +967,37 @@ mod tests {
         for topology in ALL {
             let world = topology.world_size();
             let mut client =
-                V41Tp4Roce::new_topology(topology, &peers[..world], 80, config.clone())?;
+                SparkExperts::new_topology(topology, &peers[..world], 80, config.clone())?;
             assert_eq!(client.world_size(), world);
             assert_eq!(client.topology(), Some(topology));
             assert_eq!(client.capacity(), 80);
             client.reset_connections();
         }
-        let three = V41Tp4Roce::new_ranks(&peers[..3], &[7, 8, 9], 80, config.clone())?;
+        let three = SparkExperts::new_ranks(&peers[..3], &[7, 8, 9], 80, config.clone())?;
         assert_eq!(three.world_size(), 3);
         assert_eq!(three.topology(), None);
 
         // Unsupported world sizes, mismatched topology peers, duplicates.
-        assert!(V41Tp4Roce::new_ranks(&peers[..5], &[1, 2, 3, 4, 5], 80, config.clone()).is_err());
-        assert!(V41Tp4Roce::new_ranks(&peers[..2], &[1, 2, 3], 80, config.clone()).is_err());
-        assert!(V41Tp4Roce::new_topology(
-            V41SparkTopology::NATIVE_TP3_EP2,
+        assert!(SparkExperts::new_ranks(&peers[..5], &[1, 2, 3, 4, 5], 80, config.clone()).is_err());
+        assert!(SparkExperts::new_ranks(&peers[..2], &[1, 2, 3], 80, config.clone()).is_err());
+        assert!(SparkExperts::new_topology(
+            SparkTopology::NATIVE_TP3_EP2,
             &peers[..4],
             80,
             config.clone()
         )
         .is_err());
-        assert!(V41Tp4Roce::new_topology(
-            V41SparkTopology::NATIVE_TP2_EP2,
+        assert!(SparkExperts::new_topology(
+            SparkTopology::NATIVE_TP2_EP2,
             &peers[..3],
             80,
             config.clone()
         )
         .is_err());
-        assert!(V41Tp4Roce::new_ranks(&[peers[0]; 3], &[7, 8, 9], 80, config.clone()).is_err());
-        assert!(V41Tp4Roce::new_ranks(&peers[..3], &[7, 7, 9], 80, config.clone()).is_err());
-        assert!(V41Tp4Roce::new_ranks(&peers[..3], &[7, 0, 9], 80, config.clone()).is_err());
-        assert!(V41Tp4Roce::new_ranks(&peers[..6], &[7, 8, 9, 10, 11, 12], 0, config).is_err());
+        assert!(SparkExperts::new_ranks(&[peers[0]; 3], &[7, 8, 9], 80, config.clone()).is_err());
+        assert!(SparkExperts::new_ranks(&peers[..3], &[7, 7, 9], 80, config.clone()).is_err());
+        assert!(SparkExperts::new_ranks(&peers[..3], &[7, 0, 9], 80, config.clone()).is_err());
+        assert!(SparkExperts::new_ranks(&peers[..6], &[7, 8, 9, 10, 11, 12], 0, config).is_err());
         Ok(())
     }
 
@@ -1020,21 +1020,21 @@ mod tests {
         // The exact pair compact+native (plus optional debug checksum) is legal.
         let mut valid = request(1);
         valid.with_native_group_owners(
-            &owners_for(V41SparkTopology::NATIVE_TP2_EP1),
-            V41SparkTopology::NATIVE_TP2_EP1,
+            &owners_for(SparkTopology::NATIVE_TP2_EP1),
+            SparkTopology::NATIVE_TP2_EP1,
         )?;
         assert_ne!(valid.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG, 0);
         let valid_frame = valid.encode()?;
 
         // A response still may not carry the request-only flag.
-        let native = V41BackboneRequest::parse_native_group(
+        let native = BackboneRequest::parse_native_group(
             &valid_frame,
             1,
-            V41SparkTopology::NATIVE_TP2_EP1,
+            SparkTopology::NATIVE_TP2_EP1,
         )?;
         let mut response = native
             .response(
-                V41SparkTopology::NATIVE_TP2_EP1.executor_id(0)?,
+                SparkTopology::NATIVE_TP2_EP1.executor_id(0)?,
                 &vec![0; native.plane_bytes()?],
             )?
             .to_owned()?;
@@ -1046,7 +1046,7 @@ mod tests {
 
     #[test]
     fn failed_owner_encoding_leaves_the_request_byte_identical() -> Result<()> {
-        let topology = V41SparkTopology::NATIVE_TP2_EP2;
+        let topology = SparkTopology::NATIVE_TP2_EP2;
         let owners = vec![0u8; V41_ROUTED_EXPERTS];
 
         let mut cases: Vec<(ExpertProtocolV2Request, Vec<u8>)> = Vec::new();
@@ -1098,7 +1098,7 @@ mod tests {
         assert!(retry.with_native_group_owners(&bad_owners, topology).is_err());
         retry.with_native_group_owners(&owners, topology)?;
         assert_ne!(retry.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG, 0);
-        assert!(V41BackboneRequest::parse_native_group(&retry.encode()?, 2, topology).is_ok());
+        assert!(BackboneRequest::parse_native_group(&retry.encode()?, 2, topology).is_ok());
         Ok(())
     }
 
@@ -1108,18 +1108,18 @@ mod tests {
             .map(|index| format!("127.0.0.1:{}", 26_000 + index).parse())
             .collect::<std::result::Result<_, _>>()?;
         let config = frame_config();
-        let topology = V41SparkTopology::NATIVE_TP4_EP1;
+        let topology = SparkTopology::NATIVE_TP4_EP1;
         let flagged = native_request(2, topology, &owners_for(topology))?;
         let canonical = request(2);
 
         // Legacy (topology-free) transports reject ownership before any I/O.
-        let mut legacy_roce = V41Tp4Roce::new_ranks(&peers, &[1, 2, 3, 4], 80, config.clone())?;
+        let mut legacy_roce = SparkExperts::new_ranks(&peers, &[1, 2, 3, 4], 80, config.clone())?;
         assert!(legacy_roce.dispatch(&flagged).await.is_err());
         let mut legacy_tcp = V41Tp4Tcp::new_ranks(&peers, &[1, 2, 3, 4], 80, config.clone())?;
         assert!(legacy_tcp.dispatch(&flagged).await.is_err());
 
         // Topology-bound transports require the flag; no silent canonical fallback.
-        let mut bound_roce = V41Tp4Roce::new_topology(topology, &peers, 80, config.clone())?;
+        let mut bound_roce = SparkExperts::new_topology(topology, &peers, 80, config.clone())?;
         assert!(bound_roce.dispatch(&canonical).await.is_err());
         let mut bound_tcp = V41Tp4Tcp::new_topology(topology, &peers, 80, config.clone())?;
         assert!(bound_tcp.dispatch(&canonical).await.is_err());

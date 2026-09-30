@@ -25,7 +25,7 @@ use cuteafd_core::{
     ReplicatedExpertScheduler, INACTIVE_REPLICATED_EXPERT_GROUP,
 };
 use cuteafd_transport::expert::{
-    V41BackboneRequest, V41SparkTopology, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
+    BackboneRequest, SparkTopology, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
 };
 use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,
@@ -165,11 +165,11 @@ fn route_histogram(request: &ExpertProtocolV2Request) -> [u32; EXPERTS] {
     counts
 }
 
-fn topology_for(ep: u8) -> V41SparkTopology {
+fn topology_for(ep: u8) -> SparkTopology {
     match ep {
-        1 => V41SparkTopology::NATIVE_TP4_EP1,
-        2 => V41SparkTopology::NATIVE_TP2_EP2,
-        _ => V41SparkTopology::NATIVE_TP2_EP3,
+        1 => SparkTopology::NATIVE_TP4_EP1,
+        2 => SparkTopology::NATIVE_TP2_EP2,
+        _ => SparkTopology::NATIVE_TP2_EP3,
     }
 }
 
@@ -428,13 +428,13 @@ fn main() -> Result<()> {
             // The three canonical validations across one request lifecycle.
             let canonical = base.clone();
             let validate_owned = bench_readonly(|| {
-                let result = V41BackboneRequest::validate_owned(black_box(&canonical), 4096);
+                let result = BackboneRequest::validate_owned(black_box(&canonical), 4096);
                 black_box(&result);
                 result?;
                 Ok(())
             })?;
             let validate_allocs = allocs_for(|| {
-                let result = V41BackboneRequest::validate_owned(black_box(&canonical), 4096);
+                let result = BackboneRequest::validate_owned(black_box(&canonical), 4096);
                 black_box(&result);
                 result.expect("validate");
             });
@@ -446,7 +446,7 @@ fn main() -> Result<()> {
                 request
             };
             let dispatch_validate = bench_readonly(|| {
-                let result = V41BackboneRequest::validate_owned_native_group(
+                let result = BackboneRequest::validate_owned_native_group(
                     black_box(&flagged),
                     4096,
                     black_box(topology),
@@ -456,7 +456,7 @@ fn main() -> Result<()> {
                 Ok(())
             })?;
             let dispatch_allocs = allocs_for(|| {
-                let result = V41BackboneRequest::validate_owned_native_group(
+                let result = BackboneRequest::validate_owned_native_group(
                     black_box(&flagged),
                     4096,
                     black_box(topology),
@@ -466,7 +466,7 @@ fn main() -> Result<()> {
             });
             let frame = flagged.encode()?;
             let worker_parse = bench_readonly(|| {
-                let parsed = V41BackboneRequest::parse_native_group(
+                let parsed = BackboneRequest::parse_native_group(
                     black_box(&frame),
                     4096,
                     black_box(topology),
@@ -475,7 +475,7 @@ fn main() -> Result<()> {
                 Ok(())
             })?;
             let parse_allocs = allocs_for(|| {
-                let parsed = V41BackboneRequest::parse_native_group(
+                let parsed = BackboneRequest::parse_native_group(
                     black_box(&frame),
                     4096,
                     black_box(topology),
@@ -486,7 +486,7 @@ fn main() -> Result<()> {
             // Legacy TP4 worker admission for the same canonical bytes.
             let canonical_frame = canonical.encode()?;
             let legacy_parse = bench_readonly(|| {
-                let parsed = V41BackboneRequest::parse(black_box(&canonical_frame), 4096)?;
+                let parsed = BackboneRequest::parse(black_box(&canonical_frame), 4096)?;
                 black_box(&parsed);
                 Ok(())
             })?;

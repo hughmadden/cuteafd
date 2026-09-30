@@ -1,7 +1,7 @@
 //! TP2/TP3/TP4/TP6 dispatch through persistent RoCE QPs; TCP is used only for bootstrap.
 #[cfg(test)]
-use super::V41BackboneRequest;
-use super::{V41SparkTopology, V41Tp4ChunkReceiver, V41_NATIVE_GROUP_REQUEST_FLAG};
+use super::BackboneRequest;
+use super::{SparkTopology, V41Tp4ChunkReceiver, V41_NATIVE_GROUP_REQUEST_FLAG};
 use crate::verbs::LocalTp4Client;
 use crate::{
     DeviceLanding, ExpertProtocolV2Request, ExpertProtocolV2RowDescriptor, ExpertV2SourceKind,
@@ -21,35 +21,35 @@ fn poll_quantum(rows: &[ExpertProtocolV2RowDescriptor]) -> std::time::Duration {
     std::time::Duration::from_micros(if decode { 0 } else { 250 })
 }
 
-pub struct V41Tp4Roce {
+pub struct SparkExperts {
     clients: LocalTp4Client,
     executors: Vec<u64>,
     capacity: u32,
     max_frame_bytes: usize,
-    topology: Option<V41SparkTopology>,
-    /// A [`V41Tp4RoceWave`] was dispatched and not yet received.
+    topology: Option<SparkTopology>,
+    /// A [`SparkExpertWave`] was dispatched and not yet received.
     wave_open: bool,
 }
 
 /// A dispatched wave that does not borrow its transport, so several
 /// transports can have waves in flight at once; complete it with
-/// [`V41Tp4Roce::receive_wave`] on the transport that dispatched it. A wave
+/// [`SparkExperts::receive_wave`] on the transport that dispatched it. A wave
 /// dropped without being received leaves its QPs mid-wave; the transport's
 /// next dispatch resets them first.
-pub struct V41Tp4RoceWave {
+pub struct SparkExpertWave {
     receiver: V41Tp4ChunkReceiver,
     poll_quantum: std::time::Duration,
 }
 
 /// How a received wave's rank planes arrived.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct V41WaveReceipt {
+pub struct WaveReceipt {
     /// Bit r: rank r's whole plane landed in its device range (GPU landing);
     /// the sink saw none of its rows. Other ranks' rows all went to the sink.
     pub landed: u8,
 }
 
-impl V41Tp4Roce {
+impl SparkExperts {
     pub fn new(
         peers: [SocketAddr; 4],
         executors: [u64; 4],
@@ -85,7 +85,7 @@ impl V41Tp4Roce {
     /// satisfy this transport's response coverage. Requests must then carry the
     /// native group flag.
     pub fn new_topology(
-        topology: V41SparkTopology,
+        topology: SparkTopology,
         peers: &[SocketAddr],
         capacity: u32,
         config: TcpTransportConfig,
@@ -104,7 +104,7 @@ impl V41Tp4Roce {
         capacity: u32,
         config: &TcpTransportConfig,
         clients: LocalTp4Client,
-        topology: Option<V41SparkTopology>,
+        topology: Option<SparkTopology>,
     ) -> Result<Self> {
         ensure!(peers.len() == executors.len() && matches!(peers.len(), 2 | 3 | 4 | 6),
             "native TP/EP requires two, three, four or six matching peers and executors");
@@ -153,7 +153,7 @@ impl V41Tp4Roce {
         self.executors.len()
     }
     /// Topology this transport was bound to, if any.
-    pub fn topology(&self) -> Option<V41SparkTopology> {
+    pub fn topology(&self) -> Option<SparkTopology> {
         self.topology
     }
     /// Reset persistent QPs before a new admission. Pending dispatches borrow this
@@ -165,7 +165,7 @@ impl V41Tp4Roce {
     /// Receive each rank's response payloads straight into its device range
     /// (`planes[rank]`, registered with the NIC over dma-buf) from the next
     /// connection on; `None` returns to pinned host receives. A rank whose
-    /// registration fails keeps host receives; [`V41WaveReceipt`] says which
+    /// registration fails keeps host receives; [`WaveReceipt`] says which
     /// ranks landed. Only waves received with [`Self::receive_wave`] or
     /// [`Self::receive_wave_owned`] accept landed planes.
     ///
@@ -216,9 +216,9 @@ impl V41Tp4Roce {
     pub async fn dispatch<'c, 'r>(
         &'c mut self,
         request: &'r ExpertProtocolV2Request,
-    ) -> Result<V41Tp4RocePending<'c, 'r>> {
+    ) -> Result<SparkExpertPending<'c, 'r>> {
         let receiver = self.post(request)?;
-        Ok(V41Tp4RocePending {
+        Ok(SparkExpertPending {
             receiver,
             poll_quantum: poll_quantum(&request.rows),
             owner: self,
@@ -227,18 +227,18 @@ impl V41Tp4Roce {
         })
     }
 
-    /// [`Self::dispatch`] returning an owned [`V41Tp4RoceWave`]. The clients
+    /// [`Self::dispatch`] returning an owned [`SparkExpertWave`]. The clients
     /// keep their own copy of the request, so it need not outlive the wave.
-    pub fn dispatch_wave(&mut self, request: &ExpertProtocolV2Request) -> Result<V41Tp4RoceWave> {
+    pub fn dispatch_wave(&mut self, request: &ExpertProtocolV2Request) -> Result<SparkExpertWave> {
         let receiver = self.post(request)?;
         self.wave_open = true;
-        Ok(V41Tp4RoceWave { receiver, poll_quantum: poll_quantum(&request.rows) })
+        Ok(SparkExpertWave { receiver, poll_quantum: poll_quantum(&request.rows) })
     }
 
     /// Accepts every row of `wave`, which this transport dispatched; the sink
-    /// contract is [`V41Tp4RocePending::receive`]'s. Ranks that landed in
+    /// contract is [`SparkExpertPending::receive`]'s. Ranks that landed in
     /// device memory ([`Self::set_gpu_landing`]) bypass the sink.
-    pub async fn receive_wave<F>(&mut self, wave: V41Tp4RoceWave, mut sink: F) -> Result<V41WaveReceipt>
+    pub async fn receive_wave<F>(&mut self, wave: SparkExpertWave, mut sink: F) -> Result<WaveReceipt>
     where
         F: FnMut(usize, u32, &[u8]) -> Result<()>,
     {
@@ -246,9 +246,9 @@ impl V41Tp4Roce {
     }
 
     /// [`Self::receive_wave`] handing the sink each payload's owner, as
-    /// [`V41Tp4RocePending::receive_owned`] does: a retained receive slot must
+    /// [`SparkExpertPending::receive_owned`] does: a retained receive slot must
     /// be released before this transport's next dispatch.
-    pub async fn receive_wave_owned<F>(&mut self, mut wave: V41Tp4RoceWave, sink: F) -> Result<V41WaveReceipt>
+    pub async fn receive_wave_owned<F>(&mut self, mut wave: SparkExpertWave, sink: F) -> Result<WaveReceipt>
     where
         F: FnMut(usize, u32, VerbsHostProtocolV2ResponsePayload) -> Result<()>,
     {
@@ -308,14 +308,14 @@ impl V41Tp4Roce {
 
 /// Holds exclusive admission until every active rank plane has been consumed.
 /// Cancellation resets the QPs before another wave can reuse them.
-pub struct V41Tp4RocePending<'c, 'r> {
+pub struct SparkExpertPending<'c, 'r> {
     receiver: V41Tp4ChunkReceiver,
     poll_quantum: std::time::Duration,
-    owner: &'c mut V41Tp4Roce,
+    owner: &'c mut SparkExperts,
     _request: std::marker::PhantomData<&'r ExpertProtocolV2Request>,
     complete: bool,
 }
-impl V41Tp4RocePending<'_, '_> {
+impl SparkExpertPending<'_, '_> {
     pub async fn receive<F>(self, mut sink: F) -> Result<()>
     where
         F: FnMut(usize, u32, &[u8]) -> Result<()>,
@@ -373,11 +373,11 @@ async fn drain<F>(
     receiver: &mut V41Tp4ChunkReceiver,
     poll_quantum: std::time::Duration,
     mut sink: F,
-) -> Result<V41WaveReceipt>
+) -> Result<WaveReceipt>
 where
     F: FnMut(usize, u32, crate::VerbsHostProtocolV2ResponsePayload) -> Result<()>,
 {
-    let mut receipt = V41WaveReceipt::default();
+    let mut receipt = WaveReceipt::default();
     // Give the other execution lane its first opportunity as soon as this
     // wave must wait. A 250us initial spin can consume an entire small-row
     // FFN and serialize two otherwise independent decode stacks. Subsequent
@@ -423,7 +423,7 @@ where
     Ok(receipt)
 }
 
-impl Drop for V41Tp4RocePending<'_, '_> {
+impl Drop for SparkExpertPending<'_, '_> {
     fn drop(&mut self) {
         if !self.complete {
             self.owner.reset_connections();
@@ -442,13 +442,13 @@ mod tests {
         let config = TcpTransportConfig { timing: false,
             timeout: std::time::Duration::from_secs(1), max_frame_bytes: 200_000,
         };
-        let mut client = V41Tp4Roce::new_tp2(peers, [11, 27], 2, config.clone())?;
+        let mut client = SparkExperts::new_tp2(peers, [11, 27], 2, config.clone())?;
         assert_eq!(client.world_size(), 2);
         client.reset_connections();
         assert_eq!(client.world_size(), 2);
-        assert!(V41Tp4Roce::new_tp2([peers[0]; 2], [11, 27], 2, config.clone()).is_err());
+        assert!(SparkExperts::new_tp2([peers[0]; 2], [11, 27], 2, config.clone()).is_err());
         for ids in [[0, 27], [11, 11]] {
-            assert!(V41Tp4Roce::new_tp2(peers, ids, 2, config.clone()).is_err());
+            assert!(SparkExperts::new_tp2(peers, ids, 2, config.clone()).is_err());
         }
         Ok(())
     }
@@ -457,7 +457,7 @@ mod tests {
     fn tp2_chunks_require_both_exact_rank_planes() -> Result<()> {
         let owned = super::super::tests::request(2);
         let frame = owned.encode()?;
-        let native = V41BackboneRequest::parse(&frame, 2)?;
+        let native = BackboneRequest::parse(&frame, 2)?;
         let mut receiver = V41Tp4ChunkReceiver::new_tp2(&native, [11, 27], 200_000)?;
         assert!(!receiver.complete());
         let payload = vec![0; super::super::V41_PARTIAL_ROW_BYTES as usize];
@@ -584,7 +584,7 @@ mod tests {
             .enable_all()
             .build()?;
         runtime.block_on(async {
-            let mut client = V41Tp4Roce::new(
+            let mut client = SparkExperts::new(
                 peers,
                 [1, 2, 3, 4],
                 capacity,
@@ -673,7 +673,7 @@ mod tests {
     fn gpu_landed_headers_complete_whole_rank_planes_only() -> Result<()> {
         let request = super::super::tests::request(2);
         let frame = request.encode()?;
-        let native = V41BackboneRequest::parse(&frame, 2)?;
+        let native = BackboneRequest::parse(&frame, 2)?;
         let mut receiver = V41Tp4ChunkReceiver::new(&native, [1, 2, 3, 4], 200_000)?;
         let plane = vec![7u8; 2 * super::super::V41_PARTIAL_ROW_BYTES as usize];
         let header_len = crate::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
@@ -718,7 +718,7 @@ mod tests {
     fn rdma_chunks_preserve_rank_rows_and_reject_stale_or_reordered_data() -> Result<()> {
         let request = super::super::tests::request(2);
         let frame = request.encode()?;
-        let native = V41BackboneRequest::parse(&frame, 2)?;
+        let native = BackboneRequest::parse(&frame, 2)?;
         let mut receiver = V41Tp4ChunkReceiver::new(&native, [1, 2, 3, 4], 200_000)?;
         for row in 0..2 {
             for rank in [3, 1, 0, 2] {

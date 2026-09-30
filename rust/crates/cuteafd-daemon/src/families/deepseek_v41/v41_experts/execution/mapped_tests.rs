@@ -29,7 +29,7 @@ fn real_registered_output_matches_device_compaction_and_preserves_guards() -> Re
                 expert_id: (r / 6 + r % 6 * 63) % 384, gate_weight: 0.1234567 }).collect(), hidden)?;
         owned.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         let frame = owned.encode()?;
-        let request = cuteafd_transport::expert::V41BackboneRequest::parse(&frame, 4096)?;
+        let request = cuteafd_transport::expert::BackboneRequest::parse(&frame, 4096)?;
         let bytes = request.plane_bytes()?;
         let prefix = EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
         let mut host = HostAllocation::new(&lib, prefix + bytes + 64)?;
@@ -68,7 +68,7 @@ fn real_registered_output_matches_device_compaction_and_preserves_guards() -> Re
         assert!(expected.iter().any(|&b| b != 0), "fixture must exercise nonzero outputs");
         owned.header.flags |= EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM;
         let frame = owned.encode()?;
-        let request = cuteafd_transport::expert::V41BackboneRequest::parse(&frame, 4096)?;
+        let request = cuteafd_transport::expert::BackboneRequest::parse(&frame, 4096)?;
         assert!(unsafe { execution.execute_mapped_request(&request, 1, &mut exchange, alias, None)? }.is_none());
         eprintln!("PASS registered output rows={rows}: exact compaction, guards and fallback");
     }

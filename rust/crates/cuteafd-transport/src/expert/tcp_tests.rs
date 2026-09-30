@@ -1,5 +1,5 @@
 use super::{
-    tests::request, V41BackboneRequest, V41SparkTopology, V41Tp4Tcp, V41_PARTIAL_ROW_BYTES,
+    tests::request, BackboneRequest, SparkTopology, V41Tp4Tcp, V41_PARTIAL_ROW_BYTES,
     V41_ROUTED_EXPERTS,
 };
 use crate::{ExpertProtocolV2Request, TcpTransportConfig, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN};
@@ -26,7 +26,7 @@ async fn read_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
     Ok(frame)
 }
 async fn respond(stream: &mut TcpStream, frame: &[u8], rank: usize) -> Result<()> {
-    let native = V41BackboneRequest::parse(frame, 2)?;
+    let native = BackboneRequest::parse(frame, 2)?;
     let id = ExpertProtocolV2Request::decode(frame)?.header.request_id;
     for row in 0..native.rows() {
         let partials = vec![(id + rank as u64 + row as u64) as u8; V41_PARTIAL_ROW_BYTES as usize];
@@ -180,7 +180,7 @@ async fn native_tcp_cancelled_receive_discards_partial_wave() -> Result<()> {
         servers.push(tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await?;
             let frame = read_request(&mut stream).await?;
-            let native = V41BackboneRequest::parse(&frame, 2)?;
+            let native = BackboneRequest::parse(&frame, 2)?;
             let partials = vec![0; V41_PARTIAL_ROW_BYTES as usize];
             let mut indices = [0];
             let first =
@@ -250,13 +250,13 @@ fn generic_tcp_constructors_validate_world_and_topology() -> Result<()> {
         .map(|index| format!("127.0.0.1:{}", 25_000 + index).parse())
         .collect::<std::result::Result<_, _>>()?;
     for topology in [
-        V41SparkTopology::NATIVE_TP2_EP1,
-        V41SparkTopology::NATIVE_TP3_EP1,
-        V41SparkTopology::NATIVE_TP4_EP1,
-        V41SparkTopology::NATIVE_TP2_EP2,
-        V41SparkTopology::NATIVE_TP3_EP2,
-        V41SparkTopology::NATIVE_TP2_EP3,
-        V41SparkTopology::NATIVE_TP6_EP1,
+        SparkTopology::NATIVE_TP2_EP1,
+        SparkTopology::NATIVE_TP3_EP1,
+        SparkTopology::NATIVE_TP4_EP1,
+        SparkTopology::NATIVE_TP2_EP2,
+        SparkTopology::NATIVE_TP3_EP2,
+        SparkTopology::NATIVE_TP2_EP3,
+        SparkTopology::NATIVE_TP6_EP1,
     ] {
         let world = topology.world_size();
         let client = V41Tp4Tcp::new_topology(topology, &peers[..world], 80, config())?;
@@ -266,7 +266,7 @@ fn generic_tcp_constructors_validate_world_and_topology() -> Result<()> {
     assert!(V41Tp4Tcp::new_ranks(&peers[..5], &[1, 2, 3, 4, 5], 80, config()).is_err());
     assert!(V41Tp4Tcp::new_ranks(&peers[..2], &[1, 2, 3], 80, config()).is_err());
     assert!(V41Tp4Tcp::new_topology(
-        V41SparkTopology::NATIVE_TP3_EP2,
+        SparkTopology::NATIVE_TP3_EP2,
         &peers[..4],
         80,
         config()
@@ -281,7 +281,7 @@ fn generic_tcp_constructors_validate_world_and_topology() -> Result<()> {
 
 #[tokio::test]
 async fn six_rank_native_group_tcp_covers_every_group_and_rank() -> Result<()> {
-    let topology = V41SparkTopology::NATIVE_TP2_EP3;
+    let topology = SparkTopology::NATIVE_TP2_EP3;
     let executors = topology.executor_ids();
     let mut peers = Vec::new();
     let mut servers = Vec::new();
@@ -292,7 +292,7 @@ async fn six_rank_native_group_tcp_covers_every_group_and_rank() -> Result<()> {
         servers.push(tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await?;
             let frame = read_request(&mut stream).await?;
-            let native = V41BackboneRequest::parse_native_group(&frame, 2, topology)?;
+            let native = BackboneRequest::parse_native_group(&frame, 2, topology)?;
             for row in 0..native.rows() {
                 let payload = vec![rank as u8 + 1; V41_PARTIAL_ROW_BYTES as usize];
                 let mut indices = [0u32];
@@ -332,7 +332,7 @@ async fn six_rank_native_group_tcp_covers_every_group_and_rank() -> Result<()> {
 /// own shard bytes and the coordinator must receive exactly six of them.
 #[tokio::test]
 async fn six_rank_pure_tp6_tcp_returns_six_distinct_rank_planes() -> Result<()> {
-    let topology = V41SparkTopology::NATIVE_TP6_EP1;
+    let topology = SparkTopology::NATIVE_TP6_EP1;
     let executors = topology.executor_ids();
     let mut peers = Vec::new();
     let mut servers = Vec::new();
@@ -345,7 +345,7 @@ async fn six_rank_pure_tp6_tcp_returns_six_distinct_rank_planes() -> Result<()> 
             let frame = read_request(&mut stream).await?;
             // Every rank of the single group parses the same owned batch and
             // treats every route as its own shard's work.
-            let native = V41BackboneRequest::parse_native_group(&frame, 2, topology)?;
+            let native = BackboneRequest::parse_native_group(&frame, 2, topology)?;
             for row in 0..native.rows() {
                 let payload = vec![rank as u8 + 1; V41_PARTIAL_ROW_BYTES as usize];
                 let mut indices = [0u32];

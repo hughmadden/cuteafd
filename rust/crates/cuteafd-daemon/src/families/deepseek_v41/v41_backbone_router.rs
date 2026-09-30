@@ -827,7 +827,7 @@ impl RouterOutput<'_> {
         request.header.flags |=
             cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         // Prove the same complete-batch contract used by every Spark receiver.
-        cuteafd_transport::expert::V41BackboneRequest::validate_owned(&request, self.rows)?;
+        cuteafd_transport::expert::BackboneRequest::validate_owned(&request, self.rows)?;
         Ok(BoundExpertRequest { request, binding })
     }
 }

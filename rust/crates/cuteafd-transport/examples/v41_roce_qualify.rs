@@ -18,7 +18,7 @@ impl ProtocolV2ExpertExecutor for Fixture {
         _: ProtocolV2RequestDevicePayload,
         emit: &mut dyn FnMut(ProtocolV2ExecutorResponseRef<'_>) -> Result<()>,
     ) -> Result<()> {
-        let native = V41BackboneRequest::parse(request.frame_bytes(), 80)?;
+        let native = BackboneRequest::parse(request.frame_bytes(), 80)?;
         ensure!(
             request.hidden_payload() == input(native.rows(), request.header.request_id),
             "input corrupted"
@@ -101,7 +101,7 @@ fn main() -> Result<()> {
                     .collect::<std::result::Result<Vec<_>, _>>()?
                     .try_into()
                     .unwrap();
-                let mut tp = V41Tp4Roce::new(
+                let mut tp = SparkExperts::new(
                     peers,
                     [1, 2, 3, 4],
                     80,

@@ -196,14 +196,14 @@ pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()>
                 // request contract; every other family is a protocol mismatch,
                 // not a silent fallback.
                 let request = match config.topology {
-                    Some(topology) => V41BackboneRequest::parse_native_group(
+                    Some(topology) => BackboneRequest::parse_native_group(
                         view.frame_bytes(),
                         config.capacity,
                         topology,
                     )?,
                     None if execution.is_paired() =>
-                        V41BackboneRequest::parse_paired(view.frame_bytes(), config.capacity)?,
-                    None => V41BackboneRequest::parse(view.frame_bytes(), config.capacity)?,
+                        BackboneRequest::parse_paired(view.frame_bytes(), config.capacity)?,
+                    None => BackboneRequest::parse(view.frame_bytes(), config.capacity)?,
                 };
                 if skip_compute {
                     if let Some(slot) = mapped.response_slot {

@@ -14,7 +14,7 @@ mod local;
 use crate::cli::ExpertProbeArgs;
 use anyhow::{ensure, Context, Result};
 use cuteafd_transport::{
-    expert::{V41Tp4Roce, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16},
+    expert::{SparkExperts, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16},
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,
     ExpertV2Dtype, ExpertV2SourceKind, TcpTransportConfig,
 };
@@ -152,7 +152,7 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
     if let Some(modes) = args.intake.as_deref() {
         return intake::run(&args, &intake::parse_modes(modes)?, &peers, &executors, &mut request, hidden).await;
     }
-    let mut client = V41Tp4Roce::new_ranks(&peers, &executors, args.capacity, config)?;
+    let mut client = SparkExperts::new_ranks(&peers, &executors, args.capacity, config)?;
     let mut actual = vec![0f32; rows * hidden];
     let started = Instant::now();
     client
@@ -204,7 +204,7 @@ async fn remote_partials(args: &ExpertProbeArgs, rows: usize, hidden: usize, top
     let executors = (0..peers.len())
         .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
         .collect::<Result<Vec<u64>>>()?;
-    let mut client = V41Tp4Roce::new_ranks(&peers, &executors, args.capacity, config)?;
+    let mut client = SparkExperts::new_ranks(&peers, &executors, args.capacity, config)?;
     let mut actual = vec![0f32; rows * hidden];
     let started = Instant::now();
     client.execute(&request, |_rank, first, payload| {

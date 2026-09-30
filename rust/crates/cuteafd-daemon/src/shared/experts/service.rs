@@ -6,7 +6,7 @@ use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights, Hos
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::OfficialV41Catalog;
-use cuteafd_transport::expert::{V41BackboneRequest, V41SparkTopology};
+use cuteafd_transport::expert::{BackboneRequest, SparkTopology};
 use std::{path::PathBuf, sync::mpsc, thread};
 
 pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> {
@@ -14,7 +14,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         Ok(report) => tracing::info!(target: "cuteafd::fabric", rails = report.rails.use_rails, "{}", report.summary()),
         Err(error) => tracing::warn!(target: "cuteafd::fabric", "fabric discovery failed: {error:#}"),
     }
-    let topology = crate::families::deepseek_v41::v41_spark_topology::resolve(
+    let topology = crate::shared::spark_topology::resolve(
         args.spark_tp,
         args.spark_ep,
         args.world as usize,
@@ -64,7 +64,7 @@ pub(crate) struct NativeExpertServiceConfig {
     pub max_frame_bytes: usize,
     /// Explicit replicated `TP×EP` topology; `None` keeps the legacy world 2/4
     /// behavior (EXL3 compact may still select a TP2 RTX pair).
-    pub topology: Option<V41SparkTopology>,
+    pub topology: Option<SparkTopology>,
 }
 
 fn load_weights<'a>(
@@ -435,7 +435,7 @@ fn log_spark_memory_if_enabled(
 mod tests {
     use super::*;
 
-    fn config(world: usize, rank: usize, topology: Option<V41SparkTopology>) -> NativeExpertServiceConfig {
+    fn config(world: usize, rank: usize, topology: Option<SparkTopology>) -> NativeExpertServiceConfig {
         NativeExpertServiceConfig {
             library: PathBuf::from("/native.so"),
             exl3_aot_dir: None,
@@ -455,7 +455,7 @@ mod tests {
     #[test]
     fn explicit_topology_maps_every_physical_rank_to_its_local_shard() {
         for (tp, ep) in [(2u8, 1u8), (3, 1), (4, 1), (2, 2), (3, 2), (2, 3), (6, 1)] {
-            let topology = V41SparkTopology::new(tp, ep).unwrap();
+            let topology = SparkTopology::new(tp, ep).unwrap();
             for rank in 0..topology.world_size() {
                 let selection = config(topology.world_size(), rank, Some(topology))
                     .selection(7)
@@ -473,11 +473,11 @@ mod tests {
                         }
                     );
                     assert_eq!(selection.role(), match tp {
-                        2 => crate::families::deepseek_v41::v41_spark_topology::SPARK_TP2_ROLE,
-                        3 => crate::families::deepseek_v41::v41_spark_topology::SPARK_TP3_ROLE,
+                        2 => crate::shared::spark_topology::SPARK_TP2_ROLE,
+                        3 => crate::shared::spark_topology::SPARK_TP3_ROLE,
                         // Pure TP6EP1 is its own native shard family: six
                         // disjoint intermediate slices of every expert.
-                        6 => crate::families::deepseek_v41::v41_spark_topology::SPARK_TP6_ROLE,
+                        6 => crate::shared::spark_topology::SPARK_TP6_ROLE,
                         other => panic!("unexpected explicit TP degree {other}"),
                     });
                     assert_eq!(
@@ -505,13 +505,13 @@ mod tests {
             ExpertLayer::BackboneExl3Tp { layer: 2, rank: 2, world: 3 }
         );
         // The explicit topology must match the launched rank count.
-        let topology = V41SparkTopology::new(2, 2).unwrap();
+        let topology = SparkTopology::new(2, 2).unwrap();
         assert!(resolve_topology_mismatch(&config(6, 0, Some(topology))));
         // A rank outside the topology is rejected before selection is used.
         assert!(config(4, 4, Some(topology)).selection(0).is_err());
         // A native three-rank launch therefore has to carry its topology: the
         // explicit path stays on the native shard family, never the EXL3 layer.
-        let tp3ep1 = V41SparkTopology::new(3, 1).unwrap();
+        let tp3ep1 = SparkTopology::new(3, 1).unwrap();
         assert_eq!(
             config(3, 2, Some(tp3ep1)).selection(2).unwrap(),
             ExpertLayer::BackboneReplicatedTp { layer: 2, rank: 2, world: 3 }
@@ -529,7 +529,7 @@ mod tests {
             // every `info.role == layer.role()` guard fails loudly instead of
             // matching the spark_tp3 native role by accident.
             assert!(shard.role() > 7, "EXL3 shard reported native role {}", shard.role());
-            assert_ne!(shard.role(), crate::families::deepseek_v41::v41_spark_topology::SPARK_TP3_ROLE);
+            assert_ne!(shard.role(), crate::shared::spark_topology::SPARK_TP3_ROLE);
             assert_eq!(shard, ExpertLayer::BackboneExl3Tp { layer: 7, rank, world: 3 });
         }
     }
@@ -541,7 +541,7 @@ mod tests {
     }
 
     fn resolve_topology_mismatch(config: &NativeExpertServiceConfig) -> bool {
-        crate::families::deepseek_v41::v41_spark_topology::resolve(
+        crate::shared::spark_topology::resolve(
             Some(config.topology.unwrap().tp()),
             Some(config.topology.unwrap().ep()),
             config.world,
@@ -554,7 +554,7 @@ mod tests {
     /// with no invented headroom when the override is unset.
     #[test]
     fn explicit_admission_counts_every_known_transient_exactly() {
-        let topology = V41SparkTopology::new(2, 2).unwrap();
+        let topology = SparkTopology::new(2, 2).unwrap();
         let mut config = config(4, 0, Some(topology));
         config.capacity = 4096;
         let headroom = spark_runtime_headroom().unwrap();
@@ -615,7 +615,7 @@ mod tests {
 
     #[test]
     fn explicit_admission_peak_overflow_is_rejected() {
-        let topology = V41SparkTopology::new(3, 2).unwrap();
+        let topology = SparkTopology::new(3, 2).unwrap();
         let mut config = config(6, 0, Some(topology));
         config.capacity = 16;
         assert!(spark_admission_budget(&config, usize::MAX, 1, 0, 0, 0).is_err());
@@ -660,7 +660,7 @@ mod tests {
     #[test]
     fn runtime_ring_budget_bounds_aggregate_endpoint_advertisements() {
         use cuteafd_transport::RingBudget;
-        let topology = V41SparkTopology::new(2, 2).unwrap();
+        let topology = SparkTopology::new(2, 2).unwrap();
         let mut config = config(4, 0, Some(topology));
         config.capacity = 4096;
         let limit = spark_transport_bytes(&config).unwrap();
@@ -702,7 +702,7 @@ mod tests {
 /// EXL3-only, so a native three-rank launch must carry its explicit topology.
 fn validate_topology(config: &NativeExpertServiceConfig, catalog: &OfficialV41Catalog) -> Result<()> {
     if let Some(topology) = config.topology {
-        crate::families::deepseek_v41::v41_spark_topology::require_native(Some(topology), catalog)?;
+        crate::shared::spark_topology::require_native(Some(topology), catalog)?;
         ensure!(
             config.world == topology.world_size() && config.rank < config.world,
             "explicit Spark topology {}x{} needs --world {} and --rank below it, got world {} rank {}",
@@ -770,7 +770,7 @@ impl NativeExpertServiceConfig {
     }
     /// Replicated group this worker unpacks routes for, or `None` for legacy.
     fn native_group(&self) -> Result<Option<u8>> {
-        crate::families::deepseek_v41::v41_spark_topology::group_of(self.topology, self.rank)
+        crate::shared::spark_topology::group_of(self.topology, self.rank)
     }
     /// Resolve this rank's EXL3 AOT package for the running checkpoint's
     /// decoder tiers (multi-family images) with the legacy single-family

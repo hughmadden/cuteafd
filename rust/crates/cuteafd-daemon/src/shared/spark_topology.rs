@@ -1,12 +1,12 @@
 //! CLI-resolved replicated Spark `TP×EP` topology shared by both daemons.
 //!
 //! The only source of rank identity is
-//! [`cuteafd_transport::expert::V41SparkTopology`]: this module never
+//! [`cuteafd_transport::expert::SparkTopology`]: this module never
 //! re-derives executor ids, group indices or physical rank maps, so transport,
 //! worker shard selection and coordinator assembly cannot drift apart.
 use anyhow::{ensure, Result};
 use cuteafd_loader::OfficialV41Catalog;
-use cuteafd_transport::expert::V41SparkTopology;
+use cuteafd_transport::expert::SparkTopology;
 
 /// Resolve the opt-in `--spark-tp N --spark-ep M` pair for a command that knows
 /// how many physical Spark ranks were launched.
@@ -20,10 +20,10 @@ pub(crate) fn resolve(
     ep: Option<u8>,
     world: usize,
     component: &str,
-) -> Result<Option<V41SparkTopology>> {
+) -> Result<Option<SparkTopology>> {
     let topology = match (tp, ep) {
         (None, None) => return Ok(None),
-        (Some(tp), Some(ep)) => V41SparkTopology::new(tp, ep)?,
+        (Some(tp), Some(ep)) => SparkTopology::new(tp, ep)?,
         _ => anyhow::bail!(
             "{component} --spark-tp and --spark-ep must be given together or not at all"
         ),
@@ -42,7 +42,7 @@ pub(crate) fn resolve(
 /// checkpoint. Reject EXL3 or NVFP4 publications before any weight allocation,
 /// transport connection or readiness publication.
 pub(crate) fn require_native(
-    topology: Option<V41SparkTopology>,
+    topology: Option<SparkTopology>,
     catalog: &OfficialV41Catalog,
 ) -> Result<()> {
     let Some(topology) = topology else {
@@ -59,13 +59,13 @@ pub(crate) fn require_native(
 }
 
 /// The group this physical rank belongs to, or `None` for the legacy topology.
-pub(crate) fn group_of(topology: Option<V41SparkTopology>, rank: usize) -> Result<Option<u8>> {
+pub(crate) fn group_of(topology: Option<SparkTopology>, rank: usize) -> Result<Option<u8>> {
     topology.map(|topology| topology.group(rank)).transpose()
 }
 
 /// The worker's tensor-parallel shard index inside its group, or `None` for the
 /// legacy topology.
-pub(crate) fn tp_rank_of(topology: Option<V41SparkTopology>, rank: usize) -> Result<Option<u8>> {
+pub(crate) fn tp_rank_of(topology: Option<SparkTopology>, rank: usize) -> Result<Option<u8>> {
     topology.map(|topology| topology.tp_rank(rank)).transpose()
 }
 
@@ -86,8 +86,8 @@ pub(crate) const SPARK_TP6_ROLE: u32 = 7;
 mod tests {
     use super::*;
 
-    fn topology(tp: u8, ep: u8) -> V41SparkTopology {
-        V41SparkTopology::new(tp, ep).unwrap()
+    fn topology(tp: u8, ep: u8) -> SparkTopology {
+        SparkTopology::new(tp, ep).unwrap()
     }
 
     #[test]

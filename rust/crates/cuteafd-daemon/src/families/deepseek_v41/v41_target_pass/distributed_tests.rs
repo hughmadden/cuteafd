@@ -14,7 +14,7 @@ use crate::families::deepseek_v41::v41_target_head::{TargetHeadWave, TargetHeadW
 use crate::families::deepseek_v41::v41_tensors::{NativeRtxTensors, VocabularyHead};
 use anyhow::Context;
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_transport::expert::V41Tp4Roce;
+use cuteafd_transport::expert::SparkExperts;
 use cuteafd_transport::{ExpertV2SourceKind, TcpTransportConfig};
 use std::{
     net::SocketAddr,
@@ -137,7 +137,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
         )?,
         Duration::from_secs(120),
     )?;
-    let roce = V41Tp4Roce::new(
+    let roce = SparkExperts::new(
         peers,
         [1, 2, 3, 4],
         80,
@@ -162,7 +162,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             Duration::from_secs(120),
         )?;
         let mut second_transport = NativeTp4Wave::new(&lib,
-            V41Tp4Roce::new(peers, [1, 2, 3, 4], 80, TcpTransportConfig { timing: false,
+            SparkExperts::new(peers, [1, 2, 3, 4], 80, TcpTransportConfig { timing: false,
                 timeout: Duration::from_secs(120), max_frame_bytes: 2 * 1024 * 1024,
             })?, NativeTp4Wave::device_bytes(80)?)?;
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;

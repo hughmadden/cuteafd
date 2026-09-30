@@ -14,7 +14,7 @@ use super::weights::{GlmLayer, GlmWeights};
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use crate::shared::spark_intake::{copy_parallel, IntakeMode, SparkIntake, SparkLane, SparkLink};
 use cuteafd_transport::expert::{
-    V41Tp4RoceWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
+    SparkExpertWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
 };
 use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
@@ -713,7 +713,7 @@ impl<'a> GlmEngine<'a> {
     /// One request to every Spark rank from the staged routes and wire rows
     /// ([`Self::moe_stage`]); complete it with [`Self::moe_land`].
     fn moe_send(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, transport: &mut SparkLink<'_>)
-        -> Result<V41Tp4RoceWave> {
+        -> Result<SparkExpertWave> {
         let timer = std::time::Instant::now();
         let request = {
             let staging = w.router_host.borrow();
@@ -763,7 +763,7 @@ impl<'a> GlmEngine<'a> {
 
     /// Receives `wave`'s BF16 rank partials into the transport's intake
     /// planes; returns the rank count the reduce needs.
-    async fn moe_land(&self, t: usize, transport: &mut SparkLink<'_>, wave: V41Tp4RoceWave) -> Result<usize> {
+    async fn moe_land(&self, t: usize, transport: &mut SparkLink<'_>, wave: SparkExpertWave) -> Result<usize> {
         let ranks = transport.world_size();
         ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
         let timer = std::time::Instant::now();

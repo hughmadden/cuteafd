@@ -15,7 +15,7 @@ use cuteafd_ffi::programs::{Program, Programs, Scalar};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::families::deepseek_v4::DeepseekV4Config;
 use crate::shared::spark_intake::SparkLink;
-use cuteafd_transport::expert::{V41Tp4RoceWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
+use cuteafd_transport::expert::{SparkExpertWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
 use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype,
     ExpertV2SourceKind,
@@ -628,7 +628,7 @@ impl<'a> Engine<'a> {
                 self.tap(w, &w.lanes[lane], layer, lanes[lane].tables.rows)
             };
             runtime.block_on(async {
-                let mut inflight: Option<((usize, usize), V41Tp4RoceWave)> = None;
+                let mut inflight: Option<((usize, usize), SparkExpertWave)> = None;
                 attention(units[0])?;
                 for (index, &unit) in units.iter().enumerate() {
                     let (layer, lane) = unit;
@@ -1001,7 +1001,7 @@ impl<'a> Engine<'a> {
 
     /// Receives a unit's partial rows into its transport's intake planes; the
     /// reduce that reads them is ordered after the intake on the stream.
-    async fn land(&self, transport: &mut SparkLink<'_>, wave: V41Tp4RoceWave, t: usize, _w: &Workspace<'_>)
+    async fn land(&self, transport: &mut SparkLink<'_>, wave: SparkExpertWave, t: usize, _w: &Workspace<'_>)
         -> Result<usize> {
         let timer = Instant::now();
         transport.receive(wave, t, self.stream).await?;

@@ -31,7 +31,7 @@ use anyhow::Context;
 use anyhow::{ensure, Result};
 use cuteafd_api::openai::{InferenceChunk, InferenceFinishReason, NativeRequest, PromptUsage};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_transport::expert::V41Tp4Roce;
+use cuteafd_transport::expert::SparkExperts;
 use cuteafd_transport::{ExpertV2SourceKind, TcpTransportConfig};
 use speculative::DraftRuntime;
 use std::time::{Duration, Instant};
@@ -42,7 +42,7 @@ pub(crate) async fn run(mut args: crate::cli::NativeServeArgs) -> Result<()> {
         Ok(report) => tracing::info!(target: "cuteafd::fabric", rails = report.rails.use_rails, "{}", report.summary()),
         Err(error) => tracing::warn!(target: "cuteafd::fabric", "fabric discovery failed: {error:#}"),
     }
-    let topology = crate::families::deepseek_v41::v41_spark_topology::resolve(
+    let topology = crate::shared::spark_topology::resolve(
         args.spark_tp,
         args.spark_ep,
         args.peers.len(),
@@ -168,7 +168,7 @@ mod prefill_capacity_tests {
     /// groups and nothing else — an explicit TP3EP1 native launch is not compact.
     #[test]
     fn compact_profile_covers_implicit_two_and_three_peers_only() {
-        let tp3ep1 = cuteafd_transport::expert::V41SparkTopology::new(3, 1).unwrap();
+        let tp3ep1 = cuteafd_transport::expert::SparkTopology::new(3, 1).unwrap();
         for (topology, peers, expected) in [
             (None, 2, true),
             (None, 3, true),
@@ -245,7 +245,7 @@ pub(crate) fn protocol_v2_timing() -> bool {
 /// 32 GiB device ceiling, the prefill workspace clamp and the reservation
 /// headroom cap all belong to exactly this profile; an explicit topology (any
 /// native layout, including `TP3EP1`) is never compact.
-fn legacy_compact(topology: Option<cuteafd_transport::expert::V41SparkTopology>, peers: usize) -> bool {
+fn legacy_compact(topology: Option<cuteafd_transport::expert::SparkTopology>, peers: usize) -> bool {
     topology.is_none() && matches!(peers, 2 | 3)
 }
 
@@ -253,28 +253,28 @@ fn spark_transport(
     peers: &[std::net::SocketAddr],
     capacity: u32,
     timing: bool,
-    topology: Option<cuteafd_transport::expert::V41SparkTopology>,
-) -> Result<V41Tp4Roce> {
+    topology: Option<cuteafd_transport::expert::SparkTopology>,
+) -> Result<SparkExperts> {
     let config = TcpTransportConfig { timing, timeout: Duration::from_secs(120), max_frame_bytes: 64 * 1024 * 1024 };
     if let Some(topology) = topology {
         // Topology-bound transport: canonical executor ids come from the shared
         // topology and requests must carry the native ownership contract.
-        return V41Tp4Roce::new_topology(topology, peers, capacity, config);
+        return SparkExperts::new_topology(topology, peers, capacity, config);
     }
     match peers.len() {
-        2 => V41Tp4Roce::new_tp2(peers.try_into().expect("two peers"), [
+        2 => SparkExperts::new_tp2(peers.try_into().expect("two peers"), [
             cuteafd_transport::expert::v41_spark_executor_id(2, 0)?,
             cuteafd_transport::expert::v41_spark_executor_id(2, 1)?,
         ], capacity, config),
         // The implicit three-rank EXL3 group answers in the TP3EP1 namespace
         // (7..=9) but keeps the canonical non-ownership frame contract, so it
         // must not be built through `new_topology`.
-        3 => V41Tp4Roce::new_ranks(peers, &[
+        3 => SparkExperts::new_ranks(peers, &[
             cuteafd_transport::expert::v41_spark_executor_id(3, 0)?,
             cuteafd_transport::expert::v41_spark_executor_id(3, 1)?,
             cuteafd_transport::expert::v41_spark_executor_id(3, 2)?,
         ], capacity, config),
-        4 => V41Tp4Roce::new(peers.try_into().expect("four peers"), [1, 2, 3, 4], capacity, config),
+        4 => SparkExperts::new(peers.try_into().expect("four peers"), [1, 2, 3, 4], capacity, config),
         _ => anyhow::bail!(
             "the legacy non-topology transport takes two, three or four Spark peers; \
              a six-rank layout (pure TP6EP1 or replicated) must pass --spark-tp/--spark-ep"
@@ -316,7 +316,7 @@ fn worker(
         cuteafd_loader::OFFICIAL_V41_MODEL_ID,
         &args.snapshot,
     )?;
-    let topology = crate::families::deepseek_v41::v41_spark_topology::resolve(
+    let topology = crate::shared::spark_topology::resolve(
         args.spark_tp,
         args.spark_ep,
         args.peers.len(),
@@ -324,7 +324,7 @@ fn worker(
     )?;
     // Explicit replicated groups are native-only and are rejected here, before
     // any expert weight is allocated or readiness published.
-    crate::families::deepseek_v41::v41_spark_topology::require_native(topology, &catalog)?;
+    crate::shared::spark_topology::require_native(topology, &catalog)?;
     if let Some(topology) = topology {
         // Fail before any CUDA allocation or readiness publication when the
         // library cannot reduce this physical-rank count.

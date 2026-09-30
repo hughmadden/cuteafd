@@ -90,7 +90,7 @@ impl<'w, 'a> Execution<'w, 'a> {
     }
     pub(super) unsafe fn execute_mapped_request(
         &mut self,
-        request: &V41BackboneRequest<'_>,
+        request: &BackboneRequest<'_>,
         executor_id: u64,
         exchange: &mut HostExpertExchange,
         slot: CuteafdDeviceBuffer,
@@ -108,7 +108,7 @@ impl<'w, 'a> Execution<'w, 'a> {
     }
     pub(super) fn execute_host_chunks<F>(
         &mut self,
-        request: &V41BackboneRequest<'_>,
+        request: &BackboneRequest<'_>,
         executor_id: u64,
         exchange: &mut HostExpertExchange,
         row_indices: &mut [u32],

@@ -96,7 +96,7 @@ fn request(f: &Fixture, rows: u32, id: u64, reverse: bool) -> Result<ExpertProto
     Ok(r)
 }
 async fn run_wave(
-    tp: &mut V41Tp4Roce,
+    tp: &mut SparkExperts,
     req: &ExpertProtocolV2Request,
     refs: &[Fixture],
     reverse: bool,
@@ -158,7 +158,7 @@ fn main() -> Result<()> {
         .try_into()
         .unwrap();
     let make = || {
-        V41Tp4Roce::new(
+        SparkExperts::new(
             peers,
             [1, 2, 3, 4],
             80,

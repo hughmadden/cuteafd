@@ -130,7 +130,7 @@ fn exl3_worker_mapped_and_chunked_responses_match_reference() -> Result<()> {
         )?;
         owned.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         let frame = owned.encode()?;
-        let request = V41BackboneRequest::parse(&frame, 4096)?;
+        let request = BackboneRequest::parse(&frame, 4096)?;
         let bytes = request.plane_bytes()?;
         let prefix = EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
         let mut host = HostAllocation::new(&lib, prefix + bytes + 64)?;
@@ -163,7 +163,7 @@ fn exl3_worker_mapped_and_chunked_responses_match_reference() -> Result<()> {
         // Debug-checksum requests must use host encoding; force multiple frames.
         owned.header.flags |= EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM;
         let frame = owned.encode()?;
-        let request = V41BackboneRequest::parse(&frame, 4096)?;
+        let request = BackboneRequest::parse(&frame, 4096)?;
         assert!(
             unsafe { worker.execute_mapped_request(&request, 3, &mut exchange, alias)? }.is_none()
         );
@@ -204,7 +204,7 @@ fn exl3_worker_mapped_and_chunked_responses_match_reference() -> Result<()> {
             .is_err());
         owned.header.layer_id = 1;
         let bad_frame = owned.encode()?;
-        let bad = V41BackboneRequest::parse(&bad_frame, 4096)?;
+        let bad = BackboneRequest::parse(&bad_frame, 4096)?;
         assert!(worker
             .execute_host_chunks(&bad, 3, &mut exchange, &mut row_indices, max_frame, |_| Ok(
                 ()
@@ -300,7 +300,7 @@ fn paired_worker_mapped_and_chunked_match_reference() -> Result<()> {
             }).collect::<Result<Vec<_>>>()?, input)?;
         request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16 | V41_EXL3_PAIRED_REQUEST_FLAG;
         let frame = request.encode()?;
-        let parsed = V41BackboneRequest::parse_paired(&frame,80)?;
+        let parsed = BackboneRequest::parse_paired(&frame,80)?;
         let prefix = EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
         let mut host = HostAllocation::new(&lib,prefix+expected.len()+64)?;
         host.bytes_mut().fill(0xa5);
@@ -312,7 +312,7 @@ fn paired_worker_mapped_and_chunked_match_reference() -> Result<()> {
         assert!(host.bytes_mut()[prefix+expected.len()..].iter().all(|&v| v==0xa5));
         request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM;
         let frame = request.encode()?;
-        let parsed = V41BackboneRequest::parse_paired(&frame,80)?;
+        let parsed = BackboneRequest::parse_paired(&frame,80)?;
         let mut indices = [0;3]; let mut actual = Vec::new();
         worker.execute_host_chunks(&parsed,rank as u64+1,&mut exchange,&mut indices,
             cuteafd_transport::EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN+3*(10240+4), |response| {
@@ -331,7 +331,7 @@ fn paired_worker_mapped_and_chunked_match_reference() -> Result<()> {
             next.header.flags = request.header.flags;
             if flip { for route in &mut next.routes { route.expert_id ^= 3 << 9; } }
             let frame = next.encode()?;
-            let parsed = V41BackboneRequest::parse_paired(&frame,80)?;
+            let parsed = BackboneRequest::parse_paired(&frame,80)?;
             actual.clear();
             worker.execute_host_chunks(&parsed,rank as u64+1,&mut exchange,&mut indices,
                 cuteafd_transport::EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN+3*(10240+4), |response| {

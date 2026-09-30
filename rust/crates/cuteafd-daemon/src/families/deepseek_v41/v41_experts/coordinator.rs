@@ -7,7 +7,7 @@ use cuteafd_core::{
 };
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41CompactReducer};
 use cuteafd_transport::{
-    expert::{V41SparkTopology, V41Tp4RocePending, V41Tp4Roce, V41_PARTIAL_ROW_BYTES,
+    expert::{SparkTopology, SparkExpertPending, SparkExperts, V41_PARTIAL_ROW_BYTES,
         V41_ROUTED_EXPERTS},
     ExpertProtocolV2Request, VerbsHostProtocolV2ResponsePayload,
 };
@@ -17,7 +17,7 @@ use cuteafd_transport::{
 /// each other's assignment. The histogram and encoded owners are reused across
 /// layers and requests without allocating in the request path.
 pub(crate) struct ReplicatedGroupPlanner {
-    topology: V41SparkTopology,
+    topology: SparkTopology,
     tie_seed_mode: ReplicatedExpertTieSeedMode,
     scheduler: ReplicatedExpertScheduler,
     histogram: [u32; V41_ROUTED_EXPERTS],
@@ -78,14 +78,14 @@ fn replicated_tie_seed_mode() -> Result<ReplicatedExpertTieSeedMode> {
 }
 
 impl ReplicatedGroupPlanner {
-    fn new(topology: V41SparkTopology) -> Result<Self> {
+    fn new(topology: SparkTopology) -> Result<Self> {
         Self::new_with_seed_mode(topology, replicated_tie_seed_mode()?)
     }
 
     /// Constructor with an explicit mode, used by focused tests so they never
     /// mutate process environment. Logs the resolved mode once per process.
     fn new_with_seed_mode(
-        topology: V41SparkTopology,
+        topology: SparkTopology,
         tie_seed_mode: ReplicatedExpertTieSeedMode,
     ) -> Result<Self> {
         static TIE_SEED_MODE_LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -116,7 +116,7 @@ impl ReplicatedGroupPlanner {
         self.tie_seed_mode
     }
 
-    pub(crate) fn topology(&self) -> V41SparkTopology {
+    pub(crate) fn topology(&self) -> SparkTopology {
         self.topology
     }
 
@@ -167,7 +167,7 @@ impl ReplicatedGroupPlanner {
 }
 
 pub(crate) struct NativeTp4Wave<'a> {
-    transport: V41Tp4Roce,
+    transport: SparkExperts,
     // Drop drains the stream before fields release any GPU allocations.
     stream: LoadStream<'a>,
     planes: Vec<DeviceAllocation<'a>>,
@@ -187,7 +187,7 @@ pub(crate) struct NativeTp4Wave<'a> {
 impl<'a> NativeTp4Wave<'a> {
     pub(crate) fn spark_world(&self) -> usize { self.transport.world_size() }
     /// Explicit replicated topology of this lane, or `None` for the legacy path.
-    pub(crate) fn native_topology(&self) -> Option<V41SparkTopology> {
+    pub(crate) fn native_topology(&self) -> Option<SparkTopology> {
         self.native.as_ref().map(ReplicatedGroupPlanner::topology)
     }
     pub(crate) fn install_paired(&mut self, profile: std::rc::Rc<super::paired::PairedProfile>) -> Result<()> {
@@ -297,7 +297,7 @@ impl<'a> NativeTp4Wave<'a> {
     }
     pub fn new(
         library: &'a NativeLibrary,
-        transport: V41Tp4Roce,
+        transport: SparkExperts,
         available_bytes: usize,
     ) -> Result<Self> {
         let capacity = transport.capacity();
@@ -619,7 +619,7 @@ async unsafe fn reduce_planes_cooperative(reducer: &V41CompactReducer<'_>,
 /// Borrows every mutable reduction buffer and owns all unread response sockets.
 /// Dropping before completion leaves the wave unpublished and closes the sockets.
 pub(crate) struct NativePendingFfn<'w, 'a, 'r> {
-    pending: V41Tp4RocePending<'w, 'r>,
+    pending: SparkExpertPending<'w, 'r>,
     request: &'r crate::families::deepseek_v41::v41_backbone_router::BoundExpertRequest,
     capacity: u32,
     library: &'a NativeLibrary,
@@ -732,7 +732,7 @@ impl<'w> NativePendingFfn<'w, '_, '_> {
 mod replicated_tests {
     use super::*;
     use cuteafd_transport::{
-        expert::{V41BackboneRequest, V41NativeOwnerRouteWord, V41_NATIVE_GROUP_REQUEST_FLAG},
+        expert::{BackboneRequest, V41NativeOwnerRouteWord, V41_NATIVE_GROUP_REQUEST_FLAG},
         ExpertProtocolV2RowDescriptor, ExpertProtocolV2RouteEntry, ExpertV2Dtype, ExpertV2SourceKind,
     };
 
@@ -765,7 +765,7 @@ mod replicated_tests {
         request
     }
 
-    fn owners(request: &ExpertProtocolV2Request, topology: V41SparkTopology) -> Vec<u8> {
+    fn owners(request: &ExpertProtocolV2Request, topology: SparkTopology) -> Vec<u8> {
         request.routes.iter().map(|route| {
             let word = V41NativeOwnerRouteWord::decode(route.expert_id, topology.group_count()).unwrap();
             assert!(word.expert_id < 384);
@@ -777,15 +777,15 @@ mod replicated_tests {
     fn six_route_batches_split_evenly_across_replicated_groups() {
         let unique = [0u32, 7, 19, 88, 200, 383];
         for (topology, expected) in [
-            (V41SparkTopology::new(2, 2).unwrap(), 3usize),
-            (V41SparkTopology::new(3, 2).unwrap(), 3),
-            (V41SparkTopology::new(2, 3).unwrap(), 2),
+            (SparkTopology::new(2, 2).unwrap(), 3usize),
+            (SparkTopology::new(3, 2).unwrap(), 3),
+            (SparkTopology::new(2, 3).unwrap(), 2),
         ] {
             let mut planner = ReplicatedGroupPlanner::new(topology).unwrap();
             let mut request = request(3, 11, &unique);
             planner.encode(&mut request).unwrap();
             assert_ne!(request.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG, 0);
-            V41BackboneRequest::validate_owned_native_group(&request, 1, topology).unwrap();
+            BackboneRequest::validate_owned_native_group(&request, 1, topology).unwrap();
             let owner = owners(&request, topology);
             let mut per_group = [0usize; 3];
             for group in &owner {
@@ -811,7 +811,7 @@ mod replicated_tests {
     fn seed_mode_is_wired_and_layer_is_stable_across_request_ids() {
         // Uniform-cost experts make every ordering decision a tie, so only the
         // seed can change the assignment.
-        let topology = V41SparkTopology::new(2, 2).unwrap();
+        let topology = SparkTopology::new(2, 2).unwrap();
         let experts = [0u32, 7, 19, 88, 200, 383];
 
         let mut layer = ReplicatedGroupPlanner::new_with_seed_mode(
@@ -860,7 +860,7 @@ mod replicated_tests {
     #[test]
     fn single_group_seed_modes_have_no_effect() {
         // EP1 negative: group_count == 1 makes the seed irrelevant.
-        let topology = V41SparkTopology::new(4, 1).unwrap();
+        let topology = SparkTopology::new(4, 1).unwrap();
         let experts = [0u32, 7, 19, 88, 200, 383];
         for mode in [
             ReplicatedExpertTieSeedMode::Dispatch,
@@ -885,7 +885,7 @@ mod replicated_tests {
         // and the canonical admission contract rejects it before ownership is
         // ever encoded. Duplicate expert ids *across* rows are legitimate and are
         // covered by the reuse fixture below.
-        let topology = V41SparkTopology::new(2, 2).unwrap();
+        let topology = SparkTopology::new(2, 2).unwrap();
         let mut planner = ReplicatedGroupPlanner::new(topology).unwrap();
         let mut encoded = request(5, 100, &[0u32; 6]);
         let error = planner.encode(&mut encoded).unwrap_err().to_string();
@@ -899,7 +899,7 @@ mod replicated_tests {
         // occurrence of an expert must carry the same owner, and only owned routes
         // may keep the exact FP32 gate weight; every other route is masked to the
         // 384 sentinel with weight zero.
-        let topology = V41SparkTopology::new(2, 2).unwrap();
+        let topology = SparkTopology::new(2, 2).unwrap();
         let base = [0u32, 1, 2, 3, 4, 5];
         let hot = [200u32, 201, 202, 203, 204, 205];
         let mut routes = Vec::new();
@@ -914,7 +914,7 @@ mod replicated_tests {
         let mut planner = ReplicatedGroupPlanner::new(topology).unwrap();
         let mut encoded = request(6, 777, &routes);
         planner.encode(&mut encoded).unwrap();
-        V41BackboneRequest::validate_owned_native_group(&encoded, rows as u32, topology).unwrap();
+        BackboneRequest::validate_owned_native_group(&encoded, rows as u32, topology).unwrap();
         // Ownership is a pure function of the expert id, stable across rows.
         let mut expert_owner = std::collections::BTreeMap::new();
         for (route, &expert) in encoded.routes.iter().zip(&routes) {
@@ -939,7 +939,7 @@ mod replicated_tests {
         for group in 0..topology.group_count() {
             let mut ids = vec![0i32; encoded.routes.len()];
             let mut weights = vec![0f32; encoded.routes.len()];
-            let view = V41BackboneRequest::parse_native_group(
+            let view = BackboneRequest::parse_native_group(
                 &frame, rows as u32, topology).unwrap();
             view.copy_native_group_routes_into(&mut ids, &mut weights, group).unwrap();
             for (index, (route, &expert)) in encoded.routes.iter().zip(&routes).enumerate() {
@@ -963,18 +963,18 @@ mod replicated_tests {
         // a heavily skewed calibration), so this fixture drives the ownership
         // contract directly: group 0 owns every expert, group 1 owns none, and
         // group 1 must mask all six routes to the sentinel/zero plane.
-        let topology = V41SparkTopology::new(2, 2).unwrap();
+        let topology = SparkTopology::new(2, 2).unwrap();
         let experts = [10u32, 11, 12, 13, 14, 15];
         let mut encoded = request(5, 101, &experts);
         let mut all_zero_owners = [0u8; 384];
         all_zero_owners[10] = 0; // explicit: group 0 owns the whole batch
         encoded.with_native_group_owners(&all_zero_owners, topology).unwrap();
         let frame = encoded.encode().unwrap();
-        V41BackboneRequest::validate_owned_native_group(&encoded, 1, topology).unwrap();
+        BackboneRequest::validate_owned_native_group(&encoded, 1, topology).unwrap();
         for group in 0..topology.group_count() {
             let mut ids = vec![0i32; 6];
             let mut weights = vec![0f32; 6];
-            let view = V41BackboneRequest::parse_native_group(&frame, 1, topology).unwrap();
+            let view = BackboneRequest::parse_native_group(&frame, 1, topology).unwrap();
             view.copy_native_group_routes_into(&mut ids, &mut weights, group).unwrap();
             if group == 0 {
                 assert_eq!(ids, experts.map(|expert| expert as i32));
@@ -992,7 +992,7 @@ mod replicated_tests {
     fn planning_is_reproducible_for_a_fixed_layer_and_request_id() {
         // Same (histogram, layer, request_id) must reproduce the same assignment
         // so a graph replay with unchanged input keeps identical ownership.
-        let topology = V41SparkTopology::new(2, 3).unwrap();
+        let topology = SparkTopology::new(2, 3).unwrap();
         let experts = [3u32, 9, 12, 40, 77, 300];
         let mut replan = || {
             let mut planner = ReplicatedGroupPlanner::new(topology).unwrap();
@@ -1017,7 +1017,7 @@ mod replicated_tests {
 
     #[test]
     fn single_group_topology_owns_every_active_expert() {
-        let topology = V41SparkTopology::new(2, 1).unwrap();
+        let topology = SparkTopology::new(2, 1).unwrap();
         let mut planner = ReplicatedGroupPlanner::new(topology).unwrap();
         let mut request = request(0, 1, &[1, 2, 3, 4, 5, 6]);
         planner.encode(&mut request).unwrap();
@@ -1190,7 +1190,7 @@ mod upload_tests {
         let peers = std::env::var("CUTEAFD_LIVE_ROCE_PEERS")?.split(',')
             .map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?
             .try_into().map_err(|_| anyhow::anyhow!("four peers required"))?;
-        let mut client = V41Tp4Roce::new(peers, [1,2,3,4], 4096, TcpTransportConfig { timing: false,
+        let mut client = SparkExperts::new(peers, [1,2,3,4], 4096, TcpTransportConfig { timing: false,
             timeout: std::time::Duration::from_secs(30), max_frame_bytes: 64 << 20,
         })?;
         let planes: [DeviceAllocation<'_>; 4] = (0..4).map(|_| DeviceAllocation::new(&library, 4096 * 10240))

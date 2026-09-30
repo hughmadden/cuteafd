@@ -14,7 +14,7 @@
 //!    (production-shaped) admits
 //!    `LocalVerbsExpertConnection::accept_with_budget` and hands it to a poller,
 //!    which echoes host memory (no expert kernel, no GPU compute) under a
-//!    synthetic `RingBudget`; client: existing `V41Tp4Roce`. M=1 -> 819 -> 1556 forces the
+//!    synthetic `RingBudget`; client: existing `SparkExperts`. M=1 -> 819 -> 1556 forces the
 //!    response ring and then the request ring to grow, dropping/reconnecting the
 //!    session so the old `RingReservation` is released. It does **not** claim
 //!    replicated-group ownership coverage (that is test 1 / the roundtrip test).
@@ -41,7 +41,7 @@ use std::time::Duration;
 
 use anyhow::{bail, ensure, Context, Result};
 use cuteafd_transport::expert::{
-    V41BackboneRequest, V41SparkTopology, V41Tp4ChunkReceiver, V41Tp4Roce,
+    BackboneRequest, SparkTopology, V41Tp4ChunkReceiver, SparkExperts,
     V41_NATIVE_GROUP_REQUEST_FLAG, V41_NATIVE_UNASSIGNED_EXPERT_ID, V41_PARTIAL_ROW_BYTES,
     V41_ROUTED_EXPERTS, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
 };
@@ -147,7 +147,7 @@ fn large_frame_boundaries_and_wire_roundtrip() -> Result<()> {
     assert_eq!(FLOOR_ENDPOINT_SPAN, 134_217_728);
 
     // TP2EP2 with an explicit owner map: real replicated-group coverage.
-    let topology = V41SparkTopology::NATIVE_TP2_EP2;
+    let topology = SparkTopology::NATIVE_TP2_EP2;
     let mut owners = vec![0u8; V41_ROUTED_EXPERTS];
     for (expert, owner) in owners.iter_mut().enumerate() {
         *owner = (expert % topology.group_count() as usize) as u8;
@@ -164,7 +164,7 @@ fn large_frame_boundaries_and_wire_roundtrip() -> Result<()> {
         ensure!(flagged.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG != 0);
         let frame = flagged.encode()?;
         ensure!(frame.len() == request_wire(rows));
-        let native = V41BackboneRequest::parse_native_group(&frame, CAPACITY, topology)?;
+        let native = BackboneRequest::parse_native_group(&frame, CAPACITY, topology)?;
 
         let mut owned_per_route = vec![0usize; canonical.len()];
         for rank in 0..topology.world_size() {
@@ -249,7 +249,7 @@ impl Drop for Servers {
 fn spawn_echo_servers(
     ip: IpAddr,
     ranks: usize,
-    topology: V41SparkTopology,
+    topology: SparkTopology,
     budget: Arc<RingBudget>,
     stop: Arc<AtomicBool>,
 ) -> Result<(Vec<SocketAddr>, Receiver<AcceptReport>, Servers)> {
@@ -347,11 +347,11 @@ fn spawn_echo_servers(
 
 fn echo_request(
     view: &ExpertProtocolV2RequestView<'_>,
-    topology: V41SparkTopology,
+    topology: SparkTopology,
     executor_id: u64,
     emit: &mut dyn FnMut(ProtocolV2ExecutorResponseRef<'_>) -> Result<()>,
 ) -> Result<()> {
-    let native = V41BackboneRequest::parse_native_group(view.frame_bytes(), CAPACITY, topology)?;
+    let native = BackboneRequest::parse_native_group(view.frame_bytes(), CAPACITY, topology)?;
     let rows = native.rows();
     let mut plane = vec![0u8; rows as usize * V41_PARTIAL_ROW_BYTES as usize];
     for row in 0..rows as usize {
@@ -396,9 +396,9 @@ async fn native_group_large_frame_wire_loopback_ep1() -> Result<()> {
         .and_then(|value| value.parse().ok())
         .unwrap_or(4);
     let topology = match ranks {
-        6 => V41SparkTopology::NATIVE_TP6_EP1,
-        4 => V41SparkTopology::NATIVE_TP4_EP1,
-        2 => V41SparkTopology::NATIVE_TP2_EP1,
+        6 => SparkTopology::NATIVE_TP6_EP1,
+        4 => SparkTopology::NATIVE_TP4_EP1,
+        2 => SparkTopology::NATIVE_TP2_EP1,
         other => bail!("loopback ranks must be 6 (TP6EP1), 4 (TP4EP1) or 2 (TP2EP1), got {other}"),
     };
     ensure!(topology.world_size() == ranks);
@@ -413,7 +413,7 @@ async fn native_group_large_frame_wire_loopback_ep1() -> Result<()> {
         max_frame_bytes: MAX_FRAME,
         timing: true,
     };
-    let mut transport = V41Tp4Roce::new_topology(topology, &addrs, CAPACITY, config)?;
+    let mut transport = SparkExperts::new_topology(topology, &addrs, CAPACITY, config)?;
 
     tokio::time::timeout(TIMEOUT, async {
         for &rows in &[1u32, 819, 1556] {

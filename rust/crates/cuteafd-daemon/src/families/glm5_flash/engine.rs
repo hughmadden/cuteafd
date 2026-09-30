@@ -32,7 +32,7 @@ use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
 use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
 use crate::shared::spark_intake::SparkLink;
-use cuteafd_transport::expert::{V41Tp4RoceWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
+use cuteafd_transport::expert::{SparkExpertWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
 use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
 };
@@ -1339,7 +1339,7 @@ impl<'a> GlmfEngine<'a> {
     /// shared expert (`shared`) queues behind the copies and runs while the
     /// ranks compute. Complete with [`Self::spark_land`].
     fn spark_dispatch(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, transport: &mut SparkLink<'_>,
-        shared: impl FnOnce() -> Result<()>) -> Result<V41Tp4RoceWave> {
+        shared: impl FnOnce() -> Result<()>) -> Result<SparkExpertWave> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let (route_bytes, wire_bytes) = (t * topk * 4, t * (h + h / 32));
@@ -1386,7 +1386,7 @@ impl<'a> GlmfEngine<'a> {
 
     /// Receives `wave`'s BF16 rank partials into its transport's intake planes
     /// and sums them with the shared expert into `delta`.
-    async fn spark_land(&self, w: &Workspace<'_>, t: usize, transport: &mut SparkLink<'_>, wave: V41Tp4RoceWave)
+    async fn spark_land(&self, w: &Workspace<'_>, t: usize, transport: &mut SparkLink<'_>, wave: SparkExpertWave)
         -> Result<()> {
         let ranks = transport.world_size();
         ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
@@ -1488,7 +1488,7 @@ impl<'a> GlmfEngine<'a> {
         };
         let units: Vec<(usize, usize)> = (0..layers.len()).flat_map(|l| (0..lanes.len()).map(move |k| (l, k))).collect();
         runtime.block_on(async {
-            let mut inflight: Option<((usize, usize), V41Tp4RoceWave)> = None;
+            let mut inflight: Option<((usize, usize), SparkExpertWave)> = None;
             attention(units[0])?;
             for (index, &unit) in units.iter().enumerate() {
                 let (layer, lane) = unit;

@@ -46,7 +46,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     };
     memory_checkpoint("CUDA contexts and peer access")?;
     let catalog = cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID, &args.snapshot)?;
-    let topology = crate::families::deepseek_v41::v41_spark_topology::resolve(
+    let topology = crate::shared::spark_topology::resolve(
         args.spark_tp,
         args.spark_ep,
         args.peers.len(),
@@ -54,7 +54,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     )?;
     // Reject an explicit non-native checkpoint before any expert allocation,
     // KV reservation or readiness publication.
-    crate::families::deepseek_v41::v41_spark_topology::require_native(topology, &catalog)?;
+    crate::shared::spark_topology::require_native(topology, &catalog)?;
     if let Some(topology) = topology {
         // Fail before weights are loaded when the library cannot reduce this
         // physical-rank count.

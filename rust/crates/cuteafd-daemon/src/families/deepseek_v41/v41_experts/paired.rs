@@ -1,7 +1,7 @@
 //! Lane-owned coordinator scratch; ownership travels in the existing route word.
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{Exl3BoundaryCost, Exl3Tp4OwnershipPlanner};
-use cuteafd_transport::{ExpertProtocolV2Request, expert::{V41BackboneRequest, V41PairedRouteWord, V41_EXL3_PAIRED_REQUEST_FLAG}};
+use cuteafd_transport::{ExpertProtocolV2Request, expert::{BackboneRequest, V41PairedRouteWord, V41_EXL3_PAIRED_REQUEST_FLAG}};
 
 /// Cost units must agree across weights and routed-row terms. The caller supplies
 /// calibrated costs; this adapter does not assume a bandwidth or compute ratio.
@@ -101,7 +101,7 @@ impl PairedAssignment {
     /// batch. No other lane or GPU operation is consulted.
     pub(crate) fn encode(&mut self, request: &mut ExpertProtocolV2Request,
         models: &[BoundaryCostModel; 384], tie_seed: usize) -> Result<[u64; 4]> {
-        V41BackboneRequest::validate_owned(request, 4096)?;
+        BackboneRequest::validate_owned(request, 4096)?;
         self.counts.fill(0);
         self.costs.fill(Exl3BoundaryCost::default());
         for route in &request.routes {
@@ -210,7 +210,7 @@ mod tests {
         let mut first = request();
         let original = first.encode()?;
         assert_eq!(scratch.encode(&mut first, &models, 0)?, [27*16;4]);
-        V41BackboneRequest::validate_owned_paired(&first, 3)?;
+        BackboneRequest::validate_owned_paired(&first, 3)?;
         let encoded = first.encode()?;
         assert_eq!(original.len(), encoded.len());
         let mut second = request();

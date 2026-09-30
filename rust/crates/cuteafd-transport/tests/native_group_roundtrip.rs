@@ -30,7 +30,7 @@ use cuteafd_core::{
     ReplicatedExpertScheduler, INACTIVE_REPLICATED_EXPERT_GROUP,
 };
 use cuteafd_transport::expert::{
-    V41BackboneRequest, V41NativeOwnerRouteWord, V41SparkTopology, V41Tp4ChunkReceiver,
+    BackboneRequest, V41NativeOwnerRouteWord, SparkTopology, V41Tp4ChunkReceiver,
     V41_NATIVE_GROUP_REQUEST_FLAG, V41_NATIVE_UNASSIGNED_EXPERT_ID, V41_PARTIAL_ROW_BYTES,
     V41_ROUTED_EXPERTS, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
 };
@@ -46,14 +46,14 @@ const HIDDEN_BYTES: usize = 5120 * 2;
 
 /// Every approved layout: World 2, 3, 4 and 6, including the pure unreplicated
 /// six-rank TP6EP1.
-const TOPOLOGIES: [V41SparkTopology; 7] = [
-    V41SparkTopology::NATIVE_TP2_EP1,
-    V41SparkTopology::NATIVE_TP3_EP1,
-    V41SparkTopology::NATIVE_TP4_EP1,
-    V41SparkTopology::NATIVE_TP2_EP2,
-    V41SparkTopology::NATIVE_TP3_EP2,
-    V41SparkTopology::NATIVE_TP2_EP3,
-    V41SparkTopology::NATIVE_TP6_EP1,
+const TOPOLOGIES: [SparkTopology; 7] = [
+    SparkTopology::NATIVE_TP2_EP1,
+    SparkTopology::NATIVE_TP3_EP1,
+    SparkTopology::NATIVE_TP4_EP1,
+    SparkTopology::NATIVE_TP2_EP2,
+    SparkTopology::NATIVE_TP3_EP2,
+    SparkTopology::NATIVE_TP2_EP3,
+    SparkTopology::NATIVE_TP6_EP1,
 ];
 const ROWS: [usize; 4] = [1, 2, 8, 16];
 
@@ -173,7 +173,7 @@ fn lpt_owners(counts: &[u32; EXPERTS], ep: u8) -> Result<Vec<u8>> {
 
 /// Full wire + ownership + exactly-once proof for one topology/fixture/assignment.
 fn assert_wire_roundtrip(
-    topology: V41SparkTopology,
+    topology: SparkTopology,
     fixture: &Fixture,
     owners: &[u8],
 ) -> Result<()> {
@@ -183,7 +183,7 @@ fn assert_wire_roundtrip(
     ensure!(flagged.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG != 0);
     let frame = flagged.encode()?;
     // A canonical consumer must reject the ownership frame.
-    ensure!(V41BackboneRequest::parse(&frame, MAX_ROWS).is_err());
+    ensure!(BackboneRequest::parse(&frame, MAX_ROWS).is_err());
 
     let ranks = topology.world_size();
     ensure!(ranks == topology.tp() as usize * topology.ep() as usize);
@@ -203,7 +203,7 @@ fn assert_wire_roundtrip(
     let mut owned_per_route = vec![0usize; route_count];
     let mut dispatch_weight = vec![0i64; EXPERTS];
     for rank in 0..ranks {
-        let native = V41BackboneRequest::parse_native_group(&frame, MAX_ROWS, topology)?;
+        let native = BackboneRequest::parse_native_group(&frame, MAX_ROWS, topology)?;
         ensure!(native.is_native_group());
         ensure!(native.native_topology() == Some(topology));
         ensure!(native.rows() as usize == route_count / 6);
@@ -301,10 +301,10 @@ fn wire_roundtrip_is_exactly_once_per_tp_shard_for_approved_topologies() -> Resu
 #[test]
 fn ep1_owner_zero_flag_and_single_owner_bit() -> Result<()> {
     for topology in [
-        V41SparkTopology::NATIVE_TP2_EP1,
-        V41SparkTopology::NATIVE_TP3_EP1,
-        V41SparkTopology::NATIVE_TP4_EP1,
-        V41SparkTopology::NATIVE_TP6_EP1,
+        SparkTopology::NATIVE_TP2_EP1,
+        SparkTopology::NATIVE_TP3_EP1,
+        SparkTopology::NATIVE_TP4_EP1,
+        SparkTopology::NATIVE_TP6_EP1,
     ] {
         ensure!(topology.group_count() == 1);
         for rows in [1usize, 8] {
@@ -338,9 +338,9 @@ fn ep1_owner_zero_flag_and_single_owner_bit() -> Result<()> {
 #[test]
 fn inactive_group_ranks_are_sentinel_only_zero_rows() -> Result<()> {
     for topology in [
-        V41SparkTopology::NATIVE_TP2_EP2,
-        V41SparkTopology::NATIVE_TP3_EP2,
-        V41SparkTopology::NATIVE_TP2_EP3,
+        SparkTopology::NATIVE_TP2_EP2,
+        SparkTopology::NATIVE_TP3_EP2,
+        SparkTopology::NATIVE_TP2_EP3,
     ] {
         let fixture = fixture(8, 0x1AC7_0000)?;
         let counts = route_counts(&fixture);
@@ -356,7 +356,7 @@ fn inactive_group_ranks_are_sentinel_only_zero_rows() -> Result<()> {
         let frame = flagged.encode()?;
         for rank in 0..topology.world_size() {
             let group = topology.group(rank)?;
-            let native = V41BackboneRequest::parse_native_group(&frame, MAX_ROWS, topology)?;
+            let native = BackboneRequest::parse_native_group(&frame, MAX_ROWS, topology)?;
             let mut ids = vec![0i32; fixture.experts.len()];
             let mut weights = vec![1.0f32; fixture.experts.len()];
             native.copy_native_group_routes_into(&mut ids, &mut weights, group)?;
@@ -381,10 +381,10 @@ fn inactive_group_ranks_are_sentinel_only_zero_rows() -> Result<()> {
 #[test]
 fn chunked_response_coverage_matches_n_physical_planes() -> Result<()> {
     for topology in [
-        V41SparkTopology::NATIVE_TP4_EP1,
-        V41SparkTopology::NATIVE_TP2_EP2,
-        V41SparkTopology::NATIVE_TP3_EP2,
-        V41SparkTopology::NATIVE_TP6_EP1,
+        SparkTopology::NATIVE_TP4_EP1,
+        SparkTopology::NATIVE_TP2_EP2,
+        SparkTopology::NATIVE_TP3_EP2,
+        SparkTopology::NATIVE_TP6_EP1,
     ] {
         let rows = 8usize;
         let fixture = fixture(rows, 0xC0FF_EE00)?;
@@ -393,7 +393,7 @@ fn chunked_response_coverage_matches_n_physical_planes() -> Result<()> {
         let mut flagged = fixture.request.clone();
         flagged.with_native_group_owners(&owners, topology)?;
         let frame = flagged.encode()?;
-        let native = V41BackboneRequest::parse_native_group(&frame, MAX_ROWS, topology)?;
+        let native = BackboneRequest::parse_native_group(&frame, MAX_ROWS, topology)?;
         let executors = topology.executor_ids();
         let ranks = topology.world_size();
         ensure!(ranks == executors.len());

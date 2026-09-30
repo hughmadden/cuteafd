@@ -31,7 +31,7 @@ impl DeviceLanding {
 /// Registers `landing` on `endpoint` before its receives are posted; false
 /// (with the reason logged) keeps the session on host receives.
 pub(super) fn attach(endpoint: &NativeRdmaEndpoint, landing: DeviceLanding, addr: SocketAddr) -> bool {
-    // SAFETY: `V41Tp4Roce::set_gpu_landing`'s contract makes its caller keep
+    // SAFETY: `SparkExperts::set_gpu_landing`'s contract makes its caller keep
     // the range allocated, and unread while a receive may write it, for as
     // long as this endpoint (owned by the session) exists.
     let attached = unsafe {

@@ -604,7 +604,7 @@ impl ExpertExecution<'_, '_> {
     /// partially delivered response stream without resetting receiver state.
     pub fn execute_host_chunks<F>(
         &mut self,
-        request: &cuteafd_transport::expert::V41BackboneRequest<'_>,
+        request: &cuteafd_transport::expert::BackboneRequest<'_>,
         executor_id: u64,
         exchange: &mut HostExpertExchange,
         row_indices: &mut [u32],
@@ -642,7 +642,7 @@ impl ExpertExecution<'_, '_> {
     /// The slot is GPU-accessible on this device and exclusively owned until the
     /// caller emits the returned response; the transport retains it through send completion.
     pub unsafe fn execute_mapped_request(&mut self,
-        request: &cuteafd_transport::expert::V41BackboneRequest<'_>, executor_id: u64,
+        request: &cuteafd_transport::expert::BackboneRequest<'_>, executor_id: u64,
         exchange: &mut HostExpertExchange, slot: CuteafdDeviceBuffer,
         hidden: Option<CuteafdDeviceBuffer>,
     ) -> Result<Option<cuteafd_transport::ExpertProtocolV2DeviceResponseRef<'static>>> {
@@ -662,7 +662,7 @@ impl ExpertExecution<'_, '_> {
     /// The borrowed response prevents reuse of exchange storage until encoding/send ends.
     pub fn execute_host_request<'a>(
         &mut self,
-        request: &cuteafd_transport::expert::V41BackboneRequest<'_>,
+        request: &cuteafd_transport::expert::BackboneRequest<'_>,
         executor_id: u64,
         exchange: &'a mut HostExpertExchange,
     ) -> Result<cuteafd_transport::ExpertProtocolV2ResponseRef<'a>> {
@@ -671,7 +671,7 @@ impl ExpertExecution<'_, '_> {
     }
 
     fn execute_request_output(&mut self,
-        request: &cuteafd_transport::expert::V41BackboneRequest<'_>, executor_id: u64,
+        request: &cuteafd_transport::expert::BackboneRequest<'_>, executor_id: u64,
         exchange: &mut HostExpertExchange, destination: Option<CuteafdDeviceBuffer>,
         hidden_view: Option<CuteafdDeviceBuffer>,
     ) -> Result<()> {
@@ -856,8 +856,8 @@ mod timing_role_tests {
     #[test]
     fn pure_tp6_role_selects_the_compact_output_path() {
         assert!(super::compact_output_role(
-            crate::families::deepseek_v41::v41_spark_topology::SPARK_TP6_ROLE
+            crate::shared::spark_topology::SPARK_TP6_ROLE
         ));
-        assert_eq!(crate::families::deepseek_v41::v41_spark_topology::SPARK_TP6_ROLE, 7);
+        assert_eq!(crate::shared::spark_topology::SPARK_TP6_ROLE, 7);
     }
 }
