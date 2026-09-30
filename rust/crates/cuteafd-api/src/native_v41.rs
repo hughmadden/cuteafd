@@ -131,6 +131,10 @@ impl From<String> for NativeFailure {
 impl From<&str> for NativeFailure {
     fn from(message: &str) -> Self { Self::Worker(message.into()) }
 }
+/// Silence after which a streamed response sends an SSE comment line.
+const SSE_KEEPALIVE: std::time::Duration =
+    std::time::Duration::from_millis(if cfg!(test) { 50 } else { 15_000 });
+
 pub struct NativeRequest {
     pub prompt: String,
     pub constraint: Option<NativeConstraint>,
@@ -594,7 +598,15 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> 
     if streaming {
         let stream = async_stream::stream! {
             futures::pin_mut!(chunks);
-            while let Some(chunk) = chunks.next().await {
+            loop {
+                // A comment line keeps proxies and clients from timing out while
+                // nothing is emitted: a long prefill, or a tool call the parser
+                // holds back until it is complete.
+                let chunk = match tokio::time::timeout(SSE_KEEPALIVE, chunks.next()).await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break,
+                    Err(_) => { yield Ok(": keepalive\n\n".to_owned()); continue; }
+                };
                 let failed = failure.lock().unwrap().clone();
                 if let Some(message) = failed {
                     yield Err::<String,std::io::Error>(std::io::Error::other(message)); return;
@@ -718,6 +730,26 @@ mod tests {
         assert_eq!(rendered_prompt(json!({"enable_thinking": true})).await, official_on);
         // `thinking` keeps precedence over the template kwarg.
         assert_eq!(rendered_prompt(json!({"thinking": {"type": "enabled"}, "enable_thinking": false})).await, official_on);
+    }
+
+    #[tokio::test]
+    async fn silent_streams_send_keepalive_comments() {
+        let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+        tokio::spawn(async move {
+            let job = rx.recv().await.unwrap();
+            job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
+                prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).await.unwrap();
+            tokio::time::sleep(SSE_KEEPALIVE * 4).await;
+            job.events.send(Ok(InferenceChunk::Text { content: "4".into(), content_tokens: 1 })).await.unwrap();
+            job.events.send(Ok(InferenceChunk::Finish {
+                finish_reason: InferenceFinishReason::Stop })).await.unwrap();
+        });
+        let response = router(tx).oneshot(request(true)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains(": keepalive\n\n"), "{text}");
+        assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
     }
 
     #[tokio::test]
