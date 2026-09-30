@@ -21,7 +21,7 @@ import json
 from collections import defaultdict
 
 # rows -> verify ms: dflash_policy.rs K4_TP4_STEP_MS (1 RTX PRO 6000 at 325 W + 4 Sparks TP4).
-K4_TP4 = [(1, 35.6), (2, 50.5), (3, 62.4), (4, 73.6), (5, 83.2), (6, 93.1), (7, 102.2), (8, 111.8)]
+K4_TP4 = [(1, 35.0), (2, 50.5), (3, 60.2), (4, 67.2), (5, 77.6), (6, 85.3), (7, 92.8), (8, 102.6)]
 
 
 def interpolate(table, rows):
