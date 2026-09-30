@@ -13,10 +13,10 @@
 //! (`GlmfEngine::commit`), which leaves the state serial steps would have.
 //! MLA records past the kept length are rewritten by later steps.
 use super::engine::{Allocator, GlmfEngine, GlmfPlacement, DECODE_ROWS};
-use crate::glm::dflash::{ContextRow, Draft, DraftSeq, TAP_ROWS};
-use crate::glm::dflash_policy::{self, DraftHistory, Shape};
+use crate::families::glm5::dflash::{ContextRow, Draft, DraftSeq, TAP_ROWS};
+use crate::families::glm5::dflash_policy::{self, DraftHistory, Shape};
 use super::{embed_rows, open, Opened};
-use crate::prefill_share::{add_phases, isolated_phases, Chunk, DecodeShareArgs};
+use crate::shared::prefill_share::{add_phases, isolated_phases, Chunk, DecodeShareArgs};
 use anyhow::{Context, Result};
 use cuteafd_api::native_v41::glm::GlmEncoding;
 use cuteafd_api::native_v41::{
@@ -132,7 +132,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
 /// An admitted prompt waiting for its remaining prefill chunks.
 struct Prefill<'a> {
     job: NativeRequest,
-    constraint: Option<crate::v41_native_serve::constraints::State<'a>>,
+    constraint: Option<crate::shared::constraints::State<'a>>,
     tokens: Vec<u32>,
     /// Prompt tokens prefilled so far.
     done: usize,
@@ -163,7 +163,7 @@ struct Active<'a> {
     digest: u64,
     /// Steps, DFlash2 drafts verified and accepted, copy drafts verified and accepted.
     counts: [usize; 5],
-    constraint: Option<crate::v41_native_serve::constraints::State<'a>>,
+    constraint: Option<crate::shared::constraints::State<'a>>,
     placement: GlmfPlacement,
     capacity: usize,
     next: u32,
@@ -255,7 +255,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
     policy: Policy, ranks: Option<usize>, decode_share: DecodeShareArgs) -> Result<()> {
     let mut allocator = Allocator::new(engine.pages, engine.slots);
-    let mut grammars = crate::v41_native_serve::constraints::Compiler::with_vocab(
+    let mut grammars = crate::shared::constraints::Compiler::with_vocab(
         &opened.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, engine.cfg.eos.clone());
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
     let drafter = engine.drafter.as_ref();

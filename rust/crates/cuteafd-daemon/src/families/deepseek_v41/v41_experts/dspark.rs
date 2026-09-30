@@ -27,8 +27,8 @@ pub(crate) use router::DsparkRouter;
 pub(crate) use terminal::{DsparkTerminal, DistributedDsparkTerminal};
 
 use super::{ExpertLayer, ExpertWeights};
-use crate::v41_dspark_cache::DsparkWindow;
-use crate::v41_tensors::NativeRtxTensors;
+use crate::families::deepseek_v41::v41_dspark_cache::DsparkWindow;
+use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::OfficialV41Catalog;
@@ -115,9 +115,9 @@ pub(crate) struct DsparkWeights<'library> {
     experts: ExpertStages<'library>,
     auxiliary: NativeRtxTensors<'library>,
     budget: DsparkBudget,
-    shared_scales: [crate::v41_memory::DeviceAllocation<'library>; 9],
-    grouped_output_scales: [crate::v41_memory::DeviceAllocation<'library>; 3],
-    projection_scales: [crate::v41_memory::DeviceAllocation<'library>; 13],
+    shared_scales: [crate::shared::memory::DeviceAllocation<'library>; 9],
+    grouped_output_scales: [crate::shared::memory::DeviceAllocation<'library>; 3],
+    projection_scales: [crate::shared::memory::DeviceAllocation<'library>; 13],
 }
 impl<'library> DsparkWeights<'library> {
     fn full_expert(&self, stage: usize) -> Option<&ExpertWeights<'library>> {
@@ -247,7 +247,7 @@ impl<'library> DsparkWeights<'library> {
         capacity:u32,waves:usize,budgets:[usize;2],pinned_staging_bytes:usize,width:usize)->Result<Self> {
         ensure!(catalog.native_dspark_experts(),"TP2 dSpark requires native expert weights");
         ensure!(library.cuda_get_device()?==1,"TP2 dSpark transformer belongs on RTX1");
-        let devices=[crate::v41_memory::device::Device {library,id:0},crate::v41_memory::device::Device {library,id:1}];
+        let devices=[crate::shared::memory::device::Device {library,id:0},crate::shared::memory::device::Device {library,id:1}];
         let mut budget=Self::plan_with_width(library,catalog,capacity,width,None)?;
         let mut resident=[0usize;2];let mut staging=[0usize;2];
         for rank in 0..2 { for stage in 0..3 {

@@ -1,0 +1,20 @@
+# Naming pass: Rust path renames, one regex per line, applied in order.
+#   SCOPE<TAB>REGEX<TAB>REPLACEMENT      (SCOPE: a path prefix the file must start with)
+# Used by scripts/build/rename_paths.py (the pass itself) and by
+# scripts/build/rebase-across-move.sh (hunk lines of carried branches).
+# Grouped imports (use crate::{a::X, b::Y}) are split per item before the rules run.
+#
+# daemon: shared modules
+rust/crates/cuteafd-daemon/	\bcrate::v41_memory\b	crate::shared::memory
+rust/crates/cuteafd-daemon/	\bcrate::v41_native_serve::constraints\b	crate::shared::constraints
+rust/crates/cuteafd-daemon/	\bcrate::v41_experts::(fp8|service)\b	crate::shared::experts::\1
+rust/crates/cuteafd-daemon/	\bcrate::(draft_policy|prefill_share|fp8_linear|l2_prefetch|spark_intake)\b	crate::shared::\1
+# daemon: families
+rust/crates/cuteafd-daemon/	\bcrate::(v41_[a-z0-9_]+)\b	crate::families::deepseek_v41::\1
+rust/crates/cuteafd-daemon/	\bcrate::dsv4\b	crate::families::deepseek_v4
+rust/crates/cuteafd-daemon/	\bcrate::glmf\b	crate::families::glm5_flash
+rust/crates/cuteafd-daemon/	\bcrate::glm\b	crate::families::glm5
+rust/crates/cuteafd-daemon/	\bcrate::mimo\b	crate::families::mimo_v2
+rust/crates/cuteafd-daemon/	\bcrate::qwen4\b	crate::families::qwen4
+# relative paths the move of constraints/fp8/service broke
+rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_native_serve/	\bsuper::constraints\b	crate::shared::constraints

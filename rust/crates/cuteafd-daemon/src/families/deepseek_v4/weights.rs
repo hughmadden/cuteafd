@@ -2,7 +2,7 @@
 //! b12x.integration.cuteafd.weights.WEIGHT_SOURCES prescribes: every operand is
 //! checkpoint bytes (row-concatenated where listed) except block-FP8 scales,
 //! which the scale-prep program re-lays into MMA tile order.
-use crate::v41_memory::DeviceAllocation;
+use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::dsv4::{Dsv4Programs, Dsv4Scalar};
 use cuteafd_ffi::NativeLibrary;

@@ -2,7 +2,7 @@
 mod local;
 mod backend;
 
-use super::{ExpertLayer, ExpertWeights, HostExpertExchange};
+use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights, HostExpertExchange};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::OfficialV41Catalog;
@@ -14,7 +14,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         Ok(report) => tracing::info!(target: "cuteafd::fabric", rails = report.rails.use_rails, "{}", report.summary()),
         Err(error) => tracing::warn!(target: "cuteafd::fabric", "fabric discovery failed: {error:#}"),
     }
-    let topology = crate::v41_spark_topology::resolve(
+    let topology = crate::families::deepseek_v41::v41_spark_topology::resolve(
         args.spark_tp,
         args.spark_ep,
         args.world as usize,
@@ -473,11 +473,11 @@ mod tests {
                         }
                     );
                     assert_eq!(selection.role(), match tp {
-                        2 => crate::v41_spark_topology::SPARK_TP2_ROLE,
-                        3 => crate::v41_spark_topology::SPARK_TP3_ROLE,
+                        2 => crate::families::deepseek_v41::v41_spark_topology::SPARK_TP2_ROLE,
+                        3 => crate::families::deepseek_v41::v41_spark_topology::SPARK_TP3_ROLE,
                         // Pure TP6EP1 is its own native shard family: six
                         // disjoint intermediate slices of every expert.
-                        6 => crate::v41_spark_topology::SPARK_TP6_ROLE,
+                        6 => crate::families::deepseek_v41::v41_spark_topology::SPARK_TP6_ROLE,
                         other => panic!("unexpected explicit TP degree {other}"),
                     });
                     assert_eq!(
@@ -529,7 +529,7 @@ mod tests {
             // every `info.role == layer.role()` guard fails loudly instead of
             // matching the spark_tp3 native role by accident.
             assert!(shard.role() > 7, "EXL3 shard reported native role {}", shard.role());
-            assert_ne!(shard.role(), crate::v41_spark_topology::SPARK_TP3_ROLE);
+            assert_ne!(shard.role(), crate::families::deepseek_v41::v41_spark_topology::SPARK_TP3_ROLE);
             assert_eq!(shard, ExpertLayer::BackboneExl3Tp { layer: 7, rank, world: 3 });
         }
     }
@@ -541,7 +541,7 @@ mod tests {
     }
 
     fn resolve_topology_mismatch(config: &NativeExpertServiceConfig) -> bool {
-        crate::v41_spark_topology::resolve(
+        crate::families::deepseek_v41::v41_spark_topology::resolve(
             Some(config.topology.unwrap().tp()),
             Some(config.topology.unwrap().ep()),
             config.world,
@@ -702,7 +702,7 @@ mod tests {
 /// EXL3-only, so a native three-rank launch must carry its explicit topology.
 fn validate_topology(config: &NativeExpertServiceConfig, catalog: &OfficialV41Catalog) -> Result<()> {
     if let Some(topology) = config.topology {
-        crate::v41_spark_topology::require_native(Some(topology), catalog)?;
+        crate::families::deepseek_v41::v41_spark_topology::require_native(Some(topology), catalog)?;
         ensure!(
             config.world == topology.world_size() && config.rank < config.world,
             "explicit Spark topology {}x{} needs --world {} and --rank below it, got world {} rank {}",
@@ -770,14 +770,14 @@ impl NativeExpertServiceConfig {
     }
     /// Replicated group this worker unpacks routes for, or `None` for legacy.
     fn native_group(&self) -> Result<Option<u8>> {
-        crate::v41_spark_topology::group_of(self.topology, self.rank)
+        crate::families::deepseek_v41::v41_spark_topology::group_of(self.topology, self.rank)
     }
     /// Resolve this rank's EXL3 AOT package for the running checkpoint's
     /// decoder tiers (multi-family images) with the legacy single-family
     /// location as fallback. An explicit --exl3-aot-dir is used verbatim.
     fn exl3_directory_for(&self, tiers: &[usize]) -> PathBuf {
         self.exl3_aot_dir.clone().unwrap_or_else(|| {
-            crate::v41_experts::exl3::aot_layout_directory(
+            crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
                 &self.library,
                 tiers,
                 &format!("tp{}-rank{}", self.world, self.rank),

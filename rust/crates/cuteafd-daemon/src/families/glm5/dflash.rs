@@ -24,8 +24,8 @@
 //! rows; larger updates (prefill tails) keep cuBLAS BF16. The committed
 //! tokens do not change: the target verifies every draft. After Hugh
 //! Madden's glm53f-afd FP8 drafter (MIT, v1.1.0 16de2a6).
-use crate::fp8_linear::{self, Fp8Weight};
-use crate::v41_memory::DeviceAllocation;
+use crate::shared::fp8_linear::{self, Fp8Weight};
+use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::dsv4::{VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};

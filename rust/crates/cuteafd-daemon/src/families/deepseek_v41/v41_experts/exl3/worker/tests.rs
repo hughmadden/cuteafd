@@ -1,5 +1,6 @@
 use super::*;
-use crate::{v41_experts::ExpertLayer, v41_memory::HostAllocation};
+use crate::families::deepseek_v41::v41_experts::ExpertLayer;
+use crate::shared::memory::HostAllocation;
 use cuteafd_transport::{
     v41_expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16, ExpertProtocolV2Request,
     ExpertProtocolV2ResponseView, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,

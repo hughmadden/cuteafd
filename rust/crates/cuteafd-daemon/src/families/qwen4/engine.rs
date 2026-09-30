@@ -21,14 +21,14 @@
 //! gate, and routed experts on this GPU (FP8 or EXL3 packages, a window of
 //! resident layers) or on the Sparks.
 use super::weights::{Qwen4Layer, Qwen4Weights};
-use crate::v41_experts::fp8::{Fp8Experts, Fp8Layer};
-use crate::v41_memory::{DeviceAllocation, HostAllocation};
+use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
+use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::dsv4::{Dsv4Programs, Dsv4Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::fp8_experts::Fp8ExpertTensors;
 use cuteafd_loader::qwen4_exp::{NgramHistory, Qwen4Attention, Qwen4Config};
-use crate::spark_intake::SparkLink;
+use crate::shared::spark_intake::SparkLink;
 use cuteafd_transport::v41_expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
 use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
@@ -103,7 +103,7 @@ pub(crate) struct LocalExl3<'a> {
     pub library: &'a NativeLibrary,
     pub native_lib: std::path::PathBuf,
     pub catalog: &'a cuteafd_loader::OfficialV41Catalog,
-    pub resident: RefCell<Option<(std::ops::Range<usize>, crate::dsv4::local::LocalExperts<'a>)>>,
+    pub resident: RefCell<Option<(std::ops::Range<usize>, crate::families::deepseek_v4::local::LocalExperts<'a>)>>,
     pub window: usize,
     pub layers: usize,
     /// The MTP layer's experts (draft stage 0) stay resident with every window;
@@ -126,7 +126,7 @@ impl LocalExl3<'_> {
         *self.resident.borrow_mut() = None;
         let range = layer..(layer + self.window).min(self.layers);
         let started = std::time::Instant::now();
-        let local = crate::dsv4::local::LocalExperts::load_range(self.library, &self.native_lib, self.catalog,
+        let local = crate::families::deepseek_v4::local::LocalExperts::load_range(self.library, &self.native_lib, self.catalog,
             usize::from(self.mtp), range.clone(), self.max_rows, self.budget, stream)?
             .context("no coordinator EXL3 package for this checkpoint (build qwen4:exl3-k45)")?;
         let range = layer..layer + local.layers();
@@ -374,7 +374,7 @@ pub(crate) struct Qwen4Engine<'a> {
     /// waits on it while the shared expert runs behind it.
     routes_ready: *mut c_void,
     /// L2 prefetch of the next layer's weights during decode exchanges.
-    pub l2: Option<crate::l2_prefetch::L2Prefetch>,
+    pub l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -479,7 +479,7 @@ impl<'a> Qwen4Engine<'a> {
     /// experts, in read order: the next layer's attention site, attention
     /// (the E4M3 copies where the decode programs read them), MLP site,
     /// router and shared expert; after the last layer the mixer and LM head.
-    pub fn decode_read_order(&self) -> Vec<Vec<crate::l2_prefetch::Range>> {
+    pub fn decode_read_order(&self) -> Vec<Vec<crate::shared::l2_prefetch::Range>> {
         let layers = &self.weights.layers;
         (0..layers.len()).map(|i| match layers.get(i + 1) {
             Some(next) => {
@@ -490,7 +490,7 @@ impl<'a> Qwen4Engine<'a> {
                 let names: Vec<&str> = ["attn.norm", "attn.w_di", "attn.w_up"].iter().chain(attention)
                     .chain(&["mlp.norm", "mlp.w_di", "mlp.w_up", "gate", "shared.w_gate_up", "shared.w_down"])
                     .copied().collect();
-                crate::l2_prefetch::operands(&names, |n| next.range(n))
+                crate::shared::l2_prefetch::operands(&names, |n| next.range(n))
             }
             None => self.weights.mixer.iter().chain([&self.weights.head])
                 .map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes)).collect(),
@@ -504,14 +504,14 @@ impl<'a> Qwen4Engine<'a> {
         if !decode {
             return Ok(());
         }
-        let mark = if local { crate::l2_prefetch::exchange_mark(self.library, self.stream)? } else { None };
+        let mark = if local { crate::shared::l2_prefetch::exchange_mark(self.library, self.stream)? } else { None };
         if local && mark.is_none() {
             return Ok(());
         }
         if let Some(l2) = &self.l2 {
             l2.issue(self.library, index, self.stream)?;
         }
-        crate::l2_prefetch::exchange_wait(self.library, mark)
+        crate::shared::l2_prefetch::exchange_wait(self.library, mark)
     }
 
     /// Before a sequence's first step: zeroes its state slot and maps its pool pages.
@@ -1443,9 +1443,9 @@ impl<'a> Qwen4Engine<'a> {
                 let mut resident = local.resident.borrow_mut();
                 let (_, experts) = resident.as_mut().context("EXL3 window")?;
                 let layer = if index == self.cfg.layers {
-                    crate::dsv4::local::LocalLayer::Stage(0)
+                    crate::families::deepseek_v4::local::LocalLayer::Stage(0)
                 } else {
-                    crate::dsv4::local::LocalLayer::Backbone(index)
+                    crate::families::deepseek_v4::local::LocalLayer::Backbone(index)
                 };
                 // SAFETY: wire rows, routes and the shared-expert rows are complete in
                 // stream order; the output is copied before the window can change.

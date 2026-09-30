@@ -1,7 +1,7 @@
 use super::speculative::DraftChain;
 use super::*;
-use crate::v41_backbone_cache::{BackbonePrefix, CacheLease};
-use crate::v41_requests::RequestPrefix;
+use crate::families::deepseek_v41::v41_backbone_cache::{BackbonePrefix, CacheLease};
+use crate::families::deepseek_v41::v41_requests::RequestPrefix;
 use speculative::DraftPrefix;
 mod images;
 pub(super) use images::ImageKeys;
@@ -141,7 +141,7 @@ impl<'a> PrefixCache<'a> {
         };
         let tokens = host.snapshot_tokens(hit.key).context("host snapshot has no tokens")?;
         if let Err(error) = self.make_room(requests, &[(lease, tokens.len() as u32)]) {
-            if error.downcast_ref::<crate::v41_compressor::SourcePoolExhausted>().is_none() {
+            if error.downcast_ref::<crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted>().is_none() {
                 return Err(error);
             }
             // Nothing left to evict and the pool still cannot hold the snapshot: the prefill
@@ -298,7 +298,7 @@ impl<'a> PrefixCache<'a> {
             match requests.cache().check_append_capacity(work) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    if error.downcast_ref::<crate::v41_compressor::SourcePoolExhausted>().is_none() {
+                    if error.downcast_ref::<crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted>().is_none() {
                         return Err(error);
                     }
                     match self.retained.evict_oldest() {

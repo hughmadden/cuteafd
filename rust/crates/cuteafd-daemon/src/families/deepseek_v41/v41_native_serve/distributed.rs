@@ -1,13 +1,13 @@
 //! Production owners for the 20/20 attention split and bottom-up TP2 experts.
 use super::*;
-use crate::v41_backbone_cache::CachePlacement;
-use crate::v41_backbone_execution::DistributedExecution;
-use crate::v41_backbone_shared::tp2::Weights as SharedWeights;
-use crate::v41_engram::placement::{PlacedEngram, PlacedEngramWeights};
-use crate::v41_experts::{tp2::RankWeights, tp2_ffn, ExpertLayer, ExpertWeights};
-use crate::v41_memory::device::Device;
-use crate::v41_target_head::distributed_target::DistributedTargetHead;
-use crate::v41_target_pass::{DistributedTargetPass, TargetTapWave};
+use crate::families::deepseek_v41::v41_backbone_cache::CachePlacement;
+use crate::families::deepseek_v41::v41_backbone_execution::DistributedExecution;
+use crate::families::deepseek_v41::v41_backbone_shared::tp2::Weights as SharedWeights;
+use crate::families::deepseek_v41::v41_engram::placement::{PlacedEngram, PlacedEngramWeights};
+use crate::families::deepseek_v41::v41_experts::{tp2::RankWeights, tp2_ffn, ExpertLayer, ExpertWeights};
+use crate::shared::memory::device::Device;
+use crate::families::deepseek_v41::v41_target_head::distributed_target::DistributedTargetHead;
+use crate::families::deepseek_v41::v41_target_pass::{DistributedTargetPass, TargetTapWave};
 use std::rc::Rc;
 
 pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::Receiver<NativeRequest>,
@@ -46,7 +46,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     };
     memory_checkpoint("CUDA contexts and peer access")?;
     let catalog = cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID, &args.snapshot)?;
-    let topology = crate::v41_spark_topology::resolve(
+    let topology = crate::families::deepseek_v41::v41_spark_topology::resolve(
         args.spark_tp,
         args.spark_ep,
         args.peers.len(),
@@ -54,26 +54,26 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     )?;
     // Reject an explicit non-native checkpoint before any expert allocation,
     // KV reservation or readiness publication.
-    crate::v41_spark_topology::require_native(topology, &catalog)?;
+    crate::families::deepseek_v41::v41_spark_topology::require_native(topology, &catalog)?;
     if let Some(topology) = topology {
         // Fail before weights are loaded when the library cannot reduce this
         // physical-rank count.
         lib.v41_compact_reducer()?
             .require_rank_count(topology.world_size() as u32)?;
     }
-    let paired_profile = crate::v41_experts::paired::PairedProfile::for_serving(&catalog, args.exl3_paired_tp4)?;
+    let paired_profile = crate::families::deepseek_v41::v41_experts::paired::PairedProfile::for_serving(&catalog, args.exl3_paired_tp4)?;
     let map = CachePlacement::encoder_decoder();
     let started = Instant::now();
     // Sum resident storage plus the largest transient loading excess.
-    let format = crate::v41_experts::ExpertFormat::of(&catalog);
+    let format = crate::families::deepseek_v41::v41_experts::ExpertFormat::of(&catalog);
     let compressed = format.is_exl3();
     let exl3_tiers: &[usize] = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
-    let exl3_directory = crate::v41_experts::exl3::aot_layout_directory(&args.native_lib, exl3_tiers, "rtx-tp2");
+    let exl3_directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(&args.native_lib, exl3_tiers, "rtx-tp2");
     if compressed {
-        let per_lane = crate::v41_experts::tp2::ExpertWave::exl3_device_bytes(&exl3_directory, capacity)?;
+        let per_lane = crate::families::deepseek_v41::v41_experts::tp2::ExpertWave::exl3_device_bytes(&exl3_directory, capacity)?;
         tracing::info!(per_gpu_per_lane_bytes=per_lane, capacity, "EXL3 TP2 expert workspace plan");
     } else if format.is_nvfp4() {
-        let per_lane = crate::v41_experts::tp2::ExpertWave::nvfp4_device_bytes(&lib, capacity)?;
+        let per_lane = crate::families::deepseek_v41::v41_experts::tp2::ExpertWave::nvfp4_device_bytes(&lib, capacity)?;
         tracing::info!(per_gpu_per_lane_bytes=per_lane, capacity, "NVFP4 W4A4 TP2 expert workspace plan");
     }
     let rank_prefix_peaks = [0usize, 1].map(|rank| -> Result<Vec<usize>> {
@@ -81,14 +81,14 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         (0..40).map(|layer| {
             let selection = ExpertLayer::BackboneTp2 { layer, rank };
             let budget = match format {
-                crate::v41_experts::ExpertFormat::Exl3 => {
-                    crate::v41_experts::exl3::Exl3Weights::plan(&catalog, selection)?
+                crate::families::deepseek_v41::v41_experts::ExpertFormat::Exl3 => {
+                    crate::families::deepseek_v41::v41_experts::exl3::Exl3Weights::plan(&catalog, selection)?
                 }
                 // NVFP4 uses the same ExpertWeights plan (format-aware layout).
-                crate::v41_experts::ExpertFormat::Nvfp4 => {
+                crate::families::deepseek_v41::v41_experts::ExpertFormat::Nvfp4 => {
                     ExpertWeights::plan(&lib, &catalog, selection)?
                 }
-                crate::v41_experts::ExpertFormat::Native => {
+                crate::families::deepseek_v41::v41_experts::ExpertFormat::Native => {
                     ExpertWeights::plan(&lib, &catalog, selection)?
                 }
             };
@@ -108,14 +108,14 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         args.tp2_output_projection,
     )?;
     let query_shards=if args.tp2_query_projection {
-        use crate::v41_projection_tp2::{Kind,Weights};
+        use crate::families::deepseek_v41::v41_projection_tp2::{Kind,Weights};
         Some([0usize,1].map(|rank| (0..40).map(|layer|
             Weights::load(devices[rank],&catalog,layer,Kind::QueryB,rank,
                 Weights::load_peak_device_bytes(Kind::QueryB))).collect::<Result<Vec<_>>>())
             .into_iter().collect::<Result<Vec<_>>>()?)
     } else { None };
     let output_shards=if args.tp2_output_projection {
-        use crate::v41_projection_tp2::{Kind,Weights};
+        use crate::families::deepseek_v41::v41_projection_tp2::{Kind,Weights};
         Some([0usize,1].map(|rank| (0..40).map(|layer|
             Weights::load(devices[rank],&catalog,layer,Kind::OutputB,rank,
                 Weights::load_peak_device_bytes(Kind::OutputB))).collect::<Result<Vec<_>>>())
@@ -158,8 +158,8 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     })?;
     memory_checkpoint("embedding weights")?;
     let vocab = [
-        devices[0].own(|| crate::v41_tensors::VocabularyShard::load(&lib, &catalog, 0..64640, 1 << 30, 16 << 20))?,
-        devices[1].own(|| crate::v41_tensors::VocabularyShard::load(&lib, &catalog, 64640..129280, 1 << 30, 16 << 20))?,
+        devices[0].own(|| crate::families::deepseek_v41::v41_tensors::VocabularyShard::load(&lib, &catalog, 0..64640, 1 << 30, 16 << 20))?,
+        devices[1].own(|| crate::families::deepseek_v41::v41_tensors::VocabularyShard::load(&lib, &catalog, 64640..129280, 1 << 30, 16 << 20))?,
     ];
     memory_checkpoint("vocabulary weights")?;
     let hw = devices[1].own(|| {
@@ -192,7 +192,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         .expect("two ranks");
     memory_checkpoint("weights")?;
     tracing::info!(capacity, backbone_lane_bytes=BackboneLane::placed_workspace_bytes_with_split(&lib, capacity,args.tp2_query_projection,args.tp2_output_projection)?,
-        producer_bytes=?crate::v41_backbone_execution::PlacedProducerWaves::device_bytes(&lib, map, capacity)?,
+        producer_bytes=?crate::families::deepseek_v41::v41_backbone_execution::PlacedProducerWaves::device_bytes(&lib, map, capacity)?,
         "dual RTX per-lane workspace plan");
     let make_pass = |decoder_capacity: u32| -> Result<DistributedTargetPass<'_, '_>> {
         let mut lanes = [
@@ -210,7 +210,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
             )?,
         ];
         if let Some(shards)=&query_shards {
-            use crate::v41_projection_tp2::{Kind,Wave};
+            use crate::families::deepseek_v41::v41_projection_tp2::{Kind,Wave};
             for (owner,lane) in lanes.iter_mut().enumerate() {
                 let budgets=Wave::device_bytes(&lib,Kind::QueryB,capacity,owner)?;
                 lane.enable_tp2_query([&shards[0],&shards[1]],budgets)?;
@@ -218,7 +218,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
             }
         }
         if let Some(shards)=&output_shards {
-            use crate::v41_projection_tp2::{Kind,Wave};
+            use crate::families::deepseek_v41::v41_projection_tp2::{Kind,Wave};
             for (owner,lane) in lanes.iter_mut().enumerate() {
                 let budgets=Wave::device_bytes(&lib,Kind::OutputB,capacity,owner)?;
                 lane.enable_tp2_output([&shards[0],&shards[1]],budgets)?;
@@ -258,7 +258,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
             DistributedExecution::new(
                 &producers,
                 capacity,
-                crate::v41_backbone_execution::PlacedProducerWaves::device_bytes(
+                crate::families::deepseek_v41::v41_backbone_execution::PlacedProducerWaves::device_bytes(
                     &lib, map, capacity,
                 )?,
             )?,
@@ -288,11 +288,11 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         Some(if args.tp2_dspark_experts {
             let budgets=[devices[0].run(||Ok(lib.cuda_memory_info()?.0.min(32usize<<30)))?,
                 devices[1].run(||Ok(lib.cuda_memory_info()?.0.min(32usize<<30)))?];
-            devices[1].own(||crate::v41_experts::dspark::DsparkWeights::load_serving_tp2(&lib,&catalog,
+            devices[1].own(||crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_tp2(&lib,&catalog,
                 capacity,args.concurrency,budgets,16<<20,width))?
-        } else {devices[1].own(|| crate::v41_experts::dspark::DsparkWeights::load_serving_with_width(&lib, &catalog,
+        } else {devices[1].own(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_with_width(&lib, &catalog,
             capacity, args.concurrency, 32 << 30, 16 << 20, width,
-            Some(&crate::v41_experts::exl3::aot_layout_directory(&args.native_lib, exl3_tiers, "dspark"))))?})
+            Some(&crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(&args.native_lib, exl3_tiers, "dspark"))))?})
     } else { None };
     memory_checkpoint("draft weights")?;
     let mut draft = draft_weights.as_ref().map(|weights| DraftRuntime::with_distributed_requests(
@@ -303,26 +303,26 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     }
     memory_checkpoint("draft runtime")?;
     // Vision and target snapshot copies use GPU0. These allocations precede KV sizing.
-    let mut vision = crate::v41_vision::VisionRuntime::new(&lib, &catalog, 9216,
-        crate::v41_vision::VisionRuntime::device_bytes(&catalog, 9216)?)?;
+    let mut vision = crate::families::deepseek_v41::v41_vision::VisionRuntime::new(&lib, &catalog, 9216,
+        crate::families::deepseek_v41::v41_vision::VisionRuntime::device_bytes(&catalog, 9216)?)?;
     memory_checkpoint("vision")?;
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
     let snapshot_slots = if args.prefix_cache_entries == 0 { 0 } else { 2 * args.prefix_cache_entries as usize + 2 };
-    let target_prefix_pool = (snapshot_slots > 0).then(|| crate::v41_memory::SnapshotPool::new(
-        &lib, crate::v41_backbone_cache::BackbonePrefix::device_bytes(), snapshot_slots)).transpose()?;
+    let target_prefix_pool = (snapshot_slots > 0).then(|| crate::shared::memory::SnapshotPool::new(
+        &lib, crate::families::deepseek_v41::v41_backbone_cache::BackbonePrefix::device_bytes(), snapshot_slots)).transpose()?;
     let draft_snapshot_bytes = draft.as_mut().map(|d| d.reserve_prefixes(snapshot_slots)).transpose()?.unwrap_or(0);
-    let snapshot_bytes = target_prefix_pool.as_ref().map_or(0, crate::v41_memory::SnapshotPool::device_bytes) + draft_snapshot_bytes;
+    let snapshot_bytes = target_prefix_pool.as_ref().map_or(0, crate::shared::memory::SnapshotPool::device_bytes) + draft_snapshot_bytes;
     memory_checkpoint("snapshot arenas")?;
     // Every other persistent owner is now live. Reserve both transport lanes,
     // minimum routed weights, KV and setup headroom before filling extra layers.
     let per_lane = match format {
-        crate::v41_experts::ExpertFormat::Exl3 => {
+        crate::families::deepseek_v41::v41_experts::ExpertFormat::Exl3 => {
             tp2_ffn::Wave::exl3_device_bytes(&exl3_directory, &lib, capacity)?
         }
-        crate::v41_experts::ExpertFormat::Nvfp4 => {
+        crate::families::deepseek_v41::v41_experts::ExpertFormat::Nvfp4 => {
             tp2_ffn::Wave::nvfp4_device_bytes(&lib, capacity)?
         }
-        crate::v41_experts::ExpertFormat::Native => tp2_ffn::Wave::device_bytes(&lib, capacity)?,
+        crate::families::deepseek_v41::v41_experts::ExpertFormat::Native => tp2_ffn::Wave::device_bytes(&lib, capacity)?,
     };
     // Both Spark transport lanes live on GPU1 and reserve one wave each; a
     // six-rank replicated layout needs its own larger per-wave buffer count.
@@ -353,16 +353,16 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         super::placement::StartupPlacement::publish(directory, args.rtx_gpus, expert_layers)).transpose()?;
     eprintln!("loading bottom {expert_layers} expert layers as TP2");
     let routed = match format {
-        crate::v41_experts::ExpertFormat::Exl3 => {
+        crate::families::deepseek_v41::v41_experts::ExpertFormat::Exl3 => {
             RankWeights::load_exl3_pair(devices, &catalog, expert_layers, rank_budgets, &exl3_directory)?
                 .map(Rc::new)
         }
         // The format-aware ExpertWeights loader covers NVFP4 as well.
-        crate::v41_experts::ExpertFormat::Nvfp4 => [
+        crate::families::deepseek_v41::v41_experts::ExpertFormat::Nvfp4 => [
             Rc::new(RankWeights::load(devices[0], &catalog, expert_layers, rank_budgets[0])?),
             Rc::new(RankWeights::load(devices[1], &catalog, expert_layers, rank_budgets[1])?),
         ],
-        crate::v41_experts::ExpertFormat::Native => [
+        crate::families::deepseek_v41::v41_experts::ExpertFormat::Native => [
             Rc::new(RankWeights::load(devices[0], &catalog, expert_layers, rank_budgets[0])?),
             Rc::new(RankWeights::load(devices[1], &catalog, expert_layers, rank_budgets[1])?),
         ],
@@ -371,7 +371,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         handoff.wait_ready(Duration::from_secs(900))?;
     }
     let make_transport = || {
-        let timing = crate::v41_native_serve::protocol_v2_timing();
+        let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
         let mut transport = devices[1].own(|| {
             let roce = super::spark_transport(&args.peers, capacity, timing, topology)?;
             NativeTp4Wave::new(&lib, roce, wave_bytes)

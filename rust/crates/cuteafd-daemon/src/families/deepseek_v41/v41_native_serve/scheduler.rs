@@ -1,26 +1,26 @@
 use super::speculative::DraftChain;
 use super::*;
-use crate::v41_target_pass::VerificationTarget;
-use crate::v41_target_head::TargetSamplingRowRequest;
+use crate::families::deepseek_v41::v41_target_pass::VerificationTarget;
+use crate::families::deepseek_v41::v41_target_head::TargetSamplingRowRequest;
 mod independent;
 mod admission;
 mod layout;
 use layout::ServingTarget;
 use super::scores::{BatchScores, VOCAB};
-use crate::v41_backbone_cache::CacheLease;
-use crate::v41_requests::RequestBatch;
+use crate::families::deepseek_v41::v41_backbone_cache::CacheLease;
+use crate::families::deepseek_v41::v41_requests::RequestBatch;
 use super::prefix::{ImageKeys, PrefixCache, SnapshotKind};
 use super::console;
 
 #[cfg(test)]
 pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary,
     runtime: &tokio::runtime::Runtime, snapshot: &std::path::Path,
-    first: &mut crate::v41_target_pass::DistributedTargetPass<'t, 'a>,
-    second: &mut crate::v41_target_pass::DistributedTargetPass<'t, 'a>,
+    first: &mut crate::families::deepseek_v41::v41_target_pass::DistributedTargetPass<'t, 'a>,
+    second: &mut crate::families::deepseek_v41::v41_target_pass::DistributedTargetPass<'t, 'a>,
     requests: &mut Requests<'a>,
-    transports: [&mut crate::v41_memory::device::DeviceOwner<'a, NativeTp4Wave<'a>>; 2],
+    transports: [&mut crate::shared::memory::device::DeviceOwner<'a, NativeTp4Wave<'a>>; 2],
     lease: CacheLease, id: u64, tokens: &[u32], anchor: u32,
-    draft: &mut DraftRuntime<'d, 'a, crate::v41_experts::dspark::DistributedDsparkChain<'d, 'a>>,
+    draft: &mut DraftRuntime<'d, 'a, crate::families::deepseek_v41::v41_experts::dspark::DistributedDsparkChain<'d, 'a>>,
 ) -> Result<()> {
     let (events, mut output) = mpsc::channel(64);
     let (_submit, receive) = mpsc::channel(1);
@@ -35,7 +35,7 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
     ensure!(!request.finished, "fixture requires a nonterminal continuation anchor");
     let mut active = [Some(request), None];
     let [first_transport, second_transport] = transports;
-    type Pass<'w, 'a> = crate::v41_target_pass::DistributedTargetPass<'w, 'a>;
+    type Pass<'w, 'a> = crate::families::deepseek_v41::v41_target_pass::DistributedTargetPass<'w, 'a>;
     Pass::begin_request(first_transport)?;
     Pass::begin_request(second_transport)?;
     Pass::decode_round(lib, runtime, first, second, requests, first_transport, second_transport,
@@ -60,7 +60,7 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
 }
 
 pub(super) struct Active<'a> {
-    constraint: Option<super::constraints::State<'a>>,
+    constraint: Option<crate::shared::constraints::State<'a>>,
     id: u64,
     lease: CacheLease,
     job: NativeRequest,
@@ -202,12 +202,12 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     first: &mut P, second: &mut P,
     requests: &mut Requests<'a>, first_transport: &mut P::Transport,
     second_transport: &mut P::Transport, mut draft: Option<&mut DraftRuntime<'w, 'a, P::Chain>>,
-    vision: &mut crate::v41_vision::VisionRuntime<'a>,
+    vision: &mut crate::families::deepseek_v41::v41_vision::VisionRuntime<'a>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
     mut prefixes: PrefixCache<'a>,
 ) -> Result<()> {
     let mut active: Vec<Option<Active<'a>>> = (0..args.concurrency).map(|_| None).collect();
-    let mut compiler = super::constraints::Compiler::new(lib, args.snapshot.join("tokenizer.json"));
+    let mut compiler = crate::shared::constraints::Compiler::new(lib, args.snapshot.join("tokenizer.json"));
     let mut id = 0u64;
     let mut closed = false;
     let mut pending: Option<admission::Pending> = None;
@@ -281,7 +281,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 if let Some(draft) = draft.as_deref_mut() { draft.admit(id)?; }
                 let image_keys = prefixes.prepare_key(prompt, images)?;
                 if !images.is_empty() {
-                    requests.attach_images(lease, crate::v41_requests::RequestImages::new(images)?)?;
+                    requests.attach_images(lease, crate::families::deepseek_v41::v41_requests::RequestImages::new(images)?)?;
                 }
                 let restore_started = Instant::now();
                 let hit = prefixes.restore(prompt, &image_keys, id, lease, requests, draft.as_deref_mut())?;
@@ -303,7 +303,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 Err(error) => {
                     requests.release_if_present(lease)?;
                     if let Some(draft) = draft.as_deref_mut() { draft.release(id)?; }
-                    if error.downcast_ref::<crate::v41_compressor::SourcePoolExhausted>().is_some() {
+                    if error.downcast_ref::<crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted>().is_some() {
                         if active_count > 0 {
                             tracing::debug!(request_id=id, active_count, "waiting for request KV token budget");
                             pending = Some(admission::Pending { prepared, active_when_blocked: active_count });
@@ -332,7 +332,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     // Deliberately unheld (packet HC-9): this is per-image pre-prefill
                     // preparation, not a batch-tokens chunk, so the store-pace pacing hold
                     // does not apply here; the hold covers prefill chunk dispatch only.
-                    let start = if requests.cache().stage(lease)? == crate::v41_backbone_cache::CacheStage::EncoderReplay {
+                    let start = if requests.cache().stage(lease)? == crate::families::deepseek_v41::v41_backbone_cache::CacheStage::EncoderReplay {
                         requests.cache().history_end(lease)? as usize
                     } else { source_end };
                     let needed = requests.images(lease)?.needed(start, prompt.len())?;
@@ -418,7 +418,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         }).collect();
         let room = prefixes.make_room(requests, &capacity);
         if let Err(error) = &room {
-            if let Some(pressure) = error.downcast_ref::<crate::v41_compressor::SourcePoolExhausted>() {
+            if let Some(pressure) = error.downcast_ref::<crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted>() {
                 let slot = *members.iter().flatten().nth(pressure.work_index)
                     .context("pool pressure references an invalid append participant")?;
                 let request = active[slot].as_mut().unwrap();
@@ -656,7 +656,7 @@ fn sampling_route(params: cuteafd_core::TargetSamplingParams) -> SamplingRoute {
     // plan builds both from the same `min_p` with `target_sampling_row`, so
     // there is no separate check to make here.
     if top_k > 0 {
-        if top_k > crate::v41_target_head::CUTEAFD_V41_SAMPLING_MAX_RETAINED {
+        if top_k > crate::families::deepseek_v41::v41_target_head::CUTEAFD_V41_SAMPLING_MAX_RETAINED {
             return SamplingRoute::CpuFallback;
         }
         return SamplingRoute::DeviceOrdered;
@@ -1118,7 +1118,7 @@ async fn execute_shared_sampled_rows<'a, P: VerificationTarget<'a> + ?Sized>(
 /// device-neutral greedy row by construction, so its status says nothing about
 /// the request.
 pub(crate) fn admit_device_rows(round: &SamplingRound,
-    sampled: &crate::v41_target_head::SampledTargetRows,
+    sampled: &crate::families::deepseek_v41::v41_target_head::SampledTargetRows,
 ) -> Result<(Vec<usize>, Vec<usize>)> {
     let mut admitted = Vec::new();
     let mut refused = Vec::new();
@@ -1647,7 +1647,7 @@ fn prepare_commit_lane<'a, C: DraftChain<'a>>(lane: usize,
                 if finishing && !next.has_full_logits() && !next.has_row_logits(frontier) {
                     // The pre-chunk-4b code downloaded this row here; count the
                     // transfer the gate removed.
-                    sampling_stats::record_frontier_gated(1, crate::v41_native_serve::scores::ROW_BYTES);
+                    sampling_stats::record_frontier_gated(1, crate::families::deepseek_v41::v41_native_serve::scores::ROW_BYTES);
                 }
                 next_after_commit.push(None);
             }
@@ -1716,7 +1716,7 @@ fn masked_members(round: Option<&SamplingRound>, active: &[Option<Active<'_>>], 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn console_round(tally: console::Tally, lane: usize, shared: bool, started: Instant,
     draft_us: u64, prepare_us: u64, verify_us: u64, layer_us: &[Option<f64>],
-    ffn: crate::v41_backbone_lane::FfnSplit, active: &[Option<Active<'_>>], members: &[usize],
+    ffn: crate::families::deepseek_v41::v41_backbone_lane::FfnSplit, active: &[Option<Active<'_>>], members: &[usize],
     inputs: &[Vec<u32>], round: Option<&SamplingRound>) -> console::Event {
     let masked = masked_members(round, active, members, inputs);
     tally.round(lane, shared, started, draft_us, prepare_us, verify_us, layer_us, ffn,
@@ -1798,7 +1798,7 @@ fn commit_lane<'w, 'a>(lib: &'a NativeLibrary, lane: usize,
     // `retain_from_device`, which short-circuits on packed bytes, so no transfer
     // is saved here -- only the independent lane's `download_logits` paid one.
     sampling_stats::record_frontier_packed(packed.len(),
-        crate::v41_native_serve::scores::ROW_BYTES, false);
+        crate::families::deepseek_v41::v41_native_serve::scores::ROW_BYTES, false);
     for (member, row, mask, retain) in packed {
         decision.next_after_commit[member] =
             Some(retain_packed_frontier(next, row, retain, mask.as_deref())?);
@@ -1826,7 +1826,7 @@ fn commit_lane<'w, 'a>(lib: &'a NativeLibrary, lane: usize,
 #[cfg(test)]
 mod sampling_tests {
     use super::*;
-    use crate::v41_native_serve::scores::{ROW_BYTES, VOCAB};
+    use crate::families::deepseek_v41::v41_native_serve::scores::{ROW_BYTES, VOCAB};
 
     /// Position-sensitive logits so different absolute indices and rows differ.
     fn rows(count: usize) -> Vec<u8> {
@@ -1885,7 +1885,7 @@ mod sampling_tests {
             bytes: 0,
             ..Default::default()
         };
-        let sampled = crate::v41_target_head::SampledTargetRows {
+        let sampled = crate::families::deepseek_v41::v41_target_head::SampledTargetRows {
             ids: ids.clone(),
             scores,
             status: vec![0u32; 6],
@@ -1972,7 +1972,7 @@ mod sampling_tests {
                 continue;
             }
             let top_k = params.top_k().map_or(0, |k| k as u32);
-            assert!(top_k <= crate::v41_target_head::CUTEAFD_V41_SAMPLING_MAX_RETAINED,
+            assert!(top_k <= crate::families::deepseek_v41::v41_target_head::CUTEAFD_V41_SAMPLING_MAX_RETAINED,
                 "{name} must not exceed K5's retained table");
             assert!(params.temperature().is_finite() && params.temperature() <= 2.0, "{name}");
             assert!(params.top_p().is_finite() && params.top_p() > 0.0 && params.top_p() <= 1.0,
@@ -2243,15 +2243,15 @@ mod sampling_tests {
     fn layouts_without_the_sampled_terminal_keep_the_cpu_path() {
         // Chunk 1's two layouts, as a property of the type.
         assert!(
-            <crate::v41_target_pass::TargetPass<'static, 'static> as
-                crate::v41_target_pass::VerificationTarget<'static>>::SUPPORTS_SAMPLED_TERMINAL,
+            <crate::families::deepseek_v41::v41_target_pass::TargetPass<'static, 'static> as
+                crate::families::deepseek_v41::v41_target_pass::VerificationTarget<'static>>::SUPPORTS_SAMPLED_TERMINAL,
             "TargetPass implements the sampled terminal"
         );
         // v14: the distributed layout assembles both vocabulary halves on the
         // head GPU and runs the same sampler.
         assert!(
-            <crate::v41_target_pass::DistributedTargetPass<'static, 'static> as
-                crate::v41_target_pass::VerificationTarget<'static>>::SUPPORTS_SAMPLED_TERMINAL,
+            <crate::families::deepseek_v41::v41_target_pass::DistributedTargetPass<'static, 'static> as
+                crate::families::deepseek_v41::v41_target_pass::VerificationTarget<'static>>::SUPPORTS_SAMPLED_TERMINAL,
             "the distributed layout implements the sampled terminal"
         );
         // The gate is capability AND "some row is device-servable". A

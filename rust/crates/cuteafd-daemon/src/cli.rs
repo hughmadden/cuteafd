@@ -21,26 +21,26 @@ pub(crate) enum Commands {
     /// Check live Spark expert ranks for one layer against a CPU oracle.
     ExpertProbe(ExpertProbeArgs),
     /// Prefill a DeepSeek V4 golden prompt and compare layers and logits.
-    Dsv4Golden(crate::dsv4::GoldenArgs),
+    Dsv4Golden(crate::families::deepseek_v4::GoldenArgs),
     /// Run GLM 5.x layers through the exported programs and compare with golden.py outputs.
-    GlmGolden(crate::glm::GoldenArgs),
+    GlmGolden(crate::families::glm5::GoldenArgs),
     /// Compare the MiMo V2 coordinator programs layer by layer with python/reference/families/mimo_v2/mimo_v2/golden.py outputs.
-    MimoGolden(crate::mimo::GoldenArgs),
+    MimoGolden(crate::families::mimo_v2::GoldenArgs),
     /// Serve MiMo V2 Flash (mimo_v2) through the OpenAI API with Spark FP8 experts.
-    ServeMimo(crate::mimo::serve::ServeArgs),
+    ServeMimo(crate::families::mimo_v2::serve::ServeArgs),
     /// Compare the GLM 5.3 Flash coordinator programs layer by layer with python/reference/families/glm5_flash/golden.py outputs.
-    GlmfGolden(crate::glmf::GoldenArgs),
+    GlmfGolden(crate::families::glm5_flash::GoldenArgs),
     /// Compare the Qwen 3.8 Flash Next (qwen4_exp) engine layer by layer with
     /// python/reference/families/qwen4/golden.py outputs.
-    Qwen4Golden(crate::qwen4::GoldenArgs),
+    Qwen4Golden(crate::families::qwen4::GoldenArgs),
     /// Serve Qwen 3.8 Flash Next (qwen4_exp) through the OpenAI API on the qwen4 engine.
-    ServeQwen4(crate::qwen4::serve::ServeArgs),
+    ServeQwen4(crate::families::qwen4::serve::ServeArgs),
     /// Serve GLM 5.3 Flash (glm5_next) through the OpenAI API on the glmf engine.
-    ServeGlmf(crate::glmf::serve::ServeArgs),
+    ServeGlmf(crate::families::glm5_flash::serve::ServeArgs),
     /// Serve a GLM 5.x checkpoint (OpenAI-compatible API) over the glm_* programs and Spark experts.
-    ServeGlm(crate::glm::serve::ServeArgs),
+    ServeGlm(crate::families::glm5::serve::ServeArgs),
     /// Serve a DeepSeek V4 checkpoint (OpenAI API) with Spark experts.
-    ServeDsv4(crate::dsv4::serve::ServeArgs),
+    ServeDsv4(crate::families::deepseek_v4::serve::ServeArgs),
     /// Serve official V4.1 native TP4 experts over RoCE.
     ExpertdNative(NativeExpertDaemonArgs),
     /// Serve the official V4.1 target text path.
@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn native_host_cache_accepts_auto_and_legacy_byte_counts() {
         use clap::Parser;
-        use crate::v41_native_serve::memory::HostBudget;
+        use crate::families::deepseek_v41::v41_native_serve::memory::HostBudget;
         let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so",
             "--peers", "127.0.0.1:19441"];
         for (value, bytes) in [("auto", None), ("0", Some(0)), ("1GiB", Some(1<<30)),
@@ -484,15 +484,15 @@ pub(crate) struct NativeServeArgs {
 
     /// Exact global KV/index byte budget (B/MB/GB/MiB/GiB), rounded down to page groups.
     #[arg(long)]
-    pub kv_pool_size: Option<crate::v41_native_serve::memory::ByteSize>,
+    pub kv_pool_size: Option<crate::families::deepseek_v41::v41_native_serve::memory::ByteSize>,
 
     /// Total device occupancy ceiling (% or B/MB/GB/MiB/GiB); sizes KV after fixed allocations.
     #[arg(long)]
-    pub memory_reservation: Option<crate::v41_native_serve::memory::Reservation>,
+    pub memory_reservation: Option<crate::families::deepseek_v41::v41_native_serve::memory::Reservation>,
 
     /// Complete bottom-up RTX routed layers: auto fills available memory, or 0..40.
     #[arg(long, default_value = "auto")]
-    pub rtx_expert_layers: crate::v41_native_serve::memory::LocalLayers,
+    pub rtx_expert_layers: crate::families::deepseek_v41::v41_native_serve::memory::LocalLayers,
 
     /// Use paired H128 EXL3 ownership; requires paired AOT packages on all four Spark peers.
     #[arg(long)]
@@ -516,7 +516,7 @@ pub(crate) struct NativeServeArgs {
 
     /// Pinned snapshot memory: auto sizes logical GPU+RAM capacity above retained entries * context; 0 disables it.
     #[arg(long, default_value = "0", env = "CUTEAFD_HOST_CACHE_BYTES")]
-    pub host_cache_bytes: crate::v41_native_serve::memory::HostBudget,
+    pub host_cache_bytes: crate::families::deepseek_v41::v41_native_serve::memory::HostBudget,
     /// Pinned allocation and registration granularity for the snapshot cache.
     #[arg(long, default_value_t = 256 << 20, env = "CUTEAFD_HOST_CACHE_CHUNK_BYTES")]
     pub host_cache_chunk_bytes: u64,

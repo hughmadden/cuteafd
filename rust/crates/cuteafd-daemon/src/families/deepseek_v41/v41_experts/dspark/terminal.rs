@@ -1,6 +1,6 @@
 use super::{DsparkConfidence, DsparkMarkov, DsparkWeights};
-use crate::v41_memory::{DeviceAllocation, HostAllocation, LoadStream};
-use crate::v41_tensors::VocabularyHead;
+use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::families::deepseek_v41::v41_tensors::VocabularyHead;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DsparkRng;
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41DraftStep, V41Hc, V41VocabularyProjection};

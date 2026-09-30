@@ -1,9 +1,9 @@
 //! Backbone inverse rotary, grouped FP8 wo_a and native FP8 wo_b.
-use crate::v41_attention_binding::QueryBinding;
-use crate::v41_layer_graphs::LayerGraphs;
-use crate::v41_memory::{DeviceAllocation, HostAllocation, LoadStream};
-use crate::v41_sparse_attention::SparseAttentionOutput;
-use crate::v41_tensors::NativeRtxTensors;
+use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
+use crate::families::deepseek_v41::v41_layer_graphs::LayerGraphs;
+use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::families::deepseek_v41::v41_sparse_attention::SparseAttentionOutput;
+use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{
     CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps, V41Fp8Plan,
@@ -393,7 +393,7 @@ impl AttentionOutputWave<'_, '_> {
     /// drained by the enclosing sparse-attention continuation, including errors.
     /// This method never publishes AttentionOutput or marks this wave ready.
     pub unsafe fn enqueue_attention(
-        &mut self, attention: &crate::v41_sparse_attention::QueuedSparseAttention,
+        &mut self, attention: &crate::families::deepseek_v41::v41_sparse_attention::QueuedSparseAttention,
         tokens: &[u64], stream: *mut std::ffi::c_void,
     ) -> Result<CuteafdDeviceBuffer> {
         self.ready = None;
@@ -428,7 +428,7 @@ impl AttentionOutputWave<'_, '_> {
     /// Retain attention and this wave through the containing stream's completion.
     /// None means warmup is queued and finish_prepared must follow a cooperative wait.
     pub unsafe fn enqueue_attention_prepared(&mut self,
-        attention: &crate::v41_sparse_attention::QueuedSparseAttention, tokens: &[u64],
+        attention: &crate::families::deepseek_v41::v41_sparse_attention::QueuedSparseAttention, tokens: &[u64],
         stream: *mut std::ffi::c_void) -> Result<Option<CuteafdDeviceBuffer>> {
         self.ready = None;
         self.origin = None;
@@ -479,7 +479,7 @@ impl AttentionOutputWave<'_, '_> {
     /// # Safety
     /// Matching sparse output is ordered on stream. Capture retains all weights
     /// and storage through graph destruction, and owners stay exclusive in flight.
-    pub unsafe fn enqueue_chain_graph(&mut self, attention: &crate::v41_sparse_attention::QueuedSparseAttention,
+    pub unsafe fn enqueue_chain_graph(&mut self, attention: &crate::families::deepseek_v41::v41_sparse_attention::QueuedSparseAttention,
         stream: *mut std::ffi::c_void) -> Result<CuteafdDeviceBuffer> {
         ensure!(attention.layer == self.weights.layer && attention.rows > 0
             && attention.rows <= self.capacity as usize
@@ -494,7 +494,7 @@ impl AttentionOutputWave<'_, '_> {
     /// Same capture/producer contract as enqueue_chain_graph. This queues only
     /// inverse rotary and grouped output-A; output-B must follow before FFN.
     pub unsafe fn enqueue_grouped_chain_graph(&mut self,
-        attention:&crate::v41_sparse_attention::QueuedSparseAttention,
+        attention:&crate::families::deepseek_v41::v41_sparse_attention::QueuedSparseAttention,
         stream:*mut std::ffi::c_void)->Result<CuteafdDeviceBuffer> {
         ensure!(self.kernel.is_none() && attention.layer==self.weights.layer && attention.rows>0
             && attention.rows<=self.capacity as usize && attention.values.device_id==self.b(0).device_id,
@@ -510,10 +510,10 @@ impl AttentionOutputWave<'_, '_> {
     /// Retain prefix producer, this wave and consumer storage until completion
     /// or drained cancellation. Consumer must enqueue only on the supplied stream.
     pub async unsafe fn finish_tp2_then<T>(&mut self,rows:u32,
-        projection:&mut crate::v41_projection_tp2::Wave<'_, '_>,producer:Option<*mut std::ffi::c_void>,
+        projection:&mut crate::families::deepseek_v41::v41_projection_tp2::Wave<'_, '_>,producer:Option<*mut std::ffi::c_void>,
         consume:impl FnOnce(CuteafdDeviceBuffer,*mut std::ffi::c_void)->Result<T>)->Result<T> {
         self.validate(rows)?;
-        ensure!(self.kernel.is_none() && projection.kind()==crate::v41_projection_tp2::Kind::OutputB
+        ensure!(self.kernel.is_none() && projection.kind()==crate::families::deepseek_v41::v41_projection_tp2::Kind::OutputB
             && projection.output_device().id==self.b(0).device_id
             && std::ptr::eq(projection.output_device().library,self.stream.library),"output projection owner differs");
         unsafe { projection.execute_after(self.weights.layer,rows,
@@ -570,8 +570,8 @@ impl Drop for AttentionOutputWave<'_, '_> {
 #[cfg(test)]
 mod tp2_tests {
     use super::*;
-    use crate::v41_memory::device::{Allocation,Device};
-    use crate::v41_projection_tp2::{Kind,Weights,Wave};
+    use crate::shared::memory::device::{Allocation,Device};
+    use crate::families::deepseek_v41::v41_projection_tp2::{Kind,Weights,Wave};
     #[test]
     #[ignore = "requires checkpoint, two GPUs and projection shard AOT"]
     fn checkpoint_tp2_output_preserves_grouped_rotary() -> Result<()> {
@@ -607,7 +607,7 @@ mod tp2_tests {
                 }).collect();
                 device.run(||library.copy_h2d(input.buffer,&host))?;
                 let tokens:Vec<u64>=(0..rows).map(|i|(cycle*8192+i) as u64).collect();
-                let attention=crate::v41_sparse_attention::QueuedSparseAttention {
+                let attention=crate::families::deepseek_v41::v41_sparse_attention::QueuedSparseAttention {
                     values:CuteafdDeviceBuffer {bytes:rows*ROW_BYTES[0],..input.buffer},rows,layer};
                 let stream=reference.stream.raw;
                 let expected=device.run(||unsafe {

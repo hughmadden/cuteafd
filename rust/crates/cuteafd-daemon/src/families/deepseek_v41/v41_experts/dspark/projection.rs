@@ -1,7 +1,7 @@
 //! Native dSpark main/attention FP8 matrix ownership.
 use super::DsparkWeights;
-use crate::v41_memory::{DeviceAllocation, LoadStream};
-use crate::v41_tensors::NativeRtxTensors;
+use crate::shared::memory::{DeviceAllocation, LoadStream};
+use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41Fp8Plan};
 use std::ffi::c_void;

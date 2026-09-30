@@ -1,19 +1,19 @@
 //! Reusable backbone execution storage; request caches and index selections live outside the lane.
-use crate::v41_attention_binding::QueryBinding;
-use crate::v41_attention_output::{AttentionOutputWave, AttentionOutputWeights};
-use crate::v41_attention_query::{AttentionQueryOutput, AttentionQueryWave, AttentionQueryWeights};
-use crate::v41_backbone_hc::BackboneHcWeights;
-use crate::v41_backbone_router::{BackboneRouterWave, BackboneRouterWeights, ExpertRow};
-use crate::v41_backbone_shared::{BackboneSharedWave, BackboneSharedWeights, SharedOutput};
-use crate::v41_block::{BackboneBlockWave, BlockOutput, FfnInput, PreparedBlockInput};
-use crate::v41_engram::{layer::EngramGate, EngramDeviceView};
-use crate::v41_experts::coordinator::{NativeFfnOutput, NativeTp4Wave};
-use crate::v41_index_selection::IndexSelectionOutput;
-use crate::v41_sparse_attention::{AttentionRequest, SparseAttentionWave};
-use crate::v41_target_embedding::TargetEmbedding;
+use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
+use crate::families::deepseek_v41::v41_attention_output::{AttentionOutputWave, AttentionOutputWeights};
+use crate::families::deepseek_v41::v41_attention_query::{AttentionQueryOutput, AttentionQueryWave, AttentionQueryWeights};
+use crate::families::deepseek_v41::v41_backbone_hc::BackboneHcWeights;
+use crate::families::deepseek_v41::v41_backbone_router::{BackboneRouterWave, BackboneRouterWeights, ExpertRow};
+use crate::families::deepseek_v41::v41_backbone_shared::{BackboneSharedWave, BackboneSharedWeights, SharedOutput};
+use crate::families::deepseek_v41::v41_block::{BackboneBlockWave, BlockOutput, FfnInput, PreparedBlockInput};
+use crate::families::deepseek_v41::v41_engram::{layer::EngramGate, EngramDeviceView};
+use crate::families::deepseek_v41::v41_experts::coordinator::{NativeFfnOutput, NativeTp4Wave};
+use crate::families::deepseek_v41::v41_index_selection::IndexSelectionOutput;
+use crate::families::deepseek_v41::v41_sparse_attention::{AttentionRequest, SparseAttentionWave};
+use crate::families::deepseek_v41::v41_target_embedding::TargetEmbedding;
 use anyhow::{ensure, Context, Result};
-use crate::v41_backbone_cache::CachePlacement;
-use crate::v41_memory::device::{Device, DeviceOwner};
+use crate::families::deepseek_v41::v41_backbone_cache::CachePlacement;
+use crate::shared::memory::device::{Device, DeviceOwner};
 mod placement;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::OfficialV41Catalog;
@@ -93,11 +93,11 @@ enum Phase {
 // Keep this bank before the allocations referenced by its graphs.
 struct Tp2FfnGraphs<'w,'a> {
     device: Device<'a>,
-    bank: crate::v41_layer_graphs::LayerGraphs<'w,'a,BackboneHcWeights<'a>>,
+    bank: crate::families::deepseek_v41::v41_layer_graphs::LayerGraphs<'w,'a,BackboneHcWeights<'a>>,
 }
 impl<'w,'a> Tp2FfnGraphs<'w,'a> {
     fn new(device:Device<'a>)->Self {
-        let mut bank=crate::v41_layer_graphs::LayerGraphs::new(device.library);
+        let mut bank=crate::families::deepseek_v41::v41_layer_graphs::LayerGraphs::new(device.library);
         bank.enable_small_shapes();Self {device,bank}
     }
     unsafe fn capture_ready(&mut self,block:&mut BackboneBlockWave<'w,'a>,
@@ -136,7 +136,7 @@ struct AttentionTail<'s, 'w, 'a> {
     tokens: &'s [u64],
     split_output: bool,
 }
-impl crate::v41_sparse_attention::AttentionGraphTail for AttentionTail<'_, '_, '_> {
+impl crate::families::deepseek_v41::v41_sparse_attention::AttentionGraphTail for AttentionTail<'_, '_, '_> {
     fn identity(&self) -> Vec<usize> {
         let mut identity = self.projection.chain_graph_identity().to_vec();
         identity.extend(self.block.chain_graph_identity()); identity.push(usize::from(self.split_output)); identity
@@ -144,7 +144,7 @@ impl crate::v41_sparse_attention::AttentionGraphTail for AttentionTail<'_, '_, '
     unsafe fn prepare(&mut self, stream: *mut std::ffi::c_void) -> Result<()> {
         unsafe { self.projection.prepare_chain_graph(self.tokens, stream) }
     }
-    unsafe fn enqueue(&mut self, attention: &crate::v41_sparse_attention::QueuedSparseAttention,
+    unsafe fn enqueue(&mut self, attention: &crate::families::deepseek_v41::v41_sparse_attention::QueuedSparseAttention,
         stream: *mut std::ffi::c_void) -> Result<()> {
         if self.split_output {
             unsafe { self.projection.enqueue_grouped_chain_graph(attention,stream)?; }
@@ -281,7 +281,7 @@ impl FfnSplit {
 impl LaneFfn<'_, '_, '_> {
     #[cfg(test)]
     pub async unsafe fn check_queued_components(&mut self, image_mask: &[u8],
-        mut local: Option<&mut crate::v41_experts::local::LocalExpertWave<'_>>) -> Result<()> {
+        mut local: Option<&mut crate::families::deepseek_v41::v41_experts::local::LocalExpertWave<'_>>) -> Result<()> {
         use std::{future::Future, task::Poll};
         async fn cancel_once<F: Future>(future: F) -> bool {
             let mut future = std::pin::pin!(future);
@@ -477,13 +477,13 @@ pub(crate) struct BackboneLane<'w, 'a> {
     tp2_ffn_graphs: Option<Tp2FfnGraphs<'w,'a>>,
     // Destroy containing graphs before their captured consumer allocations.
     sparse: Option<SparseAttentionWave<'a>>,
-    dual_sparse: Option<crate::v41_sparse_attention::dual::DualAttentionWave<'a>>,
+    dual_sparse: Option<crate::families::deepseek_v41::v41_sparse_attention::dual::DualAttentionWave<'a>>,
     capacity: usize,
     weights: &'w BackboneLaneWeights<'a>,
     block: BackboneBlockWave<'w, 'a>,
     query: AttentionQueryWave<'w, 'a>,
-    tp2_query: Option<crate::v41_projection_tp2::Wave<'w,'a>>,
-    tp2_output: Option<crate::v41_projection_tp2::Wave<'w,'a>>,
+    tp2_query: Option<crate::families::deepseek_v41::v41_projection_tp2::Wave<'w,'a>>,
+    tp2_output: Option<crate::families::deepseek_v41::v41_projection_tp2::Wave<'w,'a>>,
     projection: AttentionOutputWave<'w, 'a>,
     shared: Option<BackboneSharedWave<'w, 'a>>,
     router: BackboneRouterWave<'w, 'a>,
@@ -652,7 +652,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     /// # Safety
     /// Own embedding, block and query storage through the drained producer chain.
     pub async unsafe fn begin_tokens_cooperative(&mut self,
-        embedding: &mut crate::v41_target_embedding::TargetEmbeddingWave<'_, '_>,
+        embedding: &mut crate::families::deepseek_v41::v41_target_embedding::TargetEmbeddingWave<'_, '_>,
         tokens: &[u32], positions: &[u64]) -> Result<AttentionQueryOutput<'_>> {
         self.enter(Phase::Idle)?;
         ensure!(self.layer == 0 && tokens.len() == positions.len(), "invalid token entry");
@@ -731,8 +731,8 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     /// # Safety
     /// Retain the gathered upload while this lane's gate and residual copy finish.
     pub async unsafe fn apply_engram_cooperative(&mut self,
-        gate: &mut crate::v41_engram::layer::EngramGate<'_, '_>,
-        rows: &crate::v41_engram::EngramDeviceView) -> Result<()> {
+        gate: &mut crate::families::deepseek_v41::v41_engram::layer::EngramGate<'_, '_>,
+        rows: &crate::families::deepseek_v41::v41_engram::EngramDeviceView) -> Result<()> {
         self.enter(Phase::Prepared)?;
         unsafe { self.block.apply_engram_cooperative(gate, rows).await?; }
         self.phase = Phase::Prepared;
@@ -795,8 +795,8 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     /// selection storage alive and immutable until the returned owner completes
     /// or drops. Peer lanes may mutate only disjoint request slots/page claims.
     pub unsafe fn enqueue_attention_indexed_ffn(&mut self, sink: CuteafdDeviceBuffer,
-        cache: &crate::v41_backbone_cache::CacheAttention<'_>,
-        index: &crate::v41_index_lane::IndexLane<'_, '_>) -> Result<PendingLaneFfn<'_, 'w, 'a>> {
+        cache: &crate::families::deepseek_v41::v41_backbone_cache::CacheAttention<'_>,
+        index: &crate::families::deepseek_v41::v41_index_lane::IndexLane<'_, '_>) -> Result<PendingLaneFfn<'_, 'w, 'a>> {
         self.enter(Phase::Query)?;
         let selection = if self.layer >= 2 { Some(index.output(self.layer, cache)?) } else { None };
         unsafe { self.enqueue_attention_with_selection(sink,cache,selection.as_ref()) }
@@ -804,7 +804,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     /// # Safety
     /// Retain all cache/query/selection storage until the returned consumer completes or drains.
     pub unsafe fn enqueue_attention_cached_ffn(&mut self,sink:CuteafdDeviceBuffer,
-        cache:&crate::v41_backbone_cache::CacheAttention<'_>,selection:Option<&IndexSelectionOutput<'_>>)
+        cache:&crate::families::deepseek_v41::v41_backbone_cache::CacheAttention<'_>,selection:Option<&IndexSelectionOutput<'_>>)
         ->Result<PendingLaneFfn<'_,'w,'a>> {
         self.enter(Phase::Query)?;
         unsafe { self.enqueue_attention_with_selection(sink,cache,selection) }
@@ -813,8 +813,8 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     /// Keep the bank, query, proposals and selection alive until completion or
     /// cancellation. All producers and committed replica publications are ready.
     pub unsafe fn enqueue_attention_replicated_ffn(&mut self,sink:CuteafdDeviceBuffer,
-        bank:&crate::v41_backbone_cache::BackboneCache<'_>,cache:&crate::v41_backbone_cache::CacheAttention<'_>,
-        index:Option<&crate::v41_index_lane::IndexLane<'_, '_>>)->Result<PendingLaneFfn<'_,'w,'a>> {
+        bank:&crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'_>,cache:&crate::families::deepseek_v41::v41_backbone_cache::CacheAttention<'_>,
+        index:Option<&crate::families::deepseek_v41::v41_index_lane::IndexLane<'_, '_>>)->Result<PendingLaneFfn<'_,'w,'a>> {
         if self.dual_sparse.is_none() {
             return match index { Some(index)=>unsafe { self.enqueue_attention_indexed_ffn(sink,cache,index) },
                 None=>unsafe { self.enqueue_attention_cached_ffn(sink,cache,None) } };
@@ -831,7 +831,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         Ok(pending)
     }
     unsafe fn enqueue_attention_with_selection(&mut self,sink:CuteafdDeviceBuffer,
-        cache:&crate::v41_backbone_cache::CacheAttention<'_>,selection:Option<&IndexSelectionOutput<'_>>)
+        cache:&crate::families::deepseek_v41::v41_backbone_cache::CacheAttention<'_>,selection:Option<&IndexSelectionOutput<'_>>)
         ->Result<PendingLaneFfn<'_,'w,'a>> {
         ensure!(selection.is_some() == (self.layer >= 2), "attention index selection presence differs");
         let requests = cache.attention_requests();
@@ -858,8 +858,8 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     /// producers complete and no external writes racing these owners.
     pub unsafe fn select_index(
         &self,
-        index: &mut crate::v41_index_lane::IndexLane<'_, '_>,
-        cache: &crate::v41_backbone_cache::CacheAttention<'_>,
+        index: &mut crate::families::deepseek_v41::v41_index_lane::IndexLane<'_, '_>,
+        cache: &crate::families::deepseek_v41::v41_backbone_cache::CacheAttention<'_>,
     ) -> Result<()> {
         let query = self.query_output()?;
         unsafe { index.select(&query, cache) }
@@ -870,8 +870,8 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub unsafe fn attention_indexed_ffn(
         &mut self,
         sink: CuteafdDeviceBuffer,
-        cache: &crate::v41_backbone_cache::CacheAttention<'_>,
-        index: &crate::v41_index_lane::IndexLane<'_, '_>,
+        cache: &crate::families::deepseek_v41::v41_backbone_cache::CacheAttention<'_>,
+        index: &crate::families::deepseek_v41::v41_index_lane::IndexLane<'_, '_>,
     ) -> Result<LaneFfn<'_, 'w, 'a>> {
         let selection = if self.layer >= 2 { Some(index.output(self.layer, cache)?) } else { None };
         unsafe { self.attention_cached_ffn(sink, cache, selection.as_ref()) }
@@ -884,7 +884,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub unsafe fn attention_cached_ffn(
         &mut self,
         sink: CuteafdDeviceBuffer,
-        cache: &crate::v41_backbone_cache::CacheAttention<'_>,
+        cache: &crate::families::deepseek_v41::v41_backbone_cache::CacheAttention<'_>,
         selection: Option<&IndexSelectionOutput<'_>>,
     ) -> Result<LaneFfn<'_, 'w, 'a>> {
         let requests = cache.attention_requests();
@@ -986,7 +986,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         if unsafe { library.cuda_event_record(event, stream) }.is_err() { return false; }
         // Unchained passes drained this stream and later rebinds require it
         // idle; the event completes at once, so wait for it here.
-        if !crate::v41_memory::chain::active() {
+        if !crate::shared::memory::chain::active() {
             if let Err(error) = unsafe { library.cuda_event_synchronize(event) } {
                 tracing::warn!(%error, "layer timing event wait failed");
             }
@@ -1011,13 +1011,13 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub fn enable_dual_attention(&mut self,peer:Device<'a>,budgets:[usize;2])->Result<()> {
         ensure!(self.phase==Phase::Idle && self.dual_sparse.is_none(),"dual attention requires an unused lane");
         let source=Device { library:self.weights.library,id:self.query.input().device_id };
-        let mut dual=crate::v41_sparse_attention::dual::DualAttentionWave::new([source,peer],self.capacity,budgets)?;
+        let mut dual=crate::families::deepseek_v41::v41_sparse_attention::dual::DualAttentionWave::new([source,peer],self.capacity,budgets)?;
         if self.capture_routes { dual.enable_small_graph_shapes(); }
         source.run(|| { self.sparse=None; Ok(()) })?;
         self.dual_sparse=Some(dual);Ok(())
     }
     pub fn dual_attention_bytes(&self)->Result<[usize;2]> {
-        crate::v41_sparse_attention::dual::DualAttentionWave::device_bytes(self.capacity)
+        crate::families::deepseek_v41::v41_sparse_attention::dual::DualAttentionWave::device_bytes(self.capacity)
     }
     /// Reserve adaptive route history during planning, before lane execution.
     pub fn reserve_route_capture(&mut self, layers: std::ops::Range<usize>, rows: usize) -> Result<()> {

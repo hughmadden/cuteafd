@@ -1,11 +1,11 @@
 //! `expert-probe --intake host,pinned,gpu`: one request's rank partials through
-//! each coordinator intake (see `crate::spark_intake`) against the same Spark
+//! each coordinator intake (see `crate::shared::spark_intake`) against the same Spark
 //! (or loopback) ranks. Checks that every mode yields bit-identical rank planes
 //! and compact-reduced sums, and times waves from dispatch until the reduced
 //! rows are complete on the GPU, interleaving the modes round by round.
 use crate::cli::ExpertProbeArgs;
-use crate::spark_intake::{self, IntakeMode, SparkIntake, SparkLane};
-use crate::v41_memory::DeviceAllocation;
+use crate::shared::spark_intake::{self, IntakeMode, SparkIntake, SparkLane};
+use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_transport::{v41_expert::V41Tp4Roce, ExpertProtocolV2Request, TcpTransportConfig};

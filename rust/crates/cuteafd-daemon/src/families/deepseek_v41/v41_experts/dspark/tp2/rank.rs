@@ -1,6 +1,6 @@
 //! Native draft expert halves, with device-scoped ownership and fixed scratch.
-use crate::v41_experts::{ExpertLayer, ExpertWeights};
-use crate::v41_memory::device::{Allocation, Device, DeviceOwner, Stream};
+use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights};
+use crate::shared::memory::device::{Allocation, Device, DeviceOwner, Stream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41ExpertKernel, V41ExpertLaunchArgs};
 use cuteafd_loader::OfficialV41Catalog;

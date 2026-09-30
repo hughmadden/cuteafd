@@ -7,47 +7,6 @@ mod cli;
 mod commands;
 mod families;
 mod shared;
-// Old crate-root module paths, kept while the tree moves (naming pass drops them).
-use families::deepseek_v4 as dsv4;
-use families::glm5 as glm;
-use families::glm5_flash as glmf;
-use families::mimo_v2 as mimo;
-use families::qwen4;
-use families::deepseek_v41::{
-    v41_compressor,
-    v41_vision,
-    v41_index_query,
-    v41_index_lane,
-    v41_index_selection,
-    v41_experts,
-    v41_window,
-    v41_sparse_attention,
-    v41_attention_query,
-    v41_layer_graphs,
-    v41_attention_binding,
-    v41_hc,
-    v41_shared_ffn,
-    v41_backbone_shared,
-    v41_backbone_router,
-    v41_backbone_hc,
-    v41_block,
-    v41_backbone_lane,
-    v41_backbone_cache,
-    v41_backbone_execution,
-    v41_requests,
-    v41_target_head,
-    v41_target_pass,
-    v41_native_serve,
-    v41_target_embedding,
-    v41_attention_output,
-    v41_projection_tp2,
-    v41_dspark_cache,
-    v41_spark_topology,
-    v41_tensors,
-    v41_engram,
-};
-use shared::{draft_policy, prefill_share, fp8_linear, l2_prefetch, spark_intake, v41_memory};
-
 use cli::{Cli, Commands};
 use commands::bench_rdma::run_bench_rdma;
 use commands::bench_rdma_ring::run_bench_rdma_ring;
@@ -73,19 +32,19 @@ async fn main() -> Result<()> {
         Commands::Doctor(args) => run_doctor(args),
         Commands::Plan(args) => run_plan(args),
         Commands::ExpertProbe(args) => run_expert_probe(args).await,
-        Commands::Dsv4Golden(args) => dsv4::run_golden(args).await,
-        Commands::GlmGolden(args) => glm::run_golden(args).await,
-        Commands::MimoGolden(args) => mimo::run_golden(args).await,
-        Commands::ServeMimo(args) => mimo::serve::run_serve(args).await,
-        Commands::GlmfGolden(args) => glmf::run_golden(args).await,
-        Commands::Qwen4Golden(args) => qwen4::run_golden(args).await,
-        Commands::ServeQwen4(args) => qwen4::serve::run_serve(args).await,
-        Commands::ServeGlmf(args) => glmf::serve::run_serve(args).await,
-        Commands::ServeGlm(args) => glm::serve::run_serve(args).await,
-        Commands::ServeDsv4(args) => dsv4::serve::run_serve(args).await,
+        Commands::Dsv4Golden(args) => families::deepseek_v4::run_golden(args).await,
+        Commands::GlmGolden(args) => families::glm5::run_golden(args).await,
+        Commands::MimoGolden(args) => families::mimo_v2::run_golden(args).await,
+        Commands::ServeMimo(args) => families::mimo_v2::serve::run_serve(args).await,
+        Commands::GlmfGolden(args) => families::glm5_flash::run_golden(args).await,
+        Commands::Qwen4Golden(args) => families::qwen4::run_golden(args).await,
+        Commands::ServeQwen4(args) => families::qwen4::serve::run_serve(args).await,
+        Commands::ServeGlmf(args) => families::glm5_flash::serve::run_serve(args).await,
+        Commands::ServeGlm(args) => families::glm5::serve::run_serve(args).await,
+        Commands::ServeDsv4(args) => families::deepseek_v4::serve::run_serve(args).await,
         Commands::Fabric(args) => {
             let report = cuteafd_transport::fabric::discover()?;
-            let landing = spark_intake::fabric_probe(args.native_lib.as_deref(), args.device);
+            let landing = shared::spark_intake::fabric_probe(args.native_lib.as_deref(), args.device);
             if args.json {
                 let mut value = serde_json::to_value(&report)?;
                 value["gpu_landing"] = serde_json::to_value(&landing)?;
@@ -110,8 +69,8 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Commands::ExpertdNative(args) => v41_experts::service::run(args).await,
-        Commands::ServeNative(args) => v41_native_serve::run(args).await,
+        Commands::ExpertdNative(args) => shared::experts::service::run(args).await,
+        Commands::ServeNative(args) => families::deepseek_v41::v41_native_serve::run(args).await,
         Commands::BenchRdma(args) => run_bench_rdma(args),
         Commands::BenchRdmaRing(args) => run_bench_rdma_ring(args),
         Commands::TransportCapabilities(args) => run_transport_capabilities(args),

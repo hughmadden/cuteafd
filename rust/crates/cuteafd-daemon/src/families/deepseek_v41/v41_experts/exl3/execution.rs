@@ -1,7 +1,7 @@
 //! Bound EXL3 launch tables. Allocations and name resolution happen at setup;
 //! each launch only substitutes live inputs/row bounds and enqueues GPU work.
 use super::Exl3Weights;
-use crate::v41_memory::DeviceAllocation;
+use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41Exl3Kernel, V41Exl3Layout, V41Exl3Routes};
 use serde::Deserialize;
@@ -748,7 +748,8 @@ mod tests {
     }
 
     use super::*;
-    use crate::{v41_experts::ExpertLayer, v41_memory::LoadStream};
+    use crate::families::deepseek_v41::v41_experts::ExpertLayer;
+    use crate::shared::memory::LoadStream;
 
     struct Fixture<'a> {
         inputs: Vec<DeviceAllocation<'a>>,

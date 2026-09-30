@@ -1,5 +1,5 @@
 //! Native V4.1 expert residency; one GPU worker owns each layer and its buffers.
-use crate::v41_memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 pub(crate) mod coordinator;
 pub(crate) mod paired;
 pub(crate) mod local;
@@ -8,11 +8,7 @@ pub(crate) mod tp2_ffn;
 pub(crate) mod dspark;
 mod execution;
 pub(crate) mod exl3;
-#[path = "../../shared/experts/fp8/mod.rs"]
-pub(crate) mod fp8;
 pub(crate) mod nvfp4;
-#[path = "../../shared/experts/service/mod.rs"]
-pub(crate) mod service;
 pub(crate) use execution::{ExpertExecution, ExpertExecutionBudget, HostExpertExchange};
 
 use anyhow::{ensure, Context, Result};
@@ -55,7 +51,7 @@ pub(crate) enum ExpertLayer {
 const EXL3_SHARD_ROLE_SENTINEL: u32 = 100;
 
 impl ExpertLayer {
-    fn expert(self, expert: usize) -> V41ExpertSelection {
+    pub(crate) fn expert(self, expert: usize) -> V41ExpertSelection {
         match self {
             Self::Backbone { layer, rank } => V41ExpertSelection::Backbone {
                 layer,
@@ -74,7 +70,7 @@ impl ExpertLayer {
         }
     }
     /// Physical layer index for resident-weight rebinding.
-    fn layer(self) -> usize {
+    pub(crate) fn layer(self) -> usize {
         match self {
             Self::Backbone { layer, .. }
             | Self::BackboneFull { layer }
@@ -84,7 +80,7 @@ impl ExpertLayer {
             Self::Dspark { .. } | Self::DsparkTp2 { .. } => usize::MAX,
         }
     }
-    fn role(self) -> u32 {
+    pub(crate) fn role(self) -> u32 {
         match self {
             Self::Dspark { .. } => 0,
             Self::Backbone { .. } => 1,

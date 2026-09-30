@@ -4,10 +4,8 @@ use super::{
     execution::{Exl3Execution, Exl3InputFormat, Exl3Workspace},
     Exl3Weights,
 };
-use crate::{
-    v41_experts::HostExpertExchange,
-    v41_memory::{DeviceAllocation, LoadStream},
-};
+use crate::families::deepseek_v41::v41_experts::HostExpertExchange;
+use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_transport::{
@@ -20,7 +18,7 @@ pub(crate) struct Exl3Worker<'a> {
     // Drain the stream before dropping kernels, weights or input allocations.
     stream: LoadStream<'a>,
     // Opt-in diagnostics: allocate events once; the default path never records them.
-    timing: Option<[crate::v41_memory::device::Event<'a>; 2]>,
+    timing: Option<[crate::shared::memory::device::Event<'a>; 2]>,
     executions: Vec<Exl3Execution<'a>>,
     capacity: usize,
     inputs: [DeviceAllocation<'a>; 3],
@@ -156,13 +154,13 @@ impl<'a> Exl3Worker<'a> {
             raw: library.cuda_stream_create()?,
         };
         let timing = if std::env::var_os("CUTEAFD_EXL3_WORKER_TIMING").is_some() {
-            let device = crate::v41_memory::device::Device {
+            let device = crate::shared::memory::device::Device {
                 library,
                 id: library.cuda_get_device()?,
             };
             Some([
-                crate::v41_memory::device::Event::new(device)?,
-                crate::v41_memory::device::Event::new(device)?,
+                crate::shared::memory::device::Event::new(device)?,
+                crate::shared::memory::device::Event::new(device)?,
             ])
         } else {
             None

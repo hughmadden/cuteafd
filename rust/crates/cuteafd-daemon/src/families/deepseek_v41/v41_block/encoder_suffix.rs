@@ -1,5 +1,5 @@
 use super::*;
-use crate::v41_memory::DeviceAllocation;
+use crate::shared::memory::DeviceAllocation;
 
 /// One admitted prompt's final encoder rows, retained across encoder chunk reuse.
 /// Allocate at admission; capture copies only the final window's intersecting rows.
@@ -36,7 +36,7 @@ impl<'a> EncoderSuffix<'a> {
     /// producer through completion; cancellation drains queued copies and leaves
     /// this suffix invalid until it is dropped with its failed request.
     pub async unsafe fn capture_cooperative(&mut self, output: &BlockOutput<'_>,
-        stream: &crate::v41_memory::LoadStream<'_>) -> Result<()> {
+        stream: &crate::shared::memory::LoadStream<'_>) -> Result<()> {
         stream.require_complete()?;
         let queued = self.capture_with(output, |dst, src, bytes| unsafe {
             stream.library.copy_d2d_async(dst, src, bytes, stream.raw)

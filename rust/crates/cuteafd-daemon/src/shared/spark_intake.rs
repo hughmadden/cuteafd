@@ -29,7 +29,7 @@
 //! landing time (18 ms for V4 Pro TP6's 352 MB) is not on the critical path.
 //! Any `gpu` failure (no dma-buf, no registration, GPUDirect writes not
 //! ordered for kernels) falls back to `pinned` and says why.
-use crate::v41_memory::{DeviceAllocation, HostAllocation};
+use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use cuteafd_transport::v41_expert::{V41LaneBuild, V41Tp4Roce, V41Tp4RoceLane, V41Tp4RoceWave, V41WaveReceipt};

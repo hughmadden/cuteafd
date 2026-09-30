@@ -1,10 +1,10 @@
 //! One admission identity for persistent backbone caches and mapped engram history.
-use crate::v41_backbone_cache::{BackboneCache, CacheBatch, CacheLease, CacheWork, CacheStage};
-use crate::v41_backbone_execution::BackboneExecution;
-use crate::v41_backbone_lane::BackboneLane;
-use crate::v41_engram::layer::EngramGate;
-use crate::v41_engram::{EngramDeviceRows, EngramUploadPoll};
-use crate::v41_target_embedding::TargetEmbeddingWave;
+use crate::families::deepseek_v41::v41_backbone_cache::{BackboneCache, CacheBatch, CacheLease, CacheWork, CacheStage};
+use crate::families::deepseek_v41::v41_backbone_execution::BackboneExecution;
+use crate::families::deepseek_v41::v41_backbone_lane::BackboneLane;
+use crate::families::deepseek_v41::v41_engram::layer::EngramGate;
+use crate::families::deepseek_v41::v41_engram::{EngramDeviceRows, EngramUploadPoll};
+use crate::families::deepseek_v41::v41_target_embedding::TargetEmbeddingWave;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{EngramHistory, EngramPrefillCursor};
 mod reservation;
@@ -21,7 +21,7 @@ struct Request {
     images: RequestImages,
 }
 pub(crate) struct RequestPrefix<'a> {
-    cache: crate::v41_backbone_cache::BackbonePrefix<'a>,
+    cache: crate::families::deepseek_v41::v41_backbone_cache::BackbonePrefix<'a>,
     history: EngramHistory,
 }
 impl RequestPrefix<'_> {
@@ -88,7 +88,7 @@ impl<'a> Requests<'a> {
         pipeline: EngramPipeline,
         slots: usize,
         pages: [usize; 4],
-        map: crate::v41_backbone_cache::CachePlacement,
+        map: crate::families::deepseek_v41::v41_backbone_cache::CachePlacement,
         budgets: [usize; 2],
     ) -> Result<Self> {
         Ok(Self {
@@ -103,7 +103,7 @@ impl<'a> Requests<'a> {
         &self.cache
     }
     pub fn new_replicated(library:&'a NativeLibrary,pipeline:EngramPipeline,slots:usize,
-        pages:[usize;4],map:crate::v41_backbone_cache::CachePlacement,budgets:[usize;2])->Result<Self> {
+        pages:[usize;4],map:crate::families::deepseek_v41::v41_backbone_cache::CachePlacement,budgets:[usize;2])->Result<Self> {
         Ok(Self { cache:BackboneCache::new_replicated(library,map,slots,pages,budgets)?,
             prefix_histories:[None,None],pipeline,slots:(0..slots).map(|_|None).collect(),image_requests:0 })
     }
@@ -169,7 +169,7 @@ impl<'a> Requests<'a> {
         if self.slots.iter().flatten().any(|r| r.lease == lease) { self.release(lease)?; }
         Ok(())
     }
-    pub fn install_prefix_pool(&mut self, pool: crate::v41_memory::SnapshotPool<'a>) -> Result<()> {
+    pub fn install_prefix_pool(&mut self, pool: crate::shared::memory::SnapshotPool<'a>) -> Result<()> {
         self.cache.install_prefix_pool(pool)
     }
     pub fn retain_prefix(&mut self, lease: CacheLease, budget: usize) -> Result<RequestPrefix<'a>> {
@@ -187,7 +187,7 @@ impl<'a> Requests<'a> {
         ensure!(request.prefill.is_none() && request.history.position() == self.cache.committed_end(lease)?,
             "request prefix has pending or inconsistent history");
         let history = request.history.fork()?;
-        self.cache.queue_prefix(lane, lease, crate::v41_backbone_cache::BackbonePrefix::device_bytes())?;
+        self.cache.queue_prefix(lane, lease, crate::families::deepseek_v41::v41_backbone_cache::BackbonePrefix::device_bytes())?;
         self.prefix_histories[lane] = Some((lease, history));
         Ok(())
     }
@@ -511,7 +511,7 @@ impl<'a> Requests<'a> {
     pub fn commit_distributed(
         &mut self,
         batch: &mut RequestBatch,
-        execution: &mut crate::v41_backbone_execution::DistributedExecution<'_, '_>,
+        execution: &mut crate::families::deepseek_v41::v41_backbone_execution::DistributedExecution<'_, '_>,
         accepted: &[u32],
     ) -> Result<()> {
         self.commit_with(batch, accepted, |cache, batch, accepted| {
@@ -520,7 +520,7 @@ impl<'a> Requests<'a> {
     }
     pub fn abort_distributed_cache_commit(
         &mut self,
-        execution: &mut crate::v41_backbone_execution::DistributedExecution<'_, '_>,
+        execution: &mut crate::families::deepseek_v41::v41_backbone_execution::DistributedExecution<'_, '_>,
     ) -> Result<()> {
         execution.abort_cache_commit(&mut self.cache)
     }
@@ -530,7 +530,7 @@ impl<'a> Requests<'a> {
         accepted: &[u32],
         publish: impl FnOnce(
             &mut BackboneCache<'a>,
-            &crate::v41_backbone_cache::CacheBatch,
+            &crate::families::deepseek_v41::v41_backbone_cache::CacheBatch,
             &[u32],
         ) -> Result<()>,
     ) -> Result<()> {
@@ -570,7 +570,7 @@ impl<'a> Requests<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v41_backbone_execution::CacheProducerWeights;
+    use crate::families::deepseek_v41::v41_backbone_execution::CacheProducerWeights;
     #[test]
     fn real_request_prefetch_upload_cancel_and_failed_commit() -> Result<()> {
         let Some(path) = std::env::var_os("CUTEAFD_REQUESTS_LIBRARY") else {
@@ -733,10 +733,10 @@ mod tests {
 mod image_tests;
 
 impl<'a> RequestPrefix<'a> {
-    pub fn parts(&self) -> (&crate::v41_backbone_cache::BackbonePrefix<'a>, &EngramHistory) {
+    pub fn parts(&self) -> (&crate::families::deepseek_v41::v41_backbone_cache::BackbonePrefix<'a>, &EngramHistory) {
         (&self.cache, &self.history)
     }
-    pub fn from_parts(cache: crate::v41_backbone_cache::BackbonePrefix<'a>, history: EngramHistory) -> Self {
+    pub fn from_parts(cache: crate::families::deepseek_v41::v41_backbone_cache::BackbonePrefix<'a>, history: EngramHistory) -> Self {
         Self { cache, history }
     }
 }

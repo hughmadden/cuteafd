@@ -1,6 +1,6 @@
 //! Load each cache producer beside its SWA/compressed storage.
 use super::*;
-use crate::v41_backbone_cache::CacheWave;
+use crate::families::deepseek_v41::v41_backbone_cache::CacheWave;
 
 /// One lane's per-layer producer workspaces, owned by the assigned GPUs.
 pub(crate) struct PlacedProducerWaves<'w, 'a> {
@@ -165,7 +165,7 @@ impl<'w, 'a> PlacedProducerWaves<'w, 'a> {
         &'p mut self,
         bank: &BackboneCache<'_>,
         batch: &CacheBatch,
-        query: &crate::v41_attention_query::AttentionQueryOutput<'_>,
+        query: &crate::families::deepseek_v41::v41_attention_query::AttentionQueryOutput<'_>,
     ) -> Result<PendingPlacedProduction<'p, 'w, 'i, 'a>> {
         ensure!(
             self.pending_commit.is_none(),
@@ -231,7 +231,7 @@ impl<'w, 'a> PlacedProducerWaves<'w, 'a> {
         &'p mut self,
         bank: &BackboneCache<'_>,
         batch: &CacheBatch,
-        query: &crate::v41_attention_query::AttentionQueryOutput<'_>,
+        query: &crate::families::deepseek_v41::v41_attention_query::AttentionQueryOutput<'_>,
         index: &'p mut DeviceOwner<'a, IndexLane<'i, 'a>>,
     ) -> Result<PendingPlacedProduction<'p, 'w, 'i, 'a>> {
         ensure!(
@@ -518,12 +518,12 @@ impl<'a> CacheProducerWeights<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v41_window::{WindowChunk, WindowState};
+    use crate::families::deepseek_v41::v41_window::{WindowChunk, WindowState};
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT, and two CUDA GPUs"]
     fn placed_query_production_poll_cancel_and_reuse() -> Result<()> {
-        use crate::v41_attention_query::{AttentionQueryWave, AttentionQueryWeights};
-        use crate::v41_backbone_cache::CacheWork;
+        use crate::families::deepseek_v41::v41_attention_query::{AttentionQueryWave, AttentionQueryWeights};
+        use crate::families::deepseek_v41::v41_backbone_cache::CacheWork;
         use cuteafd_transport::ExpertV2SourceKind;
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let catalog = cuteafd_loader::read_official_v41_catalog(
@@ -819,9 +819,9 @@ mod tests {
         }
         let mut source_states = [
             devices[0]
-                .own(|| crate::v41_compressor::CompressorState::new(&lib, 20, 1, 2, usize::MAX))?,
+                .own(|| crate::families::deepseek_v41::v41_compressor::CompressorState::new(&lib, 20, 1, 2, usize::MAX))?,
             devices[1]
-                .own(|| crate::v41_compressor::CompressorState::new(&lib, 20, 1, 2, usize::MAX))?,
+                .own(|| crate::families::deepseek_v41::v41_compressor::CompressorState::new(&lib, 20, 1, 2, usize::MAX))?,
         ];
         let source_leases = [
             source_states[0].begin_request(0, 1)?,
@@ -849,7 +849,7 @@ mod tests {
                     placed.sources[3].get_mut()
                 };
                 let state = source_states[rank].get();
-                let chunks = [crate::v41_compressor::CompressorChunk {
+                let chunks = [crate::families::deepseek_v41::v41_compressor::CompressorChunk {
                     lease: source_leases[rank],
                     position: 0,
                     tokens: 16,

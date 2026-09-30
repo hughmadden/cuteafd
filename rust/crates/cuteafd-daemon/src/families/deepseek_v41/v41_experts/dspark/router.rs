@@ -1,6 +1,6 @@
 //! Per-stage router scratch; writes directly into the expert wave's stable inputs.
 use super::DsparkWeights;
-use crate::v41_memory::DeviceAllocation;
+use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41Router};
 use std::ffi::c_void;
@@ -52,7 +52,7 @@ impl DsparkRouter<'_, '_> {
     }
     pub(in crate::families::deepseek_v41::v41_experts) fn matches(
         &self,
-        weights: &crate::v41_experts::ExpertWeights<'_>,
+        weights: &crate::families::deepseek_v41::v41_experts::ExpertWeights<'_>,
     ) -> bool {
         self._weights.full_expert(self.stage).is_some_and(|stage| std::ptr::eq(stage, weights))
     }

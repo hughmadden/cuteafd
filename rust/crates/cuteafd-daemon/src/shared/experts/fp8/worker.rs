@@ -2,10 +2,8 @@
 //! the compact BF16 rank partial out, written straight into the registered
 //! send slot when the transport permits it.
 use super::Fp8Experts;
-use crate::{
-    v41_experts::HostExpertExchange,
-    v41_memory::{DeviceAllocation, LoadStream},
-};
+use crate::families::deepseek_v41::v41_experts::HostExpertExchange;
+use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_transport::{

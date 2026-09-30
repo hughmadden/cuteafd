@@ -9,7 +9,7 @@ pub(super) fn qualify<'w, 'a>(
     second: &mut TargetPass<'w, 'a>,
     first_transport: &mut NativeTp4Wave<'a>,
     second_transport: &mut NativeTp4Wave<'a>,
-    draft: &mut crate::v41_native_serve::speculative::DraftRuntime<'_, 'a>,
+    draft: &mut crate::families::deepseek_v41::v41_native_serve::speculative::DraftRuntime<'_, 'a>,
 ) -> Result<()> {
     for per_lane in [1usize, 3, 8] {
         let mut expected = Vec::new();

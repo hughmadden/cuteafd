@@ -1,12 +1,12 @@
 //! Real backbone shared experts, with immutable weights and exclusive captured waves.
 #[path = "v41_backbone_shared/tp2.rs"]
 pub(crate) mod tp2;
-use crate::v41_attention_binding::QueryBinding;
-use crate::v41_block::FfnInput;
-use crate::v41_layer_graphs::LayerGraphs;
-use crate::v41_memory::{DeviceAllocation, LoadStream};
-use crate::v41_shared_ffn::SharedFfn;
-use crate::v41_tensors::NativeRtxTensors;
+use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
+use crate::families::deepseek_v41::v41_block::FfnInput;
+use crate::families::deepseek_v41::v41_layer_graphs::LayerGraphs;
+use crate::shared::memory::{DeviceAllocation, LoadStream};
+use crate::families::deepseek_v41::v41_shared_ffn::SharedFfn;
+use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::OfficialV41Catalog;
@@ -150,7 +150,7 @@ impl<'w, 'a> BackboneSharedWave<'w, 'a> {
         );
         // Chained shared work is ordered before the reduction that consumes it;
         // later enqueues with the new weights follow it on this stream.
-        if !crate::v41_memory::chain::active() { self.stream.require_complete()?; }
+        if !crate::shared::memory::chain::active() { self.stream.require_complete()?; }
         // LayerGraphs retains the full owner, including packed scales, for
         // every cached graph. Only this drained stream consumes the workspace.
         unsafe {
@@ -260,7 +260,7 @@ impl BackboneSharedWave<'_, '_> {
                 .library
                 .cuda_graph_launch(graph, self.stream.raw)
         };
-        launched.and(unsafe { crate::v41_memory::chain::finish(self.stream.library, self.stream.raw) })?;
+        launched.and(unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw) })?;
         self.ready = Some(rows);
         self.output()
     }
@@ -281,7 +281,7 @@ impl BackboneSharedWave<'_, '_> {
         // Order the input copy on this stream after the chained attention output
         // (a legacy-stream copy would not order with the non-blocking streams).
         unsafe {
-            crate::v41_memory::chain::join(self.stream.library, self.stream.raw)?;
+            crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?;
             if let Err(error) = self.stream.library.copy_d2d_async(self.input.buffer, input.values,
                 input.values.bytes, self.stream.raw) { self.synchronize()?; return Err(error); }
         }
@@ -318,7 +318,7 @@ impl BackboneSharedWave<'_, '_> {
         let rows = input.tokens.len() as u32;
         let cold = self.graphs.get_shape(self.layer, self.weights, rows).is_none();
         let launched = (|| unsafe {
-            crate::v41_memory::chain::join(self.stream.library, self.stream.raw)?;
+            crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?;
             self.stream.library.copy_d2d_async(self.input.buffer, input.values, input.values.bytes, self.stream.raw)?;
             if cold { self.enqueue(rows) } else {
                 let (graph, _) = self.graphs.get_shape(self.layer, self.weights, rows).unwrap();
@@ -326,7 +326,7 @@ impl BackboneSharedWave<'_, '_> {
             }
         })();
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
-        unsafe { crate::v41_memory::chain::finish_cooperative(&self.stream).await?; }
+        unsafe { crate::shared::memory::chain::finish_cooperative(&self.stream).await?; }
         if cold {
             // The eager execution above already completed these inputs. Capture
             // records future launches without executing them; publish that result

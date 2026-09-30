@@ -1,7 +1,7 @@
 //! Independent distributed lanes linked only by the same prompt's cache dependencies.
 use super::*;
-use crate::v41_backbone_cache::CacheLease;
-use crate::v41_requests::RequestTokens;
+use crate::families::deepseek_v41::v41_backbone_cache::CacheLease;
+use crate::families::deepseek_v41::v41_requests::RequestTokens;
 use cuteafd_transport::ExpertV2SourceKind;
 use std::cell::RefCell;
 use tokio::sync::Notify;
@@ -155,8 +155,8 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             )?;
             guard.complete = true;
             committed[index].notify_one();
-            crate::v41_native_serve::console::totals::prefill(chunk.len());
-            crate::v41_native_serve::console::Prefill::done(crate::v41_native_serve::console::PrefillKind::Chunk,
+            crate::families::deepseek_v41::v41_native_serve::console::totals::prefill(chunk.len());
+            crate::families::deepseek_v41::v41_native_serve::console::Prefill::done(crate::families::deepseek_v41::v41_native_serve::console::PrefillKind::Chunk,
                 parity, index, chunks.len(), chunk.len(), started);
         }
         Ok(())

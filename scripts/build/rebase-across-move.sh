@@ -24,7 +24,9 @@
 # New files placed by a fallback get the M7/M8 depth edits (parents[k],
 # with_name siblings and fixtures, dirname BASH_SOURCE); they and new files left
 # at the top of a split directory are listed for review. Paths built other ways
-# are not rewritten: run the tests. A Rust module
+# are not rewritten: run the tests. Rust paths renamed by the naming pass
+# (scripts/build/rename-map.tsv) are rewritten in .rs hunk lines; a multi-line
+# `use crate::{...}` group is only rewritten where an item carries crate::. A Rust module
 # added beside a moved one may need its `mod` line in the new parent
 # (families/<id>/mod.rs, shared/mod.rs).
 set -euo pipefail
@@ -75,6 +77,10 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/rebase-across-move.XXXXXX")"
 cleanup() { git worktree remove --force "$work/premove" >/dev/null 2>&1 || true; rm -rf "$work"; }
 trap cleanup EXIT
 cp "$map" "$work/map"   # the pre-move tree has no map; never read it from the checkout later
+# Rust path renames of the naming pass (crate::v41_memory -> crate::shared::memory, ...).
+for f in rename-map.tsv rename_paths.py; do
+  [[ -f "$repo_root/scripts/build/$f" ]] && cp "$repo_root/scripts/build/$f" "$work/"
+done
 
 source_ref="$branch"
 if ! git merge-base --is-ancestor "$pre" "$branch"; then
@@ -117,6 +123,11 @@ git ls-tree -r --name-only "$onto" > "$work/post-files"
 python3 - "$work/map" "$work" "$rewrite_refs" <<'PY'
 import os, re, sys
 map_path, work, rewrite_refs = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+rename_rules = None
+if os.path.exists(os.path.join(work, "rename_paths.py")):
+    sys.path.insert(0, work)
+    import rename_paths
+    rename_rules = rename_paths.load(__import__("pathlib").Path(work) / "rename-map.tsv")
 exact, dirs, globs = {}, [], []
 for line in open(map_path, encoding="utf-8"):
     if not line.strip() or line.startswith("#"):
@@ -253,6 +264,8 @@ for name in sorted(os.listdir(os.path.join(work, "in"))):
             # The move rewrote repo paths in place, so context and removed lines
             # get the same rewrite as added ones or they would not match.
             text = joined_rewrites(current, ref_rx.sub(remap_ref, line[1:]))
+            if rename_rules is not None and current.endswith(".rs"):
+                text = rename_paths.rewrite(current, text, rename_rules)
             if source_path in added and line[0] == "+":
                 text = relocated_rewrites(source_path, current, text)
             line = line[0] + text

@@ -11,7 +11,7 @@
 //! `w_gate_up`) are written in place (every part but the last is a whole
 //! number of 128-row blocks, so the scale grids concatenate too); `kv_b` is
 //! split per head into `w_uk` (transposed) and `w_uv` on the host.
-use crate::v41_memory::DeviceAllocation;
+use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
@@ -42,7 +42,7 @@ pub(crate) fn fp8_operand_names(name: &str) -> (&'static str, &'static str) {
 
 impl GlmLayer<'_> {
     /// The device range of `operand`, when the layer has it.
-    pub fn range(&self, operand: &str) -> Option<crate::l2_prefetch::Range> {
+    pub fn range(&self, operand: &str) -> Option<crate::shared::l2_prefetch::Range> {
         self.operands.get(operand).map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes))
     }
 

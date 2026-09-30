@@ -1,7 +1,7 @@
 //! Owned compressed EXL3 device residency. The native execution adapter binds
 //! these buffers only after loading completes and must retain them for graphs.
 use super::{ExpertLayer, ExpertLoadBudget, EXPERT_READ_LANES};
-use crate::v41_memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::{OfficialV41Catalog, V41Exl3Layer, V41Exl3Partition, V41Exl3Residency};

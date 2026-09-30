@@ -3,7 +3,7 @@
 //! `/v1/stats` export. The policy itself lives in `cuteafd_core` and performs
 //! no device work.
 use anyhow::{ensure, Result};
-use crate::v41_experts::coordinator::NativeTp4Wave;
+use crate::families::deepseek_v41::v41_experts::coordinator::NativeTp4Wave;
 use cuteafd_core::{DsparkLayerClass, DsparkPlacement, DsparkPolicy, DSPARK_LAYERS};
 use std::sync::Mutex;
 

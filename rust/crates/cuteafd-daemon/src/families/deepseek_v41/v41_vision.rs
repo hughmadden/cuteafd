@@ -1,6 +1,6 @@
 //! Serialized native ViT/aligner owner. No request KV or text execution state.
-use crate::v41_memory::{DeviceAllocation, LoadStream};
-use crate::v41_tensors::NativeRtxTensors;
+use crate::shared::memory::{DeviceAllocation, LoadStream};
+use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, NativeLibrary, V41VisionOps};
 use cuteafd_loader::{OfficialV41Catalog, V41Image, V41ImageGrid};

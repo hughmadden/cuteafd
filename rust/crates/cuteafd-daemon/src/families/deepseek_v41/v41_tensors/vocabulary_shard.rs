@@ -51,7 +51,7 @@ impl<'a> VocabularyShard<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v41_memory::device::Device;
+    use crate::shared::memory::device::Device;
 
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and two CUDA GPUs"]

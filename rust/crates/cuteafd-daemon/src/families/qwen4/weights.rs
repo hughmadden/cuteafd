@@ -9,7 +9,7 @@
 //! indexer.index_qk_proj]`, the shared expert `w_gate_up = [gate_proj;
 //! up_proj; shared_expert_gate; 15 zero rows]`, PLE `w_kv = [key_proj;
 //! value_proj]` and FP32 `conv_w [10240, 4]`.
-use crate::v41_memory::DeviceAllocation;
+use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
@@ -38,7 +38,7 @@ impl Qwen4Layer<'_> {
     }
 
     /// The device range of `operand`, when the layer has it.
-    pub fn range(&self, operand: &str) -> Option<crate::l2_prefetch::Range> {
+    pub fn range(&self, operand: &str) -> Option<crate::shared::l2_prefetch::Range> {
         self.operands.get(operand).map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes))
     }
 
@@ -89,7 +89,7 @@ pub(crate) struct Qwen4Loader<'a> {
     /// attention projections for the decode programs (`*_fp8_m64`).
     pub fp8_decode: bool,
     /// Scale rule of the E4M3 copies (decode projections, MTP draft head).
-    pub fp8_scales: crate::fp8_linear::Fp8Scales,
+    pub fp8_scales: crate::shared::fp8_linear::Fp8Scales,
     pub stream: *mut c_void,
 }
 
@@ -267,8 +267,8 @@ impl<'a> Qwen4Loader<'a> {
             let mut weights = self.mtp(cfg)?;
             if fp8_head {
                 let started = std::time::Instant::now();
-                let (q, scales) = crate::glmf::fp8::quantize(&head, cfg.vocab_size, cfg.hidden,
-                    crate::glmf::fp8::Layout::Row128, self.fp8_scales);
+                let (q, scales) = crate::families::glm5_flash::fp8::quantize(&head, cfg.vocab_size, cfg.hidden,
+                    crate::families::glm5_flash::fp8::Layout::Row128, self.fp8_scales);
                 weights.head_fp8 = Some((self.upload(&q)?, self.upload(&f32_bytes(&scales))?));
                 tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "MTP draft head quantized to E4M3");
             }

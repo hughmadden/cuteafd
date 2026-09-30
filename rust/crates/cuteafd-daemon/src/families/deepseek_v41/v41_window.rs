@@ -1,6 +1,6 @@
 //! Backbone FP8 window KV production, private proposals and accepted ring writes.
-use crate::v41_memory::{DeviceAllocation, HostAllocation, LoadStream};
-use crate::v41_tensors::NativeRtxTensors;
+use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps, V41Fp8Plan, V41Kv};
 use cuteafd_loader::OfficialV41Catalog;
@@ -376,9 +376,9 @@ impl WindowProposal<'_> {
     /// # Safety
     /// Producer writes are complete or ordered before the replica's stream.
     /// Retain both plane owners until all peer consumers drain.
-    pub unsafe fn copy_peer(&self,replica:&crate::v41_memory::proposal_replica::ProposalReplica<'_>,
+    pub unsafe fn copy_peer(&self,replica:&crate::shared::memory::proposal_replica::ProposalReplica<'_>,
         stream:*mut c_void)->Result<()> {
-        ensure!(replica.format()==crate::v41_memory::proposal_replica::ProposalFormat::WindowFp8,
+        ensure!(replica.format()==crate::shared::memory::proposal_replica::ProposalFormat::WindowFp8,
             "window proposal replica format differs");
         unsafe { replica.copy_rows(self.values,self.scales,self.offset,self.tokens,1,stream) }
     }
@@ -417,7 +417,7 @@ pub(crate) struct WindowWave<'w, 'a> {
     pending_query: Option<(Prepared, bool)>,
     pending_commit: Option<PendingCommit>,
     replica: Option<(std::rc::Rc<replica::WindowReplica<'a>>,
-        crate::v41_memory::peer_publication::PeerPublication<'a>)>,
+        crate::shared::memory::peer_publication::PeerPublication<'a>)>,
 }
 impl WindowWave<'_, '_> {
     pub fn device_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {
@@ -532,7 +532,7 @@ impl WindowWave<'_, '_> {
     /// Query and admitted state slots stay alive and immutable until poll_query
     /// completes or abort_query drains. Peer work may use only disjoint slots.
     pub unsafe fn enqueue_query(&mut self, state: &WindowState<'_>, chunks: &[WindowChunk],
-        query: &crate::v41_attention_query::AttentionQueryOutput<'_>) -> Result<()> {
+        query: &crate::families::deepseek_v41::v41_attention_query::AttentionQueryOutput<'_>) -> Result<()> {
         let prepared = self.prepare(state, chunks)?;
         ensure!(query.binding()?.layer() == self.weights.layer && query.layer == self.weights.layer
             && query.rows == prepared.rows && query.hidden.bytes == prepared.rows * 10240
@@ -543,7 +543,7 @@ impl WindowWave<'_, '_> {
         let capture = self.graph.is_none();
         let result = (|| -> Result<()> {
             // Reads only the normalized layer input: overlap the query projections.
-            unsafe { crate::v41_memory::chain::join_fork(self.stream.library, self.stream.raw)?; }
+            unsafe { crate::shared::memory::chain::join_fork(self.stream.library, self.stream.raw)?; }
             unsafe { self.stream.library.copy_d2d_async(self.input.buffer, query.hidden,
                 query.hidden.bytes, self.stream.raw)?; }
             self.upload(&prepared)?;
@@ -562,7 +562,7 @@ impl WindowWave<'_, '_> {
         let result = (|| -> Result<bool> {
             let (prepared, capture) = self.pending_query.as_ref().context("no queued cache query")?;
             ensure!(prepared.owner == state.owner, "queued cache owner differs");
-            let chained = crate::v41_memory::chain::active();
+            let chained = crate::shared::memory::chain::active();
             if !chained && !unsafe { self.stream.library.cuda_stream_query(self.stream.raw)? } { return Ok(false); }
             if *capture {
                 unsafe { self.stream.library.cuda_graph_begin_capture(self.stream.raw)?; }
@@ -581,7 +581,7 @@ impl WindowWave<'_, '_> {
                 // committing cache state; publish the existing result below.
             }
             // Inside a stage chain the eager/replayed proposal is ordered, not complete.
-            if chained { unsafe { crate::v41_memory::chain::finish(self.stream.library, self.stream.raw)?; } }
+            if chained { unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw)?; } }
             self.ready = Some(self.pending_query.take().unwrap().0);
             self.output(state)?;
             Ok(true)
@@ -603,7 +603,7 @@ impl WindowWave<'_, '_> {
         &'s mut self,
         state: &'s WindowState<'_>,
         chunks: &[WindowChunk],
-        query: &crate::v41_attention_query::AttentionQueryOutput<'_>,
+        query: &crate::families::deepseek_v41::v41_attention_query::AttentionQueryOutput<'_>,
     ) -> Result<WindowOutput<'s>> {
         self.ready = None;
         let prepared = self.prepare(state, chunks)?;
@@ -618,7 +618,7 @@ impl WindowWave<'_, '_> {
         let executed = (|| -> Result<()> {
             unsafe {
                 // Reads only the normalized layer input: overlap the query projections.
-                crate::v41_memory::chain::join_fork(self.stream.library, self.stream.raw)?;
+                crate::shared::memory::chain::join_fork(self.stream.library, self.stream.raw)?;
                 self.stream.library.copy_d2d_async(
                     self.input.buffer, query.hidden, query.hidden.bytes, self.stream.raw,
                 )?;
@@ -699,7 +699,7 @@ impl WindowWave<'_, '_> {
         let launched = self.upload(&p).and_then(|()| unsafe {
             self.stream.library.cuda_graph_launch(g, self.stream.raw)
         });
-        launched.and(unsafe { crate::v41_memory::chain::finish(self.stream.library, self.stream.raw) })?;
+        launched.and(unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw) })?;
         self.ready = Some(p);
         self.output(state)
     }

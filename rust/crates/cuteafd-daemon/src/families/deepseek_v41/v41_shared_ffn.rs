@@ -1,6 +1,6 @@
 //! Shared native FP8 SwiGLU execution for backbone and dSpark weights.
-use crate::v41_memory::{DeviceAllocation, LoadStream};
-use crate::v41_tensors::NativeRtxTensors;
+use crate::shared::memory::{DeviceAllocation, LoadStream};
+use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41Fp8Plan, V41SharedSwiGlu};
 use std::ffi::c_void;

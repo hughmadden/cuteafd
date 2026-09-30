@@ -1,7 +1,7 @@
 use super::*;
-use crate::v41_dspark_cache::{DsparkWindow, WindowLease};
-use crate::v41_experts::dspark::{DsparkChain, DsparkMainContext, DsparkWeights};
-use crate::v41_requests::RequestBatch;
+use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowLease};
+use crate::families::deepseek_v41::v41_experts::dspark::{DsparkChain, DsparkMainContext, DsparkWeights};
+use crate::families::deepseek_v41::v41_requests::RequestBatch;
 mod chain;
 mod policy;
 pub(crate) use policy::snapshot as policy_snapshot;
@@ -40,7 +40,7 @@ struct DraftRequest {
     slot: usize,
 }
 pub(crate) struct DraftPrefix<'a> {
-    windows: crate::v41_memory::device::DeviceOwner<'a, Vec<crate::v41_dspark_cache::DsparkPrefix<'a>>>,
+    windows: crate::shared::memory::device::DeviceOwner<'a, Vec<crate::families::deepseek_v41::v41_dspark_cache::DsparkPrefix<'a>>>,
 }
 impl<'w, 'a> DraftRuntime<'w, 'a> {
     pub fn new(
@@ -402,7 +402,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         }
     }
     /// Begin a completed decode batch's accepted-cache transaction on its own lane.
-    pub fn begin_queued_commit(&mut self, lane: usize, pass: &impl crate::v41_target_pass::TargetCache<'a>,
+    pub fn begin_queued_commit(&mut self, lane: usize, pass: &impl crate::families::deepseek_v41::v41_target_pass::TargetCache<'a>,
         requests: &Requests<'a>, batch: &RequestBatch, accepted: &[u32]) -> Result<()> {
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
         ensure!(lane < self.mains.len() && self.pending_commit_ids[lane].is_empty(), "commit lane busy or invalid");
@@ -415,7 +415,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         let stage_leases: [Vec<WindowLease>; 3] = std::array::from_fn(|stage|
             leases.iter().map(|request| request[stage]).collect());
         let taps = pass.taps(batch)?;
-        let chunks = crate::v41_experts::dspark::prepare_commit_rows(taps.rows(), self.windows.each_ref(),
+        let chunks = crate::families::deepseek_v41::v41_experts::dspark::prepare_commit_rows(taps.rows(), self.windows.each_ref(),
             stage_leases.each_ref().map(|leases| leases.as_slice()), accepted)?;
         let writes = [self.windows[0].prepare_async_write(&chunks[0], taps.rows().len() as u32)?,
             self.windows[1].prepare_async_write(&chunks[1], taps.rows().len() as u32)?,
@@ -428,7 +428,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
         self.mains[lane].poll_commit()
     }
-    pub fn finish_queued_commit(&mut self, lane: usize, pass: &mut impl crate::v41_target_pass::TargetCache<'a>,
+    pub fn finish_queued_commit(&mut self, lane: usize, pass: &mut impl crate::families::deepseek_v41::v41_target_pass::TargetCache<'a>,
         requests: &mut Requests<'a>, batch: &mut RequestBatch, accepted: &[u32]) -> Result<()> {
         let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
         self.mains[lane].publish_commit(&mut self.windows)?;
@@ -529,12 +529,12 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
 }
 
 impl<'a> DraftPrefix<'a> {
-    pub fn parts(&self) -> &[crate::v41_dspark_cache::DsparkPrefix<'a>] {
+    pub fn parts(&self) -> &[crate::families::deepseek_v41::v41_dspark_cache::DsparkPrefix<'a>] {
         self.windows.get().as_slice()
     }
-    pub fn from_parts(library: &'a NativeLibrary, windows: Vec<crate::v41_dspark_cache::DsparkPrefix<'a>>) -> Result<Self> {
+    pub fn from_parts(library: &'a NativeLibrary, windows: Vec<crate::families::deepseek_v41::v41_dspark_cache::DsparkPrefix<'a>>) -> Result<Self> {
         ensure!(windows.len() == 3, "draft prefix requires three windows");
-        let device = crate::v41_memory::device::Device {
+        let device = crate::shared::memory::device::Device {
             library, id: windows[0].parts().2.buffer.device_id,
         };
         ensure!(windows.iter().all(|window| window.parts().2.buffer.device_id == device.id),
@@ -546,8 +546,8 @@ impl<'a> DraftPrefix<'a> {
 #[cfg(test)]
 mod restored_prefix_tests {
     use super::*;
-    use crate::v41_dspark_cache::DsparkPrefix;
-    use crate::v41_memory::{device::Device, SnapshotStorage};
+    use crate::families::deepseek_v41::v41_dspark_cache::DsparkPrefix;
+    use crate::shared::memory::{device::Device, SnapshotStorage};
 
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and two CUDA devices"]

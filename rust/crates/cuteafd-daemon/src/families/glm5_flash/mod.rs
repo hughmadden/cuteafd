@@ -113,10 +113,10 @@ pub(crate) struct EngineArgs {
     /// E4M3's 3 mantissa bits and quantize exactly (relative RMS 2.4e-2 ->
     /// 4.5e-4); the decode-path gate passed (NLL 1.1443 -> 1.1429, KL 0.0443
     /// -> 0.0386).
-    #[arg(long, value_enum, default_value_t = crate::fp8_linear::Fp8Scales::Pow2)]
-    pub fp8_scales: crate::fp8_linear::Fp8Scales,
+    #[arg(long, value_enum, default_value_t = crate::shared::fp8_linear::Fp8Scales::Pow2)]
+    pub fp8_scales: crate::shared::fp8_linear::Fp8Scales,
     #[command(flatten)]
-    pub l2: crate::l2_prefetch::L2PrefetchArgs,
+    pub l2: crate::shared::l2_prefetch::L2PrefetchArgs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -273,13 +273,13 @@ impl Opened {
             "--fp8-prefill kda reads the per-row FP8 copies --kda-fp8 row128 loads");
         if let Some(snapshot) = &args.draft {
             let started = Instant::now();
-            let cfg = crate::glm::dflash::DflashConfig::read(snapshot)?;
+            let cfg = crate::families::glm5::dflash::DflashConfig::read(snapshot)?;
             ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
                 && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash2 drafter does not fit this target");
             let mask = embed_rows(&self.checkpoint, &[cfg.mask_token], self.cfg.hidden)?;
-            let file = crate::glm::dflash::prefetch(snapshot).join()
+            let file = crate::families::glm5::dflash::prefetch(snapshot).join()
                 .map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
-            let mut drafter = crate::glm::dflash::GlmDrafter::load(&self.library, snapshot, file, stream,
+            let mut drafter = crate::families::glm5::dflash::GlmDrafter::load(&self.library, snapshot, file, stream,
                 args.draft_sequences, args.draft_sequences, mask, true)?;
             if args.draft_fp8 {
                 drafter.enable_fp8(engine.weights.head.buffer.ptr, args.fp8_scales)?;
@@ -292,8 +292,8 @@ impl Opened {
                 engine.set_experts(experts);
             }
         }
-        if let Some(budget) = args.l2.budget(&self.library, crate::l2_prefetch::GLM_DEFAULT)? {
-            engine.l2 = Some(crate::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
+        if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::GLM_DEFAULT)? {
+            engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
         let result = body(&engine);
         drop(engine);
@@ -308,10 +308,10 @@ impl Opened {
         }
         if let Some(tensors) = self.fp8() {
             let directory = args.fp8_package.clone()
-                .unwrap_or_else(|| crate::v41_experts::fp8::package_directory(&args.native_lib, 1));
+                .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&args.native_lib, 1));
             let (free, _) = self.library.cuda_memory_info()?;
             // An empty window: the package and its scratch; layers load on first use.
-            let experts = crate::v41_experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, 0..0, 1, 0,
+            let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, 0..0, 1, 0,
                 args.prefill_rows, free.saturating_sub(4 << 30))?;
             return Ok(Some(engine::Experts::Local(engine::LocalExperts {
                 library: &self.library, tensors, experts: std::cell::RefCell::new(experts),
@@ -334,7 +334,7 @@ impl Opened {
             .map(|rank| cuteafd_transport::v41_expert::v41_spark_executor_id(peers.len(), rank))
             .collect::<Result<_>>()?;
         // One transport per prefill lane: each lane's wave stays in flight on its own QPs.
-        let transports = (0..engine::PREFILL_LANES).map(|_| crate::spark_intake::SparkLink::new(&self.library,
+        let transports = (0..engine::PREFILL_LANES).map(|_| crate::shared::spark_intake::SparkLink::new(&self.library,
             &peers, &executors, u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2))
             .collect::<Result<Vec<_>>>()?;

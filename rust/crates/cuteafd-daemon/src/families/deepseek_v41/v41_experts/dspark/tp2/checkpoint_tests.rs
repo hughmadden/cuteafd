@@ -1,6 +1,6 @@
 use super::{pair::Pair, rank::Weights};
-use crate::v41_experts::{ExpertLayer, ExpertWeights};
-use crate::v41_memory::device::{Device, Stream};
+use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights};
+use crate::shared::memory::device::{Device, Stream};
 use anyhow::{ensure, Result};
 use cuteafd_ffi::NativeLibrary;
 

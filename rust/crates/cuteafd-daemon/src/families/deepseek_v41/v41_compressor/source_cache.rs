@@ -1,5 +1,5 @@
 //! Paired index/FP4 KV pages owned by compressor request leases.
-use crate::v41_memory::{DeviceAllocation, HostAllocation};
+use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::{ensure, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41Kv};
 use std::ffi::c_void;
@@ -488,7 +488,7 @@ mod high_pages;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v41_memory::LoadStream;
+    use crate::shared::memory::LoadStream;
 
     pub(super) fn append(
         cache: &mut SourceCache<'_>,

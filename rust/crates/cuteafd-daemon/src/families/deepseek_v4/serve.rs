@@ -2,7 +2,7 @@
 //! the prefill/decode engine (the correctness baseline batching builds on).
 use super::pool::{Placement, PoolAllocator};
 use super::{embed_rows, with_engine, EngineArgs};
-use crate::prefill_share::{Chunk, DecodeShareArgs};
+use crate::shared::prefill_share::{Chunk, DecodeShareArgs};
 use anyhow::{Context, Result};
 use cuteafd_api::native_v41::{
     ConsoleHub, InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits,
@@ -116,7 +116,7 @@ fn serve_loop(
 /// chunks of `limit` tokens; the last one returns the logits).
 struct Prefill<'a> {
     job: NativeRequest,
-    constraint: Option<crate::v41_native_serve::constraints::State<'a>>,
+    constraint: Option<crate::shared::constraints::State<'a>>,
     tokens: Vec<u32>,
     limit: usize,
     /// Chunks prefilled so far, of `chunks`.
@@ -134,7 +134,7 @@ struct Prefill<'a> {
 struct Active<'a> {
     job: NativeRequest,
     /// Grammar for structured output and tool calls.
-    constraint: Option<crate::v41_native_serve::constraints::State<'a>>,
+    constraint: Option<crate::shared::constraints::State<'a>>,
     placement: Placement,
     capacity: usize,
     next: u32,
@@ -206,7 +206,7 @@ fn speculative_step(
     hidden: usize,
     vocab: usize,
     eos: u32,
-    transports: &mut [crate::spark_intake::SparkLink<'_>],
+    transports: &mut [crate::shared::spark_intake::SparkLink<'_>],
     runtime: &tokio::runtime::Runtime,
 ) -> Result<Vec<bool>> {
     let noise = engine.cfg.dspark_noise_token_id as u32;
@@ -261,14 +261,14 @@ fn schedule(
     tokenizer: &cuteafd_loader::LoadedTokenizer,
     eos: u32,
     receive: &mut mpsc::Receiver<NativeRequest>,
-    transports: &mut [crate::spark_intake::SparkLink<'_>],
+    transports: &mut [crate::shared::spark_intake::SparkLink<'_>],
     runtime: &tokio::runtime::Runtime,
     stats: &Mutex<serde_json::Value>,
     speculate_max: usize,
     decode_share: DecodeShareArgs,
 ) -> Result<()> {
     let mut allocator = PoolAllocator::new(engine.shape);
-    let mut grammars = crate::v41_native_serve::constraints::Compiler::new(
+    let mut grammars = crate::shared::constraints::Compiler::new(
         &loaded.library, loaded.snapshot.join("tokenizer.json"));
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);

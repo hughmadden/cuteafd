@@ -9,7 +9,7 @@ pub(crate) mod weights;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::deepseek_v4::DeepseekV4Config;
-use crate::spark_intake::SparkLink;
+use crate::shared::spark_intake::SparkLink;
 use cuteafd_transport::TcpTransportConfig;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;

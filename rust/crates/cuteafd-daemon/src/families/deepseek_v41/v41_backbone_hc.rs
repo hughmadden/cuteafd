@@ -1,6 +1,6 @@
 //! Official backbone mHC parameters around attention and routed FFN execution.
-use crate::v41_hc::{HcBinding, HcSublayer};
-use crate::v41_tensors::NativeRtxTensors;
+use crate::families::deepseek_v41::v41_hc::{HcBinding, HcSublayer};
+use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::OfficialV41Catalog;
@@ -59,12 +59,12 @@ impl<'a> BackboneHcWeights<'a> {
         &self,
         capacity: usize,
         budget: usize,
-    ) -> Result<crate::v41_block::BackboneBlockWave<'_, 'a>> {
+    ) -> Result<crate::families::deepseek_v41::v41_block::BackboneBlockWave<'_, 'a>> {
         ensure!(
-            crate::v41_block::BackboneBlockWave::device_bytes(capacity)? <= budget,
+            crate::families::deepseek_v41::v41_block::BackboneBlockWave::device_bytes(capacity)? <= budget,
             "backbone block exceeds budget"
         );
-        Ok(crate::v41_block::BackboneBlockWave::new(
+        Ok(crate::families::deepseek_v41::v41_block::BackboneBlockWave::new(
             self.library,
             self.layer,
             self.boundary(true, capacity, HcSublayer::device_bytes(capacity)?)?,

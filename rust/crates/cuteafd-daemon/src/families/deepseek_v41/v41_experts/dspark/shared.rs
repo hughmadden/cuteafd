@@ -1,7 +1,7 @@
 //! Native shared-expert projections, packed scales and exclusive per-wave scratch.
 use super::DsparkWeights;
-use crate::v41_memory::{DeviceAllocation, LoadStream};
-use crate::v41_tensors::NativeRtxTensors;
+use crate::shared::memory::{DeviceAllocation, LoadStream};
+use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use std::ffi::c_void;
@@ -51,7 +51,7 @@ pub(super) fn pack_scales<'a>(
 pub(crate) struct DsparkSharedFfn<'weights, 'library> {
     weights: &'weights DsparkWeights<'library>,
     stage: usize,
-    inner: crate::v41_shared_ffn::SharedFfn<'weights, 'library>,
+    inner: crate::families::deepseek_v41::v41_shared_ffn::SharedFfn<'weights, 'library>,
 }
 impl<'library> DsparkWeights<'library> {
     pub fn shared_ffn(
@@ -64,7 +64,7 @@ impl<'library> DsparkWeights<'library> {
         Ok(DsparkSharedFfn {
             weights: self,
             stage,
-            inner: crate::v41_shared_ffn::SharedFfn::new(
+            inner: crate::families::deepseek_v41::v41_shared_ffn::SharedFfn::new(
                 self.library,
                 &self.auxiliary,
                 &format!("mtp.{stage}.ffn.shared_experts"),
@@ -77,14 +77,14 @@ impl<'library> DsparkWeights<'library> {
 }
 impl DsparkSharedFfn<'_, '_> {
     pub fn device_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {
-        crate::v41_shared_ffn::SharedFfn::device_bytes(library, capacity)
+        crate::families::deepseek_v41::v41_shared_ffn::SharedFfn::device_bytes(library, capacity)
     }
     pub(super) fn matches_stage(&self, weights: &DsparkWeights<'_>, stage: usize) -> bool {
         self.stage == stage && std::ptr::eq(self.weights, weights)
     }
     pub(in crate::families::deepseek_v41::v41_experts) fn matches(
         &self,
-        weights: &crate::v41_experts::ExpertWeights<'_>,
+        weights: &crate::families::deepseek_v41::v41_experts::ExpertWeights<'_>,
     ) -> bool {
         self.weights.full_expert(self.stage).is_some_and(|stage| std::ptr::eq(stage, weights))
     }

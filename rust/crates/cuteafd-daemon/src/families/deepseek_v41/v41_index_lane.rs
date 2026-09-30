@@ -1,10 +1,10 @@
 //! One lane's learned index query and retained source-20 candidates.
-use crate::v41_attention_query::AttentionQueryOutput;
-use crate::v41_backbone_cache::{CacheAttention, CachePlacement};
-use crate::v41_memory::device::{Device, DeviceOwner};
+use crate::families::deepseek_v41::v41_attention_query::AttentionQueryOutput;
+use crate::families::deepseek_v41::v41_backbone_cache::{CacheAttention, CachePlacement};
+use crate::shared::memory::device::{Device, DeviceOwner};
 mod placement;
-use crate::v41_index_query::{IndexQueryWave, IndexQueryWeights};
-use crate::v41_index_selection::{IndexSelectionOutput, IndexSelectionWave};
+use crate::families::deepseek_v41::v41_index_query::{IndexQueryWave, IndexQueryWeights};
+use crate::families::deepseek_v41::v41_index_selection::{IndexSelectionOutput, IndexSelectionWave};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::OfficialV41Catalog;
@@ -130,7 +130,7 @@ impl<'w, 'a> IndexLane<'w, 'a> {
         query: &AttentionQueryOutput<'_>,
         cache: &CacheAttention<'_>,
     ) -> Result<()> {
-        if crate::v41_memory::chain::active() {
+        if crate::shared::memory::chain::active() {
             // Stream-ordered: the queued projection and selection finish on the
             // chain immediately, so the host never waits here.
             unsafe { self.enqueue_projection(query)?; }
@@ -148,7 +148,7 @@ impl<'w, 'a> IndexLane<'w, 'a> {
         );
         // The direct index path drains its own streams and uses legacy-stream
         // uploads; order it after any chained producers on the host.
-        crate::v41_memory::chain::settle(self.weights.library)?;
+        crate::shared::memory::chain::settle(self.weights.library)?;
         self.query.rebind(&self.weights.weights[self.next])?;
         let requests = cache.selection_requests()?;
         let projected = unsafe { self.query.execute_attention(query)? };

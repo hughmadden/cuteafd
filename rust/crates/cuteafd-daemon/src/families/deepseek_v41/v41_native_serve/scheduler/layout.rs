@@ -1,7 +1,7 @@
 //! Layout selection stays outside lane execution and uses static dispatch.
 use super::*;
-use crate::v41_experts::dspark::{DsparkChain, DistributedDsparkChain};
-use crate::v41_target_pass::DistributedTargetPass;
+use crate::families::deepseek_v41::v41_experts::dspark::{DsparkChain, DistributedDsparkChain};
+use crate::families::deepseek_v41::v41_target_pass::DistributedTargetPass;
 use super::super::prefill_target::PrefillTarget;
 
 pub(in crate::families::deepseek_v41::v41_native_serve) trait ServingTarget<'w, 'a>: PrefillTarget<'a> {

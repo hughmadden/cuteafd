@@ -16,7 +16,7 @@
 //!
 //! The engine taps every step's last-layer rows into a hidden ring (256
 //! positions per sequence ring) that the stages read.
-use crate::v41_memory::DeviceAllocation;
+use crate::shared::memory::DeviceAllocation;
 use super::weights::MimoLayer;
 
 pub(crate) type Dev<'a> = DeviceAllocation<'a>;

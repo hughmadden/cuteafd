@@ -1,8 +1,8 @@
 //! Bounded, captured index selection and snapshot-checked candidate sharing.
-use crate::v41_attention_binding::QueryBinding;
-use crate::v41_compressor::{IndexBinding, IndexProposal};
-use crate::v41_index_query::IndexQueryOutput;
-use crate::v41_memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
+use crate::families::deepseek_v41::v41_compressor::{IndexBinding, IndexProposal};
+use crate::families::deepseek_v41::v41_index_query::IndexQueryOutput;
+use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{
     CuteafdDeviceBuffer, NativeLibrary, V41CandidateBlocks, V41IndexScores, V41IndexTopK,
@@ -365,8 +365,8 @@ impl<'a> IndexSelectionWave<'a> {
     }
     pub fn poll_pending(&mut self) -> Result<bool> {
         ensure!(self.in_flight && self.pending.is_some(), "no pending index selection");
-        let ready = if crate::v41_memory::chain::active() {
-            unsafe { crate::v41_memory::chain::finish(self.stream.library, self.stream.raw) }.map(|()| true)
+        let ready = if crate::shared::memory::chain::active() {
+            unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw) }.map(|()| true)
         } else { unsafe { self.stream.library.cuda_stream_query(self.stream.raw) } };
         match ready {
             Ok(false) => Ok(false),
@@ -506,7 +506,7 @@ impl<'a> IndexSelectionWave<'a> {
             if let Some(busy) = &self.shared_scratch_busy { busy.set(true); }
             let host = self.staging.buffer;
             unsafe {
-                crate::v41_memory::chain::join(self.stream.library, self.stream.raw)?;
+                crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?;
                 self.stream.library.copy_host_buffer_h2d_async(self.b(0), host, rows * 48, self.stream.raw)?;
                 let mut lengths = host;
                 lengths.ptr = host.ptr.cast::<u8>().add(rows * 48).cast(); lengths.bytes = rows * 8;

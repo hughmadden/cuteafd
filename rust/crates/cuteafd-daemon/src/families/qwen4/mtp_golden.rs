@@ -4,7 +4,7 @@
 use super::engine::{Allocator, MtpGroup, MtpRow, MtpSource, Qwen4Engine, Qwen4Placement, DECODE_ROWS};
 use super::speculate::{self, DraftSeq, DraftTiming, MtpSeq, Verified};
 use super::{bf16s, embed_rows, similarity, GoldenArgs, Opened};
-use crate::v41_memory::DeviceAllocation;
+use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use std::time::Instant;
 

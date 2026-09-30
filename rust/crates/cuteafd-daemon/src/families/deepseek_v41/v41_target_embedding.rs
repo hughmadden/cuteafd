@@ -1,6 +1,6 @@
 //! Token initialization and image replacement before the first target mHC block.
-use crate::v41_memory::{DeviceAllocation, HostAllocation, LoadStream};
-use crate::v41_tensors::NativeRtxTensors;
+use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{Context, Result, ensure};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps};
 use std::{ffi::c_void, marker::PhantomData};

@@ -73,7 +73,7 @@ pub(crate) struct ExpertExecution<'weights, 'library> {
     /// Pinned route ids then weights, uploaded asynchronously per request. The
     /// stream drains before each response is emitted, so the next request may
     /// rewrite this staging.
-    route_staging: crate::v41_memory::HostAllocation<'library>,
+    route_staging: crate::shared::memory::HostAllocation<'library>,
     compact_reducer: Option<V41CompactReducer<'library>>,
     compact_output: Option<DeviceAllocation<'library>>,
     output: Option<DeviceAllocation<'library>>,
@@ -91,7 +91,7 @@ impl<'library> ExpertWeights<'library> {
         let library = self.buffers[0].library;
         Self::plan_execution(self.layer, library, capacity, self.is_nvfp4())
     }
-    pub(super) fn plan_execution(
+    pub(crate) fn plan_execution(
         layer: ExpertLayer,
         library: &NativeLibrary,
         capacity: u32,
@@ -229,7 +229,7 @@ impl<'library> ExpertWeights<'library> {
         };
         let decode = prepare_small(1, budget.decode_scratch_bytes)?;
         let small = prepare_small(80, budget.small_scratch_bytes)?;
-        let route_staging = crate::v41_memory::HostAllocation::new(library, budget.routing_bytes)?;
+        let route_staging = crate::shared::memory::HostAllocation::new(library, budget.routing_bytes)?;
         Ok(ExpertExecution {
             stream,
             _weights: self,
@@ -568,9 +568,9 @@ impl Drop for ExpertExecution<'_, '_> {
 
 /// Reusable host exchange for the TCP fallback; RDMA can consume device route views.
 pub(crate) struct HostExpertExchange {
-    pub(super) ids: Vec<i32>,
-    pub(super) routing: Vec<f32>,
-    pub(super) partials: Vec<u8>,
+    pub(crate) ids: Vec<i32>,
+    pub(crate) routing: Vec<f32>,
+    pub(crate) partials: Vec<u8>,
 }
 impl HostExpertExchange {
     /// Exact bytes `new` allocates for this capacity. Admission uses this figure
@@ -856,8 +856,8 @@ mod timing_role_tests {
     #[test]
     fn pure_tp6_role_selects_the_compact_output_path() {
         assert!(super::compact_output_role(
-            crate::v41_spark_topology::SPARK_TP6_ROLE
+            crate::families::deepseek_v41::v41_spark_topology::SPARK_TP6_ROLE
         ));
-        assert_eq!(crate::v41_spark_topology::SPARK_TP6_ROLE, 7);
+        assert_eq!(crate::families::deepseek_v41::v41_spark_topology::SPARK_TP6_ROLE, 7);
     }
 }

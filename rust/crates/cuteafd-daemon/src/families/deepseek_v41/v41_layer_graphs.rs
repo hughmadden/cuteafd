@@ -112,7 +112,7 @@ impl<'w, 'a, W> LayerGraphs<'w, 'a, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v41_memory::{DeviceAllocation, LoadStream};
+    use crate::shared::memory::{DeviceAllocation, LoadStream};
 
     #[test]
     fn cuda_small_shape_bank_replays_changes_and_bounds_large_shapes() -> Result<()> {

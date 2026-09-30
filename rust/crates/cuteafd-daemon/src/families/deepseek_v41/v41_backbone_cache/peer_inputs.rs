@@ -1,8 +1,8 @@
 //! Reusable private inputs for one lane's peer attention half.
 use super::*;
-use crate::v41_memory::{device::Allocation,proposal_replica::{ProposalReplica,ProposalFormat}};
-use crate::v41_index_selection::IndexSelectionOutput;
-use crate::v41_compressor::IndexBinding;
+use crate::shared::memory::{device::Allocation,proposal_replica::{ProposalReplica,ProposalFormat}};
+use crate::families::deepseek_v41::v41_index_selection::IndexSelectionOutput;
+use crate::families::deepseek_v41::v41_compressor::IndexBinding;
 use cuteafd_ffi::{CuteafdDeviceBuffer,V41PeerCopy};
 use std::ffi::c_void;
 
@@ -33,33 +33,33 @@ mod tests {
                 BackboneCache::replicated_device_bytes(map,2,[2;4])?)?;
             let lease=bank.begin_request(0,42)?;
             let batch=bank.plan(&[CacheWork { lease,tokens:5,kind:ExpertV2SourceKind::Prefill }])?;
-            let ww=source.own(||crate::v41_window::WindowWeights::load(&lib,&catalog,layer,
-                crate::v41_window::WindowWeights::device_bytes(&lib,&catalog,layer)?,1<<20))?;
-            let cw=source.own(||crate::v41_compressor::CompressorWeights::load(&lib,&catalog,layer,
-                crate::v41_compressor::CompressorWeights::device_bytes(&catalog,layer)?,1<<20))?;
+            let ww=source.own(||crate::families::deepseek_v41::v41_window::WindowWeights::load(&lib,&catalog,layer,
+                crate::families::deepseek_v41::v41_window::WindowWeights::device_bytes(&lib,&catalog,layer)?,1<<20))?;
+            let cw=source.own(||crate::families::deepseek_v41::v41_compressor::CompressorWeights::load(&lib,&catalog,layer,
+                crate::families::deepseek_v41::v41_compressor::CompressorWeights::device_bytes(&catalog,layer)?,1<<20))?;
             let mut window=source.own(||ww.wave(16,usize::MAX))?;
             let mut compressed=source.own(||cw.wave(16,usize::MAX))?;
-            let qw=source.own(||crate::v41_attention_query::AttentionQueryWeights::load(&lib,&catalog,layer,
-                crate::v41_attention_query::AttentionQueryWeights::device_bytes(&lib,&catalog,layer)?,1<<20))?;
+            let qw=source.own(||crate::families::deepseek_v41::v41_attention_query::AttentionQueryWeights::load(&lib,&catalog,layer,
+                crate::families::deepseek_v41::v41_attention_query::AttentionQueryWeights::device_bytes(&lib,&catalog,layer)?,1<<20))?;
             let mut query=source.own(||qw.wave(16,usize::MAX))?;
-            let iw=source.own(||crate::v41_index_query::IndexQueryWeights::load(&lib,&catalog,layer,
-                crate::v41_index_query::IndexQueryWeights::device_bytes(&lib,&catalog,layer)?,1<<20))?;
+            let iw=source.own(||crate::families::deepseek_v41::v41_index_query::IndexQueryWeights::load(&lib,&catalog,layer,
+                crate::families::deepseek_v41::v41_index_query::IndexQueryWeights::device_bytes(&lib,&catalog,layer)?,1<<20))?;
             let mut index=source.own(||iw.wave(16,usize::MAX))?;
-            let mut selection=source.own(||crate::v41_index_selection::IndexSelectionWave::new(&lib,16,usize::MAX))?;
-            let mut full=source.own(||crate::v41_sparse_attention::SparseAttentionWave::new(&lib,16,usize::MAX))?;
-            let ow=source.own(||crate::v41_attention_output::AttentionOutputWeights::load(&lib,&catalog,layer,
-                crate::v41_attention_output::AttentionOutputWeights::device_bytes(&lib,&catalog,layer)?,1<<20))?;
+            let mut selection=source.own(||crate::families::deepseek_v41::v41_index_selection::IndexSelectionWave::new(&lib,16,usize::MAX))?;
+            let mut full=source.own(||crate::families::deepseek_v41::v41_sparse_attention::SparseAttentionWave::new(&lib,16,usize::MAX))?;
+            let ow=source.own(||crate::families::deepseek_v41::v41_attention_output::AttentionOutputWeights::load(&lib,&catalog,layer,
+                crate::families::deepseek_v41::v41_attention_output::AttentionOutputWeights::device_bytes(&lib,&catalog,layer)?,1<<20))?;
             let mut reference_projection=source.own(||ow.wave(16,usize::MAX))?;
             let mut projection=source.own(||ow.wave(16,usize::MAX))?;
-            let mut dual=crate::v41_sparse_attention::dual::DualAttentionWave::new([source,peer],16,
-                crate::v41_sparse_attention::dual::DualAttentionWave::device_bytes(16)?)?;
+            let mut dual=crate::families::deepseek_v41::v41_sparse_attention::dual::DualAttentionWave::new([source,peer],16,
+                crate::families::deepseek_v41::v41_sparse_attention::dual::DualAttentionWave::device_bytes(16)?)?;
             let sink_name=format!("layers.{layer}.attn.attn_sink");
-            let sink_weights=source.own(||crate::v41_tensors::NativeRtxTensors::load(
+            let sink_weights=source.own(||crate::families::deepseek_v41::v41_tensors::NativeRtxTensors::load(
                 &lib,&catalog,&[sink_name.clone()],256,1<<20))?;
             let sink=sink_weights.get().get(&sink_name)?;
             let runtime=tokio::runtime::Builder::new_current_thread().build()?;
             let inputs=PeerAttentionInputs::new(source,peer,16,PeerAttentionInputs::device_bytes(16)?)?;
-            let stream=crate::v41_memory::device::Stream::new(peer)?;
+            let stream=crate::shared::memory::device::Stream::new(peer)?;
             for seed in [0,7] {
                 let host:Vec<u8>=(0..5*5120).flat_map(|i| {
                     let value=((i+seed)%17) as f32/32.0-0.25;

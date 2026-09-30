@@ -3,7 +3,7 @@
 //! verify-by-replay against serial steps, and the verify-step cost by rows.
 use super::engine::{Allocator, GlmfEngine, GlmfPlacement};
 use super::{bf16s, embed_rows, similarity, GoldenArgs, Opened};
-use crate::glm::dflash::{ContextRow, DraftSeq, TAP_ROWS};
+use crate::families::glm5::dflash::{ContextRow, DraftSeq, TAP_ROWS};
 use anyhow::{ensure, Context, Result};
 use std::time::Instant;
 
@@ -115,10 +115,10 @@ pub(super) fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
     Ok(())
 }
 
-/// [`crate::glm::dflash::replay`] on the golden taps (mHC stream means).
+/// [`crate::families::glm5::dflash::replay`] on the golden taps (mHC stream means).
 pub(super) fn draft_replay(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngine<'_>, start: usize) -> Result<()> {
     let drafter = engine.drafter.as_ref().context("--draft-replay needs --draft")?;
-    let (tokens, greedy) = crate::glm::dflash::golden_sequence(&args.golden, opened.cfg.vocab_size)?;
+    let (tokens, greedy) = crate::families::glm5::dflash::golden_sequence(&args.golden, opened.cfg.vocab_size)?;
     let hidden = opened.cfg.hidden;
     let layers: Vec<Vec<u8>> = drafter.cfg.taps.iter()
         .map(|l| std::fs::read(args.golden.join(format!("layer{l:02}.bin")))).collect::<std::io::Result<_>>()?;
@@ -133,7 +133,7 @@ pub(super) fn draft_replay(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
         }
         Ok(taps)
     };
-    crate::glm::dflash::replay(drafter, &tokens, &greedy, &taps, &|t| embed_rows(&opened.checkpoint, t, hidden),
+    crate::families::glm5::dflash::replay(drafter, &tokens, &greedy, &taps, &|t| embed_rows(&opened.checkpoint, t, hidden),
         engine.weights.head.buffer.ptr, start)
 }
 

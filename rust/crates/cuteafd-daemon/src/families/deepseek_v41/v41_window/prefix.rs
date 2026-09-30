@@ -132,7 +132,7 @@ mod tests {
     #[ignore = "requires CUTEAFD_NATIVE_LIB and CUDA"]
     fn native_window_prefix_restores_after_slot_reuse() -> Result<()> {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-        let device = crate::v41_memory::device::cache_test_device(&lib)?;
+        let device = crate::shared::memory::device::cache_test_device(&lib)?;
         let mut state = device.own(|| WindowState::new(&lib, 20, 2, usize::MAX))?;
         let saved = DeviceAllocation::new(&lib, WINDOW_PREFIX_BYTES)?;
         let stream = LoadStream {

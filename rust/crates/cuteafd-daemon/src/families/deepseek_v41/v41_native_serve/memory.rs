@@ -1,5 +1,5 @@
 //! Startup-only source-pool sizing. No allocation policy runs in the token loop.
-use crate::v41_backbone_cache::BackboneCache;
+use crate::families::deepseek_v41::v41_backbone_cache::BackboneCache;
 use anyhow::{ensure, Context, Result};
 use std::{fmt, str::FromStr};
 
@@ -264,7 +264,7 @@ mod tests {
     }
     #[test]
     fn snapshot_arenas_trade_default_pool_bytes_without_changing_overrides() {
-        let tail = crate::v41_backbone_cache::BackbonePrefix::device_bytes().div_ceil(256) * 256;
+        let tail = crate::families::deepseek_v41::v41_backbone_cache::BackbonePrefix::device_bytes().div_ceil(256) * 256;
         let bytes = 50 * (tail + 3 * cuteafd_ffi::V41DsparkCache::SLOT_BYTES);
         let free = 56 << 30;
         let total = 96 << 30;
@@ -360,7 +360,7 @@ pub(super) struct LocalLayerPlan {
 impl LocalLayerPlan {
     /// Free memory is sampled after mandatory weights, KV and both lanes exist.
     /// Reserve both local workspaces and bounded load staging conservatively.
-    pub fn new(requested: LocalLayers, budgets: &[crate::v41_experts::ExpertLoadBudget],
+    pub fn new(requested: LocalLayers, budgets: &[crate::families::deepseek_v41::v41_experts::ExpertLoadBudget],
         workspace_bytes: usize, free: usize, total: usize, ceiling: usize) -> Result<Self> {
         ensure!(free <= total && ceiling <= total && budgets.len() <= 40, "invalid local memory inventory");
         let available = ceiling.saturating_sub(total - free).saturating_sub(RUNTIME_HEADROOM);
@@ -386,8 +386,8 @@ impl LocalLayerPlan {
 #[cfg(test)]
 mod local_tests {
     use super::*;
-    fn budgets() -> Vec<crate::v41_experts::ExpertLoadBudget> {
-        vec![crate::v41_experts::ExpertLoadBudget { resident_bytes: 7 << 30,
+    fn budgets() -> Vec<crate::families::deepseek_v41::v41_experts::ExpertLoadBudget> {
+        vec![crate::families::deepseek_v41::v41_experts::ExpertLoadBudget { resident_bytes: 7 << 30,
             device_staging_bytes: 20 << 20, pinned_host_bytes: 0, read_scratch_bytes: 0 }; 40]
     }
     #[test]

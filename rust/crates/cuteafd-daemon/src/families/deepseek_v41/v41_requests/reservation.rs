@@ -4,13 +4,13 @@ impl Requests<'_> {
     /// # Safety
     /// Retain query, cache and producer owners; abort queued writes on cancellation.
     pub unsafe fn poll_distributed_encoder_production(&mut self, batch: &RequestBatch,
-        pending: &mut crate::v41_backbone_execution::PendingDistributedProduction<'_, '_, '_, '_>) -> Result<bool> {
+        pending: &mut crate::families::deepseek_v41::v41_backbone_execution::PendingDistributedProduction<'_, '_, '_, '_>) -> Result<bool> {
         self.validate(batch)?;
         unsafe { pending.poll_encoder(&mut self.cache, batch.cache()?) }
     }
 
     pub fn finish_distributed_encoder_publication(&mut self, batch: &RequestBatch,
-        execution: &mut crate::v41_backbone_execution::DistributedExecution<'_, '_>) -> Result<()> {
+        execution: &mut crate::families::deepseek_v41::v41_backbone_execution::DistributedExecution<'_, '_>) -> Result<()> {
         self.validate(batch)?;
         execution.finish_encoder_publication(&mut self.cache, batch.cache()?)
     }
@@ -28,8 +28,8 @@ impl Requests<'_> {
     /// producers. Poll and complete the returned owner on the CUDA thread.
     pub unsafe fn prepare_encoder_layer<'l, 'lw, 'la>(&mut self, batch: &RequestBatch,
         execution: &mut BackboneExecution<'_, '_>, lane: &'l mut BackboneLane<'lw, 'la>,
-        index: &mut crate::v41_index_lane::IndexLane<'_, '_>)
-        -> Result<crate::v41_backbone_execution::PreparedLayer<'l, 'lw, 'la>> {
+        index: &mut crate::families::deepseek_v41::v41_index_lane::IndexLane<'_, '_>)
+        -> Result<crate::families::deepseek_v41::v41_backbone_execution::PreparedLayer<'l, 'lw, 'la>> {
         self.validate(batch)?;
         unsafe { execution.prepare_encoder_layer(&mut self.cache, batch.cache()?, lane, index) }
     }
@@ -106,8 +106,8 @@ impl Requests<'_> {
         batches: [&mut RequestBatch; 2],
         executions: [&mut BackboneExecution<'_, '_>; 2],
         lanes: [&mut BackboneLane<'_, '_>; 2],
-        indices: [&mut crate::v41_index_lane::IndexLane<'_, '_>; 2],
-        transports: [&mut crate::v41_experts::coordinator::NativeTp4Wave<'_>; 2],
+        indices: [&mut crate::families::deepseek_v41::v41_index_lane::IndexLane<'_, '_>; 2],
+        transports: [&mut crate::families::deepseek_v41::v41_experts::coordinator::NativeTp4Wave<'_>; 2],
     ) -> Result<()> {
         let mut guard = PairGuard { requests: self, batches, complete: false };
         let [first, second] = &mut guard.batches;

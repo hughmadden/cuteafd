@@ -34,8 +34,8 @@ impl<'a> WindowWave<'_, 'a> {
         ensure!(state.layer==self.weights.layer && state.values.buffer.device_id==self.values.buffer.device_id
             && std::ptr::eq(state.ends.library,self.stream.library),
             "window replica producer differs");
-        let source=crate::v41_memory::device::Device { library:self.stream.library,id:self.values.buffer.device_id };
-        let publication=crate::v41_memory::peer_publication::PeerPublication::new(source,replica.device())?;
+        let source=crate::shared::memory::device::Device { library:self.stream.library,id:self.values.buffer.device_id };
+        let publication=crate::shared::memory::peer_publication::PeerPublication::new(source,replica.device())?;
         self.replica=Some((replica,publication)); Ok(())
     }
     /// # Safety
@@ -244,7 +244,7 @@ mod tests {
         let mut reference = WindowState::new(&lib, 0, 2, usize::MAX)?;
         let replica=if replicated {
             Some(state.enable_replica(
-                crate::v41_memory::device::Device { library:&lib,id:1-lib.cuda_get_device()? })?)
+                crate::shared::memory::device::Device { library:&lib,id:1-lib.cuda_get_device()? })?)
         } else { None };
         let first = state.begin_request(0, 11)?;
         let second = state.begin_request(1, 22)?;

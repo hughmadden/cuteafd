@@ -1,8 +1,8 @@
 //! Lane-owned draft terminal: RTX1 normalization/sampling, TP2 shared head.
 use super::*;
-use crate::v41_memory::device::{Device, DeviceOwner};
-use crate::v41_target_head::distributed::DistributedVocabularyWave;
-use crate::v41_tensors::VocabularyShard;
+use crate::shared::memory::device::{Device, DeviceOwner};
+use crate::families::deepseek_v41::v41_target_head::distributed::DistributedVocabularyWave;
+use crate::families::deepseek_v41::v41_tensors::VocabularyShard;
 
 #[derive(Clone, Copy)]
 enum Phase { Normalize, Project, Assemble, Sample }

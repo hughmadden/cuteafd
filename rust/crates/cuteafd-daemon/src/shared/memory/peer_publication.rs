@@ -58,7 +58,7 @@ impl<'a> PeerPublication<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v41_memory::device::Allocation;
+    use crate::shared::memory::device::Allocation;
     use cuteafd_ffi::NativeLibrary;
     use std::sync::atomic::{AtomicBool, Ordering};
 

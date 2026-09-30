@@ -1,5 +1,5 @@
 use super::DsparkWeights;
-use crate::v41_memory::{DeviceAllocation, LoadStream};
+use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41DsparkConfidence};
 use std::ffi::c_void;

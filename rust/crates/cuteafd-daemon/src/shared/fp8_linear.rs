@@ -2,7 +2,7 @@
 //! packed at load by `fp8_gemv.cu` (FP32 scales per output row and 128-wide
 //! K block, `amax / 448` or with `pow2` the smallest power of two >= it) and
 //! applied by its W8A16 tensor-core GEMV (BF16 activations, FP32 sums).
-use crate::v41_memory::DeviceAllocation;
+use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Result};
 use cuteafd_ffi::NativeLibrary;
 use std::ffi::c_void;

@@ -1,6 +1,6 @@
 //! Exercise physical addresses near the expanded limit with real CUDA consumers.
 use super::*;
-use crate::v41_memory::LoadStream;
+use crate::shared::memory::LoadStream;
 use cuteafd_ffi::{V41Compressor, V41SparseSource, V41SparseWindow};
 
 fn filled<'a>(lib: &'a NativeLibrary, bytes: &[u8]) -> Result<DeviceAllocation<'a>> {

@@ -1,8 +1,8 @@
 //! Complete lane-owned GPU1 draft chain with peer embeddings and TP2 vocabulary.
 use super::*;
-use crate::v41_experts::dspark::DistributedDsparkTerminal;
-use crate::v41_memory::device::{Device, DeviceOwner};
-use crate::v41_tensors::VocabularyShard;
+use crate::families::deepseek_v41::v41_experts::dspark::DistributedDsparkTerminal;
+use crate::shared::memory::device::{Device, DeviceOwner};
+use crate::families::deepseek_v41::v41_tensors::VocabularyShard;
 #[cfg(test)]
 mod tests;
 

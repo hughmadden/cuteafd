@@ -1,5 +1,5 @@
 use super::*;
-use crate::v41_memory::{SnapshotPool, SnapshotStorage};
+use crate::shared::memory::{SnapshotPool, SnapshotStorage};
 
 pub(crate) struct DsparkPrefix<'a> {
     owner: u64,

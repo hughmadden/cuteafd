@@ -1,14 +1,14 @@
 //! One target pass from request-owned text/image rows through layer 39 and logits.
-use crate::v41_backbone_execution::BackboneExecution;
-use crate::v41_backbone_cache::CacheStage;
-use crate::v41_block::{BlockOutput, EncoderSuffix};
-use crate::v41_backbone_lane::BackboneLane;
-use crate::v41_engram::{layer::EngramGate, EngramDeviceRows};
-use crate::v41_experts::coordinator::NativeTp4Wave;
-use crate::v41_index_lane::IndexLane;
-use crate::v41_requests::{RequestBatch, Requests};
-use crate::v41_target_embedding::TargetEmbeddingWave;
-use crate::v41_target_head::{SampledTargetRows, TargetHeadWave, TargetLogits, TargetSamplingRowRequest};
+use crate::families::deepseek_v41::v41_backbone_execution::BackboneExecution;
+use crate::families::deepseek_v41::v41_backbone_cache::CacheStage;
+use crate::families::deepseek_v41::v41_block::{BlockOutput, EncoderSuffix};
+use crate::families::deepseek_v41::v41_backbone_lane::BackboneLane;
+use crate::families::deepseek_v41::v41_engram::{layer::EngramGate, EngramDeviceRows};
+use crate::families::deepseek_v41::v41_experts::coordinator::NativeTp4Wave;
+use crate::families::deepseek_v41::v41_index_lane::IndexLane;
+use crate::families::deepseek_v41::v41_requests::{RequestBatch, Requests};
+use crate::families::deepseek_v41::v41_target_embedding::TargetEmbeddingWave;
+use crate::families::deepseek_v41::v41_target_head::{SampledTargetRows, TargetHeadWave, TargetLogits, TargetSamplingRowRequest};
 use anyhow::{ensure, Context, Result};
 use std::time::{Duration, Instant};
 mod taps;
@@ -129,7 +129,7 @@ pub(crate) struct TargetPass<'w, 'a> {
     /// for every other terminal.
     sampled: Option<SampledTargetRows>,
     /// Device-side stage ordering for this pass owner (see `v41_memory::chain`).
-    chain: Option<crate::v41_memory::chain::StageChain<'a>>,
+    chain: Option<crate::shared::memory::chain::StageChain<'a>>,
 }
 impl<'w, 'a> TargetPass<'w, 'a> {
     pub fn set_route_capture(&mut self, enabled: bool) {
@@ -138,7 +138,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     }
     pub fn captured_routes(&self) -> &[Vec<[u32; 6]>] { self.lane.captured_routes() }
     /// Host FFN stage split of the last captured pass.
-    pub fn captured_ffn_split(&self) -> crate::v41_backbone_lane::FfnSplit { self.lane.captured_ffn_split() }
+    pub fn captured_ffn_split(&self) -> crate::families::deepseek_v41::v41_backbone_lane::FfnSplit { self.lane.captured_ffn_split() }
     /// Device time per layer (FFN finish to FFN finish) of the last captured
     /// pass; layer 0 has no predecessor.
     pub fn captured_layer_us(&self) -> Vec<Option<f64>> {
@@ -163,8 +163,8 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             "target engram gates out of order"
         );
         ensure!(!engram_timeout.is_zero(), "engram timeout must be positive");
-        let chain = crate::v41_memory::chain::enabled()
-            .then(|| crate::v41_memory::chain::StageChain::new(upload.library())).transpose()?;
+        let chain = crate::shared::memory::chain::enabled()
+            .then(|| crate::shared::memory::chain::StageChain::new(upload.library())).transpose()?;
         Ok(Self {
             embedding,
             lane,
@@ -405,7 +405,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
                     // Inside a stage chain the gathered rows are uploaded on their
                     // own stream and the gate joins the chain, so the direct pass
                     // uses the same queued form instead of draining the chain.
-                    if requests.cooperative_completion() || crate::v41_memory::chain::active() {
+                    if requests.cooperative_completion() || crate::shared::memory::chain::active() {
                         loop {
                             let gathered = requests.with_requests(|requests| requests.poll_engram_gather(guard.batch, &self.lane))?;
                             match gathered {
@@ -424,7 +424,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
                         }
                     } else {
                         // The direct engram gate uses legacy-stream copies.
-                        crate::v41_memory::chain::settle(self.upload.library())?;
+                        crate::shared::memory::chain::settle(self.upload.library())?;
                         while !unsafe {
                         requests.with_requests(|requests| requests.poll_engram(
                             guard.batch,
@@ -580,9 +580,9 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         &mut self,
         requests: &mut Requests<'a>,
         batch: &mut RequestBatch,
-        proposal: &mut crate::v41_experts::dspark::MainProposal<'_, '_, '_>,
-        windows: &mut [&mut crate::v41_dspark_cache::DsparkWindow<'_>; 3],
-        leases: [&[crate::v41_dspark_cache::WindowLease]; 3],
+        proposal: &mut crate::families::deepseek_v41::v41_experts::dspark::MainProposal<'_, '_, '_>,
+        windows: &mut [&mut crate::families::deepseek_v41::v41_dspark_cache::DsparkWindow<'_>; 3],
+        leases: [&[crate::families::deepseek_v41::v41_dspark_cache::WindowLease]; 3],
         accepted: &[u32],
     ) -> Result<()> {
         let id = batch.cache()?.identity();

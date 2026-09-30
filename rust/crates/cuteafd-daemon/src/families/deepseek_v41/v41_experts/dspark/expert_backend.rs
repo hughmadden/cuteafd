@@ -1,11 +1,11 @@
 //! Routed draft compute with fixed inputs/output and lane-owned graph storage.
 use super::{DsparkRouter, DsparkSharedFfn, DsparkWeights};
-use crate::v41_experts::exl3::execution::Exl3InputFormat;
-use crate::v41_experts::{
+use crate::families::deepseek_v41::v41_experts::exl3::execution::Exl3InputFormat;
+use crate::families::deepseek_v41::v41_experts::{
     exl3::{execution::{Exl3Execution, Exl3Workspace}, Exl3Weights},
     ExpertExecution,
 };
-use crate::v41_memory::{DeviceAllocation, LoadStream};
+use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41Bf16Add};
 use std::{ffi::c_void, path::Path, rc::Rc};

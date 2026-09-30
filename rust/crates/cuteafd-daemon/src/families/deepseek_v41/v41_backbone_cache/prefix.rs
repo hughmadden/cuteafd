@@ -1,7 +1,7 @@
 use super::*;
-use crate::v41_compressor::{CompressorPrefix, COMPRESSOR_PREFIX_BYTES};
-use crate::v41_memory::{SnapshotPool, SnapshotStorage};
-use crate::v41_window::{WindowPrefix, WINDOW_PREFIX_BYTES};
+use crate::families::deepseek_v41::v41_compressor::{CompressorPrefix, COMPRESSOR_PREFIX_BYTES};
+use crate::shared::memory::{SnapshotPool, SnapshotStorage};
+use crate::families::deepseek_v41::v41_window::{WindowPrefix, WINDOW_PREFIX_BYTES};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 
 pub(crate) struct BackbonePrefix<'a> {

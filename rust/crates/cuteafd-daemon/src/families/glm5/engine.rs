@@ -11,8 +11,8 @@
 //! its own workspace and transport ([`GlmEngine::prefill`]): one lane's Spark
 //! wave stays in flight while the other lane's GPU layers run.
 use super::weights::{GlmLayer, GlmWeights};
-use crate::v41_memory::{DeviceAllocation, HostAllocation};
-use crate::spark_intake::{copy_parallel, IntakeMode, SparkIntake, SparkLane, SparkLink};
+use crate::shared::memory::{DeviceAllocation, HostAllocation};
+use crate::shared::spark_intake::{copy_parallel, IntakeMode, SparkIntake, SparkLane, SparkLink};
 use cuteafd_transport::v41_expert::{
     V41Tp4RoceWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
 };
@@ -192,7 +192,7 @@ pub(crate) struct GlmEngine<'a> {
     /// The DFlash2 drafter; every step taps its target layers.
     pub drafter: Option<super::dflash::GlmDrafter<'a>>,
     /// L2 prefetch of the next layer's weights during decode exchanges.
-    pub l2: Option<crate::l2_prefetch::L2Prefetch>,
+    pub l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -600,10 +600,10 @@ impl<'a> GlmEngine<'a> {
     /// are out, in read order: the next layer's attention (E4M3 copies where
     /// the decode programs read them), post-attention norm, router and shared
     /// expert (or dense MLP); after the last layer the final norm and head.
-    pub fn decode_read_order(&self) -> Vec<Vec<crate::l2_prefetch::Range>> {
+    pub fn decode_read_order(&self) -> Vec<Vec<crate::shared::l2_prefetch::Range>> {
         let layers = &self.weights.layers;
         (0..layers.len()).map(|i| match layers.get(i + 1) {
-            Some(next) => crate::l2_prefetch::operands(&["input_norm", "w_qkv_a", "q_a_norm", "kv_a_norm", "w_q_b",
+            Some(next) => crate::shared::l2_prefetch::operands(&["input_norm", "w_qkv_a", "q_a_norm", "kv_a_norm", "w_q_b",
                 "w_iq", "w_ik", "k_norm_w", "k_norm_b", "w_uk", "w_uv", "w_o", "post_norm", "gate", "gate.bias",
                 "w_gate_up", "w_down"], |n| next.range(n)),
             None => [&self.weights.norm, &self.weights.head].iter()
@@ -674,9 +674,9 @@ impl<'a> GlmEngine<'a> {
         let skip = self.skip.as_ref().context("routed experts are not skipped")?;
         self.moe_stage(w, layer, t, cap)?;
         if cap == "m64" {
-            let mark = crate::l2_prefetch::exchange_mark(self.library, self.stream)?;
+            let mark = crate::shared::l2_prefetch::exchange_mark(self.library, self.stream)?;
             self.prefetch(index)?;
-            crate::l2_prefetch::exchange_wait(self.library, mark)?;
+            crate::shared::l2_prefetch::exchange_wait(self.library, mark)?;
         }
         skip.upload_zeros(t, self.stream)?;
         Ok(SKIP_RANKS)

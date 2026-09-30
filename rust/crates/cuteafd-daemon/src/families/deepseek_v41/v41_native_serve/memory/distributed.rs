@@ -102,13 +102,13 @@ pub(crate) struct PoolPlan {
     pub desired_groups: usize,
 }
 impl PoolPlan {
-    pub fn new(placement: crate::v41_backbone_cache::CachePlacement,
+    pub fn new(placement: crate::families::deepseek_v41::v41_backbone_cache::CachePlacement,
         slots: usize, context: usize, retained_turns: usize, _snapshot_bytes: usize,
         exact: Option<super::ByteSize>, reservation: Option<super::Reservation>,
         memory: [(usize, usize); 2]) -> anyhow::Result<Self> {
         Self::with_replication(placement,slots,context,retained_turns,_snapshot_bytes,exact,reservation,memory,false)
     }
-    pub fn with_replication(placement: crate::v41_backbone_cache::CachePlacement,
+    pub fn with_replication(placement: crate::families::deepseek_v41::v41_backbone_cache::CachePlacement,
         slots:usize,context:usize,retained_turns:usize,_snapshot_bytes:usize,
         exact:Option<super::ByteSize>,reservation:Option<super::Reservation>,
         memory:[(usize,usize);2],replicated:bool)->anyhow::Result<Self> {
@@ -173,7 +173,7 @@ mod tests {
     use super::*;
     #[test]
     fn replicated_pool_charges_both_cards_without_inflating_tokens()->anyhow::Result<()> {
-        let placement=crate::v41_backbone_cache::CachePlacement::encoder_decoder();
+        let placement=crate::families::deepseek_v41::v41_backbone_cache::CachePlacement::encoder_decoder();
         let memory=[(8usize<<30,96usize<<30);2];
         let original=PoolPlan::new(placement,16,1_048_576,20,0,None,None,memory)?;
         let unchanged=PoolPlan::with_replication(placement,16,1_048_576,20,0,None,None,memory,false)?;
@@ -182,7 +182,7 @@ mod tests {
         let replica=PoolPlan::with_replication(placement,16,1_048_576,20,0,None,None,memory,true)?;
         assert!(replica.pages[0]<original.pages[0]);
         assert_eq!(replica.global_bytes,replica.pages[0]*super::super::GROUP_BYTES);
-        assert_eq!(replica.cache_bytes,crate::v41_backbone_cache::BackboneCache::replicated_device_bytes(
+        assert_eq!(replica.cache_bytes,crate::families::deepseek_v41::v41_backbone_cache::BackboneCache::replicated_device_bytes(
             placement,16,replica.pages)?);
         for gpu in 0..2 { assert!(replica.cache_bytes[gpu]+RUNTIME_HEADROOM<=memory[gpu].0); }
         assert!(PoolPlan::with_replication(placement,16,1_048_576,20,0,
@@ -199,7 +199,7 @@ mod tests {
         // Measured 20-layer EXL3 fixed occupancy, before its KV allocation.
         let occupied = [76_599_787_520usize, 78_055_211_008];
         let memory = std::array::from_fn(|gpu| (totals[gpu] - occupied[gpu], totals[gpu]));
-        let placement = crate::v41_backbone_cache::CachePlacement::encoder_decoder();
+        let placement = crate::families::deepseek_v41::v41_backbone_cache::CachePlacement::encoder_decoder();
         let pool = PoolPlan::new(placement, 16, 1_048_576, 24, 146_150_400, None, None, memory)?;
         let layer_bytes = 2_789_290_000usize;
         let prefix: Vec<_> = (1..=40).map(|n| [n*layer_bytes; 2]).collect();
@@ -238,16 +238,16 @@ mod tests {
         let totals = [101_973_491_712usize, 101_970_345_984];
         let occupied = [92_070_477_824usize, 94_956_158_976];
         let memory = std::array::from_fn(|gpu| (totals[gpu] - occupied[gpu], totals[gpu]));
-        let plan = PoolPlan::new(crate::v41_backbone_cache::CachePlacement::encoder_decoder(),
+        let plan = PoolPlan::new(crate::families::deepseek_v41::v41_backbone_cache::CachePlacement::encoder_decoder(),
             16, 1_048_576, 24, 146_150_400, None, None, memory)?;
         assert_eq!(plan.pages, [28_736, 28_736, 28_736, 57_472]);
         assert_eq!(plan.global_bytes, 13_094_420_480);
         assert!(plan.unused_bytes[1] >= 2 * 373_293_056);
         // The new default is not a hard cap on explicit user pool requests.
-        let explicit = PoolPlan::new(crate::v41_backbone_cache::CachePlacement::encoder_decoder(),
+        let explicit = PoolPlan::new(crate::families::deepseek_v41::v41_backbone_cache::CachePlacement::encoder_decoder(),
             16, 1_048_576, 24, 146_150_400, Some(super::super::ByteSize(14_960_885_760)), None, memory)?;
         assert_eq!(explicit.pages, [32_832, 32_832, 32_832, 65_664]);
-        let smaller = PoolPlan::new(crate::v41_backbone_cache::CachePlacement::encoder_decoder(),
+        let smaller = PoolPlan::new(crate::families::deepseek_v41::v41_backbone_cache::CachePlacement::encoder_decoder(),
             8, 1_048_576, 24, 146_150_400, None, None, memory)?;
         assert_eq!(smaller.pages[0], 8 * 2048 + 8 + 48);
         for gpu in 0..2 {
@@ -258,7 +258,7 @@ mod tests {
 
     #[test]
     fn complete_cache_respects_each_card_and_counts_non_global_storage() -> anyhow::Result<()> {
-        use crate::v41_backbone_cache::{BackboneCache, CachePlacement};
+        use crate::families::deepseek_v41::v41_backbone_cache::{BackboneCache, CachePlacement};
         use super::super::{ByteSize, Reservation, GROUP_BYTES};
         let map = CachePlacement::encoder_decoder();
         let bytes = BackboneCache::distributed_device_bytes(map, 16, [100, 100, 100, 200])?;
@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn complete_cache_handles_second_card_limit_and_invalid_budgets() -> anyhow::Result<()> {
-        use crate::v41_backbone_cache::{BackboneCache, CachePlacement};
+        use crate::families::deepseek_v41::v41_backbone_cache::{BackboneCache, CachePlacement};
         use super::super::Reservation;
         let map = CachePlacement::encoder_decoder();
         let bytes = BackboneCache::distributed_device_bytes(map, 2, [64, 64, 64, 128])?;

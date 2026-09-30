@@ -11,14 +11,14 @@ use super::engine::{GlmEngine, GlmPlacement, PageAllocator, DECODE_ROWS};
 /// Most copy-window draft tokens verified per sequence and step.
 const COPY_DRAFT: usize = 7;
 use super::{embed_rows, open, Opened};
-use crate::prefill_share::{Chunk, DecodeShareArgs};
+use crate::shared::prefill_share::{Chunk, DecodeShareArgs};
 use anyhow::{Context, Result};
 use cuteafd_api::native_v41::glm::GlmEncoding;
 use cuteafd_api::native_v41::{
     ConsoleHub, InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits, NativeRequest,
     PromptUsage,
 };
-use crate::spark_intake::SparkLink;
+use crate::shared::spark_intake::SparkLink;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -123,7 +123,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
 /// An admitted prompt waiting for its remaining prefill chunks.
 struct Prefill<'a> {
     job: NativeRequest,
-    constraint: Option<crate::v41_native_serve::constraints::State<'a>>,
+    constraint: Option<crate::shared::constraints::State<'a>>,
     tokens: Vec<u32>,
     /// Prompt tokens prefilled so far.
     done: usize,
@@ -157,7 +157,7 @@ struct Active<'a> {
     digest: u64,
     /// Steps, DFlash2 drafts verified and accepted, copy drafts verified and accepted.
     counts: [usize; 5],
-    constraint: Option<crate::v41_native_serve::constraints::State<'a>>,
+    constraint: Option<crate::shared::constraints::State<'a>>,
     placement: GlmPlacement,
     capacity: usize,
     next: u32,
@@ -285,7 +285,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, stats: &Mutex<serde_json::Value>,
     max_sequences: usize, policy: Policy, ranks: usize) -> Result<()> {
     let mut allocator = PageAllocator::new(engine.pages);
-    let mut grammars = crate::v41_native_serve::constraints::Compiler::with_vocab(
+    let mut grammars = crate::shared::constraints::Compiler::with_vocab(
         &opened.library, opened.snapshot.join("tokenizer.json"), engine.cfg.vocab_size, engine.cfg.eos_tokens.clone());
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(&opened.snapshot)?;
     let drafter = engine.drafter.as_ref();

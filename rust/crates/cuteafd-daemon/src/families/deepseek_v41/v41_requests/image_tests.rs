@@ -1,5 +1,5 @@
 use super::*;
-use crate::v41_tensors::NativeRtxTensors;
+use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use cuteafd_loader::{V41Image, V41ImageSpan, V41_IMAGE_TOKEN_ID};
 
 #[test]

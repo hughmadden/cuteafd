@@ -3,19 +3,19 @@ use anyhow::Result;
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use std::ffi::c_void;
 
-#[path = "v41_memory/snapshot.rs"]
+#[path = "memory/snapshot.rs"]
 mod snapshot;
 pub(crate) use snapshot::{SnapshotCopies, SnapshotPool, SnapshotStorage};
-#[path = "v41_memory/download.rs"]
+#[path = "memory/download.rs"]
 mod download;
 pub(crate) use download::RowDownload;
-#[path = "v41_memory/device.rs"]
+#[path = "memory/device.rs"]
 pub(crate) mod device;
-#[path = "v41_memory/peer_publication.rs"]
+#[path = "memory/peer_publication.rs"]
 pub(crate) mod peer_publication;
-#[path = "v41_memory/proposal_replica.rs"]
+#[path = "memory/proposal_replica.rs"]
 pub(crate) mod proposal_replica;
-#[path = "v41_memory/chain.rs"]
+#[path = "memory/chain.rs"]
 pub(crate) mod chain;
 
 pub(crate) struct DeviceAllocation<'a> {

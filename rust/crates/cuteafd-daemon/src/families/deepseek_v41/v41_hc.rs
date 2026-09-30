@@ -1,6 +1,6 @@
 //! Shared shifted mHC boundaries for backbone and dSpark sublayers.
-use crate::v41_memory::{DeviceAllocation, LoadStream};
-use crate::v41_tensors::NativeRtxTensors;
+use crate::shared::memory::{DeviceAllocation, LoadStream};
+use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41Hc};
 use std::ffi::c_void;
@@ -88,7 +88,7 @@ impl<'weights, 'library> HcSublayer<'weights, 'library> {
         }
         // A stage chain orders all later enqueues after the queued boundary work;
         // rebinding changes only the weights those later enqueues will use.
-        if !crate::v41_memory::chain::active() { self.stream.require_complete()?; }
+        if !crate::shared::memory::chain::active() { self.stream.require_complete()?; }
         Ok(HcBinding { weights, names })
     }
     /// # Safety
@@ -124,7 +124,7 @@ impl HcSublayer<'_, '_> {
         self.stream.raw
     }
     pub(crate) async fn wait_chain(&self) -> Result<()> {
-        unsafe { crate::v41_memory::chain::finish_cooperative(&self.stream).await }
+        unsafe { crate::shared::memory::chain::finish_cooperative(&self.stream).await }
     }
     fn synchronize(&self) -> Result<()> {
         unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }

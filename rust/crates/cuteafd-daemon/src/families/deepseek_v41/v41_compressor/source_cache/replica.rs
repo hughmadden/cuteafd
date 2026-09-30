@@ -1,16 +1,16 @@
 //! Peer FP4 payload storage. Page ownership remains with the authoritative cache.
 use super::*;
-use crate::v41_memory::device::{Allocation, Device};
+use crate::shared::memory::device::{Allocation, Device};
 
 pub(crate) struct SourceCacheReplica<'a> {
     pub storage: Rc<SourceReplica<'a>>,
-    restore: crate::v41_memory::device::Stream<'a>,
+    restore: crate::shared::memory::device::Stream<'a>,
 }
 impl<'a> SourceCache<'a> {
     pub fn enable_replica(&mut self,peer:Device<'a>)->Result<Rc<SourceReplica<'a>>> {
         ensure!(self.replica.is_none(),"source replica already configured");
         let storage=Rc::new(SourceReplica::new(self,peer)?);
-        let restore=crate::v41_memory::device::Stream::new(peer)?;
+        let restore=crate::shared::memory::device::Stream::new(peer)?;
         self.replica=Some(SourceCacheReplica { storage:storage.clone(),restore });
         Ok(storage)
     }
@@ -197,7 +197,7 @@ impl<'a> SourceReplica<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v41_memory::LoadStream;
+    use crate::shared::memory::LoadStream;
 
     #[test]
     fn replica_budget_counts_only_fp4_payload_and_metadata() -> Result<()> {
@@ -217,7 +217,7 @@ mod tests {
                 let mut source = SourceCache::new(&lib,8,3)?;
                 let replica = source.enable_replica(peer)?;
                 let producer = LoadStream { library: &lib, raw: lib.cuda_stream_create()? };
-                let mut publication = crate::v41_memory::peer_publication::PeerPublication::new(owner,peer)?;
+                let mut publication = crate::shared::memory::peer_publication::PeerPublication::new(owner,peer)?;
                 let mut append = |source: &mut SourceCache<'_>, old, new, value| -> Result<()> {
                     let plan = source.reserve(&[(0,old,new)])?;
                     unsafe { source.copy_shared_tails(&plan,producer.raw)?;

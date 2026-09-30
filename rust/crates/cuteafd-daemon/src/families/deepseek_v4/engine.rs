@@ -9,12 +9,12 @@ use super::metadata::{self, StepTables, INDEX_PAGE_BYTES, MAIN_PAGE_BYTES};
 use super::pool::{Placement, PoolShape};
 use std::cell::RefCell;
 use super::weights::{LayerWeights, ModelWeights};
-use crate::v41_memory::{DeviceAllocation, HostAllocation};
+use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::dsv4::{Dsv4Program, Dsv4Programs, Dsv4Scalar};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::deepseek_v4::DeepseekV4Config;
-use crate::spark_intake::SparkLink;
+use crate::shared::spark_intake::SparkLink;
 use cuteafd_transport::v41_expert::{V41Tp4RoceWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
 use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype,

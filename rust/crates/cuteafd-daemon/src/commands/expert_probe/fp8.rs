@@ -9,8 +9,8 @@
 //! output row depends only on its own input row and routes); experts run on
 //! every core.
 use crate::cli::ExpertProbeArgs;
-use crate::v41_experts::fp8::{package_directory, Fp8Experts};
-use crate::v41_memory::DeviceAllocation;
+use crate::shared::experts::fp8::{package_directory, Fp8Experts};
+use crate::shared::memory::DeviceAllocation;
 use anyhow::{Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::fp8_experts::{ExpertFormat, Fp8ExpertTensors, Fp8Projection};

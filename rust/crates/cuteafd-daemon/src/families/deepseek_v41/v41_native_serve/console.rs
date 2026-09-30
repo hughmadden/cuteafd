@@ -11,7 +11,7 @@
 //! The console thread owns everything else: per-request state, token text
 //! decoding, JSON encoding, the 50 ms frame cadence and the snapshot a newly
 //! connected page starts from.
-use crate::v41_backbone_lane::FfnSplit;
+use crate::families::deepseek_v41::v41_backbone_lane::FfnSplit;
 use cuteafd_api::native_v41::ConsoleHub;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};

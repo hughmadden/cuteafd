@@ -200,7 +200,7 @@ impl<'a> NativeTp4Wave<'a> {
     /// lanes are a no-op; replicated lanes re-encode the route words and set the
     /// native group flag, so every remote path that dispatches through this wave
     /// carries the same contract.
-    pub(crate) fn prepare_remote_request(&mut self, request: &mut crate::v41_backbone_router::BoundExpertRequest) -> Result<()> {
+    pub(crate) fn prepare_remote_request(&mut self, request: &mut crate::families::deepseek_v41::v41_backbone_router::BoundExpertRequest) -> Result<()> {
         if let Some(paired) = &mut self.paired {
             ensure!(self.native.is_none(), "paired EXL3 and replicated groups are mutually exclusive");
             request.assign_paired(&mut paired.0, &paired.1)?;
@@ -232,8 +232,8 @@ impl<'a> NativeTp4Wave<'a> {
     /// # Safety
     /// Input and router producers have completed. Both borrowed outputs remain
     /// immutable through this operation, including cancellation draining.
-    pub async unsafe fn execute_tp2_ffn(&mut self, input: &crate::v41_block::FfnInput<'_>,
-        routed: &crate::v41_backbone_router::RouterOutput<'_>) -> Result<NativeFfnOutput<'_>> {
+    pub async unsafe fn execute_tp2_ffn(&mut self, input: &crate::families::deepseek_v41::v41_block::FfnInput<'_>,
+        routed: &crate::families::deepseek_v41::v41_backbone_router::RouterOutput<'_>) -> Result<NativeFfnOutput<'_>> {
         self.ready_rows = None;
         let binding = routed.binding()?;
         ensure!(binding == input.binding() && input.layer == routed.layer
@@ -247,8 +247,8 @@ impl<'a> NativeTp4Wave<'a> {
     /// # Safety
     /// Completed router/shared buffers stay live and unmodified through drain.
     pub unsafe fn execute_local_ffn(&mut self,
-        routed: &crate::v41_backbone_router::RouterOutput<'_>,
-        shared: &crate::v41_backbone_shared::SharedOutput<'_>) -> Result<NativeFfnOutput<'_>> {
+        routed: &crate::families::deepseek_v41::v41_backbone_router::RouterOutput<'_>,
+        shared: &crate::families::deepseek_v41::v41_backbone_shared::SharedOutput<'_>) -> Result<NativeFfnOutput<'_>> {
         self.ready_rows = None;
         let values = unsafe { self.local.as_mut().context("local expert lane missing")?.execute(routed, shared)? };
         self.ready_rows = Some(routed.rows);
@@ -257,8 +257,8 @@ impl<'a> NativeTp4Wave<'a> {
     /// # Safety
     /// Completed router/shared inputs remain immutable until completion or drain.
     pub async unsafe fn execute_local_ffn_cooperative(&mut self,
-        routed: &crate::v41_backbone_router::RouterOutput<'_>,
-        shared: &crate::v41_backbone_shared::SharedOutput<'_>) -> Result<NativeFfnOutput<'_>> {
+        routed: &crate::families::deepseek_v41::v41_backbone_router::RouterOutput<'_>,
+        shared: &crate::families::deepseek_v41::v41_backbone_shared::SharedOutput<'_>) -> Result<NativeFfnOutput<'_>> {
         self.ready_rows = None;
         let binding = routed.binding()?;
         let values = unsafe { self.local.as_mut().context("local expert lane missing")?
@@ -375,8 +375,8 @@ impl<'a> NativeTp4Wave<'a> {
     /// request and shared result must derive from the same actual block input.
     pub async unsafe fn execute_ffn<'w>(
         &'w mut self,
-        request: &crate::v41_backbone_router::BoundExpertRequest,
-        shared: &crate::v41_backbone_shared::SharedOutput<'_>,
+        request: &crate::families::deepseek_v41::v41_backbone_router::BoundExpertRequest,
+        shared: &crate::families::deepseek_v41::v41_backbone_shared::SharedOutput<'_>,
     ) -> Result<NativeFfnOutput<'w>> {
         self.ready_rows = None;
         validate_shared(
@@ -391,7 +391,7 @@ impl<'a> NativeTp4Wave<'a> {
     /// shared FFN work on RTX while the Spark workers execute the routed experts.
     pub async fn dispatch_ffn<'w, 'r>(
         &'w mut self,
-        request: &'r crate::v41_backbone_router::BoundExpertRequest,
+        request: &'r crate::families::deepseek_v41::v41_backbone_router::BoundExpertRequest,
     ) -> Result<NativePendingFfn<'w, 'a, 'r>> {
         self.ready_rows = None;
         // Previous output or cancellation cleanup completed this wave.
@@ -473,18 +473,18 @@ impl Drop for NativeTp4Wave<'_> {
 /// Complete ordered TP reduction plus the shared expert, borrowed until consumed.
 pub(crate) struct NativeFfnOutput<'a> {
     pub values: CuteafdDeviceBuffer,
-    binding: crate::v41_attention_binding::QueryBinding,
+    binding: crate::families::deepseek_v41::v41_attention_binding::QueryBinding,
     _owner: std::marker::PhantomData<&'a ()>,
 }
 impl NativeFfnOutput<'_> {
-    pub fn binding(&self) -> crate::v41_attention_binding::QueryBinding {
+    pub fn binding(&self) -> crate::families::deepseek_v41::v41_attention_binding::QueryBinding {
         self.binding
     }
 }
 
 fn validate_shared(
-    request: &crate::v41_backbone_router::BoundExpertRequest,
-    shared: &crate::v41_backbone_shared::SharedOutput<'_>,
+    request: &crate::families::deepseek_v41::v41_backbone_router::BoundExpertRequest,
+    shared: &crate::families::deepseek_v41::v41_backbone_shared::SharedOutput<'_>,
     destination: CuteafdDeviceBuffer,
     capacity: u32,
 ) -> Result<()> {
@@ -598,29 +598,29 @@ fn reduce_planes(library: &NativeLibrary, reducer: &V41CompactReducer<'_>,
     stream: &LoadStream<'_>, planes: &[DeviceAllocation<'_>], output: CuteafdDeviceBuffer,
     shared: Option<CuteafdDeviceBuffer>, rows: u32) -> Result<()> {
     let launched = unsafe {
-        crate::v41_memory::chain::join(library, stream.raw)
+        crate::shared::memory::chain::join(library, stream.raw)
             .and_then(|()| enqueue_reduce_planes(reducer, stream, planes, output, shared, rows))
     };
     if launched.is_err() { return launched.and(unsafe { library.cuda_stream_synchronize(stream.raw) }); }
-    unsafe { crate::v41_memory::chain::finish(library, stream.raw) }
+    unsafe { crate::shared::memory::chain::finish(library, stream.raw) }
 }
 /// Retain planes, upload frames, output and shared input through completion.
 async unsafe fn reduce_planes_cooperative(reducer: &V41CompactReducer<'_>,
     stream: &LoadStream<'_>, planes: &[DeviceAllocation<'_>], output: CuteafdDeviceBuffer,
     shared: Option<CuteafdDeviceBuffer>, rows: u32) -> Result<()> {
     let launched = unsafe {
-        crate::v41_memory::chain::join(stream.library, stream.raw)
+        crate::shared::memory::chain::join(stream.library, stream.raw)
             .and_then(|()| enqueue_reduce_planes(reducer, stream, planes, output, shared, rows))
     };
     if launched.is_err() { return launched.and(stream.wait().await); }
-    unsafe { crate::v41_memory::chain::finish_cooperative(stream).await }
+    unsafe { crate::shared::memory::chain::finish_cooperative(stream).await }
 }
 
 /// Borrows every mutable reduction buffer and owns all unread response sockets.
 /// Dropping before completion leaves the wave unpublished and closes the sockets.
 pub(crate) struct NativePendingFfn<'w, 'a, 'r> {
     pending: V41Tp4RocePending<'w, 'r>,
-    request: &'r crate::v41_backbone_router::BoundExpertRequest,
+    request: &'r crate::families::deepseek_v41::v41_backbone_router::BoundExpertRequest,
     capacity: u32,
     library: &'a NativeLibrary,
     stream: &'w LoadStream<'a>,
@@ -638,14 +638,14 @@ impl<'w> NativePendingFfn<'w, '_, '_> {
     /// remain immutable until the final reduction drains. Producers must be drained.
     pub async unsafe fn finish(
         self,
-        shared: &crate::v41_backbone_shared::SharedOutput<'_>,
+        shared: &crate::families::deepseek_v41::v41_backbone_shared::SharedOutput<'_>,
     ) -> Result<NativeFfnOutput<'w>> {
         unsafe { self.finish_inner(shared, false).await }
     }
     /// # Safety
     /// Same input retention as finish; cancellation drains before releasing frames.
     pub async unsafe fn finish_cooperative(self,
-        shared: &crate::v41_backbone_shared::SharedOutput<'_>) -> Result<NativeFfnOutput<'w>> {
+        shared: &crate::families::deepseek_v41::v41_backbone_shared::SharedOutput<'_>) -> Result<NativeFfnOutput<'w>> {
         unsafe { self.finish_inner(shared, true).await }
     }
     /// Run shared TP2 after Spark dispatch, reduce on the transport GPU, and
@@ -653,7 +653,7 @@ impl<'w> NativePendingFfn<'w, '_, '_> {
     /// # Safety
     /// Input is the completed normalized FFN input for the dispatched request;
     /// its storage remains immutable through completion or cancellation drain.
-    pub async unsafe fn finish_tp2(mut self, input: &crate::v41_block::FfnInput<'_>) -> Result<NativeFfnOutput<'w>> {
+    pub async unsafe fn finish_tp2(mut self, input: &crate::families::deepseek_v41::v41_block::FfnInput<'_>) -> Result<NativeFfnOutput<'w>> {
         let header = &self.request.request().header;
         ensure!(self.request.binding() == input.binding() && header.layer_id as usize == input.layer
             && header.row_count as usize == input.tokens.len()
@@ -663,14 +663,14 @@ impl<'w> NativePendingFfn<'w, '_, '_> {
             .execute_shared_on(input.layer,header.row_count,input.values,self.output.device_id as usize).await? };
         let destination = input.values.device_id;
         if destination != self.output.device_id {
-            let device = crate::v41_memory::device::Device { library: self.library, id: self.output.device_id };
+            let device = crate::shared::memory::device::Device { library: self.library, id: self.output.device_id };
             device.future(unsafe { self.finish_values(values,true,Some(destination)) }).await
         } else {
             unsafe { self.finish_values(values,true,Some(destination)).await }
         }
     }
     async unsafe fn finish_inner(self,
-        shared: &crate::v41_backbone_shared::SharedOutput<'_>, cooperative: bool) -> Result<NativeFfnOutput<'w>> {
+        shared: &crate::families::deepseek_v41::v41_backbone_shared::SharedOutput<'_>, cooperative: bool) -> Result<NativeFfnOutput<'w>> {
         validate_shared(self.request, shared, self.shared, self.capacity)?;
         unsafe { self.finish_values(shared.values,cooperative,None).await }
     }
@@ -711,7 +711,7 @@ impl<'w> NativePendingFfn<'w, '_, '_> {
                 self.output, Some(values), rows)?;
         }
         uploads.pending = false; // uploads and reduction completed on the same stream.
-        uploads.retain = crate::v41_memory::chain::active();
+        uploads.retain = crate::shared::memory::chain::active();
         tracing::debug!(target: "cuteafd::timing", layer=self.request.request().header.layer_id, rows, shared_copy_us, upload_us, receive_us=received_us-shared_copy_us-upload_us, reduce_us=timing.elapsed().as_micros() as u64-received_us, "target collection");
         *self.ready_rows = Some(rows);
         let mut values = self.output;

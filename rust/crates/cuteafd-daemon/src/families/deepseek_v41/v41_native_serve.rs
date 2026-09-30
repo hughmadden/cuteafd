@@ -7,28 +7,26 @@ pub(crate) mod console;
 mod distributed;
 mod placement;
 pub(crate) mod scores;
-#[path = "../../shared/constraints.rs"]
-pub(crate) mod constraints;
 use scores::TokenScores;
 mod prefix;
 pub(crate) mod memory;
-use crate::v41_backbone_cache::BackboneCache;
-use crate::v41_backbone_execution::BackboneExecution;
-use crate::v41_backbone_execution::CacheProducerWeights;
-use crate::v41_backbone_lane::BackboneLane;
-use crate::v41_backbone_lane::BackboneLaneWeights;
-use crate::v41_engram::{
+use crate::families::deepseek_v41::v41_backbone_cache::BackboneCache;
+use crate::families::deepseek_v41::v41_backbone_execution::BackboneExecution;
+use crate::families::deepseek_v41::v41_backbone_execution::CacheProducerWeights;
+use crate::families::deepseek_v41::v41_backbone_lane::BackboneLane;
+use crate::families::deepseek_v41::v41_backbone_lane::BackboneLaneWeights;
+use crate::families::deepseek_v41::v41_engram::{
     layer::{EngramGate, EngramLayerWeights},
     EngramDeviceRows,
 };
-use crate::v41_experts::coordinator::NativeTp4Wave;
-use crate::v41_index_lane::IndexLane;
-use crate::v41_index_lane::IndexLaneWeights;
-use crate::v41_requests::{RequestTokens, Requests};
-use crate::v41_target_embedding::TargetEmbeddingWave;
-use crate::v41_target_head::{TargetHeadWave, TargetHeadWeights};
-use crate::v41_target_pass::TargetPass;
-use crate::v41_tensors::{NativeRtxTensors, VocabularyHead};
+use crate::families::deepseek_v41::v41_experts::coordinator::NativeTp4Wave;
+use crate::families::deepseek_v41::v41_index_lane::IndexLane;
+use crate::families::deepseek_v41::v41_index_lane::IndexLaneWeights;
+use crate::families::deepseek_v41::v41_requests::{RequestTokens, Requests};
+use crate::families::deepseek_v41::v41_target_embedding::TargetEmbeddingWave;
+use crate::families::deepseek_v41::v41_target_head::{TargetHeadWave, TargetHeadWeights};
+use crate::families::deepseek_v41::v41_target_pass::TargetPass;
+use crate::families::deepseek_v41::v41_tensors::{NativeRtxTensors, VocabularyHead};
 use anyhow::Context;
 use anyhow::{ensure, Result};
 use cuteafd_api::native_v41::{InferenceChunk, InferenceFinishReason, NativeRequest, PromptUsage};
@@ -44,7 +42,7 @@ pub(crate) async fn run(mut args: crate::cli::NativeServeArgs) -> Result<()> {
         Ok(report) => tracing::info!(target: "cuteafd::fabric", rails = report.rails.use_rails, "{}", report.summary()),
         Err(error) => tracing::warn!(target: "cuteafd::fabric", "fabric discovery failed: {error:#}"),
     }
-    let topology = crate::v41_spark_topology::resolve(
+    let topology = crate::families::deepseek_v41::v41_spark_topology::resolve(
         args.spark_tp,
         args.spark_ep,
         args.peers.len(),
@@ -318,7 +316,7 @@ fn worker(
         cuteafd_loader::OFFICIAL_V41_MODEL_ID,
         &args.snapshot,
     )?;
-    let topology = crate::v41_spark_topology::resolve(
+    let topology = crate::families::deepseek_v41::v41_spark_topology::resolve(
         args.spark_tp,
         args.spark_ep,
         args.peers.len(),
@@ -326,7 +324,7 @@ fn worker(
     )?;
     // Explicit replicated groups are native-only and are rejected here, before
     // any expert weight is allocated or readiness published.
-    crate::v41_spark_topology::require_native(topology, &catalog)?;
+    crate::families::deepseek_v41::v41_spark_topology::require_native(topology, &catalog)?;
     if let Some(topology) = topology {
         // Fail before any CUDA allocation or readiness publication when the
         // library cannot reduce this physical-rank count.
@@ -343,7 +341,7 @@ fn worker(
         "an implicit two- or three-peer Spark group requires an EXL3 checkpoint; \
          a native three-rank group must pass --spark-tp 3 --spark-ep 1"
     );
-    let paired_profile = crate::v41_experts::paired::PairedProfile::for_serving(&catalog, args.exl3_paired_tp4)?;
+    let paired_profile = crate::families::deepseek_v41::v41_experts::paired::PairedProfile::for_serving(&catalog, args.exl3_paired_tp4)?;
     let start = Instant::now();
     let weights = BackboneLaneWeights::load(
         &lib,
@@ -428,10 +426,10 @@ fn worker(
         upload,
         gates,
         head,
-        crate::v41_target_pass::TargetTapWave::new(
+        crate::families::deepseek_v41::v41_target_pass::TargetTapWave::new(
             &lib,
             rows,
-            crate::v41_target_pass::TargetTapWave::device_bytes(rows)?,
+            crate::families::deepseek_v41::v41_target_pass::TargetTapWave::device_bytes(rows)?,
         )?,
         Duration::from_secs(120),
     )?;
@@ -451,7 +449,7 @@ fn worker(
         [EngramGate::new(&engram_weights[0], rows, 1024 * 1024 * 1024)?,
          EngramGate::new(&engram_weights[1], rows, 1024 * 1024 * 1024)?],
         head_weights.wave(&vocabulary, if args.dspark_draft_limit > 5 { 64 } else { 48 }, TargetHeadWave::device_bytes(if args.dspark_draft_limit > 5 { 64 } else { 48 })?)?,
-        crate::v41_target_pass::TargetTapWave::new(&lib, rows, crate::v41_target_pass::TargetTapWave::device_bytes(rows)?)?,
+        crate::families::deepseek_v41::v41_target_pass::TargetTapWave::new(&lib, rows, crate::families::deepseek_v41::v41_target_pass::TargetTapWave::device_bytes(rows)?)?,
         Duration::from_secs(120),
     )?;
     if args.dspark && args.dspark_draft_limit > 5 {
@@ -463,7 +461,7 @@ fn worker(
     if let Some(profile) = &paired_profile { prefill_transport.install_paired(profile.clone())?; }
     let exl3_tiers: &[usize] = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
     let draft_weights = if args.dspark {
-        Some(crate::v41_experts::dspark::DsparkWeights::load_serving_with_width(
+        Some(crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_with_width(
             &lib,
             &catalog,
             capacity,
@@ -471,7 +469,7 @@ fn worker(
             32 * 1024 * 1024 * 1024,
             16 * 1024 * 1024,
             if args.dspark_draft_limit > 5 { 7 } else { 5 },
-            Some(&crate::v41_experts::exl3::aot_layout_directory(&args.native_lib, exl3_tiers, "dspark")),
+            Some(&crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(&args.native_lib, exl3_tiers, "dspark")),
         )?)
     } else {
         None
@@ -484,8 +482,8 @@ fn worker(
         draft.set_draft_limit(args.dspark_draft_limit)?;
         draft.set_fixed(args.dspark_fixed);
     }
-    let mut vision = crate::v41_vision::VisionRuntime::new(&lib, &catalog, 9216,
-        crate::v41_vision::VisionRuntime::device_bytes(&catalog, 9216)?)?;
+    let mut vision = crate::families::deepseek_v41::v41_vision::VisionRuntime::new(&lib, &catalog, 9216,
+        crate::families::deepseek_v41::v41_vision::VisionRuntime::device_bytes(&catalog, 9216)?)?;
     // Reserve both retention banks plus one in-flight snapshot per lane. These
     // allocations are counted before choosing KV capacity and local expert layers.
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
@@ -493,10 +491,10 @@ fn worker(
         (args.prefix_cache_entries as usize).checked_mul(2).and_then(|n| n.checked_add(2))
             .context("snapshot slot count overflow")?
     };
-    let target_prefix_pool = (snapshot_slots > 0).then(|| crate::v41_memory::SnapshotPool::new(
-        &lib, crate::v41_backbone_cache::BackbonePrefix::device_bytes(), snapshot_slots)).transpose()?;
+    let target_prefix_pool = (snapshot_slots > 0).then(|| crate::shared::memory::SnapshotPool::new(
+        &lib, crate::families::deepseek_v41::v41_backbone_cache::BackbonePrefix::device_bytes(), snapshot_slots)).transpose()?;
     let draft_snapshot_bytes = draft.as_mut().map(|d| d.reserve_prefixes(snapshot_slots)).transpose()?.unwrap_or(0);
-    let snapshot_bytes = target_prefix_pool.as_ref().map_or(0, crate::v41_memory::SnapshotPool::device_bytes) + draft_snapshot_bytes;
+    let snapshot_bytes = target_prefix_pool.as_ref().map_or(0, crate::shared::memory::SnapshotPool::device_bytes) + draft_snapshot_bytes;
     tracing::info!(snapshot_slots, snapshot_bytes, "snapshot arenas reserved before serving");
     // Size after vision, both lanes, transports and optional draft allocations are live.
     let (free, total) = lib.cuda_memory_info()?;
@@ -526,10 +524,10 @@ fn worker(
     // launch unpublished, which the launcher treats as a failure.
     let mut placement_handoff: Option<placement::StartupPlacement> = None;
     if args.rtx_expert_layers != memory::LocalLayers::Count(0) {
-        use crate::v41_experts::{ExpertLayer, ExpertWeights, local::LocalExpertWave};
+        use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights, local::LocalExpertWave};
         let local_started = Instant::now();
-        use crate::v41_experts::exl3::Exl3Weights;
-        let exl3_directory = crate::v41_experts::exl3::aot_layout_directory(&args.native_lib, exl3_tiers, "rtx-tp1");
+        use crate::families::deepseek_v41::v41_experts::exl3::Exl3Weights;
+        let exl3_directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(&args.native_lib, exl3_tiers, "rtx-tp1");
         let compressed = catalog.exl3().is_some();
         let per_lane = if compressed { LocalExpertWave::exl3_device_bytes(&exl3_directory, capacity)? }
             else {
@@ -630,14 +628,14 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     requests: &mut Requests<'a>,
     transport: &mut P::Transport,
     other_transport: &mut P::Transport,
-    lease: crate::v41_backbone_cache::CacheLease,
+    lease: crate::families::deepseek_v41::v41_backbone_cache::CacheLease,
     tokens: &[u32],
     chunk_rows: usize,
     job: &NativeRequest,
     draft: Option<&mut DraftRuntime<'_, 'a, C>>,
     hold: &mut dyn FnMut() -> Result<()>,
 ) -> Result<TokenScores> {
-    use crate::v41_backbone_cache::{CacheStage, CacheWork};
+    use crate::families::deepseek_v41::v41_backbone_cache::{CacheStage, CacheWork};
     let end = tokens.len() as u64;
     let cached = requests.cache().committed_end(lease)? as usize;
     let stage = requests.cache().stage(lease)?;
@@ -745,7 +743,7 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
 
 fn prefill_continuation<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
     pass: &mut P, requests: &mut Requests<'a>, transport: &mut P::Transport,
-    lease: crate::v41_backbone_cache::CacheLease, tokens: &[u32], chunk_rows: usize,
+    lease: crate::families::deepseek_v41::v41_backbone_cache::CacheLease, tokens: &[u32], chunk_rows: usize,
     job: &NativeRequest, mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, hold: &mut dyn FnMut() -> Result<()>) -> Result<TokenScores> {
     ensure!(!tokens.is_empty(), "prefix continuation has no uncached rows");
     let mut anchor = None;

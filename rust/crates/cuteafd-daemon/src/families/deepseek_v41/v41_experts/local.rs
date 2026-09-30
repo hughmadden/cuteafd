@@ -4,7 +4,8 @@ use super::exl3::{
     Exl3Weights,
 };
 use super::{DeviceAllocation, ExpertLayer, ExpertWeights, LoadStream};
-use crate::{v41_backbone_router::RouterOutput, v41_backbone_shared::SharedOutput};
+use crate::families::deepseek_v41::v41_backbone_router::RouterOutput;
+use crate::families::deepseek_v41::v41_backbone_shared::SharedOutput;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{
     CuteafdDeviceBuffer, NativeLibrary, V41ExpertKernel, V41ExpertLaunchArgs, V41LocalExpertReducer,
@@ -248,7 +249,7 @@ impl<'a> LocalExpertWave<'a> {
         unsafe {
             self.enqueue(routed, shared)?;
         }
-        unsafe { crate::v41_memory::chain::finish(self.stream.library, self.stream.raw)?; }
+        unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw)?; }
         Ok(self.output_rows(rows))
     }
     /// # Safety
@@ -261,7 +262,7 @@ impl<'a> LocalExpertWave<'a> {
         unsafe {
             self.enqueue(routed, shared)?;
         }
-        unsafe { crate::v41_memory::chain::finish_cooperative(&self.stream).await?; }
+        unsafe { crate::shared::memory::chain::finish_cooperative(&self.stream).await?; }
         Ok(self.output_rows(routed.rows))
     }
     fn output_rows(&self, rows: u32) -> CuteafdDeviceBuffer {
@@ -336,7 +337,7 @@ impl<'a> LocalExpertWave<'a> {
                             self.stream.raw,
                         )?
                     };
-                    unsafe { crate::v41_memory::chain::join(self.stream.library, self.stream.raw)?; }
+                    unsafe { crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?; }
                     unsafe {
                         self.reducer.finish(
                             values.ptr.cast(),
@@ -376,7 +377,7 @@ impl<'a> LocalExpertWave<'a> {
                     unsafe {
                         state.kernel.launch(&args)?;
                     }
-                    unsafe { crate::v41_memory::chain::join(self.stream.library, self.stream.raw)?; }
+                    unsafe { crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?; }
                     unsafe {
                         match state.kernel.output_kind() {
                             cuteafd_ffi::V41ExpertOutputKind::Bf16Routes => self.reducer.finish_bf16_routes(

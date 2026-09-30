@@ -7,9 +7,9 @@
 //! - `Channel`: one scale per output row (W8A16), stored repeated as `[N, K/128]`.
 //!
 //! Quantization of a BF16 weight: `s = amax / 448` (or `--fp8-scales`' other
-//! rules, [`crate::fp8_linear::Fp8Scales`]), `q = e4m3_rn(w / s)`
+//! rules, [`crate::shared::fp8_linear::Fp8Scales`]), `q = e4m3_rn(w / s)`
 //! (saturating), the same recipe as the checkpoint's own blocks.
-use crate::fp8_linear::Fp8Scales;
+use crate::shared::fp8_linear::Fp8Scales;
 
 /// The smallest power of two >= `amax / 448` (1 for zero): Hugh Madden's
 /// glm53f-afd `pow2_scale`, bit for bit the native kernels'.

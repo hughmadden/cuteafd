@@ -7,7 +7,7 @@
 //! the CPU sampler download only themselves. `BatchScores` therefore stores the
 //! full logit bytes of **some** rows, in batch-row order, instead of requiring
 //! every row.
-use crate::v41_target_head::SampledTargetRows;
+use crate::families::deepseek_v41::v41_target_head::SampledTargetRows;
 use anyhow::{ensure, Result};
 use cuteafd_core::TargetSamplingParams;
 use std::sync::Arc;

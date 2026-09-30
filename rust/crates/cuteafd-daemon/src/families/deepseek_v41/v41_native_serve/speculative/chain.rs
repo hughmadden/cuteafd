@@ -1,9 +1,9 @@
 //! Static draft-chain dispatch for the shared request lifecycle.
 use super::*;
-use crate::v41_experts::dspark::DistributedDsparkChain;
+use crate::families::deepseek_v41::v41_experts::dspark::DistributedDsparkChain;
 
 pub(crate) trait DraftChain<'a> {
-    fn execution_device(&self) -> Option<crate::v41_memory::device::Device<'a>>;
+    fn execution_device(&self) -> Option<crate::shared::memory::device::Device<'a>>;
     fn stage_tokens(&mut self, tokens: &[i32]) -> Result<()>;
     fn stage_sampling(&mut self, rngs: &mut [&mut cuteafd_core::DsparkRng], temperatures: &[f32]) -> Result<()>;
     /// # Safety
@@ -20,7 +20,7 @@ pub(crate) trait DraftChain<'a> {
 macro_rules! chain {
     ($ty:ident, $device:expr) => {
         impl<'w, 'a> DraftChain<'a> for $ty<'w, 'a> {
-            fn execution_device(&self) -> Option<crate::v41_memory::device::Device<'a>> { ($device)(self) }
+            fn execution_device(&self) -> Option<crate::shared::memory::device::Device<'a>> { ($device)(self) }
             fn stage_tokens(&mut self, tokens: &[i32]) -> Result<()> { self.stage_tokens(tokens) }
             fn stage_sampling(&mut self, rngs: &mut [&mut cuteafd_core::DsparkRng], temperatures: &[f32]) -> Result<()> {
                 self.stage_sampling(rngs, temperatures)

@@ -1,15 +1,15 @@
 //! One request lease spans every backbone window and compressed source.
-use crate::v41_backbone_router::ExpertRow;
-use crate::v41_compressor::{
+use crate::families::deepseek_v41::v41_backbone_router::ExpertRow;
+use crate::families::deepseek_v41::v41_compressor::{
     CompressorChunk, CompressorLease, CompressorState, CompressorWave, IndexProposal,
 };
-use crate::v41_index_selection::SelectionRequest;
-use crate::v41_sparse_attention::AttentionRequest;
-use crate::v41_window::{WindowChunk, WindowLease, WindowProposal, WindowState, WindowWave};
+use crate::families::deepseek_v41::v41_index_selection::SelectionRequest;
+use crate::families::deepseek_v41::v41_sparse_attention::AttentionRequest;
+use crate::families::deepseek_v41::v41_window::{WindowChunk, WindowLease, WindowProposal, WindowState, WindowWave};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_transport::ExpertV2SourceKind;
-use crate::v41_memory::device::{Device, DeviceOwner};
+use crate::shared::memory::device::{Device, DeviceOwner};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod ced;
@@ -170,9 +170,9 @@ impl CacheAttention<'_> {
 }
 
 pub(crate) struct BackboneCache<'a> {
-    prefix_copies: [crate::v41_memory::SnapshotCopies<'a, (CacheLease, BackbonePrefix<'a>)>; 2],
-    prefix_pool: Option<crate::v41_memory::SnapshotPool<'a>>,
-    prefix_stream: crate::v41_memory::LoadStream<'a>,
+    prefix_copies: [crate::shared::memory::SnapshotCopies<'a, (CacheLease, BackbonePrefix<'a>)>; 2],
+    prefix_pool: Option<crate::shared::memory::SnapshotPool<'a>>,
+    prefix_stream: crate::shared::memory::LoadStream<'a>,
     windows: Vec<DeviceOwner<'a, WindowState<'a>>>,
     sources: Vec<DeviceOwner<'a, CompressorState<'a>>>,
     requests: Vec<Option<Request>>,
@@ -194,7 +194,7 @@ impl<'a> BackboneCache<'a> {
         }
         for (i,gpu) in placement.sources().into_iter().enumerate() {
             bytes[1-gpu]=bytes[1-gpu].checked_add(
-                crate::v41_compressor::SourceReplica::device_bytes(source_pages[i],slots)?)
+                crate::families::deepseek_v41::v41_compressor::SourceReplica::device_bytes(source_pages[i],slots)?)
                 .context("replicated source budget overflow")?;
         }
         Ok(bytes)
@@ -328,10 +328,10 @@ impl<'a> BackboneCache<'a> {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| anyhow::anyhow!("backbone cache IDs exhausted"))?;
         Ok(Self {
-            prefix_copies: [crate::v41_memory::SnapshotCopies::new(library)?,
-                crate::v41_memory::SnapshotCopies::new(library)?],
+            prefix_copies: [crate::shared::memory::SnapshotCopies::new(library)?,
+                crate::shared::memory::SnapshotCopies::new(library)?],
             prefix_pool: None,
-            prefix_stream: crate::v41_memory::LoadStream { library, raw: library.cuda_stream_create()? },
+            prefix_stream: crate::shared::memory::LoadStream { library, raw: library.cuda_stream_create()? },
             windows,
             sources,
             requests: (0..slots).map(|_| None).collect(),
@@ -523,7 +523,7 @@ impl<'a> BackboneCache<'a> {
             reserved: reserve,
             stage: stage.context("empty cache batch")?,
             replay_snapshot: if stage != Some(CacheStage::Full) {
-                Some(crate::v41_compressor::reserve_source_snapshot()?)
+                Some(crate::families::deepseek_v41::v41_compressor::reserve_source_snapshot()?)
             } else {
                 None
             },
@@ -572,7 +572,7 @@ impl<'a> BackboneCache<'a> {
     pub unsafe fn produce_window(
         &self,
         batch: &CacheBatch,
-        query: &crate::v41_attention_query::AttentionQueryOutput<'_>,
+        query: &crate::families::deepseek_v41::v41_attention_query::AttentionQueryOutput<'_>,
         wave: &mut WindowWave<'_, '_>,
     ) -> Result<()> {
         let state = self.window(batch, query.layer)?;
@@ -588,7 +588,7 @@ impl<'a> BackboneCache<'a> {
     pub unsafe fn produce_source(
         &self,
         batch: &CacheBatch,
-        query: &crate::v41_attention_query::AttentionQueryOutput<'_>,
+        query: &crate::families::deepseek_v41::v41_attention_query::AttentionQueryOutput<'_>,
         wave: &mut CompressorWave<'_, '_>,
     ) -> Result<()> {
         let state = self.source(batch, query.layer)?;
@@ -983,7 +983,7 @@ impl<'a> BackboneCache<'a> {
     pub fn owner(&self) -> u64 {
         self.owner
     }
-    pub fn prefix_pool(&self) -> Option<&crate::v41_memory::SnapshotPool<'a>> {
+    pub fn prefix_pool(&self) -> Option<&crate::shared::memory::SnapshotPool<'a>> {
         self.prefix_pool.as_ref()
     }
     pub fn prefix_library(&self) -> &'a NativeLibrary {

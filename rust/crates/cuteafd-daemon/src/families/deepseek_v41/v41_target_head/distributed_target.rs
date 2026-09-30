@@ -1,8 +1,8 @@
 //! Target mHC/norm on RTX1 followed by the per-lane split vocabulary head.
 use super::*;
 use super::distributed::DistributedVocabularyWave;
-use crate::v41_memory::device::{Device, DeviceOwner, Stream};
-use crate::v41_tensors::VocabularyShard;
+use crate::shared::memory::device::{Device, DeviceOwner, Stream};
+use crate::families::deepseek_v41::v41_tensors::VocabularyShard;
 
 const INPUT_STRIDES: [usize; 4] = [40960, 16, 10240, 10240];
 struct Normalize<'w, 'a> {
@@ -91,7 +91,7 @@ struct HeadSampler<'a> {
     assembled: DeviceOwner<'a, DeviceAllocation<'a>>,
     wave: DeviceOwner<'a, TargetSamplingWave<'a>>,
     stream: Stream<'a>,
-    download: DeviceOwner<'a, crate::v41_memory::RowDownload<'a>>,
+    download: DeviceOwner<'a, crate::shared::memory::RowDownload<'a>>,
 }
 
 pub(crate) struct DistributedTargetHead<'w, 'a> {
@@ -100,7 +100,7 @@ pub(crate) struct DistributedTargetHead<'w, 'a> {
     vocabulary: DistributedVocabularyWave<'w, 'a>,
     download: Stream<'a>,
     staging: HostAllocation<'a>,
-    rank_downloads: [DeviceOwner<'a, crate::v41_memory::RowDownload<'a>>; 2],
+    rank_downloads: [DeviceOwner<'a, crate::shared::memory::RowDownload<'a>>; 2],
     capacity: usize,
     binding: Option<QueryBinding>,
     selected: Vec<usize>,
@@ -119,8 +119,8 @@ impl<'w, 'a> DistributedTargetHead<'w, 'a> {
         let bytes = Self::device_bytes(capacity, vocabulary[0].tokens().end)?;
         ensure!(bytes.iter().zip(budgets).all(|(n, budget)| *n <= budget), "distributed target head exceeds budget");
         let rank_downloads = [
-            devices[0].own(|| crate::v41_memory::RowDownload::new(devices[0].library, capacity * vocabulary[0].tokens().len() * 4))?,
-            devices[1].own(|| crate::v41_memory::RowDownload::new(devices[1].library, capacity * vocabulary[1].tokens().len() * 4))?,
+            devices[0].own(|| crate::shared::memory::RowDownload::new(devices[0].library, capacity * vocabulary[0].tokens().len() * 4))?,
+            devices[1].own(|| crate::shared::memory::RowDownload::new(devices[1].library, capacity * vocabulary[1].tokens().len() * 4))?,
         ];
         let normalize = devices[1].own(|| Normalize::new(weights, capacity))?;
         let sampler_bytes = capacity * 129280 * 4 + TargetSamplingWave::device_bytes(capacity);
@@ -130,7 +130,7 @@ impl<'w, 'a> DistributedTargetHead<'w, 'a> {
             assembled: devices[1].own(|| DeviceAllocation::new(devices[1].library, capacity * 129280 * 4))?,
             wave: devices[1].own(|| TargetSamplingWave::new(devices[1].library, capacity))?,
             stream: Stream::new(devices[1])?,
-            download: devices[1].own(|| crate::v41_memory::RowDownload::new(devices[1].library, capacity * 129280 * 4))?,
+            download: devices[1].own(|| crate::shared::memory::RowDownload::new(devices[1].library, capacity * 129280 * 4))?,
         };
         Ok(Self { sampler, normalize, vocabulary, download: Stream::new(devices[1])?,
             staging: HostAllocation::new(devices[1].library, capacity * 8)?, rank_downloads, capacity,
@@ -159,7 +159,7 @@ impl<'w, 'a> DistributedTargetHead<'w, 'a> {
             "distributed target head block or selected rows differ");
         // The TP2 vocabulary projection moves rows between GPUs with host-ordered
         // copies; settle a chained final layer first (one wait per pass).
-        crate::v41_memory::chain::settle(device.library)?;
+        crate::shared::memory::chain::settle(device.library)?;
         device.future(unsafe { self.normalize.get_mut().execute(block, selected) }).await?;
         let normalized = self.normalize.buffers[3].buffer;
         unsafe { self.vocabulary.execute(normalized, selected.len()).await?; }
@@ -273,7 +273,7 @@ impl<'w, 'a> DistributedTargetHead<'w, 'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v41_memory::device::Allocation;
+    use crate::shared::memory::device::Allocation;
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and two CUDA GPUs"]
     fn distributed_target_head_matches_full_selection_and_publication() -> Result<()> {

@@ -4,8 +4,8 @@ use super::exl3::{
     Exl3Weights,
 };
 use super::{ExpertLayer, ExpertWeights};
-use crate::v41_memory::device::DeviceOwner;
-use crate::v41_memory::device::{Allocation, Device, Event, PeerTransfer, Stream};
+use crate::shared::memory::device::DeviceOwner;
+use crate::shared::memory::device::{Allocation, Device, Event, PeerTransfer, Stream};
 use anyhow::{ensure, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41Tp2ExpertReducer};
 use cuteafd_ffi::{V41ExpertKernel, V41ExpertLaunchArgs};

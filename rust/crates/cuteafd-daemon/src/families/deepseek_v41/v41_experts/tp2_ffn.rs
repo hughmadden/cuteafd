@@ -1,7 +1,7 @@
 //! One serving lane's TP2 encoder FFN, including peer inputs and final addition.
 use super::tp2::{ExpertWave, RankInputs, RankWeights};
-use crate::v41_backbone_shared::tp2::{Wave as SharedWave, Weights as SharedWeights};
-use crate::v41_memory::device::{Allocation, Device, Stream};
+use crate::families::deepseek_v41::v41_backbone_shared::tp2::{Wave as SharedWave, Weights as SharedWeights};
+use crate::shared::memory::device::{Allocation, Device, Stream};
 use anyhow::{Result, ensure};
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41Bf16Add};
 use std::rc::Rc;
@@ -155,7 +155,7 @@ impl<'a> Wave<'a> {
         );
         // Peer DMA is never queued behind an unresolved dependency: settle any
         // chained producer of `values` on the host first.
-        crate::v41_memory::chain::settle(self.streams[0].device.library)?;
+        crate::shared::memory::chain::settle(self.streams[0].device.library)?;
         let local = values.device_id as usize;
         let remote = 1 - local;
         let upload = &self.streams[remote];
@@ -209,7 +209,7 @@ impl<'a> Wave<'a> {
         destination: usize, rows: u32) -> Result<CuteafdDeviceBuffer> {
         ensure!(destination < 2 && rows > 0 && rows <= self.capacity
             && source.bytes >= rows as usize * 10240, "invalid TP2 result transfer");
-        crate::v41_memory::chain::settle(self.streams[0].device.library)?;
+        crate::shared::memory::chain::settle(self.streams[0].device.library)?;
         let stream = &self.streams[destination];
         let mut output = self.output[destination].buffer;
         output.bytes = rows as usize * 10240;
@@ -275,7 +275,7 @@ impl<'a> Wave<'a> {
         // Do not submit DMA behind an unresolved stream dependency: a blocked
         // copy packet can hold up independent lanes on the shared copy engine.
         // Chained producers of these inputs are settled on the host as well.
-        crate::v41_memory::chain::settle(upload.device.library)?;
+        crate::shared::memory::chain::settle(upload.device.library)?;
         upload.wait().await?;
         let peer = self.peers[remote].buffers();
         upload.device.run(|| {

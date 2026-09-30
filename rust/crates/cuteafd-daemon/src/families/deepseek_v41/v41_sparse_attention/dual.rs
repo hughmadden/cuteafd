@@ -1,7 +1,7 @@
 //! Two local-head waves for one lane; no state is shared with another lane.
 use super::*;
-use crate::v41_memory::device::{Allocation, Device, DeviceOwner, Event};
-use crate::v41_backbone_cache::{BackboneCache,CacheAttention,peer_inputs::PeerAttentionInputs};
+use crate::shared::memory::device::{Allocation, Device, DeviceOwner, Event};
+use crate::families::deepseek_v41::v41_backbone_cache::{BackboneCache,CacheAttention,peer_inputs::PeerAttentionInputs};
 
 pub(crate) struct DualAttentionWave<'a> {
     halves: [DeviceOwner<'a, CompactSparseAttentionWave<'a>>; 2],

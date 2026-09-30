@@ -1,11 +1,11 @@
 //! Local FP8 window storage for the peer attention heads.
 use super::*;
-use crate::v41_memory::device::{Allocation, Device};
+use crate::shared::memory::device::{Allocation, Device};
 use cuteafd_ffi::V41PeerCopy;
 
 pub(super) struct WindowStateReplica<'a> {
     pub storage: std::rc::Rc<WindowReplica<'a>>,
-    publication: std::cell::RefCell<crate::v41_memory::peer_publication::PeerPublication<'a>>,
+    publication: std::cell::RefCell<crate::shared::memory::peer_publication::PeerPublication<'a>>,
     source: Device<'a>,
 }
 impl<'a> WindowState<'a> {
@@ -21,7 +21,7 @@ impl<'a> WindowState<'a> {
         ensure!(self.replica.is_none(),"window replica already configured");
         let storage=std::rc::Rc::new(WindowReplica::new(self,peer)?);
         let source=Device { library:self.ends.library,id:self.ends.buffer.device_id };
-        let publication=crate::v41_memory::peer_publication::PeerPublication::new(source,peer)?;
+        let publication=crate::shared::memory::peer_publication::PeerPublication::new(source,peer)?;
         self.replica=Some(WindowStateReplica { storage:storage.clone(),
             publication:std::cell::RefCell::new(publication),source });
         Ok(storage)
@@ -152,7 +152,7 @@ impl<'a> WindowReplica<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v41_memory::{device::Stream,peer_publication::PeerPublication};
+    use crate::shared::memory::{device::Stream,peer_publication::PeerPublication};
 
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB with SM peer copy and two CUDA GPUs"]

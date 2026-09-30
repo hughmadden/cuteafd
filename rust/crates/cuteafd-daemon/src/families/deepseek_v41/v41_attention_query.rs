@@ -1,8 +1,8 @@
 //! Real backbone low-rank query projection, normalization and rotary graphs.
-use crate::v41_attention_binding::QueryBinding;
-use crate::v41_layer_graphs::LayerGraphs;
-use crate::v41_memory::{DeviceAllocation, HostAllocation, LoadStream};
-use crate::v41_tensors::NativeRtxTensors;
+use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
+use crate::families::deepseek_v41::v41_layer_graphs::LayerGraphs;
+use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps, V41Fp8Plan};
 use cuteafd_loader::OfficialV41Catalog;
@@ -385,7 +385,7 @@ impl AttentionQueryWave<'_, '_> {
                 .library
                 .cuda_graph_launch(graph, self.stream.raw)
         };
-        launched.and(unsafe { crate::v41_memory::chain::finish(self.stream.library, self.stream.raw) })?;
+        launched.and(unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw) })?;
         self.ready = Some(rows);
         self.output()
     }
@@ -422,14 +422,14 @@ impl AttentionQueryWave<'_, '_> {
         }
         let prepared_and_executed = (|| -> Result<()> {
             unsafe {
-                crate::v41_memory::chain::join(self.stream.library, self.stream.raw)?;
+                crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?;
                 self.stream.library.copy_host_buffer_h2d_async(
                     self.positions(), self.position_staging.buffer, tokens.len() * 8, self.stream.raw,
                 )?;
             }
             prepare(self.stream.raw, self.input())?;
             // The normalized input is complete here; cache producers fork from it.
-            unsafe { crate::v41_memory::chain::mark_fork(self.stream.library, self.stream.raw)?; }
+            unsafe { crate::shared::memory::chain::mark_fork(self.stream.library, self.stream.raw)?; }
             let rows = tokens.len() as u32;
             if self
                 .graphs
@@ -472,17 +472,17 @@ impl AttentionQueryWave<'_, '_> {
         }
         let graph = self.graphs.get_shape(self.weights.layer, self.weights, rows);
         let queued = (|| -> Result<()> { unsafe {
-            crate::v41_memory::chain::join(self.stream.library, self.stream.raw)?;
+            crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?;
             self.stream.library.copy_host_buffer_h2d_async(self.positions(), self.position_staging.buffer,
                 tokens.len()*8, self.stream.raw)?;
             prepare(self.stream.raw, self.input())?;
             // The normalized input is complete here; cache producers fork from it.
-            crate::v41_memory::chain::mark_fork(self.stream.library, self.stream.raw)?;
+            crate::shared::memory::chain::mark_fork(self.stream.library, self.stream.raw)?;
             if let Some((graph, _)) = graph { self.stream.library.cuda_graph_launch(graph, self.stream.raw) }
             else { self.enqueue(rows) }
         } })();
         let drained = if queued.is_err() { self.stream.wait().await }
-            else { unsafe { crate::v41_memory::chain::finish_cooperative(&self.stream).await } };
+            else { unsafe { crate::shared::memory::chain::finish_cooperative(&self.stream).await } };
         queued.and(drained)?;
         if graph.is_none() {
             // Eager output is complete; capture only records the next execution.
@@ -502,13 +502,13 @@ impl AttentionQueryWave<'_, '_> {
     /// Projection weights must be this layer's checkpoint query-B shards and
     /// its gathered output device must match this query owner.
     pub(crate) async unsafe fn execute_tokens_tp2_prepared_cooperative(
-        &mut self, tokens: &[u64], projection: &mut crate::v41_projection_tp2::Wave<'_, '_>,
+        &mut self, tokens: &[u64], projection: &mut crate::families::deepseek_v41::v41_projection_tp2::Wave<'_, '_>,
         prepare: impl FnOnce(*mut std::ffi::c_void, CuteafdDeviceBuffer)->Result<()>)
         ->Result<AttentionQueryOutput<'_>> {
         ensure!(tokens.len()<=self.capacity as usize,"query rows exceed capacity");
         self.validate(tokens.len() as u32)?;
         ensure!(tokens.iter().all(|&p|p<1048576)
-            && projection.kind()==crate::v41_projection_tp2::Kind::QueryB
+            && projection.kind()==crate::families::deepseek_v41::v41_projection_tp2::Kind::QueryB
             && projection.output_device().id==self.input().device_id
             && std::ptr::eq(projection.output_device().library,self.stream.library),"TP2 query origin differs");
         let rows=tokens.len() as u32;
@@ -610,8 +610,8 @@ impl Drop for AttentionQueryWave<'_, '_> {
 #[cfg(test)]
 mod tp2_tests {
     use super::*;
-    use crate::v41_memory::device::{Allocation,Device};
-    use crate::v41_projection_tp2::{Kind,Weights,Wave};
+    use crate::shared::memory::device::{Allocation,Device};
+    use crate::families::deepseek_v41::v41_projection_tp2::{Kind,Weights,Wave};
     #[test]
     #[ignore = "requires checkpoint, two GPUs and projection shard AOT"]
     fn checkpoint_tp2_query_preserves_rank_and_rotary() -> Result<()> {

@@ -89,7 +89,7 @@ mod tests {
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and CUDA"]
     fn native_output_budget_detects_pressure_before_prefill() -> Result<()> {
-        use crate::v41_backbone_cache::BackboneCache;
+        use crate::families::deepseek_v41::v41_backbone_cache::BackboneCache;
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let mut cache = BackboneCache::new(&lib, 2, [2; 4],
             BackboneCache::device_bytes(2, [2; 4])?)?;
@@ -100,7 +100,7 @@ mod tests {
         cache.check_append_capacity(&[(first, 256), (second, 256)])?;
         let budget = remaining_budget(256, 256, 0)?;
         let error = cache.check_append_capacity(&[(first, budget), (second, budget)]).unwrap_err();
-        assert!(error.downcast_ref::<crate::v41_compressor::SourcePoolExhausted>().is_some());
+        assert!(error.downcast_ref::<crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted>().is_some());
         // A failed check must return its temporary reservations. Either request
         // can run alone, and the other can be retried after its peer retires.
         cache.check_append_capacity(&[(first, budget)])?;

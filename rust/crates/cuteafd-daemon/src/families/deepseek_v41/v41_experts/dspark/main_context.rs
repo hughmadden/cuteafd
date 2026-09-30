@@ -1,7 +1,7 @@
 //! Shared main-hidden projection and three independent committed-KV producers.
 use super::{DsparkProjection, DsparkWeights, ProjectionKind};
-use crate::v41_dspark_cache::{DsparkWindow, WindowChunk, WindowWrite};
-use crate::v41_memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowChunk, WindowWrite};
+use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps};
 use std::ffi::c_void;
@@ -107,7 +107,7 @@ impl DsparkMainContext<'_, '_> {
     /// The prepared block and this owner remain live until the stream drains.
     pub unsafe fn enqueue_block_tap(
         &mut self,
-        input: &crate::v41_block::PreparedBlockInput<'_>,
+        input: &crate::families::deepseek_v41::v41_block::PreparedBlockInput<'_>,
         stream: *mut c_void,
     ) -> Result<()> {
         self.ready = None;

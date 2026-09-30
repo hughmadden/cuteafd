@@ -1,16 +1,16 @@
 //! Full target-pass sequencing with GPU-local lanes and short request borrows.
 use super::*;
-use crate::v41_target_head::distributed_target::{DistributedTargetHead, DistributedTargetLogits};
+use crate::families::deepseek_v41::v41_target_head::distributed_target::{DistributedTargetHead, DistributedTargetLogits};
 mod encoder_stream;
-use crate::v41_backbone_cache::CachePlacement;
-use crate::v41_backbone_execution::DistributedExecution;
-use crate::v41_block::BlockTransfer;
-use crate::v41_engram::placement::PlacedEngram;
-use crate::v41_memory::device::DeviceOwner;
+use crate::families::deepseek_v41::v41_backbone_cache::CachePlacement;
+use crate::families::deepseek_v41::v41_backbone_execution::DistributedExecution;
+use crate::families::deepseek_v41::v41_block::BlockTransfer;
+use crate::families::deepseek_v41::v41_engram::placement::PlacedEngram;
+use crate::shared::memory::device::DeviceOwner;
 use encoder_stream::EncoderFlow;
 
 #[cfg(test)]
-fn trace_query_component(query: &crate::v41_attention_query::AttentionQueryOutput<'_>)
+fn trace_query_component(query: &crate::families::deepseek_v41::v41_attention_query::AttentionQueryOutput<'_>)
     -> Result<(cuteafd_ffi::CuteafdDeviceBuffer, usize)> {
     Ok(match std::env::var("CUTEAFD_QUERY_COMPONENT").as_deref().unwrap_or("rotated") {
         "hidden" => (query.hidden, 10240),
@@ -33,26 +33,26 @@ pub(crate) struct DistributedTargetPass<'w, 'a> {
     head: DistributedTargetHead<'w, 'a>,
     taps: DeviceOwner<'a, TargetTapWave<'a>>,
     transfers: [BlockTransfer<'a>; 2],
-    suffix_stream: DeviceOwner<'a, crate::v41_memory::LoadStream<'a>>,
+    suffix_stream: DeviceOwner<'a, crate::shared::memory::LoadStream<'a>>,
     timeout: Duration,
     state: State,
     capture_routes: bool,
     route_capture: Vec<Vec<[u32; 6]>>,
     /// Device-side stage ordering across both GPUs (see `v41_memory::chain`),
     /// used for verification passes only.
-    chain: Option<crate::v41_memory::chain::StageChain<'a>>,
+    chain: Option<crate::shared::memory::chain::StageChain<'a>>,
     verification: bool,
-    sampled: Option<crate::v41_target_head::SampledTargetRows>,
+    sampled: Option<crate::families::deepseek_v41::v41_target_head::SampledTargetRows>,
     #[cfg(test)]
     trace: bool,
     #[cfg(test)]
     trace_records: Vec<(u64, usize, usize)>,
     #[cfg(test)]
-    trace_queries: [DeviceOwner<'a, crate::v41_memory::DeviceAllocation<'a>>; 2],
+    trace_queries: [DeviceOwner<'a, crate::shared::memory::DeviceAllocation<'a>>; 2],
     #[cfg(test)]
     observed_layer: Option<std::rc::Rc<std::cell::Cell<usize>>>,
     #[cfg(test)]
-    trace_buffers: [DeviceOwner<'a, crate::v41_memory::DeviceAllocation<'a>>; 2],
+    trace_buffers: [DeviceOwner<'a, crate::shared::memory::DeviceAllocation<'a>>; 2],
 }
 /// Execution futures drain their borrowed GPU work before this guard revokes
 /// reserved chunks, including cancellation during queued early publication.
@@ -81,17 +81,17 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     pub fn enable_dual_attention(&mut self)->Result<()> {
         for lane in &mut self.lanes {
             let device=lane.device;
-            let peer=crate::v41_memory::device::Device { library:device.library,id:1-device.id };
+            let peer=crate::shared::memory::device::Device { library:device.library,id:1-device.id };
             let budget=lane.dual_attention_bytes()?;
             device.run(||lane.enable_dual_attention(peer,budget))?;
         }
         Ok(())
     }
-    pub fn configure_cache_replicas(&mut self,bank:&crate::v41_backbone_cache::BackboneCache<'a>)->Result<()> {
+    pub fn configure_cache_replicas(&mut self,bank:&crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>)->Result<()> {
         bank.configure_producer_replicas(&mut self.execution.producers.windows,
             &mut self.execution.producers.sources)
     }
-    pub fn encoder_device(&self) -> Result<crate::v41_memory::device::Device<'a>> {
+    pub fn encoder_device(&self) -> Result<crate::shared::memory::device::Device<'a>> {
         Ok(self.lanes[self.map.attention(19)?].device)
     }
     pub fn new(
@@ -130,23 +130,23 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         ];
         let device = lanes[map.attention(19)?].device;
         let suffix_stream = device.own(|| {
-            Ok(crate::v41_memory::LoadStream {
+            Ok(crate::shared::memory::LoadStream {
                 library: device.library,
                 raw: unsafe { device.library.cuda_stream_create()? },
             })
         })?;
         #[cfg(test)]
         let trace_buffers = [
-            lanes[0].device.own(|| crate::v41_memory::DeviceAllocation::new(device.library, 40 * 16 * 40976))?,
-            lanes[1].device.own(|| crate::v41_memory::DeviceAllocation::new(device.library, 40 * 16 * 40976))?,
+            lanes[0].device.own(|| crate::shared::memory::DeviceAllocation::new(device.library, 40 * 16 * 40976))?,
+            lanes[1].device.own(|| crate::shared::memory::DeviceAllocation::new(device.library, 40 * 16 * 40976))?,
         ];
         #[cfg(test)]
         let trace_queries = [
-            lanes[0].device.own(|| crate::v41_memory::DeviceAllocation::new(device.library, 60 * 16 * 131072))?,
-            lanes[1].device.own(|| crate::v41_memory::DeviceAllocation::new(device.library, 60 * 16 * 131072))?,
+            lanes[0].device.own(|| crate::shared::memory::DeviceAllocation::new(device.library, 60 * 16 * 131072))?,
+            lanes[1].device.own(|| crate::shared::memory::DeviceAllocation::new(device.library, 60 * 16 * 131072))?,
         ];
-        let chain = crate::v41_memory::chain::enabled()
-            .then(|| crate::v41_memory::chain::StageChain::on_devices(lanes[0].device.library, &[0, 1]))
+        let chain = crate::shared::memory::chain::enabled()
+            .then(|| crate::shared::memory::chain::StageChain::on_devices(lanes[0].device.library, &[0, 1]))
             .transpose()?;
         let mut lanes = lanes;
         // Reserve host history at planning time. The per-layer IDs are already
@@ -205,8 +205,8 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     }
     pub fn captured_routes(&self) -> &[Vec<[u32; 6]>] { &self.route_capture }
     /// Host FFN stage split of the last captured pass, summed over both GPUs.
-    pub fn captured_ffn_split(&self) -> crate::v41_backbone_lane::FfnSplit {
-        let mut split = crate::v41_backbone_lane::FfnSplit::default();
+    pub fn captured_ffn_split(&self) -> crate::families::deepseek_v41::v41_backbone_lane::FfnSplit {
+        let mut split = crate::families::deepseek_v41::v41_backbone_lane::FfnSplit::default();
         for lane in &self.lanes { split.add(&lane.captured_ffn_split()); }
         split
     }
@@ -216,17 +216,17 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     /// # Safety
     /// The pass completed with `greedy = false` and its head is unconsumed.
     pub(crate) async unsafe fn sample_head(&mut self,
-        requests: &[crate::v41_target_head::TargetSamplingRowRequest], masks: Option<&[u32]>,
+        requests: &[crate::families::deepseek_v41::v41_target_head::TargetSamplingRowRequest], masks: Option<&[u32]>,
         mask_words: usize, ordered_rows: bool) -> Result<()> {
         self.sampled = None;
         let rows = unsafe { self.head.sample(requests, masks, mask_words, ordered_rows).await? };
         self.sampled = Some(rows);
         Ok(())
     }
-    pub(crate) fn take_sampled(&mut self) -> Result<crate::v41_target_head::SampledTargetRows> {
+    pub(crate) fn take_sampled(&mut self) -> Result<crate::families::deepseek_v41::v41_target_head::SampledTargetRows> {
         self.sampled.take().context("distributed pass has no sampled rows")
     }
-    pub(crate) async fn download_sampled(&mut self, rows: &crate::v41_target_head::SampledTargetRows,
+    pub(crate) async fn download_sampled(&mut self, rows: &crate::families::deepseek_v41::v41_target_head::SampledTargetRows,
         selection: &[usize]) -> Result<Vec<u8>> {
         self.head.download_sampled(rows, selection).await
     }
@@ -867,24 +867,24 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v41_backbone_cache::BackboneCache;
-    use crate::v41_backbone_execution::CacheProducerWeights;
-    use crate::v41_backbone_lane::BackboneLaneWeights;
-    use crate::v41_backbone_shared::tp2::Weights as SharedWeights;
-    use crate::v41_engram::placement::PlacedEngramWeights;
-    use crate::v41_experts::{tp2::RankWeights, tp2_ffn};
-    use crate::v41_index_lane::IndexLaneWeights;
-    use crate::v41_memory::device::Device;
-    use crate::v41_target_head::TargetHeadWeights;
-    use crate::v41_tensors::{NativeRtxTensors, VocabularyHead};
+    use crate::families::deepseek_v41::v41_backbone_cache::BackboneCache;
+    use crate::families::deepseek_v41::v41_backbone_execution::CacheProducerWeights;
+    use crate::families::deepseek_v41::v41_backbone_lane::BackboneLaneWeights;
+    use crate::families::deepseek_v41::v41_backbone_shared::tp2::Weights as SharedWeights;
+    use crate::families::deepseek_v41::v41_engram::placement::PlacedEngramWeights;
+    use crate::families::deepseek_v41::v41_experts::{tp2::RankWeights, tp2_ffn};
+    use crate::families::deepseek_v41::v41_index_lane::IndexLaneWeights;
+    use crate::shared::memory::device::Device;
+    use crate::families::deepseek_v41::v41_target_head::TargetHeadWeights;
+    use crate::families::deepseek_v41::v41_tensors::{NativeRtxTensors, VocabularyHead};
     use cuteafd_ffi::NativeLibrary;
     use cuteafd_transport::{ExpertV2SourceKind, TcpTransportConfig, v41_expert::V41Tp4Roce};
     use std::rc::Rc;
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT, CUTEAFD_DUAL_PEERS, two GPUs and live Sparks"]
     fn distributed_target_prefill_decode_commit_smoke() -> Result<()> {
-        use crate::v41_native_serve::prefill_target::PrefillTarget;
-        use crate::v41_experts::dspark::{DsparkChain, DsparkWeights};
+        use crate::families::deepseek_v41::v41_native_serve::prefill_target::PrefillTarget;
+        use crate::families::deepseek_v41::v41_experts::dspark::{DsparkChain, DsparkWeights};
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let snapshot = std::env::var("CUTEAFD_SNAPSHOT")?;
         let catalog = cuteafd_loader::read_official_v41_catalog(
@@ -948,8 +948,8 @@ mod tests {
             )
         })?;
         let vocab = [
-            devices[0].own(|| crate::v41_tensors::VocabularyShard::load(&lib, &catalog, 0..64640, 1 << 30, 16 << 20))?,
-            devices[1].own(|| crate::v41_tensors::VocabularyShard::load(&lib, &catalog, 64640..129280, 1 << 30, 16 << 20))?,
+            devices[0].own(|| crate::families::deepseek_v41::v41_tensors::VocabularyShard::load(&lib, &catalog, 0..64640, 1 << 30, 16 << 20))?,
+            devices[1].own(|| crate::families::deepseek_v41::v41_tensors::VocabularyShard::load(&lib, &catalog, 64640..129280, 1 << 30, 16 << 20))?,
         ];
         let hw = devices[1].own(|| {
             TargetHeadWeights::load(
@@ -1031,7 +1031,7 @@ mod tests {
                 DistributedExecution::new(
                     &producers,
                     16,
-                    crate::v41_backbone_execution::PlacedProducerWaves::device_bytes(
+                    crate::families::deepseek_v41::v41_backbone_execution::PlacedProducerWaves::device_bytes(
                         &lib, map, 16,
                     )?,
                 )?,
@@ -1069,7 +1069,7 @@ mod tests {
             peers,
             [1, 2, 3, 4],
             16,
-            TcpTransportConfig { timing: crate::v41_native_serve::protocol_v2_timing(),
+            TcpTransportConfig { timing: crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing(),
                 timeout: Duration::from_secs(120),
                 max_frame_bytes: 2 << 20,
             },
@@ -1081,7 +1081,7 @@ mod tests {
             .enable_all()
             .build()?;
         let draft_weights = devices[1].own(|| DsparkWeights::load(&lib, &catalog, 80, 1, 32usize << 30, 16 << 20))?;
-        let mut draft = crate::v41_native_serve::speculative::DraftRuntime::with_distributed_requests(
+        let mut draft = crate::families::deepseek_v41::v41_native_serve::speculative::DraftRuntime::with_distributed_requests(
             devices, &draft_weights, &table, [&vocab[0], &vocab[1]], 16, 2)?;
         draft.admit(91001)?;
         let lease = requests.admit(0, 91001)?;
@@ -1101,7 +1101,7 @@ mod tests {
                 "executing distributed full pass step={step} rows={}",
                 tokens.len()
             );
-            let mut batch = requests.prepare(&[crate::v41_requests::RequestTokens {
+            let mut batch = requests.prepare(&[crate::families::deepseek_v41::v41_requests::RequestTokens {
                 lease,
                 tokens: &tokens,
                 image_mask: None,
@@ -1150,7 +1150,7 @@ mod tests {
                 "invalid full-pass greedy output"
             );
             ensure!(
-                crate::v41_target_pass::TargetCache::taps(&pass, &batch)?.rows().len() == tokens.len(),
+                crate::families::deepseek_v41::v41_target_pass::TargetCache::taps(&pass, &batch)?.rows().len() == tokens.len(),
                 "distributed taps lost rows"
             );
             if step == 2 {
@@ -1181,7 +1181,7 @@ mod tests {
         eprintln!("PASS distributed prefill commit: target and all three dSpark cache frontiers agree");
         let prompt = [100u32, 200, 300, 400, 500, 600, 700];
         let baseline = requests.admit(1, 92000)?;
-        let mut baseline_batch = requests.prepare(&[crate::v41_requests::RequestTokens {
+        let mut baseline_batch = requests.prepare(&[crate::families::deepseek_v41::v41_requests::RequestTokens {
             lease: baseline,
             tokens: &prompt,
             image_mask: None,
@@ -1206,7 +1206,7 @@ mod tests {
         requests.begin_encoder(lease, prompt.len() as u64)?;
         let mut suffix = pass.new_suffix(&lib, prompt.len() as u64)?;
         for chunk in [&prompt[..3], &prompt[3..]] {
-            let mut batch = requests.reserve_encoder(&[crate::v41_requests::RequestTokens {
+            let mut batch = requests.reserve_encoder(&[crate::families::deepseek_v41::v41_requests::RequestTokens {
                 lease,
                 tokens: chunk,
                 image_mask: None,
@@ -1218,7 +1218,7 @@ mod tests {
         }
         assert_eq!(requests.cache().committed_end(lease)?, 7);
         assert_eq!(requests.begin_decoder_replay(lease)?, 0);
-        let mut batch = requests.prepare_replay(&[crate::v41_backbone_cache::CacheWork {
+        let mut batch = requests.prepare_replay(&[crate::families::deepseek_v41::v41_backbone_cache::CacheWork {
             lease,
             tokens: 7,
             kind: ExpertV2SourceKind::Prefill,
@@ -1263,7 +1263,7 @@ mod tests {
                     peers,
                     [1, 2, 3, 4],
                     16,
-                    TcpTransportConfig { timing: crate::v41_native_serve::protocol_v2_timing(),
+                    TcpTransportConfig { timing: crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing(),
                         timeout: Duration::from_secs(120),
                         max_frame_bytes: 2 << 20,
                     },
@@ -1277,7 +1277,7 @@ mod tests {
             requests.begin_encoder(reference_lease, prompt.len() as u64)?;
             let mut reference_suffix = pass.new_suffix(&lib, prompt.len() as u64)?;
             for chunk in prompt.chunks(chunk_rows) {
-                let mut batch = requests.reserve_encoder(&[crate::v41_requests::RequestTokens {
+                let mut batch = requests.reserve_encoder(&[crate::families::deepseek_v41::v41_requests::RequestTokens {
                     lease: reference_lease, tokens: chunk, image_mask: None, kind: ExpertV2SourceKind::Prefill,
                 }])?;
                 runtime.block_on(unsafe { pass.encoder_part(&mut requests, &mut batch, &mut transport, &mut reference_suffix) })?;
@@ -1285,7 +1285,7 @@ mod tests {
             }
             let start = requests.begin_decoder_replay(reference_lease)?;
             let replay_rows = prompt.len() as u32 - start as u32;
-            let mut batch = requests.prepare_replay(&[crate::v41_backbone_cache::CacheWork {
+            let mut batch = requests.prepare_replay(&[crate::families::deepseek_v41::v41_backbone_cache::CacheWork {
                 lease: reference_lease, tokens: replay_rows, kind: ExpertV2SourceKind::Prefill,
             }])?;
             let reference_bytes = runtime.block_on(unsafe { pass.prefill_logits(&lib, &mut requests, &mut batch,
@@ -1299,10 +1299,10 @@ mod tests {
             eprintln!("serving prefill reference chunk_rows={chunk_rows} sequential_anchor={reference_anchor} one_shot_anchor={}", expected[0].0);
             let id = 93000 + chunk_rows as u64;
             let lease = requests.admit(0, id)?;
-            let mut draft = crate::v41_native_serve::speculative::DraftRuntime::with_distributed_requests(
+            let mut draft = crate::families::deepseek_v41::v41_native_serve::speculative::DraftRuntime::with_distributed_requests(
                 devices, &draft_weights, &table, [&vocab[0], &vocab[1]], 16, 2)?;
             draft.admit(id)?;
-            let anchor = crate::v41_native_serve::prefill_target::exercise_prefill(&lib, &runtime,
+            let anchor = crate::families::deepseek_v41::v41_native_serve::prefill_target::exercise_prefill(&lib, &runtime,
                 &mut pass, &mut other, &mut requests, [&mut transport, &mut other_transport], lease,
                 &prompt, chunk_rows, Some(draft.get_mut()))?;
             assert_eq!(anchor, reference_anchor, "serving prefill anchor differs from matching sequential chunks");
@@ -1314,13 +1314,13 @@ mod tests {
             ensure!(proposed.len() == 1 && proposed[0].len() == 6 && proposed[0][0] == anchor,
                 "serving prefill to draft handoff differs");
             let continued: Vec<_> = prompt.into_iter().chain([800, 900]).collect();
-            let next = crate::v41_native_serve::prefill_target::exercise_prefill(&lib, &runtime,
+            let next = crate::families::deepseek_v41::v41_native_serve::prefill_target::exercise_prefill(&lib, &runtime,
                 &mut pass, &mut other, &mut requests, [&mut transport, &mut other_transport], lease,
                 &continued, chunk_rows, Some(draft.get_mut()))?;
             ensure!(next < 129280, "invalid continuation anchor");
             assert_eq!(requests.cache().committed_end(lease)?, 9);
             draft.validate_position(id, 9)?;
-            crate::v41_native_serve::prefill_target::exercise_distributed_decode(&lib, &runtime,
+            crate::families::deepseek_v41::v41_native_serve::prefill_target::exercise_distributed_decode(&lib, &runtime,
                 std::path::Path::new(&snapshot), &mut pass, &mut other, &mut requests, [&mut transport, &mut other_transport],
                 lease, id, &continued, next, draft.get_mut())?;
             assert_eq!(lib.cuda_get_device()?, 0);
@@ -1337,7 +1337,7 @@ mod tests {
                 let leases = [requests.admit(0, 94000)?, requests.admit(1, 94001)?];
                 for (lease, count) in leases.into_iter().zip(counts) { requests.begin_encoder(lease, count as u64)?; }
                 let mut batches = leases.into_iter().zip(counts).map(|(lease, count)| requests.reserve_encoder(&[
-                    crate::v41_requests::RequestTokens { lease, tokens: &prompt[..count],
+                    crate::families::deepseek_v41::v41_requests::RequestTokens { lease, tokens: &prompt[..count],
                         image_mask: None, kind: ExpertV2SourceKind::Prefill }
                 ])).collect::<Result<Vec<_>>>()?;
                 let mut suffixes = counts.into_iter().map(|count| devices[map.attention(19)?].own(||
@@ -1421,7 +1421,7 @@ mod tests {
                 } else {
                     for chunk in &chunks {
                         let mut batch =
-                            requests.reserve_encoder(&[crate::v41_requests::RequestTokens {
+                            requests.reserve_encoder(&[crate::families::deepseek_v41::v41_requests::RequestTokens {
                                 lease,
                                 tokens: chunk,
                                 image_mask: None,
@@ -1533,7 +1533,7 @@ mod tests {
                 assert_eq!(other.state, State::Idle);
                 assert_eq!(requests.begin_decoder_replay(lease)?, 0);
                 let mut batch =
-                    requests.prepare_replay(&[crate::v41_backbone_cache::CacheWork {
+                    requests.prepare_replay(&[crate::families::deepseek_v41::v41_backbone_cache::CacheWork {
                         lease,
                         tokens: 7,
                         kind: ExpertV2SourceKind::Prefill,
@@ -1605,7 +1605,7 @@ mod tests {
         // its admission and resets both GPU-local lanes for subsequent reuse.
         let cancelled = requests.admit(0, 92002)?;
         requests.begin_encoder(cancelled, 7)?;
-        let mut batch = requests.reserve_encoder(&[crate::v41_requests::RequestTokens {
+        let mut batch = requests.reserve_encoder(&[crate::families::deepseek_v41::v41_requests::RequestTokens {
             lease: cancelled,
             tokens: &prompt[..3],
             image_mask: None,
@@ -1636,7 +1636,7 @@ mod tests {
         assert_eq!(pass.state, State::Idle);
         assert_eq!(lib.cuda_get_device()?, 0);
         let recovered = requests.admit(0, 92003)?;
-        let mut batch = requests.prepare(&[crate::v41_requests::RequestTokens {
+        let mut batch = requests.prepare(&[crate::families::deepseek_v41::v41_requests::RequestTokens {
             lease: recovered,
             tokens: &prompt[..1],
             image_mask: None,

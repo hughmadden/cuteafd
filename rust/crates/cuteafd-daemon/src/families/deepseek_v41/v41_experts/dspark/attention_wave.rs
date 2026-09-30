@@ -1,7 +1,7 @@
 //! One-stream draft attention with generation-checked committed cache reads.
 use super::{DsparkAttentionOutput, DsparkProjection, DsparkWeights, ProjectionKind};
-use crate::v41_dspark_cache::{DsparkWindow, WindowLease, WindowRead};
-use crate::v41_memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowLease, WindowRead};
+use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps, V41DsparkAttention};
 use std::ffi::c_void;

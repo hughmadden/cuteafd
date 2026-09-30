@@ -1,5 +1,5 @@
 //! Official coordinator tensors retain their native checkpoint representations.
-use crate::v41_memory::{DeviceAllocation, HostAllocation};
+use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::OfficialV41Catalog;

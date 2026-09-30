@@ -1,7 +1,7 @@
 //! Output-channel FP8 projection shards with lane-owned exchange storage.
-use crate::v41_memory::{HostAllocation, device::{Allocation, Device, Event, Stream}};
+use crate::shared::memory::{HostAllocation, device::{Allocation, Device, Event, Stream}};
 use anyhow::{ensure, Context, Result};
-use crate::v41_layer_graphs::LayerGraphs;
+use crate::families::deepseek_v41::v41_layer_graphs::LayerGraphs;
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41Fp8Plan, V41PeerCopy};
 use cuteafd_loader::OfficialV41Catalog;
 
@@ -276,7 +276,7 @@ impl Drop for Wave<'_,'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v41_tensors::NativeRtxTensors;
+    use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
     #[test]
     #[ignore = "requires checkpoint, projection shard AOT and two CUDA GPUs"]
     fn checkpoint_dual_projection_lanes_match_full() -> Result<()> {

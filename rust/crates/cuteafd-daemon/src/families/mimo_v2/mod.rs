@@ -66,10 +66,10 @@ pub(crate) struct EngineArgs {
     /// Scale rule of the FP8 copies made from BF16 weights at load: amax /
     /// 448, the smallest power of two >= it (pow2), or per block whichever of
     /// the two leaves the smaller error (best).
-    #[arg(long, value_enum, default_value_t = crate::fp8_linear::Fp8Scales::Amax)]
-    pub fp8_scales: crate::fp8_linear::Fp8Scales,
+    #[arg(long, value_enum, default_value_t = crate::shared::fp8_linear::Fp8Scales::Amax)]
+    pub fp8_scales: crate::shared::fp8_linear::Fp8Scales,
     #[command(flatten)]
-    pub l2: crate::l2_prefetch::L2PrefetchArgs,
+    pub l2: crate::shared::l2_prefetch::L2PrefetchArgs,
     /// With --local-experts: keep only N MoE layers' experts resident and load
     /// each missing layer over the oldest (prefill checks of models whose
     /// experts do not fit one GPU, such as V2.6 Pro).
@@ -190,8 +190,8 @@ impl Opened {
                 .filter(|t| t.meta.name.starts_with("model.mtp.layers.") && t.meta.name.ends_with(".eh_proj.weight"))
                 .count();
             ensure!(args.mtp <= available, "--mtp {} but the checkpoint has {available} MTP layers", args.mtp);
-            let zeroed = |bytes: usize| -> Result<crate::v41_memory::DeviceAllocation<'_>> {
-                let allocation = crate::v41_memory::DeviceAllocation::new(&self.library, bytes.max(256))?;
+            let zeroed = |bytes: usize| -> Result<crate::shared::memory::DeviceAllocation<'_>> {
+                let allocation = crate::shared::memory::DeviceAllocation::new(&self.library, bytes.max(256))?;
                 self.library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
                 Ok(allocation)
             };
@@ -240,8 +240,8 @@ impl Opened {
         if let Some(experts) = self.experts(args, &moe_layers)? {
             engine.set_experts(experts);
         }
-        if let Some(budget) = args.l2.budget(&self.library, crate::l2_prefetch::OTHER_DEFAULT)? {
-            engine.l2 = Some(crate::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
+        if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
+            engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
         let result = body(&engine);
         drop(engine);
@@ -264,15 +264,15 @@ impl Opened {
         if args.local_experts {
             let tensors = self.catalog.fp8().context("MiMo experts are the checkpoint's FP8 tensors")?;
             let directory = args.fp8_package.clone()
-                .unwrap_or_else(|| crate::v41_experts::fp8::package_directory(&args.native_lib, 1));
+                .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&args.native_lib, 1));
             let (free, _) = self.library.cuda_memory_info()?;
             if let Some(window) = args.expert_window {
-                let experts = crate::v41_experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, 0..0, 1, 0,
+                let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, 0..0, 1, 0,
                     args.prefill_rows, free.saturating_sub(4 << 30))?;
                 return Ok(Some(engine::Experts::Streamed { experts: std::cell::RefCell::new(experts), tensors, window }));
             }
             let started = Instant::now();
-            let local = crate::v41_experts::fp8::Fp8Experts::load(&self.library, tensors, &directory,
+            let local = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory,
                 moe_layers[0]..moe_layers[moe_layers.len() - 1] + 1, 1, 0, args.prefill_rows,
                 free.saturating_sub(4 << 30))?;
             tracing::info!(layers = moe_layers.len(), elapsed_ms = started.elapsed().as_millis() as u64,
@@ -284,7 +284,7 @@ impl Opened {
         let executors: Vec<u64> = (0..peers.len())
             .map(|rank| cuteafd_transport::v41_expert::v41_spark_executor_id(peers.len(), rank))
             .collect::<Result<_>>()?;
-        let mut transport = crate::spark_intake::SparkLink::new(&self.library, &peers, &executors,
+        let mut transport = crate::shared::spark_intake::SparkLink::new(&self.library, &peers, &executors,
             u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2)?;
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
@@ -405,7 +405,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
     }
     if let Some(start) = args.draft_replay {
         let drafter = engine.drafter.as_ref().context("--draft-replay needs --draft")?;
-        let (tokens, greedy) = crate::glm::dflash::golden_sequence(&args.golden, opened.cfg.vocab_size)?;
+        let (tokens, greedy) = crate::families::glm5::dflash::golden_sequence(&args.golden, opened.cfg.vocab_size)?;
         let hidden = opened.cfg.hidden;
         let layers: Vec<Vec<u8>> = drafter.cfg.taps.iter()
             .map(|l| std::fs::read(args.golden.join(format!("layer{l:02}.bin")))).collect::<std::io::Result<_>>()?;
@@ -419,7 +419,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
             }
             Ok(taps)
         };
-        return crate::glm::dflash::replay(drafter, &tokens, &greedy, &taps,
+        return crate::families::glm5::dflash::replay(drafter, &tokens, &greedy, &taps,
             &|t| embed_rows(&opened.checkpoint, t, hidden), engine.weights.head.buffer.ptr, start);
     }
     if let Some(dir) = &args.mtp_oracle {

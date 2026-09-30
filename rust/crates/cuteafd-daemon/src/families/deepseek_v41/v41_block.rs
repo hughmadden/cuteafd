@@ -1,8 +1,8 @@
 //! Shifted backbone attention/FFN sequencing with exact query-result identity.
-use crate::v41_attention_binding::QueryBinding;
-use crate::v41_attention_output::AttentionOutput;
-use crate::v41_attention_query::{AttentionQueryOutput, AttentionQueryWave};
-use crate::v41_hc::HcSublayer;
+use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
+use crate::families::deepseek_v41::v41_attention_output::AttentionOutput;
+use crate::families::deepseek_v41::v41_attention_query::{AttentionQueryOutput, AttentionQueryWave};
+use crate::families::deepseek_v41::v41_hc::HcSublayer;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 mod encoder_suffix;
@@ -73,7 +73,7 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
     /// No device allocation or graph capture occurs here.
     pub fn advance(
         &mut self,
-        next: &'w crate::v41_backbone_hc::BackboneHcWeights<'a>,
+        next: &'w crate::families::deepseek_v41::v41_backbone_hc::BackboneHcWeights<'a>,
     ) -> Result<()> {
         let result = (|| -> Result<()> {
             let (binding, rows, copied_next) = match self.phase {
@@ -106,7 +106,7 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
     /// cancellation. Token initialization is required before attention resumes.
     pub fn restart(
         &mut self,
-        first: &'w crate::v41_backbone_hc::BackboneHcWeights<'a>,
+        first: &'w crate::families::deepseek_v41::v41_backbone_hc::BackboneHcWeights<'a>,
     ) -> Result<()> {
         let result = (|| -> Result<()> {
             ensure!(first.layer() == 0
@@ -126,7 +126,7 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
         result
     }
     /// Rebind an idle lane to decoder layer 20 and restore retained encoder rows.
-    pub fn initialize_decoder(&mut self, decoder: &'w crate::v41_backbone_hc::BackboneHcWeights<'a>,
+    pub fn initialize_decoder(&mut self, decoder: &'w crate::families::deepseek_v41::v41_backbone_hc::BackboneHcWeights<'a>,
         encoder: &BlockOutput<'_>) -> Result<()> {
         self.reset();
         let result = (|| -> Result<()> {
@@ -198,8 +198,8 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
     /// Gather and gate storage remain live and exclusive until the call drains.
     pub unsafe fn apply_engram(
         &mut self,
-        gate: &mut crate::v41_engram::layer::EngramGate<'_, '_>,
-        gathered: &crate::v41_engram::EngramDeviceView,
+        gate: &mut crate::families::deepseek_v41::v41_engram::layer::EngramGate<'_, '_>,
+        gathered: &crate::families::deepseek_v41::v41_engram::EngramDeviceView,
     ) -> Result<()> {
         let result = (|| -> Result<()> {
             let (binding, rows) = match self.phase {
@@ -219,8 +219,8 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
     /// # Safety
     /// Keep gathered upload storage and this block exclusive through the gate/copy.
     pub async unsafe fn apply_engram_cooperative(&mut self,
-        gate: &mut crate::v41_engram::layer::EngramGate<'_, '_>,
-        gathered: &crate::v41_engram::EngramDeviceView) -> Result<()> {
+        gate: &mut crate::families::deepseek_v41::v41_engram::layer::EngramGate<'_, '_>,
+        gathered: &crate::families::deepseek_v41::v41_engram::EngramDeviceView) -> Result<()> {
         let Phase::Prepared(binding, rows, false) = std::mem::replace(&mut self.phase, Phase::Idle) else {
             anyhow::bail!("block is not awaiting engram");
         };
@@ -263,7 +263,7 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
     /// output unpublished. Image replacement belongs to the separate vision path.
     pub fn initialize_embedding(
         &mut self,
-        embedding: &crate::v41_target_embedding::TargetEmbedding<'_>,
+        embedding: &crate::families::deepseek_v41::v41_target_embedding::TargetEmbedding<'_>,
     ) -> Result<()> {
         self.reset();
         let rows = embedding.positions.len();
@@ -284,7 +284,7 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
     pub unsafe fn begin_embedded_attention<'q>(
         &mut self,
         query: &'q mut AttentionQueryWave<'_, '_>,
-        embedding: &crate::v41_target_embedding::TargetEmbedding<'_>,
+        embedding: &crate::families::deepseek_v41::v41_target_embedding::TargetEmbedding<'_>,
     ) -> Result<AttentionQueryOutput<'q>> {
         self.reset();
         ensure!(query.layer() == 0, "initial block query layer differs");
@@ -343,7 +343,7 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
     /// projection owner through completion or drained cancellation.
     pub async unsafe fn begin_attention_with_projection_cooperative<'q>(&mut self,
         query: &'q mut AttentionQueryWave<'_, '_>, tokens: &[u64],
-        projection: Option<&mut crate::v41_projection_tp2::Wave<'_, '_>>,
+        projection: Option<&mut crate::families::deepseek_v41::v41_projection_tp2::Wave<'_, '_>>,
         prepare: impl FnOnce(*mut std::ffi::c_void, [CuteafdDeviceBuffer; 2]) -> Result<()>)
         -> Result<AttentionQueryOutput<'q>> {
         self.reset();
@@ -373,7 +373,7 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
     /// Same contract as begin_attention_with_projection_cooperative.
     pub async unsafe fn begin_prepared_attention_with_projection_cooperative<'q>(&mut self,
         query: &'q mut AttentionQueryWave<'_, '_>,
-        projection: Option<&mut crate::v41_projection_tp2::Wave<'_, '_>>)
+        projection: Option<&mut crate::families::deepseek_v41::v41_projection_tp2::Wave<'_, '_>>)
         -> Result<AttentionQueryOutput<'q>> {
         let tokens = match self.prepared_input() {
             Ok(input) => input.tokens.to_vec(),
@@ -509,9 +509,9 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
     pub unsafe fn finish_ffn(&mut self, binding: QueryBinding, result: CuteafdDeviceBuffer) -> Result<BlockOutput<'_>> {
         // Inside a stage chain the next-layer input copies share the ordered
         // mHC stream, so advance() needs no separate drained copy.
-        let copy_next = crate::v41_memory::chain::active() && self.layer < 39;
+        let copy_next = crate::shared::memory::chain::active() && self.layer < 39;
         let rows = unsafe { self.enqueue_finish_ffn(binding, result, copy_next)? };
-        if let Err(error) = unsafe { crate::v41_memory::chain::finish(self.library, self.ffn.stream_raw()) } {
+        if let Err(error) = unsafe { crate::shared::memory::chain::finish(self.library, self.ffn.stream_raw()) } {
             self.reset(); return Err(error);
         }
         unsafe { self.publish_finished_ffn(binding, rows, copy_next) }
@@ -551,7 +551,7 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
             };
             ensure!(binding == expected && result.device_id == self.inputs()[0].device_id
                 && result.bytes >= rows * 10240 && !result.ptr.is_null(), "block FFN result binding differs");
-            unsafe { crate::v41_memory::chain::join(self.library, self.ffn.stream_raw())?; }
+            unsafe { crate::shared::memory::chain::join(self.library, self.ffn.stream_raw())?; }
             unsafe { self.ffn.enqueue_finish(Some(result), self.ffn.stream_raw())?; }
             if copy_next { unsafe { self.enqueue_next_inputs(rows)?; } }
             Ok(rows)

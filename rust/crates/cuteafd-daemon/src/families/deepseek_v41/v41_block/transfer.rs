@@ -1,7 +1,7 @@
 //! Move completed adjacent-layer state directly into the next GPU's workspace.
 use super::*;
-use crate::v41_backbone_hc::BackboneHcWeights;
-use crate::v41_memory::device::{Device, Stream};
+use crate::families::deepseek_v41::v41_backbone_hc::BackboneHcWeights;
+use crate::shared::memory::device::{Device, Stream};
 
 /// One directed transfer stream per request lane. No intermediate device or
 /// host buffer is needed: both copies land in the destination block inputs.
@@ -42,7 +42,7 @@ impl<'a> BlockTransfer<'a> {
         );
         let device = self.destination.device;
         // Peer DMA never waits on an unresolved event; settle chained producers.
-        crate::v41_memory::chain::settle(device.library)?;
+        crate::shared::memory::chain::settle(device.library)?;
         let queued = device.run(|| {
             for (source, destination) in sources.into_iter().zip(destinations) {
                 unsafe {
@@ -121,8 +121,8 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v41_attention_query::{AttentionQueryWave, AttentionQueryWeights};
-    use crate::v41_memory::device::Allocation;
+    use crate::families::deepseek_v41::v41_attention_query::{AttentionQueryWave, AttentionQueryWeights};
+    use crate::shared::memory::device::Allocation;
 
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and two CUDA GPUs"]
@@ -149,60 +149,60 @@ mod tests {
             },
         ];
         let placement =
-            crate::v41_backbone_cache::CachePlacement::new(std::array::from_fn(|layer| {
+            crate::families::deepseek_v41::v41_backbone_cache::CachePlacement::new(std::array::from_fn(|layer| {
                 usize::from(layer >= 14)
             }))?;
-        let lane_weights = crate::v41_backbone_lane::BackboneLaneWeights::load_distributed(
+        let lane_weights = crate::families::deepseek_v41::v41_backbone_lane::BackboneLaneWeights::load_distributed(
             &lib,
             &catalog,
             placement,
-            crate::v41_backbone_lane::BackboneLaneWeights::distributed_device_bytes(
+            crate::families::deepseek_v41::v41_backbone_lane::BackboneLaneWeights::distributed_device_bytes(
                 &lib, &catalog, placement,
             )?,
             1024 * 1024,
         )?;
-        let lane_bytes = crate::v41_backbone_lane::BackboneLane::placed_workspace_bytes(&lib, 16)?;
-        let mut placed_lane = crate::v41_backbone_lane::BackboneLane::new_on_device(
+        let lane_bytes = crate::families::deepseek_v41::v41_backbone_lane::BackboneLane::placed_workspace_bytes(&lib, 16)?;
+        let mut placed_lane = crate::families::deepseek_v41::v41_backbone_lane::BackboneLane::new_on_device(
             &lane_weights,
             16,
             lane_bytes,
             1,
         )?;
-        let placed_engram_weights = crate::v41_engram::placement::PlacedEngramWeights::load(
+        let placed_engram_weights = crate::families::deepseek_v41::v41_engram::placement::PlacedEngramWeights::load(
             &lib,
             &catalog,
             placement,
-            crate::v41_engram::placement::PlacedEngramWeights::device_bytes(
+            crate::families::deepseek_v41::v41_engram::placement::PlacedEngramWeights::device_bytes(
                 &lib, &catalog, placement,
             )?,
             1024 * 1024,
         )?;
-        let mut placed_engram = crate::v41_engram::placement::PlacedEngram::new(
+        let mut placed_engram = crate::families::deepseek_v41::v41_engram::placement::PlacedEngram::new(
             &placed_engram_weights,
             16,
-            crate::v41_engram::placement::PlacedEngram::device_bytes(&lib, placement, 16)?,
+            crate::families::deepseek_v41::v41_engram::placement::PlacedEngram::device_bytes(&lib, placement, 16)?,
         )?;
         let reference_engram_weights = devices[1].own(|| {
-            crate::v41_engram::layer::EngramLayerWeights::load(
+            crate::families::deepseek_v41::v41_engram::layer::EngramLayerWeights::load(
                 &lib,
                 &catalog,
                 1,
-                crate::v41_engram::layer::EngramLayerWeights::device_bytes(&lib, &catalog, 1)?,
+                crate::families::deepseek_v41::v41_engram::layer::EngramLayerWeights::device_bytes(&lib, &catalog, 1)?,
                 1024 * 1024,
             )
         })?;
         let mut reference_gate = devices[1].own(|| {
-            crate::v41_engram::layer::EngramGate::new(
+            crate::families::deepseek_v41::v41_engram::layer::EngramGate::new(
                 &reference_engram_weights,
                 16,
-                crate::v41_engram::layer::EngramGate::device_bytes(&lib, 16)?,
+                crate::families::deepseek_v41::v41_engram::layer::EngramGate::device_bytes(&lib, 16)?,
             )
         })?;
         let mut reference_upload = devices[1].own(|| {
-            crate::v41_engram::EngramDeviceRows::new(
+            crate::families::deepseek_v41::v41_engram::EngramDeviceRows::new(
                 &lib,
                 16,
-                crate::v41_engram::EngramDeviceRows::device_bytes(16)?,
+                crate::families::deepseek_v41::v41_engram::EngramDeviceRows::device_bytes(16)?,
             )
         })?;
         let hc = devices

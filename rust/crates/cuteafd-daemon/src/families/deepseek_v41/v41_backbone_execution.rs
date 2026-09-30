@@ -1,17 +1,17 @@
 //! Cache producers and the complete per-layer backbone execution handoff.
-use crate::v41_backbone_cache::{BackboneCache, CacheBatch, CacheStage, CachePlacement};
-use crate::v41_memory::device::{Device, DeviceOwner};
+use crate::families::deepseek_v41::v41_backbone_cache::{BackboneCache, CacheBatch, CacheStage, CachePlacement};
+use crate::shared::memory::device::{Device, DeviceOwner};
 mod placement;
 mod distributed;
 pub(crate) use distributed::{DistributedExecution, PendingDistributedProduction};
 pub(crate) use placement::PlacedProducerWaves;
-use crate::v41_backbone_lane::{BackboneLane, LaneFfn, PendingLaneFfn};
-use crate::v41_backbone_router::ExpertRow;
-use crate::v41_compressor::{CompressorWave, CompressorWeights};
-use crate::v41_experts::coordinator::{NativeTp4Wave, NativeFfnOutput};
-use crate::v41_index_lane::IndexLane;
-use crate::v41_tensors::NativeRtxTensors;
-use crate::v41_window::{WindowWave, WindowWeights};
+use crate::families::deepseek_v41::v41_backbone_lane::{BackboneLane, LaneFfn, PendingLaneFfn};
+use crate::families::deepseek_v41::v41_backbone_router::ExpertRow;
+use crate::families::deepseek_v41::v41_compressor::{CompressorWave, CompressorWeights};
+use crate::families::deepseek_v41::v41_experts::coordinator::{NativeTp4Wave, NativeFfnOutput};
+use crate::families::deepseek_v41::v41_index_lane::IndexLane;
+use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
+use crate::families::deepseek_v41::v41_window::{WindowWave, WindowWeights};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::OfficialV41Catalog;
@@ -99,7 +99,7 @@ impl PreparedLayer<'_, '_, '_> {
     }
     #[cfg(test)]
     async unsafe fn check_queued_ffn(mut self, image_mask: &[u8],
-        local: Option<&mut crate::v41_experts::local::LocalExpertWave<'_>>) -> Result<Self> {
+        local: Option<&mut crate::families::deepseek_v41::v41_experts::local::LocalExpertWave<'_>>) -> Result<Self> {
         let mut ffn = match self.ffn {
             PreparedFfn::Ready(ffn) => ffn,
             PreparedFfn::Pending(pending) => pending.complete().await?,
@@ -256,9 +256,9 @@ pub(crate) struct BackboneExecution<'w, 'a> {
 /// Each window records this stream as its pending commit's completion.
 struct WindowBatch<'a> {
     library: &'a NativeLibrary,
-    stream: crate::v41_memory::LoadStream<'a>,
-    staging: crate::v41_memory::HostAllocation<'a>,
-    table: crate::v41_memory::DeviceAllocation<'a>,
+    stream: crate::shared::memory::LoadStream<'a>,
+    staging: crate::shared::memory::HostAllocation<'a>,
+    table: crate::shared::memory::DeviceAllocation<'a>,
     kernel: cuteafd_ffi::V41KvStoreLayers<'a>,
     capacity: usize,
 }
@@ -272,9 +272,9 @@ impl<'a> WindowBatch<'a> {
         let bytes = Self::bytes(capacity);
         Ok(Self {
             library,
-            stream: crate::v41_memory::LoadStream { library, raw: library.cuda_stream_create()? },
-            staging: crate::v41_memory::HostAllocation::new(library, bytes)?,
-            table: crate::v41_memory::DeviceAllocation::new(library, bytes)?,
+            stream: crate::shared::memory::LoadStream { library, raw: library.cuda_stream_create()? },
+            staging: crate::shared::memory::HostAllocation::new(library, bytes)?,
+            table: crate::shared::memory::DeviceAllocation::new(library, bytes)?,
             kernel: library.v41_kv_store_layers()?,
             capacity,
         })
@@ -282,7 +282,7 @@ impl<'a> WindowBatch<'a> {
     /// # Safety
     /// Every staged window keeps its buffers and cache state alive until this
     /// stream drains; the previous batch on this owner has completed.
-    unsafe fn enqueue(&mut self, layers: &[crate::v41_window::BatchedWindowCommit]) -> Result<()> {
+    unsafe fn enqueue(&mut self, layers: &[crate::families::deepseek_v41::v41_window::BatchedWindowCommit]) -> Result<()> {
         let rows = layers.first().context("empty window batch")?.destinations.len();
         let chunks = layers[0].ends.len();
         ensure!(layers.len() <= Self::LAYERS && rows <= self.capacity && (1..=Self::CHUNKS).contains(&chunks)

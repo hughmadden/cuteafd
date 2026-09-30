@@ -16,8 +16,8 @@ impl<'a> CompressorWave<'_, 'a> {
         replica.validate_owner(&state.index)?;
         ensure!(state.layer==self.weights.layer && state.index.kv_values.buffer.device_id==self.kv_values.buffer.device_id
             && std::ptr::eq(state.index.kv_values.library,self.stream.library), "source replica producer differs");
-        let source=crate::v41_memory::device::Device { library:self.stream.library,id:self.kv_values.buffer.device_id };
-        let publication=crate::v41_memory::peer_publication::PeerPublication::new(source,replica.device())?;
+        let source=crate::shared::memory::device::Device { library:self.stream.library,id:self.kv_values.buffer.device_id };
+        let publication=crate::shared::memory::peer_publication::PeerPublication::new(source,replica.device())?;
         self.replica=Some((replica,publication)); Ok(())
     }
     /// # Safety
@@ -255,7 +255,7 @@ mod tests {
             let mut reference = CompressorState::new(&lib, layer, 2, 4, usize::MAX)?;
             let replica=if replicated {
                 Some(state.enable_replica(
-                    crate::v41_memory::device::Device { library:&lib,id:1-lib.cuda_get_device()? })?)
+                    crate::shared::memory::device::Device { library:&lib,id:1-lib.cuda_get_device()? })?)
             } else { None };
             let leases = [state.begin_request(0, 11)?, state.begin_request(1, 22)?];
             let originals = [reference.begin_request(0, 11)?, reference.begin_request(1, 22)?];

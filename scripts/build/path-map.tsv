@@ -8,12 +8,12 @@ rust/crates/cuteafd-daemon/src/spark_intake.rs	rust/crates/cuteafd-daemon/src/sh
 rust/crates/cuteafd-daemon/src/prefill_share.rs	rust/crates/cuteafd-daemon/src/shared/prefill_share.rs
 rust/crates/cuteafd-daemon/src/fp8_linear.rs	rust/crates/cuteafd-daemon/src/shared/fp8_linear.rs
 rust/crates/cuteafd-daemon/src/l2_prefetch.rs	rust/crates/cuteafd-daemon/src/shared/l2_prefetch.rs
-rust/crates/cuteafd-daemon/src/v41_memory.rs	rust/crates/cuteafd-daemon/src/shared/v41_memory.rs
-rust/crates/cuteafd-daemon/src/v41_memory/	rust/crates/cuteafd-daemon/src/shared/v41_memory/
+rust/crates/cuteafd-daemon/src/v41_memory.rs	rust/crates/cuteafd-daemon/src/shared/memory.rs
+rust/crates/cuteafd-daemon/src/v41_memory/	rust/crates/cuteafd-daemon/src/shared/memory/
 rust/crates/cuteafd-daemon/src/v41_native_serve/constraints.rs	rust/crates/cuteafd-daemon/src/shared/constraints.rs
-rust/crates/cuteafd-daemon/src/v41_experts/fp8.rs	rust/crates/cuteafd-daemon/src/shared/experts/fp8/mod.rs
+rust/crates/cuteafd-daemon/src/v41_experts/fp8.rs	rust/crates/cuteafd-daemon/src/shared/experts/fp8.rs
 rust/crates/cuteafd-daemon/src/v41_experts/fp8/worker.rs	rust/crates/cuteafd-daemon/src/shared/experts/fp8/worker.rs
-rust/crates/cuteafd-daemon/src/v41_experts/service.rs	rust/crates/cuteafd-daemon/src/shared/experts/service/mod.rs
+rust/crates/cuteafd-daemon/src/v41_experts/service.rs	rust/crates/cuteafd-daemon/src/shared/experts/service.rs
 rust/crates/cuteafd-daemon/src/v41_experts/service/backend.rs	rust/crates/cuteafd-daemon/src/shared/experts/service/backend.rs
 rust/crates/cuteafd-daemon/src/v41_experts/service/local.rs	rust/crates/cuteafd-daemon/src/shared/experts/service/local.rs
 rust/crates/cuteafd-daemon/src/dsv4/	rust/crates/cuteafd-daemon/src/families/deepseek_v4/

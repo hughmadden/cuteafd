@@ -1,8 +1,8 @@
 //! GPU1-owned request/cache lifecycle with independent distributed draft chains.
 use super::*;
-use crate::v41_experts::dspark::DistributedDsparkChain;
-use crate::v41_memory::device::{Device, DeviceOwner};
-use crate::v41_tensors::VocabularyShard;
+use crate::families::deepseek_v41::v41_experts::dspark::DistributedDsparkChain;
+use crate::shared::memory::device::{Device, DeviceOwner};
+use crate::families::deepseek_v41::v41_tensors::VocabularyShard;
 
 impl<'w, 'a> DraftRuntime<'w, 'a, DistributedDsparkChain<'w, 'a>> {
     /// The returned owner scopes destruction to GPU1. Synchronous runtime methods
@@ -40,7 +40,7 @@ impl<'w, 'a> DraftRuntime<'w, 'a, DistributedDsparkChain<'w, 'a>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v41_dspark_cache::WindowChunk;
+    use crate::families::deepseek_v41::v41_dspark_cache::WindowChunk;
     fn append<'a, C: DraftChain<'a>>(runtime: &mut DraftRuntime<'_, 'a, C>, lib: &NativeLibrary, cycle: usize) -> Result<u64> {
         let position = if cycle == 0 { 0 } else { 4 + cycle as u64 };
         let tokens = if cycle == 0 { 5 } else { 1 };

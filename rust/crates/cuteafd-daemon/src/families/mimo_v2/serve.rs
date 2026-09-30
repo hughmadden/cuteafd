@@ -9,9 +9,9 @@
 use super::dflash::{ContextRow, DraftSeq};
 use super::mtp::MtpSeq;
 use super::engine::{Allocator, MimoEngine, MimoPlacement, DECODE_ROWS};
-use crate::glm::dflash_policy::{self, CycleCost, DraftHistory, Group, Shape};
+use crate::families::glm5::dflash_policy::{self, CycleCost, DraftHistory, Group, Shape};
 use super::{open, Opened};
-use crate::prefill_share::{add_phases, isolated_phases, Chunk, DecodeShareArgs};
+use crate::shared::prefill_share::{add_phases, isolated_phases, Chunk, DecodeShareArgs};
 use anyhow::{Context, Result};
 use cuteafd_api::native_v41::qwen::QwenEncoding;
 use cuteafd_api::native_v41::{
@@ -58,7 +58,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     // <function=NAME><parameter=KEY>VALUE</parameter>`), its reasoning `<think>`.
     let encoding = QwenEncoding::from_snapshot(&snapshot)?;
     let profile = ModelProfile::new(
-        args.model_id.clone().or_else(|| crate::glmf::serve::model_id(&snapshot)).context("model id")?,
+        args.model_id.clone().or_else(|| crate::families::glm5_flash::serve::model_id(&snapshot)).context("model id")?,
         ModelEncoding::Qwen(Arc::new(encoding)),
     );
     let (queue, receive) = mpsc::channel::<NativeRequest>(16);
@@ -131,7 +131,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
 /// An admitted prompt waiting for its remaining prefill chunks.
 struct Prefill<'a> {
     job: NativeRequest,
-    constraint: Option<crate::v41_native_serve::constraints::State<'a>>,
+    constraint: Option<crate::shared::constraints::State<'a>>,
     tokens: Vec<u32>,
     /// Prompt tokens prefilled so far.
     done: usize,
@@ -161,7 +161,7 @@ struct Active<'a> {
     /// resumes once it reached zero.
     draft_limit: usize,
     draft_pause: usize,
-    constraint: Option<crate::v41_native_serve::constraints::State<'a>>,
+    constraint: Option<crate::shared::constraints::State<'a>>,
     placement: MimoPlacement,
     capacity: usize,
     next: u32,
@@ -230,9 +230,9 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
     let mut cost = dflash_policy::step_cost(&PRO_TP6_STEP_MS, DECODE_ROWS);
-    let mut skip = crate::glm::dflash_policy::DraftSkip::default();
+    let mut skip = crate::families::glm5::dflash_policy::DraftSkip::default();
     let mut allocator = Allocator::new(engine.pages, engine.rings);
-    let mut grammars = crate::v41_native_serve::constraints::Compiler::with_vocab(
+    let mut grammars = crate::shared::constraints::Compiler::with_vocab(
         &opened.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, QwenEncoding::from_snapshot(snapshot)?.tokens().eos.clone());
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
     let embeddings = super::Embeddings::open(&opened.checkpoint, engine.cfg.hidden)?;
@@ -427,7 +427,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let dflash: &[u32] = drafted[i].as_ref().map_or(&[], |d| &d.tokens[..planned[i]]);
             let full: &[u32] = drafted[i].as_ref().map_or(&[], |d| &d.tokens);
             // `emit` already appended `next` to the history.
-            let copy = crate::glmf::serve::copy_drafts(&a.history, limits[i].min(a.draft_limit));
+            let copy = crate::families::glm5_flash::serve::copy_drafts(&a.history, limits[i].min(a.draft_limit));
             let agrees = copy.iter().zip(full).take_while(|(c, d)| c == d).count() >= dflash.len();
             let draft = if copy.len() > dflash.len() && agrees {
                 used_copy[i] = true;

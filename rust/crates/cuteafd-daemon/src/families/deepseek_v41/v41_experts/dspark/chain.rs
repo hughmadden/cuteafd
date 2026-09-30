@@ -1,8 +1,8 @@
 //! Draft transformer chain with optional shared embedding and terminal heads.
 use super::{DsparkStage, DsparkTerminal, DsparkWeights};
-use crate::v41_dspark_cache::{DsparkWindow, WindowLease, WindowRead};
-use crate::v41_memory::{DeviceAllocation, HostAllocation, LoadStream};
-use crate::v41_tensors::{NativeRtxTensors, VocabularyHead};
+use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowLease, WindowRead};
+use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::families::deepseek_v41::v41_tensors::{NativeRtxTensors, VocabularyHead};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DsparkRng;
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41AttentionOps};

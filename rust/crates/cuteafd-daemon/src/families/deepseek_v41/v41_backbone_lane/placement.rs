@@ -96,18 +96,18 @@ impl<'a> BackboneLaneWeights<'a> {
     }
 }
 impl<'w, 'a> BackboneLane<'w, 'a> {
-    pub fn enable_tp2_query(&mut self,weights:[&'w [crate::v41_projection_tp2::Weights<'a>];2],
+    pub fn enable_tp2_query(&mut self,weights:[&'w [crate::families::deepseek_v41::v41_projection_tp2::Weights<'a>];2],
         budgets:[usize;2])->Result<()> {
         ensure!(self.weights.split_query_b && self.tp2_query.is_none(),"query split configuration differs");
         let owner=self.query.input().device_id as usize;
-        self.tp2_query=Some(crate::v41_projection_tp2::Wave::new(weights,self.capacity as u32,owner,budgets)?);
+        self.tp2_query=Some(crate::families::deepseek_v41::v41_projection_tp2::Wave::new(weights,self.capacity as u32,owner,budgets)?);
         Ok(())
     }
-    pub fn enable_tp2_output(&mut self,weights:[&'w [crate::v41_projection_tp2::Weights<'a>];2],
+    pub fn enable_tp2_output(&mut self,weights:[&'w [crate::families::deepseek_v41::v41_projection_tp2::Weights<'a>];2],
         budgets:[usize;2])->Result<()> {
         ensure!(self.weights.split_output_b && self.tp2_output.is_none(),"output split configuration differs");
         let owner=self.projection.input().device_id as usize;
-        self.tp2_output=Some(crate::v41_projection_tp2::Wave::new(weights,self.capacity as u32,owner,budgets)?);
+        self.tp2_output=Some(crate::families::deepseek_v41::v41_projection_tp2::Wave::new(weights,self.capacity as u32,owner,budgets)?);
         Ok(())
     }
     pub fn placed_workspace_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {
@@ -151,7 +151,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub async unsafe fn import_previous_cooperative(
         &mut self,
         previous: &BlockOutput<'_>,
-        transfer: &mut crate::v41_block::BlockTransfer<'a>,
+        transfer: &mut crate::families::deepseek_v41::v41_block::BlockTransfer<'a>,
     ) -> Result<()> {
         self.phase = Phase::Invalid;
         ensure!(previous.layer < 39, "final layer has no successor");

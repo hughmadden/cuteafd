@@ -5,13 +5,13 @@
 //! reading the same FP8 K32 wire rows and device routes the Sparks would get,
 //! and the local reducer adds the shared expert. EXL3 checkpoints run the
 //! coordinator's `exl3-<family>-k<tiers>/rtx-tp1` package instead.
-use crate::v41_experts::exl3::{
+use crate::families::deepseek_v41::v41_experts::exl3::{
     aot_layout_directory,
     execution::{Exl3Execution, Exl3InputFormat, Exl3Workspace},
     Exl3Weights,
 };
-use crate::v41_experts::{ExpertLayer, ExpertWeights};
-use crate::v41_memory::DeviceAllocation;
+use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights};
+use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{
     CuteafdDeviceBuffer, NativeLibrary, V41ExpertKernel, V41ExpertLaunchArgs, V41LocalExpertReducer,

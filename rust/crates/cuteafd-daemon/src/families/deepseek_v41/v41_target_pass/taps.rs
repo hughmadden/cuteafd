@@ -1,8 +1,8 @@
 //! Private dSpark inputs from the target pass, in exact flattened request order.
-use crate::v41_backbone_cache::CacheBatch;
-use crate::v41_backbone_router::ExpertRow;
-use crate::v41_block::PreparedBlockInput;
-use crate::v41_memory::{DeviceAllocation, LoadStream};
+use crate::families::deepseek_v41::v41_backbone_cache::CacheBatch;
+use crate::families::deepseek_v41::v41_backbone_router::ExpertRow;
+use crate::families::deepseek_v41::v41_block::PreparedBlockInput;
+use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps};
 
@@ -102,7 +102,7 @@ impl<'a> TargetTapWave<'a> {
     ) -> Result<()> {
         let queued = unsafe { self.enqueue_capture(batch, input) };
         let drained = if queued.is_err() { unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) } }
-            else { unsafe { crate::v41_memory::chain::finish(self.stream.library, self.stream.raw) } };
+            else { unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw) } };
         if let Err(error) = queued.and(drained) { self.reset(); return Err(error); }
         self.progress.next += 1;
         Ok(())
@@ -112,7 +112,7 @@ impl<'a> TargetTapWave<'a> {
     pub(super) async unsafe fn capture_cooperative(&mut self, batch: &CacheBatch,
         input: &PreparedBlockInput<'_>) -> Result<()> {
         unsafe { self.enqueue_capture(batch, input)?; }
-        if let Err(error) = unsafe { crate::v41_memory::chain::finish_cooperative(&self.stream).await } {
+        if let Err(error) = unsafe { crate::shared::memory::chain::finish_cooperative(&self.stream).await } {
             self.reset(); return Err(error);
         }
         self.progress.next += 1;
@@ -149,7 +149,7 @@ impl<'a> TargetTapWave<'a> {
                 )?;
             }
             let launched = unsafe {
-                crate::v41_memory::chain::join(self.stream.library, self.stream.raw)?;
+                crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?;
                 self.ops.tap(
                     input.residual,
                     self.values.buffer,

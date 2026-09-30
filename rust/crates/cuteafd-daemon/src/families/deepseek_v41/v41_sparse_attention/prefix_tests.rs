@@ -5,7 +5,7 @@ use super::*;
 fn k7_sparse_reservation_preserves_k5_accounting_and_stable_query_storage() -> Result<()> {
     let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
     for gpu in 0..2 {
-        crate::v41_memory::device::Device { library: &lib, id: gpu }.run(|| {
+        crate::shared::memory::device::Device { library: &lib, id: gpu }.run(|| {
             let budget = SparseAttentionWave::device_bytes(80)?;
             let mut wave = SparseAttentionWave::new(&lib, 80, budget)?;
             let used = |wave: &SparseAttentionWave<'_>| wave.query.buffer.bytes + wave.output.buffer.bytes
@@ -39,7 +39,7 @@ fn k7_sparse_reservation_preserves_k5_accounting_and_stable_query_storage() -> R
 fn committed_prefix_survives_append_but_private_boundary_stays_exact() -> Result<()> {
     let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
     for gpu in 0..2 {
-        crate::v41_memory::device::Device {
+        crate::shared::memory::device::Device {
             library: &lib,
             id: gpu,
         }
@@ -209,7 +209,7 @@ fn compact_wave_budget_preserves_full_geometry() -> Result<()> {
 fn compact_wave_batch_graph_consumes_local_buffers() -> Result<()> {
     let lib=unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
     for gpu in 0..2 {
-        crate::v41_memory::device::Device { library:&lib,id:gpu }.run(|| {
+        crate::shared::memory::device::Device { library:&lib,id:gpu }.run(|| {
             let mut wave=CompactSparseAttentionWave::new(&lib,80,CompactSparseAttentionWave::device_bytes(80)?)?;
             let input=wave.input().ptr;
             wave.reserve_decode_rows(64)?;

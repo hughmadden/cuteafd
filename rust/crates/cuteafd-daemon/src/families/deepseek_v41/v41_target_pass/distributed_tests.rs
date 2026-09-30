@@ -1,17 +1,17 @@
 use super::*;
 mod decode_lanes;
-use crate::v41_backbone_cache::BackboneCache;
-use crate::v41_backbone_execution::CacheProducerWeights;
-use crate::v41_backbone_lane::BackboneLaneWeights;
-use crate::v41_engram::{
+use crate::families::deepseek_v41::v41_backbone_cache::BackboneCache;
+use crate::families::deepseek_v41::v41_backbone_execution::CacheProducerWeights;
+use crate::families::deepseek_v41::v41_backbone_lane::BackboneLaneWeights;
+use crate::families::deepseek_v41::v41_engram::{
     layer::{EngramGate, EngramLayerWeights},
     EngramDeviceRows,
 };
-use crate::v41_index_lane::IndexLaneWeights;
-use crate::v41_requests::{RequestTokens, Requests};
-use crate::v41_target_embedding::TargetEmbeddingWave;
-use crate::v41_target_head::{TargetHeadWave, TargetHeadWeights};
-use crate::v41_tensors::{NativeRtxTensors, VocabularyHead};
+use crate::families::deepseek_v41::v41_index_lane::IndexLaneWeights;
+use crate::families::deepseek_v41::v41_requests::{RequestTokens, Requests};
+use crate::families::deepseek_v41::v41_target_embedding::TargetEmbeddingWave;
+use crate::families::deepseek_v41::v41_target_head::{TargetHeadWave, TargetHeadWeights};
+use crate::families::deepseek_v41::v41_tensors::{NativeRtxTensors, VocabularyHead};
 use anyhow::Context;
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_transport::v41_expert::V41Tp4Roce;
@@ -130,10 +130,10 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
         upload,
         gates,
         head,
-        crate::v41_target_pass::TargetTapWave::new(
+        crate::families::deepseek_v41::v41_target_pass::TargetTapWave::new(
             &lib,
             80,
-            crate::v41_target_pass::TargetTapWave::device_bytes(80)?,
+            crate::families::deepseek_v41::v41_target_pass::TargetTapWave::device_bytes(80)?,
         )?,
         Duration::from_secs(120),
     )?;
@@ -167,9 +167,9 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             })?, NativeTp4Wave::device_bytes(80)?)?;
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         if std::env::var_os("CUTEAFD_TARGET_PASS_DECODE_LANES").is_some() {
-            let draft_weights = crate::v41_experts::dspark::DsparkWeights::load(
+            let draft_weights = crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load(
                 &lib, &catalog, 80, 1, 32 * 1024 * 1024 * 1024, 16 * 1024 * 1024)?;
-            let mut draft = crate::v41_native_serve::speculative::DraftRuntime::new(
+            let mut draft = crate::families::deepseek_v41::v41_native_serve::speculative::DraftRuntime::new(
                 &lib, &draft_weights, &table, &vocabulary, 80)?;
             return decode_lanes::qualify(&lib, &runtime, &mut requests,
                 &mut pass, &mut other, &mut transport, &mut second_transport, &mut draft);
@@ -314,7 +314,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
     }
     let dspark_weights = if std::env::var_os("CUTEAFD_TARGET_PASS_DSPARK").is_some() {
         let start = Instant::now();
-        let weights = crate::v41_experts::dspark::DsparkWeights::load(
+        let weights = crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load(
             &lib,
             &catalog,
             80,
@@ -336,7 +336,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
         .map(|weights| {
             weights.main_context(
                 80,
-                crate::v41_experts::dspark::DsparkMainContext::device_bytes(&lib, 80)?,
+                crate::families::deepseek_v41::v41_experts::dspark::DsparkMainContext::device_bytes(&lib, 80)?,
             )
         })
         .transpose()?;
@@ -387,11 +387,11 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
     let mut draft_windows = if main_context.is_some() {
         (0..3)
             .map(|_| {
-                crate::v41_dspark_cache::DsparkWindow::new(
+                crate::families::deepseek_v41::v41_dspark_cache::DsparkWindow::new(
                     &lib,
                     16,
                     80,
-                    crate::v41_dspark_cache::DsparkWindow::device_bytes(16, 80)?,
+                    crate::families::deepseek_v41::v41_dspark_cache::DsparkWindow::device_bytes(16, 80)?,
                 )
             })
             .collect::<Result<Vec<_>>>()?
@@ -408,11 +408,11 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let mut transaction_windows = (0..draft_windows.len())
         .map(|_| {
-            crate::v41_dspark_cache::DsparkWindow::new(
+            crate::families::deepseek_v41::v41_dspark_cache::DsparkWindow::new(
                 &lib,
                 16,
                 80,
-                crate::v41_dspark_cache::DsparkWindow::device_bytes(16, 80)?,
+                crate::families::deepseek_v41::v41_dspark_cache::DsparkWindow::device_bytes(16, 80)?,
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -701,7 +701,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
                 chain.execute(windows, bindings)?;
             }
             let read =
-                |chain: &crate::v41_experts::dspark::DsparkChain<'_, '_>| -> Result<Vec<Vec<u8>>> {
+                |chain: &crate::families::deepseek_v41::v41_experts::dspark::DsparkChain<'_, '_>| -> Result<Vec<Vec<u8>>> {
                     chain
                         .draft_output()?
                         .iter()
@@ -948,12 +948,12 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
 
 fn qualify_main_prefixes(
     lib: &NativeLibrary,
-    main: &mut crate::v41_experts::dspark::DsparkMainContext<'_, '_>,
+    main: &mut crate::families::deepseek_v41::v41_experts::dspark::DsparkMainContext<'_, '_>,
     taps: &TargetTaps<'_>,
-    full: &[crate::v41_dspark_cache::DsparkWindow<'_>],
+    full: &[crate::families::deepseek_v41::v41_dspark_cache::DsparkWindow<'_>],
     count: usize,
 ) -> Result<()> {
-    use crate::v41_dspark_cache::DsparkWindow;
+    use crate::families::deepseek_v41::v41_dspark_cache::DsparkWindow;
     let mut windows = (0..3)
         .map(|_| DsparkWindow::new(lib, 16, 80, DsparkWindow::device_bytes(16, 80)?))
         .collect::<Result<Vec<_>>>()?;

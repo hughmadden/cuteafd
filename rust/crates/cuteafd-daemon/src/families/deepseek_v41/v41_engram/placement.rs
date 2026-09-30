@@ -1,9 +1,9 @@
 //! GPU projections follow Engram layers; CPU table gathering stays unchanged.
 use super::layer::{EngramGate, EngramLayerWeights};
 use super::*;
-use crate::v41_backbone_cache::CachePlacement;
-use crate::v41_backbone_lane::BackboneLane;
-use crate::v41_memory::device::{Device, DeviceOwner};
+use crate::families::deepseek_v41::v41_backbone_cache::CachePlacement;
+use crate::families::deepseek_v41::v41_backbone_lane::BackboneLane;
+use crate::shared::memory::device::{Device, DeviceOwner};
 use cuteafd_loader::OfficialV41Catalog;
 
 pub(crate) struct PlacedEngramWeights<'a> {

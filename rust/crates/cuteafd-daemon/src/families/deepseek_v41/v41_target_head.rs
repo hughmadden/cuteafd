@@ -1,10 +1,10 @@
 //! Final target mHC collapse, RMS norm and the vocabulary shared with dSpark.
 pub(crate) mod distributed;
 pub(crate) mod distributed_target;
-use crate::v41_attention_binding::QueryBinding;
-use crate::v41_block::BlockOutput;
-use crate::v41_memory::{DeviceAllocation, HostAllocation, LoadStream};
-use crate::v41_tensors::{NativeRtxTensors, VocabularyHead};
+use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
+use crate::families::deepseek_v41::v41_block::BlockOutput;
+use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::families::deepseek_v41::v41_tensors::{NativeRtxTensors, VocabularyHead};
 use anyhow::{Context, Result, ensure};
 use cuteafd_ffi::{
     CuteafdDeviceBuffer, CuteafdV41SamplerRow, NativeLibrary, V41Hc, V41VocabularyProjection,
@@ -860,7 +860,7 @@ impl<'a> TargetHeadWeights<'a> {
             greedy_staging: HostAllocation::new(self.library, capacity * 8)?,
             greedy_ready: false,
             sampling: TargetSamplingWave::new(self.library, capacity)?,
-            download: crate::v41_memory::RowDownload::new(self.library, capacity * STRIDES[4])?,
+            download: crate::shared::memory::RowDownload::new(self.library, capacity * STRIDES[4])?,
         })
     }
 }
@@ -880,7 +880,7 @@ impl TargetLogits<'_> {
     }
 }
 pub(crate) struct TargetHeadWave<'w, 'a> {
-    download: crate::v41_memory::RowDownload<'a>,
+    download: crate::shared::memory::RowDownload<'a>,
     stream: LoadStream<'a>,
     projection: V41VocabularyProjection<'a>,
     _workspace: DeviceAllocation<'a>,
@@ -1052,7 +1052,7 @@ impl TargetHeadWave<'_, '_> {
         );
         let copied = (|| -> Result<()> {
             // The final block output may still be queued in a stage chain.
-            unsafe { crate::v41_memory::chain::join(self.stream.library, self.stream.raw)?; }
+            unsafe { crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?; }
             let mut first = 0;
             while first < selected.len() {
                 let mut count = 1;
@@ -1739,8 +1739,8 @@ mod sampler_wiring_tests {
 
     fn member(params: cuteafd_core::TargetSamplingParams, base_position: u64,
         masks: Vec<Option<Vec<u32>>>,
-    ) -> crate::v41_native_serve::scheduler::SamplingMember {
-        crate::v41_native_serve::scheduler::SamplingMember {
+    ) -> crate::families::deepseek_v41::v41_native_serve::scheduler::SamplingMember {
+        crate::families::deepseek_v41::v41_native_serve::scheduler::SamplingMember {
             params, base_position, row_masks: masks,
         }
     }
@@ -1755,7 +1755,7 @@ mod sampler_wiring_tests {
     /// The plan the wiring tests stage: a greedy row, three fast-path rows, an
     /// ordered masked top-k row, an ordered top-p row and a `top_k = 300` row the
     /// router must send to the CPU.
-    fn wiring_members(vocab: usize) -> Vec<crate::v41_native_serve::scheduler::SamplingMember> {
+    fn wiring_members(vocab: usize) -> Vec<crate::families::deepseek_v41::v41_native_serve::scheduler::SamplingMember> {
         use cuteafd_core::TargetSamplingParams as P;
         vec![
             // 0: greedy, no mask.
@@ -1776,14 +1776,14 @@ mod sampler_wiring_tests {
 
     /// Build the plan and the host mask arena exactly as the scheduler does.
     fn wiring_plan(vocab: usize) -> (
-        crate::v41_native_serve::scheduler::SamplingPlan, Vec<u32>, Vec<Vec<u32>>,
+        crate::families::deepseek_v41::v41_native_serve::scheduler::SamplingPlan, Vec<u32>, Vec<Vec<u32>>,
     ) {
-        use crate::v41_native_serve::scheduler::{build_sampling_masks, build_target_sampling_plan};
+        use crate::families::deepseek_v41::v41_native_serve::scheduler::{build_sampling_masks, build_target_sampling_plan};
         let members = wiring_members(vocab);
         let inputs: Vec<Vec<u32>> = WIRING_INPUTS.iter().map(|input| input.to_vec()).collect();
         let plan = build_target_sampling_plan(&members, &inputs).unwrap();
         let rows: usize = inputs.iter().map(Vec::len).sum();
-        let arena_words = crate::v41_native_serve::scores::VOCAB.div_ceil(32);
+        let arena_words = crate::families::deepseek_v41::v41_native_serve::scores::VOCAB.div_ceil(32);
         let mut arena = vec![0u32; rows * arena_words];
         let row_masks: Vec<Vec<Option<Vec<u32>>>> = plan.mask.iter()
             .enumerate()
@@ -1820,7 +1820,7 @@ mod sampler_wiring_tests {
 
     impl WiringWave {
         /// Stage the plan and run the launch through the recording launcher.
-        fn build(plan: &crate::v41_native_serve::scheduler::SamplingPlan, arena: &[u32],
+        fn build(plan: &crate::families::deepseek_v41::v41_native_serve::scheduler::SamplingPlan, arena: &[u32],
             rows: usize, vocab: usize,
         ) -> Option<Self> {
             use super::recording_sampler as rec;
@@ -1852,8 +1852,8 @@ mod sampler_wiring_tests {
     /// a device-routed row reads `best`, and a kernel that failed leaves that
     /// slot at the caller's sentinel.
     fn batch_with_value(value: impl Fn(usize) -> u32, rows: usize,
-    ) -> crate::v41_native_serve::scores::BatchScores {
-        use crate::v41_native_serve::scores::{ROW_BYTES, VOCAB};
+    ) -> crate::families::deepseek_v41::v41_native_serve::scores::BatchScores {
+        use crate::families::deepseek_v41::v41_native_serve::scores::{ROW_BYTES, VOCAB};
         let mut bytes = Vec::with_capacity(rows * ROW_BYTES);
         for row in 0..rows {
             let planted = value(row);
@@ -1862,7 +1862,7 @@ mod sampler_wiring_tests {
                 bytes.extend_from_slice(&logit.to_ne_bytes());
             }
         }
-        crate::v41_native_serve::scores::BatchScores::new(bytes).unwrap()
+        crate::families::deepseek_v41::v41_native_serve::scores::BatchScores::new(bytes).unwrap()
     }
 
     fn wiring_library() -> Option<NativeLibrary> {
@@ -1962,8 +1962,8 @@ mod sampler_wiring_tests {
     #[test]
     fn resolving_a_fallback_row_stores_the_cpu_token_in_its_best_slot() {
         use super::recording_sampler as rec;
-        use crate::v41_native_serve::scheduler::{resolve_fallback_rows, SamplingRound};
-        use crate::v41_native_serve::scores::{BatchScores, ROW_BYTES};
+        use crate::families::deepseek_v41::v41_native_serve::scheduler::{resolve_fallback_rows, SamplingRound};
+        use crate::families::deepseek_v41::v41_native_serve::scores::{BatchScores, ROW_BYTES};
         let _serial = rec::lock_and_reset();
         let vocab = rec::TEST_VOCAB;
         let Some(_library) = wiring_library() else {
@@ -2010,9 +2010,9 @@ mod sampler_wiring_tests {
     #[test]
     fn a_device_refused_row_is_re_sampled_and_stored_on_the_cpu() {
         use super::recording_sampler as rec;
-        use crate::v41_native_serve::scheduler::{admit_device_rows, resolve_fallback_rows,
+        use crate::families::deepseek_v41::v41_native_serve::scheduler::{admit_device_rows, resolve_fallback_rows,
             select_routed, SamplingRound};
-        use crate::v41_native_serve::scores::BatchScores;
+        use crate::families::deepseek_v41::v41_native_serve::scores::BatchScores;
         let _serial = rec::lock_and_reset();
         let vocab = rec::TEST_VOCAB;
         let Some(_library) = wiring_library() else {
@@ -2094,9 +2094,9 @@ mod sampler_wiring_tests {
     #[test]
     fn a_finishing_fallback_frontier_retains_its_stored_draw() {
         use super::recording_sampler as rec;
-        use crate::v41_native_serve::scheduler::{frontier_retain, resolve_fallback_rows,
+        use crate::families::deepseek_v41::v41_native_serve::scheduler::{frontier_retain, resolve_fallback_rows,
             resolve_frontier, FrontierRetain, SamplingRound};
-        use crate::v41_native_serve::scores::BatchScores;
+        use crate::families::deepseek_v41::v41_native_serve::scores::BatchScores;
         let _serial = rec::lock_and_reset();
         let vocab = rec::TEST_VOCAB;
         let Some(library) = wiring_library() else {
@@ -2225,7 +2225,7 @@ mod sampler_device_tests {
     //! is genuinely running the right route and that no divergence class outside
     //! the declared one appears.
     use super::*;
-    use crate::v41_native_serve::scheduler::{build_sampling_masks, build_target_sampling_plan,
+    use crate::families::deepseek_v41::v41_native_serve::scheduler::{build_sampling_masks, build_target_sampling_plan,
         SamplingMember};
     use cuteafd_core::TargetSamplingParams;
 
@@ -2645,7 +2645,7 @@ mod sampler_device_tests {
             }).collect();
             let inputs: Vec<Vec<u32>> = vec![vec![0]; rows];
             let plan = build_target_sampling_plan(&members, &inputs)?;
-            assert!(plan.route.iter().all(|route| *route == crate::v41_native_serve::scheduler::SamplingRoute::DeviceGreedy));
+            assert!(plan.route.iter().all(|route| *route == crate::families::deepseek_v41::v41_native_serve::scheduler::SamplingRoute::DeviceGreedy));
             let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4)?;
             library.copy_h2d(logits_buffer, &bytes(&values))?;
             let stream = library.cuda_stream_create()?;
@@ -2961,7 +2961,7 @@ mod sampler_device_tests {
 
     impl<'a> StagedWave<'a> {
         fn new(library: &'a NativeLibrary, rows: usize, values: &[f32],
-            plan: &crate::v41_native_serve::scheduler::SamplingPlan, arena: Option<&[u32]>,
+            plan: &crate::families::deepseek_v41::v41_native_serve::scheduler::SamplingPlan, arena: Option<&[u32]>,
         ) -> Result<Self> {
             let logits = library.alloc_device_buffer(rows * VOCAB * 4)?;
             library.copy_h2d(logits, &bytes(values))?;
@@ -3033,7 +3033,7 @@ mod sampler_device_tests {
     /// the upload skipped it rather than relying on allocator zeroing; rows at or
     /// after `mask_rows` are never written and are not read at all (review FIX 3).
     fn assert_uploaded_matches(wave: &StagedWave<'_>,
-        plan: &crate::v41_native_serve::scheduler::SamplingPlan, arena: &[u32],
+        plan: &crate::families::deepseek_v41::v41_native_serve::scheduler::SamplingPlan, arena: &[u32],
     ) -> Result<()> {
         let params = wave.device_params()?;
         for (row, request) in plan.rows.iter().enumerate() {
@@ -3091,7 +3091,7 @@ mod sampler_device_tests {
             vec![Some(retained_mask.clone())], vec![None], vec![None],
         ];
         let build = |seed_shift: u64| -> Result<(
-            crate::v41_native_serve::scheduler::SamplingPlan, Vec<u32>)> {
+            crate::families::deepseek_v41::v41_native_serve::scheduler::SamplingPlan, Vec<u32>)> {
             let members: Vec<SamplingMember> = params.iter().enumerate().map(|(row, &params)| {
                 let params = if seed_shift == 0 { params }
                     else { params.with_seed(params.seed().wrapping_add(seed_shift * 0x9e37)) };
@@ -3147,17 +3147,17 @@ mod sampler_device_tests {
         // re-samples it from its own values and stores the token.
         let expected_fallback = plan.params[5]
             .select_token(&values[5 * VOCAB..6 * VOCAB], None, plan.position[5])? as u32;
-        let round = crate::v41_native_serve::scheduler::SamplingRound {
+        let round = crate::families::deepseek_v41::v41_native_serve::scheduler::SamplingRound {
             plan, arena: arena.clone(), trace_rows: Vec::new() };
         let (device_rows, refused) =
-            crate::v41_native_serve::scheduler::admit_device_rows(&round, &sampled)?;
+            crate::families::deepseek_v41::v41_native_serve::scheduler::admit_device_rows(&round, &sampled)?;
         assert!(refused.is_empty(), "the planned fallback is excluded from the device set");
         assert_eq!(device_rows.len(), 5);
         let fallback = round.fallback_rows(&refused);
         assert_eq!(fallback, vec![5]);
         let bytes5 = staged.download_row(5)?;
         let mut next = sampled.with_full_logits(&[5], bytes5)?;
-        crate::v41_native_serve::scheduler::resolve_fallback_rows(&mut next, &round, &fallback)?;
+        crate::families::deepseek_v41::v41_native_serve::scheduler::resolve_fallback_rows(&mut next, &round, &fallback)?;
         assert_eq!(next.best[5], expected_fallback,
             "the fallback row commits the CPU draw");
 
@@ -3311,7 +3311,7 @@ mod sampler_device_tests {
     #[test]
     #[ignore = "requires a GPU and CUTEAFD_NATIVE_LIB; run with --ignored"]
     fn v41_device_finishing_fallback_frontier_end_to_end() -> Result<()> {
-        use crate::v41_native_serve::scheduler::{admit_device_rows, frontier_retain,
+        use crate::families::deepseek_v41::v41_native_serve::scheduler::{admit_device_rows, frontier_retain,
             resolve_fallback_rows, retain_packed_frontier, FrontierRetain, SamplingRound};
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let rows = 3usize;
@@ -3383,8 +3383,8 @@ mod sampler_device_tests {
     #[test]
     #[ignore = "requires a GPU and CUTEAFD_NATIVE_LIB; run with --ignored"]
     fn v41_device_empty_mask_is_a_hard_error_in_every_mode() -> Result<()> {
-        use crate::v41_native_serve::scheduler::{admit_device_rows, SamplingRound};
-        use crate::v41_native_serve::scheduler::SamplingRoute;
+        use crate::families::deepseek_v41::v41_native_serve::scheduler::{admit_device_rows, SamplingRound};
+        use crate::families::deepseek_v41::v41_native_serve::scheduler::SamplingRoute;
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let rows = 4usize;
         let words = VOCAB.div_ceil(32);

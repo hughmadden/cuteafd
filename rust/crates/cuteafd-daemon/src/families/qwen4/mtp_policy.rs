@@ -1,5 +1,5 @@
 //! How many MTP drafts each Qwen 3.8 Flash Next sequence verifies, on the
-//! shared policy core (`crate::draft_policy`).
+//! shared policy core (`crate::shared::draft_policy`).
 //!
 //! MTP drafts are sequential: a cycle runs one MTP step over every pending
 //! row (the canonical history, plus each drafting sequence's first draft)
@@ -9,7 +9,7 @@
 //! the other sequences' and recalibrated online; the allocator prices a
 //! cycle as the fitted verify step of its rows plus the MTP steps of its
 //! deepest sequence, both refit as the server runs.
-use crate::draft_policy::{self, Base, Calibration, CycleCost, DraftHistory, Drafter, Group};
+use crate::shared::draft_policy::{self, Base, Calibration, CycleCost, DraftHistory, Drafter, Group};
 
 /// Qwen 3.8 Flash Next EXL3 K4.25, experts local on one RTX PRO 6000 (325 W):
 /// speculative verify step ms by rows of one sequence after the 1634-token

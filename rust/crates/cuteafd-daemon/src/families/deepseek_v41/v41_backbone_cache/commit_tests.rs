@@ -1,12 +1,12 @@
 use super::*;
-use crate::v41_compressor::CompressorWeights;
-use crate::v41_window::WindowWeights;
+use crate::families::deepseek_v41::v41_compressor::CompressorWeights;
+use crate::families::deepseek_v41::v41_window::WindowWeights;
 use cuteafd_ffi::CuteafdDeviceBuffer;
 
 #[test]
 #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT, and two CUDA GPUs"]
 fn placed_cache_commits_match_direct_and_preserve_peer_requests() -> Result<()> {
-    use crate::v41_backbone_execution::{CacheProducerWeights,PlacedProducerWaves};
+    use crate::families::deepseek_v41::v41_backbone_execution::{CacheProducerWeights,PlacedProducerWaves};
     let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
     let catalog = cuteafd_loader::read_official_v41_catalog(cuteafd_loader::OFFICIAL_V41_MODEL_ID,
         std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
@@ -442,7 +442,7 @@ fn real_all_cache_commits_preserve_prefixes_and_revoke_partial_failure() -> Resu
     // while their original source page remains retained by the prefix.
     let mut bank =
         BackboneCache::new(&lib, 16, [18; 4], BackboneCache::device_bytes(16, [18; 4])?)?;
-    bank.install_prefix_pool(crate::v41_memory::SnapshotPool::new(
+    bank.install_prefix_pool(crate::shared::memory::SnapshotPool::new(
         &lib, BackbonePrefix::device_bytes(), 2)?)?;
     let leases = (0..16)
         .map(|s| bank.begin_request(s, 100 + s as u64))
@@ -635,7 +635,7 @@ fn real_all_cache_commits_preserve_prefixes_and_revoke_partial_failure() -> Resu
     // Keep one causal snapshot identity per request/source across appends. This
     // is the committed-view primitive needed by interleaved encoder chunks.
     let snapshots = (0..16).map(|_| (0..4)
-        .map(|_| crate::v41_compressor::reserve_source_snapshot())
+        .map(|_| crate::families::deepseek_v41::v41_compressor::reserve_source_snapshot())
         .collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
     let mut prior_sources = Vec::new();
     for tokens in [64, 65] {
@@ -844,7 +844,7 @@ fn real_all_cache_commits_preserve_prefixes_and_revoke_partial_failure() -> Resu
     } else {
         limited.commit(&batch, &mut windows, &mut sources, &[2; 16]).unwrap_err()
     };
-    assert!(error.downcast_ref::<crate::v41_compressor::SourcePoolExhausted>().is_some());
+    assert!(error.downcast_ref::<crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted>().is_some());
     eprintln!("expected late source exhaustion: {error}");
     for lease in leases {
         assert!(limited.request_id(lease).is_err());

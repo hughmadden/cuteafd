@@ -7,7 +7,7 @@
 //! compact BF16 response, or the whole layer at TP1 on the coordinator.
 pub(crate) mod worker;
 
-use crate::v41_memory::DeviceAllocation;
+use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::fp8_moe::{Fp8MoeModule, FP8_MOE_POINTERS};
 use cuteafd_ffi::NativeLibrary;

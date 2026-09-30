@@ -1,13 +1,13 @@
 use super::*;
 use cuteafd_ffi::CuteafdDeviceBuffer;
-use crate::v41_backbone_lane::BackboneLaneWeights;
-use crate::v41_engram::{
+use crate::families::deepseek_v41::v41_backbone_lane::BackboneLaneWeights;
+use crate::families::deepseek_v41::v41_engram::{
     layer::{EngramGate, EngramLayerWeights},
     EngramDeviceRows,
 };
-use crate::v41_index_lane::IndexLaneWeights;
-use crate::v41_requests::{RequestTokens, Requests};
-use crate::v41_target_embedding::TargetEmbeddingWave;
+use crate::families::deepseek_v41::v41_index_lane::IndexLaneWeights;
+use crate::families::deepseek_v41::v41_requests::{RequestTokens, Requests};
+use crate::families::deepseek_v41::v41_target_embedding::TargetEmbeddingWave;
 use cuteafd_transport::v41_expert::V41Tp4Roce;
 use cuteafd_transport::{ExpertV2SourceKind, TcpTransportConfig};
 use std::{
@@ -87,7 +87,7 @@ fn check_queued_production<'w, 'a>(lib: &NativeLibrary, runtime: &tokio::runtime
 }
 
 fn queued_engram_fixture(runtime: &tokio::runtime::Runtime, requests: &Requests<'_>,
-    batch: &mut crate::v41_requests::RequestBatch, upload: &mut EngramDeviceRows<'_>,
+    batch: &mut crate::families::deepseek_v41::v41_requests::RequestBatch, upload: &mut EngramDeviceRows<'_>,
     gate: &mut EngramGate<'_, '_>, lane: &mut BackboneLane<'_, '_>) -> Result<()> {
     runtime.block_on(async {
         let start = Instant::now();
@@ -205,7 +205,7 @@ fn real_layer_zero_executes_embedding_attention_tp4_and_mhc() -> Result<()> {
         },
     )?;
     let mut transport = NativeTp4Wave::new(&lib, roce, NativeTp4Wave::device_bytes(80)?)?;
-    use crate::v41_experts::{ExpertLayer, ExpertWeights, local::LocalExpertWave};
+    use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights, local::LocalExpertWave};
     let local_budget = ExpertWeights::plan(&lib, &catalog, ExpertLayer::BackboneFull { layer: 0 })?;
     let local_weights = std::rc::Rc::new(vec![ExpertWeights::load(&lib, &catalog,
         ExpertLayer::BackboneFull { layer: 0 }, local_budget.peak_device_bytes()?)?]);

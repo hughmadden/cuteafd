@@ -1,8 +1,8 @@
 //! `expert-probe --local`: the probe's wire rows and routes through the
 //! coordinator's resident-layer path (`dsv4::local::LocalExperts`) on this GPU.
 use crate::cli::ExpertProbeArgs;
-use crate::dsv4::local::{LocalExperts, LocalLayer};
-use crate::v41_memory::DeviceAllocation;
+use crate::families::deepseek_v4::local::{LocalExperts, LocalLayer};
+use crate::shared::memory::DeviceAllocation;
 use anyhow::{Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::OfficialV41Catalog;
@@ -106,8 +106,8 @@ pub(super) fn run_exl3_ranks(
     wire: &[u8],
     routes: &[ExpertProtocolV2RouteEntry],
 ) -> Result<(Vec<f32>, Duration)> {
-    use crate::v41_experts::exl3::execution::{Exl3Execution, Exl3InputFormat};
-    use crate::v41_experts::{exl3::Exl3Weights, ExpertLayer};
+    use crate::families::deepseek_v41::v41_experts::exl3::execution::{Exl3Execution, Exl3InputFormat};
+    use crate::families::deepseek_v41::v41_experts::{exl3::Exl3Weights, ExpertLayer};
     let shape = *catalog.routed_experts();
     let (hidden, topk, rows, world) = (shape.hidden, shape.topk, args.rows as usize, args.local_tp);
     anyhow::ensure!(matches!(world, 2 | 3 | 4 | 6), "--local-tp {world}: EXL3 Spark worlds are 2, 3, 4 and 6");

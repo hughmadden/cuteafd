@@ -1,7 +1,7 @@
 //! Per-lane vocabulary projection on two GPUs, with compact GPU winner merging.
 use super::*;
-use crate::v41_memory::device::{Device, DeviceOwner, Stream, Allocation};
-use crate::v41_tensors::VocabularyShard;
+use crate::shared::memory::device::{Device, DeviceOwner, Stream, Allocation};
+use crate::families::deepseek_v41::v41_tensors::VocabularyShard;
 
 struct Rank<'w, 'a> {
     stream: LoadStream<'a>,

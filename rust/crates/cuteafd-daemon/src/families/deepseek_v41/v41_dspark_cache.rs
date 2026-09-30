@@ -1,5 +1,5 @@
 //! Packed FP8 committed dSpark KV rings with generation-checked request slots.
-use crate::v41_memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{
     CuteafdDeviceBuffer, NativeLibrary, V41AttentionWindow, V41DsparkCache, V41KvWrite,
@@ -102,8 +102,8 @@ impl Drop for WriteReservation {
     }
 }
 pub(crate) struct DsparkWindow<'a> {
-    prefix_copies: [crate::v41_memory::SnapshotCopies<'a, (WindowLease, DsparkPrefix<'a>, ReadReservation)>; 2],
-    prefix_pool: Option<crate::v41_memory::SnapshotPool<'a>>,
+    prefix_copies: [crate::shared::memory::SnapshotCopies<'a, (WindowLease, DsparkPrefix<'a>, ReadReservation)>; 2],
+    prefix_pool: Option<crate::shared::memory::SnapshotPool<'a>>,
     stream: LoadStream<'a>,
     kernel: V41DsparkCache<'a>,
     source: DeviceAllocation<'a>,
@@ -118,8 +118,8 @@ pub(crate) struct DsparkWindow<'a> {
     owner: u64,
 }
 impl<'a> DsparkWindow<'a> {
-    pub fn device(&self) -> crate::v41_memory::device::Device<'a> {
-        crate::v41_memory::device::Device { library: self.stream.library, id: self.ring.buffer.device_id }
+    pub fn device(&self) -> crate::shared::memory::device::Device<'a> {
+        crate::shared::memory::device::Device { library: self.stream.library, id: self.ring.buffer.device_id }
     }
     pub fn device_bytes(slots: usize, source_rows: u32) -> Result<usize> {
         ensure!(
@@ -142,8 +142,8 @@ impl<'a> DsparkWindow<'a> {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| anyhow::anyhow!("dSpark cache owner IDs exhausted"))?;
         let mut value = Self {
-            prefix_copies: [crate::v41_memory::SnapshotCopies::new(library)?,
-                crate::v41_memory::SnapshotCopies::new(library)?],
+            prefix_copies: [crate::shared::memory::SnapshotCopies::new(library)?,
+                crate::shared::memory::SnapshotCopies::new(library)?],
             prefix_pool: None,
             stream: LoadStream {
                 library,

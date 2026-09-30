@@ -6,7 +6,7 @@ mod checkpoint_tests;
 
 pub(super) use rank::Weights;
 use super::{DsparkRouter, DsparkSharedFfn, DsparkWeights};
-use crate::v41_memory::device::{Allocation, Device, Stream};
+use crate::shared::memory::device::{Allocation, Device, Stream};
 use anyhow::{ensure, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use std::{ffi::c_void, rc::Rc};
@@ -53,7 +53,7 @@ impl<'w,'a> RoutedWave<'w,'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::v41_memory::device::{Allocation,Device,Stream};
+    use crate::shared::memory::device::{Allocation,Device,Stream};
     use anyhow::{ensure,Result};
     use cuteafd_ffi::NativeLibrary;
 

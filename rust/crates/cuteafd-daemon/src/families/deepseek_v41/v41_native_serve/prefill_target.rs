@@ -1,10 +1,10 @@
 //! Static prefill operations for the shared admission/continuation workflow.
 use super::*;
-use crate::v41_backbone_cache::{CacheLease, CacheStage};
-use crate::v41_block::EncoderSuffix;
-use crate::v41_memory::device::DeviceOwner;
-use crate::v41_requests::RequestBatch;
-use crate::v41_target_pass::{DistributedTargetPass, VerificationTarget};
+use crate::families::deepseek_v41::v41_backbone_cache::{CacheLease, CacheStage};
+use crate::families::deepseek_v41::v41_block::EncoderSuffix;
+use crate::shared::memory::device::DeviceOwner;
+use crate::families::deepseek_v41::v41_requests::RequestBatch;
+use crate::families::deepseek_v41::v41_target_pass::{DistributedTargetPass, VerificationTarget};
 use speculative::DraftChain;
 use std::cell::RefCell;
 

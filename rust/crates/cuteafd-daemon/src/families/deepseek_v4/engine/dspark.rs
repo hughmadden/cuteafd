@@ -13,9 +13,9 @@
 //! mHC head, the shared vocabulary head and the Markov head then pick the
 //! drafts greedily on the device.
 use super::{Dev, Engine, Lane, Workspace, LOCAL_EXPERTS, PREFILL_LANES, TAP_ROWS};
-use crate::dsv4::local::LocalLayer;
-use crate::dsv4::metadata::WINDOW;
-use crate::dsv4::pool::Placement;
+use crate::families::deepseek_v4::local::LocalLayer;
+use crate::families::deepseek_v4::metadata::WINDOW;
+use crate::families::deepseek_v4::pool::Placement;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::dsv4::Dsv4Scalar;
 use std::ffi::c_void;

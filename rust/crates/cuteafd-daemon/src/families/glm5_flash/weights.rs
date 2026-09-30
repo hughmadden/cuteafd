@@ -8,7 +8,7 @@
 //! kv_a]`, `kv_b` split per head into `w_uk [N, 512, 256]` (transposed key
 //! rows) and `w_uv [N, 256, 512]`; mHC `fn` widened to FP32; dense and shared
 //! `w_gate_up = [gate; up]`.
-use crate::v41_memory::DeviceAllocation;
+use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
@@ -28,7 +28,7 @@ pub(crate) struct GlmfLayer<'a> {
 
 impl GlmfLayer<'_> {
     /// The device range of `operand`, when the layer has it.
-    pub fn range(&self, operand: &str) -> Option<crate::l2_prefetch::Range> {
+    pub fn range(&self, operand: &str) -> Option<crate::shared::l2_prefetch::Range> {
         self.operands.get(operand).map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes))
     }
 
@@ -76,7 +76,7 @@ pub(crate) struct GlmfLoader<'a> {
     /// Numerics gate only: KDA projections rounded through NVFP4 (Some(search)) and kept in BF16.
     pub kda_nvfp4: Option<bool>,
     /// Scale rule of copies quantized from BF16.
-    pub fp8_scales: crate::fp8_linear::Fp8Scales,
+    pub fp8_scales: crate::shared::fp8_linear::Fp8Scales,
 }
 
 fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {

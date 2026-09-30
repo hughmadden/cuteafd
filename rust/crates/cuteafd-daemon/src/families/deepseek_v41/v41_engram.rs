@@ -1,7 +1,7 @@
 //! Owned native gathered-row upload and BF16 engram embedding production.
 pub(crate) mod layer;
 pub(crate) mod placement;
-use crate::v41_memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::{

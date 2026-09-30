@@ -9,11 +9,11 @@
 //! is: allocate fresh pages and arena slots, copy the bytes back, rebuild the `Saved` from parts
 //! and let the engine's own restore logic run unchanged.
 use super::*;
-use crate::v41_backbone_cache::BackbonePrefix;
-use crate::v41_compressor::CompressorPrefix;
-use crate::v41_dspark_cache::DsparkPrefix;
-use crate::v41_memory::SnapshotStorage;
-use crate::v41_window::WindowPrefix;
+use crate::families::deepseek_v41::v41_backbone_cache::BackbonePrefix;
+use crate::families::deepseek_v41::v41_compressor::CompressorPrefix;
+use crate::families::deepseek_v41::v41_dspark_cache::DsparkPrefix;
+use crate::shared::memory::SnapshotStorage;
+use crate::families::deepseek_v41::v41_window::WindowPrefix;
 use cuteafd_core::EngramHistory;
 use cuteafd_ffi::{CopyMechanism, CudaRuntime, CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use cuteafd_hostcache::cache::{
@@ -366,7 +366,7 @@ impl Drop for CudaCopyEngine<'_> {
 #[cfg(test)]
 mod cuda_tests {
     use super::*;
-    use crate::v41_memory::device::{Allocation, Device};
+    use crate::shared::memory::device::{Allocation, Device};
 
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and two CUDA devices"]
@@ -547,7 +547,7 @@ impl<'a> HostCacheBinding<'a> {
     }
     /// Rebuild a `Saved` from the host copy. `Ok(None)` when the restore timed out or failed (the
     /// caller prefills); allocations are released only after the restore stream drained.
-    pub(super) fn restore<C: crate::v41_native_serve::speculative::DraftChain<'a>>(
+    pub(super) fn restore<C: crate::families::deepseek_v41::v41_native_serve::speculative::DraftChain<'a>>(
         &mut self,
         hit: &Hit,
         requests: &Requests<'a>,

@@ -1,5 +1,5 @@
 //! Device-owned TP2 shared-expert weights and one rank's lane workspace.
-use crate::v41_memory::{HostAllocation, device::{Allocation, Device, Event, PeerTransfer, Stream}};
+use crate::shared::memory::{HostAllocation, device::{Allocation, Device, Event, PeerTransfer, Stream}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, V41Bf16Add, V41Fp8Plan, V41SharedSwiGlu};
 use cuteafd_loader::OfficialV41Catalog;

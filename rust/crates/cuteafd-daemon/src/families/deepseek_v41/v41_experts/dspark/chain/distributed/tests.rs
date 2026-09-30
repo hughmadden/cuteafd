@@ -1,5 +1,5 @@
 use super::*;
-use crate::v41_dspark_cache::WindowChunk;
+use crate::families::deepseek_v41::v41_dspark_cache::WindowChunk;
 
 #[test]
 #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and two CUDA GPUs"]
@@ -25,7 +25,7 @@ fn check_chain(tp2:bool,full_reference:bool) -> Result<()> {
     let exl3_directory = std::env::var_os("CUTEAFD_EXL3_AOT").map(std::path::PathBuf::from);
     let width = std::env::var("CUTEAFD_DSPARK_TEST_WIDTH").unwrap_or_else(|_| "5".into()).parse::<usize>()?;
     ensure!([5, 7].contains(&width), "draft qualification requires width 5 or 7");
-    let capacity = crate::v41_experts::dspark::DsparkAttentionWave::projection_capacity_with_width(16, width)?;
+    let capacity = crate::families::deepseek_v41::v41_experts::dspark::DsparkAttentionWave::projection_capacity_with_width(16, width)?;
     let weights = devices[1].own(|| if tp2 {
         DsparkWeights::load_tp2_with_width(&lib,&catalog,capacity,2,[32usize<<30;2],16<<20,width)
     } else {DsparkWeights::load_with_width(&lib, &catalog, capacity,

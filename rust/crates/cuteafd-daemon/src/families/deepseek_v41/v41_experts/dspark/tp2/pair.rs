@@ -1,6 +1,6 @@
 //! Capture-compatible draft expert fork/join; transformer owner stays on RTX1.
 use super::rank::{Wave, Weights};
-use crate::v41_memory::device::{Allocation, Device, Event, Stream};
+use crate::shared::memory::device::{Allocation, Device, Event, Stream};
 use anyhow::{ensure, Result};
 use cuteafd_ffi::{
     CuteafdDeviceBuffer, NativeLibrary, V41ExpertInputQuantizer, V41PeerCopy, V41RouteReducer,

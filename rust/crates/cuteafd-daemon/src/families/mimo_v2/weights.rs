@@ -21,7 +21,7 @@
 //! MMA widens to the same `bf16(w * s)` the BF16 operand holds); BF16
 //! tensors (`o_proj`) are quantized per row and 128-K block. `fp8_head`: the
 //! same per-row quantization of the BF16 LM head.
-use crate::v41_memory::DeviceAllocation;
+use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
@@ -39,7 +39,7 @@ pub(crate) struct MimoLayer<'a> {
 
 impl MimoLayer<'_> {
     /// The device range of `operand`, when the layer has it.
-    pub fn range(&self, operand: &str) -> Option<crate::l2_prefetch::Range> {
+    pub fn range(&self, operand: &str) -> Option<crate::shared::l2_prefetch::Range> {
         self.operands.get(operand).map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes))
     }
 
@@ -87,7 +87,7 @@ pub(crate) struct MimoLoader<'a> {
     pub fp8_head: bool,
     pub fp8_o_proj: bool,
     /// Scale rule of copies quantized from BF16 (o_proj, the LM head).
-    pub fp8_scales: crate::fp8_linear::Fp8Scales,
+    pub fp8_scales: crate::shared::fp8_linear::Fp8Scales,
 }
 
 /// Scale-grid row of every weight row: uniform 128-row blocks, or per

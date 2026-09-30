@@ -1,5 +1,5 @@
 //! How many DFlash2 drafts each sequence verifies (glmrt v9's adaptive K1-K7
-//! on the shared policy core, `crate::draft_policy`).
+//! on the shared policy core, `crate::shared::draft_policy`).
 //!
 //! Each sequence's conditional acceptance per draft position (its last 16
 //! outcomes, a 3-in-4 prior) is refined by the frozen logistic calibration
@@ -10,9 +10,9 @@
 //! deployment's measured single-sequence table. Identical sequences plan as
 //! one group. The first four cycles of a sequence verify five drafts; a lone
 //! warm sequence keeps five unless the plan beats them by 2%.
-pub(crate) use crate::draft_policy::{CycleCost, DraftHistory, DraftSkip};
-pub(crate) use crate::draft_policy::Shape;
-use crate::draft_policy::{self, Base, Drafter};
+pub(crate) use crate::shared::draft_policy::{CycleCost, DraftHistory, DraftSkip};
+pub(crate) use crate::shared::draft_policy::Shape;
+use crate::shared::draft_policy::{self, Base, Drafter};
 
 pub(crate) const START_DRAFTS: usize = 5;
 /// A single sequence keeps five drafts unless the schedule beats it by 2%.

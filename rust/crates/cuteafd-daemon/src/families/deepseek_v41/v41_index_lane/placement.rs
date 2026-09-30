@@ -75,7 +75,7 @@ impl<'w, 'a> IndexLane<'w, 'a> {
         ensure!(gpu < 2, "invalid index workspace GPU");
         let mut bytes = Self::workspace_bytes(library, capacity)?;
         bytes[2] = if placement.attention(20)? == gpu {
-            crate::v41_index_selection::IndexSelectionWave::shared_device_bytes(capacity as usize)?
+            crate::families::deepseek_v41::v41_index_selection::IndexSelectionWave::shared_device_bytes(capacity as usize)?
         } else { 0 };
         if !LAYERS
             .iter()
@@ -109,15 +109,15 @@ impl<'w, 'a> IndexLane<'w, 'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v41_attention_query::{AttentionQueryWave, AttentionQueryWeights};
-    use crate::v41_backbone_cache::{BackboneCache, CacheWork};
-    use crate::v41_backbone_execution::{CacheProducerWeights, PlacedProducerWaves};
+    use crate::families::deepseek_v41::v41_attention_query::{AttentionQueryWave, AttentionQueryWeights};
+    use crate::families::deepseek_v41::v41_backbone_cache::{BackboneCache, CacheWork};
+    use crate::families::deepseek_v41::v41_backbone_execution::{CacheProducerWeights, PlacedProducerWaves};
     use cuteafd_transport::ExpertV2SourceKind;
 
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and two CUDA GPUs"]
     fn placed_index_scorer_graph_replay_on_both_devices() -> Result<()> {
-        use crate::v41_memory::{DeviceAllocation, LoadStream};
+        use crate::shared::memory::{DeviceAllocation, LoadStream};
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         lib.cuda_set_device(0)?;
         // Initialize both first, then revisit GPU0 to catch overwritten AOT symbols.

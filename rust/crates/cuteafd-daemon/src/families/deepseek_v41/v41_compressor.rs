@@ -1,6 +1,6 @@
 //! CSA2 source weights, immutable proposal execution and accepted-prefix state.
-use crate::v41_memory::{DeviceAllocation, HostAllocation, LoadStream};
-use crate::v41_tensors::NativeRtxTensors;
+use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps, V41Compressor, V41Kv};
 use cuteafd_loader::OfficialV41Catalog;
@@ -70,7 +70,7 @@ impl<'a> CompressorState<'a> {
     pub fn replica_ref(&self)->Option<&SourceReplica<'a>> {
         self.index.replica.as_ref().map(|r|r.storage.as_ref())
     }
-    pub fn enable_replica(&mut self,peer:crate::v41_memory::device::Device<'a>)
+    pub fn enable_replica(&mut self,peer:crate::shared::memory::device::Device<'a>)
         ->Result<std::rc::Rc<SourceReplica<'a>>> {
         ensure!(self.slots.iter().all(|slot|slot.request.is_none()),"source replica requires no live requests");
         self.index.enable_replica(peer)
@@ -415,9 +415,9 @@ impl IndexProposal<'_> {
     /// # Safety
     /// Producer writes are complete or ordered before the replica's stream.
     /// Retain both plane owners until all peer consumers drain.
-    pub unsafe fn copy_peer(&self,replica:&crate::v41_memory::proposal_replica::ProposalReplica<'_>,
+    pub unsafe fn copy_peer(&self,replica:&crate::shared::memory::proposal_replica::ProposalReplica<'_>,
         stream:*mut c_void)->Result<()> {
-        ensure!(replica.format()==crate::v41_memory::proposal_replica::ProposalFormat::CompressedFp4,
+        ensure!(replica.format()==crate::shared::memory::proposal_replica::ProposalFormat::CompressedFp4,
             "compressed proposal replica format differs");
         if self.committed { return Ok(()); }
         unsafe { replica.copy_rows(self.kv_values,self.kv_scales,self.offset as usize,
@@ -516,7 +516,7 @@ pub(crate) struct CompressorWave<'w, 'a> {
     pending_query: Option<(Prepared, bool)>,
     pending_commit: Option<PendingCommit>,
     replica: Option<(std::rc::Rc<SourceReplica<'a>>,
-        crate::v41_memory::peer_publication::PeerPublication<'a>)>,
+        crate::shared::memory::peer_publication::PeerPublication<'a>)>,
     commit_staging: HostAllocation<'a>,
 }
 impl CompressorWave<'_, '_> {
@@ -774,7 +774,7 @@ impl CompressorWave<'_, '_> {
     /// Query and admitted state slots stay alive and immutable until poll_query
     /// completes or abort_query drains. Peer work may use only disjoint slots.
     pub unsafe fn enqueue_query(&mut self, state: &CompressorState<'_>, chunks: &[CompressorChunk],
-        query: &crate::v41_attention_query::AttentionQueryOutput<'_>) -> Result<()> {
+        query: &crate::families::deepseek_v41::v41_attention_query::AttentionQueryOutput<'_>) -> Result<()> {
         let prepared = self.prepare(state, chunks)?;
         ensure!(query.binding()?.layer() == self.weights.layer && query.layer == self.weights.layer
             && query.rows == prepared.rows && query.hidden.bytes == prepared.rows * 10240
@@ -785,7 +785,7 @@ impl CompressorWave<'_, '_> {
         let capture = self.graph.is_none();
         let result = (|| -> Result<()> {
             // Reads only the normalized layer input: overlap the query projections.
-            unsafe { crate::v41_memory::chain::join_fork(self.stream.library, self.stream.raw)?; }
+            unsafe { crate::shared::memory::chain::join_fork(self.stream.library, self.stream.raw)?; }
             unsafe { self.stream.library.copy_d2d_async(self.input.buffer, query.hidden,
                 query.hidden.bytes, self.stream.raw)?; }
             self.upload_queued(&prepared)?;
@@ -804,7 +804,7 @@ impl CompressorWave<'_, '_> {
         let result = (|| -> Result<bool> {
             let (prepared, capture) = self.pending_query.as_ref().context("no queued cache query")?;
             ensure!(prepared.owner == state.owner, "queued cache owner differs");
-            let chained = crate::v41_memory::chain::active();
+            let chained = crate::shared::memory::chain::active();
             if !chained && !unsafe { self.stream.library.cuda_stream_query(self.stream.raw)? } { return Ok(false); }
             if *capture {
                 unsafe { self.stream.library.cuda_graph_begin_capture(self.stream.raw)?; }
@@ -822,7 +822,7 @@ impl CompressorWave<'_, '_> {
                 // Eager proposal is complete. Capture records future work without
                 // committing cache state; publish the existing result below.
             }
-            if chained { unsafe { crate::v41_memory::chain::finish(self.stream.library, self.stream.raw)?; } }
+            if chained { unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw)?; } }
             self.ready = Some(self.pending_query.take().unwrap().0);
             self.output(state)?;
             Ok(true)
@@ -844,7 +844,7 @@ impl CompressorWave<'_, '_> {
         &'s mut self,
         state: &'s CompressorState<'_>,
         chunks: &[CompressorChunk],
-        query: &crate::v41_attention_query::AttentionQueryOutput<'_>,
+        query: &crate::families::deepseek_v41::v41_attention_query::AttentionQueryOutput<'_>,
     ) -> Result<CompressorOutput<'s>> {
         self.ready = None;
         let prepared = self.prepare(state, chunks)?;
@@ -856,24 +856,24 @@ impl CompressorWave<'_, '_> {
             && query.tokens()?.iter().copied().eq(chunks.iter().flat_map(|c|
                 c.position..c.position + u64::from(c.tokens))),
             "compressor query layer, rows or positions differ");
-        if crate::v41_memory::chain::active() && self.pending_query.is_none()
+        if crate::shared::memory::chain::active() && self.pending_query.is_none()
             && self.graph.is_some_and(|(_, n, o)| n == prepared.rows && o == state.owner) {
             // Captured shape: order the producer on the chain (forked from the
             // query's normalized input) instead of draining it on the host.
             let graph = self.graph.unwrap().0;
             let queued = (|| -> Result<()> { unsafe {
-                crate::v41_memory::chain::join_fork(self.stream.library, self.stream.raw)?;
+                crate::shared::memory::chain::join_fork(self.stream.library, self.stream.raw)?;
                 self.stream.library.copy_d2d_async(self.input.buffer, query.hidden,
                     query.hidden.bytes, self.stream.raw)?;
                 self.upload_queued(&prepared)?;
                 self.stream.library.cuda_graph_launch(graph, self.stream.raw)?;
-                crate::v41_memory::chain::finish(self.stream.library, self.stream.raw)
+                crate::shared::memory::chain::finish(self.stream.library, self.stream.raw)
             } })();
             if let Err(error) = queued { self.synchronize()?; return Err(error); }
             self.ready = Some(prepared);
             return self.output(state);
         }
-        crate::v41_memory::chain::settle(self.stream.library)?;
+        crate::shared::memory::chain::settle(self.stream.library)?;
         self.synchronize()?;
         self.stream.library.copy_d2d(self.input.buffer, query.hidden, query.hidden.bytes)?;
         self.select_graph(prepared.rows, state.owner, true)?;

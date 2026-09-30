@@ -51,10 +51,10 @@ pub(crate) struct EngineArgs {
     /// Scale rule of the FP8 copies made from BF16 weights at load: amax /
     /// 448, the smallest power of two >= it (pow2), or per block whichever of
     /// the two leaves the smaller error (best).
-    #[arg(long, value_enum, default_value_t = crate::fp8_linear::Fp8Scales::Amax)]
-    pub fp8_scales: crate::fp8_linear::Fp8Scales,
+    #[arg(long, value_enum, default_value_t = crate::shared::fp8_linear::Fp8Scales::Amax)]
+    pub fp8_scales: crate::shared::fp8_linear::Fp8Scales,
     #[command(flatten)]
-    pub l2: crate::l2_prefetch::L2PrefetchArgs,
+    pub l2: crate::shared::l2_prefetch::L2PrefetchArgs,
     /// Where the PLE n-gram table lives.
     #[arg(long, value_enum, default_value_t = ple::PlePlacement::Host)]
     pub ple: ple::PlePlacement,
@@ -212,8 +212,8 @@ impl Opened {
         if let Some(experts) = self.experts(args, layers)? {
             engine.set_experts(experts);
         }
-        if let Some(budget) = args.l2.budget(&self.library, crate::l2_prefetch::OTHER_DEFAULT)? {
-            engine.l2 = Some(crate::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
+        if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
+            engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
         let result = body(&engine);
         drop(engine);
@@ -229,10 +229,10 @@ impl Opened {
         }
         if let Some(tensors) = self.fp8() {
             let directory = args.fp8_package.clone()
-                .unwrap_or_else(|| crate::v41_experts::fp8::package_directory(&args.native_lib, 1));
+                .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&args.native_lib, 1));
             let (free, _) = self.library.cuda_memory_info()?;
             // An empty window: the package and its scratch; layers load on first use.
-            let experts = crate::v41_experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, 0..0, 1, 0,
+            let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, 0..0, 1, 0,
                 args.prefill_rows, free.saturating_sub(args.expert_reserve_gib.min(4) << 30))?;
             return Ok(Some(engine::Experts::Local(engine::LocalExperts {
                 library: &self.library, tensors, experts: std::cell::RefCell::new(experts),
@@ -254,7 +254,7 @@ impl Opened {
         let executors: Vec<u64> = (0..peers.len())
             .map(|rank| cuteafd_transport::v41_expert::v41_spark_executor_id(peers.len(), rank))
             .collect::<Result<_>>()?;
-        let transport = crate::spark_intake::SparkLink::new(&self.library, &peers, &executors,
+        let transport = crate::shared::spark_intake::SparkLink::new(&self.library, &peers, &executors,
             u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2)?;
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
@@ -445,7 +445,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
             println!("decode logits: top-1 agreement {:.1}% over {rows} rows | next-token accuracy engine {:.1}% \
                 golden {:.1}% | mean NLL {:.4} | mean KL(golden||engine) {:.5}", 100.0 * agree as f64 / rows as f64,
                 100.0 * next_ok as f64 / scored.max(1) as f64, 100.0 * golden_next as f64 / scored.max(1) as f64,
-                nll / scored.max(1) as f64, crate::glmf::mean_kl(&decode_logits, &golden, prefill, vocab));
+                nll / scored.max(1) as f64, crate::families::glm5_flash::mean_kl(&decode_logits, &golden, prefill, vocab));
         }
     }
     if args.bench_prefill > 0 {

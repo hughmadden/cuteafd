@@ -67,7 +67,7 @@ mod tests {
         }
         // The upload path is still synchronous/shared; this test overlaps page
         // ownership, not uploads. Producer-owned upload buffers are next.
-        let stream = crate::v41_memory::LoadStream { library: &lib, raw: lib.cuda_stream_create()? };
+        let stream = crate::shared::memory::LoadStream { library: &lib, raw: lib.cuda_stream_create()? };
         unsafe { cache.upload(&second, stream.raw)?; lib.cuda_stream_synchronize(stream.raw)?; }
         cache.apply(second);
         cache.ensure_idle(1)?;

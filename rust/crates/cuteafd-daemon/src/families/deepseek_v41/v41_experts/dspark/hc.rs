@@ -1,6 +1,6 @@
 //! dSpark bindings to the shared shifted mHC boundary owner.
 use super::DsparkWeights;
-pub(crate) use crate::v41_hc::HcSublayer;
+pub(crate) use crate::families::deepseek_v41::v41_hc::HcSublayer;
 use anyhow::{ensure, Result};
 impl<'library> DsparkWeights<'library> {
     pub fn hc_sublayer(

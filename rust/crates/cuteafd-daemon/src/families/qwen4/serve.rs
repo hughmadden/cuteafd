@@ -14,8 +14,8 @@ use super::engine::{Allocator, Qwen4Engine, Qwen4Placement, DECODE_ROWS};
 use super::mtp_policy;
 use super::speculate::{self, DraftSeq, DraftTiming, MtpSeq, Verified};
 use super::{embed_rows, open, Opened};
-use crate::draft_policy::{Calibration, DraftHistory, Shape};
-use crate::prefill_share::{add_phases, isolated_phases, Chunk, DecodeShareArgs};
+use crate::shared::draft_policy::{Calibration, DraftHistory, Shape};
+use crate::shared::prefill_share::{add_phases, isolated_phases, Chunk, DecodeShareArgs};
 use anyhow::{Context, Result};
 use cuteafd_api::native_v41::qwen::QwenEncoding;
 use cuteafd_api::native_v41::{
@@ -144,7 +144,7 @@ struct Active<'a> {
     /// resumes once it reached zero.
     draft_limit: usize,
     draft_pause: usize,
-    constraint: Option<crate::v41_native_serve::constraints::State<'a>>,
+    constraint: Option<crate::shared::constraints::State<'a>>,
     placement: Qwen4Placement,
     /// MTP stash rows and recent draft outcomes; cycles in a row planned
     /// without drafts (a probe draft follows eight).
@@ -239,7 +239,7 @@ fn copy_drafts(history: &[u32], limit: usize) -> Vec<u32> {
 /// An admitted prompt waiting for its remaining prefill chunks.
 struct Prefill<'a> {
     job: NativeRequest,
-    constraint: Option<crate::v41_native_serve::constraints::State<'a>>,
+    constraint: Option<crate::shared::constraints::State<'a>>,
     tokens: Vec<u32>,
     /// Prompt tokens prefilled so far.
     done: usize,
@@ -279,7 +279,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
     drafts: Drafts, eos: Vec<u32>, decode_share: DecodeShareArgs) -> Result<()> {
     let mut allocator = Allocator::new(engine.pages, engine.slots, &engine.cfg);
-    let mut grammars = crate::v41_native_serve::constraints::Compiler::with_vocab(
+    let mut grammars = crate::shared::constraints::Compiler::with_vocab(
         &opened.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, eos);
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
     let mut active: Vec<Active<'_>> = Vec::new();

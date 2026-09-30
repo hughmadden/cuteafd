@@ -1,9 +1,7 @@
 //! Native engram projection carriers and fused residual gate ownership.
 use super::EngramDeviceView;
-use crate::{
-    v41_memory::{DeviceAllocation, LoadStream},
-    v41_tensors::NativeRtxTensors,
-};
+use crate::shared::memory::{DeviceAllocation, LoadStream};
+use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41Fp8Plan};
 use cuteafd_loader::OfficialV41Catalog;
@@ -353,7 +351,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         let cold = self.graph.as_ref().is_none_or(|(_, rows)| *rows != gathered.rows);
         if cold { self.clear_graph()?; }
         let launched = (|| unsafe {
-            crate::v41_memory::chain::join(self.weights.library, self.stream.raw)?;
+            crate::shared::memory::chain::join(self.weights.library, self.stream.raw)?;
             self.enqueue_inputs(residual, gathered)?;
             if cold { self.enqueue(gathered.rows) } else {
                 self.weights.library.cuda_graph_launch(self.graph.unwrap().0, self.stream.raw)
@@ -369,7 +367,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         let copied = unsafe { self.weights.library.copy_d2d_async(residual, self.output.buffer,
             gathered.rows * 40960, self.stream.raw) };
         if let Err(error) = copied { self.synchronize()?; return Err(error); }
-        unsafe { crate::v41_memory::chain::finish_cooperative(&self.stream).await?; }
+        unsafe { crate::shared::memory::chain::finish_cooperative(&self.stream).await?; }
         self.ready_rows = Some(gathered.rows);
         Ok(())
     }

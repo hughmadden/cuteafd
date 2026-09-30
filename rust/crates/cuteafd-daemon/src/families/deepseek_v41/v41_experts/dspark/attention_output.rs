@@ -1,6 +1,6 @@
 //! Inverse RoPE -> grouped FP8 wo_a -> native FP8 wo_b on one owned stream.
 use super::{DsparkProjection, DsparkWeights, ProjectionKind};
-use crate::v41_memory::{DeviceAllocation, LoadStream};
+use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{
     CuteafdDeviceBuffer, NativeLibrary, V41Fp8Plan,
@@ -201,7 +201,7 @@ impl Drop for DsparkAttentionOutput<'_, '_> {
 
 pub(super) fn pack_grouped_scales<'a>(
     library: &'a NativeLibrary,
-    tensors: &crate::v41_tensors::NativeRtxTensors<'a>,
+    tensors: &crate::families::deepseek_v41::v41_tensors::NativeRtxTensors<'a>,
 ) -> Result<[DeviceAllocation<'a>; 3]> {
     let mut output = Vec::with_capacity(3);
     // Drain before destinations are released on any failed load.

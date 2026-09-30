@@ -1,6 +1,6 @@
 //! One complete attention/mHC/FFN draft stage, captured on its expert stream.
 use super::{DsparkAttentionWave, DsparkFfn, DsparkWeights, HcSublayer};
-use crate::v41_dspark_cache::{DsparkWindow, WindowLease, WindowRead};
+use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowLease, WindowRead};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use std::ffi::c_void;

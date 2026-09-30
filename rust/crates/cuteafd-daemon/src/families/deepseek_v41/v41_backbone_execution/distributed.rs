@@ -302,7 +302,7 @@ impl<'w, 'a> DistributedExecution<'w, 'a> {
         Ok(())
     }
     pub fn poll_encoder_publication(&self) -> Result<bool> {
-        use crate::v41_backbone_cache::CacheWave;
+        use crate::families::deepseek_v41::v41_backbone_cache::CacheWave;
         let (_, layer) = self.publication.context("encoder publication absent")?;
         if layer < 20 && !self.producers.windows[layer].on_device(|wave| wave.poll_commit())? {
             return Ok(false);
@@ -365,12 +365,12 @@ impl<'w, 'a> DistributedExecution<'w, 'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v41_backbone_cache::CacheWork;
-    use crate::v41_backbone_lane::BackboneLaneWeights;
-    use crate::v41_backbone_shared::tp2::Weights as SharedWeights;
-    use crate::v41_experts::{tp2::RankWeights, tp2_ffn};
-    use crate::v41_index_lane::IndexLaneWeights;
-    use crate::v41_target_embedding::TargetEmbeddingWave;
+    use crate::families::deepseek_v41::v41_backbone_cache::CacheWork;
+    use crate::families::deepseek_v41::v41_backbone_lane::BackboneLaneWeights;
+    use crate::families::deepseek_v41::v41_backbone_shared::tp2::Weights as SharedWeights;
+    use crate::families::deepseek_v41::v41_experts::{tp2::RankWeights, tp2_ffn};
+    use crate::families::deepseek_v41::v41_index_lane::IndexLaneWeights;
+    use crate::families::deepseek_v41::v41_target_embedding::TargetEmbeddingWave;
     use cuteafd_transport::{ExpertV2SourceKind, TcpTransportConfig, v41_expert::V41Tp4Roce};
     use std::rc::Rc;
     #[test]
@@ -516,14 +516,14 @@ mod tests {
             peers,
             [1, 2, 3, 4],
             16,
-            TcpTransportConfig { timing: crate::v41_native_serve::protocol_v2_timing(),
+            TcpTransportConfig { timing: crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing(),
                 timeout: std::time::Duration::from_secs(1),
                 max_frame_bytes: 2 * 1024 * 1024,
             },
         )?;
         let mut transport = NativeTp4Wave::new(&lib, roce, NativeTp4Wave::device_bytes(16)?)?;
         transport.install_tp2(tp2_ffn::Wave::new(routed, shared, 1, 16)?)?;
-        let mut handoff = crate::v41_block::BlockTransfer::new(devices[1], devices[0])?;
+        let mut handoff = crate::families::deepseek_v41::v41_block::BlockTransfer::new(devices[1], devices[0])?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;

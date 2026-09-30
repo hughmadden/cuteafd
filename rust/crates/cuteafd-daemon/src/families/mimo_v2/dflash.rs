@@ -14,9 +14,9 @@
 //! block rows 1..8. Semantics: python/reference/families/mimo_v2/mimo_dflash/reference.py
 //! (SGLang's DFlash path for MiMo). Drafts only steer speculation; verify
 //! steps keep output identical to plain greedy decoding.
-use crate::fp8_linear::{self, Fp8Weight};
-use crate::glm::dflash::FP8_ROWS;
-use crate::v41_memory::DeviceAllocation;
+use crate::shared::fp8_linear::{self, Fp8Weight};
+use crate::families::glm5::dflash::FP8_ROWS;
+use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::dsv4::{VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
@@ -407,7 +407,7 @@ impl<'a> MimoDrafter<'a> {
 
     /// Makes E4M3 copies of every GEMM weight and of the target's LM head
     /// `head` ([vocab, hidden] BF16) and drafts through them from now on (see
-    /// [`crate::glm::dflash::GlmDrafter::enable_fp8`]).
+    /// [`crate::families::glm5::dflash::GlmDrafter::enable_fp8`]).
     pub fn enable_fp8(&mut self, head: *const c_void, scales: fp8_linear::Fp8Scales) -> Result<()> {
         let started = std::time::Instant::now();
         let (library, stream) = (self.library, self.stream);
@@ -659,7 +659,7 @@ pub(crate) fn features(top: &[f32]) -> [f32; 4] {
     [best - top.get(1).copied().unwrap_or(f32::NEG_INFINITY), 1.0 / total, entropy.max(0.0), 0.0]
 }
 
-impl crate::glm::dflash::ReplayDrafter for MimoDrafter<'_> {
+impl crate::families::glm5::dflash::ReplayDrafter for MimoDrafter<'_> {
     fn block(&self) -> usize {
         self.cfg.block
     }

@@ -1,9 +1,9 @@
 //! Official backbone routing with block-bound inputs and canonical TP4 requests.
-use crate::v41_attention_binding::QueryBinding;
-use crate::v41_block::FfnInput;
-use crate::v41_layer_graphs::LayerGraphs;
-use crate::v41_memory::{DeviceAllocation, HostAllocation, LoadStream};
-use crate::v41_tensors::NativeRtxTensors;
+use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
+use crate::families::deepseek_v41::v41_block::FfnInput;
+use crate::families::deepseek_v41::v41_layer_graphs::LayerGraphs;
+use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41ExpertInputQuantizer, V41Router};
 use cuteafd_loader::OfficialV41Catalog;
@@ -538,7 +538,7 @@ impl BackboneRouterWave<'_, '_> {
             );
         }
         let staged = (|| unsafe {
-            crate::v41_memory::chain::join(self.stream.library, self.stream.raw)?;
+            crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?;
             self.stream
                 .library
                 .copy_d2d_async(self.b(0), input, input.bytes, self.stream.raw)?;
@@ -705,8 +705,8 @@ pub(crate) struct BoundExpertRequest {
     binding: QueryBinding,
 }
 impl BoundExpertRequest {
-    pub(crate) fn assign_paired(&mut self, assignment: &mut crate::v41_experts::paired::PairedAssignment,
-        profile: &crate::v41_experts::paired::PairedProfile) -> Result<()> {
+    pub(crate) fn assign_paired(&mut self, assignment: &mut crate::families::deepseek_v41::v41_experts::paired::PairedAssignment,
+        profile: &crate::families::deepseek_v41::v41_experts::paired::PairedProfile) -> Result<()> {
         let layer = self.binding.layer();
         assignment.encode(&mut self.request, profile.layer(layer)?, layer)?;
         Ok(())
@@ -715,7 +715,7 @@ impl BoundExpertRequest {
     /// still describes the same layer as its block binding. The request stays
     /// private to this owner; only the ownership encoder can rewrite route words.
     pub(crate) fn assign_native(&mut self,
-        planner: &mut crate::v41_experts::coordinator::ReplicatedGroupPlanner) -> Result<()> {
+        planner: &mut crate::families::deepseek_v41::v41_experts::coordinator::ReplicatedGroupPlanner) -> Result<()> {
         ensure!(
             self.binding.layer() == self.request.header.layer_id as usize,
             "bound native expert request layer differs from its block binding"

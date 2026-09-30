@@ -5,7 +5,7 @@
 //! Placement: `host` keeps it in mapped pinned host memory (the program reads
 //! each token's 16 rows over PCIe, 5 KiB per token for BF16); `device` copies
 //! it to the GPU. Token ids hash to rows on the host (`NgramHasher`).
-use crate::v41_memory::DeviceAllocation;
+use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdHostBuffer, NativeLibrary};
@@ -57,7 +57,7 @@ impl<'a> PleTable<'a> {
     pub fn load(library: &'a NativeLibrary, checkpoint: &Checkpoint, cfg: &Qwen4Config, layer: usize,
         placement: PlePlacement, threads: usize) -> Result<Self> {
         let loader = super::weights::Qwen4Loader { library, checkpoint, fp8_decode: false,
-            fp8_scales: crate::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut() };
+            fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut() };
         let prefix = format!("{}layers.{layer}.ple.ple_embedding.", super::weights::PREFIX);
         let multipliers = i64s(&loader.raw(&format!("{prefix}layer_multipliers"))?.0);
         let sizes = i64s(&loader.raw(&format!("{prefix}ngram_heads_vocab_sizes"))?.0);

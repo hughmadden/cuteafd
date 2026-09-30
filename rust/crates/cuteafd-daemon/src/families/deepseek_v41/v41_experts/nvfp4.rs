@@ -9,7 +9,7 @@
 //! scalar vectors are computed on the host from the checkpoint's per-tensor
 //! `weight_scale_2` and `input_scale`.
 use super::{ExpertLayer, ExpertLoadBudget, EXPERT_READ_LANES};
-use crate::v41_memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::OfficialV41Catalog;
