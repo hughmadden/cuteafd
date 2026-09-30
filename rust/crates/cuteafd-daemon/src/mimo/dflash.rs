@@ -408,10 +408,10 @@ impl<'a> MimoDrafter<'a> {
     /// Makes E4M3 copies of every GEMM weight and of the target's LM head
     /// `head` ([vocab, hidden] BF16) and drafts through them from now on (see
     /// [`crate::glm::dflash::GlmDrafter::enable_fp8`]).
-    pub fn enable_fp8(&mut self, head: *const c_void, pow2: bool) -> Result<()> {
+    pub fn enable_fp8(&mut self, head: *const c_void, scales: fp8_linear::Fp8Scales) -> Result<()> {
         let started = std::time::Instant::now();
         let (library, stream) = (self.library, self.stream);
-        let pack = |w: *const c_void, n: usize, k: usize| Fp8Weight::pack(library, w, n, k, pow2, stream);
+        let pack = |w: *const c_void, n: usize, k: usize| Fp8Weight::pack(library, w, n, k, scales, stream);
         let c = &self.cfg;
         let (h, inter, attention) = (c.hidden, c.intermediate, c.heads * c.head_dim);
         let layers = self.layers.iter().map(|l| -> Result<Fp8Layer<'a>> {
@@ -435,7 +435,7 @@ impl<'a> MimoDrafter<'a> {
         unsafe { library.cuda_stream_synchronize(stream)? };
         let resident: usize = [&fc, &head].into_iter()
             .chain(layers.iter().flat_map(|l| [&l.qkv, &l.o, &l.gate_up, &l.down])).map(Fp8Weight::bytes).sum();
-        tracing::info!(gib = resident as f64 / (1u64 << 30) as f64, pow2, elapsed_ms = started.elapsed().as_millis() as u64,
+        tracing::info!(gib = resident as f64 / (1u64 << 30) as f64, ?scales, elapsed_ms = started.elapsed().as_millis() as u64,
             "DFlash drafter FP8 copies (and FP8 LM head) resident");
         self.fp8 = Some(Fp8Weights { fc, head, layers, workspace });
         self.use_fp8.set(true);

@@ -7,6 +7,30 @@ use anyhow::{ensure, Result};
 use cuteafd_ffi::NativeLibrary;
 use std::ffi::c_void;
 
+/// How FP8 copies of BF16 weights pick a block's scale (`--fp8-scales`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum Fp8Scales {
+    /// amax / 448.
+    Amax,
+    /// The smallest power of two >= amax / 448 (after Hugh Madden's
+    /// glm53f-afd pow2_scale, MIT e56ce35): values with at most E4M3's 3
+    /// mantissa bits in the block's range quantize exactly.
+    Pow2,
+    /// Per block, whichever of the two leaves the smaller squared error.
+    Best,
+}
+
+impl Fp8Scales {
+    /// The native kernels' rule code.
+    pub fn code(self) -> i32 {
+        match self {
+            Fp8Scales::Amax => 0,
+            Fp8Scales::Pow2 => 1,
+            Fp8Scales::Best => 2,
+        }
+    }
+}
+
 /// An E4M3 copy of a `[n, k]` BF16 weight in the GEMV's fragment order.
 pub(crate) struct Fp8Weight<'a> {
     packed: DeviceAllocation<'a>,
@@ -18,13 +42,13 @@ pub(crate) struct Fp8Weight<'a> {
 impl<'a> Fp8Weight<'a> {
     /// Packs the live BF16 weight `w` [n, k] on `stream` (the caller
     /// synchronizes before the source is freed).
-    pub fn pack(library: &'a NativeLibrary, w: *const c_void, n: usize, k: usize, pow2: bool, stream: *mut c_void)
-        -> Result<Self> {
+    pub fn pack(library: &'a NativeLibrary, w: *const c_void, n: usize, k: usize, scales: Fp8Scales,
+        stream: *mut c_void) -> Result<Self> {
         ensure!(n % 16 == 0 && k % 128 == 0, "FP8 copy of [{n}, {k}]: needs n % 16 == 0 and k % 128 == 0");
         let packed = DeviceAllocation::new(library, n * k)?;
         let scale = DeviceAllocation::new(library, n * k / 128 * 4)?;
         // SAFETY: `w` is a live [n, k] BF16 weight; the new buffers hold the packed copy.
-        unsafe { library.fp8_w8a16_pack(w, packed.buffer.ptr, scale.buffer.ptr, n, k, pow2, stream)? };
+        unsafe { library.fp8_w8a16_pack(w, packed.buffer.ptr, scale.buffer.ptr, n, k, scales.code(), stream)? };
         Ok(Self { packed, scale, n, k })
     }
 

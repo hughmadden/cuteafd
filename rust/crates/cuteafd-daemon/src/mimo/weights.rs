@@ -81,6 +81,8 @@ pub(crate) struct MimoLoader<'a> {
     pub fp8_decode: bool,
     pub fp8_head: bool,
     pub fp8_o_proj: bool,
+    /// Scale rule of copies quantized from BF16 (o_proj, the LM head).
+    pub fp8_scales: crate::fp8_linear::Fp8Scales,
 }
 
 /// Scale-grid row of every weight row: uniform 128-row blocks, or per
@@ -160,10 +162,10 @@ impl<'a> MimoLoader<'a> {
                         // SAFETY: the BF16 rows and their E4M3 / scale destinations are live;
                         // the stream drains below.
                         unsafe {
-                            self.library.fp8_row_quant(dest(0, shape[0]).ptr,
+                            self.library.fp8_quant_rule(dest(0, shape[0]).ptr,
                                 at(q.buffer, row * cols, shape[0] * cols).ptr,
                                 at(s.buffer, row * k_blocks * 4, shape[0] * k_blocks * 4).ptr, shape[0], cols,
-                                self.stream)?;
+                                true, self.fp8_scales.code(), self.stream)?;
                         }
                     }
                 }

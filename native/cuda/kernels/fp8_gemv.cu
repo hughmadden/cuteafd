@@ -28,33 +28,57 @@ __device__ __forceinline__ float pow2_ceil(float x) {
   return ldexpf(1.0f, m == 0.5f ? e - 1 : e);
 }
 
-// Scale of a 128-value block with absolute maximum `amax`: amax / 448, or
-// with `pow2` the smallest power of two >= amax / 448 (BF16 weights with at
-// most E4M3's 3 mantissa bits then quantize exactly); 1 for an all-zero block.
-__device__ __forceinline__ float block_scale(float amax, int pow2) {
-  if (!(amax > 0.0f)) return 1.0f;
-  const float s = amax / 448.0f;
-  return pow2 ? pow2_ceil(s) : s;
+// The smallest power of two >= amax / 448 (Hugh Madden's glm53f-afd
+// pow2_scale, bit for bit): BF16 weights with at most E4M3's 3 mantissa bits
+// then quantize exactly.
+__device__ __forceinline__ float pow2_scale(float amax) {
+  const uint32_t b = __float_as_uint(amax);
+  int x = int(b >> 23) - 135 + int((b & 0x7FFFFFu) > 0x600000u);
+  x = x < -126 ? -126 : (x > 127 ? 127 : x);
+  return __uint_as_float(uint32_t(x + 127) << 23);
 }
 
 __device__ __forceinline__ uint8_t e4m3(float x) {
   return __nv_fp8_e4m3(x).__x;
 }
 
+__device__ __forceinline__ float quant_error(float x, float s) {
+  const float d = float(__nv_fp8_e4m3(x / s)) * s - x;
+  return d * d;
+}
+
 // One warp per (16-row tile, 128-wide K block): per-row scales, then the
 // block's four 16 x 32 tiles in A-fragment order.
+// `rule`: 0 amax / 448, 1 pow2_scale, 2 whichever leaves the smaller squared
+// error over the row's 128 values (1 for an all-zero block).
 __global__ void pack_kernel(const __nv_bfloat16* __restrict__ w, uint8_t* __restrict__ packed,
-                            float* __restrict__ scale, int n, int k, int pow2) {
+                            float* __restrict__ scale, int n, int k, int rule) {
   const int kb = blockIdx.x, rt = blockIdx.y, lane = threadIdx.x;
   const int kbs = k / 128;
   __shared__ float s_scale[16];
   for (int r = 0; r < 16; ++r) {
     const __nv_bfloat16* row = w + size_t(rt * 16 + r) * k + kb * 128 + lane * 4;
-    float amax = 0.0f;
-    for (int j = 0; j < 4; ++j) amax = fmaxf(amax, fabsf(__bfloat162float(row[j])));
+    float x[4], amax = 0.0f;
+    for (int j = 0; j < 4; ++j) {
+      x[j] = __bfloat162float(row[j]);
+      amax = fmaxf(amax, fabsf(x[j]));
+    }
     for (int offset = 16; offset; offset >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset));
+    const float sa = amax > 0.0f ? amax / 448.0f : 1.0f, sp = amax > 0.0f ? pow2_scale(amax) : 1.0f;
+    float s = rule == 1 ? sp : sa;
+    if (rule == 2) {
+      float ea = 0.0f, ep = 0.0f;
+      for (int j = 0; j < 4; ++j) {
+        ea += quant_error(x[j], sa);
+        ep += quant_error(x[j], sp);
+      }
+      for (int offset = 16; offset; offset >>= 1) {
+        ea += __shfl_xor_sync(0xffffffffu, ea, offset);
+        ep += __shfl_xor_sync(0xffffffffu, ep, offset);
+      }
+      s = ep < ea ? sp : sa;
+    }
     if (lane == 0) {
-      const float s = block_scale(amax, pow2);
       s_scale[r] = s;
       scale[size_t(rt * 16 + r) * kbs + kb] = s;
     }
@@ -274,12 +298,13 @@ size_t align256(size_t bytes) { return (bytes + 255) / 256 * 256; }
 }  // namespace
 
 // Packs a BF16 [n, k] weight (n % 16 == 0, k % 128 == 0) into `packed`
-// (n * k bytes, A-fragment order) and `scale` ([n, k / 128] FP32).
+// (n * k bytes, A-fragment order) and `scale` ([n, k / 128] FP32) under
+// scale `rule` (0 amax / 448, 1 power of two, 2 the better per block).
 extern "C" int32_t cuteafd_fp8_w8a16_pack(const void* w, void* packed, void* scale, int32_t n, int32_t k,
-                                          int32_t pow2, void* stream) {
-  if (n < 16 || n % 16 || k < 128 || k % 128) return cudaErrorInvalidValue;
+                                          int32_t rule, void* stream) {
+  if (n < 16 || n % 16 || k < 128 || k % 128 || rule < 0 || rule > 2) return cudaErrorInvalidValue;
   pack_kernel<<<dim3(k / 128, n / 16), 32, 0, static_cast<cudaStream_t>(stream)>>>(
-      static_cast<const __nv_bfloat16*>(w), static_cast<uint8_t*>(packed), static_cast<float*>(scale), n, k, pow2);
+      static_cast<const __nv_bfloat16*>(w), static_cast<uint8_t*>(packed), static_cast<float*>(scale), n, k, rule);
   return cudaGetLastError();
 }
 

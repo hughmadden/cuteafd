@@ -83,6 +83,8 @@ pub(crate) struct Qwen4Loader<'a> {
     /// Also keep E4M3 copies (FP32 128x128 block scales) of the large GDN and
     /// attention projections for the decode programs (`*_fp8_m64`).
     pub fp8_decode: bool,
+    /// Scale rule of the E4M3 copies (decode projections, MTP draft head).
+    pub fp8_scales: crate::fp8_linear::Fp8Scales,
     pub stream: *mut c_void,
 }
 
@@ -235,7 +237,8 @@ impl<'a> Qwen4Loader<'a> {
                 // SAFETY: the BF16 weight, the E4M3 copy and the scales are live device
                 // buffers of these shapes; the stream drains before they are used.
                 unsafe {
-                    self.library.fp8_block_quant(weight, q.buffer.ptr, scale.buffer.ptr, rows, cols, self.stream)?;
+                    self.library.fp8_quant_rule(weight, q.buffer.ptr, scale.buffer.ptr, rows, cols, false,
+                        self.fp8_scales.code(), self.stream)?;
                     self.library.cuda_stream_synchronize(self.stream)?;
                 }
                 let (fp8, scales): (&'static str, &'static str) = match name {
@@ -260,7 +263,7 @@ impl<'a> Qwen4Loader<'a> {
             if fp8_head {
                 let started = std::time::Instant::now();
                 let (q, scales) = crate::glmf::fp8::quantize(&head, cfg.vocab_size, cfg.hidden,
-                    crate::glmf::fp8::Layout::Row128);
+                    crate::glmf::fp8::Layout::Row128, self.fp8_scales);
                 weights.head_fp8 = Some((self.upload(&q)?, self.upload(&f32_bytes(&scales))?));
                 tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "MTP draft head quantized to E4M3");
             }

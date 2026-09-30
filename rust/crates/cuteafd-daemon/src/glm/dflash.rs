@@ -395,12 +395,12 @@ impl<'a> GlmDrafter<'a> {
 
     /// Makes E4M3 copies of every GEMM weight and of the target's LM head
     /// `head` ([vocab, hidden] BF16), with scales `amax / 448` per output row
-    /// and 128-wide K block (with `pow2` the smallest power of two >= it),
+    /// and 128-wide K block (or `scales`' other rules),
     /// and drafts through them from now on.
-    pub fn enable_fp8(&mut self, head: *const c_void, pow2: bool) -> Result<()> {
+    pub fn enable_fp8(&mut self, head: *const c_void, scales: fp8_linear::Fp8Scales) -> Result<()> {
         let started = std::time::Instant::now();
         let (library, stream) = (self.library, self.stream);
-        let pack = |w: *const c_void, n: usize, k: usize| Fp8Weight::pack(library, w, n, k, pow2, stream);
+        let pack = |w: *const c_void, n: usize, k: usize| Fp8Weight::pack(library, w, n, k, scales, stream);
         let c = &self.cfg;
         let (h, inter, conv, attention) = (c.hidden, c.intermediate, c.conv_width(), c.heads * c.head_dim);
         let layers = self.layers.iter().map(|l| -> Result<Fp8Layer<'a>> {
@@ -428,7 +428,7 @@ impl<'a> GlmDrafter<'a> {
         let resident: usize = [&fc, &projection, &head].into_iter()
             .chain(layers.iter().flat_map(|l| [&l.attn_conv, &l.qkv, &l.o, &l.mlp_conv, &l.gate_up, &l.down]))
             .map(Fp8Weight::bytes).sum();
-        tracing::info!(gib = resident as f64 / (1u64 << 30) as f64, pow2, elapsed_ms = started.elapsed().as_millis() as u64,
+        tracing::info!(gib = resident as f64 / (1u64 << 30) as f64, ?scales, elapsed_ms = started.elapsed().as_millis() as u64,
             "DFlash2 drafter FP8 copies (and FP8 LM head) resident");
         self.fp8 = Some(Fp8Weights { fc, projection, head, layers, workspace });
         self.use_fp8.set(true);

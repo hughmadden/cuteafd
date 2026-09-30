@@ -70,6 +70,8 @@ pub(crate) struct GlmfLoader<'a> {
     pub fp8_head: bool,
     /// Numerics gate only: KDA projections rounded through NVFP4 (Some(search)) and kept in BF16.
     pub kda_nvfp4: Option<bool>,
+    /// Scale rule of copies quantized from BF16.
+    pub fp8_scales: crate::fp8_linear::Fp8Scales,
 }
 
 fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
@@ -196,7 +198,7 @@ impl<'a> GlmfLoader<'a> {
                     scales.extend_from_slice(&scale);
                 }
                 DType::Bf16 => {
-                    let (q, s) = quantize(&bytes, shape[0], shape[1], layout);
+                    let (q, s) = quantize(&bytes, shape[0], shape[1], layout, self.fp8_scales);
                     values.extend_from_slice(&q);
                     scales.extend(s.iter().flat_map(|v| v.to_le_bytes()));
                 }

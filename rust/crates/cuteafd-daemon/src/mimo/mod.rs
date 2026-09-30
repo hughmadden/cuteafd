@@ -63,6 +63,11 @@ pub(crate) struct EngineArgs {
     /// head (false: BF16; the committed tokens are the same either way).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub draft_fp8: bool,
+    /// Scale rule of the FP8 copies made from BF16 weights at load: amax /
+    /// 448, the smallest power of two >= it (pow2), or per block whichever of
+    /// the two leaves the smaller error (best).
+    #[arg(long, value_enum, default_value_t = crate::fp8_linear::Fp8Scales::Amax)]
+    pub fp8_scales: crate::fp8_linear::Fp8Scales,
     /// With --local-experts: keep only N MoE layers' experts resident and load
     /// each missing layer over the oldest (prefill checks of models whose
     /// experts do not fit one GPU, such as V2.6 Pro).
@@ -175,7 +180,7 @@ impl Opened {
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::MimoLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
             checkpoint_tp: cuteafd_loader::mimo_v2::checkpoint_tp(&args.snapshot)?, fp8_decode: args.fp8_decode,
-            fp8_head: args.fp8_head, fp8_o_proj: args.fp8_o_proj };
+            fp8_head: args.fp8_head, fp8_o_proj: args.fp8_o_proj, fp8_scales: args.fp8_scales };
         let model = loader.model(&self.cfg, layers)?;
         let mtp = if args.mtp > 0 {
             let started = Instant::now();
@@ -223,7 +228,7 @@ impl Opened {
             let mut drafter = dflash::MimoDrafter::load(&self.library, dir, file, stream, args.draft_sequences,
                 args.draft_sequences, mask)?;
             if args.draft_fp8 {
-                drafter.enable_fp8(engine.weights.head.buffer.ptr, false)?;
+                drafter.enable_fp8(engine.weights.head.buffer.ptr, args.fp8_scales)?;
             }
             engine.drafter = Some(drafter);
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash drafter resident");
@@ -494,6 +499,10 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
     // Rows of `ours` are the logits of positions `first..`: top-1 agreement
     // with the golden, next-token accuracy and mean NLL of the next tokens.
     let score = |label: &str, ours_all: &[f32], first: usize| -> Result<()> {
+        // Numerics A/B between engine configs (benchmarks): the decode rows' logits, F32.
+        if let (true, Ok(path)) = (label == "decode", std::env::var("CUTEAFD_DUMP_DECODE_LOGITS")) {
+            std::fs::write(&path, ours_all.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+        }
         let golden = golden_logits()?;
         let vocab = cfg.vocab_size;
         let (mut agree, mut next_ok, mut golden_next, mut nll, mut kl) = (0usize, 0usize, 0usize, 0f64, 0f64);

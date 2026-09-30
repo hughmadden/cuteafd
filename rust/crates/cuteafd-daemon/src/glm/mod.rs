@@ -52,6 +52,11 @@ pub(crate) struct EngineArgs {
     /// head (false: BF16; the committed tokens are the same either way).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub draft_fp8: bool,
+    /// Scale rule of the FP8 copies made from BF16 weights at load: amax /
+    /// 448, the smallest power of two >= it (pow2), or per block whichever of
+    /// the two leaves the smaller error (best).
+    #[arg(long, value_enum, default_value_t = crate::fp8_linear::Fp8Scales::Amax)]
+    pub fp8_scales: crate::fp8_linear::Fp8Scales,
     /// Keep every prefill row's logits (glm-golden --nll; 2.5 GiB at 4096 rows).
     #[arg(long, hide = true)]
     pub full_prefill_logits: bool,
@@ -181,7 +186,7 @@ impl Opened {
             let mut drafter = dflash::GlmDrafter::load(&self.library, snapshot, file, stream, args.draft_sequences,
                 args.draft_sequences, mask, false)?;
             if args.draft_fp8 {
-                drafter.enable_fp8(engine.weights.head.buffer.ptr, false)?;
+                drafter.enable_fp8(engine.weights.head.buffer.ptr, args.fp8_scales)?;
             }
             engine.drafter = Some(drafter);
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash2 drafter resident");
