@@ -187,7 +187,7 @@ def resolve_tier_family(declared, observed, global_family=None, global_audit=Non
                   derived_family=list(expected), declared=None if declared is None
                   else [int(value) for value in declared],
                   rule='shared v41_exl3_family.expected_decoder_family mirroring '
-                       'rust/crates/cuteafd-loader/src/v41_exl3.rs decoder_family')
+                       'rust/crates/cuteafd-loader/src/families/deepseek_v41/v41_exl3.rs decoder_family')
     if global_family is not None:
         global_family = list(global_family)
         if global_family != expected:

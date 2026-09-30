@@ -5,7 +5,7 @@ Extracted verbatim from the accepted helpers in `qualify_v41_exl3_aot.py`
 (`expected_decoder_family` / `checkpoint_global_family`) so that the numeric
 oracle and the offline tile benchmark consult one copy of the rule instead of
 paraphrasing it per tool.  The rule itself mirrors `decoder_family` in
-`rust/crates/cuteafd-loader/src/v41_exl3.rs`, and
+`rust/crates/cuteafd-loader/src/families/deepseek_v41/v41_exl3.rs`, and
 `python/tests/test_qualify_v41_exl3_aot_tiers.py` reads that Rust source and
 fails if the loader rule moves underneath us.
 
@@ -20,7 +20,7 @@ import re
 def expected_decoder_family(observed):
     """The serving family a checkpoint's widths imply, mirroring the Rust loader.
 
-    `decoder_family` in `rust/crates/cuteafd-loader/src/v41_exl3.rs` collects the
+    `decoder_family` in `rust/crates/cuteafd-loader/src/families/deepseek_v41/v41_exl3.rs` collects the
     distinct projection widths, requires every one of them to be in K2..K5, and for
     a single width retains an empty *adjacent* tier: `bit + 1`, except K5 which
     pairs down to K4. A uniform-K4 checkpoint therefore belongs to `[4, 5]`, not to

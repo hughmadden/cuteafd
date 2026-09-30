@@ -1,60 +1,47 @@
-mod engram_pipeline;
+mod families;
+mod formats;
+// Old crate-root module paths, kept while the tree moves (naming pass drops them).
+pub use families::deepseek_v4;
+pub use families::glm5 as glm_dsa;
+pub use families::glm5_flash as glm_next;
+pub use families::mimo_v2;
+pub use families::qwen4 as qwen4_exp;
+pub use formats::fp8_experts;
+use formats::{attention_format, dspark_format, exl3_format, expert_format};
+use families::deepseek_v41::{engram_pipeline, engram_gather, engram_staging, v41_expert_staging, v41_catalog, v41_config, v41_exl3, v41_exl3_staging, v41_exl3_residency, v41_nvfp4, v41_nvfp4_staging, v41_image, engram_tokenizer, engram_prefetch};
 pub use engram_pipeline::{EngramPipeline, EngramRequestTokens, EngramWave};
-mod engram_gather;
 pub use engram_gather::{
     EngramGatherer, EngramGatherLease, EngramGatherPoll, EngramGatherTicket, EngramGatherTiming,
 };
-mod engram_staging;
 pub use engram_staging::{EngramBatchStaging, EngramGatherView};
-mod v41_expert_staging;
 pub use v41_expert_staging::{V41ExpertSelection, V41ExpertStaging};
-mod v41_catalog;
 pub use v41_catalog::{
     read_expert_catalog, read_official_v41_catalog, OfficialV41Catalog, RoutedExpertShape,
     V41StorageBudget, V41Tensor, V41TensorPlacement, V41CoordinatorTensorReader,
 };
-mod v41_config;
-mod v41_exl3;
-mod v41_exl3_staging;
-mod v41_exl3_residency;
 pub use v41_exl3_residency::{V41Exl3Layer, V41Exl3Load, V41Exl3Residency, V41Exl3ResidentBuffer};
 pub use v41_exl3_staging::V41Exl3TensorSlice;
 pub use v41_exl3::{read_v41_exl3_manifest, V41Exl3Manifest, V41Exl3Naming, V41Exl3Projection,
     V41Exl3ProjectionKind, V41Exl3Partition, V41_EXL3_SCHEMA};
-mod v41_nvfp4;
 pub use v41_nvfp4::{
     is_v41_nvfp4_publication, read_v41_nvfp4_contract, V41Nvfp4Contract, V41Nvfp4ExpertLayout,
 };
-mod v41_nvfp4_staging;
 pub use v41_nvfp4_staging::{V41Nvfp4Staging, V41_NVFP4_STAGING_SLOTS};
-mod v41_image;
 pub use v41_image::{V41Image, V41ImageGrid, V41ImageSpan, V41VisionPrompt, V41ImageTokenType,
     V41_IMAGE_TOKEN_ID, V41_MAX_IMAGES};
 pub use v41_config::{
     read_official_v41_config, OfficialV41Config, V41QuantizationConfig, V41RopeScaling,
     V41TextConfig, V41VisionConfig, OFFICIAL_V41_MODEL_ID, OFFICIAL_V41_REVISION,
 };
-mod engram_tokenizer;
 pub use engram_tokenizer::EngramTokenMap;
-mod engram_prefetch;
 pub use engram_prefetch::{EngramEncoding, EngramPrefetcher, EngramTable, PrefetchOutcome, PrefetchTicket};
 mod mapped_rows;
 pub use mapped_rows::MappedRows;
-mod attention_format;
 mod catalog;
-mod dspark_format;
-mod exl3_format;
-mod expert_format;
 mod snapshot;
 mod tensors;
 mod tokenizer;
 pub mod plan;
-pub mod deepseek_v4;
-pub mod fp8_experts;
-pub mod glm_dsa;
-pub mod glm_next;
-pub mod mimo_v2;
-pub mod qwen4_exp;
 
 pub use attention_format::{
     native_deepseek_v4_attention_tensor_specs, validate_native_deepseek_v4_attention_catalog,
