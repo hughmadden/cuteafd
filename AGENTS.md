@@ -40,8 +40,8 @@ go in commit messages as short before → after tables with conditions.
 - Build only under `~/.cache/cuteafd/builds/<task>` on root NVMe; run
   `scripts/assert-build-filesystem.py` on every path first. Never reuse a
   Cargo cache that has seen filesystem errors.
-- `./wip.sh --slot S --role both` for iteration, `scripts/run-wip.sh
-  --wip-slot S --restart` to launch; `./build.sh` and `./run.sh` for
+- `./wip.sh --slot S --role both` for iteration, `./run.sh --wip S
+  --restart` to launch; `./build.sh` and `./run.sh` for
   release images. Slots isolate artifacts, not GPUs or ports: serialize
   builds and performance runs, one model served at a time.
 - Submodules are pinned with tree locks (`third_party/*.lock.json`).
