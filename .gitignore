@@ -6,6 +6,8 @@ native/build-cuda/
 native/build-cuda-*/
 native/build-rdma/
 build/
+# ...but not the build scripts directory.
+!/scripts/build/
 dist/
 .cuteafd-release/
 .cuteafd-release-image/
