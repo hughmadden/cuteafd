@@ -21,8 +21,8 @@ measurements are short tables in commit messages and `docs/` stays tiny.
   xgrammar constraints, live console, v15 images published.
 - `ds41rt-daemon/src/commands/real_full/` (~167k LOC) is the legacy DS4
   path. Nothing live references it. It is not ported; DS4 Flash/Pro are
-  re-hosted on the new engine instead (their kernels survive: `ds4_pro_aot`,
-  `ds4_flash_aot`, `mla_indexing`, `packed_fp8_mla_exact`).
+  re-hosted on the new engine instead (the dsv4 programs replaced the
+  legacy `ds4_*_aot` and `packed_fp8_mla_exact` kernels, removed 2026-09-30).
 - `../ds4rt` has no engine code ds41rt lacks. It contributes the GPTQModel
   distributed quantization pipeline, Pro K2 evidence, and three API defaults
   (thinking on, 32K output budget, hidden internal model names).
@@ -215,7 +215,8 @@ any new model work. Concrete recipe:
    the Python tools and fixtures that only they used
    (`validate_ds4_*`, `validate_native_flash_*`, `tune_w8a16_*`,
    `tune_mtp_*`, legacy sparse-lm-head tuners). Native `ds4_*_aot.cu`,
-   `mla_indexing.cu`, `packed_fp8_mla_exact.cu` stay for Phase 1.
+   `mla_indexing.cu`, `packed_fp8_mla_exact.cu` stayed for Phase 1 (the
+   unbound ones went in the layout purge).
    Build must pass after this step.
 4. Rename: every `ds41rt` token → `cuteafd` (crates `cuteafd-*`, binary `cuteafd`, native lib
    `libcuteafd_native`, symbol prefix `cuteafd_`, env/config prefix

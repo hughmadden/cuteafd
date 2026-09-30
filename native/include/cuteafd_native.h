@@ -127,215 +127,6 @@ typedef struct cuteafd_nvfp4_route_batched_metadata_t {
   float down_scale_2;
 } cuteafd_nvfp4_route_batched_metadata_t;
 
-typedef struct cuteafd_b12x_spark_w4a16_moe_buffers_t {
-  cuteafd_device_buffer_t input;
-  cuteafd_device_buffer_t w13_weight;
-  cuteafd_device_buffer_t w2_weight;
-  cuteafd_device_buffer_t fc1_output;
-  cuteafd_device_buffer_t activated;
-  cuteafd_device_buffer_t output;
-  cuteafd_device_buffer_t w13_scale;
-  cuteafd_device_buffer_t w2_scale;
-  cuteafd_device_buffer_t w13_global_scale;
-  cuteafd_device_buffer_t w2_global_scale;
-  cuteafd_device_buffer_t packed_route_indices;
-  cuteafd_device_buffer_t block_expert_ids;
-  cuteafd_device_buffer_t packed_route_count;
-  cuteafd_device_buffer_t topk_weights;
-  cuteafd_device_buffer_t fc1_scratch;
-  cuteafd_device_buffer_t fc2_scratch;
-  cuteafd_device_buffer_t locks;
-} cuteafd_b12x_spark_w4a16_moe_buffers_t;
-
-/* Resident buffers for one DeepSeek-V4-Flash expert-TP4 rank.  Every rank
- * stores all 256 expert ids and one 512-wide intermediate slice. */
-typedef struct cuteafd_ds4_flash_spark_w4a16_moe_buffers_t {
-  cuteafd_device_buffer_t input;
-  cuteafd_device_buffer_t w13_weight;
-  cuteafd_device_buffer_t w2_weight;
-  cuteafd_device_buffer_t fc1_output;
-  cuteafd_device_buffer_t activated;
-  cuteafd_device_buffer_t routed_output;
-  cuteafd_device_buffer_t output;
-  cuteafd_device_buffer_t w13_scale;
-  cuteafd_device_buffer_t w2_scale;
-  cuteafd_device_buffer_t w13_global_scale;
-  cuteafd_device_buffer_t w2_global_scale;
-  cuteafd_device_buffer_t packed_route_indices;
-  cuteafd_device_buffer_t block_expert_ids;
-  cuteafd_device_buffer_t packed_route_count;
-  cuteafd_device_buffer_t topk_weights;
-  cuteafd_device_buffer_t fc1_scratch;
-  cuteafd_device_buffer_t fc2_scratch;
-  cuteafd_device_buffer_t locks;
-} cuteafd_ds4_flash_spark_w4a16_moe_buffers_t;
-
-/* Resident buffers for one calibrated uniform-tier EXL3 DeepSeek-V4-Flash expert-TP4
- * rank.  W13/W2 are the final native trellis tiles loaded from the checkpoint;
- * the runtime never creates a dequantized or wider packed weight copy.  Every
- * rank stores every expert id and one quarter of each expert's intermediate
- * dimension.  Full-rotation output is accumulated in FP32 and also exposed as
- * BF16 for the configured inter-Spark transport/reduction policy. */
-typedef struct cuteafd_ds4_flash_spark_exl3_k2_moe_buffers_t {
-  cuteafd_device_buffer_t input;
-  cuteafd_device_buffer_t w13_trellis;
-  cuteafd_device_buffer_t w2_trellis;
-  cuteafd_device_buffer_t gate_suh;
-  cuteafd_device_buffer_t up_suh;
-  cuteafd_device_buffer_t intermediate_rotations;
-  cuteafd_device_buffer_t down_svh;
-  cuteafd_device_buffer_t expert_map;
-  cuteafd_device_buffer_t dummy_scale;
-  cuteafd_device_buffer_t trellis_lut;
-  cuteafd_device_buffer_t global_scale;
-  cuteafd_device_buffer_t topk_ids;
-  cuteafd_device_buffer_t topk_weights;
-  cuteafd_device_buffer_t rotation_gate;
-  cuteafd_device_buffer_t rotation_up;
-  cuteafd_device_buffer_t fc1_output;
-  cuteafd_device_buffer_t activated;
-  cuteafd_device_buffer_t routed_output;
-  cuteafd_device_buffer_t output_f32;
-  cuteafd_device_buffer_t output_bf16;
-  cuteafd_device_buffer_t packed_route_indices;
-  cuteafd_device_buffer_t block_expert_ids;
-  cuteafd_device_buffer_t packed_route_count;
-  cuteafd_device_buffer_t expert_counts;
-  cuteafd_device_buffer_t expert_offsets;
-  cuteafd_device_buffer_t fc1_scratch;
-  cuteafd_device_buffer_t fc2_scratch;
-  cuteafd_device_buffer_t workspace;
-} cuteafd_ds4_flash_spark_exl3_k2_moe_buffers_t;
-
-/* Compact one-grid K2/K3 Trellis storage. Experts are tier-local in the two
- * weight slabs; global_to_combined and descriptor_map preserve the checkpoint
- * expert namespace without materializing either tier at 256 experts. */
-typedef struct cuteafd_ds4_flash_spark_exl3_mixed_moe_buffers_t {
-  cuteafd_device_buffer_t input;
-  cuteafd_device_buffer_t tier0_w13_trellis;
-  cuteafd_device_buffer_t tier0_w2_trellis;
-  cuteafd_device_buffer_t tier1_w13_trellis;
-  cuteafd_device_buffer_t tier1_w2_trellis;
-  cuteafd_device_buffer_t dummy_scale;
-  cuteafd_device_buffer_t tier0_global_scale;
-  cuteafd_device_buffer_t tier1_global_scale;
-  cuteafd_device_buffer_t gate_suh;
-  cuteafd_device_buffer_t up_suh;
-  cuteafd_device_buffer_t intermediate_rotations;
-  cuteafd_device_buffer_t down_svh;
-  cuteafd_device_buffer_t trellis_lut;
-  cuteafd_device_buffer_t global_to_combined;
-  cuteafd_device_buffer_t descriptor_map;
-  cuteafd_device_buffer_t topk_ids;
-  cuteafd_device_buffer_t mapped_topk_ids;
-  cuteafd_device_buffer_t topk_weights;
-  cuteafd_device_buffer_t rotation_gate;
-  cuteafd_device_buffer_t rotation_up;
-  cuteafd_device_buffer_t fc1_output;
-  cuteafd_device_buffer_t activated;
-  cuteafd_device_buffer_t routed_output;
-  cuteafd_device_buffer_t output_f32;
-  cuteafd_device_buffer_t output_bf16;
-  cuteafd_device_buffer_t packed_route_indices;
-  cuteafd_device_buffer_t block_expert_ids;
-  cuteafd_device_buffer_t packed_route_count;
-  cuteafd_device_buffer_t expert_counts;
-  cuteafd_device_buffer_t expert_offsets;
-  cuteafd_device_buffer_t fc1_scratch;
-  cuteafd_device_buffer_t fc2_scratch;
-  cuteafd_device_buffer_t workspace;
-} cuteafd_ds4_flash_spark_exl3_mixed_moe_buffers_t;
-
-/* Resident buffers for one calibrated EXL3 K=2 DeepSeek-V4-Pro expert-TP4
- * rank. Pro is intentionally trellis-only: unlike Flash there is no native
- * FP4 fallback that could materialize a wider resident expert copy. */
-typedef struct cuteafd_ds4_pro_spark_exl3_k2_moe_buffers_t {
-  cuteafd_device_buffer_t input;
-  cuteafd_device_buffer_t w13_trellis;
-  cuteafd_device_buffer_t w2_trellis;
-  cuteafd_device_buffer_t gate_suh;
-  cuteafd_device_buffer_t up_suh;
-  cuteafd_device_buffer_t intermediate_rotations;
-  cuteafd_device_buffer_t down_svh;
-  cuteafd_device_buffer_t expert_map;
-  cuteafd_device_buffer_t dummy_scale;
-  cuteafd_device_buffer_t trellis_lut;
-  cuteafd_device_buffer_t global_scale;
-  cuteafd_device_buffer_t topk_ids;
-  cuteafd_device_buffer_t topk_weights;
-  cuteafd_device_buffer_t rotation_gate;
-  cuteafd_device_buffer_t rotation_up;
-  cuteafd_device_buffer_t fc1_output;
-  cuteafd_device_buffer_t activated;
-  cuteafd_device_buffer_t routed_output;
-  cuteafd_device_buffer_t output_f32;
-  cuteafd_device_buffer_t output_bf16;
-  cuteafd_device_buffer_t packed_route_indices;
-  cuteafd_device_buffer_t block_expert_ids;
-  cuteafd_device_buffer_t packed_route_count;
-  cuteafd_device_buffer_t expert_counts;
-  cuteafd_device_buffer_t expert_offsets;
-  cuteafd_device_buffer_t fc1_scratch;
-  cuteafd_device_buffer_t fc2_scratch;
-  cuteafd_device_buffer_t workspace;
-} cuteafd_ds4_pro_spark_exl3_k2_moe_buffers_t;
-
-/* Caller-owned device route-pack workspace for Flash prefill. Every TP rank
- * receives the same global top-k ids and independently produces equivalent
- * block-32 metadata; no expert ownership map is applied. */
-typedef struct cuteafd_ds4_flash_route_pack_buffers_t {
-  cuteafd_device_buffer_t topk_ids;
-  cuteafd_device_buffer_t packed_route_indices;
-  cuteafd_device_buffer_t block_expert_ids;
-  cuteafd_device_buffer_t packed_route_count;
-  cuteafd_device_buffer_t expert_counts;
-  cuteafd_device_buffer_t expert_offsets;
-} cuteafd_ds4_flash_route_pack_buffers_t;
-
-/* Coordinator-resident shared expert. Checkpoint FP8 values remain row-major;
- * each compact 128x128 scale grid is expanded once to the SM12x MMA layout. */
-typedef struct cuteafd_ds4_flash_shared_expert_fp8_buffers_t {
-  cuteafd_device_buffer_t input;
-  cuteafd_device_buffer_t w1_weight;
-  cuteafd_device_buffer_t w1_scale_mma;
-  cuteafd_device_buffer_t w3_weight;
-  cuteafd_device_buffer_t w3_scale_mma;
-  cuteafd_device_buffer_t w2_weight;
-  cuteafd_device_buffer_t w2_scale_mma;
-  cuteafd_device_buffer_t gate;
-  cuteafd_device_buffer_t up;
-  cuteafd_device_buffer_t activated;
-  cuteafd_device_buffer_t output;
-  cuteafd_device_buffer_t alpha;
-} cuteafd_ds4_flash_shared_expert_fp8_buffers_t;
-
-/* Pro prefill quantizes each activation matrix once and feeds ordinary
- * runtime-M MXFP8 GEMMs.  Decode and integrated dSpark's <=8-row issue retain
- * the compact fused-quant buffer contract above. */
-typedef struct cuteafd_ds4_pro_shared_expert_fp8_prefill_buffers_t {
-  cuteafd_ds4_flash_shared_expert_fp8_buffers_t base;
-  cuteafd_device_buffer_t input_q_values;
-  cuteafd_device_buffer_t input_q_scale_rows;
-  cuteafd_device_buffer_t input_q_scale_mma;
-  cuteafd_device_buffer_t activated_q_values;
-  cuteafd_device_buffer_t activated_q_scale_rows;
-  cuteafd_device_buffer_t activated_q_scale_mma;
-} cuteafd_ds4_pro_shared_expert_fp8_prefill_buffers_t;
-
-typedef struct cuteafd_b12x_coordinator_w4a16_buffers_t {
-  cuteafd_device_buffer_t input;
-  cuteafd_device_buffer_t weight;
-  cuteafd_device_buffer_t output;
-  cuteafd_device_buffer_t scale;
-  cuteafd_device_buffer_t global_scale;
-  cuteafd_device_buffer_t packed_route_indices;
-  cuteafd_device_buffer_t block_expert_ids;
-  cuteafd_device_buffer_t packed_route_count;
-  cuteafd_device_buffer_t topk_weights;
-  cuteafd_device_buffer_t c_tmp;
-  cuteafd_device_buffer_t locks;
-} cuteafd_b12x_coordinator_w4a16_buffers_t;
-
 typedef struct cuteafd_cuda_graph_capture_info_t {
   void* graph;
   void* graph_exec;
@@ -858,18 +649,9 @@ cuteafd_status_t cuteafd_cuda_nvfp4_silu_gated_mlp_route_bf16_batched_staged_sin
     const cuteafd_nvfp4_route_batched_metadata_t* route_metadata, float* activation_workspace,
     uint16_t* out, size_t rows, size_t routes, size_t hidden_dim, size_t hidden_row_stride,
     size_t max_intermediate, size_t output_dim, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_b12x_spark_aot_available(int* out_available);
-cuteafd_status_t cuteafd_cuda_b12x_spark_aot_init(void);
 cuteafd_status_t cuteafd_cuda_b12x_quantize_bf16_nvfp4_row_payload_async(
     cuteafd_device_buffer_t input, cuteafd_device_buffer_t payload, size_t rows, size_t hidden_dim,
     void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_b12x_w4a16_pack_weight_async(
-    cuteafd_device_buffer_t source, cuteafd_device_buffer_t destination, size_t size_k,
-    size_t size_n, size_t row_rotation, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_b12x_w4a16_pack_weight_strided_async(
-    cuteafd_device_buffer_t source, cuteafd_device_buffer_t destination, size_t size_k,
-    size_t source_size_k, size_t source_start_k, size_t size_n,
-    size_t row_rotation, void* cuda_stream);
 /* Re-swizzle a plain [rows, cols] E4M3 block-scale plane into the NVFP4
    128x4 scale-factor atom layout the block-scaled MoE kernels consume. */
 cuteafd_status_t cuteafd_cuda_nvfp4_swizzle_scale_async(
@@ -881,178 +663,28 @@ cuteafd_status_t cuteafd_cuda_nvfp4_swizzle_scale_async(
 cuteafd_status_t cuteafd_cuda_nvfp4_pad_expert_async(
     const cuteafd_device_buffer_t* sources, const cuteafd_device_buffer_t* destinations,
     size_t source_n, size_t kernel_n, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_b12x_w4a16_pack_scale_async(
-    cuteafd_device_buffer_t source, cuteafd_device_buffer_t destination, size_t size_k,
-    size_t size_n, size_t row_rotation, float scale_factor, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_b12x_w4a16_pack_scale_strided_async(
-    cuteafd_device_buffer_t source, cuteafd_device_buffer_t destination, size_t size_k,
-    size_t source_size_k, size_t source_start_k, size_t size_n,
-    size_t row_rotation, float scale_factor, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_ds4_flash_w4a16_pack_weight_async(
-    cuteafd_device_buffer_t source, cuteafd_device_buffer_t destination, size_t size_k,
-    size_t size_n, size_t row_rotation, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_ds4_flash_w4a16_pack_weight_strided_async(
-    cuteafd_device_buffer_t source, cuteafd_device_buffer_t destination, size_t size_k,
-    size_t source_size_k, size_t source_start_k, size_t size_n,
-    size_t row_rotation, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_ds4_flash_w4a16_pack_e8m0_scale_async(
-    cuteafd_device_buffer_t source, cuteafd_device_buffer_t destination, size_t size_k,
-    size_t size_n, size_t row_rotation, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_ds4_flash_w4a16_pack_e8m0_scale_strided_async(
-    cuteafd_device_buffer_t source, cuteafd_device_buffer_t destination, size_t size_k,
-    size_t source_size_k, size_t source_start_k, size_t size_n,
-    size_t row_rotation, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_ds4_flash_fp8_pack_block_scale_mma_async(
-    cuteafd_device_buffer_t source, cuteafd_device_buffer_t destination,
-    size_t size_n, size_t size_k, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_ds4_flash_spark_aot_available(int* out_available);
-cuteafd_status_t cuteafd_cuda_ds4_flash_spark_aot_init(void);
-cuteafd_status_t cuteafd_cuda_ds4_flash_shared_expert_fp8_bf16_async(
-    const cuteafd_ds4_flash_shared_expert_fp8_buffers_t* buffers,
-    size_t rows, void* cuda_stream);
 /* Produces this rank's BF16 partial hidden vector.  The caller must reduce the
  * four expert-TP rank outputs before applying the residual. */
-cuteafd_status_t cuteafd_cuda_ds4_flash_spark_w4a16_decode_m1_bf16_async(
-    const cuteafd_ds4_flash_spark_w4a16_moe_buffers_t* buffers,
-    void* cuda_stream);
 /* Produces this rank's BF16 partial hidden rows for 1..2048 active rows.  The
  * caller must reduce corresponding rows across all four expert-TP ranks. */
-cuteafd_status_t cuteafd_cuda_ds4_flash_spark_w4a16_prefill_topk6_bf16_async(
-    const cuteafd_ds4_flash_spark_w4a16_moe_buffers_t* buffers, size_t rows,
-    void* cuda_stream);
 /* Executes directly from the resident rank-local uniform-tier trellis slabs. Both
  * output_f32 and output_bf16 are written; the caller selects the transport
  * representation required by the reduction transport. */
-cuteafd_status_t cuteafd_cuda_ds4_flash_spark_exl3_k2_decode_m1_async(
-    const cuteafd_ds4_flash_spark_exl3_k2_moe_buffers_t* buffers,
-    void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_ds4_flash_spark_exl3_k2_prefill_topk6_async(
-    const cuteafd_ds4_flash_spark_exl3_k2_moe_buffers_t* buffers, size_t rows,
-    void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_ds4_flash_spark_exl3_k3_decode_m1_async(
-    const cuteafd_ds4_flash_spark_exl3_k2_moe_buffers_t* buffers,
-    void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_ds4_flash_spark_exl3_k3_prefill_topk6_async(
-    const cuteafd_ds4_flash_spark_exl3_k2_moe_buffers_t* buffers, size_t rows,
-    void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_ds4_flash_spark_exl3_mixed_k2_k3_async(
-    const cuteafd_ds4_flash_spark_exl3_mixed_moe_buffers_t* buffers,
-    size_t tier0_slots, size_t tier1_slots,
-    size_t tier0_gate_experts, size_t tier1_gate_experts,
-    size_t tier0_up_experts, size_t tier1_up_experts,
-    size_t tier0_down_experts, size_t tier1_down_experts,
-    size_t rows,
-    void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_ds4_pro_spark_aot_available(int* out_available);
-cuteafd_status_t cuteafd_cuda_ds4_pro_spark_aot_init(void);
-cuteafd_status_t cuteafd_cuda_ds4_pro_shared_expert_fp8_bf16_async(
-    const cuteafd_ds4_flash_shared_expert_fp8_buffers_t* buffers,
-    size_t rows, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_ds4_pro_shared_expert_fp8_prefill_bf16_async(
-    const cuteafd_ds4_pro_shared_expert_fp8_prefill_buffers_t* buffers,
-    size_t rows, void* cuda_stream);
 /* Pro executes the same strict expert-TP4 contract as Flash, with every rank
  * holding one intermediate slice for every expert and producing one partial
  * hidden vector for the configured distributed reduction. */
-cuteafd_status_t cuteafd_cuda_ds4_pro_spark_exl3_k2_decode_m1_async(
-    const cuteafd_ds4_pro_spark_exl3_k2_moe_buffers_t* buffers,
-    void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_ds4_pro_spark_exl3_k2_prefill_topk6_async(
-    const cuteafd_ds4_pro_spark_exl3_k2_moe_buffers_t* buffers, size_t rows,
-    void* cuda_stream);
 /* Packs rows-by-6 global expert ids into the block-32 metadata consumed by the
  * Flash prefill kernels. The operation is asynchronous and allocation-free. */
-cuteafd_status_t cuteafd_cuda_ds4_flash_pack_topk6_routes_async(
-    const cuteafd_ds4_flash_route_pack_buffers_t* buffers, size_t rows,
-    void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_quantize_bf16_weight_nvfp4_async(
     cuteafd_device_buffer_t input, cuteafd_device_buffer_t packed,
     cuteafd_device_buffer_t scales, size_t rows, size_t cols,
     float global_scale, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_b12x_gather_nvfp4_rows_bf16_async(
-    cuteafd_device_buffer_t payload, size_t source_rows, size_t source_row_stride_bytes,
-    cuteafd_device_buffer_t row_indices, cuteafd_device_buffer_t output, size_t rows,
-    size_t hidden_dim, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_b12x_dequantize_nvfp4_rows_bf16_async(
-    cuteafd_device_buffer_t payload, size_t row_stride_bytes,
-    cuteafd_device_buffer_t output, size_t rows, size_t hidden_dim,
-    void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_b12x_spark_w4a16_decode_m1_nvfp4_async(
-    const cuteafd_b12x_spark_w4a16_moe_buffers_t* buffers,
-    cuteafd_device_buffer_t input_payload, size_t input_payload_stride_bytes,
-    cuteafd_device_buffer_t topk_ids, void* cuda_stream);
 /* Benchmark entry point for atomic top-k accumulation into one BF16 row. */
-cuteafd_status_t cuteafd_cuda_b12x_spark_w4a16_decode_m1_fused_sum_nvfp4_async(
-    const cuteafd_b12x_spark_w4a16_moe_buffers_t* buffers,
-    cuteafd_device_buffer_t input_payload, size_t input_payload_stride_bytes,
-    cuteafd_device_buffer_t topk_ids, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_b12x_spark_w4a16_m1_parity_m2_8_nvfp4_async(
-    const cuteafd_b12x_spark_w4a16_moe_buffers_t* buffers,
-    cuteafd_device_buffer_t input_payload, size_t input_payload_stride_bytes,
-    cuteafd_device_buffer_t topk_ids, size_t rows, void* cuda_stream);
-cuteafd_status_t
-cuteafd_cuda_b12x_spark_w4a16_m1_parity_grouped_m2_8_nvfp4_async(
-    const cuteafd_b12x_spark_w4a16_moe_buffers_t* buffers,
-    cuteafd_device_buffer_t input_payload, size_t input_payload_stride_bytes,
-    size_t rows, void* cuda_stream);
 /* Grouped fixed-order output with the selected wider FC2 tile. */
-cuteafd_status_t
-cuteafd_cuda_b12x_spark_w4a16_m1_parity_grouped_wide_m2_8_nvfp4_async(
-    const cuteafd_b12x_spark_w4a16_moe_buffers_t* buffers,
-    cuteafd_device_buffer_t input_payload, size_t input_payload_stride_bytes,
-    size_t rows, void* cuda_stream);
 /* Benchmark-only grouped decode grid sweep; serving does not reference this symbol. */
-cuteafd_status_t cuteafd_cuda_b12x_spark_w4a16_decode_m1_nvfp4_grid_candidate_async(
-    const cuteafd_b12x_spark_w4a16_moe_buffers_t* buffers,
-    cuteafd_device_buffer_t input_payload, size_t input_payload_stride_bytes,
-    cuteafd_device_buffer_t topk_ids, int grid_x, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_b12x_spark_w4a16_prefill_topk8_nvfp4_async(
-    const cuteafd_b12x_spark_w4a16_moe_buffers_t* buffers,
-    cuteafd_device_buffer_t input_payload, size_t input_payload_stride_bytes,
-    size_t rows, void* cuda_stream);
 /* Benchmark-only packed-prefill grid sweep; serving does not reference this symbol. */
-cuteafd_status_t
-cuteafd_cuda_b12x_spark_w4a16_prefill_topk8_nvfp4_grid_candidate_async(
-    const cuteafd_b12x_spark_w4a16_moe_buffers_t* buffers,
-    cuteafd_device_buffer_t input_payload, size_t input_payload_stride_bytes,
-    size_t rows, int grid_x, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_b12x_spark_w4a16_prefill_topk8_nvfp4_fp8_async(
-    const cuteafd_b12x_spark_w4a16_moe_buffers_t* buffers,
-    cuteafd_device_buffer_t input_payload, size_t input_payload_stride_bytes,
-    size_t rows, cuteafd_device_buffer_t output_fp8,
-    size_t output_fp8_row_stride_bytes, void* cuda_stream);
 /* Benchmarkable response postprocessing used by the fused FP8 serving candidate. */
-cuteafd_status_t cuteafd_cuda_b12x_spark_sum_topk8_bf16_async(
-    cuteafd_device_buffer_t routed_bf16, cuteafd_device_buffer_t output_bf16,
-    size_t rows, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_b12x_spark_sum_topk8_bf16_to_fp8_async(
-    cuteafd_device_buffer_t routed_bf16, cuteafd_device_buffer_t output_fp8,
-    size_t rows, size_t output_row_stride_bytes, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_b12x_spark_w4a16_top1_async(
-    const cuteafd_b12x_spark_w4a16_moe_buffers_t* buffers, size_t rows,
-    size_t capacity_rows, uint32_t expert_id, void* cuda_stream);
 /* Benchmark-only grid sweep; serving does not reference this symbol. */
-cuteafd_status_t cuteafd_cuda_b12x_spark_w4a16_top1_grid_candidate_async(
-    const cuteafd_b12x_spark_w4a16_moe_buffers_t* buffers, size_t rows,
-    size_t capacity_rows, uint32_t expert_id, int grid_x, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_b12x_coordinator_aot_available(int* out_available);
-cuteafd_status_t cuteafd_cuda_b12x_coordinator_aot_init(void);
-cuteafd_status_t cuteafd_cuda_b12x_coordinator_w4a16_quantize_pack_weight_async(
-    cuteafd_device_buffer_t input_bf16, cuteafd_device_buffer_t payload_scratch,
-    cuteafd_device_buffer_t packed_weight, cuteafd_device_buffer_t packed_scale,
-    cuteafd_device_buffer_t global_scale, size_t size_k, size_t size_n,
-    void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_b12x_coordinator_w4a16_initialize_launch_buffers_async(
-    const cuteafd_b12x_coordinator_w4a16_buffers_t* buffers, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_b12x_coordinator_w4a16_q_b_m8_async(
-    const cuteafd_b12x_coordinator_w4a16_buffers_t* buffers, size_t active_rows,
-    void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_b12x_coordinator_w4a16_q_b_m1_async(
-    const cuteafd_b12x_coordinator_w4a16_buffers_t* buffers, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_b12x_coordinator_w4a16_o_proj_m1_async(
-    const cuteafd_b12x_coordinator_w4a16_buffers_t* buffers, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_b12x_coordinator_w4a16_o_proj_m1_tn64_candidate_async(
-    const cuteafd_b12x_coordinator_w4a16_buffers_t* buffers, void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_residual_add_f32(const float* residual, const float* delta,
                                            float* out, size_t count);
 cuteafd_status_t cuteafd_cuda_residual_add_f32_async(const float* residual, const float* delta,
@@ -1476,21 +1108,6 @@ cuteafd_status_t cuteafd_cuda_linear_w8a16_group256_triton_file_async(
     uint16_t* output, size_t rows, size_t input_dim, size_t output_dim,
     const char* cubin_path, const char* kernel_name, size_t block_m,
     size_t block_n, size_t threads, size_t shared_bytes, void* cuda_stream);
-// Preload all embedded row buckets for a projection before CUDA graph capture.
-cuteafd_status_t cuteafd_cuda_preload_w8a16_group256_aot(
-    size_t input_dim, size_t output_dim);
-// Bucketed M=2..256 row-major W8A16 projection from embedded Triton cubins.
-cuteafd_status_t cuteafd_cuda_linear_w8a16_group256_aot_async(
-    const uint16_t* input, const int8_t* weight, const float* scales,
-    uint16_t* output, size_t rows, size_t input_dim, size_t output_dim,
-    void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_w8a16_packed_o_aot_init(void);
-cuteafd_status_t cuteafd_cuda_w8a16_packed_o_initialize_launch_buffers_async(
-    const cuteafd_b12x_coordinator_w4a16_buffers_t* buffers, size_t rows,
-    size_t block_m, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_w8a16_packed_o_async(
-    const cuteafd_b12x_coordinator_w4a16_buffers_t* buffers, size_t rows,
-    void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_linear_bf16_strided_batched_cublas(
     const uint16_t* input, const uint16_t* weight, uint16_t* output,
     size_t batch_count, size_t rows, size_t input_dim, size_t output_dim,
@@ -1636,12 +1253,6 @@ cuteafd_status_t cuteafd_cuda_mla_merge_state_bf16(
 cuteafd_status_t cuteafd_cuda_mla_merge_state_bf16_async(
     uint16_t* accumulator, float* accumulator_lse, const uint16_t* partial,
     const float* partial_lse, size_t heads, size_t kv_lora_rank, void* cuda_stream);
-cuteafd_status_t cuteafd_cuda_packed_fp8_mla_exact_grouped_async(
-    const void* q, const void* kv_cache, const void* indices, void* mid_out,
-    void* mid_lse, const void* topk_length, void* output, void* out_lse,
-    size_t num_tokens, size_t num_heads, size_t topk,
-    size_t chunks_per_block, float sm_scale, size_t stride_kv_block,
-    void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_embedding_lookup_f32(const float* embedding, const uint32_t* token_ids,
                                                float* out, size_t rows, size_t vocab,
                                                size_t hidden);

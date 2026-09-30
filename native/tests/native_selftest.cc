@@ -106,15 +106,6 @@ void test_nccl_abi() {
   assert(cuteafd_nccl_get_unique_id(unique_id.data(), unique_id.size()) == CUTEAFD_STATUS_OK);
 }
 
-void test_ds4_flash_aot_availability_abi() {
-  assert(cuteafd_cuda_ds4_flash_spark_aot_available(nullptr) ==
-         CUTEAFD_STATUS_INVALID_ARGUMENT);
-  int available = -1;
-  assert(cuteafd_cuda_ds4_flash_spark_aot_available(&available) ==
-         CUTEAFD_STATUS_OK);
-  assert(available == 0 || available == 1);
-}
-
 void write_le16(std::vector<unsigned char>& bytes, size_t offset, uint16_t value) {
   bytes[offset] = static_cast<unsigned char>(value & 0xff);
   bytes[offset + 1] = static_cast<unsigned char>((value >> 8) & 0xff);
@@ -257,7 +248,6 @@ int main() {
   test_host_buffer_copy_roundtrip();
   test_error_propagation();
   test_nccl_abi();
-  test_ds4_flash_aot_availability_abi();
   test_rdma_abi();
   std::cout << "cuteafd_native_selftest passed\n";
   return 0;

@@ -857,101 +857,6 @@ extern "C" cuteafd_status_t cuteafd_alloc_managed_device_buffer(size_t bytes,
 #endif
 }
 
-#if !CUTEAFD_NATIVE_ENABLE_B12X_AOT
-extern "C" cuteafd_status_t cuteafd_cuda_b12x_spark_aot_available(int* out_available) {
-  if (out_available == nullptr) {
-    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "B12X AOT availability output is null");
-  }
-  *out_available = 0;
-  return ok();
-}
-
-extern "C" cuteafd_status_t cuteafd_cuda_b12x_spark_aot_init(void) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "Spark B12X AOT kernels are not built");
-}
-
-#endif
-
-#if !CUTEAFD_NATIVE_ENABLE_DS4_FLASH_AOT
-extern "C" cuteafd_status_t cuteafd_cuda_ds4_flash_spark_aot_available(
-    int* out_available) {
-  if (out_available == nullptr) {
-    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
-                "DeepSeek-V4-Flash AOT availability output is null");
-  }
-  *out_available = 0;
-  return ok();
-}
-
-extern "C" cuteafd_status_t cuteafd_cuda_ds4_flash_spark_aot_init(void) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
-              "DeepSeek-V4-Flash Spark AOT kernels are not built");
-}
-
-extern "C" cuteafd_status_t cuteafd_cuda_ds4_pro_spark_aot_available(
-    int* out_available) {
-  if (out_available == nullptr) {
-    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
-                "DeepSeek-V4-Pro AOT availability output is null");
-  }
-  *out_available = 0;
-  return ok();
-}
-
-extern "C" cuteafd_status_t cuteafd_cuda_ds4_pro_spark_aot_init(void) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
-              "DeepSeek-V4-Pro Spark AOT kernels are not built");
-}
-
-extern "C" cuteafd_status_t
-cuteafd_cuda_ds4_pro_shared_expert_fp8_bf16_async(
-    const cuteafd_ds4_flash_shared_expert_fp8_buffers_t*, size_t, void*) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
-              "DeepSeek-V4-Pro coordinator AOT kernels are not built");
-}
-
-extern "C" cuteafd_status_t
-cuteafd_cuda_ds4_flash_spark_w4a16_decode_m1_bf16_async(
-    const cuteafd_ds4_flash_spark_w4a16_moe_buffers_t*, void*) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
-              "DeepSeek-V4-Flash Spark AOT kernels are not built");
-}
-
-extern "C" cuteafd_status_t
-cuteafd_cuda_ds4_pro_spark_exl3_k2_decode_m1_async(
-    const cuteafd_ds4_pro_spark_exl3_k2_moe_buffers_t*, void*) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
-              "DeepSeek-V4-Pro Spark AOT kernels are not built");
-}
-
-extern "C" cuteafd_status_t
-cuteafd_cuda_ds4_pro_spark_exl3_k2_prefill_topk6_async(
-    const cuteafd_ds4_pro_spark_exl3_k2_moe_buffers_t*, size_t, void*) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
-              "DeepSeek-V4-Pro Spark AOT kernels are not built");
-}
-
-extern "C" cuteafd_status_t
-cuteafd_cuda_ds4_flash_spark_w4a16_prefill_topk6_bf16_async(
-    const cuteafd_ds4_flash_spark_w4a16_moe_buffers_t*, size_t, void*) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
-              "DeepSeek-V4-Flash Spark AOT kernels are not built");
-}
-
-extern "C" cuteafd_status_t cuteafd_cuda_ds4_flash_pack_topk6_routes_async(
-    const cuteafd_ds4_flash_route_pack_buffers_t*, size_t, void*) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
-              "DeepSeek-V4-Flash route-pack kernels are not built");
-}
-
-extern "C" cuteafd_status_t
-cuteafd_cuda_ds4_flash_shared_expert_fp8_bf16_async(
-    const cuteafd_ds4_flash_shared_expert_fp8_buffers_t*, size_t, void*) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
-              "DeepSeek-V4-Flash coordinator AOT kernels are not built");
-}
-#endif
-
 #if !CUTEAFD_NATIVE_ENABLE_CUDA
 extern "C" cuteafd_status_t cuteafd_cuda_engram_dequant_bf16_async(
     const uint8_t*, const uint8_t*, uint16_t*, int, void*) {
@@ -965,59 +870,6 @@ extern "C" cuteafd_status_t cuteafd_cuda_engram_gate_bf16_async(
 extern "C" cuteafd_status_t cuteafd_cuda_b12x_quantize_bf16_nvfp4_row_payload_async(
     cuteafd_device_buffer_t, cuteafd_device_buffer_t, size_t, size_t, void*) {
   return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "CUDA kernels are not built");
-}
-
-extern "C" cuteafd_status_t
-cuteafd_cuda_ds4_flash_fp8_pack_block_scale_mma_async(
-    cuteafd_device_buffer_t, cuteafd_device_buffer_t, size_t, size_t, void*) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "CUDA kernels are not built");
-}
-#endif
-
-#if !CUTEAFD_NATIVE_ENABLE_B12X_COORDINATOR_AOT
-extern "C" cuteafd_status_t cuteafd_cuda_b12x_coordinator_aot_available(int* out_available) {
-  if (out_available == nullptr) {
-    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "coordinator B12X availability output is null");
-  }
-  *out_available = 0;
-  return ok();
-}
-
-extern "C" cuteafd_status_t cuteafd_cuda_b12x_coordinator_aot_init(void) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "coordinator B12X AOT kernels are not built");
-}
-
-extern "C" cuteafd_status_t cuteafd_cuda_b12x_coordinator_w4a16_quantize_pack_weight_async(
-    cuteafd_device_buffer_t, cuteafd_device_buffer_t, cuteafd_device_buffer_t,
-    cuteafd_device_buffer_t, cuteafd_device_buffer_t, size_t, size_t, void*) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "coordinator B12X AOT kernels are not built");
-}
-
-extern "C" cuteafd_status_t
-cuteafd_cuda_b12x_coordinator_w4a16_initialize_launch_buffers_async(
-    const cuteafd_b12x_coordinator_w4a16_buffers_t*, void*) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "coordinator B12X AOT kernels are not built");
-}
-
-extern "C" cuteafd_status_t cuteafd_cuda_b12x_coordinator_w4a16_q_b_m8_async(
-    const cuteafd_b12x_coordinator_w4a16_buffers_t*, size_t, void*) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "coordinator B12X AOT kernels are not built");
-}
-
-extern "C" cuteafd_status_t cuteafd_cuda_b12x_coordinator_w4a16_q_b_m1_async(
-    const cuteafd_b12x_coordinator_w4a16_buffers_t*, void*) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "coordinator B12X AOT kernels are not built");
-}
-
-extern "C" cuteafd_status_t cuteafd_cuda_b12x_coordinator_w4a16_o_proj_m1_async(
-    const cuteafd_b12x_coordinator_w4a16_buffers_t*, void*) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "coordinator B12X AOT kernels are not built");
-}
-
-extern "C" cuteafd_status_t
-cuteafd_cuda_b12x_coordinator_w4a16_o_proj_m1_tn64_candidate_async(
-    const cuteafd_b12x_coordinator_w4a16_buffers_t*, void*) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "coordinator B12X AOT kernels are not built");
 }
 #endif
 
@@ -5088,36 +4940,6 @@ extern "C" cuteafd_status_t cuteafd_cuda_linear_w8a16_group256_triton_file_async
     size_t, const char*, const char*, size_t, size_t, size_t, size_t, void*) {
   return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
               "CUDA W8A16 Triton AOT launcher is unavailable in this build");
-}
-
-extern "C" cuteafd_status_t cuteafd_cuda_preload_w8a16_group256_aot(size_t, size_t) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
-              "CUDA W8A16 AOT kernels are unavailable in this build");
-}
-
-extern "C" cuteafd_status_t cuteafd_cuda_linear_w8a16_group256_aot_async(
-    const uint16_t*, const int8_t*, const float*, uint16_t*, size_t, size_t,
-    size_t, void*) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
-              "CUDA W8A16 AOT kernels are unavailable in this build");
-}
-
-extern "C" cuteafd_status_t cuteafd_cuda_w8a16_packed_o_aot_init(void) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
-              "CUDA packed W8A16 O kernels are unavailable in this build");
-}
-
-extern "C" cuteafd_status_t
-cuteafd_cuda_w8a16_packed_o_initialize_launch_buffers_async(
-    const cuteafd_b12x_coordinator_w4a16_buffers_t*, size_t, size_t, void*) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
-              "CUDA packed W8A16 O metadata initialization is unavailable in this build");
-}
-
-extern "C" cuteafd_status_t cuteafd_cuda_w8a16_packed_o_async(
-    const cuteafd_b12x_coordinator_w4a16_buffers_t*, size_t, void*) {
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
-              "CUDA packed W8A16 O kernels are unavailable in this build");
 }
 
 extern "C" cuteafd_status_t cuteafd_cuda_causal_attention_f32(const float*, const float*, const float*,

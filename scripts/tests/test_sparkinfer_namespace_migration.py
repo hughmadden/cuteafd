@@ -223,25 +223,16 @@ def test_metadata_free_release_copies_filter_and_reject_python_caches() -> None:
         )
 
 
-def test_release_and_wip_exclude_legacy_ds4_aot() -> None:
-    release = (ROOT / "scripts/build-release-artifacts.sh").read_text(
-        encoding="utf-8"
-    )
-    assert "-DCUTEAFD_ENABLE_DS4_FLASH_AOT=OFF" in release, (
-        "native V4.1 release artifacts must exclude the legacy DS4 Flash/Pro "
-        "AOT bridge"
-    )
-
-    # The legacy DS4 Flash/Pro mixed-kernel launcher ABI drifted from the
-    # pinned SparkInfer and no longer compiles; the native serve path is the
-    # only supported development loop, so WIP artifacts also exclude it.
-    wip = (ROOT / "scripts/build-wip-artifacts.sh").read_text(encoding="utf-8")
-    assert "-DCUTEAFD_ENABLE_DS4_FLASH_AOT=OFF" in wip, (
-        "development artifacts must exclude the stale legacy DS4 Flash/Pro "
-        "AOT bridge"
-    )
-
-
+def test_legacy_ds4_aot_bridge_is_gone() -> None:
+    # The legacy DS4 Flash/Pro, B12X and W8A16 AOT bridges were removed; the
+    # dsv4 programs and V4.1 exports are the only native AOT paths.
+    cmake = (ROOT / "native/CMakeLists.txt").read_text(encoding="utf-8")
+    for option in (
+        "CUTEAFD_ENABLE_DS4_FLASH_AOT",
+        "CUTEAFD_ENABLE_SPARKINFER_COORDINATOR_AOT",
+        "CUTEAFD_ENABLE_W8A16_AOT",
+    ):
+        assert option not in cmake, f"{option} must stay removed"
 
 
 def test_fork_and_images_share_qualified_cutlass_pin() -> None:

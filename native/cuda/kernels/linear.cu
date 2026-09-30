@@ -12,10 +12,6 @@
 #include <unordered_map>
 #include <vector>
 
-#if CUTEAFD_NATIVE_ENABLE_W8A16_AOT
-#include "w8a16_row_major_aot.h"
-#endif
-
 namespace {
 
 __global__ void linear_f32_kernel(const float* input, const float* weight, const float* bias,
@@ -926,38 +922,6 @@ cuteafd_status_t triton_driver_kernel(const char* cubin_path,
   }
   *out = loaded.function;
   kernels.emplace(key, loaded);
-  return CUTEAFD_STATUS_OK;
-}
-
-cuteafd_status_t triton_driver_kernel_data(const char* cache_key,
-                                         const unsigned char* cubin,
-                                         const char* kernel_name,
-                                         CUfunction* out) {
-  if (cache_key == nullptr || cubin == nullptr || kernel_name == nullptr ||
-      out == nullptr) {
-    return CUTEAFD_STATUS_INVALID_ARGUMENT;
-  }
-  std::lock_guard<std::mutex> lock(triton_driver_kernel_mutex());
-  auto& kernels = triton_driver_kernel_cache();
-  const auto found = kernels.find(cache_key);
-  if (found != kernels.end()) {
-    *out = found->second.function;
-    return CUTEAFD_STATUS_OK;
-  }
-  if (ensure_cuda_driver_context() != CUTEAFD_STATUS_OK) {
-    return CUTEAFD_STATUS_INTERNAL_ERROR;
-  }
-  TritonDriverKernel loaded;
-  if (cuModuleLoadData(&loaded.module, cubin) != CUDA_SUCCESS ||
-      cuModuleGetFunction(&loaded.function, loaded.module, kernel_name) !=
-          CUDA_SUCCESS) {
-    if (loaded.module != nullptr) {
-      cuModuleUnload(loaded.module);
-    }
-    return CUTEAFD_STATUS_INTERNAL_ERROR;
-  }
-  *out = loaded.function;
-  kernels.emplace(cache_key, loaded);
   return CUTEAFD_STATUS_OK;
 }
 
@@ -2101,111 +2065,6 @@ extern "C" cuteafd_status_t cuteafd_cuda_linear_w8a16_group256_triton_file_async
       reinterpret_cast<CUstream>(cuda_stream), arguments, nullptr);
   return launched == CUDA_SUCCESS ? CUTEAFD_STATUS_OK
                                   : CUTEAFD_STATUS_INTERNAL_ERROR;
-}
-
-extern "C" cuteafd_status_t cuteafd_cuda_preload_w8a16_group256_aot(
-    size_t input_dim, size_t output_dim) {
-#if CUTEAFD_NATIVE_ENABLE_W8A16_AOT
-  bool matched = false;
-  for (size_t index = 0; index < cuteafd_w8a16_aot::kernel_count; ++index) {
-    const auto& config = cuteafd_w8a16_aot::kernels[index];
-    if (config.input_dim != input_dim || config.output_dim != output_dim) {
-      continue;
-    }
-    matched = true;
-    const std::string key = "w8a16-aot-" + std::to_string(input_dim) + "-" +
-                            std::to_string(output_dim) + "-" +
-                            std::to_string(config.max_rows);
-    CUfunction function = nullptr;
-    const cuteafd_status_t loaded = triton_driver_kernel_data(
-        key.c_str(), config.cubin, config.symbol, &function);
-    if (loaded != CUTEAFD_STATUS_OK) {
-      return loaded;
-    }
-    if (config.shared_bytes > 48 * 1024 &&
-        cuFuncSetAttribute(
-            function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-            static_cast<int>(config.shared_bytes)) != CUDA_SUCCESS) {
-      return CUTEAFD_STATUS_INTERNAL_ERROR;
-    }
-  }
-  return matched ? CUTEAFD_STATUS_OK : CUTEAFD_STATUS_INVALID_ARGUMENT;
-#else
-  (void)input_dim;
-  (void)output_dim;
-  return CUTEAFD_STATUS_CUDA_UNAVAILABLE;
-#endif
-}
-
-extern "C" cuteafd_status_t cuteafd_cuda_linear_w8a16_group256_aot_async(
-    const uint16_t* input, const int8_t* weight, const float* scales,
-    uint16_t* output, size_t rows, size_t input_dim, size_t output_dim,
-    void* cuda_stream) {
-#if CUTEAFD_NATIVE_ENABLE_W8A16_AOT
-  if (input == nullptr || weight == nullptr || scales == nullptr ||
-      output == nullptr || rows == 0 || rows > 2048 || input_dim == 0 ||
-      output_dim == 0 || input_dim % 256 != 0 ||
-      rows > static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
-    return CUTEAFD_STATUS_INVALID_ARGUMENT;
-  }
-  const cuteafd_w8a16_aot::KernelConfig* selected = nullptr;
-  for (size_t index = 0; index < cuteafd_w8a16_aot::kernel_count; ++index) {
-    const auto& config = cuteafd_w8a16_aot::kernels[index];
-    if (config.input_dim == input_dim && config.output_dim == output_dim &&
-        rows <= config.max_rows) {
-      selected = &config;
-      break;
-    }
-  }
-  if (selected == nullptr) {
-    return CUTEAFD_STATUS_INVALID_ARGUMENT;
-  }
-  const std::string key = "w8a16-aot-" + std::to_string(input_dim) + "-" +
-                          std::to_string(output_dim) + "-" +
-                          std::to_string(selected->max_rows);
-  CUfunction function = nullptr;
-  const cuteafd_status_t loaded = triton_driver_kernel_data(
-      key.c_str(), selected->cubin, selected->symbol, &function);
-  if (loaded != CUTEAFD_STATUS_OK) {
-    return loaded;
-  }
-  if (selected->shared_bytes > 48 * 1024 &&
-      cuFuncSetAttribute(
-          function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-          static_cast<int>(selected->shared_bytes)) != CUDA_SUCCESS) {
-    return CUTEAFD_STATUS_INTERNAL_ERROR;
-  }
-  CUdeviceptr input_arg = reinterpret_cast<CUdeviceptr>(input);
-  CUdeviceptr weight_arg = reinterpret_cast<CUdeviceptr>(weight);
-  CUdeviceptr scales_arg = reinterpret_cast<CUdeviceptr>(scales);
-  CUdeviceptr output_arg = reinterpret_cast<CUdeviceptr>(output);
-  int32_t rows_arg = static_cast<int32_t>(rows);
-  CUdeviceptr global_scratch_arg = 0;
-  CUdeviceptr profile_scratch_arg = 0;
-  void* arguments[] = {
-      &input_arg, &weight_arg, &scales_arg, &output_arg, &rows_arg,
-      &global_scratch_arg, &profile_scratch_arg};
-  const size_t grid =
-      ((rows + selected->block_m - 1) / selected->block_m) *
-      (output_dim / selected->block_n);
-  const CUresult launched = cuLaunchKernel(
-      function, static_cast<unsigned int>(grid), 1, 1,
-      static_cast<unsigned int>(selected->threads), 1, 1,
-      static_cast<unsigned int>(selected->shared_bytes),
-      reinterpret_cast<CUstream>(cuda_stream), arguments, nullptr);
-  return launched == CUDA_SUCCESS ? CUTEAFD_STATUS_OK
-                                  : CUTEAFD_STATUS_INTERNAL_ERROR;
-#else
-  (void)input;
-  (void)weight;
-  (void)scales;
-  (void)output;
-  (void)rows;
-  (void)input_dim;
-  (void)output_dim;
-  (void)cuda_stream;
-  return CUTEAFD_STATUS_CUDA_UNAVAILABLE;
-#endif
 }
 
 extern "C" cuteafd_status_t cuteafd_cuda_linear_bf16_cublas(
