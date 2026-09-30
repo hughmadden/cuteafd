@@ -53,6 +53,8 @@ pub(crate) struct EngineArgs {
     /// the two leaves the smaller error (best).
     #[arg(long, value_enum, default_value_t = crate::fp8_linear::Fp8Scales::Amax)]
     pub fp8_scales: crate::fp8_linear::Fp8Scales,
+    #[command(flatten)]
+    pub l2: crate::l2_prefetch::L2PrefetchArgs,
     /// Where the PLE n-gram table lives.
     #[arg(long, value_enum, default_value_t = ple::PlePlacement::Host)]
     pub ple: ple::PlePlacement,
@@ -209,6 +211,9 @@ impl Opened {
             args.max_context, args.prefill_rows, pages, args.slots)?;
         if let Some(experts) = self.experts(args, layers)? {
             engine.set_experts(experts);
+        }
+        if let Some(budget) = args.l2.budget(&self.library)? {
+            engine.l2 = Some(crate::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
         let result = body(&engine);
         drop(engine);

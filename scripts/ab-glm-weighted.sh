@@ -4,12 +4,15 @@
 # arms interleaved (ABC, CBA, ...), plus the branch's Spark-side gates.
 #
 #   scripts/ab-glm-weighted.sh gates  OUT BUILD      # NLL, decode agreement, verify-step table (branch build)
-#   scripts/ab-glm-weighted.sh image  BUILD TAG      # coordinator image = p7 + BUILD's cuteafd/lib/manifest
-#   scripts/ab-glm-weighted.sh ab     OUT ROUNDS ARM...   # ARM: glmrt | IMAGE (a coordinator image tag)
+#   scripts/ab-glm-weighted.sh image  BUILD TAG [NATIVE]  # coordinator image = p7 + BUILD's cuteafd/lib/manifest
+#   scripts/ab-glm-weighted.sh ab     OUT ROUNDS ARM...   # ARM: glmrt | IMAGE[+KEY=VALUE,...]
 #   scripts/ab-glm-weighted.sh stop                  # stop every arm's containers
 #
 # BUILD holds target/release/cuteafd and coord/native/{libcuteafd_native.so,
-# dsv4_programs/dsv4_programs.json} (~/.cache/cuteafd/builds/glm-parity layout).
+# dsv4_programs/dsv4_programs.json} (~/.cache/cuteafd/builds/glm-parity layout;
+# NATIVE names another native build directory). An arm's +KEY=VALUE list adds
+# run-dsv4.sh config keys, e.g. IMAGE+L2_PREFETCH=auto or IMAGE+DRAFT_FP8=off:
+# the L2 prefetch A/B is `ab OUT 3 IMAGE IMAGE+L2_PREFETCH=auto`.
 # Needs raptor GPU0 and ostrich..kiwi free; stop other models first. The power
 # cap is whatever raptor has (glmrt v9 published 33.42 at 400 W; compare arms
 # at the same cap). glmrt v9 images come from ghcr by digest and are tagged to
@@ -38,11 +41,13 @@ stop_all() {
 
 # A run-dsv4.sh config for coordinator IMAGE (p7 Spark workers, GPU0:8200, DFlash2).
 cuteafd_config() {
-  local image=$1 trace=$2
+  local image=${1%%+*} keys= trace=$2
+  [[ $1 == *+* ]] && keys=${1#*+}
   sed -e "s#^COORDINATOR_DOCKER_INFERENCE=.*#COORDINATOR_DOCKER_INFERENCE=$image#" \
       -e "s#^SPARK_EXPERT_DOCKER_INFERENCE=.*#SPARK_EXPERT_DOCKER_INFERENCE=$p7_spark#" \
       "$HOME/.cache/cuteafd/builds/sparkrun/glm-p7.config"
   echo "COORDINATOR_TRACE=$trace"
+  [[ -z $keys ]] || tr ',' '\n' <<< "$keys"
 }
 
 glmrt_prepare() {
@@ -82,9 +87,9 @@ logs() {
 case "${1:-}" in
   stop) stop_all ;;
   image)
-    build=$2 tag=$3 ctx="$(mktemp -d)"
-    cp "$build/target/release/cuteafd" "$build/coord/native/libcuteafd_native.so" \
-      "$build/coord/native/dsv4_programs/dsv4_programs.json" "$ctx/"
+    build=$2 tag=$3 native=${4:-$2/coord/native} ctx="$(mktemp -d)"
+    cp "$build/target/release/cuteafd" "$native/libcuteafd_native.so" \
+      "$native/dsv4_programs/dsv4_programs.json" "$ctx/"
     printf 'FROM %s\nCOPY cuteafd /opt/cuteafd/bin/cuteafd\nCOPY libcuteafd_native.so /opt/cuteafd/lib/libcuteafd_native.so\nCOPY dsv4_programs.json /opt/cuteafd/share/DSV4_PROGRAMS.json\n' \
       "$p7" > "$ctx/Dockerfile"
     docker build -q -t "$tag" "$ctx" && rm -rf "$ctx" ;;
@@ -117,7 +122,7 @@ case "${1:-}" in
     for round in $(seq 1 "$rounds"); do
       order=("${arms[@]}"); (( round % 2 == 0 )) && order=($(printf '%s\n' "${arms[@]}" | tac))
       for arm in "${order[@]}"; do
-        tag="$(echo "$arm" | tr '/:@' '___')-r$round"
+        tag="$(echo "$arm" | tr '/:@+=,' '______')-r$round"
         url="$(launch "$arm" "$out" "$tag")"
         # Warm-up: lazily allocated workspaces and graphs, then the timed corpus.
         "$py" "$repo/scripts/bench-glm-weighted.py" --base-url "$url" --repeats 1 --warmup 3 \
@@ -148,5 +153,5 @@ for arm, runs in by.items():
           + ' '.join(f'{k} {v:.1f}' for k, v in cases.items()))
 PY
     ;;
-  *) sed -n 2,19p "$0"; exit 2 ;;
+  *) sed -n 2,22p "$0"; exit 2 ;;
 esac

@@ -8,6 +8,7 @@ mod commands;
 mod draft_policy;
 mod prefill_share;
 mod fp8_linear;
+mod l2_prefetch;
 mod dsv4;
 mod glm;
 mod glmf;

@@ -115,6 +115,8 @@ pub(crate) struct EngineArgs {
     /// -> 0.0386).
     #[arg(long, value_enum, default_value_t = crate::fp8_linear::Fp8Scales::Pow2)]
     pub fp8_scales: crate::fp8_linear::Fp8Scales,
+    #[command(flatten)]
+    pub l2: crate::l2_prefetch::L2PrefetchArgs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -289,6 +291,9 @@ impl Opened {
             if let Some(experts) = self.experts(args)? {
                 engine.set_experts(experts);
             }
+        }
+        if let Some(budget) = args.l2.budget(&self.library)? {
+            engine.l2 = Some(crate::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
         let result = body(&engine);
         drop(engine);

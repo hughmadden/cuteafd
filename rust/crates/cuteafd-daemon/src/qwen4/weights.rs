@@ -37,6 +37,11 @@ impl Qwen4Layer<'_> {
         self.operands.contains_key(operand)
     }
 
+    /// The device range of `operand`, when the layer has it.
+    pub fn range(&self, operand: &str) -> Option<crate::l2_prefetch::Range> {
+        self.operands.get(operand).map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes))
+    }
+
     pub fn bytes(&self) -> usize {
         self.operands.values().map(|a| a.buffer.bytes).sum()
     }

@@ -68,6 +68,8 @@ pub(crate) struct EngineArgs {
     /// the two leaves the smaller error (best).
     #[arg(long, value_enum, default_value_t = crate::fp8_linear::Fp8Scales::Amax)]
     pub fp8_scales: crate::fp8_linear::Fp8Scales,
+    #[command(flatten)]
+    pub l2: crate::l2_prefetch::L2PrefetchArgs,
     /// With --local-experts: keep only N MoE layers' experts resident and load
     /// each missing layer over the oldest (prefill checks of models whose
     /// experts do not fit one GPU, such as V2.6 Pro).
@@ -237,6 +239,9 @@ impl Opened {
         engine.expert_input = args.expert_input;
         if let Some(experts) = self.experts(args, &moe_layers)? {
             engine.set_experts(experts);
+        }
+        if let Some(budget) = args.l2.budget(&self.library)? {
+            engine.l2 = Some(crate::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
         let result = body(&engine);
         drop(engine);

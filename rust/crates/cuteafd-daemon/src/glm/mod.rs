@@ -57,6 +57,8 @@ pub(crate) struct EngineArgs {
     /// the two leaves the smaller error (best).
     #[arg(long, value_enum, default_value_t = crate::fp8_linear::Fp8Scales::Amax)]
     pub fp8_scales: crate::fp8_linear::Fp8Scales,
+    #[command(flatten)]
+    pub l2: crate::l2_prefetch::L2PrefetchArgs,
     /// Keep every prefill row's logits (glm-golden --nll; 2.5 GiB at 4096 rows).
     #[arg(long, hide = true)]
     pub full_prefill_logits: bool,
@@ -248,6 +250,9 @@ impl Opened {
                 "Spark expert transports warm");
         }
         *engine.lanes.borrow_mut() = lanes;
+        if let Some(budget) = args.l2.budget(&self.library)? {
+            engine.l2 = Some(crate::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
+        }
         let result = body(&engine, transport.as_mut(), &runtime);
         drop(engine);
         // SAFETY: the engine that used the stream is gone.

@@ -109,6 +109,19 @@ if [[ "$(get COPY_DRAFTS on)" == off ]]; then
   [[ $serve != serve-dsv4 ]] || { echo "COPY_DRAFTS applies to GLM, MiMo and Qwen checkpoints" >&2; exit 2; }
   family_args+=(--no-copy-drafts)
 fi
+# DECODE_SHARE: the share of the time running requests keep while prompts
+# prefill (the engine's default 0.2; 0 prefills whole prompts before the next
+# step). Keys left unset pass nothing (images older than the options run).
+[[ -z "$(get DECODE_SHARE)" ]] || family_args+=(--decode-share "$(get DECODE_SHARE)")
+# GLM, GLM Flash, MiMo, Qwen: L2_PREFETCH (off, auto = 3/4 of the L2, or MiB)
+# pulls the next layer's weights into L2 during each one-lane decode step's
+# Spark exchange; FP8_SCALES (amax, pow2, best) is the scale rule of the FP8
+# copies made from BF16 weights at load; DRAFT_FP8=off drafts in BF16.
+if [[ $serve != serve-dsv4 ]]; then
+  [[ -z "$(get L2_PREFETCH)" ]] || family_args+=(--l2-prefetch "$(get L2_PREFETCH)")
+  [[ -z "$(get FP8_SCALES)" ]] || family_args+=(--fp8-scales "$(get FP8_SCALES)")
+  if [[ ${#draft_args[@]} -gt 0 && "$(get DRAFT_FP8 on)" == off ]]; then family_args+=(--draft-fp8 false); fi
+fi
 # SERVED_MODEL_ID: the public model id (default: the checkpoint's Hugging Face id).
 served_args=()
 served="$(get SERVED_MODEL_ID)"
