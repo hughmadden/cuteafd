@@ -31,7 +31,8 @@ use cuteafd_ffi::dsv4::{Dsv4Programs, Dsv4Scalar, VocabularyHead, VOCABULARY_HEA
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::fp8_experts::Fp8ExpertTensors;
 use cuteafd_loader::glm_next::{GlmNextAttention, GlmNextConfig};
-use cuteafd_transport::v41_expert::{V41Tp4Roce, V41Tp4RoceWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
+use crate::spark_intake::SparkLink;
+use cuteafd_transport::v41_expert::{V41Tp4RoceWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
 use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
 };
@@ -141,7 +142,7 @@ pub(crate) enum Experts<'a> {
     LocalExl3(LocalExl3<'a>),
     /// Spark ranks serving the routed experts over RoCE (one BF16 partial per
     /// rank); one transport per prefill lane (decode uses the first).
-    Spark { transports: RefCell<Vec<V41Tp4Roce>>, runtime: tokio::runtime::Runtime },
+    Spark { transports: RefCell<Vec<SparkLink<'a>>>, runtime: tokio::runtime::Runtime },
     /// Profiling only: the router, the wire rows and the shared expert run,
     /// the routed experts contribute nothing (the coordinator's own work).
     Skip,
@@ -294,9 +295,7 @@ struct Workspace<'a> {
     route_ids: Dev<'a>,
     route_weights: Dev<'a>,
     wire: Dev<'a>,
-    planes: Vec<Dev<'a>>,
     router_host: RefCell<HostAllocation<'a>>,
-    planes_host: RefCell<HostAllocation<'a>>,
     head: VocabularyHead<'a>,
     _head_workspace: Dev<'a>,
 }
@@ -349,6 +348,9 @@ pub(crate) struct GlmfEngine<'a> {
     use_graphs: bool,
     /// Spark prefill runs in lanes (CUTEAFD_GLMF_PREFILL_LANES, default on).
     lanes: bool,
+    /// CUTEAFD_GLMF_PREFILL_LANES=subset: lanes even with a `--layers`
+    /// subset (timing runs against loopback ranks that hold only those layers).
+    subset_lanes: bool,
     /// Recorded after a layer's routes and wire rows reach the host staging.
     routes_ready: *mut c_void,
     ops: Option<RefCell<OpTimes>>,
@@ -437,6 +439,7 @@ impl<'a> GlmfEngine<'a> {
             experts: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(std::collections::HashMap::new()),
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
             lanes: std::env::var("CUTEAFD_GLMF_PREFILL_LANES").map_or(true, |v| v != "1"),
+            subset_lanes: std::env::var("CUTEAFD_GLMF_PREFILL_LANES").is_ok_and(|v| v == "subset"),
             full_prefill_logits: false, routes_ready: library.cuda_event_create_ordering()?,
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
             fp8_prefill: Fp8Prefill::default() })
@@ -675,10 +678,8 @@ impl<'a> GlmfEngine<'a> {
             route_ids: self.alloc(t * topk * 4)?,
             route_weights: self.alloc(t * topk * 4)?,
             wire: self.alloc(t * (h + h / 32))?,
-            planes: if spark { (0..MAX_RANKS).map(|_| self.alloc(t * h * 2)).collect::<Result<_>>()? } else { Vec::new() },
             router_host: RefCell::new(HostAllocation::new(self.library,
                 if spark { t * (topk * 8 + h + h / 32) } else { 256 })?),
-            planes_host: RefCell::new(HostAllocation::new(self.library, if spark { MAX_RANKS * t * h * 2 } else { 256 })?),
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, t as u32,
                 self.cfg.vocab_size as u32)? },
@@ -772,7 +773,7 @@ impl<'a> GlmfEngine<'a> {
     /// Whether prefill runs as Spark lanes (a transport per lane, every layer resident).
     /// CUTEAFD_GLMF_PREFILL_LANES=1 keeps the serial one-workspace prefill (A/B runs).
     fn pipelined(&self) -> bool {
-        self.lanes && self.weights.layers.len() == self.cfg.layers && matches!(&self.experts,
+        self.lanes && (self.weights.layers.len() == self.cfg.layers || self.subset_lanes) && matches!(&self.experts,
             Some(Experts::Spark { transports, .. }) if transports.borrow().len() >= PREFILL_LANES)
     }
 
@@ -1282,7 +1283,7 @@ impl<'a> GlmfEngine<'a> {
     /// Routes and wire rows down and one request to every Spark rank; the
     /// shared expert (`shared`) queues behind the copies and runs while the
     /// ranks compute. Complete with [`Self::spark_land`].
-    fn spark_dispatch(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, transport: &mut V41Tp4Roce,
+    fn spark_dispatch(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, transport: &mut SparkLink<'_>,
         shared: impl FnOnce() -> Result<()>) -> Result<V41Tp4RoceWave> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
@@ -1325,47 +1326,21 @@ impl<'a> GlmfEngine<'a> {
             }).collect(),
             routes, wire)?;
         request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-        transport.dispatch_wave(&request)
+        transport.dispatch(&request)
     }
 
-    /// Receives `wave`'s BF16 rank partials into this workspace's pinned
-    /// staging, uploads them and sums them with the shared expert into `delta`.
-    async fn spark_land(&self, w: &Workspace<'_>, t: usize, transport: &mut V41Tp4Roce, wave: V41Tp4RoceWave)
+    /// Receives `wave`'s BF16 rank partials into its transport's intake planes
+    /// and sums them with the shared expert into `delta`.
+    async fn spark_land(&self, w: &Workspace<'_>, t: usize, transport: &mut SparkLink<'_>, wave: V41Tp4RoceWave)
         -> Result<()> {
-        let h = self.cfg.hidden;
         let ranks = transport.world_size();
         ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
-        let (row_bytes, plane_bytes) = (h * 2, t * h * 2);
-        let mut staging = w.planes_host.borrow_mut();
-        let bytes = staging.bytes_mut();
         let timer = std::time::Instant::now();
-        transport.receive_wave(wave, |rank, first, payload| {
-            let offset = rank * plane_bytes + first as usize * row_bytes;
-            ensure!(first as usize * row_bytes + payload.len() <= plane_bytes, "partial rows exceed the step");
-            bytes[offset..offset + payload.len()].copy_from_slice(payload);
-            Ok(())
-        }).await?;
+        transport.receive(wave, t, self.stream).await?;
         self.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
-        let mut pointers = [std::ptr::null::<u16>(); MAX_RANKS];
-        for rank in 0..ranks {
-            let source = cuteafd_ffi::CuteafdHostBuffer {
-                // SAFETY: rank planes are disjoint slices of the staging buffer.
-                ptr: unsafe { staging.buffer.ptr.cast::<u8>().add(rank * plane_bytes) }.cast(),
-                bytes: plane_bytes,
-                ..staging.buffer
-            };
-            // SAFETY: pinned source and device plane both hold `plane_bytes`.
-            unsafe { self.library.copy_host_buffer_h2d_async(w.planes[rank].buffer, source, plane_bytes, self.stream)? };
-            pointers[rank] = w.planes[rank].buffer.ptr.cast();
-        }
-        // SAFETY: planes, the shared-expert plane and `delta` are live [t, h] BF16
-        // buffers ordered after the uploads. No host sync: this workspace's next
-        // exchange rewrites the pinned staging only after its own routes sync,
-        // which follows these uploads in stream order.
-        unsafe {
-            self.library.v41_compact_reducer()?.reduce_planes(pointers, ranks as u32, w.shared.buffer.ptr.cast(),
-                w.delta.buffer.ptr.cast(), t as u32, self.stream)
-        }
+        // SAFETY: the shared-expert plane and `delta` are live [t, h] BF16
+        // buffers; the planes are ordered after the wave by `receive`.
+        unsafe { transport.reduce(w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream) }
     }
 
     /// Pipelined Spark prefill of consecutive-row lanes of one sequence (each

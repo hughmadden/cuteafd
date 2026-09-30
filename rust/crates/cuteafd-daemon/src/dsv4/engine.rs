@@ -14,7 +14,8 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::dsv4::{Dsv4Program, Dsv4Programs, Dsv4Scalar};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::deepseek_v4::DeepseekV4Config;
-use cuteafd_transport::v41_expert::{V41Tp4Roce, V41Tp4RoceWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
+use crate::spark_intake::SparkLink;
+use cuteafd_transport::v41_expert::{V41Tp4RoceWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
 use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype,
     ExpertV2SourceKind,
@@ -41,8 +42,6 @@ pub(crate) struct Engine<'a> {
     pub stream: *mut c_void,
     pub sms: u32,
     pub shape: PoolShape,
-    /// Spark ranks per exchange; one reduction plane each.
-    pub spark_ranks: usize,
     pools: Vec<LayerCache<'a>>,
     rope_window: Dev<'a>,
     rope_compressed: Dev<'a>,
@@ -136,8 +135,6 @@ pub(crate) struct EngineParts<'a> {
     pub stream: *mut c_void,
     pub sms: u32,
     pub shape: PoolShape,
-    /// Spark ranks whose partial rows land in reduction planes (2, 3, 4 or 6).
-    pub spark_ranks: usize,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -189,7 +186,6 @@ struct Workspace<'a> {
     route_ids: Dev<'a>,
     route_weights: Dev<'a>,
     wire: Dev<'a>,
-    planes: Vec<Dev<'a>>,
     scratch: Dev<'a>,
     dummy: Dev<'a>,
     vocab_logits: Dev<'a>,
@@ -202,7 +198,6 @@ struct Workspace<'a> {
     markov: Dev<'a>,
     /// Pinned staging: routes + wire rows down, rank partials up.
     router_host: HostAllocation<'a>,
-    planes_host: RefCell<HostAllocation<'a>>,
     // Drops before its workspace below.
     head: cuteafd_ffi::dsv4::VocabularyHead<'a>,
     _head_workspace: Dev<'a>,
@@ -322,7 +317,6 @@ impl<'a> Engine<'a> {
             stream: parts.stream,
             sms: parts.sms,
             shape: parts.shape,
-            spark_ranks: parts.spark_ranks,
             prefill_workspace: RefCell::new(None),
             decode_workspace: RefCell::new(None),
             profile: RefCell::new(Profile::default()),
@@ -368,7 +362,6 @@ impl<'a> Engine<'a> {
             route_ids: self.alloc(t * topk * 4)?,
             route_weights: self.alloc(t * topk * 4)?,
             wire: self.alloc(t * (h + h / 32))?,
-            planes: (0..self.spark_ranks).map(|_| self.alloc(t * h * 2)).collect::<Result<_>>()?,
             scratch: self.alloc(self.scratch_bytes()?)?,
             dummy: self.zeroed(4096)?,
             vocab_logits: self.alloc(t * self.cfg.vocab_size * 4)?,
@@ -378,7 +371,6 @@ impl<'a> Engine<'a> {
             drafts: self.alloc(t * 4)?,
             markov: self.alloc(self.library.dsv4_markov_workspace(t)?)?,
             router_host: HostAllocation::new(self.library, t * (topk * 8 + h + h / 32))?,
-            planes_host: RefCell::new(HostAllocation::new(self.library, self.spark_ranks * t * h * 2)?),
             // SAFETY: the workspace buffer lives in the same struct and drops
             // after the head (field order).
             head: unsafe { self.library.vocabulary_head(head_workspace.buffer.ptr, h as u32, t as u32)? },
@@ -460,7 +452,7 @@ impl<'a> Engine<'a> {
         placement: &mut Placement,
         tokens: &[u32],
         embed: &[u8],
-        transports: &mut [V41Tp4Roce],
+        transports: &mut [SparkLink<'_>],
         runtime: &tokio::runtime::Runtime,
         logit_rows: usize,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
@@ -492,7 +484,7 @@ impl<'a> Engine<'a> {
         &self,
         rows: &mut [(&mut Placement, u32)],
         embed: &[u8],
-        transport: &mut V41Tp4Roce,
+        transport: &mut SparkLink<'_>,
         runtime: &tokio::runtime::Runtime,
     ) -> Result<Vec<f32>> {
         ensure!(!rows.is_empty() && rows.len() <= self.decode_rows, "decode batch of {} rows", rows.len());
@@ -519,7 +511,7 @@ impl<'a> Engine<'a> {
         &self,
         sequences: &mut [(&mut Placement, &[u32])],
         embed: &[u8],
-        transports: &mut [V41Tp4Roce],
+        transports: &mut [SparkLink<'_>],
         runtime: &tokio::runtime::Runtime,
     ) -> Result<Vec<f32>> {
         let tokens: Vec<u32> = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect();
@@ -544,7 +536,7 @@ impl<'a> Engine<'a> {
     fn step(
         &self,
         lanes: &[LaneStep<'_>],
-        transports: &mut [V41Tp4Roce],
+        transports: &mut [SparkLink<'_>],
         runtime: &tokio::runtime::Runtime,
         logit_rows: usize,
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
@@ -583,6 +575,9 @@ impl<'a> Engine<'a> {
         if decode {
             let (tables, lane) = (lanes[0].tables, &w.lanes[0]);
             let (t, rows) = (tables.rows, rows_of(0));
+            // Decode waves go to the first transport; its planes are baked into
+            // the replayed graphs (they never move).
+            let decode_planes = transports.first().context("no transport")?.intake.pointers();
             let mut ranks = 0usize;
             for (layer, weights) in self.weights.layers.iter().enumerate() {
                 let previous = ranks;
@@ -591,7 +586,7 @@ impl<'a> Engine<'a> {
                 // replayed as a CUDA graph keyed by everything it bakes in.
                 let segment = || -> Result<()> {
                     if previous > 0 {
-                        self.post(w, lane, previous, rows, layer - 1)?;
+                        self.post(w, lane, previous, decode_planes, rows, layer - 1)?;
                         self.tap(w, lane, layer - 1, t)?;
                     }
                     self.attention(layer, weights, tables, lane, w, rows, cap)
@@ -609,7 +604,7 @@ impl<'a> Engine<'a> {
                 ranks = self.decode_experts(layer, t, w, lane, cap, transports.first_mut().context("no transport")?, runtime)?;
             }
             if ranks > 0 {
-                self.post(w, lane, ranks, rows, self.weights.layers.len() - 1)?;
+                self.post(w, lane, ranks, decode_planes, rows, self.weights.layers.len() - 1)?;
                 self.tap(w, lane, self.weights.layers.len() - 1, t)?;
             }
         } else {
@@ -624,12 +619,14 @@ impl<'a> Engine<'a> {
             let attention = |(layer, lane): (usize, usize)| {
                 self.attention(layer, &self.weights.layers[layer], lanes[lane].tables, &w.lanes[lane], w, rows_of(lane), cap)
             };
-            let post = |(layer, lane): (usize, usize), ranks: usize| {
-                self.post(w, &w.lanes[lane], ranks, rows_of(lane), layer)?;
-                self.tap(w, &w.lanes[lane], layer, lanes[lane].tables.rows)
-            };
             let local_layers = self.local_layers();
             let pipelined = transports.len() >= lanes.len() && lanes.len() > 1;
+            let planes: Vec<[*const u16; 6]> = transports.iter().map(|t| t.intake.pointers()).collect();
+            let post = |(layer, lane): (usize, usize), ranks: usize| {
+                let slot = if pipelined { lane } else { 0 };
+                self.post(w, &w.lanes[lane], ranks, planes[slot], rows_of(lane), layer)?;
+                self.tap(w, &w.lanes[lane], layer, lanes[lane].tables.rows)
+            };
             runtime.block_on(async {
                 let mut inflight: Option<((usize, usize), V41Tp4RoceWave)> = None;
                 attention(units[0])?;
@@ -642,7 +639,7 @@ impl<'a> Engine<'a> {
                     } else {
                         let request = self.stage_request(layer, t, w, ExpertV2SourceKind::Prefill)?;
                         let slot = if pipelined { lane } else { 0 };
-                        let wave = transports[slot].dispatch_wave(&request)?;
+                        let wave = transports[slot].dispatch(&request)?;
                         // The shared expert runs on the GPU while the Sparks compute.
                         self.shared_ffn(layer, w, &w.lanes[lane], rows_of(lane), cap, &self.weights.layers[layer])?;
                         if let Some((previous, wave)) = inflight.take() {
@@ -724,7 +721,8 @@ impl<'a> Engine<'a> {
 
     /// The layer's routed partials + shared expert, reduced, then mHC post
     /// into stream a.
-    fn post(&self, w: &Workspace<'_>, lane: &Lane<'_>, ranks: usize, rows: Dsv4Scalar, layer: usize) -> Result<()> {
+    fn post(&self, w: &Workspace<'_>, lane: &Lane<'_>, ranks: usize, planes: [*const u16; 6], rows: Dsv4Scalar,
+        layer: usize) -> Result<()> {
         if ranks == LOCAL_EXPERTS {
             let output = self.local.borrow().as_ref().context("local experts")?.output.buffer.ptr;
             return self.run("mhc_post", &[
@@ -734,14 +732,12 @@ impl<'a> Engine<'a> {
         }
         let Dsv4Scalar::I32(count) = rows else { unreachable!() };
         let reducer = self.library.v41_compact_reducer()?;
-        let mut pointers = [std::ptr::null::<u16>(); 6];
-        for (slot, plane) in pointers.iter_mut().zip(&w.planes[..ranks]) {
-            *slot = plane.buffer.ptr.cast();
-        }
-        // SAFETY: planes, shared and delta are live [rows, h] BF16 buffers on
-        // this device, ordered after the plane uploads and shared FFN.
+        // SAFETY: the transport's intake planes, shared and delta are live
+        // [rows, h] BF16 buffers on this device, ordered after the wave's
+        // intake and the shared FFN. The next dispatch on that transport
+        // follows a full stream sync (`stage_request`).
         unsafe {
-            reducer.reduce_planes(pointers, ranks as u32, lane.shared.buffer.ptr.cast(),
+            reducer.reduce_planes(planes, ranks as u32, lane.shared.buffer.ptr.cast(),
                 w.delta.buffer.ptr.cast(), count as u32, self.stream)
                 .with_context(|| format!("layer {layer} expert reduction"))?;
         }
@@ -926,14 +922,16 @@ impl<'a> Engine<'a> {
     /// Connects every Spark rank and registers full-size buffers with one
     /// prefill-sized request of zero rows, so the first real request does not
     /// pay for connection setup (about 0.6 s).
-    pub fn warm_transport(&self, transport: &mut V41Tp4Roce, runtime: &tokio::runtime::Runtime) -> Result<()> {
+    pub fn warm_transport(&self, transport: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime) -> Result<()> {
         let (rows, h, experts, topk) = (self.prefill_rows, self.cfg.dim, self.cfg.n_routed_experts, self.cfg.n_activated_experts);
         let routes = (0..rows * topk).map(|i| ExpertProtocolV2RouteEntry {
             row_index: (i / topk) as u32, expert_id: (i % experts) as u32, gate_weight: 0.0,
         }).collect();
         let request = self.expert_request(self.cfg.n_layers - 1, rows, routes, vec![0; rows * (h + h / 32)],
             ExpertV2SourceKind::Prefill)?;
-        runtime.block_on(async { transport.execute(&request, |_, _, _| Ok(())).await })
+        let wave = transport.dispatch(&request)?;
+        runtime.block_on(transport.receive(wave, rows, self.stream))?;
+        self.sync()
     }
 
     fn local_layers(&self) -> usize {
@@ -1001,37 +999,14 @@ impl<'a> Engine<'a> {
         request
     }
 
-    /// Receives a unit's partial rows into the pinned staging and queues one
-    /// upload per rank plane. The reduce that reads the planes is ordered
-    /// after the uploads, and the next `stage_request` sync completes them
-    /// before the staging is rewritten.
-    async fn land(&self, transport: &mut V41Tp4Roce, wave: V41Tp4RoceWave, t: usize, w: &Workspace<'_>) -> Result<usize> {
+    /// Receives a unit's partial rows into its transport's intake planes; the
+    /// reduce that reads them is ordered after the intake on the stream.
+    async fn land(&self, transport: &mut SparkLink<'_>, wave: V41Tp4RoceWave, t: usize, _w: &Workspace<'_>)
+        -> Result<usize> {
         let timer = Instant::now();
-        let row_bytes = self.cfg.dim * 2;
-        let ranks = transport.world_size();
-        ensure!(ranks <= w.planes.len(), "{ranks} Spark ranks exceed the reduction planes");
-        let plane_bytes = t * row_bytes;
-        let mut staging = w.planes_host.borrow_mut();
-        ensure!(ranks * plane_bytes <= staging.buffer.bytes, "{ranks} rank planes exceed the pinned staging");
-        let bytes = staging.bytes_mut();
-        transport.receive_wave(wave, |rank, first, payload| {
-            let offset = rank * plane_bytes + first as usize * row_bytes;
-            ensure!(first as usize * row_bytes + payload.len() <= plane_bytes, "partial rows exceed the step");
-            bytes[offset..offset + payload.len()].copy_from_slice(payload);
-            Ok(())
-        }).await?;
-        for rank in 0..ranks {
-            let source = cuteafd_ffi::CuteafdHostBuffer {
-                // SAFETY: rank planes are disjoint slices of the staging buffer.
-                ptr: unsafe { staging.buffer.ptr.cast::<u8>().add(rank * plane_bytes) }.cast(),
-                bytes: plane_bytes,
-                ..staging.buffer
-            };
-            // SAFETY: pinned source and device plane both hold `plane_bytes`.
-            unsafe { self.library.copy_host_buffer_h2d_async(w.planes[rank].buffer, source, plane_bytes, self.stream)? };
-        }
+        transport.receive(wave, t, self.stream).await?;
         self.profile.borrow_mut().add(Phase::Experts, timer);
-        Ok(ranks)
+        Ok(transport.world_size())
     }
 
     /// A decode unit's experts; returns the rank count its post needs
@@ -1044,7 +1019,7 @@ impl<'a> Engine<'a> {
         w: &Workspace<'_>,
         lane: &Lane<'_>,
         cap: usize,
-        transport: &mut V41Tp4Roce,
+        transport: &mut SparkLink<'_>,
         runtime: &tokio::runtime::Runtime,
     ) -> Result<usize> {
         if layer < self.local_layers() {
@@ -1053,7 +1028,7 @@ impl<'a> Engine<'a> {
         }
         // Decode rows poll without the prefill spin quantum.
         let request = self.stage_request(layer, t, w, ExpertV2SourceKind::Decode)?;
-        let wave = transport.dispatch_wave(&request)?;
+        let wave = transport.dispatch(&request)?;
         // The shared expert runs on the GPU while the Sparks compute.
         self.shared_ffn(layer, w, lane, Dsv4Scalar::I32(t as i32), cap, &self.weights.layers[layer])?;
         runtime.block_on(self.land(transport, wave, t, w))

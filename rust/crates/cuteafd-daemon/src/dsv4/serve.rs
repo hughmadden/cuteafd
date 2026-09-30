@@ -182,7 +182,7 @@ fn speculative_step(
     hidden: usize,
     vocab: usize,
     eos: u32,
-    transports: &mut [cuteafd_transport::v41_expert::V41Tp4Roce],
+    transports: &mut [crate::spark_intake::SparkLink<'_>],
     runtime: &tokio::runtime::Runtime,
 ) -> Result<Vec<bool>> {
     let noise = engine.cfg.dspark_noise_token_id as u32;
@@ -237,7 +237,7 @@ fn schedule(
     tokenizer: &cuteafd_loader::LoadedTokenizer,
     eos: u32,
     receive: &mut mpsc::Receiver<NativeRequest>,
-    transports: &mut [cuteafd_transport::v41_expert::V41Tp4Roce],
+    transports: &mut [crate::spark_intake::SparkLink<'_>],
     runtime: &tokio::runtime::Runtime,
     stats: &Mutex<serde_json::Value>,
     speculate_max: usize,

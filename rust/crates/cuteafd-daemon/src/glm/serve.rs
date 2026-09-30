@@ -17,7 +17,7 @@ use cuteafd_api::native_v41::{
     ConsoleHub, InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits, NativeRequest,
     PromptUsage,
 };
-use cuteafd_transport::v41_expert::V41Tp4Roce;
+use crate::spark_intake::SparkLink;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -101,7 +101,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
     };
     let mut ready = Some(ready);
     let result = opened.with_engine(&args, |engine, transport, runtime| {
-        anyhow::ensure!(transport.is_some() || engine.skip_routed, "serve-glm needs --peers for the routed experts");
+        anyhow::ensure!(transport.is_some() || engine.skip_routed(), "serve-glm needs --peers for the routed experts");
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(()));
         }
@@ -257,7 +257,7 @@ fn copy_drafts(history: &[u32], limit: usize) -> Vec<u32> {
 }
 
 fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receiver<NativeRequest>,
-    mut transport: Option<&mut V41Tp4Roce>, runtime: &tokio::runtime::Runtime, stats: &Mutex<serde_json::Value>,
+    mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, stats: &Mutex<serde_json::Value>,
     max_sequences: usize, policy: Policy) -> Result<()> {
     let mut allocator = PageAllocator::new(engine.pages);
     let mut grammars = crate::v41_native_serve::constraints::Compiler::with_vocab(

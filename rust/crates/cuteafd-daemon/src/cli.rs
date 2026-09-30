@@ -89,12 +89,27 @@ pub(crate) struct ExpertProbeArgs {
     /// BF16 rank partials in FP32, as the coordinator does.
     #[arg(long, default_value_t = 1, requires = "local")]
     pub(crate) local_tp: usize,
+    /// Compare and time coordinator intakes of the ranks' partials, e.g.
+    /// `host,pinned,gpu` (bit-identical planes and sums; `--repeat` waves each).
+    #[arg(long, requires = "native_lib")]
+    pub(crate) intake: Option<String>,
+    /// With `--intake`: run each mode's transport on its own lane thread (as
+    /// GLM 5.3 prefill does) instead of inline.
+    #[arg(long, requires = "intake")]
+    pub(crate) intake_lane: bool,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct FabricArgs {
     #[arg(long)]
     pub(crate) json: bool,
+    /// Native library for the GPU landing probe (default `$CUTEAFD_NATIVE_LIB`;
+    /// without one the probe is skipped).
+    #[arg(long)]
+    pub(crate) native_lib: Option<PathBuf>,
+    /// CUDA device the probe lands in.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) device: i32,
 }
 
 #[derive(Debug, Args)]

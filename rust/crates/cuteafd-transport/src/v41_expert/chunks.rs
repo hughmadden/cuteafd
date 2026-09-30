@@ -273,6 +273,27 @@ impl V41Tp4ChunkReceiver {
         )
     }
 
+    /// A rank's whole plane, received straight into its device landing range
+    /// (the verbs session validated the header's extent and request identity).
+    pub(crate) fn push_landed(&mut self, chunk: &crate::VerbsHostProtocolV2ResponseChunk) -> Result<usize> {
+        ensure!(chunk.landed && chunk.row_indices.is_none(), "not a GPU-landed whole-plane response");
+        ensure!(chunk.wire_bytes <= self.max_frame_bytes, "native response exceeds receive frame budget");
+        let h = &chunk.header;
+        let rank = self.identity.response_rank(h)?;
+        ensure!(!self.finished[rank] && self.received[rank] == 0, "native TP rank already completed");
+        let allowed = EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+        ensure!(h.flags & !allowed == 0, "unsupported GPU-landed response flags");
+        ensure!(h.row_count == self.identity.rows, "GPU-landed response must contain the entire plane");
+        ensure!(
+            h.output_payload_bytes
+                == u64::from(h.row_count) * u64::from(cuteafd_core::expert_geometry().row_bytes()),
+            "native payload size mismatch"
+        );
+        self.received[rank] = h.row_count;
+        self.finished[rank] = true;
+        Ok(rank)
+    }
+
     /// Validate before invoking the sink, then commit progress only if it succeeds.
     /// The sink receives (rank, first token row, contiguous BF16 rank-partial bytes).
     /// It must copy the bytes or keep their storage alive until asynchronous writes

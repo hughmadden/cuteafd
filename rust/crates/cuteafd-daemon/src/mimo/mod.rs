@@ -261,9 +261,9 @@ impl Opened {
         let executors: Vec<u64> = (0..peers.len())
             .map(|rank| cuteafd_transport::v41_expert::v41_spark_executor_id(peers.len(), rank))
             .collect::<Result<_>>()?;
-        let mut transport = cuteafd_transport::v41_expert::V41Tp4Roce::new_ranks(&peers, &executors, u32::try_from(args.prefill_rows)?,
-            cuteafd_transport::TcpTransportConfig { timing: false, timeout: std::time::Duration::from_secs(120),
-                max_frame_bytes: 64 << 20 })?;
+        let mut transport = crate::spark_intake::SparkLink::new(&self.library, &peers, &executors,
+            u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
+                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2)?;
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         // Connect every rank and register full-size buffers now: the first
         // request otherwise pays seconds of connection setup.
@@ -293,8 +293,17 @@ impl Opened {
         if args.expert_input.bf16(true) && !args.expert_input.bf16(false) {
             warmups.push(warm(1, true)?);
         }
+        let warm_stream = self.library.cuda_stream_create()?;
         for request in &warmups {
-            runtime.block_on(async { transport.execute(request, |_, _, _| Ok(())).await })?;
+            runtime.block_on(async {
+                let wave = transport.dispatch(request)?;
+                transport.receive(wave, request.header.row_count as usize, warm_stream).await
+            })?;
+        }
+        // SAFETY: the stream was created above; its waits drain before it goes.
+        unsafe {
+            self.library.cuda_stream_synchronize(warm_stream)?;
+            self.library.cuda_stream_destroy(warm_stream)?;
         }
         tracing::info!(ranks = peers.len(), elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
         Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport), runtime }))
