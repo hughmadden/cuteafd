@@ -101,7 +101,7 @@ def test_ordinary_exporter_routes_new_roles_only_through_fp8_slices() -> None:
 
 def test_cmake_wiring_is_opt_in_and_precompiles_capacities() -> None:
     cmake = CMAKE.read_text(encoding="utf-8")
-    assert 'set(CUTEAFD_V41_SPARK_TP_ROLES "" CACHE STRING' in cmake
+    assert 'set(CUTEAFD_SPARK_TP_ROLES "" CACHE STRING' in cmake
     assert "include(cmake/families/deepseek_v41/v41_spark_tp_experts.cmake)" in cmake
     assert "CUTEAFD_V41_SPARK_TP_EXPERT_TARGETS" in cmake
 
@@ -113,7 +113,7 @@ def test_cmake_wiring_is_opt_in_and_precompiles_capacities() -> None:
     assert "v41_spark_tp2_experts.cc" in tp
     assert "v41_spark_tp3_experts.cc" in tp
     # The extra artifacts are opt-in: the include only runs for a non-empty list.
-    assert 'if(NOT CUTEAFD_V41_SPARK_TP_ROLES STREQUAL "")' in cmake
+    assert 'if(NOT CUTEAFD_SPARK_TP_ROLES STREQUAL "")' in cmake
 
 
 def test_native_role_ids_and_reducer_abi_are_declared() -> None:

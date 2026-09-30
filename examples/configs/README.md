@@ -96,7 +96,7 @@ paths are unchanged.
 Every example names the **same promoted release pair** that `cuteafd.config`
 names. The Spark image is universal: it carries the default TP4 shard plus
 the `tp2`, `tp3` and `tp6` expert TP roles and advertises them as
-`io.cuteafd.v41.spark_tp_roles=tp2;tp3;tp6` (see
+`io.cuteafd.spark_tp_roles=tp2;tp3;tp6` (see
 [docs/release-v10-notes.md](../../docs/release-v10-notes.md)). One published pair
 therefore serves every approved topology, and `run.sh` is what selects the mode:
 it derives the needed role from `SPARK_TP`, requires that role in the image label

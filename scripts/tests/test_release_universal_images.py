@@ -241,7 +241,8 @@ def test_publisher_reads_spark_labels_over_ssh():
     assert "release_ssh" in read and "docker image inspect" in read
     assert '"$spark_host"' in read
     assert "BatchMode" not in read, "options belong to scripts/lib/release-common.sh"
-    assert 'io.cuteafd.v41.spark_tp_roles' in read
+    assert 'io.cuteafd.spark_tp_roles' in read
+    assert 'io.cuteafd.v41.spark_tp_roles' in read, "images built before the label rename still read"
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +285,7 @@ def test_role_build_arg_keeps_its_empty_default():
     roles the coordinator build cannot contain, and would silently override an
     operator's explicit subset request.
     """
-    assert "ARG CUTEAFD_V41_SPARK_TP_ROLES=\n" in DOCKERFILE.read_text(encoding="utf-8")
+    assert "ARG CUTEAFD_SPARK_TP_ROLES=\n" in DOCKERFILE.read_text(encoding="utf-8")
 
 
 def _corroboration_line() -> str:
@@ -369,6 +370,6 @@ def test_release_builds_label_only_the_expert_image():
     text = BUILD.read_text(encoding="utf-8")
     # One resolved set for the expert image, one explicit empty for the
     # coordinator, and nothing else that can drift.
-    assert text.count('--build-arg CUTEAFD_V41_SPARK_TP_ROLES="$spark_tp_roles"') == 1
-    assert text.count('--build-arg CUTEAFD_V41_SPARK_TP_ROLES= ' + chr(92)) == 1
-    assert text.count("CUTEAFD_V41_SPARK_TP_ROLES=") == 2
+    assert text.count('--build-arg CUTEAFD_SPARK_TP_ROLES="$spark_tp_roles"') == 1
+    assert text.count('--build-arg CUTEAFD_SPARK_TP_ROLES= ' + chr(92)) == 1
+    assert text.count("CUTEAFD_SPARK_TP_ROLES=") == 2

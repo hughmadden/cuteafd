@@ -18,14 +18,14 @@ if(NOT CUTEAFD_ENABLE_V41_EXPERT_AOT OR NOT CUTEAFD_V41_EXPERT_ROLE STREQUAL "sp
 endif()
 
 set(CUTEAFD_V41_SPARK_TP_SELECTED)
-foreach(tp IN LISTS CUTEAFD_V41_SPARK_TP_ROLES)
+foreach(tp IN LISTS CUTEAFD_SPARK_TP_ROLES)
   if(tp STREQUAL "tp2" OR tp STREQUAL "tp3" OR tp STREQUAL "tp6")
     if(tp IN_LIST CUTEAFD_V41_SPARK_TP_SELECTED)
-      message(FATAL_ERROR "CUTEAFD_V41_SPARK_TP_ROLES lists ${tp} more than once")
+      message(FATAL_ERROR "CUTEAFD_SPARK_TP_ROLES lists ${tp} more than once")
     endif()
     list(APPEND CUTEAFD_V41_SPARK_TP_SELECTED "${tp}")
   else()
-    message(FATAL_ERROR "CUTEAFD_V41_SPARK_TP_ROLES accepts only tp2, tp3 and tp6, got ${tp}")
+    message(FATAL_ERROR "CUTEAFD_SPARK_TP_ROLES accepts only tp2, tp3 and tp6, got ${tp}")
   endif()
 endforeach()
 

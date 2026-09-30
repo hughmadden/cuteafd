@@ -53,14 +53,14 @@ ARG CUTEAFD_RELEASE_VERSION=unknown
 # `tp2`/`tp3`/`tp6`). ./build.sh resolves them, universal by default, and passes an
 # empty value for the coordinator: the verification below rejects any role label the
 # built manifest and shipped library do not corroborate.
-ARG CUTEAFD_V41_SPARK_TP_ROLES=
+ARG CUTEAFD_SPARK_TP_ROLES=
 
 ENV CUTEAFD_ROLE=${CUTEAFD_ROLE}
 ENV CUTEAFD_CUDA_ARCH=${CUDA_ARCH}
 ENV CUTEAFD_ENGINE_COMMIT=${CUTEAFD_ENGINE_COMMIT}
 ENV CUTEAFD_SPARKINFER_COMMIT=${CUTEAFD_SPARKINFER_COMMIT}
 ENV CUTEAFD_RELEASE_VERSION=${CUTEAFD_RELEASE_VERSION}
-ENV CUTEAFD_V41_SPARK_TP_ROLES=${CUTEAFD_V41_SPARK_TP_ROLES}
+ENV CUTEAFD_SPARK_TP_ROLES=${CUTEAFD_SPARK_TP_ROLES}
 
 LABEL org.opencontainers.image.title="CUTEAFD inference"
 LABEL org.opencontainers.image.source="https://github.com/tpurtell/cuteafd"
@@ -71,7 +71,9 @@ LABEL org.opencontainers.image.version=${CUTEAFD_RELEASE_VERSION}
 LABEL io.cuteafd.role=${CUTEAFD_ROLE}
 LABEL io.cuteafd.cuda_arch=${CUDA_ARCH}
 LABEL io.cuteafd.sparkinfer.revision=${CUTEAFD_SPARKINFER_COMMIT}
-LABEL io.cuteafd.v41.spark_tp_roles=${CUTEAFD_V41_SPARK_TP_ROLES}
+LABEL io.cuteafd.spark_tp_roles=${CUTEAFD_SPARK_TP_ROLES}
+# The pre-rename label, set for one release so older launchers still read it.
+LABEL io.cuteafd.v41.spark_tp_roles=${CUTEAFD_SPARK_TP_ROLES}
 
 COPY scripts/build/verify-sparkinfer-source.py /opt/cuteafd/scripts/build/verify-sparkinfer-source.py
 COPY scripts/build/sparkinfer-release-provenance.py /opt/cuteafd/scripts/build/sparkinfer-release-provenance.py
@@ -131,7 +133,7 @@ RUN for exl3_family in /opt/cuteafd/lib/exl3/exl3-*/; do \
       [ -d "$fp8_family" ] || continue; \
       python3 /opt/cuteafd/python/tools/aot/package_fp8_moe_aot.py verify --package "$fp8_family"; \
     done && \
-    jq -e --arg role "$CUTEAFD_ROLE" --arg claimed "$CUTEAFD_V41_SPARK_TP_ROLES" --arg lib "$(sha256sum /opt/cuteafd/lib/libcuteafd_native.so | cut -d" " -f1)" '($claimed | split(";") | map(select(. != "")) | sort) as $want | . as $doc | $doc.role == $role and $doc.native_library_sha256 == $lib and (($doc.spark_tp_roles // []) | sort) == $want and (($doc.manifests // {}) | keys | sort) == $want' /opt/cuteafd/share/V41_EXPERT_TP_AOT.json && \
+    jq -e --arg role "$CUTEAFD_ROLE" --arg claimed "$CUTEAFD_SPARK_TP_ROLES" --arg lib "$(sha256sum /opt/cuteafd/lib/libcuteafd_native.so | cut -d" " -f1)" '($claimed | split(";") | map(select(. != "")) | sort) as $want | . as $doc | $doc.role == $role and $doc.native_library_sha256 == $lib and (($doc.spark_tp_roles // []) | sort) == $want and (($doc.manifests // {}) | keys | sort) == $want' /opt/cuteafd/share/V41_EXPERT_TP_AOT.json && \
     cmp -s \
       /opt/cuteafd/third_party/sparkinfer/LICENSE \
       /opt/cuteafd/share/SPARKINFER_LICENSE && \

@@ -371,7 +371,8 @@ done
 
 # An explicit TP2/TP3/TP6 topology needs the matching SM121 expert role baked
 # into the Spark image. The published universal release pair advertises every
-# extra role at once (label `io.cuteafd.v41.spark_tp_roles=tp2;tp3;tp6`), so one
+# extra role at once (label `io.cuteafd.spark_tp_roles=tp2;tp3;tp6`, read with the pre-rename
+# `io.cuteafd.v41.spark_tp_roles` as a fallback), so one
 # published image pair serves all approved topologies and this launch selects the
 # role it needs. A prebuilt legacy image carries no role label and keeps working
 # for the default TP4EP1 path; an explicit topology is refused here, before any
@@ -381,7 +382,7 @@ if [[ -n "$spark_tp_roles_required" ]]; then
   for host in "${hosts[@]}"; do
     advertised_roles="$(
       release_ssh -o ConnectTimeout=10 "$host" \
-        "docker image inspect -f '{{index .Config.Labels \"io.cuteafd.v41.spark_tp_roles\"}}' '$SPARK_EXPERT_DOCKER_INFERENCE'"
+        "docker image inspect -f '{{or (index .Config.Labels \"io.cuteafd.spark_tp_roles\") (index .Config.Labels \"io.cuteafd.v41.spark_tp_roles\")}}' '$SPARK_EXPERT_DOCKER_INFERENCE'"
     )" || release_die "$host cannot report the role label of $SPARK_EXPERT_DOCKER_INFERENCE; is the Spark image present on that host?"
     [[ ";$advertised_roles;" == *";$spark_tp_roles_required;"* ]] ||
       release_die "$host Spark image does not advertise required expert role $spark_tp_roles_required (advertised: ${advertised_roles:-<none>}); refusing an unbuilt TP$spark_tp topology: use the published universal release pair, or rebuild with CUTEAFD_RELEASE_SPARK_TP_ROLES=$spark_tp_roles_required"

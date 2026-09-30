@@ -143,8 +143,8 @@ else
     coordinator.role "expected coordinator got $(coord_field label.io.cuteafd.role)"
   record "$([[ "$(coord_field label.io.cuteafd.cuda_arch)" == 120 ]] && echo PASS || echo FAIL)" \
     coordinator.cuda_arch "expected 120 got $(coord_field label.io.cuteafd.cuda_arch)"
-  record "$([[ -z "$(coord_field label.io.cuteafd.v41.spark_tp_roles)" ]] && echo PASS || echo FAIL)" \
-    coordinator.spark_tp_roles "expected empty got $(coord_field label.io.cuteafd.v41.spark_tp_roles)"
+  record "$([[ -z "$(coord_field label.io.cuteafd.spark_tp_roles)" ]] && echo PASS || echo FAIL)" \
+    coordinator.spark_tp_roles "expected empty got $(coord_field label.io.cuteafd.spark_tp_roles)"
 fi
 
 ########################################################################
@@ -203,7 +203,7 @@ if [[ -n "$anchor_host" ]]; then
   spark_version_label="$(fleet_field "$anchor_host" label.org.opencontainers.image.version)"
   spark_role_label="$(fleet_field "$anchor_host" label.io.cuteafd.role)"
   spark_cuda_label="$(fleet_field "$anchor_host" label.io.cuteafd.cuda_arch)"
-  spark_roles="$(fleet_field "$anchor_host" label.io.cuteafd.v41.spark_tp_roles)"
+  spark_roles="$(fleet_field "$anchor_host" label.io.cuteafd.spark_tp_roles)"
   spark_manifest_label="$(fleet_field "$anchor_host" label.io.cuteafd.source-manifest.sha256)"
   # The coordinator block always records a status line, so its revision is set
   # even when the local image is missing.

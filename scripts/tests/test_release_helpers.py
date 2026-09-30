@@ -109,7 +109,7 @@ def host_record(host: str, *, image_id: str = SPARK_ID, status: str = "present")
             f"label.io.cuteafd.sparkinfer.revision={SPARKINFER_REVISION}",
             "label.io.cuteafd.cuda_arch=121",
             "label.io.cuteafd.role=expert",
-            "label.io.cuteafd.v41.spark_tp_roles=tp2;tp3;tp6",
+            "label.io.cuteafd.spark_tp_roles=tp2;tp3;tp6",
             "label.io.cuteafd.source-manifest.sha256=",
         ]
     return "\n".join(lines) + "\n"

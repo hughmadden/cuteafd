@@ -177,7 +177,7 @@ def test_cmake_wiring_is_opt_in_and_precompiles_capacities() -> None:
     # The new role must not change the existing TP2/TP3 selector contract.
     assert 'CUTEAFD_V41_SPARK_TP_EXPERT_ROWS_ARG "1,16,80,256,1024,4096"' in tp
     assert "--atomic-min-capacity 256" in tp
-    assert 'if(NOT CUTEAFD_V41_SPARK_TP_ROLES STREQUAL "")' in CMAKE.read_text(
+    assert 'if(NOT CUTEAFD_SPARK_TP_ROLES STREQUAL "")' in CMAKE.read_text(
         encoding="utf-8"
     )
 

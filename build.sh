@@ -475,7 +475,7 @@ docker build \
   --build-arg CUTEAFD_ENGINE_COMMIT="$engine_commit" \
   --build-arg CUTEAFD_SPARKINFER_COMMIT="$sparkinfer_commit" \
   --build-arg CUTEAFD_RELEASE_VERSION="$release_version" \
-  --build-arg CUTEAFD_V41_SPARK_TP_ROLES= \
+  --build-arg CUTEAFD_SPARK_TP_ROLES= \
   -f "$repo_root/docker/Dockerfile.release" \
   -t "$COORDINATOR_DOCKER_INFERENCE" \
   "$repo_root"
@@ -606,7 +606,7 @@ docker build \
   --build-arg CUTEAFD_ENGINE_COMMIT="$engine_commit" \
   --build-arg CUTEAFD_SPARKINFER_COMMIT="$sparkinfer_commit" \
   --build-arg CUTEAFD_RELEASE_VERSION="$release_version" \
-  --build-arg CUTEAFD_V41_SPARK_TP_ROLES="$spark_tp_roles" \
+  --build-arg CUTEAFD_SPARK_TP_ROLES="$spark_tp_roles" \
   -f docker/Dockerfile.release \
   -t "$inference_image" .
 REMOTE
@@ -850,14 +850,14 @@ for host in "${RELEASE_BUILD_HOSTS[@]}"; do
   # topology launch, so a mismatch is a hard build failure.
   spark_role_label="$(
     release_ssh "$host" \
-      "docker image inspect -f '{{index .Config.Labels \"io.cuteafd.v41.spark_tp_roles\"}}' '$SPARK_EXPERT_DOCKER_INFERENCE'"
+      "docker image inspect -f '{{or (index .Config.Labels \"io.cuteafd.spark_tp_roles\") (index .Config.Labels \"io.cuteafd.v41.spark_tp_roles\")}}' '$SPARK_EXPERT_DOCKER_INFERENCE'"
   )"
   [[ "$spark_role_label" != "<no value>" ]] || spark_role_label=
   # release-spark-tp-roles-postcheck:start
   # One canonicalizer for both sides of the comparison, so a permutation or a
   # stray separator cannot make an equal set look unequal (or the reverse).
   [[ "$(release_spark_tp_roles_canonical "$spark_role_label" \
-    "io.cuteafd.v41.spark_tp_roles")" == "$spark_tp_roles" ]] ||
+    "io.cuteafd.spark_tp_roles")" == "$spark_tp_roles" ]] ||
     release_die "$host Spark image advertises expert roles '$spark_role_label', expected exactly '$spark_tp_roles'"
   # release-spark-tp-roles-postcheck:end
 done

@@ -875,12 +875,12 @@ class BuildScopeTest(unittest.TestCase):
         release_helper = (ROOT / "scripts/build/build-release-artifacts.sh").read_text()
         wip_helper = (ROOT / "scripts/build/build-wip-artifacts.sh").read_text()
         dockerfile = (ROOT / "docker/Dockerfile.release").read_text()
-        self.assertIn('-DCUTEAFD_V41_SPARK_TP_ROLES="$spark_tp_roles"', release_helper)
-        self.assertIn('-DCUTEAFD_V41_SPARK_TP_ROLES="$spark_tp_roles"', wip_helper)
+        self.assertIn('-DCUTEAFD_SPARK_TP_ROLES="$spark_tp_roles"', release_helper)
+        self.assertIn('-DCUTEAFD_SPARK_TP_ROLES="$spark_tp_roles"', wip_helper)
         self.assertIn("exl3_aot=\"${CUTEAFD_WIP_EXL3_AOT:-ON}\"", wip_helper)
-        self.assertIn('-DCUTEAFD_ENABLE_V41_EXL3_AOT="$exl3_aot"', wip_helper)
+        self.assertIn('-DCUTEAFD_ENABLE_EXL3_PACKAGES="$exl3_aot"', wip_helper)
         self.assertIn('if [[ "$exl3_aot" == ON ]]; then', wip_helper)
-        self.assertIn("io.cuteafd.v41.spark_tp_roles", dockerfile)
+        self.assertIn("io.cuteafd.spark_tp_roles", dockerfile)
         self.assertIn("V41_EXPERT_TP_AOT.json", dockerfile)
 
     def test_run_sh_accepts_actual_placement_gpus_and_opens_single_rtx_handoff(self) -> None:

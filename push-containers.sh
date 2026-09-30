@@ -156,7 +156,7 @@ spark_roles="$(
     "$SPARK_EXPERT_DOCKER_INFERENCE" <<'REMOTE'
 set -euo pipefail
 docker image inspect \
-  -f '{{index .Config.Labels "io.cuteafd.v41.spark_tp_roles"}}' "$1"
+  -f '{{or (index .Config.Labels "io.cuteafd.spark_tp_roles") (index .Config.Labels "io.cuteafd.v41.spark_tp_roles")}}' "$1"
 REMOTE
 )"
 [[ "$spark_roles" != "<no value>" ]] || spark_roles=
