@@ -7,7 +7,7 @@ import runpy
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-SCRIPT = ROOT/'scripts/qualify/deepseek_v41/collect-ds41-top1-agreement.py'
+SCRIPT = ROOT/'scripts/qualify/deepseek_v41/collect-top1-agreement.py'
 CORPUS = ROOT/'scripts/fixtures/release-v5-top1-corpus.json'
 COLLECT = runpy.run_path(str(SCRIPT))
 

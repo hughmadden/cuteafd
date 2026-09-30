@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build a Spark (SM121, GB10) EXL3 package on an SM120 host.
 
-Runs ``package_v41_exl3_aot.py`` with its arguments after describing a GB10
+Runs ``package_exl3_aot.py`` with its arguments after describing a GB10
 compile target: Torch reports compute 12.1, 48 SMs and the GB10 name; CuTe
 DSL compiles for ``sm_121a``; Triton (route preparation) targets 121. The
 real SM120 device still hosts the exporter's buffer layout pass, which only
@@ -45,10 +45,10 @@ def describe_gb10() -> None:
 
 def main() -> None:
     describe_gb10()
-    import package_v41_exl3_aot
+    import package_exl3_aot
 
     sys.argv = [sys.argv[0], *sys.argv[1:]]
-    package_v41_exl3_aot.main()
+    package_exl3_aot.main()
 
 
 if __name__ == "__main__":

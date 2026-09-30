@@ -7,7 +7,7 @@ Two disjoint-package modes share one harness:
   geometry exactly as this harness has always raced it: the production
   baseline plus the same-tile 1-vs-2 blocks/SM residency pair.  Forcing
   blocks/SM is a *paired-only* knob (see
-  ``package_v41_exl3_aot.residency_overrides``), so it is legal only here.
+  ``package_exl3_aot.residency_overrides``), so it is legal only here.
 * ``--intermediate 768 --slice-start {0,768,1536}`` benchmarks the real
   disjoint EXL3 TP3 rank slices (the ``tp3-width768`` package layouts).  A
   width of 768 is exactly six whole H128 blocks with no padding, so the only
@@ -93,7 +93,7 @@ LEGACY_PAIRED_WIDTHS = (512, 640)
 H128_BLOCK = 128
 MCG_MAGIC = 0xCBAC1FED
 # The packed-router block and every compile option the exported EXL3 package is
-# built with (`export_b12x_v41_exl3_aot` pins block_m = 8 and passes these
+# built with (`export_b12x_exl3_aot` pins block_m = 8 and passes these
 # kwargs explicitly).  The bench mirrors that call exactly so the raced
 # geometry is the geometry the shipped AOT module was compiled under.
 MOE_BLOCK_SIZE = 8
@@ -625,7 +625,7 @@ def main(argv=None):
     prepared = load_weights(args, torch, safe_open, ProjectionTrellisTierWeights,
                             prepare_projection_native_trellis_weights, replace,
                             tiers=declared_tiers, family=tier_family)
-    # Route geometry follows the production decision exactly (export_b12x_v41_exl3_aot):
+    # Route geometry follows the production decision exactly (export_b12x_exl3_aot):
     # the pinned planner's own `_projection_mixed_direct_topk_routes` (two-tier EXL3
     # only; capped by _MIXED_TRELLIS_DIRECT_ROUTE_LIMIT, currently 0 => packed), and
     # the same `ceil(slots / block)` max_m_blocks instead of the earlier floor.

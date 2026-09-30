@@ -495,7 +495,7 @@ def build(args: argparse.Namespace) -> None:
     tiles = tile_overrides(getattr(args, 'tile', []), capacities, args.role, paired, geometry)
     # Import the source-pinned compiler only for builds, never package checks.
     import _pinned_sparkinfer
-    from export_b12x_v41_exl3_aot import export
+    from export_b12x_exl3_aot import export
     import torch
 
     props = torch.cuda.get_device_properties(0)

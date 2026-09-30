@@ -14,7 +14,7 @@ def main():
     p.add_argument('--device', type=int, required=True)
     p.add_argument('--output', type=Path, required=True)
     a = p.parse_args()
-    primitive = Path(__file__).with_name('qualify-ds41-sparse-attention.py')
+    primitive = Path(__file__).with_name('qualify-sparse-attention.py')
     spec = importlib.util.spec_from_file_location('qualified_sparse_math', primitive)
     reference = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(reference)

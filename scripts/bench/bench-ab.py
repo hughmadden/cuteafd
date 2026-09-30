@@ -52,11 +52,11 @@ def session(arm: str, path: Path, arms: dict[str, Path], rtx: int, out: Path, ar
     run(["./run.sh", "--rtx-gpus", str(rtx), "--restart", *extra], cwd=path, log=log, timeout=1800)
     ready_s = time.monotonic() - started
     py = str(REPO / ".venv/bin/python")
-    decode = [py, str(REPO / "scripts/bench/deepseek_v41/bench-ds41-release-decode.py"), "--base-url", args.base_url,
+    decode = [py, str(REPO / "scripts/bench/deepseek_v41/bench-release-decode.py"), "--base-url", args.base_url,
               "--tokenizer", args.tokenizer, "--nonce-seed", str(args.nonce_seed)]
     run([*decode, "--label", f"{arm}-warmup", "--output", str(out / "warmup.json")], log=log)
     run([*decode, "--label", arm, "--repeats", str(args.repeats), "--output", str(out / "decode.json")], log=log)
-    run([py, str(REPO / "scripts/bench/deepseek_v41/bench-ds41-concurrent-api.py"), "--base-url", args.base_url,
+    run([py, str(REPO / "scripts/bench/deepseek_v41/bench-concurrent-api.py"), "--base-url", args.base_url,
          "--case", "code", "--concurrency", *map(str, args.concurrency), "--repeats", "1",
          "--nonce", f"ab-{args.nonce_seed}", "--label", arm, "--output", str(out / "concurrent.json")], log=log)
     decode_report = json.loads((out / "decode.json").read_text())

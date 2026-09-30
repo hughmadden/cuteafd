@@ -116,7 +116,7 @@ def run_width_override_scenario() -> dict:
         )
         for wrapper in ("v41_spark_tp2_experts.cc", "v41_spark_tp3_experts.cc"):
             (wrappers / wrapper).write_text("// stub\n", encoding="utf-8")
-        (tools / "aot" / "export_b12x_v41_slices_aot.py").write_text(
+        (tools / "aot" / "export_b12x_slices_aot.py").write_text(
             _STUB_EXPORTER, encoding="utf-8"
         )
         (tools / "aot" / "export_b12x_v41_experts_aot.py").write_text(

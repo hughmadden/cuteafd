@@ -10,10 +10,10 @@ import unittest
 import importlib.util
 from types import ModuleType
 
-RULES = Path(__file__).resolve().parents[2] / 'native/cmake/families/deepseek_v41/v41_exl3.cmake'
+RULES = Path(__file__).resolve().parents[2] / 'native/cmake/shared/exl3.cmake'
 
 _spec = importlib.util.spec_from_file_location('exl3_cmake_tile_grammar',
-    Path(__file__).resolve().parents[1] / 'tools/aot/package_v41_exl3_aot.py')
+    Path(__file__).resolve().parents[1] / 'tools/aot/package_exl3_aot.py')
 package = importlib.util.module_from_spec(_spec)
 _pinned = ModuleType('_pinned_sparkinfer')
 _pinned.REVISION = 'pinned-for-tests'
@@ -186,7 +186,7 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
         examples are scraped from the file and driven through the real gate.
         """
         documented = documented_tile_examples()
-        self.assertTrue(documented, 'v41_exl3.cmake documents no tile example')
+        self.assertTrue(documented, 'exl3.cmake documents no tile example')
         for example in documented:
             example = example.rstrip(',').strip('()')
             with self.subTest(example=example):

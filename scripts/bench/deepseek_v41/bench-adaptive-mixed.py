@@ -27,7 +27,7 @@ def main():
         p.error('output must be new')
     here = Path(__file__).resolve().parents[2]
     api = runpy.run_path(str(here / 'qualify-ds41-native-api.py'))
-    bench = runpy.run_path(str(here / 'bench/deepseek_v41/bench-ds41-release-decode.py'))
+    bench = runpy.run_path(str(here / 'bench/deepseek_v41/bench-release-decode.py'))
     corpus_path = here / 'fixtures/release-semantic-corpus.json'
     corpus = json.loads(corpus_path.read_text())
     tokenizer = Tokenizer.from_file(str(args.tokenizer))

@@ -87,7 +87,7 @@ def main():
     save()
     for index, case in enumerate(cases):
         start = args.trace.stat().st_size
-        command = [sys.executable, str(here / 'bench/deepseek_v41/bench-ds41-release-decode.py'),
+        command = [sys.executable, str(here / 'bench/deepseek_v41/bench-release-decode.py'),
                    '--base-url', args.base_url, '--tokenizer', str(args.tokenizer),
                    '--corpus', str(args.corpus), '--label', 'adaptive-content-acceptance',
                    '--nonce-seed', str(args.nonce_seed + index * 100), '--case', case,

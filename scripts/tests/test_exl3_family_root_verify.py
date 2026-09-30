@@ -21,11 +21,11 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[2]
-TOOL = REPO / "python" / "tools" / "aot" / "package_v41_exl3_aot.py"
+TOOL = REPO / "python" / "tools" / "aot" / "package_exl3_aot.py"
 
 
 def load_tool():
-    spec = importlib.util.spec_from_file_location("package_v41_exl3_aot", TOOL)
+    spec = importlib.util.spec_from_file_location("package_exl3_aot", TOOL)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

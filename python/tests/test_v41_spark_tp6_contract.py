@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-SLICES = ROOT / "python" / "tools" / "aot" / "export_b12x_v41_slices_aot.py"
+SLICES = ROOT / "python" / "tools" / "aot" / "export_b12x_slices_aot.py"
 EXPERTS_EXPORTER = ROOT / "python" / "tools" / "aot" / "export_b12x_v41_experts_aot.py"
 NATIVE_HELPER = ROOT / "python" / "tools" / "lib" / "_v41_expert_native.py"
 TOOLS = ROOT / "python" / "tools"

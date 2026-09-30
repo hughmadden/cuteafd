@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 
-TOOL = Path(__file__).resolve().parents[1] / 'tools/aot/export_b12x_v41_exl3_aot.py'
+TOOL = Path(__file__).resolve().parents[1] / 'tools/aot/export_b12x_exl3_aot.py'
 
 
 def exporter():

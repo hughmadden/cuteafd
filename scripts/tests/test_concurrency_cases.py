@@ -64,7 +64,7 @@ class ConcurrencyCases(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as directory:
                 output = Path(directory) / 'result.json'
-                result = subprocess.run([sys.executable, str(ROOT / 'scripts/bench/deepseek_v41/bench-ds41-concurrent-api.py'),
+                result = subprocess.run([sys.executable, str(ROOT / 'scripts/bench/deepseek_v41/bench-concurrent-api.py'),
                     '--base-url', f'http://127.0.0.1:{server.server_port}', '--case', case,
                     '--concurrency', '1', '2', '--repeats', '1', '--nonce', 'fixture',
                     '--output', str(output)], capture_output=True, text=True)

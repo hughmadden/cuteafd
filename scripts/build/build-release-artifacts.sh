@@ -216,9 +216,9 @@ done
 # daemon resolves exl3/exl3-kXX by checkpoint tiers and treats a direct
 # layout child of exl3/ as the legacy single-family package.
 for exl3_tag in "${exl3_family_tags[@]}"; do
-  python3 "$build_root/source/python/tools/aot/package_v41_exl3_aot.py" install \
+  python3 "$build_root/source/python/tools/aot/package_exl3_aot.py" install \
     --package "$build_root/native/exl3-$exl3_tag" --output "$output_dir/exl3/exl3-$exl3_tag"
-  python3 "$build_root/source/python/tools/aot/package_v41_exl3_aot.py" verify \
+  python3 "$build_root/source/python/tools/aot/package_exl3_aot.py" verify \
     --package "$output_dir/exl3/exl3-$exl3_tag" --role "$role"
 done
 # Other expert geometries (FAMILY:exl3-kTIERS entries) ship as exl3-FAMILY-kTIERS.
@@ -226,9 +226,9 @@ IFS=';' read -ra release_family_list <<<"$expert_families"
 for release_family in "${release_family_list[@]}"; do
   [[ "$release_family" == *:exl3-k* ]] || continue
   release_package="exl3-${release_family%%:*}-${release_family#*:exl3-}"
-  python3 "$build_root/source/python/tools/aot/package_v41_exl3_aot.py" install \
+  python3 "$build_root/source/python/tools/aot/package_exl3_aot.py" install \
     --package "$build_root/native/$release_package" --output "$output_dir/exl3/$release_package"
-  python3 "$build_root/source/python/tools/aot/package_v41_exl3_aot.py" verify \
+  python3 "$build_root/source/python/tools/aot/package_exl3_aot.py" verify \
     --package "$output_dir/exl3/$release_package" --role "$role"
 done
 # Exact FP8 expert packages (FAMILY:fp8 entries) ship as fp8/fp8-FAMILY; the

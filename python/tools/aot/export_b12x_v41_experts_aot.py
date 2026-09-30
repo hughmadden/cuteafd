@@ -248,13 +248,13 @@ def export(output_dir: Path, role: str, rows: tuple[int, ...], input_format: str
         raise ValueError("compact dispatch requires native FP8 Spark experts")
     if role == "coordinator":
         from b12x.moe._shared.kernels.v41_slice_pipeline import V41DraftSlicePipeline
-        from export_b12x_v41_slices_aot import export as export_slices
+        from export_b12x_slices_aot import export as export_slices
 
         export_slices(output_dir, rows, V41DraftSlicePipeline.DEFAULT_WIDTH,
                       role=role, standard_names=True)
         return
     if role in SPARK_ROLES and input_format == "fp8_k32":
-        from export_b12x_v41_slices_aot import export as export_slices
+        from export_b12x_slices_aot import export as export_slices
 
         # Match the qualified backbone worker: narrow single-row decode,
         # wider grouped execution, and direct token output for prefill. The

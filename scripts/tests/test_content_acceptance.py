@@ -3,7 +3,7 @@ import runpy
 from pathlib import Path
 
 summarize = runpy.run_path(str(Path(__file__).parents[1] /
-                             'qualify/deepseek_v41/collect-ds41-content-acceptance.py'))['summarize_acceptance']
+                             'qualify/deepseek_v41/collect-content-acceptance.py'))['summarize_acceptance']
 
 
 def test_separates_grammar_and_terminal_cycles():

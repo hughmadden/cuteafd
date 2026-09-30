@@ -2,7 +2,7 @@
 """Launch-geometry identity for the native Spark TP3 slice expert kernel.
 
 The native ``spark_tp3`` FP8-activation artifact is exported by
-``python/tools/aot/export_b12x_v41_slices_aot.py`` from the pinned
+``python/tools/aot/export_b12x_slices_aot.py`` from the pinned
 ``b12x.moe._shared.kernels.w4a8_v41_slice.V41FusedSliceKernel`` plus
 ``b12x.moe._shared.kernels.v41_route_plan.V41RoutePlan``. This module is the one
 place that turns the artifact's planned slice width into the geometry identity a

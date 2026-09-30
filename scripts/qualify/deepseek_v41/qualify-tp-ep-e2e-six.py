@@ -718,7 +718,7 @@ def cmd_run(args) -> int:
     report.update(arm_config=config, corpus=str(args.corpus), corpus_sha256=sha256(args.corpus),
                   run_corpus=str(run_corpus), run_corpus_sha256=sha256(run_corpus),
                   frozen_runner_sha256=FROZEN_RUNNER_SHA256, base_corpus_sha256=sha256(V3_CORPUS),
-                  corpus_revision=revision, six_runner="scripts/qualify/deepseek_v41/qualify-ds41-tp-ep-e2e-six.py")
+                  corpus_revision=revision, six_runner="scripts/qualify/deepseek_v41/qualify-tp-ep-e2e-six.py")
     BASE["write_json"](args.output, report)
     return code
 

@@ -8,7 +8,7 @@ that a manual CLI check cannot protect:
 * the weighted decode-only arithmetic from the release corpus contract,
   ``sum(w * (completion_tokens - 1)) / sum(w * post_first_token_seconds)``.
 
-``scripts/bench/deepseek_v41/bench-ds41-release-decode.py`` is strict-only: there is deliberately
+``scripts/bench/deepseek_v41/bench-release-decode.py`` is strict-only: there is deliberately
 no approximation encoding, and ``--list-profiles`` documents the canonical
 vectors. Nothing here contacts a server or a GPU.
 """
@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[2]
-SCRIPT = REPO / "scripts" / "bench" / "deepseek_v41" / "bench-ds41-release-decode.py"
+SCRIPT = REPO / "scripts" / "bench" / "deepseek_v41" / "bench-release-decode.py"
 CORPUS = REPO / "scripts" / "fixtures" / "release-semantic-corpus.json"
 
 EXPECTED_PROFILES = {
@@ -277,7 +277,7 @@ def test_dspark_evidence_limit_is_explicit() -> None:
 def test_provenance_separates_measurement_source_from_release_doc_commit() -> None:
     module = _load_module()
     identity = module.harness_identity(SCRIPT)
-    assert identity["path"].endswith("bench-ds41-release-decode.py")
+    assert identity["path"].endswith("bench-release-decode.py")
     assert len(identity["sha256"]) == 64
     revision = module.source_revision(REPO)
     assert revision is None or (

@@ -4,7 +4,7 @@ from pathlib import Path
 import unittest
 
 spec = importlib.util.spec_from_file_location(
-    'exl3_package_glm', Path(__file__).resolve().parents[1] / 'tools/aot/package_v41_exl3_aot.py')
+    'exl3_package_glm', Path(__file__).resolve().parents[1] / 'tools/aot/package_exl3_aot.py')
 tool = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(tool)
 

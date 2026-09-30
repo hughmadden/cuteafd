@@ -47,11 +47,11 @@ its length and SHA-256 are kept, so the artifact stays bounded.
 
 CPU-only dry run of every check against an in-process fake server::
 
-    python3 scripts/qualify/deepseek_v41/qualify-ds41-sampling-api.py --self-test
+    python3 scripts/qualify/deepseek_v41/qualify-sampling-api.py --self-test
 
 Live run (five vectors on one deployment)::
 
-    python3 scripts/qualify/deepseek_v41/qualify-ds41-sampling-api.py --base-url http://127.0.0.1:18041 \
+    python3 scripts/qualify/deepseek_v41/qualify-sampling-api.py --base-url http://127.0.0.1:18041 \
         --output /tmp/sampling-acceptance.json
 """
 from __future__ import annotations

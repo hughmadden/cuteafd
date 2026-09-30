@@ -749,9 +749,9 @@ class Case:
 
 
 def exporter_weight_elements(experts: int, kernel_intermediate: int):
-    """The EXACT element counts `export_b12x_v41_slices_aot.py` allocates.
+    """The EXACT element counts `export_b12x_slices_aot.py` allocates.
 
-    Source: python/tools/aot/export_b12x_v41_slices_aot.py, the `specs` list:
+    Source: python/tools/aot/export_b12x_slices_aot.py, the `specs` list:
         Uint32 (experts * kernel_intermediate * n,) for n in (1280, 80, 640, 40)
     in the (w13, s13, w2, s2) slot order. These are uint32 elements, so the byte
     count is 4x. This is the contract the compiled kernel strides over, so the

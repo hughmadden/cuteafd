@@ -234,7 +234,7 @@ def main() -> None:
         parser.error("invalid contexts or repeat count")
 
     prefill = runpy.run_path(
-        str(Path(__file__).with_name("bench-ds41-release-prefill-matrix.py"))
+        str(Path(__file__).with_name("bench-release-prefill-matrix.py"))
     )
     api = runpy.run_path(str(Path(__file__).resolve().parents[2] / "qualify-ds41-native-api.py"))
     quality = runpy.run_path(str(Path(__file__).resolve().parents[2] / "release_throughput_checks.py"))

@@ -281,7 +281,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         manifest.update(paired_boundary=paired_boundary, descriptor_rows=4, native_info_version=3)
     write_bridge(output, manifest)
     if not direct:
-        from export_b12x_v41_exl3_routes_aot import export as export_routes
+        from export_b12x_exl3_routes_aot import export as export_routes
         route_manifest = export_routes(output / 'routes', capacity, experts, topk, block_m)
         for name in ('packed_route_indices', 'block_expert_ids', 'packed_route_count', 'expert_offsets', 'expert_counts'):
             if route_manifest['buffers'][name]['bytes'] > layouts[name]['bytes']:

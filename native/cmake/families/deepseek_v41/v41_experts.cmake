@@ -22,7 +22,7 @@ if(NOT CUTEAFD_V41_EXPERT_SLICE_WIDTH STREQUAL "")
   if(NOT CUTEAFD_V41_EXPERT_SLICE_WIDTH MATCHES "^(64|128|192|[0-9]+:(64|128|192)(,[0-9]+:(64|128|192))*)$")
     message(FATAL_ERROR "Experimental expert slices require valid widths or a capacity:width map")
   endif()
-  set(CUTEAFD_V41_EXPERT_EXPORT_SCRIPT export_b12x_v41_slices_aot.py)
+  set(CUTEAFD_V41_EXPERT_EXPORT_SCRIPT export_b12x_slices_aot.py)
   set(CUTEAFD_V41_EXPERT_EXPORT_ARGS --width "${CUTEAFD_V41_EXPERT_SLICE_WIDTH}"
     --rows "1,16,80,256,1024,4096" --role "${CUTEAFD_V41_EXPERT_ROLE}")
 endif()
@@ -84,7 +84,7 @@ add_custom_command(
     --output-dir "${CUTEAFD_V41_EXPERT_DIR}" ${CUTEAFD_V41_EXPERT_EXPORT_ARGS}
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/${CUTEAFD_V41_EXPERT_EXPORT_SCRIPT}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_experts_aot.py"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_slices_aot.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_spark_tp3_launch_geometry.py"
     ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
   COMMENT "Exporting native V4.1 expert kernels and scratch layouts"

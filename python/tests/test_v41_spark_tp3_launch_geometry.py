@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 TOOLS = ROOT / "python" / "tools"
 GEOMETRY = TOOLS / "lib" / "v41_spark_tp3_launch_geometry.py"
 QUALIFIER = TOOLS / "qualify" / "deepseek_v41" / "qualify_v41_replicated_native.py"
-SLICES = TOOLS / "aot" / "export_b12x_v41_slices_aot.py"
+SLICES = TOOLS / "aot" / "export_b12x_slices_aot.py"
 CMAKE_TP = ROOT / "native" / "cmake" / "families" / "deepseek_v41" / "v41_spark_tp_experts.cmake"
 
 if str(TOOLS) not in sys.path:
@@ -59,7 +59,7 @@ PINNED_ANCHORS = {
         "sparkinfer", "b12x/moe/_shared/kernels/w4a8_v41_slice.py",
         "assert width in (64, 128, 192)"),
     "spark_tp3.geometry": (
-        "cuteafd", "python/tools/aot/export_b12x_v41_slices_aot.py",
+        "cuteafd", "python/tools/aot/export_b12x_slices_aot.py",
         '"spark_tp3": (384, 768, 768, 6)'),
 }
 

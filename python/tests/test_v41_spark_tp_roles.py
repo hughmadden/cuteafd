@@ -11,7 +11,7 @@ import ast
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-SLICES = ROOT / "python" / "tools" / "aot" / "export_b12x_v41_slices_aot.py"
+SLICES = ROOT / "python" / "tools" / "aot" / "export_b12x_slices_aot.py"
 EXPERTS = ROOT / "python" / "tools" / "aot" / "export_b12x_v41_experts_aot.py"
 CMAKE = ROOT / "native" / "CMakeLists.txt"
 CMAKE_TP = ROOT / "native" / "cmake" / "families" / "deepseek_v41" / "v41_spark_tp_experts.cmake"
@@ -293,7 +293,7 @@ def _run_exporter_cli(argv: list[str]) -> list:
     module = ast.Module(body=_exporter_main_block(), type_ignores=[])
     code = compile(ast.fix_missing_locations(module), str(SLICES), "exec")
     previous = sys.argv
-    sys.argv = ["export_b12x_v41_slices_aot.py"] + argv
+    sys.argv = ["export_b12x_slices_aot.py"] + argv
     try:
         exec(code, namespace)  # noqa: S102 - executing the exporter's own CLI block
     finally:

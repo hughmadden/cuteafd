@@ -21,14 +21,14 @@ add_custom_command(
   COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
   COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
     "${Python3_EXECUTABLE}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_slices_aot.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
     --output-dir "${CUTEAFD_V41_TP2_EXPERT_DIR}" --role rtx_tp2
     --rows 1,16,80,256,1024,4096 --width 192 --atomic-min-capacity 256 --standard-names
     ${CUTEAFD_V41_TP2_COMPACT_ARGS}
   COMMAND "${CMAKE_COMMAND}" -E copy
     "${CUTEAFD_V41_TP2_EXPERT_DIR}/v41_expert_variants.h"
     "${CUTEAFD_V41_TP2_EXPERT_DIR}/v41_tp2_expert_variants.h"
-  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_slices_aot.py"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_spark_tp3_launch_geometry.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_experts_aot.py"
     ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}

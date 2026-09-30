@@ -93,7 +93,7 @@ foreach(tp IN LISTS CUTEAFD_V41_SPARK_TP_SELECTED)
     COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
     COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
       "${Python3_EXECUTABLE}"
-      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_slices_aot.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
       --output-dir "${dir}" --role "${role}"
       --rows "${CUTEAFD_V41_SPARK_TP_EXPERT_ROWS_ARG}"
       --width "${width_map}"
@@ -101,7 +101,7 @@ foreach(tp IN LISTS CUTEAFD_V41_SPARK_TP_SELECTED)
     COMMAND "${CMAKE_COMMAND}" -E copy
       "${dir}/v41_expert_variants.h" "${dir}/${variant_header}"
     DEPENDS
-      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_slices_aot.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_spark_tp3_launch_geometry.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_experts_aot.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/${wrapper_src}"

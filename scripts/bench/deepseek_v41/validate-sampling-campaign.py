@@ -2,7 +2,7 @@
 """Validate a sampling-comparison campaign's raw reports before any median is published.
 
 CPU-only, offline: reads the raw per-repeat reports produced by
-``scripts/bench/deepseek_v41/bench-ds41-release-decode.py`` and refuses to produce a result unless
+``scripts/bench/deepseek_v41/bench-release-decode.py`` and refuses to produce a result unless
 the whole matrix is complete, self-consistent, quality-clean, identity-pinned and
 actually interleaved by raw timestamp. It never contacts a server, GPU or
 network, and it never edits the frozen harness or aggregator.

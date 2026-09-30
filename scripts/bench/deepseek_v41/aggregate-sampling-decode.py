@@ -12,7 +12,7 @@ The canonical rotation is a LEFT rotation of the profile list by ``repeat - 1``
 (offsets 0/1/2 for repeats 1/2/3); ``scripts/bench/deepseek_v41/validate-sampling-campaign.py``
 enforces that exact order from the raw timestamps and overrides this example.
 
-Each invocation of ``scripts/bench/deepseek_v41/bench-ds41-release-decode.py`` writes one raw
+Each invocation of ``scripts/bench/deepseek_v41/bench-release-decode.py`` writes one raw
 report (use ``--repeat-index`` to run a single repeat). This tool combines those
 raw reports into per-profile weighted medians, per-case medians and the
 *observed* execution order, so a profile-major ordering (all repeats of greedy,
@@ -161,7 +161,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--inputs', type=Path, nargs='+', required=True,
-                        help='Raw reports from bench-ds41-release-decode.py')
+                        help='Raw reports from bench-release-decode.py')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--label', default='sampling-comparison')
     args = parser.parse_args()

@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from package_v41_exl3_aot import verify, digest
+from package_exl3_aot import verify, digest
 
 
 def main() -> None:

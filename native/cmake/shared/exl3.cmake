@@ -79,7 +79,7 @@ set(CUTEAFD_EXL3_REQUIRE_ARGS --require-layout "${CUTEAFD_EXL3_REQUIRE_LAYOUTS}"
 # precisely when the resolved configuration for this family moves.
 list(JOIN CUTEAFD_V41_EXL3_CAPACITIES "," CUTEAFD_EXL3_CAPACITIES_ARG)
 list(GET CUDAToolkit_INCLUDE_DIRS 0 CUTEAFD_EXL3_CUDA_INCLUDE)
-set(CUTEAFD_EXL3_TOOL "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/package_v41_exl3_aot.py")
+set(CUTEAFD_EXL3_TOOL "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/package_exl3_aot.py")
 # Large prefill export arenas must not overlap other GPU compiler jobs.
 get_property(CUTEAFD_EXL3_PREDECESSORS DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
 list(FILTER CUTEAFD_EXL3_PREDECESSORS INCLUDE REGEX "_export$")
@@ -123,8 +123,8 @@ foreach(family IN LISTS CUTEAFD_V41_EXL3_BIT_FAMILIES)
       --cuda-driver "$<TARGET_FILE:CUDA::cuda_driver>"
       --runtime "${CUTEAFD_B12X_AOT_RUNTIME_LIBRARY}"
     DEPENDS "${CUTEAFD_EXL3_TOOL}" "${CUTEAFD_EXL3_CONFIG_STAMP}"
-      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_exl3_aot.py"
-      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_exl3_routes_aot.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exl3_aot.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exl3_routes_aot.py"
       ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
       ${CUTEAFD_EXL3_FAMILY_CHAIN}
     COMMENT "Building native EXL3 modules and verified runtime package (tiers ${family})"
@@ -185,8 +185,8 @@ foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
       --cuda-driver "$<TARGET_FILE:CUDA::cuda_driver>"
       --runtime "${CUTEAFD_B12X_AOT_RUNTIME_LIBRARY}"
     DEPENDS "${CUTEAFD_EXL3_TOOL}" "${CUTEAFD_EXL3_CONFIG_STAMP}"
-      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_exl3_aot.py"
-      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_exl3_routes_aot.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exl3_aot.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exl3_routes_aot.py"
       ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
       ${CUTEAFD_EXL3_FAMILY_CHAIN}
     COMMENT "Building ${CUTEAFD_EXL3_GEOMETRY} EXL3 modules and verified runtime package (tiers ${CUTEAFD_EXL3_FAMILY_TIERS})"
