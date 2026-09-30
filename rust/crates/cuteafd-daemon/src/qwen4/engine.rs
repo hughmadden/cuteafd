@@ -52,6 +52,21 @@ const BLOCK: usize = 4;
 const POOL_PAGE_TOKENS: usize = BLOCK * PAGE_ROWS;
 /// Rows of the PLE conv state ((taps - 1) x dilation).
 const PLE_STATE_ROWS: usize = 9;
+/// Most rows the E4M3 draft head (`qwen4_head_fp8`) takes.
+const FP8_HEAD_ROWS: usize = 16;
+/// Rows a speculative step records per GDN layer (the fork's `REPLAY_ROWS`).
+pub(crate) const REPLAY_ROWS: usize = 64;
+/// Target rows a sequence may hold for its MTP canonical history before the
+/// next draft step (the MTP stash, per state slot).
+pub(crate) const MTP_PENDING_ROWS: usize = 64;
+
+/// Bytes of one GDN layer's replay record (`gdn_replay_layout` in the fork):
+/// normalized keys and values, decay and beta, and the conv inputs.
+fn gdn_replay_bytes(cfg: &Qwen4Config) -> usize {
+    let (kh, vh, d) = (cfg.gdn_key_heads, cfg.gdn_value_heads, cfg.gdn_head_dim);
+    let bytes = REPLAY_ROWS * (kh * d * 4 + vh * d * 4 + vh * 2 * 4 + cfg.gdn_conv_width() * 2);
+    bytes.div_ceil(1024) * 1024
+}
 
 /// Routed experts on this GPU from the TP1 FP8 package: a window of resident
 /// layers, reloaded when a step reaches a layer outside it.
@@ -90,6 +105,9 @@ pub(crate) struct LocalExl3<'a> {
     pub resident: RefCell<Option<(std::ops::Range<usize>, crate::dsv4::local::LocalExperts<'a>)>>,
     pub window: usize,
     pub layers: usize,
+    /// The MTP layer's experts (draft stage 0) stay resident with every window;
+    /// expert layer `layers` names them.
+    pub mtp: bool,
     pub max_rows: usize,
     pub budget: usize,
     pub loads: RefCell<usize>,
@@ -97,16 +115,18 @@ pub(crate) struct LocalExl3<'a> {
 
 impl LocalExl3<'_> {
     fn ensure(&self, layer: usize, stream: *mut c_void) -> Result<()> {
-        if self.resident.borrow().as_ref().is_some_and(|(range, _)| range.contains(&layer)) {
+        if self.resident.borrow().as_ref().is_some_and(|(range, _)| range.contains(&layer) || layer == self.layers) {
+            ensure!(layer < self.layers || self.mtp, "MTP experts are not loaded");
             return Ok(());
         }
+        let layer = if layer == self.layers { 0 } else { layer };
         // SAFETY: the engine owns this stream; the old window's launches drain first.
         unsafe { self.library.cuda_stream_synchronize(stream)? };
         *self.resident.borrow_mut() = None;
         let range = layer..(layer + self.window).min(self.layers);
         let started = std::time::Instant::now();
-        let local = crate::dsv4::local::LocalExperts::load_range(self.library, &self.native_lib, self.catalog, 0,
-            range.clone(), self.max_rows, self.budget, stream)?
+        let local = crate::dsv4::local::LocalExperts::load_range(self.library, &self.native_lib, self.catalog,
+            usize::from(self.mtp), range.clone(), self.max_rows, self.budget, stream)?
             .context("no coordinator EXL3 package for this checkpoint (build qwen4:exl3-k45)")?;
         let range = layer..layer + local.layers();
         ensure!(range.contains(&layer), "EXL3 expert layer {layer} does not fit the budget");
@@ -131,6 +151,9 @@ pub(crate) enum Experts<'a> {
 #[derive(Default)]
 struct StepTables {
     decode: bool,
+    /// A speculative verify: GDN and PLE record replay inputs instead of
+    /// advancing their state (`commit` applies the accepted rows).
+    spec: bool,
     positions: Vec<i64>,
     /// K/V record slot per row (also the row's raw index-key slot).
     kv_slots: Vec<i64>,
@@ -218,15 +241,6 @@ impl Allocator {
         })
     }
 
-    /// A spare state slot (a speculative verify's backup).
-    pub fn spare_slot(&mut self) -> Result<i32> {
-        self.slots.pop().context("state slots exhausted")
-    }
-
-    pub fn release_slot(&mut self, slot: i32) {
-        self.slots.push(slot);
-    }
-
     pub fn release(&mut self, placement: Qwen4Placement) {
         self.pages.extend(placement.pages);
         self.pool_pages.extend(placement.pool_pages);
@@ -269,8 +283,40 @@ struct Workspace<'a> {
     planes: Vec<Dev<'a>>,
     router_host: RefCell<HostAllocation<'a>>,
     planes_host: RefCell<HostAllocation<'a>>,
+    /// MTP steps: the source row of each row's feedback, and the greedy draft
+    /// (U32 token, FP32 logit) of each head row.
+    hidden_rows: Dev<'a>,
+    argmax: Dev<'a>,
     head: VocabularyHead<'a>,
     _head_workspace: Dev<'a>,
+}
+
+/// One MTP row: the pair (target or draft pre-mixer streams at `position`,
+/// the token at `position + 1`), its streams read from row `source` of the step's source.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MtpRow {
+    pub position: usize,
+    pub token: u32,
+    pub source: i32,
+}
+
+/// A sequence's rows of an MTP step (contiguous, in position order).
+pub(crate) struct MtpGroup<'p> {
+    pub placement: &'p Qwen4Placement,
+    pub rows: Vec<MtpRow>,
+}
+
+/// Where an MTP step reads its rows' streams.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum MtpSource {
+    /// The stash of target rows (row `slot * MTP_PENDING_ROWS + i`).
+    Pending,
+    /// The previous MTP step's output streams in the same workspace.
+    Chain,
+    /// The workspace's final target streams of its last step (prefill).
+    Target,
+    /// A caller buffer of `[rows, 4, H]` streams (golden checks).
+    Buffer(*mut c_void),
 }
 
 pub(crate) struct Qwen4Engine<'a> {
@@ -284,14 +330,32 @@ pub(crate) struct Qwen4Engine<'a> {
     pub prefill_rows: usize,
     pub pages: usize,
     pub slots: usize,
-    /// Per layer: the K/V record pool (full) or the conv state pool (GDN).
-    kv: Vec<Dev<'a>>,
-    /// Per GDN layer: the FP32 recurrent state pool.
-    state: Vec<Option<Dev<'a>>>,
+    /// Per full layer: the K/V record pool.
+    kv: Vec<Option<Dev<'a>>>,
+    /// Per layer: its ordinal among the GDN layers.
+    gdn_ord: Vec<Option<usize>>,
+    /// Every GDN layer's pools back to back (the commit program's layout):
+    /// conv state BF16 [layers, slots, 3, C], FP32 recurrent state [layers,
+    /// slots, 48, 128, 128], and the speculative replay records [layers, record].
+    gdn_conv: Option<Dev<'a>>,
+    gdn_state: Option<Dev<'a>>,
+    gdn_replay: Option<Dev<'a>>,
+    gdn_layers: usize,
     /// Per full layer: raw per-token index keys (BF16 [record slots, 128]) and pooled block keys.
     index: Vec<Option<(Dev<'a>, Dev<'a>)>>,
-    /// PLE conv state pool (BF16 [slots, 9, 4H]).
+    /// PLE conv state pool (BF16 [slots, 9, 4H]) and its speculative replay record ([64, 4H]).
     ple_state: Option<Dev<'a>>,
+    ple_replay: Option<Dev<'a>>,
+    /// Commit tables (I32 [3, sequences]).
+    commit_tables: Dev<'a>,
+    /// The MTP layer's K/V records and index caches, and the stash of target
+    /// pre-mixer stream rows awaiting the MTP (BF16 [slots, 64, 4, H]).
+    mtp_kv: Option<(Dev<'a>, Dev<'a>, Dev<'a>)>,
+    mtp_pending: Option<Dev<'a>>,
+    /// Where the last step left its final streams (decode, stream buffer).
+    last_streams: std::cell::Cell<(bool, usize)>,
+    /// Where the last MTP step left its output streams (decode, stream buffer).
+    mtp_streams: std::cell::Cell<(bool, usize)>,
     /// Logical page of each pool-cache page within its sequence.
     pool_logical: Dev<'a>,
     pub pool_pages: usize,
@@ -311,6 +375,7 @@ pub(crate) struct Qwen4Engine<'a> {
 struct GraphKey {
     segment: usize,
     rows: usize,
+    spec: bool,
     long: bool,
     pool_width: usize,
     page_stride: usize,
@@ -346,32 +411,50 @@ impl<'a> Qwen4Engine<'a> {
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
-        let conv = cfg.gdn_key_heads * cfg.gdn_head_dim * 2 + cfg.gdn_value_heads * cfg.gdn_head_dim;
         let pool_pages = pages.div_ceil(BLOCK);
-        let (mut kv, mut state, mut index) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut kv, mut gdn_ord, mut index) = (Vec::new(), Vec::new(), Vec::new());
+        let mut gdn_layers = 0;
         for layer in &weights.layers {
             match layer.attention {
                 Qwen4Attention::Full => {
-                    kv.push(zeroed(pages * PAGE_ROWS * RECORD_BYTES)?);
-                    state.push(None);
+                    kv.push(Some(zeroed(pages * PAGE_ROWS * RECORD_BYTES)?));
+                    gdn_ord.push(None);
                     index.push(Some((zeroed(pages * PAGE_ROWS * INDEX_DIM * 2)?,
                         zeroed(pool_pages * PAGE_ROWS * INDEX_DIM * 2)?)));
                 }
                 Qwen4Attention::Gdn => {
-                    kv.push(zeroed(slots * (cfg.conv_kernel - 1) * conv * 2)?);
-                    state.push(Some(zeroed(slots * cfg.gdn_value_heads * cfg.gdn_head_dim * cfg.gdn_head_dim * 4)?));
+                    kv.push(None);
+                    gdn_ord.push(Some(gdn_layers));
+                    gdn_layers += 1;
                     index.push(None);
                 }
             }
         }
-        let ple_state = if weights.layers.len() > cfg.ple_layers.first().copied().unwrap_or(usize::MAX) {
-            Some(zeroed(slots * PLE_STATE_ROWS * cfg.hc_width() * 2)?)
+        let (gdn_conv, gdn_state, gdn_replay) = if gdn_layers > 0 {
+            (Some(zeroed(gdn_layers * slots * Self::conv_slot_bytes(&cfg))?),
+             Some(zeroed(gdn_layers * slots * Self::state_slot_bytes(&cfg))?),
+             Some(zeroed(gdn_layers * gdn_replay_bytes(&cfg))?))
         } else {
-            None
+            (None, None, None)
+        };
+        let (ple_state, ple_replay) = if weights.layers.len() > cfg.ple_layers.first().copied().unwrap_or(usize::MAX) {
+            (Some(zeroed(slots * PLE_STATE_ROWS * cfg.hc_width() * 2)?),
+             Some(zeroed(REPLAY_ROWS * cfg.hc_width() * 2)?))
+        } else {
+            (None, None)
+        };
+        let (mtp_kv, mtp_pending) = if weights.mtp.is_some() {
+            (Some((zeroed(pages * PAGE_ROWS * RECORD_BYTES)?, zeroed(pages * PAGE_ROWS * INDEX_DIM * 2)?,
+                zeroed(pool_pages * PAGE_ROWS * INDEX_DIM * 2)?)),
+             Some(zeroed(slots * MTP_PENDING_ROWS * HC * cfg.hidden * 2)?))
+        } else {
+            (None, None)
         };
         let pool_logical = zeroed(pool_pages * 4)?;
-        Ok(Self { library, programs, cfg, weights, ple, stream, max_context, prefill_rows, pages, slots, kv, state,
-            index, ple_state, pool_logical, pool_pages, workspace: RefCell::new(None),
+        Ok(Self { library, programs, cfg, weights, ple, stream, max_context, prefill_rows, pages, slots, kv, gdn_ord,
+            gdn_conv, gdn_state, gdn_replay, gdn_layers, index, ple_state, ple_replay,
+            commit_tables: zeroed(3 * DECODE_ROWS * 4)?, mtp_kv, mtp_pending,
+            last_streams: std::cell::Cell::new((false, 0)), mtp_streams: std::cell::Cell::new((false, 0)), pool_logical, pool_pages, workspace: RefCell::new(None),
             decode_workspace: RefCell::new(None), experts: None, profile: RefCell::new([0.0; 2]),
             graphs: RefCell::new(std::collections::HashMap::new()),
             use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0"),
@@ -387,7 +470,7 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     /// Before a sequence's first step: zeroes its state slot and maps its pool pages.
-    fn start(&self, placement: &Qwen4Placement) -> Result<()> {
+    pub(crate) fn start(&self, placement: &Qwen4Placement) -> Result<()> {
         for (logical, &page) in placement.pool_pages.iter().enumerate() {
             let page = usize::try_from(page)?;
             ensure!(page < self.pool_pages, "pool page {page} out of range");
@@ -402,48 +485,58 @@ impl<'a> Qwen4Engine<'a> {
         self.reset_slot(placement.slot)
     }
 
-    /// Every per-slot state pool (GDN conv + recurrent state, PLE conv state).
-    fn slot_pools(&self) -> Vec<&Dev<'a>> {
-        let mut pools = Vec::new();
-        for (kv, state) in self.kv.iter().zip(&self.state) {
-            if let Some(state) = state {
-                pools.push(kv);
-                pools.push(state);
-            }
-        }
-        pools.extend(self.ple_state.iter());
-        pools
+    fn conv_slot_bytes(cfg: &Qwen4Config) -> usize {
+        (cfg.conv_kernel - 1) * cfg.gdn_conv_width() * 2
     }
 
-    fn slot_region(&self, pool: &Dev<'_>, slot: usize) -> cuteafd_ffi::CuteafdDeviceBuffer {
-        let per = pool.buffer.bytes / self.slots;
+    fn state_slot_bytes(cfg: &Qwen4Config) -> usize {
+        cfg.gdn_value_heads * cfg.gdn_head_dim * cfg.gdn_head_dim * 4
+    }
+
+    /// `bytes` at `offset` inside `pool`.
+    fn region(pool: &Dev<'_>, offset: usize, bytes: usize) -> cuteafd_ffi::CuteafdDeviceBuffer {
+        debug_assert!(offset + bytes <= pool.buffer.bytes);
         cuteafd_ffi::CuteafdDeviceBuffer {
-            // SAFETY: slot < slots, so the slot's bytes lie inside the pool.
-            ptr: unsafe { pool.buffer.ptr.cast::<u8>().add(slot * per) }.cast(),
-            bytes: per,
+            // SAFETY: callers pass offsets inside the pool.
+            ptr: unsafe { pool.buffer.ptr.cast::<u8>().add(offset) }.cast(),
+            bytes,
             ..pool.buffer
         }
     }
 
-    /// Copies a sequence's state from slot `from` to slot `to` on the engine
-    /// stream (a speculative verify's backup / restore).
-    pub fn copy_slot(&self, from: i32, to: i32) -> Result<()> {
-        let (from, to) = (usize::try_from(from)?, usize::try_from(to)?);
-        ensure!(from < self.slots && to < self.slots && from != to, "state slots {from} -> {to} out of range");
-        for pool in self.slot_pools() {
-            let (dst, src) = (self.slot_region(pool, to), self.slot_region(pool, from));
-            // SAFETY: both slot regions are live and disjoint; the stream orders the copy.
-            unsafe { self.library.copy_d2d_async(dst, src, dst.bytes, self.stream)? };
+    /// Every per-slot state region of `slot` (GDN conv + recurrent state per
+    /// GDN layer, PLE conv state).
+    fn slot_regions(&self, slot: usize) -> Vec<cuteafd_ffi::CuteafdDeviceBuffer> {
+        let mut regions = Vec::new();
+        let (conv, state) = (Self::conv_slot_bytes(&self.cfg), Self::state_slot_bytes(&self.cfg));
+        for ord in 0..self.gdn_layers {
+            if let (Some(c), Some(s)) = (&self.gdn_conv, &self.gdn_state) {
+                regions.push(Self::region(c, (ord * self.slots + slot) * conv, conv));
+                regions.push(Self::region(s, (ord * self.slots + slot) * state, state));
+            }
         }
-        Ok(())
+        if let Some(ple) = &self.ple_state {
+            let per = ple.buffer.bytes / self.slots;
+            regions.push(Self::region(ple, slot * per, per));
+        }
+        regions
+    }
+
+    /// GDN layer `ord`'s conv state pool, recurrent state pool and replay record.
+    fn gdn_pools(&self, ord: usize) -> Result<[*mut c_void; 3]> {
+        let (c, s, r) = (self.gdn_conv.as_ref(), self.gdn_state.as_ref(), self.gdn_replay.as_ref());
+        let (Some(c), Some(s), Some(r)) = (c, s, r) else { anyhow::bail!("GDN layer without state pools") };
+        let slots = self.slots;
+        Ok([Self::region(c, ord * slots * Self::conv_slot_bytes(&self.cfg), 0).ptr,
+            Self::region(s, ord * slots * Self::state_slot_bytes(&self.cfg), 0).ptr,
+            Self::region(r, ord * gdn_replay_bytes(&self.cfg), 0).ptr])
     }
 
     /// Zeroes a sequence's state (before its first step).
     pub fn reset_slot(&self, slot: i32) -> Result<()> {
         let slot = usize::try_from(slot)?;
         ensure!(slot < self.slots, "state slot {slot} out of range");
-        for pool in self.slot_pools() {
-            let region = self.slot_region(pool, slot);
+        for region in self.slot_regions(slot) {
             self.library.cuda_zero_bytes(region, region.bytes)?;
         }
         Ok(())
@@ -472,7 +565,8 @@ impl<'a> Qwen4Engine<'a> {
         let ple = if self.ple.as_ref().is_some_and(|p| p.fp8) { "qwen4_ple_fp8" } else { "qwen4_ple_bf16" };
         let mut scratch = 0;
         for name in ["qwen4_hc_pre".to_string(), "qwen4_hc_post_pre".into(), "qwen4_head".into(),
-            "qwen4_shared".into(), ple.into(), format!("qwen4_gdn_{cap}"), format!("qwen4_attn_producer_{cap}"),
+            "qwen4_shared".into(), ple.into(), "qwen4_mtp_feedback".into(), format!("qwen4_gdn_{cap}"),
+            format!("qwen4_attn_producer_{cap}"),
             format!("qwen4_sparse_gqa_{cap}"), format!("qwen4_attn_o_{cap}")] {
             if let Ok(bytes) = self.scratch(&name) {
                 scratch = usize::max(scratch, bytes);
@@ -524,6 +618,8 @@ impl<'a> Qwen4Engine<'a> {
             router_host: RefCell::new(HostAllocation::new(self.library,
                 if spark { t * (topk * 8 + h + h / 32) } else { 256 })?),
             planes_host: RefCell::new(HostAllocation::new(self.library, if spark { MAX_RANKS * t * h * 2 } else { 256 })?),
+            hidden_rows: self.alloc(t * 4)?,
+            argmax: self.alloc(logit_rows * 8)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, logit_rows as u32,
                 self.cfg.vocab_size as u32)? },
@@ -599,13 +695,28 @@ impl<'a> Qwen4Engine<'a> {
     /// GDN and PLE state advance in place: a caller rejecting a suffix must replay.
     pub fn verify(&self, sequences: &mut [(&mut Qwen4Placement, &[u32])], embed: &[u8], on_layer: LayerHook<'_>)
         -> Result<Option<Vec<f32>>> {
+        self.verify_step(sequences, embed, on_layer, false)
+    }
+
+    /// [`Self::verify`] as a speculative step: the GDN and PLE state stay as
+    /// they were and each row's replay inputs are recorded; [`Self::commit`]
+    /// then applies each sequence's accepted rows (and the caller rewinds the
+    /// placements with [`Self::rewind`]). K/V records past the accepted rows
+    /// are overwritten when those positions come again.
+    pub fn verify_spec(&self, sequences: &mut [(&mut Qwen4Placement, &[u32])], embed: &[u8],
+        on_layer: LayerHook<'_>) -> Result<Option<Vec<f32>>> {
+        self.verify_step(sequences, embed, on_layer, true)
+    }
+
+    fn verify_step(&self, sequences: &mut [(&mut Qwen4Placement, &[u32])], embed: &[u8], on_layer: LayerHook<'_>,
+        spec: bool) -> Result<Option<Vec<f32>>> {
         let rows: usize = sequences.iter().map(|(_, t)| t.len()).sum();
         ensure!(rows > 0 && rows <= DECODE_ROWS && embed.len() == rows * self.cfg.hidden * 2, "decode step of {rows} rows");
         let page_stride = sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1).next_power_of_two()
             .min(self.pages);
         let pool_stride = sequences.iter().map(|(p, _)| p.pool_pages.len()).max().unwrap_or(1).next_power_of_two()
             .min(self.pool_pages);
-        let mut tables = StepTables { decode: true, page_stride, pool_stride, page_width: page_stride,
+        let mut tables = StepTables { decode: true, spec, page_stride, pool_stride, page_width: page_stride,
             ..Default::default() };
         for (placement, tokens) in sequences.iter_mut() {
             if placement.len == 0 {
@@ -628,6 +739,238 @@ impl<'a> Qwen4Engine<'a> {
             placement.len += tokens.len();
         }
         Ok(logits)
+    }
+
+    /// Applies each sequence's accepted rows of the last speculative step to
+    /// the GDN and PLE state: `(state slot, first step row, accepted rows)`.
+    pub fn commit(&self, accepted: &[(i32, usize, usize)]) -> Result<()> {
+        let n = accepted.len();
+        if n == 0 {
+            return Ok(());
+        }
+        ensure!(n <= DECODE_ROWS, "commit of {n} sequences");
+        let mut table = vec![0i32; 3 * n];
+        for (i, &(slot, first, keep)) in accepted.iter().enumerate() {
+            ensure!(first + keep <= REPLAY_ROWS && usize::try_from(slot).is_ok_and(|s| s < self.slots),
+                "commit of rows {first}+{keep} in slot {slot}");
+            (table[i], table[n + i], table[2 * n + i]) = (slot, i32::try_from(first)?, i32::try_from(keep)?);
+        }
+        // SAFETY: the engine owns this stream; the previous commit's table is consumed.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        self.put(&self.commit_tables, &table)?;
+        let i32s = |v: usize| -> Result<Dsv4Scalar> { Ok(Dsv4Scalar::I32(i32::try_from(v)?)) };
+        if let (Some(conv), Some(state), Some(replay)) = (&self.gdn_conv, &self.gdn_state, &self.gdn_replay) {
+            self.run("qwen4_gdn_commit", &[("state", state.buffer.ptr), ("conv_state", conv.buffer.ptr),
+                ("replay", replay.buffer.ptr), ("tables", self.commit_tables.buffer.ptr)],
+                &[i32s(n)?, i32s(self.gdn_layers)?, i32s(self.slots)?])?;
+        }
+        if let (Some(state), Some(replay)) = (&self.ple_state, &self.ple_replay) {
+            self.run("qwen4_ple_commit", &[("conv_state", state.buffer.ptr), ("replay", replay.buffer.ptr),
+                ("tables", self.commit_tables.buffer.ptr)], &[i32s(n)?])?;
+        }
+        Ok(())
+    }
+
+    /// After a speculative step: `placement` keeps the `kept` tokens it verified
+    /// from `start`, whose n-gram history was `history` before the step.
+    pub fn rewind(&self, placement: &mut Qwen4Placement, start: usize, history: NgramHistory, kept: &[u32])
+        -> Result<()> {
+        placement.len = start + kept.len();
+        placement.history = history;
+        if let Some(ple) = &self.ple {
+            ple.hasher.hash(&mut placement.history, kept, &mut Vec::new())?;
+        }
+        Ok(())
+    }
+
+    /// Copies target stream rows of the last step (`decode`: the decode
+    /// workspace, else the prefill one) into the MTP stash: `(state slot,
+    /// first step row, rows, first stash row)` per sequence.
+    pub fn mtp_stash(&self, decode: bool, rows: &[(i32, usize, usize, usize)]) -> Result<()> {
+        let pending = self.mtp_pending.as_ref().context("MTP is not loaded")?;
+        let (last_decode, cur) = self.last_streams.get();
+        ensure!(last_decode == decode, "the stash reads the last step's workspace");
+        let workspace = if decode { self.decode_workspace.borrow() } else { self.workspace.borrow() };
+        let w = workspace.as_ref().context("no step ran")?;
+        let row = HC * self.cfg.hidden * 2;
+        for &(slot, first, count, at) in rows {
+            let slot = usize::try_from(slot)?;
+            ensure!(slot < self.slots && at + count <= MTP_PENDING_ROWS && first + count <= w.rows,
+                "MTP stash of rows {first}+{count} at {at}");
+            if count == 0 {
+                continue;
+            }
+            let dst = Self::region(pending, (slot * MTP_PENDING_ROWS + at) * row, count * row);
+            let src = Self::region(&w.streams[cur], first * row, count * row);
+            // SAFETY: both regions lie inside live buffers; the stream orders the copy.
+            unsafe { self.library.copy_d2d_async(dst, src, count * row, self.stream)? };
+        }
+        Ok(())
+    }
+
+    /// One MTP step over `groups` (each sequence's rows contiguous) in the
+    /// decode workspace (`decode`, at most 64 rows) or the prefill one.
+    /// Rows read their streams from `source`; the output streams stay in the
+    /// workspace for a following [`MtpSource::Chain`] step. With `heads`
+    /// (step rows), returns each head row's greedy draft (token, logit) and,
+    /// with `logits`, the head rows' FP32 logits.
+    #[allow(clippy::type_complexity)]
+    pub fn mtp_step(&self, decode: bool, groups: &[MtpGroup<'_>], source: MtpSource, heads: &[usize],
+        embed: &[u8], logits: bool) -> Result<(Vec<(u32, f32)>, Option<Vec<f32>>)> {
+        let mtp = self.weights.mtp.as_ref().context("MTP is not loaded (--mtp)")?;
+        let (kv, keys, blocks) = self.mtp_kv.as_ref().context("MTP pools")?;
+        let (h, vocab) = (self.cfg.hidden, self.cfg.vocab_size);
+        let t: usize = groups.iter().map(|g| g.rows.len()).sum();
+        let capacity = if decode { DECODE_ROWS } else { self.prefill_rows };
+        ensure!(t > 0 && t <= capacity && heads.len() <= t && embed.len() == t * h * 2, "MTP step of {t} rows");
+        let mut tables = StepTables { decode, ..Default::default() };
+        let mut hidden_rows = Vec::with_capacity(t);
+        if decode {
+            let stride = |n: usize, total: usize| n.next_power_of_two().min(total);
+            tables.page_stride = stride(groups.iter().map(|g| g.placement.pages.len()).max().unwrap_or(1), self.pages);
+            tables.pool_stride = stride(groups.iter().map(|g| g.placement.pool_pages.len()).max().unwrap_or(1),
+                self.pool_pages);
+            tables.page_width = tables.page_stride;
+        } else {
+            ensure!(groups.len() == 1, "a prefill-shaped MTP step takes one sequence");
+            tables.page_table = groups[0].placement.pages.clone();
+            tables.pool_table = groups[0].placement.pool_pages.clone();
+            tables.page_width = groups[0].placement.pages.len();
+        }
+        for group in groups {
+            let first = tables.kv_slots.len() as i32;
+            let placement = group.placement;
+            for row in &group.rows {
+                let position = row.position;
+                ensure!(position < self.max_context, "MTP position {position} past the context");
+                tables.positions.push(position as i64);
+                tables.kv_slots.push(placement.record(position)?);
+                tables.pool_slots.push(placement.pool_slot(position)?);
+                tables.slots.push(placement.slot);
+                tables.seq_first.push(first);
+                tables.cache_lengths.push(((position + 1) / BLOCK) as i32);
+                tables.long |= position + 1 > self.cfg.dense_context();
+                tables.pool_width = tables.pool_width.max((position + 1).div_ceil(POOL_PAGE_TOKENS));
+                hidden_rows.push(match source {
+                    MtpSource::Pending => i32::try_from(usize::try_from(placement.slot)? * MTP_PENDING_ROWS)?
+                        + row.source,
+                    _ => row.source,
+                });
+                if decode {
+                    let mut pages = placement.pages.clone();
+                    pages.resize(tables.page_stride, 0);
+                    tables.page_table.extend(pages);
+                    let mut pools = placement.pool_pages.clone();
+                    pools.resize(tables.pool_stride, 0);
+                    tables.pool_table.extend(pools);
+                }
+            }
+        }
+        if decode {
+            tables.pool_width = tables.pool_width.next_power_of_two().min(tables.pool_stride);
+        }
+        let slot = if decode { &self.decode_workspace } else { &self.workspace };
+        if slot.borrow().is_none() {
+            *slot.borrow_mut() = Some(self.workspace(capacity, decode, if decode { DECODE_ROWS } else { 1 })?);
+        }
+        let workspace = slot.borrow();
+        let w = workspace.as_ref().context("workspace")?;
+        ensure!(heads.len() <= w.logit_rows, "{} MTP head rows exceed the workspace's {}", heads.len(), w.logit_rows);
+        // Source streams, and the buffer the feedback writes (never the source).
+        let (src, dst) = match source {
+            MtpSource::Pending => (self.mtp_pending.as_ref().context("MTP stash")?.buffer.ptr, 0),
+            MtpSource::Buffer(ptr) => (ptr, 0),
+            MtpSource::Chain => {
+                let (d, cur) = self.mtp_streams.get();
+                ensure!(d == decode, "an MTP chain step follows an MTP step in the same workspace");
+                (w.streams[cur].buffer.ptr, cur ^ 1)
+            }
+            MtpSource::Target => {
+                let (d, cur) = self.last_streams.get();
+                ensure!(d == decode, "the MTP reads the last target step of the same workspace");
+                (w.streams[cur].buffer.ptr, cur ^ 1)
+            }
+        };
+        self.put(&w.positions, &tables.positions)?;
+        self.put(&w.kv_slots, &tables.kv_slots)?;
+        self.put(&w.slots, &tables.slots)?;
+        self.put(&w.seq_first, &tables.seq_first)?;
+        self.put(&w.pool_slots, &tables.pool_slots)?;
+        self.put(&w.cache_lengths, &tables.cache_lengths)?;
+        self.put(&w.page_table, &tables.page_table)?;
+        self.put(&w.pool_table, &tables.pool_table)?;
+        self.put(&w.hidden_rows, &hidden_rows)?;
+        self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: embed.len(), ..w.x.buffer }, embed)?;
+        let rows = Dsv4Scalar::I32(t as i32);
+        let cap = if decode { "m64" } else { "m4096" };
+        self.run("qwen4_mtp_feedback", &[("hidden", src), ("hidden_rows", w.hidden_rows.buffer.ptr),
+            ("embed", w.x.buffer.ptr), ("norm_hidden", mtp.norm_hidden.buffer.ptr),
+            ("norm_embed", mtp.norm_embed.buffer.ptr), ("fc_hidden", mtp.fc_hidden.buffer.ptr),
+            ("fc_embed", mtp.fc_embed.buffer.ptr), ("streams", w.streams[dst].buffer.ptr),
+            ("delta", w.delta.buffer.ptr), ("inject", w.inject.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
+            &[rows])?;
+        // The embedding branch joins every stream (unit injection), then the attention site.
+        self.post_pre(w, dst, &mtp.layer, "attn", rows)?;
+        self.attend(w, &mtp.layer, kv.buffer.ptr, keys.buffer.ptr, blocks.buffer.ptr, rows, cap, &tables)?;
+        self.post_pre(w, dst ^ 1, &mtp.layer, "mlp", rows)?;
+        self.moe(w, self.cfg.layers, &mtp.layer, t, rows, decode)?;
+        let mut out = dst;
+        self.post(w, &mut out, rows)?;
+        self.mtp_streams.set((decode, out));
+        if heads.is_empty() {
+            // SAFETY: the engine owns this stream.
+            unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+            return Ok((Vec::new(), None));
+        }
+        let [norm, down, up] = &mtp.mixer;
+        self.run("qwen4_head", &[("streams", w.streams[out].buffer.ptr), ("norm", norm.buffer.ptr),
+            ("w_down", down.buffer.ptr), ("w_up", up.buffer.ptr), ("out", w.x.buffer.ptr),
+            ("scratch", w.scratch.buffer.ptr)], &[rows])?;
+        // The head rows, gathered contiguously into `delta`.
+        let row = h * 2;
+        for (i, &r) in heads.iter().enumerate() {
+            ensure!(r < t, "MTP head row {r} of {t}");
+            // SAFETY: row r of `x` and row i of `delta` lie inside [t, H] buffers.
+            unsafe {
+                self.library.copy_d2d_async(Self::region(&w.delta, i * row, row), Self::region(&w.x, r * row, row),
+                    row, self.stream)?;
+            }
+        }
+        let n = heads.len();
+        match &mtp.head_fp8 {
+            Some((q, scale)) if n <= FP8_HEAD_ROWS => self.run("qwen4_head_fp8", &[("x", w.delta.buffer.ptr),
+                ("w_fp8", q.buffer.ptr), ("scale", scale.buffer.ptr), ("logits", w.logits.buffer.ptr)],
+                &[Dsv4Scalar::I32(n as i32)])?,
+            // SAFETY: the gathered rows, the shared head and the logits are live buffers of these shapes.
+            _ => unsafe {
+                w.head.launch(w.delta.buffer.ptr.cast(), self.weights.head.buffer.ptr.cast(),
+                    w.logits.buffer.ptr.cast(), n as u32, self.stream)?;
+            },
+        }
+        // SAFETY: the logits and the argmax outputs are live buffers of these shapes.
+        unsafe {
+            self.library.cuda_logits_argmax_checked_f32_async(
+                cuteafd_ffi::CuteafdDeviceBuffer { bytes: n * vocab * 4, ..w.logits.buffer },
+                Self::region(&w.argmax, 0, n * 4), Self::region(&w.argmax, n * 4, n * 4), n, vocab, self.stream)?;
+        }
+        let best = self.download(&w.argmax, n * 8)?;
+        let word = |i: usize| u32::from_le_bytes(best[i * 4..i * 4 + 4].try_into().unwrap());
+        let drafts = (0..n).map(|i| (word(i), f32::from_bits(word(n + i)))).collect();
+        let logits = if logits {
+            Some(self.download(&w.logits, n * vocab * 4)?.chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
+        } else {
+            None
+        };
+        Ok((drafts, logits))
+    }
+
+    /// The last MTP step's output streams (BF16 [rows, 4, H]).
+    pub fn mtp_output(&self, rows: usize) -> Result<Vec<u8>> {
+        let (decode, cur) = self.mtp_streams.get();
+        let workspace = if decode { self.decode_workspace.borrow() } else { self.workspace.borrow() };
+        let w = workspace.as_ref().context("no MTP step ran")?;
+        self.download(&w.streams[cur], rows * HC * self.cfg.hidden * 2)
     }
 
     fn step(&self, tables: &StepTables, embed: &[u8], logit_rows: usize, mut on_layer: LayerHook<'_>,
@@ -669,10 +1012,11 @@ impl<'a> Qwen4Engine<'a> {
         let cap = if tables.decode { "m64" } else { "m4096" };
         let layers = &self.weights.layers;
         let mut cur = 0usize;
-        self.enter(w, &mut cur, None, &layers[0], 0, rows)?;
+        let spec = tables.spec;
+        self.enter(w, &mut cur, None, &layers[0], 0, rows, spec)?;
         for (index, layer) in layers.iter().enumerate() {
             match layer.attention {
-                Qwen4Attention::Gdn => self.gdn(w, index, layer, rows, cap)?,
+                Qwen4Attention::Gdn => self.gdn(w, index, layer, rows, cap, spec)?,
                 Qwen4Attention::Full => self.full(w, index, layer, rows, cap, tables)?,
             }
             // Attention back into the streams, then the MLP site's input.
@@ -694,9 +1038,9 @@ impl<'a> Qwen4Engine<'a> {
                             self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: rows_forced.len(),
                                 ..w.streams[cur].buffer }, &rows_forced)?;
                         }
-                        self.enter(w, &mut cur, None, next, index + 1, rows)?;
+                        self.enter(w, &mut cur, None, next, index + 1, rows, spec)?;
                     } else {
-                        self.enter(w, &mut cur, Some(()), next, index + 1, rows)?;
+                        self.enter(w, &mut cur, Some(()), next, index + 1, rows, spec)?;
                     }
                 }
                 None => {
@@ -707,6 +1051,7 @@ impl<'a> Qwen4Engine<'a> {
                 }
             }
         }
+        self.last_streams.set((tables.decode, cur));
         if layers.len() < self.cfg.layers {
             // SAFETY: the engine owns this stream.
             unsafe { self.library.cuda_stream_synchronize(self.stream)? };
@@ -744,7 +1089,7 @@ impl<'a> Qwen4Engine<'a> {
         let layers = &self.weights.layers;
         let mut cur = 0usize;
         for index in 0..=layers.len() {
-            let key = GraphKey { segment: index, rows: t, long: tables.long, pool_width: tables.pool_width,
+            let key = GraphKey { segment: index, rows: t, spec: tables.spec, long: tables.long, pool_width: tables.pool_width,
                 page_stride: tables.page_stride, pool_stride: tables.pool_stride };
             let start = cur;
             self.replay(key, || -> Result<()> {
@@ -752,16 +1097,17 @@ impl<'a> Qwen4Engine<'a> {
                 let Some(layer) = layers.get(index) else {
                     return self.post(w, &mut c, rows);
                 };
+                let spec = tables.spec;
                 if index == 0 {
-                    self.enter(w, &mut c, None, layer, index, rows)?;
+                    self.enter(w, &mut c, None, layer, index, rows, spec)?;
                 } else if self.cfg.ple_layers.contains(&index) {
                     self.post(w, &mut c, rows)?;
-                    self.enter(w, &mut c, None, layer, index, rows)?;
+                    self.enter(w, &mut c, None, layer, index, rows, spec)?;
                 } else {
-                    self.enter(w, &mut c, Some(()), layer, index, rows)?;
+                    self.enter(w, &mut c, Some(()), layer, index, rows, spec)?;
                 }
                 match layer.attention {
-                    Qwen4Attention::Gdn => self.gdn(w, index, layer, rows, "m64")?,
+                    Qwen4Attention::Gdn => self.gdn(w, index, layer, rows, "m64", spec)?,
                     Qwen4Attention::Full => self.full(w, index, layer, rows, "m64", tables)?,
                 }
                 self.post_pre(w, c, layer, "mlp", rows)?;
@@ -772,6 +1118,7 @@ impl<'a> Qwen4Engine<'a> {
                 self.moe_experts(w, index, t, rows, true)?;
             }
         }
+        self.last_streams.set((true, cur));
         if layers.len() < self.cfg.layers {
             // SAFETY: the engine owns this stream.
             unsafe { self.library.cuda_stream_synchronize(self.stream)? };
@@ -808,8 +1155,9 @@ impl<'a> Qwen4Engine<'a> {
     /// in `cur` are this layer's input (PLE first when it has one, then
     /// `hc_pre`); with Some the previous MoE output is still in `delta` and
     /// `hc_post_pre` posts it (into the other buffer) and enters.
+    #[allow(clippy::too_many_arguments)]
     fn enter(&self, w: &Workspace<'_>, cur: &mut usize, posted: Option<()>, layer: &Qwen4Layer<'_>, index: usize,
-        rows: Dsv4Scalar) -> Result<()> {
+        rows: Dsv4Scalar, spec: bool) -> Result<()> {
         let [norm, di, up] = Self::site(layer, "attn")?;
         if posted.is_some() {
             self.post_pre(w, *cur, layer, "attn", rows)?;
@@ -817,7 +1165,7 @@ impl<'a> Qwen4Engine<'a> {
             return Ok(());
         }
         if self.cfg.ple_layers.contains(&index) {
-            self.ple(w, &w.streams[*cur], layer, rows)?;
+            self.ple(w, &w.streams[*cur], layer, rows, spec)?;
         }
         self.run("qwen4_hc_pre", &[("residual", w.streams[*cur].buffer.ptr), ("norm", norm), ("w_di", di),
             ("w_up", up), ("y", w.x.buffer.ptr), ("inject", w.inject.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
@@ -842,16 +1190,18 @@ impl<'a> Qwen4Engine<'a> {
         Ok(())
     }
 
-    fn ple(&self, w: &Workspace<'_>, streams: &Dev<'_>, layer: &Qwen4Layer<'_>, rows: Dsv4Scalar) -> Result<()> {
+    fn ple(&self, w: &Workspace<'_>, streams: &Dev<'_>, layer: &Qwen4Layer<'_>, rows: Dsv4Scalar, spec: bool)
+        -> Result<()> {
         let table = self.ple.as_ref().context("PLE layer without the n-gram table (--ple)")?;
         let state = self.ple_state.as_ref().context("PLE conv state")?;
+        let replay = self.ple_replay.as_ref().context("PLE replay record")?;
         let name = if table.fp8 { "qwen4_ple_fp8" } else { "qwen4_ple_bf16" };
         self.run(name, &[("streams", streams.buffer.ptr), ("ids", w.ple_ids.buffer.ptr), ("table", table.table),
             ("scale", table.scale.buffer.ptr), ("w_kv", layer.ptr("ple.w_kv")?),
             ("norm_key", layer.ptr("ple.norm_key")?), ("norm_query", layer.ptr("ple.norm_query")?),
             ("norm_conv", layer.ptr("ple.norm_conv")?), ("conv_w", layer.ptr("ple.conv_w")?),
             ("conv_state", state.buffer.ptr), ("slots", w.slots.buffer.ptr), ("seq_first", w.seq_first.buffer.ptr),
-            ("scratch", w.scratch.buffer.ptr)], &[rows])
+            ("replay", replay.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows, Dsv4Scalar::I32(i32::from(spec))])
     }
 
     /// Decode-shaped steps use the E4M3 programs when the layer carries E4M3 copies.
@@ -859,8 +1209,10 @@ impl<'a> Qwen4Engine<'a> {
         cap == "m64" && layer.has("w_in_fp8")
     }
 
-    fn gdn(&self, w: &Workspace<'_>, index: usize, layer: &Qwen4Layer<'_>, rows: Dsv4Scalar, cap: &str) -> Result<()> {
-        let state = self.state[index].as_ref().context("GDN layer without a state pool")?;
+    fn gdn(&self, w: &Workspace<'_>, index: usize, layer: &Qwen4Layer<'_>, rows: Dsv4Scalar, cap: &str, spec: bool)
+        -> Result<()> {
+        let ord = self.gdn_ord[index].context("GDN layer without a state pool")?;
+        let [conv, state, replay] = self.gdn_pools(ord)?;
         let mut pointers = vec![("x", w.x.buffer.ptr), ("w_in", layer.ptr("w_in")?)];
         let fp8 = self.fp8(layer, cap);
         if fp8 {
@@ -871,17 +1223,35 @@ impl<'a> Qwen4Engine<'a> {
         if fp8 {
             pointers.extend([("w_out_fp8", layer.ptr("w_out_fp8")?), ("w_out_scale", layer.ptr("w_out_scale")?)]);
         }
-        pointers.extend([("conv_state", self.kv[index].buffer.ptr), ("state", state.buffer.ptr),
-            ("slots", w.slots.buffer.ptr), ("seq_first", w.seq_first.buffer.ptr), ("out", w.delta.buffer.ptr),
-            ("scratch", w.scratch.buffer.ptr)]);
+        pointers.extend([("conv_state", conv), ("state", state), ("slots", w.slots.buffer.ptr),
+            ("seq_first", w.seq_first.buffer.ptr), ("out", w.delta.buffer.ptr)]);
+        // Decode capacities record speculative replay inputs (spec) or advance the state.
+        let decode = cap == "m64";
+        if decode {
+            pointers.push(("replay", replay));
+        }
+        pointers.push(("scratch", w.scratch.buffer.ptr));
         let name = if fp8 { format!("qwen4_gdn_fp8_{cap}") } else { format!("qwen4_gdn_{cap}") };
-        self.run(&name, &pointers, &[rows])
+        if decode {
+            self.run(&name, &pointers, &[rows, Dsv4Scalar::I32(i32::from(spec))])
+        } else {
+            ensure!(!spec, "speculative steps take the decode programs");
+            self.run(&name, &pointers, &[rows])
+        }
     }
 
     fn full(&self, w: &Workspace<'_>, index: usize, layer: &Qwen4Layer<'_>, rows: Dsv4Scalar, cap: &str,
         tables: &StepTables) -> Result<()> {
-        let cache = self.kv[index].buffer.ptr;
+        let cache = self.kv[index].as_ref().context("full attention layer without a record pool")?;
         let (keys, blocks) = self.index[index].as_ref().context("full attention layer without an index cache")?;
+        self.attend(w, layer, cache.buffer.ptr, keys.buffer.ptr, blocks.buffer.ptr, rows, cap, tables)
+    }
+
+    /// Full attention of `layer` over the record pool `cache`, raw index keys
+    /// `keys` and pooled block keys `blocks` (a target layer's or the MTP layer's).
+    #[allow(clippy::too_many_arguments)]
+    fn attend(&self, w: &Workspace<'_>, layer: &Qwen4Layer<'_>, cache: *mut c_void, keys: *mut c_void,
+        blocks: *mut c_void, rows: Dsv4Scalar, cap: &str, tables: &StepTables) -> Result<()> {
         let fp8 = self.fp8(layer, cap);
         let mut pointers = vec![("x", w.x.buffer.ptr), ("w_in", layer.ptr("w_in")?)];
         if fp8 {
@@ -890,14 +1260,14 @@ impl<'a> Qwen4Engine<'a> {
         pointers.extend([("q_norm", layer.ptr("q_norm")?), ("k_norm", layer.ptr("k_norm")?),
             ("iq_norm", layer.ptr("iq_norm")?), ("ik_norm", layer.ptr("ik_norm")?),
             ("positions", w.positions.buffer.ptr), ("kv_slots", w.kv_slots.buffer.ptr),
-            ("pool_slots", w.pool_slots.buffer.ptr), ("kv_cache", cache), ("token_keys", keys.buffer.ptr),
-            ("index_cache", blocks.buffer.ptr), ("query", w.query.buffer.ptr), ("gate", w.gate.buffer.ptr),
+            ("pool_slots", w.pool_slots.buffer.ptr), ("kv_cache", cache), ("token_keys", keys),
+            ("index_cache", blocks), ("query", w.query.buffer.ptr), ("gate", w.gate.buffer.ptr),
             ("index_q", w.index_q.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
         let name = if fp8 { format!("qwen4_attn_producer_fp8_{cap}") } else { format!("qwen4_attn_producer_{cap}") };
         self.run(&name, &pointers, &[rows])?;
         if tables.long {
             self.run(&format!("qwen4_index_topk_{cap}"), &[("index_q", w.index_q.buffer.ptr),
-                ("positions", w.positions.buffer.ptr), ("index_cache", blocks.buffer.ptr),
+                ("positions", w.positions.buffer.ptr), ("index_cache", blocks),
                 ("page_table", w.pool_table.buffer.ptr), ("output_indices", w.blocks.buffer.ptr),
                 ("scratch", w.topk_scratch.buffer.ptr)], &[rows, Dsv4Scalar::I32(tables.pool_stride as i32)])?;
         }
@@ -980,16 +1350,22 @@ impl<'a> Qwen4Engine<'a> {
                 local.ensure(index, self.stream)?;
                 let mut resident = local.resident.borrow_mut();
                 let (_, experts) = resident.as_mut().context("EXL3 window")?;
+                let layer = if index == self.cfg.layers {
+                    crate::dsv4::local::LocalLayer::Stage(0)
+                } else {
+                    crate::dsv4::local::LocalLayer::Backbone(index)
+                };
                 // SAFETY: wire rows, routes and the shared-expert rows are complete in
                 // stream order; the output is copied before the window can change.
                 unsafe {
-                    experts.run(crate::dsv4::local::LocalLayer::Backbone(index), t, w.wire.buffer.ptr,
+                    experts.run(layer, t, w.wire.buffer.ptr,
                         w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, w.shared.buffer.ptr, self.stream)?;
                     self.library.copy_d2d_async(w.delta.buffer, experts.output.buffer, t * h * 2, self.stream)?;
                 }
                 return Ok(());
             }
             Experts::Spark { transport, runtime } => {
+                ensure!(index < self.cfg.layers, "the Spark ranks do not serve the MTP layer's experts");
                 return self.spark_moe(w, index, t, rows, decode, &mut transport.borrow_mut(), runtime);
             }
             Experts::SharedOnly => {
