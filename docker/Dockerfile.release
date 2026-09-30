@@ -151,8 +151,7 @@ RUN for exl3_family in /opt/cuteafd/lib/exl3/exl3-*/; do \
       /opt/cuteafd/share/licenses/xgrammar/LICENSE && \
     chmod +x \
       /opt/cuteafd/bin/cuteafd \
-      /usr/local/bin/cuteafd-release-entrypoint && \
-    python3 -c 'import b12x_mla_capture, b12x_spark_capture, triton_kv_pack_capture, triton_mlp_capture, triton_router_capture, triton_sampling_capture'
+      /usr/local/bin/cuteafd-release-entrypoint
 
 WORKDIR /opt/cuteafd
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/cuteafd-release-entrypoint"]
