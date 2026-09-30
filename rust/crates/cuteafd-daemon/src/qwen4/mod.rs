@@ -2,8 +2,11 @@
 //! n-gram table, the coordinator programs' layer chain, and the golden
 //! comparison command.
 pub(crate) mod engine;
+mod mtp_golden;
+pub(crate) mod mtp_policy;
 pub(crate) mod ple;
 pub(crate) mod serve;
+pub(crate) mod speculate;
 pub(crate) mod weights;
 
 use anyhow::{ensure, Result};
@@ -78,6 +81,14 @@ pub(crate) struct EngineArgs {
     /// (logits alone are 4 GiB at 4096 rows).
     #[arg(long, default_value_t = 12)]
     pub expert_reserve_gib: usize,
+    /// Native MTP drafts per step (0: no MTP). Loads the MTP layer (`mtp.*`,
+    /// its experts local) and verifies up to this many drafts per sequence.
+    #[arg(long, default_value_t = 0)]
+    pub mtp: usize,
+    /// MTP drafts read an E4M3 copy of lm_head (per-row x 128-K scales, made at
+    /// load): half the head's bytes per draft step; verification stays exact.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub mtp_fp8_head: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -108,6 +119,21 @@ pub(crate) struct GoldenArgs {
     /// tokens) on fresh sequences, without layer downloads.
     #[arg(long, default_value_t = 0)]
     pub bench_prefill: usize,
+    /// With --step-rows k: verify each step speculatively and commit only
+    /// this many of its rows (the next step starts after them), checking
+    /// GDN/PLE verify-by-replay against the golden logits.
+    #[arg(long)]
+    pub spec_keep: Option<usize>,
+    /// Compare the MTP layer (needs --mtp) with the torch reference in this
+    /// directory (python/reference/qwen4_exp/mtp.py), teacher forced on the
+    /// golden target streams, then stop.
+    #[arg(long)]
+    pub mtp_oracle: Option<PathBuf>,
+    /// Greedy-decode this many tokens after the golden prompt (--prefill N
+    /// truncates it) plainly and with MTP speculation at depth --mtp; the
+    /// outputs must match. Reports acceptance and step costs, then stops.
+    #[arg(long)]
+    pub spec_decode: Option<usize>,
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -163,8 +189,9 @@ impl Opened {
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::Qwen4Loader { library: &self.library, checkpoint: &self.checkpoint,
             fp8_decode: args.fp8_decode, stream };
-        let model = loader.model(&self.cfg, layers)?;
-        let resident: usize = model.layers.iter().map(weights::Qwen4Layer::bytes).sum();
+        let model = loader.model(&self.cfg, layers, args.mtp > 0 && layers == self.cfg.layers, args.mtp_fp8_head)?;
+        let resident: usize = model.layers.iter().map(weights::Qwen4Layer::bytes).sum::<usize>()
+            + model.mtp.as_ref().map_or(0, weights::MtpWeights::bytes);
         tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64,
             elapsed_ms = started.elapsed().as_millis() as u64, "Qwen 3.8 Flash Next coordinator weights resident");
         let ple = match self.cfg.ple_layers.first() {
@@ -207,6 +234,7 @@ impl Opened {
             return Ok(Some(engine::Experts::LocalExl3(engine::LocalExl3 {
                 library: &self.library, native_lib: args.native_lib.clone(), catalog,
                 resident: std::cell::RefCell::new(None), window: args.exl3_window.max(1), layers,
+                mtp: args.mtp > 0 && layers == self.cfg.layers,
                 max_rows: args.prefill_rows,
                 budget: free.saturating_sub(args.expert_reserve_gib << 30), loads: std::cell::RefCell::new(0),
             })));
@@ -260,7 +288,15 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
 
 fn golden(args: GoldenArgs) -> Result<()> {
     let opened = open(&args.engine)?;
-    opened.with_engine(&args.engine, |engine| golden_run(&args, &opened, engine))
+    opened.with_engine(&args.engine, |engine| {
+        if let Some(dir) = &args.mtp_oracle {
+            return mtp_golden::mtp_oracle(&args, &opened, engine, dir);
+        }
+        if let Some(count) = args.spec_decode {
+            return mtp_golden::spec_decode(&args, &opened, engine, count, args.engine.mtp);
+        }
+        golden_run(&args, &opened, engine)
+    })
 }
 
 /// Mean NLL of `logits` rows against the next tokens, and top-1 agreements.
@@ -348,15 +384,36 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
     let mut decode_worst = Vec::new();
     let mut decode_logits: Vec<f32> = Vec::new();
     let mut position = prefill;
+    let mut spec_steps = 0usize;
     while position < tokens.len() {
         let n = args.step_rows.min(tokens.len() - position);
         let first = position;
-        if let Some(logits) = engine.verify(&mut [(&mut placement, &tokens[position..position + n])],
-            &embed[position * row..(position + n) * row],
-            Some(&mut |layer, streams| compare(layer, first, streams, &mut decode_worst)))? {
-            decode_logits.extend(logits);
+        let rows = &tokens[position..position + n];
+        let step_embed = &embed[position * row..(position + n) * row];
+        let Some(keep) = args.spec_keep else {
+            if let Some(logits) = engine.verify(&mut [(&mut placement, rows)], step_embed,
+                Some(&mut |layer, streams| compare(layer, first, streams, &mut decode_worst)))? {
+                decode_logits.extend(logits);
+            }
+            position += n;
+            continue;
+        };
+        // Speculative: verify n rows, keep the first `keep` (the rest are verified again next step).
+        let keep = keep.clamp(1, n);
+        let history = placement.history.clone();
+        let logits = engine.verify_spec(&mut [(&mut placement, rows)], step_embed,
+            Some(&mut |layer, streams| compare(layer, first, streams, &mut decode_worst)))?;
+        engine.commit(&[(placement.slot, 0, keep)])?;
+        engine.rewind(&mut placement, first, history, &rows[..keep])?;
+        if let Some(logits) = logits {
+            decode_logits.extend_from_slice(&logits[..keep * cfg.vocab_size]);
         }
-        position += n;
+        spec_steps += 1;
+        position += keep;
+    }
+    if args.spec_keep.is_some() {
+        println!("speculative verify: {spec_steps} steps of {} rows, each committing {} (GDN/PLE verify-by-replay)",
+            args.step_rows, args.spec_keep.unwrap_or(0));
     }
     let golden_logits = || -> Result<Vec<f32>> {
         Ok(std::fs::read(args.golden.join("logits.bin"))?

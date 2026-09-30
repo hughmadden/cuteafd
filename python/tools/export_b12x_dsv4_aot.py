@@ -230,6 +230,11 @@ def qwen4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         ("expert_input_quant", "expert_input_quant", {}, lambda: qwen4.compile_qwen4_expert_input_quant_aot(g)),
         ("ple_bf16", "ple", {"fp8": False}, lambda: qwen4.compile_qwen4_ple_aot(g, fp8=False)),
         ("ple_fp8", "ple", {"fp8": True}, lambda: qwen4.compile_qwen4_ple_aot(g, fp8=True)),
+        # Speculation: MTP input feedback and the verify-by-replay commits.
+        ("mtp_feedback", "mtp_feedback", {}, lambda: qwen4.compile_qwen4_mtp_feedback_aot(g)),
+        ("head_fp8", "head_fp8", {}, lambda: qwen4.compile_qwen4_head_fp8_aot(g)),
+        ("ple_commit", "ple_commit", {}, lambda: qwen4.compile_qwen4_ple_commit_aot(g)),
+        ("gdn_commit", "gdn_commit", {}, lambda: qwen4_gdn.compile_qwen4_gdn_commit_aot(g)),
     ]
     from b12x.integration.cuteafd import qwen4_attention as attn
 

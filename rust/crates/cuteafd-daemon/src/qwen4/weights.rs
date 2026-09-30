@@ -47,6 +47,34 @@ pub(crate) struct Qwen4Weights<'a> {
     /// The final hyper-connection mixer: norm, w_down, w_up.
     pub mixer: [DeviceAllocation<'a>; 3],
     pub head: DeviceAllocation<'a>,
+    /// The native MTP layer (`mtp.*`), when loaded.
+    pub mtp: Option<MtpWeights<'a>>,
+}
+
+/// Qwen's MTP drafter (vLLM `Qwen4ExpMultiTokenPredictor`): one full-attention
+/// decoder layer (`mtp.layers.0`, no PLE) fed by the `residual_linear_shared`
+/// feedback of the target's pre-mixer streams and the next token's embedding
+/// (shared `embed_tokens`), its own stream mixer, and the shared `lm_head`.
+pub(crate) struct MtpWeights<'a> {
+    pub layer: Qwen4Layer<'a>,
+    /// `pre_fc_norm_hidden` [4H], `pre_fc_norm_embedding` [H], `fc_hidden`, `fc_embedding` [H, H].
+    pub norm_hidden: DeviceAllocation<'a>,
+    pub norm_embed: DeviceAllocation<'a>,
+    pub fc_hidden: DeviceAllocation<'a>,
+    pub fc_embed: DeviceAllocation<'a>,
+    /// `mtp.hyper_connection_mixer`: norm, w_down, w_up.
+    pub mixer: [DeviceAllocation<'a>; 3],
+    /// The drafts' E4M3 copy of the shared `lm_head` (per-row x 128-K FP32
+    /// scales) and its scales; the target keeps the BF16 head.
+    pub head_fp8: Option<(DeviceAllocation<'a>, DeviceAllocation<'a>)>,
+}
+
+impl MtpWeights<'_> {
+    pub fn bytes(&self) -> usize {
+        let [a, b, c] = &self.mixer;
+        self.layer.bytes() + [&self.norm_hidden, &self.norm_embed, &self.fc_hidden, &self.fc_embed, a, b, c]
+            .iter().map(|t| t.buffer.bytes).sum::<usize>()
+    }
 }
 
 pub(crate) struct Qwen4Loader<'a> {
@@ -138,8 +166,11 @@ impl<'a> Qwen4Loader<'a> {
     }
 
     pub fn layer(&self, cfg: &Qwen4Config, layer: usize) -> Result<Qwen4Layer<'a>> {
-        let p = format!("{PREFIX}layers.{layer}");
-        let attention = cfg.attention[layer];
+        self.layer_at(cfg, &format!("{PREFIX}layers.{layer}"), cfg.attention[layer], cfg.ple_layers.contains(&layer))
+    }
+
+    /// The decoder layer under `p` (a target layer or `mtp.layers.0`).
+    fn layer_at(&self, cfg: &Qwen4Config, p: &str, attention: Qwen4Attention, ple: bool) -> Result<Qwen4Layer<'a>> {
         let mut ops: HashMap<&'static str, DeviceAllocation<'a>> = HashMap::new();
         for (site, names) in [("attn_hyper_connection", ["attn.norm", "attn.w_di", "attn.w_up"]),
             ("mlp_hyper_connection", ["mlp.norm", "mlp.w_di", "mlp.w_up"])] {
@@ -178,7 +209,7 @@ impl<'a> Qwen4Loader<'a> {
         ensure!(packed <= SHARED_ROWS, "shared expert rows exceed the packed operand");
         ops.insert("shared.w_gate_up", self.rows(&shared, SHARED_ROWS - packed)?);
         ops.insert("shared.w_down", self.one(&m("shared_expert.down_proj.weight"))?);
-        if cfg.ple_layers.contains(&layer) {
+        if ple {
             let e = |name: &str| format!("{p}.ple.{name}");
             ops.insert("ple.w_kv", self.rows(&[e("key_proj.weight"), e("value_proj.weight")], 0)?);
             ops.insert("ple.norm_key", self.one(&e("norm_key.weight"))?);
@@ -219,12 +250,43 @@ impl<'a> Qwen4Loader<'a> {
         Ok(Qwen4Layer { attention, operands: ops })
     }
 
-    /// Layers `0..layers` (all of them unless the caller stops early).
-    pub fn model(&self, cfg: &Qwen4Config, layers: usize) -> Result<Qwen4Weights<'a>> {
+    /// Layers `0..layers` (all of them unless the caller stops early), and the
+    /// MTP layer with `mtp` (with an E4M3 draft head when `fp8_head`).
+    pub fn model(&self, cfg: &Qwen4Config, layers: usize, mtp: bool, fp8_head: bool) -> Result<Qwen4Weights<'a>> {
+        let (head, dtype, shape) = self.raw("lm_head.weight")?;
+        ensure!(dtype == DType::Bf16 && shape == [cfg.vocab_size, cfg.hidden], "lm_head must be BF16 [vocab, hidden]");
+        let mtp = if mtp {
+            let mut weights = self.mtp(cfg)?;
+            if fp8_head {
+                let started = std::time::Instant::now();
+                let (q, scales) = crate::glmf::fp8::quantize(&head, cfg.vocab_size, cfg.hidden,
+                    crate::glmf::fp8::Layout::Row128);
+                weights.head_fp8 = Some((self.upload(&q)?, self.upload(&f32_bytes(&scales))?));
+                tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "MTP draft head quantized to E4M3");
+            }
+            Some(weights)
+        } else {
+            None
+        };
         Ok(Qwen4Weights {
             layers: (0..layers.min(cfg.layers)).map(|l| self.layer(cfg, l)).collect::<Result<_>>()?,
             mixer: self.hc(&format!("{PREFIX}hyper_connection_mixer"), false)?,
-            head: self.one("lm_head.weight")?,
+            head: self.upload(&head)?,
+            mtp,
+        })
+    }
+
+    pub fn mtp(&self, cfg: &Qwen4Config) -> Result<MtpWeights<'a>> {
+        ensure!(cfg.mtp_layers == 1, "the MTP drafter runs one MTP layer (config has {})", cfg.mtp_layers);
+        ensure!(self.tensor("mtp.fc_hidden.weight").is_ok(), "the checkpoint has no MTP weights (mtp.*)");
+        Ok(MtpWeights {
+            layer: self.layer_at(cfg, "mtp.layers.0", Qwen4Attention::Full, false)?,
+            norm_hidden: self.one("mtp.pre_fc_norm_hidden.weight")?,
+            norm_embed: self.one("mtp.pre_fc_norm_embedding.weight")?,
+            fc_hidden: self.one("mtp.fc_hidden.weight")?,
+            fc_embed: self.one("mtp.fc_embedding.weight")?,
+            mixer: self.hc("mtp.hyper_connection_mixer", false)?,
+            head_fp8: None,
         })
     }
 }
