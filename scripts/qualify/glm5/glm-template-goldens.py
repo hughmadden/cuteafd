@@ -17,7 +17,7 @@ import pathlib
 
 from transformers.utils.chat_template_utils import render_jinja_template
 
-FIXTURES = pathlib.Path(__file__).resolve().parents[3] / "rust/crates/cuteafd-api/src/openai/glm/fixtures"
+FIXTURES = pathlib.Path(__file__).resolve().parents[3] / "rust/crates/cuteafd-api/src/openai/chat/glm5/fixtures"
 TEMPLATES = {"exl3_k4": "glm53_exl3_k4.jinja", "zai": "glm53_zai.jinja"}
 
 WEATHER = {

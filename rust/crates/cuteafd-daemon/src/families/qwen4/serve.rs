@@ -17,7 +17,7 @@ use super::{embed_rows, open, Opened};
 use crate::shared::draft_policy::{Calibration, DraftHistory, Shape};
 use crate::shared::prefill_share::{add_phases, isolated_phases, Chunk, DecodeShareArgs};
 use anyhow::{Context, Result};
-use cuteafd_api::openai::qwen::QwenEncoding;
+use cuteafd_api::openai::chat::qwen4::QwenEncoding;
 use cuteafd_api::openai::{
     ConsoleHub, InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits, NativeRequest,
     PromptUsage,

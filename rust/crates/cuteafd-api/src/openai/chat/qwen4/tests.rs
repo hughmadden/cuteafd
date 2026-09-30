@@ -1,6 +1,6 @@
 use super::fixtures::{encoding, GOLDENS, TEMPLATE};
 use super::*;
-use crate::openai::glm::parser::GlmStop;
+use crate::openai::chat::glm5::parser::GlmStop;
 use deepseek_recipe::stream::OutputChunk;
 use deepseek_recipe_core::tools::ToolDefinition;
 use prompt::QwenToolChoice;

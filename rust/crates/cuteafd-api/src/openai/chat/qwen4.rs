@@ -15,7 +15,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::path::Path;
 
-pub use super::glm::template::ChatTemplate;
+pub use super::glm5::template::ChatTemplate;
 pub use parser::{QwenOutputParser, QwenParserOptions};
 pub use prompt::{template_context, QwenPromptOptions};
 
@@ -122,8 +122,8 @@ fn read_json(path: &Path) -> Result<Value> {
 
 #[cfg(test)]
 pub(crate) mod fixtures {
-    pub const TEMPLATE: &str = include_str!("qwen/fixtures/qwen38_flash_next.jinja");
-    pub const GOLDENS: &str = include_str!("qwen/fixtures/qwen38_template_goldens.json");
+    pub const TEMPLATE: &str = include_str!("qwen4/fixtures/qwen38_flash_next.jinja");
+    pub const GOLDENS: &str = include_str!("qwen4/fixtures/qwen38_template_goldens.json");
 
     pub fn encoding() -> super::QwenEncoding {
         super::QwenEncoding::new(TEMPLATE, super::QwenTokenIds::qwen38()).unwrap()

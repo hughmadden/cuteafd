@@ -13,7 +13,7 @@ const COPY_DRAFT: usize = 7;
 use super::{embed_rows, open, Opened};
 use crate::shared::prefill_share::{Chunk, DecodeShareArgs};
 use anyhow::{Context, Result};
-use cuteafd_api::openai::glm::GlmEncoding;
+use cuteafd_api::openai::chat::glm5::GlmEncoding;
 use cuteafd_api::openai::{
     ConsoleHub, InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits, NativeRequest,
     PromptUsage,

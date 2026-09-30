@@ -132,9 +132,9 @@ fn read_json(path: &Path) -> Result<Value> {
 
 #[cfg(test)]
 pub(crate) mod fixtures {
-    pub const EXL3_K4: &str = include_str!("glm/fixtures/glm53_exl3_k4.jinja");
-    pub const ZAI: &str = include_str!("glm/fixtures/glm53_zai.jinja");
-    pub const GOLDENS: &str = include_str!("glm/fixtures/glm53_template_goldens.json");
+    pub const EXL3_K4: &str = include_str!("glm5/fixtures/glm53_exl3_k4.jinja");
+    pub const ZAI: &str = include_str!("glm5/fixtures/glm53_zai.jinja");
+    pub const GOLDENS: &str = include_str!("glm5/fixtures/glm53_template_goldens.json");
 
     pub fn encoding() -> super::GlmEncoding {
         super::GlmEncoding::new(EXL3_K4, super::GlmTokenIds::glm5()).unwrap()

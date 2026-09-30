@@ -63,3 +63,11 @@ rust/crates/	\bGLM_DSA\b	GLM5
 rust/crates/	\bGLM_NEXT\b	GLM5_FLASH
 rust/crates/	\bQWEN4_EXP\b	QWEN4
 rust/crates/cuteafd-daemon/	\bCommands::ExpertdNative\b	Commands::Expertd
+# api: chat templates under openai::chat::<family id>
+rust/crates/	\bopenai::glm::	openai::chat::glm5::
+rust/crates/	\bopenai::qwen::	openai::chat::qwen4::
+rust/crates/	\bnative_v41::glm::	openai::chat::glm5::
+rust/crates/	\bnative_v41::qwen::	openai::chat::qwen4::
+rust/crates/cuteafd-api/src/openai.rs	(?<![\w:])glm::	glm5::
+rust/crates/cuteafd-api/src/openai.rs	(?<![\w:])qwen::	qwen4::
+rust/crates/cuteafd-api/src/openai/chat/qwen4	\bsuper::glm::	super::glm5::
