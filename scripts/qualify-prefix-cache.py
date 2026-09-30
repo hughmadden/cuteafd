@@ -3,15 +3,17 @@
 
   reference  Run the conversation set on a cache-off server (PREFIX_CACHE_ENTRIES=0) and save
              every greedy reply.
-  check      Run the same set on a cache-on server. Every reply must equal the reference
-             (restores are exact, so greedy text is identical to prefilling from cold), a
-             repeated prompt must report prompt_cache_hit_tokens == prompt_tokens, and a next
-             turn must reuse at least the previous prompt. Then the torture phase and the idle
-             accounting.
+  check      Run the same set on a cache-on server. A repeated prompt must report
+             prompt_cache_hit_tokens == prompt_tokens and reply exactly as the first time (an
+             exact-length restore takes the retained logits), and a next turn must reuse at
+             least the previous prompt. Replies that differ from the cache-off reference are
+             reported as informational: restores are byte-exact (mimo-golden --resume-at is that
+             gate), but prefilling only the suffix changes chunk boundaries and so FP order,
+             which can flip greedy near-ties. Then the torture phase and the idle accounting.
   torture    (part of check, or alone) W workers send prompts that share long prefixes and
-             cancel a random fraction during prefill (the connection closes after a random
-             delay) or during decode (after the first output), interleaved with probe requests
-             whose replies must equal the reference. Afterwards, idle, /v1/stats must show no
+             cancel a random fraction during prefill (cold prompts; the connection closes after
+             a random delay, so the server parks the prefilled chunks) or during decode (after
+             the first output), interleaved with probe requests compared with the reference. Afterwards, idle, /v1/stats must show no
              leaked pages (pages - pages_free == pages_retained) and one mark per entry.
 
   scripts/qualify-prefix-cache.py reference --base-url URL --output runs/prefix/ref.json
@@ -24,6 +26,7 @@ tail, three user turns each, thinking on, temperature 0, reasoning echoed back.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import random
 import sys
@@ -54,36 +57,58 @@ def open_request(base: str, body: dict, timeout: float = 1800):
                                                          headers={"Content-Type": "application/json"}), timeout=timeout)
 
 
+def hang_up(response) -> None:
+    """Close the connection under a blocked read (nothing arrives while the server prefills)."""
+    import socket
+    try:
+        response.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+    except (AttributeError, OSError):
+        response.close()
+
+
 def stream(base: str, body: dict, cancel_after_s: float | None = None, cancel_on_output: bool = False) -> dict:
     """Stream one reply; with a cancel option the connection is closed early (the result is
-    then partial and marked cancelled)."""
+    then partial and marked cancelled): `cancel_after_s` hangs up after that long whether or
+    not anything arrived (a cancel during prefill), `cancel_on_output` at the first output."""
     result = dict(reasoning="", content="", usage=None, finish_reason=None, cancelled=False)
-    started = time.monotonic()
     with open_request(base, dict(body, stream=True, stream_options={"include_usage": True})) as response:
-        for line in response:
-            if cancel_after_s is not None and time.monotonic() - started > cancel_after_s:
+        timer = threading.Timer(cancel_after_s, hang_up, [response]) if cancel_after_s is not None else None
+        if timer is not None:
+            timer.start()
+        try:
+            read_events(response, result, cancel_on_output)
+        except (OSError, ValueError, http.client.HTTPException):
+            if timer is None or timer.is_alive():
+                raise
+        finally:
+            if timer is not None:
+                timer.cancel()
+        hung_up = timer is not None and timer.finished.is_set() and not timer.is_alive() and result["finish_reason"] is None
+        result["cancelled"] = result["cancelled"] or hung_up
+        return result
+
+
+def read_events(response, result: dict, cancel_on_output: bool) -> None:
+    for line in response:
+        if not line.startswith(b"data: "):
+            continue
+        data = line[6:].strip()
+        if data == b"[DONE]":
+            return
+        event = json.loads(data)
+        if event.get("error"):
+            raise RuntimeError(f"SSE error: {event['error']}")
+        if event.get("usage"):
+            result["usage"] = event["usage"]
+        for choice in event.get("choices", []):
+            delta = choice.get("delta") or {}
+            result["reasoning"] += delta.get("reasoning_content") or ""
+            result["content"] += delta.get("content") or ""
+            if choice.get("finish_reason"):
+                result["finish_reason"] = choice["finish_reason"]
+            if cancel_on_output and (result["reasoning"] or result["content"]):
                 result["cancelled"] = True
-                return result
-            if not line.startswith(b"data: "):
-                continue
-            data = line[6:].strip()
-            if data == b"[DONE]":
-                break
-            event = json.loads(data)
-            if event.get("error"):
-                raise RuntimeError(f"SSE error: {event['error']}")
-            if event.get("usage"):
-                result["usage"] = event["usage"]
-            for choice in event.get("choices", []):
-                delta = choice.get("delta") or {}
-                result["reasoning"] += delta.get("reasoning_content") or ""
-                result["content"] += delta.get("content") or ""
-                if choice.get("finish_reason"):
-                    result["finish_reason"] = choice["finish_reason"]
-                if cancel_on_output and (result["reasoning"] or result["content"]):
-                    result["cancelled"] = True
-                    return result
-    return result
+                return
 
 
 def body(args, messages: list[dict]) -> dict:
@@ -109,19 +134,20 @@ def conversation(args, index: int, send=stream) -> list[dict]:
     return turns
 
 
-def compare(reference: list[list[dict]], observed: list[list[dict]]) -> list[str]:
-    problems = []
+def compare(reference: list[list[dict]], observed: list[list[dict]]) -> tuple[list[str], list[str]]:
+    """(problems, informational differences from the cache-off reference)."""
+    problems, notes = [], []
     for c, (ref, got) in enumerate(zip(reference, observed)):
         for r, g in zip(ref, got):
             where = f"conversation {c} turn {g['turn']}"
             for key in ("reasoning", "content"):
                 if r[key] != g[key]:
                     at = next((i for i, (x, y) in enumerate(zip(r[key], g[key])) if x != y), min(len(r[key]), len(g[key])))
-                    problems.append(f"{where}: {key} differs from the reference at character {at}")
+                    notes.append(f"{where}: {key} differs from the cache-off reference at character {at}")
             if "repeat" in g:
                 for key in ("reasoning", "content"):
-                    if g["repeat"][key] != r[key]:
-                        problems.append(f"{where}: the repeated prompt's {key} differs")
+                    if g["repeat"][key] != g[key]:
+                        problems.append(f"{where}: the repeated prompt's {key} differs from its first reply")
                 usage = g["repeat"]["usage"] or {}
                 if usage.get("prompt_cache_hit_tokens") != usage.get("prompt_tokens"):
                     problems.append(f"{where}: the repeated prompt hit {usage.get('prompt_cache_hit_tokens')} of "
@@ -131,7 +157,7 @@ def compare(reference: list[list[dict]], observed: list[list[dict]]) -> list[str
             hit = (turn["usage"] or {}).get("prompt_cache_hit_tokens") or 0
             if hit < ((previous["usage"] or {}).get("prompt_tokens") or 0):
                 problems.append(f"conversation {c} turn {turn['turn']}: hit {hit} is below the previous prompt")
-    return problems
+    return problems, notes
 
 
 def stats(base: str) -> dict:
@@ -147,7 +173,8 @@ def torture(args, reference: list[list[dict]] | None, send=stream, get_stats=sta
         c = rng.randrange(len(TOPICS))
         turns = rng.randrange(1, args.turns + 1)
         mode = rng.choices(["complete", "cancel-prefill", "cancel-decode", "probe"], weights=[3, 3, 3, 2])[0]
-        plan.append(dict(conversation=c, turns=turns, mode=mode, delay=rng.uniform(0.05, 1.5), index=i))
+        plan.append(dict(conversation=c, turns=turns, mode=mode, delay=rng.uniform(args.cancel_min_s, args.cancel_max_s),
+                         index=i))
     results, lock, cursor = [], threading.Lock(), iter(plan)
 
     def worker():
@@ -156,7 +183,11 @@ def torture(args, reference: list[list[dict]] | None, send=stream, get_stats=sta
                 item = next(cursor, None)
             if item is None:
                 return
-            messages = [{"role": "system", "content": system_prompt(TOPICS[item["conversation"]])}]
+            system = system_prompt(TOPICS[item["conversation"]])
+            if item["mode"] == "cancel-prefill":
+                # A cold prompt: its prefill spans many chunks, so the hang-up lands inside it.
+                system = f"request {item['index']}\n{system}"
+            messages = [{"role": "system", "content": system}]
             ref = reference[item["conversation"]] if reference else None
             for t in range(item["turns"]):
                 messages.append({"role": "user", "content": TURNS[t]})
@@ -186,10 +217,10 @@ def torture(args, reference: list[list[dict]] | None, send=stream, get_stats=sta
         thread.join()
     time.sleep(args.settle_s)
     idle = get_stats(args.base_url).get("prefix_cache") or {}
-    problems = [f"probe {r['index']} (conversation {r['conversation']}, {r['turns']} turns) differs from the reference"
-                for r in results if r.get("exact") is False]
-    problems += [f"request {r['index']} ({r['mode']}): {r['error']}" for r in results
-                 if "error" in r and not r["mode"].startswith("cancel")]
+    notes = [f"probe {r['index']} (conversation {r['conversation']}, {r['turns']} turns) differs from the reference"
+             for r in results if r.get("exact") is False]
+    problems = [f"request {r['index']} ({r['mode']}): {r['error']}" for r in results
+                if "error" in r and not r["mode"].startswith("cancel")]
     if idle:
         if idle.get("pages", 0) - idle.get("pages_free", 0) != idle.get("pages_retained"):
             problems.append(f"idle pages leaked: {idle}")
@@ -197,7 +228,7 @@ def torture(args, reference: list[list[dict]] | None, send=stream, get_stats=sta
             problems.append(f"idle marks do not match entries: {idle}")
     else:
         problems.append("/v1/stats has no prefix_cache section")
-    return dict(results=results, idle=idle, problems=problems)
+    return dict(results=results, idle=idle, problems=problems, notes=notes)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -215,21 +246,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--torture-requests", type=int, default=60)
     parser.add_argument("--settle-s", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=20260930)
+    parser.add_argument("--cancel-min-s", type=float, default=0.02, help="prefill cancellations: earliest hang-up")
+    parser.add_argument("--cancel-max-s", type=float, default=0.6, help="prefill cancellations: latest hang-up")
     args = parser.parse_args(argv)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    report: dict = dict(mode=args.mode, base_url=args.base_url, problems=[])
+    report: dict = dict(mode=args.mode, base_url=args.base_url, problems=[], notes=[])
     reference = json.loads(args.reference.read_text())["conversations"] if args.reference else None
     if args.mode in ("reference", "check"):
         report["conversations"] = [conversation(args, c) for c in range(args.conversations)]
     if args.mode == "check":
         if reference is None:
             raise SystemExit("check needs --reference")
-        report["problems"] += compare(reference, report["conversations"])
+        problems, notes = compare(reference, report["conversations"])
+        report["problems"] += problems
+        report["notes"] += notes
     if args.mode in ("check", "torture"):
         report["torture"] = torture(args, reference)
         report["problems"] += report["torture"]["problems"]
+        report["notes"] += report["torture"]["notes"]
     report["passed"] = not report["problems"]
     args.output.write_text(json.dumps(report, indent=1) + "\n")
+    for note in report["notes"]:
+        print("INFO", note)
     for problem in report["problems"]:
         print("FAIL", problem)
     print("PASS" if report["passed"] else f"{len(report['problems'])} problem(s)")

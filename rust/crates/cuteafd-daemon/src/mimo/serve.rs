@@ -406,6 +406,9 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     loop {
         while active.len() < max_sequences {
             let job = if active.is_empty() {
+                // Idle: publish the state the server waits in (captures and releases done).
+                cache.tick();
+                publish(stats, requests, generated_total, 0, &cache);
                 match receive.blocking_recv() {
                     Some(job) => job,
                     None => return Ok(()),
@@ -732,10 +735,16 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             release(&family, &mut cache, &mut free_rings, &mut free_slots, &request.placement, request.slot);
         }
         cache.tick();
-        if let Ok(mut stats) = stats.lock() {
-            *stats = serde_json::json!({"requests": requests, "generated_tokens": generated_total,
-                "active": active.len(), "prefix_cache": cache.stats()});
-        }
+        publish(stats, requests, generated_total, active.len(), &cache);
+    }
+}
+
+/// Serving statistics for `/v1/stats`.
+fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize,
+    cache: &PrefixCache<CudaCopyEngine<'_>>) {
+    if let Ok(mut stats) = stats.lock() {
+        *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
+            "prefix_cache": cache.stats()});
     }
 }
 

@@ -778,8 +778,9 @@ fn resume_check(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<
     let mut allocator = engine::Allocator::new(engine.pages, engine.rings);
     // A: prefill [0, P), capture, continue in place.
     let mut a = allocator.admit(n)?;
-    let started = Instant::now();
     prefill_digest(engine, &mut a, &embed[..at * row], chunk, false)?;
+    family.drain().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let started = Instant::now();
     family.capture(MarkSlot(0), &a, at).map_err(|e| anyhow::anyhow!("{e}"))?;
     // B: a second sequence restored from the snapshot (shared full pages, own tail and ring).
     let (mut b, copy) = allocator.fork(&a, at, n)?;
