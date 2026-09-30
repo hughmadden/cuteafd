@@ -28,10 +28,20 @@ pub(crate) type Range = (*const c_void, usize);
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct L2PrefetchArgs {
     /// L2 prefetch of the next layer's weights during a decode step's expert
-    /// exchange: off, auto (3/4 of the device L2) or a budget in MiB.
-    #[arg(long, env = "CUTEAFD_L2_PREFETCH", default_value = "off")]
-    pub l2_prefetch: String,
+    /// exchange: off, auto (3/4 of the device L2) or a budget in MiB. The
+    /// default is the family's: [`GLM_DEFAULT`] for GLM 5.3 and GLM 5.3 Flash,
+    /// [`OTHER_DEFAULT`] for MiMo and Qwen.
+    #[arg(long, env = "CUTEAFD_L2_PREFETCH")]
+    pub l2_prefetch: Option<String>,
 }
+
+/// GLM 5.3 and GLM 5.3 Flash default: auto won on the Sparks (1 RTX PRO 6000
+/// at 325 W + TP4, DFlash2, 3 interleaved rounds). GLM 5.3, glmrt v9 weighted
+/// mix: 38.53 -> 40.21 tok/s (+4.4%, every round and case). GLM 5.3 Flash C1
+/// counting / code / topic 157.5 / 118.0 / 99.0 -> 180.8 / 125.3 / 106.4.
+pub(crate) const GLM_DEFAULT: &str = "auto";
+/// Families not yet measured on real Spark exchanges keep it off.
+pub(crate) const OTHER_DEFAULT: &str = "off";
 
 /// The prefetch plan: per MoE layer, the ranges to touch while its experts
 /// are out (the next layer's, or the head's after the last).
@@ -43,8 +53,8 @@ pub(crate) struct L2Prefetch {
 
 impl L2PrefetchArgs {
     /// The budget in bytes (None: off).
-    pub fn budget(&self, library: &NativeLibrary) -> Result<Option<usize>> {
-        match self.l2_prefetch.as_str() {
+    pub fn budget(&self, library: &NativeLibrary, default: &str) -> Result<Option<usize>> {
+        match self.l2_prefetch.as_deref().unwrap_or(default) {
             "off" | "0" => Ok(None),
             "auto" => {
                 let l2 = library.l2_cache_bytes()?;

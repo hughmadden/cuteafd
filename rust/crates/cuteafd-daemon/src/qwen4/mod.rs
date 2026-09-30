@@ -212,7 +212,7 @@ impl Opened {
         if let Some(experts) = self.experts(args, layers)? {
             engine.set_experts(experts);
         }
-        if let Some(budget) = args.l2.budget(&self.library)? {
+        if let Some(budget) = args.l2.budget(&self.library, crate::l2_prefetch::OTHER_DEFAULT)? {
             engine.l2 = Some(crate::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
         let result = body(&engine);
