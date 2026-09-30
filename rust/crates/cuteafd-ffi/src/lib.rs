@@ -58,7 +58,7 @@ pub const CUTEAFD_CUDA_ROUTER_TOPK_MAX_K: usize = 64;
 pub const CUTEAFD_CUDA_SAMPLE_TOPK_MAX_K: usize = 64;
 
 /// Per-row status codes of the v4.1 GPU target-sampler
-/// (`native/shared/cuda/v41_sampling_gpu.h` §5.4). The integer values are the
+/// (`native/shared/cuda/sampling_gpu.h` §5.4). The integer values are the
 /// device ABI, not an enum: they are what `out_status` carries.
 pub const CUTEAFD_V41_SAMPLER_STATUS_OK: u32 = 0;
 pub const CUTEAFD_V41_SAMPLER_STATUS_EMPTY_CANDIDATES: u32 = 1;
@@ -99,7 +99,7 @@ pub const CUTEAFD_V41_SAMPLER_SCRATCH_BYTES: usize = 64;
 pub const CUTEAFD_V41_SAMPLER_PARAM_BYTES: usize = 64;
 
 /// 64-byte per-row parameter block, exactly as declared in
-/// `native/shared/cuda/v41_sampling_gpu.h`. Field order, sizes and natural
+/// `native/shared/cuda/sampling_gpu.h`. Field order, sizes and natural
 /// alignment are pinned by tests; `#[repr(C)]` is the ABI.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -828,7 +828,7 @@ type CudaEmbeddingLookupBf16AsyncFn = unsafe extern "C" fn(
     cuda_stream: *mut c_void,
 ) -> CuteafdStatus;
 /// K1 entry points of the v4.1 GPU target-sampler
-/// (`native/shared/cuda/v41_sampling_gpu.h`).
+/// (`native/shared/cuda/sampling_gpu.h`).
 type CudaV41TargetSampleFn = unsafe extern "C" fn(
     logits: *const f32,
     rows: usize,
@@ -863,7 +863,7 @@ type CudaV41TargetSampleAsyncFn = unsafe extern "C" fn(
     cuda_stream: *mut c_void,
 ) -> CuteafdStatus;
 /// Chunk-3a K3/K4 entry points of the v4.1 GPU target-sampler
-/// (`native/shared/cuda/v41_sampling_gpu.h`). They read K1's `scratch` and
+/// (`native/shared/cuda/sampling_gpu.h`). They read K1's `scratch` and
 /// materialize the retained set in CPU rank order into the rank-order arena.
 type CudaV41TopkSelectFn = unsafe extern "C" fn(
     logits: *const f32,
@@ -2767,7 +2767,7 @@ impl NativeLibrary {
 
 
     /// Launch the v4.1 GPU target-sampler's K1 on `cuda_stream` and return
-    /// immediately. Buffers must follow `v41_sampling_gpu.h`; every buffer is
+    /// immediately. Buffers must follow `sampling_gpu.h`; every buffer is
     /// validated first, mirroring `validate_logits_argmax_buffers`.
     ///
     /// `params` is the host-side parameter block used for validation;
@@ -2928,7 +2928,7 @@ impl NativeLibrary {
     /// as K1's. A pageable host address is not device-addressable under CUDA's
     /// documented model even where a driver happens to expose it.
     ///
-    /// See the rank-order contract in `v41_sampling_gpu.h`.
+    /// See the rank-order contract in `sampling_gpu.h`.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn cuda_v41_topk_select_async(
         &self,
@@ -3066,7 +3066,7 @@ impl NativeLibrary {
     /// `out_indices` (and, when supplied, the diagnostic `out_total` and
     /// `out_nucleus_count`) indexed by `output_row`. `out_total` and
     /// `out_nucleus_count` are only written for rows whose `DIAGNOSE` flag is
-    /// set. See the K5 contract in `v41_sampling_gpu.h`.
+    /// set. See the K5 contract in `sampling_gpu.h`.
     ///
     /// `params` is the host slice the validator reads; `params_device` is the
     /// device allocation the kernel dereferences, validated by

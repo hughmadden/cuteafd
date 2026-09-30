@@ -2009,7 +2009,7 @@ K2TreeModel k2_tree_model(const float* logits, size_t vocab, float temperature, 
                           float ln_min_p) {
   K2TreeModel out;
   /* The sampler's CTA width, from the SAME header definition the kernel uses
-   * (`CUTEAFD_V41_SAMPLER_CTA`, `v41_sampling_gpu.h`). This host model mirrors
+   * (`CUTEAFD_V41_SAMPLER_CTA`, `sampling_gpu.h`). This host model mirrors
    * the shipped segments; a hard-coded width here would model a kernel that is
    * not running (measured in chunk 6). */
   constexpr int kBlockLocal = CUTEAFD_V41_SAMPLER_CTA;

@@ -2,7 +2,7 @@
  * discipline, temperature scaling, scaled maximum, min_p survivor count and the
  * greedy / constrained-greedy device argmax (K1).
  *
- * See `v41_sampling_gpu.h` for the device ABI and
+ * See `sampling_gpu.h` for the device ABI and
  * `docs/gpu-sampling-design.md` §4.0-§4.1, §5, §11, §12.1-§12.2, §14 chunk 1 for
  * the contract. The CPU sampler in
  * `rust/crates/cuteafd-core/src/target_sampling.rs` is the correctness oracle and
@@ -29,7 +29,7 @@
  */
 
 #include "common.h"
-#include "v41_sampling_gpu.h"
+#include "sampling_gpu.h"
 
 #include <cuda_runtime_api.h>
 #include <math_constants.h>
@@ -92,7 +92,7 @@
 namespace {
 
 /* `kSamplerBlock` is the sampler's per-row CTA width; the knob, its shipped
- * default and the reason for it live in `v41_sampling_gpu.h`
+ * default and the reason for it live in `sampling_gpu.h`
  * (`CUTEAFD_V41_SAMPLER_BLOCK`) so the device selftest's host model reads the
  * same definition. */
 constexpr int kSamplerBlock = CUTEAFD_V41_SAMPLER_CTA;
@@ -983,7 +983,7 @@ __global__ void v41_sample_topk_pivot_kernel(
       kth_key = lo + m;
       /* `nabove` from the walk IS `C_gt(kth)`: it is `C_gt(hi)` at the pass-2
        * bound plus every survivor strictly above this one-key bucket. That is
-       * exactly the rank-order contract's `above_count` (v41_sampling_gpu.h).
+       * exactly the rank-order contract's `above_count` (sampling_gpu.h).
        * K4 independently re-derives the same count from the keys before
        * publishing, but the FFI's selection-only path reads K3's value, so it
        * must be `C_gt(kth)` and not `k - share`: those coincide only when
@@ -2231,7 +2231,7 @@ extern "C" cuteafd_status_t cuteafd_cuda_v41_target_sample(
 /* Chunk 3a entry points: K3 then K4 on the same stream, reading K1's `scratch`
  * exactly as K2 does. Purely additive — the K1/K2 entry points above are
  * unchanged, so the chunk-1/chunk-2 production path and its daemon caller do not
- * move. See the rank-order contract in `v41_sampling_gpu.h`. */
+ * move. See the rank-order contract in `sampling_gpu.h`. */
 extern "C" cuteafd_status_t cuteafd_cuda_v41_topk_select_async(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
     const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
@@ -2283,7 +2283,7 @@ extern "C" cuteafd_status_t cuteafd_cuda_v41_topk_select(
  * K1's `scratch` and K3/K4's rank-ordered retained list exactly as K2 reads
  * K1's scratch. Purely additive -- K1, K2 and K3/K4 above are unchanged, so the
  * chunk-1..3a paths and their daemon caller do not move. See the K5 contract in
- * `v41_sampling_gpu.h`. */
+ * `sampling_gpu.h`. */
 extern "C" cuteafd_status_t cuteafd_cuda_v41_nucleus_async(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
     const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,

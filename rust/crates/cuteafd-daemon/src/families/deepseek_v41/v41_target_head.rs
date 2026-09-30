@@ -78,7 +78,7 @@ impl SampledTargetRows {
 }
 
 /// The device's "no detail" sentinel normalized to 0, matching the ABI note in
-/// `v41_sampling_gpu.h` (approved design deviation).
+/// `sampling_gpu.h` (approved design deviation).
 fn normalize_status_detail(value: u32) -> u32 {
     if value == cuteafd_ffi::CUTEAFD_V41_SAMPLER_NO_DETAIL {
         0
@@ -573,7 +573,7 @@ impl<'a> TargetSamplingWave<'a> {
     /// serves many row classes, so a caller cannot "call the kernel for the
     /// ordered rows": K1/K2 are one entry point over every row and K3/K4/K5 are
     /// two more, each of which is a per-row no-op for the rows its contract does
-    /// not cover (`v41_sampling_gpu.cu`: `k2_applicable`, the K3/K4 eligibility
+    /// not cover (`sampling_gpu.cu`: `k2_applicable`, the K3/K4 eligibility
     /// block, and K5's ordered-row class). The rules are:
     ///
     /// * K1 + K2 always run. K1 masks, checks finiteness and publishes the

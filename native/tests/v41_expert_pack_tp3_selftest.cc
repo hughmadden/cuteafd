@@ -4,7 +4,7 @@
 // SM121 AOT expert export.
 //
 // The host reference re-implements the N256/K128 lane-major transform from
-// native/shared/cuda/v41_expert_pack.cu and every output byte is compared, so
+// native/shared/cuda/expert_pack.cu and every output byte is compared, so
 // a wrong tile/row/column mapping or a wrong packed extent fails loudly. Also
 // checks the accepted-extent list and byte sizes (32-scale alignment, 128
 // storage padding).

@@ -1348,10 +1348,10 @@ cuteafd_status_t cuteafd_cuda_unpack_nibbles(const uint8_t* packed, uint8_t* cod
 
 /* V4.1 GPU target-sampler device ABI: the 64-byte per-row parameter block,
  * the packed constraint-mask layout and the K1 entry points. Defined once in
- * shared/cuda/v41_sampling_gpu.h and shared with the kernel source. The
+ * shared/cuda/sampling_gpu.h and shared with the kernel source. The
  * relative spelling keeps `native/include` as the only include root this
  * header needs. */
-#include "../cuda/v41_sampling_gpu.h"
+#include "../cuda/sampling_gpu.h"
 
 #ifdef __cplusplus
 }

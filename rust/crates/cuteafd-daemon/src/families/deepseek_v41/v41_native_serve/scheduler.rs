@@ -558,7 +558,7 @@ pub(super) mod sampling_stats {
 /// Chunk 4a is the first chunk that serves stochastic rows on the device, so a
 /// round is no longer homogeneous. Every row is classified **independently** by
 /// its own parameters, exactly the way the device kernels classify themselves
-/// (`v41_sampling_gpu.cu`: K1's greedy branch, `k2_applicable`, the K3/K4
+/// (`sampling_gpu.cu`: K1's greedy branch, `k2_applicable`, the K3/K4
 /// eligibility block, and K5's ordered-row class), and the classification is the
 /// routing table of design §4.6:
 ///
@@ -1926,7 +1926,7 @@ mod sampling_tests {
     /// The chunk-4a routing table: one row per kernel class, asserted by the
     /// production router rather than by prose. Each expected route names the
     /// kernels the row takes (design §4.6 and the kernel eligibility blocks in
-    /// `v41_sampling_gpu.cu`).
+    /// `sampling_gpu.cu`).
     #[test]
     fn the_per_row_router_selects_the_documented_kernel_class() {
         use cuteafd_core::TargetSamplingParams;

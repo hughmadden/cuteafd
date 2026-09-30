@@ -48,7 +48,7 @@ extern "C" int32_t cuteafd_v41_router_initialize() {
   return 0;
 }
 
-// Internal projection entry: full buffer/alias validation is in v41_router.cu.
+// Internal projection entry: full buffer/alias validation is in expert_router.cu.
 // Never initialize modules or allocate during launch/capture.
 extern "C" int32_t cuteafd_v41_router_scores_aot(const uint16_t* input,
     const uint16_t* weight,float* logits,int32_t rows,int32_t experts,void* stream) {

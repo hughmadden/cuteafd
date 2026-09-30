@@ -5,7 +5,7 @@
  * the packed constraint-mask layout of §5.2/§5.3, the per-row scratch layout,
  * the per-row status codes of §5.4, and the C ABI entry-point declarations.
  *
- * It is included by `native/cuda/kernels/v41_sampling_gpu.cu` (the kernel) and
+ * It is included by `native/shared/cuda/sampling_gpu.cu` (the kernel) and
  * by `native/include/cuteafd_native.h` (the public ABI), so the two can never
  * disagree; it is mirrored by `rust/crates/cuteafd-ffi/src/lib.rs`, which
  * test-pins `sizeof`/offsets/alignment of `cuteafd_v41_sampler_row_t`.

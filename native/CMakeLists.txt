@@ -255,13 +255,13 @@ if(CUTEAFD_ENABLE_CUDA)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
   list(APPEND CUTEAFD_NATIVE_SOURCES
-    shared/cuda/v41_expert_pack.cu
-    shared/cuda/v41_exl3_wire.cu
-    shared/cuda/v41_route_reduce.cu
+    shared/cuda/expert_pack.cu
+    shared/cuda/exl3_wire.cu
+    shared/cuda/route_reduce.cu
     families/deepseek_v41/cuda/engram.cu
     families/deepseek_v41/cuda/v41_dspark.cu
     families/deepseek_v41/cuda/v41_hc.cu
-    shared/cuda/v41_router.cu
+    shared/cuda/expert_router.cu
     families/deepseek_v4/cuda/dsv4_dspark.cu
     families/glm5/cuda/glm_dflash.cu
     families/glm5/cuda/glm_mla_prefill.cu
@@ -276,7 +276,7 @@ if(CUTEAFD_ENABLE_CUDA)
     families/deepseek_v41/cuda/v41_vision.cu
     families/deepseek_v41/cuda/v41_kv.cu
     families/deepseek_v41/cuda/v41_sparse_attention.cu
-    shared/cuda/v41_peer_copy.cu
+    shared/cuda/peer_copy.cu
     families/deepseek_v41/cuda/v41_index_scores.cu
     families/deepseek_v41/cuda/v41_index_topk.cu
     families/deepseek_v41/cuda/v41_candidate_blocks.cu
@@ -291,7 +291,7 @@ if(CUTEAFD_ENABLE_CUDA)
     shared/cuda/attention.cu
     shared/cuda/embedding.cu
     shared/cuda/sampling.cu
-    shared/cuda/v41_sampling_gpu.cu
+    shared/cuda/sampling_gpu.cu
     shared/cuda/nibbles.cu
     shared/cuda/nvfp4_payload.cu
     shared/cuda/nvfp4_scale.cu
@@ -541,7 +541,7 @@ if(CUTEAFD_ENABLE_CUDA)
   target_link_libraries(cuteafd_cuda_selftest PRIVATE cuteafd_native CUDA::cudart CUDA::cublas CUDA::cuda_driver)
   add_test(NAME cuteafd_cuda_selftest COMMAND cuteafd_cuda_selftest)
   # Chunk-1 GPU target-sampler (K1) device tests. They link the shipped native
-  # library and therefore also pin the exported C ABI of v41_sampling_gpu.h.
+  # library and therefore also pin the exported C ABI of sampling_gpu.h.
   # `.cu` because the subnormal/FTZ canary defines a probe kernel compiled with
   # the same CUDA flags as the shipped sampler objects.
   add_executable(cuteafd_v41_sampling_selftest tests/v41_sampling_selftest.cu)
