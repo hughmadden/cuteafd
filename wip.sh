@@ -542,4 +542,4 @@ distribute_expert_slot() {
 }
 
 distribute_expert_slot
-echo "WIP slot '$slot' is ready. Launch it with: ./run.sh --wip --wip-slot '$slot' --restart"
+echo "WIP slot '$slot' is ready. Launch it with: ./run.sh --wip '$slot' --restart"
