@@ -6,7 +6,7 @@
  * the per-row status codes of §5.4, and the C ABI entry-point declarations.
  *
  * It is included by `native/shared/cuda/sampling_gpu.cu` (the kernel) and
- * by `native/include/cuteafd_native.h` (the public ABI), so the two can never
+ * by `native/shared/include/cuteafd_native.h` (the public ABI), so the two can never
  * disagree; it is mirrored by `rust/crates/cuteafd-ffi/src/lib.rs`, which
  * test-pins `sizeof`/offsets/alignment of `cuteafd_v41_sampler_row_t`.
  *
@@ -14,7 +14,7 @@
  * `min_p` threshold and the lowest-id tie rule are ports of the frozen CPU
  * filter chain (`rust/crates/cuteafd-core/src/target_sampling.rs`), which is the
  * correctness oracle. The argmax/block-reduce structure is ported from the
- * legacy device argmax (`native/cuda/kernels/sampling.cu`,
+ * legacy device argmax (`native/shared/cuda/sampling.cu`,
  * `logits_argmax_f32_kernel`), which itself cites TRT-LLM; the FlashInfer
  * headers are a reference for the later chunks (K2/K3/K5) only, never a build
  * dependency.

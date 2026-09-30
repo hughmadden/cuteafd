@@ -301,6 +301,11 @@ types off V4.1 names, one `serve`/`expertd`/`golden` CLI with family
 detection, `run.sh` absorbs `run-dsv4.sh`, cmake/config/env aliases for one
 release; exported C symbols and V4.1-specific names stay). ≈3 days move pass,
 ≈3–4 days naming pass; V4.1 parity before tagging.
+Status: purge, move pass (M1–M8) and naming pass (N1–N9) done on
+`work/restructure`; `scripts/build/path-map.tsv`, `rename-map.tsv` and
+`rebase-across-move.sh` carry older branches across. Pending: full native AOT
+build and V4.1 parity on hardware, then the merge into `work/p0`; M9 (fork
+layout) separately.
 
 **Phase 5 — NVIDIA ModelOpt NVFP4 checkpoints (queued; after the families
 above reach their performance targets).** nvidia/{DeepSeek-V4.1-Flash,
