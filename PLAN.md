@@ -303,6 +303,11 @@ embedding cache refcounted by the prefix cache; MTP layers are unused when a
 DFlash2 drafter drafts. Dual-GPU coordinator default is the layer-range split
 (memory, ~1.9× GPU-bound prefill); TP2 of dense layers only if a P2P probe
 shows it pays (GPU0/GPU1 cross the host bridge; ds41rt measured it a loss).
+The drafter follows the GPU that owns the last backbone layers (taps and head
+live there); TP2 drafters are ≤1% on DFlash2 and not built unless the P2P
+probe shows ≤15 µs hops; the win is lane B drafting on GPU1 while lane A
+verifies on GPU0 at C≥2. Benchmark only the natural minimum and maximum
+configs (AGENTS.md); the planner's estimates cover the rest.
 One `ExpertRouter` replaces the six per-family stage/send/land/reduce copies;
 V4.1's `receive_owned` stays untouched. Stages: S0 planner + `plan` (must
 reproduce today's layouts), S1 manifest handoff + workers, S2 router in the
