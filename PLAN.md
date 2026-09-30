@@ -307,10 +307,14 @@ Evaluate per family, not globally: GQA models with many KV heads (MiMo V2.6
 Pro: 128 q × 192, 8 KV heads, 16K-wide o_proj, ~18 GB streamed per token)
 can head-split attention across two GPUs with KV partitioned (4+4 KV heads,
 no replication) and one hidden all-reduce per layer — a possible C1 win the
-DeepSeek MLA models never showed. MLA models (V4.x, GLM) replicate the latent
-KV under a head split; their two-GPU KV option is decode context parallelism
-(DCP2: KV split by sequence, LSE merge). Order: P2P probe, then MiMo Pro head
-split vs layer-range split A/B, then DCP2 for long-context MLA pools.
+DeepSeek MLA models never showed (ds41rt's V4.1 head split with replicated KV
+measured −5…−8%; its attention weights are small next to hop and launch
+costs). GLM 5.3 is the other candidate: MLA, but ~205 MiB of coordinator
+weights per layer (o_proj 96, q_b 32, kv_b 14, shared expert 36), ~16 GB
+streamed per token, and a small replicated latent (656 B/token/layer). DCP2
+(KV split by sequence) is a capacity-only option and is not needed for V4.1
+(compressed KV, 14M-token default pool). Order: P2P probe, then head-split vs
+layer-range A/B for MiMo Pro and GLM 5.3.
 The drafter follows the GPU that owns the last backbone layers (taps and head
 live there); TP2 drafters are ≤1% on DFlash2 and not built unless the P2P
 probe shows ≤15 µs hops; the win is lane B drafting on GPU1 while lane A
