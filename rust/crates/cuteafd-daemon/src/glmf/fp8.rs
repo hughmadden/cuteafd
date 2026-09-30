@@ -6,8 +6,22 @@
 //! - `Row128`: one scale per output row and 128-wide K block, `[N, K/128]`.
 //! - `Channel`: one scale per output row (W8A16), stored repeated as `[N, K/128]`.
 //!
-//! Quantization of a BF16 weight: `s = amax / 448`, `q = e4m3_rn(w / s)`
+//! Quantization of a BF16 weight: `s = amax / 448` (or `--fp8-scales`' other
+//! rules, [`crate::fp8_linear::Fp8Scales`]), `q = e4m3_rn(w / s)`
 //! (saturating), the same recipe as the checkpoint's own blocks.
+use crate::fp8_linear::Fp8Scales;
+
+/// The smallest power of two >= `amax / 448` (1 for zero): Hugh Madden's
+/// glm53f-afd `pow2_scale`, bit for bit the native kernels'.
+pub(crate) fn pow2_scale(amax: f32) -> f32 {
+    if amax <= 0.0 || amax.is_nan() {
+        return 1.0;
+    }
+    let b = amax.to_bits();
+    // amax = m 2^e with m in [1, 2): 2^(e - 8), or 2^(e - 7) when m > 1.75 (448 = 1.75 x 2^8).
+    let x = ((b >> 23) as i32 - 135 + i32::from((b & 0x7F_FFFF) > 0x60_0000)).clamp(-126, 127);
+    f32::from_bits(((x + 127) as u32) << 23)
+}
 
 /// E4M3 (fn: no infinities, 0x7F NaN) of `x`, round to nearest even, saturating at 448.
 pub(crate) fn e4m3(x: f32) -> u8 {
@@ -119,8 +133,9 @@ fn bf16(bytes: &[u8], i: usize) -> f32 {
     f32::from_bits(u32::from(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])) << 16)
 }
 
-/// Quantizes a BF16 `[n, k]` weight; returns E4M3 bytes and FP32 scales in `layout`.
-pub(crate) fn quantize(weight: &[u8], n: usize, k: usize, layout: Layout) -> (Vec<u8>, Vec<f32>) {
+/// Quantizes a BF16 `[n, k]` weight; returns E4M3 bytes and FP32 scales in
+/// `layout`, each block's scale by `rule`.
+pub(crate) fn quantize(weight: &[u8], n: usize, k: usize, layout: Layout, rule: Fp8Scales) -> (Vec<u8>, Vec<f32>) {
     assert_eq!(weight.len(), n * k * 2);
     assert!(k % 128 == 0 && (layout != Layout::Block || n % 128 == 0));
     let kb = k / 128;
@@ -151,8 +166,33 @@ pub(crate) fn quantize(weight: &[u8], n: usize, k: usize, layout: Layout) -> (Ve
                         let amax = s.iter().copied().fold(0f32, f32::max);
                         s.fill(amax);
                     }
+                    let amax = s.clone();
                     for sb in &mut s {
-                        *sb = if *sb > 0.0 { *sb / 448.0 } else { 1.0 };
+                        *sb = match rule {
+                            Fp8Scales::Pow2 => pow2_scale(*sb),
+                            _ if *sb > 0.0 => *sb / 448.0,
+                            _ => 1.0,
+                        };
+                    }
+                    if rule == Fp8Scales::Best {
+                        // Per scale block (all its rows), the scale with the smaller squared error.
+                        let err = |b: usize, scale: f32| -> f64 {
+                            rows.clone().map(|row| (b * 128..(b + 1) * 128).map(|c| {
+                                let x = bf16(weight, row * k + c);
+                                f64::from(e4m3_value(e4m3(x / scale)) * scale - x).powi(2)
+                            }).sum::<f64>()).sum()
+                        };
+                        let blocks = if layout == Layout::Channel { 1 } else { kb };
+                        for b in 0..blocks {
+                            let (sa, sp) = (s[b], pow2_scale(amax[b]));
+                            if sp != sa && err(b, sp) < err(b, sa) {
+                                if layout == Layout::Channel {
+                                    s.fill(sp);
+                                } else {
+                                    s[b] = sp;
+                                }
+                            }
+                        }
                     }
                     for row in rows {
                         let out = &mut values[(row - first * rows_per_scale) * k..][..k];
@@ -193,12 +233,30 @@ mod tests {
     }
 
     #[test]
+    fn pow2_scales_keep_three_mantissa_bits_exact() {
+        assert_eq!(pow2_scale(448.0), 1.0);
+        assert_eq!(pow2_scale(449.0), 2.0);
+        assert_eq!(pow2_scale(1.75 * 2f32.powi(-3)), 2f32.powi(-11));
+        assert_eq!(pow2_scale(0.0), 1.0);
+        // A 128-wide row of 3-mantissa-bit values: exact under pow2 and best, not under amax / 448.
+        let w: Vec<f32> = (0..128).map(|i| [1.0, 1.125, -1.5, 0.875, 3.25][i % 5] * 2f32.powi(-(i as i32 % 9))).collect();
+        let bytes: Vec<u8> = w.iter().flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes()).collect();
+        let exact = |rule| {
+            let (q, s) = quantize(&bytes, 1, 128, Layout::Row128, rule);
+            (0..128).filter(|&i| decode(q[i]) * s[0] == w[i]).count()
+        };
+        assert_eq!(exact(Fp8Scales::Pow2), 128);
+        assert_eq!(exact(Fp8Scales::Best), 128);
+        assert!(exact(Fp8Scales::Amax) < 128);
+    }
+
+    #[test]
     fn row_layouts_bound_the_error() {
         let (n, k) = (4, 256);
         let w: Vec<f32> = (0..n * k).map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.01 * (1 + i / k) as f32).collect();
         let bytes: Vec<u8> = w.iter().flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes()).collect();
         for layout in [Layout::Row128, Layout::Channel] {
-            let (q, s) = quantize(&bytes, n, k, layout);
+            let (q, s) = quantize(&bytes, n, k, layout, Fp8Scales::Amax);
             for i in 0..n * k {
                 let x = bf16(&bytes, i);
                 let y = decode(q[i]) * s[(i / k) * 2 + (i % k) / 128];

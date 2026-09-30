@@ -191,6 +191,8 @@ pub(crate) struct GlmEngine<'a> {
     graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
     /// The DFlash2 drafter; every step taps its target layers.
     pub drafter: Option<super::dflash::GlmDrafter<'a>>,
+    /// L2 prefetch of the next layer's weights during decode exchanges.
+    pub l2: Option<crate::l2_prefetch::L2Prefetch>,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -229,7 +231,7 @@ impl<'a> GlmEngine<'a> {
         Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
             decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
             prefill_lanes: configured_lanes(),
-            lanes: RefCell::new(Vec::new()), full_prefill_logits: false, skip: None, profile: RefCell::new([0.0; 3]),
+            lanes: RefCell::new(Vec::new()), full_prefill_logits: false, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             exchange_host: RefCell::new([0.0; 4]),
             graphs: RefCell::new(std::collections::HashMap::new()), drafter: None })
     }
@@ -468,7 +470,7 @@ impl<'a> GlmEngine<'a> {
                 self.ffn(w, layer, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)?;
             } else if let Some(skip) = &self.skip {
                 self.moe_front(w, layer, t)?;
-                let ranks = self.moe_skip(w, layer, t, cap)?;
+                let ranks = self.moe_skip(w, index, layer, t, cap)?;
                 self.reduce(skip.pointers(), w, ranks, t)?;
             } else {
                 let (transport, runtime) = experts.as_mut()
@@ -565,7 +567,7 @@ impl<'a> GlmEngine<'a> {
             previous = match layer {
                 None => break,
                 Some(layer) if layer.dense => Previous::Delta,
-                Some(layer) if self.skip.is_some() => Previous::Planes(self.moe_skip(w, layer, t, "m64")?),
+                Some(layer) if self.skip.is_some() => Previous::Planes(self.moe_skip(w, index, layer, t, "m64")?),
                 Some(layer) => {
                     let (transport, runtime) = experts.as_mut()
                         .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
@@ -592,6 +594,30 @@ impl<'a> GlmEngine<'a> {
         unsafe { self.library.cuda_graph_launch(exec, self.stream)? };
         self.graphs.borrow_mut().insert(key, GraphExec(exec, self.library));
         Ok(())
+    }
+
+    /// Per layer, the weights a decode step reads after its routed experts
+    /// are out, in read order: the next layer's attention (E4M3 copies where
+    /// the decode programs read them), post-attention norm, router and shared
+    /// expert (or dense MLP); after the last layer the final norm and head.
+    pub fn decode_read_order(&self) -> Vec<Vec<crate::l2_prefetch::Range>> {
+        let layers = &self.weights.layers;
+        (0..layers.len()).map(|i| match layers.get(i + 1) {
+            Some(next) => crate::l2_prefetch::operands(&["input_norm", "w_qkv_a", "q_a_norm", "kv_a_norm", "w_q_b",
+                "w_iq", "w_ik", "k_norm_w", "k_norm_b", "w_uk", "w_uv", "w_o", "post_norm", "gate", "gate.bias",
+                "w_gate_up", "w_down"], |n| next.range(n)),
+            None => [&self.weights.norm, &self.weights.head].iter()
+                .map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes)).collect(),
+        }).collect()
+    }
+
+    /// After layer `index`'s shared expert is queued in a one-lane decode or
+    /// verify step: the L2 prefetch of what the step reads next.
+    fn prefetch(&self, index: usize) -> Result<()> {
+        match &self.l2 {
+            Some(l2) => l2.issue(self.library, index, self.stream),
+            None => Ok(()),
+        }
     }
 
     /// Router, shared expert and the Spark routed experts; leaves
@@ -632,6 +658,9 @@ impl<'a> GlmEngine<'a> {
     fn moe_exchange(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str, decode: bool,
         transport: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime) -> Result<usize> {
         self.moe_stage(w, layer, t, cap)?;
+        if decode {
+            self.prefetch(index)?;
+        }
         let wave = self.moe_send(w, index, t, decode, transport)?;
         runtime.block_on(self.moe_land(t, transport, wave))
     }
@@ -639,9 +668,16 @@ impl<'a> GlmEngine<'a> {
     /// [`Self::moe_exchange`] without the Spark request (benchmarks): the
     /// stage, then zero partials of [`SKIP_RANKS`] ranks uploaded through
     /// the skip intake's pinned staging (a host-mode wave's cost).
-    fn moe_skip(&self, w: &Workspace<'_>, layer: &GlmLayer<'_>, t: usize, cap: &str) -> Result<usize> {
+    /// With CUTEAFD_EMULATE_EXCHANGE_US a decode step waits that long after
+    /// the shared expert (and the L2 prefetch) as a Spark exchange would.
+    fn moe_skip(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str) -> Result<usize> {
         let skip = self.skip.as_ref().context("routed experts are not skipped")?;
         self.moe_stage(w, layer, t, cap)?;
+        if cap == "m64" {
+            let mark = crate::l2_prefetch::exchange_mark(self.library, self.stream)?;
+            self.prefetch(index)?;
+            crate::l2_prefetch::exchange_wait(self.library, mark)?;
+        }
         skip.upload_zeros(t, self.stream)?;
         Ok(SKIP_RANKS)
     }

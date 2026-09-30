@@ -48,6 +48,13 @@ pub(crate) struct EngineArgs {
     /// quantized at load) of the GDN and attention in/out projections.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub fp8_decode: bool,
+    /// Scale rule of the FP8 copies made from BF16 weights at load: amax /
+    /// 448, the smallest power of two >= it (pow2), or per block whichever of
+    /// the two leaves the smaller error (best).
+    #[arg(long, value_enum, default_value_t = crate::fp8_linear::Fp8Scales::Amax)]
+    pub fp8_scales: crate::fp8_linear::Fp8Scales,
+    #[command(flatten)]
+    pub l2: crate::l2_prefetch::L2PrefetchArgs,
     /// Where the PLE n-gram table lives.
     #[arg(long, value_enum, default_value_t = ple::PlePlacement::Host)]
     pub ple: ple::PlePlacement,
@@ -188,7 +195,7 @@ impl Opened {
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::Qwen4Loader { library: &self.library, checkpoint: &self.checkpoint,
-            fp8_decode: args.fp8_decode, stream };
+            fp8_decode: args.fp8_decode, fp8_scales: args.fp8_scales, stream };
         let model = loader.model(&self.cfg, layers, args.mtp > 0 && layers == self.cfg.layers, args.mtp_fp8_head)?;
         let resident: usize = model.layers.iter().map(weights::Qwen4Layer::bytes).sum::<usize>()
             + model.mtp.as_ref().map_or(0, weights::MtpWeights::bytes);
@@ -204,6 +211,9 @@ impl Opened {
             args.max_context, args.prefill_rows, pages, args.slots)?;
         if let Some(experts) = self.experts(args, layers)? {
             engine.set_experts(experts);
+        }
+        if let Some(budget) = args.l2.budget(&self.library)? {
+            engine.l2 = Some(crate::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
         let result = body(&engine);
         drop(engine);
@@ -425,13 +435,17 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
             tokens.len() - prefill, args.step_rows, started.elapsed().as_secs_f64(),
             decode_worst.iter().map(|c| format!("{c:.6}")).collect::<Vec<_>>());
         if !decode_logits.is_empty() {
-            let (agree, next_ok, golden_next, nll, scored) =
-                score(&decode_logits, &golden_logits()?, &tokens, prefill, vocab);
+            // Numerics A/B between engine configs (benchmarks): the decode rows' logits, F32.
+            if let Ok(path) = std::env::var("CUTEAFD_DUMP_DECODE_LOGITS") {
+                std::fs::write(&path, decode_logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+            }
+            let golden = golden_logits()?;
+            let (agree, next_ok, golden_next, nll, scored) = score(&decode_logits, &golden, &tokens, prefill, vocab);
             let rows = decode_logits.len() / vocab;
             println!("decode logits: top-1 agreement {:.1}% over {rows} rows | next-token accuracy engine {:.1}% \
-                golden {:.1}% | mean NLL {:.4}", 100.0 * agree as f64 / rows as f64,
+                golden {:.1}% | mean NLL {:.4} | mean KL(golden||engine) {:.5}", 100.0 * agree as f64 / rows as f64,
                 100.0 * next_ok as f64 / scored.max(1) as f64, 100.0 * golden_next as f64 / scored.max(1) as f64,
-                nll / scored.max(1) as f64);
+                nll / scored.max(1) as f64, crate::glmf::mean_kl(&decode_logits, &golden, prefill, vocab));
         }
     }
     if args.bench_prefill > 0 {
@@ -454,6 +468,8 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
         let mut token = tokens[placement.len.min(tokens.len() - 1)];
         let mut times = Vec::new();
         let mut produced = Vec::new();
+        // FNV-1a over every step's logits bits (bit-identity checks between configs).
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
         for _ in 0..args.bench_decode {
             let started = Instant::now();
             let row = embed_rows(&opened.checkpoint, &[token], cfg.hidden)?;
@@ -461,15 +477,19 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
             let logits = engine.verify(&mut [(&mut placement, &step[..])], &row, None)?;
             times.push(started.elapsed().as_secs_f64());
             if let Some(logits) = logits {
+                for v in &logits {
+                    digest = (digest ^ u64::from(v.to_bits())).wrapping_mul(0x0100_0000_01b3);
+                }
                 token = argmax(&logits);
                 produced.push(token);
             }
         }
         times.sort_by(f64::total_cmp);
         let profile = engine.profile.borrow();
-        println!("decode bench: {} steps through {layers} layers, median {:.2} ms (min {:.2}, max {:.2}); \
-            expert GPU wait {:.1} ms, exchange {:.1} ms total; tokens {:?}", times.len(),
-            1e3 * times[times.len() / 2], 1e3 * times[0], 1e3 * times[times.len() - 1], 1e3 * profile[0],
+        let mean = times.iter().sum::<f64>() / times.len() as f64;
+        println!("decode bench: {} steps through {layers} layers, median {:.3} ms (mean {:.3}, min {:.3}, max {:.2}); \
+            expert GPU wait {:.1} ms, exchange {:.1} ms total; logits digest {digest:016x}; tokens {:?}", times.len(),
+            1e3 * times[times.len() / 2], 1e3 * mean, 1e3 * times[0], 1e3 * times[times.len() - 1], 1e3 * profile[0],
             1e3 * profile[1], &produced[..produced.len().min(16)]);
     }
     let loads = match engine.experts() {

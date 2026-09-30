@@ -204,6 +204,8 @@ pub(crate) struct MimoEngine<'a> {
     pub profile: RefCell<[f64; 2]>,
     /// The DFlash drafter (V2.6 Pro's dflash/): every step taps its target layers.
     pub drafter: Option<super::dflash::MimoDrafter<'a>>,
+    /// L2 prefetch of the next layer's weights during decode exchanges.
+    pub l2: Option<crate::l2_prefetch::L2Prefetch>,
     /// The native MTP drafter: every step taps the last layer's rows.
     pub mtp: Option<super::mtp::MtpDrafter<'a>>,
 }
@@ -270,7 +272,7 @@ impl<'a> MimoEngine<'a> {
         Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, rings, family, kv, cos_sin_full,
             cos_sin_swa, workspace: RefCell::new(None), decode_workspace: RefCell::new(None), experts: None,
             expert_input: ExpertInput::Fp8,
-            profile: RefCell::new([0.0; 2]), drafter: None, mtp: None })
+            profile: RefCell::new([0.0; 2]), drafter: None, mtp: None, l2: None })
     }
 
     /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
@@ -795,6 +797,40 @@ impl<'a> MimoEngine<'a> {
         self.run(&format!("mimo_o_{cap}"), &pointers, &fp8_scalars(rows, decode, layer.has("w_o_fp8")))
     }
 
+    /// Per MoE layer, the weights a decode step reads after its routed
+    /// experts are out, in read order: the next layer's attention (E4M3
+    /// copies where the decode programs read them), norms, router and dense
+    /// MLP; after the last layer the final norm and head.
+    pub fn decode_read_order(&self) -> Vec<Vec<crate::l2_prefetch::Range>> {
+        let layers = &self.weights.layers;
+        (0..layers.len()).map(|i| match layers.get(i + 1) {
+            Some(next) => crate::l2_prefetch::operands(&["input_norm", "w_qkv", "sinks", "w_o", "post_norm", "w_router",
+                "w_hilo", "gate.bias", "w_gate_up", "w_down"], |n| next.range(n)),
+            None => {
+                let head = match &self.weights.head_fp8 {
+                    Some((q, scale)) => vec![q, scale],
+                    None => vec![&self.weights.head],
+                };
+                std::iter::once(&self.weights.norm).chain(head).map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes))
+                    .collect()
+            }
+        }).collect()
+    }
+
+    /// In a decode step with no real exchange (local experts), under
+    /// CUTEAFD_EMULATE_EXCHANGE_US (benchmarks): the L2 prefetch and a
+    /// Spark-like wait before the experts run.
+    fn emulated_exchange(&self, index: usize, decode: bool) -> Result<()> {
+        if !decode {
+            return Ok(());
+        }
+        let Some(mark) = crate::l2_prefetch::exchange_mark(self.library, self.stream)? else { return Ok(()) };
+        if let Some(l2) = &self.l2 {
+            l2.issue(self.library, index, self.stream)?;
+        }
+        crate::l2_prefetch::exchange_wait(self.library, Some(mark))
+    }
+
     /// Router scores, the sigmoid top-k select and the FP8 wire rows, then the
     /// routed experts (local or Spark); leaves their sum in `delta` for the
     /// next norm's residual add.
@@ -819,6 +855,9 @@ impl<'a> MimoEngine<'a> {
                 // SAFETY: the scale rows follow the payload inside each wire row.
                 ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
                 ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Dsv4Scalar::I32(grid as i32)])?;
+        }
+        if !matches!(experts, Experts::Spark { .. }) {
+            self.emulated_exchange(index, decode)?;
         }
         match experts {
             Experts::Local(local) => {
@@ -887,7 +926,16 @@ impl<'a> MimoEngine<'a> {
             self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.stream)?;
             self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.stream)?;
             self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), input.buffer, wire_bytes, self.stream)?;
-            self.library.cuda_stream_synchronize(self.stream)?;
+        }
+        // In a decode step the L2 prefetch queues behind the copies; the host waits for the copies only.
+        match self.l2.as_ref().filter(|_| decode) {
+            Some(l2) => {
+                let mark = crate::l2_prefetch::mark(self.library, self.stream)?;
+                l2.issue(self.library, index, self.stream)?;
+                crate::l2_prefetch::reached(self.library, mark)?;
+            }
+            // SAFETY: the engine owns this stream.
+            None => unsafe { self.library.cuda_stream_synchronize(self.stream)? },
         }
         self.profile.borrow_mut()[0] += timer.elapsed().as_secs_f64();
         let staged = staging.bytes();

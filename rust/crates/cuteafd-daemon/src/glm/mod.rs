@@ -48,6 +48,17 @@ pub(crate) struct EngineArgs {
     /// Sequences the drafter keeps a context for and drafts for at once.
     #[arg(long, default_value_t = 16)]
     pub draft_sequences: usize,
+    /// Draft through E4M3 copies of the drafter's GEMM weights and of the LM
+    /// head (false: BF16; the committed tokens are the same either way).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub draft_fp8: bool,
+    /// Scale rule of the FP8 copies made from BF16 weights at load: amax /
+    /// 448, the smallest power of two >= it (pow2), or per block whichever of
+    /// the two leaves the smaller error (best).
+    #[arg(long, value_enum, default_value_t = crate::fp8_linear::Fp8Scales::Amax)]
+    pub fp8_scales: crate::fp8_linear::Fp8Scales,
+    #[command(flatten)]
+    pub l2: crate::l2_prefetch::L2PrefetchArgs,
     /// Keep every prefill row's logits (glm-golden --nll; 2.5 GiB at 4096 rows).
     #[arg(long, hide = true)]
     pub full_prefill_logits: bool,
@@ -85,6 +96,11 @@ pub(crate) struct GoldenArgs {
     /// python/reference/glm_dflash2/reference.py's output directory.
     #[arg(long)]
     pub draft_oracle: Option<PathBuf>,
+    /// With --draft: replay the drafter alone on the golden taps, drafting
+    /// after every token from this position on, BF16 and FP8 (acceptance
+    /// against the text and the golden greedy picks, draft time).
+    #[arg(long)]
+    pub draft_replay: Option<usize>,
     /// Teacher-force this many copies of the sequence together (prefilled to
     /// staggered lengths), --step-rows rows each per step, and compare every
     /// copy's logits with the golden logits.
@@ -171,8 +187,12 @@ impl Opened {
             let mask = embed_rows(&self.catalog, &[cfg.mask_token], self.cfg.hidden)?;
             let file = draft_file.context("drafter prefetch")?.join()
                 .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
-            engine.drafter = Some(dflash::GlmDrafter::load(&self.library, snapshot, file, stream, args.draft_sequences,
-                args.draft_sequences, mask, false)?);
+            let mut drafter = dflash::GlmDrafter::load(&self.library, snapshot, file, stream, args.draft_sequences,
+                args.draft_sequences, mask, false)?;
+            if args.draft_fp8 {
+                drafter.enable_fp8(engine.weights.head.buffer.ptr, args.fp8_scales)?;
+            }
+            engine.drafter = Some(drafter);
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash2 drafter resident");
         }
         let ranks = |peers: &str| -> Result<(Vec<std::net::SocketAddr>, Vec<u64>)> {
@@ -238,6 +258,9 @@ impl Opened {
                 "Spark expert transports warm");
         }
         *engine.lanes.borrow_mut() = lanes;
+        if let Some(budget) = args.l2.budget(&self.library)? {
+            engine.l2 = Some(crate::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
+        }
         let result = body(&engine, transport.as_mut(), &runtime);
         drop(engine);
         drop(transport);
@@ -503,6 +526,25 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
     runtime: &tokio::runtime::Runtime) -> Result<()> {
     if let Some(dir) = &args.draft_oracle {
         return draft_oracle(args, opened, engine, dir);
+    }
+    if let Some(start) = args.draft_replay {
+        let drafter = engine.drafter.as_ref().context("--draft-replay needs --draft")?;
+        let (tokens, greedy) = dflash::golden_sequence(&args.golden, opened.cfg.vocab_size)?;
+        let hidden = opened.cfg.hidden;
+        let layers: Vec<Vec<u8>> = drafter.cfg.taps.iter()
+            .map(|l| std::fs::read(args.golden.join(format!("layer{l:02}.bin")))).collect::<std::io::Result<_>>()?;
+        let row = hidden * 2;
+        let taps = |first: usize, n: usize| -> Result<Vec<u8>> {
+            let mut taps = vec![0u8; n * layers.len() * row];
+            for r in 0..n {
+                for (i, layer) in layers.iter().enumerate() {
+                    taps[(r * layers.len() + i) * row..][..row].copy_from_slice(&layer[(first + r) * row..][..row]);
+                }
+            }
+            Ok(taps)
+        };
+        return dflash::replay(drafter, &tokens, &greedy, &taps, &|t| embed_rows(&opened.catalog, t, hidden),
+            engine.weights.head.buffer.ptr, start);
     }
     if let Some(rows) = args.bench_verify {
         return bench_verify(args, opened, engine, transport, runtime, rows);

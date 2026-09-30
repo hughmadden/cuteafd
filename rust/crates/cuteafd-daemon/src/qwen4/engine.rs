@@ -373,6 +373,8 @@ pub(crate) struct Qwen4Engine<'a> {
     /// Recorded after a Spark exchange's device-to-host copies: the host
     /// waits on it while the shared expert runs behind it.
     routes_ready: *mut c_void,
+    /// L2 prefetch of the next layer's weights during decode exchanges.
+    pub l2: Option<crate::l2_prefetch::L2Prefetch>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -462,7 +464,7 @@ impl<'a> Qwen4Engine<'a> {
             decode_workspace: RefCell::new(None), experts: None, profile: RefCell::new([0.0; 2]),
             graphs: RefCell::new(std::collections::HashMap::new()),
             use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0"),
-            routes_ready: library.cuda_event_create_ordering()? })
+            routes_ready: library.cuda_event_create_ordering()?, l2: None })
     }
 
     pub fn set_experts(&mut self, experts: Experts<'a>) {
@@ -471,6 +473,45 @@ impl<'a> Qwen4Engine<'a> {
 
     pub fn experts(&self) -> Option<&Experts<'a>> {
         self.experts.as_ref()
+    }
+
+    /// Per MoE layer, the weights a decode step reads after its routed
+    /// experts, in read order: the next layer's attention site, attention
+    /// (the E4M3 copies where the decode programs read them), MLP site,
+    /// router and shared expert; after the last layer the mixer and LM head.
+    pub fn decode_read_order(&self) -> Vec<Vec<crate::l2_prefetch::Range>> {
+        let layers = &self.weights.layers;
+        (0..layers.len()).map(|i| match layers.get(i + 1) {
+            Some(next) => {
+                let attention: &[&str] = match next.attention {
+                    Qwen4Attention::Gdn => &["w_in", "conv_w", "a_log", "dt_bias", "norm_w", "w_out"],
+                    Qwen4Attention::Full => &["w_in", "q_norm", "k_norm", "iq_norm", "ik_norm", "w_o"],
+                };
+                let names: Vec<&str> = ["attn.norm", "attn.w_di", "attn.w_up"].iter().chain(attention)
+                    .chain(&["mlp.norm", "mlp.w_di", "mlp.w_up", "gate", "shared.w_gate_up", "shared.w_down"])
+                    .copied().collect();
+                crate::l2_prefetch::operands(&names, |n| next.range(n))
+            }
+            None => self.weights.mixer.iter().chain([&self.weights.head])
+                .map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes)).collect(),
+        }).collect()
+    }
+
+    /// After layer `index`'s shared expert is queued in a decode step: the
+    /// L2 prefetch of what the step reads next; with local experts only under
+    /// CUTEAFD_EMULATE_EXCHANGE_US (benchmarks), with a Spark-like wait.
+    fn exchange_window(&self, index: usize, decode: bool, local: bool) -> Result<()> {
+        if !decode {
+            return Ok(());
+        }
+        let mark = if local { crate::l2_prefetch::exchange_mark(self.library, self.stream)? } else { None };
+        if local && mark.is_none() {
+            return Ok(());
+        }
+        if let Some(l2) = &self.l2 {
+            l2.issue(self.library, index, self.stream)?;
+        }
+        crate::l2_prefetch::exchange_wait(self.library, mark)
     }
 
     /// Before a sequence's first step: zeroes its state slot and maps its pool pages.
@@ -1382,6 +1423,7 @@ impl<'a> Qwen4Engine<'a> {
         let h = self.cfg.hidden;
         match self.experts.as_ref().context("MoE layer without experts")? {
             Experts::Local(local) => {
+                self.exchange_window(index, decode, true)?;
                 let resident = local.index_of(index)?;
                 let fp8 = local.experts.borrow();
                 ensure!(!fp8.wire_input(), "the coordinator FP8 package takes BF16 rows");
@@ -1396,6 +1438,7 @@ impl<'a> Qwen4Engine<'a> {
                 unsafe { self.library.cuda_stream_synchronize(self.stream)? };
             }
             Experts::LocalExl3(local) => {
+                self.exchange_window(index, decode, true)?;
                 local.ensure(index, self.stream)?;
                 let mut resident = local.resident.borrow_mut();
                 let (_, experts) = resident.as_mut().context("EXL3 window")?;
@@ -1453,8 +1496,9 @@ impl<'a> Qwen4Engine<'a> {
             self.library.cuda_event_record(self.routes_ready, self.stream)?;
         }
         // The shared expert queues behind the copies and runs during the
-        // exchange; the host waits for the copies only.
+        // exchange (the L2 prefetch behind it); the host waits for the copies only.
         self.shared(w, &self.weights.layers[index], rows)?;
+        self.exchange_window(index, decode, false)?;
         // SAFETY: the event was recorded on this engine's stream above.
         unsafe { self.library.cuda_event_synchronize(self.routes_ready)? };
         self.profile.borrow_mut()[0] += timer.elapsed().as_secs_f64();

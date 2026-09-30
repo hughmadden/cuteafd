@@ -1,6 +1,8 @@
 pub mod dsv4;
 pub mod fp8_moe;
 mod glm_dflash;
+mod fp8_gemv;
+mod l2_prefetch;
 mod glm_mla;
 mod vocab_head;
 pub use vocab_head::VOCAB_HEAD_ROWS_MAX;

@@ -324,6 +324,8 @@ pub(crate) struct GlmfEngine<'a> {
     commit_tables: Dev<'a>,
     /// The DFlash2 drafter: every step taps its target layers.
     pub drafter: Option<crate::glm::dflash::GlmDrafter<'a>>,
+    /// L2 prefetch of the next layer's weights during decode exchanges.
+    pub l2: Option<crate::l2_prefetch::L2Prefetch>,
     /// Per MLA layer (None for KDA): per-token indexer keys | gates (BF16
     /// [record slots, 256]) and the FP8 pool-key cache.
     index: Vec<Option<(Dev<'a>, Dev<'a>)>>,
@@ -442,7 +444,7 @@ impl<'a> GlmfEngine<'a> {
             subset_lanes: std::env::var("CUTEAFD_GLMF_PREFILL_LANES").is_ok_and(|v| v == "subset"),
             full_prefill_logits: false, routes_ready: library.cuda_event_create_ordering()?,
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
-            fp8_prefill: Fp8Prefill::default() })
+            fp8_prefill: Fp8Prefill::default(), l2: None })
     }
 
     /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
@@ -1228,6 +1230,53 @@ impl<'a> GlmfEngine<'a> {
         Ok(())
     }
 
+    /// Per MoE layer, the weights a decode step reads after its routed
+    /// experts are out, in read order: the next layer's attention site and
+    /// attention (E4M3 copies where the decode programs read them), FFN site,
+    /// router and shared expert; after the last layer the final norm and head.
+    pub fn decode_read_order(&self) -> Vec<Vec<crate::l2_prefetch::Range>> {
+        let layers = &self.weights.layers;
+        (0..layers.len()).map(|i| match layers.get(i + 1) {
+            Some(next) => {
+                let attention: &[&str] = match next.attention {
+                    GlmNextAttention::Kda => &["w_in", "w_fg", "conv_w", "a_log", "dt_bias", "o_norm", "w_o"],
+                    GlmNextAttention::Mla => &["w_qkv_a", "q_a_norm", "kv_a_norm", "w_q_b", "w_iq", "w_ik", "k_norm_w",
+                        "k_norm_b", "ape", "w_uk", "w_uv", "w_o"],
+                };
+                let names: Vec<&str> = ["attn.fn", "attn.scale", "attn.base", "input_norm"].iter().chain(attention)
+                    .chain(&["ffn.fn", "ffn.scale", "ffn.base", "post_norm", "gate", "gate.bias", "w_gate_up", "w_down"])
+                    .copied().collect();
+                crate::l2_prefetch::operands(&names, |n| next.range(n))
+            }
+            None => {
+                let head = match &self.weights.head_fp8 {
+                    Some((q, scale)) => vec![q, scale],
+                    None => vec![&self.weights.head],
+                };
+                std::iter::once(&self.weights.norm).chain(head).map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes))
+                    .collect()
+            }
+        }).collect()
+    }
+
+    /// After layer `index`'s shared expert is queued in a one-lane decode or
+    /// verify step (`decode`): the L2 prefetch of what the step reads next;
+    /// with no real exchange (`local`), only under CUTEAFD_EMULATE_EXCHANGE_US
+    /// (benchmarks), with a Spark-like wait.
+    fn exchange_window(&self, index: usize, decode: bool, local: bool) -> Result<()> {
+        if !decode {
+            return Ok(());
+        }
+        let mark = if local { crate::l2_prefetch::exchange_mark(self.library, self.stream)? } else { None };
+        if local && mark.is_none() {
+            return Ok(());
+        }
+        if let Some(l2) = &self.l2 {
+            l2.issue(self.library, index, self.stream)?;
+        }
+        crate::l2_prefetch::exchange_wait(self.library, mark)
+    }
+
     /// The routed experts of layer `index` (the front ran); leaves
     /// `bf16(routed + shared)` in `delta`.
     /// The shared expert runs here, after the routes are on their way (on the
@@ -1237,9 +1286,15 @@ impl<'a> GlmfEngine<'a> {
         decode: bool) -> Result<()> {
         let h = self.cfg.hidden;
         let experts = self.experts.as_ref().context("MoE layer without experts")?;
-        let shared = || self.ffn(w, layer, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, rows);
+        let shared = || {
+            self.ffn(w, layer, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, rows)?;
+            self.exchange_window(index, decode, !matches!(experts, Experts::Spark { .. }))
+        };
         match experts {
-            Experts::Skip => return self.ffn(w, layer, self.cfg.moe_intermediate, cap, w.delta.buffer.ptr, rows),
+            Experts::Skip => {
+                self.ffn(w, layer, self.cfg.moe_intermediate, cap, w.delta.buffer.ptr, rows)?;
+                return self.exchange_window(index, decode, true);
+            }
             Experts::Local(local) => {
                 shared()?;
                 let resident = local.index_of(index)?;
