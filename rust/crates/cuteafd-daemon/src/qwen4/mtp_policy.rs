@@ -15,10 +15,10 @@ use crate::glm::dflash_policy::DraftHistory;
 /// Qwen 3.8 Flash Next EXL3 K4.25, experts local on one RTX PRO 6000 (325 W):
 /// speculative verify step ms by rows (one sequence after the 1634-token golden
 /// prompt, qwen4-golden --spec-decode), and an MTP step with its E4M3 head and
-/// the host round trip (0.71 ms on the GPU).
-pub(crate) const RTX_TP1_VERIFY_MS: [(usize, f64); 13] = [(1, 9.1), (2, 9.8), (3, 11.0), (4, 11.6), (5, 12.4),
-    (6, 13.4), (8, 14.8), (12, 17.8), (16, 19.9), (24, 30.8), (32, 40.2), (48, 53.0), (64, 61.5)];
-pub(crate) const RTX_TP1_MTP_STEP_MS: f64 = 1.0;
+/// the host round trip (0.71 ms alone, 0.93 ms in a cycle).
+pub(crate) const RTX_TP1_VERIFY_MS: [(usize, f64); 13] = [(1, 9.0), (2, 9.7), (3, 10.9), (4, 11.4), (5, 12.3),
+    (6, 13.2), (8, 14.5), (12, 17.4), (16, 19.7), (24, 27.8), (32, 32.2), (48, 46.7), (64, 56.3)];
+pub(crate) const RTX_TP1_MTP_STEP_MS: f64 = 0.93;
 
 /// Cycle cost: the verify step by rows, scaled by what serving observes, and
 /// the MTP steps.

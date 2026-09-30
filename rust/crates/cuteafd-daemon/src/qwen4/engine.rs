@@ -287,6 +287,11 @@ struct Workspace<'a> {
     /// (U32 token, FP32 logit) of each head row.
     hidden_rows: Dev<'a>,
     argmax: Dev<'a>,
+    /// Pinned staging of a step's host tables and input rows (async uploads)
+    /// and its fill level.
+    staging: RefCell<(HostAllocation<'a>, usize)>,
+    /// Pinned landing of the logits rows.
+    logits_host: RefCell<HostAllocation<'a>>,
     head: VocabularyHead<'a>,
     _head_workspace: Dev<'a>,
 }
@@ -620,6 +625,10 @@ impl<'a> Qwen4Engine<'a> {
             planes_host: RefCell::new(HostAllocation::new(self.library, if spark { MAX_RANKS * t * h * 2 } else { 256 })?),
             hidden_rows: self.alloc(t * 4)?,
             argmax: self.alloc(logit_rows * 8)?,
+            logits_host: RefCell::new(HostAllocation::new(self.library, logit_rows * self.cfg.vocab_size * 4)?),
+            staging: RefCell::new((HostAllocation::new(self.library, 16 * 16
+                + t * (8 * 3 + 4 * 4 + self.cfg.ple_rows() * 8 + (HC + 1) * h * 2)
+                + table_rows * (self.pages + self.pool_pages) * 4)?, 0)),
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, logit_rows as u32,
                 self.cfg.vocab_size as u32)? },
@@ -634,6 +643,40 @@ impl<'a> Qwen4Engine<'a> {
             return Ok(());
         }
         self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer }, bytes)
+    }
+
+    /// Starts a step's staged uploads (the previous step's have drained).
+    fn begin_staging(&self, w: &Workspace<'_>) -> Result<()> {
+        // SAFETY: the engine owns this stream; its earlier copies read the staging bytes.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        w.staging.borrow_mut().1 = 0;
+        Ok(())
+    }
+
+    /// Queues `bytes` into `dst` through the workspace's pinned staging.
+    fn stage(&self, w: &Workspace<'_>, dst: cuteafd_ffi::CuteafdDeviceBuffer, bytes: &[u8]) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        ensure!(bytes.len() <= dst.bytes, "staged upload exceeds its buffer");
+        let mut staging = w.staging.borrow_mut();
+        let at = staging.1;
+        ensure!(at + bytes.len() <= staging.0.buffer.bytes, "step inputs exceed the staging buffer");
+        staging.0.bytes_mut()[at..at + bytes.len()].copy_from_slice(bytes);
+        let source = cuteafd_ffi::CuteafdHostBuffer {
+            // SAFETY: `at` lies inside the pinned staging buffer.
+            ptr: unsafe { staging.0.buffer.ptr.cast::<u8>().add(at) }.cast(),
+            bytes: bytes.len(),
+            ..staging.0.buffer
+        };
+        // SAFETY: the staged bytes stay untouched until `begin_staging` drains the stream.
+        unsafe { self.library.copy_host_buffer_h2d_async(dst, source, bytes.len(), self.stream)? };
+        staging.1 = (at + bytes.len()).div_ceil(16) * 16;
+        Ok(())
+    }
+
+    fn stage_table<T: Copy>(&self, w: &Workspace<'_>, dev: &Dev<'_>, values: &[T]) -> Result<()> {
+        self.stage(w, dev.buffer, bytes_of(values))
     }
 
     fn download(&self, dev: &Dev<'_>, bytes: usize) -> Result<Vec<u8>> {
@@ -891,16 +934,17 @@ impl<'a> Qwen4Engine<'a> {
                 (w.streams[cur].buffer.ptr, cur ^ 1)
             }
         };
-        self.put(&w.positions, &tables.positions)?;
-        self.put(&w.kv_slots, &tables.kv_slots)?;
-        self.put(&w.slots, &tables.slots)?;
-        self.put(&w.seq_first, &tables.seq_first)?;
-        self.put(&w.pool_slots, &tables.pool_slots)?;
-        self.put(&w.cache_lengths, &tables.cache_lengths)?;
-        self.put(&w.page_table, &tables.page_table)?;
-        self.put(&w.pool_table, &tables.pool_table)?;
-        self.put(&w.hidden_rows, &hidden_rows)?;
-        self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: embed.len(), ..w.x.buffer }, embed)?;
+        self.begin_staging(w)?;
+        self.stage_table(w, &w.positions, &tables.positions)?;
+        self.stage_table(w, &w.kv_slots, &tables.kv_slots)?;
+        self.stage_table(w, &w.slots, &tables.slots)?;
+        self.stage_table(w, &w.seq_first, &tables.seq_first)?;
+        self.stage_table(w, &w.pool_slots, &tables.pool_slots)?;
+        self.stage_table(w, &w.cache_lengths, &tables.cache_lengths)?;
+        self.stage_table(w, &w.page_table, &tables.page_table)?;
+        self.stage_table(w, &w.pool_table, &tables.pool_table)?;
+        self.stage_table(w, &w.hidden_rows, &hidden_rows)?;
+        self.stage(w, w.x.buffer, embed)?;
         let rows = Dsv4Scalar::I32(t as i32);
         let cap = if decode { "m64" } else { "m4096" };
         self.run("qwen4_mtp_feedback", &[("hidden", src), ("hidden_rows", w.hidden_rows.buffer.ptr),
@@ -956,12 +1000,7 @@ impl<'a> Qwen4Engine<'a> {
         let best = self.download(&w.argmax, n * 8)?;
         let word = |i: usize| u32::from_le_bytes(best[i * 4..i * 4 + 4].try_into().unwrap());
         let drafts = (0..n).map(|i| (word(i), f32::from_bits(word(n + i)))).collect();
-        let logits = if logits {
-            Some(self.download(&w.logits, n * vocab * 4)?.chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
-        } else {
-            None
-        };
+        let logits = if logits { Some(self.download_logits(w, n)?) } else { None };
         Ok((drafts, logits))
     }
 
@@ -987,15 +1026,16 @@ impl<'a> Qwen4Engine<'a> {
         let workspace = slot.borrow();
         let w = workspace.as_ref().context("workspace")?;
         ensure!(t <= w.rows && logit_rows <= t, "step exceeds the workspace");
-        self.put(&w.positions, &tables.positions)?;
-        self.put(&w.kv_slots, &tables.kv_slots)?;
-        self.put(&w.slots, &tables.slots)?;
-        self.put(&w.seq_first, &tables.seq_first)?;
-        self.put(&w.pool_slots, &tables.pool_slots)?;
-        self.put(&w.cache_lengths, &tables.cache_lengths)?;
-        self.put(&w.page_table, &tables.page_table)?;
-        self.put(&w.pool_table, &tables.pool_table)?;
-        self.put(&w.ple_ids, &tables.ple_ids)?;
+        self.begin_staging(w)?;
+        self.stage_table(w, &w.positions, &tables.positions)?;
+        self.stage_table(w, &w.kv_slots, &tables.kv_slots)?;
+        self.stage_table(w, &w.slots, &tables.slots)?;
+        self.stage_table(w, &w.seq_first, &tables.seq_first)?;
+        self.stage_table(w, &w.pool_slots, &tables.pool_slots)?;
+        self.stage_table(w, &w.cache_lengths, &tables.cache_lengths)?;
+        self.stage_table(w, &w.page_table, &tables.page_table)?;
+        self.stage_table(w, &w.pool_table, &tables.pool_table)?;
+        self.stage_table(w, &w.ple_ids, &tables.ple_ids)?;
         // Streams start as four copies of the embedding.
         let row = h * 2;
         let mut streams = vec![0u8; t * HC * row];
@@ -1004,7 +1044,7 @@ impl<'a> Qwen4Engine<'a> {
                 streams[(r * HC + s) * row..][..row].copy_from_slice(e);
             }
         }
-        self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: streams.len(), ..w.streams[0].buffer }, &streams)?;
+        self.stage(w, w.streams[0].buffer, &streams)?;
         let rows = Dsv4Scalar::I32(t as i32);
         if self.use_graphs && tables.decode && on_layer.is_none() && forced.is_none() {
             return self.decode_graphed(w, tables, t, rows, logit_rows);
@@ -1073,8 +1113,20 @@ impl<'a> Qwen4Engine<'a> {
             w.head.launch(w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2).cast(),
                 self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), logit_rows as u32, self.stream)?;
         }
-        let logits = self.download(&w.logits, logit_rows * self.cfg.vocab_size * 4)?;
-        Ok(logits.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
+        self.download_logits(w, logit_rows)
+    }
+
+    /// The first `rows` logits rows through the pinned landing buffer.
+    fn download_logits(&self, w: &Workspace<'_>, rows: usize) -> Result<Vec<f32>> {
+        let n = rows * self.cfg.vocab_size;
+        let host = w.logits_host.borrow();
+        ensure!(n * 4 <= host.buffer.bytes, "logits rows exceed the landing buffer");
+        // SAFETY: the pinned buffer holds n floats; the sync completes the copy before the read.
+        unsafe {
+            self.library.copy_d2h_host_buffer_async(host.buffer, w.logits.buffer, n * 4, self.stream)?;
+            self.library.cuda_stream_synchronize(self.stream)?;
+            Ok(std::slice::from_raw_parts(host.buffer.ptr.cast::<f32>(), n).to_vec())
+        }
     }
 
     /// A decode step as captured segments: segment `i` finishes layer `i - 1`
