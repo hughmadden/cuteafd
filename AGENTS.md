@@ -74,6 +74,10 @@ go in commit messages as short before → after tables with conditions.
 - Correctness first, then warm-up, then identical-config A/B, interleaved,
   three runs for a final number. Judge speculation by emitted tok/s, not
   acceptance. Profiling perturbs timing.
+- Benchmark each model on two reference configs only: the natural minimum
+  (1× RTX + the fewest Sparks it fits) and the maximum (2× RTX + 4 or 6
+  Sparks, whichever divides the model sensibly). Other layouts need
+  correctness gates, not perf tables; the planner's estimates cover them.
 - Unsupported is a result, not a crash: `cuteafd plan` names the tensors,
   formats, shapes and the exporter or kernel to add.
 - Load speed is a feature; do not regress readiness time.
