@@ -107,10 +107,12 @@ struct StepTables {
     table_stride: usize,
 }
 
-/// A sequence's full-attention pages, its SWA ring and its length.
+/// A sequence's full-attention pages (from the refcounted pool: full pages may be
+/// shared with retained prefix snapshots and other sequences, which never write them),
+/// its SWA ring and its length.
 #[derive(Debug, Clone)]
 pub(crate) struct MimoPlacement {
-    pub pages: Vec<i32>,
+    pub pages: Vec<u32>,
     pub ring: i32,
     pub len: usize,
 }
@@ -126,28 +128,43 @@ impl MimoPlacement {
     }
 }
 
-/// Free pages of the full-attention pool and free SWA rings.
+/// Pages of the full-attention pool (the refcounted pool the prefix cache shares) and
+/// free SWA rings, for callers without a prefix cache (the golden command).
 pub(crate) struct Allocator {
-    pages: Vec<i32>,
+    pages: cuteafd_engine::prefix::RefPagePool,
     rings: Vec<i32>,
 }
 
 impl Allocator {
     pub fn new(pages: usize, rings: usize) -> Self {
-        Self { pages: (0..pages as i32).rev().collect(), rings: (0..rings as i32).rev().collect() }
+        Self { pages: cuteafd_engine::prefix::RefPagePool::new(pages, PAGE_ROWS), rings: (0..rings as i32).rev().collect() }
     }
 
     /// Reserves every page a sequence of up to `capacity` tokens needs, and a ring.
     pub fn admit(&mut self, capacity: usize) -> Result<MimoPlacement> {
-        let pages = capacity.div_ceil(PAGE_ROWS).max(1);
-        ensure!(self.pages.len() >= pages, "cache pages exhausted ({pages} needed, {} free)", self.pages.len());
-        let ring = self.rings.pop().context("SWA rings exhausted")?;
-        Ok(MimoPlacement { pages: (0..pages).map(|_| self.pages.pop().unwrap()).collect(), ring, len: 0 })
+        let pages = self.pages.alloc(self.pages.pages_for(capacity))?;
+        let Some(ring) = self.rings.pop() else {
+            self.pages.release(&pages);
+            anyhow::bail!("SWA rings exhausted");
+        };
+        Ok(MimoPlacement { pages, ring, len: 0 })
+    }
+
+    /// A second sequence starting as `source`'s first `len` rows: full pages shared, the
+    /// partial tail page copied into its own page by the caller (the returned copy).
+    pub fn fork(&mut self, source: &MimoPlacement, len: usize, capacity: usize)
+        -> Result<(MimoPlacement, Option<cuteafd_engine::prefix::TailCopy>)> {
+        let fork = self.pages.fork(&source.pages, len, self.pages.pages_for(capacity))?;
+        let Some(ring) = self.rings.pop() else {
+            self.pages.release(&fork.pages);
+            anyhow::bail!("SWA rings exhausted");
+        };
+        Ok((MimoPlacement { pages: fork.pages, ring, len: 0 }, fork.copy))
     }
 
     /// Returns a finished sequence's pages and ring.
     pub fn release(&mut self, placement: MimoPlacement) {
-        self.pages.extend(placement.pages);
+        self.pages.release(&placement.pages);
         self.rings.push(placement.ring);
     }
 }
@@ -275,6 +292,14 @@ impl<'a> MimoEngine<'a> {
             profile: RefCell::new([0.0; 2]), drafter: None, mtp: None, l2: None })
     }
 
+    /// Layer `layer`'s KV storage: the paged record pool (full attention; page `p` holds
+    /// rows at `p * PAGE_ROWS * record`) or the SWA rings (ring `r` at `r * RING_ROWS *
+    /// record`), with its record bytes.
+    pub(crate) fn kv_layer(&self, layer: usize) -> (MimoAttention, cuteafd_ffi::CuteafdDeviceBuffer, usize) {
+        let attention = self.weights.layers[layer].attention;
+        (attention, self.kv[layer].buffer, self.cfg.record_elems(attention) * 2)
+    }
+
     /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
     pub fn set_experts(&mut self, experts: Experts<'a>) {
         self.experts = Some(experts);
@@ -398,7 +423,7 @@ impl<'a> MimoEngine<'a> {
             slots: (start..start + t).map(|p| placement.slot(p)).collect::<Result<_>>()?,
             ring_slots: (start..start + t).map(|p| placement.ring_slot(p)).collect(),
             seq_first: vec![0; t],
-            page_table: placement.pages[..used].to_vec(),
+            page_table: placement.pages[..used].iter().map(|&page| page as i32).collect(),
             table_stride: 0,
         };
         let logits = self.step(&tables, embed, if all_logits { t } else { 1 }, on_layer, forced)?;
@@ -425,7 +450,7 @@ impl<'a> MimoEngine<'a> {
                 tables.slots.push(placement.slot(position)?);
                 tables.ring_slots.push(placement.ring_slot(position));
                 tables.seq_first.push(first);
-                let mut pages = placement.pages.clone();
+                let mut pages: Vec<i32> = placement.pages.iter().map(|&page| page as i32).collect();
                 pages.resize(stride, 0);
                 tables.page_table.extend(pages);
             }
@@ -589,7 +614,9 @@ impl<'a> MimoEngine<'a> {
                     let ext = mtp.ext.borrow()[seq.ring][k];
                     ensure!(ext <= seq.len, "MTP ring {} is ahead of its sequence (reset it at admission)", seq.ring);
                     // True rows are those whose token t_{j+k+1} is known (j <= len - k - 1).
-                    let true_end = seq.len.saturating_sub(k);
+                    // Catch-up stops before row len - 1: the drafting pass needs that row (its
+                    // argmax is the draft), so stage 0 must not consume it here.
+                    let true_end = seq.len.saturating_sub(k.max(1));
                     if seq.len - ext > MTP_STEP_ROWS && ext < true_end && rows < DECODE_ROWS {
                         let n = (true_end - ext).min(DECODE_ROWS - rows);
                         groups.push((seq.ring, ext, (ext..ext + n).map(|j| seq.tokens[j + k + 1]).collect::<Vec<_>>()));

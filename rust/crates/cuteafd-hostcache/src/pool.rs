@@ -62,6 +62,12 @@ impl Layout {
             scores,
         }
     }
+    /// A generic family's layout (`cuteafd-engine::prefix`): pages of `page` bytes (every
+    /// segment of one page index), the positional mark as the tail class, optional drafter rings,
+    /// no scores. The V4.1 engine keeps [`Layout::engine`].
+    pub fn family(page: usize, mark: usize, draft: usize) -> Self {
+        Self { page, tail: mark, draft, scores: 0 }
+    }
     /// Bytes of one slab of `class`.
     pub fn size(&self, class: Class) -> usize {
         match class {

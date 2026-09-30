@@ -71,4 +71,12 @@ mod constants {
         assert_eq!(TAIL_BYTES, 2_720_064);
         assert_eq!(DRAFT_BYTES, 202_752);
     }
+    /// V4.1's numbers stay pinned while generic families bring their own layouts.
+    #[test]
+    fn v41_layout_is_pinned() {
+        let layout = pool::Layout::engine(0);
+        assert_eq!((layout.page, layout.tail, layout.draft, layout.scores), (91_136, 2_720_064, 202_752, 0));
+        assert_eq!(pool::Layout::family(1_474_560, 26_624_000, 0),
+            pool::Layout { page: 1_474_560, tail: 26_624_000, draft: 0, scores: 0 });
+    }
 }

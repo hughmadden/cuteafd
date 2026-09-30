@@ -101,6 +101,15 @@ case "$speculator" in
   mtp) family_args+=(--mtp "$(key SPECULATOR_DEPTH MTP 1)") ;;
   dspark) dspark_args=(--dspark) ;;
 esac
+# MiMo prefix cache: PREFIX_CACHE_ENTRIES snapshots per bank (prompts, turns; 0 = off),
+# HOST_CACHE_BYTES of pinned host memory for snapshots the device evicts (e.g. 64GiB; 0 = off),
+# POOL_TOKENS full-attention KV tokens shared by live sequences and retained snapshots.
+if [[ $family == mimo_v2 ]]; then
+  family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)" --pool-tokens "$(get POOL_TOKENS 131072)")
+  [[ "$(get HOST_CACHE_BYTES 0)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES)")
+  # PREFIX_PARTIAL=on: V4.1-style partial reuse (approximate; off = exact restores only).
+  family_args+=(--prefix-partial "$(get PREFIX_PARTIAL off)")
+fi
 # GLM 5.3 Flash: decode rows read FP8 copies of the dense projections from the
 # official FP8 release (GLM5_FLASH_FP8_MODEL_ID, "off" for BF16), KDA
 # projections as per-row FP8 (GLM5_FLASH_KDA_FP8: row128, channel or off) and

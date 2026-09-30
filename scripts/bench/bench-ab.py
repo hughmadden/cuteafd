@@ -10,6 +10,14 @@ under runs/ab/LABEL/ and the summary prints per-arm medians and B/A ratios.
   scripts/bench/bench-ab.py --label p0-parity \
       --arm ds41rt=/home/tj/Developer/ds41rt --arm cuteafd=/home/tj/Developer/cuteafd \
       --layouts 1 2 --sessions 4
+
+--battery agentic replays a recording of scripts/bench/bench-agentic-session.py instead (identical
+prompts in every session; C1 and C4 by default), e.g. prefix cache on vs off on MiMo:
+
+  scripts/bench/bench-ab.py --label mimo-prefix --battery agentic --agentic-recording REC \
+      --launch 'scripts/launch/run-family.sh --restart' --layouts 1 --sessions 4 \
+      --arm off=CHECKOUT --arm on=CHECKOUT \
+      --arm-arg 'off=--config mimo-off.config' --arm-arg 'on=--config mimo-on.config'
 """
 from __future__ import annotations
 
@@ -49,9 +57,11 @@ def session(arm: str, path: Path, arms: dict[str, Path], rtx: int, out: Path, ar
     stop_all(arms, log)
     started = time.monotonic()
     extra = [*args.run_arg, *[w for a in args.arm_arg if a.split("=", 1)[0] == arm for w in shlex.split(a.split("=", 1)[1])]]
-    run(["./run.sh", "--rtx-gpus", str(rtx), "--restart", *extra], cwd=path, log=log, timeout=1800)
+    run([*shlex.split(args.launch.format(rtx=rtx)), *extra], cwd=path, log=log, timeout=1800)
     ready_s = time.monotonic() - started
     py = str(REPO / ".venv/bin/python")
+    if args.battery == "agentic":
+        return agentic_session(arm, rtx, ready_s, out, log, py, args)
     decode = [py, str(REPO / "scripts/bench/deepseek_v41/bench-release-decode.py"), "--base-url", args.base_url,
               "--tokenizer", args.tokenizer, "--nonce-seed", str(args.nonce_seed)]
     run([*decode, "--label", f"{arm}-warmup", "--output", str(out / "warmup.json")], log=log)
@@ -70,19 +80,41 @@ def session(arm: str, path: Path, arms: dict[str, Path], rtx: int, out: Path, ar
     }
 
 
+AGENTIC_KEYS = ("ttft_first_s", "ttft_later_s", "hit_ratio_later", "prefill_tps_later", "decode_tps",
+                "full_turn_reused", "prompt_reused", "tool_call_validity", "session_wall_s")
+
+
+def agentic_session(arm: str, rtx: int, ready_s: float, out: Path, log: Path, py: str, args) -> dict:
+    """Replay the recording (warm-up pass discarded, then --repeats measured passes)."""
+    bench = [py, str(REPO / "scripts/bench/bench-agentic-session.py"), "replay", "--recording", str(args.agentic_recording),
+             "--base-url", args.base_url, "--concurrency", *map(str, args.concurrency), *args.agentic_arg]
+    # The warm-up only warms the path (connections, workspaces): 64 tokens per turn.
+    run([*bench, "--label", f"ab-{args.nonce_seed}-warmup", "--concurrency", "1", "--repeats", "1",
+         "--max-tokens", "64", "--output", str(out / "agentic-warmup.json")], log=log, timeout=6 * 3600)
+    run([*bench, "--label", f"ab-{args.nonce_seed}", "--repeats", str(args.repeats),
+         "--output", str(out / "agentic.json")], log=log, timeout=24 * 3600)
+    summary = json.loads((out / "agentic.json").read_text())["summary"]
+    row = {"arm": arm, "rtx": rtx, "ready_s": round(ready_s, 1)}
+    for level, values in summary.items():
+        for key in AGENTIC_KEYS:
+            row[f"{level}_{key}"] = values.get(key)
+    return row
+
+
 def summarize(rows: list[dict], arms: list[str]) -> str:
-    keys = [k for k in rows[0] if k.endswith("_tps") or k == "ready_s"]
+    keys = [k for k in rows[0] if k.endswith("_tps") or k == "ready_s" or k.endswith(AGENTIC_KEYS)]
     lines = []
     for rtx in sorted({r["rtx"] for r in rows}):
         lines.append(f"\n{rtx} RTX")
-        lines.append(f"{'metric':<22}" + "".join(f"{a:>12}" for a in arms) + f"{'B/A':>9}")
+        lines.append(f"{'metric':<30}" + "".join(f"{a:>12}" for a in arms) + f"{'B/A':>9}")
         for key in keys:
             medians = []
             for arm in arms:
                 values = [r[key] for r in rows if r["arm"] == arm and r["rtx"] == rtx and r.get(key) is not None]
                 medians.append(statistics.median(values) if values else math.nan)
             ratio = medians[1] / medians[0] if len(medians) == 2 and medians[0] else math.nan
-            lines.append(f"{key:<22}" + "".join(f"{m:>12.1f}" for m in medians) + f"{ratio:>9.3f}")
+            lines.append(f"{key:<30}" + "".join(f"{m:>12.3f}" if abs(m) < 10 else f"{m:>12.1f}" for m in medians)
+                         + f"{ratio:>9.3f}")
     return "\n".join(lines)
 
 
@@ -99,8 +131,20 @@ def main() -> None:
     parser.add_argument("--tokenizer", default=TOKENIZER_DEFAULT)
     parser.add_argument("--run-arg", action="append", default=[], help="extra run.sh argument (repeatable)")
     parser.add_argument("--arm-arg", action="append", default=[],
-                        help="NAME=ARG: run.sh argument for one arm only, shell-split, e.g. 'prune=--config FILE' (repeatable)")
+                        help="NAME=ARG: launcher argument for one arm only, shell-split, e.g. 'prune=--config FILE' (repeatable)")
+    parser.add_argument("--launch", default="./run.sh --rtx-gpus {rtx} --restart",
+                        help="launcher run in each arm's checkout ({rtx} is the layout), e.g. 'scripts/launch/run-family.sh --restart'")
+    parser.add_argument("--battery", choices=["decode", "agentic"], default="decode")
+    parser.add_argument("--agentic-recording", type=Path, help="bench-agentic-session.py record output (--battery agentic)")
+    parser.add_argument("--agentic-arg", action="append", default=[],
+                        help="extra bench-agentic-session.py replay argument (repeatable), e.g. --model=ID")
     args = parser.parse_args()
+    if args.battery == "agentic":
+        if args.agentic_recording is None:
+            raise SystemExit("--battery agentic needs --agentic-recording")
+        args.agentic_recording = args.agentic_recording.resolve()
+        if args.concurrency == [1, 4, 16]:
+            args.concurrency = [1, 4]
     arms = dict(item.split("=", 1) for item in args.arm)
     arms = {name: Path(path).resolve() for name, path in arms.items()}
     if len(arms) != 2:

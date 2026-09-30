@@ -22,8 +22,9 @@ use crate::copy::{coalesce, coalesce_restore, CopyEngine, DeviceRange, Event, St
 use crate::metrics::{Metrics, Snapshot as MetricsSnapshot};
 use crate::pool::{HostRange, Layout, SlabPool};
 use crate::snapshot::{
-    DevicePageId, Hit, HostSnapshot, Key, PageRef, SnapshotMeta, Snapshots, StorePlan,
+    DevicePageId, EvictionOrder, Hit, HostSnapshot, Key, PageRef, SnapshotMeta, Snapshots, StorePlan,
 };
+use cuteafd_core::prefix::ReuseRule;
 use crate::{SnapshotKind, COMPRESSORS};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -320,13 +321,20 @@ impl<'a> RestorePlan<'a> {
 impl<E: CopyEngine, P> HostCache<E, P> {
     /// Validates `config`, allocates the pinned pool through `engine` (nothing when disabled).
     pub fn new(config: Config, layout: Layout, engine: E) -> anyhow::Result<Self> {
+        Self::with_rule(config, layout, engine, ReuseRule::V41, EvictionOrder::Banks)
+    }
+
+    /// A cache whose lookups follow a generic family's reuse `rule` and whose eviction follows
+    /// `order`; [`HostCache::new`] is V4.1's (`ReuseRule::V41`, bank order).
+    pub fn with_rule(config: Config, layout: Layout, engine: E, rule: ReuseRule, order: EvictionOrder)
+        -> anyhow::Result<Self> {
         config.validate()?;
         let mut engine = engine;
         let snapshots = if config.enabled() {
             let chunk_bytes = usize::try_from(config.chunk_bytes)
                 .map_err(|_| anyhow::anyhow!("chunk_bytes exceeds usize"))?;
             let pool = SlabPool::new(config.bytes, chunk_bytes, layout, &mut engine)?;
-            Some(Snapshots::new(pool))
+            Some(Snapshots::with_rule(pool, rule, order))
         } else {
             None
         };

@@ -615,6 +615,7 @@ dependencies = [
  "clap",
  "cuteafd-api",
  "cuteafd-core",
+ "cuteafd-engine",
  "cuteafd-ffi",
  "cuteafd-hostcache",
  "cuteafd-loader",
@@ -628,6 +629,19 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "cuteafd-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cuteafd-core",
+ "cuteafd-hostcache",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]

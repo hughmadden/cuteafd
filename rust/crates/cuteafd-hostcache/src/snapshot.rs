@@ -11,7 +11,7 @@
 use crate::pool::{Class, HostRange, PoolExhausted, Slab, SlabPool};
 use crate::SnapshotKind;
 use crate::COMPRESSORS;
-use cuteafd_core::prefix::Retention;
+use cuteafd_core::prefix::{ReuseRule, Retention};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -29,6 +29,18 @@ pub struct DevicePageId {
 
 /// Cache-local snapshot id, unique for the life of the cache.
 pub type Key = u64;
+
+/// Which unpinned snapshot the host tier deletes first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub enum EvictionOrder {
+    /// V4.1: every prompt snapshot (oldest first) before any turn snapshot (`Retention` order).
+    #[default]
+    Banks,
+    /// Generic engine: least recently used; at equal use a prompt snapshot first (a prompt
+    /// snapshot shares its pages with its turn snapshot, so bank order deleted fresh prompts
+    /// before stale turns and made retries prefill from cold).
+    LeastRecent,
+}
 
 /// Index into the shared page table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
@@ -128,15 +140,22 @@ pub struct Snapshots {
     /// Device identity to the one host page that holds its bytes, while it is shareable.
     device_map: HashMap<DevicePageId, PageRef>,
     next_key: Key,
+    order: EvictionOrder,
 }
 
 impl Snapshots {
     /// A store over `pool` with no snapshots. Invariant: every slab this store hands out comes
     /// from `pool`, so `bytes_used()` never exceeds the pool's quota.
     pub fn new(pool: SlabPool) -> Self {
+        Self::with_rule(pool, ReuseRule::V41, EvictionOrder::Banks)
+    }
+
+    /// A store whose lookups follow `rule` and whose eviction follows `order`.
+    pub fn with_rule(pool: SlabPool, rule: ReuseRule, order: EvictionOrder) -> Self {
         Self {
+            order,
             pool,
-            retention: Retention::new(usize::MAX),
+            retention: Retention::with_rule(usize::MAX, rule),
             snapshots: HashMap::new(),
             pages: Vec::new(),
             free_pages: Vec::new(),
@@ -319,6 +338,17 @@ impl Snapshots {
     /// Evict the least recently used unpinned snapshot; returns its key and the bytes freed, or
     /// `None` when only pinned snapshots remain. Invariant: a pinned snapshot is never evicted.
     pub fn evict_one(&mut self) -> Option<(Key, u64)> {
+        if self.order == EvictionOrder::LeastRecent {
+            let key = self
+                .snapshots
+                .values()
+                .filter(|snapshot| snapshot.pins == 0)
+                .min_by_key(|s| (s.last_access_ns, s.meta.kind == SnapshotKind::Turn, s.key))
+                .map(|snapshot| snapshot.key)?;
+            let before = self.pool.bytes_used();
+            self.remove(key);
+            return Some((key, before - self.pool.bytes_used()));
+        }
         loop {
             let next = {
                 let snapshots = &self.snapshots;
@@ -684,6 +714,26 @@ mod tests {
     use super::*;
     use crate::pool::testing::CHUNK;
     use crate::pool::Layout;
+
+    #[test]
+    fn least_recent_order_evicts_by_use_then_prompt_first() {
+        let pool = crate::pool::testing::pool(1 << 30).0;
+        let mut store = Snapshots::with_rule(pool, ReuseRule::EXACT, EvictionOrder::LeastRecent);
+        let commit = |store: &mut Snapshots, kind, tokens: &[u32], page: u32, now| {
+            let plan = store.plan_store(meta(kind, tokens, false), &pages(&[id(page)])).expect("plan");
+            store.commit_store(plan, now)
+        };
+        let old_turn = commit(&mut store, SnapshotKind::Turn, &[1, 2, 3], 1, 1);
+        let fresh_prompt = commit(&mut store, SnapshotKind::Prompt, &[4, 5], 2, 9);
+        let tied_turn = commit(&mut store, SnapshotKind::Turn, &[6, 7, 8], 3, 5);
+        let tied_prompt = commit(&mut store, SnapshotKind::Prompt, &[6, 7], 4, 5);
+        // Exact-frontier rule: a partial match is no hit, an exact ancestor is.
+        assert!(store.lookup(&[1, 2, 9], 10).is_none());
+        assert_eq!(store.lookup(&[4, 5, 6], 3).map(|hit| hit.key), Some(fresh_prompt));
+        let order: Vec<Key> = std::iter::from_fn(|| store.evict_one().map(|(key, _)| key)).collect();
+        assert_eq!(order, vec![old_turn, fresh_prompt, tied_prompt, tied_turn]);
+        assert!(store.is_empty() && store.retention().bank(SnapshotKind::Prompt).is_empty());
+    }
 
     #[test]
     fn plan_allocates_one_slab_per_part_and_page() {
