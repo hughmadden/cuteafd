@@ -1,4 +1,4 @@
-//! DFlash drafter kernels of MiMo V2.6 Pro (`native/cuda/kernels/mimo_dflash.cu`):
+//! DFlash drafter kernels of MiMo V2.6 Pro (`native/families/mimo_v2/cuda/mimo_dflash.cu`):
 //! per-head norm + partial RoPE with value scale, sink attention over the
 //! block and a sliding window of ring context, and the residual add + norm.
 //! Every pointer is device memory of the documented shape on the stream's

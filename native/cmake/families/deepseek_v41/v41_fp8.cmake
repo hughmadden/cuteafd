@@ -48,7 +48,7 @@ add_custom_target(cuteafd_v41_fp8_export DEPENDS "${CUTEAFD_V41_FP8_DIR}/v41_fp8
   ${CUTEAFD_V41_FP8_OBJECTS} ${CUTEAFD_V41_FP8_HEADERS})
 add_dependencies(cuteafd_v41_fp8_export cuteafd_verify_sparkinfer_source)
 set_source_files_properties(${CUTEAFD_V41_FP8_OBJECTS} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
-list(APPEND CUTEAFD_NATIVE_SOURCES ${CUTEAFD_V41_FP8_OBJECTS} src/v41_fp8.cc cuda/kernels/v41_fp8.cu)
+list(APPEND CUTEAFD_NATIVE_SOURCES ${CUTEAFD_V41_FP8_OBJECTS} families/deepseek_v41/src/v41_fp8.cc families/deepseek_v41/cuda/v41_fp8.cu)
 
 # Independent scorer export keeps its pointer ABI auditable.
 set(CUTEAFD_V41_INDEX_DIR "${CMAKE_CURRENT_BINARY_DIR}/v41_index")
@@ -64,4 +64,4 @@ add_custom_command(
 add_custom_target(cuteafd_v41_index_export DEPENDS "${CUTEAFD_V41_INDEX_DIR}/v41_index_score.json")
 add_dependencies(cuteafd_v41_index_export cuteafd_verify_sparkinfer_source)
 set_source_files_properties("${CUTEAFD_V41_INDEX_DIR}/v41_index_score.o" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
-list(APPEND CUTEAFD_NATIVE_SOURCES "${CUTEAFD_V41_INDEX_DIR}/v41_index_score.o" src/v41_index_score.cc)
+list(APPEND CUTEAFD_NATIVE_SOURCES "${CUTEAFD_V41_INDEX_DIR}/v41_index_score.o" families/deepseek_v41/src/v41_index_score.cc)

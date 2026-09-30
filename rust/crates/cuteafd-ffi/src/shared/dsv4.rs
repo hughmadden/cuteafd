@@ -1,5 +1,5 @@
 //! Coordinator programs: the exported b12x programs behind the generic
-//! launcher in `native/src/dsv4_programs.cc`. DeepSeek V4 (`dsv4f_*`,
+//! launcher in `native/shared/src/dsv4_programs.cc`. DeepSeek V4 (`dsv4f_*`,
 //! `dsv4p_*`, `CUTEAFD_ENABLE_DSV4_AOT`) and GLM 5.x (`glm_*`,
 //! `CUTEAFD_ENABLE_GLM_AOT`) share the table and its manifest.
 //!
@@ -317,7 +317,7 @@ impl NativeLibrary {
     }
 }
 
-/// dSpark drafter kernels (native/cuda/kernels/dsv4_dspark.cu).
+/// dSpark drafter kernels (native/families/deepseek_v4/cuda/dsv4_dspark.cu).
 impl NativeLibrary {
     /// `out` BF16 [rows, cols] = FP8 E4M3 `w` [rows, cols] times its FP32
     /// 128x128 block `scale` [ceil(rows/128), ceil(cols/128)].

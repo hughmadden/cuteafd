@@ -10,8 +10,8 @@
 # skipped so one list serves both builds.
 #
 # FAMILY:exl3-kTIERS entries (for example `dsv4p:exl3-k23`, `glm:exl3-k45`) are EXL3 packages,
-# built by cmake/v41_exl3.cmake; FAMILY:fp8 entries (`mimo:fp8`, `glm:fp8`) are
-# exact FP8 packages built by cmake/fp8_moe.cmake; this file builds only the
+# built by cmake/families/deepseek_v41/v41_exl3.cmake; FAMILY:fp8 entries (`mimo:fp8`, `glm:fp8`) are
+# exact FP8 packages built by cmake/shared/fp8_moe.cmake; this file builds only the
 # native families.
 set(CUTEAFD_NATIVE_EXPERT_FAMILIES)
 foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
@@ -76,7 +76,7 @@ foreach(entry IN LISTS CUTEAFD_NATIVE_EXPERT_FAMILIES)
   file(GENERATE OUTPUT "${wrapper}" CONTENT
 "// Generated: ${family} ${role} routed-expert family (native FP8 K32, SM121).
 #define CUTEAFD_EXPERT_VARIANTS_HEADER \"${variant_header}\"
-${renames}#include \"${CMAKE_CURRENT_SOURCE_DIR}/src/v41_experts.cc\"
+${renames}#include \"${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41_experts.cc\"
 ")
   set(objects)
   set(headers)
@@ -98,7 +98,7 @@ ${renames}#include \"${CMAKE_CURRENT_SOURCE_DIR}/src/v41_experts.cc\"
       "${dir}/v41_expert_variants.h" "${dir}/${variant_header}"
     DEPENDS
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/export_b12x_v41_slices_aot.py"
-      "${CMAKE_CURRENT_SOURCE_DIR}/src/v41_experts.cc"
+      "${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41_experts.cc"
       "${stamp}"
       ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
     COMMENT "Exporting ${family} ${role} routed-expert kernels"

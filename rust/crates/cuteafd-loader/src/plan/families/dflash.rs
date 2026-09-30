@@ -81,7 +81,7 @@ impl Family for DFlash2 {
     fn component_hint(&self, component: Component) -> Option<Hint> {
         (component == Component::Speculator).then(|| Hint {
             what: "DFlash2 block drafter attached to a target engine".into(),
-            how: "cuteafd branch work/glm-dflash2 drafts for GLM 5.3 (serve-glm --draft, native/cuda/kernels/\
+            how: "cuteafd branch work/glm-dflash2 drafts for GLM 5.3 (serve-glm --draft, native/families/glm5/cuda/\
                   glm_dflash.cu). This variant adds attention_conv/mlp_conv two-tap kernels and taps the mean of \
                   the target's mHC streams; license is CC-BY-NC-ND (check before shipping)."
                 .into(),

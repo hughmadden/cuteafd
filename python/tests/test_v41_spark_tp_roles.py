@@ -14,10 +14,10 @@ ROOT = Path(__file__).resolve().parents[2]
 SLICES = ROOT / "python" / "tools" / "export_b12x_v41_slices_aot.py"
 EXPERTS = ROOT / "python" / "tools" / "export_b12x_v41_experts_aot.py"
 CMAKE = ROOT / "native" / "CMakeLists.txt"
-CMAKE_TP = ROOT / "native" / "cmake" / "v41_spark_tp_experts.cmake"
-HEADER = ROOT / "native" / "include" / "cuteafd_v41_experts.h"
-REDUCE = ROOT / "native" / "cuda" / "kernels" / "v41_route_reduce.cu"
-PACK = ROOT / "native" / "cuda" / "kernels" / "v41_expert_pack.cu"
+CMAKE_TP = ROOT / "native" / "cmake" / "families" / "deepseek_v41" / "v41_spark_tp_experts.cmake"
+HEADER = ROOT / "native" / "shared" / "include" / "cuteafd_v41_experts.h"
+REDUCE = ROOT / "native" / "shared" / "cuda" / "v41_route_reduce.cu"
+PACK = ROOT / "native" / "shared" / "cuda" / "v41_expert_pack.cu"
 
 
 def _literal_assignments(path: Path, names: set[str]) -> dict[str, object]:
@@ -102,7 +102,7 @@ def test_ordinary_exporter_routes_new_roles_only_through_fp8_slices() -> None:
 def test_cmake_wiring_is_opt_in_and_precompiles_capacities() -> None:
     cmake = CMAKE.read_text(encoding="utf-8")
     assert 'set(CUTEAFD_V41_SPARK_TP_ROLES "" CACHE STRING' in cmake
-    assert "include(cmake/v41_spark_tp_experts.cmake)" in cmake
+    assert "include(cmake/families/deepseek_v41/v41_spark_tp_experts.cmake)" in cmake
     assert "CUTEAFD_V41_SPARK_TP_EXPERT_TARGETS" in cmake
 
     tp = CMAKE_TP.read_text(encoding="utf-8")
@@ -175,7 +175,7 @@ def test_each_role_forwards_its_own_width_map_to_the_exporter() -> None:
 def test_spark_tp_width_knobs_leave_the_generic_tp4_knob_untouched() -> None:
     tp = CMAKE_TP.read_text(encoding="utf-8")
     assert "CUTEAFD_V41_EXPERT_SLICE_WIDTH" not in tp
-    experts_cmake = (ROOT / "native" / "cmake" / "v41_experts.cmake").read_text(
+    experts_cmake = (ROOT / "native" / "cmake" / "families" / "deepseek_v41" / "v41_experts.cmake").read_text(
         encoding="utf-8"
     )
     assert 'set(CUTEAFD_V41_EXPERT_SLICE_WIDTH "" CACHE STRING' in experts_cmake

@@ -2,7 +2,7 @@
 //! weights with FP32 128x128 block scales (or MXFP4, MiMo V2.6 Pro:
 //! `fp8-mimop` packages), resident per TP slice and run by
 //! an `fp8-<family>` package (`python/tools/package_fp8_moe_aot.py`,
-//! `native/include/cuteafd_fp8_moe.h`). Nothing is re-quantized. Output is
+//! `native/shared/include/cuteafd_fp8_moe.h`). Nothing is re-quantized. Output is
 //! the BF16 `[rows, H]` route sum of the slice: the Spark rank partial of the
 //! compact BF16 response, or the whole layer at TP1 on the coordinator.
 pub(crate) mod worker;

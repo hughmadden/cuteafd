@@ -1,4 +1,4 @@
-//! Vocabulary head for a few rows (`native/cuda/kernels/vocab_head_rows.cu`):
+//! Vocabulary head for a few rows (`native/shared/cuda/vocab_head_rows.cu`):
 //! FP32-accumulated BF16 projection that reads the head once per 8 rows.
 use crate::NativeLibrary;
 use anyhow::{ensure, Result};

@@ -44,7 +44,7 @@ static void launch(void** args, int count) {
 #ifdef TEST_NVFP4
 #define CUTEAFD_V41_NVFP4_VARIANTS_HEADER "v41_local_expert_variants.h"
 #endif
-#include "{ROOT / 'native/src/v41_experts.cc'}"
+#include "{ROOT / 'native/shared/src/v41_experts.cc'}"
 #include <cassert>
 extern "C" int32_t cuteafd_v41_initialize_scratch_storage_async(
     void*, uint64_t, uint64_t, uint64_t, uint32_t, void*) {{ return 0; }}
@@ -91,7 +91,7 @@ int main() {{
             for nvfp4 in (False, True):
                 with self.subTest(nvfp4=nvfp4):
                     command = ["c++", "-std=c++17", "-I", str(root), "-I",
-                               str(ROOT / "native/include"), str(root / "test.cc"),
+                               str(ROOT / "native/shared/include"), str(root / "test.cc"),
                                "-o", str(root / "test")]
                     if nvfp4:
                         command.append("-DTEST_NVFP4")

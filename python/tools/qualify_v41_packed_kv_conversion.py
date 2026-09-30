@@ -14,7 +14,7 @@ def main():
     p.add_argument('--output-dir',type=Path,required=True)
     a=p.parse_args();a.output_dir.mkdir(parents=True,exist_ok=True)
     root=Path(__file__).resolve().parents[2]
-    source=root/'native/cuda/kernels/v41_sparse_attention.cu'
+    source=root/'native/families/deepseek_v41/cuda/v41_sparse_attention.cu'
     probe=a.output_dir/'probe.cu'
     probe.write_text('#include "'+str(source)+'"\n'+r'''
 __global__ void pairs(uint32_t* packed,uint32_t* scalar) {
@@ -43,7 +43,7 @@ extern "C" int test_pairs(uint32_t* packed,uint32_t* scalar,void* stream) {
 ''')
     library=a.output_dir/'probe.so'
     subprocess.run(['nvcc','-O3','-std=c++17','-gencode','arch=compute_120a,code=sm_120a',
-        '--shared','-Xcompiler=-fPIC','-I'+str(root/'native/include'),str(probe),'-o',str(library)],check=True)
+        '--shared','-Xcompiler=-fPIC','-I'+str(root/'native/shared/include'),'-I'+str(root/'native/families/deepseek_v41/include'),'-I'+str(root/'native/shared/cuda'),str(probe),'-o',str(library)],check=True)
     lib=C.CDLL(str(library.resolve()));fn=lib.test_pairs
     fn.argtypes=[C.c_void_p,C.c_void_p,C.c_void_p]
     out=[torch.empty(1<<24,device='cuda',dtype=torch.int32) for _ in range(2)]

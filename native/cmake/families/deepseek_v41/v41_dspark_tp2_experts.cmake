@@ -37,4 +37,4 @@ add_custom_target(cuteafd_v41_dspark_tp2_experts_export DEPENDS
 add_dependencies(cuteafd_v41_dspark_tp2_experts_export cuteafd_verify_sparkinfer_source)
 set_source_files_properties(${CUTEAFD_V41_DSPARK_TP2_EXPERT_OBJECTS} PROPERTIES
   EXTERNAL_OBJECT TRUE GENERATED TRUE)
-list(APPEND CUTEAFD_NATIVE_SOURCES ${CUTEAFD_V41_DSPARK_TP2_EXPERT_OBJECTS} src/v41_dspark_tp2_experts.cc)
+list(APPEND CUTEAFD_NATIVE_SOURCES ${CUTEAFD_V41_DSPARK_TP2_EXPERT_OBJECTS} families/deepseek_v41/src/v41_dspark_tp2_experts.cc)

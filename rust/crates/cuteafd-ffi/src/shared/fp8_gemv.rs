@@ -1,4 +1,4 @@
-//! W8A16 linear for skinny row counts (`native/cuda/kernels/fp8_gemv.cu`):
+//! W8A16 linear for skinny row counts (`native/shared/cuda/fp8_gemv.cu`):
 //! E4M3 weights packed in MMA fragment order with FP32 per-row x 128-K block
 //! scales, BF16 activations, FP32 accumulation. Every pointer is device
 //! memory of the documented shape on the stream's device.

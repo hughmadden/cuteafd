@@ -255,7 +255,7 @@ impl Family for Glm {
                 "top-8 of 288 sigmoid routed experts with SwiGLU clamp 10".to_string(),
                 "EXL3 K3/K4 checkpoints: the glm:exl3 recipe at hidden 4096 / inter 2048 / 288 experts with \
                  the clamp enabled (python/tools/package_v41_exl3_aot.py, exl3_cross_sm121.py for Sparks). \
-                 FP8 checkpoints: the fp8 routed family (native/cmake/fp8_moe.cmake) at this geometry.".to_string(),
+                 FP8 checkpoints: the fp8 routed family (native/cmake/shared/fp8_moe.cmake) at this geometry.".to_string(),
             ),
             (_, Component::Attention) | (_, Component::Indexer) => (
                 "MLA with DeepSeek Sparse Attention indexer".to_string(),

@@ -18,7 +18,7 @@ capacity, and a verified ``manifest.json``:
     tp4/libcuteafd_fp8moe.so     quarter (Spark TP4: every rank runs the same slice width)
     tp6/libcuteafd_fp8moe.so     sixth in whole 128-blocks (2048: 3/2 blocks, stored 384 zero-padded)
 
-Library ABI (``native/include/cuteafd_fp8_moe.h``)::
+Library ABI (``native/shared/include/cuteafd_fp8_moe.h``)::
 
     int32_t cuteafd_fp8moe_info(uint32_t* words, uint32_t count);
         words: [0] ABI 1 (E4M3 + FP32 128x128 scales) or 2 (MXFP4: packed E2M1 +

@@ -7,7 +7,7 @@ any combination, into one table.
 
 One object and header per program, a manifest with every program's pointer
 ABI and scratch sizes at its capacity, and ``dsv4_programs.h``: the table the
-generic native shim (native/src/dsv4_programs.cc) launches from. Capacities are
+generic native shim (native/shared/src/dsv4_programs.cc) launches from. Capacities are
 compile-time: decode programs cover ``--decode-rows``, prefill programs
 ``--prefill-rows``, and cache extents follow ``--max-context``.
 """

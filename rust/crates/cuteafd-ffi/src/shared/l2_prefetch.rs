@@ -1,4 +1,4 @@
-//! L2 prefetch of weight ranges (`native/cuda/kernels/l2_prefetch.cu`).
+//! L2 prefetch of weight ranges (`native/shared/cuda/l2_prefetch.cu`).
 use crate::NativeLibrary;
 use anyhow::{ensure, Result};
 use std::ffi::c_void;

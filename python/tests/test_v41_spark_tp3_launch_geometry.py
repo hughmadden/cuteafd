@@ -21,7 +21,7 @@ TOOLS = ROOT / "python" / "tools"
 GEOMETRY = TOOLS / "v41_spark_tp3_launch_geometry.py"
 QUALIFIER = TOOLS / "qualify_v41_replicated_native.py"
 SLICES = TOOLS / "export_b12x_v41_slices_aot.py"
-CMAKE_TP = ROOT / "native" / "cmake" / "v41_spark_tp_experts.cmake"
+CMAKE_TP = ROOT / "native" / "cmake" / "families" / "deepseek_v41" / "v41_spark_tp_experts.cmake"
 
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))

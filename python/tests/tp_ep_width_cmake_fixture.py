@@ -2,7 +2,7 @@
 
 Runs a real CMake configure/build with the UnixMakefiles generator in a guarded
 root-NVMe temporary directory. The actual
-``native/cmake/v41_spark_tp_experts.cmake`` is included with a stub exporter that
+``native/cmake/families/deepseek_v41/v41_spark_tp_experts.cmake`` is included with a stub exporter that
 records the argv it receives, so re-export invalidation is proven by CMake/Make
 behavior rather than by source-string assertions.
 
@@ -23,7 +23,7 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-CMAKE_FILE = ROOT / "native" / "cmake" / "v41_spark_tp_experts.cmake"
+CMAKE_FILE = ROOT / "native" / "cmake" / "families" / "deepseek_v41" / "v41_spark_tp_experts.cmake"
 
 DEFAULT_MAP = "1:64,16:192,80:192,256:192,1024:192,4096:192"
 TP2_CAP80_128 = "1:64,16:128,80:128,256:192,1024:192,4096:192"
@@ -103,7 +103,8 @@ def run_width_override_scenario() -> dict:
     tmp = Path(tempfile.mkdtemp(prefix="width-cmake-", dir=base))
     try:
         src = tmp / "native"
-        (src / "src").mkdir(parents=True)
+        wrappers = src / "families" / "deepseek_v41" / "src"
+        wrappers.mkdir(parents=True)
         tools = tmp / "python" / "tools"
         tools.mkdir(parents=True)
         (src / "CMakeLists.txt").write_text(
@@ -113,7 +114,7 @@ def run_width_override_scenario() -> dict:
             encoding="utf-8",
         )
         for wrapper in ("v41_spark_tp2_experts.cc", "v41_spark_tp3_experts.cc"):
-            (src / "src" / wrapper).write_text("// stub\n", encoding="utf-8")
+            (wrappers / wrapper).write_text("// stub\n", encoding="utf-8")
         (tools / "export_b12x_v41_slices_aot.py").write_text(
             _STUB_EXPORTER, encoding="utf-8"
         )

@@ -6,7 +6,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--output', required=True, type=Path)
 args = parser.parse_args()
 assert not args.output.exists()
-p = Path(__file__).resolve().parents[1] / 'native/cuda/kernels/v41_sparse_attention.cu'
+p = Path(__file__).resolve().parents[1] / 'native/families/deepseek_v41/cuda/v41_sparse_attention.cu'
 s = p.read_text()
 if 'bool SourceFP4=false,bool Batched=false>' not in s:
     assert s.count('template<bool Split,int Groups=1,bool SourceFP4=false>') == 1

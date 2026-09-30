@@ -10,7 +10,7 @@ import unittest
 import importlib.util
 from types import ModuleType
 
-RULES = Path(__file__).resolve().parents[2] / 'native/cmake/v41_exl3.cmake'
+RULES = Path(__file__).resolve().parents[2] / 'native/cmake/families/deepseek_v41/v41_exl3.cmake'
 
 _spec = importlib.util.spec_from_file_location('exl3_cmake_tile_grammar',
     Path(__file__).resolve().parents[1] / 'tools/package_v41_exl3_aot.py')

@@ -15,7 +15,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 EXPORTER = ROOT / "python/tools/export_b12x_v41_nvfp4_aot.py"
-CMAKE = ROOT / "native/cmake/v41_nvfp4_experts.cmake"
+CMAKE = ROOT / "native/cmake/families/deepseek_v41/v41_nvfp4_experts.cmake"
 
 
 @pytest.fixture

@@ -61,7 +61,7 @@ pub const CUTEAFD_CUDA_ROUTER_TOPK_MAX_K: usize = 64;
 pub const CUTEAFD_CUDA_SAMPLE_TOPK_MAX_K: usize = 64;
 
 /// Per-row status codes of the v4.1 GPU target-sampler
-/// (`native/cuda/kernels/v41_sampling_gpu.h` §5.4). The integer values are the
+/// (`native/shared/cuda/v41_sampling_gpu.h` §5.4). The integer values are the
 /// device ABI, not an enum: they are what `out_status` carries.
 pub const CUTEAFD_V41_SAMPLER_STATUS_OK: u32 = 0;
 pub const CUTEAFD_V41_SAMPLER_STATUS_EMPTY_CANDIDATES: u32 = 1;
@@ -102,7 +102,7 @@ pub const CUTEAFD_V41_SAMPLER_SCRATCH_BYTES: usize = 64;
 pub const CUTEAFD_V41_SAMPLER_PARAM_BYTES: usize = 64;
 
 /// 64-byte per-row parameter block, exactly as declared in
-/// `native/cuda/kernels/v41_sampling_gpu.h`. Field order, sizes and natural
+/// `native/shared/cuda/v41_sampling_gpu.h`. Field order, sizes and natural
 /// alignment are pinned by tests; `#[repr(C)]` is the ABI.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -831,7 +831,7 @@ type CudaEmbeddingLookupBf16AsyncFn = unsafe extern "C" fn(
     cuda_stream: *mut c_void,
 ) -> CuteafdStatus;
 /// K1 entry points of the v4.1 GPU target-sampler
-/// (`native/cuda/kernels/v41_sampling_gpu.h`).
+/// (`native/shared/cuda/v41_sampling_gpu.h`).
 type CudaV41TargetSampleFn = unsafe extern "C" fn(
     logits: *const f32,
     rows: usize,
@@ -866,7 +866,7 @@ type CudaV41TargetSampleAsyncFn = unsafe extern "C" fn(
     cuda_stream: *mut c_void,
 ) -> CuteafdStatus;
 /// Chunk-3a K3/K4 entry points of the v4.1 GPU target-sampler
-/// (`native/cuda/kernels/v41_sampling_gpu.h`). They read K1's `scratch` and
+/// (`native/shared/cuda/v41_sampling_gpu.h`). They read K1's `scratch` and
 /// materialize the retained set in CPU rank order into the rank-order arena.
 type CudaV41TopkSelectFn = unsafe extern "C" fn(
     logits: *const f32,
@@ -1539,7 +1539,7 @@ fn sync_expert_hidden(lib: &Library) -> Result<()> {
             let status = unsafe { set(hidden) };
             anyhow::ensure!(
                 status == 0,
-                "native expert helpers have no instantiation for hidden size {hidden}; add it to native/cuda/kernels/expert_hidden.cuh"
+                "native expert helpers have no instantiation for hidden size {hidden}; add it to native/shared/cuda/expert_hidden.cuh"
             );
         }
         Err(_) => anyhow::ensure!(

@@ -19,7 +19,7 @@ add_custom_target(cuteafd_v41_attention_export DEPENDS "${CUTEAFD_V41_ATTENTION_
 add_dependencies(cuteafd_v41_attention_export cuteafd_verify_sparkinfer_source)
 set_source_files_properties("${CUTEAFD_V41_ATTENTION_DIR}/v41_attention.o"
   PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
-list(APPEND CUTEAFD_NATIVE_SOURCES "${CUTEAFD_V41_ATTENTION_DIR}/v41_attention.o" src/v41_attention_aot.cc)
+list(APPEND CUTEAFD_NATIVE_SOURCES "${CUTEAFD_V41_ATTENTION_DIR}/v41_attention.o" families/deepseek_v41/src/v41_attention_aot.cc)
 
 # Local TP2 head geometry is exported separately; live row counts stay dynamic.
 add_custom_command(
@@ -39,4 +39,4 @@ add_custom_target(cuteafd_v41_attention_heads32_export DEPENDS
 add_dependencies(cuteafd_v41_attention_heads32_export cuteafd_verify_sparkinfer_source)
 set_source_files_properties("${CUTEAFD_V41_ATTENTION_DIR}/v41_attention_heads32.o"
   PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
-list(APPEND CUTEAFD_NATIVE_SOURCES "${CUTEAFD_V41_ATTENTION_DIR}/v41_attention_heads32.o" src/v41_attention_heads32_aot.cc)
+list(APPEND CUTEAFD_NATIVE_SOURCES "${CUTEAFD_V41_ATTENTION_DIR}/v41_attention_heads32.o" families/deepseek_v41/src/v41_attention_heads32_aot.cc)

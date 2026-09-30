@@ -44,7 +44,7 @@ if [[ -n "$spark_tp_roles" ]]; then
 fi
 
 # Extra routed-expert kernel families (FAMILY:ROLE list, e.g. dsv4f:spark),
-# validated by native/cmake/expert_families.cmake. Empty keeps the V4.1 image.
+# validated by native/cmake/shared/expert_families.cmake. Empty keeps the V4.1 image.
 # Both builds take the same list; CMake keeps the entries for its architecture.
 expert_families="${CUTEAFD_WIP_EXPERT_FAMILIES:-}"
 # Official-only WIP builds may skip the EXL3 quantization AOT entirely. The

@@ -1,4 +1,4 @@
-//! DFlash2 drafter kernels (GLM 5.3 and GLM 5.3 Flash) (`native/cuda/kernels/glm_dflash.cu`) and
+//! DFlash2 drafter kernels (GLM 5.3 and GLM 5.3 Flash) (`native/families/glm5/cuda/glm_dflash.cu`) and
 //! the cuBLAS BF16 linear its GEMMs use. Every pointer is device memory of
 //! the documented shape on the stream's device; the stream orders them.
 use crate::NativeLibrary;

@@ -35,8 +35,10 @@ def main():
     source_name = 'v41_tp2_experts.cc' if tp2 else 'v41_experts.cc'
     obj = aot / (source_name + '.o')
     compile_command = ['g++', '-std=c++17', '-O3', '-DNDEBUG', '-fPIC', '-c',
-        '-I', str(args.source_root / 'native/include'), '-I', str(args.cuda_root / 'include'),
-        '-I', str(aot), str(args.source_root / 'native/src' / source_name), '-o', str(obj)]
+        '-I', str(args.source_root / 'native/shared/include'), '-I', str(args.source_root / 'native/shared/src'),
+        '-I', str(args.cuda_root / 'include'), '-I', str(aot),
+        str(args.source_root / ('native/families/deepseek_v41/src' if tp2 else 'native/shared/src') / source_name),
+        '-o', str(obj)]
     subprocess.run(compile_command, check=True)
     raw = subprocess.check_output(['ninja', '-C', str(build), '-t', 'commands',
                                   'libcuteafd_native.so'], text=True).splitlines()[-1]

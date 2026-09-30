@@ -226,7 +226,7 @@ impl Family for DeepSeek {
             Component::Attention | Component::Compressor | Component::Indexer => (
                 "DeepSeek V4 compressed MLA (ratios 4/128 alternating), per-layer compressor and indexer",
                 "Map each component against the official inference/model.py. V4.1's attention stack (rust daemon v41_attention_*, v41_compressor, v41_index_*, \
-                 native/cuda/kernels/v41_*) is the template; V4 differs in ratio schedule (4 and 128 \
+                 native/families/deepseek_v41/) is the template; V4 differs in ratio schedule (4 and 128 \
                  instead of 2 and 1), has an indexer compressor per ratio-4 layer, no CED encoder/decoder \
                  KV sharing, and FP8 128x128 blocks instead of 32x32. b12x kernels: \
                  attention/compressed_sparse_mla, dsv4_compressor, dsa_indexer. The legacy ds4rt engine \

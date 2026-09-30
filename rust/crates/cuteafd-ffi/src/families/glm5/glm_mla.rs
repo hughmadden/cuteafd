@@ -1,4 +1,4 @@
-//! Sparse MLA prefill on F16 tensor cores (`native/cuda/kernels/glm_mla_prefill.cu`):
+//! Sparse MLA prefill on F16 tensor cores (`native/families/glm5/cuda/glm_mla_prefill.cu`):
 //! GLM 5.x 656-byte and GLM 5.3 Flash 528-byte FP8 latent records.
 use crate::NativeLibrary;
 use anyhow::{ensure, Result};

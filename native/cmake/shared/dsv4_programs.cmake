@@ -1,5 +1,5 @@
 # Coordinator programs (SM120): b12x.integration.cuteafd exports launched
-# through the generic table in src/dsv4_programs.cc. DeepSeek V4
+# through the generic table in shared/src/dsv4_programs.cc. DeepSeek V4
 # (CUTEAFD_ENABLE_DSV4_AOT, CUTEAFD_DSV4_GEOMETRY), GLM 5.x
 # (CUTEAFD_ENABLE_GLM_AOT, geometry "glm") and MiMo V2 Flash
 # (CUTEAFD_ENABLE_MIMO_AOT, geometries CUTEAFD_MIMO_GEOMETRIES: "mimo", V2.6 Pro "mimop") and GLM 5.3 Flash
@@ -68,4 +68,4 @@ add_custom_target(cuteafd_dsv4_programs_export DEPENDS
   "${CUTEAFD_DSV4_DIR}/dsv4_programs.h" "${CUTEAFD_DSV4_ARCHIVE}")
 add_dependencies(cuteafd_dsv4_programs_export cuteafd_verify_sparkinfer_source)
 set_source_files_properties("${CUTEAFD_DSV4_DIR}/dsv4_programs.h" PROPERTIES GENERATED TRUE)
-list(APPEND CUTEAFD_NATIVE_SOURCES src/dsv4_programs.cc)
+list(APPEND CUTEAFD_NATIVE_SOURCES shared/src/dsv4_programs.cc)

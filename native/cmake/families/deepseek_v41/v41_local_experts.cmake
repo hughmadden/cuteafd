@@ -37,4 +37,4 @@ add_custom_target(cuteafd_v41_local_experts_export DEPENDS
 add_dependencies(cuteafd_v41_local_experts_export cuteafd_verify_sparkinfer_source)
 set_source_files_properties(${CUTEAFD_V41_LOCAL_EXPERT_OBJECTS} PROPERTIES
   EXTERNAL_OBJECT TRUE GENERATED TRUE)
-list(APPEND CUTEAFD_NATIVE_SOURCES ${CUTEAFD_V41_LOCAL_EXPERT_OBJECTS} src/v41_local_experts.cc)
+list(APPEND CUTEAFD_NATIVE_SOURCES ${CUTEAFD_V41_LOCAL_EXPERT_OBJECTS} families/deepseek_v41/src/v41_local_experts.cc)

@@ -1,4 +1,4 @@
-//! Exact FP8 routed-expert package library (`native/include/cuteafd_fp8_moe.h`):
+//! Exact FP8 routed-expert package library (`native/shared/include/cuteafd_fp8_moe.h`):
 //! one dlopen'd `libcuteafd_fp8moe.so` per layout, one program per capacity.
 //! Drain every stream that used the module before dropping it, on the thread
 //! (and with the device) that loaded it.

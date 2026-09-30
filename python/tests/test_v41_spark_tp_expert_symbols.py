@@ -123,9 +123,10 @@ class SparkTpSymbolContractTests(unittest.TestCase):
             (root / "test.cc").write_text(PROGRAM)
             command = [
                 "c++", "-std=c++17", "-I", str(root), "-I",
-                str(ROOT / "native" / "include"),
-                str(ROOT / "native" / "src" / "v41_spark_tp2_experts.cc"),
-                str(ROOT / "native" / "src" / "v41_spark_tp3_experts.cc"),
+                str(ROOT / "native" / "shared" / "include"),
+                "-I", str(ROOT / "native" / "shared" / "src"),
+                str(ROOT / "native" / "families" / "deepseek_v41" / "src" / "v41_spark_tp2_experts.cc"),
+                str(ROOT / "native" / "families" / "deepseek_v41" / "src" / "v41_spark_tp3_experts.cc"),
                 str(root / "test.cc"), "-o", str(root / "test"),
             ]
             subprocess.run(command, check=True, capture_output=True, text=True)

@@ -66,7 +66,17 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-set(CUTEAFD_NATIVE_SOURCES src/cuteafd_native.cc)
+set(CUTEAFD_NATIVE_SOURCES shared/src/cuteafd_native.cc)
+# Headers live beside their code: shared/ and one families/<id>/ tree per
+# family. Kernels include common.h/expert_hidden.cuh and the expert family
+# sources include v41_experts.cc by name, so shared/cuda and shared/src are
+# on the path too.
+set(CUTEAFD_NATIVE_INCLUDE_DIRS
+  ${CMAKE_CURRENT_SOURCE_DIR}/shared/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/families/deepseek_v41/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/shared/cuda
+  ${CMAKE_CURRENT_SOURCE_DIR}/shared/src
+)
 
 if(CUTEAFD_ENABLE_XGRAMMAR)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -121,22 +131,22 @@ if(CUTEAFD_ENABLE_XGRAMMAR)
   # Correct UTF-8 range tails and Unicode negation in a generated copy. Source
   # provenance is checked above; the patcher additionally verifies its anchors.
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/xgrammar_unicode_fsm.inc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shared/src/xgrammar_unicode_fsm.inc"
     "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/prepare-xgrammar-unicode.py")
   execute_process(COMMAND "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/prepare-xgrammar-unicode.py"
     --source "${CUTEAFD_XGRAMMAR_SOURCE_DIR}/cpp/grammar_functor.cc"
-    --replacement "${CMAKE_CURRENT_SOURCE_DIR}/src/xgrammar_unicode_fsm.inc"
+    --replacement "${CMAKE_CURRENT_SOURCE_DIR}/shared/src/xgrammar_unicode_fsm.inc"
     --output "${CMAKE_CURRENT_BINARY_DIR}/v41_xgrammar_unicode.cc"
     COMMAND_ERROR_IS_FATAL ANY)
   list(FILTER CUTEAFD_XGRAMMAR_SOURCES EXCLUDE REGEX "/cpp/grammar_functor\\.cc$")
   list(APPEND CUTEAFD_XGRAMMAR_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/v41_xgrammar_unicode.cc")
   list(APPEND CUTEAFD_XGRAMMAR_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/v41_xgrammar_schema.cc"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/xgrammar_regular.cc"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/xgrammar_v41_tools.cc")
+    "${CMAKE_CURRENT_SOURCE_DIR}/shared/src/xgrammar_regular.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shared/src/xgrammar_v41_tools.cc")
   add_library(cuteafd_xgrammar STATIC ${CUTEAFD_XGRAMMAR_SOURCES})
   target_include_directories(cuteafd_xgrammar PRIVATE
-    "${CUTEAFD_XGRAMMAR_SOURCE_DIR}/cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    "${CUTEAFD_XGRAMMAR_SOURCE_DIR}/cpp" "${CMAKE_CURRENT_SOURCE_DIR}/shared/src")
   target_include_directories(cuteafd_xgrammar
     PUBLIC "${CUTEAFD_XGRAMMAR_SOURCE_DIR}/include"
   )
@@ -150,11 +160,11 @@ if(CUTEAFD_ENABLE_XGRAMMAR)
   )
   find_package(Threads REQUIRED)
   target_link_libraries(cuteafd_xgrammar PUBLIC Threads::Threads)
-  list(APPEND CUTEAFD_NATIVE_SOURCES src/xgrammar_adapter.cc)
+  list(APPEND CUTEAFD_NATIVE_SOURCES shared/src/xgrammar_adapter.cc)
 endif()
 
 set(CUTEAFD_BUILD_SPARKINFER_AOT OFF)
-# FAMILY:fp8 expert families (exact FP8 packages, cmake/fp8_moe.cmake).
+# FAMILY:fp8 expert families (exact FP8 packages, cmake/shared/fp8_moe.cmake).
 set(CUTEAFD_FP8_EXPERT_FAMILIES OFF)
 if(CUTEAFD_EXPERT_FAMILIES MATCHES ":fp8")
   set(CUTEAFD_FP8_EXPERT_FAMILIES ON)
@@ -245,46 +255,46 @@ if(CUTEAFD_ENABLE_CUDA)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
   list(APPEND CUTEAFD_NATIVE_SOURCES
-    cuda/kernels/v41_expert_pack.cu
-    cuda/kernels/v41_exl3_wire.cu
-    cuda/kernels/v41_route_reduce.cu
-    cuda/kernels/engram.cu
-    cuda/kernels/v41_dspark.cu
-    cuda/kernels/v41_hc.cu
-    cuda/kernels/v41_router.cu
-    cuda/kernels/dsv4_dspark.cu
-    cuda/kernels/glm_dflash.cu
-    cuda/kernels/glm_mla_prefill.cu
-    cuda/kernels/vocab_head_rows.cu
-    cuda/kernels/mimo_dflash.cu
-    cuda/kernels/fp8_block_dequant.cu
-    cuda/kernels/fp8_gemv.cu
-    cuda/kernels/l2_prefetch.cu
-    cuda/kernels/v41_dspark_cache.cu
-    cuda/kernels/v41_dspark_attention.cu
-    cuda/kernels/v41_compressor.cu
-    cuda/kernels/v41_vision.cu
-    cuda/kernels/v41_kv.cu
-    cuda/kernels/v41_sparse_attention.cu
-    cuda/kernels/v41_peer_copy.cu
-    cuda/kernels/v41_index_scores.cu
-    cuda/kernels/v41_index_topk.cu
-    cuda/kernels/v41_candidate_blocks.cu
-    cuda/kernels/v41_attention_ops.cu
-    cuda/kernels/norm.cu
-    cuda/kernels/mlp.cu
-    cuda/kernels/residual.cu
-    cuda/kernels/kv_cache.cu
-    cuda/kernels/mla_indexing.cu
-    cuda/kernels/router.cu
-    cuda/kernels/linear.cu
-    cuda/kernels/attention.cu
-    cuda/kernels/embedding.cu
-    cuda/kernels/sampling.cu
-    cuda/kernels/v41_sampling_gpu.cu
-    cuda/kernels/nibbles.cu
-    cuda/kernels/nvfp4_payload.cu
-    cuda/kernels/nvfp4_scale.cu
+    shared/cuda/v41_expert_pack.cu
+    shared/cuda/v41_exl3_wire.cu
+    shared/cuda/v41_route_reduce.cu
+    families/deepseek_v41/cuda/engram.cu
+    families/deepseek_v41/cuda/v41_dspark.cu
+    families/deepseek_v41/cuda/v41_hc.cu
+    shared/cuda/v41_router.cu
+    families/deepseek_v4/cuda/dsv4_dspark.cu
+    families/glm5/cuda/glm_dflash.cu
+    families/glm5/cuda/glm_mla_prefill.cu
+    shared/cuda/vocab_head_rows.cu
+    families/mimo_v2/cuda/mimo_dflash.cu
+    shared/cuda/fp8_block_dequant.cu
+    shared/cuda/fp8_gemv.cu
+    shared/cuda/l2_prefetch.cu
+    families/deepseek_v41/cuda/v41_dspark_cache.cu
+    families/deepseek_v41/cuda/v41_dspark_attention.cu
+    families/deepseek_v41/cuda/v41_compressor.cu
+    families/deepseek_v41/cuda/v41_vision.cu
+    families/deepseek_v41/cuda/v41_kv.cu
+    families/deepseek_v41/cuda/v41_sparse_attention.cu
+    shared/cuda/v41_peer_copy.cu
+    families/deepseek_v41/cuda/v41_index_scores.cu
+    families/deepseek_v41/cuda/v41_index_topk.cu
+    families/deepseek_v41/cuda/v41_candidate_blocks.cu
+    families/deepseek_v41/cuda/v41_attention_ops.cu
+    shared/cuda/norm.cu
+    shared/cuda/mlp.cu
+    shared/cuda/residual.cu
+    shared/cuda/kv_cache.cu
+    shared/cuda/mla_indexing.cu
+    shared/cuda/router.cu
+    shared/cuda/linear.cu
+    shared/cuda/attention.cu
+    shared/cuda/embedding.cu
+    shared/cuda/sampling.cu
+    shared/cuda/v41_sampling_gpu.cu
+    shared/cuda/nibbles.cu
+    shared/cuda/nvfp4_payload.cu
+    shared/cuda/nvfp4_scale.cu
   )
   # SM120 builds use the family-specific target (sm_120f); every live AOT
   # export and hand kernel is qualified with it.
@@ -311,39 +321,39 @@ if(CUTEAFD_ENABLE_V41_EXPERT_AOT OR CUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT OR
 endif()
 
 if(CUTEAFD_ENABLE_V41_EXPERT_AOT)
-  include(cmake/v41_experts.cmake)
+  include(cmake/families/deepseek_v41/v41_experts.cmake)
 endif()
 if(NOT CUTEAFD_V41_SPARK_TP_ROLES STREQUAL "")
-  include(cmake/v41_spark_tp_experts.cmake)
+  include(cmake/families/deepseek_v41/v41_spark_tp_experts.cmake)
 endif()
 if(NOT CUTEAFD_EXPERT_FAMILIES STREQUAL "")
-  include(cmake/expert_families.cmake)
+  include(cmake/shared/expert_families.cmake)
 endif()
 if(CUTEAFD_FP8_EXPERT_FAMILIES)
-  include(cmake/fp8_moe.cmake)
+  include(cmake/shared/fp8_moe.cmake)
 endif()
 if(CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR CUTEAFD_ENABLE_QWEN4_AOT)
-  include(cmake/dsv4_programs.cmake)
+  include(cmake/shared/dsv4_programs.cmake)
 endif()
 if(CUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT)
-  include(cmake/v41_local_experts.cmake)
+  include(cmake/families/deepseek_v41/v41_local_experts.cmake)
 endif()
 if(CUTEAFD_ENABLE_V41_TP2_EXPERT_AOT)
-  include(cmake/v41_tp2_experts.cmake)
-  include(cmake/v41_dspark_tp2_experts.cmake)
+  include(cmake/families/deepseek_v41/v41_tp2_experts.cmake)
+  include(cmake/families/deepseek_v41/v41_dspark_tp2_experts.cmake)
 endif()
 if(CUTEAFD_ENABLE_V41_FP8_AOT)
-  include(cmake/v41_fp8.cmake)
-  include(cmake/v41_router.cmake)
+  include(cmake/families/deepseek_v41/v41_fp8.cmake)
+  include(cmake/families/deepseek_v41/v41_router.cmake)
 endif()
 if(CUTEAFD_ENABLE_V41_ATTENTION_AOT)
-  include(cmake/v41_attention.cmake)
+  include(cmake/families/deepseek_v41/v41_attention.cmake)
 endif()
 if(CUTEAFD_ENABLE_V41_NVFP4_AOT)
-  include(cmake/v41_nvfp4_experts.cmake)
+  include(cmake/families/deepseek_v41/v41_nvfp4_experts.cmake)
 endif()
 if(CUTEAFD_ENABLE_V41_EXL3_AOT)
-  include(cmake/v41_exl3.cmake)
+  include(cmake/families/deepseek_v41/v41_exl3.cmake)
 endif()
 add_library(cuteafd_native SHARED ${CUTEAFD_NATIVE_SOURCES})
 if(CUTEAFD_ENABLE_V41_EXL3_AOT)
@@ -357,7 +367,7 @@ endif()
 if(CUTEAFD_ENABLE_V41_FP8_AOT)
   # Packed FP8->BF16 conversion requires the SM120 architecture-specific ISA.
   # Keep the normal target's portable image as a fallback in the same fatbin.
-  set_property(SOURCE cuda/kernels/v41_sparse_attention.cu APPEND PROPERTY
+  set_property(SOURCE families/deepseek_v41/cuda/v41_sparse_attention.cu APPEND PROPERTY
     COMPILE_OPTIONS "--generate-code=arch=compute_120a,code=sm_120a")
   target_compile_definitions(cuteafd_native PRIVATE CUTEAFD_HAVE_V41_HC_AOT=1 CUTEAFD_HAVE_V41_ROUTER_AOT=1)
   add_dependencies(cuteafd_native cuteafd_v41_fp8_export cuteafd_v41_index_export cuteafd_v41_router_export)
@@ -395,9 +405,7 @@ if(CUTEAFD_ENABLE_V41_NVFP4_AOT)
   endforeach()
   target_include_directories(cuteafd_native PRIVATE ${CUTEAFD_V41_NVFP4_INCLUDE_DIRS})
 endif()
-target_include_directories(cuteafd_native PUBLIC
-  ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
+target_include_directories(cuteafd_native PUBLIC ${CUTEAFD_NATIVE_INCLUDE_DIRS})
 if(CUTEAFD_ENABLE_XGRAMMAR)
   target_link_libraries(cuteafd_native PRIVATE cuteafd_xgrammar)
   target_include_directories(cuteafd_native PRIVATE "${CUTEAFD_XGRAMMAR_SOURCE_DIR}/cpp")
@@ -467,7 +475,7 @@ if(CUTEAFD_ENABLE_XGRAMMAR)
   add_executable(cuteafd_xgrammar_regular_selftest tests/xgrammar_regular_selftest.cc)
   target_link_libraries(cuteafd_xgrammar_regular_selftest PRIVATE cuteafd_xgrammar)
   target_include_directories(cuteafd_xgrammar_regular_selftest PRIVATE
-    "${CUTEAFD_XGRAMMAR_SOURCE_DIR}/cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    "${CUTEAFD_XGRAMMAR_SOURCE_DIR}/cpp" "${CMAKE_CURRENT_SOURCE_DIR}/shared/src")
   add_test(NAME cuteafd_xgrammar_regular_selftest COMMAND cuteafd_xgrammar_regular_selftest)
   add_executable(cuteafd_xgrammar_selftest tests/xgrammar_selftest.cc)
   target_link_libraries(cuteafd_xgrammar_selftest PRIVATE cuteafd_native)
