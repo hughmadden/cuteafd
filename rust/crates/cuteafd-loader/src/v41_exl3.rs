@@ -112,12 +112,14 @@ impl V41Exl3Projection {
             V41Exl3ProjectionKind::Down => self.input_features,
             _ => self.output_features,
         };
-        // Six ranks are the implicit EXL3 TP6 split of checkpoints whose H128
-        // blocks divide evenly (V4 Pro: 24 -> 4 apiece). V4.1's 2304 keeps its
-        // six-rank Spark layouts native.
+        // Six ranks are the implicit EXL3 TP6 split of every non-V4.1 geometry:
+        // even where the H128 blocks divide (V4 Pro: 24 -> 4 apiece), else the
+        // first ranks own the extra blocks (2048: 3, 3, 3, 3, 2, 2), each rank
+        // with the export of its own width. V4.1's 2304 keeps its six-rank
+        // Spark layouts native.
         ensure!(
-            world != 6 || (intermediate % (6 * 128) == 0 && intermediate != 2304),
-            "EXL3 six-rank partition requires an even H128 split outside V4.1"
+            world != 6 || intermediate != 2304,
+            "EXL3 six-rank partition is not used for V4.1"
         );
         ensure!(
             intermediate % 128 == 0,
@@ -1079,6 +1081,21 @@ mod tests {
             }
             assert!(p.intermediate_partition(6, 6).is_err());
             assert!(p.intermediate_partition(5, 0).is_err());
+        }
+    }
+
+    #[test]
+    fn intermediate_2048_splits_six_ways_on_uneven_whole_blocks() {
+        // GLM 5.3 / GLM 5.3 Flash / MiMo: 16 H128 blocks -> 3, 3, 3, 3, 2, 2.
+        for kind in [V41Exl3ProjectionKind::Up, V41Exl3ProjectionKind::Down] {
+            let (input, output) = if kind == V41Exl3ProjectionKind::Down { (2048, 6144) } else { (6144, 2048) };
+            let p = V41Exl3Projection { name: "test".into(), kind, bits: 4, input_features: input, output_features: output };
+            let mut cursor = 0;
+            for (rank, width) in [384, 384, 384, 384, 256, 256].into_iter().enumerate() {
+                assert_eq!(p.intermediate_partition(6, rank).unwrap(), cursor..cursor + width);
+                cursor += width;
+            }
+            assert_eq!(cursor, 2048);
         }
     }
 

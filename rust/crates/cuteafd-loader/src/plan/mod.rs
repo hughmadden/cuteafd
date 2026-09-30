@@ -75,6 +75,9 @@ pub struct PlanReport {
     pub spark_ranks: usize,
     /// Fewest Spark ranks whose budget holds every routed expert.
     pub min_spark_ranks: usize,
+    /// Share of the routed-expert bytes the widest Spark rank holds: ranks
+    /// own whole 128-blocks of the intermediate (TP6 of 2048: 3 of 16).
+    pub spark_rank_share: f64,
     pub fits: bool,
     pub hints: Vec<Hint>,
 }
@@ -124,6 +127,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport> {
         bytes_by_owner: BTreeMap::new(),
         spark_ranks: options.spark_ranks,
         min_spark_ranks: 0,
+        spark_rank_share: 1.0 / options.spark_ranks.max(1) as f64,
         fits: true,
         hints: Vec::new(),
     };
@@ -205,18 +209,26 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport> {
         .filter(|c| c.owner == Owner::SparkSliced)
         .map(|c| c.bytes)
         .sum();
-    // Expert tensor parallelism supports these group sizes.
+    // Expert tensor parallelism supports these group sizes; ranks own whole
+    // 128-blocks of the intermediate, so the widest rank bounds the budget.
+    let intermediate = spec.moe.as_ref().map(|moe| moe.intermediate);
+    let share = |ranks: usize| match intermediate {
+        Some(i) if i % 128 == 0 && i / 128 >= ranks => (i / 128).div_ceil(ranks) as f64 / (i / 128) as f64,
+        _ => 1.0 / ranks.max(1) as f64,
+    };
+    report.spark_rank_share = share(options.spark_ranks);
+    let fits_on = |ranks: usize| routed as f64 * share(ranks) <= options.spark_budget_bytes as f64;
     let needed = routed.div_ceil(options.spark_budget_bytes.max(1)) as usize;
     report.min_spark_ranks = [1usize, 2, 3, 4, 6]
         .into_iter()
-        .find(|ranks| *ranks >= needed)
+        .find(|&ranks| fits_on(ranks))
         .unwrap_or(needed);
-    if report.min_spark_ranks > options.spark_ranks {
+    if !fits_on(options.spark_ranks) {
         report.fits = false;
         report.hints.push(Hint {
             what: format!(
-                "routed experts need {:.1} GiB per rank on {} Sparks, over the {:.0} GiB budget",
-                routed as f64 / GIB / options.spark_ranks.max(1) as f64,
+                "routed experts need {:.1} GiB on the widest of {} Spark ranks, over the {:.0} GiB budget",
+                routed as f64 * report.spark_rank_share / GIB,
                 options.spark_ranks,
                 options.spark_budget_bytes as f64 / GIB
             ),
@@ -337,7 +349,7 @@ pub fn render(report: &PlanReport) -> String {
         let _ = writeln!(out);
         for (owner, bytes) in &report.bytes_by_owner {
             let per = if owner.starts_with("spark") {
-                format!(" ({:.1} GiB per rank)", *bytes as f64 / GIB / report.spark_ranks.max(1) as f64)
+                format!(" ({:.1} GiB on the widest rank)", *bytes as f64 * report.spark_rank_share / GIB)
             } else {
                 String::new()
             };

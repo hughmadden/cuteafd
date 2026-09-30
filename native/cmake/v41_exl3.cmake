@@ -163,8 +163,9 @@ foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
   if(CUTEAFD_EXL3_GEOMETRY STREQUAL "qwen4")
     list(REMOVE_ITEM CUTEAFD_EXL3_GEOMETRY_LAYOUTS rtx-tp2)
   endif()
-  # V4 Pro's 24 H128 blocks also split over six Sparks (tp6-width512).
-  if(CUTEAFD_EXL3_ROLE STREQUAL "spark" AND CUTEAFD_EXL3_GEOMETRY STREQUAL "dsv4p")
+  # Six Sparks: V4 Pro's 24 H128 blocks (tp6-width512) and the 16 of a 2048
+  # intermediate (GLM 5.3, GLM 5.3 Flash: tp6-width384 x4 + tp6-width256 x2).
+  if(CUTEAFD_EXL3_ROLE STREQUAL "spark" AND NOT CUTEAFD_EXL3_GEOMETRY STREQUAL "qwen4")
     list(APPEND CUTEAFD_EXL3_GEOMETRY_LAYOUTS tp6-rank0 tp6-rank1 tp6-rank2 tp6-rank3 tp6-rank4 tp6-rank5)
   endif()
   list(JOIN CUTEAFD_EXL3_GEOMETRY_LAYOUTS "," CUTEAFD_EXL3_GEOMETRY_REQUIRE)

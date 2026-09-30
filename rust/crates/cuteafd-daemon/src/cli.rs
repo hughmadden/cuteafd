@@ -97,6 +97,11 @@ pub(crate) struct ExpertProbeArgs {
     /// GLM 5.3 prefill does) instead of inline.
     #[arg(long, requires = "intake")]
     pub(crate) intake_lane: bool,
+    /// With `--local --local-tp N` on an EXL3 checkpoint: the Spark-role EXL3
+    /// package root (`tp<N>-rank<R>/m<capacity>` layouts, e.g. a `--loopback`
+    /// build) whose rank slices run on this GPU in turn, BF16 partials summed.
+    #[arg(long, requires = "local")]
+    pub(crate) exl3_package: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

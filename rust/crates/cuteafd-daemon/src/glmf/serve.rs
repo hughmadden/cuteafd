@@ -116,7 +116,8 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(()));
         }
-        schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), policy)
+        let ranks = args.peers.as_deref().map(|peers| peers.split(',').count());
+        schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), policy, ranks)
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
@@ -230,14 +231,21 @@ pub(crate) fn copy_drafts(history: &[u32], limit: usize) -> Vec<u32> {
 
 fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
-    policy: Policy) -> Result<()> {
+    policy: Policy, ranks: Option<usize>) -> Result<()> {
     let mut allocator = Allocator::new(engine.pages, engine.slots);
     let mut grammars = crate::v41_native_serve::constraints::Compiler::with_vocab(
         &opened.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, engine.cfg.eos.clone());
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
-    let mut cost = dflash_policy::step_cost(&GLMF_TP2_STEP_MS, DECODE_ROWS);
+    // The TP2 table also prices TP4 as served (its observed ratio settles the
+    // level); TP6 scales the Spark share by its widest slice against TP4's.
+    let table = match ranks {
+        Some(ranks) if ranks > 4 => dflash_policy::rescale_spark(&GLMF_TP2_STEP_MS, GLMF_TP2_GPU_MS, 512,
+            dflash_policy::widest_slice(engine.cfg.moe_intermediate, ranks)),
+        _ => GLMF_TP2_STEP_MS.to_vec(),
+    };
+    let mut cost = dflash_policy::step_cost(&table, DECODE_ROWS);
     let mut skip = dflash_policy::DraftSkip::default();
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
@@ -522,6 +530,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     }
 }
 
+/// Coordinator share of `GLMF_TP2_STEP_MS` at one row (GPU 6.7 ms of 18.8).
+const GLMF_TP2_GPU_MS: f64 = 6.7;
 /// GLM 5.3 Flash, 1 RTX PRO 6000 (325 W) + Spark TP2 (rhea, moa), recommended
 /// FP8 decode config: speculative verify step ms by rows of one sequence
 /// (glmf-golden --bench-verify 16 after 512 tokens, median of 7); past 16

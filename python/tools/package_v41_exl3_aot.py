@@ -347,7 +347,10 @@ def package_name(geometry: str, bits: list[int]) -> str:
 def shard_profiles(geometry: str, role: str) -> list[tuple]:
     """Profiles of a non-V4.1 geometry: whole H128 blocks of the intermediate per
     rank (the first ranks own any extra block, as the Rust loader partitions),
-    one export per distinct width shared by the ranks that carry it."""
+    one export per distinct width shared by the ranks that carry it. TP6 of
+    2048 (GLM 5.3, GLM 5.3 Flash): 3, 3, 3, 3, 2, 2 blocks -> tp6-width384
+    for ranks 0-3 and tp6-width256 for ranks 4-5 (no padding: each rank runs
+    the export of its own width)."""
     _hidden, intermediate, experts, topk = GEOMETRIES[geometry]
     blocks = intermediate // 128
     if role != 'spark':
@@ -357,8 +360,9 @@ def shard_profiles(geometry: str, role: str) -> list[tuple]:
             profiles.append(('rtx-tp2', intermediate // 2, experts, topk, 'fp32', ['rtx-tp2']))
         return profiles
     profiles = []
-    # Six ranks only where they split the H128 blocks evenly (V4 Pro: 24 -> 4).
-    worlds = (4, 2, 3, 6) if blocks % 6 == 0 else (4, 2, 3)
+    # Six ranks wherever each gets at least one H128 block (V4 Pro: 24 -> 4;
+    # 2048: 16 -> 3/2; not Qwen's 5).
+    worlds = (4, 2, 3, 6) if blocks >= 6 else (4, 2, 3)
     for world in worlds:
         widths: dict[int, list[str]] = {}
         for rank in range(world):

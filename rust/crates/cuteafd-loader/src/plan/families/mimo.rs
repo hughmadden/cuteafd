@@ -178,8 +178,10 @@ impl Family for MiMo {
             Component::RoutedExpert => Some(Hint {
                 what: format!("sigmoid top-{k} routed experts, no shared expert (H {h}, I {i}, {e} experts)"),
                 how: format!("Exact family `mimo:fp8` (b12x fp8_moe over E4M3 + FP32 128x128 scales; packages \
-                    fp8-mimo tp1/tp2/tp4) for H {h} / I {i} / {e} experts / top-{k}; UE8M0 requantization costs \
-                    +0.011 nats mean NLL (V2 Flash), EXL3 is the compact alternative."),
+                    fp8-mimo tp1/tp2/tp4/tp6) for H {h} / I {i} / {e} experts / top-{k}; TP6 owns whole 128-blocks \
+                    ({}/{} rows) zero-padded to {}; UE8M0 requantization costs +0.011 nats mean NLL (V2 Flash), \
+                    EXL3 is the compact alternative.",
+                    (i / 128).div_ceil(6) * 128, i / 128 / 6 * 128, (i / 128).div_ceil(6) * 128),
             }),
             // Pro's router weight is BF16 (the bias FP32); Flash's is FP32.
             Component::Router if formats.iter().any(|f| f == "bf16") => Some(Hint {
