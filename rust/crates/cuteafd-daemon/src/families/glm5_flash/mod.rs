@@ -221,7 +221,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     let cfg = GlmNextConfig::read(&args.snapshot)?;
     // The expert geometry is process-wide and must be fixed before the native
     // library loads (its expert helpers size rows from it).
-    let geometry = cuteafd_core::ExpertGeometry::GLM_NEXT;
+    let geometry = cuteafd_core::ExpertGeometry::GLM5_FLASH;
     ensure!(geometry.hidden as usize == cfg.hidden && geometry.experts as usize == cfg.experts
         && geometry.topk as usize == cfg.topk && geometry.intermediate as usize == cfg.moe_intermediate,
         "checkpoint experts do not match the GLM 5.3 Flash geometry");

@@ -28,7 +28,20 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    match cli.command {
+    // `serve` and `golden` pick the family and stand for its own command.
+    let command = match cli.command {
+        Commands::Serve(args) => match commands::family::argv(commands::family::Kind::Serve, args)? {
+            Some(argv) => Cli::parse_from(argv).command,
+            None => return Ok(()),
+        },
+        Commands::Golden(args) => match commands::family::argv(commands::family::Kind::Golden, args)? {
+            Some(argv) => Cli::parse_from(argv).command,
+            None => return Ok(()),
+        },
+        command => command,
+    };
+    match command {
+        Commands::Serve(_) | Commands::Golden(_) => unreachable!("resolved to a family command above"),
         Commands::Doctor(args) => run_doctor(args),
         Commands::Plan(args) => run_plan(args),
         Commands::ExpertProbe(args) => run_expert_probe(args).await,
@@ -69,7 +82,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Commands::ExpertdNative(args) => shared::experts::service::run(args).await,
+        Commands::Expertd(args) => shared::experts::service::run(args).await,
         Commands::ServeNative(args) => families::deepseek_v41::v41_native_serve::run(args).await,
         Commands::BenchRdma(args) => run_bench_rdma(args),
         Commands::BenchRdmaRing(args) => run_bench_rdma_ring(args),

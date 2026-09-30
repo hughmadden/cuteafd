@@ -20,30 +20,49 @@ pub(crate) enum Commands {
     Fabric(FabricArgs),
     /// Check live Spark expert ranks for one layer against a CPU oracle.
     ExpertProbe(ExpertProbeArgs),
+    /// Serve a checkpoint through the OpenAI API; the family comes from
+    /// --snapshot's config.json (or --family). `serve --family ID --help` lists
+    /// that family's options.
+    Serve(crate::commands::family::FamilyArgs),
+    /// Compare a family's coordinator layer by layer with its golden reference
+    /// outputs (python/reference/families/<id>); --family or --snapshot picks it.
+    Golden(crate::commands::family::FamilyArgs),
     /// Prefill a DeepSeek V4 golden prompt and compare layers and logits.
+    #[command(hide = true)]
     Dsv4Golden(crate::families::deepseek_v4::GoldenArgs),
     /// Run GLM 5.x layers through the exported programs and compare with golden.py outputs.
+    #[command(hide = true)]
     GlmGolden(crate::families::glm5::GoldenArgs),
     /// Compare the MiMo V2 coordinator programs layer by layer with python/reference/families/mimo_v2/mimo_v2/golden.py outputs.
+    #[command(hide = true)]
     MimoGolden(crate::families::mimo_v2::GoldenArgs),
     /// Serve MiMo V2 Flash (mimo_v2) through the OpenAI API with Spark FP8 experts.
+    #[command(hide = true)]
     ServeMimo(crate::families::mimo_v2::serve::ServeArgs),
     /// Compare the GLM 5.3 Flash coordinator programs layer by layer with python/reference/families/glm5_flash/golden.py outputs.
+    #[command(hide = true)]
     GlmfGolden(crate::families::glm5_flash::GoldenArgs),
     /// Compare the Qwen 3.8 Flash Next (qwen4_exp) engine layer by layer with
     /// python/reference/families/qwen4/golden.py outputs.
+    #[command(hide = true)]
     Qwen4Golden(crate::families::qwen4::GoldenArgs),
     /// Serve Qwen 3.8 Flash Next (qwen4_exp) through the OpenAI API on the qwen4 engine.
+    #[command(hide = true)]
     ServeQwen4(crate::families::qwen4::serve::ServeArgs),
     /// Serve GLM 5.3 Flash (glm5_next) through the OpenAI API on the glmf engine.
+    #[command(hide = true)]
     ServeGlmf(crate::families::glm5_flash::serve::ServeArgs),
     /// Serve a GLM 5.x checkpoint (OpenAI-compatible API) over the glm_* programs and Spark experts.
+    #[command(hide = true)]
     ServeGlm(crate::families::glm5::serve::ServeArgs),
     /// Serve a DeepSeek V4 checkpoint (OpenAI API) with Spark experts.
+    #[command(hide = true)]
     ServeDsv4(crate::families::deepseek_v4::serve::ServeArgs),
-    /// Serve official V4.1 native TP4 experts over RoCE.
-    ExpertdNative(NativeExpertDaemonArgs),
+    /// Serve routed experts on a Spark rank over RoCE (every family).
+    #[command(alias = "expertd-native")]
+    Expertd(NativeExpertDaemonArgs),
     /// Serve the official V4.1 target text path.
+    #[command(hide = true)]
     ServeNative(NativeServeArgs),
     BenchRdma(BenchRdmaArgs),
     BenchRdmaRing(BenchRdmaRingArgs),
@@ -396,7 +415,7 @@ mod tests {
                 Commands::ServeNative(args) => {
                     assert_eq!((args.spark_tp, args.spark_ep), (None, None));
                 }
-                Commands::ExpertdNative(args) => {
+                Commands::Expertd(args) => {
                     assert_eq!((args.spark_tp, args.spark_ep), (None, None));
                 }
                 other => panic!("unexpected command {other:?}"),
@@ -409,7 +428,7 @@ mod tests {
         assert_eq!((args.spark_tp, args.spark_ep), (Some(2), Some(2)));
         let cli = Cli::try_parse_from(expert.into_iter()
             .chain(["--spark-tp", "3", "--spark-ep", "2"])).unwrap();
-        let Commands::ExpertdNative(args) = cli.command else { panic!("expertd-native") };
+        let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
         assert_eq!((args.spark_tp, args.spark_ep), (Some(3), Some(2)));
         // All-or-none and value ranges are enforced at parse time.
         for flags in [vec!["--spark-tp", "2"], vec!["--spark-ep", "2"]] {
@@ -425,7 +444,7 @@ mod tests {
         let cli = Cli::try_parse_from(["cuteafd", "expertd-native", "--snapshot", "/model",
             "--native-lib", "/native.so", "--device-budget-bytes", "1000",
             "--rank", "5", "--world", "6"]).unwrap();
-        let Commands::ExpertdNative(args) = cli.command else { panic!("expertd-native") };
+        let Commands::Expertd(args) = cli.command else { panic!("expertd-native") };
         assert_eq!((args.rank, args.world), (5, 6));
 
         // Pure TP6EP1 is a real shard family on both processes. Five is not a
@@ -437,7 +456,7 @@ mod tests {
                 .chain(["--spark-tp", "6", "--spark-ep", "1"])).unwrap();
             match cli.command {
                 Commands::ServeNative(args) => assert_eq!((args.spark_tp, args.spark_ep), (Some(6), Some(1))),
-                Commands::ExpertdNative(args) => assert_eq!((args.spark_tp, args.spark_ep), (Some(6), Some(1))),
+                Commands::Expertd(args) => assert_eq!((args.spark_tp, args.spark_ep), (Some(6), Some(1))),
                 other => panic!("unexpected command {other:?}"),
             }
             let error = Cli::try_parse_from(command.iter().copied()

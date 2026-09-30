@@ -58,3 +58,8 @@ rust/crates/	\bV41SparkTopology\b	SparkTopology
 rust/crates/	\bV41BackboneRequest\b	BackboneRequest
 # daemon: Spark rank topology is shared
 rust/crates/cuteafd-daemon/	\bcrate::families::deepseek_v41::v41_spark_topology\b	crate::shared::spark_topology
+# plan families and expert geometries by long family id
+rust/crates/	\bGLM_DSA\b	GLM5
+rust/crates/	\bGLM_NEXT\b	GLM5_FLASH
+rust/crates/	\bQWEN4_EXP\b	QWEN4
+rust/crates/cuteafd-daemon/	\bCommands::ExpertdNative\b	Commands::Expertd

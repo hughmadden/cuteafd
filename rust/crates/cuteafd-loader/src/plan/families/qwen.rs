@@ -11,11 +11,11 @@ use crate::plan::names::indexed;
 use crate::plan::spec::*;
 
 pub struct Qwen;
-pub static QWEN4_EXP: Qwen = Qwen;
+pub static QWEN4: Qwen = Qwen;
 
 impl Family for Qwen {
     fn id(&self) -> &'static str {
-        "qwen4_exp"
+        "qwen4"
     }
     fn runtime(&self) -> RuntimeStatus {
         RuntimeStatus::Serving
@@ -74,7 +74,7 @@ impl Family for Qwen {
             .unwrap_or_default();
         let mtp = opt_usize_field(text, "mtp_num_hidden_layers").unwrap_or(0);
         Ok(ModelSpec {
-            family: "qwen4_exp",
+            family: "qwen4",
             architecture: checkpoint.architectures().first().cloned().unwrap_or_default(),
             hidden: usize_field(text, "hidden_size")?,
             vocab: usize_field(text, "vocab_size")?,

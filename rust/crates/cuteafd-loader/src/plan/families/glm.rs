@@ -17,11 +17,11 @@ pub struct Glm {
 }
 
 /// GLM 5.x: serve-glm / glm-golden on the glm coordinator programs.
-pub static GLM_DSA: Glm =
-    Glm { id: "glm_dsa", architecture: "GlmMoeDsaForCausalLM", runtime: RuntimeStatus::Serving };
+pub static GLM5: Glm =
+    Glm { id: "glm5", architecture: "GlmMoeDsaForCausalLM", runtime: RuntimeStatus::Serving };
 /// GLM 5.3 Flash: serve-glmf / glmf-golden on the glmf coordinator programs.
-pub static GLM_NEXT: Glm =
-    Glm { id: "glm_next", architecture: "Glm5NextForConditionalGeneration", runtime: RuntimeStatus::Serving };
+pub static GLM5_FLASH: Glm =
+    Glm { id: "glm5_flash", architecture: "Glm5NextForConditionalGeneration", runtime: RuntimeStatus::Serving };
 
 fn str_list(config: &Value, key: &str) -> Vec<String> {
     config
@@ -51,7 +51,7 @@ impl Family for Glm {
         // BF16/F32 coordinator tensors (FP8 128x128 blocks with FP32 scales read
         // as they are); routed experts from EXL3 packages (glm: exl3-glm-k45,
         // glmf: exl3-glmf-k34) or the checkpoint's FP8 (fp8-glm, fp8-glmf).
-        let exl3_bits = if self.id == "glm_dsa" { 4..=5 } else { 3..=4 };
+        let exl3_bits = if self.id == "glm5" { 4..=5 } else { 3..=4 };
         match component {
             Component::RoutedExpert => {
                 matches!(format, Fp8Block { block: (128, 128) })
@@ -106,7 +106,7 @@ impl Family for Glm {
             notes.push(format!(
                 "mHC width {hc}, Sinkhorn {} iterations, final collapse {}",
                 opt_usize_field(text, "hc_sinkhorn_iters").unwrap_or(0),
-                if self.id == "glm_next" { "unweighted mean" } else { "hc_head" },
+                if self.id == "glm5_flash" { "unweighted mean" } else { "hc_head" },
             ));
         }
         let rope = opt_usize_field(text, "qk_rope_head_dim").unwrap_or(0);
@@ -232,26 +232,26 @@ impl Family for Glm {
     fn component_hint(&self, component: Component) -> Option<Hint> {
         let glmrt = "../glmrt (the GLM-5.3 engine this family ports from)";
         let (what, how) = match (self.id, component) {
-            ("glm_next", Component::Attention) => (
+            ("glm5_flash", Component::Attention) => (
                 "hybrid attention: Kimi Delta Attention (linear) layers plus MLA+DSA layers".to_string(),
                 "Runs as the glmf programs (b12x integration/cuteafd/glmf.py: token-sequential KDA \
                  recurrence, no-RoPE MLA over 528-byte FP8 records, pooled indexer) in \
                  cuteafd-daemon src/glmf. Faster prefill: b12x sequence/kda_prefill (chunked) for \
                  the recurrence.".to_string(),
             ),
-            ("glm_next", Component::Speculator) | ("glm_next", Component::SpeculatorExpert) => (
+            ("glm5_flash", Component::Speculator) | ("glm5_flash", Component::SpeculatorExpert) => (
                 "native MTP layer 45 (not run); DFlash2 drafter incoai/GLM-5.3-Flash-DFlash2".to_string(),
                 "serve-glmf verifies copy-window drafts only. KDA state needs a rollback for any \
                  speculator: serve-glmf backs it up per verify and replays kept rows (glmf/serve.rs).".to_string(),
             ),
-            ("glm_next", Component::Indexer) => (
+            ("glm5_flash", Component::Indexer) => (
                 "DSA indexer over 4-token key pools".to_string(),
                 "Pool keys are a per-channel softmax over each complete pool of LayerNorm(wk x) weighted by \
                  index_kpool_compress_gate x + ape; score = sum_h w_h relu(q_h . k_pool) / sqrt(128); top \
                  index_topk/kpool pools expand to tokens, plus the open tail pool. Up to index_topk + kpool - 1 \
                  tokens every token is selected, so short contexts are dense causal MLA.".to_string(),
             ),
-            ("glm_next", Component::RoutedExpert) | ("glm_next", Component::SpeculatorExpert) => (
+            ("glm5_flash", Component::RoutedExpert) | ("glm5_flash", Component::SpeculatorExpert) => (
                 "top-8 of 288 sigmoid routed experts with SwiGLU clamp 10".to_string(),
                 "EXL3 K3/K4 checkpoints: the glm:exl3 recipe at hidden 4096 / inter 2048 / 288 experts with \
                  the clamp enabled (python/tools/aot/package_v41_exl3_aot.py, exl3_cross_sm121.py for Sparks). \

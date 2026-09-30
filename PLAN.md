@@ -50,7 +50,7 @@ Core (parity tier, must match or beat the parent engines):
 | Model | Family | Format | Notes |
 | --- | --- | --- | --- |
 | deepseek-ai/DeepSeek-V4.1-Flash | deepseek_v41 | FP8 block + MXFP4 experts | engram ×2, dSpark 3-stage, vision. The regression anchor. |
-| wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1 | glm_dsa | EXL3 K4 experts | 78 layers, MLA+DSA, DFlash2 draft (`incoai/GLM-5.3-DFlash2`) |
+| wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1 | glm5 | EXL3 K4 experts | 78 layers, MLA+DSA, DFlash2 draft (`incoai/GLM-5.3-DFlash2`) |
 | deepseek-ai/DeepSeek-V4-Flash-0731 | deepseek_v4 | FP8 block + FP4 experts | compress 4/128 alternating, nextn 1 |
 | wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1 | deepseek_v4 | EXL3 K2 experts | 61 layers, 7168 wide, ~96 GiB per Spark rank at TP4 |
 
@@ -58,10 +58,10 @@ Extend (new families; kernels largely exist in b12x already):
 
 | Model | Family | New pieces |
 | --- | --- | --- |
-| zai-org/GLM-5.3-Flash, brandonmusic/GLM-5.3-Flash-tr3-4bpw | glm_next | hybrid KDA linear attention (34) + DSA MLA (11), mHC, EXL3 tr3 |
+| zai-org/GLM-5.3-Flash, brandonmusic/GLM-5.3-Flash-tr3-4bpw | glm5_flash | hybrid KDA linear attention (34) + DSA MLA (11), mHC, EXL3 tr3 |
 | XiaomiMiMo/MiMo-V2-Flash | mimo_v2 | GQA full + SWA with sink, no shared expert, FP8 |
 | XiaomiMiMo/MiMo-V2.6-Pro-RL | mimo_v2 | 70 layers, 128 heads, mxfp4 store dtype, dflash dir |
-| Qwen/Qwen3.8-Flash-Next (+ EXL3 K4.25 PLE variants) | qwen4_exp | GDN linear attention, n-gram memory tables, PLE, MTP; `../qflashrt` has a single-device port |
+| Qwen/Qwen3.8-Flash-Next (+ EXL3 K4.25 PLE variants) | qwen4 | GDN linear attention, n-gram memory tables, PLE, MTP; `../qflashrt` has a single-device port |
 
 Speculation: one best speculator per family (native MTP/nextn, dSpark,
 DFlash2). Adaptive width with calibrated confidence and cost model, as in
@@ -80,7 +80,7 @@ rust/crates/
   cuteafd-engine     model-agnostic serve runtime: scheduler, lanes, prefix cache, memory,
                  speculative transaction framework, console state
   cuteafd-api        OpenAI chat + completions, constraints, tools, images, console
-  cuteafd-families/  deepseek_v41, deepseek_v4, glm_dsa, glm_next, mimo_v2, qwen4_exp
+  cuteafd-families/  deepseek_v41, deepseek_v4, glm5, glm5_flash, mimo_v2, qwen4
                  each: spec reader, block execution, attention variants, speculator wiring,
                  chat template + tool parser + grammar generator
   cuteafd-spec/      speculators: nextn_mtp, dspark, dflash2
@@ -242,15 +242,15 @@ Reuse `ds4_*_aot`, `mla_indexing` kernels; nextn MTP speculator. Port the
 three ds4rt API defaults. Targets: Pro ≥ 50 decode / 2,500 prefill tok/s
 (ds4rt floor 33 / 1,650).
 
-**Phase 2 — GLM 5.3 (glm_dsa) + DFlash2.**
+**Phase 2 — GLM 5.3 (glm5) + DFlash2.**
 Port from glmrt: DSA indexer kernel, top-8 router, dense/shared paths,
 mixed EXL3 K3/K4 routes and loader layout, DFlash2 speculator, GLM tool
 grammar, KV profiles. Target: ≥ glmrt's 25.96 weighted tok/s on 1 RTX,
 better on 2 RTX with local expert layers.
 
 **Phase 3 — new families.**
-`glm_next` (GLM 5.3 Flash: KDA + DSA, mHC; b12x `kda_prefill`/`gdn_decode`),
-`mimo_v2` (GQA + SWA sink; b12x paged FP8 KV attention), `qwen4_exp`
+`glm5_flash` (GLM 5.3 Flash: KDA + DSA, mHC; b12x `kda_prefill`/`gdn_decode`),
+`mimo_v2` (GQA + SWA sink; b12x paged FP8 KV attention), `qwen4`
 (from `../qflashrt`: GDN, n-gram tables via `MappedTable`, PLE, MTP).
 Each lands with a `plan` that says what is missing before any kernel work.
 Finish downloads/placement first (MiMo checkpoints are incomplete today).

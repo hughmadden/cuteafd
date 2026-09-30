@@ -3,5 +3,6 @@ pub(crate) mod bench_rdma_reduce;
 pub(crate) mod bench_rdma_ring;
 pub(crate) mod doctor;
 pub(crate) mod expert_probe;
+pub(crate) mod family;
 pub(crate) mod plan;
 pub(crate) mod transport_capabilities;
