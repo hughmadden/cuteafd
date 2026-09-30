@@ -7,6 +7,7 @@ mod cli;
 mod commands;
 mod draft_policy;
 mod prefill_share;
+mod fp8_linear;
 mod dsv4;
 mod glm;
 mod glmf;

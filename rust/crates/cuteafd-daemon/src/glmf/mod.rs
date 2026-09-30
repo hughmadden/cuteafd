@@ -102,6 +102,10 @@ pub(crate) struct EngineArgs {
     /// Sequences the drafter keeps a context for and drafts for at once.
     #[arg(long, default_value_t = 8)]
     pub draft_sequences: usize,
+    /// Draft through E4M3 copies of the drafter's GEMM weights and of the LM
+    /// head (false: BF16; the committed tokens are the same either way).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub draft_fp8: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -160,6 +164,11 @@ pub(crate) struct GoldenArgs {
     /// output directory.
     #[arg(long)]
     pub draft_oracle: Option<PathBuf>,
+    /// With --draft: replay the drafter alone on the golden taps, drafting
+    /// after every token from this position on, BF16 and FP8 (acceptance
+    /// against the text and the golden greedy picks, draft time).
+    #[arg(long)]
+    pub draft_replay: Option<usize>,
     /// With --draft: after the --prefill tokens, decode N greedy tokens one row
     /// per step, drafting before each, and report how many drafts the target
     /// reproduced (0: teacher-forced on tokens.bin, scoring against it).
@@ -258,8 +267,12 @@ impl Opened {
             let mask = embed_rows(&self.checkpoint, &[cfg.mask_token], self.cfg.hidden)?;
             let file = crate::glm::dflash::prefetch(snapshot).join()
                 .map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
-            engine.drafter = Some(crate::glm::dflash::GlmDrafter::load(&self.library, snapshot, file, stream,
-                args.draft_sequences, args.draft_sequences, mask, true)?);
+            let mut drafter = crate::glm::dflash::GlmDrafter::load(&self.library, snapshot, file, stream,
+                args.draft_sequences, args.draft_sequences, mask, true)?;
+            if args.draft_fp8 {
+                drafter.enable_fp8(engine.weights.head.buffer.ptr, false)?;
+            }
+            engine.drafter = Some(drafter);
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash2 drafter resident");
         }
         if (0..layers).any(|l| !self.cfg.dense[l]) {
@@ -393,6 +406,9 @@ fn score(logits: &[f32], golden: &[f32], tokens: &[u32], first: usize, vocab: us
 fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_>) -> Result<()> {
     if let Some(dir) = &args.draft_oracle {
         return speculate::draft_oracle(args, opened, engine, dir);
+    }
+    if let Some(start) = args.draft_replay {
+        return speculate::draft_replay(args, opened, engine, start);
     }
     if let Some(rows) = args.replay_check {
         return speculate::replay_check(args, opened, engine, rows);
