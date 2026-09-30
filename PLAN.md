@@ -286,6 +286,30 @@ convergence; S4 W4A4 prefill experiment. Gates per stage: oracle cosine,
 KL vs golden within 0.005 of the FP8-expert path, tok/s ≥ it, readiness
 not worse, V4.1 parity. GLM 5.3 NVFP4 experts (~407 GB) need TP6.
 
+**Phase 6 — placement planner (design 2026-09-30).** One planner for every
+family: (model, inventory of 1–2 coordinator GPUs — real or simulated by a
+memory budget — and 1–8 Sparks, KV target, objective) → a hashed
+`placement.json` that the loader, workers, engines and launchers all
+consume. It generalizes V4.1's startup handoff (`v41_native_serve/placement.rs`),
+live memory planner and 20/20 backbone split. Per MoE layer the experts are
+resident on GPU0/GPU1 (full width, or TP2 where measured) or on a Spark group
+with TP×EP and uneven whole-block slices; EP means expert subsets per group
+(new: today groups are replicated). Cost model counts the busiest rank
+(E[max] routed experts per group), fabric intake as a shared prefill
+resource, and per-family coordinator step tables; search is exhaustive.
+Cold components get dispositions: official vision/audio towers run whole on
+a Spark when they fit (`ENCODERS=rtx0` pins them) with a hash-keyed
+embedding cache refcounted by the prefix cache; MTP layers are unused when a
+DFlash2 drafter drafts. Dual-GPU coordinator default is the layer-range split
+(memory, ~1.9× GPU-bound prefill); TP2 of dense layers only if a P2P probe
+shows it pays (GPU0/GPU1 cross the host bridge; ds41rt measured it a loss).
+One `ExpertRouter` replaces the six per-family stage/send/land/reduce copies;
+V4.1's `receive_owned` stays untouched. Stages: S0 planner + `plan` (must
+reproduce today's layouts), S1 manifest handoff + workers, S2 router in the
+generic engines + GPU1 as expert host, S3 EP subsets (GLM 5.3 official FP8 on
+2 RTX + 6 Sparks: fits, ~0.75× K4 decode), S4 encoder service + multimodal
+input, S5 coordinator range split, S6 eight Sparks.
+
 Ongoing, any phase: engram/n-gram tables in host RAM now; Spark-RAM
 replicas and fabric-fed tables are explorations, kept behind options.
 
