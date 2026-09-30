@@ -62,7 +62,7 @@ def covered_symbols(ffi_dir: Path) -> tuple[set[str], set[str]]:
     """Return (required, optional) symbols this scanner can see."""
     required: set[str] = set()
     optional: set[str] = set()
-    files = sorted(ffi_dir.glob("*.rs"))
+    files = sorted(ffi_dir.rglob("*.rs"))
     for path in files:
         for line in path.read_text().splitlines():
             for match in LOOKUP.finditer(line):
