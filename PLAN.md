@@ -260,6 +260,25 @@ mixed) on the gptqmodel fork; extend to new families; publish quants under
 wrldsuksgo2mars. Official images `ghcr.io/tpurtell/cuteafd-{coordinator,
 spark-expert}`, concise README with one headline table.
 
+**Prefix cache for every family (top priority, design 2026-09-30).** Only
+V4.1 has one (radix banks Prompt/Turn keyed by token ids, shared FP4 pages +
+a 2.72 MB copied "front" of 128 SWA rows per layer, 128-token approximate
+replay for partial hits, pinned-host tier in `cuteafd-hostcache`). Generic
+version in the engine crate: `PrefixFamily` trait (layout, capture/restore of
+the positional "mark", shareable page rows, commit point), one refcounted
+`RefPagePool` with CoW tails replacing the five per-family free lists, a
+device mark arena sized by lanes (recurrent marks are 110–141 MiB) with the
+host tier holding the rest, Hugh-style victim order and 64-token hash-chained
+host page identity, `After{greedy, logits}` for exact-length hits, drafters
+restored cold with a `context_valid_from` mask. Prompt snapshot is the
+guarantee; Turn snapshot opportunistic, later made exact by a template-aware
+canonical turn snapshot. Order: S0 engine crate + agentic reasoning-on
+benchmark (record/replay of multi-turn tool sessions; turn TTFT, hit rate,
+decode tok/s), S1 MiMo V2.6 Pro (+V2 Flash), S2 GLM 5.3 Flash, S3 GLM 5.3,
+S4 Qwen, S5 V4 Flash/Pro, S6 canonical turn snapshot, S7 embedding cache.
+Gate: resume-at-P restores are byte-identical to straight prefill; greedy
+text identical to cache-off; V4.1 parity unchanged.
+
 **Phase 5 — NVIDIA ModelOpt NVFP4 checkpoints (queued; after the families
 above reach their performance targets).** nvidia/{DeepSeek-V4.1-Flash,
 GLM-5.3, GLM-5.3-Flash, Qwen3.8-Flash-Next}-NVFP4. Common contract: U8
