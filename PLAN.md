@@ -311,9 +311,10 @@ configs (AGENTS.md); the planner's estimates cover the rest.
 One `ExpertRouter` replaces the six per-family stage/send/land/reduce copies;
 V4.1's `receive_owned` stays untouched. Stages: S0 planner + `plan` (must
 reproduce today's layouts), S1 manifest handoff + workers, S2 router in the
-generic engines + GPU1 as expert host, S3 EP subsets (GLM 5.3 official FP8 on
-2 RTX + 6 Sparks: fits, ~0.75× K4 decode), S4 encoder service + multimodal
-input, S5 coordinator range split, S6 eight Sparks.
+generic engines + GPU1 as expert host, S3 EP subsets (only if a quantized
+model needs them; GLM 5.3 official FP8 is out of scope — EXL3 and NVFP4
+quants cover it), S4 encoder service + multimodal input, S5 coordinator
+range split, S6 eight Sparks.
 
 Ongoing, any phase: engram/n-gram tables in host RAM now; Spark-RAM
 replicas and fabric-fed tables are explorations, kept behind options.
