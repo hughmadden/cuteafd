@@ -11,7 +11,7 @@
 # BUILD holds target/release/cuteafd and coord/native/{libcuteafd_native.so,
 # dsv4_programs/dsv4_programs.json} (~/.cache/cuteafd/builds/glm-parity layout;
 # NATIVE names another native build directory). An arm's +KEY=VALUE list adds
-# run-dsv4.sh config keys, e.g. IMAGE+L2_PREFETCH=auto or IMAGE+DRAFT_FP8=off:
+# run-family.sh config keys, e.g. IMAGE+L2_PREFETCH=auto or IMAGE+SPECULATOR_FP8=off:
 # the L2 prefetch A/B is `ab OUT 3 IMAGE IMAGE+L2_PREFETCH=auto`.
 # Needs raptor GPU0 and ostrich..kiwi free; stop other models first. The power
 # cap is whatever raptor has (glmrt v9 published 33.42 at 400 W; compare arms
@@ -39,14 +39,14 @@ stop_all() {
   for h in "${sparks[@]}"; do ssh "$h" "docker rm -f cuteafd-spark-expert-$h-19461 >/dev/null 2>&1 || true"; done
 }
 
-# A run-dsv4.sh config for coordinator IMAGE (p7 Spark workers, GPU0:8200, DFlash2).
+# A run-family.sh config for coordinator IMAGE (p7 Spark workers, GPU0:8200, DFlash2).
 cuteafd_config() {
   local image=${1%%+*} keys= trace=$2
   [[ $1 == *+* ]] && keys=${1#*+}
   sed -e "s#^COORDINATOR_DOCKER_INFERENCE=.*#COORDINATOR_DOCKER_INFERENCE=$image#" \
       -e "s#^SPARK_EXPERT_DOCKER_INFERENCE=.*#SPARK_EXPERT_DOCKER_INFERENCE=$p7_spark#" \
       "$HOME/.cache/cuteafd/builds/sparkrun/glm-p7.config"
-  echo "COORDINATOR_TRACE=$trace"
+  echo "SPECULATION_TRACE=$trace"
   [[ -z $keys ]] || tr ',' '\n' <<< "$keys"
 }
 
@@ -73,7 +73,7 @@ launch() {
     echo http://127.0.0.1:8000
   else
     cuteafd_config "$arm" "$out/$tag.trace.jsonl" > "$out/$tag.config"
-    "$repo/scripts/launch/run-dsv4.sh" --config "$out/$tag.config" --restart > "$out/$tag.launch.log" 2>&1
+    "$repo/scripts/launch/run-family.sh" --config "$out/$tag.config" --restart > "$out/$tag.launch.log" 2>&1
     echo http://127.0.0.1:8200
   fi
 }
@@ -96,9 +96,9 @@ case "${1:-}" in
   gates)
     out=$2 build=$3; mkdir -p "$out"
     stop_all
-    cuteafd_config "$p7" "" | grep -v '^COORDINATOR_TRACE' > "$out/workers.config"
-    # p7 Spark workers only: run-dsv4.sh starts them, then its coordinator is removed.
-    "$repo/scripts/launch/run-dsv4.sh" --config "$out/workers.config" --restart > "$out/workers.log" 2>&1
+    cuteafd_config "$p7" "" | grep -v '^SPECULATION_TRACE' > "$out/workers.config"
+    # p7 Spark workers only: run-family.sh starts them, then its coordinator is removed.
+    "$repo/scripts/launch/run-family.sh" --config "$out/workers.config" --restart > "$out/workers.log" 2>&1
     docker rm -f cuteafd-coordinator >/dev/null
     peers=10.55.0.1:19461,10.55.0.2:19461,10.55.0.3:19461,10.55.0.4:19461
     golden_run() {

@@ -187,7 +187,7 @@ run_model() { # run_model glmf|pro ROUNDS
       local cfg="$dir/$arm.config" count port
       read -r count port < <(model_config "$model" "$arm" "$cfg")
       stop_all "$count" "$port"
-      "$repo/scripts/launch/run-dsv4.sh" --config "$cfg" > "$dir/launch-$arm-$round.log" 2>&1 ||
+      "$repo/scripts/launch/run-family.sh" --config "$cfg" > "$dir/launch-$arm-$round.log" 2>&1 ||
         { tail -20 "$dir/launch-$arm-$round.log"; exit 1; }
       docker logs cuteafd-coordinator 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -i "intake" | head -5 |
         sed "s/^/$arm r$round: /" | tee -a "$dir/results.txt" || true

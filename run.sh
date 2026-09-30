@@ -8,7 +8,11 @@ usage() {
   cat <<'EOF'
 Usage: ./run.sh [OPTIONS]
 
-Starts native DeepSeek V4.1 on the RTX coordinator and configured Spark ranks.
+Starts the checkpoint named by MODEL_ID on the RTX coordinator and configured
+Spark ranks. DeepSeek V4.1 (the default) runs natively with the options below;
+DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2 and Qwen 3.8 checkpoints are
+recognized from their config.json and started by scripts/launch/run-family.sh,
+which takes --config and --restart and reads its own config keys.
 SPARK_COUNT=2 or SPARK_COUNT=3 (compact EXL3, no SPARK_TP/SPARK_EP keys)
 requires EXL3 on one RTX, with a hard 32GiB GPU ceiling.
 An optional expert-group topology is selected in the configuration with
@@ -97,6 +101,18 @@ while [[ $# -gt 0 ]]; do
     *) release_die "unknown run argument: $1" ;;
   esac
 done
+
+# Every family but DeepSeek V4.1 launches through scripts/launch/run-family.sh
+# (same config file, same container names, so ./stop.sh stops it); the family
+# comes from the checkpoint's config.json.
+family="$(release_config_family "$config")"
+if [[ "$family" != deepseek_v41 ]]; then
+  ((${#overrides[@]} == 0 && dry_run == 0)) && [[ -z "$wip_slot$dspark_draft_limit" ]] ||
+    release_die "$family checkpoints take only --config and --restart here (the other options are DeepSeek V4.1's; see scripts/launch/run-family.sh for its config keys)"
+  family_args=(--config "$config" --family "$family")
+  ((restart == 0)) || family_args+=(--restart)
+  exec "$repo_root/scripts/launch/run-family.sh" "${family_args[@]}"
+fi
 
 release_load_config "$config"
 for name in "${!overrides[@]}"; do printf -v "$name" '%s' "${overrides[$name]}"; done

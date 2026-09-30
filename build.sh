@@ -48,7 +48,7 @@ put each family's coordinator programs in the coordinator image, and
 CUTEAFD_RELEASE_EXPERT_FAMILIES (FAMILY:ROLE list, ';'-separated) adds routed-expert
 packages to both images, each keeping its architecture's entries.
 CUTEAFD_RELEASE_MIMO_GEOMETRIES picks the MiMo program geometries (default
-mimo,mimop: V2 Flash and V2.6 Pro). p7's set, everything scripts/launch/run-dsv4.sh
+mimo,mimop: V2 Flash and V2.6 Pro). p7's set, everything scripts/launch/run-family.sh
 serves (V4 Pro EXL3 K2, GLM 5.3 EXL3 K4 and FP8, GLM 5.3 Flash, MiMo V2 Flash
 FP8, MiMo V2.6 Pro MXFP4 (tp1 coordinator, tp6/tp2 Spark), Qwen 3.8 Flash Next
 EXL3 K4.25):

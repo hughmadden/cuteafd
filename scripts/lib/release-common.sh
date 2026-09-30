@@ -236,6 +236,36 @@ release_known_key() {
 # value-safety check stay in force while launch-only topology/readiness
 # requirements are skipped. A launch-incomplete but syntactically valid file
 # can therefore clean every host it names.
+# The family of the checkpoint a config names (scripts/lib/checkpoint-family.py
+# on its config.json). A config without MODEL_ID, or a snapshot not present
+# here, is DeepSeek V4.1, the release default; its own validation reports a
+# missing snapshot.
+release_config_family() {
+  local config="$1" model="" revision="" line key value hub dir
+  [[ -f "$config" ]] || { printf 'deepseek_v41\n'; return 0; }
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(release_trim "${line%%#*}")"
+    [[ "$line" == *=* ]] || continue
+    key="${line%%=*}"; value="${line#*=}"
+    case "$key" in
+      MODEL_ID) model="$value" ;;
+      MODEL_REVISION) revision="$value" ;;
+    esac
+  done < "$config"
+  [[ -n "$model" ]] || { printf 'deepseek_v41\n'; return 0; }
+  hub="${HF_HOME:-$HOME/.cache/huggingface}/hub"
+  dir="$hub/models--${model//\//--}"
+  [[ -n "$revision" || ! -f "$dir/refs/main" ]] || revision="$(<"$dir/refs/main")"
+  local described=""
+  if [[ -n "$revision" && -f "$dir/snapshots/$revision/config.json" ]]; then
+    described="$(python3 "$(dirname "${BASH_SOURCE[0]}")/checkpoint-family.py" \
+      "$dir/snapshots/$revision/config.json" 2>/dev/null)" || described=""
+  fi
+  # Unrecognized configs stay on the DeepSeek V4.1 path, whose checks name the problem.
+  [[ -n "$described" ]] || described=deepseek_v41
+  printf '%s\n' "${described%% *}"
+}
+
 release_load_config() {
   local config="$1"
   local mode="${2:-launch}"

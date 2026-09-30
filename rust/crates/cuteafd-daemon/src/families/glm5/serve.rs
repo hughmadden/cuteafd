@@ -220,7 +220,7 @@ impl Active<'_> {
     }
 }
 
-/// Per-cycle speculation trace (CUTEAFD_GLM_TRACE=path, JSON lines): every
+/// Per-cycle speculation trace (CUTEAFD_SPECULATION_TRACE=path, JSON lines): every
 /// verify of a sequence (position, rows, committed rows, planned DFlash2
 /// drafts, whether a copy window replaced them, the full DFlash2 draft and
 /// its selector features, step ms) and every finished request's generated
@@ -230,9 +230,9 @@ struct Trace(std::io::BufWriter<std::fs::File>);
 
 impl Trace {
     fn open() -> Result<Option<Self>> {
-        let Ok(path) = std::env::var("CUTEAFD_GLM_TRACE") else { return Ok(None) };
+        let Some((var, path)) = crate::shared::draft_policy::speculation_trace_path("CUTEAFD_GLM_TRACE") else { return Ok(None) };
         let file = std::fs::OpenOptions::new().create(true).append(true).open(&path)
-            .with_context(|| format!("CUTEAFD_GLM_TRACE {path}"))?;
+            .with_context(|| format!("{var} {path}"))?;
         Ok(Some(Self(std::io::BufWriter::new(file))))
     }
 

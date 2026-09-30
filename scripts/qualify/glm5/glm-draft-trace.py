@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Score DFlash2 draft-count policies offline from a serve-glm trace.
 
-serve-glm writes CUTEAFD_GLM_TRACE (JSON lines): one "cycle" record per
+serve-glm writes CUTEAFD_SPECULATION_TRACE (JSON lines): one "cycle" record per
 sequence per verify step (position = tokens already cached, rows verified,
 rows committed, planned DFlash2 drafts, the full 7-token draft) and one
 "done" record per request with its generated tokens. At temperature 0 the

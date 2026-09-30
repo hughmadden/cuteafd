@@ -781,3 +781,13 @@ mod tests {
         }
     }
 }
+
+/// Where a serve path appends its per-cycle speculation trace (JSON lines):
+/// `CUTEAFD_SPECULATION_TRACE`, else the family's pre-rename variable (`legacy`,
+/// e.g. `CUTEAFD_GLM_TRACE`), kept for one release. Returns the variable read
+/// and the path.
+pub(crate) fn speculation_trace_path(legacy: &'static str) -> Option<(&'static str, String)> {
+    ["CUTEAFD_SPECULATION_TRACE", legacy]
+        .into_iter()
+        .find_map(|var| std::env::var(var).ok().filter(|path| !path.is_empty()).map(|path| (var, path)))
+}

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check the shared draft policy's models against a serve-qwen4 --mtp trace.
 
-serve-qwen4 writes CUTEAFD_QWEN4_TRACE (JSON lines): one record per verify
+serve-qwen4 writes CUTEAFD_SPECULATION_TRACE (JSON lines): one record per verify
 cycle with the request ids, rows, each sequence's drafts ("depths") and kept
 rows, the verify / MTP / whole-cycle ms, the cost model's verify prediction
 before it folded the step in, its fit, the conditional acceptance rates the

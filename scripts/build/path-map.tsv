@@ -459,7 +459,7 @@ scripts/release/image-identity-probe.sh	scripts/build/release/image-identity-pro
 scripts/release/run-release-build.sh	scripts/build/release/run-release-build.sh
 scripts/release/verify-release-artifacts.sh	scripts/build/release/verify-release-artifacts.sh
 scripts/release/write-evidence-sums.sh	scripts/build/release/write-evidence-sums.sh
-scripts/run-dsv4.sh	scripts/launch/run-dsv4.sh
+scripts/run-dsv4.sh	scripts/launch/run-family.sh
 scripts/run-on-hosts.sh	scripts/launch/run-on-hosts.sh
 scripts/run-tp-ep-kernel-checks.sh	scripts/bench/deepseek_v41/run-tp-ep-kernel-checks.sh
 scripts/run-tp-ep-native-candidate.sh	scripts/launch/run-tp-ep-native-candidate.sh
