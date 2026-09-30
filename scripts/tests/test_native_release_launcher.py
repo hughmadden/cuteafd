@@ -19,12 +19,12 @@ class NativeReleaseLauncherTest(unittest.TestCase):
                                          ('1', '17', '0'), ('1', '0', '0')]:
             with self.subTest(layout=layout, layers=layers):
                 result = subprocess.run(['bash', '-c',
-                    'source scripts/release-common.sh; release_spark_first_layer "$1" "$2"',
+                    'source scripts/lib/release-common.sh; release_spark_first_layer "$1" "$2"',
                     'test', layout, layers], cwd=ROOT, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), expected)
         result = subprocess.run(['bash', '-c',
-            'source scripts/release-common.sh; release_spark_first_layer 2 0'],
+            'source scripts/lib/release-common.sh; release_spark_first_layer 2 0'],
             cwd=ROOT, text=True, capture_output=True)
         self.assertNotEqual(result.returncode, 0)
 
@@ -103,7 +103,7 @@ spark_tp_roles={shlex.quote(roles)}
             )
             (stub_dir / 'ssh').chmod(0o755)
             harness = f'''set -euo pipefail
-source scripts/release-common.sh
+source scripts/lib/release-common.sh
 export CUTEAFD_RELEASE_SSH_CONFIG={shlex.quote(str(config))}
 seed_host=fixture
 remote_dir=/fixture
@@ -140,7 +140,7 @@ spark_tp_roles=
                                 ('wrldsuksgo2mars/DeepSeek-V4.1-EXL3-K3.25-v1', 1)]:
             with self.subTest(model=model):
                 result = subprocess.run(
-                    ['bash', '-c', 'source scripts/release-common.sh; release_native_model_list_matches "$RELEASE_NATIVE_API_MODEL_ID"'],
+                    ['bash', '-c', 'source scripts/lib/release-common.sh; release_native_model_list_matches "$RELEASE_NATIVE_API_MODEL_ID"'],
                     cwd=ROOT, input=json.dumps({'object': 'list', 'data': [{'id': model}]}),
                     text=True, capture_output=True)
                 self.assertEqual(result.returncode, expected, result.stderr)
@@ -153,7 +153,7 @@ spark_tp_roles=
                     config.write_text((ROOT / 'cuteafd.config').read_text()
                                       + f'\nEXL3_PAIRED_TP4={setting}\n')
                     result = subprocess.run(
-                        ['bash', '-c', 'source scripts/release-common.sh; release_load_config "$1"; printf "%s" "$EXL3_PAIRED_TP4"',
+                        ['bash', '-c', 'source scripts/lib/release-common.sh; release_load_config "$1"; printf "%s" "$EXL3_PAIRED_TP4"',
                          'test', str(config)], cwd=ROOT, capture_output=True, text=True)
                     if setting == 'invalid':
                         self.assertEqual(result.returncode, 2)
@@ -164,7 +164,7 @@ spark_tp_roles=
 
     def package_identity(self, manifest: dict) -> subprocess.CompletedProcess:
         return subprocess.run(
-            ['bash', '-c', 'source scripts/release-common.sh; release_exl3_package_identity test-revision'],
+            ['bash', '-c', 'source scripts/lib/release-common.sh; release_exl3_package_identity test-revision'],
             cwd=ROOT, input=json.dumps(manifest), text=True, capture_output=True,
         )
 
@@ -191,7 +191,7 @@ spark_tp_roles=
 
     def test_shell_is_valid_and_help_exposes_native_controls(self) -> None:
         subprocess.run(
-            ["bash", "-n", "run.sh", "scripts/release-common.sh"],
+            ["bash", "-n", "run.sh", "scripts/lib/release-common.sh"],
             cwd=ROOT,
             check=True,
         )
@@ -219,7 +219,7 @@ spark_tp_roles=
 
     def test_standard_release_defaults_are_native(self) -> None:
         script = r'''
-source scripts/release-common.sh
+source scripts/lib/release-common.sh
 release_load_config cuteafd.config
 printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" \
   "$CONCURRENCY" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" \
@@ -252,7 +252,7 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
 
     def test_launchers_use_cuteafd_container_names(self) -> None:
         combined = (ROOT / "build.sh").read_text() + (ROOT / "run.sh").read_text()
-        common = (ROOT / "scripts/release-common.sh").read_text()
+        common = (ROOT / "scripts/lib/release-common.sh").read_text()
         self.assertNotIn("ds4rt", combined.lower())
         self.assertIn("cuteafd-coordinator", common)
         self.assertIn("cuteafd-spark-expert", common)
@@ -268,7 +268,7 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
         self.assertIn("trap cleanup EXIT", script)
 
     def test_coordinator_release_contains_both_rtx_expert_interfaces(self) -> None:
-        script = (ROOT / "scripts/build-release-artifacts.sh").read_text()
+        script = (ROOT / "scripts/build/build-release-artifacts.sh").read_text()
         self.assertIn('-DCUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT="$coordinator_aot"', script)
         self.assertIn('-DCUTEAFD_ENABLE_V41_TP2_EXPERT_AOT="$coordinator_aot"', script)
         self.assertIn('"cuteafd_v41_local_expert_info"', script)

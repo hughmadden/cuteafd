@@ -17,7 +17,7 @@ structure (a multi-line shell block that loses a continuation becomes unparsable
 instructions) and as the real `jq` filter it runs, against coordinator, universal,
 subset and mismatched manifests.
 
-`scripts/write-v41-expert-tp-manifest.py` stays the only writer of the built-role
+`scripts/build/write-v41-expert-tp-manifest.py` stays the only writer of the built-role
 manifest: it derives every entry from the AOT export directory and the library that
 was linked, never from a caller-supplied claim. The Dockerfile check below is what
 proves the library that ships is still the one that was hashed.
@@ -35,7 +35,7 @@ REPO = Path(__file__).resolve().parents[2]
 BUILD = REPO / "build.sh"
 PUSH = REPO / "push-containers.sh"
 DOCKERFILE = REPO / "docker" / "Dockerfile.release"
-RELEASE_COMMON = REPO / "scripts" / "release-common.sh"
+RELEASE_COMMON = REPO / "scripts" / "lib" / "release-common.sh"
 
 ROLES_BLOCK = ("# release-spark-tp-roles:start", "# release-spark-tp-roles:end")
 POSTCHECK_BLOCK = ("# release-spark-tp-roles-postcheck:start",
@@ -240,7 +240,7 @@ def test_publisher_reads_spark_labels_over_ssh():
     # not spell options out itself.
     assert "release_ssh" in read and "docker image inspect" in read
     assert '"$spark_host"' in read
-    assert "BatchMode" not in read, "options belong to scripts/release-common.sh"
+    assert "BatchMode" not in read, "options belong to scripts/lib/release-common.sh"
     assert 'io.cuteafd.v41.spark_tp_roles' in read
 
 
@@ -361,7 +361,7 @@ def test_bake_check_rejects_a_claim_the_artifacts_do_not_corroborate():
 def test_release_builds_label_only_the_expert_image():
     """The expert image is labelled from the resolved set; the coordinator is not.
 
-    Spark expert roles are expert-only: `scripts/build-release-artifacts.sh`
+    Spark expert roles are expert-only: `scripts/build/build-release-artifacts.sh`
     rejects them for `role=coordinator`, so the coordinator build passes no role
     value and inherits the empty `ARG` default pinned by
     `test_role_build_arg_keeps_its_empty_default`.

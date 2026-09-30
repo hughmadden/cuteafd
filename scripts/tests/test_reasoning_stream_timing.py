@@ -62,7 +62,7 @@ def test_reasoning_budget_exhaustion_is_a_complete_stream_not_an_answer(monkeypa
 def test_concurrent_failure_retains_reasoning_and_other_responses(tmp_path, monkeypatch):
     import runpy
     import sys
-    runner = Path(__file__).parents[1] / 'bench-ds41-concurrent-api.py'
+    runner = Path(__file__).parents[1] / 'bench/deepseek_v41/bench-ds41-concurrent-api.py'
     original = runpy.run_path
     calls = iter(range(3))
     def stream(*args, **kwargs):

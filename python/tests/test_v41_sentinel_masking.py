@@ -17,7 +17,7 @@ Correctness rules applied here and in the wider matrix to follow:
   produces no work group and its output must be an exact zero.
 
 No path manipulation happens here: the verified runner
-(``scripts/run-tp-ep-kernel-checks.sh``) sets and verifies PYTHONPATH, including
+(``scripts/bench/deepseek_v41/run-tp-ep-kernel-checks.sh``) sets and verifies PYTHONPATH, including
 the pinned SparkInfer tree. If a test is run outside that runner the import
 provenance check is bypassed, so run it through the runner.
 """

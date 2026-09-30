@@ -1,7 +1,7 @@
 """CPU-only tests for the six-rank candidate launch path.
 
-Runs the real ``scripts/run-tp-ep-six-candidate.sh`` gate and the reused
-``scripts/run-tp-ep-native-candidate.sh`` in ``plan`` mode and in mocked
+Runs the real ``scripts/launch/run-tp-ep-six-candidate.sh`` gate and the reused
+``scripts/launch/run-tp-ep-native-candidate.sh`` in ``plan`` mode and in mocked
 ``start`` mode. The fakes mirror the real emit ordering: the RDMA GID/device line
 appears only after a client connection (initialized by the bounded first request)
 AND when the transport timing diagnostic was forwarded, so a pre-connection
@@ -16,8 +16,8 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-WRAPPER = ROOT / "scripts" / "run-tp-ep-six-candidate.sh"
-LAUNCHER = ROOT / "scripts" / "run-tp-ep-native-candidate.sh"
+WRAPPER = ROOT / "scripts" / "launch" / "run-tp-ep-six-candidate.sh"
+LAUNCHER = ROOT / "scripts" / "launch" / "run-tp-ep-native-candidate.sh"
 FIX = ROOT / "scripts" / "fixtures" / "tp-ep-six"
 HOSTS = ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"]
 BUDGET = "109119320064"

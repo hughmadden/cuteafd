@@ -1,7 +1,7 @@
 """CPU-only coverage for the opt-in Spark TP x EP replicated topology.
 
 No Docker, SSH, GPU, build or serving operation is performed. Every case drives
-the launcher through `scripts/release-common.sh` or the process-boundary stubs
+the launcher through `scripts/lib/release-common.sh` or the process-boundary stubs
 used by `test_placement_handoff.py`.
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ EXAMPLES = ROOT / "examples" / "configs"
 
 def source_common(script: str, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["bash", "-euc", "source scripts/release-common.sh; " + script, "test", *args],
+        ["bash", "-euc", "source scripts/lib/release-common.sh; " + script, "test", *args],
         cwd=ROOT,
         text=True,
         capture_output=True,
@@ -363,7 +363,7 @@ class LauncherTopologyTest(unittest.TestCase):
                 **(extra_env or {}),
             )
             setup = f'''set -euo pipefail
-source scripts/release-common.sh
+source scripts/lib/release-common.sh
 release_die() {{ echo "$*" >&2; exit 1; }}
 release_validate_spark_weight_admission() {{ echo "remote_layers=stub"; }}
 RELEASE_RTX_GPUS="$1"
@@ -653,7 +653,7 @@ class VerbsDeviceMapTest(unittest.TestCase):
 
     def validate(self, value):
         return subprocess.run(
-            ["bash", "-euc", "source scripts/release-common.sh; release_validate_verbs_device_map", "test"],
+            ["bash", "-euc", "source scripts/lib/release-common.sh; release_validate_verbs_device_map", "test"],
             cwd=ROOT, text=True, capture_output=True,
             env=dict(os.environ, CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=value),
         )
@@ -694,7 +694,7 @@ exit 0
                 path.write_text(stub)
                 path.chmod(0o755)
             setup = f'''set -euo pipefail
-source scripts/release-common.sh
+source scripts/lib/release-common.sh
 SPARK_COUNT=6
 SPARK_0_HOST=h0
 SPARK_1_HOST=h1
@@ -752,7 +752,7 @@ class ManifestWriterTest(unittest.TestCase):
     def write(self, root: Path, requested: str, *, role: str = "expert",
               library: bool = True, output: str = "V41_EXPERT_TP_AOT.json") -> subprocess.CompletedProcess[str]:
         command = [
-            sys.executable, str(ROOT / "scripts/write-v41-expert-tp-manifest.py"),
+            sys.executable, str(ROOT / "scripts/build/write-v41-expert-tp-manifest.py"),
             "--role", role, "--requested", requested,
             "--native-build-dir", str(root),
             "--output", str(root / output),
@@ -872,8 +872,8 @@ class BuildScopeTest(unittest.TestCase):
             self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
 
     def test_helpers_plumb_roles_and_official_only_scope(self) -> None:
-        release_helper = (ROOT / "scripts/build-release-artifacts.sh").read_text()
-        wip_helper = (ROOT / "scripts/build-wip-artifacts.sh").read_text()
+        release_helper = (ROOT / "scripts/build/build-release-artifacts.sh").read_text()
+        wip_helper = (ROOT / "scripts/build/build-wip-artifacts.sh").read_text()
         dockerfile = (ROOT / "docker/Dockerfile.release").read_text()
         self.assertIn('-DCUTEAFD_V41_SPARK_TP_ROLES="$spark_tp_roles"', release_helper)
         self.assertIn('-DCUTEAFD_V41_SPARK_TP_ROLES="$spark_tp_roles"', wip_helper)
@@ -918,7 +918,7 @@ class BuildScopeTest(unittest.TestCase):
         self.assertIn("selected rank advertises", release)
 
     def test_shared_config_has_no_topology_to_rtx_hardcode(self) -> None:
-        common = (ROOT / "scripts/release-common.sh").read_text()
+        common = (ROOT / "scripts/lib/release-common.sh").read_text()
         self.assertNotIn("one-RTX layout", common)
         self.assertNotIn("two-RTX layout", common)
 
@@ -928,7 +928,7 @@ class BuildScopeTest(unittest.TestCase):
 
 
 
-CANDIDATE = ROOT / "scripts" / "run-tp-ep-native-candidate.sh"
+CANDIDATE = ROOT / "scripts" / "launch" / "run-tp-ep-native-candidate.sh"
 
 CANDIDATE_STUB = r'''#!/usr/bin/env python3
 import os, re, sys
@@ -1411,7 +1411,7 @@ echo "docker $*"
 """
 
     HARNESS = """set -euo pipefail
-source scripts/release-common.sh
+source scripts/lib/release-common.sh
 ssh() {{ shift 5; bash -c "$*"; }}
 release_die() {{ echo "die: $*" >&2; exit 1; }}
 SPARK_EXPERT_DOCKER_INFERENCE=registry.example/spark:v9
@@ -1492,7 +1492,7 @@ class SparkRoleGateTest(unittest.TestCase):
              ssh_rc: int = 0) -> subprocess.CompletedProcess[str]:
         block = run_sh_block('spark_advertised_roles=""', "\n# Zero-Spark deployments")
         script = f'''set -euo pipefail
-source scripts/release-common.sh
+source scripts/lib/release-common.sh
 release_die() {{ echo "die: $*" >&2; exit 1; }}
 ssh() {{ [[ {ssh_rc} -eq 0 ]] || {{ echo "No such image" >&2; return 255; }}; printf '%s\\n' '{advertised}'; }}
 hosts=(h0 h1 h2 h3 h4 h5)

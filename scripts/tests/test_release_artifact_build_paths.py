@@ -32,8 +32,8 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[2]
-SCRIPT = REPO / "scripts" / "build-release-artifacts.sh"
-GUARD = REPO / "scripts" / "assert-build-filesystem.py"
+SCRIPT = REPO / "scripts" / "build" / "build-release-artifacts.sh"
+GUARD = REPO / "scripts" / "build" / "assert-build-filesystem.py"
 
 
 def script_text() -> str:
@@ -163,8 +163,8 @@ def _fake_source(root: Path) -> Path:
         target = src / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("stub\n")
-    (src / "scripts").mkdir(parents=True, exist_ok=True)
-    (src / "scripts" / "assert-build-filesystem.py").write_bytes(GUARD.read_bytes())
+    (src / "scripts" / "build").mkdir(parents=True, exist_ok=True)
+    (src / "scripts" / "build" / "assert-build-filesystem.py").write_bytes(GUARD.read_bytes())
     return src
 
 

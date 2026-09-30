@@ -1,7 +1,7 @@
 # CUTEAFD example configurations
 
 These files are **opt-in, standalone `--config` files**. They overlay the
-launcher defaults in `scripts/release-common.sh`; every key they do not name
+launcher defaults in `scripts/lib/release-common.sh`; every key they do not name
 keeps its default. They are never selected automatically and they do not change
 `cuteafd.config`, the release images or the default serving selection.
 

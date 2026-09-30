@@ -5,7 +5,7 @@ import runpy
 import struct
 
 ROOT = Path(__file__).resolve().parents[2]
-ANALYZE = runpy.run_path(str(ROOT/'scripts/analyze-ds41-exl3-quant.py'))
+ANALYZE = runpy.run_path(str(ROOT/'scripts/qualify/deepseek_v41/analyze-ds41-exl3-quant.py'))
 
 
 def write_safetensors(path, tensors):

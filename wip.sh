@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$repo_root/scripts/release-common.sh"
+source "$repo_root/scripts/lib/release-common.sh"
 
 usage() {
   cat <<'EOF'
@@ -156,10 +156,10 @@ rsync "${snapshot_args[@]}" "$repo_root/" "$staging_dir/"
 # The selected complete configuration is part of the slot, even when the
 # caller chose a file other than the repository's default cuteafd.config.
 install -m 0644 "$RELEASE_CONFIG" "$staging_dir/cuteafd.config"
-python3 "$staging_dir/scripts/verify-sparkinfer-source.py" \
+python3 "$staging_dir/scripts/build/verify-sparkinfer-source.py" \
   --source "$staging_dir/third_party/sparkinfer" \
   --lock "$staging_dir/third_party/sparkinfer.lock.json"
-python3 "$staging_dir/scripts/verify-xgrammar-source.py" \
+python3 "$staging_dir/scripts/build/verify-xgrammar-source.py" \
   --source "$staging_dir/third_party/xgrammar" \
   --lock "$staging_dir/third_party/xgrammar.lock.json"
 
@@ -432,10 +432,10 @@ build_coordinator() {
     -e "CUTEAFD_WIP_QWEN4_AOT=${CUTEAFD_WIP_QWEN4_AOT:-OFF}" \
     -e "CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}" \
     "$coordinator_container" \
-    /wip/source/scripts/build-wip-artifacts.sh \
+    /wip/source/scripts/build/build-wip-artifacts.sh \
     /wip/source coordinator 120 /wip/build/coordinator /wip/output/coordinator
   docker exec "$coordinator_container" \
-    /wip/source/scripts/finalize-wip-slot.sh \
+    /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source coordinator "$slot" /wip/output/coordinator \
     "$COORDINATOR_DOCKER_DEV" "$image_id"
 }
@@ -448,9 +448,9 @@ build_expert() {
   # The role list and build-scope opt-ins travel inside a single quoted remote
   # command so a `tp2;tp3` value is never split by the remote shell.
   ssh -o BatchMode=yes "$seed_host" \
-    "docker exec -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' '$spark_container' /wip/source/scripts/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
+    "docker exec -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' '$spark_container' /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
   ssh -o BatchMode=yes "$seed_host" docker exec "$spark_container" \
-    /wip/source/scripts/finalize-wip-slot.sh \
+    /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source spark-expert "$slot" /wip/output/expert \
     "$SPARK_EXPERT_DOCKER_DEV" "$image_id"
 }

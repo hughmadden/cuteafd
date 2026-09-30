@@ -88,7 +88,7 @@ if(CUTEAFD_ENABLE_XGRAMMAR)
       "initialize third_party/xgrammar and its nested submodules")
   endif()
   set(CUTEAFD_XGRAMMAR_VERIFY_SCRIPT
-    "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/verify-xgrammar-source.py")
+    "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/verify-xgrammar-source.py")
   if(NOT EXISTS "${CUTEAFD_XGRAMMAR_VERIFY_SCRIPT}")
     message(FATAL_ERROR
       "XGrammar source verifier was not found: ${CUTEAFD_XGRAMMAR_VERIFY_SCRIPT}")
@@ -132,9 +132,9 @@ if(CUTEAFD_ENABLE_XGRAMMAR)
   # provenance is checked above; the patcher additionally verifies its anchors.
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/shared/src/xgrammar_unicode_fsm.inc"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/prepare-xgrammar-unicode.py")
+    "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/prepare-xgrammar-unicode.py")
   execute_process(COMMAND "${Python3_EXECUTABLE}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/prepare-xgrammar-unicode.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/prepare-xgrammar-unicode.py"
     --source "${CUTEAFD_XGRAMMAR_SOURCE_DIR}/cpp/grammar_functor.cc"
     --replacement "${CMAKE_CURRENT_SOURCE_DIR}/shared/src/xgrammar_unicode_fsm.inc"
     --output "${CMAKE_CURRENT_BINARY_DIR}/v41_xgrammar_unicode.cc"
@@ -183,7 +183,7 @@ if(CUTEAFD_BUILD_SPARKINFER_AOT)
       "select an explicit pinned source tree.")
   endif()
   set(CUTEAFD_SPARKINFER_VERIFY_SCRIPT
-    "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/verify-sparkinfer-source.py")
+    "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/verify-sparkinfer-source.py")
   set(CUTEAFD_SPARKINFER_PYTHON_BOOTSTRAP
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/_pinned_sparkinfer.py")
   if(NOT EXISTS "${CUTEAFD_SPARKINFER_VERIFY_SCRIPT}")

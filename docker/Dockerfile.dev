@@ -56,14 +56,14 @@ ENV CUTEAFD_SPARKINFER_COMMIT=${CUTEAFD_SPARKINFER_COMMIT}
 
 LABEL io.cuteafd.sparkinfer.revision=${CUTEAFD_SPARKINFER_COMMIT}
 
-COPY scripts/verify-sparkinfer-source.py /opt/cuteafd/scripts/verify-sparkinfer-source.py
+COPY scripts/build/verify-sparkinfer-source.py /opt/cuteafd/scripts/build/verify-sparkinfer-source.py
 COPY third_party/sparkinfer.lock.json /opt/cuteafd/third_party/sparkinfer.lock.json
 COPY third_party/sparkinfer /opt/cuteafd/third_party/sparkinfer
 
-RUN python3 /opt/cuteafd/scripts/verify-sparkinfer-source.py \
+RUN python3 /opt/cuteafd/scripts/build/verify-sparkinfer-source.py \
       --source /opt/cuteafd/third_party/sparkinfer \
       --lock /opt/cuteafd/third_party/sparkinfer.lock.json && \
-    locked_revision="$(python3 /opt/cuteafd/scripts/verify-sparkinfer-source.py \
+    locked_revision="$(python3 /opt/cuteafd/scripts/build/verify-sparkinfer-source.py \
       --source /opt/cuteafd/third_party/sparkinfer \
       --lock /opt/cuteafd/third_party/sparkinfer.lock.json \
       --print-revision)" && \
@@ -73,7 +73,7 @@ RUN python3 /opt/cuteafd/scripts/verify-sparkinfer-source.py \
       --editable /opt/cuteafd/third_party/sparkinfer && \
     uv pip check && \
     python3 -c 'import importlib.metadata, pathlib, b12x; source = pathlib.Path("/opt/cuteafd/third_party/sparkinfer").resolve(); module = pathlib.Path(b12x.__file__).resolve(); assert module.is_relative_to(source), (module, source); print(importlib.metadata.version("b12x"), module)' && \
-    python3 /opt/cuteafd/scripts/verify-sparkinfer-source.py \
+    python3 /opt/cuteafd/scripts/build/verify-sparkinfer-source.py \
       --source /opt/cuteafd/third_party/sparkinfer \
       --lock /opt/cuteafd/third_party/sparkinfer.lock.json \
       --require-no-python-cache

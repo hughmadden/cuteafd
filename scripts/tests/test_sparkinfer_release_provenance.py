@@ -10,7 +10,7 @@ import pytest
 
 
 ROOT = Path(__file__).parents[2]
-SCRIPT = ROOT / "scripts" / "sparkinfer-release-provenance.py"
+SCRIPT = ROOT / "scripts" / "build" / "sparkinfer-release-provenance.py"
 SPEC = importlib.util.spec_from_file_location("sparkinfer_release_provenance", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 PROVENANCE = importlib.util.module_from_spec(SPEC)
@@ -174,7 +174,7 @@ def test_changed_license_or_notices_are_rejected(tmp_path: Path) -> None:
 
 def test_release_builds_materialize_and_verify_all_records() -> None:
     artifact_builder = (
-        ROOT / "scripts" / "build-release-artifacts.sh"
+        ROOT / "scripts" / "build" / "build-release-artifacts.sh"
     ).read_text(encoding="utf-8")
     release_builder = (ROOT / "build.sh").read_text(encoding="utf-8")
     image = (ROOT / "docker" / "Dockerfile.release").read_text(encoding="utf-8")

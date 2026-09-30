@@ -4,7 +4,7 @@
 # links no extra object or symbol and behaves exactly as the historical Spark TP4
 # shard. The release path is universal: `./build.sh` resolves the default
 # `tp2;tp3;tp6` (subset only via CUTEAFD_RELEASE_SPARK_TP_ROLES) and passes it
-# through scripts/build-release-artifacts.sh, so each listed role is exported
+# through scripts/build/build-release-artifacts.sh, so each listed role is exported
 # ahead of runtime and compiled as one distinct symbol family per degree into the
 # same libcuteafd_native.so.
 #

@@ -28,9 +28,9 @@ HEADER = ROOT / "native" / "shared" / "include" / "cuteafd_v41_experts.h"
 PACK = ROOT / "native" / "shared" / "cuda" / "v41_expert_pack.cu"
 WRAPPER_TP6 = ROOT / "native" / "families" / "deepseek_v41" / "src" / "v41_spark_tp6_experts.cc"
 BUILD = ROOT / "build.sh"
-RELEASE_ARTIFACTS = ROOT / "scripts" / "build-release-artifacts.sh"
-WIP_ARTIFACTS = ROOT / "scripts" / "build-wip-artifacts.sh"
-MANIFEST = ROOT / "scripts" / "write-v41-expert-tp-manifest.py"
+RELEASE_ARTIFACTS = ROOT / "scripts" / "build" / "build-release-artifacts.sh"
+WIP_ARTIFACTS = ROOT / "scripts" / "build" / "build-wip-artifacts.sh"
+MANIFEST = ROOT / "scripts" / "build" / "write-v41-expert-tp-manifest.py"
 
 # Official V4.1 geometry: 384 experts, hidden 5120, intermediate 2304, topk 6.
 OFFICIAL_INTERMEDIATE = 2304
@@ -634,7 +634,7 @@ def test_geometry_test_is_registered_with_the_real_name() -> None:
     # The superseded per-degree file must not linger unreferenced.
     assert "v41_expert_pack_tp6_selftest" not in cmake
     assert not (ROOT / "native" / "tests" / "v41_expert_pack_tp6_selftest.cc").exists()
-    wrapper = (ROOT / "scripts" / "run-tp-ep-kernel-checks.sh").read_text(encoding="utf-8")
+    wrapper = (ROOT / "scripts" / "bench" / "deepseek_v41" / "run-tp-ep-kernel-checks.sh").read_text(encoding="utf-8")
     assert "expert_pack_geometry" in wrapper
     # The independent host oracle, the real native geometries and the fail-closed
     # device guard live in that file. Assert SEMANTICS (identifiers and the case

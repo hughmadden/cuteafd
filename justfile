@@ -8,33 +8,33 @@ default:
     @just --list
 
 doctor-host:
-    scripts/doctor.sh --role coordinator --model-id "{{ model_id }}"
+    scripts/launch/doctor.sh --role coordinator --model-id "{{ model_id }}"
 
 doctor:
-    scripts/cuteafd doctor --role coordinator --model-id "{{ model_id }}"
+    scripts/launch/cuteafd doctor --role coordinator --model-id "{{ model_id }}"
 
 doctor-container-coordinator:
-    scripts/cuteafd-dev.sh coordinator cuteafd doctor --role coordinator --model-id "{{ model_id }}"
+    scripts/build/cuteafd-dev.sh coordinator cuteafd doctor --role coordinator --model-id "{{ model_id }}"
 
 doctor-hosts HOSTS=spark_hosts:
-    scripts/run-on-hosts.sh "{{ HOSTS }}" 'cd {{ justfile_directory() }} && scripts/doctor.sh --role expert --model-id "{{ model_id }}"'
+    scripts/launch/run-on-hosts.sh "{{ HOSTS }}" 'cd {{ justfile_directory() }} && scripts/launch/doctor.sh --role expert --model-id "{{ model_id }}"'
 
 build-rust:
     cargo build --manifest-path rust/Cargo.toml --workspace
 
 test-rust:
-    scripts/run-with-python-env.sh \
+    scripts/lib/run-with-python-env.sh \
       cargo test --manifest-path rust/Cargo.toml --workspace
 
 test-rust-fast:
     RUSTFLAGS="${RUSTFLAGS:--Awarnings}" \
       CUTEAFD_DISABLE_NATIVE_AUTO_DISCOVERY=1 \
-      scripts/run-with-python-env.sh \
+      scripts/lib/run-with-python-env.sh \
       cargo test --manifest-path rust/Cargo.toml --workspace --exclude cuteafd-daemon
     RUSTFLAGS="${RUSTFLAGS:--Awarnings}" \
       env -u CUTEAFD_NATIVE_LIB -u CUTEAFD_REAL_FULL_CUDA_REFERENCE_KERNELS -u CUTEAFD_B12X \
       CUTEAFD_DISABLE_NATIVE_AUTO_DISCOVERY=1 \
-      scripts/run-with-python-env.sh \
+      scripts/lib/run-with-python-env.sh \
       cargo test --manifest-path rust/Cargo.toml -p cuteafd-daemon -- \
         --skip real_checkpoint \
         --skip when_available \
@@ -52,7 +52,7 @@ test-rust-fast:
         --skip triton
 
 test-python:
-    cd python && ../scripts/run-with-python-env.sh \
+    cd python && ../scripts/lib/run-with-python-env.sh \
       uv run --frozen pytest reference/tests ../scripts/tests
 
 test-native:
@@ -86,28 +86,28 @@ docker-build-coordinator:
       -t cuteafd-coordinator-dev .
 
 docker-gpu-check IMAGE="cuteafd-coordinator-dev":
-    CUTEAFD_DOCKER_GPU_VERIFY_IMAGE="{{ IMAGE }}" scripts/configure-docker-nvidia-runtime.sh --verify-only
+    CUTEAFD_DOCKER_GPU_VERIFY_IMAGE="{{ IMAGE }}" scripts/build/configure-docker-nvidia-runtime.sh --verify-only
 
 docker-configure-nvidia-runtime:
-    sudo scripts/configure-docker-nvidia-runtime.sh
+    sudo scripts/build/configure-docker-nvidia-runtime.sh
 
 docker-shell-coordinator *ARGS:
-    scripts/cuteafd-dev.sh coordinator {{ ARGS }}
+    scripts/build/cuteafd-dev.sh coordinator {{ ARGS }}
 
 docker-shell-spark *ARGS:
-    scripts/cuteafd-dev.sh expert {{ ARGS }}
+    scripts/build/cuteafd-dev.sh expert {{ ARGS }}
 
 api-smoke MODEL=model_id URL="http://127.0.0.1:8000":
-    scripts/api-smoke.sh "{{ URL }}" "{{ MODEL }}"
+    scripts/qualify/api-smoke.sh "{{ URL }}" "{{ MODEL }}"
 
 transport-capabilities BENCHMARK_JSONL="reports/phase0_artifacts/benchmarks/phase0_results.jsonl" OUT="reports/phase0_artifacts/transport_capabilities.json":
-    scripts/cuteafd transport-capabilities --benchmark-jsonl "{{ BENCHMARK_JSONL }}" --out "{{ OUT }}"
+    scripts/launch/cuteafd transport-capabilities --benchmark-jsonl "{{ BENCHMARK_JSONL }}" --out "{{ OUT }}"
 
 bench-rdma HOST_A HOST_B:
-    scripts/bench-rdma-pair.sh "{{ HOST_A }}" "{{ HOST_B }}"
+    scripts/bench/bench-rdma-pair.sh "{{ HOST_A }}" "{{ HOST_B }}"
 
 bench-verbs-app HOST_A HOST_B:
-    scripts/bench-verbs-app-pair.sh "{{ HOST_A }}" "{{ HOST_B }}"
+    scripts/bench/bench-verbs-app-pair.sh "{{ HOST_A }}" "{{ HOST_B }}"
 
 bench-verbs-app-coordinator HOSTS=spark_hosts:
-    scripts/bench-verbs-app-coordinator-links.sh "{{ HOSTS }}"
+    scripts/bench/bench-verbs-app-coordinator-links.sh "{{ HOSTS }}"

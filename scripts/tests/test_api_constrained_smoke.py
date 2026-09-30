@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused test for scripts/api-constrained-smoke.sh.
+"""Focused test for scripts/qualify/api-constrained-smoke.sh.
 
 The observed negative (published v8, both official layouts) was that the smoke
 omitted thinking controls, so the server's default high-effort thinking consumed
@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[2]
-SMOKE = REPO / "scripts" / "api-constrained-smoke.sh"
+SMOKE = REPO / "scripts" / "qualify" / "api-constrained-smoke.sh"
 
 GOOD_CONTENT = '{"city":"Taipei","temperature":27,"condition":"sunny"}'
 TOOL_ARGS = {"city": "Taipei", "units": "metric"}

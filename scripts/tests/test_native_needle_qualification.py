@@ -2,7 +2,7 @@ import importlib.util
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).parents[1] / 'qualify-ds41-native-needle.py'
+SCRIPT = Path(__file__).parents[1] / 'qualify/deepseek_v41/qualify-ds41-native-needle.py'
 SPEC = importlib.util.spec_from_file_location('native_needle', SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)

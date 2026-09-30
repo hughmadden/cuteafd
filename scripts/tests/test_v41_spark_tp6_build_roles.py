@@ -4,7 +4,7 @@ the `write-v41-expert-tp-manifest.py` role table.
 
 No hardware, Docker, SSH, cmake or cargo is touched. The test extracts the real
 role-selection block from each script by its boundary comments, sources the real
-`scripts/release-common.sh` for `release_die`/`release_spark_topology_explicit`,
+`scripts/lib/release-common.sh` for `release_die`/`release_spark_topology_explicit`,
 and runs the block in bash under a matrix of configurations. A change to the
 allowlist, the default set or the multi-role syntax fails here rather than at
 release time.
@@ -38,8 +38,8 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 BUILD = REPO / "build.sh"
 WIP = REPO / "wip.sh"
-RELEASE_COMMON = REPO / "scripts" / "release-common.sh"
-MANIFEST = REPO / "scripts" / "write-v41-expert-tp-manifest.py"
+RELEASE_COMMON = REPO / "scripts" / "lib" / "release-common.sh"
+MANIFEST = REPO / "scripts" / "build" / "write-v41-expert-tp-manifest.py"
 
 UNIVERSAL = "tp2;tp3;tp6"
 
@@ -182,8 +182,8 @@ def test_wip_subset_is_always_contained_in_the_release_default() -> None:
 
 def test_release_and_wip_artifact_scripts_share_the_allowlist() -> None:
     for path, variable in (
-        (REPO / "scripts" / "build-release-artifacts.sh", "CUTEAFD_RELEASE_SPARK_TP_ROLES"),
-        (REPO / "scripts" / "build-wip-artifacts.sh", "CUTEAFD_WIP_SPARK_TP_ROLES"),
+        (REPO / "scripts" / "build" / "build-release-artifacts.sh", "CUTEAFD_RELEASE_SPARK_TP_ROLES"),
+        (REPO / "scripts" / "build" / "build-wip-artifacts.sh", "CUTEAFD_WIP_SPARK_TP_ROLES"),
     ):
         text = path.read_text(encoding="utf-8")
         assert "tp2|tp3|tp6)" in text, path

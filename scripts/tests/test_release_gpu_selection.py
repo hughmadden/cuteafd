@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SELECTOR = ROOT / "scripts/select-release-gpus.py"
+SELECTOR = ROOT / "scripts/launch/select-release-gpus.py"
 PRIMARY = "GPU-00000000-0000-0000-0000-000000000000"
 SECONDARY = "GPU-11111111-1111-1111-1111-111111111111"
 

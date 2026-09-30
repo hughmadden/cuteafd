@@ -36,7 +36,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 CONFIG = REPO / "examples" / "configs" / "tp3ep1-native.config"
 LANE_README = REPO / "runs" / "v10-native-tp3ep1" / "tool-eval-short-oom" / "README.md"
-SELECTOR = REPO / "scripts" / "select-release-gpus.py"
+SELECTOR = REPO / "scripts" / "launch" / "select-release-gpus.py"
 
 # The explicit pin this profile is expected to carry. Change it here and in the
 # config together; every dependent number below is re-derived.
@@ -87,7 +87,7 @@ def load_config() -> dict[str, str]:
         '"$RTX_EXPERT_LAYERS" "$MEMORY_RESERVATION" "$SPARK_COUNT" "$SPARK_TP" "$SPARK_EP"'
     )
     result = subprocess.run(
-        ["bash", "-euc", "source scripts/release-common.sh; " + probe, "test", str(CONFIG)],
+        ["bash", "-euc", "source scripts/lib/release-common.sh; " + probe, "test", str(CONFIG)],
         cwd=REPO, text=True, capture_output=True,
     )
     assert result.returncode == 0, result.stderr

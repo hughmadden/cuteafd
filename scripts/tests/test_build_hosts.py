@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-COMMON = Path(__file__).resolve().parents[1] / "release-common.sh"
+COMMON = Path(__file__).resolve().parents[1] / "lib/release-common.sh"
 
 
 @pytest.mark.parametrize(

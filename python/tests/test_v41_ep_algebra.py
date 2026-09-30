@@ -25,7 +25,7 @@ Ownership here is the diagnostic modulo mask (``expert % ep_degree``), which is
 a correctness instrument, not a production scheduler. The provenance and every
 record say so.
 
-Run through ``scripts/run-tp-ep-kernel-checks.sh test``.
+Run through ``scripts/bench/deepseek_v41/run-tp-ep-kernel-checks.sh test``.
 """
 
 from __future__ import annotations

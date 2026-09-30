@@ -17,7 +17,7 @@ class CompactSparkTopologyTest(unittest.TestCase):
             config = Path(temporary) / 'config'
             config.write_text((ROOT / 'cuteafd.config').read_text() + '\n' + settings + '\n')
             return subprocess.run(['bash', '-euc',
-                'source scripts/release-common.sh; release_load_config "$1"; ' + command,
+                'source scripts/lib/release-common.sh; release_load_config "$1"; ' + command,
                 'test', str(config)], cwd=ROOT, text=True, capture_output=True)
 
     def test_compact_defaults_and_absolute_ceiling(self):
@@ -108,7 +108,7 @@ release_stop_wip_containers
         base = dict(compute=[12,1], variants=variants)
         def check(manifest, capacity=4096):
             return subprocess.run(['bash', '-euc',
-                'source scripts/release-common.sh; release_validate_exl3_tp2_variants "$1" k23',
+                'source scripts/lib/release-common.sh; release_validate_exl3_tp2_variants "$1" k23',
                 'test', str(capacity)], cwd=ROOT, input=json.dumps(manifest), text=True, capture_output=True)
         self.assertEqual(check(base).returncode, 0)
         for field, value in [('intermediate', 576), ('experts', 383), ('top_k', 5),
@@ -209,7 +209,7 @@ release_stop_wip_containers
         base = dict(compute=[12, 1], variants=variants)
         def check(manifest, capacity=4096):
             return subprocess.run(['bash', '-euc',
-                'source scripts/release-common.sh; release_validate_exl3_compact_variants "$1" k23 3',
+                'source scripts/lib/release-common.sh; release_validate_exl3_compact_variants "$1" k23 3',
                 'test', str(capacity)], cwd=ROOT, input=json.dumps(manifest), text=True,
                 capture_output=True)
         passed = check(base)
@@ -227,13 +227,13 @@ release_stop_wip_containers
         self.assertEqual(check(dict(base, compute=[12, 0])).returncode, 2)
         # Compact admission only exists for the compact degrees TP2 and TP3.
         rejected = subprocess.run(['bash', '-euc',
-            'source scripts/release-common.sh; release_validate_exl3_compact_variants 256 k23 4',
+            'source scripts/lib/release-common.sh; release_validate_exl3_compact_variants 256 k23 4',
             'test'], cwd=ROOT, input=json.dumps(base), text=True, capture_output=True)
         self.assertEqual(rejected.returncode, 2)
         self.assertIn('supports TP2 or TP3', rejected.stderr)
         # A TP3 layout never passes the TP2 shim and vice versa.
         shim = subprocess.run(['bash', '-euc',
-            'source scripts/release-common.sh; release_validate_exl3_tp2_variants 256 k23',
+            'source scripts/lib/release-common.sh; release_validate_exl3_tp2_variants 256 k23',
             'test'], cwd=ROOT, input=json.dumps(base), text=True, capture_output=True)
         self.assertEqual(shim.returncode, 2)
 

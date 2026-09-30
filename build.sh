@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$repo_root/scripts/release-common.sh"
+source "$repo_root/scripts/lib/release-common.sh"
 
 usage() {
   cat <<'EOF'
@@ -48,7 +48,7 @@ put each family's coordinator programs in the coordinator image, and
 CUTEAFD_RELEASE_EXPERT_FAMILIES (FAMILY:ROLE list, ';'-separated) adds routed-expert
 packages to both images, each keeping its architecture's entries.
 CUTEAFD_RELEASE_MIMO_GEOMETRIES picks the MiMo program geometries (default
-mimo,mimop: V2 Flash and V2.6 Pro). p7's set, everything scripts/run-dsv4.sh
+mimo,mimop: V2 Flash and V2.6 Pro). p7's set, everything scripts/launch/run-dsv4.sh
 serves (V4 Pro EXL3 K2, GLM 5.3 EXL3 K4 and FP8, GLM 5.3 Flash, MiMo V2 Flash
 FP8, MiMo V2.6 Pro MXFP4 (tp1 coordinator, tp6/tp2 Spark), Qwen 3.8 Flash Next
 EXL3 K4.25):
@@ -160,7 +160,7 @@ spark_tp_roles_note='universal, covers every approved native topology'
 
 # release-build-transport:start
 # The SSH option set and the canonical-path validator live in
-# scripts/release-common.sh, so a release build and the Spark-facing helpers cannot
+# scripts/lib/release-common.sh, so a release build and the Spark-facing helpers cannot
 # drift apart: stock resolution unless CUTEAFD_RELEASE_SSH_CONFIG names a config file,
 # BatchMode forced always, and a bad value refused here before any host is reached.
 # What stays here is the release-only setting: where a container leg keeps its
@@ -198,7 +198,7 @@ release_prepare_build_root() {
   local host="$1" script_dir="$2" quoted_root quoted_dir command
   printf -v quoted_root '%q' "$release_build_root"
   printf -v quoted_dir '%q' "$script_dir"
-  command="mkdir -p $quoted_root && python3 $quoted_dir/scripts/assert-build-filesystem.py $quoted_root"
+  command="mkdir -p $quoted_root && python3 $quoted_dir/scripts/build/assert-build-filesystem.py $quoted_root"
   if [[ -n "$host" ]]; then
     release_ssh "$host" "$command" ||
       release_die "$host release build root is not a safe writable filesystem: $release_build_root"
@@ -266,7 +266,7 @@ if [[ -z "$source_manifest" ]] && ((engine_source_dirty)); then
   # This directory is excluded from both the inventory and remote source sync.
   mkdir -p "$repo_root/.cuteafd-release/source-manifests"
   source_manifest="$(mktemp "$repo_root/.cuteafd-release/source-manifests/source.XXXXXXXX.sha256")"
-  python3 "$repo_root/scripts/verify-release-source-manifest.py" \
+  python3 "$repo_root/scripts/build/verify-release-source-manifest.py" \
     --source "$repo_root" --write "$source_manifest"
   echo "== recorded current checkout: $source_manifest =="
 fi
@@ -288,7 +288,7 @@ verify_local_source_manifest() {
   )"
   [[ "$current_source_manifest_sha256" == "$source_manifest_sha256" ]] ||
     release_die "release source manifest changed during the build"
-  python3 "$repo_root/scripts/verify-release-source-manifest.py" \
+  python3 "$repo_root/scripts/build/verify-release-source-manifest.py" \
     --source "$repo_root" \
     --manifest "$source_manifest" ||
     release_die "release source differs from $source_manifest"
@@ -305,19 +305,19 @@ verify_remote_source_manifest() {
   local remote_dir_quoted
   printf -v remote_dir_quoted '%q' "$remote_dir"
   release_ssh "$seed_host" \
-    "cd $remote_dir_quoted && python3 scripts/verify-release-source-manifest.py --source . --manifest -" \
+    "cd $remote_dir_quoted && python3 scripts/build/verify-release-source-manifest.py --source . --manifest -" \
     <"$source_manifest" ||
     release_die "$seed_host staged source differs from $source_manifest"
 }
 
 verify_local_source_manifest
 sparkinfer_commit="$(
-  python3 "$repo_root/scripts/verify-sparkinfer-source.py" \
+  python3 "$repo_root/scripts/build/verify-sparkinfer-source.py" \
     --source "$repo_root/third_party/sparkinfer" \
     --lock "$repo_root/third_party/sparkinfer.lock.json" \
     --print-revision
 )"
-python3 "$repo_root/scripts/verify-xgrammar-source.py" \
+python3 "$repo_root/scripts/build/verify-xgrammar-source.py" \
   --source "$repo_root/third_party/xgrammar" \
   --lock "$repo_root/third_party/xgrammar.lock.json"
 engine_revision_override="${CUTEAFD_RELEASE_ENGINE_REVISION:-}"
@@ -465,7 +465,7 @@ docker run --rm \
   -v "$repo_root:/source:ro" \
   -v "$artifact_dir:/output" \
   "$COORDINATOR_DOCKER_DEV" \
-  /source/scripts/build-release-artifacts.sh /source coordinator 120 /output
+  /source/scripts/build/build-release-artifacts.sh /source coordinator 120 /output
 
 echo "== building coordinator inference image: $COORDINATOR_DOCKER_INFERENCE =="
 docker build \
@@ -575,7 +575,7 @@ if [[ -n "$source_manifest_sha256" ]]; then
   )
 fi
 cd "$remote_dir"
-python3 scripts/verify-sparkinfer-source.py \
+python3 scripts/build/verify-sparkinfer-source.py \
   --source third_party/sparkinfer \
   --lock third_party/sparkinfer.lock.json \
   --require-no-python-cache
@@ -598,7 +598,7 @@ docker run --rm \
   -v "$remote_dir:/source:ro" \
   -v "$remote_dir/.cuteafd-release-image:/output" \
   "$dev_image" \
-  /source/scripts/build-release-artifacts.sh /source expert 121 /output
+  /source/scripts/build/build-release-artifacts.sh /source expert 121 /output
 docker build \
   "${release_source_label_args[@]}" \
   --build-arg CUTEAFD_ROLE=expert \
@@ -698,7 +698,7 @@ if [[ -n "$source_manifest" ]]; then
   dist_source_manifest+=(SOURCE_SHA256SUMS)
 fi
 for role in coordinator spark-expert; do
-  python3 "$repo_root/scripts/sparkinfer-release-provenance.py" \
+  python3 "$repo_root/scripts/build/sparkinfer-release-provenance.py" \
     --source "$repo_root/third_party/sparkinfer" \
     --lock "$repo_root/third_party/sparkinfer.lock.json" \
     --license "$repo_root/dist/$role/SPARKINFER_LICENSE" \

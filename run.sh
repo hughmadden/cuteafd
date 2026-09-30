@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$repo_root/scripts/release-common.sh"
+source "$repo_root/scripts/lib/release-common.sh"
 
 usage() {
   cat <<'EOF'
@@ -235,7 +235,7 @@ if release_spark_compact_active; then
   gpu_selection_mode=1
   compact_selection_args+=(--compact-spark)
 fi
-gpu_selection="$(python3 "$repo_root/scripts/select-release-gpus.py" \
+gpu_selection="$(python3 "$repo_root/scripts/launch/select-release-gpus.py" \
   --mode "$gpu_selection_mode" \
   --minimum-expert-layers "$minimum_expert_layers" \
   --primary-uuid "$RELEASE_COORDINATOR_GPU_UUID" \
@@ -286,7 +286,7 @@ else
   gpu_request="device=$gpu_uuid_csv"
 fi
 
-sparkinfer_commit="$(python3 "$repo_root/scripts/verify-sparkinfer-source.py" --source "$repo_root/third_party/sparkinfer" --lock "$repo_root/third_party/sparkinfer.lock.json" --print-revision)"
+sparkinfer_commit="$(python3 "$repo_root/scripts/build/verify-sparkinfer-source.py" --source "$repo_root/third_party/sparkinfer" --lock "$repo_root/third_party/sparkinfer.lock.json" --print-revision)"
 wip_layout=""
 if [[ -n "$wip_slot" ]]; then
   wip_layout="$HOME/.cache/cuteafd/wip-run/$wip_slot"

@@ -185,7 +185,7 @@ def test_images_validate_the_pinned_b12x_import_namespace() -> None:
 
 
 def test_metadata_free_release_copies_filter_and_reject_python_caches() -> None:
-    for relative in ("build.sh", "scripts/build-release-artifacts.sh"):
+    for relative in ("build.sh", "scripts/build/build-release-artifacts.sh"):
         text = (ROOT / relative).read_text(encoding="utf-8")
         exclude_lines = [
             line for line in text.splitlines() if "--exclude" in line
@@ -202,7 +202,7 @@ def test_metadata_free_release_copies_filter_and_reject_python_caches() -> None:
     for relative in (
         "build.sh",
         "wip.sh",
-        "scripts/build-release-artifacts.sh",
+        "scripts/build/build-release-artifacts.sh",
     ):
         text = (ROOT / relative).read_text(encoding="utf-8")
         exclude_lines = [line for line in text.splitlines() if "--exclude" in line]

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CPU-only regression tests for the production sampling acceptance harness.
 
-``scripts/qualify-ds41-sampling-api.py`` is the native (production) sampling
+``scripts/qualify/deepseek_v41/qualify-ds41-sampling-api.py`` is the native (production) sampling
 qualification harness. Its own ``--self-test`` runs every check against an
 in-process native-shaped fake server; these tests make that executable contract
 part of the normal CPU test run, plus verify the evidence payload and the
@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULE_PATH = ROOT / "scripts" / "qualify-ds41-sampling-api.py"
+MODULE_PATH = ROOT / "scripts" / "qualify" / "deepseek_v41" / "qualify-ds41-sampling-api.py"
 
 
 def load_module():

@@ -1,7 +1,7 @@
 import runpy
 from pathlib import Path
 
-bench = runpy.run_path(str(Path(__file__).parents[1] / 'bench-glm-weighted.py'), run_name='bench_glm_weighted')
+bench = runpy.run_path(str(Path(__file__).parents[1] / 'bench/glm5/bench-glm-weighted.py'), run_name='bench_glm_weighted')
 
 
 def test_corpus_is_glmrt_v9_weighted_suite():

@@ -23,7 +23,7 @@ LOCK = Path(
         ROOT / "third_party" / "sparkinfer.lock.json",
     )
 ).expanduser().resolve()
-VERIFIER_PATH = ROOT / "scripts" / "verify-sparkinfer-source.py"
+VERIFIER_PATH = ROOT / "scripts" / "build" / "verify-sparkinfer-source.py"
 
 
 def _load_verifier() -> ModuleType:

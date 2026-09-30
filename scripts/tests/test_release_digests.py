@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CPU-only tests for `scripts/release-digests.sh`.
+"""CPU-only tests for `scripts/build/release-digests.sh`.
 
 The helper is the post-push half of publication: it records the digest the
 registry itself reports for the coordinator OCI index and the Spark expert
@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[2]
-HELPER = REPO / "scripts" / "release-digests.sh"
+HELPER = REPO / "scripts" / "build" / "release-digests.sh"
 DEFAULT_CONFIG = REPO / "cuteafd.config"
 V10_CONFIG = REPO / "scripts" / "fixtures" / "cuteafd.build-v10.config"
 

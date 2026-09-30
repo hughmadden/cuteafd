@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location(
-    "build_filesystem", Path(__file__).resolve().parents[1] / "assert-build-filesystem.py")
+    "build_filesystem", Path(__file__).resolve().parents[1] / "build/assert-build-filesystem.py")
 guard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(guard)
 

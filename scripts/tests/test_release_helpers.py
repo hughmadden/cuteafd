@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CPU-only tests for the release helper scripts in `scripts/release/`.
+"""CPU-only tests for the release helper scripts in `scripts/build/release/`.
 
 These cover the release executor's own tooling, with no GPU, container, registry,
 SSH or host access:
@@ -33,7 +33,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[2]
-RELEASE_DIR = REPO / "scripts" / "release"
+RELEASE_DIR = REPO / "scripts" / "build" / "release"
 PROBE = RELEASE_DIR / "image-identity-probe.sh"
 VERIFY = RELEASE_DIR / "verify-release-artifacts.sh"
 BUILD_RUNNER = RELEASE_DIR / "run-release-build.sh"

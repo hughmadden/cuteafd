@@ -19,7 +19,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 STOP = ROOT / "stop.sh"
-COMMON = ROOT / "scripts" / "release-common.sh"
+COMMON = ROOT / "scripts" / "lib" / "release-common.sh"
 EXAMPLES = ROOT / "examples" / "configs"
 SIX_HOSTS = ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"]
 FOUR_HOSTS = SIX_HOSTS[:4]
@@ -289,7 +289,7 @@ class StopConfigModeTest(StopHarness):
         suffix = f" {mode}" if mode else ""
         return subprocess.run(
             ["bash", "-euc",
-             f'source scripts/release-common.sh; release_load_config "$1"{suffix}; '
+             f'source scripts/lib/release-common.sh; release_load_config "$1"{suffix}; '
              'printf "loaded\\n"',
              "test", str(config)],
             cwd=ROOT, text=True, capture_output=True,
@@ -430,7 +430,7 @@ class StopHelperScopeTest(unittest.TestCase):
 
     def run_common(self, setup, command):
         return subprocess.run(
-            ["bash", "-euc", f'source scripts/release-common.sh\n{setup}\n{command}',
+            ["bash", "-euc", f'source scripts/lib/release-common.sh\n{setup}\n{command}',
              "test"],
             cwd=ROOT, text=True, capture_output=True,
         )
@@ -544,7 +544,7 @@ class StopHelperScopeTest(unittest.TestCase):
             ssh.write_text("#!/usr/bin/env bash\nexit 255\n")
             ssh.chmod(0o755)
             script = textwrap.dedent("""\
-                source scripts/release-common.sh
+                source scripts/lib/release-common.sh
                 SPARK_COUNT=1
                 SPARK_0_HOST=ostrich
                 EXPERT_PORT=19441

@@ -26,7 +26,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[2]
-VALIDATOR = REPO / "scripts" / "validate-sampling-campaign.py"
+VALIDATOR = REPO / "scripts" / "bench" / "deepseek_v41" / "validate-sampling-campaign.py"
 CORPUS_PATH = REPO / "scripts" / "fixtures" / "release-semantic-corpus.json"
 
 CORPUS = json.loads(CORPUS_PATH.read_text())

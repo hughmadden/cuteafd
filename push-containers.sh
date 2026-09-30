@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$repo_root/scripts/release-common.sh"
+source "$repo_root/scripts/lib/release-common.sh"
 
 usage() {
   cat <<'EOF'
@@ -76,7 +76,7 @@ release_load_config "$config"
 release_need docker
 release_need ssh
 
-# One SSH option set for the whole release pipeline: scripts/release-common.sh owns
+# One SSH option set for the whole release pipeline: scripts/lib/release-common.sh owns
 # it. Resolved here, after the tag and configuration validation, so a mistyped
 # CUTEAFD_RELEASE_SSH_CONFIG is reported as itself before the daemon is queried and
 # before any Spark is contacted. The Spark image was placed on $SPARK_0_HOST through

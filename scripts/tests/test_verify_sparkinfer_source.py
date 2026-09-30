@@ -10,7 +10,7 @@ import sys
 import pytest
 
 
-SCRIPT = Path(__file__).parents[1] / "verify-sparkinfer-source.py"
+SCRIPT = Path(__file__).parents[1] / "build/verify-sparkinfer-source.py"
 BOOTSTRAP = Path(__file__).parents[2] / "python" / "tools" / "lib" / "_pinned_sparkinfer.py"
 SPEC = importlib.util.spec_from_file_location("verify_sparkinfer_source", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None

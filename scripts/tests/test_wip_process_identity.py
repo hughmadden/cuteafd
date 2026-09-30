@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-WIP_PROCESS = ROOT / "scripts" / "wip-process.sh"
+WIP_PROCESS = ROOT / "scripts" / "launch" / "wip-process.sh"
 FINGERPRINT = "a" * 64
 
 

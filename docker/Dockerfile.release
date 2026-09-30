@@ -73,15 +73,15 @@ LABEL io.cuteafd.cuda_arch=${CUDA_ARCH}
 LABEL io.cuteafd.sparkinfer.revision=${CUTEAFD_SPARKINFER_COMMIT}
 LABEL io.cuteafd.v41.spark_tp_roles=${CUTEAFD_V41_SPARK_TP_ROLES}
 
-COPY scripts/verify-sparkinfer-source.py /opt/cuteafd/scripts/verify-sparkinfer-source.py
-COPY scripts/sparkinfer-release-provenance.py /opt/cuteafd/scripts/sparkinfer-release-provenance.py
+COPY scripts/build/verify-sparkinfer-source.py /opt/cuteafd/scripts/build/verify-sparkinfer-source.py
+COPY scripts/build/sparkinfer-release-provenance.py /opt/cuteafd/scripts/build/sparkinfer-release-provenance.py
 COPY third_party/sparkinfer.lock.json /opt/cuteafd/third_party/sparkinfer.lock.json
 COPY third_party/sparkinfer /opt/cuteafd/third_party/sparkinfer
 
-RUN python3 /opt/cuteafd/scripts/verify-sparkinfer-source.py \
+RUN python3 /opt/cuteafd/scripts/build/verify-sparkinfer-source.py \
       --source /opt/cuteafd/third_party/sparkinfer \
       --lock /opt/cuteafd/third_party/sparkinfer.lock.json && \
-    locked_revision="$(python3 /opt/cuteafd/scripts/verify-sparkinfer-source.py \
+    locked_revision="$(python3 /opt/cuteafd/scripts/build/verify-sparkinfer-source.py \
       --source /opt/cuteafd/third_party/sparkinfer \
       --lock /opt/cuteafd/third_party/sparkinfer.lock.json \
       --print-revision)" && \
@@ -91,7 +91,7 @@ RUN python3 /opt/cuteafd/scripts/verify-sparkinfer-source.py \
       --editable /opt/cuteafd/third_party/sparkinfer && \
     uv pip check && \
     python3 -c 'import importlib.metadata, pathlib, b12x; source = pathlib.Path("/opt/cuteafd/third_party/sparkinfer").resolve(); module = pathlib.Path(b12x.__file__).resolve(); assert module.is_relative_to(source), (module, source); print(importlib.metadata.version("b12x"), module)' && \
-    python3 /opt/cuteafd/scripts/verify-sparkinfer-source.py \
+    python3 /opt/cuteafd/scripts/build/verify-sparkinfer-source.py \
       --source /opt/cuteafd/third_party/sparkinfer \
       --lock /opt/cuteafd/third_party/sparkinfer.lock.json \
       --require-no-python-cache
@@ -112,11 +112,11 @@ COPY .cuteafd-release-image/XGRAMMAR_PROVENANCE.json /opt/cuteafd/share/XGRAMMAR
 COPY .cuteafd-release-image/XGRAMMAR_LICENSE /opt/cuteafd/share/XGRAMMAR_LICENSE
 COPY .cuteafd-release-image/XGRAMMAR_SHA256SUMS /opt/cuteafd/share/XGRAMMAR_SHA256SUMS
 COPY python /opt/cuteafd/python
-COPY scripts/kernel-cache-identity.py /opt/cuteafd/scripts/kernel-cache-identity.py
+COPY scripts/build/kernel-cache-identity.py /opt/cuteafd/scripts/build/kernel-cache-identity.py
 COPY docker/release-entrypoint.sh /usr/local/bin/cuteafd-release-entrypoint
 
 # Bake-time artifact corroboration, inside the existing verification layer: the
-# role manifest is written by scripts/write-v41-expert-tp-manifest.py from the AOT
+# role manifest is written by scripts/build/write-v41-expert-tp-manifest.py from the AOT
 # export that was actually built, never from a build-arg, so a library the
 # manifest does not name, or a role set it does not record, is a stale or partial
 # .cuteafd-release-image directory rather than a built image. Existing manifest
@@ -137,7 +137,7 @@ RUN for exl3_family in /opt/cuteafd/lib/exl3/exl3-*/; do \
       /opt/cuteafd/share/SPARKINFER_LICENSE && \
     (cd /opt/cuteafd/share && sha256sum -c SPARKINFER_SHA256SUMS) && \
     (cd /opt/cuteafd/share && sha256sum -c XGRAMMAR_SHA256SUMS) && \
-    python3 /opt/cuteafd/scripts/sparkinfer-release-provenance.py \
+    python3 /opt/cuteafd/scripts/build/sparkinfer-release-provenance.py \
       --source /opt/cuteafd/third_party/sparkinfer \
       --lock /opt/cuteafd/third_party/sparkinfer.lock.json \
       --license /opt/cuteafd/share/SPARKINFER_LICENSE \

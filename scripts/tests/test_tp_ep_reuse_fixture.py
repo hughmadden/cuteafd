@@ -15,7 +15,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURE = ROOT / "scripts" / "fixtures" / "tp-ep-reuse-m64-e384.json"
-VALIDATOR = ROOT / "scripts" / "validate-tp-ep-reuse-fixture.py"
+VALIDATOR = ROOT / "scripts" / "bench" / "deepseek_v41" / "validate-tp-ep-reuse-fixture.py"
 
 
 def load_validator():

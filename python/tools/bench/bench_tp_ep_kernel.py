@@ -25,7 +25,7 @@ Scope and honesty rules, all enforced here rather than asserted in prose:
 The native AOT leg is NOT implemented and is disabled fail-closed; this harness
 only exercises the true Python ``V41SlicePipeline`` path.
 
-Run through ``scripts/run-tp-ep-kernel-checks.sh bench-kernel``.
+Run through ``scripts/bench/deepseek_v41/run-tp-ep-kernel-checks.sh bench-kernel``.
 """
 
 from __future__ import annotations

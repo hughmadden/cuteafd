@@ -34,14 +34,14 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 BUILD = REPO / "build.sh"
-COMMON = REPO / "scripts" / "release-common.sh"
-ARTIFACTS = REPO / "scripts" / "build-release-artifacts.sh"
+COMMON = REPO / "scripts" / "lib" / "release-common.sh"
+ARTIFACTS = REPO / "scripts" / "build" / "build-release-artifacts.sh"
 
 TRANSPORT_BLOCK = ("# release-build-transport:start", "# release-build-transport:end")
 # The block resolves paths relative to the checkout, so the harness supplies one.
 # release-common.sh is a library of declarations: sourcing it is side-effect
 # free, and it is where release_ssh and the path validator really live.
-PREAMBLE = "source scripts/release-common.sh\nrepo_root=/source\n"
+PREAMBLE = "source scripts/lib/release-common.sh\nrepo_root=/source\n"
 DIE = 2  # release_die's status in the shared library
 
 
@@ -281,7 +281,7 @@ class TestBuildRootWiring:
         )
         assert result.returncode == 0, result.stderr
         assert root.is_dir(), "the root must exist before a container binds it"
-        assert invocations == [["/source/scripts/assert-build-filesystem.py", str(root)]]
+        assert invocations == [["/source/scripts/build/assert-build-filesystem.py", str(root)]]
 
     def test_guard_rejection_is_reported_for_the_build_root(self, tmp_path):
         result, invocations = _run(
@@ -306,7 +306,7 @@ class TestBuildRootWiring:
         assert invocations == [
             [
                 "-o", "BatchMode=yes", "seed",
-                f"mkdir -p {root} && python3 /home/spark/src/scripts/assert-build-filesystem.py {root}",
+                f"mkdir -p {root} && python3 /home/spark/src/scripts/build/assert-build-filesystem.py {root}",
             ]
         ]
 

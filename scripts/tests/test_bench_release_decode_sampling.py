@@ -8,7 +8,7 @@ that a manual CLI check cannot protect:
 * the weighted decode-only arithmetic from the release corpus contract,
   ``sum(w * (completion_tokens - 1)) / sum(w * post_first_token_seconds)``.
 
-``scripts/bench-ds41-release-decode.py`` is strict-only: there is deliberately
+``scripts/bench/deepseek_v41/bench-ds41-release-decode.py`` is strict-only: there is deliberately
 no approximation encoding, and ``--list-profiles`` documents the canonical
 vectors. Nothing here contacts a server or a GPU.
 """
@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[2]
-SCRIPT = REPO / "scripts" / "bench-ds41-release-decode.py"
+SCRIPT = REPO / "scripts" / "bench" / "deepseek_v41" / "bench-ds41-release-decode.py"
 CORPUS = REPO / "scripts" / "fixtures" / "release-semantic-corpus.json"
 
 EXPECTED_PROFILES = {
@@ -300,7 +300,7 @@ def test_campaign_cli_surface_exposes_interleaving_and_identity() -> None:
 # Interleaved aggregation
 # ---------------------------------------------------------------------------
 
-AGGREGATOR = REPO / "scripts" / "aggregate-sampling-decode.py"
+AGGREGATOR = REPO / "scripts" / "bench" / "deepseek_v41" / "aggregate-sampling-decode.py"
 
 
 def _load_aggregator():

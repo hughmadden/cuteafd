@@ -18,7 +18,7 @@ go in commit messages as short before → after tables with conditions.
   200G. Read rates and states at startup (`rdma link`, sysfs `rate`); do
   not assume them. Dual rail at 100G caused head-of-line blocking against
   200+ Gb/s PCIe ingress, so rail use is a measured decision.
-- Passwordless SSH by hostname. Fan-out: `scripts/run-on-hosts.sh`.
+- Passwordless SSH by hostname. Fan-out: `scripts/launch/run-on-hosts.sh`.
 - Root: `agent-sudo --agent-context "why" CMD` (remote human approval).
 
 ## Storage
@@ -38,7 +38,7 @@ go in commit messages as short before → after tables with conditions.
 ## Build and run
 
 - Build only under `~/.cache/cuteafd/builds/<task>` on root NVMe; run
-  `scripts/assert-build-filesystem.py` on every path first. Never reuse a
+  `scripts/build/assert-build-filesystem.py` on every path first. Never reuse a
   Cargo cache that has seen filesystem errors.
 - `./wip.sh --slot S --role both` for iteration, `./run.sh --wip S
   --restart` to launch; `./build.sh` and `./run.sh` for
@@ -62,7 +62,7 @@ go in commit messages as short before → after tables with conditions.
   a git worktree until it finishes. Crates download from crates.io each build
   and can crawl while the WAN is busy; it is slow, not stuck.
 - Iterate with `./wip.sh --slot S` then `./run.sh --wip S --restart`; A/B two
-  checkouts with `scripts/bench-ab.py`. `cuteafd plan MODEL` (any HF id or
+  checkouts with `scripts/bench/bench-ab.py`. `cuteafd plan MODEL` (any HF id or
   snapshot dir) says what a checkpoint needs before any kernel work;
   `cuteafd fabric` shows ports, link/PCIe rates, subnets and the rail plan
   (services log the same line at startup).

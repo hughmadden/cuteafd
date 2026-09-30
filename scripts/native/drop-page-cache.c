@@ -19,7 +19,7 @@ int main(int argc, char **argv) {
         return 64;
     }
     if (geteuid() != 0) {
-        fputs("Root-owned setuid installation required; run scripts/drop-page-cache.sh --install.\n", stderr);
+        fputs("Root-owned setuid installation required; run scripts/launch/drop-page-cache.sh --install.\n", stderr);
         return 77;
     }
     int fd = open("/proc/sys/vm/drop_caches", O_WRONLY | O_CLOEXEC | O_NOFOLLOW);

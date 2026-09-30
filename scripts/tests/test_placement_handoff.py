@@ -33,7 +33,7 @@ class PlacementHandoffTest(unittest.TestCase):
             env=dict(os.environ,PATH=str(root)+os.pathsep+os.environ['PATH'],EVENTS=str(root/'events'),PLAN=str(root/'plan'))
             setup=r'''
 set -euo pipefail
-source scripts/release-common.sh
+source scripts/lib/release-common.sh
 release_die() { echo "$*" >&2; exit 1; }
 RELEASE_RTX_GPUS="$1"
 coordinator=coordinator
@@ -143,7 +143,7 @@ spark_first_layer=0
     def test_cli_tp2_overrides_and_invalid_config(self):
         source=(ROOT/'run.sh').read_text()
         block=source[source.index('config="$repo_root/cuteafd.config"'):source.index('for tool in docker ssh')]
-        setup='repo_root="$1"; shift; source "$repo_root/scripts/release-common.sh"\n'
+        setup='repo_root="$1"; shift; source "$repo_root/scripts/lib/release-common.sh"\n'
         finish='\nprintf "%s\\n" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS"\n'
         with tempfile.TemporaryDirectory() as directory:
             config=Path(directory)/'recipe.config'

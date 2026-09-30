@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-SIX = ROOT / "scripts" / "qualify-ds41-tp-ep-e2e-six.py"
+SIX = ROOT / "scripts" / "qualify" / "deepseek_v41" / "qualify-ds41-tp-ep-e2e-six.py"
 V4 = ROOT / "scripts" / "fixtures" / "tp-ep-e2e-corpus-v4-six.jsonl"
 V3 = ROOT / "scripts" / "fixtures" / "tp-ep-e2e-corpus.jsonl"
 

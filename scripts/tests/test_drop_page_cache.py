@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-SCRIPT = ROOT / 'scripts/drop-page-cache.sh'
+SCRIPT = ROOT / 'scripts/launch/drop-page-cache.sh'
 
 
 class CacheDropUtility(unittest.TestCase):

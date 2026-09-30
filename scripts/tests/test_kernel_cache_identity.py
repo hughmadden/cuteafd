@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 
-SCRIPT = Path(__file__).parents[1] / "kernel-cache-identity.py"
+SCRIPT = Path(__file__).parents[1] / "build/kernel-cache-identity.py"
 ROOT = Path(__file__).parents[2]
 SPEC = importlib.util.spec_from_file_location("kernel_cache_identity", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
@@ -81,8 +81,8 @@ def test_missing_environment_identity_is_rejected(tmp_path: Path) -> None:
 def test_release_image_packages_cache_identity_helper() -> None:
     dockerfile = (ROOT / "docker" / "Dockerfile.release").read_text(encoding="utf-8")
     assert (
-        "COPY scripts/kernel-cache-identity.py "
-        "/opt/cuteafd/scripts/kernel-cache-identity.py"
+        "COPY scripts/build/kernel-cache-identity.py "
+        "/opt/cuteafd/scripts/build/kernel-cache-identity.py"
     ) in dockerfile
 
 

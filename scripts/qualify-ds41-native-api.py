@@ -5,7 +5,7 @@ The release accepts sampled requests (``temperature > 0`` with optional
 ``top_p``/``top_k``/``min_p``/``seed``); this script asserts one sampled request
 is served and that its fixed seed replays exactly. Deeper sampling acceptance
 (five vectors, invalid parameters, constrained decoding, signed seeds, request
-isolation) lives in ``scripts/qualify-ds41-sampling-api.py``.
+isolation) lives in ``scripts/qualify/deepseek_v41/qualify-ds41-sampling-api.py``.
 """
 import argparse
 import json

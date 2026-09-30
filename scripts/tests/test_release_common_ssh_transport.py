@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CPU-only tests for the one SSH option set shared by every scripted Spark call.
 
-`scripts/release-common.sh` declares the transport so `build.sh` and
+`scripts/lib/release-common.sh` declares the transport so `build.sh` and
 `scripts/phase0-spark-tcp-bench.sh` cannot drift into resolving it two different
 ways:
 
@@ -32,11 +32,11 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[2]
-COMMON = REPO / "scripts" / "release-common.sh"
+COMMON = REPO / "scripts" / "lib" / "release-common.sh"
 RUN = REPO / "run.sh"
 
 DIE = 2  # release_die's status in the library
-SOURCE = 'source scripts/release-common.sh\n'
+SOURCE = 'source scripts/lib/release-common.sh\n'
 
 
 def _sh(path: Path, name: str, log: Path, body: str) -> None:

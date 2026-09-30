@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Official V4.1 Spark routed-expert benchmark for replicated expert groups.
 
-Run through ``scripts/run-tp-ep-kernel-checks.sh bench`` so the pinned
+Run through ``scripts/bench/deepseek_v41/run-tp-ep-kernel-checks.sh bench`` so the pinned
 SparkInfer tree is imported read-only. This file deliberately lives in the
-parent repository: ``scripts/verify-sparkinfer-source.py`` hashes every file
+parent repository: ``scripts/build/verify-sparkinfer-source.py`` hashes every file
 under ``third_party/sparkinfer`` including ``tests/`` and ``benchmarks/``, so a
 new file there would break AOT source verification for the native build.
 
