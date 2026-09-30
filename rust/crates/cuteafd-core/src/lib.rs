@@ -18,10 +18,7 @@ pub mod prefix;
 pub use engram::{EngramBatch, EngramError, EngramHashes, EngramHistory, EngramPrefillCursor, ENGRAM_LAYERS, ENGRAM_ROWS, ENGRAM_COMPRESSED_VOCAB};
 mod attention_geometry;
 mod constants;
-mod coordinator_graphs;
 mod debug_expert;
-mod deepseek_v4_compressor;
-mod deepseek_v4_kv;
 mod errors;
 mod expert_batch;
 mod expert_host_batch;
@@ -31,7 +28,6 @@ pub use exl3_tp4_ownership::{
     exl3_tp4_active_blocks, Exl3BoundaryCost, Exl3Tp4OwnershipPlan,
     Exl3Tp4OwnershipPlanner, EXL3_TP4_RESIDENT_BLOCKS,
 };
-mod graph_buffers;
 mod ids;
 mod kv_cache;
 mod layerwave;
@@ -70,30 +66,9 @@ pub use constants::{
     GLM52_NUM_MTP_LAYERS, GLM52_ROUTED_EXPERTS, GLM52_ROUTED_SCALING_FACTOR, GLM52_TOP_K,
     GLM52_TOTAL_LAYERS_WITH_MTP, SUPPORTED_MODEL_IDS,
 };
-pub use coordinator_graphs::{
-    coordinator_graph_bucket_for_active_rows, CoordinatorGraphInstancePlan, CoordinatorGraphKey,
-    CoordinatorGraphNetworkBoundary, CoordinatorGraphShape, COORDINATOR_GRAPH_DECODE_BUCKET_ROWS,
-    COORDINATOR_GRAPH_INSTANCE_COUNT, COORDINATOR_GRAPH_PREFILL_BUCKET_ROWS,
-    COORDINATOR_GRAPH_SHAPES,
-};
 pub use debug_expert::{
     ExpertRequest, ExpertRequestHeader, ExpertResponse, ExpertResponseHeader, ExpertRow,
     ExpertWaveMetadata, RouteEntry,
-};
-pub use deepseek_v4_compressor::{
-    deepseek_v4_compressor_execution_plans, DeepseekV4CompressorContinuationPlan,
-    DeepseekV4CompressorDecodeStep, DeepseekV4CompressorKind,
-    DeepseekV4CompressorLayerExecutionPlan, DeepseekV4CompressorPrefillPlan,
-    DeepseekV4CompressorSpec, DeepseekV4CompressorStateFill,
-};
-pub use deepseek_v4_kv::{
-    DeepseekV4KvBoundaryCopyPlan, DeepseekV4KvBoundaryLayerCopyPlan, DeepseekV4KvCacheFormat,
-    DeepseekV4KvPageCopySpan, DeepseekV4KvPagePlane, DeepseekV4KvRegionKind,
-    DeepseekV4KvRegionPlan, DeepseekV4KvSlot, DeepseekV4PhysicalKvLayerPlan,
-    DeepseekV4PhysicalKvPlan, DS4_INDEX_FP32_SCALE_BYTES_PER_ROW, DS4_INDEX_FP8_BYTES_PER_ROW,
-    DS4_KV_NOPE_FP8_BYTES, DS4_KV_NVFP4_BYTES_PER_ROW, DS4_KV_PAGE_ALIGNMENT_BYTES,
-    DS4_KV_PAYLOAD_BYTES_PER_ROW, DS4_KV_ROPE_BF16_BYTES, DS4_KV_SOURCE_PAGE_TOKENS,
-    DS4_KV_UE8M0_FOOTER_BYTES_PER_ROW, DS4_KV_UNPADDED_BYTES_PER_ROW,
 };
 pub use errors::CuteafdError;
 pub use expert_batch::{ExpertBatch, ExpertBatchRow};
@@ -105,16 +80,6 @@ pub use expert_route_plan::{
     plan_completion_first_routes, plan_rolling_expert_row_packs, CompletionFirstRouteGroup,
     CompletionFirstRoutePlan, CompletionRoutePlanEntry, RollingExpertRowPackAccumulator,
     RollingExpertRowPackConfig, RollingExpertRowPackEmission, RollingExpertRowPackPlan,
-};
-pub use graph_buffers::{
-    ExpertGraphActiveCounts, ExpertGraphBufferContract, ExpertGraphExecutionEnvelope,
-    ExpertGraphHostBatchLease, ExpertGraphHostBatchSetLease, ExpertGraphInstancePool,
-    ExpertGraphKey, ExpertGraphPoolEntry, ExpertGraphPoolLease, ExpertGraphPoolStats,
-    ExpertWorkspaceContract, HiddenRowsBufferContract, PartialOutputBufferContract,
-    RouteMetadataBufferContract, EXPERT_GRAPH_ACTIVE_COUNTS_BYTES,
-    EXPERT_GRAPH_HOST_ROW_GLOBAL_INDEX_BYTES, EXPERT_GRAPH_PROTOCOL_V2_LAYOUT,
-    EXPERT_GRAPH_ROUTE_ENTRY_BYTES, EXPERT_GRAPH_ROW_ROUTE_COUNT_BYTES,
-    EXPERT_GRAPH_TILE_METADATA_BYTES,
 };
 pub use ids::{LayerId, PlacementVersion, PositionId, Priority, RequestId};
 pub use kv_cache::{

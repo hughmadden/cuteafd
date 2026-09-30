@@ -4,8 +4,6 @@ use thiserror::Error;
 pub enum CuteafdError {
     #[error("invalid DeepSeek V4 attention geometry: {reason}")]
     InvalidDeepseekV4AttentionGeometry { reason: String },
-    #[error("invalid DeepSeek V4 physical KV layout: {reason}")]
-    InvalidDeepseekV4KvLayout { reason: String },
     #[error("unknown role: {0}")]
     UnknownRole(String),
     #[error("unknown placement policy: {0}")]
@@ -53,8 +51,6 @@ pub enum CuteafdError {
         source_rows: usize,
         hidden_rows: usize,
     },
-    #[error("ExpertBatch partial output row count {actual} did not match expected {expected}")]
-    ExpertBatchPartialRowCountMismatch { expected: usize, actual: usize },
     #[error("expert route plan rejected: {reason}")]
     ExpertRoutePlanRejected { reason: String },
     #[error("ExpertHostBatch unknown host: {host}")]
@@ -100,8 +96,6 @@ pub enum CuteafdError {
         "ExpertHostBatchSet route count {actual} did not match ExpertBatch route count {expected}"
     )]
     ExpertHostBatchSetRouteCountMismatch { expected: usize, actual: usize },
-    #[error("expert TP host count {actual} did not match required world size {expected}")]
-    ExpertTensorParallelHostCountMismatch { expected: usize, actual: usize },
     #[error("ExpertHostBatchSet partial host count {actual} did not match expected {expected}")]
     ExpertHostBatchSetPartialHostCountMismatch { expected: usize, actual: usize },
     #[error("ExpertHostBatchSet duplicate host {host} in reconstruction contract")]
@@ -143,10 +137,4 @@ pub enum CuteafdError {
     ExpertHostBatchSetReconstructionPlanMissingGlobalRow { row_index: usize },
     #[error("Graph buffer contract invalid: {reason}")]
     GraphBufferContractInvalid { reason: String },
-    #[error("Graph buffer active count {field}={actual} exceeds capacity {capacity}")]
-    GraphBufferActiveCountOutOfBounds {
-        field: &'static str,
-        actual: usize,
-        capacity: usize,
-    },
 }
