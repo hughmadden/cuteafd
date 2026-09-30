@@ -303,9 +303,9 @@ release; exported C symbols and V4.1-specific names stay). ≈3 days move pass,
 ≈3–4 days naming pass; V4.1 parity before tagging.
 Status: purge, move pass (M1–M8) and naming pass (N1–N9) done on
 `work/restructure`; `scripts/build/path-map.tsv`, `rename-map.tsv` and
-`rebase-across-move.sh` carry older branches across. Pending: full native AOT
-build and V4.1 parity on hardware, then the merge into `work/p0`; M9 (fork
-layout) separately.
+`rebase-across-move.sh` carry older branches across. Full native AOT build,
+V4.1 parity vs 9015bff, GLM 5.3 golden NLL and a MiMo launch checked on
+hardware before the merge into `work/p0`; M9 (fork layout) separately.
 
 **Phase 5 — NVIDIA ModelOpt NVFP4 checkpoints (queued; after the families
 above reach their performance targets).** nvidia/{DeepSeek-V4.1-Flash,
