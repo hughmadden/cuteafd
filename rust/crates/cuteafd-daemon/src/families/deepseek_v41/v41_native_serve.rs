@@ -7,6 +7,7 @@ pub(crate) mod console;
 mod distributed;
 mod placement;
 pub(crate) mod scores;
+#[path = "../../shared/constraints.rs"]
 pub(crate) mod constraints;
 use scores::TokenScores;
 mod prefix;

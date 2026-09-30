@@ -1,0 +1,33 @@
+//! DeepSeek V4.1 (module names keep their `v41_` prefix).
+
+pub(crate) mod v41_attention_binding;
+pub(crate) mod v41_attention_output;
+pub(crate) mod v41_attention_query;
+pub(crate) mod v41_backbone_cache;
+pub(crate) mod v41_backbone_execution;
+pub(crate) mod v41_backbone_hc;
+pub(crate) mod v41_backbone_lane;
+pub(crate) mod v41_backbone_router;
+pub(crate) mod v41_backbone_shared;
+pub(crate) mod v41_block;
+pub(crate) mod v41_compressor;
+pub(crate) mod v41_dspark_cache;
+pub(crate) mod v41_engram;
+pub(crate) mod v41_experts;
+pub(crate) mod v41_hc;
+pub(crate) mod v41_index_lane;
+pub(crate) mod v41_index_query;
+pub(crate) mod v41_index_selection;
+pub(crate) mod v41_layer_graphs;
+pub(crate) mod v41_native_serve;
+pub(crate) mod v41_projection_tp2;
+pub(crate) mod v41_requests;
+pub(crate) mod v41_shared_ffn;
+pub(crate) mod v41_spark_topology;
+pub(crate) mod v41_sparse_attention;
+pub(crate) mod v41_target_embedding;
+pub(crate) mod v41_target_head;
+pub(crate) mod v41_target_pass;
+pub(crate) mod v41_tensors;
+pub(crate) mod v41_vision;
+pub(crate) mod v41_window;

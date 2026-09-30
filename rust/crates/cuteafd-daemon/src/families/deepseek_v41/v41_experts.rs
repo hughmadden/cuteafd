@@ -8,8 +8,10 @@ pub(crate) mod tp2_ffn;
 pub(crate) mod dspark;
 mod execution;
 pub(crate) mod exl3;
+#[path = "../../shared/experts/fp8/mod.rs"]
 pub(crate) mod fp8;
 pub(crate) mod nvfp4;
+#[path = "../../shared/experts/service/mod.rs"]
 pub(crate) mod service;
 pub(crate) use execution::{ExpertExecution, ExpertExecutionBudget, HostExpertExchange};
 

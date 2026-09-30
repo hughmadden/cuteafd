@@ -82,14 +82,14 @@ impl DsparkSharedFfn<'_, '_> {
     pub(super) fn matches_stage(&self, weights: &DsparkWeights<'_>, stage: usize) -> bool {
         self.stage == stage && std::ptr::eq(self.weights, weights)
     }
-    pub(in crate::v41_experts) fn matches(
+    pub(in crate::families::deepseek_v41::v41_experts) fn matches(
         &self,
         weights: &crate::v41_experts::ExpertWeights<'_>,
     ) -> bool {
         self.weights.full_expert(self.stage).is_some_and(|stage| std::ptr::eq(stage, weights))
     }
     /// Caller drains the stream before releasing the exclusive scratch borrow.
-    pub(in crate::v41_experts) unsafe fn enqueue(
+    pub(in crate::families::deepseek_v41::v41_experts) unsafe fn enqueue(
         &mut self,
         input: CuteafdDeviceBuffer,
         output: CuteafdDeviceBuffer,

@@ -50,7 +50,7 @@ impl DsparkRouter<'_, '_> {
     pub(super) fn matches_stage(&self, weights: &DsparkWeights<'_>, stage: usize) -> bool {
         self.stage == stage && std::ptr::eq(self._weights, weights)
     }
-    pub(in crate::v41_experts) fn matches(
+    pub(in crate::families::deepseek_v41::v41_experts) fn matches(
         &self,
         weights: &crate::v41_experts::ExpertWeights<'_>,
     ) -> bool {
@@ -58,7 +58,7 @@ impl DsparkRouter<'_, '_> {
     }
     /// Caller must drain the stream, including on launch failure, before releasing
     /// this borrow: the first kernel may already be using scores scratch.
-    pub(in crate::v41_experts) unsafe fn enqueue(
+    pub(in crate::families::deepseek_v41::v41_experts) unsafe fn enqueue(
         &mut self,
         inputs: [CuteafdDeviceBuffer; 3],
         rows: usize,

@@ -20,7 +20,7 @@ struct Binding {
 /// Active requests and saved snapshots own these pins. A key may be recycled
 /// only after both have released it and the radix has removed orphaned edges.
 #[derive(Clone, Default)]
-pub(in crate::v41_native_serve) struct ImageKeys {
+pub(in crate::families::deepseek_v41::v41_native_serve) struct ImageKeys {
     bindings: Vec<Binding>,
 }
 impl ImageKeys {

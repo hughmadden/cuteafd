@@ -1,17 +1,17 @@
 //! Real-weight query-chain parity, graph shape replacement, and error recovery.
-#[path = "../src/v41_attention_binding.rs"]
+#[path = "../src/families/deepseek_v41/v41_attention_binding.rs"]
 mod v41_attention_binding;
-#[path = "../src/v41_attention_query.rs"]
+#[path = "../src/families/deepseek_v41/v41_attention_query.rs"]
 mod v41_attention_query;
-#[path = "../src/v41_projection_tp2.rs"]
+#[path = "../src/families/deepseek_v41/v41_projection_tp2.rs"]
 mod v41_projection_tp2;
-#[path = "../src/v41_hc.rs"]
+#[path = "../src/families/deepseek_v41/v41_hc.rs"]
 mod v41_hc;
-#[path = "../src/v41_layer_graphs.rs"]
+#[path = "../src/families/deepseek_v41/v41_layer_graphs.rs"]
 mod v41_layer_graphs;
-#[path = "../src/v41_memory.rs"]
+#[path = "../src/shared/v41_memory.rs"]
 mod v41_memory;
-#[path = "../src/v41_tensors.rs"]
+#[path = "../src/families/deepseek_v41/v41_tensors.rs"]
 mod v41_tensors;
 use anyhow::{ensure, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};

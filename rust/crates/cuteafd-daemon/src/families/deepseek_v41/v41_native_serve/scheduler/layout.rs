@@ -4,7 +4,7 @@ use crate::v41_experts::dspark::{DsparkChain, DistributedDsparkChain};
 use crate::v41_target_pass::DistributedTargetPass;
 use super::super::prefill_target::PrefillTarget;
 
-pub(in crate::v41_native_serve) trait ServingTarget<'w, 'a>: PrefillTarget<'a> {
+pub(in crate::families::deepseek_v41::v41_native_serve) trait ServingTarget<'w, 'a>: PrefillTarget<'a> {
     type Chain: DraftChain<'a>;
     fn begin_request(transport: &mut Self::Transport) -> Result<()>;
     fn reset_connections(transport: &mut Self::Transport) -> Result<()>;

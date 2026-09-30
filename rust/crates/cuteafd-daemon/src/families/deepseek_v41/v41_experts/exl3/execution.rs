@@ -291,9 +291,10 @@ impl<'a> Exl3Execution<'a> {
     ) -> Result<Self> {
         let meta: Manifest =
             serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
-        let lock: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../../../../third_party/sparkinfer.lock.json"
-        ))?;
+        let lock: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../third_party/sparkinfer.lock.json"
+        )))?;
         ensure!(
             meta.schema == "cuteafd.v41-exl3-aot.v1"
                 && meta.sparkinfer_revision == lock["revision"].as_str().unwrap_or(""),

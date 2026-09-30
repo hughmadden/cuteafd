@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Spark A/B for how routed-expert partials reach the coordinator GPU
-# (rust/crates/cuteafd-daemon/src/spark_intake.rs): the base engine's host
+# (rust/crates/cuteafd-daemon/src/shared/spark_intake.rs): the base engine's host
 # staging against this checkout's intakes (host, pinned, gpu, auto), with the
 # real Spark ranks. Run the steps in order once raptor GPU0 and the Sparks are
 # free (one model served at a time; this script stops what it launched):

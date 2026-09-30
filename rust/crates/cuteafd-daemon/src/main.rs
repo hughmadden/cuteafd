@@ -5,48 +5,48 @@ use std::process::Command;
 
 mod cli;
 mod commands;
-mod draft_policy;
-mod prefill_share;
-mod fp8_linear;
-mod l2_prefetch;
-mod dsv4;
-mod glm;
-mod glmf;
-mod qwen4;
-mod mimo;
-mod v41_compressor;
-mod v41_vision;
-mod v41_index_query;
-mod v41_index_lane;
-mod v41_index_selection;
-mod v41_experts;
-mod v41_memory;
-mod v41_window;
-mod v41_sparse_attention;
-mod v41_attention_query;
-mod v41_layer_graphs;
-mod v41_attention_binding;
-mod v41_hc;
-mod v41_shared_ffn;
-mod v41_backbone_shared;
-mod v41_backbone_router;
-mod v41_backbone_hc;
-mod v41_block;
-mod v41_backbone_lane;
-mod v41_backbone_cache;
-mod v41_backbone_execution;
-mod v41_requests;
-mod v41_target_head;
-mod v41_target_pass;
-mod v41_native_serve;
-mod v41_target_embedding;
-mod v41_attention_output;
-mod v41_projection_tp2;
-mod v41_dspark_cache;
-mod v41_spark_topology;
-mod v41_tensors;
-mod v41_engram;
-mod spark_intake;
+mod families;
+mod shared;
+// Old crate-root module paths, kept while the tree moves (naming pass drops them).
+use families::deepseek_v4 as dsv4;
+use families::glm5 as glm;
+use families::glm5_flash as glmf;
+use families::mimo_v2 as mimo;
+use families::qwen4;
+use families::deepseek_v41::{
+    v41_compressor,
+    v41_vision,
+    v41_index_query,
+    v41_index_lane,
+    v41_index_selection,
+    v41_experts,
+    v41_window,
+    v41_sparse_attention,
+    v41_attention_query,
+    v41_layer_graphs,
+    v41_attention_binding,
+    v41_hc,
+    v41_shared_ffn,
+    v41_backbone_shared,
+    v41_backbone_router,
+    v41_backbone_hc,
+    v41_block,
+    v41_backbone_lane,
+    v41_backbone_cache,
+    v41_backbone_execution,
+    v41_requests,
+    v41_target_head,
+    v41_target_pass,
+    v41_native_serve,
+    v41_target_embedding,
+    v41_attention_output,
+    v41_projection_tp2,
+    v41_dspark_cache,
+    v41_spark_topology,
+    v41_tensors,
+    v41_engram,
+};
+use shared::{draft_policy, prefill_share, fp8_linear, l2_prefetch, spark_intake, v41_memory};
 
 use cli::{Cli, Commands};
 use commands::bench_rdma::run_bench_rdma;

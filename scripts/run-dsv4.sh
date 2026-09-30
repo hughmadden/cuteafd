@@ -177,7 +177,7 @@ for ((rank = 0; rank < ranks; rank++)); do
 done
 peer_csv="$(IFS=,; echo "${peers[*]}")"
 # SPARK_INTAKE: how routed partials reach the coordinator GPU (auto, gpu, pinned
-# or host; see rust/crates/cuteafd-daemon/src/spark_intake.rs).
+# or host; see rust/crates/cuteafd-daemon/src/shared/spark_intake.rs).
 intake="$(get SPARK_INTAKE auto)"
 case "$intake" in auto|gpu|pinned|host) ;; *) echo "SPARK_INTAKE must be auto, gpu, pinned or host" >&2; exit 2 ;; esac
 docker run -d --name cuteafd-coordinator --restart no --gpus "device=$gpu" --network host --ipc host \
