@@ -93,6 +93,13 @@ fi
 if [[ $serve == serve-mimo && "$(get MTP 0)" != 0 ]]; then
   family_args+=(--mtp "$(get MTP 0)")
 fi
+# serve-mimo prefix cache: PREFIX_CACHE_ENTRIES snapshots per bank (prompts, turns; 0 = off),
+# HOST_CACHE_BYTES of pinned host memory for snapshots the device evicts (e.g. 64GiB; 0 = off),
+# POOL_TOKENS full-attention KV tokens shared by live sequences and retained snapshots.
+if [[ $serve == serve-mimo ]]; then
+  family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)" --pool-tokens "$(get POOL_TOKENS 131072)")
+  [[ "$(get HOST_CACHE_BYTES 0)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES)")
+fi
 if [[ $serve == serve-glmf ]]; then
   fp8_model="$(get GLMF_FP8_MODEL_ID zai-org/GLM-5.3-Flash)"
   if [[ "$fp8_model" != off ]]; then

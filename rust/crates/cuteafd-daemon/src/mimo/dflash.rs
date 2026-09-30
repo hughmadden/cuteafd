@@ -177,12 +177,17 @@ struct Workspace<'a> {
 }
 
 /// One sequence to draft for: its ring slot, the token at `position` whose
-/// target step has not run yet, and `position` itself (the context length).
+/// target step has not run yet, `position` itself (the context length), and
+/// the first position whose context entry the ring holds for this sequence
+/// (`context_valid_from`: 0 after a full prefill; a prefix-cache restore at
+/// `P` starts the drafter cold at `P`, and ring entries before it belong to
+/// the slot's previous sequence).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DraftSeq {
     pub slot: usize,
     pub anchor: u32,
     pub position: usize,
+    pub valid_from: usize,
 }
 
 /// One committed tapped row: its row in the last step's taps, the sequence's
@@ -483,7 +488,7 @@ impl<'a> MimoDrafter<'a> {
             }
             positions.extend((seq.position..seq.position + block).map(|p| p as i64));
             tables[i] = seq.slot as i32;
-            tables[s_count + i] = seq.position.min(RING) as i32;
+            tables[s_count + i] = seq.position.saturating_sub(seq.valid_from).min(RING) as i32;
             tables[2 * s_count + i] = seq.position as i32;
         }
         self.put(&w.h, &embed)?;

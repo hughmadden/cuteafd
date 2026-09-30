@@ -615,6 +615,7 @@ dependencies = [
  "clap",
  "cuteafd-api",
  "cuteafd-core",
+ "cuteafd-engine",
  "cuteafd-ffi",
  "cuteafd-hostcache",
  "cuteafd-loader",

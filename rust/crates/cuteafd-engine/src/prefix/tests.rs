@@ -455,6 +455,9 @@ fn torture_interleaved_conversations_stay_exact_and_leak_nothing() {
         }
         let stats = cache.stats();
         assert!(stats.hits > 50, "{stats:?}");
+        // Idle: every used page belongs to a retained snapshot, every used slot to an entry.
+        assert_eq!(stats.pages - stats.pages_free, stats.pages_retained, "{stats:?}");
+        assert_eq!(stats.marks_in_use, stats.entries_prompt + stats.entries_turn, "{stats:?}");
         cache.clear(&fake).unwrap();
         assert_eq!((cache.pool().free(), cache.arena().in_use()), (40, 0), "{stats:?}");
     }

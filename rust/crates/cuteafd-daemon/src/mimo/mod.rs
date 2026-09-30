@@ -3,6 +3,7 @@
 pub(crate) mod dflash;
 pub(crate) mod engine;
 pub(crate) mod mtp;
+pub(crate) mod prefix;
 pub(crate) mod serve;
 pub(crate) mod weights;
 
@@ -129,6 +130,13 @@ pub(crate) struct GoldenArgs {
     /// directory, compare with its predictions and score acceptance.
     #[arg(long)]
     pub mtp_oracle: Option<PathBuf>,
+    /// Prefix-cache restore check at token P: prefill the first P tokens, capture their
+    /// snapshot (shared pages, the copied tail page, the SWA/MTP mark), restore it into a
+    /// second sequence with its own ring, prefill the rest in both, and compare every layer's
+    /// rows, the logits and the KV state byte for byte (a restore must be exact). Chunks of
+    /// --prefill-chunk rows; a straight prefill without the boundary at P is reported too.
+    #[arg(long)]
+    pub resume_at: Option<usize>,
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -378,6 +386,9 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
     let layers = engine.weights.layers.len();
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    if let Some(at) = args.resume_at {
+        return resume_check(args, opened, engine, &tokens, at);
+    }
     let mut placement = engine::Allocator::new(engine.pages, engine.rings).admit(tokens.len())?;
     let embed = embed_rows(&opened.checkpoint, &tokens, cfg.hidden)?;
     let row = cfg.hidden * 2;
@@ -565,7 +576,7 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<
         done = position;
         let anchor = tokens[position];
         let timer = Instant::now();
-        let draft = drafter.draft(&[dflash::DraftSeq { slot: 0, anchor, position }],
+        let draft = drafter.draft(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
             &embed_rows(&opened.checkpoint, &[anchor], hidden)?, engine.weights.head.buffer.ptr)?.remove(0);
         draft_seconds += timer.elapsed().as_secs_f64();
         let reference = &ref_tokens[index * drafts_per..][..drafts_per];
@@ -600,7 +611,7 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<
     }
     let anchor = embed_rows(&opened.checkpoint, &[tokens[position]], hidden)?;
     for sequences in 1..=drafter.slots {
-        let seqs: Vec<_> = (0..sequences).map(|slot| dflash::DraftSeq { slot, anchor: tokens[position], position })
+        let seqs: Vec<_> = (0..sequences).map(|slot| dflash::DraftSeq { slot, anchor: tokens[position], position, valid_from: 0 })
             .collect();
         let rows = anchor.repeat(sequences);
         drafter.draft(&seqs, &rows, engine.weights.head.buffer.ptr)?;
@@ -681,5 +692,136 @@ fn mtp_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
     println!("MTP oracle: {n} anchors, {stages} stages; drafts equal to the reference (where comparable) {:?} of {:?}; \
         accepted prefix vs text {:.2}, vs target greedy {:.2}; {:.2} ms/draft (incl. true-row catch-up)",
         matched, compared, text as f64 / n as f64, target as f64 / n as f64, seconds * 1e3 / n as f64);
+    Ok(())
+}
+
+/// Digests of a prefill: each layer's output rows, every row's logits (bits), each row's
+/// argmax, and the last row's logits.
+struct SuffixRun {
+    layers: Vec<u64>,
+    logits: u64,
+    argmax: Vec<usize>,
+    last: Vec<f32>,
+}
+
+/// Prefill `embed` into `placement` in chunks, hashing each layer's rows and (with `logits`)
+/// every row's logits.
+fn prefill_digest(engine: &engine::MimoEngine<'_>, placement: &mut engine::MimoPlacement, embed: &[u8], chunk: usize,
+    logits: bool) -> Result<SuffixRun> {
+    use std::hash::{Hash, Hasher};
+    let (row, vocab) = (engine.cfg.hidden * 2, engine.cfg.vocab_size);
+    let mut hashers: Vec<std::collections::hash_map::DefaultHasher> = Vec::new();
+    let mut logit_hash = std::collections::hash_map::DefaultHasher::new();
+    let (mut argmax, mut last) = (Vec::new(), Vec::new());
+    for part in embed.chunks(chunk * row) {
+        let mut on_layer = |layer: usize, rows: &[u8]| -> Result<()> {
+            if hashers.len() <= layer {
+                hashers.resize_with(layer + 1, Default::default);
+            }
+            rows.hash(&mut hashers[layer]);
+            Ok(())
+        };
+        let out = engine.prefill_forced(placement, part, logits, Some(&mut on_layer), None)?
+            .context("the resume check needs every layer")?;
+        if logits {
+            for values in out.chunks_exact(vocab) {
+                values.iter().for_each(|v| v.to_bits().hash(&mut logit_hash));
+                argmax.push(values.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map_or(0, |(i, _)| i));
+            }
+            last = out[out.len() - vocab..].to_vec();
+        }
+    }
+    Ok(SuffixRun { layers: hashers.iter().map(Hasher::finish).collect(), logits: logit_hash.finish(), argmax, last })
+}
+
+/// Rows `[from, to)` of every layer's KV state of `placement` (full layers from its pages,
+/// SWA layers the ring rows still held), for byte comparison.
+fn kv_rows(engine: &engine::MimoEngine<'_>, placement: &engine::MimoPlacement, from: usize, to: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for layer in 0..engine.weights.layers.len() {
+        let (attention, buffer, record) = engine.kv_layer(layer);
+        let first = match attention {
+            cuteafd_loader::mimo_v2::MimoAttention::Full => from,
+            cuteafd_loader::mimo_v2::MimoAttention::Sliding => from.max(to.saturating_sub(engine.cfg.window)),
+        };
+        for position in first..to {
+            let offset = match attention {
+                cuteafd_loader::mimo_v2::MimoAttention::Full => placement.slot(position)? as usize * record,
+                cuteafd_loader::mimo_v2::MimoAttention::Sliding => placement.ring_slot(position) as usize * record,
+            };
+            ensure!(offset + record <= buffer.bytes, "KV row outside its buffer");
+            let mut bytes = vec![0u8; record];
+            opened_copy(engine, &mut bytes, cuteafd_ffi::CuteafdDeviceBuffer {
+                ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes: record, ..buffer })?;
+            out.extend(bytes);
+        }
+    }
+    Ok(out)
+}
+
+fn opened_copy(engine: &engine::MimoEngine<'_>, out: &mut [u8], source: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()> {
+    // SAFETY: the engine owns this stream; draining it retires every write to `source`.
+    unsafe { engine.library.cuda_stream_synchronize(engine.stream)? };
+    engine.library.copy_d2h(out, source)
+}
+
+fn resume_check(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_>, tokens: &[u32], at: usize)
+    -> Result<()> {
+    use cuteafd_engine::prefix::{MarkSlot, PrefixFamily};
+    ensure!(engine.weights.layers.len() == engine.cfg.layers, "--resume-at needs every layer");
+    let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
+    ensure!(at > 0 && at < n, "--resume-at {at} must lie inside the {n} prefilled tokens");
+    let chunk = args.prefill_chunk.unwrap_or(engine.prefill_rows).clamp(1, engine.prefill_rows);
+    let row = opened.cfg.hidden * 2;
+    let embed = embed_rows(&opened.checkpoint, &tokens[..n], opened.cfg.hidden)?;
+    let family = prefix::MimoPrefix::new(engine, |_| 2)?;
+    let mut allocator = engine::Allocator::new(engine.pages, engine.rings);
+    // A: prefill [0, P), capture, continue in place.
+    let mut a = allocator.admit(n)?;
+    let started = Instant::now();
+    prefill_digest(engine, &mut a, &embed[..at * row], chunk, false)?;
+    family.capture(MarkSlot(0), &a, at).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // B: a second sequence restored from the snapshot (shared full pages, own tail and ring).
+    let (mut b, copy) = allocator.fork(&a, at, n)?;
+    if let Some(copy) = copy {
+        family.copy_rows(copy).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    family.restore(Some(MarkSlot(0)), &mut b, at).map_err(|e| anyhow::anyhow!("{e}"))?;
+    family.drain().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let capture_s = started.elapsed().as_secs_f64();
+    // The restored rings (SWA and MTP hidden rows) read back exactly as the captured ones.
+    family.capture(MarkSlot(1), &b, at).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mark = |slot: u32| -> Result<Vec<u8>> {
+        let range = family.mark_segments(MarkSlot(slot))[0];
+        let mut bytes = vec![0u8; range.bytes];
+        opened_copy(engine, &mut bytes, cuteafd_ffi::CuteafdDeviceBuffer { ptr: range.addr as *mut std::ffi::c_void,
+            bytes: range.bytes, ..engine.kv_layer(0).1 })?;
+        Ok(bytes)
+    };
+    let mark_equal = mark(0)? == mark(1)?;
+    let straight = prefill_digest(engine, &mut a, &embed[at * row..], chunk, true)?;
+    let restored = prefill_digest(engine, &mut b, &embed[at * row..], chunk, true)?;
+    let first_layer = straight.layers.iter().zip(&restored.layers).position(|(x, y)| x != y);
+    let logits_equal = straight.logits == restored.logits;
+    let max_diff = straight.last.iter().zip(&restored.last).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+    let kv_equal = kv_rows(engine, &a, at, n)? == kv_rows(engine, &b, at, n)?;
+    println!("resume at {at} of {n} (chunks of {chunk}): layers {} | logits {} (last row max |diff| {max_diff:.3e}) | \
+        KV rows {at}..{n} {} | mark round trip {} ({} B), capture+restore {:.1} ms",
+        first_layer.map_or("identical".to_string(), |l| format!("differ from layer {l}")),
+        if logits_equal { "identical" } else { "DIFFER" }, if kv_equal { "identical" } else { "DIFFER" },
+        if mark_equal { "identical" } else { "DIFFERS" }, family.mark_bytes(), capture_s * 1e3);
+    allocator.release(b);
+    allocator.release(a);
+    // C: one prefill with no boundary at P (chunking changes may round differently; informational).
+    let mut c = allocator.admit(n)?;
+    let whole = prefill_digest(engine, &mut c, &embed, chunk, true)?;
+    let x = &whole.argmax[at..];
+    let agree = x.iter().zip(&restored.argmax).filter(|(p, q)| p == q).count();
+    let last_equal = whole.last.iter().zip(&restored.last).all(|(p, q)| p.to_bits() == q.to_bits());
+    println!("vs one straight prefill without the boundary at {at}: suffix top-1 agreement {agree}/{}, last row logits {}",
+        x.len(), if last_equal { "identical" } else { "differ" });
+    allocator.release(c);
+    ensure!(first_layer.is_none() && logits_equal && kv_equal && mark_equal,
+        "the restored sequence differs from the straight one");
     Ok(())
 }

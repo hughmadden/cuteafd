@@ -19,6 +19,7 @@ cuteafd-api = { path = "../cuteafd-api" }
 cuteafd-core = { path = "../cuteafd-core" }
 cuteafd-ffi = { path = "../cuteafd-ffi" }
 cuteafd-hostcache = { path = "../cuteafd-hostcache" }
+cuteafd-engine = { path = "../cuteafd-engine" }
 cuteafd-loader = { path = "../cuteafd-loader" }
 cuteafd-transport = { path = "../cuteafd-transport" }
 io-uring.workspace = true

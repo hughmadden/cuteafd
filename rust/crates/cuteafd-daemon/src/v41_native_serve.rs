@@ -9,7 +9,7 @@ mod placement;
 pub(crate) mod scores;
 pub(crate) mod constraints;
 use scores::TokenScores;
-mod prefix;
+pub(crate) mod prefix;
 pub(crate) mod memory;
 use crate::v41_backbone_cache::BackboneCache;
 use crate::v41_backbone_execution::BackboneExecution;

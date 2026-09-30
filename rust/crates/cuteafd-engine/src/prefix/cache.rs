@@ -122,6 +122,8 @@ pub struct PrefixStats {
     pub pages: usize,
     pub pages_free: usize,
     pub pages_shared: usize,
+    /// Distinct pages held by retained snapshots; when no request runs, every used page is one.
+    pub pages_retained: usize,
     pub mark_slots: usize,
     pub marks_in_use: usize,
     pub host: Option<cuteafd_hostcache::metrics::Snapshot>,
@@ -399,6 +401,10 @@ impl<E: CopyEngine> PrefixCache<E> {
         stats.pages = self.pool.capacity();
         stats.pages_free = self.pool.free();
         stats.pages_shared = self.pool.shared();
+        let mut retained: Vec<u32> = self.entries.values().flat_map(|e| e.pages.iter().copied()).collect();
+        retained.sort_unstable();
+        retained.dedup();
+        stats.pages_retained = retained.len();
         stats.mark_slots = self.arena.slots();
         stats.marks_in_use = self.arena.in_use();
         stats.host = self.host.as_ref().map(HostCache::metrics);
