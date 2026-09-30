@@ -27,7 +27,7 @@ def main():
     assert not args.output.exists(), 'choose a new output path to preserve evidence'
     paths = [args.fixtures_dir / name for name in ['10016.jpg', 'baidu.png']]
     paths.append(Path(__file__).resolve().parents[1] /
-                 'rust/crates/cuteafd-api/src/native_v41/fixtures/black.png')
+                 'rust/crates/cuteafd-api/src/openai/fixtures/black.png')
     images = ['data:image/' + ('jpeg' if p.suffix == '.jpg' else 'png') +
               ';base64,' + base64.b64encode(p.read_bytes()).decode() for p in paths]
     report = dict(base_url=args.base_url, fixtures=[dict(path=str(p),

@@ -7,7 +7,9 @@ mod capabilities;
 pub mod fabric;
 mod debug_json;
 pub mod protocol_v2;
-pub mod v41_expert;
+pub mod expert;
+// Old module path, kept for one release (naming pass).
+pub use expert as v41_expert;
 mod protocol_v2_tcp;
 mod synthetic;
 mod verbs;
