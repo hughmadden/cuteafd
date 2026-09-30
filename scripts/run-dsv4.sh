@@ -99,6 +99,8 @@ fi
 if [[ $serve == serve-mimo ]]; then
   family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)" --pool-tokens "$(get POOL_TOKENS 131072)")
   [[ "$(get HOST_CACHE_BYTES 0)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES)")
+  # PREFIX_PARTIAL=on: V4.1-style partial reuse (approximate; off = exact restores only).
+  family_args+=(--prefix-partial "$(get PREFIX_PARTIAL off)")
 fi
 if [[ $serve == serve-glmf ]]; then
   fp8_model="$(get GLMF_FP8_MODEL_ID zai-org/GLM-5.3-Flash)"

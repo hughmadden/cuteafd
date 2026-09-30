@@ -12,6 +12,7 @@ mod entry;
 mod family;
 mod marks;
 mod pages;
+mod points;
 #[cfg(test)]
 mod tests;
 
@@ -22,3 +23,4 @@ pub use entry::{greedy, victim, After, EntryId};
 pub use family::{BoxError, FamilyLayout, PrefixFamily};
 pub use marks::{ArenaExhausted, MarkArena, MarkSlot};
 pub use pages::{Fork, FreedPage, PoolExhausted, RefPagePool, TailCopy};
+pub use points::{message_boundaries, plan as plan_points, PointPlan, PointPolicy};

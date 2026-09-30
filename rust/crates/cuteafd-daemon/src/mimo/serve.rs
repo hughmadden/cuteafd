@@ -21,7 +21,7 @@ use super::mtp::MtpSeq;
 use super::engine::{MimoEngine, MimoPlacement, DECODE_ROWS};
 use super::prefix::MimoPrefix;
 use crate::v41_native_serve::prefix::CudaCopyEngine;
-use cuteafd_engine::prefix::{After, MarkArena, PrefixCache, PrefixConfig, SnapshotKind};
+use cuteafd_engine::prefix::{After, MarkArena, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
 use crate::glm::dflash_policy::{self, CycleCost, DraftHistory, Group, Shape};
 use super::{open, Opened};
 use anyhow::{Context, Result};
@@ -82,6 +82,34 @@ pub(crate) struct PrefixArgs {
     /// Shortest snapshot the host tier keeps.
     #[arg(long, default_value_t = 512)]
     pub host_cache_min_tokens: u32,
+    /// Intermediate snapshot points (off by default; agentic sessions hit prompt-end and
+    /// turn-end snapshots): one every N prefilled tokens at a chunk end (0 = none, e.g. 8192).
+    #[arg(long, env = "CUTEAFD_PREFIX_POINT_GAP", default_value_t = 0)]
+    pub prefix_point_gap: usize,
+    /// Intermediate snapshot points at the last N message boundaries of the rendered prompt
+    /// (before the generation prompt, before the last message, ...; 0 = none, e.g. 2).
+    #[arg(long, env = "CUTEAFD_PREFIX_POINT_BOUNDARIES", default_value_t = 0)]
+    pub prefix_point_boundaries: usize,
+    /// Most intermediate points per prompt (the deepest are kept).
+    #[arg(long, env = "CUTEAFD_PREFIX_POINTS_PER_REQUEST", default_value_t = 4)]
+    pub prefix_points_per_request: usize,
+    /// V4.1-style partial reuse (replay the SWA window before the aligned common prefix;
+    /// approximate, not byte-exact). Off: exact restores only.
+    #[arg(long, env = "CUTEAFD_PREFIX_PARTIAL", value_enum, default_value_t = Toggle::Off)]
+    pub prefix_partial: Toggle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum Toggle {
+    On,
+    Off,
+}
+
+impl PrefixArgs {
+    fn points(&self) -> PointPolicy {
+        PointPolicy { gap: self.prefix_point_gap, boundaries: self.prefix_point_boundaries,
+            per_request: self.prefix_points_per_request }
+    }
 }
 
 /// `123`, `512MiB`, `64GiB`, `1.5GB`.
@@ -271,7 +299,8 @@ fn prefix_cache<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs)
     -> Result<(MimoPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
     let entries = args.prefix_cache_entries;
     let budget = args.prefix_cache_mark_mib << 20;
-    let family = MimoPrefix::new(engine, |mark| if entries == 0 { 0 } else { MarkArena::slots_for(1, entries, mark, budget) })?;
+    let family = MimoPrefix::new(engine, |mark| if entries == 0 { 0 } else { MarkArena::slots_for(1, entries, mark, budget) },
+        args.prefix_partial == Toggle::On)?;
     let host = if entries > 0 && args.host_cache_bytes > 0 {
         let config = cuteafd_hostcache::config::Config {
             bytes: args.host_cache_bytes,
@@ -283,12 +312,13 @@ fn prefix_cache<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs)
     } else {
         None
     };
-    let layout = cuteafd_engine::prefix::PrefixFamily::layout(&family);
+    let layout = family.layout();
     let config = PrefixConfig { entries, mark_slots: family.slots(), keep_logits: true,
         min_tokens: args.prefix_cache_min_tokens };
     let cache = PrefixCache::new(layout, config, host)?;
     tracing::info!(entries, mark_slots = family.slots(), mark_bytes = family.mark_bytes(), page_bytes = layout.page_bytes,
-        pages = layout.pages, host_bytes = args.host_cache_bytes, "MiMo prefix cache");
+        pages = layout.pages, host_bytes = args.host_cache_bytes, rule = ?layout.rule, points = ?args.points(),
+        reach = family.capture_reach(), "MiMo prefix cache");
     Ok((family, cache))
 }
 
@@ -302,18 +332,29 @@ fn release(family: &MimoPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'
     slots.extend(slot);
 }
 
-/// Prefills `tokens[placement.len..]` chunk by chunk (feeding the drafter each chunk's tapped
-/// tail) and returns the last row's logits, or `None` when the client left at a chunk boundary
-/// (the rows prefilled so far stay in the placement).
+/// Where a prompt's intermediate snapshot points go: the plan's chunk ends and points.
+struct Points<'c, 'e, 'a, 'l> {
+    family: &'c MimoPrefix<'e, 'a>,
+    cache: &'c mut PrefixCache<CudaCopyEngine<'l>>,
+    plan: cuteafd_engine::prefix::PointPlan,
+}
+
+/// Prefills `tokens[placement.len..]` in the planned chunks (feeding the drafter each chunk's
+/// tapped tail), capturing the planned intermediate points after their chunks, and returns the
+/// last row's logits, or `None` when the client left at a chunk boundary (the rows prefilled so
+/// far stay in the placement).
 fn prefill_suffix(engine: &MimoEngine<'_>, embeddings: &super::Embeddings, slot: Option<usize>,
-    placement: &mut MimoPlacement, tokens: &[u32], job: &NativeRequest) -> Result<Option<Vec<f32>>> {
+    placement: &mut MimoPlacement, tokens: &[u32], job: &NativeRequest, points: Points<'_, '_, '_, '_>)
+    -> Result<Option<Vec<f32>>> {
     let started = Instant::now();
     let first = placement.len;
     let mut logits = None;
-    for chunk in tokens[first..].chunks(engine.prefill_rows) {
+    let Points { family, cache, plan } = points;
+    for (index, &end) in plan.chunks.iter().enumerate() {
         if job.events.is_closed() {
             return Ok(None);
         }
+        let chunk = &tokens[placement.len..end];
         let embed = embeddings.rows(chunk)?;
         let start = placement.len;
         logits = engine.prefill(placement, &embed, None)?;
@@ -322,6 +363,11 @@ fn prefill_suffix(engine: &MimoEngine<'_>, embeddings: &super::Embeddings, slot:
             let n = chunk.len().min(super::dflash::TAP_ROWS);
             drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot,
                 position: start + chunk.len() - n + r }).collect::<Vec<_>>())?;
+        }
+        for &(_, point) in plan.points.iter().filter(|&&(chunk, _)| chunk == index) {
+            if let Err(error) = cache.capture(family, SnapshotKind::Prompt, &tokens[..point], placement, After::default()) {
+                tracing::warn!("snapshot point {point} not retained: {error:#}");
+            }
         }
     }
     let elapsed = started.elapsed().as_secs_f64();
@@ -342,6 +388,9 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let mut cost = dflash_policy::step_cost(&PRO_TP6_STEP_MS, DECODE_ROWS);
     let mut skip = crate::glm::dflash_policy::DraftSkip::default();
     let (family, mut cache) = prefix_cache(engine, prefix)?;
+    // Messages start with `<|im_start|>`: a snapshot right before one is a message boundary.
+    let message_start = *QwenEncoding::from_snapshot(snapshot)?.tokens().turn_markers.first()
+        .context("the chat template names no message-start token")?;
     let mut free_rings: Vec<i32> = (0..engine.rings as i32).rev().collect();
     let mut grammars = crate::v41_native_serve::constraints::Compiler::with_vocab(
         &opened.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, QwenEncoding::from_snapshot(snapshot)?.tokens().eos.clone());
@@ -407,12 +456,23 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             }));
             if let Some(source) = admitted.source {
                 tracing::info!(tokens = tokens.len(), resume, kind = ?source.kind, frontier = source.frontier,
-                    host = source.host, "prefix cache hit");
+                    host = source.host, partial = source.partial, "prefix cache hit");
             }
             let logits = match admitted.after.and_then(|after| after.logits) {
                 // The whole prompt was retained: its logits give the first token.
                 Some(logits) => Ok(Some(logits.to_vec())),
-                None => prefill_suffix(engine, &embeddings, slot, &mut placement, &tokens, &job),
+                None => {
+                    let boundaries = cuteafd_engine::prefix::message_boundaries(&tokens, message_start);
+                    let plan = if cache.enabled() {
+                        cuteafd_engine::prefix::plan_points(resume, tokens.len(), engine.prefill_rows, &boundaries,
+                            family.capture_reach(), prefix.prefix_cache_min_tokens, prefix.points())
+                    } else {
+                        cuteafd_engine::prefix::plan_points(resume, tokens.len(), engine.prefill_rows, &[], 0, 0,
+                            PointPolicy { gap: 0, boundaries: 0, per_request: 0 })
+                    };
+                    prefill_suffix(engine, &embeddings, slot, &mut placement, &tokens, &job,
+                        Points { family: &family, cache: &mut cache, plan })
+                }
             };
             let logits = match logits {
                 Ok(Some(logits)) => logits,
@@ -726,6 +786,12 @@ mod tests {
     fn prefix_knobs_default_on_with_the_host_tier_off() {
         let cli = Cli::parse_from(["serve"]);
         assert_eq!((cli.prefix.prefix_cache_entries, cli.prefix.host_cache_bytes), (20, 0));
+        assert_eq!(cli.prefix.prefix_partial, Toggle::Off);
+        assert_eq!(cli.prefix.points(), PointPolicy { gap: 0, boundaries: 0, per_request: 4 });
+        let cli = Cli::parse_from(["serve", "--prefix-partial", "on", "--prefix-point-gap", "8192",
+            "--prefix-point-boundaries", "2"]);
+        assert_eq!(cli.prefix.points(), PointPolicy { gap: 8192, boundaries: 2, per_request: 4 });
+        assert_eq!(cli.prefix.prefix_partial, Toggle::On);
         let cli = Cli::parse_from(["serve", "--prefix-cache-entries", "0", "--host-cache-bytes", "64GiB"]);
         assert_eq!((cli.prefix.prefix_cache_entries, cli.prefix.host_cache_bytes), (0, 64 << 30));
         assert_eq!(parse_bytes("512MiB"), Ok(512 << 20));

@@ -16,10 +16,22 @@
 //! one. The DFlash drafter (Pro) is not captured: a restored sequence drafts cold with
 //! `context_valid_from` at the restore point (drafts only steer speculation).
 //!
-//! The mark is positional, so only exact frontiers are reused (`ReuseRule::EXACT`); every copy
-//! is enqueued on the engine stream, in order with the forward passes, and `drain` synchronizes
-//! it.
-use super::engine::{MimoEngine, MimoPlacement, PAGE_ROWS, RING_ROWS};
+//! Restores are exact: the deepest retained point whose tokens prefix the request wins
+//! (`ReuseRule::EXACT`), and intermediate points (message boundaries, periodic chunk ends; see
+//! `cuteafd_engine::prefix::plan_points`) keep one close. A point may lie up to
+//! `capture_reach` rows behind the committed length: the rings still hold its window there
+//! (256 slots, minus a verify step's 64 rows that may be written past the commit point, minus
+//! the rows a mark keeps).
+//!
+//! Opt-in (`--prefix-partial on`, off by default): V4.1-style partial reuse. A partial match
+//! shares the pages below `aligned common - window`, restarts the positional state there and
+//! replays the window. The kernels have no per-sequence key floor, so "restarts" means the
+//! ring rows before the restart point are zeroed (zero keys and values: an extra zero-logit
+//! sink for the first replayed rows); approximate by design, not byte-exact.
+//!
+//! Every copy is enqueued on the engine stream, in order with the forward passes, and `drain`
+//! synchronizes it.
+use super::engine::{MimoEngine, MimoPlacement, DECODE_ROWS, PAGE_ROWS, RING_ROWS};
 use super::mtp::HIDDEN_ROWS;
 use crate::v41_memory::DeviceAllocation;
 use anyhow::{ensure, Result};
@@ -48,6 +60,7 @@ pub(crate) struct MimoPrefix<'e, 'a> {
     mark_bytes: usize,
     arena: Option<DeviceAllocation<'a>>,
     slots: usize,
+    partial: bool,
 }
 
 /// A byte range inside `buffer` (bounds-checked; pointer arithmetic only).
@@ -58,8 +71,9 @@ fn view(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<Cute
 }
 
 impl<'e, 'a> MimoPrefix<'e, 'a> {
-    /// The family over `engine`'s buffers with a device arena of `slots(mark_bytes)` marks.
-    pub fn new(engine: &'e MimoEngine<'a>, slots: impl FnOnce(usize) -> usize) -> Result<Self> {
+    /// The family over `engine`'s buffers with a device arena of `slots(mark_bytes)` marks;
+    /// `partial` opts into V4.1-style partial reuse (approximate).
+    pub fn new(engine: &'e MimoEngine<'a>, slots: impl FnOnce(usize) -> usize, partial: bool) -> Result<Self> {
         let (mut full, mut states, mut offset) = (Vec::new(), Vec::new(), 0usize);
         let window = engine.cfg.window;
         ensure!(window > 0 && window <= RING_ROWS, "SWA window {window} does not fit the {RING_ROWS}-slot ring");
@@ -82,7 +96,8 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
         }
         let slots = slots(offset);
         let arena = if slots > 0 && offset > 0 { Some(DeviceAllocation::new(engine.library, slots * offset)?) } else { None };
-        Ok(Self { engine, full, states, mark_bytes: offset, arena, slots })
+        ensure!(!partial || window % PAGE_ROWS == 0, "partial reuse replays a whole number of pages");
+        Ok(Self { engine, full, states, mark_bytes: offset, arena, slots, partial })
     }
 
     pub fn mark_bytes(&self) -> usize {
@@ -95,6 +110,18 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
 
     pub fn slots(&self) -> usize {
         if self.arena.is_some() { self.slots } else { 0 }
+    }
+
+    /// Zero every state's rows before `len` (a partial restore's empty window).
+    fn empty_window(&self, ring: usize, len: usize) -> Result<()> {
+        for state in &self.states {
+            for (ring_row, _, rows) in runs(ring, state.ring_rows, state.rows, len) {
+                let target = view(state.buffer, ring_row * state.row, rows * state.row)?;
+                // SAFETY: the view lies inside a live engine allocation; stream-ordered.
+                unsafe { self.engine.library.cuda_zero_bytes_async(target, target.bytes, self.engine.stream)? };
+            }
+        }
+        Ok(())
     }
 
     fn copy(&self, dst: CuteafdDeviceBuffer, src: CuteafdDeviceBuffer) -> Result<()> {
@@ -149,8 +176,17 @@ impl PrefixFamily for MimoPrefix<'_, '_> {
             page_bytes: self.page_bytes(),
             mark_bytes: self.mark_bytes,
             draft_bytes: 0,
-            rule: ReuseRule::EXACT,
+            rule: if self.partial {
+                ReuseRule { align: PAGE_ROWS, replay: Some(self.engine.cfg.window) }
+            } else {
+                ReuseRule::EXACT
+            },
         }
+    }
+
+    fn capture_reach(&self) -> usize {
+        let kept = self.states.iter().map(|s| s.rows).max().unwrap_or(0);
+        RING_ROWS.saturating_sub(DECODE_ROWS + kept)
     }
 
     fn pages<'p>(&self, placement: &'p MimoPlacement) -> &'p [u32] {
@@ -162,18 +198,21 @@ impl PrefixFamily for MimoPrefix<'_, '_> {
     }
 
     fn capture(&self, slot: MarkSlot, placement: &MimoPlacement, len: usize) -> Result<(), BoxError> {
-        if len > placement.len {
-            return Err(format!("capture at {len} past the committed {} rows", placement.len).into());
+        if len > placement.len || placement.len - len > self.capture_reach() {
+            return Err(format!("capture at {len} is out of reach of the committed {} rows", placement.len).into());
         }
         Ok(self.move_mark(slot, placement.ring as usize, len, true)?)
     }
 
     fn restore(&self, mark: Option<MarkSlot>, placement: &mut MimoPlacement, len: usize) -> Result<(), BoxError> {
-        let slot = mark.ok_or("MiMo restores need their positional mark")?;
         if len.div_ceil(PAGE_ROWS) > placement.pages.len() {
             return Err(format!("restore of {len} rows into {} pages", placement.pages.len()).into());
         }
-        self.move_mark(slot, placement.ring as usize, len, false)?;
+        match mark {
+            Some(slot) => self.move_mark(slot, placement.ring as usize, len, false)?,
+            None if self.partial => self.empty_window(placement.ring as usize, len)?,
+            None => return Err("MiMo restores exact snapshots with their positional mark".into()),
+        }
         placement.len = len;
         Ok(())
     }

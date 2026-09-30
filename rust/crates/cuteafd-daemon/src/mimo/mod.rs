@@ -774,7 +774,7 @@ fn resume_check(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<
     let chunk = args.prefill_chunk.unwrap_or(engine.prefill_rows).clamp(1, engine.prefill_rows);
     let row = opened.cfg.hidden * 2;
     let embed = embed_rows(&opened.checkpoint, &tokens[..n], opened.cfg.hidden)?;
-    let family = prefix::MimoPrefix::new(engine, |_| 2)?;
+    let family = prefix::MimoPrefix::new(engine, |_| 2, false)?;
     let mut allocator = engine::Allocator::new(engine.pages, engine.rings);
     // A: prefill [0, P), capture, continue in place.
     let mut a = allocator.admit(n)?;

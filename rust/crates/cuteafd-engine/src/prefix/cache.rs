@@ -41,10 +41,8 @@ pub enum PrefixError {
         #[source]
         source: BoxError,
     },
-    #[error("snapshot of {tokens} tokens, but the placement committed {committed}")]
-    Frontier { tokens: usize, committed: usize },
-    #[error("partial reuse ({rule:?}) needs a family without a positional mark ({mark_bytes} B)")]
-    Rule { rule: cuteafd_core::prefix::ReuseRule, mark_bytes: usize },
+    #[error("snapshot of {tokens} tokens, but the placement committed {committed} (reach {reach})")]
+    Frontier { tokens: usize, committed: usize, reach: usize },
     #[error("host tier: {0}")]
     Host(String),
 }
@@ -79,6 +77,9 @@ pub struct Source {
     pub frontier: usize,
     /// Promoted from the host tier by this admission.
     pub host: bool,
+    /// A partial match: the positional state restarts empty at `resume`, which lies the rule's
+    /// replay window before the aligned common prefix (approximate; exact frontiers are exact).
+    pub partial: bool,
 }
 
 /// An admitted request: its placement, the rows already in it, and the first token's source
@@ -102,6 +103,8 @@ pub struct PrefixStats {
     pub hits: u64,
     /// Hits that restored the whole prompt (first token from the snapshot's logits).
     pub exact_hits: u64,
+    /// Hits on a partial match (replay window, approximate positional state).
+    pub partial_hits: u64,
     pub hit_tokens: u64,
     pub promotions: u64,
     pub restore_failures: u64,
@@ -148,9 +151,6 @@ impl<E: CopyEngine> PrefixCache<E> {
     /// `host`: the pinned host tier's knobs and copy engine (`None`, or a zero `bytes`, keeps it off).
     pub fn new(layout: FamilyLayout, config: PrefixConfig, host: Option<(cuteafd_hostcache::config::Config, E)>)
         -> Result<Self, PrefixError> {
-        if layout.rule.partial() && layout.mark_bytes > 0 {
-            return Err(PrefixError::Rule { rule: layout.rule, mark_bytes: layout.mark_bytes });
-        }
         let host = match host {
             Some((host_config, engine)) if config.entries > 0 && host_config.enabled() => Some(
                 HostCache::with_rule(host_config, layout.host_layout(), engine, layout.rule, EvictionOrder::LeastRecent)
@@ -249,7 +249,8 @@ impl<E: CopyEngine> PrefixCache<E> {
         }
         let entry = self.entries.get(&hit.id).expect("the hit is kept while making room");
         let fork = self.pool.fork(&entry.pages, hit.resume, total)?;
-        let mark = if hit.resume == entry.len() { entry.mark } else { None };
+        let partial = hit.resume != entry.len();
+        let mark = if partial { None } else { entry.mark };
         let after = (hit.resume == tokens.len()).then(|| entry.after.clone());
         let pages = fork.pages.clone();
         let mut placement = build(fork.pages);
@@ -269,24 +270,28 @@ impl<E: CopyEngine> PrefixCache<E> {
         self.stats.hits += 1;
         self.stats.hit_tokens += hit.resume as u64;
         self.stats.exact_hits += u64::from(after.is_some());
+        self.stats.partial_hits += u64::from(partial);
         Ok(Some(Admitted {
             placement,
             resume: hit.resume,
             after,
-            source: Some(Source { kind: hit.kind, frontier: hit.frontier, host: promoted }),
+            source: Some(Source { kind: hit.kind, frontier: hit.frontier, host: promoted, partial }),
         }))
     }
 
     /// Retain `placement`'s first `tokens.len()` rows as a `kind` snapshot; `after` is what
-    /// follows them. Ok(false) when it was not retained (disabled, too short, no room).
+    /// follows them. The snapshot point may lie up to `family.capture_reach()` rows before the
+    /// placement's commit point (an intermediate point). Ok(false) when it was not retained
+    /// (disabled, too short, no room).
     pub fn capture<F: PrefixFamily>(&mut self, family: &F, kind: SnapshotKind, tokens: &[u32],
         placement: &F::Placement, mut after: After) -> Result<bool, PrefixError> {
         if !self.enabled() || tokens.len() < self.config.min_tokens.max(1) {
             return Ok(false);
         }
         let committed = family.commit_point(placement);
-        if committed != tokens.len() {
-            return Err(PrefixError::Frontier { tokens: tokens.len(), committed });
+        let reach = family.capture_reach();
+        if tokens.len() > committed || committed - tokens.len() > reach {
+            return Err(PrefixError::Frontier { tokens: tokens.len(), committed, reach });
         }
         // Replace the same snapshot, or keep the bank within its bound, before taking storage.
         if let Some(old) = self.retained.bank_mut(kind).remove_exact(tokens) {

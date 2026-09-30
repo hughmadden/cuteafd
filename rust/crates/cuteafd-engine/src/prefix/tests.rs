@@ -11,6 +11,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
+use super::points::{plan as plan_points, PointPolicy};
 
 const ROWS: usize = 4; // page rows
 const RING: usize = 16; // ring slots per sequence
@@ -68,6 +69,8 @@ struct Placement {
     pages: Vec<u32>,
     ring: usize,
     len: usize,
+    /// First position the ring holds for this sequence (a partial restore starts it empty).
+    ring_from: usize,
 }
 
 enum Op {
@@ -82,17 +85,19 @@ struct Fake {
     queue: RefCell<Vec<Op>>,
     fail_restore: Cell<bool>,
     drains: Cell<usize>,
+    rule: ReuseRule,
 }
 
 impl Fake {
     fn new(pages: usize, rings: usize, slots: usize) -> Self {
         let bytes = (pages * ROWS + rings * RING + slots * WINDOW) * ROW;
         let mem = Rc::new(RefCell::new(StubCopyEngine::new(CopyModel::default(), bytes, 1 << 26)));
-        Self { mem, pages, rings, slots, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), drains: Cell::new(0) }
+        Self { mem, pages, rings, slots, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), drains: Cell::new(0),
+            rule: ReuseRule::EXACT }
     }
     fn layout(&self) -> FamilyLayout {
         FamilyLayout { page_rows: ROWS, pages: self.pages, page_bytes: ROWS * ROW, mark_bytes: WINDOW * ROW,
-            draft_bytes: 0, rule: ReuseRule::EXACT }
+            draft_bytes: 0, rule: self.rule }
     }
     fn page_row(&self, page: u32, row: usize) -> DeviceRange {
         DeviceRange { addr: ((page as usize * ROWS + row) * ROW) as u64, bytes: ROW }
@@ -122,7 +127,7 @@ impl Fake {
                 return Err(format!("page row {r} differs"));
             }
         }
-        for r in p.len.saturating_sub(WINDOW)..p.len {
+        for r in p.len.saturating_sub(WINDOW).max(p.ring_from)..p.len {
             if mem.read_device(self.ring_row(p.ring, r)) != value(2, &tokens[..=r]) {
                 return Err(format!("ring row {r} differs"));
             }
@@ -149,7 +154,13 @@ impl PrefixFamily for Fake {
     fn commit_point(&self, placement: &Placement) -> usize {
         placement.len
     }
+    fn capture_reach(&self) -> usize {
+        RING - WINDOW
+    }
     fn capture(&self, slot: MarkSlot, p: &Placement, len: usize) -> Result<(), BoxError> {
+        if len > p.len || p.len - len > RING - WINDOW || len.saturating_sub(WINDOW) < p.ring_from.min(len) {
+            return Err(format!("capture at {len} of {} is out of reach", p.len).into());
+        }
         let first = len.saturating_sub(WINDOW);
         for (i, r) in (first..len).enumerate() {
             self.queue.borrow_mut().push(Op::Copy(self.ring_row(p.ring, r), self.slot_row(slot, i)));
@@ -160,7 +171,12 @@ impl PrefixFamily for Fake {
         if self.fail_restore.get() {
             return Err("injected restore failure".into());
         }
-        let slot = mark.ok_or("fake family always has a mark")?;
+        let Some(slot) = mark else {
+            // Partial hit: the ring starts empty here and the replayed rows rebuild it.
+            p.len = len;
+            p.ring_from = len;
+            return Ok(());
+        };
         let first = len.saturating_sub(WINDOW);
         for (i, r) in (first..len).enumerate() {
             self.queue.borrow_mut().push(Op::Copy(self.slot_row(slot, i), self.ring_row(p.ring, r)));
@@ -200,7 +216,7 @@ fn cache(fake: &Fake, entries: usize, host_bytes: u64) -> PrefixCache<Shared> {
 /// "decode" `generated` tokens and capture a turn. Returns (resume, final tokens, placement).
 fn serve(cache: &mut PrefixCache<Shared>, fake: &Fake, ring: usize, prompt: &[u32], generated: &[u32],
     capacity: usize) -> (usize, Vec<u32>, Placement) {
-    let admitted = cache.admit(fake, prompt, capacity, false, |pages| Placement { pages, ring, len: 0 }).unwrap();
+    let admitted = cache.admit(fake, prompt, capacity, false, |pages| Placement { pages, ring, len: 0, ring_from: 0 }).unwrap();
     let mut placement = admitted.placement;
     assert_eq!(placement.len, admitted.resume);
     let logits = if admitted.resume == prompt.len() {
@@ -285,7 +301,7 @@ fn a_parked_prefill_without_logits_gives_way_to_a_shorter_snapshot() {
     let prompt = seq(100, 40);
     let (_, _, a) = serve(&mut cache, &fake, 0, &prompt[..20], &[], 64);
     // A prefill of the whole prompt is cancelled at a chunk boundary (32 rows): parked.
-    let mut admitted = cache.admit(&fake, &prompt, 64, false, |pages| Placement { pages, ring: 1, len: 0 }).unwrap();
+    let mut admitted = cache.admit(&fake, &prompt, 64, false, |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
     assert_eq!(admitted.resume, 20);
     fake.forward(&mut admitted.placement, &prompt[..32]).unwrap();
     assert!(cache.park(&fake, &prompt[..32], &admitted.placement).unwrap());
@@ -295,7 +311,7 @@ fn a_parked_prefill_without_logits_gives_way_to_a_shorter_snapshot() {
     assert_eq!(resume, 32);
     // A request of exactly the parked tokens cannot take its first token from the parked
     // snapshot (no logits), so it resumes from the 20-token prompt snapshot instead.
-    let admitted = cache.admit(&fake, &prompt[..32], 64, false, |pages| Placement { pages, ring: 2, len: 0 }).unwrap();
+    let admitted = cache.admit(&fake, &prompt[..32], 64, false, |pages| Placement { pages, ring: 2, len: 0, ring_from: 0 }).unwrap();
     assert_eq!((admitted.resume, admitted.after.is_none()), (20, true));
     assert_eq!(cache.stats().parked, 1);
     for pages in [a.pages, b.pages, admitted.placement.pages] {
@@ -363,7 +379,7 @@ fn a_failed_restore_is_a_miss_and_holds_nothing() {
     let (_, _, a) = serve(&mut cache, &fake, 0, &seq(100, 20), &[], 20);
     cache.release(&fake, &a.pages).unwrap();
     fake.fail_restore.set(true);
-    let admitted = cache.admit(&fake, &seq(100, 21), 24, false, |pages| Placement { pages, ring: 1, len: 0 }).unwrap();
+    let admitted = cache.admit(&fake, &seq(100, 21), 24, false, |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }).unwrap();
     fake.fail_restore.set(false);
     assert_eq!((admitted.resume, cache.stats().restore_failures), (0, 1));
     cache.release(&fake, &admitted.placement.pages).unwrap();
@@ -378,7 +394,7 @@ fn disabled_cache_is_a_plain_allocator() {
     let (resume, _, a) = serve(&mut cache, &fake, 0, &seq(1, 20), &[], 20);
     let (resume2, _, b) = serve(&mut cache, &fake, 1, &seq(1, 11), &[], 12);
     assert_eq!((resume, resume2), (0, 0));
-    assert!(cache.admit(&fake, &seq(1, 4), 4, false, |pages| Placement { pages, ring: 0, len: 0 }).is_err());
+    assert!(cache.admit(&fake, &seq(1, 4), 4, false, |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).is_err());
     cache.release(&fake, &a.pages).unwrap();
     cache.release(&fake, &b.pages).unwrap();
     assert_eq!((cache.pool().free(), cache.stats().captures_prompt), (8, 0));
@@ -460,5 +476,118 @@ fn torture_interleaved_conversations_stay_exact_and_leak_nothing() {
         assert_eq!(stats.marks_in_use, stats.entries_prompt + stats.entries_turn, "{stats:?}");
         cache.clear(&fake).unwrap();
         assert_eq!((cache.pool().free(), cache.arena().in_use()), (40, 0), "{stats:?}");
+    }
+}
+
+/// Prefill `prompt` from `resume` in `plan`'s chunks, capturing its intermediate points (the way
+/// serve-mimo does), then the prompt-end snapshot.
+fn serve_with_points(cache: &mut PrefixCache<Shared>, fake: &Fake, ring: usize, prompt: &[u32], boundaries: &[usize],
+    policy: PointPolicy) -> (usize, Placement) {
+    let admitted = cache.admit(fake, prompt, prompt.len() + 4, false,
+        |pages| Placement { pages, ring, len: 0, ring_from: 0 }).unwrap();
+    let mut placement = admitted.placement;
+    let resume = admitted.resume;
+    if resume == prompt.len() {
+        return (resume, placement);
+    }
+    let plan = plan_points(resume, prompt.len(), 5, boundaries, fake.capture_reach(), 1, policy);
+    for (index, &end) in plan.chunks.iter().enumerate() {
+        fake.forward(&mut placement, &prompt[..end]).unwrap();
+        for &(_, point) in plan.points.iter().filter(|&&(chunk, _)| chunk == index) {
+            assert!(cache.capture(fake, SnapshotKind::Prompt, &prompt[..point], &placement, After::default()).unwrap());
+        }
+    }
+    let logits = fake.forward(&mut placement, prompt).unwrap();
+    cache.capture(fake, SnapshotKind::Prompt, prompt, &placement, After::from_logits(&logits, true)).unwrap();
+    (resume, placement)
+}
+
+#[test]
+fn divergent_suffixes_restore_exactly_from_the_deepest_shared_point() {
+    let fake = Fake::new(128, 4, 16);
+    let mut cache = cache(&fake, 16, 0);
+    // Messages start at 0, 12, 23 and 37; the prompt is 40 tokens (chunks of 5 rows).
+    let prompt = seq(100, 40);
+    let policy = PointPolicy { gap: 10, boundaries: 2, per_request: 4 };
+    let (resume, a) = serve_with_points(&mut cache, &fake, 0, &prompt, &[0, 12, 23, 37], policy);
+    assert_eq!(resume, 0);
+    // Periodic 10, 20, 30 and boundaries 23, 37: the cap keeps the four deepest (20, 23, 30,
+    // 37), plus the prompt-end snapshot.
+    assert_eq!(cache.stats().captures_prompt, 5);
+    cache.release(&fake, &a.pages).unwrap();
+    for (diverge, expected) in [(38, 37), (36, 30), (29, 23), (22, 20), (15, 0), (7, 0)] {
+        let mut other = prompt[..diverge].to_vec();
+        other.extend(seq(9000 + diverge as u32 * 10, 6));
+        let (resume, mut b) = serve_with_points(&mut cache, &fake, 1, &other, &[], PointPolicy { gap: 0, boundaries: 0,
+            per_request: 0 });
+        assert_eq!(resume, expected, "diverging at {diverge}");
+        // Every context row (pages and ring) of the continuation is exact.
+        let mut longer = other.clone();
+        longer.push(1);
+        fake.forward(&mut b, &longer).unwrap();
+        cache.release(&fake, &b.pages).unwrap();
+    }
+    // A point more than the family's reach behind the commit point is refused, not approximated.
+    let admitted = cache.admit(&fake, &seq(5000, 30), 30, false,
+        |pages| Placement { pages, ring: 2, len: 0, ring_from: 0 }).unwrap();
+    let mut p = admitted.placement;
+    fake.forward(&mut p, &seq(5000, 30)).unwrap();
+    assert!(matches!(cache.capture(&fake, SnapshotKind::Prompt, &seq(5000, 21), &p, After::default()),
+        Err(PrefixError::Frontier { tokens: 21, committed: 30, reach: 8 })));
+    assert!(cache.capture(&fake, SnapshotKind::Prompt, &seq(5000, 22), &p, After::default()).unwrap());
+    cache.release(&fake, &p.pages).unwrap();
+    cache.clear(&fake).unwrap();
+    assert_eq!(cache.pool().free(), 128);
+}
+
+/// Opt-in partial reuse (`PREFIX_PARTIAL=on`): a partial match shares pages below the replay
+/// window and restarts the positional state there; the page rows it shares stay exact and the
+/// snapshot it came from is untouched (its later exact restore still checks every row).
+#[test]
+fn opt_in_partial_reuse_replays_the_window_without_touching_shared_pages() {
+    let mut fake = Fake::new(64, 4, 8);
+    fake.rule = ReuseRule { align: ROWS, replay: Some(WINDOW) };
+    let mut cache = cache(&fake, 4, 0);
+    let prompt = seq(100, 30);
+    let (_, _, a) = serve(&mut cache, &fake, 0, &prompt, &[], 30);
+    cache.release(&fake, &a.pages).unwrap();
+    let mut other = prompt[..27].to_vec();
+    other.extend(seq(900, 5));
+    let (resume, _, b) = serve(&mut cache, &fake, 1, &other, &[], 40);
+    assert_eq!(resume, 24 - WINDOW);
+    assert_eq!(cache.stats().partial_hits, 1);
+    cache.release(&fake, &b.pages).unwrap();
+    let mut longer = prompt.clone();
+    longer.push(5);
+    let (resume, _, c) = serve(&mut cache, &fake, 2, &longer, &[], 40);
+    assert_eq!((resume, cache.stats().partial_hits), (30, 1), "an exact ancestor saves more");
+    cache.release(&fake, &c.pages).unwrap();
+}
+
+/// Agentic sessions: every turn leaves a prompt-end and a turn-end snapshot, so a session that
+/// forks from any earlier turn (a retry, a subagent, an edited later message) restores the
+/// deepest turn it still shares, byte-exactly, and prefills only its own suffix.
+#[test]
+fn sessions_fork_from_the_deepest_earlier_turn() {
+    let fake = Fake::new(160, 4, 16);
+    let mut cache = cache(&fake, 8, 0);
+    let mut conversation = seq(100, 20);
+    let mut turn_ends = Vec::new();
+    for turn in 0..3u32 {
+        let (_, tokens, p) = serve(&mut cache, &fake, 0, &conversation, &seq(1000 * (turn + 1), 7), 64);
+        cache.release(&fake, &p.pages).unwrap();
+        turn_ends.push(tokens.len());
+        conversation = tokens;
+        conversation.extend(seq(5000 + turn * 10, 5)); // tool result / next user message
+    }
+    for (turn, &end) in turn_ends.iter().enumerate() {
+        let mut fork = conversation[..end].to_vec();
+        fork.extend(seq(7000 + turn as u32 * 10, 6));
+        let (resume, _, mut p) = serve(&mut cache, &fake, 1, &fork, &[], 64);
+        assert_eq!(resume, end, "fork after turn {turn}");
+        let mut longer = fork.clone();
+        longer.push(3);
+        fake.forward(&mut p, &longer).unwrap();
+        cache.release(&fake, &p.pages).unwrap();
     }
 }

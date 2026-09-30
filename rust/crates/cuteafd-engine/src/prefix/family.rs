@@ -24,7 +24,10 @@ pub struct FamilyLayout {
     /// Bytes of drafter state kept with a snapshot (0: drafters restore cold, masked by
     /// `context_valid_from`).
     pub draft_bytes: usize,
-    /// How partial matches are reused; a positional mark allows exact frontiers only.
+    /// How partial matches are reused. Exact frontiers restore the mark byte-exactly; a partial
+    /// rule (`align > 0`) resumes at `common` rounded down to `align` minus `replay` rows, with
+    /// no mark: the family starts its positional state empty there and the prefill of the
+    /// replayed rows rebuilds it approximately (V4.1-style).
     pub rule: ReuseRule,
 }
 
@@ -48,11 +51,19 @@ pub trait PrefixFamily {
     /// Committed rows: the length a snapshot of this placement may capture (a speculative
     /// family reports the rows its state is consistent at, not rows still being verified).
     fn commit_point(&self, placement: &Self::Placement) -> usize;
-    /// Copy the positional state of `placement` at `len` into `slot`.
+    /// How far behind its commit point a snapshot of `placement` can still be captured exactly
+    /// (MiMo: its 256-slot rings still hold the window of any position up to 124 rows back;
+    /// recurrent state: 0).
+    fn capture_reach(&self) -> usize {
+        0
+    }
+    /// Copy the positional state of `placement` at `len` (at most `capture_reach` rows before
+    /// its commit point) into `slot`.
     fn capture(&self, slot: MarkSlot, placement: &Self::Placement, len: usize) -> Result<(), BoxError>;
-    /// Make `placement` continue at `len`: copy `mark` back into its own positional state (none
-    /// for a mark-less family) and set its length. Touches tables and buffers only, never graph
-    /// shapes or workspaces.
+    /// Make `placement` continue at `len`: copy `mark` back into its own positional state and
+    /// set its length. `None` is a partial hit (or a mark-less family): start the positional
+    /// state empty at `len`; the caller prefills from `len`, replaying the rule's window.
+    /// Touches tables and buffers only, never graph shapes or workspaces.
     fn restore(&self, mark: Option<MarkSlot>, placement: &mut Self::Placement, len: usize) -> Result<(), BoxError>;
     /// Copy rows `[0, copy.rows)` of every paged buffer from page `copy.from` to page `copy.to`.
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError>;
