@@ -88,8 +88,9 @@ def agentic_session(arm: str, rtx: int, ready_s: float, out: Path, log: Path, py
     """Replay the recording (warm-up pass discarded, then --repeats measured passes)."""
     bench = [py, str(REPO / "scripts/bench-agentic-session.py"), "replay", "--recording", str(args.agentic_recording),
              "--base-url", args.base_url, "--concurrency", *map(str, args.concurrency), *args.agentic_arg]
+    # The warm-up only warms the path (connections, workspaces): 64 tokens per turn.
     run([*bench, "--label", f"ab-{args.nonce_seed}-warmup", "--concurrency", "1", "--repeats", "1",
-         "--output", str(out / "agentic-warmup.json")], log=log, timeout=6 * 3600)
+         "--max-tokens", "64", "--output", str(out / "agentic-warmup.json")], log=log, timeout=6 * 3600)
     run([*bench, "--label", f"ab-{args.nonce_seed}", "--repeats", str(args.repeats),
          "--output", str(out / "agentic.json")], log=log, timeout=24 * 3600)
     summary = json.loads((out / "agentic.json").read_text())["summary"]

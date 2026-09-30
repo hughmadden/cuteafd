@@ -14,6 +14,11 @@ it do. Contexts grow from ~8K to 60-100K tokens.
           tests pass at the end.
   replay  Sends the recorded histories turn by turn, so every arm sees identical prompts
           (timing only; the generated text is scored for tool-call validity but not fed back).
+          A turn snapshot is reused only when the server regenerates the recorded completion
+          token for token; speculative verify widths and suffix-prefill chunk boundaries flip
+          greedy near-ties, so replay usually measures the prompt-snapshot regime (hits up to
+          the previous prompt) and understates a prefix cache. Record mode (the live loop) is the
+          real agent flow: compare a cache-on and a cache-off record run for session times.
   summary Prints the per-concurrency table of one or more result files.
 
 Per turn: TTFT (first reasoning, content or tool-call delta; scripts/tests/
