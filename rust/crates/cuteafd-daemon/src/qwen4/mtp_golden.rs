@@ -226,7 +226,7 @@ pub(super) fn spec_decode(args: &GoldenArgs, opened: &Opened, engine: &Qwen4Engi
     let pos = placement.len;
     let sample: Vec<u32> = out.iter().copied().cycle().take(DECODE_ROWS).collect();
     let mut line = String::from("  verify step (spec) ms by rows:");
-    for rows in [1usize, 2, 3, 4, 5, 6, 8, 12, 16, 24, 32, 48, 64] {
+    for rows in (1..=33).chain([40, 48, 56, 64]) {
         let tokens = &sample[..rows];
         let mut times = Vec::new();
         for _ in 0..7 {

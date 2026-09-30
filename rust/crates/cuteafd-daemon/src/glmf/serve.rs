@@ -14,7 +14,7 @@
 //! MLA records past the kept length are rewritten by later steps.
 use super::engine::{Allocator, GlmfEngine, GlmfPlacement, DECODE_ROWS};
 use crate::glm::dflash::{ContextRow, Draft, DraftSeq, TAP_ROWS};
-use crate::glm::dflash_policy::{self, DraftHistory, StepCost};
+use crate::glm::dflash_policy::{self, DraftHistory, Shape};
 use super::{embed_rows, open, Opened};
 use anyhow::{Context, Result};
 use cuteafd_api::native_v41::glm::GlmEncoding;
@@ -237,7 +237,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
-    let mut cost = StepCost::new(&GLMF_TP2_STEP_MS, DECODE_ROWS);
+    let mut cost = dflash_policy::step_cost(&GLMF_TP2_STEP_MS, DECODE_ROWS);
     let mut skip = dflash_policy::DraftSkip::default();
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
@@ -431,7 +431,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 continue;
             }
         };
-        cost.observe(tokens.len(), distinct_rows, step_ms);
+        cost.observe_verify(Shape { rows: tokens.len(), distinct: distinct_rows, sequences: sequences.len() }, step_ms);
         let timer = Instant::now();
         let mut offset = 0;
         let mut context = Vec::new();
@@ -525,6 +525,6 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
 /// GLM 5.3 Flash, 1 RTX PRO 6000 (325 W) + Spark TP2 (rhea, moa), recommended
 /// FP8 decode config: speculative verify step ms by rows of one sequence
 /// (glmf-golden --bench-verify 16 after 512 tokens, median of 7); past 16
-/// rows extrapolated at the 12-16 slope (serving rescales it as it observes).
+/// rows extrapolated at the 12-16 slope (serving refits intercept and slope).
 const GLMF_TP2_STEP_MS: [(usize, f64); 15] = [(1, 19.1), (2, 26.0), (3, 30.2), (4, 35.2), (5, 40.1), (6, 43.5),
     (7, 48.7), (8, 53.8), (10, 60.7), (12, 67.4), (16, 80.2), (24, 106.0), (32, 132.0), (48, 183.0), (64, 234.0)];

@@ -5,7 +5,7 @@
 //! adaptive policy (glm/dflash_policy.rs) prices worthwhile; copy-window
 //! drafts extend a DFlash2 draft they agree with.
 use super::dflash::{ContextRow, DraftSeq, TAP_ROWS};
-use super::dflash_policy::{self, DraftHistory, StepCost};
+use super::dflash_policy::{self, DraftHistory, Shape};
 use super::engine::{GlmEngine, GlmPlacement, PageAllocator, DECODE_ROWS};
 
 /// Most copy-window draft tokens verified per sequence and step.
@@ -265,7 +265,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(&opened.snapshot)?;
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
-    let mut cost = StepCost::new(&dflash_policy::K4_TP4_STEP_MS, DECODE_ROWS);
+    let mut cost = dflash_policy::step_cost(&dflash_policy::K4_TP4_STEP_MS, DECODE_ROWS);
     let mut skip = dflash_policy::DraftSkip::default();
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total, mut admitted_total) = (0u64, 0u64, 0u64);
@@ -466,7 +466,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             }
         };
         let verify_ms = timer.elapsed().as_secs_f64() * 1e3;
-        cost.observe(tokens.len(), distinct_rows, verify_ms);
+        cost.observe_verify(Shape { rows: tokens.len(), distinct: distinct_rows, sequences: sequences.len() }, verify_ms);
         phases[3] += verify_ms / 1e3;
         phases[6] += 1.0;
         phases[7] += tokens.len() as f64;
