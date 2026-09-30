@@ -53,7 +53,7 @@ foreach(role IN LISTS CUTEAFD_V41_NVFP4_ROLES)
     COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
     COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
       "${Python3_EXECUTABLE}"
-      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/export_b12x_v41_nvfp4_aot.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_nvfp4_aot.py"
       --output-dir "${nvfp4_dir}" --role "${role}"
       --rows "${CUTEAFD_V41_NVFP4_CAPACITY_ARG}"
       --tile-m "${CUTEAFD_V41_NVFP4_TILE_M}"
@@ -64,7 +64,7 @@ foreach(role IN LISTS CUTEAFD_V41_NVFP4_ROLES)
       "${nvfp4_dir}/v41_expert_variants.h"
       "${nvfp4_dir}/v41_nvfp4_${role}_variants.h"
     DEPENDS
-      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/export_b12x_v41_nvfp4_aot.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_nvfp4_aot.py"
       ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
     COMMENT "Exporting NVFP4 ${role} expert kernels"
     VERBATIM

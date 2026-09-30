@@ -37,9 +37,9 @@ add_custom_command(
   COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
   COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV} ${CUTEAFD_HC_LAGGED_ENV} ${CUTEAFD_NARROW_ENV}
     "${Python3_EXECUTABLE}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/export_b12x_v41_fp8_aot.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_fp8_aot.py"
     --output-dir "${CUTEAFD_V41_FP8_DIR}"
-  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/export_b12x_v41_fp8_aot.py"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_fp8_aot.py"
     ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
   COMMENT "Exporting native V4.1 K32 quantization and FP8 projections"
   VERBATIM
@@ -56,9 +56,9 @@ add_custom_command(
   OUTPUT "${CUTEAFD_V41_INDEX_DIR}/v41_index_score.json" "${CUTEAFD_V41_INDEX_DIR}/v41_index_score.h" "${CUTEAFD_V41_INDEX_DIR}/v41_index_score.o"
   COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
   COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
-    "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/export_b12x_v41_index_aot.py"
+    "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_index_aot.py"
     --output-dir "${CUTEAFD_V41_INDEX_DIR}"
-  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/export_b12x_v41_index_aot.py"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_index_aot.py"
     ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
   VERBATIM)
 add_custom_target(cuteafd_v41_index_export DEPENDS "${CUTEAFD_V41_INDEX_DIR}/v41_index_score.json")

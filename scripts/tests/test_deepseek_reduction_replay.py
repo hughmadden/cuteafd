@@ -9,7 +9,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOLS = ROOT / "python" / "tools"
-sys.path.insert(0, str(TOOLS))
+sys.path[:0] = [str(TOOLS / d) for d in ("lib", "aot", "bench", "hf", "qualify/deepseek_v4", "qualify/deepseek_v41", "qualify/glm5_flash")]
 
 import analyze_expert_reduction_replay as analyze  # noqa: E402
 import collect_expert_route_bank as collect  # noqa: E402

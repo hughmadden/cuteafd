@@ -106,7 +106,8 @@ def run_width_override_scenario() -> dict:
         wrappers = src / "families" / "deepseek_v41" / "src"
         wrappers.mkdir(parents=True)
         tools = tmp / "python" / "tools"
-        tools.mkdir(parents=True)
+        (tools / "aot").mkdir(parents=True)
+        (tools / "lib").mkdir(parents=True)
         (src / "CMakeLists.txt").write_text(
             _TOY_CMAKE.replace("__PYTHON__", str(sys.executable)).replace(
                 "__CMAKE_FILE__", str(CMAKE_FILE)
@@ -115,16 +116,16 @@ def run_width_override_scenario() -> dict:
         )
         for wrapper in ("v41_spark_tp2_experts.cc", "v41_spark_tp3_experts.cc"):
             (wrappers / wrapper).write_text("// stub\n", encoding="utf-8")
-        (tools / "export_b12x_v41_slices_aot.py").write_text(
+        (tools / "aot" / "export_b12x_v41_slices_aot.py").write_text(
             _STUB_EXPORTER, encoding="utf-8"
         )
-        (tools / "export_b12x_v41_experts_aot.py").write_text(
+        (tools / "aot" / "export_b12x_v41_experts_aot.py").write_text(
             "# stub\n", encoding="utf-8"
         )
         # The real CMake export command depends on the shared TP3 launch-geometry
         # module the slices exporter imports; the toy fixture must provide it or
         # Make fails on a missing prerequisite.
-        (tools / "v41_spark_tp3_launch_geometry.py").write_text(
+        (tools / "lib" / "v41_spark_tp3_launch_geometry.py").write_text(
             "# stub\n", encoding="utf-8"
         )
         build = tmp / "build"

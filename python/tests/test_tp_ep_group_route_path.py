@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-HARNESS = ROOT / "python" / "tools" / "bench_tp_ep_kernel.py"
+HARNESS = ROOT / "python" / "tools" / "bench" / "bench_tp_ep_kernel.py"
 # The consolidator lives under the gitignored `runs/` tree: absent on a clean
 # checkout. Load it lazily so the harness route checks still run and only the
 # consolidator-dependent tests skip. The env override validates absence without

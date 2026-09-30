@@ -19,7 +19,7 @@ set(CUTEAFD_FP8_MOE_CAPACITIES "1,16,80,256,1024,4096" CACHE STRING "FP8 expert 
 set(CUTEAFD_FP8_MOE_BF16_FAMILIES "" CACHE STRING
   "FP8 expert families (mimo;glm;...) that also get a BF16-input Spark package")
 list(GET CUDAToolkit_INCLUDE_DIRS 0 CUTEAFD_FP8_MOE_CUDA_INCLUDE)
-set(CUTEAFD_FP8_MOE_TOOL "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/package_fp8_moe_aot.py")
+set(CUTEAFD_FP8_MOE_TOOL "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/package_fp8_moe_aot.py")
 set(CUTEAFD_FP8_MOE_MANIFESTS)
 foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
   if(NOT entry MATCHES ":fp8$")

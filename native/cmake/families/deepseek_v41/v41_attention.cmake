@@ -8,9 +8,9 @@ add_custom_command(
     "${CUTEAFD_V41_ATTENTION_DIR}/v41_attention.h" "${CUTEAFD_V41_ATTENTION_DIR}/v41_attention.o"
   COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
   COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
-    "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/export_b12x_v41_attention_aot.py"
+    "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_attention_aot.py"
     --output-dir "${CUTEAFD_V41_ATTENTION_DIR}"
-  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/export_b12x_v41_attention_aot.py"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_attention_aot.py"
     ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
   COMMENT "Exporting direct V4.1 FP4 attention and sink merge"
   VERBATIM)
@@ -27,9 +27,9 @@ add_custom_command(
     "${CUTEAFD_V41_ATTENTION_DIR}/v41_attention_heads32.h" "${CUTEAFD_V41_ATTENTION_DIR}/v41_attention_heads32.o"
   COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
   COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
-    "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/export_b12x_v41_attention_aot.py"
+    "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_attention_aot.py"
     --output-dir "${CUTEAFD_V41_ATTENTION_DIR}" --heads 32
-  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/export_b12x_v41_attention_aot.py"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_attention_aot.py"
     ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
   COMMENT "Exporting 32-head direct V4.1 FP4 attention and sink merge"
   VERBATIM)

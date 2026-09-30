@@ -23,7 +23,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-HARNESS = ROOT / "python" / "tools" / "bench_tp_ep_kernel.py"
+HARNESS = ROOT / "python" / "tools" / "bench" / "bench_tp_ep_kernel.py"
 # The schedule generator and manifest live under the gitignored `runs/` tree, so
 # on a clean checkout they are absent. Loading them lazily and skipping only the
 # artifact-dependent tests keeps collection (and the harness-loader tests) working.

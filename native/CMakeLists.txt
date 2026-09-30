@@ -185,7 +185,7 @@ if(CUTEAFD_BUILD_SPARKINFER_AOT)
   set(CUTEAFD_SPARKINFER_VERIFY_SCRIPT
     "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/verify-sparkinfer-source.py")
   set(CUTEAFD_SPARKINFER_PYTHON_BOOTSTRAP
-    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/_pinned_sparkinfer.py")
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/_pinned_sparkinfer.py")
   if(NOT EXISTS "${CUTEAFD_SPARKINFER_VERIFY_SCRIPT}")
     message(FATAL_ERROR
       "SparkInfer source verifier was not found: ${CUTEAFD_SPARKINFER_VERIFY_SCRIPT}")

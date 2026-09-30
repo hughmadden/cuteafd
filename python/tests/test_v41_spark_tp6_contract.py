@@ -16,11 +16,11 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-SLICES = ROOT / "python" / "tools" / "export_b12x_v41_slices_aot.py"
-EXPERTS_EXPORTER = ROOT / "python" / "tools" / "export_b12x_v41_experts_aot.py"
-NATIVE_HELPER = ROOT / "python" / "tools" / "_v41_expert_native.py"
+SLICES = ROOT / "python" / "tools" / "aot" / "export_b12x_v41_slices_aot.py"
+EXPERTS_EXPORTER = ROOT / "python" / "tools" / "aot" / "export_b12x_v41_experts_aot.py"
+NATIVE_HELPER = ROOT / "python" / "tools" / "lib" / "_v41_expert_native.py"
 TOOLS = ROOT / "python" / "tools"
-QUALIFIER = ROOT / "python" / "tools" / "qualify_v41_replicated_native.py"
+QUALIFIER = ROOT / "python" / "tools" / "qualify" / "deepseek_v41" / "qualify_v41_replicated_native.py"
 WIP = ROOT / "wip.sh"
 CMAKE = ROOT / "native" / "CMakeLists.txt"
 CMAKE_TP = ROOT / "native" / "cmake" / "families" / "deepseek_v41" / "v41_spark_tp_experts.cmake"
@@ -299,7 +299,7 @@ def _oracle_qweight_to_w4a8_rp(q, size_n: int, size_k: int):
 def _load_b12x_repack():
     """The real repack entry points; skip only when the pinned tree is absent."""
     if str(TOOLS) not in sys.path:
-        sys.path.insert(0, str(TOOLS))
+        sys.path[:0] = [str(TOOLS / d) for d in ("lib", "aot", "bench", "hf", "qualify/deepseek_v4", "qualify/deepseek_v41", "qualify/glm5_flash")]
     try:
         import _pinned_sparkinfer  # noqa: F401
         from b12x.moe.fused_moe._impl import (
@@ -529,7 +529,7 @@ def test_storage_padding_is_limited_to_the_tp4_shard() -> None:
 
 def _load_qualifier(torch):
     if str(TOOLS) not in sys.path:
-        sys.path.insert(0, str(TOOLS))
+        sys.path[:0] = [str(TOOLS / d) for d in ("lib", "aot", "bench", "hf", "qualify/deepseek_v4", "qualify/deepseek_v41", "qualify/glm5_flash")]
     import importlib.util as _u
 
     spec = _u.spec_from_file_location("cuteafd_tp6_qualifier", QUALIFIER)

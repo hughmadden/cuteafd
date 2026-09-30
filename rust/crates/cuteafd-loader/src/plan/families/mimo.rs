@@ -167,7 +167,7 @@ impl Family for MiMo {
                         even element low nibble, UE8M0 U8 [N, K/32]): H {h}, I {i}, {e} experts"),
                     how: format!("Exact family `mimop:fp8` (b12x fp8_moe weights=mxfp4: E2M1 x 2^(s-127) widened \
                         to BF16, BF16 MMA; packages fp8-mimop tp1 coordinator, tp6/tp2 Spark, \
-                        python/tools/package_fp8_moe_aot.py --geometry mimop [--cross-sm121]). Spark layout TP6 \
+                        python/tools/aot/package_fp8_moe_aot.py --geometry mimop [--cross-sm121]). Spark layout TP6 \
                         over six ranks: whole 32-blocks per rank ({widest}/{} rows) zero-padded to {padded}, \
                         {:.1} GiB per rank (TP2xEP3: {:.1} GiB, but a decode step reads all of a row's experts \
                         that land on one EP group). Missing: an MXFP4 streaming/TMA GEMM route for large \

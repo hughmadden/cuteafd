@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-HARNESS = ROOT / "python" / "tools" / "bench_tp_ep_kernel.py"
+HARNESS = ROOT / "python" / "tools" / "bench" / "bench_tp_ep_kernel.py"
 
 
 def _load():
@@ -123,8 +123,8 @@ def test_no_duplicate_top_level_definitions():
     import collections
 
     files = [
-        ROOT / "python" / "tools" / "bench_tp_ep_kernel.py",
-        ROOT / "python" / "tools" / "benchmark_v41_ep_groups.py",
+        ROOT / "python" / "tools" / "bench" / "bench_tp_ep_kernel.py",
+        ROOT / "python" / "tools" / "bench" / "benchmark_v41_ep_groups.py",
         ROOT / "python" / "tests" / "test_v41_sentinel_masking.py",
         ROOT / "python" / "tests" / "test_v41_ep_algebra.py",
         ROOT / "python" / "tests" / "test_tp_ep_cost_model.py",

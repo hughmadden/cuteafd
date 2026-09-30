@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOLS = ROOT / 'python' / 'tools'
+TOOL_DIR = {'bench_v41_exl3_tiles.py': 'bench', 'qualify_v41_exl3_aot.py': 'qualify/deepseek_v41'}
 TARGET = 'wrldsuksgo2mars/DeepSeek-V4.1-EXL3-K3.25-v1'
 
 def load_harness():
@@ -32,7 +33,7 @@ def load_harness():
     pinned.VERSION = '0.0.0'
     pinned.LOCK_DATA = {'source_tree_sha256': 'tree', 'revision': 'pinned-for-tests'}
     spec = importlib.util.spec_from_file_location(
-        'bench_v41_exl3_tiles', TOOLS / 'bench_v41_exl3_tiles.py')
+        'bench_v41_exl3_tiles', TOOLS / 'bench' / 'bench_v41_exl3_tiles.py')
     with patch.dict(sys.modules, {'_pinned_sparkinfer': pinned}):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -418,7 +419,7 @@ class GateTests(unittest.TestCase):
         self.assertFalse(harness.oracle_gate_passed([{'passed': True}, {'passed': False}]))
 
 class NonPolicyContractTests(unittest.TestCase):
-    SOURCE = (TOOLS / 'bench_v41_exl3_tiles.py').read_text()
+    SOURCE = (TOOLS / 'bench' / 'bench_v41_exl3_tiles.py').read_text()
 
     def test_top_level_imports_stay_cpu_only(self):
         import ast
@@ -468,7 +469,7 @@ class SharedFamilyRuleTests(unittest.TestCase):
             pinned.REVISION = 'pinned-for-tests'
             pinned.VERSION = '0.0.0'
             pinned.LOCK_DATA = {}
-            spec = importlib.util.spec_from_file_location(module_name, TOOLS / filename)
+            spec = importlib.util.spec_from_file_location(module_name, TOOLS / TOOL_DIR[filename] / filename)
             with patch.dict(sys.modules, {'_pinned_sparkinfer': pinned}):
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
@@ -479,7 +480,7 @@ class SharedFamilyRuleTests(unittest.TestCase):
         # exits, so cross-load identity is proven by the code object's source
         # file (both tools resolve the rule from the one shared file), never by
         # a paraphrase left behind in either tool.
-        family_file = str((TOOLS / 'v41_exl3_family.py').resolve())
+        family_file = str((TOOLS / 'lib' / 'v41_exl3_family.py').resolve())
         for name in ('expected_decoder_family', 'checkpoint_global_family'):
             self.assertEqual(getattr(harness, name).__code__.co_filename,
                              family_file, f'harness.{name}')
@@ -492,7 +493,7 @@ class SharedFamilyRuleTests(unittest.TestCase):
         # No tool file re-defines the extracted rule.
         for filename in ('bench_v41_exl3_tiles.py', 'qualify_v41_exl3_aot.py'):
             self.assertNotIn('def expected_decoder_family',
-                             (TOOLS / filename).read_text())
+                             (TOOLS / TOOL_DIR[filename] / filename).read_text())
 
     def test_widths_must_be_plain_ints_and_bool_is_refused(self):
         for bad in ([True], [3, False], [3.0], ['3'], [None]):
@@ -586,9 +587,10 @@ class FamilyLoaderFailureTests(unittest.TestCase):
     def _exercise(self, tool, tool_filename):
         saved_file = tool.__file__
         with tempfile.TemporaryDirectory() as temp:
-            broken = Path(temp) / 'v41_exl3_family.py'
+            broken = Path(temp) / 'lib' / 'v41_exl3_family.py'
+            broken.parent.mkdir()
             broken.write_text('raise RuntimeError("family import boom")\n')
-            tool.__file__ = str(Path(temp) / tool_filename)
+            tool.__file__ = str(Path(temp) / TOOL_DIR[tool_filename] / tool_filename)
             saved = sys.modules.pop(self.NAME, None)
             try:
                 with self.assertRaises(RuntimeError):
@@ -614,7 +616,7 @@ class FamilyLoaderFailureTests(unittest.TestCase):
         pinned.VERSION = '0'
         pinned.LOCK_DATA = {}
         spec = importlib.util.spec_from_file_location(
-            'qualify_loader_failure', TOOLS / 'qualify_v41_exl3_aot.py')
+            'qualify_loader_failure', TOOLS / 'qualify' / 'deepseek_v41' / 'qualify_v41_exl3_aot.py')
         with patch.dict(sys.modules, {'_pinned_sparkinfer': pinned}):
             oracle = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(oracle)

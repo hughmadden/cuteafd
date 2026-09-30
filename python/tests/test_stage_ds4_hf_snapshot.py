@@ -11,7 +11,7 @@ import pytest
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
 if str(TOOLS) not in sys.path:
-    sys.path.insert(0, str(TOOLS))
+    sys.path[:0] = [str(TOOLS / d) for d in ("lib", "aot", "bench", "hf", "qualify/deepseek_v4", "qualify/deepseek_v41", "qualify/glm5_flash")]
 
 from stage_ds4_hf_snapshot import (  # noqa: E402
     GPTQMODEL_PRODUCTION_SAMPLING_POLICY,

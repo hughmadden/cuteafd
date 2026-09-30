@@ -66,7 +66,7 @@ def load_harness():
     pinned.VERSION = '0.0.0'
     pinned.LOCK_DATA = {'source_tree_sha256': 'tree', 'revision': 'pinned-for-tests'}
     spec = importlib.util.spec_from_file_location(
-        'bench_v41_exl3_tiles_wired', TOOLS / 'bench_v41_exl3_tiles.py')
+        'bench_v41_exl3_tiles_wired', TOOLS / 'bench' / 'bench_v41_exl3_tiles.py')
     with patch.dict(sys.modules, {'_pinned_sparkinfer': pinned}):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)

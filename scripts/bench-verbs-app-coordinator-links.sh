@@ -209,7 +209,7 @@ docker "${docker_args[@]}" \
   bash -lc '
 set -euo pipefail
 cargo build --manifest-path rust/Cargo.toml -p cuteafd-daemon
-python3 python/tools/check_native_rdma_build.py \
+python3 python/tools/aot/check_native_rdma_build.py \
   --clean \
   --build-dir native/build-rdma \
   --output "reports/phase0_artifacts/benchmarks/native_rdma_build_${CUTEAFD_REMOTE_HOST}.json" \
@@ -223,7 +223,7 @@ ensure_local_native() {
     return
   fi
   echo "== building local RDMA native library at $native_lib =="
-  python3 python/tools/check_native_rdma_build.py \
+  python3 python/tools/aot/check_native_rdma_build.py \
     --clean \
     --build-dir "$(dirname "$native_lib")" \
     --output "$benchmark_dir/native_rdma_build_${coordinator_host}.json" \

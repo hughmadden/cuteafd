@@ -705,7 +705,7 @@ for role in coordinator spark-expert; do
     --notices "$repo_root/dist/$role/THIRD_PARTY_NOTICES.md" \
     --verify "$repo_root/dist/$role/SPARKINFER_PROVENANCE.json"
   (
-    python3 "$repo_root/python/tools/package_v41_exl3_aot.py" verify --package "$repo_root/dist/$role/exl3" --sparkinfer-revision "$sparkinfer_commit"
+    python3 "$repo_root/python/tools/aot/package_v41_exl3_aot.py" verify --package "$repo_root/dist/$role/exl3" --sparkinfer-revision "$sparkinfer_commit"
     cd "$repo_root/dist/$role"
     sha256sum -c SPARKINFER_SHA256SUMS
     sha256sum -c XGRAMMAR_SHA256SUMS

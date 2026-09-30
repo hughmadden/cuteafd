@@ -97,7 +97,7 @@ def test_standalone_tools_bootstrap_pinned_source_before_b12x_imports() -> None:
         "compare_v41_wo_b_fusion.py",
     }
     tools_root = ROOT / "python" / "tools"
-    for path in sorted(tools_root.glob("*.py")):
+    for path in sorted(tools_root.rglob("*.py")):
         if path.name == "_pinned_sparkinfer.py":
             continue
         text = path.read_text(encoding="utf-8")
@@ -298,7 +298,7 @@ def test_fork_accepts_the_ngc_base_torch_prerelease() -> None:
 
 def test_standalone_bootstrap_imports_verified_submodule() -> None:
     env = os.environ.copy()
-    tools_path = os.fspath(ROOT / "python" / "tools")
+    tools_path = os.fspath(ROOT / "python" / "tools" / "lib")
     env["PYTHONPATH"] = tools_path + (
         os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
     )

@@ -11,9 +11,9 @@ add_custom_command(
   OUTPUT ${CUTEAFD_V41_ROUTER_OUTPUTS}
   COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
   COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
-    "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/export_b12x_v41_router_aot.py"
+    "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_router_aot.py"
     --output-dir "${CUTEAFD_V41_ROUTER_DIR}"
-  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/export_b12x_v41_router_aot.py"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_router_aot.py"
     ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
   VERBATIM)
 add_custom_target(cuteafd_v41_router_export DEPENDS ${CUTEAFD_V41_ROUTER_OUTPUTS})

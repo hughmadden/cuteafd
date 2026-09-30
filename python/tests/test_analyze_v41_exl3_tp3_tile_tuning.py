@@ -12,7 +12,7 @@ TOOLS = Path(__file__).resolve().parents[1] / 'tools'
 
 def load_analyzer():
     spec = importlib.util.spec_from_file_location(
-        'analyze_tp3_tuning_under_test', TOOLS / 'analyze_v41_exl3_tp3_tile_tuning.py')
+        'analyze_tp3_tuning_under_test', TOOLS / 'bench' / 'analyze_v41_exl3_tp3_tile_tuning.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

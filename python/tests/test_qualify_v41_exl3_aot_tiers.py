@@ -20,9 +20,9 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location(
-    'exl3_aot_oracle', ROOT / 'python' / 'tools' / 'qualify_v41_exl3_aot.py')
+    'exl3_aot_oracle', ROOT / 'python' / 'tools' / 'qualify' / 'deepseek_v41' / 'qualify_v41_exl3_aot.py')
 LOADER_SOURCE = ROOT / 'rust' / 'crates' / 'cuteafd-loader' / 'src' / 'families' / 'deepseek_v41' / 'v41_exl3.rs'
-ORACLE_SOURCE = ROOT / 'python' / 'tools' / 'qualify_v41_exl3_aot.py'
+ORACLE_SOURCE = ROOT / 'python' / 'tools' / 'qualify' / 'deepseek_v41' / 'qualify_v41_exl3_aot.py'
 
 PROJECTIONS = ('w1', 'w3', 'w2')
 
@@ -111,7 +111,7 @@ class SnapshotFixture:
 
 
 class FamilyRuleProvenanceTests(unittest.TestCase):
-    """`python/tools/v41_exl3_family.py` is the ONE owner of the tier-family rule.
+    """`python/tools/lib/v41_exl3_family.py` is the ONE owner of the tier-family rule.
 
     The oracle and the offline tile bench consume it through import shims. A shim
     that quietly grew its own copy of the rule would keep passing every behavioural
@@ -131,7 +131,7 @@ class FamilyRuleProvenanceTests(unittest.TestCase):
         self.assertIs(oracle.checkpoint_global_family, family.checkpoint_global_family)
         self.assertIs(oracle._staged_tensor_storage, family._staged_tensor_storage)
         self.assertEqual(family.__file__,
-                         str(ROOT / 'python' / 'tools' / 'v41_exl3_family.py'))
+                         str(ROOT / 'python' / 'tools' / 'lib' / 'v41_exl3_family.py'))
 
     def test_the_oracle_does_not_reimplement_the_rule(self):
         source = ORACLE_SOURCE.read_text()
@@ -144,7 +144,7 @@ class FamilyRuleProvenanceTests(unittest.TestCase):
 
     def test_the_tile_bench_consumes_the_same_rule(self):
         """The bench is a consumer, never a second authority."""
-        bench = (ROOT / 'python' / 'tools' / 'bench_v41_exl3_tiles.py').read_text()
+        bench = (ROOT / 'python' / 'tools' / 'bench' / 'bench_v41_exl3_tiles.py').read_text()
         self.assertIn('v41_exl3_family', bench,
                       'the bench must load the shared family module')
         for name in ('def expected_decoder_family', 'def checkpoint_global_family'):
@@ -156,7 +156,7 @@ class FamilyRuleProvenanceTests(unittest.TestCase):
         Checked on import statements only: the word CUDA legitimately appears in the
         module's prose, which is not what this guards.
         """
-        tree = ast.parse((ROOT / 'python' / 'tools' / 'v41_exl3_family.py').read_text())
+        tree = ast.parse((ROOT / 'python' / 'tools' / 'lib' / 'v41_exl3_family.py').read_text())
         roots = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -463,7 +463,7 @@ class SampleProjectionContractTests(unittest.TestCase):
         self.assertIn('reference_tier_bits', source)
 
 
-FAMILY_SOURCE = ROOT / 'python' / 'tools' / 'v41_exl3_family.py'
+FAMILY_SOURCE = ROOT / 'python' / 'tools' / 'lib' / 'v41_exl3_family.py'
 
 
 def load_shared_family():

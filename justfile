@@ -71,7 +71,7 @@ test-native:
       done
 
 test-native-rdma OUT="reports/phase0_artifacts/native_rdma_enabled_build_status.json":
-    python python/tools/check_native_rdma_build.py --clean --output "{{ OUT }}"
+    python python/tools/aot/check_native_rdma_build.py --clean --output "{{ OUT }}"
 
 test-smoke: doctor-host build-rust test-rust
 

@@ -494,7 +494,7 @@ def _load_exl3_expert_layer(
         raise ValueError("EXL3 Spark expert TP requires quant_mode='w4a16'")
     if "_pinned_sparkinfer" not in sys.modules:
         raise RuntimeError(
-            "import python/tools/_pinned_sparkinfer.py before loading runtime experts"
+            "import python/tools/lib/_pinned_sparkinfer.py before loading runtime experts"
         )
 
     torch = _torch()

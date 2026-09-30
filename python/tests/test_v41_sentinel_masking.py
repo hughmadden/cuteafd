@@ -32,7 +32,7 @@ import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[2]
-BENCH_PATH = ROOT / "python" / "tools" / "benchmark_v41_ep_groups.py"
+BENCH_PATH = ROOT / "python" / "tools" / "bench" / "benchmark_v41_ep_groups.py"
 
 
 def _load_bench():

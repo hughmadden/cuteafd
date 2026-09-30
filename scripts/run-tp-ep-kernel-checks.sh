@@ -52,7 +52,7 @@ python3 "$repo_root/scripts/verify-sparkinfer-source.py" \
 # load-bearing by convention. It is still listed first so tests.moe cannot be
 # shadowed by python/reference/tests before the resolver runs.
 export CUTEAFD_SPARKINFER_SOURCE_DIR="$pin"
-export PYTHONPATH="$pin:$repo_root/python/tools:$repo_root/python/reference:$repo_root/python${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$pin:$repo_root/python/tools/lib:$repo_root/python/tools/bench:$repo_root/python/reference:$repo_root/python${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONDONTWRITEBYTECODE=1
 
 mode="${1:-}"
@@ -90,11 +90,11 @@ case "$mode" in
       python -m pytest "${tests[@]}" "$@"
     ;;
   bench)
-    [[ -f "$repo_root/python/tools/benchmark_v41_ep_groups.py" ]] || {
+    [[ -f "$repo_root/python/tools/bench/benchmark_v41_ep_groups.py" ]] || {
       echo "benchmark harness missing" >&2; exit 2; }
     verify_imports
     exec "$repo_root/scripts/run-with-python-env.sh" \
-      python "$repo_root/python/tools/benchmark_v41_ep_groups.py" "$@"
+      python "$repo_root/python/tools/bench/benchmark_v41_ep_groups.py" "$@"
     ;;
   gpu-check)
     # Device-level native checks. These MUST run on a CUDA host and must not

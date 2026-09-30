@@ -13,7 +13,7 @@ from types import ModuleType
 RULES = Path(__file__).resolve().parents[2] / 'native/cmake/families/deepseek_v41/v41_exl3.cmake'
 
 _spec = importlib.util.spec_from_file_location('exl3_cmake_tile_grammar',
-    Path(__file__).resolve().parents[1] / 'tools/package_v41_exl3_aot.py')
+    Path(__file__).resolve().parents[1] / 'tools/aot/package_v41_exl3_aot.py')
 package = importlib.util.module_from_spec(_spec)
 _pinned = ModuleType('_pinned_sparkinfer')
 _pinned.REVISION = 'pinned-for-tests'

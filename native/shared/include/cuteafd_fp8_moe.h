@@ -1,4 +1,4 @@
-// Exact FP8 routed-expert package library (python/tools/package_fp8_moe_aot.py):
+// Exact FP8 routed-expert package library (python/tools/aot/package_fp8_moe_aot.py):
 // one libcuteafd_fp8moe.so per layout (tp1, tp2, tp4) of an fp8-<geometry>
 // package, carrying one b12x fp8_moe program per capacity. Weights are the
 // checkpoint's E4M3 experts with FP32 128x128 block scales; nothing is

@@ -195,7 +195,7 @@ def _role_geometry(role: str) -> tuple:
     import importlib.util
 
     spec = importlib.util.spec_from_file_location(
-        "_tp6_export_tables", REPO / "python" / "tools" / "export_b12x_v41_slices_aot.py"
+        "_tp6_export_tables", REPO / "python" / "tools" / "aot" / "export_b12x_v41_slices_aot.py"
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

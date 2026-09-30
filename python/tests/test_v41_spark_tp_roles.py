@@ -11,8 +11,8 @@ import ast
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-SLICES = ROOT / "python" / "tools" / "export_b12x_v41_slices_aot.py"
-EXPERTS = ROOT / "python" / "tools" / "export_b12x_v41_experts_aot.py"
+SLICES = ROOT / "python" / "tools" / "aot" / "export_b12x_v41_slices_aot.py"
+EXPERTS = ROOT / "python" / "tools" / "aot" / "export_b12x_v41_experts_aot.py"
 CMAKE = ROOT / "native" / "CMakeLists.txt"
 CMAKE_TP = ROOT / "native" / "cmake" / "families" / "deepseek_v41" / "v41_spark_tp_experts.cmake"
 HEADER = ROOT / "native" / "shared" / "include" / "cuteafd_v41_experts.h"

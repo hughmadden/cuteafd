@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-HARNESS = ROOT / "python" / "tools" / "bench_tp_ep_kernel.py"
+HARNESS = ROOT / "python" / "tools" / "bench" / "bench_tp_ep_kernel.py"
 
 
 def _load():
@@ -101,7 +101,7 @@ def test_tp6_topk_and_hidden_match_the_official_geometry() -> None:
 # The standalone per-topology benchmark (`benchmark_v41_ep_groups.py`)
 # --------------------------------------------------------------------------- #
 
-STANDALONE = ROOT / "python" / "tools" / "benchmark_v41_ep_groups.py"
+STANDALONE = ROOT / "python" / "tools" / "bench" / "benchmark_v41_ep_groups.py"
 
 
 def _load_standalone():

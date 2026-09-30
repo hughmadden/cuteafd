@@ -160,7 +160,7 @@ impl Family for Qwen {
                 "512 experts top-10 (hidden 2560, intermediate 640, SiLU unclamped) in a format without a \
                  routed kernel family"
                     .to_string(),
-                "Executable: EXL3 K4/K5 (qwen4:exl3-k45, python/tools/package_v41_exl3_aot.py --geometry qwen4; \
+                "Executable: EXL3 K4/K5 (qwen4:exl3-k45, python/tools/aot/package_v41_exl3_aot.py --geometry qwen4; \
                  exl3_cross_sm121.py for Sparks) and FP8 128x128 blocks (qwen4:fp8, native/cmake/shared/fp8_moe.cmake). \
                  BF16 fused [512, 1280, 2560] experts: serve the FP8 or EXL3 K4.25 publication, or add a BF16 \
                  routed family. NVFP4 (ModelOpt E2M1 + E4M3 per-16 scales + FP32 global): export b12x fused_moe \

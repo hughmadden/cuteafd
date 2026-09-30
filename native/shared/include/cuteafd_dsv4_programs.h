@@ -5,7 +5,7 @@ extern "C" {
 #endif
 
 /* DeepSeek V4 coordinator programs exported from b12x.integration.cuteafd
- * (python/tools/export_b12x_dsv4_aot.py). Each program takes its documented
+ * (python/tools/aot/export_b12x_dsv4_aot.py). Each program takes its documented
  * pointers, then its scalars, then a stream; dsv4_programs.json in the image
  * carries the pointer names, shapes and scratch sizes. */
 typedef struct {

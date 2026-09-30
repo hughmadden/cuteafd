@@ -18,7 +18,7 @@ import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[2]
-HARNESS = ROOT / "python" / "tools" / "bench_tp_ep_kernel.py"
+HARNESS = ROOT / "python" / "tools" / "bench" / "bench_tp_ep_kernel.py"
 FIXTURE = ROOT / "scripts" / "fixtures" / "tp-ep-reuse-m64-e384.json"
 
 

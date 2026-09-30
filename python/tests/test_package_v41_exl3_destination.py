@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 spec = importlib.util.spec_from_file_location('exl3_package',
-    Path(__file__).resolve().parents[1] / 'tools/package_v41_exl3_aot.py')
+    Path(__file__).resolve().parents[1] / 'tools/aot/package_v41_exl3_aot.py')
 package = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(package)
 

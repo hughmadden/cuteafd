@@ -21,13 +21,13 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOLS = ROOT / "python" / "tools"
-QUALIFIER = TOOLS / "qualify_v41_replicated_native.py"
+QUALIFIER = TOOLS / "qualify" / "deepseek_v41" / "qualify_v41_replicated_native.py"
 
 
 def _load_qualifier():
     pytest.importorskip("torch")
     if str(TOOLS) not in sys.path:
-        sys.path.insert(0, str(TOOLS))
+        sys.path[:0] = [str(TOOLS / d) for d in ("lib", "aot", "bench", "hf", "qualify/deepseek_v4", "qualify/deepseek_v41", "qualify/glm5_flash")]
     try:
         spec = importlib.util.spec_from_file_location("cuteafd_qualifier_timing", QUALIFIER)
         module = importlib.util.module_from_spec(spec)

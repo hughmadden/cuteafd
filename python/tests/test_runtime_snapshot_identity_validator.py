@@ -8,7 +8,7 @@ import pytest
 
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
-sys.path.insert(0, str(TOOLS))
+sys.path[:0] = [str(TOOLS / d) for d in ("lib", "aot", "bench", "hf", "qualify/deepseek_v4", "qualify/deepseek_v41", "qualify/glm5_flash")]
 
 from validate_ds4_runtime_snapshot_identity import (  # noqa: E402
     REQUIRED_LABELS,

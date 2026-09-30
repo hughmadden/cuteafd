@@ -19,7 +19,7 @@ import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[2]
-HARNESS = ROOT / "python" / "tools" / "bench_tp_ep_kernel.py"
+HARNESS = ROOT / "python" / "tools" / "bench" / "bench_tp_ep_kernel.py"
 FIXTURE = ROOT / "scripts" / "fixtures" / "tp-ep-reuse-m64-e384.json"
 
 
@@ -216,8 +216,7 @@ def test_measure_group_no_longer_references_a_preloop_rows_binding():
 def _bench():
     import importlib.util
     spec = importlib.util.spec_from_file_location(
-        "cuteafd_bank_label_bench", ROOT / "python" / "tools" /
-        "benchmark_v41_ep_groups.py")
+        "cuteafd_bank_label_bench", ROOT / "python" / "tools" / "bench" / "benchmark_v41_ep_groups.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -246,7 +245,7 @@ def test_bank_label_boundary_is_exact():
 
 def test_operand_identity_uses_the_shared_label():
     """The identity must not carry a hand-rolled label that can drift."""
-    src = (ROOT / "python" / "tools" / "benchmark_v41_ep_groups.py").read_text()
+    src = (ROOT / "python" / "tools" / "bench" / "benchmark_v41_ep_groups.py").read_text()
     assert "bank_label(len(ids), experts)" in src
     assert "is_full_real_bank" in src
 
@@ -254,7 +253,7 @@ def test_operand_identity_uses_the_shared_label():
 def _parse(args):
     import importlib.util
     spec = importlib.util.spec_from_file_location(
-        "cuteafd_parse_args", ROOT / "python" / "tools" / "bench_tp_ep_kernel.py")
+        "cuteafd_parse_args", ROOT / "python" / "tools" / "bench" / "bench_tp_ep_kernel.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.parse_args(args)
@@ -291,8 +290,7 @@ def test_parse_args_accepts_exactly_one_positive_row():
 def test_row_guard_precedes_blackwell_and_operand_load():
     """The guard must be in parse_args, i.e. before _require_blackwell."""
     import ast
-    tree = ast.parse((ROOT / "python" / "tools" /
-                      "bench_tp_ep_kernel.py").read_text())
+    tree = ast.parse((ROOT / "python" / "tools" / "bench" / "bench_tp_ep_kernel.py").read_text())
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == "parse_args":
             body = ast.dump(node)

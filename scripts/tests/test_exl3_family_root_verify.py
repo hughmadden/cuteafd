@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[2]
-TOOL = REPO / "python" / "tools" / "package_v41_exl3_aot.py"
+TOOL = REPO / "python" / "tools" / "aot" / "package_v41_exl3_aot.py"
 
 
 def load_tool():

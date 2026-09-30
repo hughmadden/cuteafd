@@ -281,7 +281,7 @@ if [[ -n "$dist" ]]; then
         for family in "$dist/$role"/exl3/exl3-*/; do
           [[ -d "$family" ]] || continue
           echo "-- $(basename "$family") package verify --"
-          python3 "$repo_root/python/tools/package_v41_exl3_aot.py" verify \
+          python3 "$repo_root/python/tools/aot/package_v41_exl3_aot.py" verify \
             --package "$family" --sparkinfer-revision "$sparkinfer_rev"
           echo "package_verify_rc=$?"
         done

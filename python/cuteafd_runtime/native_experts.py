@@ -299,7 +299,7 @@ def _load_native_expert_layer(
         raise ValueError("native Spark expert TP currently requires quant_mode='w4a16'")
     if "_pinned_sparkinfer" not in sys.modules:
         raise RuntimeError(
-            "import python/tools/_pinned_sparkinfer.py before loading runtime experts"
+            "import python/tools/lib/_pinned_sparkinfer.py before loading runtime experts"
         )
 
     torch = _torch()

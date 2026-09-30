@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULE_PATH = ROOT / "python" / "tools" / "_v41_expert_native.py"
+MODULE_PATH = ROOT / "python" / "tools" / "lib" / "_v41_expert_native.py"
 
 
 def _load():

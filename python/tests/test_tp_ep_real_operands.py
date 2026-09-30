@@ -23,7 +23,7 @@ import torch
 from safetensors.torch import save_file
 
 ROOT = Path(__file__).resolve().parents[2]
-BENCH = ROOT / "python" / "tools" / "benchmark_v41_ep_groups.py"
+BENCH = ROOT / "python" / "tools" / "bench" / "benchmark_v41_ep_groups.py"
 
 
 def _load_bench():

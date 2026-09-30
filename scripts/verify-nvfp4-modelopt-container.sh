@@ -24,7 +24,7 @@ if [ -n "$gpus" ] && [ "$gpus" != "none" ]; then
 fi
 
 docker "${docker_args[@]}" "$image" \
-  python/tools/verify_nvfp4_modelopt_real_tensor_decode_fixture.py \
+  python/tools/hf/verify_nvfp4_modelopt_real_tensor_decode_fixture.py \
     --fixture "$fixture" \
     --output "$output" \
     --device "$device"

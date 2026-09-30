@@ -23,13 +23,13 @@ def load_paired():
     pinned.LOCK_DATA = {}
     # The paired tool imports load_weights from the bench harness by name.
     bench_spec = importlib.util.spec_from_file_location(
-        'bench_v41_exl3_tiles', TOOLS / 'bench_v41_exl3_tiles.py')
+        'bench_v41_exl3_tiles', TOOLS / 'bench' / 'bench_v41_exl3_tiles.py')
     bench = importlib.util.module_from_spec(bench_spec)
     sys.modules['bench_v41_exl3_tiles'] = bench
     with patch.dict(sys.modules, {'_pinned_sparkinfer': pinned}):
         bench_spec.loader.exec_module(bench)
         spec = importlib.util.spec_from_file_location(
-            'qualify_v41_exl3_paired_under_test', TOOLS / 'qualify_v41_exl3_paired.py')
+            'qualify_v41_exl3_paired_under_test', TOOLS / 'qualify' / 'deepseek_v41' / 'qualify_v41_exl3_paired.py')
         paired = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(paired)
     return paired
@@ -52,7 +52,7 @@ class PackedRouteBlocksTests(unittest.TestCase):
                 paired.packed_route_blocks(slots, block)
 
     def test_the_floor_truncation_is_gone_from_the_source(self):
-        source = (TOOLS / 'qualify_v41_exl3_paired.py').read_text()
+        source = (TOOLS / 'qualify' / 'deepseek_v41' / 'qualify_v41_exl3_paired.py').read_text()
         self.assertNotIn('[1]//8', source.replace(' ', ''))
         # ...and the compile now takes the family-resolved bits, not defaults.
         self.assertIn('family=fam', source)

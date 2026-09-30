@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-MODULE_PATH = ROOT / "python" / "tools" / "qualify_v41_tie_seed_replay.py"
+MODULE_PATH = ROOT / "python" / "tools" / "qualify" / "deepseek_v41" / "qualify_v41_tie_seed_replay.py"
 
 
 def _load():

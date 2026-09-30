@@ -77,7 +77,7 @@ DIRECT_ROUTES = _load_direct_route_policy()
 NEUTRAL_POLICY_TILE = [16, 32, 16, 32]
 
 spec = importlib.util.spec_from_file_location('exl3_package_profiles',
-    Path(__file__).resolve().parents[1] / 'tools/package_v41_exl3_aot.py')
+    Path(__file__).resolve().parents[1] / 'tools/aot/package_v41_exl3_aot.py')
 package = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(package)
 
