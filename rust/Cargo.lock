@@ -631,6 +631,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cuteafd-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cuteafd-core",
+ "cuteafd-hostcache",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "cuteafd-ffi"
 version = "0.1.0"
 dependencies = [

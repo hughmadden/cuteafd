@@ -1,0 +1,301 @@
+Date,Description,Amount,Reference
+2024-01-02,"""Best"" Hardware, Inc.",-1770.50,R10000
+2024-01-03,Parking Garage,-2156.02,R10001
+2024-01-03,Blue Bottle Coffee,1855.76,R10002
+2024-01-04,Streaming Service,1128.17,R10003
+2024-01-04,Blue Bottle Coffee,-2272.23,R10004
+2024-01-04,Northwind Utilities,1398.60,R10005
+2024-01-05,City Transit,-1769.76,R10006
+2024-01-06,City Transit,-2354.31,R10007
+2024-01-06,Green Grocer,-1327.16,R10008
+2024-01-07,Streaming Service,2086.65,R10009
+2024-01-09,Payroll ACME Corp,3150.00,R10010
+2024-01-11,Dentist - Dr. Lee,-2339.23,R10011
+2024-01-12,Book Nook,1092.85,R10012
+2024-01-14,Trattoria Roma,-1953.65,R10013
+2024-01-14,Blue Bottle Coffee,-106.86,R10014
+2024-01-15,Insurance Premium,696.60,R10015
+2024-01-16,Corner Market,859.32,R10016
+2024-01-18,"Smith, Jones & Co",-1709.37,R10017
+2024-01-19,Pharmacy 24,-176.49,R10018
+2024-01-19,Book Nook,663.17,R10019
+2024-01-20,Streaming Service,-839.99,R10020
+2024-01-21,Blue Bottle Coffee,2207.04,R10021
+2024-01-22,Trattoria Roma,-105.70,R10022
+2024-01-23,Northwind Utilities,-2005.05,R10023
+2024-01-24,Gym Membership,-117.53,R10024
+2024-01-25,City Transit,865.31,R10025
+2024-01-26,Corner Market,-1962.95,R10026
+2024-01-26,Parking Garage,-1747.85,R10027
+2024-01-26,"""Best"" Hardware, Inc.",-990.28,R10028
+2024-01-28,Gym Membership,-2221.82,R10029
+2024-02-01,Pharmacy 24,2431.66,R10030
+2024-02-03,Blue Bottle Coffee,1642.36,R10031
+2024-02-04,Book Nook,-1974.01,R10032
+2024-02-04,Payroll ACME Corp,3150.00,R10033
+2024-02-05,"Hotel Aurora, Lisbon",448.35,R10034
+2024-02-06,Dentist - Dr. Lee,1383.29,R10035
+2024-02-06,"""Best"" Hardware, Inc.",-196.31,R10036
+2024-02-06,Trattoria Roma,2010.62,R10037
+2024-02-08,Insurance Premium,-1085.31,R10038
+2024-02-09,Northwind Utilities,-1491.91,R10039
+2024-02-09,"""Best"" Hardware, Inc.",-1284.12,R10040
+2024-02-09,Northwind Utilities,-141.39,R10041
+2024-02-09,Book Nook,174.07,R10042
+2024-02-11,Green Grocer,-2144.39,R10043
+2024-02-11,Dentist - Dr. Lee,-1391.38,R10044
+2024-02-12,Northwind Utilities,-2075.29,R10045
+2024-02-13,Dentist - Dr. Lee,-616.34,R10046
+2024-02-14,Gym Membership,1671.88,R10047
+2024-02-16,"Hotel Aurora, Lisbon",1524.36,R10048
+2024-02-16,Northwind Utilities,-1188.66,R10049
+2024-02-18,Insurance Premium,1612.01,R10050
+2024-02-20,Parking Garage,-1205.25,R10051
+2024-02-21,Dentist - Dr. Lee,-1499.47,R10052
+2024-02-23,Rent - Oak St Apartments,-1500.00,R10053
+2024-02-23,Farmers Market,-1269.30,R10054
+2024-02-24,Book Nook,-1041.09,R10055
+2024-02-26,Streaming Service,-1359.93,R10056
+2024-02-26,Insurance Premium,-1087.24,R10057
+2024-02-28,Gym Membership,-1328.58,R10058
+2024-03-01,"""Best"" Hardware, Inc.",-593.65,R10059
+2024-03-03,Rent - Oak St Apartments,-1500.00,R10060
+2024-03-03,"Hotel Aurora, Lisbon",-2398.80,R10061
+2024-03-04,Insurance Premium,428.68,R10062
+2024-03-05,"Hotel Aurora, Lisbon",-2421.40,R10063
+2024-03-05,Insurance Premium,-1327.60,R10064
+2024-03-06,Parking Garage,-1742.03,R10065
+2024-03-08,"Hotel Aurora, Lisbon",-384.26,R10066
+2024-03-08,Payroll ACME Corp,3150.00,R10067
+2024-03-09,Gym Membership,-637.41,R10068
+2024-03-10,Corner Market,-2282.85,R10069
+2024-03-11,Payroll ACME Corp,3150.00,R10070
+2024-03-13,Gym Membership,-670.21,R10071
+2024-03-13,Farmers Market,1241.58,R10072
+2024-03-15,"Smith, Jones & Co",1590.73,R10073
+2024-03-17,Payroll ACME Corp,3150.00,R10074
+2024-03-17,Payroll ACME Corp,3150.00,R10075
+2024-03-19,Gym Membership,-1996.24,R10076
+2024-03-20,Pharmacy 24,1591.53,R10077
+2024-03-21,Parking Garage,-2441.71,R10078
+2024-03-23,Payroll ACME Corp,3150.00,R10079
+2024-03-25,"Smith, Jones & Co",443.81,R10080
+2024-03-27,"Smith, Jones & Co",-202.80,R10081
+2024-03-27,Gym Membership,-1456.16,R10082
+2024-03-27,"""Best"" Hardware, Inc.",-502.68,R10083
+2024-04-01,Blue Bottle Coffee,-1954.58,R10084
+2024-04-01,Payroll ACME Corp,3150.00,R10085
+2024-04-03,Bike Shop,-793.71,R10086
+2024-04-05,"""Best"" Hardware, Inc.",-2142.28,R10087
+2024-04-06,Farmers Market,2194.71,R10088
+2024-04-06,Dentist - Dr. Lee,2416.89,R10089
+2024-04-06,Pharmacy 24,-1075.06,R10090
+2024-04-06,Green Grocer,-1306.38,R10091
+2024-04-07,Farmers Market,-284.60,R10092
+2024-04-09,"Hotel Aurora, Lisbon",-2070.72,R10093
+2024-04-09,Corner Market,1887.00,R10094
+2024-04-11,Blue Bottle Coffee,-1603.95,R10095
+2024-04-11,Trattoria Roma,-2279.85,R10096
+2024-04-13,Payroll ACME Corp,3150.00,R10097
+2024-04-14,Insurance Premium,-1998.70,R10098
+2024-04-16,City Transit,-2089.15,R10099
+2024-04-17,Parking Garage,-344.03,R10100
+2024-04-18,Corner Market,-1803.41,R10101
+2024-04-20,Gym Membership,-780.50,R10102
+2024-04-22,Insurance Premium,174.84,R10103
+2024-04-24,Farmers Market,-457.44,R10104
+2024-04-26,Streaming Service,-1790.00,R10105
+2024-04-26,"Hotel Aurora, Lisbon",2250.04,R10106
+2024-04-26,Trattoria Roma,-2422.72,R10107
+2024-04-26,Bike Shop,-1102.54,R10108
+2024-04-28,Insurance Premium,-226.10,R10109
+2024-05-02,Northwind Utilities,-1542.53,R10110
+2024-05-04,Dentist - Dr. Lee,-143.63,R10111
+2024-05-04,"Hotel Aurora, Lisbon",1620.51,R10112
+2024-05-05,Corner Market,2104.34,R10113
+2024-05-05,Payroll ACME Corp,3150.00,R10114
+2024-05-07,Farmers Market,1996.58,R10115
+2024-05-08,Dentist - Dr. Lee,-91.96,R10116
+2024-05-09,Blue Bottle Coffee,-1855.45,R10117
+2024-05-11,Streaming Service,364.74,R10118
+2024-05-13,Farmers Market,-1345.17,R10119
+2024-05-13,City Transit,-314.25,R10120
+2024-05-14,Pharmacy 24,-837.05,R10121
+2024-05-16,"Hotel Aurora, Lisbon",-2461.04,R10122
+2024-05-17,Payroll ACME Corp,3150.00,R10123
+2024-05-17,Farmers Market,-415.73,R10124
+2024-05-18,Payroll ACME Corp,3150.00,R10125
+2024-05-18,Parking Garage,1539.25,R10126
+2024-05-18,"Hotel Aurora, Lisbon",-1629.27,R10127
+2024-05-18,Gym Membership,-2230.75,R10128
+2024-05-19,Insurance Premium,-1872.95,R10129
+2024-05-20,Rent - Oak St Apartments,-1500.00,R10130
+2024-05-21,City Transit,2278.50,R10131
+2024-05-23,Gym Membership,-1916.33,R10132
+2024-05-25,Payroll ACME Corp,3150.00,R10133
+2024-05-27,City Transit,-1971.86,R10134
+2024-05-27,City Transit,-834.23,R10135
+2024-05-28,Rent - Oak St Apartments,-1500.00,R10136
+2024-06-01,Trattoria Roma,680.15,R10137
+2024-06-03,"""Best"" Hardware, Inc.",1465.78,R10138
+2024-06-04,"Smith, Jones & Co",-1144.22,R10139
+2024-06-04,Northwind Utilities,1034.33,R10140
+2024-06-04,Bike Shop,290.36,R10141
+2024-06-06,Pharmacy 24,-1993.60,R10142
+2024-06-08,Gym Membership,2093.13,R10143
+2024-06-10,Farmers Market,-2252.44,R10144
+2024-06-11,Streaming Service,1163.08,R10145
+2024-06-13,Green Grocer,-1581.04,R10146
+2024-06-15,Streaming Service,-593.31,R10147
+2024-06-16,"Hotel Aurora, Lisbon",-729.79,R10148
+2024-06-16,Northwind Utilities,-1100.34,R10149
+2024-06-18,Gym Membership,336.83,R10150
+2024-06-20,Northwind Utilities,-2054.86,R10151
+2024-06-22,Parking Garage,-527.12,R10152
+2024-06-23,Insurance Premium,1974.16,R10153
+2024-06-24,Book Nook,1636.63,R10154
+2024-06-24,"Hotel Aurora, Lisbon",-686.46,R10155
+2024-06-24,Gym Membership,-2292.49,R10156
+2024-06-24,Rent - Oak St Apartments,-1500.00,R10157
+2024-06-24,Book Nook,705.21,R10158
+2024-06-26,Bike Shop,2391.78,R10159
+2024-06-28,Rent - Oak St Apartments,-1500.00,R10160
+2024-07-02,Bike Shop,-1666.22,R10161
+2024-07-03,"Smith, Jones & Co",-2252.69,R10162
+2024-07-04,"Smith, Jones & Co",-552.77,R10163
+2024-07-05,"""Best"" Hardware, Inc.",-945.45,R10164
+2024-07-05,Insurance Premium,-564.13,R10165
+2024-07-07,Bike Shop,-2309.97,R10166
+2024-07-07,Green Grocer,-1087.50,R10167
+2024-07-08,Trattoria Roma,-635.34,R10168
+2024-07-10,Rent - Oak St Apartments,-1500.00,R10169
+2024-07-11,Bike Shop,162.90,R10170
+2024-07-13,Northwind Utilities,-1416.72,R10171
+2024-07-15,Parking Garage,-939.25,R10172
+2024-07-16,Payroll ACME Corp,3150.00,R10173
+2024-07-18,"Hotel Aurora, Lisbon",-1013.96,R10174
+2024-07-20,Bike Shop,-1933.51,R10175
+2024-07-21,Bike Shop,-572.58,R10176
+2024-07-21,"""Best"" Hardware, Inc.",2158.94,R10177
+2024-07-21,Blue Bottle Coffee,-252.59,R10178
+2024-07-21,Northwind Utilities,1016.46,R10179
+2024-07-21,Streaming Service,-632.16,R10180
+2024-07-21,City Transit,1792.66,R10181
+2024-07-23,Farmers Market,-1974.02,R10182
+2024-07-23,"Smith, Jones & Co",-613.61,R10183
+2024-07-24,Bike Shop,-1071.85,R10184
+2024-07-24,Payroll ACME Corp,3150.00,R10185
+2024-07-26,Payroll ACME Corp,3150.00,R10186
+2024-07-28,Insurance Premium,-1120.86,R10187
+2024-08-02,Dentist - Dr. Lee,633.44,R10188
+2024-08-04,Insurance Premium,-1477.36,R10189
+2024-08-06,Trattoria Roma,-2068.47,R10190
+2024-08-08,Parking Garage,-2086.33,R10191
+2024-08-08,Blue Bottle Coffee,-628.49,R10192
+2024-08-09,Pharmacy 24,-2257.80,R10193
+2024-08-11,City Transit,-115.05,R10194
+2024-08-13,"""Best"" Hardware, Inc.",-1123.05,R10195
+2024-08-13,"Smith, Jones & Co",-812.93,R10196
+2024-08-14,Streaming Service,-1433.11,R10197
+2024-08-15,Blue Bottle Coffee,-1609.64,R10198
+2024-08-15,Blue Bottle Coffee,2045.76,R10199
+2024-08-16,Payroll ACME Corp,3150.00,R10200
+2024-08-18,Streaming Service,1200.36,R10201
+2024-08-20,Green Grocer,-1270.47,R10202
+2024-08-21,Parking Garage,-1426.25,R10203
+2024-08-22,"Smith, Jones & Co",-1667.80,R10204
+2024-08-23,"""Best"" Hardware, Inc.",-87.82,R10205
+2024-08-24,Trattoria Roma,-2031.25,R10206
+2024-08-24,Streaming Service,-280.82,R10207
+2024-08-25,Blue Bottle Coffee,-2059.34,R10208
+2024-08-25,"Hotel Aurora, Lisbon",-939.43,R10209
+2024-08-25,Insurance Premium,-556.49,R10210
+2024-08-25,Blue Bottle Coffee,-138.02,R10211
+2024-08-25,Corner Market,-2045.14,R10212
+2024-08-25,Payroll ACME Corp,3150.00,R10213
+2024-08-27,"Smith, Jones & Co",-2131.35,R10214
+2024-08-27,Rent - Oak St Apartments,-1500.00,R10215
+2024-09-01,Streaming Service,731.22,R10216
+2024-09-02,Farmers Market,759.12,R10217
+2024-09-03,"Hotel Aurora, Lisbon",1728.03,R10218
+2024-09-04,Parking Garage,-959.53,R10219
+2024-09-04,Book Nook,-1369.75,R10220
+2024-09-05,Parking Garage,2069.42,R10221
+2024-09-07,Insurance Premium,-1698.93,R10222
+2024-09-08,Payroll ACME Corp,3150.00,R10223
+2024-09-09,Gym Membership,362.54,R10224
+2024-09-10,Bike Shop,77.41,R10225
+2024-09-11,Streaming Service,-30.01,R10226
+2024-09-11,Rent - Oak St Apartments,-1500.00,R10227
+2024-09-13,Book Nook,2313.17,R10228
+2024-09-13,Parking Garage,-586.41,R10229
+2024-09-14,Dentist - Dr. Lee,-520.07,R10230
+2024-09-15,Payroll ACME Corp,3150.00,R10231
+2024-09-16,City Transit,-2182.18,R10232
+2024-09-18,"Hotel Aurora, Lisbon",2309.68,R10233
+2024-09-20,Corner Market,-986.57,R10234
+2024-09-21,Rent - Oak St Apartments,-1500.00,R10235
+2024-09-23,Gym Membership,-2001.21,R10236
+2024-09-24,Trattoria Roma,-239.59,R10237
+2024-09-24,Green Grocer,-942.17,R10238
+2024-09-25,Farmers Market,-471.55,R10239
+2024-09-27,Northwind Utilities,-2177.16,R10240
+2024-10-01,Book Nook,-2063.81,R10241
+2024-10-03,Green Grocer,-1032.75,R10242
+2024-10-04,Insurance Premium,-1444.05,R10243
+2024-10-05,Payroll ACME Corp,3150.00,R10244
+2024-10-07,Northwind Utilities,-1112.54,R10245
+2024-10-07,Corner Market,-1088.81,R10246
+2024-10-09,Blue Bottle Coffee,-1269.69,R10247
+2024-10-11,Trattoria Roma,-620.13,R10248
+2024-10-13,Northwind Utilities,1996.80,R10249
+2024-10-15,Insurance Premium,-1311.07,R10250
+2024-10-17,"""Best"" Hardware, Inc.",-1526.84,R10251
+2024-10-17,"Smith, Jones & Co",-2316.00,R10252
+2024-10-17,"""Best"" Hardware, Inc.",-760.83,R10253
+2024-10-17,Farmers Market,-1255.73,R10254
+2024-10-18,Book Nook,-1765.20,R10255
+2024-10-20,Pharmacy 24,1668.53,R10256
+2024-10-21,"Smith, Jones & Co",-2341.35,R10257
+2024-10-23,"""Best"" Hardware, Inc.",-589.50,R10258
+2024-10-23,City Transit,1214.76,R10259
+2024-10-25,Streaming Service,1946.11,R10260
+2024-10-27,Dentist - Dr. Lee,-2381.71,R10261
+2024-10-28,Blue Bottle Coffee,-2359.74,R10262
+2024-11-02,Rent - Oak St Apartments,-1500.00,R10263
+2024-11-03,Insurance Premium,-312.78,R10264
+2024-11-04,"Hotel Aurora, Lisbon",-2098.16,R10265
+2024-11-05,"""Best"" Hardware, Inc.",-1419.82,R10266
+2024-11-06,"Hotel Aurora, Lisbon",574.58,R10267
+2024-11-08,Gym Membership,-2432.33,R10268
+2024-11-10,Trattoria Roma,-1950.76,R10269
+2024-11-12,Book Nook,70.13,R10270
+2024-11-14,Streaming Service,-809.17,R10271
+2024-11-15,Parking Garage,1562.98,R10272
+2024-11-16,Green Grocer,-2182.97,R10273
+2024-11-16,Bike Shop,-2375.43,R10274
+2024-11-17,Rent - Oak St Apartments,-1500.00,R10275
+2024-11-17,Rent - Oak St Apartments,-1500.00,R10276
+2024-11-19,Book Nook,1627.66,R10277
+2024-11-21,City Transit,-643.59,R10278
+2024-11-23,Dentist - Dr. Lee,2208.64,R10279
+2024-11-23,Blue Bottle Coffee,-806.26,R10280
+2024-11-25,Green Grocer,1761.81,R10281
+2024-11-26,"Smith, Jones & Co",-86.75,R10282
+2024-11-28,City Transit,-981.42,R10283
+2024-11-28,Blue Bottle Coffee,-1746.53,R10284
+2024-11-28,Rent - Oak St Apartments,-1500.00,R10285
+2024-12-01,Insurance Premium,-838.19,R10286
+2024-12-01,Dentist - Dr. Lee,-1569.82,R10287
+2024-12-01,Blue Bottle Coffee,-2424.03,R10288
+2024-12-02,Corner Market,-1974.12,R10289
+2024-12-03,City Transit,-1729.59,R10290
+2024-12-04,Streaming Service,-1892.16,R10291
+2024-12-06,"""Best"" Hardware, Inc.",-1255.39,R10292
+2024-12-07,Streaming Service,345.35,R10293
+2024-12-07,Farmers Market,-1924.97,R10294
+2024-12-08,Payroll ACME Corp,3150.00,R10295
+2024-12-08,Farmers Market,-2352.90,R10296
+2024-12-09,Trattoria Roma,-1925.77,R10297
+2024-12-11,Dentist - Dr. Lee,-2313.93,R10298
+2024-12-12,Rent - Oak St Apartments,-1500.00,R10299

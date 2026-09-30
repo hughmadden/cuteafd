@@ -6,8 +6,48 @@
 //! window and a populated exact ancestor can beat a slightly longer partial match
 //! (`Reusable::skipped`). Prompt repeats and completed turns keep separate bounded banks
 //! (`Retention`); a tie prefers the completed turn.
+//!
+//! The reuse rule is a parameter ([`ReuseRule`]) so the generic engine's families share this
+//! radix: V4.1 keeps `ReuseRule::V41` (`Radix::new`, `Retention::new`), paged families resume at
+//! a page boundary, and families whose snapshot carries positional state reuse exact frontiers
+//! only.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+/// How much computation a retained frontier saves for a query that shares `common` tokens with
+/// it. An exact ancestor (`common == frontier`) always saves `common`. A partial match resumes at
+/// `common` rounded down to `align`, minus `replay` tokens replayed before it; `align == 0`
+/// disables partial reuse (a family whose snapshot holds positional state, such as sliding-window
+/// rings, cannot resume byte-identically anywhere but at the frontier it captured).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReuseRule {
+    pub align: usize,
+    pub replay: Option<usize>,
+}
+impl ReuseRule {
+    /// V4.1: even-aligned, with a 128-token approximate encoder replay window.
+    pub const V41: Self = Self { align: 2, replay: Some(128) };
+    /// Exact frontiers only.
+    pub const EXACT: Self = Self { align: 0, replay: None };
+    /// A family whose whole state lives in pages of `page_rows` rows: resume at the page boundary.
+    pub const fn paged(page_rows: usize) -> Self {
+        Self { align: page_rows, replay: None }
+    }
+    /// Whether a partial match can be reused at all.
+    pub const fn partial(self) -> bool {
+        self.align > 0
+    }
+    /// Tokens a match of `common` against a frontier at `frontier` saves.
+    pub fn skipped(self, common: usize, frontier: usize) -> usize {
+        if common == frontier {
+            common
+        } else if self.align == 0 {
+            0
+        } else {
+            (common / self.align * self.align).saturating_sub(self.replay.unwrap_or(0))
+        }
+    }
+}
 
 struct Node<T> {
     edge: Vec<u32>,
@@ -21,12 +61,8 @@ struct Reusable {
     clock: u64,
 }
 impl Reusable {
-    fn skipped(self) -> usize {
-        if self.common == self.frontier {
-            self.common
-        } else {
-            (self.common / 2 * 2).saturating_sub(128)
-        }
+    fn skipped(self, rule: ReuseRule) -> usize {
+        rule.skipped(self.common, self.frontier)
     }
 }
 impl<T> Node<T> {
@@ -101,7 +137,7 @@ impl<T> Node<T> {
                     .find_map(|child| child.any_frontier(position + child.edge.len()))
             })
     }
-    fn find_reusable(&self, tokens: &[u32], position: usize) -> Option<Reusable> {
+    fn find_reusable(&self, tokens: &[u32], position: usize, rule: ReuseRule) -> Option<Reusable> {
         let mut best = self.value.as_ref().map(|&(clock, _)| Reusable {
             common: position,
             frontier: position,
@@ -115,7 +151,7 @@ impl<T> Node<T> {
                 .take_while(|(a, b)| a == b)
                 .count();
             let candidate = if common == child.edge.len() {
-                child.find_reusable(&tokens[common..], position + common)
+                child.find_reusable(&tokens[common..], position + common, rule)
             } else {
                 child
                     .any_frontier(position + child.edge.len())
@@ -125,7 +161,7 @@ impl<T> Node<T> {
                     })
             };
             if let Some(candidate) = candidate {
-                if best.is_none_or(|old| candidate.skipped() > old.skipped()) {
+                if best.is_none_or(|old| candidate.skipped(rule) > old.skipped(rule)) {
                     best = Some(candidate);
                 }
             }
@@ -136,7 +172,7 @@ impl<T> Node<T> {
                 ..found
             });
         }
-        best.filter(|found| found.skipped() > 0)
+        best.filter(|found| found.skipped(rule) > 0)
     }
     fn refresh(&mut self, old: u64, new: u64) -> Option<&T> {
         if let Some((clock, value)) = self.value.as_mut() {
@@ -195,15 +231,24 @@ pub struct Radix<T> {
     clock: u64,
     entries: usize,
     limit: usize,
+    rule: ReuseRule,
 }
 impl<T> Radix<T> {
+    /// A bank under V4.1's reuse rule.
     pub fn new(limit: usize) -> Self {
+        Self::with_rule(limit, ReuseRule::V41)
+    }
+    pub fn with_rule(limit: usize, rule: ReuseRule) -> Self {
         Self {
             root: Node::empty(Vec::new()),
             clock: 0,
             entries: 0,
             limit,
+            rule,
         }
+    }
+    pub fn rule(&self) -> ReuseRule {
+        self.rule
     }
     /// Insert, evicting the least recently used entry if the bank is over its limit; returns
     /// that evicted entry so its owner can act before it is dropped.
@@ -232,7 +277,7 @@ impl<T> Radix<T> {
     /// Prefer the most computation saved: a populated exact ancestor can beat
     /// a slightly longer partial match which needs a complete replay window.
     pub fn lookup_reusable(&mut self, tokens: &[u32]) -> Option<(usize, usize, &T)> {
-        let found = self.root.find_reusable(tokens, 0)?;
+        let found = self.root.find_reusable(tokens, 0, self.rule)?;
         self.clock = self
             .clock
             .checked_add(1)
@@ -292,8 +337,15 @@ pub struct Retention<T> {
     turns: Radix<T>,
 }
 impl<T> Retention<T> {
+    /// Both banks under V4.1's reuse rule.
     pub fn new(limit: usize) -> Self {
-        Self { prompts: Radix::new(limit), turns: Radix::new(limit) }
+        Self::with_rule(limit, ReuseRule::V41)
+    }
+    pub fn with_rule(limit: usize, rule: ReuseRule) -> Self {
+        Self { prompts: Radix::with_rule(limit, rule), turns: Radix::with_rule(limit, rule) }
+    }
+    pub fn rule(&self) -> ReuseRule {
+        self.prompts.rule
     }
     pub fn bank(&self, kind: SnapshotKind) -> &Radix<T> {
         match kind {
@@ -305,11 +357,12 @@ impl<T> Retention<T> {
         match kind { SnapshotKind::Prompt => &mut self.prompts, SnapshotKind::Turn => &mut self.turns }
     }
     pub fn lookup_reusable(&mut self, tokens: &[u32]) -> Option<(usize, usize, &T)> {
-        let prompt = self.prompts.root.find_reusable(tokens, 0);
-        let turn = self.turns.root.find_reusable(tokens, 0);
+        let rule = self.prompts.rule;
+        let prompt = self.prompts.root.find_reusable(tokens, 0, rule);
+        let turn = self.turns.root.find_reusable(tokens, 0, self.turns.rule);
         // Prefer completed turns on a tie. Refresh only the chosen bank's LRU.
         let kind = match (prompt, turn) {
-            (Some(p), Some(t)) if p.skipped() > t.skipped() => SnapshotKind::Prompt,
+            (Some(p), Some(t)) if p.skipped(rule) > t.skipped(rule) => SnapshotKind::Prompt,
             (_, Some(_)) => SnapshotKind::Turn,
             (Some(_), None) => SnapshotKind::Prompt,
             (None, None) => return None,
@@ -341,6 +394,45 @@ impl<T> Retention<T> {
 mod tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
+
+    /// V4.1's rule is pinned: `Radix::new`/`Retention::new` keep {2, Some(128)}, which is the
+    /// formula the engine shipped with (`(common / 2 * 2) - 128` for partial matches).
+    #[test]
+    fn v41_reuse_rule_is_pinned() {
+        assert_eq!(ReuseRule::V41, ReuseRule { align: 2, replay: Some(128) });
+        assert_eq!(Radix::<u8>::new(4).rule(), ReuseRule::V41);
+        assert_eq!(Retention::<u8>::new(4).rule(), ReuseRule::V41);
+        for frontier in [1usize, 2, 127, 128, 129, 130, 255, 256, 4096, 4243] {
+            for common in 0..=frontier {
+                let old = if common == frontier { common } else { (common / 2 * 2).saturating_sub(128) };
+                assert_eq!(ReuseRule::V41.skipped(common, frontier), old, "{common}/{frontier}");
+            }
+        }
+    }
+
+    #[test]
+    fn paged_and_exact_rules_resume_where_their_state_is_valid() {
+        let tokens: Vec<u32> = (1..=300).collect();
+        let mut partial = tokens[..200].to_vec();
+        partial.push(9999);
+        let mut paged = Radix::with_rule(4, ReuseRule::paged(64));
+        paged.insert(&tokens, 300);
+        // 200 common tokens resume at the last whole page, 192, with no replay.
+        let (common, frontier, _) = paged.lookup_reusable(&partial).unwrap();
+        assert_eq!(ReuseRule::paged(64).skipped(common, frontier), 192);
+        assert!(paged.lookup_reusable(&tokens[..63]).is_none());
+        let mut exact = Retention::with_rule(4, ReuseRule::EXACT);
+        exact.bank_mut(SnapshotKind::Prompt).insert(&tokens, 300);
+        assert!(exact.lookup_reusable(&partial).is_none());
+        let mut longer = tokens.clone();
+        longer.extend([7, 8, 9]);
+        assert_eq!(exact.lookup_reusable(&longer), Some((300, 300, &300)));
+        assert_eq!(exact.lookup_reusable(&tokens), Some((300, 300, &300)));
+        // An exact ancestor still wins over a longer entry that only matches partially.
+        exact.bank_mut(SnapshotKind::Turn).insert(&tokens[..100], 100);
+        assert_eq!(exact.lookup_reusable(&partial), Some((100, 100, &100)));
+        assert!(!ReuseRule::EXACT.partial() && ReuseRule::V41.partial());
+    }
     #[test]
     fn twenty_four_completed_turns_do_not_compete_with_prompt_snapshots() {
         let mut retained = Retention::new(24);

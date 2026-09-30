@@ -1,0 +1,12 @@
+[project]
+name = "ledger"
+version = "0.9.3"
+description = "Double-entry bookkeeping with CSV importers and monthly reports"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+ledger = "ledger.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -8,6 +8,7 @@ members = [
   "crates/cuteafd-loader",
   "crates/cuteafd-transport",
     "crates/cuteafd-hostcache",
+  "crates/cuteafd-engine",
 ]
 
 [workspace.package]
