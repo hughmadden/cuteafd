@@ -11,10 +11,10 @@
 //! again). With MTP the kept rows' pre-mixer streams wait in the MTP stash
 //! for the next cycle's draft step (see `speculate`).
 use super::engine::{Allocator, Qwen4Engine, Qwen4Placement, DECODE_ROWS};
-use super::mtp_policy::{self, MtpCost};
+use super::mtp_policy;
 use super::speculate::{self, DraftSeq, DraftTiming, MtpSeq, Verified};
 use super::{embed_rows, open, Opened};
-use crate::glm::dflash_policy::DraftHistory;
+use crate::draft_policy::{DraftHistory, Shape};
 use anyhow::{Context, Result};
 use cuteafd_api::native_v41::qwen::QwenEncoding;
 use cuteafd_api::native_v41::{
@@ -157,6 +157,8 @@ struct Active<'a> {
     generated: usize,
     buffered: usize,
     started: Instant,
+    /// Admission order, for traces.
+    id: u64,
 }
 
 impl Active<'_> {
@@ -230,6 +232,25 @@ fn copy_drafts(history: &[u32], limit: usize) -> Vec<u32> {
     Vec::new()
 }
 
+/// Per-cycle step costs for policy work (`CUTEAFD_QWEN4_TRACE=path`, JSON lines).
+struct Trace(std::io::BufWriter<std::fs::File>);
+
+impl Trace {
+    fn open() -> Result<Option<Self>> {
+        let Ok(path) = std::env::var("CUTEAFD_QWEN4_TRACE") else { return Ok(None) };
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path)
+            .with_context(|| format!("CUTEAFD_QWEN4_TRACE {path}"))?;
+        Ok(Some(Self(std::io::BufWriter::new(file))))
+    }
+
+    fn cycle(&mut self, line: serde_json::Value) {
+        use std::io::Write;
+        if let Err(error) = writeln!(self.0, "{line}").and_then(|_| self.0.flush()) {
+            tracing::warn!("trace: {error:#}");
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
@@ -239,14 +260,15 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
         &opened.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, eos);
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
     let mut active: Vec<Active<'_>> = Vec::new();
-    let (mut requests, mut generated_total) = (0u64, 0u64);
+    let (mut requests, mut generated_total, mut admissions) = (0u64, 0u64, 0u64);
     // Verify steps since the last completed request, host seconds in verifies and in MTP draft steps.
     let (mut steps, mut verify_s) = (0u64, 0f64);
     let mut timing = DraftTiming::default();
     let (hidden, vocab) = (engine.cfg.hidden, engine.cfg.vocab_size);
     let embed = |tokens: &[u32]| embed_rows(&opened.checkpoint, tokens, hidden);
     let mtp = matches!(drafts, Drafts::Mtp { .. });
-    let mut cost = MtpCost::new(&mtp_policy::RTX_TP1_VERIFY_MS, mtp_policy::RTX_TP1_MTP_STEP_MS, DECODE_ROWS);
+    let mut cost = mtp_policy::cycle_cost(DECODE_ROWS);
+    let mut trace = Trace::open()?;
     loop {
         while active.len() < max_sequences {
             let job = if active.is_empty() {
@@ -284,6 +306,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                     continue;
                 }
             };
+            admissions += 1;
             let admitted = (|| -> Result<Active<'_>> {
                 let _ = job.events.blocking_send(Ok(InferenceChunk::Ready {
                     system_fingerprint: None,
@@ -314,7 +337,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                     decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?,
                     job, constraint, placement: placement.clone(), mtp: seq, outcomes: DraftHistory::default(),
                     idle: 0, proposed: 0, accepted: 0, cycles: 0, capacity, next: 0, generated: 0, buffered: 0,
-                    started: Instant::now(),
+                    started: Instant::now(), id: admissions,
                 };
                 request.next = request.select(&logits.context("prefill produced no logits")?)?;
                 request.mtp.close(request.next);
@@ -337,6 +360,9 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
         if active.is_empty() {
             continue;
         }
+        let cycle = Instant::now();
+        let mut rates: Vec<Vec<f64>> = Vec::new();
+        let (steps_before, draft_s_before) = (timing.steps, timing.seconds);
         // Each sequence verifies its next token plus its drafts within the decode programs' rows.
         let room = (DECODE_ROWS / active.len()).max(1) - 1;
         let limits: Vec<usize> = active.iter().map(|a| room.min(a.job.max_tokens - a.generated - 1)
@@ -356,7 +382,8 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             Drafts::Mtp { depth, fixed } => {
                 let limits: Vec<usize> = limits.iter().map(|&l| l.min(depth)).collect();
                 let histories: Vec<&DraftHistory> = active.iter().map(|a| &a.outcomes).collect();
-                let mut depths = mtp_policy::plan(&histories, &limits, fixed.then_some(depth), &cost);
+                rates = mtp_policy::acceptance(&histories, &limits);
+                let mut depths = mtp_policy::plan(&rates, fixed.then_some(depth), &cost);
                 for ((a, d), &limit) in active.iter_mut().zip(depths.iter_mut()).zip(&limits) {
                     // A sequence planned without drafts for a while probes one.
                     a.idle = if *d == 0 { a.idle + 1 } else { 0 };
@@ -373,7 +400,9 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                     let mut seqs: Vec<DraftSeq<'_>> = active.iter_mut().zip(&depths).map(|(a, &depth)| DraftSeq {
                         placement: &a.placement, seq: &mut a.mtp, depth }).collect();
                     let proposals = speculate::draft(engine, &embed, &mut seqs, &mut timing)?;
-                    cost.observe_steps(timing.steps - steps, 1e3 * timer.elapsed().as_secs_f64());
+                    if depths.iter().any(|&d| d > 0) {
+                        cost.observe_chain(timing.steps - steps, 1e3 * timer.elapsed().as_secs_f64());
+                    }
                     proposals
                 } else {
                     vec![Vec::new(); active.len()]
@@ -397,7 +426,9 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
         }).and_then(|logits| logits.context("decode needs every layer"));
         let elapsed = timer.elapsed().as_secs_f64();
         verify_s += elapsed;
-        cost.observe_verify(tokens.len(), 1e3 * elapsed);
+        let shape = Shape::plain(tokens.len(), sequences.len());
+        let predicted_ms = cost.verify_ms(shape);
+        cost.observe_verify(shape, 1e3 * elapsed);
         let logits = match step {
             Ok(logits) => logits,
             Err(error) => {
@@ -462,6 +493,15 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
         }
         speculate::accept(engine, &mut verified, spec, mtp)?;
         drop(verified);
+        if let Some(trace) = trace.as_mut() {
+            trace.cycle(serde_json::json!({"rows": tokens.len(), "seqs": sequences.len(),
+                "ids": active.iter().map(|a| a.id).collect::<Vec<_>>(),
+                "depths": sequences.iter().map(|s| s.len() - 1).collect::<Vec<_>>(),
+                "kept": kept.iter().map(|k| k.map_or(0, |(n, _)| n)).collect::<Vec<_>>(),
+                "verify_ms": 1e3 * elapsed, "draft_steps": timing.steps - steps_before,
+                "draft_ms": 1e3 * (timing.seconds - draft_s_before), "cycle_ms": 1e3 * cycle.elapsed().as_secs_f64(),
+                "predicted_ms": predicted_ms, "fit": cost.fitted(), "rates": rates}));
+        }
         for index in (0..active.len()).rev() {
             if !finished[index] {
                 continue;

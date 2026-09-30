@@ -9,7 +9,7 @@
 use super::dflash::{ContextRow, DraftSeq};
 use super::mtp::MtpSeq;
 use super::engine::{Allocator, MimoEngine, MimoPlacement, DECODE_ROWS};
-use crate::glm::dflash_policy::{self, DraftHistory, Group, StepCost};
+use crate::glm::dflash_policy::{self, CycleCost, DraftHistory, Group, Shape};
 use super::{open, Opened};
 use anyhow::{Context, Result};
 use cuteafd_api::native_v41::qwen::QwenEncoding;
@@ -92,8 +92,9 @@ struct Policy {
 /// sequence (`mimo-golden --timing --prefill 1000 --step-rows N`, 571 rows).
 /// The coordinator alone (`--skip-experts`) takes 18.2 / 19.2 / 23.3 / 33.8 /
 /// 37.2 ms at 1 / 4 / 16 / 24 / 32 rows (E4M3 decode weights up to 32 rows)
-/// and 56.7 ms at 48; the rest is the Spark exchange. Serving rescales it by
-/// what it observes.
+/// and 56.7 ms at 48; the rest is the Spark exchange. Serving refits its
+/// intercept and slope as it observes (sequences that share experts make rows
+/// cheaper than one sequence's).
 const PRO_TP6_STEP_MS: [(usize, f64); 9] = [(1, 31.6), (2, 39.5), (4, 54.1), (8, 77.1), (16, 114.4), (24, 166.7),
     (32, 197.8), (48, 258.3), (64, 304.4)];
 
@@ -205,7 +206,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let draft = policy.copy;
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
-    let mut cost = StepCost::new(&PRO_TP6_STEP_MS, DECODE_ROWS);
+    let mut cost = dflash_policy::step_cost(&PRO_TP6_STEP_MS, DECODE_ROWS);
     let mut skip = crate::glm::dflash_policy::DraftSkip::default();
     let mut allocator = Allocator::new(engine.pages, engine.rings);
     let mut grammars = crate::v41_native_serve::constraints::Compiler::with_vocab(
@@ -407,7 +408,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let step = engine.verify(&mut rows, &embed, None).and_then(|logits| logits.context("decode needs every layer"));
         let step_s = timer.elapsed().as_secs_f64();
         verify_s += step_s;
-        cost.observe(tokens.len(), tokens.len(), step_s * 1e3);
+        cost.observe_verify(Shape::plain(tokens.len(), sequences.len()), step_s * 1e3);
         let timer = Instant::now();
         let logits = match step {
             Ok(logits) => logits,
@@ -506,7 +507,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
 /// calibration does not apply to this drafter), priced with the sequences
 /// that do not draft.
 fn plan_drafts(active: &[Active<'_>], drafted: &[Option<super::dflash::Draft>], limits: &[usize],
-    fixed: Option<usize>, cost: &StepCost) -> Vec<usize> {
+    fixed: Option<usize>, cost: &CycleCost) -> Vec<usize> {
     let indices: Vec<usize> = (0..active.len()).filter(|&i| drafted[i].is_some()).collect();
     let mut counts = vec![0; active.len()];
     let width = |i: usize| drafted[i].as_ref().map_or(0, |d| d.tokens.len());

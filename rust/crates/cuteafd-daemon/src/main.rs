@@ -5,6 +5,7 @@ use std::process::Command;
 
 mod cli;
 mod commands;
+mod draft_policy;
 mod dsv4;
 mod glm;
 mod glmf;
