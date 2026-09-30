@@ -105,17 +105,17 @@ esac
 # official FP8 release (GLM5_FLASH_FP8_MODEL_ID, "off" for BF16), KDA
 # projections as per-row FP8 (GLM5_FLASH_KDA_FP8: row128, channel or off) and
 # optionally an FP8 LM head (GLM5_FLASH_FP8_HEAD=on); its MLA pools hold
-# GLM5_FLASH_POOL_TOKENS tokens. GLM5_FLASH_FP8_PREFILL (off, or a list of
-# mla,ffn,kda-in,kda-o / all) runs those prefill projections as block-FP8 GEMMs
-# (E4M3 activations per 128-K block). The GLMF_* and POOL_TOKENS spellings
-# still work for one release.
+# POOL_TOKENS tokens (a key every family with a paged KV pool reads).
+# GLM5_FLASH_FP8_PREFILL (off, or a list of mla,ffn,kda-in,kda-o / all) runs
+# those prefill projections as block-FP8 GEMMs (E4M3 activations per 128-K
+# block). The GLMF_* spellings still work for one release.
 if [[ $family == glm5_flash ]]; then
   fp8_model="$(key GLM5_FLASH_FP8_MODEL_ID GLMF_FP8_MODEL_ID zai-org/GLM-5.3-Flash)"
   if [[ "$fp8_model" != off ]]; then
     fp8_snapshot="$(snapshot_of "$fp8_model" "$(key GLM5_FLASH_FP8_MODEL_REVISION GLMF_FP8_MODEL_REVISION)")" || exit 1
     family_args+=(--fp8-decode --fp8-snapshot "$fp8_snapshot")
   fi
-  family_args+=(--kda-fp8 "$(key GLM5_FLASH_KDA_FP8 GLMF_KDA_FP8 row128)" --pool-tokens "$(key GLM5_FLASH_POOL_TOKENS POOL_TOKENS 65536)")
+  family_args+=(--kda-fp8 "$(key GLM5_FLASH_KDA_FP8 GLMF_KDA_FP8 row128)" --pool-tokens "$(get POOL_TOKENS 65536)")
   [[ "$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD off)" != on ]] || family_args+=(--fp8-head)
   fp8_prefill="$(key GLM5_FLASH_FP8_PREFILL GLMF_FP8_PREFILL off)"
   [[ "$fp8_prefill" == off ]] || family_args+=(--fp8-prefill "$fp8_prefill")

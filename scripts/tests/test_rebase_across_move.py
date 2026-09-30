@@ -21,7 +21,9 @@ def make_repo(tmp_path: Path) -> Path:
     git(repo, "init", "-q", "-b", "main")
     git(repo, "config", "user.email", "t@example.com")
     git(repo, "config", "user.name", "t")
-    shutil.copy(SCRIPT, repo / "scripts" / "build" / "rebase-across-move.sh")
+    for name in ("rebase-across-move.sh", "rebase_across_move.py", "rename_paths.py"):
+        shutil.copy(SCRIPT.parent / name, repo / "scripts" / "build" / name)
+    (repo / "scripts" / "build" / "rename-map.tsv").write_text("# no Rust renames in the toy\n")
     (repo / "scripts" / "old-tool.sh").write_text("echo one\n")
     (repo / "native" / "cuda" / "kernels").mkdir(parents=True)
     (repo / "native" / "cuda" / "kernels" / "v41_kv.cu").write_text("int a;\nint b;\n")
@@ -48,6 +50,8 @@ def test_branch_crosses_the_move(tmp_path: Path) -> None:
     (repo / "scripts" / "launch").mkdir()
     git(repo, "mv", "native/cuda/kernels/v41_kv.cu", "native/families/deepseek_v41/cuda/v41_kv.cu")
     git(repo, "mv", "scripts/old-tool.sh", "scripts/launch/old-tool.sh")
+    # The move also edits the file the branch changes (a different line).
+    (repo / "native" / "families" / "deepseek_v41" / "cuda" / "v41_kv.cu").write_text("int a0;\nint b;\n")
     (repo / "docs.txt").write_text("run scripts/launch/old-tool.sh\n")
     (repo / "scripts" / "build" / "path-map.tsv").write_text(
         "# toy map\n"
@@ -63,7 +67,8 @@ def test_branch_crosses_the_move(tmp_path: Path) -> None:
     assert "native/cuda/kernels/v41_new.cu -> native/families/deepseek_v41/cuda/v41_new.cu" in result.stdout
     assert git(repo, "branch", "--show-current").strip() == "feature-moved"
     moved = repo / "native" / "families" / "deepseek_v41" / "cuda"
-    assert (moved / "v41_kv.cu").read_text() == "int a;\nint b;\nint c;\n"
+    assert (moved / "v41_kv.cu").read_text() == "int a0;\nint b;\nint c;\n"
+    assert git(repo, "log", "-1", "--format=%s").strip() == "feature work"
     assert (moved / "v41_new.cu").read_text() == "int n;\n"
     assert not [p for p in git(repo, "ls-files").split() if p.startswith("native/cuda/")]
     assert (repo / "notes.txt").read_text() == "see scripts/launch/old-tool.sh\n"
