@@ -878,7 +878,7 @@ mod tests {
     use crate::families::deepseek_v41::v41_target_head::TargetHeadWeights;
     use crate::families::deepseek_v41::v41_tensors::{NativeRtxTensors, VocabularyHead};
     use cuteafd_ffi::NativeLibrary;
-    use cuteafd_transport::{ExpertV2SourceKind, TcpTransportConfig, v41_expert::V41Tp4Roce};
+    use cuteafd_transport::{ExpertV2SourceKind, TcpTransportConfig, expert::V41Tp4Roce};
     use std::rc::Rc;
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT, CUTEAFD_DUAL_PEERS, two GPUs and live Sparks"]

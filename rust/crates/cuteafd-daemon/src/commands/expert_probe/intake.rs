@@ -8,7 +8,7 @@ use crate::shared::spark_intake::{self, IntakeMode, SparkIntake, SparkLane};
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_transport::{v41_expert::V41Tp4Roce, ExpertProtocolV2Request, TcpTransportConfig};
+use cuteafd_transport::{expert::V41Tp4Roce, ExpertProtocolV2Request, TcpTransportConfig};
 use std::net::SocketAddr;
 use std::time::Instant;
 

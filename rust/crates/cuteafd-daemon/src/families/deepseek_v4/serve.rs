@@ -4,7 +4,7 @@ use super::pool::{Placement, PoolAllocator};
 use super::{embed_rows, with_engine, EngineArgs};
 use crate::shared::prefill_share::{Chunk, DecodeShareArgs};
 use anyhow::{Context, Result};
-use cuteafd_api::native_v41::{
+use cuteafd_api::openai::{
     ConsoleHub, InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits,
     NativeRequest, PromptUsage,
 };
@@ -65,7 +65,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_context, speculate_max, decode_share));
     ready_rx.await.context("engine failed before it was ready")??;
-    let router = cuteafd_api::native_v41::router_for_model(queue, limits, stats, Duration::from_secs(25),
+    let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
         ConsoleHub::disabled(), profile.clone());
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     tracing::info!(listen = %args.listen, model = %profile.id, "DeepSeek V4 API is ready");

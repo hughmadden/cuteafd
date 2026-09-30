@@ -99,7 +99,7 @@ impl Family for MiMo {
                     text.get("attention_value_scale").cloned().unwrap_or(Value::Null)
                 )];
                 if checkpoint.tensors.iter().any(|t| t.meta.name.ends_with("self_attn.qkv_proj.weight")) {
-                    let tp = crate::mimo_v2::checkpoint_tp(&checkpoint.snapshot).unwrap_or(1);
+                    let tp = crate::families::mimo_v2::checkpoint_tp(&checkpoint.snapshot).unwrap_or(1);
                     notes.push(format!("fused qkv_proj stored TP{tp}-interleaved ([q|k|v] per row shard, \
                         own 128x128 grid per shard); the engine de-interleaves it (FusedQkvLayout)"));
                 }
@@ -109,7 +109,7 @@ impl Family for MiMo {
                 if checkpoint.snapshot.join("dflash").join("config.json").exists() {
                     notes.push("dflash/: DFlash block drafter (not planned: its own qwen3-style config)".into());
                 }
-                if let Ok(family) = crate::mimo_v2::MimoV2Config::from_hf(text).and_then(|c| c.program_family().map(str::to_owned)) {
+                if let Ok(family) = crate::families::mimo_v2::MimoV2Config::from_hf(text).and_then(|c| c.program_family().map(str::to_owned)) {
                     notes.push(format!("coordinator programs: family {family} (CUTEAFD_ENABLE_MIMO_AOT, \
                         CUTEAFD_MIMO_GEOMETRIES={family})"));
                 }

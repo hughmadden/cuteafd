@@ -95,7 +95,7 @@ pub struct OfficialV41Catalog {
     tensors: Vec<V41Tensor>,
     exl3: Option<crate::V41Exl3Manifest>,
     nvfp4: Option<crate::V41Nvfp4Contract>,
-    fp8: Option<crate::fp8_experts::Fp8ExpertTensors>,
+    fp8: Option<crate::formats::fp8_experts::Fp8ExpertTensors>,
 }
 
 /// Bounded range reads for a validated, unsharded coordinator tensor.
@@ -133,7 +133,7 @@ impl OfficialV41Catalog {
     }
     /// The checkpoint's own FP8 routed experts (E4M3 + FP32 128x128 block
     /// scales), served without re-quantization by the `fp8` family.
-    pub fn fp8(&self) -> Option<&crate::fp8_experts::Fp8ExpertTensors> {
+    pub fn fp8(&self) -> Option<&crate::formats::fp8_experts::Fp8ExpertTensors> {
         self.fp8.as_ref()
     }
     /// Validated ModelOpt NVFP4 expert contract, when the checkpoint has one.
@@ -536,7 +536,7 @@ fn placement(name: &str) -> V41TensorPlacement {
 
 /// Header-only inspection: never reads or eagerly allocates checkpoint tensor payloads.
 pub fn read_official_v41_catalog(model_id: &str, snapshot: &Path) -> Result<OfficialV41Catalog> {
-    let raw_config: serde_json::Value = crate::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
+    let raw_config: serde_json::Value = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
     let exl3 = if raw_config["quantization_config"]["quant_method"] == "exl3" {
         Some(crate::read_v41_exl3_manifest(snapshot)?)
     } else { None };
@@ -706,7 +706,7 @@ pub fn read_official_v41_catalog(model_id: &str, snapshot: &Path) -> Result<Offi
 /// V4.1 storage (packed FP4 in I8, E8M0 scales per 32 values).
 pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
     let config: serde_json::Value =
-        crate::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
+        crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
     if config.get("model_type").and_then(serde_json::Value::as_str) == Some("glm5_next") {
         return read_glm_dsa_expert_catalog(snapshot, &config);
     }
@@ -768,9 +768,9 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> R
     struct Index {
         weight_map: BTreeMap<String, String>,
     }
-    let index: Index = crate::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)
+    let index: Index = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)
         .and_then(|value| Ok(serde_json::from_value(value)?))?;
-    let manifest = crate::v41_exl3::read_deepseek_v4_exl3_manifest(snapshot, shape)?;
+    let manifest = crate::families::deepseek_v41::v41_exl3::read_deepseek_v4_exl3_manifest(snapshot, shape)?;
     deepseek_v4_exl3_catalog(snapshot, &index.weight_map, manifest)
 }
 
@@ -808,9 +808,9 @@ fn read_qwen4_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Res
             weight_map: BTreeMap<String, String>,
         }
         let index: Index =
-            crate::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)
+            crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)
                 .and_then(|value| Ok(serde_json::from_value(value)?))?;
-        let manifest = crate::v41_exl3::read_deepseek_v4_exl3_manifest(snapshot, shape)?;
+        let manifest = crate::families::deepseek_v41::v41_exl3::read_deepseek_v4_exl3_manifest(snapshot, shape)?;
         return deepseek_v4_exl3_catalog(snapshot, &index.weight_map, manifest);
     }
     if quant.get("config_groups").is_some() || quant["quant_method"] == "modelopt" {
@@ -828,7 +828,7 @@ fn read_qwen4_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Res
 /// (mimo_v2) stores them MXFP4 (`weight` + UE8M0 `weight_scale`, quantization
 /// `store_dtype: mxfp4`); the same catalog detects the format.
 fn read_mimo_v2_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Result<OfficialV41Catalog> {
-    let cfg = crate::mimo_v2::MimoV2Config::from_hf(config)?;
+    let cfg = crate::families::mimo_v2::MimoV2Config::from_hf(config)?;
     let first_layer = cfg.dense.iter().position(|dense| !dense).context("MiMo config has no MoE layer")?;
     ensure!(cfg.dense[first_layer..].iter().all(|dense| !dense), "MiMo MoE layers must follow the dense ones");
     ensure!(cfg.routed_scale == 1.0, "MiMo routed scaling must be 1");
@@ -848,7 +848,7 @@ fn read_mimo_v2_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> R
 }
 
 fn fp8_catalog(snapshot: &Path, shape: RoutedExpertShape) -> Result<OfficialV41Catalog> {
-    let fp8 = crate::fp8_experts::Fp8ExpertTensors::read(snapshot, shape)?;
+    let fp8 = crate::formats::fp8_experts::Fp8ExpertTensors::read(snapshot, shape)?;
     Ok(OfficialV41Catalog {
         config: None,
         experts: shape,
@@ -863,12 +863,12 @@ fn fp8_catalog(snapshot: &Path, shape: RoutedExpertShape) -> Result<OfficialV41C
 /// DeepSeek V4 routed experts; every other tensor stays with the coordinator
 /// and is not validated here.
 fn read_deepseek_v4_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
-    let v4 = crate::deepseek_v4::DeepseekV4Config::read(snapshot, 0)?;
+    let v4 = crate::families::deepseek_v4::DeepseekV4Config::read(snapshot, 0)?;
     #[derive(Deserialize)]
     struct Index {
         weight_map: BTreeMap<String, String>,
     }
-    let index: Index = crate::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)
+    let index: Index = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)
         .and_then(|value| Ok(serde_json::from_value(value)?))?;
     let (hidden, intermediate) = (v4.dim, v4.moe_inter_dim);
     ensure!(
@@ -885,9 +885,9 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog
         draft_stages: 0,
         draft_experts: 0,
     };
-    let raw_config = crate::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
+    let raw_config = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
     if raw_config["quantization_config"]["quant_method"] == "exl3" {
-        let manifest = crate::v41_exl3::read_deepseek_v4_exl3_manifest(snapshot, backbone)?;
+        let manifest = crate::families::deepseek_v41::v41_exl3::read_deepseek_v4_exl3_manifest(snapshot, backbone)?;
         return deepseek_v4_exl3_catalog(snapshot, &index.weight_map, manifest);
     }
     let draft_stages = index.weight_map.keys()

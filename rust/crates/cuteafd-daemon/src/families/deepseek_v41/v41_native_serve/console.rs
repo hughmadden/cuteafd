@@ -12,7 +12,7 @@
 //! decoding, JSON encoding, the 50 ms frame cadence and the snapshot a newly
 //! connected page starts from.
 use crate::families::deepseek_v41::v41_backbone_lane::FfnSplit;
-use cuteafd_api::native_v41::ConsoleHub;
+use cuteafd_api::openai::ConsoleHub;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;

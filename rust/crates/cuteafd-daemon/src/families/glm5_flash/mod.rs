@@ -8,8 +8,8 @@ pub(crate) mod weights;
 
 use anyhow::{ensure, Result};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::fp8_experts::Fp8ExpertTensors;
-use cuteafd_loader::glm_next::GlmNextConfig;
+use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
+use cuteafd_loader::families::glm5_flash::GlmNextConfig;
 use cuteafd_loader::plan::checkpoint::Checkpoint;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
@@ -23,7 +23,7 @@ pub(crate) struct EngineArgs {
     pub snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
     pub native_lib: PathBuf,
-    #[arg(long, default_value = "/opt/cuteafd/share/DSV4_PROGRAMS.json")]
+    #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
     pub manifest: PathBuf,
     #[arg(long, default_value_t = 0)]
     pub device: i32,
@@ -246,7 +246,7 @@ impl Opened {
     /// Builds the engine and hands it to `body`.
     pub fn with_engine<T>(&self, args: &EngineArgs, body: impl FnOnce(&engine::GlmfEngine<'_>) -> Result<T>)
         -> Result<T> {
-        let programs = self.library.dsv4_programs()?.with_manifest(&args.manifest)?;
+        let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.load_all()?;
         let stream = self.library.cuda_stream_create()?;
         let started = Instant::now();
@@ -331,7 +331,7 @@ impl Opened {
         let Some(peers) = args.peers.as_deref() else { return Ok(None) };
         let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
         let executors: Vec<u64> = (0..peers.len())
-            .map(|rank| cuteafd_transport::v41_expert::v41_spark_executor_id(peers.len(), rank))
+            .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
             .collect::<Result<_>>()?;
         // One transport per prefill lane: each lane's wave stays in flight on its own QPs.
         let transports = (0..engine::PREFILL_LANES).map(|_| crate::shared::spark_intake::SparkLink::new(&self.library,

@@ -71,7 +71,7 @@ rust/crates/cuteafd-daemon/src/v41_vision/	rust/crates/cuteafd-daemon/src/famili
 rust/crates/cuteafd-daemon/src/v41_vision.rs	rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_vision.rs
 rust/crates/cuteafd-daemon/src/v41_window/	rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_window/
 rust/crates/cuteafd-daemon/src/v41_window.rs	rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_window.rs
-rust/crates/cuteafd-ffi/src/dsv4.rs	rust/crates/cuteafd-ffi/src/shared/dsv4.rs
+rust/crates/cuteafd-ffi/src/dsv4.rs	rust/crates/cuteafd-ffi/src/shared/programs.rs
 rust/crates/cuteafd-ffi/src/fp8_gemv.rs	rust/crates/cuteafd-ffi/src/shared/fp8_gemv.rs
 rust/crates/cuteafd-ffi/src/fp8_moe.rs	rust/crates/cuteafd-ffi/src/shared/fp8_moe.rs
 rust/crates/cuteafd-ffi/src/l2_prefetch.rs	rust/crates/cuteafd-ffi/src/shared/l2_prefetch.rs

@@ -102,7 +102,7 @@ mod tests {
     }
     #[tokio::test]
     async fn invalid_completed_schema_output_is_never_successful() {
-        use crate::native_v41::*;
+        use crate::openai::*;
         use axum::{body::{Body, to_bytes}, http::{Request, StatusCode}};
         use tower::ServiceExt;
         for streaming in [false, true] {

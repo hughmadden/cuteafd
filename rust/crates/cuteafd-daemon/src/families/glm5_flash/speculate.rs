@@ -221,7 +221,7 @@ pub(super) fn replay_check(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
     let embed = embed_rows(&opened.checkpoint, &sequence[prefill..prefill + rows], hidden)?;
     let row = hidden * 2;
     let kda_layers = engine.weights.layers.iter()
-        .filter(|l| l.attention == cuteafd_loader::glm_next::GlmNextAttention::Kda).count();
+        .filter(|l| l.attention == cuteafd_loader::families::glm5_flash::GlmNextAttention::Kda).count();
     let fp32_bytes = kda_layers * engine.cfg.kda_heads * 128 * 128 * 4;
     let allocator = std::cell::RefCell::new(Allocator::new(engine.pages, engine.slots));
     let fresh = || -> Result<GlmfPlacement> {

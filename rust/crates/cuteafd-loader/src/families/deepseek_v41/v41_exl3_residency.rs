@@ -339,10 +339,10 @@ mod tests {
             experts: crate::RoutedExpertShape::of_v41(&config),
             config: Some(config),
             naming: crate::V41Exl3Naming::CheckpointNative,
-            decoder_tiers: crate::v41_exl3::decoder_family(&projections).unwrap(),
+            decoder_tiers: crate::families::deepseek_v41::v41_exl3::decoder_family(&projections).unwrap(),
             projections,
             ple_quantization: None,
-            mtp_experts: crate::v41_exl3::V41Exl3MtpExperts::Exl3,
+            mtp_experts: crate::families::deepseek_v41::v41_exl3::V41Exl3MtpExperts::Exl3,
         }
     }
 
@@ -514,7 +514,7 @@ mod tests {
                 }
             }
             manifest.decoder_tiers =
-                crate::v41_exl3::decoder_family(&manifest.projections).unwrap();
+                crate::families::deepseek_v41::v41_exl3::decoder_family(&manifest.projections).unwrap();
             for world in [1, 2, 3, 4] {
                 for rank in 0..world {
                     for (layer, &bits) in family.iter().enumerate() {

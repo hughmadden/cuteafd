@@ -25,7 +25,7 @@ use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
-use cuteafd_loader::mimo_v2::{FusedQkvLayout, MimoAttention, MimoV2Config};
+use cuteafd_loader::families::mimo_v2::{FusedQkvLayout, MimoAttention, MimoV2Config};
 use cuteafd_loader::plan::checkpoint::{Checkpoint, CheckpointTensor};
 use std::collections::HashMap;
 use std::ffi::c_void;

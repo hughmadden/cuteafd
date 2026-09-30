@@ -284,7 +284,7 @@ fn turn_markers_and_client_stop_sequences_end_output() {
 
 mod router {
     use super::*;
-    use crate::native_v41::{router_for_model, ConsoleHub, InferenceChunk, InferenceFinishReason, ModelEncoding,
+    use crate::openai::{router_for_model, ConsoleHub, InferenceChunk, InferenceFinishReason, ModelEncoding,
         ModelProfile, NativeLimits, NativeRequest, PromptUsage};
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};

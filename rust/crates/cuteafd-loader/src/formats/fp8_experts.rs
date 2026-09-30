@@ -22,7 +22,7 @@
 //! slice zero-padded to one 128-aligned width (384): zero gate/up rows give
 //! SiLU(0) * 0 = 0 and zero down columns add nothing, so padding is exact.
 use crate::catalog::read_safetensors_metadata;
-use crate::v41_catalog::RoutedExpertShape;
+use crate::families::deepseek_v41::v41_catalog::RoutedExpertShape;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use std::collections::{BTreeMap, HashMap};
@@ -94,7 +94,7 @@ impl Fp8ExpertTensors {
     /// that each expert tensor present is E4M3 with an FP32 128x128 grid, or
     /// MXFP4 (packed E2M1 U8 with UE8M0 per-32 scales).
     pub fn read(snapshot: &Path, shape: RoutedExpertShape) -> Result<Self> {
-        let index = crate::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)?;
+        let index = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)?;
         let weight_map: BTreeMap<String, String> = serde_json::from_value(
             index.get("weight_map").cloned().context("index has no weight_map")?)?;
         let prefix = if weight_map.keys().any(|name| name.starts_with("model.language_model.layers.")) {

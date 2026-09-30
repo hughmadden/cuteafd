@@ -13,16 +13,16 @@
 use super::weights::{GlmLayer, GlmWeights};
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use crate::shared::spark_intake::{copy_parallel, IntakeMode, SparkIntake, SparkLane, SparkLink};
-use cuteafd_transport::v41_expert::{
+use cuteafd_transport::expert::{
     V41Tp4RoceWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
 };
 use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
 };
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::dsv4::{Dsv4Programs, Dsv4Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
+use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::glm_dsa::GlmDsaConfig;
+use cuteafd_loader::families::glm5::GlmDsaConfig;
 use std::cell::RefCell;
 use std::ffi::c_void;
 
@@ -155,7 +155,7 @@ struct Workspace<'a> {
 
 pub(crate) struct GlmEngine<'a> {
     pub library: &'a NativeLibrary,
-    pub programs: &'a Dsv4Programs<'a>,
+    pub programs: &'a Programs<'a>,
     pub cfg: GlmDsaConfig,
     pub weights: GlmWeights<'a>,
     pub stream: *mut c_void,
@@ -202,7 +202,7 @@ fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
 
 impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(library: &'a NativeLibrary, programs: &'a Dsv4Programs<'a>, cfg: GlmDsaConfig,
+    pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmDsaConfig,
         weights: GlmWeights<'a>, stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize)
         -> Result<Self> {
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
@@ -252,7 +252,7 @@ impl<'a> GlmEngine<'a> {
         DeviceAllocation::new(self.library, bytes.max(256))
     }
 
-    fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Dsv4Scalar]) -> Result<()> {
+    fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
         let names: Vec<&str> = pointers.iter().map(|(n, _)| *n).collect();
         let program = self.programs.program(name, &names)?;
         let raw: Vec<*mut c_void> = pointers.iter().map(|(_, p)| *p).collect();
@@ -452,7 +452,7 @@ impl<'a> GlmEngine<'a> {
         self.put(&w.cache_lengths, &tables.cache_lengths)?;
         self.put(&w.lengths, &tables.lengths)?;
         self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: embed.len(), ..w.h.buffer }, embed)?;
-        let rows = Dsv4Scalar::I32(t as i32);
+        let rows = Scalar::I32(t as i32);
         let cap = if tables.decode { "m64" } else { "m4096" };
         let layers = &self.weights.layers;
         if tables.decode && on_layer.is_none() && layers.len() == self.cfg.layers {
@@ -465,7 +465,7 @@ impl<'a> GlmEngine<'a> {
             // h += attention; x = post_attention_layernorm(h)
             self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                 ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
-                &[rows, Dsv4Scalar::I32(1)])?;
+                &[rows, Scalar::I32(1)])?;
             if layer.dense {
                 self.ffn(w, layer, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)?;
             } else if let Some(skip) = &self.skip {
@@ -484,7 +484,7 @@ impl<'a> GlmEngine<'a> {
             };
             self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                 ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
-                &[rows, Dsv4Scalar::I32(1)])?;
+                &[rows, Scalar::I32(1)])?;
             if let Some(drafter) = &self.drafter {
                 let n = t.min(super::dflash::TAP_ROWS);
                 drafter.tap(index, w.h.buffer.ptr, t - n, n)?;
@@ -521,7 +521,7 @@ impl<'a> GlmEngine<'a> {
     /// select, wire rows); the Spark exchange runs between segments.
     fn decode_layers(&self, w: &Workspace<'_>, tables: &StepTables, t: usize,
         experts: &mut Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>) -> Result<()> {
-        let rows = Dsv4Scalar::I32(t as i32);
+        let rows = Scalar::I32(t as i32);
         let layers = &self.weights.layers;
         // The decode transport's intake planes (or the skip intake's); the
         // replayed graphs bake them in.
@@ -545,7 +545,7 @@ impl<'a> GlmEngine<'a> {
                 let deltas = if matches!(previous, Previous::First) { 0 } else { 1 };
                 self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                     ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
-                    &[rows, Dsv4Scalar::I32(deltas)])?;
+                    &[rows, Scalar::I32(deltas)])?;
                 // `h` now holds the previous layer's output.
                 if let (Some(drafter), Some(previous)) = (&self.drafter, index.checked_sub(1)) {
                     drafter.tap(previous, w.h.buffer.ptr, 0, t)?;
@@ -554,7 +554,7 @@ impl<'a> GlmEngine<'a> {
                 self.attention(w, index, layer, rows, "m64", tables)?;
                 self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                     ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
-                    &[rows, Dsv4Scalar::I32(1)])?;
+                    &[rows, Scalar::I32(1)])?;
                 if layer.dense {
                     self.ffn(w, layer, self.cfg.dense_intermediate, "m64", w.delta.buffer.ptr, rows)
                 } else {
@@ -634,7 +634,7 @@ impl<'a> GlmEngine<'a> {
     /// Router scores, the sigmoid top-k selection and the wire rows (device only).
     fn moe_front(&self, w: &Workspace<'_>, layer: &GlmLayer<'_>, t: usize) -> Result<()> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
-        let rows = Dsv4Scalar::I32(t as i32);
+        let rows = Scalar::I32(t as i32);
         self.run("glm_router_scores", &[("x", w.x.buffer.ptr), ("w", layer.ptr("gate")?),
             ("logits", w.router_logits.buffer.ptr)], &[rows])?;
         // SAFETY: logits, bias and route outputs are live buffers of `t` rows.
@@ -647,7 +647,7 @@ impl<'a> GlmEngine<'a> {
         self.run("glm_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
             // SAFETY: the scale rows follow the payload inside each wire row.
             ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
-            ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Dsv4Scalar::I32(grid as i32)])
+            ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Scalar::I32(grid as i32)])
     }
 
     /// Routes and wire rows down, the shared expert, the Spark exchange and
@@ -707,7 +707,7 @@ impl<'a> GlmEngine<'a> {
         }
         self.profile.borrow_mut()[0] += timer.elapsed().as_secs_f64();
         // The shared expert runs on the GPU while the host sends and the Sparks compute.
-        self.ffn(w, layer, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, Dsv4Scalar::I32(t as i32))
+        self.ffn(w, layer, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, Scalar::I32(t as i32))
     }
 
     /// One request to every Spark rank from the staged routes and wire rows
@@ -813,7 +813,7 @@ impl<'a> GlmEngine<'a> {
         }
         let layers = &self.weights.layers;
         let cap = "m4096";
-        let rows_of = |lane: usize| Dsv4Scalar::I32(counts[lane] as i32);
+        let rows_of = |lane: usize| Scalar::I32(counts[lane] as i32);
         // The drafter taps the chunk's last TAP_ROWS rows: each lane's part of
         // that window, at its offset among the tap rows.
         let window = total - total.min(super::dflash::TAP_ROWS);
@@ -825,7 +825,7 @@ impl<'a> GlmEngine<'a> {
             self.attention(w, index, layer, rows, cap, &lanes[lane])?;
             self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                 ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
-                &[rows, Dsv4Scalar::I32(1)])?;
+                &[rows, Scalar::I32(1)])?;
             if layer.dense {
                 self.ffn(w, layer, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)
             } else {
@@ -844,7 +844,7 @@ impl<'a> GlmEngine<'a> {
             };
             self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                 ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
-                &[rows, Dsv4Scalar::I32(1)])?;
+                &[rows, Scalar::I32(1)])?;
             if let Some(drafter) = &self.drafter {
                 let begin = starts[lane];
                 let from = begin.max(window);
@@ -918,13 +918,13 @@ impl<'a> GlmEngine<'a> {
         }
     }
 
-    fn norm(&self, w: &Workspace<'_>, layer: &GlmLayer<'_>, weight: &str, deltas: i32, rows: Dsv4Scalar) -> Result<()> {
+    fn norm(&self, w: &Workspace<'_>, layer: &GlmLayer<'_>, weight: &str, deltas: i32, rows: Scalar) -> Result<()> {
         self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
             ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr(weight)?), ("out", w.x.buffer.ptr)],
-            &[rows, Dsv4Scalar::I32(deltas)])
+            &[rows, Scalar::I32(deltas)])
     }
 
-    fn attention(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, rows: Dsv4Scalar, cap: &str,
+    fn attention(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, rows: Scalar, cap: &str,
         tables: &StepTables) -> Result<()> {
         let mode = if tables.decode { "decode" } else { "prefill" };
         let kv = &self.kv[index];
@@ -951,7 +951,7 @@ impl<'a> GlmEngine<'a> {
                 ("index_k_cache", index_cache.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
                 ("cache_lengths", w.cache_lengths.buffer.ptr), ("output_indices", w.indices.buffer.ptr),
                 ("scratch", w.topk_scratch.buffer.ptr)],
-                &[rows, Dsv4Scalar::I32(tables.table_width as i32), Dsv4Scalar::I32(tables.table_stride as i32)])?;
+                &[rows, Scalar::I32(tables.table_width as i32), Scalar::I32(tables.table_stride as i32)])?;
         }
         // Shared-indexer layers read the previous full layer's `indices`.
         if !tables.decode && native_mla_prefill() {
@@ -977,7 +977,7 @@ impl<'a> GlmEngine<'a> {
 
     /// SwiGLU MLP (dense layers, or the shared expert) into `out`.
     fn ffn(&self, w: &Workspace<'_>, layer: &GlmLayer<'_>, intermediate: usize, cap: &str, out: *mut c_void,
-        rows: Dsv4Scalar) -> Result<()> {
+        rows: Scalar) -> Result<()> {
         let mut pointers = vec![("x", w.x.buffer.ptr)];
         pointers.extend(weight(layer, "w_gate_up", cap)?);
         pointers.extend(weight(layer, "w_down", cap)?);

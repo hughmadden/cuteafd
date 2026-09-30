@@ -4,7 +4,7 @@
 //! `CUTEAFD_ENABLE_GLM_AOT`) share the table and its manifest.
 //!
 //! Callers name each program and pass its pointers in the documented order;
-//! [`Dsv4Programs::with_manifest`] checks that order against the exporter's
+//! [`Programs::with_manifest`] checks that order against the exporter's
 //! `dsv4_programs.json` so a stale image cannot silently shift arguments.
 use crate::NativeLibrary;
 use anyhow::{bail, ensure, Context, Result};
@@ -33,13 +33,13 @@ type LaunchFn = unsafe extern "C" fn(u32, *const *mut c_void, *const u64, *mut c
 
 /// One scalar launch argument.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Dsv4Scalar {
+pub enum Scalar {
     I32(i32),
     I64(i64),
     F32(f32),
 }
 
-impl Dsv4Scalar {
+impl Scalar {
     fn kind(self) -> u8 {
         match self {
             Self::I32(_) => b'i',
@@ -57,7 +57,7 @@ impl Dsv4Scalar {
 }
 
 #[derive(Debug, Clone)]
-pub struct Dsv4ProgramSpec {
+pub struct ProgramSpec {
     pub name: String,
     pub pointers: Vec<String>,
     pub scalar_kinds: Vec<u8>,
@@ -66,16 +66,16 @@ pub struct Dsv4ProgramSpec {
     pub capacity_rows: u32,
 }
 
-pub struct Dsv4Programs<'a> {
+pub struct Programs<'a> {
     library: &'a NativeLibrary,
     load: LoadFn,
     launch: LaunchFn,
-    programs: HashMap<String, (u32, Dsv4ProgramSpec)>,
+    programs: HashMap<String, (u32, ProgramSpec)>,
 }
 
 impl NativeLibrary {
     /// The DeepSeek V4 programs this library was built with.
-    pub fn dsv4_programs(&self) -> Result<Dsv4Programs<'_>> {
+    pub fn programs(&self) -> Result<Programs<'_>> {
         let count = *unsafe { self.lib.get::<CountFn>(b"cuteafd_dsv4_program_count") }
             .context("native library was built without coordinator programs (CUTEAFD_ENABLE_DSV4_AOT / CUTEAFD_ENABLE_GLM_AOT)")?;
         let info = unsafe { *self.lib.get::<InfoFn>(b"cuteafd_dsv4_program_info")? };
@@ -90,7 +90,7 @@ impl NativeLibrary {
             let name = c_string(&raw.name);
             let kinds = c_string(&raw.scalar_kinds).into_bytes();
             ensure!(kinds.len() == raw.scalars as usize, "program {name} scalar table is inconsistent");
-            let spec = Dsv4ProgramSpec {
+            let spec = ProgramSpec {
                 name: name.clone(),
                 // Positional until a manifest names them.
                 pointers: (0..raw.pointers).map(|i| format!("#{i}")).collect(),
@@ -100,14 +100,22 @@ impl NativeLibrary {
             };
             programs.insert(name, (index, spec));
         }
-        Ok(Dsv4Programs { library: self, load, launch, programs })
+        Ok(Programs { library: self, load, launch, programs })
     }
 }
 
-impl<'a> Dsv4Programs<'a> {
+impl<'a> Programs<'a> {
     /// Attaches pointer names, scratch sizes and capacities from the
     /// exporter manifest, rejecting any disagreement with the native table.
+    /// Images built before the rename ship the manifest as DSV4_PROGRAMS.json;
+    /// a missing PROGRAMS.json falls back to that name beside it.
     pub fn with_manifest(mut self, path: &Path) -> Result<Self> {
+        let fallback = path.with_file_name("DSV4_PROGRAMS.json");
+        let path = if !path.exists() && path.file_name() == Some("PROGRAMS.json".as_ref()) && fallback.exists() {
+            fallback.as_path()
+        } else {
+            path
+        };
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let manifest: serde_json::Value = serde_json::from_str(&text)?;
         let entries = manifest["programs"].as_array().context("manifest has no programs")?;
@@ -144,12 +152,12 @@ impl<'a> Dsv4Programs<'a> {
         self.programs.keys().map(String::as_str)
     }
 
-    pub fn spec(&self, name: &str) -> Result<&Dsv4ProgramSpec> {
+    pub fn spec(&self, name: &str) -> Result<&ProgramSpec> {
         Ok(&self.programs.get(name).with_context(|| format!("no DeepSeek V4 program {name}"))?.1)
     }
 
     /// Resolves a program and loads its kernels on the current device.
-    pub fn program(&self, name: &str, pointer_names: &[&str]) -> Result<Dsv4Program<'_>> {
+    pub fn program(&self, name: &str, pointer_names: &[&str]) -> Result<Program<'_>> {
         let (index, spec) = self.programs.get(name).with_context(|| format!("no DeepSeek V4 program {name}"))?;
         ensure!(pointer_names.len() == spec.pointers.len(), "{name} takes {} pointers, caller passes {}",
             spec.pointers.len(), pointer_names.len());
@@ -162,7 +170,7 @@ impl<'a> Dsv4Programs<'a> {
         // the caller's current device.
         let status = unsafe { (self.load)(*index) };
         ensure!(status == 0, "loading {name} failed with CUDA status {status}");
-        Ok(Dsv4Program { programs: self, index: *index, spec })
+        Ok(Program { programs: self, index: *index, spec })
     }
 
     pub fn library(&self) -> &'a NativeLibrary {
@@ -170,14 +178,14 @@ impl<'a> Dsv4Programs<'a> {
     }
 }
 
-pub struct Dsv4Program<'a> {
-    programs: &'a Dsv4Programs<'a>,
+pub struct Program<'a> {
+    programs: &'a Programs<'a>,
     index: u32,
-    spec: &'a Dsv4ProgramSpec,
+    spec: &'a ProgramSpec,
 }
 
-impl Dsv4Program<'_> {
-    pub fn spec(&self) -> &Dsv4ProgramSpec {
+impl Program<'_> {
+    pub fn spec(&self) -> &ProgramSpec {
         self.spec
     }
 
@@ -185,7 +193,7 @@ impl Dsv4Program<'_> {
     /// Every pointer must reference live device memory of the documented
     /// shape for `rows`, on the device the program was loaded on, and stay
     /// valid until the stream reaches this launch.
-    pub unsafe fn launch(&self, pointers: &[*mut c_void], scalars: &[Dsv4Scalar], stream: *mut c_void) -> Result<()> {
+    pub unsafe fn launch(&self, pointers: &[*mut c_void], scalars: &[Scalar], stream: *mut c_void) -> Result<()> {
         ensure!(pointers.len() == self.spec.pointers.len(), "{}: pointer count", self.spec.name);
         ensure!(scalars.len() == self.spec.scalar_kinds.len(), "{}: scalar count", self.spec.name);
         for (scalar, kind) in scalars.iter().zip(&self.spec.scalar_kinds) {
@@ -214,8 +222,8 @@ mod tests {
 
     #[test]
     fn scalar_slots() {
-        assert_eq!(Dsv4Scalar::I32(-1).slot(), u64::MAX);
-        assert_eq!(Dsv4Scalar::F32(1.0).slot(), 0x3f80_0000);
+        assert_eq!(Scalar::I32(-1).slot(), u64::MAX);
+        assert_eq!(Scalar::F32(1.0).slot(), 0x3f80_0000);
         assert_eq!(c_string(b"abc\0def"), "abc");
     }
 }

@@ -212,7 +212,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     let mut closed = false;
     let mut pending: Option<admission::Pending> = None;
     let mut stats_published = Instant::now();
-    let limits = cuteafd_api::native_v41::NativeLimits::new(args.max_context_tokens, args.max_output_tokens)?;
+    let limits = cuteafd_api::openai::NativeLimits::new(args.max_context_tokens, args.max_output_tokens)?;
     loop {
         prefixes.tick();
         if stats_published.elapsed() >= std::time::Duration::from_secs(1) {
@@ -264,7 +264,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 match admission::Prepared::new(job, &args.snapshot, limits) {
                     Ok(prepared) => prepared,
                     Err(error) => {
-                        let failure = error.downcast_ref::<cuteafd_api::native_v41::NativeFailure>()
+                        let failure = error.downcast_ref::<cuteafd_api::openai::NativeFailure>()
                             .cloned().unwrap_or_else(|| format!("{error:#}").into());
                         let _ = events.blocking_send(Err(failure));
                         continue;
@@ -309,10 +309,10 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                             pending = Some(admission::Pending { prepared, active_when_blocked: active_count });
                             break;
                         }
-                        let _ = events.blocking_send(Err(cuteafd_api::native_v41::NativeFailure::BadRequest(
+                        let _ = events.blocking_send(Err(cuteafd_api::openai::NativeFailure::BadRequest(
                             "prompt plus max_tokens exceeds the GPU KV pool; reduce max_tokens or increase the pool".into())));
                     } else {
-                        let failure = error.downcast_ref::<cuteafd_api::native_v41::NativeFailure>()
+                        let failure = error.downcast_ref::<cuteafd_api::openai::NativeFailure>()
                             .cloned().unwrap_or_else(|| format!("{error:#}").into());
                         let _ = events.blocking_send(Err(failure));
                     }
@@ -394,7 +394,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 }
                 Err(error) => {
                     // Other completed requests retain their caches.
-                    let failure = error.downcast_ref::<cuteafd_api::native_v41::NativeFailure>()
+                    let failure = error.downcast_ref::<cuteafd_api::openai::NativeFailure>()
                         .cloned().unwrap_or_else(|| format!("{error:#}").into());
                     let _ = events.blocking_send(Err(failure));
                     if counted { console::totals::retired(); }

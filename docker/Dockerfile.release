@@ -103,7 +103,7 @@ COPY .cuteafd-release-image/fp8 /opt/cuteafd/lib/fp8
 COPY .cuteafd-release-image/V41_EXPERT_AOT.json /opt/cuteafd/share/V41_EXPERT_AOT.json
 COPY .cuteafd-release-image/V41_EXPERT_TP_AOT.json /opt/cuteafd/share/V41_EXPERT_TP_AOT.json
 COPY .cuteafd-release-image/V41_FP8_AOT.json /opt/cuteafd/share/V41_FP8_AOT.json
-COPY .cuteafd-release-image/DSV4_PROGRAMS.json /opt/cuteafd/share/DSV4_PROGRAMS.json
+COPY .cuteafd-release-image/PROGRAMS.json /opt/cuteafd/share/PROGRAMS.json
 COPY .cuteafd-release-image/THIRD_PARTY_NOTICES.md /opt/cuteafd/share/THIRD_PARTY_NOTICES.md
 COPY .cuteafd-release-image/SPARKINFER_PROVENANCE.json /opt/cuteafd/share/SPARKINFER_PROVENANCE.json
 COPY .cuteafd-release-image/SPARKINFER_LICENSE /opt/cuteafd/share/SPARKINFER_LICENSE

@@ -22,7 +22,7 @@ use deepseek_recipe::stream::{InferenceChunk, InferenceFinishReason};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-use crate::native_v41::{router, NativeRequest};
+use crate::openai::{router, NativeRequest};
 
 const MODEL: &str = "deepseek-ai/DeepSeek-V4.1-Flash";
 
@@ -60,7 +60,7 @@ async fn response_json(response: axum::response::Response) -> (StatusCode, Value
 /// Feed the synthetic worker events for the first queued request.
 fn spawn_driver(
     mut rx: tokio::sync::mpsc::Receiver<NativeRequest>,
-    chunks: Vec<Result<InferenceChunk, crate::native_v41::NativeFailure>>,
+    chunks: Vec<Result<InferenceChunk, crate::openai::NativeFailure>>,
 ) {
     tokio::spawn(async move {
         let job = rx.recv().await.expect("worker receives the request");
@@ -287,8 +287,8 @@ async fn non_stream_body_carries_content_and_finish_reason() {
 async fn native_queue_pressure_is_429_with_retry_after_and_stats() {
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
     let held = tx.clone().reserve_owned().await.unwrap();
-    let app = crate::native_v41::router_with_admission(tx,
-        crate::native_v41::NativeLimits::default(),
+    let app = crate::openai::router_with_admission(tx,
+        crate::openai::NativeLimits::default(),
         std::sync::Arc::new(std::sync::Mutex::new(Value::Null)),
         std::time::Duration::from_millis(1));
     let response = app.clone().oneshot(post_json(valid_request())).await.unwrap();
@@ -314,7 +314,7 @@ async fn native_queue_pressure_is_429_with_retry_after_and_stats() {
 #[tokio::test]
 async fn native_v41_long_offending_input_is_bounded_in_the_error_body() {
     let (queue, _rx) = tokio::sync::mpsc::channel(1);
-    let app = crate::native_v41::router(queue);
+    let app = crate::openai::router(queue);
     let long_string_input = json!({
         "model": "deepseek-ai/DeepSeek-V4.1-Flash",
         "messages": [{"role": "user", "content": "hello"}],

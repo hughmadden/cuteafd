@@ -11,7 +11,7 @@
 //! | upstream invariant                     | cuteafd surface under test |
 //! |----------------------------------------|---------------------------|
 //! | admission gating / capacity accounting | `cuteafd_core::admit_layerwaves_for_iteration` (the per-iteration scheduler admission used by `commands::scheduler_smoke` and `real_full/scheduler/execution/admission.rs`) |
-//! | queue-full rejection shape (503)       | `cuteafd_api::native_v41` router: bounded mpsc queue `try_send` failure -> HTTP 503, closed-queue health -> 503, worker-side admission failure -> 500 with cause retained |
+//! | queue-full rejection shape (503)       | `cuteafd_api::openai` router: bounded mpsc queue `try_send` failure -> HTTP 503, closed-queue health -> 503, worker-side admission failure -> 500 with cause retained |
 //! | delayed admission (min-free-slots)     | sglang policy ported verbatim below as pure functions (`resolve_min_free_slots`, `MinFreeSlotsDelayer::should_delay`) plus a deferred-prefill scheduler simulation against the real `admit_layerwaves_for_iteration` |
 //! | priority under pressure                | `PrefillChunkPolicy::decode_priority` ordering inside `admit_layerwaves_for_iteration` |
 //! | concurrent single-slot admission       | the daemon's own invariant, modeled after `v41_requests::Requests::admit` ("request slot occupied") + the `v41_native_serve/scheduler.rs` slot loop; the real loop needs CUDA machinery so the occupancy arithmetic is modeled here |
@@ -715,10 +715,10 @@ mod slot_admission {
 // ---------------------------------------------------------------------------
 
 mod http_503_mapping {
-    use cuteafd_api::native_v41;
+    use cuteafd_api::openai;
     use std::net::SocketAddr;
 
-    const MODEL: &str = native_v41::MODEL;
+    const MODEL: &str = openai::MODEL;
 
     fn chat_body(max_tokens: u32) -> String {
         format!(
@@ -758,9 +758,9 @@ mod http_503_mapping {
         addr
     }
 
-    fn dummy_job() -> native_v41::NativeRequest {
+    fn dummy_job() -> openai::NativeRequest {
         let (events, _receive) = tokio::sync::mpsc::channel(16);
-        native_v41::NativeRequest {
+        openai::NativeRequest {
             prompt: String::new(),
             constraint: None,
             images: Vec::new(),
@@ -778,11 +778,11 @@ mod http_503_mapping {
         // full queue is transient back-pressure, so it answers 429 with
         // Retry-After (pinned by native_queue_pressure_is_429_with_retry_after_and_stats);
         // 503 is reserved for a closed queue.
-        let (queue, _receive) = tokio::sync::mpsc::channel::<native_v41::NativeRequest>(2);
+        let (queue, _receive) = tokio::sync::mpsc::channel::<openai::NativeRequest>(2);
         for _ in 0..2 {
             queue.try_send(dummy_job()).unwrap();
         }
-        let router = native_v41::router_with_limits(queue, native_v41::NativeLimits::default());
+        let router = openai::router_with_limits(queue, openai::NativeLimits::default());
         let addr = serve(router).await;
         let (status, response) =
             http_request(addr, "POST", "/v1/chat/completions", &chat_body(1)).await;
@@ -796,9 +796,9 @@ mod http_503_mapping {
         // The health endpoint advertises admission availability: a closed
         // queue (worker gone) is 503, matching the upstream invariant that
         // overload/unavailability surfaces as 503, not 500.
-        let (queue, receive) = tokio::sync::mpsc::channel::<native_v41::NativeRequest>(1);
+        let (queue, receive) = tokio::sync::mpsc::channel::<openai::NativeRequest>(1);
         drop(receive);
-        let router = native_v41::router(queue);
+        let router = openai::router(queue);
         let addr = serve(router).await;
         let (status, _) = http_request(addr, "GET", "/health", "").await;
         assert_eq!(status, 503);
@@ -806,8 +806,8 @@ mod http_503_mapping {
 
     #[tokio::test]
     async fn admission_open_queue_health_maps_to_200() {
-        let (queue, _receive) = tokio::sync::mpsc::channel::<native_v41::NativeRequest>(1);
-        let router = native_v41::router(queue);
+        let (queue, _receive) = tokio::sync::mpsc::channel::<openai::NativeRequest>(1);
+        let router = openai::router(queue);
         let addr = serve(router).await;
         let (status, _) = http_request(addr, "GET", "/health", "").await;
         assert_eq!(status, 200);
@@ -818,16 +818,16 @@ mod http_503_mapping {
         // The daemon's scheduler-side admission failure (e.g. pool exhausted
         // during preparation) reaches the client as a 500 carrying the cause,
         // not a fabricated success — pinned by the comment in native_v41.rs.
-        let (queue, mut receive) = tokio::sync::mpsc::channel::<native_v41::NativeRequest>(4);
+        let (queue, mut receive) = tokio::sync::mpsc::channel::<openai::NativeRequest>(4);
         let worker = tokio::spawn(async move {
             while let Some(job) = receive.recv().await {
                 let _ = job
                     .events
-                    .send(Err(native_v41::NativeFailure::from("pool exhausted")))
+                    .send(Err(openai::NativeFailure::from("pool exhausted")))
                     .await;
             }
         });
-        let router = native_v41::router(queue);
+        let router = openai::router(queue);
         let addr = serve(router).await;
         let (status, response) =
             http_request(addr, "POST", "/v1/chat/completions", &chat_body(1)).await;
@@ -840,8 +840,8 @@ mod http_503_mapping {
     async fn admission_invalid_request_maps_to_400_not_503() {
         // Rejection shape discipline: a client-side admission violation
         // (max_tokens=0) is 400, never 503 — 503 is reserved for overload.
-        let (queue, _receive) = tokio::sync::mpsc::channel::<native_v41::NativeRequest>(1);
-        let router = native_v41::router(queue);
+        let (queue, _receive) = tokio::sync::mpsc::channel::<openai::NativeRequest>(1);
+        let router = openai::router(queue);
         let addr = serve(router).await;
         let (status, response) =
             http_request(addr, "POST", "/v1/chat/completions", &chat_body(0)).await;

@@ -24,12 +24,12 @@ use super::weights::{Qwen4Layer, Qwen4Weights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::dsv4::{Dsv4Programs, Dsv4Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
+use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::fp8_experts::Fp8ExpertTensors;
-use cuteafd_loader::qwen4_exp::{NgramHistory, Qwen4Attention, Qwen4Config};
+use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
+use cuteafd_loader::families::qwen4::{NgramHistory, Qwen4Attention, Qwen4Config};
 use crate::shared::spark_intake::SparkLink;
-use cuteafd_transport::v41_expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+use cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
 use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
 };
@@ -325,7 +325,7 @@ pub(crate) enum MtpSource {
 
 pub(crate) struct Qwen4Engine<'a> {
     pub library: &'a NativeLibrary,
-    pub programs: &'a Dsv4Programs<'a>,
+    pub programs: &'a Programs<'a>,
     pub cfg: Qwen4Config,
     pub weights: Qwen4Weights<'a>,
     pub ple: Option<super::ple::PleTable<'a>>,
@@ -408,7 +408,7 @@ type Forced<'h> = Option<&'h dyn Fn(usize) -> Option<Vec<u8>>>;
 
 impl<'a> Qwen4Engine<'a> {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(library: &'a NativeLibrary, programs: &'a Dsv4Programs<'a>, cfg: Qwen4Config, weights: Qwen4Weights<'a>,
+    pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: Qwen4Config, weights: Qwen4Weights<'a>,
         ple: Option<super::ple::PleTable<'a>>, stream: *mut c_void, max_context: usize, prefill_rows: usize,
         pages: usize, slots: usize) -> Result<Self> {
         cfg.check_programs()?;
@@ -591,7 +591,7 @@ impl<'a> Qwen4Engine<'a> {
         DeviceAllocation::new(self.library, bytes.max(256))
     }
 
-    fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Dsv4Scalar]) -> Result<()> {
+    fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
         let names: Vec<&str> = pointers.iter().map(|(n, _)| *n).collect();
         let program = self.programs.program(name, &names)?;
         let raw: Vec<*mut c_void> = pointers.iter().map(|(_, p)| *p).collect();
@@ -839,7 +839,7 @@ impl<'a> Qwen4Engine<'a> {
         // SAFETY: the engine owns this stream; the previous commit's table is consumed.
         unsafe { self.library.cuda_stream_synchronize(self.stream)? };
         self.put(&self.commit_tables, &table)?;
-        let i32s = |v: usize| -> Result<Dsv4Scalar> { Ok(Dsv4Scalar::I32(i32::try_from(v)?)) };
+        let i32s = |v: usize| -> Result<Scalar> { Ok(Scalar::I32(i32::try_from(v)?)) };
         if let (Some(conv), Some(state), Some(replay)) = (&self.gdn_conv, &self.gdn_state, &self.gdn_replay) {
             self.run("qwen4_gdn_commit", &[("state", state.buffer.ptr), ("conv_state", conv.buffer.ptr),
                 ("replay", replay.buffer.ptr), ("tables", self.commit_tables.buffer.ptr)],
@@ -983,7 +983,7 @@ impl<'a> Qwen4Engine<'a> {
         self.stage_table(w, &w.pool_table, &tables.pool_table)?;
         self.stage_table(w, &w.hidden_rows, &hidden_rows)?;
         self.stage(w, w.x.buffer, embed)?;
-        let rows = Dsv4Scalar::I32(t as i32);
+        let rows = Scalar::I32(t as i32);
         let cap = if decode { "m64" } else { "m4096" };
         self.run("qwen4_mtp_feedback", &[("hidden", src), ("hidden_rows", w.hidden_rows.buffer.ptr),
             ("embed", w.x.buffer.ptr), ("norm_hidden", mtp.norm_hidden.buffer.ptr),
@@ -1022,7 +1022,7 @@ impl<'a> Qwen4Engine<'a> {
         match &mtp.head_fp8 {
             Some((q, scale)) if n <= FP8_HEAD_ROWS => self.run("qwen4_head_fp8", &[("x", w.delta.buffer.ptr),
                 ("w_fp8", q.buffer.ptr), ("scale", scale.buffer.ptr), ("logits", w.logits.buffer.ptr)],
-                &[Dsv4Scalar::I32(n as i32)])?,
+                &[Scalar::I32(n as i32)])?,
             // SAFETY: the gathered rows, the shared head and the logits are live buffers of these shapes.
             _ => unsafe {
                 w.head.launch(w.delta.buffer.ptr.cast(), self.weights.head.buffer.ptr.cast(),
@@ -1083,7 +1083,7 @@ impl<'a> Qwen4Engine<'a> {
             }
         }
         self.stage(w, w.streams[0].buffer, &streams)?;
-        let rows = Dsv4Scalar::I32(t as i32);
+        let rows = Scalar::I32(t as i32);
         if self.use_graphs && tables.decode && on_layer.is_none() && forced.is_none() {
             return self.decode_graphed(w, tables, t, rows, logit_rows);
         }
@@ -1139,7 +1139,7 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     /// The stream mixer and lm_head over the last `logit_rows` rows.
-    fn logits(&self, w: &Workspace<'_>, streams: &Dev<'_>, t: usize, rows: Dsv4Scalar, logit_rows: usize)
+    fn logits(&self, w: &Workspace<'_>, streams: &Dev<'_>, t: usize, rows: Scalar, logit_rows: usize)
         -> Result<Vec<f32>> {
         let h = self.cfg.hidden;
         let [norm, down, up] = &self.weights.mixer;
@@ -1174,7 +1174,7 @@ impl<'a> Qwen4Engine<'a> {
     /// later layers twice (their attention entry, then the MLP site), and the
     /// final segment once; the parity is the same every step, so replays
     /// track it without running the closures.
-    fn decode_graphed(&self, w: &Workspace<'_>, tables: &StepTables, t: usize, rows: Dsv4Scalar, logit_rows: usize)
+    fn decode_graphed(&self, w: &Workspace<'_>, tables: &StepTables, t: usize, rows: Scalar, logit_rows: usize)
         -> Result<Option<Vec<f32>>> {
         let layers = &self.weights.layers;
         let mut cur = 0usize;
@@ -1247,7 +1247,7 @@ impl<'a> Qwen4Engine<'a> {
     /// `hc_post_pre` posts it (into the other buffer) and enters.
     #[allow(clippy::too_many_arguments)]
     fn enter(&self, w: &Workspace<'_>, cur: &mut usize, posted: Option<()>, layer: &Qwen4Layer<'_>, index: usize,
-        rows: Dsv4Scalar, spec: bool) -> Result<()> {
+        rows: Scalar, spec: bool) -> Result<()> {
         let [norm, di, up] = Self::site(layer, "attn")?;
         if posted.is_some() {
             self.post_pre(w, *cur, layer, "attn", rows)?;
@@ -1264,7 +1264,7 @@ impl<'a> Qwen4Engine<'a> {
 
     /// `delta` (the finished sublayer's output) into streams `cur` (written
     /// to the other buffer), then `site`'s input from them.
-    fn post_pre(&self, w: &Workspace<'_>, cur: usize, layer: &Qwen4Layer<'_>, site: &str, rows: Dsv4Scalar) -> Result<()> {
+    fn post_pre(&self, w: &Workspace<'_>, cur: usize, layer: &Qwen4Layer<'_>, site: &str, rows: Scalar) -> Result<()> {
         let [norm, di, up] = Self::site(layer, site)?;
         self.run("qwen4_hc_post_pre", &[("x", w.delta.buffer.ptr), ("residual", w.streams[cur].buffer.ptr),
             ("inject", w.inject.buffer.ptr), ("norm", norm), ("w_di", di), ("w_up", up),
@@ -1273,14 +1273,14 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     /// `delta` into streams `cur` alone (written to the other buffer).
-    fn post(&self, w: &Workspace<'_>, cur: &mut usize, rows: Dsv4Scalar) -> Result<()> {
+    fn post(&self, w: &Workspace<'_>, cur: &mut usize, rows: Scalar) -> Result<()> {
         self.run("qwen4_hc_post", &[("x", w.delta.buffer.ptr), ("residual", w.streams[*cur].buffer.ptr),
             ("inject", w.inject.buffer.ptr), ("out", w.streams[*cur ^ 1].buffer.ptr)], &[rows])?;
         *cur ^= 1;
         Ok(())
     }
 
-    fn ple(&self, w: &Workspace<'_>, streams: &Dev<'_>, layer: &Qwen4Layer<'_>, rows: Dsv4Scalar, spec: bool)
+    fn ple(&self, w: &Workspace<'_>, streams: &Dev<'_>, layer: &Qwen4Layer<'_>, rows: Scalar, spec: bool)
         -> Result<()> {
         let table = self.ple.as_ref().context("PLE layer without the n-gram table (--ple)")?;
         let state = self.ple_state.as_ref().context("PLE conv state")?;
@@ -1291,7 +1291,7 @@ impl<'a> Qwen4Engine<'a> {
             ("norm_key", layer.ptr("ple.norm_key")?), ("norm_query", layer.ptr("ple.norm_query")?),
             ("norm_conv", layer.ptr("ple.norm_conv")?), ("conv_w", layer.ptr("ple.conv_w")?),
             ("conv_state", state.buffer.ptr), ("slots", w.slots.buffer.ptr), ("seq_first", w.seq_first.buffer.ptr),
-            ("replay", replay.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows, Dsv4Scalar::I32(i32::from(spec))])
+            ("replay", replay.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows, Scalar::I32(i32::from(spec))])
     }
 
     /// Decode-shaped steps use the E4M3 programs when the layer carries E4M3 copies.
@@ -1299,7 +1299,7 @@ impl<'a> Qwen4Engine<'a> {
         cap == "m64" && layer.has("w_in_fp8")
     }
 
-    fn gdn(&self, w: &Workspace<'_>, index: usize, layer: &Qwen4Layer<'_>, rows: Dsv4Scalar, cap: &str, spec: bool)
+    fn gdn(&self, w: &Workspace<'_>, index: usize, layer: &Qwen4Layer<'_>, rows: Scalar, cap: &str, spec: bool)
         -> Result<()> {
         let ord = self.gdn_ord[index].context("GDN layer without a state pool")?;
         let [conv, state, replay] = self.gdn_pools(ord)?;
@@ -1323,14 +1323,14 @@ impl<'a> Qwen4Engine<'a> {
         pointers.push(("scratch", w.scratch.buffer.ptr));
         let name = if fp8 { format!("qwen4_gdn_fp8_{cap}") } else { format!("qwen4_gdn_{cap}") };
         if decode {
-            self.run(&name, &pointers, &[rows, Dsv4Scalar::I32(i32::from(spec))])
+            self.run(&name, &pointers, &[rows, Scalar::I32(i32::from(spec))])
         } else {
             ensure!(!spec, "speculative steps take the decode programs");
             self.run(&name, &pointers, &[rows])
         }
     }
 
-    fn full(&self, w: &Workspace<'_>, index: usize, layer: &Qwen4Layer<'_>, rows: Dsv4Scalar, cap: &str,
+    fn full(&self, w: &Workspace<'_>, index: usize, layer: &Qwen4Layer<'_>, rows: Scalar, cap: &str,
         tables: &StepTables) -> Result<()> {
         let cache = self.kv[index].as_ref().context("full attention layer without a record pool")?;
         let (keys, blocks) = self.index[index].as_ref().context("full attention layer without an index cache")?;
@@ -1341,7 +1341,7 @@ impl<'a> Qwen4Engine<'a> {
     /// `keys` and pooled block keys `blocks` (a target layer's or the MTP layer's).
     #[allow(clippy::too_many_arguments)]
     fn attend(&self, w: &Workspace<'_>, layer: &Qwen4Layer<'_>, cache: *mut c_void, keys: *mut c_void,
-        blocks: *mut c_void, rows: Dsv4Scalar, cap: &str, tables: &StepTables) -> Result<()> {
+        blocks: *mut c_void, rows: Scalar, cap: &str, tables: &StepTables) -> Result<()> {
         let fp8 = self.fp8(layer, cap);
         let mut pointers = vec![("x", w.x.buffer.ptr), ("w_in", layer.ptr("w_in")?)];
         if fp8 {
@@ -1359,14 +1359,14 @@ impl<'a> Qwen4Engine<'a> {
             self.run(&format!("qwen4_index_topk_{cap}"), &[("index_q", w.index_q.buffer.ptr),
                 ("positions", w.positions.buffer.ptr), ("index_cache", blocks),
                 ("page_table", w.pool_table.buffer.ptr), ("output_indices", w.blocks.buffer.ptr),
-                ("scratch", w.topk_scratch.buffer.ptr)], &[rows, Dsv4Scalar::I32(tables.pool_stride as i32)])?;
+                ("scratch", w.topk_scratch.buffer.ptr)], &[rows, Scalar::I32(tables.pool_stride as i32)])?;
         }
         self.run("qwen4_index_expand", &[("positions", w.positions.buffer.ptr), ("blocks", w.blocks.buffer.ptr),
             ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr)], &[rows])?;
         self.run(&format!("qwen4_sparse_gqa_{cap}"), &[("query", w.query.buffer.ptr), ("kv_cache", cache),
             ("positions", w.positions.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
             ("indices", w.indices.buffer.ptr), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
-            &[rows, Dsv4Scalar::I32(tables.page_width as i32), Dsv4Scalar::I32(tables.page_stride as i32)])?;
+            &[rows, Scalar::I32(tables.page_width as i32), Scalar::I32(tables.page_stride as i32)])?;
         let mut pointers = vec![("attn", w.attn.buffer.ptr), ("gate", w.gate.buffer.ptr), ("w_o", layer.ptr("w_o")?)];
         if fp8 {
             pointers.extend([("w_o_fp8", layer.ptr("w_o_fp8")?), ("w_o_scale", layer.ptr("w_o_scale")?)]);
@@ -1377,7 +1377,7 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     /// Router, shared expert and routed experts; leaves `bf16(routed + shared)` in `delta`.
-    fn moe(&self, w: &Workspace<'_>, index: usize, layer: &Qwen4Layer<'_>, t: usize, rows: Dsv4Scalar, decode: bool)
+    fn moe(&self, w: &Workspace<'_>, index: usize, layer: &Qwen4Layer<'_>, t: usize, rows: Scalar, decode: bool)
         -> Result<()> {
         self.moe_front(w, index, layer, t, rows)?;
         self.moe_experts(w, index, t, rows, decode)
@@ -1385,7 +1385,7 @@ impl<'a> Qwen4Engine<'a> {
 
     /// Router logits, the softmax top-10, the shared expert (into `shared`)
     /// and, for wire-fed experts, the FP8 K32 wire rows. No host sync.
-    fn moe_front(&self, w: &Workspace<'_>, index: usize, layer: &Qwen4Layer<'_>, t: usize, rows: Dsv4Scalar)
+    fn moe_front(&self, w: &Workspace<'_>, index: usize, layer: &Qwen4Layer<'_>, t: usize, rows: Scalar)
         -> Result<()> {
         let h = self.cfg.hidden;
         let experts = self.experts.as_ref().with_context(|| format!(
@@ -1406,12 +1406,12 @@ impl<'a> Qwen4Engine<'a> {
             self.run("qwen4_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
                 // SAFETY: the scale rows follow the payload inside each wire row.
                 ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
-                ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Dsv4Scalar::I32(grid as i32)])?;
+                ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Scalar::I32(grid as i32)])?;
         }
         Ok(())
     }
 
-    fn shared(&self, w: &Workspace<'_>, layer: &Qwen4Layer<'_>, rows: Dsv4Scalar) -> Result<()> {
+    fn shared(&self, w: &Workspace<'_>, layer: &Qwen4Layer<'_>, rows: Scalar) -> Result<()> {
         self.run("qwen4_shared", &[("x", w.x.buffer.ptr), ("w_gate_up", layer.ptr("shared.w_gate_up")?),
             ("w_down", layer.ptr("shared.w_down")?), ("out", w.shared.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
             &[rows])
@@ -1419,7 +1419,7 @@ impl<'a> Qwen4Engine<'a> {
 
     /// The routed experts of layer `index` (the front ran); leaves
     /// `bf16(routed + shared)` in `delta`.
-    fn moe_experts(&self, w: &Workspace<'_>, index: usize, t: usize, rows: Dsv4Scalar, decode: bool) -> Result<()> {
+    fn moe_experts(&self, w: &Workspace<'_>, index: usize, t: usize, rows: Scalar, decode: bool) -> Result<()> {
         let h = self.cfg.hidden;
         match self.experts.as_ref().context("MoE layer without experts")? {
             Experts::Local(local) => {
@@ -1473,7 +1473,7 @@ impl<'a> Qwen4Engine<'a> {
     /// Routes and wire rows down, one request to every Spark rank, the BF16
     /// rank partials and the shared expert summed into `delta`.
     #[allow(clippy::too_many_arguments)]
-    fn spark_moe(&self, w: &Workspace<'_>, index: usize, t: usize, rows: Dsv4Scalar, decode: bool,
+    fn spark_moe(&self, w: &Workspace<'_>, index: usize, t: usize, rows: Scalar, decode: bool,
         transport: &mut SparkLink<'_>,
         runtime: &tokio::runtime::Runtime) -> Result<()> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };

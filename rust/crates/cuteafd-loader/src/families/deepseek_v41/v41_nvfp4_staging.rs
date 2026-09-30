@@ -9,7 +9,7 @@ use crate::OfficialV41Catalog;
 use anyhow::{ensure, Context, Result};
 use std::ops::Range;
 
-use crate::v41_expert_staging::V41ExpertSelection;
+use crate::families::deepseek_v41::v41_expert_staging::V41ExpertSelection;
 
 /// Number of staged regions: three packed weights, three scale planes and
 /// six replicated FP32 scalars.

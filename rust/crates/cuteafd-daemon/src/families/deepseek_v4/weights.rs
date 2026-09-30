@@ -4,9 +4,9 @@
 //! which the scale-prep program re-lays into MMA tile order.
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::dsv4::{Dsv4Programs, Dsv4Scalar};
+use cuteafd_ffi::programs::{Programs, Scalar};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::deepseek_v4::DeepseekV4Config;
+use cuteafd_loader::families::deepseek_v4::DeepseekV4Config;
 use cuteafd_loader::OfficialV41Catalog;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -124,7 +124,7 @@ fn layer_sources(cfg: &DeepseekV4Config, ratio: usize) -> Vec<Source> {
 pub(crate) struct WeightLoader<'a, 'p> {
     pub library: &'a NativeLibrary,
     pub catalog: &'a OfficialV41Catalog,
-    pub programs: &'p Dsv4Programs<'a>,
+    pub programs: &'p Programs<'a>,
     pub family: &'static str,
     pub stream: *mut c_void,
 }
@@ -164,7 +164,7 @@ impl<'a> WeightLoader<'a, '_> {
         // the stream is synchronized before `source` drops.
         unsafe {
             program.launch(&[source.buffer.ptr, output.buffer.ptr],
-                &[Dsv4Scalar::I32(n_blocks as i32), Dsv4Scalar::I32(k_blocks as i32)], self.stream)?;
+                &[Scalar::I32(n_blocks as i32), Scalar::I32(k_blocks as i32)], self.stream)?;
             self.library.cuda_stream_synchronize(self.stream)?;
         }
         Ok(output)

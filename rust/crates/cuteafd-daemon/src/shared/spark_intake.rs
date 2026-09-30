@@ -32,7 +32,7 @@
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
-use cuteafd_transport::v41_expert::{V41LaneBuild, V41Tp4Roce, V41Tp4RoceLane, V41Tp4RoceWave, V41WaveReceipt};
+use cuteafd_transport::expert::{V41LaneBuild, V41Tp4Roce, V41Tp4RoceLane, V41Tp4RoceWave, V41WaveReceipt};
 use cuteafd_transport::{DeviceLanding, GpuLandingProbe, VerbsHostProtocolV2ResponsePayload};
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
@@ -663,7 +663,7 @@ impl<'a> SparkLane<'a> {
 
     /// Waits for the submitted wave and orders `stream` after its planes.
     pub(crate) fn wait(&mut self, t: usize, timeout: std::time::Duration, stream: *mut c_void)
-        -> Result<cuteafd_transport::v41_expert::V41LaneTimes> {
+        -> Result<cuteafd_transport::expert::V41LaneTimes> {
         let times = self.lane.wait(timeout)?;
         self.intake.after_lane(t, times.landed, stream)?;
         Ok(times)

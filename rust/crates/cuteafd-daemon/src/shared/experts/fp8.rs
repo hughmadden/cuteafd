@@ -11,7 +11,7 @@ use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::fp8_moe::{Fp8MoeModule, FP8_MOE_POINTERS};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::fp8_experts::{Fp8ExpertTensors, Fp8Projection};
+use cuteafd_loader::formats::fp8_experts::{Fp8ExpertTensors, Fp8Projection};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
@@ -117,7 +117,7 @@ impl<'a> Fp8Experts<'a> {
                 directory.display()))?;
         let info = module.info().clone();
         let shape = tensors.shape();
-        let mxfp4 = tensors.format() == cuteafd_loader::fp8_experts::ExpertFormat::Mxfp4;
+        let mxfp4 = tensors.format() == cuteafd_loader::formats::fp8_experts::ExpertFormat::Mxfp4;
         ensure!(info.hidden == shape.hidden && info.experts == shape.experts && info.topk == shape.topk
             && info.intermediate == shape.intermediate && info.tp == tp && info.mxfp4 == mxfp4
             && info.slice == tensors.slice(tp)?,

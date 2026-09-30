@@ -1,7 +1,7 @@
 //! Cross-host native wire qualification without checkpoint/GPU compute.
 //! server <rank 0..3> <bind>, or client <peer0> <peer1> <peer2> <peer3>.
 use anyhow::{bail, ensure, Result};
-use cuteafd_transport::{v41_expert::*, *};
+use cuteafd_transport::{expert::*, *};
 use std::{sync::Arc, time::Duration};
 
 struct Fixture(u64);

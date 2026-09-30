@@ -11,11 +11,11 @@ use std::cell::RefCell;
 use super::weights::{LayerWeights, ModelWeights};
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::dsv4::{Dsv4Program, Dsv4Programs, Dsv4Scalar};
+use cuteafd_ffi::programs::{Program, Programs, Scalar};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::deepseek_v4::DeepseekV4Config;
+use cuteafd_loader::families::deepseek_v4::DeepseekV4Config;
 use crate::shared::spark_intake::SparkLink;
-use cuteafd_transport::v41_expert::{V41Tp4RoceWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
+use cuteafd_transport::expert::{V41Tp4RoceWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
 use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype,
     ExpertV2SourceKind,
@@ -30,7 +30,7 @@ type Dev<'a> = DeviceAllocation<'a>;
 
 pub(crate) struct Engine<'a> {
     pub library: &'a NativeLibrary,
-    pub programs: &'a Dsv4Programs<'a>,
+    pub programs: &'a Programs<'a>,
     pub cfg: DeepseekV4Config,
     pub weights: ModelWeights<'a>,
     pub family: &'static str,
@@ -124,7 +124,7 @@ impl Profile {
 /// Everything an [`Engine`] needs besides its pools and workspaces.
 pub(crate) struct EngineParts<'a> {
     pub library: &'a NativeLibrary,
-    pub programs: &'a Dsv4Programs<'a>,
+    pub programs: &'a Programs<'a>,
     pub cfg: DeepseekV4Config,
     pub weights: ModelWeights<'a>,
     pub family: &'static str,
@@ -199,7 +199,7 @@ struct Workspace<'a> {
     /// Pinned staging: routes + wire rows down, rank partials up.
     router_host: HostAllocation<'a>,
     // Drops before its workspace below.
-    head: cuteafd_ffi::dsv4::VocabularyHead<'a>,
+    head: cuteafd_ffi::programs::VocabularyHead<'a>,
     _head_workspace: Dev<'a>,
 }
 
@@ -231,11 +231,11 @@ impl<'a> Engine<'a> {
         Ok(allocation)
     }
 
-    fn program(&self, name: &str, pointers: &[&str]) -> Result<Dsv4Program<'a>> {
+    fn program(&self, name: &str, pointers: &[&str]) -> Result<Program<'a>> {
         self.programs.program(&format!("{}_{name}", self.family), pointers)
     }
 
-    fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Dsv4Scalar]) -> Result<()> {
+    fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
         let names: Vec<&str> = pointers.iter().map(|(n, _)| *n).collect();
         let program = self.program(name, &names)?;
         let raw: Vec<*mut c_void> = pointers.iter().map(|(_, p)| *p).collect();
@@ -329,7 +329,7 @@ impl<'a> Engine<'a> {
         let h = self.cfg.dim;
         let heads = self.cfg.n_heads;
         let (experts, topk) = (self.cfg.n_routed_experts, self.cfg.n_activated_experts);
-        let head_workspace = self.alloc(cuteafd_ffi::dsv4::VOCABULARY_HEAD_WORKSPACE)?;
+        let head_workspace = self.alloc(cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE)?;
         let mut topk_scratch = 0usize;
         for route in [format!("decode_m{}", self.decode_rows), format!("prefill_m{}", self.prefill_rows)] {
             let spec = self.programs.spec(&format!("{}_index_topk_{route}", self.family))?;
@@ -571,7 +571,7 @@ impl<'a> Engine<'a> {
             self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: token_bytes.len(), ..lane.tokens.buffer }, &token_bytes)?;
         }
         let cap = if decode { self.decode_rows } else { self.prefill_rows };
-        let rows_of = |lane: usize| Dsv4Scalar::I32(lanes[lane].tables.rows as i32);
+        let rows_of = |lane: usize| Scalar::I32(lanes[lane].tables.rows as i32);
         if decode {
             let (tables, lane) = (lanes[0].tables, &w.lanes[0]);
             let (t, rows) = (tables.rows, rows_of(0));
@@ -721,7 +721,7 @@ impl<'a> Engine<'a> {
 
     /// The layer's routed partials + shared expert, reduced, then mHC post
     /// into stream a.
-    fn post(&self, w: &Workspace<'_>, lane: &Lane<'_>, ranks: usize, planes: [*const u16; 6], rows: Dsv4Scalar,
+    fn post(&self, w: &Workspace<'_>, lane: &Lane<'_>, ranks: usize, planes: [*const u16; 6], rows: Scalar,
         layer: usize) -> Result<()> {
         if ranks == LOCAL_EXPERTS {
             let output = self.local.borrow().as_ref().context("local experts")?.output.buffer.ptr;
@@ -730,7 +730,7 @@ impl<'a> Engine<'a> {
                 ("prev_comb", lane.comb.buffer.ptr), ("out", lane.stream_a.buffer.ptr),
             ], &[rows]);
         }
-        let Dsv4Scalar::I32(count) = rows else { unreachable!() };
+        let Scalar::I32(count) = rows else { unreachable!() };
         let reducer = self.library.v41_compact_reducer()?;
         // SAFETY: the transport's intake planes, shared and delta are live
         // [rows, h] BF16 buffers on this device, ordered after the wave's
@@ -757,7 +757,7 @@ impl<'a> Engine<'a> {
         tables: &StepTables,
         lane: &Lane<'_>,
         w: &Workspace<'_>,
-        rows: Dsv4Scalar,
+        rows: Scalar,
         cap: usize,
     ) -> Result<()> {
         let m = &lane.tables;
@@ -798,7 +798,7 @@ impl<'a> Engine<'a> {
             ("base", weights.ptr("ffn.base")?), ("norm", weights.ptr("ffn.norm")?), ("residual_out", b.buffer.ptr),
             ("post", lane.post.buffer.ptr), ("comb", lane.comb.buffer.ptr), ("y", w.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
         ], &[rows])?;
-        let Dsv4Scalar::I32(t) = rows else { unreachable!() };
+        let Scalar::I32(t) = rows else { unreachable!() };
         let h = self.cfg.dim;
         self.run("router_scores", &[
             ("x", w.y.buffer.ptr), ("w", weights.ptr("gate")?), ("logits", w.logits.buffer.ptr),
@@ -821,7 +821,7 @@ impl<'a> Engine<'a> {
             // SAFETY: the scale rows follow the payload inside each wire row.
             ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
             ("scale_mma_ptr", w.dummy.buffer.ptr),
-        ], &[rows, Dsv4Scalar::I32(grid as i32)])
+        ], &[rows, Scalar::I32(grid as i32)])
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -834,7 +834,7 @@ impl<'a> Engine<'a> {
         m: &StepBuffers<'_>,
         w: &Workspace<'_>,
         rope: &Dev<'_>,
-        rows: Dsv4Scalar,
+        rows: Scalar,
         cap: usize,
     ) -> Result<(&'static str, *mut c_void, *mut c_void, *mut c_void)> {
         let dummy = w.dummy.buffer.ptr;
@@ -875,7 +875,7 @@ impl<'a> Engine<'a> {
             let completed = names[0].1[0].max(1);
             let program = if tables.start == 0 { "prefill" } else { "continuation" };
             self.run(&format!("compressor_{program}_c{ratio}"), &pointers,
-                &[rows, Dsv4Scalar::I32(completed), Dsv4Scalar::I32(1)])
+                &[rows, Scalar::I32(completed), Scalar::I32(1)])
         }
         .with_context(|| format!("layer {layer} compressor"))?;
         if groups == 0 {
@@ -896,7 +896,7 @@ impl<'a> Engine<'a> {
             ("index_k_cache", cache.index.as_ref().context("index cache")?.buffer.ptr),
             ("page_table", m.c4_page_table.buffer.ptr), ("cache_lengths", m.c4_visible.buffer.ptr),
             ("output_indices", w.selected.buffer.ptr), ("scratch", w.topk_scratch.buffer.ptr),
-        ], &[rows, Dsv4Scalar::I32(tables.c4_table_width as i32), Dsv4Scalar::I32(tables.c4_table_stride as i32)])?;
+        ], &[rows, Scalar::I32(tables.c4_table_width as i32), Scalar::I32(tables.c4_table_stride as i32)])?;
         Ok(("c4", compressed, w.selected.buffer.ptr, m.c4_indexed_lengths.buffer.ptr))
     }
 
@@ -939,7 +939,7 @@ impl<'a> Engine<'a> {
     }
 
     /// The shared expert on the unit's FFN input `y` into the lane's `shared`.
-    fn shared_ffn(&self, layer: usize, w: &Workspace<'_>, lane: &Lane<'_>, rows: Dsv4Scalar, cap: usize,
+    fn shared_ffn(&self, layer: usize, w: &Workspace<'_>, lane: &Lane<'_>, rows: Scalar, cap: usize,
         weights: &LayerWeights<'_>) -> Result<()> {
         self.run(&format!("shared_ffn_m{cap}"), &[
             ("x", w.y.buffer.ptr), ("w13", weights.ptr("w13")?), ("w13_scale", weights.ptr("w13_scale")?),
@@ -951,7 +951,7 @@ impl<'a> Engine<'a> {
     /// Shared and routed experts of a coordinator-resident layer: routes,
     /// wire rows and results stay on the device, the host only enqueues.
     fn local_experts(&self, layer: usize, t: usize, w: &Workspace<'_>, lane: &Lane<'_>, cap: usize) -> Result<()> {
-        self.shared_ffn(layer, w, lane, Dsv4Scalar::I32(t as i32), cap, &self.weights.layers[layer])?;
+        self.shared_ffn(layer, w, lane, Scalar::I32(t as i32), cap, &self.weights.layers[layer])?;
         let timer = Instant::now();
         let mut local = self.local.borrow_mut();
         let local = local.as_mut().context("local experts")?;
@@ -1030,7 +1030,7 @@ impl<'a> Engine<'a> {
         let request = self.stage_request(layer, t, w, ExpertV2SourceKind::Decode)?;
         let wave = transport.dispatch(&request)?;
         // The shared expert runs on the GPU while the Sparks compute.
-        self.shared_ffn(layer, w, lane, Dsv4Scalar::I32(t as i32), cap, &self.weights.layers[layer])?;
+        self.shared_ffn(layer, w, lane, Scalar::I32(t as i32), cap, &self.weights.layers[layer])?;
         runtime.block_on(self.land(transport, wave, t, w))
     }
 
@@ -1042,7 +1042,7 @@ impl<'a> Engine<'a> {
             ("residual", stream.buffer.ptr), ("fn", self.weights.head_fn.buffer.ptr),
             ("scale", self.weights.head_scale.buffer.ptr), ("base", self.weights.head_base.buffer.ptr),
             ("norm", self.weights.norm.buffer.ptr), ("collapsed", w.delta.buffer.ptr), ("out", w.y.buffer.ptr),
-        ], &[Dsv4Scalar::I32(t as i32)])?;
+        ], &[Scalar::I32(t as i32)])?;
         // SAFETY: input, weights and logits are live buffers of the head's
         // shape; the last `n` rows start `t - n` rows into `y`.
         unsafe {

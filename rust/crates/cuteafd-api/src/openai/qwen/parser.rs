@@ -22,8 +22,8 @@ use deepseek_recipe::stream::OutputChunk;
 use deepseek_recipe_core::tools::ToolDefinition;
 use serde_json::Value;
 
-use crate::native_v41::glm::parser::GlmStop;
-use crate::native_v41::glm::TextParser;
+use crate::openai::glm::parser::GlmStop;
+use crate::openai::glm::TextParser;
 
 pub const THINK_OPEN: &str = "<think>";
 pub const THINK_CLOSE: &str = "</think>";

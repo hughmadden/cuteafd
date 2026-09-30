@@ -18,3 +18,31 @@ rust/crates/cuteafd-daemon/	\bcrate::mimo\b	crate::families::mimo_v2
 rust/crates/cuteafd-daemon/	\bcrate::qwen4\b	crate::families::qwen4
 # relative paths the move of constraints/fp8/service broke
 rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_native_serve/	\bsuper::constraints\b	crate::shared::constraints
+# ffi: the program table is every family's, not DeepSeek V4's
+rust/crates/	\bcuteafd_ffi::dsv4\b	cuteafd_ffi::programs
+rust/crates/	\bDsv4Programs\b	Programs
+rust/crates/	\bDsv4ProgramSpec\b	ProgramSpec
+rust/crates/	\bDsv4Program\b	Program
+rust/crates/	\bDsv4Scalar\b	Scalar
+rust/crates/	\.dsv4_programs\(\)	.programs()
+rust/crates/	\bfn dsv4_programs\(	fn programs(
+# loader: families/ and formats/ are the module paths; long family ids
+rust/crates/	\bcuteafd_loader::glm_dsa\b	cuteafd_loader::families::glm5
+rust/crates/	\bcuteafd_loader::glm_next\b	cuteafd_loader::families::glm5_flash
+rust/crates/	\bcuteafd_loader::qwen4_exp\b	cuteafd_loader::families::qwen4
+rust/crates/	\bcuteafd_loader::(deepseek_v4|mimo_v2)\b	cuteafd_loader::families::\1
+rust/crates/	\bcuteafd_loader::fp8_experts\b	cuteafd_loader::formats::fp8_experts
+# transport/api: the expert client and the OpenAI API under their own names
+rust/crates/	\bcuteafd_transport::v41_expert\b	cuteafd_transport::expert
+rust/crates/	\bcuteafd_api::native_v41\b	cuteafd_api::openai
+rust/crates/	(?<![\w:])v41_expert::	expert::
+rust/crates/	(?<![\w:])native_v41::	openai::
+rust/crates/cuteafd-transport/	\bcrate::v41_expert\b	crate::expert
+rust/crates/cuteafd-api/	\bcrate::native_v41\b	crate::openai
+# loader internals
+rust/crates/cuteafd-loader/	\bcrate::(v41_[a-z0-9_]+|engram_[a-z]+)\b	crate::families::deepseek_v41::\1
+rust/crates/cuteafd-loader/	\bcrate::(attention_format|dspark_format|exl3_format|expert_format|fp8_experts)\b	crate::formats::\1
+rust/crates/cuteafd-loader/	\bcrate::glm_dsa\b	crate::families::glm5
+rust/crates/cuteafd-loader/	\bcrate::glm_next\b	crate::families::glm5_flash
+rust/crates/cuteafd-loader/	\bcrate::qwen4_exp\b	crate::families::qwen4
+rust/crates/cuteafd-loader/	\bcrate::(deepseek_v4|mimo_v2)\b	crate::families::\1

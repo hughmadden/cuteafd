@@ -1,6 +1,6 @@
 //! Host-built step metadata for DeepSeek V4: RoPE tables and the slot, window
 //! and compressor tables one sequence prefilled from position 0 needs.
-use cuteafd_loader::deepseek_v4::DeepseekV4Config;
+use cuteafd_loader::families::deepseek_v4::DeepseekV4Config;
 
 pub(crate) const WINDOW: usize = 128;
 pub(crate) const SOURCE_PAGE_TOKENS: usize = 256;

@@ -13,7 +13,7 @@ use crate::shared::experts::fp8::{package_directory, Fp8Experts};
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{Context, Result};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::fp8_experts::{ExpertFormat, Fp8ExpertTensors, Fp8Projection};
+use cuteafd_loader::formats::fp8_experts::{ExpertFormat, Fp8ExpertTensors, Fp8Projection};
 use cuteafd_loader::OfficialV41Catalog;
 use cuteafd_transport::ExpertProtocolV2RouteEntry;
 use std::collections::BTreeMap;

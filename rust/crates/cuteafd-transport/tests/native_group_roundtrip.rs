@@ -29,7 +29,7 @@ use cuteafd_core::{
     replicated_expert_tie_seed, ReplicatedExpertCostModel, ReplicatedExpertScheduleConfig,
     ReplicatedExpertScheduler, INACTIVE_REPLICATED_EXPERT_GROUP,
 };
-use cuteafd_transport::v41_expert::{
+use cuteafd_transport::expert::{
     V41BackboneRequest, V41NativeOwnerRouteWord, V41SparkTopology, V41Tp4ChunkReceiver,
     V41_NATIVE_GROUP_REQUEST_FLAG, V41_NATIVE_UNASSIGNED_EXPERT_ID, V41_PARTIAL_ROW_BYTES,
     V41_ROUTED_EXPERTS, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,

@@ -224,7 +224,7 @@ fn unique_json(text: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_v41::*;
+    use crate::openai::*;
     use axum::{body::{Body, to_bytes}, http::{Request, StatusCode}};
     use tower::ServiceExt;
 

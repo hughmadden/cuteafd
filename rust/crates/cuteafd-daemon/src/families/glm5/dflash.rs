@@ -27,7 +27,7 @@
 use crate::shared::fp8_linear::{self, Fp8Weight};
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::dsv4::{VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
+use cuteafd_ffi::programs::{VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::{read_safetensors_metadata, SafetensorsTensorMetadata};
 use std::cell::RefCell;

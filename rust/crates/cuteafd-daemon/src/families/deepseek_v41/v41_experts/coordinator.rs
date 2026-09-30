@@ -7,7 +7,7 @@ use cuteafd_core::{
 };
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41CompactReducer};
 use cuteafd_transport::{
-    v41_expert::{V41SparkTopology, V41Tp4RocePending, V41Tp4Roce, V41_PARTIAL_ROW_BYTES,
+    expert::{V41SparkTopology, V41Tp4RocePending, V41Tp4Roce, V41_PARTIAL_ROW_BYTES,
         V41_ROUTED_EXPERTS},
     ExpertProtocolV2Request, VerbsHostProtocolV2ResponsePayload,
 };
@@ -732,7 +732,7 @@ impl<'w> NativePendingFfn<'w, '_, '_> {
 mod replicated_tests {
     use super::*;
     use cuteafd_transport::{
-        v41_expert::{V41BackboneRequest, V41NativeOwnerRouteWord, V41_NATIVE_GROUP_REQUEST_FLAG},
+        expert::{V41BackboneRequest, V41NativeOwnerRouteWord, V41_NATIVE_GROUP_REQUEST_FLAG},
         ExpertProtocolV2RowDescriptor, ExpertProtocolV2RouteEntry, ExpertV2Dtype, ExpertV2SourceKind,
     };
 
@@ -761,7 +761,7 @@ mod replicated_tests {
             vec![0; rows * 5280],
         ).unwrap();
         request.header.flags |=
-            cuteafd_transport::v41_expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+            cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         request
     }
 
@@ -948,7 +948,7 @@ mod replicated_tests {
                     assert_eq!(ids[index], expert as i32);
                     assert_eq!(weights[index], 1.0 / 6.0);
                 } else {
-                    assert_eq!(ids[index], cuteafd_transport::v41_expert::V41_NATIVE_UNASSIGNED_EXPERT_ID);
+                    assert_eq!(ids[index], cuteafd_transport::expert::V41_NATIVE_UNASSIGNED_EXPERT_ID);
                     assert_eq!(weights[index], 0.0);
                 }
             }
@@ -981,7 +981,7 @@ mod replicated_tests {
             } else {
                 assert_eq!(
                     ids,
-                    vec![cuteafd_transport::v41_expert::V41_NATIVE_UNASSIGNED_EXPERT_ID; 6]
+                    vec![cuteafd_transport::expert::V41_NATIVE_UNASSIGNED_EXPERT_ID; 6]
                 );
                 assert!(weights.iter().all(|&weight| weight == 0.0));
             }
@@ -1216,7 +1216,7 @@ mod upload_tests {
                     (0..rows).flat_map(|r| (0..6).map(move |j| ExpertProtocolV2RouteEntry {
                         row_index: r, expert_id: (r*7+j)%384, gate_weight: 1.0/6.0,
                     })).collect(), hidden)?;
-                request.header.flags = cuteafd_transport::v41_expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+                request.header.flags = cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
                 for fail in [false,true,false] {
                     request_id += 1;
                     request.header.request_id = request_id;

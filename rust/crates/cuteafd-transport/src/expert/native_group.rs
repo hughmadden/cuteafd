@@ -351,7 +351,7 @@ impl crate::ExpertProtocolV2Request {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v41_expert::{
+    use crate::expert::{
         tests::request, V41BackboneRequest, V41Tp4ChunkReceiver, V41Tp4Planes, V41Tp4Roce,
         V41Tp4Tcp, V41_EXL3_PAIRED_REQUEST_FLAG, V41_PARTIAL_ROW_BYTES,
     };
@@ -694,7 +694,7 @@ mod tests {
 
         // A canonical (non-compact) request cannot adopt the contract.
         let mut compactless = canonical.clone();
-        compactless.header.flags &= !crate::v41_expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+        compactless.header.flags &= !crate::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         assert!(compactless
             .with_native_group_owners(&vec![0u8; V41_ROUTED_EXPERTS], topology)
             .is_err());
@@ -1003,7 +1003,7 @@ mod tests {
 
     #[test]
     fn generic_protocol_flag_validator_bounds_the_new_flag() -> Result<()> {
-        use crate::v41_expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+        use crate::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         let compact = EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         // Native group flag alone, with the paired flag, or with foreign flags.
         for flags in [

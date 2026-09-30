@@ -8,7 +8,7 @@ use crate::families::deepseek_v41::v41_engram::{
 use crate::families::deepseek_v41::v41_index_lane::IndexLaneWeights;
 use crate::families::deepseek_v41::v41_requests::{RequestTokens, Requests};
 use crate::families::deepseek_v41::v41_target_embedding::TargetEmbeddingWave;
-use cuteafd_transport::v41_expert::V41Tp4Roce;
+use cuteafd_transport::expert::V41Tp4Roce;
 use cuteafd_transport::{ExpertV2SourceKind, TcpTransportConfig};
 use std::{
     net::SocketAddr,

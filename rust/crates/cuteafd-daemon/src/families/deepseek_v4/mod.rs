@@ -8,7 +8,7 @@ pub(crate) mod weights;
 
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::deepseek_v4::DeepseekV4Config;
+use cuteafd_loader::families::deepseek_v4::DeepseekV4Config;
 use crate::shared::spark_intake::SparkLink;
 use cuteafd_transport::TcpTransportConfig;
 use std::os::unix::fs::FileExt;
@@ -27,7 +27,7 @@ pub(crate) struct EngineArgs {
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
     pub native_lib: PathBuf,
     /// dsv4_programs.json written by the exporter next to the library.
-    #[arg(long, default_value = "/opt/cuteafd/share/DSV4_PROGRAMS.json")]
+    #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
     pub manifest: PathBuf,
     #[arg(long, default_value_t = 0)]
     pub device: i32,
@@ -147,7 +147,7 @@ pub(crate) fn with_engine<T>(
     args: &EngineArgs,
     body: impl FnOnce(&engine::Engine<'_>, &mut [SparkLink<'_>], &tokio::runtime::Runtime) -> Result<T>,
 ) -> Result<T> {
-    let programs = loaded.library.dsv4_programs()?.with_manifest(&args.manifest)?;
+    let programs = loaded.library.programs()?.with_manifest(&args.manifest)?;
     let started = Instant::now();
     programs.load_all()?;
     tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 programs loaded");
@@ -195,7 +195,7 @@ pub(crate) fn with_engine<T>(
     *engine.local.borrow_mut() = local;
     // Implicit Spark worlds: TP4 executors 1..=4, TP2 5..=6, TP3 7..=9, TP6 27..=32.
     let executors = (0..peers.len())
-        .map(|rank| cuteafd_transport::v41_expert::v41_spark_executor_id(peers.len(), rank))
+        .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
         .collect::<Result<Vec<u64>>>()?;
     // One transport (connection set) per prefill lane, so each lane can keep
     // a Spark wave in flight; decode uses the first.

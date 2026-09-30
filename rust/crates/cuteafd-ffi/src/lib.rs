@@ -1,30 +1,27 @@
 mod families;
 mod shared;
-// Old crate-root module paths, kept while the tree moves (naming pass drops them).
-pub use shared::{dsv4, fp8_moe};
-use shared::{vocab_head, v41_experts, v41_device_ops, v41_exl3_wire, v41_router, v41_exl3};
-use families::deepseek_v41::{v41_candidate_blocks, v41_index_topk, v41_index_scores, v41_kv, v41_sparse_attention, v41_compressor, v41_vision, v41_dspark_attention, v41_grouped_output, v41_attention_ops, v41_dspark_cache, v41_hc, v41_dspark, v41_fp8, v41_fp8_plan};
-pub use vocab_head::VOCAB_HEAD_ROWS_MAX;
-pub use v41_device_ops::{V41Bf16Add, V41PeerCopy};
-pub use v41_candidate_blocks::V41CandidateBlocks;
-pub use v41_index_topk::V41IndexTopK;
-pub use v41_sparse_attention::{V41SparseAttention, V41SparseBatch, V41SparseSource, V41SparseWindow};
-pub use v41_index_scores::V41IndexScores;
-pub use v41_kv::{V41Kv, V41KvStoreLayer, V41KvStoreLayers};
-pub use v41_vision::V41VisionOps;
-pub use v41_compressor::V41Compressor;
-pub use v41_dspark_attention::{V41DsparkAttention,V41AttentionWindow};
-pub use v41_grouped_output::{V41GroupedOutput, V41_GROUPED_OUTPUT_WORKSPACE};
-pub use v41_attention_ops::V41AttentionOps;
-pub use v41_dspark_cache::{V41DsparkCache, V41KvWrite};
-pub use v41_router::V41Router;
-pub use v41_hc::V41Hc;
-pub use v41_dspark::{V41DraftStep, V41DsparkConfidence, V41VocabularyProjection};
-pub use v41_fp8::{V41Fp8Info, V41Fp8Kernel, V41SharedSwiGlu};
-pub use v41_fp8_plan::{V41Fp8Plan, V41Fp8PlanInfo};
-pub use v41_exl3::{exl3_shard_widths, V41Exl3Info, V41Exl3Kernel, V41Exl3Layout, V41Exl3Routes};
-pub use v41_exl3_wire::V41Exl3Wire;
-pub use v41_experts::{
+pub use shared::{fp8_moe, programs};
+pub use shared::vocab_head::VOCAB_HEAD_ROWS_MAX;
+pub use shared::v41_device_ops::{V41Bf16Add, V41PeerCopy};
+pub use families::deepseek_v41::v41_candidate_blocks::V41CandidateBlocks;
+pub use families::deepseek_v41::v41_index_topk::V41IndexTopK;
+pub use families::deepseek_v41::v41_sparse_attention::{V41SparseAttention, V41SparseBatch, V41SparseSource, V41SparseWindow};
+pub use families::deepseek_v41::v41_index_scores::V41IndexScores;
+pub use families::deepseek_v41::v41_kv::{V41Kv, V41KvStoreLayer, V41KvStoreLayers};
+pub use families::deepseek_v41::v41_vision::V41VisionOps;
+pub use families::deepseek_v41::v41_compressor::V41Compressor;
+pub use families::deepseek_v41::v41_dspark_attention::{V41DsparkAttention,V41AttentionWindow};
+pub use families::deepseek_v41::v41_grouped_output::{V41GroupedOutput, V41_GROUPED_OUTPUT_WORKSPACE};
+pub use families::deepseek_v41::v41_attention_ops::V41AttentionOps;
+pub use families::deepseek_v41::v41_dspark_cache::{V41DsparkCache, V41KvWrite};
+pub use shared::v41_router::V41Router;
+pub use families::deepseek_v41::v41_hc::V41Hc;
+pub use families::deepseek_v41::v41_dspark::{V41DraftStep, V41DsparkConfidence, V41VocabularyProjection};
+pub use families::deepseek_v41::v41_fp8::{V41Fp8Info, V41Fp8Kernel, V41SharedSwiGlu};
+pub use families::deepseek_v41::v41_fp8_plan::{V41Fp8Plan, V41Fp8PlanInfo};
+pub use shared::v41_exl3::{exl3_shard_widths, V41Exl3Info, V41Exl3Kernel, V41Exl3Layout, V41Exl3Routes};
+pub use shared::v41_exl3_wire::V41Exl3Wire;
+pub use shared::v41_experts::{
     V41ExpertInfo, V41ExpertInputQuantizer, V41ExpertKernel, V41ExpertLaunchArgs, V41ExpertPacker, V41ExpertPointer, V41ExpertOutputKind,
     V41CompactReducer, V41LocalExpertReducer, V41Tp2ExpertReducer, V41RouteReducer, V41_EXPERT_POINTER_COUNT,
     v41_pack_intermediate_supported, v41_rank_count_supported,

@@ -16,7 +16,7 @@
 //! n-gram history rewound, and the kept rows' streams stashed for the MTP.
 use super::engine::{MtpGroup, MtpRow, MtpSource, Qwen4Engine, Qwen4Placement, DECODE_ROWS, MTP_PENDING_ROWS};
 use anyhow::{ensure, Result};
-use cuteafd_loader::qwen4_exp::NgramHistory;
+use cuteafd_loader::families::qwen4::NgramHistory;
 
 /// A sequence's MTP bookkeeping: stash rows (position, token at position + 1)
 /// whose pairs are not in the MTP's history yet.

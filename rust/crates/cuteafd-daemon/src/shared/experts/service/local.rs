@@ -119,7 +119,7 @@ pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()>
         })?;
     let executor_id = match config.topology {
         Some(topology) => topology.executor_id(config.rank)?,
-        None => cuteafd_transport::v41_expert::v41_spark_executor_id(config.world, config.rank)?,
+        None => cuteafd_transport::expert::v41_spark_executor_id(config.world, config.rank)?,
     };
     let mut connections = Vec::<LocalVerbsExpertConnection>::with_capacity(16);
     // Structured startup evidence: one line per rank naming the native role and

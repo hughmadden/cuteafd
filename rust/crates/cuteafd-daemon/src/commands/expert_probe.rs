@@ -14,7 +14,7 @@ mod local;
 use crate::cli::ExpertProbeArgs;
 use anyhow::{ensure, Context, Result};
 use cuteafd_transport::{
-    v41_expert::{V41Tp4Roce, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16},
+    expert::{V41Tp4Roce, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16},
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,
     ExpertV2Dtype, ExpertV2SourceKind, TcpTransportConfig,
 };
@@ -147,7 +147,7 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
     let config = TcpTransportConfig { timing: false, timeout: Duration::from_secs(60), max_frame_bytes: 64 << 20 };
     // Implicit Spark worlds: TP4 ranks are executors 1..=4, TP2 5..=6, TP3 7..=9.
     let executors = (0..peers.len())
-        .map(|rank| cuteafd_transport::v41_expert::v41_spark_executor_id(peers.len(), rank))
+        .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
         .collect::<Result<Vec<u64>>>()?;
     if let Some(modes) = args.intake.as_deref() {
         return intake::run(&args, &intake::parse_modes(modes)?, &peers, &executors, &mut request, hidden).await;
@@ -202,7 +202,7 @@ async fn remote_partials(args: &ExpertProbeArgs, rows: usize, hidden: usize, top
         .context("--peers takes comma-separated HOST:PORT addresses")?;
     let config = TcpTransportConfig { timing: false, timeout: Duration::from_secs(60), max_frame_bytes: 64 << 20 };
     let executors = (0..peers.len())
-        .map(|rank| cuteafd_transport::v41_expert::v41_spark_executor_id(peers.len(), rank))
+        .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
         .collect::<Result<Vec<u64>>>()?;
     let mut client = V41Tp4Roce::new_ranks(&peers, &executors, args.capacity, config)?;
     let mut actual = vec![0f32; rows * hidden];

@@ -14,7 +14,7 @@ use crate::families::deepseek_v41::v41_target_head::{TargetHeadWave, TargetHeadW
 use crate::families::deepseek_v41::v41_tensors::{NativeRtxTensors, VocabularyHead};
 use anyhow::Context;
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_transport::v41_expert::V41Tp4Roce;
+use cuteafd_transport::expert::V41Tp4Roce;
 use cuteafd_transport::{ExpertV2SourceKind, TcpTransportConfig};
 use std::{
     net::SocketAddr,

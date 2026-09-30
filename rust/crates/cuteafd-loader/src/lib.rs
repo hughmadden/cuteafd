@@ -1,40 +1,31 @@
-mod families;
-mod formats;
-// Old crate-root module paths, kept while the tree moves (naming pass drops them).
-pub use families::deepseek_v4;
-pub use families::glm5 as glm_dsa;
-pub use families::glm5_flash as glm_next;
-pub use families::mimo_v2;
-pub use families::qwen4 as qwen4_exp;
-pub use formats::fp8_experts;
-use formats::{attention_format, dspark_format, exl3_format, expert_format};
-use families::deepseek_v41::{engram_pipeline, engram_gather, engram_staging, v41_expert_staging, v41_catalog, v41_config, v41_exl3, v41_exl3_staging, v41_exl3_residency, v41_nvfp4, v41_nvfp4_staging, v41_image, engram_tokenizer, engram_prefetch};
-pub use engram_pipeline::{EngramPipeline, EngramRequestTokens, EngramWave};
-pub use engram_gather::{
+pub mod families;
+pub mod formats;
+pub use families::deepseek_v41::engram_pipeline::{EngramPipeline, EngramRequestTokens, EngramWave};
+pub use families::deepseek_v41::engram_gather::{
     EngramGatherer, EngramGatherLease, EngramGatherPoll, EngramGatherTicket, EngramGatherTiming,
 };
-pub use engram_staging::{EngramBatchStaging, EngramGatherView};
-pub use v41_expert_staging::{V41ExpertSelection, V41ExpertStaging};
-pub use v41_catalog::{
+pub use families::deepseek_v41::engram_staging::{EngramBatchStaging, EngramGatherView};
+pub use families::deepseek_v41::v41_expert_staging::{V41ExpertSelection, V41ExpertStaging};
+pub use families::deepseek_v41::v41_catalog::{
     read_expert_catalog, read_official_v41_catalog, OfficialV41Catalog, RoutedExpertShape,
     V41StorageBudget, V41Tensor, V41TensorPlacement, V41CoordinatorTensorReader,
 };
-pub use v41_exl3_residency::{V41Exl3Layer, V41Exl3Load, V41Exl3Residency, V41Exl3ResidentBuffer};
-pub use v41_exl3_staging::V41Exl3TensorSlice;
-pub use v41_exl3::{read_v41_exl3_manifest, V41Exl3Manifest, V41Exl3Naming, V41Exl3Projection,
+pub use families::deepseek_v41::v41_exl3_residency::{V41Exl3Layer, V41Exl3Load, V41Exl3Residency, V41Exl3ResidentBuffer};
+pub use families::deepseek_v41::v41_exl3_staging::V41Exl3TensorSlice;
+pub use families::deepseek_v41::v41_exl3::{read_v41_exl3_manifest, V41Exl3Manifest, V41Exl3Naming, V41Exl3Projection,
     V41Exl3ProjectionKind, V41Exl3Partition, V41_EXL3_SCHEMA};
-pub use v41_nvfp4::{
+pub use families::deepseek_v41::v41_nvfp4::{
     is_v41_nvfp4_publication, read_v41_nvfp4_contract, V41Nvfp4Contract, V41Nvfp4ExpertLayout,
 };
-pub use v41_nvfp4_staging::{V41Nvfp4Staging, V41_NVFP4_STAGING_SLOTS};
-pub use v41_image::{V41Image, V41ImageGrid, V41ImageSpan, V41VisionPrompt, V41ImageTokenType,
+pub use families::deepseek_v41::v41_nvfp4_staging::{V41Nvfp4Staging, V41_NVFP4_STAGING_SLOTS};
+pub use families::deepseek_v41::v41_image::{V41Image, V41ImageGrid, V41ImageSpan, V41VisionPrompt, V41ImageTokenType,
     V41_IMAGE_TOKEN_ID, V41_MAX_IMAGES};
-pub use v41_config::{
+pub use families::deepseek_v41::v41_config::{
     read_official_v41_config, OfficialV41Config, V41QuantizationConfig, V41RopeScaling,
     V41TextConfig, V41VisionConfig, OFFICIAL_V41_MODEL_ID, OFFICIAL_V41_REVISION,
 };
-pub use engram_tokenizer::EngramTokenMap;
-pub use engram_prefetch::{EngramEncoding, EngramPrefetcher, EngramTable, PrefetchOutcome, PrefetchTicket};
+pub use families::deepseek_v41::engram_tokenizer::EngramTokenMap;
+pub use families::deepseek_v41::engram_prefetch::{EngramEncoding, EngramPrefetcher, EngramTable, PrefetchOutcome, PrefetchTicket};
 mod mapped_rows;
 pub use mapped_rows::MappedRows;
 mod catalog;
@@ -43,7 +34,7 @@ mod tensors;
 mod tokenizer;
 pub mod plan;
 
-pub use attention_format::{
+pub use formats::attention_format::{
     native_deepseek_v4_attention_tensor_specs, validate_native_deepseek_v4_attention_catalog,
     NativeDeepseekV4AttentionCatalogSummary, NativeDeepseekV4AttentionTensorFamily,
     NativeDeepseekV4AttentionTensorSpec, NATIVE_ATTENTION_FP8_BLOCK,
@@ -52,11 +43,11 @@ pub use catalog::{
     build_catalog, build_catalog_for_snapshot, classification_summary_markdown, read_model_facts,
     read_safetensors_metadata, SafetensorsTensorMetadata,
 };
-pub use dspark_format::{
+pub use formats::dspark_format::{
     native_deepseek_v4_dspark_tensor_specs, validate_native_deepseek_v4_dspark_catalog,
     NativeDeepseekV4DsparkCatalogSummary, NativeDeepseekV4DsparkTensorSpec,
 };
-pub use exl3_format::{
+pub use formats::exl3_format::{
     exl3_expert, exl3_expert_trellis_bits, exl3_projection_trellis_bits,
     exl3_trellis_bits_for_recipe, is_deepseek_v4_exl3_recipe, is_deepseek_v4_mixed_exl3_recipe,
     validate_exl3_expert_catalog, Exl3CatalogSummary, Exl3Expert, Exl3Projection,
@@ -67,7 +58,7 @@ pub use exl3_format::{
     DEEPSEEK_V4_EXL3_T12_LUT_BYTES, DEEPSEEK_V4_EXL3_TENSOR_FORMAT, DEEPSEEK_V4_EXL3_TRELLIS_BITS,
     EXLLAMAV3_REPOSITORY, EXLLAMAV3_REVISION, EXLLAMAV3_SOURCE_TREE_SHA256,
 };
-pub use expert_format::{
+pub use formats::expert_format::{
     native_fp4_expert, validate_native_fp4_expert_catalog, NativeFp4CatalogSummary,
     NativeFp4Expert, NativeFp4Projection, NativeFp4ProjectionKind, NativeFp4TpExpertShard,
     NativeFp4TpProjectionShard, NativeFp4TpTensorWindow, NATIVE_FP4_K_BLOCK,

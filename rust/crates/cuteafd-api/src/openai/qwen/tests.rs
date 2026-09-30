@@ -1,6 +1,6 @@
 use super::fixtures::{encoding, GOLDENS, TEMPLATE};
 use super::*;
-use crate::native_v41::glm::parser::GlmStop;
+use crate::openai::glm::parser::GlmStop;
 use deepseek_recipe::stream::OutputChunk;
 use deepseek_recipe_core::tools::ToolDefinition;
 use prompt::QwenToolChoice;
@@ -248,7 +248,7 @@ fn stop_sequences_match_visible_content_only() {
 
 #[test]
 fn tool_constraints_use_the_qwen_xml_style() {
-    use crate::native_v41::tools::{ToolConstraints, ToolSyntax};
+    use crate::openai::tools::{ToolConstraints, ToolSyntax};
     use deepseek_recipe_core::tools::ToolChoice;
     let constraints = ToolConstraints::new(&tools(), ToolChoice::Auto, true, true, false, ToolSyntax::QwenXml)
         .unwrap().unwrap();

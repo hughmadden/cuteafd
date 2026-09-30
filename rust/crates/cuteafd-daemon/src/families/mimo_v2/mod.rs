@@ -8,7 +8,7 @@ pub(crate) mod weights;
 
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::mimo_v2::MimoV2Config;
+use cuteafd_loader::families::mimo_v2::MimoV2Config;
 use cuteafd_loader::plan::checkpoint::Checkpoint;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
@@ -22,7 +22,7 @@ pub(crate) struct EngineArgs {
     pub snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
     pub native_lib: PathBuf,
-    #[arg(long, default_value = "/opt/cuteafd/share/DSV4_PROGRAMS.json")]
+    #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
     pub manifest: PathBuf,
     #[arg(long, default_value_t = 0)]
     pub device: i32,
@@ -173,7 +173,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
 impl Opened {
     /// Builds the engine and hands it to `body`.
     pub fn with_engine<T>(&self, args: &EngineArgs, body: impl FnOnce(&engine::MimoEngine<'_>) -> Result<T>) -> Result<T> {
-        let programs = self.library.dsv4_programs()?.with_manifest(&args.manifest)?;
+        let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.load_all()?;
         let draft_dir = args.draft.as_deref().map(dflash::drafter_dir);
         let draft_file = draft_dir.as_deref().map(dflash::prefetch);
@@ -181,7 +181,7 @@ impl Opened {
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::MimoLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
-            checkpoint_tp: cuteafd_loader::mimo_v2::checkpoint_tp(&args.snapshot)?, fp8_decode: args.fp8_decode,
+            checkpoint_tp: cuteafd_loader::families::mimo_v2::checkpoint_tp(&args.snapshot)?, fp8_decode: args.fp8_decode,
             fp8_head: args.fp8_head, fp8_o_proj: args.fp8_o_proj, fp8_scales: args.fp8_scales };
         let model = loader.model(&self.cfg, layers)?;
         let mtp = if args.mtp > 0 {
@@ -195,7 +195,7 @@ impl Opened {
                 self.library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
                 Ok(allocation)
             };
-            let (h, record) = (self.cfg.hidden, self.cfg.record_elems(cuteafd_loader::mimo_v2::MimoAttention::Sliding));
+            let (h, record) = (self.cfg.hidden, self.cfg.record_elems(cuteafd_loader::families::mimo_v2::MimoAttention::Sliding));
             let stages = (0..args.mtp).map(|k| -> Result<mtp::MtpStage<'_>> {
                 let [eh, enorm, hnorm, final_norm] = loader.mtp_extras(k)?;
                 Ok(mtp::MtpStage { layer: loader.mtp_layer(&self.cfg, k)?, eh, enorm, hnorm, final_norm,
@@ -282,7 +282,7 @@ impl Opened {
         let Some(peers) = args.peers.as_deref() else { return Ok(None) };
         let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
         let executors: Vec<u64> = (0..peers.len())
-            .map(|rank| cuteafd_transport::v41_expert::v41_spark_executor_id(peers.len(), rank))
+            .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
             .collect::<Result<_>>()?;
         let mut transport = crate::shared::spark_intake::SparkLink::new(&self.library, &peers, &executors,
             u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
@@ -309,7 +309,7 @@ impl Opened {
                     route_count: topk as u32,
                 }).collect(),
                 routes, vec![0; rows * row_bytes])?;
-            request.header.flags |= cuteafd_transport::v41_expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+            request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
             Ok(request)
         };
         let mut warmups = vec![warm(args.prefill_rows, args.expert_input.bf16(false))?];

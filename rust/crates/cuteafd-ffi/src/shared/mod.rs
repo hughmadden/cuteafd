@@ -1,9 +1,9 @@
 //! Bindings every family uses (program table, expert kernels, FP8 GEMV/MoE,
 //! L2 prefetch, vocabulary head, peer copy, EXL3 wire and packages).
 
-pub mod dsv4;
 pub(crate) mod fp8_gemv;
 pub mod fp8_moe;
+pub mod programs;
 pub(crate) mod l2_prefetch;
 pub(crate) mod v41_device_ops;
 pub(crate) mod v41_exl3;

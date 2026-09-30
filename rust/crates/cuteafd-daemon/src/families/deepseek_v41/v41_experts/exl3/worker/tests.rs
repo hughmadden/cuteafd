@@ -2,7 +2,7 @@ use super::*;
 use crate::families::deepseek_v41::v41_experts::ExpertLayer;
 use crate::shared::memory::HostAllocation;
 use cuteafd_transport::{
-    v41_expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16, ExpertProtocolV2Request,
+    expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16, ExpertProtocolV2Request,
     ExpertProtocolV2ResponseView, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,
     ExpertV2SourceKind, EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM,
 };
@@ -258,7 +258,7 @@ fn paired_worker_loading_rejects_wrong_rank_and_mixed_capacities() -> Result<()>
 #[ignore = "requires paired Spark package, paired reference fixtures, snapshot and CUDA"]
 fn paired_worker_mapped_and_chunked_match_reference() -> Result<()> {
     use cuteafd_loader::V41Exl3Partition;
-    use cuteafd_transport::v41_expert::{V41PairedRouteWord, V41_EXL3_PAIRED_REQUEST_FLAG};
+    use cuteafd_transport::expert::{V41PairedRouteWord, V41_EXL3_PAIRED_REQUEST_FLAG};
     let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
     lib.cuda_set_device(0)?;
     let snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_EXL3_SNAPSHOT")?);

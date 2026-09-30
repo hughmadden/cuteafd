@@ -13,8 +13,8 @@ use crate::families::glm5::dflash_policy::{self, CycleCost, DraftHistory, Group,
 use super::{open, Opened};
 use crate::shared::prefill_share::{add_phases, isolated_phases, Chunk, DecodeShareArgs};
 use anyhow::{Context, Result};
-use cuteafd_api::native_v41::qwen::QwenEncoding;
-use cuteafd_api::native_v41::{
+use cuteafd_api::openai::qwen::QwenEncoding;
+use cuteafd_api::openai::{
     ConsoleHub, InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits, NativeRequest,
     PromptUsage,
 };
@@ -73,7 +73,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, draft));
     ready_rx.await.context("engine failed before it was ready")??;
-    let router = cuteafd_api::native_v41::router_for_model(queue, limits, stats, Duration::from_secs(25),
+    let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
         ConsoleHub::disabled(), profile.clone());
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     tracing::info!(listen = %args.listen, model = %profile.id, "MiMo V2 API is ready");

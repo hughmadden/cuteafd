@@ -12,7 +12,7 @@ use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
-use cuteafd_loader::glm_next::{GlmNextAttention, GlmNextConfig};
+use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
 use cuteafd_loader::plan::checkpoint::{Checkpoint, CheckpointTensor};
 use std::collections::HashMap;
 use std::ffi::c_void;

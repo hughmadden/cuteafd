@@ -17,17 +17,17 @@
 //! the step to the ring afterwards.
 use super::weights::{MimoLayer, MimoWeights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
-use cuteafd_loader::fp8_experts::Fp8ExpertTensors;
+use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use crate::shared::spark_intake::SparkLink;
-use cuteafd_transport::v41_expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+use cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
 use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
 };
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::dsv4::{Dsv4Programs, Dsv4Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
+use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::mimo_v2::{MimoAttention, MimoV2Config};
+use cuteafd_loader::families::mimo_v2::{MimoAttention, MimoV2Config};
 use std::cell::RefCell;
 use std::ffi::c_void;
 
@@ -182,7 +182,7 @@ struct Workspace<'a> {
 
 pub(crate) struct MimoEngine<'a> {
     pub library: &'a NativeLibrary,
-    pub programs: &'a Dsv4Programs<'a>,
+    pub programs: &'a Programs<'a>,
     pub cfg: MimoV2Config,
     pub weights: MimoWeights<'a>,
     pub stream: *mut c_void,
@@ -216,10 +216,10 @@ fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
 }
 
 /// `[rows]`, plus the decode programs' `fp8_rows` (`FP8_DECODE_ROWS` when the layer has the FP8 copy, else 0).
-fn fp8_scalars(rows: Dsv4Scalar, decode: bool, fp8: bool) -> Vec<Dsv4Scalar> {
+fn fp8_scalars(rows: Scalar, decode: bool, fp8: bool) -> Vec<Scalar> {
     let mut scalars = vec![rows];
     if decode {
-        scalars.push(Dsv4Scalar::I32(if fp8 { FP8_DECODE_ROWS } else { 0 }));
+        scalars.push(Scalar::I32(if fp8 { FP8_DECODE_ROWS } else { 0 }));
     }
     scalars
 }
@@ -233,7 +233,7 @@ fn kind(attention: MimoAttention) -> &'static str {
 
 impl<'a> MimoEngine<'a> {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(library: &'a NativeLibrary, programs: &'a Dsv4Programs<'a>, cfg: MimoV2Config,
+    pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: MimoV2Config,
         weights: MimoWeights<'a>, stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize,
         rings: usize) -> Result<Self> {
         let family = cfg.program_family()?;
@@ -297,7 +297,7 @@ impl<'a> MimoEngine<'a> {
         }
     }
 
-    fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Dsv4Scalar]) -> Result<()> {
+    fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
         let name = &self.program_name(name);
         let names: Vec<&str> = pointers.iter().map(|(n, _)| *n).collect();
         let program = self.programs.program(name, &names)?;
@@ -454,7 +454,7 @@ impl<'a> MimoEngine<'a> {
         self.put(&w.seq_first, &tables.seq_first)?;
         self.put(&w.page_table, &tables.page_table)?;
         self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: embed.len(), ..w.h.buffer }, embed)?;
-        let rows = Dsv4Scalar::I32(t as i32);
+        let rows = Scalar::I32(t as i32);
         let cap = if tables.decode { "m64" } else { "m4096" };
         let layers = &self.weights.layers;
         self.norm(w, layers[0].ptr("input_norm")?, 0, rows)?;
@@ -513,7 +513,7 @@ impl<'a> MimoEngine<'a> {
         match &self.weights.head_fp8 {
             Some((q, scale)) if tables.decode && logit_rows <= FP8_ROWS as usize => {
                 self.run("mimo_head_fp8", &[("x", x), ("w_fp8", q.buffer.ptr), ("scale", scale.buffer.ptr),
-                    ("logits", w.logits.buffer.ptr)], &[Dsv4Scalar::I32(logit_rows as i32)])?;
+                    ("logits", w.logits.buffer.ptr)], &[Scalar::I32(logit_rows as i32)])?;
             }
             // SAFETY: the final norm's output and the head operands are live buffers of these shapes.
             _ => unsafe {
@@ -526,10 +526,10 @@ impl<'a> MimoEngine<'a> {
     }
 
     /// `residual (h) += delta` when `deltas` is 1, then `x = weight * RMSNorm(h)`.
-    fn norm(&self, w: &Workspace<'_>, weight: *mut c_void, deltas: i32, rows: Dsv4Scalar) -> Result<()> {
+    fn norm(&self, w: &Workspace<'_>, weight: *mut c_void, deltas: i32, rows: Scalar) -> Result<()> {
         self.run("mimo_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
             ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
-            &[rows, Dsv4Scalar::I32(deltas)])
+            &[rows, Scalar::I32(deltas)])
     }
 
     /// Copies this step's last-layer rows (pre-norm) into the MTP hidden ring
@@ -691,11 +691,11 @@ impl<'a> MimoEngine<'a> {
                 at += 1;
             }
         }
-        let rows = Dsv4Scalar::I32(t as i32);
+        let rows = Scalar::I32(t as i32);
         for (source, weight, out) in [(&mtp.embed, &stage.enorm, &mtp.normed_e), (&mtp.rows_h, &stage.hnorm, &mtp.normed_h)] {
             self.run("mimo_norm", &[("residual", source.buffer.ptr), ("delta0", source.buffer.ptr),
                 ("delta1", source.buffer.ptr), ("weight", weight.buffer.ptr), ("out", out.buffer.ptr)],
-                &[rows, Dsv4Scalar::I32(0)])?;
+                &[rows, Scalar::I32(0)])?;
         }
         // SAFETY: [t, H] sources into [t, 2H] halves, then eh_proj into the residual stream.
         unsafe {
@@ -749,7 +749,7 @@ impl<'a> MimoEngine<'a> {
     }
 
     /// `kv`: the layer's paged record pool (full) or its rings (SWA).
-    fn attention(&self, w: &Workspace<'_>, kv: *mut c_void, layer: &MimoLayer<'_>, rows: Dsv4Scalar, cap: &str,
+    fn attention(&self, w: &Workspace<'_>, kv: *mut c_void, layer: &MimoLayer<'_>, rows: Scalar, cap: &str,
         tables: &StepTables) -> Result<()> {
         let mode = if tables.decode { "decode" } else { "prefill" };
         let k = kind(layer.attention);
@@ -773,9 +773,9 @@ impl<'a> MimoEngine<'a> {
         let name = format!("mimo_{k}_attention_{mode}_{cap}");
         match layer.attention {
             MimoAttention::Full => {
-                let mut scalars = vec![rows, Dsv4Scalar::I32(tables.table_stride as i32)];
+                let mut scalars = vec![rows, Scalar::I32(tables.table_stride as i32)];
                 if tables.decode {
-                    scalars.push(Dsv4Scalar::I32(DECODE_SPLITS));
+                    scalars.push(Scalar::I32(DECODE_SPLITS));
                 }
                 self.run(&name, &[("q", w.query.buffer.ptr), ("kv_cache", kv),
                     ("positions", w.positions.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
@@ -839,7 +839,7 @@ impl<'a> MimoEngine<'a> {
         let experts = self.experts.as_ref().with_context(|| format!(
             "layer {index} is an MoE layer: pass Spark --peers serving the fp8 family, or --local-experts \
              (run --layers 1 for the dense layer alone)"))?;
-        let rows = Dsv4Scalar::I32(t as i32);
+        let rows = Scalar::I32(t as i32);
         self.run("mimo_router_scores", &[("x", w.x.buffer.ptr), layer.router_operand()?,
             ("logits", w.router_logits.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])?;
         // SAFETY: logits, bias and route outputs are live buffers of `t` rows.
@@ -854,7 +854,7 @@ impl<'a> MimoEngine<'a> {
             self.run("mimo_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
                 // SAFETY: the scale rows follow the payload inside each wire row.
                 ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
-                ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Dsv4Scalar::I32(grid as i32)])?;
+                ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Scalar::I32(grid as i32)])?;
         }
         if !matches!(experts, Experts::Spark { .. }) {
             self.emulated_exchange(index, decode)?;

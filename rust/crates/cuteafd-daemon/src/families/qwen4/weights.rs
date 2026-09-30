@@ -14,7 +14,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::plan::checkpoint::{Checkpoint, CheckpointTensor};
-use cuteafd_loader::qwen4_exp::{Qwen4Attention, Qwen4Config};
+use cuteafd_loader::families::qwen4::{Qwen4Attention, Qwen4Config};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::unix::fs::FileExt;

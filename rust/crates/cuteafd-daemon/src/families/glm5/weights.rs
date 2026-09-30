@@ -15,7 +15,7 @@ use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
-use cuteafd_loader::glm_dsa::{GlmDsaConfig, GlmIndexer};
+use cuteafd_loader::families::glm5::{GlmDsaConfig, GlmIndexer};
 use cuteafd_loader::OfficialV41Catalog;
 use std::collections::HashMap;
 use std::ffi::c_void;

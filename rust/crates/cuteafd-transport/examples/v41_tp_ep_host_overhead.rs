@@ -24,7 +24,7 @@ use cuteafd_core::{
     replicated_expert_tie_seed, ReplicatedExpertCostModel, ReplicatedExpertScheduleConfig,
     ReplicatedExpertScheduler, INACTIVE_REPLICATED_EXPERT_GROUP,
 };
-use cuteafd_transport::v41_expert::{
+use cuteafd_transport::expert::{
     V41BackboneRequest, V41SparkTopology, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
 };
 use cuteafd_transport::{
@@ -240,7 +240,7 @@ where
 }
 
 fn reset_route_words(request: &mut ExpertProtocolV2Request, canonical_ids: &[u32]) {
-    request.header.flags &= !cuteafd_transport::v41_expert::V41_NATIVE_GROUP_REQUEST_FLAG;
+    request.header.flags &= !cuteafd_transport::expert::V41_NATIVE_GROUP_REQUEST_FLAG;
     for (route, expert) in request.routes.iter_mut().zip(canonical_ids) {
         route.expert_id = *expert;
     }

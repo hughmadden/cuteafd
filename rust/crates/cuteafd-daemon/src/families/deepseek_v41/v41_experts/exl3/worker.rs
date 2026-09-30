@@ -9,7 +9,7 @@ use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_transport::{
-    v41_expert::V41BackboneRequest, ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2ResponseRef,
+    expert::V41BackboneRequest, ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2ResponseRef,
     ExpertV2Dtype, EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN,
 };
 use std::{path::Path, rc::Rc};
@@ -177,7 +177,7 @@ impl<'a> Exl3Worker<'a> {
             first_layer,
             layer_count,
             layer: 0,
-            executor_id: cuteafd_transport::v41_expert::v41_spark_executor_id(first.layout.world, rank)?,
+            executor_id: cuteafd_transport::expert::v41_spark_executor_id(first.layout.world, rank)?,
         })
     }
 

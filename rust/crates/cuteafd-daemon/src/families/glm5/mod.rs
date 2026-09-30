@@ -8,7 +8,7 @@ pub(crate) mod weights;
 
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::glm_dsa::GlmDsaConfig;
+use cuteafd_loader::families::glm5::GlmDsaConfig;
 use crate::shared::spark_intake::{SparkLane, SparkLink};
 use std::ffi::c_void;
 use std::os::unix::fs::FileExt;
@@ -23,7 +23,7 @@ pub(crate) struct EngineArgs {
     pub snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
     pub native_lib: PathBuf,
-    #[arg(long, default_value = "/opt/cuteafd/share/DSV4_PROGRAMS.json")]
+    #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
     pub manifest: PathBuf,
     #[arg(long, default_value_t = 0)]
     pub device: i32,
@@ -163,7 +163,7 @@ impl Opened {
     pub fn with_engine<T>(&self, args: &EngineArgs,
         body: impl FnOnce(&engine::GlmEngine<'_>, Option<&mut SparkLink<'_>>, &tokio::runtime::Runtime) -> Result<T>)
         -> Result<T> {
-        let programs = self.library.dsv4_programs()?.with_manifest(&args.manifest)?;
+        let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.load_all()?;
         let stream = self.library.cuda_stream_create()?;
         let draft_file = args.draft.as_deref().map(dflash::prefetch);
@@ -198,7 +198,7 @@ impl Opened {
         let ranks = |peers: &str| -> Result<(Vec<std::net::SocketAddr>, Vec<u64>)> {
             let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             let executors: Vec<u64> = (0..peers.len())
-                .map(|rank| cuteafd_transport::v41_expert::v41_spark_executor_id(peers.len(), rank))
+                .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
                 .collect::<Result<_>>()?;
             Ok((peers, executors))
         };
@@ -234,7 +234,7 @@ impl Opened {
                     route_count: topk as u32,
                 }).collect(),
                 routes, vec![0; rows * (h + h / 32)])?;
-            request.header.flags |= cuteafd_transport::v41_expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+            request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
             Ok(request)
         };
         let started = Instant::now();
@@ -279,7 +279,7 @@ impl Opened {
 /// vocab] FP32 are live device buffers on `stream`'s device; `head` was
 /// created for at least `rows` rows of this width and vocabulary.
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn launch_head(library: &NativeLibrary, head: &cuteafd_ffi::dsv4::VocabularyHead<'_>,
+pub(crate) unsafe fn launch_head(library: &NativeLibrary, head: &cuteafd_ffi::programs::VocabularyHead<'_>,
     x: *const c_void, weight: *const c_void, logits: *mut f32, rows: usize, width: usize, vocab: usize,
     stream: *mut c_void) -> Result<()> {
     static CUBLAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

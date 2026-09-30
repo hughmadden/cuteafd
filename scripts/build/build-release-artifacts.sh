@@ -267,9 +267,9 @@ else
 fi
 # DeepSeek V4 coordinator program manifest (an empty table when not built).
 if [[ -s "$build_root/native/dsv4_programs/dsv4_programs.json" ]]; then
-  install -m 0644 "$build_root/native/dsv4_programs/dsv4_programs.json" "$output_dir/DSV4_PROGRAMS.json"
+  install -m 0644 "$build_root/native/dsv4_programs/dsv4_programs.json" "$output_dir/PROGRAMS.json"
 else
-  printf '%s\n' '{"schema":1,"programs":[]}' >"$output_dir/DSV4_PROGRAMS.json"
+  printf '%s\n' '{"schema":1,"programs":[]}' >"$output_dir/PROGRAMS.json"
 fi
 install -m 0644 \
   "$build_root/source/THIRD_PARTY_NOTICES.md" \

@@ -8,7 +8,7 @@ pub(super) struct Prepared {
 }
 impl Prepared {
     pub fn new(mut job: NativeRequest, snapshot: &std::path::Path,
-        limits: cuteafd_api::native_v41::NativeLimits) -> Result<Self> {
+        limits: cuteafd_api::openai::NativeLimits) -> Result<Self> {
         let prompt = cuteafd_loader::encode_tokenizer_text(snapshot, &job.prompt, false)?.token_ids;
         let (prompt, images) = if job.images.is_empty() { (prompt, Vec::new()) } else {
             let expanded = cuteafd_loader::V41VisionPrompt::expand(&prompt,

@@ -371,7 +371,7 @@ mod tests {
     use crate::families::deepseek_v41::v41_experts::{tp2::RankWeights, tp2_ffn};
     use crate::families::deepseek_v41::v41_index_lane::IndexLaneWeights;
     use crate::families::deepseek_v41::v41_target_embedding::TargetEmbeddingWave;
-    use cuteafd_transport::{ExpertV2SourceKind, TcpTransportConfig, v41_expert::V41Tp4Roce};
+    use cuteafd_transport::{ExpertV2SourceKind, TcpTransportConfig, expert::V41Tp4Roce};
     use std::rc::Rc;
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and two CUDA GPUs"]

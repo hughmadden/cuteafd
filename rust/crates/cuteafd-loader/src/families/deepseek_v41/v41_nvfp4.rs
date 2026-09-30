@@ -47,7 +47,7 @@ pub fn is_v41_nvfp4_publication(quantization_config: &Value) -> bool {
 /// Read and validate the NVFP4 expert contract, returning `None` for every
 /// checkpoint that does not declare it.
 pub fn read_v41_nvfp4_contract(snapshot: &Path) -> Result<Option<V41Nvfp4Contract>> {
-    let raw = crate::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
+    let raw = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
     let Some(quant) = raw.get("quantization_config") else {
         return Ok(None);
     };

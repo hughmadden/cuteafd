@@ -1,10 +1,11 @@
 use crate::snapshot::resolve_snapshot;
-use crate::{
-    exl3_format::exl3_recipe_from_quantization_config, is_deepseek_v4_exl3_recipe,
-    validate_exl3_expert_catalog, validate_native_deepseek_v4_attention_catalog,
-    validate_native_deepseek_v4_dspark_catalog, validate_native_fp4_expert_catalog,
-    DEEPSEEK_V4_EXL3_RECIPE,
-};
+use crate::formats::exl3_format::exl3_recipe_from_quantization_config;
+use crate::is_deepseek_v4_exl3_recipe;
+use crate::validate_exl3_expert_catalog;
+use crate::validate_native_deepseek_v4_attention_catalog;
+use crate::validate_native_deepseek_v4_dspark_catalog;
+use crate::validate_native_fp4_expert_catalog;
+use crate::DEEPSEEK_V4_EXL3_RECIPE;
 use anyhow::{Context, Result};
 use cuteafd_core::{
     DType, ModelFacts, ModelVariant, TensorCatalog, TensorInfo, TensorRole, DS4_FLASH_HIDDEN_SIZE,

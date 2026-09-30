@@ -90,7 +90,7 @@ case "${1:-}" in
     build=$2 tag=$3 native=${4:-$2/coord/native} ctx="$(mktemp -d)"
     cp "$build/target/release/cuteafd" "$native/libcuteafd_native.so" \
       "$native/dsv4_programs/dsv4_programs.json" "$ctx/"
-    printf 'FROM %s\nCOPY cuteafd /opt/cuteafd/bin/cuteafd\nCOPY libcuteafd_native.so /opt/cuteafd/lib/libcuteafd_native.so\nCOPY dsv4_programs.json /opt/cuteafd/share/DSV4_PROGRAMS.json\n' \
+    printf 'FROM %s\nCOPY cuteafd /opt/cuteafd/bin/cuteafd\nCOPY libcuteafd_native.so /opt/cuteafd/lib/libcuteafd_native.so\nCOPY dsv4_programs.json /opt/cuteafd/share/PROGRAMS.json\n' \
       "$p7" > "$ctx/Dockerfile"
     docker build -q -t "$tag" "$ctx" && rm -rf "$ctx" ;;
   gates)

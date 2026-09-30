@@ -27,12 +27,12 @@ use super::weights::{GlmfLayer, GlmfWeights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::dsv4::{Dsv4Programs, Dsv4Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
+use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::fp8_experts::Fp8ExpertTensors;
-use cuteafd_loader::glm_next::{GlmNextAttention, GlmNextConfig};
+use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
+use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
 use crate::shared::spark_intake::SparkLink;
-use cuteafd_transport::v41_expert::{V41Tp4RoceWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
+use cuteafd_transport::expert::{V41Tp4RoceWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
 use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
 };
@@ -302,7 +302,7 @@ struct Workspace<'a> {
 
 pub(crate) struct GlmfEngine<'a> {
     pub library: &'a NativeLibrary,
-    pub programs: &'a Dsv4Programs<'a>,
+    pub programs: &'a Programs<'a>,
     pub cfg: GlmNextConfig,
     pub weights: GlmfWeights<'a>,
     pub stream: *mut c_void,
@@ -400,7 +400,7 @@ fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
 
 impl<'a> GlmfEngine<'a> {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(library: &'a NativeLibrary, programs: &'a Dsv4Programs<'a>, cfg: GlmNextConfig, weights: GlmfWeights<'a>,
+    pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmNextConfig, weights: GlmfWeights<'a>,
         stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize, slots: usize) -> Result<Self> {
         ensure!(cfg.hc_mult == HC && cfg.kv_lora_rank == 512 && cfg.kda_head_dim == 128 && cfg.heads == 64,
             "the glmf programs are built for 4 mHC streams, a 512 latent, 64 MLA heads and 128-wide KDA heads");
@@ -548,14 +548,14 @@ impl<'a> GlmfEngine<'a> {
         let layers = self.kda_ordinal.iter().flatten().count();
         self.run("kda_commit", &[("state", self.kda_state.buffer.ptr), ("conv_state", self.kda_conv.buffer.ptr),
             ("replay", self.kda_replay.buffer.ptr), ("tables", self.commit_tables.buffer.ptr)],
-            &[Dsv4Scalar::I32(n as i32), Dsv4Scalar::I32(layers as i32), Dsv4Scalar::I32(self.slots as i32)])
+            &[Scalar::I32(n as i32), Scalar::I32(layers as i32), Scalar::I32(self.slots as i32)])
     }
 
     fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
         DeviceAllocation::new(self.library, bytes.max(256))
     }
 
-    fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Dsv4Scalar]) -> Result<()> {
+    fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
         let name = format!("glmf_{name}");
         let names: Vec<&str> = pointers.iter().map(|(n, _)| *n).collect();
         let program = self.programs.program(&name, &names)?;
@@ -895,7 +895,7 @@ impl<'a> GlmfEngine<'a> {
         self.put(&w.pool_table, &tables.pool_table)?;
         let row = h * 2;
         self.load_streams(w, embed)?;
-        let rows = Dsv4Scalar::I32(t as i32);
+        let rows = Scalar::I32(t as i32);
         if self.use_graphs && tables.decode && on_layer.is_none() && forced.is_none() {
             return self.decode_graphed(w, tables, t, rows, logit_rows);
         }
@@ -962,7 +962,7 @@ impl<'a> GlmfEngine<'a> {
     /// FFN output into the streams with layer `i`'s attention-site collapse,
     /// then runs layer `i` up to its routed experts, which run (local or on
     /// the Sparks) between segments. Streams start and end in buffer 0.
-    fn decode_graphed(&self, w: &Workspace<'_>, tables: &StepTables, t: usize, rows: Dsv4Scalar, logit_rows: usize)
+    fn decode_graphed(&self, w: &Workspace<'_>, tables: &StepTables, t: usize, rows: Scalar, logit_rows: usize)
         -> Result<Option<Vec<f32>>> {
         let layers = &self.weights.layers;
         for index in 0..=layers.len() {
@@ -1024,7 +1024,7 @@ impl<'a> GlmfEngine<'a> {
         let x = unsafe { w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2) }.cast::<c_void>();
         if let (Some((q, scale)), true) = (&self.weights.head_fp8, decode && logit_rows <= FP8_ROWS as usize) {
             return self.run("head_fp8", &[("x", x), ("w_fp8", q.buffer.ptr), ("scale", scale.buffer.ptr),
-                ("logits", w.logits.buffer.ptr)], &[Dsv4Scalar::I32(logit_rows as i32)]);
+                ("logits", w.logits.buffer.ptr)], &[Scalar::I32(logit_rows as i32)]);
         }
         // SAFETY: the head's input and operands are live buffers of these shapes.
         unsafe {
@@ -1054,7 +1054,7 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// Attention-site collapse and input norm of `layer` from `streams`.
-    fn pre(&self, w: &Workspace<'_>, streams: &Dev<'_>, layer: &GlmfLayer<'_>, rows: Dsv4Scalar) -> Result<()> {
+    fn pre(&self, w: &Workspace<'_>, streams: &Dev<'_>, layer: &GlmfLayer<'_>, rows: Scalar) -> Result<()> {
         self.run("mhc_pre", &[("residual", streams.buffer.ptr), ("fn", layer.ptr("attn.fn")?),
             ("scale", layer.ptr("attn.scale")?), ("base", layer.ptr("attn.base")?), ("norm", layer.ptr("input_norm")?),
             ("post", w.post.buffer.ptr), ("comb", w.comb.buffer.ptr), ("y", w.x.buffer.ptr),
@@ -1065,7 +1065,7 @@ impl<'a> GlmfEngine<'a> {
     /// `site` collapse of `layer` normalized by its `norm`.
     #[allow(clippy::too_many_arguments)]
     fn post_pre(&self, w: &Workspace<'_>, cur: usize, layer: &GlmfLayer<'_>, site: &str, norm: &str,
-        rows: Dsv4Scalar, cap: &str) -> Result<()> {
+        rows: Scalar, cap: &str) -> Result<()> {
         self.run(&format!("mhc_post_pre_{cap}"), &[("x", w.delta.buffer.ptr),
             ("residual", w.streams[cur].buffer.ptr), ("prev_post", w.post.buffer.ptr),
             ("prev_comb", w.comb.buffer.ptr), ("fn", layer.ptr(&format!("{site}.fn"))?),
@@ -1075,7 +1075,7 @@ impl<'a> GlmfEngine<'a> {
             ("scratch", w.scratch.buffer.ptr)], &[rows])
     }
 
-    fn kda(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Dsv4Scalar, cap: &str, spec: bool)
+    fn kda(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str, spec: bool)
         -> Result<()> {
         let ordinal = self.kda_ordinal[index].context("KDA layer without a state pool")?;
         let at = |pool: &Dev<'_>, per: usize| -> *mut c_void {
@@ -1099,11 +1099,11 @@ impl<'a> GlmfEngine<'a> {
         let mut scalars = self.fp8_scalars(rows, decode, layer.has(if decode { "w_in_fp8" } else { "w_in_kscale" }));
         if !decode && layer.has("w_in_kscale") {
             // Prefill fp8_rows bits: 1 the in-projection, 2 o_proj.
-            scalars[1] = Dsv4Scalar::I32(self.fp8_prefill.kda_bits);
+            scalars[1] = Scalar::I32(self.fp8_prefill.kda_bits);
         }
         if decode {
             pointers.push(("replay", replay));
-            scalars.push(Dsv4Scalar::I32(i32::from(spec)));
+            scalars.push(Scalar::I32(i32::from(spec)));
         } else {
             ensure!(!spec, "speculative steps are decode-shaped");
         }
@@ -1114,8 +1114,8 @@ impl<'a> GlmfEngine<'a> {
     /// `[rows, fp8]`: the decode programs' `fp8_rows` (16 when the layer has
     /// the FP8 copy, else 0), or the prefill programs' `fp8` switch (1: rows
     /// past the skinny GEMV run the block-FP8 GEMMs).
-    fn fp8_scalars(&self, rows: Dsv4Scalar, decode: bool, fp8: bool) -> Vec<Dsv4Scalar> {
-        vec![rows, Dsv4Scalar::I32(match (fp8, decode) {
+    fn fp8_scalars(&self, rows: Scalar, decode: bool, fp8: bool) -> Vec<Scalar> {
+        vec![rows, Scalar::I32(match (fp8, decode) {
             (false, _) => 0,
             (true, true) => FP8_ROWS,
             (true, false) => 1,
@@ -1123,7 +1123,7 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// SwiGLU MLP (dense layer or shared expert) of intermediate `inter` into `out`.
-    fn ffn(&self, w: &Workspace<'_>, layer: &GlmfLayer<'_>, inter: usize, cap: &str, out: *mut c_void, rows: Dsv4Scalar)
+    fn ffn(&self, w: &Workspace<'_>, layer: &GlmfLayer<'_>, inter: usize, cap: &str, out: *mut c_void, rows: Scalar)
         -> Result<()> {
         let decode = cap == "m64";
         let mut pointers = vec![("x", w.x.buffer.ptr), ("w_gate_up", layer.ptr("w_gate_up")?)];
@@ -1137,7 +1137,7 @@ impl<'a> GlmfEngine<'a> {
         self.run(&format!("ffn_i{inter}_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))
     }
 
-    fn mla(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Dsv4Scalar, cap: &str,
+    fn mla(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str,
         tables: &StepTables) -> Result<()> {
         let mode = if tables.decode { "decode" } else { "prefill" };
         let cache = self.kv[index].as_ref().context("MLA layer without a record pool")?.buffer.ptr;
@@ -1166,12 +1166,12 @@ impl<'a> GlmfEngine<'a> {
                 ("weights", w.head_weights.buffer.ptr), ("index_k_cache", pool_cache.buffer.ptr),
                 ("page_table", w.pool_table.buffer.ptr), ("cache_lengths", w.cache_lengths.buffer.ptr),
                 ("output_indices", w.pools.buffer.ptr), ("scratch", w.topk_scratch.buffer.ptr)],
-                &[rows, Dsv4Scalar::I32(tables.pool_width.max(1) as i32), Dsv4Scalar::I32(tables.pool_stride as i32)])?;
+                &[rows, Scalar::I32(tables.pool_width.max(1) as i32), Scalar::I32(tables.pool_stride as i32)])?;
         }
         self.run("index_expand", &[("positions", w.positions.buffer.ptr), ("pools", w.pools.buffer.ptr),
             ("pool_logical", self.pool_logical.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
             ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr)],
-            &[rows, Dsv4Scalar::I32(tables.page_stride as i32)])?;
+            &[rows, Scalar::I32(tables.page_stride as i32)])?;
         if !tables.decode && crate::families::glm5::engine::native_mla_prefill() {
             let scale = (self.cfg.qk_nope_dim as f32).powf(-0.5);
             self.timed("glm_mla_prefill (native)", || {
@@ -1196,7 +1196,7 @@ impl<'a> GlmfEngine<'a> {
 
     /// Router, shared expert and routed experts; leaves `bf16(routed + shared)` in `delta`.
     #[allow(clippy::too_many_arguments)]
-    fn moe(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, t: usize, rows: Dsv4Scalar, cap: &str,
+    fn moe(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, t: usize, rows: Scalar, cap: &str,
         decode: bool) -> Result<()> {
         self.moe_front(w, index, layer, t, rows, cap)?;
         self.moe_experts(w, index, layer, t, rows, cap, decode)
@@ -1204,7 +1204,7 @@ impl<'a> GlmfEngine<'a> {
 
     /// Router logits, the sigmoid top-8, the shared expert (into `shared`)
     /// and, for wire-fed experts, the FP8 K32 wire rows. No host sync.
-    fn moe_front(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, t: usize, rows: Dsv4Scalar, cap: &str)
+    fn moe_front(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, t: usize, rows: Scalar, cap: &str)
         -> Result<()> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let experts = self.experts.as_ref().with_context(|| format!(
@@ -1225,7 +1225,7 @@ impl<'a> GlmfEngine<'a> {
             self.run("expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
                 // SAFETY: the scale rows follow the payload inside each wire row.
                 ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
-                ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Dsv4Scalar::I32(grid as i32)])?;
+                ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Scalar::I32(grid as i32)])?;
         }
         Ok(())
     }
@@ -1282,7 +1282,7 @@ impl<'a> GlmfEngine<'a> {
     /// The shared expert runs here, after the routes are on their way (on the
     /// Spark path while the ranks compute).
     #[allow(clippy::too_many_arguments)]
-    fn moe_experts(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, t: usize, rows: Dsv4Scalar, cap: &str,
+    fn moe_experts(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, t: usize, rows: Scalar, cap: &str,
         decode: bool) -> Result<()> {
         let h = self.cfg.hidden;
         let experts = self.experts.as_ref().context("MoE layer without experts")?;
@@ -1440,7 +1440,7 @@ impl<'a> GlmfEngine<'a> {
         }
         let layers = &self.weights.layers;
         let cap = "m4096";
-        let rows_of = |lane: usize| Dsv4Scalar::I32(lanes[lane].0.kv_slots.len() as i32);
+        let rows_of = |lane: usize| Scalar::I32(lanes[lane].0.kv_slots.len() as i32);
         // The drafter taps the chunk's last TAP_ROWS rows: lane `lane`'s part of
         // that window, at its offset in the tap rows.
         let tap_rows = total.min(crate::families::glm5::dflash::TAP_ROWS);
@@ -1537,7 +1537,7 @@ impl<'a> GlmfEngine<'a> {
                 continue;
             }
             self.run("head", &[("streams", w.streams[0].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
-                ("out", w.x.buffer.ptr)], &[Dsv4Scalar::I32(t as i32)])?;
+                ("out", w.x.buffer.ptr)], &[Scalar::I32(t as i32)])?;
             self.logits(w, t, wanted, false)?;
             let bytes = self.download(&w.logits, wanted * self.cfg.vocab_size * 4)?;
             logits.extend(bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())));

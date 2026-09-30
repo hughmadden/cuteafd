@@ -1,7 +1,7 @@
 //! Real four-Spark expert responses against hashed B12x rank fixtures.
 //! <fixture-root> <peer0> <peer1> <peer2> <peer3>
 use anyhow::{ensure, Context, Result};
-use cuteafd_transport::{v41_expert::*, *};
+use cuteafd_transport::{expert::*, *};
 use sha2::{Digest, Sha256};
 use std::{path::Path, time::Duration};
 

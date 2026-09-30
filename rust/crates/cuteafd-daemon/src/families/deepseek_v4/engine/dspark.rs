@@ -17,7 +17,7 @@ use crate::families::deepseek_v4::local::LocalLayer;
 use crate::families::deepseek_v4::metadata::WINDOW;
 use crate::families::deepseek_v4::pool::Placement;
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::dsv4::Dsv4Scalar;
+use cuteafd_ffi::programs::Scalar;
 use std::ffi::c_void;
 
 /// One sequence to draft for: `token` is its next token, at `placement.len`.
@@ -84,7 +84,7 @@ impl<'a> Engine<'a> {
                 ("w_q", weights.ptr("w_q")?), ("w_q_scale", weights.ptr("w_q_scale")?), ("q_norm", weights.ptr("q_norm")?),
                 ("kv_norm", weights.ptr("kv_norm")?), ("main_kv_cache", cache.main.buffer.ptr),
                 ("query", w.query.buffer.ptr), ("q_rank", w.q_rank.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
-            ], &[Dsv4Scalar::I32(n as i32)])?;
+            ], &[Scalar::I32(n as i32)])?;
         }
         Ok(())
     }
@@ -141,7 +141,7 @@ impl<'a> Engine<'a> {
         }
         bytes(&expanded, &lane.stream_a)?;
         let cap = self.decode_rows;
-        let scalar = Dsv4Scalar::I32(rows as i32);
+        let scalar = Scalar::I32(rows as i32);
         for (stage, weights) in dspark.stages.iter().enumerate() {
             let layer = self.cfg.n_layers + stage;
             let cache = &self.pools[layer];
@@ -192,7 +192,7 @@ impl<'a> Engine<'a> {
             self.run("expert_input_quant", &[
                 ("source_ptr", w.y.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
                 ("scale_rows_ptr", offset(&w.wire, h)), ("scale_mma_ptr", w.dummy.buffer.ptr),
-            ], &[scalar, Dsv4Scalar::I32(grid as i32)])?;
+            ], &[scalar, Scalar::I32(grid as i32)])?;
             self.shared_ffn(layer, w, lane, scalar, cap, weights)?;
             {
                 let mut local = self.local.borrow_mut();

@@ -1,7 +1,7 @@
 //! Lane-owned coordinator scratch; ownership travels in the existing route word.
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{Exl3BoundaryCost, Exl3Tp4OwnershipPlanner};
-use cuteafd_transport::{ExpertProtocolV2Request, v41_expert::{V41BackboneRequest, V41PairedRouteWord, V41_EXL3_PAIRED_REQUEST_FLAG}};
+use cuteafd_transport::{ExpertProtocolV2Request, expert::{V41BackboneRequest, V41PairedRouteWord, V41_EXL3_PAIRED_REQUEST_FLAG}};
 
 /// Cost units must agree across weights and routed-row terms. The caller supplies
 /// calibrated costs; this adapter does not assume a bandwidth or compute ratio.
@@ -183,7 +183,7 @@ mod tests {
                 source_request_id:r as u64 + 1, token_position:0, route_offset:r*6, route_count:6 }).collect(),
             (0..18).map(|r| ExpertProtocolV2RouteEntry { row_index:r/6, expert_id:r%6, gate_weight:1.0/6.0 }).collect(),
             vec![0; 3*5280]).unwrap();
-        request.header.flags |= cuteafd_transport::v41_expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+        request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         request
     }
     #[test]

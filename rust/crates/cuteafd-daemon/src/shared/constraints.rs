@@ -1,6 +1,6 @@
 use crate::families::deepseek_v41::v41_native_serve::scores::{BatchScores, VOCAB};
 use anyhow::{ensure, Result};
-use cuteafd_api::native_v41::{NativeConstraint, NativeFailure};
+use cuteafd_api::openai::{NativeConstraint, NativeFailure};
 use cuteafd_ffi::{NativeLibrary, CuteafdXGrammarCompiler, CuteafdXGrammarGrammar,
     CuteafdXGrammarMatcher, CUTEAFD_XGRAMMAR_STRUCTURAL_TAG};
 use std::{collections::{HashMap, VecDeque}, path::PathBuf, sync::Arc};

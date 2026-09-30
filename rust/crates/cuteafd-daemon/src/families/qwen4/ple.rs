@@ -10,7 +10,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdHostBuffer, NativeLibrary};
 use cuteafd_loader::plan::checkpoint::Checkpoint;
-use cuteafd_loader::qwen4_exp::{NgramHasher, Qwen4Config};
+use cuteafd_loader::families::qwen4::{NgramHasher, Qwen4Config};
 use std::ffi::c_void;
 use std::os::unix::fs::FileExt;
 use std::time::Instant;

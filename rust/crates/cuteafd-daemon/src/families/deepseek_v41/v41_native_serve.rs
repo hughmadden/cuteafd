@@ -29,9 +29,9 @@ use crate::families::deepseek_v41::v41_target_pass::TargetPass;
 use crate::families::deepseek_v41::v41_tensors::{NativeRtxTensors, VocabularyHead};
 use anyhow::Context;
 use anyhow::{ensure, Result};
-use cuteafd_api::native_v41::{InferenceChunk, InferenceFinishReason, NativeRequest, PromptUsage};
+use cuteafd_api::openai::{InferenceChunk, InferenceFinishReason, NativeRequest, PromptUsage};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_transport::v41_expert::V41Tp4Roce;
+use cuteafd_transport::expert::V41Tp4Roce;
 use cuteafd_transport::{ExpertV2SourceKind, TcpTransportConfig};
 use speculative::DraftRuntime;
 use std::time::{Duration, Instant};
@@ -72,13 +72,13 @@ pub(crate) async fn run(mut args: crate::cli::NativeServeArgs) -> Result<()> {
     }
     args.host_cache_config()?;
     let listen = args.listen.clone();
-    let limits = cuteafd_api::native_v41::NativeLimits::new(args.max_context_tokens, args.max_output_tokens)?;
+    let limits = cuteafd_api::openai::NativeLimits::new(args.max_context_tokens, args.max_output_tokens)?;
     let (send, receive) = mpsc::channel(args.http_queue_depth.unwrap_or(args.concurrency) as usize);
     let http_queue_wait = Duration::from_millis(args.http_queue_wait_ms);
     let (ready, readiness) = oneshot::channel();
     let stats = std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
     let worker_stats = stats.clone();
-    let console_hub = cuteafd_api::native_v41::ConsoleHub::new(args.console_text);
+    let console_hub = cuteafd_api::openai::ConsoleHub::new(args.console_text);
     console::install(console_hub.clone(), console_config(&args))?;
     let worker_thread = std::thread::Builder::new()
         .name("v41-target-cuda".into())
@@ -102,7 +102,7 @@ pub(crate) async fn run(mut args: crate::cli::NativeServeArgs) -> Result<()> {
         .map_err(anyhow::Error::msg)?;
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     tracing::info!(%listen,"native V4.1 target API ready");
-    axum::serve(listener, cuteafd_api::native_v41::router_with_console(send, limits, stats, http_queue_wait, console_hub))
+    axum::serve(listener, cuteafd_api::openai::router_with_console(send, limits, stats, http_queue_wait, console_hub))
         .with_graceful_shutdown(async {
             let mut term =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -123,7 +123,7 @@ fn console_config(args: &crate::cli::NativeServeArgs) -> console::Config {
     console::Config {
         snapshot: args.snapshot.clone(),
         info: serde_json::json!({
-            "model": cuteafd_api::native_v41::MODEL,
+            "model": cuteafd_api::openai::MODEL,
             "release": env("CUTEAFD_RELEASE_VERSION"),
             "revision": env("CUTEAFD_CONSOLE_REVISION").or_else(|| env("CUTEAFD_ENGINE_COMMIT")),
             "layout": layout,
@@ -168,7 +168,7 @@ mod prefill_capacity_tests {
     /// groups and nothing else — an explicit TP3EP1 native launch is not compact.
     #[test]
     fn compact_profile_covers_implicit_two_and_three_peers_only() {
-        let tp3ep1 = cuteafd_transport::v41_expert::V41SparkTopology::new(3, 1).unwrap();
+        let tp3ep1 = cuteafd_transport::expert::V41SparkTopology::new(3, 1).unwrap();
         for (topology, peers, expected) in [
             (None, 2, true),
             (None, 3, true),
@@ -245,7 +245,7 @@ pub(crate) fn protocol_v2_timing() -> bool {
 /// 32 GiB device ceiling, the prefill workspace clamp and the reservation
 /// headroom cap all belong to exactly this profile; an explicit topology (any
 /// native layout, including `TP3EP1`) is never compact.
-fn legacy_compact(topology: Option<cuteafd_transport::v41_expert::V41SparkTopology>, peers: usize) -> bool {
+fn legacy_compact(topology: Option<cuteafd_transport::expert::V41SparkTopology>, peers: usize) -> bool {
     topology.is_none() && matches!(peers, 2 | 3)
 }
 
@@ -253,7 +253,7 @@ fn spark_transport(
     peers: &[std::net::SocketAddr],
     capacity: u32,
     timing: bool,
-    topology: Option<cuteafd_transport::v41_expert::V41SparkTopology>,
+    topology: Option<cuteafd_transport::expert::V41SparkTopology>,
 ) -> Result<V41Tp4Roce> {
     let config = TcpTransportConfig { timing, timeout: Duration::from_secs(120), max_frame_bytes: 64 * 1024 * 1024 };
     if let Some(topology) = topology {
@@ -263,16 +263,16 @@ fn spark_transport(
     }
     match peers.len() {
         2 => V41Tp4Roce::new_tp2(peers.try_into().expect("two peers"), [
-            cuteafd_transport::v41_expert::v41_spark_executor_id(2, 0)?,
-            cuteafd_transport::v41_expert::v41_spark_executor_id(2, 1)?,
+            cuteafd_transport::expert::v41_spark_executor_id(2, 0)?,
+            cuteafd_transport::expert::v41_spark_executor_id(2, 1)?,
         ], capacity, config),
         // The implicit three-rank EXL3 group answers in the TP3EP1 namespace
         // (7..=9) but keeps the canonical non-ownership frame contract, so it
         // must not be built through `new_topology`.
         3 => V41Tp4Roce::new_ranks(peers, &[
-            cuteafd_transport::v41_expert::v41_spark_executor_id(3, 0)?,
-            cuteafd_transport::v41_expert::v41_spark_executor_id(3, 1)?,
-            cuteafd_transport::v41_expert::v41_spark_executor_id(3, 2)?,
+            cuteafd_transport::expert::v41_spark_executor_id(3, 0)?,
+            cuteafd_transport::expert::v41_spark_executor_id(3, 1)?,
+            cuteafd_transport::expert::v41_spark_executor_id(3, 2)?,
         ], capacity, config),
         4 => V41Tp4Roce::new(peers.try_into().expect("four peers"), [1, 2, 3, 4], capacity, config),
         _ => anyhow::bail!(

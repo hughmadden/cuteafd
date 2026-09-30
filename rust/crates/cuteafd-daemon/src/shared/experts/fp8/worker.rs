@@ -7,7 +7,7 @@ use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_transport::{
-    v41_expert::V41BackboneRequest, ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2ResponseRef, ExpertV2Dtype,
+    expert::V41BackboneRequest, ExpertProtocolV2DeviceResponseRef, ExpertProtocolV2ResponseRef, ExpertV2Dtype,
     EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN,
 };
 use std::rc::Rc;
@@ -47,7 +47,7 @@ impl<'a> Fp8Worker<'a> {
             DeviceAllocation::new(library, capacity * topk * 4)?,
         ];
         let output = DeviceAllocation::new(library, capacity * hidden * 2)?;
-        let executor_id = cuteafd_transport::v41_expert::v41_spark_executor_id(experts.tp, experts.rank)?;
+        let executor_id = cuteafd_transport::expert::v41_spark_executor_id(experts.tp, experts.rank)?;
         Ok(Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             experts,

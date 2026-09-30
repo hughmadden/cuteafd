@@ -475,11 +475,11 @@ pub(crate) struct NativeServeArgs {
     pub prefill_batch_tokens: u32,
 
     /// Total prompt plus generated tokens; compressed cache is reserved at startup.
-    #[arg(long, default_value_t = cuteafd_api::native_v41::MAX_CONTEXT_TOKENS, value_parser = clap::value_parser!(u32).range(1..=1048576))]
+    #[arg(long, default_value_t = cuteafd_api::openai::MAX_CONTEXT_TOKENS, value_parser = clap::value_parser!(u32).range(1..=1048576))]
     pub max_context_tokens: u32,
 
     /// Default and maximum generated tokens, further bounded by remaining context.
-    #[arg(long, default_value_t = cuteafd_api::native_v41::MAX_OUTPUT_TOKENS, value_parser = clap::value_parser!(u32).range(1..=393216))]
+    #[arg(long, default_value_t = cuteafd_api::openai::MAX_OUTPUT_TOKENS, value_parser = clap::value_parser!(u32).range(1..=393216))]
     pub max_output_tokens: u32,
 
     /// Exact global KV/index byte budget (B/MB/GB/MiB/GiB), rounded down to page groups.
@@ -541,7 +541,7 @@ pub(crate) struct NativeServeArgs {
     #[arg(long, default_value_t = 512, env = "CUTEAFD_HOST_CACHE_MIN_TOKENS")]
     pub host_cache_min_tokens: u32,
     /// Snapshots longer than this are not cached.
-    #[arg(long, default_value_t = cuteafd_api::native_v41::MAX_CONTEXT_TOKENS, env = "CUTEAFD_HOST_CACHE_MAX_TOKENS")]
+    #[arg(long, default_value_t = cuteafd_api::openai::MAX_CONTEXT_TOKENS, env = "CUTEAFD_HOST_CACHE_MAX_TOKENS")]
     pub host_cache_max_tokens: u32,
     /// Which retention banks the cache serves: `prompt`, `turn`, or `prompt,turn`.
     #[arg(long, default_value = "prompt,turn", env = "CUTEAFD_HOST_CACHE_KINDS")]

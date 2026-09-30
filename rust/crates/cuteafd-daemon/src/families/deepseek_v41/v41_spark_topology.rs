@@ -1,12 +1,12 @@
 //! CLI-resolved replicated Spark `TP×EP` topology shared by both daemons.
 //!
 //! The only source of rank identity is
-//! [`cuteafd_transport::v41_expert::V41SparkTopology`]: this module never
+//! [`cuteafd_transport::expert::V41SparkTopology`]: this module never
 //! re-derives executor ids, group indices or physical rank maps, so transport,
 //! worker shard selection and coordinator assembly cannot drift apart.
 use anyhow::{ensure, Result};
 use cuteafd_loader::OfficialV41Catalog;
-use cuteafd_transport::v41_expert::V41SparkTopology;
+use cuteafd_transport::expert::V41SparkTopology;
 
 /// Resolve the opt-in `--spark-tp N --spark-ep M` pair for a command that knows
 /// how many physical Spark ranks were launched.
@@ -140,7 +140,7 @@ mod tests {
         assert!(group_of(Some(resolved), 6).is_err());
         // The implicit six-rank EXL3 group shares the TP6EP1 namespace.
         for rank in 0..6 {
-            assert_eq!(cuteafd_transport::v41_expert::v41_spark_executor_id(6, rank).unwrap(),
+            assert_eq!(cuteafd_transport::expert::v41_spark_executor_id(6, rank).unwrap(),
                 resolved.executor_id(rank).unwrap());
         }
     }

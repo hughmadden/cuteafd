@@ -6,7 +6,7 @@ use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights, Hos
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::OfficialV41Catalog;
-use cuteafd_transport::v41_expert::{V41BackboneRequest, V41SparkTopology};
+use cuteafd_transport::expert::{V41BackboneRequest, V41SparkTopology};
 use std::{path::PathBuf, sync::mpsc, thread};
 
 pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> {

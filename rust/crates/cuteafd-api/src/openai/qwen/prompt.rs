@@ -8,8 +8,8 @@
 //! system message and rejects later ones.
 use serde_json::{json, Map, Value};
 
-use crate::native_v41::glm::prompt::{reasoning_effort, response_format_instruction, template_message};
-pub use crate::native_v41::glm::prompt::{resolve_thinking, GlmToolChoice as QwenToolChoice};
+use crate::openai::glm::prompt::{reasoning_effort, response_format_instruction, template_message};
+pub use crate::openai::glm::prompt::{resolve_thinking, GlmToolChoice as QwenToolChoice};
 
 /// Request-level prompt settings resolved by the API layer.
 #[derive(Debug, Clone)]

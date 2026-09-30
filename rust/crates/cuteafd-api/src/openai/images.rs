@@ -256,9 +256,9 @@ mod tests {
             queue,
             limits: NativeLimits::default(),
             images: ImageDecoder::new(1),
-            admission: crate::native_v41::admission::Admission::new(1, Duration::from_millis(1)),
+            admission: crate::openai::admission::Admission::new(1, Duration::from_millis(1)),
             stats: std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null)),
-            profile: std::sync::Arc::new(crate::native_v41::ModelProfile::default()),
+            profile: std::sync::Arc::new(crate::openai::ModelProfile::default()),
         };
         let body = |url: String| {
             json!({"model":MODEL,"messages":[{"role":"user","content":[
