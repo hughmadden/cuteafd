@@ -1,4 +1,6 @@
 mod registered_response;
+mod landing;
+pub use landing::{gpu_landing_probe, DeviceLanding, GpuLandingProbe};
 use registered_response::{RegisteredResponseFrame, RegisteredResponseRing};
 mod local;
 mod local_client;
@@ -1034,6 +1036,9 @@ pub struct VerbsHostProtocolV2ResponseChunk {
     pub row_indices: Option<Vec<u32>>,
     pub partial_output_payload: VerbsHostProtocolV2ResponsePayload,
     pub wire_bytes: usize,
+    /// The payload was received straight into the session's device landing
+    /// range (see [`DeviceLanding`]); `partial_output_payload` is empty.
+    pub landed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1767,6 +1772,8 @@ struct VerbsHostProtocolV2PersistentClientSession {
     pinned_response_frame_pool: Vec<VerbsHostProtocolV2PinnedResponseFrame>,
     pinned_response_frame_recycle_tx: mpsc::Sender<VerbsHostProtocolV2PinnedResponseFrame>,
     pinned_response_frame_recycle_rx: mpsc::Receiver<VerbsHostProtocolV2PinnedResponseFrame>,
+    /// Response payloads land in device memory; only headers reach the host.
+    gpu_landing: bool,
 }
 
 struct ProtocolV2ResponseChunkAssembler {
@@ -2005,18 +2012,18 @@ impl VerbsHostProtocolV2PersistentClientSession {
         execution_lane: u32,
         cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
     ) -> Result<Self> {
-        Self::connect_impl(addr, config, request, execution_lane, cq_harvester, false)
+        Self::connect_impl(addr, config, request, execution_lane, cq_harvester, false, None)
     }
 
     fn connect_local(addr: SocketAddr, config: &TcpTransportConfig,
-                     request: &ExpertProtocolV2Request) -> Result<Self> {
-        Self::connect_impl(addr, config, request, 0, None, true)
+                     request: &ExpertProtocolV2Request, landing: Option<DeviceLanding>) -> Result<Self> {
+        Self::connect_impl(addr, config, request, 0, None, true, landing)
     }
 
     fn connect_impl(addr: SocketAddr, config: &TcpTransportConfig,
                     request: &ExpertProtocolV2Request, execution_lane: u32,
                     cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
-                    retain_final_response: bool) -> Result<Self> {
+                    retain_final_response: bool, landing: Option<DeviceLanding>) -> Result<Self> {
         verbs_host_preflight()?;
         let native_path = verbs_host_native_library_path().context(
             "native library not found; set CUTEAFD_NATIVE_LIB or build native/libcuteafd_native.so with RDMA",
@@ -2035,6 +2042,8 @@ impl VerbsHostProtocolV2PersistentClientSession {
                 Arc::clone(&library), "client", request_capacity_wire_bytes,
                 response_capacity_wire_bytes, request_registered_span_bytes,
                 response_registered_span_bytes, next_local_psn("client"), response_ring.depth,
+                // A landing receive scatters header and payload (two entries).
+                if landing.is_some() { 2 } else { 1 },
             )?
         } else {
             NativeRdmaEndpoint::create_from_wire_bytes(
@@ -2109,6 +2118,11 @@ impl VerbsHostProtocolV2PersistentClientSession {
             );
         }
         endpoint.connect(&ready.server_native_endpoint)?;
+        // Before any receive is posted, so every response slot scatters alike.
+        let gpu_landing = match landing {
+            Some(landing) => landing::attach(&endpoint, landing, addr),
+            None => false,
+        };
         for slot in 0..response_ring.depth {
             endpoint.post_recv_at(
                 response_ring.slot_offset(slot),
@@ -2118,7 +2132,8 @@ impl VerbsHostProtocolV2PersistentClientSession {
         }
         let (response_frame_recycle_tx, response_frame_recycle_rx) = mpsc::channel();
         let (pinned_response_frame_recycle_tx, pinned_response_frame_recycle_rx) = mpsc::channel();
-        let retained_response_ring = if retain_final_response {
+        // Landed payloads are not in the host slot, so there is nothing to retain.
+        let retained_response_ring = if retain_final_response && !gpu_landing {
             Some(RegisteredResponseRing::new(&endpoint, response_ring)?)
         } else { None };
         Ok(Self {
@@ -2144,6 +2159,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             pinned_response_frame_pool: Vec::new(),
             pinned_response_frame_recycle_tx,
             pinned_response_frame_recycle_rx,
+            gpu_landing,
         })
     }
 
@@ -2376,6 +2392,10 @@ impl VerbsHostProtocolV2PersistentClientSession {
             response_recv_offset,
             EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN,
         )?;
+        if self.gpu_landing {
+            return self.accept_landed_chunk_frame(pending, &response_header, response_recv_offset,
+                response_recv_slot, config);
+        }
         let response_wire_bytes =
             ExpertProtocolV2Response::wire_bytes_from_header(&response_header)?;
         if response_wire_bytes > config.max_frame_bytes
@@ -2434,6 +2454,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
                 row_indices,
                 partial_output_payload,
                 wire_bytes: response_wire_bytes,
+                landed: false,
             })
             .context("forwarding pipelined persistent verbs-host ProtocolV2 response chunk")?;
         front.response_frames += 1;
@@ -2631,6 +2652,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
                         row_indices,
                         partial_output_payload,
                         wire_bytes: response_wire_bytes,
+                        landed: false,
                     })
                     .context("forwarding persistent verbs-host ProtocolV2 response chunk")?;
                 **emitted_frames += 1;
@@ -3276,6 +3298,7 @@ impl NativeRdmaEndpoint {
             0,
             VERBS_HOST_RDMA_RING_DEPTH as u32,
             rdma_device,
+            1,
         )
     }
 
@@ -3301,6 +3324,7 @@ impl NativeRdmaEndpoint {
             CUTEAFD_HOST_BUFFER_FLAG_PINNED | CUTEAFD_HOST_BUFFER_FLAG_MAPPED,
             8,
             rdma_device,
+            1,
         )
     }
 
@@ -3314,6 +3338,7 @@ impl NativeRdmaEndpoint {
         response_registered_span_bytes: usize,
         local_psn: u32,
         ring_depth: usize,
+        max_sge: u32,
     ) -> Result<Self> {
         let queue_depth = u32::try_from(ring_depth.max(VERBS_HOST_RDMA_RING_DEPTH))
             .context("mapped RDMA ring depth exceeds u32")?;
@@ -3328,6 +3353,7 @@ impl NativeRdmaEndpoint {
             CUTEAFD_HOST_BUFFER_FLAG_PINNED | CUTEAFD_HOST_BUFFER_FLAG_MAPPED,
             queue_depth,
             None,
+            max_sge,
         )
     }
 
@@ -3356,6 +3382,7 @@ impl NativeRdmaEndpoint {
             CUTEAFD_HOST_BUFFER_FLAG_PINNED | CUTEAFD_HOST_BUFFER_FLAG_MAPPED,
             queue_depth,
             rdma_device,
+            1,
         )
     }
 
@@ -3371,6 +3398,7 @@ impl NativeRdmaEndpoint {
         host_buffer_flags: u64,
         queue_depth: u32,
         rdma_device: Option<&str>,
+        max_sge: u32,
     ) -> Result<Self> {
         let port_num = verbs_host_ib_port_num()?;
         let (send_frame_bytes, recv_frame_bytes, send_span, recv_span) = match role {
@@ -3399,7 +3427,7 @@ impl NativeRdmaEndpoint {
                 recv_span,
                 queue_depth,
                 queue_depth,
-                1,
+                max_sge,
                 host_buffer_flags,
             )?
         } else if host_buffer_flags == 0 {
@@ -3412,7 +3440,7 @@ impl NativeRdmaEndpoint {
                 recv_span,
                 queue_depth,
                 queue_depth,
-                1,
+                max_sge,
             )?
         } else {
             library.rdma_rc_endpoint_create_with_buffer_flags(
@@ -3424,7 +3452,7 @@ impl NativeRdmaEndpoint {
                 recv_span,
                 queue_depth,
                 queue_depth,
-                1,
+                max_sge,
                 host_buffer_flags,
             )?
         };
@@ -3720,6 +3748,7 @@ impl VerbsHostMappedRdmaRing {
                 layout.registered_span_bytes,
                 next_local_psn("client"),
                 layout.depth,
+                1,
             )?,
         };
         let mut stream = connect_control_stream(peer, transport.timeout)?;

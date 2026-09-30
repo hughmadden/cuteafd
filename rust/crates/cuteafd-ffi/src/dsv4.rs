@@ -363,6 +363,24 @@ impl NativeLibrary {
         Ok(())
     }
 
+    /// [`Self::fp8_block_quant`] / [`Self::fp8_row_quant`] under scale `rule`
+    /// (0 amax / 448, 1 the smallest power of two >= it, 2 whichever of the
+    /// two leaves the smaller squared error per block); `row` selects the
+    /// per-row x 128-K layout.
+    ///
+    /// # Safety
+    /// Every pointer is live device memory of its shape on the stream's device.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fp8_quant_rule(&self, w: *const c_void, q: *mut c_void, scale: *mut c_void, rows: usize,
+        cols: usize, row: bool, rule: i32, stream: *mut c_void) -> Result<()> {
+        type Quant = unsafe extern "C" fn(*const c_void, *mut c_void, *mut c_void, i32, i32, i32, *mut c_void) -> i32;
+        let name: &[u8] = if row { b"cuteafd_fp8_row_quant_rule" } else { b"cuteafd_fp8_block_quant_rule" };
+        let f = *unsafe { self.lib.get::<Quant>(name) }?;
+        let status = unsafe { f(w, q, scale, i32::try_from(rows)?, i32::try_from(cols)?, rule, stream) };
+        ensure!(status == 0, "FP8 quantization (rule {rule}) failed with {status}");
+        Ok(())
+    }
+
     /// Mean over the four mHC copies of `rows` stream rows [rows, 4, hidden]
     /// into columns `offset..offset + hidden` of `out` [rows, stride], BF16.
     ///

@@ -279,6 +279,28 @@ S4 Qwen, S5 V4 Flash/Pro, S6 canonical turn snapshot, S7 embedding cache.
 Gate: resume-at-P restores are byte-identical to straight prefill; greedy
 text identical to cache-off; V4.1 parity unchanged.
 
+**Repo layout and naming (study 2026-09-30; run at a quiet point after a merge
+round, before prefix-cache S1 and planner S0 create new modules).** Family ids:
+long ids `deepseek_v41`, `deepseek_v4`, `glm5`, `glm5_flash`, `mimo_v2`,
+`qwen4` for directories, modules, plan ids, goldens; short tags `v41`,
+`dsv4`(f/p), `glm`, `glmf`, `mimo`(p), `qwen4` only for C symbols, AOT
+program prefixes and package dirs (baked into manifests; unchanged). Target:
+`shared/` + `families/<id>/` in the daemon, ffi and loader; transport
+`v41_expert` → `expert`; api `native_v41` → `openai` + `chat/<id>`;
+`native/{shared,families/<id>}/{cuda,src,include}` + `cmake/{shared,families}`;
+`python/reference/families/<id>`, `python/tools/{aot,bench,hf,qualify/<id>}`;
+`scripts/{lib,build,launch,bench/<id>,qualify/<id>}`; multimodal input path in
+the engine crate, per-family encoders beside their family. Steps: P1 purge
+dead legacy (≈6.4k lines of unbound ds4/b12x/w8a16 kernels, python runtime,
+stale justfile recipes, unused core modules), P2 baselines; M1–M9 pure
+`git mv` commits with only forced build-file edits and root re-exports
+(`crate::v41_*` paths keep compiling), verified per group, plus
+`path-map.tsv` and a rebase-across-move script; then a naming pass (generic
+types off V4.1 names, one `serve`/`expertd`/`golden` CLI with family
+detection, `run.sh` absorbs `run-dsv4.sh`, cmake/config/env aliases for one
+release; exported C symbols and V4.1-specific names stay). ≈3 days move pass,
+≈3–4 days naming pass; V4.1 parity before tagging.
+
 **Phase 5 — NVIDIA ModelOpt NVFP4 checkpoints (queued; after the families
 above reach their performance targets).** nvidia/{DeepSeek-V4.1-Flash,
 GLM-5.3, GLM-5.3-Flash, Qwen3.8-Flash-Next}-NVFP4. Common contract: U8

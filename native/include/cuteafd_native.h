@@ -460,6 +460,20 @@ typedef struct cuteafd_rdma_rc_endpoint_buffer_view_t {
   uint64_t host_flags;
 } cuteafd_rdma_rc_endpoint_buffer_view_t;
 
+// Whether routed results can land in device memory over dma-buf, and a
+// loopback SEND measurement of landing in device vs pinned host memory.
+typedef struct cuteafd_rdma_gpu_landing_probe_t {
+  int cuda_device;
+  int dma_buf_supported;
+  int gpudirect_rdma_supported;
+  int writes_ordering;
+  int registered;
+  double gpu_gbps;
+  double host_gbps;
+  char device_name[64];
+  char status[256];
+} cuteafd_rdma_gpu_landing_probe_t;
+
 typedef struct cuteafd_rdma_rc_completion_stats_t {
   uint32_t expected_send_completions;
   uint32_t expected_recv_completions;
@@ -682,6 +696,14 @@ cuteafd_status_t cuteafd_rdma_rc_endpoint_connect(void* handle, uint32_t remote_
 cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv(void* handle, size_t bytes, uint64_t wr_id);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv_at(void* handle, size_t offset_bytes,
                                                    size_t bytes, uint64_t wr_id);
+// Receives scatter their first `header_bytes` into the host slot and the rest
+// into [device_ptr, device_ptr + bytes) (dma-buf MR); a null range restores
+// host-only receives. Applies to receives posted afterwards.
+cuteafd_status_t cuteafd_rdma_rc_endpoint_set_recv_landing(void* handle, void* device_ptr,
+                                                       size_t bytes, size_t header_bytes);
+cuteafd_status_t cuteafd_rdma_gpu_landing_probe(const char* device_name, uint32_t port_num,
+                                            size_t bytes, uint32_t iterations,
+                                            cuteafd_rdma_gpu_landing_probe_t* out);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_post_send_at(void* handle, size_t offset_bytes,
                                                    size_t bytes, uint64_t wr_id);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_send(void* handle, const void* frame, size_t bytes,

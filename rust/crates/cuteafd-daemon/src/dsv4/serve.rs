@@ -2,6 +2,7 @@
 //! the prefill/decode engine (the correctness baseline batching builds on).
 use super::pool::{Placement, PoolAllocator};
 use super::{embed_rows, with_engine, EngineArgs};
+use crate::prefill_share::{Chunk, DecodeShareArgs};
 use anyhow::{Context, Result};
 use cuteafd_api::native_v41::{
     ConsoleHub, InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits,
@@ -30,6 +31,8 @@ pub(crate) struct ServeArgs {
     /// (and their verify rows fit the decode programs).
     #[arg(long, default_value_t = 10)]
     pub speculate_max_sequences: usize,
+    #[command(flatten)]
+    pub decode_share: DecodeShareArgs,
 }
 
 /// "…/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/<rev>" -> "deepseek-ai/DeepSeek-V4-Flash-0731".
@@ -57,9 +60,10 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let engine_args = args.engine.clone();
     let worker_stats = stats.clone();
-    let (max_context, speculate_max) = (args.max_context as usize, args.speculate_max_sequences);
+    let (max_context, speculate_max, decode_share) =
+        (args.max_context as usize, args.speculate_max_sequences, args.decode_share);
     let worker = tokio::task::spawn_blocking(move ||
-        serve_loop(engine_args, receive, ready_tx, worker_stats, max_context, speculate_max));
+        serve_loop(engine_args, receive, ready_tx, worker_stats, max_context, speculate_max, decode_share));
     ready_rx.await.context("engine failed before it was ready")??;
     let router = cuteafd_api::native_v41::router_for_model(queue, limits, stats, Duration::from_secs(25),
         ConsoleHub::disabled(), profile.clone());
@@ -79,6 +83,7 @@ fn serve_loop(
     stats: Arc<Mutex<serde_json::Value>>,
     max_context: usize,
     speculate_max: usize,
+    decode_share: DecodeShareArgs,
 ) -> Result<()> {
     let loaded = match super::load(&args) {
         Ok(loaded) => loaded,
@@ -98,12 +103,31 @@ fn serve_loop(
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(()));
         }
-        schedule(engine, &loaded, &tokenizer, eos, &mut receive, transports, runtime, &stats, speculate_max)
+        schedule(engine, &loaded, &tokenizer, eos, &mut receive, transports, runtime, &stats, speculate_max,
+            decode_share)
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
     }
     result
+}
+
+/// An admitted prompt waiting for its remaining prefill chunks (equal
+/// chunks of `limit` tokens; the last one returns the logits).
+struct Prefill<'a> {
+    job: NativeRequest,
+    constraint: Option<crate::v41_native_serve::constraints::State<'a>>,
+    tokens: Vec<u32>,
+    limit: usize,
+    /// Chunks prefilled so far, of `chunks`.
+    index: usize,
+    chunks: usize,
+    placement: Placement,
+    capacity: usize,
+    logits: Vec<f32>,
+    started: Instant,
+    /// Seconds in this prompt's chunks.
+    busy: f64,
 }
 
 /// One admitted request: its placement, stream state and next input token.
@@ -182,7 +206,7 @@ fn speculative_step(
     hidden: usize,
     vocab: usize,
     eos: u32,
-    transports: &mut [cuteafd_transport::v41_expert::V41Tp4Roce],
+    transports: &mut [crate::spark_intake::SparkLink<'_>],
     runtime: &tokio::runtime::Runtime,
 ) -> Result<Vec<bool>> {
     let noise = engine.cfg.dspark_noise_token_id as u32;
@@ -237,10 +261,11 @@ fn schedule(
     tokenizer: &cuteafd_loader::LoadedTokenizer,
     eos: u32,
     receive: &mut mpsc::Receiver<NativeRequest>,
-    transports: &mut [cuteafd_transport::v41_expert::V41Tp4Roce],
+    transports: &mut [crate::spark_intake::SparkLink<'_>],
     runtime: &tokio::runtime::Runtime,
     stats: &Mutex<serde_json::Value>,
     speculate_max: usize,
+    decode_share: DecodeShareArgs,
 ) -> Result<()> {
     let mut allocator = PoolAllocator::new(engine.shape);
     let mut grammars = crate::v41_native_serve::constraints::Compiler::new(
@@ -250,10 +275,11 @@ fn schedule(
     let hidden = engine.cfg.dim;
     let vocab = engine.cfg.vocab_size;
     let chunk_limit = engine.prefill_capacity().min(engine.max_context);
+    let mut prefills = decode_share.queue::<Prefill<'_>>()?;
     loop {
         // Admit while sequence slots and decode rows remain.
-        while allocator.free_states() > 0 && active.len() < engine.decode_rows {
-            let job = if active.is_empty() {
+        while allocator.free_states() > 0 && active.len() + prefills.len() < engine.decode_rows {
+            let job = if active.is_empty() && prefills.is_empty() {
                 match receive.blocking_recv() {
                     Some(job) => job,
                     None => return Ok(()),
@@ -284,57 +310,71 @@ fn schedule(
                 continue;
             }
             let capacity = (tokens.len() + job.max_tokens).min(engine.max_context);
-            let mut placement = match allocator.admit(capacity) {
+            let placement = match allocator.admit(capacity) {
                 Ok(placement) => placement,
                 Err(error) => {
                     reject(&job, format!("{error:#}"));
                     continue;
                 }
             };
-            let admitted = (|| -> Result<Active<'_>> {
-                let _ = job.events.blocking_send(Ok(InferenceChunk::Ready {
-                    system_fingerprint: None,
-                    prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: 0 },
-                }));
-                let embed = embed_rows(&loaded.catalog, &tokens, hidden)?;
-                let mut logits = Vec::new();
-                let started = Instant::now();
-                *engine.profile.borrow_mut() = super::engine::Profile::default();
-                // Equal chunks, so no lane runs a tiny tail.
-                let chunks = tokens.len().div_ceil(chunk_limit);
-                let limit = tokens.len().div_ceil(chunks);
-                for (index, (chunk, rows)) in tokens.chunks(limit).zip(embed.chunks(limit * hidden * 2)).enumerate() {
-                    let logit_rows = usize::from(index + 1 == chunks);
-                    logits = engine.prefill(&mut placement, chunk, rows, transports, runtime, logit_rows, None)?;
-                }
-                tracing::debug!(tokens = tokens.len(), elapsed_ms = started.elapsed().as_millis() as u64,
-                    phases = %engine.profile.borrow().report(), "prefill");
-                let last = logits.len() / vocab - 1;
-                let mut request = Active {
-                    decoder: cuteafd_loader::streaming_token_decoder(&loaded.snapshot, false)?,
-                    job, constraint, placement: placement.clone(), capacity, next: 0, generated: 0, buffered: 0,
-                    started: Instant::now(),
-                };
-                request.next = request.select(&logits[last * vocab..])?;
-                Ok(request)
-            })();
-            match admitted {
-                Ok(mut request) => {
-                    let token = request.next;
-                    match request.emit(token, eos) {
-                        Ok(false) => active.push(request),
-                        Ok(true) | Err(_) => allocator.release(request.placement),
+            let _ = job.events.blocking_send(Ok(InferenceChunk::Ready {
+                system_fingerprint: None,
+                prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: 0 },
+            }));
+            // Equal chunks, so no lane runs a tiny tail.
+            let chunks = tokens.len().div_ceil(chunk_limit);
+            let limit = tokens.len().div_ceil(chunks);
+            prefills.push(Prefill { job, constraint, tokens, limit, index: 0, chunks, placement, capacity,
+                logits: Vec::new(), started: Instant::now(), busy: 0.0 });
+        }
+        if prefills.due(!active.is_empty()) {
+            // One chunk of each waiting prompt (whole prompts with --decode-share 0).
+            let finished = prefills.round(|p| {
+                anyhow::ensure!(!p.job.events.is_closed(), "client went away");
+                let timer = Instant::now();
+                let from = p.index * p.limit;
+                let chunk = &p.tokens[from..(from + p.limit).min(p.tokens.len())];
+                let rows = embed_rows(&loaded.catalog, chunk, hidden)?;
+                let logit_rows = usize::from(p.index + 1 == p.chunks);
+                p.logits = engine.prefill(&mut p.placement, chunk, &rows, transports, runtime, logit_rows, None)?;
+                p.index += 1;
+                p.busy += timer.elapsed().as_secs_f64();
+                Ok(if p.index == p.chunks { Chunk::Done } else { Chunk::More })
+            });
+            for (p, prefilled) in finished {
+                let placement = p.placement.clone();
+                let admitted = prefilled.and_then(|()| {
+                    tracing::debug!(tokens = p.tokens.len(), elapsed_ms = p.started.elapsed().as_millis() as u64,
+                        busy_ms = (1e3 * p.busy) as u64, "prefill");
+                    let last = (p.logits.len() / vocab).checked_sub(1).context("prefill produced no logits")?;
+                    let mut request = Active {
+                        decoder: cuteafd_loader::streaming_token_decoder(&loaded.snapshot, false)?,
+                        job: p.job, constraint: p.constraint, placement: p.placement, capacity: p.capacity, next: 0,
+                        generated: 0, buffered: 0, started: Instant::now(),
+                    };
+                    request.next = request.select(&p.logits[last * vocab..])?;
+                    Ok(request)
+                });
+                match admitted {
+                    Ok(mut request) => {
+                        let token = request.next;
+                        match request.emit(token, eos) {
+                            Ok(false) => active.push(request),
+                            Ok(true) | Err(_) => allocator.release(request.placement),
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!("prefill failed: {error:#}");
+                        allocator.release(placement);
                     }
                 }
-                Err(error) => {
-                    tracing::warn!("prefill failed: {error:#}");
-                    allocator.release(placement);
-                }
             }
+            prefills.settle(!active.is_empty());
         }
         if active.is_empty() {
             continue;
         }
+        let cycle = Instant::now();
         // One decode step over every active sequence; with the drafter and a
         // small batch, each sequence verifies its next token plus a draft.
         let block = engine.draft_block();
@@ -377,8 +417,10 @@ fn schedule(
             allocator.release(request.placement);
         }
         if let Ok(mut stats) = stats.lock() {
-            *stats = serde_json::json!({"requests": requests, "generated_tokens": generated_total, "active": active.len()});
+            *stats = serde_json::json!({"requests": requests, "generated_tokens": generated_total, "active": active.len(),
+                "prefilling": prefills.len()});
         }
+        prefills.stepped(cycle.elapsed().as_secs_f64());
     }
 }
 

@@ -6,6 +6,9 @@ use std::process::Command;
 mod cli;
 mod commands;
 mod draft_policy;
+mod prefill_share;
+mod fp8_linear;
+mod l2_prefetch;
 mod dsv4;
 mod glm;
 mod glmf;
@@ -43,6 +46,7 @@ mod v41_dspark_cache;
 mod v41_spark_topology;
 mod v41_tensors;
 mod v41_engram;
+mod spark_intake;
 
 use cli::{Cli, Commands};
 use commands::bench_rdma::run_bench_rdma;
@@ -81,8 +85,11 @@ async fn main() -> Result<()> {
         Commands::ServeDsv4(args) => dsv4::serve::run_serve(args).await,
         Commands::Fabric(args) => {
             let report = cuteafd_transport::fabric::discover()?;
+            let landing = spark_intake::fabric_probe(args.native_lib.as_deref(), args.device);
             if args.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                let mut value = serde_json::to_value(&report)?;
+                value["gpu_landing"] = serde_json::to_value(&landing)?;
+                println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 for port in &report.ports {
                     println!(
@@ -99,6 +106,7 @@ async fn main() -> Result<()> {
                     );
                 }
                 println!("{}", report.summary());
+                println!("{}", landing.summary());
             }
             Ok(())
         }

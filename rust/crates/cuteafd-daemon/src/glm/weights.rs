@@ -41,6 +41,11 @@ pub(crate) fn fp8_operand_names(name: &str) -> (&'static str, &'static str) {
 }
 
 impl GlmLayer<'_> {
+    /// The device range of `operand`, when the layer has it.
+    pub fn range(&self, operand: &str) -> Option<crate::l2_prefetch::Range> {
+        self.operands.get(operand).map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes))
+    }
+
     pub fn ptr(&self, operand: &str) -> Result<*mut c_void> {
         Ok(self.operands.get(operand).with_context(|| format!("layer has no weight {operand}"))?.buffer.ptr)
     }

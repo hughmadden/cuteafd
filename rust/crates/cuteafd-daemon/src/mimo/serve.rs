@@ -24,6 +24,7 @@ use crate::v41_native_serve::prefix::CudaCopyEngine;
 use cuteafd_engine::prefix::{After, MarkArena, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
 use crate::glm::dflash_policy::{self, CycleCost, DraftHistory, Group, Shape};
 use super::{open, Opened};
+use crate::prefill_share::{add_phases, isolated_phases, Chunk, DecodeShareArgs};
 use anyhow::{Context, Result};
 use cuteafd_api::native_v41::qwen::QwenEncoding;
 use cuteafd_api::native_v41::{
@@ -59,6 +60,8 @@ pub(crate) struct ServeArgs {
     /// instead of the adaptive plan.
     #[arg(long)]
     pub draft_fixed: Option<usize>,
+    #[command(flatten)]
+    pub decode_share: DecodeShareArgs,
     #[command(flatten)]
     pub prefix: PrefixArgs,
 }
@@ -151,7 +154,8 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     engine_args.rings = engine_args.rings.max(args.max_sequences);
     let (worker_stats, max_sequences) = (stats.clone(), args.max_sequences);
     engine_args.draft_sequences = engine_args.draft_sequences.max(args.max_sequences);
-    let draft = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed };
+    let draft = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed,
+        decode_share: args.decode_share };
     let prefix = args.prefix.clone();
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, draft, prefix));
@@ -172,6 +176,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
 struct Policy {
     copy: usize,
     fixed: Option<usize>,
+    decode_share: DecodeShareArgs,
 }
 
 /// Verify-step ms by rows for MiMo V2.6 Pro, RTX PRO 6000 (GPU0, 325 W) + six
@@ -208,6 +213,32 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         let _ = ready.send(result.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
     }
     result
+}
+
+/// An admitted prompt waiting for its remaining prefill chunks.
+struct Prefill<'a> {
+    job: NativeRequest,
+    constraint: Option<crate::v41_native_serve::constraints::State<'a>>,
+    tokens: Vec<u32>,
+    /// Prompt tokens prefilled so far (from the prefix cache's restore point).
+    done: usize,
+    /// Rows restored from the prefix cache.
+    resume: usize,
+    /// Chunk ends and intermediate snapshot points (`cuteafd_engine::prefix::plan_points`).
+    plan: cuteafd_engine::prefix::PointPlan,
+    /// Chunks prefilled so far.
+    chunks: usize,
+    /// The client left mid-prefill: its prefilled rows are parked as a prompt snapshot.
+    cancelled: bool,
+    placement: super::engine::MimoPlacement,
+    capacity: usize,
+    slot: Option<usize>,
+    /// The last chunk's logits.
+    logits: Option<Vec<f32>>,
+    started: Instant,
+    /// Seconds in this prompt's chunks, and their engine phases.
+    busy: f64,
+    phases: [f64; 2],
 }
 
 struct Active<'a> {
@@ -332,52 +363,6 @@ fn release(family: &MimoPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'
     slots.extend(slot);
 }
 
-/// Where a prompt's intermediate snapshot points go: the plan's chunk ends and points.
-struct Points<'c, 'e, 'a, 'l> {
-    family: &'c MimoPrefix<'e, 'a>,
-    cache: &'c mut PrefixCache<CudaCopyEngine<'l>>,
-    plan: cuteafd_engine::prefix::PointPlan,
-}
-
-/// Prefills `tokens[placement.len..]` in the planned chunks (feeding the drafter each chunk's
-/// tapped tail), capturing the planned intermediate points after their chunks, and returns the
-/// last row's logits, or `None` when the client left at a chunk boundary (the rows prefilled so
-/// far stay in the placement).
-fn prefill_suffix(engine: &MimoEngine<'_>, embeddings: &super::Embeddings, slot: Option<usize>,
-    placement: &mut MimoPlacement, tokens: &[u32], job: &NativeRequest, points: Points<'_, '_, '_, '_>)
-    -> Result<Option<Vec<f32>>> {
-    let started = Instant::now();
-    let first = placement.len;
-    let mut logits = None;
-    let Points { family, cache, plan } = points;
-    for (index, &end) in plan.chunks.iter().enumerate() {
-        if job.events.is_closed() {
-            return Ok(None);
-        }
-        let chunk = &tokens[placement.len..end];
-        let embed = embeddings.rows(chunk)?;
-        let start = placement.len;
-        logits = engine.prefill(placement, &embed, None)?;
-        // The chunk's tapped tail becomes the drafter's context.
-        if let (Some(drafter), Some(slot)) = (engine.drafter.as_ref(), slot) {
-            let n = chunk.len().min(super::dflash::TAP_ROWS);
-            drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot,
-                position: start + chunk.len() - n + r }).collect::<Vec<_>>())?;
-        }
-        for &(_, point) in plan.points.iter().filter(|&&(chunk, _)| chunk == index) {
-            if let Err(error) = cache.capture(family, SnapshotKind::Prompt, &tokens[..point], placement, After::default()) {
-                tracing::warn!("snapshot point {point} not retained: {error:#}");
-            }
-        }
-    }
-    let elapsed = started.elapsed().as_secs_f64();
-    let phases = std::mem::take(&mut *engine.profile.borrow_mut());
-    tracing::info!(tokens = tokens.len(), cached = first, elapsed_ms = (1e3 * elapsed) as u64,
-        tok_s = (tokens.len() - first) as f64 / elapsed, gpu_wait_ms = (1e3 * phases[0]) as u64,
-        experts_ms = (1e3 * phases[1]) as u64, "prefill");
-    logits.context("prefill produced no logits").map(Some)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
@@ -403,12 +388,13 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let mut steps = 0u64;
     let (mut verify_s, mut draft_s, mut emit_s, mut embed_s) = (0f64, 0f64, 0f64, 0f64);
     let vocab = engine.cfg.vocab_size;
+    let mut prefills = policy.decode_share.queue::<Prefill<'_>>()?;
     loop {
-        while active.len() < max_sequences {
-            let job = if active.is_empty() {
+        while active.len() + prefills.len() < max_sequences {
+            let job = if active.is_empty() && prefills.is_empty() {
                 // Idle: publish the state the server waits in (captures and releases done).
                 cache.tick();
-                publish(stats, requests, generated_total, 0, &cache);
+                publish(stats, requests, generated_total, 0, 0, &cache);
                 match receive.blocking_recv() {
                     Some(job) => job,
                     None => return Ok(()),
@@ -441,6 +427,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             };
             let slot = free_slots.pop();
             cache.tick();
+            // Lookup, fork of the retained pages and restore of the mark (byte-exact).
             let admitted = match cache.admit(&family, &tokens, capacity, true,
                 |pages| MimoPlacement { pages, ring, len: 0 }) {
                 Ok(admitted) => admitted,
@@ -452,7 +439,6 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 }
             };
             let resume = admitted.resume;
-            let mut placement = admitted.placement;
             let _ = job.events.blocking_send(Ok(InferenceChunk::Ready {
                 system_fingerprint: None,
                 prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: resume },
@@ -461,89 +447,139 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 tracing::info!(tokens = tokens.len(), resume, kind = ?source.kind, frontier = source.frontier,
                     host = source.host, partial = source.partial, "prefix cache hit");
             }
-            let logits = match admitted.after.and_then(|after| after.logits) {
-                // The whole prompt was retained: its logits give the first token.
-                Some(logits) => Ok(Some(logits.to_vec())),
-                None => {
-                    let boundaries = cuteafd_engine::prefix::message_boundaries(&tokens, message_start);
-                    let plan = if cache.enabled() {
-                        cuteafd_engine::prefix::plan_points(resume, tokens.len(), engine.prefill_rows, &boundaries,
-                            family.capture_reach(), prefix.prefix_cache_min_tokens, prefix.points())
+            let boundaries = cuteafd_engine::prefix::message_boundaries(&tokens, message_start);
+            let plan = if cache.enabled() {
+                cuteafd_engine::prefix::plan_points(resume, tokens.len(), engine.prefill_rows, &boundaries,
+                    family.capture_reach(), prefix.prefix_cache_min_tokens, prefix.points())
+            } else {
+                cuteafd_engine::prefix::plan_points(resume, tokens.len(), engine.prefill_rows, &[], 0, 0,
+                    PointPolicy { gap: 0, boundaries: 0, per_request: 0 })
+            };
+            // A whole-prompt hit brings its first token's logits: nothing to prefill.
+            let logits = admitted.after.and_then(|after| after.logits).map(|logits| logits.to_vec());
+            let plan = if logits.is_some() { cuteafd_engine::prefix::PointPlan::default() } else { plan };
+            prefills.push(Prefill { job, constraint, tokens, done: resume, resume, plan, chunks: 0, cancelled: false,
+                placement: admitted.placement, capacity, slot, logits, started: Instant::now(), busy: 0.0,
+                phases: [0.0; 2] });
+        }
+        if prefills.due(!active.is_empty()) {
+            // One chunk of each waiting prompt (whole prompts with --decode-share 0).
+            let finished = prefills.round(|p| {
+                if p.done == p.tokens.len() {
+                    return Ok(Chunk::Done);
+                }
+                if p.job.events.is_closed() {
+                    p.cancelled = true;
+                    anyhow::bail!("client went away");
+                }
+                let timer = Instant::now();
+                let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
+                let chunk = &p.tokens[p.done..end];
+                let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
+                    let embed = embeddings.rows(chunk)?;
+                    let start = p.placement.len;
+                    p.logits = engine.prefill(&mut p.placement, &embed, None)?;
+                    // The chunk's tapped tail becomes the drafter's context.
+                    if let (Some(drafter), Some(slot)) = (drafter, p.slot) {
+                        let n = chunk.len().min(super::dflash::TAP_ROWS);
+                        drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot,
+                            position: start + chunk.len() - n + r }).collect::<Vec<_>>())?;
+                    }
+                    Ok(())
+                });
+                p.done += chunk.len();
+                add_phases(&mut p.phases, phases);
+                p.busy += timer.elapsed().as_secs_f64();
+                result?;
+                // Intermediate snapshot points this chunk reaches (off unless configured).
+                for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks) {
+                    if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, &p.tokens[..point], &p.placement,
+                        After::default()) {
+                        tracing::warn!("snapshot point {point} not retained: {error:#}");
+                    }
+                }
+                p.chunks += 1;
+                Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
+            });
+            for (p, prefilled) in finished {
+                let (slot, placement, resume) = (p.slot, p.placement.clone(), p.resume);
+                if let Err(error) = &prefilled {
+                    if p.cancelled {
+                        // The client left during the prefill: keep what it computed for a retry.
+                        if placement.len > resume {
+                            if let Err(error) = cache.park(&family, &p.tokens[..placement.len], &placement) {
+                                tracing::warn!("parking a cancelled prefill: {error:#}");
+                            }
+                        }
                     } else {
-                        cuteafd_engine::prefix::plan_points(resume, tokens.len(), engine.prefill_rows, &[], 0, 0,
-                            PointPolicy { gap: 0, boundaries: 0, per_request: 0 })
-                    };
-                    prefill_suffix(engine, &embeddings, slot, &mut placement, &tokens, &job,
-                        Points { family: &family, cache: &mut cache, plan })
-                }
-            };
-            let logits = match logits {
-                Ok(Some(logits)) => logits,
-                Ok(None) => {
-                    // The client left during the prefill: keep what it computed for a retry.
-                    if placement.len > resume {
-                        if let Err(error) = cache.park(&family, &tokens[..placement.len], &placement) {
-                            tracing::warn!("parking a cancelled prefill: {error:#}");
-                        }
+                        tracing::warn!("prefill failed: {error:#}");
+                        let _ = p.job.events.blocking_send(Err(NativeFailure::Worker(format!("{error:#}"))));
                     }
                     release(&family, &mut cache, &mut free_rings, &mut free_slots, &placement, slot);
                     continue;
                 }
-                Err(error) => {
-                    tracing::warn!("prefill failed: {error:#}");
-                    let _ = job.events.blocking_send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                let Some(logits) = p.logits.clone() else {
+                    tracing::warn!("prefill produced no logits");
                     release(&family, &mut cache, &mut free_rings, &mut free_slots, &placement, slot);
                     continue;
-                }
-            };
-            // The prompt snapshot, taken once the first token is out (it only enqueues copies).
-            let mut retain_prompt = |cache: &mut PrefixCache<CudaCopyEngine<'_>>, placement: &MimoPlacement| {
-                if resume < tokens.len() {
-                    if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, &tokens, placement,
-                        After::from_logits(&logits, true)) {
-                        tracing::warn!("prompt snapshot not retained: {error:#}");
-                    }
-                }
-            };
-            engine.mtp_reset(placement.ring as usize, placement.len);
-            let admitted = (|| -> Result<Active<'_>> {
-                let mut request = Active {
-                    slot,
-                    drafts: DraftHistory::default(),
-                    counts: [0; 5],
-                    history: tokens.clone(),
-                    draft_limit: draft,
-                    draft_pause: 0,
-                    decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?,
-                    job, constraint, placement: placement.clone(), draft_from: resume, turn: None, capacity, next: 0,
-                    generated: 0, buffered: 0, started: Instant::now(),
                 };
-                request.next = request.select(&logits)?;
-                Ok(request)
-            })();
-            match admitted {
-                Ok(mut request) => {
-                    let token = request.next;
-                    let emitted = request.emit(token);
-                    retain_prompt(&mut cache, &request.placement);
-                    match emitted {
-                        Ok(false) => active.push(request),
-                        // Finished at its first token: its turn is its prompt snapshot.
-                        Ok(true) | Err(_) => {
-                            release(&family, &mut cache, &mut free_rings, &mut free_slots, &request.placement, request.slot)
+                if resume < p.tokens.len() {
+                    tracing::info!(tokens = p.tokens.len(), cached = resume,
+                        elapsed_ms = p.started.elapsed().as_millis() as u64, busy_ms = (1e3 * p.busy) as u64,
+                        tok_s = (p.tokens.len() - resume) as f64 / p.busy, gpu_wait_ms = (1e3 * p.phases[0]) as u64,
+                        experts_ms = (1e3 * p.phases[1]) as u64, "prefill");
+                }
+                // The prompt snapshot, taken once the first token is out (it only enqueues copies).
+                let prompt = (resume < p.tokens.len()).then(|| p.tokens.clone());
+                let retain_prompt = |cache: &mut PrefixCache<CudaCopyEngine<'_>>, placement: &MimoPlacement| {
+                    if let Some(prompt) = &prompt {
+                        if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, prompt, placement,
+                            After::from_logits(&logits, true)) {
+                            tracing::warn!("prompt snapshot not retained: {error:#}");
                         }
                     }
-                }
-                Err(error) => {
-                    tracing::warn!("admission failed: {error:#}");
-                    retain_prompt(&mut cache, &placement);
-                    release(&family, &mut cache, &mut free_rings, &mut free_slots, &placement, slot);
+                };
+                engine.mtp_reset(p.placement.ring as usize, p.placement.len);
+                let admitted = (|| -> Result<Active<'_>> {
+                    let mut request = Active {
+                        slot,
+                        drafts: DraftHistory::default(),
+                        counts: [0; 5],
+                        history: p.tokens,
+                        draft_limit: draft,
+                        draft_pause: 0,
+                        decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?,
+                        job: p.job, constraint: p.constraint, placement: p.placement, draft_from: resume, turn: None,
+                        capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(),
+                    };
+                    request.next = request.select(&logits)?;
+                    Ok(request)
+                })();
+                match admitted {
+                    Ok(mut request) => {
+                        let token = request.next;
+                        let emitted = request.emit(token);
+                        retain_prompt(&mut cache, &request.placement);
+                        match emitted {
+                            Ok(false) => active.push(request),
+                            // Finished at its first token: its turn is its prompt snapshot.
+                            Ok(true) | Err(_) => release(&family, &mut cache, &mut free_rings, &mut free_slots,
+                                &request.placement, request.slot),
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!("admission failed: {error:#}");
+                        retain_prompt(&mut cache, &placement);
+                        release(&family, &mut cache, &mut free_rings, &mut free_slots, &placement, slot);
+                    }
                 }
             }
+            prefills.settle(!active.is_empty());
         }
         if active.is_empty() {
             continue;
         }
+        let cycle = Instant::now();
         // Rows each sequence may add after its next token.
         let room = (DECODE_ROWS / active.len()).max(1) - 1;
         let limits: Vec<usize> = active.iter().map(|a| room.min(a.job.max_tokens - a.generated - 1)
@@ -735,16 +771,17 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             release(&family, &mut cache, &mut free_rings, &mut free_slots, &request.placement, request.slot);
         }
         cache.tick();
-        publish(stats, requests, generated_total, active.len(), &cache);
+        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache);
+        prefills.stepped(cycle.elapsed().as_secs_f64());
     }
 }
 
 /// Serving statistics for `/v1/stats`.
-fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize,
+fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
     cache: &PrefixCache<CudaCopyEngine<'_>>) {
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
-            "prefix_cache": cache.stats()});
+            "prefilling": prefilling, "prefix_cache": cache.stats()});
     }
 }
 

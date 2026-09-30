@@ -45,6 +45,12 @@ pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()>
     let mut execution = weights.execution(&library, &config, remaining)?;
     let mut exchange = HostExpertExchange::new(config.capacity)?;
     let mut row_indices = vec![0; config.capacity as usize];
+    // Transport benchmarks only: answer each request with its response slot
+    // as it is, without running the experts.
+    let skip_compute = std::env::var("CUTEAFD_EXPERTD_SKIP_COMPUTE").is_ok_and(|v| v == "1");
+    if skip_compute {
+        tracing::warn!("CUTEAFD_EXPERTD_SKIP_COMPUTE=1: answering without running the experts");
+    }
     // The mapped rings each accepted endpoint pins are bounded by the
     // capacity-sized two-endpoint allowance that admission already reserved and
     // proved against the device budget and actual free memory. A stale or larger
@@ -199,6 +205,20 @@ pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()>
                         V41BackboneRequest::parse_paired(view.frame_bytes(), config.capacity)?,
                     None => V41BackboneRequest::parse(view.frame_bytes(), config.capacity)?,
                 };
+                if skip_compute {
+                    if let Some(slot) = mapped.response_slot {
+                        let prefix = cuteafd_transport::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
+                        let bytes = request.plane_bytes()?;
+                        if request.permits_device_response() && slot.bytes >= prefix + bytes {
+                            let output = cuteafd_ffi::CuteafdDeviceBuffer {
+                                // SAFETY: the payload follows the header inside the mapped slot.
+                                ptr: unsafe { slot.ptr.cast::<u8>().add(prefix) }.cast(), bytes, ..slot
+                            };
+                            return emit(ProtocolV2ExecutorResponseRef::Device(
+                                request.response_device(executor_id, output)?));
+                        }
+                    }
+                }
                 let layer = (request.layer() as usize).checked_sub(config.first_layer)
                     .context("requested expert layer is not resident on this Spark")?;
                 execution.bind_layer(&weights, layer)?;

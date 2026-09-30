@@ -28,7 +28,8 @@ use cuteafd_ffi::dsv4::{Dsv4Programs, Dsv4Scalar, VocabularyHead, VOCABULARY_HEA
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::fp8_experts::Fp8ExpertTensors;
 use cuteafd_loader::qwen4_exp::{NgramHistory, Qwen4Attention, Qwen4Config};
-use cuteafd_transport::v41_expert::{V41Tp4Roce, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
+use crate::spark_intake::SparkLink;
+use cuteafd_transport::v41_expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
 use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
 };
@@ -142,7 +143,7 @@ pub(crate) enum Experts<'a> {
     Local(LocalExperts<'a>),
     LocalExl3(LocalExl3<'a>),
     /// Spark ranks over RoCE (one BF16 partial plane per rank).
-    Spark { transport: RefCell<V41Tp4Roce>, runtime: tokio::runtime::Runtime },
+    Spark { transport: RefCell<SparkLink<'a>>, runtime: tokio::runtime::Runtime },
     /// No routed experts (plumbing tests only: the MoE output is the shared expert alone).
     SharedOnly,
 }
@@ -280,9 +281,7 @@ struct Workspace<'a> {
     route_ids: Dev<'a>,
     route_weights: Dev<'a>,
     wire: Dev<'a>,
-    planes: Vec<Dev<'a>>,
     router_host: RefCell<HostAllocation<'a>>,
-    planes_host: RefCell<HostAllocation<'a>>,
     /// MTP steps: the source row of each row's feedback, and the greedy draft
     /// (U32 token, FP32 logit) of each head row.
     hidden_rows: Dev<'a>,
@@ -374,6 +373,8 @@ pub(crate) struct Qwen4Engine<'a> {
     /// Recorded after a Spark exchange's device-to-host copies: the host
     /// waits on it while the shared expert runs behind it.
     routes_ready: *mut c_void,
+    /// L2 prefetch of the next layer's weights during decode exchanges.
+    pub l2: Option<crate::l2_prefetch::L2Prefetch>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -463,7 +464,7 @@ impl<'a> Qwen4Engine<'a> {
             decode_workspace: RefCell::new(None), experts: None, profile: RefCell::new([0.0; 2]),
             graphs: RefCell::new(std::collections::HashMap::new()),
             use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0"),
-            routes_ready: library.cuda_event_create_ordering()? })
+            routes_ready: library.cuda_event_create_ordering()?, l2: None })
     }
 
     pub fn set_experts(&mut self, experts: Experts<'a>) {
@@ -472,6 +473,45 @@ impl<'a> Qwen4Engine<'a> {
 
     pub fn experts(&self) -> Option<&Experts<'a>> {
         self.experts.as_ref()
+    }
+
+    /// Per MoE layer, the weights a decode step reads after its routed
+    /// experts, in read order: the next layer's attention site, attention
+    /// (the E4M3 copies where the decode programs read them), MLP site,
+    /// router and shared expert; after the last layer the mixer and LM head.
+    pub fn decode_read_order(&self) -> Vec<Vec<crate::l2_prefetch::Range>> {
+        let layers = &self.weights.layers;
+        (0..layers.len()).map(|i| match layers.get(i + 1) {
+            Some(next) => {
+                let attention: &[&str] = match next.attention {
+                    Qwen4Attention::Gdn => &["w_in", "conv_w", "a_log", "dt_bias", "norm_w", "w_out"],
+                    Qwen4Attention::Full => &["w_in", "q_norm", "k_norm", "iq_norm", "ik_norm", "w_o"],
+                };
+                let names: Vec<&str> = ["attn.norm", "attn.w_di", "attn.w_up"].iter().chain(attention)
+                    .chain(&["mlp.norm", "mlp.w_di", "mlp.w_up", "gate", "shared.w_gate_up", "shared.w_down"])
+                    .copied().collect();
+                crate::l2_prefetch::operands(&names, |n| next.range(n))
+            }
+            None => self.weights.mixer.iter().chain([&self.weights.head])
+                .map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes)).collect(),
+        }).collect()
+    }
+
+    /// After layer `index`'s shared expert is queued in a decode step: the
+    /// L2 prefetch of what the step reads next; with local experts only under
+    /// CUTEAFD_EMULATE_EXCHANGE_US (benchmarks), with a Spark-like wait.
+    fn exchange_window(&self, index: usize, decode: bool, local: bool) -> Result<()> {
+        if !decode {
+            return Ok(());
+        }
+        let mark = if local { crate::l2_prefetch::exchange_mark(self.library, self.stream)? } else { None };
+        if local && mark.is_none() {
+            return Ok(());
+        }
+        if let Some(l2) = &self.l2 {
+            l2.issue(self.library, index, self.stream)?;
+        }
+        crate::l2_prefetch::exchange_wait(self.library, mark)
     }
 
     /// Before a sequence's first step: zeroes its state slot and maps its pool pages.
@@ -619,10 +659,8 @@ impl<'a> Qwen4Engine<'a> {
             route_ids: self.alloc(t * topk * 4)?,
             route_weights: self.alloc(t * topk * 4)?,
             wire: self.alloc(t * (h + h / 32))?,
-            planes: if spark { (0..MAX_RANKS).map(|_| self.alloc(t * h * 2)).collect::<Result<_>>()? } else { Vec::new() },
             router_host: RefCell::new(HostAllocation::new(self.library,
                 if spark { t * (topk * 8 + h + h / 32) } else { 256 })?),
-            planes_host: RefCell::new(HostAllocation::new(self.library, if spark { MAX_RANKS * t * h * 2 } else { 256 })?),
             hidden_rows: self.alloc(t * 4)?,
             argmax: self.alloc(logit_rows * 8)?,
             logits_host: RefCell::new(HostAllocation::new(self.library, logit_rows * self.cfg.vocab_size * 4)?),
@@ -1385,6 +1423,7 @@ impl<'a> Qwen4Engine<'a> {
         let h = self.cfg.hidden;
         match self.experts.as_ref().context("MoE layer without experts")? {
             Experts::Local(local) => {
+                self.exchange_window(index, decode, true)?;
                 let resident = local.index_of(index)?;
                 let fp8 = local.experts.borrow();
                 ensure!(!fp8.wire_input(), "the coordinator FP8 package takes BF16 rows");
@@ -1399,6 +1438,7 @@ impl<'a> Qwen4Engine<'a> {
                 unsafe { self.library.cuda_stream_synchronize(self.stream)? };
             }
             Experts::LocalExl3(local) => {
+                self.exchange_window(index, decode, true)?;
                 local.ensure(index, self.stream)?;
                 let mut resident = local.resident.borrow_mut();
                 let (_, experts) = resident.as_mut().context("EXL3 window")?;
@@ -1434,7 +1474,7 @@ impl<'a> Qwen4Engine<'a> {
     /// rank partials and the shared expert summed into `delta`.
     #[allow(clippy::too_many_arguments)]
     fn spark_moe(&self, w: &Workspace<'_>, index: usize, t: usize, rows: Dsv4Scalar, decode: bool,
-        transport: &mut V41Tp4Roce,
+        transport: &mut SparkLink<'_>,
         runtime: &tokio::runtime::Runtime) -> Result<()> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
@@ -1456,8 +1496,9 @@ impl<'a> Qwen4Engine<'a> {
             self.library.cuda_event_record(self.routes_ready, self.stream)?;
         }
         // The shared expert queues behind the copies and runs during the
-        // exchange; the host waits for the copies only.
+        // exchange (the L2 prefetch behind it); the host waits for the copies only.
         self.shared(w, &self.weights.layers[index], rows)?;
+        self.exchange_window(index, decode, false)?;
         // SAFETY: the event was recorded on this engine's stream above.
         unsafe { self.library.cuda_event_synchronize(self.routes_ready)? };
         self.profile.borrow_mut()[0] += timer.elapsed().as_secs_f64();
@@ -1478,36 +1519,16 @@ impl<'a> Qwen4Engine<'a> {
         request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         let ranks = transport.world_size();
         ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
-        let (row_bytes, plane_bytes) = (h * 2, t * h * 2);
-        let mut staging = w.planes_host.borrow_mut();
-        let bytes = staging.bytes_mut();
         let timer = std::time::Instant::now();
         runtime.block_on(async {
-            transport.execute(&request, |rank, first, payload| {
-                let offset = rank * plane_bytes + first as usize * row_bytes;
-                ensure!(first as usize * row_bytes + payload.len() <= plane_bytes, "partial rows exceed the step");
-                bytes[offset..offset + payload.len()].copy_from_slice(payload);
-                Ok(())
-            }).await
+            let wave = transport.dispatch(&request)?;
+            transport.receive(wave, t, self.stream).await
         })?;
         self.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
-        let mut pointers = [std::ptr::null::<u16>(); MAX_RANKS];
-        for rank in 0..ranks {
-            let source = cuteafd_ffi::CuteafdHostBuffer {
-                // SAFETY: rank planes are disjoint slices of the staging buffer.
-                ptr: unsafe { staging.buffer.ptr.cast::<u8>().add(rank * plane_bytes) }.cast(),
-                bytes: plane_bytes,
-                ..staging.buffer
-            };
-            // SAFETY: pinned source and device plane both hold `plane_bytes`.
-            unsafe { self.library.copy_host_buffer_h2d_async(w.planes[rank].buffer, source, plane_bytes, self.stream)? };
-            pointers[rank] = w.planes[rank].buffer.ptr.cast();
-        }
-        // SAFETY: planes, the shared-expert plane and `delta` are live [t, h] BF16
-        // buffers ordered after the uploads.
+        // SAFETY: the shared-expert plane and `delta` are live [t, h] BF16
+        // buffers; the intake planes are ordered after the wave by `receive`.
         unsafe {
-            self.library.v41_compact_reducer()?.reduce_planes(pointers, ranks as u32, w.shared.buffer.ptr.cast(),
-                w.delta.buffer.ptr.cast(), t as u32, self.stream)?;
+            transport.reduce(w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream)?;
             self.library.cuda_stream_synchronize(self.stream)
         }
     }

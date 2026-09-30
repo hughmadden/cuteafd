@@ -115,6 +115,28 @@ pub(super) fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
     Ok(())
 }
 
+/// [`crate::glm::dflash::replay`] on the golden taps (mHC stream means).
+pub(super) fn draft_replay(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngine<'_>, start: usize) -> Result<()> {
+    let drafter = engine.drafter.as_ref().context("--draft-replay needs --draft")?;
+    let (tokens, greedy) = crate::glm::dflash::golden_sequence(&args.golden, opened.cfg.vocab_size)?;
+    let hidden = opened.cfg.hidden;
+    let layers: Vec<Vec<u8>> = drafter.cfg.taps.iter()
+        .map(|l| std::fs::read(args.golden.join(format!("layer{l:02}.bin")))).collect::<std::io::Result<_>>()?;
+    let row = hidden * 2;
+    let taps = |first: usize, n: usize| -> Result<Vec<u8>> {
+        let means: Vec<Vec<u8>> = layers.iter().map(|layer| stream_mean(layer, first, n, hidden)).collect();
+        let mut taps = vec![0u8; n * layers.len() * row];
+        for r in 0..n {
+            for (i, mean) in means.iter().enumerate() {
+                taps[(r * layers.len() + i) * row..][..row].copy_from_slice(&mean[r * row..][..row]);
+            }
+        }
+        Ok(taps)
+    };
+    crate::glm::dflash::replay(drafter, &tokens, &greedy, &taps, &|t| embed_rows(&opened.checkpoint, t, hidden),
+        engine.weights.head.buffer.ptr, start)
+}
+
 /// Prefills the golden prompt's first --prefill tokens, then decodes one row
 /// per step (teacher-forced on tokens.bin, or greedy with --generate),
 /// drafting with DFlash2 before every step; reports the accepted prefix per

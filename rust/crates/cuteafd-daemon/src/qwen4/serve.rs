@@ -15,6 +15,7 @@ use super::mtp_policy;
 use super::speculate::{self, DraftSeq, DraftTiming, MtpSeq, Verified};
 use super::{embed_rows, open, Opened};
 use crate::draft_policy::{Calibration, DraftHistory, Shape};
+use crate::prefill_share::{add_phases, isolated_phases, Chunk, DecodeShareArgs};
 use anyhow::{Context, Result};
 use cuteafd_api::native_v41::qwen::QwenEncoding;
 use cuteafd_api::native_v41::{
@@ -50,6 +51,8 @@ pub(crate) struct ServeArgs {
     /// instead of the adaptive plan.
     #[arg(long)]
     pub mtp_fixed: bool,
+    #[command(flatten)]
+    pub decode_share: DecodeShareArgs,
 }
 
 fn model_id(snapshot: &std::path::Path) -> Option<String> {
@@ -74,7 +77,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
     engine_args.slots = engine_args.slots.max(args.max_sequences);
-    let (worker_stats, max_sequences) = (stats.clone(), args.max_sequences);
+    let (worker_stats, max_sequences, decode_share) = (stats.clone(), args.max_sequences, args.decode_share);
     let drafts = if engine_args.mtp > 0 {
         Drafts::Mtp { depth: engine_args.mtp.min(DECODE_ROWS - 1), fixed: args.mtp_fixed }
     } else if args.no_copy_drafts {
@@ -83,7 +86,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         Drafts::Copy
     };
     let worker = tokio::task::spawn_blocking(move ||
-        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, drafts, eos));
+        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, drafts, eos, decode_share));
     ready_rx.await.context("engine failed before it was ready")??;
     let router = cuteafd_api::native_v41::router_for_model(queue, limits, stats, Duration::from_secs(25),
         ConsoleHub::disabled(), profile.clone());
@@ -107,7 +110,7 @@ enum Drafts {
 
 fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: tokio::sync::oneshot::Sender<Result<()>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
-    draft: Drafts, eos: Vec<u32>) -> Result<()> {
+    draft: Drafts, eos: Vec<u32>, decode_share: DecodeShareArgs) -> Result<()> {
     let opened = match open(&args) {
         Ok(opened) => opened,
         Err(error) => {
@@ -123,7 +126,8 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(()));
         }
-        schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), draft, eos)
+        schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), draft, eos,
+            decode_share)
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
@@ -232,6 +236,25 @@ fn copy_drafts(history: &[u32], limit: usize) -> Vec<u32> {
     Vec::new()
 }
 
+/// An admitted prompt waiting for its remaining prefill chunks.
+struct Prefill<'a> {
+    job: NativeRequest,
+    constraint: Option<crate::v41_native_serve::constraints::State<'a>>,
+    tokens: Vec<u32>,
+    /// Prompt tokens prefilled so far.
+    done: usize,
+    placement: Qwen4Placement,
+    capacity: usize,
+    seq: MtpSeq,
+    /// The last chunk's logits.
+    logits: Option<Vec<f32>>,
+    started: Instant,
+    /// Seconds in this prompt's chunks, and their engine phases.
+    busy: f64,
+    phases: [f64; 2],
+    id: u64,
+}
+
 /// Per-cycle step costs for policy work (`CUTEAFD_QWEN4_TRACE=path`, JSON lines).
 struct Trace(std::io::BufWriter<std::fs::File>);
 
@@ -254,7 +277,7 @@ impl Trace {
 #[allow(clippy::too_many_arguments)]
 fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
-    drafts: Drafts, eos: Vec<u32>) -> Result<()> {
+    drafts: Drafts, eos: Vec<u32>, decode_share: DecodeShareArgs) -> Result<()> {
     let mut allocator = Allocator::new(engine.pages, engine.slots, &engine.cfg);
     let mut grammars = crate::v41_native_serve::constraints::Compiler::with_vocab(
         &opened.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, eos);
@@ -270,9 +293,10 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
     let mut cost = mtp_policy::cycle_cost(DECODE_ROWS);
     let mut calibration = Calibration::default();
     let mut trace = Trace::open()?;
+    let mut prefills = decode_share.queue::<Prefill<'_>>()?;
     loop {
-        while active.len() < max_sequences {
-            let job = if active.is_empty() {
+        while active.len() + prefills.len() < max_sequences {
+            let job = if active.is_empty() && prefills.is_empty() {
                 match receive.blocking_recv() {
                     Some(job) => job,
                     None => return Ok(()),
@@ -300,7 +324,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             }
             let capacity = (tokens.len() + job.max_tokens).min(engine.max_context);
             // Room for the rows a verify may write past the last kept one.
-            let mut placement = match allocator.admit((capacity + DECODE_ROWS).min(engine.max_context)) {
+            let placement = match allocator.admit((capacity + DECODE_ROWS).min(engine.max_context)) {
                 Ok(placement) => placement,
                 Err(error) => {
                     reject(&job, format!("{error:#}"));
@@ -308,55 +332,69 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 }
             };
             admissions += 1;
-            let admitted = (|| -> Result<Active<'_>> {
-                let _ = job.events.blocking_send(Ok(InferenceChunk::Ready {
-                    system_fingerprint: None,
-                    prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: 0 },
-                }));
-                let started = Instant::now();
-                let mut logits = None;
-                let mut seq = MtpSeq::default();
-                let mut done = 0;
-                for chunk in tokens.chunks(engine.prefill_rows) {
-                    let start = placement.len;
-                    logits = engine.prefill(&mut placement, chunk, &embed(chunk)?)?;
-                    done += chunk.len();
+            let _ = job.events.blocking_send(Ok(InferenceChunk::Ready {
+                system_fingerprint: None,
+                prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: 0 },
+            }));
+            prefills.push(Prefill { job, constraint, tokens, done: 0, placement, capacity, seq: MtpSeq::default(),
+                logits: None, started: Instant::now(), busy: 0.0, phases: [0.0; 2], id: admissions });
+        }
+        if prefills.due(!active.is_empty()) {
+            // One chunk of each waiting prompt (whole prompts with --decode-share 0).
+            let finished = prefills.round(|p| {
+                anyhow::ensure!(!p.job.events.is_closed(), "client went away");
+                let timer = Instant::now();
+                let chunk = &p.tokens[p.done..(p.done + engine.prefill_rows).min(p.tokens.len())];
+                let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
+                    let start = p.placement.len;
+                    p.logits = engine.prefill(&mut p.placement, chunk, &embed(chunk)?)?;
                     if mtp {
-                        speculate::prefill_chunk(engine, &embed, &placement, start, chunk, tokens.get(done).copied(),
-                            &mut seq)?;
+                        speculate::prefill_chunk(engine, &embed, &p.placement, start, chunk,
+                            p.tokens.get(p.done + chunk.len()).copied(), &mut p.seq)?;
                     }
-                }
-                let elapsed = started.elapsed().as_secs_f64();
-                let phases = std::mem::take(&mut *engine.profile.borrow_mut());
-                tracing::info!(tokens = tokens.len(), elapsed_ms = (1e3 * elapsed) as u64,
-                    tok_s = tokens.len() as f64 / elapsed, gpu_wait_ms = (1e3 * phases[0]) as u64,
-                    experts_ms = (1e3 * phases[1]) as u64, "prefill");
-                let mut request = Active {
-                    history: tokens.clone(),
-                    draft_limit: COPY_DRAFT,
-                    draft_pause: 0,
-                    decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?,
-                    job, constraint, placement: placement.clone(), mtp: seq, outcomes: DraftHistory::default(),
-                    idle: 0, proposed: 0, accepted: 0, cycles: 0, capacity, next: 0, generated: 0, buffered: 0,
-                    started: Instant::now(), id: admissions,
-                };
-                request.next = request.select(&logits.context("prefill produced no logits")?)?;
-                request.mtp.close(request.next);
-                Ok(request)
-            })();
-            match admitted {
-                Ok(mut request) => {
-                    let token = request.next;
-                    match request.emit(token) {
-                        Ok(false) => active.push(request),
-                        Ok(true) | Err(_) => allocator.release(request.placement),
+                    Ok(())
+                });
+                p.done += chunk.len();
+                add_phases(&mut p.phases, phases);
+                p.busy += timer.elapsed().as_secs_f64();
+                result?;
+                Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
+            });
+            for (p, prefilled) in finished {
+                let elapsed = p.started.elapsed().as_secs_f64();
+                let placement = p.placement.clone();
+                let admitted = prefilled.and_then(|()| {
+                    tracing::info!(tokens = p.tokens.len(), elapsed_ms = (1e3 * elapsed) as u64,
+                        busy_ms = (1e3 * p.busy) as u64, tok_s = p.tokens.len() as f64 / p.busy,
+                        gpu_wait_ms = (1e3 * p.phases[0]) as u64, experts_ms = (1e3 * p.phases[1]) as u64, "prefill");
+                    let mut request = Active {
+                        history: p.tokens,
+                        draft_limit: COPY_DRAFT,
+                        draft_pause: 0,
+                        decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?,
+                        job: p.job, constraint: p.constraint, placement: p.placement, mtp: p.seq,
+                        outcomes: DraftHistory::default(), idle: 0, proposed: 0, accepted: 0, cycles: 0,
+                        capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(), id: p.id,
+                    };
+                    request.next = request.select(&p.logits.context("prefill produced no logits")?)?;
+                    request.mtp.close(request.next);
+                    Ok(request)
+                });
+                match admitted {
+                    Ok(mut request) => {
+                        let token = request.next;
+                        match request.emit(token) {
+                            Ok(false) => active.push(request),
+                            Ok(true) | Err(_) => allocator.release(request.placement),
+                        }
                     }
-                }
-                Err(error) => {
-                    tracing::warn!("prefill failed: {error:#}");
-                    allocator.release(placement);
+                    Err(error) => {
+                        tracing::warn!("prefill failed: {error:#}");
+                        allocator.release(placement);
+                    }
                 }
             }
+            prefills.settle(!active.is_empty());
         }
         if active.is_empty() {
             continue;
@@ -528,7 +566,8 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
         }
         if let Ok(mut stats) = stats.lock() {
             *stats = serde_json::json!({"requests": requests, "generated_tokens": generated_total,
-                "active": active.len()});
+                "active": active.len(), "prefilling": prefills.len()});
         }
+        prefills.stepped(cycle.elapsed().as_secs_f64());
     }
 }

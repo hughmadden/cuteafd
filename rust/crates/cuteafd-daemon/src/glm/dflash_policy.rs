@@ -120,14 +120,32 @@ pub(crate) fn plan_counts(inputs: &[PlanInput<'_>], fixed: Option<usize>, cost: 
 }
 
 /// GLM-5.3 EXL3 K4, 1 RTX PRO 6000 (325 W) + 4 Sparks TP4: verify step ms by
-/// rows. Measured on the Sparks before the sparse MLA read only selected
-/// tokens and the few-row head (35.6 / 111.8 / 260.2 ms at 1 / 8 / 32 rows),
-/// less the coordinator time those saved at each row count (glm-golden
-/// --bench-verify --skip-routed-experts, 512 tokens of context); re-measure
-/// with --bench-verify on the Sparks.
-pub(crate) const K4_TP4_STEP_MS: [(usize, f64); 15] = [(1, 34.5), (2, 48.9), (3, 59.5), (4, 69.4), (5, 77.4),
-    (6, 85.8), (7, 93.8), (8, 102.1), (10, 118.8), (12, 134.0), (16, 157.9), (24, 197.8), (32, 223.6), (48, 284.7),
-    (64, 327.1)];
+/// rows, the serving fit's prior. Measured on the Sparks (p7 Spark images,
+/// coordinator b3521aa: sparse MLA reads only selected tokens, few-row head)
+/// with glm-golden --bench-verify 64, 512 tokens of context, median of 7.
+pub(crate) const K4_TP4_STEP_MS: [(usize, f64); 15] = [(1, 35.0), (2, 50.5), (3, 60.2), (4, 67.2), (5, 77.6),
+    (6, 85.3), (7, 92.8), (8, 102.6), (10, 116.2), (12, 127.8), (16, 148.4), (24, 190.6), (32, 223.7), (48, 269.4),
+    (64, 317.8)];
+/// Coordinator share of `K4_TP4_STEP_MS` at one row: 35.0 ms less the
+/// 18.2 ms Spark exchange of the same run (GPU wait 13.7, logits 1.35).
+pub(crate) const K4_TP4_GPU_MS: f64 = 16.8;
+
+/// Widest intermediate slice of `ranks` Spark ranks splitting `intermediate`
+/// in whole 128-blocks (2048: TP4 512, TP6 384): it bounds how many expert
+/// bytes the busiest rank reads per step.
+pub(crate) fn widest_slice(intermediate: usize, ranks: usize) -> usize {
+    (intermediate / 128).div_ceil(ranks.max(1)) * 128
+}
+
+/// A step table measured with widest Spark slice `measured` re-priced for
+/// widest slice `widest`: the coordinator share `gpu_ms` stays, the Spark
+/// share (expert reads and exchange) scales with the slice. Serving still
+/// rescales the whole table by what it observes.
+pub(crate) fn rescale_spark(points: &[(usize, f64)], gpu_ms: f64, measured: usize, widest: usize)
+    -> Vec<(usize, f64)> {
+    let factor = widest as f64 / measured as f64;
+    points.iter().map(|&(rows, ms)| (rows, gpu_ms + (ms - gpu_ms).max(0.0) * factor)).collect()
+}
 
 /// Sequences that draft together: identical ones (same tokens, same
 /// position) form one group of `members`, with one draft between them.
@@ -166,6 +184,18 @@ pub(crate) fn plan(groups: &[Group<'_>], base: (usize, usize), cost: &CycleCost)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spark_share_scales_with_the_widest_slice() {
+        assert_eq!((widest_slice(2048, 4), widest_slice(2048, 6), widest_slice(2048, 2)), (512, 384, 1024));
+        let same = rescale_spark(&K4_TP4_STEP_MS, K4_TP4_GPU_MS, 512, 512);
+        assert!(same.iter().zip(&K4_TP4_STEP_MS).all(|(a, b)| a.0 == b.0 && (a.1 - b.1).abs() < 1e-9));
+        let six = rescale_spark(&K4_TP4_STEP_MS, K4_TP4_GPU_MS, 512, 384);
+        for (scaled, &(rows, ms)) in six.iter().zip(&K4_TP4_STEP_MS) {
+            assert_eq!(scaled.0, rows);
+            assert!((scaled.1 - (K4_TP4_GPU_MS + (ms - K4_TP4_GPU_MS) * 0.75)).abs() < 1e-9);
+        }
+    }
 
     #[test]
     fn matches_frozen_glmrt_calibration() {

@@ -10,6 +10,8 @@ pub(crate) struct LocalTp4Client {
     chunks: Option<tokio::sync::mpsc::UnboundedReceiver<VerbsHostProtocolV2ResponseChunk>>,
     done: Vec<tokio::sync::oneshot::Receiver<Result<VerbsHostProtocolV2ResponseStreamStats>>>,
     deadline: Option<Instant>,
+    /// Per-rank device ranges response payloads land in (GPU landing).
+    landing: Vec<Option<DeviceLanding>>,
 }
 impl LocalTp4Client {
     pub(crate) fn new(peers: [SocketAddr; 4], config: TcpTransportConfig) -> Self {
@@ -32,7 +34,20 @@ impl LocalTp4Client {
             chunks: None,
             done: Vec::with_capacity(world),
             deadline: None,
+            landing: vec![None; world],
         }
+    }
+    /// Lands each rank's response payloads in its device range from the next
+    /// connection on; drops current sessions so they reconnect that way.
+    pub(crate) fn set_landing(&mut self, landing: Vec<Option<DeviceLanding>>) -> Result<()> {
+        anyhow::ensure!(landing.len() == self.peers.len(), "one GPU landing entry per rank");
+        self.reset();
+        self.landing = landing;
+        Ok(())
+    }
+    /// Ranks whose live session lands payloads in device memory.
+    pub(crate) fn landing_ranks(&self) -> Vec<bool> {
+        self.sessions.iter().map(|s| s.as_ref().is_some_and(|s| s.gpu_landing)).collect()
     }
     pub(crate) fn reset(&mut self) {
         // Drop queued payloads before sessions unregister their receive rings.
@@ -71,6 +86,7 @@ impl LocalTp4Client {
                     self.peers[rank],
                     &self.config,
                     request,
+                    self.landing[rank],
                 )?);
             }
             let timing = self.sessions[rank]

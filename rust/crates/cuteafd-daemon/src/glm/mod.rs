@@ -9,7 +9,7 @@ pub(crate) mod weights;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::glm_dsa::GlmDsaConfig;
-use cuteafd_transport::v41_expert::V41Tp4Roce;
+use crate::spark_intake::{SparkLane, SparkLink};
 use std::ffi::c_void;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
@@ -48,6 +48,17 @@ pub(crate) struct EngineArgs {
     /// Sequences the drafter keeps a context for and drafts for at once.
     #[arg(long, default_value_t = 16)]
     pub draft_sequences: usize,
+    /// Draft through E4M3 copies of the drafter's GEMM weights and of the LM
+    /// head (false: BF16; the committed tokens are the same either way).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub draft_fp8: bool,
+    /// Scale rule of the FP8 copies made from BF16 weights at load: amax /
+    /// 448, the smallest power of two >= it (pow2), or per block whichever of
+    /// the two leaves the smaller error (best).
+    #[arg(long, value_enum, default_value_t = crate::fp8_linear::Fp8Scales::Amax)]
+    pub fp8_scales: crate::fp8_linear::Fp8Scales,
+    #[command(flatten)]
+    pub l2: crate::l2_prefetch::L2PrefetchArgs,
     /// Keep every prefill row's logits (glm-golden --nll; 2.5 GiB at 4096 rows).
     #[arg(long, hide = true)]
     pub full_prefill_logits: bool,
@@ -85,6 +96,11 @@ pub(crate) struct GoldenArgs {
     /// python/reference/glm_dflash2/reference.py's output directory.
     #[arg(long)]
     pub draft_oracle: Option<PathBuf>,
+    /// With --draft: replay the drafter alone on the golden taps, drafting
+    /// after every token from this position on, BF16 and FP8 (acceptance
+    /// against the text and the golden greedy picks, draft time).
+    #[arg(long)]
+    pub draft_replay: Option<usize>,
     /// Teacher-force this many copies of the sequence together (prefilled to
     /// staggered lengths), --step-rows rows each per step, and compare every
     /// copy's logits with the golden logits.
@@ -145,7 +161,7 @@ impl Opened {
     /// Builds the engine (and the Spark transport when peers are given) and
     /// hands them to `body`.
     pub fn with_engine<T>(&self, args: &EngineArgs,
-        body: impl FnOnce(&engine::GlmEngine<'_>, Option<&mut V41Tp4Roce>, &tokio::runtime::Runtime) -> Result<T>)
+        body: impl FnOnce(&engine::GlmEngine<'_>, Option<&mut SparkLink<'_>>, &tokio::runtime::Runtime) -> Result<T>)
         -> Result<T> {
         let programs = self.library.dsv4_programs()?.with_manifest(&args.manifest)?;
         programs.load_all()?;
@@ -160,7 +176,9 @@ impl Opened {
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages)?;
         engine.full_prefill_logits = args.full_prefill_logits;
-        engine.skip_routed = args.skip_routed_experts;
+        if args.skip_routed_experts {
+            engine.skip_routed_experts()?;
+        }
         if let Some(snapshot) = &args.draft {
             let started = Instant::now();
             let cfg = dflash::DflashConfig::read(snapshot)?;
@@ -169,8 +187,12 @@ impl Opened {
             let mask = embed_rows(&self.catalog, &[cfg.mask_token], self.cfg.hidden)?;
             let file = draft_file.context("drafter prefetch")?.join()
                 .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
-            engine.drafter = Some(dflash::GlmDrafter::load(&self.library, snapshot, file, stream, args.draft_sequences,
-                args.draft_sequences, mask, false)?);
+            let mut drafter = dflash::GlmDrafter::load(&self.library, snapshot, file, stream, args.draft_sequences,
+                args.draft_sequences, mask, false)?;
+            if args.draft_fp8 {
+                drafter.enable_fp8(engine.weights.head.buffer.ptr, args.fp8_scales)?;
+            }
+            engine.drafter = Some(drafter);
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash2 drafter resident");
         }
         let ranks = |peers: &str| -> Result<(Vec<std::net::SocketAddr>, Vec<u64>)> {
@@ -182,15 +204,16 @@ impl Opened {
         };
         let config = cuteafd_transport::TcpTransportConfig { timing: false,
             timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 };
-        let mut transport = args.peers.as_deref().map(|peers| -> Result<V41Tp4Roce> {
+        let row_bytes = self.cfg.hidden * 2;
+        let mut transport = args.peers.as_deref().map(|peers| -> Result<SparkLink<'_>> {
             let (peers, executors) = ranks(peers)?;
-            V41Tp4Roce::new_ranks(&peers, &executors, 4096, config.clone())
+            SparkLink::new(&self.library, &peers, &executors, 4096, config.clone(), row_bytes)
         }).transpose()?;
         // One transport thread per prefill lane (their waves fly beside each other's).
         let mut lanes = match args.peers.as_deref() {
             Some(peers) => (0..engine::configured_lanes()).filter(|_| engine::configured_lanes() > 1).map(|_| {
                 let (peers, executors) = ranks(peers)?;
-                cuteafd_transport::v41_expert::V41Tp4RoceLane::spawn(peers, executors, 4096, config.clone())
+                SparkLane::new(&self.library, peers, executors, 4096, config.clone(), row_bytes)
             }).collect::<Result<Vec<_>>>()?,
             None => Vec::new(),
         };
@@ -217,21 +240,30 @@ impl Opened {
         let started = Instant::now();
         if let Some(transport) = transport.as_mut() {
             let request = warm()?;
-            runtime.block_on(async { transport.execute(&request, |_, _, _| Ok(())).await })?;
+            runtime.block_on(async {
+                let wave = transport.dispatch(&request)?;
+                transport.receive(wave, rows, stream).await
+            })?;
         }
         for lane in &mut lanes {
-            lane.submit(Box::new(warm), Box::new(|_, _, _| Ok(())))?;
+            lane.submit(rows, Box::new(warm))?;
         }
         for lane in &mut lanes {
-            lane.wait(std::time::Duration::from_secs(120))?;
+            lane.wait(rows, std::time::Duration::from_secs(120), stream)?;
         }
+        // SAFETY: the engine's stream; the warm waves' intake waits drain here.
+        unsafe { self.library.cuda_stream_synchronize(stream)? };
         if transport.is_some() {
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, lanes = lanes.len(),
                 "Spark expert transports warm");
         }
         *engine.lanes.borrow_mut() = lanes;
+        if let Some(budget) = args.l2.budget(&self.library, crate::l2_prefetch::GLM_DEFAULT)? {
+            engine.l2 = Some(crate::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
+        }
         let result = body(&engine, transport.as_mut(), &runtime);
         drop(engine);
+        drop(transport);
         // SAFETY: the engine that used the stream is gone.
         unsafe { self.library.cuda_stream_destroy(stream)? };
         result
@@ -324,7 +356,7 @@ fn mean_kl(logits: &[f32], golden: &[f32], vocab: usize) -> f64 {
 /// --nll: the golden prompt through prefill chunks of the engine's capacity
 /// (Spark lanes when available), every row's logits scored against the
 /// golden: mean NLL of the next token, top-1 agreement, KL.
-fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, transport: &mut V41Tp4Roce,
+fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, transport: &mut SparkLink<'_>,
     runtime: &tokio::runtime::Runtime) -> Result<()> {
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
@@ -364,11 +396,11 @@ fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, t
 /// --bench-verify: verify-step cost by rows (the DFlash2 policy's step
 /// table) with the host's phase split, then the drafter step by sequences.
 fn bench_verify(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
-    mut transport: Option<&mut V41Tp4Roce>, runtime: &tokio::runtime::Runtime, max_rows: usize) -> Result<()> {
+    mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, max_rows: usize) -> Result<()> {
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
     ensure!(max_rows >= 1 && max_rows <= engine::DECODE_ROWS, "--bench-verify takes 1..={} rows", engine::DECODE_ROWS);
-    ensure!(transport.is_some() || engine.skip_routed, "--bench-verify needs Spark peers or --skip-routed-experts");
+    ensure!(transport.is_some() || engine.skip_routed(), "--bench-verify needs Spark peers or --skip-routed-experts");
     let prefill = args.bench_context.or(args.prefill).unwrap_or(512);
     let tokens: Vec<u32> = tokens.iter().copied().cycle().take(prefill + max_rows).collect();
     let row = opened.cfg.hidden * 2;
@@ -380,7 +412,7 @@ fn bench_verify(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
     let start = placement.len;
     println!("verify cost after {prefill} tokens (teacher-forced, one sequence, median of 7; host phases per step: \
         GPU wait before each exchange, exchange, logits download){}",
-        if engine.skip_routed { " [routed experts skipped]" } else { "" });
+        if engine.skip_routed() { " [routed experts skipped]" } else { "" });
     let mut counts: Vec<usize> = (0..).map(|i| 1usize << i).take_while(|&r| r < max_rows).chain([max_rows]).collect();
     if !args.bench_rows.is_empty() {
         ensure!(args.bench_rows.iter().all(|&r| r >= 1 && r <= max_rows), "--bench-rows past --bench-verify");
@@ -447,7 +479,7 @@ fn bench_verify(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
 }
 
 /// --bench-prefill: fresh sequences of --bench-prefill-tokens tokens.
-fn bench_prefill(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, transport: &mut V41Tp4Roce,
+fn bench_prefill(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, transport: &mut SparkLink<'_>,
     runtime: &tokio::runtime::Runtime) -> Result<()> {
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
@@ -490,10 +522,29 @@ fn golden(args: GoldenArgs) -> Result<()> {
     opened.with_engine(&args.engine, |engine, transport, runtime| golden_run(&args, &opened, engine, transport, runtime))
 }
 
-fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, mut transport: Option<&mut V41Tp4Roce>,
+fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, mut transport: Option<&mut SparkLink<'_>>,
     runtime: &tokio::runtime::Runtime) -> Result<()> {
     if let Some(dir) = &args.draft_oracle {
         return draft_oracle(args, opened, engine, dir);
+    }
+    if let Some(start) = args.draft_replay {
+        let drafter = engine.drafter.as_ref().context("--draft-replay needs --draft")?;
+        let (tokens, greedy) = dflash::golden_sequence(&args.golden, opened.cfg.vocab_size)?;
+        let hidden = opened.cfg.hidden;
+        let layers: Vec<Vec<u8>> = drafter.cfg.taps.iter()
+            .map(|l| std::fs::read(args.golden.join(format!("layer{l:02}.bin")))).collect::<std::io::Result<_>>()?;
+        let row = hidden * 2;
+        let taps = |first: usize, n: usize| -> Result<Vec<u8>> {
+            let mut taps = vec![0u8; n * layers.len() * row];
+            for r in 0..n {
+                for (i, layer) in layers.iter().enumerate() {
+                    taps[(r * layers.len() + i) * row..][..row].copy_from_slice(&layer[(first + r) * row..][..row]);
+                }
+            }
+            Ok(taps)
+        };
+        return dflash::replay(drafter, &tokens, &greedy, &taps, &|t| embed_rows(&opened.catalog, t, hidden),
+            engine.weights.head.buffer.ptr, start);
     }
     if let Some(rows) = args.bench_verify {
         return bench_verify(args, opened, engine, transport, runtime, rows);
@@ -603,7 +654,7 @@ fn argmax(logits: &[f32]) -> u32 {
 /// Prefills the golden prompt, then decodes one row per step (teacher-forced
 /// on tokens.bin, or greedy with --generate), drafting with DFlash2 before
 /// every step; reports the accepted prefix per step against the sequence.
-fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, mut transport: Option<&mut V41Tp4Roce>,
+fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, mut transport: Option<&mut SparkLink<'_>>,
     runtime: &tokio::runtime::Runtime) -> Result<()> {
     let drafter = engine.drafter.as_ref().context("--draft")?;
     let (catalog, hidden) = (&opened.catalog, opened.cfg.hidden);
@@ -736,7 +787,7 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
 
 /// Several copies of the golden sequence verified in the same decode steps.
 fn multi_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, copies: usize,
-    mut transport: Option<&mut V41Tp4Roce>, runtime: &tokio::runtime::Runtime) -> Result<()> {
+    mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime) -> Result<()> {
     let (catalog, hidden, vocab) = (&opened.catalog, opened.cfg.hidden, opened.cfg.vocab_size);
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();

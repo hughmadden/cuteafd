@@ -16,6 +16,7 @@ capacity, and a verified ``manifest.json``:
     tp1/libcuteafd_fp8moe.so     full intermediate (RTX local / MTP layers)
     tp2/libcuteafd_fp8moe.so     half (Spark TP2)
     tp4/libcuteafd_fp8moe.so     quarter (Spark TP4: every rank runs the same slice width)
+    tp6/libcuteafd_fp8moe.so     sixth in whole 128-blocks (2048: 3/2 blocks, stored 384 zero-padded)
 
 Library ABI (``native/include/cuteafd_fp8_moe.h``)::
 
@@ -51,7 +52,7 @@ os.environ.setdefault("B12X_COMPILE_DISK_CACHE", "0")
 os.environ.setdefault("B12X_COMPILE_MEMORY_CACHE", "0")
 
 SCHEMA = "cuteafd.fp8moe-package.v1"
-ROLE_LAYOUTS = {"spark": ("tp4", "tp2"), "coordinator": ("tp1",)}
+ROLE_LAYOUTS = {"spark": ("tp4", "tp2", "tp6"), "coordinator": ("tp1",)}
 MXFP4_ROLE_LAYOUTS = {"spark": ("tp6", "tp2"), "coordinator": ("tp1",)}
 ROLE_COMPUTE = {"spark": (12, 1), "coordinator": (12, 0)}
 # Spark ranks take the FP8 K32 wire rows of the expert protocol; coordinator
@@ -195,10 +196,16 @@ def build(args: argparse.Namespace) -> None:
     if base.weights == "mxfp4" and not args.layouts:
         # MXFP4 slices pad to 128 (MiMo V2.6 Pro: TP6 over all six Sparks, TP2 x EP3 shards).
         layouts = list(MXFP4_ROLE_LAYOUTS[args.role])
-    # Default Spark layouts keep only the TP degrees that split the intermediate
-    # into whole 128-row blocks (Qwen 3.8 Flash Next's 640 splits into none).
+    # Default Spark layouts keep the TP degrees that split the intermediate into
+    # whole 128-row blocks (Qwen 3.8 Flash Next's 640 splits into none), and
+    # TP6 of any intermediate of at least six blocks: uneven whole blocks
+    # zero-padded to the widest (2048: 3, 3, 3, 3, 2, 2 blocks stored as 384).
     elif not args.layouts:
-        layouts = [l for l in layouts if base.intermediate % (128 * int(l.removeprefix("tp"))) == 0]
+        def servable(tp: int) -> bool:
+            blocks = base.intermediate // 128
+            return base.intermediate % (128 * tp) == 0 or (tp == 6 and blocks >= 6)
+
+        layouts = [l for l in layouts if servable(int(l.removeprefix("tp")))]
         if not layouts:
             raise SystemExit(f"{args.geometry}: intermediate {base.intermediate} has no default {args.role} "
                              "TP layout of whole 128-row blocks; pass --layouts")
@@ -277,7 +284,8 @@ def main() -> None:
     create = commands.add_parser("build")
     create.add_argument("--role", choices=sorted(ROLE_LAYOUTS), required=True)
     create.add_argument("--geometry", choices=("mimo", "mimop", "glm", "glmf", "qwen4"), required=True)
-    create.add_argument("--layouts", help="comma list (default: tp4,tp2 for spark, tp1 for coordinator)")
+    create.add_argument("--layouts", help="comma list (default: tp4,tp2,tp6 where they split for spark, "
+                        "tp1 for coordinator)")
     create.add_argument("--capacities", default="1,16,80,256,1024,4096")
     create.add_argument("--input", choices=("wire", "bf16"),
                         help="expert input rows (default: wire for spark, bf16 for coordinator)")

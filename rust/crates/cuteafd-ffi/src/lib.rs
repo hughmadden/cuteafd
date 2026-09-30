@@ -1,6 +1,8 @@
 pub mod dsv4;
 pub mod fp8_moe;
 mod glm_dflash;
+mod fp8_gemv;
+mod l2_prefetch;
 mod glm_mla;
 mod vocab_head;
 pub use vocab_head::VOCAB_HEAD_ROWS_MAX;
@@ -652,6 +654,38 @@ pub struct CuteafdRdmaRcCompletionStats {
     pub status: [c_char; 128],
 }
 
+/// `cuteafd_rdma_gpu_landing_probe_t`: dma-buf GPU landing support and a
+/// loopback measurement of landing in device vs pinned host memory.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct CuteafdRdmaGpuLandingProbe {
+    pub cuda_device: i32,
+    pub dma_buf_supported: i32,
+    pub gpudirect_rdma_supported: i32,
+    pub writes_ordering: i32,
+    pub registered: i32,
+    pub gpu_gbps: f64,
+    pub host_gbps: f64,
+    pub device_name: [c_char; 64],
+    pub status: [c_char; 256],
+}
+
+impl Default for CuteafdRdmaGpuLandingProbe {
+    fn default() -> Self {
+        Self {
+            cuda_device: -1,
+            dma_buf_supported: 0,
+            gpudirect_rdma_supported: 0,
+            writes_ordering: -1,
+            registered: 0,
+            gpu_gbps: 0.0,
+            host_gbps: 0.0,
+            device_name: [0; 64],
+            status: [0; 256],
+        }
+    }
+}
+
 impl Default for CuteafdRdmaRcCompletionStats {
     fn default() -> Self {
         Self {
@@ -1021,6 +1055,19 @@ type RdmaRcEndpointPostRecvAtFn = unsafe extern "C" fn(
     offset_bytes: usize,
     bytes: usize,
     wr_id: u64,
+) -> CuteafdStatus;
+type RdmaRcEndpointSetRecvLandingFn = unsafe extern "C" fn(
+    handle: *mut c_void,
+    device_ptr: *mut c_void,
+    bytes: usize,
+    header_bytes: usize,
+) -> CuteafdStatus;
+type RdmaGpuLandingProbeFn = unsafe extern "C" fn(
+    device_name: *const c_char,
+    port_num: u32,
+    bytes: usize,
+    iterations: u32,
+    out: *mut CuteafdRdmaGpuLandingProbe,
 ) -> CuteafdStatus;
 type RdmaRcEndpointPostSendAtFn = unsafe extern "C" fn(
     handle: *mut c_void,
@@ -3497,6 +3544,45 @@ impl NativeLibrary {
             unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_post_recv_at")? };
         let status = unsafe { recv_fn(handle, offset_bytes, bytes, wr_id) };
         self.status_to_result("cuteafd_rdma_rc_endpoint_post_recv_at", status)
+    }
+
+    /// Scatter each later receive: its first `header_bytes` into the host
+    /// slot, the rest into `device` (registered over dma-buf). `None` restores
+    /// host-only receives.
+    ///
+    /// # Safety
+    /// `handle` is a live endpoint, and `device` must stay allocated, and not
+    /// be read while a receive may still write it, until the endpoint is
+    /// destroyed or its landing is cleared.
+    pub unsafe fn rdma_rc_endpoint_set_recv_landing(
+        &self,
+        handle: *mut c_void,
+        device: Option<CuteafdDeviceBuffer>,
+        header_bytes: usize,
+    ) -> Result<()> {
+        let set_fn: Symbol<RdmaRcEndpointSetRecvLandingFn> =
+            unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_set_recv_landing")? };
+        let (ptr, bytes) = device.map_or((std::ptr::null_mut(), 0), |d| (d.ptr, d.bytes));
+        // SAFETY: the caller guarantees the handle and range contract above.
+        let status = unsafe { set_fn(handle, ptr, bytes, header_bytes) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_set_recv_landing", status)
+    }
+
+    /// Probe dma-buf GPU landing on the current CUDA device and time loopback
+    /// SENDs of `bytes` landing in device vs pinned host memory. The probe
+    /// struct is returned even when landing is unavailable (see `status`).
+    pub fn rdma_gpu_landing_probe(&self, device_name: Option<&str>, port_num: u32, bytes: usize,
+        iterations: u32) -> Result<(CuteafdRdmaGpuLandingProbe, Option<String>)> {
+        let probe_fn: Symbol<RdmaGpuLandingProbeFn> =
+            unsafe { self.lib.get(b"cuteafd_rdma_gpu_landing_probe")? };
+        let name = device_name.map(std::ffi::CString::new).transpose()?;
+        let mut out = CuteafdRdmaGpuLandingProbe::default();
+        // SAFETY: the name is NUL-terminated or null, and `out` is a live struct.
+        let status = unsafe {
+            probe_fn(name.as_ref().map_or(std::ptr::null(), |n| n.as_ptr()), port_num, bytes, iterations, &mut out)
+        };
+        let failure = self.status_to_result("cuteafd_rdma_gpu_landing_probe", status).err().map(|e| e.to_string());
+        Ok((out, failure))
     }
 
     pub fn rdma_rc_endpoint_post_send_at(

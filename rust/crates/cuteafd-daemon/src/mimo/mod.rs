@@ -60,6 +60,17 @@ pub(crate) struct EngineArgs {
     /// Sequences the drafter keeps a context for and drafts for at once.
     #[arg(long, default_value_t = 4)]
     pub draft_sequences: usize,
+    /// Draft through E4M3 copies of the drafter's GEMM weights and of the LM
+    /// head (false: BF16; the committed tokens are the same either way).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub draft_fp8: bool,
+    /// Scale rule of the FP8 copies made from BF16 weights at load: amax /
+    /// 448, the smallest power of two >= it (pow2), or per block whichever of
+    /// the two leaves the smaller error (best).
+    #[arg(long, value_enum, default_value_t = crate::fp8_linear::Fp8Scales::Amax)]
+    pub fp8_scales: crate::fp8_linear::Fp8Scales,
+    #[command(flatten)]
+    pub l2: crate::l2_prefetch::L2PrefetchArgs,
     /// With --local-experts: keep only N MoE layers' experts resident and load
     /// each missing layer over the oldest (prefill checks of models whose
     /// experts do not fit one GPU, such as V2.6 Pro).
@@ -125,6 +136,11 @@ pub(crate) struct GoldenArgs {
     /// drafts, and score them against the golden text and greedy targets.
     #[arg(long, requires = "draft")]
     pub draft_oracle: Option<PathBuf>,
+    /// With --draft: replay the drafter alone on the golden taps, drafting
+    /// after every token from this position on, BF16 and FP8 (acceptance
+    /// against the text and the golden greedy picks, draft time).
+    #[arg(long)]
+    pub draft_replay: Option<usize>,
     /// With --mtp: run only the MTP drafter on the golden's last-layer rows at
     /// the anchors of python/reference/mimo_mtp/reference.py's output
     /// directory, compare with its predictions and score acceptance.
@@ -174,7 +190,7 @@ impl Opened {
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::MimoLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
             checkpoint_tp: cuteafd_loader::mimo_v2::checkpoint_tp(&args.snapshot)?, fp8_decode: args.fp8_decode,
-            fp8_head: args.fp8_head, fp8_o_proj: args.fp8_o_proj };
+            fp8_head: args.fp8_head, fp8_o_proj: args.fp8_o_proj, fp8_scales: args.fp8_scales };
         let model = loader.model(&self.cfg, layers)?;
         let mtp = if args.mtp > 0 {
             let started = Instant::now();
@@ -219,14 +235,21 @@ impl Opened {
             };
             let file = draft_file.context("drafter prefetch")?.join()
                 .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
-            engine.drafter = Some(dflash::MimoDrafter::load(&self.library, dir, file, stream, args.draft_sequences,
-                args.draft_sequences, mask)?);
+            let mut drafter = dflash::MimoDrafter::load(&self.library, dir, file, stream, args.draft_sequences,
+                args.draft_sequences, mask)?;
+            if args.draft_fp8 {
+                drafter.enable_fp8(engine.weights.head.buffer.ptr, args.fp8_scales)?;
+            }
+            engine.drafter = Some(drafter);
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash drafter resident");
         }
         let moe_layers = (0..layers).filter(|&l| !self.cfg.dense[l]).collect::<Vec<_>>();
         engine.expert_input = args.expert_input;
         if let Some(experts) = self.experts(args, &moe_layers)? {
             engine.set_experts(experts);
+        }
+        if let Some(budget) = args.l2.budget(&self.library, crate::l2_prefetch::OTHER_DEFAULT)? {
+            engine.l2 = Some(crate::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
         let result = body(&engine);
         drop(engine);
@@ -269,9 +292,9 @@ impl Opened {
         let executors: Vec<u64> = (0..peers.len())
             .map(|rank| cuteafd_transport::v41_expert::v41_spark_executor_id(peers.len(), rank))
             .collect::<Result<_>>()?;
-        let mut transport = cuteafd_transport::v41_expert::V41Tp4Roce::new_ranks(&peers, &executors, u32::try_from(args.prefill_rows)?,
-            cuteafd_transport::TcpTransportConfig { timing: false, timeout: std::time::Duration::from_secs(120),
-                max_frame_bytes: 64 << 20 })?;
+        let mut transport = crate::spark_intake::SparkLink::new(&self.library, &peers, &executors,
+            u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
+                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2)?;
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         // Connect every rank and register full-size buffers now: the first
         // request otherwise pays seconds of connection setup.
@@ -301,8 +324,17 @@ impl Opened {
         if args.expert_input.bf16(true) && !args.expert_input.bf16(false) {
             warmups.push(warm(1, true)?);
         }
+        let warm_stream = self.library.cuda_stream_create()?;
         for request in &warmups {
-            runtime.block_on(async { transport.execute(request, |_, _, _| Ok(())).await })?;
+            runtime.block_on(async {
+                let wave = transport.dispatch(request)?;
+                transport.receive(wave, request.header.row_count as usize, warm_stream).await
+            })?;
+        }
+        // SAFETY: the stream was created above; its waits drain before it goes.
+        unsafe {
+            self.library.cuda_stream_synchronize(warm_stream)?;
+            self.library.cuda_stream_destroy(warm_stream)?;
         }
         tracing::info!(ranks = peers.len(), elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
         Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport), runtime }))
@@ -378,6 +410,25 @@ fn golden(args: GoldenArgs) -> Result<()> {
 fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_>) -> Result<()> {
     if let Some(dir) = &args.draft_oracle {
         return draft_oracle(args, opened, engine, dir);
+    }
+    if let Some(start) = args.draft_replay {
+        let drafter = engine.drafter.as_ref().context("--draft-replay needs --draft")?;
+        let (tokens, greedy) = crate::glm::dflash::golden_sequence(&args.golden, opened.cfg.vocab_size)?;
+        let hidden = opened.cfg.hidden;
+        let layers: Vec<Vec<u8>> = drafter.cfg.taps.iter()
+            .map(|l| std::fs::read(args.golden.join(format!("layer{l:02}.bin")))).collect::<std::io::Result<_>>()?;
+        let row = hidden * 2;
+        let taps = |first: usize, n: usize| -> Result<Vec<u8>> {
+            let mut taps = vec![0u8; n * layers.len() * row];
+            for r in 0..n {
+                for (i, layer) in layers.iter().enumerate() {
+                    taps[(r * layers.len() + i) * row..][..row].copy_from_slice(&layer[(first + r) * row..][..row]);
+                }
+            }
+            Ok(taps)
+        };
+        return crate::glm::dflash::replay(drafter, &tokens, &greedy, &taps,
+            &|t| embed_rows(&opened.checkpoint, t, hidden), engine.weights.head.buffer.ptr, start);
     }
     if let Some(dir) = &args.mtp_oracle {
         return mtp_oracle(args, opened, engine, dir);
@@ -473,6 +524,10 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
     // Rows of `ours` are the logits of positions `first..`: top-1 agreement
     // with the golden, next-token accuracy and mean NLL of the next tokens.
     let score = |label: &str, ours_all: &[f32], first: usize| -> Result<()> {
+        // Numerics A/B between engine configs (benchmarks): the decode rows' logits, F32.
+        if let (true, Ok(path)) = (label == "decode", std::env::var("CUTEAFD_DUMP_DECODE_LOGITS")) {
+            std::fs::write(&path, ours_all.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+        }
         let golden = golden_logits()?;
         let vocab = cfg.vocab_size;
         let (mut agree, mut next_ok, mut golden_next, mut nll, mut kl) = (0usize, 0usize, 0usize, 0f64, 0f64);

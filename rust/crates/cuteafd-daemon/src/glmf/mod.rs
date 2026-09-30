@@ -102,6 +102,21 @@ pub(crate) struct EngineArgs {
     /// Sequences the drafter keeps a context for and drafts for at once.
     #[arg(long, default_value_t = 8)]
     pub draft_sequences: usize,
+    /// Draft through E4M3 copies of the drafter's GEMM weights and of the LM
+    /// head (false: BF16; the committed tokens are the same either way).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub draft_fp8: bool,
+    /// Scale rule of the FP8 copies made from BF16 weights at load (KDA
+    /// projections, LM head, drafter): amax / 448, the smallest power of two
+    /// >= it (pow2), or per block whichever of the two leaves the smaller
+    /// error (best). pow2: 84-86% of the KDA q/k/v/o weights have at most
+    /// E4M3's 3 mantissa bits and quantize exactly (relative RMS 2.4e-2 ->
+    /// 4.5e-4); the decode-path gate passed (NLL 1.1443 -> 1.1429, KL 0.0443
+    /// -> 0.0386).
+    #[arg(long, value_enum, default_value_t = crate::fp8_linear::Fp8Scales::Pow2)]
+    pub fp8_scales: crate::fp8_linear::Fp8Scales,
+    #[command(flatten)]
+    pub l2: crate::l2_prefetch::L2PrefetchArgs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -160,6 +175,11 @@ pub(crate) struct GoldenArgs {
     /// output directory.
     #[arg(long)]
     pub draft_oracle: Option<PathBuf>,
+    /// With --draft: replay the drafter alone on the golden taps, drafting
+    /// after every token from this position on, BF16 and FP8 (acceptance
+    /// against the text and the golden greedy picks, draft time).
+    #[arg(long)]
+    pub draft_replay: Option<usize>,
     /// With --draft: after the --prefill tokens, decode N greedy tokens one row
     /// per step, drafting before each, and report how many drafts the target
     /// reproduced (0: teacher-forced on tokens.bin, scoring against it).
@@ -233,7 +253,8 @@ impl Opened {
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::GlmfLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
             fp8_dense: args.fp8_decode, fp8_source: self.fp8_checkpoint.as_ref(), kda_fp8: args.kda_fp8,
-            fp8_head: args.fp8_head, kda_nvfp4: args.kda_nvfp4_gate.as_deref().map(|mode| mode == "search") };
+            fp8_head: args.fp8_head, kda_nvfp4: args.kda_nvfp4_gate.as_deref().map(|mode| mode == "search"),
+            fp8_scales: args.fp8_scales };
         let model = loader.model(&self.cfg, layers)?;
         let resident: usize = model.layers.iter().map(weights::GlmfLayer::bytes).sum();
         tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64, fp8_decode = args.fp8_decode,
@@ -258,14 +279,21 @@ impl Opened {
             let mask = embed_rows(&self.checkpoint, &[cfg.mask_token], self.cfg.hidden)?;
             let file = crate::glm::dflash::prefetch(snapshot).join()
                 .map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
-            engine.drafter = Some(crate::glm::dflash::GlmDrafter::load(&self.library, snapshot, file, stream,
-                args.draft_sequences, args.draft_sequences, mask, true)?);
+            let mut drafter = crate::glm::dflash::GlmDrafter::load(&self.library, snapshot, file, stream,
+                args.draft_sequences, args.draft_sequences, mask, true)?;
+            if args.draft_fp8 {
+                drafter.enable_fp8(engine.weights.head.buffer.ptr, args.fp8_scales)?;
+            }
+            engine.drafter = Some(drafter);
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash2 drafter resident");
         }
         if (0..layers).any(|l| !self.cfg.dense[l]) {
             if let Some(experts) = self.experts(args)? {
                 engine.set_experts(experts);
             }
+        }
+        if let Some(budget) = args.l2.budget(&self.library, crate::l2_prefetch::GLM_DEFAULT)? {
+            engine.l2 = Some(crate::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
         let result = body(&engine);
         drop(engine);
@@ -306,9 +334,9 @@ impl Opened {
             .map(|rank| cuteafd_transport::v41_expert::v41_spark_executor_id(peers.len(), rank))
             .collect::<Result<_>>()?;
         // One transport per prefill lane: each lane's wave stays in flight on its own QPs.
-        let transports = (0..engine::PREFILL_LANES).map(|_| cuteafd_transport::v41_expert::V41Tp4Roce::new_ranks(
+        let transports = (0..engine::PREFILL_LANES).map(|_| crate::spark_intake::SparkLink::new(&self.library,
             &peers, &executors, u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
-                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }))
+                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2))
             .collect::<Result<Vec<_>>>()?;
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         Ok(Some(engine::Experts::Spark { transports: std::cell::RefCell::new(transports), runtime }))
@@ -358,7 +386,7 @@ fn golden(args: GoldenArgs) -> Result<()> {
 /// Mean NLL of `logits` rows against the next tokens, and top-1 agreements.
 /// Mean KL(golden || engine) over rows, in float64 (the golden's next-token
 /// distribution against the engine's, as the published KL gates compute it).
-fn mean_kl(logits: &[f32], golden: &[f32], first: usize, vocab: usize) -> f64 {
+pub(crate) fn mean_kl(logits: &[f32], golden: &[f32], first: usize, vocab: usize) -> f64 {
     let log_softmax = |l: &[f32]| -> Vec<f64> {
         let top = l.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
         let lse = top + l.iter().map(|&x| (x as f64 - top).exp()).sum::<f64>().ln();
@@ -393,6 +421,9 @@ fn score(logits: &[f32], golden: &[f32], tokens: &[u32], first: usize, vocab: us
 fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_>) -> Result<()> {
     if let Some(dir) = &args.draft_oracle {
         return speculate::draft_oracle(args, opened, engine, dir);
+    }
+    if let Some(start) = args.draft_replay {
+        return speculate::draft_replay(args, opened, engine, start);
     }
     if let Some(rows) = args.replay_check {
         return speculate::replay_check(args, opened, engine, rows);
@@ -500,6 +531,10 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
             tokens.len() - prefill, args.step_rows, started.elapsed().as_secs_f64(),
             decode_worst.iter().map(|c| format!("{c:.6}")).collect::<Vec<_>>());
         if !decode_logits.is_empty() {
+            // Numerics A/B between engine configs (benchmarks): the decode rows' logits, F32.
+            if let Ok(path) = std::env::var("CUTEAFD_DUMP_DECODE_LOGITS") {
+                std::fs::write(&path, decode_logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+            }
             let golden = golden_logits()?;
             let (agree, next_ok, golden_next, nll, scored) = score(&decode_logits, &golden, &tokens, prefill, vocab);
             let (_, _, _, golden_nll, _) =

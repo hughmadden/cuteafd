@@ -501,6 +501,57 @@ impl<'a> ExpertProtocolV2ResponseView<'a> {
         Ok(view)
     }
 
+    /// Header of a frame whose payload a receive scattered into device memory
+    /// (GPU landing): only the fixed header reached the host. Such a frame must
+    /// be one unindexed, checksum-free response whose payload directly follows
+    /// the header, so the payload's first byte is the landing range's first byte.
+    pub fn parse_landed_header(bytes: &[u8]) -> Result<ExpertProtocolV2ResponseHeader> {
+        if bytes.len() < EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN {
+            bail!("ExpertProtocolV2 landed response header too short: {}", bytes.len());
+        }
+        let header_len = validate_common_header(bytes, RESPONSE_KIND)?;
+        let row_count = read_u32(bytes, 36, "row_count")?;
+        let output_payload_bytes = read_u64(bytes, 44, "output_payload_bytes")?;
+        let wire_bytes = read_u64(bytes, 60, "wire_bytes")?;
+        let flags = read_u32(bytes, 68, "flags")?;
+        validate_flags(flags, "response")?;
+        validate_header_len(header_len, response_header_len_from_flags(flags))?;
+        if header_len != EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN
+            || response_row_indices_enabled(flags)
+            || response_more_chunks_enabled(flags)
+        {
+            bail!("GPU landing needs single unindexed response frames without checksums");
+        }
+        let header = ExpertProtocolV2ResponseHeader {
+            request_id: read_u64(bytes, 16, "request_id")?,
+            placement_version: read_u64(bytes, 24, "placement_version")?,
+            layer_id: read_u32(bytes, 32, "layer_id")?,
+            row_count,
+            output_dim: read_u32(bytes, 72, "output_dim")?,
+            output_dtype: ExpertV2Dtype::from_u16(read_u16(bytes, 40, "output_dtype")?)?,
+            output_row_stride_bytes: read_u32(bytes, 76, "output_row_stride_bytes")?,
+            status: ExpertProtocolV2Status::from_u16(read_u16(bytes, 42, "status")?)?,
+            output_payload_bytes,
+            flags,
+            executor_id: read_u64(bytes, RESPONSE_EXECUTOR_ID_OFFSET, "executor_id")?,
+        };
+        if header.output_dim == 0 {
+            bail!("ExpertProtocolV2 response output_dim must be non-zero");
+        }
+        let logical_row_bytes = header.output_dtype.row_bytes(header.output_dim as usize)
+            .context("ExpertProtocolV2 response output row byte count")?;
+        if (header.output_row_stride_bytes as usize) < logical_row_bytes {
+            bail!("ExpertProtocolV2 response output row stride is smaller than a row");
+        }
+        let expected = u64::from(row_count) * u64::from(header.output_row_stride_bytes);
+        if expected != output_payload_bytes || wire_bytes != header_len as u64 + output_payload_bytes {
+            bail!(
+                "ExpertProtocolV2 landed response extent mismatch: rows={row_count} payload={output_payload_bytes} wire={wire_bytes}"
+            );
+        }
+        Ok(header)
+    }
+
     pub fn header_len(&self) -> usize {
         response_header_len_from_flags(self.header.flags)
     }

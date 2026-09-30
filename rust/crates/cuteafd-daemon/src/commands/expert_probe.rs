@@ -8,6 +8,7 @@
 //! the kernels do. EXL3 checkpoints use the trellis oracle in `exl3`.
 mod exl3;
 mod fp8;
+mod intake;
 mod local;
 
 use crate::cli::ExpertProbeArgs;
@@ -74,7 +75,7 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
         }
     }
     let exl3 = catalog.exl3().is_some();
-    if catalog.fp8().is_some() {
+    if catalog.fp8().is_some() && args.intake.is_none() {
         ensure!(args.stage.is_none(), "FP8 checkpoints have no dSpark stages");
         let sampled = fp8::sampled_rows(rows);
         let pick = |values: &[f32]| -> Vec<f32> {
@@ -93,6 +94,14 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
         let expected = fp8::oracle(&catalog, args.layer, &input, &routes, &sampled, fp8::swiglu_limit(&args.snapshot))?;
         return report(&format!("layer {} rows {rows} fp8 ({} rows checked)", args.layer, sampled.len()), false,
             &pick(&actual), &expected, remote, started.elapsed());
+    }
+    if args.local && args.exl3_package.is_some() {
+        ensure!(exl3 && args.stage.is_none(), "--exl3-package probes backbone layers of an EXL3 checkpoint");
+        let (actual, elapsed) = local::run_exl3_ranks(&args, &catalog, &wire, &routes)?;
+        let started = Instant::now();
+        let expected = exl3::oracle(&catalog, false, args.layer, &input, &routes, rows)?;
+        return report(&format!("layer {} rows {rows} local exl3 tp{}", args.layer, args.local_tp), true, &actual,
+            &expected, elapsed, started.elapsed());
     }
     if args.local {
         let (actual, elapsed) = local::run(&args, &catalog, &wire, &routes)?;
@@ -140,6 +149,9 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
     let executors = (0..peers.len())
         .map(|rank| cuteafd_transport::v41_expert::v41_spark_executor_id(peers.len(), rank))
         .collect::<Result<Vec<u64>>>()?;
+    if let Some(modes) = args.intake.as_deref() {
+        return intake::run(&args, &intake::parse_modes(modes)?, &peers, &executors, &mut request, hidden).await;
+    }
     let mut client = V41Tp4Roce::new_ranks(&peers, &executors, args.capacity, config)?;
     let mut actual = vec![0f32; rows * hidden];
     let started = Instant::now();

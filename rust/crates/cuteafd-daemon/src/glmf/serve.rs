@@ -16,6 +16,7 @@ use super::engine::{Allocator, GlmfEngine, GlmfPlacement, DECODE_ROWS};
 use crate::glm::dflash::{ContextRow, Draft, DraftSeq, TAP_ROWS};
 use crate::glm::dflash_policy::{self, DraftHistory, Shape};
 use super::{embed_rows, open, Opened};
+use crate::prefill_share::{add_phases, isolated_phases, Chunk, DecodeShareArgs};
 use anyhow::{Context, Result};
 use cuteafd_api::native_v41::glm::GlmEncoding;
 use cuteafd_api::native_v41::{
@@ -51,6 +52,8 @@ pub(crate) struct ServeArgs {
     /// (within the rows) instead of the adaptive policy.
     #[arg(long)]
     pub draft_fixed: Option<usize>,
+    #[command(flatten)]
+    pub decode_share: DecodeShareArgs,
 }
 
 /// Speculation settings: copy-window draft cap (0 disables) and a fixed
@@ -83,10 +86,10 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let mut engine_args = args.engine.clone();
     engine_args.slots = engine_args.slots.max(args.max_sequences);
     engine_args.draft_sequences = engine_args.draft_sequences.max(args.max_sequences);
-    let (worker_stats, max_sequences) = (stats.clone(), args.max_sequences);
+    let (worker_stats, max_sequences, decode_share) = (stats.clone(), args.max_sequences, args.decode_share);
     let policy = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed };
     let worker = tokio::task::spawn_blocking(move ||
-        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy));
+        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, decode_share));
     ready_rx.await.context("engine failed before it was ready")??;
     let router = cuteafd_api::native_v41::router_for_model(queue, limits, stats, Duration::from_secs(25),
         ConsoleHub::disabled(), profile.clone());
@@ -101,7 +104,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
 
 fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: tokio::sync::oneshot::Sender<Result<()>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
-    policy: Policy) -> Result<()> {
+    policy: Policy, decode_share: DecodeShareArgs) -> Result<()> {
     let opened = match open(&args) {
         Ok(opened) => opened,
         Err(error) => {
@@ -116,12 +119,32 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(()));
         }
-        schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), policy)
+        let ranks = args.peers.as_deref().map(|peers| peers.split(',').count());
+        schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), policy, ranks,
+            decode_share)
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
     }
     result
+}
+
+/// An admitted prompt waiting for its remaining prefill chunks.
+struct Prefill<'a> {
+    job: NativeRequest,
+    constraint: Option<crate::v41_native_serve::constraints::State<'a>>,
+    tokens: Vec<u32>,
+    /// Prompt tokens prefilled so far.
+    done: usize,
+    placement: GlmfPlacement,
+    capacity: usize,
+    slot: Option<usize>,
+    /// The last chunk's logits.
+    logits: Option<Vec<f32>>,
+    started: Instant,
+    /// Seconds in this prompt's chunks, and their engine phases.
+    busy: f64,
+    phases: [f64; 3],
 }
 
 struct Active<'a> {
@@ -230,14 +253,21 @@ pub(crate) fn copy_drafts(history: &[u32], limit: usize) -> Vec<u32> {
 
 fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
-    policy: Policy) -> Result<()> {
+    policy: Policy, ranks: Option<usize>, decode_share: DecodeShareArgs) -> Result<()> {
     let mut allocator = Allocator::new(engine.pages, engine.slots);
     let mut grammars = crate::v41_native_serve::constraints::Compiler::with_vocab(
         &opened.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, engine.cfg.eos.clone());
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
-    let mut cost = dflash_policy::step_cost(&GLMF_TP2_STEP_MS, DECODE_ROWS);
+    // The TP2 table also prices TP4 as served (its observed ratio settles the
+    // level); TP6 scales the Spark share by its widest slice against TP4's.
+    let table = match ranks {
+        Some(ranks) if ranks > 4 => dflash_policy::rescale_spark(&GLMF_TP2_STEP_MS, GLMF_TP2_GPU_MS, 512,
+            dflash_policy::widest_slice(engine.cfg.moe_intermediate, ranks)),
+        _ => GLMF_TP2_STEP_MS.to_vec(),
+    };
+    let mut cost = dflash_policy::step_cost(&table, DECODE_ROWS);
     let mut skip = dflash_policy::DraftSkip::default();
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
@@ -245,9 +275,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     // (engine step + commit) and selecting/streaming tokens.
     let (mut steps, mut draft_s, mut verify_s, mut emit_s) = (0u64, 0f64, 0f64, 0f64);
     let (hidden, vocab) = (engine.cfg.hidden, engine.cfg.vocab_size);
+    let mut prefills = decode_share.queue::<Prefill<'_>>()?;
     loop {
-        while active.len() < max_sequences {
-            let job = if active.is_empty() {
+        while active.len() + prefills.len() < max_sequences {
+            let job = if active.is_empty() && prefills.is_empty() {
                 match receive.blocking_recv() {
                     Some(job) => job,
                     None => return Ok(()),
@@ -274,7 +305,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 continue;
             }
             let capacity = (tokens.len() + job.max_tokens).min(engine.max_context);
-            let mut placement = match allocator.admit(capacity) {
+            let placement = match allocator.admit(capacity) {
                 Ok(placement) => placement,
                 Err(error) => {
                     reject(&job, format!("{error:#}"));
@@ -282,65 +313,83 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 }
             };
             let slot = free_slots.pop();
-            let admitted = (|| -> Result<Active<'_>> {
-                let _ = job.events.blocking_send(Ok(InferenceChunk::Ready {
-                    system_fingerprint: None,
-                    prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: 0 },
-                }));
-                let started = Instant::now();
-                let mut logits = None;
-                for chunk in tokens.chunks(engine.prefill_capacity()) {
+            let _ = job.events.blocking_send(Ok(InferenceChunk::Ready {
+                system_fingerprint: None,
+                prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: 0 },
+            }));
+            prefills.push(Prefill { job, constraint, tokens, done: 0, placement, capacity, slot, logits: None,
+                started: Instant::now(), busy: 0.0, phases: [0.0; 3] });
+        }
+        if prefills.due(!active.is_empty()) {
+            // One chunk (a lane wave) of each waiting prompt (whole prompts with --decode-share 0).
+            let finished = prefills.round(|p| {
+                anyhow::ensure!(!p.job.events.is_closed(), "client went away");
+                let timer = Instant::now();
+                let chunk = &p.tokens[p.done..(p.done + engine.prefill_capacity()).min(p.tokens.len())];
+                let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
                     let embed = embed_rows(&opened.checkpoint, chunk, hidden)?;
-                    let start = placement.len;
-                    logits = engine.prefill(&mut placement, &embed, None)?;
+                    let start = p.placement.len;
+                    p.logits = engine.prefill(&mut p.placement, &embed, None)?;
                     // The chunk's tapped tail becomes drafter context before the next step.
-                    if let (Some(drafter), Some(slot)) = (drafter, slot) {
+                    if let (Some(drafter), Some(slot)) = (drafter, p.slot) {
                         let n = chunk.len().min(TAP_ROWS);
                         let first = start + chunk.len() - n;
                         drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot, position: first + r })
                             .collect::<Vec<_>>())?;
                     }
-                }
-                let phases = std::mem::take(&mut *engine.profile.borrow_mut());
-                tracing::info!(tokens = tokens.len(), elapsed_ms = started.elapsed().as_millis() as u64,
-                    gpu_wait_ms = (1e3 * phases[0]) as u64, experts_ms = (1e3 * phases[1]) as u64,
-                    head_ms = (1e3 * phases[2]) as u64, "prefill");
-                let mut request = Active {
-                    history: tokens.clone(),
-                    digest: tokens.iter().fold(DIGEST_SEED, |d, &t| digest(d, t)),
-                    draft_limit: policy.copy,
-                    draft_pause: 0,
-                    slot,
-                    drafts: DraftHistory::default(),
-                    counts: [0; 5],
-                    decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?,
-                    job, constraint, placement: placement.clone(), capacity, next: 0, generated: 0,
-                    buffered: 0, started: Instant::now(),
-                };
-                request.next = request.select(&logits.context("prefill produced no logits")?)?;
-                Ok(request)
-            })();
-            match admitted {
-                Ok(mut request) => {
-                    let token = request.next;
-                    match request.emit(token) {
-                        Ok(false) => active.push(request),
-                        Ok(true) | Err(_) => {
-                            free_slots.extend(request.slot);
-                            allocator.release(request.placement);
+                    Ok(())
+                });
+                p.done += chunk.len();
+                add_phases(&mut p.phases, phases);
+                p.busy += timer.elapsed().as_secs_f64();
+                result?;
+                Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
+            });
+            for (p, prefilled) in finished {
+                let (slot, placement) = (p.slot, p.placement.clone());
+                let admitted = prefilled.and_then(|()| {
+                    tracing::info!(tokens = p.tokens.len(), elapsed_ms = p.started.elapsed().as_millis() as u64,
+                        busy_ms = (1e3 * p.busy) as u64, gpu_wait_ms = (1e3 * p.phases[0]) as u64,
+                        experts_ms = (1e3 * p.phases[1]) as u64, head_ms = (1e3 * p.phases[2]) as u64, "prefill");
+                    let mut request = Active {
+                        digest: p.tokens.iter().fold(DIGEST_SEED, |d, &t| digest(d, t)),
+                        history: p.tokens,
+                        draft_limit: policy.copy,
+                        draft_pause: 0,
+                        slot,
+                        drafts: DraftHistory::default(),
+                        counts: [0; 5],
+                        decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?,
+                        job: p.job, constraint: p.constraint, placement: p.placement, capacity: p.capacity, next: 0,
+                        generated: 0, buffered: 0, started: Instant::now(),
+                    };
+                    request.next = request.select(&p.logits.context("prefill produced no logits")?)?;
+                    Ok(request)
+                });
+                match admitted {
+                    Ok(mut request) => {
+                        let token = request.next;
+                        match request.emit(token) {
+                            Ok(false) => active.push(request),
+                            Ok(true) | Err(_) => {
+                                free_slots.extend(request.slot);
+                                allocator.release(request.placement);
+                            }
                         }
                     }
-                }
-                Err(error) => {
-                    tracing::warn!("prefill failed: {error:#}");
-                    free_slots.extend(slot);
-                    allocator.release(placement);
+                    Err(error) => {
+                        tracing::warn!("prefill failed: {error:#}");
+                        free_slots.extend(slot);
+                        allocator.release(placement);
+                    }
                 }
             }
+            prefills.settle(!active.is_empty());
         }
         if active.is_empty() {
             continue;
         }
+        let cycle = Instant::now();
         // Rows each sequence may add after its next token.
         let room = (DECODE_ROWS / active.len()).max(1) - 1;
         let limits: Vec<usize> = active.iter().map(|a| room.min(a.job.max_tokens - a.generated - 1)
@@ -517,11 +566,14 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         }
         if let Ok(mut stats) = stats.lock() {
             *stats = serde_json::json!({"requests": requests, "generated_tokens": generated_total,
-                "active": active.len()});
+                "active": active.len(), "prefilling": prefills.len()});
         }
+        prefills.stepped(cycle.elapsed().as_secs_f64());
     }
 }
 
+/// Coordinator share of `GLMF_TP2_STEP_MS` at one row (GPU 6.7 ms of 18.8).
+const GLMF_TP2_GPU_MS: f64 = 6.7;
 /// GLM 5.3 Flash, 1 RTX PRO 6000 (325 W) + Spark TP2 (rhea, moa), recommended
 /// FP8 decode config: speculative verify step ms by rows of one sequence
 /// (glmf-golden --bench-verify 16 after 512 tokens, median of 7); past 16
