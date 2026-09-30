@@ -17,15 +17,18 @@
 //!   buffer and uploaded on the compute stream after the wave.
 //!
 //! `auto` (the default) probes dma-buf landing once at startup (a loopback
-//! QP pair timing sends into device vs pinned host memory) and then picks per
-//! transport: `gpu` when a full wave lands within [`GPU_WAVE_BUDGET_MS`] at
-//! the probed device rate, `pinned` otherwise. Device landing takes nothing
-//! from the host or the compute stream but, on raptor, the NIC writes GPU
-//! memory at ~19 GB/s against ~52 GB/s into host memory (cross-root-complex
-//! peer writes), so a wide wave (V4 Pro TP6: 352 MB) would wait on the wire
-//! longer than the Sparks compute. Any `gpu` failure (no dma-buf, no
-//! registration, GPUDirect writes not ordered for kernels) falls back to
-//! `pinned` and says why.
+//! QP pair timing sends into device vs pinned host memory, and pinned host to
+//! device copies) and picks `gpu` when the NIC lands in device memory at
+//! least [`GPU_SHARE_OF_PINNED`] of the pinned path's store-and-forward rate
+//! (NIC into host memory, then the H2D copy), `pinned` otherwise. On raptor
+//! the NIC writes GPU memory at ~19.6 GB/s (cross-root-complex peer writes)
+//! against ~52 GB/s into host memory, yet landing wins end to end at every
+//! wave size measured: device landing takes no host memory bandwidth, CPU,
+//! copy engine or receive-slot retention, and prefill lanes overlap each
+//! wave's wire time with the other lanes' GPU work, so a wave's standalone
+//! landing time (18 ms for V4 Pro TP6's 352 MB) is not on the critical path.
+//! Any `gpu` failure (no dma-buf, no registration, GPUDirect writes not
+//! ordered for kernels) falls back to `pinned` and says why.
 use crate::v41_memory::{DeviceAllocation, HostAllocation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
@@ -70,26 +73,49 @@ pub(crate) struct IntakeChoice {
     pub(crate) mode: IntakeMode,
     pub(crate) reason: String,
     pub(crate) probe: Option<GpuLandingProbe>,
+    /// Pinned host to device copy rate, GB/s (the pinned path's second leg).
+    pub(crate) h2d_gbps: Option<f64>,
 }
 
-/// `auto` lands a transport's waves in device memory only when a full wave
-/// (every rank, `capacity` rows) lands within this many milliseconds at the
-/// probed device rate: about a 4096-row TP4 layer on the Sparks, so the wire
-/// stays hidden behind their compute.
-pub(crate) const GPU_WAVE_BUDGET_MS: f64 = 12.0;
+/// `auto` lands in device memory when the probed landing rate is at least
+/// this share of the pinned path's store-and-forward rate
+/// ([`pinned_path_gbps`]). Measured end to end, landing won at shares 0.53
+/// (loopback on GPU1, GLM 5.3 Flash TP4 8K prefill 566 -> 541 ms, per-wave
+/// 6.4 vs 12.0 ms) and 0.71 (raptor GPU0 + Sparks, landing 19.6 GB/s, host
+/// 52.4, H2D 57.6: GLM 5.3 Flash TP4 5329 -> 5477 tok/s, V4 Pro TP6 1502 ->
+/// 1650 tok/s, C1 decode +2-3%), the win growing with the wave (134 -> 352
+/// MB); below half nothing was measured.
+pub(crate) const GPU_SHARE_OF_PINNED: f64 = 0.5;
+
+/// The pinned path's rate for a wave: every byte lands in host memory and
+/// then crosses to the GPU, and a rank's upload starts only once its rows
+/// have landed, so the legs add up per byte.
+pub(crate) fn pinned_path_gbps(host_gbps: f64, h2d_gbps: f64) -> f64 {
+    1.0 / (1.0 / host_gbps + 1.0 / h2d_gbps)
+}
+
+/// Whether `auto` lands in device memory at the probed rates (landing
+/// verified), and the rates it compared.
+fn gpu_wins(probe: &GpuLandingProbe, h2d_gbps: Option<f64>) -> (bool, String) {
+    match h2d_gbps {
+        Some(h2d) if probe.gpu_gbps > 0.0 && probe.host_gbps > 0.0 && h2d > 0.0 => {
+            let pinned = pinned_path_gbps(probe.host_gbps, h2d);
+            let share = probe.gpu_gbps / pinned;
+            (share >= GPU_SHARE_OF_PINNED, format!("landing {:.1} GB/s = {share:.2} of the pinned path's {pinned:.1} \
+                (host {:.1}, H2D {h2d:.1}; gpu from {GPU_SHARE_OF_PINNED})", probe.gpu_gbps, probe.host_gbps))
+        }
+        _ => (probe.gpu_gbps > 0.0, format!("landing {:.1} GB/s (pinned path not probed)", probe.gpu_gbps)),
+    }
+}
 
 impl IntakeChoice {
-    /// The mode for a transport whose full wave carries `wave_bytes`.
+    /// The mode for a transport whose full wave carries `wave_bytes` (the
+    /// same for every wave size; logged with the probed landing time).
     pub(crate) fn mode_for(&self, wave_bytes: usize) -> (IntakeMode, String) {
         match (&self.probe, self.mode) {
-            (Some(probe), IntakeMode::Gpu) if self.setting == "auto" && probe.gpu_gbps > 0.0 => {
+            (Some(probe), IntakeMode::Gpu) if probe.gpu_gbps > 0.0 => {
                 let ms = wave_bytes as f64 / (probe.gpu_gbps * 1e6);
-                if ms <= GPU_WAVE_BUDGET_MS {
-                    (IntakeMode::Gpu, format!("{} ({:.0} MB waves land in {ms:.1} ms)", self.reason, wave_bytes as f64 / 1e6))
-                } else {
-                    (IntakeMode::Pinned, format!("{} but {:.0} MB waves would take {ms:.1} ms to land (budget {} ms)",
-                        self.reason, wave_bytes as f64 / 1e6, GPU_WAVE_BUDGET_MS))
-                }
+                (IntakeMode::Gpu, format!("{} ({:.0} MB waves land in {ms:.1} ms)", self.reason, wave_bytes as f64 / 1e6))
             }
             _ => (self.mode, self.reason.clone()),
         }
@@ -101,6 +127,36 @@ pub(crate) fn probe_gpu_landing(library: &NativeLibrary) -> Result<GpuLandingPro
     cuteafd_transport::gpu_landing_probe(library, None, 64 << 20, 8)
 }
 
+/// Pinned host to device copy rate on the current device, GB/s: eight
+/// 64 MiB copies after one warm-up, on a stream of their own.
+pub(crate) fn probe_h2d(library: &NativeLibrary) -> Result<f64> {
+    const BYTES: usize = 64 << 20;
+    let host = HostAllocation::new(library, BYTES)?;
+    let device = DeviceAllocation::new(library, BYTES)?;
+    let stream = library.cuda_stream_create()?;
+    let timed = (|| -> Result<f64> {
+        let mut started = std::time::Instant::now();
+        for copy in 0..9 {
+            // SAFETY: both buffers hold BYTES and outlive the stream sync below.
+            unsafe { library.copy_host_buffer_h2d_async(device.buffer, host.buffer, BYTES, stream)? };
+            if copy == 0 {
+                // SAFETY: the stream was created above.
+                unsafe { library.cuda_stream_synchronize(stream)? };
+                started = std::time::Instant::now();
+            }
+        }
+        // SAFETY: as above.
+        unsafe { library.cuda_stream_synchronize(stream)? };
+        Ok(8.0 * BYTES as f64 / started.elapsed().as_secs_f64() / 1e9)
+    })();
+    // SAFETY: the stream is idle (synchronized, or its copies failed to queue).
+    unsafe {
+        let _ = library.cuda_stream_synchronize(stream);
+        library.cuda_stream_destroy(stream)?;
+    }
+    timed
+}
+
 /// Resolves `CUTEAFD_SPARK_INTAKE` (and probes dma-buf landing for `auto` and
 /// `gpu`) once per process.
 pub(crate) fn choose_mode(library: &NativeLibrary) -> Result<IntakeChoice> {
@@ -109,24 +165,33 @@ pub(crate) fn choose_mode(library: &NativeLibrary) -> Result<IntakeChoice> {
         return Ok(choice.clone());
     }
     let setting = std::env::var("CUTEAFD_SPARK_INTAKE").unwrap_or_else(|_| "auto".into());
-    let (mode, reason, probe) = match setting.as_str() {
-        "host" => (IntakeMode::Host, "CUTEAFD_SPARK_INTAKE=host".to_string(), None),
-        "pinned" => (IntakeMode::Pinned, "CUTEAFD_SPARK_INTAKE=pinned".to_string(), None),
+    let (mode, reason, probe, h2d_gbps) = match setting.as_str() {
+        "host" => (IntakeMode::Host, "CUTEAFD_SPARK_INTAKE=host".to_string(), None, None),
+        "pinned" => (IntakeMode::Pinned, "CUTEAFD_SPARK_INTAKE=pinned".to_string(), None, None),
         "gpu" | "auto" => {
             let probe = probe_gpu_landing(library);
+            let h2d = match (&probe, setting.as_str()) {
+                (Ok(p), "auto") if p.usable() => probe_h2d(library)
+                    .map_err(|error| tracing::warn!("H2D copy probe failed: {error:#}")).ok(),
+                _ => None,
+            };
             let (mode, reason) = match &probe {
                 Err(error) => (IntakeMode::Pinned, format!("GPU landing probe failed: {error:#}")),
                 Ok(p) if !p.usable() => (IntakeMode::Pinned, format!("GPU landing unusable: {}{}",
                     p.error.as_deref().unwrap_or(&p.status),
                     if p.registered && p.writes_ordering < 100 { " (GPUDirect writes not ordered for kernels)" } else { "" })),
+                Ok(p) if setting == "auto" => match gpu_wins(p, h2d) {
+                    (true, rates) => (IntakeMode::Gpu, format!("dma-buf landing verified, {rates}")),
+                    (false, rates) => (IntakeMode::Pinned, format!("dma-buf landing verified but slow, {rates}")),
+                },
                 Ok(p) => (IntakeMode::Gpu, format!("dma-buf landing verified, {:.1} GB/s into GPU vs {:.1} GB/s into host",
                     p.gpu_gbps, p.host_gbps)),
             };
-            (mode, reason, probe.ok())
+            (mode, reason, probe.ok(), h2d)
         }
         other => anyhow::bail!("CUTEAFD_SPARK_INTAKE={other:?} is not one of auto, gpu, pinned, host"),
     };
-    let choice = IntakeChoice { setting, mode, reason, probe };
+    let choice = IntakeChoice { setting, mode, reason, probe, h2d_gbps };
     tracing::info!(setting = %choice.setting, mode = choice.mode.name(), reason = %choice.reason, "Spark partial intake");
     Ok(CHOICE.get_or_init(|| choice).clone())
 }
@@ -145,16 +210,18 @@ pub(crate) fn transport_mode(library: &NativeLibrary, ranks: usize, capacity: us
 pub(crate) struct FabricLanding {
     pub(crate) cuda_device: i32,
     pub(crate) probe: Option<GpuLandingProbe>,
+    pub(crate) h2d_gbps: Option<f64>,
     pub(crate) error: Option<String>,
 }
 
 impl FabricLanding {
     pub(crate) fn summary(&self) -> String {
         match (&self.probe, &self.error) {
-            (Some(p), _) if p.usable() => format!(
-                "GPU landing (cuda {}, {}): dma-buf ok, loopback {:.1} GB/s into GPU vs {:.1} GB/s into host; \
-                 intake auto: gpu for waves up to {:.0} MB, pinned above",
-                self.cuda_device, p.rdma_device, p.gpu_gbps, p.host_gbps, p.gpu_gbps * 1e6 * GPU_WAVE_BUDGET_MS / 1e6),
+            (Some(p), _) if p.usable() => {
+                let (gpu, rates) = gpu_wins(p, self.h2d_gbps);
+                format!("GPU landing (cuda {}, {}): dma-buf ok, loopback {rates}; intake auto: {}",
+                    self.cuda_device, p.rdma_device, if gpu { "gpu" } else { "pinned" })
+            }
             (Some(p), _) => format!("GPU landing (cuda {}): unusable ({}); intake auto: pinned", self.cuda_device,
                 p.error.as_deref().unwrap_or(&p.status)),
             (None, Some(error)) => format!("GPU landing (cuda {}): not probed ({error}); intake auto: pinned",
@@ -169,16 +236,18 @@ impl FabricLanding {
 pub(crate) fn fabric_probe(native_lib: Option<&std::path::Path>, device: i32) -> FabricLanding {
     let path = native_lib.map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("CUTEAFD_NATIVE_LIB").map(std::path::PathBuf::from));
-    let result = (|| -> Result<GpuLandingProbe> {
+    let result = (|| -> Result<(GpuLandingProbe, Option<f64>)> {
         let path = path.context("no native library (pass --native-lib or set CUTEAFD_NATIVE_LIB)")?;
         // SAFETY: a trusted image library, loaded once for this command.
         let library = unsafe { NativeLibrary::load(&path) }?;
         library.cuda_set_device(device)?;
-        probe_gpu_landing(&library)
+        let probe = probe_gpu_landing(&library)?;
+        let h2d = probe_h2d(&library).ok();
+        Ok((probe, h2d))
     })();
     match result {
-        Ok(probe) => FabricLanding { cuda_device: device, probe: Some(probe), error: None },
-        Err(error) => FabricLanding { cuda_device: device, probe: None, error: Some(format!("{error:#}")) },
+        Ok((probe, h2d_gbps)) => FabricLanding { cuda_device: device, probe: Some(probe), h2d_gbps, error: None },
+        Err(error) => FabricLanding { cuda_device: device, probe: None, h2d_gbps: None, error: Some(format!("{error:#}")) },
     }
 }
 
@@ -605,28 +674,35 @@ impl<'a> SparkLane<'a> {
 mod tests {
     use super::*;
 
-    fn choice(setting: &str, mode: IntakeMode, gpu_gbps: f64) -> IntakeChoice {
-        IntakeChoice {
-            setting: setting.into(),
-            mode,
-            reason: "probe".into(),
-            probe: Some(GpuLandingProbe {
-                rdma_device: "mlx5_0".into(), cuda_device: 0, dma_buf: true, gpudirect_rdma: true,
-                writes_ordering: 100, registered: true, gpu_gbps, host_gbps: 52.0, status: String::new(), error: None,
-            }),
+    fn probe(gpu_gbps: f64) -> GpuLandingProbe {
+        GpuLandingProbe {
+            rdma_device: "mlx5_0".into(), cuda_device: 0, dma_buf: true, gpudirect_rdma: true,
+            writes_ordering: 100, registered: true, gpu_gbps, host_gbps: 52.4, status: String::new(), error: None,
         }
     }
 
     #[test]
-    fn auto_lands_waves_on_the_gpu_only_within_the_budget() {
-        let auto = choice("auto", IntakeMode::Gpu, 19.0);
-        // GLM 5.3 Flash TP4: 4 x 4096 x 4096 BF16 = 134 MB, 7 ms at 19 GB/s.
-        assert_eq!(auto.mode_for(4 * 4096 * 4096 * 2).0, IntakeMode::Gpu);
-        // V4 Pro TP6: 6 x 4096 x 7168 BF16 = 352 MB, 18.5 ms.
-        assert_eq!(auto.mode_for(6 * 4096 * 7168 * 2).0, IntakeMode::Pinned);
-        // An explicit gpu setting never second-guesses the wave size.
-        assert_eq!(choice("gpu", IntakeMode::Gpu, 19.0).mode_for(6 * 4096 * 7168 * 2).0, IntakeMode::Gpu);
-        // Unusable landing resolved to pinned stays pinned.
-        assert_eq!(choice("auto", IntakeMode::Pinned, 19.0).mode_for(1).0, IntakeMode::Pinned);
+    fn auto_lands_on_the_gpu_from_half_the_pinned_path_rate() {
+        // raptor GPU0: 19.6 GB/s landing vs 52.4 into host and 57.6 H2D ->
+        // 27.4 pinned path, share 0.71: measured faster at 134 and 352 MB waves.
+        let pinned = pinned_path_gbps(52.4, 57.6);
+        assert!((pinned - 27.4).abs() < 0.1);
+        assert!(gpu_wins(&probe(19.6), Some(57.6)).0);
+        // Loopback GPU1 per-wave share 0.53 also won end to end.
+        assert!(gpu_wins(&probe(0.53 * pinned), Some(57.6)).0);
+        // A landing path at a third of the pinned path's rate stays pinned.
+        assert!(!gpu_wins(&probe(pinned / 3.0), Some(57.6)).0);
+        // Without the H2D probe, a verified landing path is used.
+        assert!(gpu_wins(&probe(19.6), None).0);
+    }
+
+    #[test]
+    fn mode_for_keeps_the_resolved_mode_for_every_wave_size() {
+        let choice = |mode| IntakeChoice { setting: "auto".into(), mode, reason: "probe".into(),
+            probe: Some(probe(19.6)), h2d_gbps: Some(57.6) };
+        // GLM 5.3 Flash TP4 (134 MB) and V4 Pro TP6 (352 MB) both land on the GPU.
+        assert_eq!(choice(IntakeMode::Gpu).mode_for(4 * 4096 * 4096 * 2).0, IntakeMode::Gpu);
+        assert_eq!(choice(IntakeMode::Gpu).mode_for(6 * 4096 * 7168 * 2).0, IntakeMode::Gpu);
+        assert_eq!(choice(IntakeMode::Pinned).mode_for(1).0, IntakeMode::Pinned);
     }
 }
