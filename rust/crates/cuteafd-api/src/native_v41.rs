@@ -380,6 +380,19 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> 
         Some((Ok(thinking), encoding)) => Some((encoding, body.clone(), thinking)),
         Some((Err(message), _)) => return error(StatusCode::BAD_REQUEST, message),
     };
+    // Clients written for vLLM/SGLang send `enable_thinking` (top level or in
+    // `chat_template_kwargs`) instead of `thinking.type`; honour it for every
+    // template when `thinking` itself is absent.
+    let enable_thinking = match (body.get("thinking").filter(|v| !v.is_null()), glm_request.is_none()) {
+        (None, true) => match glm::resolve_thinking(&body) {
+            Ok(thinking) if body.get("enable_thinking").filter(|v| !v.is_null()).is_some()
+                || body.get("chat_template_kwargs").and_then(|v| v.get("enable_thinking")).filter(|v| !v.is_null()).is_some()
+                => Some(thinking),
+            Ok(_) => None,
+            Err(message) => return error(StatusCode::BAD_REQUEST, message),
+        },
+        _ => None,
+    };
     let mut parsed: ChatCompletionRequest = match serde_json::from_value(body) {
         Ok(r) => r,
         Err(e) => return error(StatusCode::BAD_REQUEST, e),
@@ -398,6 +411,9 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> 
     }
     if let Some((_, _, thinking)) = &glm_request {
         converted.conversation.thinking_mode = *thinking;
+    }
+    if let Some(thinking) = enable_thinking {
+        converted.conversation.thinking_mode = thinking;
     }
     let model = state.profile.id.clone();
     if converted.model.as_deref() != Some(model.as_str()) {
@@ -666,6 +682,42 @@ mod tests {
             assert_eq!(value["error"]["type"], "invalid_request_error");
             assert_eq!(value["error"]["param"], "response_format.json_schema.schema");
         }
+    }
+
+    /// The rendered DeepSeek prompt for one request body (the worker side
+    /// answers with an immediate stop).
+    async fn rendered_prompt(extra: Value) -> String {
+        let mut body = json!({"model": MODEL, "messages": [{"role": "user", "content": "Hi"}],
+            "temperature": 0, "max_tokens": 4});
+        for (key, value) in extra.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+        let worker = tokio::spawn(async move {
+            let job = rx.recv().await.unwrap();
+            job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
+                prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).await.unwrap();
+            job.events.send(Ok(InferenceChunk::Finish {
+                finish_reason: InferenceFinishReason::Stop })).await.unwrap();
+            job.prompt
+        });
+        let request = axum::http::Request::post("/v1/chat/completions")
+            .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap();
+        let response = router(tx).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        worker.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn enable_thinking_selects_the_deepseek_thinking_mode() {
+        let official_off = rendered_prompt(json!({"thinking": {"type": "disabled"}})).await;
+        let official_on = rendered_prompt(json!({"thinking": {"type": "enabled"}})).await;
+        assert_ne!(official_off, official_on);
+        assert_eq!(rendered_prompt(json!({"enable_thinking": false})).await, official_off);
+        assert_eq!(rendered_prompt(json!({"chat_template_kwargs": {"enable_thinking": false}})).await, official_off);
+        assert_eq!(rendered_prompt(json!({"enable_thinking": true})).await, official_on);
+        // `thinking` keeps precedence over the template kwarg.
+        assert_eq!(rendered_prompt(json!({"thinking": {"type": "enabled"}, "enable_thinking": false})).await, official_on);
     }
 
     #[tokio::test]
