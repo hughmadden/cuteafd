@@ -120,17 +120,15 @@ pub(crate) fn plan_counts(inputs: &[PlanInput<'_>], fixed: Option<usize>, cost: 
 }
 
 /// GLM-5.3 EXL3 K4, 1 RTX PRO 6000 (325 W) + 4 Sparks TP4: verify step ms by
-/// rows. Measured on the Sparks before the sparse MLA read only selected
-/// tokens and the few-row head (35.6 / 111.8 / 260.2 ms at 1 / 8 / 32 rows),
-/// less the coordinator time those saved at each row count (glm-golden
-/// --bench-verify --skip-routed-experts, 512 tokens of context); re-measure
-/// with --bench-verify on the Sparks.
-pub(crate) const K4_TP4_STEP_MS: [(usize, f64); 15] = [(1, 34.5), (2, 48.9), (3, 59.5), (4, 69.4), (5, 77.4),
-    (6, 85.8), (7, 93.8), (8, 102.1), (10, 118.8), (12, 134.0), (16, 157.9), (24, 197.8), (32, 223.6), (48, 284.7),
-    (64, 327.1)];
-/// Coordinator share of `K4_TP4_STEP_MS` at one row (35.6 ms = ~16.6 GPU +
-/// ~19 Spark exchange: 226 us x 75 layers).
-pub(crate) const K4_TP4_GPU_MS: f64 = 16.6;
+/// rows, the serving fit's prior. Measured on the Sparks (p7 Spark images,
+/// coordinator b3521aa: sparse MLA reads only selected tokens, few-row head)
+/// with glm-golden --bench-verify 64, 512 tokens of context, median of 7.
+pub(crate) const K4_TP4_STEP_MS: [(usize, f64); 15] = [(1, 35.0), (2, 50.5), (3, 60.2), (4, 67.2), (5, 77.6),
+    (6, 85.3), (7, 92.8), (8, 102.6), (10, 116.2), (12, 127.8), (16, 148.4), (24, 190.6), (32, 223.7), (48, 269.4),
+    (64, 317.8)];
+/// Coordinator share of `K4_TP4_STEP_MS` at one row: 35.0 ms less the
+/// 18.2 ms Spark exchange of the same run (GPU wait 13.7, logits 1.35).
+pub(crate) const K4_TP4_GPU_MS: f64 = 16.8;
 
 /// Widest intermediate slice of `ranks` Spark ranks splitting `intermediate`
 /// in whole 128-blocks (2048: TP4 512, TP6 384): it bounds how many expert
