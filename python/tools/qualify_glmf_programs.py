@@ -2,7 +2,7 @@
 """Qualify the GLM 5.3 Flash coordinator programs (b12x ``glmf``) against transformers.
 
 For each requested layer, feeds the golden streams entering that layer
-(``runs/glmf-golden``, from python/reference/glm5_next/golden.py) through
+(``runs/glmf-golden``, from python/reference/families/glm5_flash/golden.py) through
 the reference Glm5NextTextDecoderLayer pieces and through the AOT programs
 launched in process, and prints cosines per stage: mHC pre, the attention
 sublayer (KDA or MLA), mHC post+pre, the dense FFN or the MoE router logits
@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def golden_module():
-    spec = importlib.util.spec_from_file_location("glmf_golden", ROOT / "python/reference/glm5_next/golden.py")
+    spec = importlib.util.spec_from_file_location("glmf_golden", ROOT / "python/reference/families/glm5_flash/golden.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

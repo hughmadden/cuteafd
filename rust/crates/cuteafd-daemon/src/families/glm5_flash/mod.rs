@@ -134,7 +134,7 @@ pub(crate) struct GoldenArgs {
     #[command(flatten)]
     pub engine: EngineArgs,
     /// Directory with tokens.bin, layerNN.bin and logits.bin from
-    /// python/reference/glm5_next/golden.py.
+    /// python/reference/families/glm5_flash/golden.py.
     #[arg(long)]
     pub golden: PathBuf,
     /// Prefill only the first N tokens, then feed the rest through decode
@@ -171,7 +171,7 @@ pub(crate) struct GoldenArgs {
     #[arg(long)]
     pub bench_prefill_tokens: Option<usize>,
     /// With --draft: run only the drafter on the golden taps (the layers'
-    /// stream means) and compare with python/reference/glm_dflash2/reference.py's
+    /// stream means) and compare with python/reference/families/glm5/dflash2/reference.py's
     /// output directory.
     #[arg(long)]
     pub draft_oracle: Option<PathBuf>,

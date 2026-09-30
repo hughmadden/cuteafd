@@ -5,7 +5,7 @@
 // GLM DFlash2 kernels (glm_dflash.cu) do not cover; GEMMs run through cuBLAS
 // and RMSNorm, SwiGLU, taps and the top-16 through the glm_dflash exports.
 //
-// Statement order and BF16 boundaries follow python/reference/mimo_dflash/
+// Statement order and BF16 boundaries follow python/reference/families/mimo_v2/mimo_dflash/
 // reference.py: per-head RMSNorm rounds the unit-RMS value before the weight;
 // RoPE rounds cos/sin, each product and the sum; values are bf16(v * scale);
 // attention keeps FP32 scores and BF16 probabilities.

@@ -6,7 +6,7 @@
 //! Stage `k` at row `j` takes the target's last-layer output `h_j` (pre-norm)
 //! and the token `t_{j+k+1}` and predicts `t_{j+k+2}` (every stage reads the
 //! target's hidden state: chaining a stage's own output measures far worse,
-//! python/reference/mimo_mtp/reference.py). Each stage keeps its own SWA ring
+//! python/reference/families/mimo_v2/mimo_mtp/reference.py). Each stage keeps its own SWA ring
 //! per sequence (the engine's ring layout and programs). A draft at a
 //! sequence of length `len` (tokens `0..len` processed, `t_len` = next) runs
 //! stage `k` over its rows `ext[k]..len`: rows `j <= len - k - 1` with their

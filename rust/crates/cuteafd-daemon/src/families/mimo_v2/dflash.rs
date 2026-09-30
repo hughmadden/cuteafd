@@ -11,7 +11,7 @@
 //! layers over the block `[anchor, mask x 7]` at the anchor's position (the
 //! mask token's row is `mask_embedding.pt`'s trained vector) non-causally
 //! against the ring, and takes the argmax of the target head's logits for
-//! block rows 1..8. Semantics: python/reference/mimo_dflash/reference.py
+//! block rows 1..8. Semantics: python/reference/families/mimo_v2/mimo_dflash/reference.py
 //! (SGLang's DFlash path for MiMo). Drafts only steer speculation; verify
 //! steps keep output identical to plain greedy decoding.
 use crate::fp8_linear::{self, Fp8Weight};

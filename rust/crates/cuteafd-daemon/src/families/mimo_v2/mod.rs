@@ -105,7 +105,7 @@ pub(crate) struct GoldenArgs {
     #[command(flatten)]
     pub engine: EngineArgs,
     /// Directory with tokens.bin, layerNN.bin and logits.bin from
-    /// python/reference/mimo_v2/golden.py.
+    /// python/reference/families/mimo_v2/mimo_v2/golden.py.
     #[arg(long)]
     pub golden: PathBuf,
     /// Prefill only the first N tokens, then feed the rest through decode
@@ -131,7 +131,7 @@ pub(crate) struct GoldenArgs {
     #[arg(long)]
     pub timing: bool,
     /// With --draft: run only the drafter on the golden taps at the anchors of
-    /// python/reference/mimo_dflash/reference.py's output directory, compare
+    /// python/reference/families/mimo_v2/mimo_dflash/reference.py's output directory, compare
     /// drafts, and score them against the golden text and greedy targets.
     #[arg(long, requires = "draft")]
     pub draft_oracle: Option<PathBuf>,
@@ -141,7 +141,7 @@ pub(crate) struct GoldenArgs {
     #[arg(long)]
     pub draft_replay: Option<usize>,
     /// With --mtp: run only the MTP drafter on the golden's last-layer rows at
-    /// the anchors of python/reference/mimo_mtp/reference.py's output
+    /// the anchors of python/reference/families/mimo_v2/mimo_mtp/reference.py's output
     /// directory, compare with its predictions and score acceptance.
     #[arg(long)]
     pub mtp_oracle: Option<PathBuf>,

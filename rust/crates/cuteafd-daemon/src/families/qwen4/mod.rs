@@ -103,7 +103,7 @@ pub(crate) struct GoldenArgs {
     #[command(flatten)]
     pub engine: EngineArgs,
     /// Directory with tokens.bin, layerNN.bin and logits.bin from
-    /// python/reference/qwen4_exp/golden.py.
+    /// python/reference/families/qwen4/golden.py.
     #[arg(long)]
     pub golden: PathBuf,
     /// Prefill only the first N tokens, then feed the rest through decode
@@ -132,7 +132,7 @@ pub(crate) struct GoldenArgs {
     #[arg(long)]
     pub spec_keep: Option<usize>,
     /// Compare the MTP layer (needs --mtp) with the torch reference in this
-    /// directory (python/reference/qwen4_exp/mtp.py), teacher forced on the
+    /// directory (python/reference/families/qwen4/mtp.py), teacher forced on the
     /// golden target streams, then stop.
     #[arg(long)]
     pub mtp_oracle: Option<PathBuf>,

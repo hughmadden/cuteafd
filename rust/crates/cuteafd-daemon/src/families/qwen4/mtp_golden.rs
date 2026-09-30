@@ -1,5 +1,5 @@
 //! Speculation checks for Qwen 3.8 Flash Next (qwen4-golden): the MTP layer
-//! against the torch reference (python/reference/qwen4_exp/mtp.py), greedy
+//! against the torch reference (python/reference/families/qwen4/mtp.py), greedy
 //! MTP speculation against plain greedy decoding, and step costs by rows.
 use super::engine::{Allocator, MtpGroup, MtpRow, MtpSource, Qwen4Engine, Qwen4Placement, DECODE_ROWS};
 use super::speculate::{self, DraftSeq, DraftTiming, MtpSeq, Verified};
