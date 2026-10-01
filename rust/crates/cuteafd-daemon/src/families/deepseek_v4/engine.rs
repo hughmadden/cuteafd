@@ -284,8 +284,8 @@ impl<'a> Engine<'a> {
         let main = zeroed(shape.window_pages() * MAIN_PAGE_BYTES)?;
         let (compressed, index, states) = match parts.cfg.compress_ratios.get(layer).copied().unwrap_or(0) {
             4 => (
-                Some(zeroed(shape.c4_pages * metadata::compressed_page_bytes(4))?),
-                Some(zeroed(shape.c4_pages * INDEX_PAGE_BYTES)?),
+                Some(zeroed(shape.units * metadata::compressed_page_bytes(4))?),
+                Some(zeroed(shape.units * INDEX_PAGE_BYTES)?),
                 vec![
                     zeroed(sequences * 16 * 1024 * 4)?,
                     zeroed(sequences * 16 * 1024 * 4)?,
@@ -294,7 +294,7 @@ impl<'a> Engine<'a> {
                 ],
             ),
             128 => (
-                Some(zeroed(shape.c128_pages * metadata::compressed_page_bytes(128))?),
+                Some(zeroed(shape.units * metadata::compressed_page_bytes(128))?),
                 None,
                 vec![zeroed(sequences * 256 * 512 * 4)?, zeroed(sequences * 256 * 512 * 4)?],
             ),
@@ -408,7 +408,7 @@ impl<'a> Engine<'a> {
             swa_lengths: ints(rows)?,
             c4: metadata(4)?,
             c128: metadata(128)?,
-            c4_page_table: ints(rows.max(1) * self.shape.c4_pages)?,
+            c4_page_table: ints(rows.max(1) * self.shape.units)?,
             c4_visible: ints(rows)?,
             c4_indexed_lengths: ints(rows)?,
             c128_indices: ints(rows * self.c128_width)?,
@@ -451,6 +451,12 @@ impl<'a> Engine<'a> {
         let mut out = vec![0u8; bytes];
         self.library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..allocation.buffer })?;
         Ok(out)
+    }
+
+    /// Every layer's caches and compressor state (backbone layers, then the dSpark stages'
+    /// window caches), for the prefix cache's copies.
+    pub fn caches(&self) -> &[LayerCache<'a>] {
+        &self.pools
     }
 
     /// Longest chunk one [`Self::prefill`] call takes.
