@@ -363,8 +363,9 @@ prefill 1.08x EXL3 (W4A4 1.36x), 1.6K 0.96x (W4A4 1.33x). W4A4 costs
 TJ. S2: GLM 5.3 Flash NVFP4 dense MLPs run natively (one-expert
 `fp8-glmfdense-nvfp4`): nvidia/GLM-5.3-Flash-NVFP4 serves alone (NLL 2.3896);
 GLM 5.3's per-tensor FP8 dense layers are the same bytes under a uniform
-block grid and its BF16 parts quantize to FP8 blocks at load (6-Spark gate
-pending). Open: W4A16 stream efficiency (GB10 4096 rows 14.3 ms/layer TP4 vs
+block grid and its BF16 parts quantize to FP8 blocks at load: nvidia/GLM-5.3-NVFP4
+serves on six Sparks (TP6 W4A16: NLL 2.4814 / KL 0.0571 vs golden 2.4677; 8K
+prefill 4.22 s, W4A4 3.20 s). Open: W4A16 stream efficiency (GB10 4096 rows 14.3 ms/layer TP4 vs
 EXL3 9.1), SM121 route thresholds, BF16 MLA programs (vs FP8 at load).
 
 **Phase 6 — placement planner (design 2026-09-30).** One planner for every
