@@ -60,7 +60,7 @@ def main():
     for name, types in {
         'cuteafd_v41_expert_input_quant_initialize': [C.POINTER(P)],
         'cuteafd_v41_expert_input_quantize_async': [P, P, P, U, P],
-        'cuteafd_v41_reduce_routes_async': [C.POINTER(P), P, P, U, U, U, P],
+        'cuteafd_reduce_routes_async': [C.POINTER(P), P, P, U, U, U, P],
     }.items():
         fn = getattr(lib, name); fn.argtypes = types; fn.restype = C.c_int32
     quant = P(); check(lib.cuteafd_v41_expert_input_quant_initialize(C.byref(quant)))
@@ -83,7 +83,7 @@ def main():
                     assert tuple(t.shape) == shape, (key, t.shape)
                     assert t.dtype == (torch.int8 if suffix == 'weight' else torch.float8_e8m0fnu), (key, t.dtype)
                     sources.append(t.view(torch.uint8).contiguous().cuda())
-            check(lib.cuteafd_v41_pack_expert_async((P*6)(*[t.data_ptr() for t in sources]),
+            check(lib.cuteafd_pack_expert_async((P*6)(*[t.data_ptr() for t in sources]),
                 (P*4)(*[t[expert].data_ptr() for t in weights]), n, torch.cuda.current_stream().cuda_stream))
         torch.cuda.synchronize()
     emit('loaded', experts=experts, bytes=sum(t.numel() for t in weights))
@@ -125,7 +125,7 @@ def main():
     if candidate is not None:
         outputs['candidate'] = torch.empty_like(shared)
     def finish(route_output, out, rows):
-        check(lib.cuteafd_v41_reduce_routes_async((P*4)(route_output.data_ptr(), None, None, None),
+        check(lib.cuteafd_reduce_routes_async((P*4)(route_output.data_ptr(), None, None, None),
               shared.data_ptr(), out.data_ptr(), rows, 1, topk, torch.cuda.current_stream().cuda_stream))
     for case in ('shared', 'dispersed'):
         for rows in opt.rows:

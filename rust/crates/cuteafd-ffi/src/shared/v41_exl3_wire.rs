@@ -12,9 +12,9 @@ pub struct V41Exl3Wire<'a> {
 }
 impl NativeLibrary {
     pub fn v41_exl3_wire(&self) -> Result<V41Exl3Wire<'_>> {
-        let initialize = unsafe { *self.lib.get::<unsafe extern "C" fn(*mut *mut c_void) -> i32>(b"cuteafd_v41_exl3_wire_initialize")? };
-        let decode = unsafe { *self.lib.get(b"cuteafd_v41_exl3_wire_decode")? };
-        let destroy = unsafe { *self.lib.get(b"cuteafd_v41_exl3_wire_destroy")? };
+        let initialize = unsafe { *self.lib.get::<unsafe extern "C" fn(*mut *mut c_void) -> i32>(b"cuteafd_exl3_wire_initialize")? };
+        let decode = unsafe { *self.lib.get(b"cuteafd_exl3_wire_decode")? };
+        let destroy = unsafe { *self.lib.get(b"cuteafd_exl3_wire_destroy")? };
         let mut context = std::ptr::null_mut();
         let status = unsafe { initialize(&mut context) };
         ensure!(status == 0, "EXL3 wire initialization failed: {status}");

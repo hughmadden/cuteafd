@@ -10,7 +10,7 @@
 // storage padding).
 //
 // Requires a CUDA device; exits 77 (ctest SKIP) when none is present.
-#include "cuteafd_v41_experts.h"
+#include "cuteafd_experts.h"
 
 #include <cuda_runtime.h>
 
@@ -110,7 +110,7 @@ int main() {
 
   // Accepted extents and exact byte model for TP3 (padded == 768, no padding).
   uint64_t sizes[4] = {};
-  require(cuteafd_v41_expert_packed_sizes(kIntermediate, sizes) == cudaSuccess,
+  require(cuteafd_expert_packed_sizes(kIntermediate, sizes) == cudaSuccess,
           "packed sizes rejected 768");
   require(sizes[0] == uint64_t(kIntermediate) * kHidden, "W13 extent");
   require(sizes[1] == uint64_t(kIntermediate) * kHidden / 16, "S13 extent");
@@ -118,14 +118,14 @@ int main() {
   require(sizes[3] == uint64_t(kHidden) * kIntermediate / 32, "S2 extent");
   uint64_t scratch[4] = {};
   for (uint32_t rejected : {0u, 1u, 577u, 2303u, 8224u})
-    require(cuteafd_v41_expert_packed_sizes(rejected, scratch) != cudaSuccess,
+    require(cuteafd_expert_packed_sizes(rejected, scratch) != cudaSuccess,
             "packed sizes accepted an unsupported extent");
   // Geometry follows the process hidden size (DeepSeek V4 Flash TP4 here).
   require(cuteafd_set_expert_hidden(1234) != cudaSuccess, "accepted an uncompiled hidden size");
   require(cuteafd_set_expert_hidden(4096) == cudaSuccess && cuteafd_expert_hidden() == 4096,
           "rejected hidden 4096");
   uint64_t flash[4] = {};
-  require(cuteafd_v41_expert_packed_sizes(512, flash) == cudaSuccess &&
+  require(cuteafd_expert_packed_sizes(512, flash) == cudaSuccess &&
           flash[0] == 512ull * 4096 && flash[3] == 4096ull * 512 / 32, "V4 Flash TP4 extents");
   require(cuteafd_set_expert_hidden(kHidden) == cudaSuccess, "restore hidden");
 
@@ -158,7 +158,7 @@ int main() {
       /*gated=*/false, /*scales=*/true, s2.data(), nullptr, kHidden, kIntermediate, 0,
       sizes[3]);
 
-  require(cuteafd_v41_pack_expert_async(sources, destinations, kIntermediate, nullptr) ==
+  require(cuteafd_pack_expert_async(sources, destinations, kIntermediate, nullptr) ==
               cudaSuccess,
           "pack launch failed");
   check_cuda(cudaStreamSynchronize(nullptr), "synchronize");

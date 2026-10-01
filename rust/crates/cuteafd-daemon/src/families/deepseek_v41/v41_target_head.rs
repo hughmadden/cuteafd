@@ -537,7 +537,7 @@ impl<'a> TargetSamplingWave<'a> {
                 let source = slot * self.mask_words;
                 let target = target_row * self.mask_words;
                 let mut words = mask_staging[source..source + self.mask_words].to_vec();
-                cuteafd_ffi::cuteafd_v41_sampler_clear_remainder(&mut words, SAMPLING_VOCAB);
+                cuteafd_ffi::cuteafd_sampler_clear_remainder(&mut words, SAMPLING_VOCAB);
                 staging[target * 4..(target + self.mask_words) * 4]
                     .copy_from_slice(bytemuck_slice(&words));
                 mask_rows = mask_rows.max(target_row + 1);
@@ -1829,7 +1829,7 @@ mod sampler_wiring_tests {
             let logits_buffer = library.alloc_device_buffer(rows * vocab * 4).unwrap();
             let values = logits(rows, vocab);
             library.copy_h2d(logits_buffer, &logit_bytes(&values)).unwrap();
-            wave.upload(&plan.rows, Some(arena), cuteafd_ffi::cuteafd_v41_sampler_mask_words(vocab),
+            wave.upload(&plan.rows, Some(arena), cuteafd_ffi::cuteafd_sampler_mask_words(vocab),
                 std::ptr::null_mut()).unwrap();
             wave.launch(logits_buffer, rows, plan.routes_need_ordered_tail(),
                 std::ptr::null_mut()).unwrap();
@@ -2276,7 +2276,7 @@ mod sampler_device_tests {
     fn mask_excluding(rows: usize, excluded: &[u32]) -> Vec<u32> {
         let words = VOCAB.div_ceil(32);
         let mut arena = vec![u32::MAX; rows * words];
-        cuteafd_ffi::cuteafd_v41_sampler_clear_remainder(&mut arena, VOCAB);
+        cuteafd_ffi::cuteafd_sampler_clear_remainder(&mut arena, VOCAB);
         for (row, &token) in excluded.iter().enumerate() {
             arena[row * words + token as usize / 32] &= !(1u32 << (token % 32));
         }
@@ -2930,7 +2930,7 @@ mod sampler_device_tests {
         for &token in tokens {
             words[token as usize / 32] |= 1u32 << (token % 32);
         }
-        cuteafd_ffi::cuteafd_v41_sampler_clear_remainder(&mut words, VOCAB);
+        cuteafd_ffi::cuteafd_sampler_clear_remainder(&mut words, VOCAB);
         words
     }
 

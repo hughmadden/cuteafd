@@ -16,7 +16,7 @@
 //     otherwise-valid six-slot argument set.
 //
 // Requires a CUDA device; exits 77 (ctest SKIP) when none is present.
-#include "cuteafd_v41_experts.h"
+#include "cuteafd_experts.h"
 
 #include <cuda_runtime.h>
 
@@ -167,7 +167,7 @@ int main() {
                      : reinterpret_cast<uint16_t*>(output_raw);
     check_cuda(cudaMemset(destination, kPoison, plane_bytes), "poison destination");
     if (use_shared) upload_shared(rows);
-    require(cuteafd_v41_reduce_compact_bf16_planes_async(
+    require(cuteafd_reduce_compact_bf16_planes_async(
                 selected.data(), use_shared ? reinterpret_cast<const uint16_t*>(shared_raw)
                                             : nullptr,
                 destination, rows, ranks, nullptr) == cudaSuccess,
@@ -194,14 +194,14 @@ int main() {
         uint16_t* fixed_output = reinterpret_cast<uint16_t*>(equivalence_raw);
         check_cuda(cudaMemset(generic, 0, plane_bytes), "memset generic");
         check_cuda(cudaMemset(fixed_output, 0, plane_bytes), "memset fixed");
-        require(cuteafd_v41_reduce_compact_bf16_planes_async(
+        require(cuteafd_reduce_compact_bf16_planes_async(
                     selected.data(), nullptr, generic, rows, ranks, nullptr) == cudaSuccess,
                 "generic equivalence launch failed");
         if (ranks == 2) {
           const uint16_t* fixed[2] = {
               reinterpret_cast<const uint16_t*>(raw[0]),
               reinterpret_cast<const uint16_t*>(raw[1])};
-          require(cuteafd_v41_reduce_tp2_compact_bf16_async(fixed, nullptr, fixed_output,
+          require(cuteafd_reduce_tp2_compact_bf16_async(fixed, nullptr, fixed_output,
                       rows, nullptr) == cudaSuccess, "fixed tp2 launch failed");
         } else {
           const uint16_t* fixed[4] = {
@@ -209,7 +209,7 @@ int main() {
               reinterpret_cast<const uint16_t*>(raw[1]),
               reinterpret_cast<const uint16_t*>(raw[2]),
               reinterpret_cast<const uint16_t*>(raw[3])};
-          require(cuteafd_v41_reduce_compact_bf16_async(fixed, nullptr, fixed_output,
+          require(cuteafd_reduce_compact_bf16_async(fixed, nullptr, fixed_output,
                       rows, nullptr) == cudaSuccess, "fixed tp4 launch failed");
         }
         check_cuda(cudaStreamSynchronize(nullptr), "synchronize equivalence");
@@ -270,7 +270,7 @@ int main() {
       const auto selected = slots(ranks);
       check_cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
                  "begin capture");
-      require(cuteafd_v41_reduce_compact_bf16_planes_async(
+      require(cuteafd_reduce_compact_bf16_planes_async(
                   selected.data(), reinterpret_cast<const uint16_t*>(shared_raw),
                   reinterpret_cast<uint16_t*>(output_raw), rows, ranks, stream) == cudaSuccess,
               "captured launch failed");
@@ -311,7 +311,7 @@ int main() {
     auto* output = reinterpret_cast<uint16_t*>(output_raw);
     auto call = [&](const uint16_t* const* planes, const uint16_t* shared,
                     uint16_t* destination, uint32_t call_rows, uint32_t ranks) {
-      return cuteafd_v41_reduce_compact_bf16_planes_async(
+      return cuteafd_reduce_compact_bf16_planes_async(
           planes, shared, destination, call_rows, ranks, nullptr);
     };
 

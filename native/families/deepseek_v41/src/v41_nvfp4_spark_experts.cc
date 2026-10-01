@@ -1,10 +1,10 @@
 // NVFP4 (W4A4) Spark TP4 modules. Separate symbol family from the W4A8 and
 // EXL3 variants; consumes BF16 hidden rows over the expert fabric.
 #define CUTEAFD_V41_NVFP4_VARIANTS_HEADER "v41_nvfp4_spark_variants.h"
-#define cuteafd_v41_expert_info cuteafd_v41_nvfp4_expert_info
-#define cuteafd_v41_expert_initialize cuteafd_v41_nvfp4_expert_initialize
-#define cuteafd_v41_expert_output_kind cuteafd_v41_nvfp4_expert_output_kind
-#define cuteafd_v41_expert_bind_scratch cuteafd_v41_nvfp4_expert_bind_scratch
-#define cuteafd_v41_expert_initialize_scratch_async cuteafd_v41_nvfp4_expert_initialize_scratch_async
-#define cuteafd_v41_expert_launch cuteafd_v41_nvfp4_expert_launch
+#define cuteafd_expert_info cuteafd_v41_nvfp4_expert_info
+#define cuteafd_expert_initialize cuteafd_v41_nvfp4_expert_initialize
+#define cuteafd_expert_output_kind cuteafd_v41_nvfp4_expert_output_kind
+#define cuteafd_expert_bind_scratch cuteafd_v41_nvfp4_expert_bind_scratch
+#define cuteafd_expert_initialize_scratch_async cuteafd_v41_nvfp4_expert_initialize_scratch_async
+#define cuteafd_expert_launch cuteafd_v41_nvfp4_expert_launch
 #include "v41_experts.cc"

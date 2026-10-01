@@ -55,10 +55,10 @@ def test_only_launch_abi_symbols_are_namespaced() -> None:
     assert module.namespaced_symbol("cuteafd_v41_expert_info", prefix) == \
         "cuteafd_v41_spark_tp2_expert_info"
     # The packer size query and the packer are canonical for every family.
-    assert module.namespaced_symbol("cuteafd_v41_expert_packed_sizes", prefix) == \
-        "cuteafd_v41_expert_packed_sizes"
-    assert module.namespaced_symbol("cuteafd_v41_pack_expert_async", prefix) == \
-        "cuteafd_v41_pack_expert_async"
+    assert module.namespaced_symbol("cuteafd_expert_packed_sizes", prefix) == \
+        "cuteafd_expert_packed_sizes"
+    assert module.namespaced_symbol("cuteafd_pack_expert_async", prefix) == \
+        "cuteafd_pack_expert_async"
     # The canonical prefix is an identity mapping.
     assert module.namespaced_symbol("cuteafd_v41_expert_launch",
                                     "cuteafd_v41_expert_") == "cuteafd_v41_expert_launch"

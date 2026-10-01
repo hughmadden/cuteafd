@@ -307,11 +307,13 @@ stale justfile recipes, unused core modules), P2 baselines; M1–M9 pure
 `path-map.tsv` and a rebase-across-move script; then a naming pass (generic
 types off V4.1 names, one `serve`/`expertd`/`golden` CLI with family
 detection, `run.sh` absorbs `run-dsv4.sh`, cmake/config/env aliases for one
-release; exported C symbols and V4.1-specific names stay). ≈3 days move pass,
+release; shared C symbols and headers drop `v41` with no aliases, since the
+library and binary ship together; V4.1-specific names stay). ≈3 days move pass,
 ≈3–4 days naming pass; V4.1 parity before tagging.
 Status: purge, move pass (M1–M8) and naming pass (N1–N9) done on
-`work/restructure`; `scripts/build/path-map.tsv`, `rename-map.tsv` and
-`rebase-across-move.sh` carry older branches across. Full native AOT build,
+`work/restructure`, N10 (shared C symbols) on `work/p0`;
+`scripts/build/path-map.tsv`, `rename-map.tsv` and `rebase-across-move.sh`
+carry older branches across. Full native AOT build,
 V4.1 parity vs 9015bff, GLM 5.3 golden NLL and a MiMo launch checked on
 hardware before the merge into `work/p0`; M9 (fork layout) separately.
 

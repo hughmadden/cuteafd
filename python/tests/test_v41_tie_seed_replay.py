@@ -193,11 +193,11 @@ def test_abi_layout_branches_for_v2_routes_and_v3_tokens() -> None:
     module = _load()
     kind, symbol, shape = module.abi_layout(False, 2)
     assert kind == "fp32_routes"
-    assert symbol == "cuteafd_v41_compact_routes_bf16_async"
+    assert symbol == "cuteafd_compact_routes_bf16_async"
     assert shape == (1, 6, 5120)
     kind, symbol, shape = module.abi_layout(True, 3)
     assert kind == "fp32_tokens"
-    assert symbol == "cuteafd_v41_compact_tokens_bf16_async"
+    assert symbol == "cuteafd_compact_tokens_bf16_async"
     assert shape == (1, 5120)
     with pytest.raises(AssertionError):
         module.abi_layout(True, 2)

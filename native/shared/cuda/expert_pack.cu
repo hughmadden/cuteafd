@@ -1,4 +1,4 @@
-#include "cuteafd_v41_experts.h"
+#include "cuteafd_experts.h"
 #include <cuda_runtime.h>
 #include <cstdint>
 
@@ -48,7 +48,7 @@ bool overlaps(const void* a, uint64_t an, const void* b, uint64_t bn) {
 }
 }
 
-extern "C" int32_t cuteafd_v41_expert_packed_sizes(uint32_t intermediate,
+extern "C" int32_t cuteafd_expert_packed_sizes(uint32_t intermediate,
     uint64_t bytes[4]) {
   // Per-rank intermediate extents are multiples of 32 so the K/32 scale axis is
   // exact; the 128 padding below is storage-only (V4.1 TP4 576 -> 640).
@@ -63,10 +63,10 @@ extern "C" int32_t cuteafd_v41_expert_packed_sizes(uint32_t intermediate,
   return cudaSuccess;
 }
 
-extern "C" int32_t cuteafd_v41_pack_expert_async(const uint8_t* const sources[6],
+extern "C" int32_t cuteafd_pack_expert_async(const uint8_t* const sources[6],
     uint8_t* const destinations[4], uint32_t intermediate, void* stream) {
   uint64_t sizes[4];
-  if (!sources || !destinations || cuteafd_v41_expert_packed_sizes(intermediate, sizes))
+  if (!sources || !destinations || cuteafd_expert_packed_sizes(intermediate, sizes))
     return cudaErrorInvalidValue;
   const uint32_t hidden = cuteafd_expert_hidden();
   const uint64_t weight_bytes = uint64_t(intermediate) * hidden / 2;

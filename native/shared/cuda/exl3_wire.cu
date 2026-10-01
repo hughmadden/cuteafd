@@ -1,5 +1,5 @@
-#include "cuteafd_v41_exl3_wire.h"
-#include "cuteafd_v41_experts.h"
+#include "cuteafd_exl3_wire.h"
+#include "cuteafd_experts.h"
 #include "expert_hidden.cuh"
 #include <cuda_runtime.h>
 #include <cuda_fp8.h>
@@ -23,7 +23,7 @@ __global__ void decode_wire(const uint8_t* input, __nv_bfloat16* output, uint64_
 }
 }
 
-extern "C" int32_t cuteafd_v41_exl3_wire_initialize(void** out) {
+extern "C" int32_t cuteafd_exl3_wire_initialize(void** out) {
   if (!out) return cudaErrorInvalidValue;
   *out = nullptr;
   auto* context = new(std::nothrow) Context;
@@ -34,10 +34,10 @@ extern "C" int32_t cuteafd_v41_exl3_wire_initialize(void** out) {
   if (status != cudaSuccess) { delete context; return status; }
   *out = context; return cudaSuccess;
 }
-extern "C" void cuteafd_v41_exl3_wire_destroy(void* handle) {
+extern "C" void cuteafd_exl3_wire_destroy(void* handle) {
   delete static_cast<Context*>(handle);
 }
-extern "C" int32_t cuteafd_v41_exl3_wire_decode(void* handle, const uint8_t* input,
+extern "C" int32_t cuteafd_exl3_wire_decode(void* handle, const uint8_t* input,
     uint64_t input_bytes, uint16_t* output, uint64_t output_bytes, uint32_t rows, void* stream) {
   if (!handle || !input || !output || rows < 1 || rows > 4096) return cudaErrorInvalidValue;
   const uint64_t hidden = cuteafd_expert_hidden();

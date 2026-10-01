@@ -48,7 +48,7 @@ ROLE_SM = {
     "spark_tp3": (12, 1),
     "spark_tp6": (12, 1),
 }
-# Native `cuteafd_v41_expert_info_t.role` values (see native/shared/include/cuteafd_v41_experts.h).
+# Native `cuteafd_expert_info_t.role` values (see native/shared/include/cuteafd_experts.h).
 ROLE_NATIVE_ID = {
     "coordinator": 0,
     "spark": 1,
