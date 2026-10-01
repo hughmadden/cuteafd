@@ -142,11 +142,6 @@ impl<'a> TokenEmbedding<'a> {
         self.source.hidden
     }
 
-    /// The device table (BF16 `[vocab, hidden]`), when resident.
-    pub fn table(&self) -> Option<CuteafdDeviceBuffer> {
-        self.table.as_ref().map(|t| t.buffer)
-    }
-
     pub fn check(&self, tokens: &[u32]) -> Result<(), TokenIoError> {
         match tokens.iter().find(|&&t| t as usize >= self.source.vocab) {
             Some(&token) => Err(TokenIoError::TokenOutOfRange { token, vocab: self.source.vocab }),
@@ -400,13 +395,6 @@ impl SelectBatch {
         Ok(())
     }
 
-    pub fn len(&self) -> usize {
-        self.rows.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
 }
 
 pub(crate) type RowResult = std::result::Result<Selected, TargetSamplingError>;
@@ -494,10 +482,6 @@ impl<'a> TokenSelector<'a> {
         ensure!(capacity > 0 && vocab > 0, "token selector of {capacity} rows x {vocab}");
         Ok(Self { library, placement, vocab, capacity, out: DeviceAllocation::new(library, capacity * 12)?,
             landing: HostAllocation::new(library, capacity * 12)?, wave: None, counts: [0; 3] })
-    }
-
-    pub fn placement(&self) -> SelectPlacement {
-        self.placement
     }
 
     /// Selects `batch.rows[i]` from logits row `i`.
