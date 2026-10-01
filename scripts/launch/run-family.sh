@@ -81,7 +81,9 @@ if [[ -z "$speculator" ]]; then
   [[ $speculator == off ]] || echo "warning: DRAFT_MODEL_ID/DFLASH/MTP/DSPARK are deprecated; use SPECULATOR=$speculator" >&2
 fi
 case "$family:$speculator" in
-  *:off|glm5:dflash2|glm5_flash:dflash2|mimo_v2:dflash2|mimo_v2:mtp|qwen4:mtp|deepseek_v4:dspark) ;;
+  qwen4:mtp)
+    echo "SPECULATOR=mtp for Qwen needs the MTP layer's experts on the coordinator; the Spark ranks do not serve them and this launcher does not place local experts yet" >&2; exit 2 ;;
+  *:off|glm5:dflash2|glm5_flash:dflash2|mimo_v2:dflash2|mimo_v2:mtp|deepseek_v4:dspark) ;;
   *) echo "SPECULATOR=$speculator does not apply to $family" >&2; exit 2 ;;
 esac
 draft_args=()
@@ -101,15 +103,21 @@ case "$speculator" in
   mtp) family_args+=(--mtp "$(key SPECULATOR_DEPTH MTP 1)") ;;
   dspark) dspark_args=(--dspark) ;;
 esac
-# MiMo prefix cache: PREFIX_CACHE_ENTRIES snapshots per bank (prompts, turns; 0 = off),
-# HOST_CACHE_BYTES of pinned host memory for snapshots the device evicts (e.g. 64GiB; 0 = off),
-# POOL_TOKENS full-attention KV tokens shared by live sequences and retained snapshots.
+# Prefix cache (MiMo, GLM 5.3, GLM 5.3 Flash): PREFIX_CACHE_ENTRIES snapshots per bank
+# (prompts, turns; 0 = off), HOST_CACHE_BYTES of pinned host memory for snapshots the
+# device evicts (e.g. 64GiB; 0 = off). POOL_TOKENS: paged KV tokens shared by live
+# sequences and retained snapshots.
+case $family in
+  mimo_v2|glm5|glm5_flash)
+    family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
+    [[ "$(get HOST_CACHE_BYTES 0)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES)") ;;
+esac
 if [[ $family == mimo_v2 ]]; then
-  family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)" --pool-tokens "$(get POOL_TOKENS 131072)")
-  [[ "$(get HOST_CACHE_BYTES 0)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES)")
+  family_args+=(--pool-tokens "$(get POOL_TOKENS 131072)")
   # PREFIX_PARTIAL=on: V4.1-style partial reuse (approximate; off = exact restores only).
   family_args+=(--prefix-partial "$(get PREFIX_PARTIAL off)")
 fi
+[[ $family != glm5 || -z "$(get POOL_TOKENS)" ]] || family_args+=(--pool-tokens "$(get POOL_TOKENS)")
 # GLM 5.3 Flash: decode rows read FP8 copies of the dense projections from the
 # official FP8 release (GLM5_FLASH_FP8_MODEL_ID, "off" for BF16), KDA
 # projections as per-row FP8 (GLM5_FLASH_KDA_FP8: row128, channel or off) and
@@ -173,11 +181,13 @@ gpu="$(get COORDINATOR_GPU 0)"
 peers=()
 # --restart removes this launcher's containers (stop.sh's release parser rejects
 # the keys above, e.g. SPECULATOR).
+# One model is served at a time: every expert worker on these hosts goes, whatever
+# its port (a leftover worker of another model holds Spark memory and OOMs the next).
 if [[ "$restart" == 1 ]]; then
   docker rm -f cuteafd-coordinator >/dev/null 2>&1 || true
   for ((rank = 0; rank < ranks; rank++)); do
     host="$(get "SPARK_${rank}_HOST")"
-    ssh "$host" "docker rm -f cuteafd-spark-expert-$host-$port >/dev/null 2>&1 || true"
+    ssh "$host" 'ids=$(docker ps -aq --filter name=^cuteafd-spark-expert-); [ -z "$ids" ] || docker rm -f $ids >/dev/null 2>&1 || true'
   done
 fi
 # GB10 CUDA allocations cannot reclaim page cache: drop it on the expert hosts first.
