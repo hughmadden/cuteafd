@@ -378,6 +378,19 @@ streamed per token, and a small replicated latent (656 B/token/layer). DCP2
 (KV split by sequence) is a capacity-only option and is not needed for V4.1
 (compressed KV, 14M-token default pool). Order: P2P probe, then head-split vs
 layer-range A/B for MiMo Pro and GLM 5.3.
+Status (2026-10-01): `cuteafd fabric --p2p` measured GPU0<->GPU1 (NODE) hops of
+3.3 us for 12 KiB (SM push + release flag, graph), a two-way exchange of 3.4 /
+4.8 / 25 us for 12 KiB / 96 KiB / 1 MiB and 1.1 ms for a 48 MiB prefill chunk
+(copy engine 0.9 ms); saturating host->GPU0 ingress roughly quadruples small
+hops. So the head split pays and is the default with two RTX
+(`--split-device`, run-family `RTX_GPUS`/`COORDINATOR_GPUS`, `COORDINATOR_SPLIT=off`
+opts out): MiMo V2.6 Pro (coordinator-only decode -41%, 8K prefill -43%; with
+6 Sparks C1 decode 30.9 -> 26.0 ms, prefill Spark-bound) and GLM 5.3
+(coordinator-only 8K prefill -28%; with 6 Sparks decode -9.5%, prefill
+Spark-bound). Shared plumbing in `shared/peer_split.rs`: per-slot release flags,
+partials exchanged and summed in the same operand order on both GPUs (identical
+residual streams), GPU1 queued a layer ahead of GPU0's Spark exchange, decode
+graphs captured per GPU. The layer-range split is not needed for these two.
 The drafter follows the GPU that owns the last backbone layers (taps and head
 live there); TP2 drafters are ≤1% on DFlash2 and not built unless the P2P
 probe shows ≤15 µs hops; the win is lane B drafting on GPU1 while lane A

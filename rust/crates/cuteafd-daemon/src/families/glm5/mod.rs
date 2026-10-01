@@ -210,7 +210,16 @@ impl Opened {
         programs.load_all()?;
         let stream = self.library.cuda_stream_create()?;
         // The head split's second GPU and its stream (load kernels, then the engine's).
-        let peer_stream = match args.split_device {
+        // A head split needs its share's programs (`glm2`) in this build.
+        let split_device = match args.split_device {
+            Some(device) if programs.spec("glm2_o_m64").is_ok() => Some(device),
+            Some(device) => {
+                tracing::info!(device, "no head-split programs (glm2) in this build; serving from --device alone");
+                None
+            }
+            None => None,
+        };
+        let peer_stream = match split_device {
             Some(device) => {
                 ensure!(device != args.device, "--split-device must differ from --device");
                 self.library.cuda_enable_peer(device)?;

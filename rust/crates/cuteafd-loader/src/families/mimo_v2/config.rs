@@ -188,7 +188,8 @@ impl MimoV2Config {
         match (self.hidden, self.heads, self.full_kv_heads, self.swa_kv_heads, self.experts) {
             (4096, 64, 4, 8, 256) => Ok("mimo"),
             (6144, 128, 8, 8, 384) => Ok("mimop"),
-            // One GPU of V2.6 Pro's two-GPU head split (`head_split(2)`).
+            // One GPU of a two-GPU head split (`head_split(2)`): V2 Flash, V2.6 Pro.
+            (4096, 32, 2, 4, 256) => Ok("mimo2"),
             (6144, 64, 4, 4, 384) => Ok("mimop2"),
             other => anyhow::bail!("no mimo program geometry for (hidden, heads, full KV, SWA KV, experts) {other:?}: \
                 add a MiMoGeometry to b12x.integration.cuteafd._common and an exporter entry"),

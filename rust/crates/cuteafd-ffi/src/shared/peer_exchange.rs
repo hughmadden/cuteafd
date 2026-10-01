@@ -58,6 +58,30 @@ impl NativeLibrary {
         Ok(us)
     }
 
+    /// Loads the exchange kernels on the current device (before any wait is
+    /// queued there; see `cuteafd_peer_exchange_initialize`).
+    pub fn peer_exchange_initialize(&self) -> Result<()> {
+        type F = unsafe extern "C" fn() -> i32;
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_peer_exchange_initialize") }?;
+        let status = unsafe { f() };
+        ensure!(status == 0, "loading the peer exchange kernels failed with CUDA error {status}");
+        Ok(())
+    }
+
+    /// `out = bf16(a + b)` over `count` BF16 elements on `stream`.
+    ///
+    /// # Safety
+    /// `a`, `b` and `out` are live device buffers of `count` elements on the
+    /// stream's device, `out` disjoint from both, producers ordered before.
+    pub unsafe fn peer_add_bf16(&self, a: *const c_void, b: *const c_void, out: *mut c_void, count: usize,
+        stream: *mut c_void) -> Result<()> {
+        type F = unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, u64, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_peer_add_bf16_async") }?;
+        let status = unsafe { f(a, b, out, count as u64, stream) };
+        ensure!(status == 0, "BF16 add of {count} elements failed with CUDA error {status}");
+        Ok(())
+    }
+
     /// Pushes `bytes` from local `source` to peer `destination` and publishes
     /// the next sequence to the peer's `flag` (see `cuteafd_peer_push_signal`).
     ///

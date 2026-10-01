@@ -83,6 +83,7 @@ impl<'a> PeerExchange<'a> {
         let end = |rank: usize| -> Result<End<'a>> {
             on_device(library, ranks[rank].device, ranks[0].device, || {
                 library.cuda_enable_peer(ranks[1 - rank].device)?;
+                library.peer_exchange_initialize()?;
                 let zeroed = |bytes: usize| -> Result<DeviceAllocation<'a>> {
                     let allocation = DeviceAllocation::new(library, bytes.max(256))?;
                     library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
@@ -141,6 +142,7 @@ impl<'a> PeerExchange<'a> {
     pub fn push_to(&self, from: usize, slot: usize, source: *const c_void, destination: *mut c_void, bytes: usize)
         -> Result<()> {
         let flag = self.flag_index(slot)?;
+        tracing::trace!(from, flag, bytes, "peer push");
         let (mine, theirs) = (&self.ends[from], &self.ends[1 - from]);
         // SAFETY: peer access is enabled both ways (new); the source rows are final on
         // this stream and untouched until later work on it; the destination is a live
@@ -151,9 +153,18 @@ impl<'a> PeerExchange<'a> {
         })
     }
 
+    /// Queues on `rank`'s stream: `out = bf16(a + b)` over `count` elements (the same
+    /// bits whichever order the two partials come in).
+    pub fn add(&self, rank: usize, a: *const c_void, b: *const c_void, out: *mut c_void, count: usize) -> Result<()> {
+        // SAFETY: callers pass live, disjoint [count] BF16 buffers of rank `rank`'s GPU whose
+        // producers are ordered before on its stream.
+        self.on(rank, || unsafe { self.library.peer_add_bf16(a, b, out, count, self.ranks[rank].stream) })
+    }
+
     /// Queues on `at`'s stream: wait for the other GPU's next push on flag `slot`.
     pub fn wait(&self, at: usize, slot: usize) -> Result<()> {
         let flag = self.flag_index(slot)?;
+        tracing::trace!(at, flag, "peer wait");
         let end = &self.ends[at];
         // SAFETY: the flag and state are this GPU's control words; every wait is matched by a
         // push the host queues before it waits on either stream.
