@@ -2,7 +2,7 @@
 //! against the torch reference, drafts against the target, KDA
 //! verify-by-replay against serial steps, and the verify-step cost by rows.
 use super::engine::{Allocator, GlmfEngine, GlmfPlacement};
-use super::{bf16s, embed_rows, similarity, GoldenArgs, Opened};
+use super::{bf16s, similarity, GoldenArgs, Opened};
 use crate::families::glm5::dflash::{ContextRow, DraftSeq, TAP_ROWS};
 use anyhow::{ensure, Context, Result};
 use std::time::Instant;
@@ -38,13 +38,12 @@ fn stream_mean(layer: &[u8], first: usize, rows: usize, hidden: usize) -> Vec<u8
 
 /// Prefills `tokens` in prefill-row chunks, feeding each chunk's tapped tail to
 /// the drafter's ring `slot`; returns the last row's logits.
-fn prefill_with_taps(opened: &Opened, engine: &GlmfEngine<'_>, placement: &mut GlmfPlacement, tokens: &[u32],
+fn prefill_with_taps(engine: &GlmfEngine<'_>, placement: &mut GlmfPlacement, tokens: &[u32],
     slot: usize) -> Result<Vec<f32>> {
-    let hidden = opened.cfg.hidden;
     let mut logits = None;
     for chunk in tokens.chunks(engine.prefill_capacity()) {
         let start = placement.len;
-        logits = engine.prefill(placement, &embed_rows(&opened.checkpoint, chunk, hidden)?, None)?;
+        logits = engine.prefill(placement, chunk, None)?;
         if let Some(drafter) = &engine.drafter {
             let n = chunk.len().min(TAP_ROWS);
             let first = start + chunk.len() - n;
@@ -92,7 +91,7 @@ pub(super) fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
         let anchor = tokens[position];
         let timer = Instant::now();
         let draft = drafter.draft(&[DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
-            &embed_rows(&opened.checkpoint, &[anchor], hidden)?, engine.weights.head.buffer.ptr)?.remove(0);
+            &engine.embedding.host_rows(&[anchor])?, engine.weights.head.buffer.ptr)?.remove(0);
         draft_seconds += timer.elapsed().as_secs_f64();
         let reference = &ref_tokens[index * drafts_per..][..drafts_per];
         exact += usize::from(draft.tokens == reference);
@@ -133,7 +132,7 @@ pub(super) fn draft_replay(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
         }
         Ok(taps)
     };
-    crate::families::glm5::dflash::replay(drafter, &tokens, &greedy, &taps, &|t| embed_rows(&opened.checkpoint, t, hidden),
+    crate::families::glm5::dflash::replay(drafter, &tokens, &greedy, &taps, &|t| engine.embedding.host_rows(t),
         engine.weights.head.buffer.ptr, start)
 }
 
@@ -143,7 +142,6 @@ pub(super) fn draft_replay(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
 /// step against the sequence.
 pub(super) fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngine<'_>) -> Result<()> {
     let drafter = engine.drafter.as_ref().context("--draft")?;
-    let hidden = opened.cfg.hidden;
     let mut sequence = tokens(args)?;
     let prefill = args.prefill.unwrap_or(sequence.len() / 2).min(sequence.len() - 1);
     let end = match args.generate {
@@ -156,7 +154,7 @@ pub(super) fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngine<
     let greedy = end > sequence.len();
     let mut placement = Allocator::new(engine.pages, engine.slots).admit(end + 1)?;
     let started = Instant::now();
-    let logits = prefill_with_taps(opened, engine, &mut placement, &sequence[..prefill], 0)?;
+    let logits = prefill_with_taps(engine, &mut placement, &sequence[..prefill], 0)?;
     if greedy {
         sequence.push(argmax(&logits));
     }
@@ -165,12 +163,12 @@ pub(super) fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngine<
     let started = Instant::now();
     for position in prefill..end {
         let anchor = sequence[position];
-        let anchor_row = embed_rows(&opened.checkpoint, &[anchor], hidden)?;
+        let anchor_row = engine.embedding.host_rows(&[anchor])?;
         let timer = Instant::now();
         let draft = drafter.draft(&[DraftSeq { slot: 0, anchor, position, valid_from: 0 }], &anchor_row, engine.weights.head.buffer.ptr)?;
         draft_seconds += timer.elapsed().as_secs_f64();
         drafts.push((position, draft.into_iter().next().context("draft")?));
-        let logits = engine.verify(&mut [(&mut placement, 1)], &anchor_row, None)?.context("decode needs every layer")?;
+        let logits = engine.verify(&mut [(&mut placement, 1)], &[anchor], None)?.context("decode needs every layer")?;
         drafter.update(&[ContextRow { tap_row: 0, slot: 0, position }])?;
         if greedy {
             sequence.push(argmax(&logits));
@@ -213,20 +211,18 @@ fn state_delta(a: &[u8], b: &[u8], fp32_bytes: usize) -> (usize, f32) {
 }
 
 /// See `GoldenArgs::replay_check`.
-pub(super) fn replay_check(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngine<'_>, rows: usize) -> Result<()> {
-    let hidden = opened.cfg.hidden;
+pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usize) -> Result<()> {
     let sequence = tokens(args)?;
     let prefill = args.prefill.unwrap_or(64).min(sequence.len() - rows);
     ensure!(rows >= 1 && prefill + rows <= sequence.len(), "--replay-check rows past the golden tokens");
-    let embed = embed_rows(&opened.checkpoint, &sequence[prefill..prefill + rows], hidden)?;
-    let row = hidden * 2;
+    let embed = &sequence[prefill..prefill + rows];
     let kda_layers = engine.weights.layers.iter()
         .filter(|l| l.attention == cuteafd_loader::families::glm5_flash::GlmNextAttention::Kda).count();
     let fp32_bytes = kda_layers * engine.cfg.kda_heads * 128 * 128 * 4;
     let allocator = std::cell::RefCell::new(Allocator::new(engine.pages, engine.slots));
     let fresh = || -> Result<GlmfPlacement> {
         let mut placement = allocator.borrow_mut().admit(prefill + rows + 1)?;
-        engine.prefill(&mut placement, &embed_rows(&opened.checkpoint, &sequence[..prefill], hidden)?, None)?;
+        engine.prefill(&mut placement, &sequence[..prefill], None)?;
         Ok(placement)
     };
     let max_logit = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
@@ -234,13 +230,13 @@ pub(super) fn replay_check(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
         let mut serial = fresh()?;
         let mut serial_logits = Vec::new();
         for j in 0..keep {
-            if let Some(l) = engine.verify(&mut [(&mut serial, 1)], &embed[j * row..(j + 1) * row], None)? {
+            if let Some(l) = engine.verify(&mut [(&mut serial, 1)], &embed[j..j + 1], None)? {
                 serial_logits.push(l);
             }
         }
         let mut spec = fresh()?;
         let start = spec.len;
-        let logits = engine.verify_spec(&mut [(&mut spec, rows)], &embed)?;
+        let logits = engine.verify_spec(&mut [(&mut spec, rows)], embed)?;
         engine.commit(&[(spec.slot, 0, keep)])?;
         spec.len = start + keep;
         let (differ, worst) = state_delta(&engine.slot_state(serial.slot)?, &engine.slot_state(spec.slot)?, fp32_bytes);
@@ -250,7 +246,7 @@ pub(super) fn replay_check(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
             (max FP32 |delta| {worst:.3e}); kept-row logits max |delta| {logit:?}");
         if keep == rows {
             let mut plain = fresh()?;
-            engine.verify(&mut [(&mut plain, rows)], &embed, None)?;
+            engine.verify(&mut [(&mut plain, rows)], embed, None)?;
             let (differ, worst) = state_delta(&engine.slot_state(plain.slot)?, &engine.slot_state(spec.slot)?, fp32_bytes);
             println!("keep {keep}/{rows}: speculative verify + commit vs a plain {rows}-row verify: {differ} state bytes \
                 differ (max FP32 |delta| {worst:.3e})");
@@ -268,12 +264,12 @@ pub(super) fn replay_check(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
             placement.len = start;
             let timer = Instant::now();
             if spec {
-                engine.verify_spec(&mut [(&mut placement, rows)], &embed)?;
+                engine.verify_spec(&mut [(&mut placement, rows)], embed)?;
                 engine.commit(&[(placement.slot, 0, rows)])?;
                 // SAFETY: the engine owns this stream.
                 unsafe { engine.library.cuda_stream_synchronize(engine.stream)? };
             } else {
-                engine.verify(&mut [(&mut placement, rows)], &embed, None)?;
+                engine.verify(&mut [(&mut placement, rows)], embed, None)?;
             }
             times.push(timer.elapsed().as_secs_f64());
         }
@@ -287,8 +283,7 @@ pub(super) fn replay_check(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
 }
 
 /// See `GoldenArgs::bench_verify`.
-pub(super) fn bench_verify(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngine<'_>, max_rows: usize) -> Result<()> {
-    let hidden = opened.cfg.hidden;
+pub(super) fn bench_verify(args: &GoldenArgs, engine: &GlmfEngine<'_>, max_rows: usize) -> Result<()> {
     let sequence = tokens(args)?;
     let count = args.bench_sequences.max(1);
     let prefill = args.prefill.unwrap_or(256).min(sequence.len() - max_rows - count);
@@ -296,7 +291,7 @@ pub(super) fn bench_verify(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
     // Distinct sequences: sequence i starts i tokens later in the golden prompt.
     let mut placements = (0..count).map(|i| -> Result<GlmfPlacement> {
         let mut placement = allocator.admit(prefill + max_rows + 1)?;
-        engine.prefill(&mut placement, &embed_rows(&opened.checkpoint, &sequence[i..i + prefill], hidden)?, None)?;
+        engine.prefill(&mut placement, &sequence[i..i + prefill], None)?;
         Ok(placement)
     }).collect::<Result<Vec<_>>>()?;
     let starts: Vec<usize> = placements.iter().map(|p| p.len).collect();
@@ -306,7 +301,6 @@ pub(super) fn bench_verify(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
             break;
         }
         let tokens: Vec<u32> = (0..count).flat_map(|i| sequence[i + prefill..i + prefill + rows].iter().copied()).collect();
-        let embed = embed_rows(&opened.checkpoint, &tokens, hidden)?;
         let mut times = Vec::new();
         *engine.profile.borrow_mut() = [0.0; 3];
         for round in 0..9 {
@@ -315,7 +309,7 @@ pub(super) fn bench_verify(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
             }
             let mut step: Vec<(&mut GlmfPlacement, usize)> = placements.iter_mut().map(|p| (p, rows)).collect();
             let timer = Instant::now();
-            engine.verify_spec(&mut step, &embed)?;
+            engine.verify_spec(&mut step, &tokens)?;
             if round >= 2 {
                 times.push(timer.elapsed().as_secs_f64());
             } else {

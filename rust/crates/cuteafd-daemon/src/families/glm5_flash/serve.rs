@@ -30,7 +30,8 @@ use crate::shared::prefix::{PrefixArgs, Toggle};
 use cuteafd_engine::prefix::{After, MarkArena, PointPlan, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
 use crate::families::glm5::dflash::{ContextRow, Draft, DraftSeq, TAP_ROWS};
 use crate::families::glm5::dflash_policy::{self, DraftHistory, Shape};
-use super::{embed_rows, open, Opened};
+use super::{open, Opened};
+use crate::shared::token_io::{RowResult, SelectBatch, SelectPlacement, TokenSelector};
 use crate::shared::prefill_share::{add_phases, isolated_phases, Chunk, DecodeShareArgs};
 use anyhow::{Context, Result};
 use cuteafd_api::openai::chat::glm5::GlmEncoding;
@@ -140,7 +141,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         }
         let ranks = args.peers.as_deref().map(|peers| peers.split(',').count());
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), policy, ranks,
-            decode_share, &prefix)
+            decode_share, &prefix, args.token_io.token_select)
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
@@ -166,8 +167,12 @@ struct Prefill<'a> {
     placement: GlmfPlacement,
     capacity: usize,
     slot: Option<usize>,
-    /// The last chunk's logits.
+    /// A whole-prompt prefix hit's retained logits (its first token is selected from them).
     logits: Option<Vec<f32>>,
+    /// The first generated token, selected right after the last chunk, and
+    /// that row's logits when a prompt snapshot will keep them.
+    first: Option<u32>,
+    prompt_row: Option<Vec<f32>>,
     started: Instant,
     /// Seconds in this prompt's chunks, and their engine phases.
     busy: f64,
@@ -207,21 +212,32 @@ struct Active<'a> {
     started: Instant,
 }
 
-impl Active<'_> {
-    fn select(&mut self, logits: &[f32]) -> Result<u32> {
-        let position = self.placement.len as u64;
-        let mask = match self.constraint.as_mut() {
-            Some(state) => state.mask()?,
-            None => None,
-        };
-        let token = self.job.sampling.select_token(logits, mask, position)
-            .map_err(|e| anyhow::anyhow!("sampling: {e:?}"))? as u32;
-        if let Some(state) = self.constraint.as_mut() {
-            state.accept(token)?;
-        }
-        Ok(token)
+/// Commits a selected token to the request's grammar.
+fn take(constraint: Option<&mut crate::shared::constraints::State<'_>>, selected: &RowResult) -> Result<u32> {
+    let token = selected.as_ref().map_err(|e| anyhow::anyhow!("sampling: {e:?}"))?.token;
+    if let Some(state) = constraint {
+        state.accept(token)?;
     }
+    Ok(token)
+}
 
+/// Selects (and commits) a token from host logits: a whole-prompt prefix hit's retained row.
+fn select_host(constraint: Option<&mut crate::shared::constraints::State<'_>>,
+    sampling: cuteafd_core::TargetSamplingParams, logits: &[f32], position: u64) -> Result<u32> {
+    let mut constraint = constraint;
+    let mask = match constraint.as_deref_mut() {
+        Some(state) => state.mask()?.map(<[u32]>::to_vec),
+        None => None,
+    };
+    let token = sampling.select_token(logits, mask.as_deref(), position)
+        .map_err(|e| anyhow::anyhow!("sampling: {e:?}"))? as u32;
+    if let Some(state) = constraint {
+        state.accept(token)?;
+    }
+    Ok(token)
+}
+
+impl Active<'_> {
     fn send(&self, chunk: InferenceChunk) -> Result<()> {
         self.job.events.send(Ok(chunk)).map_err(|_| anyhow::anyhow!("client went away"))
     }
@@ -330,8 +346,10 @@ pub(crate) const MESSAGE_STARTS: [&str; 4] = ["<|system|>", "<|user|>", "<|assis
 #[allow(clippy::too_many_arguments)]
 fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
-    policy: Policy, ranks: Option<usize>, decode_share: DecodeShareArgs, prefix: &PrefixArgs) -> Result<()> {
+    policy: Policy, ranks: Option<usize>, decode_share: DecodeShareArgs, prefix: &PrefixArgs, select: SelectPlacement)
+    -> Result<()> {
     let (family, mut cache) = prefix_cache(engine, prefix, max_sequences)?;
+    let mut selector = TokenSelector::new(&opened.library, select, engine.cfg.vocab_size, DECODE_ROWS)?;
     let markers = crate::shared::prefix::marker_ids(snapshot, &MESSAGE_STARTS)?;
     let mut free_kda: Vec<i32> = (0..engine.slots as i32).rev().collect();
     let mut grammars = crate::shared::constraints::Compiler::with_vocab(
@@ -353,7 +371,6 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     // Per request window: verify steps, and host seconds drafting, verifying
     // (engine step + commit) and selecting/streaming tokens.
     let (mut steps, mut draft_s, mut verify_s, mut emit_s) = (0u64, 0f64, 0f64, 0f64);
-    let (hidden, vocab) = (engine.cfg.hidden, engine.cfg.vocab_size);
     let mut prefills = decode_share.queue::<Prefill<'_>>()?;
     loop {
         while active.len() + prefills.len() < max_sequences {
@@ -424,10 +441,11 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let logits = admitted.after.and_then(|after| after.logits).map(|logits| logits.to_vec());
             let plan = if logits.is_some() { PointPlan::default() } else { plan };
             prefills.push(Prefill { job, constraint, tokens, done: resume, resume, plan, chunks: 0, cancelled: false,
-                placement: admitted.placement, capacity, slot, logits, started: Instant::now(), busy: 0.0,
-                phases: [0.0; 3] });
+                placement: admitted.placement, capacity, slot, logits, first: None, prompt_row: None,
+                started: Instant::now(), busy: 0.0, phases: [0.0; 3] });
         }
         if prefills.due(!active.is_empty()) {
+            let caching = cache.enabled();
             // One chunk (a lane wave) of each waiting prompt (whole prompts with --decode-share 0).
             let finished = prefills.round(|p| {
                 if p.done == p.tokens.len() {
@@ -441,9 +459,19 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
                 let chunk = &p.tokens[p.done..end];
                 let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
-                    let embed = embed_rows(&opened.checkpoint, chunk, hidden)?;
                     let start = p.placement.len;
-                    p.logits = engine.prefill(&mut p.placement, &embed, None)?;
+                    let logits = engine.prefill_device(&mut p.placement, chunk)?;
+                    if end == p.tokens.len() {
+                        // The first token, while this prompt's logits are the workspace's.
+                        let logits = logits.context("prefill produced no logits")?;
+                        if caching && p.resume < p.tokens.len() {
+                            p.prompt_row = Some(logits.row_host(&opened.library, 0)?);
+                        }
+                        let mut batch = SelectBatch::default();
+                        batch.push_next(p.job.sampling, p.constraint.as_mut(), p.placement.len as u64)?;
+                        let selected = selector.select(&logits, &batch)?;
+                        p.first = Some(take(p.constraint.as_mut(), &selected[0])?);
+                    }
                     // The chunk's tapped tail becomes drafter context before the next step.
                     if let (Some(drafter), Some(slot)) = (drafter, p.slot) {
                         let n = chunk.len().min(TAP_ROWS);
@@ -484,11 +512,23 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     release(&family, &mut cache, &mut free_kda, &mut free_slots, &placement, slot);
                     continue;
                 }
-                let Some(logits) = p.logits.clone() else {
-                    tracing::warn!("prefill produced no logits");
-                    release(&family, &mut cache, &mut free_kda, &mut free_slots, &placement, slot);
-                    continue;
+                // A whole-prompt hit selects from its retained logits; a prefill selected already.
+                let mut p = p;
+                let first = match (p.first, p.logits.as_deref()) {
+                    (Some(first), _) => Ok(first),
+                    (None, Some(logits)) => select_host(p.constraint.as_mut(), p.job.sampling, logits,
+                        p.placement.len as u64),
+                    (None, None) => Err(anyhow::anyhow!("prefill produced no logits")),
                 };
+                let first = match first {
+                    Ok(first) => first,
+                    Err(error) => {
+                        tracing::warn!("{error:#}");
+                        release(&family, &mut cache, &mut free_kda, &mut free_slots, &placement, slot);
+                        continue;
+                    }
+                };
+                let logits = p.prompt_row.take();
                 if resume < p.tokens.len() {
                     tracing::info!(tokens = p.tokens.len(), cached = resume,
                         elapsed_ms = p.started.elapsed().as_millis() as u64, busy_ms = (1e3 * p.busy) as u64,
@@ -498,9 +538,9 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 // The prompt snapshot, taken once the first token is out (it only enqueues copies).
                 let prompt = (resume < p.tokens.len()).then(|| p.tokens.clone());
                 let retain_prompt = |cache: &mut PrefixCache<CudaCopyEngine<'_>>, placement: &GlmfPlacement| {
-                    if let Some(prompt) = &prompt {
+                    if let (Some(prompt), Some(logits)) = (&prompt, &logits) {
                         if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, prompt, placement,
-                            After::from_logits(&logits, true)) {
+                            After::from_logits(logits, true)) {
                             tracing::warn!("prompt snapshot not retained: {error:#}");
                         }
                     }
@@ -518,7 +558,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         job: p.job, constraint: p.constraint, placement: p.placement, draft_from: resume, turn: None,
                         capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(),
                     };
-                    request.next = request.select(&logits)?;
+                    request.next = first;
                     Ok(request)
                 })();
                 match admitted {
@@ -559,7 +599,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         valid_from: a.draft_from })))
                     .collect();
                 let anchors: Vec<u32> = seqs.iter().map(|(_, s)| s.anchor).collect();
-                let drafts = embed_rows(&opened.checkpoint, &anchors, hidden).and_then(|rows| drafter.draft(
+                let drafts = engine.embedding.host_rows(&anchors).and_then(|rows| drafter.draft(
                     &seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &rows, engine.weights.head.buffer.ptr));
                 cost.observe_draft(timer.elapsed().as_secs_f64() * 1e3);
                 let mut out = vec![None; active.len()];
@@ -608,25 +648,36 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             } else {
                 dflash.to_vec()
             };
-            std::iter::once(a.next).chain(draft).collect()
-        }).collect();
+            let mut rows: Vec<u32> = std::iter::once(a.next).chain(draft).collect();
+            // Drafts the grammar rejects could never be kept: verify none of them.
+            if let Some(state) = a.constraint.as_ref() {
+                state.truncate_proposal(&mut rows)?;
+            }
+            Ok(rows)
+        }).collect::<Result<_>>()?;
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
         let distinct_rows: usize = active.iter().zip(&sequences).map(|(a, rows)| (key(a), rows))
             .collect::<std::collections::HashSet<_>>().iter().map(|(_, rows)| rows.len()).sum();
         let tokens: Vec<u32> = sequences.iter().flatten().copied().collect();
         // A step with drafts runs speculatively and commits what it keeps.
         let spec = sequences.iter().any(|rows| rows.len() > 1);
-        let embed = embed_rows(&opened.checkpoint, &tokens, hidden)?;
         let mut rows: Vec<(&mut GlmfPlacement, usize)> = active.iter_mut().zip(&sequences)
             .map(|(a, s)| (&mut a.placement, s.len())).collect();
         steps += 1;
         let timer = Instant::now();
-        let step = if spec { engine.verify_spec(&mut rows, &embed) } else { engine.verify(&mut rows, &embed, None) }
-            .and_then(|logits| logits.context("decode needs every layer"));
+        let step = engine.verify_device(&mut rows, &tokens, spec).and_then(|logits| logits.context("decode needs every layer"))
+            .and_then(|logits| {
+                // Each row draws at the position after it, masked along its sequence's drafts.
+                let mut batch = SelectBatch::default();
+                for ((a, rows), &start) in active.iter().zip(&sequences).zip(&starts) {
+                    batch.push_sequence(a.job.sampling, a.constraint.as_ref(), rows, start as u64 + 1)?;
+                }
+                Ok((selector.select(&logits, &batch)?, logits))
+            });
         let step_ms = timer.elapsed().as_secs_f64() * 1e3;
         verify_s += step_ms / 1e3;
-        let logits = match step {
-            Ok(logits) => logits,
+        let (selected, logits) = match step {
+            Ok(step) => step,
             Err(error) => {
                 tracing::warn!("decode step failed: {error:#}");
                 for request in active.drain(..) {
@@ -642,20 +693,20 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let mut context = Vec::new();
         let mut commits = Vec::new();
         let mut kept = Vec::new();
+        let caching = cache.enabled();
         let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(starts).enumerate()
             .map(|(i, ((request, rows), start))| {
             let mut finished = false;
             for j in 0..rows.len() {
                 // Rows 0..=j are committed; the token row j produces is next.
                 request.placement.len = start + j + 1;
-                let row = &logits[(offset + j) * vocab..][..vocab];
-                match request.select(row).and_then(|t| Ok((t, request.emit(t)?))) {
+                match take(request.constraint.as_mut(), &selected[offset + j]).and_then(|t| Ok((t, request.emit(t)?))) {
                     Ok((token, done)) => {
                         finished = done;
-                        if done {
+                        if done && caching {
                             // A normal finish (the client took the last chunk): the row that
                             // produced the last token follows the turn snapshot.
-                            request.turn = Some(row.to_vec());
+                            request.turn = logits.row_host(&opened.library, offset + j).ok();
                         }
                         if done || rows.get(j + 1) != Some(&token) {
                             break;

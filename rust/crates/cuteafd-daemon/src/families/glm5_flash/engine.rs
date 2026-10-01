@@ -26,6 +26,7 @@
 use super::weights::{GlmfLayer, GlmfWeights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
+use crate::shared::token_io::{DeviceLogits, EmbedPlacement, TokenEmbedding};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::NativeLibrary;
@@ -318,6 +319,10 @@ struct Workspace<'a> {
     /// The pool top-k's scratch: zeroed once, restored by every launch.
     topk_scratch: Dev<'a>,
     logits: Dev<'a>,
+    /// The step's token ids (U32, gathered from the device embedding table).
+    ids: Dev<'a>,
+    /// Greedy selection of the logits rows inside the decode graph: U32 ids, then U32 statuses.
+    select: Dev<'a>,
     router_logits: Dev<'a>,
     route_ids: Dev<'a>,
     route_weights: Dev<'a>,
@@ -388,6 +393,8 @@ pub(crate) struct GlmfEngine<'a> {
     ops: Option<RefCell<OpTimes>>,
     /// Prefill projections that run block-FP8 GEMMs (the layers need FP8 copies).
     pub fp8_prefill: Fp8Prefill,
+    /// The token embedding table (resident on this GPU or read from its shard).
+    pub embedding: TokenEmbedding<'a>,
 }
 
 /// Which prefill projections run block-FP8 GEMMs (E4M3 activations per row
@@ -431,7 +438,9 @@ fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
 impl<'a> GlmfEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmNextConfig, weights: GlmfWeights<'a>,
-        stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize, slots: usize) -> Result<Self> {
+        stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize, slots: usize,
+        embedding: TokenEmbedding<'a>) -> Result<Self> {
+        ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         ensure!(cfg.hc_mult == HC && cfg.kv_lora_rank == 512 && cfg.kda_head_dim == 128 && cfg.heads == 64,
             "the glmf programs are built for 4 mHC streams, a 512 latent, 64 MLA heads and 128-wide KDA heads");
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
@@ -476,7 +485,7 @@ impl<'a> GlmfEngine<'a> {
             subset_lanes: std::env::var("CUTEAFD_GLMF_PREFILL_LANES").is_ok_and(|v| v == "subset"),
             full_prefill_logits: false, routes_ready: library.cuda_event_create_ordering()?,
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
-            fp8_prefill: Fp8Prefill::default(), l2: None })
+            fp8_prefill: Fp8Prefill::default(), l2: None, embedding })
     }
 
     /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
@@ -727,6 +736,8 @@ impl<'a> GlmfEngine<'a> {
             },
             logits: self.alloc(if decode || self.full_prefill_logits { t } else { t.min(DECODE_ROWS) }
                 * self.cfg.vocab_size * 4)?,
+            ids: self.alloc(t * 4)?,
+            select: self.alloc(t * 8)?,
             router_logits: self.alloc(t * self.cfg.experts * 4)?,
             route_ids: self.alloc(t * topk * 4)?,
             route_weights: self.alloc(t * topk * 4)?,
@@ -740,16 +751,29 @@ impl<'a> GlmfEngine<'a> {
         })
     }
 
-    /// Streams start as four copies of the embedding: the rows go up once
-    /// (into the second stream buffer) and are copied into each stream slot on
-    /// the device.
-    fn load_streams(&self, w: &Workspace<'_>, embed: &[u8]) -> Result<()> {
+    /// Streams start as four copies of each token's embedding. With the
+    /// device table the ids go up and the rows are gathered into every stream
+    /// slot (unless `defer_gather`: the decode graph's first segment gathers);
+    /// otherwise the shard's rows go up once (into the second stream buffer)
+    /// and are copied into each stream slot on the device.
+    fn load_streams(&self, w: &Workspace<'_>, tokens: &[u32], defer_gather: bool) -> Result<()> {
+        ensure!(!tokens.is_empty() && tokens.len() <= w.rows, "{} tokens exceed the workspace", tokens.len());
+        if self.embedding.placement() == EmbedPlacement::Gpu {
+            let host = std::time::Instant::now();
+            self.embedding.check(tokens)?;
+            self.put(&w.ids, tokens)?;
+            self.host_op("host: token ids upload", host);
+            if !defer_gather {
+                self.timed("embedding gather", || self.gather_streams(w, tokens.len()))?;
+            }
+            return Ok(());
+        }
+        let embed = self.embedding.host_rows(tokens)?;
         let row = self.cfg.hidden * 2;
-        let t = embed.len() / row;
-        ensure!(embed.len() == t * row && t <= w.rows, "embedding rows exceed the workspace");
+        let t = tokens.len();
         let host = std::time::Instant::now();
         let staged = cuteafd_ffi::CuteafdDeviceBuffer { bytes: embed.len(), ..w.streams[1].buffer };
-        self.library.copy_h2d(staged, embed)?;
+        self.library.copy_h2d(staged, &embed)?;
         self.host_op("host: embedding upload", host);
         self.timed("stream expansion", || {
             for s in 0..HC {
@@ -765,6 +789,33 @@ impl<'a> GlmfEngine<'a> {
             }
             Ok(())
         })
+    }
+
+    /// The device table's rows of the `t` staged ids, four copies each, into stream buffer 0.
+    fn gather_streams(&self, w: &Workspace<'_>, t: usize) -> Result<()> {
+        // SAFETY: the ids are on the device (a completed copy) and the streams hold t x 4 rows.
+        unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, HC, std::ptr::null(),
+            w.streams[0].buffer.ptr, self.stream) }
+    }
+
+    /// Greedy tokens of the first `rows` logits rows into `select`.
+    fn select_greedy(&self, w: &Workspace<'_>, rows: usize) -> Result<()> {
+        let vocab = self.cfg.vocab_size;
+        // SAFETY: the logits rows and the select buffer (ids, then statuses) are live buffers of these shapes.
+        unsafe {
+            self.library.cuda_logits_greedy_f32_async(w.logits.buffer.ptr, rows, vocab, vocab, w.select.buffer.ptr,
+                std::ptr::null_mut(), w.select.buffer.ptr.cast::<u8>().add(rows * 4).cast(), self.stream)
+        }
+    }
+
+    /// The first `rows` logits rows as device logits (`greedy`: with the rows'
+    /// selection from [`Self::select_greedy`]).
+    fn device_logits(&self, w: &Workspace<'_>, rows: usize, greedy: bool) -> DeviceLogits {
+        let vocab = self.cfg.vocab_size;
+        DeviceLogits { ptr: w.logits.buffer.ptr, rows, vocab, stride: vocab, stream: self.stream,
+            // SAFETY: the statuses follow the ids inside the rows x 8-byte select buffer.
+            greedy: greedy.then(|| (w.select.buffer.ptr.cast_const(),
+                unsafe { w.select.buffer.ptr.cast::<u8>().add(rows * 4) }.cast_const().cast())) }
     }
 
     fn put<T: Copy>(&self, dev: &Dev<'_>, values: &[T]) -> Result<()> {
@@ -804,12 +855,25 @@ impl<'a> GlmfEngine<'a> {
     /// With `forced`, `forced(l)` (when it returns rows) replaces the streams
     /// after layer `l`, so each layer's comparison measures that layer alone.
     /// With `all_logits`, returns every row's logits instead of the last.
-    pub fn prefill_forced(&self, placement: &mut GlmfPlacement, embed: &[u8],
+    pub fn prefill_forced(&self, placement: &mut GlmfPlacement, tokens: &[u32],
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, all_logits: bool) -> Result<Option<Vec<f32>>> {
-        let (t, start) = (embed.len() / (self.cfg.hidden * 2), placement.len);
+        self.prefill_step(placement, tokens, on_layer, forced, all_logits, false)?
+            .map(|logits| logits.into_host(self.library)).transpose()
+    }
+
+    /// [`Self::prefill`] leaving the last row's logits on the device.
+    pub fn prefill_device(&self, placement: &mut GlmfPlacement, tokens: &[u32]) -> Result<Option<DeviceLogits>> {
+        self.prefill_step(placement, tokens, None, None, false, true)?.map(StepLogits::device).transpose()
+    }
+
+    fn prefill_step(&self, placement: &mut GlmfPlacement, tokens: &[u32],
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, all_logits: bool, device: bool)
+        -> Result<Option<StepLogits>> {
+        let (t, start) = (tokens.len(), placement.len);
         if on_layer.is_none() && forced.is_none() && self.pipelined() {
-            return self.prefill_lanes(placement, embed, all_logits);
+            return self.prefill_lanes(placement, tokens, all_logits, device);
         }
         ensure!(t > 0 && t <= self.prefill_rows && start + t <= self.max_context, "prefill of {t} rows at {start}");
         if start == 0 {
@@ -818,10 +882,10 @@ impl<'a> GlmfEngine<'a> {
         let mut tables = StepTables { page_table: placement.pages.clone(), pool_table: placement.pool_pages.clone(),
             ..Default::default() };
         self.rows(placement, start..start + t, 0, &mut tables)?;
-        let logits = self.step(&tables, embed, if all_logits { t } else { 1 }, on_layer, forced)?;
+        let logits = self.step(&tables, tokens, if all_logits { t } else { 1 }, on_layer, forced)?;
         placement.len += t;
         placement.kda_len = placement.len;
-        Ok(logits)
+        Ok(logits.map(StepLogits::Device))
     }
 
     /// Whether prefill runs as Spark lanes (a transport per lane, every layer resident).
@@ -839,10 +903,9 @@ impl<'a> GlmfEngine<'a> {
 
     /// A Spark prefill chunk as up to [`PREFILL_LANES`] lanes of consecutive
     /// rows (see [`Self::step_lanes`]).
-    fn prefill_lanes(&self, placement: &mut GlmfPlacement, embed: &[u8], all_logits: bool)
-        -> Result<Option<Vec<f32>>> {
-        let (row, start) = (self.cfg.hidden * 2, placement.len);
-        let t = embed.len() / row;
+    fn prefill_lanes(&self, placement: &mut GlmfPlacement, tokens: &[u32], all_logits: bool, device: bool)
+        -> Result<Option<StepLogits>> {
+        let (start, t) = (placement.len, tokens.len());
         let lanes = if t >= PREFILL_LANES * MIN_LANE_ROWS { PREFILL_LANES } else { 1 };
         // Lanes split at a multiple of 64 rows (an MLA page), so each lane's
         // pools and pages start where the previous lane's end.
@@ -859,27 +922,27 @@ impl<'a> GlmfEngine<'a> {
             let mut tables = StepTables { page_table: placement.pages.clone(), pool_table: placement.pool_pages.clone(),
                 ..Default::default() };
             self.rows(placement, start + first..start + first + n, 0, &mut tables)?;
-            steps.push((tables, &embed[first * row..(first + n) * row]));
+            steps.push((tables, &tokens[first..first + n]));
             first += n;
         }
-        let logits = self.step_lanes(&steps, if all_logits { t } else { 1 })?;
+        let logits = self.step_lanes(&steps, if all_logits { t } else { 1 }, device)?;
         placement.len += t;
         placement.kda_len = placement.len;
         Ok(logits)
     }
 
-    pub fn prefill(&self, placement: &mut GlmfPlacement, embed: &[u8],
+    pub fn prefill(&self, placement: &mut GlmfPlacement, tokens: &[u32],
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<Vec<f32>>> {
-        self.prefill_forced(placement, embed, on_layer, None, false)
+        self.prefill_forced(placement, tokens, on_layer, None, false)
     }
 
     /// Appends each sequence's tokens (one for decode, several for a verify)
     /// at its length in one decode-shaped step; returns every row's logits.
     /// KDA state advances in place: a caller rejecting a suffix must replay
     /// (or verify with [`Self::verify_spec`] and commit what it keeps).
-    pub fn verify(&self, sequences: &mut [(&mut GlmfPlacement, usize)], embed: &[u8],
+    pub fn verify(&self, sequences: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32],
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<Vec<f32>>> {
-        self.decode_step(sequences, embed, on_layer, false)
+        self.decode_step(sequences, tokens, on_layer, false)?.map(|l| l.to_host(self.library)).transpose()
     }
 
     /// A speculative verify: as [`Self::verify`], but the KDA state stays at
@@ -887,15 +950,22 @@ impl<'a> GlmfEngine<'a> {
     /// caller then passes every sequence's kept rows to [`Self::commit`]
     /// (MLA records past a sequence's kept length are rewritten by later
     /// steps). Placements advance by all rows; callers set the kept length.
-    pub fn verify_spec(&self, sequences: &mut [(&mut GlmfPlacement, usize)], embed: &[u8])
+    pub fn verify_spec(&self, sequences: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32])
         -> Result<Option<Vec<f32>>> {
-        self.decode_step(sequences, embed, None, true)
+        self.decode_step(sequences, tokens, None, true)?.map(|l| l.to_host(self.library)).transpose()
     }
 
-    fn decode_step(&self, sequences: &mut [(&mut GlmfPlacement, usize)], embed: &[u8],
-        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>, spec: bool) -> Result<Option<Vec<f32>>> {
+    /// [`Self::verify`] (`spec`: [`Self::verify_spec`]) leaving every row's
+    /// logits on the device, with the decode graph's greedy selection of them.
+    pub fn verify_device(&self, sequences: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32], spec: bool)
+        -> Result<Option<DeviceLogits>> {
+        self.decode_step(sequences, tokens, None, spec)
+    }
+
+    fn decode_step(&self, sequences: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32],
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>, spec: bool) -> Result<Option<DeviceLogits>> {
         let rows: usize = sequences.iter().map(|(_, n)| n).sum();
-        ensure!(rows > 0 && rows <= DECODE_ROWS && embed.len() == rows * self.cfg.hidden * 2, "decode step of {rows} rows");
+        ensure!(rows > 0 && rows <= DECODE_ROWS && tokens.len() == rows, "decode step of {rows} rows");
         // Power-of-two strides and widths bound the graphs a growing batch captures.
         let page_stride = sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1).next_power_of_two()
             .min(self.pages);
@@ -918,7 +988,7 @@ impl<'a> GlmfEngine<'a> {
             }
         }
         tables.pool_width = tables.pool_width.next_power_of_two().min(pool_stride);
-        let logits = self.step(&tables, embed, rows, on_layer, None)?;
+        let logits = self.step(&tables, tokens, rows, on_layer, None)?;
         for (placement, count) in sequences.iter_mut() {
             placement.len += *count;
             if !spec {
@@ -928,9 +998,9 @@ impl<'a> GlmfEngine<'a> {
         Ok(logits)
     }
 
-    fn step(&self, tables: &StepTables, embed: &[u8], logit_rows: usize,
+    fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
-        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<Vec<f32>>> {
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<DeviceLogits>> {
         let (h, t) = (self.cfg.hidden, tables.kv_slots.len());
         let (slot, capacity) = if tables.decode { (&self.decode_workspace, DECODE_ROWS) } else { (&self.workspace, self.prefill_rows) };
         if slot.borrow().is_none() {
@@ -950,9 +1020,11 @@ impl<'a> GlmfEngine<'a> {
         self.put(&w.page_table, &tables.page_table)?;
         self.put(&w.pool_table, &tables.pool_table)?;
         let row = h * 2;
-        self.load_streams(w, embed)?;
+        ensure!(tokens.len() == t, "{} tokens for a {t}-row step", tokens.len());
+        let graphed = self.use_graphs && tables.decode && on_layer.is_none() && forced.is_none();
+        self.load_streams(w, tokens, graphed)?;
         let rows = Scalar::I32(t as i32);
-        if self.use_graphs && tables.decode && on_layer.is_none() && forced.is_none() {
+        if graphed {
             return self.decode_graphed(w, tables, t, rows, logit_rows);
         }
         let cap = if tables.decode { "m64" } else { "m4096" };
@@ -1009,9 +1081,8 @@ impl<'a> GlmfEngine<'a> {
         self.run("head", &[("streams", w.streams[cur].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
             ("out", w.x.buffer.ptr)], &[rows])?;
         self.logits(w, t, logit_rows, tables.decode)?;
-        let logits = self.download(&w.logits, logit_rows * self.cfg.vocab_size * 4)?;
         self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
-        Ok(Some(logits.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()))
+        Ok(Some(self.device_logits(w, logit_rows, false)))
     }
 
     /// A decode step as captured segments: segment `i` posts layer `i - 1`'s
@@ -1019,8 +1090,11 @@ impl<'a> GlmfEngine<'a> {
     /// then runs layer `i` up to its routed experts, which run (local or on
     /// the Sparks) between segments. Streams start and end in buffer 0.
     fn decode_graphed(&self, w: &Workspace<'_>, tables: &StepTables, t: usize, rows: Scalar, logit_rows: usize)
-        -> Result<Option<Vec<f32>>> {
+        -> Result<Option<DeviceLogits>> {
         let layers = &self.weights.layers;
+        // Every layer resident: the last segment ends in the head and the greedy selection.
+        let head = layers.len() == self.cfg.layers && logit_rows == t;
+        let gather = self.embedding.placement() == EmbedPlacement::Gpu;
         for index in 0..=layers.len() {
             let key = GraphKey { segment: index, rows: t, spec: tables.spec, long: tables.long,
                 pool_width: tables.pool_width, page_stride: tables.page_stride, pool_stride: tables.pool_stride };
@@ -1034,9 +1108,19 @@ impl<'a> GlmfEngine<'a> {
                     self.run("mhc_post", &[("x", w.delta.buffer.ptr), ("residual", w.streams[1].buffer.ptr),
                         ("prev_post", w.post.buffer.ptr), ("prev_comb", w.comb.buffer.ptr),
                         ("out", w.streams[0].buffer.ptr)], &[rows])?;
-                    return tap();
+                    tap()?;
+                    if head {
+                        self.run("head", &[("streams", w.streams[0].buffer.ptr),
+                            ("weight", self.weights.norm.buffer.ptr), ("out", w.x.buffer.ptr)], &[rows])?;
+                        self.logits(w, t, t, true)?;
+                        self.select_greedy(w, t)?;
+                    }
+                    return Ok(());
                 };
                 if index == 0 {
+                    if gather {
+                        self.gather_streams(w, t)?;
+                    }
                     self.pre(w, &w.streams[0], layer, rows)?;
                 } else {
                     self.post_pre(w, 1, layer, "attn", "input_norm", rows, "m64")?;
@@ -1062,14 +1146,14 @@ impl<'a> GlmfEngine<'a> {
             unsafe { self.library.cuda_stream_synchronize(self.stream)? };
             return Ok(None);
         }
-        let h = self.cfg.hidden;
-        let timer = std::time::Instant::now();
-        self.run("head", &[("streams", w.streams[0].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
-            ("out", w.x.buffer.ptr)], &[rows])?;
-        self.logits(w, t, logit_rows, tables.decode)?;
-        let logits = self.download(&w.logits, logit_rows * self.cfg.vocab_size * 4)?;
-        self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
-        Ok(Some(logits.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()))
+        if !head {
+            let timer = std::time::Instant::now();
+            self.run("head", &[("streams", w.streams[0].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
+                ("out", w.x.buffer.ptr)], &[rows])?;
+            self.logits(w, t, logit_rows, tables.decode)?;
+            self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
+        }
+        Ok(Some(self.device_logits(w, logit_rows, head)))
     }
 
     /// The vocabulary projection of the last `logit_rows` normalized rows into
@@ -1463,8 +1547,8 @@ impl<'a> GlmfEngine<'a> {
     /// while the other lane's GPU layers run and is received after the next
     /// wave is dispatched, so the ranks hold the next request when they finish
     /// one. Returns the logits of the last `logit_rows` rows across the lanes.
-    fn step_lanes(&self, lanes: &[(StepTables, &[u8])], logit_rows: usize) -> Result<Option<Vec<f32>>> {
-        let h = self.cfg.hidden;
+    fn step_lanes(&self, lanes: &[(StepTables, &[u32])], logit_rows: usize, device: bool)
+        -> Result<Option<StepLogits>> {
         let Some(Experts::Spark { transports, runtime }) = &self.experts else {
             anyhow::bail!("pipelined prefill needs Spark experts");
         };
@@ -1480,8 +1564,7 @@ impl<'a> GlmfEngine<'a> {
         let total: usize = lanes.iter().map(|(t, _)| t.kv_slots.len()).sum();
         ensure!(logit_rows <= total && (self.full_prefill_logits || logit_rows <= DECODE_ROWS),
             "prefill logits past {DECODE_ROWS} rows need full_prefill_logits");
-        let row = h * 2;
-        for ((tables, embed), w) in lanes.iter().zip(workspaces.iter()) {
+        for ((tables, tokens), w) in lanes.iter().zip(workspaces.iter()) {
             let t = tables.kv_slots.len();
             ensure!(t <= w.rows, "lane of {t} rows exceeds its workspace");
             self.put(&w.positions, &tables.positions)?;
@@ -1492,7 +1575,7 @@ impl<'a> GlmfEngine<'a> {
             self.put(&w.cache_lengths, &tables.cache_lengths)?;
             self.put(&w.page_table, &tables.page_table)?;
             self.put(&w.pool_table, &tables.pool_table)?;
-            self.load_streams(w, embed)?;
+            self.load_streams(w, tokens, false)?;
         }
         let layers = &self.weights.layers;
         let cap = "m4096";
@@ -1584,6 +1667,18 @@ impl<'a> GlmfEngine<'a> {
             return Ok(None);
         }
         let timer = std::time::Instant::now();
+        let last = lanes.len() - 1;
+        if device {
+            // The last rows sit in the last lane: their logits stay in its workspace.
+            let t = lanes[last].0.kv_slots.len();
+            ensure!(logit_rows <= t, "device logits of {logit_rows} rows across prefill lanes");
+            let w = &workspaces[last];
+            self.run("head", &[("streams", w.streams[0].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
+                ("out", w.x.buffer.ptr)], &[Scalar::I32(t as i32)])?;
+            self.logits(w, t, logit_rows, false)?;
+            self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
+            return Ok(Some(StepLogits::Device(self.device_logits(w, logit_rows, false))));
+        }
         let mut logits = Vec::with_capacity(logit_rows * self.cfg.vocab_size);
         for (((tables, _), w), &first) in lanes.iter().zip(workspaces.iter()).zip(&lane_first) {
             let t = tables.kv_slots.len();
@@ -1599,7 +1694,29 @@ impl<'a> GlmfEngine<'a> {
             logits.extend(bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())));
         }
         self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
-        Ok(Some(logits))
+        Ok(Some(StepLogits::Host(logits)))
+    }
+}
+
+/// A prefill's logits: on the device (one workspace), or gathered across lanes on the host.
+pub(crate) enum StepLogits {
+    Device(DeviceLogits),
+    Host(Vec<f32>),
+}
+
+impl StepLogits {
+    fn into_host(self, library: &NativeLibrary) -> Result<Vec<f32>> {
+        match self {
+            Self::Device(logits) => logits.to_host(library),
+            Self::Host(logits) => Ok(logits),
+        }
+    }
+
+    fn device(self) -> Result<DeviceLogits> {
+        match self {
+            Self::Device(logits) => Ok(logits),
+            Self::Host(_) => anyhow::bail!("prefill lanes left their logits on the host"),
+        }
     }
 }
 
