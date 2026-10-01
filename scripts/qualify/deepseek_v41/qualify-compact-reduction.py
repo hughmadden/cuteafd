@@ -20,10 +20,10 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     lib = C.CDLL(str(args.native_lib.resolve()))
-    pack = lib.cuteafd_v41_compact_routes_bf16_async
+    pack = lib.cuteafd_compact_routes_bf16_async
     pack.argtypes = [C.c_void_p, C.c_void_p, C.c_uint32, C.c_void_p]
     pack.restype = C.c_int32
-    reduce = lib.cuteafd_v41_reduce_compact_bf16_async
+    reduce = lib.cuteafd_reduce_compact_bf16_async
     reduce.argtypes = [C.POINTER(C.c_void_p), C.c_void_p, C.c_void_p,
                        C.c_uint32, C.c_void_p]
     reduce.restype = C.c_int32

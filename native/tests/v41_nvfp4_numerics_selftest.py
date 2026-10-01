@@ -109,7 +109,7 @@ def main():
     routes = routes.reshape(capacity, k, h)[:m]
     stream = torch.cuda.current_stream().cuda_stream
     check(k == 6 and h == 5120, "native BF16 reducer requires six 5120-wide routes")
-    reduce_routes = lib.cuteafd_v41_compact_bf16_routes_async
+    reduce_routes = lib.cuteafd_compact_bf16_routes_async
     reduce_routes.argtypes = [C.c_void_p, C.c_void_p, C.c_uint32, C.c_void_p]
     reduce_routes.restype = C.c_int32
     actual = torch.empty_like(x)

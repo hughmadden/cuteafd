@@ -2,7 +2,7 @@
 #include <cuda_bf16.h>
 #include <math_constants.h>
 #include <stdint.h>
-#include "cuteafd_v41_router.h"
+#include "cuteafd_router.h"
 #ifdef CUTEAFD_HAVE_V41_ROUTER_AOT
 #include "v41_router_dispatch.h"
 extern "C" int32_t cuteafd_v41_router_scores_aot(const uint16_t*,const uint16_t*,float*,int32_t,int32_t,void*);

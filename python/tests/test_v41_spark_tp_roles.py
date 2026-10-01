@@ -15,7 +15,7 @@ SLICES = ROOT / "python" / "tools" / "aot" / "export_b12x_slices_aot.py"
 EXPERTS = ROOT / "python" / "tools" / "aot" / "export_b12x_v41_experts_aot.py"
 CMAKE = ROOT / "native" / "CMakeLists.txt"
 CMAKE_TP = ROOT / "native" / "cmake" / "families" / "deepseek_v41" / "v41_spark_tp_experts.cmake"
-HEADER = ROOT / "native" / "shared" / "include" / "cuteafd_v41_experts.h"
+HEADER = ROOT / "native" / "shared" / "include" / "cuteafd_experts.h"
 REDUCE = ROOT / "native" / "shared" / "cuda" / "route_reduce.cu"
 PACK = ROOT / "native" / "shared" / "cuda" / "expert_pack.cu"
 
@@ -120,7 +120,7 @@ def test_native_role_ids_and_reducer_abi_are_declared() -> None:
     header = HEADER.read_text(encoding="utf-8")
     assert "5: Spark TP2 shard (intermediate 1152)" in header
     assert "6: Spark TP3 shard (intermediate 768)" in header
-    assert "cuteafd_v41_reduce_compact_bf16_planes_async" in header
+    assert "cuteafd_reduce_compact_bf16_planes_async" in header
     assert "const uint16_t* const planes[6]" in header
     assert "uint32_t ranks" in header
 
@@ -128,8 +128,8 @@ def test_native_role_ids_and_reducer_abi_are_declared() -> None:
     assert "if constexpr (Ranks >= 6)" in reduce_source
     assert "valid_compact_planes" in reduce_source
     # The two historical fixed entry points must remain.
-    assert "cuteafd_v41_reduce_compact_bf16_async" in reduce_source
-    assert "cuteafd_v41_reduce_tp2_compact_bf16_async" in reduce_source
+    assert "cuteafd_reduce_compact_bf16_async" in reduce_source
+    assert "cuteafd_reduce_tp2_compact_bf16_async" in reduce_source
 
 
 def test_packer_accepts_tp3_extent_and_requires_scale_alignment() -> None:

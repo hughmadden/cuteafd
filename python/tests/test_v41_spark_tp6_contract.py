@@ -24,7 +24,7 @@ QUALIFIER = ROOT / "python" / "tools" / "qualify" / "deepseek_v41" / "qualify_v4
 WIP = ROOT / "wip.sh"
 CMAKE = ROOT / "native" / "CMakeLists.txt"
 CMAKE_TP = ROOT / "native" / "cmake" / "families" / "deepseek_v41" / "v41_spark_tp_experts.cmake"
-HEADER = ROOT / "native" / "shared" / "include" / "cuteafd_v41_experts.h"
+HEADER = ROOT / "native" / "shared" / "include" / "cuteafd_experts.h"
 PACK = ROOT / "native" / "shared" / "cuda" / "expert_pack.cu"
 WRAPPER_TP6 = ROOT / "native" / "families" / "deepseek_v41" / "src" / "v41_spark_tp6_experts.cc"
 BUILD = ROOT / "build.sh"
@@ -202,7 +202,7 @@ def test_native_role_ids_and_packer_extent_are_declared() -> None:
     assert "#define CUTEAFD_V41_SPARK_TP6_EXPERTS 1" in wrapper
     for suffix in ("info", "initialize", "output_kind", "bind_scratch",
                    "initialize_scratch_async", "launch"):
-        assert f"#define cuteafd_v41_expert_{suffix} cuteafd_v41_spark_tp6_expert_{suffix}" in wrapper
+        assert f"#define cuteafd_expert_{suffix} cuteafd_v41_spark_tp6_expert_{suffix}" in wrapper
     # The canonical FP8 quantizer stays in exactly one translation unit.
     experts_source = (ROOT / "native" / "shared" / "src" / "v41_experts.cc").read_text(
         encoding="utf-8"

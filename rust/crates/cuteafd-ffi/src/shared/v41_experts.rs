@@ -514,21 +514,21 @@ impl NativeLibrary {
             compact: unsafe {
                 *self
                     .lib
-                    .get::<CompactFn>(b"cuteafd_v41_compact_routes_bf16_async")?
+                    .get::<CompactFn>(b"cuteafd_compact_routes_bf16_async")?
             },
-            compact_tokens: unsafe { self.lib.get::<CompactFn>(b"cuteafd_v41_compact_tokens_bf16_async").ok().map(|f| *f) },
-            compact_bf16_routes: unsafe { self.lib.get::<CompactBf16RoutesFn>(b"cuteafd_v41_compact_bf16_routes_async").ok().map(|f| *f) },
+            compact_tokens: unsafe { self.lib.get::<CompactFn>(b"cuteafd_compact_tokens_bf16_async").ok().map(|f| *f) },
+            compact_bf16_routes: unsafe { self.lib.get::<CompactBf16RoutesFn>(b"cuteafd_compact_bf16_routes_async").ok().map(|f| *f) },
             reduce: unsafe {
                 *self
                     .lib
-                    .get::<ReduceCompactFn>(b"cuteafd_v41_reduce_compact_bf16_async")?
+                    .get::<ReduceCompactFn>(b"cuteafd_reduce_compact_bf16_async")?
             },
             reduce_tp2: unsafe {
-                self.lib.get::<ReduceCompactFn>(b"cuteafd_v41_reduce_tp2_compact_bf16_async").ok().map(|f| *f)
+                self.lib.get::<ReduceCompactFn>(b"cuteafd_reduce_tp2_compact_bf16_async").ok().map(|f| *f)
             },
             reduce_planes: unsafe {
                 self.lib
-                    .get::<ReduceCompactPlanesFn>(b"cuteafd_v41_reduce_compact_bf16_planes_async")
+                    .get::<ReduceCompactPlanesFn>(b"cuteafd_reduce_compact_bf16_planes_async")
                     .ok()
                     .map(|f| *f)
             },
@@ -542,9 +542,9 @@ impl NativeLibrary {
         );
         let sizes = unsafe {
             self.lib
-                .get::<PackedSizesFn>(b"cuteafd_v41_expert_packed_sizes")?
+                .get::<PackedSizesFn>(b"cuteafd_expert_packed_sizes")?
         };
-        let pack = unsafe { *self.lib.get::<PackFn>(b"cuteafd_v41_pack_expert_async")? };
+        let pack = unsafe { *self.lib.get::<PackFn>(b"cuteafd_pack_expert_async")? };
         let mut bytes = [0; 4];
         let status = unsafe { sizes(intermediate, bytes.as_mut_ptr()) };
         ensure!(
@@ -563,7 +563,7 @@ impl NativeLibrary {
         let reduce = unsafe {
             *self
                 .lib
-                .get::<ReduceFn>(b"cuteafd_v41_reduce_routes_async")?
+                .get::<ReduceFn>(b"cuteafd_reduce_routes_async")?
         };
         Ok(V41RouteReducer {
             _library: self,
@@ -804,13 +804,13 @@ impl NativeLibrary {
                 ensure!(kind == V41ExpertOutputKind::Bf16Routes && info.abi_version == 2,
                     "NVFP4 requires deterministic BF16 route output");
                 unsafe {
-                    self.lib.get::<CompactBf16RoutesFn>(b"cuteafd_v41_compact_bf16_routes_async")?;
-                    self.lib.get::<ReduceTp2Bf16RoutesFn>(b"cuteafd_v41_reduce_tp2_bf16_routes_async")?;
+                    self.lib.get::<CompactBf16RoutesFn>(b"cuteafd_compact_bf16_routes_async")?;
+                    self.lib.get::<ReduceTp2Bf16RoutesFn>(b"cuteafd_reduce_tp2_bf16_routes_async")?;
                 }
             } else {
                 ensure!(kind == V41ExpertOutputKind::Fp32Tokens && matches!(info.role, 1 | 2 | 3 | 5 | 6 | 7),
                     "unsupported V4.1 ABI 3 output layout");
-                unsafe { self.lib.get::<CompactFn>(b"cuteafd_v41_compact_tokens_bf16_async")?; }
+                unsafe { self.lib.get::<CompactFn>(b"cuteafd_compact_tokens_bf16_async")?; }
             }
             kind
         } else { V41ExpertOutputKind::Fp32Routes };
@@ -1336,9 +1336,9 @@ type SumTp2RoutesFn = unsafe extern "C" fn(*const f32, *mut f32, u32, *mut c_voi
 impl NativeLibrary {
     pub fn v41_tp2_expert_reducer(&self) -> Result<V41Tp2ExpertReducer<'_>> {
         Ok(V41Tp2ExpertReducer { _library: self,
-            reduce: unsafe { *self.lib.get::<ReduceTp2Fn>(b"cuteafd_v41_reduce_tp2_experts_async")? },
-            reduce_bf16_routes: unsafe { self.lib.get::<ReduceTp2Bf16RoutesFn>(b"cuteafd_v41_reduce_tp2_bf16_routes_async").ok().map(|f| *f) },
-            sum_routes: unsafe { self.lib.get::<SumTp2RoutesFn>(b"cuteafd_v41_sum_tp2_routes_async").ok().map(|f| *f) } })
+            reduce: unsafe { *self.lib.get::<ReduceTp2Fn>(b"cuteafd_reduce_tp2_experts_async")? },
+            reduce_bf16_routes: unsafe { self.lib.get::<ReduceTp2Bf16RoutesFn>(b"cuteafd_reduce_tp2_bf16_routes_async").ok().map(|f| *f) },
+            sum_routes: unsafe { self.lib.get::<SumTp2RoutesFn>(b"cuteafd_sum_tp2_routes_async").ok().map(|f| *f) } })
     }
 }
 impl V41Tp2ExpertReducer<'_> {
@@ -1403,8 +1403,8 @@ pub struct V41LocalExpertReducer<'a> {
 impl NativeLibrary {
     pub fn v41_local_expert_reducer(&self) -> Result<V41LocalExpertReducer<'_>> {
         Ok(V41LocalExpertReducer { _library: self,
-            finish: unsafe { *self.lib.get::<FinishLocalFn>(b"cuteafd_v41_finish_local_experts_async")? },
-            finish_bf16_routes: unsafe { self.lib.get::<FinishLocalBf16RoutesFn>(b"cuteafd_v41_finish_local_bf16_routes_async").ok().map(|f| *f) } })
+            finish: unsafe { *self.lib.get::<FinishLocalFn>(b"cuteafd_finish_local_experts_async")? },
+            finish_bf16_routes: unsafe { self.lib.get::<FinishLocalBf16RoutesFn>(b"cuteafd_finish_local_bf16_routes_async").ok().map(|f| *f) } })
     }
 }
 impl V41LocalExpertReducer<'_> {

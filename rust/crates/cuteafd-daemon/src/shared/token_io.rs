@@ -10,7 +10,7 @@
 //! [`TargetSamplingParams::select_token`], the reference the device path
 //! must reproduce (token-identical for greedy rows).
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
-use crate::shared::sampler::{TargetSamplingRowRequest, TargetSamplingWave, CUTEAFD_V41_SAMPLING_MAX_RETAINED};
+use crate::shared::sampler::{TargetSamplingRowRequest, TargetSamplingWave, SAMPLING_MAX_RETAINED};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{TargetSamplingError, TargetSamplingParams};
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdV41SamplerRow, NativeLibrary};
@@ -432,7 +432,7 @@ fn route(params: TargetSamplingParams) -> Route {
         return Route::Greedy;
     }
     match params.top_k() {
-        Some(k) if k > CUTEAFD_V41_SAMPLING_MAX_RETAINED as usize => Route::Host,
+        Some(k) if k > SAMPLING_MAX_RETAINED as usize => Route::Host,
         Some(_) => Route::Ordered,
         None if params.top_p() < 1.0 => Route::Ordered,
         None => Route::Fast,

@@ -1,5 +1,5 @@
 // SM-issued peer reads keep lane-local waits off the shared DMA copy queue.
-#include "cuteafd_v41_peer_copy.h"
+#include "cuteafd_peer_copy.h"
 #include <cuda_runtime.h>
 #include <stdint.h>
 namespace {
@@ -40,7 +40,7 @@ template<class T> int32_t dispatch_rows(void* destination,const void* source,uin
 }
 
 }
-extern "C" int32_t cuteafd_v41_peer_copy_initialize() {
+extern "C" int32_t cuteafd_peer_copy_initialize() {
   cudaFuncAttributes attributes{};
   auto status=cudaFuncGetAttributes(&attributes,peer_copy);
   if(status!=cudaSuccess)return status;
@@ -52,7 +52,7 @@ extern "C" int32_t cuteafd_v41_peer_copy_initialize() {
 }
 // Source peer access must be enabled on the stream's destination device.
 // Both buffers remain live and disjoint until completion; no allocation/wait.
-extern "C" int32_t cuteafd_v41_peer_copy_async(void* destination,const void* source,
+extern "C" int32_t cuteafd_peer_copy_async(void* destination,const void* source,
     uint64_t bytes,void* stream) {
   const auto dst=reinterpret_cast<uintptr_t>(destination),src=reinterpret_cast<uintptr_t>(source);
   if(!stream || !dst || !src || bytes==0 || bytes>(1ull<<40) ||
@@ -65,7 +65,7 @@ extern "C" int32_t cuteafd_v41_peer_copy_async(void* destination,const void* sou
   return cudaGetLastError();
 }
 
-extern "C" int32_t cuteafd_v41_peer_copy_rows_async(void* destination,const void* source,
+extern "C" int32_t cuteafd_peer_copy_rows_async(void* destination,const void* source,
     uint64_t width,uint64_t rows,uint64_t destination_pitch,uint64_t source_pitch,void* stream) {
   uint64_t dst_bytes=0,src_bytes=0;
   const auto dst=reinterpret_cast<uintptr_t>(destination),src=reinterpret_cast<uintptr_t>(source);

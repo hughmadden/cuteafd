@@ -417,8 +417,8 @@ def test_run_timing_branch_executes_with_mocks_and_emits_the_record_schema(tmp_p
 
     lib = SimpleNamespace(
         cuteafd_v41_expert_info=_record_capacity,
-        cuteafd_v41_compact_routes_bf16_async=lambda *a, **k: 0,
-        cuteafd_v41_compact_tokens_bf16_async=lambda *a, **k: 0)
+        cuteafd_compact_routes_bf16_async=lambda *a, **k: 0,
+        cuteafd_compact_tokens_bf16_async=lambda *a, **k: 0)
 
     options = SimpleNamespace(
         manifest=manifest_path, native_lib=tmp_path / "lib.so", width=None,

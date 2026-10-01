@@ -656,7 +656,7 @@ fn sampling_route(params: cuteafd_core::TargetSamplingParams) -> SamplingRoute {
     // plan builds both from the same `min_p` with `target_sampling_row`, so
     // there is no separate check to make here.
     if top_k > 0 {
-        if top_k > crate::families::deepseek_v41::v41_target_head::CUTEAFD_V41_SAMPLING_MAX_RETAINED {
+        if top_k > crate::families::deepseek_v41::v41_target_head::SAMPLING_MAX_RETAINED {
             return SamplingRoute::CpuFallback;
         }
         return SamplingRoute::DeviceOrdered;
@@ -1972,7 +1972,7 @@ mod sampling_tests {
                 continue;
             }
             let top_k = params.top_k().map_or(0, |k| k as u32);
-            assert!(top_k <= crate::families::deepseek_v41::v41_target_head::CUTEAFD_V41_SAMPLING_MAX_RETAINED,
+            assert!(top_k <= crate::families::deepseek_v41::v41_target_head::SAMPLING_MAX_RETAINED,
                 "{name} must not exceed K5's retained table");
             assert!(params.temperature().is_finite() && params.temperature() <= 2.0, "{name}");
             assert!(params.top_p().is_finite() && params.top_p() > 0.0 && params.top_p() <= 1.0,

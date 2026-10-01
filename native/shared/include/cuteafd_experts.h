@@ -21,11 +21,11 @@ uint32_t cuteafd_expert_hidden(void);
  * returned below; source and destination storage must not overlap.
  * Representation-only transform preserves FP4/E8M0 bytes and zero-pads tails;
  * caller owns all buffers and stream ordering through completion. */
-int32_t cuteafd_v41_expert_packed_sizes(uint32_t intermediate, uint64_t bytes[4]);
-int32_t cuteafd_v41_pack_expert_async(const uint8_t* const sources[6],
+int32_t cuteafd_expert_packed_sizes(uint32_t intermediate, uint64_t bytes[4]);
+int32_t cuteafd_pack_expert_async(const uint8_t* const sources[6],
     uint8_t* const destinations[4], uint32_t intermediate, void* stream);
 /* Pointer slots follow the exported dynamic W4A8 C ABI; see the manifest. */
-typedef struct cuteafd_v41_expert_launch_t {
+typedef struct cuteafd_expert_launch_t {
   void* tensors[CUTEAFD_V41_EXPERT_POINTERS];
   int32_t num_tokens;
   int32_t max_rows;
@@ -35,9 +35,9 @@ typedef struct cuteafd_v41_expert_launch_t {
   int32_t max_phys_tiles;
   int32_t max_active_clusters;
   void* stream;
-} cuteafd_v41_expert_launch_t;
+} cuteafd_expert_launch_t;
 
-typedef struct cuteafd_v41_expert_info_t {
+typedef struct cuteafd_expert_info_t {
   uint32_t abi_version;
   uint32_t role; /* 0: coordinator dSpark; 1: Spark TP4 shard; 2: full RTX backbone; 3: backbone TP2;
                     4: dSpark TP2; 5: Spark TP2 shard (intermediate 1152); 6: Spark TP3 shard (intermediate 768);
@@ -55,7 +55,7 @@ typedef struct cuteafd_v41_expert_info_t {
   int32_t max_phys_tiles;
   int32_t max_active_clusters;
   uint32_t input_dtype; /* ABI 2: 1 BF16; 7 row E4M3 + UE8M0 K32 scales */
-} cuteafd_v41_expert_info_t;
+} cuteafd_expert_info_t;
 
 /* Prewarm before graph capture. Quantize BF16 [rows,5120] into contiguous
  * 5280-byte rows: 5120 E4M3 bytes then 160 UE8M0 K32 scales, amax floor 1e-4.
@@ -70,9 +70,9 @@ int32_t cuteafd_v41_expert_input_quantize_async(void* kernel,
  * Initialize before graph capture; each variant binds to its first CUDA device.
  * Kernel handles borrow the library and must outlive every launch/graph replay.
  * Callers own CUDA buffers, capacity, initialization and stream ordering. */
-int32_t cuteafd_v41_expert_info(int32_t capacity, cuteafd_v41_expert_info_t* out);
+int32_t cuteafd_v41_expert_info(int32_t capacity, cuteafd_expert_info_t* out);
 int32_t cuteafd_v41_expert_initialize(int32_t capacity, void** out_kernel);
-int32_t cuteafd_v41_expert_launch(void* kernel, const cuteafd_v41_expert_launch_t* args);
+int32_t cuteafd_v41_expert_launch(void* kernel, const cuteafd_expert_launch_t* args);
 /* Caller-owned scratch must be 16-byte aligned and at least info.scratch_bytes.
  * Bind writes only scratch pointer slots, preserving caller weight/input slots.
  * Initialize once before use/capture, with exclusive ownership on this stream;
@@ -87,25 +87,25 @@ int32_t cuteafd_v41_expert_initialize_scratch_async(void* kernel, void* storage,
  * and role id per TP degree (5: TP2 logical intermediate 1152; 6: TP3 768;
  * 7: TP6 384). All are unpadded (kernel_intermediate == logical_intermediate).
  * Artifacts are pre-compiled per capacity; there is no runtime compilation path. */
-int32_t cuteafd_v41_spark_tp2_expert_info(int32_t capacity, cuteafd_v41_expert_info_t* out);
+int32_t cuteafd_v41_spark_tp2_expert_info(int32_t capacity, cuteafd_expert_info_t* out);
 int32_t cuteafd_v41_spark_tp2_expert_initialize(int32_t capacity, void** out_kernel);
-int32_t cuteafd_v41_spark_tp2_expert_launch(void* kernel, const cuteafd_v41_expert_launch_t* args);
+int32_t cuteafd_v41_spark_tp2_expert_launch(void* kernel, const cuteafd_expert_launch_t* args);
 int32_t cuteafd_v41_spark_tp2_expert_bind_scratch(void* kernel, void* storage,
     uint64_t bytes, void* tensors[CUTEAFD_V41_EXPERT_POINTERS]);
 int32_t cuteafd_v41_spark_tp2_expert_initialize_scratch_async(void* kernel, void* storage,
     uint64_t bytes, void* stream);
 int32_t cuteafd_v41_spark_tp2_expert_output_kind(int32_t capacity, uint32_t* out);
-int32_t cuteafd_v41_spark_tp3_expert_info(int32_t capacity, cuteafd_v41_expert_info_t* out);
+int32_t cuteafd_v41_spark_tp3_expert_info(int32_t capacity, cuteafd_expert_info_t* out);
 int32_t cuteafd_v41_spark_tp3_expert_initialize(int32_t capacity, void** out_kernel);
-int32_t cuteafd_v41_spark_tp3_expert_launch(void* kernel, const cuteafd_v41_expert_launch_t* args);
+int32_t cuteafd_v41_spark_tp3_expert_launch(void* kernel, const cuteafd_expert_launch_t* args);
 int32_t cuteafd_v41_spark_tp3_expert_bind_scratch(void* kernel, void* storage,
     uint64_t bytes, void* tensors[CUTEAFD_V41_EXPERT_POINTERS]);
 int32_t cuteafd_v41_spark_tp3_expert_initialize_scratch_async(void* kernel, void* storage,
     uint64_t bytes, void* stream);
 int32_t cuteafd_v41_spark_tp3_expert_output_kind(int32_t capacity, uint32_t* out);
-int32_t cuteafd_v41_spark_tp6_expert_info(int32_t capacity, cuteafd_v41_expert_info_t* out);
+int32_t cuteafd_v41_spark_tp6_expert_info(int32_t capacity, cuteafd_expert_info_t* out);
 int32_t cuteafd_v41_spark_tp6_expert_initialize(int32_t capacity, void** out_kernel);
-int32_t cuteafd_v41_spark_tp6_expert_launch(void* kernel, const cuteafd_v41_expert_launch_t* args);
+int32_t cuteafd_v41_spark_tp6_expert_launch(void* kernel, const cuteafd_expert_launch_t* args);
 int32_t cuteafd_v41_spark_tp6_expert_bind_scratch(void* kernel, void* storage,
     uint64_t bytes, void* tensors[CUTEAFD_V41_EXPERT_POINTERS]);
 int32_t cuteafd_v41_spark_tp6_expert_initialize_scratch_async(void* kernel, void* storage,
@@ -120,7 +120,7 @@ int32_t cuteafd_v41_spark_tp6_expert_output_kind(int32_t capacity, uint32_t* out
  * Output may equal shared exactly, but must not overlap any route plane or
  * partially overlap shared; all device storage must outlive stream completion.
  * No allocation or synchronization; returns a CUDA runtime error code. */
-int32_t cuteafd_v41_reduce_routes_async(const float* const planes[4],
+int32_t cuteafd_reduce_routes_async(const float* const planes[4],
     const uint16_t* shared, uint16_t* output, uint32_t rows,
     uint32_t ranks, uint32_t topk, void* stream);
 /* ABI 3 variants expose FP32 token accumulations instead of per-route planes.
@@ -129,26 +129,26 @@ int32_t cuteafd_v41_reduce_routes_async(const float* const planes[4],
 int32_t cuteafd_v41_expert_output_kind(int32_t capacity, uint32_t* out);
 /* Round FP32 [rows,5120] token sums to BF16 without allocation or synchronization.
  * Nonoverlapping storage must remain alive through stream completion. */
-int32_t cuteafd_v41_compact_tokens_bf16_async(const float* tokens,
+int32_t cuteafd_compact_tokens_bf16_async(const float* tokens,
     uint16_t* output, uint32_t rows, void* stream);
 
 /* Compact backbone serving arithmetic: sum six local FP32 route vectors in
  * slot order, then round once to a BF16 hidden-width partial. This differs
  * from per-route TP reduction above. Input [rows,6,5120], output [rows,5120].
  * Storage must not overlap and must remain alive through stream completion. */
-int32_t cuteafd_v41_compact_routes_bf16_async(const float* routes,
+int32_t cuteafd_compact_routes_bf16_async(const float* routes,
     uint16_t* output, uint32_t rows, void* stream);
 /* Sum four compact BF16 partials in rank order in FP32, add optional BF16
  * shared expert and round once to BF16. All planes are [rows,5120].
  * Output must not overlap planes; exact output==shared is permitted, partial
  * overlap is not. Both compact functions allocate nothing and do not sync. */
-int32_t cuteafd_v41_reduce_compact_bf16_async(const uint16_t* const planes[4],
+int32_t cuteafd_reduce_compact_bf16_async(const uint16_t* const planes[4],
     const uint16_t* shared, uint16_t* output, uint32_t rows, void* stream);
 /* TP2 compact equivalent: exactly two BF16 [rows,5120] rank planes, summed
  * in FP32 before optional BF16 shared addition and a single final BF16 rounding.
  * planes is a host array of exactly two device pointers; 1 <= rows <= 4096.
  * Same alias/lifetime rules as TP4 above; no allocation or synchronization. */
-int32_t cuteafd_v41_reduce_tp2_compact_bf16_async(const uint16_t* const planes[2],
+int32_t cuteafd_reduce_tp2_compact_bf16_async(const uint16_t* const planes[2],
     const uint16_t* shared, uint16_t* output, uint32_t rows, void* stream);
 /* Replicated-group compact reduction: sum `ranks` BF16 [rows,5120] physical-rank
  * partial planes in rank order in FP32, add optional BF16 shared exactly once,
@@ -159,39 +159,39 @@ int32_t cuteafd_v41_reduce_tp2_compact_bf16_async(const uint16_t* const planes[2
  * TP2/TP4 entry points (output may equal shared exactly; output must not overlap
  * any plane). 1 <= rows <= 4096. The kernel receives the six pointers by value;
  * no device pointer array and no per-call allocation are used. */
-int32_t cuteafd_v41_reduce_compact_bf16_planes_async(const uint16_t* const planes[6],
+int32_t cuteafd_reduce_compact_bf16_planes_async(const uint16_t* const planes[6],
     const uint16_t* shared, uint16_t* output, uint32_t rows, uint32_t ranks,
     void* stream);
 /* Full local routed output: sum six FP32 routes (token_sums=0) or consume
  * FP32 token sums (token_sums=1), round to BF16, add optional BF16 shared and
  * round to BF16. Output may equal shared exactly; no routed/output overlap.
  * All storage must remain valid through stream completion. */
-int32_t cuteafd_v41_finish_local_experts_async(const float* routed,
+int32_t cuteafd_finish_local_experts_async(const float* routed,
     const uint16_t* shared, uint16_t* output, uint32_t rows,
     uint32_t token_sums, void* stream);
 
 /* NVFP4 local equivalent: BF16 [rows,6,5120] routes accumulated in FP32,
  * rounded to BF16 before optional shared addition. Same alias/lifetime rules. */
-int32_t cuteafd_v41_finish_local_bf16_routes_async(const uint16_t* routed,
+int32_t cuteafd_finish_local_bf16_routes_async(const uint16_t* routed,
     const uint16_t* shared, uint16_t* output, uint32_t rows, void* stream);
 
 /* NVFP4 deterministic route reduction. Inputs are BF16 [rows,6,5120];
  * accumulate six routes (and corresponding TP2 rank pairs) in FP32, with
  * a single final BF16 rounding. 1 <= rows <= 4096; disjoint input/output
  * storage on the current device must remain live through stream completion. */
-int32_t cuteafd_v41_compact_bf16_routes_async(const uint16_t* routes,
+int32_t cuteafd_compact_bf16_routes_async(const uint16_t* routes,
     uint16_t* output, uint32_t rows, void* stream);
-int32_t cuteafd_v41_reduce_tp2_bf16_routes_async(const uint16_t* rank0,
+int32_t cuteafd_reduce_tp2_bf16_routes_async(const uint16_t* rank0,
     const uint16_t* rank1, uint16_t* output, uint32_t rows, void* stream);
 
 // Both FP32 rank contributions must be resident on the current device and ready
 // on this stream. Sum without intermediate rank rounding; emit BF16 once.
-int32_t cuteafd_v41_reduce_tp2_experts_async(const float* rank0, const float* rank1,
+int32_t cuteafd_reduce_tp2_experts_async(const float* rank0, const float* rank1,
     uint16_t* output, uint32_t rows, uint32_t token_sums, void* stream);
 
 // FP32 per-token sum of one rank's FP32 [rows,6,5120] route planes into
 // [rows,5120], adding routes in order 0..5 on this stream.
-int32_t cuteafd_v41_sum_tp2_routes_async(const float* routes, float* sums, uint32_t rows,
+int32_t cuteafd_sum_tp2_routes_async(const float* routes, float* sums, uint32_t rows,
     void* stream);
 #ifdef __cplusplus
 }

@@ -46,12 +46,12 @@ static void launch(void** args, int count) {
 #endif
 #include "{ROOT / 'native/shared/src/v41_experts.cc'}"
 #include <cassert>
-extern "C" int32_t cuteafd_v41_initialize_scratch_storage_async(
+extern "C" int32_t cuteafd_initialize_scratch_storage_async(
     void*, uint64_t, uint64_t, uint64_t, uint32_t, void*) {{ return 0; }}
 int main() {{
   void* kernel=nullptr;
   assert(cuteafd_v41_expert_initialize(16, &kernel) == 0);
-  cuteafd_v41_expert_launch_t args{{}};
+  cuteafd_expert_launch_t args{{}};
   for (auto& p : args.tensors) p = &args;
   args.num_tokens=1; args.scatter_rows=6;
   args.max_rows=32; args.rows_padded=32;

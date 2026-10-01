@@ -72,7 +72,7 @@ pub const CUTEAFD_V41_SAMPLER_STATUS_INTERNAL: u32 = 5;
 /// before it is observable (approved design deviation, see the header).
 pub const CUTEAFD_V41_SAMPLER_NO_DETAIL: u32 = u32::MAX;
 
-/// Per-row flags of `cuteafd_v41_sampler_row_t`.
+/// Per-row flags of `cuteafd_sampler_row_t`.
 pub const CUTEAFD_V41_SAMPLER_FLAG_GREEDY: u32 = 0x1;
 pub const CUTEAFD_V41_SAMPLER_FLAG_DIAGNOSE: u32 = 0x2;
 /// An unconstrained row: the kernel treats every token `< vocab` as allowed and
@@ -144,13 +144,13 @@ impl Default for CuteafdV41SamplerRow {
 pub const CUTEAFD_V41_SAMPLER_NO_MASK_ROW: u32 = u32::MAX;
 
 /// Packed mask words for a vocabulary: `ceil(vocab / 32)` (design §5.2).
-pub const fn cuteafd_v41_sampler_mask_words(vocab: usize) -> usize {
+pub const fn cuteafd_sampler_mask_words(vocab: usize) -> usize {
     vocab.div_ceil(32)
 }
 
 /// Clear every mask bit `>= vocab` in the final word before upload
 /// (design §5.3 rule 2). A no-op when the vocabulary is a multiple of 32.
-pub fn cuteafd_v41_sampler_clear_remainder(words: &mut [u32], vocab: usize) {
+pub fn cuteafd_sampler_clear_remainder(words: &mut [u32], vocab: usize) {
     let remainder = vocab % 32;
     if remainder == 0 || vocab == 0 {
         return;
@@ -4630,33 +4630,33 @@ mod tests {
     /// the design names plus the official checkpoint.
     #[test]
     fn v41_sampler_mask_width_and_remainder_rule() {
-        assert_eq!(cuteafd_v41_sampler_mask_words(1), 1);
-        assert_eq!(cuteafd_v41_sampler_mask_words(32), 1);
-        assert_eq!(cuteafd_v41_sampler_mask_words(33), 2);
-        assert_eq!(cuteafd_v41_sampler_mask_words(100), 4);
-        assert_eq!(cuteafd_v41_sampler_mask_words(127), 4);
-        assert_eq!(cuteafd_v41_sampler_mask_words(129_280), 4_040);
-        assert_eq!(cuteafd_v41_sampler_mask_words(129_281), 4_041);
+        assert_eq!(cuteafd_sampler_mask_words(1), 1);
+        assert_eq!(cuteafd_sampler_mask_words(32), 1);
+        assert_eq!(cuteafd_sampler_mask_words(33), 2);
+        assert_eq!(cuteafd_sampler_mask_words(100), 4);
+        assert_eq!(cuteafd_sampler_mask_words(127), 4);
+        assert_eq!(cuteafd_sampler_mask_words(129_280), 4_040);
+        assert_eq!(cuteafd_sampler_mask_words(129_281), 4_041);
 
         // A checkpoint-width vocabulary has no remainder: leaving the final word
         // alone is the whole rule.
         let mut aligned = vec![u32::MAX; 1];
-        cuteafd_v41_sampler_clear_remainder(&mut aligned, 32);
+        cuteafd_sampler_clear_remainder(&mut aligned, 32);
         assert_eq!(aligned, vec![u32::MAX]);
 
         // vocab 33: bit 0 of the final word is the first out-of-range bit.
         let mut words = vec![u32::MAX; 2];
-        cuteafd_v41_sampler_clear_remainder(&mut words, 33);
+        cuteafd_sampler_clear_remainder(&mut words, 33);
         assert_eq!(words, vec![u32::MAX, 1]);
 
         // vocab 127: 31 real bits in word 3, so only bit 31 is cleared.
         let mut words = vec![u32::MAX; 4];
-        cuteafd_v41_sampler_clear_remainder(&mut words, 127);
+        cuteafd_sampler_clear_remainder(&mut words, 127);
         assert_eq!(words, vec![u32::MAX, u32::MAX, u32::MAX, 0x7FFF_FFFF]);
 
         // vocab 129281: 1 real bit in the fifth word.
         let mut words = vec![u32::MAX; 4041];
-        cuteafd_v41_sampler_clear_remainder(&mut words, 129_281);
+        cuteafd_sampler_clear_remainder(&mut words, 129_281);
         assert_eq!(words[4040], 1);
         assert!(words[..4040].iter().all(|word| *word == u32::MAX));
     }
@@ -5552,7 +5552,7 @@ mod tests {
         }
     }
 
-    /// Host port of the shipped `cuteafd_v41_order_key` (design §4.3).
+    /// Host port of the shipped `cuteafd_order_key` (design §4.3).
     fn v41_order_key(scaled: f32) -> u32 {
         let value = if scaled == 0.0 { 0.0 } else { scaled };
         let bits = value.to_bits();

@@ -25,11 +25,11 @@ const SAMPLING_MAX_MASK_ROWS: usize = 128;
 /// `kBlock` (256) at all: it reports `INTERNAL` for `top_k >= 257` regardless of
 /// the arena. The arena is therefore sized to exactly that supported limit
 /// (`capacity 80 x 256 x 4 B = 80 KiB`, plus 160 KiB u64 staging), and every row
-/// with `top_k >= CUTEAFD_V41_SAMPLING_MAX_RETAINED` is routed to the CPU sampler
+/// with `top_k >= SAMPLING_MAX_RETAINED` is routed to the CPU sampler
 /// **before** the launch rather than materializing a list K5 would refuse. The
 /// alternative — sizing the arena at the full vocabulary — would cost 41 MiB at
 /// capacity 80 to serve a configuration the kernel still rejects.
-pub(crate) const CUTEAFD_V41_SAMPLING_MAX_RETAINED: u32 = 256;
+pub(crate) const SAMPLING_MAX_RETAINED: u32 = 256;
 
 /// Per-row work for one target-sampler launch.
 ///
@@ -388,7 +388,7 @@ impl<'a> TargetSamplingWave<'a> {
     /// supplied together (the FFI validator is all-or-nothing).
     pub(crate) fn rank_order_bytes(capacity: usize) -> usize {
         capacity
-            * CUTEAFD_V41_SAMPLING_MAX_RETAINED as usize
+            * SAMPLING_MAX_RETAINED as usize
             * (std::mem::size_of::<u32>() + std::mem::size_of::<u64>())
     }
     /// Device bytes the sampler adds to the head wave budget (design §11.1).
@@ -418,7 +418,7 @@ impl<'a> TargetSamplingWave<'a> {
             (1..=SAMPLING_MAX_MASK_ROWS).contains(&capacity),
             "sampling capacity must be 1..{SAMPLING_MAX_MASK_ROWS}"
         );
-        let retained = CUTEAFD_V41_SAMPLING_MAX_RETAINED as usize;
+        let retained = SAMPLING_MAX_RETAINED as usize;
         Ok(Self {
             library,
             stages,
@@ -527,7 +527,7 @@ impl<'a> TargetSamplingWave<'a> {
                 let source = slot * self.mask_words;
                 let target = target_row * self.mask_words;
                 let mut words = mask_staging[source..source + self.mask_words].to_vec();
-                cuteafd_ffi::cuteafd_v41_sampler_clear_remainder(&mut words, self.vocab);
+                cuteafd_ffi::cuteafd_sampler_clear_remainder(&mut words, self.vocab);
                 staging[target * 4..(target + self.mask_words) * 4]
                     .copy_from_slice(bytemuck_slice(&words));
                 mask_rows = mask_rows.max(target_row + 1);
@@ -579,7 +579,7 @@ impl<'a> TargetSamplingWave<'a> {
     ///   test, not a wrong token. Skipping them would leave the ordered row's
     ///   `out_indices` at the caller's sentinel.
     /// * `rank_order_capacity` is fixed at
-    ///   [`CUTEAFD_V41_SAMPLING_MAX_RETAINED`] (K5's `kBlock` limit), so the
+    ///   [`SAMPLING_MAX_RETAINED`] (K5's `kBlock` limit), so the
     ///   validator's `capacity >= max top_k` holds for every servable row; a row
     ///   above the limit is routed to the CPU sampler by the caller **before**
     ///   this call rather than enqueued for a kernel that would report
@@ -620,7 +620,7 @@ impl<'a> TargetSamplingWave<'a> {
         )?;
         let mut runs = SamplerStageRuns { prepare: true, topk_select: None, nucleus: false };
         if ordered_rows {
-            let capacity = CUTEAFD_V41_SAMPLING_MAX_RETAINED as usize;
+            let capacity = SAMPLING_MAX_RETAINED as usize;
             self.stages.launcher().launch_topk_select(
                 self.library,
                 logits,

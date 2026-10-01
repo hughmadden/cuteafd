@@ -70,7 +70,7 @@ foreach(entry IN LISTS CUTEAFD_NATIVE_EXPERT_FAMILIES)
     CONTENT "family=${family}\nrole=${role}\nwidth=${CUTEAFD_EXPERT_FAMILY_WIDTH}\natomic_min_capacity=256\n")
   set(renames "")
   foreach(op IN LISTS expert_ops)
-    string(APPEND renames "#define cuteafd_v41_expert_${op} ${symbol}_expert_${op}\n")
+    string(APPEND renames "#define cuteafd_expert_${op} ${symbol}_expert_${op}\n")
   endforeach()
   set(wrapper "${dir}/${family}_${role}_experts.cc")
   file(GENERATE OUTPUT "${wrapper}" CONTENT

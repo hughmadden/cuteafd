@@ -112,7 +112,7 @@ def main():
         for name, types in {
             'cuteafd_v41_expert_input_quant_initialize': [C.POINTER(P)],
             'cuteafd_v41_expert_input_quantize_async': [P, P, P, U, P],
-            'cuteafd_v41_finish_local_experts_async': [P, P, P, U, U, P],
+            'cuteafd_finish_local_experts_async': [P, P, P, U, U, P],
         }.items():
             fn = getattr(lib, name); fn.argtypes = types; fn.restype = C.c_int32
         quant = P(); check(lib.cuteafd_v41_expert_input_quant_initialize(C.byref(quant)))
@@ -122,7 +122,7 @@ def main():
         for expert in range(e):
             sources = [weights[name][expert] for name in ('w1', 'w3', 'w2')]
             sources += [scales[name][expert] for name in ('w1', 'w3', 'w2')]
-            check(lib.cuteafd_v41_pack_expert_async(
+            check(lib.cuteafd_pack_expert_async(
                 (P*6)(*[v.data_ptr() for v in sources]),
                 (P*4)(*[v[expert].data_ptr() for v in native_weights]),
                 n, torch.cuda.current_stream().cuda_stream))
@@ -176,7 +176,7 @@ def main():
                     check(lib.cuteafd_v41_expert_input_quantize_async(
                         quant, x.data_ptr(), wire.data_ptr(), rows, torch.cuda.current_stream().cuda_stream))
                     native.run(rows)
-                    check(lib.cuteafd_v41_finish_local_experts_async(native.output.data_ptr(), None, output.data_ptr(), rows, int(native.token_accumulation), torch.cuda.current_stream().cuda_stream))
+                    check(lib.cuteafd_finish_local_experts_async(native.output.data_ptr(), None, output.data_ptr(), rows, int(native.token_accumulation), torch.cuda.current_stream().cuda_stream))
                     return output
                 context = nullcontext(SimpleNamespace(run=run_native, implementation='native_tp2' if n == 1152 else 'native_spark'))
             elif use_compact and args.candidate_native_lib:
@@ -188,7 +188,7 @@ def main():
                     check(lib.cuteafd_v41_expert_input_quantize_async(
                         quant, x.data_ptr(), candidate_wire.data_ptr(), rows, torch.cuda.current_stream().cuda_stream))
                     candidate_native.run(rows)
-                    check(lib.cuteafd_v41_finish_local_experts_async(candidate_native.output.data_ptr(), None, output.data_ptr(), rows, int(candidate_native.token_accumulation), torch.cuda.current_stream().cuda_stream))
+                    check(lib.cuteafd_finish_local_experts_async(candidate_native.output.data_ptr(), None, output.data_ptr(), rows, int(candidate_native.token_accumulation), torch.cuda.current_stream().cuda_stream))
                     return output
                 context = nullcontext(SimpleNamespace(run=run_candidate_native, implementation='native_compact_tp2' if n == 1152 else 'native_compact_spark', owners=(candidate_native, candidate_wire)))
             elif use_compact:
@@ -206,7 +206,7 @@ def main():
                         max_tokens=rows, num_topk=6, swiglu_limit=10, fast_math=False, native_v41=args.compact_native)
                     route_holder[:] = [routes]
                     if args.compact_native:
-                        check(lib.cuteafd_v41_finish_local_experts_async(routes.data_ptr(), None, output.data_ptr(), rows, 0, torch.cuda.current_stream().cuda_stream))
+                        check(lib.cuteafd_finish_local_experts_async(routes.data_ptr(), None, output.data_ptr(), rows, 0, torch.cuda.current_stream().cuda_stream))
                     else:
                         _w4a16_topk_sum_launch_flat(routes, output, rows, 6, h, 'bf16', torch.cuda.current_stream().cuda_stream)
                     return output

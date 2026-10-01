@@ -8,7 +8,7 @@
  * It is included by `native/shared/cuda/sampling_gpu.cu` (the kernel) and
  * by `native/shared/include/cuteafd_native.h` (the public ABI), so the two can never
  * disagree; it is mirrored by `rust/crates/cuteafd-ffi/src/lib.rs`, which
- * test-pins `sizeof`/offsets/alignment of `cuteafd_v41_sampler_row_t`.
+ * test-pins `sizeof`/offsets/alignment of `cuteafd_sampler_row_t`.
  *
  * Algorithm provenance: the mask predicate, the scale-then-compare order, the
  * `min_p` threshold and the lowest-id tie rule are ports of the frozen CPU
@@ -68,7 +68,7 @@ extern "C" {
  *       false` is the production signal (`constraints.rs`). The remainder rule
  *       stays unconditional and host-enforced: the host always zeroes bits
  *       `>= vocab` of the final word before upload
- *       (`cuteafd_v41_sampler_clear_remainder`), so a whole-word reader is safe
+ *       (`cuteafd_sampler_clear_remainder`), so a whole-word reader is safe
  *       regardless of this bit. */
 #define CUTEAFD_V41_SAMPLER_FLAG_NO_MASK 0x4u
 /* bit3: CPU-oracle cross-check (diagnostic only; unused in production). */
@@ -107,7 +107,7 @@ extern "C" {
 #define CUTEAFD_V41_SAMPLER_NO_MASK_ROW 0xFFFFFFFFu
 
 /* ---- 64-byte per-row parameter block (§5.1), natural alignment ---- */
-typedef struct cuteafd_v41_sampler_row_s {
+typedef struct cuteafd_sampler_row_s {
   uint64_t seed;        /* +0  served request seed, two's complement */
   uint64_t position;    /* +8  absolute emitted-token index */
   float    temperature; /* +16 validated range 0..=2 */
@@ -124,11 +124,11 @@ typedef struct cuteafd_v41_sampler_row_s {
   uint32_t reserved0;   /* +48 must be 0 */
   uint32_t reserved1;   /* +52 must be 0 */
   uint64_t reserved2;   /* +56 must be 0 */
-} cuteafd_v41_sampler_row_t; /* exactly 64 B */
+} cuteafd_sampler_row_t; /* exactly 64 B */
 
 /* ---- `params` residency ---- */
 /* `params` MUST point at device memory holding `rows` consecutive
- * `cuteafd_v41_sampler_row_t` blocks: the kernel dereferences
+ * `cuteafd_sampler_row_t` blocks: the kernel dereferences
  * `params[blockIdx.x]` on device. A pageable host address is not
  * device-addressable under CUDA's documented model, even on a platform whose
  * driver happens to expose it, so the host must H2D-copy the block first. The
@@ -137,7 +137,7 @@ typedef struct cuteafd_v41_sampler_row_s {
  * slice it validates. */
 
 /* ---- Per-row K1 scratch, 64-byte stride (§11.1) ---- */
-typedef struct cuteafd_v41_sampler_scratch_s {
+typedef struct cuteafd_sampler_scratch_s {
   float    max_scaled;        /* +0  max over ALLOWED tokens (stochastic) */
   float    inv_temperature;   /* +4  1.0f / temperature, exactly as the CPU */
   uint32_t allowed_count;     /* +8  allowed tokens (0 -> EMPTY_CANDIDATES) */
@@ -152,7 +152,7 @@ typedef struct cuteafd_v41_sampler_scratch_s {
   uint32_t reserved2;         /* +48 must be 0 */
   uint32_t reserved3;         /* +52 must be 0 */
   uint64_t reserved4;         /* +56 must be 0 */
-} cuteafd_v41_sampler_scratch_t; /* exactly 64 B */
+} cuteafd_sampler_scratch_t; /* exactly 64 B */
 
 /* Byte layout of one row's scratch region. Exposed as macros so the Rust
  * planner and the C ABI test can pin the same numbers. */
@@ -184,13 +184,13 @@ typedef struct cuteafd_v41_sampler_scratch_s {
  * The host must additionally zero the bits `>= vocab` of the final word before
  * upload (§5.3 rule 2); every kernel loop is bounded by `vocab` (rule 1), so a
  * token id `>= vocab` can never be produced (rule 3). */
-static inline size_t cuteafd_v41_sampler_mask_words(size_t vocab) {
+static inline size_t cuteafd_sampler_mask_words(size_t vocab) {
   return (vocab + 31u) / 32u;
 }
 
 /* Apply §5.3 rule 2 to a host mask row in place: clear every bit `>= vocab` of
- * the final word. `words` must be `cuteafd_v41_sampler_mask_words(vocab)`. */
-static inline void cuteafd_v41_sampler_clear_remainder(uint32_t* words, size_t vocab) {
+ * the final word. `words` must be `cuteafd_sampler_mask_words(vocab)`. */
+static inline void cuteafd_sampler_clear_remainder(uint32_t* words, size_t vocab) {
   const size_t remainder = vocab % 32u;
   if (remainder == 0u || vocab == 0u) {
     return;
@@ -220,7 +220,7 @@ static inline void cuteafd_v41_sampler_clear_remainder(uint32_t* words, size_t v
 #define CUTEAFD_V41_SAMPLER_RNG_MUL 0x9e3779b97f4a7c15ull
 
 #if defined(__CUDACC__)
-__device__ __forceinline__ float cuteafd_v41_target_uniform(uint64_t seed, uint64_t position) {
+__device__ __forceinline__ float cuteafd_target_uniform(uint64_t seed, uint64_t position) {
   uint64_t mixed = seed + CUTEAFD_V41_SAMPLER_RNG_DOMAIN +
                    position * CUTEAFD_V41_SAMPLER_RNG_MUL + CUTEAFD_V41_SAMPLER_RNG_MUL;
   mixed = (mixed ^ (mixed >> 30)) * 0xbf58476d1ce4e5b9ull;
@@ -232,7 +232,7 @@ __device__ __forceinline__ float cuteafd_v41_target_uniform(uint64_t seed, uint6
 
 /* The clamp of design §4.8 / §6.1, in the exact CPU order
  * (`MAX_UNIFORM.min(uniform.max(0.0))`). */
-__device__ __forceinline__ float cuteafd_v41_target_clamp_uniform(float uniform) {
+__device__ __forceinline__ float cuteafd_target_clamp_uniform(float uniform) {
   return fminf(fmaxf(uniform, 0.0f), __uint_as_float(CUTEAFD_V41_SAMPLER_MAX_UNIFORM_BITS));
 }
 
@@ -253,7 +253,7 @@ __device__ __forceinline__ float cuteafd_v41_target_clamp_uniform(float uniform)
  *
  * These live in the header (under `__CUDACC__`) because the device tests and
  * any later chunk (K5) must call the *shipped* primitive, never a copy. */
-__device__ __forceinline__ uint32_t cuteafd_v41_order_key(float scaled) {
+__device__ __forceinline__ uint32_t cuteafd_order_key(float scaled) {
   /* Canonicalize -0.0 so both zeroes map to one key, exactly as
    * `descending_radix_key` does (`target_sampling.rs:336`). */
   const float value = (scaled == 0.0f) ? 0.0f : scaled;
@@ -261,12 +261,12 @@ __device__ __forceinline__ uint32_t cuteafd_v41_order_key(float scaled) {
   return ((bits & 0x80000000u) != 0u) ? ~bits : (bits ^ 0x80000000u);
 }
 
-/* Inverse of `cuteafd_v41_order_key` on the canonical f32 bit patterns: the float
+/* Inverse of `cuteafd_order_key` on the canonical f32 bit patterns: the float
  * whose order key is `key`. Used only to publish `scratch.kth_value_bits` in the
  * design's §4.3 spelling (the *value bits* of the k-th value) and to feed K4's
  * tie predicate; `order_key(ordered_value(key)) == key` for every key produced
  * by `order_key`, and the k-th value is always a survivor's scaled value. */
-__device__ __forceinline__ float cuteafd_v41_ordered_value(uint32_t key) {
+__device__ __forceinline__ float cuteafd_ordered_value(uint32_t key) {
   const uint32_t bits =
       ((key & 0x80000000u) != 0u) ? (key ^ 0x80000000u) : ~key;
   return __uint_as_float(bits);
@@ -274,7 +274,7 @@ __device__ __forceinline__ float cuteafd_v41_ordered_value(uint32_t key) {
 #endif
 
 /* Lower `16 * CUTEAFD_V41_SAMPLER_ROW_PARAM_OFFSET_<field>` is the field's byte
- * offset inside `cuteafd_v41_sampler_row_t`; the Rust ABI test pins these. */
+ * offset inside `cuteafd_sampler_row_t`; the Rust ABI test pins these. */
 #define CUTEAFD_V41_SAMPLER_ROW_PARAM_OFFSET_SEED 0u
 #define CUTEAFD_V41_SAMPLER_ROW_PARAM_OFFSET_POSITION 8u
 #define CUTEAFD_V41_SAMPLER_ROW_PARAM_OFFSET_TEMPERATURE 16u
@@ -295,7 +295,7 @@ __device__ __forceinline__ float cuteafd_v41_ordered_value(uint32_t key) {
  * `logits_stride` floats (>= vocab). `params` is `rows` 64-byte blocks.
  * `mask_words` is nullable; when non-null it is `rows * mask_words_per_row`
  * packed u32 words and `mask_words_per_row` must equal
- * `cuteafd_v41_sampler_mask_words(vocab)`.
+ * `cuteafd_sampler_mask_words(vocab)`.
  *
  * `out_indices`, `out_status`, `out_status_detail`, `out_scores` and
  * `scratch` are required; `out_total` and `out_nucleus_count` may be null.
@@ -311,17 +311,17 @@ __device__ __forceinline__ float cuteafd_v41_ordered_value(uint32_t key) {
  */
 cuteafd_status_t cuteafd_cuda_v41_target_sample_async(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, uint32_t* out_indices, uint32_t* out_status,
     uint32_t* out_status_detail, float* out_scores, float* out_total,
-    uint32_t* out_nucleus_count, cuteafd_v41_sampler_scratch_t* scratch,
+    uint32_t* out_nucleus_count, cuteafd_sampler_scratch_t* scratch,
     void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_v41_target_sample(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, uint32_t* out_indices, uint32_t* out_status,
     uint32_t* out_status_detail, float* out_scores, float* out_total,
-    uint32_t* out_nucleus_count, cuteafd_v41_sampler_scratch_t* scratch);
+    uint32_t* out_nucleus_count, cuteafd_sampler_scratch_t* scratch);
 
 /* ====================================================================== */
 /* Chunk 3a: K3 pivot selection + K4 exact-k membership (design §4.3-§4.4) */
@@ -385,18 +385,18 @@ cuteafd_status_t cuteafd_cuda_v41_target_sample(
 
 cuteafd_status_t cuteafd_cuda_v41_topk_select_async(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, uint32_t* rank_order_ids,
     uint64_t* rank_order_scratch, size_t rank_order_capacity,
     uint32_t* out_retained_count, uint32_t* out_pivot_passes,
-    cuteafd_v41_sampler_scratch_t* scratch, void* cuda_stream);
+    cuteafd_sampler_scratch_t* scratch, void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_v41_topk_select(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, uint32_t* rank_order_ids,
     uint64_t* rank_order_scratch, size_t rank_order_capacity,
     uint32_t* out_retained_count, uint32_t* out_pivot_passes,
-    cuteafd_v41_sampler_scratch_t* scratch);
+    cuteafd_sampler_scratch_t* scratch);
 
 /* ====================================================================== */
 /* Chunk 3b: K5 inclusive-prefix top-p nucleus + rank-order draw          */
@@ -508,19 +508,19 @@ cuteafd_status_t cuteafd_cuda_v41_topk_select(
 
 cuteafd_status_t cuteafd_cuda_v41_nucleus_async(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, const uint32_t* rank_order_ids,
     size_t rank_order_capacity, const uint32_t* rank_retained_count,
     uint32_t* out_indices, uint32_t* out_status, float* out_total,
-    uint32_t* out_nucleus_count, cuteafd_v41_sampler_scratch_t* scratch,
+    uint32_t* out_nucleus_count, cuteafd_sampler_scratch_t* scratch,
     void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_v41_nucleus(
     const float* logits, size_t rows, size_t vocab, size_t logits_stride,
-    const cuteafd_v41_sampler_row_t* params, const uint32_t* mask_words,
+    const cuteafd_sampler_row_t* params, const uint32_t* mask_words,
     size_t mask_words_per_row, const uint32_t* rank_order_ids,
     size_t rank_order_capacity, const uint32_t* rank_retained_count,
     uint32_t* out_indices, uint32_t* out_status, float* out_total,
-    uint32_t* out_nucleus_count, cuteafd_v41_sampler_scratch_t* scratch);
+    uint32_t* out_nucleus_count, cuteafd_sampler_scratch_t* scratch);
 
 #ifdef __cplusplus
 } /* extern "C" */

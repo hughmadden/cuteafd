@@ -763,7 +763,7 @@ def exporter_weight_elements(experts: int, kernel_intermediate: int):
 def native_packer_bytes(intermediate: int, experts: int, hidden: int = HIDDEN):
     """Per-expert bytes from the native packer's own size function.
 
-    Source: native/shared/cuda/expert_pack.cu, `cuteafd_v41_expert_packed_sizes`:
+    Source: native/shared/cuda/expert_pack.cu, `cuteafd_expert_packed_sizes`:
         padded = align_up(intermediate, 128)
         bytes  = [padded*hidden, padded*hidden/16, hidden*padded/2,
                   hidden*padded/32]

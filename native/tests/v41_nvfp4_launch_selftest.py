@@ -103,7 +103,7 @@ def main():
                  h * (n // 2), ceil_to(h, 128) * ceil_to(n // 16, 4)]
         scale_byte = 0x38  # E4M3 1.0
     else:
-        sizes_fn = lib.cuteafd_v41_expert_packed_sizes
+        sizes_fn = lib.cuteafd_expert_packed_sizes
         sizes_fn.argtypes = [C.c_uint32, C.POINTER(C.c_uint64)]
         sizes_fn.restype = C.c_int32
         packed = (C.c_uint64 * 4)()

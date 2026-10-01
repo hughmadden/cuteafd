@@ -166,7 +166,7 @@ def main():
             src = (P * 6)(*[x.data_ptr() for x in sources])
             dst = (P * 4)(*[x[expert].data_ptr() for x in weights])
             check(
-                lib.cuteafd_v41_pack_expert_async(
+                lib.cuteafd_pack_expert_async(
                     src, dst, 576, torch.cuda.current_stream().cuda_stream
                 )
             )
@@ -356,7 +356,7 @@ def main():
                 ac = torch.empty(rows, 5120, device="cuda", dtype=torch.bfloat16)
                 bc = torch.empty_like(ac)
                 check(
-                    lib.cuteafd_v41_compact_routes_bf16_async(
+                    lib.cuteafd_compact_routes_bf16_async(
                         base.data_ptr(),
                         ac.data_ptr(),
                         rows,
@@ -364,7 +364,7 @@ def main():
                     )
                 )
                 check(
-                    lib.cuteafd_v41_compact_routes_bf16_async(
+                    lib.cuteafd_compact_routes_bf16_async(
                         candidate.data_ptr(),
                         bc.data_ptr(),
                         rows,

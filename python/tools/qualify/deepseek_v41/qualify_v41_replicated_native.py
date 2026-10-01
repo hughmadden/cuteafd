@@ -72,7 +72,7 @@ from v41_spark_tp3_launch_geometry import LaunchGeometryError, manifest_geometry
 # (I=384). TP2/TP3/TP6 are unpadded; the legacy TP4 shard stores 640 for a 576
 # logical intermediate.
 SPARK_TP_INTERMEDIATE = {2: 1152, 3: 768, 6: 384}
-# Native `cuteafd_v41_expert_info_t.role` per TP degree, and the per-rank storage
+# Native `cuteafd_expert_info_t.role` per TP degree, and the per-rank storage
 # extent that role's exported variants must declare.
 SPARK_TP_ROLE = {2: 5, 3: 6, 6: 7}
 SPARK_TP_KERNEL_INTERMEDIATE = {2: 1152, 3: 768, 6: 384}
@@ -475,12 +475,12 @@ def _oracle_compact_mask_checks(torch_module, lib, native, wire, x, weights, sca
     bf16_expected = expected.bfloat16().float()
     compact = torch_module.empty((rows, 5120), device="cuda", dtype=torch_module.bfloat16)
     if native.token_accumulation:
-        check(lib.cuteafd_v41_compact_tokens_bf16_async(
+        check(lib.cuteafd_compact_tokens_bf16_async(
             native.output[:rows].data_ptr(), compact.data_ptr(), rows,
             torch_module.cuda.current_stream().cuda_stream))
     else:
         routes = native.output[:rows * topk].contiguous()
-        check(lib.cuteafd_v41_compact_routes_bf16_async(
+        check(lib.cuteafd_compact_routes_bf16_async(
             routes.data_ptr(), compact.data_ptr(), rows,
             torch_module.cuda.current_stream().cuda_stream))
     torch_module.cuda.synchronize()
@@ -760,11 +760,11 @@ def _run_timing(options, torch_module, lib, arena, intermediate, role, gids, bas
         def compact_launch(rows):
             """The worker's production BF16 compaction on the native FP32 output."""
             if native.token_accumulation:
-                check(lib.cuteafd_v41_compact_tokens_bf16_async(
+                check(lib.cuteafd_compact_tokens_bf16_async(
                     native.output[:rows].data_ptr(), compact.data_ptr(), rows,
                     torch_module.cuda.current_stream().cuda_stream))
             else:
-                check(lib.cuteafd_v41_compact_routes_bf16_async(
+                check(lib.cuteafd_compact_routes_bf16_async(
                     native.output[:rows * topk].data_ptr(), compact.data_ptr(), rows,
                     torch_module.cuda.current_stream().cuda_stream))
         # Every (capacity, rows) pair this variant covers; rows are never clamped.
@@ -986,7 +986,7 @@ def run_checkpoint(options, torch_module, lib):
         scales[name] = torch_module.stack(scale_rows)
 
     sizes = (L * 4)()
-    check(lib.cuteafd_v41_expert_packed_sizes(intermediate, sizes))
+    check(lib.cuteafd_expert_packed_sizes(intermediate, sizes))
     per = [int(sizes[i]) for i in range(4)]
     arena = [torch_module.zeros(ARENA_EXPERTS * per[i], dtype=torch_module.uint8,
                                 device="cuda") for i in range(4)]
@@ -998,7 +998,7 @@ def run_checkpoint(options, torch_module, lib):
             weights["w2"][k].data_ptr(), scales["w1"][k].data_ptr(),
             scales["w3"][k].data_ptr(), scales["w2"][k].data_ptr()])
         dst = (P * 4)(*[arena[i].data_ptr() + slot * per[i] for i in range(4)])
-        check(lib.cuteafd_v41_pack_expert_async(src, dst, intermediate, stream))
+        check(lib.cuteafd_pack_expert_async(src, dst, intermediate, stream))
     torch_module.cuda.synchronize()
 
     # Cross-check the native packer against the b12x repack the Python pipeline

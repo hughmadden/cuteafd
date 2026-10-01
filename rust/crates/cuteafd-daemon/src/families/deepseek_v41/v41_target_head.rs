@@ -23,7 +23,7 @@ const SAMPLING_VOCAB: usize = 129_280;
 const SAMPLING_MASK_WORDS: usize = SAMPLING_VOCAB.div_ceil(32);
 
 pub(crate) use crate::shared::sampler::{
-    SampledTargetRows, TargetSamplingRowRequest, TargetSamplingWave, CUTEAFD_V41_SAMPLING_MAX_RETAINED,
+    SampledTargetRows, TargetSamplingRowRequest, TargetSamplingWave, SAMPLING_MAX_RETAINED,
 };
 #[cfg(test)]
 use cuteafd_ffi::CuteafdV41SamplerRow;
@@ -589,7 +589,7 @@ mod sampling_budget_tests {
     /// to `kBlock` cannot silently desynchronize the two.
     #[test]
     fn rank_order_arena_covers_exactly_the_supported_retained_width() {
-        assert_eq!(CUTEAFD_V41_SAMPLING_MAX_RETAINED, 256);
+        assert_eq!(SAMPLING_MAX_RETAINED, 256);
         // 80 rows x 256 ids x (4 + 8) bytes = 240 KiB.
         assert_eq!(TargetSamplingWave::rank_order_bytes(80), 80 * 256 * 12);
         assert_eq!(TargetSamplingWave::rank_order_bytes(1), 256 * 12);
@@ -1075,7 +1075,7 @@ mod sampler_wiring_tests {
             let logits_buffer = library.alloc_device_buffer(rows * vocab * 4).unwrap();
             let values = logits(rows, vocab);
             library.copy_h2d(logits_buffer, &logit_bytes(&values)).unwrap();
-            wave.upload(&plan.rows, Some(arena), cuteafd_ffi::cuteafd_v41_sampler_mask_words(vocab),
+            wave.upload(&plan.rows, Some(arena), cuteafd_ffi::cuteafd_sampler_mask_words(vocab),
                 std::ptr::null_mut()).unwrap();
             wave.launch(logits_buffer, rows, plan.routes_need_ordered_tail(),
                 std::ptr::null_mut()).unwrap();
@@ -1522,7 +1522,7 @@ mod sampler_device_tests {
     fn mask_excluding(rows: usize, excluded: &[u32]) -> Vec<u32> {
         let words = VOCAB.div_ceil(32);
         let mut arena = vec![u32::MAX; rows * words];
-        cuteafd_ffi::cuteafd_v41_sampler_clear_remainder(&mut arena, VOCAB);
+        cuteafd_ffi::cuteafd_sampler_clear_remainder(&mut arena, VOCAB);
         for (row, &token) in excluded.iter().enumerate() {
             arena[row * words + token as usize / 32] &= !(1u32 << (token % 32));
         }
@@ -2176,7 +2176,7 @@ mod sampler_device_tests {
         for &token in tokens {
             words[token as usize / 32] |= 1u32 << (token % 32);
         }
-        cuteafd_ffi::cuteafd_v41_sampler_clear_remainder(&mut words, VOCAB);
+        cuteafd_ffi::cuteafd_sampler_clear_remainder(&mut words, VOCAB);
         words
     }
 
@@ -2361,7 +2361,7 @@ mod sampler_device_tests {
         let mut staged = StagedWave::new(&library, rows, &values, &plan, Some(&arena))?;
         let stages = staged.wave.last_stages();
         assert!(stages.prepare, "K1 always runs");
-        assert_eq!(stages.topk_select, Some(CUTEAFD_V41_SAMPLING_MAX_RETAINED as usize),
+        assert_eq!(stages.topk_select, Some(SAMPLING_MAX_RETAINED as usize),
             "one ordered row forces K3/K4");
         assert!(stages.nucleus, "one ordered row forces K5");
         let sampled = staged.output()?;

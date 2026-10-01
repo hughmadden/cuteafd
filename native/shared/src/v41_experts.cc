@@ -1,4 +1,16 @@
-#include "cuteafd_v41_experts.h"
+// Routed-expert role ABI shared by every family. A role wrapper #defines the
+// six cuteafd_expert_* entry points to its own names (cuteafd_{family}[_{role}]
+// _expert_*, see cmake/shared/expert_families.cmake and the V4.1 role wrappers)
+// before including this file; a bare build is the V4.1 Spark TP4 shard.
+#ifndef cuteafd_expert_info
+#define cuteafd_expert_info cuteafd_v41_expert_info
+#define cuteafd_expert_initialize cuteafd_v41_expert_initialize
+#define cuteafd_expert_output_kind cuteafd_v41_expert_output_kind
+#define cuteafd_expert_bind_scratch cuteafd_v41_expert_bind_scratch
+#define cuteafd_expert_initialize_scratch_async cuteafd_v41_expert_initialize_scratch_async
+#define cuteafd_expert_launch cuteafd_v41_expert_launch
+#endif
+#include "cuteafd_experts.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstddef>
@@ -34,15 +46,15 @@
 #define CUTEAFD_V41_OUTPUT_KIND(capacity) 0
 #endif
 
-static_assert(sizeof(cuteafd_v41_expert_info_t) == 64);
-static_assert(sizeof(cuteafd_v41_expert_launch_t) == 392);
-static_assert(offsetof(cuteafd_v41_expert_launch_t, stream) == 384);
+static_assert(sizeof(cuteafd_expert_info_t) == 64);
+static_assert(sizeof(cuteafd_expert_launch_t) == 392);
+static_assert(offsetof(cuteafd_expert_launch_t, stream) == 384);
 
 namespace {
 using ModuleFn = void (*)(void**);
 using LaunchFn = void (*)(void**, int32_t);
 struct Variant {
-  cuteafd_v41_expert_info_t info;
+  cuteafd_expert_info_t info;
   ModuleFn initialize;
   ModuleFn load;
   LaunchFn launch;
@@ -90,10 +102,10 @@ Variant* by_capacity(int32_t capacity) {
 }
 }
 
-extern "C" int32_t cuteafd_v41_initialize_scratch_storage_async(
+extern "C" int32_t cuteafd_initialize_scratch_storage_async(
     void*, uint64_t, uint64_t, uint64_t, uint32_t, void*);
 
-extern "C" int32_t cuteafd_v41_expert_bind_scratch(void* kernel, void* storage,
+extern "C" int32_t cuteafd_expert_bind_scratch(void* kernel, void* storage,
     uint64_t bytes, void* tensors[CUTEAFD_V41_EXPERT_POINTERS]) {
   auto* variant = by_handle(kernel);
   if (!valid_scratch(variant, storage, bytes) || !tensors) return cudaErrorInvalidValue;
@@ -109,7 +121,7 @@ extern "C" int32_t cuteafd_v41_expert_bind_scratch(void* kernel, void* storage,
   return cudaSuccess;
 }
 
-extern "C" int32_t cuteafd_v41_expert_initialize_scratch_async(void* kernel,
+extern "C" int32_t cuteafd_expert_initialize_scratch_async(void* kernel,
     void* storage, uint64_t bytes, void* stream) {
   auto* variant = by_handle(kernel);
   if (!valid_scratch(variant, storage, bytes)) return cudaErrorInvalidValue;
@@ -117,19 +129,19 @@ extern "C" int32_t cuteafd_v41_expert_initialize_scratch_async(void* kernel,
   auto status = cudaGetDevice(&device);
   if (status != cudaSuccess) return status;
   if (device != variant->device) return cudaErrorInvalidDevice;
-  return cuteafd_v41_initialize_scratch_storage_async(storage, variant->info.scratch_bytes,
+  return cuteafd_initialize_scratch_storage_async(storage, variant->info.scratch_bytes,
       variant->scratch_offsets[37], variant->scratch_offsets[40],
       variant->info.experts, stream);
 }
 
-extern "C" int32_t cuteafd_v41_expert_info(int32_t capacity, cuteafd_v41_expert_info_t* out) {
+extern "C" int32_t cuteafd_expert_info(int32_t capacity, cuteafd_expert_info_t* out) {
   auto* variant = by_capacity(capacity);
   if (!variant || !out) return cudaErrorInvalidValue;
   *out = variant->info;
   return cudaSuccess;
 }
 
-extern "C" int32_t cuteafd_v41_expert_output_kind(int32_t capacity, uint32_t* out) {
+extern "C" int32_t cuteafd_expert_output_kind(int32_t capacity, uint32_t* out) {
   auto* variant = by_capacity(capacity);
   if (!variant || !out) return cudaErrorInvalidValue;
   *out = CUTEAFD_V41_OUTPUT_KIND(capacity);
@@ -149,7 +161,7 @@ int32_t reject_expert_device(const char* what, int device, int major, int minor,
   return cudaErrorInvalidDevice;
 }
 }  // namespace
-extern "C" int32_t cuteafd_v41_expert_initialize(int32_t capacity, void** out) {
+extern "C" int32_t cuteafd_expert_initialize(int32_t capacity, void** out) {
   if (!out) return cudaErrorInvalidValue;
   *out = nullptr;
   auto* variant = by_capacity(capacity);
@@ -209,7 +221,7 @@ extern "C" int32_t cuteafd_v41_expert_initialize(int32_t capacity, void** out) {
   return cudaSuccess;
 }
 
-extern "C" int32_t cuteafd_v41_expert_launch(void* kernel, const cuteafd_v41_expert_launch_t* args) {
+extern "C" int32_t cuteafd_expert_launch(void* kernel, const cuteafd_expert_launch_t* args) {
   Variant* variant = by_handle(kernel);
   if (!variant || !args || variant->device < 0) return cudaErrorInvalidValue;
   const auto& info = variant->info;

@@ -37,7 +37,7 @@ def main():
     a = p.parse_args()
     torch.manual_seed(413264 + a.rank)
     libs = {'baseline': library(str(a.baseline_lib)), 'candidate': library(str(a.candidate_lib))}
-    token_cast = libs['candidate'].cuteafd_v41_compact_tokens_bf16_async
+    token_cast = libs['candidate'].cuteafd_compact_tokens_bf16_async
     token_cast.argtypes = [P, P, U, P]
     token_cast.restype = I
     query = libs['candidate'].cuteafd_v41_expert_output_kind
@@ -67,7 +67,7 @@ def main():
                 else:
                     part = raw[a.rank * 576:(a.rank + 1) * 576]
                 sources.append(part.contiguous().cuda())
-            check(libs['baseline'].cuteafd_v41_pack_expert_async(
+            check(libs['baseline'].cuteafd_pack_expert_async(
                 (P * 6)(*[x.data_ptr() for x in sources]),
                 (P * 4)(*[x[expert].data_ptr() for x in weights]), 576,
                 torch.cuda.current_stream().cuda_stream))

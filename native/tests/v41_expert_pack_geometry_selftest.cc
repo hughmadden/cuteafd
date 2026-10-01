@@ -41,7 +41,7 @@
 //
 // Requires a CUDA device; exits 77 (ctest SKIP) when none is present, or 1 when
 // CUTEAFD_REQUIRE_CUDA is set (so a scheduled gate cannot pass by skipping).
-#include "cuteafd_v41_experts.h"
+#include "cuteafd_experts.h"
 
 #include <cuda_runtime.h>
 
@@ -393,7 +393,7 @@ int main() {
     const uint32_t intermediate = item.intermediate;
     const std::string name = item.name;
     uint64_t sizes[4] = {};
-    require(cuteafd_v41_expert_packed_sizes(intermediate, sizes) == cudaSuccess,
+    require(cuteafd_expert_packed_sizes(intermediate, sizes) == cudaSuccess,
             name + ": packer rejected the extent");
 
     const uint64_t weight_bytes = uint64_t(intermediate) * kHidden / 2;
@@ -415,7 +415,7 @@ int main() {
     for (int i = 0; i < 4; ++i)
       check_cuda(cudaMalloc(reinterpret_cast<void**>(&destinations[i]), sizes[i]),
                  "cudaMalloc destination");
-    require(cuteafd_v41_pack_expert_async(sources, destinations, intermediate,
+    require(cuteafd_pack_expert_async(sources, destinations, intermediate,
                                          nullptr) == cudaSuccess,
             name + ": pack launch failed");
     check_cuda(cudaStreamSynchronize(nullptr), "synchronize");

@@ -8,7 +8,7 @@ pub struct V41Bf16Add<'a> { _library: &'a NativeLibrary, launch: AddFn }
 impl NativeLibrary {
     pub fn v41_bf16_add(&self) -> Result<V41Bf16Add<'_>> {
         Ok(V41Bf16Add { _library: self,
-            launch: unsafe { *self.lib.get(b"cuteafd_v41_add_tp2_shared_async")? } })
+            launch: unsafe { *self.lib.get(b"cuteafd_add_tp2_shared_async")? } })
     }
 }
 impl V41Bf16Add<'_> {
@@ -38,10 +38,10 @@ type PeerRowsFn = unsafe extern "C" fn(*mut c_void,*const c_void,u64,u64,u64,u64
 pub struct V41PeerCopy<'a> { _library: &'a NativeLibrary, launch: PeerCopyFn, rows: PeerRowsFn }
 impl NativeLibrary {
     pub fn v41_peer_copy(&self) -> Result<V41PeerCopy<'_>> {
-        let initialize=unsafe { *self.lib.get::<unsafe extern "C" fn()->i32>(b"cuteafd_v41_peer_copy_initialize")? };
+        let initialize=unsafe { *self.lib.get::<unsafe extern "C" fn()->i32>(b"cuteafd_peer_copy_initialize")? };
         ensure!(unsafe { initialize() }==0,"peer copy initialization failed");
-        Ok(V41PeerCopy { _library:self,launch:unsafe { *self.lib.get(b"cuteafd_v41_peer_copy_async")? },
-            rows:unsafe { *self.lib.get(b"cuteafd_v41_peer_copy_rows_async")? } })
+        Ok(V41PeerCopy { _library:self,launch:unsafe { *self.lib.get(b"cuteafd_peer_copy_async")? },
+            rows:unsafe { *self.lib.get(b"cuteafd_peer_copy_rows_async")? } })
     }
 }
 impl V41PeerCopy<'_> {

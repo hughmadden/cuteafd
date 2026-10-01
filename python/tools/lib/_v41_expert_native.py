@@ -111,10 +111,10 @@ def library(path, *, local=False, tp2=False, spark_tp=None):
         "cuteafd_v41_expert_bind_scratch": [P, P, L, C.POINTER(P)],
         "cuteafd_v41_expert_initialize_scratch_async": [P, P, L, P],
         "cuteafd_v41_expert_launch": [P, C.POINTER(Launch)],
-        "cuteafd_v41_expert_packed_sizes": [U, C.POINTER(L)],
-        "cuteafd_v41_pack_expert_async": [C.POINTER(P), C.POINTER(P), U, P],
-        "cuteafd_v41_compact_routes_bf16_async": [P, P, U, P],
-        "cuteafd_v41_compact_tokens_bf16_async": [P, P, U, P],
+        "cuteafd_expert_packed_sizes": [U, C.POINTER(L)],
+        "cuteafd_pack_expert_async": [C.POINTER(P), C.POINTER(P), U, P],
+        "cuteafd_compact_routes_bf16_async": [P, P, U, P],
+        "cuteafd_compact_tokens_bf16_async": [P, P, U, P],
     }.items():
         selected = namespaced_symbol(name, prefix)
         fn = getattr(lib, selected)

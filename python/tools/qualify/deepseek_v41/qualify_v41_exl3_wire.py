@@ -40,14 +40,14 @@ def main() -> None:
     wire=wire_owner[32:-32].view(capacity,5280)
     output=out_owner[32:-32].view(torch.bfloat16).view(capacity,5120)
     lib=ct.CDLL(str(args.library))
-    lib.cuteafd_v41_exl3_wire_initialize.argtypes=[ct.POINTER(ct.c_void_p)]
-    lib.cuteafd_v41_exl3_wire_initialize.restype=ct.c_int
-    lib.cuteafd_v41_exl3_wire_destroy.argtypes=[ct.c_void_p]
-    lib.cuteafd_v41_exl3_wire_decode.argtypes=[ct.c_void_p,ct.c_void_p,ct.c_uint64,ct.c_void_p,ct.c_uint64,ct.c_uint32,ct.c_void_p]
-    lib.cuteafd_v41_exl3_wire_decode.restype=ct.c_int
-    context=ct.c_void_p();assert lib.cuteafd_v41_exl3_wire_initialize(ct.byref(context))==0
+    lib.cuteafd_exl3_wire_initialize.argtypes=[ct.POINTER(ct.c_void_p)]
+    lib.cuteafd_exl3_wire_initialize.restype=ct.c_int
+    lib.cuteafd_exl3_wire_destroy.argtypes=[ct.c_void_p]
+    lib.cuteafd_exl3_wire_decode.argtypes=[ct.c_void_p,ct.c_void_p,ct.c_uint64,ct.c_void_p,ct.c_uint64,ct.c_uint32,ct.c_void_p]
+    lib.cuteafd_exl3_wire_decode.restype=ct.c_int
+    context=ct.c_void_p();assert lib.cuteafd_exl3_wire_initialize(ct.byref(context))==0
     def launch(rows,input_bytes=wire.numel(),out_ptr=output.data_ptr()):
-        return lib.cuteafd_v41_exl3_wire_decode(context,wire.data_ptr(),input_bytes,out_ptr,output.numel()*2,rows,torch.cuda.current_stream().cuda_stream)
+        return lib.cuteafd_exl3_wire_decode(context,wire.data_ptr(),input_bytes,out_ptr,output.numel()*2,rows,torch.cuda.current_stream().cuda_stream)
     def reference(rows):
         values=wire[:rows,:5120].contiguous().view(torch.float8_e4m3fn).float()
         scales=wire[:rows,5120:].int()
@@ -100,7 +100,7 @@ def main() -> None:
     finally:
         torch.cuda.synchronize()
         del graph
-        lib.cuteafd_v41_exl3_wire_destroy(context)
+        lib.cuteafd_exl3_wire_destroy(context)
 
 
 if __name__=='__main__':main()

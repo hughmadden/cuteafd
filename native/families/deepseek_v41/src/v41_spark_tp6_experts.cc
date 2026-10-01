@@ -5,10 +5,10 @@
 // intermediate 2304 splits evenly across six ranks, so the local shard is 384
 // with no storage padding (kernel_intermediate == intermediate == 384).
 #define CUTEAFD_V41_SPARK_TP6_EXPERTS 1
-#define cuteafd_v41_expert_info cuteafd_v41_spark_tp6_expert_info
-#define cuteafd_v41_expert_initialize cuteafd_v41_spark_tp6_expert_initialize
-#define cuteafd_v41_expert_output_kind cuteafd_v41_spark_tp6_expert_output_kind
-#define cuteafd_v41_expert_bind_scratch cuteafd_v41_spark_tp6_expert_bind_scratch
-#define cuteafd_v41_expert_initialize_scratch_async cuteafd_v41_spark_tp6_expert_initialize_scratch_async
-#define cuteafd_v41_expert_launch cuteafd_v41_spark_tp6_expert_launch
+#define cuteafd_expert_info cuteafd_v41_spark_tp6_expert_info
+#define cuteafd_expert_initialize cuteafd_v41_spark_tp6_expert_initialize
+#define cuteafd_expert_output_kind cuteafd_v41_spark_tp6_expert_output_kind
+#define cuteafd_expert_bind_scratch cuteafd_v41_spark_tp6_expert_bind_scratch
+#define cuteafd_expert_initialize_scratch_async cuteafd_v41_spark_tp6_expert_initialize_scratch_async
+#define cuteafd_expert_launch cuteafd_v41_spark_tp6_expert_launch
 #include "v41_experts.cc"
