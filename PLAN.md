@@ -279,12 +279,16 @@ decode tok/s), S1 MiMo V2.6 Pro (+V2 Flash), S2 GLM 5.3 Flash, S3 GLM 5.3,
 S4 Qwen, S5 V4 Flash/Pro, S6 canonical turn snapshot, S7 embedding cache.
 Gate: resume-at-P restores are byte-identical to straight prefill; greedy
 text identical to cache-off; V4.1 parity unchanged.
-Status: S0-S4 merged (S2 GLM 5.3 Flash: 256-row units = 4 MLA pages + the
+Status: S0-S5 merged (S2 GLM 5.3 Flash: 256-row units = 4 MLA pages + the
 pool page, 140.8 MiB KDA mark, kda_len commit point; S3 GLM 5.3: pages only,
 host tier via a stand-in tail; S4 Qwen 3.8: the same 256-row units over 12
 full-attention layers, 110.3 MiB GDN+PLE mark, state_len commit point, n-gram
-history recomputed from the ids), GPU-gated with experts skipped; agentic gate
-on Sparks next (Qwen: one live session with local EXL3 experts on one RTX). The DSA index top-k (b12x `tiled_topk`: GLM 5.x, GLM 5.3
+history recomputed from the ids; S5 V4 Flash/Pro: 256-token units = the C4, index and C128 pages
+of one index, 27.9 / 42.2 MB mark = every layer's last 128 window rows, dSpark rings included
+(drafts warm), plus the compressors' FP32 rolling state; commit point = placement length), GPU-gated
+with experts skipped; S5's live agentic gate ran on Sparks (V4 Flash TP4 + dSpark, one
+session: 8/8 turns reuse the whole previous turn, later-turn hit ratio 0.93, TTFT 0.83 -> 0.20 s,
+task solved); the others next (Qwen: one live session with local EXL3 experts on one RTX). The DSA index top-k (b12x `tiled_topk`: GLM 5.x, GLM 5.3
 Flash, V4 Flash/Pro) is deterministic: ties go to the lower index and picks
 come out in ascending order, so `--resume-at` is byte-exact past 2048 tokens
 too. Still arrival-ordered: the fused decode route (`persistent_topk`, used
