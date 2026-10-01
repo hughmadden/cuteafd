@@ -598,9 +598,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     .filter_map(|(i, a)| a.slot.map(|slot| (i, DraftSeq { slot, anchor: a.next, position: a.placement.len,
                         valid_from: a.draft_from })))
                     .collect();
-                let anchors: Vec<u32> = seqs.iter().map(|(_, s)| s.anchor).collect();
-                let drafts = engine.embedding.host_rows(&anchors).and_then(|rows| drafter.draft(
-                    &seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &rows, engine.weights.head.buffer.ptr));
+                let drafts = drafter.draft_device(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
+                    engine.weights.head.buffer.ptr);
                 cost.observe_draft(timer.elapsed().as_secs_f64() * 1e3);
                 let mut out = vec![None; active.len()];
                 match drafts {
