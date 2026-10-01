@@ -219,14 +219,16 @@ impl Opened {
         let draft_file = draft_dir.as_deref().map(dflash::prefetch);
         let stream = self.library.cuda_stream_create()?;
         // The head split's second GPU and its stream (load kernels, then the engine's).
-        // The head split exists for V2.6 Pro's geometry (`mimop2`); V2 Flash serves from --device.
-        let split_device = match args.split_device {
-            Some(device) if self.cfg.head_split(2).and_then(|share| share.program_family()).is_ok() => Some(device),
-            Some(device) => {
-                tracing::info!(device, "this MiMo geometry has no head split; serving from --device alone");
+        // A head split needs its share's programs (`mimo2`, `mimop2`) in this build;
+        // without them the checkpoint serves from --device.
+        let share = self.cfg.head_split(2).and_then(|share| share.program_family());
+        let split_device = match (args.split_device, &share) {
+            (Some(device), Ok(family)) if programs.spec(&format!("{family}_o_m64")).is_ok() => Some(device),
+            (Some(device), _) => {
+                tracing::info!(device, "no head-split programs for this MiMo geometry; serving from --device alone");
                 None
             }
-            None => None,
+            (None, _) => None,
         };
         let peer_stream = match split_device {
             Some(device) => {
@@ -346,7 +348,7 @@ impl Opened {
         if args.local_experts {
             let tensors = self.catalog.fp8().context("MiMo experts are the checkpoint's FP8 tensors")?;
             let directory = args.fp8_package.clone()
-                .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&args.native_lib, 1));
+                .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&args.native_lib, 1, tensors.format()));
             let (free, _) = self.library.cuda_memory_info()?;
             if let Some(window) = args.expert_window {
                 let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, 0..0, 1, 0,

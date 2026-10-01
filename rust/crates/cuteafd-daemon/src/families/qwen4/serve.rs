@@ -460,6 +460,11 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             // A whole-prompt hit brings its first token's logits: nothing to prefill.
             let logits = admitted.after.and_then(|after| after.logits).map(|logits| logits.to_vec());
             let plan = if logits.is_some() { PointPlan::default() } else { plan };
+            // The first chunk's PLE rows page in while earlier work runs.
+            if logits.is_none() {
+                let end = plan.chunks.first().copied().unwrap_or(tokens.len());
+                engine.prefetch_ple(&placement.history, &tokens[resume..end]);
+            }
             prefills.push(Prefill { job, constraint, tokens, done: resume, resume, plan, chunks: 0, cancelled: false,
                 placement, capacity, seq: MtpSeq::default(), logits, first: None, prompt_row: None,
                 started: Instant::now(), busy: 0.0, phases: [0.0; 2], id: admissions });
@@ -478,6 +483,11 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 let timer = Instant::now();
                 let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
                 let chunk = &p.tokens[p.done..end];
+                // The next chunk's PLE rows page in while this one runs.
+                if end < p.tokens.len() {
+                    let next = p.plan.chunks.get(p.chunks + 1).copied().unwrap_or(p.tokens.len());
+                    engine.prefetch_ple(&history_of(&engine.cfg, &p.tokens[..end]), &p.tokens[end..next]);
+                }
                 let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
                     let start = p.placement.len;
                     let logits = engine.prefill_device(&mut p.placement, chunk, None, None, 1)?;
@@ -551,6 +561,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                     tracing::info!(tokens = p.tokens.len(), cached = resume, elapsed_ms = (1e3 * elapsed) as u64,
                         busy_ms = (1e3 * p.busy) as u64, tok_s = (p.tokens.len() - resume) as f64 / p.busy,
                         gpu_wait_ms = (1e3 * p.phases[0]) as u64, experts_ms = (1e3 * p.phases[1]) as u64, "prefill");
+                    engine.log_table_stats("prefill");
                 }
                 // The prompt snapshot, taken once the first token is out (it only enqueues copies).
                 let prompt = (resume < p.tokens.len()).then(|| p.tokens.clone());
@@ -704,7 +715,12 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             for j in 0..rows.len() {
                 // Rows 0..=j are committed; the token row j produces is next.
                 request.placement.len = start + j + 1;
-                match take(request.constraint.as_mut(), &selected[offset + j]).and_then(|t| Ok((t, request.emit(t)?))) {
+                match take(request.constraint.as_mut(), &selected[offset + j]).and_then(|t| {
+                    // The token's PLE rows page in during emission, the commit and (MTP)
+                    // drafting, before the step that feeds it gathers them.
+                    engine.prefetch_ple(&history_of(&engine.cfg, &request.history), &[t]);
+                    Ok((t, request.emit(t)?))
+                }) {
                     Ok((token, done)) => {
                         last = Some((j + 1, token));
                         finished = done;
@@ -782,6 +798,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 accepted = request.accepted, tokens_per_cycle = request.generated as f64 / request.cycles.max(1) as f64,
                 verify_s, draft_s = timing.seconds, draft_steps = timing.steps, gpu_wait_s = phases[0],
                 experts_s = phases[1], "request complete");
+            engine.log_table_stats("decode");
             (steps, verify_s, timing) = (0, 0.0, DraftTiming::default());
             if let Some(row) = &request.turn {
                 // The conversation so far: every committed row (the last token is not in it).

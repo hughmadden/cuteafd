@@ -339,17 +339,20 @@ impl OfficialV41Catalog {
             self.config().text().engram_layer_ids.contains(&layer),
             "no engram table at layer {layer}"
         );
-        let map = |suffix: &str| -> Result<crate::MappedRows> {
+        let map = |suffix: &str| -> Result<crate::MappedTable> {
             let tensor = self.tensor(&format!("layers.{layer}.engram.embed.{suffix}"))?;
             let metadata = &tensor.metadata;
-            unsafe {
-                crate::MappedRows::open(
+            ensure!(metadata.shape.len() == 2, "engram tensor {suffix} is not 2-D");
+            // SAFETY: forwarded from this function's contract.
+            Ok(unsafe {
+                crate::MappedTable::single(
                     &self.snapshot.join(&tensor.shard),
                     metadata.byte_offset,
                     metadata.shape[0] as u64,
-                    metadata.shape[1],
-                )
-            }
+                    // One byte per element for every engram encoding (FP8, UE8M0, packed NVFP4 bytes).
+                    crate::RowFormat { dtype: metadata.dtype.clone(), width: metadata.shape[1], row_bytes: metadata.shape[1] },
+                )?
+            })
         };
         if let Some(ple) = self.exl3.as_ref().and_then(|m| m.ple_quantization.as_ref()) {
             use std::os::unix::fs::FileExt;
@@ -758,6 +761,9 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> R
         draft_stages: 0,
         draft_experts: 0,
     };
+    if let Some(catalog) = nvfp4_catalog(snapshot, config, shape)? {
+        return Ok(catalog);
+    }
     if config["quantization_config"]["quant_method"] == "fp8" {
         // The official FP8 experts (~675 GiB) do not fit the Spark pool; the
         // catalog serves selected layers, above all the MTP layer, whose ids
@@ -766,8 +772,8 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> R
     }
     ensure!(
         config["quantization_config"]["quant_method"] == "exl3",
-        "GLM routed experts serve from EXL3 publications (e.g. wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1) \
-         or, coordinator-local, from the official FP8 checkpoint"
+        "GLM routed experts serve from EXL3 publications (e.g. wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1), \
+         ModelOpt NVFP4 releases or, coordinator-local, from the official FP8 checkpoint"
     );
     #[derive(Deserialize)]
     struct Index {
@@ -803,6 +809,9 @@ fn read_qwen4_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Res
         draft_stages: 0,
         draft_experts: 0,
     };
+    if let Some(catalog) = nvfp4_catalog(snapshot, config, shape)? {
+        return Ok(catalog);
+    }
     let quant = &config["quantization_config"];
     if quant["quant_method"] == "fp8" {
         ensure!(quant["weight_block_size"] == serde_json::json!([128, 128]),
@@ -821,9 +830,8 @@ fn read_qwen4_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Res
         return deepseek_v4_exl3_catalog(snapshot, &index.weight_map, shape, &[4, 5]);
     }
     if quant.get("config_groups").is_some() || quant["quant_method"] == "modelopt" {
-        anyhow::bail!("Qwen NVFP4 (ModelOpt) routed experts have no expert package: serve the FP8 \
-            (Qwen/Qwen3.8-Flash-Next-FP8) or EXL3 (wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-*) release, \
-            or add an nvfp4 qwen4 family (W4A16 over the packed E2M1 weights and E4M3 group-16 scales)");
+        anyhow::bail!("Qwen ModelOpt routed experts other than NVFP4 have no expert package: serve the \
+            NVFP4, FP8 (Qwen/Qwen3.8-Flash-Next-FP8) or EXL3 (wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-*) release");
     }
     anyhow::bail!("Qwen BF16 routed experts are fused [512, ...] tensors with no expert package: serve the \
         FP8 (Qwen/Qwen3.8-Flash-Next-FP8) or EXL3 (wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-*) release")
@@ -852,6 +860,25 @@ fn read_mimo_v2_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> R
         draft_stages: 0,
         draft_experts: 0,
     })
+}
+
+/// The routed experts of a ModelOpt export whose metadata (hf_quant_config.json,
+/// config.json) declares them NVFP4: the backbone's routed layers through the
+/// `fp8` family's NVFP4 packages. `None` for other checkpoints.
+fn nvfp4_catalog(snapshot: &Path, config: &serde_json::Value, shape: RoutedExpertShape)
+    -> Result<Option<OfficialV41Catalog>> {
+    let Some(modelopt) = crate::formats::modelopt::ModelOpt::read(snapshot, config)? else {
+        return Ok(None);
+    };
+    if !modelopt.experts_nvfp4() {
+        return Ok(None);
+    }
+    let catalog = fp8_catalog(snapshot, shape)?;
+    let tensors = catalog.fp8().context("NVFP4 catalog")?;
+    ensure!(tensors.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4,
+        "{} declares NVFP4 routed experts, but layer {} stores {:?}", modelopt.source, shape.first_layer,
+        tensors.format());
+    Ok(Some(catalog))
 }
 
 fn fp8_catalog(snapshot: &Path, shape: RoutedExpertShape) -> Result<OfficialV41Catalog> {

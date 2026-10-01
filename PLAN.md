@@ -348,6 +348,17 @@ Qwen on one RTX: 68 GB); S2 dense + MTP dispositions; S3 V4.1
 convergence; S4 W4A4 prefill experiment. Gates per stage: oracle cosine,
 KL vs golden within 0.005 of the FP8-expert path, tok/s ≥ it, readiness
 not worse, V4.1 parity. GLM 5.3 NVFP4 experts (~407 GB) need TP6.
+Status: S0 + S1 on `work/nvfp4` (fork `cuteafd/nvfp4-w4a16`). The ModelOpt
+reader (`formats/modelopt.rs`) checks every weight against its
+hf_quant_config.json / config.json declaration; `glm|glmf|qwen4:nvfp4` build
+`fp8-<family>-nvfp4` packages (ABI 3, grouped GEMV at every row count, alphas
+after each scale grid; Spark tp2/3/4/6, coordinator tp1). Real layers pass the
+CPU oracle at every slice. NVIDIA's NVFP4 experts are ~9% RMS from the FP8
+originals, so GLM 5.3 Flash's KL is +0.037 over the FP8-expert path (NLL
++0.003): the checkpoint, not the kernels (S1 measurements in the commit).
+Open: an NVFP4 stream/GEMM route for large prefill steps (the GEMV is ~4% behind
+EXL3 on Qwen prefill), Spark-native runs, S2 dense dispositions (GLM 5.3 Flash
+NVFP4 dense FFN, GLM 5.3 BF16/per-tensor FP8 parts).
 
 **Phase 6 — placement planner (design 2026-09-30).** One planner for every
 family: (model, inventory of 1–2 coordinator GPUs — real or simulated by a
@@ -378,6 +389,19 @@ streamed per token, and a small replicated latent (656 B/token/layer). DCP2
 (KV split by sequence) is a capacity-only option and is not needed for V4.1
 (compressed KV, 14M-token default pool). Order: P2P probe, then head-split vs
 layer-range A/B for MiMo Pro and GLM 5.3.
+Status (2026-10-01): `cuteafd fabric --p2p` measured GPU0<->GPU1 (NODE) hops of
+3.3 us for 12 KiB (SM push + release flag, graph), a two-way exchange of 3.4 /
+4.8 / 25 us for 12 KiB / 96 KiB / 1 MiB and 1.1 ms for a 48 MiB prefill chunk
+(copy engine 0.9 ms); saturating host->GPU0 ingress roughly quadruples small
+hops. So the head split pays and is the default with two RTX
+(`--split-device`, run-family `RTX_GPUS`/`COORDINATOR_GPUS`, `COORDINATOR_SPLIT=off`
+opts out): MiMo V2.6 Pro (coordinator-only decode -41%, 8K prefill -43%; with
+6 Sparks C1 decode 30.9 -> 26.0 ms, prefill Spark-bound) and GLM 5.3
+(coordinator-only 8K prefill -28%; with 6 Sparks decode -9.5%, prefill
+Spark-bound). Shared plumbing in `shared/peer_split.rs`: per-slot release flags,
+partials exchanged and summed in the same operand order on both GPUs (identical
+residual streams), GPU1 queued a layer ahead of GPU0's Spark exchange, decode
+graphs captured per GPU. The layer-range split is not needed for these two.
 The drafter follows the GPU that owns the last backbone layers (taps and head
 live there); TP2 drafters are ≤1% on DFlash2 and not built unless the P2P
 probe shows ≤15 µs hops; the win is lane B drafting on GPU1 while lane A
@@ -402,8 +426,11 @@ rank waits for the slowest peer's slice, the exchange is bandwidth-bound
 (NCCL's ceiling on rhea+moa: ~20 GB/s per direction on two rails, ~11 on one),
 and it gets worse at 100 Gb. Coordinator-side intake and pipelining come first.
 
-Ongoing, any phase: engram/n-gram tables in host RAM now; Spark-RAM
-replicas and fabric-fed tables are explorations, kept behind options.
+Ongoing, any phase: engram/n-gram tables are memory-mapped from the
+checkpoint (`formats::mapped_table` + daemon `shared::mapped_table`: page
+cache, bounded prefetch, gather pool/worker, pinned upload ring, stats; V4.1
+engram and Qwen PLE use it); Spark-RAM replicas and fabric-fed tables are
+explorations, kept behind options.
 
 ## Decisions (2026-09-28)
 

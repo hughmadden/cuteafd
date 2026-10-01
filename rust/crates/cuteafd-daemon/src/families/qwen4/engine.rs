@@ -323,6 +323,9 @@ struct Workspace<'a> {
     page_table: Dev<'a>,
     pool_table: Dev<'a>,
     ple_ids: Dev<'a>,
+    /// Mapped PLE table: the step's gathered rows ([rows x 16, row bytes]) and
+    /// the identity ids the program reads them with.
+    ple_rows: Option<(Dev<'a>, Dev<'a>)>,
     query: Dev<'a>,
     gate: Dev<'a>,
     index_q: Dev<'a>,
@@ -435,6 +438,8 @@ pub(crate) struct Qwen4Engine<'a> {
     /// PLE conv state pool (BF16 [slots, 9, 4H]) and its speculative replay record ([64, 4H]).
     ple_state: Option<Dev<'a>>,
     ple_replay: Option<Dev<'a>>,
+    /// Mapped PLE table: the current step's rows, gathering until the PLE layer.
+    ple_pending: RefCell<Option<crate::shared::mapped_table::PendingRows>>,
     /// Commit tables (I32 [3, sequences]).
     commit_tables: Dev<'a>,
     /// The MTP layer's K/V records and index caches, and the stash of target
@@ -553,7 +558,7 @@ impl<'a> Qwen4Engine<'a> {
         };
         let pool_logical = zeroed(pool_pages * 4)?;
         Ok(Self { library, programs, cfg, weights, ple, stream, max_context, prefill_rows, pages, slots, kv, gdn_ord,
-            gdn_conv, gdn_state, gdn_replay, gdn_layers, index, ple_state, ple_replay,
+            gdn_conv, gdn_state, gdn_replay, gdn_layers, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
             commit_tables: zeroed(3 * DECODE_ROWS * 4)?, mtp_kv, mtp_pending,
             last_streams: std::cell::Cell::new((false, 0)), mtp_streams: std::cell::Cell::new((false, 0)), pool_logical,
             pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages, workspace: RefCell::new(None),
@@ -760,6 +765,15 @@ impl<'a> Qwen4Engine<'a> {
             page_table: self.alloc(table_rows * self.pages * 4)?,
             pool_table: self.alloc(table_rows * self.pool_pages * 4)?,
             ple_ids: self.alloc(t * self.cfg.ple_rows() * 8)?,
+            ple_rows: match self.ple.as_ref().filter(|p| p.mapped().is_some()) {
+                Some(ple) => {
+                    let n = t * self.cfg.ple_rows();
+                    let local = self.alloc(n * 8)?;
+                    self.put(&local, &(0..n as i64).collect::<Vec<i64>>())?;
+                    Some((self.alloc(n * ple.row_bytes)?, local))
+                }
+                None => None,
+            },
             query: self.alloc(t * heads * hd * 2)?,
             gate: self.alloc(t * heads * hd * 2)?,
             index_q: self.alloc(t * self.cfg.index_heads * INDEX_DIM * 2)?,
@@ -876,6 +890,24 @@ impl<'a> Qwen4Engine<'a> {
         let mut out = vec![0u8; bytes];
         self.library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..dev.buffer })?;
         Ok(out)
+    }
+
+    /// Advises the page cache of a mapped PLE table about the rows of
+    /// `tokens` appended after `history` (a later step's, e.g. the next
+    /// prefill chunk); best effort: never blocks, failures only log.
+    pub fn prefetch_ple(&self, history: &NgramHistory, tokens: &[u32]) {
+        let Some((ple, mapped)) = self.ple.as_ref().and_then(|p| p.mapped().map(|m| (p, m))) else { return };
+        let mut ids = Vec::with_capacity(tokens.len() * self.cfg.ple_rows());
+        if let Err(error) = ple.hasher.hash(&mut history.clone(), tokens, &mut ids).and_then(|()| mapped.prefetch(&ids)) {
+            tracing::warn!("PLE prefetch: {error:#}");
+        }
+    }
+
+    /// Logs the mapped PLE table's stats since the previous call.
+    pub fn log_table_stats(&self, event: &str) {
+        if let Some(mapped) = self.ple.as_ref().and_then(|p| p.mapped()) {
+            mapped.log_interval(event);
+        }
     }
 
     /// Per-row positions, record and pool slots, blocks seen, PLE rows.
@@ -1284,7 +1316,15 @@ impl<'a> Qwen4Engine<'a> {
         self.stage_table(w, &w.cache_lengths, &tables.cache_lengths)?;
         self.stage_table(w, &w.page_table, &tables.page_table)?;
         self.stage_table(w, &w.pool_table, &tables.pool_table)?;
-        self.stage_table(w, &w.ple_ids, &tables.ple_ids)?;
+        match self.ple.as_ref().and_then(|p| p.mapped()) {
+            // Gathers while the layers before the PLE layer are enqueued (`finish_ple`).
+            Some(mapped) => {
+                // A failed step's rows are dropped (their gather waited) first.
+                drop(self.ple_pending.borrow_mut().take());
+                *self.ple_pending.borrow_mut() = Some(mapped.begin(&tables.ple_ids)?);
+            }
+            None => self.stage_table(w, &w.ple_ids, &tables.ple_ids)?,
+        }
         // Streams start as four copies of the embedding.
         let row = h * 2;
         ensure!(tokens.len() == t, "{} tokens for a {t}-row step", tokens.len());
@@ -1298,6 +1338,9 @@ impl<'a> Qwen4Engine<'a> {
         let layers = &self.weights.layers;
         let mut cur = 0usize;
         let spec = tables.spec;
+        if self.cfg.ple_layers.contains(&0) {
+            self.finish_ple(w)?;
+        }
         self.enter(w, &mut cur, None, &layers[0], 0, rows, spec)?;
         for (index, layer) in layers.iter().enumerate() {
             match layer.attention {
@@ -1322,6 +1365,9 @@ impl<'a> Qwen4Engine<'a> {
                             ensure!(rows_forced.len() == t * HC * row, "teacher-forced streams of the wrong size");
                             self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: rows_forced.len(),
                                 ..w.streams[cur].buffer }, &rows_forced)?;
+                        }
+                        if has_ple {
+                            self.finish_ple(w)?;
                         }
                         self.enter(w, &mut cur, None, next, index + 1, rows, spec)?;
                     } else {
@@ -1411,6 +1457,9 @@ impl<'a> Qwen4Engine<'a> {
             let key = GraphKey { segment: index, rows: t, spec: tables.spec, long: tables.long, pool_width: tables.pool_width,
                 page_stride: tables.page_stride, pool_stride: tables.pool_stride };
             let start = cur;
+            if self.cfg.ple_layers.contains(&index) {
+                self.finish_ple(w)?;
+            }
             self.replay(key, || -> Result<()> {
                 let mut c = start;
                 let Some(layer) = layers.get(index) else {
@@ -1522,13 +1571,30 @@ impl<'a> Qwen4Engine<'a> {
         Ok(())
     }
 
+    /// Mapped PLE table: waits for the step's rows and queues their upload
+    /// (outside any graph capture, before the PLE layer's work).
+    fn finish_ple(&self, w: &Workspace<'_>) -> Result<()> {
+        let (Some(mapped), Some((rows, _))) = (self.ple.as_ref().and_then(|p| p.mapped()), &w.ple_rows) else {
+            return Ok(());
+        };
+        let pending = self.ple_pending.borrow_mut().take().context("the step's PLE rows were not gathered")?;
+        // SAFETY: the engine owns this stream; the workspace's rows outlive the step.
+        unsafe { mapped.finish(pending, rows.buffer, self.stream)? };
+        Ok(())
+    }
+
     fn ple(&self, w: &Workspace<'_>, streams: &Dev<'_>, layer: &Qwen4Layer<'_>, rows: Scalar, spec: bool)
         -> Result<()> {
-        let table = self.ple.as_ref().context("PLE layer without the n-gram table (--ple)")?;
+        let table = self.ple.as_ref().context("PLE layer without the n-gram table (--table-placement)")?;
         let state = self.ple_state.as_ref().context("PLE conv state")?;
         let replay = self.ple_replay.as_ref().context("PLE replay record")?;
         let name = if table.fp8 { "qwen4_ple_fp8" } else { "qwen4_ple_bf16" };
-        self.run(name, &[("streams", streams.buffer.ptr), ("ids", w.ple_ids.buffer.ptr), ("table", table.table),
+        // Mapped: the step's rows were gathered in id order, so identity ids read them.
+        let (ids, gathered) = match &w.ple_rows {
+            Some((gathered, local)) => (local.buffer.ptr, gathered.buffer.ptr),
+            None => (w.ple_ids.buffer.ptr, table.table),
+        };
+        self.run(name, &[("streams", streams.buffer.ptr), ("ids", ids), ("table", gathered),
             ("scale", table.scale.buffer.ptr), ("w_kv", layer.ptr("ple.w_kv")?),
             ("norm_key", layer.ptr("ple.norm_key")?), ("norm_query", layer.ptr("ple.norm_query")?),
             ("norm_conv", layer.ptr("ple.norm_conv")?), ("conv_w", layer.ptr("ple.conv_w")?),

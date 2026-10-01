@@ -342,7 +342,7 @@ impl Opened {
         }
         if let Some(tensors) = self.fp8() {
             let directory = args.fp8_package.clone()
-                .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&args.native_lib, 1));
+                .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&args.native_lib, 1, tensors.format()));
             let (free, _) = self.library.cuda_memory_info()?;
             // An empty window: the package and its scratch; layers load on first use.
             let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, 0..0, 1, 0,

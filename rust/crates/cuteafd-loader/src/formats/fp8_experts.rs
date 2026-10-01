@@ -21,6 +21,17 @@
 //! (TP6 of 2048: 352, 352, 352, 352, 320, 320), and every rank stores its
 //! slice zero-padded to one 128-aligned width (384): zero gate/up rows give
 //! SiLU(0) * 0 = 0 and zero down columns add nothing, so padding is exact.
+//!
+//! NVIDIA ModelOpt NVFP4 releases (`ExpertFormat::Nvfp4`: GLM 5.3, GLM 5.3
+//! Flash, Qwen 3.8 Flash Next) store `weight` U8 `[N, K/2]` (E2M1, even
+//! element low), `weight_scale` E4M3 `[N, K/16]` (linear layout) and an FP32
+//! `weight_scale_2` per projection (the expert's alpha; `input_scale` belongs
+//! to the W4A4 recipe and is not read). The `fp8-<geometry>-nvfp4` packages
+//! widen `e2m1 * e4m3` exactly to BF16 and apply alpha in FP32 (W4A16).
+//! Slices split `I` in whole 16-value scale blocks (TP6 of 2048: 352, 352,
+//! 336, 336, 336, 336), zero-padded to one 128-aligned width (384); each
+//! projection's scale region is the E4M3 grid of every expert followed by
+//! the experts' FP32 alphas.
 use crate::catalog::read_safetensors_metadata;
 use crate::families::deepseek_v41::v41_catalog::RoutedExpertShape;
 use anyhow::{ensure, Context, Result};
@@ -55,6 +66,35 @@ pub enum ExpertFormat {
     Fp8Block128,
     /// Packed E2M1 with UE8M0 scales per 32 values along K (`weight_scale`).
     Mxfp4,
+    /// ModelOpt NVFP4: packed E2M1, E4M3 scales per 16 values along K
+    /// (`weight_scale`) and an FP32 per-tensor `weight_scale_2`.
+    Nvfp4,
+}
+
+impl ExpertFormat {
+    /// The package directory suffix and label (`fp8-glmf`, `fp8-mimop`,
+    /// `fp8-glmf-nvfp4`): FP8 and MXFP4 checkpoints have distinct
+    /// geometries, NVFP4 releases share theirs with the FP8 ones.
+    pub fn package_suffix(self) -> &'static str {
+        match self {
+            Self::Fp8Block128 | Self::Mxfp4 => "",
+            Self::Nvfp4 => "-nvfp4",
+        }
+    }
+
+    /// Whether the weights are packed E2M1 (two codes per byte).
+    pub fn packed_fp4(self) -> bool {
+        matches!(self, Self::Mxfp4 | Self::Nvfp4)
+    }
+
+    /// Values per scale along K: 128 (FP8 blocks), 32 (MXFP4), 16 (NVFP4).
+    pub fn group(self) -> usize {
+        match self {
+            Self::Fp8Block128 => 128,
+            Self::Mxfp4 => 32,
+            Self::Nvfp4 => 16,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -127,7 +167,10 @@ impl Fp8ExpertTensors {
             format: ExpertFormat::Fp8Block128, tensors };
         let first = catalog.name(shape.first_layer, 0, Fp8Projection::Gate);
         if matches!(catalog.located(&first)?.dtype, DType::U8 | DType::I8) {
-            catalog.format = ExpertFormat::Mxfp4;
+            // E4M3 scales with a second-level FP32 scale: ModelOpt NVFP4; UE8M0 ones: MXFP4.
+            let nvfp4 = catalog.tensors.get(&format!("{first}_scale")).is_some_and(|s| s.dtype == DType::F8E4M3)
+                && catalog.tensors.contains_key(&format!("{first}_scale_2"));
+            catalog.format = if nvfp4 { ExpertFormat::Nvfp4 } else { ExpertFormat::Mxfp4 };
         }
         // One expert of the first routed layer fixes the format contract.
         for projection in Fp8Projection::ALL {
@@ -162,6 +205,18 @@ impl Fp8ExpertTensors {
         let name = self.name(layer, expert, projection);
         let (rows, cols) = self.dims(projection);
         let weight = self.located(&name)?;
+        if self.format == ExpertFormat::Nvfp4 {
+            ensure!(weight.dtype == DType::U8 && weight.shape == [rows, cols / 2] && cols % 16 == 0,
+                "{name}: expected packed E2M1 U8 [{rows}, {}], found {:?} {:?}", cols / 2, weight.dtype, weight.shape);
+            let scale = self.located(&format!("{name}_scale"))?;
+            ensure!(scale.dtype == DType::F8E4M3 && scale.shape == [rows, cols / 16],
+                "{name}_scale: expected E4M3 [{rows}, {}] (16 values per scale, linear), found {:?} {:?}", cols / 16,
+                scale.dtype, scale.shape);
+            let alpha = self.located(&format!("{name}_scale_2"))?;
+            ensure!(alpha.dtype == DType::F32 && alpha.bytes == 4,
+                "{name}_scale_2: expected one FP32 value, found {:?} {:?}", alpha.dtype, alpha.shape);
+            return Ok(());
+        }
         if self.format == ExpertFormat::Mxfp4 {
             ensure!(matches!(weight.dtype, DType::U8 | DType::I8) && weight.shape == [rows, cols / 2] && cols % 32 == 0,
                 "{name}: expected packed E2M1 U8 [{rows}, {}], found {:?} {:?}", cols / 2, weight.dtype, weight.shape);
@@ -179,10 +234,10 @@ impl Fp8ExpertTensors {
         Ok(())
     }
 
-    /// Rows of one slice block: the 128x128 scale block (FP8) or the 32-wide
-    /// UE8M0 block (MXFP4).
-    fn block(&self) -> usize {
-        if self.format == ExpertFormat::Mxfp4 { 32 } else { 128 }
+    /// Rows of one slice block: the 128x128 scale block (FP8), the 32-wide
+    /// UE8M0 block (MXFP4) or the 16-wide E4M3 block (NVFP4).
+    pub fn block(&self) -> usize {
+        self.format.group()
     }
 
     /// The stored intermediate slice width of every rank of `tp`: the widest
@@ -211,14 +266,39 @@ impl Fp8ExpertTensors {
         let (rows, cols) = self.dims(projection);
         let slice = self.slice(tp)?;
         let (rows, cols) = if projection == Fp8Projection::Down { (rows, slice) } else { (slice, cols) };
-        if self.format == ExpertFormat::Mxfp4 {
-            return Ok((rows * cols / 2, rows * cols / 32));
+        if self.format.packed_fp4() {
+            return Ok((rows * cols / 2, rows * cols / self.format.group()));
         }
         Ok((rows * cols, rows.div_ceil(128) * cols.div_ceil(128) * 4))
     }
 
-    /// `read_slice` for MXFP4: rank rows `[first, first + len)` of gate/up
-    /// (rows) or down (K columns), zero-padded to the stored slice width.
+    /// Bytes of one projection's scale region for every expert: the scale
+    /// grids, then (NVFP4) the experts' FP32 alphas.
+    pub fn scale_region_bytes(&self, projection: Fp8Projection, tp: usize) -> Result<usize> {
+        let experts = self.shape.experts;
+        let alphas = if self.format == ExpertFormat::Nvfp4 { experts * 4 } else { 0 };
+        Ok(experts * self.slice_bytes(projection, tp)?.1 + alphas)
+    }
+
+    /// An NVFP4 projection's `weight_scale_2` (alpha); 1 for the other formats.
+    pub fn read_alpha(&self, layer: usize, expert: usize, projection: Fp8Projection) -> Result<f32> {
+        if self.format != ExpertFormat::Nvfp4 {
+            return Ok(1.0);
+        }
+        let name = format!("{}_scale_2", self.name(layer, expert, projection));
+        let located = self.located(&name)?;
+        ensure!(located.dtype == DType::F32 && located.bytes == 4, "{name}: expected one FP32 value");
+        let mut bytes = [0u8; 4];
+        std::fs::File::open(self.snapshot.join(&located.shard))?.read_exact_at(&mut bytes, located.offset)
+            .with_context(|| format!("reading {name}"))?;
+        let alpha = f32::from_le_bytes(bytes);
+        ensure!(alpha.is_finite() && alpha > 0.0, "{name}: weight_scale_2 {alpha} is not a positive finite value");
+        Ok(alpha)
+    }
+
+    /// `read_slice` for packed FP4 (MXFP4, NVFP4): rank rows `[first, first +
+    /// len)` of gate/up (rows) or down (K columns), zero-padded to the stored
+    /// slice width.
     #[allow(clippy::too_many_arguments)]
     fn read_mxfp4_slice(&self, name: &str, projection: Fp8Projection, tp: usize, rank: usize, weight: &mut [u8],
         scale: &mut [u8], staging: &mut Vec<u8>) -> Result<()> {
@@ -233,7 +313,8 @@ impl Fp8ExpertTensors {
         scale.fill(0);
         if projection == Fp8Projection::Down {
             // K columns [first, first + len) of every row, into slice-wide rows.
-            for (located, file, out, per) in [(w, &w_file, &mut *weight, 2usize), (s, &s_file, &mut *scale, 32)] {
+            let group = self.format.group();
+            for (located, file, out, per) in [(w, &w_file, &mut *weight, 2usize), (s, &s_file, &mut *scale, group)] {
                 staging.resize(located.bytes as usize, 0);
                 file.read_exact_at(staging, located.offset).with_context(|| format!("reading {name}"))?;
                 let (row_in, row_out, take) = (cols / per, slice / per, len / per);
@@ -242,7 +323,7 @@ impl Fp8ExpertTensors {
                 }
             }
         } else {
-            let (w_row, s_row) = (cols / 2, cols / 32);
+            let (w_row, s_row) = (cols / 2, cols / self.format.group());
             w_file.read_exact_at(&mut weight[..len * w_row], w.offset + (first * w_row) as u64)
                 .with_context(|| format!("reading {name}"))?;
             s_file.read_exact_at(&mut scale[..len * s_row], s.offset + (first * s_row) as u64)
@@ -264,7 +345,7 @@ impl Fp8ExpertTensors {
         let slice = self.slice(tp)?;
         let (weight_bytes, scale_bytes) = self.slice_bytes(projection, tp)?;
         ensure!(weight.len() == weight_bytes && scale.len() == scale_bytes, "{name}: slice buffers of the wrong size");
-        if self.format == ExpertFormat::Mxfp4 {
+        if self.format.packed_fp4() {
             return self.read_mxfp4_slice(&name, projection, tp, rank, weight, scale, staging);
         }
         let w = self.located(&name)?;
@@ -342,6 +423,22 @@ mod tests {
         let qwen = catalog(ExpertFormat::Fp8Block128, 640);
         assert_eq!(ranges(&qwen, 3), [(0, 256), (256, 256), (512, 128)]);
         assert_eq!(qwen.slice(3).unwrap(), 256);
+    }
+
+    #[test]
+    fn nvfp4_slices_keep_their_16_blocks() {
+        let nvfp4 = catalog(ExpertFormat::Nvfp4, 2048);
+        // TP6 of 128 blocks: 22, 22, 21, 21, 21, 21 stored 384 wide.
+        assert_eq!(nvfp4.slice(6).unwrap(), 384);
+        assert_eq!(ranges(&nvfp4, 6), [(0, 352), (352, 352), (704, 336), (1040, 336), (1376, 336), (1712, 336)]);
+        assert_eq!(nvfp4.slice_bytes(Fp8Projection::Gate, 6).unwrap(), (384 * 6144 / 2, 384 * 6144 / 16));
+        assert_eq!(nvfp4.slice_bytes(Fp8Projection::Down, 1).unwrap(), (6144 * 1024, 6144 * 128));
+        assert_eq!(nvfp4.scale_region_bytes(Fp8Projection::Down, 1).unwrap(), 256 * 6144 * 128 + 256 * 4);
+        // Qwen's 640 = 40 blocks: TP3 14, 13, 13 in 256.
+        let qwen = catalog(ExpertFormat::Nvfp4, 640);
+        assert_eq!(ranges(&qwen, 3), [(0, 224), (224, 208), (432, 208)]);
+        assert_eq!(qwen.slice(3).unwrap(), 256);
+        assert_eq!(qwen.slice(2).unwrap(), 384);
     }
 
     #[test]

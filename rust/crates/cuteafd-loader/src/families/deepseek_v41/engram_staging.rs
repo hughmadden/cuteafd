@@ -171,7 +171,8 @@ mod tests {
                 }
             }
             let map = |file: &tempfile::NamedTempFile, stride| unsafe {
-                crate::MappedRows::open(file.path(), 0, ENGRAM_ROWS[0], stride)
+                crate::MappedTable::single(file.path(), 0, ENGRAM_ROWS[0],
+                    crate::RowFormat { dtype: cuteafd_core::DType::U8, width: stride, row_bytes: stride })
             };
             let table = match encoding {
                 EngramEncoding::Fp8 => EngramTable::new(map(&weights, wb)?, map(&scales, sb)?)?,

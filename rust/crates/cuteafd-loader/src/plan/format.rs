@@ -406,8 +406,11 @@ pub fn detect(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOper
 fn fp8_scale(weight: &crate::SafetensorsTensorMetadata, suffix: &str, scale: &crate::SafetensorsTensorMetadata)
     -> Result<BlockScale, Malformed> {
     let malformed = |reason: String| Malformed { tensor: scale.name.clone(), reason };
-    let encoding = scale_encoding(&scale.dtype)
-        .ok_or_else(|| malformed(format!("scale dtype {}", dtype_label(&scale.dtype))))?;
+    // MXFP8 stores its UE8M0 exponents as U8 (the MXFP4 convention).
+    let encoding = match scale.dtype {
+        DType::U8 => Some(ScaleEncoding::Ue8m0),
+        ref other => scale_encoding(other),
+    }.ok_or_else(|| malformed(format!("scale dtype {}", dtype_label(&scale.dtype))))?;
     let numel: usize = scale.shape.iter().product();
     let (rows, cols) = match weight.shape.as_slice() {
         [rows, cols] => (*rows, *cols),

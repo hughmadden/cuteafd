@@ -1,11 +1,10 @@
-//! Bounded background page-in for paired native engram weight and scale tables.
-use crate::MappedRows;
+//! Paired native engram weight and scale tables on the shared mapped-table
+//! infrastructure (`formats::mapped_table`): mapping, bounded background
+//! page-in and per-table stats.
+use crate::{AdviseRows, MappedTable, MappedTableError, RowFormat, TablePrefetchOutcome, TablePrefetchTicket,
+    TablePrefetcher};
 use anyhow::{ensure, Context, Result};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    mpsc, Arc,
-};
-use std::thread::{self, JoinHandle};
+use std::sync::{atomic::AtomicBool, Arc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngramEncoding { Fp8, Nvfp4 }
@@ -15,8 +14,8 @@ impl EngramEncoding {
 }
 
 pub struct EngramTable {
-    weights: MappedRows,
-    scales: MappedRows,
+    weights: MappedTable,
+    scales: MappedTable,
     encoding: EngramEncoding,
     global_scale: f32,
 }
@@ -24,17 +23,21 @@ pub struct EngramTable {
 impl EngramTable {
     pub fn encoding(&self) -> EngramEncoding { self.encoding }
     pub fn global_scale(&self) -> f32 { self.global_scale }
-    pub fn new_nvfp4(weights: MappedRows, scales: MappedRows, global_scale: f32) -> Result<Self> {
+    pub fn new_nvfp4(weights: MappedTable, scales: MappedTable, global_scale: f32) -> Result<Self> {
         ensure!(weights.rows() == scales.rows() && weights.row_bytes() == 128 && scales.row_bytes() == 16,
             "NVFP4 engram requires paired 128-byte weight and 16-byte scale rows");
         ensure!(global_scale.is_finite() && global_scale > 0.0, "invalid NVFP4 engram global scale");
         Ok(Self { weights, scales, encoding: EngramEncoding::Nvfp4, global_scale })
     }
-    pub fn weights(&self) -> &MappedRows {
+    pub fn weights(&self) -> &MappedTable {
         &self.weights
     }
-    pub fn scales(&self) -> &MappedRows {
+    pub fn scales(&self) -> &MappedTable {
         &self.scales
+    }
+    /// Gather stats are kept on the weight table (scales share its rows).
+    pub fn stats(&self) -> crate::TableStatsSnapshot {
+        self.weights.stats().snapshot()
     }
 
     /// Map the official embedding and per-row scale tensors for one engram layer.
@@ -49,7 +52,7 @@ impl EngramTable {
             14 => 384_016_682_usize,
             _ => anyhow::bail!("V4.1 Flash has no engram table at layer {layer}"),
         };
-        let map = |suffix: &str, dtype: DType, width: usize| -> Result<MappedRows> {
+        let map = |suffix: &str, dtype: DType, width: usize| -> Result<MappedTable> {
             let name = format!("layers.{layer}.engram.embed.{suffix}");
             let mut matching = catalog.tensors.iter().filter(|tensor| tensor.name == name);
             let tensor = matching
@@ -71,21 +74,22 @@ impl EngramTable {
                         .all(|part| matches!(part, Component::Normal(_))),
                 "invalid engram checkpoint shard path"
             );
-            unsafe {
-                MappedRows::open(
+            // SAFETY: forwarded from this function's contract.
+            Ok(unsafe {
+                MappedTable::single(
                     &Path::new(&catalog.snapshot_path).join(&tensor.file),
                     tensor.byte_offset,
                     rows as u64,
-                    width,
-                )
-            }
+                    RowFormat::of(dtype, width)?,
+                )?
+            })
         };
         Self::new(
             map("weight", DType::F8E4M3, 256)?,
             map("scale", DType::F8E8M0, 8)?,
         )
     }
-    pub fn new(weights: MappedRows, scales: MappedRows) -> Result<Self> {
+    pub fn new(weights: MappedTable, scales: MappedTable) -> Result<Self> {
         ensure!(
             weights.rows() == scales.rows(),
             "engram weight/scale row counts differ"
@@ -98,13 +102,6 @@ impl EngramTable {
     }
 }
 
-struct Job {
-    table: Arc<EngramTable>,
-    rows: Vec<u64>,
-    cancelled: Arc<AtomicBool>,
-    completion: mpsc::SyncSender<Result<PrefetchOutcome>>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrefetchOutcome {
     Cancelled,
@@ -114,73 +111,47 @@ pub enum PrefetchOutcome {
     },
 }
 
+/// Weights and scales are advised as one unit, cancellable between them.
+impl AdviseRows for EngramTable {
+    fn row_count(&self) -> u64 {
+        self.weights.rows()
+    }
+    fn advise(&self, rows: &[u64], max_pages: usize, cancelled: &AtomicBool)
+        -> Result<Option<Vec<usize>>, MappedTableError> {
+        let Some(weights) = self.weights.advise(rows, max_pages, cancelled)? else { return Ok(None) };
+        let Some(scales) = self.scales.advise(rows, max_pages, cancelled)? else { return Ok(None) };
+        Ok(Some(vec![weights[0], scales[0]]))
+    }
+}
+
 /// Request-owned completion, independent of recycled scheduler slot numbers.
 /// Dropping it cancels queued work; advice already issued to the OS is harmless.
-pub struct PrefetchTicket {
-    cancelled: Arc<AtomicBool>,
-    completion: mpsc::Receiver<Result<PrefetchOutcome>>,
-}
+pub struct PrefetchTicket(TablePrefetchTicket);
 
 impl PrefetchTicket {
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        self.0.cancel();
     }
     pub fn wait(&self) -> Result<PrefetchOutcome> {
-        self.completion
-            .recv()
-            .context("engram prefetch worker stopped")?
+        Ok(match self.0.wait().context("engram prefetch worker stopped")? {
+            TablePrefetchOutcome::Cancelled => PrefetchOutcome::Cancelled,
+            TablePrefetchOutcome::Advised(pages) => PrefetchOutcome::Advised {
+                weight_pages: pages[0],
+                scale_pages: pages[1],
+            },
+        })
     }
 }
 
-impl Drop for PrefetchTicket {
-    fn drop(&mut self) {
-        self.cancel();
-    }
-}
-
-/// One worker and a bounded queue; submission never waits for disk or queue space.
-/// The row cap bounds job memory independently of page deduplication.
+/// The shared table prefetcher (one worker, bounded queue; submission never
+/// waits for disk or queue space) over paired engram weight/scale tables.
 pub struct EngramPrefetcher {
-    sender: Option<mpsc::SyncSender<Job>>,
-    worker: Option<JoinHandle<()>>,
-    max_rows: usize,
+    inner: TablePrefetcher,
 }
 
 impl EngramPrefetcher {
     pub fn new(queue_depth: usize, max_rows: usize, max_pages_per_table: usize) -> Result<Self> {
-        ensure!(
-            queue_depth > 0 && max_rows > 0 && max_pages_per_table > 0,
-            "engram prefetch capacities must be nonzero"
-        );
-        let (sender, receiver) = mpsc::sync_channel::<Job>(queue_depth);
-        let worker = thread::Builder::new()
-            .name("engram-prefetch".into())
-            .spawn(move || {
-                while let Ok(job) = receiver.recv() {
-                    let result = (|| {
-                        if job.cancelled.load(Ordering::Acquire) {
-                            return Ok(PrefetchOutcome::Cancelled);
-                        }
-                        let weight_pages =
-                            job.table.weights.prefetch(&job.rows, max_pages_per_table)?;
-                        if job.cancelled.load(Ordering::Acquire) {
-                            return Ok(PrefetchOutcome::Cancelled);
-                        }
-                        let scale_pages =
-                            job.table.scales.prefetch(&job.rows, max_pages_per_table)?;
-                        Ok(PrefetchOutcome::Advised {
-                            weight_pages,
-                            scale_pages,
-                        })
-                    })();
-                    let _ = job.completion.send(result);
-                }
-            })?;
-        Ok(Self {
-            sender: Some(sender),
-            worker: Some(worker),
-            max_rows,
-        })
+        Ok(Self { inner: TablePrefetcher::new("engram-prefetch", queue_depth, max_rows, max_pages_per_table)? })
     }
 
     /// Submit the address batch prepared from decode, prefill, or verification IDs.
@@ -202,7 +173,7 @@ impl EngramPrefetcher {
             .filter(|&row| batch.is_image(row) == Some(false))
             .count();
         ensure!(
-            text_rows <= self.max_rows / 24,
+            text_rows <= self.inner.max_rows() / 24,
             "engram hash batch exceeds prefetch row capacity"
         );
         self.try_submit(table, &batch.prefetch_rows(layer_index)?)
@@ -214,46 +185,11 @@ impl EngramPrefetcher {
         table: Arc<EngramTable>,
         rows: &[u64],
     ) -> Result<Option<PrefetchTicket>> {
-        ensure!(
-            rows.len() <= self.max_rows,
-            "engram prefetch exceeds row capacity"
-        );
-        ensure!(
-            rows.iter().all(|&row| row < table.weights.rows()),
-            "engram row out of range"
-        );
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let (completion, receiver) = mpsc::sync_channel(1);
-        let job = Job {
-            table,
-            rows: rows.to_vec(),
-            cancelled: cancelled.clone(),
-            completion,
-        };
-        match self
-            .sender
-            .as_ref()
-            .context("engram prefetcher stopped")?
-            .try_send(job)
-        {
-            Ok(()) => Ok(Some(PrefetchTicket {
-                cancelled,
-                completion: receiver,
-            })),
-            Err(mpsc::TrySendError::Full(_)) => Ok(None),
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                anyhow::bail!("engram prefetch worker disconnected")
-            }
+        let ticket = self.inner.try_submit(table.clone(), rows)?;
+        if ticket.is_none() {
+            table.weights.stats().record_prefetch_dropped();
         }
-    }
-}
-
-impl Drop for EngramPrefetcher {
-    fn drop(&mut self) {
-        self.sender.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        Ok(ticket.map(PrefetchTicket))
     }
 }
 
@@ -329,8 +265,8 @@ mod tests {
         weights.write_all(&[0x38; 512])?;
         scales.write_all(&[127; 16])?;
         let table = Arc::new(EngramTable::new(
-            unsafe { MappedRows::open(weights.path(), 0, 2, 256)? },
-            unsafe { MappedRows::open(scales.path(), 0, 2, 8)? },
+            unsafe { MappedTable::single(weights.path(), 0, 2, RowFormat::of(cuteafd_core::DType::F8E4M3, 256)?)? },
+            unsafe { MappedTable::single(scales.path(), 0, 2, RowFormat::of(cuteafd_core::DType::F8E8M0, 8)?)? },
         )?);
         let worker = EngramPrefetcher::new(1, 16, 2)?;
         assert!(worker.try_submit(table.clone(), &[2]).is_err());

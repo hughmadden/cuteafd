@@ -2,9 +2,12 @@
 # for example mimo:fp8 or glm:fp8): the checkpoint's E4M3 experts with FP32
 # 128x128 block scales, run by b12x fp8_moe programs. Each entry builds
 # fp8-FAMILY/ next to the native library: tp1 in the SM120 coordinator build
-# (RTX local / MTP layers), tp4 and tp2 in the SM121 Spark build. The daemon
+# (RTX local / MTP layers), tp4, tp2 and tp6 in the SM121 Spark build. The daemon
 # resolves <libdir>/fp8/fp8-FAMILY/tp<world>; the artifact scripts install
-# the packages there.
+# the packages there. FAMILY:nvfp4 entries (glm, glmf, qwen4) build
+# fp8-FAMILY-nvfp4/ the same way for NVIDIA ModelOpt NVFP4 releases (W4A16:
+# packed E2M1 x E4M3 per-16 scales widened exactly, FP32 alpha per expert;
+# exporter geometry FAMILY_nvfp4).
 if(CUTEAFD_CUDA_ARCHITECTURES MATCHES "^120")
   set(CUTEAFD_FP8_MOE_ROLE coordinator)
 elseif(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "121")
@@ -22,14 +25,19 @@ list(GET CUDAToolkit_INCLUDE_DIRS 0 CUTEAFD_FP8_MOE_CUDA_INCLUDE)
 set(CUTEAFD_FP8_MOE_TOOL "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/package_fp8_moe_aot.py")
 set(CUTEAFD_FP8_MOE_MANIFESTS)
 foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
-  if(NOT entry MATCHES ":fp8$")
+  if(NOT entry MATCHES ":(fp8|nvfp4)$")
     continue()
   endif()
-  if(NOT entry MATCHES "^(mimo|mimop|glm|glmf|qwen4):fp8$")
-    message(FATAL_ERROR "FP8 expert family ${entry} must be (mimo|mimop|glm|glmf|qwen4):fp8 (mimop: MXFP4 weights)")
+  if(entry MATCHES "^(mimo|mimop|glm|glmf|qwen4):fp8$")
+    set(geometry "${CMAKE_MATCH_1}")
+    set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-${geometry}")
+  elseif(entry MATCHES "^(glm|glmf|qwen4):nvfp4$")
+    set(geometry "${CMAKE_MATCH_1}_nvfp4")
+    set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-${CMAKE_MATCH_1}-nvfp4")
+  else()
+    message(FATAL_ERROR "FP8 expert family ${entry} must be (mimo|mimop|glm|glmf|qwen4):fp8 (mimop: MXFP4 weights) \
+or (glm|glmf|qwen4):nvfp4 (ModelOpt NVFP4)")
   endif()
-  set(geometry "${CMAKE_MATCH_1}")
-  set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-${geometry}")
   set(stamp "${CMAKE_CURRENT_BINARY_DIR}/fp8_moe_${geometry}.stamp")
   file(GENERATE OUTPUT "${stamp}" CONTENT "role=${CUTEAFD_FP8_MOE_ROLE}|capacities=${CUTEAFD_FP8_MOE_CAPACITIES}\n")
   add_custom_command(

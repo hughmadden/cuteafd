@@ -1,9 +1,11 @@
 //! FP8 experts (the checkpoint's E4M3 weights with FP32 128x128 block scales,
-//! or MXFP4: packed E2M1 with UE8M0 per 32): the CPU oracle and the `--local`
+//! MXFP4: packed E2M1 with UE8M0 per 32, or ModelOpt NVFP4: packed E2M1 with
+//! E4M3 per 16 and an FP32 alpha): the CPU oracle and the `--local`
 //! coordinator run.
 //!
-//! The oracle is the checkpoint math at full width: weights `bf16(w * s)`,
-//! BF16 gate and up (clamped at the config's `swiglu_limit` when it has one:
+//! The oracle is the checkpoint math at full width: weights `bf16(w * s)`
+//! (NVFP4: the exact `e2m1 * e4m3`, each projection's FP32 dot product times
+//! the expert's `weight_scale_2` before its BF16 rounding), BF16 gate and up (clamped at the config's `swiglu_limit` when it has one:
 //! gate from above, up both ways), `bf16(bf16(silu(g)) * u)`, BF16 down output, FP32 route
 //! sum. Above 256 rows it checks a deterministic sample of 256 rows (every
 //! output row depends only on its own input row and routes); experts run on
@@ -40,29 +42,35 @@ fn e4m3(code: u8) -> f32 {
     super::e4m3(code)
 }
 
-/// Full-width `[rows, cols]` `bf16(w * s)` of one expert projection.
+/// Full-width `[rows, cols]` `bf16(w * s)` of one expert projection, and
+/// the factor its dot products take before rounding (NVFP4's alpha, else 1).
 fn dequantize(tensors: &Fp8ExpertTensors, layer: usize, expert: usize, projection: Fp8Projection, _rows: usize,
-    cols: usize) -> Result<Vec<f32>> {
+    cols: usize) -> Result<(Vec<f32>, f32)> {
     let (w_bytes, s_bytes) = tensors.slice_bytes(projection, 1)?;
     let (mut weight, mut scale, mut staging) = (vec![0u8; w_bytes], vec![0u8; s_bytes], Vec::new());
     tensors.read_slice(layer, expert, projection, 1, 0, &mut weight, &mut scale, &mut staging)?;
-    if tensors.format() == ExpertFormat::Mxfp4 {
-        // Packed E2M1 (even element in the low nibble) times 2^(s - 127) per 32 values.
+    if tensors.format().packed_fp4() {
+        // Packed E2M1 (even element in the low nibble) times 2^(s - 127) per 32
+        // values (MXFP4) or an E4M3 scale per 16 (NVFP4: exact in BF16).
         const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
         let value = |code: u8| if code & 8 != 0 { -E2M1[usize::from(code & 7)] } else { E2M1[usize::from(code & 7)] };
-        return Ok((0..weight.len() * 2).map(|i| {
+        let nvfp4 = tensors.format() == ExpertFormat::Nvfp4;
+        let group = tensors.format().group();
+        let factor = |byte: u8| if nvfp4 { e4m3(byte) } else { (f32::from(byte) - 127.0).exp2() };
+        let alpha = tensors.read_alpha(layer, expert, projection)?;
+        return Ok(((0..weight.len() * 2).map(|i| {
             let (row, col) = (i / cols, i % cols);
             let byte = weight[i / 2];
             let code = if i % 2 == 0 { byte & 0xF } else { byte >> 4 };
-            bf16(value(code) * (f32::from(scale[row * (cols / 32) + col / 32]) - 127.0).exp2())
-        }).collect());
+            bf16(value(code) * factor(scale[row * (cols / group) + col / group]))
+        }).collect(), alpha));
     }
     let scale: Vec<f32> = scale.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
     let grid = cols.div_ceil(128);
-    Ok(weight.iter().enumerate().map(|(i, &code)| {
+    Ok((weight.iter().enumerate().map(|(i, &code)| {
         let (row, col) = (i / cols, i % cols);
         bf16(e4m3(code) * scale[(row / 128) * grid + col / 128])
-    }).collect())
+    }).collect(), 1.0))
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -97,14 +105,14 @@ pub(super) fn oracle(catalog: &OfficialV41Catalog, layer: usize, input: &[f32], 
             let mut out = vec![0f32; sampled.len() * hidden];
             for (expert, routes) in chunk {
                 let e = *expert as usize;
-                let w1 = dequantize(tensors, layer, e, Fp8Projection::Gate, inter, hidden)?;
-                let w3 = dequantize(tensors, layer, e, Fp8Projection::Up, inter, hidden)?;
-                let w2 = dequantize(tensors, layer, e, Fp8Projection::Down, hidden, inter)?;
+                let (w1, a1) = dequantize(tensors, layer, e, Fp8Projection::Gate, inter, hidden)?;
+                let (w3, a3) = dequantize(tensors, layer, e, Fp8Projection::Up, inter, hidden)?;
+                let (w2, a2) = dequantize(tensors, layer, e, Fp8Projection::Down, hidden, inter)?;
                 for route in routes {
                     let x = &input[route.row_index as usize * hidden..][..hidden];
                     let act: Vec<f32> = (0..inter).map(|n| {
-                        let mut gate = bf16(dot(x, &w1[n * hidden..][..hidden]));
-                        let mut up = bf16(dot(x, &w3[n * hidden..][..hidden]));
+                        let mut gate = bf16(a1 * dot(x, &w1[n * hidden..][..hidden]));
+                        let mut up = bf16(a3 * dot(x, &w3[n * hidden..][..hidden]));
                         if let Some(limit) = limit {
                             gate = gate.min(limit);
                             up = up.clamp(-limit, limit);
@@ -113,7 +121,7 @@ pub(super) fn oracle(catalog: &OfficialV41Catalog, layer: usize, input: &[f32], 
                     }).collect();
                     let row = &mut out[slot[&(route.row_index as usize)] * hidden..][..hidden];
                     for (h, value) in row.iter_mut().enumerate() {
-                        *value += route.gate_weight * bf16(dot(&act, &w2[h * inter..][..inter]));
+                        *value += route.gate_weight * bf16(a2 * dot(&act, &w2[h * inter..][..inter]));
                     }
                 }
             }
@@ -144,7 +152,7 @@ pub(super) fn run_local(args: &ExpertProbeArgs, catalog: &OfficialV41Catalog, wi
     let library = unsafe { NativeLibrary::load(native_lib) }?;
     library.cuda_set_device(0)?;
     let stream = library.cuda_stream_create()?;
-    let directory = args.fp8_package.clone().unwrap_or_else(|| package_directory(native_lib, tp));
+    let directory = args.fp8_package.clone().unwrap_or_else(|| package_directory(native_lib, tp, tensors.format()));
     let upload = |bytes: &[u8]| -> Result<DeviceAllocation<'_>> {
         let allocation = DeviceAllocation::new(&library, bytes.len().max(16))?;
         library.copy_h2d(allocation.buffer, bytes)?;

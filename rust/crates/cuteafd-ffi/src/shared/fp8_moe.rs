@@ -9,6 +9,18 @@ use std::{ffi::c_void, marker::PhantomData, path::Path, ptr::NonNull, rc::Rc};
 pub const FP8_MOE_POINTERS: usize = 11;
 pub const FP8_MOE_LIBRARY: &str = "libcuteafd_fp8moe.so";
 
+/// The expert weight format a package reads (ABI word 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fp8MoeWeights {
+    /// ABI 1: E4M3 with FP32 128x128 block scales.
+    Fp8,
+    /// ABI 2: packed E2M1 with UE8M0 scales per 32.
+    Mxfp4,
+    /// ABI 3: ModelOpt NVFP4: packed E2M1, E4M3 scales per 16, each scale
+    /// region followed by the experts' FP32 `weight_scale_2` (W4A16).
+    Nvfp4,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fp8MoeInfo {
     pub hidden: usize,
@@ -21,15 +33,14 @@ pub struct Fp8MoeInfo {
     pub wire_input: bool,
     pub swiglu_limit: f32,
     pub capacities: Vec<usize>,
-    /// MXFP4 weights (packed E2M1 + UE8M0 per 32, ABI 2) rather than E4M3 +
-    /// FP32 128x128 scales (ABI 1). MXFP4 slices are zero-padded to 128.
-    pub mxfp4: bool,
+    /// The weight format; packed FP4 slices are zero-padded to 128.
+    pub weights: Fp8MoeWeights,
 }
 
 impl Fp8MoeInfo {
     fn from_words(words: [u32; 16]) -> Result<Self> {
         let count = words[9] as usize;
-        ensure!(matches!(words[0], 1 | 2) && matches!(words[7], 1 | 7) && (1..=6).contains(&count),
+        ensure!(matches!(words[0], 1..=3) && matches!(words[7], 1 | 7) && (1..=6).contains(&count),
             "unsupported FP8 expert package ABI {words:?}");
         let info = Self {
             hidden: words[1] as usize,
@@ -41,7 +52,11 @@ impl Fp8MoeInfo {
             wire_input: words[7] == 7,
             swiglu_limit: f32::from_bits(words[8]),
             capacities: words[10..10 + count].iter().map(|&c| c as usize).collect(),
-            mxfp4: words[0] == 2,
+            weights: match words[0] {
+                1 => Fp8MoeWeights::Fp8,
+                2 => Fp8MoeWeights::Mxfp4,
+                _ => Fp8MoeWeights::Nvfp4,
+            },
         };
         // Slices are the widest rank range, zero-padded to 128 (MXFP4 32-blocks
         // or FP8 128-blocks split unevenly, TP6 of 2048: 384).

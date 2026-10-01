@@ -4,7 +4,7 @@
 use super::{bf16, bf16_or_f32, describe, leaf, require};
 use crate::families::qwen4::{Qwen4Attention, Qwen4Config};
 use crate::plan::checkpoint::Checkpoint;
-use crate::plan::experts::{exl3_spark_worlds, fp8_spark_worlds};
+use crate::plan::experts::{exl3_spark_worlds, fp8_spark_worlds, nvfp4_spark_worlds};
 use crate::plan::family::{ConfigError, ExpertContract, Family, FamilyModel, Hint, RuntimeStatus};
 use crate::plan::format::{Encoding, QuantOperand, ScaleEncoding};
 use crate::plan::names::indexed;
@@ -138,8 +138,8 @@ impl Family for Qwen {
                 "Executable: EXL3 K4/K5 (qwen4:exl3-k45, python/tools/aot/package_exl3_aot.py --geometry qwen4; \
                  exl3_cross_sm121.py for Sparks) and FP8 128x128 blocks (qwen4:fp8, native/cmake/shared/fp8_moe.cmake). \
                  BF16 fused [512, 1280, 2560] experts: serve the FP8 or EXL3 K4.25 publication, or add a BF16 \
-                 routed family. NVFP4 (ModelOpt E2M1 + E4M3 per-16 scales + FP32 global): export b12x fused_moe \
-                 NVFP4 at this geometry (W4A16 for accuracy) and teach read_expert_catalog its tensors."
+                 routed family. ModelOpt NVFP4 (E2M1 + E4M3 per-16 scales + FP32 global) runs W4A16 as qwen4:nvfp4 \
+                 (fp8_moe weights=nvfp4)."
                     .to_string(),
             ),
             Component::Speculator | Component::SpeculatorExpert => (
@@ -198,9 +198,10 @@ impl FamilyModel for QwenModel {
                     .ok_or("not a routed projection (gate/up/down_proj)")?;
                 require(operand.logical == shape, || format!("experts are {shape:?}, found {}", describe(operand)))?;
                 require(operand.is_fp8_block(128, &[ScaleEncoding::F32, ScaleEncoding::Bf16])
-                    || matches!(operand.exl3_bits(), Some(4..=5)), || {
-                    format!("routed experts run EXL3 K4/K5 (qwen4:exl3-k45) or E4M3 with 128x128 scales (qwen4:fp8); \
-                        found {}", describe(operand))
+                    || matches!(operand.exl3_bits(), Some(4..=5))
+                    || operand.is_nvfp4() && operand.scale.as_ref().is_some_and(|s| s.cols == 16), || {
+                    format!("routed experts run EXL3 K4/K5 (qwen4:exl3-k45), E4M3 with 128x128 scales (qwen4:fp8) or \
+                        ModelOpt NVFP4 group 16 (qwen4:nvfp4); found {}", describe(operand))
                 })
             }
             // The n-gram table: BF16 or E4M3 shards (`ngram_embedding.shard_*`)
@@ -234,6 +235,14 @@ impl FamilyModel for QwenModel {
                 block: 128,
                 spark_worlds: exl3_spark_worlds(moe.intermediate),
                 local: Ok("serve-qwen4 --local-experts (TP1 EXL3 package)".into()),
+            });
+        }
+        if operand.is_nvfp4() {
+            return Some(ExpertContract {
+                package: "qwen4:nvfp4".into(),
+                block: 16,
+                spark_worlds: nvfp4_spark_worlds(moe.intermediate),
+                local: Ok("serve-qwen4 --local-experts (fp8-qwen4-nvfp4 tp1)".into()),
             });
         }
         operand.is_fp8_block(128, &[ScaleEncoding::F32, ScaleEncoding::Bf16]).then(|| ExpertContract {

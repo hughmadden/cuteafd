@@ -151,12 +151,14 @@ pub(super) fn load_fp8<'a>(
 ) -> Result<(Weights<'a>, usize)> {
     let tensors = catalog.fp8().context("FP8 residency requires the checkpoint's FP8 experts")?;
     // FP8 slices are whole 128-row blocks (TP2/TP4 of 2048); MXFP4 slices are
-    // whole 32-blocks padded to 128 (MiMo V2.6 Pro: TP6, TP2). `slice` checks it.
-    ensure!(config.topology.is_none() && matches!(config.world, 2 | 4 | 6),
-        "FP8/MXFP4 experts serve implicit Spark TP2, TP4 or TP6 groups");
+    // whole 32-blocks padded to 128 (MiMo V2.6 Pro: TP6, TP2), NVFP4 ones whole
+    // 16-blocks padded to 128 (TP3 as well). `slice` checks it; the package
+    // directory has a layout per built world.
+    ensure!(config.topology.is_none() && matches!(config.world, 2 | 3 | 4 | 6),
+        "FP8/MXFP4/NVFP4 experts serve implicit Spark TP2, TP3, TP4 or TP6 groups");
     tensors.slice(config.world)?;
     let directory = config.fp8_package.clone()
-        .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&config.library, config.world));
+        .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&config.library, config.world, tensors.format()));
     let layers = config.resident_layers(catalog.routed_experts().layers)?;
     let workspace = Fp8Worker::workspace_bytes(config.capacity as usize);
     let budget = config.device_budget.checked_sub(workspace).context("FP8 worker workspace exceeds the budget")?;

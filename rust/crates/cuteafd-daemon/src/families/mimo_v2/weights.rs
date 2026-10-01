@@ -333,6 +333,54 @@ impl<'a> MimoLoader<'a> {
         })
     }
 
+    /// [`Self::fp8_kmajor`] over a head split's `ranks` GPUs: each tensor's rows
+    /// split evenly (V2 Flash's q / k / v by heads: whole query heads and the KV
+    /// heads they read), rank `r`'s slices concatenated in tensor order, every row
+    /// with its own grid value. Read once.
+    fn fp8_kmajor_ranks(&self, names: &[String], ranks: usize) -> Result<Vec<Fp8Copy<'a>>> {
+        let total: u64 = names.iter().map(|n| self.tensor(n).map(|t| t.meta.byte_length)).sum::<Result<u64>>()?;
+        crate::shared::memory::staging::with_staging(total as usize, |values| {
+            // Per tensor: its first row in the concatenation and row count; per row: grid and block row.
+            let (mut grids, mut rows, mut parts) = (Vec::new(), Vec::<(usize, usize)>::new(), Vec::new());
+            let (mut cols, mut at) = (None, 0usize);
+            for name in names {
+                let (length, dtype, shape) = self.read_into(name, values, at)?;
+                at += length;
+                ensure!(dtype == DType::F8E4M3 && shape.len() == 2 && shape[1] % 128 == 0
+                    && cols.is_none_or(|c| c == shape[1]) && shape[0] % ranks == 0,
+                    "{name}: a head split takes this weight as an FP8 checkpoint tensor whose rows split over {ranks} \
+                     GPUs, found {dtype:?} {shape:?}");
+                cols = Some(shape[1]);
+                let (scale, scale_dtype, scale_shape) = self.raw(&format!("{name}_scale_inv"))?;
+                ensure!(scale_dtype == DType::F32 && scale_shape.len() == 2 && scale_shape[1] == shape[1] / 128,
+                    "{name}: expected FP32 block scales, found {scale_dtype:?} {scale_shape:?}");
+                grids.push(scale.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<f32>>());
+                parts.push((rows.len(), shape[0]));
+                rows.extend(scale_rows(name, shape[0], scale_shape[0])?.into_iter().map(|r| (grids.len() - 1, r)));
+            }
+            let cols = cols.context("no FP8 rows")?;
+            let k_blocks = cols / 128;
+            (0..ranks).map(|rank| {
+                let picked: Vec<usize> = parts.iter()
+                    .flat_map(|&(first, count)| first + rank * count / ranks..first + (rank + 1) * count / ranks).collect();
+                let n = picked.len();
+                let mut bytes = Vec::with_capacity(n * cols);
+                let (mut scale, mut kscale) = (vec![0u8; k_blocks * n * 4], vec![0u8; k_blocks * n * 4]);
+                for (i, &row) in picked.iter().enumerate() {
+                    bytes.extend_from_slice(&values[row * cols..(row + 1) * cols]);
+                    let (grid, r) = rows[row];
+                    for b in 0..k_blocks {
+                        let v = grids[grid][r * k_blocks + b].to_le_bytes();
+                        scale[(i * k_blocks + b) * 4..][..4].copy_from_slice(&v);
+                        kscale[(b * n + i) * 4..][..4].copy_from_slice(&v);
+                    }
+                }
+                self.on_rank(rank, |_| Ok(Fp8Copy { values: self.upload(&bytes)?, scale: self.upload(&scale)?,
+                    kscale: self.upload(&kscale)? }))
+            }).collect()
+        })
+    }
+
     /// V2.6 Pro's fused `qkv_proj` (FP8, TP-interleaved row shards with their
     /// own 128x128 grids) in the coordinator's `[q; k; v]` layout with keys
     /// `cfg.qkv_key_stride()` rows apart (256: each 192-row key zero-padded):
@@ -597,8 +645,9 @@ impl<'a> MimoLoader<'a> {
             format!("{p}.self_attn.v_proj.weight")];
         let copies = if self.has(&fused) {
             self.fused_qkv(cfg, attention, &fused, ranks)?
+        } else if ranks > 1 {
+            self.fp8_kmajor_ranks(&qkv, ranks)?
         } else {
-            ensure!(ranks == 1, "{layer}: a head split needs the fused qkv_proj layout (MiMo V2.6 Pro)");
             vec![self.fp8_kmajor(&qkv)?]
         };
         for (map, copy) in ops.iter_mut().zip(copies) {

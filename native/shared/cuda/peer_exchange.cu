@@ -2,8 +2,10 @@
 // `cuteafd fabric --p2p` probe that measures it against the copy engine and a
 // pinned-host bounce.
 #include "cuteafd_peer_exchange.h"
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include <cstdio>
 #include <algorithm>
 #include <atomic>
 #include <thread>
@@ -42,14 +44,36 @@ __global__ void push_signal(uint4* destination, const uint4* source, uint64_t un
   }
 }
 
+__device__ __forceinline__ uint64_t global_ns() {
+  uint64_t ns;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ns));
+  return ns;
+}
+
+// A wait gives up after this long (the peer's stream failed or was never fed):
+// the trap faults this stream, so the host sees an error instead of a hang.
+constexpr uint64_t kWaitTimeoutNs = 60ull * 1000 * 1000 * 1000;
+
 __global__ void wait_flag(const uint32_t* flag, uint32_t* state) {
   if (threadIdx.x == 0) {
     const uint32_t expected = state[0] + 1;
+    const uint64_t start = global_ns();
+    uint32_t polls = 0;
     while (int32_t(load_acquire_sys(flag) - expected) < 0) {
+      if ((++polls & 1023) == 0 && global_ns() - start > kWaitTimeoutNs) {
+        printf("peer_wait: flag %p still %u, waiting for %u after 60 s\n", flag, load_acquire_sys(flag), expected);
+        __trap();
+      }
     }
     state[0] = expected;
   }
   __syncthreads();
+}
+
+__global__ void add_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* out, uint64_t count) {
+  const uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
+  for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += stride)
+    out[i] = __float2bfloat16_rn(__fadd_rn(__bfloat162float(a[i]), __bfloat162float(b[i])));
 }
 
 __global__ void sm_copy(uint4* destination, const uint4* source, uint64_t units) {
@@ -126,6 +150,33 @@ double median(std::vector<double> values) {
 }
 
 }  // namespace
+
+extern "C" int32_t cuteafd_peer_exchange_initialize() {
+  // Loads the exchange kernels on the current device now: a lazily loaded kernel's
+  // first launch may wait for the device to idle, which a spinning wait never does.
+  cudaFuncAttributes attributes{};
+  for (const void* kernel : {reinterpret_cast<const void*>(push_signal), reinterpret_cast<const void*>(wait_flag),
+       reinterpret_cast<const void*>(add_bf16)}) {
+    const cudaError_t status = cudaFuncGetAttributes(&attributes, kernel);
+    if (status != cudaSuccess) return status;
+  }
+  return cudaSuccess;
+}
+
+extern "C" int32_t cuteafd_peer_add_bf16_async(const void* a, const void* b, void* out, uint64_t count, void* stream) {
+  const auto in_range = [count](const void* p, const void* q) {
+    const auto x = reinterpret_cast<uintptr_t>(p), y = reinterpret_cast<uintptr_t>(q);
+    return x + 2 * count <= y || y + 2 * count <= x;
+  };
+  if (!a || !b || !out || !stream || !count || count > (1ull << 36) ||
+      ((reinterpret_cast<uintptr_t>(a) | reinterpret_cast<uintptr_t>(b) | reinterpret_cast<uintptr_t>(out)) & 1) ||
+      !in_range(a, out) || !in_range(b, out))
+    return cudaErrorInvalidValue;
+  const uint64_t blocks = std::min<uint64_t>((count + 255) / 256, 4096);
+  add_bf16<<<unsigned(blocks), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const __nv_bfloat16*>(a), static_cast<const __nv_bfloat16*>(b), static_cast<__nv_bfloat16*>(out), count);
+  return cudaGetLastError();
+}
 
 extern "C" int32_t cuteafd_peer_push_signal(void* destination, const void* source, uint64_t bytes,
     uint32_t* flag, uint32_t* send_state, uint32_t blocks, void* stream) {
