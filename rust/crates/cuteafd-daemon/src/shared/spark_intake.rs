@@ -41,6 +41,47 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// Most ranks a compact reduction sums.
 pub(crate) const MAX_INTAKE_RANKS: usize = 6;
 
+/// Spark-side reduction (`CUTEAFD_SPARK_REDUCE`, resolved once per process):
+/// waves of at least this many rows ask the Spark ranks to reduce-scatter
+/// their partials over the Spark fabric (each rank returns only the rows it
+/// owns, summed over every rank in rank order in FP32), so the coordinator
+/// lands one reduced plane instead of one partial plane per rank. `off` (the
+/// default) or a row count; `on` means [`SPARK_REDUCE_DEFAULT_ROWS`]. The
+/// workers need `--reduce-rail`.
+pub(crate) fn spark_reduce_min_rows() -> Option<usize> {
+    static SETTING: OnceLock<Option<usize>> = OnceLock::new();
+    *SETTING.get_or_init(|| {
+        let raw = std::env::var("CUTEAFD_SPARK_REDUCE").unwrap_or_default();
+        let rows = match raw.trim() {
+            "" | "off" | "0" => None,
+            "on" | "auto" => Some(SPARK_REDUCE_DEFAULT_ROWS),
+            // Never below a decode step: captured decode graphs bake the
+            // compact reducer over the rank planes.
+            rows => match rows.parse::<usize>() {
+                Ok(rows) => Some(rows.max(SPARK_REDUCE_FLOOR_ROWS)),
+                Err(_) => {
+                    tracing::warn!(setting = %raw, "CUTEAFD_SPARK_REDUCE is off, a row count or on; keeping it off");
+                    None
+                }
+            },
+        };
+        tracing::info!(min_rows = ?rows, "Spark-side reduction");
+        rows
+    })
+}
+
+/// A request id no other Spark-reduced wave of this process carries.
+pub(crate) fn next_reduced_request_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    (1 << 63) | NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Smallest wave `CUTEAFD_SPARK_REDUCE=on` reduces on the Sparks.
+pub(crate) const SPARK_REDUCE_DEFAULT_ROWS: usize = 512;
+/// No wave this small is reduced on the Sparks (decode steps and verifies
+/// are at most 64 rows).
+const SPARK_REDUCE_FLOOR_ROWS: usize = 128;
+
 /// Waves up to this many partial bytes (all ranks) are small: pinned mode
 /// stages them, and uploads that remain go on the compute stream.
 const SMALL_WAVE_BYTES: usize = 1 << 20;
@@ -269,6 +310,9 @@ pub(crate) struct SparkIntake<'a> {
     consumed: *mut c_void,
     consumed_pending: Cell<bool>,
     copies_pending: Cell<bool>,
+    /// The current wave was reduced on the Sparks: plane r holds rank r's
+    /// reduced rows ([`cuteafd_transport::expert::spark_row_shard`]).
+    row_sharded: Cell<bool>,
     /// Receive slots whose uploads are queued; released before the next wave.
     held: Arc<Mutex<Vec<(usize, u32, VerbsHostProtocolV2ResponsePayload)>>>,
 }
@@ -297,6 +341,7 @@ impl<'a> SparkIntake<'a> {
             consumed: library.cuda_event_create_ordering()?,
             consumed_pending: Cell::new(false),
             copies_pending: Cell::new(false),
+            row_sharded: Cell::new(false),
             held: Arc::new(Mutex::new(Vec::new())),
         })
     }
@@ -459,6 +504,38 @@ impl<'a> SparkIntake<'a> {
         self.upload_staging(0, plane_bytes, stream)
     }
 
+    /// Whether the current wave was reduced on the Sparks.
+    pub(crate) fn row_sharded(&self) -> bool {
+        self.row_sharded.get()
+    }
+
+    /// Records whether the wave about to be dispatched (directly on a
+    /// transport, after [`Self::before_dispatch`]) is reduced on the Sparks.
+    pub(crate) fn set_row_sharded(&self, sharded: bool) {
+        self.row_sharded.set(sharded);
+    }
+
+    /// Queues `output = shared + this wave's routed sum` for `t` rows on
+    /// `stream`: the compact reducer over the rank planes, or for a wave
+    /// reduced on the Sparks the gather of their reduced rows.
+    ///
+    /// # Safety
+    /// `shared` (or null) and `output` are live `[t, hidden]` BF16 device
+    /// buffers ordered on `stream`, and the planes hold this wave's rows on
+    /// `stream` (after its receive).
+    pub(crate) unsafe fn reduce_into(&self, shared: *const u16, output: *mut u16, t: usize, stream: *mut c_void)
+        -> Result<()> {
+        let reducer = self.library.v41_compact_reducer()?;
+        // SAFETY: forwarded from this function's contract.
+        unsafe {
+            if self.row_sharded.get() {
+                reducer.gather_row_shards(self.pointers(), self.ranks as u32, shared, output, t as u32, stream)
+            } else {
+                reducer.reduce_planes(self.pointers(), self.ranks as u32, shared, output, t as u32, stream)
+            }
+        }
+    }
+
     /// Plane pointers for the compact reducer.
     pub(crate) fn pointers(&self) -> [*const u16; MAX_INTAKE_RANKS] {
         let mut pointers = [std::ptr::null::<u16>(); MAX_INTAKE_RANKS];
@@ -582,6 +659,8 @@ pub(crate) fn copy_parallel(dst: &mut [u8], src: &[u8]) {
 pub(crate) struct SparkLink<'a> {
     pub(crate) transport: SparkExperts,
     pub(crate) intake: SparkIntake<'a>,
+    /// Waves of at least this many rows are reduced on the Sparks.
+    reduce_min_rows: Option<usize>,
 }
 
 impl<'a> SparkLink<'a> {
@@ -595,7 +674,19 @@ impl<'a> SparkLink<'a> {
         // SAFETY: the link drops its transport before its intake, and every
         // dispatch goes through `dispatch`, which calls `before_dispatch`.
         unsafe { intake.attach(&mut transport)? };
-        Ok(Self { transport, intake })
+        let reduce_min_rows = spark_reduce_min_rows().filter(|_| {
+            let supported = library.v41_compact_reducer().is_ok_and(|reducer| reducer.supports_row_shards());
+            if !supported {
+                tracing::warn!("the native library has no row-shard gather; Spark-side reduction stays off");
+            }
+            supported
+        });
+        Ok(Self { transport, intake, reduce_min_rows })
+    }
+
+    /// Whether a `t`-row wave is reduced on the Sparks.
+    pub(crate) fn reduces_on_sparks(&self, t: usize) -> bool {
+        self.reduce_min_rows.is_some_and(|min| t >= min.max(self.world_size()))
     }
 
     pub(crate) fn world_size(&self) -> usize {
@@ -605,7 +696,20 @@ impl<'a> SparkLink<'a> {
     /// Posts `request` to every rank once the previous wave's planes are free.
     pub(crate) fn dispatch(&mut self, request: &cuteafd_transport::ExpertProtocolV2Request) -> Result<SparkExpertWave> {
         self.intake.before_dispatch()?;
-        self.transport.dispatch_wave(request)
+        let sharded = self.reduces_on_sparks(request.header.row_count as usize);
+        self.intake.row_sharded.set(sharded);
+        if sharded {
+            // Rows and routes are small next to the shared hidden payload.
+            let mut flagged = request.clone();
+            flagged.header.flags |= cuteafd_transport::expert::SPARK_ROW_SHARD_FLAGS;
+            // The ranks tag their slices with the request id; engines reuse
+            // ids across waves (MiMo: the layer), so reduced waves get ids
+            // unique in this process.
+            flagged.header.request_id = next_reduced_request_id();
+            self.transport.dispatch_wave(&flagged)
+        } else {
+            self.transport.dispatch_wave(request)
+        }
     }
 
     /// Receives `wave` (`t` rows) into the planes, ordering `stream` after it.
@@ -622,13 +726,9 @@ impl<'a> SparkLink<'a> {
     /// ordered on `stream` before this call.
     pub(crate) unsafe fn reduce(&self, shared: *const u16, output: *mut u16, t: usize, stream: *mut c_void)
         -> Result<()> {
-        let library = self.intake.library;
         // SAFETY: the planes hold this wave's `t` rows once `stream` reaches
         // this point (see `receive`); the caller vouches for the rest.
-        unsafe {
-            library.v41_compact_reducer()?.reduce_planes(self.intake.pointers(), self.world_size() as u32, shared,
-                output, t as u32, stream)?;
-        }
+        unsafe { self.intake.reduce_into(shared, output, t, stream)? };
         self.intake.consumed(stream)
     }
 }

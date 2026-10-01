@@ -196,6 +196,28 @@ if [[ "$restart" == 1 ]]; then
     ssh "$host" 'ids=$(docker ps -aq --filter name=^cuteafd-spark-expert-); [ -z "$ids" ] || docker rm -f $ids >/dev/null 2>&1 || true'
   done
 fi
+# SPARK_REDUCE (off, on or a minimum row count): waves of at least that many
+# rows are reduce-scattered among the Sparks (CUTEAFD_SPARK_REDUCE), which then
+# return one reduced slice each instead of whole partial planes. The workers'
+# mesh runs on SPARK_REDUCE_RAILS (b: the SPARK_i_LANE_B addresses, a, or a,b
+# for both) at EXPERT_PORT + 100 (+ 101 for the second rail).
+spark_reduce="$(get SPARK_REDUCE off)"
+reduce_args=""
+if [[ "$spark_reduce" != off ]]; then
+  rail_index=0
+  IFS=',' read -ra reduce_rails <<<"$(get SPARK_REDUCE_RAILS b)"
+  for rail in "${reduce_rails[@]}"; do
+    case "$rail" in a) lane_key=LANE_A ;; b) lane_key=LANE_B ;; *) echo "SPARK_REDUCE_RAILS takes a, b or a,b" >&2; exit 2 ;; esac
+    addresses=()
+    for ((rank = 0; rank < ranks; rank++)); do
+      address="$(get "SPARK_${rank}_${lane_key}")"
+      [[ -n "$address" ]] || { echo "SPARK_REDUCE needs SPARK_${rank}_${lane_key}" >&2; exit 2; }
+      addresses+=("$address:$((port + 100 + rail_index))")
+    done
+    reduce_args+=" --reduce-rail $(IFS=,; echo "${addresses[*]}")"
+    rail_index=$((rail_index + 1))
+  done
+fi
 # GB10 CUDA allocations cannot reclaim page cache: drop it on the expert hosts first.
 spark_hosts=()
 for ((rank = 0; rank < ranks; rank++)); do spark_hosts+=(--host "$(get "SPARK_${rank}_HOST")"); done
@@ -209,7 +231,7 @@ for ((rank = 0; rank < ranks; rank++)); do
     -v \$(readlink -f \$HOME/.cache/huggingface/hub):/root/.cache/huggingface/hub:ro '$spark_image' \
     cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
     --rank $rank --world $ranks --capacity 4096 --device-budget-bytes $budget $layer_args \
-    --listen 0.0.0.0:$port >/dev/null" &
+    --listen 0.0.0.0:$port$reduce_args >/dev/null" &
 done
 wait
 for ((rank = 0; rank < ranks; rank++)); do
@@ -227,6 +249,7 @@ intake="$(get SPARK_INTAKE auto)"
 case "$intake" in auto|gpu|pinned|host) ;; *) echo "SPARK_INTAKE must be auto, gpu, pinned or host" >&2; exit 2 ;; esac
 docker run -d --name cuteafd-coordinator --restart no --gpus "device=$gpu" --network host --ipc host \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e "CUTEAFD_SPARK_INTAKE=$intake" \
+  -e "CUTEAFD_SPARK_REDUCE=$spark_reduce" \
   -v "$hub:/root/.cache/huggingface/hub:ro" \
   "${trace_args[@]}" "$coordinator_image" cuteafd $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peer_csv" --listen "$addr" \

@@ -1,6 +1,9 @@
 //! The GPU owner polls admitted QPs and sends results without work queues.
 use super::*;
-use cuteafd_transport::{LocalVerbsExpertConnection, ProtocolV2ExecutorResponseRef};
+use cuteafd_transport::{
+    ExpertProtocolV2ResponseHeader, LocalVerbsExpertConnection, ProtocolV2ExecutorResponseRef,
+    RequestDisposition, SparkReduceMesh, SparkReduceMeshConfig,
+};
 use std::{
     net::TcpListener,
     sync::{
@@ -12,6 +15,44 @@ use std::{
 
 struct Admission {
     stop: Arc<AtomicBool>,
+}
+
+/// A wave whose partial went out to the other ranks; answered once their
+/// copies of this rank's rows arrive.
+struct ReduceJob {
+    connection: u64,
+    partial: usize,
+    tag: u32,
+    rows: u32,
+    header: ExpertProtocolV2ResponseHeader,
+    started: Instant,
+    computed_ms: f64,
+}
+
+/// The reduction mesh, formed on its own thread while the weights load.
+enum Mesh {
+    Off,
+    Forming(mpsc::Receiver<Result<SparkReduceMesh>>),
+    Ready(SparkReduceMesh),
+    Failed(String),
+}
+
+impl Mesh {
+    fn get(&mut self) -> Result<&mut SparkReduceMesh> {
+        if let Mesh::Forming(receiver) = self {
+            *self = match receiver.recv_timeout(Duration::from_secs(600)) {
+                Ok(Ok(mesh)) => Mesh::Ready(mesh),
+                Ok(Err(error)) => Mesh::Failed(format!("{error:#}")),
+                Err(_) => Mesh::Failed("the reduction mesh never formed".into()),
+            };
+        }
+        match self {
+            Mesh::Ready(mesh) => Ok(mesh),
+            Mesh::Off => anyhow::bail!("Spark reduction requested but this worker has no --reduce-rail"),
+            Mesh::Failed(error) => anyhow::bail!("Spark reduction mesh unavailable: {error}"),
+            Mesh::Forming(_) => unreachable!("resolved above"),
+        }
+    }
 }
 impl Drop for Admission {
     fn drop(&mut self) {
@@ -40,6 +81,27 @@ pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()>
         (minimum_frame..=64 * 1024 * 1024).contains(&config.max_frame_bytes),
         "invalid native frame budget"
     );
+    let mut mesh = if config.reduce_rails.is_empty() {
+        Mesh::Off
+    } else {
+        let mesh_config = SparkReduceMeshConfig {
+            rank: config.rank,
+            world: config.world,
+            rails: config.reduce_rails.clone(),
+            capacity_rows: config.capacity,
+            row_bytes: geometry.row_bytes() as usize,
+            timeout: Duration::from_secs(1800),
+        };
+        let (formed, receiver) = mpsc::sync_channel(1);
+        thread::Builder::new().name("spark-reduce-mesh".into()).spawn(move || {
+            let mesh = SparkReduceMesh::establish(mesh_config);
+            if let Err(error) = &mesh {
+                tracing::error!("Spark reduction mesh failed: {error:#}");
+            }
+            let _ = formed.send(mesh);
+        })?;
+        Mesh::Forming(receiver)
+    };
     let library = unsafe { NativeLibrary::load(&config.library) }?;
     let (weights, remaining) = load_weights(&library, &catalog, &config)?;
     let mut execution = weights.execution(&library, &config, remaining)?;
@@ -121,7 +183,19 @@ pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()>
         Some(topology) => topology.executor_id(config.rank)?,
         None => cuteafd_transport::expert::v41_spark_executor_id(config.world, config.rank)?,
     };
-    let mut connections = Vec::<LocalVerbsExpertConnection>::with_capacity(16);
+    let mut connections = Vec::<(u64, LocalVerbsExpertConnection)>::with_capacity(16);
+    let mut next_connection = 0u64;
+    let mut jobs = Vec::<ReduceJob>::with_capacity(cuteafd_transport::SPARK_REDUCE_WAVES);
+    let reducer = library.v41_compact_reducer()?;
+    let reduce_stream = match mesh {
+        Mesh::Off => std::ptr::null_mut(),
+        _ => {
+            ensure!(reducer.supports_row_shards(), "the native library has no Spark reduction kernels");
+            library.cuda_stream_create()?
+        }
+    };
+    let reduce_timing = std::env::var("CUTEAFD_SPARK_REDUCE_TIMING").is_ok_and(|v| v == "1");
+    let row_bytes = geometry.row_bytes() as usize;
     // Structured startup evidence: one line per rank naming the native role and
     // logical intermediate this worker actually loaded. A captured log can then
     // be hashed and checked against the declared topology, instead of trusting a
@@ -156,8 +230,9 @@ pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()>
     let mut pending_steady_log = false;
     loop {
         let mut progressed = false;
-        if connections.is_empty() {
-            connections.push(incoming.recv().context("native RoCE admission stopped")?);
+        if connections.is_empty() && jobs.is_empty() {
+            connections.push((next_connection, incoming.recv().context("native RoCE admission stopped")?));
+            next_connection += 1;
             progressed = true;
             pending_steady_log = true;
             log_spark_memory_if_enabled(
@@ -170,7 +245,8 @@ pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()>
         } else if let Ok(connection) = incoming.try_recv() {
             progressed = true;
             if connections.len() < 16 {
-                connections.push(connection);
+                connections.push((next_connection, connection));
+                next_connection += 1;
                 pending_steady_log = true;
                 log_spark_memory_if_enabled(
                     &library,
@@ -185,13 +261,15 @@ pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()>
         }
         let waiting = !progressed
             && !connections.is_empty()
+            && jobs.is_empty()
             && last_activity.elapsed() >= idle_spin;
         let wait_index = waiting.then(|| idle_cursor % connections.len());
         let mut index = 0;
         while index < connections.len() {
             let mut execution_failed = false;
             let wait = (wait_index == Some(index)).then_some(idle_wait);
-            let result = connections[index].poll(wait, |view, mapped, emit| {
+            let connection_id = connections[index].0;
+            let result = connections[index].1.poll(wait, |view, mapped, emit| {
                 // A topology-bound worker admits only the ownership-aware
                 // request contract; every other family is a protocol mismatch,
                 // not a silent fallback.
@@ -205,6 +283,45 @@ pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()>
                         BackboneRequest::parse_paired(view.frame_bytes(), config.capacity)?,
                     None => BackboneRequest::parse(view.frame_bytes(), config.capacity)?,
                 };
+                if request.is_row_sharded() {
+                    let started = Instant::now();
+                    let mesh = mesh.get()?;
+                    let tag = request_tag(&request);
+                    ensure!(!jobs.iter().any(|job| job.tag == tag), "two reduction waves share tag {tag:#x}");
+                    let header = request.row_shard_response_header(executor_id, config.world, config.rank)?;
+                    let (partial, slot) = mesh.acquire()?;
+                    if !skip_compute {
+                        let computed = (|| {
+                            let layer = (request.layer() as usize).checked_sub(config.first_layer)
+                                .context("requested expert layer is not resident on this Spark")?;
+                            execution.bind_layer(&weights, layer)?;
+                            // SAFETY: the partial buffer is mapped, device-visible
+                            // and claimed for this wave until `finish`.
+                            unsafe { execution.execute_mapped_request(&request, executor_id, &mut exchange,
+                                slot, Some(mapped.hidden_payload)) }
+                        })();
+                        match computed {
+                            Ok(Some(_)) => {}
+                            Ok(None) => {
+                                mesh.abandon(partial);
+                                anyhow::bail!("this expert backend has no device response path for Spark reduction");
+                            }
+                            Err(error) => {
+                                mesh.abandon(partial);
+                                execution_failed = true;
+                                return Err(error);
+                            }
+                        }
+                    }
+                    let computed_ms = started.elapsed().as_secs_f64() * 1e3;
+                    if let Err(error) = mesh.post(partial, tag, request.rows()) {
+                        mesh.abandon(partial);
+                        return Err(error);
+                    }
+                    jobs.push(ReduceJob { connection: connection_id, partial, tag, rows: request.rows(), header,
+                        started, computed_ms });
+                    return Ok(RequestDisposition::Deferred);
+                }
                 if skip_compute {
                     if let Some(slot) = mapped.response_slot {
                         let prefix = cuteafd_transport::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
@@ -215,7 +332,8 @@ pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()>
                                 ptr: unsafe { slot.ptr.cast::<u8>().add(prefix) }.cast(), bytes, ..slot
                             };
                             return emit(ProtocolV2ExecutorResponseRef::Device(
-                                request.response_device(executor_id, output)?));
+                                request.response_device(executor_id, output)?))
+                                .map(|()| RequestDisposition::Answered);
                         }
                     }
                 }
@@ -232,7 +350,8 @@ pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()>
                         Err(error) => { execution_failed = true; return Err(error); }
                     };
                     if let Some(response) = response {
-                        return emit(ProtocolV2ExecutorResponseRef::Device(response));
+                        return emit(ProtocolV2ExecutorResponseRef::Device(response))
+                            .map(|()| RequestDisposition::Answered);
                     }
                 }
                 let mut emit_failed = false;
@@ -249,7 +368,7 @@ pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()>
                     },
                 );
                 execution_failed = result.is_err() && !emit_failed;
-                result
+                result.map(|()| RequestDisposition::Answered)
             });
             match result {
                 Ok(processed) => {
@@ -275,6 +394,58 @@ pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()>
                 }
             }
         }
+        if !jobs.is_empty() {
+            let Mesh::Ready(mesh) = &mut mesh else { unreachable!("jobs exist only with a ready mesh") };
+            mesh.poll().context("Spark reduction mesh failed")?;
+            let mut index = 0;
+            while index < jobs.len() {
+                let job = &jobs[index];
+                let Some(steps) = mesh.ready(job.partial, job.tag, job.rows)? else {
+                    index += 1;
+                    continue;
+                };
+                let arrived_ms = job.started.elapsed().as_secs_f64() * 1e3;
+                let owner = connections.iter().position(|(id, _)| *id == job.connection);
+                let mut answered = Ok(());
+                if let Some(position) = owner {
+                    let connection = &mut connections[position].1;
+                    answered = (|| -> Result<()> {
+                        let slot = connection.deferred_response_slot()?;
+                        let base = slot.ptr as usize + cuteafd_transport::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
+                        ensure!(slot.bytes >= cuteafd_transport::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN
+                            + job.header.output_payload_bytes as usize, "reduced rows exceed the response slot");
+                        for step in &steps {
+                            let output = (base + step.row_offset as usize * row_bytes) as *mut u16;
+                            // SAFETY: the slices are this wave's received and own
+                            // rows (mapped, device-visible); the output range lies
+                            // inside the reserved response slot (checked above).
+                            unsafe {
+                                reducer.reduce_rank_slices(step.slices, config.world as u32, output,
+                                    step.rows as u64 * (row_bytes / 2) as u64, reduce_stream)?;
+                            }
+                        }
+                        // SAFETY: the stream was created above and is live.
+                        unsafe { library.cuda_stream_synchronize(reduce_stream)? };
+                        Ok(())
+                    })();
+                }
+                mesh.finish(job.partial, job.tag)?;
+                let job = jobs.swap_remove(index);
+                if let (Some(position), Ok(())) = (owner, &answered) {
+                    answered = connections[position].1.complete_deferred(job.header.clone());
+                }
+                if reduce_timing {
+                    eprintln!("spark_reduce wave={:#x} rows={} share={} compute_ms={:.3} exchange_ms={:.3} total_ms={:.3}",
+                        job.tag, job.rows, job.header.row_count, job.computed_ms, arrived_ms - job.computed_ms,
+                        job.started.elapsed().as_secs_f64() * 1e3);
+                }
+                if let (Some(position), Err(error)) = (owner, answered) {
+                    tracing::warn!(%error, "native RoCE peer removed while answering a reduced wave");
+                    connections.swap_remove(position);
+                }
+                progressed = true;
+            }
+        }
         if progressed {
             last_activity = Instant::now();
         }
@@ -284,4 +455,10 @@ pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()>
             std::hint::spin_loop();
         }
     }
+}
+
+/// The wave tag peers attach to their slices: the request id the coordinator
+/// sent every rank (unique among waves in flight).
+fn request_tag(request: &BackboneRequest<'_>) -> u32 {
+    request.request_id() as u32
 }

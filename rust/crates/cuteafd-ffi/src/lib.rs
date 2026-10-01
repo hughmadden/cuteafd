@@ -618,6 +618,17 @@ impl Default for CuteafdRdmaRcEndpointBufferView {
     }
 }
 
+/// `cuteafd_rdma_completion_t`: one peer-exchange work completion.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CuteafdRdmaCompletion {
+    pub wr_id: u64,
+    pub byte_len: u32,
+    pub imm: u32,
+    pub recv: u32,
+    pub has_imm: u32,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct CuteafdRdmaRcCompletionStats {
@@ -3721,6 +3732,59 @@ impl NativeLibrary {
             )
         };
         self.status_to_result("cuteafd_rdma_rc_endpoint_copy_recv_at", status)
+    }
+
+    /// Registers `[ptr, ptr + bytes)` on the endpoint's protection domain for
+    /// [`Self::rdma_rc_endpoint_post_send_region`]; returns the region index.
+    ///
+    /// # Safety
+    /// The range must be host memory that stays allocated until the endpoint is
+    /// destroyed.
+    pub unsafe fn rdma_rc_endpoint_register_region(
+        &self,
+        handle: *mut c_void,
+        ptr: *mut c_void,
+        bytes: usize,
+    ) -> Result<u32> {
+        type RegisterFn = unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut u32) -> CuteafdStatus;
+        let register: Symbol<RegisterFn> =
+            unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_register_region")? };
+        let mut region = 0;
+        let status = unsafe { register(handle, ptr, bytes, &mut region) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_register_region", status)?;
+        Ok(region)
+    }
+
+    /// Posts a signaled SEND_WITH_IMM of `bytes` at `offset_bytes` in `region`.
+    pub fn rdma_rc_endpoint_post_send_region(
+        &self,
+        handle: *mut c_void,
+        region: u32,
+        offset_bytes: usize,
+        bytes: usize,
+        wr_id: u64,
+        imm: u32,
+    ) -> Result<()> {
+        type PostFn = unsafe extern "C" fn(*mut c_void, u32, usize, usize, u64, u32) -> CuteafdStatus;
+        let post: Symbol<PostFn> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_post_send_region")? };
+        let status = unsafe { post(handle, region, offset_bytes, bytes, wr_id, imm) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_post_send_region", status)
+    }
+
+    /// Drains up to `out.len()` completions (sends first); returns how many.
+    pub fn rdma_rc_endpoint_poll_completions(
+        &self,
+        handle: *mut c_void,
+        out: &mut [CuteafdRdmaCompletion],
+    ) -> Result<usize> {
+        type PollFn =
+            unsafe extern "C" fn(*mut c_void, *mut CuteafdRdmaCompletion, u32, *mut u32) -> CuteafdStatus;
+        let poll: Symbol<PollFn> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_poll_completions")? };
+        let capacity = u32::try_from(out.len()).unwrap_or(u32::MAX);
+        let mut count = 0;
+        let status = unsafe { poll(handle, out.as_mut_ptr(), capacity, &mut count) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_poll_completions", status)?;
+        Ok(count as usize)
     }
 
     pub fn rdma_rc_endpoint_destroy(&self, handle: *mut c_void) -> Result<()> {

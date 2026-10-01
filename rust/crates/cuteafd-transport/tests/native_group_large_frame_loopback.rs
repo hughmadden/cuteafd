@@ -327,7 +327,7 @@ fn spawn_echo_servers(
                 let mut progressed = false;
                 for (index, connection) in connections.iter_mut().enumerate() {
                     match connection.poll(None, |view, _mapped, emit| {
-                        echo_request(view, topology, executor_id, emit)
+                        echo_request(view, topology, executor_id, emit).map(|()| cuteafd_transport::RequestDisposition::Answered)
                     }) {
                         Ok(did) => progressed |= did,
                         Err(_) => dead.push(index),

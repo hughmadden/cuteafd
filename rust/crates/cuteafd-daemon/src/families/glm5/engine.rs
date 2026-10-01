@@ -766,6 +766,13 @@ impl<'a> GlmEngine<'a> {
         transport: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime) -> Result<()> {
         self.moe_front(w, layer, t)?;
         let ranks = self.moe_exchange(w, index, layer, t, cap, decode, transport, runtime)?;
+        if transport.intake.row_sharded() {
+            // SAFETY: as `reduce`: shared and delta are live [t, h] BF16
+            // buffers ordered after the wave's intake.
+            return unsafe {
+                transport.intake.reduce_into(w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream)
+            };
+        }
         self.reduce(transport.intake.pointers(), w, ranks, t)
     }
 

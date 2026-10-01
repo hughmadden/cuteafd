@@ -92,7 +92,8 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
         let (actual, remote) = remote_partials(&args, rows, hidden, topk, &routes, wire).await?;
         let started = Instant::now();
         let expected = fp8::oracle(&catalog, args.layer, &input, &routes, &sampled, fp8::swiglu_limit(&args.snapshot))?;
-        return report(&format!("layer {} rows {rows} fp8 ({} rows checked)", args.layer, sampled.len()), false,
+        return report(&format!("layer {} rows {rows} fp8{} ({} rows checked)", args.layer,
+            if args.spark_reduce { " spark-reduced" } else { "" }, sampled.len()), false,
             &pick(&actual), &expected, remote, started.elapsed());
     }
     if args.local && args.exl3_package.is_some() {
@@ -152,14 +153,20 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
     if let Some(modes) = args.intake.as_deref() {
         return intake::run(&args, &intake::parse_modes(modes)?, &peers, &executors, &mut request, hidden).await;
     }
+    if args.spark_reduce {
+        request.header.flags |= cuteafd_transport::expert::SPARK_ROW_SHARD_FLAGS;
+    }
     let mut client = SparkExperts::new_ranks(&peers, &executors, args.capacity, config)?;
     let mut actual = vec![0f32; rows * hidden];
     let started = Instant::now();
+    let world = peers.len();
+    let sharded = args.spark_reduce;
     client
-        .execute(&request, |_rank, first, payload| {
+        .execute(&request, |rank, first, payload| {
+            let base = first as usize + shard_start(sharded, rows, world, rank);
             for (index, pair) in payload.chunks_exact(2).enumerate() {
                 let value = f32::from_bits(u32::from(u16::from_le_bytes([pair[0], pair[1]])) << 16);
-                actual[first as usize * hidden + index] += value;
+                actual[base * hidden + index] += value;
             }
             Ok(())
         })
@@ -182,7 +189,8 @@ pub(crate) async fn run_expert_probe(args: ExpertProbeArgs) -> Result<()> {
     } else {
         oracle(&catalog, args.layer, hidden, &input, &routes, rows)?
     };
-    report(&format!("layer {} rows {rows} ranks {}", args.layer, peers.len()), exl3, &actual, &expected,
+    report(&format!("layer {} rows {rows} ranks {}{}", args.layer, peers.len(),
+        if args.spark_reduce { " spark-reduced" } else { "" }), exl3, &actual, &expected,
         remote, started.elapsed())
 }
 
@@ -197,6 +205,9 @@ async fn remote_partials(args: &ExpertProbeArgs, rows: usize, hidden: usize, top
         }).collect(),
         routes.to_vec(), wire)?;
     request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    if args.spark_reduce {
+        request.header.flags |= cuteafd_transport::expert::SPARK_ROW_SHARD_FLAGS;
+    }
     let peers = args.peers.as_deref().context("--peers is required without --local")?
         .split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()
         .context("--peers takes comma-separated HOST:PORT addresses")?;
@@ -207,9 +218,11 @@ async fn remote_partials(args: &ExpertProbeArgs, rows: usize, hidden: usize, top
     let mut client = SparkExperts::new_ranks(&peers, &executors, args.capacity, config)?;
     let mut actual = vec![0f32; rows * hidden];
     let started = Instant::now();
-    client.execute(&request, |_rank, first, payload| {
+    let world = peers.len();
+    client.execute(&request, |rank, first, payload| {
+        let base = first as usize + shard_start(args.spark_reduce, rows, world, rank);
         for (index, pair) in payload.chunks_exact(2).enumerate() {
-            actual[first as usize * hidden + index] += f32::from_bits(u32::from(u16::from_le_bytes([pair[0], pair[1]])) << 16);
+            actual[base * hidden + index] += f32::from_bits(u32::from(u16::from_le_bytes([pair[0], pair[1]])) << 16);
         }
         Ok(())
     }).await?;
@@ -225,6 +238,12 @@ async fn remote_partials(args: &ExpertProbeArgs, rows: usize, hidden: usize, top
         println!("round trip over {} repeats: median {:.0} us, min {:.0} us", args.repeat, times[times.len() / 2], times[0]);
     }
     Ok((actual, remote))
+}
+
+/// First wave row of `rank`'s rows: its share's start when the Sparks
+/// reduced the wave, else 0 (every rank returns a whole partial plane).
+fn shard_start(sharded: bool, rows: usize, world: usize, rank: usize) -> usize {
+    if sharded { cuteafd_transport::expert::spark_row_shard(rows as u32, world, rank).0 as usize } else { 0 }
 }
 
 fn report(what: &str, exl3: bool, actual: &[f32], expected: &[f32], remote: Duration, oracle_elapsed: Duration)

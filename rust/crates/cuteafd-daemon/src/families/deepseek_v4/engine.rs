@@ -63,6 +63,9 @@ pub(crate) struct Engine<'a> {
 const LOCAL_EXPERTS: usize = usize::MAX;
 /// `exchange` result for a layer whose routed experts were skipped.
 const SKIPPED_EXPERTS: usize = usize::MAX - 1;
+/// Or'ed into a Spark unit's rank count when its wave was reduced on the
+/// Sparks (the planes hold each rank's reduced rows).
+const ROW_SHARDED: usize = 1 << 16;
 
 /// Lanes a long prefill chunk splits into, and the fewest rows per lane worth
 /// a second Spark exchange per layer.
@@ -852,14 +855,19 @@ impl<'a> Engine<'a> {
         }
         let Scalar::I32(count) = rows else { unreachable!() };
         let reducer = self.library.v41_compact_reducer()?;
+        let (sharded, ranks) = (ranks & ROW_SHARDED != 0, (ranks & !ROW_SHARDED) as u32);
         // SAFETY: the transport's intake planes, shared and delta are live
         // [rows, h] BF16 buffers on this device, ordered after the wave's
         // intake and the shared FFN. The next dispatch on that transport
         // follows a full stream sync (`stage_request`).
         unsafe {
-            reducer.reduce_planes(planes, ranks as u32, lane.shared.buffer.ptr.cast(),
-                w.delta.buffer.ptr.cast(), count as u32, self.stream)
-                .with_context(|| format!("layer {layer} expert reduction"))?;
+            let (shared, delta) = (lane.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast());
+            if sharded {
+                reducer.gather_row_shards(planes, ranks, shared, delta, count as u32, self.stream)
+            } else {
+                reducer.reduce_planes(planes, ranks, shared, delta, count as u32, self.stream)
+            }
+            .with_context(|| format!("layer {layer} expert reduction"))?;
         }
         self.run("mhc_post", &[
             ("x", w.delta.buffer.ptr), ("residual", lane.stream_b.buffer.ptr), ("prev_post", lane.post.buffer.ptr),
@@ -1126,7 +1134,7 @@ impl<'a> Engine<'a> {
         let timer = Instant::now();
         transport.receive(wave, t, self.stream).await?;
         self.profile.borrow_mut().add(Phase::Experts, timer);
-        Ok(transport.world_size())
+        Ok(transport.world_size() | if transport.intake.row_sharded() { ROW_SHARDED } else { 0 })
     }
 
     /// A decode unit's experts; returns the rank count its post needs

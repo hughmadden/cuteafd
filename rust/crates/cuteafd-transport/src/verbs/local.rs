@@ -95,6 +95,18 @@ impl Drop for RingReservation {
     }
 }
 
+/// What an executor did with a request it was handed by
+/// [`LocalVerbsExpertConnection::poll`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestDisposition {
+    /// The final response chunk was emitted.
+    Answered,
+    /// Nothing was emitted; the answer follows later through
+    /// [`LocalVerbsExpertConnection::complete_deferred`] (Spark-side reduction
+    /// waits for the other ranks' rows without blocking this thread).
+    Deferred,
+}
+
 pub struct LocalVerbsExpertConnection {
     stream: TcpStream,
     library: Arc<NativeLibrary>,
@@ -109,6 +121,9 @@ pub struct LocalVerbsExpertConnection {
     response_send_sequence: usize,
     response_send_in_flight: usize,
     response_copy_stream: Option<VerbsHostCudaStream>,
+    /// Request id of an answer deferred by the executor; the coordinator
+    /// sends nothing else on this connection until it arrives.
+    deferred: Option<u64>,
     last_activity: Instant,
     last_liveness: Instant,
     /// Startup-resolved diagnostics flag; see `protocol_v2_timing_from_env`.
@@ -368,6 +383,7 @@ impl LocalVerbsExpertConnection {
             response_send_sequence: 0,
             response_send_in_flight: 0,
             response_copy_stream: None,
+            deferred: None,
             last_activity: Instant::now(),
             last_liveness: Instant::now(),
             timing,
@@ -388,7 +404,7 @@ impl LocalVerbsExpertConnection {
             &ExpertProtocolV2RequestView<'_>,
             ProtocolV2RequestDevicePayload,
             &mut dyn FnMut(ProtocolV2ExecutorResponseRef<'_>) -> Result<()>,
-        ) -> Result<()>,
+        ) -> Result<RequestDisposition>,
     {
         let timing_enabled = self.timing;
         let total_started = timing_enabled.then(Instant::now);
@@ -419,6 +435,11 @@ impl LocalVerbsExpertConnection {
             return Ok(false);
         }
         self.last_activity = Instant::now();
+        anyhow::ensure!(
+            self.deferred.is_none(),
+            "native RoCE request arrived while an answer was still deferred"
+        );
+        let mut deferred = None;
         let endpoint = &self.endpoint;
         let library = &self.library;
         let start = &self.start;
@@ -505,7 +526,7 @@ impl LocalVerbsExpertConnection {
                 start.execution_lane,
             )?;
             let execute_started = timing_enabled.then(Instant::now);
-            execute(&request, device_payload, &mut |response| {
+            let disposition = execute(&request, device_payload, &mut |response| {
                 if final_response_emitted {
                     bail!(
                         "persistent verbs-host executor emitted a response after the final chunk"
@@ -617,8 +638,16 @@ impl LocalVerbsExpertConnection {
                 Ok(())
             })?;
             let execute_ms = elapsed_ms_optional(execute_started);
-            if response_frames == 0 || !final_response_emitted {
-                bail!("persistent verbs-host executor did not emit a final response chunk");
+            match disposition {
+                RequestDisposition::Answered if response_frames == 0 || !final_response_emitted => {
+                    bail!("persistent verbs-host executor did not emit a final response chunk")
+                }
+                RequestDisposition::Answered => {}
+                RequestDisposition::Deferred => {
+                    anyhow::ensure!(response_frames == 0,
+                        "persistent verbs-host executor deferred a request it already answered");
+                    deferred = Some(request_id);
+                }
             }
             let post_recv_started = timing_enabled.then(Instant::now);
             endpoint.post_recv_at(
@@ -659,7 +688,62 @@ impl LocalVerbsExpertConnection {
         self.request_recv_sequence = request_recv_sequence;
         self.response_send_sequence = response_send_sequence;
         self.response_send_in_flight = response_send_in_flight;
+        if result.is_ok() {
+            self.deferred = deferred;
+        }
         result.map(|()| true)
+    }
+
+    /// Request id of the deferred answer, if one is outstanding.
+    pub fn deferred(&self) -> Option<u64> {
+        self.deferred
+    }
+
+    /// The mapped response slot the deferred answer goes out from; its payload
+    /// starts [`EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN`] bytes in. Write it,
+    /// then call [`Self::complete_deferred`].
+    pub fn deferred_response_slot(&mut self) -> Result<CuteafdDeviceBuffer> {
+        anyhow::ensure!(self.deferred.is_some(), "no deferred native RoCE answer");
+        if self.response_send_in_flight == self.response_ring.depth {
+            self.endpoint.poll(1, 0, default_control_timeout())?;
+            self.response_send_in_flight -= 1;
+        }
+        Ok(mapped_ring_slot(self.response_send_view, self.response_ring,
+            self.response_send_sequence as u64)?.device_buffer)
+    }
+
+    /// Sends the deferred answer: one unindexed frame whose `header` describes
+    /// the payload already written after the header in
+    /// [`Self::deferred_response_slot`] (all device writes finished).
+    pub fn complete_deferred(&mut self, header: ExpertProtocolV2ResponseHeader) -> Result<()> {
+        let request_id = self.deferred.context("no deferred native RoCE answer")?;
+        anyhow::ensure!(header.request_id == request_id, "deferred answer is for another request");
+        anyhow::ensure!(self.response_send_in_flight < self.response_ring.depth,
+            "deferred answer slot was not reserved");
+        let slot = mapped_ring_slot(self.response_send_view, self.response_ring,
+            self.response_send_sequence as u64)?;
+        let payload = protocol_v2_device_buffer_slice(slot.device_buffer,
+            EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN, header.output_payload_bytes as usize,
+            "deferred native RoCE answer")?;
+        let response = crate::ExpertProtocolV2DeviceResponseRef { header, row_indices: None,
+            partial_output_payload: payload };
+        let prefix = self.response_frame.encode_device_response_prefix(&response)?;
+        anyhow::ensure!(prefix.len() == EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN,
+            "deferred answers are unindexed frames without checksums");
+        let wire_bytes = prefix.len() + payload.bytes;
+        anyhow::ensure!(wire_bytes <= self.start.response_capacity_wire_bytes,
+            "deferred answer of {wire_bytes} bytes exceeds the response capacity");
+        // SAFETY: the slot's host view spans its whole capacity, which holds
+        // the header; no send from this slot is in flight (reserved above).
+        unsafe { std::ptr::copy_nonoverlapping(prefix.as_ptr(), slot.host_ptr, prefix.len()) };
+        let send_slot = self.response_send_sequence % self.response_ring.depth;
+        self.endpoint.post_send_at(self.response_ring.slot_offset(self.response_send_sequence), wire_bytes,
+            VERBS_HOST_SEND_WR_ID + send_slot as u64)?;
+        self.response_send_sequence = self.response_send_sequence.wrapping_add(1);
+        self.response_send_in_flight += 1;
+        self.deferred = None;
+        self.last_activity = Instant::now();
+        Ok(())
     }
 }
 

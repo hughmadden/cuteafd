@@ -30,6 +30,25 @@ pub const V41_HIDDEN: u32 = 5120;
 pub const V41_BACKBONE_TOPK: u32 = 6;
 pub const V41_PARTIAL_ROW_BYTES: u32 = V41_HIDDEN * 2;
 
+/// Request flags for Spark-side reduction: the TP ranks reduce-scatter their
+/// partials by rows over the Spark fabric and each returns only the rows it
+/// owns ([`spark_row_shard`]), summed over every rank in rank order in FP32
+/// and rounded once to BF16.
+pub const SPARK_ROW_SHARD_FLAGS: u32 = crate::EXPERT_PROTOCOL_V2_FLAG_SPARK_REDUCTION
+    | crate::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_SPARK_ROW_SHARDED_REDUCTION;
+
+/// Rows `[lo, hi)` of a `rows`-row wave that `rank` of `world` owns under
+/// Spark-side reduction. The native gather kernel uses the same split.
+pub fn spark_row_shard(rows: u32, world: usize, rank: usize) -> (u32, u32) {
+    let at = |r: usize| (u64::from(rows) * r as u64 / world as u64) as u32;
+    (at(rank), at(rank + 1))
+}
+
+/// Whether a request asks the Sparks to reduce-scatter its partials.
+pub fn spark_row_sharded(flags: u32) -> bool {
+    flags & SPARK_ROW_SHARD_FLAGS == SPARK_ROW_SHARD_FLAGS
+}
+
 /// Bind native Spark responses to their tensor-parallel topology without a wire
 /// ABI change. TP4 retains executor IDs 1..=4; TP2 uses the disjoint namespace
 /// 5..=6, so a two-peer coordinator rejects stale TP4 rank-0/rank-1 workers.
@@ -132,9 +151,19 @@ fn validate_canonical(
     ensure!(
         header.flags
             & !(EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
-                | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16)
+                | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
+                | SPARK_ROW_SHARD_FLAGS)
             == 0,
-        "native complete batches cannot use legacy reduction/compression or stream flags"
+        "native complete batches cannot use legacy compression or stream flags"
+    );
+    let sharded = header.flags & SPARK_ROW_SHARD_FLAGS;
+    ensure!(
+        sharded == 0 || sharded == SPARK_ROW_SHARD_FLAGS,
+        "Spark-side reduction needs both reduction flags"
+    );
+    ensure!(
+        sharded == 0 || header.flags & EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM == 0,
+        "Spark-side reduction answers with device frames, which carry no checksum"
     );
     validate_canonical_body(header, max_rows, row_at, route_at)
 }
@@ -259,6 +288,9 @@ impl<'a> BackboneRequest<'a> {
     pub fn rows(&self) -> u32 {
         self.view.header.row_count
     }
+    pub fn request_id(&self) -> u64 {
+        self.view.header.request_id
+    }
     pub fn layer(&self) -> u32 {
         self.view.header.layer_id
     }
@@ -359,7 +391,8 @@ impl<'a> BackboneRequest<'a> {
                 status: ExpertProtocolV2Status::Ok,
                 // Request-only admission flags never appear in a response.
                 flags: header.flags
-                    & !(V41_EXL3_PAIRED_REQUEST_FLAG | V41_NATIVE_GROUP_REQUEST_FLAG),
+                    & !(V41_EXL3_PAIRED_REQUEST_FLAG | V41_NATIVE_GROUP_REQUEST_FLAG
+                        | SPARK_ROW_SHARD_FLAGS),
                 executor_id,
             })
     }
@@ -371,6 +404,25 @@ impl<'a> BackboneRequest<'a> {
         };
         response.validate()?;
         Ok(response)
+    }
+    /// Whether the ranks reduce-scatter this request's partials.
+    pub fn is_row_sharded(&self) -> bool {
+        spark_row_sharded(self.view.header.flags)
+    }
+    /// Header of the reduced response `rank` of `world` returns: its own rows
+    /// ([`spark_row_shard`]) as one unindexed BF16 frame.
+    pub fn row_shard_response_header(&self, executor_id: u64, world: usize, rank: usize)
+        -> Result<ExpertProtocolV2ResponseHeader> {
+        ensure!(self.is_row_sharded(), "request does not ask for Spark-side reduction");
+        ensure!(rank < world && self.rows() as usize >= world,
+            "Spark-side reduction needs at least one row per rank");
+        let (lo, hi) = spark_row_shard(self.rows(), world, rank);
+        let mut header = self.response_header(executor_id)?;
+        header.row_count = hi - lo;
+        header.output_payload_bytes =
+            u64::from(hi - lo) * u64::from(cuteafd_core::expert_geometry().row_bytes());
+        header.flags &= !SPARK_ROW_SHARD_FLAGS;
+        Ok(header)
     }
     pub fn permits_device_response(&self) -> bool {
         self.view.header.flags & EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM == 0
@@ -468,6 +520,10 @@ impl<'a> V41Tp4Planes<'a> {
                 "native TP requires distinct nonzero executor identities"
             );
         }
+        ensure!(
+            !spark_row_sharded(h.flags) || h.row_count as usize >= executors.len(),
+            "Spark-side reduction needs at least one row per rank"
+        );
         Ok(Self {
             request_id: h.request_id,
             placement_version: h.placement_version,

@@ -162,6 +162,24 @@ int32_t cuteafd_reduce_tp2_compact_bf16_async(const uint16_t* const planes[2],
 int32_t cuteafd_reduce_compact_bf16_planes_async(const uint16_t* const planes[6],
     const uint16_t* shared, uint16_t* output, uint32_t rows, uint32_t ranks,
     void* stream);
+/* Spark-side reduction (reduce-scatter by rows). Rank r of a world of N owns
+ * rows [floor(rows*r/N), floor(rows*(r+1)/N)) of a wave.
+ *
+ * cuteafd_reduce_rank_slices_bf16_async: output[i] = BF16(sum of slices[k][i]
+ * for k in rank order, accumulated in FP32), exactly the compact planes
+ * reducer's arithmetic without a shared term. 2 <= ranks <= 8, elements a
+ * multiple of 8, every pointer 16-byte aligned, output disjoint from inputs.
+ *
+ * cuteafd_gather_row_shards_bf16_async: the coordinator's half. planes[r]
+ * holds rank r's reduced rows at its start; output[row] = BF16(owner row +
+ * optional BF16 shared row) in FP32, so with no shared term the result equals
+ * the compact planes reducer's bit for bit. ranks is 2, 3, 4 or 6, 1 <= rows
+ * <= 4096; output may equal shared exactly and must not overlap any plane. */
+int32_t cuteafd_reduce_rank_slices_bf16_async(const uint16_t* const slices[8],
+    uint32_t ranks, uint16_t* output, uint64_t elements, void* stream);
+int32_t cuteafd_gather_row_shards_bf16_async(const uint16_t* const planes[6],
+    const uint16_t* shared, uint16_t* output, uint32_t rows, uint32_t ranks,
+    void* stream);
 /* Full local routed output: sum six FP32 routes (token_sums=0) or consume
  * FP32 token sums (token_sums=1), round to BF16, add optional BF16 shared and
  * round to BF16. Output may equal shared exactly; no routed/output overlap.

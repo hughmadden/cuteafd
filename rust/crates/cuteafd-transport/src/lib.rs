@@ -62,7 +62,8 @@ pub use synthetic::{
 };
 pub use verbs::{
     gpu_landing_probe, DeviceLanding, GpuLandingProbe,
-    LocalVerbsExpertConnection, RingBudget, RingReservation,
+    LocalVerbsExpertConnection, RequestDisposition, RingBudget, RingReservation,
+    SparkReduceMesh, SparkReduceMeshConfig, SparkReduceSlices, SPARK_REDUCE_WAVES,
     serve_protocol_v2_verbs_host_with_executor, serve_synthetic_verbs_host,
     verbs_host_protocol_v2_endpoint_plan, verbs_host_protocol_v2_expert_request_roundtrip,
     verbs_host_protocol_v2_handshake_contract, verbs_host_protocol_v2_round_trip_plan,

@@ -293,6 +293,8 @@ type ReduceCompactFn =
     unsafe extern "C" fn(*const *const u16, *const u16, *mut u16, u32, *mut c_void) -> i32;
 type ReduceCompactPlanesFn =
     unsafe extern "C" fn(*const *const u16, *const u16, *mut u16, u32, u32, *mut c_void) -> i32;
+type ReduceRankSlicesFn =
+    unsafe extern "C" fn(*const *const u16, u32, *mut u16, u64, *mut c_void) -> i32;
 
 /// Compact BF16 backbone returns; independent from diagnostic per-route reduction.
 pub struct V41CompactReducer<'a> {
@@ -303,6 +305,8 @@ pub struct V41CompactReducer<'a> {
     reduce: ReduceCompactFn,
     reduce_tp2: Option<ReduceCompactFn>,
     reduce_planes: Option<ReduceCompactPlanesFn>,
+    gather_row_shards: Option<ReduceCompactPlanesFn>,
+    reduce_rank_slices: Option<ReduceRankSlicesFn>,
 }
 impl V41CompactReducer<'_> {
     /// Whether the loaded library can reduce `ranks` physical-rank BF16 planes.
@@ -468,6 +472,55 @@ impl V41CompactReducer<'_> {
     }
 }
 
+impl V41CompactReducer<'_> {
+    /// Whether the library carries the Spark-side reduction kernels.
+    pub fn supports_row_shards(&self) -> bool {
+        self.gather_row_shards.is_some() && self.reduce_rank_slices.is_some()
+    }
+
+    /// Coordinator half of the Spark-side reduction: `planes[r]` holds rank
+    /// r's reduced rows `[rows*r/ranks, rows*(r+1)/ranks)` at its start;
+    /// `output[row] = BF16(owner row + shared row)` in FP32. Without `shared`
+    /// the result equals [`Self::reduce_planes`] on the unreduced planes bit for
+    /// bit when the ranks summed in rank order in FP32.
+    /// # Safety
+    /// As [`Self::reduce_planes`], and every pointer is 16-byte aligned.
+    pub unsafe fn gather_row_shards(
+        &self,
+        planes: [*const u16; 6],
+        ranks: u32,
+        shared: *const u16,
+        output: *mut u16,
+        rows: u32,
+        stream: *mut c_void,
+    ) -> Result<()> {
+        let function = self.gather_row_shards.context("native row-shard gather unavailable")?;
+        let status = unsafe { function(planes.as_ptr(), shared, output, rows, ranks, stream) };
+        ensure!(status == 0, "row-shard gather of {ranks} ranks failed with CUDA status {status}");
+        Ok(())
+    }
+
+    /// Spark half: `output = BF16(sum of slices[0..ranks] in rank order, FP32)`
+    /// over `elements` values.
+    /// # Safety
+    /// Every slice and the output are live device-visible BF16 ranges of
+    /// `elements` values, 16-byte aligned, output disjoint from the slices;
+    /// storage outlives stream completion.
+    pub unsafe fn reduce_rank_slices(
+        &self,
+        slices: [*const u16; 8],
+        ranks: u32,
+        output: *mut u16,
+        elements: u64,
+        stream: *mut c_void,
+    ) -> Result<()> {
+        let function = self.reduce_rank_slices.context("native rank-slice reduction unavailable")?;
+        let status = unsafe { function(slices.as_ptr(), ranks, output, elements, stream) };
+        ensure!(status == 0, "rank-slice reduction of {ranks} ranks failed with CUDA status {status}");
+        Ok(())
+    }
+}
+
 impl V41RouteReducer<'_> {
     /// # Safety
     /// Active planes must be contiguous CUDA FP32 [rows,topk,5120] in identical
@@ -529,6 +582,18 @@ impl NativeLibrary {
             reduce_planes: unsafe {
                 self.lib
                     .get::<ReduceCompactPlanesFn>(b"cuteafd_reduce_compact_bf16_planes_async")
+                    .ok()
+                    .map(|f| *f)
+            },
+            gather_row_shards: unsafe {
+                self.lib
+                    .get::<ReduceCompactPlanesFn>(b"cuteafd_gather_row_shards_bf16_async")
+                    .ok()
+                    .map(|f| *f)
+            },
+            reduce_rank_slices: unsafe {
+                self.lib
+                    .get::<ReduceRankSlicesFn>(b"cuteafd_reduce_rank_slices_bf16_async")
                     .ok()
                     .map(|f| *f)
             },

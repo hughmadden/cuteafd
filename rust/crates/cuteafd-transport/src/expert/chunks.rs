@@ -105,6 +105,8 @@ impl BackboneRequest<'_> {
 /// As with complete responses, request IDs must identify unique in-flight waves.
 pub struct V41Tp4ChunkReceiver {
     identity: V41Tp4Planes<'static>,
+    /// Spark-side reduction: rank r returns only the rows it owns.
+    row_sharded: bool,
     received: [u32; 6],
     finished: [bool; 6],
     max_frame_bytes: usize,
@@ -150,6 +152,7 @@ impl V41Tp4ChunkReceiver {
         request.response_chunk_rows(max_frame_bytes)?;
         Ok(Self {
             identity: V41Tp4Planes::from_header_ranks(&request.view.header, executors)?,
+            row_sharded: super::spark_row_sharded(request.view.header.flags),
             received: [0; 6],
             finished: [false; 6],
             max_frame_bytes,
@@ -193,6 +196,7 @@ impl V41Tp4ChunkReceiver {
             "response frame cannot fit one native token row");
         Ok(Self {
             identity: V41Tp4Planes::from_header_ranks(&request.header, executors)?,
+            row_sharded: super::spark_row_sharded(request.header.flags),
             received: [0; 6],
             finished: [false; 6],
             max_frame_bytes,
@@ -230,10 +234,20 @@ impl V41Tp4ChunkReceiver {
         );
         Ok(Self {
             identity: V41Tp4Planes::from_header_ranks(&request.header, executors)?,
+            row_sharded: super::spark_row_sharded(request.header.flags),
             received: [0; 6],
             finished: [false; 6],
             max_frame_bytes,
         })
+    }
+    /// Rows `rank` returns for this wave.
+    fn expected(&self, rank: usize) -> u32 {
+        if self.row_sharded {
+            let (lo, hi) = super::spark_row_shard(self.identity.rows, self.identity.world_size(), rank);
+            hi - lo
+        } else {
+            self.identity.rows
+        }
     }
     pub fn complete(&self) -> bool {
         self.finished[..self.identity.world_size()].iter().all(|value| *value)
@@ -283,7 +297,7 @@ impl V41Tp4ChunkReceiver {
         ensure!(!self.finished[rank] && self.received[rank] == 0, "native TP rank already completed");
         let allowed = EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         ensure!(h.flags & !allowed == 0, "unsupported GPU-landed response flags");
-        ensure!(h.row_count == self.identity.rows, "GPU-landed response must contain the entire plane");
+        ensure!(h.row_count == self.expected(rank), "GPU-landed response must contain the rank's entire plane");
         ensure!(
             h.output_payload_bytes
                 == u64::from(h.row_count) * u64::from(cuteafd_core::expert_geometry().row_bytes()),
@@ -346,11 +360,12 @@ impl V41Tp4ChunkReceiver {
             "unsupported native response chunk flags"
         );
         let start = self.received[rank];
+        let rows = self.expected(rank);
         let end = start
             .checked_add(h.row_count)
             .context("native received row overflow")?;
         ensure!(
-            h.row_count > 0 && end <= self.identity.rows,
+            h.row_count > 0 && end <= rows,
             "native response chunk exceeds remaining rows"
         );
         ensure!(
@@ -375,17 +390,17 @@ impl V41Tp4ChunkReceiver {
             }
         } else {
             ensure!(
-                start == 0 && h.row_count == self.identity.rows && !more_chunks,
+                start == 0 && h.row_count == rows && !more_chunks,
                 "unindexed native response must contain the entire plane"
             );
         }
         ensure!(
-            more_chunks == (end < self.identity.rows),
+            more_chunks == (end < rows),
             "native response has an early or missing final marker"
         );
         sink(rank, start, payload)?;
         self.received[rank] = end;
-        self.finished[rank] = end == self.identity.rows;
+        self.finished[rank] = end == rows;
         Ok(rank)
     }
 }

@@ -116,6 +116,11 @@ pub(crate) struct ExpertProbeArgs {
     /// GLM 5.3 prefill does) instead of inline.
     #[arg(long, requires = "intake")]
     pub(crate) intake_lane: bool,
+    /// Ask the Spark ranks to reduce-scatter the wave among themselves
+    /// (workers need `--reduce-rail`); the reduced rows are checked against
+    /// the oracle.
+    #[arg(long)]
+    pub(crate) spark_reduce: bool,
     /// With `--local --local-tp N` on an EXL3 checkpoint: the Spark-role EXL3
     /// package root (`tp<N>-rank<R>/m<capacity>` layouts, e.g. a `--loopback`
     /// build) whose rank slices run on this GPU in turn, BF16 partials summed.
@@ -222,6 +227,12 @@ pub(crate) struct NativeExpertDaemonArgs {
     pub(crate) max_frame_bytes: usize,
     #[arg(long, default_value = "0.0.0.0:9100")]
     pub(crate) listen: String,
+    /// Spark-side reduction rail: the reduction listeners of every rank in
+    /// rank order (`host:port,...`); repeat for a second rail. Waves the
+    /// coordinator flags for Spark reduction are reduce-scattered over these
+    /// links, each rail on the RDMA device that owns this rank's address.
+    #[arg(long = "reduce-rail")]
+    pub(crate) reduce_rails: Vec<String>,
 }
 
 #[derive(Debug, Args)]

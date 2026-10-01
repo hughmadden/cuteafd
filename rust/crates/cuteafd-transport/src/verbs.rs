@@ -4,8 +4,10 @@ pub use landing::{gpu_landing_probe, DeviceLanding, GpuLandingProbe};
 use registered_response::{RegisteredResponseFrame, RegisteredResponseRing};
 mod local;
 mod local_client;
+mod peer;
+pub use peer::{SparkReduceMesh, SparkReduceMeshConfig, SparkReduceSlices, SPARK_REDUCE_WAVES};
 pub(crate) use local_client::LocalTp4Client;
-pub use local::{LocalVerbsExpertConnection, RingBudget, RingReservation};
+pub use local::{LocalVerbsExpertConnection, RequestDisposition, RingBudget, RingReservation};
 use anyhow::{bail, Context, Result};
 use cuteafd_core::{ExpertRequest, ExpertResponse};
 use cuteafd_ffi::{c_char_array_to_string, CuteafdDeviceBuffer, CuteafdHostBuffer, CuteafdRdmaRcCompletionStats, CuteafdRdmaRcEndpointBufferView, CuteafdRdmaRcEndpointInfo, NativeLibrary, CUTEAFD_DEVICE_BUFFER_FLAG_MAPPED_HOST, CUTEAFD_HOST_BUFFER_FLAG_MAPPED, CUTEAFD_HOST_BUFFER_FLAG_PINNED};
@@ -1851,7 +1853,10 @@ impl ProtocolV2ResponseChunkAssembler {
             self.final_chunk_received = true;
             return Ok(());
         }
-        if !chunk.row_indexed() && chunk.header.row_count as usize != self.request_row_count {
+        if !chunk.row_indexed()
+            && chunk.header.row_count as usize != self.request_row_count
+            && !self.row_sharded_reduction
+        {
             bail!(
                 "ProtocolV2 non-indexed response row count {} did not match request row count {}",
                 chunk.header.row_count,
@@ -3179,6 +3184,7 @@ fn handle_verbs_host_protocol_v2_persistent_connection(
     loop {
         if !connection.poll(None, |request, payload, emit| {
             executor.execute_streaming_device_payload_with_identity(request, payload, emit)
+                .map(|()| local::RequestDisposition::Answered)
         })? { std::hint::spin_loop(); }
     }
 }

@@ -29,6 +29,16 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
             topology.ep()
         );
     }
+    let reduce_rails = args.reduce_rails.iter().map(|rail| {
+        let addresses = rail.split(',').map(|address| address.trim().parse::<std::net::SocketAddr>()
+            .with_context(|| format!("invalid --reduce-rail address {address:?}")))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(addresses.len() == args.world as usize,
+            "--reduce-rail lists {} addresses for a world of {}", addresses.len(), args.world);
+        Ok(addresses)
+    }).collect::<Result<Vec<_>>>()?;
+    ensure!(reduce_rails.is_empty() || topology.is_none(),
+        "Spark-side reduction covers implicit TP groups only, not an explicit TP×EP topology");
     let config = NativeExpertServiceConfig {
         library: args.native_lib,
         exl3_aot_dir: args.exl3_aot_dir,
@@ -42,6 +52,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         device_budget: args.device_budget_bytes,
         max_frame_bytes: args.max_frame_bytes,
         topology,
+        reduce_rails,
     };
     tokio::task::spawn_blocking(move || local::run(config, &args.listen))
         .await
@@ -65,6 +76,9 @@ pub(crate) struct NativeExpertServiceConfig {
     /// Explicit replicated `TP×EP` topology; `None` keeps the legacy world 2/4
     /// behavior (EXL3 compact may still select a TP2 RTX pair).
     pub topology: Option<SparkTopology>,
+    /// Spark-side reduction rails (`[rail][rank]`); empty answers flagged
+    /// waves with an error.
+    pub reduce_rails: Vec<Vec<std::net::SocketAddr>>,
 }
 
 fn load_weights<'a>(
@@ -449,6 +463,7 @@ mod tests {
             device_budget: 1 << 40,
             max_frame_bytes: 64 << 20,
             topology,
+            reduce_rails: Vec::new(),
         }
     }
 

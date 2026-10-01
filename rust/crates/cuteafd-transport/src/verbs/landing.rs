@@ -58,7 +58,10 @@ impl ProtocolV2ResponseChunkAssembler {
         validate_response_matches_request(header, request)?;
         anyhow::ensure!(!self.stream_frame && self.partial_output_payload.is_none(),
             "GPU landing takes only streamed whole-plane responses");
-        anyhow::ensure!(header.row_count as usize == self.request_row_count,
+        // Under Spark-side reduction a rank returns only its own rows; the
+        // wave receiver checks each rank's exact share.
+        anyhow::ensure!(header.row_count as usize == self.request_row_count
+            || (self.row_sharded_reduction && header.row_count as usize <= self.request_row_count),
             "GPU-landed response carries {} of {} request rows", header.row_count, self.request_row_count);
         self.completed_rows.iter_mut().for_each(|row| *row = true);
         self.completed_row_count = self.request_row_count;

@@ -291,6 +291,116 @@ extern "C" int32_t cuteafd_reduce_compact_bf16_planes_async(
   return cudaGetLastError();
 }
 
+struct RankSlices {
+  const uint4* slice[8];
+};
+
+// Eight BF16 values per thread; ordered FP32 accumulation as reduce_compact.
+__global__ void reduce_rank_slices(RankSlices slices, uint32_t ranks, uint4* output,
+    uint64_t vectors) {
+  for (uint64_t v = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; v < vectors;
+       v += uint64_t(gridDim.x) * blockDim.x) {
+    uint4 first = slices.slice[0][v];
+    const __nv_bfloat162* f = reinterpret_cast<const __nv_bfloat162*>(&first);
+    float acc[8];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      float2 pair = __bfloat1622float2(f[i]);
+      acc[2 * i] = pair.x;
+      acc[2 * i + 1] = pair.y;
+    }
+    for (uint32_t rank = 1; rank < ranks; ++rank) {
+      uint4 next = slices.slice[rank][v];
+      const __nv_bfloat162* n = reinterpret_cast<const __nv_bfloat162*>(&next);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        float2 pair = __bfloat1622float2(n[i]);
+        acc[2 * i] = __fadd_rn(acc[2 * i], pair.x);
+        acc[2 * i + 1] = __fadd_rn(acc[2 * i + 1], pair.y);
+      }
+    }
+    uint4 out;
+    __nv_bfloat162* o = reinterpret_cast<__nv_bfloat162*>(&out);
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      o[i] = __floats2bfloat162_rn(acc[2 * i], acc[2 * i + 1]);
+    output[v] = out;
+  }
+}
+
+extern "C" int32_t cuteafd_reduce_rank_slices_bf16_async(const uint16_t* const slices[8],
+    uint32_t ranks, uint16_t* output, uint64_t elements, void* stream) {
+  if (!slices || !output || ranks < 2 || ranks > 8 || !elements || elements % 8)
+    return cudaErrorInvalidValue;
+  const uint64_t bytes = elements * 2;
+  if (reinterpret_cast<uintptr_t>(output) % 16) return cudaErrorInvalidValue;
+  RankSlices packed = {};
+  for (uint32_t rank = 0; rank < ranks; ++rank) {
+    if (!slices[rank] || reinterpret_cast<uintptr_t>(slices[rank]) % 16 ||
+        overlaps(slices[rank], bytes, output, bytes))
+      return cudaErrorInvalidValue;
+    packed.slice[rank] = reinterpret_cast<const uint4*>(slices[rank]);
+  }
+  const uint64_t vectors = elements / 8;
+  const unsigned blocks = static_cast<unsigned>(
+      (vectors + 255) / 256 < 2048 ? (vectors + 255) / 256 : 2048);
+  reduce_rank_slices<<<blocks, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      packed, ranks, reinterpret_cast<uint4*>(output), vectors);
+  return cudaGetLastError();
+}
+
+struct RankPlanes {
+  const uint4* plane[6];
+};
+
+// One block per row: the owning rank's reduced row (at that rank's plane
+// start), plus the optional shared row, rounded once.
+__global__ void gather_row_shards(RankPlanes planes, uint32_t ranks, const uint4* shared,
+    uint4* output, uint32_t rows, uint32_t vectors_per_row) {
+  const uint32_t row = blockIdx.x;
+  uint32_t owner = ranks - 1;
+  while (uint64_t(rows) * owner / ranks > row) --owner;
+  const uint32_t local = row - static_cast<uint32_t>(uint64_t(rows) * owner / ranks);
+  const uint4* source = planes.plane[owner] + uint64_t(local) * vectors_per_row;
+  const uint64_t base = uint64_t(row) * vectors_per_row;
+  for (uint32_t v = threadIdx.x; v < vectors_per_row; v += blockDim.x) {
+    uint4 value = source[v];
+    if (shared) {
+      uint4 add = shared[base + v];
+      const __nv_bfloat162* a = reinterpret_cast<const __nv_bfloat162*>(&value);
+      const __nv_bfloat162* b = reinterpret_cast<const __nv_bfloat162*>(&add);
+      uint4 out;
+      __nv_bfloat162* o = reinterpret_cast<__nv_bfloat162*>(&out);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        float2 x = __bfloat1622float2(a[i]);
+        float2 y = __bfloat1622float2(b[i]);
+        o[i] = __floats2bfloat162_rn(__fadd_rn(x.x, y.x), __fadd_rn(x.y, y.y));
+      }
+      value = out;
+    }
+    output[base + v] = value;
+  }
+}
+
+extern "C" int32_t cuteafd_gather_row_shards_bf16_async(const uint16_t* const planes[6],
+    const uint16_t* shared, uint16_t* output, uint32_t rows, uint32_t ranks, void* stream) {
+  if (!valid_compact_planes(planes, shared, output, rows, ranks)) return cudaErrorInvalidValue;
+  const uint32_t hidden = cuteafd_expert_hidden();
+  if (hidden % 8 || reinterpret_cast<uintptr_t>(output) % 16 ||
+      (shared && reinterpret_cast<uintptr_t>(shared) % 16))
+    return cudaErrorInvalidValue;
+  RankPlanes packed = {};
+  for (uint32_t rank = 0; rank < ranks; ++rank) {
+    if (reinterpret_cast<uintptr_t>(planes[rank]) % 16) return cudaErrorInvalidValue;
+    packed.plane[rank] = reinterpret_cast<const uint4*>(planes[rank]);
+  }
+  gather_row_shards<<<rows, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      packed, ranks, reinterpret_cast<const uint4*>(shared), reinterpret_cast<uint4*>(output),
+      rows, hidden / 8);
+  return cudaGetLastError();
+}
+
 extern "C" int32_t cuteafd_initialize_scratch_storage_async(void* storage,
     uint64_t bytes, uint64_t input_offset, uint64_t down_offset,
     uint32_t experts, void* stream) {

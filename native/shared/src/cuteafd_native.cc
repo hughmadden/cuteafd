@@ -18,6 +18,7 @@
 #endif
 
 #if CUTEAFD_NATIVE_ENABLE_RDMA
+#include <arpa/inet.h>
 #include <infiniband/verbs.h>
 #include <poll.h>
 #include <unistd.h>
@@ -447,6 +448,8 @@ struct CuteafdRdmaRcEndpointHandle {
   unsigned char* landing_ptr = nullptr;
   size_t landing_bytes = 0;
   size_t landing_header_bytes = 0;
+  // Peer exchange regions (`cuteafd_rdma_rc_endpoint_register_region`).
+  std::vector<ibv_mr*> regions;
   uint32_t pending_send_completions = 0;
   uint32_t pending_recv_completions = 0;
   std::chrono::steady_clock::time_point busy_poll_until = {};
@@ -492,6 +495,10 @@ void destroy_rdma_rc_endpoint(CuteafdRdmaRcEndpointHandle* endpoint) {
   if (endpoint->landing_mr != nullptr) {
     ibv_dereg_mr(endpoint->landing_mr);
   }
+  for (ibv_mr* region : endpoint->regions) {
+    ibv_dereg_mr(region);
+  }
+  endpoint->regions.clear();
   if (endpoint->send_mr != nullptr) {
     ibv_dereg_mr(endpoint->send_mr);
   }
@@ -4053,6 +4060,123 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_copy_recv_at(
 extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_copy_recv(void* handle, void* out,
                                                             size_t out_bytes, size_t bytes) {
   return cuteafd_rdma_rc_endpoint_copy_recv_at(handle, out, out_bytes, 0, bytes);
+}
+
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_register_region(void* handle, void* ptr,
+                                                                size_t bytes, uint32_t* region) {
+  if (handle == nullptr || ptr == nullptr || region == nullptr || bytes == 0) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint region is invalid");
+  }
+#if CUTEAFD_NATIVE_ENABLE_RDMA
+  auto* endpoint = static_cast<CuteafdRdmaRcEndpointHandle*>(handle);
+  if (endpoint->regions.size() >= 64) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint has 64 regions already");
+  }
+  ibv_mr* mr = ibv_reg_mr(endpoint->pd, ptr, bytes, IBV_ACCESS_LOCAL_WRITE);
+  if (mr == nullptr) {
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "ibv_reg_mr failed for RC endpoint region");
+  }
+  endpoint->regions.push_back(mr);
+  *region = static_cast<uint32_t>(endpoint->regions.size() - 1);
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
+              "RDMA RC endpoint regions require CUTEAFD_ENABLE_RDMA=ON");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_post_send_region(
+    void* handle, uint32_t region, size_t offset_bytes, size_t bytes, uint64_t wr_id,
+    uint32_t imm) {
+  if (handle == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint handle is null");
+  }
+  if (bytes == 0 || bytes > std::numeric_limits<uint32_t>::max()) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint region send size is invalid");
+  }
+#if CUTEAFD_NATIVE_ENABLE_RDMA
+  auto* endpoint = static_cast<CuteafdRdmaRcEndpointHandle*>(handle);
+  if (region >= endpoint->regions.size()) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint region is not registered");
+  }
+  ibv_mr* mr = endpoint->regions[region];
+  if (offset_bytes > mr->length || bytes > mr->length - offset_bytes) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint region send exceeds region");
+  }
+  ibv_sge sge = {};
+  sge.addr = reinterpret_cast<uintptr_t>(mr->addr) + offset_bytes;
+  sge.length = static_cast<uint32_t>(bytes);
+  sge.lkey = mr->lkey;
+  ibv_send_wr wr = {};
+  wr.wr_id = wr_id;
+  wr.sg_list = &sge;
+  wr.num_sge = 1;
+  wr.opcode = IBV_WR_SEND_WITH_IMM;
+  wr.imm_data = htonl(imm);
+  wr.send_flags = IBV_SEND_SIGNALED;
+  ibv_send_wr* bad = nullptr;
+  if (ibv_post_send(endpoint->qp, &wr, &bad) != 0) {
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "ibv_post_send failed for RC endpoint region");
+  }
+  return ok();
+#else
+  (void)region;
+  (void)offset_bytes;
+  (void)wr_id;
+  (void)imm;
+  return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
+              "RDMA RC endpoint regions require CUTEAFD_ENABLE_RDMA=ON");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_poll_completions(
+    void* handle, cuteafd_rdma_completion_t* out, uint32_t capacity, uint32_t* count) {
+  if (handle == nullptr || out == nullptr || count == nullptr || capacity == 0) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint completion poll is invalid");
+  }
+  *count = 0;
+#if CUTEAFD_NATIVE_ENABLE_RDMA
+  auto* endpoint = static_cast<CuteafdRdmaRcEndpointHandle*>(handle);
+  ibv_wc wcs[16];
+  for (int recv = 0; recv < 2 && *count < capacity; ++recv) {
+    ibv_cq* cq = recv ? endpoint->recv_cq : endpoint->send_cq;
+    while (*count < capacity) {
+      const int want = static_cast<int>(std::min<uint32_t>(capacity - *count, 16));
+      const int polled = ibv_poll_cq(cq, want, wcs);
+      if (polled < 0) {
+        return fail(CUTEAFD_STATUS_INTERNAL_ERROR, "ibv_poll_cq failed for RC endpoint");
+      }
+      for (int i = 0; i < polled; ++i) {
+        const ibv_wc& wc = wcs[i];
+        if (wc.status != IBV_WC_SUCCESS) {
+          char message[256];
+          std::snprintf(message, sizeof(message),
+                        "RDMA RC endpoint %s completion failed status=%u (%s) wr_id=%llu "
+                        "vendor_err=%u",
+                        recv ? "recv" : "send", static_cast<unsigned>(wc.status),
+                        ibv_wc_status_str(wc.status),
+                        static_cast<unsigned long long>(wc.wr_id),
+                        static_cast<unsigned>(wc.vendor_err));
+          return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, message);
+        }
+        cuteafd_rdma_completion_t& entry = out[*count];
+        entry.wr_id = wc.wr_id;
+        entry.byte_len = wc.byte_len;
+        entry.recv = recv ? 1u : 0u;
+        entry.has_imm = (wc.wc_flags & IBV_WC_WITH_IMM) != 0 ? 1u : 0u;
+        entry.imm = entry.has_imm ? ntohl(wc.imm_data) : 0u;
+        *count += 1;
+      }
+      if (polled < want) {
+        break;
+      }
+    }
+  }
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
+              "RDMA RC endpoint completions require CUTEAFD_ENABLE_RDMA=ON");
+#endif
 }
 
 extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_destroy(void* handle) {

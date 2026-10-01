@@ -520,6 +520,24 @@ cuteafd_status_t cuteafd_rdma_rc_endpoint_copy_recv(void* handle, void* out, siz
                                                  size_t bytes);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_copy_recv_at(void* handle, void* out, size_t out_bytes,
                                                    size_t offset_bytes, size_t bytes);
+// Peer exchange (Spark-side reduction): host ranges registered on the
+// endpoint's protection domain, SEND_WITH_IMM straight from them, and
+// completions reported one by one (send CQ first, then receive CQ).
+typedef struct cuteafd_rdma_completion_t {
+  uint64_t wr_id;
+  uint32_t byte_len;
+  uint32_t imm;
+  uint32_t recv;
+  uint32_t has_imm;
+} cuteafd_rdma_completion_t;
+cuteafd_status_t cuteafd_rdma_rc_endpoint_register_region(void* handle, void* ptr, size_t bytes,
+                                                      uint32_t* region);
+cuteafd_status_t cuteafd_rdma_rc_endpoint_post_send_region(void* handle, uint32_t region,
+                                                       size_t offset_bytes, size_t bytes,
+                                                       uint64_t wr_id, uint32_t imm);
+cuteafd_status_t cuteafd_rdma_rc_endpoint_poll_completions(void* handle,
+                                                       cuteafd_rdma_completion_t* out,
+                                                       uint32_t capacity, uint32_t* count);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_destroy(void* handle);
 
 cuteafd_status_t cuteafd_cuda_rmsnorm_f32(const float* x, const float* weight, float* out,
