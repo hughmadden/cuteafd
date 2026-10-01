@@ -144,12 +144,17 @@ pub(crate) struct PlanArgs {
     pub(crate) revision: Option<String>,
     #[arg(long)]
     pub(crate) hf_home: Option<PathBuf>,
-    /// Spark ranks sharing the routed experts.
+    /// Spark ranks sharing the routed experts: 2, 3, 4 or 6, or 0 to place
+    /// every routed expert on the coordinator GPU (local-only).
     #[arg(long, default_value_t = 4)]
     pub(crate) spark_ranks: usize,
     /// Routed-expert weight budget per Spark rank, GiB.
     #[arg(long, default_value_t = 100.0)]
     pub(crate) spark_budget_gib: f64,
+    /// Weight budget of the coordinator GPU, GiB (its own tensors, plus every
+    /// routed expert with --spark-ranks 0).
+    #[arg(long, default_value_t = 80.0)]
+    pub(crate) coordinator_budget_gib: f64,
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,
     /// Exit non-zero unless every part is servable.

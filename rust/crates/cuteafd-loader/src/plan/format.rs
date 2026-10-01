@@ -1,53 +1,271 @@
 //! Storage-format detection for one logical weight (a group of tensors that
 //! share a stem, such as `x.weight` + `x.weight_scale_inv`, or the EXL3
 //! `x.trellis`/`x.suh`/`x.svh`/`x.mcg` set).
+//!
+//! Detection is lossless: a [`QuantOperand`] records the element encoding
+//! (E4M3 and E5M2 stay distinct), the scale tensor's encoding, direction and
+//! block tiling, row segments whose block grid restarts, the logical and
+//! stored shapes and the companion tensors. It decides nothing about what a
+//! family executes; family contracts accept or reject an operand, and resolve
+//! segment layouts only they know (MiMo's fused qkv shards). A group whose
+//! tensors do not describe one consistent operand is a [`Malformed`] result
+//! naming the tensor and the reason.
+//!
+//! The descriptor is shaped to carry ModelOpt NVFP4 (PLAN.md Phase 5,
+//! `QuantOperand`): E2M1 codes low nibble first, E4M3 scales per 16 in linear
+//! layout, an FP32 `weight_scale_2` and an `input_scale`.
 use cuteafd_core::DType;
 use serde::Serialize;
 use std::collections::BTreeMap;
 
 use super::checkpoint::CheckpointTensor;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(rename_all = "snake_case", tag = "format")]
-pub enum WeightFormat {
+/// How the stored elements encode the weight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum Encoding {
     Bf16,
     F16,
     F32,
-    /// E4M3 weights with a block scale; `block` is (rows, cols) per scale.
-    Fp8Block { block: (usize, usize) },
-    /// E4M3 weights with 128x128 blocks whose row blocks restart at segment
-    /// boundaries (per KV head, or per checkpoint TP shard of a fused
-    /// projection), so the grid has more rows than `ceil(rows / 128)`.
-    Fp8SegmentedBlock { block: (usize, usize) },
-    /// E4M3 weights with one scale per output row or tensor.
-    Fp8PerChannel,
-    /// Packed E2M1 with E8M0 group scales (OCP MX, DeepSeek FP4 experts).
-    Mxfp4 { group: usize },
-    /// ModelOpt NVFP4: packed E2M1, E4M3 per-16 scales, FP32 global scale.
-    Nvfp4,
-    /// EXL3 trellis with `bits` per weight.
+    /// FP8 E4M3 (OCP, finite-only `fn` variant as checkpoints store it).
+    E4m3,
+    /// FP8 E5M2.
+    E5m2,
+    /// FP4 E2M1 codes, two per byte along the last axis, the even element in
+    /// the low nibble.
+    E2m1,
+    /// EXL3 trellis codes at `bits` per weight (mcg codebook, Hadamard
+    /// sign vectors `suh`/`svh`).
     Exl3 { bits: usize },
-    /// Integer lookup data (hash-route tables, offsets).
-    Int,
-    /// Anything else, described by its dtype set.
-    Unknown { dtypes: String },
+    /// Integer data (hash-route tables, offsets); `bits` wide.
+    Int { bits: usize },
 }
 
-impl WeightFormat {
-    pub fn label(&self) -> String {
-        match self {
-            WeightFormat::Bf16 => "bf16".into(),
-            WeightFormat::F16 => "f16".into(),
-            WeightFormat::F32 => "f32".into(),
-            WeightFormat::Fp8Block { block } => format!("fp8-block{}x{}", block.0, block.1),
-            WeightFormat::Fp8SegmentedBlock { block } => format!("fp8-block{}x{}-segmented", block.0, block.1),
-            WeightFormat::Fp8PerChannel => "fp8-channel".into(),
-            WeightFormat::Mxfp4 { group } => format!("mxfp4-g{group}"),
-            WeightFormat::Nvfp4 => "nvfp4".into(),
-            WeightFormat::Exl3 { bits } => format!("exl3-k{bits}"),
-            WeightFormat::Int => "int".into(),
-            WeightFormat::Unknown { dtypes } => format!("unknown({dtypes})"),
+/// How a scale tensor stores its values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScaleEncoding {
+    F32,
+    Bf16,
+    F16,
+    /// Unsigned E8M0 exponents (`F8_E8M0`, or `U8` in MXFP4 checkpoints).
+    Ue8m0,
+    E4m3,
+}
+
+/// How a scale applies. Every checkpoint layout this build knows multiplies
+/// (`w = q * s`), including HF's `weight_scale_inv` (named for the
+/// quantizer's division); a divisor layout would get its own variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScaleDirection {
+    Multiply,
+}
+
+/// How the scale grid tiles the weight's rows.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum RowTiling {
+    /// Uniform blocks of `rows` (the last one may be partial).
+    Uniform { rows: usize },
+    /// More block rows than a uniform tiling has: the grid restarts at segment
+    /// boundaries only the family knows (fused projections, per-head blocks).
+    Unresolved { scale_rows: usize },
+    /// Segments (row counts, in storage order), each tiled by `block` rows
+    /// from its own first row.
+    Segments { block: usize, rows: Vec<usize> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct BlockScale {
+    /// The member suffix holding the scales (`weight_scale_inv`, `scale`, ...).
+    pub tensor: String,
+    pub encoding: ScaleEncoding,
+    pub direction: ScaleDirection,
+    pub rows: RowTiling,
+    /// Logical elements per scale along the last (K) axis.
+    pub cols: usize,
+    /// The stored scale grid shape.
+    pub grid: Vec<usize>,
+}
+
+/// A FP4 operand's per-tensor second-level scale (ModelOpt `weight_scale_2`)
+/// or static activation scale (`input_scale`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct TensorScale {
+    pub encoding: ScaleEncoding,
+}
+
+/// One logical weight as the checkpoint stores it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct QuantOperand {
+    pub encoding: Encoding,
+    /// The stored container dtype of the codes (`U8` vs `I8` for packed FP4).
+    pub container: String,
+    /// The logical (dequantized) shape.
+    pub logical: Vec<usize>,
+    /// The stored shape of the codes.
+    pub stored: Vec<usize>,
+    pub scale: Option<BlockScale>,
+    pub global_scale: Option<TensorScale>,
+    pub input_scale: Option<TensorScale>,
+    /// Member suffixes beyond the codes and scales (`suh`, `svh`, `mcg`, `bias`).
+    pub companions: Vec<String>,
+}
+
+/// A group whose tensors do not form one operand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, thiserror::Error)]
+#[error("{tensor}: {reason}")]
+pub struct Malformed {
+    pub tensor: String,
+    pub reason: String,
+}
+
+impl QuantOperand {
+    fn plain(encoding: Encoding, meta: &crate::SafetensorsTensorMetadata) -> Self {
+        Self {
+            encoding,
+            container: dtype_label(&meta.dtype),
+            logical: meta.shape.clone(),
+            stored: meta.shape.clone(),
+            scale: None,
+            global_scale: None,
+            input_scale: None,
+            companions: Vec::new(),
         }
+    }
+
+    /// Rows x cols (the last two logical dims), when the operand is a matrix.
+    pub fn matrix(&self) -> Option<(usize, usize)> {
+        match self.logical.as_slice() {
+            [rows, cols] => Some((*rows, *cols)),
+            _ => None,
+        }
+    }
+
+    /// A short, distinct label: the element encoding, then the scale encoding
+    /// and its tiling. E4M3 and E5M2, FP32 and E8M0 scales, uniform and
+    /// segmented grids all label differently.
+    pub fn label(&self) -> String {
+        let element = match self.encoding {
+            Encoding::Bf16 => return "bf16".into(),
+            Encoding::F16 => return "f16".into(),
+            Encoding::F32 => return "f32".into(),
+            Encoding::Int { .. } => return "int".into(),
+            Encoding::Exl3 { bits } => return format!("exl3-k{bits}"),
+            Encoding::E4m3 => "fp8",
+            Encoding::E5m2 => "fp8e5m2",
+            Encoding::E2m1 => {
+                return match (&self.scale, self.global_scale) {
+                    (Some(scale), Some(_)) if scale.encoding == ScaleEncoding::E4m3 => format!("nvfp4-g{}", scale.cols),
+                    (Some(scale), None) if scale.encoding == ScaleEncoding::Ue8m0 => format!("mxfp4-g{}", scale.cols),
+                    (Some(scale), _) => format!("fp4-{}-g{}", scale_label(scale.encoding), scale.cols),
+                    (None, _) => "fp4-unscaled".into(),
+                };
+            }
+        };
+        let Some(scale) = &self.scale else {
+            return format!("{element}-unscaled");
+        };
+        let (rows, cols) = self.matrix().unwrap_or((0, 0));
+        let encoding = scale_label(scale.encoding);
+        match &scale.rows {
+            RowTiling::Uniform { rows: r } if *r >= rows && scale.cols >= cols => format!("{element}-tensor/{encoding}"),
+            RowTiling::Uniform { rows: 1 } if scale.cols >= cols => format!("{element}-channel/{encoding}"),
+            RowTiling::Uniform { rows: r } => format!("{element}-block{r}x{}/{encoding}", scale.cols),
+            RowTiling::Unresolved { .. } => format!("{element}-block?x{}/{encoding}-unresolved", scale.cols),
+            RowTiling::Segments { block, rows } => {
+                format!("{element}-block{block}x{}/{encoding}-segmented{}", scale.cols, rows.len())
+            }
+        }
+    }
+
+    /// E4M3 with `encoding` scales in uniform `block` x `block` tiles.
+    pub fn is_fp8_block(&self, block: usize, encodings: &[ScaleEncoding]) -> bool {
+        self.encoding == Encoding::E4m3
+            && self.scale.as_ref().is_some_and(|s| {
+                s.cols == block && matches!(s.rows, RowTiling::Uniform { rows } if rows == block)
+                    && encodings.contains(&s.encoding)
+            })
+    }
+
+    /// E4M3 with one `encoding` scale per row and `group` elements along K.
+    pub fn is_fp8_row_groups(&self, group: usize, encodings: &[ScaleEncoding]) -> bool {
+        self.encoding == Encoding::E4m3
+            && self.scale.as_ref().is_some_and(|s| {
+                s.cols == group && matches!(s.rows, RowTiling::Uniform { rows: 1 }) && encodings.contains(&s.encoding)
+            })
+    }
+
+    /// E4M3 with `encoding` scales whose rows restart at resolved segments.
+    pub fn is_fp8_segmented(&self, block: usize, encodings: &[ScaleEncoding]) -> bool {
+        self.encoding == Encoding::E4m3
+            && self.scale.as_ref().is_some_and(|s| {
+                s.cols == block && matches!(&s.rows, RowTiling::Segments { block: b, .. } if *b == block)
+                    && encodings.contains(&s.encoding)
+            })
+    }
+
+    /// Packed E2M1 with UE8M0 scales per `group` along K and no second-level scale.
+    pub fn is_mxfp4(&self, group: usize) -> bool {
+        self.encoding == Encoding::E2m1
+            && self.global_scale.is_none()
+            && self.scale.as_ref().is_some_and(|s| {
+                s.encoding == ScaleEncoding::Ue8m0 && s.cols == group && matches!(s.rows, RowTiling::Uniform { rows: 1 })
+            })
+    }
+
+    /// ModelOpt NVFP4: packed E2M1, E4M3 per-16 linear scales, FP32 global scale.
+    pub fn is_nvfp4(&self) -> bool {
+        self.encoding == Encoding::E2m1
+            && self.global_scale.is_some_and(|g| g.encoding == ScaleEncoding::F32)
+            && self.scale.as_ref().is_some_and(|s| {
+                s.encoding == ScaleEncoding::E4m3 && s.cols == 16 && matches!(s.rows, RowTiling::Uniform { rows: 1 })
+            })
+    }
+
+    /// The EXL3 trellis bits per weight, if this is a (complete) EXL3 operand.
+    pub fn exl3_bits(&self) -> Option<usize> {
+        match self.encoding {
+            Encoding::Exl3 { bits } => Some(bits),
+            _ => None,
+        }
+    }
+
+    /// One of the plain encodings, unscaled.
+    pub fn is_plain(&self, encodings: &[Encoding]) -> bool {
+        self.scale.is_none() && self.global_scale.is_none() && encodings.contains(&self.encoding)
+    }
+
+    /// Resolves an [`RowTiling::Unresolved`] grid into `segments` (row counts
+    /// in storage order), each tiled by `block` rows. Fails unless the
+    /// segments cover the rows and their blocks are exactly the grid's rows.
+    pub fn resolve_segments(&mut self, block: usize, segments: Vec<usize>) -> Result<(), String> {
+        let rows = self.matrix().map(|(rows, _)| rows).ok_or("not a matrix")?;
+        let scale = self.scale.as_mut().ok_or("no scale grid")?;
+        let grid_rows = scale.grid.first().copied().unwrap_or(0);
+        let total: usize = segments.iter().sum();
+        let blocks: usize = segments.iter().map(|s| s.div_ceil(block)).sum();
+        if block == 0 || total != rows || blocks != grid_rows {
+            return Err(format!(
+                "segments {segments:?} of {block}-row blocks do not tile {rows} rows onto {grid_rows} scale rows"
+            ));
+        }
+        if scale.cols != block {
+            return Err(format!("{}-column scale blocks, segments use {block}", scale.cols));
+        }
+        scale.rows = RowTiling::Segments { block, rows: segments };
+        Ok(())
+    }
+}
+
+fn scale_label(encoding: ScaleEncoding) -> &'static str {
+    match encoding {
+        ScaleEncoding::F32 => "f32",
+        ScaleEncoding::Bf16 => "bf16",
+        ScaleEncoding::F16 => "f16",
+        ScaleEncoding::Ue8m0 => "ue8m0",
+        ScaleEncoding::E4m3 => "e4m3",
     }
 }
 
@@ -100,83 +318,227 @@ fn dtype_label(dtype: &DType) -> String {
     }
 }
 
-/// The block edge that tiles `dim` into `scales` blocks, allowing a partial
-/// last block (576 rows in 128-row blocks need 5 scales). Falls back to the
-/// rounded-up quotient for layouts that are not power-of-two blocked.
-fn block_edge(dim: usize, scales: usize) -> usize {
-    if scales <= 1 {
-        return dim;
+fn scale_encoding(dtype: &DType) -> Option<ScaleEncoding> {
+    Some(match dtype {
+        DType::F32 => ScaleEncoding::F32,
+        DType::Bf16 => ScaleEncoding::Bf16,
+        DType::F16 => ScaleEncoding::F16,
+        DType::F8E8M0 => ScaleEncoding::Ue8m0,
+        DType::F8E4M3 => ScaleEncoding::E4m3,
+        _ => return None,
+    })
+}
+
+/// The power-of-two block edge whose tiling of `dim` gives exactly `scales`
+/// blocks (576 rows in 128-row blocks need 5 scales).
+fn block_edge(dim: usize, scales: usize) -> Option<usize> {
+    if scales == 1 {
+        return Some(dim.max(1));
     }
-    [1usize, 16, 32, 64, 128, 256, 512]
-        .into_iter()
-        .find(|edge| dim.div_ceil(*edge) == scales)
-        .unwrap_or_else(|| dim.div_ceil(scales))
+    [1usize, 16, 32, 64, 128, 256, 512].into_iter().find(|edge| dim.div_ceil(*edge) == scales)
 }
 
 /// Detects the storage format of one logical weight.
-pub fn detect(members: &BTreeMap<String, &CheckpointTensor>) -> WeightFormat {
+pub fn detect(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOperand, Malformed> {
     let get = |suffix: &str| members.get(suffix).map(|tensor| &tensor.meta);
-    if let Some(trellis) = get("trellis") {
-        // EXL3 trellis tensors are [K/16, N/16, 16 * bits] of int16.
-        let bits = trellis.shape.last().copied().unwrap_or(0) / 16;
-        return WeightFormat::Exl3 { bits };
+    let malformed = |tensor: &str, reason: String| Malformed { tensor: tensor.to_owned(), reason };
+    if members.contains_key("trellis") || members.contains_key("mul1") {
+        return detect_exl3(members);
     }
-    let weight = get("weight").or_else(|| members.values().next().map(|tensor| &tensor.meta));
-    let Some(weight) = weight else {
-        return WeightFormat::Unknown { dtypes: String::new() };
-    };
-    match &weight.dtype {
-        DType::F8E4M3 | DType::F8E5M2 => {
-            let scale = get("weight_scale_inv").or_else(|| get("scale")).or_else(|| get("weight_scale"));
-            match scale {
-                Some(scale) if scale.shape.len() == 2 && weight.shape.len() == 2 => {
-                    let rows = block_edge(weight.shape[0], scale.shape[0]);
-                    let cols = block_edge(weight.shape[1], scale.shape[1]);
-                    let uniform = weight.shape[0].div_ceil(128);
-                    if cols == weight.shape[1] {
-                        WeightFormat::Fp8PerChannel
-                    } else if cols == 128 && scale.shape[0] > uniform && scale.shape[0] < weight.shape[0].div_ceil(64) {
-                        // More 128-row blocks than rows / 128: blocks restart per segment.
-                        WeightFormat::Fp8SegmentedBlock { block: (128, 128) }
-                    } else {
-                        WeightFormat::Fp8Block { block: (rows, cols) }
-                    }
-                }
-                _ => WeightFormat::Fp8PerChannel,
+    let weight = match get("weight") {
+        Some(weight) => weight,
+        // A group without `weight`: one tensor named by its own stem, or a lone
+        // scale (a table-wide scale shared by sharded weights).
+        None => match members.values().collect::<Vec<_>>().as_slice() {
+            [only] => &only.meta,
+            _ => {
+                let first = members.values().next().map_or(String::new(), |t| t.meta.name.clone());
+                return Err(malformed(&first, format!("members {:?} have no weight tensor", members.keys().collect::<Vec<_>>())));
             }
-        }
-        DType::U8 | DType::I8 | DType::F4 => {
-            if get("weight_scale_2").is_some() {
-                return WeightFormat::Nvfp4;
-            }
-            let scale = get("scale").or_else(|| get("weight_scale")).or_else(|| get("weight_scale_inv"));
-            match scale {
-                Some(scale) if matches!(scale.dtype, DType::F8E8M0 | DType::U8) && !weight.shape.is_empty() => {
-                    // Packed two values per byte along the last axis.
-                    let logical_k = weight.shape.last().copied().unwrap_or(0) * 2;
-                    let groups = scale.shape.last().copied().unwrap_or(1).max(1);
-                    WeightFormat::Mxfp4 { group: logical_k / groups }
-                }
-                Some(scale) if matches!(scale.dtype, DType::F8E4M3) => WeightFormat::Nvfp4,
-                _ => WeightFormat::Unknown {
-                    dtypes: members
-                        .values()
-                        .map(|tensor| dtype_label(&tensor.meta.dtype))
-                        .collect::<Vec<_>>()
-                        .join("+"),
-                },
-            }
-        }
-        DType::Bf16 => WeightFormat::Bf16,
-        DType::F16 => WeightFormat::F16,
-        DType::F32 => WeightFormat::F32,
-        DType::I16 | DType::I32 | DType::I64 => WeightFormat::Int,
-        _ => WeightFormat::Unknown {
-            dtypes: members
-                .values()
-                .map(|tensor| dtype_label(&tensor.meta.dtype))
-                .collect::<Vec<_>>()
-                .join("+"),
         },
+    };
+    let companions: Vec<String> = members.keys().filter(|s| *s == "bias").cloned().collect();
+    let mut operand = match &weight.dtype {
+        DType::Bf16 => QuantOperand::plain(Encoding::Bf16, weight),
+        DType::F16 => QuantOperand::plain(Encoding::F16, weight),
+        DType::F32 => QuantOperand::plain(Encoding::F32, weight),
+        DType::I16 => QuantOperand::plain(Encoding::Int { bits: 16 }, weight),
+        DType::I32 => QuantOperand::plain(Encoding::Int { bits: 32 }, weight),
+        DType::I64 => QuantOperand::plain(Encoding::Int { bits: 64 }, weight),
+        DType::F8E4M3 | DType::F8E5M2 => {
+            let encoding = if weight.dtype == DType::F8E4M3 { Encoding::E4m3 } else { Encoding::E5m2 };
+            let mut operand = QuantOperand::plain(encoding, weight);
+            let scale = ["weight_scale_inv", "scale", "weight_scale"].into_iter().find_map(|s| get(s).map(|m| (s, m)));
+            if let Some((suffix, scale)) = scale {
+                operand.scale = Some(fp8_scale(weight, suffix, scale)?);
+            }
+            if get("weight_scale_2").is_some() {
+                return Err(malformed(&weight.name, "an FP8 weight with a second-level weight_scale_2".into()));
+            }
+            operand
+        }
+        DType::U8 | DType::I8 | DType::F4 => fp4(members, weight)?,
+        other => {
+            return Err(malformed(&weight.name, format!("unknown element dtype {}", dtype_label(other))));
+        }
+    };
+    if let Some(input) = get("input_scale") {
+        let encoding = scale_encoding(&input.dtype)
+            .ok_or_else(|| malformed(&input.name, format!("input_scale dtype {}", dtype_label(&input.dtype))))?;
+        operand.input_scale = Some(TensorScale { encoding });
     }
+    operand.companions = companions;
+    if operand.scale.is_none() && !matches!(operand.encoding, Encoding::E4m3 | Encoding::E5m2 | Encoding::E2m1) {
+        if let Some(suffix) = ["weight_scale_inv", "weight_scale", "scale", "weight_scale_2"].into_iter()
+            .find(|s| members.contains_key(*s) && members.len() > 1) {
+            return Err(malformed(&members[suffix].meta.name, format!("a scale beside the unquantized {} weight {}",
+                operand.label(), weight.name)));
+        }
+    }
+    let known = ["weight", "weight_scale_inv", "weight_scale", "scale", "weight_scale_2", "input_scale", "bias", ""];
+    if let Some((suffix, tensor)) = members.iter().find(|(s, _)| !known.contains(&s.as_str())) {
+        return Err(malformed(&tensor.meta.name, format!("unexpected member .{suffix} beside {}", weight.name)));
+    }
+    Ok(operand)
+}
+
+/// The block scale of an FP8 weight `[N, K]` (or a per-tensor scale).
+fn fp8_scale(weight: &crate::SafetensorsTensorMetadata, suffix: &str, scale: &crate::SafetensorsTensorMetadata)
+    -> Result<BlockScale, Malformed> {
+    let malformed = |reason: String| Malformed { tensor: scale.name.clone(), reason };
+    let encoding = scale_encoding(&scale.dtype)
+        .ok_or_else(|| malformed(format!("scale dtype {}", dtype_label(&scale.dtype))))?;
+    let numel: usize = scale.shape.iter().product();
+    let (rows, cols) = match weight.shape.as_slice() {
+        [rows, cols] => (*rows, *cols),
+        _ if numel == 1 => {
+            // A per-tensor scale of a weight of any rank.
+            let n = weight.shape.iter().product();
+            return Ok(BlockScale { tensor: suffix.into(), encoding, direction: ScaleDirection::Multiply,
+                rows: RowTiling::Uniform { rows: n }, cols: n, grid: scale.shape.clone() });
+        }
+        other => return Err(malformed(format!("block scales of a rank-{} weight {other:?}", other.len()))),
+    };
+    let (grid_rows, grid_cols) = match scale.shape.as_slice() {
+        [] | [1] => (1, 1),
+        [r] if *r == rows => (rows, 1),
+        [r, c] => (*r, *c),
+        other => return Err(malformed(format!("scale grid {other:?} for weight [{rows}, {cols}]"))),
+    };
+    let col_edge = block_edge(cols, grid_cols)
+        .ok_or_else(|| malformed(format!("{grid_cols} scale columns do not tile {cols} columns in power-of-two blocks")))?;
+    let tiling = match block_edge(rows, grid_rows) {
+        Some(edge) => RowTiling::Uniform { rows: edge },
+        // More block rows than a uniform tiling (but fewer than per-row): the
+        // grid restarts at segment boundaries.
+        None if grid_rows > rows.div_ceil(col_edge.max(1)) && grid_rows < rows => {
+            RowTiling::Unresolved { scale_rows: grid_rows }
+        }
+        None => return Err(malformed(format!("{grid_rows} scale rows do not tile {rows} rows"))),
+    };
+    Ok(BlockScale { tensor: suffix.into(), encoding, direction: ScaleDirection::Multiply, rows: tiling,
+        cols: col_edge, grid: scale.shape.clone() })
+}
+
+/// Packed FP4 (two E2M1 codes per byte): MXFP4 (UE8M0 per 32) or ModelOpt
+/// NVFP4 (E4M3 per 16 plus an FP32 `weight_scale_2`).
+fn fp4(members: &BTreeMap<String, &CheckpointTensor>, weight: &crate::SafetensorsTensorMetadata)
+    -> Result<QuantOperand, Malformed> {
+    let get = |suffix: &str| members.get(suffix).map(|tensor| &tensor.meta);
+    let malformed = |tensor: &str, reason: String| Malformed { tensor: tensor.to_owned(), reason };
+    let Some((suffix, scale)) = ["weight_scale", "scale", "weight_scale_inv"].into_iter().find_map(|s| get(s).map(|m| (s, m)))
+    else {
+        // Unscaled 8-bit integers are integer data, not FP4.
+        let bits = 8;
+        let mut operand = QuantOperand::plain(Encoding::Int { bits }, weight);
+        if weight.dtype == DType::F4 {
+            operand.encoding = Encoding::E2m1;
+        }
+        return Ok(operand);
+    };
+    let [rows, packed] = weight.shape.as_slice() else {
+        return Err(malformed(&weight.name, format!("packed FP4 weight of rank {} {:?}", weight.shape.len(), weight.shape)));
+    };
+    let (rows, k) = (*rows, packed * 2);
+    let global = get("weight_scale_2");
+    let encoding = match (&scale.dtype, global) {
+        (DType::F8E8M0 | DType::U8, None) => ScaleEncoding::Ue8m0,
+        (DType::F8E4M3, _) => ScaleEncoding::E4m3,
+        (other, _) => {
+            return Err(malformed(&scale.name, format!("FP4 scale dtype {}{}", dtype_label(other),
+                if global.is_some() { " with a weight_scale_2" } else { "" })));
+        }
+    };
+    let [scale_rows, groups] = scale.shape.as_slice() else {
+        return Err(malformed(&scale.name, format!("FP4 scale grid {:?} for weight [{rows}, {k}]", scale.shape)));
+    };
+    if *scale_rows != rows || *groups == 0 || k % groups != 0 {
+        return Err(malformed(&scale.name, format!("FP4 scale grid [{scale_rows}, {groups}] does not tile [{rows}, {k}] \
+            (one row of scales per weight row, whole groups along K)")));
+    }
+    let mut operand = QuantOperand::plain(Encoding::E2m1, weight);
+    operand.logical = vec![rows, k];
+    operand.scale = Some(BlockScale { tensor: suffix.into(), encoding, direction: ScaleDirection::Multiply,
+        rows: RowTiling::Uniform { rows: 1 }, cols: k / groups, grid: scale.shape.clone() });
+    if let Some(global) = global {
+        let numel: usize = global.shape.iter().product();
+        let encoding = scale_encoding(&global.dtype).filter(|_| numel == 1).ok_or_else(|| {
+            malformed(&global.name, format!("weight_scale_2 must be one value, found {} {:?}",
+                dtype_label(&global.dtype), global.shape))
+        })?;
+        operand.global_scale = Some(TensorScale { encoding });
+    }
+    Ok(operand)
+}
+
+/// An EXL3 projection: `trellis` I16 `[K/16, N/16, 16 * bits]`, `suh` F16
+/// `[K]`, `svh` F16 `[N]` and the mcg codebook marker `mcg` I32 `[]` — the
+/// same contract the EXL3 staging validates (`formats::exl3_format`).
+fn detect_exl3(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOperand, Malformed> {
+    let get = |suffix: &str| members.get(suffix).map(|tensor| &tensor.meta);
+    let anchor = members.values().next().map_or(String::new(), |t| t.meta.name.clone());
+    let stem = split_stem(&anchor).0.to_owned();
+    let malformed = |tensor: String, reason: String| Malformed { tensor, reason };
+    if let Some(mul1) = get("mul1") {
+        return Err(malformed(mul1.name.clone(), "EXL3 mul1 codebook (this build runs the mcg codebook only)".into()));
+    }
+    let need = |suffix: &str| get(suffix).ok_or_else(|| malformed(format!("{stem}.{suffix}"),
+        "missing EXL3 companion (a trellis needs suh, svh and mcg)".into()));
+    let trellis = need("trellis")?;
+    let [k16, n16, packed] = trellis.shape.as_slice() else {
+        return Err(malformed(trellis.name.clone(), format!("trellis of rank {} {:?} (expected [K/16, N/16, 16 x bits])",
+            trellis.shape.len(), trellis.shape)));
+    };
+    if trellis.dtype != DType::I16 {
+        return Err(malformed(trellis.name.clone(), format!("trellis dtype {} (expected I16)", dtype_label(&trellis.dtype))));
+    }
+    if *packed == 0 || packed % 16 != 0 || !(1..=8).contains(&(packed / 16)) {
+        return Err(malformed(trellis.name.clone(), format!("trellis last dim {packed} is not 16 x bits for 1..=8 bits")));
+    }
+    let (k, n, bits) = (k16 * 16, n16 * 16, packed / 16);
+    let expected = (k * n * bits / 8) as u64;
+    if trellis.byte_length != expected {
+        return Err(malformed(trellis.name.clone(), format!("{} bytes for {k} x {n} at K{bits} (expected {expected})",
+            trellis.byte_length)));
+    }
+    for (suffix, dtype, shape) in [("suh", DType::F16, vec![k]), ("svh", DType::F16, vec![n]), ("mcg", DType::I32, vec![])] {
+        let tensor = need(suffix)?;
+        if tensor.dtype != dtype || tensor.shape != shape {
+            return Err(malformed(tensor.name.clone(), format!("{} {:?} (expected {} {shape:?})", dtype_label(&tensor.dtype),
+                tensor.shape, dtype_label(&dtype))));
+        }
+    }
+    if let Some((suffix, tensor)) = members.iter().find(|(s, _)| !["trellis", "suh", "svh", "mcg"].contains(&s.as_str())) {
+        return Err(malformed(tensor.meta.name.clone(), format!("unexpected member .{suffix} beside an EXL3 trellis")));
+    }
+    Ok(QuantOperand {
+        encoding: Encoding::Exl3 { bits },
+        container: "i16".into(),
+        logical: vec![n, k],
+        stored: trellis.shape.clone(),
+        scale: None,
+        global_scale: None,
+        input_scale: None,
+        companions: vec!["mcg".into(), "suh".into(), "svh".into()],
+    })
 }

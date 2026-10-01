@@ -189,9 +189,8 @@ impl Fp8ExpertTensors {
     /// rank range in whole blocks, padded to 128.
     pub fn slice(&self, tp: usize) -> Result<usize> {
         let (i, block) = (self.shape.intermediate, self.block());
-        ensure!(tp > 0 && i % block == 0 && i / block >= tp,
-            "intermediate {i} does not split into whole {block}-row blocks over {tp} ranks");
-        Ok(((i / block).div_ceil(tp) * block).div_ceil(128) * 128)
+        crate::plan::experts::stored_slice(i, block, tp)
+            .with_context(|| format!("intermediate {i} does not split into whole {block}-row blocks over {tp} ranks"))
     }
 
     /// The intermediate rows `[first, first + len)` rank `rank` of `tp` computes

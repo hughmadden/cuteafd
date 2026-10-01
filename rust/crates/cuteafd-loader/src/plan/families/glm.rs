@@ -4,9 +4,13 @@
 use anyhow::Result;
 use serde_json::Value;
 
+use super::{bf16, bf16_or_f32, bf16_or_fp8_block128, describe, fp8_f32_block128, leaf, require};
+use crate::families::glm5::{GlmDsaConfig, GlmIndexer};
+use crate::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
 use crate::plan::checkpoint::{opt_usize_field, usize_field, Checkpoint};
-use crate::plan::family::{Family, Hint, RuntimeStatus};
-use crate::plan::format::WeightFormat;
+use crate::plan::experts::{exl3_spark_worlds, fp8_spark_worlds};
+use crate::plan::family::{ConfigError, ExpertContract, Family, FamilyModel, Hint, RuntimeStatus};
+use crate::plan::format::{QuantOperand, ScaleEncoding};
 use crate::plan::names::indexed;
 use crate::plan::spec::*;
 
@@ -43,23 +47,8 @@ impl Family for Glm {
         self.runtime
     }
 
-    fn executes(&self, component: Component, format: &WeightFormat) -> bool {
-        if self.runtime != RuntimeStatus::Serving {
-            return false;
-        }
-        use WeightFormat::*;
-        // BF16/F32 coordinator tensors (FP8 128x128 blocks with FP32 scales read
-        // as they are); routed experts from EXL3 packages (glm: exl3-glm-k45,
-        // glmf: exl3-glmf-k34) or the checkpoint's FP8 (fp8-glm, fp8-glmf).
-        let exl3_bits = if self.id == "glm5" { 4..=5 } else { 3..=4 };
-        match component {
-            Component::RoutedExpert => {
-                matches!(format, Fp8Block { block: (128, 128) })
-                    || matches!(format, Exl3 { bits } if exl3_bits.contains(bits))
-            }
-            Component::Speculator | Component::SpeculatorExpert | Component::Vision => false,
-            _ => matches!(format, Fp8Block { block: (128, 128) } | Bf16 | F32),
-        }
+    fn expert_catalog(&self) -> bool {
+        true
     }
 
     fn optional(&self, component: Component) -> bool {
@@ -71,117 +60,9 @@ impl Family for Glm {
         checkpoint.architectures().iter().any(|arch| arch == self.architecture)
     }
 
-    fn spec(&self, checkpoint: &Checkpoint) -> Result<ModelSpec> {
-        let text = checkpoint.text_config();
-        let layers = usize_field(text, "num_hidden_layers")?;
-        let mlp_types = str_list(text, "mlp_layer_types");
-        let layer_types = str_list(text, "layer_types");
-        let indexer_types = str_list(text, "indexer_types");
-        let first_dense = opt_usize_field(text, "first_k_dense_replace").unwrap_or(0);
-        let dense_intermediate = opt_usize_field(text, "intermediate_size").unwrap_or(0);
-        let layer_specs = (0..layers)
-            .map(|layer| {
-                let dense = mlp_types.get(layer).map_or(layer < first_dense, |t| t == "dense");
-                let kind = layer_types.get(layer).map(String::as_str).unwrap_or("deepseek_sparse_attention");
-                let attention = if kind == "linear_attention" {
-                    AttentionKind::Kda
-                } else {
-                    AttentionKind::MlaDsa {
-                        indexer: indexer_types.get(layer).map_or(true, |t| t == "full"),
-                    }
-                };
-                LayerSpec {
-                    attention,
-                    ffn: if dense {
-                        FfnKind::Dense { intermediate: dense_intermediate }
-                    } else {
-                        FfnKind::Moe
-                    },
-                }
-            })
-            .collect();
-        let mtp = opt_usize_field(text, "num_nextn_predict_layers").unwrap_or(0);
-        let mut notes = Vec::new();
-        if let Some(hc) = opt_usize_field(text, "hc_mult") {
-            notes.push(format!(
-                "mHC width {hc}, Sinkhorn {} iterations, final collapse {}",
-                opt_usize_field(text, "hc_sinkhorn_iters").unwrap_or(0),
-                if self.id == "glm5_flash" { "unweighted mean" } else { "hc_head" },
-            ));
-        }
-        let rope = opt_usize_field(text, "qk_rope_head_dim").unwrap_or(0);
-        let kv_lora = opt_usize_field(text, "kv_lora_rank").unwrap_or(0);
-        notes.push(format!(
-            "MLA q_lora {} kv_lora {kv_lora} rope {rope}, qk nope {} v {} (absorbed query {}; FP8 latent record \
-             {} B: E4M3 + 4 FP32 group scales{})",
-            opt_usize_field(text, "q_lora_rank").unwrap_or(0),
-            opt_usize_field(text, "qk_nope_head_dim").unwrap_or(0),
-            opt_usize_field(text, "v_head_dim").unwrap_or(0),
-            kv_lora + rope,
-            kv_lora + 4 * (kv_lora / 128) + 2 * rope,
-            if rope > 0 { " + BF16 RoPE" } else { ", no RoPE" },
-        ));
-        let kpool = opt_usize_field(text, "index_kpool").unwrap_or(1);
-        notes.push(format!(
-            "DSA index top-k {}{}",
-            opt_usize_field(text, "index_topk").unwrap_or(0),
-            if kpool > 1 {
-                format!(
-                    " tokens = {} pools of {kpool} (gated softmax pool keys + learned position bias){}; \
-                     dense causal up to {} tokens",
-                    opt_usize_field(text, "index_topk").unwrap_or(0) / kpool,
-                    if text.get("index_kpool_always_select_tail").and_then(Value::as_bool) == Some(true) {
-                        ", plus the open tail pool"
-                    } else {
-                        ""
-                    },
-                    opt_usize_field(text, "index_topk").unwrap_or(0) + kpool - 1,
-                )
-            } else {
-                String::new()
-            },
-        ));
-        if let Some(linear) = text.get("linear_attn_config") {
-            let heads = opt_usize_field(linear, "num_heads").unwrap_or(0);
-            let dim = opt_usize_field(linear, "head_dim").unwrap_or(0);
-            let kda = layer_types.iter().filter(|t| *t == "linear_attention").count();
-            notes.push(format!(
-                "KDA {heads} heads x {dim}, short conv {}, gate lower bound {}; recurrent state {:.1} MiB per \
-                 sequence ({kda} layers x FP32 {heads}x{dim}x{dim}) plus conv state",
-                opt_usize_field(linear, "short_conv_kernel_size").unwrap_or(0),
-                linear.get("gate_lower_bound").and_then(Value::as_f64).unwrap_or(0.0),
-                (kda * heads * dim * dim * 4) as f64 / (1u64 << 20) as f64,
-            ));
-        }
-        if let Some(limit) = text.get("swiglu_limit").and_then(Value::as_f64) {
-            notes.push(format!(
-                "SwiGLU clamp {limit} (gate <= {limit}, |up| <= {limit}) in dense, shared and routed experts"
-            ));
-        }
-        Ok(ModelSpec {
-            family: self.id,
-            architecture: self.architecture.into(),
-            hidden: usize_field(text, "hidden_size")?,
-            vocab: usize_field(text, "vocab_size")?,
-            layers: layer_specs,
-            moe: Some(MoeSpec {
-                experts: usize_field(text, "n_routed_experts")?,
-                top_k: usize_field(text, "num_experts_per_tok")?,
-                intermediate: usize_field(text, "moe_intermediate_size")?,
-                shared_experts: opt_usize_field(text, "n_shared_experts").unwrap_or(0),
-                shared_intermediate: usize_field(text, "moe_intermediate_size")?,
-                scoring: text.get("scoring_func").and_then(Value::as_str).unwrap_or("sigmoid").into(),
-                routed_scaling: text.get("routed_scaling_factor").and_then(Value::as_f64),
-                groups: match (opt_usize_field(text, "n_group"), opt_usize_field(text, "topk_group")) {
-                    (Some(n), Some(k)) if n > 1 => Some((n, k)),
-                    _ => None,
-                },
-            }),
-            speculator: (mtp > 0).then_some(SpeculatorSpec::NativeMtp { layers: mtp }),
-            tables: Vec::new(),
-            vision: checkpoint.config.get("vision_config").is_some(),
-            notes,
-        })
+    fn open(&self, checkpoint: &Checkpoint) -> Result<Box<dyn FamilyModel>, ConfigError> {
+        let spec = self.spec(checkpoint).map_err(ConfigError::from_anyhow)?;
+        Ok(Box::new(GlmModel { id: self.id, spec }))
     }
 
     fn classify(&self, spec: &ModelSpec, name: &str) -> Option<TensorRole> {
@@ -292,5 +173,258 @@ impl Family for Glm {
             _ => return None,
         };
         Some(Hint { what, how })
+    }
+}
+
+impl Glm {
+    /// The spec from the runtime's reader (`GlmDsaConfig` for serve-glm,
+    /// `GlmNextConfig` for serve-glmf): layer schedule, MoE and RoPE come from
+    /// it; the notes describe the rest of config.json.
+    fn spec(&self, checkpoint: &Checkpoint) -> Result<ModelSpec> {
+        let text = checkpoint.text_config();
+        let (layer_specs, moe, mtp) = if self.id == "glm5" {
+            let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
+            let layers = (0..cfg.layers)
+                .map(|layer| LayerSpec {
+                    attention: AttentionKind::MlaDsa { indexer: cfg.indexers[layer] == GlmIndexer::Full },
+                    ffn: if layer < cfg.first_moe_layer {
+                        FfnKind::Dense { intermediate: cfg.dense_intermediate }
+                    } else {
+                        FfnKind::Moe
+                    },
+                    rope: Some(RopeSpec { dims: cfg.qk_rope_head_dim, theta: cfg.rope_theta }),
+                })
+                .collect::<Vec<_>>();
+            let moe = MoeSpec {
+                experts: cfg.experts,
+                top_k: cfg.topk,
+                intermediate: cfg.moe_intermediate,
+                shared_experts: cfg.shared_experts,
+                shared_intermediate: cfg.moe_intermediate,
+                scoring: "sigmoid".into(),
+                routed_scaling: Some(cfg.routed_scale),
+                groups: None,
+            };
+            (layers, moe, cfg.mtp_layers)
+        } else {
+            let cfg = GlmNextConfig::from_hf(&checkpoint.config)?;
+            let layers = (0..cfg.layers)
+                .map(|layer| LayerSpec {
+                    attention: match cfg.attention[layer] {
+                        GlmNextAttention::Kda => AttentionKind::Kda,
+                        GlmNextAttention::Mla => AttentionKind::MlaDsa { indexer: true },
+                    },
+                    ffn: if cfg.dense[layer] {
+                        FfnKind::Dense { intermediate: cfg.dense_intermediate }
+                    } else {
+                        FfnKind::Moe
+                    },
+                    rope: None,
+                })
+                .collect::<Vec<_>>();
+            let moe = MoeSpec {
+                experts: cfg.experts,
+                top_k: cfg.topk,
+                intermediate: cfg.moe_intermediate,
+                shared_experts: opt_usize_field(text, "n_shared_experts").unwrap_or(0),
+                shared_intermediate: cfg.moe_intermediate,
+                scoring: "sigmoid".into(),
+                routed_scaling: Some(cfg.routed_scale),
+                groups: None,
+            };
+            (layers, moe, opt_usize_field(text, "num_nextn_predict_layers").unwrap_or(0))
+        };
+        let layer_types = str_list(text, "layer_types");
+        let mut notes = Vec::new();
+        if let Some(hc) = opt_usize_field(text, "hc_mult") {
+            notes.push(format!(
+                "mHC width {hc}, Sinkhorn {} iterations, final collapse {}",
+                opt_usize_field(text, "hc_sinkhorn_iters").unwrap_or(0),
+                if self.id == "glm5_flash" { "unweighted mean" } else { "hc_head" },
+            ));
+        }
+        let rope = opt_usize_field(text, "qk_rope_head_dim").unwrap_or(0);
+        let kv_lora = opt_usize_field(text, "kv_lora_rank").unwrap_or(0);
+        notes.push(format!(
+            "MLA q_lora {} kv_lora {kv_lora} rope {rope}, qk nope {} v {} (absorbed query {}; FP8 latent record \
+             {} B: E4M3 + 4 FP32 group scales{})",
+            opt_usize_field(text, "q_lora_rank").unwrap_or(0),
+            opt_usize_field(text, "qk_nope_head_dim").unwrap_or(0),
+            opt_usize_field(text, "v_head_dim").unwrap_or(0),
+            kv_lora + rope,
+            kv_lora + 4 * (kv_lora / 128) + 2 * rope,
+            if rope > 0 { " + BF16 RoPE" } else { ", no RoPE" },
+        ));
+        let kpool = opt_usize_field(text, "index_kpool").unwrap_or(1);
+        notes.push(format!(
+            "DSA index top-k {}{}",
+            opt_usize_field(text, "index_topk").unwrap_or(0),
+            if kpool > 1 {
+                format!(
+                    " tokens = {} pools of {kpool} (gated softmax pool keys + learned position bias){}; \
+                     dense causal up to {} tokens",
+                    opt_usize_field(text, "index_topk").unwrap_or(0) / kpool,
+                    if text.get("index_kpool_always_select_tail").and_then(Value::as_bool) == Some(true) {
+                        ", plus the open tail pool"
+                    } else {
+                        ""
+                    },
+                    opt_usize_field(text, "index_topk").unwrap_or(0) + kpool - 1,
+                )
+            } else {
+                String::new()
+            },
+        ));
+        if let Some(linear) = text.get("linear_attn_config") {
+            let heads = opt_usize_field(linear, "num_heads").unwrap_or(0);
+            let dim = opt_usize_field(linear, "head_dim").unwrap_or(0);
+            let kda = layer_types.iter().filter(|t| *t == "linear_attention").count();
+            notes.push(format!(
+                "KDA {heads} heads x {dim}, short conv {}, gate lower bound {}; recurrent state {:.1} MiB per \
+                 sequence ({kda} layers x FP32 {heads}x{dim}x{dim}) plus conv state",
+                opt_usize_field(linear, "short_conv_kernel_size").unwrap_or(0),
+                linear.get("gate_lower_bound").and_then(Value::as_f64).unwrap_or(0.0),
+                (kda * heads * dim * dim * 4) as f64 / (1u64 << 20) as f64,
+            ));
+        }
+        if let Some(limit) = text.get("swiglu_limit").and_then(Value::as_f64) {
+            notes.push(format!(
+                "SwiGLU clamp {limit} (gate <= {limit}, |up| <= {limit}) in dense, shared and routed experts"
+            ));
+        }
+        Ok(ModelSpec {
+            family: self.id,
+            architecture: self.architecture.into(),
+            hidden: usize_field(text, "hidden_size")?,
+            vocab: usize_field(text, "vocab_size")?,
+            layers: layer_specs,
+            moe: Some(moe),
+            speculator: (mtp > 0).then_some(SpeculatorSpec::NativeMtp { layers: mtp }),
+            tables: Vec::new(),
+            vision: checkpoint.config.get("vision_config").is_some(),
+            notes,
+        })
+    }
+
+}
+
+struct GlmModel {
+    id: &'static str,
+    spec: ModelSpec,
+}
+
+/// serve-glm's decode programs read these as the checkpoint's own FP8 (E4M3
+/// with FP32 128x128 scales) beside the BF16 operand (`GlmLoader::layer`,
+/// `rows_fp8(.., keep_fp8 = true)`); a BF16 copy is not accepted.
+const GLM5_DECODE_FP8: &[&str] = &["q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj", "gate_proj", "up_proj", "down_proj"];
+
+impl GlmModel {
+    fn glm5(&self, stem: &str, operand: &QuantOperand) -> Result<(), String> {
+        let name = leaf(stem);
+        let indexer = stem.contains(".indexer.");
+        if GLM5_DECODE_FP8.contains(&name) || (indexer && name == "wq_b") {
+            // Concatenated FP8 parts (q_a | kv_a, gate | up) must end on whole 128-row blocks.
+            let first_of_pair = matches!(name, "q_a_proj" | "gate_proj");
+            return require(fp8_f32_block128(operand)
+                && (!first_of_pair || operand.matrix().is_some_and(|(rows, _)| rows % 128 == 0)), || {
+                format!("serve-glm's decode programs read {name} as checkpoint FP8 (E4M3, FP32 128x128 scales{}); \
+                    found {}", if first_of_pair { ", 128-row multiple" } else { "" }, describe(operand))
+            });
+        }
+        match name {
+            "kv_b_proj" | "wk" | "weights_proj" | "lm_head" => bf16_or_fp8_block128(operand, name),
+            "gate" => bf16(operand, "the router weight"),
+            "e_score_correction_bias" => require(operand.is_plain(&[crate::plan::format::Encoding::F32]),
+                || format!("the router bias must be FP32, found {}", describe(operand))),
+            _ => bf16(operand, name),
+        }
+    }
+
+    fn glm5_flash(&self, stem: &str, operand: &QuantOperand) -> Result<(), String> {
+        let name = leaf(stem);
+        match name {
+            // `absorbed` splits kv_b_proj into w_uk / w_uv from BF16 rows.
+            "kv_b_proj" => bf16(operand, "kv_b_proj (absorbed into w_uk / w_uv)"),
+            "A_log" | "dt_bias" | "q_conv1d" | "k_conv1d" | "v_conv1d" | "e_score_correction_bias" => {
+                bf16_or_f32(operand, name)
+            }
+            _ if name.starts_with("hc_") => bf16_or_f32(operand, name),
+            _ if name.ends_with("norm") || name.ends_with("layernorm") || name == "index_kpool_compress_ape" => {
+                bf16(operand, name)
+            }
+            "gate" => bf16(operand, "the router weight"),
+            _ if operand.matrix().is_some() => bf16_or_fp8_block128(operand, name),
+            _ => bf16(operand, name),
+        }
+    }
+
+    fn routed(&self, stem: &str, operand: &QuantOperand) -> Result<(), String> {
+        let moe = self.spec.moe.as_ref().ok_or("no MoE geometry")?;
+        let shape = super::deepseek::routed_shape(stem, self.spec.hidden, moe.intermediate)
+            .ok_or("not a routed projection (gate/up/down_proj)")?;
+        require(operand.logical == shape, || format!("experts are {shape:?}, found {}", describe(operand)))?;
+        let exl3 = if self.id == "glm5" { 4..=5 } else { 3..=4 };
+        require(operand.is_fp8_block(128, &[ScaleEncoding::F32, ScaleEncoding::Bf16])
+            || operand.exl3_bits().is_some_and(|bits| exl3.contains(&bits)), || {
+            format!("routed experts run E4M3 with 128x128 scales or EXL3 K{}-K{}; found {}", exl3.start(), exl3.end(),
+                describe(operand))
+        })
+    }
+
+    fn geometry(&self) -> &'static str {
+        if self.id == "glm5" { "glm" } else { "glmf" }
+    }
+}
+
+impl FamilyModel for GlmModel {
+    fn spec(&self) -> &ModelSpec {
+        &self.spec
+    }
+
+    fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
+        match role.component {
+            Component::RoutedExpert => self.routed(stem, operand),
+            Component::Speculator | Component::SpeculatorExpert => {
+                Err("the native MTP layer is not run (speculation uses a DFlash2 drafter)".into())
+            }
+            Component::Vision => Err("text-only: the vision tower is not run".into()),
+            _ if self.id == "glm5" => self.glm5(stem, operand),
+            _ => self.glm5_flash(stem, operand),
+        }
+    }
+
+    fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
+        let moe = self.spec.moe.as_ref()?;
+        let geometry = cuteafd_core::ExpertGeometry {
+            hidden: self.spec.hidden as u32,
+            experts: moe.experts as u32,
+            topk: moe.top_k as u32,
+            intermediate: moe.intermediate as u32,
+            layers: 0,
+        };
+        let expected = if self.id == "glm5" { cuteafd_core::ExpertGeometry::GLM5 } else { cuteafd_core::ExpertGeometry::GLM5_FLASH };
+        if !geometry.same_shape(&expected) {
+            return None;
+        }
+        let local = if self.id == "glm5" {
+            Err("serve-glm has no local expert path (no --local-experts)".to_string())
+        } else {
+            Ok("serve-glmf --local-experts (TP1 FP8 or EXL3 package)".to_string())
+        };
+        if operand.exl3_bits().is_some() {
+            let tiers = if self.id == "glm5" { "k45" } else { "k34" };
+            return Some(ExpertContract {
+                package: format!("{}:exl3-{tiers}", self.geometry()),
+                block: 128,
+                spark_worlds: exl3_spark_worlds(moe.intermediate),
+                local,
+            });
+        }
+        operand.is_fp8_block(128, &[ScaleEncoding::F32, ScaleEncoding::Bf16]).then(|| ExpertContract {
+            package: format!("{}:fp8", self.geometry()),
+            block: 128,
+            spark_worlds: fp8_spark_worlds(moe.intermediate),
+            local,
+        })
     }
 }

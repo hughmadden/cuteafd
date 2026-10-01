@@ -3,9 +3,12 @@
 use anyhow::Result;
 use serde_json::Value;
 
+use super::{describe, require};
+use crate::families::deepseek_v4::DeepseekV4Config;
 use crate::plan::checkpoint::{opt_usize_field, usize_field, Checkpoint};
-use crate::plan::family::{Family, Hint, RuntimeStatus};
-use crate::plan::format::WeightFormat;
+use crate::plan::experts::TRANSPORT_WORLDS;
+use crate::plan::family::{ConfigError, ExpertContract, Family, FamilyModel, Hint, RuntimeStatus};
+use crate::plan::format::{Encoding, QuantOperand, ScaleEncoding};
 use crate::plan::names::{indexed, indexed_tail};
 use crate::plan::spec::*;
 
@@ -45,80 +48,13 @@ impl Family for DeepSeek {
         checkpoint.architectures().iter().any(|arch| arch == self.architecture)
     }
 
-    fn spec(&self, checkpoint: &Checkpoint) -> Result<ModelSpec> {
-        let text = checkpoint.text_config();
-        let layers = usize_field(text, "num_hidden_layers")?;
-        let ratios = usize_list(text, "compress_ratios");
-        let index_sources = usize_list(text, "index_source_layer_ids");
-        let hash_layers = opt_usize_field(text, "num_hash_layers").unwrap_or(0);
-        // A layer carries its own indexer when its tensors say so; V4.1
-        // publishes the owners explicitly, V4 puts one on every ratio-4 layer.
-        let has_indexer = |layer: usize| {
-            let prefix = format!("layers.{layer}.attn.indexer.");
-            checkpoint.tensors.iter().any(|t| t.meta.name.starts_with(&prefix))
-                || index_sources.contains(&layer)
+    fn open(&self, checkpoint: &Checkpoint) -> Result<Box<dyn FamilyModel>, ConfigError> {
+        let spec = if self.id == "deepseek_v4" {
+            v4_spec(checkpoint).map_err(ConfigError::from_anyhow)?
+        } else {
+            v41_spec(checkpoint).map_err(ConfigError::from_anyhow)?
         };
-        let layer_specs = (0..layers)
-            .map(|layer| LayerSpec {
-                attention: AttentionKind::CompressedMla {
-                    ratio: ratios.get(layer).copied().unwrap_or(0),
-                    indexer: has_indexer(layer),
-                },
-                ffn: FfnKind::Moe,
-            })
-            .collect();
-        let dspark_stages = checkpoint
-            .tensors
-            .iter()
-            .filter_map(|t| indexed(&t.meta.name, "mtp.").map(|(index, _)| index))
-            .max()
-            .map_or(0, |max| max + 1);
-        let speculator = (dspark_stages > 0).then(|| SpeculatorSpec::Dspark {
-            stages: dspark_stages,
-            experts: opt_usize_field(text, "dspark_n_routed_experts")
-                .or_else(|| opt_usize_field(text, "n_routed_experts"))
-                .unwrap_or(0),
-            top_k: opt_usize_field(text, "dspark_num_experts_per_tok")
-                .or_else(|| opt_usize_field(text, "num_experts_per_tok"))
-                .unwrap_or(0),
-            target_layers: usize_list(text, "dspark_target_layer_ids"),
-        });
-        let engram = usize_list(text, "engram_layer_ids");
-        let mut tables = Vec::new();
-        if !engram.is_empty() {
-            tables.push(MappedTableSpec { name: "engram".into(), layers: engram });
-        }
-        let mut notes = vec![format!("compress ratios {:?}", dedup(&ratios))];
-        if let Some(hc) = opt_usize_field(text, "hc_mult") {
-            notes.push(format!("mHC width {hc}"));
-        }
-        if hash_layers > 0 {
-            notes.push(format!("hash-routed layers 0..{hash_layers} (ffn.gate.tid2eid)"));
-        }
-        if let Some(sources) = text.get("kv_source_layer_ids") {
-            notes.push(format!("CED KV sources {sources}"));
-        }
-        Ok(ModelSpec {
-            family: self.id,
-            architecture: self.architecture.into(),
-            hidden: usize_field(text, "hidden_size")?,
-            vocab: usize_field(text, "vocab_size")?,
-            layers: layer_specs,
-            moe: Some(MoeSpec {
-                experts: usize_field(text, "n_routed_experts")?,
-                top_k: usize_field(text, "num_experts_per_tok")?,
-                intermediate: usize_field(text, "moe_intermediate_size")?,
-                shared_experts: opt_usize_field(text, "n_shared_experts").unwrap_or(0),
-                shared_intermediate: usize_field(text, "moe_intermediate_size")?,
-                scoring: text.get("scoring_func").and_then(Value::as_str).unwrap_or("softmax").into(),
-                routed_scaling: text.get("routed_scaling_factor").and_then(Value::as_f64),
-                groups: None,
-            }),
-            speculator,
-            tables,
-            vision: checkpoint.config.get("vision_config").is_some(),
-            notes,
-        })
+        Ok(Box::new(DeepSeekModel { id: self.id, spec }))
     }
 
     fn classify(&self, _spec: &ModelSpec, name: &str) -> Option<TensorRole> {
@@ -177,36 +113,13 @@ impl Family for DeepSeek {
         Some(TensorRole::layer(component, layer))
     }
 
-    fn executes(&self, component: Component, format: &WeightFormat) -> bool {
-        if self.runtime != RuntimeStatus::Serving {
-            return false;
-        }
-        use WeightFormat::*;
-        if self.id == "deepseek_v4" {
-            // serve-dsv4: native MXFP4 or EXL3 (expertd-native, packages
-            // exl3-dsv4*-k*) routed experts on the Sparks, 128x128 block-FP8
-            // projections and BF16/F32 tensors on the RTX, integer
-            // hash-routing tables.
-            return match component {
-                Component::RoutedExpert => matches!(format, Mxfp4 { group: 32 } | Exl3 { bits: 2..=4 }),
-                Component::Speculator | Component::SpeculatorExpert => false,
-                _ => matches!(format, Fp8Block { block: (128, 128) } | Bf16 | F32 | Int),
-            };
-        }
-        match component {
-            // Native MXFP4, EXL3 K2-K4 packages and ModelOpt W4A4 NVFP4.
-            Component::RoutedExpert | Component::SpeculatorExpert => matches!(
-                format,
-                Mxfp4 { group: 32 } | Exl3 { bits: 2..=4 } | Nvfp4
-            ),
-            // Engram rows: FP8 with 1x32 E8M0 scales, or the FP4PLE NVFP4 variant.
-            Component::MappedTable => matches!(format, Fp8Block { block: (1, 32) } | Nvfp4),
-            _ => matches!(format, Fp8Block { block: (32, 32) } | Bf16 | F32),
-        }
+    fn expert_catalog(&self) -> bool {
+        self.id == "deepseek_v4"
     }
 
     fn optional(&self, component: Component) -> bool {
-        self.id == "deepseek_v4" && matches!(component, Component::Speculator | Component::SpeculatorExpert)
+        self.id == "deepseek_v4"
+            && matches!(component, Component::Speculator | Component::SpeculatorExpert | Component::Vision)
     }
 
     fn component_hint(&self, component: Component) -> Option<Hint> {
@@ -265,4 +178,239 @@ fn dedup(values: &[usize]) -> Vec<usize> {
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// dSpark stages the checkpoint carries (`mtp.{s}.*`): V4's HF config says
+/// one while every V4 checkpoint ships three.
+fn dspark_stages(checkpoint: &Checkpoint) -> usize {
+    checkpoint
+        .tensors
+        .iter()
+        .filter_map(|t| indexed_tail(&t.meta.name, "mtp.").map(|(index, _)| index))
+        .max()
+        .map_or(0, |max| max + 1)
+}
+
+/// V4's spec from the runtime's own reader (`DeepseekV4Config::read`:
+/// `inference/config.json` when the snapshot has one, else the mapped HF
+/// config), so serve-dsv4 and the plan see the same schedule.
+fn v4_spec(checkpoint: &Checkpoint) -> Result<ModelSpec> {
+    let stages = dspark_stages(checkpoint);
+    let cfg = DeepseekV4Config::read(&checkpoint.snapshot, stages)?;
+    let layers = (0..cfg.n_layers)
+        .map(|layer| {
+            let ratio = cfg.compress_ratios[layer];
+            LayerSpec {
+                attention: AttentionKind::CompressedMla { ratio, indexer: ratio == 4 },
+                ffn: FfnKind::Moe,
+                rope: Some(RopeSpec {
+                    dims: cfg.rope_head_dim,
+                    theta: if ratio == 0 { cfg.rope_theta } else { cfg.compress_rope_theta },
+                }),
+            }
+        })
+        .collect();
+    let mut notes = vec![format!("compress ratios {:?}", dedup(&cfg.compress_ratios)), format!("mHC width {}", cfg.hc_mult)];
+    if cfg.n_hash_layers > 0 {
+        notes.push(format!("hash-routed layers 0..{} (ffn.gate.tid2eid)", cfg.n_hash_layers));
+    }
+    if checkpoint.snapshot.join("inference/config.json").is_file() {
+        notes.push("configuration from inference/config.json (the runtime's reader)".into());
+    }
+    Ok(ModelSpec {
+        family: "deepseek_v4",
+        architecture: checkpoint.architectures().first().cloned().unwrap_or_default(),
+        hidden: cfg.dim,
+        vocab: cfg.vocab_size,
+        layers,
+        moe: Some(MoeSpec {
+            experts: cfg.n_routed_experts,
+            top_k: cfg.n_activated_experts,
+            intermediate: cfg.moe_inter_dim,
+            shared_experts: cfg.n_shared_experts,
+            shared_intermediate: cfg.moe_inter_dim,
+            scoring: cfg.score_func.clone(),
+            routed_scaling: Some(cfg.route_scale),
+            groups: None,
+        }),
+        speculator: (stages > 0).then(|| SpeculatorSpec::Dspark {
+            stages,
+            experts: cfg.n_routed_experts,
+            top_k: cfg.n_activated_experts,
+            target_layers: cfg.dspark_target_layer_ids.clone(),
+        }),
+        tables: Vec::new(),
+        vision: checkpoint.config.get("vision_config").is_some(),
+        notes,
+    })
+}
+
+/// V4.1's spec from its HF config. serve-native validates the pinned official
+/// configuration (`OfficialV41Config`); the planner describes V4.1
+/// publications (EXL3, NVFP4) whose configs extend it, reading the same keys
+/// without defaults for the schedule.
+fn v41_spec(checkpoint: &Checkpoint) -> Result<ModelSpec> {
+    let text = checkpoint.text_config();
+    let layers = usize_field(text, "num_hidden_layers")?;
+    let ratios = usize_list(text, "compress_ratios");
+    anyhow::ensure!(ratios.len() >= layers, "compress_ratios has {} entries for {layers} layers", ratios.len());
+    let index_sources = usize_list(text, "index_source_layer_ids");
+    let hash_layers = opt_usize_field(text, "num_hash_layers").unwrap_or(0);
+    // A layer carries its own indexer when its tensors say so; V4.1 publishes
+    // the owners explicitly.
+    let has_indexer = |layer: usize| {
+        let prefix = format!("layers.{layer}.attn.indexer.");
+        checkpoint.tensors.iter().any(|t| t.meta.name.starts_with(&prefix)) || index_sources.contains(&layer)
+    };
+    let layer_specs = (0..layers)
+        .map(|layer| LayerSpec {
+            attention: AttentionKind::CompressedMla { ratio: ratios[layer], indexer: has_indexer(layer) },
+            ffn: FfnKind::Moe,
+            rope: None,
+        })
+        .collect();
+    let stages = dspark_stages(checkpoint);
+    let speculator = (stages > 0).then(|| SpeculatorSpec::Dspark {
+        stages,
+        experts: opt_usize_field(text, "dspark_n_routed_experts")
+            .or_else(|| opt_usize_field(text, "n_routed_experts"))
+            .unwrap_or(0),
+        top_k: opt_usize_field(text, "dspark_num_experts_per_tok")
+            .or_else(|| opt_usize_field(text, "num_experts_per_tok"))
+            .unwrap_or(0),
+        target_layers: usize_list(text, "dspark_target_layer_ids"),
+    });
+    let engram = usize_list(text, "engram_layer_ids");
+    let mut tables = Vec::new();
+    if !engram.is_empty() {
+        tables.push(MappedTableSpec { name: "engram".into(), layers: engram });
+    }
+    let mut notes = vec![format!("compress ratios {:?}", dedup(&ratios[..layers]))];
+    if let Some(hc) = opt_usize_field(text, "hc_mult") {
+        notes.push(format!("mHC width {hc}"));
+    }
+    if hash_layers > 0 {
+        notes.push(format!("hash-routed layers 0..{hash_layers} (ffn.gate.tid2eid)"));
+    }
+    if let Some(sources) = text.get("kv_source_layer_ids") {
+        notes.push(format!("CED KV sources {sources}"));
+    }
+    Ok(ModelSpec {
+        family: "deepseek_v41",
+        architecture: "DeepseekV41ForCausalLM".into(),
+        hidden: usize_field(text, "hidden_size")?,
+        vocab: usize_field(text, "vocab_size")?,
+        layers: layer_specs,
+        moe: Some(MoeSpec {
+            experts: usize_field(text, "n_routed_experts")?,
+            top_k: usize_field(text, "num_experts_per_tok")?,
+            intermediate: usize_field(text, "moe_intermediate_size")?,
+            shared_experts: opt_usize_field(text, "n_shared_experts").unwrap_or(0),
+            shared_intermediate: usize_field(text, "moe_intermediate_size")?,
+            scoring: text.get("scoring_func").and_then(Value::as_str).unwrap_or("softmax").into(),
+            routed_scaling: text.get("routed_scaling_factor").and_then(Value::as_f64),
+            groups: None,
+        }),
+        speculator,
+        tables,
+        vision: checkpoint.config.get("vision_config").is_some(),
+        notes,
+    })
+}
+
+struct DeepSeekModel {
+    id: &'static str,
+    spec: ModelSpec,
+}
+
+/// The routed projection shape `[N, K]` a stem names: w1/w3 (gate/up) are
+/// `[I, H]`, w2 (down) `[H, I]`.
+pub(crate) fn routed_shape(stem: &str, hidden: usize, intermediate: usize) -> Option<[usize; 2]> {
+    match super::leaf(stem) {
+        "w1" | "w3" | "gate_proj" | "up_proj" => Some([intermediate, hidden]),
+        "w2" | "down_proj" => Some([hidden, intermediate]),
+        _ => None,
+    }
+}
+
+impl DeepSeekModel {
+    fn geometry(&self) -> Option<&'static str> {
+        let moe = self.spec.moe.as_ref()?;
+        cuteafd_core::ExpertGeometry {
+            hidden: self.spec.hidden as u32,
+            experts: moe.experts as u32,
+            topk: moe.top_k as u32,
+            intermediate: moe.intermediate as u32,
+            layers: self.spec.layers.len() as u32,
+        }
+        .family()
+    }
+
+    fn routed(&self, stem: &str, operand: &QuantOperand) -> Result<(), String> {
+        let moe = self.spec.moe.as_ref().ok_or("no MoE geometry")?;
+        let geometry = self.geometry().ok_or_else(|| format!("no expert kernels at hidden {} / intermediate {} / {} \
+            experts / top-{} (cuteafd_core::ExpertGeometry)", self.spec.hidden, moe.intermediate, moe.experts, moe.top_k))?;
+        let shape = routed_shape(stem, self.spec.hidden, moe.intermediate)
+            .ok_or_else(|| format!("not a routed projection (w1/w2/w3 or gate/up/down_proj)"))?;
+        require(operand.logical == shape, || format!("{geometry} experts are {shape:?}, found {}", describe(operand)))?;
+        let nvfp4 = self.id == "deepseek_v41" && operand.is_nvfp4();
+        require(operand.is_mxfp4(32) || matches!(operand.exl3_bits(), Some(2..=4)) || nvfp4, || {
+            format!("{geometry} experts run MXFP4 (E2M1 + UE8M0 per 32), EXL3 K2-K4{}; found {}",
+                if self.id == "deepseek_v41" { " or ModelOpt NVFP4" } else { "" }, describe(operand))
+        })
+    }
+
+    /// Block-FP8 coordinator weights: E4M3 with UE8M0 scales, 32x32 (V4.1)
+    /// or 128x128 with 128-multiple extents (V4's scale prep).
+    fn coordinator(&self, operand: &QuantOperand) -> Result<(), String> {
+        if operand.is_plain(&[Encoding::Bf16, Encoding::F32]) || matches!(operand.encoding, Encoding::Int { .. }) {
+            return Ok(());
+        }
+        let block = if self.id == "deepseek_v4" { 128 } else { 32 };
+        let extents = operand.matrix().is_some_and(|(n, k)| n % block == 0 && k % block == 0);
+        require(operand.is_fp8_block(block, &[ScaleEncoding::Ue8m0]) && extents, || {
+            format!("coordinator weights are BF16, FP32, integer or E4M3 with UE8M0 {block}x{block} block scales over \
+                {block}-multiple extents; found {}", describe(operand))
+        })
+    }
+}
+
+impl FamilyModel for DeepSeekModel {
+    fn spec(&self) -> &ModelSpec {
+        &self.spec
+    }
+
+    fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
+        match (self.id, role.component) {
+            (_, Component::RoutedExpert) => self.routed(stem, operand),
+            ("deepseek_v4", Component::Speculator | Component::SpeculatorExpert) => {
+                Err("serve-dsv4 does not run the dSpark drafter".into())
+            }
+            ("deepseek_v4", Component::Vision) => Err("serve-dsv4 takes no images".into()),
+            (_, Component::SpeculatorExpert) => self.routed(stem, operand),
+            (_, Component::MappedTable) => require(
+                operand.is_fp8_row_groups(32, &[ScaleEncoding::Ue8m0]) || operand.is_nvfp4(),
+                || format!("engram rows are E4M3 with UE8M0 1x32 scales or NVFP4; found {}", describe(operand)),
+            ),
+            _ => self.coordinator(operand),
+        }
+    }
+
+    fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
+        let geometry = self.geometry()?;
+        let format = match operand.exl3_bits() {
+            Some(bits) => format!("exl3-k{bits}"),
+            None if operand.is_mxfp4(32) => "mxfp4".into(),
+            None if operand.is_nvfp4() => "nvfp4".into(),
+            None => return None,
+        };
+        let serve = if self.id == "deepseek_v4" { "serve-dsv4" } else { "serve-native" };
+        Some(ExpertContract {
+            package: format!("{geometry}:{format} (expertd-native)"),
+            block: 128,
+            spark_worlds: TRANSPORT_WORLDS.to_vec(),
+            local: Err(format!("{serve} runs routed experts on 2, 3, 4 or 6 Spark ranks (its local expert layers \
+                supplement them)")),
+        })
+    }
 }
