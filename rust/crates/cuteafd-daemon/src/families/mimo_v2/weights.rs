@@ -29,6 +29,7 @@ use cuteafd_loader::plan::checkpoint::{Checkpoint, CheckpointTensor};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::unix::fs::FileExt;
+use crate::shared::peer_split::{slice_2d, Axis, RankDevice};
 
 pub(crate) struct MimoLayer<'a> {
     pub attention: MimoAttention,
@@ -99,39 +100,6 @@ pub(crate) struct MimoLoader<'a> {
     pub device: i32,
     /// The other GPUs of a head split, ranks 1.. (empty: one GPU).
     pub peers: Vec<RankDevice>,
-}
-
-/// One GPU of a head split: its device and the stream its load kernels run on.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct RankDevice {
-    pub device: i32,
-    pub stream: *mut c_void,
-}
-
-/// How a head split slices a 2-D weight: by output rows or by input columns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Axis {
-    Rows,
-    Cols,
-}
-
-/// `part` of `ranks` equal slices of a row-major `[rows, cols]` tensor of
-/// `elem`-byte elements along `axis`, as contiguous bytes.
-fn slice_2d(bytes: &[u8], rows: usize, cols: usize, elem: usize, axis: Axis, part: usize, ranks: usize) -> Vec<u8> {
-    match axis {
-        Axis::Rows => {
-            let n = rows / ranks;
-            bytes[part * n * cols * elem..(part + 1) * n * cols * elem].to_vec()
-        }
-        Axis::Cols => {
-            let n = cols / ranks;
-            let mut out = Vec::with_capacity(rows * n * elem);
-            for row in bytes.chunks_exact(cols * elem) {
-                out.extend_from_slice(&row[part * n * elem..(part + 1) * n * elem]);
-            }
-            out
-        }
-    }
 }
 
 /// Scale-grid row of every weight row: uniform 128-row blocks, or per

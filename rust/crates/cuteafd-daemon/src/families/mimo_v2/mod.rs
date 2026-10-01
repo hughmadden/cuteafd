@@ -219,7 +219,16 @@ impl Opened {
         let draft_file = draft_dir.as_deref().map(dflash::prefetch);
         let stream = self.library.cuda_stream_create()?;
         // The head split's second GPU and its stream (load kernels, then the engine's).
-        let peer_stream = match args.split_device {
+        // The head split exists for V2.6 Pro's geometry (`mimop2`); V2 Flash serves from --device.
+        let split_device = match args.split_device {
+            Some(device) if self.cfg.head_split(2).and_then(|share| share.program_family()).is_ok() => Some(device),
+            Some(device) => {
+                tracing::info!(device, "this MiMo geometry has no head split; serving from --device alone");
+                None
+            }
+            None => None,
+        };
+        let peer_stream = match split_device {
             Some(device) => {
                 ensure!(device != args.device, "--split-device must differ from --device");
                 // Peer access both ways first: the loader slices weights over peer copies.
@@ -236,7 +245,7 @@ impl Opened {
         let loader = weights::MimoLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
             checkpoint_tp: cuteafd_loader::families::mimo_v2::checkpoint_tp(&args.snapshot)?, fp8_decode: args.fp8_decode,
             fp8_head: args.fp8_head, fp8_o_proj: args.fp8_o_proj, fp8_scales: args.fp8_scales, device: args.device,
-            peers: peer_stream.iter().map(|&(device, stream)| weights::RankDevice { device, stream }).collect() };
+            peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream }).collect() };
         let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
             args.token_io.embed_placement, || loader.model(&self.cfg, layers))?;
         let mtp = if args.mtp > 0 {

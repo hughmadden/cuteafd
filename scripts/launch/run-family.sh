@@ -184,21 +184,47 @@ addr="$(get ADDR 0.0.0.0:8000)"
 ranks="$(get SPARK_COUNT 4)"
 budget="$(get SPARK_DEVICE_BUDGET_BYTES 107374182400)"
 gpu="$(get COORDINATOR_GPU 0)"
-# COORDINATOR_SPLIT=heads (MiMo V2.6 Pro): every layer's attention heads and dense MLP
-# split over COORDINATOR_GPU and COORDINATOR_SPLIT_GPU (default the other of 0/1), one
-# hidden all-reduce per layer over peer memory; experts, router, head and drafter stay
-# on the lower-numbered GPU of the two (the container sees both, in host order).
+# Two coordinator GPUs (RTX_GPUS=auto/2 with COORDINATOR_GPU as V4.1's two-RTX config picks
+# the other card, or an explicit COORDINATOR_GPUS=0,1): families with a
+# head split (MiMo V2.6 Pro, GLM 5.x) split every layer's attention heads and dense /
+# shared-expert MLPs over both by default (COORDINATOR_SPLIT=auto or heads), one hidden
+# all-reduce per layer over peer memory; experts, router, head and drafter stay on the
+# first GPU. COORDINATOR_SPLIT=off serves from the first GPU alone. Families without a
+# split use the first GPU (the serve command logs it for MiMo V2 Flash). The container
+# sees both GPUs in host order. COORDINATOR_SPLIT_GPU names the second GPU when only
+# COORDINATOR_GPU is set (default the other of 0/1).
+coordinator_gpus="$(get COORDINATOR_GPUS)"
+if [[ -z "$coordinator_gpus" ]]; then
+  coordinator_gpus="$gpu"
+  case "$(get RTX_GPUS auto)" in
+    1) ;;
+    2|auto)
+      other="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | tr -d ' ' | grep -vx "$gpu" | head -n 1)"
+      [[ -z "$other" ]] || coordinator_gpus="$gpu,$other" ;;
+    *) echo "RTX_GPUS must be auto, 1 or 2" >&2; exit 2 ;;
+  esac
+fi
+IFS=, read -r -a coordinator_gpus <<<"$coordinator_gpus"
+gpu="${coordinator_gpus[0]}"
+split="$(get COORDINATOR_SPLIT auto)"
+case "$split" in auto|heads|off) ;; *) echo "COORDINATOR_SPLIT must be auto, heads or off" >&2; exit 2 ;; esac
+second=""
+if [[ ${#coordinator_gpus[@]} -ge 2 ]]; then
+  second="${coordinator_gpus[1]}"
+elif [[ "$split" == heads ]]; then
+  second="$(get COORDINATOR_SPLIT_GPU $((1 - gpu)))"
+fi
 gpus="device=$gpu"
-case "$(get COORDINATOR_SPLIT off)" in
-  off) ;;
-  heads)
-    [[ $family == mimo_v2 ]] || { echo "COORDINATOR_SPLIT=heads applies to MiMo V2.6 Pro" >&2; exit 2; }
-    second="$(get COORDINATOR_SPLIT_GPU $((1 - gpu)))"
-    [[ "$second" != "$gpu" ]] || { echo "COORDINATOR_SPLIT_GPU must differ from COORDINATOR_GPU" >&2; exit 2; }
-    gpus="\"device=$gpu,$second\""
-    family_args+=(--device 0 --split-device 1) ;;
-  *) echo "COORDINATOR_SPLIT must be off or heads" >&2; exit 2 ;;
-esac
+if [[ -n "$second" && "$split" != off ]]; then
+  [[ "$second" != "$gpu" ]] || { echo "the second coordinator GPU must differ from the first" >&2; exit 2; }
+  case "$family" in
+    mimo_v2|glm5)
+      lower=$((gpu < second ? gpu : second)) upper=$((gpu < second ? second : gpu))
+      gpus="\"device=$lower,$upper\""
+      family_args+=(--device $((gpu == lower ? 0 : 1)) --split-device $((gpu == lower ? 1 : 0))) ;;
+    *) echo "note: $family has no head split; serving from GPU $gpu alone" >&2 ;;
+  esac
+fi
 peers=()
 # --restart removes this launcher's containers (stop.sh's release parser rejects
 # the keys above, e.g. SPECULATOR).
