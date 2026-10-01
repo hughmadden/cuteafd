@@ -170,8 +170,12 @@ fi
 # Exact FP8 expert packages (FAMILY:fp8 entries) ship as fp8/fp8-FAMILY.
 IFS=';' read -ra wip_fp8_list <<<"$expert_families"
 for wip_family in "${wip_fp8_list[@]}"; do
-  [[ "$wip_family" == *:fp8 ]] || continue
-  wip_package="fp8-${wip_family%%:*}"
+  case "$wip_family" in
+    *:fp8) wip_package="fp8-${wip_family%%:*}" ;;
+    # ModelOpt NVFP4 (W4A16 / W4A4 large-row steps) share the fp8_moe programs.
+    *:nvfp4|*:nvfp4a4) wip_package="fp8-${wip_family%%:*}-${wip_family#*:}" ;;
+    *) continue ;;
+  esac
   mkdir -p "$output_dir/fp8"
   rm -rf "$output_dir/fp8/$wip_package"
   cp -a "$build_dir/native/fp8/$wip_package" "$output_dir/fp8/$wip_package"

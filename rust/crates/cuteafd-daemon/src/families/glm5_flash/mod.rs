@@ -321,6 +321,11 @@ impl Opened {
             engine.drafter = Some(drafter);
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash2 drafter resident");
         }
+        if engine.weights.layers.iter().any(|layer| layer.has("nvfp4_w1")) {
+            let directory = crate::shared::experts::fp8::dense_package_directory(&args.native_lib, "glmfdense");
+            engine.set_dense_nvfp4(engine::DenseNvfp4::load(&self.library, &directory, &self.cfg, args.prefill_rows)?);
+            tracing::info!(package = %directory.display(), "NVFP4 dense MLPs on their own package");
+        }
         if (0..layers).any(|l| !self.cfg.dense[l]) {
             if let Some(experts) = self.experts(args)? {
                 engine.set_experts(experts);

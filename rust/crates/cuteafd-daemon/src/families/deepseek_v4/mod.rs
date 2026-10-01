@@ -31,6 +31,13 @@ pub(crate) struct EngineArgs {
     pub manifest: PathBuf,
     #[arg(long, default_value_t = 0)]
     pub device: i32,
+    /// Split every backbone layer's attention heads (w_q rows, sinks, wo
+    /// groups) and shared expert over --device and this second GPU; mHC, the
+    /// latent projection, compressors, indexer and caches are replicated, the
+    /// partial sums meet over peer memory. Router, routed experts, head and
+    /// drafter stay on --device.
+    #[arg(long)]
+    pub split_device: Option<i32>,
     #[arg(long, default_value_t = 188)]
     pub sms: u32,
     /// Sequences that can be resident at once (compressor state slots).
@@ -191,11 +198,38 @@ pub(crate) fn with_engine<T>(
     tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 programs loaded");
     let caps = &loaded.manifest["capacities"];
     let stream = loaded.library.cuda_stream_create()?;
+    // The head split's second GPU and its stream (load kernels, then the engine's).
+    // A head split needs its share's programs (`dsv4f2` / `dsv4p2`) in this build.
+    let share_program = format!("{}2_wo_m{}", loaded.family, caps["decode_rows"].as_u64().unwrap_or(64));
+    let split_device = match args.split_device {
+        Some(device) if programs.spec(&share_program).is_ok() => Some(device),
+        Some(device) => {
+            tracing::info!(device, "no head-split programs ({share_program}) in this build; serving from --device alone");
+            None
+        }
+        None => None,
+    };
+    let peer_stream = match split_device {
+        Some(device) => {
+            ensure!(device != args.device, "--split-device must differ from --device");
+            loaded.library.cuda_enable_peer(device)?;
+            loaded.library.cuda_set_device(device)?;
+            let stream = loaded.library.cuda_enable_peer(args.device)
+                .and_then(|()| programs.load_all())
+                .and_then(|()| loaded.library.cuda_stream_create());
+            loaded.library.cuda_set_device(args.device)?;
+            Some((device, stream?))
+        }
+        None => None,
+    };
     let started = Instant::now();
     let loader = weights::WeightLoader {
         library: &loaded.library, catalog: &loaded.catalog, programs: &programs, family: loaded.family, stream,
+        device: args.device,
+        peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
+            .collect(),
     };
-    let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&loaded.library,
+    let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&loaded.library,
         embed_source(&loaded.catalog, loaded.cfg.dim)?, args.token_io.embed_placement, || loader.model(&loaded.cfg))?;
     tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 coordinator weights resident");
     let max_context = caps["max_context"].as_u64().context("manifest max_context")? as usize;
@@ -213,7 +247,7 @@ pub(crate) fn with_engine<T>(
         ensure!(matches!(peers.len(), 2 | 3 | 4 | 6), "DeepSeek V4 serves 2, 3, 4 or 6 Spark ranks, got {}", peers.len());
         loaded.library.v41_compact_reducer()?.require_rank_count(peers.len() as u32)?;
     }
-    let engine = engine::Engine::new(engine::EngineParts {
+    let mut engine = engine::Engine::new(engine::EngineParts {
         library: &loaded.library,
         programs: &programs,
         cfg: loaded.cfg.clone(),
@@ -229,6 +263,9 @@ pub(crate) fn with_engine<T>(
         embedding,
         skip_routed: skip,
     })?;
+    if let Some((device, stream)) = peer_stream {
+        engine.attach_peer(device, stream, shares.pop().context("head-split shares")?, engine::PeerParts { shape })?;
+    }
     let held = held(&engine)?;
     let (free, _) = loaded.library.cuda_memory_info()?;
     let budget = free.saturating_sub(args.reserve_gib << 30).saturating_sub(held);
@@ -257,9 +294,22 @@ pub(crate) fn with_engine<T>(
     }
     tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
     let result = body(&engine, &mut transports, &runtime);
+    if let Err(error) = &result {
+        // Teardown may fail after a device fault and would otherwise hide this.
+        tracing::error!("{error:#}");
+    }
     drop(engine);
     drop(transports);
-    unsafe { loaded.library.cuda_stream_destroy(stream)? };
+    // SAFETY: the engine that used the streams is gone.
+    unsafe {
+        loaded.library.cuda_stream_destroy(stream)?;
+        if let Some((device, stream)) = peer_stream {
+            loaded.library.cuda_set_device(device)?;
+            let destroyed = loaded.library.cuda_stream_destroy(stream);
+            loaded.library.cuda_set_device(args.device)?;
+            destroyed?;
+        }
+    }
     result
 }
 

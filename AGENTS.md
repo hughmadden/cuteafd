@@ -47,6 +47,9 @@ go in commit messages as short before → after tables with conditions.
 - Submodules are pinned with tree locks (`third_party/*.lock.json`).
   Kernel changes go to `../sparkinfer-glmrt` master, quantizer changes to
   `../GPTQModel` main; push there first, then bump pin and lock here.
+  A SparkInfer bump also needs `scripts/build/build-dev-images.sh` (shared
+  dev images on raptor and every Spark, then `./wip.sh --recreate`);
+  `wip.sh` and `run.sh --wip` refuse a stale dev image and say so.
 - Kernels: CuTe-DSL/Triton AOT exports from the b12x fork are the default;
   hand CUDA only where measured to pay. SM120 and SM121 are both targets.
 - Run CUDA/PyTorch checks inside the matching architecture's container.

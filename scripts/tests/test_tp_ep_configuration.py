@@ -1421,6 +1421,7 @@ snapshot_rel=hub/models--x--M/snapshots/rev
 host=dodo
 model_is_exl3={exl3}
 exl3_family_tag={family}
+wip_slot={wip_slot}
 HOME={home}
 unset HF_HOME
 """
@@ -1437,7 +1438,8 @@ unset HF_HOME
         return cls.STATEMENT
 
     def preflight(self, *, exl3: str = "false", family: str = '""',
-                  missing: int = 0) -> subprocess.CompletedProcess[str]:
+                  missing: int = 0, sparkinfer: str = "sparkinfer-revision",
+                  wip_slot: str = '""') -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
             # HF_HOME is unset below, so the remote resolves the snapshot under
@@ -1448,14 +1450,15 @@ unset HF_HOME
             docker = stub / "docker"
             docker.write_text(self.DOCKER_STUB)
             docker.chmod(0o755)
-            script = (self.HARNESS.format(exl3=exl3, family=family, home=str(home))
+            script = (self.HARNESS.format(exl3=exl3, family=family, wip_slot=wip_slot,
+                                          home=str(home))
                       + self.statement()
                       + '\nprintf "manifest=[%s]\n" "$spark_manifest"\n')
             return subprocess.run(
                 ["bash", "-c", script], cwd=ROOT, text=True, capture_output=True, timeout=20,
                 env=dict(os.environ, PATH=f"{stub}{os.pathsep}{os.environ['PATH']}",
                          CUTEAFD_STUB_ENGINE="engine-revision",
-                         CUTEAFD_STUB_SPARKINFER="sparkinfer-revision",
+                         CUTEAFD_STUB_SPARKINFER=sparkinfer,
                          CUTEAFD_STUB_MISSING=str(missing)),
             )
 
@@ -1472,6 +1475,19 @@ unset HF_HOME
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("spark preflight on dodo: inference image is missing", result.stderr)
         self.assertIn("Spark host preflight failed on dodo", result.stderr)
+
+    def test_sparkinfer_mismatch_names_both_revisions_and_the_rebuild(self) -> None:
+        # A pin bump leaves every image behind the lock; the refusal must say
+        # which revision each side has and which rebuild fixes that launch kind.
+        release = self.preflight(sparkinfer="old-revision")
+        self.assertNotEqual(release.returncode, 0)
+        self.assertIn("carries SparkInfer old-revision but this checkout pins sparkinfer-revision",
+                      release.stderr)
+        self.assertIn("./build.sh", release.stderr)
+        wip = self.preflight(sparkinfer="old-revision", wip_slot='"slot"')
+        self.assertNotEqual(wip.returncode, 0)
+        self.assertIn("scripts/build/build-dev-images.sh", wip.stderr)
+        self.assertIn("spark preflight on dodo", wip.stderr)
 
     def test_exl3_family_tag_reaches_the_manifest_path(self) -> None:
         result = self.preflight(exl3="true", family='"k23"')

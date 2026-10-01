@@ -873,11 +873,26 @@ fn nvfp4_catalog(snapshot: &Path, config: &serde_json::Value, shape: RoutedExper
     if !modelopt.experts_nvfp4() {
         return Ok(None);
     }
-    let catalog = fp8_catalog(snapshot, shape)?;
+    let mut catalog = fp8_catalog(snapshot, shape)?;
     let tensors = catalog.fp8().context("NVFP4 catalog")?;
     ensure!(tensors.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4,
         "{} declares NVFP4 routed experts, but layer {} stores {:?}", modelopt.source, shape.first_layer,
         tensors.format());
+    // The coordinator's tensors (serve-glm reads its weights through the catalog):
+    // everything but the backbone's routed experts, which Fp8ExpertTensors serves.
+    #[derive(Deserialize)]
+    struct Index {
+        weight_map: BTreeMap<String, String>,
+    }
+    let index: Index = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"),
+        64 * 1024 * 1024).and_then(|value| Ok(serde_json::from_value(value)?))?;
+    let mut coordinator: Vec<V41Tensor> = read_index_headers(snapshot, &index.weight_map)?.into_iter()
+        .filter(|(_, tensor)| !(tensor.name.contains(".mlp.experts.")
+            && hf_layer(&tensor.name).is_some_and(|layer| layer < shape.layers)))
+        .map(|(shard, metadata)| V41Tensor { shard, metadata, placement: V41TensorPlacement::CoordinatorRtx })
+        .collect();
+    coordinator.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+    catalog.tensors = coordinator;
     Ok(Some(catalog))
 }
 

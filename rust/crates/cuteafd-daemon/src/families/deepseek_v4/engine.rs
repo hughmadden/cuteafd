@@ -21,6 +21,7 @@ use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype,
     ExpertV2SourceKind,
 };
+use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
 use std::ffi::c_void;
 use std::time::Instant;
 
@@ -57,6 +58,37 @@ pub(crate) struct Engine<'a> {
     pub embedding: TokenEmbedding<'a>,
     /// Benchmarks and token gates only: MoE layers run the shared expert alone.
     pub skip_routed: bool,
+    /// This engine's GPU (rank 0 of a head split).
+    pub device: i32,
+    /// Program family of one GPU's share under a head split (`dsv4f2`, `dsv4p2`).
+    split_family: Option<&'static str>,
+    /// The head split's second GPU and the exchange between the two.
+    peer: Option<V4Peer<'a>>,
+    exchange: Option<PeerExchange<'a>>,
+}
+
+/// The second GPU of a two-GPU head split (rank 1): its share of every
+/// backbone layer (half the heads' `w_q` rows and sinks, half the output
+/// groups, half the shared expert), its copy of the caches and compressor
+/// state (the replicated mHC, latent projection, compressors and indexer
+/// keep them identical), RoPE tables, workspaces and decode graphs.
+pub(crate) struct V4Peer<'a> {
+    pub device: i32,
+    pub stream: *mut c_void,
+    pub layers: Vec<LayerWeights<'a>>,
+    pools: Vec<LayerCache<'a>>,
+    rope_window: Dev<'a>,
+    rope_compressed: Dev<'a>,
+    prefill_workspace: RefCell<Option<Workspace<'a>>>,
+    decode_workspace: RefCell<Option<Workspace<'a>>>,
+    graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
+}
+
+/// Exchange slot of layer `layer`, lane `lane`: its attention partials (`ffn`
+/// false) or its FFN exchange (rank 1's shared-expert half, rank 0's routed +
+/// shared sum), by layer parity.
+fn slot(layer: usize, ffn: bool, lane: usize) -> usize {
+    4 * lane + 2 * (layer % 2) + usize::from(ffn)
 }
 
 /// `exchange` result for a layer whose experts ran on this GPU.
@@ -128,6 +160,12 @@ impl Profile {
         let names = ["router_sync", "routing", "experts", "head"];
         names.iter().zip(self.seconds).map(|(n, s)| format!("{n} {:.1} ms", s * 1e3)).collect::<Vec<_>>().join(", ")
     }
+}
+
+/// What [`Engine::attach_peer`] sizes the second GPU's caches with.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PeerParts {
+    pub shape: PoolShape,
 }
 
 /// Everything an [`Engine`] needs besides its pools and workspaces.
@@ -211,8 +249,10 @@ struct Workspace<'a> {
     draft_ids: Dev<'a>,
     /// Pinned staging: routes + wire rows down, rank partials up.
     router_host: HostAllocation<'a>,
-    // Drops before its workspace below.
-    head: cuteafd_ffi::programs::VocabularyHead<'a>,
+    /// A head split's sums of the two GPUs' partials ([rows, dim] BF16).
+    sum: Dev<'a>,
+    // Drops before its workspace below (rank 0 only).
+    head: Option<cuteafd_ffi::programs::VocabularyHead<'a>>,
     _head_workspace: Dev<'a>,
 }
 
@@ -249,13 +289,79 @@ impl<'a> Engine<'a> {
     }
 
     fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
+        self.run_on(0, false, name, pointers, scalars)
+    }
+
+    /// Launches `name` on rank `rank`'s stream; `split` picks the head-split
+    /// share's program (`{split_family}_{name}`).
+    fn run_on(&self, rank: usize, split: bool, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar])
+        -> Result<()> {
+        let family = if split { self.split_family.context("no head-split programs")? } else { self.family };
         let names: Vec<&str> = pointers.iter().map(|(n, _)| *n).collect();
-        let program = self.program(name, &names)?;
+        let program = self.programs.program(&format!("{family}_{name}"), &names)?;
         let raw: Vec<*mut c_void> = pointers.iter().map(|(_, p)| *p).collect();
-        // SAFETY: every pointer names a live allocation sized for the rows in
-        // `scalars`; the stream orders all launches of this engine.
-        unsafe { program.launch(&raw, scalars, self.stream) }
+        // SAFETY: every pointer names a live allocation of rank `rank`'s GPU sized for
+        // the rows in `scalars`; that rank's stream orders all its launches.
+        self.on(rank, || unsafe { program.launch(&raw, scalars, self.stream_of(rank)) })
             .with_context(|| format!("{name} with scalars {scalars:?}"))
+    }
+
+    /// GPUs this engine runs on: 2 under a head split.
+    pub(crate) fn ranks(&self) -> usize {
+        1 + usize::from(self.peer.is_some())
+    }
+
+    /// The stream of rank `rank`.
+    pub(crate) fn stream_of(&self, rank: usize) -> *mut c_void {
+        match (rank, &self.peer) {
+            (1, Some(peer)) => peer.stream,
+            _ => self.stream,
+        }
+    }
+
+    /// Runs `body` with rank `rank`'s device current (this engine's device again after).
+    pub(crate) fn on<T>(&self, rank: usize, body: impl FnOnce() -> Result<T>) -> Result<T> {
+        match (rank, &self.peer) {
+            (1, Some(peer)) => crate::shared::peer_split::on_device(self.library, peer.device, self.device, body),
+            _ => body(),
+        }
+    }
+
+    fn peer(&self) -> Result<&V4Peer<'a>> {
+        self.peer.as_ref().context("no head-split peer")
+    }
+
+    fn exchange(&self) -> Result<&PeerExchange<'a>> {
+        self.exchange.as_ref().context("no head-split exchange")
+    }
+
+    /// Attaches the head split's second GPU: `device` with `stream`, holding
+    /// `layers` (every backbone layer's rank-1 share). Loads the programs there and
+    /// allocates its caches, RoPE tables and the exchange (four slots per prefill lane).
+    pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<LayerWeights<'a>>, parts: PeerParts)
+        -> Result<()> {
+        ensure!(self.split_family.is_some() && layers.len() == self.cfg.n_layers && layers.iter().all(|l| l.split),
+            "attach_peer needs the head-split shares of every backbone layer");
+        let rows = self.prefill_rows.max(self.decode_rows);
+        let exchange = PeerExchange::new(self.library, [RankDevice { device: self.device, stream: self.stream },
+            RankDevice { device, stream }], 4 * PREFILL_LANES, rows * self.cfg.dim * 2)?;
+        let peer = exchange.on(1, || -> Result<V4Peer<'a>> {
+            self.programs.load_all()?;
+            let table = |compressed: bool| -> Result<Dev<'a>> {
+                let values = metadata::rope_table(&self.cfg, compressed, self.max_context.max(metadata::WINDOW));
+                let allocation = DeviceAllocation::new(self.library, values.len() * 4)?;
+                self.library.copy_h2d(allocation.buffer, bytes_of(&values))?;
+                Ok(allocation)
+            };
+            let pools = (0..self.cfg.n_layers).map(|l| Self::pool_layer_for(self.library, &self.cfg, parts.shape, l))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(V4Peer { device, stream, layers, pools, rope_window: table(false)?, rope_compressed: table(true)?,
+                prefill_workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
+                graphs: RefCell::new(std::collections::HashMap::new()) })
+        })?;
+        self.peer = Some(peer);
+        self.exchange = Some(exchange);
+        Ok(())
     }
 
     /// Largest scratch of every program in the table (one shared region;
@@ -274,15 +380,20 @@ impl<'a> Engine<'a> {
     }
 
     fn pool_layer(parts: &EngineParts<'a>, layer: usize) -> Result<LayerCache<'a>> {
+        Self::pool_layer_for(parts.library, &parts.cfg, parts.shape, layer)
+    }
+
+    /// Layer `layer`'s zeroed caches and compressor state on the current device.
+    fn pool_layer_for(library: &'a NativeLibrary, cfg: &DeepseekV4Config, shape: PoolShape, layer: usize)
+        -> Result<LayerCache<'a>> {
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-            let allocation = DeviceAllocation::new(parts.library, bytes.max(256))?;
-            parts.library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
+            let allocation = DeviceAllocation::new(library, bytes.max(256))?;
+            library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
-        let shape = parts.shape;
         let sequences = shape.sequences;
         let main = zeroed(shape.window_pages() * MAIN_PAGE_BYTES)?;
-        let (compressed, index, states) = match parts.cfg.compress_ratios.get(layer).copied().unwrap_or(0) {
+        let (compressed, index, states) = match cfg.compress_ratios.get(layer).copied().unwrap_or(0) {
             4 => (
                 Some(zeroed(shape.units * metadata::compressed_page_bytes(4))?),
                 Some(zeroed(shape.units * INDEX_PAGE_BYTES)?),
@@ -316,7 +427,17 @@ impl<'a> Engine<'a> {
             parts.library.copy_h2d(allocation.buffer, bytes_of(&values))?;
             Ok(allocation)
         };
+        let split_family = match (parts.weights.layers.first().is_some_and(|l| l.split), parts.family) {
+            (false, _) => None,
+            (true, "dsv4f") => Some("dsv4f2"),
+            (true, "dsv4p") => Some("dsv4p2"),
+            (true, other) => anyhow::bail!("no head-split programs for {other}"),
+        };
         Ok(Self {
+            device: parts.library.cuda_get_device()?,
+            split_family,
+            peer: None,
+            exchange: None,
             rope_window: table(false)?,
             rope_compressed: table(true)?,
             pools,
@@ -343,10 +464,22 @@ impl<'a> Engine<'a> {
     }
 
     fn workspace(&self, t: usize, lanes: usize) -> Result<Workspace<'a>> {
+        self.workspace_on(0, t, lanes)
+    }
+
+    /// Rank `rank`'s workspace (rank 1 has no router, expert, drafter or head
+    /// buffers), allocated on that rank's GPU.
+    fn workspace_on(&self, rank: usize, t: usize, lanes: usize) -> Result<Workspace<'a>> {
+        self.on(rank, || self.workspace_here(rank, t, lanes))
+    }
+
+    fn workspace_here(&self, rank: usize, t: usize, lanes: usize) -> Result<Workspace<'a>> {
+        let lead = rank == 0;
+        let lead_only = |bytes: usize| if lead { bytes } else { 256 };
         let h = self.cfg.dim;
         let heads = self.cfg.n_heads;
         let (experts, topk) = (self.cfg.n_routed_experts, self.cfg.n_activated_experts);
-        let head_workspace = self.alloc(cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE)?;
+        let head_workspace = self.alloc(lead_only(cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE))?;
         let mut topk_scratch = 0usize;
         for route in [format!("decode_m{}", self.decode_rows), format!("prefill_m{}", self.prefill_rows)] {
             let spec = self.programs.spec(&format!("{}_index_topk_{route}", self.family))?;
@@ -375,23 +508,28 @@ impl<'a> Engine<'a> {
             index_weights: self.alloc(t * self.cfg.index_n_heads * 4)?,
             selected: self.alloc(t * self.cfg.index_topk * 4)?,
             topk_scratch: self.zeroed(topk_scratch)?,
-            logits: self.alloc(t * experts * 4)?,
-            route_ids: self.alloc(t * topk * 4)?,
-            route_weights: self.alloc(t * topk * 4)?,
-            wire: self.alloc(t * (h + h / 32))?,
+            logits: self.alloc(lead_only(t * experts * 4))?,
+            route_ids: self.alloc(lead_only(t * topk * 4))?,
+            route_weights: self.alloc(lead_only(t * topk * 4))?,
+            wire: self.alloc(lead_only(t * (h + h / 32)))?,
             scratch: self.alloc(self.scratch_bytes()?)?,
             dummy: self.zeroed(4096)?,
-            vocab_logits: self.alloc(t * self.cfg.vocab_size * 4)?,
+            vocab_logits: self.alloc(lead_only(t * self.cfg.vocab_size * 4))?,
             main_x: self.alloc(t.min(TAP_ROWS) * h * 2)?,
             main_work: self.alloc(t.min(TAP_ROWS) * h * 4)?,
             first_tokens: self.alloc(t * 4)?,
             drafts: self.alloc(t * 4)?,
             markov: self.alloc(self.library.dsv4_markov_workspace(t)?)?,
             draft_ids: self.alloc(t * 4)?,
-            router_host: HostAllocation::new(self.library, t * (topk * 8 + h + h / 32))?,
+            router_host: HostAllocation::new(self.library, lead_only(t * (topk * 8 + h + h / 32)))?,
+            sum: self.alloc(if self.split_family.is_some() { t * h * 2 } else { 256 })?,
             // SAFETY: the workspace buffer lives in the same struct and drops
             // after the head (field order).
-            head: unsafe { self.library.vocabulary_head(head_workspace.buffer.ptr, h as u32, t as u32)? },
+            head: if lead {
+                Some(unsafe { self.library.vocabulary_head(head_workspace.buffer.ptr, h as u32, t as u32)? })
+            } else {
+                None
+            },
             _head_workspace: head_workspace,
         })
     }
@@ -457,6 +595,14 @@ impl<'a> Engine<'a> {
     /// window caches), for the prefix cache's copies.
     pub fn caches(&self) -> &[LayerCache<'a>] {
         &self.pools
+    }
+
+    /// [`Self::caches`] of rank `rank` (1: the head split's copy, backbone layers only).
+    pub fn caches_on(&self, rank: usize) -> &[LayerCache<'a>] {
+        match (rank, &self.peer) {
+            (1, Some(peer)) => &peer.pools,
+            _ => &self.pools,
+        }
     }
 
     /// Longest chunk one [`Self::prefill`] call takes.
@@ -648,6 +794,50 @@ impl<'a> Engine<'a> {
         }
         let cap = if decode { self.decode_rows } else { self.prefill_rows };
         let rows_of = |lane: usize| Scalar::I32(lanes[lane].tables.rows as i32);
+        // The head split's second GPU: its workspace of the same shape, the same tables,
+        // and each lane's residual streams pushed over (the first decode segment pushes them).
+        let peer_workspace = match &self.peer {
+            Some(peer) => {
+                let cell = if decode { &peer.decode_workspace } else { &peer.prefill_workspace };
+                if cell.borrow().is_none() {
+                    let (rows, count) = if decode { (self.decode_rows, 1) } else { (self.prefill_rows, PREFILL_LANES) };
+                    *cell.borrow_mut() = Some(self.workspace_on(1, rows, count)?);
+                }
+                Some(cell.borrow())
+            }
+            None => None,
+        };
+        let w1 = match &peer_workspace {
+            Some(ws) => Some(ws.as_ref().context("peer workspace")?),
+            None => None,
+        };
+        if let Some(w1) = w1 {
+            // SAFETY: the engine owns the peer stream; every wait on it was matched by a
+            // push rank 0 queued, so it drains before its tables are rewritten.
+            unsafe { self.library.cuda_stream_synchronize(self.stream_of(1))? };
+            for (step, lane1) in lanes.iter().zip(&w1.lanes) {
+                self.on(1, || self.fill(&lane1.tables, step.tables))?;
+            }
+            if !decode {
+                for (index, (step, lane)) in lanes.iter().zip(&w.lanes).enumerate() {
+                    self.exchange()?.push_to(0, DIRECT, lane.stream_a.buffer.ptr, w1.lanes[index].stream_a.buffer.ptr,
+                        step.tables.rows * 4 * h * 2)?;
+                }
+                for (index, step) in lanes.iter().enumerate() {
+                    self.peer_front(0, step.tables, &w1.lanes[index], index, w1, rows_of(index), cap)?;
+                }
+            }
+        }
+        // Rank 1 after rank 0 queued unit (layer, lane)'s FFN: that unit's FFN close and the
+        // lane's next attention (rank 1 runs a unit ahead of the host's rank-0 work).
+        let peer_next = |(layer, lane): (usize, usize)| -> Result<()> {
+            let Some(w1) = w1 else { return Ok(()) };
+            self.peer_post(layer, &w1.lanes[lane], lane, w1, rows_of(lane))?;
+            if layer + 1 < self.weights.layers.len() {
+                self.peer_front(layer + 1, lanes[lane].tables, &w1.lanes[lane], lane, w1, rows_of(lane), cap)?;
+            }
+            Ok(())
+        };
         if decode {
             let (tables, lane) = (lanes[0].tables, &w.lanes[0]);
             let (t, rows) = (tables.rows, rows_of(0));
@@ -668,11 +858,19 @@ impl<'a> Engine<'a> {
                     if layer == 0 && gather {
                         self.gather_streams(lane, t)?;
                     }
+                    if let (0, Some(w1)) = (layer, w1) {
+                        self.exchange()?.push_to(0, DIRECT, lane.stream_a.buffer.ptr, w1.lanes[0].stream_a.buffer.ptr,
+                            t * 4 * h * 2)?;
+                    }
                     if previous > 0 {
-                        self.post(w, lane, previous, decode_planes, rows, layer - 1)?;
+                        self.post_layer(w, lane, 0, previous, decode_planes, rows, layer - 1)?;
                         self.tap(w, lane, layer - 1, t)?;
                     }
-                    self.attention(layer, weights, tables, lane, w, rows, cap)
+                    if w1.is_some() {
+                        self.attention_split(layer, weights, tables, lane, 0, w, rows, cap)
+                    } else {
+                        self.attention(layer, weights, tables, lane, w, rows, cap)
+                    }
                 };
                 let key = GraphKey {
                     layer,
@@ -683,7 +881,17 @@ impl<'a> Engine<'a> {
                     table_stride: tables.c4_table_stride,
                     previous,
                 };
-                self.replay(key, segment)?;
+                self.replay_on(0, key, segment)?;
+                if let Some(w1) = w1 {
+                    // Rank 1's segments: layer 0 after rank 0's, then each next one before the
+                    // host waits in this layer's exchange.
+                    if layer == 0 {
+                        self.peer_segment(0, tables, w1, t, cap)?;
+                    }
+                    if layer + 1 < self.weights.layers.len() {
+                        self.peer_segment(layer + 1, tables, w1, t, cap)?;
+                    }
+                }
                 ranks = self.decode_experts(layer, t, w, lane, cap, transports.first_mut(), runtime)?;
             }
             // The tail: the last post, its taps and the drafter's KV, then the head.
@@ -692,7 +900,7 @@ impl<'a> Engine<'a> {
                 table_stride: 0, previous: ranks };
             self.replay(key, || -> Result<()> {
                 if ranks > 0 {
-                    self.post(w, lane, ranks, decode_planes, rows, last)?;
+                    self.post_layer(w, lane, 0, ranks, decode_planes, rows, last)?;
                     self.tap(w, lane, last, t)?;
                 }
                 self.write_draft_kv(w, lane, t, cap)?;
@@ -709,7 +917,12 @@ impl<'a> Engine<'a> {
             let units: Vec<(usize, usize)> = (0..self.weights.layers.len())
                 .flat_map(|layer| (0..lanes.len()).map(move |lane| (layer, lane))).collect();
             let attention = |(layer, lane): (usize, usize)| {
-                self.attention(layer, &self.weights.layers[layer], lanes[lane].tables, &w.lanes[lane], w, rows_of(lane), cap)
+                let weights = &self.weights.layers[layer];
+                if w1.is_some() {
+                    self.attention_split(layer, weights, lanes[lane].tables, &w.lanes[lane], lane, w, rows_of(lane), cap)
+                } else {
+                    self.attention(layer, weights, lanes[lane].tables, &w.lanes[lane], w, rows_of(lane), cap)
+                }
             };
             let local_layers = self.local_layers();
             let pipelined = transports.len() >= lanes.len() && lanes.len() > 1;
@@ -717,7 +930,7 @@ impl<'a> Engine<'a> {
             let post = |(layer, lane): (usize, usize), ranks: usize| {
                 let slot = if pipelined { lane } else { 0 };
                 let plane = planes.get(slot).copied().unwrap_or([std::ptr::null(); 6]);
-                self.post(w, &w.lanes[lane], ranks, plane, rows_of(lane), layer)?;
+                self.post_layer(w, &w.lanes[lane], lane, ranks, plane, rows_of(lane), layer)?;
                 self.tap(w, &w.lanes[lane], layer, lanes[lane].tables.rows)
             };
             runtime.block_on(async {
@@ -728,9 +941,11 @@ impl<'a> Engine<'a> {
                     let t = lanes[lane].tables.rows;
                     if self.skip_routed {
                         self.shared_ffn(layer, w, &w.lanes[lane], rows_of(lane), cap, &self.weights.layers[layer])?;
+                        peer_next(unit)?;
                         post(unit, SKIPPED_EXPERTS)?;
                     } else if layer < local_layers {
                         self.local_experts(layer, t, w, &w.lanes[lane], cap)?;
+                        peer_next(unit)?;
                         post(unit, LOCAL_EXPERTS)?;
                     } else {
                         let slot = if pipelined { lane } else { 0 };
@@ -739,6 +954,7 @@ impl<'a> Engine<'a> {
                         let wave = transports[slot].dispatch(&request)?;
                         // The shared expert runs on the GPU while the Sparks compute.
                         self.shared_ffn(layer, w, &w.lanes[lane], rows_of(lane), cap, &self.weights.layers[layer])?;
+                        peer_next(unit)?;
                         if let Some((previous, wave)) = inflight.take() {
                             let slot = if pipelined { previous.1 } else { 0 };
                             let ranks = self.land(&mut transports[slot], wave, lanes[previous.1].tables.rows, w).await?;
@@ -824,20 +1040,47 @@ impl<'a> Engine<'a> {
     /// Launches `segment` through a captured graph for `key`, capturing it the
     /// first time.
     fn replay(&self, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
-        if let Some(graph) = self.graphs.borrow().get(&key) {
-            // SAFETY: the graph's pointers are persistent engine buffers.
-            return unsafe { self.library.cuda_graph_launch(graph.0, self.stream) };
+        self.replay_on(0, key, segment)
+    }
+
+    /// [`Self::replay`] on rank `rank`'s stream (its own graphs).
+    fn replay_on(&self, rank: usize, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+        let graphs = match (rank, &self.peer) {
+            (1, Some(peer)) => &peer.graphs,
+            _ => &self.graphs,
+        };
+        let stream = self.stream_of(rank);
+        if let Some(graph) = graphs.borrow().get(&key) {
+            // SAFETY: the graph's pointers are persistent engine buffers of that rank.
+            return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
         }
-        // SAFETY: capture records launches on the engine stream; nothing in the
+        // SAFETY: capture records launches on that rank's stream; nothing in the
         // segment synchronizes the host.
-        unsafe { self.library.cuda_graph_begin_capture(self.stream)? };
+        self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
         let captured = segment();
-        let exec = unsafe { self.library.cuda_graph_end_capture(self.stream) };
+        let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
         captured?;
         let exec = exec?;
-        unsafe { self.library.cuda_graph_launch(exec, self.stream)? };
-        self.graphs.borrow_mut().insert(key, GraphExec(exec, self.library));
+        self.on(rank, || unsafe { self.library.cuda_graph_launch(exec, stream) })?;
+        graphs.borrow_mut().insert(key, GraphExec(exec, self.library));
         Ok(())
+    }
+
+    /// Rank 1's decode segment of `layer`: the previous layer's FFN close, then this
+    /// layer's share (see [`Self::peer_front`]), replayed as its own graph.
+    fn peer_segment(&self, layer: usize, tables: &StepTables, w1: &Workspace<'_>, t: usize, cap: usize) -> Result<()> {
+        let rows = Scalar::I32(t as i32);
+        let lane = &w1.lanes[0];
+        let segment = || -> Result<()> {
+            if layer > 0 {
+                self.peer_post(layer - 1, lane, 0, w1, rows)?;
+            }
+            self.peer_front(layer, tables, lane, 0, w1, rows, cap)
+        };
+        let key = GraphKey { layer, rows: t, chunked: tables.chunked,
+            attention: self.attention_kind(self.peer()?.layers[layer].ratio, tables),
+            table_width: tables.c4_table_width, table_stride: tables.c4_table_stride, previous: usize::from(layer > 0) };
+        self.replay_on(1, key, segment)
     }
 
     /// The layer's routed partials + shared expert, reduced, then mHC post
@@ -874,6 +1117,92 @@ impl<'a> Engine<'a> {
         ], &[rows])
     }
 
+    /// A backbone layer's [`Self::post`] for lane `index`: [`Self::post_split`] under a head split.
+    #[allow(clippy::too_many_arguments)]
+    fn post_layer(&self, w: &Workspace<'_>, lane: &Lane<'_>, index: usize, ranks: usize, planes: [*const u16; 6],
+        rows: Scalar, layer: usize) -> Result<()> {
+        if self.peer.is_some() {
+            self.post_split(w, lane, index, ranks, planes, rows, layer)
+        } else {
+            self.post(w, lane, ranks, planes, rows, layer)
+        }
+    }
+
+    /// [`Self::post`] on rank 0 under a head split (lane `index`): the routed sum
+    /// with this GPU's shared-expert half (or the local layer's output, or the
+    /// half alone when routed experts are skipped), sent to rank 1 first (not after
+    /// the last layer), plus rank 1's half, then mHC post.
+    #[allow(clippy::too_many_arguments)]
+    fn post_split(&self, w: &Workspace<'_>, lane: &Lane<'_>, index: usize, ranks: usize, planes: [*const u16; 6],
+        rows: Scalar, layer: usize) -> Result<()> {
+        let Scalar::I32(count) = rows else { unreachable!() };
+        let base = match ranks {
+            SKIPPED_EXPERTS => lane.shared.buffer.ptr,
+            LOCAL_EXPERTS => self.local.borrow().as_ref().context("local experts")?.output.buffer.ptr,
+            _ => {
+                let reducer = self.library.v41_compact_reducer()?;
+                // SAFETY: as in `post`.
+                unsafe {
+                    reducer.reduce_planes(planes, ranks as u32, lane.shared.buffer.ptr.cast(),
+                        w.delta.buffer.ptr.cast(), count as u32, self.stream)
+                        .with_context(|| format!("layer {layer} expert reduction"))?;
+                }
+                w.delta.buffer.ptr
+            }
+        };
+        let (exchange, ffn) = (self.exchange()?, slot(layer, true, index));
+        if layer + 1 < self.cfg.n_layers {
+            exchange.push(0, ffn, base, count as usize * self.cfg.dim * 2)?;
+        }
+        exchange.wait(0, ffn)?;
+        self.add(0, base, exchange.recv(0, ffn)?, w.sum.buffer.ptr, count as usize)?;
+        self.run("mhc_post", &[
+            ("x", w.sum.buffer.ptr), ("residual", lane.stream_b.buffer.ptr), ("prev_post", lane.post.buffer.ptr),
+            ("prev_comb", lane.comb.buffer.ptr), ("out", lane.stream_a.buffer.ptr),
+        ], &[rows])
+    }
+
+    /// Rank 1's share of `layer` for its lane `index` (`lane`, `w` its own):
+    /// (layer 0: rank 0's residual streams in), its heads' attention and the
+    /// attention all-reduce, mHC post_pre, then its shared-expert half out to rank 0.
+    #[allow(clippy::too_many_arguments)]
+    fn peer_front(&self, layer: usize, tables: &StepTables, lane: &Lane<'_>, index: usize, w: &Workspace<'_>,
+        rows: Scalar, cap: usize) -> Result<()> {
+        let peer = self.peer()?;
+        let weights = &peer.layers[layer];
+        let exchange = self.exchange()?;
+        if layer == 0 {
+            exchange.wait(1, DIRECT)?;
+        }
+        self.attention_front(1, layer, weights, tables, lane, w, rows, cap)?;
+        self.attention_sum(1, layer, index, w, rows)?;
+        self.attention_back(1, weights, lane, w, rows, cap, w.sum.buffer.ptr)?;
+        self.run_on(1, true, &format!("shared_ffn_m{cap}"), &[
+            ("x", w.y.buffer.ptr), ("w13", weights.ptr("w13")?), ("w13_scale", weights.ptr("w13_scale")?),
+            ("w2", weights.ptr("w2")?), ("w2_scale", weights.ptr("w2_scale")?), ("out", lane.shared.buffer.ptr),
+            ("scratch", w.scratch.buffer.ptr),
+        ], &[rows]).with_context(|| format!("layer {layer} shared expert (rank 1)"))?;
+        let Scalar::I32(t) = rows else { unreachable!() };
+        exchange.push(1, slot(layer, true, index), lane.shared.buffer.ptr, t as usize * self.cfg.dim * 2)
+    }
+
+    /// Rank 1's FFN close of `layer` (not after the last layer): rank 0's routed +
+    /// shared sum in, plus its own shared half (the same operands as rank 0's sum),
+    /// then mHC post into its stream a.
+    fn peer_post(&self, layer: usize, lane: &Lane<'_>, index: usize, w: &Workspace<'_>, rows: Scalar) -> Result<()> {
+        if layer + 1 >= self.cfg.n_layers {
+            return Ok(());
+        }
+        let Scalar::I32(count) = rows else { unreachable!() };
+        let (exchange, ffn) = (self.exchange()?, slot(layer, true, index));
+        exchange.wait(1, ffn)?;
+        self.add(1, exchange.recv(1, ffn)?, lane.shared.buffer.ptr, w.sum.buffer.ptr, count as usize)?;
+        self.run_on(1, false, "mhc_post", &[
+            ("x", w.sum.buffer.ptr), ("residual", lane.stream_b.buffer.ptr), ("prev_post", lane.post.buffer.ptr),
+            ("prev_comb", lane.comb.buffer.ptr), ("out", lane.stream_a.buffer.ptr),
+        ], &[rows])
+    }
+
     /// mHC pre, producer, compressor/indexer, sparse MLA, wo, mHC post_pre,
     /// router scores and expert input quantization (stream a -> stream b, y).
     #[allow(clippy::too_many_arguments)]
@@ -887,18 +1216,69 @@ impl<'a> Engine<'a> {
         rows: Scalar,
         cap: usize,
     ) -> Result<()> {
+        self.attention_front(0, layer, weights, tables, lane, w, rows, cap)?;
+        self.attention_back(0, weights, lane, w, rows, cap, w.delta.buffer.ptr)
+    }
+
+    /// [`Self::attention`] on rank 0 under a head split: the front, the attention
+    /// all-reduce with rank 1 (lane `index`'s slot), then the back on the sum.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_split(&self, layer: usize, weights: &LayerWeights<'_>, tables: &StepTables, lane: &Lane<'_>,
+        index: usize, w: &Workspace<'_>, rows: Scalar, cap: usize) -> Result<()> {
+        self.attention_front(0, layer, weights, tables, lane, w, rows, cap)?;
+        self.attention_sum(0, layer, index, w, rows)?;
+        self.attention_back(0, weights, lane, w, rows, cap, w.sum.buffer.ptr)
+    }
+
+    /// Rank `rank`'s attention partial into `delta` pushed to the other GPU, the
+    /// other's waited for, and their sum (local first: the same operands on both
+    /// GPUs, so the same bits) into `sum`.
+    fn attention_sum(&self, rank: usize, layer: usize, lane: usize, w: &Workspace<'_>, rows: Scalar) -> Result<()> {
+        let Scalar::I32(t) = rows else { unreachable!() };
+        let (exchange, at) = (self.exchange()?, slot(layer, false, lane));
+        let bytes = t as usize * self.cfg.dim * 2;
+        exchange.push(rank, at, w.delta.buffer.ptr, bytes)?;
+        exchange.wait(rank, at)?;
+        self.add(rank, w.delta.buffer.ptr, exchange.recv(rank, at)?, w.sum.buffer.ptr, t as usize)
+    }
+
+    /// `out = bf16(a + b)` over `t` rows on rank `rank` (a sum of two partials: the
+    /// same bits whichever GPU adds them).
+    fn add(&self, rank: usize, a: *mut c_void, b: *mut c_void, out: *mut c_void, t: usize) -> Result<()> {
+        self.exchange()?.add(rank, a, b, out, t * self.cfg.dim)
+    }
+
+    /// mHC pre, producer, compressor/indexer, sparse MLA and wo into `delta` on
+    /// rank `rank` (under a head split: its heads, a partial wo sum).
+    #[allow(clippy::too_many_arguments)]
+    fn attention_front(
+        &self,
+        rank: usize,
+        layer: usize,
+        weights: &LayerWeights<'_>,
+        tables: &StepTables,
+        lane: &Lane<'_>,
+        w: &Workspace<'_>,
+        rows: Scalar,
+        cap: usize,
+    ) -> Result<()> {
         let m = &lane.tables;
-        let cache = &self.pools[layer];
+        let (pools, rope_window, rope_compressed) = match (rank, &self.peer) {
+            (1, Some(peer)) => (&peer.pools, &peer.rope_window, &peer.rope_compressed),
+            _ => (&self.pools, &self.rope_window, &self.rope_compressed),
+        };
+        let cache = &pools[layer];
         let ratio = weights.ratio;
-        let rope = if ratio == 0 { &self.rope_window } else { &self.rope_compressed };
+        let rope = if ratio == 0 { rope_window } else { rope_compressed };
         let mode = if tables.decode { "decode" } else { "prefill" };
-        let (a, b) = (&lane.stream_a, &lane.stream_b);
-        self.run("mhc_pre", &[
+        let split = weights.split;
+        let a = &lane.stream_a;
+        self.run_on(rank, false, "mhc_pre", &[
             ("residual", a.buffer.ptr), ("fn", weights.ptr("attn.fn")?), ("scale", weights.ptr("attn.scale")?),
             ("base", weights.ptr("attn.base")?), ("norm", weights.ptr("attn.norm")?), ("post", lane.post.buffer.ptr),
             ("comb", lane.comb.buffer.ptr), ("y", w.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
         ], &[rows])?;
-        self.run(&format!("producer_m{cap}"), &[
+        self.run_on(rank, split, &format!("producer_m{cap}"), &[
             ("hidden", w.y.buffer.ptr), ("positions", m.positions.buffer.ptr), ("main_slots", m.main_slots.buffer.ptr),
             ("cos_sin", rope.buffer.ptr), ("w_qkv", weights.ptr("w_qkv")?), ("w_qkv_scale", weights.ptr("w_qkv_scale")?),
             ("w_q", weights.ptr("w_q")?), ("w_q_scale", weights.ptr("w_q_scale")?), ("q_norm", weights.ptr("q_norm")?),
@@ -906,25 +1286,36 @@ impl<'a> Engine<'a> {
             ("q_rank", w.q_rank.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
         ], &[rows])?;
         let (attention, indexed_cache, indexed_indices, indexed_lengths) =
-            self.compress(layer, weights, cache, tables, m, w, rope, rows, cap)?;
+            self.compress(rank, layer, weights, cache, tables, m, w, rope, rows, cap)?;
         debug_assert_eq!(attention, self.attention_kind(ratio, tables));
-        self.run(&format!("sparse_mla_{mode}_{attention}_m{cap}"), &[
+        self.run_on(rank, split, &format!("sparse_mla_{mode}_{attention}_m{cap}"), &[
             ("q", w.query.buffer.ptr), ("swa_cache", cache.main.buffer.ptr), ("swa_indices", m.swa_indices.buffer.ptr),
             ("swa_lengths", m.swa_lengths.buffer.ptr), ("indexed_cache", indexed_cache),
             ("indexed_indices", indexed_indices), ("indexed_lengths", indexed_lengths),
             ("attn_sink", weights.ptr("attn_sink")?), ("out", w.attn_out.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
         ], &[rows])?;
-        self.run(&format!("wo_m{cap}"), &[
+        self.run_on(rank, split, &format!("wo_m{cap}"), &[
             ("o", w.attn_out.buffer.ptr), ("positions", m.positions.buffer.ptr), ("cos_sin", rope.buffer.ptr),
             ("wo_a", weights.ptr("wo_a")?), ("wo_a_scale", weights.ptr("wo_a_scale")?), ("wo_b", weights.ptr("wo_b")?),
             ("wo_b_scale", weights.ptr("wo_b_scale")?), ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
-        ], &[rows])?;
-        self.run(&format!("mhc_post_pre_m{cap}"), &[
-            ("x", w.delta.buffer.ptr), ("residual", a.buffer.ptr), ("prev_post", lane.post.buffer.ptr),
+        ], &[rows])
+    }
+
+    /// mHC post_pre over the attention output `x` (stream a -> stream b, y), then on
+    /// rank 0 the router scores and expert input quantization.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_back(&self, rank: usize, weights: &LayerWeights<'_>, lane: &Lane<'_>, w: &Workspace<'_>, rows: Scalar,
+        cap: usize, x: *mut c_void) -> Result<()> {
+        let (a, b) = (&lane.stream_a, &lane.stream_b);
+        self.run_on(rank, false, &format!("mhc_post_pre_m{cap}"), &[
+            ("x", x), ("residual", a.buffer.ptr), ("prev_post", lane.post.buffer.ptr),
             ("prev_comb", lane.comb.buffer.ptr), ("fn", weights.ptr("ffn.fn")?), ("scale", weights.ptr("ffn.scale")?),
             ("base", weights.ptr("ffn.base")?), ("norm", weights.ptr("ffn.norm")?), ("residual_out", b.buffer.ptr),
             ("post", lane.post.buffer.ptr), ("comb", lane.comb.buffer.ptr), ("y", w.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
         ], &[rows])?;
+        if rank != 0 {
+            return Ok(());
+        }
         let Scalar::I32(t) = rows else { unreachable!() };
         let h = self.cfg.dim;
         self.run("router_scores", &[
@@ -954,6 +1345,7 @@ impl<'a> Engine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn compress(
         &self,
+        rank: usize,
         layer: usize,
         weights: &LayerWeights<'_>,
         cache: &LayerCache<'_>,
@@ -995,13 +1387,13 @@ impl<'a> Engine<'a> {
         if tables.chunked {
             // Grid bounds: a row completes at most one group, and there are
             // at most as many sequences as rows.
-            self.run(&format!("compressor_continuation_c{ratio}"), &pointers, &[rows, rows, rows])
+            self.run_on(rank, false, &format!("compressor_continuation_c{ratio}"), &pointers, &[rows, rows, rows])
         } else if tables.decode {
-            self.run(&format!("compressor_decode_c{ratio}"), &pointers, &[rows])
+            self.run_on(rank, false, &format!("compressor_decode_c{ratio}"), &pointers, &[rows])
         } else {
             let completed = names[0].1[0].max(1);
             let program = if tables.start == 0 { "prefill" } else { "continuation" };
-            self.run(&format!("compressor_{program}_c{ratio}"), &pointers,
+            self.run_on(rank, false, &format!("compressor_{program}_c{ratio}"), &pointers,
                 &[rows, Scalar::I32(completed), Scalar::I32(1)])
         }
         .with_context(|| format!("layer {layer} compressor"))?;
@@ -1011,14 +1403,14 @@ impl<'a> Engine<'a> {
         if ratio == 128 {
             return Ok(("c128", compressed, m.c128_indices.buffer.ptr, m.c128_lengths.buffer.ptr));
         }
-        self.run(&format!("index_producer_m{cap}"), &[
+        self.run_on(rank, false, &format!("index_producer_m{cap}"), &[
             ("q_rank", w.q_rank.buffer.ptr), ("hidden", w.y.buffer.ptr), ("positions", m.positions.buffer.ptr),
             ("cos_sin", rope.buffer.ptr), ("w_q", weights.ptr("index_w_q")?), ("w_q_scale", weights.ptr("index_w_q_scale")?),
             ("w_proj", weights.ptr("index_w_proj")?), ("query", w.index_query.buffer.ptr),
             ("head_weights", w.index_weights.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
         ], &[rows])?;
         let mode = if tables.decode { "decode" } else { "prefill" };
-        self.run(&format!("index_topk_{mode}_m{cap}"), &[
+        self.run_on(rank, false, &format!("index_topk_{mode}_m{cap}"), &[
             ("q_fp8", w.index_query.buffer.ptr), ("weights", w.index_weights.buffer.ptr),
             ("index_k_cache", cache.index.as_ref().context("index cache")?.buffer.ptr),
             ("page_table", m.c4_page_table.buffer.ptr), ("cache_lengths", m.c4_visible.buffer.ptr),
@@ -1068,7 +1460,8 @@ impl<'a> Engine<'a> {
     /// The shared expert on the unit's FFN input `y` into the lane's `shared`.
     fn shared_ffn(&self, layer: usize, w: &Workspace<'_>, lane: &Lane<'_>, rows: Scalar, cap: usize,
         weights: &LayerWeights<'_>) -> Result<()> {
-        self.run(&format!("shared_ffn_m{cap}"), &[
+        // A head split's layers hold half the shared expert (its program family's share).
+        self.run_on(0, weights.split, &format!("shared_ffn_m{cap}"), &[
             ("x", w.y.buffer.ptr), ("w13", weights.ptr("w13")?), ("w13_scale", weights.ptr("w13_scale")?),
             ("w2", weights.ptr("w2")?), ("w2_scale", weights.ptr("w2_scale")?), ("out", lane.shared.buffer.ptr),
             ("scratch", w.scratch.buffer.ptr),
@@ -1185,7 +1578,7 @@ impl<'a> Engine<'a> {
         // SAFETY: input, weights and logits are live buffers of the head's
         // shape; the last `n` rows start `t - n` rows into `y`.
         unsafe {
-            w.head.launch(w.y.buffer.ptr.cast::<u8>().add((t - n) * h * 2).cast(), self.weights.head.buffer.ptr.cast(),
+            w.head.as_ref().context("LM head")?.launch(w.y.buffer.ptr.cast::<u8>().add((t - n) * h * 2).cast(), self.weights.head.buffer.ptr.cast(),
                 w.vocab_logits.buffer.ptr.cast::<f32>().add(at * vocab), n as u32, self.stream)
         }
     }
