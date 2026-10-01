@@ -57,19 +57,39 @@ impl GlmDsaConfig {
             v[key].as_f64().with_context(|| format!("glm_moe_dsa config lacks {key}"))
         };
         let layers = int("num_hidden_layers")?;
-        let indexers = match v["indexer_types"].as_array() {
-            Some(types) => types.iter().map(|t| match t.as_str() {
+        let indexers = match v.get("indexer_types").filter(|x| !x.is_null()) {
+            Some(types) => types.as_array().context("indexer_types must be a list")?.iter().map(|t| match t.as_str() {
                 Some("full") => Ok(GlmIndexer::Full),
                 Some("shared") => Ok(GlmIndexer::Shared),
                 other => anyhow::bail!("unknown indexer type {other:?}"),
             }).collect::<Result<Vec<_>>>()?,
             None => vec![GlmIndexer::Full; layers],
         };
-        ensure!(indexers.len() >= layers && indexers[0] == GlmIndexer::Full,
-            "indexer_types must cover every layer and start with a full indexer");
-        let first_moe_layer = match v["mlp_layer_types"].as_array() {
-            Some(types) => types.iter().position(|t| t == "sparse").context("no sparse layer in mlp_layer_types")?,
-            None => int("first_k_dense_replace")?,
+        ensure!(indexers.len() == layers && indexers[0] == GlmIndexer::Full,
+            "indexer_types must cover exactly every layer and start with a full indexer");
+        // Every layer is MLA + DSA; a `layer_types` list, when present, must say so.
+        if let Some(types) = v.get("layer_types").filter(|x| !x.is_null()) {
+            let types = types.as_array().context("layer_types must be a list")?;
+            ensure!(types.len() == layers && types.iter().all(|t| t == "deepseek_sparse_attention"),
+                "glm_moe_dsa layer_types must name deepseek_sparse_attention for exactly every layer");
+        }
+        // Dense layers are a prefix: `mlp_layer_types` (dense then sparse) or
+        // `first_k_dense_replace`; when both are present they agree.
+        let first_k = v.get("first_k_dense_replace").filter(|x| !x.is_null())
+            .map(|x| x.as_u64().map(|x| x as usize).context("first_k_dense_replace must be an unsigned integer"))
+            .transpose()?;
+        let first_moe_layer = match v.get("mlp_layer_types").filter(|x| !x.is_null()) {
+            Some(types) => {
+                let types = types.as_array().context("mlp_layer_types must be a list")?;
+                ensure!(types.len() == layers, "mlp_layer_types has {} entries for {layers} layers", types.len());
+                ensure!(types.iter().all(|t| t == "dense" || t == "sparse"), "mlp_layer_types entries are dense or sparse");
+                let first = types.iter().position(|t| t == "sparse").context("no sparse layer in mlp_layer_types")?;
+                ensure!(types[first..].iter().all(|t| t == "sparse"), "mlp_layer_types: dense layers must be a prefix");
+                ensure!(first_k.is_none_or(|k| k == first),
+                    "mlp_layer_types ({first} dense) and first_k_dense_replace ({}) disagree", first_k.unwrap_or(0));
+                first
+            }
+            None => first_k.context("glm_moe_dsa config lacks first_k_dense_replace")?,
         };
         ensure!(v["scoring_func"] == "sigmoid" && v["topk_method"] == "noaux_tc"
             && v["n_group"].as_u64().unwrap_or(1) == 1, "GLM routing must be sigmoid noaux_tc without groups");
@@ -95,7 +115,7 @@ impl GlmDsaConfig {
             index_heads: int("index_n_heads")?,
             index_head_dim: int("index_head_dim")?,
             index_topk: int("index_topk")?,
-            indexers: indexers[..layers].to_vec(),
+            indexers,
             first_moe_layer,
             dense_intermediate: int("intermediate_size")?,
             experts: int("n_routed_experts")?,

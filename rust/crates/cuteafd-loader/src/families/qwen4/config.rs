@@ -65,12 +65,12 @@ impl Qwen4Config {
         };
         let layers = int(v, "num_hidden_layers")?;
         let types = v["layer_types"].as_array().context("qwen4_exp config lacks layer_types")?;
-        let attention = types.iter().take(layers).map(|t| match t.as_str() {
+        ensure!(types.len() == layers, "layer_types has {} entries for {layers} layers", types.len());
+        let attention = types.iter().map(|t| match t.as_str() {
             Some("linear_attention") => Ok(Qwen4Attention::Gdn),
             Some("full_attention") => Ok(Qwen4Attention::Full),
             other => anyhow::bail!("unknown qwen4_exp layer type {other:?}"),
         }).collect::<Result<Vec<_>>>()?;
-        ensure!(attention.len() == layers, "layer_types must cover every layer");
         let rope = &v["rope_parameters"];
         let partial = rope["partial_rotary_factor"].as_f64().or(v["partial_rotary_factor"].as_f64()).unwrap_or(1.0);
         let head_dim = int(v, "head_dim")?;

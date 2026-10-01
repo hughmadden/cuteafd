@@ -4,7 +4,9 @@
 //! The hub config uses the checkpoint's own keys (`hybrid_layer_pattern`,
 //! `moe_layer_freq`, `swa_*`, `layernorm_epsilon`); transformers' native
 //! config uses `layer_types` / `mlp_layer_types` and doubles the full layers'
-//! KV heads on SWA layers. Both spellings are read.
+//! KV heads on SWA layers. Both spellings are read; each present pattern must
+//! cover exactly every layer, and two present spellings must agree. This is
+//! the one reader: serve-mimo and `cuteafd plan` both derive from it.
 use anyhow::{ensure, Context, Result};
 use serde_json::Value;
 use std::path::Path;
@@ -47,6 +49,77 @@ pub struct MimoV2Config {
     pub v_scale: f64,
 }
 
+/// One per-layer pattern in either spelling: each spelling present must be a
+/// list covering exactly `layers` entries of known values, and when both are
+/// present they must agree. `None` when neither is present.
+fn pattern<T: PartialEq + Copy + std::fmt::Debug>(v: &Value, layers: usize, spellings: [(&str, &dyn Fn(&Value) -> Option<T>); 2])
+    -> Result<Option<Vec<T>>> {
+    let mut found: Option<(&str, Vec<T>)> = None;
+    for (key, decode) in spellings {
+        let Some(raw) = v.get(key).filter(|x| !x.is_null()) else { continue };
+        let list = raw.as_array().with_context(|| format!("{key} must be a list of {layers} entries, found {raw}"))?;
+        ensure!(list.len() == layers, "{key} has {} entries for {layers} layers", list.len());
+        let values = list.iter().enumerate()
+            .map(|(layer, x)| decode(x).with_context(|| format!("{key}[{layer}] = {x} is not a known entry")))
+            .collect::<Result<Vec<T>>>()?;
+        if let Some((other, previous)) = &found {
+            ensure!(*previous == values, "{other} and {key} disagree");
+        }
+        found = Some((key, values));
+    }
+    Ok(found.map(|(_, values)| values))
+}
+
+/// `hybrid_layer_pattern` (0 full, 1 sliding) or `layer_types`; default: full
+/// attention on layer 0 and every sixth layer.
+fn attention_pattern(v: &Value, layers: usize) -> Result<Vec<MimoAttention>> {
+    let hybrid = |x: &Value| match x.as_u64() {
+        Some(0) => Some(MimoAttention::Full),
+        Some(1) => Some(MimoAttention::Sliding),
+        _ => None,
+    };
+    let types = |x: &Value| match x.as_str() {
+        Some("full_attention") => Some(MimoAttention::Full),
+        Some("sliding_attention") => Some(MimoAttention::Sliding),
+        _ => None,
+    };
+    Ok(pattern(v, layers, [("hybrid_layer_pattern", &hybrid), ("layer_types", &types)])?.unwrap_or_else(|| {
+        (0..layers).map(|l| if l == 0 || (l + 1) % 6 == 0 { MimoAttention::Full } else { MimoAttention::Sliding }).collect()
+    }))
+}
+
+/// `dense[layer]` from `moe_layer_freq` (0 dense, 1 MoE) or `mlp_layer_types`
+/// ("dense" / "sparse"); default: layer 0 dense.
+fn dense_pattern(v: &Value, layers: usize) -> Result<Vec<bool>> {
+    let freq = |x: &Value| match x.as_u64() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    };
+    let types = |x: &Value| match x.as_str() {
+        Some("dense") => Some(true),
+        Some("sparse") => Some(false),
+        _ => None,
+    };
+    Ok(pattern(v, layers, [("moe_layer_freq", &freq), ("mlp_layer_types", &types)])?
+        .unwrap_or_else(|| (0..layers).map(|l| l == 0).collect()))
+}
+
+/// `sliding_window_size` or `sliding_window` (equal when both are present).
+fn window(v: &Value) -> Result<usize> {
+    let read = |key: &str| v.get(key).filter(|x| !x.is_null()).map(|x| {
+        x.as_u64().map(|x| x as usize).with_context(|| format!("{key} must be an unsigned integer, found {x}"))
+    }).transpose();
+    match (read("sliding_window_size")?, read("sliding_window")?) {
+        (Some(a), Some(b)) => {
+            ensure!(a == b, "sliding_window_size {a} and sliding_window {b} disagree");
+            Ok(a)
+        }
+        (Some(w), None) | (None, Some(w)) => Ok(w),
+        (None, None) => anyhow::bail!("mimo_v2 config lacks sliding_window_size / sliding_window"),
+    }
+}
+
 impl MimoV2Config {
     pub fn read(snapshot: &Path) -> Result<Self> {
         Self::from_hf(&read_json(&snapshot.join("config.json"))?)
@@ -59,31 +132,8 @@ impl MimoV2Config {
             v[key].as_u64().map(|x| x as usize).with_context(|| format!("mimo_v2 config lacks {key}"))
         };
         let layers = int("num_hidden_layers")?;
-        let attention = if let Some(pattern) = v["hybrid_layer_pattern"].as_array() {
-            pattern.iter().map(|p| match p.as_u64() {
-                Some(0) => Ok(MimoAttention::Full),
-                Some(1) => Ok(MimoAttention::Sliding),
-                other => anyhow::bail!("unknown hybrid_layer_pattern entry {other:?}"),
-            }).collect::<Result<Vec<_>>>()?
-        } else if let Some(types) = v["layer_types"].as_array() {
-            types.iter().map(|t| match t.as_str() {
-                Some("full_attention") => Ok(MimoAttention::Full),
-                Some("sliding_attention") => Ok(MimoAttention::Sliding),
-                other => anyhow::bail!("unknown layer type {other:?}"),
-            }).collect::<Result<Vec<_>>>()?
-        } else {
-            (0..layers).map(|l| if l == 0 || (l + 1) % 6 == 0 { MimoAttention::Full } else { MimoAttention::Sliding })
-                .collect()
-        };
-        ensure!(attention.len() >= layers, "the layer pattern must cover every layer");
-        let dense = if let Some(freq) = v["moe_layer_freq"].as_array() {
-            freq.iter().map(|f| f.as_u64() == Some(0)).collect::<Vec<_>>()
-        } else if let Some(types) = v["mlp_layer_types"].as_array() {
-            types.iter().map(|t| t == "dense").collect()
-        } else {
-            (0..layers).map(|l| l == 0).collect()
-        };
-        ensure!(dense.len() >= layers, "the MLP pattern must cover every layer");
+        let attention = attention_pattern(v, layers)?;
+        let dense = dense_pattern(v, layers)?;
         ensure!(v["scoring_func"].as_str().unwrap_or("sigmoid") == "sigmoid"
             && v["topk_method"].as_str().unwrap_or("noaux_tc") == "noaux_tc"
             && v["n_group"].as_u64().unwrap_or(1) == 1 && v["norm_topk_prob"].as_bool().unwrap_or(true),
@@ -116,11 +166,11 @@ impl MimoV2Config {
             rope_dim: (head_dim as f64 * partial) as usize,
             full_rope_theta,
             swa_rope_theta,
-            window: int("sliding_window_size").or_else(|_| int("sliding_window"))?,
-            attention: attention[..layers].to_vec(),
+            window: window(v)?,
+            attention,
             full_sinks: v["add_full_attention_sink_bias"].as_bool().unwrap_or(false),
             swa_sinks: v["add_swa_attention_sink_bias"].as_bool().unwrap_or(true),
-            dense: dense[..layers].to_vec(),
+            dense,
             dense_intermediate: int("intermediate_size")?,
             experts: int("n_routed_experts")?,
             topk: int("num_experts_per_tok")?,
@@ -220,6 +270,40 @@ mod tests {
         assert_eq!(cfg.attention.iter().filter(|a| **a == MimoAttention::Full).count(), 10);
         assert_eq!(cfg.record_elems(MimoAttention::Full), 2560);
         assert_eq!(cfg.program_family()?, "mimop");
+        Ok(())
+    }
+
+    fn two_layers() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "mimo_v2_flash", "vocab_size": 64, "hidden_size": 4096, "num_hidden_layers": 2,
+            "num_attention_heads": 64, "num_key_value_heads": 4, "head_dim": 192, "v_head_dim": 128,
+            "rope_theta": 5000000, "swa_rope_theta": 10000, "sliding_window": 128, "intermediate_size": 16384,
+            "n_routed_experts": 256, "num_experts_per_tok": 8, "moe_intermediate_size": 2048,
+        })
+    }
+
+    #[test]
+    fn both_spellings_read_alike_and_partial_patterns_are_refused() -> Result<()> {
+        let mut hub = two_layers();
+        hub["hybrid_layer_pattern"] = serde_json::json!([0, 1]);
+        hub["moe_layer_freq"] = serde_json::json!([0, 1]);
+        let mut hf = two_layers();
+        hf["layer_types"] = serde_json::json!(["full_attention", "sliding_attention"]);
+        hf["mlp_layer_types"] = serde_json::json!(["dense", "sparse"]);
+        let mut both = hub.clone();
+        both["layer_types"] = hf["layer_types"].clone();
+        let (a, b, c) = (MimoV2Config::from_hf(&hub)?, MimoV2Config::from_hf(&hf)?, MimoV2Config::from_hf(&both)?);
+        assert!(a == b && b == c && a.swa_sinks && !a.full_sinks);
+        assert_eq!((a.attention.clone(), a.dense.clone()), (vec![MimoAttention::Full, MimoAttention::Sliding], vec![true, false]));
+        // The defaults equal the hub pattern for these two layers.
+        assert_eq!(MimoV2Config::from_hf(&two_layers())?, a);
+        for (key, value) in [("moe_layer_freq", serde_json::json!([0])), ("moe_layer_freq", serde_json::json!(1)),
+            ("layer_types", serde_json::json!(["full_attention", "full_attention"])),
+            ("hybrid_layer_pattern", serde_json::json!([0, 2])), ("sliding_window_size", serde_json::json!(64))] {
+            let mut config = hub.clone();
+            config[key] = value;
+            assert!(MimoV2Config::from_hf(&config).is_err(), "{key}");
+        }
         Ok(())
     }
 }

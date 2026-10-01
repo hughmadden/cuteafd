@@ -8,6 +8,12 @@ FAMILY is the long family id (deepseek_v41, deepseek_v4, glm5, glm5_flash,
 mimo_v2, qwen4). The Spark ranks serve routed experts on [FIRST, LAST]
 (LAST -1: through the end); MTP/nextn layers past the decoder stay off them for
 GLM 5.3 Flash and Qwen 3.8, whose serve paths do not run their MTP heads.
+
+The layer patterns are read as the runtimes' config readers read them
+(cuteafd-loader families/*/config.rs, plan/launch.rs): both spellings of a
+pattern, each covering exactly every layer, agreeing when both are present.
+rust/crates/cuteafd-loader/tests/fixtures/launch-families.json holds the cases
+both implementations are checked against.
 """
 from __future__ import annotations
 
@@ -25,6 +31,43 @@ FAMILIES = {
 }
 
 
+def _pattern(text: dict, layers: int, spellings: dict) -> list | None:
+    """One per-layer pattern in either spelling (key -> {entry: value}); None when absent."""
+    found = None
+    for key, values in spellings.items():
+        raw = text.get(key)
+        if raw is None:
+            continue
+        if not isinstance(raw, list) or len(raw) != layers:
+            raise SystemExit(f"{key} must be a list of {layers} entries")
+        # Entries match by type too (JSON true is not 1, 1.0 is not 1).
+        typed = {(type(entry), entry): value for entry, value in values.items()}
+        try:
+            decoded = [typed[(type(entry), entry)] for entry in raw]
+        except (KeyError, TypeError):
+            raise SystemExit(f"{key} has an unknown entry") from None
+        if found is not None and found[1] != decoded:
+            raise SystemExit(f"{found[0]} and {key} disagree")
+        found = (key, decoded)
+    return None if found is None else found[1]
+
+
+def _dense_prefix(text: dict, layers: int) -> int:
+    """GLM 5.x: dense layers are a prefix (mlp_layer_types or first_k_dense_replace)."""
+    first_k = text.get("first_k_dense_replace")
+    dense = _pattern(text, layers, {"mlp_layer_types": {"dense": True, "sparse": False}})
+    if dense is None:
+        if first_k is None:
+            raise SystemExit("config lacks first_k_dense_replace")
+        return int(first_k)
+    first = dense.index(False) if False in dense else layers
+    if any(dense[first:]):
+        raise SystemExit("mlp_layer_types: dense layers must be a prefix")
+    if first_k is not None and first_k != first:
+        raise SystemExit("mlp_layer_types and first_k_dense_replace disagree")
+    return first
+
+
 def describe(config: dict) -> tuple[str, str, int, int]:
     text = config.get("text_config", config)
     kind = config.get("model_type", "?")
@@ -32,13 +75,36 @@ def describe(config: dict) -> tuple[str, str, int, int]:
     if family is None:
         raise SystemExit(f"unsupported model_type {kind!r}; known: {', '.join(sorted(FAMILIES))}")
     first, last = 0, -1
-    if family in ("glm5", "glm5_flash"):
-        types = text.get("mlp_layer_types")
-        first = types.index("sparse") if types else text.get("first_k_dense_replace", 0)
+    if family in ("glm5", "glm5_flash", "mimo_v2", "qwen4"):
+        layers = text.get("num_hidden_layers")
+        if not isinstance(layers, int) or layers <= 0:
+            raise SystemExit("config lacks num_hidden_layers")
+    if family == "glm5":
+        first = _dense_prefix(text, layers)
+    elif family == "glm5_flash":
+        kinds = {"linear_attention": "kda", "deepseek_sparse_attention": "mla"}
+        if _pattern(text, layers, {"layer_types": kinds}) is None:
+            raise SystemExit("config lacks layer_types")
+        # Any per-layer pattern (serve-glmf reads dense[layer]); first_k_dense_replace agrees when present.
+        first_k = text.get("first_k_dense_replace")
+        dense = _pattern(text, layers, {"mlp_layer_types": {"dense": True, "sparse": False}})
+        if dense is None:
+            dense = [layer < (first_k or 0) for layer in range(layers)]
+        elif first_k is not None and dense != [layer < first_k for layer in range(layers)]:
+            raise SystemExit("mlp_layer_types and first_k_dense_replace disagree")
+        first = dense.index(False) if False in dense else layers
+        last = layers - 1
     elif family == "mimo_v2":
-        first = text["moe_layer_freq"].index(1)
-    if family in ("glm5_flash", "qwen4"):
-        last = text["num_hidden_layers"] - 1
+        dense = _pattern(text, layers, {"moe_layer_freq": {0: True, 1: False},
+                                        "mlp_layer_types": {"dense": True, "sparse": False}})
+        if dense is None:
+            dense = [layer == 0 for layer in range(layers)]
+        first = dense.index(False) if False in dense else layers
+    elif family == "qwen4":
+        kinds = {"linear_attention": "gdn", "full_attention": "full"}
+        if _pattern(text, layers, {"layer_types": kinds}) is None:
+            raise SystemExit("config lacks layer_types")
+        last = layers - 1
     return family, kind, first, last
 
 

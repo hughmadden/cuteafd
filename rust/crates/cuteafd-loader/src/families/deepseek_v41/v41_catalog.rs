@@ -733,22 +733,28 @@ pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
 /// come first, and the MTP layer after the backbone keeps its experts on the
 /// coordinator.
 fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Result<OfficialV41Catalog> {
-    let text = config.get("text_config").unwrap_or(config);
-    let field = |key: &str| -> Result<usize> {
-        text[key].as_u64().map(|v| v as usize).with_context(|| format!("glm_moe_dsa config lacks {key}"))
+    // The geometry from the coordinator's own config readers, so the Spark
+    // ranks and serve-glm / serve-glmf agree on the routed layers.
+    let (dense, mtp, shape) = if config.get("model_type").and_then(serde_json::Value::as_str) == Some("glm5_next") {
+        let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(config)?;
+        let text = config.get("text_config").unwrap_or(config);
+        let mtp = text["num_nextn_predict_layers"].as_u64().unwrap_or(0) as usize;
+        (cfg.dense.clone(), mtp, (cfg.layers, cfg.experts, cfg.topk, cfg.hidden, cfg.moe_intermediate))
+    } else {
+        let cfg = crate::families::glm5::GlmDsaConfig::from_hf(config)?;
+        let dense = (0..cfg.layers).map(|layer| layer < cfg.first_moe_layer).collect::<Vec<_>>();
+        (dense, cfg.mtp_layers, (cfg.layers, cfg.experts, cfg.topk, cfg.hidden, cfg.moe_intermediate))
     };
-    let layers = field("num_hidden_layers")?;
-    let first_layer = match text["mlp_layer_types"].as_array() {
-        Some(types) => types.iter().position(|t| t == "sparse").context("no sparse layer in mlp_layer_types")?,
-        None => field("first_k_dense_replace").unwrap_or(0),
-    };
+    let (layers, experts, topk, hidden, intermediate) = shape;
+    let first_layer = dense.iter().position(|dense| !dense).context("GLM config has no MoE layer")?;
+    ensure!(dense[first_layer..].iter().all(|dense| !dense), "GLM MoE layers must follow the dense ones");
     let shape = RoutedExpertShape {
         layers,
         first_layer,
-        experts: field("n_routed_experts")?,
-        topk: field("num_experts_per_tok")?,
-        hidden: field("hidden_size")?,
-        intermediate: field("moe_intermediate_size")?,
+        experts,
+        topk,
+        hidden,
+        intermediate,
         draft_stages: 0,
         draft_experts: 0,
     };
@@ -756,7 +762,6 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> R
         // The official FP8 experts (~675 GiB) do not fit the Spark pool; the
         // catalog serves selected layers, above all the MTP layer, whose ids
         // follow the backbone (num_hidden_layers..): the id bound includes them.
-        let mtp = text["num_nextn_predict_layers"].as_u64().unwrap_or(0) as usize;
         return fp8_catalog(snapshot, RoutedExpertShape { layers: layers + mtp, ..shape });
     }
     ensure!(
@@ -782,17 +787,14 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> R
 /// experts into `[512, ...]` tensors and NVIDIA's release is NVFP4: neither
 /// has an expert package.
 fn read_qwen4_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Result<OfficialV41Catalog> {
-    let text = config.get("text_config").unwrap_or(config);
-    let field = |key: &str| -> Result<usize> {
-        text[key].as_u64().map(|v| v as usize).with_context(|| format!("qwen4_exp config lacks {key}"))
-    };
+    let cfg = crate::families::qwen4::Qwen4Config::from_hf(config)?;
     let shape = RoutedExpertShape {
-        layers: field("num_hidden_layers")?,
+        layers: cfg.layers,
         first_layer: 0,
-        experts: field("num_experts")?,
-        topk: field("num_experts_per_tok")?,
-        hidden: field("hidden_size")?,
-        intermediate: field("moe_intermediate_size")?,
+        experts: cfg.experts,
+        topk: cfg.topk,
+        hidden: cfg.hidden,
+        intermediate: cfg.moe_intermediate,
         draft_stages: 0,
         draft_experts: 0,
     };
