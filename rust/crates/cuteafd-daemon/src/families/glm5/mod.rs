@@ -12,7 +12,6 @@ use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::families::glm5::GlmDsaConfig;
 use crate::shared::spark_intake::{SparkLane, SparkLink};
 use std::ffi::c_void;
-use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -75,6 +74,8 @@ pub(crate) struct EngineArgs {
     /// scales, the official FP8 release's served numerics).
     #[arg(long)]
     pub prefill_w8a16: bool,
+    #[command(flatten)]
+    pub token_io: crate::shared::token_io::TokenIoArgs,
 }
 
 #[derive(Debug, clap::Args)]
@@ -167,6 +168,11 @@ pub(crate) struct GoldenArgs {
     /// --resume-at attempts on fresh sequences (all must be byte-identical).
     #[arg(long, default_value_t = 1)]
     pub resume_repeat: usize,
+    /// Token I/O gate after the golden prompt (--prefill tokens of it), then
+    /// stop: the resident embedding table against the shard, device against
+    /// host greedy selection over this many decode steps, device against host sampling.
+    #[arg(long)]
+    pub token_check: Option<usize>,
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -200,14 +206,15 @@ impl Opened {
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::GlmLoader { library: &self.library, catalog: &self.catalog, stream };
-        let model = loader.model(&self.cfg, layers)?;
+        let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
+            args.token_io.embed_placement, || loader.model(&self.cfg, layers))?;
         let bytes: usize = model.layers.iter().map(|l| l.bytes()).sum::<usize>() + model.norm.buffer.bytes
             + model.head.buffer.bytes;
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64,
             gib = format!("{:.2}", bytes as f64 / (1u64 << 30) as f64), "GLM coordinator weights resident");
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            args.max_context, args.prefill_rows, pages)?;
+            args.max_context, args.prefill_rows, pages, embedding)?;
         engine.full_prefill_logits = args.full_prefill_logits;
         engine.prefill_w8a8 = !args.prefill_w8a16;
         if args.skip_routed_experts {
@@ -218,7 +225,7 @@ impl Opened {
             let cfg = dflash::DflashConfig::read(snapshot)?;
             ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
                 && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash2 drafter does not fit this target");
-            let mask = embed_rows(&self.catalog, &[cfg.mask_token], self.cfg.hidden)?;
+            let mask = engine.embedding.host_rows(&[cfg.mask_token])?;
             let file = draft_file.context("drafter prefetch")?.join()
                 .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
             let mut drafter = dflash::GlmDrafter::load(&self.library, snapshot, file, stream, args.draft_sequences,
@@ -326,30 +333,13 @@ pub(crate) unsafe fn launch_head(library: &NativeLibrary, head: &cuteafd_ffi::pr
     unsafe { head.launch(x.cast(), weight.cast(), logits, rows as u32, stream) }
 }
 
-pub(crate) fn embed_rows(catalog: &cuteafd_loader::OfficialV41Catalog, tokens: &[u32], hidden: usize) -> Result<Vec<u8>> {
-    // Every decode step embeds its rows: keep the shard open (an open through
-    // the sparknest mount costs more than the row reads).
-    static SHARDS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Arc<std::fs::File>>>> =
-        std::sync::OnceLock::new();
-    let tensor = catalog.tensor("model.embed_tokens.weight")?;
-    let path = catalog.snapshot().join(&tensor.shard);
-    let file = {
-        let mut shards = SHARDS.get_or_init(Default::default).lock().map_err(|_| anyhow::anyhow!("embed shards"))?;
-        match shards.get(&path) {
-            Some(file) => file.clone(),
-            None => {
-                let file = std::sync::Arc::new(std::fs::File::open(&path)?);
-                shards.insert(path, file.clone());
-                file
-            }
-        }
-    };
-    let row = hidden * 2;
-    let mut out = vec![0u8; tokens.len() * row];
-    for (slot, token) in out.chunks_exact_mut(row).zip(tokens) {
-        file.read_exact_at(slot, tensor.metadata.byte_offset + u64::from(*token) * row as u64)?;
+impl Opened {
+    /// The checkpoint's `model.embed_tokens.weight` (BF16 [vocab, hidden]).
+    fn embed_source(&self) -> Result<crate::shared::token_io::EmbedSource> {
+        let tensor = self.catalog.tensor("model.embed_tokens.weight")?;
+        crate::shared::token_io::EmbedSource::new(self.catalog.snapshot(), &tensor.shard, &tensor.metadata,
+            self.cfg.hidden)
     }
-    Ok(out)
 }
 
 fn bf16s(bytes: &[u8]) -> Vec<f32> {
@@ -394,14 +384,13 @@ fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, m
     runtime: &tokio::runtime::Runtime) -> Result<()> {
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
-    let (row, vocab) = (opened.cfg.hidden * 2, opened.cfg.vocab_size);
-    let embed = embed_rows(&opened.catalog, &tokens, opened.cfg.hidden)?;
+    let vocab = opened.cfg.vocab_size;
     let mut placement = engine::PageAllocator::new(engine.pages).admit(tokens.len())?;
     let started = Instant::now();
     let mut logits = Vec::new();
-    for chunk in embed.chunks(engine.prefill_capacity() * row) {
+    for chunk in tokens.chunks(engine.prefill_capacity()) {
         logits.extend(engine.prefill_rows_logits(&mut placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)),
-            None, chunk.len() / row)?.context("the prefill needs every layer")?);
+            None, chunk.len())?.context("the prefill needs every layer")?);
     }
     let seconds = started.elapsed().as_secs_f64();
     if let Some(dir) = &args.save_logits {
@@ -444,7 +433,7 @@ fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, m
 
 /// --bench-verify: verify-step cost by rows (the DFlash2 policy's step
 /// table) with the host's phase split, then the drafter step by sequences.
-fn bench_verify(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
+fn bench_verify(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
     mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, max_rows: usize) -> Result<()> {
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
@@ -452,10 +441,8 @@ fn bench_verify(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
     ensure!(transport.is_some() || engine.skip_routed(), "--bench-verify needs Spark peers or --skip-routed-experts");
     let prefill = args.bench_context.or(args.prefill).unwrap_or(512);
     let tokens: Vec<u32> = tokens.iter().copied().cycle().take(prefill + max_rows).collect();
-    let row = opened.cfg.hidden * 2;
-    let embed = embed_rows(&opened.catalog, &tokens, opened.cfg.hidden)?;
     let mut placement = engine::PageAllocator::new(engine.pages).admit(prefill + max_rows)?;
-    for chunk in embed[..prefill * row].chunks(engine.prefill_capacity() * row) {
+    for chunk in tokens[..prefill].chunks(engine.prefill_capacity()) {
         engine.prefill(&mut placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)), None)?;
     }
     let start = placement.len;
@@ -475,7 +462,7 @@ fn bench_verify(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
                 *engine.profile.borrow_mut() = [0.0; 3];
             }
             let started = Instant::now();
-            let logits = engine.verify(&mut [(&mut placement, rows)], &embed[start * row..(start + rows) * row],
+            let logits = engine.verify(&mut [(&mut placement, rows)], &tokens[start..start + rows],
                 transport.as_deref_mut().map(|t| (t, runtime)), None)?;
             if round >= 2 {
                 times.push(started.elapsed().as_secs_f64() * 1e3);
@@ -507,11 +494,10 @@ fn bench_verify(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
         for sequences in counts {
             let seqs: Vec<dflash::DraftSeq> = (0..sequences)
                 .map(|slot| dflash::DraftSeq { slot, anchor: tokens[start], position: start, valid_from: 0 }).collect();
-            let anchors = embed_rows(&opened.catalog, &vec![tokens[start]; sequences], opened.cfg.hidden)?;
             let mut times = Vec::new();
             for round in 0..9 {
                 let started = Instant::now();
-                let drafts = drafter.draft(&seqs, &anchors, engine.weights.head.buffer.ptr)?;
+                let drafts = drafter.draft_device(&seqs, &engine.embedding, engine.weights.head.buffer.ptr)?;
                 if round >= 2 {
                     times.push(started.elapsed().as_secs_f64() * 1e3);
                 }
@@ -528,14 +514,12 @@ fn bench_verify(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
 }
 
 /// --bench-prefill: fresh sequences of --bench-prefill-tokens tokens.
-fn bench_prefill(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
+fn bench_prefill(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
     mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime) -> Result<()> {
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
-    let row = opened.cfg.hidden * 2;
     let n = args.bench_prefill_tokens;
-    let embed = embed_rows(&opened.catalog, &tokens, opened.cfg.hidden)?;
-    let long: Vec<u8> = embed.chunks_exact(row).cycle().take(n).flatten().copied().collect();
+    let long: Vec<u32> = tokens.iter().copied().cycle().take(n).collect();
     let mut allocator = engine::PageAllocator::new(engine.pages);
     let mut times = Vec::new();
     for round in 0..=args.bench_prefill {
@@ -544,7 +528,7 @@ fn bench_prefill(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<
         }
         let mut placement = allocator.admit(n)?;
         let started = Instant::now();
-        for chunk in long.chunks(engine.prefill_capacity() * row) {
+        for chunk in long.chunks(engine.prefill_capacity()) {
             engine.prefill(&mut placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)), None)?;
         }
         // Round 0 warms the workspaces.
@@ -592,20 +576,22 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
             }
             Ok(taps)
         };
-        return dflash::replay(drafter, &tokens, &greedy, &taps, &|t| embed_rows(&opened.catalog, t, hidden),
+        return dflash::replay(drafter, &tokens, &greedy, &taps, &|t| engine.embedding.host_rows(t),
             engine.weights.head.buffer.ptr, start);
     }
     if let Some(rows) = args.bench_verify {
-        return bench_verify(args, opened, engine, transport, runtime, rows);
+        return bench_verify(args, engine, transport, runtime, rows);
     }
     if let Some(at) = args.resume_at {
         let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
             .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
         let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
-        let hidden = opened.cfg.hidden;
-        return prefix::resume_check(engine, &|t| embed_rows(&opened.catalog, t, hidden), &tokens, at, n,
+        return prefix::resume_check(engine, &tokens, at, n,
             args.prefill_chunk.unwrap_or(engine.prefill_rows), args.resume_decode, args.resume_cold,
             args.resume_repeat, transport.map(|t| (t, runtime)));
+    }
+    if let Some(steps) = args.token_check {
+        return token_check(args, opened, engine, transport, runtime, steps);
     }
     if engine.drafter.is_some() {
         return draft_run(args, opened, engine, transport, runtime);
@@ -617,19 +603,18 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
             nll_run(args, opened, engine, transport.as_deref_mut(), runtime)?;
         }
         if args.bench_prefill > 0 {
-            bench_prefill(args, opened, engine, transport, runtime)?;
+            bench_prefill(args, engine, transport, runtime)?;
         }
         return Ok(());
     }
     if let Some(copies) = args.sequences {
         return multi_run(args, opened, engine, copies, transport, runtime);
     }
-    let (catalog, cfg) = (&opened.catalog, &opened.cfg);
+    let cfg = &opened.cfg;
     let layers = engine.weights.layers.len();
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
     let mut placement = engine::PageAllocator::new(engine.pages).admit(tokens.len())?;
-    let embed = embed_rows(catalog, &tokens, cfg.hidden)?;
     let row = cfg.hidden * 2;
     let prefill = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
     let started = Instant::now();
@@ -651,7 +636,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
         Ok(())
     };
     let mut worst = Vec::new();
-    let logits = engine.prefill(&mut placement, &embed[..prefill * row], transport.as_deref_mut().map(|t| (t, runtime)),
+    let logits = engine.prefill(&mut placement, &tokens[..prefill], transport.as_deref_mut().map(|t| (t, runtime)),
         Some(&mut |layer, stream| compare(layer, 0, stream, &mut worst)))?;
     let prefill_seconds = started.elapsed().as_secs_f64();
     let started = Instant::now();
@@ -664,7 +649,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
         let mut layer_compare = |layer: usize, stream: &[u8]| compare(layer, first, stream, &mut decode_worst);
         let on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>> =
             if args.no_layer_compare { None } else { Some(&mut layer_compare) };
-        if let Some(logits) = engine.verify(&mut [(&mut placement, n)], &embed[position * row..(position + n) * row],
+        if let Some(logits) = engine.verify(&mut [(&mut placement, n)], &tokens[position..position + n],
             transport.as_deref_mut().map(|t| (t, runtime)), on_layer)? {
             decode_logits.extend(logits);
         }
@@ -716,7 +701,6 @@ fn argmax(logits: &[f32]) -> u32 {
 fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, mut transport: Option<&mut SparkLink<'_>>,
     runtime: &tokio::runtime::Runtime) -> Result<()> {
     let drafter = engine.drafter.as_ref().context("--draft")?;
-    let (catalog, hidden) = (&opened.catalog, opened.cfg.hidden);
     let mut sequence: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
     let prefill = args.prefill.unwrap_or(sequence.len() / 2).min(sequence.len() - 1);
@@ -729,7 +713,7 @@ fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
     };
     let mut placement = engine::PageAllocator::new(engine.pages).admit(end + 1)?;
     let started = Instant::now();
-    let logits = engine.prefill(&mut placement, &embed_rows(catalog, &sequence[..prefill], hidden)?,
+    let logits = engine.prefill(&mut placement, &sequence[..prefill],
         transport.as_deref_mut().map(|t| (t, runtime)), None)?.context("drafting needs every target layer")?;
     let n = prefill.min(dflash::TAP_ROWS);
     drafter.update(&(0..n).map(|r| dflash::ContextRow { tap_row: r, slot: 0, position: prefill - n + r })
@@ -742,13 +726,12 @@ fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
     let started = Instant::now();
     for position in prefill..end {
         let anchor = sequence[position];
-        let anchor_row = embed_rows(catalog, &[anchor], hidden)?;
         let timer = Instant::now();
-        let draft = drafter.draft(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }], &anchor_row,
-            engine.weights.head.buffer.ptr)?;
+        let draft = drafter.draft_device(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
+            &engine.embedding, engine.weights.head.buffer.ptr)?;
         draft_seconds += timer.elapsed().as_secs_f64();
         drafts.push((position, draft.into_iter().next().context("draft")?));
-        let logits = engine.verify(&mut [(&mut placement, 1)], &anchor_row, transport.as_deref_mut().map(|t| (t, runtime)),
+        let logits = engine.verify(&mut [(&mut placement, 1)], &[anchor], transport.as_deref_mut().map(|t| (t, runtime)),
             None)?.context("decode needs every layer")?;
         drafter.update(&[dflash::ContextRow { tap_row: 0, slot: 0, position }])?;
         if args.generate.is_some() {
@@ -820,8 +803,8 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
         }
         let anchor = tokens[position];
         let timer = Instant::now();
-        let draft = drafter.draft(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
-            &embed_rows(&opened.catalog, &[anchor], hidden)?, engine.weights.head.buffer.ptr)?.remove(0);
+        let draft = drafter.draft_device(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
+            &engine.embedding, engine.weights.head.buffer.ptr)?.remove(0);
         draft_seconds += timer.elapsed().as_secs_f64();
         let reference = &ref_tokens[index * drafts_per..][..drafts_per];
         exact += usize::from(draft.tokens == reference);
@@ -847,7 +830,7 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
 /// Several copies of the golden sequence verified in the same decode steps.
 fn multi_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, copies: usize,
     mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime) -> Result<()> {
-    let (catalog, hidden, vocab) = (&opened.catalog, opened.cfg.hidden, opened.cfg.vocab_size);
+    let vocab = opened.cfg.vocab_size;
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
     let golden: Vec<f32> = std::fs::read(args.golden.join("logits.bin"))?
@@ -858,7 +841,7 @@ fn multi_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
     for copy in 0..copies {
         let mut placement = pages.admit(tokens.len())?;
         let n = prefill - 37 * copy;
-        engine.prefill(&mut placement, &embed_rows(catalog, &tokens[..n], hidden)?,
+        engine.prefill(&mut placement, &tokens[..n],
             transport.as_deref_mut().map(|t| (t, runtime)), None)?;
         placements.push(placement);
     }
@@ -874,7 +857,7 @@ fn multi_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
         }
         let starts: Vec<usize> = placements.iter().map(|p| p.len).collect();
         let mut step: Vec<(&mut engine::GlmPlacement, usize)> = placements.iter_mut().zip(&counts).map(|(p, &n)| (p, n)).collect();
-        let logits = engine.verify(&mut step, &embed_rows(catalog, &rows, hidden)?,
+        let logits = engine.verify(&mut step, &rows,
             transport.as_deref_mut().map(|t| (t, runtime)), None)?.context("decode needs every layer")?;
         let mut offset = 0;
         for (copy, (&start, &n)) in starts.iter().zip(&counts).enumerate() {
@@ -890,4 +873,30 @@ fn multi_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
     println!("multi: {copies} copies, {} rows each per step: top-1 agreement per copy {:?}", args.step_rows,
         agree.iter().zip(&total).map(|(a, t)| format!("{:.1}% of {t}", 100.0 * *a as f64 / *t as f64)).collect::<Vec<_>>());
     Ok(())
+}
+
+/// `--token-check N`: prefill the golden prompt (--prefill tokens of it), then
+/// [`crate::shared::token_io::gate`] over N greedy decode steps.
+fn token_check(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
+    mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, steps: usize) -> Result<()> {
+    ensure!(transport.is_some() || engine.skip_routed(), "--token-check needs Spark peers or --skip-routed-experts");
+    let mut tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
+        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    if let Some(p) = args.prefill {
+        tokens.truncate(p);
+    }
+    let mut allocator = engine::PageAllocator::new(engine.pages);
+    let mut placement = allocator.admit(tokens.len() + steps + 1)?;
+    let mut last = None;
+    for chunk in tokens.chunks(engine.prefill_capacity()) {
+        last = engine.prefill_device(&mut placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)))?;
+    }
+    let last = last.context("--token-check needs every layer")?.row_host(&opened.library, 0)?;
+    let first = cuteafd_core::TargetSamplingParams::greedy().select_token(&last, None, 0)? as u32;
+    let result = crate::shared::token_io::gate(&opened.library, &engine.embedding, first, steps, |token| {
+        engine.verify_device(&mut [(&mut placement, 1)], &[token], transport.as_deref_mut().map(|t| (t, runtime)))?
+            .context("decode needs every layer")
+    });
+    allocator.release(placement);
+    result
 }

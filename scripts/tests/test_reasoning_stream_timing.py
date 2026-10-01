@@ -81,7 +81,7 @@ def test_concurrent_failure_retains_reasoning_and_other_responses(tmp_path, monk
     monkeypatch.setattr(runpy, 'run_path', modules)
     output = tmp_path / 'failure.json'
     monkeypatch.setattr(sys, 'argv', [str(runner), '--case', 'code-reasoning', '--concurrency','2',
-                                    '--repeats','1','--output',str(output)])
+                                    '--repeats','1','--warm-batches','0','--output',str(output)])
     with pytest.raises(SystemExit, match='all responses retained'):
         original(str(runner), run_name='__main__')
     report = json.loads(output.read_text())

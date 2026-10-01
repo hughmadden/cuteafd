@@ -139,14 +139,14 @@ type Experts<'t, 'l> = Option<(&'t mut crate::shared::spark_intake::SparkLink<'l
 
 /// Prefill `embed` into `placement` in chunks of `chunk` rows, digesting each layer's rows and
 /// (with `logits`) every row's logits.
-fn prefill_digest(engine: &GlmEngine<'_>, placement: &mut GlmPlacement, embed: &[u8], chunk: usize, logits: bool,
+fn prefill_digest(engine: &GlmEngine<'_>, placement: &mut GlmPlacement, tokens: &[u32], chunk: usize, logits: bool,
     experts: &mut Experts<'_, '_>) -> Result<SuffixRun> {
     use std::hash::{Hash, Hasher};
-    let (row, vocab) = (engine.cfg.hidden * 2, engine.cfg.vocab_size);
+    let vocab = engine.cfg.vocab_size;
     let mut hashers: Vec<std::collections::hash_map::DefaultHasher> = Vec::new();
     let mut logit_hash = std::collections::hash_map::DefaultHasher::new();
     let (mut argmax, mut last) = (Vec::new(), Vec::new());
-    for part in embed.chunks(chunk * row) {
+    for part in tokens.chunks(chunk) {
         let mut on_layer = |layer: usize, rows: &[u8]| -> Result<()> {
             if hashers.len() <= layer {
                 hashers.resize_with(layer + 1, Default::default);
@@ -156,7 +156,7 @@ fn prefill_digest(engine: &GlmEngine<'_>, placement: &mut GlmPlacement, embed: &
         };
         let transport = experts.as_mut().map(|(t, r)| (&mut **t, *r));
         let out = engine.prefill_rows_logits(placement, part, transport, Some(&mut on_layer),
-            if logits { part.len() / row } else { 1 })?
+            if logits { part.len() } else { 1 })?
             .ok_or_else(|| anyhow::anyhow!("the resume check needs every layer"))?;
         if logits {
             for values in out.chunks_exact(vocab) {
@@ -207,7 +207,7 @@ fn paged_rows(family: &GlmPrefix<'_, '_>, placement: &GlmPlacement, len: usize) 
 /// what the kernels themselves vary. The check runs `repeat` times on fresh sequences (every
 /// attempt must be identical: the DSA top-k is deterministic, ties going to the lower index).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn resume_check(engine: &GlmEngine<'_>, embed_rows: &dyn Fn(&[u32]) -> Result<Vec<u8>>, tokens: &[u32],
+pub(crate) fn resume_check(engine: &GlmEngine<'_>, tokens: &[u32],
     at: usize, n: usize, chunk: usize, decode: usize, cold: bool, repeat: usize, mut experts: Experts<'_, '_>)
     -> Result<()> {
     use super::engine::PageAllocator;
@@ -217,8 +217,7 @@ pub(crate) fn resume_check(engine: &GlmEngine<'_>, embed_rows: &dyn Fn(&[u32]) -
     ensure!(experts.is_some() || engine.skip_routed(), "--resume-at needs Spark peers or --skip-routed-experts");
     ensure!(at > 0 && at < n && n <= tokens.len(), "--resume-at {at} must lie inside the {n} prefilled tokens");
     let chunk = chunk.clamp(1, engine.prefill_rows);
-    let row = engine.cfg.hidden * 2;
-    let embed = embed_rows(&tokens[..n])?;
+    let embed = &tokens[..n];
     let family = GlmPrefix::new(engine, false)?;
     let mut allocator = PageAllocator::new(engine.pages);
     let err = |e: BoxError| anyhow::anyhow!("{e}");
@@ -226,13 +225,13 @@ pub(crate) fn resume_check(engine: &GlmEngine<'_>, embed_rows: &dyn Fn(&[u32]) -
     for _ in 0..repeat.max(1) {
     // A: prefill [0, P), capture (pages only), continue in place.
     let mut a = allocator.admit(n + decode)?;
-    prefill_digest(engine, &mut a, &embed[..at * row], chunk, false, &mut experts)?;
+    prefill_digest(engine, &mut a, &embed[..at], chunk, false, &mut experts)?;
     family.drain().map_err(err)?;
     let started = std::time::Instant::now();
     // B: a second sequence restored from the snapshot (shared full pages, its own tail page).
     let mut b = if cold {
         let mut b = allocator.admit(n + decode)?;
-        prefill_digest(engine, &mut b, &embed[..at * row], chunk, false, &mut experts)?;
+        prefill_digest(engine, &mut b, &embed[..at], chunk, false, &mut experts)?;
         b
     } else {
         let (mut b, copy) = allocator.fork(&a, at, n + decode)?;
@@ -246,8 +245,8 @@ pub(crate) fn resume_check(engine: &GlmEngine<'_>, embed_rows: &dyn Fn(&[u32]) -
     let restore_ms = started.elapsed().as_secs_f64() * 1e3;
     // The state at P (every paged row): what a restore must reproduce.
     let state_at = paged_rows(&family, &a, at)? == paged_rows(&family, &b, at)?;
-    let straight = prefill_digest(engine, &mut a, &embed[at * row..], chunk, true, &mut experts)?;
-    let restored = prefill_digest(engine, &mut b, &embed[at * row..], chunk, true, &mut experts)?;
+    let straight = prefill_digest(engine, &mut a, &embed[at..], chunk, true, &mut experts)?;
+    let restored = prefill_digest(engine, &mut b, &embed[at..], chunk, true, &mut experts)?;
     let first_layer = straight.layers.iter().zip(&restored.layers).position(|(x, y)| x != y);
     let logits_equal = straight.logits == restored.logits;
     let max_diff = straight.last.iter().zip(&restored.last).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
@@ -256,9 +255,9 @@ pub(crate) fn resume_check(engine: &GlmEngine<'_>, embed_rows: &dyn Fn(&[u32]) -
     let mut decode_equal = next_a == next_b;
     for _ in 0..decode {
         let transport = experts.as_mut().map(|(t, r)| (&mut **t, *r));
-        let la = engine.verify(&mut [(&mut a, 1)], &embed_rows(&[next_a])?, transport, None)?.context("decode logits")?;
+        let la = engine.verify(&mut [(&mut a, 1)], &[next_a], transport, None)?.context("decode logits")?;
         let transport = experts.as_mut().map(|(t, r)| (&mut **t, *r));
-        let lb = engine.verify(&mut [(&mut b, 1)], &embed_rows(&[next_b])?, transport, None)?.context("decode logits")?;
+        let lb = engine.verify(&mut [(&mut b, 1)], &[next_b], transport, None)?.context("decode logits")?;
         decode_equal &= la.iter().zip(&lb).all(|(x, y)| x.to_bits() == y.to_bits());
         (next_a, next_b) = (argmax(&la), argmax(&lb));
     }
@@ -280,7 +279,7 @@ pub(crate) fn resume_check(engine: &GlmEngine<'_>, embed_rows: &dyn Fn(&[u32]) -
     let repeat = repeat.max(1);
     // C: one prefill with no boundary at P (chunking changes may round differently; informational).
     let mut c = allocator.admit(n)?;
-    let whole = prefill_digest(engine, &mut c, &embed, chunk, true, &mut experts)?;
+    let whole = prefill_digest(engine, &mut c, embed, chunk, true, &mut experts)?;
     let x = &whole.argmax[at..];
     let agree = x.iter().zip(&restored.argmax).filter(|(p, q)| p == q).count();
     let last_equal = whole.last.iter().zip(&restored.last).all(|(p, q)| p.to_bits() == q.to_bits());

@@ -10,4 +10,5 @@ pub(crate) mod v41_exl3;
 pub(crate) mod v41_exl3_wire;
 pub(crate) mod v41_experts;
 pub(crate) mod v41_router;
+pub(crate) mod token_io;
 pub(crate) mod vocab_head;

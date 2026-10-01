@@ -13,7 +13,8 @@
 use super::engine::{Allocator, Qwen4Engine, Qwen4Placement, DECODE_ROWS};
 use super::mtp_policy;
 use super::speculate::{self, DraftSeq, DraftTiming, MtpSeq, Verified};
-use super::{embed_rows, open, Opened};
+use super::{open, Opened};
+use crate::shared::token_io::{SelectBatch, SelectPlacement, TokenSelector};
 use crate::shared::draft_policy::{Calibration, DraftHistory, Shape};
 use crate::shared::prefill_share::{add_phases, isolated_phases, Chunk, DecodeShareArgs};
 use anyhow::{Context, Result};
@@ -127,7 +128,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
             let _ = ready.send(Ok(()));
         }
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), draft, eos,
-            decode_share)
+            decode_share, args.token_io.token_select)
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
@@ -165,21 +166,17 @@ struct Active<'a> {
     id: u64,
 }
 
-impl Active<'_> {
-    fn select(&mut self, logits: &[f32]) -> Result<u32> {
-        let position = self.placement.len as u64;
-        let mask = match self.constraint.as_mut() {
-            Some(state) => state.mask()?,
-            None => None,
-        };
-        let token = self.job.sampling.select_token(logits, mask, position)
-            .map_err(|e| anyhow::anyhow!("sampling: {e:?}"))? as u32;
-        if let Some(state) = self.constraint.as_mut() {
-            state.accept(token)?;
-        }
-        Ok(token)
+/// Commits a selected token to the request's grammar.
+fn take(constraint: Option<&mut crate::shared::constraints::State<'_>>, selected: &crate::shared::token_io::RowResult)
+    -> Result<u32> {
+    let token = selected.as_ref().map_err(|e| anyhow::anyhow!("sampling: {e:?}"))?.token;
+    if let Some(state) = constraint {
+        state.accept(token)?;
     }
+    Ok(token)
+}
 
+impl Active<'_> {
     fn send(&self, chunk: InferenceChunk) -> Result<()> {
         self.job.events.send(Ok(chunk)).map_err(|_| anyhow::anyhow!("client went away"))
     }
@@ -246,8 +243,8 @@ struct Prefill<'a> {
     placement: Qwen4Placement,
     capacity: usize,
     seq: MtpSeq,
-    /// The last chunk's logits.
-    logits: Option<Vec<f32>>,
+    /// The first generated token, selected after the last chunk.
+    first: Option<u32>,
     started: Instant,
     /// Seconds in this prompt's chunks, and their engine phases.
     busy: f64,
@@ -277,7 +274,7 @@ impl Trace {
 #[allow(clippy::too_many_arguments)]
 fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
-    drafts: Drafts, eos: Vec<u32>, decode_share: DecodeShareArgs) -> Result<()> {
+    drafts: Drafts, eos: Vec<u32>, decode_share: DecodeShareArgs, select: SelectPlacement) -> Result<()> {
     let mut allocator = Allocator::new(engine.pages, engine.slots, &engine.cfg);
     let mut grammars = crate::shared::constraints::Compiler::with_vocab(
         &opened.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, eos);
@@ -287,8 +284,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
     // Verify steps since the last completed request, host seconds in verifies and in MTP draft steps.
     let (mut steps, mut verify_s) = (0u64, 0f64);
     let mut timing = DraftTiming::default();
-    let (hidden, vocab) = (engine.cfg.hidden, engine.cfg.vocab_size);
-    let embed = |tokens: &[u32]| embed_rows(&opened.checkpoint, tokens, hidden);
+    let mut selector = TokenSelector::new(&opened.library, select, engine.cfg.vocab_size, DECODE_ROWS)?;
     let mtp = matches!(drafts, Drafts::Mtp { .. });
     let mut cost = mtp_policy::cycle_cost(DECODE_ROWS);
     let mut calibration = Calibration::default();
@@ -337,7 +333,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: 0 },
             }));
             prefills.push(Prefill { job, constraint, tokens, done: 0, placement, capacity, seq: MtpSeq::default(),
-                logits: None, started: Instant::now(), busy: 0.0, phases: [0.0; 2], id: admissions });
+                first: None, started: Instant::now(), busy: 0.0, phases: [0.0; 2], id: admissions });
         }
         if prefills.due(!active.is_empty()) {
             // One chunk of each waiting prompt (whole prompts with --decode-share 0).
@@ -347,9 +343,18 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 let chunk = &p.tokens[p.done..(p.done + engine.prefill_rows).min(p.tokens.len())];
                 let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
                     let start = p.placement.len;
-                    p.logits = engine.prefill(&mut p.placement, chunk, &embed(chunk)?)?;
+                    let last = p.done + chunk.len() == p.tokens.len();
+                    let logits = engine.prefill_device(&mut p.placement, chunk, None, None, 1)?;
+                    if last {
+                        // The first token, while this prompt's logits are the workspace's.
+                        let logits = logits.context("prefill produced no logits")?;
+                        let mut batch = SelectBatch::default();
+                        batch.push_next(p.job.sampling, p.constraint.as_mut(), p.placement.len as u64)?;
+                        let selected = selector.select(&logits, &batch)?;
+                        p.first = Some(take(p.constraint.as_mut(), &selected[0])?);
+                    }
                     if mtp {
-                        speculate::prefill_chunk(engine, &embed, &p.placement, start, chunk,
+                        speculate::prefill_chunk(engine, &p.placement, start, chunk,
                             p.tokens.get(p.done + chunk.len()).copied(), &mut p.seq)?;
                     }
                     Ok(())
@@ -376,7 +381,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                         outcomes: DraftHistory::default(), idle: 0, proposed: 0, accepted: 0, cycles: 0,
                         capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(), id: p.id,
                     };
-                    request.next = request.select(&p.logits.context("prefill produced no logits")?)?;
+                    request.next = p.first.context("prefill produced no first token")?;
                     request.mtp.close(request.next);
                     Ok(request)
                 });
@@ -439,7 +444,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                     let timer = Instant::now();
                     let mut seqs: Vec<DraftSeq<'_>> = active.iter_mut().zip(&depths).map(|(a, &depth)| DraftSeq {
                         placement: &a.placement, seq: &mut a.mtp, depth }).collect();
-                    let proposals = speculate::draft(engine, &embed, &mut seqs, &mut timing)?;
+                    let proposals = speculate::draft(engine, &mut seqs, &mut timing)?;
                     if depths.iter().any(|&d| d > 0) {
                         cost.observe_chain(timing.steps - steps, 1e3 * timer.elapsed().as_secs_f64());
                     }
@@ -449,8 +454,14 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 }
             }
         };
-        let sequences: Vec<Vec<u32>> = active.iter().zip(&proposals)
-            .map(|(a, drafted)| std::iter::once(a.next).chain(drafted.iter().copied()).collect()).collect();
+        let sequences: Vec<Vec<u32>> = active.iter().zip(&proposals).map(|(a, drafted)| {
+            let mut rows: Vec<u32> = std::iter::once(a.next).chain(drafted.iter().copied()).collect();
+            // Drafts the grammar rejects could never be kept: verify none of them.
+            if let Some(state) = a.constraint.as_ref() {
+                state.truncate_proposal(&mut rows)?;
+            }
+            Ok(rows)
+        }).collect::<Result<_>>()?;
         let spec = sequences.iter().any(|rows| rows.len() > 1);
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
         let histories: Vec<_> = active.iter().map(|a| a.placement.history.clone()).collect();
@@ -459,18 +470,22 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             .map(|(a, s)| (&mut a.placement, s.as_slice())).collect();
         steps += 1;
         let timer = Instant::now();
-        let step = embed(&tokens).and_then(|embedded| if spec {
-            engine.verify_spec(&mut rows, &embedded, None)
-        } else {
-            engine.verify(&mut rows, &embedded, None)
-        }).and_then(|logits| logits.context("decode needs every layer"));
+        let step = engine.verify_device(&mut rows, spec).and_then(|logits| logits.context("decode needs every layer"))
+            .and_then(|logits| {
+                // Each row draws at the position after it, masked along its sequence's drafts.
+                let mut batch = SelectBatch::default();
+                for ((a, rows), &start) in active.iter().zip(&sequences).zip(&starts) {
+                    batch.push_sequence(a.job.sampling, a.constraint.as_ref(), rows, start as u64 + 1)?;
+                }
+                selector.select(&logits, &batch)
+            });
         let elapsed = timer.elapsed().as_secs_f64();
         verify_s += elapsed;
         let shape = Shape::plain(tokens.len(), sequences.len());
         let predicted_ms = cost.verify_ms(shape);
         cost.observe_verify(shape, 1e3 * elapsed);
-        let logits = match step {
-            Ok(logits) => logits,
+        let selected = match step {
+            Ok(selected) => selected,
             Err(error) => {
                 tracing::warn!("decode step failed: {error:#}");
                 for request in active.drain(..) {
@@ -489,7 +504,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             for j in 0..rows.len() {
                 // Rows 0..=j are committed; the token row j produces is next.
                 request.placement.len = start + j + 1;
-                match request.select(&logits[(offset + j) * vocab..][..vocab]).and_then(|t| Ok((t, request.emit(t)?))) {
+                match take(request.constraint.as_mut(), &selected[offset + j]).and_then(|t| Ok((t, request.emit(t)?))) {
                     Ok((token, done)) => {
                         last = Some((j + 1, token));
                         finished = done;

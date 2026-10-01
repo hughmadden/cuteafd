@@ -199,16 +199,16 @@ pub(crate) struct SuffixRun {
     pub last: Vec<f32>,
 }
 
-/// Prefill `embed` into `placement` in chunks of `chunk` rows, digesting each layer's streams
+/// Prefill `tokens` into `placement` in chunks of `chunk` rows, digesting each layer's streams
 /// and (with `logits`) every row's logits.
-pub(crate) fn prefill_digest(engine: &GlmfEngine<'_>, placement: &mut GlmfPlacement, embed: &[u8], chunk: usize,
+pub(crate) fn prefill_digest(engine: &GlmfEngine<'_>, placement: &mut GlmfPlacement, tokens: &[u32], chunk: usize,
     logits: bool) -> Result<SuffixRun> {
     use std::hash::{Hash, Hasher};
-    let (row, vocab) = (engine.cfg.hidden * 2, engine.cfg.vocab_size);
+    let vocab = engine.cfg.vocab_size;
     let mut hashers: Vec<std::collections::hash_map::DefaultHasher> = Vec::new();
     let mut logit_hash = std::collections::hash_map::DefaultHasher::new();
     let (mut argmax, mut last) = (Vec::new(), Vec::new());
-    for part in embed.chunks(chunk * row) {
+    for part in tokens.chunks(chunk) {
         let mut on_layer = |layer: usize, rows: &[u8]| -> Result<()> {
             if hashers.len() <= layer {
                 hashers.resize_with(layer + 1, Default::default);
@@ -266,15 +266,13 @@ fn paged_rows(family: &GlmfPrefix<'_, '_>, placement: &GlmfPlacement, len: usize
 /// what the kernels themselves vary. The check runs `repeat` times on fresh sequences (every
 /// attempt must be identical: the DSA top-k is deterministic, ties going to the lower index).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn resume_check(engine: &GlmfEngine<'_>, embed_rows: &dyn Fn(&[u32]) -> Result<Vec<u8>>, tokens: &[u32],
-    at: usize, n: usize, chunk: usize, decode: usize, cold: bool, repeat: usize) -> Result<()> {
+pub(crate) fn resume_check(engine: &GlmfEngine<'_>, tokens: &[u32], at: usize, n: usize, chunk: usize, decode: usize, cold: bool, repeat: usize) -> Result<()> {
     use super::engine::Allocator;
     ensure!(engine.weights.layers.len() == engine.cfg.layers, "--resume-at needs every layer");
     ensure!(engine.full_prefill_logits, "--resume-at needs every prefill row's logits");
     ensure!(at > 0 && at < n && n <= tokens.len(), "--resume-at {at} must lie inside the {n} prefilled tokens");
     let chunk = chunk.clamp(1, engine.prefill_rows);
-    let row = engine.cfg.hidden * 2;
-    let embed = embed_rows(&tokens[..n])?;
+    let embed = &tokens[..n];
     let family = GlmfPrefix::new(engine, |_| 2)?;
     let mut allocator = Allocator::new(engine.pages, engine.slots);
     let err = |e: BoxError| anyhow::anyhow!("{e}");
@@ -282,7 +280,7 @@ pub(crate) fn resume_check(engine: &GlmfEngine<'_>, embed_rows: &dyn Fn(&[u32]) 
     for _ in 0..repeat.max(1) {
     // A: prefill [0, P), capture, continue in place.
     let mut a = allocator.admit(n + decode)?;
-    prefill_digest(engine, &mut a, &embed[..at * row], chunk, false)?;
+    prefill_digest(engine, &mut a, &embed[..at], chunk, false)?;
     family.drain().map_err(err)?;
     let started = std::time::Instant::now();
     family.capture(MarkSlot(0), &a, at).map_err(err)?;
@@ -290,7 +288,7 @@ pub(crate) fn resume_check(engine: &GlmfEngine<'_>, embed_rows: &dyn Fn(&[u32]) 
     let mut b = if cold {
         // The floor: B prefilled cold on its own units (what placement alone changes).
         let mut b = allocator.admit(n + decode)?;
-        prefill_digest(engine, &mut b, &embed[..at * row], chunk, false)?;
+        prefill_digest(engine, &mut b, &embed[..at], chunk, false)?;
         family.capture(MarkSlot(1), &b, at).map_err(err)?;
         family.restore(Some(MarkSlot(1)), &mut b, at).map_err(err)?;
         b
@@ -315,8 +313,8 @@ pub(crate) fn resume_check(engine: &GlmfEngine<'_>, embed_rows: &dyn Fn(&[u32]) 
     // The state at P (every paged row and the KDA state): what a restore must reproduce.
     let state_at = paged_rows(&family, &a, at)? == paged_rows(&family, &b, at)?
         && engine.slot_state(a.slot)? == engine.slot_state(b.slot)?;
-    let straight = prefill_digest(engine, &mut a, &embed[at * row..], chunk, true)?;
-    let restored = prefill_digest(engine, &mut b, &embed[at * row..], chunk, true)?;
+    let straight = prefill_digest(engine, &mut a, &embed[at..], chunk, true)?;
+    let restored = prefill_digest(engine, &mut b, &embed[at..], chunk, true)?;
     let first_layer = straight.layers.iter().zip(&restored.layers).position(|(x, y)| x != y);
     let logits_equal = straight.logits == restored.logits;
     let max_diff = straight.last.iter().zip(&restored.last).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
@@ -325,8 +323,8 @@ pub(crate) fn resume_check(engine: &GlmfEngine<'_>, embed_rows: &dyn Fn(&[u32]) 
     let (mut next_a, mut next_b) = (argmax(&straight.last), argmax(&restored.last));
     let mut decode_equal = next_a == next_b;
     for _ in 0..decode {
-        let la = engine.verify(&mut [(&mut a, 1)], &embed_rows(&[next_a])?, None)?.context("decode logits")?;
-        let lb = engine.verify(&mut [(&mut b, 1)], &embed_rows(&[next_b])?, None)?.context("decode logits")?;
+        let la = engine.verify(&mut [(&mut a, 1)], &[next_a], None)?.context("decode logits")?;
+        let lb = engine.verify(&mut [(&mut b, 1)], &[next_b], None)?.context("decode logits")?;
         decode_equal &= la.iter().zip(&lb).all(|(x, y)| x.to_bits() == y.to_bits());
         (next_a, next_b) = (argmax(&la), argmax(&lb));
     }
@@ -351,7 +349,7 @@ pub(crate) fn resume_check(engine: &GlmfEngine<'_>, embed_rows: &dyn Fn(&[u32]) 
     let repeat = repeat.max(1);
     // C: one prefill with no boundary at P (chunking changes may round differently; informational).
     let mut c = allocator.admit(n)?;
-    let whole = prefill_digest(engine, &mut c, &embed, chunk, true)?;
+    let whole = prefill_digest(engine, &mut c, embed, chunk, true)?;
     let x = &whole.argmax[at..];
     let agree = x.iter().zip(&restored.argmax).filter(|(p, q)| p == q).count();
     let last_equal = whole.last.iter().zip(&restored.last).all(|(p, q)| p.to_bits() == q.to_bits());

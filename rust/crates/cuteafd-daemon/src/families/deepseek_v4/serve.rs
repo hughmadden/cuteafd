@@ -1,7 +1,8 @@
 //! OpenAI-compatible serving for DeepSeek V4: one request at a time through
 //! the prefill/decode engine (the correctness baseline batching builds on).
 use super::pool::{Placement, PoolAllocator};
-use super::{embed_rows, with_engine, EngineArgs};
+use super::{with_engine, EngineArgs};
+use crate::shared::token_io::{RowResult, SelectBatch, TokenSelector};
 use crate::shared::prefill_share::{Chunk, DecodeShareArgs};
 use anyhow::{Context, Result};
 use cuteafd_api::openai::{
@@ -103,8 +104,10 @@ fn serve_loop(
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(()));
         }
+        let mut selector = TokenSelector::new(&loaded.library, args.token_io.token_select, engine.cfg.vocab_size,
+            engine.decode_rows)?;
         schedule(engine, &loaded, &tokenizer, eos, &mut receive, transports, runtime, &stats, speculate_max,
-            decode_share)
+            decode_share, &mut selector)
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
@@ -124,7 +127,8 @@ struct Prefill<'a> {
     chunks: usize,
     placement: Placement,
     capacity: usize,
-    logits: Vec<f32>,
+    /// The first generated token, selected after the last chunk.
+    first: Option<u32>,
     started: Instant,
     /// Seconds in this prompt's chunks.
     busy: f64,
@@ -145,21 +149,6 @@ struct Active<'a> {
 }
 
 impl Active<'_> {
-    /// Masked selection for the row that produces this sequence's next token.
-    fn select(&mut self, logits: &[f32]) -> Result<u32> {
-        let position = self.placement.len as u64;
-        let mask = match self.constraint.as_mut() {
-            Some(state) => state.mask()?,
-            None => None,
-        };
-        let token = self.job.sampling.select_token(logits, mask, position)
-            .map_err(|e| anyhow::anyhow!("sampling: {e:?}"))? as u32;
-        if let Some(state) = self.constraint.as_mut() {
-            state.accept(token)?;
-        }
-        Ok(token)
-    }
-
     fn send(&self, chunk: InferenceChunk) -> Result<()> {
         self.job.events.send(Ok(chunk)).map_err(|_| anyhow::anyhow!("client went away"))
     }
@@ -194,45 +183,67 @@ impl Active<'_> {
     }
 }
 
+/// Commits a selected token to the request's grammar.
+fn take(constraint: Option<&mut crate::shared::constraints::State<'_>>, selected: &RowResult) -> Result<u32> {
+    let token = selected.as_ref().map_err(|e| anyhow::anyhow!("sampling: {e:?}"))?.token;
+    if let Some(state) = constraint {
+        state.accept(token)?;
+    }
+    Ok(token)
+}
+
+/// Each row draws at the position after it, masked along its sequence's drafts.
+fn select_rows(selector: &mut TokenSelector<'_>, logits: &crate::shared::token_io::DeviceLogits, active: &[Active<'_>],
+    sequences: &[Vec<u32>], starts: &[usize]) -> Result<Vec<RowResult>> {
+    let mut batch = SelectBatch::default();
+    for ((a, rows), &start) in active.iter().zip(sequences).zip(starts) {
+        batch.push_sequence(a.job.sampling, a.constraint.as_ref(), rows, start as u64 + 1)?;
+    }
+    selector.select(logits, &batch)
+}
+
 /// Drafts after every active sequence's next token, verifies `[next, drafts]`
 /// in one step and accepts each sequence's longest matching prefix plus the
 /// verifier's own token after it. Returns which requests finished.
 #[allow(clippy::too_many_arguments)]
 fn speculative_step(
     engine: &super::engine::Engine<'_>,
-    loaded: &super::Loaded,
     active: &mut [Active<'_>],
     block: usize,
-    hidden: usize,
-    vocab: usize,
     eos: u32,
     transports: &mut [crate::shared::spark_intake::SparkLink<'_>],
     runtime: &tokio::runtime::Runtime,
+    selector: &mut TokenSelector<'_>,
 ) -> Result<Vec<bool>> {
     let noise = engine.cfg.dspark_noise_token_id as u32;
     let inputs: Vec<u32> = active.iter()
         .flat_map(|a| std::iter::once(a.next).chain(std::iter::repeat_n(noise, block - 1))).collect();
     let requests: Vec<super::engine::DraftRequest<'_>> = active.iter()
         .map(|a| super::engine::DraftRequest { placement: &a.placement, token: a.next }).collect();
-    let drafts = engine.draft(&requests, &embed_rows(&loaded.catalog, &inputs, hidden)?)?;
-    // Verify no more rows than the request may still produce or hold.
+    let drafts = engine.draft(&requests, &inputs)?;
+    // Verify no more rows than the request may still produce or hold, and no
+    // draft the grammar rejects (it could never be kept).
     let sequences: Vec<Vec<u32>> = active.iter().zip(&drafts).map(|(a, draft)| {
         let room = (a.job.max_tokens - a.generated).min(a.capacity - a.placement.len - 1);
-        std::iter::once(a.next).chain(draft.iter().copied().take(room.saturating_sub(1).min(block))).collect()
-    }).collect();
+        let mut rows: Vec<u32> =
+            std::iter::once(a.next).chain(draft.iter().copied().take(room.saturating_sub(1).min(block))).collect();
+        if let Some(state) = a.constraint.as_ref() {
+            state.truncate_proposal(&mut rows)?;
+        }
+        Ok(rows)
+    }).collect::<Result<_>>()?;
     let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
-    let tokens: Vec<u32> = sequences.iter().flatten().copied().collect();
-    let embed = embed_rows(&loaded.catalog, &tokens, hidden)?;
     let mut rows: Vec<(&mut Placement, &[u32])> = active.iter_mut().zip(&sequences)
         .map(|(a, tokens)| (&mut a.placement, tokens.as_slice())).collect();
-    let logits = engine.verify(&mut rows, &embed, transports, runtime)?;
+    let logits = engine.verify_device(&mut rows, transports, runtime)?;
+    let selected = select_rows(selector, &logits, active, &sequences, &starts)?;
     let mut offset = 0;
     Ok(active.iter_mut().zip(&sequences).zip(starts).map(|((request, rows), start)| {
         let mut finished = false;
         for (j, _) in rows.iter().enumerate() {
             // Rows 0..=j are committed; the token row j produces is next.
             request.placement.len = start + j + 1;
-            let result = request.select(&logits[(offset + j) * vocab..][..vocab])
+            let result = take(request.constraint.as_mut(), &selected[offset + j])
                 .and_then(|token| Ok((token, request.emit(token, eos)?)));
             match result {
                 Ok((token, done)) => {
@@ -266,14 +277,13 @@ fn schedule(
     stats: &Mutex<serde_json::Value>,
     speculate_max: usize,
     decode_share: DecodeShareArgs,
+    selector: &mut TokenSelector<'_>,
 ) -> Result<()> {
     let mut allocator = PoolAllocator::new(engine.shape);
     let mut grammars = crate::shared::constraints::Compiler::new(
         &loaded.library, loaded.snapshot.join("tokenizer.json"));
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
-    let hidden = engine.cfg.dim;
-    let vocab = engine.cfg.vocab_size;
     let chunk_limit = engine.prefill_capacity().min(engine.max_context);
     let mut prefills = decode_share.queue::<Prefill<'_>>()?;
     loop {
@@ -325,7 +335,7 @@ fn schedule(
             let chunks = tokens.len().div_ceil(chunk_limit);
             let limit = tokens.len().div_ceil(chunks);
             prefills.push(Prefill { job, constraint, tokens, limit, index: 0, chunks, placement, capacity,
-                logits: Vec::new(), started: Instant::now(), busy: 0.0 });
+                first: None, started: Instant::now(), busy: 0.0 });
         }
         if prefills.due(!active.is_empty()) {
             // One chunk of each waiting prompt (whole prompts with --decode-share 0).
@@ -334,9 +344,16 @@ fn schedule(
                 let timer = Instant::now();
                 let from = p.index * p.limit;
                 let chunk = &p.tokens[from..(from + p.limit).min(p.tokens.len())];
-                let rows = embed_rows(&loaded.catalog, chunk, hidden)?;
-                let logit_rows = usize::from(p.index + 1 == p.chunks);
-                p.logits = engine.prefill(&mut p.placement, chunk, &rows, transports, runtime, logit_rows, None)?;
+                let last = p.index + 1 == p.chunks;
+                let logits = engine.prefill_device(&mut p.placement, chunk, transports, runtime, usize::from(last))?;
+                if last {
+                    // The first token, while this prompt's logits are the workspace's.
+                    let logits = logits.context("prefill produced no logits")?;
+                    let mut batch = SelectBatch::default();
+                    batch.push_next(p.job.sampling, p.constraint.as_mut(), p.placement.len as u64)?;
+                    let selected = selector.select(&logits, &batch)?;
+                    p.first = Some(take(p.constraint.as_mut(), &selected[0])?);
+                }
                 p.index += 1;
                 p.busy += timer.elapsed().as_secs_f64();
                 Ok(if p.index == p.chunks { Chunk::Done } else { Chunk::More })
@@ -346,13 +363,12 @@ fn schedule(
                 let admitted = prefilled.and_then(|()| {
                     tracing::debug!(tokens = p.tokens.len(), elapsed_ms = p.started.elapsed().as_millis() as u64,
                         busy_ms = (1e3 * p.busy) as u64, "prefill");
-                    let last = (p.logits.len() / vocab).checked_sub(1).context("prefill produced no logits")?;
                     let mut request = Active {
                         decoder: cuteafd_loader::streaming_token_decoder(&loaded.snapshot, false)?,
                         job: p.job, constraint: p.constraint, placement: p.placement, capacity: p.capacity, next: 0,
                         generated: 0, buffered: 0, started: Instant::now(),
                     };
-                    request.next = request.select(&p.logits[last * vocab..])?;
+                    request.next = p.first.context("prefill produced no first token")?;
                     Ok(request)
                 });
                 match admitted {
@@ -381,17 +397,16 @@ fn schedule(
         let speculate = block > 0 && active.len() <= speculate_max
             && active.len() * (block + 1) <= engine.decode_rows;
         let step = if speculate {
-            speculative_step(engine, loaded, &mut active, block, hidden, vocab, eos, transports, runtime)
+            speculative_step(engine, &mut active, block, eos, transports, runtime, selector)
         } else {
-            let tokens: Vec<u32> = active.iter().map(|a| a.next).collect();
-            let embed = embed_rows(&loaded.catalog, &tokens, hidden)?;
+            let sequences: Vec<Vec<u32>> = active.iter().map(|a| vec![a.next]).collect();
+            let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
             let mut rows: Vec<(&mut Placement, u32)> = active.iter_mut().map(|a| (&mut a.placement, a.next)).collect();
-            engine.decode(&mut rows, &embed, &mut transports[0], runtime).map(|logits| {
-                active.iter_mut().enumerate().map(|(row, request)| {
-                    let logits_row = &logits[row * vocab..][..vocab];
-                    request.select(logits_row).and_then(|token| request.emit(token, eos)).unwrap_or(true)
-                }).collect::<Vec<bool>>()
-            })
+            engine.decode_device(&mut rows, transports.first_mut(), runtime)
+                .and_then(|logits| select_rows(selector, &logits, &active, &sequences, &starts))
+                .map(|selected| active.iter_mut().zip(&selected).map(|(request, selected)| {
+                    take(request.constraint.as_mut(), selected).and_then(|token| request.emit(token, eos)).unwrap_or(true)
+                }).collect::<Vec<bool>>())
         };
         let finished = match step {
             Ok(finished) => finished,

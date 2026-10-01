@@ -11,7 +11,6 @@ use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::families::deepseek_v4::DeepseekV4Config;
 use crate::shared::spark_intake::SparkLink;
 use cuteafd_transport::TcpTransportConfig;
-use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -22,7 +21,7 @@ pub(crate) struct EngineArgs {
     #[arg(long)]
     pub snapshot: PathBuf,
     /// Spark expert ranks in TP order, comma-separated HOST:PORT.
-    #[arg(long)]
+    #[arg(long, default_value = "")]
     pub peers: String,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
     pub native_lib: PathBuf,
@@ -50,6 +49,12 @@ pub(crate) struct EngineArgs {
     /// GiB kept free on the coordinator GPU for workspaces and headroom.
     #[arg(long, default_value_t = 10)]
     pub reserve_gib: usize,
+    /// Benchmarks and token gates only: MoE layers run the shared expert
+    /// alone (no Sparks, no local experts; outputs do not match the model).
+    #[arg(long, hide = true)]
+    pub skip_routed_experts: bool,
+    #[command(flatten)]
+    pub token_io: crate::shared::token_io::TokenIoArgs,
 }
 
 #[derive(Debug, clap::Args)]
@@ -76,6 +81,12 @@ pub(crate) struct GoldenArgs {
     /// Prefill in chunks of this many tokens (continuation compressor).
     #[arg(long)]
     pub chunk: Option<usize>,
+    /// Token I/O gate after the golden prompt (--prefill N truncates it),
+    /// then stop: the resident embedding table against the shard, device
+    /// against host greedy selection over this many decode steps, and device
+    /// against host sampling.
+    #[arg(long)]
+    pub token_check: Option<usize>,
 }
 
 fn f32s(bytes: &[u8]) -> Vec<f32> {
@@ -98,15 +109,10 @@ fn similarity(a: &[f32], b: &[f32]) -> (f64, f64) {
     (dot / (na.sqrt() * nb.sqrt()).max(f64::MIN_POSITIVE), diff.sqrt() / nb.sqrt().max(f64::MIN_POSITIVE))
 }
 
-pub(crate) fn embed_rows(catalog: &cuteafd_loader::OfficialV41Catalog, tokens: &[u32], hidden: usize) -> Result<Vec<u8>> {
+/// The checkpoint's `embed.weight` (BF16 [vocab, dim]).
+fn embed_source(catalog: &cuteafd_loader::OfficialV41Catalog, dim: usize) -> Result<crate::shared::token_io::EmbedSource> {
     let tensor = catalog.tensor("embed.weight")?;
-    let file = std::fs::File::open(catalog.snapshot().join(&tensor.shard))?;
-    let row = hidden * 2;
-    let mut out = vec![0u8; tokens.len() * row];
-    for (slot, token) in out.chunks_exact_mut(row).zip(tokens) {
-        file.read_exact_at(slot, tensor.metadata.byte_offset + u64::from(*token) * row as u64)?;
-    }
-    Ok(out)
+    crate::shared::token_io::EmbedSource::new(catalog.snapshot(), &tensor.shard, &tensor.metadata, dim)
 }
 
 pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
@@ -157,7 +163,8 @@ pub(crate) fn with_engine<T>(
     let loader = weights::WeightLoader {
         library: &loaded.library, catalog: &loaded.catalog, programs: &programs, family: loaded.family, stream,
     };
-    let model = loader.model(&loaded.cfg)?;
+    let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&loaded.library,
+        embed_source(&loaded.catalog, loaded.cfg.dim)?, args.token_io.embed_placement, || loader.model(&loaded.cfg))?;
     tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 coordinator weights resident");
     let max_context = caps["max_context"].as_u64().context("manifest max_context")? as usize;
     let shape = pool::PoolShape::new(
@@ -167,9 +174,15 @@ pub(crate) fn with_engine<T>(
         (args.pool_tokens / 4).div_ceil(64) + args.max_sequences,
         (args.pool_tokens / 128).div_ceil(2) + args.max_sequences,
     );
-    let peers = args.peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
-    ensure!(matches!(peers.len(), 2 | 3 | 4 | 6), "DeepSeek V4 serves 2, 3, 4 or 6 Spark ranks, got {}", peers.len());
-    loaded.library.v41_compact_reducer()?.require_rank_count(peers.len() as u32)?;
+    let skip = args.skip_routed_experts;
+    let peers = args.peers.split(',').filter(|p| !p.is_empty()).map(str::parse)
+        .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
+    if skip {
+        tracing::warn!("--skip-routed-experts: MoE layers run the shared expert alone (outputs do not match the model)");
+    } else {
+        ensure!(matches!(peers.len(), 2 | 3 | 4 | 6), "DeepSeek V4 serves 2, 3, 4 or 6 Spark ranks, got {}", peers.len());
+        loaded.library.v41_compact_reducer()?.require_rank_count(peers.len() as u32)?;
+    }
     let engine = engine::Engine::new(engine::EngineParts {
         library: &loaded.library,
         programs: &programs,
@@ -183,13 +196,15 @@ pub(crate) fn with_engine<T>(
         stream,
         sms: args.sms,
         shape,
+        embedding,
+        skip_routed: skip,
     })?;
     let (free, _) = loaded.library.cuda_memory_info()?;
     let budget = free.saturating_sub(args.reserve_gib << 30);
     let started = Instant::now();
     let stages = if args.dspark { engine.weights.dspark.as_ref().map_or(0, |d| d.stages.len()) } else { 0 };
-    let local = local::LocalExperts::load(&loaded.library, &args.native_lib, &loaded.catalog, stages,
-        args.local_expert_layers.unwrap_or(usize::MAX), engine.decode_rows.max(engine.prefill_rows), budget, stream)?;
+    let local = if skip { None } else { local::LocalExperts::load(&loaded.library, &args.native_lib, &loaded.catalog, stages,
+        args.local_expert_layers.unwrap_or(usize::MAX), engine.decode_rows.max(engine.prefill_rows), budget, stream)? };
     tracing::info!(layers = local.as_ref().map_or(0, |l| l.layers()), elapsed_ms = started.elapsed().as_millis() as u64,
         "DeepSeek V4 expert layers resident on the coordinator");
     *engine.local.borrow_mut() = local;
@@ -199,7 +214,8 @@ pub(crate) fn with_engine<T>(
         .collect::<Result<Vec<u64>>>()?;
     // One transport (connection set) per prefill lane, so each lane can keep
     // a Spark wave in flight; decode uses the first.
-    let mut transports = (0..engine::PREFILL_LANES).map(|_| SparkLink::new(&loaded.library, &peers, &executors, 4096,
+    let lanes = if skip { 0 } else { engine::PREFILL_LANES };
+    let mut transports = (0..lanes).map(|_| SparkLink::new(&loaded.library, &peers, &executors, 4096,
         TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
         loaded.cfg.dim * 2))
         .collect::<Result<Vec<_>>>()?;
@@ -219,12 +235,14 @@ pub(crate) fn with_engine<T>(
 fn golden(args: GoldenArgs) -> Result<()> {
     let loaded = load(&args.engine)?;
     let cfg = loaded.cfg.clone();
-    with_engine(&loaded, &args.engine, |engine, transports, runtime| golden_run(&args, &loaded.catalog, &cfg, engine, transports, runtime))
+    with_engine(&loaded, &args.engine, |engine, transports, runtime| match args.token_check {
+        Some(steps) => token_check(&args, &loaded, engine, transports, runtime, steps),
+        None => golden_run(&args, &cfg, engine, transports, runtime),
+    })
 }
 
 fn golden_run(
     args: &GoldenArgs,
-    catalog: &cuteafd_loader::OfficialV41Catalog,
     cfg: &DeepseekV4Config,
     engine: &engine::Engine<'_>,
     transports: &mut [SparkLink<'_>],
@@ -232,13 +250,11 @@ fn golden_run(
 ) -> Result<()> {
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
-    let embed = embed_rows(catalog, &tokens, cfg.dim)?;
     let started = Instant::now();
     let compare_layers = args.layers.unwrap_or(cfg.n_layers);
     let prefill = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
     let mut allocator = pool::PoolAllocator::new(engine.shape);
     let mut placement = allocator.admit(tokens.len())?;
-    let row = cfg.dim * 2;
     let chunk = args.chunk.unwrap_or(engine.prefill_rows).min(engine.prefill_rows);
     let mut logits = Vec::new();
     let mut offset = 0;
@@ -255,7 +271,7 @@ fn golden_run(
         };
         // Per-layer streams are compared only for a whole-prompt prefill.
         let whole = offset == 0 && end == tokens.len() && compare_layers > 0;
-        logits.extend(engine.prefill(&mut placement, &tokens[offset..end], &embed[offset * row..end * row], transports, runtime,
+        logits.extend(engine.prefill(&mut placement, &tokens[offset..end], transports, runtime,
             end - offset, if whole { Some(&mut compare) } else { None })?);
         offset = end;
     }
@@ -271,9 +287,8 @@ fn golden_run(
             let block = engine.draft_block();
             let mut inputs = vec![tokens[position]];
             inputs.resize(block, cfg.dspark_noise_token_id as u32);
-            let rows = embed_rows(catalog, &inputs, cfg.dim)?;
             let started = Instant::now();
-            let drafts = engine.draft(&[engine::DraftRequest { placement: &placement, token: tokens[position] }], &rows)?;
+            let drafts = engine.draft(&[engine::DraftRequest { placement: &placement, token: tokens[position] }], &inputs)?;
             draft_seconds += started.elapsed().as_secs_f64();
             let truth = &tokens[(position + 1).min(tokens.len())..(position + 1 + block).min(tokens.len())];
             let accepted = drafts[0].iter().zip(truth).take_while(|(d, t)| d == t).count();
@@ -282,11 +297,10 @@ fn golden_run(
             draft_steps += 1;
         }
         let end = (position + args.verify_rows.unwrap_or(1)).min(tokens.len());
-        let rows = &embed[position * row..end * row];
         logits.extend(if args.verify_rows.is_some() {
-            engine.verify(&mut [(&mut placement, &tokens[position..end])], rows, transports, runtime)?
+            engine.verify(&mut [(&mut placement, &tokens[position..end])], transports, runtime)?
         } else {
-            engine.decode(&mut [(&mut placement, tokens[position])], rows, &mut transports[0], runtime)?
+            engine.decode(&mut [(&mut placement, tokens[position])], transports.first_mut(), runtime)?
         });
         position = end;
     }
@@ -340,4 +354,29 @@ fn golden_run(
             100.0 * decode_agree as f64 / decode_steps as f64);
     }
     Ok(())
+}
+
+/// `--token-check N`: prefill the golden prompt, then [`crate::shared::token_io::gate`]
+/// over N greedy decode steps.
+fn token_check(args: &GoldenArgs, loaded: &Loaded, engine: &engine::Engine<'_>, transports: &mut [SparkLink<'_>],
+    runtime: &tokio::runtime::Runtime, steps: usize) -> Result<()> {
+    let mut tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
+        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    if let Some(p) = args.prefill {
+        tokens.truncate(p);
+    }
+    let mut allocator = pool::PoolAllocator::new(engine.shape);
+    let mut placement = allocator.admit(tokens.len() + steps + 1)?;
+    let chunks: Vec<&[u32]> = tokens.chunks(engine.prefill_capacity()).collect();
+    let mut last = None;
+    for (i, chunk) in chunks.iter().enumerate() {
+        last = engine.prefill_device(&mut placement, chunk, transports, runtime, usize::from(i + 1 == chunks.len()))?;
+    }
+    let last = last.context("prefill produced no logits")?.row_host(&loaded.library, 0)?;
+    let first = cuteafd_core::TargetSamplingParams::greedy().select_token(&last, None, 0)? as u32;
+    let result = crate::shared::token_io::gate(&loaded.library, &engine.embedding, first, steps, |token| {
+        engine.decode_device(&mut [(&mut placement, token)], transports.first_mut(), runtime)
+    });
+    allocator.release(placement);
+    result
 }

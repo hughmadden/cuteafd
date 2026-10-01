@@ -90,14 +90,14 @@ impl<'a> Engine<'a> {
     }
 
     /// Proposes `draft_block()` tokens after each request's next token.
-    /// `embed` holds the block's input rows per request: the token's
-    /// embedding, then the noise token's.
-    pub fn draft(&self, requests: &[DraftRequest<'_>], embed: &[u8]) -> Result<Vec<Vec<u32>>> {
+    /// `inputs` holds the block's input tokens per request: the token, then
+    /// the noise token (embedded on the device).
+    pub fn draft(&self, requests: &[DraftRequest<'_>], inputs: &[u32]) -> Result<Vec<Vec<u32>>> {
         let dspark = self.weights.dspark.as_ref().context("the checkpoint has no dSpark drafter")?;
         ensure!(self.draft_ready(), "dSpark stage experts are not resident on the coordinator");
         let (h, block) = (self.cfg.dim, self.cfg.dspark_block_size);
         let rows = requests.len() * block;
-        ensure!(!requests.is_empty() && rows <= self.decode_rows && embed.len() == rows * h * 2,
+        ensure!(!requests.is_empty() && rows <= self.decode_rows && inputs.len() == rows,
             "draft step of {} requests", requests.len());
         let slot = &self.decode_workspace;
         if slot.borrow().is_none() {
@@ -133,13 +133,8 @@ impl<'a> Engine<'a> {
         bytes(super::bytes_of(&lengths), &m.swa_lengths)?;
         let first: Vec<u32> = requests.iter().map(|r| r.token).collect();
         bytes(super::bytes_of(&first), &w.first_tokens)?;
-        let mut expanded = Vec::with_capacity(embed.len() * 4);
-        for row in embed.chunks_exact(h * 2) {
-            for _ in 0..4 {
-                expanded.extend_from_slice(row);
-            }
-        }
-        bytes(&expanded, &lane.stream_a)?;
+        // The mHC streams start as four copies of each input's embedding.
+        self.embedding.embed(inputs, w.draft_ids.buffer, 4, lane.stream_a.buffer, self.stream)?;
         let cap = self.decode_rows;
         let scalar = Scalar::I32(rows as i32);
         for (stage, weights) in dspark.stages.iter().enumerate() {

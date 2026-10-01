@@ -111,7 +111,7 @@ impl<'w, 'a> DistributedTargetHead<'w, 'a> {
     pub fn device_bytes(capacity: usize, split: usize) -> Result<[usize; 2]> {
         let mut bytes = DistributedVocabularyWave::device_bytes(capacity, split)?;
         bytes[1] += capacity * INPUT_STRIDES.iter().sum::<usize>()
-            + capacity * 129280 * 4 + TargetSamplingWave::device_bytes(capacity);
+            + capacity * 129280 * 4 + TargetSamplingWave::device_bytes(capacity, 129280);
         Ok(bytes)
     }
     pub fn new(devices: [Device<'a>; 2], weights: &'w TargetHeadWeights<'a>,
@@ -123,12 +123,12 @@ impl<'w, 'a> DistributedTargetHead<'w, 'a> {
             devices[1].own(|| crate::shared::memory::RowDownload::new(devices[1].library, capacity * vocabulary[1].tokens().len() * 4))?,
         ];
         let normalize = devices[1].own(|| Normalize::new(weights, capacity))?;
-        let sampler_bytes = capacity * 129280 * 4 + TargetSamplingWave::device_bytes(capacity);
+        let sampler_bytes = capacity * 129280 * 4 + TargetSamplingWave::device_bytes(capacity, 129280);
         let vocabulary = DistributedVocabularyWave::new(devices, vocabulary, capacity,
             [budgets[0], budgets[1] - capacity * INPUT_STRIDES.iter().sum::<usize>() - sampler_bytes])?;
         let sampler = HeadSampler {
             assembled: devices[1].own(|| DeviceAllocation::new(devices[1].library, capacity * 129280 * 4))?,
-            wave: devices[1].own(|| TargetSamplingWave::new(devices[1].library, capacity))?,
+            wave: devices[1].own(|| TargetSamplingWave::new(devices[1].library, capacity, 129280))?,
             stream: Stream::new(devices[1])?,
             download: devices[1].own(|| crate::shared::memory::RowDownload::new(devices[1].library, capacity * 129280 * 4))?,
         };

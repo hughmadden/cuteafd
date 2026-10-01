@@ -96,6 +96,8 @@ pub(crate) struct EngineArgs {
     /// load): half the head's bytes per draft step; verification stays exact.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub mtp_fp8_head: bool,
+    #[command(flatten)]
+    pub token_io: crate::shared::token_io::TokenIoArgs,
 }
 
 #[derive(Debug, clap::Args)]
@@ -136,6 +138,11 @@ pub(crate) struct GoldenArgs {
     /// golden target streams, then stop.
     #[arg(long)]
     pub mtp_oracle: Option<PathBuf>,
+    /// Token I/O gate after the golden prompt, then stop: the resident
+    /// embedding table against the shard, device against host greedy
+    /// selection over this many decode steps, and device against host sampling.
+    #[arg(long)]
+    pub token_check: Option<usize>,
     /// Greedy-decode this many tokens after the golden prompt (--prefill N
     /// truncates it) plainly and with MTP speculation at depth --mtp; the
     /// outputs must match. Reports acceptance and step costs, then stops.
@@ -196,7 +203,10 @@ impl Opened {
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::Qwen4Loader { library: &self.library, checkpoint: &self.checkpoint,
             fp8_decode: args.fp8_decode, fp8_scales: args.fp8_scales, stream };
-        let model = loader.model(&self.cfg, layers, args.mtp > 0 && layers == self.cfg.layers, args.mtp_fp8_head)?;
+        let source = self.embed_source()?;
+        let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library, source,
+            args.token_io.embed_placement,
+            || loader.model(&self.cfg, layers, args.mtp > 0 && layers == self.cfg.layers, args.mtp_fp8_head))?;
         let resident: usize = model.layers.iter().map(weights::Qwen4Layer::bytes).sum::<usize>()
             + model.mtp.as_ref().map_or(0, weights::MtpWeights::bytes);
         tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64,
@@ -208,7 +218,7 @@ impl Opened {
         };
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::Qwen4Engine::new(&self.library, &programs, self.cfg.clone(), model, ple, stream,
-            args.max_context, args.prefill_rows, pages, args.slots)?;
+            args.max_context, args.prefill_rows, pages, args.slots, embedding)?;
         if let Some(experts) = self.experts(args, layers)? {
             engine.set_experts(experts);
         }
@@ -262,18 +272,15 @@ impl Opened {
     }
 }
 
-pub(crate) fn embed_rows(checkpoint: &Checkpoint, tokens: &[u32], hidden: usize) -> Result<Vec<u8>> {
-    let name = format!("{}embed_tokens.weight", weights::PREFIX);
-    let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(&name))
-        .map_err(|_| anyhow::anyhow!("checkpoint has no {name}"))?;
-    let tensor = &checkpoint.tensors[at];
-    let file = std::fs::File::open(checkpoint.snapshot.join(&tensor.shard))?;
-    let row = hidden * 2;
-    let mut out = vec![0u8; tokens.len() * row];
-    for (slot, token) in out.chunks_exact_mut(row).zip(tokens) {
-        file.read_exact_at(slot, tensor.meta.byte_offset + u64::from(*token) * row as u64)?;
+impl Opened {
+    /// The checkpoint's `embed_tokens` (BF16 [vocab, hidden]).
+    fn embed_source(&self) -> Result<crate::shared::token_io::EmbedSource> {
+        let name = format!("{}embed_tokens.weight", weights::PREFIX);
+        let at = self.checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(&name))
+            .map_err(|_| anyhow::anyhow!("checkpoint has no {name}"))?;
+        let tensor = &self.checkpoint.tensors[at];
+        crate::shared::token_io::EmbedSource::new(&self.checkpoint.snapshot, &tensor.shard, &tensor.meta, self.cfg.hidden)
     }
-    Ok(out)
 }
 
 fn bf16s(bytes: &[u8]) -> Vec<f32> {
@@ -305,6 +312,9 @@ fn golden(args: GoldenArgs) -> Result<()> {
         if let Some(count) = args.spec_decode {
             return mtp_golden::spec_decode(&args, &opened, engine, count, args.engine.mtp);
         }
+        if let Some(steps) = args.token_check {
+            return token_check(&args, &opened, engine, steps);
+        }
         golden_run(&args, &opened, engine)
     })
 }
@@ -335,7 +345,6 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
     let mut allocator = engine::Allocator::new(engine.pages, engine.slots, cfg);
     let mut placement = allocator.admit(tokens.len() + args.bench_decode)?;
-    let embed = embed_rows(&opened.checkpoint, &tokens, cfg.hidden)?;
     let row = cfg.hidden * 2;
     let stream_row = row * 4;
     let prefill = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
@@ -377,7 +386,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
     while done < prefill {
         let n = engine.prefill_rows.min(prefill - done);
         let first = done;
-        let chunk = engine.prefill_forced(&mut placement, &tokens[done..done + n], &embed[done * row..(done + n) * row],
+        let chunk = engine.prefill_forced(&mut placement, &tokens[done..done + n],
             Some(&mut |layer, streams| compare(layer, first, streams, &mut worst)),
             args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>), if args.nll { n } else { 1 })?;
         logits = match (logits, chunk) {
@@ -399,9 +408,8 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
         let n = args.step_rows.min(tokens.len() - position);
         let first = position;
         let rows = &tokens[position..position + n];
-        let step_embed = &embed[position * row..(position + n) * row];
         let Some(keep) = args.spec_keep else {
-            if let Some(logits) = engine.verify(&mut [(&mut placement, rows)], step_embed,
+            if let Some(logits) = engine.verify(&mut [(&mut placement, rows)],
                 Some(&mut |layer, streams| compare(layer, first, streams, &mut decode_worst)))? {
                 decode_logits.extend(logits);
             }
@@ -411,7 +419,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
         // Speculative: verify n rows, keep the first `keep` (the rest are verified again next step).
         let keep = keep.clamp(1, n);
         let history = placement.history.clone();
-        let logits = engine.verify_spec(&mut [(&mut placement, rows)], step_embed,
+        let logits = engine.verify_spec(&mut [(&mut placement, rows)],
             Some(&mut |layer, streams| compare(layer, first, streams, &mut decode_worst)))?;
         engine.commit(&[(placement.slot, 0, keep)])?;
         engine.rewind(&mut placement, first, history, &rows[..keep])?;
@@ -454,7 +462,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
         for _ in 0..args.bench_prefill {
             let mut fresh = allocator.admit(n)?;
             let started = Instant::now();
-            engine.prefill(&mut fresh, &tokens[..n], &embed[..n * row])?;
+            engine.prefill(&mut fresh, &tokens[..n])?;
             times.push(started.elapsed().as_secs_f64());
             allocator.release(fresh);
         }
@@ -472,9 +480,8 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
         let mut digest = 0xcbf2_9ce4_8422_2325u64;
         for _ in 0..args.bench_decode {
             let started = Instant::now();
-            let row = embed_rows(&opened.checkpoint, &[token], cfg.hidden)?;
             let step = [token];
-            let logits = engine.verify(&mut [(&mut placement, &step[..])], &row, None)?;
+            let logits = engine.verify(&mut [(&mut placement, &step[..])], None)?;
             times.push(started.elapsed().as_secs_f64());
             if let Some(logits) = logits {
                 for v in &logits {
@@ -515,4 +522,28 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
         println!("last-row logits: argmax engine {} golden {} cosine {cosine:.6}", argmax(logits), argmax(last));
     }
     Ok(())
+}
+
+/// `--token-check N`: prefill the golden prompt, then [`crate::shared::token_io::gate`]
+/// over N greedy decode steps.
+fn token_check(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'_>, steps: usize) -> Result<()> {
+    let mut tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
+        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    if let Some(p) = args.prefill {
+        tokens.truncate(p);
+    }
+    let mut allocator = engine::Allocator::new(engine.pages, engine.slots, &opened.cfg);
+    let mut placement = allocator.admit(tokens.len() + steps + 1)?;
+    let mut last = None;
+    for chunk in tokens.chunks(engine.prefill_rows) {
+        last = engine.prefill_device(&mut placement, chunk, None, None, 1)?;
+    }
+    let last = last.ok_or_else(|| anyhow::anyhow!("--token-check needs every layer"))?.row_host(&opened.library, 0)?;
+    let first = cuteafd_core::TargetSamplingParams::greedy().select_token(&last, None, 0)? as u32;
+    let result = crate::shared::token_io::gate(&opened.library, &engine.embedding, first, steps, |token| {
+        engine.verify_device(&mut [(&mut placement, &[token][..])], false)?
+            .ok_or_else(|| anyhow::anyhow!("decode needs every layer"))
+    });
+    allocator.release(placement);
+    result
 }

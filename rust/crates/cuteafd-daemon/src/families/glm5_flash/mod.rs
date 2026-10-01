@@ -12,7 +12,6 @@ use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
 use cuteafd_loader::families::glm5_flash::GlmNextConfig;
 use cuteafd_loader::plan::checkpoint::Checkpoint;
-use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -121,6 +120,8 @@ pub(crate) struct EngineArgs {
     pub fp8_scales: crate::shared::fp8_linear::Fp8Scales,
     #[command(flatten)]
     pub l2: crate::shared::l2_prefetch::L2PrefetchArgs,
+    #[command(flatten)]
+    pub token_io: crate::shared::token_io::TokenIoArgs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -222,6 +223,12 @@ pub(crate) struct GoldenArgs {
     /// --resume-at attempts on fresh sequences (all must be byte-identical).
     #[arg(long, default_value_t = 1)]
     pub resume_repeat: usize,
+    /// Token I/O gate after the golden prompt (--prefill N truncates it), then
+    /// stop: the resident embedding table against the shard, device against
+    /// host greedy selection over this many decode steps, and device against
+    /// host sampling.
+    #[arg(long)]
+    pub token_check: Option<usize>,
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -280,14 +287,16 @@ impl Opened {
             fp8_source: self.fp8_checkpoint.as_ref(), kda_fp8: args.kda_fp8,
             fp8_head: args.fp8_head, kda_nvfp4: args.kda_nvfp4_gate.as_deref().map(|mode| mode == "search"),
             fp8_scales: args.fp8_scales };
-        let model = loader.model(&self.cfg, layers)?;
+        let source = self.embed_source()?;
+        let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library, source,
+            args.token_io.embed_placement, || loader.model(&self.cfg, layers))?;
         let resident: usize = model.layers.iter().map(weights::GlmfLayer::bytes).sum();
         tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64,
             fp8_source = self.fp8_checkpoint.is_some(), kda_fp8 = ?args.kda_fp8, fp8_prefill = ?args.fp8_prefill,
             elapsed_ms = started.elapsed().as_millis() as u64, "GLM 5.3 Flash coordinator weights resident");
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            args.max_context, args.prefill_rows, pages, args.slots)?;
+            args.max_context, args.prefill_rows, pages, args.slots, embedding)?;
         engine.full_prefill_logits = args.full_prefill_logits;
         ensure!(!args.fp8_prefill.contains(&Fp8PrefillGroup::None) || args.fp8_prefill.len() == 1,
             "--fp8-prefill none takes no other group");
@@ -301,7 +310,7 @@ impl Opened {
             let cfg = crate::families::glm5::dflash::DflashConfig::read(snapshot)?;
             ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
                 && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash2 drafter does not fit this target");
-            let mask = embed_rows(&self.checkpoint, &[cfg.mask_token], self.cfg.hidden)?;
+            let mask = engine.embedding.host_rows(&[cfg.mask_token])?;
             let file = crate::families::glm5::dflash::prefetch(snapshot).join()
                 .map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
             let mut drafter = crate::families::glm5::dflash::GlmDrafter::load(&self.library, snapshot, file, stream,
@@ -368,18 +377,16 @@ impl Opened {
     }
 }
 
-pub(crate) fn embed_rows(checkpoint: &Checkpoint, tokens: &[u32], hidden: usize) -> Result<Vec<u8>> {
-    let name = format!("{}embed_tokens.weight", weights::PREFIX);
-    let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(&name))
-        .map_err(|_| anyhow::anyhow!("checkpoint has no {name}"))?;
-    let tensor = &checkpoint.tensors[at];
-    let file = std::fs::File::open(checkpoint.snapshot.join(&tensor.shard))?;
-    let row = hidden * 2;
-    let mut out = vec![0u8; tokens.len() * row];
-    for (slot, token) in out.chunks_exact_mut(row).zip(tokens) {
-        file.read_exact_at(slot, tensor.meta.byte_offset + u64::from(*token) * row as u64)?;
+impl Opened {
+    /// The checkpoint's `embed_tokens` (BF16 [vocab, hidden]).
+    fn embed_source(&self) -> Result<crate::shared::token_io::EmbedSource> {
+        let name = format!("{}embed_tokens.weight", weights::PREFIX);
+        let at = self.checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(&name))
+            .map_err(|_| anyhow::anyhow!("checkpoint has no {name}"))?;
+        let tensor = &self.checkpoint.tensors[at];
+        crate::shared::token_io::EmbedSource::new(&self.checkpoint.snapshot, &tensor.shard, &tensor.meta,
+            self.cfg.hidden)
     }
-    Ok(out)
 }
 
 fn bf16s(bytes: &[u8]) -> Vec<f32> {
@@ -451,19 +458,21 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         return speculate::draft_replay(args, opened, engine, start);
     }
     if let Some(rows) = args.replay_check {
-        return speculate::replay_check(args, opened, engine, rows);
+        return speculate::replay_check(args, engine, rows);
     }
     if let Some(rows) = args.bench_verify {
-        return speculate::bench_verify(args, opened, engine, rows);
+        return speculate::bench_verify(args, engine, rows);
     }
     if let Some(at) = args.resume_at {
         let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
             .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
         let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
-        let hidden = opened.cfg.hidden;
-        return prefix::resume_check(engine, &|t| embed_rows(&opened.checkpoint, t, hidden), &tokens, at, n,
+        return prefix::resume_check(engine, &tokens, at, n,
             args.prefill_chunk.unwrap_or(engine.prefill_rows), args.resume_decode, args.resume_cold,
             args.resume_repeat);
+    }
+    if let Some(steps) = args.token_check {
+        return token_check(args, opened, engine, steps);
     }
     if engine.drafter.is_some() {
         return speculate::draft_run(args, opened, engine);
@@ -474,7 +483,6 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
     let mut placement = engine::Allocator::new(engine.pages, engine.slots).admit(tokens.len() + args.bench_decode)?;
-    let embed = embed_rows(&opened.checkpoint, &tokens, cfg.hidden)?;
     let row = cfg.hidden * 2;
     let stream_row = row * 4;
     let prefill = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
@@ -520,7 +528,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         let mut compare_layer = |layer, streams: &[u8]| compare(layer, first, streams, &mut worst);
         let on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>> =
             if args.logits_only && !args.teacher_force { None } else { Some(&mut compare_layer) };
-        let chunk = engine.prefill_forced(&mut placement, &embed[done * row..(done + n) * row], on_layer,
+        let chunk = engine.prefill_forced(&mut placement, &tokens[done..done + n], on_layer,
             args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>), args.nll)?;
         logits = match (logits, chunk) {
             (Some(mut all), Some(more)) if args.nll => {
@@ -542,7 +550,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         let mut compare_layer = |layer, streams: &[u8]| compare(layer, first, streams, &mut decode_worst);
         let on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>> =
             if args.logits_only { None } else { Some(&mut compare_layer) };
-        let step = &embed[position * row..(position + n) * row];
+        let step = &tokens[position..position + n];
         let logits = if args.spec_steps {
             let logits = engine.verify_spec(&mut [(&mut placement, n)], step)?;
             engine.commit(&[(placement.slot, 0, n)])?;
@@ -585,14 +593,14 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         *engine.profile.borrow_mut() = [0.0; 3];
         engine.op_profile()?;
         let n = args.bench_prefill_tokens.unwrap_or(prefill.min(engine.prefill_capacity()));
-        let long: Vec<u8> = embed.chunks_exact(row).cycle().take(n).flatten().copied().collect();
+        let long: Vec<u32> = tokens.iter().copied().cycle().take(n).collect();
         let mut allocator = engine::Allocator::new(engine.pages, engine.slots);
         let _held = allocator.admit(tokens.len() + args.bench_decode)?;
         let mut times = Vec::new();
         for _ in 0..args.bench_prefill {
             let mut fresh = allocator.admit(n)?;
             let started = Instant::now();
-            for chunk in long.chunks(engine.prefill_capacity() * row) {
+            for chunk in long.chunks(engine.prefill_capacity()) {
                 engine.prefill(&mut fresh, chunk, None)?;
             }
             times.push(started.elapsed().as_secs_f64());
@@ -623,12 +631,16 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         let mut token = tokens[placement.len.min(tokens.len() - 1)];
         let mut times = Vec::new();
         let mut produced = Vec::new();
+        // FNV-1a over every step's logits bits (bit-identity checks between builds).
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
         for _ in 0..args.bench_decode {
             let started = Instant::now();
-            let row = embed_rows(&opened.checkpoint, &[token], cfg.hidden)?;
-            let logits = engine.verify(&mut [(&mut placement, 1)], &row, None)?;
+            let logits = engine.verify(&mut [(&mut placement, 1)], &[token], None)?;
             times.push(started.elapsed().as_secs_f64());
             if let Some(logits) = logits {
+                for v in &logits {
+                    digest = (digest ^ u64::from(v.to_bits())).wrapping_mul(0x0100_0000_01b3);
+                }
                 token = argmax(&logits);
                 produced.push(token);
             }
@@ -638,7 +650,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         let steps = times.len() as f64;
         println!("decode bench: {} steps through {layers} layers, median {:.2} ms (min {:.2}, max {:.2}); \
             per step: GPU until the expert exchanges {:.2} ms, Spark exchanges {:.2} ms, head {:.2} ms; \
-            tokens {:?}", times.len(),
+            logits digest {digest:016x}; tokens {:?}", times.len(),
             1e3 * times[times.len() / 2], 1e3 * times[0], 1e3 * times[times.len() - 1], 1e3 * profile[0] / steps,
             1e3 * profile[1] / steps, 1e3 * profile[2] / steps, &produced[..produced.len().min(16)]);
     }
@@ -679,4 +691,28 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         println!("last-row logits: argmax engine {} golden {} cosine {cosine:.6}", argmax(logits), argmax(last));
     }
     Ok(())
+}
+
+/// `--token-check N`: prefill the golden prompt, then [`crate::shared::token_io::gate`]
+/// over N greedy decode steps.
+fn token_check(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_>, steps: usize) -> Result<()> {
+    let mut tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
+        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    if let Some(p) = args.prefill {
+        tokens.truncate(p);
+    }
+    let mut allocator = engine::Allocator::new(engine.pages, engine.slots);
+    let mut placement = allocator.admit(tokens.len() + steps + 1)?;
+    let mut last = None;
+    for chunk in tokens.chunks(engine.prefill_capacity()) {
+        last = engine.prefill_device(&mut placement, chunk)?;
+    }
+    let last = last.ok_or_else(|| anyhow::anyhow!("--token-check needs every layer"))?.row_host(&opened.library, 0)?;
+    let first = cuteafd_core::TargetSamplingParams::greedy().select_token(&last, None, 0)? as u32;
+    let result = crate::shared::token_io::gate(&opened.library, &engine.embedding, first, steps, |token| {
+        engine.verify_device(&mut [(&mut placement, 1)], &[token], false)?
+            .ok_or_else(|| anyhow::anyhow!("decode needs every layer"))
+    });
+    allocator.release(placement);
+    result
 }

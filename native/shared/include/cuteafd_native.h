@@ -1266,6 +1266,18 @@ cuteafd_status_t cuteafd_cuda_embedding_lookup_bf16(const uint16_t* embedding,
 cuteafd_status_t cuteafd_cuda_embedding_lookup_bf16_async(
     const uint16_t* embedding, const uint32_t* token_ids, uint16_t* out, size_t rows,
     size_t vocab, size_t hidden, void* cuda_stream);
+/* Token I/O (shared/cuda/token_io.cu). `copies` contiguous copies of
+ * table[token_ids[r]] per input row (table[token_ids[index[r]]] with a
+ * non-null `index`); an id >= vocab copies `fallback` (nullable: zeros). Greedy selection: lowest id among the largest logits, NaN never
+ * chosen; out_status[r] = 1 when row r holds a non-finite logit;
+ * out_logprob (nullable) = log_softmax(row)[id]. */
+cuteafd_status_t cuteafd_cuda_embed_gather_bf16_async(
+    const uint16_t* table, size_t vocab, size_t hidden, const uint32_t* token_ids,
+    const uint32_t* index, size_t rows, size_t copies, const uint16_t* fallback, uint16_t* out,
+    void* cuda_stream);
+cuteafd_status_t cuteafd_cuda_logits_greedy_f32_async(
+    const float* logits, size_t rows, size_t vocab, size_t stride, uint32_t* out_ids,
+    float* out_logprob, uint32_t* out_status, void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_lm_head_argmax_bf16(const uint16_t* hidden, const uint16_t* lm_head,
                                               uint32_t* out_indices, float* out_scores,
                                               size_t rows, size_t hidden_dim, size_t vocab);

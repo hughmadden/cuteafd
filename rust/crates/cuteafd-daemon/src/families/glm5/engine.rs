@@ -12,6 +12,7 @@
 //! wave stays in flight while the other lane's GPU layers run.
 use super::weights::{GlmLayer, GlmWeights};
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
+use crate::shared::token_io::{DeviceLogits, EmbedPlacement, TokenEmbedding};
 use crate::shared::spark_intake::{copy_parallel, IntakeMode, SparkIntake, SparkLane, SparkLink};
 use cuteafd_transport::expert::{
     SparkExpertWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
@@ -61,6 +62,8 @@ struct GraphKey {
     table_width: usize,
     table_stride: usize,
     previous: Previous,
+    /// The last segment ends in the head and the greedy selection.
+    head: bool,
 }
 
 struct GraphExec<'a>(*mut c_void, &'a NativeLibrary);
@@ -163,8 +166,19 @@ struct Workspace<'a> {
     wire: Dev<'a>,
     shared: Dev<'a>,
     router_host: RefCell<HostAllocation<'a>>,
+    /// The step's token ids (U32, gathered from the device embedding table).
+    ids: Dev<'a>,
+    /// Greedy selection of the logits rows inside the decode graph: U32 ids, then U32 statuses.
+    select: Dev<'a>,
     head: VocabularyHead<'a>,
     _head_workspace: Dev<'a>,
+}
+
+/// A step's logits: on the device (one workspace's rows), or downloaded
+/// (rows spanning several prefill lanes).
+enum StepLogits {
+    Device(DeviceLogits),
+    Host(Vec<f32>),
 }
 
 pub(crate) struct GlmEngine<'a> {
@@ -207,6 +221,8 @@ pub(crate) struct GlmEngine<'a> {
     pub drafter: Option<super::dflash::GlmDrafter<'a>>,
     /// L2 prefetch of the next layer's weights during decode exchanges.
     pub l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
+    /// The token embedding table (resident on this GPU or read from its shard).
+    pub embedding: TokenEmbedding<'a>,
     /// Prefill projections over the FP8 weights run W8A8 (E4M3 activations per
     /// row and 128-K block, the official FP8 release's served numerics); false:
     /// W8A16 (bitwise the former BF16 prefill over dequantized weights).
@@ -221,8 +237,9 @@ fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
 impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmDsaConfig,
-        weights: GlmWeights<'a>, stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize)
-        -> Result<Self> {
+        weights: GlmWeights<'a>, stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize,
+        embedding: TokenEmbedding<'a>) -> Result<Self> {
+        ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, bytes.max(256))?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
@@ -251,7 +268,7 @@ impl<'a> GlmEngine<'a> {
             prefill_lanes: configured_lanes(),
             lanes: RefCell::new(Vec::new()), full_prefill_logits: false, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             exchange_host: RefCell::new([0.0; 4]),
-            graphs: RefCell::new(std::collections::HashMap::new()), drafter: None, prefill_w8a8: true })
+            graphs: RefCell::new(std::collections::HashMap::new()), drafter: None, embedding, prefill_w8a8: true })
     }
 
     /// Every layer's latent record pool (656 B per row, 64-row pages) and, on full-indexer
@@ -330,6 +347,8 @@ impl<'a> GlmEngine<'a> {
             wire: self.alloc(t * (h + h / 32))?,
             shared: self.alloc(t * h * 2)?,
             router_host: RefCell::new(HostAllocation::new(self.library, t * (self.cfg.topk * 8 + h + h / 32))?),
+            ids: self.alloc(t * 4)?,
+            select: self.alloc(t * 8)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, t as u32,
                 self.cfg.vocab_size as u32)? },
@@ -354,10 +373,32 @@ impl<'a> GlmEngine<'a> {
     /// Prefills a sequence from its length through every resident layer and
     /// returns the last row's logits when all layers are resident.
     /// `on_layer` receives each layer's output rows (BF16 [t, hidden]).
-    pub fn prefill(&self, placement: &mut GlmPlacement, embed: &[u8],
+    pub fn prefill(&self, placement: &mut GlmPlacement, tokens: &[u32],
         experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<Vec<f32>>> {
-        self.prefill_rows_logits(placement, embed, experts, on_layer, 1)
+        self.prefill_rows_logits(placement, tokens, experts, on_layer, 1)
+    }
+
+    /// [`Self::prefill`] leaving the last row's logits on the device.
+    pub fn prefill_device(&self, placement: &mut GlmPlacement, tokens: &[u32],
+        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>) -> Result<Option<DeviceLogits>> {
+        match self.prefill_step(placement, tokens, experts, None, 1)? {
+            Some(StepLogits::Device(logits)) => Ok(Some(logits)),
+            Some(StepLogits::Host(_)) => anyhow::bail!("the last prefill row's logits span lanes"),
+            None => Ok(None),
+        }
+    }
+
+    /// Downloads a step's logits (counted in the logits phase).
+    fn host_logits(&self, logits: Option<StepLogits>) -> Result<Option<Vec<f32>>> {
+        let timer = std::time::Instant::now();
+        let out = match logits {
+            Some(StepLogits::Device(logits)) => Some(logits.to_host(self.library)?),
+            Some(StepLogits::Host(logits)) => Some(logits),
+            None => None,
+        };
+        self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
+        Ok(out)
     }
 
     /// Whether a Spark prefill runs as lanes (a lane transport, every layer resident).
@@ -388,45 +429,65 @@ impl<'a> GlmEngine<'a> {
     /// [`Self::prefill`] returning the logits of the chunk's last `logit_rows` rows.
     /// Without `on_layer`, a Spark chunk of at least 2 x 256 rows runs as
     /// [`PREFILL_LANES`] lanes (see [`Self::step_lanes`]).
-    pub fn prefill_rows_logits(&self, placement: &mut GlmPlacement, embed: &[u8],
+    pub fn prefill_rows_logits(&self, placement: &mut GlmPlacement, tokens: &[u32],
         experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>, logit_rows: usize) -> Result<Option<Vec<f32>>> {
-        let (row, start) = (self.cfg.hidden * 2, placement.len);
-        let t = embed.len() / row;
+        let logits = self.prefill_step(placement, tokens, experts, on_layer, logit_rows)?;
+        self.host_logits(logits)
+    }
+
+    fn prefill_step(&self, placement: &mut GlmPlacement, tokens: &[u32],
+        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>, logit_rows: usize) -> Result<Option<StepLogits>> {
+        let (start, t) = (placement.len, tokens.len());
         if on_layer.is_none() && self.pipelined() && t >= 2 * MIN_LANE_ROWS && experts.is_some() {
             // Lanes split at 64-row pages, so each lane's pages start where the previous lane's end.
             let count = self.prefill_lanes.min(t / MIN_LANE_ROWS);
             let per_lane = t.div_ceil(count).next_multiple_of(PAGE_ROWS);
             ensure!(per_lane <= self.prefill_rows && start + t <= self.max_context,
                 "prefill of {t} rows at {start} exceeds {} rows per lane or the context", self.prefill_rows);
-            let (mut lanes, mut embeds) = (Vec::new(), Vec::new());
+            let (mut lanes, mut chunks) = (Vec::new(), Vec::new());
             let mut first = 0;
             while first < t {
                 let n = per_lane.min(t - first);
                 lanes.push(self.prefill_tables(placement, start + first, n)?);
-                embeds.push(&embed[first * row..(first + n) * row]);
+                chunks.push(&tokens[first..first + n]);
                 first += n;
             }
-            let logits = self.step_lanes(&lanes, &embeds, logit_rows)?;
+            let logits = self.step_lanes(&lanes, &chunks, logit_rows)?;
             placement.len += t;
             return Ok(logits);
         }
         ensure!(t > 0 && t <= self.prefill_rows && start + t <= self.max_context, "prefill of {t} rows at {start}");
         let tables = self.prefill_tables(placement, start, t)?;
-        let logits = self.step(&tables, embed, logit_rows, experts, on_layer)?;
+        let logits = self.step(&tables, tokens, logit_rows, experts, on_layer)?;
         placement.len += t;
-        Ok(logits)
+        Ok(logits.map(StepLogits::Device))
     }
 
     /// Appends each sequence's tokens (one for decode, several for a
     /// speculative verify) at its length in one decode-shaped step; returns
     /// every row's logits. A caller that rejects a suffix sets `len` back:
     /// GLM keeps no recurrent state, and rejected records are overwritten.
-    pub fn verify(&self, sequences: &mut [(&mut GlmPlacement, usize)], embed: &[u8],
+    pub fn verify(&self, sequences: &mut [(&mut GlmPlacement, usize)], tokens: &[u32],
         experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<Vec<f32>>> {
+        let logits = self.verify_device_hooked(sequences, tokens, experts, on_layer)?;
+        self.host_logits(logits.map(StepLogits::Device))
+    }
+
+    /// [`Self::verify`] leaving every row's logits on the device, with the
+    /// decode graph's greedy selection of them.
+    pub fn verify_device(&self, sequences: &mut [(&mut GlmPlacement, usize)], tokens: &[u32],
+        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>) -> Result<Option<DeviceLogits>> {
+        self.verify_device_hooked(sequences, tokens, experts, None)
+    }
+
+    fn verify_device_hooked(&self, sequences: &mut [(&mut GlmPlacement, usize)], tokens: &[u32],
+        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<DeviceLogits>> {
         let rows: usize = sequences.iter().map(|(_, n)| n).sum();
-        ensure!(rows > 0 && rows <= DECODE_ROWS && embed.len() == rows * self.cfg.hidden * 2, "decode step of {rows} rows");
+        ensure!(rows > 0 && rows <= DECODE_ROWS && tokens.len() == rows, "decode step of {rows} rows");
         let stride = sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1);
         let mut tables = StepTables { decode: true, positions: Vec::new(), slots: Vec::new(), page_table: Vec::new(),
             table_width: 1, table_stride: stride, cache_lengths: Vec::new(), lengths: Vec::new() };
@@ -445,16 +506,16 @@ impl<'a> GlmEngine<'a> {
                 tables.page_table.extend(std::iter::repeat_n(0, stride - placement.pages.len()));
             }
         }
-        let logits = self.step(&tables, embed, rows, experts, on_layer)?;
+        let logits = self.step(&tables, tokens, rows, experts, on_layer)?;
         for (placement, count) in sequences.iter_mut() {
             placement.len += *count;
         }
         Ok(logits)
     }
 
-    fn step(&self, tables: &StepTables, embed: &[u8], logit_rows: usize,
+    fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
         mut experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
-        mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<Vec<f32>>> {
+        mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<DeviceLogits>> {
         let (h, t) = (self.cfg.hidden, tables.positions.len());
         // Decode steps have their own workspace; a serial prefill uses the first lane's.
         if tables.decode && self.decode_workspace.borrow().is_none() {
@@ -474,14 +535,28 @@ impl<'a> GlmEngine<'a> {
         self.put(&w.page_table, &tables.page_table)?;
         self.put(&w.cache_lengths, &tables.cache_lengths)?;
         self.put(&w.lengths, &tables.lengths)?;
-        self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: embed.len(), ..w.h.buffer }, embed)?;
+        ensure!(tokens.len() == t, "{} tokens for a {t}-row step", tokens.len());
         let rows = Scalar::I32(t as i32);
         let cap = if tables.decode { "m64" } else { "m4096" };
         let layers = &self.weights.layers;
         if tables.decode && on_layer.is_none() && layers.len() == self.cfg.layers {
-            self.decode_layers(w, tables, t, &mut experts)?;
-            return self.head(w, t, logit_rows).map(Some);
+            // The first captured segment gathers the rows from the staged ids;
+            // the last runs the head and the greedy selection.
+            let gather = self.embedding.placement() == EmbedPlacement::Gpu;
+            if gather {
+                self.embedding.check(tokens)?;
+                self.put(&w.ids, tokens)?;
+            } else {
+                self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
+            }
+            let head = logit_rows == t;
+            self.decode_layers(w, tables, t, &mut experts, gather, head)?;
+            if !head {
+                self.launch_head(w, t, logit_rows)?;
+            }
+            return Ok(Some(self.device_logits(w, logit_rows, head)));
         }
+        self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
         self.norm(w, &layers[0], "input_norm", 0, rows)?;
         for (index, layer) in layers.iter().enumerate() {
             self.attention(w, index, layer, rows, cap, tables)?;
@@ -521,21 +596,48 @@ impl<'a> GlmEngine<'a> {
             unsafe { self.library.cuda_stream_synchronize(self.stream)? };
             return Ok(None);
         }
-        self.head(w, t, logit_rows).map(Some)
+        self.launch_head(w, t, logit_rows)?;
+        Ok(Some(self.device_logits(w, logit_rows, false)))
     }
 
-    /// Logits of the last `n` of `t` rows of the final norm's output.
-    fn head(&self, w: &Workspace<'_>, t: usize, n: usize) -> Result<Vec<f32>> {
+    /// Logits of the last `n` of `t` rows of the final norm's output into the workspace's logits.
+    fn launch_head(&self, w: &Workspace<'_>, t: usize, n: usize) -> Result<()> {
         let h = self.cfg.hidden;
         // SAFETY: the final norm's output and the head operands are live buffers of these shapes.
         unsafe {
             super::launch_head(self.library, &w.head, w.x.buffer.ptr.cast::<u8>().add((t - n) * h * 2).cast(),
-                self.weights.head.buffer.ptr, w.logits.buffer.ptr.cast(), n, h, self.cfg.vocab_size, self.stream)?;
+                self.weights.head.buffer.ptr, w.logits.buffer.ptr.cast(), n, h, self.cfg.vocab_size, self.stream)
         }
-        let timer = std::time::Instant::now();
-        let logits = self.download(&w.logits, n * self.cfg.vocab_size * 4)?;
-        self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
-        Ok(logits.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
+    }
+
+    /// `bytes` at `offset` inside `dev`.
+    fn region(dev: &Dev<'_>, offset: usize, bytes: usize) -> cuteafd_ffi::CuteafdDeviceBuffer {
+        debug_assert!(offset + bytes <= dev.buffer.bytes);
+        cuteafd_ffi::CuteafdDeviceBuffer {
+            // SAFETY: callers pass offsets inside the buffer.
+            ptr: unsafe { dev.buffer.ptr.cast::<u8>().add(offset) }.cast(),
+            bytes,
+            ..dev.buffer
+        }
+    }
+
+    /// Greedy tokens of the first `rows` logits rows into `select`.
+    fn select_greedy(&self, w: &Workspace<'_>, rows: usize) -> Result<()> {
+        let vocab = self.cfg.vocab_size;
+        // SAFETY: the logits rows and the select buffer (ids, then statuses) are live buffers of these shapes.
+        unsafe {
+            self.library.cuda_logits_greedy_f32_async(w.logits.buffer.ptr, rows, vocab, vocab, w.select.buffer.ptr,
+                std::ptr::null_mut(), Self::region(&w.select, rows * 4, rows * 4).ptr, self.stream)
+        }
+    }
+
+    /// The first `rows` logits rows as device logits (`greedy`: with the rows'
+    /// selection from [`Self::select_greedy`]).
+    fn device_logits(&self, w: &Workspace<'_>, rows: usize, greedy: bool) -> DeviceLogits {
+        let vocab = self.cfg.vocab_size;
+        DeviceLogits { ptr: w.logits.buffer.ptr, rows, vocab, stride: vocab, stream: self.stream,
+            greedy: greedy.then(|| (w.select.buffer.ptr.cast_const(), Self::region(&w.select, rows * 4, rows * 4).ptr
+                .cast_const())) }
     }
 
     /// Decode layers as captured graph segments: each replays the previous
@@ -543,7 +645,7 @@ impl<'a> GlmEngine<'a> {
     /// post-attention norm, and the dense FFN or the MoE front (router,
     /// select, wire rows); the Spark exchange runs between segments.
     fn decode_layers(&self, w: &Workspace<'_>, tables: &StepTables, t: usize,
-        experts: &mut Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>) -> Result<()> {
+        experts: &mut Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>, gather: bool, head: bool) -> Result<()> {
         let rows = Scalar::I32(t as i32);
         let layers = &self.weights.layers;
         // The decode transport's intake planes (or the skip intake's); the
@@ -558,6 +660,11 @@ impl<'a> GlmEngine<'a> {
         for index in 0..=layers.len() {
             let layer = layers.get(index);
             let segment = || -> Result<()> {
+                if index == 0 && gather {
+                    // SAFETY: the step's ids are in `ids` before the replay; `h` holds its rows.
+                    unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, 1, std::ptr::null(),
+                        w.h.buffer.ptr, self.stream)? };
+                }
                 if let Previous::Planes(ranks) = previous {
                     self.reduce(planes, w, ranks, t)?;
                 }
@@ -573,7 +680,13 @@ impl<'a> GlmEngine<'a> {
                 if let (Some(drafter), Some(previous)) = (&self.drafter, index.checked_sub(1)) {
                     drafter.tap(previous, w.h.buffer.ptr, 0, t)?;
                 }
-                let Some(layer) = layer else { return Ok(()) };
+                let Some(layer) = layer else {
+                    if head {
+                        self.launch_head(w, t, t)?;
+                        self.select_greedy(w, t)?;
+                    }
+                    return Ok(());
+                };
                 self.attention(w, index, layer, rows, "m64", tables)?;
                 self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                     ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
@@ -585,7 +698,7 @@ impl<'a> GlmEngine<'a> {
                 }
             };
             let key = GraphKey { layer: index, rows: t, table_width: tables.table_width,
-                table_stride: tables.table_stride, previous };
+                table_stride: tables.table_stride, previous, head: head && layer.is_none() };
             self.replay(key, segment)?;
             previous = match layer {
                 None => break,
@@ -806,7 +919,7 @@ impl<'a> GlmEngine<'a> {
     /// own workspace kept from its last full layer. A lane's request is built,
     /// posted and received on its thread while this thread queues the other
     /// lanes' GPU layers. Returns the last `logit_rows` rows' logits.
-    fn step_lanes(&self, lanes: &[StepTables], embeds: &[&[u8]], logit_rows: usize) -> Result<Option<Vec<f32>>> {
+    fn step_lanes(&self, lanes: &[StepTables], chunks: &[&[u32]], logit_rows: usize) -> Result<Option<StepLogits>> {
         {
             let mut slots = self.lane_workspaces.borrow_mut();
             while slots.len() < lanes.len() {
@@ -827,14 +940,15 @@ impl<'a> GlmEngine<'a> {
         let total: usize = counts.iter().sum();
         ensure!(logit_rows <= total && (self.full_prefill_logits || logit_rows <= DECODE_ROWS),
             "prefill logits past {DECODE_ROWS} rows need full_prefill_logits");
-        for ((tables, embed), w) in lanes.iter().zip(embeds).zip(&workspaces) {
-            ensure!(tables.positions.len() <= w.rows, "lane exceeds its workspace");
+        for ((tables, tokens), w) in lanes.iter().zip(chunks).zip(&workspaces) {
+            ensure!(tables.positions.len() <= w.rows && tokens.len() == tables.positions.len(),
+                "lane exceeds its workspace");
             self.put(&w.positions, &tables.positions)?;
             self.put(&w.slots, &tables.slots)?;
             self.put(&w.page_table, &tables.page_table)?;
             self.put(&w.cache_lengths, &tables.cache_lengths)?;
             self.put(&w.lengths, &tables.lengths)?;
-            self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: embed.len(), ..w.h.buffer }, embed)?;
+            self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
         }
         let layers = &self.weights.layers;
         let cap = "m4096";
@@ -920,15 +1034,22 @@ impl<'a> GlmEngine<'a> {
             unsafe { self.library.cuda_stream_synchronize(self.stream)? };
             return Ok(None);
         }
+        let last = counts.len() - 1;
+        if logit_rows <= counts[last] {
+            // The wanted rows are the last lane's: they stay on the device.
+            self.launch_head(workspaces[last], counts[last], logit_rows)?;
+            return Ok(Some(StepLogits::Device(self.device_logits(workspaces[last], logit_rows, false))));
+        }
         let mut logits = Vec::with_capacity(logit_rows * self.cfg.vocab_size);
         for ((w, &t), &begin) in workspaces.iter().zip(&counts).zip(&starts) {
             // Rows of this lane inside the last `logit_rows` of the chunk.
             let wanted = (begin + t).saturating_sub((total - logit_rows).max(begin));
             if wanted > 0 {
-                logits.extend(self.head(w, t, wanted)?);
+                self.launch_head(w, t, wanted)?;
+                logits.extend(self.device_logits(w, wanted, false).to_host(self.library)?);
             }
         }
-        Ok(Some(logits))
+        Ok(Some(StepLogits::Host(logits)))
     }
 
     /// A transport's rank planes + shared expert into `delta`. The next
