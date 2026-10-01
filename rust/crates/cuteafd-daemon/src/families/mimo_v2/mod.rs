@@ -219,7 +219,16 @@ impl Opened {
         let draft_file = draft_dir.as_deref().map(dflash::prefetch);
         let stream = self.library.cuda_stream_create()?;
         // The head split's second GPU and its stream (load kernels, then the engine's).
-        let peer_stream = match args.split_device {
+        // The head split exists for V2.6 Pro's geometry (`mimop2`); V2 Flash serves from --device.
+        let split_device = match args.split_device {
+            Some(device) if self.cfg.head_split(2).and_then(|share| share.program_family()).is_ok() => Some(device),
+            Some(device) => {
+                tracing::info!(device, "this MiMo geometry has no head split; serving from --device alone");
+                None
+            }
+            None => None,
+        };
+        let peer_stream = match split_device {
             Some(device) => {
                 ensure!(device != args.device, "--split-device must differ from --device");
                 // Peer access both ways first: the loader slices weights over peer copies.

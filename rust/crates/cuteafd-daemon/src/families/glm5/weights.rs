@@ -293,25 +293,42 @@ impl<'a> GlmLoader<'a> {
         if let ([name], Axis::Cols) = (names, axis) {
             return self.fp8_cols(name, ranks);
         }
-        let parts = names.iter().map(|name| -> Result<(Vec<u8>, Vec<f32>, usize, usize)> {
-            self.with_fp8(std::slice::from_ref(name), |values, grid, rows, cols| {
-                ensure!(rows % 128 == 0 && cols % 128 == 0
-                    && (if axis == Axis::Rows { rows } else { cols }) % (128 * ranks) == 0,
-                    "{name}: [{rows}, {cols}] does not split into whole 128-blocks over {ranks} GPUs");
-                Ok((values.to_vec(), grid, rows, cols))
-            })
-        }).collect::<Result<Vec<_>>>()?;
-        (0..ranks).map(|rank| {
-            let (mut values, mut grid) = (Vec::new(), Vec::new());
-            for (bytes, full, rows, cols) in &parts {
-                let kb = cols / 128;
-                values.extend(slice_2d(bytes, *rows, *cols, 1, axis, rank, ranks));
-                let grid_bytes: Vec<u8> = full.iter().flat_map(|v| v.to_le_bytes()).collect();
-                let part = slice_2d(&grid_bytes, rows / 128, kb, 4, axis, rank, ranks);
-                grid.extend(part.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())));
-            }
-            self.on_rank(rank, |_| Ok((self.upload(&values)?, self.upload(&f32_bytes(&grid))?)))
-        }).collect()
+        ensure!(axis == Axis::Rows, "{names:?}: concatenated weights split by rows");
+        // Per rank: the E4M3 rows and grid rows of every part, uploaded straight from the
+        // staging buffer into the part's offset (whole 128-row blocks, so grids slice too).
+        let mut out: Vec<Option<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> = (0..ranks).map(|_| None).collect();
+        let (mut row_at, mut grid_at) = (0usize, 0usize);
+        let (total_rows, cols) = names.iter().try_fold((0usize, 0usize), |(rows, _), name| -> Result<_> {
+            let shape = &self.catalog.tensor(name)?.metadata.shape;
+            Ok((rows + shape[0], shape[1]))
+        })?;
+        for name in names {
+            self.with_fp8(std::slice::from_ref(name), |values, grid, rows, part_cols| {
+                ensure!(part_cols == cols && rows % (128 * ranks) == 0 && cols % 128 == 0,
+                    "{name}: [{rows}, {cols}] does not split into whole 128-row blocks over {ranks} GPUs");
+                let (share, kb) = (rows / ranks, cols / 128);
+                for (rank, slot) in out.iter_mut().enumerate() {
+                    self.on_rank(rank, |_| {
+                        if slot.is_none() {
+                            *slot = Some((DeviceAllocation::new(self.library, total_rows / ranks * cols)?,
+                                DeviceAllocation::new(self.library, total_rows / ranks / 128 * kb * 4)?));
+                        }
+                        let (dv, dg) = slot.as_ref().context("rank buffers")?;
+                        let at = |buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize| CuteafdDeviceBuffer {
+                            // SAFETY: offset + bytes lie inside the rank's buffer (sized above).
+                            ptr: unsafe { buffer.ptr.cast::<u8>().add(offset) }.cast(), bytes, ..buffer };
+                        self.library.copy_h2d(at(dv.buffer, row_at / ranks * cols, share * cols),
+                            &values[rank * share * cols..(rank + 1) * share * cols])?;
+                        let grid_part = f32_bytes(&grid[rank * share / 128 * kb..(rank + 1) * share / 128 * kb]);
+                        self.library.copy_h2d(at(dg.buffer, grid_at / ranks * 4, grid_part.len()), &grid_part)
+                    })?;
+                }
+                row_at += rows;
+                grid_at += rows / 128 * kb;
+                Ok(())
+            })?;
+        }
+        out.into_iter().map(|slot| slot.context("no FP8 parts")).collect()
     }
 
     /// One FP8 weight sliced by columns over `ranks`: the whole E4M3 weight goes up
