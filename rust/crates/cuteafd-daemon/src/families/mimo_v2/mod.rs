@@ -11,7 +11,6 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::families::mimo_v2::MimoV2Config;
 use cuteafd_loader::plan::checkpoint::Checkpoint;
-use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -99,6 +98,8 @@ pub(crate) struct EngineArgs {
     /// steps only.
     #[arg(long, value_enum, default_value_t = engine::ExpertInput::Fp8)]
     pub expert_input: engine::ExpertInput,
+    #[command(flatten)]
+    pub token_io: crate::shared::token_io::TokenIoArgs,
 }
 
 #[derive(Debug, clap::Args)]
@@ -153,6 +154,17 @@ pub(crate) struct GoldenArgs {
     /// --prefill-chunk rows; a straight prefill without the boundary at P is reported too.
     #[arg(long)]
     pub resume_at: Option<usize>,
+    /// Token I/O gate after the golden prompt (--prefill N truncates it),
+    /// then stop: the resident embedding table against the shard, device
+    /// against host greedy selection over this many decode steps, and device
+    /// against host sampling.
+    #[arg(long)]
+    pub token_check: Option<usize>,
+    /// Greedy-decode this many tokens after the golden prompt and print the
+    /// tokens and an FNV-1a digest of every step's logits bits (bit-identity
+    /// between builds), then stop. With --mtp N also MTP-speculative.
+    #[arg(long)]
+    pub greedy_digest: Option<usize>,
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -191,7 +203,8 @@ impl Opened {
         let loader = weights::MimoLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
             checkpoint_tp: cuteafd_loader::families::mimo_v2::checkpoint_tp(&args.snapshot)?, fp8_decode: args.fp8_decode,
             fp8_head: args.fp8_head, fp8_o_proj: args.fp8_o_proj, fp8_scales: args.fp8_scales };
-        let model = loader.model(&self.cfg, layers)?;
+        let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
+            args.token_io.embed_placement, || loader.model(&self.cfg, layers))?;
         let mtp = if args.mtp > 0 {
             let started = Instant::now();
             let available = self.checkpoint.tensors.iter()
@@ -213,7 +226,8 @@ impl Opened {
             let drafter = mtp::MtpDrafter { stages, hidden: zeroed(args.rings * mtp::HIDDEN_ROWS * h * 2)?,
                 embed: zeroed(rows * h * 2)?, rows_h: zeroed(rows * h * 2)?, normed_e: zeroed(rows * h * 2)?,
                 normed_h: zeroed(rows * h * 2)?, cat: zeroed(rows * 2 * h * 2)?,
-                ext: std::cell::RefCell::new(vec![vec![0; args.mtp]; args.rings]) };
+                ext: std::cell::RefCell::new(vec![vec![0; args.mtp]; args.rings]),
+                ids: zeroed((1 + args.mtp) * rows * 4)?, index: zeroed(rows * 4)? };
             tracing::info!(stages = args.mtp, elapsed_ms = started.elapsed().as_millis() as u64, "MTP drafter resident");
             Some(drafter)
         } else {
@@ -222,7 +236,7 @@ impl Opened {
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64, "MiMo coordinator weights resident");
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::MimoEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            args.max_context, args.prefill_rows, pages, args.rings)?;
+            args.max_context, args.prefill_rows, pages, args.rings, embedding)?;
         engine.mtp = mtp;
         if let Some(dir) = &draft_dir {
             let started = Instant::now();
@@ -231,7 +245,7 @@ impl Opened {
                 && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash drafter does not fit this target");
             let mask = match dflash::mask_embedding(dir, cfg.hidden)? {
                 Some(row) => row,
-                None => embed_rows(&self.checkpoint, &[cfg.mask_token], cfg.hidden)?,
+                None => engine.embedding.host_rows(&[cfg.mask_token])?,
             };
             let file = draft_file.context("drafter prefetch")?.join()
                 .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
@@ -341,45 +355,15 @@ impl Opened {
     }
 }
 
-/// The embedding table's shard, opened once (serving reads rows every step).
-pub(crate) struct Embeddings {
-    file: std::fs::File,
-    offset: u64,
-    row: usize,
-}
-
-impl Embeddings {
-    pub fn open(checkpoint: &Checkpoint, hidden: usize) -> Result<Self> {
+impl Opened {
+    /// The checkpoint's `embed_tokens` (BF16 [vocab, hidden]).
+    fn embed_source(&self) -> Result<crate::shared::token_io::EmbedSource> {
         let name = "model.embed_tokens.weight";
-        let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
+        let at = self.checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
             .map_err(|_| anyhow::anyhow!("checkpoint has no {name}"))?;
-        let tensor = &checkpoint.tensors[at];
-        Ok(Self { file: std::fs::File::open(checkpoint.snapshot.join(&tensor.shard))?, offset: tensor.meta.byte_offset,
-            row: hidden * 2 })
+        let tensor = &self.checkpoint.tensors[at];
+        crate::shared::token_io::EmbedSource::new(&self.checkpoint.snapshot, &tensor.shard, &tensor.meta, self.cfg.hidden)
     }
-
-    /// BF16 rows of `tokens`.
-    pub fn rows(&self, tokens: &[u32]) -> Result<Vec<u8>> {
-        let mut out = vec![0u8; tokens.len() * self.row];
-        for (slot, token) in out.chunks_exact_mut(self.row).zip(tokens) {
-            self.file.read_exact_at(slot, self.offset + u64::from(*token) * self.row as u64)?;
-        }
-        Ok(out)
-    }
-}
-
-pub(crate) fn embed_rows(checkpoint: &Checkpoint, tokens: &[u32], hidden: usize) -> Result<Vec<u8>> {
-    let name = "model.embed_tokens.weight";
-    let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
-        .map_err(|_| anyhow::anyhow!("checkpoint has no {name}"))?;
-    let tensor = &checkpoint.tensors[at];
-    let file = std::fs::File::open(checkpoint.snapshot.join(&tensor.shard))?;
-    let row = hidden * 2;
-    let mut out = vec![0u8; tokens.len() * row];
-    for (slot, token) in out.chunks_exact_mut(row).zip(tokens) {
-        file.read_exact_at(slot, tensor.meta.byte_offset + u64::from(*token) * row as u64)?;
-    }
-    Ok(out)
 }
 
 fn bf16s(bytes: &[u8]) -> Vec<f32> {
@@ -428,7 +412,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
             Ok(taps)
         };
         return crate::families::glm5::dflash::replay(drafter, &tokens, &greedy, &taps,
-            &|t| embed_rows(&opened.checkpoint, t, hidden), engine.weights.head.buffer.ptr, start);
+            &|t| engine.embedding.host_rows(t), engine.weights.head.buffer.ptr, start);
     }
     if let Some(dir) = &args.mtp_oracle {
         return mtp_oracle(args, opened, engine, dir);
@@ -438,10 +422,15 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
     if let Some(at) = args.resume_at {
-        return resume_check(args, opened, engine, &tokens, at);
+        return resume_check(args, engine, &tokens, at);
+    }
+    if let Some(steps) = args.token_check {
+        return token_check(args, opened, engine, &tokens, steps);
+    }
+    if let Some(count) = args.greedy_digest {
+        return greedy_digest(args, opened, engine, &tokens, count);
     }
     let mut placement = engine::Allocator::new(engine.pages, engine.rings).admit(tokens.len())?;
-    let embed = embed_rows(&opened.checkpoint, &tokens, cfg.hidden)?;
     let row = cfg.hidden * 2;
     let prefill = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
     // Rows [first, first + n) of layer `layer`'s golden output.
@@ -482,7 +471,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
     for first in (0..prefill).step_by(chunk) {
         let n = chunk.min(prefill - first);
         let mut prefill_compare = |layer: usize, stream: &[u8]| compare(layer, first, stream, &mut worst);
-        logits = engine.prefill_forced(&mut placement, &embed[first * row..(first + n) * row], args.nll,
+        logits = engine.prefill_forced(&mut placement, &tokens[first..first + n], args.nll,
             (!args.timing).then_some(&mut prefill_compare as &mut dyn FnMut(usize, &[u8]) -> Result<()>),
             args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>))?;
         if args.nll {
@@ -505,7 +494,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
         let n = args.step_rows.min(tokens.len() - position);
         let first = position;
         let mut step_compare = |layer: usize, stream: &[u8]| compare(layer, first, stream, &mut decode_worst);
-        if let Some(logits) = engine.verify(&mut [(&mut placement, n)], &embed[position * row..(position + n) * row],
+        if let Some(logits) = engine.verify(&mut [(&mut placement, n)], &tokens[position..position + n],
             (!args.timing).then_some(&mut step_compare as &mut dyn FnMut(usize, &[u8]) -> Result<()>))? {
             decode_logits.extend(logits);
         }
@@ -632,7 +621,7 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<
         let anchor = tokens[position];
         let timer = Instant::now();
         let draft = drafter.draft(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
-            &embed_rows(&opened.checkpoint, &[anchor], hidden)?, engine.weights.head.buffer.ptr)?.remove(0);
+            &engine.embedding, engine.weights.head.buffer.ptr)?.remove(0);
         draft_seconds += timer.elapsed().as_secs_f64();
         let reference = &ref_tokens[index * drafts_per..][..drafts_per];
         exact += usize::from(draft.tokens == reference);
@@ -664,15 +653,13 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<
     for slot in 1..drafter.slots {
         update(position.saturating_sub(dflash::RING), position, slot)?;
     }
-    let anchor = embed_rows(&opened.checkpoint, &[tokens[position]], hidden)?;
     for sequences in 1..=drafter.slots {
         let seqs: Vec<_> = (0..sequences).map(|slot| dflash::DraftSeq { slot, anchor: tokens[position], position, valid_from: 0 })
             .collect();
-        let rows = anchor.repeat(sequences);
-        drafter.draft(&seqs, &rows, engine.weights.head.buffer.ptr)?;
+        drafter.draft(&seqs, &engine.embedding, engine.weights.head.buffer.ptr)?;
         let timer = Instant::now();
         for _ in 0..10 {
-            drafter.draft(&seqs, &rows, engine.weights.head.buffer.ptr)?;
+            drafter.draft(&seqs, &engine.embedding, engine.weights.head.buffer.ptr)?;
         }
         let per = timer.elapsed().as_secs_f64() * 1e2;
         let timer = Instant::now();
@@ -713,7 +700,6 @@ fn mtp_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
     }).collect();
     let last = std::fs::read(args.golden.join(format!("layer{:02}.bin", opened.cfg.layers - 1)))?;
     let row = hidden * 2;
-    let embed = |ids: &[u32]| embed_rows(&opened.checkpoint, ids, hidden);
     engine.mtp_reset(0, anchors[0]);
     let (mut compared, mut matched, mut text, mut target) = (vec![0usize; stages], vec![0usize; stages], 0usize, 0usize);
     let mut seconds = 0f64;
@@ -729,7 +715,7 @@ fn mtp_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
         }
         filled = p;
         let timer = Instant::now();
-        let drafts = engine.mtp_draft(&[mtp::MtpSeq { ring: 0, len: p, tokens: &tokens[..=p] }], stages, &embed)?
+        let drafts = engine.mtp_draft(&[mtp::MtpSeq { ring: 0, len: p, tokens: &tokens[..=p] }], stages)?
             .remove(0);
         seconds += timer.elapsed().as_secs_f64();
         for k in 0..stages {
@@ -759,16 +745,16 @@ struct SuffixRun {
     last: Vec<f32>,
 }
 
-/// Prefill `embed` into `placement` in chunks, hashing each layer's rows and (with `logits`)
+/// Prefill `tokens` into `placement` in chunks, hashing each layer's rows and (with `logits`)
 /// every row's logits.
-fn prefill_digest(engine: &engine::MimoEngine<'_>, placement: &mut engine::MimoPlacement, embed: &[u8], chunk: usize,
+fn prefill_digest(engine: &engine::MimoEngine<'_>, placement: &mut engine::MimoPlacement, tokens: &[u32], chunk: usize,
     logits: bool) -> Result<SuffixRun> {
     use std::hash::{Hash, Hasher};
-    let (row, vocab) = (engine.cfg.hidden * 2, engine.cfg.vocab_size);
+    let vocab = engine.cfg.vocab_size;
     let mut hashers: Vec<std::collections::hash_map::DefaultHasher> = Vec::new();
     let mut logit_hash = std::collections::hash_map::DefaultHasher::new();
     let (mut argmax, mut last) = (Vec::new(), Vec::new());
-    for part in embed.chunks(chunk * row) {
+    for part in tokens.chunks(chunk) {
         let mut on_layer = |layer: usize, rows: &[u8]| -> Result<()> {
             if hashers.len() <= layer {
                 hashers.resize_with(layer + 1, Default::default);
@@ -820,20 +806,19 @@ fn opened_copy(engine: &engine::MimoEngine<'_>, out: &mut [u8], source: cuteafd_
     engine.library.copy_d2h(out, source)
 }
 
-fn resume_check(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_>, tokens: &[u32], at: usize)
+fn resume_check(args: &GoldenArgs, engine: &engine::MimoEngine<'_>, tokens: &[u32], at: usize)
     -> Result<()> {
     use cuteafd_engine::prefix::{MarkSlot, PrefixFamily};
     ensure!(engine.weights.layers.len() == engine.cfg.layers, "--resume-at needs every layer");
     let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
     ensure!(at > 0 && at < n, "--resume-at {at} must lie inside the {n} prefilled tokens");
     let chunk = args.prefill_chunk.unwrap_or(engine.prefill_rows).clamp(1, engine.prefill_rows);
-    let row = opened.cfg.hidden * 2;
-    let embed = embed_rows(&opened.checkpoint, &tokens[..n], opened.cfg.hidden)?;
+    let embed = &tokens[..n];
     let family = prefix::MimoPrefix::new(engine, |_| 2, false)?;
     let mut allocator = engine::Allocator::new(engine.pages, engine.rings);
     // A: prefill [0, P), capture, continue in place.
     let mut a = allocator.admit(n)?;
-    prefill_digest(engine, &mut a, &embed[..at * row], chunk, false)?;
+    prefill_digest(engine, &mut a, &embed[..at], chunk, false)?;
     family.drain().map_err(|e| anyhow::anyhow!("{e}"))?;
     let started = Instant::now();
     family.capture(MarkSlot(0), &a, at).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -855,8 +840,8 @@ fn resume_check(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<
         Ok(bytes)
     };
     let mark_equal = mark(0)? == mark(1)?;
-    let straight = prefill_digest(engine, &mut a, &embed[at * row..], chunk, true)?;
-    let restored = prefill_digest(engine, &mut b, &embed[at * row..], chunk, true)?;
+    let straight = prefill_digest(engine, &mut a, &embed[at..], chunk, true)?;
+    let restored = prefill_digest(engine, &mut b, &embed[at..], chunk, true)?;
     let first_layer = straight.layers.iter().zip(&restored.layers).position(|(x, y)| x != y);
     let logits_equal = straight.logits == restored.logits;
     let max_diff = straight.last.iter().zip(&restored.last).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
@@ -870,7 +855,7 @@ fn resume_check(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<
     allocator.release(a);
     // C: one prefill with no boundary at P (chunking changes may round differently; informational).
     let mut c = allocator.admit(n)?;
-    let whole = prefill_digest(engine, &mut c, &embed, chunk, true)?;
+    let whole = prefill_digest(engine, &mut c, embed, chunk, true)?;
     let x = &whole.argmax[at..];
     let agree = x.iter().zip(&restored.argmax).filter(|(p, q)| p == q).count();
     let last_equal = whole.last.iter().zip(&restored.last).all(|(p, q)| p.to_bits() == q.to_bits());
@@ -879,5 +864,112 @@ fn resume_check(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<
     allocator.release(c);
     ensure!(first_layer.is_none() && logits_equal && kv_equal && mark_equal,
         "the restored sequence differs from the straight one");
+    Ok(())
+}
+
+/// The golden prompt (`--prefill N` truncates it) prefilled into a fresh
+/// sequence; returns the placement and the last row's logits.
+fn prefill_prompt(args: &GoldenArgs, engine: &engine::MimoEngine<'_>, allocator: &mut engine::Allocator,
+    tokens: &[u32], extra: usize) -> Result<(engine::MimoPlacement, Vec<f32>)> {
+    let prompt = &tokens[..args.prefill.unwrap_or(tokens.len()).min(tokens.len())];
+    let mut placement = allocator.admit(prompt.len() + extra + engine::DECODE_ROWS)?;
+    let mut last = None;
+    for chunk in prompt.chunks(engine.prefill_rows) {
+        last = engine.prefill_device(&mut placement, chunk, false, None, None)?;
+    }
+    let last = last.context("the check needs every layer")?.row_host(engine.library, 0)?;
+    engine.mtp_reset(placement.ring as usize, placement.len);
+    Ok((placement, last))
+}
+
+/// `--token-check N`: [`crate::shared::token_io::gate`] over N greedy decode steps after the prompt.
+fn token_check(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_>, tokens: &[u32], steps: usize)
+    -> Result<()> {
+    let mut allocator = engine::Allocator::new(engine.pages, engine.rings);
+    let (mut placement, last) = prefill_prompt(args, engine, &mut allocator, tokens, steps)?;
+    let first = cuteafd_core::TargetSamplingParams::greedy().select_token(&last, None, 0)? as u32;
+    let result = crate::shared::token_io::gate(&opened.library, &engine.embedding, first, steps, |token| {
+        engine.verify_device(&mut [(&mut placement, 1)], &[token], None)?
+            .ok_or_else(|| anyhow::anyhow!("decode needs every layer"))
+    });
+    allocator.release(placement);
+    result
+}
+
+/// `--greedy-digest N`: N greedy tokens after the prompt, one per step, with
+/// an FNV-1a digest of every step's logits; with MTP stages loaded, the same
+/// decode speculatively (drafts verified in one step, host argmax) must give
+/// the same tokens.
+fn greedy_digest(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_>, tokens: &[u32], count: usize)
+    -> Result<()> {
+    let vocab = opened.cfg.vocab_size;
+    let argmax = |l: &[f32]| -> Result<u32> {
+        Ok(cuteafd_core::TargetSamplingParams::greedy().select_token(l, None, 0)? as u32)
+    };
+    let mut allocator = engine::Allocator::new(engine.pages, engine.rings);
+    let (mut placement, last) = prefill_prompt(args, engine, &mut allocator, tokens, count)?;
+    let mut next = argmax(&last)?;
+    let mut plain = vec![next];
+    let mut digest = 0xcbf2_9ce4_8422_2325u64;
+    let started = Instant::now();
+    while plain.len() < count {
+        let logits = engine.verify(&mut [(&mut placement, 1)], &[next], None)?.context("decode needs every layer")?;
+        for v in &logits {
+            digest = (digest ^ u64::from(v.to_bits())).wrapping_mul(0x0100_0000_01b3);
+        }
+        next = argmax(&logits)?;
+        plain.push(next);
+    }
+    let plain_s = started.elapsed().as_secs_f64();
+    allocator.release(placement);
+    println!("greedy digest: {count} tokens, logits digest {digest:016x}, {:.2} ms/token; tokens {:?}",
+        1e3 * plain_s / count as f64, &plain[..plain.len().min(32)]);
+    let Some(mtp) = engine.mtp.as_ref() else { return Ok(()) };
+    let stages = mtp.stages.len();
+    let (mut placement, last) = prefill_prompt(args, engine, &mut allocator, tokens, count)?;
+    let mut history: Vec<u32> = tokens[..placement.len].to_vec();
+    let mut out = vec![argmax(&last)?];
+    history.push(out[0]);
+    let (mut cycles, mut accepted, mut all_drafts) = (0usize, 0usize, Vec::new());
+    let started = Instant::now();
+    let mut draft_s = 0f64;
+    while out.len() < count {
+        let timer = Instant::now();
+        let drafts = engine.mtp_draft(&[mtp::MtpSeq { ring: placement.ring as usize, len: placement.len,
+            tokens: &history }], stages)?.remove(0);
+        draft_s += timer.elapsed().as_secs_f64();
+        all_drafts.extend_from_slice(&drafts);
+        let room = count - out.len();
+        let rows: Vec<u32> = std::iter::once(*history.last().unwrap()).chain(drafts.iter().copied())
+            .take(room.max(1)).collect();
+        let start = placement.len;
+        let logits = engine.verify(&mut [(&mut placement, rows.len())], &rows, None)?
+            .context("decode needs every layer")?;
+        let mut kept = 0;
+        for j in 0..rows.len() {
+            let token = argmax(&logits[j * vocab..(j + 1) * vocab])?;
+            kept = j + 1;
+            out.push(token);
+            history.push(token);
+            if rows.get(j + 1) != Some(&token) || out.len() >= count {
+                break;
+            }
+        }
+        placement.len = start + kept;
+        cycles += 1;
+        accepted += kept - 1;
+    }
+    out.truncate(count);
+    let mut draft_digest = 0xcbf2_9ce4_8422_2325u64;
+    for d in &all_drafts {
+        draft_digest = (draft_digest ^ u64::from(*d)).wrapping_mul(0x0100_0000_01b3);
+    }
+    let same = out.iter().zip(&plain).take_while(|(a, b)| a == b).count();
+    println!("MTP greedy ({stages} stages): {} | {cycles} cycles, {:.2} tokens/cycle, accepted {accepted} of {} drafts, \
+        draft digest {draft_digest:016x}; {:.2} ms/draft cycle, {:.1} tok/s",
+        if same == count { "identical to plain greedy".to_string() } else { format!("diverges at token {same}") },
+        count as f64 / cycles as f64, all_drafts.len(), 1e3 * draft_s / cycles as f64,
+        count as f64 / started.elapsed().as_secs_f64());
+    allocator.release(placement);
     Ok(())
 }

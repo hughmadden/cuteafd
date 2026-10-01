@@ -19,6 +19,7 @@ use super::weights::{MimoLayer, MimoWeights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
+use crate::shared::token_io::{DeviceLogits, TokenEmbedding};
 use crate::shared::spark_intake::SparkLink;
 use cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
 use cuteafd_transport::{
@@ -193,6 +194,10 @@ struct Workspace<'a> {
     /// has none), and pinned staging for routes, wire rows and partials.
     zero_plane: Dev<'a>,
     router_host: RefCell<HostAllocation<'a>>,
+    /// The step's token ids (U32), gathered from the device embedding table.
+    ids: Dev<'a>,
+    /// Greedy selection of logits rows (MTP drafts): U32 ids, then U32 statuses.
+    select: Dev<'a>,
     head: VocabularyHead<'a>,
     _head_workspace: Dev<'a>,
 }
@@ -225,6 +230,10 @@ pub(crate) struct MimoEngine<'a> {
     pub l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
     /// The native MTP drafter: every step taps the last layer's rows.
     pub mtp: Option<super::mtp::MtpDrafter<'a>>,
+    /// The token embedding table (resident on this GPU or read from its shard).
+    pub embedding: TokenEmbedding<'a>,
+    /// Pinned staging of queued MTP passes' tables (async uploads) and its fill level.
+    mtp_staging: RefCell<(HostAllocation<'a>, usize)>,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -252,8 +261,9 @@ impl<'a> MimoEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: MimoV2Config,
         weights: MimoWeights<'a>, stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize,
-        rings: usize) -> Result<Self> {
+        rings: usize, embedding: TokenEmbedding<'a>) -> Result<Self> {
         let family = cfg.program_family()?;
+        ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         ensure!(cfg.rope_dim == 64 && cfg.head_dim == 192 && cfg.v_head_dim == 128 && cfg.window <= RING_ROWS - DECODE_ROWS,
             "the mimo programs are built for 192/128 heads, 64 RoPE dims and a window of at most {}",
             RING_ROWS - DECODE_ROWS);
@@ -289,7 +299,8 @@ impl<'a> MimoEngine<'a> {
         Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, rings, family, kv, cos_sin_full,
             cos_sin_swa, workspace: RefCell::new(None), decode_workspace: RefCell::new(None), experts: None,
             expert_input: ExpertInput::Fp8,
-            profile: RefCell::new([0.0; 2]), drafter: None, mtp: None, l2: None })
+            profile: RefCell::new([0.0; 2]), drafter: None, mtp: None, l2: None, embedding,
+            mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20)?, 0)) })
     }
 
     /// Layer `layer`'s KV storage: the paged record pool (full attention; page `p` holds
@@ -378,6 +389,8 @@ impl<'a> MimoEngine<'a> {
             },
             router_host: RefCell::new(HostAllocation::new(self.library,
                 if spark { t * (self.cfg.topk * 8 + 2 * h) } else { 256 })?),
+            ids: self.alloc(t * 4)?,
+            select: self.alloc(t * 8)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, t as u32,
                 self.cfg.vocab_size as u32)? },
@@ -400,21 +413,22 @@ impl<'a> MimoEngine<'a> {
     }
 
     /// Prefills a sequence from its length through every resident layer and
-    /// returns the last row's logits when all layers are resident.
-    /// `on_layer` receives each layer's output rows (BF16 [t, hidden]).
-    pub fn prefill(&self, placement: &mut MimoPlacement, embed: &[u8],
-        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<Vec<f32>>> {
-        self.prefill_forced(placement, embed, false, on_layer, None)
-    }
-
-    /// `prefill` with teacher forcing: after layer `l`, `forced(l)` (when it
+    /// returns the last row's logits when all layers are resident, with teacher forcing: after layer `l`, `forced(l)` (when it
     /// returns rows) replaces the residual before layer `l + 1`, so each
     /// layer's comparison measures that layer alone. `all_logits` returns
     /// every row's logits instead of the last row's.
-    pub fn prefill_forced(&self, placement: &mut MimoPlacement, embed: &[u8], all_logits: bool,
+    pub fn prefill_forced(&self, placement: &mut MimoPlacement, tokens: &[u32], all_logits: bool,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<Vec<f32>>> {
-        let (t, start) = (embed.len() / (self.cfg.hidden * 2), placement.len);
+        self.prefill_device(placement, tokens, all_logits, on_layer, forced)?
+            .map(|logits| logits.to_host(self.library)).transpose()
+    }
+
+    /// [`Self::prefill_forced`] leaving the logits on the device.
+    pub fn prefill_device(&self, placement: &mut MimoPlacement, tokens: &[u32], all_logits: bool,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<DeviceLogits>> {
+        let (t, start) = (tokens.len(), placement.len);
         ensure!(t > 0 && t <= self.prefill_rows && start + t <= self.max_context, "prefill of {t} rows at {start}");
         let used = (start + t).div_ceil(PAGE_ROWS);
         let tables = StepTables {
@@ -426,7 +440,7 @@ impl<'a> MimoEngine<'a> {
             page_table: placement.pages[..used].iter().map(|&page| page as i32).collect(),
             table_stride: 0,
         };
-        let logits = self.step(&tables, embed, if all_logits { t } else { 1 }, on_layer, forced)?;
+        let logits = self.step(&tables, tokens, if all_logits { t } else { 1 }, on_layer, forced)?;
         placement.len += t;
         Ok(logits)
     }
@@ -435,10 +449,16 @@ impl<'a> MimoEngine<'a> {
     /// speculative verify) at its length in one decode-shaped step; returns
     /// every row's logits. A caller that rejects a suffix sets `len` back:
     /// the 256-slot rings keep every key a later step can still need.
-    pub fn verify(&self, sequences: &mut [(&mut MimoPlacement, usize)], embed: &[u8],
+    pub fn verify(&self, sequences: &mut [(&mut MimoPlacement, usize)], tokens: &[u32],
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<Vec<f32>>> {
+        self.verify_device(sequences, tokens, on_layer)?.map(|logits| logits.to_host(self.library)).transpose()
+    }
+
+    /// [`Self::verify`] leaving every row's logits on the device.
+    pub fn verify_device(&self, sequences: &mut [(&mut MimoPlacement, usize)], tokens: &[u32],
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<DeviceLogits>> {
         let rows: usize = sequences.iter().map(|(_, n)| n).sum();
-        ensure!(rows > 0 && rows <= DECODE_ROWS && embed.len() == rows * self.cfg.hidden * 2, "decode step of {rows} rows");
+        ensure!(rows > 0 && rows <= DECODE_ROWS && tokens.len() == rows, "decode step of {rows} rows");
         let stride = sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1);
         let mut tables = StepTables { decode: true, positions: Vec::new(), slots: Vec::new(), ring_slots: Vec::new(),
             seq_first: Vec::new(), page_table: Vec::new(), table_stride: stride };
@@ -455,16 +475,16 @@ impl<'a> MimoEngine<'a> {
                 tables.page_table.extend(pages);
             }
         }
-        let logits = self.step(&tables, embed, rows, on_layer, None)?;
+        let logits = self.step(&tables, tokens, rows, on_layer, None)?;
         for (placement, count) in sequences.iter_mut() {
             placement.len += *count;
         }
         Ok(logits)
     }
 
-    fn step(&self, tables: &StepTables, embed: &[u8], logit_rows: usize,
+    fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
-        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<Vec<f32>>> {
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<DeviceLogits>> {
         let (h, t) = (self.cfg.hidden, tables.positions.len());
         let (slot, capacity) = if tables.decode { (&self.decode_workspace, DECODE_ROWS) } else { (&self.workspace, self.prefill_rows) };
         if slot.borrow().is_none() {
@@ -472,13 +492,17 @@ impl<'a> MimoEngine<'a> {
         }
         let workspace = slot.borrow();
         let w = workspace.as_ref().context("workspace")?;
-        ensure!(t <= w.rows && logit_rows <= t, "step exceeds the workspace");
+        ensure!(t <= w.rows && logit_rows <= t && tokens.len() == t, "step exceeds the workspace");
+        // The tables and ids go up synchronously: the previous step (which no
+        // longer ends in a logits download) must be done reading them.
+        // SAFETY: the engine owns this stream.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
         self.put(&w.positions, &tables.positions)?;
         self.put(&w.slots, &tables.slots)?;
         self.put(&w.ring_slots, &tables.ring_slots)?;
         self.put(&w.seq_first, &tables.seq_first)?;
         self.put(&w.page_table, &tables.page_table)?;
-        self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: embed.len(), ..w.h.buffer }, embed)?;
+        self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
         let rows = Scalar::I32(t as i32);
         let cap = if tables.decode { "m64" } else { "m4096" };
         let layers = &self.weights.layers;
@@ -546,8 +570,9 @@ impl<'a> MimoEngine<'a> {
                     logit_rows as u32, self.stream)?;
             },
         }
-        let logits = self.download(&w.logits, logit_rows * self.cfg.vocab_size * 4)?;
-        Ok(Some(logits.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()))
+        let vocab = self.cfg.vocab_size;
+        Ok(Some(DeviceLogits { ptr: w.logits.buffer.ptr, rows: logit_rows, vocab, stride: vocab, stream: self.stream,
+            greedy: None }))
     }
 
     /// `residual (h) += delta` when `deltas` is 1, then `x = weight * RMSNorm(h)`.
@@ -599,12 +624,18 @@ impl<'a> MimoEngine<'a> {
     }
 
     /// Up to `stages` MTP drafts after each sequence's next token (see
-    /// `mtp`); `embed` maps tokens to BF16 embedding rows.
-    pub fn mtp_draft(&self, seqs: &[super::mtp::MtpSeq<'_>], stages: usize,
-        embed: &dyn Fn(&[u32]) -> Result<Vec<u8>>) -> Result<Vec<Vec<u32>>> {
+    /// `mtp`). Every pass embeds its tokens on the device (later stages read
+    /// the earlier stages' drafts there), so the passes queue back to back
+    /// and the drafts come back once, at the end.
+    pub fn mtp_draft(&self, seqs: &[super::mtp::MtpSeq<'_>], stages: usize) -> Result<Vec<Vec<u32>>> {
+        use super::mtp::Token;
         let mtp = self.mtp.as_ref().context("no MTP drafter")?;
         let stages = stages.min(mtp.stages.len());
-        let mut drafts: Vec<Vec<u32>> = vec![Vec::new(); seqs.len()];
+        ensure!(seqs.len() <= DECODE_ROWS, "MTP drafts of {} sequences", seqs.len());
+        // The previous step is done with the staging.
+        // SAFETY: the engine owns this stream.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        self.mtp_staging.borrow_mut().1 = 0;
         for k in 0..stages {
             // Catch-up passes over true rows while a sequence's rows exceed the step.
             loop {
@@ -619,14 +650,15 @@ impl<'a> MimoEngine<'a> {
                     let true_end = seq.len.saturating_sub(k.max(1));
                     if seq.len - ext > MTP_STEP_ROWS && ext < true_end && rows < DECODE_ROWS {
                         let n = (true_end - ext).min(DECODE_ROWS - rows);
-                        groups.push((seq.ring, ext, (ext..ext + n).map(|j| seq.tokens[j + k + 1]).collect::<Vec<_>>()));
+                        groups.push((seq.ring, ext, (ext..ext + n).map(|j| Token::Known(seq.tokens[j + k + 1]))
+                            .collect::<Vec<_>>()));
                         rows += n;
                     }
                 }
                 if groups.is_empty() {
                     break;
                 }
-                self.mtp_pass(mtp, k, &groups, embed, false)?;
+                self.mtp_pass(mtp, k, &groups, None)?;
                 let mut ext = mtp.ext.borrow_mut();
                 for (ring, first, tokens) in &groups {
                     ext[*ring][k] = ext[*ring][k].max(first + tokens.len());
@@ -647,46 +679,91 @@ impl<'a> MimoEngine<'a> {
                         break;
                     }
                     ensure!(n <= DECODE_ROWS, "MTP stage {k}: {n} pending rows");
-                    let tokens: Vec<u32> = (ext..seq.len).map(|j| {
+                    let tokens: Vec<Token> = (ext..seq.len).map(|j| {
                         let at = j + k + 1;
-                        if at <= seq.len { seq.tokens[at] } else { drafts[index][at - seq.len - 1] }
+                        if at <= seq.len { Token::Known(seq.tokens[at]) }
+                        else { Token::Draft { stage: at - seq.len - 1, member: index } }
                     }).collect();
                     groups.push((seq.ring, ext, tokens));
                     members.push(index);
                     rows += n;
                     index += 1;
                 }
-                let tops = self.mtp_pass(mtp, k, &groups, embed, true)?;
+                self.mtp_pass(mtp, k, &groups, Some(&members))?;
                 let mut ext = mtp.ext.borrow_mut();
-                for ((&i, (ring, _, _)), top) in members.iter().zip(&groups).zip(tops) {
-                    drafts[i].push(top);
+                for (&i, (ring, _, _)) in members.iter().zip(&groups) {
                     ext[*ring][k] = ext[*ring][k].max(seqs[i].len.saturating_sub(k));
                 }
             }
         }
-        Ok(drafts)
+        if stages == 0 {
+            return Ok(vec![Vec::new(); seqs.len()]);
+        }
+        let bytes = self.download(&mtp.ids, (1 + stages) * DECODE_ROWS * 4)?;
+        let word = |at: usize| u32::from_le_bytes(bytes[at * 4..at * 4 + 4].try_into().unwrap());
+        Ok((0..seqs.len()).map(|i| (0..stages).map(|k| word((1 + k) * DECODE_ROWS + i)).collect()).collect())
+    }
+
+    /// Queues `bytes` into `dst` through the MTP staging (waits for the
+    /// stream only when the staging is full).
+    fn stage_async(&self, dst: cuteafd_ffi::CuteafdDeviceBuffer, bytes: &[u8]) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        ensure!(bytes.len() <= dst.bytes, "staged upload exceeds its buffer");
+        let mut staging = self.mtp_staging.borrow_mut();
+        if staging.1 + bytes.len() > staging.0.buffer.bytes {
+            // SAFETY: the engine owns this stream; its queued copies read the staging.
+            unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+            staging.1 = 0;
+        }
+        let at = staging.1;
+        ensure!(at + bytes.len() <= staging.0.buffer.bytes, "MTP pass inputs exceed the staging buffer");
+        staging.0.bytes_mut()[at..at + bytes.len()].copy_from_slice(bytes);
+        let source = cuteafd_ffi::CuteafdHostBuffer {
+            // SAFETY: `at` lies inside the pinned staging buffer.
+            ptr: unsafe { staging.0.buffer.ptr.cast::<u8>().add(at) }.cast(),
+            bytes: bytes.len(),
+            ..staging.0.buffer
+        };
+        // SAFETY: the staged bytes stay untouched until the stream drains (see above).
+        unsafe { self.library.copy_host_buffer_h2d_async(dst, source, bytes.len(), self.stream)? };
+        staging.1 = (at + bytes.len()).div_ceil(16) * 16;
+        Ok(())
     }
 
     /// One MTP stage over `groups` of (ring, first row, tokens t_{j+k+1});
-    /// with `logits`, returns the argmax of each group's last row.
-    fn mtp_pass(&self, mtp: &super::mtp::MtpDrafter<'_>, k: usize, groups: &[(usize, usize, Vec<u32>)],
-        embed: &dyn Fn(&[u32]) -> Result<Vec<u8>>, logits: bool) -> Result<Vec<u32>> {
-        use super::mtp::HIDDEN_ROWS;
+    /// with `members`, each group's last row's draft becomes stage `k`'s draft
+    /// of that member (on the device). Queued: no host wait.
+    fn mtp_pass(&self, mtp: &super::mtp::MtpDrafter<'_>, k: usize,
+        groups: &[(usize, usize, Vec<super::mtp::Token>)], members: Option<&[usize]>) -> Result<()> {
+        use super::mtp::{Token, HIDDEN_ROWS};
         let stage = &mtp.stages[k];
         let (h, vocab) = (self.cfg.hidden, self.cfg.vocab_size);
         let mut tables = StepTables { decode: true, positions: Vec::new(), slots: Vec::new(), ring_slots: Vec::new(),
             seq_first: Vec::new(), page_table: vec![0], table_stride: 1 };
-        let mut all_tokens = Vec::new();
+        let (mut known, mut index) = (Vec::new(), Vec::new());
         for (ring, first, tokens) in groups {
             ensure!(*ring < self.rings, "MTP ring {ring} of {}", self.rings);
             let start = tables.positions.len() as i32;
-            for j in *first..first + tokens.len() {
+            for (j, token) in (*first..first + tokens.len()).zip(tokens) {
                 tables.positions.push(j as i64);
                 tables.slots.push(-1);
                 tables.ring_slots.push((ring * RING_ROWS + j % RING_ROWS) as i64);
                 tables.seq_first.push(start);
+                let r = known.len();
+                match *token {
+                    Token::Known(id) => {
+                        known.push(id);
+                        index.push(r as u32);
+                    }
+                    Token::Draft { stage, member } => {
+                        ensure!(stage < k && member < DECODE_ROWS, "MTP stage {k} reads draft {stage} of {member}");
+                        known.push(0);
+                        index.push(((1 + stage) * DECODE_ROWS + member) as u32);
+                    }
+                }
             }
-            all_tokens.extend_from_slice(tokens);
         }
         let t = tables.positions.len();
         ensure!(t > 0 && t <= DECODE_ROWS, "MTP pass of {t} rows");
@@ -695,13 +772,18 @@ impl<'a> MimoEngine<'a> {
         }
         let workspace = self.decode_workspace.borrow();
         let w = workspace.as_ref().context("workspace")?;
-        self.put(&w.positions, &tables.positions)?;
-        self.put(&w.ring_slots, &tables.ring_slots)?;
-        self.put(&w.seq_first, &tables.seq_first)?;
-        self.put(&w.page_table, &tables.page_table)?;
+        self.stage_async(w.positions.buffer, bytes_of(&tables.positions))?;
+        self.stage_async(w.ring_slots.buffer, bytes_of(&tables.ring_slots))?;
+        self.stage_async(w.seq_first.buffer, bytes_of(&tables.seq_first))?;
+        self.stage_async(w.page_table.buffer, bytes_of(&tables.page_table))?;
+        self.embedding.check(&known)?;
+        self.stage_async(mtp.ids.buffer, bytes_of(&known))?;
+        self.stage_async(mtp.index.buffer, bytes_of(&index))?;
         let row = h * 2;
-        self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: t * row, ..mtp.embed.buffer },
-            &embed(&all_tokens)?)?;
+        // SAFETY: the ids (known tokens, earlier stages' drafts) and the indices are
+        // ordered on this stream before the gather; `embed` holds DECODE_ROWS rows.
+        unsafe { self.embedding.embed_device_ids(mtp.ids.buffer, Some((mtp.index.buffer.ptr.cast_const(), &index)),
+            t, 1, None, mtp.embed.buffer, self.stream)? };
         // The target's hidden rows of the same positions.
         let mut at = 0;
         for (ring, first, tokens) in groups {
@@ -741,11 +823,8 @@ impl<'a> MimoEngine<'a> {
         pointers.extend([("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
         self.run("mimo_ffn_m64", &pointers, &fp8_scalars(rows, true, layer.has("w_down_fp8")))?;
         self.norm(w, stage.final_norm.buffer.ptr, 1, rows)?;
-        if !logits {
-            // SAFETY: the engine owns this stream.
-            unsafe { self.library.cuda_stream_synchronize(self.stream)? };
-            return Ok(Vec::new());
-        }
+        let Some(members) = members else { return Ok(()) };
+        ensure!(members.len() == groups.len(), "a member per drafting group");
         match &self.weights.head_fp8 {
             Some((q, scale)) if t <= FP8_ROWS as usize => {
                 self.run("mimo_head_fp8", &[("x", w.x.buffer.ptr), ("w_fp8", q.buffer.ptr), ("scale", scale.buffer.ptr),
@@ -757,22 +836,22 @@ impl<'a> MimoEngine<'a> {
                     t as u32, self.stream)?;
             },
         }
-        // SAFETY: the engine owns this stream.
-        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
-        let mut tops = Vec::with_capacity(groups.len());
-        let mut end = 0;
-        let mut bytes = vec![0u8; vocab * 4];
-        for (_, _, tokens) in groups {
-            end += tokens.len();
-            self.library.copy_d2h(&mut bytes, cuteafd_ffi::CuteafdDeviceBuffer {
-                // SAFETY: row end - 1 lies inside the logits buffer.
-                ptr: unsafe { w.logits.buffer.ptr.cast::<u8>().add((end - 1) * vocab * 4) }.cast(),
-                bytes: vocab * 4, ..w.logits.buffer })?;
-            let best = bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).enumerate()
-                .max_by(|a, b| a.1.total_cmp(&b.1)).map_or(0, |(i, _)| i);
-            tops.push(best as u32);
+        let region = |dev: &Dev<'_>, offset: usize, bytes: usize| cuteafd_ffi::CuteafdDeviceBuffer {
+            // SAFETY: callers pass offsets inside the allocation.
+            ptr: unsafe { dev.buffer.ptr.cast::<u8>().add(offset) }.cast(), bytes, ..dev.buffer };
+        // SAFETY: the logits rows, the select buffer (ids, then statuses) and the
+        // drafts region are live buffers of these shapes; stream-ordered.
+        unsafe {
+            self.library.cuda_logits_greedy_f32_async(w.logits.buffer.ptr, t, vocab, vocab, w.select.buffer.ptr,
+                std::ptr::null_mut(), region(&w.select, t * 4, t * 4).ptr, self.stream)?;
+            let mut end = 0;
+            for ((_, _, tokens), &member) in groups.iter().zip(members) {
+                end += tokens.len();
+                self.library.copy_d2d_async(region(&mtp.ids, ((1 + k) * DECODE_ROWS + member) * 4, 4),
+                    region(&w.select, (end - 1) * 4, 4), 4, self.stream)?;
+            }
         }
-        Ok(tops)
+        Ok(())
     }
 
     /// `kv`: the layer's paged record pool (full) or its rings (SWA).
