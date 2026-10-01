@@ -594,6 +594,28 @@ fn egress_enabled() -> bool {
     })
 }
 
+/// Logs once how this coordinator moves expert traffic, from the fabric it
+/// detected: requests leave zero-copy from one registered buffer
+/// (`CUTEAFD_SPARK_EGRESS`), partials arrive by the probed intake
+/// (`CUTEAFD_SPARK_INTAKE`), and every rank's traffic uses the coordinator's
+/// first rail. Measured on raptor (one 400 Gb port, both GPUs a host bridge
+/// away from the NIC) with six Sparks: the coordinator's intake (~19 GB/s
+/// landed in GPU memory) bounds a wave long before the ranks' links do (six
+/// rails of 100-200 Gb), so striping ranks over rails gains nothing there; a
+/// split GPU/pinned intake was slower than GPU landing alone.
+fn log_transfer_plan(mode: IntakeMode, ranks: usize) {
+    static LOGGED: OnceLock<()> = OnceLock::new();
+    LOGGED.get_or_init(|| match cuteafd_transport::fabric::discover() {
+        Ok(report) => {
+            let ports = report.rails.rails.iter().map(|rail| format!("{}@{} {:.0}G", rail.device, rail.address,
+                rail.effective_gbps)).collect::<Vec<_>>().join(", ");
+            tracing::info!(ranks, intake = mode.name(), egress = if egress_enabled() { "zero-copy" } else { "copied" },
+                coordinator_rails = %ports, "Spark transfer plan: every rank on the first coordinator rail");
+        }
+        Err(error) => tracing::warn!("Spark transfer plan: fabric discovery failed: {error:#}"),
+    });
+}
+
 /// A Spark transport and the intake its waves land in (dropped in that order).
 pub(crate) struct SparkLink<'a> {
     pub(crate) transport: SparkExperts,
@@ -614,6 +636,7 @@ impl<'a> SparkLink<'a> {
         // dispatch goes through `dispatch`, which calls `before_dispatch`.
         unsafe { intake.attach(&mut transport)? };
         // Expert input rows are at most BF16, as wide as a partial row.
+        log_transfer_plan(mode, peers.len());
         let egress_bytes = if egress_enabled() { capacity as usize * row_bytes } else { 0 };
         if egress_bytes > 0 {
             transport.enable_egress(egress_bytes)?;
