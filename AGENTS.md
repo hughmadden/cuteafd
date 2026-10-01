@@ -78,6 +78,13 @@ go in commit messages as short before → after tables with conditions.
   (1× RTX + the fewest Sparks it fits) and the maximum (2× RTX + 4 or 6
   Sparks, whichever divides the model sensibly). Other layouts need
   correctness gates, not perf tables; the planner's estimates cover them.
+- Tiered gates. Merges and features: cargo/script tests (failing ids, not
+  counts), golden NLL/byte-exactness on one GPU or loopback, and the
+  feature's own measurement. Full V4.1 parity (3 interleaved sessions; 6 only
+  when borderline) runs at release cuts and for changes to shared hot paths
+  (transport, expert exchange, native lib, sampler). Release images are built
+  for release cuts, not to verify branches; agentic benches gate with 1–2
+  short sessions, the full bench runs at release.
 - Unsupported is a result, not a crash: `cuteafd plan` names the tensors,
   formats, shapes and the exporter or kernel to add.
 - Load speed is a feature; do not regress readiness time.
