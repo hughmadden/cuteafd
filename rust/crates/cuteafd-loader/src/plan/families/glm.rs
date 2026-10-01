@@ -117,9 +117,10 @@ impl Family for Glm {
         if component != Component::RoutedExpert && modelopt {
             return Some(Hint {
                 what: format!("{} stored as {} (a ModelOpt release's dense parts)", component.label(), formats.join(", ")),
-                how: "PLAN.md Phase 5 S2: dequantize NVFP4 / per-tensor FP8 to BF16 at load (E2M1 x E4M3 x \
-                      weight_scale_2), then take the family's BF16 path (serve-glmf quantizes BF16 to 128x128 FP8 \
-                      blocks where its programs read FP8); serve-glm needs the same for BF16 MLA/FFN weights."
+                how: "PLAN.md Phase 5 S2: serve-glmf runs NVFP4 dense MLPs natively and quantizes BF16 to \
+                      128x128 FP8 blocks where its programs read FP8; serve-glm prefills per-tensor FP8 MLPs as \
+                      static W8A8 and quantizes BF16 MLA / shared-expert weights to FP8 blocks at load \
+                      (CUTEAFD_GLM_BF16=native: the BF16 programs on the checkpoint's own weights)."
                     .into(),
             });
         }
@@ -331,8 +332,9 @@ struct GlmModel {
 
 /// serve-glm's decode programs read these as FP8 (E4M3 with FP32 128x128
 /// scales): the checkpoint's own blocks, a ModelOpt per-tensor FP8 weight
-/// under a uniform grid, or a ModelOpt release's BF16 weight quantized to
-/// blocks at load (`GlmLoader::with_fp8`).
+/// under a uniform grid (prefill: static W8A8 on its input_scale), or a
+/// ModelOpt release's BF16 weight quantized to blocks at load
+/// (`GlmLoader::with_fp8`; CUTEAFD_GLM_BF16=native keeps it BF16 instead).
 const GLM5_DECODE_FP8: &[&str] = &["q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj", "gate_proj", "up_proj", "down_proj"];
 
 impl GlmModel {

@@ -137,6 +137,19 @@ def glm_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         for inter in (g.moe_inter, g.dense_inter):
             out.append((f"ffn_i{inter}_m{rows}", "ffn", {"max_rows": rows, "inter": inter, "fp8_only": w8},
                         lambda r=rows, i=inter, m=w8: ffn.compile_glm_ffn_aot(g, inter=i, max_rows=r, fp8_only=m)))
+    # A checkpoint's BF16 attention, indexer and shared experts (nvidia/GLM-5.3-NVFP4) as-is: the
+    # BF16 programs (skinny GEMV for few decode rows, BF16 tensor-core GEMMs above).
+    for rows in (decode_rows, prefill_rows):
+        out += [
+            (f"producer_bf16_m{rows}", "producer", {"max_rows": rows, "weights": "bf16"},
+             lambda r=rows: attn.compile_glm_producer_aot(g, max_rows=r)),
+            (f"index_producer_bf16_m{rows}", "index_producer", {"max_rows": rows, "weights": "bf16"},
+             lambda r=rows: attn.compile_glm_index_producer_aot(g, max_rows=r)),
+            (f"o_bf16_m{rows}", "o", {"max_rows": rows, "weights": "bf16"},
+             lambda r=rows: attn.compile_glm_o_aot(g, max_rows=r)),
+            (f"ffn_i{g.moe_inter}_bf16_m{rows}", "ffn", {"max_rows": rows, "inter": g.moe_inter, "weights": "bf16"},
+             lambda r=rows: ffn.compile_glm_ffn_aot(g, inter=g.moe_inter, max_rows=r)),
+        ]
     # ModelOpt per-tensor FP8 dense MLPs (nvidia/GLM-5.3-NVFP4): static W8A8 prefill with the
     # checkpoint's input_scale and weight_scale (decode rows take the same bytes on the GEMV).
     out.append((f"ffn_i{g.dense_inter}_pt_m{prefill_rows}", "ffn",
@@ -159,7 +172,7 @@ def glm_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context:
     latent record, its heads' queries), sparse MLA, W_UV + o_proj (a partial over its heads)
     and the dense / shared-expert MLPs (partials over their intermediate slices); the indexer,
     norms, router and expert input stay the whole model's programs."""
-    keep = ("producer_m", "o_m", "ffn_i", "sparse_mla_")
+    keep = ("producer_m", "producer_bf16_m", "o_m", "o_bf16_m", "ffn_i", "sparse_mla_")
     return [item for item in glm_programs(g, decode_rows, prefill_rows, max_context) if item[0].startswith(keep)]
 
 

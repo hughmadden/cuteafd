@@ -478,9 +478,15 @@ impl<'a> GlmEngine<'a> {
             format!("{prefix}_ffn_i{dense}_{cap}")] {
             scratch = scratch.max(self.scratch(&name)?);
         }
+        // Per-tensor FP8 dense MLPs and BF16 attention / shared experts (libraries built before
+        // them lack these programs).
+        let mut optional = vec![format!("glm_index_producer_bf16_{cap}"), format!("{prefix}_producer_bf16_{cap}"),
+            format!("{prefix}_o_bf16_{cap}"), format!("{prefix}_ffn_i{moe}_bf16_{cap}")];
         if !decode {
-            // Per-tensor FP8 dense MLPs (libraries built before it lack the program).
-            scratch = scratch.max(self.scratch(&format!("{prefix}_ffn_i{dense}_pt_{cap}")).unwrap_or(0));
+            optional.push(format!("{prefix}_ffn_i{dense}_pt_{cap}"));
+        }
+        for name in optional {
+            scratch = scratch.max(self.scratch(&name).unwrap_or(0));
         }
         let head_workspace = self.alloc(if lead { VOCABULARY_HEAD_WORKSPACE } else { 256 })?;
         let topk = self.alloc(self.scratch(&format!("glm_index_topk_{mode}_{cap}"))?)?;
@@ -1140,10 +1146,10 @@ impl<'a> GlmEngine<'a> {
             _ => &self.weights.layers,
         };
         (0..layers.len()).map(|i| match layers.get(i + 1) {
-            Some(next) => crate::shared::l2_prefetch::operands(&["input_norm", "w_qkv_a_fp8", "w_qkv_a_scale",
-                "q_a_norm", "kv_a_norm", "w_q_b_fp8", "w_q_b_scale", "w_iq_fp8", "w_iq_scale", "w_ik", "k_norm_w",
-                "k_norm_b", "w_uk_fp8", "w_uk_scale", "w_uv_fp8", "w_uv_scale", "w_o_fp8", "w_o_scale", "post_norm",
-                "gate", "gate.bias", "w_gate_up_fp8", "w_gate_up_scale", "w_down_fp8", "w_down_scale"],
+            // `operands` takes a weight's E4M3 copy and scales, else its BF16 operand.
+            Some(next) => crate::shared::l2_prefetch::operands(&["input_norm", "w_qkv_a", "q_a_norm", "kv_a_norm",
+                "w_q_b", "w_iq", "w_ik", "k_norm_w", "k_norm_b", "w_uk", "w_uv", "w_o", "post_norm", "gate",
+                "gate.bias", "w_gate_up", "w_down"],
                 |n| next.range(n)),
             None if rank == 1 => Vec::new(),
             None => [&self.weights.norm, &self.weights.head].iter()
@@ -1537,6 +1543,10 @@ impl<'a> GlmEngine<'a> {
             _ => (&self.kv[index], &self.index[index], &self.cos_sin),
         };
         let heads = self.cfg.heads / if layer.split { 2 } else { 1 };
+        // A checkpoint's BF16 attention runs the BF16 programs on its own weights.
+        let (bf16, attn_bf16, index_bf16) = (|n: &str| layer.range(n).is_some(), "w_q_b", "w_iq");
+        let variant = |name: &str, bf16: bool| if bf16 { format!("{name}_bf16_{cap}") } else { format!("{name}_{cap}") };
+        let scalars_for = |bf16: bool| if bf16 { vec![rows] } else { self.projection_scalars(rows, cap) };
         let mut producer = vec![("x", w.x.buffer.ptr), ("positions", w.positions.buffer.ptr),
             ("kv_slots", w.slots.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr)];
         producer.extend(weight(layer, "w_qkv_a", cap)?);
@@ -1545,8 +1555,8 @@ impl<'a> GlmEngine<'a> {
         producer.extend(weight(layer, "w_uk", cap)?);
         producer.extend([("kv_cache", kv.buffer.ptr), ("query", w.query.buffer.ptr),
             ("q_resid", w.q_resid.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
-        let scalars = self.projection_scalars(rows, cap);
-        self.run_on(rank, &Self::program(layer, &format!("glm_producer_{cap}")), &producer, &scalars)?;
+        self.run_on(rank, &Self::program(layer, &variant("glm_producer", bf16(attn_bf16))), &producer,
+            &scalars_for(bf16(attn_bf16)))?;
         if let Some(index_cache) = index_cache {
             let mut pointers = vec![("x", w.x.buffer.ptr), ("q_resid", w.q_resid.buffer.ptr),
                 ("positions", w.positions.buffer.ptr), ("index_slots", w.slots.buffer.ptr),
@@ -1556,7 +1566,7 @@ impl<'a> GlmEngine<'a> {
                 ("k_norm_b", layer.ptr("k_norm_b")?), ("index_cache", index_cache.buffer.ptr),
                 ("q_fp8", w.q_fp8.buffer.ptr), ("head_weights", w.head_weights.buffer.ptr),
                 ("scratch", w.scratch.buffer.ptr)]);
-            self.run_on(rank, &format!("glm_index_producer_{cap}"), &pointers, &scalars)?;
+            self.run_on(rank, &variant("glm_index_producer", bf16(index_bf16)), &pointers, &scalars_for(bf16(index_bf16)))?;
             self.run_on(rank, &format!("glm_index_topk_{mode}_{cap}"), &[
                 ("q_fp8", w.q_fp8.buffer.ptr), ("weights", w.head_weights.buffer.ptr),
                 ("index_k_cache", index_cache.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
@@ -1584,7 +1594,7 @@ impl<'a> GlmEngine<'a> {
         o.extend(weight(layer, "w_uv", cap)?);
         o.extend(weight(layer, "w_o", cap)?);
         o.extend([("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
-        self.run_on(rank, &Self::program(layer, &format!("glm_o_{cap}")), &o, &scalars)
+        self.run_on(rank, &Self::program(layer, &variant("glm_o", bf16("w_o"))), &o, &scalars_for(bf16("w_o")))
     }
 
     /// Scalars of the programs over FP8 weights: `rows`, plus the prefill
@@ -1621,6 +1631,11 @@ impl<'a> GlmEngine<'a> {
         pointers.extend(weight(layer, "w_gate_up", cap)?);
         pointers.extend(weight(layer, "w_down", cap)?);
         pointers.extend([("out", out), ("scratch", w.scratch.buffer.ptr)]);
+        if layer.range("w_gate_up").is_some() {
+            // A checkpoint's BF16 shared expert on its own weights.
+            return self.run_on(rank, &Self::program(layer, &format!("glm_ffn_i{intermediate}_bf16_{cap}")), &pointers,
+                &[rows]);
+        }
         self.run_on(rank, &Self::program(layer, &format!("glm_ffn_i{intermediate}_{cap}")), &pointers,
             &self.projection_scalars(rows, cap))
     }
@@ -1672,9 +1687,13 @@ fn expert_request(staged: &[u8], index: usize, t: usize, h: usize, topk: usize, 
     Ok(request)
 }
 
-/// An FP8 weight's program pointers: its E4M3 copy and FP32 scales (prefill
-/// programs read `w_qkv_a`'s per-row scales, K-block major).
+/// A weight's program pointers: the checkpoint's BF16 operand when the layer holds one (the
+/// BF16 programs), else its E4M3 copy and FP32 scales (prefill programs read `w_qkv_a`'s
+/// per-row scales, K-block major).
 fn weight(layer: &GlmLayer<'_>, name: &'static str, cap: &str) -> Result<Vec<(&'static str, *mut c_void)>> {
+    if layer.range(name).is_some() {
+        return Ok(vec![(name, layer.ptr(name)?)]);
+    }
     let (fp8, scale, kscale) = super::weights::fp8_operand_names(name);
     let scale = if cap != "m64" && !kscale.is_empty() { kscale } else { scale };
     Ok(vec![(fp8, layer.ptr(fp8)?), (scale, layer.ptr(scale)?)])

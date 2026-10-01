@@ -362,11 +362,19 @@ prefill 1.08x EXL3 (W4A4 1.36x), 1.6K 0.96x (W4A4 1.33x). W4A4 costs
 +0.02 KL (over this plan's 0.005 bound): W4A16 stays default, a decision for
 TJ. S2: GLM 5.3 Flash NVFP4 dense MLPs run natively (one-expert
 `fp8-glmfdense-nvfp4`): nvidia/GLM-5.3-Flash-NVFP4 serves alone (NLL 2.3896);
-GLM 5.3's per-tensor FP8 dense layers are the same bytes under a uniform
-block grid and its BF16 parts quantize to FP8 blocks at load: nvidia/GLM-5.3-NVFP4
-serves on six Sparks (TP6 W4A16: NLL 2.4814 / KL 0.0571 vs golden 2.4677; 8K
-prefill 4.22 s, W4A4 3.20 s). Open: W4A16 stream efficiency (GB10 4096 rows 14.3 ms/layer TP4 vs
-EXL3 9.1), SM121 route thresholds, BF16 MLA programs (vs FP8 at load).
+nvidia/GLM-5.3-NVFP4 serves on six Sparks (TP6 W4A16: NLL 2.4814 / KL 0.0571
+vs golden 2.4677; 8K prefill 4.22 s, W4A4 3.20 s). Its per-tensor FP8 dense
+MLPs prefill as static W8A8 on their own input_scale / weight_scale (plain
+E4M3 MMAs; decode GEMVs read the same bytes under a uniform grid): NLL 2.4827 /
+KL 0.0580, MLP 1.4x faster than block W8A8 at 4096 rows. Its BF16 attention,
+indexer and shared experts quantize to FP8 blocks at load by default; with
+`CUTEAFD_GLM_BF16=native` they run as-is on the BF16 programs (one or two
+RTX): KL 0.0491, but C1 step 41.7 vs 34.3 ms with the Sparks (coordinator
+alone 28.6 vs 19.2 ms one RTX, 19.8 vs 16.1 two), coordinator 8K prefill
+3.35 vs 2.75 s (2.36 vs 2.07), weights 32.3 vs 17.6 GiB: the default is a
+decision for TJ. W4A4 gate/up + SwiGLU + FP4 quant run fused (bit-exact;
+layer 7-17% faster, GB10 13-17%). Open: W4A16 stream efficiency (GB10 4096
+rows 14.3 ms/layer TP4 vs EXL3 9.1), SM121 route thresholds.
 
 **Phase 6 — placement planner (design 2026-09-30).** One planner for every
 family: (model, inventory of 1–2 coordinator GPUs — real or simulated by a

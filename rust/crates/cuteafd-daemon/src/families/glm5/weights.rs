@@ -319,6 +319,85 @@ impl<'a> GlmLoader<'a> {
         })
     }
 
+    /// Whether `names` run as the checkpoint's BF16 tensors (the BF16 programs): every one is
+    /// BF16 and CUTEAFD_GLM_BF16=native asks for them ([`bf16_programs`]).
+    fn bf16_native(&self, names: &[String]) -> Result<bool> {
+        if !bf16_programs() {
+            return Ok(false);
+        }
+        for name in names {
+            if self.catalog.tensor(name)?.metadata.dtype != DType::Bf16 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// The row-concatenation of BF16 `names`: its bytes, rows and columns.
+    fn bf16_rows(&self, names: &[String]) -> Result<(Vec<u8>, usize, usize)> {
+        let mut out = Vec::new();
+        let (mut rows, mut cols) = (0usize, None);
+        for name in names {
+            let (bytes, dtype, shape) = self.raw(name)?;
+            ensure!(dtype == DType::Bf16 && shape.len() == 2, "{name}: expected a BF16 matrix, found {dtype:?} {shape:?}");
+            ensure!(cols.is_none_or(|c| c == shape[1]), "{names:?} do not share columns");
+            cols = Some(shape[1]);
+            rows += shape[0];
+            out.extend_from_slice(&bytes);
+        }
+        Ok((out, rows, cols.context("no BF16 parts")?))
+    }
+
+    /// The BF16 weights `names` concatenated by rows, sliced over `ranks` along `axis`:
+    /// rank `r` takes part `r` of every concatenated weight's rows (so a head- or
+    /// intermediate-split `gate | up` stays gate rows then up rows), or of the columns.
+    fn bf16_split(&self, names: &[String], axis: Axis, ranks: usize) -> Result<Vec<DeviceAllocation<'a>>> {
+        if ranks == 1 {
+            return Ok(vec![self.upload(&self.bf16_rows(names)?.0)?]);
+        }
+        let parts = names.iter().map(|n| self.bf16_rows(std::slice::from_ref(n))).collect::<Result<Vec<_>>>()?;
+        ensure!(axis == Axis::Rows || parts.len() == 1, "{names:?}: concatenated weights split by rows");
+        (0..ranks).map(|rank| {
+            let mut bytes = Vec::new();
+            for (values, rows, cols) in &parts {
+                ensure!(if axis == Axis::Rows { rows % ranks == 0 } else { cols % ranks == 0 },
+                    "{names:?}: [{rows}, {cols}] does not split over {ranks} GPUs");
+                bytes.extend(slice_2d(values, *rows, *cols, 2, axis, rank, ranks));
+            }
+            self.on_rank(rank, |_| self.upload(&bytes))
+        }).collect()
+    }
+
+    /// `w_uk [N, 512, D]` / `w_uv [N, V, 512]` BF16 per-head slices of the BF16 `kv_b`
+    /// (`w_uk[h,c,d] = kv_b[h*(D+V)+d, c]`, `w_uv[h,v,c] = kv_b[h*(D+V)+D+v, c]`), each rank
+    /// its heads.
+    fn kv_b_bf16(&self, cfg: &GlmDsaConfig, prefix: &str, ranks: usize)
+        -> Result<Vec<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
+        let (heads, d, v, c) = (cfg.heads, cfg.qk_nope_head_dim, cfg.v_head_dim, cfg.kv_lora_rank);
+        let (kv_b, rows, cols) = self.bf16_rows(&[format!("{prefix}.self_attn.kv_b_proj.weight")])?;
+        ensure!(rows == heads * (d + v) && cols == c && heads % ranks == 0,
+            "{prefix}: kv_b_proj [{rows}, {cols}] does not match {heads} heads x ({d} + {v}) x {c} over {ranks} GPUs");
+        let (mut uk, mut uv) = (vec![0u8; heads * c * d * 2], vec![0u8; heads * v * c * 2]);
+        std::thread::scope(|scope| {
+            for (h, (uk, uv)) in uk.chunks_mut(c * d * 2).zip(uv.chunks_mut(v * c * 2)).enumerate() {
+                let kv_b = &kv_b;
+                scope.spawn(move || {
+                    let base = h * (d + v);
+                    for dd in 0..d {
+                        let src = &kv_b[(base + dd) * c * 2..][..c * 2];
+                        for col in 0..c {
+                            uk[(col * d + dd) * 2..][..2].copy_from_slice(&src[col * 2..col * 2 + 2]);
+                        }
+                    }
+                    uv.copy_from_slice(&kv_b[(base + d) * c * 2..(base + d + v) * c * 2]);
+                });
+            }
+        });
+        let part = |bytes: &[u8], rank: usize| bytes[rank * bytes.len() / ranks..(rank + 1) * bytes.len() / ranks].to_vec();
+        (0..ranks).map(|rank| self.on_rank(rank, |_| Ok((self.upload(&part(&uk, rank))?, self.upload(&part(&uv, rank))?))))
+            .collect()
+    }
+
     fn one(&self, name: &str) -> Result<DeviceAllocation<'a>> {
         let (bytes, dtype, shape) = self.raw(name)?;
         if shape.len() == 2 && dtype == DType::F8E4M3 {
@@ -488,6 +567,20 @@ impl<'a> GlmLoader<'a> {
         put(&mut ops, "input_norm", self.replicated(ranks, || raw(&format!("{p}.input_layernorm.weight")))?);
         put(&mut ops, "post_norm", self.replicated(ranks, || raw(&format!("{p}.post_attention_layernorm.weight")))?);
         let qkv_a = [format!("{p}.self_attn.q_a_proj.weight"), format!("{p}.self_attn.kv_a_proj_with_mqa.weight")];
+        let attention = [&qkv_a[..], &[format!("{p}.self_attn.q_b_proj.weight"),
+            format!("{p}.self_attn.kv_b_proj.weight"), format!("{p}.self_attn.o_proj.weight")]].concat();
+        if self.bf16_native(&attention)? {
+            // The checkpoint's BF16 attention as-is (the BF16 programs).
+            put(&mut ops, "w_qkv_a", self.upload_all(ranks, &self.bf16_rows(&qkv_a)?.0)?);
+            put(&mut ops, "q_a_norm", self.replicated(ranks, || raw(&format!("{p}.self_attn.q_a_layernorm.weight")))?);
+            put(&mut ops, "kv_a_norm", self.replicated(ranks, || raw(&format!("{p}.self_attn.kv_a_layernorm.weight")))?);
+            put(&mut ops, "w_q_b", self.bf16_split(&[format!("{p}.self_attn.q_b_proj.weight")], Axis::Rows, ranks)?);
+            for (rank, (uk, uv)) in self.kv_b_bf16(cfg, &p, ranks)?.into_iter().enumerate() {
+                ops[rank].insert("w_uk", uk);
+                ops[rank].insert("w_uv", uv);
+            }
+            put(&mut ops, "w_o", self.bf16_split(&[format!("{p}.self_attn.o_proj.weight")], Axis::Cols, ranks)?);
+        } else {
         let (values, scale, kscale) = self.with_fp8(&qkv_a, |values, grid, rows, cols| {
             // Prefill: per-row scales K-block major (the block-FP8 GEMM wants whole 128-row blocks).
             let kb = cols.div_ceil(128);
@@ -510,10 +603,14 @@ impl<'a> GlmLoader<'a> {
             ops[rank].insert("w_uv_scale", uv_scale);
         }
         with_fp8(&mut ops, "w_o", &[format!("{p}.self_attn.o_proj.weight")], Axis::Cols)?;
+        }
         if full_indexer {
-            for (key, name) in [("w_iq", format!("{p}.self_attn.indexer.wq_b.weight"))] {
-                let (w8_name, scale_name, _) = fp8_operand_names(key);
-                let (values, grid) = self.with_fp8(&[name], |values, grid, _, _| Ok((values.to_vec(), f32_bytes(&grid))))?;
+            let wq_b = [format!("{p}.self_attn.indexer.wq_b.weight")];
+            if self.bf16_native(&wq_b)? {
+                put(&mut ops, "w_iq", self.upload_all(ranks, &self.bf16_rows(&wq_b)?.0)?);
+            } else {
+                let (w8_name, scale_name, _) = fp8_operand_names("w_iq");
+                let (values, grid) = self.with_fp8(&wq_b, |values, grid, _, _| Ok((values.to_vec(), f32_bytes(&grid))))?;
                 put(&mut ops, w8_name, self.replicated(ranks, || Ok(values))?);
                 put(&mut ops, scale_name, self.replicated(ranks, || Ok(grid))?);
             }
@@ -540,8 +637,14 @@ impl<'a> GlmLoader<'a> {
         let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
         let (gate_up, down) = ([format!("{mlp}.gate_proj.weight"), format!("{mlp}.up_proj.weight")],
             [format!("{mlp}.down_proj.weight")]);
-        with_fp8(&mut ops, "w_gate_up", &gate_up, Axis::Rows)?;
-        with_fp8(&mut ops, "w_down", &down, Axis::Cols)?;
+        if !dense && self.bf16_native(&[&gate_up[..], &down[..]].concat())? {
+            // The checkpoint's BF16 shared expert as-is.
+            put(&mut ops, "w_gate_up", self.bf16_split(&gate_up, Axis::Rows, ranks)?);
+            put(&mut ops, "w_down", self.bf16_split(&down, Axis::Cols, ranks)?);
+        } else {
+            with_fp8(&mut ops, "w_gate_up", &gate_up, Axis::Rows)?;
+            with_fp8(&mut ops, "w_down", &down, Axis::Cols)?;
+        }
         // ModelOpt per-tensor FP8 dense MLPs also carry their static W8A8 scales (prefill).
         if dense {
             if let (Some(gu), Some(d)) = (self.tensor_scales(&gate_up)?, self.tensor_scales(&down)?) {
@@ -578,3 +681,12 @@ impl<'a> GlmLoader<'a> {
     }
 }
 
+/// BF16 checkpoint weights (nvidia/GLM-5.3-NVFP4's attention, indexer and shared experts) run
+/// as-is on the BF16 programs with CUTEAFD_GLM_BF16=native; by default they are quantized to
+/// 128x128 FP8 blocks at load (power-of-two scales) for the FP8 programs: BF16 reads twice
+/// the bytes (one RTX PRO 6000, coordinator alone: C1 step 28.6 vs 21.0 ms, 8K prefill 3.35
+/// vs 2.74 s), a decision pending in PLAN.md Phase 5.
+pub(crate) fn bf16_programs() -> bool {
+    static NATIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NATIVE.get_or_init(|| std::env::var("CUTEAFD_GLM_BF16").is_ok_and(|v| v == "native"))
+}
