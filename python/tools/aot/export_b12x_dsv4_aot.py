@@ -110,21 +110,22 @@ def glm_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         ("router_scores", "router_scores", {}, lambda: ffn.compile_glm_router_scores_aot(g)),
         ("expert_input_quant", "expert_input_quant", {}, lambda: ffn.compile_glm_expert_input_quant_aot(g)),
     ]
-    # Decode programs also take the FP8 checkpoint weights (E4M3 + FP32 block
-    # scales) for their few-row GEMVs; prefill programs take BF16 only.
+    # The checkpoint's FP8 weights (E4M3 + FP32 128x128 scales; kv_b per head with per-row
+    # x 64-K scales) are the only copies: decode programs run the GEMV up to 16 rows and
+    # W8A16 GEMMs above, prefill programs W8A8 (``fp8_rows`` nonzero) or W8A16.
     for rows in (decode_rows, prefill_rows):
-        f8 = rows == decode_rows
+        w8 = "decode" if rows == decode_rows else "prefill"
         out += [
-            (f"producer_m{rows}", "producer", {"max_rows": rows, "fp8": f8},
-             lambda r=rows, f=f8: attn.compile_glm_producer_aot(g, max_rows=r, fp8=f)),
-            (f"index_producer_m{rows}", "index_producer", {"max_rows": rows, "fp8": f8},
-             lambda r=rows, f=f8: attn.compile_glm_index_producer_aot(g, max_rows=r, fp8=f)),
-            (f"o_m{rows}", "o", {"max_rows": rows, "fp8": f8},
-             lambda r=rows, f=f8: attn.compile_glm_o_aot(g, max_rows=r, fp8=f)),
+            (f"producer_m{rows}", "producer", {"max_rows": rows, "fp8_only": w8},
+             lambda r=rows, m=w8: attn.compile_glm_producer_aot(g, max_rows=r, fp8_only=m)),
+            (f"index_producer_m{rows}", "index_producer", {"max_rows": rows, "fp8_only": w8},
+             lambda r=rows, m=w8: attn.compile_glm_index_producer_aot(g, max_rows=r, fp8_only=m)),
+            (f"o_m{rows}", "o", {"max_rows": rows, "fp8_only": w8},
+             lambda r=rows, m=w8: attn.compile_glm_o_aot(g, max_rows=r, fp8_only=m)),
         ]
         for inter in (g.moe_inter, g.dense_inter):
-            out.append((f"ffn_i{inter}_m{rows}", "ffn", {"max_rows": rows, "inter": inter, "fp8": f8},
-                        lambda r=rows, i=inter, f=f8: ffn.compile_glm_ffn_aot(g, inter=i, max_rows=r, fp8=f)))
+            out.append((f"ffn_i{inter}_m{rows}", "ffn", {"max_rows": rows, "inter": inter, "fp8_only": w8},
+                        lambda r=rows, i=inter, m=w8: ffn.compile_glm_ffn_aot(g, inter=i, max_rows=r, fp8_only=m)))
     for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
         out.append((f"index_topk_{mode}_m{rows}", "index_topk",
                     {"mode": mode, "max_rows": rows, "max_pages": index_pages},
@@ -137,9 +138,11 @@ def glm_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
 
 def mimo_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """MiMo V2 programs, same (stem suffix, op, params, thunk) shape as ``programs``.
-    Decode programs also take E4M3 copies (per-row x 128-K FP32 scales) of the
-    qkv, o and dense FFN weights behind an ``fp8_rows`` scalar; prefill programs
-    take BF16 only. ``head_fp8``: the LM head over an E4M3 copy for decode rows."""
+    qkv and the dense FFN take only the checkpoint's E4M3 weights (per-row x 128-K FP32
+    scales): decode rows up to ``fp8_rows`` on the GEMVs, W8A16 above; prefill W8A8
+    (``fp8_rows`` nonzero) or W8A16. o_proj (BF16 in the release): decode programs also
+    take a quantized E4M3 copy, prefill BF16. ``head_fp8``: the LM head over an E4M3 copy
+    for decode rows."""
     from b12x.integration.cuteafd import mimo_attention as attn
     from b12x.integration.cuteafd import mimo_ffn as ffn
 
@@ -154,13 +157,13 @@ def mimo_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         out += [
             (f"o_m{rows}", "o", {"max_rows": rows, "fp8": f8},
              lambda r=rows, f=f8: attn.compile_mimo_o_aot(g, max_rows=r, fp8=f)),
-            (f"ffn_m{rows}", "ffn", {"max_rows": rows, "inter": g.dense_inter, "fp8": f8},
-             lambda r=rows, f=f8: ffn.compile_mimo_ffn_aot(g, max_rows=r, fp8=f)),
+            (f"ffn_m{rows}", "ffn", {"max_rows": rows, "inter": g.dense_inter, "fp8_only": mode},
+             lambda r=rows, m=mode: ffn.compile_mimo_ffn_aot(g, max_rows=r, fp8_only=m)),
         ]
         for kind in ("full", "swa"):
             out += [
-                (f"{kind}_producer_m{rows}", "producer", {"kind": kind, "max_rows": rows, "fp8": f8},
-                 lambda k=kind, r=rows, f=f8: attn.compile_mimo_producer_aot(g, kind=k, max_rows=r, fp8=f)),
+                (f"{kind}_producer_m{rows}", "producer", {"kind": kind, "max_rows": rows, "fp8_only": mode},
+                 lambda k=kind, r=rows, m=mode: attn.compile_mimo_producer_aot(g, kind=k, max_rows=r, fp8_only=m)),
                 (f"{kind}_attention_{mode}_m{rows}", "attention", {"kind": kind, "route": mode, "max_rows": rows},
                  lambda k=kind, m=mode, r=rows: attn.compile_mimo_attention_aot(g, kind=k, route=m, max_rows=r)),
             ]
@@ -188,9 +191,11 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         ("index_expand", "index_expand", {}, lambda: glmf.compile_glmf_index_expand_aot(g)),
         ("kda_commit", "kda_commit", {}, lambda: glmf.compile_glmf_kda_commit_aot(g)),
     ]
-    # Decode programs also take FP8 weights (checkpoint 128x128 blocks, or
-    # per-row scales for the KDA projections) behind an ``fp8_rows`` scalar;
-    # prefill programs run block-FP8 GEMMs over them when ``fp8_rows`` is nonzero.
+    # MLA, dense and shared-expert projections take only E4M3 weights with 128x128 scales
+    # (the official FP8 release's): decode rows up to ``fp8_rows`` on the GEMV, W8A16
+    # above; prefill W8A8 when ``fp8_rows`` is nonzero, else W8A16. KDA projections (BF16
+    # in the release) keep BF16 plus optional per-row FP8 copies: decode programs read the
+    # copies behind ``fp8_rows``, prefill programs run block-FP8 GEMMs on its bits.
     for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
         f8 = True if mode == "decode" else "prefill"
         # Prefill mHC mixes run on TF32 tensor cores (split FP32 fn) from 384 rows.
@@ -204,16 +209,17 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
              lambda r=rows, rt=route: mhc.compile_dsv4_mhc_post_pre_aot(mg, max_rows=r, route=rt)),
             (f"kda_m{rows}", "kda", {"max_rows": rows, "fp8": f8},
              lambda r=rows, f=f8: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8=f)),
-            (f"mla_producer_m{rows}", "mla_producer", {"max_rows": rows, "fp8": f8},
-             lambda r=rows, f=f8: glmf.compile_glmf_mla_producer_aot(g, max_rows=r, fp8=f)),
-            (f"o_m{rows}", "o", {"max_rows": rows, "fp8": f8},
-             lambda r=rows, f=f8: glmf.compile_glmf_o_aot(g, max_rows=r, fp8=f)),
+            (f"mla_producer_m{rows}", "mla_producer", {"max_rows": rows, "fp8_only": mode},
+             lambda r=rows, m=mode: glmf.compile_glmf_mla_producer_aot(g, max_rows=r, fp8_only=m)),
+            (f"o_m{rows}", "o", {"max_rows": rows, "fp8_only": mode},
+             lambda r=rows, m=mode: glmf.compile_glmf_o_aot(g, max_rows=r, fp8_only=m)),
             (f"sparse_mla_{mode}_m{rows}", "sparse_mla", {"route": mode, "max_rows": rows},
              lambda m=mode, r=rows: mla.compile_glm_sparse_mla_aot(g, route=m, max_rows=r, name="glmf_sparse_mla")),
         ]
         for inter in (g.moe_inter, g.dense_inter):
-            out.append((f"ffn_i{inter}_m{rows}", "ffn", {"max_rows": rows, "inter": inter, "fp8": f8},
-                        lambda r=rows, i=inter, f=f8: glmf.compile_glmf_ffn_aot(g, inter=i, max_rows=r, fp8=f)))
+            out.append((f"ffn_i{inter}_m{rows}", "ffn", {"max_rows": rows, "inter": inter, "fp8_only": mode},
+                        lambda r=rows, i=inter, m=mode: glmf.compile_glmf_ffn_aot(g, inter=i, max_rows=r,
+                                                                                  fp8_only=m)))
     return out
 
 

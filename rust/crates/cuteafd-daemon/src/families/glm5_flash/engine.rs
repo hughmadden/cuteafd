@@ -390,10 +390,10 @@ pub(crate) struct GlmfEngine<'a> {
     pub fp8_prefill: Fp8Prefill,
 }
 
-/// Which prefill projections run block-FP8 GEMMs (E4M3 activations per row
-/// and 128-K block): the MLA projections, the dense and shared-expert MLPs
-/// (the official FP8 weights), the KDA in-projection and o_proj (per-row x
-/// 128-K copies).
+/// Which prefill projections run W8A8 block-FP8 GEMMs (E4M3 activations per
+/// row and 128-K block): the MLA projections, the dense and shared-expert MLPs
+/// (FP8-only weights: W8A16 otherwise), the KDA in-projection and o_proj
+/// (per-row x 128-K copies: BF16 otherwise).
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct Fp8Prefill {
     pub mla: bool,
@@ -1182,15 +1182,11 @@ impl<'a> GlmfEngine<'a> {
     fn ffn(&self, w: &Workspace<'_>, layer: &GlmfLayer<'_>, inter: usize, cap: &str, out: *mut c_void, rows: Scalar)
         -> Result<()> {
         let decode = cap == "m64";
-        let mut pointers = vec![("x", w.x.buffer.ptr), ("w_gate_up", layer.ptr("w_gate_up")?)];
-        pointers.extend([("w_gate_up_fp8", layer.ptr_or("w_gate_up_fp8", "w_gate_up")?),
-            ("w_gate_up_scale", layer.ptr_or("w_gate_up_scale", "w_gate_up")?)]);
-        pointers.push(("w_down", layer.ptr("w_down")?));
-        pointers.extend([("w_down_fp8", layer.ptr_or("w_down_fp8", "w_down")?),
-            ("w_down_scale", layer.ptr_or("w_down_scale", "w_down")?)]);
-        pointers.extend([("out", out), ("scratch", w.scratch.buffer.ptr)]);
-        let fp8 = layer.has("w_down_fp8") && (decode || self.fp8_prefill.ffn);
-        self.run(&format!("ffn_i{inter}_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))
+        let pointers = [("x", w.x.buffer.ptr), ("w_gate_up_fp8", layer.ptr("w_gate_up_fp8")?),
+            ("w_gate_up_scale", layer.ptr("w_gate_up_scale")?), ("w_down_fp8", layer.ptr("w_down_fp8")?),
+            ("w_down_scale", layer.ptr("w_down_scale")?), ("out", out), ("scratch", w.scratch.buffer.ptr)];
+        // FP8-only weights: decode rows up to `fp8_rows` on the GEMV; prefill W8A8 or W8A16.
+        self.run(&format!("ffn_i{inter}_{cap}"), &pointers, &self.fp8_scalars(rows, decode, decode || self.fp8_prefill.ffn))
     }
 
     fn mla(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str,
@@ -1199,15 +1195,12 @@ impl<'a> GlmfEngine<'a> {
         let cache = self.kv[index].as_ref().context("MLA layer without a record pool")?.buffer.ptr;
         let (keys, pool_cache) = self.index[index].as_ref().context("MLA layer without an index cache")?;
         let decode = tables.decode;
-        let fp8 = layer.has("w_qkv_a_fp8") && (decode || self.fp8_prefill.mla);
+        // FP8-only weights: decode rows up to `fp8_rows` on the GEMV; prefill W8A8 or W8A16.
+        let fp8 = decode || self.fp8_prefill.mla;
         let mut pointers = vec![("x", w.x.buffer.ptr), ("kv_slots", w.kv_slots.buffer.ptr),
-            ("w_qkv_a", layer.ptr("w_qkv_a")?)];
-        pointers.extend([("w_qkv_a_fp8", layer.ptr_or("w_qkv_a_fp8", "w_qkv_a")?),
-            ("w_qkv_a_scale", layer.ptr_or("w_qkv_a_scale", "w_qkv_a")?)]);
-        pointers.extend([("q_a_norm", layer.ptr("q_a_norm")?), ("kv_a_norm", layer.ptr("kv_a_norm")?),
-            ("w_q_b", layer.ptr("w_q_b")?)]);
-        pointers.extend([("w_q_b_fp8", layer.ptr_or("w_q_b_fp8", "w_q_b")?),
-            ("w_q_b_scale", layer.ptr_or("w_q_b_scale", "w_q_b")?)]);
+            ("w_qkv_a_fp8", layer.ptr("w_qkv_a_fp8")?), ("w_qkv_a_scale", layer.ptr("w_qkv_a_scale")?),
+            ("q_a_norm", layer.ptr("q_a_norm")?), ("kv_a_norm", layer.ptr("kv_a_norm")?),
+            ("w_q_b_fp8", layer.ptr("w_q_b_fp8")?), ("w_q_b_scale", layer.ptr("w_q_b_scale")?)];
         pointers.extend([("w_uk", layer.ptr("w_uk")?), ("kv_cache", cache), ("query", w.query.buffer.ptr),
             ("q_resid", w.q_resid.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
         self.run(&format!("mla_producer_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))?;
@@ -1244,9 +1237,9 @@ impl<'a> GlmfEngine<'a> {
                 ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr), ("out", w.latent.buffer.ptr),
                 ("scratch", w.scratch.buffer.ptr)], &[rows])?;
         }
-        let mut pointers = vec![("attn", w.latent.buffer.ptr), ("w_uv", layer.ptr("w_uv")?), ("w_o", layer.ptr("w_o")?)];
-        pointers.extend([("w_o_fp8", layer.ptr_or("w_o_fp8", "w_o")?), ("w_o_scale", layer.ptr_or("w_o_scale", "w_o")?)]);
-        pointers.extend([("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
+        let pointers = [("attn", w.latent.buffer.ptr), ("w_uv", layer.ptr("w_uv")?),
+            ("w_o_fp8", layer.ptr("w_o_fp8")?), ("w_o_scale", layer.ptr("w_o_scale")?),
+            ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)];
         self.run(&format!("o_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))
     }
 
@@ -1296,11 +1289,13 @@ impl<'a> GlmfEngine<'a> {
             Some(next) => {
                 let attention: &[&str] = match next.attention {
                     GlmNextAttention::Kda => &["w_in", "w_fg", "conv_w", "a_log", "dt_bias", "o_norm", "w_o"],
-                    GlmNextAttention::Mla => &["w_qkv_a", "q_a_norm", "kv_a_norm", "w_q_b", "w_iq", "w_ik", "k_norm_w",
-                        "k_norm_b", "ape", "w_uk", "w_uv", "w_o"],
+                    GlmNextAttention::Mla => &["w_qkv_a_fp8", "w_qkv_a_scale", "q_a_norm", "kv_a_norm", "w_q_b_fp8",
+                        "w_q_b_scale", "w_iq", "w_ik", "k_norm_w", "k_norm_b", "ape", "w_uk", "w_uv", "w_o_fp8",
+                        "w_o_scale"],
                 };
                 let names: Vec<&str> = ["attn.fn", "attn.scale", "attn.base", "input_norm"].iter().chain(attention)
-                    .chain(&["ffn.fn", "ffn.scale", "ffn.base", "post_norm", "gate", "gate.bias", "w_gate_up", "w_down"])
+                    .chain(&["ffn.fn", "ffn.scale", "ffn.base", "post_norm", "gate", "gate.bias", "w_gate_up_fp8",
+                        "w_gate_up_scale", "w_down_fp8", "w_down_scale"])
                     .copied().collect();
                 crate::shared::l2_prefetch::operands(&names, |n| next.range(n))
             }

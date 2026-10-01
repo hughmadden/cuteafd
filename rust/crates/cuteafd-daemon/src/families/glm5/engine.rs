@@ -207,6 +207,10 @@ pub(crate) struct GlmEngine<'a> {
     pub drafter: Option<super::dflash::GlmDrafter<'a>>,
     /// L2 prefetch of the next layer's weights during decode exchanges.
     pub l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
+    /// Prefill projections over the FP8 weights run W8A8 (E4M3 activations per
+    /// row and 128-K block, the official FP8 release's served numerics); false:
+    /// W8A16 (bitwise the former BF16 prefill over dequantized weights).
+    pub prefill_w8a8: bool,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -247,7 +251,7 @@ impl<'a> GlmEngine<'a> {
             prefill_lanes: configured_lanes(),
             lanes: RefCell::new(Vec::new()), full_prefill_logits: false, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             exchange_host: RefCell::new([0.0; 4]),
-            graphs: RefCell::new(std::collections::HashMap::new()), drafter: None })
+            graphs: RefCell::new(std::collections::HashMap::new()), drafter: None, prefill_w8a8: true })
     }
 
     /// Every layer's latent record pool (656 B per row, 64-row pages) and, on full-indexer
@@ -616,15 +620,17 @@ impl<'a> GlmEngine<'a> {
     }
 
     /// Per layer, the weights a decode step reads after its routed experts
-    /// are out, in read order: the next layer's attention (E4M3 copies where
-    /// the decode programs read them), post-attention norm, router and shared
-    /// expert (or dense MLP); after the last layer the final norm and head.
+    /// are out, in read order: the next layer's attention (E4M3 weights and
+    /// their scales), post-attention norm, router and shared expert (or dense
+    /// MLP); after the last layer the final norm and head.
     pub fn decode_read_order(&self) -> Vec<Vec<crate::shared::l2_prefetch::Range>> {
         let layers = &self.weights.layers;
         (0..layers.len()).map(|i| match layers.get(i + 1) {
-            Some(next) => crate::shared::l2_prefetch::operands(&["input_norm", "w_qkv_a", "q_a_norm", "kv_a_norm", "w_q_b",
-                "w_iq", "w_ik", "k_norm_w", "k_norm_b", "w_uk", "w_uv", "w_o", "post_norm", "gate", "gate.bias",
-                "w_gate_up", "w_down"], |n| next.range(n)),
+            Some(next) => crate::shared::l2_prefetch::operands(&["input_norm", "w_qkv_a_fp8", "w_qkv_a_scale",
+                "q_a_norm", "kv_a_norm", "w_q_b_fp8", "w_q_b_scale", "w_iq_fp8", "w_iq_scale", "w_ik", "k_norm_w",
+                "k_norm_b", "w_uk_fp8", "w_uk_scale", "w_uv_fp8", "w_uv_scale", "w_o_fp8", "w_o_scale", "post_norm",
+                "gate", "gate.bias", "w_gate_up_fp8", "w_gate_up_scale", "w_down_fp8", "w_down_scale"],
+                |n| next.range(n)),
             None => [&self.weights.norm, &self.weights.head].iter()
                 .map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes)).collect(),
         }).collect()
@@ -952,9 +958,11 @@ impl<'a> GlmEngine<'a> {
         producer.extend(weight(layer, "w_qkv_a", cap)?);
         producer.extend([("q_a_norm", layer.ptr("q_a_norm")?), ("kv_a_norm", layer.ptr("kv_a_norm")?)]);
         producer.extend(weight(layer, "w_q_b", cap)?);
-        producer.extend([("w_uk", layer.ptr("w_uk")?), ("kv_cache", kv.buffer.ptr), ("query", w.query.buffer.ptr),
+        producer.extend(weight(layer, "w_uk", cap)?);
+        producer.extend([("kv_cache", kv.buffer.ptr), ("query", w.query.buffer.ptr),
             ("q_resid", w.q_resid.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
-        self.run(&format!("glm_producer_{cap}"), &producer, &[rows])?;
+        let scalars = self.projection_scalars(rows, cap);
+        self.run(&format!("glm_producer_{cap}"), &producer, &scalars)?;
         if let Some(index_cache) = &self.index[index] {
             let mut pointers = vec![("x", w.x.buffer.ptr), ("q_resid", w.q_resid.buffer.ptr),
                 ("positions", w.positions.buffer.ptr), ("index_slots", w.slots.buffer.ptr),
@@ -964,7 +972,7 @@ impl<'a> GlmEngine<'a> {
                 ("k_norm_b", layer.ptr("k_norm_b")?), ("index_cache", index_cache.buffer.ptr),
                 ("q_fp8", w.q_fp8.buffer.ptr), ("head_weights", w.head_weights.buffer.ptr),
                 ("scratch", w.scratch.buffer.ptr)]);
-            self.run(&format!("glm_index_producer_{cap}"), &pointers, &[rows])?;
+            self.run(&format!("glm_index_producer_{cap}"), &pointers, &scalars)?;
             self.run(&format!("glm_index_topk_{mode}_{cap}"), &[
                 ("q_fp8", w.q_fp8.buffer.ptr), ("weights", w.head_weights.buffer.ptr),
                 ("index_k_cache", index_cache.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
@@ -988,10 +996,21 @@ impl<'a> GlmEngine<'a> {
                 ("lengths", w.lengths.buffer.ptr), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
                 &[rows])?;
         }
-        let mut o = vec![("attn", w.attn.buffer.ptr), ("w_uv", layer.ptr("w_uv")?)];
+        let mut o = vec![("attn", w.attn.buffer.ptr)];
+        o.extend(weight(layer, "w_uv", cap)?);
         o.extend(weight(layer, "w_o", cap)?);
         o.extend([("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
-        self.run(&format!("glm_o_{cap}"), &o, &[rows])
+        self.run(&format!("glm_o_{cap}"), &o, &scalars)
+    }
+
+    /// Scalars of the programs over FP8 weights: `rows`, plus the prefill
+    /// programs' `fp8_rows` (1: W8A8, 0: W8A16).
+    fn projection_scalars(&self, rows: Scalar, cap: &str) -> Vec<Scalar> {
+        if cap == "m64" {
+            vec![rows]
+        } else {
+            vec![rows, Scalar::I32(i32::from(self.prefill_w8a8))]
+        }
     }
 
     /// SwiGLU MLP (dense layers, or the shared expert) into `out`.
@@ -1001,7 +1020,7 @@ impl<'a> GlmEngine<'a> {
         pointers.extend(weight(layer, "w_gate_up", cap)?);
         pointers.extend(weight(layer, "w_down", cap)?);
         pointers.extend([("out", out), ("scratch", w.scratch.buffer.ptr)]);
-        self.run(&format!("glm_ffn_i{intermediate}_{cap}"), &pointers, &[rows])
+        self.run(&format!("glm_ffn_i{intermediate}_{cap}"), &pointers, &self.projection_scalars(rows, cap))
     }
 }
 
@@ -1043,13 +1062,10 @@ fn expert_request(staged: &[u8], index: usize, t: usize, h: usize, topk: usize, 
     Ok(request)
 }
 
-/// A weight's program pointers: its BF16 copy, plus the E4M3 copy and FP32
-/// block scales the decode (`m64`) programs read for their few-row GEMVs.
+/// An FP8 weight's program pointers: its E4M3 copy and FP32 scales (prefill
+/// programs read `w_qkv_a`'s per-row scales, K-block major).
 fn weight(layer: &GlmLayer<'_>, name: &'static str, cap: &str) -> Result<Vec<(&'static str, *mut c_void)>> {
-    let mut pointers = vec![(name, layer.ptr(name)?)];
-    if cap == "m64" {
-        let (fp8, scale) = super::weights::fp8_operand_names(name);
-        pointers.extend([(fp8, layer.ptr(fp8)?), (scale, layer.ptr(scale)?)]);
-    }
-    Ok(pointers)
+    let (fp8, scale, kscale) = super::weights::fp8_operand_names(name);
+    let scale = if cap != "m64" && !kscale.is_empty() { kscale } else { scale };
+    Ok(vec![(fp8, layer.ptr(fp8)?), (scale, layer.ptr(scale)?)])
 }

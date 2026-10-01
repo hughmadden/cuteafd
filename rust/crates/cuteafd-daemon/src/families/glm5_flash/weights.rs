@@ -1,8 +1,13 @@
 //! GLM 5.3 Flash coordinator weights, packed for the exported glmf_* programs.
 //!
-//! Every matrix operand is BF16: the EXL3 publications store the dense
-//! tensors in BF16 (equal to the official BF16 release), FP8 checkpoint
-//! tensors are dequantized on the GPU with their FP32 128x128 block scales.
+//! The MLA (`q_a|kv_a`, `q_b`, `o_proj`), dense and shared-expert projections
+//! are FP8 only: the official FP8 release's E4M3 bytes and FP32 128x128 block
+//! scales (`--fp8-snapshot`), else 128x128 blocks quantized from the BF16
+//! checkpoint at load. Every other matrix operand is BF16 (the EXL3
+//! publications store the dense tensors in BF16, equal to the official BF16
+//! release; FP8 checkpoint tensors are dequantized on the GPU with their FP32
+//! 128x128 block scales), plus the optional per-row FP8 copies of the KDA
+//! projections and the LM head.
 //! Packing (see the glmf program docstrings): KDA `w_in = [q; k; v; f_a; g_a;
 //! b]`, `w_fg = [f_b; g_b]`, `conv_w` FP32 `[3D, 4]`; MLA `w_qkv_a = [q_a;
 //! kv_a]`, `kv_b` split per head into `w_uk [N, 512, 256]` (transposed key
@@ -66,10 +71,8 @@ pub(crate) struct GlmfLoader<'a> {
     pub library: &'a NativeLibrary,
     pub checkpoint: &'a Checkpoint,
     pub stream: *mut c_void,
-    /// FP8 decode copies: MLA/dense/shared at 128x128 blocks (from `fp8_source`,
-    /// the official FP8 release, when given; else quantized from BF16) and the
-    /// KDA projections per row.
-    pub fp8_dense: bool,
+    /// The official FP8 release: MLA/dense/shared weights (their only copies,
+    /// 128x128 blocks) come from it when given, else are quantized from BF16.
     pub fp8_source: Option<&'a Checkpoint>,
     pub kda_fp8: super::fp8::KdaFp8,
     pub fp8_head: bool,
@@ -151,8 +154,51 @@ impl<'a> GlmfLoader<'a> {
     /// `layout`: the FP8 source checkpoint's own blocks when it stores the
     /// tensors as FP8 (block layout), else quantized from BF16.
     fn fp8(&self, names: &[String], layout: super::fp8::Layout) -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
+        if layout == super::fp8::Layout::Block {
+            if let Some(copy) = self.fp8_blocks(names)? {
+                return Ok(copy);
+            }
+        }
         let (values, scales, _) = self.fp8_host(names, layout)?;
         Ok((self.upload(&values)?, self.upload(&scales)?))
+    }
+
+    /// The FP8 source's own E4M3 blocks and FP32 128x128 grids of `names`
+    /// (row-concatenated) on the device, read through this thread's staging
+    /// buffer; None when a part is not an FP8 tensor there (quantized instead).
+    fn fp8_blocks(&self, names: &[String]) -> Result<Option<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
+        let checkpoint = self.fp8_source.unwrap_or(self.checkpoint);
+        let find = |name: &str| -> Result<&'a CheckpointTensor> {
+            let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
+                .map_err(|_| anyhow::anyhow!("FP8 checkpoint has no tensor {name}"))?;
+            Ok(&checkpoint.tensors[at])
+        };
+        let tensors = names.iter().map(|n| find(n)).collect::<Result<Vec<_>>>()?;
+        if tensors.iter().any(|t| t.meta.dtype != DType::F8E4M3 || t.meta.shape.len() != 2) {
+            return Ok(None);
+        }
+        let total: usize = tensors.iter().map(|t| t.meta.byte_length as usize).sum();
+        crate::shared::memory::staging::with_staging(total, |values| {
+            let (mut grid, mut at) = (Vec::new(), 0usize);
+            for (i, (name, tensor)) in names.iter().zip(&tensors).enumerate() {
+                let shape = &tensor.meta.shape;
+                ensure!(shape[1] == tensors[0].meta.shape[1] && (i + 1 == names.len() || shape[0] % 128 == 0),
+                    "{names:?}: FP8 rows must share columns and fill whole 128-row blocks but the last");
+                let length = tensor.meta.byte_length as usize;
+                std::fs::File::open(checkpoint.snapshot.join(&tensor.shard))?
+                    .read_exact_at(&mut values[at..at + length], tensor.meta.byte_offset)
+                    .with_context(|| format!("reading {name}"))?;
+                at += length;
+                let scale = find(&format!("{name}_scale_inv"))?;
+                ensure!(scale.meta.dtype == DType::F32 && scale.meta.shape == [shape[0] / 128, shape[1].div_ceil(128)],
+                    "{name}: expected FP32 128x128 block scales, found {:?} {:?}", scale.meta.dtype, scale.meta.shape);
+                let mut bytes = vec![0u8; scale.meta.byte_length as usize];
+                std::fs::File::open(checkpoint.snapshot.join(&scale.shard))?
+                    .read_exact_at(&mut bytes, scale.meta.byte_offset)?;
+                grid.extend_from_slice(&bytes);
+            }
+            Ok(Some((self.upload(values)?, self.upload(&grid)?)))
+        })
     }
 
     /// Per-row FP8 copy of `names` (Row128) plus its scales K-block major
@@ -335,26 +381,21 @@ impl<'a> GlmfLoader<'a> {
                 ops.insert("w_o", w_o);
             }
             GlmNextAttention::Mla => {
-                ops.insert("w_qkv_a", self.rows(&[a("q_a_proj.weight"), a("kv_a_proj_with_mqa.weight")])?);
                 ops.insert("q_a_norm", self.one(&a("q_a_layernorm.weight"))?);
                 ops.insert("kv_a_norm", self.one(&a("kv_a_layernorm.weight"))?);
-                ops.insert("w_q_b", self.one(&a("q_b_proj.weight"))?);
                 let (uk, uv) = self.absorbed(cfg, &a("kv_b_proj.weight"))?;
                 ops.insert("w_uk", uk);
                 ops.insert("w_uv", uv);
-                ops.insert("w_o", self.one(&a("o_proj.weight"))?);
-                if self.fp8_dense {
-                    let block = super::fp8::Layout::Block;
-                    let (q, s) = self.fp8(&[a("q_a_proj.weight"), a("kv_a_proj_with_mqa.weight")], block)?;
-                    ops.insert("w_qkv_a_fp8", q);
-                    ops.insert("w_qkv_a_scale", s);
-                    let (q, s) = self.fp8(&[a("q_b_proj.weight")], block)?;
-                    ops.insert("w_q_b_fp8", q);
-                    ops.insert("w_q_b_scale", s);
-                    let (q, s) = self.fp8(&[a("o_proj.weight")], block)?;
-                    ops.insert("w_o_fp8", q);
-                    ops.insert("w_o_scale", s);
-                }
+                let block = super::fp8::Layout::Block;
+                let (q, s) = self.fp8(&[a("q_a_proj.weight"), a("kv_a_proj_with_mqa.weight")], block)?;
+                ops.insert("w_qkv_a_fp8", q);
+                ops.insert("w_qkv_a_scale", s);
+                let (q, s) = self.fp8(&[a("q_b_proj.weight")], block)?;
+                ops.insert("w_q_b_fp8", q);
+                ops.insert("w_q_b_scale", s);
+                let (q, s) = self.fp8(&[a("o_proj.weight")], block)?;
+                ops.insert("w_o_fp8", q);
+                ops.insert("w_o_scale", s);
                 let i = |name: &str| a(&format!("indexer.{name}"));
                 ops.insert("w_iq", self.one(&i("wq_b.weight"))?);
                 ops.insert("w_ik", self.rows(&[i("wk.weight"), i("weights_proj.weight"),
@@ -365,31 +406,23 @@ impl<'a> GlmfLoader<'a> {
             }
         }
         let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
-        if self.fp8_dense {
-            let block = super::fp8::Layout::Block;
-            let (q, s) = self.fp8(&[format!("{mlp}.gate_proj.weight"), format!("{mlp}.up_proj.weight")], block)?;
-            ops.insert("w_gate_up_fp8", q);
-            ops.insert("w_gate_up_scale", s);
-            let (q, s) = self.fp8(&[format!("{mlp}.down_proj.weight")], block)?;
-            ops.insert("w_down_fp8", q);
-            ops.insert("w_down_scale", s);
-        }
-        if dense {
-            ops.insert("w_gate_up", self.rows(&[format!("{p}.mlp.gate_proj.weight"), format!("{p}.mlp.up_proj.weight")])?);
-            ops.insert("w_down", self.one(&format!("{p}.mlp.down_proj.weight"))?);
-        } else {
+        let block = super::fp8::Layout::Block;
+        let (q, s) = self.fp8(&[format!("{mlp}.gate_proj.weight"), format!("{mlp}.up_proj.weight")], block)?;
+        ops.insert("w_gate_up_fp8", q);
+        ops.insert("w_gate_up_scale", s);
+        let (q, s) = self.fp8(&[format!("{mlp}.down_proj.weight")], block)?;
+        ops.insert("w_down_fp8", q);
+        ops.insert("w_down_scale", s);
+        if !dense {
             ops.insert("gate", self.one(&format!("{p}.mlp.gate.weight"))?);
             ops.insert("gate.bias", self.f32(&[format!("{p}.mlp.gate.e_score_correction_bias")])?);
-            ops.insert("w_gate_up", self.rows(&[format!("{p}.mlp.shared_experts.gate_proj.weight"),
-                format!("{p}.mlp.shared_experts.up_proj.weight")])?);
-            ops.insert("w_down", self.one(&format!("{p}.mlp.shared_experts.down_proj.weight"))?);
         }
         Ok(GlmfLayer { attention, dense, operands: ops })
     }
 
     /// Layers `0..layers` (all of them unless the caller stops early).
     pub fn model(&self, cfg: &GlmNextConfig, layers: usize) -> Result<GlmfWeights<'a>> {
-        Ok(GlmfWeights {
+        let weights = GlmfWeights {
             layers: (0..layers.min(cfg.layers)).map(|l| self.layer(cfg, l)).collect::<Result<_>>()?,
             norm: self.one(&format!("{PREFIX}norm.weight"))?,
             head: self.one("lm_head.weight")?,
@@ -398,6 +431,8 @@ impl<'a> GlmfLoader<'a> {
             } else {
                 None
             },
-        })
+        };
+        crate::shared::memory::staging::release_staging();
+        Ok(weights)
     }
 }

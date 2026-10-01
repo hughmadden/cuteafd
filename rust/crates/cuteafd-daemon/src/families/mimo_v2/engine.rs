@@ -225,6 +225,10 @@ pub(crate) struct MimoEngine<'a> {
     pub l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
     /// The native MTP drafter: every step taps the last layer's rows.
     pub mtp: Option<super::mtp::MtpDrafter<'a>>,
+    /// Prefill qkv and dense-FFN projections run W8A8 (E4M3 activations per
+    /// row and 128-K block, the official FP8 release's served numerics); false:
+    /// W8A16 (bitwise the former BF16 prefill over dequantized weights).
+    pub prefill_w8a8: bool,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -239,6 +243,19 @@ fn fp8_scalars(rows: Scalar, decode: bool, fp8: bool) -> Vec<Scalar> {
         scalars.push(Scalar::I32(if fp8 { FP8_DECODE_ROWS } else { 0 }));
     }
     scalars
+}
+
+/// An FP8-only weight's scales: row major for decode programs, K-block major for prefill ones.
+fn scale(name: &str, decode: bool, layer: &MimoLayer<'_>) -> Result<(&'static str, *mut c_void)> {
+    let operand: &'static str = match (name, decode) {
+        ("w_qkv", true) => "w_qkv_scale",
+        ("w_qkv", false) => "w_qkv_kscale",
+        ("w_gate_up", true) => "w_gate_up_scale",
+        ("w_gate_up", false) => "w_gate_up_kscale",
+        ("w_down", true) => "w_down_scale",
+        _ => "w_down_kscale",
+    };
+    Ok((operand, layer.ptr(operand)?))
 }
 
 fn kind(attention: MimoAttention) -> &'static str {
@@ -289,7 +306,7 @@ impl<'a> MimoEngine<'a> {
         Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, rings, family, kv, cos_sin_full,
             cos_sin_swa, workspace: RefCell::new(None), decode_workspace: RefCell::new(None), experts: None,
             expert_input: ExpertInput::Fp8,
-            profile: RefCell::new([0.0; 2]), drafter: None, mtp: None, l2: None })
+            profile: RefCell::new([0.0; 2]), drafter: None, mtp: None, l2: None, prefill_w8a8: true })
     }
 
     /// Layer `layer`'s KV storage: the paged record pool (full attention; page `p` holds
@@ -488,18 +505,7 @@ impl<'a> MimoEngine<'a> {
             // h += attention; x = post_attention_layernorm(h)
             self.norm(w, layer.ptr("post_norm")?, 1, rows)?;
             if layer.dense {
-                let mut pointers = vec![("x", w.x.buffer.ptr), ("w_gate_up", layer.ptr("w_gate_up")?)];
-                if tables.decode {
-                    pointers.extend([("w_gate_up_fp8", layer.ptr_or("w_gate_up_fp8", "w_gate_up")?),
-                        ("w_gate_up_scale", layer.ptr_or("w_gate_up_scale", "w_gate_up")?)]);
-                }
-                pointers.push(("w_down", layer.ptr("w_down")?));
-                if tables.decode {
-                    pointers.extend([("w_down_fp8", layer.ptr_or("w_down_fp8", "w_down")?),
-                        ("w_down_scale", layer.ptr_or("w_down_scale", "w_down")?)]);
-                }
-                pointers.extend([("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
-                self.run(&format!("mimo_ffn_{cap}"), &pointers, &fp8_scalars(rows, tables.decode, layer.has("w_down_fp8")))?;
+                self.dense_ffn(w, layer, rows, cap, tables.decode)?;
             } else {
                 self.moe(w, index, layer, t, tables.decode)?;
             }
@@ -734,12 +740,7 @@ impl<'a> MimoEngine<'a> {
         self.norm(w, layer.ptr("input_norm")?, 0, rows)?;
         self.attention(w, stage.ring.buffer.ptr, layer, rows, "m64", &tables)?;
         self.norm(w, layer.ptr("post_norm")?, 1, rows)?;
-        let mut pointers = vec![("x", w.x.buffer.ptr), ("w_gate_up", layer.ptr("w_gate_up")?),
-            ("w_gate_up_fp8", layer.ptr_or("w_gate_up_fp8", "w_gate_up")?),
-            ("w_gate_up_scale", layer.ptr_or("w_gate_up_scale", "w_gate_up")?), ("w_down", layer.ptr("w_down")?),
-            ("w_down_fp8", layer.ptr_or("w_down_fp8", "w_down")?), ("w_down_scale", layer.ptr_or("w_down_scale", "w_down")?)];
-        pointers.extend([("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
-        self.run("mimo_ffn_m64", &pointers, &fp8_scalars(rows, true, layer.has("w_down_fp8")))?;
+        self.dense_ffn(w, layer, rows, "m64", true)?;
         self.norm(w, stage.final_norm.buffer.ptr, 1, rows)?;
         if !logits {
             // SAFETY: the engine owns this stream.
@@ -789,14 +790,10 @@ impl<'a> MimoEngine<'a> {
             MimoAttention::Sliding => w.kv_step.buffer.ptr,
         };
         let decode = tables.decode;
-        let mut pointers = vec![("x", w.x.buffer.ptr), ("positions", w.positions.buffer.ptr), ("kv_slots", slots),
-            ("cos_sin", cos_sin), ("w_qkv", layer.ptr("w_qkv")?)];
-        if decode {
-            pointers.extend([("w_qkv_fp8", layer.ptr_or("w_qkv_fp8", "w_qkv")?),
-                ("w_qkv_scale", layer.ptr_or("w_qkv_scale", "w_qkv")?)]);
-        }
-        pointers.extend([("kv_cache", records), ("query", w.query.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
-        self.run(&format!("mimo_{k}_producer_{cap}"), &pointers, &fp8_scalars(rows, decode, layer.has("w_qkv_fp8")))?;
+        let pointers = [("x", w.x.buffer.ptr), ("positions", w.positions.buffer.ptr), ("kv_slots", slots),
+            ("cos_sin", cos_sin), ("w_qkv_fp8", layer.ptr("w_qkv_fp8")?), scale("w_qkv", decode, layer)?,
+            ("kv_cache", records), ("query", w.query.buffer.ptr), ("scratch", w.scratch.buffer.ptr)];
+        self.run(&format!("mimo_{k}_producer_{cap}"), &pointers, &self.w8_scalars(rows, decode))?;
         let name = format!("mimo_{k}_attention_{mode}_{cap}");
         match layer.attention {
             MimoAttention::Full => {
@@ -824,6 +821,21 @@ impl<'a> MimoEngine<'a> {
         self.run(&format!("mimo_o_{cap}"), &pointers, &fp8_scalars(rows, decode, layer.has("w_o_fp8")))
     }
 
+    /// The dense SwiGLU MLP (layer 0, MTP layers) over its FP8-only weights into `delta`.
+    fn dense_ffn(&self, w: &Workspace<'_>, layer: &MimoLayer<'_>, rows: Scalar, cap: &str, decode: bool) -> Result<()> {
+        let pointers = [("x", w.x.buffer.ptr), ("w_gate_up_fp8", layer.ptr("w_gate_up_fp8")?),
+            scale("w_gate_up", decode, layer)?, ("w_down_fp8", layer.ptr("w_down_fp8")?), scale("w_down", decode, layer)?,
+            ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)];
+        self.run(&format!("mimo_ffn_{cap}"), &pointers, &self.w8_scalars(rows, decode))
+    }
+
+    /// `[rows, fp8_rows]` of the programs over FP8-only weights: decode rows up
+    /// to `FP8_DECODE_ROWS` on the FP8 GEMVs (W8A16 GEMMs above); prefill 1
+    /// (W8A8) or 0 (W8A16, `prefill_w8a8` off).
+    fn w8_scalars(&self, rows: Scalar, decode: bool) -> [Scalar; 2] {
+        [rows, Scalar::I32(if decode { FP8_DECODE_ROWS } else { i32::from(self.prefill_w8a8) })]
+    }
+
     /// Per MoE layer, the weights a decode step reads after its routed
     /// experts are out, in read order: the next layer's attention (E4M3
     /// copies where the decode programs read them), norms, router and dense
@@ -831,8 +843,8 @@ impl<'a> MimoEngine<'a> {
     pub fn decode_read_order(&self) -> Vec<Vec<crate::shared::l2_prefetch::Range>> {
         let layers = &self.weights.layers;
         (0..layers.len()).map(|i| match layers.get(i + 1) {
-            Some(next) => crate::shared::l2_prefetch::operands(&["input_norm", "w_qkv", "sinks", "w_o", "post_norm", "w_router",
-                "w_hilo", "gate.bias", "w_gate_up", "w_down"], |n| next.range(n)),
+            Some(next) => crate::shared::l2_prefetch::operands(&["input_norm", "w_qkv", "sinks", "w_o", "post_norm",
+                "w_router", "w_hilo", "gate.bias", "w_gate_up", "w_down"], |n| next.range(n)),
             None => {
                 let head = match &self.weights.head_fp8 {
                     Some((q, scale)) => vec![q, scale],

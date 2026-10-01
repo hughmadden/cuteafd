@@ -59,12 +59,13 @@ pub(crate) struct EngineArgs {
     /// FP8 expert layers resident at once with --local-experts (7.25 GiB each).
     #[arg(long, default_value_t = 6)]
     pub expert_window: usize,
-    /// Decode rows (<= 16 per step) read FP8 copies of the MLA, dense and
-    /// shared-expert projections: the official FP8 release's own E4M3 blocks
-    /// with --fp8-snapshot, else 128x128 blocks quantized from BF16.
+    /// Kept for launch scripts: the MLA, dense and shared-expert projections
+    /// are always FP8 (their only copies): the official FP8 release's E4M3
+    /// blocks with --fp8-snapshot, else 128x128 blocks quantized from BF16.
     #[arg(long)]
     pub fp8_decode: bool,
-    /// The official FP8 checkpoint (zai-org/GLM-5.3-Flash) for --fp8-decode.
+    /// The official FP8 checkpoint (zai-org/GLM-5.3-Flash): the MLA, dense and
+    /// shared-expert weights (E4M3 with FP32 128x128 block scales).
     #[arg(long)]
     pub fp8_snapshot: Option<PathBuf>,
     /// FP8 KDA projections for decode rows, quantized per row at load.
@@ -85,12 +86,14 @@ pub(crate) struct EngineArgs {
     /// memory decides first).
     #[arg(long, default_value_t = 64)]
     pub exl3_window: usize,
-    /// Prefill projections that run block-FP8 GEMMs (E4M3 activations per row
-    /// and 128-K block, FP32 scales): `mla` (q_a|kv_a, q_b, o_proj) and `ffn`
-    /// (dense and shared-expert MLPs) over the official FP8 weights (needs
-    /// --fp8-decode --fp8-snapshot), `kda-in` / `kda-o` (the KDA in-projection
-    /// and o_proj over their per-row copies; needs --kda-fp8 row128).
-    #[arg(long, value_enum, value_delimiter = ',')]
+    /// Prefill projections that run W8A8 block-FP8 GEMMs (E4M3 activations per
+    /// row and 128-K block, FP32 scales): `mla` (q_a|kv_a, q_b, o_proj) and
+    /// `ffn` (dense and shared-expert MLPs) over the FP8 weights, the default
+    /// (the official FP8 release's served numerics; without them those run
+    /// W8A16), `kda-in` / `kda-o` (the KDA in-projection and o_proj, BF16 in the
+    /// release, over their per-row copies; needs --kda-fp8 row128), `all`, or
+    /// `none` (MLA and FFN W8A16, KDA BF16).
+    #[arg(long, value_enum, value_delimiter = ',', default_value = "mla,ffn")]
     pub fp8_prefill: Vec<Fp8PrefillGroup>,
     /// Profiling only: MoE layers run the router, the expert wire rows and the
     /// shared expert; the routed experts contribute nothing.
@@ -128,6 +131,8 @@ pub(crate) enum Fp8PrefillGroup {
     KdaO,
     /// Every group.
     All,
+    /// No group: every prefill projection over FP8 weights runs W8A16.
+    None,
 }
 
 #[derive(Debug, clap::Args)]
@@ -272,23 +277,23 @@ impl Opened {
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::GlmfLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
-            fp8_dense: args.fp8_decode, fp8_source: self.fp8_checkpoint.as_ref(), kda_fp8: args.kda_fp8,
+            fp8_source: self.fp8_checkpoint.as_ref(), kda_fp8: args.kda_fp8,
             fp8_head: args.fp8_head, kda_nvfp4: args.kda_nvfp4_gate.as_deref().map(|mode| mode == "search"),
             fp8_scales: args.fp8_scales };
         let model = loader.model(&self.cfg, layers)?;
         let resident: usize = model.layers.iter().map(weights::GlmfLayer::bytes).sum();
-        tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64, fp8_decode = args.fp8_decode,
-            fp8_source = self.fp8_checkpoint.is_some(), kda_fp8 = ?args.kda_fp8,
+        tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64,
+            fp8_source = self.fp8_checkpoint.is_some(), kda_fp8 = ?args.kda_fp8, fp8_prefill = ?args.fp8_prefill,
             elapsed_ms = started.elapsed().as_millis() as u64, "GLM 5.3 Flash coordinator weights resident");
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages, args.slots)?;
         engine.full_prefill_logits = args.full_prefill_logits;
+        ensure!(!args.fp8_prefill.contains(&Fp8PrefillGroup::None) || args.fp8_prefill.len() == 1,
+            "--fp8-prefill none takes no other group");
         let group = |g: Fp8PrefillGroup| args.fp8_prefill.iter().any(|&x| x == g || x == Fp8PrefillGroup::All);
         engine.fp8_prefill = engine::Fp8Prefill { mla: group(Fp8PrefillGroup::Mla), ffn: group(Fp8PrefillGroup::Ffn),
             kda_bits: i32::from(group(Fp8PrefillGroup::KdaIn)) | (i32::from(group(Fp8PrefillGroup::KdaO)) << 1) };
-        ensure!(!(engine.fp8_prefill.mla || engine.fp8_prefill.ffn) || args.fp8_decode,
-            "--fp8-prefill mla/ffn reads the FP8 copies --fp8-decode loads");
         ensure!(engine.fp8_prefill.kda_bits == 0 || args.kda_fp8 == fp8::KdaFp8::Row128,
             "--fp8-prefill kda reads the per-row FP8 copies --kda-fp8 row128 loads");
         if let Some(snapshot) = &args.draft {

@@ -69,6 +69,12 @@ pub(crate) struct EngineArgs {
     /// coordinator alone. Outputs are not the model's.
     #[arg(long, hide = true)]
     pub skip_routed_experts: bool,
+    /// Prefill projections over the checkpoint's FP8 weights run W8A16 (the
+    /// weights widened to BF16 in-kernel: the former BF16 prefill bit for bit)
+    /// instead of W8A8 (E4M3 activations per row and 128-K block with FP32
+    /// scales, the official FP8 release's served numerics).
+    #[arg(long)]
+    pub prefill_w8a16: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -111,6 +117,11 @@ pub(crate) struct GoldenArgs {
     /// KL); the prefill runs without layer downloads (Spark lanes).
     #[arg(long)]
     pub nll: bool,
+    /// With --nll: also write tokens.bin and every row's logits.bin (F32) to
+    /// this directory, a golden for A/B runs between builds or numerics (e.g.
+    /// W8A8 against --prefill-w8a16 with --skip-routed-experts).
+    #[arg(long, hide = true)]
+    pub save_logits: Option<PathBuf>,
     /// Time this many prefills of --bench-prefill-tokens tokens (the golden
     /// prompt repeated, in chunks of the prefill capacity) on fresh sequences.
     #[arg(long, default_value_t = 0)]
@@ -190,11 +201,15 @@ impl Opened {
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::GlmLoader { library: &self.library, catalog: &self.catalog, stream };
         let model = loader.model(&self.cfg, layers)?;
-        tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64, "GLM coordinator weights resident");
+        let bytes: usize = model.layers.iter().map(|l| l.bytes()).sum::<usize>() + model.norm.buffer.bytes
+            + model.head.buffer.bytes;
+        tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64,
+            gib = format!("{:.2}", bytes as f64 / (1u64 << 30) as f64), "GLM coordinator weights resident");
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages)?;
         engine.full_prefill_logits = args.full_prefill_logits;
+        engine.prefill_w8a8 = !args.prefill_w8a16;
         if args.skip_routed_experts {
             engine.skip_routed_experts()?;
         }
@@ -389,6 +404,11 @@ fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, m
             None, chunk.len() / row)?.context("the prefill needs every layer")?);
     }
     let seconds = started.elapsed().as_secs_f64();
+    if let Some(dir) = &args.save_logits {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join("tokens.bin"), tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>())?;
+        std::fs::write(dir.join("logits.bin"), logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+    }
     let nll_of = |l: &[f32], next: u32| {
         let top = l.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
         top + l.iter().map(|&x| (x as f64 - top).exp()).sum::<f64>().ln() - l[next as usize] as f64

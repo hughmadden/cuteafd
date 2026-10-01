@@ -83,10 +83,18 @@ pub(crate) struct EngineArgs {
     /// TP1 FP8 package layout for --local-experts (default `<libdir>/fp8/fp8-mimo/tp1`).
     #[arg(long)]
     pub fp8_package: Option<PathBuf>,
-    /// Decode steps of <= 16 rows read E4M3 copies of the qkv, o and dense FFN
-    /// weights (the checkpoint's own FP8 bytes; o_proj quantized per row).
+    /// Decode steps of <= 32 rows read an E4M3 copy of o_proj (with
+    /// --fp8-o-proj). The qkv and dense FFN weights are the checkpoint's FP8
+    /// bytes either way (their only copies): decode rows up to 32 on the FP8
+    /// GEMVs, W8A16 GEMMs above.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub fp8_decode: bool,
+    /// Prefill qkv and dense-FFN projections run W8A16 (the FP8 weights widened
+    /// to BF16 in-kernel: the former BF16 prefill bit for bit) instead of W8A8
+    /// (E4M3 activations per row and 128-K block with FP32 scales, the official
+    /// FP8 release's served numerics).
+    #[arg(long)]
+    pub prefill_w8a16: bool,
     /// Decode steps of <= 16 rows read an E4M3 copy of the LM head (per row x 128-K scales).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub fp8_head: bool,
@@ -131,6 +139,12 @@ pub(crate) struct GoldenArgs {
     /// back), so prefill and decode times are the engine's.
     #[arg(long)]
     pub timing: bool,
+    /// Then time this many prefills of --bench-prefill-tokens tokens (the
+    /// golden prompt repeated, in chunks of --prefill-rows) on fresh sequences.
+    #[arg(long, default_value_t = 0)]
+    pub bench_prefill: usize,
+    #[arg(long, default_value_t = 4096)]
+    pub bench_prefill_tokens: usize,
     /// With --draft: run only the drafter on the golden taps at the anchors of
     /// python/reference/families/mimo_v2/mimo_dflash/reference.py's output directory, compare
     /// drafts, and score them against the golden text and greedy targets.
@@ -219,10 +233,14 @@ impl Opened {
         } else {
             None
         };
-        tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64, "MiMo coordinator weights resident");
+        let bytes: usize = model.layers.iter().map(|l| l.bytes()).sum::<usize>() + model.norm.buffer.bytes
+            + model.head.buffer.bytes + model.head_fp8.as_ref().map_or(0, |(q, s)| q.buffer.bytes + s.buffer.bytes);
+        tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64,
+            gib = format!("{:.2}", bytes as f64 / (1u64 << 30) as f64), "MiMo coordinator weights resident");
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::MimoEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages, args.rings)?;
+        engine.prefill_w8a8 = !args.prefill_w8a16;
         engine.mtp = mtp;
         if let Some(dir) = &draft_dir {
             let started = Instant::now();
@@ -507,12 +525,15 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
         let mut step_compare = |layer: usize, stream: &[u8]| compare(layer, first, stream, &mut decode_worst);
         if let Some(logits) = engine.verify(&mut [(&mut placement, n)], &embed[position * row..(position + n) * row],
             (!args.timing).then_some(&mut step_compare as &mut dyn FnMut(usize, &[u8]) -> Result<()>))? {
-            decode_logits.extend(logits);
+            // --timing: step times without the scoring copy of every row's logits.
+            if !args.timing {
+                decode_logits.extend(logits);
+            }
         }
         position += n;
     }
     if prefill < tokens.len() {
-        println!("decode: {} rows in steps of {} in {:.2} s; worst row-block cosine per layer {:?}", tokens.len() - prefill,
+        println!("decode: {} rows in steps of {} in {:.4} s; worst row-block cosine per layer {:?}", tokens.len() - prefill,
             args.step_rows, started.elapsed().as_secs_f64(),
             decode_worst.iter().map(|c| format!("{c:.6}")).collect::<Vec<_>>());
     }
@@ -570,10 +591,32 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
         let (cosine, _) = similarity(&logits, last);
         println!("last-row logits: argmax engine {} golden {} cosine {cosine:.6}", argmax(&logits), argmax(last));
     }
-    let profile = engine.profile.borrow();
-    if profile[1] > 0.0 {
-        println!("phases: GPU wait before expert requests {:.2} s, expert exchange / streamed loads {:.2} s",
-            profile[0], profile[1]);
+    {
+        let profile = engine.profile.borrow();
+        if profile[1] > 0.0 {
+            println!("phases: GPU wait before expert requests {:.2} s, expert exchange / streamed loads {:.2} s",
+                profile[0], profile[1]);
+        }
+    }
+    if args.bench_prefill > 0 {
+        // Fresh sequences on a second allocator over the same pools (timing only).
+        let n = args.bench_prefill_tokens;
+        let long: Vec<u8> = embed.chunks_exact(row).cycle().take(n).flatten().copied().collect();
+        let mut allocator = engine::Allocator::new(engine.pages, engine.rings);
+        let mut times = Vec::new();
+        for _ in 0..args.bench_prefill {
+            let mut fresh = allocator.admit(n)?;
+            let started = Instant::now();
+            for chunk in long.chunks(engine.prefill_rows * row) {
+                engine.prefill(&mut fresh, chunk, None)?;
+            }
+            times.push(started.elapsed().as_secs_f64());
+            allocator.release(fresh);
+        }
+        times.sort_by(f64::total_cmp);
+        let median = times[times.len() / 2];
+        println!("prefill bench: {n} tokens through {layers} layers in chunks of {}, median {:.1} ms ({:.0} tok/s), \
+            min {:.1} ms", engine.prefill_rows, 1e3 * median, n as f64 / median, 1e3 * times[0]);
     }
     Ok(())
 }
