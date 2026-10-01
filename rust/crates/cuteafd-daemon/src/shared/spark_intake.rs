@@ -578,10 +578,28 @@ pub(crate) fn copy_parallel(dst: &mut [u8], src: &[u8]) {
     });
 }
 
+/// Waves whose expert input is at least this large go out through the
+/// transport's zero-copy egress buffer ([`SparkLink::egress`]); smaller
+/// (decode) requests keep their own copy.
+const EGRESS_MIN_BYTES: usize = 1 << 20;
+
+/// `CUTEAFD_SPARK_EGRESS` (on, the default, or off): prefill requests go out
+/// zero-copy from one registered buffer shared by every rank's session.
+fn egress_enabled() -> bool {
+    static SETTING: OnceLock<bool> = OnceLock::new();
+    *SETTING.get_or_init(|| {
+        let on = !matches!(std::env::var("CUTEAFD_SPARK_EGRESS").as_deref(), Ok("off" | "0"));
+        tracing::info!(zero_copy = on, min_bytes = EGRESS_MIN_BYTES, "Spark request egress");
+        on
+    })
+}
+
 /// A Spark transport and the intake its waves land in (dropped in that order).
 pub(crate) struct SparkLink<'a> {
     pub(crate) transport: SparkExperts,
     pub(crate) intake: SparkIntake<'a>,
+    /// Bytes of the transport's egress buffer (0: none).
+    egress_bytes: usize,
 }
 
 impl<'a> SparkLink<'a> {
@@ -595,7 +613,28 @@ impl<'a> SparkLink<'a> {
         // SAFETY: the link drops its transport before its intake, and every
         // dispatch goes through `dispatch`, which calls `before_dispatch`.
         unsafe { intake.attach(&mut transport)? };
-        Ok(Self { transport, intake })
+        // Expert input rows are at most BF16, as wide as a partial row.
+        let egress_bytes = if egress_enabled() { capacity as usize * row_bytes } else { 0 };
+        if egress_bytes > 0 {
+            transport.enable_egress(egress_bytes)?;
+        }
+        Ok(Self { transport, intake, egress_bytes })
+    }
+
+    /// Where to write a wave's `bytes` of expert input so it goes out
+    /// zero-copy (then build the request with [`Self::egress_payload`]), or
+    /// `None` for a small wave or without egress. Waits for the previous
+    /// wave's request sends; the previous request must have been dropped.
+    pub(crate) fn egress(&mut self, bytes: usize) -> Result<Option<CuteafdHostBuffer>> {
+        if bytes < EGRESS_MIN_BYTES || bytes > self.egress_bytes {
+            return Ok(None);
+        }
+        self.transport.egress_target().map(Some)
+    }
+
+    /// The first `bytes` of the egress buffer as a request payload.
+    pub(crate) fn egress_payload(&self, bytes: usize) -> Result<bytes::Bytes> {
+        self.transport.egress_payload(bytes)
     }
 
     pub(crate) fn world_size(&self) -> usize {

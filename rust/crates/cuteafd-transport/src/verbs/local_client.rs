@@ -12,6 +12,8 @@ pub(crate) struct LocalTp4Client {
     deadline: Option<Instant>,
     /// Per-rank device ranges response payloads land in (GPU landing).
     landing: Vec<Option<DeviceLanding>>,
+    /// Shared registered request buffer (zero-copy egress).
+    egress: Option<Arc<super::egress::EgressBuffer>>,
 }
 impl LocalTp4Client {
     pub(crate) fn new(peers: [SocketAddr; 4], config: TcpTransportConfig) -> Self {
@@ -35,7 +37,32 @@ impl LocalTp4Client {
             done: Vec::with_capacity(world),
             deadline: None,
             landing: vec![None; world],
+            egress: None,
         }
+    }
+    /// Allocates the shared request buffer (`bytes`, pinned and device-mapped)
+    /// and registers it on every session from the next connection on.
+    pub(crate) fn enable_egress(&mut self, bytes: usize) -> Result<CuteafdHostBuffer> {
+        self.reset();
+        let buffer = super::egress::EgressBuffer::new(bytes)?;
+        let host = buffer.host();
+        self.egress = Some(buffer);
+        Ok(host)
+    }
+    /// The shared request buffer, once no request payload views it and every
+    /// session's request sends have left, so it may be rewritten.
+    pub(crate) fn egress_target(&mut self) -> Result<CuteafdHostBuffer> {
+        let buffer = self.egress.as_ref().context("this transport has no egress buffer")?;
+        anyhow::ensure!(buffer.writable(), "a request still views the egress buffer");
+        let host = buffer.host();
+        for session in self.sessions.iter_mut().flatten() {
+            session.drain_request_sends(&self.config)?;
+        }
+        Ok(host)
+    }
+    /// The first `len` bytes of the egress buffer as a request payload.
+    pub(crate) fn egress_payload(&self, len: usize) -> Result<bytes::Bytes> {
+        self.egress.as_ref().context("this transport has no egress buffer")?.payload(len)
     }
     /// Lands each rank's response payloads in its device range from the next
     /// connection on; drops current sessions so they reconnect that way.
@@ -87,6 +114,7 @@ impl LocalTp4Client {
                     &self.config,
                     request,
                     self.landing[rank],
+                    self.egress.as_ref(),
                 )?);
             }
             let timing = self.sessions[rank]

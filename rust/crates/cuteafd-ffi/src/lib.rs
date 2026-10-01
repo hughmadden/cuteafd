@@ -3740,6 +3740,46 @@ impl NativeLibrary {
         self.status_to_result("cuteafd_rdma_rc_endpoint_copy_recv_at", status)
     }
 
+    /// Registers `[ptr, ptr + bytes)` on the endpoint's protection domain for
+    /// [`Self::rdma_rc_endpoint_post_send_slot_region`]; returns the region index.
+    ///
+    /// # Safety
+    /// The range must be host memory that stays allocated until the endpoint is
+    /// destroyed.
+    pub unsafe fn rdma_rc_endpoint_register_region(
+        &self,
+        handle: *mut c_void,
+        ptr: *mut c_void,
+        bytes: usize,
+    ) -> Result<u32> {
+        type RegisterFn = unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut u32) -> CuteafdStatus;
+        let register: Symbol<RegisterFn> =
+            unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_register_region")? };
+        let mut region = 0;
+        let status = unsafe { register(handle, ptr, bytes, &mut region) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_register_region", status)?;
+        Ok(region)
+    }
+
+    /// Posts a signaled SEND gathering `slot_bytes` at `slot_offset` of the send
+    /// ring and `region_bytes` at `region_offset` of a registered region.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rdma_rc_endpoint_post_send_slot_region(
+        &self,
+        handle: *mut c_void,
+        slot_offset: usize,
+        slot_bytes: usize,
+        region: u32,
+        region_offset: usize,
+        region_bytes: usize,
+        wr_id: u64,
+    ) -> Result<()> {
+        type PostFn = unsafe extern "C" fn(*mut c_void, usize, usize, u32, usize, usize, u64) -> CuteafdStatus;
+        let post: Symbol<PostFn> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_post_send_slot_region")? };
+        let status = unsafe { post(handle, slot_offset, slot_bytes, region, region_offset, region_bytes, wr_id) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_post_send_slot_region", status)
+    }
+
     pub fn rdma_rc_endpoint_destroy(&self, handle: *mut c_void) -> Result<()> {
         let destroy_fn: Symbol<RdmaRcEndpointDestroyFn> =
             unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_destroy")? };

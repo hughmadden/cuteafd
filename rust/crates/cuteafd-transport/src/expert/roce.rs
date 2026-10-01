@@ -188,6 +188,27 @@ impl SparkExperts {
         self.clients.set_landing(landing)
     }
 
+    /// Zero-copy request egress: allocates a pinned, device-mapped buffer of
+    /// `bytes` that every rank's session registers (from the next connection
+    /// on). Requests whose hidden payload comes from [`Self::egress_payload`]
+    /// are sent without copying it into each rank's send ring. Returns the
+    /// buffer, for the engine's D2H target.
+    pub fn enable_egress(&mut self, bytes: usize) -> Result<cuteafd_ffi::CuteafdHostBuffer> {
+        self.wave_open = false;
+        self.clients.enable_egress(bytes)
+    }
+
+    /// The egress buffer to write the next wave's payload into: fails unless
+    /// no request views it any more; waits for the previous requests' sends.
+    pub fn egress_target(&mut self) -> Result<cuteafd_ffi::CuteafdHostBuffer> {
+        self.clients.egress_target()
+    }
+
+    /// The first `len` bytes of the egress buffer as a request's hidden payload.
+    pub fn egress_payload(&self, len: usize) -> Result<bytes::Bytes> {
+        self.clients.egress_payload(len)
+    }
+
     /// Ranks whose current connection lands payloads in device memory
     /// (connections open on the first dispatch after a reset).
     pub fn gpu_landing_ranks(&self) -> Vec<bool> {

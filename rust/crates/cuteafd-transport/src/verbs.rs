@@ -2,6 +2,7 @@ mod registered_response;
 mod landing;
 pub use landing::{gpu_landing_probe, DeviceLanding, GpuLandingProbe};
 use registered_response::{RegisteredResponseFrame, RegisteredResponseRing};
+mod egress;
 mod local;
 mod local_client;
 pub(crate) use local_client::LocalTp4Client;
@@ -26,6 +27,18 @@ use crate::synthetic::{expert_response_from_protocol_v2_response, protocol_v2_re
 use crate::{is_connection_closed, verbs_host_preflight, ExpertProtocolV2FrameBuffer, ExpertProtocolV2Request, ExpertProtocolV2RequestView, ExpertProtocolV2Response, ExpertProtocolV2ResponseHeader, ExpertProtocolV2ResponseView, ExpertProtocolV2Status, ExpertV2Dtype, TcpTransportConfig, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN};
 
 const VERBS_HOST_RECV_WR_ID: u64 = 0x7256_1001;
+/// Request payloads at least this large are staged by several threads.
+const PARALLEL_REQUEST_COPY_BYTES: usize = 4 << 20;
+
+/// `dst.copy_from_slice(src)` split over eight threads.
+fn copy_threads(dst: &mut [u8], src: &[u8]) {
+    let chunk = src.len().div_ceil(8).next_multiple_of(4096);
+    thread::scope(|scope| {
+        for (d, s) in dst.chunks_mut(chunk).zip(src.chunks(chunk)) {
+            scope.spawn(move || d.copy_from_slice(s));
+        }
+    });
+}
 const VERBS_HOST_SEND_WR_ID: u64 = 0x7256_1002;
 const VERBS_HOST_RDMA_RING_DEPTH: usize = 8;
 const VERBS_HOST_MAPPED_RDMA_RING_MAX_DEPTH: usize = 32;
@@ -1774,6 +1787,9 @@ struct VerbsHostProtocolV2PersistentClientSession {
     pinned_response_frame_recycle_rx: mpsc::Receiver<VerbsHostProtocolV2PinnedResponseFrame>,
     /// Response payloads land in device memory; only headers reach the host.
     gpu_landing: bool,
+    /// Zero-copy egress: the shared request buffer and its region on this
+    /// endpoint. Declared after `endpoint`, so the registration goes first.
+    egress: Option<(Arc<egress::EgressBuffer>, u32)>,
 }
 
 struct ProtocolV2ResponseChunkAssembler {
@@ -2012,18 +2028,31 @@ impl VerbsHostProtocolV2PersistentClientSession {
         execution_lane: u32,
         cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
     ) -> Result<Self> {
-        Self::connect_impl(addr, config, request, execution_lane, cq_harvester, false, None)
+        Self::connect_impl(addr, config, request, execution_lane, cq_harvester, false, None, false)
     }
 
     fn connect_local(addr: SocketAddr, config: &TcpTransportConfig,
-                     request: &ExpertProtocolV2Request, landing: Option<DeviceLanding>) -> Result<Self> {
-        Self::connect_impl(addr, config, request, 0, None, true, landing)
+                     request: &ExpertProtocolV2Request, landing: Option<DeviceLanding>,
+                     egress: Option<&Arc<egress::EgressBuffer>>) -> Result<Self> {
+        let mut session = Self::connect_impl(addr, config, request, 0, None, true, landing, egress.is_some())?;
+        if let Some(buffer) = egress {
+            let host = buffer.host();
+            // SAFETY: the buffer is pinned host memory kept alive by the Arc
+            // stored next to the endpoint, which drops (deregistering it) first.
+            let region = unsafe {
+                session.endpoint.library.rdma_rc_endpoint_register_region(session.endpoint.info.handle,
+                    host.ptr, host.bytes)?
+            };
+            session.egress = Some((Arc::clone(buffer), region));
+        }
+        Ok(session)
     }
 
     fn connect_impl(addr: SocketAddr, config: &TcpTransportConfig,
                     request: &ExpertProtocolV2Request, execution_lane: u32,
                     cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
-                    retain_final_response: bool, landing: Option<DeviceLanding>) -> Result<Self> {
+                    retain_final_response: bool, landing: Option<DeviceLanding>, gathered_sends: bool)
+                    -> Result<Self> {
         verbs_host_preflight()?;
         let native_path = verbs_host_native_library_path().context(
             "native library not found; set CUTEAFD_NATIVE_LIB or build native/libcuteafd_native.so with RDMA",
@@ -2042,8 +2071,9 @@ impl VerbsHostProtocolV2PersistentClientSession {
                 Arc::clone(&library), "client", request_capacity_wire_bytes,
                 response_capacity_wire_bytes, request_registered_span_bytes,
                 response_registered_span_bytes, next_local_psn("client"), response_ring.depth,
-                // A landing receive scatters header and payload (two entries).
-                if landing.is_some() { 2 } else { 1 },
+                // A landing receive scatters header and payload, a gathered
+                // send gathers them (two entries each).
+                if landing.is_some() || gathered_sends { 2 } else { 1 },
             )?
         } else {
             NativeRdmaEndpoint::create_from_wire_bytes(
@@ -2160,6 +2190,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             pinned_response_frame_recycle_tx,
             pinned_response_frame_recycle_rx,
             gpu_landing,
+            egress: None,
         })
     }
 
@@ -2272,12 +2303,52 @@ impl VerbsHostProtocolV2PersistentClientSession {
         }
         let send_started = timing_enabled.then(Instant::now);
         let request_send_slot = self.request_send_sequence % self.request_ring.depth;
-        self.endpoint.send_parts_at(
-            request_prefix,
-            &request.hidden_payload,
-            self.request_ring.slot_offset(self.request_send_sequence),
-            VERBS_HOST_SEND_WR_ID + request_send_slot as u64,
-        )?;
+        let offset = self.request_ring.slot_offset(self.request_send_sequence);
+        let egress = self.egress.as_ref()
+            .and_then(|(buffer, region)| Some((*region, buffer.offset_of(&request.hidden_payload)?)))
+            .filter(|_| !request.hidden_payload.is_empty());
+        if let Some((region, payload_offset)) = egress {
+            // Zero-copy: the header from this session's slot, the payload
+            // straight from the shared registered request buffer.
+            let view = self.endpoint.send_buffer_view()?;
+            anyhow::ensure!(!view.host_ptr.is_null() && offset + request_prefix.len() <= view.bytes,
+                "persistent verbs-host request slot exceeds its send buffer");
+            // SAFETY: the prefix range lies inside this endpoint's registered
+            // send buffer (checked above) and no send from this slot is in
+            // flight (the ring reclaimed it above).
+            unsafe {
+                std::ptr::copy_nonoverlapping(request_prefix.as_ptr(), view.host_ptr.cast::<u8>().add(offset),
+                    request_prefix.len());
+            }
+            self.endpoint.library.rdma_rc_endpoint_post_send_slot_region(self.endpoint.info.handle, offset,
+                request_prefix.len(), region, payload_offset, request.hidden_payload.len(),
+                VERBS_HOST_SEND_WR_ID + request_send_slot as u64)?;
+        } else if request.hidden_payload.len() >= PARALLEL_REQUEST_COPY_BYTES {
+            // Prefill waves: one core copies ~10 GB/s, so staging the same
+            // hidden rows for six ranks one after another delayed the last
+            // rank's request by ~15 ms; split each copy across threads.
+            let view = self.endpoint.send_buffer_view()?;
+            anyhow::ensure!(!view.host_ptr.is_null() && offset + request_wire_bytes <= view.bytes,
+                "persistent verbs-host request slot exceeds its send buffer");
+            // SAFETY: the slot lies inside this endpoint's registered send
+            // buffer (checked above) and no send from it is in flight: the
+            // ring reclaimed this slot before reuse (above), and only this
+            // session writes its buffer.
+            let slot = unsafe {
+                std::slice::from_raw_parts_mut(view.host_ptr.cast::<u8>().add(offset), request_wire_bytes)
+            };
+            let (prefix, payload) = slot.split_at_mut(request_prefix.len());
+            prefix.copy_from_slice(request_prefix);
+            copy_threads(payload, &request.hidden_payload);
+            self.endpoint.post_send_at(offset, request_wire_bytes, VERBS_HOST_SEND_WR_ID + request_send_slot as u64)?;
+        } else {
+            self.endpoint.send_parts_at(
+                request_prefix,
+                &request.hidden_payload,
+                offset,
+                VERBS_HOST_SEND_WR_ID + request_send_slot as u64,
+            )?;
+        }
         self.request_send_sequence = self.request_send_sequence.wrapping_add(1);
         self.request_send_in_flight += 1;
         Ok(VerbsHostProtocolV2ChunkSubmissionTiming {
@@ -2286,6 +2357,19 @@ impl VerbsHostProtocolV2PersistentClientSession {
             expected_response_ms,
             send_ms: elapsed_ms_optional(send_started),
         })
+    }
+
+    /// Waits until every request this session posted has left (its send
+    /// completed), so a shared egress buffer may be rewritten.
+    fn drain_request_sends(&mut self, config: &TcpTransportConfig) -> Result<()> {
+        let started = Instant::now();
+        while self.request_send_in_flight > 0 {
+            let stats = self.endpoint.try_poll(self.request_send_in_flight as u32, 0)?;
+            anyhow::ensure!(stats.recv_completions == 0, "request send drain consumed a response");
+            self.request_send_in_flight -= (stats.send_completions as usize).min(self.request_send_in_flight);
+            anyhow::ensure!(started.elapsed() < config.timeout, "request sends never completed");
+        }
+        Ok(())
     }
 
     fn try_progress_chunk_requests(
