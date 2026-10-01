@@ -81,6 +81,33 @@ impl Fp8MoeInfo {
 type Launch = unsafe extern "C" fn(*mut c_void, u32, *const *mut c_void, i32, *mut c_void) -> i32;
 type Destroy = unsafe extern "C" fn(*mut c_void);
 type Scratch = unsafe extern "C" fn(u32, *mut u64) -> i32;
+type SetOptions = unsafe extern "C" fn(*mut c_void, u32) -> i32;
+
+/// `cuteafd_fp8moe_set_options` bit 0: run the W8A16 prefill fallback programs.
+const OPTION_PREFILL_A16: u32 = 1;
+
+/// How FP8 expert packages run their large (prefill) row counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Fp8MoePrefill {
+    /// Block-scaled E4M3 x E4M3 gate/up over the FP8 K32 wire rows (BF16
+    /// rows quantized to wire rows first at coordinator TP1): the default.
+    #[default]
+    W8a8,
+    /// The former W8A16 programs (weights widened to `bf16(w * s)`; BF16
+    /// input rows exact on the coordinator).
+    W8a16,
+}
+
+impl std::str::FromStr for Fp8MoePrefill {
+    type Err = anyhow::Error;
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "w8a8" => Ok(Self::W8a8),
+            "w8a16" => Ok(Self::W8a16),
+            other => anyhow::bail!("FP8 expert prefill is w8a8 or w8a16, not {other:?}"),
+        }
+    }
+}
 
 pub struct Fp8MoeModule {
     // Function addresses and the context are valid only while the library is loaded.
@@ -90,6 +117,7 @@ pub struct Fp8MoeModule {
     scratch: Vec<usize>,
     launch: Launch,
     destroy: Destroy,
+    set_options: Option<SetOptions>,
     _owner_thread: PhantomData<Rc<()>>,
 }
 
@@ -108,6 +136,8 @@ impl Fp8MoeModule {
         let create = *library.get::<unsafe extern "C" fn(*mut *mut c_void) -> i32>(b"cuteafd_fp8moe_create")?;
         let launch = *library.get::<Launch>(b"cuteafd_fp8moe_launch")?;
         let destroy = *library.get::<Destroy>(b"cuteafd_fp8moe_destroy")?;
+        // Packages built before the W8A16 fallback forms have no options.
+        let set_options = library.get::<SetOptions>(b"cuteafd_fp8moe_set_options").ok().map(|f| *f);
         let mut words = [0u32; 16];
         ensure!(query(words.as_mut_ptr(), 16) == 0, "FP8 expert package info query failed");
         let info = Fp8MoeInfo::from_words(words)?;
@@ -120,7 +150,22 @@ impl Fp8MoeModule {
         let status = create(&mut context);
         ensure!(status == 0, "FP8 expert package initialization failed with CUDA status {status}");
         let context = NonNull::new(context).context("FP8 expert package returned a null context")?;
-        Ok(Self { _library: library, context, info, scratch, launch, destroy, _owner_thread: PhantomData })
+        Ok(Self { _library: library, context, info, scratch, launch, destroy, set_options,
+            _owner_thread: PhantomData })
+    }
+
+    /// Selects the programs large row counts run (W8A8 unless asked otherwise).
+    /// A package without the option runs its single form: accepted for W8A8.
+    pub fn set_prefill(&mut self, prefill: Fp8MoePrefill) -> Result<()> {
+        let options = if prefill == Fp8MoePrefill::W8a16 { OPTION_PREFILL_A16 } else { 0 };
+        let Some(set) = self.set_options else {
+            ensure!(options == 0, "this FP8 expert package predates the W8A16 prefill fallback; rebuild it");
+            return Ok(());
+        };
+        // SAFETY: the context came from this library's create and is still live.
+        let status = unsafe { set(self.context.as_ptr(), options) };
+        ensure!(status == 0, "FP8 expert package rejected options {options:#x} ({status})");
+        Ok(())
     }
 
     pub fn info(&self) -> &Fp8MoeInfo {
