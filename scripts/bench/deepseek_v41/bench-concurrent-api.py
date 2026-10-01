@@ -8,6 +8,8 @@ parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--concurrency', type=int, nargs='+', default=[1,2,4,8,16])
 parser.add_argument('--repeats', type=int, default=3)
 parser.add_argument('--label', default='release-concurrency')
+parser.add_argument('--prompt-label', help='Word that opens the prompt (default: --label). Arms of an A/B must share it: '
+                    'a different prompt changes dSpark acceptance (about 2%% of C1 code tok/s)')
 parser.add_argument('--case', choices=['counting','code','code-reasoning','topic'], default='counting')
 parser.add_argument('--nonce', help='Use the same prompt nonce for controlled comparisons; defaults to a fresh UUID')
 parser.add_argument('--max-tokens', type=int, help='Override the corpus output budget for both arms of a controlled comparison')
@@ -27,7 +29,7 @@ checks=runpy.run_path(str(Path(__file__).resolve().parents[2] / 'release_through
 definition={'prompt':'Count from 1 to 200, separated by commas. Output only the sequence.','max_tokens':640} if args.case=='counting' else corpus['cases'][args.case]
 if args.max_tokens is not None:
  definition=dict(definition,max_tokens=args.max_tokens)
-prompt=f"{args.label} {args.nonce if args.nonce is not None else uuid.uuid4().hex}. {definition['prompt']}"
+prompt=f"{args.prompt_label or args.label} {args.nonce if args.nonce is not None else uuid.uuid4().hex}. {definition['prompt']}"
 def validate(result):
  if args.case=='counting':
   assert [x.strip() for x in result['text'].split(',')]==[str(x) for x in range(1,201)],'counting sequence was incorrect'

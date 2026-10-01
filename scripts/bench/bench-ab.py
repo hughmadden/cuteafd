@@ -68,7 +68,8 @@ def session(arm: str, path: Path, arms: dict[str, Path], rtx: int, out: Path, ar
     run([*decode, "--label", arm, "--repeats", str(args.repeats), "--output", str(out / "decode.json")], log=log)
     run([py, str(REPO / "scripts/bench/deepseek_v41/bench-concurrent-api.py"), "--base-url", args.base_url,
          "--case", "code", "--concurrency", *map(str, args.concurrency), "--repeats", "1",
-         "--nonce", f"ab-{args.nonce_seed}", "--label", arm, "--output", str(out / "concurrent.json")], log=log)
+         "--nonce", f"ab-{args.nonce_seed}", "--prompt-label", "ab", "--label", arm,
+         "--output", str(out / "concurrent.json")], log=log)
     decode_report = json.loads((out / "decode.json").read_text())
     concurrent_report = json.loads((out / "concurrent.json").read_text())
     return {
