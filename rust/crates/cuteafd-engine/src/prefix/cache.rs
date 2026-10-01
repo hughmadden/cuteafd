@@ -488,7 +488,7 @@ impl<E: CopyEngine> PrefixCache<E> {
         let snapshot = DeviceSnapshot {
             meta: SnapshotMeta { kind: entry.kind, tokens: entry.tokens.clone(), end: entry.len() as u32, has_draft: false },
             pages,
-            tail: entry.mark.map_or_else(Vec::new, |slot| family.mark_segments(slot)),
+            tail: entry.mark.map_or_else(|| family.host_tail(), |slot| family.mark_segments(slot)),
             draft: None,
             scores: Vec::new(),
         };
@@ -548,7 +548,7 @@ impl<E: CopyEngine> PrefixCache<E> {
         target_pages[0] = pages.iter().zip(ids).map(|(&page, id)| DevicePage { id, segments: family.page_segments(page) }).collect();
         let target = RestoreTarget {
             pages: target_pages,
-            tail: slot.map_or_else(Vec::new, |slot| family.mark_segments(slot)),
+            tail: slot.map_or_else(|| family.host_tail(), |slot| family.mark_segments(slot)),
             draft: None,
             scores: Vec::new(),
         };
