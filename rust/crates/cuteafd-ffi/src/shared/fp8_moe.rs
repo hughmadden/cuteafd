@@ -16,9 +16,10 @@ pub enum Fp8MoeWeights {
     Fp8,
     /// ABI 2: packed E2M1 with UE8M0 scales per 32.
     Mxfp4,
-    /// ABI 3: ModelOpt NVFP4: packed E2M1, E4M3 scales per 16, each scale
-    /// region followed by the experts' FP32 `weight_scale_2` (W4A16).
-    Nvfp4,
+    /// ABI 3 / 4: ModelOpt NVFP4: packed E2M1, E4M3 scales per 16, each
+    /// scale region followed by the experts' FP32 `weight_scale_2` and
+    /// `input_scale` (W4A16; ABI 4 runs its large-row steps W4A4).
+    Nvfp4 { w4a4: bool },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -40,7 +41,7 @@ pub struct Fp8MoeInfo {
 impl Fp8MoeInfo {
     fn from_words(words: [u32; 16]) -> Result<Self> {
         let count = words[9] as usize;
-        ensure!(matches!(words[0], 1..=3) && matches!(words[7], 1 | 7) && (1..=6).contains(&count),
+        ensure!(matches!(words[0], 1..=4) && matches!(words[7], 1 | 7) && (1..=6).contains(&count),
             "unsupported FP8 expert package ABI {words:?}");
         let info = Self {
             hidden: words[1] as usize,
@@ -55,7 +56,7 @@ impl Fp8MoeInfo {
             weights: match words[0] {
                 1 => Fp8MoeWeights::Fp8,
                 2 => Fp8MoeWeights::Mxfp4,
-                _ => Fp8MoeWeights::Nvfp4,
+                w => Fp8MoeWeights::Nvfp4 { w4a4: w == 4 },
             },
         };
         // Slices are the widest rank range, zero-padded to 128 (MXFP4 32-blocks

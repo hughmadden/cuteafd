@@ -19,13 +19,40 @@ use std::path::{Path, PathBuf};
 /// Parallel readers per layer load.
 const READERS: usize = 16;
 
-/// `<libdir>/fp8/fp8-<family>[-nvfp4]/tp<world>`: the package layout serving
-/// TP degree `tp` of the process expert geometry in `format` (NVFP4 releases
-/// share their geometry with the FP8 ones and get packages of their own).
+/// `<libdir>/fp8/fp8-<family>[-nvfp4|-nvfp4a4]/tp<world>`: the package layout
+/// serving TP degree `tp` of the process expert geometry in `format` (NVFP4
+/// releases share their geometry with the FP8 ones and get packages of their
+/// own). `CUTEAFD_NVFP4_ACTIVATIONS=a4` takes the W4A4 package (`-nvfp4a4`:
+/// large-row steps quantize activations with the checkpoint's input_scale)
+/// when it is built; W4A16 is the default (GLM 5.3 Flash: KL vs golden
+/// 0.0589 W4A16, 0.0791 W4A4, over PLAN.md's 0.005-nat bound).
 pub(crate) fn package_directory(native_lib: &Path, tp: usize, format: ExpertFormat) -> PathBuf {
     let family = cuteafd_core::expert_geometry().family().unwrap_or("unknown");
-    native_lib.parent().unwrap_or(Path::new(".")).join("fp8")
-        .join(format!("fp8-{family}{}", format.package_suffix())).join(format!("tp{tp}"))
+    let root = native_lib.parent().unwrap_or(Path::new(".")).join("fp8");
+    let layout = format!("tp{tp}");
+    if format == ExpertFormat::Nvfp4 && nvfp4_activations() == Nvfp4Activations::A4 {
+        let a4 = root.join(format!("fp8-{family}-nvfp4a4")).join(&layout);
+        if a4.is_dir() {
+            return a4;
+        }
+    }
+    root.join(format!("fp8-{family}{}", format.package_suffix())).join(layout)
+}
+
+/// How NVFP4 experts treat activations (`CUTEAFD_NVFP4_ACTIVATIONS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Nvfp4Activations {
+    /// W4A4 large-row steps where a `-nvfp4a4` package is built.
+    A4,
+    /// W4A16 at every row count (default).
+    A16,
+}
+
+pub(crate) fn nvfp4_activations() -> Nvfp4Activations {
+    match std::env::var("CUTEAFD_NVFP4_ACTIVATIONS").as_deref() {
+        Ok("a4") => Nvfp4Activations::A4,
+        _ => Nvfp4Activations::A16,
+    }
 }
 
 /// The BF16-input sibling of an FP8 package directory:
@@ -64,22 +91,25 @@ impl<'a> Fp8Layer<'a> {
             let (w_bytes, s_bytes) = tensors.slice_bytes(projection, tp)?;
             let mut weights = vec![0u8; experts * w_bytes];
             let mut scales = vec![0u8; tensors.scale_region_bytes(projection, tp)?];
-            // NVFP4: the experts' FP32 alphas follow the scale grids.
-            let (grids, alphas) = scales.split_at_mut(experts * s_bytes);
-            let alpha_bytes = if alphas.is_empty() { 0 } else { 4 };
-            let mut alpha_slots: Vec<&mut [u8]> = alphas.chunks_exact_mut(4).collect();
+            // NVFP4: the experts' FP32 alphas, then their input scales, follow the scale grids.
+            let (grids, scalars) = scales.split_at_mut(experts * s_bytes);
+            let nvfp4 = !scalars.is_empty();
+            let (alphas, inputs) = scalars.split_at_mut(scalars.len() / 2);
+            let mut alpha_slots: Vec<(&mut [u8], &mut [u8])> =
+                alphas.chunks_exact_mut(4).zip(inputs.chunks_exact_mut(4)).collect();
             alpha_slots.resize_with(experts, Default::default);
-            let mut jobs: Vec<(usize, &mut [u8], &mut [u8], &mut [u8])> = weights.chunks_exact_mut(w_bytes)
+            let mut jobs: Vec<(usize, &mut [u8], &mut [u8], (&mut [u8], &mut [u8]))> = weights.chunks_exact_mut(w_bytes)
                 .zip(grids.chunks_exact_mut(s_bytes)).zip(alpha_slots).enumerate()
                 .map(|(e, ((w, s), a))| (e, w, s, a)).collect();
             let per = jobs.len().div_ceil(READERS);
             std::thread::scope(|scope| -> Result<()> {
                 let handles: Vec<_> = jobs.chunks_mut(per).map(|chunk| scope.spawn(move || -> Result<()> {
                     let mut staging = Vec::new();
-                    for (expert, w, s, a) in chunk.iter_mut() {
+                    for (expert, w, s, (alpha, input)) in chunk.iter_mut() {
                         tensors.read_slice(layer, *expert, projection, tp, rank, w, s, &mut staging)?;
-                        if alpha_bytes > 0 {
-                            a.copy_from_slice(&tensors.read_alpha(layer, *expert, projection)?.to_le_bytes());
+                        if nvfp4 {
+                            alpha.copy_from_slice(&tensors.read_alpha(layer, *expert, projection)?.to_le_bytes());
+                            input.copy_from_slice(&tensors.read_input_scale(layer, *expert, projection)?.to_le_bytes());
                         }
                     }
                     Ok(())
@@ -133,7 +163,7 @@ impl<'a> Fp8Experts<'a> {
         let weights = match tensors.format() {
             ExpertFormat::Fp8Block128 => Fp8MoeWeights::Fp8,
             ExpertFormat::Mxfp4 => Fp8MoeWeights::Mxfp4,
-            ExpertFormat::Nvfp4 => Fp8MoeWeights::Nvfp4,
+            ExpertFormat::Nvfp4 => Fp8MoeWeights::Nvfp4 { w4a4: matches!(info.weights, Fp8MoeWeights::Nvfp4 { w4a4: true }) },
         };
         ensure!(info.hidden == shape.hidden && info.experts == shape.experts && info.topk == shape.topk
             && info.intermediate == shape.intermediate && info.tp == tp && info.weights == weights

@@ -235,8 +235,12 @@ done
 # directory always exists so the release image can COPY it.
 mkdir -p "$output_dir/fp8"
 for release_family in "${release_family_list[@]}"; do
-  [[ "$release_family" == *:fp8 ]] || continue
-  release_package="fp8-${release_family%%:*}"
+  case "$release_family" in
+    *:fp8) release_package="fp8-${release_family%%:*}" ;;
+    # ModelOpt NVFP4 (W4A16 / W4A4 large-row steps) share the fp8_moe programs.
+    *:nvfp4|*:nvfp4a4) release_package="fp8-${release_family%%:*}-${release_family#*:}" ;;
+    *) continue ;;
+  esac
   mkdir -p "$output_dir/fp8"
   rm -rf "$output_dir/fp8/$release_package"
   cp -a "$build_root/native/fp8/$release_package" "$output_dir/fp8/$release_package"

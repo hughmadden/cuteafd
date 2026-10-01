@@ -31,7 +31,7 @@
 //! Slices split `I` in whole 16-value scale blocks (TP6 of 2048: 352, 352,
 //! 336, 336, 336, 336), zero-padded to one 128-aligned width (384); each
 //! projection's scale region is the E4M3 grid of every expert followed by
-//! the experts' FP32 alphas.
+//! the experts' FP32 alphas and FP32 input scales (read by the W4A4 route).
 use crate::catalog::read_safetensors_metadata;
 use crate::families::deepseek_v41::v41_catalog::RoutedExpertShape;
 use anyhow::{ensure, Context, Result};
@@ -273,27 +273,38 @@ impl Fp8ExpertTensors {
     }
 
     /// Bytes of one projection's scale region for every expert: the scale
-    /// grids, then (NVFP4) the experts' FP32 alphas.
+    /// grids, then (NVFP4) the experts' FP32 alphas and FP32 input scales.
     pub fn scale_region_bytes(&self, projection: Fp8Projection, tp: usize) -> Result<usize> {
         let experts = self.shape.experts;
-        let alphas = if self.format == ExpertFormat::Nvfp4 { experts * 4 } else { 0 };
+        let alphas = if self.format == ExpertFormat::Nvfp4 { experts * 8 } else { 0 };
         Ok(experts * self.slice_bytes(projection, tp)?.1 + alphas)
     }
 
     /// An NVFP4 projection's `weight_scale_2` (alpha); 1 for the other formats.
     pub fn read_alpha(&self, layer: usize, expert: usize, projection: Fp8Projection) -> Result<f32> {
+        self.read_scalar(&format!("{}_scale_2", self.name(layer, expert, projection)))
+    }
+
+    /// An NVFP4 projection's static activation scale (`input_scale`, the W4A4
+    /// recipe's); 1 for the other formats.
+    pub fn read_input_scale(&self, layer: usize, expert: usize, projection: Fp8Projection) -> Result<f32> {
+        let weight = self.name(layer, expert, projection);
+        self.read_scalar(&format!("{}.input_scale", weight.strip_suffix(".weight").unwrap_or(&weight)))
+    }
+
+    fn read_scalar(&self, name: &str) -> Result<f32> {
         if self.format != ExpertFormat::Nvfp4 {
             return Ok(1.0);
         }
-        let name = format!("{}_scale_2", self.name(layer, expert, projection));
+        let name = name.to_owned();
         let located = self.located(&name)?;
         ensure!(located.dtype == DType::F32 && located.bytes == 4, "{name}: expected one FP32 value");
         let mut bytes = [0u8; 4];
         std::fs::File::open(self.snapshot.join(&located.shard))?.read_exact_at(&mut bytes, located.offset)
             .with_context(|| format!("reading {name}"))?;
-        let alpha = f32::from_le_bytes(bytes);
-        ensure!(alpha.is_finite() && alpha > 0.0, "{name}: weight_scale_2 {alpha} is not a positive finite value");
-        Ok(alpha)
+        let value = f32::from_le_bytes(bytes);
+        ensure!(value.is_finite() && value > 0.0, "{name}: {value} is not a positive finite scale");
+        Ok(value)
     }
 
     /// `read_slice` for packed FP4 (MXFP4, NVFP4): rank rows `[first, first +
@@ -433,7 +444,7 @@ mod tests {
         assert_eq!(ranges(&nvfp4, 6), [(0, 352), (352, 352), (704, 336), (1040, 336), (1376, 336), (1712, 336)]);
         assert_eq!(nvfp4.slice_bytes(Fp8Projection::Gate, 6).unwrap(), (384 * 6144 / 2, 384 * 6144 / 16));
         assert_eq!(nvfp4.slice_bytes(Fp8Projection::Down, 1).unwrap(), (6144 * 1024, 6144 * 128));
-        assert_eq!(nvfp4.scale_region_bytes(Fp8Projection::Down, 1).unwrap(), 256 * 6144 * 128 + 256 * 4);
+        assert_eq!(nvfp4.scale_region_bytes(Fp8Projection::Down, 1).unwrap(), 256 * 6144 * 128 + 256 * 8);
         // Qwen's 640 = 40 blocks: TP3 14, 13, 13 in 256.
         let qwen = catalog(ExpertFormat::Nvfp4, 640);
         assert_eq!(ranges(&qwen, 3), [(0, 224), (224, 208), (432, 208)]);
