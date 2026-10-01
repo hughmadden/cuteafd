@@ -1,5 +1,6 @@
 use super::testing::*;
 use super::*;
+use crate::formats::exl3_storage::Exl3StorageSource;
 use crate::families::mimo_v2::{MimoAttention, MimoV2Config};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -179,14 +180,24 @@ fn malformed_trellis_and_scales_name_the_tensor() {
     };
     let good = exl3(("I16", &[4, 2, 48]), &[64], &[]).unwrap();
     assert_eq!((good.encoding, good.logical.clone()), (Encoding::Exl3 { bits: 3 }, vec![32, 64]));
-    let cases: [(Result<QuantOperand, Malformed>, &str, &str); 6] = [
+    // exllamav3 writes a scalar MCG marker, other exporters a one-element vector.
+    assert_eq!(exl3(("I16", &[4, 2, 48]), &[64], &[1]).unwrap(), good);
+    let cases: [(Result<QuantOperand, Malformed>, &str, &str); 10] = [
         (exl3(("I16", &[4, 96]), &[64], &[]), "p.trellis", "rank 2"),
         (exl3(("I32", &[4, 2, 48]), &[64], &[]), "p.trellis", "dtype i32"),
         (exl3(("I16", &[4, 2, 40]), &[64], &[]), "p.trellis", "not 16 x bits"),
         (exl3(("I16", &[4, 2, 48]), &[48], &[]), "p.suh", "expected f16 [64]"),
-        (exl3(("I16", &[4, 2, 48]), &[64], &[1]), "p.mcg", "expected i32 []"),
+        (exl3(("I16", &[4, 2, 48]), &[64], &[2]), "p.mcg", "expected i32 [] or [1]"),
         (detect_group("p", &[("trellis", "I16", &[4, 2, 48]), ("suh", "F16", &[64]), ("svh", "F16", &[32])]),
-            "p.mcg", "missing EXL3 companion"),
+            "p.trellis", "3INST codebook"),
+        (detect_group("p", &[("trellis", "I16", &[4, 2, 48]), ("suh", "F16", &[64]), ("svh", "F16", &[32]),
+            ("mul1", "I32", &[])]), "p.mul1", "MUL1 codebook"),
+        (detect_group("p", &[("trellis", "I16", &[4, 2, 48]), ("su", "I16", &[4]), ("sv", "I16", &[2]),
+            ("mcg", "I32", &[])]), "p.su", "packed EXL3 sign bitfield"),
+        (detect_group("p", &[("trellis", "I16", &[4, 2, 48]), ("suh", "F16", &[64]), ("mcg", "I32", &[])]),
+            "p.svh", "missing EXL3 companion"),
+        (detect_group("p", &[("suh", "F16", &[64]), ("svh", "F16", &[32]), ("mcg", "I32", &[1])]),
+            "p.mcg", "without a trellis"),
     ];
     for (result, tensor, reason) in cases {
         let error = result.unwrap_err();
@@ -279,10 +290,57 @@ fn glm5_flash_mixed_exl3_tiers_share_one_package() {
     let contract = report.experts.as_ref().unwrap();
     assert_eq!((contract.package.as_str(), contract.spark_worlds.as_slice()), ("glmf:exl3-k34", &[2, 3, 4, 6][..]));
     assert!(report.executable(), "{}", render(&report));
-    // Without its storage map the expert service refuses the same tensors.
+    assert_eq!(report.expert_storage, Some(Exl3StorageSource::GptqModel));
+    // A storage map that disagrees with the tensors is refused, by module.
+    let mut lying = exl3_manifest(&exl3_compact(3), &projections);
+    lying["tensor_storage"]["model.language_model.layers.1.mlp.experts.0.gate_proj"]["bits_per_weight"] = json!(4);
+    lying["tensor_storage"]["model.language_model.layers.1.mlp.experts.0.gate_proj"]["stored_tensors"]
+        ["model.language_model.layers.1.mlp.experts.0.gate_proj.trellis"]["shape"] = json!([256, 128, 64]);
+    write_quantize_config(dir.path(), &lying);
+    let report = plan(dir.path(), &sparks(3)).unwrap();
+    let reason = &rejected(&report, Component::RoutedExpert)[0];
+    assert!(reason.contains("quantize_config.json disagrees with the safetensors headers at \
+        model.language_model.layers.1.mlp.experts.0.gate_proj: map K4"), "{reason}");
+    assert!(!report.executable());
+    // Without its storage map the expert service derives the same layout.
     std::fs::remove_file(dir.path().join("quantize_config.json")).unwrap();
     let report = plan(dir.path(), &sparks(3)).unwrap();
-    assert!(rejected(&report, Component::RoutedExpert)[0].contains("quantize_config.json"), "{}", render(&report));
+    assert!(report.executable(), "{}", render(&report));
+    assert_eq!(report.expert_storage, Some(Exl3StorageSource::Headers));
+}
+
+/// A standard exllamav3 GLM 5.3 Flash checkpoint (brandonmusic/GLM-5.3-Flash-
+/// tr3-4bpw): the exllamav3 config block, no storage map, uniform K4 with
+/// `[1]` MCG markers. It runs on the K3/K4 package with an empty K3 tier.
+#[test]
+fn glm5_flash_standard_exllamav3_checkpoint_is_ready() {
+    let mut tensors = vec![t("model.language_model.layers.1.mlp.gate.weight", "BF16", &[288, 4096])];
+    for expert in 0..288 {
+        for (proj, n, k) in [("gate_proj", 2048, 4096), ("up_proj", 2048, 4096), ("down_proj", 4096, 2048)] {
+            let name = format!("model.language_model.layers.1.mlp.experts.{expert}.{proj}");
+            let mut projection = exl3(&name, n, k, 4);
+            projection[3].2 = vec![1];
+            tensors.extend(projection);
+        }
+    }
+    let mut config = glm5_flash_config(2);
+    config["quantization_config"] = json!({"quant_method": "exl3", "version": "0.0.43", "bits": 4, "head_bits": 16,
+        "codebook": "mcg", "scope": "glm53_routed_experts_only", "non_routed_dtype_policy": "official_source_native",
+        "serving_reader_qualified": false});
+    let dir = snapshot(config.clone(), &tensors);
+    let report = plan(dir.path(), &sparks(4)).unwrap();
+    assert!(report.executable(), "{}", render(&report));
+    assert_eq!(report.expert_storage, Some(Exl3StorageSource::Headers));
+    assert!(render(&report).contains("exl3 map   derived from config.json and the tensor headers"), "{}", render(&report));
+    assert_eq!(report.experts.as_ref().unwrap().package, "glmf:exl3-k34");
+    let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+    assert_eq!(catalog.exl3().unwrap().decoder_tiers(), &[3, 4]);
+    // An unsupported codebook in config.json stays unsupported, by key.
+    let mut mul1 = config.clone();
+    mul1["quantization_config"]["codebook"] = json!("mul1");
+    let report = plan(snapshot(mul1, &tensors).path(), &sparks(4)).unwrap();
+    let reason = &rejected(&report, Component::RoutedExpert)[0];
+    assert!(reason.contains("quantization_config.codebook=\"mul1\": this build runs the MCG codebook only"), "{reason}");
 }
 
 // --- R07: MiMo serves, with a precise contract ------------------------------

@@ -775,8 +775,13 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> R
     }
     let index: Index = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)
         .and_then(|value| Ok(serde_json::from_value(value)?))?;
-    let manifest = crate::families::deepseek_v41::v41_exl3::read_deepseek_v4_exl3_manifest(snapshot, shape)?;
-    deepseek_v4_exl3_catalog(snapshot, &index.weight_map, manifest)
+    // The tier pair of the family's expert packages (glmf:exl3-k34, glm:exl3-k45).
+    let tiers: &[usize] = if config.get("model_type").and_then(serde_json::Value::as_str) == Some("glm5_next") {
+        &[3, 4]
+    } else {
+        &[4, 5]
+    };
+    deepseek_v4_exl3_catalog(snapshot, &index.weight_map, shape, tiers)
 }
 
 /// Qwen 3.8 Flash Next (qwen4_exp) routed experts: every layer is MoE (512
@@ -812,8 +817,8 @@ fn read_qwen4_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Res
         let index: Index =
             crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)
                 .and_then(|value| Ok(serde_json::from_value(value)?))?;
-        let manifest = crate::families::deepseek_v41::v41_exl3::read_deepseek_v4_exl3_manifest(snapshot, shape)?;
-        return deepseek_v4_exl3_catalog(snapshot, &index.weight_map, manifest);
+        // qwen4:exl3-k45.
+        return deepseek_v4_exl3_catalog(snapshot, &index.weight_map, shape, &[4, 5]);
     }
     if quant.get("config_groups").is_some() || quant["quant_method"] == "modelopt" {
         anyhow::bail!("Qwen NVFP4 (ModelOpt) routed experts have no expert package: serve the FP8 \
@@ -889,8 +894,8 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog
     };
     let raw_config = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
     if raw_config["quantization_config"]["quant_method"] == "exl3" {
-        let manifest = crate::families::deepseek_v41::v41_exl3::read_deepseek_v4_exl3_manifest(snapshot, backbone)?;
-        return deepseek_v4_exl3_catalog(snapshot, &index.weight_map, manifest);
+        // dsv4p:exl3-k23.
+        return deepseek_v4_exl3_catalog(snapshot, &index.weight_map, backbone, &[2, 3]);
     }
     let draft_stages = index.weight_map.keys()
         .filter_map(|name| name.strip_prefix("mtp.")?.split('.').next()?.parse::<usize>().ok())
@@ -973,55 +978,77 @@ fn hf_layer(name: &str) -> Option<usize> {
         .split('.').next()?.parse().ok()
 }
 
-/// DeepSeek V4 EXL3 routed experts: every projection's trellis/suh/svh/mcg is
-/// checked against its safetensors header; backbone projections are sliced
-/// onto the Sparks, draft projections stay with the coordinator.
-fn deepseek_v4_exl3_catalog(
+/// Every tensor header of the shards `weight_map` names, each in its shard.
+fn read_index_headers(
     snapshot: &Path,
     weight_map: &BTreeMap<String, String>,
-    manifest: crate::V41Exl3Manifest,
-) -> Result<OfficialV41Catalog> {
+) -> Result<Vec<(String, SafetensorsTensorMetadata)>> {
     let mut shards: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for (name, shard) in weight_map {
         shards.entry(shard).or_default().insert(name);
     }
-    let mut tensors = Vec::with_capacity(weight_map.len());
-    let mut routed = 0usize;
+    let mut headers = Vec::with_capacity(weight_map.len());
     for (shard, names) in shards {
         let metadata = read_safetensors_metadata(&snapshot.join(shard))
             .with_context(|| format!("reading {shard}"))?;
         ensure!(metadata.len() == names.len(), "index/header tensor count mismatch in {shard}");
         for tensor in metadata {
             ensure!(names.contains(tensor.name.as_str()), "tensor {} appears in unexpected shard {shard}", tensor.name);
-            let projection = tensor
-                .name
-                .rsplit_once('.')
-                .and_then(|(prefix, _)| manifest.projections.get(prefix));
-            let placement = match projection {
-                Some(projection) => {
-                    projection.validate_tensor(&tensor)?;
-                    routed += 1;
-                    let backbone = hf_layer(&tensor.name).is_some_and(|layer| layer < manifest.experts.layers);
-                    if backbone {
-                        V41TensorPlacement::BackboneExl3
-                    } else {
-                        V41TensorPlacement::CoordinatorRtx
-                    }
-                }
-                None => {
-                    // Experts past the backbone (a native MTP layer) stay on the coordinator.
-                    let past_backbone = hf_layer(&tensor.name).is_some_and(|layer| layer >= manifest.experts.layers);
-                    ensure!(
-                        past_backbone
-                            || (!tensor.name.contains(".mlp.experts.") && !tensor.name.contains(".ffn.experts.")),
-                        "routed expert tensor {} is not in the EXL3 storage map",
-                        tensor.name
-                    );
+            headers.push((shard.to_string(), tensor));
+        }
+    }
+    Ok(headers)
+}
+
+/// DeepSeek V4, GLM 5.x and Qwen 3.8 EXL3 routed experts: the storage layout
+/// comes from the headers (a storage map, when present, must agree), every
+/// projection's trellis/suh/svh/mcg is checked against its header; backbone
+/// projections are sliced onto the Sparks, draft projections stay with the
+/// coordinator. `tiers`: the family's package tier pair.
+fn deepseek_v4_exl3_catalog(
+    snapshot: &Path,
+    weight_map: &BTreeMap<String, String>,
+    backbone: RoutedExpertShape,
+    tiers: &[usize],
+) -> Result<OfficialV41Catalog> {
+    let headers = read_index_headers(snapshot, weight_map)?;
+    let manifest = crate::families::deepseek_v41::v41_exl3::read_deepseek_v4_exl3_manifest(
+        snapshot,
+        backbone,
+        headers.iter().map(|(_, tensor)| tensor),
+        tiers,
+    )?;
+    let mut tensors = Vec::with_capacity(headers.len());
+    let mut routed = 0usize;
+    for (shard, tensor) in headers {
+        let projection = tensor
+            .name
+            .rsplit_once('.')
+            .and_then(|(prefix, _)| manifest.projections.get(prefix));
+        let placement = match projection {
+            Some(projection) => {
+                projection.validate_tensor(&tensor)?;
+                routed += 1;
+                let backbone = hf_layer(&tensor.name).is_some_and(|layer| layer < manifest.experts.layers);
+                if backbone {
+                    V41TensorPlacement::BackboneExl3
+                } else {
                     V41TensorPlacement::CoordinatorRtx
                 }
-            };
-            tensors.push(V41Tensor { shard: shard.to_string(), metadata: tensor, placement });
-        }
+            }
+            None => {
+                // Experts past the backbone (a native MTP layer) stay on the coordinator.
+                let past_backbone = hf_layer(&tensor.name).is_some_and(|layer| layer >= manifest.experts.layers);
+                ensure!(
+                    past_backbone
+                        || (!tensor.name.contains(".mlp.experts.") && !tensor.name.contains(".ffn.experts.")),
+                    "routed expert tensor {} is not in the EXL3 storage map",
+                    tensor.name
+                );
+                V41TensorPlacement::CoordinatorRtx
+            }
+        };
+        tensors.push(V41Tensor { shard, metadata: tensor, placement });
     }
     ensure!(
         routed == 4 * manifest.projections.len(),

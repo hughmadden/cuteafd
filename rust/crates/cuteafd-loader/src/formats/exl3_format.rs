@@ -803,7 +803,10 @@ fn validate_projection(projection: Exl3Projection<'_>, trellis_bits: usize) -> R
         (projection.output_features * 2) as u64,
         true,
     )?;
-    validate_tensor(projection.mcg, DType::I32, &[], 4, true)?;
+    // The MCG marker: a scalar (exllamav3) or a one-element vector.
+    let mcg_shape: &[usize] =
+        if super::exl3_storage::mcg_marker_shape(&projection.mcg.shape) { &projection.mcg.shape } else { &[] };
+    validate_tensor(projection.mcg, DType::I32, mcg_shape, 4, true)?;
     Ok(())
 }
 

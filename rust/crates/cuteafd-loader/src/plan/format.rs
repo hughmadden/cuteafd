@@ -342,7 +342,7 @@ fn block_edge(dim: usize, scales: usize) -> Option<usize> {
 pub fn detect(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOperand, Malformed> {
     let get = |suffix: &str| members.get(suffix).map(|tensor| &tensor.meta);
     let malformed = |tensor: &str, reason: String| Malformed { tensor: tensor.to_owned(), reason };
-    if members.contains_key("trellis") || members.contains_key("mul1") {
+    if crate::formats::exl3_storage::EXL3_SUFFIXES.iter().any(|suffix| members.contains_key(*suffix)) {
         return detect_exl3(members);
     }
     let weight = match get("weight") {
@@ -492,45 +492,25 @@ fn fp4(members: &BTreeMap<String, &CheckpointTensor>, weight: &crate::Safetensor
 }
 
 /// An EXL3 projection: `trellis` I16 `[K/16, N/16, 16 * bits]`, `suh` F16
-/// `[K]`, `svh` F16 `[N]` and the mcg codebook marker `mcg` I32 `[]` — the
-/// same contract the EXL3 staging validates (`formats::exl3_format`).
+/// `[K]`, `svh` F16 `[N]` and the MCG codebook marker `mcg` I32 `[]` or `[1]`
+/// — the contract the expert catalog derives its storage map with
+/// (`formats::exl3_storage::exl3_module`). MUL1, 3INST and packed `su`/`sv`
+/// stay unsupported, named by tensor.
 fn detect_exl3(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOperand, Malformed> {
-    let get = |suffix: &str| members.get(suffix).map(|tensor| &tensor.meta);
+    use crate::formats::exl3_storage::{exl3_module, Exl3StorageError};
     let anchor = members.values().next().map_or(String::new(), |t| t.meta.name.clone());
     let stem = split_stem(&anchor).0.to_owned();
-    let malformed = |tensor: String, reason: String| Malformed { tensor, reason };
-    if let Some(mul1) = get("mul1") {
-        return Err(malformed(mul1.name.clone(), "EXL3 mul1 codebook (this build runs the mcg codebook only)".into()));
-    }
-    let need = |suffix: &str| get(suffix).ok_or_else(|| malformed(format!("{stem}.{suffix}"),
-        "missing EXL3 companion (a trellis needs suh, svh and mcg)".into()));
-    let trellis = need("trellis")?;
-    let [k16, n16, packed] = trellis.shape.as_slice() else {
-        return Err(malformed(trellis.name.clone(), format!("trellis of rank {} {:?} (expected [K/16, N/16, 16 x bits])",
-            trellis.shape.len(), trellis.shape)));
-    };
-    if trellis.dtype != DType::I16 {
-        return Err(malformed(trellis.name.clone(), format!("trellis dtype {} (expected I16)", dtype_label(&trellis.dtype))));
-    }
-    if *packed == 0 || packed % 16 != 0 || !(1..=8).contains(&(packed / 16)) {
-        return Err(malformed(trellis.name.clone(), format!("trellis last dim {packed} is not 16 x bits for 1..=8 bits")));
-    }
-    let (k, n, bits) = (k16 * 16, n16 * 16, packed / 16);
-    let expected = (k * n * bits / 8) as u64;
-    if trellis.byte_length != expected {
-        return Err(malformed(trellis.name.clone(), format!("{} bytes for {k} x {n} at K{bits} (expected {expected})",
-            trellis.byte_length)));
-    }
-    for (suffix, dtype, shape) in [("suh", DType::F16, vec![k]), ("svh", DType::F16, vec![n]), ("mcg", DType::I32, vec![])] {
-        let tensor = need(suffix)?;
-        if tensor.dtype != dtype || tensor.shape != shape {
-            return Err(malformed(tensor.name.clone(), format!("{} {:?} (expected {} {shape:?})", dtype_label(&tensor.dtype),
-                tensor.shape, dtype_label(&dtype))));
-        }
-    }
-    if let Some((suffix, tensor)) = members.iter().find(|(s, _)| !["trellis", "suh", "svh", "mcg"].contains(&s.as_str())) {
-        return Err(malformed(tensor.meta.name.clone(), format!("unexpected member .{suffix} beside an EXL3 trellis")));
-    }
+    let suffixes: Vec<&str> = members.keys().map(String::as_str).collect();
+    let module = exl3_module(&stem, &suffixes, |suffix| members.get(suffix).map(|tensor| &tensor.meta))
+        .map_err(|error| match error {
+            Exl3StorageError::Malformed { tensor, reason } => Malformed { tensor, reason },
+            Exl3StorageError::Unsupported { tensor, variant } => {
+                Malformed { tensor, reason: format!("{variant} (this build runs the MCG codebook with unpacked suh/svh)") }
+            }
+            other => Malformed { tensor: stem.clone(), reason: other.to_string() },
+        })?;
+    let trellis = &members["trellis"].meta;
+    let (k, n, bits) = (module.input_features, module.output_features, module.bits);
     Ok(QuantOperand {
         encoding: Encoding::Exl3 { bits },
         container: "i16".into(),
