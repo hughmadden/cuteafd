@@ -457,7 +457,7 @@ fn bench_verify(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
         }
         for sequences in counts {
             let seqs: Vec<dflash::DraftSeq> = (0..sequences)
-                .map(|slot| dflash::DraftSeq { slot, anchor: tokens[start], position: start }).collect();
+                .map(|slot| dflash::DraftSeq { slot, anchor: tokens[start], position: start, valid_from: 0 }).collect();
             let anchors = embed_rows(&opened.catalog, &vec![tokens[start]; sequences], opened.cfg.hidden)?;
             let mut times = Vec::new();
             for round in 0..9 {
@@ -685,7 +685,7 @@ fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
         let anchor = sequence[position];
         let anchor_row = embed_rows(catalog, &[anchor], hidden)?;
         let timer = Instant::now();
-        let draft = drafter.draft(&[dflash::DraftSeq { slot: 0, anchor, position }], &anchor_row,
+        let draft = drafter.draft(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }], &anchor_row,
             engine.weights.head.buffer.ptr)?;
         draft_seconds += timer.elapsed().as_secs_f64();
         drafts.push((position, draft.into_iter().next().context("draft")?));
@@ -761,7 +761,7 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
         }
         let anchor = tokens[position];
         let timer = Instant::now();
-        let draft = drafter.draft(&[dflash::DraftSeq { slot: 0, anchor, position }],
+        let draft = drafter.draft(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
             &embed_rows(&opened.catalog, &[anchor], hidden)?, engine.weights.head.buffer.ptr)?.remove(0);
         draft_seconds += timer.elapsed().as_secs_f64();
         let reference = &ref_tokens[index * drafts_per..][..drafts_per];

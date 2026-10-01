@@ -12,7 +12,22 @@
 //! are recorded) and then commits every sequence's kept rows
 //! (`GlmfEngine::commit`), which leaves the state serial steps would have.
 //! MLA records past the kept length are rewritten by later steps.
-use super::engine::{Allocator, GlmfEngine, GlmfPlacement, DECODE_ROWS};
+//!
+//! Prefix cache (`cuteafd_engine::prefix` over `super::prefix::GlmfPrefix`):
+//! admission restores the deepest retained snapshot whose tokens prefix the
+//! prompt (shared units, the copied tail unit, the KDA state mark) and
+//! prefills only the rest; a whole-prompt hit takes its first token from the
+//! retained logits. The prompt is retained at prompt end (unless it was a
+//! whole hit), the conversation at a normal finish (`Turn`; its kept rows are
+//! committed to the KDA state first), a prefill whose client left is parked
+//! at its last chunk; a decode whose client left is not retained.
+//! `prompt_cache_hit_tokens` reports the restored rows; `/v1/stats` carries
+//! the cache's counters.
+use super::engine::{GlmfEngine, GlmfPlacement, DECODE_ROWS};
+use super::prefix::GlmfPrefix;
+use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
+use crate::shared::prefix::{PrefixArgs, Toggle};
+use cuteafd_engine::prefix::{After, MarkArena, PointPlan, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
 use crate::families::glm5::dflash::{ContextRow, Draft, DraftSeq, TAP_ROWS};
 use crate::families::glm5::dflash_policy::{self, DraftHistory, Shape};
 use super::{embed_rows, open, Opened};
@@ -54,6 +69,8 @@ pub(crate) struct ServeArgs {
     pub draft_fixed: Option<usize>,
     #[command(flatten)]
     pub decode_share: DecodeShareArgs,
+    #[command(flatten)]
+    pub prefix: PrefixArgs,
 }
 
 /// Speculation settings: copy-window draft cap (0 disables) and a fixed
@@ -88,8 +105,9 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     engine_args.draft_sequences = engine_args.draft_sequences.max(args.max_sequences);
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), args.max_sequences, args.decode_share);
     let policy = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed };
+    let prefix = args.prefix.clone();
     let worker = tokio::task::spawn_blocking(move ||
-        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, decode_share));
+        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, decode_share, prefix));
     ready_rx.await.context("engine failed before it was ready")??;
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
         ConsoleHub::disabled(), profile.clone());
@@ -102,9 +120,10 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: tokio::sync::oneshot::Sender<Result<()>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
-    policy: Policy, decode_share: DecodeShareArgs) -> Result<()> {
+    policy: Policy, decode_share: DecodeShareArgs, prefix: PrefixArgs) -> Result<()> {
     let opened = match open(&args) {
         Ok(opened) => opened,
         Err(error) => {
@@ -121,7 +140,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         }
         let ranks = args.peers.as_deref().map(|peers| peers.split(',').count());
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), policy, ranks,
-            decode_share)
+            decode_share, &prefix)
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
@@ -134,8 +153,16 @@ struct Prefill<'a> {
     job: NativeRequest,
     constraint: Option<crate::shared::constraints::State<'a>>,
     tokens: Vec<u32>,
-    /// Prompt tokens prefilled so far.
+    /// Prompt tokens prefilled so far (from the prefix cache's restore point).
     done: usize,
+    /// Rows restored from the prefix cache.
+    resume: usize,
+    /// Chunk ends and intermediate snapshot points (`cuteafd_engine::prefix::plan_points`).
+    plan: PointPlan,
+    /// Chunks prefilled so far.
+    chunks: usize,
+    /// The client left mid-prefill: its prefilled rows are parked as a prompt snapshot.
+    cancelled: bool,
     placement: GlmfPlacement,
     capacity: usize,
     slot: Option<usize>,
@@ -165,6 +192,13 @@ struct Active<'a> {
     counts: [usize; 5],
     constraint: Option<crate::shared::constraints::State<'a>>,
     placement: GlmfPlacement,
+    /// First position the DFlash2 drafter's context holds for this sequence
+    /// (the prefix-cache restore point; the drafter starts cold there).
+    draft_from: usize,
+    /// The logit row that produced the last token, once the request finished
+    /// normally (EOS or max_tokens with the client still there): what follows
+    /// its `Turn` snapshot.
+    turn: Option<Vec<f32>>,
     capacity: usize,
     next: u32,
     decoder: cuteafd_loader::StreamingTokenDecoder,
@@ -251,10 +285,55 @@ pub(crate) fn copy_drafts(history: &[u32], limit: usize) -> Vec<u32> {
     Vec::new()
 }
 
+/// The prefix cache over `engine` (always present: with zero entries it is the page allocator),
+/// its mark arena sized for `lanes` decoding sequences.
+fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, lanes: usize)
+    -> Result<(GlmfPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
+    let entries = args.prefix_cache_entries;
+    let budget = args.prefix_cache_mark_mib << 20;
+    anyhow::ensure!(args.prefix_partial == Toggle::Off, "GLM 5.3 Flash restores exact snapshots only (KDA state)");
+    let family = GlmfPrefix::new(engine, |mark| if entries == 0 { 0 } else { MarkArena::slots_for(lanes, entries, mark, budget) })?;
+    let template = engine.paged_buffers().first().map(|b| b[0]).context("GLM 5.3 Flash has no MLA layer")?;
+    let host = args.host_tier(engine.library, template, family.mark_bytes())?;
+    let layout = family.layout();
+    let config = PrefixConfig { entries, mark_slots: family.slots(), keep_logits: true,
+        min_tokens: args.prefix_cache_min_tokens };
+    let cache = PrefixCache::new(layout, config, host)?;
+    tracing::info!(entries, mark_slots = family.slots(), mark_bytes = family.mark_bytes(), page_bytes = layout.page_bytes,
+        pages = layout.pages, page_rows = layout.page_rows, host_bytes = args.host_cache_bytes, points = ?args.points(),
+        "GLM 5.3 Flash prefix cache");
+    Ok((family, cache))
+}
+
+/// Gives a finished or failed sequence's units, KDA slot and drafter slot back.
+fn release(family: &GlmfPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_>>, kda: &mut Vec<i32>,
+    slots: &mut Vec<usize>, placement: &GlmfPlacement, slot: Option<usize>) {
+    if let Err(error) = cache.release(family, &placement.units) {
+        tracing::error!(%error, "releasing a GLM 5.3 Flash sequence's units");
+    }
+    kda.push(placement.slot);
+    slots.extend(slot);
+}
+
+/// Serving statistics for `/v1/stats`.
+fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
+    cache: &PrefixCache<CudaCopyEngine<'_>>) {
+    if let Ok(mut stats) = stats.lock() {
+        *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
+            "prefilling": prefilling, "prefix_cache": cache.stats()});
+    }
+}
+
+/// Message starts of the GLM chat template: a snapshot right before one is a message boundary.
+pub(crate) const MESSAGE_STARTS: [&str; 4] = ["<|system|>", "<|user|>", "<|assistant|>", "<|observation|>"];
+
+#[allow(clippy::too_many_arguments)]
 fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
-    policy: Policy, ranks: Option<usize>, decode_share: DecodeShareArgs) -> Result<()> {
-    let mut allocator = Allocator::new(engine.pages, engine.slots);
+    policy: Policy, ranks: Option<usize>, decode_share: DecodeShareArgs, prefix: &PrefixArgs) -> Result<()> {
+    let (family, mut cache) = prefix_cache(engine, prefix, max_sequences)?;
+    let markers = crate::shared::prefix::marker_ids(snapshot, &MESSAGE_STARTS)?;
+    let mut free_kda: Vec<i32> = (0..engine.slots as i32).rev().collect();
     let mut grammars = crate::shared::constraints::Compiler::with_vocab(
         &opened.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, engine.cfg.eos.clone());
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
@@ -279,6 +358,9 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     loop {
         while active.len() + prefills.len() < max_sequences {
             let job = if active.is_empty() && prefills.is_empty() {
+                // Idle: publish the state the server waits in (captures and releases done).
+                cache.tick();
+                publish(stats, requests, generated_total, 0, 0, &cache);
                 match receive.blocking_recv() {
                     Some(job) => job,
                     None => return Ok(()),
@@ -305,27 +387,59 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 continue;
             }
             let capacity = (tokens.len() + job.max_tokens).min(engine.max_context);
-            let placement = match allocator.admit(capacity) {
-                Ok(placement) => placement,
+            let Some(kda) = free_kda.pop() else {
+                reject(&job, "KDA state slots exhausted".into());
+                continue;
+            };
+            let slot = free_slots.pop();
+            cache.tick();
+            // Lookup, fork of the retained units and restore of the KDA mark (byte-exact).
+            let admitted = match cache.admit(&family, &tokens, capacity, true, |units| GlmfPlacement::new(units, kda)) {
+                Ok(admitted) => admitted,
                 Err(error) => {
+                    free_kda.push(kda);
+                    free_slots.extend(slot);
                     reject(&job, format!("{error:#}"));
                     continue;
                 }
             };
-            let slot = free_slots.pop();
+            let resume = admitted.resume;
             let _ = job.events.blocking_send(Ok(InferenceChunk::Ready {
                 system_fingerprint: None,
-                prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: 0 },
+                prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: resume },
             }));
-            prefills.push(Prefill { job, constraint, tokens, done: 0, placement, capacity, slot, logits: None,
-                started: Instant::now(), busy: 0.0, phases: [0.0; 3] });
+            if let Some(source) = admitted.source {
+                tracing::info!(tokens = tokens.len(), resume, kind = ?source.kind, frontier = source.frontier,
+                    host = source.host, "prefix cache hit");
+            }
+            let plan = if cache.enabled() {
+                cuteafd_engine::prefix::plan_points(resume, tokens.len(), engine.prefill_capacity(),
+                    &crate::shared::prefix::boundaries(&tokens, &markers), family.capture_reach(),
+                    prefix.prefix_cache_min_tokens, prefix.points())
+            } else {
+                cuteafd_engine::prefix::plan_points(resume, tokens.len(), engine.prefill_capacity(), &[], 0, 0,
+                    PointPolicy { gap: 0, boundaries: 0, per_request: 0 })
+            };
+            // A whole-prompt hit brings its first token's logits: nothing to prefill.
+            let logits = admitted.after.and_then(|after| after.logits).map(|logits| logits.to_vec());
+            let plan = if logits.is_some() { PointPlan::default() } else { plan };
+            prefills.push(Prefill { job, constraint, tokens, done: resume, resume, plan, chunks: 0, cancelled: false,
+                placement: admitted.placement, capacity, slot, logits, started: Instant::now(), busy: 0.0,
+                phases: [0.0; 3] });
         }
         if prefills.due(!active.is_empty()) {
             // One chunk (a lane wave) of each waiting prompt (whole prompts with --decode-share 0).
             let finished = prefills.round(|p| {
-                anyhow::ensure!(!p.job.events.is_closed(), "client went away");
+                if p.done == p.tokens.len() {
+                    return Ok(Chunk::Done);
+                }
+                if p.job.events.is_closed() {
+                    p.cancelled = true;
+                    anyhow::bail!("client went away");
+                }
                 let timer = Instant::now();
-                let chunk = &p.tokens[p.done..(p.done + engine.prefill_capacity()).min(p.tokens.len())];
+                let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
+                let chunk = &p.tokens[p.done..end];
                 let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
                     let embed = embed_rows(&opened.checkpoint, chunk, hidden)?;
                     let start = p.placement.len;
@@ -343,14 +457,55 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 add_phases(&mut p.phases, phases);
                 p.busy += timer.elapsed().as_secs_f64();
                 result?;
+                // Intermediate snapshot points this chunk ends at (off unless configured).
+                for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks) {
+                    if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, &p.tokens[..point], &p.placement,
+                        After::default()) {
+                        tracing::warn!("snapshot point {point} not retained: {error:#}");
+                    }
+                }
+                p.chunks += 1;
                 Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
             });
             for (p, prefilled) in finished {
-                let (slot, placement) = (p.slot, p.placement.clone());
-                let admitted = prefilled.and_then(|()| {
-                    tracing::info!(tokens = p.tokens.len(), elapsed_ms = p.started.elapsed().as_millis() as u64,
-                        busy_ms = (1e3 * p.busy) as u64, gpu_wait_ms = (1e3 * p.phases[0]) as u64,
+                let (slot, placement, resume) = (p.slot, p.placement.clone(), p.resume);
+                if let Err(error) = &prefilled {
+                    if p.cancelled {
+                        // The client left during the prefill: keep what it computed for a retry.
+                        if placement.len > resume {
+                            if let Err(error) = cache.park(&family, &p.tokens[..placement.len], &placement) {
+                                tracing::warn!("parking a cancelled prefill: {error:#}");
+                            }
+                        }
+                    } else {
+                        tracing::warn!("prefill failed: {error:#}");
+                        let _ = p.job.events.blocking_send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                    }
+                    release(&family, &mut cache, &mut free_kda, &mut free_slots, &placement, slot);
+                    continue;
+                }
+                let Some(logits) = p.logits.clone() else {
+                    tracing::warn!("prefill produced no logits");
+                    release(&family, &mut cache, &mut free_kda, &mut free_slots, &placement, slot);
+                    continue;
+                };
+                if resume < p.tokens.len() {
+                    tracing::info!(tokens = p.tokens.len(), cached = resume,
+                        elapsed_ms = p.started.elapsed().as_millis() as u64, busy_ms = (1e3 * p.busy) as u64,
+                        tok_s = (p.tokens.len() - resume) as f64 / p.busy, gpu_wait_ms = (1e3 * p.phases[0]) as u64,
                         experts_ms = (1e3 * p.phases[1]) as u64, head_ms = (1e3 * p.phases[2]) as u64, "prefill");
+                }
+                // The prompt snapshot, taken once the first token is out (it only enqueues copies).
+                let prompt = (resume < p.tokens.len()).then(|| p.tokens.clone());
+                let retain_prompt = |cache: &mut PrefixCache<CudaCopyEngine<'_>>, placement: &GlmfPlacement| {
+                    if let Some(prompt) = &prompt {
+                        if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, prompt, placement,
+                            After::from_logits(&logits, true)) {
+                            tracing::warn!("prompt snapshot not retained: {error:#}");
+                        }
+                    }
+                };
+                let admitted = (|| -> Result<Active<'_>> {
                     let mut request = Active {
                         digest: p.tokens.iter().fold(DIGEST_SEED, |d, &t| digest(d, t)),
                         history: p.tokens,
@@ -360,27 +515,28 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         drafts: DraftHistory::default(),
                         counts: [0; 5],
                         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?,
-                        job: p.job, constraint: p.constraint, placement: p.placement, capacity: p.capacity, next: 0,
-                        generated: 0, buffered: 0, started: Instant::now(),
+                        job: p.job, constraint: p.constraint, placement: p.placement, draft_from: resume, turn: None,
+                        capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(),
                     };
-                    request.next = request.select(&p.logits.context("prefill produced no logits")?)?;
+                    request.next = request.select(&logits)?;
                     Ok(request)
-                });
+                })();
                 match admitted {
                     Ok(mut request) => {
                         let token = request.next;
-                        match request.emit(token) {
+                        let emitted = request.emit(token);
+                        retain_prompt(&mut cache, &request.placement);
+                        match emitted {
                             Ok(false) => active.push(request),
-                            Ok(true) | Err(_) => {
-                                free_slots.extend(request.slot);
-                                allocator.release(request.placement);
-                            }
+                            // Finished at its first token: its turn is its prompt snapshot.
+                            Ok(true) | Err(_) => release(&family, &mut cache, &mut free_kda, &mut free_slots,
+                                &request.placement, request.slot),
                         }
                     }
                     Err(error) => {
-                        tracing::warn!("prefill failed: {error:#}");
-                        free_slots.extend(slot);
-                        allocator.release(placement);
+                        tracing::warn!("admission failed: {error:#}");
+                        retain_prompt(&mut cache, &placement);
+                        release(&family, &mut cache, &mut free_kda, &mut free_slots, &placement, slot);
                     }
                 }
             }
@@ -399,7 +555,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let drafted: Vec<Option<Draft>> = match drafter {
             Some(drafter) if skip.drafts() && active.iter().any(|a| a.slot.is_some()) => {
                 let seqs: Vec<(usize, DraftSeq)> = active.iter().enumerate()
-                    .filter_map(|(i, a)| a.slot.map(|slot| (i, DraftSeq { slot, anchor: a.next, position: a.placement.len })))
+                    .filter_map(|(i, a)| a.slot.map(|slot| (i, DraftSeq { slot, anchor: a.next, position: a.placement.len,
+                        valid_from: a.draft_from })))
                     .collect();
                 let anchors: Vec<u32> = seqs.iter().map(|(_, s)| s.anchor).collect();
                 let drafts = embed_rows(&opened.checkpoint, &anchors, hidden).and_then(|rows| drafter.draft(
@@ -474,8 +631,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 tracing::warn!("decode step failed: {error:#}");
                 for request in active.drain(..) {
                     let _ = request.job.events.blocking_send(Err(NativeFailure::Worker(format!("{error:#}"))));
-                    free_slots.extend(request.slot);
-                    allocator.release(request.placement);
+                    release(&family, &mut cache, &mut free_kda, &mut free_slots, &request.placement, request.slot);
                 }
                 continue;
             }
@@ -485,15 +641,22 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let mut offset = 0;
         let mut context = Vec::new();
         let mut commits = Vec::new();
+        let mut kept = Vec::new();
         let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(starts).enumerate()
             .map(|(i, ((request, rows), start))| {
             let mut finished = false;
             for j in 0..rows.len() {
                 // Rows 0..=j are committed; the token row j produces is next.
                 request.placement.len = start + j + 1;
-                match request.select(&logits[(offset + j) * vocab..][..vocab]).and_then(|t| Ok((t, request.emit(t)?))) {
+                let row = &logits[(offset + j) * vocab..][..vocab];
+                match request.select(row).and_then(|t| Ok((t, request.emit(t)?))) {
                     Ok((token, done)) => {
                         finished = done;
+                        if done {
+                            // A normal finish (the client took the last chunk): the row that
+                            // produced the last token follows the turn snapshot.
+                            request.turn = Some(row.to_vec());
+                        }
                         if done || rows.get(j + 1) != Some(&token) {
                             break;
                         }
@@ -505,8 +668,12 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 }
             }
             let committed = request.placement.len - start;
-            if !finished {
+            // A turn snapshot captures the KDA state at the kept length: commit it too.
+            if !finished || request.turn.is_some() {
                 commits.push((request.placement.slot, offset, committed));
+                kept.push(i);
+            }
+            if !finished {
                 if let Some(slot) = request.slot {
                     context.extend((0..committed).map(|r| ContextRow { tap_row: offset + r, slot, position: start + r }));
                 }
@@ -541,6 +708,9 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let timer = Instant::now();
         if spec {
             engine.commit(&commits)?;
+            for &i in &kept {
+                active[i].placement.kda_len = active[i].placement.len;
+            }
         }
         if let Some(drafter) = drafter {
             drafter.update(&context)?;
@@ -561,13 +731,18 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 draft_s, verify_s, emit_s, gpu_wait_s = phases[0], experts_s = phases[1], head_s = phases[2],
                 "request complete");
             (steps, draft_s, verify_s, emit_s) = (0, 0.0, 0.0, 0.0);
-            free_slots.extend(request.slot);
-            allocator.release(request.placement);
+            if let Some(row) = &request.turn {
+                // The conversation so far: every committed row (the last token is not in it).
+                let rows = &request.history[..request.placement.len];
+                if let Err(error) = cache.capture(&family, SnapshotKind::Turn, rows, &request.placement,
+                    After::from_logits(row, true)) {
+                    tracing::warn!("turn snapshot not retained: {error:#}");
+                }
+            }
+            release(&family, &mut cache, &mut free_kda, &mut free_slots, &request.placement, request.slot);
         }
-        if let Ok(mut stats) = stats.lock() {
-            *stats = serde_json::json!({"requests": requests, "generated_tokens": generated_total,
-                "active": active.len(), "prefilling": prefills.len()});
-        }
+        cache.tick();
+        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache);
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
 }

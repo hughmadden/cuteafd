@@ -91,7 +91,7 @@ pub(super) fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
         }
         let anchor = tokens[position];
         let timer = Instant::now();
-        let draft = drafter.draft(&[DraftSeq { slot: 0, anchor, position }],
+        let draft = drafter.draft(&[DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
             &embed_rows(&opened.checkpoint, &[anchor], hidden)?, engine.weights.head.buffer.ptr)?.remove(0);
         draft_seconds += timer.elapsed().as_secs_f64();
         let reference = &ref_tokens[index * drafts_per..][..drafts_per];
@@ -167,7 +167,7 @@ pub(super) fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngine<
         let anchor = sequence[position];
         let anchor_row = embed_rows(&opened.checkpoint, &[anchor], hidden)?;
         let timer = Instant::now();
-        let draft = drafter.draft(&[DraftSeq { slot: 0, anchor, position }], &anchor_row, engine.weights.head.buffer.ptr)?;
+        let draft = drafter.draft(&[DraftSeq { slot: 0, anchor, position, valid_from: 0 }], &anchor_row, engine.weights.head.buffer.ptr)?;
         draft_seconds += timer.elapsed().as_secs_f64();
         drafts.push((position, draft.into_iter().next().context("draft")?));
         let logits = engine.verify(&mut [(&mut placement, 1)], &anchor_row, None)?.context("decode needs every layer")?;

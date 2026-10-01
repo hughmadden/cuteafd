@@ -49,7 +49,7 @@ pub(crate) const SPARSE_TOPK: usize = 2112;
 /// Most decode rows the FP8 GEMVs take (the programs' FP8_ROWS).
 const FP8_ROWS: i32 = 16;
 /// FP8 latent record bytes (512 E4M3 + 4 FP32 group scales).
-const RECORD_BYTES: usize = 528;
+pub(crate) const RECORD_BYTES: usize = 528;
 /// Rows a speculative step records per KDA layer (`REPLAY_ROWS` of the fork's
 /// `_glmf_kernels.py`; the decode programs' rows).
 const REPLAY_ROWS: usize = DECODE_ROWS;
@@ -186,19 +186,38 @@ struct StepTables {
 }
 
 /// Tokens per DSA index pool, and pools per pool-cache page.
-const KPOOL: usize = 4;
+pub(crate) const KPOOL: usize = 4;
 const POOL_PAGE_TOKENS: usize = KPOOL * PAGE_ROWS;
 
-/// A sequence's MLA pages, its pool pages, its KDA state slot and its length.
+/// MLA pages per allocation unit: a unit is four consecutive 64-row MLA pages (256 tokens) and
+/// the pool-cache page of the same index (64 pools of 4 tokens), so one refcounted unit index
+/// names every paged byte of 256 positions (the prefix cache's page).
+pub(crate) const UNIT_PAGES: usize = KPOOL;
+pub(crate) const UNIT_ROWS: usize = POOL_PAGE_TOKENS;
+
+/// A sequence's allocation units (and the MLA and pool pages they expand to), its KDA state
+/// slot, its length and the rows its KDA state holds.
 #[derive(Debug, Clone)]
 pub(crate) struct GlmfPlacement {
+    pub units: Vec<u32>,
     pub pages: Vec<i32>,
     pub pool_pages: Vec<i32>,
     pub slot: i32,
     pub len: usize,
+    /// Rows the KDA recurrent and conv state has consumed: `len` after a prefill or a plain
+    /// verify; a speculative verify leaves it until the caller commits the kept rows.
+    pub kda_len: usize,
 }
 
 impl GlmfPlacement {
+    /// A fresh sequence over `units` with KDA state slot `slot`.
+    pub fn new(units: Vec<u32>, slot: i32) -> Self {
+        let pages = units.iter().flat_map(|&u| (0..UNIT_PAGES as i32).map(move |i| u as i32 * UNIT_PAGES as i32 + i))
+            .collect();
+        let pool_pages = units.iter().map(|&u| u as i32).collect();
+        Self { units, pages, pool_pages, slot, len: 0, kda_len: 0 }
+    }
+
     pub fn record(&self, position: usize) -> Result<i64> {
         let page = *self.pages.get(position / PAGE_ROWS).context("position past the sequence's pages")?;
         Ok(i64::from(page) * PAGE_ROWS as i64 + (position % PAGE_ROWS) as i64)
@@ -214,36 +233,45 @@ impl GlmfPlacement {
     }
 }
 
-/// Free MLA pages, pool pages and KDA state slots.
+/// Refcounted allocation units and free KDA state slots (goldens and benches; serving takes
+/// its units from the prefix cache's pool).
 pub(crate) struct Allocator {
-    pages: Vec<i32>,
-    pool_pages: Vec<i32>,
+    units: cuteafd_engine::prefix::RefPagePool,
     slots: Vec<i32>,
 }
 
 impl Allocator {
+    /// Over an engine of `pages` MLA pages (a whole number of units) and `slots` KDA slots.
     pub fn new(pages: usize, slots: usize) -> Self {
-        let pool_pages = pages.div_ceil(KPOOL);
-        Self { pages: (0..pages as i32).rev().collect(), pool_pages: (0..pool_pages as i32).rev().collect(),
+        Self { units: cuteafd_engine::prefix::RefPagePool::new(pages / UNIT_PAGES, UNIT_ROWS),
             slots: (0..slots as i32).rev().collect() }
     }
 
-    /// Reserves every page a sequence of up to `capacity` tokens needs and a
-    /// state slot (the engine zeroes the slot and maps the pool pages before
-    /// the first step).
+    /// Reserves every unit a sequence of up to `capacity` tokens needs and a state slot (the
+    /// engine zeroes the slot and maps the pool pages before the first step).
     pub fn admit(&mut self, capacity: usize) -> Result<GlmfPlacement> {
-        let pages = capacity.div_ceil(PAGE_ROWS).max(1);
-        let pool_pages = capacity.div_ceil(POOL_PAGE_TOKENS).max(1);
-        ensure!(self.pages.len() >= pages && self.pool_pages.len() >= pool_pages,
-            "cache pages exhausted ({pages} + {pool_pages} pool pages needed, {} + {} free)", self.pages.len(),
-            self.pool_pages.len());
         let slot = self.slots.pop().context("KDA state slots exhausted")?;
-        Ok(GlmfPlacement {
-            pages: (0..pages).map(|_| self.pages.pop().unwrap()).collect(),
-            pool_pages: (0..pool_pages).map(|_| self.pool_pages.pop().unwrap()).collect(),
-            slot,
-            len: 0,
-        })
+        match self.units.alloc(self.units.pages_for(capacity)) {
+            Ok(units) => Ok(GlmfPlacement::new(units, slot)),
+            Err(error) => {
+                self.slots.push(slot);
+                Err(error).context("cache pages exhausted")
+            }
+        }
+    }
+
+    /// A second sequence starting as `source`'s first `len` rows: full units shared, the
+    /// partial tail unit copied by the caller (the returned copy), and its own KDA slot.
+    pub fn fork(&mut self, source: &GlmfPlacement, len: usize, capacity: usize)
+        -> Result<(GlmfPlacement, Option<cuteafd_engine::prefix::TailCopy>)> {
+        let slot = self.slots.pop().context("KDA state slots exhausted")?;
+        match self.units.fork(&source.units, len, self.units.pages_for(capacity)) {
+            Ok(fork) => Ok((GlmfPlacement::new(fork.pages, slot), fork.copy)),
+            Err(error) => {
+                self.slots.push(slot);
+                Err(error).context("cache pages exhausted")
+            }
+        }
     }
 
     /// A spare KDA state slot (a speculative verify's backup).
@@ -256,8 +284,7 @@ impl Allocator {
     }
 
     pub fn release(&mut self, placement: GlmfPlacement) {
-        self.pages.extend(placement.pages);
-        self.pool_pages.extend(placement.pool_pages);
+        self.units.release(&placement.units);
         self.slots.push(placement.slot);
     }
 }
@@ -329,8 +356,11 @@ pub(crate) struct GlmfEngine<'a> {
     /// Per MLA layer (None for KDA): per-token indexer keys | gates (BF16
     /// [record slots, 256]) and the FP8 pool-key cache.
     index: Vec<Option<(Dev<'a>, Dev<'a>)>>,
-    /// Logical page of each pool-cache page within its sequence.
+    /// Logical page of each pool-cache page within its sequence, and its host copy (a shared
+    /// pool page sits at the same logical page in every sequence that holds it).
     pool_logical: Dev<'a>,
+    pool_logical_host: RefCell<Vec<i32>>,
+    /// Pool-cache pages: one per allocation unit (`pages / UNIT_PAGES`).
     pub pool_pages: usize,
     workspace: RefCell<Option<Workspace<'a>>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
@@ -358,6 +388,11 @@ pub(crate) struct GlmfEngine<'a> {
     ops: Option<RefCell<OpTimes>>,
     /// Prefill projections that run block-FP8 GEMMs (the layers need FP8 copies).
     pub fp8_prefill: Fp8Prefill,
+    /// CUTEAFD_DSA_SORTED_TOPK=1: each row's top-k pools are sorted by position before the
+    /// expansion, so the sparse attention's order (and its rounding) is canonical: the radix
+    /// top-k emits in shared-atomic order, which varies run to run (deterministic serving and
+    /// the --resume-at gate past 2051 tokens).
+    pub sorted_topk: bool,
 }
 
 /// Which prefill projections run block-FP8 GEMMs (E4M3 activations per row
@@ -410,7 +445,9 @@ impl<'a> GlmfEngine<'a> {
             Ok(allocation)
         };
         let d = cfg.kda_heads * cfg.kda_head_dim;
-        let pool_pages = pages.div_ceil(KPOOL);
+        // Whole allocation units: four MLA pages and one pool page each.
+        let pages = pages.max(1).next_multiple_of(UNIT_PAGES);
+        let pool_pages = pages / UNIT_PAGES;
         let mut kv = Vec::new();
         let mut kda_ordinal = Vec::new();
         let mut index = Vec::new();
@@ -436,7 +473,7 @@ impl<'a> GlmfEngine<'a> {
         let pool_logical = zeroed(pool_pages * 4)?;
         Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, slots, kv, kda_ordinal,
             kda_state, kda_conv, kda_replay, commit_tables: zeroed(3 * DECODE_ROWS * 4)?, drafter: None, index,
-            pool_logical, pool_pages, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
+            pool_logical, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
             lane_workspaces: RefCell::new(Vec::new()),
             experts: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(std::collections::HashMap::new()),
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
@@ -444,7 +481,7 @@ impl<'a> GlmfEngine<'a> {
             subset_lanes: std::env::var("CUTEAFD_GLMF_PREFILL_LANES").is_ok_and(|v| v == "subset"),
             full_prefill_logits: false, routes_ready: library.cuda_event_create_ordering()?,
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
-            fp8_prefill: Fp8Prefill::default(), l2: None })
+            fp8_prefill: Fp8Prefill::default(), l2: None, sorted_topk: sorted_topk() })
     }
 
     /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
@@ -458,18 +495,27 @@ impl<'a> GlmfEngine<'a> {
 
     /// Before a sequence's first step: zeroes its KDA state and maps its pool pages.
     fn start(&self, placement: &GlmfPlacement) -> Result<()> {
+        self.map_pools(placement)?;
+        self.reset_slot(placement.slot)
+    }
+
+    /// Records each of `placement`'s pool pages' logical page (the index expansion reads it).
+    /// A restored sequence maps its pages before its first step as a fresh one does; shared
+    /// pages keep the value they have.
+    pub fn map_pools(&self, placement: &GlmfPlacement) -> Result<()> {
+        let mut host = self.pool_logical_host.borrow_mut();
+        let mut changed = false;
         for (logical, &page) in placement.pool_pages.iter().enumerate() {
             let page = usize::try_from(page)?;
             ensure!(page < self.pool_pages, "pool page {page} out of range");
-            let at = cuteafd_ffi::CuteafdDeviceBuffer {
-                // SAFETY: page < pool_pages, so the entry lies inside the table.
-                ptr: unsafe { self.pool_logical.buffer.ptr.cast::<u8>().add(page * 4) }.cast(),
-                bytes: 4,
-                ..self.pool_logical.buffer
-            };
-            self.library.copy_h2d(at, &(logical as i32).to_le_bytes())?;
+            changed |= std::mem::replace(&mut host[page], logical as i32) != logical as i32;
         }
-        self.reset_slot(placement.slot)
+        if changed {
+            // Entries other sequences' queued steps read keep their values.
+            self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: host.len() * 4, ..self.pool_logical.buffer },
+                bytes_of(&host[..]))?;
+        }
+        Ok(())
     }
 
     /// Copies a sequence's KDA recurrent and conv state from slot `from` to
@@ -486,7 +532,7 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// Every KDA layer's recurrent and conv state regions of `slot`.
-    fn slot_regions(&self, slot: usize) -> Vec<cuteafd_ffi::CuteafdDeviceBuffer> {
+    pub(crate) fn slot_regions(&self, slot: usize) -> Vec<cuteafd_ffi::CuteafdDeviceBuffer> {
         let layers = self.kda_ordinal.iter().flatten().count().max(1);
         let mut out = Vec::new();
         for pool in [&self.kda_state, &self.kda_conv] {
@@ -501,6 +547,15 @@ impl<'a> GlmfEngine<'a> {
             }
         }
         out
+    }
+
+    /// Every MLA layer's paged buffers: latent records (528 B per row), indexer token keys
+    /// (512 B per row), both in 64-row MLA pages, and the pool-key cache (8448 B per pool page).
+    pub(crate) fn paged_buffers(&self) -> Vec<[cuteafd_ffi::CuteafdDeviceBuffer; 3]> {
+        self.kv.iter().zip(&self.index).filter_map(|(kv, index)| match (kv, index) {
+            (Some(kv), Some((keys, pools))) => Some([kv.buffer, keys.buffer, pools.buffer]),
+            _ => None,
+        }).collect()
     }
 
     /// Zeroes a sequence's KDA recurrent and conv state (before its first step).
@@ -531,6 +586,7 @@ impl<'a> GlmfEngine<'a> {
     /// After a speculative verify step (`verify_spec`): applies each
     /// sequence's first `keep` rows (from step row `first`) to the KDA state
     /// of `slot` in every layer, as serial steps over those rows would have.
+    /// Callers set the committed placements' `kda_len` to their kept length.
     pub fn commit(&self, sequences: &[(i32, usize, usize)]) -> Result<()> {
         if sequences.is_empty() {
             return Ok(());
@@ -769,6 +825,7 @@ impl<'a> GlmfEngine<'a> {
         self.rows(placement, start..start + t, 0, &mut tables)?;
         let logits = self.step(&tables, embed, if all_logits { t } else { 1 }, on_layer, forced)?;
         placement.len += t;
+        placement.kda_len = placement.len;
         Ok(logits)
     }
 
@@ -812,6 +869,7 @@ impl<'a> GlmfEngine<'a> {
         }
         let logits = self.step_lanes(&steps, if all_logits { t } else { 1 })?;
         placement.len += t;
+        placement.kda_len = placement.len;
         Ok(logits)
     }
 
@@ -868,6 +926,9 @@ impl<'a> GlmfEngine<'a> {
         let logits = self.step(&tables, embed, rows, on_layer, None)?;
         for (placement, count) in sequences.iter_mut() {
             placement.len += *count;
+            if !spec {
+                placement.kda_len = placement.len;
+            }
         }
         Ok(logits)
     }
@@ -1167,6 +1228,16 @@ impl<'a> GlmfEngine<'a> {
                 ("page_table", w.pool_table.buffer.ptr), ("cache_lengths", w.cache_lengths.buffer.ptr),
                 ("output_indices", w.pools.buffer.ptr), ("scratch", w.topk_scratch.buffer.ptr)],
                 &[rows, Scalar::I32(tables.pool_width.max(1) as i32), Scalar::I32(tables.pool_stride as i32)])?;
+            if self.sorted_topk {
+                self.timed("pool top-k sort", || {
+                    // SAFETY: `pools` holds the step's rows of index_topk / 4 pool slots, every one
+                    // on a pool page `pool_logical` maps; stream-ordered after the top-k.
+                    unsafe {
+                        self.library.dsa_sort_slots(w.pools.buffer.ptr, self.pool_logical.buffer.ptr,
+                            tables.positions.len(), self.cfg.index_topk / KPOOL, self.stream)
+                    }
+                })?;
+            }
         }
         self.run("index_expand", &[("positions", w.positions.buffer.ptr), ("pools", w.pools.buffer.ptr),
             ("pool_logical", self.pool_logical.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
@@ -1545,6 +1616,11 @@ impl<'a> GlmfEngine<'a> {
         self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
         Ok(Some(logits))
     }
+}
+
+/// CUTEAFD_DSA_SORTED_TOPK=1 (see [`GlmfEngine::sorted_topk`]).
+pub(crate) fn sorted_topk() -> bool {
+    std::env::var("CUTEAFD_DSA_SORTED_TOPK").is_ok_and(|v| v == "1")
 }
 
 impl Drop for GlmfEngine<'_> {
