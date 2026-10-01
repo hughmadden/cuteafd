@@ -209,7 +209,7 @@ impl<'a> Engine<'a> {
         // SAFETY: y, head weights, logits, Markov weights, tokens and the
         // argmax workspace are live buffers of these shapes.
         unsafe {
-            w.head.launch(w.y.buffer.ptr.cast(), self.weights.head.buffer.ptr.cast(),
+            w.head.as_ref().context("LM head")?.launch(w.y.buffer.ptr.cast(), self.weights.head.buffer.ptr.cast(),
                 w.vocab_logits.buffer.ptr.cast(), rows as u32, self.stream)?;
             self.library.dsv4_markov_drafts(w.vocab_logits.buffer.ptr, dspark.markov_w1.buffer.ptr,
                 dspark.markov_w2.buffer.ptr, w.first_tokens.buffer.ptr, w.drafts.buffer.ptr, w.markov.buffer.ptr,
