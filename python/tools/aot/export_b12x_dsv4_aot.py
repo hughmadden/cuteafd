@@ -137,6 +137,16 @@ def glm_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     return out
 
 
+def glm_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
+    """One GPU's share of a two-GPU GLM 5.x head split (``g`` the half geometry: half the
+    heads, half the dense and shared-expert intermediates): the MLA producer (the replicated
+    latent record, its heads' queries), sparse MLA, W_UV + o_proj (a partial over its heads)
+    and the dense / shared-expert MLPs (partials over their intermediate slices); the indexer,
+    norms, router and expert input stay the whole model's programs."""
+    keep = ("producer_m", "o_m", "ffn_i", "sparse_mla_")
+    return [item for item in glm_programs(g, decode_rows, prefill_rows, max_context) if item[0].startswith(keep)]
+
+
 def mimo_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """MiMo V2 programs, same (stem suffix, op, params, thunk) shape as ``programs``.
     qkv and the dense FFN take only the checkpoint's E4M3 weights (per-row x 128-K FP32
@@ -288,7 +298,8 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--geometry", default="flash",
                         help="comma-separated geometries in one table: flash, pro (DeepSeek V4), glm (GLM 5.x), "
-                             "mimo (MiMo V2 Flash), mimop (MiMo V2.6 Pro), mimop2 (V2.6 Pro, one GPU of a two-GPU head split), "
+                             "glm2 (GLM 5.x, one GPU of a two-GPU head split), mimo (MiMo V2 Flash), mimop (MiMo V2.6 Pro), "
+                             "mimop2 (V2.6 Pro, one GPU of a two-GPU head split), "
                              "glmf (GLM 5.3 Flash), qwen4 (Qwen 3.8 Flash Next)")
     parser.add_argument("--decode-rows", type=int, default=64)
     parser.add_argument("--prefill-rows", type=int, default=4096)
@@ -303,9 +314,9 @@ def main() -> None:
     )
 
     geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
-    if not geometries or any(name not in ("flash", "pro", "glm", "mimo", "mimop", "mimop2", "glmf", "qwen4")
+    if not geometries or any(name not in ("flash", "pro", "glm", "glm2", "mimo", "mimop", "mimop2", "glmf", "qwen4")
                              for name in geometries):
-        raise SystemExit("--geometry takes flash, pro, glm, mimo, mimop, mimop2, glmf and/or qwen4")
+        raise SystemExit("--geometry takes flash, pro, glm, glm2, mimo, mimop, mimop2, glmf and/or qwen4")
     props = torch.cuda.get_device_properties(0)
     if (props.major, props.minor) != (12, 0):
         raise SystemExit("coordinator programs export on SM120")
@@ -330,12 +341,16 @@ def main() -> None:
                                      full_kv_heads=MIMO_V26_PRO.full_kv_heads // 2,
                                      swa_kv_heads=MIMO_V26_PRO.swa_kv_heads // 2,
                                      dense_inter=MIMO_V26_PRO.dense_inter // 2)
-        g = {"flash": FLASH, "pro": PRO, "glm": GLM53, "mimo": MIMO_V2_FLASH, "mimop": MIMO_V26_PRO, "mimop2": mimop2,
-             "glmf": GLM53_FLASH, "qwen4": QWEN38_FLASH_NEXT}[name]
-        family = {"flash": "dsv4f", "pro": "dsv4p", "glm": "glm", "mimo": "mimo", "mimop": "mimop", "mimop2": "mimop2",
-                  "glmf": "glmf", "qwen4": "qwen4"}[name]
+        # glm2: GLM 5.x split over two GPUs by heads (32 each; dense and shared MLPs by
+        # intermediate).
+        glm2 = dataclasses.replace(GLM53, name="glm53_tp2", heads=GLM53.heads // 2, dense_inter=GLM53.dense_inter // 2,
+                                   moe_inter=GLM53.moe_inter // 2)
+        g = {"flash": FLASH, "pro": PRO, "glm": GLM53, "glm2": glm2, "mimo": MIMO_V2_FLASH, "mimop": MIMO_V26_PRO,
+             "mimop2": mimop2, "glmf": GLM53_FLASH, "qwen4": QWEN38_FLASH_NEXT}[name]
+        family = {"flash": "dsv4f", "pro": "dsv4p", "glm": "glm", "glm2": "glm2", "mimo": "mimo", "mimop": "mimop",
+                  "mimop2": "mimop2", "glmf": "glmf", "qwen4": "qwen4"}[name]
         manifest["families"][family] = {k: v for k, v in vars(g).items()}
-        make = {"glm": glm_programs, "mimo": mimo_programs, "mimop": mimo_programs, "mimop2": mimo_head_split_programs,
+        make = {"glm": glm_programs, "glm2": glm_head_split_programs, "mimo": mimo_programs, "mimop": mimo_programs, "mimop2": mimo_head_split_programs,
                 "glmf": glmf_programs,
                 "qwen4": qwen4_programs}.get(name, programs)
         work += [(family, *item) for item in make(g, args.decode_rows, args.prefill_rows, args.max_context)]

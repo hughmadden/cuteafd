@@ -24,6 +24,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::families::glm5::GlmDsaConfig;
+use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
 use std::cell::RefCell;
 use std::ffi::c_void;
 
@@ -170,8 +171,50 @@ struct Workspace<'a> {
     ids: Dev<'a>,
     /// Greedy selection of the logits rows inside the decode graph: U32 ids, then U32 statuses.
     select: Dev<'a>,
-    head: VocabularyHead<'a>,
+    /// The cuBLAS LM head (rank 0 only).
+    head: Option<VocabularyHead<'a>>,
     _head_workspace: Dev<'a>,
+}
+
+/// The second GPU of a two-GPU head split (rank 1): its share of every layer
+/// (half the heads' q_b, kv_b and o_proj; half the dense and shared-expert
+/// intermediate), its copy of the latent and index caches (the replicated
+/// latent projection and DSA indexer write identical records on both GPUs),
+/// RoPE table, workspaces and captured decode segments.
+pub(crate) struct GlmPeer<'a> {
+    pub device: i32,
+    pub stream: *mut c_void,
+    pub layers: Vec<GlmLayer<'a>>,
+    kv: Vec<Dev<'a>>,
+    index: Vec<Option<Dev<'a>>>,
+    cos_sin: Dev<'a>,
+    decode_workspace: RefCell<Option<Workspace<'a>>>,
+    lane_workspaces: RefCell<Vec<Workspace<'a>>>,
+    graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
+    /// L2 prefetch of its next layer's weights while rank 0 waits in a decode exchange.
+    l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
+}
+
+/// Exchange slot of layer `index`, lane `lane`: its attention partials (`ffn`
+/// false) or its FFN exchange (dense partials, the shared-expert partial from
+/// rank 1, the routed + shared sum from rank 0), by layer parity.
+fn slot(index: usize, ffn: bool, lane: usize) -> usize {
+    4 * lane + 2 * (index % 2) + usize::from(ffn)
+}
+
+/// Borrowed workspaces of the head split's second GPU.
+enum PeerWorkspaces<'e, 'a> {
+    Decode(std::cell::Ref<'e, Option<Workspace<'a>>>),
+    Lanes(std::cell::Ref<'e, Vec<Workspace<'a>>>),
+}
+
+impl<'a> PeerWorkspaces<'_, 'a> {
+    fn get(&self, lane: usize) -> Result<&Workspace<'a>> {
+        match self {
+            Self::Decode(w) => w.as_ref().context("peer decode workspace"),
+            Self::Lanes(w) => w.get(lane).context("peer lane workspace"),
+        }
+    }
 }
 
 /// A step's logits: on the device (one workspace's rows), or downloaded
@@ -227,6 +270,41 @@ pub(crate) struct GlmEngine<'a> {
     /// row and 128-K block, the official FP8 release's served numerics); false:
     /// W8A16 (bitwise the former BF16 prefill over dequantized weights).
     pub prefill_w8a8: bool,
+    /// This engine's GPU (rank 0 of a head split).
+    pub device: i32,
+    /// The head split's second GPU and the exchange between the two.
+    peer: Option<GlmPeer<'a>>,
+    exchange: Option<PeerExchange<'a>>,
+}
+
+/// Per layer the latent record pool and (full-indexer layers) the index-key
+/// pool, zeroed, and the RoPE table, on the current device.
+#[allow(clippy::type_complexity)]
+fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer<'_>], pages: usize, max_context: usize)
+    -> Result<(Vec<Dev<'a>>, Vec<Option<Dev<'a>>>, Dev<'a>)> {
+    let zeroed = |bytes: usize| -> Result<Dev<'a>> {
+        let allocation = DeviceAllocation::new(library, bytes.max(256))?;
+        library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
+        Ok(allocation)
+    };
+    let kv = (0..layers.len()).map(|_| zeroed(pages * RECORD_PAGE_BYTES)).collect::<Result<Vec<_>>>()?;
+    let index = layers.iter()
+        .map(|l| l.full_indexer.then(|| zeroed(pages * INDEX_PAGE_BYTES)).transpose())
+        .collect::<Result<Vec<_>>>()?;
+    // cos | sin of position * theta^(-2i/64), FP32 like the reference's inv_freq.
+    let dim = cfg.qk_rope_head_dim;
+    let mut table = vec![0f32; max_context * dim];
+    let inv: Vec<f32> = (0..dim / 2).map(|i| 1.0 / (cfg.rope_theta as f32).powf((2 * i) as f32 / dim as f32)).collect();
+    for p in 0..max_context {
+        for (i, f) in inv.iter().enumerate() {
+            let angle = p as f32 * f;
+            table[p * dim + i] = angle.cos();
+            table[p * dim + dim / 2 + i] = angle.sin();
+        }
+    }
+    let cos_sin = DeviceAllocation::new(library, table.len() * 4)?;
+    library.copy_h2d(cos_sin.buffer, bytes_of(&table))?;
+    Ok((kv, index, cos_sin))
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -240,30 +318,9 @@ impl<'a> GlmEngine<'a> {
         weights: GlmWeights<'a>, stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize,
         embedding: TokenEmbedding<'a>) -> Result<Self> {
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
-        let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-            let allocation = DeviceAllocation::new(library, bytes.max(256))?;
-            library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
-            Ok(allocation)
-        };
-        let layers = weights.layers.len();
-        let kv = (0..layers).map(|_| zeroed(pages * RECORD_PAGE_BYTES)).collect::<Result<Vec<_>>>()?;
-        let index = weights.layers.iter()
-            .map(|l| l.full_indexer.then(|| zeroed(pages * INDEX_PAGE_BYTES)).transpose())
-            .collect::<Result<Vec<_>>>()?;
-        // cos | sin of position * theta^(-2i/64), FP32 like the reference's inv_freq.
-        let dim = cfg.qk_rope_head_dim;
-        let mut table = vec![0f32; max_context * dim];
-        let inv: Vec<f32> = (0..dim / 2).map(|i| 1.0 / (cfg.rope_theta as f32).powf((2 * i) as f32 / dim as f32)).collect();
-        for p in 0..max_context {
-            for (i, f) in inv.iter().enumerate() {
-                let angle = p as f32 * f;
-                table[p * dim + i] = angle.cos();
-                table[p * dim + dim / 2 + i] = angle.sin();
-            }
-        }
-        let cos_sin = DeviceAllocation::new(library, table.len() * 4)?;
-        library.copy_h2d(cos_sin.buffer, bytes_of(&table))?;
-        Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
+        let (kv, index, cos_sin) = caches(library, &cfg, &weights.layers, pages, max_context)?;
+        let device = library.cuda_get_device()?;
+        Ok(Self { device, peer: None, exchange: None, library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
             decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
             prefill_lanes: configured_lanes(),
             lanes: RefCell::new(Vec::new()), full_prefill_logits: false, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
@@ -274,7 +331,102 @@ impl<'a> GlmEngine<'a> {
     /// Every layer's latent record pool (656 B per row, 64-row pages) and, on full-indexer
     /// layers, its index-key pool (8448 B per page: 64 x 128 E4M3 keys, then 64 FP32 scales).
     pub(crate) fn paged_buffers(&self) -> Vec<(cuteafd_ffi::CuteafdDeviceBuffer, Option<cuteafd_ffi::CuteafdDeviceBuffer>)> {
-        self.kv.iter().zip(&self.index).map(|(kv, index)| (kv.buffer, index.as_ref().map(|i| i.buffer))).collect()
+        self.paged_buffers_on(0)
+    }
+
+    /// [`Self::paged_buffers`] of rank `rank` (1: the head split's copy on its second GPU).
+    pub(crate) fn paged_buffers_on(&self, rank: usize)
+        -> Vec<(cuteafd_ffi::CuteafdDeviceBuffer, Option<cuteafd_ffi::CuteafdDeviceBuffer>)> {
+        let (kv, index) = match (rank, &self.peer) {
+            (1, Some(peer)) => (&peer.kv, &peer.index),
+            _ => (&self.kv, &self.index),
+        };
+        kv.iter().zip(index).map(|(kv, index)| (kv.buffer, index.as_ref().map(|i| i.buffer))).collect()
+    }
+
+    /// GPUs this engine runs on: 2 under a head split.
+    pub fn ranks(&self) -> usize {
+        1 + usize::from(self.peer.is_some())
+    }
+
+    /// Attaches the head split's second GPU: `device` with `stream`, holding
+    /// `layers` (every layer's rank-1 share, see `GlmLoader::model`). Enables
+    /// peer access both ways, loads the programs there, and allocates its
+    /// caches, RoPE table and the exchange (four slots per prefill lane).
+    pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<GlmLayer<'a>>) -> Result<()> {
+        ensure!(layers.len() == self.weights.layers.len() && layers.iter().chain(&self.weights.layers).all(|l| l.split),
+            "attach_peer needs the head-split shares of every loaded layer");
+        let rows = self.prefill_rows.max(DECODE_ROWS);
+        let exchange = PeerExchange::new(self.library, [RankDevice { device: self.device, stream: self.stream },
+            RankDevice { device, stream }], 4 * self.prefill_lanes.max(1), rows * self.cfg.hidden * 2)?;
+        let peer = exchange.on(1, || -> Result<GlmPeer<'a>> {
+            self.programs.load_all()?;
+            let (kv, index, cos_sin) = caches(self.library, &self.cfg, &layers, self.pages, self.max_context)?;
+            Ok(GlmPeer { device, stream, layers, kv, index, cos_sin, decode_workspace: RefCell::new(None),
+                lane_workspaces: RefCell::new(Vec::new()), graphs: RefCell::new(std::collections::HashMap::new()),
+                l2: None })
+        })?;
+        self.peer = Some(peer);
+        self.exchange = Some(exchange);
+        Ok(())
+    }
+
+    fn peer(&self) -> Result<&GlmPeer<'a>> {
+        self.peer.as_ref().context("no head-split peer")
+    }
+
+    fn exchange(&self) -> Result<&PeerExchange<'a>> {
+        self.exchange.as_ref().context("no head-split exchange")
+    }
+
+    /// The stream of rank `rank`.
+    pub(crate) fn stream_of(&self, rank: usize) -> *mut c_void {
+        match (rank, &self.peer) {
+            (1, Some(peer)) => peer.stream,
+            _ => self.stream,
+        }
+    }
+
+    /// Runs `body` with rank `rank`'s device current (this engine's device again after).
+    pub(crate) fn on<T>(&self, rank: usize, body: impl FnOnce() -> Result<T>) -> Result<T> {
+        match (rank, &self.peer) {
+            (1, Some(peer)) => crate::shared::peer_split::on_device(self.library, peer.device, self.device, body),
+            _ => body(),
+        }
+    }
+
+    /// Receive slot `slot` of rank `rank`.
+    fn recv(&self, rank: usize, slot: usize) -> Result<*mut c_void> {
+        self.exchange()?.recv(rank, slot)
+    }
+
+    /// `name` (a `glm_*` program) for `layer`: its head-split share's (`glm2_*`) when split.
+    fn program(layer: &GlmLayer<'_>, name: &str) -> String {
+        match (layer.split, name.strip_prefix("glm_")) {
+            (true, Some(rest)) => format!("glm2_{rest}"),
+            _ => name.to_string(),
+        }
+    }
+
+    /// Launches `name` on rank `rank`'s stream.
+    fn run_on(&self, rank: usize, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
+        let names: Vec<&str> = pointers.iter().map(|(n, _)| *n).collect();
+        let program = self.programs.program(name, &names)?;
+        let raw: Vec<*mut c_void> = pointers.iter().map(|(_, p)| *p).collect();
+        // SAFETY: every pointer names a live allocation of rank `rank`'s GPU sized for
+        // the rows in `scalars`; that rank's stream orders all its launches.
+        self.on(rank, || unsafe { program.launch(&raw, scalars, self.stream_of(rank)) })
+            .with_context(|| format!("{name} with {scalars:?}"))
+    }
+
+    /// On rank `rank`: `h += bf16(first + second)` (`deltas` 2; the same operand
+    /// order on both GPUs of a head split), `h += first` (1) or nothing (0),
+    /// then `x = weight * RMSNorm(h)`.
+    #[allow(clippy::too_many_arguments)]
+    fn norm_full(&self, rank: usize, w: &Workspace<'_>, weight: *mut c_void, deltas: i32, rows: Scalar,
+        first: *mut c_void, second: *mut c_void) -> Result<()> {
+        self.run_on(rank, "glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", first), ("delta1", second),
+            ("weight", weight), ("out", w.x.buffer.ptr)], &[rows, Scalar::I32(deltas)])
     }
 
     /// Benchmarks: MoE layers skip the Spark exchange from now on.
@@ -294,12 +446,7 @@ impl<'a> GlmEngine<'a> {
     }
 
     fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
-        let names: Vec<&str> = pointers.iter().map(|(n, _)| *n).collect();
-        let program = self.programs.program(name, &names)?;
-        let raw: Vec<*mut c_void> = pointers.iter().map(|(_, p)| *p).collect();
-        // SAFETY: every pointer names a live allocation sized for the rows in
-        // `scalars`; the stream orders all launches of this engine.
-        unsafe { program.launch(&raw, scalars, self.stream) }.with_context(|| format!("{name} with {scalars:?}"))
+        self.run_on(0, name, pointers, scalars)
     }
 
     fn scratch(&self, name: &str) -> Result<usize> {
@@ -307,15 +454,31 @@ impl<'a> GlmEngine<'a> {
     }
 
     fn workspace(&self, t: usize, decode: bool) -> Result<Workspace<'a>> {
+        self.workspace_on(0, t, decode)
+    }
+
+    /// Rank `rank`'s workspace for steps of up to `t` rows (rank 1 has no
+    /// router, expert or head buffers), allocated on that rank's GPU.
+    fn workspace_on(&self, rank: usize, t: usize, decode: bool) -> Result<Workspace<'a>> {
+        self.on(rank, || self.workspace_here(rank, t, decode))
+    }
+
+    fn workspace_here(&self, rank: usize, t: usize, decode: bool) -> Result<Workspace<'a>> {
         let (h, heads) = (self.cfg.hidden, self.cfg.heads);
         let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
+        let lead = rank == 0;
+        let lead_only = |bytes: usize| if lead { bytes } else { 256 };
         let mut scratch = 0usize;
-        for name in [format!("glm_producer_{cap}"), format!("glm_index_producer_{cap}"),
-            format!("glm_sparse_mla_{mode}_{cap}"), format!("glm_o_{cap}"), format!("glm_ffn_i2048_{cap}"),
-            format!("glm_ffn_i12288_{cap}")] {
+        let split = self.weights.layers.first().is_some_and(|l| l.split);
+        let (moe, dense) = (self.cfg.moe_intermediate, self.cfg.dense_intermediate);
+        // A head split's layers (all of them) run its share's programs.
+        let (prefix, moe, dense) = if split { ("glm2", moe / 2, dense / 2) } else { ("glm", moe, dense) };
+        for name in [format!("glm_index_producer_{cap}"), format!("{prefix}_producer_{cap}"),
+            format!("{prefix}_sparse_mla_{mode}_{cap}"), format!("{prefix}_o_{cap}"), format!("{prefix}_ffn_i{moe}_{cap}"),
+            format!("{prefix}_ffn_i{dense}_{cap}")] {
             scratch = scratch.max(self.scratch(&name)?);
         }
-        let head_workspace = self.alloc(VOCABULARY_HEAD_WORKSPACE)?;
+        let head_workspace = self.alloc(if lead { VOCABULARY_HEAD_WORKSPACE } else { 256 })?;
         let topk = self.alloc(self.scratch(&format!("glm_index_topk_{mode}_{cap}"))?)?;
         self.library.cuda_zero_bytes(topk.buffer, topk.buffer.bytes)?;
         let lengths: Vec<i32> = vec![self.cfg.index_topk as i32; t];
@@ -339,19 +502,23 @@ impl<'a> GlmEngine<'a> {
             cache_lengths: self.alloc(t * 4)?,
             scratch: self.alloc(scratch)?,
             topk_scratch: topk,
-            logits: self.alloc(if decode || self.full_prefill_logits { t } else { t.min(DECODE_ROWS) }
-                * self.cfg.vocab_size * 4)?,
-            router_logits: self.alloc(t * self.cfg.experts * 4)?,
-            route_ids: self.alloc(t * self.cfg.topk * 4)?,
-            route_weights: self.alloc(t * self.cfg.topk * 4)?,
-            wire: self.alloc(t * (h + h / 32))?,
+            logits: self.alloc(lead_only(if decode || self.full_prefill_logits { t } else { t.min(DECODE_ROWS) }
+                * self.cfg.vocab_size * 4))?,
+            router_logits: self.alloc(lead_only(t * self.cfg.experts * 4))?,
+            route_ids: self.alloc(lead_only(t * self.cfg.topk * 4))?,
+            route_weights: self.alloc(lead_only(t * self.cfg.topk * 4))?,
+            wire: self.alloc(lead_only(t * (h + h / 32)))?,
             shared: self.alloc(t * h * 2)?,
-            router_host: RefCell::new(HostAllocation::new(self.library, t * (self.cfg.topk * 8 + h + h / 32))?),
+            router_host: RefCell::new(HostAllocation::new(self.library, lead_only(t * (self.cfg.topk * 8 + h + h / 32)))?),
             ids: self.alloc(t * 4)?,
             select: self.alloc(t * 8)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
-            head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, t as u32,
-                self.cfg.vocab_size as u32)? },
+            head: if lead {
+                Some(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, t as u32,
+                    self.cfg.vocab_size as u32)? })
+            } else {
+                None
+            },
             _head_workspace: head_workspace,
         })
     }
@@ -530,11 +697,13 @@ impl<'a> GlmEngine<'a> {
         ensure!(t <= w.rows && logit_rows <= t, "step exceeds the workspace");
         ensure!(tables.decode || self.full_prefill_logits || logit_rows <= DECODE_ROWS,
             "prefill logits past {DECODE_ROWS} rows need full_prefill_logits");
-        self.put(&w.positions, &tables.positions)?;
-        self.put(&w.slots, &tables.slots)?;
-        self.put(&w.page_table, &tables.page_table)?;
-        self.put(&w.cache_lengths, &tables.cache_lengths)?;
-        self.put(&w.lengths, &tables.lengths)?;
+        self.put_tables(w, tables)?;
+        // The head split's second GPU: its workspace of the same shape and the same tables.
+        let peer_workspaces = self.peer_workspaces(tables.decode, 1)?;
+        let w1 = peer_workspaces.as_ref().map(|p| p.get(0)).transpose()?;
+        if let Some(w1) = w1 {
+            self.peer_tables(w1, tables)?;
+        }
         ensure!(tokens.len() == t, "{} tokens for a {t}-row step", tokens.len());
         let rows = Scalar::I32(t as i32);
         let cap = if tables.decode { "m64" } else { "m4096" };
@@ -550,22 +719,45 @@ impl<'a> GlmEngine<'a> {
                 self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
             }
             let head = logit_rows == t;
-            self.decode_layers(w, tables, t, &mut experts, gather, head)?;
+            self.decode_layers(w, w1, tables, t, &mut experts, gather, head)?;
             if !head {
                 self.launch_head(w, t, logit_rows)?;
             }
             return Ok(Some(self.device_logits(w, logit_rows, head)));
         }
         self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
+        let bytes = t * h * 2;
+        if let Some(w1) = w1 {
+            // The embedded rows to the second GPU, which runs one layer ahead of the host's
+            // rank-0 work (all its inputs are pushes from rank 0).
+            self.exchange()?.push_to(0, DIRECT, w.h.buffer.ptr, w1.h.buffer.ptr, bytes)?;
+            self.peer_attention(0, 0, w1, rows, cap, tables, bytes)?;
+        }
         self.norm(w, &layers[0], "input_norm", 0, rows)?;
         for (index, layer) in layers.iter().enumerate() {
             self.attention(w, index, layer, rows, cap, tables)?;
             // h += attention; x = post_attention_layernorm(h)
-            self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
-                ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
-                &[rows, Scalar::I32(1)])?;
+            let (attended, ffn) = (slot(index, false, 0), slot(index, true, 0));
+            match w1 {
+                Some(w1) => {
+                    self.exchange()?.push(0, attended, w.delta.buffer.ptr, bytes)?;
+                    self.exchange()?.wait(0, attended)?;
+                    self.norm_full(0, w, layer.ptr("post_norm")?, 2, rows, w.delta.buffer.ptr, self.recv(0, attended)?)?;
+                    // Rank 1: this layer's FFN side, then the next layer's attention.
+                    self.peer_post(index, 0, w1, rows, bytes)?;
+                    if index + 1 < layers.len() {
+                        self.peer_attention(index + 1, 0, w1, rows, cap, tables, bytes)?;
+                    }
+                }
+                None => self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                    ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
+                    &[rows, Scalar::I32(1)])?,
+            }
             if layer.dense {
                 self.ffn(w, layer, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)?;
+                if w1.is_some() {
+                    self.exchange()?.push(0, ffn, w.delta.buffer.ptr, bytes)?;
+                }
             } else if let Some(skip) = &self.skip {
                 self.moe_front(w, layer, t)?;
                 let ranks = self.moe_skip(w, index, layer, t, cap)?;
@@ -575,14 +767,24 @@ impl<'a> GlmEngine<'a> {
                     .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
                 self.moe(w, index, layer, t, cap, tables.decode, transport, runtime)?;
             }
-            // h += ffn; x = next input_layernorm(h) (or the final norm).
+            // h += ffn; x = next input_layernorm(h) (or the final norm). Under a head split
+            // the FFN output is this GPU's partial plus rank 1's (dense), or the routed sum
+            // with this GPU's shared-expert half plus rank 1's half (sent to rank 1 first).
             let weight = match layers.get(index + 1) {
                 Some(next) => next.ptr("input_norm")?,
                 None => self.weights.norm.buffer.ptr,
             };
-            self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
-                ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
-                &[rows, Scalar::I32(1)])?;
+            if w1.is_some() {
+                if !layer.dense && index + 1 < layers.len() {
+                    self.exchange()?.push(0, ffn, w.delta.buffer.ptr, bytes)?;
+                }
+                self.exchange()?.wait(0, ffn)?;
+                self.norm_full(0, w, weight, 2, rows, w.delta.buffer.ptr, self.recv(0, ffn)?)?;
+            } else {
+                self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                    ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
+                    &[rows, Scalar::I32(1)])?;
+            }
             if let Some(drafter) = &self.drafter {
                 let n = t.min(super::dflash::TAP_ROWS);
                 drafter.tap(index, w.h.buffer.ptr, t - n, n)?;
@@ -605,9 +807,88 @@ impl<'a> GlmEngine<'a> {
         let h = self.cfg.hidden;
         // SAFETY: the final norm's output and the head operands are live buffers of these shapes.
         unsafe {
-            super::launch_head(self.library, &w.head, w.x.buffer.ptr.cast::<u8>().add((t - n) * h * 2).cast(),
+            super::launch_head(self.library, w.head.as_ref().context("LM head")?, w.x.buffer.ptr.cast::<u8>().add((t - n) * h * 2).cast(),
                 self.weights.head.buffer.ptr, w.logits.buffer.ptr.cast(), n, h, self.cfg.vocab_size, self.stream)
         }
+    }
+
+    /// Writes a step's tables into `w` (rank 0's).
+    fn put_tables(&self, w: &Workspace<'_>, tables: &StepTables) -> Result<()> {
+        self.put(&w.positions, &tables.positions)?;
+        self.put(&w.slots, &tables.slots)?;
+        self.put(&w.page_table, &tables.page_table)?;
+        self.put(&w.cache_lengths, &tables.cache_lengths)?;
+        self.put(&w.lengths, &tables.lengths)
+    }
+
+    /// Writes a step's tables into rank 1's `w1` after its stream drained (every wait
+    /// on it is matched by a push rank 0 queued earlier, so it drains).
+    fn peer_tables(&self, w1: &Workspace<'_>, tables: &StepTables) -> Result<()> {
+        // SAFETY: the engine owns the peer stream.
+        unsafe { self.library.cuda_stream_synchronize(self.stream_of(1))? };
+        self.on(1, || self.put_tables(w1, tables))
+    }
+
+    /// Rank 1's workspaces (the decode one, or `lanes` prefill lanes), created on first use.
+    fn peer_workspaces(&self, decode: bool, lanes: usize)
+        -> Result<Option<PeerWorkspaces<'_, 'a>>> {
+        let Some(peer) = &self.peer else { return Ok(None) };
+        if decode {
+            if peer.decode_workspace.borrow().is_none() {
+                *peer.decode_workspace.borrow_mut() = Some(self.workspace_on(1, DECODE_ROWS, true)?);
+            }
+            return Ok(Some(PeerWorkspaces::Decode(peer.decode_workspace.borrow())));
+        }
+        {
+            let mut slots = peer.lane_workspaces.borrow_mut();
+            while slots.len() < lanes {
+                slots.push(self.workspace_on(1, self.prefill_rows, false)?);
+            }
+        }
+        Ok(Some(PeerWorkspaces::Lanes(peer.lane_workspaces.borrow())))
+    }
+
+    /// Rank 1's attention half of unit (`index`, `lane`): (layer 0: the embedded
+    /// rows and input norm), its heads' attention, the attention all-reduce and
+    /// post-attention norm, then its dense-MLP partial or shared-expert half,
+    /// pushed to rank 0.
+    #[allow(clippy::too_many_arguments)]
+    fn peer_attention(&self, index: usize, lane: usize, w1: &Workspace<'_>, rows: Scalar, cap: &str,
+        tables: &StepTables, bytes: usize) -> Result<()> {
+        let peer = self.peer()?;
+        let (layer, exchange) = (&peer.layers[index], self.exchange()?);
+        if index == 0 {
+            exchange.wait(1, DIRECT)?;
+            self.norm_full(1, w1, layer.ptr("input_norm")?, 0, rows, w1.delta.buffer.ptr, w1.delta.buffer.ptr)?;
+        }
+        self.attention_on(1, w1, index, layer, rows, cap, tables)?;
+        let (attended, ffn) = (slot(index, false, lane), slot(index, true, lane));
+        exchange.push(1, attended, w1.delta.buffer.ptr, bytes)?;
+        exchange.wait(1, attended)?;
+        self.norm_full(1, w1, layer.ptr("post_norm")?, 2, rows, w1.delta.buffer.ptr, self.recv(1, attended)?)?;
+        if layer.dense {
+            self.ffn_on(1, w1, layer, self.cfg.dense_intermediate, cap, w1.delta.buffer.ptr, rows)?;
+            exchange.push(1, ffn, w1.delta.buffer.ptr, bytes)
+        } else {
+            self.ffn_on(1, w1, layer, self.cfg.moe_intermediate, cap, w1.shared.buffer.ptr, rows)?;
+            exchange.push(1, ffn, w1.shared.buffer.ptr, bytes)
+        }
+    }
+
+    /// Rank 1's FFN half of unit (`index`, `lane`): rank 0's dense partial or
+    /// routed + shared sum in, then the next layer's input norm (nothing after
+    /// the last layer). The norm adds the same two operands in the same order as
+    /// rank 0's.
+    fn peer_post(&self, index: usize, lane: usize, w1: &Workspace<'_>, rows: Scalar, bytes: usize) -> Result<()> {
+        let _ = bytes;
+        let peer = self.peer()?;
+        let Some(next) = peer.layers.get(index + 1) else { return Ok(()) };
+        let ffn = slot(index, true, lane);
+        self.exchange()?.wait(1, ffn)?;
+        let received = self.recv(1, ffn)?;
+        let (first, second) = if peer.layers[index].dense { (w1.delta.buffer.ptr, received) }
+            else { (received, w1.shared.buffer.ptr) };
+        self.norm_full(1, w1, next.ptr("input_norm")?, 2, rows, first, second)
     }
 
     /// `bytes` at `offset` inside `dev`.
@@ -644,10 +925,16 @@ impl<'a> GlmEngine<'a> {
     /// layer's reduce + residual norm, this layer's attention and
     /// post-attention norm, and the dense FFN or the MoE front (router,
     /// select, wire rows); the Spark exchange runs between segments.
-    fn decode_layers(&self, w: &Workspace<'_>, tables: &StepTables, t: usize,
+    ///
+    /// Under a head split each segment exchanges with rank 1's segment of the
+    /// same layer (captured on rank 1's stream); rank 1's next segment is
+    /// queued before the host waits in this layer's Spark exchange.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_layers(&self, w: &Workspace<'_>, w1: Option<&Workspace<'_>>, tables: &StepTables, t: usize,
         experts: &mut Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>, gather: bool, head: bool) -> Result<()> {
         let rows = Scalar::I32(t as i32);
         let layers = &self.weights.layers;
+        let bytes = t * self.cfg.hidden * 2;
         // The decode transport's intake planes (or the skip intake's); the
         // replayed graphs bake them in.
         let planes = match (experts.as_ref(), &self.skip) {
@@ -665,6 +952,9 @@ impl<'a> GlmEngine<'a> {
                     unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, 1, std::ptr::null(),
                         w.h.buffer.ptr, self.stream)? };
                 }
+                if let (0, Some(w1)) = (index, w1) {
+                    self.exchange()?.push_to(0, DIRECT, w.h.buffer.ptr, w1.h.buffer.ptr, bytes)?;
+                }
                 if let Previous::Planes(ranks) = previous {
                     self.reduce(planes, w, ranks, t)?;
                 }
@@ -672,10 +962,24 @@ impl<'a> GlmEngine<'a> {
                     Some(layer) => layer.ptr("input_norm")?,
                     None => self.weights.norm.buffer.ptr,
                 };
-                let deltas = if matches!(previous, Previous::First) { 0 } else { 1 };
-                self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
-                    ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
-                    &[rows, Scalar::I32(deltas)])?;
+                match (w1, previous, index.checked_sub(1)) {
+                    // Rank 1's partial (dense) or shared-expert half in; this GPU's routed +
+                    // shared sum out first (rank 1 needs it; not after the last layer).
+                    (Some(_), Previous::Delta | Previous::Planes(_), Some(before)) => {
+                        let ffn = slot(before, true, 0);
+                        if matches!(previous, Previous::Planes(_)) && layer.is_some() {
+                            self.exchange()?.push(0, ffn, w.delta.buffer.ptr, bytes)?;
+                        }
+                        self.exchange()?.wait(0, ffn)?;
+                        self.norm_full(0, w, weight, 2, rows, w.delta.buffer.ptr, self.recv(0, ffn)?)?;
+                    }
+                    _ => {
+                        let deltas = if matches!(previous, Previous::First) { 0 } else { 1 };
+                        self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                            ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
+                            &[rows, Scalar::I32(deltas)])?;
+                    }
+                }
                 // `h` now holds the previous layer's output.
                 if let (Some(drafter), Some(previous)) = (&self.drafter, index.checked_sub(1)) {
                     drafter.tap(previous, w.h.buffer.ptr, 0, t)?;
@@ -688,18 +992,44 @@ impl<'a> GlmEngine<'a> {
                     return Ok(());
                 };
                 self.attention(w, index, layer, rows, "m64", tables)?;
-                self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
-                    ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
-                    &[rows, Scalar::I32(1)])?;
+                if w1.is_some() {
+                    let attended = slot(index, false, 0);
+                    self.exchange()?.push(0, attended, w.delta.buffer.ptr, bytes)?;
+                    self.exchange()?.wait(0, attended)?;
+                    self.norm_full(0, w, layer.ptr("post_norm")?, 2, rows, w.delta.buffer.ptr, self.recv(0, attended)?)?;
+                } else {
+                    self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                        ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
+                        &[rows, Scalar::I32(1)])?;
+                }
                 if layer.dense {
-                    self.ffn(w, layer, self.cfg.dense_intermediate, "m64", w.delta.buffer.ptr, rows)
+                    self.ffn(w, layer, self.cfg.dense_intermediate, "m64", w.delta.buffer.ptr, rows)?;
+                    if w1.is_some() {
+                        self.exchange()?.push(0, slot(index, true, 0), w.delta.buffer.ptr, bytes)?;
+                    }
+                    Ok(())
                 } else {
                     self.moe_front(w, layer, t)
                 }
             };
             let key = GraphKey { layer: index, rows: t, table_width: tables.table_width,
                 table_stride: tables.table_stride, previous, head: head && layer.is_none() };
-            self.replay(key, segment)?;
+            self.replay_on(0, key, segment)?;
+            if let Some(w1) = w1 {
+                // Rank 1's segments: layer 0 with rank 0's first, then each next one before
+                // the host waits in this layer's exchange.
+                if index == 0 {
+                    self.peer_segment(0, Previous::First, w1, t, tables, bytes)?;
+                }
+                if let Some(layer) = layer.filter(|_| index + 1 < layers.len()) {
+                    let kind = if layer.dense { Previous::Delta } else { Previous::Planes(0) };
+                    // Rank 1's next weights into L2 while rank 0 waits in this layer's exchange.
+                    if let (false, Some(l2)) = (layer.dense, self.peer()?.l2.as_ref()) {
+                        self.on(1, || l2.issue(self.library, index, self.stream_of(1)))?;
+                    }
+                    self.peer_segment(index + 1, kind, w1, t, tables, bytes)?;
+                }
+            }
             previous = match layer {
                 None => break,
                 Some(layer) if layer.dense => Previous::Delta,
@@ -714,21 +1044,71 @@ impl<'a> GlmEngine<'a> {
         Ok(())
     }
 
+    /// Rank 1's decode segment of layer `index` (see [`Self::decode_layers`]):
+    /// the previous layer's FFN exchange (rank 0's dense partial or routed +
+    /// shared sum in) and this layer's input norm, its heads' attention and the
+    /// attention all-reduce, then its dense partial or shared-expert half out.
+    fn peer_segment(&self, index: usize, previous: Previous, w1: &Workspace<'_>, t: usize, tables: &StepTables,
+        bytes: usize) -> Result<()> {
+        let peer = self.peer()?;
+        let rows = Scalar::I32(t as i32);
+        let segment = || -> Result<()> {
+            let exchange = self.exchange()?;
+            let layer = &peer.layers[index];
+            match (previous, index.checked_sub(1)) {
+                (Previous::Delta | Previous::Planes(_), Some(before)) => {
+                    let ffn = slot(before, true, 0);
+                    exchange.wait(1, ffn)?;
+                    let received = self.recv(1, ffn)?;
+                    let (first, second) = if matches!(previous, Previous::Delta) { (w1.delta.buffer.ptr, received) }
+                        else { (received, w1.shared.buffer.ptr) };
+                    self.norm_full(1, w1, layer.ptr("input_norm")?, 2, rows, first, second)?;
+                }
+                _ => {
+                    exchange.wait(1, DIRECT)?;
+                    self.norm_full(1, w1, layer.ptr("input_norm")?, 0, rows, w1.delta.buffer.ptr, w1.delta.buffer.ptr)?;
+                }
+            }
+            self.attention_on(1, w1, index, layer, rows, "m64", tables)?;
+            let (attended, ffn) = (slot(index, false, 0), slot(index, true, 0));
+            exchange.push(1, attended, w1.delta.buffer.ptr, bytes)?;
+            exchange.wait(1, attended)?;
+            self.norm_full(1, w1, layer.ptr("post_norm")?, 2, rows, w1.delta.buffer.ptr, self.recv(1, attended)?)?;
+            let out = if layer.dense { w1.delta.buffer.ptr } else { w1.shared.buffer.ptr };
+            let intermediate = if layer.dense { self.cfg.dense_intermediate } else { self.cfg.moe_intermediate };
+            self.ffn_on(1, w1, layer, intermediate, "m64", out, rows)?;
+            exchange.push(1, ffn, out, bytes)
+        };
+        let key = GraphKey { layer: index, rows: t, table_width: tables.table_width, table_stride: tables.table_stride,
+            previous, head: false };
+        self.replay_on(1, key, segment)
+    }
+
     /// Launches `segment` through a graph captured the first time `key` is seen.
     fn replay(&self, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
-        if let Some(graph) = self.graphs.borrow().get(&key) {
-            // SAFETY: the graph's pointers are persistent engine buffers.
-            return unsafe { self.library.cuda_graph_launch(graph.0, self.stream) };
+        self.replay_on(0, key, segment)
+    }
+
+    /// [`Self::replay`] on rank `rank`'s stream (its own graphs).
+    fn replay_on(&self, rank: usize, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+        let graphs = match (rank, &self.peer) {
+            (1, Some(peer)) => &peer.graphs,
+            _ => &self.graphs,
+        };
+        let stream = self.stream_of(rank);
+        if let Some(graph) = graphs.borrow().get(&key) {
+            // SAFETY: the graph's pointers are persistent engine buffers of that rank.
+            return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
         }
-        // SAFETY: capture records launches on the engine stream; nothing in the
+        // SAFETY: capture records launches on that rank's stream; nothing in the
         // segment synchronizes the host.
-        unsafe { self.library.cuda_graph_begin_capture(self.stream)? };
+        self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
         let captured = segment();
-        let exec = unsafe { self.library.cuda_graph_end_capture(self.stream) };
+        let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
         captured?;
         let exec = exec?;
-        unsafe { self.library.cuda_graph_launch(exec, self.stream)? };
-        self.graphs.borrow_mut().insert(key, GraphExec(exec, self.library));
+        self.on(rank, || unsafe { self.library.cuda_graph_launch(exec, stream) })?;
+        graphs.borrow_mut().insert(key, GraphExec(exec, self.library));
         Ok(())
     }
 
@@ -737,13 +1117,31 @@ impl<'a> GlmEngine<'a> {
     /// their scales), post-attention norm, router and shared expert (or dense
     /// MLP); after the last layer the final norm and head.
     pub fn decode_read_order(&self) -> Vec<Vec<crate::shared::l2_prefetch::Range>> {
-        let layers = &self.weights.layers;
+        self.decode_read_order_on(0)
+    }
+
+    /// Rank 1's L2 prefetch (its shares of the next layer's weights) with `budget`
+    /// bytes per layer, issued between its decode segments.
+    pub fn attach_peer_l2(&mut self, budget: usize) -> Result<()> {
+        let order = self.decode_read_order_on(1);
+        let l2 = self.on(1, || crate::shared::l2_prefetch::L2Prefetch::new(self.library, budget, &order))?;
+        self.peer.as_mut().context("no head-split peer")?.l2 = Some(l2);
+        Ok(())
+    }
+
+    /// [`Self::decode_read_order`] of rank `rank`'s shares (rank 1 reads no head).
+    fn decode_read_order_on(&self, rank: usize) -> Vec<Vec<crate::shared::l2_prefetch::Range>> {
+        let layers = match (rank, &self.peer) {
+            (1, Some(peer)) => &peer.layers,
+            _ => &self.weights.layers,
+        };
         (0..layers.len()).map(|i| match layers.get(i + 1) {
             Some(next) => crate::shared::l2_prefetch::operands(&["input_norm", "w_qkv_a_fp8", "w_qkv_a_scale",
                 "q_a_norm", "kv_a_norm", "w_q_b_fp8", "w_q_b_scale", "w_iq_fp8", "w_iq_scale", "w_ik", "k_norm_w",
                 "k_norm_b", "w_uk_fp8", "w_uk_scale", "w_uv_fp8", "w_uv_scale", "w_o_fp8", "w_o_scale", "post_norm",
                 "gate", "gate.bias", "w_gate_up_fp8", "w_gate_up_scale", "w_down_fp8", "w_down_scale"],
                 |n| next.range(n)),
+            None if rank == 1 => Vec::new(),
             None => [&self.weights.norm, &self.weights.head].iter()
                 .map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes)).collect(),
         }).collect()
@@ -943,16 +1341,40 @@ impl<'a> GlmEngine<'a> {
         for ((tables, tokens), w) in lanes.iter().zip(chunks).zip(&workspaces) {
             ensure!(tables.positions.len() <= w.rows && tokens.len() == tables.positions.len(),
                 "lane exceeds its workspace");
-            self.put(&w.positions, &tables.positions)?;
-            self.put(&w.slots, &tables.slots)?;
-            self.put(&w.page_table, &tables.page_table)?;
-            self.put(&w.cache_lengths, &tables.cache_lengths)?;
-            self.put(&w.lengths, &tables.lengths)?;
+            self.put_tables(w, tables)?;
             self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
         }
         let layers = &self.weights.layers;
         let cap = "m4096";
         let rows_of = |lane: usize| Scalar::I32(counts[lane] as i32);
+        let bytes_of_lane = |lane: usize| counts[lane] * self.cfg.hidden * 2;
+        // The head split's second GPU: each lane's tables and embedded rows, then every
+        // lane's layer-0 attention (rank 1 runs a unit ahead of the host's rank-0 work).
+        let peer_workspaces = self.peer_workspaces(false, lanes.len())?;
+        let split = peer_workspaces.is_some();
+        if let Some(peers) = &peer_workspaces {
+            // SAFETY: the engine owns the peer stream; drained before its tables are rewritten.
+            unsafe { self.library.cuda_stream_synchronize(self.stream_of(1))? };
+            for (lane, (tables, w)) in lanes.iter().zip(&workspaces).enumerate() {
+                let w1 = peers.get(lane)?;
+                self.on(1, || self.put_tables(w1, tables))?;
+                self.exchange()?.push_to(0, DIRECT, w.h.buffer.ptr, w1.h.buffer.ptr, bytes_of_lane(lane))?;
+            }
+            for (lane, tables) in lanes.iter().enumerate() {
+                self.peer_attention(0, lane, peers.get(lane)?, rows_of(lane), cap, tables, bytes_of_lane(lane))?;
+            }
+        }
+        // After rank 0 queued unit (index, lane)'s FFN: rank 1's FFN exchange of that unit
+        // and its lane's next attention.
+        let peer_next = |(index, lane): (usize, usize)| -> Result<()> {
+            let Some(peers) = &peer_workspaces else { return Ok(()) };
+            let w1 = peers.get(lane)?;
+            self.peer_post(index, lane, w1, rows_of(lane), bytes_of_lane(lane))?;
+            if index + 1 < layers.len() {
+                self.peer_attention(index + 1, lane, w1, rows_of(lane), cap, &lanes[lane], bytes_of_lane(lane))?;
+            }
+            Ok(())
+        };
         // The drafter taps the chunk's last TAP_ROWS rows: each lane's part of
         // that window, at its offset among the tap rows.
         let window = total - total.min(super::dflash::TAP_ROWS);
@@ -962,11 +1384,22 @@ impl<'a> GlmEngine<'a> {
                 self.norm(w, layer, "input_norm", 0, rows)?;
             }
             self.attention(w, index, layer, rows, cap, &lanes[lane])?;
-            self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
-                ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
-                &[rows, Scalar::I32(1)])?;
+            if split {
+                let attended = slot(index, false, lane);
+                self.exchange()?.push(0, attended, w.delta.buffer.ptr, bytes_of_lane(lane))?;
+                self.exchange()?.wait(0, attended)?;
+                self.norm_full(0, w, layer.ptr("post_norm")?, 2, rows, w.delta.buffer.ptr, self.recv(0, attended)?)?;
+            } else {
+                self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                    ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
+                    &[rows, Scalar::I32(1)])?;
+            }
             if layer.dense {
-                self.ffn(w, layer, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)
+                self.ffn(w, layer, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)?;
+                if split {
+                    self.exchange()?.push(0, slot(index, true, lane), w.delta.buffer.ptr, bytes_of_lane(lane))?;
+                }
+                Ok(())
             } else {
                 self.moe_front(w, layer, counts[lane])
             }
@@ -981,9 +1414,20 @@ impl<'a> GlmEngine<'a> {
                 Some(next) => next.ptr("input_norm")?,
                 None => self.weights.norm.buffer.ptr,
             };
-            self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
-                ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
-                &[rows, Scalar::I32(1)])?;
+            if split {
+                // Rank 1's dense partial or shared-expert half in; the routed + shared sum out
+                // first (not after the last layer).
+                let ffn = slot(index, true, lane);
+                if ranks.is_some() && index + 1 < layers.len() {
+                    self.exchange()?.push(0, ffn, w.delta.buffer.ptr, bytes_of_lane(lane))?;
+                }
+                self.exchange()?.wait(0, ffn)?;
+                self.norm_full(0, w, weight, 2, rows, w.delta.buffer.ptr, self.recv(0, ffn)?)?;
+            } else {
+                self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                    ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
+                    &[rows, Scalar::I32(1)])?;
+            }
             if let Some(drafter) = &self.drafter {
                 let begin = starts[lane];
                 let from = begin.max(window);
@@ -1008,10 +1452,12 @@ impl<'a> GlmEngine<'a> {
         for (position, &unit) in units.iter().enumerate() {
             let (index, lane) = unit;
             if layers[index].dense {
+                peer_next(unit)?;
                 post(unit, None)?;
             } else {
                 self.moe_stage(workspaces[lane], &layers[index], counts[lane], cap)?;
                 self.lane_send(workspaces[lane], index, counts[lane], &mut transports[lane])?;
+                peer_next(unit)?;
                 inflight.push_back(unit);
             }
             match units.get(position + 1).copied() {
@@ -1072,10 +1518,23 @@ impl<'a> GlmEngine<'a> {
 
     fn attention(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, rows: Scalar, cap: &str,
         tables: &StepTables) -> Result<()> {
+        self.attention_on(0, w, index, layer, rows, cap, tables)
+    }
+
+    /// Layer `index`'s attention on rank `rank` into `delta`: under a head split
+    /// that rank's heads (the replicated latent record and DSA indexer, its
+    /// heads' sparse MLA, W_UV and a partial o_proj sum).
+    #[allow(clippy::too_many_arguments)]
+    fn attention_on(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, rows: Scalar,
+        cap: &str, tables: &StepTables) -> Result<()> {
         let mode = if tables.decode { "decode" } else { "prefill" };
-        let kv = &self.kv[index];
+        let (kv, index_cache, cos_sin) = match (rank, &self.peer) {
+            (1, Some(peer)) => (&peer.kv[index], &peer.index[index], &peer.cos_sin),
+            _ => (&self.kv[index], &self.index[index], &self.cos_sin),
+        };
+        let heads = self.cfg.heads / if layer.split { 2 } else { 1 };
         let mut producer = vec![("x", w.x.buffer.ptr), ("positions", w.positions.buffer.ptr),
-            ("kv_slots", w.slots.buffer.ptr), ("cos_sin", self.cos_sin.buffer.ptr)];
+            ("kv_slots", w.slots.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr)];
         producer.extend(weight(layer, "w_qkv_a", cap)?);
         producer.extend([("q_a_norm", layer.ptr("q_a_norm")?), ("kv_a_norm", layer.ptr("kv_a_norm")?)]);
         producer.extend(weight(layer, "w_q_b", cap)?);
@@ -1083,18 +1542,18 @@ impl<'a> GlmEngine<'a> {
         producer.extend([("kv_cache", kv.buffer.ptr), ("query", w.query.buffer.ptr),
             ("q_resid", w.q_resid.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
         let scalars = self.projection_scalars(rows, cap);
-        self.run(&format!("glm_producer_{cap}"), &producer, &scalars)?;
-        if let Some(index_cache) = &self.index[index] {
+        self.run_on(rank, &Self::program(layer, &format!("glm_producer_{cap}")), &producer, &scalars)?;
+        if let Some(index_cache) = index_cache {
             let mut pointers = vec![("x", w.x.buffer.ptr), ("q_resid", w.q_resid.buffer.ptr),
                 ("positions", w.positions.buffer.ptr), ("index_slots", w.slots.buffer.ptr),
-                ("cos_sin", self.cos_sin.buffer.ptr)];
+                ("cos_sin", cos_sin.buffer.ptr)];
             pointers.extend(weight(layer, "w_iq", cap)?);
             pointers.extend([("w_ik", layer.ptr("w_ik")?), ("k_norm_w", layer.ptr("k_norm_w")?),
                 ("k_norm_b", layer.ptr("k_norm_b")?), ("index_cache", index_cache.buffer.ptr),
                 ("q_fp8", w.q_fp8.buffer.ptr), ("head_weights", w.head_weights.buffer.ptr),
                 ("scratch", w.scratch.buffer.ptr)]);
-            self.run(&format!("glm_index_producer_{cap}"), &pointers, &scalars)?;
-            self.run(&format!("glm_index_topk_{mode}_{cap}"), &[
+            self.run_on(rank, &format!("glm_index_producer_{cap}"), &pointers, &scalars)?;
+            self.run_on(rank, &format!("glm_index_topk_{mode}_{cap}"), &[
                 ("q_fp8", w.q_fp8.buffer.ptr), ("weights", w.head_weights.buffer.ptr),
                 ("index_k_cache", index_cache.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
                 ("cache_lengths", w.cache_lengths.buffer.ptr), ("output_indices", w.indices.buffer.ptr),
@@ -1105,14 +1564,14 @@ impl<'a> GlmEngine<'a> {
         if !tables.decode && native_mla_prefill() {
             let scale = ((self.cfg.qk_nope_head_dim + self.cfg.qk_rope_head_dim) as f32).powf(-0.5);
             // SAFETY: query, cache, indices, lengths and the attention output are
-            // live buffers of the step's rows on the engine stream.
-            unsafe {
+            // live buffers of the step's rows on this rank's stream.
+            self.on(rank, || unsafe {
                 self.library.glm_mla_prefill(w.query.buffer.ptr, kv.buffer.ptr, w.indices.buffer.ptr,
-                    w.lengths.buffer.ptr, w.attn.buffer.ptr, tables.positions.len(), self.cfg.heads,
-                    self.cfg.index_topk, 656, scale * std::f32::consts::LOG2_E, self.stream)?;
-            }
+                    w.lengths.buffer.ptr, w.attn.buffer.ptr, tables.positions.len(), heads,
+                    self.cfg.index_topk, 656, scale * std::f32::consts::LOG2_E, self.stream_of(rank))
+            })?;
         } else {
-            self.run(&format!("glm_sparse_mla_{mode}_{cap}"), &[
+            self.run_on(rank, &Self::program(layer, &format!("glm_sparse_mla_{mode}_{cap}")), &[
                 ("q", w.query.buffer.ptr), ("kv_cache", kv.buffer.ptr), ("indices", w.indices.buffer.ptr),
                 ("lengths", w.lengths.buffer.ptr), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
                 &[rows])?;
@@ -1121,7 +1580,7 @@ impl<'a> GlmEngine<'a> {
         o.extend(weight(layer, "w_uv", cap)?);
         o.extend(weight(layer, "w_o", cap)?);
         o.extend([("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
-        self.run(&format!("glm_o_{cap}"), &o, &scalars)
+        self.run_on(rank, &Self::program(layer, &format!("glm_o_{cap}")), &o, &scalars)
     }
 
     /// Scalars of the programs over FP8 weights: `rows`, plus the prefill
@@ -1137,11 +1596,21 @@ impl<'a> GlmEngine<'a> {
     /// SwiGLU MLP (dense layers, or the shared expert) into `out`.
     fn ffn(&self, w: &Workspace<'_>, layer: &GlmLayer<'_>, intermediate: usize, cap: &str, out: *mut c_void,
         rows: Scalar) -> Result<()> {
+        self.ffn_on(0, w, layer, intermediate, cap, out, rows)
+    }
+
+    /// [`Self::ffn`] on rank `rank`; a head-split layer runs its slice of the
+    /// `intermediate` (a partial sum).
+    #[allow(clippy::too_many_arguments)]
+    fn ffn_on(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, intermediate: usize, cap: &str,
+        out: *mut c_void, rows: Scalar) -> Result<()> {
+        let intermediate = intermediate / if layer.split { 2 } else { 1 };
         let mut pointers = vec![("x", w.x.buffer.ptr)];
         pointers.extend(weight(layer, "w_gate_up", cap)?);
         pointers.extend(weight(layer, "w_down", cap)?);
         pointers.extend([("out", out), ("scratch", w.scratch.buffer.ptr)]);
-        self.run(&format!("glm_ffn_i{intermediate}_{cap}"), &pointers, &self.projection_scalars(rows, cap))
+        self.run_on(rank, &Self::program(layer, &format!("glm_ffn_i{intermediate}_{cap}")), &pointers,
+            &self.projection_scalars(rows, cap))
     }
 }
 

@@ -27,6 +27,13 @@ pub(crate) struct EngineArgs {
     pub manifest: PathBuf,
     #[arg(long, default_value_t = 0)]
     pub device: i32,
+    /// Split every layer's attention heads (q_b, kv_b, o_proj; 32 of 64 each)
+    /// and the dense / shared-expert MLPs over --device and this second GPU,
+    /// with the small latent projection, latent cache and DSA indexer
+    /// replicated; the partial sums meet over peer memory. Router, routed
+    /// experts, LM head and drafter stay on --device.
+    #[arg(long)]
+    pub split_device: Option<i32>,
     /// Run only the first N layers (dense layers need no experts).
     #[arg(long)]
     pub layers: Option<usize>,
@@ -202,20 +209,39 @@ impl Opened {
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.load_all()?;
         let stream = self.library.cuda_stream_create()?;
+        // The head split's second GPU and its stream (load kernels, then the engine's).
+        let peer_stream = match args.split_device {
+            Some(device) => {
+                ensure!(device != args.device, "--split-device must differ from --device");
+                self.library.cuda_enable_peer(device)?;
+                self.library.cuda_set_device(device)?;
+                let stream = self.library.cuda_enable_peer(args.device).and_then(|()| self.library.cuda_stream_create());
+                self.library.cuda_set_device(args.device)?;
+                Some((device, stream?))
+            }
+            None => None,
+        };
         let draft_file = args.draft.as_deref().map(dflash::prefetch);
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
-        let loader = weights::GlmLoader { library: &self.library, catalog: &self.catalog, stream };
-        let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
+        let loader = weights::GlmLoader { library: &self.library, catalog: &self.catalog, stream, device: args.device,
+            peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
+                .collect() };
+        let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
             args.token_io.embed_placement, || loader.model(&self.cfg, layers))?;
         let bytes: usize = model.layers.iter().map(|l| l.bytes()).sum::<usize>() + model.norm.buffer.bytes
             + model.head.buffer.bytes;
+        let peer_bytes: usize = shares.iter().flatten().map(|l| l.bytes()).sum();
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64,
-            gib = format!("{:.2}", bytes as f64 / (1u64 << 30) as f64), "GLM coordinator weights resident");
+            gib = format!("{:.2}", bytes as f64 / (1u64 << 30) as f64),
+            split_gib = format!("{:.2}", peer_bytes as f64 / (1u64 << 30) as f64), "GLM coordinator weights resident");
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages, embedding)?;
         engine.full_prefill_logits = args.full_prefill_logits;
+        if let Some((device, stream)) = peer_stream {
+            engine.attach_peer(device, stream, shares.pop().context("head-split shares")?)?;
+        }
         engine.prefill_w8a8 = !args.prefill_w8a16;
         if args.skip_routed_experts {
             engine.skip_routed_experts()?;
@@ -301,12 +327,23 @@ impl Opened {
         *engine.lanes.borrow_mut() = lanes;
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::GLM_DEFAULT)? {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
+            if engine.ranks() > 1 {
+                engine.attach_peer_l2(budget)?;
+            }
         }
         let result = body(&engine, transport.as_mut(), &runtime);
         drop(engine);
         drop(transport);
-        // SAFETY: the engine that used the stream is gone.
-        unsafe { self.library.cuda_stream_destroy(stream)? };
+        // SAFETY: the engine that used the streams is gone.
+        unsafe {
+            self.library.cuda_stream_destroy(stream)?;
+            if let Some((device, stream)) = peer_stream {
+                self.library.cuda_set_device(device)?;
+                let destroyed = self.library.cuda_stream_destroy(stream);
+                self.library.cuda_set_device(args.device)?;
+                destroyed?;
+            }
+        }
         result
     }
 }

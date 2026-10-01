@@ -334,7 +334,16 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs)
     let entries = args.prefix_cache_entries;
     let family = GlmPrefix::new(engine, args.prefix_partial == Toggle::On)?;
     let template = engine.paged_buffers().first().map(|b| b.0).context("GLM has no layers")?;
-    let host = args.host_tier(engine.library, template, 1)?;
+    // The pinned host tier copies through one GPU's copy engine; a head split keeps its
+    // (replicated) pages on both GPUs, so it keeps device-resident snapshots only.
+    let host = if engine.ranks() > 1 {
+        if args.host_cache_bytes > 0 && args.prefix_cache_entries > 0 {
+            tracing::warn!("GLM head split: the prefix cache's host tier is off (device-resident snapshots only)");
+        }
+        None
+    } else {
+        args.host_tier(engine.library, template, 1)?
+    };
     let layout = family.layout();
     let config = PrefixConfig { entries, mark_slots: 0, keep_logits: true, min_tokens: args.prefix_cache_min_tokens };
     let cache = PrefixCache::new(layout, config, host)?;

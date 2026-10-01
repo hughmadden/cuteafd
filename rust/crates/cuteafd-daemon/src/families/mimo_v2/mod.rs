@@ -236,7 +236,7 @@ impl Opened {
         let loader = weights::MimoLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
             checkpoint_tp: cuteafd_loader::families::mimo_v2::checkpoint_tp(&args.snapshot)?, fp8_decode: args.fp8_decode,
             fp8_head: args.fp8_head, fp8_o_proj: args.fp8_o_proj, fp8_scales: args.fp8_scales, device: args.device,
-            peers: peer_stream.iter().map(|&(device, stream)| weights::RankDevice { device, stream }).collect() };
+            peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream }).collect() };
         let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
             args.token_io.embed_placement, || loader.model(&self.cfg, layers))?;
         let mtp = if args.mtp > 0 {
