@@ -191,7 +191,7 @@ pub(super) fn spec_decode(args: &GoldenArgs, opened: &Opened, engine: &Qwen4Engi
         accepted += kept - 1;
         let timer = Instant::now();
         speculate::accept(engine, &mut [Verified { placement: &mut placement, seq: &mut seq, start, history,
-            rows: &rows, first_row: 0, kept: Some((kept, after)) }], spec, true)?;
+            rows: &rows, first_row: 0, kept: Some((kept, after)), finished: false }], spec, true)?;
         // SAFETY: the engine owns this stream.
         unsafe { opened.library.cuda_stream_synchronize(engine.stream)? };
         commit_s += timer.elapsed().as_secs_f64();
