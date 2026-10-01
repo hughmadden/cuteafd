@@ -40,6 +40,7 @@ def _run(repo: Path, hf: Path, *args: str) -> subprocess.CompletedProcess[str]:
 def test_glm_flash_config_goes_to_run_family(tmp_path: Path) -> None:
     repo, hf = _repo(tmp_path), tmp_path / "hf"
     _snapshot(hf, "zai-org/GLM-5.3-Flash", {"model_type": "glm5_next", "num_hidden_layers": 45,
+                                           "layer_types": ["linear_attention"] * 45,
                                            "mlp_layer_types": ["dense"] * 3 + ["sparse"] * 42})
     (repo / "glmf.config").write_text("MODEL_ID=zai-org/GLM-5.3-Flash\nDRAFT_MODEL_ID=incoai/x\n")
     result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--restart")
@@ -55,10 +56,12 @@ def test_family_table_names_every_launchable_family() -> None:
     cases = {
         "deepseek_v41": {"model_type": "deepseek_v41"},
         "deepseek_v4": {"model_type": "deepseek_v4"},
-        "glm5": {"model_type": "glm_moe_dsa", "first_k_dense_replace": 3},
-        "glm5_flash": {"model_type": "glm5_next", "num_hidden_layers": 45, "mlp_layer_types": ["sparse"]},
-        "mimo_v2": {"model_type": "mimo_v2_flash", "moe_layer_freq": [0, 1]},
-        "qwen4": {"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 48}},
+        "glm5": {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3},
+        "glm5_flash": {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+                       "layer_types": ["linear_attention", "deepseek_sparse_attention"]},
+        "mimo_v2": {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
+        "qwen4": {"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
+                                                             "layer_types": ["linear_attention", "full_attention"]}},
     }
     for family, config in cases.items():
         path = Path(os.environ.get("TMPDIR", "/tmp")) / f"family-{os.getpid()}-{family}.json"
@@ -68,6 +71,19 @@ def test_family_table_names_every_launchable_family() -> None:
         finally:
             path.unlink()
         assert out.stdout.split()[0] == family
+
+
+def test_family_table_matches_the_rust_launch_fixtures(tmp_path: Path) -> None:
+    """checkpoint-family.py and cuteafd-loader plan::launch read the same cases the
+    same way (both spellings, exact pattern lengths, agreement)."""
+    table = ROOT / "scripts" / "lib" / "checkpoint-family.py"
+    fixtures = ROOT / "rust" / "crates" / "cuteafd-loader" / "tests" / "fixtures" / "launch-families.json"
+    for case in json.loads(fixtures.read_text()):
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps(case["config"]))
+        out = subprocess.run(["python3", str(table), str(path)], capture_output=True, text=True)
+        got = out.stdout.strip() if out.returncode == 0 else None
+        assert got == case["line"], (case["name"], out.stderr)
 
 
 def _family_launch_lines(tmp_path: Path, family_config: dict, model: str, keys: str) -> str:
@@ -97,7 +113,7 @@ def _family_launch_lines(tmp_path: Path, family_config: dict, model: str, keys: 
 
 
 def test_speculator_and_its_pre_rename_keys_launch_the_same(tmp_path: Path) -> None:
-    config = {"model_type": "mimo_v2_flash", "moe_layer_freq": [0, 1, 1]}
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 3, "moe_layer_freq": [0, 1, 1]}
     new = _family_launch_lines(tmp_path / "a", config, "XiaomiMiMo/MiMo-V2-Flash", "SPECULATOR=mtp\nSPECULATOR_DEPTH=2\n")
     old = _family_launch_lines(tmp_path / "b", config, "XiaomiMiMo/MiMo-V2-Flash", "MTP=2\n")
     launch = lambda text: [l for l in text.splitlines() if "cuteafd serve-mimo" in l]

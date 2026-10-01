@@ -55,16 +55,32 @@ impl GlmNextConfig {
         };
         let layers = int(v, "num_hidden_layers")?;
         let types = v["layer_types"].as_array().context("glm5_next config lacks layer_types")?;
-        let attention = types.iter().take(layers).map(|t| match t.as_str() {
+        ensure!(types.len() == layers, "layer_types has {} entries for {layers} layers", types.len());
+        let attention = types.iter().map(|t| match t.as_str() {
             Some("linear_attention") => Ok(GlmNextAttention::Kda),
             Some("deepseek_sparse_attention") => Ok(GlmNextAttention::Mla),
             other => anyhow::bail!("unknown glm5_next layer type {other:?}"),
         }).collect::<Result<Vec<_>>>()?;
-        let dense: Vec<bool> = match v["mlp_layer_types"].as_array() {
-            Some(types) => types.iter().take(layers).map(|t| t == "dense").collect(),
-            None => (0..layers).map(|l| l < int(v, "first_k_dense_replace").unwrap_or(0)).collect(),
+        let first_k = v.get("first_k_dense_replace").filter(|x| !x.is_null())
+            .map(|x| x.as_u64().map(|x| x as usize).context("first_k_dense_replace must be an unsigned integer"))
+            .transpose()?;
+        let dense: Vec<bool> = match v.get("mlp_layer_types").filter(|x| !x.is_null()) {
+            Some(types) => {
+                let types = types.as_array().context("mlp_layer_types must be a list")?;
+                ensure!(types.len() == layers, "mlp_layer_types has {} entries for {layers} layers", types.len());
+                let dense = types.iter().map(|t| match t.as_str() {
+                    Some("dense") => Ok(true),
+                    Some("sparse") => Ok(false),
+                    other => anyhow::bail!("unknown glm5_next MLP type {other:?}"),
+                }).collect::<Result<Vec<_>>>()?;
+                if let Some(k) = first_k {
+                    ensure!(dense.iter().enumerate().all(|(l, d)| *d == (l < k)),
+                        "mlp_layer_types and first_k_dense_replace ({k}) disagree");
+                }
+                dense
+            }
+            None => (0..layers).map(|l| l < first_k.unwrap_or(0)).collect(),
         };
-        ensure!(attention.len() == layers && dense.len() == layers, "layer patterns must cover every layer");
         let linear = &v["linear_attn_config"];
         ensure!(v["mla_use_nope"].as_bool().unwrap_or(false) && int(v, "qk_rope_head_dim").unwrap_or(0) == 0,
             "the glmf programs are built for MLA without RoPE (mla_use_nope)");

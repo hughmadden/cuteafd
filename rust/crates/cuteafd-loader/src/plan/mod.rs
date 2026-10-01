@@ -1,23 +1,28 @@
 //! `cuteafd plan`: what a checkpoint is, where each part would live, and what
 //! this build can or cannot run - with hints a code agent can act on.
 pub mod checkpoint;
+pub mod experts;
 pub mod families;
 pub mod family;
 pub mod format;
+pub mod launch;
 pub mod names;
 pub mod spec;
+#[doc(hidden)]
+pub mod testing;
 
-use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 pub use checkpoint::Checkpoint;
-pub use family::{Family, Hint, RuntimeStatus};
-pub use format::WeightFormat;
+pub use family::{ConfigError, ExpertContract, Family, FamilyModel, Hint, RuntimeStatus};
+pub use format::{Encoding, Malformed, QuantOperand, RowTiling, ScaleEncoding};
 pub use spec::{AttentionKind, Component, FfnKind, ModelSpec, TensorRole};
 
 const GIB: f64 = (1u64 << 30) as f64;
+/// Rejected tensors kept per component (the count covers the rest).
+const REJECTIONS_KEPT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -28,11 +33,12 @@ pub enum Owner {
 }
 
 impl Owner {
-    fn label(self, sparks: usize) -> String {
-        match self {
-            Owner::Rtx => "rtx".into(),
-            Owner::SparkSliced => format!("spark x{sparks}"),
-            Owner::HostMapped => "host-mapped".into(),
+    fn label(self, placement: ExpertPlacement) -> String {
+        match (self, placement) {
+            (Owner::Rtx, _) => "rtx".into(),
+            (Owner::SparkSliced, ExpertPlacement::Sparks { ranks }) => format!("spark x{ranks}"),
+            (Owner::SparkSliced, ExpertPlacement::Local) => "rtx (local)".into(),
+            (Owner::HostMapped, _) => "host-mapped".into(),
         }
     }
 }
@@ -50,6 +56,13 @@ pub enum Status {
     Unused,
 }
 
+/// A tensor (group) the family's loaders would not take, and why.
+#[derive(Debug, Clone, Serialize)]
+pub struct Rejection {
+    pub tensor: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ComponentPlan {
     pub component: Component,
@@ -59,6 +72,43 @@ pub struct ComponentPlan {
     /// Detected storage formats with the number of logical weights in each.
     pub formats: BTreeMap<String, usize>,
     pub status: Status,
+    /// Logical weights the contract rejects (malformed or not executed).
+    pub rejected: usize,
+    /// The first of them, with reasons.
+    pub rejections: Vec<Rejection>,
+}
+
+/// Where the routed experts live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ExpertPlacement {
+    /// Every routed-expert layer resident on the coordinator GPU.
+    Local,
+    /// Tensor-parallel slices over `ranks` Spark ranks.
+    Sparks { ranks: usize },
+}
+
+impl ExpertPlacement {
+    /// The `--spark-ranks` spelling: 0 is the local-only placement.
+    pub fn from_spark_ranks(ranks: usize) -> Self {
+        if ranks == 0 { Self::Local } else { Self::Sparks { ranks } }
+    }
+
+    pub fn spark_ranks(self) -> usize {
+        match self {
+            Self::Local => 0,
+            Self::Sparks { ranks } => ranks,
+        }
+    }
+}
+
+/// Planning options that cannot describe a deployment.
+#[derive(Debug, thiserror::Error)]
+pub enum PlanError {
+    #[error("invalid {option}: {reason}")]
+    InvalidOption { option: &'static str, reason: String },
+    #[error(transparent)]
+    Checkpoint(#[from] anyhow::Error),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -67,41 +117,94 @@ pub struct PlanReport {
     pub family: Option<String>,
     pub architectures: Vec<String>,
     pub runtime: Option<RuntimeStatus>,
+    /// Why the family's runtime refuses this configuration, when it does.
+    pub config_error: Option<String>,
     pub spec: Option<ModelSpec>,
     pub components: Vec<ComponentPlan>,
     pub unclassified: Vec<String>,
     pub missing_shards: Vec<String>,
     pub bytes_by_owner: BTreeMap<String, u64>,
+    pub placement: ExpertPlacement,
+    /// Spark ranks of the placement (0: local-only).
     pub spark_ranks: usize,
-    /// Fewest Spark ranks whose budget holds every routed expert.
-    pub min_spark_ranks: usize,
+    /// The package and layouts that serve this checkpoint's routed experts.
+    pub experts: Option<ExpertContract>,
+    /// Whether this build has a layout for the requested placement.
+    pub placement_supported: bool,
+    /// Fewest Spark ranks with a package layout whose budget holds every
+    /// routed expert, if any does.
+    pub min_spark_ranks: Option<usize>,
     /// Share of the routed-expert bytes the widest Spark rank holds: ranks
-    /// own whole 128-blocks of the intermediate (TP6 of 2048: 3 of 16).
+    /// own whole blocks of the intermediate (TP6 of 2048: 3 of 16).
     pub spark_rank_share: f64,
     pub fits: bool,
+    /// Family and routed-expert layers for the launch scripts.
+    pub launch: Option<launch::LaunchDescription>,
     pub hints: Vec<Hint>,
 }
 
 impl PlanReport {
     pub fn executable(&self) -> bool {
         self.family.is_some()
+            && self.config_error.is_none()
             && self.missing_shards.is_empty()
             && self.unclassified.is_empty()
             && self.components.iter().all(|c| matches!(c.status, Status::Ready | Status::Unused))
+            && self.placement_supported
             && self.fits
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct PlanOptions {
-    pub spark_ranks: usize,
+    pub placement: ExpertPlacement,
     /// Routed-expert bytes one Spark rank may hold (weights only).
     pub spark_budget_bytes: u64,
+    /// Weight bytes the coordinator GPU may hold (its own tensors, plus every
+    /// routed expert in the local-only placement).
+    pub coordinator_budget_bytes: u64,
 }
 
 impl Default for PlanOptions {
     fn default() -> Self {
-        Self { spark_ranks: 4, spark_budget_bytes: 100 << 30 }
+        Self {
+            placement: ExpertPlacement::Sparks { ranks: 4 },
+            spark_budget_bytes: 100 << 30,
+            coordinator_budget_bytes: 80 << 30,
+        }
     }
+}
+
+impl PlanOptions {
+    /// Rejects options that describe no deployment: Spark worlds the
+    /// transport does not run (it runs 2, 3, 4 or 6; 0 is the local-only
+    /// placement) and empty budgets.
+    pub fn validate(&self) -> Result<(), PlanError> {
+        if let ExpertPlacement::Sparks { ranks } = self.placement {
+            if !experts::TRANSPORT_WORLDS.contains(&ranks) {
+                return Err(PlanError::InvalidOption {
+                    option: "spark ranks",
+                    reason: format!("{ranks}: the expert transport runs 2, 3, 4 or 6 Spark ranks \
+                        (0 places every routed expert on the coordinator)"),
+                });
+            }
+        }
+        for (option, bytes) in [("Spark budget", self.spark_budget_bytes), ("coordinator budget", self.coordinator_budget_bytes)] {
+            if bytes == 0 {
+                return Err(PlanError::InvalidOption { option, reason: "must be positive".into() });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `gib` as bytes: a finite, positive number of GiB that fits in u64.
+pub fn budget_bytes(option: &'static str, gib: f64) -> Result<u64, PlanError> {
+    let bytes = gib * GIB;
+    if !gib.is_finite() || gib <= 0.0 || bytes < 1.0 || bytes >= u64::MAX as f64 {
+        return Err(PlanError::InvalidOption { option, reason: format!("{gib} GiB is not a finite positive size") });
+    }
+    Ok(bytes as u64)
 }
 
 fn owner_for(component: Component) -> Owner {
@@ -112,23 +215,29 @@ fn owner_for(component: Component) -> Owner {
     }
 }
 
-pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport> {
+pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanError> {
+    options.validate()?;
     let checkpoint = Checkpoint::open(snapshot)
-        .with_context(|| format!("reading checkpoint at {}", snapshot.display()))?;
+        .map_err(|error| error.context(format!("reading checkpoint at {}", snapshot.display())))?;
     let mut report = PlanReport {
         snapshot: snapshot.display().to_string(),
         family: None,
         architectures: checkpoint.architectures(),
         runtime: None,
+        config_error: None,
         spec: None,
         components: Vec::new(),
         unclassified: Vec::new(),
         missing_shards: checkpoint.missing_shards.clone(),
         bytes_by_owner: BTreeMap::new(),
-        spark_ranks: options.spark_ranks,
-        min_spark_ranks: 0,
-        spark_rank_share: 1.0 / options.spark_ranks.max(1) as f64,
+        placement: options.placement,
+        spark_ranks: options.placement.spark_ranks(),
+        experts: None,
+        placement_supported: true,
+        min_spark_ranks: None,
+        spark_rank_share: 0.0,
         fits: true,
+        launch: launch::describe(&checkpoint.config).ok(),
         hints: Vec::new(),
     };
     let Some(family) = family::detect(&checkpoint) else {
@@ -139,61 +248,108 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport> {
                 checkpoint.model_type()
             ),
             how: "Add a family under rust/crates/cuteafd-loader/src/plan/families/ implementing \
-                  Family (detect, spec, classify, component_hint) and register it in \
+                  Family (detect, open, classify, component_hint) and register it in \
                   plan/family.rs::registry. Start from the closest existing family."
                 .into(),
         });
         return Ok(report);
     };
-    let spec = family.spec(&checkpoint)?;
     report.family = Some(family.id().into());
     report.runtime = Some(family.runtime());
+    let model = match family.open(&checkpoint) {
+        Ok(model) => model,
+        Err(error) => {
+            report.hints.push(Hint {
+                what: format!("{} configuration is not servable: {error}", family.id()),
+                how: format!("The {} runtime parses config.json with the same reader \
+                    (cuteafd-loader/src/families/{}/config.rs); extend it and the engine together.",
+                    family.id(), family.id()),
+            });
+            report.config_error = Some(error.0);
+            return Ok(report);
+        }
+    };
+    let spec = model.spec();
 
-    // Classify every tensor, then group each component's tensors by stem to
-    // detect one storage format per logical weight.
+    // Classify every tensor, then group each component's tensors by stem: one
+    // operand per logical weight, checked against the family's contract.
     let mut by_component: BTreeMap<Component, Vec<checkpoint::CheckpointTensor>> = BTreeMap::new();
+    let mut roles: BTreeMap<String, TensorRole> = BTreeMap::new();
     for tensor in &checkpoint.tensors {
-        match family.classify(&spec, &tensor.meta.name) {
-            Some(role) => by_component.entry(role.component).or_default().push(tensor.clone()),
+        match family.classify(spec, &tensor.meta.name) {
+            Some(role) => {
+                roles.insert(format::split_stem(&tensor.meta.name).0.to_owned(), role.clone());
+                by_component.entry(role.component).or_default().push(tensor.clone());
+            }
             None => report.unclassified.push(tensor.meta.name.clone()),
         }
     }
+    // The expert staging's own verdict on the routed experts.
+    let catalog_error = (family.expert_catalog() && by_component.contains_key(&Component::RoutedExpert))
+        .then(|| crate::read_expert_catalog(&checkpoint.snapshot).err())
+        .flatten()
+        .map(|error| format!("{error:#}"));
     let mut hinted = BTreeSet::new();
+    // Routed-expert operands by label, for the placement contract.
+    let mut routed_operands: BTreeMap<String, QuantOperand> = BTreeMap::new();
     for (component, tensors) in &by_component {
         let groups = format::group_by_stem(tensors);
         let mut formats: BTreeMap<String, usize> = BTreeMap::new();
-        let mut all_ready = true;
-        for members in groups.values() {
-            let detected = format::detect(members);
-            if !family.executes(*component, &detected) {
-                all_ready = false;
+        let mut rejected = 0usize;
+        let mut rejections = Vec::new();
+        for (stem, members) in &groups {
+            let role = roles.get(stem).cloned().unwrap_or_else(|| TensorRole::new(*component));
+            let verdict = match format::detect(members) {
+                Ok(mut operand) => {
+                    let accepted = model.accepts(&role, stem, &mut operand);
+                    *formats.entry(operand.label()).or_default() += 1;
+                    if accepted.is_ok() && *component == Component::RoutedExpert {
+                        routed_operands.entry(operand.label()).or_insert(operand);
+                    }
+                    accepted.map_err(|reason| Rejection { tensor: stem.clone(), reason })
+                }
+                Err(malformed) => {
+                    *formats.entry("malformed".into()).or_default() += 1;
+                    Err(Rejection { tensor: malformed.tensor, reason: malformed.reason })
+                }
+            };
+            if let Err(rejection) = verdict {
+                rejected += 1;
+                if rejections.len() < REJECTIONS_KEPT {
+                    rejections.push(rejection);
+                }
             }
-            *formats.entry(detected.label()).or_default() += 1;
+        }
+        if let (Component::RoutedExpert, Some(error)) = (component, &catalog_error) {
+            rejected += 1;
+            rejections.insert(0, Rejection { tensor: "routed experts (read_expert_catalog)".into(), reason: error.clone() });
+            rejections.truncate(REJECTIONS_KEPT);
         }
         let status = match family.runtime() {
             RuntimeStatus::Planned => Status::Planned,
-            RuntimeStatus::Serving if all_ready => Status::Ready,
+            RuntimeStatus::Serving if rejected == 0 => Status::Ready,
             RuntimeStatus::Serving if family.optional(*component) => Status::Unused,
             RuntimeStatus::Serving => Status::MissingKernel,
         };
         if !matches!(status, Status::Ready | Status::Unused) && hinted.insert(*component) {
+            if let Some(first) = rejections.first() {
+                report.hints.push(Hint {
+                    what: format!("{}: {rejected} of {} weights not executable, e.g. {}: {}", component.label(),
+                        groups.len(), first.tensor, first.reason),
+                    how: "The family's tensor contract (plan/families/) mirrors its loaders; a new format needs \
+                        the loader staging and kernels first, then the contract."
+                        .into(),
+                });
+            }
             let labels: Vec<String> = formats.keys().cloned().collect();
-            if let Some(hint) = family.component_hint_for(&spec, *component, &labels) {
+            if let Some(hint) = family.component_hint_for(spec, *component, &labels) {
                 if !report.hints.iter().any(|h| h.what == hint.what) {
                     report.hints.push(hint);
                 }
-            } else if status == Status::MissingKernel {
-                report.hints.push(Hint {
-                    what: format!("{} in formats {:?}", component.label(), formats.keys().collect::<Vec<_>>()),
-                    how: "Add an execution path for this format (b12x kernel export + loader staging) \
-                          and teach the family's `executes` to accept it."
-                        .into(),
-                });
             }
         }
         let bytes: u64 = tensors.iter().map(|t| t.meta.byte_length).sum();
         let owner = owner_for(*component);
-        *report.bytes_by_owner.entry(owner.label(options.spark_ranks)).or_default() += bytes;
         report.components.push(ComponentPlan {
             component: *component,
             owner,
@@ -201,44 +357,11 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport> {
             bytes,
             formats,
             status,
+            rejected,
+            rejections,
         });
     }
-    let routed: u64 = report
-        .components
-        .iter()
-        .filter(|c| c.owner == Owner::SparkSliced)
-        .map(|c| c.bytes)
-        .sum();
-    // Expert tensor parallelism supports these group sizes; ranks own whole
-    // 128-blocks of the intermediate, so the widest rank bounds the budget.
-    let intermediate = spec.moe.as_ref().map(|moe| moe.intermediate);
-    let share = |ranks: usize| match intermediate {
-        Some(i) if i % 128 == 0 && i / 128 >= ranks => (i / 128).div_ceil(ranks) as f64 / (i / 128) as f64,
-        _ => 1.0 / ranks.max(1) as f64,
-    };
-    report.spark_rank_share = share(options.spark_ranks);
-    let fits_on = |ranks: usize| routed as f64 * share(ranks) <= options.spark_budget_bytes as f64;
-    let needed = routed.div_ceil(options.spark_budget_bytes.max(1)) as usize;
-    report.min_spark_ranks = [1usize, 2, 3, 4, 6]
-        .into_iter()
-        .find(|&ranks| fits_on(ranks))
-        .unwrap_or(needed);
-    if !fits_on(options.spark_ranks) {
-        report.fits = false;
-        report.hints.push(Hint {
-            what: format!(
-                "routed experts need {:.1} GiB on the widest of {} Spark ranks, over the {:.0} GiB budget",
-                routed as f64 * report.spark_rank_share / GIB,
-                options.spark_ranks,
-                options.spark_budget_bytes as f64 / GIB
-            ),
-            how: format!(
-                "Use at least {} Spark ranks (--spark-ranks), keep bottom layers' experts resident \
-                 on the RTX cards, or quantize the experts further (EXL3 K2-K3).",
-                report.min_spark_ranks
-            ),
-        });
-    }
+    place(&mut report, options, spec, model.as_ref(), &routed_operands);
     if !report.unclassified.is_empty() {
         report.hints.push(Hint {
             what: format!("{} tensors match no {} rule", report.unclassified.len(), family.id()),
@@ -255,8 +378,117 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport> {
             how: "Finish the download (hf download) or replicate it (nest replicate hf:ORG/NAME).".into(),
         });
     }
-    report.spec = Some(spec);
+    report.spec = Some(spec.clone());
     Ok(report)
+}
+
+/// Places the routed experts (Spark slices or the coordinator) and checks
+/// memory: the widest Spark rank against the Spark budget, the coordinator's
+/// own tensors (plus every expert, local-only) against its budget.
+fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model: &dyn FamilyModel,
+    routed_operands: &BTreeMap<String, QuantOperand>) {
+    let bytes_of = |owner: Owner| -> u64 {
+        report.components.iter().filter(|c| c.owner == owner).map(|c| c.bytes).sum()
+    };
+    let (routed, rtx, mapped) = (bytes_of(Owner::SparkSliced), bytes_of(Owner::Rtx), bytes_of(Owner::HostMapped));
+    for (owner, bytes) in [(Owner::Rtx, rtx), (Owner::SparkSliced, routed), (Owner::HostMapped, mapped)] {
+        if bytes > 0 {
+            *report.bytes_by_owner.entry(owner.label(options.placement)).or_default() += bytes;
+        }
+    }
+    // One contract for every routed format present (EXL3 K3 and K4 tiers
+    // share theirs); mixed packages keep the layouts they all have.
+    let contracts: Vec<ExpertContract> = routed_operands.values().filter_map(|op| model.experts(op)).collect();
+    let contract = contracts.first().cloned().map(|mut first| {
+        for other in &contracts[1..] {
+            first.spark_worlds.retain(|w| other.spark_worlds.contains(w));
+            if first.block != other.block {
+                first.spark_worlds.clear();
+            }
+            if other.local.is_err() {
+                first.local = other.local.clone();
+            }
+            if !first.package.split(" + ").any(|p| p == other.package) {
+                first.package = format!("{} + {}", first.package, other.package);
+            }
+        }
+        first
+    });
+    let intermediate = spec.moe.as_ref().map(|moe| moe.intermediate);
+    let gib = |bytes: f64| bytes / GIB;
+    let coordinator = options.coordinator_budget_bytes as f64;
+    if routed > 0 {
+        let share = |ranks: usize| -> Option<f64> {
+            let contract = contract.as_ref()?;
+            let i = intermediate?;
+            experts::stored_slice(i, contract.block, ranks).map(|slice| slice as f64 / i as f64)
+        };
+        let fits_on = |ranks: usize| share(ranks).is_some_and(|s| routed as f64 * s <= options.spark_budget_bytes as f64);
+        report.min_spark_ranks = contract.as_ref().and_then(|c| c.spark_worlds.iter().copied().find(|&r| fits_on(r)));
+        let advice = match report.min_spark_ranks {
+            Some(ranks) => format!("Use {ranks} Spark ranks (--spark-ranks {ranks})"),
+            None => "No Spark layout of this package holds them at this budget".into(),
+        };
+        match (options.placement, &contract) {
+            (_, None) => {} // the routed-expert component already reports its missing kernel
+            (ExpertPlacement::Sparks { ranks }, Some(contract)) => {
+                report.spark_rank_share = share(ranks).unwrap_or(0.0);
+                if !contract.spark_worlds.contains(&ranks) || share(ranks).is_none() {
+                    report.placement_supported = false;
+                    report.hints.push(Hint {
+                        what: format!("no {} layout for {ranks} Spark ranks (this build packages {:?}{})",
+                            contract.package, contract.spark_worlds,
+                            intermediate.map_or(String::new(), |i| format!(", intermediate {i} in {}-row blocks", contract.block))),
+                        how: match share(ranks) {
+                            Some(_) => format!("{advice}, or build a tp{ranks} layout (python/tools/aot/\
+                                package_fp8_moe_aot.py --layouts / package_exl3_aot.py)."),
+                            None => format!("{advice}: {ranks} ranks cannot each own whole {}-row blocks.",
+                                contract.block),
+                        },
+                    });
+                } else if !fits_on(ranks) {
+                    report.fits = false;
+                    report.hints.push(Hint {
+                        what: format!("routed experts need {:.1} GiB on the widest of {ranks} Spark ranks, over the \
+                            {:.0} GiB budget", gib(routed as f64 * report.spark_rank_share),
+                            gib(options.spark_budget_bytes as f64)),
+                        how: format!("{advice}, keep bottom layers' experts resident on the RTX cards, or quantize \
+                            the experts further (EXL3 K2-K3)."),
+                    });
+                }
+            }
+            (ExpertPlacement::Local, Some(contract)) => match &contract.local {
+                Err(why) => {
+                    report.placement_supported = false;
+                    report.hints.push(Hint {
+                        what: format!("unsupported: no local expert package for {}: {why}", spec.family),
+                        how: format!("{advice}."),
+                    });
+                }
+                Ok(_) => {
+                    let need = (rtx + routed) as f64;
+                    if need > coordinator {
+                        report.fits = false;
+                        report.hints.push(Hint {
+                            what: format!("local-only placement needs {:.1} GiB on the coordinator GPU ({:.1} GiB \
+                                routed experts + {:.1} GiB other weights), {:.1} GiB over the {:.0} GiB budget",
+                                gib(need), gib(routed as f64), gib(rtx as f64), gib(need - coordinator), gib(coordinator)),
+                            how: format!("{advice}."),
+                        });
+                    }
+                }
+            },
+        }
+    }
+    if options.placement != ExpertPlacement::Local && rtx as f64 > coordinator {
+        report.fits = false;
+        report.hints.push(Hint {
+            what: format!("coordinator weights need {:.1} GiB, over the {:.0} GiB coordinator budget",
+                gib(rtx as f64), gib(coordinator)),
+            how: "Split the backbone over two coordinator GPUs or move components to Sparks.".into(),
+        });
+    }
+    report.experts = contract;
 }
 
 /// Human-readable report.
@@ -320,6 +552,10 @@ pub fn render(report: &PlanReport) -> String {
                 let _ = writeln!(out, "note       {note}");
             }
         }
+        (Some(family), None) => {
+            let _ = writeln!(out, "family     {family}: configuration refused ({})",
+                report.config_error.as_deref().unwrap_or("no spec"));
+        }
         _ => {
             let _ = writeln!(out, "family     not recognized");
         }
@@ -341,10 +577,23 @@ pub fn render(report: &PlanReport) -> String {
                 c.component.label(),
                 c.tensors,
                 c.bytes as f64 / GIB,
-                c.owner.label(report.spark_ranks),
+                c.owner.label(report.placement),
                 status,
                 formats
             );
+        }
+        let rejected: Vec<&ComponentPlan> =
+            report.components.iter().filter(|c| c.status == Status::MissingKernel && c.rejected > 0).collect();
+        if !rejected.is_empty() {
+            let _ = writeln!(out, "\nrejected weights:");
+            for c in rejected {
+                for r in c.rejections.iter().take(3) {
+                    let _ = writeln!(out, "  {:<16} {}: {}", c.component.label(), r.tensor, r.reason);
+                }
+                if c.rejected > 3 {
+                    let _ = writeln!(out, "  {:<16} ... {} more", c.component.label(), c.rejected - 3);
+                }
+            }
         }
         let _ = writeln!(out);
         for (owner, bytes) in &report.bytes_by_owner {
@@ -365,14 +614,25 @@ pub fn render(report: &PlanReport) -> String {
     if !report.missing_shards.is_empty() {
         let _ = writeln!(out, "\nmissing shards: {}", report.missing_shards.len());
     }
-    if report.family.is_some() {
-        let _ = writeln!(
-            out,
-            "capacity   routed experts need >= {} Spark ranks at {} ranks: {}",
-            report.min_spark_ranks,
-            report.spark_ranks,
-            if report.fits { "fits" } else { "DOES NOT FIT" }
-        );
+    if let Some(experts) = &report.experts {
+        let local = match &experts.local {
+            Ok(package) => package.clone(),
+            Err(_) => "none".into(),
+        };
+        let _ = writeln!(out, "experts    {}: Spark worlds {:?}; local {local}", experts.package, experts.spark_worlds);
+    }
+    if report.spec.is_some() && report.bytes_by_owner.keys().any(|o| o != "rtx") {
+        let min = report.min_spark_ranks.map_or("no Spark layout fits".into(), |r| format!(">= {r} Spark ranks"));
+        let at = match report.placement {
+            ExpertPlacement::Local => "local-only".into(),
+            ExpertPlacement::Sparks { ranks } => format!("{ranks} ranks"),
+        };
+        let verdict = match (report.placement_supported, report.fits) {
+            (false, _) => "UNSUPPORTED",
+            (true, true) => "fits",
+            (true, false) => "DOES NOT FIT",
+        };
+        let _ = writeln!(out, "capacity   routed experts need {min}; at {at}: {verdict}");
     }
     let _ = writeln!(out, "\nverdict    {}", if report.executable() { "READY to serve" } else { "NOT servable by this build" });
     if !report.hints.is_empty() {

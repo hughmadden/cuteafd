@@ -1,46 +1,66 @@
+use super::testing::*;
 use super::*;
-use serde_json::json;
-use std::fs;
-use std::io::Write;
+use crate::families::mimo_v2::{MimoAttention, MimoV2Config};
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
 
-/// Writes a safetensors file whose payload is zero bytes of the right length.
-fn write_safetensors(path: &Path, tensors: &[(&str, &str, Vec<usize>)]) {
-    let width = |dtype: &str| match dtype {
-        "BF16" | "F16" | "I16" => 2,
-        "F32" | "I32" => 4,
-        "I64" => 8,
-        _ => 1,
-    };
-    let mut header = serde_json::Map::new();
-    let mut offset = 0u64;
-    for (name, dtype, shape) in tensors {
-        let bytes = shape.iter().product::<usize>() as u64 * width(dtype);
-        header.insert(
-            (*name).into(),
-            json!({"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + bytes]}),
-        );
-        offset += bytes;
-    }
-    let header = serde_json::to_vec(&header).unwrap();
-    let mut file = fs::File::create(path).unwrap();
-    file.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
-    file.write_all(&header).unwrap();
-    file.write_all(&vec![0u8; offset as usize]).unwrap();
+fn snapshot(config: Value, tensors: &[Tensor]) -> tempfile::TempDir {
+    snapshot_tp(config, tensors, None)
 }
 
-fn snapshot(config: serde_json::Value, tensors: &[(&str, &str, Vec<usize>)]) -> tempfile::TempDir {
+fn snapshot_tp(config: Value, tensors: &[Tensor], tp: Option<usize>) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
-    write_safetensors(&dir.path().join("model.safetensors"), tensors);
+    write_snapshot(dir.path(), &config, tensors, tp);
     dir
 }
 
-fn v41_config() -> serde_json::Value {
+/// One Qwen layer with all 512 EXL3 experts and its storage map.
+fn qwen_snapshot(bits: usize) -> tempfile::TempDir {
+    let (tensors, manifest) = qwen4_exl3(1, bits);
+    let mut config = qwen4_config(1);
+    config["quantization_config"] = exl3_compact(bits);
+    let dir = snapshot(config, &tensors);
+    write_quantize_config(dir.path(), &manifest);
+    dir
+}
+
+fn sparks(ranks: usize) -> PlanOptions {
+    PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks), ..PlanOptions::default() }
+}
+
+fn component(report: &PlanReport, component: Component) -> &ComponentPlan {
+    report.components.iter().find(|c| c.component == component).unwrap_or_else(|| panic!("{component:?}"))
+}
+
+fn rejected(report: &PlanReport, which: Component) -> Vec<String> {
+    component(report, which).rejections.iter().map(|r| format!("{}: {}", r.tensor, r.reason)).collect()
+}
+
+/// Detects one group from (suffix, dtype, shape) members.
+fn detect_group(stem: &str, members: &[(&str, &'static str, &[usize])]) -> Result<QuantOperand, Malformed> {
+    let tensors: Vec<Tensor> = members
+        .iter()
+        .map(|(suffix, dtype, shape)| t(if suffix.is_empty() { stem.to_string() } else { format!("{stem}.{suffix}") },
+            dtype, shape))
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    write_safetensors(&dir.path().join("x.safetensors"), &tensors);
+    let tensors: Vec<checkpoint::CheckpointTensor> = crate::read_safetensors_metadata(&dir.path().join("x.safetensors"))
+        .unwrap()
+        .into_iter()
+        .map(|meta| checkpoint::CheckpointTensor { shard: "x".into(), meta })
+        .collect();
+    let groups = format::group_by_stem(&tensors);
+    assert_eq!(groups.len(), 1, "{:?}", groups.keys().collect::<Vec<_>>());
+    format::detect(groups.values().next().unwrap())
+}
+
+fn v41_config() -> Value {
     json!({
         "architectures": ["DeepseekV41ForCausalLM"],
         "text_config": {
-            "hidden_size": 64, "vocab_size": 128, "num_hidden_layers": 2,
-            "n_routed_experts": 2, "num_experts_per_tok": 1, "moe_intermediate_size": 32,
+            "hidden_size": 5120, "vocab_size": 128, "num_hidden_layers": 2,
+            "n_routed_experts": 384, "num_experts_per_tok": 6, "moe_intermediate_size": 2304,
             "n_shared_experts": 1, "compress_ratios": [0, 2], "scoring_func": "sqrtsoftplus",
             "engram_layer_ids": [1]
         }
@@ -52,33 +72,33 @@ fn deepseek_v41_components_formats_and_placement() {
     let dir = snapshot(
         v41_config(),
         &[
-            ("embed.weight", "BF16", vec![128, 64]),
-            ("head.weight", "BF16", vec![128, 64]),
-            ("norm.weight", "BF16", vec![64]),
-            ("layers.0.attn.wq_a.weight", "F8_E4M3", vec![64, 64]),
-            ("layers.0.attn.wq_a.scale", "F8_E8M0", vec![2, 2]),
-            ("layers.0.attn.attn_sink", "F32", vec![4]),
-            ("layers.1.attn.indexer.wq_b.weight", "F8_E4M3", vec![64, 64]),
-            ("layers.1.attn.indexer.wq_b.scale", "F8_E8M0", vec![2, 2]),
-            ("layers.0.ffn.gate.weight", "BF16", vec![2, 64]),
-            ("layers.0.ffn.experts.0.w1.weight", "I8", vec![32, 32]),
-            ("layers.0.ffn.experts.0.w1.scale", "F8_E8M0", vec![32, 2]),
-            ("layers.1.engram.embed.weight", "F8_E4M3", vec![16, 64]),
-            ("layers.1.engram.embed.scale", "F8_E8M0", vec![16, 2]),
-            ("mtp.0.ffn.experts.0.w1.weight", "I8", vec![32, 32]),
-            ("mtp.0.ffn.experts.0.w1.scale", "F8_E8M0", vec![32, 2]),
+            t("embed.weight", "BF16", &[128, 5120]),
+            t("head.weight", "BF16", &[128, 5120]),
+            t("norm.weight", "BF16", &[5120]),
+            t("layers.0.attn.wq_a.weight", "F8_E4M3", &[64, 5120]),
+            t("layers.0.attn.wq_a.scale", "F8_E8M0", &[2, 160]),
+            t("layers.0.attn.attn_sink", "F32", &[4]),
+            t("layers.1.attn.indexer.wq_b.weight", "F8_E4M3", &[64, 64]),
+            t("layers.1.attn.indexer.wq_b.scale", "F8_E8M0", &[2, 2]),
+            t("layers.0.ffn.gate.weight", "BF16", &[384, 5120]),
+            t("layers.0.ffn.experts.0.w1.weight", "I8", &[2304, 2560]),
+            t("layers.0.ffn.experts.0.w1.scale", "F8_E8M0", &[2304, 160]),
+            t("layers.1.engram.embed.weight", "F8_E4M3", &[16, 64]),
+            t("layers.1.engram.embed.scale", "F8_E8M0", &[16, 2]),
+            t("mtp.0.ffn.experts.0.w2.weight", "I8", &[5120, 1152]),
+            t("mtp.0.ffn.experts.0.w2.scale", "F8_E8M0", &[5120, 72]),
         ],
     );
     let report = plan(dir.path(), &PlanOptions::default()).unwrap();
     assert_eq!(report.family.as_deref(), Some("deepseek_v41"));
     assert!(report.unclassified.is_empty(), "{:?}", report.unclassified);
-    let find = |component| report.components.iter().find(|c| c.component == component).unwrap();
-    assert_eq!(find(Component::RoutedExpert).owner, Owner::SparkSliced);
-    assert!(find(Component::RoutedExpert).formats.contains_key("mxfp4-g32"));
-    assert!(find(Component::Attention).formats.contains_key("fp8-block32x32"));
-    assert_eq!(find(Component::MappedTable).owner, Owner::HostMapped);
-    assert!(find(Component::MappedTable).formats.contains_key("fp8-block1x32"));
-    assert_eq!(find(Component::SpeculatorExpert).owner, Owner::Rtx);
+    assert_eq!(component(&report, Component::RoutedExpert).owner, Owner::SparkSliced);
+    assert!(component(&report, Component::RoutedExpert).formats.contains_key("mxfp4-g32"));
+    assert!(component(&report, Component::Attention).formats.contains_key("fp8-block32x32/ue8m0"));
+    assert_eq!(component(&report, Component::MappedTable).owner, Owner::HostMapped);
+    assert!(component(&report, Component::MappedTable).formats.contains_key("fp8-block1x32/ue8m0"));
+    assert_eq!(component(&report, Component::SpeculatorExpert).owner, Owner::Rtx);
+    assert_eq!(report.experts.as_ref().unwrap().spark_worlds, [2, 3, 4, 6]);
     assert!(report.executable(), "{}", render(&report));
 }
 
@@ -86,113 +106,508 @@ fn deepseek_v41_components_formats_and_placement() {
 fn v41_rejects_an_unsupported_expert_format_with_a_hint() {
     let dir = snapshot(
         v41_config(),
-        &[
-            ("embed.weight", "BF16", vec![128, 64]),
-            ("layers.0.ffn.experts.0.w1.weight", "BF16", vec![32, 64]),
-        ],
+        &[t("embed.weight", "BF16", &[128, 5120]), t("layers.0.ffn.experts.0.w1.weight", "BF16", &[2304, 5120])],
     );
     let report = plan(dir.path(), &PlanOptions::default()).unwrap();
-    let experts = report.components.iter().find(|c| c.component == Component::RoutedExpert).unwrap();
-    assert_eq!(experts.status, Status::MissingKernel);
+    assert_eq!(component(&report, Component::RoutedExpert).status, Status::MissingKernel);
     assert!(!report.executable());
     assert!(report.hints.iter().any(|hint| hint.what.contains("routed_expert")));
+    assert!(rejected(&report, Component::RoutedExpert)[0].starts_with("layers.0.ffn.experts.0.w1: "));
 }
 
 #[test]
 fn unknown_architecture_is_reported_not_fatal() {
-    let dir = snapshot(json!({"architectures": ["SomethingNew"], "model_type": "new"}),
-        &[("w", "BF16", vec![2])]);
+    let dir = snapshot(json!({"architectures": ["SomethingNew"], "model_type": "new"}), &[t("w", "BF16", &[2])]);
     let report = plan(dir.path(), &PlanOptions::default()).unwrap();
     assert!(report.family.is_none());
     assert!(report.hints[0].what.contains("SomethingNew"));
 }
 
+// --- R06: lossless formats and the loaders' tensor contracts ---------------
+
+/// The review's observation: an E5M2 expert and an EXL3 trellis without its
+/// companions planned as ready. Both are now unsupported, by tensor name.
 #[test]
-fn exl3_bits_and_partial_fp8_blocks_are_detected() {
-    let dir = snapshot(
-        json!({"architectures": ["GlmMoeDsaForCausalLM"], "hidden_size": 64, "vocab_size": 8,
-               "num_hidden_layers": 1, "n_routed_experts": 1, "num_experts_per_tok": 1,
-               "moe_intermediate_size": 32}),
-        &[
-            ("model.layers.0.self_attn.kv_a_proj_with_mqa.weight", "F8_E4M3", vec![576, 256]),
-            ("model.layers.0.self_attn.kv_a_proj_with_mqa.weight_scale_inv", "F32", vec![5, 2]),
-            ("model.layers.0.mlp.experts.0.gate_proj.trellis", "I16", vec![4, 2, 48]),
-            ("model.layers.0.mlp.experts.0.gate_proj.suh", "F16", vec![64]),
-            ("model.layers.0.mlp.experts.0.gate_proj.svh", "F16", vec![32]),
-            ("model.layers.0.mlp.experts.0.gate_proj.mcg", "I32", vec![1]),
-        ],
-    );
+fn observed_e5m2_and_incomplete_exl3_are_ready() {
+    let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| {
+        if name.ends_with("gate_proj") {
+            vec![t(format!("{name}.weight"), "F8_E5M2", &[n, k]), t(format!("{name}.weight_scale_inv"), "F32",
+                &[n / 128, k / 128])]
+        } else if name.ends_with("up_proj") {
+            vec![t(format!("{name}.trellis"), "I16", &[k / 16, n / 16, 64])]
+        } else {
+            fp8(name, n, k, None)
+        }
+    }));
     let report = plan(dir.path(), &PlanOptions::default()).unwrap();
-    let find = |component| report.components.iter().find(|c| c.component == component).unwrap();
-    assert!(find(Component::Attention).formats.contains_key("fp8-block128x128"));
-    assert_eq!(find(Component::RoutedExpert).formats.get("exl3-k3"), Some(&1));
+    let experts = component(&report, Component::RoutedExpert);
+    assert_eq!(experts.status, Status::MissingKernel, "{}", render(&report));
+    // Two operands, and the expert staging's own refusal of the E5M2 weight.
+    assert_eq!(experts.rejected, 3);
+    let reasons = rejected(&report, Component::RoutedExpert);
+    assert!(reasons[0].starts_with("routed experts (read_expert_catalog): ") && reasons[0].contains("expected E4M3"),
+        "{reasons:?}");
+    assert!(reasons.iter().any(|r| r.starts_with("model.layers.1.mlp.experts.0.gate_proj: ") && r.contains("fp8e5m2")),
+        "{reasons:?}");
+    assert!(reasons.iter().any(|r| r.starts_with("model.layers.1.mlp.experts.0.up_proj.") && r.contains("missing EXL3")),
+        "{reasons:?}");
+    assert!(experts.formats.contains_key("fp8e5m2-block128x128/f32") && experts.formats.contains_key("malformed"));
+    assert!(!report.executable());
 }
 
 #[test]
-fn mimo_pro_segmented_fp8_grid_and_mxfp4_experts_are_described() {
-    let dir = snapshot(
-        json!({"architectures": ["MiMoV2ForCausalLM"], "model_type": "mimo_v2", "hidden_size": 256,
-               "vocab_size": 8, "num_hidden_layers": 1, "num_attention_heads": 4, "num_key_value_heads": 2,
-               "head_dim": 192, "v_head_dim": 128, "hybrid_layer_pattern": [0], "moe_layer_freq": [1],
-               "n_routed_experts": 2, "num_experts_per_tok": 1, "moe_intermediate_size": 64}),
-        &[
-            // Two row shards of [q (2 x 192) | k (1 x 192) | v (1 x 128)]: 3 + 2 + 1 blocks each.
-            ("model.layers.0.self_attn.qkv_proj.weight", "F8_E4M3", vec![1408, 256]),
-            ("model.layers.0.self_attn.qkv_proj.weight_scale_inv", "F32", vec![12, 2]),
-            ("model.layers.0.mlp.experts.0.gate_proj.weight", "U8", vec![64, 128]),
-            ("model.layers.0.mlp.experts.0.gate_proj.weight_scale", "U8", vec![64, 8]),
-        ],
-    );
-    let report = plan(dir.path(), &PlanOptions::default()).unwrap();
-    let find = |component| report.components.iter().find(|c| c.component == component).unwrap();
-    assert!(find(Component::Attention).formats.contains_key("fp8-block128x128-segmented"));
-    assert!(find(Component::RoutedExpert).formats.contains_key("mxfp4-g32"));
-    assert!(report.hints.iter().any(|h| h.how.contains("mimop:fp8")), "{:?}", report.hints);
+fn e4m3_and_e5m2_are_distinct_operands() {
+    let e4m3 = detect_group("w", &[("weight", "F8_E4M3", &[256, 256]), ("weight_scale_inv", "F32", &[2, 2])]).unwrap();
+    let e5m2 = detect_group("w", &[("weight", "F8_E5M2", &[256, 256]), ("weight_scale_inv", "F32", &[2, 2])]).unwrap();
+    assert_eq!(e4m3.encoding, Encoding::E4m3);
+    assert_eq!(e5m2.encoding, Encoding::E5m2);
+    assert_ne!(e4m3.label(), e5m2.label());
+    assert!(e4m3.is_fp8_block(128, &[ScaleEncoding::F32]) && !e5m2.is_fp8_block(128, &[ScaleEncoding::F32]));
+    // Scale encodings stay distinct too: E8M0 grids are not FP32 grids.
+    let ue8m0 = detect_group("w", &[("weight", "F8_E4M3", &[256, 256]), ("scale", "F8_E8M0", &[2, 2])]).unwrap();
+    assert!(ue8m0.is_fp8_block(128, &[ScaleEncoding::Ue8m0]) && !ue8m0.is_fp8_block(128, &[ScaleEncoding::F32]));
+    // Both rows of a GLM routed expert: E4M3 accepted, E5M2 rejected.
+    let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+    assert!(plan(dir.path(), &PlanOptions::default()).unwrap().executable());
 }
 
 #[test]
-fn capacity_suggests_a_supported_rank_count() {
-    let dir = snapshot(v41_config(), &[("layers.0.ffn.experts.0.w1.weight", "I8", vec![1024, 1024])]);
-    let report = plan(dir.path(), &PlanOptions { spark_ranks: 4, spark_budget_bytes: 200 << 10 }).unwrap();
-    // 1 MiB of experts at 200 KiB per rank needs 6 ranks (5 is not a TP size).
-    assert_eq!(report.min_spark_ranks, 6);
-    assert!(!report.fits);
+fn malformed_trellis_and_scales_name_the_tensor() {
+    let exl3 = |trellis: (&'static str, &'static [usize]), suh: &'static [usize], mcg: &'static [usize]| {
+        detect_group("p", &[("trellis", trellis.0, trellis.1), ("suh", "F16", suh), ("svh", "F16", &[32]),
+            ("mcg", "I32", mcg)])
+    };
+    let good = exl3(("I16", &[4, 2, 48]), &[64], &[]).unwrap();
+    assert_eq!((good.encoding, good.logical.clone()), (Encoding::Exl3 { bits: 3 }, vec![32, 64]));
+    let cases: [(Result<QuantOperand, Malformed>, &str, &str); 6] = [
+        (exl3(("I16", &[4, 96]), &[64], &[]), "p.trellis", "rank 2"),
+        (exl3(("I32", &[4, 2, 48]), &[64], &[]), "p.trellis", "dtype i32"),
+        (exl3(("I16", &[4, 2, 40]), &[64], &[]), "p.trellis", "not 16 x bits"),
+        (exl3(("I16", &[4, 2, 48]), &[48], &[]), "p.suh", "expected f16 [64]"),
+        (exl3(("I16", &[4, 2, 48]), &[64], &[1]), "p.mcg", "expected i32 []"),
+        (detect_group("p", &[("trellis", "I16", &[4, 2, 48]), ("suh", "F16", &[64]), ("svh", "F16", &[32])]),
+            "p.mcg", "missing EXL3 companion"),
+    ];
+    for (result, tensor, reason) in cases {
+        let error = result.unwrap_err();
+        assert_eq!(error.tensor, tensor, "{error}");
+        assert!(error.reason.contains(reason), "{error}");
+    }
+    // Scales: a grid that tiles neither axis, an MXFP4 grid that does not divide K, a BF16 weight with a scale.
+    let bad_fp8 = detect_group("w", &[("weight", "F8_E4M3", &[256, 256]), ("weight_scale_inv", "F32", &[2, 3])]);
+    assert_eq!(bad_fp8.unwrap_err().tensor, "w.weight_scale_inv");
+    let bad_mx = detect_group("e", &[("weight", "U8", &[64, 96]), ("weight_scale", "U8", &[64, 5])]);
+    assert!(bad_mx.unwrap_err().reason.contains("does not tile"));
+    let bf16_scaled = detect_group("n", &[("weight", "BF16", &[64]), ("scale", "F32", &[1])]);
+    assert_eq!(bf16_scaled.unwrap_err().tensor, "n.scale");
+    let mx = detect_group("e", &[("weight", "U8", &[64, 96]), ("weight_scale", "U8", &[64, 6])]).unwrap();
+    assert!(mx.is_mxfp4(32) && mx.logical == [64, 192]);
+}
+
+#[test]
+fn nvfp4_operand_carries_its_global_and_input_scales() {
+    let nvfp4 = detect_group("e", &[("weight", "U8", &[64, 64]), ("weight_scale", "F8_E4M3", &[64, 8]),
+        ("weight_scale_2", "F32", &[]), ("input_scale", "F32", &[])]).unwrap();
+    assert!(nvfp4.is_nvfp4() && nvfp4.input_scale.is_some());
+    assert_eq!((nvfp4.label(), nvfp4.logical.clone()), ("nvfp4-g16".to_string(), vec![64, 128]));
+    // An E4M3 per-16 grid without the FP32 global scale is not NVFP4.
+    let partial = detect_group("e", &[("weight", "U8", &[64, 64]), ("weight_scale", "F8_E4M3", &[64, 8])]).unwrap();
+    assert!(!partial.is_nvfp4());
+}
+
+#[test]
+fn segmented_fused_qkv_resolves_checkpoint_shards() {
+    let dir = snapshot_tp(mimo_pro_config(), &mimo_pro_tensors(), Some(8));
+    let report = plan(dir.path(), &sparks(6)).unwrap();
+    let attention = component(&report, Component::Attention);
+    assert_eq!(attention.status, Status::Ready, "{}", render(&report));
+    // 8 shards x [q | k | v]: 24 segments, each its own 128-row grid.
+    assert!(attention.formats.contains_key("fp8-block128x128/f32-segmented24"), "{:?}", attention.formats);
+    assert!(report.executable(), "{}", render(&report));
+    // The same rows read as TP4 shards do not tile the 216-row grid.
+    let dir = snapshot_tp(mimo_pro_config(), &mimo_pro_tensors(), Some(4));
+    let report = plan(dir.path(), &sparks(6)).unwrap();
+    assert_eq!(component(&report, Component::Attention).status, Status::MissingKernel);
+    assert!(rejected(&report, Component::Attention)[0].contains("fused qkv_proj"), "{}", render(&report));
+}
+
+#[test]
+fn glm5_coordinator_bf16_and_f32_are_unsupported_where_decode_reads_fp8() {
+    let mut tensors = glm5_tensors(|name, n, k| fp8(name, n, k, None));
+    tensors.retain(|(name, ..)| !name.contains("layers.1.self_attn.q_b_proj") && !name.contains("layers.1.self_attn.o_proj")
+        && !name.contains("layers.1.self_attn.kv_b_proj"));
+    tensors.push(t("model.layers.1.self_attn.q_b_proj.weight", "BF16", &[16384, 2048]));
+    tensors.push(t("model.layers.1.self_attn.o_proj.weight", "F32", &[6144, 16384]));
+    // kv_b_proj is staged through BF16 rows: BF16 is fine there.
+    tensors.push(t("model.layers.1.self_attn.kv_b_proj.weight", "BF16", &[28672, 512]));
+    let dir = snapshot(glm5_config(), &tensors);
+    let report = plan(dir.path(), &PlanOptions::default()).unwrap();
+    let attention = component(&report, Component::Attention);
+    assert_eq!((attention.status, attention.rejected), (Status::MissingKernel, 2), "{}", render(&report));
+    let reasons = rejected(&report, Component::Attention).join("\n");
+    assert!(reasons.contains("model.layers.1.self_attn.q_b_proj: serve-glm's decode programs read q_b_proj as checkpoint FP8"),
+        "{reasons}");
+    assert!(reasons.contains("model.layers.1.self_attn.o_proj: ") && reasons.contains("found f32"), "{reasons}");
+    // A BF16 router bias (FP32 in every GLM checkpoint) is refused too.
+    let mut tensors = glm5_tensors(|name, n, k| fp8(name, n, k, None));
+    tensors.retain(|(name, ..)| !name.ends_with("e_score_correction_bias"));
+    tensors.push(t("model.layers.1.mlp.gate.e_score_correction_bias", "BF16", &[256]));
+    let report = plan(snapshot(glm5_config(), &tensors).path(), &PlanOptions::default()).unwrap();
+    assert_eq!(component(&report, Component::Router).status, Status::MissingKernel);
+}
+
+#[test]
+fn glm5_flash_mixed_exl3_tiers_share_one_package() {
+    let mut tensors = vec![t("model.language_model.layers.1.mlp.gate.weight", "BF16", &[288, 4096])];
+    let mut projections = Vec::new();
+    for expert in 0..288 {
+        let bits = 3 + expert % 2;
+        for (proj, n, k) in [("gate_proj", 2048, 4096), ("up_proj", 2048, 4096), ("down_proj", 4096, 2048)] {
+            let name = format!("model.language_model.layers.1.mlp.experts.{expert}.{proj}");
+            tensors.extend(exl3(&name, n, k, bits));
+            projections.push((name, bits, k, n));
+        }
+    }
+    let mut config = glm5_flash_config(2);
+    config["quantization_config"] = exl3_compact(3);
+    let dir = snapshot(config, &tensors);
+    write_quantize_config(dir.path(), &exl3_manifest(&exl3_compact(3), &projections));
+    let report = plan(dir.path(), &sparks(3)).unwrap();
+    let experts = component(&report, Component::RoutedExpert);
+    assert_eq!(experts.status, Status::Ready, "{}", render(&report));
+    assert_eq!(experts.formats.len(), 2);
+    let contract = report.experts.as_ref().unwrap();
+    assert_eq!((contract.package.as_str(), contract.spark_worlds.as_slice()), ("glmf:exl3-k34", &[2, 3, 4, 6][..]));
+    assert!(report.executable(), "{}", render(&report));
+    // Without its storage map the expert service refuses the same tensors.
+    std::fs::remove_file(dir.path().join("quantize_config.json")).unwrap();
+    let report = plan(dir.path(), &sparks(3)).unwrap();
+    assert!(rejected(&report, Component::RoutedExpert)[0].contains("quantize_config.json"), "{}", render(&report));
+}
+
+// --- R07: MiMo serves, with a precise contract ------------------------------
+
+/// The review's observation: the MiMo family reported Planned although
+/// serve-mimo runs it. It is Serving now.
+#[test]
+fn observed_mimo_runtime_still_planned() {
+    let report = plan(snapshot_tp(mimo_flash_config(), &mimo_flash_tensors(), Some(1)).path(), &sparks(4)).unwrap();
+    assert_eq!(report.runtime, Some(RuntimeStatus::Serving));
+    assert!(report.components.iter().all(|c| c.status != Status::Planned), "{}", render(&report));
+}
+
+#[test]
+fn mimo_flash_complete_inventory_is_ready() {
+    let dir = snapshot_tp(mimo_flash_config(), &mimo_flash_tensors(), Some(1));
+    let report = plan(dir.path(), &sparks(4)).unwrap();
+    assert!(report.executable(), "{}", render(&report));
+    // The full layer's k_proj grid restarts per 192-row head (4 heads).
+    assert!(component(&report, Component::Attention).formats.contains_key("fp8-block128x128/f32-segmented4"));
+    let contract = report.experts.as_ref().unwrap();
+    assert_eq!((contract.package.as_str(), contract.block), ("mimo:fp8", 128));
+    assert_eq!(contract.spark_worlds, [2, 4, 6]);
+    assert!(contract.local.is_ok());
+    // fp8-mimo has no tp3 layout (16 blocks do not split in three).
+    let report = plan(dir.path(), &sparks(3)).unwrap();
+    assert!(!report.placement_supported && !report.executable());
+    assert!(report.hints.iter().any(|h| h.what.contains("no mimo:fp8 layout for 3 Spark ranks")));
+}
+
+#[test]
+fn mimo_pro_complete_inventory_needs_its_packaged_worlds() {
+    let dir = snapshot_tp(mimo_pro_config(), &mimo_pro_tensors(), Some(8));
+    for (ranks, executable) in [(0, true), (2, true), (3, false), (4, false), (6, true)] {
+        let report = plan(dir.path(), &sparks(ranks)).unwrap();
+        assert_eq!(report.executable(), executable, "{ranks} ranks\n{}", render(&report));
+    }
+    let report = plan(dir.path(), &sparks(6)).unwrap();
+    let contract = report.experts.as_ref().unwrap();
+    assert_eq!((contract.package.as_str(), contract.block, contract.spark_worlds.as_slice()),
+        ("mimop:fp8 (MXFP4)", 32, &[2, 6][..]));
+    // TP6 of 2048 in 32-row blocks: 352 rows, stored 384 wide.
+    assert!((report.spark_rank_share - 384.0 / 2048.0).abs() < 1e-12);
+}
+
+#[test]
+fn mimo_unsupported_inventories_name_the_tensors() {
+    // V2 Flash geometry with MXFP4 experts: the mimo package runs E4M3.
+    let mut tensors = mimo_flash_tensors();
+    tensors.retain(|(name, ..)| !name.contains(".experts."));
+    for (proj, n, k) in [("gate_proj", 2048, 4096), ("up_proj", 2048, 4096), ("down_proj", 4096, 2048)] {
+        tensors.extend(mxfp4(&format!("model.layers.1.mlp.experts.0.{proj}"), n, k));
+    }
+    let report = plan(snapshot_tp(mimo_flash_config(), &tensors, Some(1)).path(), &sparks(4)).unwrap();
+    assert_eq!(component(&report, Component::RoutedExpert).status, Status::MissingKernel);
+    assert!(rejected(&report, Component::RoutedExpert)[0].contains("mimo:fp8 runs E4M3"));
+    // Sinks on a full-attention layer.
+    let mut tensors = mimo_flash_tensors();
+    tensors.push(t("model.layers.0.self_attn.attention_sink_bias", "BF16", &[64]));
+    let report = plan(snapshot_tp(mimo_flash_config(), &tensors, Some(1)).path(), &sparks(4)).unwrap();
+    assert!(rejected(&report, Component::Attention)[0].contains("sinks on a full-attention layer"));
+    // A configuration with full-layer sinks: the programs refuse every coordinator part.
+    let mut config = mimo_flash_config();
+    config["add_full_attention_sink_bias"] = json!(true);
+    let report = plan(snapshot_tp(config, &mimo_flash_tensors(), Some(1)).path(), &sparks(4)).unwrap();
+    assert!(!report.executable());
+    assert!(rejected(&report, Component::Embedding)[0].contains("sinks on SWA layers only"));
+    // A geometry no program family is built for.
+    let mut config = mimo_flash_config();
+    config["num_attention_heads"] = json!(32);
+    config["swa_num_attention_heads"] = json!(32);
+    let report = plan(snapshot_tp(config, &mimo_flash_tensors(), Some(1)).path(), &sparks(4)).unwrap();
+    assert!(rejected(&report, Component::Embedding)[0].contains("no mimo program geometry"), "{}", render(&report));
+}
+
+// --- R08: one canonical configuration per family ----------------------------
+
+fn transformers_spelling(mut config: Value) -> Value {
+    let object = config.as_object_mut().unwrap();
+    let pattern = object.remove("hybrid_layer_pattern").unwrap();
+    let freq = object.remove("moe_layer_freq").unwrap();
+    object.insert("layer_types".into(), pattern.as_array().unwrap().iter()
+        .map(|p| if p == 0 { "full_attention" } else { "sliding_attention" }).collect());
+    object.insert("mlp_layer_types".into(), freq.as_array().unwrap().iter()
+        .map(|f| if f == 0 { "dense" } else { "sparse" }).collect());
+    config
+}
+
+/// The planner's layer, compared field by field with the runtime's reading.
+fn assert_layers_match_runtime(spec: &ModelSpec, cfg: &MimoV2Config) {
+    assert_eq!(spec.layers.len(), cfg.layers);
+    for (layer, planned) in spec.layers.iter().enumerate() {
+        let attention = cfg.attention[layer];
+        let expected = match attention {
+            MimoAttention::Full => AttentionKind::Gqa { heads: cfg.heads, kv_heads: cfg.full_kv_heads, head_dim: cfg.head_dim },
+            MimoAttention::Sliding => AttentionKind::SlidingGqa { heads: cfg.heads, kv_heads: cfg.swa_kv_heads,
+                head_dim: cfg.head_dim, window: cfg.window, sinks: cfg.swa_sinks },
+        };
+        assert_eq!(planned.attention, expected, "layer {layer}");
+        assert_eq!(planned.ffn == FfnKind::Moe, !cfg.dense[layer], "layer {layer}");
+        assert_eq!(planned.rope, Some(spec::RopeSpec { dims: cfg.rope_dim, theta: cfg.rope_theta(attention) }));
+    }
+    let moe = spec.moe.as_ref().unwrap();
+    assert_eq!((moe.experts, moe.top_k, moe.intermediate, moe.routed_scaling),
+        (cfg.experts, cfg.topk, cfg.moe_intermediate, Some(cfg.routed_scale)));
+}
+
+/// The review's observation: the runtime read `layer_types` / `mlp_layer_types`
+/// while the planner fell back to all-full, all-dense. Both now read the one
+/// canonical configuration.
+#[test]
+fn observed_mimo_planner_disagrees_with_runtime_layer_types() {
+    let config = transformers_spelling(mimo_flash_config());
+    let report = plan(snapshot_tp(config.clone(), &mimo_flash_tensors(), Some(1)).path(), &sparks(4)).unwrap();
+    let spec = report.spec.as_ref().unwrap();
+    assert!(matches!(spec.layers[1].attention, AttentionKind::SlidingGqa { sinks: true, window: 128, .. }));
+    assert_eq!(spec.layers[1].ffn, FfnKind::Moe);
+    assert_layers_match_runtime(spec, &MimoV2Config::from_hf(&config).unwrap());
+    assert!(report.executable(), "{}", render(&report));
+}
+
+#[test]
+fn mimo_spellings_give_identical_planner_and_runtime_geometry() {
+    let hub = mimo_flash_config();
+    let transformers = transformers_spelling(hub.clone());
+    let mut both = hub.clone();
+    both["layer_types"] = transformers["layer_types"].clone();
+    both["mlp_layer_types"] = transformers["mlp_layer_types"].clone();
+    let runtime = MimoV2Config::from_hf(&hub).unwrap();
+    let mut specs = Vec::new();
+    for config in [hub, transformers, both] {
+        assert_eq!(MimoV2Config::from_hf(&config).unwrap(), runtime);
+        let report = plan(snapshot_tp(config, &mimo_flash_tensors(), Some(1)).path(), &sparks(4)).unwrap();
+        let spec = report.spec.unwrap();
+        assert_layers_match_runtime(&spec, &runtime);
+        specs.push((spec.layers, spec.moe));
+    }
+    assert!(specs.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
+#[test]
+fn mimo_partial_or_conflicting_patterns_are_refused_alike() {
+    let base = mimo_flash_config();
+    let mut short = base.clone();
+    short["moe_layer_freq"] = json!([0]);
+    let mut scalar = base.clone();
+    scalar["moe_layer_freq"] = json!(1);
+    let mut conflict = base.clone();
+    conflict["layer_types"] = json!(["full_attention", "full_attention"]);
+    let mut unknown = base.clone();
+    unknown["hybrid_layer_pattern"] = json!([0, 2]);
+    for config in [short, scalar, conflict, unknown] {
+        let runtime = MimoV2Config::from_hf(&config).map(|_| ()).unwrap_err();
+        let report = plan(snapshot_tp(config, &mimo_flash_tensors(), Some(1)).path(), &sparks(4)).unwrap();
+        assert_eq!(report.config_error.as_deref(), Some(format!("{runtime:#}").as_str()));
+        assert!(!report.executable() && report.components.is_empty());
+    }
+}
+
+#[test]
+fn mimo_defaults_are_the_runtime_defaults() {
+    // No patterns and no sink flags: full attention on layer 0 and every sixth
+    // layer, layer 0 dense, SWA sinks on (the runtime's defaults).
+    let mut config = mimo_flash_config();
+    for key in ["hybrid_layer_pattern", "moe_layer_freq", "add_swa_attention_sink_bias", "add_full_attention_sink_bias",
+        "sliding_window_size"] {
+        config.as_object_mut().unwrap().remove(key);
+    }
+    let runtime = MimoV2Config::from_hf(&config).unwrap();
+    assert!(runtime.swa_sinks && !runtime.full_sinks);
+    let report = plan(snapshot_tp(config, &mimo_flash_tensors(), Some(1)).path(), &sparks(4)).unwrap();
+    assert_layers_match_runtime(report.spec.as_ref().unwrap(), &runtime);
+    assert!(report.executable(), "{}", render(&report));
+}
+
+#[test]
+fn glm_and_qwen_patterns_follow_their_runtime_readers() {
+    // GLM 5.x: dense layers are a prefix; GLM Flash and Qwen: patterns cover exactly every layer.
+    let mut gap = glm5_config();
+    gap["mlp_layer_types"] = json!(["sparse", "dense"]);
+    gap["first_k_dense_replace"] = json!(0);
+    let mut short_flash = glm5_flash_config(2);
+    short_flash["text_config"]["layer_types"] = json!(["linear_attention"]);
+    let mut short_qwen = qwen4_config(4);
+    short_qwen["text_config"]["layer_types"] = json!(vec!["linear_attention"; 3]);
+    for (config, needle) in [(gap, "prefix"), (short_flash, "layer_types has 1 entries"), (short_qwen, "layer_types has 3")] {
+        let report = plan(snapshot(config, &[t("lm_head.weight", "BF16", &[64, 64])]).path(), &sparks(4)).unwrap();
+        assert!(report.config_error.as_deref().is_some_and(|e| e.contains(needle)), "{:?}", report.config_error);
+    }
+    // GLM 5.3's spec is the runtime's: indexers, dense prefix and RoPE.
+    let report = plan(snapshot(glm5_config(), &glm5_tensors(|n, r, k| fp8(n, r, k, None))).path(), &sparks(4)).unwrap();
+    let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&glm5_config()).unwrap();
+    let spec = report.spec.unwrap();
+    assert_eq!(spec.layers[1].attention, AttentionKind::MlaDsa { indexer: false });
+    assert_eq!(spec.layers.iter().filter(|l| l.ffn != FfnKind::Moe).count(), cfg.first_moe_layer);
+    assert_eq!(spec.layers[0].rope, Some(spec::RopeSpec { dims: 64, theta: 8e6 }));
+}
+
+#[test]
+fn deepseek_v4_plan_reads_the_runtime_config_source() {
+    // serve-dsv4 reads inference/config.json when the snapshot has one; so does the plan.
+    let hf = json!({"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4"});
+    let mut ratios = vec![0, 0];
+    ratios.extend([4, 128, 4]);
+    let args = json!({
+        "vocab_size": 64, "dim": 4096, "moe_inter_dim": 2048, "n_layers": 4, "n_hash_layers": 1, "n_heads": 64,
+        "n_routed_experts": 256, "n_shared_experts": 1, "n_activated_experts": 6, "score_func": "sqrtsoftplus",
+        "route_scale": 1.5, "swiglu_limit": 10.0, "q_lora_rank": 1024, "head_dim": 512, "rope_head_dim": 64,
+        "o_groups": 8, "o_lora_rank": 1024, "window_size": 128, "original_seq_len": 65536, "rope_theta": 10000,
+        "rope_factor": 16, "beta_fast": 32, "beta_slow": 1, "index_n_heads": 64, "index_head_dim": 128,
+        "index_topk": 512, "hc_mult": 4, "hc_sinkhorn_iters": 20, "compress_rope_theta": 160000,
+        "compress_ratios": ratios[1..].to_vec()
+    });
+    let dir = snapshot(hf, &[t("embed.weight", "BF16", &[64, 4096])]);
+    std::fs::create_dir_all(dir.path().join("inference")).unwrap();
+    std::fs::write(dir.path().join("inference/config.json"), serde_json::to_vec(&args).unwrap()).unwrap();
+    let report = plan(dir.path(), &sparks(4)).unwrap();
+    let spec = report.spec.as_ref().expect("planned from inference/config.json");
+    let cfg = crate::families::deepseek_v4::DeepseekV4Config::read(dir.path(), 0).unwrap();
+    let ratios: Vec<usize> = spec.layers.iter().map(|l| match l.attention {
+        AttentionKind::CompressedMla { ratio, .. } => ratio,
+        _ => unreachable!(),
+    }).collect();
+    assert_eq!(ratios, cfg.compress_ratios);
+    assert_eq!(spec.layers[1].rope, Some(spec::RopeSpec { dims: 64, theta: 160000.0 }));
+}
+
+#[test]
+fn launch_descriptions_match_the_shared_fixtures() {
+    let fixtures: Vec<Value> =
+        serde_json::from_str(include_str!("../../tests/fixtures/launch-families.json")).unwrap();
+    assert!(fixtures.len() >= 10);
+    for case in fixtures {
+        let described = launch::describe(&case["config"]).map(|d| d.line()).ok();
+        assert_eq!(described.as_deref(), case["line"].as_str(), "{}", case["name"]);
+    }
+}
+
+// --- R09: placement options --------------------------------------------------
+
+/// The review's observation: `--spark-ranks 0` divided by zero. Zero ranks is
+/// the local-only placement: every routed expert on the coordinator GPU.
+#[test]
+fn observed_zero_ranks_panics() {
+    let dir = qwen_snapshot(4);
+    let report = plan(dir.path(), &sparks(0)).unwrap();
+    assert_eq!((report.placement, report.spark_ranks), (ExpertPlacement::Local, 0));
+    assert!(report.placement_supported && report.fits, "{}", render(&report));
+    assert_eq!(component(&report, Component::RoutedExpert).owner.label(report.placement), "rtx (local)");
+    // Over the coordinator budget: the shortfall is named.
+    let tight = PlanOptions { coordinator_budget_bytes: 1 << 20, ..sparks(0) };
+    let report = plan(dir.path(), &tight).unwrap();
+    assert!(!report.fits && report.hints.iter().any(|h| h.what.contains("over the 0 GiB budget")), "{}", render(&report));
+    // GLM 5.x has no local expert package.
+    let report = plan(snapshot(glm5_config(), &glm5_tensors(|n, r, k| fp8(n, r, k, None))).path(), &sparks(0)).unwrap();
+    assert!(!report.placement_supported && !report.executable());
+    assert!(report.hints.iter().any(|h| h.what.contains("unsupported: no local expert package for glm5")));
+}
+
+#[test]
+fn spark_rank_options_follow_transport_and_packages() {
+    let flash = snapshot_tp(mimo_flash_config(), &mimo_flash_tensors(), Some(1));
+    let qwen = qwen_snapshot(4);
+    let dsv41 = snapshot(v41_config(), &[t("layers.0.ffn.experts.0.w1.weight", "I8", &[2304, 2560]),
+        t("layers.0.ffn.experts.0.w1.scale", "F8_E8M0", &[2304, 160])]);
+    for ranks in 0..=8 {
+        let options = sparks(ranks);
+        if !matches!(ranks, 0 | 2 | 3 | 4 | 6) {
+            let error = plan(flash.path(), &options).unwrap_err();
+            assert!(matches!(error, PlanError::InvalidOption { option: "spark ranks", .. }), "{ranks}: {error}");
+            continue;
+        }
+        // mimo:fp8: local, tp2/tp4/tp6; qwen4:exl3: local, 2/3/4; V4.1: Sparks 2/3/4/6 only.
+        assert_eq!(plan(flash.path(), &options).unwrap().placement_supported, ranks != 3, "mimo {ranks}");
+        assert_eq!(plan(qwen.path(), &options).unwrap().placement_supported, ranks != 6, "qwen {ranks}");
+        assert_eq!(plan(dsv41.path(), &options).unwrap().placement_supported, ranks != 0, "v41 {ranks}");
+    }
+}
+
+#[test]
+fn invalid_budgets_are_typed_option_errors() {
+    for gib in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0, 1e30, f64::MIN_POSITIVE] {
+        assert!(matches!(budget_bytes("--spark-budget-gib", gib), Err(PlanError::InvalidOption { .. })), "{gib}");
+    }
+    assert_eq!(budget_bytes("--spark-budget-gib", 100.0).unwrap(), 100 << 30);
+    let dir = qwen_snapshot(4);
+    for options in [PlanOptions { spark_budget_bytes: 0, ..sparks(4) }, PlanOptions { coordinator_budget_bytes: 0, ..sparks(0) }] {
+        assert!(matches!(plan(dir.path(), &options), Err(PlanError::InvalidOption { .. })));
+    }
+}
+
+#[test]
+fn capacity_suggests_a_packaged_rank_count() {
+    // One layer of Qwen EXL3 K4 experts.
+    let dir = qwen_snapshot(4);
+    let routed = component(&plan(dir.path(), &sparks(2)).unwrap(), Component::RoutedExpert).bytes;
+    // Qwen's 5 blocks over 2, 3, 4 ranks: the widest holds 3/5, 2/5, 2/5 (padded to 128 rows).
+    let budget = (routed as f64 * 0.45) as u64;
+    let report = plan(dir.path(), &PlanOptions { spark_budget_bytes: budget, ..sparks(2) }).unwrap();
+    assert!(!report.fits && report.min_spark_ranks == Some(3), "{}", render(&report));
+    let report = plan(dir.path(), &PlanOptions { spark_budget_bytes: budget, ..sparks(3) }).unwrap();
+    assert!(report.fits && report.executable(), "{}", render(&report));
 }
 
 #[test]
 fn capacity_counts_the_widest_rank_of_an_uneven_split() {
     // 2048 = 16 whole 128-blocks: six ranks hold 3, 3, 3, 3, 2, 2 of them, so the
     // widest carries 3/16 of the routed bytes, not 1/6.
-    let config = json!({"architectures": ["Glm5NextForConditionalGeneration"], "text_config": {
-        "hidden_size": 64, "vocab_size": 8, "num_hidden_layers": 2, "n_routed_experts": 2,
-        "num_experts_per_tok": 1, "moe_intermediate_size": 2048, "kv_lora_rank": 512, "qk_rope_head_dim": 0,
-        "qk_nope_head_dim": 256, "v_head_dim": 256, "index_topk": 2048, "index_kpool": 4,
-        "index_kpool_always_select_tail": true, "hc_mult": 4, "hc_sinkhorn_iters": 20, "swiglu_limit": 10.0,
-        "layer_types": ["linear_attention", "deepseek_sparse_attention"], "mlp_layer_types": ["dense", "sparse"],
-        "linear_attn_config": {"num_heads": 64, "head_dim": 128, "short_conv_kernel_size": 4, "gate_lower_bound": -5.0}}});
-    let dir = snapshot(config, &[("model.language_model.layers.1.mlp.experts.0.gate_proj.weight", "F8_E4M3",
-        vec![1024, 1024])]);
-    let report = plan(dir.path(), &PlanOptions { spark_ranks: 6, spark_budget_bytes: 180 << 10 }).unwrap();
+    let mut tensors = vec![t("model.language_model.layers.1.mlp.gate.weight", "BF16", &[288, 4096])];
+    for proj in ["gate_proj", "up_proj"] {
+        tensors.extend(fp8(&format!("model.language_model.layers.1.mlp.experts.0.{proj}"), 2048, 4096, None));
+    }
+    tensors.extend(fp8("model.language_model.layers.1.mlp.experts.0.down_proj", 4096, 2048, None));
+    let dir = snapshot(glm5_flash_config(2), &tensors);
+    let routed = component(&plan(dir.path(), &sparks(6)).unwrap(), Component::RoutedExpert).bytes as f64;
+    let report = plan(dir.path(), &PlanOptions { spark_budget_bytes: (routed * 0.18) as u64, ..sparks(6) }).unwrap();
     assert!((report.spark_rank_share - 3.0 / 16.0).abs() < 1e-12, "{}", report.spark_rank_share);
-    assert!(!report.fits, "192 KiB on the widest rank exceeds 180 KiB");
-    let report = plan(dir.path(), &PlanOptions { spark_ranks: 6, spark_budget_bytes: 200 << 10 }).unwrap();
-    assert!(report.fits && report.min_spark_ranks == 6);
+    assert!(!report.fits, "3/16 of the routed bytes exceeds 0.18");
+    let report = plan(dir.path(), &PlanOptions { spark_budget_bytes: (routed * 0.19) as u64, ..sparks(6) }).unwrap();
+    assert!(report.fits && report.min_spark_ranks == Some(6), "{}", render(&report));
 }
 
 #[test]
 fn glm_next_facts_and_dflash2_drafter_are_described() {
-    let dir = snapshot(
-        json!({"architectures": ["Glm5NextForConditionalGeneration"], "text_config": {
-            "hidden_size": 64, "vocab_size": 8, "num_hidden_layers": 2, "n_routed_experts": 2,
-            "num_experts_per_tok": 1, "moe_intermediate_size": 32, "kv_lora_rank": 512, "qk_rope_head_dim": 0,
-            "qk_nope_head_dim": 256, "v_head_dim": 256, "index_topk": 2048, "index_kpool": 4,
-            "index_kpool_always_select_tail": true, "hc_mult": 4, "hc_sinkhorn_iters": 20, "swiglu_limit": 10.0,
-            "layer_types": ["linear_attention", "deepseek_sparse_attention"],
-            "mlp_layer_types": ["dense", "sparse"],
-            "linear_attn_config": {"num_heads": 64, "head_dim": 128, "short_conv_kernel_size": 4,
-                                   "gate_lower_bound": -5.0}}}),
-        &[("model.language_model.layers.0.self_attn.A_log", "F32", vec![64])],
-    );
+    let dir = snapshot(glm5_flash_config(2), &[t("model.language_model.layers.0.self_attn.A_log", "F32", &[64])]);
     let report = plan(dir.path(), &PlanOptions::default()).unwrap();
     let notes = report.spec.as_ref().unwrap().notes.join("\n");
     assert!(notes.contains("record 528 B"), "{notes}");
@@ -205,9 +620,19 @@ fn glm_next_facts_and_dflash2_drafter_are_described() {
                "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 1, "head_dim": 16,
                "sliding_window": 2048, "intermediate_size": 128, "num_target_layers": 45,
                "dflash_config": {"block_size": 8, "target_layer_ids": [5, 14]}}),
-        &[("fc.weight", "BF16", vec![64, 128])],
+        &[t("fc.weight", "BF16", &[64, 128])],
     );
     let report = plan(draft.path(), &PlanOptions::default()).unwrap();
     assert_eq!(report.family.as_deref(), Some("dflash2"));
     assert!(report.spec.unwrap().notes[0].contains("taps [5, 14] of a 45-layer target"));
+}
+
+#[test]
+fn formats_count_logical_weights() {
+    let dir = snapshot_tp(mimo_flash_config(), &mimo_flash_tensors(), Some(1));
+    let report = plan(dir.path(), &sparks(4)).unwrap();
+    let total: BTreeMap<Component, usize> =
+        report.components.iter().map(|c| (c.component, c.formats.values().sum())).collect();
+    // q, k, v, o for two layers, plus one sink.
+    assert_eq!(total[&Component::Attention], 9);
 }

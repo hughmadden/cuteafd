@@ -1,12 +1,12 @@
 //! Qwen 3.8 Flash Next (qwen4_exp): Gated DeltaNet linear attention with a
 //! full-attention layer every fourth (with an indexer), fused expert tensors,
 //! shared expert with a sigmoid gate, hyper-connections and PLE n-gram tables.
-use anyhow::Result;
-use serde_json::Value;
-
-use crate::plan::checkpoint::{opt_usize_field, usize_field, Checkpoint};
-use crate::plan::family::{Family, Hint, RuntimeStatus};
-use crate::plan::format::WeightFormat;
+use super::{bf16, bf16_or_f32, describe, leaf, require};
+use crate::families::qwen4::{Qwen4Attention, Qwen4Config};
+use crate::plan::checkpoint::Checkpoint;
+use crate::plan::experts::{exl3_spark_worlds, fp8_spark_worlds};
+use crate::plan::family::{ConfigError, ExpertContract, Family, FamilyModel, Hint, RuntimeStatus};
+use crate::plan::format::{Encoding, QuantOperand, ScaleEncoding};
 use crate::plan::names::indexed;
 use crate::plan::spec::*;
 
@@ -21,17 +21,8 @@ impl Family for Qwen {
         RuntimeStatus::Serving
     }
 
-    fn executes(&self, component: Component, format: &WeightFormat) -> bool {
-        use WeightFormat::*;
-        // qwen4 programs: BF16 coordinator tensors; the PLE table in BF16 or
-        // E4M3 with one scale; routed experts from EXL3 K4/K5 packages
-        // (qwen4:exl3-k45) or the checkpoint's FP8 128x128 blocks (qwen4:fp8).
-        match component {
-            Component::RoutedExpert => matches!(format, Exl3 { bits: 4..=5 } | Fp8Block { block: (128, 128) }),
-            Component::MappedTable => matches!(format, Bf16 | Fp8PerChannel | Int),
-            Component::Speculator | Component::SpeculatorExpert | Component::Vision => false,
-            _ => matches!(format, Bf16 | F32),
-        }
+    fn expert_catalog(&self) -> bool {
+        true
     }
 
     fn optional(&self, component: Component) -> bool {
@@ -45,64 +36,48 @@ impl Family for Qwen {
             .any(|arch| arch == "Qwen4ExpForConditionalGeneration" || arch == "Qwen4ExpForCausalLM")
     }
 
-    fn spec(&self, checkpoint: &Checkpoint) -> Result<ModelSpec> {
-        let text = checkpoint.text_config();
-        let layers = usize_field(text, "num_hidden_layers")?;
-        let types: Vec<String> = text
-            .get("layer_types")
-            .and_then(Value::as_array)
-            .map(|v| v.iter().filter_map(|t| t.as_str().map(str::to_owned)).collect())
-            .unwrap_or_default();
-        let layer_specs = (0..layers)
-            .map(|layer| LayerSpec {
-                attention: if types.get(layer).map(String::as_str) == Some("linear_attention") {
-                    AttentionKind::GatedDeltaNet
-                } else {
-                    AttentionKind::Gqa {
-                        heads: opt_usize_field(text, "num_attention_heads").unwrap_or(0),
-                        kv_heads: opt_usize_field(text, "num_key_value_heads").unwrap_or(0),
-                        head_dim: opt_usize_field(text, "head_dim").unwrap_or(0),
-                    }
+    fn open(&self, checkpoint: &Checkpoint) -> Result<Box<dyn FamilyModel>, ConfigError> {
+        let cfg = Qwen4Config::from_hf(&checkpoint.config).map_err(ConfigError::from_anyhow)?;
+        let layers = (0..cfg.layers)
+            .map(|layer| match cfg.attention[layer] {
+                Qwen4Attention::Gdn => LayerSpec { attention: AttentionKind::GatedDeltaNet, ffn: FfnKind::Moe, rope: None },
+                Qwen4Attention::Full => LayerSpec {
+                    attention: AttentionKind::Gqa { heads: cfg.heads, kv_heads: cfg.kv_heads, head_dim: cfg.head_dim },
+                    ffn: FfnKind::Moe,
+                    rope: Some(RopeSpec { dims: cfg.rope_dim, theta: cfg.rope_theta }),
                 },
-                ffn: FfnKind::Moe,
             })
             .collect();
-        let ple_layers: Vec<usize> = text
-            .get("ple_layer_ids")
-            .and_then(Value::as_array)
-            .map(|v| v.iter().filter_map(Value::as_u64).map(|v| v as usize).collect())
-            .unwrap_or_default();
-        let mtp = opt_usize_field(text, "mtp_num_hidden_layers").unwrap_or(0);
-        Ok(ModelSpec {
+        let spec = ModelSpec {
             family: "qwen4",
             architecture: checkpoint.architectures().first().cloned().unwrap_or_default(),
-            hidden: usize_field(text, "hidden_size")?,
-            vocab: usize_field(text, "vocab_size")?,
-            layers: layer_specs,
+            hidden: cfg.hidden,
+            vocab: cfg.vocab_size,
+            layers,
             moe: Some(MoeSpec {
-                experts: usize_field(text, "num_experts")?,
-                top_k: usize_field(text, "num_experts_per_tok")?,
-                intermediate: usize_field(text, "moe_intermediate_size")?,
+                experts: cfg.experts,
+                top_k: cfg.topk,
+                intermediate: cfg.moe_intermediate,
                 shared_experts: 1,
-                shared_intermediate: opt_usize_field(text, "shared_expert_intermediate_size").unwrap_or(0),
+                shared_intermediate: cfg.shared_intermediate,
                 scoring: "softmax".into(),
                 routed_scaling: None,
                 groups: None,
             }),
-            speculator: (mtp > 0).then_some(SpeculatorSpec::NativeMtp { layers: mtp }),
-            tables: if ple_layers.is_empty() {
+            speculator: (cfg.mtp_layers > 0).then_some(SpeculatorSpec::NativeMtp { layers: cfg.mtp_layers }),
+            tables: if cfg.ple_layers.is_empty() {
                 Vec::new()
             } else {
-                vec![MappedTableSpec { name: "ple-ngram".into(), layers: ple_layers }]
+                vec![MappedTableSpec { name: "ple-ngram".into(), layers: cfg.ple_layers.clone() }]
             },
             vision: checkpoint.config.get("vision_config").is_some(),
             notes: vec![format!(
                 "hyper-connections {} (low rank {}), indexer budget {}",
-                opt_usize_field(text, "hc_count").unwrap_or(0),
-                opt_usize_field(text, "hc_lowrank").unwrap_or(0),
-                opt_usize_field(text, "indexer_budget").unwrap_or(0)
+                cfg.hc_count, cfg.hc_lowrank, cfg.index_budget
             )],
-        })
+        };
+        let programs = cfg.check_programs().map_err(|e| format!("{e:#}"));
+        Ok(Box::new(QwenModel { spec, programs }))
     }
 
     fn classify(&self, _spec: &ModelSpec, name: &str) -> Option<TensorRole> {
@@ -192,5 +167,80 @@ impl Family for Qwen {
             ),
         };
         Some(Hint { what, how })
+    }
+}
+
+struct QwenModel {
+    spec: ModelSpec,
+    /// `Qwen4Config::check_programs`: the shapes the qwen4 programs are built for.
+    programs: Result<(), String>,
+}
+
+impl FamilyModel for QwenModel {
+    fn spec(&self) -> &ModelSpec {
+        &self.spec
+    }
+
+    fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
+        let name = leaf(stem);
+        match role.component {
+            Component::Speculator | Component::SpeculatorExpert => {
+                return Err("the MTP drafter is not part of the plain serve path".into());
+            }
+            Component::Vision => return Err("text-only: the vision tower is not run".into()),
+            _ => {}
+        }
+        self.programs.clone()?;
+        match role.component {
+            Component::RoutedExpert => {
+                let moe = self.spec.moe.as_ref().ok_or("no MoE geometry")?;
+                let shape = super::deepseek::routed_shape(stem, self.spec.hidden, moe.intermediate)
+                    .ok_or("not a routed projection (gate/up/down_proj)")?;
+                require(operand.logical == shape, || format!("experts are {shape:?}, found {}", describe(operand)))?;
+                require(operand.is_fp8_block(128, &[ScaleEncoding::F32, ScaleEncoding::Bf16])
+                    || matches!(operand.exl3_bits(), Some(4..=5)), || {
+                    format!("routed experts run EXL3 K4/K5 (qwen4:exl3-k45) or E4M3 with 128x128 scales (qwen4:fp8); \
+                        found {}", describe(operand))
+                })
+            }
+            // The n-gram table: BF16 or E4M3 shards (`ngram_embedding.shard_*`)
+            // sharing one table scale (`ngram_embedding.weight_scale`), and its
+            // integer hash parameters.
+            Component::MappedTable => require(
+                operand.is_plain(&[Encoding::Bf16, Encoding::E4m3, Encoding::F32])
+                    || matches!(operand.encoding, Encoding::Int { .. }),
+                || format!("PLE table data must be BF16, unscaled E4M3 shards, FP32 or integer; found {}", describe(operand)),
+            ),
+            _ if matches!(name, "conv1d" | "A_log" | "dt_bias") => bf16_or_f32(operand, name),
+            _ => bf16(operand, "qwen4 coordinator tensors"),
+        }
+    }
+
+    fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
+        let moe = self.spec.moe.as_ref()?;
+        let geometry = cuteafd_core::ExpertGeometry {
+            hidden: self.spec.hidden as u32,
+            experts: moe.experts as u32,
+            topk: moe.top_k as u32,
+            intermediate: moe.intermediate as u32,
+            layers: 0,
+        };
+        if !geometry.same_shape(&cuteafd_core::ExpertGeometry::QWEN4) {
+            return None;
+        }
+        if operand.exl3_bits().is_some() {
+            return Some(ExpertContract {
+                package: "qwen4:exl3-k45".into(),
+                block: 128,
+                spark_worlds: exl3_spark_worlds(moe.intermediate),
+                local: Ok("serve-qwen4 --local-experts (TP1 EXL3 package)".into()),
+            });
+        }
+        operand.is_fp8_block(128, &[ScaleEncoding::F32, ScaleEncoding::Bf16]).then(|| ExpertContract {
+            package: "qwen4:fp8".into(),
+            block: 128,
+            spark_worlds: fp8_spark_worlds(moe.intermediate),
+            local: Ok("serve-qwen4 --local-experts (fp8-qwen4 tp1)".into()),
+        })
     }
 }

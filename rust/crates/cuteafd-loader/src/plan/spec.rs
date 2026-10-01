@@ -26,13 +26,24 @@ pub enum FfnKind {
     Moe,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// Rotary embedding of one layer's attention: the rotated leading dims of
+/// each query/key head and the base.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct RopeSpec {
+    pub dims: usize,
+    pub theta: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LayerSpec {
     pub attention: AttentionKind,
     pub ffn: FfnKind,
+    /// `None` for layers without RoPE (linear attention, no-RoPE MLA) or
+    /// families whose spec does not carry it.
+    pub rope: Option<RopeSpec>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MoeSpec {
     pub experts: usize,
     pub top_k: usize,

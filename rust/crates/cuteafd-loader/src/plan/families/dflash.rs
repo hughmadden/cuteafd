@@ -6,7 +6,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::plan::checkpoint::{opt_usize_field, usize_field, Checkpoint};
-use crate::plan::family::{Family, Hint, RuntimeStatus};
+use crate::plan::family::{ConfigError, Described, Family, FamilyModel, Hint, RuntimeStatus};
 use crate::plan::spec::*;
 
 pub struct DFlash2;
@@ -23,11 +23,34 @@ impl Family for DFlash2 {
         checkpoint.architectures().iter().any(|arch| arch == "DFlash2DraftModel")
     }
 
+    fn open(&self, checkpoint: &Checkpoint) -> Result<Box<dyn FamilyModel>, ConfigError> {
+        self.spec(checkpoint).map(|spec| Box::new(Described(spec)) as Box<dyn FamilyModel>)
+            .map_err(ConfigError::from_anyhow)
+    }
+
+    fn classify(&self, _spec: &ModelSpec, _name: &str) -> Option<TensorRole> {
+        // Every tensor belongs to the drafter; it runs on the coordinator.
+        Some(TensorRole::new(Component::Speculator))
+    }
+
+    fn component_hint(&self, component: Component) -> Option<Hint> {
+        (component == Component::Speculator).then(|| Hint {
+            what: "DFlash2 block drafter attached to a target engine".into(),
+            how: "cuteafd branch work/glm-dflash2 drafts for GLM 5.3 (serve-glm --draft, native/families/glm5/cuda/\
+                  glm_dflash.cu). This variant adds attention_conv/mlp_conv two-tap kernels and taps the mean of \
+                  the target's mHC streams; license is CC-BY-NC-ND (check before shipping)."
+                .into(),
+        })
+    }
+}
+
+impl DFlash2 {
     fn spec(&self, checkpoint: &Checkpoint) -> Result<ModelSpec> {
         let c = &checkpoint.config;
         let dflash = c.get("dflash_config").cloned().unwrap_or(Value::Null);
         let window = opt_usize_field(c, "sliding_window").unwrap_or(0);
         let layer = LayerSpec {
+            rope: None,
             attention: AttentionKind::SlidingGqa {
                 heads: usize_field(c, "num_attention_heads")?,
                 kv_heads: opt_usize_field(c, "num_key_value_heads").unwrap_or(0),
@@ -70,21 +93,6 @@ impl Family for DFlash2 {
             tables: Vec::new(),
             vision: false,
             notes,
-        })
-    }
-
-    fn classify(&self, _spec: &ModelSpec, _name: &str) -> Option<TensorRole> {
-        // Every tensor belongs to the drafter; it runs on the coordinator.
-        Some(TensorRole::new(Component::Speculator))
-    }
-
-    fn component_hint(&self, component: Component) -> Option<Hint> {
-        (component == Component::Speculator).then(|| Hint {
-            what: "DFlash2 block drafter attached to a target engine".into(),
-            how: "cuteafd branch work/glm-dflash2 drafts for GLM 5.3 (serve-glm --draft, native/families/glm5/cuda/\
-                  glm_dflash.cu). This variant adds attention_conv/mlp_conv two-tap kernels and taps the mean of \
-                  the target's mHC streams; license is CC-BY-NC-ND (check before shipping)."
-                .into(),
         })
     }
 }
