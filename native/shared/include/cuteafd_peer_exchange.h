@@ -12,6 +12,15 @@ extern "C" {
 // counter); B owns `recv_state` (u32 [1]: last sequence waited for). All zeroed
 // before first use. Peer access to B must be enabled on A.
 
+// Loads the exchange kernels on the current device (call once per device
+// before any wait is queued: a lazily loaded kernel's first launch may wait for
+// the device to idle, which a spinning wait never lets it do).
+int32_t cuteafd_peer_exchange_initialize(void);
+// `out = bf16(a + b)` over `count` BF16 elements (FP32 add, round to nearest
+// even: the same bits whichever order a GPU passes the two partials in).
+// `out` must not overlap `a` or `b`.
+int32_t cuteafd_peer_add_bf16_async(const void* a, const void* b, void* out, uint64_t count, void* stream);
+
 // On A's stream: copy `bytes` (16-byte aligned, at most 2^40) from local
 // `source` to peer `destination`, then publish the next sequence to the peer
 // `flag` once every block's stores are visible system-wide. `blocks` 0 picks
@@ -19,7 +28,9 @@ extern "C" {
 int32_t cuteafd_peer_push_signal(void* destination, const void* source, uint64_t bytes,
     uint32_t* flag, uint32_t* send_state, uint32_t blocks, void* stream);
 // On B's stream: one warp spins until `flag` reaches the next expected
-// sequence (acquire), so later work on the stream sees the pushed bytes.
+// sequence (acquire), so later work on the stream sees the pushed bytes. After
+// 60 s without it (the peer's stream failed or was never fed) the kernel traps:
+// the stream faults instead of hanging.
 int32_t cuteafd_peer_wait(const uint32_t* flag, uint32_t* recv_state, void* stream);
 
 // P2P probe for `cuteafd fabric --p2p`. Runs one measurement between devices
