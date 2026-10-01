@@ -79,8 +79,24 @@ pub(crate) enum Experts<'a> {
     /// outputs are not the model's).
     Skip,
     /// Spark ranks serving the `fp8` family over RoCE.
-    Spark { transport: RefCell<SparkLink<'a>>, runtime: tokio::runtime::Runtime },
+    /// `lane`: a second transport to the same ranks for the first row lane of
+    /// a pipelined prefill ([`MimoEngine::prefill_capacity`]); `None` keeps
+    /// prefill serial.
+    Spark { transport: RefCell<SparkLink<'a>>, lane: Option<RefCell<SparkLink<'a>>>, runtime: tokio::runtime::Runtime },
 }
+
+/// A dispatched Spark wave and its send-side host phases (seconds).
+struct SentWave {
+    wave: cuteafd_transport::expert::SparkExpertWave,
+    gpu_wait: f64,
+    build: f64,
+    dispatch: f64,
+    sent: std::time::Instant,
+}
+
+/// Fewest rows per lane of a pipelined prefill: at least the DFlash tap ring
+/// (1024 rows) and the MTP hidden ring, which the last lane alone feeds.
+const MIN_LANE_ROWS: usize = 1024;
 
 /// Most rows the FP8 LM head program takes (MmaFp8Gemv's M tile).
 pub(crate) const FP8_ROWS: i32 = 16;
@@ -272,6 +288,8 @@ pub(crate) struct MimoEngine<'a> {
     cos_sin_swa: Dev<'a>,
     workspace: RefCell<Option<Workspace<'a>>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
+    /// The first row lane's workspace of a pipelined prefill (no LM head).
+    lane_workspace: RefCell<Option<Workspace<'a>>>,
     experts: Option<Experts<'a>>,
     pub expert_input: ExpertInput,
     /// Host time per phase: GPU wait before the expert request, the Spark exchange.
@@ -360,7 +378,8 @@ impl<'a> MimoEngine<'a> {
         let (cos_sin_full, cos_sin_swa) = (table(cfg.full_rope_theta)?, table(cfg.swa_rope_theta)?);
         Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, rings, family, device,
             split_family, peer: None, exchange: None, kv, cos_sin_full,
-            cos_sin_swa, workspace: RefCell::new(None), decode_workspace: RefCell::new(None), experts: None,
+            cos_sin_swa, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
+            lane_workspace: RefCell::new(None), experts: None,
             expert_input: ExpertInput::Fp8,
             profile: RefCell::new([0.0; 2]),
             wave_timing: std::env::var("CUTEAFD_MIMO_WAVE_TIMING").is_ok_and(|v| v == "1"), drafter: None, mtp: None, l2: None, embedding,
@@ -514,13 +533,16 @@ impl<'a> MimoEngine<'a> {
     /// Rank `rank`'s workspace for steps of up to `t` rows (rank 1 holds the
     /// attention-side buffers only); allocated on that rank's GPU.
     fn workspace(&self, rank: usize, t: usize, decode: bool) -> Result<Workspace<'a>> {
-        self.on(rank, || self.workspace_here(rank, t, decode))
+        self.on(rank, || self.workspace_here(rank, t, decode, true))
     }
 
-    fn workspace_here(&self, rank: usize, t: usize, decode: bool) -> Result<Workspace<'a>> {
+    /// `head`: the LM head and its logits (only the last row lane of a
+    /// pipelined prefill skips them).
+    fn workspace_here(&self, rank: usize, t: usize, decode: bool, head: bool) -> Result<Workspace<'a>> {
         let (h, heads) = (self.cfg.hidden, self.cfg.heads);
         let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
         let lead = rank == 0;
+        let with_head = lead && head;
         let mut scratch = if lead { self.scratch("mimo_router_scores", false)? } else { 0 };
         // Whole-model programs (MTP layers on rank 0) and the split share's.
         let families: &[bool] = match (self.split_family, lead) {
@@ -535,7 +557,7 @@ impl<'a> MimoEngine<'a> {
                 scratch = scratch.max(self.scratch(&name, split)?);
             }
         }
-        let head_workspace = self.alloc(if lead { VOCABULARY_HEAD_WORKSPACE } else { 256 })?;
+        let head_workspace = self.alloc(if with_head { VOCABULARY_HEAD_WORKSPACE } else { 256 })?;
         let spark = lead && matches!(self.experts, Some(Experts::Spark { .. }));
         let identity: Vec<i64> = (0..t as i64).collect();
         let step_slots = self.alloc(t * 8)?;
@@ -558,7 +580,7 @@ impl<'a> MimoEngine<'a> {
             seq_first: self.alloc(t * 4)?,
             page_table: self.alloc(if decode { t * self.pages * 4 } else { self.pages * 4 })?,
             scratch: self.alloc(scratch)?,
-            logits: self.alloc(lead_only(t * self.cfg.vocab_size * 4))?,
+            logits: self.alloc(if with_head { t * self.cfg.vocab_size * 4 } else { 256 })?,
             router_logits: self.alloc(lead_only(t * self.cfg.experts * 4))?,
             route_ids: self.alloc(lead_only(t * self.cfg.topk * 4))?,
             route_weights: self.alloc(lead_only(t * self.cfg.topk * 4))?,
@@ -573,7 +595,7 @@ impl<'a> MimoEngine<'a> {
             ids: self.alloc(t * 4)?,
             select: self.alloc(t * 8)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
-            head: if lead {
+            head: if with_head {
                 Some(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, t as u32,
                     self.cfg.vocab_size as u32)? })
             } else {
@@ -614,20 +636,140 @@ impl<'a> MimoEngine<'a> {
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<DeviceLogits>> {
         let (t, start) = (tokens.len(), placement.len);
-        ensure!(t > 0 && t <= self.prefill_rows && start + t <= self.max_context, "prefill of {t} rows at {start}");
+        let lanes = self.lanes_ready() && !all_logits && on_layer.is_none() && forced.is_none()
+            && t >= 2 * MIN_LANE_ROWS;
+        let limit = if lanes { 2 * self.prefill_rows } else { self.prefill_rows };
+        ensure!(t > 0 && t <= limit && start + t <= self.max_context, "prefill of {t} rows at {start}");
         let used = (start + t).div_ceil(PAGE_ROWS);
-        let tables = StepTables {
-            decode: false,
-            positions: (start..start + t).map(|p| p as i64).collect(),
-            slots: (start..start + t).map(|p| placement.slot(p)).collect::<Result<_>>()?,
-            ring_slots: (start..start + t).map(|p| placement.ring_slot(p)).collect(),
-            seq_first: vec![0; t],
-            page_table: placement.pages[..used].iter().map(|&page| page as i32).collect(),
-            table_stride: 0,
+        let tables = |first: usize, end: usize| -> Result<StepTables> {
+            Ok(StepTables {
+                decode: false,
+                positions: (first..end).map(|p| p as i64).collect(),
+                slots: (first..end).map(|p| placement.slot(p)).collect::<Result<_>>()?,
+                ring_slots: (first..end).map(|p| placement.ring_slot(p)).collect(),
+                seq_first: vec![0; end - first],
+                page_table: placement.pages[..used].iter().map(|&page| page as i32).collect(),
+                table_stride: 0,
+            })
         };
-        let logits = self.step(&tables, tokens, if all_logits { t } else { 1 }, on_layer, forced)?;
+        let logits = if lanes {
+            // Two row lanes, each as a consecutive chunk would see the cache.
+            let split = t.div_ceil(2);
+            let (first, second) = (tables(start, start + split)?, tables(start + split, start + t)?);
+            self.step_lanes([(&first, &tokens[..split]), (&second, &tokens[split..])])?
+        } else {
+            self.step(&tables(start, start + t)?, tokens, if all_logits { t } else { 1 }, on_layer, forced)?
+        };
         placement.len += t;
         Ok(logits)
+    }
+
+    /// Rows one prefill step takes: twice the programs' rows when prefill
+    /// runs pipelined in two row lanes ([`Self::step_lanes`]).
+    pub fn prefill_capacity(&self) -> usize {
+        if self.lanes_ready() { 2 * self.prefill_rows } else { self.prefill_rows }
+    }
+
+    /// Pipelined prefill is available: Spark experts with a lane transport and
+    /// no head split.
+    fn lanes_ready(&self) -> bool {
+        self.peer.is_none() && matches!(&self.experts, Some(Experts::Spark { lane: Some(_), .. }))
+    }
+
+    /// A prefill step in two row lanes, layer by layer: lane `i` lands its
+    /// previous layer's experts, then queues this layer's attention and router
+    /// and sends its wave, so the GPU works on one lane while the other's
+    /// wave is out. Each lane is exactly a consecutive prefill chunk (lane 0
+    /// writes its KV before lane 1 reads it at every layer). Returns the last
+    /// row's logits.
+    fn step_lanes(&self, lanes: [(&StepTables, &[u32]); 2]) -> Result<Option<DeviceLogits>> {
+        let Some(Experts::Spark { transport, lane: Some(lane), runtime }) = &self.experts else {
+            anyhow::bail!("pipelined prefill needs Spark experts with a lane transport");
+        };
+        for (cell, head) in [(&self.lane_workspace, false), (&self.workspace, true)] {
+            if cell.borrow().is_none() {
+                *cell.borrow_mut() = Some(self.on(0, || self.workspace_here(0, self.prefill_rows, false, head))?);
+            }
+        }
+        let (first, second) = (self.lane_workspace.borrow(), self.workspace.borrow());
+        let w = [first.as_ref().context("lane workspace")?, second.as_ref().context("workspace")?];
+        let t = [lanes[0].1.len(), lanes[1].1.len()];
+        ensure!(t[0] <= w[0].rows && t[1] <= w[1].rows, "prefill lanes exceed their workspaces");
+        let rows = t.map(|t| Scalar::I32(t as i32));
+        // SAFETY: the engine owns this stream; the previous step must be done reading the tables.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        for (i, (tables, tokens)) in lanes.iter().enumerate() {
+            self.put(&w[i].positions, &tables.positions)?;
+            self.put(&w[i].slots, &tables.slots)?;
+            self.put(&w[i].ring_slots, &tables.ring_slots)?;
+            self.put(&w[i].seq_first, &tables.seq_first)?;
+            self.put(&w[i].page_table, &tables.page_table)?;
+            self.embedding.embed(tokens, w[i].ids.buffer, 1, w[i].h.buffer, self.stream)?;
+        }
+        let layers = &self.weights.layers;
+        let bf16_input = self.expert_input.bf16(false);
+        let mut transports = [lane.borrow_mut(), transport.borrow_mut()];
+        let mut inflight: [Option<(usize, SentWave)>; 2] = [None, None];
+        // After a lane's FFN output is in its `delta`: the next input norm, then
+        // the last lane's drafter and MTP taps.
+        let after_ffn = |i: usize, index: usize| -> Result<()> {
+            let weight = match layers.get(index + 1) {
+                Some(next) => next.ptr("input_norm")?,
+                None => self.weights.norm.buffer.ptr,
+            };
+            self.norm(w[i], weight, 1, rows[i])?;
+            if i == 1 {
+                if let Some(drafter) = &self.drafter {
+                    let n = t[1].min(super::dflash::TAP_ROWS);
+                    drafter.tap(index, w[1].h.buffer.ptr, t[1] - n, n)?;
+                }
+                if let (Some(mtp), true) = (&self.mtp, index + 1 == self.cfg.layers) {
+                    self.mtp_tap(mtp, w[1], lanes[1].0)?;
+                }
+            }
+            Ok(())
+        };
+        for i in 0..2 {
+            self.norm(w[i], layers[0].ptr("input_norm")?, 0, rows[i])?;
+        }
+        for (index, layer) in layers.iter().enumerate() {
+            for i in 0..2 {
+                if let Some((previous, sent)) = inflight[i].take() {
+                    self.spark_land(w[i], previous, t[i], &mut transports[i], runtime, sent, None, false)?;
+                    after_ffn(i, previous)?;
+                }
+                self.attention_on(0, w[i], self.kv[index].buffer.ptr, layer, rows[i], "m4096", lanes[i].0)?;
+                self.norm(w[i], layer.ptr("post_norm")?, 1, rows[i])?;
+                if layer.dense {
+                    self.dense_ffn(0, w[i], layer, rows[i], "m4096", false)?;
+                    after_ffn(i, index)?;
+                } else {
+                    self.moe_front(w[i], layer, t[i], bf16_input)?;
+                    inflight[i] = Some((index, self.spark_send(w[i], index, t[i], false, bf16_input, &mut transports[i])?));
+                }
+            }
+        }
+        for i in 0..2 {
+            if let Some((previous, sent)) = inflight[i].take() {
+                self.spark_land(w[i], previous, t[i], &mut transports[i], runtime, sent, None, false)?;
+                after_ffn(i, previous)?;
+            }
+        }
+        if layers.len() < self.cfg.layers {
+            // SAFETY: the engine owns this stream.
+            unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+            return Ok(None);
+        }
+        // SAFETY: the last row lies inside the final norm's output of lane 1.
+        let x = unsafe { w[1].x.buffer.ptr.cast::<u8>().add((t[1] - 1) * self.cfg.hidden * 2) }.cast::<c_void>();
+        // SAFETY: the final norm's output and the head operands are live buffers of these shapes.
+        unsafe {
+            w[1].head.as_ref().context("LM head")?.launch(x.cast(), self.weights.head.buffer.ptr.cast(),
+                w[1].logits.buffer.ptr.cast(), 1, self.stream)?;
+        }
+        let vocab = self.cfg.vocab_size;
+        Ok(Some(DeviceLogits { ptr: w[1].logits.buffer.ptr, rows: 1, vocab, stride: vocab, stream: self.stream,
+            greedy: None }))
     }
 
     /// Appends each sequence's tokens (one for decode, several for a
@@ -1282,12 +1424,10 @@ impl<'a> MimoEngine<'a> {
         }
     }
 
-    fn moe_local(&self, w: &Workspace<'_>, index: usize, layer: &MimoLayer<'_>, t: usize, decode: bool,
-        forward: Option<usize>) -> Result<()> {
+    /// Router scores, the top-k selection and (unless the ranks take BF16
+    /// rows) the FP8 wire rows, all on the stream.
+    fn moe_front(&self, w: &Workspace<'_>, layer: &MimoLayer<'_>, t: usize, bf16_input: bool) -> Result<()> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
-        let experts = self.experts.as_ref().with_context(|| format!(
-            "layer {index} is an MoE layer: pass Spark --peers serving the fp8 family, or --local-experts \
-             (run --layers 1 for the dense layer alone)"))?;
         let rows = Scalar::I32(t as i32);
         self.run("mimo_router_scores", &[("x", w.x.buffer.ptr), layer.router_operand()?,
             ("logits", w.router_logits.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows])?;
@@ -1297,7 +1437,6 @@ impl<'a> MimoEngine<'a> {
                 std::ptr::null(), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t, self.cfg.experts, topk,
                 self.cfg.routed_scale as f32, true, self.stream)?;
         }
-        let bf16_input = matches!(experts, Experts::Spark { .. }) && self.expert_input.bf16(decode);
         let grid = (t * h.div_ceil(256)).div_ceil(8).clamp(1, 4 * 188);
         if !bf16_input {
             self.run("mimo_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
@@ -1305,6 +1444,17 @@ impl<'a> MimoEngine<'a> {
                 ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
                 ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Scalar::I32(grid as i32)])?;
         }
+        Ok(())
+    }
+
+    fn moe_local(&self, w: &Workspace<'_>, index: usize, layer: &MimoLayer<'_>, t: usize, decode: bool,
+        forward: Option<usize>) -> Result<()> {
+        let (h, topk) = (self.cfg.hidden, self.cfg.topk);
+        let experts = self.experts.as_ref().with_context(|| format!(
+            "layer {index} is an MoE layer: pass Spark --peers serving the fp8 family, or --local-experts \
+             (run --layers 1 for the dense layer alone)"))?;
+        let bf16_input = matches!(experts, Experts::Spark { .. }) && self.expert_input.bf16(decode);
+        self.moe_front(w, layer, t, bf16_input)?;
         if !matches!(experts, Experts::Spark { .. }) {
             self.emulated_exchange(index, decode)?;
         }
@@ -1346,7 +1496,7 @@ impl<'a> MimoEngine<'a> {
             Experts::Skip => unsafe {
                 self.library.cuda_zero_bytes_async(w.delta.buffer, t * h * 2, self.stream)
             },
-            Experts::Spark { transport, runtime } => {
+            Experts::Spark { transport, runtime, .. } => {
                 self.spark_moe(w, index, t, decode, bf16_input, &mut transport.borrow_mut(), runtime, forward)
             }
         }
@@ -1357,6 +1507,14 @@ impl<'a> MimoEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn spark_moe(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, bf16_input: bool,
         transport: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime, forward: Option<usize>) -> Result<()> {
+        let sent = self.spark_send(w, index, t, decode, bf16_input, transport)?;
+        self.spark_land(w, index, t, transport, runtime, sent, forward, true)
+    }
+
+    /// The send half of [`Self::spark_moe`]: routes and wire rows down (the
+    /// stream drains first), the request out to every rank.
+    fn spark_send(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, bf16_input: bool,
+        transport: &mut SparkLink<'_>) -> Result<SentWave> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let (route_bytes, wire_bytes) = (t * topk * 4, if bf16_input { t * h * 2 } else { t * (h + h / 32) });
@@ -1414,14 +1572,21 @@ impl<'a> MimoEngine<'a> {
         ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
         let build = built.elapsed().as_secs_f64();
         let timer = std::time::Instant::now();
-        let mut dispatched = 0.0;
-        runtime.block_on(async {
-            let wave = transport.dispatch(&request)?;
-            dispatched = timer.elapsed().as_secs_f64();
-            transport.receive(wave, t, self.stream).await
-        })?;
-        let exchange = timer.elapsed().as_secs_f64();
-        self.profile.borrow_mut()[1] += exchange;
+        let wave = transport.dispatch(&request)?;
+        Ok(SentWave { wave, gpu_wait, build, dispatch: timer.elapsed().as_secs_f64(), sent: timer })
+    }
+
+    /// The land half: receives the wave into the transport's planes and
+    /// queues their sum into `delta` (forwarded to the head split's second GPU
+    /// when `forward`); `drain` waits for the stream after it.
+    #[allow(clippy::too_many_arguments)]
+    fn spark_land(&self, w: &Workspace<'_>, index: usize, t: usize, transport: &mut SparkLink<'_>,
+        runtime: &tokio::runtime::Runtime, sent: SentWave, forward: Option<usize>, drain: bool) -> Result<()> {
+        let h = self.cfg.hidden;
+        let waited = std::time::Instant::now();
+        runtime.block_on(transport.receive(sent.wave, t, self.stream))?;
+        let receive = waited.elapsed().as_secs_f64();
+        self.profile.borrow_mut()[1] += sent.sent.elapsed().as_secs_f64();
         let reduced = std::time::Instant::now();
         // SAFETY: the zero plane and delta are live [t, h] BF16 buffers; the
         // intake planes are ordered after the wave by `receive`.
@@ -1430,13 +1595,15 @@ impl<'a> MimoEngine<'a> {
             if let Some(slot) = forward {
                 self.push(0, slot, w.delta.buffer.ptr, t * h * 2)?;
             }
-            // The next layer's request staging is rewritten only after this drains.
-            self.library.cuda_stream_synchronize(self.stream)?;
+            if drain {
+                // The next layer's request staging is rewritten only after this drains.
+                self.library.cuda_stream_synchronize(self.stream)?;
+            }
         }
         if self.wave_timing {
             eprintln!("mimo_wave layer={index} rows={t} gpu_wait_ms={:.3} build_ms={:.3} dispatch_ms={:.3} \
-                receive_ms={:.3} reduce_ms={:.3}", gpu_wait * 1e3, build * 1e3, dispatched * 1e3,
-                (exchange - dispatched) * 1e3, reduced.elapsed().as_secs_f64() * 1e3);
+                receive_ms={:.3} reduce_ms={:.3}", sent.gpu_wait * 1e3, sent.build * 1e3, sent.dispatch * 1e3,
+                receive * 1e3, reduced.elapsed().as_secs_f64() * 1e3);
         }
         Ok(())
     }

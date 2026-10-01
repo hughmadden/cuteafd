@@ -394,10 +394,10 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             }
             let boundaries = cuteafd_engine::prefix::message_boundaries(&tokens, message_start);
             let plan = if cache.enabled() {
-                cuteafd_engine::prefix::plan_points(resume, tokens.len(), engine.prefill_rows, &boundaries,
+                cuteafd_engine::prefix::plan_points(resume, tokens.len(), engine.prefill_capacity(), &boundaries,
                     family.capture_reach(), prefix.prefix_cache_min_tokens, prefix.points())
             } else {
-                cuteafd_engine::prefix::plan_points(resume, tokens.len(), engine.prefill_rows, &[], 0, 0,
+                cuteafd_engine::prefix::plan_points(resume, tokens.len(), engine.prefill_capacity(), &[], 0, 0,
                     PointPolicy { gap: 0, boundaries: 0, per_request: 0 })
             };
             // A whole-prompt hit brings its first token's logits: nothing to prefill.

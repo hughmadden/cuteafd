@@ -368,9 +368,19 @@ impl Opened {
         let executors: Vec<u64> = (0..peers.len())
             .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
             .collect::<Result<_>>()?;
-        let mut transport = crate::shared::spark_intake::SparkLink::new(&self.library, &peers, &executors,
+        let link = || crate::shared::spark_intake::SparkLink::new(&self.library, &peers, &executors,
             u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
-                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2)?;
+                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2);
+        let mut transport = link()?;
+        // Pipelined prefill (CUTEAFD_MIMO_PREFILL_LANES, 2 by default; 1 keeps
+        // it serial): a second transport carries the first row lane's waves.
+        let lanes = match std::env::var("CUTEAFD_MIMO_PREFILL_LANES").as_deref() {
+            Ok("1") => 1,
+            Ok("2") | Err(_) => 2,
+            Ok(other) => anyhow::bail!("CUTEAFD_MIMO_PREFILL_LANES is 1 or 2, not {other}"),
+        };
+        let mut lane = if lanes == 2 { Some(link()?) } else { None };
+        tracing::info!(lanes, "MiMo prefill lanes");
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         // Connect every rank and register full-size buffers now: the first
         // request otherwise pays seconds of connection setup.
@@ -407,13 +417,20 @@ impl Opened {
                 transport.receive(wave, request.header.row_count as usize, warm_stream).await
             })?;
         }
+        if let Some(lane) = lane.as_mut() {
+            runtime.block_on(async {
+                let wave = lane.dispatch(&warmups[0])?;
+                lane.receive(wave, warmups[0].header.row_count as usize, warm_stream).await
+            })?;
+        }
         // SAFETY: the stream was created above; its waits drain before it goes.
         unsafe {
             self.library.cuda_stream_synchronize(warm_stream)?;
             self.library.cuda_stream_destroy(warm_stream)?;
         }
         tracing::info!(ranks = peers.len(), elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
-        Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport), runtime }))
+        Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport),
+            lane: lane.map(std::cell::RefCell::new), runtime }))
     }
 }
 
@@ -648,16 +665,23 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
         for _ in 0..args.bench_prefill {
             let mut fresh = allocator.admit(n)?;
             let started = Instant::now();
-            for chunk in long.chunks(engine.prefill_rows) {
-                engine.prefill_forced(&mut fresh, chunk, false, None, None)?;
+            let mut last = None;
+            for chunk in long.chunks(engine.prefill_capacity()) {
+                last = engine.prefill_forced(&mut fresh, chunk, false, None, None)?;
             }
             times.push(started.elapsed().as_secs_f64());
+            // Diagnostics: the first prefill's last-row logits (FP32), e.g. to
+            // compare pipelined and serial prefill.
+            if let (Ok(path), Some(logits), 1) = (std::env::var("CUTEAFD_MIMO_BENCH_LOGITS"), last, times.len()) {
+                std::fs::write(&path, logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())
+                    .with_context(|| format!("writing {path}"))?;
+            }
             allocator.release(fresh);
         }
         times.sort_by(f64::total_cmp);
         let median = times[times.len() / 2];
         println!("prefill bench: {n} tokens through {layers} layers in chunks of {}, median {:.1} ms ({:.0} tok/s), \
-            min {:.1} ms", engine.prefill_rows, 1e3 * median, n as f64 / median, 1e3 * times[0]);
+            min {:.1} ms", engine.prefill_capacity(), 1e3 * median, n as f64 / median, 1e3 * times[0]);
     }
     Ok(())
 }
