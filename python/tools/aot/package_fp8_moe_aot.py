@@ -301,7 +301,8 @@ def main() -> None:
     create = commands.add_parser("build")
     create.add_argument("--role", choices=sorted(ROLE_LAYOUTS), required=True)
     create.add_argument("--geometry", choices=("mimo", "mimop", "glm", "glmf", "qwen4", "glm_nvfp4", "glmf_nvfp4",
-                                               "qwen4_nvfp4", "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4"),
+                                               "qwen4_nvfp4", "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4",
+                                               "glmfdense_nvfp4", "glmfdense_nvfp4a4"),
                         required=True)
     create.add_argument("--layouts", help="comma list (default: tp4,tp2,tp6 where they split for spark, "
                         "tp1 for coordinator)")

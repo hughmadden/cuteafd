@@ -332,6 +332,40 @@ struct Workspace<'a> {
     _head_workspace: Dev<'a>,
 }
 
+/// ModelOpt NVFP4 dense MLPs (nvidia/GLM-5.3-Flash-NVFP4 layers 0-2) on the
+/// `fp8-glmfdense-nvfp4` package: one always-selected expert (ids 0, weight 1),
+/// so the route sum is the MLP output exactly.
+pub(crate) struct DenseNvfp4<'a> {
+    pub module: cuteafd_ffi::fp8_moe::Fp8MoeModule,
+    pub scratch: crate::shared::memory::DeviceAllocation<'a>,
+    pub ids: crate::shared::memory::DeviceAllocation<'a>,
+    pub weights: crate::shared::memory::DeviceAllocation<'a>,
+}
+
+impl<'a> DenseNvfp4<'a> {
+    /// Loads the package at `directory` with scratch, ids and weights for `rows` rows.
+    pub fn load(library: &'a NativeLibrary, directory: &std::path::Path, cfg: &GlmNextConfig, rows: usize)
+        -> Result<Self> {
+        // SAFETY: a trusted package for the current device; the engine drains its
+        // stream before dropping it.
+        let module = unsafe { cuteafd_ffi::fp8_moe::Fp8MoeModule::load(directory) }
+            .with_context(|| format!("dense NVFP4 package {} (glmfdense:nvfp4)", directory.display()))?;
+        let info = module.info().clone();
+        ensure!(info.experts == 1 && info.topk == 1 && info.hidden == cfg.hidden
+            && info.intermediate == cfg.dense_intermediate && !info.wire_input
+            && matches!(info.weights, cuteafd_ffi::fp8_moe::Fp8MoeWeights::Nvfp4 { .. }),
+            "{} ({info:?}) is not the dense NVFP4 MLP package", directory.display());
+        let top = info.capacity_for(rows).with_context(|| format!("dense NVFP4 package has no capacity for {rows} rows"))?;
+        let scratch = crate::shared::memory::DeviceAllocation::new(library, module.scratch_bytes(top)?.max(256))?;
+        let ids = crate::shared::memory::DeviceAllocation::new(library, rows * 4)?;
+        library.copy_h2d(ids.buffer, &vec![0u8; rows * 4])?;
+        let weights = crate::shared::memory::DeviceAllocation::new(library, rows * 4)?;
+        let ones: Vec<u8> = (0..rows).flat_map(|_| 1f32.to_le_bytes()).collect();
+        library.copy_h2d(weights.buffer, &ones)?;
+        Ok(Self { module, scratch, ids, weights })
+    }
+}
+
 pub(crate) struct GlmfEngine<'a> {
     pub library: &'a NativeLibrary,
     pub programs: &'a Programs<'a>,
@@ -372,6 +406,7 @@ pub(crate) struct GlmfEngine<'a> {
     /// Pipelined Spark prefill: one workspace of `prefill_rows` rows per lane.
     lane_workspaces: RefCell<Vec<Workspace<'a>>>,
     experts: Option<Experts<'a>>,
+    dense_nvfp4: Option<DenseNvfp4<'a>>,
     /// Host seconds: GPU wait before expert exchanges, the exchanges.
     /// Host seconds per phase: GPU work until each expert exchange (waiting
     /// for the routes and wire rows), the Spark exchanges, and the head (final
@@ -479,7 +514,7 @@ impl<'a> GlmfEngine<'a> {
             kda_state, kda_conv, kda_replay, commit_tables: zeroed(3 * DECODE_ROWS * 4)?, drafter: None, index,
             pool_logical, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
             lane_workspaces: RefCell::new(Vec::new()),
-            experts: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(std::collections::HashMap::new()),
+            experts: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(std::collections::HashMap::new()),
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
             lanes: std::env::var("CUTEAFD_GLMF_PREFILL_LANES").map_or(true, |v| v != "1"),
             subset_lanes: std::env::var("CUTEAFD_GLMF_PREFILL_LANES").is_ok_and(|v| v == "subset"),
@@ -489,6 +524,11 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
+    /// The one-expert NVFP4 package for ModelOpt NVFP4 dense MLPs.
+    pub fn set_dense_nvfp4(&mut self, dense: DenseNvfp4<'a>) {
+        self.dense_nvfp4 = Some(dense);
+    }
+
     pub fn set_experts(&mut self, experts: Experts<'a>) {
         self.experts = Some(experts);
     }
@@ -1265,6 +1305,19 @@ impl<'a> GlmfEngine<'a> {
     /// SwiGLU MLP (dense layer or shared expert) of intermediate `inter` into `out`.
     fn ffn(&self, w: &Workspace<'_>, layer: &GlmfLayer<'_>, inter: usize, cap: &str, out: *mut c_void, rows: Scalar)
         -> Result<()> {
+        if layer.has("nvfp4_w1") {
+            let dense = self.dense_nvfp4.as_ref().context("an NVFP4 dense layer needs the fp8-glmfdense-nvfp4 package")?;
+            let Scalar::I32(rows) = rows else { anyhow::bail!("row count scalar") };
+            let pointers = [w.x.buffer.ptr, dense.ids.buffer.ptr, dense.weights.buffer.ptr, layer.ptr("nvfp4_w1")?,
+                layer.ptr("nvfp4_s1")?, layer.ptr("nvfp4_w3")?, layer.ptr("nvfp4_s3")?, layer.ptr("nvfp4_w2")?,
+                layer.ptr("nvfp4_s2")?, out, dense.scratch.buffer.ptr];
+            // SAFETY: the input rows, the layer's NVFP4 operands, the constant ids/weights
+            // (prefill capacity rows), the output and the scratch are live device buffers
+            // used on the engine stream.
+            return self.timed("ffn (NVFP4 dense)", || unsafe {
+                dense.module.launch(&pointers, usize::try_from(rows)?, self.stream)
+            });
+        }
         let decode = cap == "m64";
         let pointers = [("x", w.x.buffer.ptr), ("w_gate_up_fp8", layer.ptr("w_gate_up_fp8")?),
             ("w_gate_up_scale", layer.ptr("w_gate_up_scale")?), ("w_down_fp8", layer.ptr("w_down_fp8")?),

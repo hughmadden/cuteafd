@@ -405,6 +405,9 @@ impl FamilyModel for GlmModel {
                 Err("the native MTP layer is not run (speculation uses a DFlash2 drafter)".into())
             }
             Component::Vision => Err("text-only: the vision tower is not run".into()),
+            // ModelOpt NVFP4 dense MLPs run natively (serve-glmf: the fp8-glmfdense-nvfp4 package).
+            Component::DenseFfn if self.id == "glm5_flash" && operand.is_nvfp4()
+                && operand.scale.as_ref().is_some_and(|s| s.cols == 16) => Ok(()),
             _ if self.id == "glm5" => self.glm5(stem, operand),
             _ => self.glm5_flash(stem, operand),
         }

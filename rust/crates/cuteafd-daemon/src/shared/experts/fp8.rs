@@ -39,6 +39,18 @@ pub(crate) fn package_directory(native_lib: &Path, tp: usize, format: ExpertForm
     root.join(format!("fp8-{family}{}", format.package_suffix())).join(layout)
 }
 
+/// `<libdir>/fp8/fp8-<geometry>-nvfp4[a4]/tp1`: a coordinator NVFP4 dense-MLP
+/// package (one always-selected expert), W4A4 under `CUTEAFD_NVFP4_ACTIVATIONS=a4`
+/// when built.
+pub(crate) fn dense_package_directory(native_lib: &Path, geometry: &str) -> PathBuf {
+    let root = native_lib.parent().unwrap_or(Path::new(".")).join("fp8");
+    let a4 = root.join(format!("fp8-{geometry}-nvfp4a4")).join("tp1");
+    if nvfp4_activations() == Nvfp4Activations::A4 && a4.is_dir() {
+        return a4;
+    }
+    root.join(format!("fp8-{geometry}-nvfp4")).join("tp1")
+}
+
 /// How NVFP4 experts treat activations (`CUTEAFD_NVFP4_ACTIVATIONS`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Nvfp4Activations {

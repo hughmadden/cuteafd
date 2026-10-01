@@ -9,7 +9,8 @@
 # packed E2M1 x E4M3 per-16 scales widened exactly, FP32 alpha per expert;
 # exporter geometry FAMILY_nvfp4); FAMILY:nvfp4a4 builds fp8-FAMILY-nvfp4a4/,
 # whose large-row steps run W4A4 (activations quantized with the checkpoint's
-# input_scale, block-scaled FP4 MMAs; decode rows stay W4A16).
+# input_scale, block-scaled FP4 MMAs; decode rows stay W4A16). glmfdense:nvfp4[a4]
+# is GLM 5.3 Flash's NVFP4 dense MLP (one always-selected expert, coordinator tp1).
 if(CUTEAFD_CUDA_ARCHITECTURES MATCHES "^120")
   set(CUTEAFD_FP8_MOE_ROLE coordinator)
 elseif(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "121")
@@ -33,7 +34,10 @@ foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
   if(entry MATCHES "^(mimo|mimop|glm|glmf|qwen4):fp8$")
     set(geometry "${CMAKE_MATCH_1}")
     set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-${geometry}")
-  elseif(entry MATCHES "^(glm|glmf|qwen4):(nvfp4|nvfp4a4)$")
+  elseif(entry MATCHES "^(glm|glmf|glmfdense|qwen4):(nvfp4|nvfp4a4)$")
+    if(CMAKE_MATCH_1 STREQUAL "glmfdense" AND CUTEAFD_FP8_MOE_ROLE STREQUAL "spark")
+      continue()  # dense MLPs run on the coordinator only
+    endif()
     set(geometry "${CMAKE_MATCH_1}_${CMAKE_MATCH_2}")
     set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-${CMAKE_MATCH_1}-${CMAKE_MATCH_2}")
   else()
