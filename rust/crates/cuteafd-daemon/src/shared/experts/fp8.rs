@@ -1,6 +1,7 @@
 //! Exact FP8 routed experts (the `fp8` family): the checkpoint's E4M3 expert
 //! weights with FP32 128x128 block scales (or MXFP4, MiMo V2.6 Pro:
-//! `fp8-mimop` packages), resident per TP slice and run by
+//! `fp8-mimop` packages; or ModelOpt NVFP4 run W4A16, `fp8-<family>-nvfp4`
+//! packages), resident per TP slice and run by
 //! an `fp8-<family>` package (`python/tools/aot/package_fp8_moe_aot.py`,
 //! `native/shared/include/cuteafd_fp8_moe.h`). Nothing is re-quantized. Output is
 //! the BF16 `[rows, H]` route sum of the slice: the Spark rank partial of the
@@ -9,20 +10,22 @@ pub(crate) mod worker;
 
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::fp8_moe::{Fp8MoeModule, FP8_MOE_POINTERS};
+use cuteafd_ffi::fp8_moe::{Fp8MoeModule, Fp8MoeWeights, FP8_MOE_POINTERS};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::formats::fp8_experts::{Fp8ExpertTensors, Fp8Projection};
+use cuteafd_loader::formats::fp8_experts::{ExpertFormat, Fp8ExpertTensors, Fp8Projection};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
 /// Parallel readers per layer load.
 const READERS: usize = 16;
 
-/// `<libdir>/fp8/fp8-<family>/tp<world>`: the package layout serving TP
-/// degree `tp` of the process expert geometry.
-pub(crate) fn package_directory(native_lib: &Path, tp: usize) -> PathBuf {
+/// `<libdir>/fp8/fp8-<family>[-nvfp4]/tp<world>`: the package layout serving
+/// TP degree `tp` of the process expert geometry in `format` (NVFP4 releases
+/// share their geometry with the FP8 ones and get packages of their own).
+pub(crate) fn package_directory(native_lib: &Path, tp: usize, format: ExpertFormat) -> PathBuf {
     let family = cuteafd_core::expert_geometry().family().unwrap_or("unknown");
-    native_lib.parent().unwrap_or(Path::new(".")).join("fp8").join(format!("fp8-{family}")).join(format!("tp{tp}"))
+    native_lib.parent().unwrap_or(Path::new(".")).join("fp8")
+        .join(format!("fp8-{family}{}", format.package_suffix())).join(format!("tp{tp}"))
 }
 
 /// The BF16-input sibling of an FP8 package directory:
@@ -34,8 +37,9 @@ pub(crate) fn bf16_sibling(directory: &Path) -> Option<PathBuf> {
     Some(package.with_file_name(format!("{name}-bf16")).join(layout))
 }
 
-/// One layer's resident slice: per projection the E4M3 weights of every
-/// expert (`[E, rows, cols]`) and their FP32 block-scale grids.
+/// One layer's resident slice: per projection the weights of every expert
+/// (`[E, rows, cols]`) and their scale grids (NVFP4: then the experts'
+/// FP32 alphas).
 pub(crate) struct Fp8Layer<'a> {
     pub layer: usize,
     regions: Vec<DeviceAllocation<'a>>,
@@ -46,8 +50,8 @@ impl<'a> Fp8Layer<'a> {
     pub fn bytes(tensors: &Fp8ExpertTensors, tp: usize) -> Result<usize> {
         let experts = tensors.shape().experts;
         Fp8Projection::ALL.iter().try_fold(0usize, |total, &p| {
-            let (w, s) = tensors.slice_bytes(p, tp)?;
-            Ok(total + experts * (w + s))
+            let (w, _) = tensors.slice_bytes(p, tp)?;
+            Ok(total + experts * w + tensors.scale_region_bytes(p, tp)?)
         })
     }
 
@@ -59,15 +63,24 @@ impl<'a> Fp8Layer<'a> {
         for projection in Fp8Projection::ALL {
             let (w_bytes, s_bytes) = tensors.slice_bytes(projection, tp)?;
             let mut weights = vec![0u8; experts * w_bytes];
-            let mut scales = vec![0u8; experts * s_bytes];
-            let mut jobs: Vec<(usize, &mut [u8], &mut [u8])> = weights.chunks_exact_mut(w_bytes)
-                .zip(scales.chunks_exact_mut(s_bytes)).enumerate().map(|(e, (w, s))| (e, w, s)).collect();
+            let mut scales = vec![0u8; tensors.scale_region_bytes(projection, tp)?];
+            // NVFP4: the experts' FP32 alphas follow the scale grids.
+            let (grids, alphas) = scales.split_at_mut(experts * s_bytes);
+            let alpha_bytes = if alphas.is_empty() { 0 } else { 4 };
+            let mut alpha_slots: Vec<&mut [u8]> = alphas.chunks_exact_mut(4).collect();
+            alpha_slots.resize_with(experts, Default::default);
+            let mut jobs: Vec<(usize, &mut [u8], &mut [u8], &mut [u8])> = weights.chunks_exact_mut(w_bytes)
+                .zip(grids.chunks_exact_mut(s_bytes)).zip(alpha_slots).enumerate()
+                .map(|(e, ((w, s), a))| (e, w, s, a)).collect();
             let per = jobs.len().div_ceil(READERS);
             std::thread::scope(|scope| -> Result<()> {
                 let handles: Vec<_> = jobs.chunks_mut(per).map(|chunk| scope.spawn(move || -> Result<()> {
                     let mut staging = Vec::new();
-                    for (expert, w, s) in chunk.iter_mut() {
+                    for (expert, w, s, a) in chunk.iter_mut() {
                         tensors.read_slice(layer, *expert, projection, tp, rank, w, s, &mut staging)?;
+                        if alpha_bytes > 0 {
+                            a.copy_from_slice(&tensors.read_alpha(layer, *expert, projection)?.to_le_bytes());
+                        }
                     }
                     Ok(())
                 })).collect();
@@ -117,9 +130,13 @@ impl<'a> Fp8Experts<'a> {
                 directory.display()))?;
         let info = module.info().clone();
         let shape = tensors.shape();
-        let mxfp4 = tensors.format() == cuteafd_loader::formats::fp8_experts::ExpertFormat::Mxfp4;
+        let weights = match tensors.format() {
+            ExpertFormat::Fp8Block128 => Fp8MoeWeights::Fp8,
+            ExpertFormat::Mxfp4 => Fp8MoeWeights::Mxfp4,
+            ExpertFormat::Nvfp4 => Fp8MoeWeights::Nvfp4,
+        };
         ensure!(info.hidden == shape.hidden && info.experts == shape.experts && info.topk == shape.topk
-            && info.intermediate == shape.intermediate && info.tp == tp && info.mxfp4 == mxfp4
+            && info.intermediate == shape.intermediate && info.tp == tp && info.weights == weights
             && info.slice == tensors.slice(tp)?,
             "FP8 package {} ({info:?}) does not serve this checkpoint at TP{tp}", directory.display());
         let top = info.capacity_for(capacity)
@@ -147,7 +164,7 @@ impl<'a> Fp8Experts<'a> {
         let module = unsafe { Fp8MoeModule::load(directory) }
             .with_context(|| format!("BF16-input FP8 expert package {}", directory.display()))?;
         let (info, main) = (module.info().clone(), self.module.info());
-        ensure!(!info.wire_input && info.hidden == main.hidden && info.experts == main.experts
+        ensure!(!info.wire_input && info.weights == main.weights && info.hidden == main.hidden && info.experts == main.experts
             && info.topk == main.topk && info.intermediate == main.intermediate && info.tp == main.tp,
             "{} ({info:?}) is not the BF16-input form of this FP8 package", directory.display());
         let top = info.capacity_for(capacity)
