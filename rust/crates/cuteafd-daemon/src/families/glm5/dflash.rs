@@ -26,6 +26,7 @@
 //! Madden's glm53f-afd FP8 drafter (MIT, v1.1.0 16de2a6).
 use crate::shared::fp8_linear::{self, Fp8Weight};
 use crate::shared::memory::DeviceAllocation;
+use crate::shared::token_io::TokenEmbedding;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
@@ -209,6 +210,8 @@ struct Workspace<'a> {
     candidates: Dev<'a>,
     projected: Dev<'a>,
     anchors: Dev<'a>,
+    /// The block's input ids (anchor, then mask tokens) for the device embedding gather.
+    ids: Dev<'a>,
     tokens: Dev<'a>,
     features: Dev<'a>,
     positions: Dev<'a>,
@@ -248,6 +251,15 @@ pub(crate) struct ContextRow {
 pub(crate) struct Draft {
     pub tokens: Vec<u32>,
     pub features: Vec<[f32; 4]>,
+}
+
+/// Where a draft step's input rows come from.
+#[derive(Clone, Copy)]
+enum DraftInput<'r, 'e> {
+    /// The anchors' embedding rows (host BF16); the mask rows are the drafter's own copy.
+    Rows(&'r [u8]),
+    /// Gathered on the device from the target's embedding table by token id.
+    Table(&'r TokenEmbedding<'e>),
 }
 
 pub(crate) struct GlmDrafter<'a> {
@@ -576,6 +588,7 @@ impl<'a> GlmDrafter<'a> {
             candidates: alloc(drafted * 16 * 4)?,
             projected: alloc(rows * c.rank * 2)?,
             anchors: alloc(sequences * 4)?,
+            ids: alloc(rows * 4)?,
             tokens: alloc(drafted * 4)?,
             features: alloc(drafted * 16)?,
             positions: alloc(rows * 8)?,
@@ -594,10 +607,25 @@ impl<'a> GlmDrafter<'a> {
     /// holds the anchors' embedding rows; `head` is the target's vocabulary
     /// head [vocab, hidden] BF16.
     pub fn draft(&self, sequences: &[DraftSeq], anchor_rows: &[u8], head: *const c_void) -> Result<Vec<Draft>> {
+        self.draft_from(sequences, DraftInput::Rows(anchor_rows), head)
+    }
+
+    /// [`Self::draft`] with the block's input rows gathered from the target's
+    /// embedding table by token id: each anchor, then the mask token (the
+    /// drafter's mask row is that table row).
+    pub fn draft_device(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>, head: *const c_void)
+        -> Result<Vec<Draft>> {
+        self.draft_from(sequences, DraftInput::Table(embedding), head)
+    }
+
+    fn draft_from(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: *const c_void) -> Result<Vec<Draft>> {
         let c = &self.cfg;
         let (s_count, block, h) = (sequences.len(), c.block, c.hidden);
-        ensure!(s_count > 0 && s_count <= self.max_sequences && anchor_rows.len() == s_count * h * 2,
-            "draft step of {s_count} sequences");
+        let rows_ok = match input {
+            DraftInput::Rows(r) => r.len() == s_count * h * 2,
+            DraftInput::Table(_) => true,
+        };
+        ensure!(s_count > 0 && s_count <= self.max_sequences && rows_ok, "draft step of {s_count} sequences");
         let rows = s_count * block;
         let mut slot = self.workspace.borrow_mut();
         if slot.as_ref().is_none_or(|w| w.sequences < s_count) {
@@ -605,21 +633,33 @@ impl<'a> GlmDrafter<'a> {
             *slot = Some(self.workspace(self.max_sequences)?);
         }
         let w = slot.as_ref().context("draft workspace")?;
-        let mut embed = Vec::with_capacity(rows * h * 2);
         let mut positions = Vec::with_capacity(rows);
         let mut tables = vec![0i32; 3 * s_count];
         for (i, seq) in sequences.iter().enumerate() {
             ensure!(seq.slot < self.slots, "ring slot {} of {}", seq.slot, self.slots);
-            embed.extend_from_slice(&anchor_rows[i * h * 2..(i + 1) * h * 2]);
-            for _ in 1..block {
-                embed.extend_from_slice(&self.mask_row);
-            }
             positions.extend((seq.position..seq.position + block).map(|p| p as i64));
             tables[i] = seq.slot as i32;
             tables[s_count + i] = seq.position.saturating_sub(seq.valid_from).min(RING) as i32;
             tables[2 * s_count + i] = seq.position as i32;
         }
-        self.put(&w.h, &embed)?;
+        match input {
+            DraftInput::Rows(anchor_rows) => {
+                let mut embed = Vec::with_capacity(rows * h * 2);
+                for i in 0..s_count {
+                    embed.extend_from_slice(&anchor_rows[i * h * 2..(i + 1) * h * 2]);
+                    for _ in 1..block {
+                        embed.extend_from_slice(&self.mask_row);
+                    }
+                }
+                self.put(&w.h, &embed)?;
+            }
+            DraftInput::Table(embedding) => {
+                let ids: Vec<u32> = sequences.iter()
+                    .flat_map(|seq| std::iter::once(seq.anchor).chain(std::iter::repeat_n(c.mask_token, block - 1)))
+                    .collect();
+                embedding.embed(&ids, w.ids.buffer, 1, w.h.buffer, self.stream)?;
+            }
+        }
         self.put(&w.positions, bytes_of(&positions))?;
         self.put(&w.tables, bytes_of(&tables))?;
         let anchors: Vec<u32> = sequences.iter().map(|s| s.anchor).collect();
