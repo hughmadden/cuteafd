@@ -40,7 +40,7 @@ class FakeServer:
 def args(module, **extra):
     namespace = type("A", (), {})()
     defaults = dict(base_url="u", model="m", max_tokens=16, reasoning_effort="high", turns=3, workers=3,
-                    torture_requests=12, settle_s=0, seed=1, cancel_min_s=0.02, cancel_max_s=0.6)
+                    torture_requests=12, settle_s=0, seed=1, cancel_min_s=0.02, cancel_max_s=0.6, doc_chars=0)
     for key, value in {**defaults, **extra}.items():
         setattr(namespace, key, value)
     return namespace
@@ -84,6 +84,12 @@ def test_torture_checks_probes_and_idle_accounting():
     leaked = dict(prefix_cache=dict(good["prefix_cache"], pages_free=59))
     report = q.torture(a, reference, send=FakeServer(), get_stats=lambda base: leaked)
     assert any("idle pages leaked" in p for p in report["problems"])
+    # A pages-only family (GLM 5.3) has no mark arena and holds no marks.
+    pages_only = dict(prefix_cache=dict(good["prefix_cache"], mark_slots=0, marks_in_use=0))
+    assert q.torture(a, reference, send=FakeServer(), get_stats=lambda base: pages_only)["problems"] == []
+    stray = dict(prefix_cache=dict(good["prefix_cache"], mark_slots=8, marks_in_use=4))
+    report = q.torture(a, reference, send=FakeServer(), get_stats=lambda base: stray)
+    assert any("idle marks do not match" in p for p in report["problems"])
 
 
 def test_a_prefill_cancel_hangs_up_while_the_server_is_silent():

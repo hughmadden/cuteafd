@@ -73,4 +73,11 @@ pub trait PrefixFamily {
     fn page_segments(&self, page: u32) -> Vec<DeviceRange>;
     /// Device ranges of one mark slot (host tier).
     fn mark_segments(&self, slot: MarkSlot) -> Vec<DeviceRange>;
+    /// A mark-less family's stand-in for the mark of its host snapshots (the host tier keeps a
+    /// tail per snapshot): at most `max(mark_bytes, 1)` bytes of device scratch that host
+    /// restores overwrite and nothing reads. Empty (the default): no host snapshots without a
+    /// mark.
+    fn host_tail(&self) -> Vec<DeviceRange> {
+        Vec::new()
+    }
 }

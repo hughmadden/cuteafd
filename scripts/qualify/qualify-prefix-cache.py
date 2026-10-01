@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prefix cache qualification over the OpenAI-compatible API (serve-mimo, later every family).
+"""Prefix cache qualification over the OpenAI-compatible API (MiMo V2, GLM 5.3 Flash, GLM 5.3).
 
   reference  Run the conversation set on a cache-off server (PREFIX_CACHE_ENTRIES=0) and save
              every greedy reply.
@@ -14,7 +14,8 @@
              cancel a random fraction during prefill (cold prompts; the connection closes after
              a random delay, so the server parks the prefilled chunks) or during decode (after
              the first output), interleaved with probe requests compared with the reference. Afterwards, idle, /v1/stats must show no
-             leaked pages (pages - pages_free == pages_retained) and one mark per entry.
+             leaked pages (pages - pages_free == pages_retained) and one mark per entry (none for a
+             pages-only family).
 
   scripts/qualify/qualify-prefix-cache.py reference --base-url URL --output runs/prefix/ref.json
   scripts/qualify/qualify-prefix-cache.py check --base-url URL --reference runs/prefix/ref.json \\
@@ -44,10 +45,15 @@ TURNS = [
 TOPICS = ["budgets and envelopes", "currency conversion", "CSV quoting", "month-end reporting"]
 
 
-def system_prompt(topic: str) -> str:
+def system_prompt(topic: str, doc_chars: int = 0) -> str:
+    """`doc_chars` > 0 keeps that many characters of the docs: conversations that stay under 2048
+    tokens, below the DSA top-k (GLM 5.x), whose selection among exactly tied scores varies run
+    to run, so replies there are deterministic."""
     docs = "\n\n".join((FIXTURE / name).read_text() for name in
                        ("README.md", "CONTRIBUTING.md", "docs/architecture.md", "docs/importers.md",
                         "ledger/money.py", "ledger/parser.py", "ledger/journal.py", "ledger/report.py"))
+    if doc_chars > 0:
+        docs = docs[:doc_chars]
     return f"You are a concise assistant for the ledger project.\n\n{docs}\n\nFocus on {topic}."
 
 
@@ -119,7 +125,7 @@ def body(args, messages: list[dict]) -> dict:
 def conversation(args, index: int, send=stream) -> list[dict]:
     """One conversation's turns: each prompt, reply and usage; the second request of turn 0
     repeats the first prompt exactly (a whole-prompt hit)."""
-    messages = [{"role": "system", "content": system_prompt(TOPICS[index % len(TOPICS)])}]
+    messages = [{"role": "system", "content": system_prompt(TOPICS[index % len(TOPICS)], args.doc_chars)}]
     turns = []
     for turn, text in enumerate(TURNS[: args.turns]):
         messages.append({"role": "user", "content": text})
@@ -183,7 +189,7 @@ def torture(args, reference: list[list[dict]] | None, send=stream, get_stats=sta
                 item = next(cursor, None)
             if item is None:
                 return
-            system = system_prompt(TOPICS[item["conversation"]])
+            system = system_prompt(TOPICS[item["conversation"]], args.doc_chars)
             if item["mode"] == "cancel-prefill":
                 # A cold prompt: its prefill spans many chunks, so the hang-up lands inside it.
                 system = f"request {item['index']}\n{system}"
@@ -224,7 +230,9 @@ def torture(args, reference: list[list[dict]] | None, send=stream, get_stats=sta
     if idle:
         if idle.get("pages", 0) - idle.get("pages_free", 0) != idle.get("pages_retained"):
             problems.append(f"idle pages leaked: {idle}")
-        if idle.get("marks_in_use") != idle.get("entries_prompt", 0) + idle.get("entries_turn", 0):
+        # A pages-only family (GLM 5.3) has no mark arena: its snapshots hold no mark.
+        marks = idle.get("entries_prompt", 0) + idle.get("entries_turn", 0) if idle.get("mark_slots", 1) else 0
+        if idle.get("marks_in_use") != marks:
             problems.append(f"idle marks do not match entries: {idle}")
     else:
         problems.append("/v1/stats has no prefix_cache section")
@@ -240,6 +248,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--reference", type=Path)
     parser.add_argument("--conversations", type=int, default=4)
     parser.add_argument("--turns", type=int, default=3)
+    parser.add_argument("--doc-chars", type=int, default=0,
+                        help="keep this many characters of the system prompt's docs (0: all; GLM 5.x: e.g. 2500 "
+                             "keeps conversations below the DSA top-k's 2048 tokens)")
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--reasoning-effort", default="high")
     parser.add_argument("--workers", type=int, default=4)

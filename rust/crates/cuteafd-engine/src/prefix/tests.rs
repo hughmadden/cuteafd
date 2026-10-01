@@ -86,6 +86,9 @@ struct Fake {
     fail_restore: Cell<bool>,
     drains: Cell<usize>,
     rule: ReuseRule,
+    /// A pages-only family (GLM 5.3): no mark; restores resume at the snapshot's length and the
+    /// host tier keeps a one-byte stand-in tail.
+    markless: bool,
 }
 
 impl Fake {
@@ -93,11 +96,11 @@ impl Fake {
         let bytes = (pages * ROWS + rings * RING + slots * WINDOW) * ROW;
         let mem = Rc::new(RefCell::new(StubCopyEngine::new(CopyModel::default(), bytes, 1 << 26)));
         Self { mem, pages, rings, slots, queue: RefCell::new(Vec::new()), fail_restore: Cell::new(false), drains: Cell::new(0),
-            rule: ReuseRule::EXACT }
+            rule: ReuseRule::EXACT, markless: false }
     }
     fn layout(&self) -> FamilyLayout {
-        FamilyLayout { page_rows: ROWS, pages: self.pages, page_bytes: ROWS * ROW, mark_bytes: WINDOW * ROW,
-            draft_bytes: 0, rule: self.rule }
+        FamilyLayout { page_rows: ROWS, pages: self.pages, page_bytes: ROWS * ROW,
+            mark_bytes: if self.markless { 0 } else { WINDOW * ROW }, draft_bytes: 0, rule: self.rule }
     }
     fn page_row(&self, page: u32, row: usize) -> DeviceRange {
         DeviceRange { addr: ((page as usize * ROWS + row) * ROW) as u64, bytes: ROW }
@@ -200,6 +203,9 @@ impl PrefixFamily for Fake {
     }
     fn mark_segments(&self, slot: MarkSlot) -> Vec<DeviceRange> {
         vec![DeviceRange { addr: self.slot_row(slot, 0).addr, bytes: WINDOW * ROW }]
+    }
+    fn host_tail(&self) -> Vec<DeviceRange> {
+        if self.markless { vec![DeviceRange { addr: self.slot_row(MarkSlot(0), 0).addr, bytes: 1 }] } else { Vec::new() }
     }
 }
 
@@ -436,6 +442,42 @@ fn host_tier_restores_evicted_snapshots_exactly_and_shares_identical_prefixes() 
     longer.push(7);
     fake.forward(&mut p, &longer).unwrap();
     cache.release(&fake, &p.pages).unwrap();
+}
+
+#[test]
+fn pages_only_family_restores_from_device_and_host_without_a_mark() {
+    let mut fake = Fake::new(24, 4, 1);
+    fake.markless = true;
+    let mut cache = cache(&fake, 8, 1 << 20);
+    assert_eq!(cache.arena().slots(), 0);
+    let prompt = seq(100, 22);
+    let (resume, _, p) = serve(&mut cache, &fake, 0, &prompt, &[], 26);
+    assert_eq!(resume, 0);
+    fake.mem.borrow_mut().advance(10_000_000);
+    cache.tick();
+    cache.release(&fake, &p.pages).unwrap();
+    // A device hit: shared full pages, the copied tail, no mark.
+    let mut next = prompt.clone();
+    next.extend(seq(3000, 5));
+    let (resume, _, p) = serve(&mut cache, &fake, 1, &next, &[], 40);
+    assert_eq!(resume, prompt.len());
+    fake.mem.borrow_mut().advance(10_000_000);
+    cache.tick();
+    cache.release(&fake, &p.pages).unwrap();
+    assert_eq!(cache.stats().host.unwrap().stores_completed, 2);
+    // Evicted from the device, the longer prompt comes back from the host tier, exactly.
+    cache.clear(&fake).unwrap();
+    assert_eq!(cache.pool().free(), 24);
+    let (resume, _, mut q) = serve(&mut cache, &fake, 2, &next, &[], 40);
+    assert_eq!(resume, next.len());
+    let stats = cache.stats();
+    assert_eq!((stats.promotions, stats.marks_in_use, stats.host.unwrap().restores), (1, 0, 1));
+    let mut longer = next.clone();
+    longer.push(7);
+    fake.forward(&mut q, &longer).unwrap();
+    cache.release(&fake, &q.pages).unwrap();
+    cache.clear(&fake).unwrap();
+    assert_eq!(cache.pool().free(), 24);
 }
 
 /// Randomized conversations over shared system prompts, with rings reused across requests and a

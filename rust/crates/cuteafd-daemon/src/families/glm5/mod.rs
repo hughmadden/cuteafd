@@ -3,6 +3,7 @@
 pub(crate) mod dflash;
 pub(crate) mod dflash_policy;
 pub(crate) mod engine;
+pub(crate) mod prefix;
 pub(crate) mod serve;
 pub(crate) mod weights;
 
@@ -137,6 +138,24 @@ pub(crate) struct GoldenArgs {
     /// repeated) instead of --prefill, for long-context step costs.
     #[arg(long)]
     pub bench_context: Option<usize>,
+    /// Prefix-cache restore check at token P: prefill the first P tokens (of --prefill, default
+    /// all), fork their pages into a second sequence (shared full pages, the copied tail page),
+    /// continue both (prefill in --prefill-chunk rows, then --resume-decode greedy steps) and
+    /// compare every layer's rows, the logits and the paged rows byte for byte.
+    #[arg(long)]
+    pub resume_at: Option<usize>,
+    /// Prefill chunk rows of --resume-at (default the engine's prefill rows).
+    #[arg(long)]
+    pub prefill_chunk: Option<usize>,
+    #[arg(long, default_value_t = 4)]
+    pub resume_decode: usize,
+    /// With --resume-at: prefill the second sequence cold on its own pages instead of
+    /// restoring it (the floor: what the kernels themselves vary).
+    #[arg(long, hide = true)]
+    pub resume_cold: bool,
+    /// --resume-at attempts on fresh sequences (all must be byte-identical).
+    #[arg(long, default_value_t = 1)]
+    pub resume_repeat: usize,
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -335,7 +354,7 @@ fn similarity(a: &[f32], b: &[f32]) -> (f64, f64) {
 }
 
 pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
-    args.engine.full_prefill_logits |= args.nll;
+    args.engine.full_prefill_logits |= args.nll || args.resume_at.is_some();
     tokio::task::spawn_blocking(move || golden(args)).await?
 }
 
@@ -457,7 +476,7 @@ fn bench_verify(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
         }
         for sequences in counts {
             let seqs: Vec<dflash::DraftSeq> = (0..sequences)
-                .map(|slot| dflash::DraftSeq { slot, anchor: tokens[start], position: start }).collect();
+                .map(|slot| dflash::DraftSeq { slot, anchor: tokens[start], position: start, valid_from: 0 }).collect();
             let anchors = embed_rows(&opened.catalog, &vec![tokens[start]; sequences], opened.cfg.hidden)?;
             let mut times = Vec::new();
             for round in 0..9 {
@@ -548,6 +567,15 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
     }
     if let Some(rows) = args.bench_verify {
         return bench_verify(args, opened, engine, transport, runtime, rows);
+    }
+    if let Some(at) = args.resume_at {
+        let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
+            .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+        let n = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
+        let hidden = opened.cfg.hidden;
+        return prefix::resume_check(engine, &|t| embed_rows(&opened.catalog, t, hidden), &tokens, at, n,
+            args.prefill_chunk.unwrap_or(engine.prefill_rows), args.resume_decode, args.resume_cold,
+            args.resume_repeat, transport.map(|t| (t, runtime)));
     }
     if engine.drafter.is_some() {
         return draft_run(args, opened, engine, transport, runtime);
@@ -685,7 +713,7 @@ fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
         let anchor = sequence[position];
         let anchor_row = embed_rows(catalog, &[anchor], hidden)?;
         let timer = Instant::now();
-        let draft = drafter.draft(&[dflash::DraftSeq { slot: 0, anchor, position }], &anchor_row,
+        let draft = drafter.draft(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }], &anchor_row,
             engine.weights.head.buffer.ptr)?;
         draft_seconds += timer.elapsed().as_secs_f64();
         drafts.push((position, draft.into_iter().next().context("draft")?));
@@ -761,7 +789,7 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
         }
         let anchor = tokens[position];
         let timer = Instant::now();
-        let draft = drafter.draft(&[dflash::DraftSeq { slot: 0, anchor, position }],
+        let draft = drafter.draft(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
             &embed_rows(&opened.catalog, &[anchor], hidden)?, engine.weights.head.buffer.ptr)?.remove(0);
         draft_seconds += timer.elapsed().as_secs_f64();
         let reference = &ref_tokens[index * drafts_per..][..drafts_per];

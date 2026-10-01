@@ -66,76 +66,7 @@ pub(crate) struct ServeArgs {
     pub prefix: PrefixArgs,
 }
 
-/// The prefix cache's knobs.
-#[derive(Debug, Clone, clap::Args)]
-pub(crate) struct PrefixArgs {
-    /// Retained snapshots per bank (prompts, completed turns); 0 turns the prefix cache off.
-    #[arg(long, env = "CUTEAFD_PREFIX_CACHE_ENTRIES", default_value_t = 20)]
-    pub prefix_cache_entries: usize,
-    /// Device memory for retained positional marks (SWA rows, MTP hidden rows), MiB; the arena
-    /// holds two marks per entry pair while they fit, and never fewer than four.
-    #[arg(long, env = "CUTEAFD_PREFIX_CACHE_MARK_MIB", default_value_t = 2048)]
-    pub prefix_cache_mark_mib: usize,
-    /// Shortest prompt or turn worth a snapshot.
-    #[arg(long, default_value_t = 64)]
-    pub prefix_cache_min_tokens: usize,
-    /// Pinned host memory for snapshots the device evicts (e.g. 64GiB; 0 = off).
-    #[arg(long, env = "CUTEAFD_HOST_CACHE_BYTES", default_value = "0", value_parser = parse_bytes)]
-    pub host_cache_bytes: u64,
-    /// Shortest snapshot the host tier keeps.
-    #[arg(long, default_value_t = 512)]
-    pub host_cache_min_tokens: u32,
-    /// Intermediate snapshot points (off by default; agentic sessions hit prompt-end and
-    /// turn-end snapshots): one every N prefilled tokens at a chunk end (0 = none, e.g. 8192).
-    #[arg(long, env = "CUTEAFD_PREFIX_POINT_GAP", default_value_t = 0)]
-    pub prefix_point_gap: usize,
-    /// Intermediate snapshot points at the last N message boundaries of the rendered prompt
-    /// (before the generation prompt, before the last message, ...; 0 = none, e.g. 2).
-    #[arg(long, env = "CUTEAFD_PREFIX_POINT_BOUNDARIES", default_value_t = 0)]
-    pub prefix_point_boundaries: usize,
-    /// Most intermediate points per prompt (the deepest are kept).
-    #[arg(long, env = "CUTEAFD_PREFIX_POINTS_PER_REQUEST", default_value_t = 4)]
-    pub prefix_points_per_request: usize,
-    /// V4.1-style partial reuse (replay the SWA window before the aligned common prefix;
-    /// approximate, not byte-exact). Off: exact restores only.
-    #[arg(long, env = "CUTEAFD_PREFIX_PARTIAL", value_enum, default_value_t = Toggle::Off)]
-    pub prefix_partial: Toggle,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub(crate) enum Toggle {
-    On,
-    Off,
-}
-
-impl PrefixArgs {
-    fn points(&self) -> PointPolicy {
-        PointPolicy { gap: self.prefix_point_gap, boundaries: self.prefix_point_boundaries,
-            per_request: self.prefix_points_per_request }
-    }
-}
-
-/// `123`, `512MiB`, `64GiB`, `1.5GB`.
-pub(crate) fn parse_bytes(text: &str) -> std::result::Result<u64, String> {
-    let text = text.trim();
-    let split = text.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(text.len());
-    let (number, unit) = text.split_at(split);
-    let scale: f64 = match unit {
-        "" | "B" => 1.0,
-        "KB" => 1e3,
-        "MB" => 1e6,
-        "GB" => 1e9,
-        "KiB" => 1024.0,
-        "MiB" => 1024.0 * 1024.0,
-        "GiB" => 1024.0 * 1024.0 * 1024.0,
-        other => return Err(format!("unknown byte unit {other:?}")),
-    };
-    let value: f64 = number.parse().map_err(|e| format!("{text:?}: {e}"))?;
-    if !(value >= 0.0) {
-        return Err(format!("{text:?} is negative"));
-    }
-    Ok((value * scale) as u64)
-}
+pub(crate) use crate::shared::prefix::{PrefixArgs, Toggle};
 
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let snapshot: PathBuf = args.engine.snapshot.clone();
@@ -332,17 +263,7 @@ fn prefix_cache<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs)
     let budget = args.prefix_cache_mark_mib << 20;
     let family = MimoPrefix::new(engine, |mark| if entries == 0 { 0 } else { MarkArena::slots_for(1, entries, mark, budget) },
         args.prefix_partial == Toggle::On)?;
-    let host = if entries > 0 && args.host_cache_bytes > 0 {
-        let config = cuteafd_hostcache::config::Config {
-            bytes: args.host_cache_bytes,
-            chunk_bytes: (256u64 << 20).max(family.mark_bytes() as u64).min(args.host_cache_bytes),
-            min_tokens: args.host_cache_min_tokens,
-            ..Default::default()
-        };
-        Some((config, CudaCopyEngine::new(engine.library, engine.kv_layer(0).1)?))
-    } else {
-        None
-    };
+    let host = args.host_tier(engine.library, engine.kv_layer(0).1, family.mark_bytes())?;
     let layout = family.layout();
     let config = PrefixConfig { entries, mark_slots: family.slots(), keep_logits: true,
         min_tokens: args.prefix_cache_min_tokens };
@@ -815,34 +736,4 @@ fn plan_drafts(active: &[Active<'_>], drafted: &[Option<super::dflash::Draft>], 
         counts[i] = n;
     }
     counts
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use clap::Parser;
-
-    #[derive(Parser)]
-    struct Cli {
-        #[command(flatten)]
-        prefix: PrefixArgs,
-    }
-
-    #[test]
-    fn prefix_knobs_default_on_with_the_host_tier_off() {
-        let cli = Cli::parse_from(["serve"]);
-        assert_eq!((cli.prefix.prefix_cache_entries, cli.prefix.host_cache_bytes), (20, 0));
-        assert_eq!(cli.prefix.prefix_partial, Toggle::Off);
-        assert_eq!(cli.prefix.points(), PointPolicy { gap: 0, boundaries: 0, per_request: 4 });
-        let cli = Cli::parse_from(["serve", "--prefix-partial", "on", "--prefix-point-gap", "8192",
-            "--prefix-point-boundaries", "2"]);
-        assert_eq!(cli.prefix.points(), PointPolicy { gap: 8192, boundaries: 2, per_request: 4 });
-        assert_eq!(cli.prefix.prefix_partial, Toggle::On);
-        let cli = Cli::parse_from(["serve", "--prefix-cache-entries", "0", "--host-cache-bytes", "64GiB"]);
-        assert_eq!((cli.prefix.prefix_cache_entries, cli.prefix.host_cache_bytes), (0, 64 << 30));
-        assert_eq!(parse_bytes("512MiB"), Ok(512 << 20));
-        assert_eq!(parse_bytes("1.5GB"), Ok(1_500_000_000));
-        assert_eq!(parse_bytes("123"), Ok(123));
-        assert!(parse_bytes("12 parsecs").is_err() && parse_bytes("-1").is_err());
-    }
 }
