@@ -372,8 +372,9 @@ indexer and shared experts quantize to FP8 blocks at load by default; with
 `CUTEAFD_GLM_BF16=native` they run as-is on the BF16 programs (one or two
 RTX): KL 0.0491, but C1 step 41.7 vs 34.3 ms with the Sparks (coordinator
 alone 28.6 vs 19.2 ms one RTX, 19.8 vs 16.1 two), coordinator 8K prefill
-3.35 vs 2.75 s (2.36 vs 2.07), weights 32.3 vs 17.6 GiB: the default is a
-decision for TJ. W4A4 gate/up + SwiGLU + FP4 quant run fused (bit-exact;
+3.35 vs 2.75 s (2.36 vs 2.07), weights 32.3 vs 17.6 GiB. FP8 blocks stay the
+default (TJ, 2026-10-02): the official zai-org GLM 5.3 ships these tensors as
+128x128 block FP8, so the load-time conversion matches the official format. W4A4 gate/up + SwiGLU + FP4 quant run fused (bit-exact;
 layer 7-17% faster, GB10 13-17%). Open: W4A16 stream efficiency (GB10 4096
 rows 14.3 ms/layer TP4 vs EXL3 9.1), SM121 route thresholds.
 
