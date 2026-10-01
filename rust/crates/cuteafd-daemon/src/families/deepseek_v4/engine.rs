@@ -10,6 +10,7 @@ use super::pool::{Placement, PoolShape};
 use std::cell::RefCell;
 use super::weights::{LayerWeights, ModelWeights};
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
+use crate::shared::token_io::{DeviceLogits, EmbedPlacement, TokenEmbedding};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Program, Programs, Scalar};
 use cuteafd_ffi::NativeLibrary;
@@ -52,10 +53,16 @@ pub(crate) struct Engine<'a> {
     graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
     /// Expert layers resident on this GPU (they skip the Spark exchange).
     pub local: RefCell<Option<super::local::LocalExperts<'a>>>,
+    /// The token embedding table (resident on this GPU or read from its shard).
+    pub embedding: TokenEmbedding<'a>,
+    /// Benchmarks and token gates only: MoE layers run the shared expert alone.
+    pub skip_routed: bool,
 }
 
 /// `exchange` result for a layer whose experts ran on this GPU.
 const LOCAL_EXPERTS: usize = usize::MAX;
+/// `exchange` result for a layer whose routed experts were skipped.
+const SKIPPED_EXPERTS: usize = usize::MAX - 1;
 
 /// Lanes a long prefill chunk splits into, and the fewest rows per lane worth
 /// a second Spark exchange per layer.
@@ -69,7 +76,6 @@ const TAP_ROWS: usize = metadata::WINDOW;
 struct LaneStep<'s> {
     tables: &'s StepTables,
     tokens: &'s [u32],
-    embed: &'s [u8],
 }
 
 /// Everything a captured decode segment bakes in.
@@ -83,6 +89,9 @@ struct GraphKey {
     table_stride: usize,
     previous: usize,
 }
+
+/// The decode step's tail (last post, taps, drafter KV, head) as a graph key layer.
+const TAIL_SEGMENT: usize = usize::MAX;
 
 struct GraphExec<'a>(*mut c_void, &'a NativeLibrary);
 
@@ -135,6 +144,8 @@ pub(crate) struct EngineParts<'a> {
     pub stream: *mut c_void,
     pub sms: u32,
     pub shape: PoolShape,
+    pub embedding: TokenEmbedding<'a>,
+    pub skip_routed: bool,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -196,6 +207,8 @@ struct Workspace<'a> {
     first_tokens: Dev<'a>,
     drafts: Dev<'a>,
     markov: Dev<'a>,
+    /// dSpark: the draft block's token ids (token, then noise) for the gather.
+    draft_ids: Dev<'a>,
     /// Pinned staging: routes + wire rows down, rank partials up.
     router_host: HostAllocation<'a>,
     // Drops before its workspace below.
@@ -292,6 +305,8 @@ impl<'a> Engine<'a> {
 
     /// Allocates the cache pools and RoPE tables for `parts.shape`.
     pub fn new(parts: EngineParts<'a>) -> Result<Self> {
+        ensure!(parts.embedding.hidden() == parts.cfg.dim, "embedding rows of {} for dim {}", parts.embedding.hidden(),
+            parts.cfg.dim);
         // Layers past the backbone are the dSpark stages' window caches.
         let stages = parts.weights.dspark.as_ref().map_or(0, |d| d.stages.len());
         let pools = (0..parts.cfg.n_layers + stages).map(|l| Self::pool_layer(&parts, l)).collect::<Result<Vec<_>>>()?;
@@ -322,6 +337,8 @@ impl<'a> Engine<'a> {
             profile: RefCell::new(Profile::default()),
             graphs: RefCell::new(std::collections::HashMap::new()),
             local: RefCell::new(None),
+            embedding: parts.embedding,
+            skip_routed: parts.skip_routed,
         })
     }
 
@@ -370,6 +387,7 @@ impl<'a> Engine<'a> {
             first_tokens: self.alloc(t * 4)?,
             drafts: self.alloc(t * 4)?,
             markov: self.alloc(self.library.dsv4_markov_workspace(t)?)?,
+            draft_ids: self.alloc(t * 4)?,
             router_host: HostAllocation::new(self.library, t * (topk * 8 + h + h / 32))?,
             // SAFETY: the workspace buffer lives in the same struct and drops
             // after the head (field order).
@@ -451,12 +469,38 @@ impl<'a> Engine<'a> {
         &self,
         placement: &mut Placement,
         tokens: &[u32],
-        embed: &[u8],
         transports: &mut [SparkLink<'_>],
         runtime: &tokio::runtime::Runtime,
         logit_rows: usize,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
     ) -> Result<Vec<f32>> {
+        match self.prefill_step(placement, tokens, transports, runtime, logit_rows, on_layer, true)? {
+            Logits::Host(logits) => Ok(logits),
+            Logits::Device(_) => unreachable!("a downloading prefill"),
+        }
+    }
+
+    /// [`Self::prefill`] leaving the logits on the device (`None` without
+    /// logit rows); the rows must lie in one workspace's worth.
+    pub fn prefill_device(&self, placement: &mut Placement, tokens: &[u32], transports: &mut [SparkLink<'_>],
+        runtime: &tokio::runtime::Runtime, logit_rows: usize) -> Result<Option<DeviceLogits>> {
+        match self.prefill_step(placement, tokens, transports, runtime, logit_rows, None, false)? {
+            Logits::Device(logits) => Ok(logits),
+            Logits::Host(_) => unreachable!("a device prefill"),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_step(
+        &self,
+        placement: &mut Placement,
+        tokens: &[u32],
+        transports: &mut [SparkLink<'_>],
+        runtime: &tokio::runtime::Runtime,
+        logit_rows: usize,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        download: bool,
+    ) -> Result<Logits> {
         let start = placement.len;
         let t = tokens.len();
         let lanes = if on_layer.is_none() && t >= PREFILL_LANES * MIN_LANE_ROWS { PREFILL_LANES } else { 1 };
@@ -464,16 +508,15 @@ impl<'a> Engine<'a> {
         ensure!(t > 0 && per_lane <= self.prefill_rows && start + t <= self.max_context,
             "prefill chunk of {t} tokens at {start} exceeds {} rows per lane or the {}-token context",
             self.prefill_rows, self.max_context);
-        let row = self.cfg.dim * 2;
         let tables = (0..lanes).map(|lane| {
             let (first, end) = (lane * per_lane, ((lane + 1) * per_lane).min(t));
             metadata::prefill_step(placement, &self.shape, start + first, end - first, self.cfg.index_topk, self.c128_width)
         }).collect::<Result<Vec<_>>>()?;
         let steps: Vec<LaneStep<'_>> = tables.iter().enumerate().map(|(lane, tables)| {
             let (first, end) = (lane * per_lane, ((lane + 1) * per_lane).min(t));
-            LaneStep { tables, tokens: &tokens[first..end], embed: &embed[first * row..end * row] }
+            LaneStep { tables, tokens: &tokens[first..end] }
         }).collect();
-        let logits = self.step(&steps, transports, runtime, logit_rows, on_layer)?;
+        let logits = self.step(&steps, transports, runtime, logit_rows, on_layer, download)?;
         placement.len += t;
         Ok(logits)
     }
@@ -483,10 +526,19 @@ impl<'a> Engine<'a> {
     pub fn decode(
         &self,
         rows: &mut [(&mut Placement, u32)],
-        embed: &[u8],
-        transport: &mut SparkLink<'_>,
+        transport: Option<&mut SparkLink<'_>>,
         runtime: &tokio::runtime::Runtime,
     ) -> Result<Vec<f32>> {
+        self.decode_device(rows, transport, runtime)?.to_host(self.library)
+    }
+
+    /// [`Self::decode`] leaving the logits on the device.
+    pub fn decode_device(
+        &self,
+        rows: &mut [(&mut Placement, u32)],
+        transport: Option<&mut SparkLink<'_>>,
+        runtime: &tokio::runtime::Runtime,
+    ) -> Result<DeviceLogits> {
         ensure!(!rows.is_empty() && rows.len() <= self.decode_rows, "decode batch of {} rows", rows.len());
         for (placement, _) in rows.iter() {
             ensure!(placement.len > 0 && placement.len < self.max_context, "decode at {} outside the context", placement.len);
@@ -494,12 +546,16 @@ impl<'a> Engine<'a> {
         let tokens: Vec<u32> = rows.iter().map(|(_, token)| *token).collect();
         let steps: Vec<(&Placement, usize)> = rows.iter().map(|(p, _)| (&**p, p.len)).collect();
         let tables = metadata::decode_step(&steps, &self.shape, self.cfg.index_topk, self.c128_width)?;
-        let step = LaneStep { tables: &tables, tokens: &tokens, embed };
-        let logits = self.step(&[step], std::slice::from_mut(transport), runtime, tokens.len(), None)?;
+        let step = LaneStep { tables: &tables, tokens: &tokens };
+        let transports = match transport {
+            Some(transport) => std::slice::from_mut(transport),
+            None => &mut [],
+        };
+        let logits = self.step(&[step], transports, runtime, tokens.len(), None, false)?;
         for (placement, _) in rows.iter_mut() {
             placement.len += 1;
         }
-        Ok(logits)
+        logits.device()
     }
 
     /// Appends each sequence's tokens (one or more) at its length in one
@@ -510,10 +566,19 @@ impl<'a> Engine<'a> {
     pub fn verify(
         &self,
         sequences: &mut [(&mut Placement, &[u32])],
-        embed: &[u8],
         transports: &mut [SparkLink<'_>],
         runtime: &tokio::runtime::Runtime,
     ) -> Result<Vec<f32>> {
+        self.verify_device(sequences, transports, runtime)?.to_host(self.library)
+    }
+
+    /// [`Self::verify`] leaving every row's logits on the device.
+    pub fn verify_device(
+        &self,
+        sequences: &mut [(&mut Placement, &[u32])],
+        transports: &mut [SparkLink<'_>],
+        runtime: &tokio::runtime::Runtime,
+    ) -> Result<DeviceLogits> {
         let tokens: Vec<u32> = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect();
         ensure!(!tokens.is_empty() && tokens.len() <= self.decode_rows, "verify step of {} rows", tokens.len());
         for (placement, tokens) in sequences.iter() {
@@ -522,12 +587,12 @@ impl<'a> Engine<'a> {
         }
         let spans: Vec<(&Placement, usize, usize)> = sequences.iter().map(|(p, t)| (&**p, p.len, t.len())).collect();
         let tables = metadata::verify_step(&spans, &self.shape, self.cfg.index_topk, self.c128_width)?;
-        let step = LaneStep { tables: &tables, tokens: &tokens, embed };
-        let logits = self.step(&[step], transports, runtime, tokens.len(), None)?;
+        let step = LaneStep { tables: &tables, tokens: &tokens };
+        let logits = self.step(&[step], transports, runtime, tokens.len(), None, false)?;
         for (placement, tokens) in sequences.iter_mut() {
             placement.len += tokens.len();
         }
-        Ok(logits)
+        logits.device()
     }
 
     /// Runs every layer for `lanes` (one decode lane, or prefill lanes of
@@ -540,13 +605,14 @@ impl<'a> Engine<'a> {
         runtime: &tokio::runtime::Runtime,
         logit_rows: usize,
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
-    ) -> Result<Vec<f32>> {
+        download: bool,
+    ) -> Result<Logits> {
         let h = self.cfg.dim;
         let decode = lanes[0].tables.decode;
         ensure!(!lanes.is_empty(), "a step needs a lane");
         let total: usize = lanes.iter().map(|l| l.tables.rows).sum();
         ensure!(logit_rows <= total && (on_layer.is_none() || lanes.len() == 1)
-            && lanes.iter().all(|l| l.tokens.len() == l.tables.rows && l.embed.len() == l.tables.rows * h * 2)
+            && lanes.iter().all(|l| l.tokens.len() == l.tables.rows)
             && (!decode || lanes.len() == 1), "step lanes disagree");
         let slot = if decode { &self.decode_workspace } else { &self.prefill_workspace };
         if slot.borrow().is_none() {
@@ -558,17 +624,21 @@ impl<'a> Engine<'a> {
         ensure!(lanes.len() <= w.lanes.len(), "{} lanes exceed the workspace", lanes.len());
         // Tables are copied in only after the previous step's last read (the
         // head download synchronized the stream).
+        // The decode graph's first segment gathers the streams itself.
+        let gather = self.embedding.placement() == EmbedPlacement::Gpu;
         for (step, lane) in lanes.iter().zip(&w.lanes) {
             self.fill(&lane.tables, step.tables)?;
-            let mut expanded = Vec::with_capacity(step.embed.len() * 4);
-            for row in step.embed.chunks_exact(h * 2) {
-                for _ in 0..4 {
-                    expanded.extend_from_slice(row);
-                }
-            }
-            self.library.copy_h2d(lane.stream_a.buffer, &expanded)?;
+            self.embedding.check(step.tokens)?;
+            // Token ids feed hash routing and the embedding gather.
             let token_bytes: Vec<u8> = step.tokens.iter().flat_map(|token| token.to_le_bytes()).collect();
             self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: token_bytes.len(), ..lane.tokens.buffer }, &token_bytes)?;
+            if !gather {
+                // The mHC streams start as four copies of the embedding.
+                let rows = self.embedding.host_rows_repeated(step.tokens, 4)?;
+                self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: rows.len(), ..lane.stream_a.buffer }, &rows)?;
+            } else if !decode {
+                self.gather_streams(lane, step.tables.rows)?;
+            }
         }
         let cap = if decode { self.decode_rows } else { self.prefill_rows };
         let rows_of = |lane: usize| Scalar::I32(lanes[lane].tables.rows as i32);
@@ -577,7 +647,11 @@ impl<'a> Engine<'a> {
             let (t, rows) = (tables.rows, rows_of(0));
             // Decode waves go to the first transport; its planes are baked into
             // the replayed graphs (they never move).
-            let decode_planes = transports.first().context("no transport")?.intake.pointers();
+            let decode_planes = match transports.first() {
+                Some(transport) => transport.intake.pointers(),
+                None if self.skip_routed || self.local_layers() == self.weights.layers.len() => [std::ptr::null(); 6],
+                None => anyhow::bail!("no transport"),
+            };
             let mut ranks = 0usize;
             for (layer, weights) in self.weights.layers.iter().enumerate() {
                 let previous = ranks;
@@ -585,6 +659,9 @@ impl<'a> Engine<'a> {
                 // this layer's attention, router and expert input quantization,
                 // replayed as a CUDA graph keyed by everything it bakes in.
                 let segment = || -> Result<()> {
+                    if layer == 0 && gather {
+                        self.gather_streams(lane, t)?;
+                    }
                     if previous > 0 {
                         self.post(w, lane, previous, decode_planes, rows, layer - 1)?;
                         self.tap(w, lane, layer - 1, t)?;
@@ -601,12 +678,21 @@ impl<'a> Engine<'a> {
                     previous,
                 };
                 self.replay(key, segment)?;
-                ranks = self.decode_experts(layer, t, w, lane, cap, transports.first_mut().context("no transport")?, runtime)?;
+                ranks = self.decode_experts(layer, t, w, lane, cap, transports.first_mut(), runtime)?;
             }
-            if ranks > 0 {
-                self.post(w, lane, ranks, decode_planes, rows, self.weights.layers.len() - 1)?;
-                self.tap(w, lane, self.weights.layers.len() - 1, t)?;
-            }
+            // The tail: the last post, its taps and the drafter's KV, then the head.
+            let last = self.weights.layers.len() - 1;
+            let key = GraphKey { layer: TAIL_SEGMENT, rows: t, chunked: false, attention: "tail", table_width: 0,
+                table_stride: 0, previous: ranks };
+            self.replay(key, || -> Result<()> {
+                if ranks > 0 {
+                    self.post(w, lane, ranks, decode_planes, rows, last)?;
+                    self.tap(w, lane, last, t)?;
+                }
+                self.write_draft_kv(w, lane, t, cap)?;
+                self.head_launch(&lane.stream_a, t, t, 0, w)
+            })?;
+            return Ok(Logits::Device(Some(self.device_logits(w, t))));
         } else {
             // Units run layer-major. A unit's attention needs its own lane's
             // previous layer posted and the previous lane's same layer (KV and
@@ -624,7 +710,8 @@ impl<'a> Engine<'a> {
             let planes: Vec<[*const u16; 6]> = transports.iter().map(|t| t.intake.pointers()).collect();
             let post = |(layer, lane): (usize, usize), ranks: usize| {
                 let slot = if pipelined { lane } else { 0 };
-                self.post(w, &w.lanes[lane], ranks, planes[slot], rows_of(lane), layer)?;
+                let plane = planes.get(slot).copied().unwrap_or([std::ptr::null(); 6]);
+                self.post(w, &w.lanes[lane], ranks, plane, rows_of(lane), layer)?;
                 self.tap(w, &w.lanes[lane], layer, lanes[lane].tables.rows)
             };
             runtime.block_on(async {
@@ -633,7 +720,10 @@ impl<'a> Engine<'a> {
                 for (index, &unit) in units.iter().enumerate() {
                     let (layer, lane) = unit;
                     let t = lanes[lane].tables.rows;
-                    if layer < local_layers {
+                    if self.skip_routed {
+                        self.shared_ffn(layer, w, &w.lanes[lane], rows_of(lane), cap, &self.weights.layers[layer])?;
+                        post(unit, SKIPPED_EXPERTS)?;
+                    } else if layer < local_layers {
                         self.local_experts(layer, t, w, &w.lanes[lane], cap)?;
                         post(unit, LOCAL_EXPERTS)?;
                     } else {
@@ -675,20 +765,44 @@ impl<'a> Engine<'a> {
         if logit_rows == 0 {
             // The next step rewrites the tables only after this one drains.
             self.sync()?;
-            return Ok(Vec::new());
+            return Ok(if download { Logits::Host(Vec::new()) } else { Logits::Device(None) });
         }
-        let mut logits = Vec::with_capacity(logit_rows * self.cfg.vocab_size);
-        let mut first = 0;
+        let mut logits = Vec::with_capacity(if download { logit_rows * self.cfg.vocab_size } else { 0 });
+        let (mut first, mut landed) = (0, 0);
         for (step, lane) in lanes.iter().zip(&w.lanes) {
             let rows = step.tables.rows;
             // Rows of this lane inside the last `logit_rows` of the step.
             let wanted = (first + rows).saturating_sub((total - logit_rows).max(first));
-            if wanted > 0 {
-                logits.extend(self.head(&lane.stream_a, rows, wanted, w)?);
+            if wanted > 0 && download {
+                self.head_launch(&lane.stream_a, rows, wanted, 0, w)?;
+                let timer = Instant::now();
+                let bytes = self.download(&w.vocab_logits, wanted * self.cfg.vocab_size * 4)?;
+                self.profile.borrow_mut().add(Phase::Head, timer);
+                logits.extend(bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())));
+            } else if wanted > 0 {
+                // Lanes land their rows one after the other in the logits buffer.
+                let capacity = w.lanes[0].tables.rows;
+                ensure!(landed + wanted <= capacity, "{logit_rows} device logit rows exceed the workspace's {capacity}");
+                self.head_launch(&lane.stream_a, rows, wanted, landed, w)?;
+                landed += wanted;
             }
             first += rows;
         }
-        Ok(logits)
+        Ok(if download { Logits::Host(logits) } else { Logits::Device(Some(self.device_logits(w, landed))) })
+    }
+
+    /// The step's token embeddings, four copies per row, into the lane's streams.
+    fn gather_streams(&self, lane: &Lane<'_>, rows: usize) -> Result<()> {
+        // SAFETY: the lane's token ids are copied in before the stream reaches
+        // the gather; its streams hold [rows, 4, dim] BF16.
+        unsafe { self.embedding.gather(lane.tokens.buffer.ptr, std::ptr::null(), rows, 4, std::ptr::null(),
+            lane.stream_a.buffer.ptr, self.stream) }
+    }
+
+    /// The first `rows` rows of the workspace's vocabulary logits.
+    fn device_logits(&self, w: &Workspace<'_>, rows: usize) -> DeviceLogits {
+        let vocab = self.cfg.vocab_size;
+        DeviceLogits { ptr: w.vocab_logits.buffer.ptr, rows, vocab, stride: vocab, stream: self.stream, greedy: None }
     }
 
     /// Which sparse attention a layer runs this step.
@@ -723,6 +837,12 @@ impl<'a> Engine<'a> {
     /// into stream a.
     fn post(&self, w: &Workspace<'_>, lane: &Lane<'_>, ranks: usize, planes: [*const u16; 6], rows: Scalar,
         layer: usize) -> Result<()> {
+        if ranks == SKIPPED_EXPERTS {
+            return self.run("mhc_post", &[
+                ("x", lane.shared.buffer.ptr), ("residual", lane.stream_b.buffer.ptr), ("prev_post", lane.post.buffer.ptr),
+                ("prev_comb", lane.comb.buffer.ptr), ("out", lane.stream_a.buffer.ptr),
+            ], &[rows]);
+        }
         if ranks == LOCAL_EXPERTS {
             let output = self.local.borrow().as_ref().context("local experts")?.output.buffer.ptr;
             return self.run("mhc_post", &[
@@ -1019,13 +1139,18 @@ impl<'a> Engine<'a> {
         w: &Workspace<'_>,
         lane: &Lane<'_>,
         cap: usize,
-        transport: &mut SparkLink<'_>,
+        transport: Option<&mut SparkLink<'_>>,
         runtime: &tokio::runtime::Runtime,
     ) -> Result<usize> {
+        if self.skip_routed {
+            self.shared_ffn(layer, w, lane, Scalar::I32(t as i32), cap, &self.weights.layers[layer])?;
+            return Ok(SKIPPED_EXPERTS);
+        }
         if layer < self.local_layers() {
             self.local_experts(layer, t, w, lane, cap)?;
             return Ok(LOCAL_EXPERTS);
         }
+        let transport = transport.context("no transport")?;
         // Decode rows poll without the prefill spin quantum.
         let request = self.stage_request(layer, t, w, ExpertV2SourceKind::Decode)?;
         let wave = transport.dispatch(&request)?;
@@ -1034,8 +1159,8 @@ impl<'a> Engine<'a> {
         runtime.block_on(self.land(transport, wave, t, w))
     }
 
-    /// Logits of the last `n` of `t` rows.
-    fn head(&self, stream: &Dev<'_>, t: usize, n: usize, w: &Workspace<'_>) -> Result<Vec<f32>> {
+    /// Logits of the last `n` of `t` rows into vocabulary logits rows `at..at + n`.
+    fn head_launch(&self, stream: &Dev<'_>, t: usize, n: usize, at: usize, w: &Workspace<'_>) -> Result<()> {
         let h = self.cfg.dim;
         let vocab = self.cfg.vocab_size;
         self.run("mhc_head", &[
@@ -1047,12 +1172,22 @@ impl<'a> Engine<'a> {
         // shape; the last `n` rows start `t - n` rows into `y`.
         unsafe {
             w.head.launch(w.y.buffer.ptr.cast::<u8>().add((t - n) * h * 2).cast(), self.weights.head.buffer.ptr.cast(),
-                w.vocab_logits.buffer.ptr.cast(), n as u32, self.stream)?;
+                w.vocab_logits.buffer.ptr.cast::<f32>().add(at * vocab), n as u32, self.stream)
         }
-        let timer = Instant::now();
-        let logits = self.download(&w.vocab_logits, n * vocab * 4)?;
-        self.profile.borrow_mut().add(Phase::Head, timer);
-        Ok(logits
-            .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
+    }
+}
+
+/// A step's logits: downloaded, or left on the device.
+enum Logits {
+    Host(Vec<f32>),
+    Device(Option<DeviceLogits>),
+}
+
+impl Logits {
+    fn device(self) -> Result<DeviceLogits> {
+        match self {
+            Logits::Device(Some(logits)) => Ok(logits),
+            _ => anyhow::bail!("the step left no device logits"),
+        }
     }
 }

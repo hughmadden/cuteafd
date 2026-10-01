@@ -753,27 +753,54 @@ fn sample_check(library: &NativeLibrary, selector: &mut TokenSelector<'_>, row: 
     // SAFETY: our stream; the selections synchronized it.
     unsafe { library.cuda_stream_destroy(stream)? };
     result?;
-    // Chi-square of the two histograms (tokens drawn at least 5 times by either pool together).
-    let (mut chi2, mut bins, mut rare) = (0f64, 0usize, (0f64, 0f64));
-    for &(d, h) in counts.values() {
-        if d + h >= 10.0 {
+    // Two-sample chi-square over equal-mass bins of softmax(logits / T),
+    // tokens ordered by logit: exact matches depend on how flat the row is
+    // (a different summation order moves the cumulative boundaries), the
+    // distribution must not.
+    let (mut chi2, dof) = (0f64, SAMPLE_BINS - 1);
+    for (d, h) in mass_bins(row, params.temperature(), &counts) {
+        if d + h > 0.0 {
             chi2 += (d - h).powi(2) / (d + h);
-            bins += 1;
-        } else {
-            rare.0 += d;
-            rare.1 += h;
         }
     }
-    if rare.0 + rare.1 > 0.0 {
-        chi2 += (rare.0 - rare.1).powi(2) / (rare.0 + rare.1);
-        bins += 1;
-    }
+    let critical = chi_square_critical(dof);
     println!("token gate: sampled (T {}, top-p {}, top-k {:?}, seed {}) {draws} draws: {matched} identical to the \
-        host sampler ({:.2}%), {} distinct tokens, chi-square {chi2:.2} over {} dof", params.temperature(),
-        params.top_p(), params.top_k(), params.seed(), 100.0 * matched as f64 / draws as f64, counts.len(),
-        bins.saturating_sub(1));
-    ensure!(matched * 100 >= draws * 99, "device sampling departs from the host sampler");
+        host sampler ({:.2}%), {} distinct tokens, chi-square {chi2:.2} over {dof} dof (p=0.001 bound {critical:.1})",
+        params.temperature(), params.top_p(), params.top_k(), params.seed(), 100.0 * matched as f64 / draws as f64,
+        counts.len());
+    ensure!(chi2 <= critical, "device sampling departs from the host sampler's distribution");
     Ok(())
+}
+
+/// Equal-mass bins of the sampling distribution for [`sample_check`].
+const SAMPLE_BINS: usize = 32;
+
+/// Device and host draw counts per bin: tokens by descending logit, cut into
+/// [`SAMPLE_BINS`] runs of equal softmax(logits / T) mass.
+fn mass_bins(row: &[f32], temperature: f32, counts: &std::collections::HashMap<u32, (f64, f64)>) -> Vec<(f64, f64)> {
+    let mut order: Vec<usize> = (0..row.len()).filter(|&i| row[i].is_finite()).collect();
+    order.sort_by(|&a, &b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
+    let top = order.first().map_or(0.0, |&i| f64::from(row[i]));
+    let weight = |i: usize| ((f64::from(row[i]) - top) / f64::from(temperature.max(1e-6))).exp();
+    let total: f64 = order.iter().map(|&i| weight(i)).sum();
+    let mut bins = vec![(0f64, 0f64); SAMPLE_BINS];
+    let mut mass = 0f64;
+    for &i in &order {
+        let bin = ((mass / total * SAMPLE_BINS as f64) as usize).min(SAMPLE_BINS - 1);
+        mass += weight(i);
+        if let Some(&(d, h)) = counts.get(&(i as u32)) {
+            bins[bin].0 += d;
+            bins[bin].1 += h;
+        }
+    }
+    bins
+}
+
+/// Wilson-Hilferty upper 0.1% point of chi-square with `dof` degrees of freedom.
+fn chi_square_critical(dof: usize) -> f64 {
+    let k = dof as f64;
+    let z = 3.0902;
+    k * (1.0 - 2.0 / (9.0 * k) + z * (2.0 / (9.0 * k)).sqrt()).powi(3)
 }
 
 #[cfg(test)]
@@ -806,6 +833,26 @@ mod tests {
         let host = sampler_row(params, 1, 0, true, Route::Host);
         assert_eq!(host.temperature, 0.0);
         assert_eq!(host.mask_row, cuteafd_ffi::CUTEAFD_V41_SAMPLER_NO_MASK_ROW);
+    }
+
+    #[test]
+    fn chi_square_bound_matches_tables() {
+        assert!((chi_square_critical(31) - 61.10).abs() < 0.3);
+        assert!((chi_square_critical(7) - 24.32).abs() < 0.3);
+    }
+
+    #[test]
+    fn mass_bins_split_the_distribution_evenly() {
+        let flat = vec![0.5f32; 1024];
+        let counts = (0..1024u32).map(|t| (t, (1.0, 2.0))).collect();
+        let bins = mass_bins(&flat, 1.0, &counts);
+        assert!(bins.iter().all(|&b| b == (32.0, 64.0)), "{bins:?}");
+        // A dominant token fills the first bins alone; the tail lands in the last.
+        let mut peaked = vec![-20.0f32; 1024];
+        peaked[7] = 10.0;
+        let bins = mass_bins(&peaked, 1.0, &counts);
+        assert_eq!(bins[0], (1.0, 2.0));
+        assert_eq!(bins[SAMPLE_BINS - 1], (1023.0, 2046.0));
     }
 
     #[test]
