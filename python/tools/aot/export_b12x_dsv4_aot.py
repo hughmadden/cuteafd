@@ -137,6 +137,12 @@ def glm_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         for inter in (g.moe_inter, g.dense_inter):
             out.append((f"ffn_i{inter}_m{rows}", "ffn", {"max_rows": rows, "inter": inter, "fp8_only": w8},
                         lambda r=rows, i=inter, m=w8: ffn.compile_glm_ffn_aot(g, inter=i, max_rows=r, fp8_only=m)))
+    # ModelOpt per-tensor FP8 dense MLPs (nvidia/GLM-5.3-NVFP4): static W8A8 prefill with the
+    # checkpoint's input_scale and weight_scale (decode rows take the same bytes on the GEMV).
+    out.append((f"ffn_i{g.dense_inter}_pt_m{prefill_rows}", "ffn",
+                {"max_rows": prefill_rows, "inter": g.dense_inter, "fp8_only": "prefill", "tensor_scales": True},
+                lambda: ffn.compile_glm_ffn_aot(g, inter=g.dense_inter, max_rows=prefill_rows, fp8_only="prefill",
+                                                tensor_scales=True)))
     for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
         out.append((f"index_topk_{mode}_m{rows}", "index_topk",
                     {"mode": mode, "max_rows": rows, "max_pages": index_pages},

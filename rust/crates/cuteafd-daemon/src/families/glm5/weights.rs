@@ -198,8 +198,8 @@ impl<'a> GlmLoader<'a> {
                     grid.extend(scale.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())));
                 } else {
                     // ModelOpt per-tensor FP8 (one FP32 `weight_scale`): the same E4M3 bytes
-                    // with every block scale equal to it, exactly. Its static input_scale is
-                    // not read: the programs quantize activations per row and 128-K block.
+                    // with every block scale equal to it, exactly (decode GEMVs and W8A16).
+                    // Prefill W8A8 takes its static input_scale (`tensor_scales`).
                     let (scale, scale_dtype, _) = self.raw(&format!("{name}_scale"))
                         .with_context(|| format!("{name}: an FP8 weight needs weight_scale_inv blocks or a weight_scale"))?;
                     ensure!(scale_dtype == DType::F32 && scale.len() == 4, "{name}_scale: expected one FP32 value");
@@ -209,8 +209,41 @@ impl<'a> GlmLoader<'a> {
                 at += n * k;
                 rows += n;
             }
-            body(values, grid, rows, cols.context("no FP8 rows")?)
+            // The E4M3 bytes only (BF16 parts left their staging tail unused).
+            body(&values[..at], grid, rows, cols.context("no FP8 rows")?)
         })
+    }
+
+    /// The prefill programs' FP32 `[12]` tensor-scale operand of row-concatenated ModelOpt
+    /// per-tensor FP8 weights `parts` (E4M3, one FP32 `weight_scale`, one calibrated
+    /// `input_scale` shared by the parts): `input_scale` at 0 and `input_scale * weight_scale`
+    /// of part `i` at `4 * (i + 1)`. None unless every part is stored that way.
+    fn tensor_scales(&self, parts: &[String]) -> Result<Option<Vec<u8>>> {
+        ensure!(parts.len() <= 2, "{parts:?}: the tensor-scale operand holds two parts");
+        let scalar = |name: &str| -> Result<Option<f32>> {
+            if self.catalog.tensor(name).is_err() {
+                return Ok(None);
+            }
+            let (bytes, dtype, _) = self.raw(name)?;
+            ensure!(dtype == DType::F32 && bytes.len() == 4, "{name}: expected one FP32 value");
+            Ok(Some(f32::from_le_bytes(bytes[..4].try_into().unwrap())))
+        };
+        let mut out = [0f32; 12];
+        let mut input = None;
+        for (i, name) in parts.iter().enumerate() {
+            let Some(stem) = name.strip_suffix("weight") else { return Ok(None) };
+            if self.catalog.tensor(name)?.metadata.dtype != DType::F8E4M3 {
+                return Ok(None);
+            }
+            let (Some(weight_scale), Some(input_scale)) =
+                (scalar(&format!("{name}_scale"))?, scalar(&format!("{stem}input_scale"))?) else { return Ok(None) };
+            ensure!(input.is_none_or(|s| s == input_scale),
+                "{parts:?}: concatenated per-tensor FP8 parts need one input_scale");
+            input = Some(input_scale);
+            out[4 * (i + 1)] = input_scale * weight_scale;
+        }
+        out[0] = input.context("no parts")?;
+        Ok(Some(f32_bytes(&out)))
     }
 
     /// E4M3 `[N, K]` and the FP32 block grid of `names` on the device.
@@ -505,8 +538,17 @@ impl<'a> GlmLoader<'a> {
             put(&mut ops, "k_norm_b", self.replicated(ranks, || raw(&format!("{p}.self_attn.indexer.k_norm.bias")))?);
         }
         let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
-        with_fp8(&mut ops, "w_gate_up", &[format!("{mlp}.gate_proj.weight"), format!("{mlp}.up_proj.weight")], Axis::Rows)?;
-        with_fp8(&mut ops, "w_down", &[format!("{mlp}.down_proj.weight")], Axis::Cols)?;
+        let (gate_up, down) = ([format!("{mlp}.gate_proj.weight"), format!("{mlp}.up_proj.weight")],
+            [format!("{mlp}.down_proj.weight")]);
+        with_fp8(&mut ops, "w_gate_up", &gate_up, Axis::Rows)?;
+        with_fp8(&mut ops, "w_down", &down, Axis::Cols)?;
+        // ModelOpt per-tensor FP8 dense MLPs also carry their static W8A8 scales (prefill).
+        if dense {
+            if let (Some(gu), Some(d)) = (self.tensor_scales(&gate_up)?, self.tensor_scales(&down)?) {
+                put(&mut ops, "w_gate_up_tscale", self.upload_all(ranks, &gu)?);
+                put(&mut ops, "w_down_tscale", self.upload_all(ranks, &d)?);
+            }
+        }
         if !dense {
             ops[0].insert("gate", self.one(&format!("{p}.mlp.gate.weight"))?);
             ops[0].insert("gate.bias", self.one(&format!("{p}.mlp.gate.e_score_correction_bias"))?);
@@ -535,3 +577,4 @@ impl<'a> GlmLoader<'a> {
         Ok((weights, shares.collect()))
     }
 }
+

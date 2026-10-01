@@ -478,6 +478,10 @@ impl<'a> GlmEngine<'a> {
             format!("{prefix}_ffn_i{dense}_{cap}")] {
             scratch = scratch.max(self.scratch(&name)?);
         }
+        if !decode {
+            // Per-tensor FP8 dense MLPs (libraries built before it lack the program).
+            scratch = scratch.max(self.scratch(&format!("{prefix}_ffn_i{dense}_pt_{cap}")).unwrap_or(0));
+        }
         let head_workspace = self.alloc(if lead { VOCABULARY_HEAD_WORKSPACE } else { 256 })?;
         let topk = self.alloc(self.scratch(&format!("glm_index_topk_{mode}_{cap}"))?)?;
         self.library.cuda_zero_bytes(topk.buffer, topk.buffer.bytes)?;
@@ -1605,6 +1609,14 @@ impl<'a> GlmEngine<'a> {
     fn ffn_on(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, intermediate: usize, cap: &str,
         out: *mut c_void, rows: Scalar) -> Result<()> {
         let intermediate = intermediate / if layer.split { 2 } else { 1 };
+        if cap != "m64" && self.prefill_w8a8 && tensor_fp8_prefill() && layer.range("w_gate_up_tscale").is_some() {
+            // ModelOpt per-tensor FP8: static W8A8 with the checkpoint's input and weight scales.
+            let pointers = [("x", w.x.buffer.ptr), ("w_gate_up_fp8", layer.ptr("w_gate_up_fp8")?),
+                ("w_gate_up_tscale", layer.ptr("w_gate_up_tscale")?), ("w_down_fp8", layer.ptr("w_down_fp8")?),
+                ("w_down_tscale", layer.ptr("w_down_tscale")?), ("out", out), ("scratch", w.scratch.buffer.ptr)];
+            return self.run_on(rank, &Self::program(layer, &format!("glm_ffn_i{intermediate}_pt_{cap}")), &pointers,
+                &[rows]);
+        }
         let mut pointers = vec![("x", w.x.buffer.ptr)];
         pointers.extend(weight(layer, "w_gate_up", cap)?);
         pointers.extend(weight(layer, "w_down", cap)?);
@@ -1612,6 +1624,14 @@ impl<'a> GlmEngine<'a> {
         self.run_on(rank, &Self::program(layer, &format!("glm_ffn_i{intermediate}_{cap}")), &pointers,
             &self.projection_scalars(rows, cap))
     }
+}
+
+/// Prefill of ModelOpt per-tensor FP8 dense MLPs on the static W8A8 programs (the checkpoint's
+/// input_scale) unless CUTEAFD_GLM_TENSOR_FP8=block keeps them on the block W8A8 programs
+/// (dynamic per-row x 128-K activation scales over a uniform weight grid).
+pub(crate) fn tensor_fp8_prefill() -> bool {
+    static TENSOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TENSOR.get_or_init(|| std::env::var("CUTEAFD_GLM_TENSOR_FP8").map_or(true, |v| v != "block"))
 }
 
 /// Prefill sparse MLA on the native F16 kernel (glm_mla_prefill.cu) unless
