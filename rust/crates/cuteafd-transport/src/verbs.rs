@@ -28,6 +28,18 @@ use crate::synthetic::{expert_response_from_protocol_v2_response, protocol_v2_re
 use crate::{is_connection_closed, verbs_host_preflight, ExpertProtocolV2FrameBuffer, ExpertProtocolV2Request, ExpertProtocolV2RequestView, ExpertProtocolV2Response, ExpertProtocolV2ResponseHeader, ExpertProtocolV2ResponseView, ExpertProtocolV2Status, ExpertV2Dtype, TcpTransportConfig, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN};
 
 const VERBS_HOST_RECV_WR_ID: u64 = 0x7256_1001;
+/// Request payloads at least this large are staged by several threads.
+const PARALLEL_REQUEST_COPY_BYTES: usize = 4 << 20;
+
+/// `dst.copy_from_slice(src)` split over eight threads.
+fn copy_threads(dst: &mut [u8], src: &[u8]) {
+    let chunk = src.len().div_ceil(8).next_multiple_of(4096);
+    thread::scope(|scope| {
+        for (d, s) in dst.chunks_mut(chunk).zip(src.chunks(chunk)) {
+            scope.spawn(move || d.copy_from_slice(s));
+        }
+    });
+}
 const VERBS_HOST_SEND_WR_ID: u64 = 0x7256_1002;
 const VERBS_HOST_RDMA_RING_DEPTH: usize = 8;
 const VERBS_HOST_MAPPED_RDMA_RING_MAX_DEPTH: usize = 32;
@@ -2277,12 +2289,33 @@ impl VerbsHostProtocolV2PersistentClientSession {
         }
         let send_started = timing_enabled.then(Instant::now);
         let request_send_slot = self.request_send_sequence % self.request_ring.depth;
-        self.endpoint.send_parts_at(
-            request_prefix,
-            &request.hidden_payload,
-            self.request_ring.slot_offset(self.request_send_sequence),
-            VERBS_HOST_SEND_WR_ID + request_send_slot as u64,
-        )?;
+        let offset = self.request_ring.slot_offset(self.request_send_sequence);
+        if request.hidden_payload.len() >= PARALLEL_REQUEST_COPY_BYTES {
+            // Prefill waves: one core copies ~10 GB/s, so staging the same
+            // hidden rows for six ranks one after another delayed the last
+            // rank's request by ~15 ms; split each copy across threads.
+            let view = self.endpoint.send_buffer_view()?;
+            anyhow::ensure!(!view.host_ptr.is_null() && offset + request_wire_bytes <= view.bytes,
+                "persistent verbs-host request slot exceeds its send buffer");
+            // SAFETY: the slot lies inside this endpoint's registered send
+            // buffer (checked above) and no send from it is in flight: the
+            // ring reclaimed this slot before reuse (above), and only this
+            // session writes its buffer.
+            let slot = unsafe {
+                std::slice::from_raw_parts_mut(view.host_ptr.cast::<u8>().add(offset), request_wire_bytes)
+            };
+            let (prefix, payload) = slot.split_at_mut(request_prefix.len());
+            prefix.copy_from_slice(request_prefix);
+            copy_threads(payload, &request.hidden_payload);
+            self.endpoint.post_send_at(offset, request_wire_bytes, VERBS_HOST_SEND_WR_ID + request_send_slot as u64)?;
+        } else {
+            self.endpoint.send_parts_at(
+                request_prefix,
+                &request.hidden_payload,
+                offset,
+                VERBS_HOST_SEND_WR_ID + request_send_slot as u64,
+            )?;
+        }
         self.request_send_sequence = self.request_send_sequence.wrapping_add(1);
         self.request_send_in_flight += 1;
         Ok(VerbsHostProtocolV2ChunkSubmissionTiming {
