@@ -11,7 +11,9 @@
 //! With `--prefix-partial on` a request that shares only part of a snapshot resumes at its last
 //! common page boundary (`ReuseRule::paged`): the shared rows are the snapshot's own bytes, so
 //! this is exact too. The DFlash2 drafter is not captured: a restored sequence drafts cold
-//! with `valid_from` at the restore point.
+//! with `valid_from` at the restore point. Under a head split both GPUs hold identical copies
+//! of the latent and index pages (the replicated MLA projection and indexer write them): tail
+//! copies run on each GPU's stream, and the host tier is off.
 use super::engine::{GlmEngine, GlmPlacement, INDEX_PAGE_BYTES, PAGE_ROWS, RECORD_BYTES};
 use crate::shared::memory::DeviceAllocation;
 use crate::shared::prefix::view;
@@ -26,8 +28,8 @@ const INDEX_SCALES: usize = PAGE_ROWS * INDEX_KEY_BYTES;
 
 pub(crate) struct GlmPrefix<'e, 'a> {
     engine: &'e GlmEngine<'a>,
-    /// Per layer: latent records and, on full-indexer layers, index keys.
-    paged: Vec<(CuteafdDeviceBuffer, Option<CuteafdDeviceBuffer>)>,
+    /// Per rank and layer: latent records and, on full-indexer layers, index keys.
+    paged: Vec<(usize, CuteafdDeviceBuffer, Option<CuteafdDeviceBuffer>)>,
     partial: bool,
     /// The host tier's stand-in tail (one byte host restores overwrite and nothing reads).
     scratch: DeviceAllocation<'a>,
@@ -35,18 +37,24 @@ pub(crate) struct GlmPrefix<'e, 'a> {
 
 impl<'e, 'a> GlmPrefix<'e, 'a> {
     pub fn new(engine: &'e GlmEngine<'a>, partial: bool) -> Result<Self> {
-        Ok(Self { engine, paged: engine.paged_buffers(), partial, scratch: DeviceAllocation::new(engine.library, 256)? })
+        let paged = (0..engine.ranks())
+            .flat_map(|rank| engine.paged_buffers_on(rank).into_iter().map(move |(records, index)| (rank, records, index)))
+            .collect();
+        Ok(Self { engine, paged, partial, scratch: DeviceAllocation::new(engine.library, 256)? })
     }
 
     pub fn page_bytes(&self) -> usize {
-        self.paged.iter().map(|(_, index)| PAGE_ROWS * RECORD_BYTES + index.map_or(0, |_| INDEX_PAGE_BYTES)).sum()
+        self.paged.iter().map(|(_, _, index)| PAGE_ROWS * RECORD_BYTES + index.map_or(0, |_| INDEX_PAGE_BYTES)).sum()
     }
 
-    fn copy(&self, dst: CuteafdDeviceBuffer, src: CuteafdDeviceBuffer) -> Result<()> {
+    /// A copy between two views on rank `rank`'s GPU.
+    fn copy(&self, rank: usize, dst: CuteafdDeviceBuffer, src: CuteafdDeviceBuffer) -> Result<()> {
         debug_assert_eq!(dst.bytes, src.bytes);
-        // SAFETY: both views lie inside live engine allocations (checked by `view`); the copy is
-        // ordered on the engine stream with every forward pass that reads or writes them.
-        unsafe { self.engine.library.copy_d2d_async(dst, src, src.bytes, self.engine.stream) }
+        // SAFETY: both views lie inside live allocations of that GPU (checked by `view`); the copy
+        // is ordered on its stream with every forward pass that reads or writes them.
+        self.engine.on(rank, || unsafe {
+            self.engine.library.copy_d2d_async(dst, src, src.bytes, self.engine.stream_of(rank))
+        })
     }
 }
 
@@ -87,28 +95,31 @@ impl PrefixFamily for GlmPrefix<'_, '_> {
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
         let (from, to, rows) = (copy.from as usize, copy.to as usize, copy.rows);
         let record_page = PAGE_ROWS * RECORD_BYTES;
-        for &(records, index) in &self.paged {
-            self.copy(view(records, to * record_page, rows * RECORD_BYTES)?,
+        for &(rank, records, index) in &self.paged {
+            self.copy(rank, view(records, to * record_page, rows * RECORD_BYTES)?,
                 view(records, from * record_page, rows * RECORD_BYTES)?)?;
             if let Some(index) = index {
                 let (from, to) = (from * INDEX_PAGE_BYTES, to * INDEX_PAGE_BYTES);
-                self.copy(view(index, to, rows * INDEX_KEY_BYTES)?, view(index, from, rows * INDEX_KEY_BYTES)?)?;
-                self.copy(view(index, to + INDEX_SCALES, rows * 4)?, view(index, from + INDEX_SCALES, rows * 4)?)?;
+                self.copy(rank, view(index, to, rows * INDEX_KEY_BYTES)?, view(index, from, rows * INDEX_KEY_BYTES)?)?;
+                self.copy(rank, view(index, to + INDEX_SCALES, rows * 4)?, view(index, from + INDEX_SCALES, rows * 4)?)?;
             }
         }
         Ok(())
     }
 
     fn drain(&self) -> Result<(), BoxError> {
-        // SAFETY: the engine owns this stream.
-        Ok(unsafe { self.engine.library.cuda_stream_synchronize(self.engine.stream) }?)
+        for rank in 0..self.engine.ranks() {
+            // SAFETY: the engine owns these streams.
+            unsafe { self.engine.library.cuda_stream_synchronize(self.engine.stream_of(rank))? };
+        }
+        Ok(())
     }
 
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
         let page = page as usize;
         let record_page = PAGE_ROWS * RECORD_BYTES;
         let mut out = Vec::new();
-        for &(records, index) in &self.paged {
+        for &(_, records, index) in self.paged.iter().filter(|(rank, _, _)| *rank == 0) {
             out.push(DeviceRange { addr: records.ptr as u64 + (page * record_page) as u64, bytes: record_page });
             if let Some(index) = index {
                 out.push(DeviceRange { addr: index.ptr as u64 + (page * INDEX_PAGE_BYTES) as u64, bytes: INDEX_PAGE_BYTES });
@@ -171,7 +182,9 @@ fn prefill_digest(engine: &GlmEngine<'_>, placement: &mut GlmPlacement, tokens: 
 
 fn download(engine: &GlmEngine<'_>, addr: u64, bytes: usize, template: CuteafdDeviceBuffer) -> Result<Vec<u8>> {
     // SAFETY: the engine owns this stream; draining it retires every write to the range.
-    unsafe { engine.library.cuda_stream_synchronize(engine.stream)? };
+    for rank in 0..engine.ranks() {
+        unsafe { engine.library.cuda_stream_synchronize(engine.stream_of(rank))? };
+    }
     let mut out = vec![0u8; bytes];
     engine.library.copy_d2h(&mut out, CuteafdDeviceBuffer { ptr: addr as *mut std::ffi::c_void, bytes, ..template })?;
     Ok(out)
@@ -184,7 +197,7 @@ fn paged_rows(family: &GlmPrefix<'_, '_>, placement: &GlmPlacement, len: usize) 
     let record_page = PAGE_ROWS * RECORD_BYTES;
     for (p, &page) in placement.pages.iter().enumerate().take(len.div_ceil(PAGE_ROWS)) {
         let (page, rows) = (page as usize, (len - p * PAGE_ROWS).min(PAGE_ROWS));
-        for &(records, index) in &family.paged {
+        for &(_, records, index) in &family.paged {
             out.extend_from_slice(&download(family.engine, records.ptr as u64 + (page * record_page) as u64,
                 rows * RECORD_BYTES, records)?);
             if let Some(index) = index {

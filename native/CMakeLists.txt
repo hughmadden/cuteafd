@@ -44,6 +44,8 @@ option(CUTEAFD_ENABLE_V41_HC_LAGGED_AOT "Build candidate native lagged mHC begin
 option(CUTEAFD_ENABLE_V41_FP8_AOT "Build native V4.1 coordinator FP8 AOT kernels" OFF)
 option(CUTEAFD_ENABLE_DSV4_AOT "Build the DeepSeek V4 coordinator programs" OFF)
 option(CUTEAFD_ENABLE_GLM_AOT "Build the GLM 5.x coordinator programs (same table as DeepSeek V4)" OFF)
+set(CUTEAFD_GLM_GEOMETRIES "glm" CACHE STRING
+  "GLM program geometries with CUTEAFD_ENABLE_GLM_AOT: glm (GLM 5.x), glm2 (its two-GPU head split)")
 option(CUTEAFD_ENABLE_MIMO_AOT "Build the MiMo V2 coordinator programs (same table as DeepSeek V4)" OFF)
 set(CUTEAFD_MIMO_GEOMETRIES "mimo" CACHE STRING
   "MiMo program geometries with CUTEAFD_ENABLE_MIMO_AOT: mimo (V2 Flash), mimop (V2.6 Pro), mimop2 (V2.6 Pro head split)")
