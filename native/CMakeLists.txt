@@ -178,9 +178,9 @@ if(CUTEAFD_ENABLE_XGRAMMAR)
 endif()
 
 set(CUTEAFD_BUILD_SPARKINFER_AOT OFF)
-# FAMILY:fp8 expert families (exact FP8 packages, cmake/shared/fp8_moe.cmake).
+# FAMILY:fp8 and FAMILY:nvfp4 expert families (fp8_moe packages, cmake/shared/fp8_moe.cmake).
 set(CUTEAFD_FP8_EXPERT_FAMILIES OFF)
-if(CUTEAFD_EXPERT_FAMILIES MATCHES ":fp8")
+if(CUTEAFD_EXPERT_FAMILIES MATCHES ":(fp8|nvfp4)")
   set(CUTEAFD_FP8_EXPERT_FAMILIES ON)
 endif()
 if(CUTEAFD_ENABLE_V41_EXPERT_AOT OR CUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT OR

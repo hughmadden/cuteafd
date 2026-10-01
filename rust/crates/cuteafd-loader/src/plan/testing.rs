@@ -66,6 +66,17 @@ pub fn mxfp4(name: &str, n: usize, k: usize) -> Vec<Tensor> {
     vec![t(format!("{name}.weight"), "U8", &[n, k / 2]), t(format!("{name}.weight_scale"), "U8", &[n, k / 32])]
 }
 
+/// ModelOpt NVFP4 `[n, k]`: packed E2M1 U8 `[n, k/2]`, E4M3 `[n, k/16]`, FP32
+/// `weight_scale_2` and `input_scale` scalars.
+pub fn nvfp4(name: &str, n: usize, k: usize) -> Vec<Tensor> {
+    vec![
+        t(format!("{name}.weight"), "U8", &[n, k / 2]),
+        t(format!("{name}.weight_scale"), "F8_E4M3", &[n, k / 16]),
+        t(format!("{name}.weight_scale_2"), "F32", &[]),
+        t(format!("{name}.input_scale"), "F32", &[]),
+    ]
+}
+
 /// A complete EXL3 projection `[n, k]` at `bits`.
 pub fn exl3(name: &str, n: usize, k: usize, bits: usize) -> Vec<Tensor> {
     vec![

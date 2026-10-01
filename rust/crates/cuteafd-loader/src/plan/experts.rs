@@ -8,6 +8,9 @@
 //!   blocks padded to the widest); a tp1 coordinator package.
 //! - MXFP4 through the same programs (MiMo V2.6 Pro `mimop:fp8`): Spark tp6
 //!   and tp2, a tp1 coordinator package.
+//! - NVFP4 (ModelOpt) through the same programs (`glmf:nvfp4`, `qwen4:nvfp4`,
+//!   `glm:nvfp4`): Spark tp4, tp2, tp3 and tp6 in whole 16-value blocks, a tp1
+//!   coordinator package.
 //! - EXL3 (`python/tools/aot/package_exl3_aot.py`): Spark worlds 4, 2, 3, and
 //!   6 when the intermediate has at least six 128-row blocks.
 //! - DeepSeek native experts (expertd-native MXFP4 / EXL3): 2, 3, 4 and 6.
@@ -29,6 +32,12 @@ pub fn fp8_spark_worlds(intermediate: usize) -> Vec<usize> {
 /// Default Spark layouts of an MXFP4 package on the fp8_moe programs.
 pub fn mxfp4_spark_worlds() -> Vec<usize> {
     vec![2, 6]
+}
+
+/// Default Spark layouts of an NVFP4 package on the fp8_moe programs: the
+/// transport worlds whose ranks each own a 16-value block.
+pub fn nvfp4_spark_worlds(intermediate: usize) -> Vec<usize> {
+    TRANSPORT_WORLDS.into_iter().filter(|&tp| intermediate % 16 == 0 && intermediate / 16 >= tp).collect()
 }
 
 /// Spark worlds of an EXL3 package (`package_exl3_aot.py` profiles).
@@ -70,5 +79,8 @@ mod tests {
         assert_eq!(stored_slice(2304, 128, 4), Some(640));
         assert_eq!(stored_slice(640, 128, 6), None);
         assert_eq!(stored_slice(2048, 128, 0), None);
+        assert_eq!(nvfp4_spark_worlds(640), [2, 3, 4, 6]);
+        assert_eq!(stored_slice(640, 16, 6), Some(128));
+        assert_eq!(stored_slice(2048, 16, 6), Some(384));
     }
 }

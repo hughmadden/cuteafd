@@ -348,6 +348,17 @@ Qwen on one RTX: 68 GB); S2 dense + MTP dispositions; S3 V4.1
 convergence; S4 W4A4 prefill experiment. Gates per stage: oracle cosine,
 KL vs golden within 0.005 of the FP8-expert path, tok/s ≥ it, readiness
 not worse, V4.1 parity. GLM 5.3 NVFP4 experts (~407 GB) need TP6.
+Status: S0 + S1 on `work/nvfp4` (fork `cuteafd/nvfp4-w4a16`). The ModelOpt
+reader (`formats/modelopt.rs`) checks every weight against its
+hf_quant_config.json / config.json declaration; `glm|glmf|qwen4:nvfp4` build
+`fp8-<family>-nvfp4` packages (ABI 3, grouped GEMV at every row count, alphas
+after each scale grid; Spark tp2/3/4/6, coordinator tp1). Real layers pass the
+CPU oracle at every slice. NVIDIA's NVFP4 experts are ~9% RMS from the FP8
+originals, so GLM 5.3 Flash's KL is +0.037 over the FP8-expert path (NLL
++0.003): the checkpoint, not the kernels (S1 measurements in the commit).
+Open: an NVFP4 stream/GEMM route for large prefill steps (the GEMV is ~4% behind
+EXL3 on Qwen prefill), Spark-native runs, S2 dense dispositions (GLM 5.3 Flash
+NVFP4 dense FFN, GLM 5.3 BF16/per-tensor FP8 parts).
 
 **Phase 6 — placement planner (design 2026-09-30).** One planner for every
 family: (model, inventory of 1–2 coordinator GPUs — real or simulated by a
