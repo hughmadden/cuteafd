@@ -402,7 +402,13 @@ Spark-bound) and DeepSeek V4 (4 Sparks, all experts remote: Flash decode -10%,
 Pro decode -12%, prefill neutral). Shared plumbing in `shared/peer_split.rs`: per-slot release flags,
 partials exchanged and summed in the same operand order on both GPUs (identical
 residual streams), GPU1 queued a layer ahead of GPU0's Spark exchange, decode
-graphs captured per GPU. The layer-range split is not needed for these three.
+graphs captured per GPU. The layer-range split is not needed for these three. V4.1 Flash re-measured on p8 images (2 RTX + Sparks, code,
+dSpark on): its TP2 modes still lose (C1 187 -> 170 tok/s for TP2_ATTENTION and for
+TP2 q+o projections; C4 501 -> 466 / 482). Each projection there ends in a
+cross-device event and a host wait, so a gain needs V4.1's per-layer flow rebuilt
+around device-side flags. The attention-only ceiling is about the DeepSeek V4 Flash
+split (-10%, all experts remote), and less with RTX-resident expert layers, so
+V4.1 keeps its layer split.
 The drafter follows the GPU that owns the last backbone layers (taps and head
 live there); TP2 drafters are ≤1% on DFlash2 and not built unless the P2P
 probe shows ≤15 µs hops; the win is lane B drafting on GPU1 while lane A
