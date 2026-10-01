@@ -388,11 +388,6 @@ pub(crate) struct GlmfEngine<'a> {
     ops: Option<RefCell<OpTimes>>,
     /// Prefill projections that run block-FP8 GEMMs (the layers need FP8 copies).
     pub fp8_prefill: Fp8Prefill,
-    /// CUTEAFD_DSA_SORTED_TOPK=1: each row's top-k pools are sorted by position before the
-    /// expansion, so the sparse attention's order (and its rounding) is canonical: the radix
-    /// top-k emits in shared-atomic order, which varies run to run (deterministic serving and
-    /// the --resume-at gate past 2051 tokens).
-    pub sorted_topk: bool,
 }
 
 /// Which prefill projections run block-FP8 GEMMs (E4M3 activations per row
@@ -481,7 +476,7 @@ impl<'a> GlmfEngine<'a> {
             subset_lanes: std::env::var("CUTEAFD_GLMF_PREFILL_LANES").is_ok_and(|v| v == "subset"),
             full_prefill_logits: false, routes_ready: library.cuda_event_create_ordering()?,
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
-            fp8_prefill: Fp8Prefill::default(), l2: None, sorted_topk: sorted_topk() })
+            fp8_prefill: Fp8Prefill::default(), l2: None })
     }
 
     /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
@@ -1228,16 +1223,6 @@ impl<'a> GlmfEngine<'a> {
                 ("page_table", w.pool_table.buffer.ptr), ("cache_lengths", w.cache_lengths.buffer.ptr),
                 ("output_indices", w.pools.buffer.ptr), ("scratch", w.topk_scratch.buffer.ptr)],
                 &[rows, Scalar::I32(tables.pool_width.max(1) as i32), Scalar::I32(tables.pool_stride as i32)])?;
-            if self.sorted_topk {
-                self.timed("pool top-k sort", || {
-                    // SAFETY: `pools` holds the step's rows of index_topk / 4 pool slots, every one
-                    // on a pool page `pool_logical` maps; stream-ordered after the top-k.
-                    unsafe {
-                        self.library.dsa_sort_slots(w.pools.buffer.ptr, self.pool_logical.buffer.ptr,
-                            tables.positions.len(), self.cfg.index_topk / KPOOL, self.stream)
-                    }
-                })?;
-            }
         }
         self.run("index_expand", &[("positions", w.positions.buffer.ptr), ("pools", w.pools.buffer.ptr),
             ("pool_logical", self.pool_logical.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
@@ -1616,11 +1601,6 @@ impl<'a> GlmfEngine<'a> {
         self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
         Ok(Some(logits))
     }
-}
-
-/// CUTEAFD_DSA_SORTED_TOPK=1 (see [`GlmfEngine::sorted_topk`]).
-pub(crate) fn sorted_topk() -> bool {
-    std::env::var("CUTEAFD_DSA_SORTED_TOPK").is_ok_and(|v| v == "1")
 }
 
 impl Drop for GlmfEngine<'_> {

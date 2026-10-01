@@ -375,7 +375,7 @@ fn mean_kl(logits: &[f32], golden: &[f32], vocab: usize) -> f64 {
 /// --nll: the golden prompt through prefill chunks of the engine's capacity
 /// (Spark lanes when available), every row's logits scored against the
 /// golden: mean NLL of the next token, top-1 agreement, KL.
-fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, transport: &mut SparkLink<'_>,
+fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, mut transport: Option<&mut SparkLink<'_>>,
     runtime: &tokio::runtime::Runtime) -> Result<()> {
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
@@ -385,17 +385,27 @@ fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, t
     let started = Instant::now();
     let mut logits = Vec::new();
     for chunk in embed.chunks(engine.prefill_capacity() * row) {
-        logits.extend(engine.prefill_rows_logits(&mut placement, chunk, Some((&mut *transport, runtime)), None,
-            chunk.len() / row)?.context("the prefill needs every layer")?);
+        logits.extend(engine.prefill_rows_logits(&mut placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)),
+            None, chunk.len() / row)?.context("the prefill needs every layer")?);
     }
     let seconds = started.elapsed().as_secs_f64();
-    let golden: Vec<f32> = std::fs::read(args.golden.join("logits.bin"))?
-        .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-    let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
     let nll_of = |l: &[f32], next: u32| {
         let top = l.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
         top + l.iter().map(|&x| (x as f64 - top).exp()).sum::<f64>().ln() - l[next as usize] as f64
     };
+    let Ok(golden) = std::fs::read(args.golden.join("logits.bin")) else {
+        // No golden logits (a token file alone): the engine's NLL of the text and a digest of
+        // every logit (bitwise A/B between builds and runs).
+        use std::hash::{Hash, Hasher};
+        let mut digest = std::collections::hash_map::DefaultHasher::new();
+        logits.iter().for_each(|v| v.to_bits().hash(&mut digest));
+        let nll: f64 = (0..tokens.len() - 1).map(|r| nll_of(&logits[r * vocab..][..vocab], tokens[r + 1])).sum();
+        println!("prefill logits: {} tokens in {seconds:.2} s | mean NLL engine {:.4} | logits digest {:016x}",
+            tokens.len(), nll / (tokens.len() - 1) as f64, digest.finish());
+        return Ok(());
+    };
+    let golden: Vec<f32> = golden.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+    let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
     let rows = tokens.len();
     let (mut agree, mut nll, mut golden_nll) = (0usize, 0f64, 0f64);
     for r in 0..rows {
@@ -498,8 +508,8 @@ fn bench_verify(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
 }
 
 /// --bench-prefill: fresh sequences of --bench-prefill-tokens tokens.
-fn bench_prefill(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, transport: &mut SparkLink<'_>,
-    runtime: &tokio::runtime::Runtime) -> Result<()> {
+fn bench_prefill(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
+    mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime) -> Result<()> {
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
     let row = opened.cfg.hidden * 2;
@@ -515,7 +525,7 @@ fn bench_prefill(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<
         let mut placement = allocator.admit(n)?;
         let started = Instant::now();
         for chunk in long.chunks(engine.prefill_capacity() * row) {
-            engine.prefill(&mut placement, chunk, Some((&mut *transport, runtime)), None)?;
+            engine.prefill(&mut placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)), None)?;
         }
         // Round 0 warms the workspaces.
         if round > 0 {
@@ -581,9 +591,10 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
         return draft_run(args, opened, engine, transport, runtime);
     }
     if args.nll || args.bench_prefill > 0 {
-        let transport = transport.context("--nll and --bench-prefill need Spark peers")?;
+        ensure!(transport.is_some() || engine.skip_routed(),
+            "--nll and --bench-prefill need Spark peers or --skip-routed-experts");
         if args.nll {
-            nll_run(args, opened, engine, transport, runtime)?;
+            nll_run(args, opened, engine, transport.as_deref_mut(), runtime)?;
         }
         if args.bench_prefill > 0 {
             bench_prefill(args, opened, engine, transport, runtime)?;

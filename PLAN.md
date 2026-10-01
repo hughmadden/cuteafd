@@ -279,15 +279,14 @@ decode tok/s), S1 MiMo V2.6 Pro (+V2 Flash), S2 GLM 5.3 Flash, S3 GLM 5.3,
 S4 Qwen, S5 V4 Flash/Pro, S6 canonical turn snapshot, S7 embedding cache.
 Gate: resume-at-P restores are byte-identical to straight prefill; greedy
 text identical to cache-off; V4.1 parity unchanged.
-Status: S0/S1 merged; S2 (GLM 5.3 Flash: 256-row units = 4 MLA pages + the
-pool page, 140.8 MiB KDA mark, kda_len commit point) and S3 (GLM 5.3:
-pages only, host tier via a stand-in tail) on `work/prefix-glm`, GPU-gated
-with experts skipped; agentic gate on Sparks next. Past 2048 tokens the DSA
-top-k is not deterministic (radix select: shared-atomic output order, fixed
-by opt-in `CUTEAFD_DSA_SORTED_TOPK=1`; and the selection among exactly tied
-scores, which needs an index tie-break in the b12x `tiled_topk`), so
-`--resume-at` there gates the state at P exactly and the continuation
-against a cold-prefill floor.
+Status: S0-S3 merged (S2 GLM 5.3 Flash: 256-row units = 4 MLA pages + the
+pool page, 140.8 MiB KDA mark, kda_len commit point; S3 GLM 5.3: pages only,
+host tier via a stand-in tail), GPU-gated with experts skipped; agentic gate
+on Sparks next. The DSA index top-k (b12x `tiled_topk`: GLM 5.x, GLM 5.3
+Flash, V4 Flash/Pro) is deterministic: ties go to the lower index and picks
+come out in ascending order, so `--resume-at` is byte-exact past 2048 tokens
+too. Still arrival-ordered: the fused decode route (`persistent_topk`, used
+only by plans of 16 rows or fewer, not by the exported m64 programs).
 
 **Repo layout and naming (study 2026-09-30; run at a quiet point after a merge
 round, before prefix-cache S1 and planner S0 create new modules).** Family ids:

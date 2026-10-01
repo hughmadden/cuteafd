@@ -204,8 +204,8 @@ fn paged_rows(family: &GlmPrefix<'_, '_>, placement: &GlmPlacement, len: usize) 
 /// paged row byte for byte (a restore must be exact). A straight prefill without the boundary
 /// at P is reported too (informational: chunking changes may round differently).
 /// With `cold`, B is prefilled from scratch on its own pages instead (no restore): the floor of
-/// what the kernels themselves vary. The check runs `repeat` times on fresh sequences (past
-/// 2048 tokens the DSA top-k's selection at exactly tied scores varies run to run).
+/// what the kernels themselves vary. The check runs `repeat` times on fresh sequences (every
+/// attempt must be identical: the DSA top-k is deterministic, ties going to the lower index).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resume_check(engine: &GlmEngine<'_>, embed_rows: &dyn Fn(&[u32]) -> Result<Vec<u8>>, tokens: &[u32],
     at: usize, n: usize, chunk: usize, decode: usize, cold: bool, repeat: usize, mut experts: Experts<'_, '_>)
@@ -216,8 +216,6 @@ pub(crate) fn resume_check(engine: &GlmEngine<'_>, embed_rows: &dyn Fn(&[u32]) -
     ensure!(engine.full_prefill_logits, "--resume-at needs every prefill row's logits");
     ensure!(experts.is_some() || engine.skip_routed(), "--resume-at needs Spark peers or --skip-routed-experts");
     ensure!(at > 0 && at < n && n <= tokens.len(), "--resume-at {at} must lie inside the {n} prefilled tokens");
-    ensure!(engine.sorted_topk || n + decode <= engine.cfg.index_topk, "past {} tokens the radix top-k emits in an \
-        order that varies run to run: set CUTEAFD_DSA_SORTED_TOPK=1", engine.cfg.index_topk);
     let chunk = chunk.clamp(1, engine.prefill_rows);
     let row = engine.cfg.hidden * 2;
     let embed = embed_rows(&tokens[..n])?;
