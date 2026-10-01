@@ -80,11 +80,14 @@ go in commit messages as short before → after tables with conditions.
   correctness gates, not perf tables; the planner's estimates cover them.
 - Tiered gates. Merges and features: cargo/script tests (failing ids, not
   counts), golden NLL/byte-exactness on one GPU or loopback, and the
-  feature's own measurement. Full V4.1 parity (3 interleaved sessions; 6 only
-  when borderline) runs at release cuts and for changes to shared hot paths
-  (transport, expert exchange, native lib, sampler). Release images are built
-  for release cuts, not to verify branches; agentic benches gate with 1–2
-  short sessions, the full bench runs at release.
+  feature's own measurement. Changes to shared hot paths (transport, expert
+  exchange, native lib, sampler) add a quick V4.1 parity: one launch of the
+  candidate (WIP images) vs a baseline measured the same day, C1 + C16 code
+  decode only (~10 min); escalate to 3 interleaved sessions per arm only if a
+  metric is below 0.98. Full V4.1 parity (3 sessions per arm, all metrics)
+  runs at release cuts only. Release images are built for release cuts, not
+  to verify branches; agentic benches gate with 1–2 short sessions, the full
+  bench runs at release.
 - Unsupported is a result, not a crash: `cuteafd plan` names the tensors,
   formats, shapes and the exporter or kernel to add.
 - Load speed is a feature; do not regress readiness time.
