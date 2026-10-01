@@ -29,6 +29,7 @@ image = { version = "0.25.10", default-features = false, features = ["png", "web
 turbojpeg = { version = "1.5.1", default-features = false, features = ["cmake", "require-simd"] }
 libc = "0.2"
 libloading = "0.8"
+rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"

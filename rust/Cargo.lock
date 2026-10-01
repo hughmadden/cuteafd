@@ -676,6 +676,7 @@ dependencies = [
  "cuteafd-core",
  "image",
  "libc",
+ "rayon",
  "serde",
  "serde_json",
  "sha2",

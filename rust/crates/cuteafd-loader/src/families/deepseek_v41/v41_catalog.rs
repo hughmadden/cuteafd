@@ -339,17 +339,19 @@ impl OfficialV41Catalog {
             self.config().text().engram_layer_ids.contains(&layer),
             "no engram table at layer {layer}"
         );
-        let map = |suffix: &str| -> Result<crate::MappedRows> {
+        let map = |suffix: &str| -> Result<crate::MappedTable> {
             let tensor = self.tensor(&format!("layers.{layer}.engram.embed.{suffix}"))?;
             let metadata = &tensor.metadata;
-            unsafe {
-                crate::MappedRows::open(
+            ensure!(metadata.shape.len() == 2, "engram tensor {suffix} is not 2-D");
+            // SAFETY: forwarded from this function's contract.
+            Ok(unsafe {
+                crate::MappedTable::single(
                     &self.snapshot.join(&tensor.shard),
                     metadata.byte_offset,
                     metadata.shape[0] as u64,
-                    metadata.shape[1],
-                )
-            }
+                    crate::RowFormat::of(metadata.dtype.clone(), metadata.shape[1])?,
+                )?
+            })
         };
         if let Some(ple) = self.exl3.as_ref().and_then(|m| m.ple_quantization.as_ref()) {
             use std::os::unix::fs::FileExt;

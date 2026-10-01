@@ -6,3 +6,4 @@ pub(crate) mod exl3_format;
 pub mod exl3_storage;
 pub(crate) mod expert_format;
 pub mod fp8_experts;
+pub mod mapped_table;

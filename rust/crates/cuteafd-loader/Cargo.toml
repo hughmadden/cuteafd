@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 libc.workspace = true
+rayon.workspace = true
 image.workspace = true
 turbojpeg.workspace = true
 cuteafd-core = { path = "../cuteafd-core" }
