@@ -84,28 +84,38 @@ type Destroy = unsafe extern "C" fn(*mut c_void);
 type Scratch = unsafe extern "C" fn(u32, *mut u64) -> i32;
 type SetOptions = unsafe extern "C" fn(*mut c_void, u32) -> i32;
 
-/// `cuteafd_fp8moe_set_options` bit 0: run the W8A16 prefill fallback programs.
-const OPTION_PREFILL_A16: u32 = 1;
-
-/// How FP8 expert packages run their large (prefill) row counts.
+/// How FP8 expert packages run their large (prefill) row counts
+/// (`cuteafd_fp8moe_set_options`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Fp8MoePrefill {
-    /// Block-scaled E4M3 x E4M3 gate/up over the FP8 K32 wire rows (BF16
-    /// rows quantized to wire rows first at coordinator TP1): the default.
+    /// The package default: FP8 K32 wire rows W8A8 (block-scaled E4M3 x E4M3
+    /// gate/up), BF16 rows W8A16 (exact rows).
     #[default]
-    W8a8,
-    /// The former W8A16 programs (weights widened to `bf16(w * s)`; BF16
-    /// input rows exact on the coordinator).
+    Auto,
+    /// The former W8A16 programs (weights widened to `bf16(w * s)`).
     W8a16,
+    /// W8A8 for BF16 rows too: quantized to wire rows inside the program.
+    W8a8,
+}
+
+impl Fp8MoePrefill {
+    fn option(self) -> u32 {
+        match self {
+            Self::Auto => 0,
+            Self::W8a16 => 1,
+            Self::W8a8 => 2,
+        }
+    }
 }
 
 impl std::str::FromStr for Fp8MoePrefill {
     type Err = anyhow::Error;
     fn from_str(value: &str) -> Result<Self> {
         match value {
+            "auto" => Ok(Self::Auto),
             "w8a8" => Ok(Self::W8a8),
             "w8a16" => Ok(Self::W8a16),
-            other => anyhow::bail!("FP8 expert prefill is w8a8 or w8a16, not {other:?}"),
+            other => anyhow::bail!("FP8 expert prefill is auto, w8a8 or w8a16, not {other:?}"),
         }
     }
 }
@@ -155,12 +165,12 @@ impl Fp8MoeModule {
             _owner_thread: PhantomData })
     }
 
-    /// Selects the programs large row counts run (W8A8 unless asked otherwise).
-    /// A package without the option runs its single form: accepted for W8A8.
+    /// Selects the programs large row counts run. A package without the
+    /// option runs its single (default) form.
     pub fn set_prefill(&mut self, prefill: Fp8MoePrefill) -> Result<()> {
-        let options = if prefill == Fp8MoePrefill::W8a16 { OPTION_PREFILL_A16 } else { 0 };
+        let options = prefill.option();
         let Some(set) = self.set_options else {
-            ensure!(options == 0, "this FP8 expert package predates the W8A16 prefill fallback; rebuild it");
+            ensure!(options == 0, "this FP8 expert package predates the prefill forms; rebuild it");
             return Ok(());
         };
         // SAFETY: the context came from this library's create and is still live.

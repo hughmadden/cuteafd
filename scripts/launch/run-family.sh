@@ -237,11 +237,12 @@ if [[ "$restart" == 1 ]]; then
     ssh "$host" 'ids=$(docker ps -aq --filter name=^cuteafd-spark-expert-); [ -z "$ids" ] || docker rm -f $ids >/dev/null 2>&1 || true'
   done
 fi
-# FP8_EXPERT_PREFILL: how FP8 expert packages run prefill row counts, w8a8
-# (default: E4M3 x E4M3 gate/up) or w8a16 (the former programs; exact BF16 rows
-# for experts on the coordinator GPU). Spark workers and the coordinator both read it.
-fp8_prefill="$(get FP8_EXPERT_PREFILL w8a8)"
-case "$fp8_prefill" in w8a8|w8a16) ;; *) echo "FP8_EXPERT_PREFILL must be w8a8 or w8a16" >&2; exit 2 ;; esac
+# FP8_EXPERT_PREFILL: how FP8 expert packages run prefill row counts: auto
+# (default: wire rows W8A8 with E4M3 x E4M3 gate/up, BF16 rows W8A16), w8a16
+# (the former programs) or w8a8 (also quantizes the BF16 rows of experts on the
+# coordinator GPU). Spark workers and the coordinator both read it.
+fp8_prefill="$(get FP8_EXPERT_PREFILL auto)"
+case "$fp8_prefill" in auto|w8a8|w8a16) ;; *) echo "FP8_EXPERT_PREFILL must be auto, w8a8 or w8a16" >&2; exit 2 ;; esac
 # GB10 CUDA allocations cannot reclaim page cache: drop it on the expert hosts first.
 spark_hosts=()
 for ((rank = 0; rank < ranks; rank++)); do spark_hosts+=(--host "$(get "SPARK_${rank}_HOST")"); done

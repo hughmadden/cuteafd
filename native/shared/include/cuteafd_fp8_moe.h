@@ -25,10 +25,10 @@ int32_t cuteafd_fp8moe_create(void** context);
 int32_t cuteafd_fp8moe_launch(void* context, uint32_t capacity, void* const* pointers, int32_t rows,
                               void* stream);
 void cuteafd_fp8moe_destroy(void* context);
-// options bit 0: run the W8A16 prefill fallback programs (FP8 weights). Large
-// row counts otherwise run W8A8: block-scaled E4M3 x E4M3 gate/up over the wire
-// rows (BF16 rows at coordinator TP1 are quantized to wire rows first). Packages
-// built before the fallback lack this symbol.
+// options: the large-row form of FP8 programs. 0 the package default (wire rows
+// W8A8: block-scaled E4M3 x E4M3 gate/up; BF16 rows W8A16, exact), 1 W8A16 (the
+// former programs), 2 W8A8 (BF16 rows quantized to wire rows first). Packages
+// built before the forms lack this symbol.
 int32_t cuteafd_fp8moe_set_options(void* context, uint32_t options);
 
 #ifdef __cplusplus

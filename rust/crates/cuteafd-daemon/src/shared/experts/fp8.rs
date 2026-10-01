@@ -20,8 +20,9 @@ use std::path::{Path, PathBuf};
 const READERS: usize = 16;
 
 /// Environment switch for how FP8 expert packages run prefill row counts:
-/// `w8a8` (default: block-scaled E4M3 x E4M3 gate/up) or `w8a16` (the former
-/// programs, weights widened to `bf16(w * s)`; exact BF16 rows at coordinator TP1).
+/// `auto` (default: FP8 wire rows W8A8, block-scaled E4M3 x E4M3 gate/up; BF16
+/// rows W8A16, exact), `w8a16` (the former programs, weights widened to
+/// `bf16(w * s)`) or `w8a8` (BF16 rows quantized to wire rows too).
 pub(crate) const PREFILL_ENV: &str = "CUTEAFD_FP8_EXPERT_PREFILL";
 
 /// The prefill form `PREFILL_ENV` asks for.
