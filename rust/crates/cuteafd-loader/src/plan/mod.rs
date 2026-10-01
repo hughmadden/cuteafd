@@ -140,6 +140,8 @@ pub struct PlanReport {
     pub fits: bool,
     /// Family and routed-expert layers for the launch scripts.
     pub launch: Option<launch::LaunchDescription>,
+    /// Where the expert service read the routed EXL3 storage layout from.
+    pub expert_storage: Option<crate::formats::exl3_storage::Exl3StorageSource>,
     pub hints: Vec<Hint>,
 }
 
@@ -238,6 +240,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         spark_rank_share: 0.0,
         fits: true,
         launch: launch::describe(&checkpoint.config).ok(),
+        expert_storage: None,
         hints: Vec::new(),
     };
     let Some(family) = family::detect(&checkpoint) else {
@@ -285,10 +288,10 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         }
     }
     // The expert staging's own verdict on the routed experts.
-    let catalog_error = (family.expert_catalog() && by_component.contains_key(&Component::RoutedExpert))
-        .then(|| crate::read_expert_catalog(&checkpoint.snapshot).err())
-        .flatten()
-        .map(|error| format!("{error:#}"));
+    let catalog = (family.expert_catalog() && by_component.contains_key(&Component::RoutedExpert))
+        .then(|| crate::read_expert_catalog(&checkpoint.snapshot));
+    report.expert_storage = catalog.as_ref().and_then(|catalog| catalog.as_ref().ok()?.exl3().map(|m| m.storage));
+    let catalog_error = catalog.and_then(Result::err).map(|error| format!("{error:#}"));
     let mut hinted = BTreeSet::new();
     // Routed-expert operands by label, for the placement contract.
     let mut routed_operands: BTreeMap<String, QuantOperand> = BTreeMap::new();
@@ -581,6 +584,9 @@ pub fn render(report: &PlanReport) -> String {
                 status,
                 formats
             );
+        }
+        if let Some(storage) = report.expert_storage {
+            let _ = writeln!(out, "exl3 map   {}", storage.describe());
         }
         let rejected: Vec<&ComponentPlan> =
             report.components.iter().filter(|c| c.status == Status::MissingKernel && c.rejected > 0).collect();

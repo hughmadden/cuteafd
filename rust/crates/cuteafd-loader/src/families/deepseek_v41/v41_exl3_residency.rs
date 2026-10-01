@@ -343,6 +343,7 @@ mod tests {
             projections,
             ple_quantization: None,
             mtp_experts: crate::families::deepseek_v41::v41_exl3::V41Exl3MtpExperts::Exl3,
+            storage: crate::formats::exl3_storage::Exl3StorageSource::GptqModel,
         }
     }
 
