@@ -13,6 +13,49 @@ use std::path::Path;
 
 use crate::plan::checkpoint::read_json;
 
+/// Storage format of the full-attention KV records (the paged pool shared by sequences and
+/// prefix snapshots). SWA rings and steps stay BF16: they hold 256 rows per sequence, and
+/// widening 8-bit ring records cost a V2 Flash decode step ~1.3% (39 SWA layers).
+///
+/// E4M3 records (scales per 64 dims) are not offered: on the goldens they raised
+/// KL(golden||engine) by 0.235 (V2 Flash) and 0.012 (V2.6 Pro) over BF16, int8 by
+/// -0.0002 and 0.0015 at about the same size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MimoKvCache {
+    /// BF16 keys and values.
+    Bf16,
+    /// Signed 8-bit keys and values with FP32 scales `amax / 127` per 32 dims of each head's key
+    /// and value (sparkinfer `_mimo_kernels`, `kv8="s8"`).
+    #[default]
+    Int8,
+}
+
+impl MimoKvCache {
+    /// Program-name tag of the attention programs over these records (`full_producer{tag}_m64`).
+    pub fn program_tag(self) -> &'static str {
+        match self {
+            Self::Bf16 => "",
+            Self::Int8 => "_kvint8",
+        }
+    }
+
+    /// The format of `attention` layers' records: `self` for full attention, BF16 for SWA.
+    pub fn of(self, attention: MimoAttention) -> Self {
+        match attention {
+            MimoAttention::Full => self,
+            MimoAttention::Sliding => Self::Bf16,
+        }
+    }
+
+    /// Dims of a key or value sharing one FP32 scale (0 for BF16).
+    pub fn scale_group(self) -> usize {
+        match self {
+            Self::Bf16 => 0,
+            Self::Int8 => 32,
+        }
+    }
+}
+
 /// A layer's attention: full causal GQA or sliding-window GQA with sinks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MimoAttention {
@@ -228,6 +271,25 @@ impl MimoV2Config {
         self.kv_heads(attention) * (self.head_dim + self.v_head_dim)
     }
 
+    /// Bytes of one token's KV record in `kv`: BF16 (`record_elems * 2`), or int8 (sparkinfer
+    /// `_mimo_kernels`): signed bytes for keys and values, then one FP32 scale per
+    /// `kv.scale_group()` dims of each KV head's key and value, padded to 16 bytes.
+    pub fn record_bytes(&self, attention: MimoAttention, kv: MimoKvCache) -> usize {
+        self.record_bytes_of(self.kv_heads(attention), kv.of(attention))
+    }
+
+    /// [`Self::record_bytes`] of a record holding `heads` KV heads.
+    pub fn record_bytes_of(&self, heads: usize, kv: MimoKvCache) -> usize {
+        match kv {
+            MimoKvCache::Bf16 => heads * (self.head_dim + self.v_head_dim) * 2,
+            MimoKvCache::Int8 => {
+                let raw = heads * (self.head_dim + self.v_head_dim)
+                    + 4 * heads * (self.head_dim + self.v_head_dim) / kv.scale_group();
+                raw.div_ceil(16) * 16
+            }
+        }
+    }
+
     pub fn rope_theta(&self, attention: MimoAttention) -> f64 {
         match attention {
             MimoAttention::Full => self.full_rope_theta,
@@ -262,6 +324,9 @@ mod tests {
         assert_eq!(cfg.attention[5], MimoAttention::Full);
         assert_eq!(cfg.dense.iter().filter(|d| **d).count(), 1);
         assert_eq!((cfg.record_elems(MimoAttention::Full), cfg.record_elems(MimoAttention::Sliding)), (1280, 2560));
+        assert_eq!((cfg.record_bytes(MimoAttention::Full, MimoKvCache::Int8),
+            cfg.record_bytes(MimoAttention::Sliding, MimoKvCache::Int8)), (1440, 5120));
+        assert_eq!(cfg.head_split(2)?.record_bytes(MimoAttention::Full, MimoKvCache::Int8), 720);
         assert!((cfg.routed_scale - 1.0).abs() < 1e-12 && !cfg.full_sinks && cfg.swa_sinks);
         Ok(())
     }
@@ -286,6 +351,8 @@ mod tests {
         assert_eq!((cfg.rope_dim, cfg.full_kv_heads, cfg.swa_kv_heads), (64, 8, 8));
         assert_eq!(cfg.attention.iter().filter(|a| **a == MimoAttention::Full).count(), 10);
         assert_eq!(cfg.record_elems(MimoAttention::Full), 2560);
+        assert_eq!(cfg.record_bytes(MimoAttention::Full, MimoKvCache::Int8), 2560 + 320);
+        assert_eq!(cfg.head_split(2)?.record_bytes(MimoAttention::Full, MimoKvCache::Int8), 1280 + 160);
         assert_eq!(cfg.program_family()?, "mimop");
         Ok(())
     }

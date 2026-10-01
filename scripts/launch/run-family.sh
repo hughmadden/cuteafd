@@ -116,6 +116,9 @@ if [[ $family == mimo_v2 ]]; then
   family_args+=(--pool-tokens "$(get POOL_TOKENS 131072)")
   # PREFIX_PARTIAL=on: V4.1-style partial reuse (approximate; off = exact restores only).
   family_args+=(--prefix-partial "$(get PREFIX_PARTIAL off)")
+  # KV_CACHE: int8 (the engine default: 8-bit full-attention records with FP32 scales per 32
+  # dims; SWA rings stay BF16) or bf16.
+  [[ -z "$(get KV_CACHE)" ]] || family_args+=(--kv-cache "$(get KV_CACHE)")
 fi
 [[ ! $family =~ ^(glm5|qwen4|deepseek_v4)$ || -z "$(get POOL_TOKENS)" ]] || family_args+=(--pool-tokens "$(get POOL_TOKENS)")
 # GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
@@ -237,6 +240,12 @@ if [[ "$restart" == 1 ]]; then
     ssh "$host" 'ids=$(docker ps -aq --filter name=^cuteafd-spark-expert-); [ -z "$ids" ] || docker rm -f $ids >/dev/null 2>&1 || true'
   done
 fi
+# FP8_EXPERT_PREFILL: how FP8 expert packages run prefill row counts: auto
+# (default: wire rows W8A8 with E4M3 x E4M3 gate/up, BF16 rows W8A16), w8a16
+# (the former programs) or w8a8 (also quantizes the BF16 rows of experts on the
+# coordinator GPU). Spark workers and the coordinator both read it.
+fp8_prefill="$(get FP8_EXPERT_PREFILL auto)"
+case "$fp8_prefill" in auto|w8a8|w8a16) ;; *) echo "FP8_EXPERT_PREFILL must be auto, w8a8 or w8a16" >&2; exit 2 ;; esac
 # GB10 CUDA allocations cannot reclaim page cache: drop it on the expert hosts first.
 spark_hosts=()
 for ((rank = 0; rank < ranks; rank++)); do spark_hosts+=(--host "$(get "SPARK_${rank}_HOST")"); done
@@ -246,7 +255,7 @@ for ((rank = 0; rank < ranks; rank++)); do
   lane="$(get "SPARK_${rank}_LANE_A")"
   peers+=("$lane:$port")
   ssh "$host" "docker run -d --name cuteafd-spark-expert-$host-$port --restart no --gpus all --network host \
-    --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info \
+    --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill \
     -v \$(readlink -f \$HOME/.cache/huggingface/hub):/root/.cache/huggingface/hub:ro '$spark_image' \
     cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
     --rank $rank --world $ranks --capacity 4096 --device-budget-bytes $budget $layer_args \
@@ -268,6 +277,7 @@ intake="$(get SPARK_INTAKE auto)"
 case "$intake" in auto|gpu|pinned|host) ;; *) echo "SPARK_INTAKE must be auto, gpu, pinned or host" >&2; exit 2 ;; esac
 docker run -d --name cuteafd-coordinator --restart no --gpus "$gpus" --network host --ipc host \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e "CUTEAFD_SPARK_INTAKE=$intake" \
+  -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" \
   -v "$hub:/root/.cache/huggingface/hub:ro" \
   "${trace_args[@]}" "$coordinator_image" cuteafd $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peer_csv" --listen "$addr" \

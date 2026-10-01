@@ -10,7 +10,7 @@ pub(crate) mod worker;
 
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::fp8_moe::{Fp8MoeModule, Fp8MoeWeights, FP8_MOE_POINTERS};
+use cuteafd_ffi::fp8_moe::{Fp8MoeModule, Fp8MoePrefill, Fp8MoeWeights, FP8_MOE_POINTERS};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::formats::fp8_experts::{ExpertFormat, Fp8ExpertTensors, Fp8Projection};
 use std::ffi::c_void;
@@ -18,6 +18,34 @@ use std::path::{Path, PathBuf};
 
 /// Parallel readers per layer load.
 const READERS: usize = 16;
+
+/// Environment switch for how FP8 expert packages run prefill row counts:
+/// `auto` (default: FP8 wire rows W8A8, block-scaled E4M3 x E4M3 gate/up; BF16
+/// rows W8A16, exact), `w8a16` (the former programs, weights widened to
+/// `bf16(w * s)`) or `w8a8` (BF16 rows quantized to wire rows too).
+pub(crate) const PREFILL_ENV: &str = "CUTEAFD_FP8_EXPERT_PREFILL";
+
+/// The prefill form `PREFILL_ENV` asks for.
+pub(crate) fn prefill_mode() -> Result<Fp8MoePrefill> {
+    match std::env::var(PREFILL_ENV) {
+        Ok(value) if !value.is_empty() => value.parse().with_context(|| format!("{PREFILL_ENV}={value}")),
+        _ => Ok(Fp8MoePrefill::default()),
+    }
+}
+
+/// Loads an FP8 expert package and selects its prefill form.
+///
+/// # Safety
+/// As `Fp8MoeModule::load`.
+unsafe fn load_module(directory: &Path) -> Result<Fp8MoeModule> {
+    let mut module = Fp8MoeModule::load(directory)?;
+    let prefill = prefill_mode()?;
+    module.set_prefill(prefill).with_context(|| format!("{} ({PREFILL_ENV})", directory.display()))?;
+    if prefill != Fp8MoePrefill::default() {
+        tracing::info!(package = %directory.display(), ?prefill, "FP8 expert prefill form");
+    }
+    Ok(module)
+}
 
 /// `<libdir>/fp8/fp8-<family>[-nvfp4|-nvfp4a4]/tp<world>`: the package layout
 /// serving TP degree `tp` of the process expert geometry in `format` (NVFP4
@@ -167,7 +195,7 @@ impl<'a> Fp8Experts<'a> {
         layers: std::ops::Range<usize>, tp: usize, rank: usize, capacity: usize, budget: usize) -> Result<Self> {
         // SAFETY: a trusted package for the current device; the owner drains
         // its streams before dropping.
-        let module = unsafe { Fp8MoeModule::load(directory) }
+        let module = unsafe { load_module(directory) }
             .with_context(|| format!("FP8 expert package {} (build it with package_fp8_moe_aot.py)",
                 directory.display()))?;
         let info = module.info().clone();
@@ -203,7 +231,7 @@ impl<'a> Fp8Experts<'a> {
     /// slice), growing the shared scratch when it needs more.
     pub fn add_bf16_module(&mut self, library: &'a NativeLibrary, directory: &Path, capacity: usize) -> Result<()> {
         // SAFETY: a trusted package for the current device; dropped with this object.
-        let module = unsafe { Fp8MoeModule::load(directory) }
+        let module = unsafe { load_module(directory) }
             .with_context(|| format!("BF16-input FP8 expert package {}", directory.display()))?;
         let (info, main) = (module.info().clone(), self.module.info());
         ensure!(!info.wire_input && info.weights == main.weights && info.hidden == main.hidden && info.experts == main.experts

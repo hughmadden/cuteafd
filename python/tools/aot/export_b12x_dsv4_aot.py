@@ -159,7 +159,7 @@ def glm_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context:
 
 def mimo_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """MiMo V2 programs, same (stem suffix, op, params, thunk) shape as ``programs``.
-    qkv and the dense FFN take only the checkpoint's E4M3 weights (per-row x 128-K FP32
+    Full-attention producers and attention come in both KV record formats (BF16, int8 ``_kvint8``). qkv and the dense FFN take only the checkpoint's E4M3 weights (per-row x 128-K FP32
     scales): decode rows up to ``fp8_rows`` on the GEMVs, W8A16 above; prefill W8A8
     (``fp8_rows`` nonzero) or W8A16. o_proj (BF16 in the release): decode programs also
     take a quantized E4M3 copy, prefill BF16. ``head_fp8``: the LM head over an E4M3 copy
@@ -181,13 +181,22 @@ def mimo_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
             (f"ffn_m{rows}", "ffn", {"max_rows": rows, "inter": g.dense_inter, "fp8_only": mode},
              lambda r=rows, m=mode: ffn.compile_mimo_ffn_aot(g, max_rows=r, fp8_only=m)),
         ]
+        # KV records: BF16 (no tag) and, for the full-attention page pool, int8 (``_kvint8``: FP32
+        # scales per 32 dims). SWA rings stay BF16 (bounded per sequence; widening their 8-bit
+        # records costs a decode step ~1.3%). The fork's E4M3 records are not exported (golden KL
+        # +0.235 Flash / +0.012 V2.6 Pro over BF16).
         for kind in ("full", "swa"):
-            out += [
-                (f"{kind}_producer_m{rows}", "producer", {"kind": kind, "max_rows": rows, "fp8_only": mode},
-                 lambda k=kind, r=rows, m=mode: attn.compile_mimo_producer_aot(g, kind=k, max_rows=r, fp8_only=m)),
-                (f"{kind}_attention_{mode}_m{rows}", "attention", {"kind": kind, "route": mode, "max_rows": rows},
-                 lambda k=kind, m=mode, r=rows: attn.compile_mimo_attention_aot(g, kind=k, route=m, max_rows=r)),
-            ]
+            for kv, tag in (("bf16", ""), ("int8", "_kvint8"))[:2 if kind == "full" else 1]:
+                out += [
+                    (f"{kind}_producer{tag}_m{rows}", "producer",
+                     {"kind": kind, "max_rows": rows, "fp8_only": mode, "kv": kv},
+                     lambda k=kind, r=rows, m=mode, c=kv: attn.compile_mimo_producer_aot(
+                         g, kind=k, max_rows=r, fp8_only=m, kv=c)),
+                    (f"{kind}_attention{tag}_{mode}_m{rows}", "attention",
+                     {"kind": kind, "route": mode, "max_rows": rows, "kv": kv},
+                     lambda k=kind, m=mode, r=rows, c=kv: attn.compile_mimo_attention_aot(
+                         g, kind=k, route=m, max_rows=r, kv=c)),
+                ]
     return out
 
 

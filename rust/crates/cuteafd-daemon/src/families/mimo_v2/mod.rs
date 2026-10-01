@@ -41,6 +41,11 @@ pub(crate) struct EngineArgs {
     /// Tokens the full-attention record pool holds across sequences.
     #[arg(long, default_value_t = 131_072)]
     pub pool_tokens: usize,
+    /// Full-attention KV record format: int8 (signed bytes with an FP32 scale
+    /// `amax / 127` per 32 dims of each head's key and value: 0.56x the bytes of
+    /// BF16) or bf16. SWA rings are BF16 either way.
+    #[arg(long, value_enum, default_value_t = KvCacheArg::Int8, env = "CUTEAFD_MIMO_KV_CACHE")]
+    pub kv_cache: KvCacheArg,
     /// Sequences with a sliding-window ring.
     #[arg(long, default_value_t = 16)]
     pub rings: usize,
@@ -114,6 +119,22 @@ pub(crate) struct EngineArgs {
     pub expert_input: engine::ExpertInput,
     #[command(flatten)]
     pub token_io: crate::shared::token_io::TokenIoArgs,
+}
+
+/// `--kv-cache` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum KvCacheArg {
+    Int8,
+    Bf16,
+}
+
+impl From<KvCacheArg> for cuteafd_loader::families::mimo_v2::MimoKvCache {
+    fn from(value: KvCacheArg) -> Self {
+        match value {
+            KvCacheArg::Int8 => Self::Int8,
+            KvCacheArg::Bf16 => Self::Bf16,
+        }
+    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -261,11 +282,12 @@ impl Opened {
                 self.library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
                 Ok(allocation)
             };
-            let (h, record) = (self.cfg.hidden, self.cfg.record_elems(cuteafd_loader::families::mimo_v2::MimoAttention::Sliding));
+            let (h, record) = (self.cfg.hidden, self.cfg.record_bytes(cuteafd_loader::families::mimo_v2::MimoAttention::Sliding,
+                args.kv_cache.into()));
             let stages = (0..args.mtp).map(|k| -> Result<mtp::MtpStage<'_>> {
                 let [eh, enorm, hnorm, final_norm] = loader.mtp_extras(k)?;
                 Ok(mtp::MtpStage { layer: loader.mtp_layer(&self.cfg, k)?, eh, enorm, hnorm, final_norm,
-                    ring: zeroed(args.rings * engine::RING_ROWS * record * 2)? })
+                    ring: zeroed(args.rings * engine::RING_ROWS * record)? })
             }).collect::<Result<Vec<_>>>()?;
             let rows = engine::DECODE_ROWS;
             let drafter = mtp::MtpDrafter { stages, hidden: zeroed(args.rings * mtp::HIDDEN_ROWS * h * 2)?,
@@ -286,8 +308,19 @@ impl Opened {
             split_gib = format!("{:.2}", peer_bytes as f64 / (1u64 << 30) as f64), "MiMo coordinator weights resident");
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::MimoEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            args.max_context, args.prefill_rows, pages, args.rings, embedding)?;
+            args.max_context, args.prefill_rows, pages, args.rings, embedding, args.kv_cache.into())?;
         engine.prefill_w8a8 = !args.prefill_w8a16;
+        {
+            use cuteafd_loader::families::mimo_v2::MimoAttention;
+            let kv = args.kv_cache.into();
+            let per_token: usize = self.cfg.attention.iter().take(layers).filter(|a| **a == MimoAttention::Full)
+                .map(|_| self.cfg.record_bytes(MimoAttention::Full, kv)).sum();
+            let ring_bytes: usize = self.cfg.attention.iter().take(layers).filter(|a| **a == MimoAttention::Sliding)
+                .map(|_| self.cfg.record_bytes(MimoAttention::Sliding, kv) * engine::RING_ROWS).sum();
+            tracing::info!(kv_cache = ?args.kv_cache, pool_tokens = pages * engine::PAGE_ROWS,
+                bytes_per_token = per_token, tokens_per_gib = (1usize << 30) / per_token.max(1),
+                ring_mib_per_sequence = format!("{:.2}", ring_bytes as f64 / (1u64 << 20) as f64), "MiMo KV records");
+        }
         if let Some((device, stream)) = peer_stream {
             engine.attach_peer(device, stream, shares.pop().context("head-split shares")?)?;
         }
