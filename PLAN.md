@@ -353,14 +353,15 @@ Status (2026-10-02): S0, S1 and the S4 kernels landed (`work/nvfp4`, fork
 every weight against hf_quant_config.json / config.json. `glm|glmf|qwen4:nvfp4`
 build `fp8-<family>-nvfp4` packages (W4A16: GEMV, stream above 2048 rows);
 `:nvfp4a4` builds W4A4 large-row steps (static input_scale, mxf4nvf4 MMAs,
-above 512 rows), opt-in with `CUTEAFD_NVFP4_ACTIVATIONS=a4`. Native SM121
+above 512 rows); every `:nvfp4` entry also builds it and W4A4 is the default
+(`CUTEAFD_NVFP4_ACTIVATIONS=a16` keeps W4A16). Native SM121
 packages pass the CPU oracle on GB10 at tp2/3/4/6. GLM 5.3 Flash TP4 Sparks
 (EXL3 K3.25 coordinator weights): NVFP4 W4A16 NLL 2.3880 / KL 0.0587 (EXL3
 K3.25 2.4082 / 0.0616), C1 step 16.3 ms vs 15.3 (4.5 vs 3.25 bits read), 8K
 prefill equal; W4A4 KL 0.0799, prefill 1.33x. Qwen on one RTX: NVFP4 8K
 prefill 1.08x EXL3 (W4A4 1.36x), 1.6K 0.96x (W4A4 1.33x). W4A4 costs
-+0.02 KL (over this plan's 0.005 bound): W4A16 stays default, a decision for
-TJ. S2: GLM 5.3 Flash NVFP4 dense MLPs run natively (one-expert
++0.02 KL (over this plan's 0.005 bound) but is the checkpoint's calibrated
+numerics: W4A4 is the default (TJ, 2026-10-02). S2: GLM 5.3 Flash NVFP4 dense MLPs run natively (one-expert
 `fp8-glmfdense-nvfp4`): nvidia/GLM-5.3-Flash-NVFP4 serves alone (NLL 2.3896);
 nvidia/GLM-5.3-NVFP4 serves on six Sparks (TP6 W4A16: NLL 2.4814 / KL 0.0571
 vs golden 2.4677; 8K prefill 4.22 s, W4A4 3.20 s). Its per-tensor FP8 dense

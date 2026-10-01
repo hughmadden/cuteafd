@@ -242,9 +242,14 @@ for release_family in "${release_family_list[@]}"; do
     *) continue ;;
   esac
   mkdir -p "$output_dir/fp8"
-  rm -rf "$output_dir/fp8/$release_package"
-  cp -a "$build_root/native/fp8/$release_package" "$output_dir/fp8/$release_package"
-  python3 "$build_root/source/python/tools/aot/package_fp8_moe_aot.py" verify --package "$output_dir/fp8/$release_package"
+  # A FAMILY:nvfp4 entry also builds the default W4A4 sibling (fp8_moe.cmake).
+  release_packages=("$release_package")
+  [[ "$release_family" == *:nvfp4 ]] && release_packages+=("${release_package}a4")
+  for release_package in "${release_packages[@]}"; do
+    rm -rf "$output_dir/fp8/$release_package"
+    cp -a "$build_root/native/fp8/$release_package" "$output_dir/fp8/$release_package"
+    python3 "$build_root/source/python/tools/aot/package_fp8_moe_aot.py" verify --package "$output_dir/fp8/$release_package"
+  done
 done
 install -m 0644 "$build_root/native/v41_experts/v41_experts.json" "$output_dir/V41_EXPERT_AOT.json"
 # Always write the built-role manifest, including the empty-role default, so

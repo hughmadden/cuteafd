@@ -9,7 +9,8 @@
 # packed E2M1 x E4M3 per-16 scales widened exactly, FP32 alpha per expert;
 # exporter geometry FAMILY_nvfp4); FAMILY:nvfp4a4 builds fp8-FAMILY-nvfp4a4/,
 # whose large-row steps run W4A4 (activations quantized with the checkpoint's
-# input_scale, block-scaled FP4 MMAs; decode rows stay W4A16). glmfdense:nvfp4[a4]
+# input_scale, block-scaled FP4 MMAs; decode rows stay W4A16). A FAMILY:nvfp4
+# entry builds both, since the daemon serves W4A4 by default. glmfdense:nvfp4[a4]
 # is GLM 5.3 Flash's NVFP4 dense MLP (one always-selected expert, coordinator tp1).
 if(CUTEAFD_CUDA_ARCHITECTURES MATCHES "^120")
   set(CUTEAFD_FP8_MOE_ROLE coordinator)
@@ -27,7 +28,15 @@ set(CUTEAFD_FP8_MOE_BF16_FAMILIES "" CACHE STRING
 list(GET CUDAToolkit_INCLUDE_DIRS 0 CUTEAFD_FP8_MOE_CUDA_INCLUDE)
 set(CUTEAFD_FP8_MOE_TOOL "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/package_fp8_moe_aot.py")
 set(CUTEAFD_FP8_MOE_MANIFESTS)
+set(CUTEAFD_FP8_MOE_ENTRIES)
 foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
+  list(APPEND CUTEAFD_FP8_MOE_ENTRIES "${entry}")
+  if(entry MATCHES ":nvfp4$")
+    list(APPEND CUTEAFD_FP8_MOE_ENTRIES "${entry}a4")
+  endif()
+endforeach()
+list(REMOVE_DUPLICATES CUTEAFD_FP8_MOE_ENTRIES)
+foreach(entry IN LISTS CUTEAFD_FP8_MOE_ENTRIES)
   if(NOT entry MATCHES ":(fp8|nvfp4|nvfp4a4)$")
     continue()
   endif()

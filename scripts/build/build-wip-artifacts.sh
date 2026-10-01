@@ -177,9 +177,14 @@ for wip_family in "${wip_fp8_list[@]}"; do
     *) continue ;;
   esac
   mkdir -p "$output_dir/fp8"
-  rm -rf "$output_dir/fp8/$wip_package"
-  cp -a "$build_dir/native/fp8/$wip_package" "$output_dir/fp8/$wip_package"
-  python3 "$source_dir/python/tools/aot/package_fp8_moe_aot.py" verify --package "$output_dir/fp8/$wip_package"
+  # A FAMILY:nvfp4 entry also builds the default W4A4 sibling (fp8_moe.cmake).
+  wip_packages=("$wip_package")
+  [[ "$wip_family" == *:nvfp4 ]] && wip_packages+=("${wip_package}a4")
+  for wip_package in "${wip_packages[@]}"; do
+    rm -rf "$output_dir/fp8/$wip_package"
+    cp -a "$build_dir/native/fp8/$wip_package" "$output_dir/fp8/$wip_package"
+    python3 "$source_dir/python/tools/aot/package_fp8_moe_aot.py" verify --package "$output_dir/fp8/$wip_package"
+  done
 done
 install -m 0644 "$build_dir/native/v41_experts/v41_experts.json" "$output_dir/V41_EXPERT_AOT.json"
 # Always emit the built-role manifest (empty for the legacy default). Roles are

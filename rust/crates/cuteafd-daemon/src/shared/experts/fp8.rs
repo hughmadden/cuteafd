@@ -50,10 +50,10 @@ unsafe fn load_module(directory: &Path) -> Result<Fp8MoeModule> {
 /// `<libdir>/fp8/fp8-<family>[-nvfp4|-nvfp4a4]/tp<world>`: the package layout
 /// serving TP degree `tp` of the process expert geometry in `format` (NVFP4
 /// releases share their geometry with the FP8 ones and get packages of their
-/// own). `CUTEAFD_NVFP4_ACTIVATIONS=a4` takes the W4A4 package (`-nvfp4a4`:
-/// large-row steps quantize activations with the checkpoint's input_scale)
-/// when it is built; W4A16 is the default (GLM 5.3 Flash: KL vs golden
-/// 0.0589 W4A16, 0.0791 W4A4, over PLAN.md's 0.005-nat bound).
+/// own). The W4A4 package (`-nvfp4a4`: large-row steps quantize activations
+/// with the checkpoint's input_scale, as ModelOpt calibrated them) is the
+/// default when built; `CUTEAFD_NVFP4_ACTIVATIONS=a16` keeps W4A16 (GLM 5.3
+/// Flash: KL vs golden 0.0589 W4A16, 0.0791 W4A4; 8K prefill 1.33x).
 pub(crate) fn package_directory(native_lib: &Path, tp: usize, format: ExpertFormat) -> PathBuf {
     let family = cuteafd_core::expert_geometry().family().unwrap_or("unknown");
     let root = native_lib.parent().unwrap_or(Path::new(".")).join("fp8");
@@ -68,8 +68,8 @@ pub(crate) fn package_directory(native_lib: &Path, tp: usize, format: ExpertForm
 }
 
 /// `<libdir>/fp8/fp8-<geometry>-nvfp4[a4]/tp1`: a coordinator NVFP4 dense-MLP
-/// package (one always-selected expert), W4A4 under `CUTEAFD_NVFP4_ACTIVATIONS=a4`
-/// when built.
+/// package (one always-selected expert), W4A4 when built unless
+/// `CUTEAFD_NVFP4_ACTIVATIONS=a16`.
 pub(crate) fn dense_package_directory(native_lib: &Path, geometry: &str) -> PathBuf {
     let root = native_lib.parent().unwrap_or(Path::new(".")).join("fp8");
     let a4 = root.join(format!("fp8-{geometry}-nvfp4a4")).join("tp1");
@@ -82,16 +82,16 @@ pub(crate) fn dense_package_directory(native_lib: &Path, geometry: &str) -> Path
 /// How NVFP4 experts treat activations (`CUTEAFD_NVFP4_ACTIVATIONS`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Nvfp4Activations {
-    /// W4A4 large-row steps where a `-nvfp4a4` package is built.
+    /// W4A4 large-row steps where a `-nvfp4a4` package is built (default).
     A4,
-    /// W4A16 at every row count (default).
+    /// W4A16 at every row count.
     A16,
 }
 
 pub(crate) fn nvfp4_activations() -> Nvfp4Activations {
     match std::env::var("CUTEAFD_NVFP4_ACTIVATIONS").as_deref() {
-        Ok("a4") => Nvfp4Activations::A4,
-        _ => Nvfp4Activations::A16,
+        Ok("a16") => Nvfp4Activations::A16,
+        _ => Nvfp4Activations::A4,
     }
 }
 
