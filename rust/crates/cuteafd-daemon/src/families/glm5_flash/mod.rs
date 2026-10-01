@@ -643,6 +643,19 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         _ => String::new(),
     };
     println!("prefill: {prefill} tokens through {layers} layers in {prefill_seconds:.2} s{loads}");
+    if let (Some(logits), false) = (&logits, args.golden.join("logits.bin").exists()) {
+        if args.nll {
+            // No golden logits (a token file alone): the engine's NLL of the text and a digest
+            // of every logit (bitwise A/B between builds and runs).
+            use std::hash::{Hash, Hasher};
+            let mut digest = std::collections::hash_map::DefaultHasher::new();
+            logits.iter().for_each(|v| v.to_bits().hash(&mut digest));
+            let (_, _, _, nll, scored) = score(logits, logits, &tokens, 0, vocab);
+            println!("prefill logits: {prefill} rows | mean NLL engine {:.4} | logits digest {:016x}",
+                nll / scored.max(1) as f64, digest.finish());
+        }
+        return Ok(());
+    }
     if let Some(logits) = logits {
         let golden = golden_logits()?;
         if args.nll {
