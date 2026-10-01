@@ -186,7 +186,7 @@ budget="$(get SPARK_DEVICE_BUDGET_BYTES 107374182400)"
 gpu="$(get COORDINATOR_GPU 0)"
 # Two coordinator GPUs (RTX_GPUS=auto/2 with COORDINATOR_GPU as V4.1's two-RTX config picks
 # the other card, or an explicit COORDINATOR_GPUS=0,1): families with a
-# head split (MiMo V2.6 Pro, GLM 5.x) split every layer's attention heads and dense /
+# head split (MiMo V2.6 Pro, GLM 5.x, DeepSeek V4) split every layer's attention heads and dense /
 # shared-expert MLPs over both by default (COORDINATOR_SPLIT=auto or heads), one hidden
 # all-reduce per layer over peer memory; experts, router, head and drafter stay on the
 # first GPU. COORDINATOR_SPLIT=off serves from the first GPU alone. Families without a
@@ -218,7 +218,7 @@ gpus="device=$gpu"
 if [[ -n "$second" && "$split" != off ]]; then
   [[ "$second" != "$gpu" ]] || { echo "the second coordinator GPU must differ from the first" >&2; exit 2; }
   case "$family" in
-    mimo_v2|glm5)
+    mimo_v2|glm5|deepseek_v4)
       lower=$((gpu < second ? gpu : second)) upper=$((gpu < second ? second : gpu))
       gpus="\"device=$lower,$upper\""
       family_args+=(--device $((gpu == lower ? 0 : 1)) --split-device $((gpu == lower ? 1 : 0))) ;;

@@ -11,6 +11,7 @@ use cuteafd_loader::OfficialV41Catalog;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::unix::fs::FileExt;
+use crate::shared::peer_split::{slice_2d, Axis};
 
 enum Prep {
     Raw,
@@ -27,6 +28,10 @@ struct Source {
 pub(crate) struct LayerWeights<'a> {
     pub ratio: usize,
     pub hash: bool,
+    /// One GPU's share of a head split: its heads' `w_q` rows and sinks, its
+    /// output groups' `wo_a` / `wo_b` columns (a partial sum) and its slice of
+    /// the shared expert (a partial sum); it runs the split programs.
+    pub split: bool,
     /// Device operands; routing adds `gate.bias` (FP32, score layers) or
     /// `gate.tid2eid` (I32 [vocab, topk], hash layers).
     operands: HashMap<&'static str, DeviceAllocation<'a>>,
@@ -127,6 +132,33 @@ pub(crate) struct WeightLoader<'a, 'p> {
     pub programs: &'p Programs<'a>,
     pub family: &'static str,
     pub stream: *mut c_void,
+    /// This loader's device (rank 0 of a head split).
+    pub device: i32,
+    /// The other GPU of a head split (rank 1), if any.
+    pub peers: Vec<crate::shared::peer_split::RankDevice>,
+}
+
+/// How a head split shares an operand's checkpoint tensors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Share {
+    /// Every rank holds the whole operand.
+    All,
+    /// Rank 0 only (the router).
+    Lead,
+    /// Rows split evenly (per tensor, concatenated): heads, wo groups, shared-expert intermediate.
+    Rows,
+    /// Columns split evenly: wo_b over the groups, the shared expert's w2 over the intermediate.
+    Cols,
+}
+
+/// The head-split share of operand `operand`.
+fn share(operand: &str) -> Share {
+    match operand {
+        "w_q" | "w_q_scale" | "attn_sink" | "wo_a" | "wo_a_scale" | "w13" | "w13_scale" => Share::Rows,
+        "wo_b" | "wo_b_scale" | "w2" | "w2_scale" => Share::Cols,
+        "gate" => Share::Lead,
+        _ => Share::All,
+    }
 }
 
 impl<'a> WeightLoader<'a, '_> {
@@ -170,8 +202,105 @@ impl<'a> WeightLoader<'a, '_> {
         Ok(output)
     }
 
-    pub fn layer(&self, cfg: &DeepseekV4Config, layer: usize) -> Result<LayerWeights<'a>> {
-        self.block(cfg, &format!("layers.{layer}"), cfg.compress_ratios[layer], cfg.is_hash_layer(layer))
+    pub fn layer(&self, cfg: &DeepseekV4Config, layer: usize) -> Result<Vec<LayerWeights<'a>>> {
+        if self.peers.is_empty() {
+            return Ok(vec![self.block(cfg, &format!("layers.{layer}"), cfg.compress_ratios[layer],
+                cfg.is_hash_layer(layer))?]);
+        }
+        self.block_split(cfg, &format!("layers.{layer}"), cfg.compress_ratios[layer], cfg.is_hash_layer(layer))
+    }
+
+    /// GPUs of the head split this loader fills (1: no split).
+    pub fn ranks(&self) -> usize {
+        1 + self.peers.len()
+    }
+
+    /// Runs `body` with rank `rank`'s device current and its load stream.
+    fn on_rank<T>(&self, rank: usize, body: impl FnOnce(*mut c_void) -> Result<T>) -> Result<T> {
+        if rank == 0 {
+            return body(self.stream);
+        }
+        let peer = self.peers.get(rank - 1).with_context(|| format!("no rank {rank}"))?;
+        crate::shared::peer_split::on_device(self.library, peer.device, self.device, || body(peer.stream))
+    }
+
+    /// [`Self::scale`] on `stream` (the current device's).
+    fn scale_on(&self, raw: &[u8], n: usize, k: usize, groups: usize, stream: *mut c_void) -> Result<DeviceAllocation<'a>> {
+        ensure!(n % 128 == 0 && k % 128 == 0, "block-FP8 weights need 128-multiple extents");
+        let (n_blocks, k_blocks) = (groups * n / 128, k / 128);
+        ensure!(raw.len() == n_blocks * k_blocks, "scale bytes {} do not cover {n_blocks}x{k_blocks} blocks", raw.len());
+        let source = self.upload(raw)?;
+        let output = DeviceAllocation::new(self.library, n_blocks * k_blocks * 512)?;
+        let program = self.programs.program(&format!("{}_block_fp8_scale_prep", self.family), &["scale", "scale_mma"])?;
+        // SAFETY: both buffers are live device allocations sized for the grid;
+        // the stream is synchronized before `source` drops.
+        unsafe {
+            program.launch(&[source.buffer.ptr, output.buffer.ptr],
+                &[Scalar::I32(n_blocks as i32), Scalar::I32(k_blocks as i32)], stream)?;
+            self.library.cuda_stream_synchronize(stream)?;
+        }
+        Ok(output)
+    }
+
+    /// One block's operands over the head split's ranks (see [`share`]): each
+    /// tensor read once, every rank's slice uploaded on its GPU (scales re-laid
+    /// by that GPU's scale-prep program at the slice's extents).
+    fn block_split(&self, cfg: &DeepseekV4Config, prefix: &str, ratio: usize, hash: bool) -> Result<Vec<LayerWeights<'a>>> {
+        let ranks = self.ranks();
+        let mut operands: Vec<HashMap<&'static str, DeviceAllocation<'a>>> = (0..ranks).map(|_| HashMap::new()).collect();
+        for source in layer_sources(cfg, ratio) {
+            let kind = share(source.operand);
+            let names: Vec<String> = source.tensors.iter().map(|t| format!("{prefix}.{t}")).collect();
+            // Per rank, the concatenation of each tensor's slice.
+            let mut parts: Vec<Vec<u8>> = vec![Vec::new(); ranks];
+            for name in &names {
+                let raw = self.read(std::slice::from_ref(name))?;
+                let shape = self.catalog.tensor(name)?.metadata.shape.clone();
+                for (rank, part) in parts.iter_mut().enumerate() {
+                    match kind {
+                        Share::All | Share::Lead => part.extend_from_slice(&raw),
+                        Share::Rows => {
+                            ensure!(raw.len() % ranks == 0 && shape.first().is_some_and(|r| r % ranks == 0),
+                                "{name}: {shape:?} does not split by rows over {ranks} GPUs");
+                            part.extend_from_slice(&raw[rank * raw.len() / ranks..(rank + 1) * raw.len() / ranks]);
+                        }
+                        Share::Cols => {
+                            ensure!(shape.len() == 2 && shape[1] % ranks == 0 && raw.len() == shape[0] * shape[1],
+                                "{name}: {shape:?} does not split by byte columns over {ranks} GPUs");
+                            part.extend(slice_2d(&raw, shape[0], shape[1], 1, Axis::Cols, rank, ranks));
+                        }
+                    }
+                }
+            }
+            for (rank, part) in parts.into_iter().enumerate() {
+                if kind == Share::Lead && rank > 0 {
+                    continue;
+                }
+                let allocation = self.on_rank(rank, |stream| match source.prep {
+                    Prep::Raw => self.upload(&part),
+                    Prep::Scale { n, k, groups } => {
+                        let (n, k, groups) = match (source.operand, kind) {
+                            ("wo_a_scale", _) => (n, k, groups / ranks),
+                            (_, Share::Rows) => (n / ranks, k, groups),
+                            (_, Share::Cols) => (n, k / ranks, groups),
+                            _ => (n, k, groups),
+                        };
+                        self.scale_on(&part, n, k, groups, stream)
+                    }
+                })?;
+                operands[rank].insert(source.operand, allocation);
+            }
+        }
+        if hash {
+            // The checkpoint stores I64 expert ids; the router reads I32.
+            let raw = self.read(&[format!("{prefix}.ffn.gate.tid2eid")])?;
+            let ids = raw.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+                .map(|id| i32::try_from(id).map(i32::to_le_bytes)).collect::<Result<Vec<_>, _>>()?;
+            operands[0].insert("gate.tid2eid", self.upload(ids.as_flattened())?);
+        } else {
+            operands[0].insert("gate.bias", self.tensor(&format!("{prefix}.ffn.gate.bias"))?);
+        }
+        Ok(operands.into_iter().map(|operands| LayerWeights { ratio, hash, split: true, operands }).collect())
     }
 
     /// One block's operands from the checkpoint names under `prefix`.
@@ -195,7 +324,7 @@ impl<'a> WeightLoader<'a, '_> {
         } else {
             operands.insert("gate.bias", self.tensor(&format!("{prefix}.ffn.gate.bias"))?);
         }
-        Ok(LayerWeights { ratio, hash, operands })
+        Ok(LayerWeights { ratio, hash, split: false, operands })
     }
 
     /// The drafter, when the checkpoint carries one (`mtp.0.main_proj`).
@@ -220,9 +349,19 @@ impl<'a> WeightLoader<'a, '_> {
         }))
     }
 
-    pub fn model(&self, cfg: &DeepseekV4Config) -> Result<ModelWeights<'a>> {
-        let layers = (0..cfg.n_layers).map(|layer| self.layer(cfg, layer)).collect::<Result<_>>()?;
-        Ok(ModelWeights {
+    /// Every layer (rank 0's shares under a head split, the other rank's in the
+    /// second value), the drafter and the head.
+    #[allow(clippy::type_complexity)]
+    pub fn model(&self, cfg: &DeepseekV4Config) -> Result<(ModelWeights<'a>, Vec<Vec<LayerWeights<'a>>>)> {
+        let mut shares: Vec<Vec<LayerWeights<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
+        for layer in 0..cfg.n_layers {
+            for (share, part) in shares.iter_mut().zip(self.layer(cfg, layer)?) {
+                share.push(part);
+            }
+        }
+        let mut shares = shares.into_iter();
+        let layers = shares.next().context("rank 0")?;
+        Ok((ModelWeights {
             layers,
             dspark: self.dspark(cfg)?,
             head: self.tensor("head.weight")?,
@@ -230,7 +369,7 @@ impl<'a> WeightLoader<'a, '_> {
             head_scale: self.tensor("hc_head_scale")?,
             head_base: self.tensor("hc_head_base")?,
             norm: self.tensor("norm.weight")?,
-        })
+        }, shares.collect()))
     }
 
 }
