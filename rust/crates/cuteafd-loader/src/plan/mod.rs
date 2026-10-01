@@ -116,6 +116,9 @@ pub struct PlanReport {
     pub snapshot: String,
     pub family: Option<String>,
     pub architectures: Vec<String>,
+    /// The checkpoint's ModelOpt quantization metadata (hf_quant_config.json /
+    /// config.json), summarized; every weight was checked against it.
+    pub quantization: Option<String>,
     pub runtime: Option<RuntimeStatus>,
     /// Why the family's runtime refuses this configuration, when it does.
     pub config_error: Option<String>,
@@ -225,6 +228,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         snapshot: snapshot.display().to_string(),
         family: None,
         architectures: checkpoint.architectures(),
+        quantization: None,
         runtime: None,
         config_error: None,
         spec: None,
@@ -243,6 +247,22 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         expert_storage: None,
         hints: Vec::new(),
     };
+    // ModelOpt exports describe what they quantized; each weight's tensors
+    // must agree with that description.
+    let modelopt = match crate::formats::modelopt::ModelOpt::read(&checkpoint.snapshot, &checkpoint.config) {
+        Ok(modelopt) => modelopt,
+        Err(error) => {
+            report.hints.push(Hint {
+                what: format!("unreadable quantization metadata: {error}"),
+                how: "ModelOpt checkpoints are read from their own hf_quant_config.json and config.json \
+                      quantization_config (cuteafd-loader/src/formats/modelopt.rs); extend the reader for a new \
+                      algorithm or spelling.".into(),
+            });
+            report.config_error = Some(error.to_string());
+            None
+        }
+    };
+    report.quantization = modelopt.as_ref().map(|m| m.summary());
     let Some(family) = family::detect(&checkpoint) else {
         report.hints.push(Hint {
             what: format!(
@@ -268,7 +288,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
                     (cuteafd-loader/src/families/{}/config.rs); extend it and the engine together.",
                     family.id(), family.id()),
             });
-            report.config_error = Some(error.0);
+            report.config_error.get_or_insert(error.0);
             return Ok(report);
         }
     };
@@ -304,7 +324,8 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
             let role = roles.get(stem).cloned().unwrap_or_else(|| TensorRole::new(*component));
             let verdict = match format::detect(members) {
                 Ok(mut operand) => {
-                    let accepted = model.accepts(&role, stem, &mut operand);
+                    let declared = modelopt.as_ref().map_or(Ok(()), |m| m.check(stem, &operand));
+                    let accepted = declared.and_then(|()| model.accepts(&role, stem, &mut operand));
                     *formats.entry(operand.label()).or_default() += 1;
                     if accepted.is_ok() && *component == Component::RoutedExpert {
                         routed_operands.entry(operand.label()).or_insert(operand);
@@ -500,6 +521,9 @@ pub fn render(report: &PlanReport) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "snapshot   {}", report.snapshot);
     let _ = writeln!(out, "arch       {}", report.architectures.join(", "));
+    if let Some(quantization) = &report.quantization {
+        let _ = writeln!(out, "quant      {quantization}");
+    }
     match (&report.family, &report.spec) {
         (Some(family), Some(spec)) => {
             let runtime = match report.runtime {

@@ -343,6 +343,58 @@ fn glm5_flash_standard_exllamav3_checkpoint_is_ready() {
     assert!(reason.contains("quantization_config.codebook=\"mul1\": this build runs the MCG codebook only"), "{reason}");
 }
 
+/// nvidia/GLM-5.3-Flash-NVFP4's shape: ModelOpt NVFP4 routed experts read
+/// from the checkpoint's own hf_quant_config.json; the experts run on the
+/// fp8_moe NVFP4 packages (`glmf:nvfp4`, 16-value slices: TP3 too).
+#[test]
+fn glm5_flash_modelopt_nvfp4_experts_are_ready() {
+    let mut tensors = vec![t("model.language_model.layers.1.mlp.gate.weight", "BF16", &[288, 4096])];
+    for expert in 0..288 {
+        for (proj, n, k) in [("gate_proj", 2048, 4096), ("up_proj", 2048, 4096), ("down_proj", 4096, 2048)] {
+            tensors.extend(nvfp4(&format!("model.language_model.layers.1.mlp.experts.{expert}.{proj}"), n, k));
+        }
+    }
+    let mut config = glm5_flash_config(2);
+    config["quantization_config"] = json!({"quant_method": "modelopt", "quant_algo": "NVFP4",
+        "config_groups": {"group_0": {"weights": {"num_bits": 4, "type": "float", "group_size": 16}}},
+        "ignore": ["lm_head", "model.language_model.layers.1.mlp.gate"], "producer": {"name": "modelopt"}});
+    let dir = snapshot(config, &tensors);
+    let hf = json!({"producer": {"name": "modelopt", "version": "0.47"}, "quantization": {"quant_algo": "NVFP4",
+        "group_size": 16, "kv_cache_quant_algo": "FP8", "exclude_modules": ["lm_head", "model.language_model.layers.1.mlp.gate"]}});
+    std::fs::write(dir.path().join("hf_quant_config.json"), serde_json::to_vec(&hf).unwrap()).unwrap();
+    let report = plan(dir.path(), &sparks(3)).unwrap();
+    assert_eq!(component(&report, Component::RoutedExpert).status, Status::Ready, "{}", render(&report));
+    let contract = report.experts.as_ref().unwrap();
+    assert_eq!((contract.package.as_str(), contract.block, contract.spark_worlds.as_slice()),
+        ("glmf:nvfp4", 16, &[2, 3, 4, 6][..]));
+    assert!(contract.local.is_ok());
+    assert!(report.executable(), "{}", render(&report));
+    assert!(render(&report).contains("quant      modelopt 0.47 (hf_quant_config.json) NVFP4: every Linear NVFP4 g16"),
+        "{}", render(&report));
+    // TP3 of 128 blocks: 43 blocks (688 rows) stored 768 wide.
+    assert!((report.spark_rank_share - 768.0 / 2048.0).abs() < 1e-9);
+    let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+    let tensors = catalog.fp8().unwrap();
+    assert_eq!(tensors.format(), crate::formats::fp8_experts::ExpertFormat::Nvfp4);
+    assert_eq!(tensors.rank_range(3, 2).unwrap(), (1376, 672));
+    // Metadata that excludes the experts contradicts their NVFP4 tensors.
+    let hf = json!({"producer": {"name": "modelopt"}, "quantization": {"quant_algo": "NVFP4", "group_size": 16,
+        "exclude_modules": ["model.language_model.layers.1.mlp.experts*"]}});
+    std::fs::write(dir.path().join("hf_quant_config.json"), serde_json::to_vec(&hf).unwrap()).unwrap();
+    let report = plan(dir.path(), &sparks(3)).unwrap();
+    let reason = &rejected(&report, Component::RoutedExpert)[0];
+    assert!(reason.contains("hf_quant_config.json excludes model.language_model.layers.1.mlp.experts.0.down_proj \
+        (model.language_model.layers.1.mlp.experts*), but its tensors store NVFP4"), "{reason}");
+    assert!(!report.executable());
+    // An algorithm this build does not read is a typed refusal, not a guess.
+    let hf = json!({"producer": {"name": "modelopt"}, "quantization": {"quant_algo": "MIXED_PRECISION",
+        "quantized_layers": {"model.language_model.layers.1.mlp.experts": {"quant_algo": "W4A8_AWQ"}}}});
+    std::fs::write(dir.path().join("hf_quant_config.json"), serde_json::to_vec(&hf).unwrap()).unwrap();
+    let report = plan(dir.path(), &sparks(3)).unwrap();
+    assert!(report.config_error.as_deref().is_some_and(|e| e.contains("W4A8_AWQ")), "{}", render(&report));
+    assert!(!report.executable());
+}
+
 // --- R07: MiMo serves, with a precise contract ------------------------------
 
 /// The review's observation: the MiMo family reported Planned although

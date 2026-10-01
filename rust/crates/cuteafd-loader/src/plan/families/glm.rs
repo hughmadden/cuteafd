@@ -8,7 +8,7 @@ use super::{bf16, bf16_or_f32, bf16_or_fp8_block128, describe, fp8_f32_block128,
 use crate::families::glm5::{GlmDsaConfig, GlmIndexer};
 use crate::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
 use crate::plan::checkpoint::{opt_usize_field, usize_field, Checkpoint};
-use crate::plan::experts::{exl3_spark_worlds, fp8_spark_worlds};
+use crate::plan::experts::{exl3_spark_worlds, fp8_spark_worlds, nvfp4_spark_worlds};
 use crate::plan::family::{ConfigError, ExpertContract, Family, FamilyModel, Hint, RuntimeStatus};
 use crate::plan::format::{QuantOperand, ScaleEncoding};
 use crate::plan::names::indexed;
@@ -108,6 +108,22 @@ impl Family for Glm {
             Other
         };
         Some(TensorRole::layer(component, layer))
+    }
+
+    fn component_hint_for(&self, _spec: &ModelSpec, component: Component, formats: &[String]) -> Option<Hint> {
+        // ModelOpt releases (nvidia/GLM-5.3-NVFP4, nvidia/GLM-5.3-Flash-NVFP4) store the
+        // dense parts as NVFP4, per-tensor FP8 or BF16 where the programs read FP8 blocks.
+        let modelopt = formats.iter().any(|f| f.starts_with("nvfp4") || f.starts_with("fp8-tensor"));
+        if component != Component::RoutedExpert && modelopt {
+            return Some(Hint {
+                what: format!("{} stored as {} (a ModelOpt release's dense parts)", component.label(), formats.join(", ")),
+                how: "PLAN.md Phase 5 S2: dequantize NVFP4 / per-tensor FP8 to BF16 at load (E2M1 x E4M3 x \
+                      weight_scale_2), then take the family's BF16 path (serve-glmf quantizes BF16 to 128x128 FP8 \
+                      blocks where its programs read FP8); serve-glm needs the same for BF16 MLA/FFN weights."
+                    .into(),
+            });
+        }
+        self.component_hint(component)
     }
 
     fn component_hint(&self, component: Component) -> Option<Hint> {
@@ -365,9 +381,10 @@ impl GlmModel {
         require(operand.logical == shape, || format!("experts are {shape:?}, found {}", describe(operand)))?;
         let exl3 = if self.id == "glm5" { 4..=5 } else { 3..=4 };
         require(operand.is_fp8_block(128, &[ScaleEncoding::F32, ScaleEncoding::Bf16])
-            || operand.exl3_bits().is_some_and(|bits| exl3.contains(&bits)), || {
-            format!("routed experts run E4M3 with 128x128 scales or EXL3 K{}-K{}; found {}", exl3.start(), exl3.end(),
-                describe(operand))
+            || operand.exl3_bits().is_some_and(|bits| exl3.contains(&bits))
+            || operand.is_nvfp4() && operand.scale.as_ref().is_some_and(|s| s.cols == 16), || {
+            format!("routed experts run E4M3 with 128x128 scales, EXL3 K{}-K{} or ModelOpt NVFP4 (group 16); found {}",
+                exl3.start(), exl3.end(), describe(operand))
         })
     }
 
@@ -409,8 +426,16 @@ impl FamilyModel for GlmModel {
         let local = if self.id == "glm5" {
             Err("serve-glm has no local expert path (no --local-experts)".to_string())
         } else {
-            Ok("serve-glmf --local-experts (TP1 FP8 or EXL3 package)".to_string())
+            Ok("serve-glmf --local-experts (TP1 FP8, NVFP4 or EXL3 package)".to_string())
         };
+        if operand.is_nvfp4() {
+            return Some(ExpertContract {
+                package: format!("{}:nvfp4", self.geometry()),
+                block: 16,
+                spark_worlds: nvfp4_spark_worlds(moe.intermediate),
+                local,
+            });
+        }
         if operand.exl3_bits().is_some() {
             let tiers = if self.id == "glm5" { "k45" } else { "k34" };
             return Some(ExpertContract {
