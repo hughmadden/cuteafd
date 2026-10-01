@@ -55,7 +55,8 @@ impl ModelOptAlgo {
             reason: format!("{algo} needs a {what}"),
         };
         Ok(match algo {
-            "NVFP4" => Self::Nvfp4 { group: group.ok_or_else(|| need("group_size"))? },
+            // W4A16_NVFP4: the weight-only export of the same storage (no input_scale).
+            "NVFP4" | "W4A16_NVFP4" => Self::Nvfp4 { group: group.ok_or_else(|| need("group_size"))? },
             "FP8" => Self::Fp8,
             // FP8_PB_WO: the per-block weight-only spelling (config.json) of the same storage.
             "FP8_BLOCK_SCALES" | "FP8_PB_WO" => Self::Fp8BlockScales { block: group.ok_or_else(|| need("group_size"))? },
