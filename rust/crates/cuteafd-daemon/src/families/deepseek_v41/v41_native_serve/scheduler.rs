@@ -22,7 +22,7 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
     lease: CacheLease, id: u64, tokens: &[u32], anchor: u32,
     draft: &mut DraftRuntime<'d, 'a, crate::families::deepseek_v41::v41_experts::dspark::DistributedDsparkChain<'d, 'a>>,
 ) -> Result<()> {
-    let (events, mut output) = mpsc::channel(64);
+    let (events, mut output) = mpsc::unbounded_channel();
     let (_submit, receive) = mpsc::channel(1);
     let mut prefixes = PrefixCache::new(2);
     let image_keys = prefixes.prepare_key(tokens, &[])?;
@@ -121,7 +121,7 @@ impl Active<'_> {
     }
     fn emit(&mut self, tokens: &[u32]) -> Result<()> {
         for &token in tokens {
-            for chunk in self.emit_one(token)?.into_iter().flatten() { self.job.events.blocking_send(Ok(chunk))?; }
+            for chunk in self.emit_one(token)?.into_iter().flatten() { self.job.events.send(Ok(chunk))?; }
             if self.finished { break; }
         }
         Ok(())
@@ -266,7 +266,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     Err(error) => {
                         let failure = error.downcast_ref::<cuteafd_api::openai::NativeFailure>()
                             .cloned().unwrap_or_else(|| format!("{error:#}").into());
-                        let _ = events.blocking_send(Err(failure));
+                        let _ = events.send(Err(failure));
                         continue;
                     }
                 }
@@ -309,12 +309,12 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                             pending = Some(admission::Pending { prepared, active_when_blocked: active_count });
                             break;
                         }
-                        let _ = events.blocking_send(Err(cuteafd_api::openai::NativeFailure::BadRequest(
+                        let _ = events.send(Err(cuteafd_api::openai::NativeFailure::BadRequest(
                             "prompt plus max_tokens exceeds the GPU KV pool; reduce max_tokens or increase the pool".into())));
                     } else {
                         let failure = error.downcast_ref::<cuteafd_api::openai::NativeFailure>()
                             .cloned().unwrap_or_else(|| format!("{error:#}").into());
-                        let _ = events.blocking_send(Err(failure));
+                        let _ = events.send(Err(failure));
                     }
                     continue;
                 }
@@ -348,7 +348,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                         encoder_ms=started.elapsed().as_secs_f64()*1000.0, "native vision preparation");
                 }
                 drop(images);
-                job.events.blocking_send(Ok(InferenceChunk::Ready {
+                job.events.send(Ok(InferenceChunk::Ready {
                     system_fingerprint: Some(if draft.is_some() { "cuteafd-native-fp4-kv-dspark" }
                         else { "cuteafd-native-fp4-kv" }.into()),
                     prompt_usage: PromptUsage { prompt_tokens: prompt.len(), prompt_cache_hit_tokens: cached },
@@ -387,7 +387,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     console::lifecycle(console::Event::First { id: request.id, at: Instant::now(), token: request.anchor });
                     if let Err(error) = request.emit(&[request.anchor]) {
                         request.failed = !request.job.events.is_closed();
-                        let _ = request.job.events.blocking_send(Err(format!("{error:#}").into()));
+                        let _ = request.job.events.send(Err(format!("{error:#}").into()));
                         request.finished = true;
                     }
                     active[slot] = Some(request); loads[lane] += 1;
@@ -396,7 +396,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     // Other completed requests retain their caches.
                     let failure = error.downcast_ref::<cuteafd_api::openai::NativeFailure>()
                         .cloned().unwrap_or_else(|| format!("{error:#}").into());
-                    let _ = events.blocking_send(Err(failure));
+                    let _ = events.send(Err(failure));
                     if counted { console::totals::retired(); }
                     console::lifecycle(console::Event::Retire { id, at: Instant::now(),
                         reason: if events.is_closed() { "cancelled" } else { "failed" }, generated: 0 });
@@ -422,7 +422,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 let slot = *members.iter().flatten().nth(pressure.work_index)
                     .context("pool pressure references an invalid append participant")?;
                 let request = active[slot].as_mut().unwrap();
-                let _ = request.job.events.blocking_send(Err(format!("{error:#}").into()));
+                let _ = request.job.events.send(Err(format!("{error:#}").into()));
                 request.finished = true;
                 request.cacheable = false;
                 request.failed = true;
@@ -440,7 +440,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             tracing::error!(error=%format!("{error:#}"), "native decode round failed");
             P::reset_connections(first_transport)?; P::reset_connections(second_transport)?;
             for request in active.iter_mut().flatten() {
-                let _ = request.job.events.blocking_send(Err(format!("{error:#}").into()));
+                let _ = request.job.events.send(Err(format!("{error:#}").into()));
                 request.finished = true;
                 request.cacheable = false;
                 request.failed = true;
@@ -1252,7 +1252,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
             let request = active[slot].as_mut().unwrap();
             if let Err(error) = request.emit(&tokens) {
                 request.failed = !request.job.events.is_closed();
-                let _ = request.job.events.blocking_send(Err(format!("{error:#}").into()));
+                let _ = request.job.events.send(Err(format!("{error:#}").into()));
                 request.finished = true;
             }
         }
@@ -1292,7 +1292,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
             let request = active[slot].as_mut().unwrap();
             if let Err(error) = request.emit(&tokens) {
                 request.failed = !request.job.events.is_closed();
-                let _ = request.job.events.blocking_send(Err(format!("{error:#}").into()));
+                let _ = request.job.events.send(Err(format!("{error:#}").into()));
                 request.finished = true;
             }
         }

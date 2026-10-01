@@ -759,7 +759,7 @@ mod http_503_mapping {
     }
 
     fn dummy_job() -> openai::NativeRequest {
-        let (events, _receive) = tokio::sync::mpsc::channel(16);
+        let (events, _receive) = tokio::sync::mpsc::unbounded_channel();
         openai::NativeRequest {
             prompt: String::new(),
             constraint: None,
@@ -824,7 +824,7 @@ mod http_503_mapping {
                 let _ = job
                     .events
                     .send(Err(openai::NativeFailure::from("pool exhausted")))
-                    .await;
+                    ;
             }
         });
         let router = openai::router(queue);

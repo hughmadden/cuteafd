@@ -148,7 +148,7 @@ pub struct NativeRequest {
     /// its turn markers (and `<tool_call>` when no tools are declared).
     /// DeepSeek engines keep their built-in EOS handling.
     pub stop_token_ids: Vec<u32>,
-    pub events: mpsc::Sender<Result<InferenceChunk, NativeFailure>>,
+    pub events: mpsc::UnboundedSender<Result<InferenceChunk, NativeFailure>>,
 }
 /// Serving statistics the CUDA owner publishes (a JSON object; `null` until the first publish).
 pub type SharedStats = Arc<Mutex<Value>>;
@@ -534,7 +534,10 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> 
             Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
         }
     };
-    let (events, mut receive) = mpsc::channel(16);
+    // Unbounded on purpose: inference threads send without ever blocking, so a
+    // client that stops reading cannot stall the shared scheduler. A request's
+    // backlog is bounded by its own max_tokens.
+    let (events, mut receive) = mpsc::unbounded_channel();
     // Recipe 0.1.0 uses a protocol placeholder; the pinned model tokenizer
     // spells token 129264 differently. Preserve the text-only prompt verbatim.
     let prompt = if prepared.is_empty() { prompt }
@@ -708,9 +711,9 @@ mod tests {
         let worker = tokio::spawn(async move {
             let job = rx.recv().await.unwrap();
             job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
-                prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).await.unwrap();
+                prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).unwrap();
             job.events.send(Ok(InferenceChunk::Finish {
-                finish_reason: InferenceFinishReason::Stop })).await.unwrap();
+                finish_reason: InferenceFinishReason::Stop })).unwrap();
             job.prompt
         });
         let request = axum::http::Request::post("/v1/chat/completions")
@@ -733,16 +736,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_client_that_stops_reading_never_blocks_the_inference_thread() {
+        // The worker emits far more events than any bounded channel holds while
+        // nobody reads the response body; its sends must all complete.
+        let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+        let worker = tokio::spawn(async move {
+            let job = rx.recv().await.unwrap();
+            job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
+                prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).unwrap();
+            for _ in 0..10_000 {
+                job.events.send(Ok(InferenceChunk::Text { content: "x".into(), content_tokens: 1 })).unwrap();
+            }
+            job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })).unwrap();
+        });
+        let response = router(tx).oneshot(request(true)).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), worker).await
+            .expect("inference sends blocked on an unread stream").unwrap();
+        drop(response);
+    }
+
+    #[tokio::test]
     async fn silent_streams_send_keepalive_comments() {
         let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
         tokio::spawn(async move {
             let job = rx.recv().await.unwrap();
             job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
-                prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).await.unwrap();
+                prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).unwrap();
             tokio::time::sleep(SSE_KEEPALIVE * 4).await;
-            job.events.send(Ok(InferenceChunk::Text { content: "4".into(), content_tokens: 1 })).await.unwrap();
+            job.events.send(Ok(InferenceChunk::Text { content: "4".into(), content_tokens: 1 })).unwrap();
             job.events.send(Ok(InferenceChunk::Finish {
-                finish_reason: InferenceFinishReason::Stop })).await.unwrap();
+                finish_reason: InferenceFinishReason::Stop })).unwrap();
         });
         let response = router(tx).oneshot(request(true)).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -761,11 +784,11 @@ mod tests {
             let job = rx.recv().await.unwrap();
             assert!(job.constraint.is_some());
             job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
-                prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).await.unwrap();
+                prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).unwrap();
             job.events.send(Ok(InferenceChunk::Text {
-                content: "{\"x\":\"a\"}".into(), content_tokens: 5 })).await.unwrap();
+                content: "{\"x\":\"a\"}".into(), content_tokens: 5 })).unwrap();
             job.events.send(Ok(InferenceChunk::Finish {
-                finish_reason: InferenceFinishReason::Stop })).await.unwrap();
+                finish_reason: InferenceFinishReason::Stop })).unwrap();
         });
         let request = axum::http::Request::post("/v1/chat/completions")
             .header("content-type", "application/json")
@@ -797,10 +820,10 @@ mod tests {
                 let job = rx.recv().await.unwrap();
                 assert_eq!(job.max_tokens, expected);
                 job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
-                    prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).await.unwrap();
+                    prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).unwrap();
                 job.events.send(Ok(InferenceChunk::Finish {
                     finish_reason: InferenceFinishReason::Length,
-                })).await.unwrap();
+                })).unwrap();
             });
             let body = json!({"model":MODEL,"messages":[{"role":"user","content":"Count."}],
                 "max_tokens":requested});
@@ -838,14 +861,14 @@ mod tests {
                     assert!(job.prompt.ends_with("</think>"));
                 }
                 job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
-                    prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).await.unwrap();
+                    prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).unwrap();
                 job.events.send(Ok(InferenceChunk::Text {
                     content: if score.is_some() { "Compute. </think>4" } else { "4" }.into(),
                     content_tokens: 1,
-                })).await.unwrap();
+                })).unwrap();
                 job.events.send(Ok(InferenceChunk::Finish {
                     finish_reason: InferenceFinishReason::Stop,
-                })).await.unwrap();
+                })).unwrap();
             });
             let mut body = json!({"model":MODEL,"messages":[{"role":"user","content":"2+2?"}],
                 "max_tokens":16,"stream":false});
@@ -887,7 +910,7 @@ mod tests {
                         finish_reason: InferenceFinishReason::Stop,
                     },
                 ] {
-                    job.events.send(Ok(event)).await.unwrap();
+                    job.events.send(Ok(event)).unwrap();
                 }
             });
             let response = router(tx).oneshot(request(streaming)).await.unwrap();
@@ -916,7 +939,7 @@ mod tests {
                     let job = rx.recv().await.unwrap();
                     let message = "required parameter has incompatible value constraints: nx".to_string();
                     job.events.send(Err(if bad_request { NativeFailure::BadRequest(message) }
-                        else { NativeFailure::Worker(message) })).await.unwrap();
+                        else { NativeFailure::Worker(message) })).unwrap();
                 });
                 let body = json!({"model":MODEL,"messages":[{"role":"user","content":"Call lookup."}],
                     "tools":[{"type":"function","function":{"name":"lookup","strict":true,
@@ -941,8 +964,8 @@ mod tests {
             tokio::spawn(async move {
                 let job = rx.recv().await.unwrap();
                 job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
-                    prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).await.unwrap();
-                job.events.send(Err(NativeFailure::Worker("late execution failure".into()))).await.unwrap();
+                    prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).unwrap();
+                job.events.send(Err(NativeFailure::Worker("late execution failure".into()))).unwrap();
             });
             let body = json!({"model":MODEL,"messages":[{"role":"user","content":"Call lookup."}],
                 "tools":[{"type":"function","function":{"name":"lookup","strict":true,
@@ -970,7 +993,7 @@ mod tests {
                 if explicit_error {
                     job.events
                         .send(Err("execution failed".into()))
-                        .await
+                        
                         .unwrap();
                 }
             });

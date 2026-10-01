@@ -19,7 +19,7 @@ async fn unicode_reasoning_and_content_survive_character_chunks_in_both_modes() 
                         prompt_cache_hit_tokens: 0,
                     },
                 }))
-                .await
+                
                 .unwrap();
             // The protocol consumes newlines adjoining </think>, while the
             // newline and every Unicode/control scalar inside reasoning stay.
@@ -29,14 +29,14 @@ async fn unicode_reasoning_and_content_survive_character_chunks_in_both_modes() 
                         content: character.to_string(),
                         content_tokens: 1,
                     }))
-                    .await
+                    
                     .unwrap();
             }
             job.events
                 .send(Ok(InferenceChunk::Finish {
                     finish_reason: InferenceFinishReason::Stop,
                 }))
-                .await
+                
                 .unwrap();
         });
         let mut body = json!({"model":MODEL,"messages":[{"role":"user","content":input}],

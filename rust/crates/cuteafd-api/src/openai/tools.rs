@@ -299,11 +299,11 @@ mod tests {
                                 "expected":valid && !truncated})).unwrap()).unwrap();
                         }
                         if job.events.send(Ok(InferenceChunk::Ready { system_fingerprint:None,
-                            prompt_usage:PromptUsage { prompt_tokens:1,prompt_cache_hit_tokens:0 } })).await.is_err() { return; }
+                            prompt_usage:PromptUsage { prompt_tokens:1,prompt_cache_hit_tokens:0 } })).is_err() { return; }
                         for character in text.chars() {
-                            if job.events.send(Ok(InferenceChunk::Text { content:character.to_string(),content_tokens:1 })).await.is_err() { return; }
+                            if job.events.send(Ok(InferenceChunk::Text { content:character.to_string(),content_tokens:1 })).is_err() { return; }
                         }
-                        let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason:if truncated { InferenceFinishReason::Length } else { InferenceFinishReason::Stop } })).await;
+                        let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason:if truncated { InferenceFinishReason::Length } else { InferenceFinishReason::Stop } }));
                     });
                     let mut body = json!({"model":MODEL,"messages":[{"role":"user","content":"Use lookup."}],"stream":streaming,
                         "tools":[{"type":"function","function":{"name":"lookup","parameters":schema,"strict":true}}],

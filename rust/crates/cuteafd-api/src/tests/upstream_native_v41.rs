@@ -65,7 +65,7 @@ fn spawn_driver(
     tokio::spawn(async move {
         let job = rx.recv().await.expect("worker receives the request");
         for chunk in chunks {
-            job.events.send(chunk).await.expect("event accepted");
+            job.events.send(chunk).expect("event accepted");
         }
     });
 }
@@ -120,13 +120,13 @@ async fn post_and_capture_sampling(
                     system_fingerprint: None,
                     prompt_usage: Default::default(),
                 }))
-                .await;
+                ;
             let _ = job
                 .events
                 .send(Ok(InferenceChunk::Finish {
                     finish_reason: InferenceFinishReason::Stop,
                 }))
-                .await;
+                ;
         }
     });
     let response = app.oneshot(post_json(body)).await.unwrap();

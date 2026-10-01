@@ -114,7 +114,7 @@ mod tests {
                     InferenceChunk::Ready { system_fingerprint:None, prompt_usage:PromptUsage { prompt_tokens:1, prompt_cache_hit_tokens:0 } },
                     InferenceChunk::Text { content:"{\"wrong\":true}".into(), content_tokens:5 },
                     InferenceChunk::Finish { finish_reason:InferenceFinishReason::Stop },
-                ] { if job.events.send(Ok(event)).await.is_err() { break; } }
+                ] { if job.events.send(Ok(event)).is_err() { break; } }
             });
             let body = json!({"model":MODEL,"messages":[{"role":"user","content":"Return JSON."}],
                 "thinking":{"type":"disabled"},"stream":streaming,

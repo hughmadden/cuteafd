@@ -161,7 +161,7 @@ impl Active<'_> {
     }
 
     fn send(&self, chunk: InferenceChunk) -> Result<()> {
-        self.job.events.blocking_send(Ok(chunk)).map_err(|_| anyhow::anyhow!("client went away"))
+        self.job.events.send(Ok(chunk)).map_err(|_| anyhow::anyhow!("client went away"))
     }
 
     /// Streams `token`; returns true when the request is finished.
@@ -291,7 +291,7 @@ fn schedule(
                 }
             };
             let reject = |job: &NativeRequest, message: String| {
-                let _ = job.events.blocking_send(Err(NativeFailure::BadRequest(message)));
+                let _ = job.events.send(Err(NativeFailure::BadRequest(message)));
             };
             if !job.images.is_empty() {
                 reject(&job, "this checkpoint takes no images".into());
@@ -317,7 +317,7 @@ fn schedule(
                     continue;
                 }
             };
-            let _ = job.events.blocking_send(Ok(InferenceChunk::Ready {
+            let _ = job.events.send(Ok(InferenceChunk::Ready {
                 system_fingerprint: None,
                 prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: 0 },
             }));
@@ -398,7 +398,7 @@ fn schedule(
             Err(error) => {
                 tracing::warn!("decode step failed: {error:#}");
                 for request in active.drain(..) {
-                    let _ = request.job.events.blocking_send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                    let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                     allocator.release(request.placement);
                 }
                 continue;

@@ -221,7 +221,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
                                 let request = active[slot].as_mut().unwrap();
                                 (request.emit_one(token)?, request.finished)
                             };
-                            for chunk in chunks.into_iter().flatten() { sender.send(Ok(chunk)).await?; }
+                            for chunk in chunks.into_iter().flatten() { sender.send(Ok(chunk))?; }
                             if finished { break; }
                         }
                         Ok(())
@@ -233,7 +233,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
                         request.finished = true;
                         request.failed = failed;
                         drop(active);
-                        let _ = sender.send(Err(format!("{error:#}").into())).await;
+                        let _ = sender.send(Err(format!("{error:#}").into()));
                     }
                 }
                 let layer_us = pass.captured_layer_us();

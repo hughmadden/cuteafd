@@ -308,13 +308,13 @@ mod router {
             let job = receive.recv().await.unwrap();
             check(&job);
             let _ = job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
-                prompt_usage: PromptUsage { prompt_tokens: 9, prompt_cache_hit_tokens: 0 } })).await;
+                prompt_usage: PromptUsage { prompt_tokens: 9, prompt_cache_hit_tokens: 0 } }));
             for character in text.chars() {
-                if job.events.send(Ok(InferenceChunk::Text { content: character.to_string(), content_tokens: 1 })).await.is_err() {
+                if job.events.send(Ok(InferenceChunk::Text { content: character.to_string(), content_tokens: 1 })).is_err() {
                     return;
                 }
             }
-            let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop })).await;
+            let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop }));
         });
         let request = Request::post("/v1/chat/completions").header("content-type", "application/json")
             .body(Body::from(body.to_string())).unwrap();

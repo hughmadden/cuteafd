@@ -289,7 +289,7 @@ impl Active<'_> {
     }
 
     fn send(&self, chunk: InferenceChunk) -> Result<()> {
-        self.job.events.blocking_send(Ok(chunk)).map_err(|_| anyhow::anyhow!("client went away"))
+        self.job.events.send(Ok(chunk)).map_err(|_| anyhow::anyhow!("client went away"))
     }
 
     /// Streams `token` (special tokens stay text for the output parser);
@@ -406,7 +406,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 }
             };
             let reject = |job: &NativeRequest, message: String| {
-                let _ = job.events.blocking_send(Err(NativeFailure::BadRequest(message)));
+                let _ = job.events.send(Err(NativeFailure::BadRequest(message)));
             };
             let constraint = match job.constraint.as_ref().map(|spec| grammars.matcher(spec)).transpose() {
                 Ok(constraint) => constraint,
@@ -439,7 +439,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 }
             };
             let resume = admitted.resume;
-            let _ = job.events.blocking_send(Ok(InferenceChunk::Ready {
+            let _ = job.events.send(Ok(InferenceChunk::Ready {
                 system_fingerprint: None,
                 prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: resume },
             }));
@@ -513,7 +513,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         }
                     } else {
                         tracing::warn!("prefill failed: {error:#}");
-                        let _ = p.job.events.blocking_send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                        let _ = p.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                     }
                     release(&family, &mut cache, &mut free_rings, &mut free_slots, &placement, slot);
                     continue;
@@ -679,7 +679,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             Err(error) => {
                 tracing::warn!("decode step failed: {error:#}");
                 for request in active.drain(..) {
-                    let _ = request.job.events.blocking_send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                    let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                     release(&family, &mut cache, &mut free_rings, &mut free_slots, &request.placement, request.slot);
                 }
                 continue;

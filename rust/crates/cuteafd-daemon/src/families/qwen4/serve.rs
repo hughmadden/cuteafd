@@ -181,7 +181,7 @@ impl Active<'_> {
     }
 
     fn send(&self, chunk: InferenceChunk) -> Result<()> {
-        self.job.events.blocking_send(Ok(chunk)).map_err(|_| anyhow::anyhow!("client went away"))
+        self.job.events.send(Ok(chunk)).map_err(|_| anyhow::anyhow!("client went away"))
     }
 
     /// Streams `token` (special tokens stay text for the Qwen parser); returns
@@ -308,7 +308,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 }
             };
             let reject = |job: &NativeRequest, message: String| {
-                let _ = job.events.blocking_send(Err(NativeFailure::BadRequest(message)));
+                let _ = job.events.send(Err(NativeFailure::BadRequest(message)));
             };
             let constraint = match job.constraint.as_ref().map(|spec| grammars.matcher(spec)).transpose() {
                 Ok(constraint) => constraint,
@@ -332,7 +332,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 }
             };
             admissions += 1;
-            let _ = job.events.blocking_send(Ok(InferenceChunk::Ready {
+            let _ = job.events.send(Ok(InferenceChunk::Ready {
                 system_fingerprint: None,
                 prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: 0 },
             }));
@@ -474,7 +474,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             Err(error) => {
                 tracing::warn!("decode step failed: {error:#}");
                 for request in active.drain(..) {
-                    let _ = request.job.events.blocking_send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                    let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                     allocator.release(request.placement);
                 }
                 continue;

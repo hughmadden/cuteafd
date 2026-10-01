@@ -344,13 +344,13 @@ mod tests {
                         prompt_cache_hit_tokens: 0,
                     },
                 }))
-                .await
+                
                 .unwrap();
             job.events
                 .send(Ok(InferenceChunk::Finish {
                     finish_reason: InferenceFinishReason::Length,
                 }))
-                .await
+                
                 .unwrap();
         });
         assert_eq!(
