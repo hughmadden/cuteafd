@@ -360,11 +360,23 @@ fn paged_rows(family: &Dsv4Prefix<'_, '_>, placement: &Placement, len: usize) ->
     Ok(out)
 }
 
-/// The bytes of mark `slot`.
-fn mark(family: &Dsv4Prefix<'_, '_>, slot: u32) -> Result<Vec<u8>> {
+/// The bytes mark `slot` holds for a snapshot at `len`: per layer its `min(len, 128)` window rows
+/// (rows past them are left over from earlier marks) and its compressor state.
+fn mark(family: &Dsv4Prefix<'_, '_>, slot: u32, len: usize) -> Result<Vec<u8>> {
     let range = family.mark_segments(MarkSlot(slot))[0];
-    download(family.engine, CuteafdDeviceBuffer { ptr: range.addr as *mut std::ffi::c_void, bytes: range.bytes,
-        ..family.template() })
+    let bytes = download(family.engine, CuteafdDeviceBuffer { ptr: range.addr as *mut std::ffi::c_void,
+        bytes: range.bytes, ..family.template() })?;
+    let rows = len.min(WINDOW);
+    let (mut out, mut offset) = (Vec::with_capacity(bytes.len()), 0);
+    for layer in &family.layers {
+        out.extend_from_slice(&bytes[offset..][..rows * PAYLOAD_BYTES]);
+        out.extend_from_slice(&bytes[offset + WINDOW * PAYLOAD_BYTES..][..rows * SCALE_BYTES]);
+        offset += WINDOW_MARK_BYTES;
+        let states: usize = layer.states.iter().map(|&(_, stride)| stride).sum();
+        out.extend_from_slice(&bytes[offset..][..states]);
+        offset += states;
+    }
+    Ok(out)
 }
 
 /// One `--resume-at` case.
@@ -441,7 +453,7 @@ fn resume_case(runner: &mut Runner<'_, '_, '_>, family: &Dsv4Prefix<'_, '_>, all
         let restore_ms = started.elapsed().as_secs_f64() * 1e3;
         // The restored state reads back exactly as the captured one, and every paged row agrees.
         family.capture(MarkSlot(1), &b, at).map_err(err)?;
-        let mark_equal = mark(family, 0)? == mark(family, 1)?;
+        let mark_equal = mark(family, 0, at)? == mark(family, 1, at)?;
         let state_at = paged_rows(family, &a, at)? == paged_rows(family, &b, at)?;
         let straight = runner.prefill(&mut a, &embed[at..], chunk, true)?;
         let restored = runner.prefill(&mut b, &embed[at..], chunk, true)?;
@@ -463,7 +475,7 @@ fn resume_case(runner: &mut Runner<'_, '_, '_>, family: &Dsv4Prefix<'_, '_>, all
         // Both sequences' positional state at the end (window rows, compressor state).
         family.capture(MarkSlot(1), &a, len).map_err(err)?;
         family.capture(MarkSlot(2), &b, len).map_err(err)?;
-        let state_equal = mark(family, 1)? == mark(family, 2)?;
+        let state_equal = mark(family, 1, len)? == mark(family, 2, len)?;
         println!("resume at {at} of {n} (chunks of {chunk}{}, {decode} decode steps): paged rows at {at} {} | layers {} | \
             logits {} (last row max |diff| {max_diff:.3e}) | decode {} | paged rows 0..{len} {} | window+compressor \
             state {} | mark round trip {} ({} B), capture+restore {restore_ms:.1} ms",

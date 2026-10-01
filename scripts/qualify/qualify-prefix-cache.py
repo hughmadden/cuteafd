@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prefix cache qualification over the OpenAI-compatible API (MiMo V2, GLM 5.3 Flash, GLM 5.3).
+"""Prefix cache qualification over the OpenAI-compatible API (MiMo V2, GLM 5.3 Flash, GLM 5.3, Qwen 3.8, DeepSeek V4).
 
   reference  Run the conversation set on a cache-off server (PREFIX_CACHE_ENTRIES=0) and save
              every greedy reply.
