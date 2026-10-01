@@ -347,7 +347,16 @@ fn prefix_cache<'e, 'a>(engine: &'e super::engine::Engine<'a>, args: &PrefixArgs
         "DeepSeek V4 restores exact snapshots only (window and compressor state)");
     let entries = args.prefix_cache_entries;
     let family = Dsv4Prefix::new(engine, |mark| mark_slots(engine, args, mark))?;
-    let host = args.host_tier(engine.library, family.template(), family.mark_bytes())?;
+    // The pinned host tier copies through one GPU's copy engine; a head split keeps its
+    // (replicated) state on both GPUs, so it keeps device-resident snapshots only.
+    let host = if engine.ranks() > 1 {
+        if args.host_cache_bytes > 0 && args.prefix_cache_entries > 0 {
+            tracing::warn!("DeepSeek V4 head split: the prefix cache's host tier is off (device-resident snapshots only)");
+        }
+        None
+    } else {
+        args.host_tier(engine.library, family.template(), family.mark_bytes())?
+    };
     let layout = family.layout();
     let config = PrefixConfig { entries, mark_slots: family.slots(), keep_logits: true,
         min_tokens: args.prefix_cache_min_tokens };

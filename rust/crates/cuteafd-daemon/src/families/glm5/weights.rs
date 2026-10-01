@@ -1,6 +1,8 @@
 //! GLM 5.x coordinator weights, packed for the exported glm_* programs.
 //!
-//! The checkpoint's FP8 projections stay FP8: E4M3 bytes (`{w}_fp8`) with
+//! The checkpoint's FP8 projections stay FP8 (ModelOpt per-tensor FP8 as the
+//! same bytes under a uniform block grid; a ModelOpt release's BF16 projections
+//! are quantized to 128x128 blocks at load): E4M3 bytes (`{w}_fp8`) with
 //! their FP32 128x128 scale grids (`{w}_scale`, `[ceil(N/128), K/128]`) are
 //! the only copies of `w_qkv_a`, `w_q_b`, `w_iq`, `w_o`, `w_gate_up` and
 //! `w_down` (decode programs: FP8 GEMV up to 16 rows, W8A16 GEMMs above, bitwise
@@ -163,25 +165,49 @@ impl<'a> GlmLoader<'a> {
     /// whole number of 128-row blocks), N and K.
     fn with_fp8<T>(&self, names: &[String], body: impl FnOnce(&[u8], Vec<f32>, usize, usize) -> Result<T>)
         -> Result<T> {
+        // BF16 parts need room for their padded rows while they quantize in place.
         let total: u64 = names.iter().map(|n| self.catalog.tensor(n).map(|t| t.metadata.byte_length))
-            .sum::<Result<u64>>()?;
+            .sum::<Result<u64>>()? + 128 * 8192 * 2;
         crate::shared::memory::staging::with_staging(total as usize, |values| {
             let mut grid = Vec::new();
             let (mut rows, mut cols, mut at) = (0usize, None, 0usize);
             for (i, name) in names.iter().enumerate() {
                 let (length, dtype, shape) = self.read_into(name, values, at)?;
-                at += length;
-                ensure!(dtype == DType::F8E4M3 && shape.len() == 2,
-                    "{name}: the glm programs take this weight as an FP8 checkpoint tensor, found {dtype:?} {shape:?}");
+                ensure!(shape.len() == 2 && matches!(dtype, DType::F8E4M3 | DType::Bf16),
+                    "{name}: the glm programs take this weight as FP8 (or BF16 quantized at load), found {dtype:?} {shape:?}");
                 ensure!(cols.is_none_or(|c| c == shape[1]), "{names:?} do not share columns");
                 ensure!(i + 1 == names.len() || shape[0] % 128 == 0,
                     "{names:?}: only the last concatenated weight may end inside a 128-row block");
                 cols = Some(shape[1]);
-                let (scale, scale_dtype, scale_shape) = self.raw(&format!("{name}_scale_inv"))?;
-                ensure!(scale_dtype == DType::F32 && scale_shape == [shape[0].div_ceil(128), shape[1].div_ceil(128)],
-                    "{name}: expected FP32 128x128 block scales, found {scale_dtype:?} {scale_shape:?}");
-                grid.extend(scale.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())));
-                rows += shape[0];
+                let (n, k) = (shape[0], shape[1]);
+                let block_rows = n.div_ceil(128);
+                if dtype == DType::Bf16 {
+                    // An unquantized weight of a ModelOpt release (nvidia/GLM-5.3-NVFP4 keeps
+                    // attention and the shared experts BF16): 128x128 E4M3 blocks at load,
+                    // power-of-two scales (the glmf rule), rows padded to whole blocks.
+                    let mut padded = values[at..at + length].to_vec();
+                    padded.resize(block_rows * 128 * k * 2, 0);
+                    let (q, scales) = crate::families::glm5_flash::fp8::quantize(&padded, block_rows * 128, k,
+                        crate::families::glm5_flash::fp8::Layout::Block, crate::shared::fp8_linear::Fp8Scales::Pow2);
+                    values[at..at + n * k].copy_from_slice(&q[..n * k]);
+                    grid.extend(scales);
+                } else if self.catalog.tensor(&format!("{name}_scale_inv")).is_ok() {
+                    let (scale, scale_dtype, scale_shape) = self.raw(&format!("{name}_scale_inv"))?;
+                    ensure!(scale_dtype == DType::F32 && scale_shape == [block_rows, k.div_ceil(128)],
+                        "{name}: expected FP32 128x128 block scales, found {scale_dtype:?} {scale_shape:?}");
+                    grid.extend(scale.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())));
+                } else {
+                    // ModelOpt per-tensor FP8 (one FP32 `weight_scale`): the same E4M3 bytes
+                    // with every block scale equal to it, exactly. Its static input_scale is
+                    // not read: the programs quantize activations per row and 128-K block.
+                    let (scale, scale_dtype, _) = self.raw(&format!("{name}_scale"))
+                        .with_context(|| format!("{name}: an FP8 weight needs weight_scale_inv blocks or a weight_scale"))?;
+                    ensure!(scale_dtype == DType::F32 && scale.len() == 4, "{name}_scale: expected one FP32 value");
+                    let value = f32::from_le_bytes(scale[..4].try_into().unwrap());
+                    grid.extend(std::iter::repeat_n(value, block_rows * k.div_ceil(128)));
+                }
+                at += n * k;
+                rows += n;
             }
             body(values, grid, rows, cols.context("no FP8 rows")?)
         })
@@ -368,8 +394,28 @@ impl<'a> GlmLoader<'a> {
 
     /// Every rank's copy of a small operand read once.
     fn replicated(&self, ranks: usize, read: impl FnOnce() -> Result<Vec<u8>>) -> Result<Vec<DeviceAllocation<'a>>> {
-        let bytes = read()?;
-        (0..ranks).map(|rank| self.on_rank(rank, |_| self.upload(&bytes))).collect()
+        self.upload_all(ranks, &read()?)
+    }
+
+    /// `bytes` on every rank: one upload to rank 0, peer copies to the others (faster than
+    /// a second pageable host upload).
+    fn upload_all(&self, ranks: usize, bytes: &[u8]) -> Result<Vec<DeviceAllocation<'a>>> {
+        let first = self.upload(bytes)?;
+        let mut out = Vec::with_capacity(ranks);
+        for rank in 1..ranks {
+            out.push(self.on_rank(rank, |stream| {
+                let copy = DeviceAllocation::new(self.library, bytes.len().max(256))?;
+                // SAFETY: both allocations hold `bytes.len()` bytes; peer access to rank 0 is
+                // enabled (the split setup); the stream drains before return.
+                unsafe {
+                    self.library.copy_d2d_async(copy.buffer, first.buffer, bytes.len(), stream)?;
+                    self.library.cuda_stream_synchronize(stream)?;
+                }
+                Ok(copy)
+            })?);
+        }
+        out.insert(0, first);
+        Ok(out)
     }
 
     /// Layer `layer`, one share per rank of this loader's head split (one
@@ -414,9 +460,7 @@ impl<'a> GlmLoader<'a> {
             let kb = cols.div_ceil(128);
             let grid_ref = &grid;
             let kscale: Vec<f32> = (0..kb).flat_map(|b| (0..rows).map(move |r| grid_ref[(r / 128) * kb + b])).collect();
-            let each = |bytes: &[u8]| -> Result<Vec<DeviceAllocation<'a>>> {
-                (0..ranks).map(|rank| self.on_rank(rank, |_| self.upload(bytes))).collect()
-            };
+            let each = |bytes: &[u8]| self.upload_all(ranks, bytes);
             Ok((each(values)?, each(&f32_bytes(&grid))?, each(&f32_bytes(&kscale))?))
         })?;
         put(&mut ops, "w_qkv_a_fp8", values);
@@ -445,9 +489,16 @@ impl<'a> GlmLoader<'a> {
                 format!("{p}.self_attn.indexer.weights_proj.weight")])?;
             let mut copies = vec![];
             for rank in 1..ranks {
-                let mut host = vec![0u8; w_ik.buffer.bytes];
-                self.library.copy_d2h(&mut host, w_ik.buffer)?;
-                copies.push(self.on_rank(rank, |_| self.upload(&host))?);
+                copies.push(self.on_rank(rank, |stream| {
+                    let copy = DeviceAllocation::new(self.library, w_ik.buffer.bytes)?;
+                    // SAFETY: both allocations hold the whole operand; peer access to rank 0 is
+                    // enabled (the split setup); the stream drains before return.
+                    unsafe {
+                        self.library.copy_d2d_async(copy.buffer, w_ik.buffer, w_ik.buffer.bytes, stream)?;
+                        self.library.cuda_stream_synchronize(stream)?;
+                    }
+                    Ok(copy)
+                })?);
             }
             put(&mut ops, "w_ik", std::iter::once(w_ik).chain(copies).collect());
             put(&mut ops, "k_norm_w", self.replicated(ranks, || raw(&format!("{p}.self_attn.indexer.k_norm.weight")))?);

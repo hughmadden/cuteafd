@@ -242,8 +242,11 @@ fn segmented_fused_qkv_resolves_checkpoint_shards() {
     assert!(rejected(&report, Component::Attention)[0].contains("fused qkv_proj"), "{}", render(&report));
 }
 
+/// serve-glm's FP8 decode operands come from FP8 blocks, ModelOpt per-tensor
+/// FP8 (a uniform grid) or BF16 quantized at load (nvidia/GLM-5.3-NVFP4); FP32
+/// is still refused.
 #[test]
-fn glm5_coordinator_bf16_and_f32_are_unsupported_where_decode_reads_fp8() {
+fn glm5_coordinator_takes_bf16_and_per_tensor_fp8_where_decode_reads_fp8() {
     let mut tensors = glm5_tensors(|name, n, k| fp8(name, n, k, None));
     tensors.retain(|(name, ..)| !name.contains("layers.1.self_attn.q_b_proj") && !name.contains("layers.1.self_attn.o_proj")
         && !name.contains("layers.1.self_attn.kv_b_proj"));
@@ -254,11 +257,17 @@ fn glm5_coordinator_bf16_and_f32_are_unsupported_where_decode_reads_fp8() {
     let dir = snapshot(glm5_config(), &tensors);
     let report = plan(dir.path(), &PlanOptions::default()).unwrap();
     let attention = component(&report, Component::Attention);
-    assert_eq!((attention.status, attention.rejected), (Status::MissingKernel, 2), "{}", render(&report));
+    assert_eq!((attention.status, attention.rejected), (Status::MissingKernel, 1), "{}", render(&report));
     let reasons = rejected(&report, Component::Attention).join("\n");
-    assert!(reasons.contains("model.layers.1.self_attn.q_b_proj: serve-glm's decode programs read q_b_proj as checkpoint FP8"),
-        "{reasons}");
-    assert!(reasons.contains("model.layers.1.self_attn.o_proj: ") && reasons.contains("found f32"), "{reasons}");
+    assert!(reasons.contains("model.layers.1.self_attn.o_proj: serve-glm's decode programs read o_proj as FP8 128x128 \
+        blocks") && reasons.contains("found f32"), "{reasons}");
+    // Per-tensor FP8 (E4M3 + one FP32 weight_scale) is the same bytes under a uniform grid.
+    let mut tensors = glm5_tensors(|name, n, k| fp8(name, n, k, None));
+    tensors.retain(|(name, ..)| !name.contains("layers.0.mlp.down_proj"));
+    tensors.push(t("model.layers.0.mlp.down_proj.weight", "F8_E4M3", &[6144, 12288]));
+    tensors.push(t("model.layers.0.mlp.down_proj.weight_scale", "F32", &[]));
+    let report = plan(snapshot(glm5_config(), &tensors).path(), &PlanOptions::default()).unwrap();
+    assert_eq!(component(&report, Component::DenseFfn).status, Status::Ready, "{}", render(&report));
     // A BF16 router bias (FP32 in every GLM checkpoint) is refused too.
     let mut tensors = glm5_tensors(|name, n, k| fp8(name, n, k, None));
     tensors.retain(|(name, ..)| !name.ends_with("e_score_correction_bias"));
