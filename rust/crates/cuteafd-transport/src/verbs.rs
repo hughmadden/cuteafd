@@ -2359,6 +2359,12 @@ impl VerbsHostProtocolV2PersistentClientSession {
         })
     }
 
+    /// Whether `request` goes out zero-copy from this session's egress buffer.
+    fn sends_from_egress(&self, request: &ExpertProtocolV2Request) -> bool {
+        !request.hidden_payload.is_empty()
+            && self.egress.as_ref().is_some_and(|(buffer, _)| buffer.offset_of(&request.hidden_payload).is_some())
+    }
+
     /// Waits until every request this session posted has left (its send
     /// completed), so a shared egress buffer may be rewritten.
     fn drain_request_sends(&mut self, config: &TcpTransportConfig) -> Result<()> {

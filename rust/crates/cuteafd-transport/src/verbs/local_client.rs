@@ -2,6 +2,12 @@
 //! response assembler/recycling code runs locally; no QP worker is spawned.
 use super::*;
 
+/// Requests up to this size go out rank after rank under a staggered egress.
+/// Posted alone, one rank's zero-copy request completes at ~12-14 GB/s up to
+/// 13 MB but at ~3 GB/s at 26 MB (raptor to a Spark, 200 Gb); larger requests
+/// go out all at once, where the ranks' queue pairs overlap that.
+const STAGGER_MAX_BYTES: usize = 16 << 20;
+
 pub(crate) struct LocalTp4Client {
     peers: Vec<SocketAddr>,
     config: TcpTransportConfig,
@@ -14,6 +20,9 @@ pub(crate) struct LocalTp4Client {
     landing: Vec<Option<DeviceLanding>>,
     /// Shared registered request buffer (zero-copy egress).
     egress: Option<Arc<super::egress::EgressBuffer>>,
+    /// Post the ranks' zero-copy requests one after another (each once the
+    /// previous rank's send completed) rather than all at once.
+    stagger: bool,
 }
 impl LocalTp4Client {
     pub(crate) fn new(peers: [SocketAddr; 4], config: TcpTransportConfig) -> Self {
@@ -38,15 +47,17 @@ impl LocalTp4Client {
             deadline: None,
             landing: vec![None; world],
             egress: None,
+            stagger: false,
         }
     }
     /// Allocates the shared request buffer (`bytes`, pinned and device-mapped)
     /// and registers it on every session from the next connection on.
-    pub(crate) fn enable_egress(&mut self, bytes: usize) -> Result<CuteafdHostBuffer> {
+    pub(crate) fn enable_egress(&mut self, bytes: usize, stagger: bool) -> Result<CuteafdHostBuffer> {
         self.reset();
         let buffer = super::egress::EgressBuffer::new(bytes)?;
         let host = buffer.host();
         self.egress = Some(buffer);
+        self.stagger = stagger;
         Ok(host)
     }
     /// The shared request buffer, once no request payload views it and every
@@ -117,10 +128,16 @@ impl LocalTp4Client {
                     self.egress.as_ref(),
                 )?);
             }
-            let timing = self.sessions[rank]
-                .as_mut()
-                .unwrap()
-                .post_chunk_request(request, &self.config)?;
+            let session = self.sessions[rank].as_mut().unwrap();
+            let timing = session.post_chunk_request(request, &self.config)?;
+            if self.stagger && rank + 1 < self.peers.len() && request.hidden_payload.len() <= STAGGER_MAX_BYTES
+                && session.sends_from_egress(request) {
+                // The next rank's request goes out once this one has left: each
+                // rank gets the whole link in turn and starts computing as early
+                // as it can, so the ranks finish, and their partials land,
+                // staggered instead of all at once.
+                session.drain_request_sends(&self.config)?;
+            }
             let (response_tx, response_rx) = tokio::sync::oneshot::channel();
             self.pending[rank].push_back(VerbsHostProtocolV2PendingChunkRoundtrip::new(
                 VerbsHostProtocolV2QueuedChunkCommand {

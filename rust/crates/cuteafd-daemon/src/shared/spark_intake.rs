@@ -583,15 +583,36 @@ pub(crate) fn copy_parallel(dst: &mut [u8], src: &[u8]) {
 /// (decode) requests keep their own copy.
 const EGRESS_MIN_BYTES: usize = 1 << 20;
 
-/// `CUTEAFD_SPARK_EGRESS` (on, the default, or off): prefill requests go out
-/// zero-copy from one registered buffer shared by every rank's session.
-fn egress_enabled() -> bool {
-    static SETTING: OnceLock<bool> = OnceLock::new();
+/// How prefill requests leave (`CUTEAFD_SPARK_EGRESS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Egress {
+    /// Each rank's session copies the payload into its own send ring.
+    Copied,
+    /// Zero-copy from one registered buffer, every rank's send posted at once.
+    Parallel,
+    /// Zero-copy, each rank's send posted once the previous one left (default).
+    Staggered,
+}
+
+fn egress_setting() -> Egress {
+    static SETTING: OnceLock<Egress> = OnceLock::new();
     *SETTING.get_or_init(|| {
-        let on = !matches!(std::env::var("CUTEAFD_SPARK_EGRESS").as_deref(), Ok("off" | "0"));
-        tracing::info!(zero_copy = on, min_bytes = EGRESS_MIN_BYTES, "Spark request egress");
-        on
+        let egress = match std::env::var("CUTEAFD_SPARK_EGRESS").as_deref() {
+            Ok("off" | "0" | "copied") => Egress::Copied,
+            Ok("parallel") => Egress::Parallel,
+            Ok("on" | "staggered") | Err(_) => Egress::Staggered,
+            Ok(other) => {
+                tracing::warn!(setting = other, "CUTEAFD_SPARK_EGRESS is staggered, parallel or off; staggered");
+                Egress::Staggered
+            }
+        };
+        tracing::info!(?egress, min_bytes = EGRESS_MIN_BYTES, "Spark request egress");
+        egress
     })
+}
+
+fn egress_enabled() -> bool {
+    egress_setting() != Egress::Copied
 }
 
 /// Logs once how this coordinator moves expert traffic, from the fabric it
@@ -609,7 +630,7 @@ fn log_transfer_plan(mode: IntakeMode, ranks: usize) {
         Ok(report) => {
             let ports = report.rails.rails.iter().map(|rail| format!("{}@{} {:.0}G", rail.device, rail.address,
                 rail.effective_gbps)).collect::<Vec<_>>().join(", ");
-            tracing::info!(ranks, intake = mode.name(), egress = if egress_enabled() { "zero-copy" } else { "copied" },
+            tracing::info!(ranks, intake = mode.name(), egress = ?egress_setting(),
                 coordinator_rails = %ports, "Spark transfer plan: every rank on the first coordinator rail");
         }
         Err(error) => tracing::warn!("Spark transfer plan: fabric discovery failed: {error:#}"),
@@ -639,7 +660,7 @@ impl<'a> SparkLink<'a> {
         log_transfer_plan(mode, peers.len());
         let egress_bytes = if egress_enabled() { capacity as usize * row_bytes } else { 0 };
         if egress_bytes > 0 {
-            transport.enable_egress(egress_bytes)?;
+            transport.enable_egress(egress_bytes, egress_setting() == Egress::Staggered)?;
         }
         Ok(Self { transport, intake, egress_bytes })
     }
