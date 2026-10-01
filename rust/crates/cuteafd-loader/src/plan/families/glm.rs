@@ -329,9 +329,10 @@ struct GlmModel {
     spec: ModelSpec,
 }
 
-/// serve-glm's decode programs read these as the checkpoint's own FP8 (E4M3
-/// with FP32 128x128 scales) beside the BF16 operand (`GlmLoader::layer`,
-/// `rows_fp8(.., keep_fp8 = true)`); a BF16 copy is not accepted.
+/// serve-glm's decode programs read these as FP8 (E4M3 with FP32 128x128
+/// scales): the checkpoint's own blocks, a ModelOpt per-tensor FP8 weight
+/// under a uniform grid, or a ModelOpt release's BF16 weight quantized to
+/// blocks at load (`GlmLoader::with_fp8`).
 const GLM5_DECODE_FP8: &[&str] = &["q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj", "gate_proj", "up_proj", "down_proj"];
 
 impl GlmModel {
@@ -341,10 +342,15 @@ impl GlmModel {
         if GLM5_DECODE_FP8.contains(&name) || (indexer && name == "wq_b") {
             // Concatenated FP8 parts (q_a | kv_a, gate | up) must end on whole 128-row blocks.
             let first_of_pair = matches!(name, "q_a_proj" | "gate_proj");
-            return require(fp8_f32_block128(operand)
-                && (!first_of_pair || operand.matrix().is_some_and(|(rows, _)| rows % 128 == 0)), || {
-                format!("serve-glm's decode programs read {name} as checkpoint FP8 (E4M3, FP32 128x128 scales{}); \
-                    found {}", if first_of_pair { ", 128-row multiple" } else { "" }, describe(operand))
+            let per_tensor = operand.encoding == crate::plan::format::Encoding::E4m3
+                && operand.scale.as_ref().is_some_and(|s| s.encoding == ScaleEncoding::F32 && s.grid.iter().product::<usize>() == 1);
+            let stored = fp8_f32_block128(operand) || per_tensor
+                || operand.is_plain(&[crate::plan::format::Encoding::Bf16]);
+            return require(stored && operand.matrix().is_some_and(|(rows, cols)| cols % 128 == 0
+                && (!first_of_pair || rows % 128 == 0)), || {
+                format!("serve-glm's decode programs read {name} as FP8 128x128 blocks (the checkpoint's FP8 blocks, \
+                    per-tensor FP8, or BF16 quantized at load{}); found {}",
+                    if first_of_pair { "; 128-row multiple" } else { "" }, describe(operand))
             });
         }
         match name {
@@ -405,6 +411,9 @@ impl FamilyModel for GlmModel {
                 Err("the native MTP layer is not run (speculation uses a DFlash2 drafter)".into())
             }
             Component::Vision => Err("text-only: the vision tower is not run".into()),
+            // ModelOpt NVFP4 dense MLPs run natively (serve-glmf: the fp8-glmfdense-nvfp4 package).
+            Component::DenseFfn if self.id == "glm5_flash" && operand.is_nvfp4()
+                && operand.scale.as_ref().is_some_and(|s| s.cols == 16) => Ok(()),
             _ if self.id == "glm5" => self.glm5(stem, operand),
             _ => self.glm5_flash(stem, operand),
         }

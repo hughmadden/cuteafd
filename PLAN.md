@@ -348,17 +348,25 @@ Qwen on one RTX: 68 GB); S2 dense + MTP dispositions; S3 V4.1
 convergence; S4 W4A4 prefill experiment. Gates per stage: oracle cosine,
 KL vs golden within 0.005 of the FP8-expert path, tok/s ≥ it, readiness
 not worse, V4.1 parity. GLM 5.3 NVFP4 experts (~407 GB) need TP6.
-Status: S0 + S1 on `work/nvfp4` (fork `cuteafd/nvfp4-w4a16`). The ModelOpt
-reader (`formats/modelopt.rs`) checks every weight against its
-hf_quant_config.json / config.json declaration; `glm|glmf|qwen4:nvfp4` build
-`fp8-<family>-nvfp4` packages (ABI 3, grouped GEMV at every row count, alphas
-after each scale grid; Spark tp2/3/4/6, coordinator tp1). Real layers pass the
-CPU oracle at every slice. NVIDIA's NVFP4 experts are ~9% RMS from the FP8
-originals, so GLM 5.3 Flash's KL is +0.037 over the FP8-expert path (NLL
-+0.003): the checkpoint, not the kernels (S1 measurements in the commit).
-Open: an NVFP4 stream/GEMM route for large prefill steps (the GEMV is ~4% behind
-EXL3 on Qwen prefill), Spark-native runs, S2 dense dispositions (GLM 5.3 Flash
-NVFP4 dense FFN, GLM 5.3 BF16/per-tensor FP8 parts).
+Status (2026-10-02): S0, S1 and the S4 kernels landed (`work/nvfp4`, fork
+`cuteafd/nvfp4-w4a16`). The ModelOpt reader (`formats/modelopt.rs`) checks
+every weight against hf_quant_config.json / config.json. `glm|glmf|qwen4:nvfp4`
+build `fp8-<family>-nvfp4` packages (W4A16: GEMV, stream above 2048 rows);
+`:nvfp4a4` builds W4A4 large-row steps (static input_scale, mxf4nvf4 MMAs,
+above 512 rows), opt-in with `CUTEAFD_NVFP4_ACTIVATIONS=a4`. Native SM121
+packages pass the CPU oracle on GB10 at tp2/3/4/6. GLM 5.3 Flash TP4 Sparks
+(EXL3 K3.25 coordinator weights): NVFP4 W4A16 NLL 2.3880 / KL 0.0587 (EXL3
+K3.25 2.4082 / 0.0616), C1 step 16.3 ms vs 15.3 (4.5 vs 3.25 bits read), 8K
+prefill equal; W4A4 KL 0.0799, prefill 1.33x. Qwen on one RTX: NVFP4 8K
+prefill 1.08x EXL3 (W4A4 1.36x), 1.6K 0.96x (W4A4 1.33x). W4A4 costs
++0.02 KL (over this plan's 0.005 bound): W4A16 stays default, a decision for
+TJ. S2: GLM 5.3 Flash NVFP4 dense MLPs run natively (one-expert
+`fp8-glmfdense-nvfp4`): nvidia/GLM-5.3-Flash-NVFP4 serves alone (NLL 2.3896);
+GLM 5.3's per-tensor FP8 dense layers are the same bytes under a uniform
+block grid and its BF16 parts quantize to FP8 blocks at load: nvidia/GLM-5.3-NVFP4
+serves on six Sparks (TP6 W4A16: NLL 2.4814 / KL 0.0571 vs golden 2.4677; 8K
+prefill 4.22 s, W4A4 3.20 s). Open: W4A16 stream efficiency (GB10 4096 rows 14.3 ms/layer TP4 vs
+EXL3 9.1), SM121 route thresholds, BF16 MLA programs (vs FP8 at load).
 
 **Phase 6 — placement planner (design 2026-09-30).** One planner for every
 family: (model, inventory of 1–2 coordinator GPUs — real or simulated by a
@@ -398,10 +406,11 @@ hops. So the head split pays and is the default with two RTX
 opts out): MiMo V2.6 Pro (coordinator-only decode -41%, 8K prefill -43%; with
 6 Sparks C1 decode 30.9 -> 26.0 ms, prefill Spark-bound) and GLM 5.3
 (coordinator-only 8K prefill -28%; with 6 Sparks decode -9.5%, prefill
-Spark-bound). Shared plumbing in `shared/peer_split.rs`: per-slot release flags,
+Spark-bound) and DeepSeek V4 (4 Sparks, all experts remote: Flash decode -10%,
+Pro decode -12%, prefill neutral). Shared plumbing in `shared/peer_split.rs`: per-slot release flags,
 partials exchanged and summed in the same operand order on both GPUs (identical
 residual streams), GPU1 queued a layer ahead of GPU0's Spark exchange, decode
-graphs captured per GPU. The layer-range split is not needed for these two.
+graphs captured per GPU. The layer-range split is not needed for these three.
 The drafter follows the GPU that owns the last backbone layers (taps and head
 live there); TP2 drafters are ≤1% on DFlash2 and not built unless the P2P
 probe shows ≤15 µs hops; the win is lane B drafting on GPU1 while lane A
