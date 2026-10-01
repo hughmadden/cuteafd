@@ -82,7 +82,8 @@ class ConcurrencyCases(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue(report['passed'])
                 self.assertEqual(report['case'], case)
-                self.assertEqual(len(requests), 4)
+                # warm-up, C1, one untimed C2 warm batch (--warm-batches 1), timed C2
+                self.assertEqual(len(requests), 6)
                 self.assertTrue(all(r['max_tokens'] == limit for r in requests))
                 self.assertTrue(all(r['thinking'] == {'type': 'disabled'} for r in requests))
                 rows = [r for batch in report['records'] for r in batch['rows']]
