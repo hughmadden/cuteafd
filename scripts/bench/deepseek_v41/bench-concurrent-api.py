@@ -7,6 +7,7 @@ parser.add_argument('--base-url', default='http://127.0.0.1:18042')
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--concurrency', type=int, nargs='+', default=[1,2,4,8,16])
 parser.add_argument('--repeats', type=int, default=3)
+parser.add_argument('--warm-batches', type=int, default=1, help='untimed batches per concurrency level before measuring (the first wide batch after a launch pays one-time warm-up: engram/host table paging, graph and workspace first use)')
 parser.add_argument('--label', default='release-concurrency')
 parser.add_argument('--prompt-label', help='Word that opens the prompt (default: --label). Arms of an A/B must share it: '
                     'a different prompt changes dSpark acceptance (about 2%% of C1 code tok/s)')
@@ -62,6 +63,9 @@ if not warmup_row['passed']:fail('warmup',[warmup_row],warmup_row['error'])
 warmup=warmup_row['result'];reference=[warmup['text'],{k:warmup['usage'][k] for k in ['prompt_tokens','completion_tokens','total_tokens']}]
 warmup_checks=validate(warmup)
 for c in args.concurrency:
+ for warm in range(args.warm_batches if c>1 else 0):
+  with concurrent.futures.ThreadPoolExecutor(max_workers=c) as pool:rows=list(pool.map(run,range(c)))
+  if not all(row['passed'] for row in rows):fail(f'C{c} warm-up {warm+1}',rows,'response or output check failed')
  for repeat in range(args.repeats):
   with concurrent.futures.ThreadPoolExecutor(max_workers=c) as pool:rows=list(pool.map(run,range(c)))
   phase=f'C{c} repeat {repeat+1}'
@@ -83,4 +87,4 @@ summaries=[]
 for c in args.concurrency:
  values=[row['aggregate_tps'] for row in records if row['concurrency']==c]
  summaries.append(dict(concurrency=c,samples=len(values),median_aggregate_tps=statistics.median(values),min_aggregate_tps=min(values),max_aggregate_tps=max(values)))
-args.output.write_text(json.dumps(dict(scope=__doc__,base_url=args.base_url,label=args.label,case=args.case,corpus_sha256=hashlib.sha256(corpus_path.read_bytes()).hexdigest(),prompt=prompt,max_tokens=definition['max_tokens'],thinking=definition.get('thinking','disabled'),reasoning_effort=definition.get('reasoning_effort'),warmup=warmup,warmup_checks=warmup_checks,concurrency=args.concurrency,repeats=args.repeats,records=records,summaries=summaries,passed=True),indent=2)+'\n')
+args.output.write_text(json.dumps(dict(scope=__doc__,base_url=args.base_url,label=args.label,case=args.case,corpus_sha256=hashlib.sha256(corpus_path.read_bytes()).hexdigest(),prompt=prompt,max_tokens=definition['max_tokens'],thinking=definition.get('thinking','disabled'),reasoning_effort=definition.get('reasoning_effort'),warmup=warmup,warmup_checks=warmup_checks,concurrency=args.concurrency,repeats=args.repeats,warm_batches=args.warm_batches,records=records,summaries=summaries,passed=True),indent=2)+'\n')
