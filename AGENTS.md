@@ -84,7 +84,9 @@ go in commit messages as short before → after tables with conditions.
   exchange, native lib, sampler) add a quick V4.1 parity: one launch of the
   candidate (WIP images) vs a baseline measured the same day, C1 + C16 code
   decode only (~10 min); escalate to 3 interleaved sessions per arm only if a
-  metric is below 0.98. Full V4.1 parity (3 sessions per arm, all metrics)
+  metric is below 0.98 after warm-up (benches run one untimed batch per
+  concurrency level; DeepSeek engram tables and first-use workspaces make the
+  first wide batch after a launch ~10% slow — explain, don't re-run). Full V4.1 parity (3 sessions per arm, all metrics)
   runs at release cuts only. Release images are built for release cuts, not
   to verify branches; agentic benches gate with 1–2 short sessions, the full
   bench runs at release.
