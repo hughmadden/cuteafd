@@ -17,6 +17,7 @@
 use crate::shared::fp8_linear::{self, Fp8Weight};
 use crate::families::glm5::dflash::FP8_ROWS;
 use crate::shared::memory::DeviceAllocation;
+use crate::shared::token_io::TokenEmbedding;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
@@ -188,6 +189,8 @@ struct Workspace<'a> {
     candidates: Dev<'a>,
     positions: Dev<'a>,
     tables: Dev<'a>,
+    /// Token ids of the block rows (anchors; the mask rows' sentinel).
+    ids: Dev<'a>,
     attention_workspace: Dev<'a>,
     topk_workspace: Dev<'a>,
     head: VocabularyHead<'a>,
@@ -243,12 +246,26 @@ pub(crate) struct MimoDrafter<'a> {
     context_kv: Dev<'a>,
     context_positions: Dev<'a>,
     context_slots: Dev<'a>,
-    /// The mask token's (trained) embedding row.
+    /// The mask token's (trained) embedding row, and its device copy (the
+    /// gather's fallback row for the mask id).
     mask_row: Vec<u8>,
+    mask_device: Dev<'a>,
     workspace: RefCell<Option<Workspace<'a>>>,
     fp8: Option<Fp8Weights<'a>>,
     /// Whether draft steps use `fp8` (a replay toggles it).
     use_fp8: std::cell::Cell<bool>,
+}
+
+/// The block rows' mask id: past every table, so the gather takes the mask row.
+const MASK_ID: u32 = u32::MAX;
+
+/// Where a draft step's block rows come from.
+#[derive(Clone, Copy)]
+enum Anchors<'r> {
+    /// The anchors' embedding rows (host).
+    Rows(&'r [u8]),
+    /// The anchors' token ids through the target's embedding table.
+    Tokens(&'r TokenEmbedding<'r>),
 }
 
 fn at(dev: &Dev<'_>, bytes: usize) -> *mut c_void {
@@ -385,6 +402,7 @@ impl<'a> MimoDrafter<'a> {
             context_kv: zeroed(TAP_ROWS * 2 * kv * 2)?,
             context_positions: zeroed(TAP_ROWS * 8)?,
             context_slots: zeroed(TAP_ROWS * 4)?,
+            mask_device: upload(&mask_row)?,
             mask_row,
             workspace: RefCell::new(None),
             fp8: None,
@@ -538,6 +556,7 @@ impl<'a> MimoDrafter<'a> {
             candidates: alloc(drafted * 16 * 4)?,
             positions: alloc(rows * 8)?,
             tables: alloc(3 * sequences * 4)?,
+            ids: alloc(rows * 4)?,
             attention_workspace: alloc(self.library.mimo_dflash_attention_workspace(sequences, c.heads, c.kv_heads,
                 c.block, RING + c.block)?)?,
             topk_workspace: alloc(self.library.glm_dflash_topk_workspace(drafted)?)?,
@@ -548,14 +567,28 @@ impl<'a> MimoDrafter<'a> {
         })
     }
 
-    /// Drafts `block - 1` tokens after each sequence's anchor. `anchor_rows`
-    /// holds the anchors' embedding rows; `head` is the target's vocabulary
-    /// head [vocab, hidden] BF16.
-    pub fn draft(&self, sequences: &[DraftSeq], anchor_rows: &[u8], head: *const c_void) -> Result<Vec<Draft>> {
+    /// Drafts `block - 1` tokens after each sequence's anchor, its rows
+    /// gathered on the device from the target's embedding table (the mask
+    /// rows from the trained mask row); `head` is the target's vocabulary head
+    /// [vocab, hidden] BF16.
+    pub fn draft(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>, head: *const c_void)
+        -> Result<Vec<Draft>> {
+        self.draft_from(sequences, Anchors::Tokens(embedding), head)
+    }
+
+    /// [`Self::draft`] from the anchors' embedding rows (oracles and replays).
+    pub fn draft_rows(&self, sequences: &[DraftSeq], anchor_rows: &[u8], head: *const c_void) -> Result<Vec<Draft>> {
+        self.draft_from(sequences, Anchors::Rows(anchor_rows), head)
+    }
+
+    fn draft_from(&self, sequences: &[DraftSeq], anchors: Anchors<'_>, head: *const c_void) -> Result<Vec<Draft>> {
         let c = &self.cfg;
         let (s_count, block, h) = (sequences.len(), c.block, c.hidden);
-        ensure!(s_count > 0 && s_count <= self.max_sequences && anchor_rows.len() == s_count * h * 2,
-            "draft step of {s_count} sequences");
+        let anchors_fit = match anchors {
+            Anchors::Rows(rows) => rows.len() == s_count * h * 2,
+            Anchors::Tokens(_) => true,
+        };
+        ensure!(s_count > 0 && s_count <= self.max_sequences && anchors_fit, "draft step of {s_count} sequences");
         let rows = s_count * block;
         let mut slot = self.workspace.borrow_mut();
         if slot.as_ref().is_none_or(|w| w.sequences < s_count) {
@@ -563,21 +596,38 @@ impl<'a> MimoDrafter<'a> {
             *slot = Some(self.workspace(self.max_sequences)?);
         }
         let w = slot.as_ref().context("draft workspace")?;
-        let mut embed = Vec::with_capacity(rows * h * 2);
         let mut positions = Vec::with_capacity(rows);
         let mut tables = vec![0i32; 3 * s_count];
         for (i, seq) in sequences.iter().enumerate() {
             ensure!(seq.slot < self.slots, "ring slot {} of {}", seq.slot, self.slots);
-            embed.extend_from_slice(&anchor_rows[i * h * 2..(i + 1) * h * 2]);
-            for _ in 1..block {
-                embed.extend_from_slice(&self.mask_row);
-            }
             positions.extend((seq.position..seq.position + block).map(|p| p as i64));
             tables[i] = seq.slot as i32;
             tables[s_count + i] = seq.position.saturating_sub(seq.valid_from).min(RING) as i32;
             tables[2 * s_count + i] = seq.position as i32;
         }
-        self.put(&w.h, &embed)?;
+        match anchors {
+            Anchors::Rows(anchor_rows) => {
+                let mut embed = Vec::with_capacity(rows * h * 2);
+                for i in 0..s_count {
+                    embed.extend_from_slice(&anchor_rows[i * h * 2..(i + 1) * h * 2]);
+                    for _ in 1..block {
+                        embed.extend_from_slice(&self.mask_row);
+                    }
+                }
+                self.put(&w.h, &embed)?;
+            }
+            Anchors::Tokens(embedding) => {
+                // Each block: the anchor, then the mask rows (an id past the table takes the mask row).
+                let ids: Vec<u32> = sequences.iter()
+                    .flat_map(|seq| std::iter::once(seq.anchor).chain(std::iter::repeat_n(MASK_ID, block - 1))).collect();
+                embedding.check(&sequences.iter().map(|seq| seq.anchor).collect::<Vec<_>>())?;
+                self.put(&w.ids, bytes_of(&ids))?;
+                // SAFETY: the ids are up (synchronous copy); `h` holds the block rows; the
+                // mask row is a live [hidden] BF16 buffer.
+                unsafe { embedding.embed_device_ids(w.ids.buffer, None, rows, 1,
+                    Some((self.mask_device.buffer.ptr.cast_const(), &self.mask_row)), w.h.buffer, self.stream)? };
+            }
+        }
         self.put(&w.positions, bytes_of(&positions))?;
         self.put(&w.tables, bytes_of(&tables))?;
         let (s, l, eps, inter) = (self.stream, self.library, c.eps, c.intermediate);
@@ -690,7 +740,7 @@ impl crate::families::glm5::dflash::ReplayDrafter for MimoDrafter<'_> {
     fn draft_tokens(&self, seqs: &[(usize, u32, usize)], anchor_rows: &[u8], head: *const c_void)
         -> Result<Vec<Vec<u32>>> {
         let seqs: Vec<DraftSeq> = seqs.iter().map(|&(slot, anchor, position)| DraftSeq { slot, anchor, position, valid_from: 0 }).collect();
-        Ok(self.draft(&seqs, anchor_rows, head)?.into_iter().map(|d| d.tokens).collect())
+        Ok(self.draft_rows(&seqs, anchor_rows, head)?.into_iter().map(|d| d.tokens).collect())
     }
 
     fn tap_rows(&self) -> usize {

@@ -48,6 +48,19 @@ pub(crate) struct MtpDrafter<'a> {
     pub cat: Dev<'a>,
     /// Per ring and stage: rows `0..ext` of the stage's ring hold true tokens.
     pub ext: std::cell::RefCell<Vec<Vec<usize>>>,
+    /// Token ids of a draft cycle (U32): a pass's known tokens (DECODE_ROWS),
+    /// then stage `k`'s draft of member `i` at `(1 + k) * DECODE_ROWS + i`.
+    pub ids: Dev<'a>,
+    /// A pass's row -> `ids` index (U32 [DECODE_ROWS]).
+    pub index: Dev<'a>,
+}
+
+/// The token a pass row embeds: known on the host, or an earlier stage's
+/// draft (still on the device) of the cycle's member `member`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Token {
+    Known(u32),
+    Draft { stage: usize, member: usize },
 }
 
 /// One sequence's MTP draft request: its ring, its length (`t_len` next) and
