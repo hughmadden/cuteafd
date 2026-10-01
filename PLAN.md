@@ -391,6 +391,17 @@ model needs them; GLM 5.3 official FP8 is out of scope — EXL3 and NVFP4
 quants cover it), S4 encoder service + multimodal input, S5 coordinator
 range split, S6 eight Sparks.
 
+**Spark-side reduction (measured and parked 2026-10-01, `work/spark-reduce`).**
+TP ranks reduce-scatter their routed partials by rows over an RC mesh between
+the Sparks (`expertd --reduce-rail`, SEND_WITH_IMM tagged per wave, FP32 sum in
+rank order) and each returns only its rows, so the coordinator lands one plane
+instead of N. Correct (sums bit-identical to the coordinator reduce, oracle
+cosine 0.999995, MiMo V2.6 Pro golden NLL unchanged at 2.4123), but MiMo V2.6
+Pro TP6 8K prefill gained only ~3% on one 200 Gb rail and ~9-12% on two: every
+rank waits for the slowest peer's slice, the exchange is bandwidth-bound
+(NCCL's ceiling on rhea+moa: ~20 GB/s per direction on two rails, ~11 on one),
+and it gets worse at 100 Gb. Coordinator-side intake and pipelining come first.
+
 Ongoing, any phase: engram/n-gram tables in host RAM now; Spark-RAM
 replicas and fabric-fed tables are explorations, kept behind options.
 
