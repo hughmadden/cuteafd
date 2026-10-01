@@ -46,8 +46,10 @@ impl ExpertProtocolV2Request {
         )
     }
 
+    /// [`Self::new`] with a shared payload (e.g. a view of a transport's
+    /// egress buffer), which is not copied.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_bytes(
+    pub fn new_bytes(
         request_id: u64,
         placement_version: u64,
         layer_id: u32,

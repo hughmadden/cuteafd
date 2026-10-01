@@ -276,6 +276,9 @@ pub(crate) struct MimoEngine<'a> {
     pub expert_input: ExpertInput,
     /// Host time per phase: GPU wait before the expert request, the Spark exchange.
     pub profile: RefCell<[f64; 2]>,
+    /// `CUTEAFD_MIMO_WAVE_TIMING=1`: one line per Spark wave with its host
+    /// phases (diagnostics; read once at construction).
+    wave_timing: bool,
     /// The DFlash drafter (V2.6 Pro's dflash/): every step taps its target layers.
     pub drafter: Option<super::dflash::MimoDrafter<'a>>,
     /// L2 prefetch of the next layer's weights during decode exchanges.
@@ -359,7 +362,8 @@ impl<'a> MimoEngine<'a> {
             split_family, peer: None, exchange: None, kv, cos_sin_full,
             cos_sin_swa, workspace: RefCell::new(None), decode_workspace: RefCell::new(None), experts: None,
             expert_input: ExpertInput::Fp8,
-            profile: RefCell::new([0.0; 2]), drafter: None, mtp: None, l2: None, embedding,
+            profile: RefCell::new([0.0; 2]),
+            wave_timing: std::env::var("CUTEAFD_MIMO_WAVE_TIMING").is_ok_and(|v| v == "1"), drafter: None, mtp: None, l2: None, embedding,
             mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20)?, 0)), prefill_w8a8: true })
     }
 
@@ -1366,11 +1370,15 @@ impl<'a> MimoEngine<'a> {
             ..host
         };
         let timer = std::time::Instant::now();
+        // Prefill rows go straight into the transport's registered egress
+        // buffer and out from there to every rank; small waves keep a copy.
+        let egress = transport.egress(wire_bytes)?;
         // SAFETY: the pinned regions are large enough; the sync completes them.
         unsafe {
             self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.stream)?;
             self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.stream)?;
-            self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), input.buffer, wire_bytes, self.stream)?;
+            let target = egress.unwrap_or(at(2 * route_bytes));
+            self.library.copy_d2h_host_buffer_async(target, input.buffer, wire_bytes, self.stream)?;
         }
         // In a decode step the L2 prefetch queues behind the copies; the host waits for the copies only.
         match self.l2.as_ref().filter(|_| decode) {
@@ -1382,15 +1390,20 @@ impl<'a> MimoEngine<'a> {
             // SAFETY: the engine owns this stream.
             None => unsafe { self.library.cuda_stream_synchronize(self.stream)? },
         }
-        self.profile.borrow_mut()[0] += timer.elapsed().as_secs_f64();
+        let gpu_wait = timer.elapsed().as_secs_f64();
+        self.profile.borrow_mut()[0] += gpu_wait;
+        let built = std::time::Instant::now();
         let staged = staging.bytes();
         let word = |offset: usize, i: usize| u32::from_le_bytes(staged[offset + i * 4..][..4].try_into().unwrap());
         let routes = (0..t * topk).map(|i| ExpertProtocolV2RouteEntry {
             row_index: (i / topk) as u32, expert_id: word(0, i), gate_weight: f32::from_bits(word(route_bytes, i)),
         }).collect();
-        let wire = staged[2 * route_bytes..2 * route_bytes + wire_bytes].to_vec();
+        let wire = match egress {
+            Some(_) => transport.egress_payload(wire_bytes)?,
+            None => staged[2 * route_bytes..2 * route_bytes + wire_bytes].to_vec().into(),
+        };
         drop(staging);
-        let mut request = ExpertProtocolV2Request::new(index as u64 + 1, 17, index as u32, h as u32, dtype,
+        let mut request = ExpertProtocolV2Request::new_bytes(index as u64 + 1, 17, index as u32, h as u32, dtype,
             (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
                 row_id: u64::from(row), source_kind: kind, source_request_id: 1,
                 token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32,
@@ -1399,12 +1412,17 @@ impl<'a> MimoEngine<'a> {
         request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         let ranks = transport.world_size();
         ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
+        let build = built.elapsed().as_secs_f64();
         let timer = std::time::Instant::now();
+        let mut dispatched = 0.0;
         runtime.block_on(async {
             let wave = transport.dispatch(&request)?;
+            dispatched = timer.elapsed().as_secs_f64();
             transport.receive(wave, t, self.stream).await
         })?;
-        self.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
+        let exchange = timer.elapsed().as_secs_f64();
+        self.profile.borrow_mut()[1] += exchange;
+        let reduced = std::time::Instant::now();
         // SAFETY: the zero plane and delta are live [t, h] BF16 buffers; the
         // intake planes are ordered after the wave by `receive`.
         unsafe {
@@ -1413,7 +1431,13 @@ impl<'a> MimoEngine<'a> {
                 self.push(0, slot, w.delta.buffer.ptr, t * h * 2)?;
             }
             // The next layer's request staging is rewritten only after this drains.
-            self.library.cuda_stream_synchronize(self.stream)
+            self.library.cuda_stream_synchronize(self.stream)?;
         }
+        if self.wave_timing {
+            eprintln!("mimo_wave layer={index} rows={t} gpu_wait_ms={:.3} build_ms={:.3} dispatch_ms={:.3} \
+                receive_ms={:.3} reduce_ms={:.3}", gpu_wait * 1e3, build * 1e3, dispatched * 1e3,
+                (exchange - dispatched) * 1e3, reduced.elapsed().as_secs_f64() * 1e3);
+        }
+        Ok(())
     }
 }

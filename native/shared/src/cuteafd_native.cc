@@ -447,6 +447,8 @@ struct CuteafdRdmaRcEndpointHandle {
   unsigned char* landing_ptr = nullptr;
   size_t landing_bytes = 0;
   size_t landing_header_bytes = 0;
+  // Host ranges sends may gather from (`cuteafd_rdma_rc_endpoint_register_region`).
+  std::vector<ibv_mr*> regions;
   uint32_t pending_send_completions = 0;
   uint32_t pending_recv_completions = 0;
   std::chrono::steady_clock::time_point busy_poll_until = {};
@@ -492,6 +494,10 @@ void destroy_rdma_rc_endpoint(CuteafdRdmaRcEndpointHandle* endpoint) {
   if (endpoint->landing_mr != nullptr) {
     ibv_dereg_mr(endpoint->landing_mr);
   }
+  for (ibv_mr* region : endpoint->regions) {
+    ibv_dereg_mr(region);
+  }
+  endpoint->regions.clear();
   if (endpoint->send_mr != nullptr) {
     ibv_dereg_mr(endpoint->send_mr);
   }
@@ -4053,6 +4059,85 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_copy_recv_at(
 extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_copy_recv(void* handle, void* out,
                                                             size_t out_bytes, size_t bytes) {
   return cuteafd_rdma_rc_endpoint_copy_recv_at(handle, out, out_bytes, 0, bytes);
+}
+
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_register_region(void* handle, void* ptr,
+                                                                size_t bytes, uint32_t* region) {
+  if (handle == nullptr || ptr == nullptr || region == nullptr || bytes == 0) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint region is invalid");
+  }
+#if CUTEAFD_NATIVE_ENABLE_RDMA
+  auto* endpoint = static_cast<CuteafdRdmaRcEndpointHandle*>(handle);
+  if (endpoint->regions.size() >= 64) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint has 64 regions already");
+  }
+  ibv_mr* mr = ibv_reg_mr(endpoint->pd, ptr, bytes, IBV_ACCESS_LOCAL_WRITE);
+  if (mr == nullptr) {
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "ibv_reg_mr failed for RC endpoint region");
+  }
+  endpoint->regions.push_back(mr);
+  *region = static_cast<uint32_t>(endpoint->regions.size() - 1);
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
+              "RDMA RC endpoint regions require CUTEAFD_ENABLE_RDMA=ON");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_post_send_slot_region(
+    void* handle, size_t slot_offset, size_t slot_bytes, uint32_t region, size_t region_offset,
+    size_t region_bytes, uint64_t wr_id) {
+  if (handle == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint handle is null");
+  }
+  if (slot_bytes == 0 || region_bytes == 0 ||
+      slot_bytes + region_bytes > std::numeric_limits<uint32_t>::max()) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint gathered send size is invalid");
+  }
+#if CUTEAFD_NATIVE_ENABLE_RDMA
+  auto* endpoint = static_cast<CuteafdRdmaRcEndpointHandle*>(handle);
+  if (slot_bytes + region_bytes > endpoint->send_frame_bytes) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                "RDMA RC endpoint send bytes exceed frame capacity");
+  }
+  if (slot_offset > endpoint->send_registered_span_bytes ||
+      slot_bytes > endpoint->send_registered_span_bytes - slot_offset) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                "RDMA RC endpoint send slot exceeds registered span");
+  }
+  if (region >= endpoint->regions.size()) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint region is not registered");
+  }
+  ibv_mr* mr = endpoint->regions[region];
+  if (region_offset > mr->length || region_bytes > mr->length - region_offset) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint send exceeds its region");
+  }
+  ibv_sge sge[2] = {};
+  sge[0].addr = reinterpret_cast<uintptr_t>(endpoint->send_buffer + slot_offset);
+  sge[0].length = static_cast<uint32_t>(slot_bytes);
+  sge[0].lkey = endpoint->send_mr->lkey;
+  sge[1].addr = reinterpret_cast<uintptr_t>(mr->addr) + region_offset;
+  sge[1].length = static_cast<uint32_t>(region_bytes);
+  sge[1].lkey = mr->lkey;
+  ibv_send_wr wr = {};
+  wr.wr_id = wr_id;
+  wr.sg_list = sge;
+  wr.num_sge = 2;
+  wr.opcode = IBV_WR_SEND;
+  wr.send_flags = IBV_SEND_SIGNALED;
+  ibv_send_wr* bad = nullptr;
+  if (ibv_post_send(endpoint->qp, &wr, &bad) != 0) {
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "ibv_post_send failed for a gathered RC send");
+  }
+  return ok();
+#else
+  (void)slot_offset;
+  (void)region;
+  (void)region_offset;
+  (void)wr_id;
+  return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
+              "RDMA RC endpoint regions require CUTEAFD_ENABLE_RDMA=ON");
+#endif
 }
 
 extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_destroy(void* handle) {

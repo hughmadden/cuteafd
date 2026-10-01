@@ -363,8 +363,9 @@ prefill 1.08x EXL3 (W4A4 1.36x), 1.6K 0.96x (W4A4 1.33x). W4A4 costs
 TJ. S2: GLM 5.3 Flash NVFP4 dense MLPs run natively (one-expert
 `fp8-glmfdense-nvfp4`): nvidia/GLM-5.3-Flash-NVFP4 serves alone (NLL 2.3896);
 GLM 5.3's per-tensor FP8 dense layers are the same bytes under a uniform
-block grid and its BF16 parts quantize to FP8 blocks at load (6-Spark gate
-pending). Open: W4A16 stream efficiency (GB10 4096 rows 14.3 ms/layer TP4 vs
+block grid and its BF16 parts quantize to FP8 blocks at load: nvidia/GLM-5.3-NVFP4
+serves on six Sparks (TP6 W4A16: NLL 2.4814 / KL 0.0571 vs golden 2.4677; 8K
+prefill 4.22 s, W4A4 3.20 s). Open: W4A16 stream efficiency (GB10 4096 rows 14.3 ms/layer TP4 vs
 EXL3 9.1), SM121 route thresholds, BF16 MLA programs (vs FP8 at load).
 
 **Phase 6 — placement planner (design 2026-09-30).** One planner for every
@@ -409,7 +410,13 @@ Spark-bound) and DeepSeek V4 (4 Sparks, all experts remote: Flash decode -10%,
 Pro decode -12%, prefill neutral). Shared plumbing in `shared/peer_split.rs`: per-slot release flags,
 partials exchanged and summed in the same operand order on both GPUs (identical
 residual streams), GPU1 queued a layer ahead of GPU0's Spark exchange, decode
-graphs captured per GPU. The layer-range split is not needed for these three.
+graphs captured per GPU. The layer-range split is not needed for these three. V4.1 Flash re-measured on p8 images (2 RTX + Sparks, code,
+dSpark on): its TP2 modes still lose (C1 187 -> 170 tok/s for TP2_ATTENTION and for
+TP2 q+o projections; C4 501 -> 466 / 482). Each projection there ends in a
+cross-device event and a host wait, so a gain needs V4.1's per-layer flow rebuilt
+around device-side flags. The attention-only ceiling is about the DeepSeek V4 Flash
+split (-10%, all experts remote), and less with RTX-resident expert layers, so
+V4.1 keeps its layer split.
 The drafter follows the GPU that owns the last backbone layers (taps and head
 live there); TP2 drafters are ≤1% on DFlash2 and not built unless the P2P
 probe shows ≤15 µs hops; the win is lane B drafting on GPU1 while lane A
@@ -422,6 +429,17 @@ generic engines + GPU1 as expert host, S3 EP subsets (only if a quantized
 model needs them; GLM 5.3 official FP8 is out of scope — EXL3 and NVFP4
 quants cover it), S4 encoder service + multimodal input, S5 coordinator
 range split, S6 eight Sparks.
+
+**Spark-side reduction (measured and parked 2026-10-01, `work/spark-reduce`).**
+TP ranks reduce-scatter their routed partials by rows over an RC mesh between
+the Sparks (`expertd --reduce-rail`, SEND_WITH_IMM tagged per wave, FP32 sum in
+rank order) and each returns only its rows, so the coordinator lands one plane
+instead of N. Correct (sums bit-identical to the coordinator reduce, oracle
+cosine 0.999995, MiMo V2.6 Pro golden NLL unchanged at 2.4123), but MiMo V2.6
+Pro TP6 8K prefill gained only ~3% on one 200 Gb rail and ~9-12% on two: every
+rank waits for the slowest peer's slice, the exchange is bandwidth-bound
+(NCCL's ceiling on rhea+moa: ~20 GB/s per direction on two rails, ~11 on one),
+and it gets worse at 100 Gb. Coordinator-side intake and pipelining come first.
 
 Ongoing, any phase: engram/n-gram tables are memory-mapped from the
 checkpoint (`formats::mapped_table` + daemon `shared::mapped_table`: page

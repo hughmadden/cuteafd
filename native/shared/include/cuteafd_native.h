@@ -520,6 +520,13 @@ cuteafd_status_t cuteafd_rdma_rc_endpoint_copy_recv(void* handle, void* out, siz
                                                  size_t bytes);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_copy_recv_at(void* handle, void* out, size_t out_bytes,
                                                    size_t offset_bytes, size_t bytes);
+// Zero-copy egress: host ranges registered on the endpoint's protection domain;
+// a send gathers its header from a send-ring slot and its payload from a region.
+cuteafd_status_t cuteafd_rdma_rc_endpoint_register_region(void* handle, void* ptr, size_t bytes,
+                                                      uint32_t* region);
+cuteafd_status_t cuteafd_rdma_rc_endpoint_post_send_slot_region(
+    void* handle, size_t slot_offset, size_t slot_bytes, uint32_t region, size_t region_offset,
+    size_t region_bytes, uint64_t wr_id);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_destroy(void* handle);
 
 cuteafd_status_t cuteafd_cuda_rmsnorm_f32(const float* x, const float* weight, float* out,
