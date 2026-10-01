@@ -58,9 +58,14 @@ async fn main() -> Result<()> {
         Commands::Fabric(args) => {
             let report = cuteafd_transport::fabric::discover()?;
             let landing = shared::spark_intake::fabric_probe(args.native_lib.as_deref(), args.device);
+            let p2p = args.p2p.then(|| shared::peer_probe::run(args.native_lib.as_deref(), &args.p2p_devices,
+                &args.p2p_bytes));
             if args.json {
                 let mut value = serde_json::to_value(&report)?;
                 value["gpu_landing"] = serde_json::to_value(&landing)?;
+                if let Some(p2p) = &p2p {
+                    value["p2p"] = serde_json::to_value(p2p)?;
+                }
                 println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 for port in &report.ports {
@@ -79,6 +84,9 @@ async fn main() -> Result<()> {
                 }
                 println!("{}", report.summary());
                 println!("{}", landing.summary());
+                if let Some(p2p) = &p2p {
+                    print!("{}", p2p.table());
+                }
             }
             Ok(())
         }

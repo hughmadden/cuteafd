@@ -289,6 +289,7 @@ if(CUTEAFD_ENABLE_CUDA)
     families/deepseek_v41/cuda/v41_kv.cu
     families/deepseek_v41/cuda/v41_sparse_attention.cu
     shared/cuda/peer_copy.cu
+    shared/cuda/peer_exchange.cu
     families/deepseek_v41/cuda/v41_index_scores.cu
     families/deepseek_v41/cuda/v41_index_topk.cu
     families/deepseek_v41/cuda/v41_candidate_blocks.cu
