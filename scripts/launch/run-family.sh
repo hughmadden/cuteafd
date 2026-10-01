@@ -184,6 +184,21 @@ addr="$(get ADDR 0.0.0.0:8000)"
 ranks="$(get SPARK_COUNT 4)"
 budget="$(get SPARK_DEVICE_BUDGET_BYTES 107374182400)"
 gpu="$(get COORDINATOR_GPU 0)"
+# COORDINATOR_SPLIT=heads (MiMo V2.6 Pro): every layer's attention heads and dense MLP
+# split over COORDINATOR_GPU and COORDINATOR_SPLIT_GPU (default the other of 0/1), one
+# hidden all-reduce per layer over peer memory; experts, router, head and drafter stay
+# on the lower-numbered GPU of the two (the container sees both, in host order).
+gpus="device=$gpu"
+case "$(get COORDINATOR_SPLIT off)" in
+  off) ;;
+  heads)
+    [[ $family == mimo_v2 ]] || { echo "COORDINATOR_SPLIT=heads applies to MiMo V2.6 Pro" >&2; exit 2; }
+    second="$(get COORDINATOR_SPLIT_GPU $((1 - gpu)))"
+    [[ "$second" != "$gpu" ]] || { echo "COORDINATOR_SPLIT_GPU must differ from COORDINATOR_GPU" >&2; exit 2; }
+    gpus="\"device=$gpu,$second\""
+    family_args+=(--device 0 --split-device 1) ;;
+  *) echo "COORDINATOR_SPLIT must be off or heads" >&2; exit 2 ;;
+esac
 peers=()
 # --restart removes this launcher's containers (stop.sh's release parser rejects
 # the keys above, e.g. SPECULATOR).
@@ -225,7 +240,7 @@ peer_csv="$(IFS=,; echo "${peers[*]}")"
 # or host; see rust/crates/cuteafd-daemon/src/shared/spark_intake.rs).
 intake="$(get SPARK_INTAKE auto)"
 case "$intake" in auto|gpu|pinned|host) ;; *) echo "SPARK_INTAKE must be auto, gpu, pinned or host" >&2; exit 2 ;; esac
-docker run -d --name cuteafd-coordinator --restart no --gpus "device=$gpu" --network host --ipc host \
+docker run -d --name cuteafd-coordinator --restart no --gpus "$gpus" --network host --ipc host \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e "CUTEAFD_SPARK_INTAKE=$intake" \
   -v "$hub:/root/.cache/huggingface/hub:ro" \
   "${trace_args[@]}" "$coordinator_image" cuteafd $serve --snapshot "$snapshot" \

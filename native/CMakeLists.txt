@@ -46,7 +46,7 @@ option(CUTEAFD_ENABLE_DSV4_AOT "Build the DeepSeek V4 coordinator programs" OFF)
 option(CUTEAFD_ENABLE_GLM_AOT "Build the GLM 5.x coordinator programs (same table as DeepSeek V4)" OFF)
 option(CUTEAFD_ENABLE_MIMO_AOT "Build the MiMo V2 coordinator programs (same table as DeepSeek V4)" OFF)
 set(CUTEAFD_MIMO_GEOMETRIES "mimo" CACHE STRING
-  "MiMo program geometries with CUTEAFD_ENABLE_MIMO_AOT: mimo (V2 Flash), mimop (V2.6 Pro)")
+  "MiMo program geometries with CUTEAFD_ENABLE_MIMO_AOT: mimo (V2 Flash), mimop (V2.6 Pro), mimop2 (V2.6 Pro head split)")
 option(CUTEAFD_ENABLE_GLMF_AOT "Build the GLM 5.3 Flash coordinator programs (same table as DeepSeek V4)" OFF)
 option(CUTEAFD_ENABLE_QWEN4_AOT "Build the Qwen 3.8 Flash Next coordinator programs (same table as DeepSeek V4)" OFF)
 set(CUTEAFD_DSV4_GEOMETRY "flash,pro" CACHE STRING "DeepSeek V4 program geometries, comma-separated: flash, pro")

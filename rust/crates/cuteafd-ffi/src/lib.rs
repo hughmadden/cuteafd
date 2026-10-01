@@ -2144,6 +2144,23 @@ impl NativeLibrary {
         self.status_to_result("cuteafd_copy_d2h_async", status)
     }
 
+    /// Copies `rows` rows of `width_bytes` between pitched device buffers
+    /// (`cudaMemcpy2DAsync`; with peer access the two may live on different GPUs).
+    ///
+    /// # Safety
+    /// Both buffers are live, cover their pitched spans (checked natively),
+    /// do not overlap, and stay untouched by other work until `cuda_stream`
+    /// reaches the copy; the stream belongs to the current device.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn copy_d2d_2d_async(&self, dst: CuteafdDeviceBuffer, dst_pitch_bytes: usize, src: CuteafdDeviceBuffer,
+        src_pitch_bytes: usize, width_bytes: usize, rows: usize, cuda_stream: *mut c_void) -> Result<()> {
+        type F = unsafe extern "C" fn(CuteafdDeviceBuffer, usize, CuteafdDeviceBuffer, usize, usize, usize, *mut c_void)
+            -> CuteafdStatus;
+        let copy_fn: Symbol<F> = unsafe { self.lib.get(b"cuteafd_copy_d2d_2d_async")? };
+        let status = unsafe { copy_fn(dst, dst_pitch_bytes, src, src_pitch_bytes, width_bytes, rows, cuda_stream) };
+        self.status_to_result("cuteafd_copy_d2d_2d_async", status)
+    }
+
     pub unsafe fn copy_d2d_async(
         &self,
         dst: CuteafdDeviceBuffer,

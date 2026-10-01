@@ -33,6 +33,9 @@ use std::os::unix::fs::FileExt;
 pub(crate) struct MimoLayer<'a> {
     pub attention: MimoAttention,
     pub dense: bool,
+    /// One GPU's share of a head split: its qkv/attention/o_proj cover its heads
+    /// (o_proj and the dense MLP produce partial sums) and run the split programs.
+    pub split: bool,
     operands: HashMap<&'static str, DeviceAllocation<'a>>,
 }
 
@@ -92,6 +95,43 @@ pub(crate) struct MimoLoader<'a> {
     pub fp8_o_proj: bool,
     /// Scale rule of copies quantized from BF16 (o_proj, the LM head).
     pub fp8_scales: crate::shared::fp8_linear::Fp8Scales,
+    /// This loader's device (rank 0 of a head split).
+    pub device: i32,
+    /// The other GPUs of a head split, ranks 1.. (empty: one GPU).
+    pub peers: Vec<RankDevice>,
+}
+
+/// One GPU of a head split: its device and the stream its load kernels run on.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RankDevice {
+    pub device: i32,
+    pub stream: *mut c_void,
+}
+
+/// How a head split slices a 2-D weight: by output rows or by input columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Axis {
+    Rows,
+    Cols,
+}
+
+/// `part` of `ranks` equal slices of a row-major `[rows, cols]` tensor of
+/// `elem`-byte elements along `axis`, as contiguous bytes.
+fn slice_2d(bytes: &[u8], rows: usize, cols: usize, elem: usize, axis: Axis, part: usize, ranks: usize) -> Vec<u8> {
+    match axis {
+        Axis::Rows => {
+            let n = rows / ranks;
+            bytes[part * n * cols * elem..(part + 1) * n * cols * elem].to_vec()
+        }
+        Axis::Cols => {
+            let n = cols / ranks;
+            let mut out = Vec::with_capacity(rows * n * elem);
+            for row in bytes.chunks_exact(cols * elem) {
+                out.extend_from_slice(&row[part * n * elem..(part + 1) * n * elem]);
+            }
+            out
+        }
+    }
 }
 
 /// Scale-grid row of every weight row: uniform 128-row blocks, or per
@@ -330,20 +370,30 @@ impl<'a> MimoLoader<'a> {
     /// `cfg.qkv_key_stride()` rows apart (256: each 192-row key zero-padded):
     /// the E4M3 rows and FP32 per-row x 128-K scales, row major and K-block
     /// major (exactly the checkpoint's values; padding rows keep zero values and scales).
-    fn fused_qkv(&self, cfg: &MimoV2Config, attention: MimoAttention, name: &str) -> Result<Fp8Copy<'a>> {
-        let layout = FusedQkvLayout::new(cfg, attention, self.checkpoint_tp)?;
+    /// Over `ranks` GPUs (a head split), rank `r` takes checkpoint shards
+    /// `r * tp / ranks ..`: its query heads and the KV heads they read, in the
+    /// same layout at its share's geometry. Read once, one copy per rank.
+    fn fused_qkv(&self, cfg: &MimoV2Config, attention: MimoAttention, name: &str, ranks: usize)
+        -> Result<Vec<Fp8Copy<'a>>> {
+        let full = FusedQkvLayout::new(cfg, attention, self.checkpoint_tp)?;
+        ensure!(self.checkpoint_tp % ranks == 0, "{name}: checkpoint TP {} does not split over {ranks} GPUs",
+            self.checkpoint_tp);
+        let share = cfg.head_split(ranks)?;
+        let layout = FusedQkvLayout::new(&share, attention, self.checkpoint_tp / ranks)?;
+        ensure!(layout.rows() * ranks == full.rows() && layout.scale_rows() * ranks == full.scale_rows(),
+            "{name}: checkpoint shards do not divide into {ranks} head groups");
         let source_bytes = self.tensor(name)?.meta.byte_length as usize;
         let (scale, scale_dtype, scale_shape) = self.raw(&format!("{name}_scale_inv"))?;
-        let stride = cfg.qkv_key_stride();
+        let stride = share.qkv_key_stride();
         let width = layout.padded_rows(stride);
-        let cols = source_bytes / layout.rows().max(1);
+        let cols = source_bytes / full.rows().max(1);
         crate::shared::memory::staging::with_staging_pair(width * cols, source_bytes, |values, bytes| {
             let (_, dtype, shape) = self.read_into(name, bytes, 0)?;
             let k_blocks = cols.div_ceil(128);
-            ensure!(dtype == DType::F8E4M3 && shape == [layout.rows(), cols] && scale_dtype == DType::F32
-                && scale_shape == [layout.scale_rows(), k_blocks] && cols % 128 == 0,
+            ensure!(dtype == DType::F8E4M3 && shape == [full.rows(), cols] && scale_dtype == DType::F32
+                && scale_shape == [full.scale_rows(), k_blocks] && cols % 128 == 0,
                 "{name}: expected E4M3 [{}, {cols}] with FP32 [{}, {}] scales for checkpoint TP {}, found {dtype:?} \
-                 {shape:?} / {scale_dtype:?} {scale_shape:?}", layout.rows(), layout.scale_rows(), k_blocks,
+                 {shape:?} / {scale_dtype:?} {scale_shape:?}", full.rows(), full.scale_rows(), k_blocks,
                 self.checkpoint_tp);
             let segments = if stride == layout.k {
                 layout.segments()
@@ -353,24 +403,152 @@ impl<'a> MimoLoader<'a> {
                 layout.segments_with_key_stride(stride)
             };
             let grid: Vec<f32> = scale.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-            // The padded E4M3 rows and each row's shard-grid scales; padding rows are zero.
-            let mut covered = vec![false; width];
-            let mut row_scales = vec![0f32; width * k_blocks];
-            for segment in &segments {
-                values[segment.dest_row * cols..][..segment.rows * cols]
-                    .copy_from_slice(&bytes[segment.source_row * cols..][..segment.rows * cols]);
-                covered[segment.dest_row..segment.dest_row + segment.rows].fill(true);
-                for r in 0..segment.rows {
-                    row_scales[(segment.dest_row + r) * k_blocks..][..k_blocks]
-                        .copy_from_slice(&grid[(segment.scale_row + r / 128) * k_blocks..][..k_blocks]);
+            (0..ranks).map(|rank| {
+                // This rank's shards: a contiguous run of checkpoint rows and grid rows.
+                let (source0, scale0) = (rank * layout.rows(), rank * layout.scale_rows());
+                // The padded E4M3 rows and each row's shard-grid scales; padding rows are zero.
+                let mut covered = vec![false; width];
+                let mut row_scales = vec![0f32; width * k_blocks];
+                for segment in &segments {
+                    values[segment.dest_row * cols..][..segment.rows * cols]
+                        .copy_from_slice(&bytes[(source0 + segment.source_row) * cols..][..segment.rows * cols]);
+                    covered[segment.dest_row..segment.dest_row + segment.rows].fill(true);
+                    for r in 0..segment.rows {
+                        row_scales[(segment.dest_row + r) * k_blocks..][..k_blocks]
+                            .copy_from_slice(&grid[(scale0 + segment.scale_row + r / 128) * k_blocks..][..k_blocks]);
+                    }
+                }
+                for (row, _) in covered.iter().enumerate().filter(|(_, &c)| !c) {
+                    values[row * cols..(row + 1) * cols].fill(0);
+                }
+                self.on_rank(rank, |_| Ok(Fp8Copy { values: self.upload(values)?,
+                    scale: self.upload(&f32_bytes(&row_scales))?, kscale: self.upload(&kmajor(&row_scales, k_blocks))? }))
+            }).collect()
+        })
+    }
+
+    /// GPUs of the head split this loader fills (1: no split).
+    pub fn ranks(&self) -> usize {
+        1 + self.peers.len()
+    }
+
+    /// Runs `body` with rank `rank`'s device current and its load stream.
+    fn on_rank<T>(&self, rank: usize, body: impl FnOnce(*mut c_void) -> Result<T>) -> Result<T> {
+        if rank == 0 {
+            return body(self.stream);
+        }
+        let peer = self.peers.get(rank - 1).with_context(|| format!("no rank {rank}"))?;
+        self.library.cuda_set_device(peer.device)?;
+        let out = body(peer.stream);
+        self.library.cuda_set_device(self.device)?;
+        out
+    }
+
+    /// The BF16 o_proj `[H, heads * v_head]` sliced by columns over `ranks`
+    /// (rank `r`'s heads), each with its per-row x 128-K E4M3 copy when `fp8`
+    /// (the same blocks as the whole weight's: slices are whole 128-K blocks).
+    #[allow(clippy::type_complexity)]
+    fn o_proj(&self, name: &str, fp8: bool, ranks: usize)
+        -> Result<Vec<(DeviceAllocation<'a>, Option<(DeviceAllocation<'a>, DeviceAllocation<'a>)>)>> {
+        let tensor = self.tensor(name)?;
+        if ranks == 1 && tensor.meta.dtype != DType::Bf16 {
+            return Ok(vec![self.rows_fp8(&[name.to_string()], fp8)?]);
+        }
+        let shape = tensor.meta.shape.clone();
+        ensure!(tensor.meta.dtype == DType::Bf16 && shape.len() == 2 && (ranks == 1 || shape[1] % (ranks * 128) == 0),
+            "{name}: a head split takes o_proj as BF16 [H, K] with K a multiple of {}, found {:?} {shape:?}",
+            ranks * 128, tensor.meta.dtype);
+        let (rows, cols) = (shape[0], shape[1] / ranks);
+        // The whole weight goes up once to rank 0; each rank's columns are a pitched
+        // device copy from it (over peer memory for the others).
+        let whole = crate::shared::memory::staging::with_staging(tensor.meta.byte_length as usize, |bytes| {
+            self.read_into(name, bytes, 0)?;
+            self.upload(bytes)
+        })?;
+        let mut whole = Some(whole);
+        let out = (0..ranks).map(|rank| {
+            self.on_rank(rank, |stream| {
+                if ranks == 1 {
+                    // One GPU: the uploaded weight itself.
+                    let out = whole.take().context("o_proj")?;
+                    let copy = if fp8 { Some(self.quantize_rows(&out, rows, cols, stream)?) } else { None };
+                    return Ok((out, copy));
+                }
+                let whole = whole.as_ref().context("o_proj")?;
+                let out = DeviceAllocation::new(self.library, rows * cols * 2)?;
+                let source = CuteafdDeviceBuffer {
+                    // SAFETY: column block `rank` of every row lies inside the whole weight.
+                    ptr: unsafe { whole.buffer.ptr.cast::<u8>().add(rank * cols * 2) }.cast(),
+                    bytes: whole.buffer.bytes - rank * cols * 2,
+                    ..whole.buffer
+                };
+                // SAFETY: both buffers are live and sized for these pitched spans; peer access to
+                // rank 0 is enabled on every rank (the engine's split setup), drained below.
+                unsafe {
+                    self.library.copy_d2d_2d_async(out.buffer, cols * 2, source, shape[1] * 2, cols * 2, rows, stream)?;
+                }
+                let copy = if fp8 { Some(self.quantize_rows(&out, rows, cols, stream)?) } else { None };
+                // SAFETY: the loader owns this stream; the copy reads `whole`, which drops after.
+                unsafe { self.library.cuda_stream_synchronize(stream)? };
+                Ok((out, copy))
+            })
+        }).collect();
+        drop(whole);
+        out
+    }
+
+    /// The per-row x 128-K E4M3 copy of BF16 `[rows, cols]` on the current device,
+    /// quantized on `stream` and drained.
+    fn quantize_rows(&self, bf16: &DeviceAllocation<'a>, rows: usize, cols: usize, stream: *mut c_void)
+        -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
+        let (q, s) = (DeviceAllocation::new(self.library, rows * cols)?,
+            DeviceAllocation::new(self.library, rows * cols.div_ceil(128) * 4)?);
+        // SAFETY: the BF16 rows and their E4M3 / scale destinations are live on this device;
+        // the stream drains before return.
+        unsafe {
+            self.library.fp8_quant_rule(bf16.buffer.ptr, q.buffer.ptr, s.buffer.ptr, rows, cols, true,
+                self.fp8_scales.code(), stream)?;
+            self.library.cuda_stream_synchronize(stream)?;
+        }
+        Ok((q, s))
+    }
+
+    /// The FP8 checkpoint weights `names` concatenated by rows (as
+    /// `fp8_kmajor`), each sliced over `ranks` along `axis` (whole 128-row or
+    /// 128-K blocks, so every slice keeps exactly its grid values).
+    fn fp8_split(&self, names: &[String], axis: Axis, ranks: usize) -> Result<Vec<Fp8Copy<'a>>> {
+        if ranks == 1 {
+            return Ok(vec![self.fp8_kmajor(names)?]);
+        }
+        let tensors = names.iter().map(|name| -> Result<_> {
+            let (bytes, dtype, shape) = self.raw(name)?;
+            let (scale, scale_dtype, scale_shape) = self.raw(&format!("{name}_scale_inv"))?;
+            ensure!(dtype == DType::F8E4M3 && shape.len() == 2 && scale_dtype == DType::F32
+                && scale_shape == [shape[0].div_ceil(128), shape[1].div_ceil(128)]
+                && shape[if axis == Axis::Rows { 0 } else { 1 }] % (ranks * 128) == 0 && shape[1] % 128 == 0,
+                "{name}: a head split takes this weight as E4M3 with 128x128 FP32 blocks split into whole blocks, \
+                 found {dtype:?} {shape:?} / {scale_dtype:?} {scale_shape:?}");
+            let grid: Vec<f32> = scale.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+            Ok((bytes, shape, grid))
+        }).collect::<Result<Vec<_>>>()?;
+        (0..ranks).map(|rank| {
+            let (mut values, mut row_scales, mut k_blocks) = (Vec::new(), Vec::new(), 0);
+            for (bytes, shape, grid) in &tensors {
+                let (rows, cols) = (shape[0], shape[1]);
+                let kb = cols / 128;
+                values.extend(slice_2d(bytes, rows, cols, 1, axis, rank, ranks));
+                let (first, count, kb0, kbn) = match axis {
+                    Axis::Rows => (rank * rows / ranks, rows / ranks, 0, kb),
+                    Axis::Cols => (0, rows, rank * kb / ranks, kb / ranks),
+                };
+                k_blocks = kbn;
+                for r in first..first + count {
+                    row_scales.extend_from_slice(&grid[(r / 128) * kb + kb0..][..kbn]);
                 }
             }
-            for (row, _) in covered.iter().enumerate().filter(|(_, &c)| !c) {
-                values[row * cols..(row + 1) * cols].fill(0);
-            }
-            Ok(Fp8Copy { values: self.upload(values)?, scale: self.upload(&f32_bytes(&row_scales))?,
-                kscale: self.upload(&kmajor(&row_scales, k_blocks))? })
-        })
+            self.on_rank(rank, |_| Ok(Fp8Copy { values: self.upload(&values)?, scale: self.upload(&f32_bytes(&row_scales))?,
+                kscale: self.upload(&kmajor(&row_scales, k_blocks))? }))
+        }).collect()
     }
 
     fn one(&self, name: &str) -> Result<DeviceAllocation<'a>> {
@@ -402,17 +580,20 @@ impl<'a> MimoLoader<'a> {
         self.upload(&out)
     }
 
-    pub fn layer(&self, cfg: &MimoV2Config, layer: usize) -> Result<MimoLayer<'a>> {
+    /// Layer `layer`, one share per rank of this loader's head split (one
+    /// element without a split).
+    pub fn layer(&self, cfg: &MimoV2Config, layer: usize) -> Result<Vec<MimoLayer<'a>>> {
         self.block(cfg, &format!("model.layers.{layer}"), cfg.attention[layer], cfg.dense[layer],
-            "post_attention_layernorm")
+            "post_attention_layernorm", self.ranks())
     }
 
     /// MTP layer `k` (`model.mtp.layers.{k}`): an SWA decoder layer with a
-    /// dense MLP (`pre_mlp_layernorm` is its post-attention norm).
+    /// dense MLP (`pre_mlp_layernorm` is its post-attention norm). Whole, on
+    /// this loader's GPU (rank 0), under a head split too.
     pub fn mtp_layer(&self, cfg: &MimoV2Config, k: usize) -> Result<MimoLayer<'a>> {
-        let layer = self.block(cfg, &format!("model.mtp.layers.{k}"), MimoAttention::Sliding, true, "pre_mlp_layernorm");
+        let layer = self.block(cfg, &format!("model.mtp.layers.{k}"), MimoAttention::Sliding, true, "pre_mlp_layernorm", 1);
         crate::shared::memory::staging::release_staging();
-        layer
+        Ok(layer?.remove(0))
     }
 
     /// One MTP block's extra weights: `eh_proj` (BF16 [H, 2H]), `enorm`,
@@ -423,33 +604,47 @@ impl<'a> MimoLoader<'a> {
             self.one(&format!("{p}.hnorm.weight"))?, self.one(&format!("{p}.final_layernorm.weight"))?])
     }
 
-    fn block(&self, cfg: &MimoV2Config, p: &str, attention: MimoAttention, dense: bool, post: &str)
-        -> Result<MimoLayer<'a>> {
+    /// One decoder block, one share per rank over `ranks` GPUs: rank `r` holds
+    /// its heads' qkv rows, sinks and o_proj columns and its slice of the dense
+    /// MLP's intermediate; every rank the norms; rank 0 the router.
+    fn block(&self, cfg: &MimoV2Config, p: &str, attention: MimoAttention, dense: bool, post: &str, ranks: usize)
+        -> Result<Vec<MimoLayer<'a>>> {
         let layer = p;
-        let mut ops: HashMap<&'static str, DeviceAllocation<'a>> = HashMap::new();
-        ops.insert("input_norm", self.one(&format!("{p}.input_layernorm.weight"))?);
-        ops.insert("post_norm", self.one(&format!("{p}.{post}.weight"))?);
-        let fused = format!("{p}.self_attn.qkv_proj.weight");
-        let qkv = [format!("{p}.self_attn.q_proj.weight"), format!("{p}.self_attn.k_proj.weight"),
-            format!("{p}.self_attn.v_proj.weight")];
-        // `w_o` (BF16 in the release) plus, for decode rows, its per-row FP8 copy.
-        let both = |ops: &mut HashMap<&'static str, DeviceAllocation<'a>>, key: &'static str, names: &[String],
-            fp8: bool| -> Result<()> {
-            let (bf16, copy) = self.rows_fp8(names, fp8)?;
-            ops.insert(key, bf16);
-            if let Some((q, s)) = copy {
-                let (q_key, s_key) = match key {
-                    "w_o" => ("w_o_fp8", "w_o_scale"),
-                    other => anyhow::bail!("{other} has no BF16 + FP8 layout"),
-                };
-                ops.insert(q_key, q);
-                ops.insert(s_key, s);
+        let mut ops: Vec<HashMap<&'static str, DeviceAllocation<'a>>> = (0..ranks).map(|_| HashMap::new()).collect();
+        // Small BF16 operands: read once, every rank's slice (`Some(axis)`) or a copy.
+        let small = |ops: &mut Vec<HashMap<&'static str, DeviceAllocation<'a>>>, key: &'static str, name: &str,
+            split: bool| -> Result<()> {
+            let (bytes, _, _) = self.raw(name)?;
+            ensure!(!split || bytes.len() % ranks == 0, "{name} does not split over {ranks} GPUs");
+            for (rank, map) in ops.iter_mut().enumerate() {
+                let part = if split { &bytes[rank * bytes.len() / ranks..(rank + 1) * bytes.len() / ranks] } else { &bytes };
+                map.insert(key, self.on_rank(rank, |_| self.upload(part))?);
             }
             Ok(())
         };
-        let copy = if self.has(&fused) { self.fused_qkv(cfg, attention, &fused)? } else { self.fp8_kmajor(&qkv)? };
-        copy.insert(&mut ops, ["w_qkv_fp8", "w_qkv_scale", "w_qkv_kscale"]);
-        both(&mut ops, "w_o", &[format!("{p}.self_attn.o_proj.weight")], self.fp8_decode && self.fp8_o_proj)?;
+        small(&mut ops, "input_norm", &format!("{p}.input_layernorm.weight"), false)?;
+        small(&mut ops, "post_norm", &format!("{p}.{post}.weight"), false)?;
+        let fused = format!("{p}.self_attn.qkv_proj.weight");
+        let qkv = [format!("{p}.self_attn.q_proj.weight"), format!("{p}.self_attn.k_proj.weight"),
+            format!("{p}.self_attn.v_proj.weight")];
+        let copies = if self.has(&fused) {
+            self.fused_qkv(cfg, attention, &fused, ranks)?
+        } else {
+            ensure!(ranks == 1, "{layer}: a head split needs the fused qkv_proj layout (MiMo V2.6 Pro)");
+            vec![self.fp8_kmajor(&qkv)?]
+        };
+        for (map, copy) in ops.iter_mut().zip(copies) {
+            copy.insert(map, ["w_qkv_fp8", "w_qkv_scale", "w_qkv_kscale"]);
+        }
+        // `w_o` (BF16 in the release) plus, for decode rows, its per-row FP8 copy.
+        let o = self.o_proj(&format!("{p}.self_attn.o_proj.weight"), self.fp8_decode && self.fp8_o_proj, ranks)?;
+        for (map, (bf16, copy)) in ops.iter_mut().zip(o) {
+            map.insert("w_o", bf16);
+            if let Some((q, s)) = copy {
+                map.insert("w_o_fp8", q);
+                map.insert("w_o_scale", s);
+            }
+        }
         let sinks = match attention {
             MimoAttention::Full => cfg.full_sinks,
             MimoAttention::Sliding => cfg.swa_sinks,
@@ -457,35 +652,48 @@ impl<'a> MimoLoader<'a> {
         ensure!(sinks == (attention == MimoAttention::Sliding),
             "layer {layer}: the mimo programs take sinks on SWA layers only");
         if sinks {
-            ops.insert("sinks", self.one(&format!("{p}.self_attn.attention_sink_bias"))?);
+            small(&mut ops, "sinks", &format!("{p}.self_attn.attention_sink_bias"), true)?;
         }
         if dense {
-            self.fp8_kmajor(&[format!("{p}.mlp.gate_proj.weight"), format!("{p}.mlp.up_proj.weight")])?
-                .insert(&mut ops, ["w_gate_up_fp8", "w_gate_up_scale", "w_gate_up_kscale"]);
-            self.fp8_kmajor(&[format!("{p}.mlp.down_proj.weight")])?
-                .insert(&mut ops, ["w_down_fp8", "w_down_scale", "w_down_kscale"]);
+            let gate_up = self.fp8_split(&[format!("{p}.mlp.gate_proj.weight"), format!("{p}.mlp.up_proj.weight")],
+                Axis::Rows, ranks)?;
+            let down = self.fp8_split(&[format!("{p}.mlp.down_proj.weight")], Axis::Cols, ranks)?;
+            for ((map, gate_up), down) in ops.iter_mut().zip(gate_up).zip(down) {
+                gate_up.insert(map, ["w_gate_up_fp8", "w_gate_up_scale", "w_gate_up_kscale"]);
+                down.insert(map, ["w_down_fp8", "w_down_scale", "w_down_kscale"]);
+            }
         } else {
             let router = format!("{p}.mlp.gate.weight");
             if self.tensor(&router)?.meta.dtype == DType::Bf16 {
-                ops.insert("w_router", self.one(&router)?);
+                ops[0].insert("w_router", self.one(&router)?);
             } else {
-                ops.insert("w_hilo", self.router_hilo(&router)?);
+                ops[0].insert("w_hilo", self.router_hilo(&router)?);
             }
-            ops.insert("gate.bias", self.one(&format!("{p}.mlp.gate.e_score_correction_bias"))?);
+            ops[0].insert("gate.bias", self.one(&format!("{p}.mlp.gate.e_score_correction_bias"))?);
         }
-        Ok(MimoLayer { attention, dense, operands: ops })
+        Ok(ops.into_iter().map(|operands| MimoLayer { attention, dense, split: ranks > 1, operands }).collect())
     }
 
-    /// Layers `0..layers` (all of them unless the caller stops early).
-    pub fn model(&self, cfg: &MimoV2Config, layers: usize) -> Result<MimoWeights<'a>> {
+    /// Layers `0..layers` (all of them unless the caller stops early): rank 0's
+    /// weights (its layer shares, the norm and head), and with a head split each
+    /// other rank's layer shares.
+    #[allow(clippy::type_complexity)]
+    pub fn model(&self, cfg: &MimoV2Config, layers: usize) -> Result<(MimoWeights<'a>, Vec<Vec<MimoLayer<'a>>>)> {
         let (head, head_fp8) = self.rows_fp8(&["lm_head.weight".to_string()], self.fp8_head)?;
+        let mut shares: Vec<Vec<MimoLayer<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
+        for layer in 0..layers.min(cfg.layers) {
+            for (share, part) in shares.iter_mut().zip(self.layer(cfg, layer)?) {
+                share.push(part);
+            }
+        }
+        let mut shares = shares.into_iter();
         let weights = MimoWeights {
-            layers: (0..layers.min(cfg.layers)).map(|l| self.layer(cfg, l)).collect::<Result<_>>()?,
+            layers: shares.next().context("rank 0")?,
             norm: self.one("model.norm.weight")?,
             head,
             head_fp8,
         };
         crate::shared::memory::staging::release_staging();
-        Ok(weights)
+        Ok((weights, shares.collect()))
     }
 }

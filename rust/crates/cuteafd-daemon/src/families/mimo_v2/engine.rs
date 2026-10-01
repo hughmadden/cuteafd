@@ -198,8 +198,73 @@ struct Workspace<'a> {
     ids: Dev<'a>,
     /// Greedy selection of logits rows (MTP drafts): U32 ids, then U32 statuses.
     select: Dev<'a>,
-    head: VocabularyHead<'a>,
+    /// The cuBLAS LM head (rank 0 only).
+    head: Option<VocabularyHead<'a>>,
     _head_workspace: Dev<'a>,
+}
+
+/// The second GPU of a two-GPU head split (see `MimoV2Config::head_split`):
+/// its share of every layer (half the query heads with the KV heads they read,
+/// half the dense MLP), its KV records, RoPE tables and workspaces.
+pub(crate) struct Peer<'a> {
+    pub device: i32,
+    pub stream: *mut c_void,
+    pub layers: Vec<MimoLayer<'a>>,
+    kv: Vec<Dev<'a>>,
+    cos_sin_full: Dev<'a>,
+    cos_sin_swa: Dev<'a>,
+    workspace: RefCell<Option<Workspace<'a>>>,
+    decode_workspace: RefCell<Option<Workspace<'a>>>,
+}
+
+/// One GPU's end of the head split's exchange: receive buffers the other GPU
+/// pushes into (attention partials by layer parity at 0/2, FFN partials or
+/// the routed experts' sum at 1/3), and control words: `[0]` the sequence the
+/// other GPU publishes, `[1..3]` this GPU's send state, `[3]` its receive state.
+struct Exchange<'a> {
+    recv: [Dev<'a>; 4],
+    control: Dev<'a>,
+}
+
+impl Exchange<'_> {
+    fn flag(&self) -> *mut u32 {
+        self.control.buffer.ptr.cast()
+    }
+
+    fn send_state(&self) -> *mut u32 {
+        // SAFETY: words 1..3 of the 256-byte control allocation.
+        unsafe { self.control.buffer.ptr.cast::<u32>().add(1) }
+    }
+
+    fn recv_state(&self) -> *mut u32 {
+        // SAFETY: word 3 of the 256-byte control allocation.
+        unsafe { self.control.buffer.ptr.cast::<u32>().add(3) }
+    }
+}
+
+/// Exchange slot of layer `index`'s attention partials (`ffn` false) or its
+/// FFN partials / routed-expert sum: by layer parity, so a push for layer `l`
+/// never lands on rows the other GPU may still read (it consumed layer `l - 2`'s
+/// before it sent layer `l - 1`'s attention partial, which this GPU waited for).
+fn slot(index: usize, ffn: bool) -> usize {
+    2 * (index % 2) + usize::from(ffn)
+}
+
+/// cos | sin of position * theta^(-2i/dim) for `max_context` positions, FP32
+/// like the reference's inv_freq, on the current device.
+fn rope_table<'a>(library: &'a NativeLibrary, dim: usize, theta: f64, max_context: usize) -> Result<Dev<'a>> {
+    let inv: Vec<f32> = (0..dim / 2).map(|i| 1.0 / (theta as f32).powf((2 * i) as f32 / dim as f32)).collect();
+    let mut values = vec![0f32; max_context * dim];
+    for p in 0..max_context {
+        for (i, f) in inv.iter().enumerate() {
+            let angle = p as f32 * f;
+            values[p * dim + i] = angle.cos();
+            values[p * dim + dim / 2 + i] = angle.sin();
+        }
+    }
+    let allocation = DeviceAllocation::new(library, values.len() * 4)?;
+    library.copy_h2d(allocation.buffer, bytes_of(&values))?;
+    Ok(allocation)
 }
 
 pub(crate) struct MimoEngine<'a> {
@@ -214,6 +279,14 @@ pub(crate) struct MimoEngine<'a> {
     pub rings: usize,
     /// Program family of the checkpoint's geometry (`mimo`, `mimop`).
     family: &'static str,
+    /// This engine's GPU (rank 0 of a head split).
+    pub device: i32,
+    /// Program family of one GPU's share under a head split (`mimop2`): the
+    /// layers' producer, attention, o_proj and dense MLP programs.
+    split_family: Option<&'static str>,
+    /// The head split's second GPU and both ends of its exchange (rank 0's, the peer's).
+    peer: Option<Peer<'a>>,
+    exchange: Vec<Exchange<'a>>,
     /// Per layer: the paged record pool (full) or the rings (SWA).
     kv: Vec<Dev<'a>>,
     cos_sin_full: Dev<'a>,
@@ -280,6 +353,11 @@ impl<'a> MimoEngine<'a> {
         weights: MimoWeights<'a>, stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize,
         rings: usize, embedding: TokenEmbedding<'a>) -> Result<Self> {
         let family = cfg.program_family()?;
+        // Layers loaded as head-split shares carry half the heads (see `attach_peer`).
+        let ranks = if weights.layers.iter().any(|l| l.split) { 2 } else { 1 };
+        let share = cfg.head_split(ranks)?;
+        let split_family = if ranks > 1 { Some(share.program_family()?) } else { None };
+        let device = library.cuda_get_device()?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         ensure!(cfg.rope_dim == 64 && cfg.head_dim == 192 && cfg.v_head_dim == 128 && cfg.window <= RING_ROWS - DECODE_ROWS,
             "the mimo programs are built for 192/128 heads, 64 RoPE dims and a window of at most {}",
@@ -290,30 +368,16 @@ impl<'a> MimoEngine<'a> {
             Ok(allocation)
         };
         let kv = weights.layers.iter().map(|layer| {
-            let record = cfg.record_elems(layer.attention) * 2;
+            let record = if layer.split { share.record_elems(layer.attention) } else { cfg.record_elems(layer.attention) } * 2;
             zeroed(match layer.attention {
                 MimoAttention::Full => pages * PAGE_ROWS * record,
                 MimoAttention::Sliding => rings * RING_ROWS * record,
             })
         }).collect::<Result<Vec<_>>>()?;
-        // cos | sin of position * theta^(-2i/64), FP32 like the reference's inv_freq.
-        let table = |theta: f64| -> Result<Dev<'a>> {
-            let dim = cfg.rope_dim;
-            let inv: Vec<f32> = (0..dim / 2).map(|i| 1.0 / (theta as f32).powf((2 * i) as f32 / dim as f32)).collect();
-            let mut values = vec![0f32; max_context * dim];
-            for p in 0..max_context {
-                for (i, f) in inv.iter().enumerate() {
-                    let angle = p as f32 * f;
-                    values[p * dim + i] = angle.cos();
-                    values[p * dim + dim / 2 + i] = angle.sin();
-                }
-            }
-            let allocation = DeviceAllocation::new(library, values.len() * 4)?;
-            library.copy_h2d(allocation.buffer, bytes_of(&values))?;
-            Ok(allocation)
-        };
+        let table = |theta: f64| rope_table(library, cfg.rope_dim, theta, max_context);
         let (cos_sin_full, cos_sin_swa) = (table(cfg.full_rope_theta)?, table(cfg.swa_rope_theta)?);
-        Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, rings, family, kv, cos_sin_full,
+        Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, rings, family, device,
+            split_family, peer: None, exchange: Vec::new(), kv, cos_sin_full,
             cos_sin_swa, workspace: RefCell::new(None), decode_workspace: RefCell::new(None), experts: None,
             expert_input: ExpertInput::Fp8,
             profile: RefCell::new([0.0; 2]), drafter: None, mtp: None, l2: None, embedding,
@@ -324,8 +388,125 @@ impl<'a> MimoEngine<'a> {
     /// rows at `p * PAGE_ROWS * record`) or the SWA rings (ring `r` at `r * RING_ROWS *
     /// record`), with its record bytes.
     pub(crate) fn kv_layer(&self, layer: usize) -> (MimoAttention, cuteafd_ffi::CuteafdDeviceBuffer, usize) {
-        let attention = self.weights.layers[layer].attention;
-        (attention, self.kv[layer].buffer, self.cfg.record_elems(attention) * 2)
+        self.kv_layer_on(0, layer)
+    }
+
+    /// [`Self::kv_layer`] of rank `rank`'s share (0: this GPU, 1: the head split's peer).
+    pub(crate) fn kv_layer_on(&self, rank: usize, layer: usize) -> (MimoAttention, cuteafd_ffi::CuteafdDeviceBuffer, usize) {
+        let (layers, kv) = match (rank, &self.peer) {
+            (1, Some(peer)) => (&peer.layers, &peer.kv),
+            _ => (&self.weights.layers, &self.kv),
+        };
+        let attention = layers[layer].attention;
+        (attention, kv[layer].buffer, self.record_elems(&layers[layer]) * 2)
+    }
+
+    /// BF16 elements of `layer`'s KV record on the GPU holding it (its KV heads only under a head split).
+    fn record_elems(&self, layer: &MimoLayer<'_>) -> usize {
+        let heads = self.cfg.kv_heads(layer.attention) / if layer.split { 2 } else { 1 };
+        heads * (self.cfg.head_dim + self.cfg.v_head_dim)
+    }
+
+    /// GPUs this engine runs on: 2 under a head split.
+    pub fn ranks(&self) -> usize {
+        1 + usize::from(self.peer.is_some())
+    }
+
+    /// Attaches the head split's second GPU: `device` with `stream`, holding
+    /// `layers` (every layer's rank-1 share, see `MimoLoader::model`). Enables
+    /// peer access both ways, loads the programs there, and allocates its KV
+    /// records, RoPE tables and both ends of the exchange.
+    pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<MimoLayer<'a>>) -> Result<()> {
+        ensure!(self.split_family.is_some() && layers.len() == self.weights.layers.len()
+            && layers.iter().all(|l| l.split), "attach_peer needs the head-split shares of every loaded layer");
+        let library = self.library;
+        let rows = self.prefill_rows.max(DECODE_ROWS);
+        let recv_bytes = rows * self.cfg.hidden * 2;
+        let zeroed = |bytes: usize| -> Result<Dev<'a>> {
+            let allocation = DeviceAllocation::new(library, bytes.max(256))?;
+            library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
+            Ok(allocation)
+        };
+        let exchange = |zeroed: &dyn Fn(usize) -> Result<Dev<'a>>| -> Result<Exchange<'a>> {
+            Ok(Exchange { recv: [zeroed(recv_bytes)?, zeroed(recv_bytes)?, zeroed(recv_bytes)?, zeroed(recv_bytes)?],
+                control: zeroed(256)? })
+        };
+        library.cuda_enable_peer(device)?;
+        let mine = exchange(&zeroed)?;
+        library.cuda_set_device(device)?;
+        let peer = (|| -> Result<(Peer<'a>, Exchange<'a>)> {
+            library.cuda_enable_peer(self.device)?;
+            self.programs.load_all()?;
+            let kv = layers.iter().map(|layer| {
+                let record = self.record_elems(layer) * 2;
+                zeroed(match layer.attention {
+                    MimoAttention::Full => self.pages * PAGE_ROWS * record,
+                    MimoAttention::Sliding => self.rings * RING_ROWS * record,
+                })
+            }).collect::<Result<Vec<_>>>()?;
+            let table = |theta: f64| rope_table(library, self.cfg.rope_dim, theta, self.max_context);
+            let peer = Peer { device, stream, kv, cos_sin_full: table(self.cfg.full_rope_theta)?,
+                cos_sin_swa: table(self.cfg.swa_rope_theta)?, layers, workspace: RefCell::new(None),
+                decode_workspace: RefCell::new(None) };
+            Ok((peer, exchange(&zeroed)?))
+        })();
+        library.cuda_set_device(self.device)?;
+        let (peer, theirs) = peer?;
+        self.peer = Some(peer);
+        self.exchange = vec![mine, theirs];
+        Ok(())
+    }
+
+    /// The stream of rank `rank`.
+    pub(crate) fn stream_of(&self, rank: usize) -> *mut c_void {
+        match (rank, &self.peer) {
+            (1, Some(peer)) => peer.stream,
+            _ => self.stream,
+        }
+    }
+
+    /// Runs `body` with rank `rank`'s device current (this engine's device again after).
+    pub(crate) fn on<T>(&self, rank: usize, body: impl FnOnce() -> Result<T>) -> Result<T> {
+        let Some(peer) = self.peer.as_ref().filter(|_| rank == 1) else { return body() };
+        self.library.cuda_set_device(peer.device)?;
+        let out = body();
+        self.library.cuda_set_device(self.device)?;
+        out
+    }
+
+    /// Receive buffer `slot` of rank `rank`'s exchange end.
+    fn recv(&self, rank: usize, slot: usize) -> *mut c_void {
+        self.exchange[rank].recv[slot].buffer.ptr
+    }
+
+    /// Queues on `from`'s stream: push `bytes` of `source` into the other GPU's
+    /// `destination` and publish the next sequence to its flag.
+    fn push(&self, from: usize, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()> {
+        let (mine, theirs) = (&self.exchange[from], &self.exchange[1 - from]);
+        // SAFETY: peer access is enabled both ways (attach_peer); the source rows are
+        // final on this stream and stay untouched until later work on it; the
+        // destination is a live buffer of the other GPU that it reads only after
+        // its matching wait (exchange slots by layer parity, see `slot`).
+        self.on(from, || unsafe {
+            self.library.peer_push_signal(destination, source, bytes, theirs.flag(), mine.send_state(), 0,
+                self.stream_of(from))
+        })
+    }
+
+    /// Queues on `at`'s stream: wait for the other GPU's next push.
+    fn wait(&self, at: usize) -> Result<()> {
+        let end = &self.exchange[at];
+        // SAFETY: the flag and state are this GPU's control words; every wait is
+        // matched by a push the host queues before it waits on either stream.
+        self.on(at, || unsafe { self.library.peer_wait(end.flag(), end.recv_state(), self.stream_of(at)) })
+    }
+
+    /// Both GPUs push their `delta` rows into the other's slot `slot` and wait for the other's.
+    fn exchange_deltas(&self, w: [&Workspace<'_>; 2], slot: usize, bytes: usize) -> Result<()> {
+        self.push(0, w[0].delta.buffer.ptr, self.recv(1, slot), bytes)?;
+        self.push(1, w[1].delta.buffer.ptr, self.recv(0, slot), bytes)?;
+        self.wait(0)?;
+        self.wait(1)
     }
 
     /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
@@ -343,42 +524,67 @@ impl<'a> MimoEngine<'a> {
 
     /// `mimo_*` program names of this checkpoint's program family (`mimo` for
     /// V2 Flash, `mimop` for V2.6 Pro).
-    fn program_name(&self, name: &str) -> String {
+    fn program_name(&self, name: &str, split: bool) -> String {
+        let family = if split { self.split_family.unwrap_or(self.family) } else { self.family };
         match name.strip_prefix("mimo_") {
-            Some(rest) => format!("{}_{rest}", self.family),
+            Some(rest) => format!("{family}_{rest}"),
             None => name.to_string(),
         }
     }
 
     fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
-        let name = &self.program_name(name);
+        self.run_on(0, false, name, pointers, scalars)
+    }
+
+    /// Launches `name` on rank `rank`'s stream; `split` picks the head-split share's program.
+    fn run_on(&self, rank: usize, split: bool, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar])
+        -> Result<()> {
+        let name = &self.program_name(name, split);
         let names: Vec<&str> = pointers.iter().map(|(n, _)| *n).collect();
         let program = self.programs.program(name, &names)?;
         let raw: Vec<*mut c_void> = pointers.iter().map(|(_, p)| *p).collect();
-        // SAFETY: every pointer names a live allocation sized for the rows in
-        // `scalars`; the stream orders all launches of this engine.
-        unsafe { program.launch(&raw, scalars, self.stream) }.with_context(|| format!("{name} with {scalars:?}"))
+        // SAFETY: every pointer names a live allocation of rank `rank`'s GPU sized for
+        // the rows in `scalars`; that rank's stream orders all its launches.
+        self.on(rank, || unsafe { program.launch(&raw, scalars, self.stream_of(rank)) })
+            .with_context(|| format!("{name} with {scalars:?}"))
     }
 
-    fn scratch(&self, name: &str) -> Result<usize> {
-        Ok(self.programs.spec(&self.program_name(name))?.scratch.get("scratch").copied().unwrap_or(0) as usize)
+    fn scratch(&self, name: &str, split: bool) -> Result<usize> {
+        Ok(self.programs.spec(&self.program_name(name, split))?.scratch.get("scratch").copied().unwrap_or(0) as usize)
     }
 
-    fn workspace(&self, t: usize, decode: bool) -> Result<Workspace<'a>> {
+    /// Rank `rank`'s workspace for steps of up to `t` rows (rank 1 holds the
+    /// attention-side buffers only); allocated on that rank's GPU.
+    fn workspace(&self, rank: usize, t: usize, decode: bool) -> Result<Workspace<'a>> {
+        self.on(rank, || self.workspace_here(rank, t, decode))
+    }
+
+    fn workspace_here(&self, rank: usize, t: usize, decode: bool) -> Result<Workspace<'a>> {
         let (h, heads) = (self.cfg.hidden, self.cfg.heads);
         let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
-        let mut scratch = self.scratch("mimo_router_scores")?;
-        for name in [format!("mimo_full_producer_{cap}"), format!("mimo_swa_producer_{cap}"),
-            format!("mimo_full_attention_{mode}_{cap}"), format!("mimo_swa_attention_{mode}_{cap}"),
-            format!("mimo_ffn_{cap}")] {
-            scratch = scratch.max(self.scratch(&name)?);
+        let lead = rank == 0;
+        let mut scratch = if lead { self.scratch("mimo_router_scores", false)? } else { 0 };
+        // Whole-model programs (MTP layers on rank 0) and the split share's.
+        let families: &[bool] = match (self.split_family, lead) {
+            (None, _) => &[false],
+            (Some(_), true) => &[false, true],
+            (Some(_), false) => &[true],
+        };
+        for &split in families {
+            for name in [format!("mimo_full_producer_{cap}"), format!("mimo_swa_producer_{cap}"),
+                format!("mimo_full_attention_{mode}_{cap}"), format!("mimo_swa_attention_{mode}_{cap}"),
+                format!("mimo_ffn_{cap}")] {
+                scratch = scratch.max(self.scratch(&name, split)?);
+            }
         }
-        let head_workspace = self.alloc(VOCABULARY_HEAD_WORKSPACE)?;
-        let spark = matches!(self.experts, Some(Experts::Spark { .. }));
+        let head_workspace = self.alloc(if lead { VOCABULARY_HEAD_WORKSPACE } else { 256 })?;
+        let spark = lead && matches!(self.experts, Some(Experts::Spark { .. }));
         let identity: Vec<i64> = (0..t as i64).collect();
         let step_slots = self.alloc(t * 8)?;
         self.library.copy_h2d(step_slots.buffer, bytes_of(&identity))?;
         let record = self.cfg.record_elems(MimoAttention::Sliding).max(self.cfg.record_elems(MimoAttention::Full));
+        // Rank 1 never runs the router, experts, head or drafters.
+        let lead_only = |bytes: usize| if lead { bytes } else { 256 };
         Ok(Workspace {
             rows: t,
             h: self.alloc(t * h * 2)?,
@@ -394,11 +600,11 @@ impl<'a> MimoEngine<'a> {
             seq_first: self.alloc(t * 4)?,
             page_table: self.alloc(if decode { t * self.pages * 4 } else { self.pages * 4 })?,
             scratch: self.alloc(scratch)?,
-            logits: self.alloc(t * self.cfg.vocab_size * 4)?,
-            router_logits: self.alloc(t * self.cfg.experts * 4)?,
-            route_ids: self.alloc(t * self.cfg.topk * 4)?,
-            route_weights: self.alloc(t * self.cfg.topk * 4)?,
-            wire: self.alloc(t * (h + h / 32))?,
+            logits: self.alloc(lead_only(t * self.cfg.vocab_size * 4))?,
+            router_logits: self.alloc(lead_only(t * self.cfg.experts * 4))?,
+            route_ids: self.alloc(lead_only(t * self.cfg.topk * 4))?,
+            route_weights: self.alloc(lead_only(t * self.cfg.topk * 4))?,
+            wire: self.alloc(lead_only(t * (h + h / 32)))?,
             zero_plane: {
                 let zero = self.alloc(if spark { t * h * 2 } else { 256 })?;
                 self.library.cuda_zero_bytes(zero.buffer, zero.buffer.bytes)?;
@@ -409,8 +615,12 @@ impl<'a> MimoEngine<'a> {
             ids: self.alloc(t * 4)?,
             select: self.alloc(t * 8)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
-            head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, t as u32,
-                self.cfg.vocab_size as u32)? },
+            head: if lead {
+                Some(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, t as u32,
+                    self.cfg.vocab_size as u32)? })
+            } else {
+                None
+            },
             _head_workspace: head_workspace,
         })
     }
@@ -503,42 +713,109 @@ impl<'a> MimoEngine<'a> {
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<DeviceLogits>> {
         let (h, t) = (self.cfg.hidden, tables.positions.len());
-        let (slot, capacity) = if tables.decode { (&self.decode_workspace, DECODE_ROWS) } else { (&self.workspace, self.prefill_rows) };
-        if slot.borrow().is_none() {
-            *slot.borrow_mut() = Some(self.workspace(capacity, tables.decode)?);
+        let (cell, capacity) = if tables.decode { (&self.decode_workspace, DECODE_ROWS) } else { (&self.workspace, self.prefill_rows) };
+        if cell.borrow().is_none() {
+            *cell.borrow_mut() = Some(self.workspace(0, capacity, tables.decode)?);
         }
-        let workspace = slot.borrow();
+        let workspace = cell.borrow();
         let w = workspace.as_ref().context("workspace")?;
         ensure!(t <= w.rows && logit_rows <= t && tokens.len() == t, "step exceeds the workspace");
+        // The head split's second GPU: its workspace of the same shape.
+        let peer_workspace = match &self.peer {
+            Some(peer) => {
+                let cell = if tables.decode { &peer.decode_workspace } else { &peer.workspace };
+                if cell.borrow().is_none() {
+                    *cell.borrow_mut() = Some(self.workspace(1, capacity, tables.decode)?);
+                }
+                Some((peer, cell.borrow()))
+            }
+            None => None,
+        };
+        let split = match &peer_workspace {
+            Some((peer, ws)) => Some((*peer, ws.as_ref().context("peer workspace")?)),
+            None => None,
+        };
         // The tables and ids go up synchronously: the previous step (which no
         // longer ends in a logits download) must be done reading them.
-        // SAFETY: the engine owns this stream.
-        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
-        self.put(&w.positions, &tables.positions)?;
-        self.put(&w.slots, &tables.slots)?;
-        self.put(&w.ring_slots, &tables.ring_slots)?;
-        self.put(&w.seq_first, &tables.seq_first)?;
-        self.put(&w.page_table, &tables.page_table)?;
+        // SAFETY: the engine owns these streams; every exchange wait queued on
+        // them was matched by a push the previous step queued, so they drain.
+        unsafe {
+            self.library.cuda_stream_synchronize(self.stream)?;
+            if let Some((peer, _)) = split {
+                self.library.cuda_stream_synchronize(peer.stream)?;
+            }
+        }
+        for (rank, w) in std::iter::once(w).chain(split.map(|(_, w1)| w1)).enumerate() {
+            self.on(rank, || {
+                self.put(&w.positions, &tables.positions)?;
+                self.put(&w.slots, &tables.slots)?;
+                self.put(&w.ring_slots, &tables.ring_slots)?;
+                self.put(&w.seq_first, &tables.seq_first)?;
+                self.put(&w.page_table, &tables.page_table)
+            })?;
+        }
         self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
         let rows = Scalar::I32(t as i32);
         let cap = if tables.decode { "m64" } else { "m4096" };
         let layers = &self.weights.layers;
+        let bytes = t * h * 2;
+        if let Some((_, w1)) = split {
+            // The embedded rows to the second GPU's residual stream.
+            self.push(0, w.h.buffer.ptr, w1.h.buffer.ptr, bytes)?;
+            self.wait(1)?;
+        }
         self.norm(w, layers[0].ptr("input_norm")?, 0, rows)?;
+        if let Some((peer, w1)) = split {
+            self.norm_on(1, w1, peer.layers[0].ptr("input_norm")?, 0, rows, w1.delta.buffer.ptr)?;
+        }
         for (index, layer) in layers.iter().enumerate() {
-            self.attention(w, self.kv[index].buffer.ptr, layer, rows, cap, tables)?;
+            let last = index + 1 == layers.len();
+            self.attention_on(0, w, self.kv[index].buffer.ptr, layer, rows, cap, tables)?;
             // h += attention; x = post_attention_layernorm(h)
-            self.norm(w, layer.ptr("post_norm")?, 1, rows)?;
+            match split {
+                Some((peer, w1)) => {
+                    let share = &peer.layers[index];
+                    self.attention_on(1, w1, peer.kv[index].buffer.ptr, share, rows, cap, tables)?;
+                    // Both GPUs add both partials in the same order: identical residual streams.
+                    let at = slot(index, false);
+                    self.exchange_deltas([w, w1], at, bytes)?;
+                    self.norm_on(0, w, layer.ptr("post_norm")?, 2, rows, self.recv(0, at))?;
+                    self.norm_on(1, w1, share.ptr("post_norm")?, 2, rows, self.recv(1, at))?;
+                }
+                None => self.norm(w, layer.ptr("post_norm")?, 1, rows)?,
+            }
+            let ffn = slot(index, true);
+            // How each GPU's next norm takes the FFN output: deltas and the second delta.
+            let mut deltas = 1;
             if layer.dense {
-                self.dense_ffn(w, layer, rows, cap, tables.decode)?;
+                self.dense_ffn(0, w, layer, rows, cap, tables.decode)?;
+                if let Some((peer, w1)) = split {
+                    self.dense_ffn(1, w1, &peer.layers[index], rows, cap, tables.decode)?;
+                    self.exchange_deltas([w, w1], ffn, bytes)?;
+                    deltas = 2;
+                }
             } else {
                 self.moe(w, index, layer, t, tables.decode)?;
+                if let (Some(_), false) = (split, last) {
+                    // The routed experts' sum (on this GPU) to the second GPU.
+                    self.push(0, w.delta.buffer.ptr, self.recv(1, ffn), bytes)?;
+                    self.wait(1)?;
+                }
             }
             // h += ffn; x = next input_layernorm(h) (or the final norm).
             let weight = match layers.get(index + 1) {
                 Some(next) => next.ptr("input_norm")?,
                 None => self.weights.norm.buffer.ptr,
             };
-            self.norm(w, weight, 1, rows)?;
+            let second = if deltas == 2 { self.recv(0, ffn) } else { w.delta.buffer.ptr };
+            self.norm_on(0, w, weight, deltas, rows, second)?;
+            if let (Some((peer, w1)), false) = (split, last) {
+                // Rank 1's FFN delta: its own partial plus rank 0's (dense), or rank 0's
+                // routed-expert sum alone.
+                let (first, second) = if deltas == 2 { (w1.delta.buffer.ptr, self.recv(1, ffn)) }
+                    else { (self.recv(1, ffn), self.recv(1, ffn)) };
+                self.norm_full(1, w1, peer.layers[index + 1].ptr("input_norm")?, deltas, rows, first, second)?;
+            }
             if let Some(drafter) = &self.drafter {
                 // The step's last TAP_ROWS rows (a prefill's tail holds every
                 // context row later drafts can see).
@@ -556,6 +833,13 @@ impl<'a> MimoEngine<'a> {
                 self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: rows_forced.len(), ..w.h.buffer },
                     &rows_forced)?;
                 self.norm(w, weight, 0, rows)?;
+                if let (Some((peer, w1)), false) = (split, last) {
+                    // SAFETY: the engine owns the peer stream; drained before the synchronous copy.
+                    unsafe { self.library.cuda_stream_synchronize(peer.stream)? };
+                    self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: rows_forced.len(), ..w1.h.buffer },
+                        &rows_forced)?;
+                    self.norm_on(1, w1, peer.layers[index + 1].ptr("input_norm")?, 0, rows, w1.delta.buffer.ptr)?;
+                }
             }
         }
         if layers.len() < self.cfg.layers {
@@ -572,7 +856,7 @@ impl<'a> MimoEngine<'a> {
             }
             // SAFETY: the final norm's output and the head operands are live buffers of these shapes.
             _ => unsafe {
-                w.head.launch(x.cast(), self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(),
+                w.head.as_ref().context("LM head")?.launch(x.cast(), self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(),
                     logit_rows as u32, self.stream)?;
             },
         }
@@ -583,9 +867,23 @@ impl<'a> MimoEngine<'a> {
 
     /// `residual (h) += delta` when `deltas` is 1, then `x = weight * RMSNorm(h)`.
     fn norm(&self, w: &Workspace<'_>, weight: *mut c_void, deltas: i32, rows: Scalar) -> Result<()> {
-        self.run("mimo_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
-            ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
-            &[rows, Scalar::I32(deltas)])
+        self.norm_full(0, w, weight, deltas, rows, w.delta.buffer.ptr, w.delta.buffer.ptr)
+    }
+
+    /// On rank `rank`: `h += bf16(delta + second)` when `deltas` is 2 (the local
+    /// `delta` first, so both GPUs of a head split sum identically), `h += delta`
+    /// when 1, then `x = weight * RMSNorm(h)`.
+    #[allow(clippy::too_many_arguments)]
+    fn norm_on(&self, rank: usize, w: &Workspace<'_>, weight: *mut c_void, deltas: i32, rows: Scalar,
+        second: *mut c_void) -> Result<()> {
+        self.norm_full(rank, w, weight, deltas, rows, w.delta.buffer.ptr, second)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn norm_full(&self, rank: usize, w: &Workspace<'_>, weight: *mut c_void, deltas: i32, rows: Scalar,
+        first: *mut c_void, second: *mut c_void) -> Result<()> {
+        self.run_on(rank, false, "mimo_norm", &[("residual", w.h.buffer.ptr), ("delta0", first), ("delta1", second),
+            ("weight", weight), ("out", w.x.buffer.ptr)], &[rows, Scalar::I32(deltas)])
     }
 
     /// Copies this step's last-layer rows (pre-norm) into the MTP hidden ring
@@ -774,7 +1072,7 @@ impl<'a> MimoEngine<'a> {
         let t = tables.positions.len();
         ensure!(t > 0 && t <= DECODE_ROWS, "MTP pass of {t} rows");
         if self.decode_workspace.borrow().is_none() {
-            *self.decode_workspace.borrow_mut() = Some(self.workspace(DECODE_ROWS, true)?);
+            *self.decode_workspace.borrow_mut() = Some(self.workspace(0, DECODE_ROWS, true)?);
         }
         let workspace = self.decode_workspace.borrow();
         let w = workspace.as_ref().context("workspace")?;
@@ -822,7 +1120,7 @@ impl<'a> MimoEngine<'a> {
         self.norm(w, layer.ptr("input_norm")?, 0, rows)?;
         self.attention(w, stage.ring.buffer.ptr, layer, rows, "m64", &tables)?;
         self.norm(w, layer.ptr("post_norm")?, 1, rows)?;
-        self.dense_ffn(w, layer, rows, "m64", true)?;
+        self.dense_ffn(0, w, layer, rows, "m64", true)?;
         self.norm(w, stage.final_norm.buffer.ptr, 1, rows)?;
         let Some(members) = members else { return Ok(()) };
         ensure!(members.len() == groups.len(), "a member per drafting group");
@@ -833,7 +1131,7 @@ impl<'a> MimoEngine<'a> {
             }
             // SAFETY: the final norm's output and the head operands are live buffers of these shapes.
             _ => unsafe {
-                w.head.launch(w.x.buffer.ptr.cast(), self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(),
+                w.head.as_ref().context("LM head")?.launch(w.x.buffer.ptr.cast(), self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(),
                     t as u32, self.stream)?;
             },
         }
@@ -858,12 +1156,25 @@ impl<'a> MimoEngine<'a> {
     /// `kv`: the layer's paged record pool (full) or its rings (SWA).
     fn attention(&self, w: &Workspace<'_>, kv: *mut c_void, layer: &MimoLayer<'_>, rows: Scalar, cap: &str,
         tables: &StepTables) -> Result<()> {
+        self.attention_on(0, w, kv, layer, rows, cap, tables)
+    }
+
+    /// Attention of `layer` (rank `rank`'s share under a head split: its heads,
+    /// a partial o_proj sum) into `delta`, on that rank's GPU.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_on(&self, rank: usize, w: &Workspace<'_>, kv: *mut c_void, layer: &MimoLayer<'_>, rows: Scalar,
+        cap: &str, tables: &StepTables) -> Result<()> {
         let mode = if tables.decode { "decode" } else { "prefill" };
         let k = kind(layer.attention);
-        let (slots, cos_sin) = match layer.attention {
-            MimoAttention::Full => (w.slots.buffer.ptr, self.cos_sin_full.buffer.ptr),
-            MimoAttention::Sliding => (w.step_slots.buffer.ptr, self.cos_sin_swa.buffer.ptr),
+        let (full, swa) = match (rank, &self.peer) {
+            (1, Some(peer)) => (&peer.cos_sin_full, &peer.cos_sin_swa),
+            _ => (&self.cos_sin_full, &self.cos_sin_swa),
         };
+        let (slots, cos_sin) = match layer.attention {
+            MimoAttention::Full => (w.slots.buffer.ptr, full.buffer.ptr),
+            MimoAttention::Sliding => (w.step_slots.buffer.ptr, swa.buffer.ptr),
+        };
+        let split = layer.split;
         let records = match layer.attention {
             MimoAttention::Full => kv,
             MimoAttention::Sliding => w.kv_step.buffer.ptr,
@@ -872,7 +1183,7 @@ impl<'a> MimoEngine<'a> {
         let pointers = [("x", w.x.buffer.ptr), ("positions", w.positions.buffer.ptr), ("kv_slots", slots),
             ("cos_sin", cos_sin), ("w_qkv_fp8", layer.ptr("w_qkv_fp8")?), scale("w_qkv", decode, layer)?,
             ("kv_cache", records), ("query", w.query.buffer.ptr), ("scratch", w.scratch.buffer.ptr)];
-        self.run(&format!("mimo_{k}_producer_{cap}"), &pointers, &self.w8_scalars(rows, decode))?;
+        self.run_on(rank, split, &format!("mimo_{k}_producer_{cap}"), &pointers, &self.w8_scalars(rows, decode))?;
         let name = format!("mimo_{k}_attention_{mode}_{cap}");
         match layer.attention {
             MimoAttention::Full => {
@@ -880,12 +1191,12 @@ impl<'a> MimoEngine<'a> {
                 if tables.decode {
                     scalars.push(Scalar::I32(DECODE_SPLITS));
                 }
-                self.run(&name, &[("q", w.query.buffer.ptr), ("kv_cache", kv),
+                self.run_on(rank, split, &name, &[("q", w.query.buffer.ptr), ("kv_cache", kv),
                     ("positions", w.positions.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
                     ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &scalars)?;
             }
             MimoAttention::Sliding => {
-                self.run(&name, &[("q", w.query.buffer.ptr), ("kv_step", w.kv_step.buffer.ptr),
+                self.run_on(rank, split, &name, &[("q", w.query.buffer.ptr), ("kv_step", w.kv_step.buffer.ptr),
                     ("ring", kv), ("positions", w.positions.buffer.ptr),
                     ("ring_slots", w.ring_slots.buffer.ptr), ("seq_first", w.seq_first.buffer.ptr),
                     ("sinks", layer.ptr("sinks")?), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
@@ -897,15 +1208,17 @@ impl<'a> MimoEngine<'a> {
             pointers.extend([("w_o_fp8", layer.ptr_or("w_o_fp8", "w_o")?), ("w_o_scale", layer.ptr_or("w_o_scale", "w_o")?)]);
         }
         pointers.push(("out", w.delta.buffer.ptr));
-        self.run(&format!("mimo_o_{cap}"), &pointers, &fp8_scalars(rows, decode, layer.has("w_o_fp8")))
+        self.run_on(rank, split, &format!("mimo_o_{cap}"), &pointers, &fp8_scalars(rows, decode, layer.has("w_o_fp8")))
     }
 
     /// The dense SwiGLU MLP (layer 0, MTP layers) over its FP8-only weights into `delta`.
-    fn dense_ffn(&self, w: &Workspace<'_>, layer: &MimoLayer<'_>, rows: Scalar, cap: &str, decode: bool) -> Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    fn dense_ffn(&self, rank: usize, w: &Workspace<'_>, layer: &MimoLayer<'_>, rows: Scalar, cap: &str, decode: bool)
+        -> Result<()> {
         let pointers = [("x", w.x.buffer.ptr), ("w_gate_up_fp8", layer.ptr("w_gate_up_fp8")?),
             scale("w_gate_up", decode, layer)?, ("w_down_fp8", layer.ptr("w_down_fp8")?), scale("w_down", decode, layer)?,
             ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)];
-        self.run(&format!("mimo_ffn_{cap}"), &pointers, &self.w8_scalars(rows, decode))
+        self.run_on(rank, layer.split, &format!("mimo_ffn_{cap}"), &pointers, &self.w8_scalars(rows, decode))
     }
 
     /// `[rows, fp8_rows]` of the programs over FP8-only weights: decode rows up
