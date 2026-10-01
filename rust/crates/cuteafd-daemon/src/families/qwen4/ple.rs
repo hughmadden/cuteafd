@@ -1,10 +1,17 @@
 //! The PLE n-gram table (`ple.ple_embedding.ngram_embedding.shard_*`): 128
 //! shards of 2,500,012 rows x 160, BF16 (~95 GiB) or E4M3 with one BF16
-//! scale (~48 GiB), held as one array the `qwen4_ple_*` program gathers from.
+//! scale (~48 GiB). Token ids hash to rows on the host (`NgramHasher`), 16
+//! per token; the `qwen4_ple_*` program gathers `table[ids]`.
 //!
-//! Placement: `host` keeps it in mapped pinned host memory (the program reads
-//! each token's 16 rows over PCIe, 5 KiB per token for BF16); `device` copies
-//! it to the GPU. Token ids hash to rows on the host (`NgramHasher`).
+//! Placement (`--table-placement`):
+//! - `mapped` (default): the shards stay memory-mapped (page cache, nothing
+//!   read at startup); each step's rows are gathered on host threads into a
+//!   pinned ring and uploaded, and the program reads them from device memory
+//!   with identity ids (`shared::mapped_table`);
+//! - `host-preload`: the table is read into mapped pinned host memory at
+//!   startup and the program reads each token's rows over PCIe;
+//! - `device`: the table is copied to the GPU.
+use crate::shared::mapped_table::{MappedTableArgs, MappedTableDevice, TablePlacement};
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
@@ -15,27 +22,22 @@ use std::ffi::c_void;
 use std::os::unix::fs::FileExt;
 use std::time::Instant;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub(crate) enum PlePlacement {
-    /// Mapped pinned host memory, gathered over PCIe.
-    Host,
-    /// GPU memory.
-    Device,
-}
-
 enum Storage<'a> {
     Host(&'a NativeLibrary, CuteafdHostBuffer),
     Device(DeviceAllocation<'a>),
+    Mapped(MappedTableDevice<'a>),
 }
 
 pub(crate) struct PleTable<'a> {
     storage: Storage<'a>,
-    /// Device-visible address of row 0.
+    /// Device-visible address of row 0 (null when mapped: each step's rows
+    /// are uploaded instead).
     pub table: *mut c_void,
     /// FP32 [1] table scale on the device (1.0 for BF16 tables).
     pub scale: DeviceAllocation<'a>,
     pub fp8: bool,
     pub rows: usize,
+    pub row_bytes: usize,
     pub hasher: NgramHasher,
 }
 
@@ -54,8 +56,18 @@ fn i64s(bytes: &[u8]) -> Vec<i64> {
 }
 
 impl<'a> PleTable<'a> {
+    /// The mapped table when the placement is `mapped`.
+    pub fn mapped(&self) -> Option<&MappedTableDevice<'a>> {
+        match &self.storage {
+            Storage::Mapped(mapped) => Some(mapped),
+            _ => None,
+        }
+    }
+
+    /// `max_rows`: the most token rows one step gathers (mapped placement).
     pub fn load(library: &'a NativeLibrary, checkpoint: &Checkpoint, cfg: &Qwen4Config, layer: usize,
-        placement: PlePlacement, threads: usize) -> Result<Self> {
+        placement: TablePlacement, args: &MappedTableArgs, max_rows: usize) -> Result<Self> {
+        let threads = args.threads;
         let loader = super::weights::Qwen4Loader { library, checkpoint, fp8_decode: false,
             fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut() };
         let prefix = format!("{}layers.{layer}.ple.ple_embedding.", super::weights::PREFIX);
@@ -139,13 +151,21 @@ impl<'a> PleTable<'a> {
             })
         };
         let (storage, table) = match placement {
-            PlePlacement::Host => {
+            TablePlacement::Mapped => {
+                let tensors: Vec<_> = shards.iter().map(|s| (s.shard.as_str(), &s.meta)).collect();
+                // SAFETY: checkpoint snapshots are immutable while the server runs.
+                let mapped = unsafe { cuteafd_loader::MappedTable::from_tensors(&checkpoint.snapshot, &tensors)? };
+                ensure!(mapped.row_bytes() == row_bytes && mapped.rows() as usize == rows, "mapped PLE table geometry");
+                let device = MappedTableDevice::new(library, "ple", mapped, args, max_rows * cfg.ple_rows())?;
+                (Storage::Mapped(device), std::ptr::null_mut())
+            }
+            TablePlacement::HostPreload => {
                 let buffer = library.alloc_host_buffer(total)?;
                 read_into(buffer.ptr.cast())?;
                 let alias = library.cuda_host_buffer_device_alias(buffer)?;
                 (Storage::Host(library, buffer), alias.ptr)
             }
-            PlePlacement::Device => {
+            TablePlacement::Device => {
                 let device = DeviceAllocation::new(library, total)?;
                 // Stage shard by shard through pageable memory (a one-time load).
                 let mut staging = vec![0u8; shards.iter().map(|s| s.meta.byte_length as usize).max().unwrap_or(0)];
@@ -165,8 +185,8 @@ impl<'a> PleTable<'a> {
                 (Storage::Device(device), ptr)
             }
         };
-        tracing::info!(gib = total as f64 / (1u64 << 30) as f64, fp8, ?placement,
-            elapsed_ms = started.elapsed().as_millis() as u64, "PLE n-gram table resident");
-        Ok(Self { storage, table, scale: scale_dev, fp8, rows, hasher })
+        tracing::info!(gib = total as f64 / (1u64 << 30) as f64, fp8, ?placement, parts = shards.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64, "PLE n-gram table ready");
+        Ok(Self { storage, table, scale: scale_dev, fp8, rows, row_bytes, hasher })
     }
 }

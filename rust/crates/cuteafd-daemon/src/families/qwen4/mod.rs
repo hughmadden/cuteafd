@@ -55,12 +55,13 @@ pub(crate) struct EngineArgs {
     pub fp8_scales: crate::shared::fp8_linear::Fp8Scales,
     #[command(flatten)]
     pub l2: crate::shared::l2_prefetch::L2PrefetchArgs,
-    /// Where the PLE n-gram table lives.
-    #[arg(long, value_enum, default_value_t = ple::PlePlacement::Host)]
-    pub ple: ple::PlePlacement,
-    /// Reader threads for the PLE table.
-    #[arg(long, default_value_t = 16)]
-    pub ple_threads: usize,
+    /// Where the PLE n-gram table lives (`mapped`: page cache, rows gathered
+    /// per step; `host-preload`: read into pinned host memory at startup).
+    #[arg(long = "table-placement", alias = "ple", value_enum,
+        default_value_t = crate::shared::mapped_table::TablePlacement::Mapped)]
+    pub table_placement: crate::shared::mapped_table::TablePlacement,
+    #[command(flatten)]
+    pub table: crate::shared::mapped_table::MappedTableArgs,
     /// Spark ranks in TP order (HOST:PORT,...) serving the routed experts.
     #[arg(long, conflicts_with_all = ["local_experts", "shared_only"])]
     pub peers: Option<String>,
@@ -213,7 +214,7 @@ impl Opened {
             elapsed_ms = started.elapsed().as_millis() as u64, "Qwen 3.8 Flash Next coordinator weights resident");
         let ple = match self.cfg.ple_layers.first() {
             Some(&layer) if layer < layers => Some(ple::PleTable::load(&self.library, &self.checkpoint, &self.cfg,
-                layer, args.ple, args.ple_threads)?),
+                layer, args.table_placement, &args.table, args.prefill_rows.max(engine::DECODE_ROWS))?),
             _ => None,
         };
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);

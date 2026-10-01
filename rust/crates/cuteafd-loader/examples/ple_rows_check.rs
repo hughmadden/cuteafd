@@ -67,5 +67,31 @@ fn main() -> Result<()> {
     table.gather_into(&rows, &mut out)?;
     ensure!(out == expected, "gather_into rows differ from the shard bytes");
     println!("PASS {} PLE rows of {count} tokens byte-identical (pool, cache, gather_into)", rows.len());
+    // Warm per-step costs at decode shapes: rows of 1, 4 and 64 tokens.
+    let pool = std::sync::Arc::new(pool);
+    let table = std::sync::Arc::new(table);
+    for tokens in [1usize, 4, 64] {
+        let n = tokens * cfg.ple_rows();
+        let mut out = vec![0u8; n * row_bytes];
+        let (mut inline, mut pooled, mut spawned) = (0.0, 0.0, 0.0);
+        let iterations = 2000;
+        for i in 0..iterations {
+            let batch = &rows[(i * n) % (rows.len() - n)..][..n];
+            let t = std::time::Instant::now();
+            table.gather_into(batch, &mut out)?;
+            inline += t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            pool.gather(&table, batch, &mut out, None)?;
+            pooled += t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            // SAFETY: `out` outlives the wait below and nothing else touches it.
+            let pending = unsafe { pool.spawn_gather(table.clone(), batch.to_vec(), out.as_mut_ptr(), out.len(), None) };
+            pending.wait()?;
+            spawned += t.elapsed().as_secs_f64();
+        }
+        let us = |s: f64| 1e6 * s / iterations as f64;
+        println!("{tokens} tokens ({n} rows): inline {:.1} us, pool {:.1} us, spawn+wait {:.1} us per step",
+            us(inline), us(pooled), us(spawned));
+    }
     Ok(())
 }

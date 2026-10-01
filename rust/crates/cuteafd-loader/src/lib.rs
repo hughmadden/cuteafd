@@ -28,7 +28,7 @@ pub use families::deepseek_v41::engram_tokenizer::EngramTokenMap;
 pub use families::deepseek_v41::engram_prefetch::{EngramEncoding, EngramPrefetcher, EngramTable, PrefetchOutcome, PrefetchTicket};
 pub use formats::mapped_table::{
     AdviseRows, GatherFailure, GatherLease, GatherPool, GatherPoll, GatherReport, GatherTicket, GatherTiming,
-    GatherWorker, HotRowCache, MappedRows, MappedTable, MappedTableError, RowFormat, TablePart, TablePrefetchOutcome,
+    GatherWorker, HotRowCache, MappedRows, PendingGather, MappedTable, MappedTableError, RowFormat, TablePart, TablePrefetchOutcome,
     TablePrefetchTicket, TablePrefetcher, TableStats, TableStatsSnapshot,
 };
 mod catalog;

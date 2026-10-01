@@ -328,6 +328,8 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 }
             };
             admissions += 1;
+            // The first chunk's PLE rows page in while earlier work runs.
+            engine.prefetch_ple(&placement.history, &tokens[..tokens.len().min(engine.prefill_rows)]);
             let _ = job.events.send(Ok(InferenceChunk::Ready {
                 system_fingerprint: None,
                 prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: 0 },
@@ -341,6 +343,12 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 anyhow::ensure!(!p.job.events.is_closed(), "client went away");
                 let timer = Instant::now();
                 let chunk = &p.tokens[p.done..(p.done + engine.prefill_rows).min(p.tokens.len())];
+                // The next chunk's PLE rows page in while this one runs.
+                let next = p.done + chunk.len();
+                if next < p.tokens.len() {
+                    engine.prefetch_ple(&engine.ngram_history_at(&p.tokens, next),
+                        &p.tokens[next..(next + engine.prefill_rows).min(p.tokens.len())]);
+                }
                 let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
                     let start = p.placement.len;
                     let last = p.done + chunk.len() == p.tokens.len();
@@ -372,6 +380,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                     tracing::info!(tokens = p.tokens.len(), elapsed_ms = (1e3 * elapsed) as u64,
                         busy_ms = (1e3 * p.busy) as u64, tok_s = p.tokens.len() as f64 / p.busy,
                         gpu_wait_ms = (1e3 * p.phases[0]) as u64, experts_ms = (1e3 * p.phases[1]) as u64, "prefill");
+                    engine.log_table_stats("prefill");
                     let mut request = Active {
                         history: p.tokens,
                         draft_limit: COPY_DRAFT,
@@ -504,7 +513,12 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             for j in 0..rows.len() {
                 // Rows 0..=j are committed; the token row j produces is next.
                 request.placement.len = start + j + 1;
-                match take(request.constraint.as_mut(), &selected[offset + j]).and_then(|t| Ok((t, request.emit(t)?))) {
+                match take(request.constraint.as_mut(), &selected[offset + j]).and_then(|t| {
+                    // The token's PLE rows page in during emission, the commit and (MTP)
+                    // drafting, before the step that feeds it gathers them.
+                    engine.prefetch_ple(&engine.ngram_history_at(&request.history, request.history.len()), &[t]);
+                    Ok((t, request.emit(t)?))
+                }) {
                     Ok((token, done)) => {
                         last = Some((j + 1, token));
                         finished = done;
@@ -576,6 +590,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 accepted = request.accepted, tokens_per_cycle = request.generated as f64 / request.cycles.max(1) as f64,
                 verify_s, draft_s = timing.seconds, draft_steps = timing.steps, gpu_wait_s = phases[0],
                 experts_s = phases[1], "request complete");
+            engine.log_table_stats("decode");
             (steps, verify_s, timing) = (0, 0.0, DraftTiming::default());
             allocator.release(request.placement);
         }

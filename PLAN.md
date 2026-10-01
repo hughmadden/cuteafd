@@ -385,8 +385,11 @@ model needs them; GLM 5.3 official FP8 is out of scope — EXL3 and NVFP4
 quants cover it), S4 encoder service + multimodal input, S5 coordinator
 range split, S6 eight Sparks.
 
-Ongoing, any phase: engram/n-gram tables in host RAM now; Spark-RAM
-replicas and fabric-fed tables are explorations, kept behind options.
+Ongoing, any phase: engram/n-gram tables are memory-mapped from the
+checkpoint (`formats::mapped_table` + daemon `shared::mapped_table`: page
+cache, bounded prefetch, gather pool/worker, pinned upload ring, stats; V4.1
+engram and Qwen PLE use it); Spark-RAM replicas and fabric-fed tables are
+explorations, kept behind options.
 
 ## Decisions (2026-09-28)
 

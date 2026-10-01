@@ -210,3 +210,41 @@ fn gather_worker_recycles_slots_and_cancels() -> TestResult {
     assert!(matches!(cancelled.poll(), Ok(GatherPoll::Cancelled)));
     Ok(())
 }
+
+#[test]
+fn spawned_gathers_complete_into_caller_storage() -> TestResult {
+    let (_dir, parts) = parted([3, 3, 2])?;
+    let table = Arc::new(unsafe { MappedTable::open(&parts, u8_rows(4))? });
+    let pool = Arc::new(GatherPool::new("test-spawn", 2)?);
+    let mut out = vec![0u8; 12];
+    let pending = unsafe { pool.spawn_gather(table.clone(), vec![6, 0, 4], out.as_mut_ptr(), out.len(), None) };
+    assert_eq!(pending.wait()?.rows, 3);
+    assert_eq!(out, [6, 6, 6, 6, 0, 0, 0, 0, 4, 4, 4, 4]);
+    // An invalid row fails without writing; dropping an unwaited gather waits for it.
+    let failing = unsafe { pool.spawn_gather(table.clone(), vec![1, 8, 1], out.as_mut_ptr(), out.len(), None) };
+    assert!(failing.wait().is_err());
+    assert_eq!(out, [6, 6, 6, 6, 0, 0, 0, 0, 4, 4, 4, 4]);
+    let cache = Arc::new(HotRowCache::new(4, 64).expect("rows"));
+    drop(unsafe { pool.spawn_gather(table.clone(), vec![2, 2, 2], out.as_mut_ptr(), out.len(), Some(cache.clone())) });
+    assert_eq!(out, [2; 12]);
+    assert_eq!(cache.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn warm_reads_every_part_and_stops_on_request() -> TestResult {
+    let (_dir, parts) = parted([3, 3, 2])?;
+    let table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
+    // Each part's mapping starts at its page; part 2 shares b's page with part 1.
+    let total = table.warm(&AtomicBool::new(false), None)?;
+    assert!(total >= 8 * 4);
+    assert_eq!(table.warm(&AtomicBool::new(true), None)?, 0);
+    // Pacing: the whole table at twice its size per second takes about half a second.
+    let started = Instant::now();
+    assert_eq!(table.warm(&AtomicBool::new(false), Some(2 * total))?, total);
+    assert!(started.elapsed() >= Duration::from_millis(400));
+    let mut out = [0; 4];
+    table.gather_into(&[7], &mut out)?;
+    assert_eq!(out, [7; 4]);
+    Ok(())
+}
