@@ -51,6 +51,10 @@ pub(crate) enum IntakeMode {
     Host,
     Pinned,
     Gpu,
+    /// The first K ranks land in device memory, the others take the pinned
+    /// path, so both ingress paths carry partials at once (0: a third of the
+    /// ranks, at least one).
+    Split(u8),
 }
 
 impl IntakeMode {
@@ -59,6 +63,17 @@ impl IntakeMode {
             Self::Host => "host",
             Self::Pinned => "pinned",
             Self::Gpu => "gpu",
+            Self::Split(_) => "split",
+        }
+    }
+
+    /// Ranks of `ranks` whose partials land in device memory.
+    fn gpu_ranks(self, ranks: usize) -> usize {
+        match self {
+            Self::Gpu => ranks,
+            Self::Split(0) => ranks.div_ceil(3).max(1),
+            Self::Split(k) => usize::from(k).min(ranks),
+            Self::Host | Self::Pinned => 0,
         }
     }
 }
@@ -168,6 +183,19 @@ pub(crate) fn choose_mode(library: &NativeLibrary) -> Result<IntakeChoice> {
     let (mode, reason, probe, h2d_gbps) = match setting.as_str() {
         "host" => (IntakeMode::Host, "CUTEAFD_SPARK_INTAKE=host".to_string(), None, None),
         "pinned" => (IntakeMode::Pinned, "CUTEAFD_SPARK_INTAKE=pinned".to_string(), None, None),
+        split if split == "split" || split.starts_with("split:") => {
+            let k = match split.strip_prefix("split:") {
+                Some(k) => k.parse::<u8>().with_context(|| format!("CUTEAFD_SPARK_INTAKE={split}: K is a rank count"))?,
+                None => 0,
+            };
+            let probe = probe_gpu_landing(library);
+            match &probe {
+                Ok(p) if p.usable() => (IntakeMode::Split(k), format!("CUTEAFD_SPARK_INTAKE={split}"), probe.ok(), None),
+                Ok(p) => (IntakeMode::Pinned, format!("split intake needs GPU landing, unusable: {}",
+                    p.error.as_deref().unwrap_or(&p.status)), None, None),
+                Err(error) => (IntakeMode::Pinned, format!("GPU landing probe failed: {error:#}"), None, None),
+            }
+        }
         "gpu" | "auto" => {
             let probe = probe_gpu_landing(library);
             let h2d = match (&probe, setting.as_str()) {
@@ -189,7 +217,7 @@ pub(crate) fn choose_mode(library: &NativeLibrary) -> Result<IntakeChoice> {
             };
             (mode, reason, probe.ok(), h2d)
         }
-        other => anyhow::bail!("CUTEAFD_SPARK_INTAKE={other:?} is not one of auto, gpu, pinned, host"),
+        other => anyhow::bail!("CUTEAFD_SPARK_INTAKE={other:?} is not one of auto, gpu, pinned, host, split[:K]"),
     };
     let choice = IntakeChoice { setting, mode, reason, probe, h2d_gbps };
     tracing::info!(setting = %choice.setting, mode = choice.mode.name(), reason = %choice.reason, "Spark partial intake");
@@ -283,7 +311,7 @@ impl<'a> SparkIntake<'a> {
         // Host mode stages every wave; pinned mode only small ones (see `stages`).
         let staging = match mode {
             IntakeMode::Host => Some(RefCell::new(HostAllocation::new(library, ranks * plane_bytes)?)),
-            IntakeMode::Pinned => Some(RefCell::new(HostAllocation::new(library,
+            IntakeMode::Pinned | IntakeMode::Split(_) => Some(RefCell::new(HostAllocation::new(library,
                 (ranks * plane_bytes).min(SMALL_WAVE_BYTES).max(256))?)),
             IntakeMode::Gpu => None,
         };
@@ -302,8 +330,10 @@ impl<'a> SparkIntake<'a> {
     }
 
     /// The device ranges a GPU-mode transport lands in.
-    pub(crate) fn landing(&self) -> Option<Vec<DeviceLanding>> {
-        (self.mode == IntakeMode::Gpu).then(|| self.planes.iter().map(|p| DeviceLanding::new(p.buffer)).collect())
+    pub(crate) fn landing(&self) -> Option<Vec<Option<DeviceLanding>>> {
+        let gpu_ranks = self.mode.gpu_ranks(self.ranks);
+        (gpu_ranks > 0).then(|| self.planes.iter().enumerate()
+            .map(|(rank, p)| (rank < gpu_ranks).then(|| DeviceLanding::new(p.buffer))).collect())
     }
 
     /// Points `transport`'s receives at this intake's planes (GPU mode).
@@ -353,7 +383,7 @@ impl<'a> SparkIntake<'a> {
     fn stages(&self, plane_bytes: usize) -> bool {
         match self.mode {
             IntakeMode::Host => true,
-            IntakeMode::Pinned => self.ranks * plane_bytes <= SMALL_WAVE_BYTES,
+            IntakeMode::Pinned | IntakeMode::Split(_) => self.ranks * plane_bytes <= SMALL_WAVE_BYTES,
             IntakeMode::Gpu => false,
         }
     }

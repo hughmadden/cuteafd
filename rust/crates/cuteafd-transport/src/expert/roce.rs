@@ -163,7 +163,8 @@ impl SparkExperts {
     }
 
     /// Receive each rank's response payloads straight into its device range
-    /// (`planes[rank]`, registered with the NIC over dma-buf) from the next
+    /// (`planes[rank]` where present, registered with the NIC over dma-buf;
+    /// ranks without one keep pinned host receives) from the next
     /// connection on; `None` returns to pinned host receives. A rank whose
     /// registration fails keeps host receives; [`WaveReceipt`] says which
     /// ranks landed. Only waves received with [`Self::receive_wave`] or
@@ -175,12 +176,12 @@ impl SparkExperts {
     /// planes are written from its dispatch until its receive returns; the
     /// caller must not read them before that, and must finish every read
     /// (including queued GPU work) before dispatching the next wave.
-    pub unsafe fn set_gpu_landing(&mut self, planes: Option<Vec<DeviceLanding>>) -> Result<()> {
+    pub unsafe fn set_gpu_landing(&mut self, planes: Option<Vec<Option<DeviceLanding>>>) -> Result<()> {
         let world = self.world_size();
         let landing = match planes {
             Some(planes) => {
-                ensure!(planes.len() == world, "GPU landing needs one device range per rank");
-                planes.into_iter().map(Some).collect()
+                ensure!(planes.len() == world, "GPU landing needs one entry per rank");
+                planes
             }
             None => vec![None; world],
         };

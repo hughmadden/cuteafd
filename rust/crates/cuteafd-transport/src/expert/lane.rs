@@ -63,7 +63,7 @@ impl SparkExpertLane {
     /// [`SparkExperts::set_gpu_landing`]'s contract, with a lane's wave running
     /// from [`Self::submit`] until [`Self::wait`] returns.
     pub unsafe fn spawn_with_landing(peers: Vec<SocketAddr>, executors: Vec<u64>, capacity: u32,
-        config: TcpTransportConfig, landing: Option<Vec<DeviceLanding>>) -> Result<Self> {
+        config: TcpTransportConfig, landing: Option<Vec<Option<DeviceLanding>>>) -> Result<Self> {
         let (jobs, inbox) = mpsc::channel::<Job>();
         let (report, done) = mpsc::channel::<Result<LaneTimes>>();
         let (ready_tx, ready) = mpsc::channel::<Result<usize>>();
