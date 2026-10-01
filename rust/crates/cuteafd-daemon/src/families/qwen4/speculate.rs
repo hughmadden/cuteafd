@@ -190,11 +190,14 @@ pub(crate) struct Verified<'p> {
     /// Rows kept (the next token plus the accepted drafts) and the token
     /// after them (the correction or bonus); None drops the sequence (finished).
     pub kept: Option<(usize, u32)>,
+    /// The sequence finished in this step: its kept rows are committed (its turn snapshot
+    /// captures the state at its kept length) but not stashed for the MTP.
+    pub finished: bool,
 }
 
 /// After a speculative verify: commits each sequence's kept rows to the GDN
 /// and PLE state, rewinds its placement, and stashes the kept rows' streams
-/// with their next tokens for the MTP.
+/// with their next tokens for the MTP (not for finished sequences).
 pub(crate) fn accept(engine: &Qwen4Engine<'_>, verified: &mut [Verified<'_>], spec: bool, mtp: bool) -> Result<()> {
     let mut commits = Vec::new();
     let mut stash = Vec::new();
@@ -208,7 +211,7 @@ pub(crate) fn accept(engine: &Qwen4Engine<'_>, verified: &mut [Verified<'_>], sp
         } else {
             ensure!(kept == v.rows.len(), "a plain step keeps every row");
         }
-        if !mtp {
+        if !mtp || v.finished {
             continue;
         }
         let at = v.seq.pending.len();

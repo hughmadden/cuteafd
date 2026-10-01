@@ -134,6 +134,18 @@ pub(crate) struct FabricArgs {
     /// CUDA device the probe lands in.
     #[arg(long, default_value_t = 0)]
     pub(crate) device: i32,
+    /// Also measure GPU<->GPU peer transfers (copy engine, SM pull/push,
+    /// pinned-host bounce; one-way, hops and two-way exchanges, eager and
+    /// graph-captured) between the two `--p2p-devices`, idle and under
+    /// host->GPU ingress (a proxy for NIC->GPU traffic on the same links).
+    #[arg(long)]
+    pub(crate) p2p: bool,
+    #[arg(long, value_delimiter = ',', default_values_t = [0, 1])]
+    pub(crate) p2p_devices: Vec<i32>,
+    /// Transfer sizes in bytes (default: one 6144-wide BF16 row, 8 rows,
+    /// 1 MiB and a 4096-row prefill chunk).
+    #[arg(long, value_delimiter = ',', default_values_t = [12288usize, 98304, 1 << 20, 50331648])]
+    pub(crate) p2p_bytes: Vec<usize>,
 }
 
 #[derive(Debug, Args)]

@@ -23,10 +23,15 @@ use cuteafd_loader::OfficialV41Catalog;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::unix::fs::FileExt;
+use crate::shared::peer_split::{slice_2d, Axis};
 
 pub(crate) struct GlmLayer<'a> {
     pub dense: bool,
     pub full_indexer: bool,
+    /// One GPU's share of a head split: q_b, kv_b and o_proj cover its heads
+    /// (o_proj gives a partial sum), the dense / shared-expert MLP its slice of
+    /// the intermediate (a partial sum); it runs the split (`glm2`) programs.
+    pub split: bool,
     operands: HashMap<&'static str, DeviceAllocation<'a>>,
 }
 
@@ -72,6 +77,10 @@ pub(crate) struct GlmLoader<'a> {
     pub library: &'a NativeLibrary,
     pub catalog: &'a OfficialV41Catalog,
     pub stream: *mut c_void,
+    /// This loader's device (rank 0 of a head split).
+    pub device: i32,
+    /// The other GPU of a head split (rank 1), if any.
+    pub peers: Vec<crate::shared::peer_split::RankDevice>,
 }
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
@@ -187,9 +196,10 @@ impl<'a> GlmLoader<'a> {
     /// with one scale per weight row and 64-wide K tile (`[N, 512, D/64]`,
     /// `[N, V, 512/64]`): `w_uk[h,c,d] = kv_b[h*(D+V)+d, c]`,
     /// `w_uv[h,v,c] = kv_b[h*(D+V)+D+v, c]`.
+    /// Over `ranks` GPUs each takes its heads' slices (head-major, so contiguous).
     #[allow(clippy::type_complexity)]
-    fn kv_b(&self, cfg: &GlmDsaConfig, prefix: &str)
-        -> Result<((DeviceAllocation<'a>, DeviceAllocation<'a>), (DeviceAllocation<'a>, DeviceAllocation<'a>))> {
+    fn kv_b(&self, cfg: &GlmDsaConfig, prefix: &str, ranks: usize)
+        -> Result<Vec<((DeviceAllocation<'a>, DeviceAllocation<'a>), (DeviceAllocation<'a>, DeviceAllocation<'a>))>> {
         let (heads, d, v, c) = (cfg.heads, cfg.qk_nope_head_dim, cfg.v_head_dim, cfg.kv_lora_rank);
         self.with_fp8(&[format!("{prefix}.self_attn.kv_b_proj.weight")], |kv_b, grid, rows, cols| {
         ensure!(rows == heads * (d + v) && cols == c && d % 64 == 0 && c % 128 == 0,
@@ -239,7 +249,14 @@ impl<'a> GlmLoader<'a> {
                 });
             }
         });
-        Ok(((self.upload(&uk)?, self.upload(&f32_bytes(&uk_s))?), (self.upload(&uv)?, self.upload(&f32_bytes(&uv_s))?)))
+        ensure!(heads % ranks == 0, "{prefix}: {heads} heads do not split over {ranks} GPUs");
+        let part = |bytes: &[u8], rank: usize| -> Vec<u8> {
+            bytes[rank * bytes.len() / ranks..(rank + 1) * bytes.len() / ranks].to_vec()
+        };
+        let (uk_s, uv_s) = (f32_bytes(&uk_s), f32_bytes(&uv_s));
+        (0..ranks).map(|rank| self.on_rank(rank, |_| Ok((
+            (self.upload(&part(&uk, rank))?, self.upload(&part(&uk_s, rank))?),
+            (self.upload(&part(&uv, rank))?, self.upload(&part(&uv_s, rank))?))))).collect()
         })
     }
 
@@ -251,67 +268,219 @@ impl<'a> GlmLoader<'a> {
         self.upload(&bytes)
     }
 
-    pub fn layer(&self, cfg: &GlmDsaConfig, layer: usize) -> Result<GlmLayer<'a>> {
+    /// GPUs of the head split this loader fills (1: no split).
+    pub fn ranks(&self) -> usize {
+        1 + self.peers.len()
+    }
+
+    /// Runs `body` with rank `rank`'s device current and its load stream.
+    fn on_rank<T>(&self, rank: usize, body: impl FnOnce(*mut c_void) -> Result<T>) -> Result<T> {
+        if rank == 0 {
+            return body(self.stream);
+        }
+        let peer = self.peers.get(rank - 1).with_context(|| format!("no rank {rank}"))?;
+        crate::shared::peer_split::on_device(self.library, peer.device, self.device, || body(peer.stream))
+    }
+
+    /// The FP8 weights `names` concatenated by rows, each sliced over `ranks`
+    /// along `axis` in whole 128-row / 128-K blocks: per rank its E4M3 bytes and
+    /// the matching part of the FP32 128x128 grid. Rows-sliced weights read once.
+    fn fp8_split(&self, names: &[String], axis: Axis, ranks: usize)
+        -> Result<Vec<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
+        if ranks == 1 {
+            return Ok(vec![self.fp8(names)?]);
+        }
+        if let ([name], Axis::Cols) = (names, axis) {
+            return self.fp8_cols(name, ranks);
+        }
+        ensure!(axis == Axis::Rows, "{names:?}: concatenated weights split by rows");
+        // Per rank: the E4M3 rows and grid rows of every part, uploaded straight from the
+        // staging buffer into the part's offset (whole 128-row blocks, so grids slice too).
+        let mut out: Vec<Option<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> = (0..ranks).map(|_| None).collect();
+        let (mut row_at, mut grid_at) = (0usize, 0usize);
+        let (total_rows, cols) = names.iter().try_fold((0usize, 0usize), |(rows, _), name| -> Result<_> {
+            let shape = &self.catalog.tensor(name)?.metadata.shape;
+            Ok((rows + shape[0], shape[1]))
+        })?;
+        for name in names {
+            self.with_fp8(std::slice::from_ref(name), |values, grid, rows, part_cols| {
+                ensure!(part_cols == cols && rows % (128 * ranks) == 0 && cols % 128 == 0,
+                    "{name}: [{rows}, {cols}] does not split into whole 128-row blocks over {ranks} GPUs");
+                let (share, kb) = (rows / ranks, cols / 128);
+                for (rank, slot) in out.iter_mut().enumerate() {
+                    self.on_rank(rank, |_| {
+                        if slot.is_none() {
+                            *slot = Some((DeviceAllocation::new(self.library, total_rows / ranks * cols)?,
+                                DeviceAllocation::new(self.library, total_rows / ranks / 128 * kb * 4)?));
+                        }
+                        let (dv, dg) = slot.as_ref().context("rank buffers")?;
+                        let at = |buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize| CuteafdDeviceBuffer {
+                            // SAFETY: offset + bytes lie inside the rank's buffer (sized above).
+                            ptr: unsafe { buffer.ptr.cast::<u8>().add(offset) }.cast(), bytes, ..buffer };
+                        self.library.copy_h2d(at(dv.buffer, row_at / ranks * cols, share * cols),
+                            &values[rank * share * cols..(rank + 1) * share * cols])?;
+                        let grid_part = f32_bytes(&grid[rank * share / 128 * kb..(rank + 1) * share / 128 * kb]);
+                        self.library.copy_h2d(at(dg.buffer, grid_at / ranks * 4, grid_part.len()), &grid_part)
+                    })?;
+                }
+                row_at += rows;
+                grid_at += rows / 128 * kb;
+                Ok(())
+            })?;
+        }
+        out.into_iter().map(|slot| slot.context("no FP8 parts")).collect()
+    }
+
+    /// One FP8 weight sliced by columns over `ranks`: the whole E4M3 weight goes up
+    /// once to rank 0 and each rank's columns are a pitched device copy from it
+    /// (over peer memory for rank 1); the grid's column blocks are sliced on the host.
+    fn fp8_cols(&self, name: &str, ranks: usize) -> Result<Vec<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
+        let (whole, grid, rows, cols) = self.with_fp8(&[name.to_string()], |values, grid, rows, cols| {
+            ensure!(rows % 128 == 0 && cols % (128 * ranks) == 0,
+                "{name}: [{rows}, {cols}] does not split into whole 128-K blocks over {ranks} GPUs");
+            Ok((self.upload(values)?, grid, rows, cols))
+        })?;
+        let width = cols / ranks;
+        let grid_bytes = f32_bytes(&grid);
+        let out = (0..ranks).map(|rank| {
+            let part = slice_2d(&grid_bytes, rows / 128, cols / 128, 4, Axis::Cols, rank, ranks);
+            self.on_rank(rank, |stream| {
+                let values = DeviceAllocation::new(self.library, rows * width)?;
+                let source = CuteafdDeviceBuffer {
+                    // SAFETY: column block `rank` of every row lies inside the whole weight.
+                    ptr: unsafe { whole.buffer.ptr.cast::<u8>().add(rank * width) }.cast(),
+                    bytes: whole.buffer.bytes - rank * width,
+                    ..whole.buffer
+                };
+                // SAFETY: both buffers are live and sized for these pitched spans; peer access
+                // to rank 0 is enabled on every rank (the split setup); drained below, before
+                // `whole` drops.
+                unsafe {
+                    self.library.copy_d2d_2d_async(values.buffer, width, source, cols, width, rows, stream)?;
+                    self.library.cuda_stream_synchronize(stream)?;
+                }
+                Ok((values, self.upload(&part)?))
+            })
+        }).collect();
+        drop(whole);
+        out
+    }
+
+    /// Every rank's copy of a small operand read once.
+    fn replicated(&self, ranks: usize, read: impl FnOnce() -> Result<Vec<u8>>) -> Result<Vec<DeviceAllocation<'a>>> {
+        let bytes = read()?;
+        (0..ranks).map(|rank| self.on_rank(rank, |_| self.upload(&bytes))).collect()
+    }
+
+    /// Layer `layer`, one share per rank of this loader's head split (one
+    /// element without a split): rank `r` takes heads `r * heads / ranks ..`
+    /// (their q_b rows, kv_b heads and o_proj columns) and the matching slice
+    /// of the dense or shared-expert intermediate; every rank the replicated
+    /// latent projection (q_a | kv_a), its norms and the DSA indexer; rank 0
+    /// the router.
+    pub fn layer(&self, cfg: &GlmDsaConfig, layer: usize) -> Result<Vec<GlmLayer<'a>>> {
+        let ranks = self.ranks();
         let p = format!("model.layers.{layer}");
         let dense = layer < cfg.first_moe_layer;
         let full_indexer = cfg.indexers[layer] == GlmIndexer::Full;
-        let mut ops: HashMap<&'static str, DeviceAllocation<'a>> = HashMap::new();
-        // The checkpoint's E4M3 bytes and FP32 scale grid: the only copy.
-        let with_fp8 = |ops: &mut HashMap<&'static str, DeviceAllocation<'a>>, name: &'static str,
-            parts: &[String]| -> Result<()> {
-            let (w8, scale) = self.fp8(parts)?;
+        let mut ops: Vec<HashMap<&'static str, DeviceAllocation<'a>>> = (0..ranks).map(|_| HashMap::new()).collect();
+        let put = |ops: &mut Vec<HashMap<&'static str, DeviceAllocation<'a>>>, key: &'static str,
+            parts: Vec<DeviceAllocation<'a>>| {
+            for (map, part) in ops.iter_mut().zip(parts) {
+                map.insert(key, part);
+            }
+        };
+        // The checkpoint's E4M3 bytes and FP32 scale grid: the only copy (per rank's slice).
+        let with_fp8 = |ops: &mut Vec<HashMap<&'static str, DeviceAllocation<'a>>>, name: &'static str,
+            parts: &[String], axis: Axis| -> Result<()> {
             let (w8_name, scale_name, _) = fp8_operand_names(name);
-            ops.insert(w8_name, w8);
-            ops.insert(scale_name, scale);
+            let split = if ranks > 1 { self.fp8_split(parts, axis, ranks)? } else { vec![self.fp8(parts)?] };
+            for (map, (w8, scale)) in ops.iter_mut().zip(split) {
+                map.insert(w8_name, w8);
+                map.insert(scale_name, scale);
+            }
             Ok(())
         };
-        ops.insert("input_norm", self.one(&format!("{p}.input_layernorm.weight"))?);
-        ops.insert("post_norm", self.one(&format!("{p}.post_attention_layernorm.weight"))?);
+        let raw = |name: &str| -> Result<Vec<u8>> {
+            let (bytes, dtype, shape) = self.raw(name)?;
+            ensure!(!(shape.len() == 2 && dtype == DType::F8E4M3), "{name}: replicated operands are not FP8");
+            Ok(bytes)
+        };
+        put(&mut ops, "input_norm", self.replicated(ranks, || raw(&format!("{p}.input_layernorm.weight")))?);
+        put(&mut ops, "post_norm", self.replicated(ranks, || raw(&format!("{p}.post_attention_layernorm.weight")))?);
         let qkv_a = [format!("{p}.self_attn.q_a_proj.weight"), format!("{p}.self_attn.kv_a_proj_with_mqa.weight")];
         let (values, scale, kscale) = self.with_fp8(&qkv_a, |values, grid, rows, cols| {
             // Prefill: per-row scales K-block major (the block-FP8 GEMM wants whole 128-row blocks).
             let kb = cols.div_ceil(128);
             let grid_ref = &grid;
             let kscale: Vec<f32> = (0..kb).flat_map(|b| (0..rows).map(move |r| grid_ref[(r / 128) * kb + b])).collect();
-            Ok((self.upload(values)?, self.upload(&f32_bytes(&grid))?, self.upload(&f32_bytes(&kscale))?))
+            let each = |bytes: &[u8]| -> Result<Vec<DeviceAllocation<'a>>> {
+                (0..ranks).map(|rank| self.on_rank(rank, |_| self.upload(bytes))).collect()
+            };
+            Ok((each(values)?, each(&f32_bytes(&grid))?, each(&f32_bytes(&kscale))?))
         })?;
-        ops.insert("w_qkv_a_fp8", values);
-        ops.insert("w_qkv_a_scale", scale);
-        ops.insert("w_qkv_a_kscale", kscale);
-        ops.insert("q_a_norm", self.one(&format!("{p}.self_attn.q_a_layernorm.weight"))?);
-        ops.insert("kv_a_norm", self.one(&format!("{p}.self_attn.kv_a_layernorm.weight"))?);
-        with_fp8(&mut ops, "w_q_b", &[format!("{p}.self_attn.q_b_proj.weight")])?;
-        let ((uk, uk_scale), (uv, uv_scale)) = self.kv_b(cfg, &p)?;
-        ops.insert("w_uk_fp8", uk);
-        ops.insert("w_uk_scale", uk_scale);
-        ops.insert("w_uv_fp8", uv);
-        ops.insert("w_uv_scale", uv_scale);
-        with_fp8(&mut ops, "w_o", &[format!("{p}.self_attn.o_proj.weight")])?;
+        put(&mut ops, "w_qkv_a_fp8", values);
+        put(&mut ops, "w_qkv_a_scale", scale);
+        put(&mut ops, "w_qkv_a_kscale", kscale);
+        put(&mut ops, "q_a_norm", self.replicated(ranks, || raw(&format!("{p}.self_attn.q_a_layernorm.weight")))?);
+        put(&mut ops, "kv_a_norm", self.replicated(ranks, || raw(&format!("{p}.self_attn.kv_a_layernorm.weight")))?);
+        // q_b rows are head-major (each head's 192 + 64 query rows): whole heads per rank.
+        with_fp8(&mut ops, "w_q_b", &[format!("{p}.self_attn.q_b_proj.weight")], Axis::Rows)?;
+        for (rank, ((uk, uk_scale), (uv, uv_scale))) in self.kv_b(cfg, &p, ranks)?.into_iter().enumerate() {
+            ops[rank].insert("w_uk_fp8", uk);
+            ops[rank].insert("w_uk_scale", uk_scale);
+            ops[rank].insert("w_uv_fp8", uv);
+            ops[rank].insert("w_uv_scale", uv_scale);
+        }
+        with_fp8(&mut ops, "w_o", &[format!("{p}.self_attn.o_proj.weight")], Axis::Cols)?;
         if full_indexer {
-            with_fp8(&mut ops, "w_iq", &[format!("{p}.self_attn.indexer.wq_b.weight")])?;
-            ops.insert("w_ik", self.rows(&[format!("{p}.self_attn.indexer.wk.weight"),
-                format!("{p}.self_attn.indexer.weights_proj.weight")])?);
-            ops.insert("k_norm_w", self.one(&format!("{p}.self_attn.indexer.k_norm.weight"))?);
-            ops.insert("k_norm_b", self.one(&format!("{p}.self_attn.indexer.k_norm.bias"))?);
+            for (key, name) in [("w_iq", format!("{p}.self_attn.indexer.wq_b.weight"))] {
+                let (w8_name, scale_name, _) = fp8_operand_names(key);
+                let (values, grid) = self.with_fp8(&[name], |values, grid, _, _| Ok((values.to_vec(), f32_bytes(&grid))))?;
+                put(&mut ops, w8_name, self.replicated(ranks, || Ok(values))?);
+                put(&mut ops, scale_name, self.replicated(ranks, || Ok(grid))?);
+            }
+            // `w_ik`: BF16 (FP8 `wk` dequantized) on rank 0, copied to the others.
+            let w_ik = self.rows(&[format!("{p}.self_attn.indexer.wk.weight"),
+                format!("{p}.self_attn.indexer.weights_proj.weight")])?;
+            let mut copies = vec![];
+            for rank in 1..ranks {
+                let mut host = vec![0u8; w_ik.buffer.bytes];
+                self.library.copy_d2h(&mut host, w_ik.buffer)?;
+                copies.push(self.on_rank(rank, |_| self.upload(&host))?);
+            }
+            put(&mut ops, "w_ik", std::iter::once(w_ik).chain(copies).collect());
+            put(&mut ops, "k_norm_w", self.replicated(ranks, || raw(&format!("{p}.self_attn.indexer.k_norm.weight")))?);
+            put(&mut ops, "k_norm_b", self.replicated(ranks, || raw(&format!("{p}.self_attn.indexer.k_norm.bias")))?);
         }
         let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
-        with_fp8(&mut ops, "w_gate_up", &[format!("{mlp}.gate_proj.weight"), format!("{mlp}.up_proj.weight")])?;
-        with_fp8(&mut ops, "w_down", &[format!("{mlp}.down_proj.weight")])?;
+        with_fp8(&mut ops, "w_gate_up", &[format!("{mlp}.gate_proj.weight"), format!("{mlp}.up_proj.weight")], Axis::Rows)?;
+        with_fp8(&mut ops, "w_down", &[format!("{mlp}.down_proj.weight")], Axis::Cols)?;
         if !dense {
-            ops.insert("gate", self.one(&format!("{p}.mlp.gate.weight"))?);
-            ops.insert("gate.bias", self.one(&format!("{p}.mlp.gate.e_score_correction_bias"))?);
+            ops[0].insert("gate", self.one(&format!("{p}.mlp.gate.weight"))?);
+            ops[0].insert("gate.bias", self.one(&format!("{p}.mlp.gate.e_score_correction_bias"))?);
         }
-        Ok(GlmLayer { dense, full_indexer, operands: ops })
+        Ok(ops.into_iter().map(|operands| GlmLayer { dense, full_indexer, split: ranks > 1, operands }).collect())
     }
 
-    /// Layers `0..layers` (all of them unless the caller stops early).
-    pub fn model(&self, cfg: &GlmDsaConfig, layers: usize) -> Result<GlmWeights<'a>> {
+    /// Layers `0..layers` (all of them unless the caller stops early): rank 0's
+    /// weights (its layer shares, the norm and head) and with a head split the
+    /// other rank's layer shares.
+    #[allow(clippy::type_complexity)]
+    pub fn model(&self, cfg: &GlmDsaConfig, layers: usize) -> Result<(GlmWeights<'a>, Vec<Vec<GlmLayer<'a>>>)> {
+        let mut shares: Vec<Vec<GlmLayer<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
+        for layer in 0..layers.min(cfg.layers) {
+            for (share, part) in shares.iter_mut().zip(self.layer(cfg, layer)?) {
+                share.push(part);
+            }
+        }
+        let mut shares = shares.into_iter();
         let weights = GlmWeights {
-            layers: (0..layers.min(cfg.layers)).map(|l| self.layer(cfg, l)).collect::<Result<_>>()?,
+            layers: shares.next().context("rank 0")?,
             norm: self.one("model.norm.weight")?,
             head: self.one("lm_head.weight")?,
         };
         crate::shared::memory::staging::release_staging();
-        Ok(weights)
+        Ok((weights, shares.collect()))
     }
 }

@@ -103,12 +103,12 @@ case "$speculator" in
   mtp) family_args+=(--mtp "$(key SPECULATOR_DEPTH MTP 1)") ;;
   dspark) dspark_args=(--dspark) ;;
 esac
-# Prefix cache (MiMo, GLM 5.3, GLM 5.3 Flash): PREFIX_CACHE_ENTRIES snapshots per bank
-# (prompts, turns; 0 = off), HOST_CACHE_BYTES of pinned host memory for snapshots the
-# device evicts (e.g. 64GiB; 0 = off). POOL_TOKENS: paged KV tokens shared by live
-# sequences and retained snapshots.
+# Prefix cache (MiMo, GLM 5.3, GLM 5.3 Flash, Qwen 3.8, DeepSeek V4): PREFIX_CACHE_ENTRIES
+# snapshots per bank (prompts, turns; 0 = off), HOST_CACHE_BYTES of pinned host memory for
+# snapshots the device evicts (e.g. 64GiB; 0 = off). POOL_TOKENS: paged KV tokens shared by
+# live sequences and retained snapshots.
 case $family in
-  mimo_v2|glm5|glm5_flash)
+  mimo_v2|glm5|glm5_flash|qwen4|deepseek_v4)
     family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
     [[ "$(get HOST_CACHE_BYTES 0)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES)") ;;
 esac
@@ -117,7 +117,7 @@ if [[ $family == mimo_v2 ]]; then
   # PREFIX_PARTIAL=on: V4.1-style partial reuse (approximate; off = exact restores only).
   family_args+=(--prefix-partial "$(get PREFIX_PARTIAL off)")
 fi
-[[ $family != glm5 || -z "$(get POOL_TOKENS)" ]] || family_args+=(--pool-tokens "$(get POOL_TOKENS)")
+[[ ! $family =~ ^(glm5|qwen4|deepseek_v4)$ || -z "$(get POOL_TOKENS)" ]] || family_args+=(--pool-tokens "$(get POOL_TOKENS)")
 # GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
 # from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" quantizes the
 # BF16 checkpoint's at load); KDA projections get per-row FP8 decode copies
@@ -184,6 +184,47 @@ addr="$(get ADDR 0.0.0.0:8000)"
 ranks="$(get SPARK_COUNT 4)"
 budget="$(get SPARK_DEVICE_BUDGET_BYTES 107374182400)"
 gpu="$(get COORDINATOR_GPU 0)"
+# Two coordinator GPUs (RTX_GPUS=auto/2 with COORDINATOR_GPU as V4.1's two-RTX config picks
+# the other card, or an explicit COORDINATOR_GPUS=0,1): families with a
+# head split (MiMo V2.6 Pro, GLM 5.x) split every layer's attention heads and dense /
+# shared-expert MLPs over both by default (COORDINATOR_SPLIT=auto or heads), one hidden
+# all-reduce per layer over peer memory; experts, router, head and drafter stay on the
+# first GPU. COORDINATOR_SPLIT=off serves from the first GPU alone. Families without a
+# split use the first GPU (the serve command logs it for MiMo V2 Flash). The container
+# sees both GPUs in host order. COORDINATOR_SPLIT_GPU names the second GPU when only
+# COORDINATOR_GPU is set (default the other of 0/1).
+coordinator_gpus="$(get COORDINATOR_GPUS)"
+if [[ -z "$coordinator_gpus" ]]; then
+  coordinator_gpus="$gpu"
+  case "$(get RTX_GPUS auto)" in
+    1) ;;
+    2|auto)
+      other="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | tr -d ' ' | grep -vx "$gpu" | head -n 1)"
+      [[ -z "$other" ]] || coordinator_gpus="$gpu,$other" ;;
+    *) echo "RTX_GPUS must be auto, 1 or 2" >&2; exit 2 ;;
+  esac
+fi
+IFS=, read -r -a coordinator_gpus <<<"$coordinator_gpus"
+gpu="${coordinator_gpus[0]}"
+split="$(get COORDINATOR_SPLIT auto)"
+case "$split" in auto|heads|off) ;; *) echo "COORDINATOR_SPLIT must be auto, heads or off" >&2; exit 2 ;; esac
+second=""
+if [[ ${#coordinator_gpus[@]} -ge 2 ]]; then
+  second="${coordinator_gpus[1]}"
+elif [[ "$split" == heads ]]; then
+  second="$(get COORDINATOR_SPLIT_GPU $((1 - gpu)))"
+fi
+gpus="device=$gpu"
+if [[ -n "$second" && "$split" != off ]]; then
+  [[ "$second" != "$gpu" ]] || { echo "the second coordinator GPU must differ from the first" >&2; exit 2; }
+  case "$family" in
+    mimo_v2|glm5)
+      lower=$((gpu < second ? gpu : second)) upper=$((gpu < second ? second : gpu))
+      gpus="\"device=$lower,$upper\""
+      family_args+=(--device $((gpu == lower ? 0 : 1)) --split-device $((gpu == lower ? 1 : 0))) ;;
+    *) echo "note: $family has no head split; serving from GPU $gpu alone" >&2 ;;
+  esac
+fi
 peers=()
 # --restart removes this launcher's containers (stop.sh's release parser rejects
 # the keys above, e.g. SPECULATOR).
@@ -225,7 +266,7 @@ peer_csv="$(IFS=,; echo "${peers[*]}")"
 # or host; see rust/crates/cuteafd-daemon/src/shared/spark_intake.rs).
 intake="$(get SPARK_INTAKE auto)"
 case "$intake" in auto|gpu|pinned|host) ;; *) echo "SPARK_INTAKE must be auto, gpu, pinned or host" >&2; exit 2 ;; esac
-docker run -d --name cuteafd-coordinator --restart no --gpus "device=$gpu" --network host --ipc host \
+docker run -d --name cuteafd-coordinator --restart no --gpus "$gpus" --network host --ipc host \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e "CUTEAFD_SPARK_INTAKE=$intake" \
   -v "$hub:/root/.cache/huggingface/hub:ro" \
   "${trace_args[@]}" "$coordinator_image" cuteafd $serve --snapshot "$snapshot" \

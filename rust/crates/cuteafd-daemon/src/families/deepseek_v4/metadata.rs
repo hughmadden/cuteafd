@@ -169,7 +169,7 @@ pub(crate) fn prefill_step(
         c128_tables,
         c4_groups,
         c128_groups: end / 128,
-        c4_page_table: placement.c4_pages.clone(),
+        c4_page_table: placement.pages.clone(),
         c4_table_width: c4_groups.div_ceil(compressed_page_rows(4)).max(1),
         c4_table_stride: 0,
         c4_indexed_lengths: visible4.iter().map(|&v| v.min(index_topk as i32)).collect(),
@@ -202,7 +202,7 @@ pub(crate) fn decode_step(
         c128_groups: 0,
         c4_page_table: Vec::new(),
         c4_table_width: 1,
-        c4_table_stride: rows.iter().map(|(p, _)| p.c4_pages.len()).max().unwrap_or(1),
+        c4_table_stride: rows.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1),
         c4_visible: Vec::with_capacity(n),
         c4_indexed_lengths: Vec::with_capacity(n),
         c128_indices: vec![-1; n * c128_width],
@@ -240,7 +240,7 @@ pub(crate) fn decode_step(
         tables.c4_visible.push(visible4 as i32);
         tables.c4_indexed_lengths.push(visible4.min(index_topk) as i32);
         tables.c4_table_width = tables.c4_table_width.max(visible4.div_ceil(compressed_page_rows(4)));
-        let mut pages = placement.c4_pages.clone();
+        let mut pages = placement.pages.clone();
         pages.resize(tables.c4_table_stride, pages.last().copied().unwrap_or(0));
         tables.c4_page_table.extend(pages);
         for j in 0..visible128.min(c128_width) {
@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn prefill_and_decode_tables_use_physical_slots() -> anyhow::Result<()> {
-        let shape = PoolShape::new(2, 131_072, 4096, 64, 64);
+        let shape = PoolShape::new(2, 4096, 64);
         let mut pool = PoolAllocator::new(shape);
         let _other = pool.admit(1000)?;
         let seq = pool.admit(1000)?;

@@ -106,6 +106,18 @@ mod tests {
         let segments = layout.segments();
         assert_eq!(segments[1], QkvSegment { source_row: 3072, scale_row: 24, dest_row: 24576, rows: 192 });
         assert_eq!(segments[5], QkvSegment { source_row: 3392 + 3264, scale_row: 27 + 26, dest_row: 26112 + 128, rows: 128 });
+        // A two-GPU head split: each GPU takes four whole checkpoint shards (64 query heads,
+        // 4 KV heads), the same per-shard layout at half the rows and grid rows.
+        let share = cfg.head_split(2)?;
+        assert_eq!((share.heads, share.full_kv_heads, share.dense_intermediate), (64, 4, 8192));
+        assert_eq!((share.program_family()?, share.qkv_key_stride()), ("mimop2", 256));
+        let half = FusedQkvLayout::new(&share, MimoAttention::Full, 4)?;
+        assert_eq!((half.rows() * 2, half.scale_rows() * 2), (layout.rows(), layout.scale_rows()));
+        // Rank 0's sources are the first four shards' (destinations follow the half layout).
+        let source = |s: &[QkvSegment]| s.iter().map(|s| (s.source_row, s.scale_row, s.rows)).collect::<Vec<_>>();
+        assert_eq!(source(&half.segments()), source(&segments[..12]));
+        assert_eq!(half.segments()[1].dest_row, 64 * 192);
+        assert!(cfg.head_split(3).is_err());
         Ok(())
     }
 }

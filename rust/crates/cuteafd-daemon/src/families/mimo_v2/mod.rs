@@ -26,6 +26,12 @@ pub(crate) struct EngineArgs {
     pub manifest: PathBuf,
     #[arg(long, default_value_t = 0)]
     pub device: i32,
+    /// Split every layer's attention heads (and the dense MLP) over --device
+    /// and this second GPU (MiMo V2.6 Pro: 64 query / 4 KV heads each, KV
+    /// partitioned), one hidden all-reduce per layer over peer memory. Routed
+    /// experts, the router, LM head and drafters stay on --device.
+    #[arg(long)]
+    pub split_device: Option<i32>,
     /// Run only the first N layers (layer 0 is the only dense layer).
     #[arg(long)]
     pub layers: Option<usize>,
@@ -212,12 +218,35 @@ impl Opened {
         let draft_dir = args.draft.as_deref().map(dflash::drafter_dir);
         let draft_file = draft_dir.as_deref().map(dflash::prefetch);
         let stream = self.library.cuda_stream_create()?;
+        // The head split's second GPU and its stream (load kernels, then the engine's).
+        // The head split exists for V2.6 Pro's geometry (`mimop2`); V2 Flash serves from --device.
+        let split_device = match args.split_device {
+            Some(device) if self.cfg.head_split(2).and_then(|share| share.program_family()).is_ok() => Some(device),
+            Some(device) => {
+                tracing::info!(device, "this MiMo geometry has no head split; serving from --device alone");
+                None
+            }
+            None => None,
+        };
+        let peer_stream = match split_device {
+            Some(device) => {
+                ensure!(device != args.device, "--split-device must differ from --device");
+                // Peer access both ways first: the loader slices weights over peer copies.
+                self.library.cuda_enable_peer(device)?;
+                self.library.cuda_set_device(device)?;
+                let stream = self.library.cuda_enable_peer(args.device).and_then(|()| self.library.cuda_stream_create());
+                self.library.cuda_set_device(args.device)?;
+                Some((device, stream?))
+            }
+            None => None,
+        };
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::MimoLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
             checkpoint_tp: cuteafd_loader::families::mimo_v2::checkpoint_tp(&args.snapshot)?, fp8_decode: args.fp8_decode,
-            fp8_head: args.fp8_head, fp8_o_proj: args.fp8_o_proj, fp8_scales: args.fp8_scales };
-        let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
+            fp8_head: args.fp8_head, fp8_o_proj: args.fp8_o_proj, fp8_scales: args.fp8_scales, device: args.device,
+            peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream }).collect() };
+        let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
             args.token_io.embed_placement, || loader.model(&self.cfg, layers))?;
         let mtp = if args.mtp > 0 {
             let started = Instant::now();
@@ -249,12 +278,17 @@ impl Opened {
         };
         let bytes: usize = model.layers.iter().map(|l| l.bytes()).sum::<usize>() + model.norm.buffer.bytes
             + model.head.buffer.bytes + model.head_fp8.as_ref().map_or(0, |(q, s)| q.buffer.bytes + s.buffer.bytes);
+        let peer_bytes: usize = shares.iter().flatten().map(|l| l.bytes()).sum();
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64,
-            gib = format!("{:.2}", bytes as f64 / (1u64 << 30) as f64), "MiMo coordinator weights resident");
+            gib = format!("{:.2}", bytes as f64 / (1u64 << 30) as f64),
+            split_gib = format!("{:.2}", peer_bytes as f64 / (1u64 << 30) as f64), "MiMo coordinator weights resident");
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::MimoEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages, args.rings, embedding)?;
         engine.prefill_w8a8 = !args.prefill_w8a16;
+        if let Some((device, stream)) = peer_stream {
+            engine.attach_peer(device, stream, shares.pop().context("head-split shares")?)?;
+        }
         engine.mtp = mtp;
         if let Some(dir) = &draft_dir {
             let started = Instant::now();
@@ -285,8 +319,16 @@ impl Opened {
         }
         let result = body(&engine);
         drop(engine);
-        // SAFETY: the engine that used the stream is gone.
-        unsafe { self.library.cuda_stream_destroy(stream)? };
+        // SAFETY: the engine that used the streams is gone.
+        unsafe {
+            self.library.cuda_stream_destroy(stream)?;
+            if let Some((device, stream)) = peer_stream {
+                self.library.cuda_set_device(device)?;
+                let destroyed = self.library.cuda_stream_destroy(stream);
+                self.library.cuda_set_device(args.device)?;
+                destroyed?;
+            }
+        }
         result
     }
 }
@@ -508,7 +550,9 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
     let mut decode_worst = Vec::new();
     let mut decode_logits: Vec<f32> = Vec::new();
     let mut position = prefill;
+    let mut step_times = Vec::new();
     while position < tokens.len() {
+        let step_started = Instant::now();
         let n = args.step_rows.min(tokens.len() - position);
         let first = position;
         let mut step_compare = |layer: usize, stream: &[u8]| compare(layer, first, stream, &mut decode_worst);
@@ -520,11 +564,17 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
             }
         }
         position += n;
+        step_times.push(step_started.elapsed().as_secs_f64());
     }
     if prefill < tokens.len() {
         println!("decode: {} rows in steps of {} in {:.4} s; worst row-block cosine per layer {:?}", tokens.len() - prefill,
             args.step_rows, started.elapsed().as_secs_f64(),
             decode_worst.iter().map(|c| format!("{c:.6}")).collect::<Vec<_>>());
+        // Warm step time: the median after the first step (which allocates the decode workspaces).
+        let mut warm = step_times[1.min(step_times.len() - 1)..].to_vec();
+        warm.sort_by(f64::total_cmp);
+        println!("decode steps of {}: warm median {:.3} ms, first {:.3} ms", args.step_rows, 1e3 * warm[warm.len() / 2],
+            1e3 * step_times[0]);
     }
     let golden_logits = || -> Result<Vec<f32>> {
         Ok(std::fs::read(args.golden.join("logits.bin"))?

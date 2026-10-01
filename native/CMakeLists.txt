@@ -44,9 +44,11 @@ option(CUTEAFD_ENABLE_V41_HC_LAGGED_AOT "Build candidate native lagged mHC begin
 option(CUTEAFD_ENABLE_V41_FP8_AOT "Build native V4.1 coordinator FP8 AOT kernels" OFF)
 option(CUTEAFD_ENABLE_DSV4_AOT "Build the DeepSeek V4 coordinator programs" OFF)
 option(CUTEAFD_ENABLE_GLM_AOT "Build the GLM 5.x coordinator programs (same table as DeepSeek V4)" OFF)
+set(CUTEAFD_GLM_GEOMETRIES "glm" CACHE STRING
+  "GLM program geometries with CUTEAFD_ENABLE_GLM_AOT: glm (GLM 5.x), glm2 (its two-GPU head split)")
 option(CUTEAFD_ENABLE_MIMO_AOT "Build the MiMo V2 coordinator programs (same table as DeepSeek V4)" OFF)
 set(CUTEAFD_MIMO_GEOMETRIES "mimo" CACHE STRING
-  "MiMo program geometries with CUTEAFD_ENABLE_MIMO_AOT: mimo (V2 Flash), mimop (V2.6 Pro)")
+  "MiMo program geometries with CUTEAFD_ENABLE_MIMO_AOT: mimo (V2 Flash), mimop (V2.6 Pro), mimop2 (V2.6 Pro head split)")
 option(CUTEAFD_ENABLE_GLMF_AOT "Build the GLM 5.3 Flash coordinator programs (same table as DeepSeek V4)" OFF)
 option(CUTEAFD_ENABLE_QWEN4_AOT "Build the Qwen 3.8 Flash Next coordinator programs (same table as DeepSeek V4)" OFF)
 set(CUTEAFD_DSV4_GEOMETRY "flash,pro" CACHE STRING "DeepSeek V4 program geometries, comma-separated: flash, pro")
@@ -289,6 +291,7 @@ if(CUTEAFD_ENABLE_CUDA)
     families/deepseek_v41/cuda/v41_kv.cu
     families/deepseek_v41/cuda/v41_sparse_attention.cu
     shared/cuda/peer_copy.cu
+    shared/cuda/peer_exchange.cu
     families/deepseek_v41/cuda/v41_index_scores.cu
     families/deepseek_v41/cuda/v41_index_topk.cu
     families/deepseek_v41/cuda/v41_candidate_blocks.cu
@@ -316,9 +319,9 @@ if(CUTEAFD_ENABLE_CUDA)
   endif()
 endif()
 
-if(CUTEAFD_ENABLE_V41_EXPERT_AOT OR CUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT OR
-   CUTEAFD_ENABLE_V41_TP2_EXPERT_AOT OR CUTEAFD_ENABLE_EXL3_PACKAGES OR CUTEAFD_ENABLE_V41_NVFP4_AOT OR CUTEAFD_ENABLE_V41_FP8_AOT OR CUTEAFD_ENABLE_V41_ATTENTION_AOT OR
-   CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_FP8_EXPERT_FAMILIES)
+# Every CuTe-DSL AOT export (any program table, expert kernels, EXL3/FP8 packages) calls
+# into the CuTe DSL runtime: one condition finds it and links it.
+if(CUTEAFD_BUILD_SPARKINFER_AOT)
   execute_process(
     COMMAND "${Python3_EXECUTABLE}" -m cutlass.cute.export.aot_config --libdir
     OUTPUT_VARIABLE CUTEAFD_B12X_AOT_RUNTIME_DIR
@@ -438,9 +441,7 @@ if(CUTEAFD_ENABLE_CUDA)
 else()
   target_compile_definitions(cuteafd_native PRIVATE CUTEAFD_NATIVE_ENABLE_CUDA=0)
 endif()
-if(CUTEAFD_ENABLE_V41_EXPERT_AOT OR CUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT OR
-   CUTEAFD_ENABLE_V41_TP2_EXPERT_AOT OR CUTEAFD_ENABLE_EXL3_PACKAGES OR CUTEAFD_ENABLE_V41_NVFP4_AOT OR CUTEAFD_ENABLE_V41_FP8_AOT OR CUTEAFD_ENABLE_V41_ATTENTION_AOT OR
-   CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR CUTEAFD_ENABLE_QWEN4_AOT)
+if(CUTEAFD_BUILD_SPARKINFER_AOT)
   target_link_libraries(cuteafd_native PUBLIC "${CUTEAFD_B12X_AOT_RUNTIME_LIBRARY}")
   set_property(TARGET cuteafd_native APPEND PROPERTY BUILD_RPATH "${CUTEAFD_B12X_AOT_RUNTIME_DIR}")
 endif()

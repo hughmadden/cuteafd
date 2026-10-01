@@ -3,6 +3,7 @@ pub(crate) mod engine;
 pub(crate) mod local;
 pub(crate) mod metadata;
 pub(crate) mod pool;
+pub(crate) mod prefix;
 pub(crate) mod serve;
 pub(crate) mod weights;
 
@@ -87,6 +88,34 @@ pub(crate) struct GoldenArgs {
     /// against host sampling.
     #[arg(long)]
     pub token_check: Option<usize>,
+    /// Prefix-cache restore check at each token P (comma separated): prefill the first P tokens
+    /// (of --prefill, default P + --resume-span), capture their snapshot (shared units, the
+    /// copied tail unit, the window/compressor mark), restore it into a second sequence,
+    /// continue both (prefill in --prefill-chunk rows, then --resume-decode greedy steps) and
+    /// compare every layer's rows, the logits, the paged rows, the final positional state and
+    /// the mark round trip byte for byte (a restore must be exact). Every P runs with every
+    /// --prefill-chunk. Needs --max-sequences 3 or more.
+    #[arg(long, value_delimiter = ',')]
+    pub resume_at: Vec<usize>,
+    /// Prefill chunk rows of --resume-at, comma separated (default the engine's prefill rows).
+    #[arg(long, value_delimiter = ',')]
+    pub prefill_chunk: Vec<usize>,
+    /// Tokens prefilled past P by --resume-at without --prefill.
+    #[arg(long, default_value_t = 1000)]
+    pub resume_span: usize,
+    #[arg(long, default_value_t = 4)]
+    pub resume_decode: usize,
+    /// With --resume-at: prefill the second sequence cold on its own units instead of
+    /// restoring it (the floor: what page placement alone changes).
+    #[arg(long, hide = true)]
+    pub resume_cold: bool,
+    /// --resume-at attempts on fresh sequences per case (all must be byte-identical).
+    #[arg(long, default_value_t = 1)]
+    pub resume_repeat: usize,
+    /// --resume-at prefills as serving does (chunks of 512 rows or more split into two lanes,
+    /// up to twice the prefill rows per chunk); layer streams are then not compared.
+    #[arg(long)]
+    pub resume_lanes: bool,
 }
 
 fn f32s(bytes: &[u8]) -> Vec<f32> {
@@ -147,10 +176,13 @@ pub(crate) fn load(args: &EngineArgs) -> Result<Loaded> {
 }
 
 /// Builds the engine over `loaded` and hands it, with a Spark transport and a
-/// runtime for it, to `body`.
+/// runtime for it, to `body`. `held` is the device memory `body` allocates
+/// besides the engine's workspaces (the prefix cache's mark arena): it is kept
+/// free of local experts.
 pub(crate) fn with_engine<T>(
     loaded: &Loaded,
     args: &EngineArgs,
+    held: impl FnOnce(&engine::Engine<'_>) -> Result<usize>,
     body: impl FnOnce(&engine::Engine<'_>, &mut [SparkLink<'_>], &tokio::runtime::Runtime) -> Result<T>,
 ) -> Result<T> {
     let programs = loaded.library.programs()?.with_manifest(&args.manifest)?;
@@ -169,10 +201,8 @@ pub(crate) fn with_engine<T>(
     let max_context = caps["max_context"].as_u64().context("manifest max_context")? as usize;
     let shape = pool::PoolShape::new(
         args.max_sequences,
-        max_context,
         caps["prefill_rows"].as_u64().context("prefill_rows")? as usize,
-        (args.pool_tokens / 4).div_ceil(64) + args.max_sequences,
-        (args.pool_tokens / 128).div_ceil(2) + args.max_sequences,
+        pool::PoolShape::units_for(args.pool_tokens, args.max_sequences),
     );
     let skip = args.skip_routed_experts;
     let peers = args.peers.split(',').filter(|p| !p.is_empty()).map(str::parse)
@@ -199,8 +229,9 @@ pub(crate) fn with_engine<T>(
         embedding,
         skip_routed: skip,
     })?;
+    let held = held(&engine)?;
     let (free, _) = loaded.library.cuda_memory_info()?;
-    let budget = free.saturating_sub(args.reserve_gib << 30);
+    let budget = free.saturating_sub(args.reserve_gib << 30).saturating_sub(held);
     let started = Instant::now();
     let stages = if args.dspark { engine.weights.dspark.as_ref().map_or(0, |d| d.stages.len()) } else { 0 };
     let local = if skip { None } else { local::LocalExperts::load(&loaded.library, &args.native_lib, &loaded.catalog, stages,
@@ -235,10 +266,29 @@ pub(crate) fn with_engine<T>(
 fn golden(args: GoldenArgs) -> Result<()> {
     let loaded = load(&args.engine)?;
     let cfg = loaded.cfg.clone();
-    with_engine(&loaded, &args.engine, |engine, transports, runtime| match args.token_check {
+    with_engine(&loaded, &args.engine, |_| Ok(0), |engine, transports, runtime| match args.token_check {
         Some(steps) => token_check(&args, &loaded, engine, transports, runtime, steps),
+        None if !args.resume_at.is_empty() => resume(&args, engine, transports, runtime),
         None => golden_run(&args, &cfg, engine, transports, runtime),
     })
+}
+
+/// `--resume-at P,..`: [`prefix::resume_check`] for every P and every --prefill-chunk.
+fn resume(args: &GoldenArgs, engine: &engine::Engine<'_>, transports: &mut [SparkLink<'_>],
+    runtime: &tokio::runtime::Runtime) -> Result<()> {
+    let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
+        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let chunks = if args.prefill_chunk.is_empty() { vec![engine.prefill_rows] } else { args.prefill_chunk.clone() };
+    let cases: Vec<prefix::ResumeCase> = chunks.iter().flat_map(|&chunk| args.resume_at.iter().map(move |&at| (at, chunk)))
+        .map(|(at, chunk)| prefix::ResumeCase { at, n: args.prefill.unwrap_or(at + args.resume_span).min(tokens.len()),
+            chunk })
+        .collect();
+    let mut runner = prefix::Runner { engine, transports, runtime, lanes: args.resume_lanes };
+    let passed = prefix::resume_check(&mut runner, &tokens, &cases, args.resume_decode, args.resume_cold,
+        args.resume_repeat)?;
+    ensure!(passed, "a restored sequence differs from the straight one (see above)");
+    println!("resume check: all {} cases byte-identical", cases.len());
+    Ok(())
 }
 
 fn golden_run(

@@ -188,6 +188,8 @@ impl MimoV2Config {
         match (self.hidden, self.heads, self.full_kv_heads, self.swa_kv_heads, self.experts) {
             (4096, 64, 4, 8, 256) => Ok("mimo"),
             (6144, 128, 8, 8, 384) => Ok("mimop"),
+            // One GPU of V2.6 Pro's two-GPU head split (`head_split(2)`).
+            (6144, 64, 4, 4, 384) => Ok("mimop2"),
             other => anyhow::bail!("no mimo program geometry for (hidden, heads, full KV, SWA KV, experts) {other:?}: \
                 add a MiMoGeometry to b12x.integration.cuteafd._common and an exporter entry"),
         }
@@ -196,7 +198,21 @@ impl MimoV2Config {
     /// Rows between key heads in the coordinator's qkv layout: 192, or 256 for
     /// `mimop` (keys zero-padded to whole 128-row blocks; see `FusedQkvLayout`).
     pub fn qkv_key_stride(&self) -> usize {
-        if self.program_family().ok() == Some("mimop") { 256 } else { self.head_dim }
+        if matches!(self.program_family().ok(), Some("mimop" | "mimop2")) { 256 } else { self.head_dim }
+    }
+
+    /// One GPU's share of a head split over `ranks` GPUs: `heads / ranks` query
+    /// heads with the KV heads they read (`kv / ranks`, partitioned, not
+    /// replicated) and `dense_intermediate / ranks` of the dense MLP. Rank `r`
+    /// owns query heads `r * heads / ranks ..`, KV heads `r * kv / ranks ..` (GQA
+    /// groups stay whole) and the matching o_proj columns.
+    pub fn head_split(&self, ranks: usize) -> Result<Self> {
+        ensure!(ranks > 0 && self.heads % ranks == 0 && self.full_kv_heads % ranks == 0
+            && self.swa_kv_heads % ranks == 0 && self.dense_intermediate % (ranks * 128) == 0,
+            "{} query / {}+{} KV heads and a {}-wide dense MLP do not split over {ranks} GPUs", self.heads,
+            self.full_kv_heads, self.swa_kv_heads, self.dense_intermediate);
+        Ok(Self { heads: self.heads / ranks, full_kv_heads: self.full_kv_heads / ranks,
+            swa_kv_heads: self.swa_kv_heads / ranks, dense_intermediate: self.dense_intermediate / ranks, ..self.clone() })
     }
 
     pub fn kv_heads(&self, attention: MimoAttention) -> usize {

@@ -123,3 +123,32 @@ def test_speculator_and_its_pre_rename_keys_launch_the_same(tmp_path: Path) -> N
     assert "deprecated" in old and "deprecated" not in new
     bad = _family_launch_lines(tmp_path / "c", config, "XiaomiMiMo/MiMo-V2-Flash", "SPECULATOR=dspark\n")
     assert "does not apply to mimo_v2" in bad
+
+
+def test_qwen_launches_with_the_prefix_cache_keys(tmp_path: Path) -> None:
+    config = {"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
+                                                         "layer_types": ["linear_attention", "full_attention"]}}
+    keys = "PREFIX_CACHE_ENTRIES=8\nHOST_CACHE_BYTES=16GiB\nPOOL_TOKENS=65536\n"
+    text = _family_launch_lines(tmp_path / "a", config, "Qwen/Qwen3.8-Flash-Next", keys)
+    launch = [l for l in text.splitlines() if "cuteafd serve-qwen4" in l]
+    assert launch, text
+    for flag in ("--prefix-cache-entries 8", "--host-cache-bytes 16GiB", "--pool-tokens 65536"):
+        assert flag in launch[0], flag
+    default = _family_launch_lines(tmp_path / "b", config, "Qwen/Qwen3.8-Flash-Next", "")
+    launch = [l for l in default.splitlines() if "cuteafd serve-qwen4" in l]
+    assert "--prefix-cache-entries 20" in launch[0]
+    assert "--host-cache-bytes" not in launch[0] and "--pool-tokens" not in launch[0]
+
+
+def test_deepseek_v4_launches_with_the_prefix_cache_keys(tmp_path: Path) -> None:
+    config = {"model_type": "deepseek_v4"}
+    keys = "PREFIX_CACHE_ENTRIES=12\nHOST_CACHE_BYTES=32GiB\nPOOL_TOKENS=524288\nSPECULATOR=dspark\n"
+    text = _family_launch_lines(tmp_path / "a", config, "deepseek-ai/DeepSeek-V4-Flash-0731", keys)
+    launch = [l for l in text.splitlines() if "cuteafd serve-dsv4" in l]
+    assert launch, text
+    for flag in ("--prefix-cache-entries 12", "--host-cache-bytes 32GiB", "--pool-tokens 524288", "--dspark"):
+        assert flag in launch[0], flag
+    default = _family_launch_lines(tmp_path / "b", config, "deepseek-ai/DeepSeek-V4-Flash-0731", "")
+    launch = [l for l in default.splitlines() if "cuteafd serve-dsv4" in l]
+    assert "--prefix-cache-entries 20" in launch[0]
+    assert "--host-cache-bytes" not in launch[0] and "--pool-tokens" not in launch[0]

@@ -30,7 +30,8 @@
 //! sink for the first replayed rows); approximate by design, not byte-exact.
 //!
 //! Every copy is enqueued on the engine stream, in order with the forward passes, and `drain`
-//! synchronizes it.
+//! synchronizes it. Under a head split each GPU keeps its own KV heads: its pages and ring rows
+//! are copied on that GPU's stream into its own mark arena (the same slot on both GPUs).
 use super::engine::{MimoEngine, MimoPlacement, DECODE_ROWS, PAGE_ROWS, RING_ROWS};
 use super::mtp::HIDDEN_ROWS;
 use crate::shared::memory::DeviceAllocation;
@@ -44,6 +45,8 @@ use cuteafd_loader::families::mimo_v2::MimoAttention;
 /// `row` bytes, ring `r` position `p` at `(r * ring_rows + p % ring_rows) * row`.
 #[derive(Clone, Copy)]
 struct RingState {
+    /// The head-split rank whose GPU holds the ring (0 without a split).
+    rank: usize,
     buffer: CuteafdDeviceBuffer,
     row: usize,
     ring_rows: usize,
@@ -54,11 +57,14 @@ struct RingState {
 
 pub(crate) struct MimoPrefix<'e, 'a> {
     engine: &'e MimoEngine<'a>,
-    /// Full-attention record pools: (buffer, record bytes).
-    full: Vec<(CuteafdDeviceBuffer, usize)>,
+    /// Full-attention record pools: (rank, buffer, record bytes).
+    full: Vec<(usize, CuteafdDeviceBuffer, usize)>,
     states: Vec<RingState>,
+    /// Bytes of one mark on each rank's GPU, and their sum.
+    rank_mark_bytes: Vec<usize>,
     mark_bytes: usize,
-    arena: Option<DeviceAllocation<'a>>,
+    /// Per rank: its marks' arena.
+    arenas: Vec<DeviceAllocation<'a>>,
     slots: usize,
     partial: bool,
 }
@@ -74,16 +80,20 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
     /// The family over `engine`'s buffers with a device arena of `slots(mark_bytes)` marks;
     /// `partial` opts into V4.1-style partial reuse (approximate).
     pub fn new(engine: &'e MimoEngine<'a>, slots: impl FnOnce(usize) -> usize, partial: bool) -> Result<Self> {
-        let (mut full, mut states, mut offset) = (Vec::new(), Vec::new(), 0usize);
+        let (mut full, mut states) = (Vec::new(), Vec::new());
+        let mut offsets = vec![0usize; engine.ranks()];
         let window = engine.cfg.window;
         ensure!(window > 0 && window <= RING_ROWS, "SWA window {window} does not fit the {RING_ROWS}-slot ring");
-        for layer in 0..engine.weights.layers.len() {
-            let (attention, buffer, record) = engine.kv_layer(layer);
-            match attention {
-                MimoAttention::Full => full.push((buffer, record)),
-                MimoAttention::Sliding => {
-                    states.push(RingState { buffer, row: record, ring_rows: RING_ROWS, rows: window, offset });
-                    offset += window * record;
+        for rank in 0..engine.ranks() {
+            for layer in 0..engine.weights.layers.len() {
+                let (attention, buffer, record) = engine.kv_layer_on(rank, layer);
+                match attention {
+                    MimoAttention::Full => full.push((rank, buffer, record)),
+                    MimoAttention::Sliding => {
+                        states.push(RingState { rank, buffer, row: record, ring_rows: RING_ROWS, rows: window,
+                            offset: offsets[rank] });
+                        offsets[rank] += window * record;
+                    }
                 }
             }
         }
@@ -91,13 +101,21 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
             let rows = window + mtp.stages.len() + 1;
             ensure!(rows <= HIDDEN_ROWS, "MTP catch-up of {rows} rows exceeds the {HIDDEN_ROWS}-row hidden ring");
             let row = engine.cfg.hidden * 2;
-            states.push(RingState { buffer: mtp.hidden.buffer, row, ring_rows: HIDDEN_ROWS, rows, offset });
-            offset += rows * row;
+            states.push(RingState { rank: 0, buffer: mtp.hidden.buffer, row, ring_rows: HIDDEN_ROWS, rows,
+                offset: offsets[0] });
+            offsets[0] += rows * row;
         }
-        let slots = slots(offset);
-        let arena = if slots > 0 && offset > 0 { Some(DeviceAllocation::new(engine.library, slots * offset)?) } else { None };
+        let mark_bytes: usize = offsets.iter().sum();
+        let slots = slots(mark_bytes);
+        let arenas = if slots > 0 && mark_bytes > 0 {
+            offsets.iter().enumerate().map(|(rank, &bytes)| {
+                engine.on(rank, || DeviceAllocation::new(engine.library, (slots * bytes).max(256)))
+            }).collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         ensure!(!partial || window % PAGE_ROWS == 0, "partial reuse replays a whole number of pages");
-        Ok(Self { engine, full, states, mark_bytes: offset, arena, slots, partial })
+        Ok(Self { engine, full, states, rank_mark_bytes: offsets, mark_bytes, arenas, slots, partial })
     }
 
     pub fn mark_bytes(&self) -> usize {
@@ -105,11 +123,11 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
     }
 
     pub fn page_bytes(&self) -> usize {
-        self.full.iter().map(|(_, record)| PAGE_ROWS * record).sum()
+        self.full.iter().map(|(_, _, record)| PAGE_ROWS * record).sum()
     }
 
     pub fn slots(&self) -> usize {
-        if self.arena.is_some() { self.slots } else { 0 }
+        if self.arenas.is_empty() { 0 } else { self.slots }
     }
 
     /// Zero every state's rows before `len` (a partial restore's empty window).
@@ -117,33 +135,39 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
         for state in &self.states {
             for (ring_row, _, rows) in runs(ring, state.ring_rows, state.rows, len) {
                 let target = view(state.buffer, ring_row * state.row, rows * state.row)?;
-                // SAFETY: the view lies inside a live engine allocation; stream-ordered.
-                unsafe { self.engine.library.cuda_zero_bytes_async(target, target.bytes, self.engine.stream)? };
+                // SAFETY: the view lies inside a live allocation of the state's GPU; ordered on its stream.
+                self.engine.on(state.rank, || unsafe {
+                    self.engine.library.cuda_zero_bytes_async(target, target.bytes, self.engine.stream_of(state.rank))
+                })?;
             }
         }
         Ok(())
     }
 
-    fn copy(&self, dst: CuteafdDeviceBuffer, src: CuteafdDeviceBuffer) -> Result<()> {
+    /// A copy between two views on rank `rank`'s GPU.
+    fn copy(&self, rank: usize, dst: CuteafdDeviceBuffer, src: CuteafdDeviceBuffer) -> Result<()> {
         debug_assert_eq!(dst.bytes, src.bytes);
-        // SAFETY: both views lie inside live engine allocations (checked by `view`); the copy is
-        // ordered on the engine stream with every forward pass that reads or writes them.
-        unsafe { self.engine.library.copy_d2d_async(dst, src, src.bytes, self.engine.stream) }
+        // SAFETY: both views lie inside live allocations of that GPU (checked by `view`); the copy
+        // is ordered on its stream with every forward pass that reads or writes them.
+        self.engine.on(rank, || unsafe {
+            self.engine.library.copy_d2d_async(dst, src, src.bytes, self.engine.stream_of(rank))
+        })
     }
 
     /// Copy every state's last rows before `len` between ring `ring` and mark `slot`.
     fn move_mark(&self, slot: MarkSlot, ring: usize, len: usize, capture: bool) -> Result<()> {
-        let arena = self.arena.as_ref().map(|a| a.buffer).ok_or_else(|| anyhow::anyhow!("no mark arena"))?;
+        ensure!(!self.arenas.is_empty(), "no mark arena");
         ensure!((slot.0 as usize) < self.slots, "mark slot {} of {}", slot.0, self.slots);
-        let base = slot.0 as usize * self.mark_bytes;
         for state in &self.states {
+            let arena = self.arenas[state.rank].buffer;
+            let base = slot.0 as usize * self.rank_mark_bytes[state.rank];
             for (ring_row, mark_row, rows) in runs(ring, state.ring_rows, state.rows, len) {
                 let ring_view = view(state.buffer, ring_row * state.row, rows * state.row)?;
                 let mark_view = view(arena, base + state.offset + mark_row * state.row, rows * state.row)?;
                 if capture {
-                    self.copy(mark_view, ring_view)?;
+                    self.copy(state.rank, mark_view, ring_view)?;
                 } else {
-                    self.copy(ring_view, mark_view)?;
+                    self.copy(state.rank, ring_view, mark_view)?;
                 }
             }
         }
@@ -218,31 +242,34 @@ impl PrefixFamily for MimoPrefix<'_, '_> {
     }
 
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
-        for &(buffer, record) in &self.full {
+        for &(rank, buffer, record) in &self.full {
             let page = PAGE_ROWS * record;
-            self.copy(view(buffer, copy.to as usize * page, copy.rows * record)?,
+            self.copy(rank, view(buffer, copy.to as usize * page, copy.rows * record)?,
                 view(buffer, copy.from as usize * page, copy.rows * record)?)?;
         }
         Ok(())
     }
 
     fn drain(&self) -> Result<(), BoxError> {
-        // SAFETY: the engine owns this stream.
-        Ok(unsafe { self.engine.library.cuda_stream_synchronize(self.engine.stream) }?)
+        for rank in 0..self.engine.ranks() {
+            // SAFETY: the engine owns these streams.
+            unsafe { self.engine.library.cuda_stream_synchronize(self.engine.stream_of(rank))? };
+        }
+        Ok(())
     }
 
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
-        self.full.iter().map(|&(buffer, record)| {
+        self.full.iter().map(|&(_, buffer, record)| {
             let bytes = PAGE_ROWS * record;
             DeviceRange { addr: buffer.ptr as u64 + (page as usize * bytes) as u64, bytes }
         }).collect()
     }
 
     fn mark_segments(&self, slot: MarkSlot) -> Vec<DeviceRange> {
-        self.arena.as_ref().map_or_else(Vec::new, |arena| vec![DeviceRange {
-            addr: arena.buffer.ptr as u64 + (slot.0 as usize * self.mark_bytes) as u64,
-            bytes: self.mark_bytes,
-        }])
+        self.arenas.iter().zip(&self.rank_mark_bytes).map(|(arena, &bytes)| DeviceRange {
+            addr: arena.buffer.ptr as u64 + (slot.0 as usize * bytes) as u64,
+            bytes,
+        }).collect()
     }
 }
 

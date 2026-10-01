@@ -5,6 +5,7 @@ pub(crate) mod engine;
 mod mtp_golden;
 pub(crate) mod mtp_policy;
 pub(crate) mod ple;
+pub(crate) mod prefix;
 pub(crate) mod serve;
 pub(crate) mod speculate;
 pub(crate) mod weights;
@@ -149,6 +150,29 @@ pub(crate) struct GoldenArgs {
     /// outputs must match. Reports acceptance and step costs, then stops.
     #[arg(long)]
     pub spec_decode: Option<usize>,
+    /// Prefix-cache restore check at each token P (comma separated): prefill the first P tokens
+    /// (of --prefill, default P + --resume-span), capture their snapshot (shared units, the
+    /// copied tail unit, the GDN/PLE state mark), restore it into a second sequence, continue
+    /// both (prefill in --prefill-chunk rows, then --resume-decode greedy steps) and compare
+    /// every layer's rows, the logits, the paged rows, the state slot and the mark round trip
+    /// byte for byte (a restore must be exact). Every P runs with every --prefill-chunk.
+    #[arg(long, value_delimiter = ',')]
+    pub resume_at: Vec<usize>,
+    /// Prefill chunk rows of --resume-at, comma separated (default the engine's prefill rows).
+    #[arg(long, value_delimiter = ',')]
+    pub prefill_chunk: Vec<usize>,
+    /// Tokens prefilled past P by --resume-at without --prefill.
+    #[arg(long, default_value_t = 1000)]
+    pub resume_span: usize,
+    #[arg(long, default_value_t = 4)]
+    pub resume_decode: usize,
+    /// With --resume-at: prefill the second sequence cold on its own units instead of
+    /// restoring it (the floor: what page placement alone changes).
+    #[arg(long, hide = true)]
+    pub resume_cold: bool,
+    /// --resume-at attempts on fresh sequences per case (all must be byte-identical).
+    #[arg(long, default_value_t = 1)]
+    pub resume_repeat: usize,
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -316,8 +340,26 @@ fn golden(args: GoldenArgs) -> Result<()> {
         if let Some(steps) = args.token_check {
             return token_check(&args, &opened, engine, steps);
         }
+        if !args.resume_at.is_empty() {
+            return resume(&args, engine);
+        }
         golden_run(&args, &opened, engine)
     })
+}
+
+/// `--resume-at P,..`: [`prefix::resume_check`] for every P and every --prefill-chunk.
+fn resume(args: &GoldenArgs, engine: &engine::Qwen4Engine<'_>) -> Result<()> {
+    let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
+        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let chunks = if args.prefill_chunk.is_empty() { vec![engine.prefill_rows] } else { args.prefill_chunk.clone() };
+    let cases: Vec<prefix::ResumeCase> = chunks.iter().flat_map(|&chunk| args.resume_at.iter().map(move |&at| (at, chunk)))
+        .map(|(at, chunk)| prefix::ResumeCase { at, n: args.prefill.unwrap_or(at + args.resume_span).min(tokens.len()),
+            chunk })
+        .collect();
+    let passed = prefix::resume_check(engine, &tokens, &cases, args.resume_decode, args.resume_cold, args.resume_repeat)?;
+    ensure!(passed, "a restored sequence differs from the straight one (see above)");
+    println!("resume check: all {} cases byte-identical", cases.len());
+    Ok(())
 }
 
 /// Mean NLL of `logits` rows against the next tokens, and top-1 agreements.
