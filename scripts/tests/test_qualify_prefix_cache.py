@@ -40,7 +40,7 @@ class FakeServer:
 def args(module, **extra):
     namespace = type("A", (), {})()
     defaults = dict(base_url="u", model="m", max_tokens=16, reasoning_effort="high", turns=3, workers=3,
-                    torture_requests=12, settle_s=0, seed=1, cancel_min_s=0.02, cancel_max_s=0.6)
+                    torture_requests=12, settle_s=0, seed=1, cancel_min_s=0.02, cancel_max_s=0.6, doc_chars=0)
     for key, value in {**defaults, **extra}.items():
         setattr(namespace, key, value)
     return namespace
