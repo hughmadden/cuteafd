@@ -215,7 +215,8 @@ impl Family for MiMo {
             Component::Attention => (
                 "GQA full attention plus 128-token sliding-window GQA with learned sink bias",
                 "serve-mimo runs the mimo (V2 Flash) and mimop (V2.6 Pro) programs (b12x integration \
-                 mimo_{full,swa}_{producer,attention}, mimo_o): BF16 KV records, paged full layers, SWA rings, \
+                 mimo_{full,swa}_{producer,attention}, mimo_full_*_kvint8, mimo_o): int8 full-attention KV \
+                 records (FP32 scale per 32 dims; --kv-cache bf16 for BF16) in paged pools, BF16 SWA rings, \
                  sinks on SWA layers only, QK 192 / V 128, NeoX RoPE on 64 dims. MimoLoader stages BF16 or E4M3 \
                  with FP32 128x128 grids, restarting per 192-row head (Flash's full-layer k_proj) or per \
                  checkpoint TP shard (Pro's fused qkv_proj, FusedQkvLayout); another layout needs a loader \

@@ -9,12 +9,16 @@
 //! family): on the Sparks (one BF16 partial per TP rank, summed on the GPU,
 //! as GLM) or, with local experts, on this GPU from the TP1 package.
 //!
-//! KV state: full layers keep BF16 records (keys then values of the 4 KV
-//! heads, 1280 elements) in a paged pool shared by sequences (64 rows per
-//! page); SWA layers keep a 256-slot ring per sequence (8 KV heads, 2560
-//! elements). An SWA step's records go to a step buffer first; the attention
-//! program reads in-step keys from it, older keys from the ring, and commits
-//! the step to the ring afterwards.
+//! KV state: full layers keep one record per token (keys then values of the 4
+//! KV heads) in a paged pool shared by sequences (64 rows per page); SWA layers
+//! keep a 256-slot ring per sequence (8 KV heads). Full-attention records are
+//! int8 by default (an FP32 scale `amax / 127` per 32 dims of each head's key and
+//! value: 1440 bytes on V2 Flash) or BF16 (`--kv-cache bf16`: 2560 bytes); the
+//! `full_*_kvint8` programs read and write the int8 layout, and int8 prefill widens
+//! the sequence's records once into `kv_wide`. SWA records are BF16. An SWA
+//! step's records go to a step buffer first; the attention program reads
+//! in-step keys from it, older keys from the ring, and commits the step to the
+//! ring afterwards.
 use super::weights::{MimoLayer, MimoWeights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
@@ -28,7 +32,7 @@ use cuteafd_transport::{
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::families::mimo_v2::{MimoAttention, MimoV2Config};
+use cuteafd_loader::families::mimo_v2::{MimoAttention, MimoKvCache, MimoV2Config};
 use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -182,6 +186,8 @@ struct Workspace<'a> {
     attn: Dev<'a>,
     delta: Dev<'a>,
     kv_step: Dev<'a>,
+    /// 8-bit KV prefill: BF16 copy of one sequence's full-attention records (`max_context` rows).
+    kv_wide: Dev<'a>,
     positions: Dev<'a>,
     slots: Dev<'a>,
     step_slots: Dev<'a>,
@@ -290,6 +296,8 @@ pub(crate) struct MimoEngine<'a> {
     /// row and 128-K block, the official FP8 release's served numerics); false:
     /// W8A16 (bitwise the former BF16 prefill over dequantized weights).
     pub prefill_w8a8: bool,
+    /// KV record format of every layer (and the MTP rings).
+    kv_cache: MimoKvCache,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -330,7 +338,7 @@ impl<'a> MimoEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: MimoV2Config,
         weights: MimoWeights<'a>, stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize,
-        rings: usize, embedding: TokenEmbedding<'a>) -> Result<Self> {
+        rings: usize, embedding: TokenEmbedding<'a>, kv_cache: MimoKvCache) -> Result<Self> {
         let family = cfg.program_family()?;
         // Layers loaded as head-split shares carry half the heads (see `attach_peer`).
         let ranks = if weights.layers.iter().any(|l| l.split) { 2 } else { 1 };
@@ -347,7 +355,7 @@ impl<'a> MimoEngine<'a> {
             Ok(allocation)
         };
         let kv = weights.layers.iter().map(|layer| {
-            let record = if layer.split { share.record_elems(layer.attention) } else { cfg.record_elems(layer.attention) } * 2;
+            let record = if layer.split { &share } else { &cfg }.record_bytes(layer.attention, kv_cache);
             zeroed(match layer.attention {
                 MimoAttention::Full => pages * PAGE_ROWS * record,
                 MimoAttention::Sliding => rings * RING_ROWS * record,
@@ -360,7 +368,7 @@ impl<'a> MimoEngine<'a> {
             cos_sin_swa, workspace: RefCell::new(None), decode_workspace: RefCell::new(None), experts: None,
             expert_input: ExpertInput::Fp8,
             profile: RefCell::new([0.0; 2]), drafter: None, mtp: None, l2: None, embedding,
-            mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20)?, 0)), prefill_w8a8: true })
+            mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20)?, 0)), prefill_w8a8: true, kv_cache })
     }
 
     /// Layer `layer`'s KV storage: the paged record pool (full attention; page `p` holds
@@ -377,13 +385,18 @@ impl<'a> MimoEngine<'a> {
             _ => (&self.weights.layers, &self.kv),
         };
         let attention = layers[layer].attention;
-        (attention, kv[layer].buffer, self.record_elems(&layers[layer]) * 2)
+        (attention, kv[layer].buffer, self.record_bytes(&layers[layer]))
     }
 
-    /// BF16 elements of `layer`'s KV record on the GPU holding it (its KV heads only under a head split).
-    fn record_elems(&self, layer: &MimoLayer<'_>) -> usize {
+    /// The KV record format.
+    pub fn kv_cache(&self) -> MimoKvCache {
+        self.kv_cache
+    }
+
+    /// Bytes of `layer`'s KV record on the GPU holding it (its KV heads only under a head split).
+    fn record_bytes(&self, layer: &MimoLayer<'_>) -> usize {
         let heads = self.cfg.kv_heads(layer.attention) / if layer.split { 2 } else { 1 };
-        heads * (self.cfg.head_dim + self.cfg.v_head_dim)
+        self.cfg.record_bytes_of(heads, self.kv_cache.of(layer.attention))
     }
 
     /// GPUs this engine runs on: 2 under a head split.
@@ -410,7 +423,7 @@ impl<'a> MimoEngine<'a> {
         let peer = exchange.on(1, || -> Result<Peer<'a>> {
             self.programs.load_all()?;
             let kv = layers.iter().map(|layer| {
-                let record = self.record_elems(layer) * 2;
+                let record = self.record_bytes(layer);
                 zeroed(match layer.attention {
                     MimoAttention::Full => self.pages * PAGE_ROWS * record,
                     MimoAttention::Sliding => self.rings * RING_ROWS * record,
@@ -525,8 +538,9 @@ impl<'a> MimoEngine<'a> {
             (Some(_), false) => &[true],
         };
         for &split in families {
-            for name in [format!("mimo_full_producer_{cap}"), format!("mimo_swa_producer_{cap}"),
-                format!("mimo_full_attention_{mode}_{cap}"), format!("mimo_swa_attention_{mode}_{cap}"),
+            let kv = self.kv_cache.program_tag();
+            for name in [format!("mimo_full_producer{kv}_{cap}"), format!("mimo_swa_producer_{cap}"),
+                format!("mimo_full_attention{kv}_{mode}_{cap}"), format!("mimo_swa_attention_{mode}_{cap}"),
                 format!("mimo_ffn_{cap}")] {
                 scratch = scratch.max(self.scratch(&name, split)?);
             }
@@ -536,7 +550,8 @@ impl<'a> MimoEngine<'a> {
         let identity: Vec<i64> = (0..t as i64).collect();
         let step_slots = self.alloc(t * 8)?;
         self.library.copy_h2d(step_slots.buffer, bytes_of(&identity))?;
-        let record = self.cfg.record_elems(MimoAttention::Sliding).max(self.cfg.record_elems(MimoAttention::Full));
+        let record = self.cfg.record_bytes(MimoAttention::Sliding, self.kv_cache)
+            .max(self.cfg.record_bytes(MimoAttention::Full, self.kv_cache));
         // Rank 1 never runs the router, experts, head or drafters.
         let lead_only = |bytes: usize| if lead { bytes } else { 256 };
         Ok(Workspace {
@@ -546,7 +561,9 @@ impl<'a> MimoEngine<'a> {
             query: self.alloc(t * heads * self.cfg.head_dim * 2)?,
             attn: self.alloc(t * heads * self.cfg.v_head_dim * 2)?,
             delta: self.alloc(t * h * 2)?,
-            kv_step: self.alloc(t * record * 2)?,
+            kv_step: self.alloc(t * record)?,
+            kv_wide: self.alloc(if decode || self.kv_cache == MimoKvCache::Bf16 { 256 } else {
+                self.max_context * self.cfg.record_bytes(MimoAttention::Full, MimoKvCache::Bf16) })?,
             positions: self.alloc(t * 8)?,
             slots: self.alloc(t * 8)?,
             step_slots,
@@ -1178,19 +1195,27 @@ impl<'a> MimoEngine<'a> {
             let pointers = [("x", w.x.buffer.ptr), ("positions", w.positions.buffer.ptr), ("kv_slots", slots),
                 ("cos_sin", cos_sin), ("w_qkv_fp8", layer.ptr("w_qkv_fp8")?), scale("w_qkv", decode, layer)?,
                 ("kv_cache", records), ("query", w.query.buffer.ptr), ("scratch", w.scratch.buffer.ptr)];
-            return self.run_on(rank, split, &format!("mimo_{k}_producer_{cap}"), &pointers, &self.w8_scalars(rows, decode));
+            let kv = self.kv_cache.of(layer.attention).program_tag();
+            return self.run_on(rank, split, &format!("mimo_{k}_producer{kv}_{cap}"), &pointers, &self.w8_scalars(rows, decode));
         }
-        let name = format!("mimo_{k}_attention_{mode}_{cap}");
+        let name = format!("mimo_{k}_attention{}_{mode}_{cap}", self.kv_cache.of(layer.attention).program_tag());
         match layer.attention {
             _ if part != 1 => {}
             MimoAttention::Full => {
                 let mut scalars = vec![rows, Scalar::I32(tables.table_stride as i32)];
+                let mut pointers = vec![("q", w.query.buffer.ptr), ("kv_cache", kv),
+                    ("positions", w.positions.buffer.ptr), ("page_table", w.page_table.buffer.ptr)];
                 if tables.decode {
                     scalars.push(Scalar::I32(DECODE_SPLITS));
+                } else if self.kv_cache != MimoKvCache::Bf16 {
+                    // 8-bit prefill: the sequence's keys are widened once into `kv_wide`.
+                    let keys = tables.positions.last().map_or(0, |&p| p + 1);
+                    ensure!(keys as usize <= self.max_context, "prefill past max_context ({keys} keys)");
+                    pointers.push(("kv_wide", w.kv_wide.buffer.ptr));
+                    scalars.push(Scalar::I32(keys as i32));
                 }
-                self.run_on(rank, split, &name, &[("q", w.query.buffer.ptr), ("kv_cache", kv),
-                    ("positions", w.positions.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
-                    ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &scalars)?;
+                pointers.extend([("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
+                self.run_on(rank, split, &name, &pointers, &scalars)?;
             }
             MimoAttention::Sliding => {
                 self.run_on(rank, split, &name, &[("q", w.query.buffer.ptr), ("kv_step", w.kv_step.buffer.ptr),
