@@ -23,6 +23,7 @@
 use super::weights::{Qwen4Layer, Qwen4Weights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
+use crate::shared::token_io::{DeviceLogits, EmbedPlacement, TokenEmbedding};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::NativeLibrary;
@@ -286,6 +287,11 @@ struct Workspace<'a> {
     /// (U32 token, FP32 logit) of each head row.
     hidden_rows: Dev<'a>,
     argmax: Dev<'a>,
+    /// The step's token ids (U32, gathered from the device embedding table;
+    /// MTP chain steps: indices into the previous step's drafts).
+    ids: Dev<'a>,
+    /// Greedy selection of the logits rows inside the decode graph: U32 ids, then U32 statuses.
+    select: Dev<'a>,
     /// Pinned staging of a step's host tables and input rows (async uploads)
     /// and its fill level.
     staging: RefCell<(HostAllocation<'a>, usize)>,
@@ -309,6 +315,29 @@ pub(crate) struct MtpGroup<'p> {
     pub placement: &'p Qwen4Placement,
     pub rows: Vec<MtpRow>,
 }
+
+/// The tokens an MTP step embeds.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum MtpTokens<'t> {
+    /// Host token ids, one per row.
+    Host(&'t [u32]),
+    /// Chain steps: row `r` embeds draft `index[r]` of the deferred step `step`.
+    Drafts { step: usize, index: &'t [u32] },
+}
+
+/// What an MTP step with head rows hands back.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum MtpOut {
+    /// Each head row's greedy draft (token, logit) now, and with `logits`
+    /// the head rows' FP32 logits (synchronizes).
+    Download { logits: bool },
+    /// The drafts stay on the device as step `step` of the draft cycle
+    /// ([`Qwen4Engine::mtp_drafts`] reads them back).
+    Defer { step: usize },
+}
+
+/// Draft steps one cycle can defer (the most drafts a sequence verifies).
+pub(crate) const MTP_DEFERRED_STEPS: usize = DECODE_ROWS;
 
 /// Where an MTP step reads its rows' streams.
 #[derive(Debug, Clone, Copy)]
@@ -375,6 +404,10 @@ pub(crate) struct Qwen4Engine<'a> {
     routes_ready: *mut c_void,
     /// L2 prefetch of the next layer's weights during decode exchanges.
     pub l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
+    /// The token embedding table (resident on this GPU or read from its shard).
+    pub embedding: TokenEmbedding<'a>,
+    /// Deferred MTP drafts of a cycle: U32 [MTP_DEFERRED_STEPS, DECODE_ROWS].
+    mtp_drafts: Dev<'a>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -410,7 +443,8 @@ impl<'a> Qwen4Engine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: Qwen4Config, weights: Qwen4Weights<'a>,
         ple: Option<super::ple::PleTable<'a>>, stream: *mut c_void, max_context: usize, prefill_rows: usize,
-        pages: usize, slots: usize) -> Result<Self> {
+        pages: usize, slots: usize, embedding: TokenEmbedding<'a>) -> Result<Self> {
+        ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         cfg.check_programs()?;
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, bytes.max(256))?;
@@ -464,7 +498,8 @@ impl<'a> Qwen4Engine<'a> {
             decode_workspace: RefCell::new(None), experts: None, profile: RefCell::new([0.0; 2]),
             graphs: RefCell::new(std::collections::HashMap::new()),
             use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0"),
-            routes_ready: library.cuda_event_create_ordering()?, l2: None })
+            routes_ready: library.cuda_event_create_ordering()?, l2: None, embedding,
+            mtp_drafts: zeroed(MTP_DEFERRED_STEPS * DECODE_ROWS * 4)? })
     }
 
     pub fn set_experts(&mut self, experts: Experts<'a>) {
@@ -663,6 +698,8 @@ impl<'a> Qwen4Engine<'a> {
                 if spark { t * (topk * 8 + h + h / 32) } else { 256 })?),
             hidden_rows: self.alloc(t * 4)?,
             argmax: self.alloc(logit_rows * 8)?,
+            ids: self.alloc(t * 4)?,
+            select: self.alloc(logit_rows * 8)?,
             logits_host: RefCell::new(HostAllocation::new(self.library, logit_rows * self.cfg.vocab_size * 4)?),
             staging: RefCell::new((HostAllocation::new(self.library, 16 * 16
                 + t * (8 * 3 + 4 * 4 + self.cfg.ple_rows() * 8 + (HC + 1) * h * 2)
@@ -689,6 +726,37 @@ impl<'a> Qwen4Engine<'a> {
         unsafe { self.library.cuda_stream_synchronize(self.stream)? };
         w.staging.borrow_mut().1 = 0;
         Ok(())
+    }
+
+    /// Like [`Self::begin_staging`], but keeps appending to the staging (no
+    /// host wait) while `bytes` more still fit: queued steps (MTP draft
+    /// chains) then run back to back.
+    fn continue_staging(&self, w: &Workspace<'_>, bytes: usize) -> Result<()> {
+        let (capacity, used) = { let staging = w.staging.borrow(); (staging.0.buffer.bytes, staging.1) };
+        if used + bytes > capacity {
+            self.begin_staging(w)?;
+        }
+        Ok(())
+    }
+
+    /// The step's token embeddings (`copies` per token) into `out`: the ids
+    /// staged for the device table's gather (queued unless `defer_gather`:
+    /// the decode graph's first segment runs it), else the shard's rows staged.
+    fn stage_embedding(&self, w: &Workspace<'_>, tokens: &[u32], copies: usize, out: &Dev<'_>, defer_gather: bool)
+        -> Result<()> {
+        match self.embedding.placement() {
+            EmbedPlacement::Gpu => {
+                self.embedding.check(tokens)?;
+                self.stage_table(w, &w.ids, tokens)?;
+                if !defer_gather {
+                    // SAFETY: the ids are staged on this stream; `out` holds the rows.
+                    unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), tokens.len(), copies,
+                        std::ptr::null(), out.buffer.ptr, self.stream)? };
+                }
+                Ok(())
+            }
+            EmbedPlacement::Host => self.stage(w, out.buffer, &self.embedding.host_rows_repeated(tokens, copies)?),
+        }
     }
 
     /// Queues `bytes` into `dst` through the workspace's pinned staging.
@@ -751,32 +819,38 @@ impl<'a> Qwen4Engine<'a> {
     /// resident. `on_layer` receives each layer's output streams (BF16 [t, 4,
     /// H]); with `forced`, `forced(l)` (when it returns rows) replaces the
     /// streams after layer `l`, so each layer's comparison measures that layer alone.
-    pub fn prefill_forced(&self, placement: &mut Qwen4Placement, tokens: &[u32], embed: &[u8], on_layer: LayerHook<'_>,
+    pub fn prefill_forced(&self, placement: &mut Qwen4Placement, tokens: &[u32], on_layer: LayerHook<'_>,
         forced: Forced<'_>, logit_rows: usize) -> Result<Option<Vec<f32>>> {
+        self.prefill_device(placement, tokens, on_layer, forced, logit_rows)?
+            .map(|logits| logits.to_host(self.library)).transpose()
+    }
+
+    /// [`Self::prefill_forced`] leaving the logits on the device.
+    pub fn prefill_device(&self, placement: &mut Qwen4Placement, tokens: &[u32], on_layer: LayerHook<'_>,
+        forced: Forced<'_>, logit_rows: usize) -> Result<Option<DeviceLogits>> {
         let (t, start) = (tokens.len(), placement.len);
         ensure!(t > 0 && t <= self.prefill_rows && start + t <= self.max_context, "prefill of {t} rows at {start}");
-        ensure!(embed.len() == t * self.cfg.hidden * 2, "embedding rows do not match the tokens");
         if start == 0 {
             self.start(placement)?;
         }
         let mut tables = StepTables { page_table: placement.pages.clone(), pool_table: placement.pool_pages.clone(),
             page_stride: 0, pool_stride: 0, page_width: placement.pages.len(), ..Default::default() };
         self.rows(placement, tokens, 0, &mut tables)?;
-        let logits = self.step(&tables, embed, logit_rows.clamp(1, t), on_layer, forced)?;
+        let logits = self.step(&tables, tokens, logit_rows.clamp(1, t), on_layer, forced)?;
         placement.len += t;
         Ok(logits)
     }
 
-    pub fn prefill(&self, placement: &mut Qwen4Placement, tokens: &[u32], embed: &[u8]) -> Result<Option<Vec<f32>>> {
-        self.prefill_forced(placement, tokens, embed, None, None, 1)
+    pub fn prefill(&self, placement: &mut Qwen4Placement, tokens: &[u32]) -> Result<Option<Vec<f32>>> {
+        self.prefill_forced(placement, tokens, None, None, 1)
     }
 
     /// Appends each sequence's tokens (one for decode, several for a verify)
     /// at its length in one decode-shaped step; returns every row's logits.
     /// GDN and PLE state advance in place: a caller rejecting a suffix must replay.
-    pub fn verify(&self, sequences: &mut [(&mut Qwen4Placement, &[u32])], embed: &[u8], on_layer: LayerHook<'_>)
+    pub fn verify(&self, sequences: &mut [(&mut Qwen4Placement, &[u32])], on_layer: LayerHook<'_>)
         -> Result<Option<Vec<f32>>> {
-        self.verify_step(sequences, embed, on_layer, false)
+        self.verify_step(sequences, on_layer, false)?.map(|logits| logits.to_host(self.library)).transpose()
     }
 
     /// [`Self::verify`] as a speculative step: the GDN and PLE state stay as
@@ -784,15 +858,23 @@ impl<'a> Qwen4Engine<'a> {
     /// then applies each sequence's accepted rows (and the caller rewinds the
     /// placements with [`Self::rewind`]). K/V records past the accepted rows
     /// are overwritten when those positions come again.
-    pub fn verify_spec(&self, sequences: &mut [(&mut Qwen4Placement, &[u32])], embed: &[u8],
-        on_layer: LayerHook<'_>) -> Result<Option<Vec<f32>>> {
-        self.verify_step(sequences, embed, on_layer, true)
+    pub fn verify_spec(&self, sequences: &mut [(&mut Qwen4Placement, &[u32])], on_layer: LayerHook<'_>)
+        -> Result<Option<Vec<f32>>> {
+        self.verify_step(sequences, on_layer, true)?.map(|logits| logits.to_host(self.library)).transpose()
     }
 
-    fn verify_step(&self, sequences: &mut [(&mut Qwen4Placement, &[u32])], embed: &[u8], on_layer: LayerHook<'_>,
-        spec: bool) -> Result<Option<Vec<f32>>> {
+    /// [`Self::verify`] (`spec`: [`Self::verify_spec`]) leaving every row's
+    /// logits on the device, with the decode graph's greedy selection of them.
+    pub fn verify_device(&self, sequences: &mut [(&mut Qwen4Placement, &[u32])], spec: bool)
+        -> Result<Option<DeviceLogits>> {
+        self.verify_step(sequences, None, spec)
+    }
+
+    fn verify_step(&self, sequences: &mut [(&mut Qwen4Placement, &[u32])], on_layer: LayerHook<'_>,
+        spec: bool) -> Result<Option<DeviceLogits>> {
         let rows: usize = sequences.iter().map(|(_, t)| t.len()).sum();
-        ensure!(rows > 0 && rows <= DECODE_ROWS && embed.len() == rows * self.cfg.hidden * 2, "decode step of {rows} rows");
+        ensure!(rows > 0 && rows <= DECODE_ROWS, "decode step of {rows} rows");
+        let tokens: Vec<u32> = sequences.iter().flat_map(|(_, t)| t.iter().copied()).collect();
         let page_stride = sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1).next_power_of_two()
             .min(self.pages);
         let pool_stride = sequences.iter().map(|(p, _)| p.pool_pages.len()).max().unwrap_or(1).next_power_of_two()
@@ -815,7 +897,7 @@ impl<'a> Qwen4Engine<'a> {
             }
         }
         tables.pool_width = tables.pool_width.next_power_of_two().min(pool_stride);
-        let logits = self.step(&tables, embed, rows, on_layer, None)?;
+        let logits = self.step(&tables, &tokens, rows, on_layer, None)?;
         for (placement, tokens) in sequences.iter_mut() {
             placement.len += tokens.len();
         }
@@ -890,20 +972,23 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     /// One MTP step over `groups` (each sequence's rows contiguous) in the
-    /// decode workspace (`decode`, at most 64 rows) or the prefill one.
-    /// Rows read their streams from `source`; the output streams stay in the
-    /// workspace for a following [`MtpSource::Chain`] step. With `heads`
-    /// (step rows), returns each head row's greedy draft (token, logit) and,
-    /// with `logits`, the head rows' FP32 logits.
-    #[allow(clippy::type_complexity)]
+    /// decode workspace (`decode`, at most 64 rows) or the prefill one,
+    /// embedding `tokens`. Rows read their streams from `source`; the output
+    /// streams stay in the workspace for a following [`MtpSource::Chain`]
+    /// step. With `heads` (step rows), each head row's greedy draft is
+    /// returned (token, logit; and with `logits` the head rows' FP32 logits)
+    /// or deferred on the device, per `out`. Deferred and head-less steps
+    /// queue without a host wait while the staging lasts.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     pub fn mtp_step(&self, decode: bool, groups: &[MtpGroup<'_>], source: MtpSource, heads: &[usize],
-        embed: &[u8], logits: bool) -> Result<(Vec<(u32, f32)>, Option<Vec<f32>>)> {
+        tokens: MtpTokens<'_>, output: MtpOut) -> Result<(Vec<(u32, f32)>, Option<Vec<f32>>)> {
         let mtp = self.weights.mtp.as_ref().context("MTP is not loaded (--mtp)")?;
         let (kv, keys, blocks) = self.mtp_kv.as_ref().context("MTP pools")?;
         let (h, vocab) = (self.cfg.hidden, self.cfg.vocab_size);
         let t: usize = groups.iter().map(|g| g.rows.len()).sum();
         let capacity = if decode { DECODE_ROWS } else { self.prefill_rows };
-        ensure!(t > 0 && t <= capacity && heads.len() <= t && embed.len() == t * h * 2, "MTP step of {t} rows");
+        let token_rows = match tokens { MtpTokens::Host(t) => t.len(), MtpTokens::Drafts { index, .. } => index.len() };
+        ensure!(t > 0 && t <= capacity && heads.len() <= t && token_rows == t, "MTP step of {t} rows");
         let mut tables = StepTables { decode, ..Default::default() };
         let mut hidden_rows = Vec::with_capacity(t);
         if decode {
@@ -972,7 +1057,10 @@ impl<'a> Qwen4Engine<'a> {
                 (w.streams[cur].buffer.ptr, cur ^ 1)
             }
         };
-        self.begin_staging(w)?;
+        // Staged bytes (16-byte aligned tables, then the embedding rows at most).
+        let staged = 16 * 16 + t * (8 * 3 + 4 * 4) + (tables.page_table.len() + tables.pool_table.len()) * 4
+            + t * h * 2;
+        self.continue_staging(w, staged)?;
         self.stage_table(w, &w.positions, &tables.positions)?;
         self.stage_table(w, &w.kv_slots, &tables.kv_slots)?;
         self.stage_table(w, &w.slots, &tables.slots)?;
@@ -982,7 +1070,19 @@ impl<'a> Qwen4Engine<'a> {
         self.stage_table(w, &w.page_table, &tables.page_table)?;
         self.stage_table(w, &w.pool_table, &tables.pool_table)?;
         self.stage_table(w, &w.hidden_rows, &hidden_rows)?;
-        self.stage(w, w.x.buffer, embed)?;
+        match tokens {
+            MtpTokens::Host(tokens) => self.stage_embedding(w, tokens, 1, &w.x, false)?,
+            MtpTokens::Drafts { step, index } => {
+                ensure!(step < MTP_DEFERRED_STEPS && index.iter().all(|&i| (i as usize) < DECODE_ROWS),
+                    "MTP chain step reads draft step {step}");
+                self.stage_table(w, &w.ids, index)?;
+                let drafts = Self::region(&self.mtp_drafts, step * DECODE_ROWS * 4, DECODE_ROWS * 4);
+                // SAFETY: the drafts of `step` and the staged indices are ordered on this
+                // stream before the gather; `x` holds t rows.
+                unsafe { self.embedding.embed_device_ids(drafts, Some((w.ids.buffer.ptr.cast_const(), index)), t, 1,
+                    None, w.x.buffer, self.stream)? };
+            }
+        }
         let rows = Scalar::I32(t as i32);
         let cap = if decode { "m64" } else { "m4096" };
         self.run("qwen4_mtp_feedback", &[("hidden", src), ("hidden_rows", w.hidden_rows.buffer.ptr),
@@ -1000,8 +1100,6 @@ impl<'a> Qwen4Engine<'a> {
         self.post(w, &mut out, rows)?;
         self.mtp_streams.set((decode, out));
         if heads.is_empty() {
-            // SAFETY: the engine owns this stream.
-            unsafe { self.library.cuda_stream_synchronize(self.stream)? };
             return Ok((Vec::new(), None));
         }
         let [norm, down, up] = &mtp.mixer;
@@ -1019,6 +1117,7 @@ impl<'a> Qwen4Engine<'a> {
             }
         }
         let n = heads.len();
+        ensure!(n <= DECODE_ROWS, "{n} MTP head rows");
         match &mtp.head_fp8 {
             Some((q, scale)) if n <= FP8_HEAD_ROWS => self.run("qwen4_head_fp8", &[("x", w.delta.buffer.ptr),
                 ("w_fp8", q.buffer.ptr), ("scale", scale.buffer.ptr), ("logits", w.logits.buffer.ptr)],
@@ -1035,11 +1134,32 @@ impl<'a> Qwen4Engine<'a> {
                 cuteafd_ffi::CuteafdDeviceBuffer { bytes: n * vocab * 4, ..w.logits.buffer },
                 Self::region(&w.argmax, 0, n * 4), Self::region(&w.argmax, n * 4, n * 4), n, vocab, self.stream)?;
         }
+        let logits = match output {
+            MtpOut::Defer { step } => {
+                ensure!(step < MTP_DEFERRED_STEPS, "deferred MTP step {step}");
+                let at = Self::region(&self.mtp_drafts, step * DECODE_ROWS * 4, n * 4);
+                // SAFETY: both regions are live; the stream orders the copy after the argmax.
+                unsafe { self.library.copy_d2d_async(at, Self::region(&w.argmax, 0, n * 4), n * 4, self.stream)? };
+                return Ok((Vec::new(), None));
+            }
+            MtpOut::Download { logits } => logits,
+        };
         let best = self.download(&w.argmax, n * 8)?;
         let word = |i: usize| u32::from_le_bytes(best[i * 4..i * 4 + 4].try_into().unwrap());
         let drafts = (0..n).map(|i| (word(i), f32::from_bits(word(n + i)))).collect();
         let logits = if logits { Some(self.download_logits(w, n)?) } else { None };
         Ok((drafts, logits))
+    }
+
+    /// The deferred drafts of a cycle's steps: `counts[s]` drafts of step `s`
+    /// (synchronizes).
+    pub fn mtp_drafts(&self, counts: &[usize]) -> Result<Vec<Vec<u32>>> {
+        ensure!(counts.len() <= MTP_DEFERRED_STEPS && counts.iter().all(|&n| n <= DECODE_ROWS), "deferred drafts");
+        let bytes = self.download(&self.mtp_drafts, counts.len() * DECODE_ROWS * 4)?;
+        Ok(counts.iter().enumerate().map(|(s, &n)| (0..n).map(|i| {
+            let at = (s * DECODE_ROWS + i) * 4;
+            u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+        }).collect()).collect())
     }
 
     /// The last MTP step's output streams (BF16 [rows, 4, H]).
@@ -1050,8 +1170,8 @@ impl<'a> Qwen4Engine<'a> {
         self.download(&w.streams[cur], rows * HC * self.cfg.hidden * 2)
     }
 
-    fn step(&self, tables: &StepTables, embed: &[u8], logit_rows: usize, mut on_layer: LayerHook<'_>,
-        forced: Forced<'_>) -> Result<Option<Vec<f32>>> {
+    fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize, mut on_layer: LayerHook<'_>,
+        forced: Forced<'_>) -> Result<Option<DeviceLogits>> {
         let (h, t) = (self.cfg.hidden, tables.kv_slots.len());
         let (slot, capacity) = if tables.decode { (&self.decode_workspace, DECODE_ROWS) } else { (&self.workspace, self.prefill_rows) };
         if slot.borrow().as_ref().is_some_and(|w| w.logit_rows < logit_rows) {
@@ -1076,15 +1196,11 @@ impl<'a> Qwen4Engine<'a> {
         self.stage_table(w, &w.ple_ids, &tables.ple_ids)?;
         // Streams start as four copies of the embedding.
         let row = h * 2;
-        let mut streams = vec![0u8; t * HC * row];
-        for (r, e) in embed.chunks_exact(row).enumerate() {
-            for s in 0..HC {
-                streams[(r * HC + s) * row..][..row].copy_from_slice(e);
-            }
-        }
-        self.stage(w, w.streams[0].buffer, &streams)?;
+        ensure!(tokens.len() == t, "{} tokens for a {t}-row step", tokens.len());
+        let graphed = self.use_graphs && tables.decode && on_layer.is_none() && forced.is_none();
+        self.stage_embedding(w, tokens, HC, &w.streams[0], graphed)?;
         let rows = Scalar::I32(t as i32);
-        if self.use_graphs && tables.decode && on_layer.is_none() && forced.is_none() {
+        if graphed {
             return self.decode_graphed(w, tables, t, rows, logit_rows);
         }
         let cap = if tables.decode { "m64" } else { "m4096" };
@@ -1135,12 +1251,13 @@ impl<'a> Qwen4Engine<'a> {
             unsafe { self.library.cuda_stream_synchronize(self.stream)? };
             return Ok(None);
         }
-        self.logits(w, &w.streams[cur], t, rows, logit_rows).map(Some)
+        self.head(w, &w.streams[cur], t, rows, logit_rows)?;
+        Ok(Some(self.device_logits(w, logit_rows, false)))
     }
 
-    /// The stream mixer and lm_head over the last `logit_rows` rows.
-    fn logits(&self, w: &Workspace<'_>, streams: &Dev<'_>, t: usize, rows: Scalar, logit_rows: usize)
-        -> Result<Vec<f32>> {
+    /// The stream mixer and lm_head over the last `logit_rows` rows, and with
+    /// `greedy` the rows' greedy tokens into `select` (decode graphs).
+    fn head(&self, w: &Workspace<'_>, streams: &Dev<'_>, t: usize, rows: Scalar, logit_rows: usize) -> Result<()> {
         let h = self.cfg.hidden;
         let [norm, down, up] = &self.weights.mixer;
         self.run("qwen4_head", &[("streams", streams.buffer.ptr), ("norm", norm.buffer.ptr),
@@ -1149,9 +1266,27 @@ impl<'a> Qwen4Engine<'a> {
         // SAFETY: the head's input and operands are live buffers of these shapes.
         unsafe {
             w.head.launch(w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2).cast(),
-                self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), logit_rows as u32, self.stream)?;
+                self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), logit_rows as u32, self.stream)
         }
-        self.download_logits(w, logit_rows)
+    }
+
+    /// Greedy tokens of the first `rows` logits rows into `select`.
+    fn select_greedy(&self, w: &Workspace<'_>, rows: usize) -> Result<()> {
+        let vocab = self.cfg.vocab_size;
+        // SAFETY: the logits rows and the select buffer (ids, then statuses) are live buffers of these shapes.
+        unsafe {
+            self.library.cuda_logits_greedy_f32_async(w.logits.buffer.ptr, rows, vocab, vocab, w.select.buffer.ptr,
+                std::ptr::null_mut(), Self::region(&w.select, rows * 4, rows * 4).ptr, self.stream)
+        }
+    }
+
+    /// The first `rows` logits rows as device logits (`greedy`: with the rows'
+    /// selection from [`Self::select_greedy`]).
+    fn device_logits(&self, w: &Workspace<'_>, rows: usize, greedy: bool) -> DeviceLogits {
+        let vocab = self.cfg.vocab_size;
+        DeviceLogits { ptr: w.logits.buffer.ptr, rows, vocab, stride: vocab, stream: self.stream,
+            greedy: greedy.then(|| (w.select.buffer.ptr.cast_const(), Self::region(&w.select, rows * 4, rows * 4).ptr
+                .cast_const())) }
     }
 
     /// The first `rows` logits rows through the pinned landing buffer.
@@ -1175,8 +1310,11 @@ impl<'a> Qwen4Engine<'a> {
     /// final segment once; the parity is the same every step, so replays
     /// track it without running the closures.
     fn decode_graphed(&self, w: &Workspace<'_>, tables: &StepTables, t: usize, rows: Scalar, logit_rows: usize)
-        -> Result<Option<Vec<f32>>> {
+        -> Result<Option<DeviceLogits>> {
         let layers = &self.weights.layers;
+        // Every layer resident: the last segment ends in the head and the greedy selection.
+        let head = layers.len() == self.cfg.layers && logit_rows == t;
+        let gather = self.embedding.placement() == EmbedPlacement::Gpu;
         let mut cur = 0usize;
         for index in 0..=layers.len() {
             let key = GraphKey { segment: index, rows: t, spec: tables.spec, long: tables.long, pool_width: tables.pool_width,
@@ -1185,9 +1323,19 @@ impl<'a> Qwen4Engine<'a> {
             self.replay(key, || -> Result<()> {
                 let mut c = start;
                 let Some(layer) = layers.get(index) else {
-                    return self.post(w, &mut c, rows);
+                    self.post(w, &mut c, rows)?;
+                    if head {
+                        self.head(w, &w.streams[c], t, rows, t)?;
+                        self.select_greedy(w, t)?;
+                    }
+                    return Ok(());
                 };
                 let spec = tables.spec;
+                if index == 0 && gather {
+                    // SAFETY: the step's ids are staged before the replay; the streams hold its rows.
+                    unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, HC, std::ptr::null(),
+                        w.streams[0].buffer.ptr, self.stream)? };
+                }
                 if index == 0 {
                     self.enter(w, &mut c, None, layer, index, rows, spec)?;
                 } else if self.cfg.ple_layers.contains(&index) {
@@ -1214,7 +1362,10 @@ impl<'a> Qwen4Engine<'a> {
             unsafe { self.library.cuda_stream_synchronize(self.stream)? };
             return Ok(None);
         }
-        self.logits(w, &w.streams[cur], t, rows, logit_rows).map(Some)
+        if !head {
+            self.head(w, &w.streams[cur], t, rows, logit_rows)?;
+        }
+        Ok(Some(self.device_logits(w, logit_rows, head)))
     }
 
     fn replay(&self, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {

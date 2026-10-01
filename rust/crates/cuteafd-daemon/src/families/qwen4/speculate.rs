@@ -14,7 +14,10 @@
 //! (GDN and PLE record replay inputs instead of advancing); the accepted rows
 //! are committed (`qwen4_gdn_commit` / `qwen4_ple_commit`), the placement and
 //! n-gram history rewound, and the kept rows' streams stashed for the MTP.
-use super::engine::{MtpGroup, MtpRow, MtpSource, Qwen4Engine, Qwen4Placement, DECODE_ROWS, MTP_PENDING_ROWS};
+use super::engine::{
+    MtpGroup, MtpOut, MtpRow, MtpSource, MtpTokens, Qwen4Engine, Qwen4Placement, DECODE_ROWS, MTP_DEFERRED_STEPS,
+    MTP_PENDING_ROWS,
+};
 use anyhow::{ensure, Result};
 use cuteafd_loader::families::qwen4::NgramHistory;
 
@@ -43,8 +46,7 @@ impl MtpSeq {
 /// After the prefill of `chunk` (tokens from position `start`): the MTP's
 /// canonical rows for every pair whose next token is known (`next`: the token
 /// after the chunk, if known), and the chunk's last row stashed otherwise.
-pub(crate) fn prefill_chunk(engine: &Qwen4Engine<'_>, embed: &dyn Fn(&[u32]) -> Result<Vec<u8>>,
-    placement: &Qwen4Placement, start: usize, chunk: &[u32], next: Option<u32>, seq: &mut MtpSeq) -> Result<()> {
+pub(crate) fn prefill_chunk(engine: &Qwen4Engine<'_>, placement: &Qwen4Placement, start: usize, chunk: &[u32], next: Option<u32>, seq: &mut MtpSeq) -> Result<()> {
     let n = chunk.len();
     ensure!(n > 0 && seq.pending.is_empty(), "MTP prefill of an empty chunk or behind pending rows");
     let known = if next.is_some() { n } else { n - 1 };
@@ -59,7 +61,8 @@ pub(crate) fn prefill_chunk(engine: &Qwen4Engine<'_>, embed: &dyn Fn(&[u32]) -> 
     }
     let tokens: Vec<u32> = (0..known).map(|i| chunk.get(i + 1).copied().or(next).unwrap_or_default()).collect();
     let rows = (0..known).map(|i| MtpRow { position: start + i, token: tokens[i], source: i as i32 }).collect();
-    engine.mtp_step(false, &[MtpGroup { placement, rows }], MtpSource::Target, &[], &embed(&tokens)?, false)?;
+    engine.mtp_step(false, &[MtpGroup { placement, rows }], MtpSource::Target, &[], MtpTokens::Host(&tokens),
+        MtpOut::Download { logits: false })?;
     Ok(())
 }
 
@@ -79,9 +82,11 @@ pub(crate) struct DraftTiming {
 }
 
 /// Runs the pending rows of every sequence (canonical history) and drafts up
-/// to each sequence's depth; returns each sequence's drafts.
-pub(crate) fn draft(engine: &Qwen4Engine<'_>, embed: &dyn Fn(&[u32]) -> Result<Vec<u8>>, seqs: &mut [DraftSeq<'_>],
-    timing: &mut DraftTiming) -> Result<Vec<Vec<u32>>> {
+/// to each sequence's depth; returns each sequence's drafts. Every chain
+/// step embeds the previous step's drafts on the device, so the steps queue
+/// back to back and the drafts come back once, at the end.
+pub(crate) fn draft(engine: &Qwen4Engine<'_>, seqs: &mut [DraftSeq<'_>], timing: &mut DraftTiming)
+    -> Result<Vec<Vec<u32>>> {
     let mut drafts = vec![Vec::new(); seqs.len()];
     let started = std::time::Instant::now();
     // Step 0: every pending row; heads on the last row of the drafting sequences.
@@ -112,45 +117,60 @@ pub(crate) fn draft(engine: &Qwen4Engine<'_>, embed: &dyn Fn(&[u32]) -> Result<V
     if groups.is_empty() {
         return Ok(drafts);
     }
-    let (best, _) = engine.mtp_step(true, &groups, MtpSource::Pending, &heads, &embed(&tokens)?, false)?;
+    let depth = seqs.iter().map(|s| s.depth).max().unwrap_or(0);
+    ensure!(depth <= MTP_DEFERRED_STEPS, "MTP depth {depth}");
+    engine.mtp_step(true, &groups, MtpSource::Pending, &heads, MtpTokens::Host(&tokens), MtpOut::Defer { step: 0 })?;
     timing.steps += 1;
     drop(groups);
     for s in seqs.iter_mut() {
         s.seq.pending.clear();
     }
+    // Per step, the sequences it drafted for, in draft order (step 0: by head).
+    let mut steps: Vec<Vec<usize>> = Vec::new();
+    let mut first = vec![usize::MAX; heads.len()];
     for (i, h) in head_of.iter().enumerate() {
         if let Some(h) = h {
-            drafts[i].push(best[*h].0);
+            first[*h] = i;
         }
     }
-    // Chain steps: one row per sequence still drafting, reading its previous head row.
-    let depth = seqs.iter().map(|s| s.depth).max().unwrap_or(0);
-    let mut previous_head = head_of.clone().into_iter().map(|h| h.map(|h| heads[h])).collect::<Vec<_>>();
+    steps.push(first);
+    // Chain steps: one row per sequence still drafting, reading its previous
+    // head row and embedding its previous draft (still on the device).
+    // Where each sequence's last draft sits: (step row, head row).
+    let mut previous: Vec<Option<(usize, usize)>> = head_of.iter().map(|h| h.map(|h| (heads[h], h))).collect();
     for j in 1..depth {
         let mut groups = Vec::new();
-        let mut tokens = Vec::new();
+        let mut index = Vec::new();
         let mut members = Vec::new();
         for (i, s) in seqs.iter().enumerate() {
-            let Some(source) = previous_head[i] else { continue };
+            let Some((source, draft)) = previous[i] else { continue };
             if s.depth <= j {
                 continue;
             }
-            let token = *drafts[i].last().expect("a draft per step");
-            tokens.push(token);
+            index.push(draft as u32);
             members.push(i);
-            groups.push(MtpGroup { placement: s.placement, rows: vec![MtpRow { position: last_position[i] + j, token,
-                source: source as i32 }] });
+            // The row's token is the previous draft (embedded on the device; the MTP's
+            // history does not keep it).
+            groups.push(MtpGroup { placement: s.placement, rows: vec![MtpRow { position: last_position[i] + j,
+                token: 0, source: source as i32 }] });
         }
         if groups.is_empty() {
             break;
         }
         let heads: Vec<usize> = (0..groups.len()).collect();
-        let (best, _) = engine.mtp_step(true, &groups, MtpSource::Chain, &heads, &embed(&tokens)?, false)?;
+        engine.mtp_step(true, &groups, MtpSource::Chain, &heads, MtpTokens::Drafts { step: j - 1, index: &index },
+            MtpOut::Defer { step: j })?;
         timing.steps += 1;
-        previous_head = vec![None; seqs.len()];
+        previous = vec![None; seqs.len()];
         for (r, &i) in members.iter().enumerate() {
-            drafts[i].push(best[r].0);
-            previous_head[i] = Some(r);
+            previous[i] = Some((r, r));
+        }
+        steps.push(members);
+    }
+    let counts: Vec<usize> = steps.iter().map(Vec::len).collect();
+    for (step, ids) in steps.iter().zip(engine.mtp_drafts(&counts)?) {
+        for (&i, id) in step.iter().zip(ids) {
+            drafts[i].push(id);
         }
     }
     timing.seconds += started.elapsed().as_secs_f64();

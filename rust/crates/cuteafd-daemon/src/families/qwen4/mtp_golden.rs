@@ -1,9 +1,9 @@
 //! Speculation checks for Qwen 3.8 Flash Next (qwen4-golden): the MTP layer
 //! against the torch reference (python/reference/families/qwen4/mtp.py), greedy
 //! MTP speculation against plain greedy decoding, and step costs by rows.
-use super::engine::{Allocator, MtpGroup, MtpRow, MtpSource, Qwen4Engine, Qwen4Placement, DECODE_ROWS};
+use super::engine::{Allocator, MtpGroup, MtpOut, MtpRow, MtpSource, MtpTokens, Qwen4Engine, Qwen4Placement, DECODE_ROWS};
 use super::speculate::{self, DraftSeq, DraftTiming, MtpSeq, Verified};
-use super::{bf16s, embed_rows, similarity, GoldenArgs, Opened};
+use super::{bf16s, similarity, GoldenArgs, Opened};
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use std::time::Instant;
@@ -59,7 +59,7 @@ pub(super) fn mtp_oracle(args: &GoldenArgs, opened: &Opened, engine: &Qwen4Engin
         let next: Vec<u32> = rows.iter().map(|r| r.token).collect();
         let heads: Vec<usize> = (0..rows.len()).collect();
         let (best, logits) = engine.mtp_step(true, &[MtpGroup { placement: &placement, rows }],
-            MtpSource::Buffer(source.buffer.ptr), &heads, &embed_rows(&opened.checkpoint, &next, h)?, true)?;
+            MtpSource::Buffer(source.buffer.ptr), &heads, MtpTokens::Host(&next), MtpOut::Download { logits: true })?;
         let logits = logits.context("logits")?;
         let ours = bf16s(&engine.mtp_output(end - first)?);
         let theirs = bf16s(&ref_streams[first * row..end * row]);
@@ -98,19 +98,17 @@ pub(super) fn mtp_oracle(args: &GoldenArgs, opened: &Opened, engine: &Qwen4Engin
 
 /// Prefills `prompt` (with the MTP's canonical rows when `mtp`); returns the
 /// last row's logits.
-fn prefill(opened: &Opened, engine: &Qwen4Engine<'_>, placement: &mut Qwen4Placement, prompt: &[u32],
-    mtp: Option<&mut MtpSeq>) -> Result<Vec<f32>> {
-    let h = opened.cfg.hidden;
-    let embed = |t: &[u32]| embed_rows(&opened.checkpoint, t, h);
+fn prefill(engine: &Qwen4Engine<'_>, placement: &mut Qwen4Placement, prompt: &[u32], mtp: Option<&mut MtpSeq>)
+    -> Result<Vec<f32>> {
     let mut logits = None;
     let mut mtp = mtp;
     let mut done = 0;
     for chunk in prompt.chunks(engine.prefill_rows) {
         let start = placement.len;
-        logits = engine.prefill(placement, chunk, &embed(chunk)?)?;
+        logits = engine.prefill(placement, chunk)?;
         done += chunk.len();
         if let Some(seq) = mtp.as_deref_mut() {
-            speculate::prefill_chunk(engine, &embed, placement, start, chunk, prompt.get(done).copied(), seq)?;
+            speculate::prefill_chunk(engine, placement, start, chunk, prompt.get(done).copied(), seq)?;
         }
     }
     logits.context("prefill needs every layer")
@@ -123,8 +121,7 @@ fn prefill(opened: &Opened, engine: &Qwen4Engine<'_>, placement: &mut Qwen4Place
 pub(super) fn spec_decode(args: &GoldenArgs, opened: &Opened, engine: &Qwen4Engine<'_>, count: usize, depth: usize)
     -> Result<()> {
     let cfg = &opened.cfg;
-    let (h, vocab) = (cfg.hidden, cfg.vocab_size);
-    let embed = |t: &[u32]| embed_rows(&opened.checkpoint, t, h);
+    let vocab = cfg.vocab_size;
     let mut prompt = words(&args.golden.join("tokens.bin"))?;
     if let Some(p) = args.prefill {
         prompt.truncate(p);
@@ -132,13 +129,13 @@ pub(super) fn spec_decode(args: &GoldenArgs, opened: &Opened, engine: &Qwen4Engi
     let mut allocator = Allocator::new(engine.pages, engine.slots, cfg);
     // Plain greedy.
     let mut placement = allocator.admit(prompt.len() + count + DECODE_ROWS)?;
-    let mut next = argmax(&prefill(opened, engine, &mut placement, &prompt, None)?);
+    let mut next = argmax(&prefill(engine, &mut placement, &prompt, None)?);
     let mut plain = vec![next];
     // Top-2 logit margin of every plain step (near-ties may flip under other row counts).
     let mut margins = vec![f32::INFINITY];
     let started = Instant::now();
     while plain.len() < count {
-        let logits = engine.verify(&mut [(&mut placement, &[next][..])], &embed(&[next])?, None)?
+        let logits = engine.verify(&mut [(&mut placement, &[next][..])], None)?
             .context("decode needs every layer")?;
         next = argmax(&logits);
         let second = logits.iter().enumerate().filter(|&(i, _)| i != next as usize).map(|(_, &l)| l)
@@ -151,7 +148,7 @@ pub(super) fn spec_decode(args: &GoldenArgs, opened: &Opened, engine: &Qwen4Engi
     // MTP speculation.
     let mut placement = allocator.admit(prompt.len() + count + DECODE_ROWS)?;
     let mut seq = MtpSeq::default();
-    next = argmax(&prefill(opened, engine, &mut placement, &prompt, Some(&mut seq))?);
+    next = argmax(&prefill(engine, &mut placement, &prompt, Some(&mut seq))?);
     seq.close(next);
     let mut out = vec![next];
     let (mut cycles, mut proposed, mut accepted) = (0usize, 0usize, 0usize);
@@ -162,16 +159,16 @@ pub(super) fn spec_decode(args: &GoldenArgs, opened: &Opened, engine: &Qwen4Engi
     while out.len() < count {
         let room = (count - out.len()).min(DECODE_ROWS - 1);
         let want = depth.min(room.saturating_sub(1));
-        let drafts = speculate::draft(engine, &embed,
+        let drafts = speculate::draft(engine,
             &mut [DraftSeq { placement: &placement, seq: &mut seq, depth: want }], &mut timing)?.remove(0);
         let rows: Vec<u32> = std::iter::once(next).chain(drafts.iter().copied()).collect();
         let (start, history) = (placement.len, placement.history.clone());
         let timer = Instant::now();
         let spec = rows.len() > 1;
         let logits = if spec {
-            engine.verify_spec(&mut [(&mut placement, &rows[..])], &embed(&rows)?, None)?
+            engine.verify_spec(&mut [(&mut placement, &rows[..])], None)?
         } else {
-            engine.verify(&mut [(&mut placement, &rows[..])], &embed(&rows)?, None)?
+            engine.verify(&mut [(&mut placement, &rows[..])], None)?
         }.context("decode needs every layer")?;
         verify_s += timer.elapsed().as_secs_f64();
         let mut kept = 0;
@@ -232,7 +229,7 @@ pub(super) fn spec_decode(args: &GoldenArgs, opened: &Opened, engine: &Qwen4Engi
         for _ in 0..7 {
             let mut p = placement.clone();
             let timer = Instant::now();
-            engine.verify_spec(&mut [(&mut p, tokens)], &embed(tokens)?, None)?;
+            engine.verify_spec(&mut [(&mut p, tokens)], None)?;
             times.push(timer.elapsed().as_secs_f64());
         }
         times.sort_by(f64::total_cmp);
@@ -248,7 +245,7 @@ pub(super) fn spec_decode(args: &GoldenArgs, opened: &Opened, engine: &Qwen4Engi
         for _ in 0..7 {
             let timer = Instant::now();
             engine.mtp_step(true, std::slice::from_ref(&group), MtpSource::Pending, &heads,
-                &embed(&sample[..rows])?, false)?;
+                MtpTokens::Host(&sample[..rows]), MtpOut::Download { logits: false })?;
             times.push(timer.elapsed().as_secs_f64());
         }
         times.sort_by(f64::total_cmp);
