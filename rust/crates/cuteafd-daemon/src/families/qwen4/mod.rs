@@ -130,6 +130,11 @@ pub(crate) struct GoldenArgs {
     /// tokens) on fresh sequences, without layer downloads.
     #[arg(long, default_value_t = 0)]
     pub bench_prefill: usize,
+    /// Prompt length of --bench-prefill (the golden tokens repeated), in
+    /// chunks of the engine's prefill rows; default the golden prompt up to
+    /// one chunk.
+    #[arg(long)]
+    pub bench_prefill_tokens: Option<usize>,
     /// With --step-rows k: verify each step speculatively and commit only
     /// this many of its rows (the next step starts after them), checking
     /// GDN/PLE verify-by-replay against the golden logits.
@@ -500,12 +505,15 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
         }
     }
     if args.bench_prefill > 0 {
-        let n = prefill.min(engine.prefill_rows);
+        let n = args.bench_prefill_tokens.unwrap_or(prefill.min(engine.prefill_rows));
+        let long: Vec<u32> = tokens.iter().copied().cycle().take(n).collect();
         let mut times = Vec::new();
         for _ in 0..args.bench_prefill {
             let mut fresh = allocator.admit(n)?;
             let started = Instant::now();
-            engine.prefill(&mut fresh, &tokens[..n])?;
+            for chunk in long.chunks(engine.prefill_rows) {
+                engine.prefill(&mut fresh, chunk)?;
+            }
             times.push(started.elapsed().as_secs_f64());
             allocator.release(fresh);
         }

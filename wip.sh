@@ -163,16 +163,32 @@ python3 "$staging_dir/scripts/build/verify-xgrammar-source.py" \
   --source "$staging_dir/third_party/xgrammar" \
   --lock "$staging_dir/third_party/xgrammar.lock.json"
 
+sparkinfer_revision="$(python3 "$staging_dir/scripts/build/verify-sparkinfer-source.py" \
+  --source "$staging_dir/third_party/sparkinfer" \
+  --lock "$staging_dir/third_party/sparkinfer.lock.json" \
+  --print-revision)"
+
+# Slots are built and launched inside the development images, which bake in
+# the pinned SparkInfer; run.sh --wip refuses a mismatch, so refuse it here,
+# before any container is recreated, and name the rebuild.
 ensure_local_image() {
   docker image inspect "$COORDINATOR_DOCKER_DEV" >/dev/null 2>&1 ||
-    release_die "missing coordinator development image $COORDINATOR_DOCKER_DEV; run ./build.sh"
+    release_die "missing coordinator development image $COORDINATOR_DOCKER_DEV; $(release_dev_image_rebuild_hint)"
+  release_require_dev_image_sparkinfer "$(hostname)" "$COORDINATOR_DOCKER_DEV" \
+    "$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.sparkinfer.revision"}}' "$COORDINATOR_DOCKER_DEV")" \
+    "$sparkinfer_revision"
 }
 
 ensure_seed_image() {
-  ssh -o BatchMode=yes "$seed_host" \
-    "docker image inspect '$SPARK_EXPERT_DOCKER_DEV' >/dev/null" ||
-    release_die "$seed_host lacks development image $SPARK_EXPERT_DOCKER_DEV; run ./build.sh"
+  local label
+  label="$(ssh -o BatchMode=yes "$seed_host" \
+    "docker image inspect -f '{{index .Config.Labels \"io.cuteafd.sparkinfer.revision\"}}' '$SPARK_EXPERT_DOCKER_DEV'")" ||
+    release_die "$seed_host lacks development image $SPARK_EXPERT_DOCKER_DEV; $(release_dev_image_rebuild_hint)"
+  release_require_dev_image_sparkinfer "$seed_host" "$SPARK_EXPERT_DOCKER_DEV" "$label" "$sparkinfer_revision"
 }
+
+ensure_local_image
+ensure_seed_image
 
 distribute_spark_dev_image() {
   local seed_id
@@ -217,9 +233,6 @@ if ((recreate)); then
   echo "== discarding persistent WIP containers and build caches =="
   remove_wip_containers
 fi
-
-ensure_local_image
-ensure_seed_image
 
 preflight_existing_container_images() {
   local expected actual host coordinator_device

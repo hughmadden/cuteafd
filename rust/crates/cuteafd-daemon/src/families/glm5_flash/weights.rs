@@ -12,7 +12,10 @@
 //! b]`, `w_fg = [f_b; g_b]`, `conv_w` FP32 `[3D, 4]`; MLA `w_qkv_a = [q_a;
 //! kv_a]`, `kv_b` split per head into `w_uk [N, 512, 256]` (transposed key
 //! rows) and `w_uv [N, 256, 512]`; mHC `fn` widened to FP32; dense and shared
-//! `w_gate_up = [gate; up]`.
+//! `w_gate_up = [gate; up]`. A ModelOpt NVFP4 dense MLP (nvidia/GLM-5.3-Flash-
+//! NVFP4, layers 0-2) stays NVFP4: `nvfp4_w{1,3,2}` packed E2M1 and
+//! `nvfp4_s{1,3,2}` its E4M3 scales then FP32 weight_scale_2 and input_scale,
+//! the one-expert layout of the `fp8-glmfdense-nvfp4` package.
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
@@ -104,6 +107,34 @@ impl<'a> GlmfLoader<'a> {
             .read_exact_at(&mut bytes, tensor.meta.byte_offset)
             .with_context(|| format!("reading {name}"))?;
         Ok((bytes, tensor.meta.dtype.clone(), tensor.meta.shape.clone()))
+    }
+
+    /// A ModelOpt NVFP4 dense MLP at `mlp` as the one-expert fp8_moe operands
+    /// (see the module docstring); false when the checkpoint stores it otherwise.
+    fn nvfp4_dense(&self, cfg: &GlmNextConfig, mlp: &str, ops: &mut HashMap<&'static str, DeviceAllocation<'a>>)
+        -> Result<bool> {
+        if self.tensor(&format!("{mlp}.gate_proj.weight"))?.meta.dtype != DType::U8 {
+            return Ok(false);
+        }
+        let (h, i) = (cfg.hidden, cfg.dense_intermediate);
+        for (proj, w_key, s_key, rows, cols) in [("gate_proj", "nvfp4_w1", "nvfp4_s1", i, h),
+            ("up_proj", "nvfp4_w3", "nvfp4_s3", i, h), ("down_proj", "nvfp4_w2", "nvfp4_s2", h, i)] {
+            let name = format!("{mlp}.{proj}");
+            let (weight, dtype, shape) = self.raw(&format!("{name}.weight"))?;
+            ensure!(dtype == DType::U8 && shape == [rows, cols / 2], "{name}.weight: expected packed E2M1 U8 [{rows}, {}], \
+                found {dtype:?} {shape:?}", cols / 2);
+            let (mut scales, dtype, shape) = self.raw(&format!("{name}.weight_scale"))?;
+            ensure!(dtype == DType::F8E4M3 && shape == [rows, cols / 16], "{name}.weight_scale: expected E4M3 \
+                [{rows}, {}], found {dtype:?} {shape:?}", cols / 16);
+            for scalar in ["weight_scale_2", "input_scale"] {
+                let (bytes, dtype, _) = self.raw(&format!("{name}.{scalar}"))?;
+                ensure!(dtype == DType::F32 && bytes.len() == 4, "{name}.{scalar}: expected one FP32 value");
+                scales.extend_from_slice(&bytes);
+            }
+            ops.insert(w_key, self.upload(&weight)?);
+            ops.insert(s_key, self.upload(&scales)?);
+        }
+        Ok(true)
     }
 
     fn upload(&self, bytes: &[u8]) -> Result<DeviceAllocation<'a>> {
@@ -406,13 +437,15 @@ impl<'a> GlmfLoader<'a> {
             }
         }
         let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
-        let block = super::fp8::Layout::Block;
-        let (q, s) = self.fp8(&[format!("{mlp}.gate_proj.weight"), format!("{mlp}.up_proj.weight")], block)?;
-        ops.insert("w_gate_up_fp8", q);
-        ops.insert("w_gate_up_scale", s);
-        let (q, s) = self.fp8(&[format!("{mlp}.down_proj.weight")], block)?;
-        ops.insert("w_down_fp8", q);
-        ops.insert("w_down_scale", s);
+        if !(dense && self.nvfp4_dense(cfg, &mlp, &mut ops)?) {
+            let block = super::fp8::Layout::Block;
+            let (q, s) = self.fp8(&[format!("{mlp}.gate_proj.weight"), format!("{mlp}.up_proj.weight")], block)?;
+            ops.insert("w_gate_up_fp8", q);
+            ops.insert("w_gate_up_scale", s);
+            let (q, s) = self.fp8(&[format!("{mlp}.down_proj.weight")], block)?;
+            ops.insert("w_down_fp8", q);
+            ops.insert("w_down_scale", s);
+        }
         if !dense {
             ops.insert("gate", self.one(&format!("{p}.mlp.gate.weight"))?);
             ops.insert("gate.bias", self.f32(&[format!("{p}.mlp.gate.e_score_correction_bias")])?);

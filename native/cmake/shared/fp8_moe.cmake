@@ -7,7 +7,10 @@
 # the packages there. FAMILY:nvfp4 entries (glm, glmf, qwen4) build
 # fp8-FAMILY-nvfp4/ the same way for NVIDIA ModelOpt NVFP4 releases (W4A16:
 # packed E2M1 x E4M3 per-16 scales widened exactly, FP32 alpha per expert;
-# exporter geometry FAMILY_nvfp4).
+# exporter geometry FAMILY_nvfp4); FAMILY:nvfp4a4 builds fp8-FAMILY-nvfp4a4/,
+# whose large-row steps run W4A4 (activations quantized with the checkpoint's
+# input_scale, block-scaled FP4 MMAs; decode rows stay W4A16). glmfdense:nvfp4[a4]
+# is GLM 5.3 Flash's NVFP4 dense MLP (one always-selected expert, coordinator tp1).
 if(CUTEAFD_CUDA_ARCHITECTURES MATCHES "^120")
   set(CUTEAFD_FP8_MOE_ROLE coordinator)
 elseif(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "121")
@@ -25,18 +28,21 @@ list(GET CUDAToolkit_INCLUDE_DIRS 0 CUTEAFD_FP8_MOE_CUDA_INCLUDE)
 set(CUTEAFD_FP8_MOE_TOOL "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/package_fp8_moe_aot.py")
 set(CUTEAFD_FP8_MOE_MANIFESTS)
 foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
-  if(NOT entry MATCHES ":(fp8|nvfp4)$")
+  if(NOT entry MATCHES ":(fp8|nvfp4|nvfp4a4)$")
     continue()
   endif()
   if(entry MATCHES "^(mimo|mimop|glm|glmf|qwen4):fp8$")
     set(geometry "${CMAKE_MATCH_1}")
     set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-${geometry}")
-  elseif(entry MATCHES "^(glm|glmf|qwen4):nvfp4$")
-    set(geometry "${CMAKE_MATCH_1}_nvfp4")
-    set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-${CMAKE_MATCH_1}-nvfp4")
+  elseif(entry MATCHES "^(glm|glmf|glmfdense|qwen4):(nvfp4|nvfp4a4)$")
+    if(CMAKE_MATCH_1 STREQUAL "glmfdense" AND CUTEAFD_FP8_MOE_ROLE STREQUAL "spark")
+      continue()  # dense MLPs run on the coordinator only
+    endif()
+    set(geometry "${CMAKE_MATCH_1}_${CMAKE_MATCH_2}")
+    set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-${CMAKE_MATCH_1}-${CMAKE_MATCH_2}")
   else()
     message(FATAL_ERROR "FP8 expert family ${entry} must be (mimo|mimop|glm|glmf|qwen4):fp8 (mimop: MXFP4 weights) \
-or (glm|glmf|qwen4):nvfp4 (ModelOpt NVFP4)")
+or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, W4A16 or W4A4 large-row steps)")
   endif()
   set(stamp "${CMAKE_CURRENT_BINARY_DIR}/fp8_moe_${geometry}.stamp")
   file(GENERATE OUTPUT "${stamp}" CONTENT "role=${CUTEAFD_FP8_MOE_ROLE}|capacities=${CUTEAFD_FP8_MOE_CAPACITIES}\n")

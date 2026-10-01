@@ -20,7 +20,9 @@
 //! rejected rows at positions past it and set the length back.
 //!
 //! Every copy is enqueued on the engine stream, in order with the forward passes, and `drain`
-//! synchronizes it.
+//! synchronizes it. Under a head split each GPU keeps identical caches and compressor state
+//! (the split replicates them): units, window rows and state are copied on each GPU's stream,
+//! into each GPU's own mark arena (the same slot on both).
 use super::engine::Engine;
 use super::metadata::{compressed_page_bytes, INDEX_PAGE_BYTES, MAIN_PAGE_BYTES, SOURCE_PAGE_TOKENS, WINDOW};
 use super::pool::{Placement, PoolAllocator};
@@ -44,6 +46,8 @@ const INDEX_KEY_BYTES: usize = 128;
 
 /// One layer's device buffers.
 struct LayerBuffers {
+    /// The head-split rank whose GPU holds them (0 without a split).
+    rank: usize,
     /// Window pool (every sequence's ring).
     main: CuteafdDeviceBuffer,
     /// Compression ratio (0: window only) and the compressed pool.
@@ -57,14 +61,17 @@ struct LayerBuffers {
 pub(crate) struct Dsv4Prefix<'e, 'a> {
     engine: &'e Engine<'a>,
     layers: Vec<LayerBuffers>,
+    /// One mark's bytes on each rank's GPU, and their sum.
+    rank_mark_bytes: Vec<usize>,
     mark_bytes: usize,
-    arena: Option<DeviceAllocation<'a>>,
+    /// Per rank: its marks' arena.
+    arenas: Vec<DeviceAllocation<'a>>,
     slots: usize,
 }
 
 fn layer_buffers(engine: &Engine<'_>) -> Result<Vec<LayerBuffers>> {
     let sequences = engine.shape.sequences;
-    engine.caches().iter().map(|cache| {
+    (0..engine.ranks()).flat_map(|rank| engine.caches_on(rank).iter().map(move |cache| (rank, cache))).map(|(rank, cache)| {
         let compressed = match (&cache.compressed, &cache.index) {
             (Some(c), Some(_)) => Some((4, c.buffer)),
             (Some(c), None) => Some((128, c.buffer)),
@@ -74,7 +81,7 @@ fn layer_buffers(engine: &Engine<'_>) -> Result<Vec<LayerBuffers>> {
             ensure!(s.buffer.bytes % sequences == 0, "compressor state of {} B for {sequences} sequences", s.buffer.bytes);
             Ok((s.buffer, s.buffer.bytes / sequences))
         }).collect::<Result<_>>()?;
-        Ok(LayerBuffers { main: cache.main.buffer, compressed, index: cache.index.as_ref().map(|i| i.buffer), states })
+        Ok(LayerBuffers { rank, main: cache.main.buffer, compressed, index: cache.index.as_ref().map(|i| i.buffer), states })
     }).collect()
 }
 
@@ -89,16 +96,28 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
                 ensure!(buffer.bytes >= shape.units * compressed_page_bytes(ratio), "C{ratio} pool smaller than the units");
             }
         }
-        let mark_bytes = Self::mark_bytes_of(engine)?;
+        let rank_mark_bytes: Vec<usize> = (0..engine.ranks()).map(|rank| layers.iter().filter(|l| l.rank == rank)
+            .map(Self::layer_mark_bytes).sum()).collect();
+        let mark_bytes = rank_mark_bytes.iter().sum();
         let slots = slots(mark_bytes);
-        let arena = if slots > 0 { Some(DeviceAllocation::new(engine.library, slots * mark_bytes)?) } else { None };
-        Ok(Self { engine, layers, mark_bytes, arena, slots })
+        let arenas = if slots > 0 {
+            rank_mark_bytes.iter().enumerate().map(|(rank, &bytes)| {
+                engine.on(rank, || DeviceAllocation::new(engine.library, (slots * bytes).max(256)))
+            }).collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        Ok(Self { engine, layers, rank_mark_bytes, mark_bytes, arenas, slots })
     }
 
-    /// Bytes of one mark for `engine` (window rows and compressor state of every layer).
+    /// One layer's share of a mark: its window rows and compressor state.
+    fn layer_mark_bytes(layer: &LayerBuffers) -> usize {
+        WINDOW_MARK_BYTES + layer.states.iter().map(|&(_, stride)| stride).sum::<usize>()
+    }
+
+    /// Bytes of one mark for `engine` (window rows and compressor state of every layer, on every GPU).
     pub fn mark_bytes_of(engine: &Engine<'_>) -> Result<usize> {
-        Ok(layer_buffers(engine)?.iter()
-            .map(|l| WINDOW_MARK_BYTES + l.states.iter().map(|&(_, stride)| stride).sum::<usize>()).sum())
+        Ok(layer_buffers(engine)?.iter().map(Self::layer_mark_bytes).sum())
     }
 
     pub fn mark_bytes(&self) -> usize {
@@ -114,7 +133,7 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
     }
 
     pub fn slots(&self) -> usize {
-        if self.arena.is_some() { self.slots } else { 0 }
+        if self.arenas.is_empty() { 0 } else { self.slots }
     }
 
     /// A device buffer of the engine (the host tier's copy-engine template).
@@ -122,24 +141,27 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
         self.layers[0].main
     }
 
-    fn copy(&self, dst: CuteafdDeviceBuffer, src: CuteafdDeviceBuffer) -> Result<()> {
+    /// A copy between two views on rank `rank`'s GPU.
+    fn copy(&self, rank: usize, dst: CuteafdDeviceBuffer, src: CuteafdDeviceBuffer) -> Result<()> {
         debug_assert_eq!(dst.bytes, src.bytes);
-        // SAFETY: both views lie inside live engine allocations (checked by `view`); the copy is
-        // ordered on the engine stream with every forward pass that reads or writes them.
-        unsafe { self.engine.library.copy_d2d_async(dst, src, src.bytes, self.engine.stream) }
+        // SAFETY: both views lie inside live allocations of that GPU (checked by `view`); the copy
+        // is ordered on its stream with every forward pass that reads or writes them.
+        self.engine.on(rank, || unsafe {
+            self.engine.library.copy_d2d_async(dst, src, src.bytes, self.engine.stream_of(rank))
+        })
     }
 
     /// The device ranges of one unit, per compressed layer: the C4 page and its index page, or
     /// the C128 page.
-    fn unit_ranges(&self, unit: u32) -> Result<Vec<CuteafdDeviceBuffer>> {
+    fn unit_ranges(&self, unit: u32) -> Result<Vec<(usize, CuteafdDeviceBuffer)>> {
         let unit = unit as usize;
         let mut out = Vec::new();
         for layer in &self.layers {
             let Some((ratio, buffer)) = layer.compressed else { continue };
             let bytes = compressed_page_bytes(ratio);
-            out.push(view(buffer, unit * bytes, bytes)?);
+            out.push((layer.rank, view(buffer, unit * bytes, bytes)?));
             if let Some(index) = layer.index {
-                out.push(view(index, unit * INDEX_PAGE_BYTES, INDEX_PAGE_BYTES)?);
+                out.push((layer.rank, view(index, unit * INDEX_PAGE_BYTES, INDEX_PAGE_BYTES)?));
             }
         }
         Ok(out)
@@ -149,16 +171,18 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
     /// rows of positions `[len - min(len, 128), len)` (mark row `k` is position
     /// `len - min(len, 128) + k`), then every compressor state array's slice of its state slot.
     fn move_mark(&self, slot: MarkSlot, placement: &Placement, len: usize, capture: bool) -> Result<()> {
-        let arena = self.arena.as_ref().map(|a| a.buffer).context("no mark arena")?;
+        ensure!(!self.arenas.is_empty(), "no mark arena");
         let shape = self.engine.shape;
         ensure!((slot.0 as usize) < self.slots, "mark slot {} of {}", slot.0, self.slots);
         ensure!(placement.state < shape.sequences, "state slot {} of {}", placement.state, shape.sequences);
         let first = len - len.min(WINDOW);
-        let mut offset = slot.0 as usize * self.mark_bytes;
-        let copy = |ring: CuteafdDeviceBuffer, mark: CuteafdDeviceBuffer| {
-            if capture { self.copy(mark, ring) } else { self.copy(ring, mark) }
-        };
+        let mut offsets: Vec<usize> = self.rank_mark_bytes.iter().map(|&bytes| slot.0 as usize * bytes).collect();
         for layer in &self.layers {
+            let (rank, arena) = (layer.rank, self.arenas[layer.rank].buffer);
+            let offset = &mut offsets[rank];
+            let copy = |ring: CuteafdDeviceBuffer, mark: CuteafdDeviceBuffer| {
+                if capture { self.copy(rank, mark, ring) } else { self.copy(rank, ring, mark) }
+            };
             // Positions [first, len) in runs that stay inside one window page.
             let mut position = first;
             while position < len {
@@ -167,15 +191,15 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
                 let page = placement.window_slot(&shape, position) as usize / SOURCE_PAGE_TOKENS;
                 let (base, k) = (page * MAIN_PAGE_BYTES, position - first);
                 copy(view(layer.main, base + row * PAYLOAD_BYTES, count * PAYLOAD_BYTES)?,
-                    view(arena, offset + k * PAYLOAD_BYTES, count * PAYLOAD_BYTES)?)?;
+                    view(arena, *offset + k * PAYLOAD_BYTES, count * PAYLOAD_BYTES)?)?;
                 copy(view(layer.main, base + SOURCE_PAGE_TOKENS * PAYLOAD_BYTES + row * SCALE_BYTES, count * SCALE_BYTES)?,
-                    view(arena, offset + WINDOW * PAYLOAD_BYTES + k * SCALE_BYTES, count * SCALE_BYTES)?)?;
+                    view(arena, *offset + WINDOW * PAYLOAD_BYTES + k * SCALE_BYTES, count * SCALE_BYTES)?)?;
                 position += count;
             }
-            offset += WINDOW_MARK_BYTES;
+            *offset += WINDOW_MARK_BYTES;
             for &(state, stride) in &layer.states {
-                copy(view(state, placement.state * stride, stride)?, view(arena, offset, stride)?)?;
-                offset += stride;
+                copy(view(state, placement.state * stride, stride)?, view(arena, *offset, stride)?)?;
+                *offset += stride;
             }
         }
         Ok(())
@@ -226,27 +250,30 @@ impl PrefixFamily for Dsv4Prefix<'_, '_> {
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
         // Whole pages: the records of groups the copied rows complete, and nothing anyone reads
         // past them.
-        for (from, to) in self.unit_ranges(copy.from)?.into_iter().zip(self.unit_ranges(copy.to)?) {
-            self.copy(to, from)?;
+        for ((rank, from), (_, to)) in self.unit_ranges(copy.from)?.into_iter().zip(self.unit_ranges(copy.to)?) {
+            self.copy(rank, to, from)?;
         }
         Ok(())
     }
 
     fn drain(&self) -> Result<(), BoxError> {
-        // SAFETY: the engine owns this stream.
-        Ok(unsafe { self.engine.library.cuda_stream_synchronize(self.engine.stream) }?)
+        for rank in 0..self.engine.ranks() {
+            // SAFETY: the engine owns these streams.
+            unsafe { self.engine.library.cuda_stream_synchronize(self.engine.stream_of(rank))? };
+        }
+        Ok(())
     }
 
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
         self.unit_ranges(page).unwrap_or_default().into_iter()
-            .map(|b| DeviceRange { addr: b.ptr as u64, bytes: b.bytes }).collect()
+            .map(|(_, b)| DeviceRange { addr: b.ptr as u64, bytes: b.bytes }).collect()
     }
 
     fn mark_segments(&self, slot: MarkSlot) -> Vec<DeviceRange> {
-        self.arena.as_ref().map_or_else(Vec::new, |arena| vec![DeviceRange {
-            addr: arena.buffer.ptr as u64 + (slot.0 as usize * self.mark_bytes) as u64,
-            bytes: self.mark_bytes,
-        }])
+        self.arenas.iter().zip(&self.rank_mark_bytes).map(|(arena, &bytes)| DeviceRange {
+            addr: arena.buffer.ptr as u64 + (slot.0 as usize * bytes) as u64,
+            bytes,
+        }).collect()
     }
 }
 
@@ -330,7 +357,9 @@ impl Runner<'_, '_, '_> {
 
 fn download(engine: &Engine<'_>, range: CuteafdDeviceBuffer) -> Result<Vec<u8>> {
     // SAFETY: the engine owns this stream; draining it retires every write to `range`.
-    unsafe { engine.library.cuda_stream_synchronize(engine.stream)? };
+    for rank in 0..engine.ranks() {
+        unsafe { engine.library.cuda_stream_synchronize(engine.stream_of(rank))? };
+    }
     let mut bytes = vec![0u8; range.bytes];
     engine.library.copy_d2h(&mut bytes, range)?;
     Ok(bytes)
@@ -347,11 +376,11 @@ fn paged_rows(family: &Dsv4Prefix<'_, '_>, placement: &Placement, len: usize) ->
             let Some((ratio, _)) = layer.compressed else { continue };
             let page_rows = SOURCE_PAGE_TOKENS / ratio;
             let rows = (len / ratio).saturating_sub(u * page_rows).min(page_rows);
-            let page = download(family.engine, ranges.next().context("unit range")?)?;
+            let page = download(family.engine, ranges.next().context("unit range")?.1)?;
             out.extend_from_slice(&page[..rows * PAYLOAD_BYTES]);
             out.extend_from_slice(&page[page_rows * PAYLOAD_BYTES..][..rows * SCALE_BYTES]);
             if layer.index.is_some() {
-                let page = download(family.engine, ranges.next().context("index range")?)?;
+                let page = download(family.engine, ranges.next().context("index range")?.1)?;
                 out.extend_from_slice(&page[..rows * INDEX_KEY_BYTES]);
                 out.extend_from_slice(&page[INDEX_ROWS * INDEX_KEY_BYTES..][..rows * 4]);
             }
@@ -368,7 +397,8 @@ fn mark(family: &Dsv4Prefix<'_, '_>, slot: u32, len: usize) -> Result<Vec<u8>> {
         bytes: range.bytes, ..family.template() })?;
     let rows = len.min(WINDOW);
     let (mut out, mut offset) = (Vec::with_capacity(bytes.len()), 0);
-    for layer in &family.layers {
+    // Rank 0's arena (a head split's rank 1 keeps an identical copy of its layers' rows).
+    for layer in family.layers.iter().filter(|l| l.rank == 0) {
         out.extend_from_slice(&bytes[offset..][..rows * PAYLOAD_BYTES]);
         out.extend_from_slice(&bytes[offset + WINDOW * PAYLOAD_BYTES..][..rows * SCALE_BYTES]);
         offset += WINDOW_MARK_BYTES;
