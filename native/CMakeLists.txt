@@ -51,7 +51,8 @@ set(CUTEAFD_MIMO_GEOMETRIES "mimo" CACHE STRING
   "MiMo program geometries with CUTEAFD_ENABLE_MIMO_AOT: mimo (V2 Flash), mimop (V2.6 Pro); mimo2 / mimop2 their two-GPU head splits")
 option(CUTEAFD_ENABLE_GLMF_AOT "Build the GLM 5.3 Flash coordinator programs (same table as DeepSeek V4)" OFF)
 option(CUTEAFD_ENABLE_QWEN4_AOT "Build the Qwen 3.8 Flash Next coordinator programs (same table as DeepSeek V4)" OFF)
-set(CUTEAFD_DSV4_GEOMETRY "flash,pro" CACHE STRING "DeepSeek V4 program geometries, comma-separated: flash, pro")
+set(CUTEAFD_DSV4_GEOMETRY "flash,pro,flash2,pro2" CACHE STRING
+  "DeepSeek V4 program geometries, comma-separated: flash, pro; flash2 / pro2 their two-GPU head splits")
 set(CUTEAFD_DSV4_DECODE_ROWS "64" CACHE STRING "DeepSeek V4 decode program capacity (below 96 keeps mHC on its decode route)")
 set(CUTEAFD_DSV4_PREFILL_ROWS "4096" CACHE STRING "DeepSeek V4 prefill program capacity")
 set(CUTEAFD_DSV4_MAX_CONTEXT "131072" CACHE STRING "DeepSeek V4 cache extent compiled into programs")

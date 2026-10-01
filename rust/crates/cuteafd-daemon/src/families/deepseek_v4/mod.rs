@@ -199,7 +199,17 @@ pub(crate) fn with_engine<T>(
     let caps = &loaded.manifest["capacities"];
     let stream = loaded.library.cuda_stream_create()?;
     // The head split's second GPU and its stream (load kernels, then the engine's).
-    let peer_stream = match args.split_device {
+    // A head split needs its share's programs (`dsv4f2` / `dsv4p2`) in this build.
+    let share_program = format!("{}2_wo_m{}", loaded.family, caps["decode_rows"].as_u64().unwrap_or(64));
+    let split_device = match args.split_device {
+        Some(device) if programs.spec(&share_program).is_ok() => Some(device),
+        Some(device) => {
+            tracing::info!(device, "no head-split programs ({share_program}) in this build; serving from --device alone");
+            None
+        }
+        None => None,
+    };
+    let peer_stream = match split_device {
         Some(device) => {
             ensure!(device != args.device, "--split-device must differ from --device");
             loaded.library.cuda_enable_peer(device)?;

@@ -368,8 +368,28 @@ impl<'a> GlmLoader<'a> {
 
     /// Every rank's copy of a small operand read once.
     fn replicated(&self, ranks: usize, read: impl FnOnce() -> Result<Vec<u8>>) -> Result<Vec<DeviceAllocation<'a>>> {
-        let bytes = read()?;
-        (0..ranks).map(|rank| self.on_rank(rank, |_| self.upload(&bytes))).collect()
+        self.upload_all(ranks, &read()?)
+    }
+
+    /// `bytes` on every rank: one upload to rank 0, peer copies to the others (faster than
+    /// a second pageable host upload).
+    fn upload_all(&self, ranks: usize, bytes: &[u8]) -> Result<Vec<DeviceAllocation<'a>>> {
+        let first = self.upload(bytes)?;
+        let mut out = Vec::with_capacity(ranks);
+        for rank in 1..ranks {
+            out.push(self.on_rank(rank, |stream| {
+                let copy = DeviceAllocation::new(self.library, bytes.len().max(256))?;
+                // SAFETY: both allocations hold `bytes.len()` bytes; peer access to rank 0 is
+                // enabled (the split setup); the stream drains before return.
+                unsafe {
+                    self.library.copy_d2d_async(copy.buffer, first.buffer, bytes.len(), stream)?;
+                    self.library.cuda_stream_synchronize(stream)?;
+                }
+                Ok(copy)
+            })?);
+        }
+        out.insert(0, first);
+        Ok(out)
     }
 
     /// Layer `layer`, one share per rank of this loader's head split (one
@@ -414,9 +434,7 @@ impl<'a> GlmLoader<'a> {
             let kb = cols.div_ceil(128);
             let grid_ref = &grid;
             let kscale: Vec<f32> = (0..kb).flat_map(|b| (0..rows).map(move |r| grid_ref[(r / 128) * kb + b])).collect();
-            let each = |bytes: &[u8]| -> Result<Vec<DeviceAllocation<'a>>> {
-                (0..ranks).map(|rank| self.on_rank(rank, |_| self.upload(bytes))).collect()
-            };
+            let each = |bytes: &[u8]| self.upload_all(ranks, bytes);
             Ok((each(values)?, each(&f32_bytes(&grid))?, each(&f32_bytes(&kscale))?))
         })?;
         put(&mut ops, "w_qkv_a_fp8", values);
@@ -445,9 +463,16 @@ impl<'a> GlmLoader<'a> {
                 format!("{p}.self_attn.indexer.weights_proj.weight")])?;
             let mut copies = vec![];
             for rank in 1..ranks {
-                let mut host = vec![0u8; w_ik.buffer.bytes];
-                self.library.copy_d2h(&mut host, w_ik.buffer)?;
-                copies.push(self.on_rank(rank, |_| self.upload(&host))?);
+                copies.push(self.on_rank(rank, |stream| {
+                    let copy = DeviceAllocation::new(self.library, w_ik.buffer.bytes)?;
+                    // SAFETY: both allocations hold the whole operand; peer access to rank 0 is
+                    // enabled (the split setup); the stream drains before return.
+                    unsafe {
+                        self.library.copy_d2d_async(copy.buffer, w_ik.buffer, w_ik.buffer.bytes, stream)?;
+                        self.library.cuda_stream_synchronize(stream)?;
+                    }
+                    Ok(copy)
+                })?);
             }
             put(&mut ops, "w_ik", std::iter::once(w_ik).chain(copies).collect());
             put(&mut ops, "k_norm_w", self.replicated(ranks, || raw(&format!("{p}.self_attn.indexer.k_norm.weight")))?);

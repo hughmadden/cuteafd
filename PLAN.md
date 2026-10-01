@@ -398,10 +398,11 @@ hops. So the head split pays and is the default with two RTX
 opts out): MiMo V2.6 Pro (coordinator-only decode -41%, 8K prefill -43%; with
 6 Sparks C1 decode 30.9 -> 26.0 ms, prefill Spark-bound) and GLM 5.3
 (coordinator-only 8K prefill -28%; with 6 Sparks decode -9.5%, prefill
-Spark-bound). Shared plumbing in `shared/peer_split.rs`: per-slot release flags,
+Spark-bound) and DeepSeek V4 (4 Sparks, all experts remote: Flash decode -10%,
+Pro decode -12%, prefill neutral). Shared plumbing in `shared/peer_split.rs`: per-slot release flags,
 partials exchanged and summed in the same operand order on both GPUs (identical
 residual streams), GPU1 queued a layer ahead of GPU0's Spark exchange, decode
-graphs captured per GPU. The layer-range split is not needed for these two.
+graphs captured per GPU. The layer-range split is not needed for these three.
 The drafter follows the GPU that owns the last backbone layers (taps and head
 live there); TP2 drafters are ≤1% on DFlash2 and not built unless the P2P
 probe shows ≤15 µs hops; the win is lane B drafting on GPU1 while lane A
