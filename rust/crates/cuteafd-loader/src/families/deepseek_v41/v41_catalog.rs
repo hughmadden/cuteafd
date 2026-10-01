@@ -349,7 +349,8 @@ impl OfficialV41Catalog {
                     &self.snapshot.join(&tensor.shard),
                     metadata.byte_offset,
                     metadata.shape[0] as u64,
-                    crate::RowFormat::of(metadata.dtype.clone(), metadata.shape[1])?,
+                    // One byte per element for every engram encoding (FP8, UE8M0, packed NVFP4 bytes).
+                    crate::RowFormat { dtype: metadata.dtype.clone(), width: metadata.shape[1], row_bytes: metadata.shape[1] },
                 )?
             })
         };
