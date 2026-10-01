@@ -314,6 +314,9 @@ pub(crate) fn resume_check(engine: &GlmfEngine<'_>, embed_rows: &dyn Fn(&[u32]) 
             ..family.paged[0][0] })
     };
     let mark_equal = mark(0)? == mark(1)?;
+    // The state at P (every paged row and the KDA state): what a restore must reproduce.
+    let state_at = paged_rows(&family, &a, at)? == paged_rows(&family, &b, at)?
+        && engine.slot_state(a.slot)? == engine.slot_state(b.slot)?;
     let straight = prefill_digest(engine, &mut a, &embed[at * row..], chunk, true)?;
     let restored = prefill_digest(engine, &mut b, &embed[at * row..], chunk, true)?;
     let first_layer = straight.layers.iter().zip(&restored.layers).position(|(x, y)| x != y);
@@ -332,9 +335,9 @@ pub(crate) fn resume_check(engine: &GlmfEngine<'_>, embed_rows: &dyn Fn(&[u32]) 
     let len = a.len;
     let paged_equal = paged_rows(&family, &a, len)? == paged_rows(&family, &b, len)?;
     let state_equal = engine.slot_state(a.slot)? == engine.slot_state(b.slot)?;
-    println!("resume at {at} of {n} (chunks of {chunk}, {decode} decode steps): layers {} | logits {} (last row max \
-        |diff| {max_diff:.3e}) | decode {} | paged rows 0..{len} {} | KDA state {} | mark round trip {} ({} B), \
-        capture+restore {restore_ms:.1} ms",
+    println!("resume at {at} of {n} (chunks of {chunk}, {decode} decode steps): state at {at} {} | layers {} | logits \
+        {} (last row max |diff| {max_diff:.3e}) | decode {} | paged rows 0..{len} {} | KDA state {} | mark round trip \
+        {} ({} B), capture+restore {restore_ms:.1} ms", if state_at { "identical" } else { "DIFFERS" },
         first_layer.map_or("identical".to_string(), |l| format!("differ from layer {l}")),
         if logits_equal { "identical" } else { "DIFFER" }, if decode_equal { "identical" } else { "DIFFERS" },
         if paged_equal { "identical" } else { "DIFFER" }, if state_equal { "identical" } else { "DIFFERS" },
@@ -343,7 +346,7 @@ pub(crate) fn resume_check(engine: &GlmfEngine<'_>, embed_rows: &dyn Fn(&[u32]) 
     allocator.release(a);
     identical += usize::from(first_layer.is_none() && logits_equal && decode_equal && paged_equal && state_equal
         && mark_equal);
-    marks_identical += usize::from(mark_equal);
+    marks_identical += usize::from(mark_equal && state_at);
     last = Some(restored);
     }
     let restored = last.context("no attempt")?;
@@ -358,8 +361,9 @@ pub(crate) fn resume_check(engine: &GlmfEngine<'_>, embed_rows: &dyn Fn(&[u32]) 
         x.len(), if last_equal { "identical" } else { "differ" });
     allocator.release(c);
     println!("resume at {at} of {n} (chunks of {chunk}): {identical}/{repeat} attempts byte-identical, mark round trip \
-        identical in {marks_identical}/{repeat}{}", if cold { " [cold floor: B prefilled, not restored]" } else { "" });
-    ensure!(identical == repeat, "the restored sequence differs from the straight one");
+        and state at {at} identical in {marks_identical}/{repeat}{}", if cold { " [cold floor: B prefilled, not restored]" } else { "" });
+    ensure!(marks_identical == repeat, "the restored state differs from the captured one");
+    ensure!(identical == repeat, "the restored sequence's continuation differs from the straight one");
     Ok(())
 }
 

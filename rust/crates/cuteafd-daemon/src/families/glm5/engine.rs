@@ -29,8 +29,9 @@ use std::ffi::c_void;
 type Dev<'a> = DeviceAllocation<'a>;
 
 pub(crate) const PAGE_ROWS: usize = 64;
-const RECORD_PAGE_BYTES: usize = PAGE_ROWS * 656;
-const INDEX_PAGE_BYTES: usize = 8448;
+pub(crate) const RECORD_BYTES: usize = 656;
+const RECORD_PAGE_BYTES: usize = PAGE_ROWS * RECORD_BYTES;
+pub(crate) const INDEX_PAGE_BYTES: usize = 8448;
 /// Most Spark ranks a step's partials come from (the compact reducer's limit).
 const MAX_RANKS: usize = 6;
 /// Ranks whose (zero) partials a skipped exchange uploads: the TP4 layout.
@@ -89,7 +90,7 @@ struct StepTables {
 /// A sequence's pages (shared by the latent and index caches) and length.
 #[derive(Debug, Clone)]
 pub(crate) struct GlmPlacement {
-    pub pages: Vec<i32>,
+    pub pages: Vec<u32>,
     pub len: usize,
 }
 
@@ -98,27 +99,40 @@ impl GlmPlacement {
         let page = *self.pages.get(position / PAGE_ROWS).context("position past the sequence's pages")?;
         Ok(i64::from(page) * PAGE_ROWS as i64 + (position % PAGE_ROWS) as i64)
     }
+
+    /// The first `count` pages as a page-table row.
+    fn table(&self, count: usize) -> impl Iterator<Item = i32> + '_ {
+        self.pages[..count].iter().map(|&p| p as i32)
+    }
 }
 
-/// Free pages of the shared latent/index cache pool.
+/// Refcounted pages of the shared latent/index cache pool (goldens and benches; serving takes
+/// its pages from the prefix cache's pool).
 pub(crate) struct PageAllocator {
-    free: Vec<i32>,
+    pool: cuteafd_engine::prefix::RefPagePool,
 }
 
 impl PageAllocator {
     pub fn new(pages: usize) -> Self {
-        Self { free: (0..pages as i32).rev().collect() }
+        Self { pool: cuteafd_engine::prefix::RefPagePool::new(pages, PAGE_ROWS) }
     }
 
     /// Reserves every page a sequence of up to `capacity` tokens needs.
     pub fn admit(&mut self, capacity: usize) -> Result<GlmPlacement> {
-        let pages = capacity.div_ceil(PAGE_ROWS).max(1);
-        ensure!(self.free.len() >= pages, "cache pages exhausted ({pages} needed, {} free)", self.free.len());
-        Ok(GlmPlacement { pages: (0..pages).map(|_| self.free.pop().unwrap()).collect(), len: 0 })
+        let pages = self.pool.alloc(self.pool.pages_for(capacity)).context("cache pages exhausted")?;
+        Ok(GlmPlacement { pages, len: 0 })
+    }
+
+    /// A second sequence starting as `source`'s first `len` rows: full pages shared, the
+    /// partial tail page copied by the caller (the returned copy).
+    pub fn fork(&mut self, source: &GlmPlacement, len: usize, capacity: usize)
+        -> Result<(GlmPlacement, Option<cuteafd_engine::prefix::TailCopy>)> {
+        let fork = self.pool.fork(&source.pages, len, self.pool.pages_for(capacity)).context("cache pages exhausted")?;
+        Ok((GlmPlacement { pages: fork.pages, len: 0 }, fork.copy))
     }
 
     pub fn release(&mut self, placement: GlmPlacement) {
-        self.free.extend(placement.pages);
+        self.pool.release(&placement.pages);
     }
 }
 
@@ -193,6 +207,14 @@ pub(crate) struct GlmEngine<'a> {
     pub drafter: Option<super::dflash::GlmDrafter<'a>>,
     /// L2 prefetch of the next layer's weights during decode exchanges.
     pub l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
+    /// CUTEAFD_DSA_SORTED_TOPK=1: each row's top-k record slots are sorted by position before
+    /// the sparse attention, so its order (and rounding) is canonical: the radix top-k emits in
+    /// shared-atomic order, which varies run to run (deterministic serving and the --resume-at
+    /// gate past 2048 tokens). `page_logical` maps each page to its page in its sequence (a
+    /// shared page sits at the same one in every sequence that holds it).
+    pub sorted_topk: bool,
+    page_logical: Dev<'a>,
+    page_logical_host: RefCell<Vec<i32>>,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -233,7 +255,35 @@ impl<'a> GlmEngine<'a> {
             prefill_lanes: configured_lanes(),
             lanes: RefCell::new(Vec::new()), full_prefill_logits: false, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             exchange_host: RefCell::new([0.0; 4]),
-            graphs: RefCell::new(std::collections::HashMap::new()), drafter: None })
+            graphs: RefCell::new(std::collections::HashMap::new()), drafter: None,
+            sorted_topk: crate::families::glm5_flash::engine::sorted_topk(), page_logical: zeroed(pages * 4)?,
+            page_logical_host: RefCell::new(vec![0; pages]) })
+    }
+
+    /// Every layer's latent record pool (656 B per row, 64-row pages) and, on full-indexer
+    /// layers, its index-key pool (8448 B per page: 64 x 128 E4M3 keys, then 64 FP32 scales).
+    pub(crate) fn paged_buffers(&self) -> Vec<(cuteafd_ffi::CuteafdDeviceBuffer, Option<cuteafd_ffi::CuteafdDeviceBuffer>)> {
+        self.kv.iter().zip(&self.index).map(|(kv, index)| (kv.buffer, index.as_ref().map(|i| i.buffer))).collect()
+    }
+
+    /// With sorted top-k: records each of `placement`'s pages' logical page (the sort key).
+    fn map_pages(&self, placement: &GlmPlacement) -> Result<()> {
+        if !self.sorted_topk {
+            return Ok(());
+        }
+        let mut host = self.page_logical_host.borrow_mut();
+        let mut changed = false;
+        for (logical, &page) in placement.pages.iter().enumerate() {
+            let page = page as usize;
+            ensure!(page < self.pages, "page {page} out of range");
+            changed |= std::mem::replace(&mut host[page], logical as i32) != logical as i32;
+        }
+        if changed {
+            // Entries other sequences' queued steps read keep their values.
+            self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: host.len() * 4, ..self.page_logical.buffer },
+                bytes_of(&host[..]))?;
+        }
+        Ok(())
     }
 
     /// Benchmarks: MoE layers skip the Spark exchange from now on.
@@ -353,7 +403,7 @@ impl<'a> GlmEngine<'a> {
             decode: false,
             positions: (start..start + t).map(|p| p as i64).collect(),
             slots: (start..start + t).map(|p| placement.slot(p)).collect::<Result<_>>()?,
-            page_table: placement.pages[..used].to_vec(),
+            page_table: placement.table(used).collect(),
             table_width: used,
             table_stride: 0,
             cache_lengths: (start..start + t).map(|p| (p + 1) as i32).collect(),
@@ -369,6 +419,7 @@ impl<'a> GlmEngine<'a> {
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>, logit_rows: usize) -> Result<Option<Vec<f32>>> {
         let (row, start) = (self.cfg.hidden * 2, placement.len);
         let t = embed.len() / row;
+        self.map_pages(placement)?;
         if on_layer.is_none() && self.pipelined() && t >= 2 * MIN_LANE_ROWS && experts.is_some() {
             // Lanes split at 64-row pages, so each lane's pages start where the previous lane's end.
             let count = self.prefill_lanes.min(t / MIN_LANE_ROWS);
@@ -407,6 +458,7 @@ impl<'a> GlmEngine<'a> {
         let mut tables = StepTables { decode: true, positions: Vec::new(), slots: Vec::new(), page_table: Vec::new(),
             table_width: 1, table_stride: stride, cache_lengths: Vec::new(), lengths: Vec::new() };
         for (placement, count) in sequences.iter() {
+            self.map_pages(placement)?;
             for position in placement.len..placement.len + count {
                 ensure!(position < self.max_context, "decode at {position} past the context");
                 tables.positions.push(position as i64);
@@ -417,9 +469,8 @@ impl<'a> GlmEngine<'a> {
                 tables.lengths.push((position + 1).min(self.cfg.index_topk) as i32);
                 // Power-of-two widths bound the graphs a growing context captures.
                 tables.table_width = tables.table_width.max((position + 1).div_ceil(PAGE_ROWS).next_power_of_two().min(stride));
-                let mut pages = placement.pages.clone();
-                pages.resize(stride, 0);
-                tables.page_table.extend(pages);
+                tables.page_table.extend(placement.table(placement.pages.len()));
+                tables.page_table.extend(std::iter::repeat_n(0, stride - placement.pages.len()));
             }
         }
         let logits = self.step(&tables, embed, rows, experts, on_layer)?;
@@ -952,6 +1003,14 @@ impl<'a> GlmEngine<'a> {
                 ("cache_lengths", w.cache_lengths.buffer.ptr), ("output_indices", w.indices.buffer.ptr),
                 ("scratch", w.topk_scratch.buffer.ptr)],
                 &[rows, Scalar::I32(tables.table_width as i32), Scalar::I32(tables.table_stride as i32)])?;
+            if self.sorted_topk {
+                // SAFETY: `indices` holds the step's rows of index_topk record slots, every one on
+                // a page `page_logical` maps; stream-ordered after the top-k.
+                unsafe {
+                    self.library.dsa_sort_slots(w.indices.buffer.ptr, self.page_logical.buffer.ptr,
+                        tables.positions.len(), self.cfg.index_topk, self.stream)?;
+                }
+            }
         }
         // Shared-indexer layers read the previous full layer's `indices`.
         if !tables.decode && native_mla_prefill() {
