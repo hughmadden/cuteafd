@@ -279,7 +279,16 @@ fn prefix_cache<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs)
     let budget = args.prefix_cache_mark_mib << 20;
     let family = MimoPrefix::new(engine, |mark| if entries == 0 { 0 } else { MarkArena::slots_for(1, entries, mark, budget) },
         args.prefix_partial == Toggle::On)?;
-    let host = args.host_tier(engine.library, engine.kv_layer(0).1, family.mark_bytes())?;
+    // The pinned host tier copies through one GPU's copy engine; a head split's
+    // pages and marks live on two GPUs, so it keeps device-resident snapshots only.
+    let host = if engine.ranks() > 1 {
+        if args.host_cache_bytes > 0 && entries > 0 {
+            tracing::warn!("MiMo head split: the prefix cache's host tier is off (device-resident snapshots only)");
+        }
+        None
+    } else {
+        args.host_tier(engine.library, engine.kv_layer(0).1, family.mark_bytes())?
+    };
     let layout = family.layout();
     let config = PrefixConfig { entries, mark_slots: family.slots(), keep_logits: true,
         min_tokens: args.prefix_cache_min_tokens };

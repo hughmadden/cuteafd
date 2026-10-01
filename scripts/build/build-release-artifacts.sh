@@ -187,7 +187,7 @@ cmake \
   -DCUTEAFD_ENABLE_DSV4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_DSV4_AOT:-ON}" || echo OFF)" \
   -DCUTEAFD_ENABLE_GLM_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_GLM_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_MIMO_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_MIMO_AOT:-OFF}" || echo OFF)" \
-  -DCUTEAFD_MIMO_GEOMETRIES="$(g="${CUTEAFD_RELEASE_MIMO_GEOMETRIES:-mimo,mimop}"; echo "${g//,/;}")" \
+  -DCUTEAFD_MIMO_GEOMETRIES="$(g="${CUTEAFD_RELEASE_MIMO_GEOMETRIES:-mimo,mimop,mimop2}"; echo "${g//,/;}")" \
   -DCUTEAFD_ENABLE_GLMF_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_GLMF_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_QWEN4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_QWEN4_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_V41_ATTENTION_AOT="$coordinator_aot" \

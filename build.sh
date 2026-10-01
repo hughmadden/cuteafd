@@ -48,12 +48,12 @@ put each family's coordinator programs in the coordinator image, and
 CUTEAFD_RELEASE_EXPERT_FAMILIES (FAMILY:ROLE list, ';'-separated) adds routed-expert
 packages to both images, each keeping its architecture's entries.
 CUTEAFD_RELEASE_MIMO_GEOMETRIES picks the MiMo program geometries (default
-mimo,mimop: V2 Flash and V2.6 Pro). p7's set, everything scripts/launch/run-family.sh
+mimo,mimop,mimop2: V2 Flash, V2.6 Pro and its two-GPU head split). p7's set, everything scripts/launch/run-family.sh
 serves (V4 Pro EXL3 K2, GLM 5.3 EXL3 K4 and FP8, GLM 5.3 Flash, MiMo V2 Flash
 FP8, MiMo V2.6 Pro MXFP4 (tp1 coordinator, tp6/tp2 Spark), Qwen 3.8 Flash Next
 EXL3 K4.25):
     CUTEAFD_RELEASE_GLM_AOT=ON CUTEAFD_RELEASE_GLMF_AOT=ON CUTEAFD_RELEASE_MIMO_AOT=ON
-    CUTEAFD_RELEASE_QWEN4_AOT=ON CUTEAFD_RELEASE_MIMO_GEOMETRIES=mimo,mimop
+    CUTEAFD_RELEASE_QWEN4_AOT=ON CUTEAFD_RELEASE_MIMO_GEOMETRIES=mimo,mimop,mimop2
     CUTEAFD_RELEASE_EXPERT_FAMILIES='dsv4p:exl3-k23;glm:exl3-k45;glm:fp8;mimo:fp8;mimop:fp8;qwen4:exl3-k45'
 (p6 was the same without QWEN4, mimop, mimop:fp8 and qwen4:exl3-k45.)
 
@@ -458,7 +458,7 @@ docker run --rm \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}" \
   -e "CUTEAFD_RELEASE_GLM_AOT=${CUTEAFD_RELEASE_GLM_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_MIMO_AOT=${CUTEAFD_RELEASE_MIMO_AOT:-OFF}" \
-  -e "CUTEAFD_RELEASE_MIMO_GEOMETRIES=${CUTEAFD_RELEASE_MIMO_GEOMETRIES:-mimo,mimop}" \
+  -e "CUTEAFD_RELEASE_MIMO_GEOMETRIES=${CUTEAFD_RELEASE_MIMO_GEOMETRIES:-mimo,mimop,mimop2}" \
   -e "CUTEAFD_RELEASE_GLMF_AOT=${CUTEAFD_RELEASE_GLMF_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_QWEN4_AOT=${CUTEAFD_RELEASE_QWEN4_AOT:-OFF}" \
   ${release_build_root_args[@]+"${release_build_root_args[@]}"} \
