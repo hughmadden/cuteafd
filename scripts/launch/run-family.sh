@@ -103,12 +103,12 @@ case "$speculator" in
   mtp) family_args+=(--mtp "$(key SPECULATOR_DEPTH MTP 1)") ;;
   dspark) dspark_args=(--dspark) ;;
 esac
-# Prefix cache (MiMo, GLM 5.3, GLM 5.3 Flash): PREFIX_CACHE_ENTRIES snapshots per bank
+# Prefix cache (MiMo, GLM 5.3, GLM 5.3 Flash, Qwen 3.8): PREFIX_CACHE_ENTRIES snapshots per bank
 # (prompts, turns; 0 = off), HOST_CACHE_BYTES of pinned host memory for snapshots the
 # device evicts (e.g. 64GiB; 0 = off). POOL_TOKENS: paged KV tokens shared by live
 # sequences and retained snapshots.
 case $family in
-  mimo_v2|glm5|glm5_flash)
+  mimo_v2|glm5|glm5_flash|qwen4)
     family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
     [[ "$(get HOST_CACHE_BYTES 0)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES)") ;;
 esac
@@ -117,7 +117,7 @@ if [[ $family == mimo_v2 ]]; then
   # PREFIX_PARTIAL=on: V4.1-style partial reuse (approximate; off = exact restores only).
   family_args+=(--prefix-partial "$(get PREFIX_PARTIAL off)")
 fi
-[[ $family != glm5 || -z "$(get POOL_TOKENS)" ]] || family_args+=(--pool-tokens "$(get POOL_TOKENS)")
+[[ ! $family =~ ^(glm5|qwen4)$ || -z "$(get POOL_TOKENS)" ]] || family_args+=(--pool-tokens "$(get POOL_TOKENS)")
 # GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
 # from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" quantizes the
 # BF16 checkpoint's at load); KDA projections get per-row FP8 decode copies

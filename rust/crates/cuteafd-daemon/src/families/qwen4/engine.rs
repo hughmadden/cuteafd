@@ -45,13 +45,18 @@ pub(crate) const DECODE_ROWS: usize = 64;
 /// Selected-slot row width of the sparse attention (2048 + 3, padded to 64).
 pub(crate) const SPARSE_TOPK: usize = 2112;
 /// BF16 K/V record of one token: K [2, 256] then V [2, 256].
-const RECORD_BYTES: usize = 2048;
-const INDEX_DIM: usize = 128;
+pub(crate) const RECORD_BYTES: usize = 2048;
+pub(crate) const INDEX_DIM: usize = 128;
 const MAX_RANKS: usize = 6;
 const HC: usize = 4;
 /// Tokens per QSA index block, and blocks per pool-cache page.
-const BLOCK: usize = 4;
+pub(crate) const BLOCK: usize = 4;
 const POOL_PAGE_TOKENS: usize = BLOCK * PAGE_ROWS;
+/// Record pages per allocation unit: a unit is four consecutive 64-row record pages (256 tokens)
+/// and the pool-cache page of the same index (64 blocks of 4 tokens), so one refcounted unit
+/// index names every paged byte of 256 positions (the prefix cache's page).
+pub(crate) const UNIT_PAGES: usize = BLOCK;
+pub(crate) const UNIT_ROWS: usize = POOL_PAGE_TOKENS;
 /// Rows of the PLE conv state ((taps - 1) x dilation).
 const PLE_STATE_ROWS: usize = 9;
 /// Most rows the E4M3 draft head (`qwen4_head_fp8`) takes.
@@ -182,17 +187,31 @@ struct StepTables {
     ple_ids: Vec<i64>,
 }
 
-/// A sequence's K/V pages, pool pages, state slot, length and n-gram history.
+/// A sequence's allocation units (and the record and pool pages they expand to), its GDN/PLE
+/// state slot, its length, the rows its state holds and its n-gram history.
 #[derive(Debug, Clone)]
 pub(crate) struct Qwen4Placement {
+    pub units: Vec<u32>,
     pub pages: Vec<i32>,
     pub pool_pages: Vec<i32>,
     pub slot: i32,
     pub len: usize,
+    /// Rows the GDN recurrent/conv and PLE conv state has consumed: `len` after a prefill or a
+    /// plain verify; a speculative verify leaves it until the kept rows are committed and the
+    /// placement rewound ([`Qwen4Engine::rewind`]).
+    pub state_len: usize,
     pub history: NgramHistory,
 }
 
 impl Qwen4Placement {
+    /// A fresh sequence over `units` with state slot `slot` and n-gram history `history`.
+    pub fn new(units: Vec<u32>, slot: i32, history: NgramHistory) -> Self {
+        let pages = units.iter().flat_map(|&u| (0..UNIT_PAGES as i32).map(move |i| u as i32 * UNIT_PAGES as i32 + i))
+            .collect();
+        let pool_pages = units.iter().map(|&u| u as i32).collect();
+        Self { units, pages, pool_pages, slot, len: 0, state_len: 0, history }
+    }
+
     pub fn record(&self, position: usize) -> Result<i64> {
         let page = *self.pages.get(position / PAGE_ROWS).context("position past the sequence's pages")?;
         Ok(i64::from(page) * PAGE_ROWS as i64 + (position % PAGE_ROWS) as i64)
@@ -208,44 +227,81 @@ impl Qwen4Placement {
     }
 }
 
-/// Free record pages, pool pages and state slots.
+/// The n-gram history after `tokens` (the PLE hash's context is a pure function of the token ids:
+/// their last `ngram_size - 1`, EOS before the first).
+pub(crate) fn history_of(cfg: &Qwen4Config, tokens: &[u32]) -> NgramHistory {
+    ngram_history(cfg.eos, cfg.ngram_size, tokens)
+}
+
+fn ngram_history(eos: u32, ngram_size: usize, tokens: &[u32]) -> NgramHistory {
+    let context = ngram_size - 1;
+    let mut history = vec![eos; context];
+    history.extend_from_slice(&tokens[tokens.len().saturating_sub(context)..]);
+    NgramHistory(history.split_off(history.len() - context))
+}
+
+#[cfg(test)]
+mod tests {
+    use cuteafd_loader::families::qwen4::NgramHasher;
+
+    #[test]
+    fn history_after_tokens_is_what_the_hash_leaves() {
+        for ngram in [2usize, 3, 5] {
+            let hasher = NgramHasher::from_config(1000, 20_000_000, ngram, 2, 0, 1234, 7);
+            for len in [0usize, 1, 2, 3, 9] {
+                let tokens: Vec<u32> = (0..len as u32).map(|t| if t == 4 { 7 } else { 100 + t }).collect();
+                let mut history = hasher.start();
+                hasher.hash(&mut history, &tokens, &mut Vec::new()).unwrap();
+                assert_eq!(super::ngram_history(7, ngram, &tokens), history, "ngram {ngram} len {len}");
+            }
+        }
+    }
+}
+
+/// Refcounted allocation units and free state slots (goldens and benches; serving takes its
+/// units from the prefix cache's pool).
 pub(crate) struct Allocator {
-    pages: Vec<i32>,
-    pool_pages: Vec<i32>,
+    units: cuteafd_engine::prefix::RefPagePool,
     slots: Vec<i32>,
-    eos: u32,
-    context: usize,
+    cfg: Qwen4Config,
 }
 
 impl Allocator {
+    /// Over an engine of `pages` record pages (a whole number of units) and `slots` state slots.
     pub fn new(pages: usize, slots: usize, cfg: &Qwen4Config) -> Self {
-        let pool_pages = pages.div_ceil(BLOCK);
-        Self { pages: (0..pages as i32).rev().collect(), pool_pages: (0..pool_pages as i32).rev().collect(),
-            slots: (0..slots as i32).rev().collect(), eos: cfg.eos, context: cfg.ngram_size - 1 }
+        Self { units: cuteafd_engine::prefix::RefPagePool::new(pages / UNIT_PAGES, UNIT_ROWS),
+            slots: (0..slots as i32).rev().collect(), cfg: cfg.clone() }
     }
 
-    /// Reserves every page a sequence of up to `capacity` tokens needs and a
-    /// state slot (the engine zeroes the slot and maps the pool pages before
-    /// the first step).
+    /// Reserves every unit a sequence of up to `capacity` tokens needs and a state slot (the
+    /// engine zeroes the slot and maps the pool pages before the first step).
     pub fn admit(&mut self, capacity: usize) -> Result<Qwen4Placement> {
-        let pages = capacity.div_ceil(PAGE_ROWS).max(1);
-        let pool_pages = capacity.div_ceil(POOL_PAGE_TOKENS).max(1);
-        ensure!(self.pages.len() >= pages && self.pool_pages.len() >= pool_pages,
-            "cache pages exhausted ({pages} + {pool_pages} pool pages needed, {} + {} free)", self.pages.len(),
-            self.pool_pages.len());
         let slot = self.slots.pop().context("state slots exhausted")?;
-        Ok(Qwen4Placement {
-            pages: (0..pages).map(|_| self.pages.pop().unwrap()).collect(),
-            pool_pages: (0..pool_pages).map(|_| self.pool_pages.pop().unwrap()).collect(),
-            slot,
-            len: 0,
-            history: NgramHistory(vec![self.eos; self.context]),
-        })
+        match self.units.alloc(self.units.pages_for(capacity)) {
+            Ok(units) => Ok(Qwen4Placement::new(units, slot, history_of(&self.cfg, &[]))),
+            Err(error) => {
+                self.slots.push(slot);
+                Err(error).context("cache pages exhausted")
+            }
+        }
+    }
+
+    /// A second sequence starting as `source`'s first `len` rows (`tokens`): full units shared,
+    /// the partial tail unit copied by the caller (the returned copy), its own state slot.
+    pub fn fork(&mut self, source: &Qwen4Placement, tokens: &[u32], capacity: usize)
+        -> Result<(Qwen4Placement, Option<cuteafd_engine::prefix::TailCopy>)> {
+        let slot = self.slots.pop().context("state slots exhausted")?;
+        match self.units.fork(&source.units, tokens.len(), self.units.pages_for(capacity)) {
+            Ok(fork) => Ok((Qwen4Placement::new(fork.pages, slot, history_of(&self.cfg, tokens)), fork.copy)),
+            Err(error) => {
+                self.slots.push(slot);
+                Err(error).context("cache pages exhausted")
+            }
+        }
     }
 
     pub fn release(&mut self, placement: Qwen4Placement) {
-        self.pages.extend(placement.pages);
-        self.pool_pages.extend(placement.pool_pages);
+        self.units.release(&placement.units);
         self.slots.push(placement.slot);
     }
 }
@@ -389,8 +445,11 @@ pub(crate) struct Qwen4Engine<'a> {
     last_streams: std::cell::Cell<(bool, usize)>,
     /// Where the last MTP step left its output streams (decode, stream buffer).
     mtp_streams: std::cell::Cell<(bool, usize)>,
-    /// Logical page of each pool-cache page within its sequence.
+    /// Logical page of each pool-cache page within its sequence, and its host copy (a shared
+    /// pool page sits at the same logical page in every sequence that holds it).
     pool_logical: Dev<'a>,
+    pool_logical_host: RefCell<Vec<i32>>,
+    /// Pool-cache pages: one per allocation unit (`pages / UNIT_PAGES`).
     pub pool_pages: usize,
     workspace: RefCell<Option<Workspace<'a>>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
@@ -451,7 +510,9 @@ impl<'a> Qwen4Engine<'a> {
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
-        let pool_pages = pages.div_ceil(BLOCK);
+        // Whole allocation units: four record pages and one pool page each.
+        let pages = pages.max(1).next_multiple_of(UNIT_PAGES);
+        let pool_pages = pages / UNIT_PAGES;
         let (mut kv, mut gdn_ord, mut index) = (Vec::new(), Vec::new(), Vec::new());
         let mut gdn_layers = 0;
         for layer in &weights.layers {
@@ -494,7 +555,8 @@ impl<'a> Qwen4Engine<'a> {
         Ok(Self { library, programs, cfg, weights, ple, stream, max_context, prefill_rows, pages, slots, kv, gdn_ord,
             gdn_conv, gdn_state, gdn_replay, gdn_layers, index, ple_state, ple_replay,
             commit_tables: zeroed(3 * DECODE_ROWS * 4)?, mtp_kv, mtp_pending,
-            last_streams: std::cell::Cell::new((false, 0)), mtp_streams: std::cell::Cell::new((false, 0)), pool_logical, pool_pages, workspace: RefCell::new(None),
+            last_streams: std::cell::Cell::new((false, 0)), mtp_streams: std::cell::Cell::new((false, 0)), pool_logical,
+            pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages, workspace: RefCell::new(None),
             decode_workspace: RefCell::new(None), experts: None, profile: RefCell::new([0.0; 2]),
             graphs: RefCell::new(std::collections::HashMap::new()),
             use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0"),
@@ -551,18 +613,41 @@ impl<'a> Qwen4Engine<'a> {
 
     /// Before a sequence's first step: zeroes its state slot and maps its pool pages.
     pub(crate) fn start(&self, placement: &Qwen4Placement) -> Result<()> {
+        self.map_pools(placement)?;
+        self.reset_slot(placement.slot)
+    }
+
+    /// Records each of `placement`'s pool pages' logical page (the index expansion reads it).
+    /// A restored sequence maps its pages before its first step as a fresh one does; shared
+    /// pages keep the value they have.
+    pub fn map_pools(&self, placement: &Qwen4Placement) -> Result<()> {
+        let mut host = self.pool_logical_host.borrow_mut();
+        let mut changed = false;
         for (logical, &page) in placement.pool_pages.iter().enumerate() {
             let page = usize::try_from(page)?;
             ensure!(page < self.pool_pages, "pool page {page} out of range");
-            let at = cuteafd_ffi::CuteafdDeviceBuffer {
-                // SAFETY: page < pool_pages, so the entry lies inside the table.
-                ptr: unsafe { self.pool_logical.buffer.ptr.cast::<u8>().add(page * 4) }.cast(),
-                bytes: 4,
-                ..self.pool_logical.buffer
-            };
-            self.library.copy_h2d(at, &(logical as i32).to_le_bytes())?;
+            changed |= std::mem::replace(&mut host[page], logical as i32) != logical as i32;
         }
-        self.reset_slot(placement.slot)
+        if changed {
+            // Entries other sequences' queued steps read keep their values.
+            self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: host.len() * 4, ..self.pool_logical.buffer },
+                bytes_of(&host[..]))?;
+        }
+        Ok(())
+    }
+
+    /// Every full-attention layer's paged buffers (the MTP layer's last, when loaded): K/V
+    /// records (2048 B per row) and raw index keys (256 B per row), both in 64-row record pages,
+    /// and pooled block keys (256 B per block, 64 blocks per pool page).
+    pub(crate) fn paged_buffers(&self) -> Vec<[cuteafd_ffi::CuteafdDeviceBuffer; 3]> {
+        let mut out: Vec<_> = self.kv.iter().zip(&self.index).filter_map(|(kv, index)| match (kv, index) {
+            (Some(kv), Some((keys, pools))) => Some([kv.buffer, keys.buffer, pools.buffer]),
+            _ => None,
+        }).collect();
+        if let Some((kv, keys, pools)) = &self.mtp_kv {
+            out.push([kv.buffer, keys.buffer, pools.buffer]);
+        }
+        out
     }
 
     fn conv_slot_bytes(cfg: &Qwen4Config) -> usize {
@@ -586,7 +671,7 @@ impl<'a> Qwen4Engine<'a> {
 
     /// Every per-slot state region of `slot` (GDN conv + recurrent state per
     /// GDN layer, PLE conv state).
-    fn slot_regions(&self, slot: usize) -> Vec<cuteafd_ffi::CuteafdDeviceBuffer> {
+    pub(crate) fn slot_regions(&self, slot: usize) -> Vec<cuteafd_ffi::CuteafdDeviceBuffer> {
         let mut regions = Vec::new();
         let (conv, state) = (Self::conv_slot_bytes(&self.cfg), Self::state_slot_bytes(&self.cfg));
         for ord in 0..self.gdn_layers {
@@ -838,6 +923,7 @@ impl<'a> Qwen4Engine<'a> {
         self.rows(placement, tokens, 0, &mut tables)?;
         let logits = self.step(&tables, tokens, logit_rows.clamp(1, t), on_layer, forced)?;
         placement.len += t;
+        placement.state_len = placement.len;
         Ok(logits)
     }
 
@@ -900,6 +986,9 @@ impl<'a> Qwen4Engine<'a> {
         let logits = self.step(&tables, &tokens, rows, on_layer, None)?;
         for (placement, tokens) in sequences.iter_mut() {
             placement.len += tokens.len();
+            if !spec {
+                placement.state_len = placement.len;
+            }
         }
         Ok(logits)
     }
@@ -935,10 +1024,12 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     /// After a speculative step: `placement` keeps the `kept` tokens it verified
-    /// from `start`, whose n-gram history was `history` before the step.
+    /// from `start`, whose n-gram history was `history` before the step. The caller commits
+    /// the kept rows to the state ([`Self::commit`]) with this rewind.
     pub fn rewind(&self, placement: &mut Qwen4Placement, start: usize, history: NgramHistory, kept: &[u32])
         -> Result<()> {
         placement.len = start + kept.len();
+        placement.state_len = placement.len;
         placement.history = history;
         if let Some(ple) = &self.ple {
             ple.hasher.hash(&mut placement.history, kept, &mut Vec::new())?;
