@@ -306,6 +306,9 @@ sparkinfer_commit="$(python3 "$repo_root/scripts/build/verify-sparkinfer-source.
 wip_layout=""
 if [[ -n "$wip_slot" ]]; then
   wip_layout="$HOME/.cache/cuteafd/wip-run/$wip_slot"
+  release_require_dev_image_sparkinfer "$(hostname)" "$COORDINATOR_DOCKER_INFERENCE" \
+    "$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.sparkinfer.revision"}}' "$COORDINATOR_DOCKER_INFERENCE")" \
+    "$sparkinfer_commit"
   release_stage_wip_layout cuteafd-coordinator-wip "$wip_slot" coordinator "$wip_layout"
   engine_commit="wip-$wip_slot-$(sha256sum "$wip_layout/lib/libcuteafd_native.so" | cut -c1-12)"
 else
@@ -343,8 +346,13 @@ if [[ "$wip_slot" == __none__ ]]; then
 [[ "$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")" == "$engine" ]] ||
   die "$image has another engine revision"
 fi
-[[ "$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.sparkinfer.revision"}}' "$image")" == "$sparkinfer" ]] ||
-  die "$image uses another SparkInfer revision"
+image_sparkinfer="$(docker image inspect -f '{{index .Config.Labels "io.cuteafd.sparkinfer.revision"}}' "$image")"
+if [[ "$image_sparkinfer" != "$sparkinfer" ]]; then
+  # WIP launches run the shared development image, which has its own rebuild.
+  [[ "$wip_slot" == __none__ ]] && remedy="./build.sh, or pull the matching pair" ||
+    remedy="scripts/build/build-dev-images.sh, then ./wip.sh --recreate"
+  die "$image carries SparkInfer ${image_sparkinfer:-<none>} but this checkout pins $sparkinfer; rebuild with $remedy"
+fi
 hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
 [[ -d "$hf_home/$snapshot_rel" ]] || die "model snapshot is missing: $snapshot_rel"
 if find "$hf_home/$snapshot_rel" -xtype l -print -quit | grep -q .; then

@@ -1172,6 +1172,19 @@ release_tp2_enabled() {
 
 # Copies a WIP slot's artifacts out of a persistent WIP container into a
 # release-shaped layout (bin/, lib/, share/) on this host for ./run.sh --wip.
+# Development images bake in the pinned SparkInfer, so a pin bump needs a
+# rebuild before WIP slots are built or launched from them.
+release_dev_image_rebuild_hint() {
+  printf 'rebuild the shared development images at this pin with scripts/build/build-dev-images.sh --config %s, then ./wip.sh --recreate' "$RELEASE_CONFIG"
+}
+
+# WHERE names the host, LABEL is the image's io.cuteafd.sparkinfer.revision.
+release_require_dev_image_sparkinfer() {
+  local where="$1" image="$2" label="$3" expected="$4"
+  [[ "$label" == "$expected" ]] ||
+    release_die "$where development image $image carries SparkInfer ${label:-<none>} but this checkout pins $expected; $(release_dev_image_rebuild_hint)"
+}
+
 release_stage_wip_layout() {
   local container="$1" slot="$2" role="$3" layout="$4"
   local raw="$layout.tmp/raw"

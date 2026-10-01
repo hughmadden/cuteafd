@@ -99,3 +99,16 @@ def test_wip_builder_streams_every_local_heredoc_into_docker() -> None:
 
     assert len(local_heredocs) == 4
     assert all("-i" in options.split() for options in local_heredocs)
+
+
+def test_wip_builder_refuses_stale_dev_images_before_recreating() -> None:
+    # A SparkInfer pin bump makes the shared development images stale. The
+    # label check must name the rebuild and run before --recreate discards the
+    # persistent containers, or a stale image costs every slot for nothing.
+    builder = (ROOT / "wip.sh").read_text(encoding="utf-8")
+    common = (ROOT / "scripts/lib/release-common.sh").read_text(encoding="utf-8")
+    assert "scripts/build/build-dev-images.sh" in common
+    assert (ROOT / "scripts/build/build-dev-images.sh").stat().st_mode & 0o111
+    checks = builder.index("\nensure_local_image\nensure_seed_image\n")
+    assert checks < builder.index("if ((recreate)); then")
+    assert builder.count("release_require_dev_image_sparkinfer") == 2
