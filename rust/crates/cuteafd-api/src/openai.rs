@@ -188,6 +188,8 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
         .route("/", get(console::page))
         .route("/v1/console", get(console::socket))
         .route("/v1/console/snapshot", get(console::snapshot))
+        .route("/assets/cuteafd-ui.css", get(console::ui_css))
+        .route("/assets/cuteafd-ui.js", get(console::ui_js))
         .with_state(console);
     Router::new()
         .route("/health", get(health))

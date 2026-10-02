@@ -34,6 +34,7 @@ use cuteafd_api::openai::{
     PromptUsage,
 };
 use crate::shared::spark_intake::SparkLink;
+use crate::shared::console;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -64,6 +65,8 @@ pub(crate) struct ServeArgs {
     pub decode_share: DecodeShareArgs,
     #[command(flatten)]
     pub prefix: PrefixArgs,
+    #[command(flatten)]
+    pub console: console::ConsoleArgs,
 }
 
 fn model_id(snapshot: &std::path::Path) -> Option<String> {
@@ -89,11 +92,12 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let policy = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed,
         decode_share: args.decode_share };
     let prefix = args.prefix.clone();
+    let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id)));
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, prefix));
     ready_rx.await.context("engine failed before it was ready")??;
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
-        ConsoleHub::disabled(), profile.clone());
+        hub, profile.clone());
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     tracing::info!(listen = %args.listen, model = %profile.id, "GLM API is ready");
     tokio::select! {
@@ -101,6 +105,35 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         finished = worker => finished??,
     }
     Ok(())
+}
+
+/// What the live console shows for GLM 5.3.
+fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
+    use console::{Color::*, StepGroup};
+    let mut layout = console::Layout::new("glm5", model.into(), args.engine.snapshot.clone());
+    let sparks = args.engine.peers.as_deref().map_or(0, |peers| peers.split(',').count());
+    layout.hardware = console::hardware(1 + usize::from(args.engine.split_device.is_some()), sparks, false);
+    layout.split = args.engine.split_device.map(|_| "head split".into());
+    layout.concurrency = args.max_sequences.min(DECODE_ROWS);
+    let copy = if args.no_copy_drafts { "" } else { " · copy windows" };
+    let policy = args.draft_fixed.map_or_else(|| "adaptive".to_string(), |n| format!("fixed {n}"));
+    layout.speculator = match (&args.engine.draft, args.no_copy_drafts) {
+        (Some(_), _) => Some(console::Speculator { name: "DFlash2".into(), positions: 8, policy: policy + copy }),
+        (None, false) => Some(console::Speculator { name: "Copy window".into(), positions: COPY_DRAFT,
+            policy: "adaptive length".into() }),
+        (None, true) => None,
+    };
+    layout.steps = vec![
+        StepGroup::new("Decode step", "host clock", &[("round.cycle", "step", Target),
+            ("draft", "DFlash2 draft", Accepted), ("plan", "draft plan + copy windows", Ink),
+            ("rows", "selection rows", Ink), ("verify", "verify pass + token selection", Target),
+            ("emit", "accept + stream", Ink), ("update", "drafter context", Accepted)]),
+        StepGroup::new("Verify pass", "host clock, engine phases", &[
+            ("gpu", "GPU until expert exchanges", Rtx), ("experts", "Spark expert exchanges", Spark),
+            ("head", "head + logits", Target)]),
+        StepGroup::admission(false),
+    ];
+    layout
 }
 
 /// Speculation settings: copy-window draft cap (0 disables) and a fixed
@@ -165,6 +198,7 @@ struct Prefill<'a> {
     /// Seconds in this prompt's chunks.
     busy: f64,
     id: u64,
+    ticket: console::Ticket,
 }
 
 struct Active<'a> {
@@ -201,6 +235,7 @@ struct Active<'a> {
     generated: usize,
     buffered: usize,
     started: Instant,
+    ticket: console::Ticket,
 }
 
 /// Commits a selected token to the request's grammar.
@@ -403,6 +438,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 // Idle: publish the state the server waits in (captures and releases done).
                 cache.tick();
                 publish(stats, requests, generated_total, 0, 0, &cache);
+                console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
                 match receive.blocking_recv() {
                     Some(job) => job,
                     None => return Ok(()),
@@ -431,6 +467,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             let capacity = (tokens.len() + job.max_tokens).min(engine.max_context);
             let slot = free_slots.pop();
             cache.tick();
+            let admit_started = Instant::now();
             // Lookup and fork of the retained pages (byte-exact: the pages are the whole state).
             let admitted = match cache.admit(&family, &tokens, capacity, true, |pages| GlmPlacement { pages, len: 0 }) {
                 Ok(admitted) => admitted,
@@ -446,6 +483,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 system_fingerprint: None,
                 prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: resume },
             }));
+            let ticket = console::admit(tokens.len(), resume, job.max_tokens, constraint.is_some(), job.images.len(),
+                admit_started);
             if let Some(source) = admitted.source {
                 tracing::info!(tokens = tokens.len(), resume, kind = ?source.kind, frontier = source.frontier,
                     host = source.host, partial = source.partial, "prefix cache hit");
@@ -463,7 +502,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             let plan = if logits.is_some() { PointPlan::default() } else { plan };
             prefills.push(Prefill { job, constraint, tokens, done: resume, resume, plan, chunks: 0, cancelled: false,
                 placement: admitted.placement, capacity, slot, logits, first: None, started: Instant::now(), busy: 0.0,
-                id: admitted_total });
+                id: admitted_total, ticket });
         }
         if prefills.due(!active.is_empty()) {
             // One chunk (a lane wave) of each waiting prompt (whole prompts with --decode-share 0).
@@ -502,6 +541,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 }
                 p.done += chunk.len();
                 p.busy += timer.elapsed().as_secs_f64();
+                p.ticket.prefill(chunk.len(), p.chunks, p.plan.chunks.len(), timer);
                 // Intermediate snapshot points this chunk ends at (off unless configured).
                 for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks) {
                     if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, &p.tokens[..point], &p.placement,
@@ -512,10 +552,11 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 p.chunks += 1;
                 Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
             });
-            for (p, prefilled) in finished {
+            for (mut p, prefilled) in finished {
                 let (slot, placement, resume) = (p.slot, p.placement.clone(), p.resume);
                 if let Err(error) = &prefilled {
                     if p.cancelled {
+                        p.ticket.cancel();
                         // The client left during the prefill: keep what it computed for a retry.
                         if placement.len > resume {
                             if let Err(error) = cache.park(&family, &p.tokens[..placement.len], &placement) {
@@ -563,6 +604,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         decoder: cuteafd_loader::streaming_token_decoder(&opened.snapshot, false)?,
                         job: p.job, constraint: p.constraint, placement: p.placement, draft_from: resume, turn: None,
                         capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(),
+                        ticket: p.ticket,
                     };
                     request.next = match (p.first, &logits) {
                         (Some(first), _) => first,
@@ -575,12 +617,15 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     Ok(mut request) => {
                         let token = request.next;
                         let emitted = request.emit(token);
+                        request.ticket.first(token);
                         retain_prompt(&mut cache, &request.placement);
                         match emitted {
                             Ok(false) => active.push(request),
                             // Finished at its first token: its turn is its prompt snapshot.
-                            Ok(true) | Err(_) => release(&family, &mut cache, &mut free_slots, &request.placement,
-                                request.slot),
+                            Ok(true) | Err(_) => {
+                                request.ticket.done(emitted.is_err(), request.generated);
+                                release(&family, &mut cache, &mut free_slots, &request.placement, request.slot)
+                            }
                         }
                     }
                     Err(error) => {
@@ -596,6 +641,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             continue;
         }
         let cycle = Instant::now();
+        let mut tally = console::Step::begin(0);
+        let (phases_before, engine_before) = (phases, tally.live().then(|| *engine.profile.borrow()));
         // Rows each sequence may add after its next token.
         let room = (DECODE_ROWS / active.len()).max(1) - 1;
         let limits: Vec<usize> = active.iter().map(|a| room.min(a.job.max_tokens - a.generated - 1)
@@ -707,6 +754,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         let mut context = Vec::new();
         let draft_list = &drafted;
         let trace_ref = &mut trace;
+        let before: Vec<usize> = active.iter().map(|a| a.history.len()).collect();
         // A normal finish's turn snapshot keeps the row that produced the last token.
         let retain_turn = cache.enabled();
         let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(starts).enumerate()
@@ -780,11 +828,24 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         }
         phases[5] += timer.elapsed().as_secs_f64();
         cost.observe_host(1e3 * (cycle_host + timer.elapsed().as_secs_f64()));
+        for (i, request) in active.iter().enumerate() {
+            let proposal = if used_copy[i] { &sequences[i][1..] } else { drafted[i].as_ref().map_or(&[][..], |d| &d.tokens) };
+            tally.member(&request.ticket, proposal, sequences[i].len() - 1, &request.history[before[i]..],
+                request.constraint.is_some(), finished[i]);
+        }
+        tally.end(|| {
+            let host = |i: usize| 1e6 * (phases[i] - phases_before[i]);
+            let engine_now = *engine.profile.borrow();
+            let gpu = |i: usize| engine_before.map_or(f64::NAN, |before| 1e6 * (engine_now[i] - before[i]));
+            vec![("draft", host(0)), ("plan", host(1)), ("rows", host(2)), ("verify", host(3)), ("emit", host(4)),
+                ("update", host(5)), ("gpu", gpu(0)), ("experts", gpu(1)), ("head", gpu(2))]
+        });
         for index in (0..active.len()).rev() {
             if !finished[index] {
                 continue;
             }
-            let request = active.remove(index);
+            let mut request = active.remove(index);
+            request.ticket.done(request.job.events.is_closed(), request.generated);
             if let Some(trace) = trace.as_mut() {
                 trace.done(request.id, request.prompt_tokens, &request.history[request.prompt_tokens..])?;
             }
@@ -814,6 +875,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         }
         cache.tick();
         publish(stats, requests, generated_total, active.len(), prefills.len(), &cache);
+        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
 }
