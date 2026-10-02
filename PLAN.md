@@ -515,6 +515,39 @@ cache, bounded prefetch, gather pool/worker, pinned upload ring, stats; V4.1
 engram and Qwen PLE use it); Spark-RAM replicas and fabric-fed tables are
 explorations, kept behind options.
 
+## Release v0 (after the current backlog; planned 2026-10-02)
+
+The first official release. Deliverables:
+- README: logo; the mission (the strongest open models with robust quant
+  support, attention/FFN disaggregation on consumer Blackwell: data-center
+  intelligence and speed in a home lab, owned and private); a model × quant
+  grid of Release smoke cards (min and max hardware), three per row, each
+  linking to its family page; quick start; links to AGENTS.md and benchmarks.
+- `docs/models/<family>.md` per family: supported checkpoints and quants,
+  engineering notes (attention, experts, speculator, KV format, RTX/Spark
+  layout, head split, prefix cache), limits, and a changelog table. A release
+  adds a family row only when a model-specific or model-affecting change
+  triggered its basic eval; the row inlines that eval's card SVG. A second
+  table lists additional benchmark reports (engine version, date, profile,
+  hardware, report SVG). v0 starts both with one row.
+- Release smoke over the full family × quant × min/max matrix (`cuteafd bench
+  smoke`), published by `bench publish`.
+- AGENTS.md rewritten as the complete guide for agents and collaborators: the
+  working method (parallel agents in worktrees, merge-first, tiered and
+  frugal gates, measure-first experiments with a stated ceiling, lock and
+  container hygiene), engineering principles (honor checkpoint numerics with
+  native kernels, standard HF loading, exact prefix-cache restores, device-
+  driven exchange with no idle CPU burn, one build for RTX PRO 6000 and 5090,
+  hand-rolled collectives), and results publishing.
+- Public-readiness: submodule URLs over https (gptqmodel is ssh), notices for
+  tool-eval-bench, deepseek-recipe, exllamav3-derived code and GPTQModel;
+  host names, IPs and sparknest paths moved from AGENTS.md into an example
+  cluster config; fast loading from a plain HF cache without sparknest; a
+  setup guide (RoCE, MTU/PFC, GPUDirect/dma-buf, drivers); GitHub Actions for
+  cargo and script tests; images pushed to ghcr.io with semver tags (v0.1.0)
+  next to the build identity; secure defaults (bind address, API key, console
+  token text off, bench lockout auth); the RTX 5090 audit before claiming it.
+
 ## Backlog (lowest priority: only when nothing planned is left)
 
 - Qwen 3.8 Flash Next NVFP4 without Sparks, competitive with vLLM on one
