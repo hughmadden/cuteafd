@@ -277,11 +277,10 @@ gpu_uuid_csv="$(IFS=,; echo "${release_gpu_uuids[*]}")"
 gpu_index_csv="$(IFS=,; echo "${release_gpu_indices[*]}")"
 gpu_pci_csv="$(IFS=,; echo "${release_gpu_pci[*]}")"
 spark_first_layer="$(release_spark_first_layer "$RELEASE_RTX_GPUS" "$RTX_EXPERT_LAYERS")"
-# A dual-RTX auto boundary, and a single-RTX explicit topology with an explicit
-# local count, are published by the coordinator; the weight-only admission below
-# must not pretend a boundary it has not read yet.
-if { ((RELEASE_RTX_GPUS == 2)) && [[ "$RTX_EXPERT_LAYERS" == auto ]]; } ||
-   { ((RELEASE_RTX_GPUS == 1)) && [[ "$RTX_EXPERT_LAYERS" =~ ^([1-9]|[1-3][0-9])$ ]]; }; then
+# Auto placement is resolved from live GPU memory, including on one RTX.
+# Do not admit or start workers against a guessed local/remote boundary.
+if [[ "$RTX_EXPERT_LAYERS" == auto ]] ||
+   { ((RELEASE_RTX_GPUS == 1)) && [[ "$RTX_EXPERT_LAYERS" != 0 ]]; }; then
   spark_first_layer=runtime-plan
 fi
 # Admission against the resolved boundary. Weight-only is all the launcher can
@@ -478,16 +477,11 @@ cleanup() {
 trap cleanup EXIT
 
 placement_directory=
-# A placement plan is needed whenever the coordinator keeps local routed experts
-# the workers must not also reserve. The dual-RTX path always does; an explicit
-# topology on ONE RTX does when it is given an explicit local count in 1..=39.
-# `auto` and `0` have no local boundary to publish on 1 RTX and keep the legacy
-# no-handoff launch, so the legacy TP4 default and the 2-RTX auto handoff are
-# unchanged. The daemon computes the real boundary from the local device only; it
-# does not read or connect the remote transport to do so.
-release_local_expert_count=""
-if [[ "$RTX_EXPERT_LAYERS" =~ ^([1-9]|[1-3][0-9])$ ]]; then release_local_expert_count="$RTX_EXPERT_LAYERS"; fi
-if ((RELEASE_RTX_GPUS == 2)) || { ((topology_explicit)) && [[ -n "$release_local_expert_count" ]]; }; then
+# Start the coordinator first whenever it can retain routed experts. Its live
+# memory plan tells every worker which layers to skip; local expert loading can
+# then overlap remote loading. Explicit all-remote single-RTX launches need no
+# handoff. Planning uses only the local device and never connects to a worker.
+if ((RELEASE_RTX_GPUS == 2)) || [[ "$RTX_EXPERT_LAYERS" != 0 ]]; then
   placement_directory=/run/cuteafd-placement
 fi
 
@@ -557,12 +551,14 @@ if [[ -n "$placement_directory" ]]; then
   done
   # Accept the coordinator's actual RTX count (1 or 2) and require it to match
   # the layout this launch selected.
-  spark_first_layer="$(jq -er --argjson gpus "$RELEASE_RTX_GPUS" '
+  spark_first_layer="$(jq -er --argjson gpus "$RELEASE_RTX_GPUS" --arg requested "$RTX_EXPERT_LAYERS" '
     select(.version == 1)
     | select((.rtx_gpus | type) == "number" and .rtx_gpus == $gpus)
     | select((.nonce | type) == "string" and (.nonce | length) > 0)
     | select((.rtx_expert_layers | type) == "number")
-    | select(.rtx_expert_layers == (.rtx_expert_layers | floor) and .rtx_expert_layers >= 1 and .rtx_expert_layers <= 40)
+    | select(.rtx_expert_layers == (.rtx_expert_layers | floor) and .rtx_expert_layers >= 0 and .rtx_expert_layers <= 40)
+    | select(.rtx_expert_layers > 0 or $gpus == 1)
+    | select($requested == "auto" or .rtx_expert_layers == ($requested | tonumber))
     | select(.spark_first_layer == ([.rtx_expert_layers, 39] | min))
     | .spark_first_layer' <<<"$placement_plan")" || release_die "invalid coordinator placement plan"
   echo "  runtime placement: RTX GPUs $(jq -r '.rtx_gpus' <<<"$placement_plan"), RTX layers $(jq -r '.rtx_expert_layers' <<<"$placement_plan"); Spark first layer $spark_first_layer"

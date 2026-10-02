@@ -261,14 +261,12 @@ fn worker(
     ready: &mut Option<oneshot::Sender<std::result::Result<(), String>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
 ) -> Result<()> {
-    // A placement handoff needs a local/remote boundary to publish: it is
-    // meaningful when the coordinator keeps 1..=39 local routed layers, on one
-    // or two RTX cards. An all-local (40) or all-remote (0) plan has nothing to
-    // hand off and must not open the handshake.
+    // Auto placement must publish its live boundary even when no local layer
+    // fits. Explicit all-remote single-RTX launches do not need a handoff.
     if let Some(directory) = args.placement_directory.as_deref() {
         ensure!(
-            args.rtx_gpus == 2 || matches!(args.rtx_expert_layers, memory::LocalLayers::Count(1..=39)),
-            "placement handoff requires --rtx-gpus 2 or a 1-RTX explicit local expert count in 1..=39"
+            args.rtx_gpus == 2 || args.rtx_expert_layers != memory::LocalLayers::Count(0),
+            "placement handoff requires --rtx-gpus 2 or single-RTX auto/local expert placement"
         );
         // The handoff directory must name a real path, not an empty string.
         ensure!(

@@ -327,9 +327,11 @@ class ExampleConfigTest(unittest.TestCase):
 
 
 STUB = r'''#!/usr/bin/env python3
-import json,os,sys
+import json,os,sys,shlex
 from pathlib import Path
 args=sys.argv[1:]; tool=Path(sys.argv[0]).name
+if tool=='ssh' and args and args[-1].startswith('bash -s -- '):
+ args=args[:-1]+shlex.split(args[-1])
 with open(os.environ['EVENTS'],'a') as f:f.write(json.dumps([tool,args])+'\n')
 if tool=='docker':
  if args[0]=='inspect':print('running')
@@ -405,6 +407,8 @@ hosts=({' '.join(hosts)})
 EXPERT_PORT=19441
 expert_capacity=4096
 spark_first_layer=0
+wip_layout=
+wip_slot=
 SPARK_COUNT={spark_count}
 {extra_setup}'''
             result = subprocess.run(
@@ -439,7 +443,7 @@ SPARK_COUNT={spark_count}
         self.assertNotIn("--spark-ep", coordinator)
         # Worker positional tail ends with topology(explicit,tp,ep) then the
         # three optional RDMA env values.
-        self.assertTrue(all(args[-6] == "0" for tool, args in events if tool == "ssh" and "-s" in args))
+        self.assertTrue(all(args[-8] == "0" for tool, args in events if tool == "ssh" and "-s" in args))
 
     def test_explicit_topology_reaches_coordinator_and_every_worker(self) -> None:
         result, events = self.run_startup(
@@ -462,8 +466,8 @@ SPARK_COUNT={spark_count}
         starts = [args for tool, args in events if tool == "ssh" and "-s" in args]
         self.assertEqual(len(starts), 4)
         for args in starts:
-            self.assertEqual(args[-6:-3], ["1", "2", "2"])
-            self.assertEqual(args[-7], "4")
+            self.assertEqual(args[-8:-5], ["1", "2", "2"])
+            self.assertEqual(args[-9], "4")
 
     def test_six_rank_explicit_topology_starts_six_workers(self) -> None:
         result, events = self.run_startup(
@@ -478,9 +482,9 @@ SPARK_COUNT={spark_count}
         self.assertEqual(result.returncode, 0, result.stderr)
         starts = [args for tool, args in events if tool == "ssh" and "-s" in args]
         self.assertEqual(len(starts), 6)
-        self.assertEqual([args[-8] for args in starts], ["12"] * 6)
-        self.assertEqual([args[-7] for args in starts], ["6"] * 6)
-        self.assertEqual([args[-6:-3] for args in starts], [["1", "2", "3"]] * 6)
+        self.assertEqual([args[-10] for args in starts], ["12"] * 6)
+        self.assertEqual([args[-9] for args in starts], ["6"] * 6)
+        self.assertEqual([args[-8:-5] for args in starts], [["1", "2", "3"]] * 6)
 
     def test_single_rtx_local_count_publishes_and_hands_off_five(self) -> None:
         # The current official 1-RTX shape on an explicit topology: 5 local
@@ -507,9 +511,9 @@ SPARK_COUNT={spark_count}
         self.assertEqual(len(starts), 6)
         # Worker positional tail: ... first_layer world topology explicit,tp,ep
         for args in starts:
-            self.assertEqual(args[-8], "5", args)
-            self.assertEqual(args[-7], "6")
-            self.assertEqual(args[-6:-3], ["1", "6", "1"])
+            self.assertEqual(args[-10], "5", args)
+            self.assertEqual(args[-9], "6")
+            self.assertEqual(args[-8:-5], ["1", "6", "1"])
         # The boundary is acknowledged after the workers start.
         acks = [args for tool, args in events if tool == "docker" and args[0] == "exec"]
         self.assertTrue(any("ready.json" in " ".join(a) for a in acks), acks)
@@ -537,9 +541,9 @@ SPARK_COUNT={spark_count}
         starts = [args for tool, args in events if tool == "ssh" and "-s" in args]
         self.assertEqual(len(starts), 3)
         for args in starts:
-            self.assertEqual(args[-8], "5", args)
-            self.assertEqual(args[-7], "3")
-            self.assertEqual(args[-6:-3], ["1", "3", "1"])
+            self.assertEqual(args[-10], "5", args)
+            self.assertEqual(args[-9], "3")
+            self.assertEqual(args[-8:-5], ["1", "3", "1"])
         acks = [args for tool, args in events if tool == "docker" and args[0] == "exec"]
         self.assertTrue(any("ready.json" in " ".join(a) for a in acks), acks)
 
@@ -561,7 +565,7 @@ SPARK_COUNT={spark_count}
         starts = [args for tool, args in events if tool == "ssh" and "-s" in args]
         self.assertEqual(len(starts), 6)
         for args in starts:
-            self.assertEqual(args[-8], "0", args)
+            self.assertEqual(args[-10], "0", args)
         acks = [args for tool, args in events if tool == "docker" and args[0] == "exec"]
         self.assertFalse(any("ready.json" in " ".join(a) for a in acks), acks)
 
@@ -645,7 +649,7 @@ SPARK_COUNT={spark_count}
         starts = [args for tool, args in events if tool == "ssh" and "-s" in args]
         self.assertEqual(len(starts), 6)
         for args in starts:
-            self.assertEqual(args[-3:], [device_map, "1", "2"])
+            self.assertEqual(args[-5:-2], [device_map, "1", "2"])
 
 
 class VerbsDeviceMapTest(unittest.TestCase):
@@ -887,12 +891,6 @@ class BuildScopeTest(unittest.TestCase):
         release = (ROOT / "run.sh").read_text()
         self.assertIn('--argjson gpus "$RELEASE_RTX_GPUS"', release)
         self.assertIn(".rtx_gpus == $gpus", release)
-        # A dual-RTX launch always publishes a placement plan; a single-RTX
-        # explicit topology does so only for an explicit local count in 1..=39,
-        # because `auto`/`0` have no local boundary to hand off. Standalone `0`
-        # and the legacy default keep the historical no-handoff launch.
-        self.assertIn("((RELEASE_RTX_GPUS == 2)) || { ((topology_explicit)) && [[ -n \"$release_local_expert_count\" ]]; }", release)
-        self.assertIn('^([1-9]|[1-3][0-9])$', release)
         self.assertIn("handoff", release)
         # The boundary acknowledgement must not be gated on the RTX count alone.
         self.assertIn('if [[ -n "$placement_directory" ]]; then', release)
