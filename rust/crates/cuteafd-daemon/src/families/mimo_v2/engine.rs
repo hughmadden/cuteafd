@@ -52,6 +52,11 @@ pub(crate) const PAGE_ROWS: usize = 64;
 pub(crate) const RING_ROWS: usize = 256;
 /// Rows of the decode-route programs (`_m64`).
 pub(crate) const DECODE_ROWS: usize = 64;
+/// Expert scratch and transport must fit every decode/verify row shape even
+/// when prompts are deliberately processed through a narrower workspace.
+pub(super) fn expert_capacity(prefill_rows: usize) -> usize {
+    prefill_rows.max(DECODE_ROWS)
+}
 /// Programs of one layer's attention: the qkv producer, attention, o_proj.
 const ATTENTION_PARTS: usize = 3;
 
@@ -2265,7 +2270,32 @@ impl<'a> MimoEngine<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{attention_workspace_geometry, lane_prefill_capacity, MimoAttentionWorkspace, MIN_LANE_ROWS};
+    use super::{attention_workspace_geometry, expert_capacity, lane_prefill_capacity,
+        MimoAttentionWorkspace, DECODE_ROWS, MIN_LANE_ROWS};
+
+    #[test]
+    fn narrow_prefill_expert_storage_covers_every_decode_descriptor_and_native_program() {
+        use cuteafd_ffi::fp8_moe::{Fp8MoeInfo, Fp8MoeWeights};
+        let info = Fp8MoeInfo { hidden: 4096, slice: 2048, experts: 256, topk: 8,
+            intermediate: 2048, tp: 1, wire_input: false, swiglu_limit: 0.0,
+            capacities: vec![16, 64, 4096], weights: Fp8MoeWeights::Fp8 };
+        for prefill in [1, 16, 32, 63, 64, 128, 4096] {
+            // Local load/scratch, SparkLink negotiation/intake, and warmup
+            // all consume this common extent; the native program must fit it.
+            let capacity = expert_capacity(prefill);
+            let program = info.capacity_for(capacity).unwrap();
+            let partial_plane = capacity * info.hidden * 2;
+            for decode_rows in 1..=DECODE_ROWS {
+                assert!(decode_rows <= capacity && decode_rows <= program);
+                assert!(decode_rows * info.hidden * 2 <= partial_plane);
+            }
+            assert!(prefill <= capacity);
+            if prefill >= DECODE_ROWS { assert_eq!(capacity, prefill); }
+        }
+        assert_eq!(expert_capacity(4096), 4096);
+        let narrow_only = Fp8MoeInfo { capacities: vec![16], ..info };
+        assert_eq!(narrow_only.capacity_for(expert_capacity(1)), None);
+    }
 
     #[test]
     fn split_prefill_and_peer_workspaces_use_only_their_attention_heads() {

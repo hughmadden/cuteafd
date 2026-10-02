@@ -555,6 +555,10 @@ split-rank cache restores, continuation and serving with speculation on/off.
 Unsupported explicit MiMo head splits now fail before loading, and stream
 cleanup preserves the primary error. Cancelling queued peer waits after a
 failed split-rank submission remains separate open work.
+MiMo expert scratch, Spark intake and startup negotiation now admit at least
+the full decode/verify extent even when prefill chunks are smaller. The
+narrow-prefill full-model gate matches physical KV/marks, every layer and
+continuation exactly; the old path fails its native capacity guard.
 
 Next: startup must consume the same resolved pool/context/state values before
 loading weights, with actual weight conversions, all lane/workspace shapes,

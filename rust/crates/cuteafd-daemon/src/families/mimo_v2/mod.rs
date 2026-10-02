@@ -410,12 +410,12 @@ impl Opened {
             let (free, _) = self.library.cuda_memory_info()?;
             if let Some(window) = args.expert_window {
                 let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, 0..0, 1, 0,
-                    args.prefill_rows, free.saturating_sub(4 << 30))?;
+                    engine::expert_capacity(args.prefill_rows), free.saturating_sub(4 << 30))?;
                 return Ok(Some(engine::Experts::Streamed { experts: std::cell::RefCell::new(experts), tensors, window }));
             }
             let started = Instant::now();
             let local = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory,
-                moe_layers[0]..moe_layers[moe_layers.len() - 1] + 1, 1, 0, args.prefill_rows,
+                moe_layers[0]..moe_layers[moe_layers.len() - 1] + 1, 1, 0, engine::expert_capacity(args.prefill_rows),
                 free.saturating_sub(4 << 30))?;
             tracing::info!(layers = moe_layers.len(), elapsed_ms = started.elapsed().as_millis() as u64,
                 "MiMo FP8 experts resident on this GPU");
@@ -427,7 +427,7 @@ impl Opened {
             .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
             .collect::<Result<_>>()?;
         let link = || crate::shared::spark_intake::SparkLink::new(&self.library, &peers, &executors,
-            u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
+            u32::try_from(engine::expert_capacity(args.prefill_rows))?, cuteafd_transport::TcpTransportConfig { timing: false,
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2);
         let mut transport = link()?;
         // Pipelined prefill (CUTEAFD_MIMO_PREFILL_LANES, 2 by default; 1 keeps
@@ -464,7 +464,7 @@ impl Opened {
             request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
             Ok(request)
         };
-        let mut warmups = vec![warm(args.prefill_rows, args.expert_input.bf16(false))?];
+        let mut warmups = vec![warm(engine::expert_capacity(args.prefill_rows), args.expert_input.bf16(false))?];
         if args.expert_input.bf16(true) && !args.expert_input.bf16(false) {
             warmups.push(warm(1, true)?);
         }
