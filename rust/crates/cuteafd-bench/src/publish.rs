@@ -155,7 +155,7 @@ pub fn index(placed: &[Placed]) -> String {
 pub fn splice(text: &str, begin: &str, end: &str, body: &str) -> Result<String> {
     let start = text.find(begin).with_context(|| format!("marker {begin} missing"))? + begin.len();
     let stop = text[start..].find(end).with_context(|| format!("marker {end} missing"))? + start;
-    Ok(format!("{}\n{}\n{}", &text[..start], body.trim_matches('\n'), &text[stop..]))
+    Ok(format!("{}\n{}\n\n{}", &text[..start], body.trim_end_matches('\n'), &text[stop..]))
 }
 
 const INDEX_HEADER: &str = "# Benchmarks\n\nReports from `cuteafd bench` (profiles other than the basic one run \

@@ -14,7 +14,7 @@ pub struct RunOptions {
     pub profile: Option<String>,
     pub panels: Option<Vec<String>>,
     pub passes: Vec<(String, u32)>,
-    /// `svg`, `png`, `json`.
+    /// `svg` (report, card, panels), `png` (report and card), `card` (card.png only), `json`.
     pub export: Vec<String>,
     /// Output directory; `None`: `benchmarks/<family>/<date>-<profile>-<hardware>/` under `root`.
     pub out: Option<PathBuf>,
@@ -56,6 +56,8 @@ pub fn write_exports(report: &Report, dir: &Path, kinds: &[String]) -> Result<Ve
     }
     if want("png") {
         files.extend(["report.png".to_string(), "card.png".to_string()]);
+    } else if want("card") {
+        files.push("card.png".to_string());
     }
     for file in files {
         let bytes = if file.ends_with(".png") {

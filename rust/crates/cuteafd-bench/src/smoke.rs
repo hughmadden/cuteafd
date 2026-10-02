@@ -511,7 +511,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         }
         outcome.launch_s = Some(launch.elapsed().as_secs_f64());
         let options = crate::cli::RunOptions { url, profile: Some(profile.to_string()), panels: None, passes: vec![],
-            export: vec!["svg".into(), "png".into(), "json".into()], out: None, root: out_root.to_path_buf(),
+            export: vec!["svg".into(), "card".into(), "json".into()], out: None, root: out_root.to_path_buf(),
             api_key: std::env::var("CUTEAFD_API_KEY").ok(), quiet: true };
         let (report, dir) = crate::cli::run(&options)?;
         outcome.dir = Some(dir.display().to_string());
