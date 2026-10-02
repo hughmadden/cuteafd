@@ -312,8 +312,9 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     let matrix: Matrix = serde_json::from_str(&std::fs::read_to_string(&args.matrix)
         .with_context(|| format!("{}", args.matrix.display()))?).context("parsing the matrix")?;
     let repo = args.repo.canonicalize().context("--repo")?;
-    let out_root = args.out_root.clone().unwrap_or_else(|| repo.clone());
-    let state_dir = expand(&args.state);
+    // ./run.sh runs inside --repo: every path handed to it must be absolute.
+    let out_root = std::path::absolute(args.out_root.clone().unwrap_or_else(|| repo.clone())).context("--out-root")?;
+    let state_dir = std::path::absolute(expand(&args.state)).context("--state")?;
     let paths = Paths { state: state_dir.join("state.json"), configs: state_dir.join("configs"), logs: state_dir.join("logs") };
     std::fs::create_dir_all(&paths.configs)?;
     std::fs::create_dir_all(&paths.logs)?;
