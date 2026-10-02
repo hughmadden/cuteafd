@@ -808,9 +808,17 @@ active admission deferral and active KV paging are separate remaining work.
     paths before releasing a required representation. Prefer native compact
     kernels or bounded staging, selecting the representation at startup.
     Partially split matrices must not retain overlapping BF16/FP8 rows.
-    Do not silently change checkpoint precision to save
-    memory: any added quantization needs its own golden NLL/KL (<=0.005 nat)
-    and tool/agentic gates. Check exactness when arithmetic is preserved,
+    Do not silently change target checkpoint precision to save
+    memory: added target quantization needs its own golden NLL/KL (<=0.005 nat)
+    and tool/agentic gates. Drafter precision is a performance decision
+    (TJ, 2026-10-03): choose BF16, FP8 or a per-matrix mixture by net emitted
+    tokens/s after target verification and actual memory use. Include context
+    updates, drafting cost and proposal acceptance; do not force 8-bit weights
+    or activations. Drafter proposal KL is diagnostic, not a target-quality
+    threshold or a standalone rejection criterion. Target verification,
+    final-output correctness and cache-state contracts remain mandatory.
+    Eliminate wasted duplicate representations whichever precision wins.
+    Check exactness when arithmetic is preserved,
     readiness, C1/C16 decode and 8K prefill on both reference layouts; include
     every surviving copy and expanded scale layout in admission.
 11. **Parked**: Spark-side reduce-scatter ([`work/spark-reduce`](https://github.com/tpurtell/cuteafd/tree/work/spark-reduce),
