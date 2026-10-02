@@ -333,7 +333,12 @@ function tableFor(id) {
     });
     if (b.card.prefill) { const p = b.card.prefill; rows.push(['8K prefill', p.tok_s, p.prompt_tokens, p.ttft_s * 1000, '']); }
     const checks = b.quality.checks.map((c) => [c.title, c.status, c.summary, c.seconds]);
-    return tableHtml(['measurement', 'tok/s', 'tokens', 'TTFT ms', 'decode s'], rows)
+    const cap = b.card.capacity || {};
+    const capRows = [['KV pool', cap.kv_tokens != null ? `${fmt.n0(cap.kv_tokens)} tokens${cap.kv_pages != null ? ` · ${fmt.n0(cap.kv_pages)} pages` : ''}` : '—'],
+      ['KV format', cap.kv_format || '—'], ['max requests', cap.max_requests ?? '—'],
+      ['max context / output', `${cap.max_context ?? '—'} / ${cap.max_output ?? '—'}`],
+      ['host prefix cache', cap.host_cache_bytes != null ? (cap.host_cache_bytes ? fmt.bytes(cap.host_cache_bytes) : 'off') : '—']];
+    return tableHtml(['capacity', ''], capRows) + tableHtml(['measurement', 'tok/s', 'tokens', 'TTFT ms', 'decode s'], rows)
       + tableHtml(['check', 'status', 'result', 'seconds'], checks);
   }
   if (id === 'hardware') {

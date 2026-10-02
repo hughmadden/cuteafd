@@ -99,8 +99,8 @@ pub fn results(placed: &[Placed]) -> String {
     let mut out = String::new();
     for (family, entries) in &rows {
         out.push_str(&format!("\n#### {}\n\n", family_title(family)));
-        out.push_str("| Checkpoint | Hardware | C1 code | prose | JSON | 8K prefill | TTFT | Quality | Run |\n");
-        out.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |\n");
+        out.push_str("| Checkpoint | Hardware | KV / req | C1 code | prose | JSON | 8K prefill | TTFT | Quality | Run |\n");
+        out.push_str("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |\n");
         for ((name, class), p) in entries {
             let r = &p.report;
             let b = r.baseline.as_ref().expect("filtered");
@@ -113,8 +113,8 @@ pub fn results(placed: &[Placed]) -> String {
                 _ => b.quality.badge(),
             };
             let hardware = format!("{} ({})", short_hardware(r), if *class == 0 { "min" } else { "max" });
-            out.push_str(&format!("| {name} | {hardware} | {} | {} | {} | {prefill} | {ttft} | {quality} | [{} · {}]({}) |\n",
-                decode("code"), decode("prose"), decode("json"), crate::render::date(&r.created),
+            out.push_str(&format!("| {name} | {hardware} | {} | {} | {} | {} | {prefill} | {ttft} | {quality} | [{} · {}]({}) |\n",
+                r.capacity().compact(), decode("code"), decode("prose"), decode("json"), crate::render::date(&r.created),
                 r.server.build.label(), link(&p.dir, "report.svg")));
         }
     }

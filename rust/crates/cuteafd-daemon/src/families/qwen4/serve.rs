@@ -383,6 +383,8 @@ fn prefix_cache<'e, 'a>(engine: &'e Qwen4Engine<'a>, args: &PrefixArgs, lanes: u
     tracing::info!(entries, mark_slots = family.slots(), mark_bytes = family.mark_bytes(), page_bytes = layout.page_bytes,
         pages = layout.pages, page_rows = layout.page_rows, host_bytes = args.host_cache_bytes, points = ?args.points(),
         "Qwen 3.8 Flash Next prefix cache");
+    cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64,
+        &"BF16 full-attention + GDN/PLE state".to_string(), if args.prefix_cache_entries == 0 { 0 } else { args.host_cache_bytes });
     Ok((family, cache))
 }
 

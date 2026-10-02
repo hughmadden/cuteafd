@@ -346,7 +346,8 @@ impl Bench {
             None => {
                 let estimate = crate::baseline::estimate_s(&rates);
                 self.begin(active, "baseline", estimate, remaining, total, progress);
-                let b = crate::baseline::run(&client, &info, progress, &active.id, &fingerprint, max_context)?;
+                let b = crate::baseline::run(&client, &info, progress, &active.id, &fingerprint, max_context,
+                    max_output)?;
                 remaining -= estimate;
                 if b.quality.status != crate::report::CheckStatus::Pending {
                     self.baselines.lock().expect("baselines lock").insert(fingerprint.clone(), b.clone());

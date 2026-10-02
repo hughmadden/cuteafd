@@ -576,6 +576,7 @@ fn worker(
         .enable_all()
         .build()?;
     let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests)?;
+    scheduler::publish_capacity(&requests, &prefixes);
     ready
         .take()
         .context("startup readiness missing")?

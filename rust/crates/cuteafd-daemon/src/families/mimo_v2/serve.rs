@@ -349,6 +349,8 @@ fn prefix_cache<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs)
     tracing::info!(entries, mark_slots = family.slots(), mark_bytes = family.mark_bytes(), page_bytes = layout.page_bytes,
         pages = layout.pages, host_bytes = args.host_cache_bytes, rule = ?layout.rule, points = ?args.points(),
         reach = family.capture_reach(), "MiMo prefix cache");
+    cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64,
+        &format!("{:?} full + BF16 SWA rings", engine.kv_cache()), if args.prefix_cache_entries == 0 { 0 } else { args.host_cache_bytes });
     Ok((family, cache))
 }
 
