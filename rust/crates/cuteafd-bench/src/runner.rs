@@ -306,6 +306,9 @@ impl Bench {
         if let Some(ticker) = ticker {
             let _ = ticker.join();
         }
+        if let Ok(mut plan) = self.plan_state().lock() {
+            *plan = (String::new(), String::new(), 0.0, 0.0, 1.0);
+        }
         *self.active.lock().expect("active lock") = None;
         let snapshot = report.lock().expect("report lock").clone();
         self.emit(json!({"type": "report", "run": id, "report": snapshot}));
@@ -319,6 +322,7 @@ impl Bench {
         let mut client = Client::new(base, Some(active.token.clone()), active.cancel.clone());
         let record = client.discover()?;
         let max_context = record["max_context_tokens"].as_u64().unwrap_or(8192);
+        let max_output = record["max_output_tokens"].as_u64().unwrap_or(4096);
         let info = self.server_info(&client.model);
         let fingerprint = crate::server::fingerprint(&info);
         {
@@ -375,7 +379,7 @@ impl Bench {
                 client.check()?;
                 self.begin(active, panel.id(), estimate, remaining, total, progress);
                 let ctx = Ctx { client: &client, info: &info, baseline: Some(&baseline), rates, progress, pass,
-                    history: &earlier };
+                    history: &earlier, max_context, max_output };
                 let outcome = panel.run(&ctx);
                 remaining -= estimate;
                 let mut r = report.lock().expect("report lock");
@@ -456,6 +460,10 @@ impl Bench {
             }
             let title = if panel == "baseline" { "Basic card + quick quality".to_string() }
                 else { panels::find(&panel).map_or(panel.clone(), |p| p.title().to_string()) };
+            if run.is_empty() {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
             self.emit(json!({"type": "progress", "run": run, "panel": panel, "title": title, "label": state.label,
                 "panel_fraction": state.fraction, "fraction": fraction, "eta_s": eta,
                 "live": {"tok_s": tok_s, "active": active_requests}}));

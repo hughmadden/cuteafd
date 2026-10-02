@@ -186,7 +186,11 @@ impl<'a> View<'a> {
             y += row(doc, t, 0.0, y, w, "Rails", rails);
         }
         if let Some(ready) = self.report.server.readiness_s {
-            y += row(doc, t, 0.0, y, w, "Readiness", &format!("{} from process start to serving", seconds(ready)));
+            let mut text = format!("{} from process start to serving", seconds(ready));
+            if let Some(warmup) = self.report.baseline.as_ref().and_then(|b| b.card.warmup_s) {
+                text.push_str(&format!(" · first requests (warm-up) {}", seconds(warmup)));
+            }
+            y += row(doc, t, 0.0, y, w, "Readiness", &text);
         }
         y
     }

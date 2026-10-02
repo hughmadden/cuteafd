@@ -118,6 +118,7 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     // Warm-up: first-use workspaces, graphs and tables (untimed), and a two-point
     // fit of tokens per filler word for the prefill case.
     run.step(0.01, "warm-up");
+    let warmup = Instant::now();
     let mut fit = Vec::new();
     for (i, words) in [300usize, 900].into_iter().enumerate() {
         let text = format!("[{}] Summarize in one word.\n\n{}", nonce(), filler(17 + i as u64, words));
@@ -125,6 +126,7 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
         fit.push((words as f64, chat.timing.prompt_tokens as f64));
     }
     client.chat(plain(&format!("[{}] {}", nonce(), CONTENT[0].1), 32), None).context("warm-up decode")?;
+    run.baseline.card.warmup_s = Some(warmup.elapsed().as_secs_f64());
     // C1 decode per content type.
     for (i, (content, prompt)) in CONTENT.iter().enumerate() {
         run.step(0.04 + 0.1 * i as f64, &format!("C1 decode · {content}"));
@@ -209,15 +211,32 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     Ok(())
 }
 
-/// First-token row of a probed request: (hash, cached tokens).
-fn first_row(client: &Client, ids: Vec<u32>, cold: bool) -> Result<(String, usize)> {
-    let spec = ProbeSpec { prompt_ids: Some(ids), cold, record_first: true, top_k: 1, ..ProbeSpec::default() };
-    let chat = client.chat(plain("cache probe", 1), Some(spec))?;
-    let record = probe_of(&chat)?;
-    let row = record.rows.first().context("the engine recorded no first-token row")?;
-    Ok((row.hash.clone(), record.cached_tokens))
+/// The probe record of one request.
+fn probed(client: &Client, body: Value, spec: ProbeSpec) -> Result<ProbeRecord> {
+    let chat = client.chat(body, Some(spec))?;
+    probe_of(&chat).cloned()
 }
 
+/// Whether `a` and `b` recorded byte-identical rows at every position both hold:
+/// (positions compared, positions that differ).
+fn compare_rows(a: &ProbeRecord, b: &ProbeRecord) -> (usize, Vec<usize>) {
+    let mut compared = 0;
+    let mut differ = Vec::new();
+    for row in &b.rows {
+        if let Some(other) = a.rows.iter().find(|r| r.position == row.position) {
+            compared += 1;
+            if other.hash != row.hash {
+                differ.push(row.position);
+            }
+        }
+    }
+    (compared, differ)
+}
+
+/// Restore exactness: a whole-prompt hit on a prompt-end snapshot and on a
+/// turn-end snapshot, then one decode step on the restored state, compared
+/// byte for byte with the same rows computed without a restore (same
+/// chunking, drafts off).
 fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     if run.setting("prefix-cache-entries").is_some_and(|v| v == "0") {
         check.status = CheckStatus::Skipped;
@@ -225,52 +244,59 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
         return Ok(());
     }
     let client = run.client;
-    // The engine's own tokenization of a fresh prompt.
-    let text = format!("[{}] Read the notes and wait.\n\n{}", nonce(), filler(31, 1100));
-    let chat = client.chat(plain(&text, 1), Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))?;
-    let record = probe_of(&chat)?;
-    if !honoured(record) {
+    let rows = |n: usize| ProbeSpec { no_speculation: true, record_rows: n, top_k: 1, ..ProbeSpec::default() };
+    // Prompt end: the first request computes and retains, the second restores it whole.
+    let text = format!("[{}] Read the notes and answer in one word.\n\n{}", nonce(), filler(31, 1100));
+    let first = probed(client, plain(&text, 2), rows(2))?;
+    if !honoured(&first) {
         unsupported(check);
         return Ok(());
     }
-    let ids = record.prompt_ids.clone();
-    anyhow::ensure!(ids.len() > 400, "prompt of {} tokens", ids.len());
-    // Prompt-end snapshot: retain a prefix, then extend it (restored) and compare with cold.
-    let cut = ids.len() * 3 / 4;
-    client.chat(plain("cache probe", 1), Some(ProbeSpec { prompt_ids: Some(ids[..cut].to_vec()),
-        ..ProbeSpec::default() }))?;
-    let (warm, restored) = first_row(client, ids.clone(), false)?;
-    let (cold, _) = first_row(client, ids.clone(), true)?;
-    // Turn-end snapshot: a finished turn, then the conversation continues past it.
+    let restored = probed(client, plain(&text, 2), rows(2))?;
+    let (prompt_compared, prompt_differ) = compare_rows(&first, &restored);
+    let prompt_hit = restored.cached_tokens == restored.prompt_ids.len() && !restored.prompt_ids.is_empty();
+    // Turn end: a finished turn, the same turn recomputed cold one token further,
+    // then the turn's tokens again (a whole hit on the turn snapshot).
     let turn_text = format!("[{}] List five rivers of Europe, one per line.", nonce());
-    let turn = client.chat(plain(&turn_text, 24), Some(ProbeSpec::default()))?;
-    let turn_record = probe_of(&turn)?;
-    let mut extended = turn_record.prompt_ids.clone();
-    extended.extend(&turn_record.generated);
-    let turn_len = extended.len();
-    extended.extend(&ids[ids.len() / 3..ids.len() / 3 + 96]);
-    let (turn_warm, turn_restored) = first_row(client, extended.clone(), false)?;
-    let (turn_cold, _) = first_row(client, extended, true)?;
-    check.set("prompt_restored", restored as u64);
-    check.set("prompt_tokens", ids.len() as u64);
-    check.set("turn_restored", turn_restored as u64);
-    check.set("turn_tokens", turn_len as u64);
-    check.set("prompt_identical", warm == cold);
-    check.set("turn_identical", turn_warm == turn_cold);
-    let describe = |restored: usize, total: usize, same: bool| if restored == 0 {
-        format!("no restore of {total} tokens")
+    let turn = probed(client, plain(&turn_text, 24), ProbeSpec { no_speculation: true, ..ProbeSpec::default() })?;
+    let reference = probed(client, plain(&turn_text, 25),
+        ProbeSpec { cold: true, ..rows(25) })?;
+    let reproducible = reference.generated.len() > turn.generated.len()
+        && reference.generated[..turn.generated.len()] == turn.generated[..];
+    let mut ids = turn.prompt_ids.clone();
+    ids.extend(&turn.generated[..turn.generated.len().saturating_sub(1)]);
+    let again = probed(client, plain("cache probe", 2), ProbeSpec { prompt_ids: Some(ids.clone()), ..rows(2) })?;
+    let (turn_compared, turn_differ) = compare_rows(&reference, &again);
+    let turn_hit = again.cached_tokens == ids.len();
+    let decode_rows = first.rows.len() >= 2 && restored.rows.len() >= 2;
+    check.set("prompt_tokens", restored.prompt_ids.len() as u64);
+    check.set("prompt_restored", restored.cached_tokens as u64);
+    check.set("prompt_rows_compared", prompt_compared as u64);
+    check.set("turn_tokens", ids.len() as u64);
+    check.set("turn_restored", again.cached_tokens as u64);
+    check.set("turn_rows_compared", turn_compared as u64);
+    let describe = |hit: bool, restored: usize, total: usize, compared: usize, differ: &[usize]| if !hit {
+        format!("no whole restore ({restored}/{total})")
+    } else if !differ.is_empty() {
+        format!("{total} restored, rows DIFFER at {differ:?}")
     } else {
-        format!("{restored}/{total} restored {}", if same { "byte-identical" } else { "DIFFERS from cold" })
+        format!("{total} restored, {compared} rows byte-identical")
     };
-    check.summary = format!("prompt end: {} · turn end: {}", describe(restored, ids.len(), warm == cold),
-        describe(turn_restored, turn_len, turn_warm == turn_cold));
-    check.status = if (restored > 0 && warm != cold) || (turn_restored > 0 && turn_warm != turn_cold) {
+    check.summary = format!("prompt end: {} · turn end: {}{}",
+        describe(prompt_hit, restored.cached_tokens, restored.prompt_ids.len(), prompt_compared, &prompt_differ),
+        describe(turn_hit, again.cached_tokens, ids.len(), turn_compared, &turn_differ),
+        if decode_rows { "" } else { " (no decode rows recorded: first rows only)" });
+    let failed = (prompt_hit && !prompt_differ.is_empty()) || (turn_hit && reproducible && !turn_differ.is_empty());
+    check.status = if failed {
         CheckStatus::Fail
-    } else if restored > 0 && turn_restored > 0 {
+    } else if prompt_hit && turn_hit && decode_rows && prompt_compared >= 2 && turn_compared >= 2 {
         CheckStatus::Pass
     } else {
         CheckStatus::Info
     };
+    if !reproducible && turn_hit {
+        check.summary.push_str(" · the turn's greedy text did not reproduce");
+    }
     Ok(())
 }
 

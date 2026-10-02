@@ -31,7 +31,12 @@ fn inference(method: &Method, path: &str) -> bool {
 /// Refuses other clients' inference with 503 + Retry-After while a run is active.
 pub async fn lockout(State(bench): State<Arc<Bench>>, request: Request, next: Next) -> Response {
     if inference(request.method(), request.uri().path()) {
-        let token = request.headers().get(BENCH_HEADER).and_then(|v| v.to_str().ok());
+        // The run's own requests carry its token; tools it runs as subprocesses
+        // (tool-eval-bench) pass it as their API key.
+        let token = request.headers().get(BENCH_HEADER).and_then(|v| v.to_str().ok()).or_else(|| {
+            request.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer ")).map(str::trim)
+        });
         if let Some(retry) = bench.locked(token) {
             let mut response = (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": {
                 "message": format!("a benchmark is running on this server; retry in about {retry} s"),

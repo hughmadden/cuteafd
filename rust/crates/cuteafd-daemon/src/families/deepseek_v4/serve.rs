@@ -304,6 +304,7 @@ fn select_host(constraint: Option<&mut crate::shared::constraints::State<'_>>,
 /// request finished (normally, or because the client left).
 fn finish_row(request: &mut Active<'_>, token: Result<u32>, eos: u32, logits: &DeviceLogits, row: usize,
     caching: bool, library: &cuteafd_ffi::NativeLibrary) -> bool {
+    probe::decode_row(library, &request.job.probe, logits, row, request.generated, request.history.len());
     match token.and_then(|token| request.emit(token, eos)) {
         Ok(false) => false,
         Ok(true) => {

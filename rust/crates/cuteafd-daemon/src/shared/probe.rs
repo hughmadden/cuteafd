@@ -36,7 +36,21 @@ pub(crate) fn scoring(probe: &ProbeRef) -> Option<usize> {
 
 /// Whether the first generated token's row is wanted.
 pub(crate) fn wants_first(probe: &ProbeRef) -> bool {
-    probe.as_ref().is_some_and(|p| p.spec.record_first)
+    probe.as_ref().is_some_and(|p| p.spec.record_first || p.spec.record_rows > 0)
+}
+
+/// Records decode row `row` (selecting generated token `generated`, at
+/// `position`) when the probe wants that many rows.
+pub(crate) fn decode_row(library: &NativeLibrary, probe: &ProbeRef, logits: &DeviceLogits, row: usize,
+    generated: usize, position: usize) {
+    let Some(p) = probe else { return };
+    if generated >= p.spec.record_rows {
+        return;
+    }
+    match logits.row_host(library, row) {
+        Ok(host) => p.row(position, &host),
+        Err(error) => p.fail(format!("decode row: {error:#}")),
+    }
 }
 
 pub(crate) fn admitted(probe: &ProbeRef, engine: &str, ids: &[u32], cached: usize) {

@@ -35,6 +35,10 @@ pub struct ProbeSpec {
     /// Record the row the first generated token is selected from.
     #[serde(default)]
     pub record_first: bool,
+    /// Record the rows the first N generated tokens are selected from (the
+    /// first from the prefill or a retained row, the rest from decode steps).
+    #[serde(default)]
+    pub record_rows: usize,
     /// Top entries kept per recorded row.
     #[serde(default)]
     pub top_k: usize,

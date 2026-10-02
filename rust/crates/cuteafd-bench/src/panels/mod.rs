@@ -6,7 +6,9 @@ use serde::Serialize;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 
+pub mod common;
 pub mod info;
+pub mod speed;
 
 /// Rates that turn a panel's workload into seconds: the baseline's when it
 /// ran, a conservative guess before.
@@ -92,6 +94,9 @@ pub struct Ctx<'a> {
     pub pass: u32,
     /// Earlier passes on the same fingerprint (panels that accumulate).
     pub history: &'a [Value],
+    /// The server's request limits (`/v1/models`).
+    pub max_context: u64,
+    pub max_output: u64,
 }
 
 pub trait Panel: Send + Sync {

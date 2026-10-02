@@ -326,6 +326,9 @@ pub struct BasicCard {
     pub decode: Vec<ContentRate>,
     #[serde(default)]
     pub prefill: Option<PrefillRate>,
+    /// Seconds of the untimed warm-up requests (first-use loads, graphs, tables).
+    #[serde(default)]
+    pub warmup_s: Option<f64>,
 }
 
 impl BasicCard {
