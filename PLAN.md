@@ -426,7 +426,13 @@ TP2 q+o projections; C4 501 -> 466 / 482). Each projection there ends in a
 cross-device event and a host wait, so a gain needs V4.1's per-layer flow rebuilt
 around device-side flags. The attention-only ceiling is about the DeepSeek V4 Flash
 split (-10%, all experts remote), and less with RTX-resident expert layers, so
-V4.1 keeps its layer split.
+V4.1 keeps its layer split. Measured 2026-10-02 (C1 code, 6-row verify rounds of
+~27 ms): each RTX is busy ~40% (C4 ~47%), the head-splittable work (q_b, sparse
+core, wo_a, wo_b) is ~115 us of a ~170 us attention block per layer, and a 32-head
+core saves only 9 of 24 us. With KV replicas, peer inputs and the exchange, a
+V4-style split projects +2-4% C1, ~0-2% C4, less at C16, and the replicated 14M-token
+pool (+5-8 GB per card) costs two RTX expert layers at the release config: not built.
+V4.1's lever is its host-driven layer (route download, Spark collect ~470 us).
 The drafter follows the GPU that owns the last backbone layers (taps and head
 live there); TP2 drafters are ≤1% on DFlash2 and not built unless the P2P
 probe shows ≤15 µs hops; the win is lane B drafting on GPU1 while lane A
