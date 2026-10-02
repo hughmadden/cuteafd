@@ -714,7 +714,10 @@ active admission deferral and active KV paging are separate remaining work.
         Real scheduler/cache cases and cancellation after Spark dispatch also
         pass without late captures or tracked allocation growth. The same
         full-model matrix also passes with the single-copy FP8 bundle on both
-        layouts. Clean-binary throughput/latency gates remain pending;
+        layouts. Clean-binary throughput/latency gates now pass three
+        interleaved serial/paired comparisons on each reference layout,
+        preserving C1 outputs and steady graph captures. The measured cohort
+        includes cold request prefills; it is not sustained C16 decode.
         HTTP transport and MTP pairing are outside this gate.
      i. V4 / V4.1 turn-end prefix-cache restore not byte-exact (reported,
         not gated). V4 Flash also differs across repeated uncached solo
@@ -789,7 +792,9 @@ active admission deferral and active KV paging are separate remaining work.
    A private candidate pairs adjacent 1–2047-row requests without changing
    their kernel row partitions. Larger chunks and MTP keep the existing
    path. Queue, placement and memory-admission checks pass in the composed
-   workspace; GPU exactness and throughput gates remain pending.
+   workspace. Full-model exactness passes in checkpoint and single-copy FP8
+   modes on both reference layouts; clean-binary emitted throughput and
+   per-request latency also pass three interleaved comparisons per layout.
 6. **RTX 5090 audit and claim**: hard-coded `4*188` grid clamps and the
    per-tensor FP8 GEMM grid sized for 188 SMs; one SM120 build must serve both.
    `6d4ea7a` derives expert quantizer grids from each engine's GPU and removes
