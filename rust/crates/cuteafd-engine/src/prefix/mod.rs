@@ -6,6 +6,7 @@
 //! Families plug in through [`PrefixFamily`]; [`PrefixCache`] does lookup, fork, restore,
 //! capture, eviction and the pinned host tier (`cuteafd-hostcache`, generalized by
 //! [`FamilyLayout::host_layout`], pages identified by a 64-token hash chain).
+mod admission;
 mod cache;
 mod chain;
 mod entry;
@@ -16,6 +17,7 @@ mod points;
 #[cfg(test)]
 mod tests;
 
+pub use admission::{AdmissionPoll, DeferredAdmission};
 pub use cache::{Admitted, Hit, HostPayload, PrefixCache, PrefixConfig, PrefixError, PrefixStats, Source};
 pub use chain::{content_id, page_chain, CONTENT_CLASS};
 pub use cuteafd_core::prefix::{ReuseRule, SnapshotKind};
