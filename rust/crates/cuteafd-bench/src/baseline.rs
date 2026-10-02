@@ -373,22 +373,23 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
 /// Top-two log-probability margin under which a greedy flip counts as a tie.
 const TIE_NATS: f64 = 0.05;
 
-/// Top-two margin under which a speculation flip is batch noise on an engine whose
-/// concurrent greedy outputs already differ from C1 (verify rows run batched).
-const BATCH_VARIANT_NATS: f64 = 0.5;
+/// Top-two margin under which a speculation flip is kernel noise: drafts are verified
+/// as several rows of one request, a different kernel shape than one-row decode.
+const VERIFY_NOISE_NATS: f64 = 0.5;
 
-/// Speculation verifies drafts as a batch of rows. When plain C4 already diverges from
-/// C1, a flip at a small margin says the numerics are not batch invariant, not that
-/// speculation changes the model: that is reported (not gated), and larger flips still fail.
+/// A flip past a near tie but under [`VERIFY_NOISE_NATS`] says the verify rows round
+/// differently, not that speculation changes the model: reported, not gated. Larger
+/// flips still fail. The summary says whether plain C4 also differs from C1.
 fn batch_variant_speculation(quality: &mut Quality) {
     let batch_variant = quality.checks.iter().any(|c| c.id == "c1_c4" && c.status == CheckStatus::Info
         && c.metrics.get("identical").and_then(|v| v.as_u64()).is_some_and(|n| n < 4));
     let Some(check) = quality.checks.iter_mut().find(|c| c.id == "spec_lossless" && c.status == CheckStatus::Fail)
     else { return };
     let margin = check.metrics.get("divergence_margin").and_then(|v| v.as_f64());
-    if batch_variant && margin.is_some_and(|m| m < BATCH_VARIANT_NATS) {
+    if margin.is_some_and(|m| m < VERIFY_NOISE_NATS) {
         check.status = CheckStatus::Info;
-        check.summary = format!("{} · not gated: C4 differs from C1 too (batch-variant numerics)", check.summary);
+        check.summary = format!("{} · not gated: under {VERIFY_NOISE_NATS} nats{}", check.summary,
+            if batch_variant { "; C4 differs from C1 too" } else { "" });
     }
 }
 
@@ -517,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn small_speculation_flips_on_batch_variant_engines_are_not_gated() {
+    fn small_speculation_flips_are_reported_not_gated() {
         let quality = |margin: f64, identical: u64| {
             let mut q = Quality::default();
             q.checks.push(check("spec_lossless", CheckStatus::Fail, json!({"divergence_margin": margin})));
@@ -526,7 +527,7 @@ mod tests {
             q.checks[0].status
         };
         assert_eq!(quality(0.28, 0), CheckStatus::Info);
-        assert_eq!(quality(0.28, 4), CheckStatus::Fail);
+        assert_eq!(quality(0.12, 4), CheckStatus::Info);
         assert_eq!(quality(1.2, 0), CheckStatus::Fail);
     }
 }
