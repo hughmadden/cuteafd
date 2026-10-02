@@ -677,7 +677,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 }
                 let timer = Instant::now();
                 let drafts = drafter.draft(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
-                    engine.weights.head.buffer.ptr);
+                    engine.head());
                 let ms = timer.elapsed().as_secs_f64() * 1e3;
                 cost.observe_draft(ms);
                 draft_s += ms / 1e3;

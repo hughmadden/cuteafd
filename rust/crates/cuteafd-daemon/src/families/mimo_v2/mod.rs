@@ -7,6 +7,7 @@ pub(crate) mod mtp;
 pub(crate) mod prefix;
 pub(crate) mod serve;
 pub(crate) mod weights;
+mod head;
 mod split;
 mod teardown;
 #[cfg(test)]
@@ -125,11 +126,12 @@ pub(crate) struct EngineArgs {
     /// FP8 release's served numerics).
     #[arg(long)]
     pub prefill_w8a16: bool,
-    /// Decode steps of <= 16 rows read an E4M3 copy of the LM head (per row x 128-K scales).
+    /// Store only E4M3 LM-head values/scales and use them for every target,
+    /// MTP and drafter row shape; false stores only BF16.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub fp8_head: bool,
-    /// With --fp8-decode, also an E4M3 copy of o_proj (BF16 in the checkpoint,
-    /// quantized per row and 128-K block at load).
+    /// Store only E4M3 o_proj values/scales for every prefill/decode/verify
+    /// shape; false stores only BF16. Prefill activations remain BF16.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub fp8_o_proj: bool,
     /// Decode and verify steps replay one captured CUDA graph per layer segment
@@ -152,8 +154,7 @@ pub(crate) struct EngineArgs {
 pub(crate) enum DraftRepresentationArg {
     Bf16Only,
     Fp8Only,
-    /// Preserve BF16 FC and complete QKV; pack only o_proj/gate-up/down.
-    Bf16Context,
+
 }
 
 impl EngineArgs {
@@ -163,13 +164,9 @@ impl EngineArgs {
                 ensure!(self.draft_fp8, "--draft-representation fp8-only conflicts with --draft-fp8 false; use bf16-only");
                 Ok(MimoDraftRepresentation::Fp8Only)
             }
-            Some(DraftRepresentationArg::Bf16Context) => {
-                ensure!(self.draft_fp8, "--draft-representation bf16-context includes FP8 matrices and conflicts with --draft-fp8 false; use bf16-only");
-                Ok(MimoDraftRepresentation::Bf16Context)
-            }
             Some(DraftRepresentationArg::Bf16Only) => Ok(MimoDraftRepresentation::Bf16Only),
             None if !self.draft_fp8 => Ok(MimoDraftRepresentation::Bf16Only),
-            None => Ok(MimoDraftRepresentation::LegacyDual),
+            None => Ok(MimoDraftRepresentation::Fp8Only),
         }
     }
 
@@ -179,8 +176,10 @@ impl EngineArgs {
     }
 
     fn validate_draft_replay(&self, replay: bool) -> Result<()> {
-        ensure!(!replay || matches!(self.draft_storage()?,MimoDraftRepresentation::Bf16Only | MimoDraftRepresentation::LegacyDual),
+        ensure!(!replay || self.draft_storage()? == MimoDraftRepresentation::Bf16Only,
             "--draft-replay compares complete BF16 weights; load --draft-representation bf16-only separately from a candidate with immutable FP8 matrices");
+        ensure!(!replay || !self.fp8_head,
+            "--draft-replay requires a separately loaded BF16 target head (--fp8-head false); FP8-only storage has no BF16 fallback");
         Ok(())
     }
 }
@@ -203,10 +202,10 @@ mod draft_storage_tests {
 
     #[test]
     fn bf16_diagnostics_keep_complete_single_copy_storage() {
-        let args = args(&["--draft-fp8", "false"]);
+        let args = args(&["--draft-fp8", "false", "--fp8-head", "false"]);
         assert_eq!(args.draft_storage().unwrap(), MimoDraftRepresentation::Bf16Only);
         args.validate_draft_replay(true).unwrap();
-        let args = self::args(&["--draft-representation", "bf16-only"]);
+        let args = self::args(&["--draft-representation", "bf16-only", "--fp8-head", "false"]);
         assert_eq!(args.draft_storage().unwrap(), MimoDraftRepresentation::Bf16Only);
         args.validate_draft_replay(true).unwrap();
     }
@@ -228,15 +227,7 @@ mod draft_storage_tests {
             context_slots: 20, max_batch_sequences: 16, block_rows: 128,
         });
     }
-    #[test]
-    fn bf16_context_is_immutable_and_requires_its_fp8_matrices() {
-        let args = args(&["--draft-representation","bf16-context"]);
-        assert_eq!(args.draft_storage().unwrap(),MimoDraftRepresentation::Bf16Context);
-        args.validate_draft_replay(false).unwrap();
-        assert!(args.validate_draft_replay(true).unwrap_err().to_string().contains("bf16-only separately"));
-        let args = self::args(&["--draft-representation","bf16-context","--draft-fp8","false"]);
-        assert!(open(&args).err().unwrap().to_string().contains("conflicts with --draft-fp8 false"));
-    }
+
 }
 
 /// `--kv-cache` values.
@@ -383,6 +374,26 @@ impl Opened {
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         let split_device = split::requested_device(&self.cfg, args.device, args.split_device,
             |name| programs.spec(name).is_ok())?;
+        if args.fp8_head {
+            let name = format!("{}_head_fp8", self.cfg.program_family()?);
+            let spec = programs.spec(&name).with_context(|| format!(
+                "FP8-only MiMo target head requires {name}; export the16-row head program before loading weights"))?;
+            ensure!(spec.capacity_rows >= head::FP8_HEAD_ROWS as u32 && spec.pointers == ["x", "w_fp8", "scale", "logits"],
+                "{name}: FP8-only head requires capacity16 and x,w_fp8,scale,logits operands");
+        }
+        if args.fp8_o_proj {
+            let mut geometries = vec![self.cfg.program_family()?];
+            if split_device.is_some() { geometries.push(self.cfg.head_split(2)?.program_family()?); }
+            for geometry in geometries {
+                for (cap, scale) in [("m64", "w_o_scale"), ("m4096", "w_o_kscale")] {
+                    let name = format!("{geometry}_o_w8_{cap}");
+                    let spec = programs.spec(&name).with_context(|| format!(
+                        "FP8-only MiMo o_proj requires {name}; export fp8_only output siblings before loading weights"))?;
+                    ensure!(spec.pointers == ["attn", "w_o_fp8", scale, "out", "scratch"],
+                        "{name}: FP8-only output ABI must contain no BF16 w_o operand");
+                }
+            }
+        }
         let preflight = admission::preflight(self, args, &programs, split_device, serving, prefill_output)?;
         // Module allocation is checked against its provisional bound before
         // tensors. It does not qualify later capture or constraint demand.
@@ -418,7 +429,7 @@ impl Opened {
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::MimoLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
-            checkpoint_tp: cuteafd_loader::families::mimo_v2::checkpoint_tp(&args.snapshot)?, fp8_decode: args.fp8_decode,
+            checkpoint_tp: cuteafd_loader::families::mimo_v2::checkpoint_tp(&args.snapshot)?,
             fp8_head: args.fp8_head, fp8_o_proj: args.fp8_o_proj, fp8_scales: args.fp8_scales, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream }).collect() };
         let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
@@ -453,7 +464,7 @@ impl Opened {
             None
         };
         let bytes: usize = model.layers.iter().map(|l| l.bytes()).sum::<usize>() + model.norm.buffer.bytes
-            + model.head.buffer.bytes + model.head_fp8.as_ref().map_or(0, |(q, s)| q.buffer.bytes + s.buffer.bytes);
+            + model.head.bytes();
         let peer_bytes: usize = shares.iter().flatten().map(|l| l.bytes()).sum();
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64,
             gib = format!("{:.2}", bytes as f64 / (1u64 << 30) as f64),
@@ -462,6 +473,7 @@ impl Opened {
         let mut engine = engine::MimoEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages, args.rings, embedding, args.kv_cache.into(), prefill_output)?;
         engine.prefill_w8a8 = !args.prefill_w8a16;
+        engine.output_fp8_decode = args.fp8_decode;
         engine.decode_graphs = args.decode_graphs;
         {
             use cuteafd_loader::families::mimo_v2::MimoAttention;
@@ -491,18 +503,8 @@ impl Opened {
                 .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
             let capacity = args.draft_capacity(cfg.block)?;
             let representation = args.draft_storage()?;
-            let mut drafter = dflash::MimoDrafter::load(&self.library, dir, file, stream, capacity.context_slots,
+            let drafter = dflash::MimoDrafter::load(&self.library, dir, file, stream, capacity.context_slots,
                 capacity.max_batch_sequences, mask, representation, args.fp8_scales)?;
-            if representation == MimoDraftRepresentation::LegacyDual && args.draft_fp8 {
-                if let Err(error) = drafter.enable_fp8(engine.weights.head.buffer.ptr, args.fp8_scales) {
-                    // Packing borrows drafter BF16 matrices AND the target head.
-                    // Failed initialization cannot guarantee stream completion;
-                    // retain all source/destination owners until process teardown.
-                    std::mem::forget(drafter);
-                    std::mem::forget(engine);
-                    return Err(error.context("DFlash legacy initialization owners quarantined"));
-                }
-            }
             engine.drafter = Some(drafter);
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash drafter resident");
         }
@@ -706,7 +708,7 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
             Ok(taps)
         };
         return crate::families::glm5::dflash::replay(drafter, &tokens, &greedy, &taps,
-            &|t| engine.embedding.host_rows(t), engine.weights.head.buffer.ptr, start);
+            &|t| engine.embedding.host_rows(t), engine.weights.head.bf16_ptr()?, start);
     }
     if let Some(dir) = &args.mtp_oracle {
         return mtp_oracle(args, opened, engine, dir);
@@ -969,7 +971,7 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<
         let anchor = tokens[position];
         let timer = Instant::now();
         let draft = drafter.draft(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
-            &engine.embedding, engine.weights.head.buffer.ptr)?.remove(0);
+            &engine.embedding, engine.head())?.remove(0);
         draft_seconds += timer.elapsed().as_secs_f64();
         let reference = &ref_tokens[index * drafts_per..][..drafts_per];
         exact += usize::from(draft.tokens == reference);
@@ -1004,10 +1006,10 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<
     for sequences in 1..=drafter.max_batch_sequences() {
         let seqs: Vec<_> = (0..sequences).map(|slot| dflash::DraftSeq { slot, anchor: tokens[position], position, valid_from: 0 })
             .collect();
-        drafter.draft(&seqs, &engine.embedding, engine.weights.head.buffer.ptr)?;
+        drafter.draft(&seqs, &engine.embedding, engine.head())?;
         let timer = Instant::now();
         for _ in 0..10 {
-            drafter.draft(&seqs, &engine.embedding, engine.weights.head.buffer.ptr)?;
+            drafter.draft(&seqs, &engine.embedding, engine.head())?;
         }
         let per = timer.elapsed().as_secs_f64() * 1e2;
         let timer = Instant::now();

@@ -1,16 +1,12 @@
 //! Immutable MiMo DFlash storage and its device-loading contract.
-//! The target owns the BF16 vocabulary head; single-copy drafters borrow it.
+//! The target owns the selected vocabulary-head format; drafters borrow it.
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MimoDraftRepresentation {
     Bf16Only,
     Fp8Only,
-    /// BF16 FC and complete QKV matrices; FP8 o_proj, gate/up and down.
-    /// Every matrix owns one representation and the target head is borrowed.
-    Bf16Context,
-    /// Unchanged private qualification baseline, not a single-copy mode.
-    LegacyDual,
+
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,12 +68,71 @@ pub struct MimoDraftWeightLayout {
     pub fp8_scales: u64,
     /// Norms, sinks and trained mask row, always BF16.
     pub small_bf16: u64,
-    /// Only the legacy baseline owns a packed copy of the target head.
+    /// Always zero: both immutable modes borrow the target head.
     pub head_fp8_values: u64,
     pub head_fp8_scales: u64,
     /// One BF16 source matrix while packing FP8-only storage. Packing is
     /// drained before this allocation is released or the next matrix loads.
     pub max_load_staging: u64,
+}
+
+/// Native FP8 scratch query for a selected operand shape, `[rows,k] @ [n,k]`.
+/// Shape metadata owns no weights and does not allocate or load a module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MimoDraftLinearShape {
+    pub k: u64,
+    pub n: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MimoDraftFp8ScratchLayout {
+    pub rows: usize,
+    pub shapes: Vec<MimoDraftLinearShape>,
+}
+
+/// One immutable drafter mode's weight/loading and FP8 scratch contracts.
+/// Ring/activation/attention arenas still use `capacity` and native queries;
+/// BF16-only modes never query or allocate FP8 scratch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MimoDraftRuntimeLayout {
+    pub capacity: MimoDraftCapacity,
+    pub weights: MimoDraftWeightLayout,
+    pub fp8_scratch: Option<MimoDraftFp8ScratchLayout>,
+}
+
+impl MimoDraftRuntimeLayout {
+    pub fn new(
+        geometry: MimoDraftGeometry,
+        mode: MimoDraftRepresentation,
+        capacity: MimoDraftCapacity,
+        tap_rows: usize,
+        _legacy_fp8_rows: usize,
+    ) -> Result<Self, MimoDraftStorageError> {
+        if tap_rows == 0 {
+            return Err(MimoDraftStorageError::Unsupported("drafter scratch needs positive row capacity"));
+        }
+        let weights = MimoDraftWeightLayout::new(geometry, mode)?;
+        let h = geometry.hidden;
+        let attention = mul(geometry.heads, geometry.head_dim)?;
+        let kv = mul(geometry.kv_heads, geometry.head_dim)?;
+        let taps = mul(geometry.taps, h)?;
+        let qkv = add(attention, mul(2, kv)?)?;
+        let shapes = vec![
+            MimoDraftLinearShape { k: taps, n: h },
+            MimoDraftLinearShape { k: h, n: qkv },
+            MimoDraftLinearShape { k: h, n: mul(2, kv)? },
+            MimoDraftLinearShape { k: attention, n: h },
+            MimoDraftLinearShape { k: h, n: mul(2, geometry.intermediate)? },
+            MimoDraftLinearShape { k: geometry.intermediate, n: h },
+        ];
+        let fp8_scratch = match mode {
+            MimoDraftRepresentation::Bf16Only => None,
+            MimoDraftRepresentation::Fp8Only => Some(MimoDraftFp8ScratchLayout {
+                rows: tap_rows.max(capacity.block_rows), shapes,
+            }),
+        };
+        Ok(Self { capacity, weights, fp8_scratch })
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -144,17 +199,9 @@ impl MimoDraftWeightLayout {
                     mul(values / 128, 4)?.max(256),
                 ))
             };
-        let layer = layer_shapes
-            .into_iter()
-            .enumerate()
-            .map(|(index, shape)| {
-                matrix(
-                    shape,
-                    uses_fp8 && !(mode == MimoDraftRepresentation::Bf16Context && index == 0),
-                )
-            })
+        let layer = layer_shapes.into_iter().map(|shape| matrix(shape, uses_fp8))
             .collect::<Result<Vec<_>, _>>()?;
-        let fc_bytes = matrix(fc, uses_fp8 && mode != MimoDraftRepresentation::Bf16Context)?;
+        let fc_bytes = matrix(fc, uses_fp8)?;
         let own = |index: usize| -> Result<u64, MimoDraftStorageError> {
             let get = |m: &(u64, u64, u64)| match index {
                 0 => m.0,
@@ -162,11 +209,6 @@ impl MimoDraftWeightLayout {
                 _ => m.2,
             };
             add(get(&fc_bytes), mul(g.layers, sum(layer.iter().map(get))?)?)
-        };
-        let context_bf16 = add(fc_bytes.0, mul(g.layers, layer[0].0)?)?;
-        let rest = |index: usize| -> Result<u64, MimoDraftStorageError> {
-            let get = |m: &(u64, u64, u64)| if index == 1 { m.1 } else { m.2 };
-            mul(g.layers, sum(layer[1..].iter().map(get))?)
         };
         let small_per_layer = sum([
             mul(2, mul(g.hidden, 2)?.max(256))?,
@@ -181,31 +223,22 @@ impl MimoDraftWeightLayout {
             mul(g.layers, small_per_layer)?,
             mul(3, mul(g.hidden, 2)?.max(256))?,
         )?;
-        let (head_fp8_values, head_fp8_scales) = if mode == MimoDraftRepresentation::LegacyDual {
-            let (_, values, scales) = matrix((g.vocab, g.hidden), true)?;
-            (values, scales)
-        } else {
-            (0, 0)
-        };
         Ok(Self {
             bf16_values: match mode {
                 MimoDraftRepresentation::Fp8Only => 0,
-                MimoDraftRepresentation::Bf16Context => context_bf16,
                 _ => own(0)?,
             },
             fp8_values: match mode {
                 MimoDraftRepresentation::Bf16Only => 0,
-                MimoDraftRepresentation::Bf16Context => rest(1)?,
                 _ => own(1)?,
             },
             fp8_scales: match mode {
                 MimoDraftRepresentation::Bf16Only => 0,
-                MimoDraftRepresentation::Bf16Context => rest(2)?,
                 _ => own(2)?,
             },
             small_bf16,
-            head_fp8_values,
-            head_fp8_scales,
+            head_fp8_values: 0,
+            head_fp8_scales: 0,
             max_load_staging: match mode {
                 MimoDraftRepresentation::Fp8Only => layer
                     .iter()
@@ -213,9 +246,6 @@ impl MimoDraftWeightLayout {
                     .chain([fc_bytes.0])
                     .max()
                     .unwrap_or(0),
-                MimoDraftRepresentation::Bf16Context => {
-                    layer[1..].iter().map(|m| m.0).max().unwrap_or(0)
-                }
                 _ => 0,
             },
         })
@@ -253,10 +283,37 @@ mod tests {
             sinks: true,
         }
     }
+
+    #[test]
+    fn selected_runtime_layout_covers_wide_updates_and_independent_slots() {
+        let capacity = MimoDraftCapacity::new(20, 16, 8).unwrap();
+        for mode in [MimoDraftRepresentation::Fp8Only] {
+            let layout = MimoDraftRuntimeLayout::new(pro(), mode, capacity, 1024, 128).unwrap();
+            let scratch = layout.fp8_scratch.unwrap();
+            assert_eq!(scratch.rows, 1024);
+            assert_eq!(scratch.shapes.len(), 6);
+            assert!(scratch.shapes.contains(&MimoDraftLinearShape { k: 30_720, n: 6144 }));
+            assert!(scratch.shapes.contains(&MimoDraftLinearShape { k: 6144, n: 2048 }));
+            assert!(!scratch.shapes.iter().any(|shape| shape.n == 152_576));
+            assert_eq!(layout.capacity.context_slots, 20);
+            assert_eq!(layout.capacity.block_rows, 128);
+            assert_eq!(layout.weights.max_load_staging, 402_653_184);
+        }
+        let bf16 = MimoDraftRuntimeLayout::new(pro(), MimoDraftRepresentation::Bf16Only, capacity, 1024, 0).unwrap();
+        assert!(bf16.fp8_scratch.is_none());
+        assert_eq!(bf16.weights.max_load_staging, 0);
+
+    }
+
+    #[test]
+    fn runtime_scratch_admits_larger_supported_draft_batches() {
+        let capacity = MimoDraftCapacity::new(200, 160, 8).unwrap();
+        let layout = MimoDraftRuntimeLayout::new(pro(), MimoDraftRepresentation::Fp8Only, capacity, 1024, 128).unwrap();
+        assert_eq!(layout.fp8_scratch.unwrap().rows, 1280);
+        assert!(MimoDraftRuntimeLayout::new(pro(), MimoDraftRepresentation::Fp8Only, capacity, 0, 128).is_err());
+    }
     #[test]
     fn pro_single_copy_counts_and_one_matrix_loading_peak() {
-        let legacy =
-            MimoDraftWeightLayout::new(pro(), MimoDraftRepresentation::LegacyDual).unwrap();
         let fp8 = MimoDraftWeightLayout::new(pro(), MimoDraftRepresentation::Fp8Only).unwrap();
         let bf16 = MimoDraftWeightLayout::new(pro(), MimoDraftRepresentation::Bf16Only).unwrap();
         assert_eq!(bf16.bf16_values, 5_536_481_280);
@@ -270,10 +327,6 @@ mod tests {
         assert_eq!(
             bf16.fp8_values + bf16.fp8_scales + bf16.head_fp8_values + bf16.max_load_staging,
             0
-        );
-        assert_eq!(
-            legacy.resident_bytes().unwrap() - fp8.resident_bytes().unwrap(),
-            6_503_202_816
         );
         assert_eq!(
             fp8.loading_peak_bytes().unwrap(),
@@ -294,30 +347,6 @@ mod tests {
         assert!(MimoDraftCapacity::new(20, 0, 8).is_err());
         assert!(MimoDraftCapacity::new(20, 16, 1).is_err());
         assert!(MimoDraftCapacity::new(2_097_153, 16, 8).is_err());
-    }
-    #[test]
-    fn bf16_context_keeps_one_copy_of_each_complete_matrix() {
-        let layout =
-            MimoDraftWeightLayout::new(pro(), MimoDraftRepresentation::Bf16Context).unwrap();
-        let legacy =
-            MimoDraftWeightLayout::new(pro(), MimoDraftRepresentation::LegacyDual).unwrap();
-        assert_eq!(layout.bf16_values, 1_509_949_440);
-        assert_eq!(layout.fp8_values, 2_013_265_920);
-        assert_eq!(layout.fp8_scales, 62_914_560);
-        assert_eq!(layout.head_fp8_values + layout.head_fp8_scales, 0);
-        assert_eq!(layout.max_load_staging, 402_653_184);
-        assert_eq!(
-            legacy.resident_bytes().unwrap() - layout.resident_bytes().unwrap(),
-            5_771_821_056
-        );
-        let mut geometry = pro();
-        geometry.intermediate = 128;
-        geometry.taps = 32;
-        // A persistent BF16 FC must not be counted again as temporary FP8
-        // packing storage. The only large packed matrix is o_proj here.
-        let layout =
-            MimoDraftWeightLayout::new(geometry, MimoDraftRepresentation::Bf16Context).unwrap();
-        assert_eq!(layout.max_load_staging, 201_326_592);
     }
     #[test]
     fn reject_overflow_and_fp8_alignment_but_preserve_bf16_geometry() {

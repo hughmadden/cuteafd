@@ -24,6 +24,7 @@
 //! captured graph per layer segment between the Spark exchanges
 //! ([`MimoEngine::decode_layers`]), every 1..=64-row shape captured at startup.
 use super::weights::{MimoLayer, MimoWeights};
+use super::head::BorrowedHead;
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
 use crate::shared::launch_grid::Fp8QuantizeGrid;
@@ -395,6 +396,8 @@ pub(crate) struct MimoEngine<'a> {
     /// row and 128-K block, the official FP8 release's served numerics); false:
     /// W8A16 (bitwise the former BF16 prefill over dequantized weights).
     pub prefill_w8a8: bool,
+    /// Kernel/activation choice over the same immutable FP8 output weight.
+    pub output_fp8_decode: bool,
     /// KV record format of every layer (and the MTP rings).
     kv_cache: MimoKvCache,
     /// Decode and verify steps replay one captured graph per layer segment
@@ -480,7 +483,8 @@ impl<'a> MimoEngine<'a> {
             expert_input: ExpertInput::Fp8,
             profile: RefCell::new([0.0; 2]),
             wave_timing: std::env::var("CUTEAFD_MIMO_WAVE_TIMING").is_ok_and(|v| v == "1"), drafter: None, mtp: None, l2: None, embedding,
-            mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20)?, 0)), prefill_w8a8: true, kv_cache,
+            mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20)?, 0)), prefill_w8a8: true,
+            output_fp8_decode: true, kv_cache,
             decode_graphs: false, graphs: RefCell::new(HashMap::new()), late_captures: Cell::new(0) })
     }
 
@@ -611,6 +615,13 @@ impl<'a> MimoEngine<'a> {
 
     pub fn has_experts(&self) -> bool {
         self.experts.is_some()
+    }
+
+    /// Borrows the immutable target head, including its exact native layout.
+    /// Every queued head launch is drained while the engine still owns it.
+    pub fn head(&self) -> BorrowedHead<'_, 'a> {
+        BorrowedHead { weight: &self.weights.head, programs: self.programs, family: self.family,
+            hidden: self.cfg.hidden, vocab: self.cfg.vocab_size }
     }
 
     fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
@@ -939,13 +950,7 @@ impl<'a> MimoEngine<'a> {
             }
             return Ok(None);
         }
-        // SAFETY: the last row lies inside the final norm's output of lane 1.
-        let x = unsafe { w[1].x.buffer.ptr.cast::<u8>().add((t[1] - 1) * self.cfg.hidden * 2) }.cast::<c_void>();
-        // SAFETY: the final norm's output and the head operands are live buffers of these shapes.
-        unsafe {
-            w[1].head.as_ref().context("LM head")?.launch(x.cast(), self.weights.head.buffer.ptr.cast(),
-                w[1].logits.buffer.ptr.cast(), 1, self.stream)?;
-        }
+        self.launch_head(w[1], t[1], 1, false)?;
         let vocab = self.cfg.vocab_size;
         Ok(Some(DeviceLogits { ptr: w[1].logits.buffer.ptr, rows: 1, vocab, stride: vocab, stream: self.stream,
             greedy: None }))
@@ -1150,23 +1155,12 @@ impl<'a> MimoEngine<'a> {
         Ok(Some(self.device_logits(w, logit_rows, false)))
     }
 
-    /// Logits of the last `n` of `t` rows of the final norm's output: the E4M3 head
-    /// program for decode steps of up to `FP8_ROWS` rows, the cuBLAS head otherwise.
-    fn launch_head(&self, w: &Workspace<'_>, t: usize, n: usize, decode: bool) -> Result<()> {
+    /// Logits of the last `n` of `t` final-norm rows, always through the
+    /// immutable head representation. FP8 partitions rows into16-row launches.
+    fn launch_head(&self, w: &Workspace<'_>, t: usize, n: usize, _decode: bool) -> Result<()> {
         ensure!(n <= t && n <= w.logits_rows, "head exceeds admitted logits rows");
-        // SAFETY: the rows start inside the final norm's output.
-        let x = unsafe { w.x.buffer.ptr.cast::<u8>().add((t - n) * self.cfg.hidden * 2) }.cast::<c_void>();
-        match &self.weights.head_fp8 {
-            Some((q, scale)) if decode && n <= FP8_ROWS as usize => {
-                self.run("mimo_head_fp8", &[("x", x), ("w_fp8", q.buffer.ptr), ("scale", scale.buffer.ptr),
-                    ("logits", w.logits.buffer.ptr)], &[Scalar::I32(n as i32)])
-            }
-            // SAFETY: the final norm's output and the head operands are live buffers of these shapes.
-            _ => unsafe {
-                w.head.as_ref().context("LM head")?.launch(x.cast(), self.weights.head.buffer.ptr.cast(),
-                    w.logits.buffer.ptr.cast(), n as u32, self.stream)
-            },
-        }
+        let x = Self::region(&w.x, (t - n) *self.cfg.hidden *2, n *self.cfg.hidden *2);
+        self.head().launch(w.head.as_ref(), x, w.logits.buffer, n, self.stream)
     }
 
     /// `bytes` at `offset` inside `dev`.
@@ -1829,17 +1823,7 @@ impl<'a> MimoEngine<'a> {
         self.norm(w, stage.final_norm.buffer.ptr, 1, rows)?;
         let Some(members) = members else { return Ok(()) };
         ensure!(members.len() == groups.len(), "a member per drafting group");
-        match &self.weights.head_fp8 {
-            Some((q, scale)) if t <= FP8_ROWS as usize => {
-                self.run("mimo_head_fp8", &[("x", w.x.buffer.ptr), ("w_fp8", q.buffer.ptr), ("scale", scale.buffer.ptr),
-                    ("logits", w.logits.buffer.ptr)], &[rows])?;
-            }
-            // SAFETY: the final norm's output and the head operands are live buffers of these shapes.
-            _ => unsafe {
-                w.head.as_ref().context("LM head")?.launch(w.x.buffer.ptr.cast(), self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(),
-                    t as u32, self.stream)?;
-            },
-        }
+        self.launch_head(w, t, t, true)?;
         let region = |dev: &Dev<'_>, offset: usize, bytes: usize| cuteafd_ffi::CuteafdDeviceBuffer {
             // SAFETY: callers pass offsets inside the allocation.
             ptr: unsafe { dev.buffer.ptr.cast::<u8>().add(offset) }.cast(), bytes, ..dev.buffer };
@@ -1934,6 +1918,14 @@ impl<'a> MimoEngine<'a> {
         if part != 2 {
             return Ok(());
         }
+        if layer.has("w_o_fp8") {
+            let pointers = [("attn", w.attn.buffer.ptr), ("w_o_fp8", layer.ptr("w_o_fp8")?),
+                scale("w_o", decode, layer)?, ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)];
+            // Prefill retains BF16 activations. A8 output activations are a
+            // separate arithmetic/quality gate, independent of QKV/FFN flags.
+            let scalars = [rows, Scalar::I32(if decode && self.output_fp8_decode { FP8_DECODE_ROWS } else { 0 })];
+            return self.run_on(rank, split, &format!("mimo_o_w8_{cap}"), &pointers, &scalars);
+        }
         let mut pointers = vec![("attn", w.attn.buffer.ptr), ("w_o", layer.ptr("w_o")?)];
         if decode {
             pointers.extend([("w_o_fp8", layer.ptr_or("w_o_fp8", "w_o")?), ("w_o_scale", layer.ptr_or("w_o_scale", "w_o")?)]);
@@ -1969,10 +1961,7 @@ impl<'a> MimoEngine<'a> {
             Some(next) => crate::shared::l2_prefetch::operands(&["input_norm", "w_qkv", "sinks", "w_o", "post_norm",
                 "w_router", "w_hilo", "gate.bias", "w_gate_up", "w_down"], |n| next.range(n)),
             None => {
-                let head = match &self.weights.head_fp8 {
-                    Some((q, scale)) => vec![q, scale],
-                    None => vec![&self.weights.head],
-                };
+                let head = self.weights.head.allocations();
                 std::iter::once(&self.weights.norm).chain(head).map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes))
                     .collect()
             }

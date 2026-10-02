@@ -20,10 +20,11 @@ use crate::shared::memory::DeviceAllocation;
 use crate::shared::token_io::TokenEmbedding;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
+use super::head::BorrowedHead;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::{read_safetensors_metadata, SafetensorsTensorMetadata};
 use cuteafd_loader::families::mimo_v2::draft_representation::{
-    MimoDraftCapacity, MimoDraftGeometry, MimoDraftRepresentation, MimoDraftWeightLayout,
+    MimoDraftCapacity, MimoDraftGeometry, MimoDraftRepresentation, MimoDraftRuntimeLayout, MimoDraftWeightLayout,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -137,12 +138,33 @@ impl DflashConfig {
         (self.heads + 2 * self.kv_heads) * self.head_dim
     }
 
-    pub fn weight_layout(&self, mode: MimoDraftRepresentation) -> Result<MimoDraftWeightLayout> {
-        Ok(MimoDraftWeightLayout::new(MimoDraftGeometry { hidden: self.hidden as u64,
+    fn weight_geometry(&self) -> MimoDraftGeometry {
+        MimoDraftGeometry { hidden: self.hidden as u64,
             intermediate: self.intermediate as u64, layers: self.layers as u64, heads: self.heads as u64,
             kv_heads: self.kv_heads as u64, head_dim: self.head_dim as u64, taps: self.taps.len() as u64,
-            vocab: self.vocab as u64, sinks: self.sinks }, mode)?)
+            vocab: self.vocab as u64, sinks: self.sinks }
     }
+
+    pub fn weight_layout(&self, mode: MimoDraftRepresentation) -> Result<MimoDraftWeightLayout> {
+        Ok(MimoDraftWeightLayout::new(self.weight_geometry(), mode)?)
+    }
+
+    /// The admission consumer and allocator use the same selected mode/rows.
+    pub fn runtime_layout(&self, mode: MimoDraftRepresentation, capacity: MimoDraftCapacity)
+        -> Result<MimoDraftRuntimeLayout> {
+        Ok(MimoDraftRuntimeLayout::new(self.weight_geometry(), mode, capacity, TAP_ROWS, FP8_ROWS)?)
+    }
+}
+
+fn draft_fp8_scratch<'a>(library: &'a NativeLibrary, layout: &MimoDraftRuntimeLayout)
+    -> Result<Option<Dev<'a>>> {
+    layout.fp8_scratch.as_ref().map(|scratch| {
+        let shapes = scratch.shapes.iter().map(|shape| Ok((
+            usize::try_from(shape.k).context("DFlash scratch K width")?,
+            usize::try_from(shape.n).context("DFlash scratch N width")?,
+        ))).collect::<Result<Vec<_>>>()?;
+        fp8_linear::scratch(library, scratch.rows, &shapes)
+    }).transpose()
 }
 
 /// The drafter directory of a MiMo snapshot (`SNAP/dflash`), or `path` itself.
@@ -150,27 +172,10 @@ pub(crate) fn drafter_dir(path: &Path) -> PathBuf {
     if path.join(WEIGHTS).exists() { path.to_path_buf() } else { path.join("dflash") }
 }
 
-/// A matrix owns exactly one resident representation in either single-copy
-/// mode. Only the private legacy A/B baseline can retain both.
+/// A matrix owns exactly one immutable resident representation.
 enum DraftWeight<'a> {
     Bf16(Dev<'a>),
     Fp8(Fp8Weight<'a>),
-    LegacyDual { bf16: Dev<'a>, fp8: Option<Fp8Weight<'a>> },
-}
-
-impl<'a> DraftWeight<'a> {
-    fn pack_legacy(&mut self, library: &'a NativeLibrary, n: usize, k: usize,
-        scales: fp8_linear::Fp8Scales, stream: *mut c_void) -> Result<()> {
-        let Self::LegacyDual { bf16, fp8 } = self else {
-            anyhow::bail!("immutable single-copy DFlash storage cannot add an overlapping FP8 matrix");
-        };
-        *fp8 = Some(Fp8Weight::pack(library, bf16.buffer.ptr, n, k, scales, stream)?);
-        Ok(())
-    }
-
-    fn fp8(&self) -> Option<&Fp8Weight<'a>> {
-        match self { Self::Fp8(w) => Some(w), Self::LegacyDual { fp8, .. } => fp8.as_ref(), _ => None }
-    }
 }
 
 struct DraftLayer<'a> {
@@ -270,11 +275,7 @@ pub(crate) struct MimoDrafter<'a> {
     workspace: RefCell<Option<Workspace<'a>>>,
     representation: MimoDraftRepresentation,
     fp8_workspace: Option<Dev<'a>>,
-    /// Only the legacy baseline owns this copy; single-copy modes borrow the
-    /// target BF16 head at each call, without another resident layout.
-    fp8_head: Option<Fp8Weight<'a>>,
-    /// A diagnostic replay can toggle only the complete legacy baseline.
-    use_fp8: std::cell::Cell<bool>,
+
 }
 
 /// The block rows' mask id: past every table, so the gather takes the mask row.
@@ -392,8 +393,11 @@ impl<'a> MimoDrafter<'a> {
         max_sequences: usize, mask_row: Vec<u8>, representation: MimoDraftRepresentation,
         scales: fp8_linear::Fp8Scales) -> Result<Self> {
         let cfg = DflashConfig::read(dir)?;
-        MimoDraftCapacity::new(slots, max_sequences, cfg.block)?;
-        let weight_layout = cfg.weight_layout(representation)?;
+        ensure!(matches!(representation, MimoDraftRepresentation::Bf16Only | MimoDraftRepresentation::Fp8Only),
+            "MiMo serving supports only immutable bf16-only or fp8-only drafter storage; historical dual/mixed controls are not production modes");
+        let capacity = MimoDraftCapacity::new(slots, max_sequences, cfg.block)?;
+        let runtime_layout = cfg.runtime_layout(representation, capacity)?;
+        let weight_layout = runtime_layout.weights;
         ensure!(mask_row.len() == cfg.hidden * 2, "mask row of {} bytes", mask_row.len());
         let checkpoint = Checkpoint {
             data: file,
@@ -411,11 +415,8 @@ impl<'a> MimoDrafter<'a> {
             Ok(allocation)
         };
         let (h, kv, inter) = (cfg.hidden, cfg.kv_width(), cfg.intermediate);
-        let fp8_workspace = if matches!(representation, MimoDraftRepresentation::Fp8Only | MimoDraftRepresentation::Bf16Context) {
-            Some(fp8_linear::scratch(library, TAP_ROWS.max(max_sequences * cfg.block), &[
-                (cfg.taps.len() * h, h), (h, cfg.qkv_width()), (h, 2 * kv),
-                (cfg.heads * cfg.head_dim, h), (h, 2 * inter), (inter, h),
-            ])?)
+        let fp8_workspace = if representation == MimoDraftRepresentation::Fp8Only {
+            draft_fp8_scratch(library, &runtime_layout)?
         } else { None };
         let tensor = |name: &str, shape: &[usize]| checkpoint.bytes(name, shape).and_then(upload);
         let concat = |parts: &[(&str, usize)], cols: usize| -> Result<Dev<'a>> {
@@ -430,12 +431,10 @@ impl<'a> MimoDrafter<'a> {
             }
             Ok(allocation)
         };
-        let matrix = |source: Dev<'a>, n: usize, k: usize, context_weight: bool| -> Result<DraftWeight<'a>> {
+        let matrix = |source: Dev<'a>, n: usize, k: usize, _context_weight: bool| -> Result<DraftWeight<'a>> {
             match representation {
                 MimoDraftRepresentation::Bf16Only => Ok(DraftWeight::Bf16(source)),
-                MimoDraftRepresentation::LegacyDual => Ok(DraftWeight::LegacyDual { bf16: source, fp8: None }),
-                MimoDraftRepresentation::Bf16Context if context_weight => Ok(DraftWeight::Bf16(source)),
-                MimoDraftRepresentation::Fp8Only | MimoDraftRepresentation::Bf16Context => {
+                MimoDraftRepresentation::Fp8Only => {
                     let packed = Fp8Weight::pack(library, source.buffer.ptr, n, k, scales, stream);
                     // SAFETY: packing reads this live BF16 source on `stream`.
                     // Drain even on packing failure before the source leaves scope.
@@ -496,8 +495,6 @@ impl<'a> MimoDrafter<'a> {
             workspace: RefCell::new(None),
             representation,
             fp8_workspace,
-            fp8_head: None,
-            use_fp8: std::cell::Cell::new(false),
             cfg,
         })
     }
@@ -523,61 +520,16 @@ impl<'a> MimoDrafter<'a> {
         }
     }
 
-    /// Makes E4M3 copies of every GEMM weight and of the target's LM head
-    /// `head` ([vocab, hidden] BF16) and drafts through them from now on (see
-    /// [`crate::families::glm5::dflash::GlmDrafter::enable_fp8`]).
-    pub fn enable_fp8(&mut self, head: *const c_void, scales: fp8_linear::Fp8Scales) -> Result<()> {
-        ensure!(self.representation == MimoDraftRepresentation::LegacyDual,
-            "immutable single-copy DFlash storage cannot enable overlapping FP8 copies");
-        let started = std::time::Instant::now();
-        let (library, stream) = (self.library, self.stream);
-        let c = &self.cfg;
-        let (h, inter, attention) = (c.hidden, c.intermediate, c.heads * c.head_dim);
-        let shapes = [(c.taps.len() * h, h), (h, c.vocab), (h, 2 * c.kv_width()),
-            (h, c.qkv_width()), (attention, h), (h, 2 * inter), (inter, h)];
-        self.fp8_workspace = Some(fp8_linear::scratch(library, FP8_ROWS, &shapes)?);
-        for l in &mut self.layers {
-            l.qkv.pack_legacy(library, c.qkv_width(), h, scales, stream)?;
-            l.o.pack_legacy(library, h, attention, scales, stream)?;
-            l.gate_up.pack_legacy(library, 2 * inter, h, scales, stream)?;
-            l.down.pack_legacy(library, h, inter, scales, stream)?;
-        }
-        self.fc.pack_legacy(library, h, c.taps.len() * h, scales, stream)?;
-        self.fp8_head = Some(Fp8Weight::pack(library, head, c.vocab, h, scales, stream)?);
-        // SAFETY: the packing kernels ran on this stream.
-        unsafe { library.cuda_stream_synchronize(stream)? };
-        let resident: usize = self.fc.fp8().into_iter().chain(self.fp8_head.as_ref())
-            .chain(self.layers.iter().flat_map(|l| [&l.qkv, &l.o, &l.gate_up, &l.down])
-                .filter_map(DraftWeight::fp8)).map(Fp8Weight::bytes).sum();
-        tracing::info!(gib = resident as f64 / (1u64 << 30) as f64, ?scales, elapsed_ms = started.elapsed().as_millis() as u64,
-            "DFlash drafter FP8 copies (and FP8 LM head) resident");
-        self.use_fp8.set(true);
-        Ok(())
-    }
-
-    /// Drafts through the FP8 copies (when made) or the BF16 weights.
-    pub fn set_fp8(&self, on: bool) {
-        // Single-copy storage is immutable. BF16 diagnostics use a separately
-        // loaded Bf16Only instance; the shared replay only toggles LegacyDual.
-        if self.representation == MimoDraftRepresentation::LegacyDual {
-            self.use_fp8.set(on && self.fp8_head.is_some());
-        }
-    }
-
     /// `out` [rows, n] = `x` [rows, k] @ weight rows `first..first+n`.
     /// FP8-only storage covers every row count through the native kernel's
-    /// bounded 64-row chunks. Only the legacy baseline uses a BF16 fallback.
+    /// bounded 64-row chunks. There is no resident BF16 fallback.
     ///
     /// # Safety
     /// Pointers are live device buffers of those shapes.
     #[allow(clippy::too_many_arguments)]
     unsafe fn linear(&self, x: *const c_void, weight: &DraftWeight<'_>, first: usize, out: *mut c_void,
         rows: usize, k: usize, n: usize) -> Result<()> {
-        let fp8 = match weight {
-            DraftWeight::Fp8(w) => Some(w),
-            DraftWeight::LegacyDual { fp8, .. } if self.use_fp8.get() && rows <= FP8_ROWS => fp8.as_ref(),
-            _ => None,
-        };
+        let fp8 = match weight { DraftWeight::Fp8(w) => Some(w), _ => None };
         if let Some(w8) = fp8 {
             let scratch = self.fp8_workspace.as_ref().context("FP8-only DFlash scratch was not admitted")?;
             // SAFETY: the caller's contract; scratch covers each native chunk
@@ -585,7 +537,7 @@ impl<'a> MimoDrafter<'a> {
             return unsafe { w8.apply(self.library, x, out, false, rows, first, n, scratch, self.stream) };
         }
         let bf16 = match weight {
-            DraftWeight::Bf16(w) | DraftWeight::LegacyDual { bf16: w, .. } => w,
+            DraftWeight::Bf16(w) => w,
             DraftWeight::Fp8(_) => anyhow::bail!("FP8-only DFlash has no BF16 fallback"),
         };
         // SAFETY: the selected rows belong to the live BF16 matrix.
@@ -672,18 +624,26 @@ impl<'a> MimoDrafter<'a> {
     /// Drafts `block - 1` tokens after each sequence's anchor, its rows
     /// gathered on the device from the target's embedding table (the mask
     /// rows from the trained mask row); `head` is the target's vocabulary head
-    /// [vocab, hidden] BF16.
-    pub fn draft(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>, head: *const c_void)
+    /// in its immutable BF16 or target row-major FP8 representation.
+    pub fn draft(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>, head: BorrowedHead<'_, '_>)
         -> Result<Vec<Draft>> {
-        self.draft_from(sequences, Anchors::Tokens(embedding), head)
+        ensure!(head.hidden == self.cfg.hidden && head.vocab == self.cfg.vocab,
+            "DFlash borrowed target head geometry differs from its checkpoint");
+        self.draft_from(sequences, Anchors::Tokens(embedding), |plan, x, out, rows|
+            head.launch(Some(plan), x, out, rows, self.stream))
     }
 
     /// [`Self::draft`] from the anchors' embedding rows (oracles and replays).
     pub fn draft_rows(&self, sequences: &[DraftSeq], anchor_rows: &[u8], head: *const c_void) -> Result<Vec<Draft>> {
-        self.draft_from(sequences, Anchors::Rows(anchor_rows), head)
+        self.draft_from(sequences, Anchors::Rows(anchor_rows), |plan, x, out, rows| {
+            // SAFETY: ReplayDrafter's caller retains a complete BF16 target
+            // head. FP8-only targets reject that diagnostic before loading.
+            unsafe { plan.launch(x.ptr.cast(), head.cast(), out.ptr.cast(), rows as u32, self.stream) }
+        })
     }
 
-    fn draft_from(&self, sequences: &[DraftSeq], anchors: Anchors<'_>, head: *const c_void) -> Result<Vec<Draft>> {
+    fn draft_from(&self, sequences: &[DraftSeq], anchors: Anchors<'_>,
+        head: impl FnOnce(&VocabularyHead<'_>, CuteafdDeviceBuffer, CuteafdDeviceBuffer, usize) -> Result<()>) -> Result<Vec<Draft>> {
         let c = &self.cfg;
         let (s_count, block, h) = (sequences.len(), c.block, c.hidden);
         let anchors_fit = match anchors {
@@ -761,11 +721,7 @@ impl<'a> MimoDrafter<'a> {
                 let next = self.layers.get(index + 1).map_or(self.norm.buffer.ptr, |n| n.input_norm.buffer.ptr);
                 l.mimo_dflash_add_norm(w.h.buffer.ptr, w.delta.buffer.ptr, next, w.n.buffer.ptr, rows, h, eps, s)?;
             }
-            match (&self.fp8_head, &self.fp8_workspace) {
-                (Some(head), Some(scratch)) if self.use_fp8.get() && rows <= FP8_ROWS =>
-                    head.apply(l, w.n.buffer.ptr, w.logits.buffer.ptr, true, rows, 0, c.vocab, scratch, s)?,
-                _ => w.head.launch(w.n.buffer.ptr.cast(), head.cast(), w.logits.buffer.ptr.cast(), rows as u32, s)?,
-            }
+            head(&w.head, w.n.buffer, w.logits.buffer, rows)?;
             l.glm_dflash_topk(w.logits.buffer.ptr, w.unary.buffer.ptr, w.candidates.buffer.ptr,
                 w.topk_workspace.buffer.ptr, s_count, block, c.drafts(), c.vocab, s)?;
             l.cuda_stream_synchronize(s)?;
@@ -824,11 +780,12 @@ impl crate::families::glm5::dflash::ReplayDrafter for MimoDrafter<'_> {
     }
 
     fn has_fp8(&self) -> bool {
-        self.representation == MimoDraftRepresentation::LegacyDual && self.fp8_head.is_some()
+        false
     }
 
-    fn set_fp8(&self, on: bool) {
-        MimoDrafter::set_fp8(self, on);
+    fn set_fp8(&self, _on: bool) {
+        // Shared replay's legacy restore hook is inert. This drafter has one
+        // immutable representation and has_fp8() advertises no toggle arm.
     }
 
     fn context(&self, taps: &[u8], first: usize) -> Result<()> {
