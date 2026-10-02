@@ -150,20 +150,22 @@ impl Panel for Reasoning {
             }
         }
         let mut rows: Vec<Value> = Vec::new();
-        for (chunk_index, chunk) in jobs.chunks(8).enumerate() {
+        let width = common::concurrency(ctx.info).clamp(1, 8);
+        for (chunk_index, chunk) in jobs.chunks(width).enumerate() {
             ctx.client.check()?;
             ctx.progress.step(rows.len() as f64 / jobs.len() as f64,
                 format!("{} of {} problems", rows.len(), jobs.len()));
-            let bodies = chunk.iter().map(|&(l, i)| {
+            let bodies: Vec<Value> = chunk.iter().map(|&(l, i)| {
                 let mut body = json!({"messages": common::messages(&format!("{}\nGive the final answer on the last \
                     line as 'ANSWER: <integer>'.", items[i].1)), "max_tokens": cap,
-                    "seed": (chunk_index * 8 + l) as i64});
+                    "seed": (chunk_index * width + l) as i64});
                 for (k, v) in sampling.as_object().into_iter().flatten().chain(levels[l].1.as_object().into_iter().flatten()) {
                     body[k] = v.clone();
                 }
                 body
             }).collect();
-            for (&(l, i), result) in chunk.iter().zip(common::wave(ctx.client, bodies)) {
+            let results = common::wave_retrying(ctx.client, bodies);
+            for (&(l, i), result) in chunk.iter().zip(results) {
                 let (tier, question, answer) = &items[i];
                 let mut row = json!({"level": levels[l].0, "level_index": l, "tier": tier, "question": question,
                     "answer": answer});

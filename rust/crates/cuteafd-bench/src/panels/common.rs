@@ -71,6 +71,25 @@ pub fn wave(client: &Client, bodies: Vec<Value>) -> Vec<Result<Timed>> {
     })
 }
 
+/// Requests refused because their batch crowded the server (KV pool or queue).
+pub fn crowded(result: &Result<Timed>) -> bool {
+    result.as_ref().err().is_some_and(|e| {
+        let text = format!("{e:#}");
+        text.contains("pool exhausted") || text.contains("HTTP 429") || text.contains("queue is full")
+    })
+}
+
+/// [`wave`], then each crowded request again on its own.
+pub fn wave_retrying(client: &Client, bodies: Vec<Value>) -> Vec<Result<Timed>> {
+    let mut results = wave(client, bodies.clone());
+    for (k, result) in results.iter_mut().enumerate() {
+        if crowded(result) {
+            *result = wave(client, vec![bodies[k].clone()]).pop().unwrap_or_else(|| Err(anyhow::anyhow!("no result")));
+        }
+    }
+    results
+}
+
 /// Aggregate output tokens per second of a wave (first token to last token).
 pub fn aggregate(results: &[Timed]) -> f64 {
     let tokens: u64 = results.iter().map(|r| r.chat.timing.completion_tokens.saturating_sub(1)).sum();

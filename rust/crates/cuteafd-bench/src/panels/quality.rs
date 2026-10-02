@@ -17,7 +17,7 @@ pub fn batched(ctx: &Ctx<'_>, bodies: Vec<Value>, parallel: usize, label: &str) 
             break;
         }
         ctx.progress.step(out.len() as f64 / total.max(1) as f64, format!("{label} {}/{}", out.len(), total));
-        out.extend(common::wave(ctx.client, chunk.to_vec()).into_iter().map(|r| r.map(|t| t.chat)));
+        out.extend(common::wave_retrying(ctx.client, chunk.to_vec()).into_iter().map(|r| r.map(|t| t.chat)));
     }
     out
 }
@@ -258,7 +258,7 @@ impl Panel for Math {
         let problems: Vec<(String, i64)> = (0..12).map(|_| word_problem(&mut rng)).collect();
         let bodies = problems.iter().map(|(q, _)| default_thinking(&format!("{q}\nGive the final answer on the \
             last line as 'ANSWER: <integer>'."), ctx, 3072)).collect();
-        let results = batched(ctx, bodies, 4, "problem");
+        let results = batched(ctx, bodies, common::concurrency(ctx.info).clamp(1, 4), "problem");
         let mut rows = Vec::new();
         for ((question, answer), result) in problems.iter().zip(results) {
             let (given, tokens, error) = match result {
@@ -346,7 +346,7 @@ impl Panel for IfEval {
     fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
         let items = ifeval_items();
         let bodies = items.iter().map(|(prompt, _)| plain(prompt, 700)).collect();
-        let results = batched(ctx, bodies, 4, "prompt");
+        let results = batched(ctx, bodies, common::concurrency(ctx.info).clamp(1, 4), "prompt");
         let (mut rows, mut prompt_ok, mut checks, mut checks_ok) = (Vec::new(), 0, 0, 0);
         for ((prompt, rules), result) in items.iter().zip(results) {
             let content = result.as_ref().map(|c| c.content.clone()).unwrap_or_default();
@@ -470,7 +470,7 @@ impl Panel for Code {
         let bodies = PROBLEMS.iter().map(|(_, task, _)| default_thinking(&format!("Write a Python function {task} \
             Use only the standard library. Reply with one ```python code block containing the function."), ctx, 4096))
             .collect();
-        let results = batched(ctx, bodies, 4, "problem");
+        let results = batched(ctx, bodies, common::concurrency(ctx.info).clamp(1, 4), "problem");
         let mut rows = Vec::new();
         let mut sandbox = "none";
         for ((name, _, tests), result) in PROBLEMS.iter().zip(results) {
