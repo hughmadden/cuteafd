@@ -1041,10 +1041,21 @@ fn resume_check(args: &GoldenArgs, engine: &engine::MimoEngine<'_>, tokens: &[u3
     // The restored rings (SWA and MTP hidden rows) read back exactly as the captured ones.
     family.capture(MarkSlot(1), &b, at).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mark = |slot: u32| -> Result<Vec<u8>> {
-        let range = family.mark_segments(MarkSlot(slot))[0];
-        let mut bytes = vec![0u8; range.bytes];
-        opened_copy(engine, &mut bytes, cuteafd_ffi::CuteafdDeviceBuffer { ptr: range.addr as *mut std::ffi::c_void,
-            bytes: range.bytes, ..engine.kv_layer(0).1 })?;
+        let ranges = family.mark_segments(MarkSlot(slot));
+        ensure!(ranges.len() == engine.ranks(), "a positional mark must cover every MiMo rank");
+        let mut bytes = Vec::with_capacity(family.mark_bytes());
+        for (rank, range) in ranges.into_iter().enumerate() {
+            let template = engine.kv_layer_on(rank, 0).1;
+            let start = bytes.len();
+            bytes.resize(start + range.bytes, 0);
+            crate::shared::memory::device::Device { library: engine.library, id: template.device_id }.run(|| {
+                // SAFETY: this rank owns the stream; retire its capture before reading its mark.
+                unsafe { engine.library.cuda_stream_synchronize(engine.stream_of(rank))?; }
+                engine.library.copy_d2h(&mut bytes[start..], cuteafd_ffi::CuteafdDeviceBuffer {
+                    ptr: range.addr as *mut std::ffi::c_void, bytes: range.bytes, ..template })
+            })?;
+        }
+        ensure!(bytes.len() == family.mark_bytes(), "positional mark byte coverage differs from its layout");
         Ok(bytes)
     };
     let mark_equal = mark(0)? == mark(1)?;
