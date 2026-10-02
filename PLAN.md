@@ -666,7 +666,12 @@ active admission deferral and active KV paging are separate remaining work.
         TTFT) vs 2,438 max; MiMo Flash max 2,899 vs min 5,877; MiMo Pro max
         1,754 vs min 2,741 (two-lane prefill off under the head split).
      i. V4 / V4.1 turn-end prefix-cache restore not byte-exact (reported,
-        not gated).
+        not gated). V4 Flash also differs across repeated uncached solo
+        prefills: captured inputs and coordinator reduction are exact, while
+        Spark expert outputs vary with FP32 atomic arrival order. A private
+        ordered reducer removes that component's repeat drift but is too slow
+        to promote. A lower-traffic ordered kernel is awaiting qualification;
+        prefix-cache or admission changes must not hide this baseline defect.
      j. MiMo V2 Flash fidelity is the weakest that passes (KL 0.10, top-1 82%).
         `73dfbbe` packages opt-in same-pin BF16 expert-input siblings;
         `bbd9a6b` preflights their capacity and arithmetic contract before launch.
@@ -702,7 +707,9 @@ active admission deferral and active KV paging are separate remaining work.
    above 640 live rows: the host dispatch and embedded CUDA binary contain
    the 640-row branch and `QMMA.SF.16832.F32.E4M3.E2M1.E8`. Its down projection
    still consumes BF16 SwiGLU output and widens MXFP4 weights for BF16 MMAs.
-   Qualify A8 down projection next; do not reimplement the existing gate/up.
+   The first private A8-down candidate fails the full-model added-error gate
+   despite its component speedup; it is not deployed. Improve its accuracy
+   before further performance promotion; retain the existing gate/up.
 6. **RTX 5090 audit and claim**: hard-coded `4*188` grid clamps and the
    per-tensor FP8 GEMM grid sized for 188 SMs; one SM120 build must serve both.
    `6d4ea7a` derives expert quantizer grids from each engine's GPU and removes
