@@ -551,6 +551,16 @@ pub struct PanelResult {
     /// Earlier runs on the same fingerprint the chart aggregates (tool eval).
     #[serde(default)]
     pub history: Vec<Value>,
+    /// The running pass's record so far (charts fill progressively).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<Value>,
+}
+
+impl PanelResult {
+    /// The newest record: the running pass's partial one, else the last pass.
+    pub fn latest(&self) -> Option<&Value> {
+        self.partial.as_ref().or_else(|| self.passes.last())
+    }
 }
 
 /// RFC 3339 UTC with seconds, from the system clock.

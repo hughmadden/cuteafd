@@ -507,7 +507,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
                 let _ = child.kill();
                 bail!("not ready within {} s", timeout.as_secs());
             }
-            std::thread::sleep(Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(500));
         }
         outcome.launch_s = Some(launch.elapsed().as_secs_f64());
         let options = crate::cli::RunOptions { url, profile: Some(profile.to_string()), panels: None, passes: vec![],

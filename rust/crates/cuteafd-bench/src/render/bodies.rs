@@ -77,7 +77,10 @@ impl<'a> View<'a> {
             "hardware" => self.hardware(&mut doc, width),
             "configuration" => self.configuration(&mut doc, width),
             "baseline" => self.baseline(&mut doc, width),
-            _ => self.generic(&mut doc, width, self.report.panel(id)),
+            _ => match self.report.panel(id).and_then(|p| super::panels::body(&mut doc, &self.theme, id, p, width)) {
+                Some(height) => height,
+                None => self.generic(&mut doc, width, self.report.panel(id)),
+            },
         };
         (doc.into_parts().1, height)
     }

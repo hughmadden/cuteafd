@@ -233,7 +233,7 @@ function hasData(id) {
   if (!report) return false;
   if (id === 'baseline') return !!report.baseline;
   if (id === 'hardware' || id === 'configuration') return true;
-  return (result(id)?.passes || []).length > 0;
+  return (result(id)?.passes || []).length > 0 || !!result(id)?.partial;
 }
 
 function renderPanels() {

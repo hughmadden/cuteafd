@@ -632,6 +632,7 @@ dependencies = [
  "cuteafd-loader",
  "cuteafd-transport",
  "futures",
+ "jsonschema",
  "resvg",
  "rusqlite",
  "serde",

@@ -257,7 +257,9 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     let prompt_hit = restored.cached_tokens == restored.prompt_ids.len() && !restored.prompt_ids.is_empty();
     // Turn end: a finished turn, the same turn recomputed cold one token further,
     // then the turn's tokens again (a whole hit on the turn snapshot).
-    let turn_text = format!("[{}] List five rivers of Europe, one per line.", nonce());
+    // Long enough to clear the cache's minimum snapshot size and several units.
+    let turn_text = format!("[{}] Here are some notes.\n\n{}\n\nList five rivers of Europe, one per line.", nonce(),
+        filler(57, 900));
     let turn = probed(client, plain(&turn_text, 24), ProbeSpec { no_speculation: true, ..ProbeSpec::default() })?;
     let reference = probed(client, plain(&turn_text, 25),
         ProbeSpec { cold: true, ..rows(25) })?;

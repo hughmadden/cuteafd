@@ -15,6 +15,7 @@ cuteafd-api = { path = "../cuteafd-api" }
 cuteafd-loader = { path = "../cuteafd-loader" }
 cuteafd-transport = { path = "../cuteafd-transport" }
 futures.workspace = true
+jsonschema = { version = "=0.18.3", default-features = false, features = ["draft201909", "draft202012"] }
 rusqlite = { version = "=0.37.0", features = ["bundled"] }
 resvg = { version = "0.45", default-features = false, features = ["text"] }
 serde.workspace = true

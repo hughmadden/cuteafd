@@ -384,7 +384,10 @@ impl Bench {
                 remaining -= estimate;
                 let mut r = report.lock().expect("report lock");
                 match outcome {
-                    Ok(value) => r.panels[index].passes.push(value),
+                    Ok(value) => {
+                        r.panels[index].passes.push(value);
+                        r.panels[index].partial = None;
+                    }
                     Err(error) => {
                         if error.downcast_ref::<crate::client::Cancelled>().is_some() {
                             return Err(error);
@@ -470,11 +473,13 @@ impl Bench {
             if state.revision != revision {
                 revision = state.revision;
                 if let Some(partial) = state.partial {
-                    if panel == "baseline" {
-                        if let Ok(b) = serde_json::from_value::<Baseline>(partial.clone()) {
-                            if let Ok(mut r) = report.lock() {
+                    if let Ok(mut r) = report.lock() {
+                        if panel == "baseline" {
+                            if let Ok(b) = serde_json::from_value::<Baseline>(partial.clone()) {
                                 r.baseline = Some(b);
                             }
+                        } else if let Some(p) = r.panels.iter_mut().find(|p| p.id == panel) {
+                            p.partial = Some(partial.clone());
                         }
                     }
                     self.emit(json!({"type": "partial", "run": run, "panel": panel, "value": partial}));

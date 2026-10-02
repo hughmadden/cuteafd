@@ -7,6 +7,7 @@ pub mod bodies;
 pub mod report;
 pub mod card;
 pub mod charts;
+pub mod panels;
 pub mod png;
 
 pub use theme::Theme;

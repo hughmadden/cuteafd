@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 pub mod common;
 pub mod info;
+pub mod quality;
 pub mod speed;
 
 /// Rates that turn a panel's workload into seconds: the baseline's when it
@@ -114,7 +115,9 @@ pub trait Panel: Send + Sync {
 
 /// Every panel this build runs, in display order.
 pub fn catalog() -> Vec<&'static dyn Panel> {
-    vec![&info::HARDWARE, &info::CONFIGURATION]
+    vec![&info::HARDWARE, &info::CONFIGURATION, &speed::DECODE_CONTENT, &speed::CONCURRENCY, &speed::PREFILL,
+        &speed::RETAINED, &speed::PREFIX_CACHE, &quality::STRUCTURED, &quality::NEEDLE, &quality::IFEVAL,
+        &quality::CODE, &quality::MATH]
 }
 
 pub fn find(id: &str) -> Option<&'static dyn Panel> {
