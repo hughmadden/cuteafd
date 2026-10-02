@@ -144,8 +144,9 @@ fi
 [[ ! $family =~ ^(glm5|qwen4|deepseek_v4)$ || -z "$(get POOL_TOKENS)" ]] || family_args+=(--pool-tokens "$(get POOL_TOKENS)")
 # GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
 # from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" quantizes the
-# BF16 checkpoint's at load); KDA projections get per-row FP8 decode copies
-# (GLM5_FLASH_KDA_FP8: row128, channel or off) and optionally an FP8 LM head
+# BF16 checkpoint's at load). KDA's BF16 source weights run as-is by default
+# (GLM5_FLASH_KDA_FP8: unset/auto/off); explicit row128/channel still make
+# dual resident copies and await single-copy qualification. Optionally an FP8 LM head
 # (GLM5_FLASH_FP8_HEAD=on); its MLA pools hold POOL_TOKENS tokens (a key every
 # family with a paged KV pool reads). GLM5_FLASH_FP8_PREFILL lists the prefill
 # projections that run W8A8 (E4M3 activations per 128-K block): unset = the
@@ -158,7 +159,13 @@ if [[ $family == glm5_flash ]]; then
     fp8_snapshot="$(snapshot_of "$fp8_model" "$(key GLM5_FLASH_FP8_MODEL_REVISION GLMF_FP8_MODEL_REVISION)")" || exit 1
     family_args+=(--fp8-decode --fp8-snapshot "$fp8_snapshot")
   fi
-  family_args+=(--kda-fp8 "$(key GLM5_FLASH_KDA_FP8 GLMF_KDA_FP8 row128)" --pool-tokens "$(get POOL_TOKENS 65536)")
+  kda_fp8="$(key GLM5_FLASH_KDA_FP8 GLMF_KDA_FP8 auto)"
+  case "$kda_fp8" in
+    ""|auto|off) kda_fp8=off ;;
+    row128|channel) ;;
+    *) echo "GLM5_FLASH_KDA_FP8 must be auto, off, row128 or channel" >&2; exit 2 ;;
+  esac
+  family_args+=(--kda-fp8 "$kda_fp8" --pool-tokens "$(get POOL_TOKENS 65536)")
   [[ "$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD off)" != on ]] || family_args+=(--fp8-head)
   fp8_prefill="$(key GLM5_FLASH_FP8_PREFILL GLMF_FP8_PREFILL)"
   case "$fp8_prefill" in

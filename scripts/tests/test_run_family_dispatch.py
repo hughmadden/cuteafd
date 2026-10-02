@@ -126,6 +126,32 @@ def _family_launch_lines(tmp_path: Path, family_config: dict, model: str, keys: 
     return _family_launch_result(tmp_path, family_config, model, keys).stderr
 
 
+@pytest.mark.parametrize("mode,expected", [(None, "off"), ("auto", "off"), ("off", "off"),
+                                          ("row128", "row128"), ("channel", "channel")])
+def test_glmf_kda_preserves_bf16_unless_conversion_is_explicit(tmp_path, mode, expected):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    keys = "GLM5_FLASH_FP8_MODEL_ID=off\n"
+    if mode is not None:
+        keys += f"GLM5_FLASH_KDA_FP8={mode}\n"
+    result = _family_launch_result(tmp_path, config, "test/glmf", keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert f"--kda-fp8 {expected}" in launch
+    assert launch.count("--kda-fp8") == 1
+
+
+def test_glmf_kda_rejects_invalid_conversion_before_launch(tmp_path):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_KDA_FP8=invalid\n")
+    assert result.returncode == 2 and "GLM5_FLASH_KDA_FP8 must be" in result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
 @pytest.mark.parametrize("mode", ["bf16", "bf16-decode"])
 @pytest.mark.parametrize("store, geometry, ranks", [("fp8", "mimo", 4), ("mxfp4", "mimop", 6)])
 def test_mimo_expert_input_preflights_every_rank_before_serving(tmp_path, mode, store, geometry, ranks):
