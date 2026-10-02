@@ -29,8 +29,9 @@ pub(crate) enum KdaInputError {
     },
 }
 
-/// The current KDA path owns BF16 weights for every row shape. Its optional
-/// FP8 copies are explicit conversions, not support for native FP8 sources.
+/// The current KDA path owns BF16 weights for every row shape. Conversion
+/// requests are unsupported until single-copy consumers cover those shapes;
+/// they do not provide support for native FP8 source weights.
 /// Validate only the layers this invocation loads, before any native module.
 pub(crate) fn check_kda_inputs(
     checkpoint: &Checkpoint,
