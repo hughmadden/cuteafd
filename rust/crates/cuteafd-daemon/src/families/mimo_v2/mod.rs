@@ -6,6 +6,7 @@ pub(crate) mod mtp;
 pub(crate) mod prefix;
 pub(crate) mod serve;
 pub(crate) mod weights;
+mod split;
 #[cfg(test)]
 mod host_gate;
 
@@ -252,25 +253,17 @@ impl Opened {
     /// Builds the engine and hands it to `body`.
     pub fn with_engine<T>(&self, args: &EngineArgs, body: impl FnOnce(&engine::MimoEngine<'_>) -> Result<T>) -> Result<T> {
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
+        // An explicit layout is a requirement. Reject a missing head-split
+        // export before loading modules, starting streams or allocating weights.
+        let split_device = split::requested_device(&self.cfg, args.device, args.split_device,
+            |name| programs.spec(name).is_ok())?;
         programs.load_all()?;
         let draft_dir = args.draft.as_deref().map(dflash::drafter_dir);
         let draft_file = draft_dir.as_deref().map(dflash::prefetch);
         let stream = self.library.cuda_stream_create()?;
         // The head split's second GPU and its stream (load kernels, then the engine's).
-        // A head split needs its share's programs (`mimo2`, `mimop2`) in this build;
-        // without them the checkpoint serves from --device.
-        let share = self.cfg.head_split(2).and_then(|share| share.program_family());
-        let split_device = match (args.split_device, &share) {
-            (Some(device), Ok(family)) if programs.spec(&format!("{family}_o_m64")).is_ok() => Some(device),
-            (Some(device), _) => {
-                tracing::info!(device, "no head-split programs for this MiMo geometry; serving from --device alone");
-                None
-            }
-            (None, _) => None,
-        };
         let peer_stream = match split_device {
             Some(device) => {
-                ensure!(device != args.device, "--split-device must differ from --device");
                 // Peer access both ways first: the loader slices weights over peer copies.
                 self.library.cuda_enable_peer(device)?;
                 self.library.cuda_set_device(device)?;
