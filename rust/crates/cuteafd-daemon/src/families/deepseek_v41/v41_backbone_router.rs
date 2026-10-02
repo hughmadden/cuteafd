@@ -674,19 +674,20 @@ impl BackboneRouterWave<'_, '_> {
             }
         })();
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
+        // Captured routes of device-read layers go to this layer's ring slot
+        // (read once the pass drained), on every path including a cold shape.
+        if self.ring_capture && !self.full_request && crate::shared::memory::chain::deferred() {
+            let ring = self.route_ring.as_ref().context("route ring absent")?.buffer;
+            let slot = self.layer * self.capacity as usize * 24;
+            let target = cuteafd_ffi::CuteafdHostBuffer {
+                ptr: unsafe { ring.ptr.cast::<u8>().add(slot) }.cast(), bytes: rows as usize * 24, ..ring };
+            unsafe { self.stream.library.copy_d2h_host_buffer_async(target, self.b(3), rows as usize * 24,
+                self.stream.raw)?; }
+            self.ring_pending.push((self.layer, rows));
+        }
         if !cold && !self.full_request && crate::shared::memory::chain::deferred() {
             // Local experts read the routes on the device: later stages join
-            // the chain instead of the host waiting. Captured routes go to this
-            // layer's ring slot, read once the pass drained.
-            if self.ring_capture {
-                let ring = self.route_ring.as_ref().context("route ring absent")?.buffer;
-                let slot = self.layer * self.capacity as usize * 24;
-                let target = cuteafd_ffi::CuteafdHostBuffer {
-                    ptr: unsafe { ring.ptr.cast::<u8>().add(slot) }.cast(), bytes: rows as usize * 24, ..ring };
-                unsafe { self.stream.library.copy_d2h_host_buffer_async(target, self.b(3), rows as usize * 24,
-                    self.stream.raw)?; }
-                self.ring_pending.push((self.layer, rows));
-            }
+            // the chain instead of the host waiting.
             unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw)?; }
         } else {
             self.stream.wait().await?;
