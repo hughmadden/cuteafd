@@ -28,8 +28,11 @@ pub(crate) enum BenchAction {
         /// The report.json to render.
         #[arg(long)]
         json: PathBuf,
+        /// Output directory (default: benchmarks/<family>/<date>-<profile>-<checkpoint>-<hardware>/ under --root).
         #[arg(long)]
-        out: PathBuf,
+        out: Option<PathBuf>,
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
         #[arg(long, value_delimiter = ',', default_value = "svg,png,json")]
         export: Vec<String>,
     },
@@ -88,8 +91,9 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
         }
         Some(BenchAction::Smoke(smoke)) => cuteafd_bench::smoke::run(smoke),
         Some(BenchAction::Cancel { url, api_key }) => cuteafd_bench::cli::cancel(&url, &api_key),
-        Some(BenchAction::Export { json, out, export }) => {
+        Some(BenchAction::Export { json, out, root, export }) => {
             let report: cuteafd_bench::report::Report = serde_json::from_str(&std::fs::read_to_string(&json)?)?;
+            let out = out.unwrap_or_else(|| cuteafd_bench::cli::default_dir(&root, &report));
             for path in cuteafd_bench::cli::write_exports(&report, &out, &export)? {
                 eprintln!("wrote {}", path.display());
             }
