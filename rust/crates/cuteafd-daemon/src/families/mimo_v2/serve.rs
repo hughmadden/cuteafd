@@ -235,8 +235,9 @@ struct Active<'a> {
     slot: Option<usize>,
     /// Recent DFlash (proposed, accepted) outcomes for the adaptive plan.
     drafts: DraftHistory,
-    /// Steps, DFlash drafts verified / accepted, copy drafts verified / accepted.
-    counts: [usize; 5],
+    /// Steps, neural drafts verified / accepted, copy drafts verified / accepted,
+    /// and actual neural-drafter calls for this request.
+    counts: [usize; 6],
     /// Current copy-draft length (halved after a fully rejected draft,
     /// doubled after a fully accepted one) and steps left before drafting
     /// resumes once it reached zero.
@@ -427,7 +428,10 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 reject(&job, "SWA rings exhausted".into());
                 continue;
             };
-            let slot = free_slots.pop();
+            // Disabled neural drafts need neither a ring slot nor context updates.
+            let slot = if probe::no_speculation(&job.probe) || policy.fixed == Some(0) {
+                None
+            } else { free_slots.pop() };
             cache.tick();
             let admit_started = Instant::now();
             // Lookup, fork of the retained pages and restore of the mark (byte-exact).
@@ -583,7 +587,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     let mut request = Active {
                         slot,
                         drafts: DraftHistory::default(),
-                        counts: [0; 5],
+                        counts: [0; 6],
                         history: p.tokens,
                         draft_limit: draft,
                         draft_pause: 0,
@@ -643,11 +647,14 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         // DFlash drafts after every next token (sequences with a ring slot),
         // then the adaptive plan's counts.
         let drafted: Vec<Option<super::dflash::Draft>> = match drafter {
-            Some(drafter) if skip.drafts() && active.iter().any(|a| a.slot.is_some()) => {
+            Some(drafter) if skip.drafts() && active.iter().enumerate().any(|(i, a)| a.slot.is_some() && limits[i] > 0) => {
                 let seqs: Vec<(usize, DraftSeq)> = active.iter().enumerate()
-                    .filter_map(|(i, a)| a.slot.map(|slot| (i, DraftSeq { slot, anchor: a.next, position: a.placement.len,
+                    .filter_map(|(i, a)| a.slot.filter(|_| limits[i] > 0).map(|slot| (i, DraftSeq { slot, anchor: a.next, position: a.placement.len,
                         valid_from: a.draft_from })))
                     .collect();
+                for &(i, _) in &seqs {
+                    active[i].counts[5] += 1;
+                }
                 let timer = Instant::now();
                 let drafts = drafter.draft(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
                     engine.weights.head.buffer.ptr);
@@ -667,10 +674,16 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 out
             }
             // Native MTP drafts (MiMo V2 Flash; V2.6 Pro prefers DFlash).
-            None if skip.drafts() && engine.mtp.is_some() => {
-                let seqs: Vec<MtpSeq<'_>> = active.iter()
-                    .map(|a| MtpSeq { ring: a.placement.ring as usize, len: a.placement.len, tokens: &a.history })
-                    .collect();
+            None if skip.drafts() && engine.mtp.is_some() && policy.fixed != Some(0)
+                && limits.iter().any(|&limit| limit > 0) => {
+                let indices: Vec<usize> = (0..active.len()).filter(|&i| limits[i] > 0).collect();
+                for &i in &indices {
+                    active[i].counts[5] += 1;
+                }
+                let seqs: Vec<MtpSeq<'_>> = indices.iter().map(|&i| {
+                    let a = &active[i];
+                    MtpSeq { ring: a.placement.ring as usize, len: a.placement.len, tokens: &a.history }
+                }).collect();
                 let stages = engine.mtp.as_ref().map_or(0, |m| m.stages.len());
                 let timer = Instant::now();
                 let drafts = engine.mtp_draft(&seqs, stages);
@@ -678,10 +691,14 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 cost.observe_draft(ms);
                 draft_s += ms / 1e3;
                 match drafts {
-                    Ok(drafts) => drafts.into_iter().map(|tokens| {
-                        let features = vec![[0.0, 1.0, 0.0, 0.0]; tokens.len()];
-                        Some(super::dflash::Draft { tokens, features })
-                    }).collect(),
+                    Ok(drafts) => {
+                        let mut out = vec![None; active.len()];
+                        for (i, tokens) in indices.into_iter().zip(drafts) {
+                            let features = vec![[0.0, 1.0, 0.0, 0.0]; tokens.len()];
+                            out[i] = Some(super::dflash::Draft { tokens, features });
+                        }
+                        out
+                    },
                     Err(error) => {
                         tracing::warn!("MTP draft failed: {error:#}");
                         vec![None; active.len()]
@@ -811,7 +828,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             }
             finished
         }).collect();
-        if let Some(drafter) = drafter {
+        if let Some(drafter) = drafter.filter(|_| !context.is_empty()) {
             drafter.update(&context)?;
         }
         emit_s += timer.elapsed().as_secs_f64();
@@ -836,10 +853,10 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             generated_total += request.generated as u64;
             let seconds = request.started.elapsed().as_secs_f64();
             let phases = std::mem::take(&mut *engine.profile.borrow_mut());
-            let [cycles, dflash, dflash_ok, copy, copy_ok] = request.counts;
+            let [cycles, dflash, dflash_ok, copy, copy_ok, draft_calls] = request.counts;
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
                 active = active.len(), steps, verify_s, draft_s, emit_s, gpu_wait_s = phases[0],
-                experts_s = phases[1], cycles, dflash, dflash_ok, copy, copy_ok, late_graphs = engine.late_captures(),
+                experts_s = phases[1], cycles, dflash, dflash_ok, copy, copy_ok, draft_calls, late_graphs = engine.late_captures(),
                 "request complete");
             (steps, verify_s, draft_s, emit_s) = (0, 0.0, 0.0, 0.0);
             if let Some(row) = &request.turn {
