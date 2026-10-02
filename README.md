@@ -7,7 +7,7 @@
 
 CuteAFD brings frontier-scale open-weights models into the home lab at
 data-center speed. It disaggregates attention from the routed experts: one or
-two consumer-Blackwell RTX PRO 6000 (or 5090) cards run attention, the dense
+two consumer-Blackwell RTX PRO 6000 cards run attention, the dense
 backbone, routing and sampling, while a pool of DGX Sparks (GB10, SM121) holds
 the routed experts and answers over RoCE. The same engine loads a model's
 standard Hugging Face checkpoint directly — no side files, no repacking — and
@@ -17,7 +17,7 @@ checkpoint's own numerics instead of converting everything to one internal
 format.
 
 - Attention/FFN disaggregation (AFD): RTX cards own the backbone, Sparks own
-  the experts, device-to-device over RoCE with no host hops on the hot path.
+  the experts, exchanging activations over RoCE with GPU-direct landing.
 - Robust quant support: official FP8/MXFP4, NVIDIA ModelOpt NVFP4, and EXL3,
   loaded from the checkpoint's own `config.json` and tensor headers.
 - Exact prefix caching for agentic work: the deepest cached snapshot that
