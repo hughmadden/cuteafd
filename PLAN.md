@@ -507,6 +507,15 @@ cache, bounded prefetch, gather pool/worker, pinned upload ring, stats; V4.1
 engram and Qwen PLE use it); Spark-RAM replicas and fabric-fed tables are
 explorations, kept behind options.
 
+## Backlog (lowest priority: only when nothing planned is left)
+
+- Qwen 3.8 Flash Next NVFP4 without Sparks, competitive with vLLM on one
+  RTX PRO 6000 (localmaxxing card, 2026-10: batch 1, MTP, 2,821 in / 2,048
+  out: 373 tok/s output, 12,078 tok/s prefill, 234 ms TTFT; ours today ~100-130
+  C1 with EXL3 local experts, NVFP4 W4A4 8K prefill ~9.5K tok/s). Outside the
+  usual scope; reference configs for it in spirit: min = simulated RTX 5090
+  (32 GB) + 1 Spark, max = 2x RTX with no Sparks.
+
 ## Decisions (2026-09-28)
 
 - Fresh copy of ds41rt at `3067d06` into this repo; no history import. The
