@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/cuteafd-logo-light.svg">
-    <img src="assets/brand/cuteafd-logo.svg" alt="cuteafd" width="480">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/cuteafd-logo-color-dark.svg">
+    <img src="assets/brand/cuteafd-logo-color.svg" alt="cuteafd" width="480">
   </picture>
 </p>
 
