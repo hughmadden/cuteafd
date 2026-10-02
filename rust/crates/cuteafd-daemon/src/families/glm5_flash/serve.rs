@@ -234,8 +234,9 @@ struct Active<'a> {
     drafts: DraftHistory,
     /// Hash of `history` (identical sequences share it).
     digest: u64,
-    /// Steps, DFlash2 drafts verified and accepted, copy drafts verified and accepted.
-    counts: [usize; 5],
+    /// Steps, DFlash2 drafts verified/accepted, copy drafts verified/accepted,
+    /// and actual neural drafter forward calls for this sequence.
+    counts: [usize; 6],
     constraint: Option<crate::shared::constraints::State<'a>>,
     placement: GlmfPlacement,
     /// First position the DFlash2 drafter's context holds for this sequence
@@ -456,7 +457,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 reject(&job, "KDA state slots exhausted".into());
                 continue;
             };
-            let slot = free_slots.pop();
+            // Disabled neural drafts need neither a ring slot nor context updates.
+            let slot = if probe::no_speculation(&job.probe) || policy.fixed == Some(0) {
+                None
+            } else { free_slots.pop() };
             cache.tick();
             let admit_started = Instant::now();
             // Lookup, fork of the retained units and restore of the KDA mark (byte-exact).
@@ -630,7 +634,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         draft_pause: 0,
                         slot,
                         drafts: DraftHistory::default(),
-                        counts: [0; 5],
+                        counts: [0; 6],
                         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?,
                         job: p.job, constraint: p.constraint, placement: p.placement, draft_from: resume, turn: None,
                         capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(),
@@ -678,11 +682,14 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         // DFlash2 drafts after every next token, then the policy's counts.
         let timer = Instant::now();
         let drafted: Vec<Option<Draft>> = match drafter {
-            Some(drafter) if skip.drafts() && active.iter().any(|a| a.slot.is_some()) => {
+            Some(drafter) if skip.drafts() && active.iter().enumerate().any(|(i, a)| a.slot.is_some() && limits[i] > 0) => {
                 let seqs: Vec<(usize, DraftSeq)> = active.iter().enumerate()
-                    .filter_map(|(i, a)| a.slot.map(|slot| (i, DraftSeq { slot, anchor: a.next, position: a.placement.len,
-                        valid_from: a.draft_from })))
+                    .filter_map(|(i, a)| a.slot.filter(|_| limits[i] > 0).map(|slot|
+                        (i, DraftSeq { slot, anchor: a.next, position: a.placement.len, valid_from: a.draft_from })))
                     .collect();
+                for &(i, _) in &seqs {
+                    active[i].counts[5] += 1;
+                }
                 let drafts = drafter.draft_device(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
                     engine.weights.head.buffer.ptr);
                 cost.observe_draft(timer.elapsed().as_secs_f64() * 1e3);
@@ -878,9 +885,9 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             generated_total += request.generated as u64;
             let seconds = request.started.elapsed().as_secs_f64();
             let phases = std::mem::take(&mut *engine.profile.borrow_mut());
-            let [steps_seen, dflash, dflash_ok, copy, copy_ok] = request.counts;
+            let [steps_seen, dflash, dflash_ok, copy, copy_ok, draft_calls] = request.counts;
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
-                active = active.len(), steps = steps_seen, all_steps = steps, dflash, dflash_ok, copy, copy_ok,
+                active = active.len(), steps = steps_seen, all_steps = steps, dflash, dflash_ok, copy, copy_ok, draft_calls,
                 draft_s, verify_s, emit_s, gpu_wait_s = phases[0], experts_s = phases[1], head_s = phases[2],
                 "request complete");
             (steps, draft_s, verify_s, emit_s) = (0, 0.0, 0.0, 0.0);
