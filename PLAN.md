@@ -515,38 +515,88 @@ cache, bounded prefetch, gather pool/worker, pinned upload ring, stats; V4.1
 engram and Qwen PLE use it); Spark-RAM replicas and fabric-fed tables are
 explorations, kept behind options.
 
-## Release v0 (after the current backlog; planned 2026-10-02)
+## Release v0 (2026-10-02)
 
-The first official release. Deliverables:
-- README: logo; the mission (the strongest open models with robust quant
-  support, attention/FFN disaggregation on consumer Blackwell: data-center
-  intelligence and speed in a home lab, owned and private); a model × quant
-  grid of Release smoke cards (min and max hardware), three per row, each
-  linking to its family page; quick start; links to AGENTS.md and benchmarks.
-- `docs/models/<family>.md` per family: supported checkpoints and quants,
-  engineering notes (attention, experts, speculator, KV format, RTX/Spark
-  layout, head split, prefix cache), limits, and a changelog table. A release
-  adds a family row only when a model-specific or model-affecting change
-  triggered its basic eval; the row inlines that eval's card SVG. A second
-  table lists additional benchmark reports (engine version, date, profile,
-  hardware, report SVG). v0 starts both with one row.
-- Release smoke over the full family × quant × min/max matrix (`cuteafd bench
-  smoke`), published by `bench publish`.
-- AGENTS.md rewritten as the complete guide for agents and collaborators: the
-  working method (parallel agents in worktrees, merge-first, tiered and
-  frugal gates, measure-first experiments with a stated ceiling, lock and
-  container hygiene), engineering principles (honor checkpoint numerics with
-  native kernels, standard HF loading, exact prefix-cache restores, device-
-  driven exchange with no idle CPU burn, one build for RTX PRO 6000 and 5090,
-  hand-rolled collectives), and results publishing.
-- Public-readiness: submodule URLs over https (gptqmodel is ssh), notices for
-  tool-eval-bench, deepseek-recipe, exllamav3-derived code and GPTQModel;
-  host names, IPs and sparknest paths moved from AGENTS.md into an example
-  cluster config; fast loading from a plain HF cache without sparknest; a
-  setup guide (RoCE, MTU/PFC, GPUDirect/dma-buf, drivers); GitHub Actions for
-  cargo and script tests; images pushed to ghcr.io with semver tags (v0.1.0)
-  next to the build identity; secure defaults (bind address, API key, console
-  token text off, bench lockout auth); the RTX 5090 audit before claiming it.
+Cut early from `work/p0` (p9 + benchmark dashboard + live console for every
+family + README card grid) with the V4.1 8K prefill staging regression fixed.
+The full Release smoke matrix (family × quant × natural-minimum and maximum
+hardware) published as the README card grid is the v0 artifact. Images stay
+local until TJ says to push them. No model license notes: we bundle no weights.
+
+## Release v1 — priority plan (2026-10-02)
+
+Everything after v0 lands as v1. Helpers: read AGENTS.md, then pick the top
+open item; each names its branch (pushed WIP) and the next step. Merge green
+steps into `work/p0`; tag `v1.0.0` when the list's top half is done.
+
+1. **Device-driven Spark exchange, shared by every family** — branch
+   [`work/v41-device`](https://github.com/tpurtell/cuteafd/tree/work/v41-device). Today every family does 2–3
+   blocking host round trips per MoE layer (router ids D2H + sync, host-built
+   request and RDMA post, host CQ poll before the reduce); no device-initiated
+   networking exists. Design: GPU kernels write requests and set a ready flag;
+   a host proxy thread posts pre-built WQEs (spins only while a step is in
+   flight, parks on a futex when idle); replies land GPU-direct with a
+   NIC-written completion flag and the reduce waits on the device; whole step
+   in one CUDA graph. Order: DeepSeek V4 → V4.1 (adopt SparkIntake/GPU landing,
+   device-side replica ownership) → GLM 5.3, GLM Flash, MiMo, Qwen. Then the
+   Spark worker loop, then IBGDA (GPU rings the NIC doorbell) to drop the
+   proxy. Projection (V4.1, `ae91c6a`): exchange alone C1 +5–7% / C4 +3–6%;
+   with whole-step graphs C1 +10–15% / C4 +8–12%.
+   State at 057be61 (WIP, all behind env switches, default byte-identical):
+   decision B (retrofit V4.1; both engines share one device exchange,
+   `SparkDeviceLane`, idle 0.6% of a core, ~5 µs wake). V4 Flash
+   `CUTEAFD_SPARK_DEVICE=1`: decode 13.2 → 13.1 ms, verify 4.7 → 4.5 ms.
+   V4.1 `CUTEAFD_V41_DEVICE=1` (one lane device-ordered): 2 RTX C1 185.5 →
+   192.9 (+4%), C4 flat; 1 RTX +1%; greedy byte-identical with the fixed draft
+   policy. Spark worker host cost ~20 of ~544 µs (GB10 expert kernel ~510 µs:
+   TP6 is the bigger lever); worker now parks after 5 ms idle. Next: test the
+   built-but-unrun GPU-direct receive (`CUTEAFD_SPARK_WRITE=1`, `v41-ab2.sh
+   v41-2rtx-w.config 2rtx-w 0 1 1+write`); fix corruption with both lanes
+   device-ordered (`CUTEAFD_V41_DEVICE_LANES=1`, 0/10 consistent C4); whole-step
+   graphs (D4); recheck head split; full parity. IBGDA is possible
+   (ConnectX-7 fw 28.43/28.45) but needs `PeerMappingOverride=1` on raptor.
+   Gotchas: build with `build-coord.sh`/`build-spark.sh` in
+   `~/.cache/cuteafd/builds/v41-device` (Spark build on moa as root; artifacts
+   relay via raptor); use the fixed draft policy for byte-exact A/B;
+   `chain::settle` must stay a host wait.
+2. **Whole-step graphs** — MiMo's per-layer segments are merged and opt-in
+   (`DECODE_GRAPHS=on`, [`work/mimo-graphs`](https://github.com/tpurtell/cuteafd/tree/work/mimo-graphs)); flat today,
+   they pay once item 1 removes the host hops. Same for every family.
+3. **V4.1 step wins** (from the critical-path note): device-side draft
+   acceptance (~0.8 ms host gap per round, up to +3%); FP8 target and draft
+   heads (2 × ~450 µs per round); one host thread serves both lanes (26–43% of
+   wall time in CUDA calls) — item 1 removes most of it.
+4. **Model-specific issues found** (fix in v1, not essential for v0):
+   - GLM 5.3 Flash (likely GLM 5.3): a JSON-schema request whose grammar
+     accepts the stop token keeps decoding; xgrammar `fill_bitmask` then fails
+     and the whole batch fails.
+   - MiMo V2.6 Pro: two-lane prefill runs only without the head split, so 8K
+     prefill is slower on 2 RTX (4.79 s) than on 1 RTX (3.18 s).
+   - V4.1 on 1 RTX: startup is serial (Sparks load all 40 layers at ~0.4 GB/s
+     each, ~205 s, including 5 the RTX holds; then the coordinator). Start the
+     coordinator first, skip RTX-held layers on the Sparks, speed up the Spark
+     layer load. 2 RTX: 108 s.
+   - DeepSeek V4 Flash: the native expert format refuses 2 Sparks (min config
+     needs 4); V4.1 TP3 fits per `cuteafd plan` but is unqualified.
+   - Benchmarks: reasoning-effort panel re-run after the pool back-off fix;
+     turn-end cache check is informational (greedy non-repeat); code sandbox
+     lacks network isolation; tool-eval-bench reaches images with the next
+     `./build.sh`.
+   - Issues the v0 smoke matrix reports get appended here.
+5. **Spark expert kernels**: MiMo V2.6 Pro TP6 prefill is Spark-bound (~35 of
+   ~42 ms per layer); GLM 5.3 verify is bound by distinct expert reads; NVFP4
+   W4A16 GB10 prefill (14.3 vs EXL3 9.1 ms/layer TP4).
+6. **RTX 5090 audit and claim**: hard-coded `4*188` grid clamps and the
+   per-tensor FP8 GEMM grid sized for 188 SMs; one SM120 build must serve both.
+7. **Phase 6 placement planner** (incl. cold components such as the vision
+   encoder on a Spark) and **multimodal input** (official encoders only).
+8. **NVFP4 follow-ups**: native per-tensor FP8 decode with static scales.
+9. **Parked**: Spark-side reduce-scatter ([`work/spark-reduce`](https://github.com/tpurtell/cuteafd/tree/work/spark-reduce),
+   +3% one rail, +9–12% two rails at 200G); split intake
+   ([`work/split-intake`](https://github.com/tpurtell/cuteafd/tree/work/split-intake), slower). Revisit only on new evidence.
+10. **Housekeeping**: prune agent test images on raptor; delete
+    `~/.cache/cuteafd/builds/{n10-rel,bisect-rel}` on ostrich (root); refresh
+    the inherited script-test failure ids in AGENTS.md.
 
 ## Backlog (lowest priority: only when nothing planned is left)
 

@@ -82,7 +82,9 @@ if [[ -z "$speculator" ]]; then
 fi
 case "$family:$speculator" in
   qwen4:mtp)
-    echo "SPECULATOR=mtp for Qwen needs the MTP layer's experts on the coordinator; the Spark ranks do not serve them and this launcher does not place local experts yet" >&2; exit 2 ;;
+    # The MTP layer's experts run on the coordinator: only with local experts (SPARK_COUNT=0).
+    [[ "$(get SPARK_COUNT 4)" == 0 ]] ||
+      { echo "SPECULATOR=mtp for Qwen needs SPARK_COUNT=0 (local experts); the Spark ranks do not serve the MTP layer's experts" >&2; exit 2; } ;;
   *:off|glm5:dflash2|glm5_flash:dflash2|mimo_v2:dflash2|mimo_v2:mtp|deepseek_v4:dspark) ;;
   *) echo "SPECULATOR=$speculator does not apply to $family" >&2; exit 2 ;;
 esac

@@ -408,6 +408,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     memory_checkpoint("allocated KV cache")?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests)?;
+    scheduler::publish_capacity(&requests, &prefixes);
     tracing::info!(elapsed_ms=started.elapsed().as_millis(), "dual RTX serving owners ready");
     ready.take().context("startup readiness missing")?.send(Ok(()))
         .map_err(|_| anyhow::anyhow!("API startup cancelled"))?;

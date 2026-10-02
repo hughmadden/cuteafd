@@ -329,6 +329,112 @@ pub struct BasicCard {
     /// Seconds of the untimed warm-up requests (first-use loads, graphs, tables).
     #[serde(default)]
     pub warmup_s: Option<f64>,
+    /// The serving capacity the numbers were measured under.
+    #[serde(default)]
+    pub capacity: Option<Capacity>,
+}
+
+/// KV pool, request and context limits, host prefix cache.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Capacity {
+    #[serde(default)]
+    pub kv_tokens: Option<u64>,
+    #[serde(default)]
+    pub kv_pages: Option<u64>,
+    #[serde(default)]
+    pub kv_format: Option<String>,
+    /// Requests decoding at once.
+    #[serde(default)]
+    pub max_requests: Option<u64>,
+    #[serde(default)]
+    pub max_context: Option<u64>,
+    #[serde(default)]
+    pub max_output: Option<u64>,
+    /// Pinned host prefix-cache bytes (0: off).
+    #[serde(default)]
+    pub host_cache_bytes: Option<u64>,
+}
+
+/// Token counts in K/M: 412K, 14.7M.
+pub fn short_tokens(v: u64) -> String {
+    // Powers-of-two style sizes read best in binary units (32768 -> 32K).
+    if v >= 1 << 20 && v % (1 << 20) == 0 {
+        return format!("{}M", v >> 20);
+    }
+    if v >= 1024 && v % 1024 == 0 {
+        return format!("{}K", v >> 10);
+    }
+    match v {
+        v if v >= 1_000_000 => format!("{:.1}M", v as f64 / 1e6).replace(".0M", "M"),
+        v if v >= 10_000 => format!("{}K", (v as f64 / 1e3).round()),
+        v if v >= 1_000 => format!("{:.1}K", v as f64 / 1e3).replace(".0K", "K"),
+        v => v.to_string(),
+    }
+}
+
+fn bytes_label(v: u64) -> String {
+    if v == 0 { "off".into() } else if v >= 1 << 30 { format!("{:.0} GiB", v as f64 / (1u64 << 30) as f64) }
+    else { format!("{:.0} MiB", v as f64 / (1u64 << 20) as f64) }
+}
+
+impl Capacity {
+    /// From a report's resolved options, for records without a measured capacity.
+    pub fn from_settings(info: &ServerInfo) -> Self {
+        let get = |names: &[&str]| info.configuration.settings.iter().find(|s| names.contains(&s.name.as_str()))
+            .and_then(|s| s.value.clone());
+        let number = |names: &[&str]| get(names).and_then(|v| v.parse::<u64>().ok());
+        Self {
+            kv_tokens: number(&["pool-tokens"]),
+            kv_pages: None,
+            kv_format: None,
+            max_requests: number(&["concurrency", "max-sequences"]),
+            max_context: number(&["max-context", "max-context-tokens"]),
+            max_output: number(&["max-output", "max-output-tokens"]),
+            host_cache_bytes: number(&["host-cache-bytes"]),
+        }
+    }
+
+    /// `KV 412K tok · int8 full · 16 req max · 128K ctx · host cache 64 GiB`.
+    pub fn line(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(tokens) = self.kv_tokens {
+            parts.push(format!("KV {} tok", short_tokens(tokens)));
+        }
+        if let Some(format) = &self.kv_format {
+            parts.push(format.clone());
+        }
+        if let Some(n) = self.max_requests {
+            parts.push(format!("{n} req max"));
+        }
+        if let Some(n) = self.max_context {
+            parts.push(format!("{} ctx", short_tokens(n)));
+        }
+        if let Some(n) = self.max_output {
+            parts.push(format!("{} out", short_tokens(n)));
+        }
+        if let Some(bytes) = self.host_cache_bytes {
+            parts.push(format!("host cache {}", bytes_label(bytes)));
+        }
+        parts.join(" · ")
+    }
+
+    /// `412K tok / 16 req` for the README table.
+    pub fn compact(&self) -> String {
+        match (self.kv_tokens, self.max_requests) {
+            (Some(t), Some(r)) => format!("{} tok / {r} req", short_tokens(t)),
+            (Some(t), None) => format!("{} tok", short_tokens(t)),
+            (None, Some(r)) => format!("{r} req"),
+            _ => "—".into(),
+        }
+    }
+}
+
+impl Report {
+    /// The capacity of the baseline, else what the options say.
+    pub fn capacity(&self) -> Capacity {
+        self.baseline.as_ref().and_then(|b| b.card.capacity.clone())
+            .unwrap_or_else(|| Capacity::from_settings(&self.server))
+    }
 }
 
 impl BasicCard {

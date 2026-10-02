@@ -1762,6 +1762,19 @@ pub(super) fn console_round(tally: console::Tally, lane: usize, shared: bool, st
         }))
 }
 
+/// Publishes the resolved KV pool (the compressed source with the fewest
+/// tokens) and host-cache bytes for the benchmark's capacity record.
+pub(crate) fn publish_capacity(requests: &Requests<'_>, prefixes: &PrefixCache<'_>) {
+    let tokens = requests.cache().sources().iter().zip([2u64, 2, 2, 1]).map(|(source, ratio)| {
+        let [total, _, _] = source.get().source_cache().occupancy();
+        (total * 256 * ratio, total)
+    }).min();
+    let host = prefixes.host_config().map_or(0, |config| config.bytes as u64);
+    if let Some((tokens, pages)) = tokens {
+        cuteafd_bench::context::set_kv(tokens, pages, "FP4 compressed (CSA/HCA) + FP8 window", host);
+    }
+}
+
 /// Occupancy gauges for the live console, read from host-side bookkeeping only.
 pub(super) fn console_gauges(active: &[Option<Active<'_>>], requests: &Requests<'_>,
     prefixes: &PrefixCache<'_>, queued: usize, pending: Option<bool>) -> console::Event {

@@ -229,6 +229,7 @@ impl<'a> View<'a> {
             y += chips(doc, t, 120.0, y, w - 120.0, &items, t.series[0]) + 6.0;
         }
         y += row(doc, t, 0.0, y, w, "Speculator", c.speculator.as_deref().unwrap_or("none"));
+        y += row(doc, t, 0.0, y, w, "Capacity", &self.report.capacity().line());
         if let Some(layout) = &c.layout {
             y += row(doc, t, 0.0, y, w, "Layout", layout);
         }
@@ -297,8 +298,9 @@ impl<'a> View<'a> {
             doc.text(bx + bw, y + 12.0, Font::new(12.0, t.ink).anchor(Anchor::End).opacity(dim),
                 &format!("{warn}{}", rate(d.tok_s)));
         }
+        doc.text(0.0, 102.0, Font::new(11.0, t.ink2), &fit(&self.report.capacity().line(), 11.0, w));
         // Quick quality.
-        let mut y = 104.0;
+        let mut y = 116.0;
         doc.line(0.0, y, w, y, t.line, 1.0);
         y += 8.0;
         let q = &b.quality;

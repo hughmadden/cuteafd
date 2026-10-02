@@ -61,7 +61,10 @@ pub fn report(failed: bool) -> Report {
         fingerprint: "3f9a2c41d07be5a1".into(), run_id: "7c1e2d3f4a5b6c7d8e9f".into(), created: "2026-10-02T10:12:00Z".into(),
         card: BasicCard { decode: vec![rate("code", 187.3), rate("prose", 142.6), rate("json", 201.9)],
             prefill: Some(PrefillRate { prompt_tokens: 8192, tok_s: 2415.0, ttft_s: 3.392, runs: vec![] }),
-            warmup_s: Some(14.2) },
+            warmup_s: Some(14.2),
+            capacity: Some(Capacity { kv_tokens: Some(14_710_000), kv_pages: Some(28_728),
+                kv_format: Some("FP4 compressed (CSA/HCA) + FP8 window".into()), max_requests: Some(16),
+                max_context: Some(1 << 20), max_output: Some(393_216), host_cache_bytes: Some(64 << 30) }) },
         quality, seconds: 151.0,
     };
     Report {

@@ -17,7 +17,19 @@ pub struct ServerContext {
     pub settings: Vec<Setting>,
 }
 
+/// What the engine resolved for its device KV pool and host prefix cache.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct KvCapacity {
+    pub tokens: Option<u64>,
+    pub pages: Option<u64>,
+    /// KV record format, e.g. `FP8 latent + index` or `int8 full + BF16 SWA`.
+    pub format: Option<String>,
+    /// Pinned host prefix-cache bytes (0: off).
+    pub host_bytes: Option<u64>,
+}
+
 struct State {
+    kv: Mutex<Option<KvCapacity>>,
     context: Mutex<ServerContext>,
     phases: Mutex<Vec<(String, SystemTime)>>,
     started: SystemTime,
@@ -29,6 +41,7 @@ fn state() -> &'static State {
     static STATE: OnceLock<State> = OnceLock::new();
     STATE.get_or_init(|| State {
         context: Mutex::new(ServerContext::default()),
+        kv: Mutex::new(None),
         phases: Mutex::new(Vec::new()),
         started: process_start().unwrap_or_else(SystemTime::now),
         ready: OnceLock::new(),
@@ -46,6 +59,18 @@ pub fn set(context: ServerContext) {
 
 pub fn get() -> ServerContext {
     state().context.lock().map(|c| c.clone()).unwrap_or_default()
+}
+
+/// The engine's resolved device KV pool (tokens, pages, record format) and host cache bytes.
+pub fn set_kv(tokens: u64, pages: u64, format: &str, host_bytes: u64) {
+    if let Ok(mut slot) = state().kv.lock() {
+        *slot = Some(KvCapacity { tokens: Some(tokens), pages: Some(pages), format: Some(format.to_string()),
+            host_bytes: Some(host_bytes) });
+    }
+}
+
+pub fn kv() -> Option<KvCapacity> {
+    state().kv.lock().ok().and_then(|k| k.clone())
 }
 
 /// A named startup milestone (the startup panel's Gantt).

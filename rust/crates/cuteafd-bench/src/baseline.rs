@@ -108,12 +108,17 @@ fn unsupported(check: &mut Check) {
 }
 
 pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str, fingerprint: &str,
-    max_context: u64) -> Result<Baseline> {
+    max_context: u64, max_output: u64) -> Result<Baseline> {
     let started = Instant::now();
+    let kv = crate::context::kv().unwrap_or_default();
+    let from_settings = crate::report::Capacity::from_settings(info);
+    let capacity = crate::report::Capacity { kv_tokens: kv.tokens.or(from_settings.kv_tokens), kv_pages: kv.pages,
+        kv_format: kv.format, max_requests: from_settings.max_requests, max_context: Some(max_context),
+        max_output: Some(max_output), host_cache_bytes: kv.host_bytes.or(from_settings.host_cache_bytes) };
     let mut run = Run {
         client, info, progress, max_context,
         baseline: Baseline { fingerprint: fingerprint.into(), run_id: run_id.into(), created: now_rfc3339(),
-            card: BasicCard::default(), quality: Quality::default(), seconds: 0.0 },
+            card: BasicCard { capacity: Some(capacity), ..BasicCard::default() }, quality: Quality::default(), seconds: 0.0 },
     };
     // Warm-up: first-use workspaces, graphs and tables (untimed), and a two-point
     // fit of tokens per filler word for the prefill case.

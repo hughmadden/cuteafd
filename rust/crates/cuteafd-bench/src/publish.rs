@@ -75,13 +75,16 @@ fn link(dir: &Path, file: &str) -> String {
     format!("{}/{file}", dir.display()).replace('\\', "/")
 }
 
-/// The root README's results: one table per family, a row per checkpoint ×
-/// reference hardware (newest basic profile of each).
-pub fn results(placed: &[Placed]) -> String {
-    let mut rows: BTreeMap<String, BTreeMap<(String, u8), &Placed>> = BTreeMap::new();
+/// Family display order.
+const FAMILIES: [&str; 6] = ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4"];
+
+/// The newest basic-profile report per family, checkpoint and reference hardware, in
+/// family order, then checkpoint, minimum before maximum.
+fn reference_rows(placed: &[Placed]) -> Vec<(String, String, u8, &Placed)> {
+    let mut rows: BTreeMap<(usize, String, String, u8), &Placed> = BTreeMap::new();
     for p in placed {
         let r = &p.report;
-        if r.baseline.is_none() {
+        if r.baseline.is_none() || !matches!(r.profile.as_str(), "smoke" | "share") {
             continue;
         }
         let class = match r.server.hardware.class() {
@@ -90,37 +93,65 @@ pub fn results(placed: &[Placed]) -> String {
             HardwareClass::Other => continue,
         };
         let family = r.server.family.clone().unwrap_or_else(|| "unknown".into());
+        let order = FAMILIES.iter().position(|f| *f == family).unwrap_or(FAMILIES.len());
         // `placed` is newest first: keep the first of each key.
-        rows.entry(family).or_default().entry((checkpoint(r), class)).or_insert(p);
+        rows.entry((order, family, checkpoint(r), class)).or_insert(p);
     }
+    rows.into_iter().map(|((_, family, name, class), p)| (family, name, class, p)).collect()
+}
+
+fn quality_cell(b: &crate::report::Baseline) -> String {
+    match b.quality.status {
+        CheckStatus::Fail => format!("⚠ **FAILED** {}", crate::render::bodies::quality_line(b)),
+        CheckStatus::Pass => format!("✓ {}", b.quality.badge()),
+        _ => b.quality.badge(),
+    }
+}
+
+/// The root README's results: a three-column grid of share cards (each links
+/// to its family page under `docs/models/`), then the same rows as a compact table.
+pub fn results(placed: &[Placed]) -> String {
+    let rows = reference_rows(placed);
     if rows.is_empty() {
         return "_Pending the first published run._\n".into();
     }
-    let mut out = String::new();
-    for (family, entries) in &rows {
-        out.push_str(&format!("\n#### {}\n\n", family_title(family)));
-        out.push_str("| Checkpoint | Hardware | C1 code | prose | JSON | 8K prefill | TTFT | Quality | Run |\n");
-        out.push_str("| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |\n");
-        for ((name, class), p) in entries {
+    let mut out = String::from("<table>\n");
+    for chunk in rows.chunks(3) {
+        out.push_str("<tr>\n");
+        for (family, _, class, p) in chunk {
             let r = &p.report;
-            let b = r.baseline.as_ref().expect("filtered");
-            let decode = |content: &str| b.card.decode_of(content).map_or("—".into(), |d| rate(d.tok_s));
-            let (prefill, ttft) = b.card.prefill.as_ref()
-                .map_or(("—".into(), "—".into()), |p| (rate(p.tok_s), seconds(p.ttft_s)));
-            let quality = match b.quality.status {
-                CheckStatus::Fail => format!("⚠ **FAILED** {}", crate::render::bodies::quality_line(b)),
-                CheckStatus::Pass => format!("✓ {}", b.quality.badge()),
-                _ => b.quality.badge(),
-            };
-            let hardware = format!("{} ({})", short_hardware(r), if *class == 0 { "min" } else { "max" });
-            out.push_str(&format!("| {name} | {hardware} | {} | {} | {} | {prefill} | {ttft} | {quality} | [{} · {}]({}) |\n",
-                decode("code"), decode("prose"), decode("json"), crate::render::date(&r.created),
-                r.server.build.label(), link(&p.dir, "report.svg")));
+            out.push_str(&format!("<td width=\"33%\" valign=\"top\"><a href=\"docs/models/{family}.md\"><img src=\"{}\" \
+                alt=\"{} on {}\"></a><br><sub>{} · {} ({})</sub></td>\n", link(&p.dir, "card.svg"), r.server.model,
+                r.server.hardware.line(), family_title(family), short_hardware(r), if *class == 0 { "min" } else { "max" }));
         }
+        out.push_str("</tr>\n");
     }
-    out.push_str("\ntok/s; C1 decode with thinking off, 8K prefill cold. Quality: logit fidelity against the \
-        family golden reference, prefix-cache restore exactness, lossless speculation.\n");
+    out.push_str("</table>\n\n");
+    out.push_str("| Family | Checkpoint | Hardware | KV / req | C1 code | prose | JSON | 8K prefill | TTFT | Quality | Report |\n");
+    out.push_str("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |\n");
+    for (family, name, class, p) in &rows {
+        let r = &p.report;
+        let b = r.baseline.as_ref().expect("filtered");
+        let decode = |content: &str| b.card.decode_of(content).map_or("—".into(), |d| rate(d.tok_s));
+        let (prefill, ttft) = b.card.prefill.as_ref()
+            .map_or(("—".into(), "—".into()), |p| (rate(p.tok_s), seconds(p.ttft_s)));
+        let hardware = format!("{} ({})", short_hardware(r), if *class == 0 { "min" } else { "max" });
+        out.push_str(&format!("| [{}](docs/models/{family}.md) | {name} | {hardware} | {} | {} | {} | {} | {prefill} | {ttft} | {} | \
+            [{} · {}]({}) |\n", family_title(family), r.capacity().compact(), decode("code"), decode("prose"),
+            decode("json"), quality_cell(b), crate::render::date(&r.created), r.server.build.label(),
+            link(&p.dir, "report.svg")));
+    }
+    out.push_str("\ntok/s; C1 decode with thinking off, 8K prefill cold. Quality: logit fidelity against the family golden \
+        reference, prefix-cache restore exactness, lossless speculation.\n");
     out
+}
+
+/// A family page's basic-eval cell: its cards (paths relative to `docs/models/`).
+pub fn family_cards(placed: &[Placed], family: &str) -> String {
+    reference_rows(placed).into_iter().filter(|(f, ..)| f == family).map(|(_, name, class, p)| {
+        format!("<a href=\"../../{}\"><img src=\"../../{}\" width=\"360\" alt=\"{name} ({})\"></a>",
+            link(&p.dir, "report.svg"), link(&p.dir, "card.svg"), if class == 0 { "min" } else { "max" })
+    }).collect::<Vec<_>>().join(" ")
 }
 
 /// The benchmarks/README.md index: per family, newest first.
@@ -158,6 +189,46 @@ pub fn splice(text: &str, begin: &str, end: &str, body: &str) -> Result<String> 
     Ok(format!("{}\n{}\n\n{}", &text[..start], body.trim_end_matches('\n'), &text[stop..]))
 }
 
+/// The release whose changelog row (`| v0 | ... | Basic eval |`) gets the cards
+/// (`CUTEAFD_RELEASE_ROW`, default `v0`).
+fn release_row() -> String {
+    std::env::var("CUTEAFD_RELEASE_ROW").unwrap_or_else(|_| "v0".into())
+}
+
+/// Fills the Basic eval cell of each `docs/models/<family>.md` changelog row of
+/// this release with the family's Release smoke cards.
+fn family_pages(root: &Path, placed: &[Placed]) -> Result<()> {
+    let row = format!("| {} |", release_row());
+    for family in FAMILIES {
+        let path = root.join("docs/models").join(format!("{family}.md"));
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let cards = family_cards(placed, family);
+        if cards.is_empty() {
+            continue;
+        }
+        let mut changed = false;
+        let lines: Vec<String> = text.lines().map(|line| {
+            if !line.starts_with(&row) {
+                return line.to_string();
+            }
+            let cells: Vec<&str> = line.trim_end().trim_end_matches('|').split('|').collect();
+            if cells.len() < 3 {
+                return line.to_string();
+            }
+            changed = true;
+            format!("{}| {cards} |", cells[..cells.len() - 1].join("|"))
+        }).collect();
+        if changed {
+            let mut out = lines.join("\n");
+            if text.ends_with('\n') {
+                out.push('\n');
+            }
+            crate::cli::write_if_changed(&path, &out)?;
+        }
+    }
+    Ok(())
+}
+
 const INDEX_HEADER: &str = "# Benchmarks\n\nReports from `cuteafd bench` (profiles other than the basic one run \
     when asked). Each directory holds `report.svg`, `report.json` and the share card; `cuteafd bench publish` \
     rebuilds this index and the root README's table.\n\n";
@@ -191,6 +262,7 @@ pub fn publish(root: &Path, dirs: &[PathBuf]) -> Result<(PathBuf, PathBuf, usize
     let current = std::fs::read_to_string(&index_path)
         .unwrap_or_else(|_| format!("{INDEX_HEADER}{INDEX_BEGIN}\n{INDEX_END}\n"));
     crate::cli::write_if_changed(&index_path, &splice(&current, INDEX_BEGIN, INDEX_END, &index(&placed))?)?;
+    family_pages(root, &placed)?;
     Ok((readme, index_path, placed.len()))
 }
 
@@ -201,6 +273,9 @@ mod tests {
     #[test]
     fn publish_rebuilds_the_table_and_index() {
         let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("docs/models")).unwrap();
+        std::fs::write(root.path().join("docs/models/deepseek_v41.md"),
+            "## Changelog\n\n| Version | Date | Change | Basic eval |\n| --- | --- | --- | --- |\n| v0 | 2026-10-02 | First release | — |\n").unwrap();
         std::fs::write(root.path().join("README.md"),
             format!("# x\n\n{RESULTS_BEGIN}\n_Pending._\n{RESULTS_END}\n\nrest\n")).unwrap();
         let mut ok = crate::sample::report(false);
@@ -217,9 +292,12 @@ mod tests {
         let (readme, index, count) = publish(root.path(), &[dir]).unwrap();
         assert_eq!(count, 2);
         let readme = std::fs::read_to_string(readme).unwrap();
-        assert!(readme.contains("#### DeepSeek V4.1"), "{readme}");
+        assert!(readme.contains("<img src=\"benchmarks/deepseek_v41/2026-10-02-smoke-1rtx-4spark/card.svg\""), "{readme}");
         // One row per checkpoint × hardware: the newest wins.
         assert_eq!(readme.matches("| DeepSeek-V4.1-Flash (mxfp4) |").count(), 1, "{readme}");
+        assert!(super::family_cards(&scan(root.path()).unwrap(), "deepseek_v41").contains("../../benchmarks/"));
+        let page = std::fs::read_to_string(root.path().join("docs/models/deepseek_v41.md")).unwrap();
+        assert!(page.contains("| v0 | 2026-10-02 | First release | <a href=\"../../benchmarks/"), "{page}");
         assert!(readme.contains("benchmarks/deepseek_v41/2026-10-02-smoke-1rtx-4spark/report.svg"));
         assert!(readme.ends_with("rest\n"));
         let index = std::fs::read_to_string(index).unwrap();
