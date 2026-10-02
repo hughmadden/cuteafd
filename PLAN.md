@@ -591,6 +591,16 @@ steps into `work/p0`; tag `v1.0.0` when the list's top half is done.
 7. **Phase 6 placement planner** (incl. cold components such as the vision
    encoder on a Spark) and **multimodal input** (official encoders only).
 8. **NVFP4 follow-ups**: native per-tensor FP8 decode with static scales.
+   **Revisit W4A4 for `nvidia/DeepSeek-V4.1-Flash-NVFP4`** (TJ): V4.1's own
+   NVFP4 path keeps the ds41rt 44-slot W4A4 family opt-in because ds41rt
+   measured it slower, which is implausible for FP4 MMAs on Blackwell and
+   contradicts the checkpoint's declared numerics (W4A4, static input_scale).
+   Honor the checkpoint: profile why ds41rt's W4A4 lost (likely activation
+   quant overhead, tile shapes, or decode rows taking the W4A4 path), port the
+   shared fp8_moe W4A4 route (fused gate/up + SwiGLU + FP4 quant, large-row
+   threshold, W4A16 decode rows) to V4.1 if it wins, and make W4A4 the default
+   for that checkpoint. Gate: V4.1 golden/KL vs the official FP8 reference,
+   8K prefill and C1/C4 vs the current NVFP4 default.
 9. **Parked**: Spark-side reduce-scatter ([`work/spark-reduce`](https://github.com/tpurtell/cuteafd/tree/work/spark-reduce),
    +3% one rail, +9–12% two rails at 200G); split intake
    ([`work/split-intake`](https://github.com/tpurtell/cuteafd/tree/work/split-intake), slower). Revisit only on new evidence.
