@@ -42,6 +42,12 @@ pub struct MimoCapacityOptions {
 pub struct MimoCapacityProfiles {
     /// Fixed-only admission before any target weight allocation.
     pub loading: Vec<DeviceCosts>,
+    /// Actual target storage after KV/peer attachment, before drafter packing,
+    /// marks, workspaces, routed experts and Spark transport are allocated.
+    /// `pool_unit_bytes` contains only the persistent target record pools.
+    /// The runtime adds the selected drafter packing costs and live peer/module
+    /// storage to admit that later loading phase separately from steady use.
+    pub post_target_kv: Vec<DeviceCosts>,
     /// Persistent admission, including the selected logical KV pool.
     pub steady: CapacityProfile,
 }
@@ -128,6 +134,7 @@ pub fn mimo_capacity_profiles(
         .ok_or(CacheGeometryError::Overflow("MiMo aggregate exact mark"))?;
     let mut devices = Vec::with_capacity(options.ranks.len());
     let mut loading = Vec::with_capacity(options.ranks.len());
+    let mut post_target_kv = Vec::with_capacity(options.ranks.len());
     for (rank, runtime) in options.ranks.iter().enumerate() {
         if options.ranks[..rank]
             .iter()
@@ -147,14 +154,14 @@ pub fn mimo_capacity_profiles(
                 "loading.mtp_state_before_target_kv",
                 before_kv_state,
             );
-            // The loader drains this peak before target KV allocation. It
-            // constrains startup, without reducing the steady KV/expert budget.
-            reserve(
-                &mut loading_costs,
-                "loading.temporary",
-                resident.loading_temporary_rank0_bytes,
-            );
         }
+        // Each rank's loader drains its source peak before target KV. This
+        // constrains startup without reducing the steady KV/expert budget.
+        reserve(
+            &mut loading_costs,
+            "loading.temporary",
+            resident.loading_temporary_rank_bytes[rank],
+        );
         loading_costs.extend(runtime.loading_additional.iter().cloned());
         loading_costs
             .iter()
@@ -176,6 +183,23 @@ pub fn mimo_capacity_profiles(
                 &[options.rings, storage.active_state_per_sequence_bytes],
             )?,
         );
+        reserve(&mut costs, "state.fixed", storage.fixed_state_bytes);
+        reserve(
+            &mut costs,
+            "context.rope_tables",
+            product(
+                "MiMo RoPE tables",
+                &[
+                    options.max_context_tokens,
+                    storage.context_table_bytes_per_token,
+                ],
+            )?,
+        );
+        post_target_kv.push(DeviceCosts {
+            device: runtime.device,
+            reservations: costs.clone(),
+            pool_unit_bytes: storage.persistent_unit_bytes,
+        });
         if options.mark_slots > 0 && mark_bytes > 0 {
             reserve(
                 &mut costs,
@@ -187,22 +211,10 @@ pub fn mimo_capacity_profiles(
                 .max(256),
             );
         }
-        reserve(&mut costs, "state.fixed", storage.fixed_state_bytes);
         reserve(
             &mut costs,
             "state.speculative_replay",
             storage.speculative_replay_bytes,
-        );
-        reserve(
-            &mut costs,
-            "context.rope_tables",
-            product(
-                "MiMo RoPE tables",
-                &[
-                    options.max_context_tokens,
-                    storage.context_table_bytes_per_token,
-                ],
-            )?,
         );
         let mut unit_bytes = add(
             "MiMo persistent pool metadata",
@@ -250,6 +262,7 @@ pub fn mimo_capacity_profiles(
     }
     Ok(MimoCapacityProfiles {
         loading,
+        post_target_kv,
         steady: CapacityProfile {
             // MiMo attention consumes dynamic key/page extents; it does not index
             // the GLM/Qwen MAX_CONTEXT-sized exported attention map.
@@ -277,8 +290,8 @@ mod tests {
             checkpoint_tp: 1,
             native_mtp_layers: 0,
             gpu_embedding: true,
-            fp8_head: true,
-            fp8_o_proj: true,
+            fp8_head: false,
+            fp8_o_proj: false,
         }
     }
 
@@ -385,6 +398,25 @@ mod tests {
             .find(|r| r.name == "loading.temporary")
             .unwrap();
         assert_eq!(loading_extra.bytes, 4096 * 8192 * 2);
+        for phase in &phases.post_target_kv {
+            assert_eq!(phase.pool_unit_bytes, 64 * 720);
+            assert!(phase
+                .reservations
+                .iter()
+                .any(|cost| cost.name == "state.active_rings"));
+            assert!(phase
+                .reservations
+                .iter()
+                .any(|cost| cost.name == "context.rope_tables"));
+            assert!(!phase
+                .reservations
+                .iter()
+                .any(|cost| cost.name.starts_with("prefix.")
+                    || cost.name.starts_with("prefill.")
+                    || cost.name.starts_with("decode.")
+                    || cost.name.starts_with("loading.")
+                    || cost.name == "native.modules"));
+        }
     }
 
     #[test]
@@ -414,6 +446,7 @@ mod tests {
         let all = mimo_capacity_profiles(&checkpoint, &cfg, weights(2), &diagnostic).unwrap();
         let last = mimo_capacity_profiles(&checkpoint, &cfg, weights(2), &serving).unwrap();
         assert_eq!(all.loading, last.loading);
+        assert_eq!(all.post_target_kv, last.post_target_kv);
         assert_eq!(all.steady.host_prefix_bytes, last.steady.host_prefix_bytes);
         for rank in 0..2 {
             let before = &all.steady.devices[rank];

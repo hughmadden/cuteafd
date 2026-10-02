@@ -1,6 +1,7 @@
 //! Header-only admission for the representations MimoLoader actually keeps.
 //! Routed experts, CUDA modules/graphs, runtime workspaces and draft rings
 //! remain separate reservations. No tensor data or CUDA allocation is read.
+use super::projection::{MimoProjectionLayout, MimoProjectionRepresentation};
 use super::{FusedQkvLayout, MimoAttention, MimoV2Config};
 use crate::plan::checkpoint::{Checkpoint, CheckpointTensor};
 use crate::serving_capacity::CacheGeometryError;
@@ -14,17 +15,18 @@ pub struct MimoResidentOptions {
     pub native_mtp_layers: usize,
     pub gpu_embedding: bool,
     pub fp8_head: bool,
-    /// Effective loader policy: fp8_decode && fp8_o_proj.
+    /// Selected immutable output representation, independent of activation precision.
     pub fp8_o_proj: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MimoResidentLayout {
     pub ranks: Vec<Vec<MemoryReservation>>,
-    /// Loading may stage a whole o_proj while both shares exist, or retain
-    /// source FP8 values/scales while producing its BF16 destination. Reserve
-    /// the maximum extra device bytes until loading drains, before KV exists.
-    pub loading_temporary_rank0_bytes: u64,
+    /// Maximum extra source storage on each physical rank while target weights
+    /// load, before target KV exists. BF16 TP2 slices a whole output matrix on
+    /// the lead; selected FP8 packing stages at most1024 source rows per rank.
+    /// A checkpoint-native FP8 upload needs no device source staging.
+    pub loading_temporary_rank_bytes: Vec<u64>,
 }
 
 fn mul(label: &'static str, dims: &[u64]) -> Result<u64, CacheGeometryError> {
@@ -176,6 +178,57 @@ fn fp8_copy(
     Ok(())
 }
 
+fn projection(
+    checkpoint: &Checkpoint,
+    source: &CheckpointTensor,
+    costs: &mut Vec<MemoryReservation>,
+    name: &str,
+    rows: u64,
+    cols: u64,
+    fp8: bool,
+    scale_banks: u64,
+) -> Result<u64, CacheGeometryError> {
+    let representation = if fp8 {
+        MimoProjectionRepresentation::Fp8
+    } else {
+        MimoProjectionRepresentation::Bf16
+    };
+    let layout =
+        MimoProjectionLayout::new(rows, cols, representation, scale_banks).map_err(|error| {
+            CacheGeometryError::ResidentTensor {
+                name: source.meta.name.clone(),
+                what: error.to_string(),
+            }
+        })?;
+    push(
+        costs,
+        format!("{name}.{}", if fp8 { "fp8" } else { "bf16" }),
+        layout.values,
+    );
+    if fp8 {
+        // The allocator keeps row-major and (for O) K-major scale orders.
+        let bank_bytes = layout.scales / scale_banks;
+        push(costs, format!("{name}.row_scale"), bank_bytes);
+        if scale_banks == 2 {
+            push(costs, format!("{name}.k_scale"), bank_bytes);
+        }
+        if source.meta.dtype == DType::F8E4M3 {
+            fp8_scales(
+                checkpoint,
+                &source.meta.name,
+                source.meta.shape[0],
+                source.meta.shape[1],
+                true,
+            )?;
+            Ok(0)
+        } else {
+            Ok(layout.max_load_staging)
+        }
+    } else {
+        conversion_temporary(checkpoint, source)
+    }
+}
+
 fn small(
     checkpoint: &Checkpoint,
     costs: &mut Vec<MemoryReservation>,
@@ -199,7 +252,7 @@ fn block(
     checkpoint_tp: usize,
     fp8_o: bool,
     costs: &mut [Vec<MemoryReservation>],
-) -> Result<u64, CacheGeometryError> {
+) -> Result<Vec<u64>, CacheGeometryError> {
     let share = cfg
         .head_split(ranks)
         .map_err(|_| CacheGeometryError::Unsupported {
@@ -286,7 +339,7 @@ fn block(
         checkpoint,
         &o_name,
         &[cfg.hidden, o_cols],
-        if ranks > 1 {
+        if ranks > 1 && !fp8_o {
             &[DType::Bf16]
         } else {
             &[DType::Bf16, DType::F8E4M3]
@@ -305,6 +358,7 @@ fn block(
             fp8_scales(checkpoint, &name, shape[0], shape[1], false)?;
         }
     }
+    let mut temporary = vec![0; ranks];
     for (rank, out) in costs.iter_mut().take(ranks).enumerate() {
         small(
             checkpoint,
@@ -327,15 +381,18 @@ fn block(
             cfg.hidden as u64,
             true,
         )?;
-        push(out, format!("{prefix}.o_proj.bf16"), o_bytes / ranks as u64);
-        if fp8_o {
-            fp8_copy(
-                out,
-                &format!("{prefix}.o_proj"),
-                cfg.hidden as u64,
-                (o_cols / ranks) as u64,
-                false,
-            )?;
+        temporary[rank] = projection(
+            checkpoint,
+            o_tensor,
+            out,
+            &format!("{prefix}.o_proj"),
+            cfg.hidden as u64,
+            (o_cols / ranks) as u64,
+            fp8_o,
+            2,
+        )?;
+        if !fp8_o && ranks > 1 && rank == 0 {
+            temporary[rank] = temporary[rank].max(o_bytes);
         }
         if attention == MimoAttention::Sliding {
             let t = tensor(
@@ -387,11 +444,7 @@ fn block(
             )?;
         }
     }
-    Ok(if ranks > 1 {
-        o_bytes
-    } else {
-        conversion_temporary(checkpoint, o_tensor)?
-    })
+    Ok(temporary)
 }
 
 #[cfg(test)]
@@ -408,8 +461,8 @@ mod tests {
             checkpoint_tp: tp,
             native_mtp_layers: 0,
             gpu_embedding: true,
-            fp8_head: true,
-            fp8_o_proj: true,
+            fp8_head: false,
+            fp8_o_proj: false,
         }
     }
     fn total(layout: &MimoResidentLayout) -> u64 {
@@ -417,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn flash_fp8_copies_and_both_scale_layouts_are_real_reservations() {
+    fn flash_selected_fp8_owns_one_value_copy_and_two_output_scale_banks() {
         let dir = tempfile::tempdir().unwrap();
         write_snapshot(
             dir.path(),
@@ -427,7 +480,12 @@ mod tests {
         );
         let checkpoint = Checkpoint::open(dir.path()).unwrap();
         let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
-        let copies = MimoResidentLayout::new(&checkpoint, &cfg, options(1, 1)).unwrap();
+        let fp8_options = MimoResidentOptions {
+            fp8_head: true,
+            fp8_o_proj: true,
+            ..options(1, 1)
+        };
+        let copies = MimoResidentLayout::new(&checkpoint, &cfg, fp8_options).unwrap();
         let plain = MimoResidentLayout::new(
             &checkpoint,
             &cfg,
@@ -438,7 +496,24 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(total(&copies) - total(&plain), 69_476_352);
+        assert_eq!(total(&plain) - total(&copies), 63_168_512);
+        assert!(copies.ranks[0]
+            .iter()
+            .all(|cost| !cost.name.ends_with("o_proj.bf16") && cost.name != "lm_head.bf16"));
+        assert!(plain.ranks[0].iter().all(
+            |cost| !cost.name.starts_with("lm_head.fp8") && !cost.name.ends_with("o_proj.fp8")
+        ));
+        for layer in 0..2 {
+            let name = format!("model.layers.{layer}.o_proj.k_scale");
+            assert_eq!(
+                copies.ranks[0]
+                    .iter()
+                    .find(|cost| cost.name == name)
+                    .unwrap()
+                    .bytes,
+                4096 * 64 * 4
+            );
+        }
         for rank in &copies.ranks {
             for scale in rank.iter().filter(|r| r.name.ends_with(".k_scale")) {
                 let row = rank
@@ -448,13 +523,13 @@ mod tests {
                 assert_eq!(row.bytes, scale.bytes);
             }
         }
-        assert_eq!(copies.loading_temporary_rank0_bytes, 0);
+        assert_eq!(copies.loading_temporary_rank_bytes, [1024 * 8192 * 2]);
         let host = MimoResidentLayout::new(
             &checkpoint,
             &cfg,
             MimoResidentOptions {
                 gpu_embedding: false,
-                ..options(1, 1)
+                ..fp8_options
             },
         )
         .unwrap();
@@ -478,8 +553,8 @@ mod tests {
                 && !r.name.starts_with("model.embed_tokens")
                 && !r.name.contains(".mlp.gate.")));
             assert_eq!(
-                split.loading_temporary_rank0_bytes,
-                cfg.hidden as u64 * cfg.heads as u64 * 128 * 2
+                split.loading_temporary_rank_bytes,
+                [cfg.hidden as u64 * cfg.heads as u64 * 128 * 2, 0]
             );
             if let Some(rows) = padded_rows {
                 let qkv = one.ranks[0]
@@ -489,6 +564,29 @@ mod tests {
                 assert_eq!(qkv.bytes, rows * cfg.hidden as u64);
             }
         }
+    }
+
+    #[test]
+    fn split_fp8_loading_peak_belongs_to_both_physical_ranks() {
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
+        let selected = MimoResidentOptions {
+            fp8_head: true,
+            fp8_o_proj: true,
+            ..options(2, 8)
+        };
+        let layout = MimoResidentLayout::new(&checkpoint, &cfg, selected).unwrap();
+        assert_eq!(layout.loading_temporary_rank_bytes, [16 << 20; 2]);
+        for costs in &layout.ranks {
+            assert!(costs
+                .iter()
+                .all(|cost| !cost.name.ends_with("o_proj.bf16") && cost.name != "lm_head.bf16"));
+        }
+        assert!(layout.ranks[1]
+            .iter()
+            .all(|cost| !cost.name.starts_with("lm_head")));
     }
 
     #[test]
@@ -523,14 +621,27 @@ mod tests {
         let cfg = MimoV2Config::from_hf(&config).unwrap();
         let layout = MimoResidentLayout::new(&checkpoint, &cfg, options(1, 1)).unwrap();
         assert_eq!(
-            layout.loading_temporary_rank0_bytes,
-            4096 * 8192 + 32 * 64 * 4
+            layout.loading_temporary_rank_bytes,
+            [4096 * 8192 + 32 * 64 * 4]
         );
-        // TP2's actual loader accepts BF16 o_proj only, before slicing.
+        // The BF16 TP2 loader accepts BF16 o_proj only, before slicing.
         assert!(
             matches!(MimoResidentLayout::new(&checkpoint, &cfg, options(2, 1)),
             Err(CacheGeometryError::ResidentTensor { name, .. }) if name == o)
         );
+
+        let fp8 = MimoResidentOptions {
+            fp8_o_proj: true,
+            ..options(2, 1)
+        };
+        let native = MimoResidentLayout::new(&checkpoint, &cfg, fp8).unwrap();
+        // Layer0 directly uploads its checkpoint FP8; the other BF16 layer's
+        // drained source stage is bounded independently on both ranks.
+        assert_eq!(native.loading_temporary_rank_bytes, [1024 * 4096 * 2; 2]);
+        assert!(native
+            .ranks
+            .iter()
+            .all(|costs| costs.iter().all(|cost| !cost.name.ends_with("o_proj.bf16"))));
 
         let k = "model.layers.0.self_attn.k_proj.weight_scale_inv";
         tensors.iter_mut().find(|t| t.0 == k).unwrap().2 = vec![7, 32];
@@ -567,9 +678,9 @@ impl MimoResidentLayout {
             });
         }
         let mut costs = vec![Vec::new(); options.coordinator_ranks];
-        let mut temporary = 0;
+        let mut temporary = vec![0; options.coordinator_ranks];
         for layer in 0..options.layers {
-            temporary = temporary.max(block(
+            let peak = block(
                 checkpoint,
                 cfg,
                 &format!("model.layers.{layer}"),
@@ -580,7 +691,10 @@ impl MimoResidentLayout {
                 options.checkpoint_tp,
                 options.fp8_o_proj,
                 &mut costs,
-            )?);
+            )?;
+            for (reserved, peak) in temporary.iter_mut().zip(peak) {
+                *reserved = (*reserved).max(peak);
+            }
         }
         small(
             checkpoint,
@@ -595,24 +709,16 @@ impl MimoResidentLayout {
             &[cfg.vocab_size, cfg.hidden],
             &[DType::Bf16, DType::F8E4M3],
         )?;
-        temporary = temporary.max(conversion_temporary(checkpoint, head)?);
-        push(
+        temporary[0] = temporary[0].max(projection(
+            checkpoint,
+            head,
             &mut costs[0],
-            "lm_head.bf16",
-            mul(
-                "MiMo BF16 head",
-                &[cfg.vocab_size as u64, cfg.hidden as u64, 2],
-            )?,
-        );
-        if options.fp8_head {
-            fp8_copy(
-                &mut costs[0],
-                "lm_head",
-                cfg.vocab_size as u64,
-                cfg.hidden as u64,
-                false,
-            )?;
-        }
+            "lm_head",
+            cfg.vocab_size as u64,
+            cfg.hidden as u64,
+            options.fp8_head,
+            1,
+        )?);
         if options.gpu_embedding {
             small(
                 checkpoint,
@@ -624,7 +730,7 @@ impl MimoResidentLayout {
         }
         for stage in 0..options.native_mtp_layers {
             let prefix = format!("model.mtp.layers.{stage}");
-            temporary = temporary.max(block(
+            let peak = block(
                 checkpoint,
                 cfg,
                 &prefix,
@@ -635,7 +741,8 @@ impl MimoResidentLayout {
                 options.checkpoint_tp,
                 options.fp8_o_proj,
                 &mut costs[..1],
-            )?);
+            )?;
+            temporary[0] = temporary[0].max(peak[0]);
             small(
                 checkpoint,
                 &mut costs[0],
@@ -662,7 +769,7 @@ impl MimoResidentLayout {
         }
         Ok(Self {
             ranks: costs,
-            loading_temporary_rank0_bytes: temporary,
+            loading_temporary_rank_bytes: temporary,
         })
     }
 }
