@@ -42,6 +42,8 @@ pub(crate) struct DistributedTargetPass<'w, 'a> {
     /// used for verification passes only.
     chain: Option<crate::shared::memory::chain::StageChain<'a>>,
     verification: bool,
+    /// The next verification pass may run device-ordered (see `set_device_order`).
+    device_order: bool,
     sampled: Option<crate::families::deepseek_v41::v41_target_head::SampledTargetRows>,
     #[cfg(test)]
     trace: bool,
@@ -172,6 +174,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             route_capture: (0..40).map(|_| Vec::with_capacity(4096)).collect(),
             chain,
             verification: false,
+            device_order: true,
             sampled: None,
             #[cfg(test)]
             trace: false,
@@ -212,6 +215,8 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     }
     /// The next `execute` is a verification pass (consumed by that call).
     pub(crate) fn mark_verification(&mut self) { self.verification = true; }
+    /// The next pass may run device-ordered (`CUTEAFD_V41_DEVICE`); reset after it.
+    pub(crate) fn set_device_order(&mut self, on: bool) { self.device_order = on; }
     /// Device-select the rows of a completed non-greedy verification pass.
     /// # Safety
     /// The pass completed with `greedy = false` and its head is unconsumed.
@@ -292,6 +297,9 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         // modes (TP2 attention/query/output, all opt-in) keep host drains.
         let chained = std::mem::replace(&mut self.verification, false)
             && !self.lanes.iter().any(|lane| lane.uses_peer_projection());
+        if let Some(chain) = &self.chain {
+            chain.set_device_order(std::mem::replace(&mut self.device_order, true));
+        }
         let Some(handle) = self.chain.as_ref().filter(|_| chained).map(|chain| chain.handle()) else {
             return unsafe { self.execute_unchained(requests, batch, transport, placement, selected,
                 suffix, encoder, greedy).await };

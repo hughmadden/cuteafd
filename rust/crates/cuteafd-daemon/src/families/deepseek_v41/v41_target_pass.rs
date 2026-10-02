@@ -130,8 +130,12 @@ pub(crate) struct TargetPass<'w, 'a> {
     sampled: Option<SampledTargetRows>,
     /// Device-side stage ordering for this pass owner (see `v41_memory::chain`).
     chain: Option<crate::shared::memory::chain::StageChain<'a>>,
+    /// The next verification pass may run device-ordered (see `set_device_order`).
+    device_order: bool,
 }
 impl<'w, 'a> TargetPass<'w, 'a> {
+    /// The next pass may run device-ordered (`CUTEAFD_V41_DEVICE`); reset after it.
+    pub(crate) fn set_device_order(&mut self, on: bool) { self.device_order = on; }
     pub fn set_route_capture(&mut self, enabled: bool) {
         self.lane.set_route_capture(enabled);
         if enabled { self.index.enable_small_graph_shapes(); }
@@ -178,6 +182,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             state: State::Idle,
             sampled: None,
             chain,
+            device_order: true,
         })
     }
     /// # Safety
@@ -324,6 +329,9 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         // Prefill, encoder and replay passes keep host-drained stages: their
         // many-row paths publish KV and encoder state through host-ordered copies.
         let verification = matches!(terminal, HeadTerminal::Greedy | HeadTerminal::Sampled { .. });
+        if let Some(chain) = &self.chain {
+            chain.set_device_order(std::mem::replace(&mut self.device_order, true));
+        }
         let Some(handle) = self.chain.as_ref().filter(|_| verification).map(|chain| chain.handle()) else {
             return unsafe { self.execute_phase_inner(requests, batch, transport, placement, selected,
                 suffix, encoder, terminal).await };
