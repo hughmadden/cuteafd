@@ -27,8 +27,11 @@ use crate::synthetic::{expert_response_from_protocol_v2_response, protocol_v2_re
 use crate::{is_connection_closed, verbs_host_preflight, ExpertProtocolV2FrameBuffer, ExpertProtocolV2Request, ExpertProtocolV2RequestView, ExpertProtocolV2Response, ExpertProtocolV2ResponseHeader, ExpertProtocolV2ResponseView, ExpertProtocolV2Status, ExpertV2Dtype, TcpTransportConfig, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN};
 
 const VERBS_HOST_RECV_WR_ID: u64 = 0x7256_1001;
-/// Request payloads at least this large are staged by several threads.
-const PARALLEL_REQUEST_COPY_BYTES: usize = 4 << 20;
+/// Request payloads above this size are staged by several threads. V4.1's
+/// ~11 MB prefill requests stay single-threaded: the serial copy spaces the
+/// ranks' sends, and eight-thread staging cost 4-5% of its 8K prefill (p9
+/// cut, 0.953 / 0.962 of p8); MiMo V2.6 Pro's 26 MB waves still gain.
+const PARALLEL_REQUEST_COPY_BYTES: usize = 16 << 20;
 
 /// `dst.copy_from_slice(src)` split over eight threads.
 fn copy_threads(dst: &mut [u8], src: &[u8]) {
