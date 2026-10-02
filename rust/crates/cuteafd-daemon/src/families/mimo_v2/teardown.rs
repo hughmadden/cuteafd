@@ -8,6 +8,16 @@ pub(super) enum CleanupStep {
     RestoreDevice,
 }
 
+/// An outer-owned stream may predate its installation in the engine. Retire
+/// it after engine queues, or retain all owners if either proof fails. Do not
+/// touch a potentially blocked outer queue after engine retirement failed.
+pub(super) fn retire_engine(has_uninstalled_peer: bool, engine: impl FnOnce() -> Result<()>,
+    peer: impl FnOnce() -> Result<()>, retain: impl FnOnce()) -> Result<()> {
+    let result = engine().and_then(|()| if has_uninstalled_peer { peer() } else { Ok(()) });
+    if result.is_err() { retain(); }
+    result
+}
+
 /// Cleanup errors must not replace the error that made the engine stop.
 /// This does not cancel queued peer waits; callers still own that drain.
 pub(super) fn finish<T>(body: Result<T>, has_peer: bool,
@@ -37,6 +47,40 @@ mod tests {
     #[derive(Debug, thiserror::Error)]
     #[error("forward capacity failure")]
     struct ForwardFailure;
+
+    #[test]
+    fn partial_peer_initialization_retires_both_owned_stream_phases() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        retire_engine(true, || { seen.borrow_mut().push("engine"); Ok(()) },
+            || { seen.borrow_mut().push("uninstalled-peer"); Ok(()) },
+            || seen.borrow_mut().push("retained")).unwrap();
+        assert_eq!(*seen.borrow(), ["engine", "uninstalled-peer"]);
+    }
+
+    #[test]
+    fn failed_engine_proof_retains_without_entering_possibly_blocked_peer() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let error = retire_engine(true, || { seen.borrow_mut().push("engine-failed"); Err(ForwardFailure.into()) },
+            || panic!("unproven peer drain may block"), || seen.borrow_mut().push("retained")).unwrap_err();
+        assert!(error.downcast_ref::<ForwardFailure>().is_some());
+        assert_eq!(*seen.borrow(), ["engine-failed", "retained"]);
+    }
+
+    #[test]
+    fn failed_uninstalled_peer_proof_retains_its_typed_error() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let error = retire_engine(true, || { seen.borrow_mut().push("engine"); Ok(()) },
+            || { seen.borrow_mut().push("peer-failed"); Err(ForwardFailure.into()) },
+            || seen.borrow_mut().push("retained")).unwrap_err();
+        assert!(error.downcast_ref::<ForwardFailure>().is_some());
+        assert_eq!(*seen.borrow(), ["engine", "peer-failed", "retained"]);
+    }
+
+    #[test]
+    fn installed_peer_is_already_owned_by_engine_retirement() {
+        retire_engine(false, || Ok(()), || panic!("duplicate outer stream retirement"),
+            || panic!("successful retirement retained owners")).unwrap();
+    }
 
     #[test]
     fn forward_error_survives_every_cleanup_failure() {

@@ -681,55 +681,73 @@ impl Opened {
         let pages = usize::try_from(preflight.capacity.allocated_gpu_kv_tokens)? / engine::PAGE_ROWS;
         let mut engine = engine::MimoEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages, args.rings, embedding, args.kv_cache.into(), prefill_output)?;
-        engine.prefill_w8a8 = !args.prefill_w8a16;
-        engine.output_fp8_decode = args.fp8_decode;
-        engine.decode_graphs = args.decode_graphs;
-        engine.graph_storage_plan = Some(preflight.graph_plan.clone());
-        engine.graph_storage_bound_bytes = Some(preflight.graph_bound_bytes.clone());
-        {
-            use cuteafd_loader::families::mimo_v2::MimoAttention;
-            let kv = args.kv_cache.into();
-            let per_token: usize = self.cfg.attention.iter().take(layers).filter(|a| **a == MimoAttention::Full)
-                .map(|_| self.cfg.record_bytes(MimoAttention::Full, kv)).sum();
-            let ring_bytes: usize = self.cfg.attention.iter().take(layers).filter(|a| **a == MimoAttention::Sliding)
-                .map(|_| self.cfg.record_bytes(MimoAttention::Sliding, kv) * engine::RING_ROWS).sum();
-            tracing::info!(kv_cache = ?args.kv_cache, pool_tokens = pages * engine::PAGE_ROWS,
-                bytes_per_token = per_token, tokens_per_gib = (1usize << 30) / per_token.max(1),
-                ring_mib_per_sequence = format!("{:.2}", ring_bytes as f64 / (1u64 << 20) as f64), "MiMo KV records");
-        }
-        if let Some((device, stream)) = peer_stream {
-            engine.attach_peer(device, stream, shares.pop().context("head-split shares")?)?;
-        }
-        engine.mtp = mtp;
-        if let Some(dir) = &draft_dir {
-            let started = Instant::now();
-            let cfg = dflash::DflashConfig::read(dir)?;
-            ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
-                && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash drafter does not fit this target");
-            let mask = match dflash::mask_embedding(dir, cfg.hidden)? {
-                Some(row) => row,
-                None => engine.embedding.host_rows(&[cfg.mask_token])?,
-            };
-            let file = draft_file.context("drafter prefetch")?.join()
-                .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
-            let capacity = args.draft_capacity(cfg.block)?;
-            let representation = self.weight_formats.draft;
-            let drafter = dflash::MimoDrafter::load(&self.library, dir, file, stream, capacity.context_slots,
-                capacity.max_batch_sequences, mask, representation, args.fp8_scales)?;
-            engine.drafter = Some(drafter);
-            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash drafter resident");
-        }
-        let moe_layers = (0..layers).filter(|&l| !self.cfg.dense[l]).collect::<Vec<_>>();
-        engine.expert_input = args.expert_input;
-        if let Some(experts) = self.experts(args, &moe_layers, preflight.local_expert_budget)? {
-            engine.set_experts(experts);
-        }
-        if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
-            engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
-        }
-        let result = body(&engine, preflight.host_config);
+        // Once an engine exists, setup and body failures share the same terminal
+        // retirement path. Pre-engine loader ownership is a separate boundary.
+        let result = (|| -> Result<T> {
+            engine.prefill_w8a8 = !args.prefill_w8a16;
+            engine.output_fp8_decode = args.fp8_decode;
+            engine.decode_graphs = args.decode_graphs;
+            engine.graph_storage_plan = Some(preflight.graph_plan.clone());
+            engine.graph_storage_bound_bytes = Some(preflight.graph_bound_bytes.clone());
+            {
+                use cuteafd_loader::families::mimo_v2::MimoAttention;
+                let kv = args.kv_cache.into();
+                let per_token: usize = self.cfg.attention.iter().take(layers).filter(|a| **a == MimoAttention::Full)
+                    .map(|_| self.cfg.record_bytes(MimoAttention::Full, kv)).sum();
+                let ring_bytes: usize = self.cfg.attention.iter().take(layers).filter(|a| **a == MimoAttention::Sliding)
+                    .map(|_| self.cfg.record_bytes(MimoAttention::Sliding, kv) * engine::RING_ROWS).sum();
+                tracing::info!(kv_cache = ?args.kv_cache, pool_tokens = pages * engine::PAGE_ROWS,
+                    bytes_per_token = per_token, tokens_per_gib = (1usize << 30) / per_token.max(1),
+                    ring_mib_per_sequence = format!("{:.2}", ring_bytes as f64 / (1u64 << 20) as f64), "MiMo KV records");
+            }
+            if let Some((device, stream)) = peer_stream {
+                engine.attach_peer(device, stream, shares.pop().context("head-split shares")?)?;
+            }
+            engine.mtp = mtp;
+            if let Some(dir) = &draft_dir {
+                let started = Instant::now();
+                let cfg = dflash::DflashConfig::read(dir)?;
+                ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
+                    && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash drafter does not fit this target");
+                let mask = match dflash::mask_embedding(dir, cfg.hidden)? {
+                    Some(row) => row,
+                    None => engine.embedding.host_rows(&[cfg.mask_token])?,
+                };
+                let file = draft_file.context("drafter prefetch")?.join()
+                    .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
+                let capacity = args.draft_capacity(cfg.block)?;
+                let representation = self.weight_formats.draft;
+                let drafter = dflash::MimoDrafter::load(&self.library, dir, file, stream, capacity.context_slots,
+                    capacity.max_batch_sequences, mask, representation, args.fp8_scales)?;
+                engine.drafter = Some(drafter);
+                tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash drafter resident");
+            }
+            let moe_layers = (0..layers).filter(|&l| !self.cfg.dense[l]).collect::<Vec<_>>();
+            engine.expert_input = args.expert_input;
+            if let Some(experts) = self.experts(args, &moe_layers, preflight.local_expert_budget)? {
+                engine.set_experts(experts);
+            }
+            if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
+                engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
+            }
+            body(&engine, preflight.host_config)
+        })();
         let submission_failed = engine.submission_failed();
-        let shutdown = engine.terminal_shutdown();
+        let uninstalled_peer = peer_stream.filter(|_| engine.ranks() == 1);
+        let shutdown = teardown::retire_engine(uninstalled_peer.is_some(), || engine.terminal_shutdown(), || {
+            // attach_peer installs its peer/exchange only after initialization
+            // succeeds. Its caller still owns the created peer stream on an
+            // earlier failure, so engine-only drainage cannot certify it.
+            if let Some((device, peer_owned)) = uninstalled_peer {
+                crate::shared::peer_split::on_device(&self.library, device, args.device, || {
+                    // SAFETY: the stream is still owned by this scope; no peer
+                    // wait was submitted before attach_peer installed exchange.
+                    unsafe { self.library.cuda_stream_synchronize(peer_owned)?; }
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        }, || engine.retain_serving_storage());
         let result = match (result,shutdown) {
             (Err(primary),Err(cleanup))=> {
                 tracing::error!(error=%format!("{cleanup:#}"),"terminal shutdown also failed; preserving primary body error");
