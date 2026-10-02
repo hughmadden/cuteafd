@@ -145,9 +145,9 @@ fi
 # GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
 # from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" requires native
 # FP8 block tensors in the primary checkpoint). KDA's BF16 source weights run as-is by default
-# (GLM5_FLASH_KDA_FP8: unset/auto/off); explicit row128/channel still make
-# dual resident copies and await single-copy qualification. Optionally an FP8 LM head
-# (GLM5_FLASH_FP8_HEAD=on); its MLA pools hold POOL_TOKENS tokens (a key every
+# (GLM5_FLASH_KDA_FP8: unset/auto/off). Legacy row128/channel and the extra
+# FP8 head are unsupported until they have single-copy consumers. Its MLA
+# pools hold POOL_TOKENS tokens (a key every
 # family with a paged KV pool reads). GLM5_FLASH_FP8_PREFILL lists the prefill
 # projections that run W8A8 (E4M3 activations per 128-K block): unset = the
 # engine default mla,ffn (the official FP8 tensors), a list of
@@ -162,12 +162,22 @@ if [[ $family == glm5_flash ]]; then
   kda_fp8="$(key GLM5_FLASH_KDA_FP8 GLMF_KDA_FP8 auto)"
   case "$kda_fp8" in
     ""|auto|off) kda_fp8=off ;;
-    row128|channel) ;;
+    row128|channel)
+      echo "GLM5_FLASH_KDA_FP8=$kda_fp8 requires duplicate BF16/FP8 weights; single-copy consumers are missing; use off" >&2
+      exit 2 ;;
     *) echo "GLM5_FLASH_KDA_FP8 must be auto, off, row128 or channel" >&2; exit 2 ;;
   esac
   family_args+=(--kda-fp8 "$kda_fp8" --pool-tokens "$(get POOL_TOKENS 65536)")
-  [[ "$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD off)" != on ]] || family_args+=(--fp8-head)
+  if [[ "$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD off)" == on ]]; then
+    echo "GLM5_FLASH_FP8_HEAD=on duplicates the checkpoint head; a shared single-copy consumer is missing; use off" >&2
+    exit 2
+  fi
   fp8_prefill="$(key GLM5_FLASH_FP8_PREFILL GLMF_FP8_PREFILL)"
+  case ",$fp8_prefill," in
+    *,all,*|*,kda-in,*|*,kda-o,*)
+      echo "GLM5_FLASH_FP8_PREFILL=$fp8_prefill requires duplicate KDA weights; use mla,ffn or off until single-copy consumers exist" >&2
+      exit 2 ;;
+  esac
   case "$fp8_prefill" in
     "") ;;
     off) family_args+=(--fp8-prefill none) ;;
