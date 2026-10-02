@@ -5,6 +5,7 @@ pub(crate) mod fp8;
 pub(crate) mod prefix;
 pub(crate) mod serve;
 mod speculate;
+mod expert_rows;
 pub(crate) mod weights;
 
 use anyhow::{ensure, Context, Result};
@@ -205,6 +206,12 @@ pub(crate) struct GoldenArgs {
     /// verify, then time spec + commit from identical recurrent state.
     #[arg(long)]
     pub replay_check: Option<usize>,
+    /// Isolate one real routed-expert layer with --local-experts: compare a
+    /// fixed first row across m1/m16/m80 packages and require that changing
+    /// later inputs in the same row geometry cannot change it. No backbone
+    /// weights or drafter load; this checks expert compute, not model KL.
+    #[arg(long)]
+    pub expert_row_check: Option<usize>,
     /// Time verify steps of 1..=N rows per sequence (C sequences, see
     /// --bench-sequences) after --prefill tokens: the step cost by rows.
     #[arg(long)]
@@ -433,6 +440,9 @@ pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
 
 fn golden(args: GoldenArgs) -> Result<()> {
     let opened = open(&args.engine)?;
+    if let Some(rows) = args.expert_row_check {
+        return expert_rows::check(&args.engine, &opened, rows);
+    }
     opened.with_engine(&args.engine, |engine| golden_run(&args, &opened, engine))
 }
 
