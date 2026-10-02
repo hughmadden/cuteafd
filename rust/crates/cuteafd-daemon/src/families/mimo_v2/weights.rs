@@ -14,10 +14,11 @@
 //! TP-interleaved `qkv_proj` de-interleaved with every key padded to 256
 //! rows, see `FusedQkvLayout`).
 //!
-//! BF16 operands: `w_o` (BF16 in the release; `fp8_decode && fp8_o_proj` adds
-//! an E4M3 copy with per-row x 128-K scales `[N, K/128]` for decode rows), the
-//! norms, sinks and LM head (`fp8_head`: the same per-row quantization for
-//! decode rows); the FP32 router weight (Flash) becomes `w_hilo = [bf16(w);
+//! Head and output projections have one immutable format across row shapes:
+//! checkpoint BF16 or E4M3 by default, with explicit conversion available at
+//! load. FP8 has one value allocation and row/K-major scale metadata, never a
+//! resident BF16 fallback. Norms and sinks remain checkpoint BF16; the FP32
+//! router weight (Flash) becomes `w_hilo = [bf16(w);
 //! bf16(w - bf16(w))]` for the router program's two FP32-accumulated BF16
 //! products, a BF16 one (V2.6 Pro) is `w_router` as stored.
 use crate::shared::memory::DeviceAllocation;
@@ -28,7 +29,7 @@ use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::families::mimo_v2::{FusedQkvLayout, MimoAttention, MimoV2Config};
 use cuteafd_loader::plan::checkpoint::{Checkpoint, CheckpointTensor};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::os::unix::fs::FileExt;
 use crate::shared::peer_split::{slice_2d, Axis, RankDevice};
@@ -93,7 +94,7 @@ pub(crate) struct MimoLoader<'a> {
     /// The checkpoint's tensor-parallel degree (fused `qkv_proj` row shards).
     pub checkpoint_tp: usize,
     pub fp8_head: bool,
-    pub fp8_o_proj: bool,
+    pub output_formats: &'a BTreeMap<String, MimoProjectionRepresentation>,
     /// Scale rule of copies quantized from BF16 (o_proj, the LM head).
     pub fp8_scales: crate::shared::fp8_linear::Fp8Scales,
     /// This loader's device (rank 0 of a head split).
@@ -104,7 +105,7 @@ pub(crate) struct MimoLoader<'a> {
 
 /// Scale-grid row of every weight row: uniform 128-row blocks, or per
 /// 192-row head (a 128-row then a 64-row block).
-fn scale_rows(name: &str, rows: usize, grid_rows: usize) -> Result<Vec<usize>> {
+pub(crate) fn scale_rows(name: &str, rows: usize, grid_rows: usize) -> Result<Vec<usize>> {
     if rows.div_ceil(128) == grid_rows {
         return Ok((0..rows).map(|r| r / 128).collect());
     }
@@ -677,7 +678,9 @@ impl<'a> MimoLoader<'a> {
         let name = format!("{p}.self_attn.o_proj.weight");
         ensure!(self.tensor(&name)?.meta.shape == [cfg.hidden, cfg.heads *cfg.v_head_dim],
             "{name}: target output projection does not match configured attention geometry");
-        if self.fp8_o_proj {
+        let output_format = self.output_formats.get(&name)
+            .with_context(|| format!("{name}: output weight format was not resolved before loading"))?;
+        if *output_format == MimoProjectionRepresentation::Fp8 {
             for (map, (q, s, ks)) in ops.iter_mut().zip(self.fp8_projection(&name, ranks, true)?) {
                 map.insert("w_o_fp8", q);
                 map.insert("w_o_scale", s);
@@ -742,7 +745,7 @@ impl<'a> MimoLoader<'a> {
             layers: shares.next().context("rank 0")?,
             norm: self.one("model.norm.weight")?,
             head,
-            output_fp8: self.fp8_o_proj,
+            output_fp8: self.output_formats.values().any(|&format| format == MimoProjectionRepresentation::Fp8),
         };
         crate::shared::memory::staging::release_staging();
         Ok((weights, shares.collect()))

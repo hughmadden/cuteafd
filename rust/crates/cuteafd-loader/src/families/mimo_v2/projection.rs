@@ -1,9 +1,32 @@
 //! One immutable resident representation of a target head/output projection.
 use std::fmt;
+use cuteafd_core::DType;
 
 /// BF16 or row-major E4M3 values. Scale banks are metadata, not another weight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MimoProjectionRepresentation { Bf16, Fp8 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MimoProjectionSourceError(pub DType);
+impl fmt::Display for MimoProjectionSourceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unsupported MiMo projection source {:?}; add a checkpoint-native loader/kernel rather than converting it by default", self.0)
+    }
+}
+impl std::error::Error for MimoProjectionSourceError {}
+
+impl MimoProjectionRepresentation {
+    /// With no explicit conversion, preserve the checkpoint's value format.
+    /// The loader validates the FP8 scale/layout contract separately.
+    pub fn from_source(source: DType, fp8: Option<bool>) -> Result<Self, MimoProjectionSourceError> {
+        let native = match source {
+            DType::Bf16 => Self::Bf16,
+            DType::F8E4M3 => Self::Fp8,
+            dtype => return Err(MimoProjectionSourceError(dtype)),
+        };
+        Ok(match fp8 { Some(true) => Self::Fp8, Some(false) => Self::Bf16, None => native })
+    }
+}
 
 /// Maximum BF16 source rows uploaded during FP8 packing. Each block is drained
 /// before its source storage is reused; the final weight owns no BF16 fallback.
@@ -52,6 +75,17 @@ impl MimoProjectionLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn default_preserves_source_and_only_explicit_options_convert() {
+        use MimoProjectionRepresentation::{Bf16, Fp8};
+        assert_eq!(MimoProjectionRepresentation::from_source(DType::Bf16, None).unwrap(), Bf16);
+        assert_eq!(MimoProjectionRepresentation::from_source(DType::F8E4M3, None).unwrap(), Fp8);
+        assert_eq!(MimoProjectionRepresentation::from_source(DType::Bf16, Some(true)).unwrap(), Fp8);
+        assert_eq!(MimoProjectionRepresentation::from_source(DType::F8E4M3, Some(false)).unwrap(), Bf16);
+        for explicit in [None, Some(true), Some(false)] {
+            assert!(MimoProjectionRepresentation::from_source(DType::F32, explicit).is_err());
+        }
+    }
     #[test]
     fn pro_head_has_one_weight_and_bounded_source() {
         let fp8 = MimoProjectionLayout::new(152576, 6144, MimoProjectionRepresentation::Fp8, 1).unwrap();

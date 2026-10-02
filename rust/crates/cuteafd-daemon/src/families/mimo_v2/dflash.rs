@@ -305,6 +305,19 @@ struct Checkpoint {
     tensors: HashMap<String, SafetensorsTensorMetadata>,
 }
 
+/// Read only the header before target/native admission. This loader currently
+/// supports BF16 drafter checkpoints; FP8 storage is an explicit load transform.
+pub(crate) fn checkpoint_representation(dir: &Path) -> Result<MimoDraftRepresentation> {
+    let tensors = read_safetensors_metadata(&dir.join(WEIGHTS))?;
+    ensure!(!tensors.is_empty(), "DFlash checkpoint has no tensors");
+    for tensor in tensors {
+        ensure!(tensor.dtype == cuteafd_core::DType::Bf16,
+            "DFlash checkpoint tensor {} has unsupported source {:?}; the drafter loader requires checkpoint BF16, add a native-format reader before selecting this checkpoint",
+            tensor.name, tensor.dtype);
+    }
+    Ok(MimoDraftRepresentation::Bf16Only)
+}
+
 impl Checkpoint {
     fn bytes(&self, name: &str, shape: &[usize]) -> Result<&[u8]> {
         let t = self.tensors.get(name).with_context(|| format!("DFlash checkpoint has no {name}"))?;
