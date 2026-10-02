@@ -241,6 +241,9 @@ for release_family in "${release_family_list[@]}"; do
     *:nvfp4|*:nvfp4a4) release_package="fp8-${release_family%%:*}-${release_family#*:}" ;;
     *) continue ;;
   esac
+  # GLM 5.3 Flash's NVFP4 dense MLP runs on the coordinator only (fp8_moe.cmake
+  # skips it in the Spark build).
+  [[ "$role" == expert && "$release_family" == glmfdense:* ]] && continue
   mkdir -p "$output_dir/fp8"
   # A FAMILY:nvfp4 entry also builds the default W4A4 sibling (fp8_moe.cmake).
   release_packages=("$release_package")
