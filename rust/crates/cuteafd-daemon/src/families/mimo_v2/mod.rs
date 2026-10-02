@@ -1164,6 +1164,11 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<
             drafter.put_taps(&taps)?;
             drafter.update(&(0..n).map(|r| dflash::ContextRow { tap_row: r, slot, position: at + r })
                 .collect::<Vec<_>>())?;
+            // This oracle queues consecutive updates without the serving loop's
+            // step drain. Finish the consumers before overwriting their taps,
+            // positions and ring-slot tables on the next chunk or sequence.
+            // SAFETY: the engine owns the drafter's stream and all its buffers.
+            unsafe { opened.library.cuda_stream_synchronize(engine.stream)? };
             at += n;
         }
         Ok(())
