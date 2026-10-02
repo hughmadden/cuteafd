@@ -760,6 +760,10 @@ active admission deferral and active KV paging are separate remaining work.
    and drain both expert waves on failure. Gate against serial KV/context and
    continuation exactness, including mixed cached/uncached prefixes, then
    measure emitted throughput and per-step active rows on both RTX layouts.
+   A private candidate pairs adjacent 1–2047-row requests without changing
+   their kernel row partitions. Larger chunks and MTP keep the existing
+   path. Queue, placement and memory-admission checks pass in the composed
+   workspace; GPU exactness and throughput gates remain pending.
 6. **RTX 5090 audit and claim**: hard-coded `4*188` grid clamps and the
    per-tensor FP8 GEMM grid sized for 188 SMs; one SM120 build must serve both.
    `6d4ea7a` derives expert quantizer grids from each engine's GPU and removes
@@ -904,8 +908,16 @@ active admission deferral and active KV paging are separate remaining work.
     synthetic long-context case; checkpoint BF16 remains the default.
     GLM target precision admission also passes loader/planner/exporter checks;
     its compact index-key and BF16 dense consumers still need native gates.
-    GLM Flash's direct CLI fallback without an official FP8 side snapshot
-    still implicitly quantizes EXL3 BF16 coordinator tensors and must be fixed.
+    Private GLM Flash direct-CLI guards now reject BF16 block inputs before
+    native loading instead of silently quantizing them. Actual checkpoint
+    headers validate the qualified EXL3-primary/official-FP8-side route;
+    standalone planner diagnostics still need to match this policy.
+    Private Qwen defaults preserve checkpoint BF16 projections and share the
+    target head with MTP. Legacy duplicate-storage options reject before
+    native loading until compact all-row/shared-head consumers exist. These
+    changes pass composed workspace/script checks; Qwen model quality,
+    readiness and performance gates remain pending. Explicit GLM Flash
+    duplicate-storage options and other persistent FP8 widening remain open.
     GLM head admission now reads indexed checkpoint headers independently of
     the routed-expert catalog. The
     audited DeepSeek V4 target/dSpark paths preserve checkpoint weight values;

@@ -143,8 +143,8 @@ if [[ -n "$expert_input" ]]; then
 fi
 [[ ! $family =~ ^(glm5|qwen4|deepseek_v4)$ || -z "$(get POOL_TOKENS)" ]] || family_args+=(--pool-tokens "$(get POOL_TOKENS)")
 # GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
-# from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" quantizes the
-# BF16 checkpoint's at load). KDA's BF16 source weights run as-is by default
+# from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" requires native
+# FP8 block tensors in the primary checkpoint). KDA's BF16 source weights run as-is by default
 # (GLM5_FLASH_KDA_FP8: unset/auto/off); explicit row128/channel still make
 # dual resident copies and await single-copy qualification. Optionally an FP8 LM head
 # (GLM5_FLASH_FP8_HEAD=on); its MLA pools hold POOL_TOKENS tokens (a key every
