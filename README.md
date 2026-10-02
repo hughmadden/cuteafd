@@ -61,7 +61,10 @@ cache layout works.
 2. Pick or adapt a config under [`examples/configs/`](examples/configs/) or
    edit `cuteafd.config` for your own topology (coordinator GPUs, Spark
    ranks, TP/EP layout).
-3. `./run.sh` launches the release images; `./wip.sh --slot S --role both`
+3. `./run.sh` launches the release images named in the config,
+   `ghcr.io/tpurtell/cuteafd-coordinator:v0.1.0` on the RTX host and
+   `ghcr.io/tpurtell/cuteafd-spark-expert:v0.1.0` on each Spark; `docker pull`
+   them on those hosts first (`./run.sh` does not pull). `./wip.sh --slot S --role both`
    plus `./run.sh --wip S --restart` is the faster loop while iterating.
 
 ## Working on it
