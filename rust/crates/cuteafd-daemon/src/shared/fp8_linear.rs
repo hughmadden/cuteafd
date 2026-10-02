@@ -7,6 +7,10 @@ use anyhow::{ensure, Result};
 use cuteafd_ffi::NativeLibrary;
 use std::ffi::c_void;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "fp8_linear_lifetime_tests.rs"]
+mod lifetime_tests;
+
 /// How FP8 copies of BF16 weights pick a block's scale (`--fp8-scales`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum Fp8Scales {
@@ -41,7 +45,8 @@ pub(crate) struct Fp8Weight<'a> {
 
 impl<'a> Fp8Weight<'a> {
     /// Packs the live BF16 weight `w` [n, k] on `stream` (the caller
-    /// synchronizes before the source is freed).
+    /// synchronizes before the source is freed, including on errors, and
+    /// retains its source owner if completion cannot be proved).
     pub fn pack(library: &'a NativeLibrary, w: *const c_void, n: usize, k: usize, scales: Fp8Scales,
         stream: *mut c_void) -> Result<Self> {
         ensure!(n % 16 == 0 && k % 128 == 0, "FP8 copy of [{n}, {k}]: needs n % 16 == 0 and k % 128 == 0");
@@ -59,9 +64,12 @@ impl<'a> Fp8Weight<'a> {
                 Err(drain) => {
                     // Completion is unknown. Retain these allocations until
                     // process teardown rather than running cuda_free on Drop.
+                    // The borrowed library may otherwise unload as the loader
+                    // unwinds; the caller must also retain the source owner.
+                    library.quarantine_module_after_failed_drain();
                     std::mem::forget(packed);
                     std::mem::forget(scale);
-                    Err(error.context(format!("FP8 destinations quarantined after failed drain: {drain}")))
+                    Err(error.context(format!("FP8 destinations and native module quarantined after failed drain: {drain}")))
                 }
             };
         }
@@ -74,8 +82,10 @@ impl<'a> Fp8Weight<'a> {
     }
 
     /// A failed stream drain cannot prove that queued reads/writes retired.
-    /// Keep the owning allocations live until process teardown.
+    /// Keep the owning allocations and their native module live until process
+    /// teardown. The caller must also retain any outstanding source/scratch.
     pub fn quarantine(self) {
+        self.packed.library.quarantine_module_after_failed_drain();
         std::mem::forget(self);
     }
 
