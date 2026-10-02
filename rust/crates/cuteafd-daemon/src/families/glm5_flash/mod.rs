@@ -212,6 +212,10 @@ pub(crate) struct GoldenArgs {
     /// weights or drafter load; this checks expert compute, not model KL.
     #[arg(long)]
     pub expert_row_check: Option<usize>,
+    /// Dump fixed-token serial and --step-rows-wide layer outputs and router
+    /// inputs to this directory, then report their full-vocabulary KL.
+    #[arg(long)]
+    pub geometry_trace: Option<PathBuf>,
     /// Time verify steps of 1..=N rows per sequence (C sequences, see
     /// --bench-sequences) after --prefill tokens: the step cost by rows.
     #[arg(long)]
@@ -490,6 +494,9 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
     }
     if let Some(rows) = args.replay_check {
         return speculate::replay_check(args, engine, rows);
+    }
+    if let Some(dir) = &args.geometry_trace {
+        return speculate::geometry_trace(args, engine, dir);
     }
     if let Some(rows) = args.bench_verify {
         return speculate::bench_verify(args, engine, rows);

@@ -239,6 +239,39 @@ fn exact_logits(a: &[f32], b: &[f32]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
+/// One fixed-token serial/wide trace; no greedy feedback or rejected suffix
+/// changes. Per-layer router inputs isolate where geometry drift grows.
+pub(super) fn geometry_trace(args: &GoldenArgs, engine: &GlmfEngine<'_>, dir: &std::path::Path) -> Result<()> {
+    let sequence = tokens(args)?;
+    let rows = args.step_rows;
+    ensure!(rows > 1, "--geometry-trace needs --step-rows > 1");
+    let prefill = replay_bounds(sequence.len(), rows, args.prefill)?;
+    let mut allocator = Allocator::new(engine.pages, engine.slots);
+    let mut serial = allocator.admit(prefill + rows)?;
+    let mut wide = allocator.admit(prefill + rows)?;
+    engine.prefill(&mut serial, &sequence[..prefill], None)?;
+    engine.prefill(&mut wide, &sequence[..prefill], None)?;
+    let mut serial_logits = Vec::new();
+    for j in 0..rows {
+        let mut snapshot = |layer, streams: &[u8]| engine.trace_decode_layer(layer, 1, streams,
+            &dir.join(format!("serial/row{j:02}/layer{layer:02}")));
+        serial_logits.extend(engine.verify_trace(&mut [(&mut serial, 1)], &sequence[prefill + j..prefill + j + 1],
+            &mut snapshot, &dir.join(format!("serial/row{j:02}")))?.context("geometry trace needs every layer")?);
+    }
+    let mut snapshot = |layer, streams: &[u8]| engine.trace_decode_layer(layer, rows, streams,
+        &dir.join(format!("wide/layer{layer:02}")));
+    let wide_logits = engine.verify_trace(&mut [(&mut wide, rows)], &sequence[prefill..prefill + rows],
+        &mut snapshot, &dir.join("wide"))?.context("geometry trace needs every layer")?;
+    finite_logits(&serial_logits)?;
+    finite_logits(&wide_logits)?;
+    for (name, logits) in [("serial-logits.bin", &serial_logits), ("wide-logits.bin", &wide_logits)] {
+        std::fs::write(dir.join(name), logits.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>())?;
+    }
+    println!("geometry trace: {rows} rows after {prefill} fixed tokens, KL(serial || wide) {:.6} nat; {}",
+        super::mean_kl(&wide_logits, &serial_logits, 0, engine.cfg.vocab_size), dir.display());
+    Ok(())
+}
+
 /// See `GoldenArgs::replay_check`.
 pub(super) fn replay_check(args: &GoldenArgs, engine: &GlmfEngine<'_>, rows: usize) -> Result<()> {
     let sequence = tokens(args)?;
