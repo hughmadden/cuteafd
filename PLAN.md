@@ -427,12 +427,22 @@ cross-device event and a host wait, so a gain needs V4.1's per-layer flow rebuil
 around device-side flags. The attention-only ceiling is about the DeepSeek V4 Flash
 split (-10%, all experts remote), and less with RTX-resident expert layers, so
 V4.1 keeps its layer split. Measured 2026-10-02 (C1 code, 6-row verify rounds of
-~27 ms): each RTX is busy ~40% (C4 ~47%), the head-splittable work (q_b, sparse
+~27 ms): each RTX is busy ~33% (C4 ~47%), the head-splittable work (q_b, sparse
 core, wo_a, wo_b) is ~115 us of a ~170 us attention block per layer, and a 32-head
 core saves only 9 of 24 us. With KV replicas, peer inputs and the exchange, a
 V4-style split projects +2-4% C1, ~0-2% C4, less at C16, and the replicated 14M-token
 pool (+5-8 GB per card) costs two RTX expert layers at the release config: not built.
-V4.1's lever is its host-driven layer (route download, Spark collect ~470 us).
+V4.1's lever is its host-driven layer. Per layer at C1 (5-row verify, nsys): remote
+(20 layers) 789 us = GPU to route ids 118, route D2H to host 12, Spark round trip and
+collect 544, combine to next attention 99 (55 of kernels, the rest host launch
+gaps); local TP2 (20) 450 us = 120, route to expert launch 35, experts 164, host-run
+TP2 reduce 31, next attention 96. C4 lanes: remote 1086 (round trip 782), local 673.
+A device-driven exchange (GPU-written requests + proxy post, GPU-landed replies with
+a NIC-written flag, device wait, device-flag TP2 reduce) projects C1 +5-7%, C4
++3-6%; also capturing the whole verify step (no launch gaps) C1 +10-15%, C4 +8-12%.
+Unknown: the host share inside the Spark round trip (worker-side timing needed).
+Outside the layer loop: ~0.8 ms host gap per round after argmax, and two BF16
+vocab heads (target, draft) of 450 us each.
 The drafter follows the GPU that owns the last backbone layers (taps and head
 live there); TP2 drafters are ≤1% on DFlash2 and not built unless the P2P
 probe shows ≤15 µs hops; the win is lane B drafting on GPU1 while lane A
