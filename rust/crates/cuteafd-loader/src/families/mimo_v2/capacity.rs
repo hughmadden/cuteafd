@@ -92,7 +92,7 @@ pub fn mimo_capacity_profiles(
             what: "capacity context, rings or physical rank mapping",
         });
     }
-    let resident = MimoResidentLayout::new(checkpoint, cfg, resident_options)?;
+    let resident = MimoResidentLayout::new(checkpoint, cfg, &resident_options)?;
     let cache = mimo_cache_geometry(
         cfg,
         resident_options.layers,
@@ -292,8 +292,15 @@ mod tests {
             checkpoint_tp: 1,
             native_mtp_layers: 0,
             gpu_embedding: true,
-            fp8_head: false,
-            fp8_o_proj: false,
+            head_format: super::super::projection::MimoProjectionRepresentation::Bf16,
+            output_formats: (0..2)
+                .map(|layer| {
+                    (
+                        format!("model.layers.{layer}.self_attn.o_proj.weight"),
+                        super::super::projection::MimoProjectionRepresentation::Bf16,
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -487,8 +494,11 @@ mod tests {
         let fixed_workspace: u64 = profile.devices[0]
             .reservations
             .iter()
-            .filter(|r| r.name.starts_with("prefill.") || r.name.starts_with("decode.")
-                || r.name == "state.prefill_kv_wide")
+            .filter(|r| {
+                r.name.starts_with("prefill.")
+                    || r.name.starts_with("decode.")
+                    || r.name == "state.prefill_kv_wide"
+            })
             .map(|r| r.bytes)
             .sum();
         for pages in [0, 1, 2, 7, 64, 4096] {
@@ -589,6 +599,14 @@ mod tests {
             &cfg,
             MimoResidentOptions {
                 native_mtp_layers: 1,
+                output_formats: weights(2)
+                    .output_formats
+                    .into_iter()
+                    .chain(std::iter::once((
+                        "model.mtp.layers.0.self_attn.o_proj.weight".into(),
+                        super::super::projection::MimoProjectionRepresentation::Bf16,
+                    )))
+                    .collect(),
                 ..weights(2)
             },
             &options(2),

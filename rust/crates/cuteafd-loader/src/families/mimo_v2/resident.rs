@@ -6,17 +6,19 @@ use super::{FusedQkvLayout, MimoAttention, MimoV2Config};
 use crate::plan::checkpoint::{Checkpoint, CheckpointTensor};
 use crate::serving_capacity::CacheGeometryError;
 use cuteafd_core::{serving_capacity::MemoryReservation, DType};
+use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct MimoResidentOptions {
     pub layers: usize,
     pub coordinator_ranks: usize,
     pub checkpoint_tp: usize,
     pub native_mtp_layers: usize,
     pub gpu_embedding: bool,
-    pub fp8_head: bool,
-    /// Selected immutable output representation, independent of activation precision.
-    pub fp8_o_proj: bool,
+    pub head_format: MimoProjectionRepresentation,
+    /// Exact selected format of each target/MTP output tensor. Loading and
+    /// admission consume the same resolved choices, including mixed sources.
+    pub output_formats: BTreeMap<String, MimoProjectionRepresentation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,7 +252,7 @@ fn block(
     post: &str,
     ranks: usize,
     checkpoint_tp: usize,
-    fp8_o: bool,
+    output_formats: &BTreeMap<String, MimoProjectionRepresentation>,
     costs: &mut [Vec<MemoryReservation>],
 ) -> Result<Vec<u64>, CacheGeometryError> {
     let share = cfg
@@ -335,6 +337,14 @@ fn block(
     };
     let o_cols = cfg.heads * cfg.v_head_dim;
     let o_name = format!("{prefix}.self_attn.o_proj.weight");
+    let fp8_o = *output_formats
+        .get(&o_name)
+        .ok_or_else(|| CacheGeometryError::ResidentTensor {
+            name: o_name.clone(),
+            what: "selected output representation is missing from the resolved loading contract"
+                .into(),
+        })?
+        == MimoProjectionRepresentation::Fp8;
     let o_tensor = tensor(
         checkpoint,
         &o_name,
@@ -461,9 +471,23 @@ mod tests {
             checkpoint_tp: tp,
             native_mtp_layers: 0,
             gpu_embedding: true,
-            fp8_head: false,
-            fp8_o_proj: false,
+            head_format: MimoProjectionRepresentation::Bf16,
+            output_formats: (0..2)
+                .map(|layer| {
+                    (
+                        format!("model.layers.{layer}.self_attn.o_proj.weight"),
+                        MimoProjectionRepresentation::Bf16,
+                    )
+                })
+                .collect(),
         }
+    }
+    fn fp8_options(mut options: MimoResidentOptions) -> MimoResidentOptions {
+        options.head_format = MimoProjectionRepresentation::Fp8;
+        for mode in options.output_formats.values_mut() {
+            *mode = MimoProjectionRepresentation::Fp8;
+        }
+        options
     }
     fn total(layout: &MimoResidentLayout) -> u64 {
         layout.ranks.iter().flatten().map(|r| r.bytes).sum()
@@ -480,22 +504,9 @@ mod tests {
         );
         let checkpoint = Checkpoint::open(dir.path()).unwrap();
         let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
-        let fp8_options = MimoResidentOptions {
-            fp8_head: true,
-            fp8_o_proj: true,
-            ..options(1, 1)
-        };
-        let copies = MimoResidentLayout::new(&checkpoint, &cfg, fp8_options).unwrap();
-        let plain = MimoResidentLayout::new(
-            &checkpoint,
-            &cfg,
-            MimoResidentOptions {
-                fp8_head: false,
-                fp8_o_proj: false,
-                ..options(1, 1)
-            },
-        )
-        .unwrap();
+        let selected = fp8_options(options(1, 1));
+        let copies = MimoResidentLayout::new(&checkpoint, &cfg, &selected).unwrap();
+        let plain = MimoResidentLayout::new(&checkpoint, &cfg, &options(1, 1)).unwrap();
         assert_eq!(total(&plain) - total(&copies), 63_168_512);
         assert!(copies.ranks[0]
             .iter()
@@ -527,9 +538,9 @@ mod tests {
         let host = MimoResidentLayout::new(
             &checkpoint,
             &cfg,
-            MimoResidentOptions {
+            &MimoResidentOptions {
                 gpu_embedding: false,
-                ..fp8_options
+                ..selected
             },
         )
         .unwrap();
@@ -546,8 +557,8 @@ mod tests {
             write_snapshot(dir.path(), &config, &tensors, Some(tp));
             let checkpoint = Checkpoint::open(dir.path()).unwrap();
             let cfg = MimoV2Config::from_hf(&config).unwrap();
-            let one = MimoResidentLayout::new(&checkpoint, &cfg, options(1, tp)).unwrap();
-            let split = MimoResidentLayout::new(&checkpoint, &cfg, options(2, tp)).unwrap();
+            let one = MimoResidentLayout::new(&checkpoint, &cfg, &options(1, tp)).unwrap();
+            let split = MimoResidentLayout::new(&checkpoint, &cfg, &options(2, tp)).unwrap();
             assert_eq!(total(&split) - total(&one), 4 * cfg.hidden as u64 * 2 + 256);
             assert!(split.ranks[1].iter().all(|r| !r.name.starts_with("lm_head")
                 && !r.name.starts_with("model.embed_tokens")
@@ -572,12 +583,8 @@ mod tests {
         write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
         let checkpoint = Checkpoint::open(dir.path()).unwrap();
         let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
-        let selected = MimoResidentOptions {
-            fp8_head: true,
-            fp8_o_proj: true,
-            ..options(2, 8)
-        };
-        let layout = MimoResidentLayout::new(&checkpoint, &cfg, selected).unwrap();
+        let selected = fp8_options(options(2, 8));
+        let layout = MimoResidentLayout::new(&checkpoint, &cfg, &selected).unwrap();
         assert_eq!(layout.loading_temporary_rank_bytes, [16 << 20; 2]);
         for costs in &layout.ranks {
             assert!(costs
@@ -590,6 +597,47 @@ mod tests {
     }
 
     #[test]
+    fn mixed_output_sources_keep_each_selected_format_and_reject_missing_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tensors = mimo_flash_tensors();
+        let o = "model.layers.0.self_attn.o_proj.weight";
+        tensors.iter_mut().find(|tensor| tensor.0 == o).unwrap().1 = "F8_E4M3";
+        tensors.push(crate::plan::testing::t(
+            format!("{o}_scale_inv"),
+            "F32",
+            &[32, 64],
+        ));
+        write_snapshot(dir.path(), &mimo_flash_config(), &tensors, Some(1));
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
+        let mut selected = options(2, 1);
+        selected
+            .output_formats
+            .insert(o.into(), MimoProjectionRepresentation::Fp8);
+        let layout = MimoResidentLayout::new(&checkpoint, &cfg, &selected).unwrap();
+        for rank in &layout.ranks {
+            assert!(rank
+                .iter()
+                .any(|cost| cost.name == "model.layers.0.o_proj.fp8"));
+            assert!(!rank
+                .iter()
+                .any(|cost| cost.name == "model.layers.0.o_proj.bf16"));
+            assert!(rank
+                .iter()
+                .any(|cost| cost.name == "model.layers.1.o_proj.bf16"));
+            assert!(!rank
+                .iter()
+                .any(|cost| cost.name == "model.layers.1.o_proj.fp8"));
+        }
+        assert_eq!(layout.loading_temporary_rank_bytes, [4096 * 8192 * 2, 0]);
+        selected.output_formats.remove(o);
+        assert!(
+            matches!(MimoResidentLayout::new(&checkpoint,&cfg,&selected),
+            Err(CacheGeometryError::ResidentTensor{name,..}) if name==o)
+        );
+    }
+
+    #[test]
     fn missing_or_unsupported_resident_tensors_fail_before_any_cuda_dependency() {
         let dir = tempfile::tempdir().unwrap();
         let config = mimo_flash_config();
@@ -599,7 +647,7 @@ mod tests {
         let checkpoint = Checkpoint::open(dir.path()).unwrap();
         let cfg = MimoV2Config::from_hf(&config).unwrap();
         assert!(
-            matches!(MimoResidentLayout::new(&checkpoint,&cfg,options(1,1)),
+            matches!(MimoResidentLayout::new(&checkpoint,&cfg,&options(1,1)),
             Err(CacheGeometryError::ResidentTensor {name,..}) if name=="model.layers.0.input_layernorm.weight")
         );
     }
@@ -619,22 +667,19 @@ mod tests {
         write_snapshot(dir.path(), &config, &tensors, Some(1));
         let checkpoint = Checkpoint::open(dir.path()).unwrap();
         let cfg = MimoV2Config::from_hf(&config).unwrap();
-        let layout = MimoResidentLayout::new(&checkpoint, &cfg, options(1, 1)).unwrap();
+        let layout = MimoResidentLayout::new(&checkpoint, &cfg, &options(1, 1)).unwrap();
         assert_eq!(
             layout.loading_temporary_rank_bytes,
             [4096 * 8192 + 32 * 64 * 4]
         );
         // The BF16 TP2 loader accepts BF16 o_proj only, before slicing.
         assert!(
-            matches!(MimoResidentLayout::new(&checkpoint, &cfg, options(2, 1)),
+            matches!(MimoResidentLayout::new(&checkpoint, &cfg, &options(2, 1)),
             Err(CacheGeometryError::ResidentTensor { name, .. }) if name == o)
         );
 
-        let fp8 = MimoResidentOptions {
-            fp8_o_proj: true,
-            ..options(2, 1)
-        };
-        let native = MimoResidentLayout::new(&checkpoint, &cfg, fp8).unwrap();
+        let fp8 = fp8_options(options(2, 1));
+        let native = MimoResidentLayout::new(&checkpoint, &cfg, &fp8).unwrap();
         // Layer0 directly uploads its checkpoint FP8; the other BF16 layer's
         // drained source stage is bounded independently on both ranks.
         assert_eq!(native.loading_temporary_rank_bytes, [1024 * 4096 * 2; 2]);
@@ -648,7 +693,7 @@ mod tests {
         write_snapshot(dir.path(), &config, &tensors, Some(1));
         let checkpoint = Checkpoint::open(dir.path()).unwrap();
         assert!(
-            matches!(MimoResidentLayout::new(&checkpoint, &cfg, options(1, 1)),
+            matches!(MimoResidentLayout::new(&checkpoint, &cfg, &options(1, 1)),
             Err(CacheGeometryError::ResidentTensor { name, .. }) if name == k)
         );
     }
@@ -658,7 +703,7 @@ impl MimoResidentLayout {
     pub fn new(
         checkpoint: &Checkpoint,
         cfg: &MimoV2Config,
-        options: MimoResidentOptions,
+        options: &MimoResidentOptions,
     ) -> Result<Self, CacheGeometryError> {
         if options.layers == 0
             || options.layers > cfg.layers
@@ -689,7 +734,7 @@ impl MimoResidentLayout {
                 "post_attention_layernorm",
                 options.coordinator_ranks,
                 options.checkpoint_tp,
-                options.fp8_o_proj,
+                &options.output_formats,
                 &mut costs,
             )?;
             for (reserved, peak) in temporary.iter_mut().zip(peak) {
@@ -716,7 +761,7 @@ impl MimoResidentLayout {
             "lm_head",
             cfg.vocab_size as u64,
             cfg.hidden as u64,
-            options.fp8_head,
+            options.head_format == MimoProjectionRepresentation::Fp8,
             1,
         )?);
         if options.gpu_embedding {
@@ -739,7 +784,7 @@ impl MimoResidentLayout {
                 "pre_mlp_layernorm",
                 1,
                 options.checkpoint_tp,
-                options.fp8_o_proj,
+                &options.output_formats,
                 &mut costs[..1],
             )?;
             temporary[0] = temporary[0].max(peak[0]);

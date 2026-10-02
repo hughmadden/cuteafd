@@ -232,7 +232,7 @@ pub(super) fn preflight(
                     library,
                     &dir,
                     &draft,
-                    args.draft_storage()?,
+                    opened.weight_formats.draft,
                     args.draft_capacity(draft.block)?,
                 )?;
                 additional.extend(reservations.steady);
@@ -253,6 +253,7 @@ pub(super) fn preflight(
             spark_ranks > 0,
             VOCABULARY_HEAD_WORKSPACE as u64,
             prefill_output,
+            opened.weight_formats.any_fp8_output(),
         )?;
         runtime.push(MimoRankRuntime {
             device: device_id,
@@ -274,8 +275,8 @@ pub(super) fn preflight(
             native_mtp_layers: args.mtp,
             gpu_embedding: args.token_io.embed_placement
                 == crate::shared::token_io::EmbedPlacement::Gpu,
-            fp8_head: args.fp8_head,
-            fp8_o_proj: args.fp8_o_proj,
+            head_format: opened.weight_formats.head,
+            output_formats: opened.weight_formats.output.clone(),
         },
         &MimoCapacityOptions {
             checkpoint_max_context_tokens: context,
@@ -500,6 +501,7 @@ fn workspace_options(
     spark: bool,
     head_workspace_bytes: u64,
     prefill_output: MimoPrefillOutput,
+    fp8_output: bool,
 ) -> Result<
     Vec<(
         String,
@@ -542,7 +544,7 @@ fn workspace_options(
                         rank,
                         decode,
                         args.kv_cache.into(),
-                        args.fp8_o_proj,
+                        fp8_output,
                     )?,
                     head_workspace_bytes,
                 },
