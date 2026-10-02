@@ -686,9 +686,12 @@ active admission deferral and active KV paging are separate remaining work.
         interleaved component timing. Its compiled exports now pass mixed-size
         graph replay and scratch poisoning. The private full-model candidate
         repeats logits exactly and passes the existing official-reference
-        golden with slightly lower KL/NLL. Exact prefix continuation and
-        serving performance still need qualification before any native pin or
-        default change; admission changes must not hide this baseline defect.
+        golden with slightly lower KL/NLL. Prefix restores across the first
+        physical-page boundary also match logits, paged KV, window/compressor
+        state and continuation exactly on the one-RTX reference layout.
+        Serving performance and parity still need qualification before any
+        native pin or default change; admission changes must not hide this
+        baseline defect.
      j. MiMo V2 Flash fidelity is the weakest that passes (KL 0.10, top-1 82%).
         `73dfbbe` packages opt-in same-pin BF16 expert-input siblings;
         `bbd9a6b` preflights their capacity and arithmetic contract before launch.
