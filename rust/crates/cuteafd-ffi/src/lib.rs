@@ -30,13 +30,21 @@ mod cuda_runtime;
 pub use cuda_runtime::{select_copy_mechanism, CopyMechanism, CudaRuntime};
 #[cfg(feature = "test-support")]
 pub mod test_support;
+#[cfg(all(target_os = "linux", any(test, feature = "test-support")))]
+#[doc(hidden)]
+pub mod native_library_lifetime_fixture;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "native_library_lifetime_tests.rs"]
+mod native_library_lifetime;
 
 use anyhow::{Context, Result};
 use libloading::{Library, Symbol};
 use std::ffi::{CStr, CString};
+use std::mem::ManuallyDrop;
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub type CuteafdStatus = c_int;
 
@@ -1166,7 +1174,8 @@ type XGrammarMatcherIsCompletedFn = unsafe extern "C" fn(
 ) -> CuteafdStatus;
 
 pub struct NativeLibrary {
-    lib: Library,
+    lib: ManuallyDrop<Library>,
+    quarantine_after_failed_drain: AtomicBool,
     sync_h2d_staging: Mutex<SyncH2DStagingBuffer>,
     rdma_rc_endpoint_try_poll_fn: RdmaRcEndpointTryPollFn,
 }
@@ -1466,6 +1475,9 @@ impl Drop for CuteafdNcclComm {
 }
 
 struct SyncH2DStagingBuffer {
+    // Released explicitly by NativeLibrary while its module is loaded. Do not
+    // add an automatic release here: failed-drain quarantine retains this raw
+    // pinned allocation even after the Rust wrapper is dropped.
     buffer: CuteafdHostBuffer,
 }
 
@@ -1522,9 +1534,19 @@ impl SyncH2DStagingBuffer {
 
 impl Drop for NativeLibrary {
     fn drop(&mut self) {
+        if self.quarantine_after_failed_drain.load(Ordering::Relaxed) {
+            // A queued kernel may still execute code from this module. The
+            // staging wrapper has no Drop: retaining its raw allocation also
+            // avoids releasing pinned memory while completion is unknown.
+            return;
+        }
         if let Ok(staging) = self.sync_h2d_staging.get_mut() {
             staging.release_with_library(&self.lib);
         }
+        // SAFETY: this is the sole normal-path owner of the module. Staging
+        // was released while its free function was still loaded; quarantine
+        // deliberately bypasses both releases.
+        unsafe { ManuallyDrop::drop(&mut self.lib) };
     }
 }
 
@@ -1557,10 +1579,25 @@ impl NativeLibrary {
             unsafe { *lib.get::<RdmaRcEndpointTryPollFn>(b"cuteafd_rdma_rc_endpoint_try_poll")? };
         sync_expert_hidden(&lib)?;
         Ok(Self {
-            lib,
+            lib: ManuallyDrop::new(lib),
+            quarantine_after_failed_drain: AtomicBool::new(false),
             sync_h2d_staging: Mutex::new(SyncH2DStagingBuffer::default()),
             rdma_rc_endpoint_try_poll_fn,
         })
+    }
+
+    /// Irreversibly retain this module and its reusable pinned H2D staging
+    /// until process teardown after a stream drain failed to prove completion.
+    /// Idempotent; normal loads and launches do not take an extra owner.
+    ///
+    /// This only protects module code and library-owned staging. The caller
+    /// must separately retain every source, destination, scratch allocation,
+    /// and other native owner that queued work may still use, and abandon the
+    /// failed operation. It does not repair arbitrary pre-engine load errors
+    /// or make subsequent work safe. Other NativeLibrary instances are not
+    /// quarantined.
+    pub fn quarantine_module_after_failed_drain(&self) {
+        self.quarantine_after_failed_drain.store(true, Ordering::Relaxed);
     }
 
     pub fn version(&self) -> Result<String> {
