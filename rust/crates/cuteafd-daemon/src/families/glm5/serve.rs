@@ -30,7 +30,7 @@ use crate::shared::prefill_share::{Chunk, DecodeShareArgs};
 use anyhow::{Context, Result};
 use cuteafd_api::openai::chat::glm5::GlmEncoding;
 use cuteafd_api::openai::{
-    ConsoleHub, InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits, NativeRequest,
+    InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits, NativeRequest,
     PromptUsage,
 };
 use crate::shared::spark_intake::SparkLink;
