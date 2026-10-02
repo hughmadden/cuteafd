@@ -131,8 +131,10 @@ fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
             ("verify", "verify pass + token selection", Target), ("emit", "accept + stream + drafter context", Ink)]),
         StepGroup::new("Verify pass", "host clock, engine phases", &[
             ("gpu", "GPU until expert exchanges", Rtx), ("experts", "expert exchanges", Spark)]),
+        StepGroup::layers(),
         StepGroup::admission(false),
     ];
+    layout.layers = Some(console::Layers::host_clock());
     layout
 }
 
@@ -169,6 +171,8 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
     let result = opened.with_engine(&args, |engine| {
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-mimo needs every layer");
         anyhow::ensure!(engine.has_experts(), "serve-mimo needs --peers (or --local-experts) for the routed experts");
+        let spark = args.peers.is_some() && !args.local_experts;
+        console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(()));
         }

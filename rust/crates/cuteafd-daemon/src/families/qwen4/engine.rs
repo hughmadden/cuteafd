@@ -1381,6 +1381,7 @@ impl<'a> Qwen4Engine<'a> {
                     }
                 }
             }
+            crate::shared::console::layer_mark(index);
         }
         self.last_streams.set((tables.decode, cur));
         if layers.len() < self.cfg.layers {
@@ -1494,6 +1495,7 @@ impl<'a> Qwen4Engine<'a> {
             cur ^= if index == 0 || index == layers.len() { 1 } else { 0 };
             if index < layers.len() {
                 self.moe_experts(w, index, t, rows, true)?;
+                crate::shared::console::layer_mark(index);
             }
         }
         self.last_streams.set((true, cur));

@@ -893,6 +893,7 @@ impl<'a> Engine<'a> {
                     }
                 }
                 ranks = self.decode_experts(layer, t, w, lane, cap, transports.first_mut(), runtime)?;
+                crate::shared::console::layer_mark(layer);
             }
             // The tail: the last post, its taps and the drafter's KV, then the head.
             let last = self.weights.layers.len() - 1;
@@ -1453,7 +1454,7 @@ impl<'a> Engine<'a> {
         self.sync()
     }
 
-    fn local_layers(&self) -> usize {
+    pub(crate) fn local_layers(&self) -> usize {
         self.local.borrow().as_ref().map_or(0, |l| l.layers())
     }
 

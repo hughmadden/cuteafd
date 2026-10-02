@@ -954,6 +954,7 @@ impl<'a> MimoEngine<'a> {
                     self.norm_on(1, w1, peer.layers[index + 1].ptr("input_norm")?, 0, rows, w1.delta.buffer.ptr)?;
                 }
             }
+            crate::shared::console::layer_mark(index);
         }
         if layers.len() < self.cfg.layers {
             // SAFETY: the engine owns this stream.

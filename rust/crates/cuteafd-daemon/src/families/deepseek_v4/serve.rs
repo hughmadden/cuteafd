@@ -121,8 +121,10 @@ fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
         StepGroup::new("Verify pass", "host clock, engine phases", &[
             ("router_sync", "GPU through router + quantizer", Rtx), ("routing", "route packing", Ink),
             ("experts", "Spark expert exchanges", Spark), ("head", "head + logits", Target)]),
+        StepGroup::layers(),
         StepGroup::admission(false),
     ];
+    layout.layers = Some(console::Layers::host_clock());
     layout
 }
 
@@ -173,6 +175,8 @@ fn serve_loop(
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(()));
         }
+        let local = engine.local_layers();
+        console::layer_classes((0..engine.weights.layers.len()).map(|l| console::layer_class(false, l >= local)).collect());
         let mut selector = TokenSelector::new(&loaded.library, args.token_io.token_select, engine.cfg.vocab_size,
             engine.decode_rows)?;
         schedule(engine, &loaded, &tokenizer, eos, &mut receive, transports, runtime, &stats, speculate_max,

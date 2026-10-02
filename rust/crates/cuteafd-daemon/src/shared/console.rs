@@ -30,7 +30,7 @@ use std::time::Instant;
 
 mod layout;
 mod worker;
-pub(crate) use layout::{Color, Fact, Layers, Layout, Speculator, StepGroup};
+pub(crate) use layout::{layer_class, Color, Layers, Layout, Speculator, StepGroup};
 
 const CHANNEL: usize = 8192;
 const GAUGES_MS: u64 = 250;
@@ -198,6 +198,12 @@ impl Gauges {
     }
 }
 
+/// Name the layer profile's class of every layer (index into the layout's
+/// classes) once the engine knows its placement.
+pub(crate) fn layer_classes(classes: Vec<u8>) {
+    lifecycle(Event::LayerClasses(classes));
+}
+
 /// Push gauges built by `build` when a viewer is connected and 250 ms passed.
 #[inline]
 pub(crate) fn gauges(build: impl FnOnce() -> Gauges) {
@@ -359,6 +365,34 @@ impl Drop for Ticket {
     fn drop(&mut self) { self.retire("failed", 0); }
 }
 
+thread_local! {
+    /// Layer-end marks of the decode step running on this thread (armed only
+    /// while a viewer is connected; see [`layer_mark`]).
+    static LAYER_MARKS: std::cell::RefCell<Option<Vec<(u16, Instant)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A decode step finished layer `index` on the host clock. Engines call this
+/// once per layer of their decode loop; it records only while a [`Step`] with
+/// a viewer runs on this thread (otherwise one thread-local check).
+#[inline]
+pub(crate) fn layer_mark(index: usize) {
+    LAYER_MARKS.with(|marks| {
+        if let Some(marks) = marks.borrow_mut().as_mut() { marks.push((index.min(u16::MAX as usize) as u16, Instant::now())); }
+    });
+}
+
+/// Per-layer microseconds from layer-end marks: each layer's time is from the
+/// previous mark (repeats of a layer add up); the first mark has no start.
+fn layer_times(marks: &[(u16, Instant)]) -> Vec<f32> {
+    let Some(layers) = marks.iter().map(|&(index, _)| usize::from(index) + 1).max() else { return Vec::new() };
+    let mut times = vec![f32::NAN; layers];
+    for pair in marks.windows(2) {
+        let (index, us) = (usize::from(pair[1].0), pair[1].1.saturating_duration_since(pair[0].1).as_secs_f32() * 1e6);
+        times[index] = if times[index].is_nan() { us } else { times[index] + us };
+    }
+    times
+}
+
 /// One decode round of a generic family. Always counts the lifetime totals;
 /// builds the round event only while a viewer is connected.
 pub(crate) struct Step {
@@ -374,6 +408,7 @@ impl Step {
     #[inline]
     pub fn begin(lane: usize) -> Self {
         let live = live();
+        if live.is_some() { LAYER_MARKS.with(|marks| *marks.borrow_mut() = Some(Vec::with_capacity(128))); }
         Self { started: Instant::now(), lane: lane as u8, live, text: live.is_some_and(Live::text),
             requests: Vec::new(), tally: [0; 4] }
     }
@@ -403,13 +438,21 @@ impl Step {
 
     /// Count the round; with a viewer, send it with the stage times `stages`
     /// returns (microseconds by the layout's stage keys).
-    pub fn end(self, stages: impl FnOnce() -> Vec<(&'static str, f64)>) {
+    pub fn end(mut self, stages: impl FnOnce() -> Vec<(&'static str, f64)>) {
         let [drafted, verified, accepted, emitted] = self.tally;
         totals::round(drafted, verified, accepted, emitted);
         let Some(live) = self.live else { return };
+        let marks = LAYER_MARKS.with(|marks| marks.borrow_mut().take()).unwrap_or_default();
         let stages = stages().into_iter().map(|(key, us)| (key, us as f32)).collect();
         live.push(Event::Round(Round { lane: self.lane, shared: false, started: self.started,
-            finished: Instant::now(), stages, layer_us: Vec::new(), requests: self.requests }));
+            finished: Instant::now(), stages, layer_us: layer_times(&marks),
+            requests: std::mem::take(&mut self.requests) }));
+    }
+}
+
+impl Drop for Step {
+    fn drop(&mut self) {
+        if self.live.is_some() { LAYER_MARKS.with(|marks| *marks.borrow_mut() = None); }
     }
 }
 
@@ -477,14 +520,12 @@ mod tests {
         layout.steps = vec![StepGroup::new("Decode step", "host clock", &[("round.cycle", "step", Color::Target),
             ("draft", "DFlash2 draft", Color::Accepted), ("verify", "verify pass + head", Color::Target),
             ("emit", "accept + stream", Color::Ink)]),
-            StepGroup::new("Verify pass", "host clock", &[("experts", "Spark experts wait", Color::Spark),
-            ("layers.sum", "layers", Color::Target), ("layers.max", "slowest layer", Color::Warn)]),
-            StepGroup::admission(false)];
-        layout.layers = Some(Layers { title: "Layer profile · last step · host clock".into(), first: 0,
-            classes: vec![("dense".into(), Color::Rtx), ("Spark experts".into(), Color::Spark)],
-            class: (0..78).map(|l| u8::from(l >= 3)).collect() });
+            StepGroup::new("Verify pass", "host clock", &[("experts", "Spark experts wait", Color::Spark)]),
+            StepGroup::layers(), StepGroup::admission(false)];
+        layout.layers = Some(Layers::host_clock());
         let hub = ConsoleHub::new(false);
         install(hub.clone(), layout).unwrap();
+        layer_classes((0..78).map(|l| layer_class(l < 3, true)).collect());
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let (queue, _receive) = tokio::sync::mpsc::channel(4);
         let router = cuteafd_api::openai::router_with_console(queue, cuteafd_api::openai::NativeLimits::default(),
@@ -511,7 +552,10 @@ mod tests {
             let draft = Instant::now();
             std::thread::sleep(std::time::Duration::from_millis(4));
             let draft_us = us(draft);
-            std::thread::sleep(std::time::Duration::from_millis(25));
+            for layer in 0..78 {
+                std::thread::sleep(std::time::Duration::from_micros(if layer < 3 { 80 } else { 250 + 3 * layer as u64 }));
+                layer_mark(layer);
+            }
             for (ticket, generated, _) in &mut requests {
                 let width = if speculate { 7 } else { 0 };
                 let verified = width.min(random(8));
@@ -530,6 +574,20 @@ mod tests {
                 !done
             });
         }
+    }
+
+    #[test]
+    fn layer_marks_become_per_layer_times() {
+        let t = Instant::now();
+        let at = |us: u64| t + std::time::Duration::from_micros(us);
+        // Layers 0..3 end at 10, 30, 60 µs; an MTP pass re-runs layer 2 (ends at 70).
+        let times = layer_times(&[(0, at(10)), (1, at(30)), (2, at(60)), (2, at(70))]);
+        assert!(times[0].is_nan());
+        assert_eq!((times[1].round(), times[2].round()), (20.0, 40.0));
+        assert!(layer_times(&[]).is_empty());
+        // Unarmed marks are dropped.
+        layer_mark(3);
+        assert!(LAYER_MARKS.with(|marks| marks.borrow().is_none()));
     }
 
     #[test]

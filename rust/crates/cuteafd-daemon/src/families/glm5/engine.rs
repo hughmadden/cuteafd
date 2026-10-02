@@ -802,6 +802,7 @@ impl<'a> GlmEngine<'a> {
             if let Some(on_layer) = on_layer.as_mut() {
                 on_layer(index, &self.download(&w.h, t * h * 2)?)?;
             }
+            crate::shared::console::layer_mark(index);
         }
         if layers.len() < self.cfg.layers {
             // SAFETY: the engine owns this stream.
@@ -1050,6 +1051,7 @@ impl<'a> GlmEngine<'a> {
                     Previous::Planes(self.moe_exchange(w, index, layer, t, "m64", true, transport, runtime)?)
                 }
             };
+            crate::shared::console::layer_mark(index);
         }
         Ok(())
     }
