@@ -34,12 +34,13 @@
 //! are copied on that GPU's stream into its own mark arena (the same slot on both GPUs).
 use super::engine::{MimoEngine, MimoPlacement, DECODE_ROWS, PAGE_ROWS, RING_ROWS};
 use super::mtp::HIDDEN_ROWS;
-use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::device::{Allocation, Device};
 use anyhow::{ensure, Result};
 use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, PrefixFamily, ReuseRule, TailCopy};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_hostcache::copy::DeviceRange;
 use cuteafd_loader::families::mimo_v2::MimoAttention;
+use std::rc::Rc;
 
 /// One ring-structured state the mark keeps rows of: `rows` rows before the frontier, each
 /// `row` bytes, ring `r` position `p` at `(r * ring_rows + p % ring_rows) * row`.
@@ -64,7 +65,7 @@ pub(crate) struct MimoPrefix<'e, 'a> {
     rank_mark_bytes: Vec<usize>,
     mark_bytes: usize,
     /// Per rank: its marks' arena.
-    arenas: Vec<DeviceAllocation<'a>>,
+    arenas: Vec<Rc<Allocation<'a>>>,
     slots: usize,
     partial: bool,
 }
@@ -109,7 +110,8 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
         let slots = slots(mark_bytes);
         let arenas = if slots > 0 && mark_bytes > 0 {
             offsets.iter().enumerate().map(|(rank, &bytes)| {
-                engine.on(rank, || DeviceAllocation::new(engine.library, (slots * bytes).max(256)))
+                let device = Device { library: engine.library, id: engine.kv_layer_on(rank, 0).1.device_id };
+                Allocation::new(device, (slots * bytes).max(256)).map(Rc::new)
             }).collect::<Result<Vec<_>>>()?
         } else {
             Vec::new()
@@ -133,9 +135,8 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
     /// Stable allocations the host snapshot tier may copy. Full pages and
     /// per-rank SWA/MTP mark arenas are registered on their actual devices;
     /// the live rings are captured into those arenas before host submission.
-    pub fn host_buffers(&self) -> Vec<CuteafdDeviceBuffer> {
-        self.full.iter().map(|&(_, buffer, _)| buffer)
-            .chain(self.arenas.iter().map(|arena| arena.buffer)).collect()
+    pub fn host_owners(&self) -> Vec<Rc<Allocation<'a>>> {
+        self.engine.full_kv_owners().into_iter().chain(self.arenas.iter().cloned()).collect()
     }
 
     /// Zero every state's rows before `len` (a partial restore's empty window).
@@ -260,8 +261,11 @@ impl PrefixFamily for MimoPrefix<'_, '_> {
 
     fn drain(&self) -> Result<(), BoxError> {
         for rank in 0..self.engine.ranks() {
-            // SAFETY: the engine owns these streams.
-            unsafe { self.engine.library.cuda_stream_synchronize(self.engine.stream_of(rank))? };
+            let device = Device { library: self.engine.library, id: self.engine.kv_layer_on(rank, 0).1.device_id };
+            device.run(|| {
+                // SAFETY: the engine owns this stream on the selected rank.
+                unsafe { self.engine.library.cuda_stream_synchronize(self.engine.stream_of(rank)) }
+            })?;
         }
         Ok(())
     }

@@ -55,7 +55,8 @@ fn range(buffer: CuteafdDeviceBuffer) -> DeviceRange {
 
 mod regions;
 use regions::Regions;
-use crate::shared::memory::device::Device;
+use crate::shared::memory::device::{Allocation, Device};
+use std::rc::Rc;
 
 /// One device-owned stream and its nonblocking event probe.
 struct StreamState<'a> {
@@ -143,6 +144,9 @@ pub(crate) struct CudaCopyEngine<'a> {
     batch_sizes: Vec<usize>,
     ordered: Vec<(HostRange, DeviceRange)>,
     routed: Vec<(usize, HostRange, CuteafdDeviceBuffer)>,
+    /// Registered allocation owners outlive every stream and pinned chunk.
+    /// A failed drain deliberately retains these references through shutdown.
+    owners: Vec<Rc<Allocation<'a>>>,
 }
 
 impl<'a> CudaCopyEngine<'a> {
@@ -156,6 +160,16 @@ impl<'a> CudaCopyEngine<'a> {
     pub fn registered(library: &'a NativeLibrary, buffers: &[CuteafdDeviceBuffer]) -> Result<Self> {
         let regions = Regions::new(buffers)?;
         Self::create(library, buffers[0], Some(regions))
+    }
+    /// Keep the actual allocation owners, including family-owned mark arenas,
+    /// alive until all host copies drain, even if the family/engine shuts down.
+    pub fn registered_owned(library: &'a NativeLibrary, owners: Vec<Rc<Allocation<'a>>>) -> Result<Self> {
+        ensure!(owners.iter().all(|owner| std::ptr::eq(owner.device.library, library)),
+            "snapshot allocations belong to a different native library");
+        let buffers: Vec<_> = owners.iter().map(|owner| owner.buffer).collect();
+        let mut engine = Self::registered(library, &buffers)?;
+        engine.owners = owners;
+        Ok(engine)
     }
     fn create(library: &'a NativeLibrary, template: CuteafdDeviceBuffer, regions: Option<Regions>) -> Result<Self> {
         let ids = regions.as_ref().map(|r| r.devices.clone()).unwrap_or_else(|| vec![template.device_id]);
@@ -171,7 +185,7 @@ impl<'a> CudaCopyEngine<'a> {
             "host snapshot cache copy mechanism");
         Ok(Self { library, template, regions, chunks: Vec::new(), streams, next_event: 0,
             started: Instant::now(), runtime, submissions: 0, batch_dsts: Vec::new(),
-            batch_srcs: Vec::new(), batch_sizes: Vec::new(), ordered: Vec::new(), routed: Vec::new() })
+            batch_srcs: Vec::new(), batch_sizes: Vec::new(), ordered: Vec::new(), routed: Vec::new(), owners: Vec::new() })
     }
     fn resolve_host(chunks: &[Option<CuteafdHostBuffer>], range: HostRange) -> Result<CuteafdHostBuffer> {
         let chunk = chunks.get(range.chunk as usize).and_then(Option::as_ref).context("host cache chunk released")?;
@@ -316,8 +330,10 @@ impl Drop for CudaCopyEngine<'_> {
         let store = self.synchronize(Stream::Store);
         let restore = self.synchronize(Stream::Restore);
         if let Err(error) = store.and(restore) {
-            // Keep the pinned allocations held if completion cannot be proved.
-            tracing::error!(%error, "host cache drain failed; retaining pinned copy storage");
+            // Descriptors and page refs do not own memory. Retain the strong
+            // allocation references too, so family/engine drop cannot free it.
+            std::mem::forget(std::mem::take(&mut self.owners));
+            tracing::error!(%error, "host cache drain failed; retaining pinned and device copy storage");
             return;
         }
         for buffer in self.chunks.iter_mut().flatten() {
@@ -418,6 +434,49 @@ mod cuda_tests {
     #[ignore = "requires CUTEAFD_NATIVE_LIB, libcudart.so.13 and two CUDA devices"]
     fn queued_rank_copy_engine_drop_drains_before_pinned_storage_is_freed() -> Result<()> {
         queued_rank_release(true)
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, libcudart.so.13 and two CUDA devices"]
+    fn registered_owners_survive_family_drop_until_copy_engine_drains() -> Result<()> {
+        use crate::shared::memory::device::{Event as DeviceEvent, Stream as DeviceStream};
+        use cuteafd_ffi::test_support::CudaStreamGate;
+        use std::sync::atomic::Ordering;
+        // SAFETY: every CUDA owner is destroyed before this loaded library.
+        let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let owners = (0..2).map(|id| Allocation::new(Device { library: &lib, id }, 4096).map(Rc::new))
+            .collect::<Result<Vec<_>>>()?;
+        let weak: Vec<_> = owners.iter().map(Rc::downgrade).collect();
+        lib.cuda_set_device(0)?;
+        let mut engine = CudaCopyEngine::registered_owned(&lib, owners.clone())?;
+        let chunk = engine.allocate_chunk(8192)?;
+        let device = Device { library: &lib, id: 1 };
+        let producer = DeviceStream::new(device)?;
+        // SAFETY: this independent producer stream outlives both its gate and the copy engine.
+        let gate = device.run(|| unsafe { CudaStreamGate::new(&lib, producer.raw) })?;
+        let mut ready = DeviceEvent::new(device)?;
+        ready.record(&producer)?;
+        device.run(|| {
+            // SAFETY: the event and copy stream belong to this live device.
+            unsafe { lib.cuda_stream_wait_event(engine.streams[1][Stream::Store as usize].raw, ready.raw) }
+        })?;
+        for (rank, owner) in owners.iter().enumerate() {
+            engine.d2h(Stream::Store, range(owner.buffer), HostRange { chunk: chunk.id, offset: rank * 4096, bytes: 4096 })?;
+        }
+        drop(owners); // Model/family ownership has ended; only the copy engine remains.
+        assert!(weak.iter().all(|owner| owner.upgrade().is_some()));
+        let release = gate.release_handle();
+        std::thread::scope(|threads| {
+            threads.spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                release.store(true, Ordering::Release);
+            });
+            drop(engine);
+        });
+        drop(gate);
+        assert!(weak.iter().all(|owner| owner.upgrade().is_none()));
+        assert_eq!(lib.cuda_get_device()?, 0);
+        Ok(())
     }
 
     #[test]

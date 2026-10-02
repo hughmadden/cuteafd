@@ -28,6 +28,7 @@ use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
 use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
+use crate::shared::memory::device::{Allocation, Device};
 use crate::shared::token_io::{DeviceLogits, EmbedPlacement, TokenEmbedding};
 use crate::shared::spark_intake::SparkLink;
 use cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
@@ -43,6 +44,7 @@ use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::rc::Rc;
 
 type Dev<'a> = DeviceAllocation<'a>;
 
@@ -296,7 +298,7 @@ pub(crate) struct Peer<'a> {
     pub device: i32,
     pub stream: *mut c_void,
     pub layers: Vec<MimoLayer<'a>>,
-    kv: Vec<Dev<'a>>,
+    kv: Vec<Rc<Allocation<'a>>>,
     cos_sin_full: Dev<'a>,
     cos_sin_swa: Dev<'a>,
     workspace: RefCell<Option<Workspace<'a>>>,
@@ -358,7 +360,7 @@ pub(crate) struct MimoEngine<'a> {
     peer: Option<Peer<'a>>,
     exchange: Option<PeerExchange<'a>>,
     /// Per layer: the paged record pool (full) or the rings (SWA).
-    kv: Vec<Dev<'a>>,
+    kv: Vec<Rc<Allocation<'a>>>,
     cos_sin_full: Dev<'a>,
     cos_sin_swa: Dev<'a>,
     workspace: RefCell<Option<Workspace<'a>>>,
@@ -448,8 +450,8 @@ impl<'a> MimoEngine<'a> {
         ensure!(cfg.rope_dim == 64 && cfg.head_dim == 192 && cfg.v_head_dim == 128 && cfg.window <= RING_ROWS - DECODE_ROWS,
             "the mimo programs are built for 192/128 heads, 64 RoPE dims and a window of at most {}",
             RING_ROWS - DECODE_ROWS);
-        let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-            let allocation = DeviceAllocation::new(library, bytes.max(256))?;
+        let zeroed = |bytes: usize| -> Result<Rc<Allocation<'a>>> {
+            let allocation = Rc::new(Allocation::new(Device { library, id: device }, bytes.max(256))?);
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
@@ -490,6 +492,21 @@ impl<'a> MimoEngine<'a> {
         (attention, kv[layer].buffer, self.record_bytes(&layers[layer]))
     }
 
+    /// Strong allocation ownership for host snapshot DMA, independent of this
+    /// engine's lifetime. Sliding rings are captured into separate mark arenas.
+    pub(crate) fn full_kv_owners(&self) -> Vec<Rc<Allocation<'a>>> {
+        let mut owners = Vec::new();
+        for rank in 0..self.ranks() {
+            let (layers, kv) = match (rank, &self.peer) {
+                (1, Some(peer)) => (&peer.layers, &peer.kv),
+                _ => (&self.weights.layers, &self.kv),
+            };
+            owners.extend(layers.iter().zip(kv).filter(|(layer, _)| layer.attention == MimoAttention::Full)
+                .map(|(_, owner)| Rc::clone(owner)));
+        }
+        owners
+    }
+
     /// The KV record format.
     pub fn kv_cache(&self) -> MimoKvCache {
         self.kv_cache
@@ -517,8 +534,8 @@ impl<'a> MimoEngine<'a> {
         let rows = self.prefill_rows.max(DECODE_ROWS);
         let exchange = PeerExchange::new(library, [RankDevice { device: self.device, stream: self.stream },
             RankDevice { device, stream }], 8, rows * self.cfg.hidden * 2)?;
-        let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-            let allocation = DeviceAllocation::new(library, bytes.max(256))?;
+        let zeroed = |bytes: usize| -> Result<Rc<Allocation<'a>>> {
+            let allocation = Rc::new(Allocation::new(Device { library, id: device }, bytes.max(256))?);
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
