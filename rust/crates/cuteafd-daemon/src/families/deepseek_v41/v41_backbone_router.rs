@@ -82,6 +82,11 @@ impl<'a> BackboneRouterWeights<'a> {
             // Large prefill retains direct downloads to avoid another host copy.
             request_staging: HostAllocation::new(self.library,
                 capacity as usize * (request_hidden_format(self.nvfp4).1 + 48))?,
+            mask_staging: HostAllocation::new(self.library, capacity as usize)?,
+            route_ring: crate::shared::memory::chain::device_enabled()
+                .then(|| HostAllocation::new(self.library, 40 * capacity as usize * 24)).transpose()?,
+            ring_capture: false,
+            ring_pending: Vec::with_capacity(40),
             weights: self,
             tokens: Vec::new(),
             layer: self.layer,
@@ -334,6 +339,15 @@ pub(crate) struct BackboneRouterWave<'w, 'a> {
     weights: &'w BackboneRouterWeights<'a>,
     buffers: Vec<DeviceAllocation<'a>>,
     request_staging: HostAllocation<'a>,
+    /// The modality mask's own pinned source under device-ordered passes, where
+    /// the host stages the next layer while this layer's route download into
+    /// the request arena may still be queued.
+    mask_staging: HostAllocation<'a>,
+    /// Device-ordered passes: each local layer's route ids, downloaded into
+    /// its own slot (`[40][capacity][6]` u32) and read after the pass drains.
+    route_ring: Option<HostAllocation<'a>>,
+    ring_capture: bool,
+    ring_pending: Vec<(usize, u32)>,
     tokens: Vec<u64>,
     layer: usize,
     capacity: u32,
@@ -365,6 +379,30 @@ impl<'w, 'a> BackboneRouterWave<'w, 'a> {
     }
 }
 impl BackboneRouterWave<'_, '_> {
+    /// Device-ordered passes keep captured local routes in the ring.
+    pub fn set_ring_capture(&mut self, enabled: bool) {
+        self.ring_capture = enabled && self.route_ring.is_some();
+        self.ring_pending.clear();
+    }
+    /// Whether this wave captures local routes into its ring (no host read now).
+    pub fn ring_capture(&self) -> bool {
+        self.ring_capture && crate::shared::memory::chain::deferred()
+    }
+    /// After the pass drained: every ring-captured layer's routes into `output[layer]`.
+    pub fn drain_ring(&mut self, output: &mut [Vec<[u32; 6]>]) -> Result<Vec<usize>> {
+        self.synchronize()?;
+        let ring = match &self.route_ring { Some(ring) => ring.bytes(), None => return Ok(Vec::new()) };
+        let mut layers = Vec::with_capacity(self.ring_pending.len());
+        for (layer, rows) in self.ring_pending.drain(..) {
+            let slot = &ring[layer * self.capacity as usize * 24..][..rows as usize * 24];
+            let rows_out = output.get_mut(layer).context("ring layer outside the capture")?;
+            rows_out.clear();
+            rows_out.extend(slot.chunks_exact(24).map(|row| std::array::from_fn(|i|
+                u32::from_ne_bytes(row[4 * i..4 * i + 4].try_into().unwrap()))));
+            layers.push(layer);
+        }
+        Ok(layers)
+    }
     pub fn set_local_mode(&mut self, local: bool) -> Result<()> {
         if self.full_request == !local { return Ok(()); }
         self.stream.require_complete()?;
@@ -530,10 +568,17 @@ impl BackboneRouterWave<'_, '_> {
                 && mask.len() <= self.request_staging.buffer.bytes,
             "invalid router staged input"
         );
+        // Deferred passes stage every layer's (identical) mask in its own
+        // buffer: rewriting the same bytes cannot race the queued H2D.
+        let source = if crate::shared::memory::chain::deferred() {
+            self.mask_staging.buffer
+        } else {
+            self.request_staging.buffer
+        };
         unsafe {
             std::ptr::copy_nonoverlapping(
                 mask.as_ptr(),
-                self.request_staging.buffer.ptr.cast::<u8>(),
+                source.ptr.cast::<u8>(),
                 mask.len(),
             );
         }
@@ -544,7 +589,7 @@ impl BackboneRouterWave<'_, '_> {
                 .copy_d2d_async(self.b(0), input, input.bytes, self.stream.raw)?;
             self.stream.library.copy_host_buffer_h2d_async(
                 self.b(1),
-                self.request_staging.buffer,
+                source,
                 mask.len(),
                 self.stream.raw,
             )
@@ -629,7 +674,23 @@ impl BackboneRouterWave<'_, '_> {
             }
         })();
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
-        self.stream.wait().await?;
+        if !cold && !self.full_request && crate::shared::memory::chain::deferred() {
+            // Local experts read the routes on the device: later stages join
+            // the chain instead of the host waiting. Captured routes go to this
+            // layer's ring slot, read once the pass drained.
+            if self.ring_capture {
+                let ring = self.route_ring.as_ref().context("route ring absent")?.buffer;
+                let slot = self.layer * self.capacity as usize * 24;
+                let target = cuteafd_ffi::CuteafdHostBuffer {
+                    ptr: unsafe { ring.ptr.cast::<u8>().add(slot) }.cast(), bytes: rows as usize * 24, ..ring };
+                unsafe { self.stream.library.copy_d2h_host_buffer_async(target, self.b(3), rows as usize * 24,
+                    self.stream.raw)?; }
+                self.ring_pending.push((self.layer, rows));
+            }
+            unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw)?; }
+        } else {
+            self.stream.wait().await?;
+        }
         if cold {
             // The eager execution above already completed these inputs. Capture
             // records future launches without executing them; publish that result

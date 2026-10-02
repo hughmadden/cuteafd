@@ -122,6 +122,28 @@ pub(crate) fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("CUTEAFD_STAGE_CHAIN").map_or(true, |v| v != "0"))
 }
 
+/// Whether chained V4.1 passes also drop the host waits that only kept
+/// copy-engine transfers from queuing behind unresolved events
+/// (`CUTEAFD_V41_DEVICE=1`, PLAN.md device-driven exchange, stage D3): peer
+/// transfers become SM copies ordered by device events and the host enqueues
+/// the next stage at once. Off by default; the default path is unchanged.
+pub(crate) fn device_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let on = matches!(std::env::var("CUTEAFD_V41_DEVICE").as_deref(), Ok("1" | "on" | "true"));
+        if on {
+            tracing::info!("V4.1 device-ordered passes: chained stages enqueue without host waits");
+        }
+        on
+    })
+}
+
+/// Inside a chain scope with [`device_enabled`]: stages that used to wait on
+/// the host for a producer stream join the chain instead.
+pub(crate) fn deferred() -> bool {
+    active() && device_enabled()
+}
+
 pub(crate) struct ChainScope<F> {
     current: Current,
     future: F,
@@ -225,6 +247,10 @@ pub(crate) async unsafe fn finish_cooperative(stream: &LoadStream<'_>) -> Result
 /// Host wait for all chained work before a host-synchronous operation (legacy
 /// stream copies do not order with the non-blocking stage streams).
 pub(crate) fn settle(library: &NativeLibrary) -> Result<()> {
+    if deferred() {
+        // The settled transfers are SM copies ordered by the chain events.
+        return Ok(());
+    }
     let Some(current) = current() else { return Ok(()) };
     if let Some(head) = current.head.get() {
         unsafe { library.cuda_event_synchronize(current.events[head].1)?; }

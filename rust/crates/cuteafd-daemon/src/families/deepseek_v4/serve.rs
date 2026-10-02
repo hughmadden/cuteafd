@@ -313,6 +313,7 @@ fn speculative_step(
         .map(|(a, tokens)| (&mut a.placement, tokens.as_slice())).collect();
     let logits = engine.verify_device(&mut rows, transports, runtime)?;
     let selected = select_rows(selector, &logits, active, &sequences, &starts)?;
+    engine.check_device()?;
     let mut offset = 0;
     Ok(active.iter_mut().zip(&sequences).zip(starts).map(|((request, rows), start)| {
         let mut finished = false;
@@ -618,6 +619,7 @@ fn schedule(
             let mut rows: Vec<(&mut Placement, u32)> = active.iter_mut().map(|a| (&mut a.placement, a.next)).collect();
             engine.decode_device(&mut rows, transports.first_mut(), runtime).and_then(|logits| {
                 let selected = select_rows(selector, &logits, &active, &sequences, &starts)?;
+                engine.check_device()?;
                 Ok(active.iter_mut().zip(&selected).enumerate().map(|(row, (request, selected))| {
                     let token = take(request.constraint.as_mut(), selected);
                     finish_row(request, token, eos, &logits, row, caching, engine.library)

@@ -33,6 +33,17 @@ int32_t cuteafd_peer_push_signal(void* destination, const void* source, uint64_t
 // the stream faults instead of hanging.
 int32_t cuteafd_peer_wait(const uint32_t* flag, uint32_t* recv_state, void* stream);
 
+// Host proxy mailbox (the device-driven Spark exchange): on the stream, after
+// its earlier work (D2H copies into the pinned mailbox), write the four
+// `words` to `descriptor` and publish the next sequence to `flag` (both
+// pinned, device-mapped host memory) with a system-scope release; the proxy
+// thread spinning on `flag` then reads the mailbox. `send_state` (u32 [1],
+// device memory, zeroed) carries the sequence across graph replays. The
+// proxy answers through another pinned flag that `cuteafd_peer_wait` spins on
+// (host-mapped flags work there too).
+int32_t cuteafd_host_signal(uint32_t* flag, uint32_t* send_state, uint32_t* descriptor,
+    const uint32_t* words, void* stream);
+
 // P2P probe for `cuteafd fabric --p2p`. Runs one measurement between devices
 // `a` and `b` (peer access enabled both ways by the call) and writes the time
 // per operation in microseconds (median of 5 repeats of `iterations` ops):

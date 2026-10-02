@@ -100,6 +100,22 @@ impl NativeLibrary {
         Ok(())
     }
 
+    /// Publishes a host mailbox on `stream`: writes `words` to `descriptor`,
+    /// then the next sequence to `flag` (see `cuteafd_host_signal`).
+    ///
+    /// # Safety
+    /// `flag` and `descriptor` are live pinned, device-mapped host memory,
+    /// `send_state` (u32 [1]) live memory of the stream's device; the host
+    /// side reads the mailbox only after it sees the sequence.
+    pub unsafe fn host_signal(&self, flag: *mut u32, send_state: *mut u32, descriptor: *mut u32, words: [u32; 4],
+        stream: *mut c_void) -> Result<()> {
+        type F = unsafe extern "C" fn(*mut u32, *mut u32, *mut u32, *const u32, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_host_signal") }?;
+        let status = unsafe { f(flag, send_state, descriptor, words.as_ptr(), stream) };
+        ensure!(status == 0, "host mailbox signal failed with CUDA error {status}");
+        Ok(())
+    }
+
     /// Spins on `stream` until `flag` reaches the next sequence.
     ///
     /// # Safety
