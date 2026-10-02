@@ -473,6 +473,12 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             }
             let gpu = self.map.attention(layer)?;
             let device = self.lanes[gpu].device;
+            if layer != first && crate::shared::memory::chain::deferred() {
+                // The previous layer's attention stages uploaded from host staging
+                // this layer rewrites: wait until they ran (the GPU still has that
+                // layer's FFN queued, so it does not idle while this one is queued).
+                crate::shared::memory::chain::fence_wait(device.library, (layer - 1) % 2)?;
+            }
             if layer != first {
                 unsafe {
                     self.advance(layer).await?;
@@ -621,6 +627,9 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                     )
                 })?
             };
+            if crate::shared::memory::chain::deferred() {
+                crate::shared::memory::chain::fence_mark(device.library, layer % 2)?;
+            }
             #[cfg(test)]
             let prepared = if self.trace && std::env::var_os("CUTEAFD_TRACE_FFN").is_some()
                 && std::env::var("CUTEAFD_TRACE_LAYER").ok().map_or(true,
