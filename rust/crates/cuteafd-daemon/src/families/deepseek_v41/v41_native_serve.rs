@@ -79,7 +79,7 @@ pub(crate) async fn run(mut args: crate::cli::NativeServeArgs) -> Result<()> {
     let stats = std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
     let worker_stats = stats.clone();
     let console_hub = cuteafd_api::openai::ConsoleHub::new(args.console_text);
-    console::install(console_hub.clone(), console_config(&args))?;
+    console::install(console_hub.clone(), console::layout(&args))?;
     let worker_thread = std::thread::Builder::new()
         .name("v41-target-cuda".into())
         .spawn(move || {
@@ -117,36 +117,6 @@ pub(crate) async fn run(mut args: crate::cli::NativeServeArgs) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("native CUDA worker panicked during shutdown"))?;
     Ok(())
 }
-/// Header facts for the live console. The revision comes from the release
-/// image's environment; `CUTEAFD_CONSOLE_REVISION` overrides it for dev binaries.
-fn console_config(args: &crate::cli::NativeServeArgs) -> console::Config {
-    let env = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
-    let layout = format!("{}×RTX + {} Spark", args.rtx_gpus, args.peers.len());
-    console::Config {
-        snapshot: args.snapshot.clone(),
-        info: serde_json::json!({
-            "model": cuteafd_api::openai::MODEL,
-            "release": env("CUTEAFD_RELEASE_VERSION"),
-            "revision": env("CUTEAFD_CONSOLE_REVISION").or_else(|| env("CUTEAFD_ENGINE_COMMIT")),
-            "layout": layout,
-            "rtx_gpus": args.rtx_gpus,
-            "sparks": args.peers.len(),
-            "concurrency": args.concurrency,
-            "lanes": 2,
-            "lane_capacity": 8,
-            "dspark": args.dspark,
-            "draft_limit": args.dspark_draft_limit,
-            "policy": if !args.dspark { "off" } else if args.dspark_fixed { "fixed" } else { "bandwidth" },
-            "prefill_chunk_rows": args.prefill_batch_tokens,
-            "max_context_tokens": args.max_context_tokens,
-            "prefix_cache_entries": args.prefix_cache_entries,
-            "text": args.console_text,
-            "started_unix_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis() as u64),
-        }),
-    }
-}
-
 // Reserve a supported AOT capacity once; live prefill chunks retain the user's
 // requested size. All backbone/draft workspaces and transport share this bound.
 fn prefill_capacity(batch_tokens: u32) -> Result<u32> {

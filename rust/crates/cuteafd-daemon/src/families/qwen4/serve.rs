@@ -37,9 +37,10 @@ use crate::shared::prefill_share::{add_phases, isolated_phases, Chunk, DecodeSha
 use anyhow::{Context, Result};
 use cuteafd_api::openai::chat::qwen4::QwenEncoding;
 use cuteafd_api::openai::{
-    ConsoleHub, InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits, NativeRequest,
+    InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits, NativeRequest,
     PromptUsage,
 };
+use crate::shared::console;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -73,6 +74,8 @@ pub(crate) struct ServeArgs {
     pub decode_share: DecodeShareArgs,
     #[command(flatten)]
     pub prefix: PrefixArgs,
+    #[command(flatten)]
+    pub console: console::ConsoleArgs,
 }
 
 fn model_id(snapshot: &std::path::Path) -> Option<String> {
@@ -106,11 +109,12 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         Drafts::Copy
     };
     let prefix = args.prefix.clone();
+    let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id, drafts, &eos)));
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, drafts, eos, decode_share, prefix));
     ready_rx.await.context("engine failed before it was ready")??;
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
-        ConsoleHub::disabled(), profile.clone());
+        hub, profile.clone());
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     cuteafd_bench::ready(&listener);
     tracing::info!(listen = %args.listen, model = %profile.id, "Qwen 3.8 Flash Next API is ready");
@@ -120,6 +124,32 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         finished = worker => finished??,
     }
     Ok(())
+}
+
+/// What the live console shows for Qwen 3.8 Flash Next.
+fn console_layout(args: &ServeArgs, model: &str, drafts: Drafts, eos: &[u32]) -> console::Layout {
+    use console::{Color::*, StepGroup};
+    let mut layout = console::Layout::new("qwen4", model.into(), args.engine.snapshot.clone());
+    let sparks = args.engine.peers.as_deref().map_or(0, |peers| peers.split(',').count());
+    layout.hardware = console::hardware(1, sparks, args.engine.local_experts || args.engine.shared_only);
+    layout.concurrency = args.max_sequences.min(DECODE_ROWS);
+    layout.eos = eos.to_vec();
+    layout.speculator = match drafts {
+        Drafts::None => None,
+        Drafts::Copy => Some(console::Speculator { name: "Copy window".into(), positions: COPY_DRAFT,
+            policy: "adaptive length".into() }),
+        Drafts::Mtp { depth, fixed } => Some(console::Speculator { name: "MTP".into(), positions: depth,
+            policy: if fixed { format!("fixed {depth}") } else { format!("adaptive ≤ {depth}") } }),
+    };
+    layout.steps = vec![
+        StepGroup::new("Decode step", "host clock", &[("round.cycle", "step", Target),
+            ("draft", "draft plan + MTP / copy drafts", Accepted), ("verify", "verify pass + token selection", Target),
+            ("emit", "accept + stream", Ink), ("commit", "commit kept rows + MTP stash", Accepted)]),
+        StepGroup::new("Verify pass", "host clock, engine phases", &[
+            ("gpu", "GPU until expert exchanges", Rtx), ("experts", "expert exchanges", Spark)]),
+        StepGroup::admission(false),
+    ];
+    layout
 }
 
 /// Where a step's drafts come from.
@@ -194,6 +224,7 @@ struct Active<'a> {
     started: Instant,
     /// Admission order, for traces.
     id: u64,
+    ticket: console::Ticket,
 }
 
 /// Commits a selected token to the request's grammar.
@@ -308,6 +339,7 @@ struct Prefill<'a> {
     busy: f64,
     phases: [f64; 2],
     id: u64,
+    ticket: console::Ticket,
 }
 
 /// Per-cycle step costs for policy work (`CUTEAFD_SPECULATION_TRACE=path`, JSON lines).
@@ -397,6 +429,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 // Idle: publish the state the server waits in (captures and releases done).
                 cache.tick();
                 publish(stats, requests, generated_total, 0, 0, &cache);
+                console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
                 match receive.blocking_recv() {
                     Some(job) => job,
                     None => return Ok(()),
@@ -429,6 +462,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 continue;
             };
             cache.tick();
+            let admit_started = Instant::now();
             // Lookup, fork of the retained units and restore of the state mark (byte-exact), with
             // room for the rows a verify may write past the last kept one.
             let start = history_of(&engine.cfg, &[]);
@@ -466,6 +500,8 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 release(&family, &mut cache, &mut free_slots, &placement);
                 continue;
             }
+            let ticket = console::admit(tokens.len(), resume, job.max_tokens, constraint.is_some(), job.images.len(),
+                admit_started);
             if let Some(source) = admitted.source {
                 tracing::info!(tokens = tokens.len(), resume, kind = ?source.kind, frontier = source.frontier,
                     host = source.host, "prefix cache hit");
@@ -488,7 +524,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             }
             prefills.push(Prefill { job, constraint, tokens, done: resume, resume, plan, chunks: 0, cancelled: false,
                 placement, capacity, seq: MtpSeq::default(), logits, first: None, prompt_row: None,
-                started: Instant::now(), busy: 0.0, phases: [0.0; 2], id: admissions });
+                started: Instant::now(), busy: 0.0, phases: [0.0; 2], id: admissions, ticket });
         }
         if prefills.due(!active.is_empty()) {
             let caching = cache.enabled();
@@ -535,6 +571,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 p.done += chunk.len();
                 add_phases(&mut p.phases, phases);
                 p.busy += timer.elapsed().as_secs_f64();
+                p.ticket.prefill(chunk.len(), p.chunks, p.plan.chunks.len(), timer);
                 result?;
                 // Intermediate snapshot points this chunk ends at (off unless configured).
                 for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks) {
@@ -546,10 +583,11 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 p.chunks += 1;
                 Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
             });
-            for (p, prefilled) in finished {
+            for (mut p, prefilled) in finished {
                 let (placement, resume) = (p.placement.clone(), p.resume);
                 if let Err(error) = &prefilled {
                     if p.cancelled {
+                        p.ticket.cancel();
                         // The client left during the prefill: keep what it computed for a retry.
                         if placement.len > resume && !probe::cold(&p.job.probe) {
                             if let Err(error) = cache.park(&family, &p.tokens[..placement.len], &placement) {
@@ -564,7 +602,6 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                     continue;
                 }
                 // A whole-prompt hit selects from its retained logits; a prefill selected already.
-                let mut p = p;
                 let first = match (p.first, p.logits.as_deref()) {
                     (Some(first), _) => Ok(first),
                     (None, Some(logits)) => {
@@ -610,6 +647,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                         job: p.job, constraint: p.constraint, placement: p.placement, mtp: p.seq,
                         outcomes: DraftHistory::default(), idle: 0, proposed: 0, accepted: 0, cycles: 0, turn: None,
                         capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(), id: p.id,
+                        ticket: p.ticket,
                     };
                     request.next = first;
                     request.mtp.close(request.next);
@@ -619,11 +657,15 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                     Ok(mut request) => {
                         let token = request.next;
                         let emitted = request.emit(token);
+                        request.ticket.first(token);
                         retain_prompt(&mut cache, &request.placement);
                         match emitted {
                             Ok(false) => active.push(request),
                             // Finished at its first token: its turn is its prompt snapshot.
-                            Ok(true) | Err(_) => release(&family, &mut cache, &mut free_slots, &request.placement),
+                            Ok(true) | Err(_) => {
+                                request.ticket.done(emitted.is_err(), request.generated);
+                                release(&family, &mut cache, &mut free_slots, &request.placement)
+                            }
                         }
                     }
                     Err(error) => {
@@ -639,6 +681,8 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             continue;
         }
         let cycle = Instant::now();
+        let mut tally = console::Step::begin(0);
+        let engine_before = tally.live().then(|| *engine.profile.borrow());
         let mut rates: Vec<Vec<f64>> = Vec::new();
         let (steps_before, draft_s_before) = (timing.steps, timing.seconds);
         // Each sequence verifies its next token plus its drafts within the decode programs' rows.
@@ -701,6 +745,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             Ok(rows)
         }).collect::<Result<_>>()?;
         let spec = sequences.iter().any(|rows| rows.len() > 1);
+        let draft_us = console::us(cycle);
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
         let histories: Vec<_> = active.iter().map(|a| a.placement.history.clone()).collect();
         let tokens: Vec<u32> = sequences.iter().flatten().copied().collect();
@@ -736,6 +781,8 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
         let caching = cache.enabled();
         let mut offset = 0;
         let mut kept = Vec::with_capacity(active.len());
+        let before: Vec<usize> = active.iter().map(|a| a.history.len()).collect();
+        let emit_timer = Instant::now();
         let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(&starts).enumerate()
             .map(|(index, ((request, rows), &start))| {
             let mut finished = false;
@@ -791,6 +838,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             kept.push(if !finished || request.turn.is_some() { last } else { None });
             finished
         }).collect();
+        let (emit_us, commit_timer) = (console::us(emit_timer), Instant::now());
         // Commit the kept rows (speculative steps), rewind, and stash them for the MTP.
         let mut first_row = 0;
         let mut verified: Vec<Verified<'_>> = Vec::with_capacity(active.len());
@@ -802,6 +850,17 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
         }
         speculate::accept(engine, &mut verified, spec, mtp)?;
         drop(verified);
+        let commit_us = console::us(commit_timer);
+        for (i, request) in active.iter().enumerate() {
+            tally.member(&request.ticket, &proposals[i], sequences[i].len() - 1, &request.history[before[i]..],
+                request.constraint.is_some(), finished[i]);
+        }
+        tally.end(|| {
+            let engine_now = *engine.profile.borrow();
+            let gpu = |i: usize| engine_before.map_or(f64::NAN, |before| 1e6 * (engine_now[i] - before[i]));
+            vec![("draft", draft_us), ("verify", 1e6 * elapsed), ("emit", emit_us), ("commit", commit_us),
+                ("gpu", gpu(0)), ("experts", gpu(1))]
+        });
         if let Some(trace) = trace.as_mut() {
             trace.cycle(serde_json::json!({"rows": tokens.len(), "seqs": sequences.len(),
                 "ids": active.iter().map(|a| a.id).collect::<Vec<_>>(),
@@ -816,7 +875,8 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             if !finished[index] {
                 continue;
             }
-            let request = active.remove(index);
+            let mut request = active.remove(index);
+            request.ticket.done(request.job.events.is_closed(), request.generated);
             requests += 1;
             generated_total += request.generated as u64;
             let seconds = request.started.elapsed().as_secs_f64();
@@ -840,6 +900,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
         }
         cache.tick();
         publish(stats, requests, generated_total, active.len(), prefills.len(), &cache);
+        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
 }

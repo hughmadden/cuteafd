@@ -29,9 +29,10 @@ use crate::shared::prefill_share::{add_phases, isolated_phases, Chunk, DecodeSha
 use anyhow::{Context, Result};
 use cuteafd_api::openai::chat::qwen4::QwenEncoding;
 use cuteafd_api::openai::{
-    ConsoleHub, InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits, NativeRequest,
+    InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits, NativeRequest,
     PromptUsage,
 };
+use crate::shared::console;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -65,6 +66,8 @@ pub(crate) struct ServeArgs {
     pub decode_share: DecodeShareArgs,
     #[command(flatten)]
     pub prefix: PrefixArgs,
+    #[command(flatten)]
+    pub console: console::ConsoleArgs,
 }
 
 pub(crate) use crate::shared::prefix::{PrefixArgs, Toggle};
@@ -90,11 +93,12 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let draft = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed,
         decode_share: args.decode_share };
     let prefix = args.prefix.clone();
+    let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id)));
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, draft, prefix));
     ready_rx.await.context("engine failed before it was ready")??;
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
-        ConsoleHub::disabled(), profile.clone());
+        hub, profile.clone());
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     cuteafd_bench::ready(&listener);
     tracing::info!(listen = %args.listen, model = %profile.id, "MiMo V2 API is ready");
@@ -104,6 +108,35 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         finished = worker => finished??,
     }
     Ok(())
+}
+
+/// What the live console shows for MiMo V2 (Flash and V2.6 Pro).
+fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
+    use console::{Color::*, StepGroup};
+    let mut layout = console::Layout::new("mimo_v2", model.into(), args.engine.snapshot.clone());
+    let sparks = args.engine.peers.as_deref().map_or(0, |peers| peers.split(',').count());
+    layout.hardware = console::hardware(1 + usize::from(args.engine.split_device.is_some()), sparks,
+        args.engine.local_experts);
+    layout.split = args.engine.split_device.map(|_| "head split".into());
+    layout.concurrency = args.max_sequences.min(DECODE_ROWS);
+    let copy = if args.no_copy_drafts { "" } else { " · copy windows" };
+    let policy = args.draft_fixed.map_or_else(|| "adaptive".to_string(), |n| format!("fixed {n}"));
+    let drafter = if args.engine.draft.is_some() { Some("DFlash") } else if args.engine.mtp > 0 { Some("MTP") } else { None };
+    layout.speculator = match (drafter, args.no_copy_drafts) {
+        (Some(name), _) => Some(console::Speculator { name: name.into(), positions: 8, policy: policy + copy }),
+        (None, false) => Some(console::Speculator { name: "Copy window".into(), positions: COPY_DRAFT,
+            policy: "adaptive length".into() }),
+        (None, true) => None,
+    };
+    layout.steps = vec![
+        StepGroup::new("Decode step", "host clock", &[("round.cycle", "step", Target),
+            ("draft", "draft (DFlash / MTP)", Accepted), ("plan", "draft plan + copy windows", Ink),
+            ("verify", "verify pass + token selection", Target), ("emit", "accept + stream + drafter context", Ink)]),
+        StepGroup::new("Verify pass", "host clock, engine phases", &[
+            ("gpu", "GPU until expert exchanges", Rtx), ("experts", "expert exchanges", Spark)]),
+        StepGroup::admission(false),
+    ];
+    layout
 }
 
 /// Draft settings: copy-window draft length, fixed DFlash draft count.
@@ -178,6 +211,7 @@ struct Prefill<'a> {
     /// Seconds in this prompt's chunks, and their engine phases.
     busy: f64,
     phases: [f64; 2],
+    ticket: console::Ticket,
 }
 
 struct Active<'a> {
@@ -210,6 +244,7 @@ struct Active<'a> {
     generated: usize,
     buffered: usize,
     started: Instant,
+    ticket: console::Ticket,
 }
 
 /// Commits a selected token to the request's grammar.
@@ -344,6 +379,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 // Idle: publish the state the server waits in (captures and releases done).
                 cache.tick();
                 publish(stats, requests, generated_total, 0, 0, &cache);
+                console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
                 match receive.blocking_recv() {
                     Some(job) => job,
                     None => return Ok(()),
@@ -377,6 +413,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             };
             let slot = free_slots.pop();
             cache.tick();
+            let admit_started = Instant::now();
             // Lookup, fork of the retained pages and restore of the mark (byte-exact).
             let lookup: &[u32] = if cold { &[] } else { &tokens };
             let admitted = match cache.admit(&family, lookup, capacity, true,
@@ -410,6 +447,8 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 release(&family, &mut cache, &mut free_rings, &mut free_slots, &placement, slot);
                 continue;
             }
+            let ticket = console::admit(tokens.len(), resume, job.max_tokens, constraint.is_some(), job.images.len(),
+                admit_started);
             if let Some(source) = admitted.source {
                 tracing::info!(tokens = tokens.len(), resume, kind = ?source.kind, frontier = source.frontier,
                     host = source.host, partial = source.partial, "prefix cache hit");
@@ -427,7 +466,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let plan = if logits.is_some() { cuteafd_engine::prefix::PointPlan::default() } else { plan };
             prefills.push(Prefill { job, constraint, tokens, done: resume, resume, plan, chunks: 0, cancelled: false,
                 placement: admitted.placement, capacity, slot, logits, first: None, started: Instant::now(), busy: 0.0,
-                phases: [0.0; 2] });
+                phases: [0.0; 2], ticket });
         }
         if prefills.due(!active.is_empty()) {
             // One chunk of each waiting prompt (whole prompts with --decode-share 0).
@@ -470,6 +509,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 p.done += chunk.len();
                 add_phases(&mut p.phases, phases);
                 p.busy += timer.elapsed().as_secs_f64();
+                p.ticket.prefill(chunk.len(), p.chunks, p.plan.chunks.len(), timer);
                 result?;
                 // Intermediate snapshot points this chunk reaches (off unless configured).
                 for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks) {
@@ -481,10 +521,11 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 p.chunks += 1;
                 Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
             });
-            for (p, prefilled) in finished {
+            for (mut p, prefilled) in finished {
                 let (slot, placement, resume) = (p.slot, p.placement.clone(), p.resume);
                 if let Err(error) = &prefilled {
                     if p.cancelled {
+                        p.ticket.cancel();
                         // The client left during the prefill: keep what it computed for a retry.
                         if placement.len > resume && !probe::cold(&p.job.probe) {
                             if let Err(error) = cache.park(&family, &p.tokens[..placement.len], &placement) {
@@ -532,6 +573,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?,
                         job: p.job, constraint: p.constraint, placement: p.placement, draft_from: resume, turn: None,
                         capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(),
+                        ticket: p.ticket,
                     };
                     request.next = match p.first {
                         Some(token) => token,
@@ -549,12 +591,16 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     Ok(mut request) => {
                         let token = request.next;
                         let emitted = request.emit(token);
+                        request.ticket.first(token);
                         retain_prompt(&mut cache, &request.placement);
                         match emitted {
                             Ok(false) => active.push(request),
                             // Finished at its first token: its turn is its prompt snapshot.
-                            Ok(true) | Err(_) => release(&family, &mut cache, &mut free_rings, &mut free_slots,
-                                &request.placement, request.slot),
+                            Ok(true) | Err(_) => {
+                                request.ticket.done(emitted.is_err(), request.generated);
+                                release(&family, &mut cache, &mut free_rings, &mut free_slots, &request.placement,
+                                    request.slot)
+                            }
                         }
                     }
                     Err(error) => {
@@ -570,6 +616,9 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             continue;
         }
         let cycle = Instant::now();
+        let mut tally = console::Step::begin(0);
+        let (draft0, emit0) = (draft_s, emit_s);
+        let engine_before = tally.live().then(|| *engine.profile.borrow());
         // Rows each sequence may add after its next token.
         let room = (DECODE_ROWS / active.len()).max(1) - 1;
         let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else { room.min(a.job.max_tokens - a.generated - 1)
@@ -624,6 +673,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             }
             _ => vec![None; active.len()],
         };
+        let plan_timer = Instant::now();
         let planned = plan_drafts(&active, &drafted, &limits, policy.fixed, &cost);
         skip.after(drafted.iter().any(Option::is_some) && policy.fixed.is_none(), planned.iter().all(|&n| n == 0));
         // Each sequence verifies its next token, then its DFlash drafts, or a
@@ -655,6 +705,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             Ok(rows)
         }).collect::<Result<_>>()?;
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
+        let plan_us = console::us(plan_timer);
         let tokens: Vec<u32> = sequences.iter().flatten().copied().collect();
         let mut rows: Vec<(&mut MimoPlacement, usize)> = active.iter_mut().zip(&sequences)
             .map(|(a, s)| (&mut a.placement, s.len())).collect();
@@ -686,6 +737,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         };
         let mut offset = 0;
         let mut context = Vec::new();
+        let before: Vec<usize> = active.iter().map(|a| a.history.len()).collect();
         let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(&starts).enumerate()
             .map(|(i, ((request, rows), &start))| {
             let mut finished = false;
@@ -744,11 +796,23 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             drafter.update(&context)?;
         }
         emit_s += timer.elapsed().as_secs_f64();
+        for (i, request) in active.iter().enumerate() {
+            let proposal = if used_copy[i] { &sequences[i][1..] } else { drafted[i].as_ref().map_or(&[][..], |d| &d.tokens) };
+            tally.member(&request.ticket, proposal, sequences[i].len() - 1, &request.history[before[i]..],
+                request.constraint.is_some(), finished[i]);
+        }
+        tally.end(|| {
+            let engine_now = *engine.profile.borrow();
+            let gpu = |i: usize| engine_before.map_or(f64::NAN, |before| 1e6 * (engine_now[i] - before[i]));
+            vec![("draft", 1e6 * (draft_s - draft0)), ("plan", plan_us), ("verify", 1e6 * step_s),
+                ("emit", 1e6 * (emit_s - emit0)), ("gpu", gpu(0)), ("experts", gpu(1))]
+        });
         for index in (0..active.len()).rev() {
             if !finished[index] {
                 continue;
             }
-            let request = active.remove(index);
+            let mut request = active.remove(index);
+            request.ticket.done(request.job.events.is_closed(), request.generated);
             requests += 1;
             generated_total += request.generated as u64;
             let seconds = request.started.elapsed().as_secs_f64();
@@ -770,6 +834,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         }
         cache.tick();
         publish(stats, requests, generated_total, active.len(), prefills.len(), &cache);
+        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
 }

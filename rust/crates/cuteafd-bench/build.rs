@@ -43,6 +43,16 @@ fn main() {
             println!("cargo:rerun-if-changed={}", dir.join("index").display());
         }
     }
+    // The daemon's stamp (wip.sh) when nothing else named the commit.
+    let stamp = root.join(".cuteafd-source-revision");
+    println!("cargo:rerun-if-changed={}", stamp.display());
+    if commit.is_empty() {
+        if let Ok(text) = std::fs::read_to_string(&stamp) {
+            let mut words = text.split_whitespace();
+            commit = words.next().unwrap_or_default().to_string();
+            dirty = (words.next() == Some("dirty")).to_string();
+        }
+    }
     if let Ok(value) = std::env::var("CUTEAFD_BUILD_COMMIT") {
         commit = value;
     }

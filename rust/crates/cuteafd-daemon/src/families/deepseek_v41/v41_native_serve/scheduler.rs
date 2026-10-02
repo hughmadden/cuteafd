@@ -368,7 +368,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     grammar: constraint.is_some(), images: image_count });
                 if cached > 0 {
                     if let Some(live) = console::live() {
-                        live.push(console::Event::Prefill(console::Prefill { kind: console::PrefillKind::Restore,
+                        live.push(console::Event::Prefill(console::Prefill { id: Some(id), kind: console::PrefillKind::Restore,
                             lane: 0, index: 0, of: 1, rows: cached as u32, started: restore.0, finished: restore.1 }));
                     }
                 }
@@ -1753,7 +1753,9 @@ pub(super) fn console_gauges(active: &[Option<Active<'_>>], requests: &Requests<
         used(a).total_cmp(&used(b))
     });
     let host = prefixes.host_metrics().and_then(|metrics| serde_json::to_value(metrics).ok());
-    console::Event::Gauges(console::Gauges { lanes, queued: queued as u32, pending, kv, host })
+    let kv = kv.map(|[pages, free, active, ratio]| console::Kv { pages, free, active, tokens_per_page: 256 * ratio });
+    console::Event::Gauges(console::Gauges { lanes: lanes.to_vec(), queued: queued as u32, prefilling: None, pending,
+        kv, host, prefix: None })
 }
 
 fn observe_lane_round<'a, C: DraftChain<'a>>(draft: Option<&mut DraftRuntime<'_, 'a, C>>, capture_routes: bool,

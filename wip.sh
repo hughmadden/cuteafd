@@ -148,6 +148,7 @@ snapshot_args=(
   --exclude .cuteafd-release/ --exclude .cuteafd-release-image/
   --exclude .cuteafd-wip/ --exclude dist/ --exclude rust/target/
   --exclude 'native/build*/'
+  --filter 'P .cuteafd-source-revision'
 )
 
 echo "== freezing current checkout for WIP slot $slot =="
@@ -156,6 +157,13 @@ rsync "${snapshot_args[@]}" "$repo_root/" "$staging_dir/"
 # The selected complete configuration is part of the slot, even when the
 # caller chose a file other than the repository's default cuteafd.config.
 install -m 0644 "$RELEASE_CONFIG" "$staging_dir/cuteafd.config"
+# The live console names the source revision; slots carry no .git, so the
+# daemon's build script reads it from this stamp (rewritten only on change).
+source_revision="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || echo unknown)"
+[[ -z "$(git -C "$repo_root" status --porcelain --untracked-files=no 2>/dev/null || true)" ]] ||
+  source_revision+=" dirty"
+[[ "$(cat "$staging_dir/.cuteafd-source-revision" 2>/dev/null || true)" == "$source_revision" ]] ||
+  printf '%s\n' "$source_revision" >"$staging_dir/.cuteafd-source-revision"
 # The frozen tree has no .git: its identity goes in BUILD_IDENTITY.json for report footers.
 "$repo_root/scripts/build/write-build-identity.sh" "$repo_root" "$staging_dir/BUILD_IDENTITY.json"
 python3 "$staging_dir/scripts/build/verify-sparkinfer-source.py" \

@@ -4,168 +4,19 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CUTEAFD Engine Console</title>
+<link rel="icon" type="image/svg+xml" href="/assets/cuteafd-mark.svg">
+<link rel="stylesheet" href="/assets/cuteafd-ui.css">
 <style>
-:root {
-  color-scheme: dark;
-  --bg: #05070b;
-  --panel: #0a0e15;
-  --panel-2: #0e141d;
-  --well: #070a10;
-  --line: #172030;
-  --line-2: #22304a;
-  --ink: #e8eef8;
-  --ink-2: #9dabc1;
-  --muted: #5f6e86;
-  --accepted: #2ee6a6;
-  --target: #4cc3ff;
-  --rejected: #ff5d73;
-  --skipped: #33405a;
-  --grammar: #ffb547;
-  --prefill: #a27bff;
-  --restore: #5a4cc0;
-  --replay: #6d55e8;
-  --rtx: #4cc3ff;
-  --spark: #c08bff;
-  --good: #3ddc84;
-  --warn: #ffb547;
-  --bad: #ff5d73;
-  --mono: ui-monospace, "JetBrains Mono", "SF Mono", "Cascadia Mono", "Roboto Mono", Menlo, Consolas, monospace;
-  --sans: "Inter", "Segoe UI Variable Text", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
-}
-* { box-sizing: border-box; }
-html, body { margin: 0; background: var(--bg); color: var(--ink); }
-body {
-  font: 13px/1.4 var(--sans);
-  background:
-    radial-gradient(1200px 500px at 12% -10%, rgba(76,195,255,.07), transparent 60%),
-    radial-gradient(900px 480px at 100% 0%, rgba(162,123,255,.06), transparent 60%),
-    var(--bg);
-  min-height: 100vh;
-}
-.app { display: grid; gap: 12px; padding: 14px 18px 28px; max-width: 2000px; margin: 0 auto; }
-
-/* header */
-header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 22px; padding: 2px 2px 4px; }
-.brand { display: flex; align-items: baseline; gap: 10px; }
-.brand b { font: 700 19px/1 var(--mono); letter-spacing: .04em;
-  background: linear-gradient(90deg, var(--target), var(--accepted) 55%, var(--prefill));
-  -webkit-background-clip: text; background-clip: text; color: transparent; }
-.brand span { font: 500 10.5px var(--sans); letter-spacing: .28em; text-transform: uppercase; color: var(--muted); }
-.status { display: inline-flex; align-items: center; gap: 7px; padding: 3px 10px 3px 8px; border-radius: 999px;
-  border: 1px solid var(--line-2); background: var(--panel); font: 600 10.5px var(--mono); letter-spacing: .12em; }
-.status i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
-.status.live i { background: var(--good); box-shadow: 0 0 10px var(--good); animation: pulse 1.6s ease-in-out infinite; }
-.status.stalled i { background: var(--warn); }
-.status.offline i { background: var(--bad); }
-@keyframes pulse { 50% { opacity: .45; } }
-.meta { display: flex; flex-wrap: wrap; gap: 4px 16px; font: 12px var(--mono); color: var(--muted); }
-.meta b { color: var(--ink-2); font-weight: 500; }
-.spacer { flex: 1; }
-.keys { font: 11px var(--mono); color: var(--muted); }
-.keys kbd { font: inherit; color: var(--ink-2); border: 1px solid var(--line-2); border-radius: 4px; padding: 0 4px; }
-
-/* KPI tiles */
-.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(178px, 1fr)); gap: 10px; }
-.tile { position: relative; overflow: hidden; background: linear-gradient(180deg, var(--panel-2), var(--panel));
-  border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px 6px; display: grid; gap: 1px; min-width: 0; }
-.tile::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 2px; background: var(--c, var(--line-2)); opacity: .9;
-  box-shadow: 0 0 14px var(--c, transparent); }
-.label { font: 600 10px var(--sans); letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
-.tile .v { font: 600 27px/1.1 var(--mono); letter-spacing: -.02em; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.tile .v small { font-size: 12px; font-weight: 400; color: var(--ink-2); margin-left: 4px; letter-spacing: 0; }
-.tile .sub { font: 11.5px var(--mono); color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.tile canvas { width: 100%; height: 30px; display: block; margin-top: 3px; }
-.tile .side { position: absolute; top: 27px; right: 12px; display: grid; gap: 1px; justify-items: end;
-  font: 11px/1.25 var(--mono); color: var(--ink-2); font-variant-numeric: tabular-nums; text-align: right; }
-.tile .side b { color: var(--ink); font-weight: 600; }
-.tile .side span { color: var(--muted); }
-
-/* meters */
-.meters { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px; }
-.meter { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; display: grid; gap: 7px; min-width: 0; }
-.row { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; flex-wrap: wrap; }
-.num { font: 12px var(--mono); color: var(--ink-2); font-variant-numeric: tabular-nums; }
-.num b { color: var(--ink); font-weight: 600; }
-.track { position: relative; height: 10px; border-radius: 5px; background: var(--well); border: 1px solid var(--line); overflow: hidden; display: flex; }
-.track span { display: block; height: 100%; transition: width .5s ease; }
-.legend-inline { display: flex; gap: 12px; flex-wrap: wrap; font: 11px var(--mono); color: var(--muted); }
-.legend-inline i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; vertical-align: 0; }
-
-/* panels */
-.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; display: grid; gap: 10px; min-width: 0; }
-.panel-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
-.panel-head h2 { margin: 0; font: 600 12px var(--sans); letter-spacing: .14em; text-transform: uppercase; color: var(--ink); }
-.panel-head .hint { font: 11px var(--mono); color: var(--muted); }
-.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font: 11.5px var(--sans); color: var(--ink-2); align-items: center; }
-.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
-.ctl { margin-left: auto; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-.seg { display: inline-flex; border: 1px solid var(--line-2); border-radius: 7px; overflow: hidden; }
-.seg button { font: 600 11px var(--mono); color: var(--ink-2); background: transparent; border: 0; padding: 5px 10px; cursor: pointer; letter-spacing: .04em; }
-.seg button + button { border-left: 1px solid var(--line-2); }
-.seg button[aria-pressed="true"] { color: var(--bg); background: var(--target); }
-.seg button:disabled { color: var(--muted); cursor: not-allowed; }
-button:focus-visible, select:focus-visible { outline: 2px solid var(--target); outline-offset: 2px; }
-.btn { font: 600 11px var(--mono); color: var(--ink-2); background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 7px; padding: 5px 10px; cursor: pointer; }
-.btn[aria-pressed="true"] { color: var(--bg); background: var(--grammar); border-color: var(--grammar); }
 .canvas-wrap { position: relative; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); background: var(--well); }
 #ticker { display: block; width: 100%; cursor: crosshair; }
-.note { font: 12px var(--sans); color: var(--muted); max-width: 120ch; }
-.tip { position: fixed; z-index: 10; pointer-events: none; background: rgba(10,14,21,.96); border: 1px solid var(--line-2);
-  border-radius: 8px; padding: 8px 10px; font: 11.5px/1.5 var(--mono); color: var(--ink); white-space: pre; box-shadow: 0 10px 30px rgba(0,0,0,.5); }
-
-.bottom { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 12px; }
-@media (max-width: 1100px) { .bottom { grid-template-columns: 1fr; } }
-
-/* micro-steps */
-.steps { display: grid; grid-template-columns: minmax(150px, max-content) 1fr 90px; gap: 5px 12px; align-items: center; }
-.steps .g { grid-column: 1 / -1; display: flex; gap: 10px; align-items: baseline; margin-top: 8px; }
-.steps .g:first-child { margin-top: 0; }
-.steps .g em { font: 11px var(--mono); font-style: normal; color: var(--muted); }
-.steps .n { font: 12px var(--sans); color: var(--ink-2); white-space: nowrap; }
-.steps .n .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 7px; vertical-align: 1px; }
-.bar { position: relative; height: 12px; border-radius: 3px; background: var(--well); border: 1px solid var(--line); overflow: hidden; }
-.bar .med { position: absolute; inset: 0 auto 0 0; background: color-mix(in oklab, var(--c) 26%, transparent); transition: width .35s ease; }
-.bar .now { position: absolute; left: 0; top: 3px; bottom: 3px; background: var(--c); border-radius: 0 2px 2px 0; box-shadow: 0 0 8px var(--c); transition: width .25s ease; }
-.bar .max { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--ink-2); opacity: .55; transition: left .35s ease; }
-.steps .v { font: 12px var(--mono); text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
-.steps .v small { color: var(--muted); }
-.profile { display: grid; gap: 4px; }
 #layers { width: 100%; height: 64px; display: block; }
-
-/* right column */
-.pos { display: grid; grid-template-columns: 44px 1fr 110px; gap: 6px 12px; align-items: center; }
-.pos .n { font: 12px var(--mono); color: var(--ink-2); }
-.pos .bar .now { top: 0; bottom: 0; border-radius: 0; box-shadow: none; }
-.pos .v { font: 12px var(--mono); text-align: right; font-variant-numeric: tabular-nums; }
-.pos .v small { color: var(--muted); }
-.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; }
-.fact { background: var(--well); border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; display: grid; gap: 2px; }
-.fact .v { font: 600 16px var(--mono); font-variant-numeric: tabular-nums; }
-.fact .v small { font-size: 11px; color: var(--ink-2); font-weight: 400; margin-left: 3px; }
-table { width: 100%; border-collapse: collapse; font: 12px var(--mono); font-variant-numeric: tabular-nums; }
-th { text-align: right; font: 600 10px var(--sans); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); padding: 4px 6px; border-bottom: 1px solid var(--line); }
-td { text-align: right; padding: 4px 6px; color: var(--ink-2); border-bottom: 1px solid rgba(34,48,74,.35); white-space: nowrap; }
-th:first-child, td:first-child { text-align: left; }
-td b { color: var(--ink); font-weight: 500; }
-.tag { display: inline-block; font: 600 10px var(--mono); padding: 1px 6px; border-radius: 4px; letter-spacing: .06em; }
-.tag.ok { color: var(--good); background: rgba(61,220,132,.1); }
-.tag.bad { color: var(--bad); background: rgba(255,93,115,.1); }
-.tag.gone { color: var(--warn); background: rgba(255,181,71,.1); }
-.tablewrap { overflow-x: auto; }
-.empty { color: var(--muted); font: 12px var(--mono); padding: 6px 0; }
-.banner { border: 1px solid var(--line-2); background: var(--panel-2); border-radius: 10px; padding: 10px 14px; font: 12.5px var(--mono); color: var(--warn); }
-@media (prefers-reduced-motion: reduce) { .status.live i { animation: none; } .track span, .bar * { transition: none; } }
 </style>
 </head>
 <body>
 <div class="app">
-  <header>
-    <div class="brand"><b>CUTEAFD</b><span>Engine console</span></div>
-    <span class="status" id="status"><i></i><span id="status-text">CONNECTING</span></span>
-    <div class="meta" id="meta"></div>
-    <div class="spacer"></div>
-    <div class="keys"><kbd>space</kbd> pause · <kbd>t</kbd> text · <kbd>−</kbd><kbd>+</kbd> zoom</div>
-  </header>
+  <header id="top"></header>
+  <template id="status-tpl"><span class="status" id="status"><i></i><span id="status-text">CONNECTING</span></span></template>
+  <template id="keys-tpl"><span class="keys"><kbd>space</kbd> pause · <kbd>t</kbd> text · <kbd>−</kbd><kbd>+</kbd> zoom</span></template>
   <div class="banner" id="banner" hidden></div>
 
   <section class="kpis" id="kpis"></section>
@@ -173,8 +24,8 @@ td b { color: var(--ink); font-weight: 500; }
   <section class="meters">
     <div class="meter">
       <div class="row"><span class="label">Concurrency</span><span class="num"><b id="c-active">0</b> active · <span id="c-queued">0</span> queued · limit <span id="c-limit">16</span></span></div>
-      <div class="track"><span id="c-l0" style="background:var(--target);width:0"></span><span id="c-l1" style="background:color-mix(in oklab,var(--target) 55%,var(--well));width:0"></span><span id="c-pf" style="background:var(--prefill);width:0"></span></div>
-      <div class="row"><span class="legend-inline"><span><i style="background:var(--target)"></i>lane 0 <b id="c-n0">0</b></span><span><i style="background:color-mix(in oklab,var(--target) 55%,var(--well))"></i>lane 1 <b id="c-n1">0</b></span><span><i style="background:var(--prefill)"></i>prefilling <b id="c-npf">0</b></span></span><span class="num" id="c-pending"></span></div>
+      <div class="track" id="c-track"></div>
+      <div class="row"><span class="legend-inline" id="c-legend"></span><span class="num" id="c-pending"></span></div>
     </div>
     <div class="meter">
       <div class="row"><span class="label">KV cache · device pool</span><span class="num"><b id="kv-used">–</b> used / <span id="kv-total">–</span> pages</span></div>
@@ -182,9 +33,9 @@ td b { color: var(--ink); font-weight: 500; }
       <div class="row"><span class="legend-inline"><span><i style="background:var(--accepted)"></i>active <b id="kv-active">–</b></span><span><i style="background:color-mix(in oklab,var(--accepted) 38%,var(--well))"></i>retained <b id="kv-ret">–</b></span></span><span class="num"><b id="kv-tok">–</b> of <span id="kv-cap">–</span> tokens</span></div>
     </div>
     <div class="meter">
-      <div class="row"><span class="label">Host KV offload · pinned RAM</span><span class="num"><b id="h-used">–</b> / <span id="h-total">–</span></span></div>
+      <div class="row"><span class="label" id="h-title">Host KV offload · pinned RAM</span><span class="num"><b id="h-used">–</b> / <span id="h-total">–</span></span></div>
       <div class="track"><span id="h-bar" style="background:var(--prefill);width:0"></span></div>
-      <div class="row"><span class="num">snapshots <b id="h-snaps">–</b> · hits <b id="h-hits">–</b> / <span id="h-look">–</span></span><span class="num">restore p50 <b id="h-p50">–</b></span></div>
+      <div class="row"><span class="num">snapshots <b id="h-snaps">–</b> · hits <b id="h-hits">–</b> / <span id="h-look">–</span></span><span class="num"><span id="h-p50-label">restore p50</span> <b id="h-p50">–</b></span></div>
     </div>
   </section>
 
@@ -222,15 +73,17 @@ td b { color: var(--ink); font-weight: 500; }
     <section class="panel">
       <div class="panel-head"><h2>Pipeline micro-steps</h2><span class="hint">bar = last round · shade = 60 s median · tick = 60 s max</span></div>
       <div class="steps" id="steps"></div>
-      <div class="profile">
-        <div class="row"><span class="label">Layer profile · last round · CUDA events</span><span class="legend-inline"><span><i style="background:var(--rtx)"></i>RTX-resident experts</span><span><i style="background:var(--spark)"></i>Spark-routed experts</span><span><i style="background:var(--ink-2);opacity:.5"></i>60 s median</span></span></div>
-        <canvas id="layers"></canvas>
+      <div class="profile" id="profile" hidden>
+        <div class="row"><span class="label" id="layers-title">Layer profile</span><span class="legend-inline" id="layers-legend"></span></div>
+        <svg id="layers" class="columns"></svg>
       </div>
     </section>
     <section class="panel">
-      <div class="panel-head"><h2>dSpark acceptance</h2><span class="hint">by draft position · rolling 60 s</span></div>
-      <div class="pos" id="pos"></div>
-      <div class="facts" id="facts"></div>
+      <div id="spec" class="stack" hidden>
+        <div class="panel-head"><h2 id="spec-title">Draft acceptance</h2><span class="hint">by draft position · rolling 60 s</span></div>
+        <div class="pos" id="pos"></div>
+        <div class="facts" id="facts"></div>
+      </div>
       <div class="panel-head" style="margin-top:4px"><h2>Recent requests</h2></div>
       <div class="tablewrap"><table><thead><tr><th>Request</th><th>Input</th><th>Cached</th><th>Output</th><th>TTFT</th><th>Decode</th><th>Status</th></tr></thead><tbody id="recent"></tbody></table></div>
     </section>
@@ -238,6 +91,8 @@ td b { color: var(--ink); font-weight: 500; }
 </div>
 <div class="tip" id="tip" hidden></div>
 
+<script src="/assets/cuteafd-ui.js"></script>
+<script src="/bench/banner.js" defer></script>
 <script>
 (() => {
 'use strict';
@@ -251,11 +106,15 @@ const COL = {
   well: V('--well'), panel: V('--panel'), good: V('--good'), bad: V('--bad'), warn: V('--warn'),
 };
 const MONO = V('--mono'), SANS = V('--sans');
+const tok = (name) => CuteUI.color(name);
 const DELAY = 180;            // display lags the engine clock so every round arrives before it is drawn
 const KEEP = 60000;           // history kept for statistics, engine ms
 const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 // ---------------------------------------------------------------- state
+const top = CuteUI.header($('#top'), { page: 'console', subtitle: 'Engine console' });
+top.status.replaceWith($('#status-tpl').content.cloneNode(true));
+top.extra.replaceWith($('#keys-tpl').content.cloneNode(true));
 const S = {
   config: {}, textAllowed: false, disabled: false, starting: false,
   requests: new Map(), recent: [], gauges: {}, totals: [], prefill: [], rounds: [],
@@ -265,31 +124,9 @@ const S = {
 };
 
 // ---------------------------------------------------------------- formatting
-const nf0 = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
-const nf1 = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1, minimumFractionDigits: 1 });
-function n0(v) { return Number.isFinite(v) ? nf0.format(v) : '–'; }
-function compact(v) {
-  if (!Number.isFinite(v)) return '–';
-  const a = Math.abs(v);
-  if (a >= 1e9) return (v / 1e9).toFixed(2) + 'B';
-  if (a >= 1e6) return (v / 1e6).toFixed(2) + 'M';
-  if (a >= 1e4) return (v / 1e3).toFixed(1) + 'k';
-  return nf0.format(v);
-}
-function bytes(v) {
-  if (!Number.isFinite(v)) return '–';
-  const u = ['B', 'KiB', 'MiB', 'GiB', 'TiB']; let i = 0;
-  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
-  return (i ? v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2) : v) + ' ' + u[i];
-}
-function pct(a, b) { return b > 0 ? (100 * a / b).toFixed(0) + '%' : '–'; }
-function us(v) {
-  if (!Number.isFinite(v)) return '–';
-  if (v >= 1e6) return `${(v / 1e6).toFixed(2)} <small>s</small>`;
-  if (v >= 1000) return `${(v / 1000).toFixed(v >= 1e4 ? 1 : 2)} <small>ms</small>`;
-  return `${v.toFixed(0)} <small>µs</small>`;
-}
-function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+const F = CuteUI.fmt;
+const { n0, compact, bytes, pct, us, esc } = F;
+const nf1 = { format: F.n1 };
 
 // ---------------------------------------------------------------- clock
 // Engine timestamps are milliseconds since the console started. The page keeps
@@ -354,6 +191,11 @@ function onFrame(m) {
   S.lastFrame = performance.now();
   for (const e of m.ev) event(e);
   if (m.g) gauges(m.g, m.now);
+  // Requests the engine no longer runs (retired before this page subscribed) leave the lanes.
+  if (m.g && Array.isArray(m.g.ids)) {
+    const live = new Set(m.g.ids);
+    for (const [id, r] of S.requests) if (r.retired == null && !live.has(id)) S.requests.delete(id);
+  }
 }
 function event(e) {
   switch (e.e) {
@@ -370,6 +212,7 @@ function event(e) {
     }
     case 'round': round(e); break;
     case 'prefill': S.prefill.push(e); break;
+    case 'layers': if (S.config.layers) S.config.layers.class = e.class; break;
     case 'retire': {
       const r = S.requests.get(e.id);
       if (r) { r.retired = e.t; r.reason = e.reason; r.gen = Math.max(r.gen, e.gen); }
@@ -384,8 +227,8 @@ function event(e) {
   }
 }
 function round(e) {
-  const meta = { lane: e.lane, shared: e.shared, t0: e.t0, t1: e.t1, draft: e.draft, prepare: e.prepare,
-    verify: e.verify, layers: e.layers, ffn: e.ffn, n: e.req.length, req: e.req };
+  const meta = { lane: e.lane, shared: e.shared, t0: e.t0, t1: e.t1, s: e.s || {}, layers: e.layers,
+    n: e.req.length, req: e.req };
   S.rounds.push(meta);
   for (const q of e.req) {
     const [id, w, v, a, em, g, fin, segs] = q;
@@ -445,14 +288,15 @@ function connect() {
 
 // ---------------------------------------------------------------- header, status
 function header() {
-  const c = S.config;
-  const rev = c.revision ? String(c.revision).slice(0, 12) : 'unknown';
-  const policy = c.dspark ? `${c.policy} · limit ${c.draft_limit}` : 'dSpark off';
-  $('#meta').innerHTML = [
-    ['model', (c.model || '').split('/').pop()], ['release', c.release || 'dev'], ['rev', rev],
-    ['layout', c.layout], ['draft', policy], ['text', c.text ? 'on' : 'off'], ['up', '<span id="uptime">–</span>'],
-  ].map(([k, v]) => `<span>${k} <b>${v}</b></span>`).join('');
+  const c = S.config, spec = c.speculator;
+  const split = c.split ? ` · ${esc(c.split)}` : '';
+  CuteUI.facts(top.meta, [
+    ['model', esc((c.model || '').split('/').pop()), c.model], ['checkpoint', esc(c.checkpoint || '–'), c.family],
+    ['layout', esc(c.layout || '–') + split], ['draft', spec ? `${esc(spec.name)} · ${esc(spec.policy)}` : 'off'],
+    ['build', CuteUI.build(c.build)], ['text', c.text ? 'on' : 'off'], ['up', '<span id="uptime">–</span>'],
+  ]);
   $('#c-limit').textContent = c.concurrency ?? 16;
+  layoutChanged();
 }
 function banner() {
   const b = $('#banner');
@@ -469,8 +313,7 @@ function status() {
   el.className = 'status ' + cls; text.textContent = label;
   const up = $('#uptime');
   if (up && S.config.started_unix_ms) {
-    const s = Math.max(0, Math.floor((Date.now() - S.config.started_unix_ms) / 1000));
-    up.textContent = `${Math.floor(s / 3600)}:${String(Math.floor(s / 60) % 60).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+    up.textContent = F.clock((Date.now() - S.config.started_unix_ms) / 1000);
   }
 }
 
@@ -485,24 +328,7 @@ const TILES = [
   { key: 'output', label: 'Output tokens', c: COL.acc },
 ];
 $('#kpis').innerHTML = TILES.map((t) => `<div class="tile" style="--c:${t.c}"><span class="label">${t.label}</span>
-  <span class="v" id="k-${t.key}">–</span><span class="side" id="kx-${t.key}"></span><span class="sub" id="ks-${t.key}">&nbsp;</span>${t.spark ? `<canvas id="kc-${t.key}"></canvas>` : ''}</div>`).join('');
-function spark(canvas, data, color) {
-  const dpr = devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
-  if (!w) return;
-  if (canvas.width !== Math.round(w * dpr)) { canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr); }
-  const g = canvas.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
-  const pts = data.filter(Number.isFinite); if (pts.length < 2) return;
-  const max = Math.max(1e-9, ...pts) * 1.1, n = 60, step = w / (n - 1);
-  const x = (i) => w - (data.length - 1 - i) * step, y = (v) => h - 1.5 - (v / max) * (h - 4);
-  g.beginPath(); let started = false;
-  data.forEach((v, i) => { if (!Number.isFinite(v)) return; started ? g.lineTo(x(i), y(v)) : g.moveTo(x(i), y(v)); started = true; });
-  g.strokeStyle = color; g.lineWidth = 1.5; g.shadowColor = color; g.shadowBlur = 6; g.stroke(); g.shadowBlur = 0;
-  g.lineTo(w, h); g.lineTo(x(data.findIndex(Number.isFinite)), h); g.closePath();
-  const grad = g.createLinearGradient(0, 0, 0, h); grad.addColorStop(0, color + '40'); grad.addColorStop(1, color + '00');
-  g.fillStyle = grad; g.fill();
-  const last = data[data.length - 1];
-  if (Number.isFinite(last)) { g.beginPath(); g.arc(w - 2, y(last), 2.5, 0, 7); g.fillStyle = color; g.fill(); }
-}
+  <span class="v" id="k-${t.key}">–</span><span class="side" id="kx-${t.key}"></span><span class="sub" id="ks-${t.key}">&nbsp;</span>${t.spark ? `<svg class="spark" id="kc-${t.key}"></svg>` : ''}</div>`).join('');
 function sampleSeries() {
   const s = {
     out: rate('output_tokens', 1000), acc: rate('accepted_drafts', 1000), drf: rate('drafted_tokens', 1000),
@@ -515,19 +341,21 @@ function renderKpis() {
   const w = 2000;
   const out = rate('output_tokens', w), acc = rate('accepted_drafts', w), drf = rate('drafted_tokens', w);
   const ver = rate('verified_drafts', w), pre = rate('prefill_tokens', w), rounds = rate('verification_rounds', w);
-  const g = S.gauges, lanes = g.lanes || [0, 0];
+  const g = S.gauges, lanes = g.lanes || [];
   const set = (k, v, sub) => { $('#k-' + k).innerHTML = v; $('#ks-' + k).textContent = sub; };
   set('out', n0(out), Number.isFinite(out / rounds) && rounds > 0 ? `${nf1.format(out / rounds)} per lane round` : 'idle');
   set('acc', n0(acc), ver > 0 ? `${pct(acc, ver)} of verified drafts` : 'no drafts verified');
   set('drf', n0(drf), drf > 0 ? `${pct(ver, drf)} verified by the target` : 'no drafts proposed');
   const pf = g.prefilling;
   set('pre', n0(pre), pf ? `#${pf.id} ${pct(pf.done, pf.prompt)} of ${compact(pf.prompt)}` : 'idle');
-  set('conc', n0(g.active ?? 0), `lanes ${lanes[0]} + ${lanes[1]}${pf ? ' · 1 prefilling' : ''} · queued ${g.queued ?? 0}`);
+  const npf = g.prefilling_n ?? (pf ? 1 : 0);
+  const decoding = lanes.length > 1 ? `lanes ${lanes.join(' + ')}` : `${n0(lanes[0] ?? 0)} decoding`;
+  set('conc', n0(g.active ?? 0), `${decoding}${npf ? ` · ${npf} prefilling` : ''} · queued ${g.queued ?? 0}`);
   if (t) {
     set('input', compact(t.input_tokens), `${compact(t.cached_input_tokens)} cached · ${pct(t.cached_input_tokens, t.input_tokens)} · ${n0(t.requests_admitted)} req`);
     set('output', compact(t.output_tokens), `${pct(t.accepted_drafts, t.output_tokens)} from accepted drafts`);
   }
-  for (const tile of TILES) if (tile.spark && !reduced) spark($('#kc-' + tile.key), S.series[tile.key], tile.c);
+  for (const tile of TILES) if (tile.spark && !reduced) CuteUI.svg.sparkline($('#kc-' + tile.key), S.series[tile.key], { color: tile.c });
   // Right-hand stats: the 60 s peak, and for lifetime totals the current rate.
   const peak = (k) => { const v = S.series[k].filter(Number.isFinite); return v.length ? Math.max(...v) : NaN; };
   const side = (k, html) => { $('#kx-' + k).innerHTML = html; };
@@ -538,13 +366,18 @@ function renderKpis() {
 }
 
 // ---------------------------------------------------------------- meters
+const LANE_SHADES = ['var(--target)', 'color-mix(in oklab,var(--target) 55%,var(--well))', 'color-mix(in oklab,var(--target) 35%,var(--well))'];
+function laneCount() { return Math.max(1, S.config.lanes || 1); }
+function laneName(lane) { return laneCount() > 1 ? `lane ${lane}` : 'decoding'; }
 function renderMeters() {
-  const g = S.gauges, c = S.config, lanes = g.lanes || [0, 0], limit = c.concurrency || 16;
-  const pf = g.prefilling ? 1 : 0;
+  const g = S.gauges, limit = S.config.concurrency || 16, lanes = g.lanes || [];
+  const pf = g.prefilling_n ?? (g.prefilling ? 1 : 0);
   $('#c-active').textContent = g.active ?? 0; $('#c-queued').textContent = g.queued ?? 0;
-  $('#c-n0').textContent = lanes[0]; $('#c-n1').textContent = lanes[1]; $('#c-npf').textContent = pf;
-  $('#c-l0').style.width = (100 * lanes[0] / limit) + '%'; $('#c-l1').style.width = (100 * lanes[1] / limit) + '%';
-  $('#c-pf').style.width = (100 * pf / limit) + '%';
+  const segs = [];
+  for (let i = 0; i < laneCount(); i++) segs.push({ value: lanes[i] || 0, color: LANE_SHADES[i % LANE_SHADES.length], name: laneName(i) });
+  segs.push({ value: pf, color: 'var(--prefill)', name: 'prefilling' });
+  $('#c-track').innerHTML = segs.map((x) => `<span style="background:${x.color};width:${(100 * x.value / limit).toFixed(2)}%"></span>`).join('');
+  $('#c-legend').innerHTML = segs.map((x) => `<span><i style="background:${x.color}"></i>${x.name} <b>${n0(x.value)}</b></span>`).join('');
   $('#c-pending').textContent = g.pending ? 'waiting for KV pages' : '';
   const kv = g.kv;
   if (kv) {
@@ -563,48 +396,64 @@ function renderMeters() {
     const bounds = ['≤1 ms', '≤5 ms', '≤10 ms', '≤50 ms', '≤100 ms', '≤500 ms', '≤1 s', '>1 s'];
     let acc = 0, p50 = '–'; for (let i = 0; i < b.length; i++) { acc += b[i]; if (total && acc >= total / 2) { p50 = bounds[i]; break; } }
     $('#h-p50').textContent = total ? p50 : 'no restores';
+    $('#h-title').textContent = 'Host KV offload · pinned RAM'; $('#h-p50-label').textContent = 'restore p50';
+  } else if (g.prefix) {
+    const p = g.prefix;
+    $('#h-title').textContent = p.enabled === false ? 'Prefix cache · off' : 'Prefix cache · device snapshots';
+    const kv = g.kv, retained = kv ? Math.max(0, kv.pages - kv.free - kv.active) : 0;
+    $('#h-used').textContent = n0(retained) + ' pages'; $('#h-total').textContent = kv ? n0(kv.pages) : '–';
+    $('#h-bar').style.width = kv ? (100 * retained / Math.max(1, kv.pages)) + '%' : '0';
+    $('#h-snaps').textContent = n0(p.entries); $('#h-hits').textContent = n0(p.hits); $('#h-look').textContent = n0(p.lookups);
+    const restores = S.prefill.filter((x) => x.k === 'restore').map((x) => x.t1 - x.t0);
+    $('#h-p50-label').textContent = 'reused';
+    $('#h-p50').textContent = `${compact(p.hit_tokens)} tok` + (restores.length ? ` · restore p50 ${F.ms(median(restores))}` : '');
   } else if (S.gauges.kv) {
     $('#h-used').textContent = 'disabled'; $('#h-total').textContent = '0 B';
   }
 }
 
 // ---------------------------------------------------------------- micro-steps
-const STEPS = [
-  { g: 'Lane round', note: 'host clock', rows: [
-    ['cycle0', 'lane 0 cycle', COL.tgt], ['cycle1', 'lane 1 cycle', COL.tgt], ['draft', 'dSpark draft + length select', COL.acc],
-    ['prepare', 'prepare rows', COL.ink2], ['verify', 'verification pass + head', COL.tgt], ['commit', 'commit + emit', COL.ink2]] },
-  { g: 'Verification pass', note: 'CUDA events, FFN finish to FFN finish', rows: [
-    ['pass', 'layers 1–39 on device', COL.tgt], ['lmean', 'RTX-expert layer (mean)', COL.rtx],
-    ['rmean', 'Spark-expert layer (mean)', COL.spark], ['lmax', 'slowest layer', COL.warn]] },
-  { g: 'Expert stages per layer', note: 'host clock, mean per layer', rows: [
-    ['lroute', 'RTX: router + route ids', COL.rtx], ['ltotal', 'RTX: routed + shared experts', COL.rtx],
-    ['rroute', 'Spark: router + route ids', COL.spark], ['rdispatch', 'Spark: dispatch to ranks', COL.spark],
-    ['rshared', 'Spark: shared experts on RTX', COL.rtx], ['rcollect', 'Spark: wait replies + reduce', COL.spark]] },
-  { g: 'Admission', note: 'host clock', rows: [
-    ['chunk', 'prefill chunk ≥ 1024 rows', COL.pf], ['short', 'short prompt prefill', COL.pf],
-    ['replay', 'decoder replay', COL.rp], ['restore', 'prefix restore', COL.rs]] },
-];
-$('#steps').innerHTML = STEPS.map((grp) => `<div class="g"><span class="label">${grp.g}</span><em>${grp.note}</em></div>` +
-  grp.rows.map(([k, n, c]) => `<span class="n"><span class="dot" style="background:${c}"></span>${n}</span>
-  <span class="bar" style="--c:${c}"><span class="med" id="sm-${k}" style="width:0"></span><span class="now" id="sn-${k}" style="width:0"></span><span class="max" id="sx-${k}" style="left:0"></span></span>
-  <span class="v" id="sv-${k}">–</span>`).join('')).join('');
+// The family layout declares its micro-step groups: [{title, note, rows: [[key, label, color]]}].
+// Keys name a round's stages, or a derived value: round.cycle / round.cycleN (round wall
+// time, any lane / lane N), layers.sum / layers.max / layers.mean.K (the round's layer
+// profile), prefill.chunk / prefill.short / prefill.replay / prefill.restore (admission).
+let STEPS = [], LABELS = {}, layoutKey = null;
+function layoutChanged() {
+  const c = S.config, key = JSON.stringify([c.steps, c.layers, c.speculator, c.lanes]);
+  if (key === layoutKey) return;
+  layoutKey = key;
+  STEPS = (c.steps || []).map((g) => ({ g: g.title, note: g.note, rows: g.rows.map(([k, n, col]) => [k, n, tok(col)]) }));
+  LABELS = {}; for (const g of c.steps || []) for (const [k, n] of g.rows) LABELS[k] = n;
+  $('#steps').innerHTML = STEPS.map((grp, gi) => `<div class="g"><span class="label">${esc(grp.g)}</span><em>${esc(grp.note)}</em></div>` +
+    grp.rows.map(([k, n, col], ri) => { const id = `${gi}-${ri}`; return `<span class="n"><span class="dot" style="background:${col}"></span>${esc(n)}</span>
+    <span class="bar" style="--c:${col}"><span class="med" id="sm-${id}" style="width:0"></span><span class="now" id="sn-${id}" style="width:0"></span><span class="max" id="sx-${id}" style="left:0"></span></span>
+    <span class="v" id="sv-${id}">–</span>`; }).join('')).join('') || '<span class="empty">This engine reports no stage timings.</span>';
+  const L = c.layers;
+  $('#profile').hidden = !L;
+  if (L) {
+    $('#layers-title').textContent = L.title;
+    $('#layers-legend').innerHTML = L.classes.map(([n, col]) => `<span><i style="background:${tok(col)}"></i>${esc(n)}</span>`).join('') +
+      '<span><i style="background:var(--ink-2);opacity:.5"></i>60 s median</span>';
+  }
+  const spec = c.speculator;
+  $('#spec').hidden = !spec;
+  if (spec) $('#spec-title').textContent = `${spec.name} acceptance`;
+}
 function median(a) { if (!a.length) return NaN; const s = a.slice().sort((x, y) => x - y); return s[s.length >> 1]; }
-function localLayers() { return S.gauges.dspark?.local_layers ?? 20; }
+function layerClass(i) { const L = S.config.layers; return L && L.class ? (L.class[i] ?? 0) : 0; }
 function roundMetrics(r) {
-  const m = {}; const cyc = (r.t1 - r.t0) * 1000;
-  m['cycle' + r.lane] = cyc; m.draft = r.draft; m.prepare = r.prepare; m.verify = r.verify;
-  m.commit = Math.max(0, cyc - r.draft - r.prepare - r.verify);
-  const L = localLayers(); let ls = 0, ln = 0, rs = 0, rn = 0, mx = 0, sum = 0, any = false;
+  const m = Object.assign({}, r.s); const cyc = (r.t1 - r.t0) * 1000;
+  m['round.cycle'] = cyc; m['round.cycle' + r.lane] = cyc;
+  const first = S.config.layers?.first ?? 0;
+  let sum = 0, mx = 0, any = false; const cs = {}, cn = {};
   (r.layers || []).forEach((v, i) => {
-    if (v == null || i === 0) return; any = true; sum += v; mx = Math.max(mx, v);
-    if (i < L) { ls += v; ln++; } else { rs += v; rn++; }
+    if (v == null || i < first) return; any = true; sum += v; mx = Math.max(mx, v);
+    const k = layerClass(i); cs[k] = (cs[k] || 0) + v; cn[k] = (cn[k] || 0) + 1;
   });
-  if (any) { m.pass = sum; m.lmax = mx; if (ln) m.lmean = ls / ln; if (rn) m.rmean = rs / rn; }
-  const f = r.ffn || [];
-  if (f[0] > 0) { m.lroute = f[1] / f[0]; m.ltotal = f[2] / f[0]; }
-  if (f[3] > 0) { m.rroute = f[4] / f[3]; m.rdispatch = f[5] / f[3]; m.rshared = f[6] / f[3]; m.rcollect = f[7] / f[3]; }
+  if (any) { m['layers.sum'] = sum; m['layers.max'] = mx; for (const k in cs) m['layers.mean.' + k] = cs[k] / cn[k]; }
   return m;
 }
+function prefillKey(p) { return p.k === 'replay' ? 'prefill.replay' : p.k === 'restore' ? 'prefill.restore' : p.rows >= 1024 ? 'prefill.chunk' : 'prefill.short'; }
 function renderSteps() {
   const now = engineNow();
   while (S.rounds.length && S.rounds[0].t1 < now - KEEP) S.rounds.shift();
@@ -614,58 +463,55 @@ function renderSteps() {
   for (const r of S.rounds) { const m = roundMetrics(r); for (const k in m) push(k, m[k], r.t1); }
   for (const p of S.prefill) {
     const d = (p.t1 - p.t0) * 1000;
-    push(p.k === 'replay' ? 'replay' : p.k === 'restore' ? 'restore' : p.rows >= 1024 ? 'chunk' : 'short', d, p.t1);
+    push(prefillKey(p), d, p.t1);
   }
-  for (const grp of STEPS) {
+  STEPS.forEach((grp, gi) => {
     let scale = 1;
     for (const [k] of grp.rows) if (hist[k]) scale = Math.max(scale, ...hist[k]);
-    for (const [k] of grp.rows) {
-      const h = hist[k];
-      const label = $('#sv-' + k).previousElementSibling.previousElementSibling;
-      if (!h) { $('#sv-' + k).innerHTML = '–'; continue; }
+    grp.rows.forEach(([k], ri) => {
+      const id = `${gi}-${ri}`, h = hist[k], v = $('#sv-' + id);
+      const label = v.previousElementSibling.previousElementSibling;
+      if (!h) { v.innerHTML = '–'; return; }
       const med = median(h), max = Math.max(...h), now_ = last[k].v;
       const unused = max === 0;
       label.style.opacity = unused ? 0.45 : 1;
-      if (unused) { $('#sv-' + k).innerHTML = '<small>not used here</small>'; $('#sn-' + k).style.width = '0'; $('#sm-' + k).style.width = '0'; continue; }
-      $('#sn-' + k).style.width = (100 * now_ / scale) + '%';
-      $('#sm-' + k).style.width = (100 * med / scale) + '%';
-      $('#sx-' + k).style.left = `calc(${(100 * max / scale).toFixed(2)}% - 2px)`;
-      $('#sv-' + k).innerHTML = us(now_);
-    }
-  }
+      if (unused) { v.innerHTML = '<small>not used here</small>'; $('#sn-' + id).style.width = '0'; $('#sm-' + id).style.width = '0'; return; }
+      $('#sn-' + id).style.width = (100 * now_ / scale) + '%';
+      $('#sm-' + id).style.width = (100 * med / scale) + '%';
+      $('#sx-' + id).style.left = `calc(${(100 * max / scale).toFixed(2)}% - 2px)`;
+      v.innerHTML = us(now_);
+    });
+  });
   renderLayers();
 }
 function renderLayers() {
-  const c = $('#layers'), dpr = devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight;
-  if (!w) return;
-  if (c.width !== Math.round(w * dpr)) { c.width = Math.round(w * dpr); c.height = Math.round(h * dpr); }
-  const g = c.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+  const L = S.config.layers;
+  if (!L) return;
   const withLayers = S.rounds.filter((r) => r.layers && r.layers.some((v) => v != null));
-  if (!withLayers.length) { g.fillStyle = COL.muted; g.font = `11px ${MONO}`; g.fillText('No layer timings yet (requires dSpark route capture)', 4, h / 2); return; }
-  const last = withLayers[withLayers.length - 1].layers;
-  const med = []; for (let i = 0; i < 40; i++) med.push(median(withLayers.map((r) => r.layers[i]).filter((v) => v != null)));
-  const max = Math.max(1, ...last.filter((v) => v != null), ...med.filter(Number.isFinite));
-  const L = localLayers(), bw = w / 39, top = 12, base = h - 13;
-  g.font = `9.5px ${MONO}`; g.textAlign = 'center';
-  for (let i = 1; i < 40; i++) {
-    const x = (i - 1) * bw, v = last[i], m = med[i], color = i < L ? COL.rtx : COL.spark;
-    if (Number.isFinite(m)) { g.fillStyle = COL.line2; const mh = (base - top) * m / max; g.fillRect(x + 1, base - mh, bw - 2, mh); }
-    if (v != null) { const vh = Math.max(1, (base - top) * v / max); g.fillStyle = color; g.globalAlpha = .9; g.fillRect(x + bw * .22, base - vh, bw * .56, vh); g.globalAlpha = 1; }
-    if (i === 1 || i % 5 === 0 || i === 39) { g.fillStyle = COL.muted; g.fillText(String(i), x + bw / 2, h - 2); }
-  }
-  g.textAlign = 'left'; g.fillStyle = COL.muted; g.fillText(`max ${(max / 1000).toFixed(2)} ms`, 2, 9);
+  const first = L.first ?? 0;
+  if (!withLayers.length) { CuteUI.svg.columns($('#layers'), [], { empty: 'No layer timings yet' }); return; }
+  const last = withLayers[withLayers.length - 1].layers.slice(first).map((v) => v ?? NaN);
+  const med = last.map((_, i) => median(withLayers.map((r) => r.layers[i + first]).filter((v) => v != null)));
+  const n = last.length;
+  CuteUI.svg.columns($('#layers'), last, {
+    median: med, height: 64, colors: (i) => tok(L.classes[layerClass(i + first)]?.[1] || 'target'),
+    label: (i) => { const l = i + first; return i === 0 || l % 5 === 0 || i === n - 1 ? String(l) : null; },
+    note: (max) => `max ${(max / 1000).toFixed(2)} ms`,
+  });
 }
 
 // ---------------------------------------------------------------- acceptance, facts, recent
 function renderAcceptance() {
-  const reach = new Array(7).fill(0), ok = new Array(7).fill(0);
+  const spec = S.config.speculator;
+  if (!spec) return;
+  const reach = new Array(16).fill(0), ok = new Array(16).fill(0);
   let rr = 0, drafted = 0, verified = 0, accepted = 0, emitted = 0, widths = {};
   for (const r of S.rounds) for (const q of r.req) {
     const [, w, v, a, e] = q; rr++; drafted += w; verified += v; accepted += a; emitted += e;
     if (w) widths[w] = (widths[w] || 0) + 1;
-    for (let p = 1; p <= Math.min(v, a + 1) && p <= 7; p++) { reach[p - 1]++; if (p <= a) ok[p - 1]++; }
+    for (let p = 1; p <= Math.min(v, a + 1) && p <= 16; p++) { reach[p - 1]++; if (p <= a) ok[p - 1]++; }
   }
-  const limit = Math.max(5, S.config.draft_limit || 5);
+  const limit = Math.min(16, Math.max(1, spec.positions || 5));
   let html = '';
   for (let i = 0; i < limit; i++) {
     const r = reach[i] ? ok[i] / reach[i] : NaN;
@@ -673,17 +519,13 @@ function renderAcceptance() {
       <span class="v">${Number.isFinite(r) ? (100 * r).toFixed(1) + '%' : '–'} <small>n=${compact(reach[i])}</small></span>`;
   }
   $('#pos').innerHTML = html;
-  const d = S.gauges.dspark || {};
-  const warm = d.solo ? `solo ${d.solo.warm ? 'warm' : 'cold'} · shared ${d.shared?.warm ? 'warm' : 'cold'}` : '–';
-  const err = d.prediction?.mean_abs_relative_error;
   const facts = [
     ['Accepted / round', rr ? nf1.format(accepted / rr) : '–', 'per request'],
     ['Tokens / round', rr ? nf1.format(emitted / rr) : '–', 'per request'],
     ['Drafted / round', rr ? nf1.format(drafted / rr) : '–', `verified ${pct(verified, drafted)}`],
-    ['Policy', d.mode || (S.config.dspark ? '…' : 'off'), `fit: ${warm}`],
-    ['Cost model error', Number.isFinite(err) ? (100 * err).toFixed(1) + '%' : '–', 'mean abs, per round'],
+    ...(S.gauges.facts || [['Policy', spec.policy || '–', spec.name]]),
   ];
-  $('#facts').innerHTML = facts.map(([l, v, s]) => `<div class="fact"><span class="label">${l}</span><span class="v">${v}</span><span class="num">${s}</span></div>`).join('');
+  $('#facts').innerHTML = facts.map(([l, v, s]) => `<div class="fact"><span class="label">${esc(l)}</span><span class="v">${esc(v)}</span><span class="num">${esc(s)}</span></div>`).join('');
 }
 function renderRecent() {
   const rows = S.recent.slice(0, 12).map((x) => {
@@ -748,7 +590,7 @@ cv.addEventListener('pointerleave', () => { hover = null; tip.hidden = true; });
 function layout() {
   const rowsOut = [{ kind: 'prefill', h: 30 }];
   const tD = displayNow();
-  for (const lane of [0, 1]) {
+  for (let lane = 0; lane < laneCount(); lane++) {
     const members = [...S.requests.values()].filter((r) => r.lane === lane && r.first != null && r.first <= tD + 50).sort((a, b) => a.id - b.id);
     rowsOut.push({ kind: 'lane', lane, h: 24, members });
     if (!members.length) rowsOut.push({ kind: 'idle', lane, h: 24 });
@@ -798,7 +640,7 @@ function draw() {
     if (row.kind === 'lane') {
       ctx.fillStyle = COL.line2; ctx.fillRect(0, y0 + row.h - 4, right, 1);
       ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
-      ctx.font = `700 10.5px ${SANS}`; ctx.fillStyle = COL.ink; ctx.fillText(`LANE ${row.lane}`, 0, y0 + 10);
+      ctx.font = `700 10.5px ${SANS}`; ctx.fillStyle = COL.ink; ctx.fillText(laneCount() > 1 ? `LANE ${row.lane}` : 'DECODE', 0, y0 + 10);
       const st = laneStats(row.lane, tD);
       ctx.font = `10.5px ${MONO}`; ctx.fillStyle = COL.muted;
       ctx.fillText(st ? `${row.members.filter((r) => r.retired == null).length} req · ${st.cyc.toFixed(1)} ms · ${st.per.toFixed(2)} tok/rnd` : `${row.members.length} req`, 58, y0 + 10);
@@ -930,7 +772,7 @@ function drawPrefill(y0, h, right, X, tD) {
     const x0 = Math.max(GUT - 4, X(p.t0)), x1 = Math.min(X(p.t1), X(tD));
     if (x1 < GUT - 4) continue;
     let yy = y0 + 4, hh2 = h - 8, color = COL.pf;
-    if (p.k === 'chunk') { yy = y0 + 4 + (p.lane ? hh : 0); hh2 = hh - 1; }
+    if (p.k === 'chunk' && laneCount() > 1) { yy = y0 + 4 + (p.lane ? hh : 0); hh2 = hh - 1; }
     else if (p.k === 'restore') color = COL.rs;
     else if (p.k === 'replay') color = COL.rp;
     ctx.fillStyle = color; ctx.globalAlpha = p.k === 'replay' ? 0.75 : 1;
@@ -945,15 +787,18 @@ function tooltip(hit) {
   let text;
   if (hit.kind === 'col') {
     const c = hit.c, m = c.m, cyc = (m.t1 - m.t0);
-    const commit = Math.max(0, cyc * 1000 - m.draft - m.prepare - m.verify);
-    text = `#${hit.r.id}  lane ${m.lane} ${m.shared ? '(both lanes busy)' : '(solo)'}\n` +
+    // The first micro-step group is the family's round breakdown.
+    const stages = (S.config.steps?.[0]?.rows || []).filter(([k]) => m.s[k] != null)
+      .map(([k, n]) => `${n} ${(m.s[k] / 1000).toFixed(2)} ms`);
+    const lane = laneCount() > 1 ? `  lane ${m.lane} ${m.shared ? '(both lanes busy)' : '(solo)'}` : '';
+    text = `#${hit.r.id}${lane}\n` +
       `round ${cyc.toFixed(2)} ms · ${m.n} request${m.n === 1 ? '' : 's'}\n` +
-      `drafted ${c.w}  verified ${c.v}  accepted ${c.a}  emitted ${c.e}\n` +
-      `draft ${(m.draft / 1000).toFixed(2)}  prepare ${(m.prepare / 1000).toFixed(2)}  verify ${(m.verify / 1000).toFixed(2)}  commit ${(commit / 1000).toFixed(2)} ms` +
+      `drafted ${c.w}  verified ${c.v}  accepted ${c.a}  emitted ${c.e}` +
+      (stages.length ? '\n' + stages.join('\n') : '') +
       (c.g ? '\ngrammar mask active' : '') + (c.fin ? '\nfinished this round' : '');
   } else if (hit.kind === 'prefill') {
     const p = hit.p, d = p.t1 - p.t0;
-    text = `${p.k === 'chunk' ? `prefill chunk ${p.i + 1}/${p.n}, lane ${p.lane}` : p.k === 'restore' ? 'prefix restore' : p.k === 'replay' ? 'decoder replay' : `prefill ${p.k}`}${p.id != null ? `  #${p.id}` : ''}\n` +
+    text = `${p.k === 'chunk' ? `prefill chunk ${p.i + 1}/${p.n}${laneCount() > 1 ? `, lane ${p.lane}` : ''}` : p.k === 'restore' ? 'prefix restore' : p.k === 'replay' ? 'decoder replay' : `prefill ${p.k}`}${p.id != null ? `  #${p.id}` : ''}\n` +
       `${n0(p.rows)} rows · ${d.toFixed(1)} ms${p.k !== 'replay' && d > 0 ? ` · ${compact(p.rows / d * 1000)} tok/s` : ''}`;
   } else {
     const r = hit.r, c = hit.c;

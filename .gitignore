@@ -25,6 +25,7 @@ __pycache__/
 htmlcov/
 .env
 .cuteafd-cache/
+.cuteafd-source-revision
 # Tool-evaluation output generated in the repository root.
 data/benchmarks.sqlite
 runs/
