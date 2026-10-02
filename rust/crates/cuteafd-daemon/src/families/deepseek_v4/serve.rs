@@ -20,7 +20,7 @@ use crate::shared::console;
 use crate::shared::token_io::{DeviceLogits, RowResult, SelectBatch, TokenSelector};
 use crate::shared::prefill_share::{Chunk, DecodeShareArgs};
 use cuteafd_engine::prefix::{After, MarkArena, PointPlan, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::{
     InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits,
     NativeRequest, PromptUsage,
@@ -237,6 +237,7 @@ struct Active<'a> {
     turn: Option<Vec<f32>>,
     decoder: cuteafd_loader::StreamingTokenDecoder,
     generated: usize,
+    draft_calls: usize,
     buffered: usize,
     started: Instant,
     ticket: console::Ticket,
@@ -349,13 +350,21 @@ fn speculative_step(
     shape: &mut StepShape,
 ) -> Result<Vec<bool>> {
     let noise = engine.cfg.dspark_noise_token_id as u32;
-    let inputs: Vec<u32> = active.iter()
-        .flat_map(|a| std::iter::once(a.next).chain(std::iter::repeat_n(noise, block - 1))).collect();
-    let requests: Vec<super::engine::DraftRequest<'_>> = active.iter()
-        .map(|a| super::engine::DraftRequest { placement: &a.placement, token: a.next }).collect();
+    let draft_indices: Vec<usize> = active.iter().enumerate()
+        .filter_map(|(i, a)| (!probe::no_speculation(&a.job.probe)).then_some(i)).collect();
+    let inputs: Vec<u32> = draft_indices.iter()
+        .flat_map(|&i| std::iter::once(active[i].next).chain(std::iter::repeat_n(noise, block - 1))).collect();
+    let requests: Vec<super::engine::DraftRequest<'_>> = draft_indices.iter()
+        .map(|&i| super::engine::DraftRequest { placement: &active[i].placement, token: active[i].next }).collect();
     let timer = Instant::now();
-    let drafts = engine.draft(&requests, &inputs)?;
+    let proposed = engine.draft(&requests, &inputs)?;
     shape.draft_us = console::us(timer);
+    ensure!(proposed.len() == draft_indices.len(), "dSpark proposal count differs from participating requests");
+    let mut drafts = vec![Vec::new(); active.len()];
+    for (i, proposal) in draft_indices.into_iter().zip(proposed) {
+        active[i].draft_calls += 1;
+        drafts[i] = proposal;
+    }
     // Verify no more rows than the request may still produce or hold, and no
     // draft the grammar rejects (it could never be kept).
     let sequences: Vec<Vec<u32>> = active.iter().zip(&drafts).map(|(a, draft)| {
@@ -688,7 +697,7 @@ fn schedule(
                 };
                 let mut request = Active {
                     decoder, job: p.job, constraint: p.constraint, placement: p.placement, capacity: p.capacity,
-                    next: first, history: p.tokens, turn: None, generated: 0, buffered: 0, started: Instant::now(),
+                    next: first, history: p.tokens, turn: None, generated: 0, draft_calls: 0, buffered: 0, started: Instant::now(),
                     ticket: p.ticket,
                 };
                 let emitted = request.emit(first, eos);
@@ -718,7 +727,8 @@ fn schedule(
         // small batch, each sequence verifies its next token plus a draft.
         let block = engine.draft_block();
         let speculate = block > 0 && active.len() <= speculate_max
-            && active.len() * (block + 1) <= engine.decode_rows;
+            && active.len() * (block + 1) <= engine.decode_rows
+            && active.iter().any(|a| !probe::no_speculation(&a.job.probe));
         let step = if speculate {
             speculative_step(engine, &mut active, block, eos, transports, runtime, selector, caching, &mut shape)
         } else {
@@ -768,6 +778,7 @@ fn schedule(
             generated_total += request.generated as u64;
             let seconds = request.started.elapsed().as_secs_f64();
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
+                draft_calls = request.draft_calls,
                 active = active.len(), "request complete");
             if let Some(row) = &request.turn {
                 // The conversation so far: every committed row (the last token is not in it).
