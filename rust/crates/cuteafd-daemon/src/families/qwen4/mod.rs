@@ -402,7 +402,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
     let mut allocator = engine::Allocator::new(engine.pages, engine.slots, cfg);
-    let mut placement = allocator.admit(tokens.len() + args.bench_decode)?;
+    let mut placement = allocator.admit(tokens.len() + args.bench_decode + usize::from(args.bench_decode > 0))?;
     let row = cfg.hidden * 2;
     let stream_row = row * 4;
     let prefill = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
@@ -537,6 +537,13 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
         let mut token = tokens[placement.len.min(tokens.len() - 1)];
         let mut times = Vec::new();
         let mut produced = Vec::new();
+        // Capture the complete decode shape and warm its kernels before timing.
+        let warm = [token];
+        if let Some(logits) = engine.verify(&mut [(&mut placement, &warm[..])], None)? {
+            token = argmax(&logits);
+        }
+        let warm_graphs = engine.captured_graphs();
+        *engine.profile.borrow_mut() = [0.0; 2];
         // FNV-1a over every step's logits bits (bit-identity checks between configs).
         let mut digest = 0xcbf2_9ce4_8422_2325u64;
         for _ in 0..args.bench_decode {
@@ -556,9 +563,10 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
         let profile = engine.profile.borrow();
         let mean = times.iter().sum::<f64>() / times.len() as f64;
         println!("decode bench: {} steps through {layers} layers, median {:.3} ms (mean {:.3}, min {:.3}, max {:.2}); \
-            expert GPU wait {:.1} ms, exchange {:.1} ms total; logits digest {digest:016x}; tokens {:?}", times.len(),
+            expert GPU wait {:.1} ms, exchange {:.1} ms total; logits digest {digest:016x}; tokens {:?}; \
+            graph captures warm {warm_graphs}, timed {}", times.len(),
             1e3 * times[times.len() / 2], 1e3 * mean, 1e3 * times[0], 1e3 * times[times.len() - 1], 1e3 * profile[0],
-            1e3 * profile[1], &produced[..produced.len().min(16)]);
+            1e3 * profile[1], &produced[..produced.len().min(16)], engine.captured_graphs() - warm_graphs);
     }
     let loads = match engine.experts() {
         Some(engine::Experts::Local(local)) => format!(", {} FP8 expert layer loads", local.loads.borrow()),

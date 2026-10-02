@@ -577,6 +577,10 @@ impl<'a> Qwen4Engine<'a> {
         self.experts = Some(experts);
     }
 
+    pub fn captured_graphs(&self) -> usize {
+        self.graphs.borrow().len()
+    }
+
     pub fn experts(&self) -> Option<&Experts<'a>> {
         self.experts.as_ref()
     }
