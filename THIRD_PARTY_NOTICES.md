@@ -112,6 +112,86 @@ CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 POSSIBILITY OF SUCH DAMAGE.
 
+## deepseek-recipe
+
+CUTEAFD's OpenAI-compatible API (`cuteafd-api`) depends on the `deepseek-recipe`,
+`deepseek-recipe-core` and `deepseek-recipe-encoding` crates from crates.io
+for chat-completion streaming types, tool-call definitions and DeepSeek
+prompt encoding: <https://github.com/deepseek-ai/deepseek-recipe>.
+
+SPDX-License-Identifier: MIT
+
+Copyright (c) the deepseek-recipe authors.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to
+deal in the Software without restriction, including without limitation the
+rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+sell copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+## GPTQModel
+
+CUTEAFD vendors a pinned fork of GPTQModel as the `third_party/gptqmodel`
+submodule: <https://github.com/tpurtell/GPTQModel>. It provides the
+distributed quantization tooling (EXL3/FP4/FP8 calibration and export) used
+to produce the quantized checkpoints CUTEAFD serves; it is build/quantization
+tooling, not linked into the served engine binaries. The pinned revision is
+recorded by the submodule's commit in `.gitmodules` / `git submodule status`.
+
+Copyright (c) the GPTQModel authors and other per-file copyright holders.
+
+SPDX-License-Identifier: Apache-2.0
+
+GPTQModel is distributed under the Apache License, Version 2.0. You may
+obtain the Apache License at <https://www.apache.org/licenses/LICENSE-2.0>.
+The complete license text is distributed in the submodule's own `LICENSE`
+file.
+
+## EXL3 checkpoint format (exllamav3)
+
+CUTEAFD's loader (`rust/crates/cuteafd-loader/src/formats/exl3_format.rs`,
+`exl3_storage.rs` and the per-family EXL3 readers) implements the EXL3
+trellis-quantized checkpoint format — tensor layout (`*.trellis`, `*.suh`,
+`*.svh`, codebook markers), the MCG codebook multiplier, and the decode
+tables the format requires — so that CUTEAFD can load standard EXL3
+checkpoints (including ones produced by upstream exllamav3, not only by our
+GPTQModel fork) without checkpoint-specific side files. This is original
+CUTEAFD code written to be compatible with a format defined and published by
+exllamav3: <https://github.com/turboderp-org/exllamav3>.
+
+Copyright (c) 2024-2025 turboderp
+
+SPDX-License-Identifier: MIT
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to
+deal in the Software without restriction, including without limitation the
+rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+sell copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 
 ## Native vision image preparation
 
