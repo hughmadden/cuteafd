@@ -2,6 +2,7 @@
 pub mod config;
 pub mod qkv;
 pub mod resident;
+pub mod capacity;
 pub mod workspace;
 pub use config::{MimoAttention, MimoKvCache, MimoV2Config};
 pub use qkv::{checkpoint_tp, FusedQkvLayout, QkvSegment};
