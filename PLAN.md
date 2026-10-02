@@ -742,6 +742,14 @@ active admission deferral and active KV paging are separate remaining work.
    The first private A8-down candidate fails the full-model added-error gate
    despite its component speedup; it is not deployed. Improve its accuracy
    before further performance promotion; retain the existing gate/up.
+   MiMo's short-request C16 serving campaign is dominated by serialized cold
+   prefills; decode already batches active sequences. Evaluate independent
+   requests on the two existing prefill lanes before changing weight precision
+   further. Preserve separate placements, rings, complete drafter taps and
+   both first-token outputs; keep shared KV-widening scratch consumers ordered
+   and drain both expert waves on failure. Gate against serial KV/context and
+   continuation exactness, including mixed cached/uncached prefixes, then
+   measure emitted throughput and per-step active rows on both RTX layouts.
 6. **RTX 5090 audit and claim**: hard-coded `4*188` grid clamps and the
    per-tensor FP8 GEMM grid sized for 188 SMs; one SM120 build must serve both.
    `6d4ea7a` derives expert quantizer grids from each engine's GPU and removes
@@ -850,8 +858,12 @@ active admission deferral and active KV paging are separate remaining work.
     verifier/cache-state correctness directly on the two single-copy paths.
     The private FP8 feature now passes original-reference quality, exact
     prefix restoration, fixed-history repeat/graph/causal-anchor checks and
-    tool serving on both MiMo Pro reference layouts. One warmed serving
-    sample is recorded, not a final performance qualification. Repeated
+    tool serving on both MiMo Pro reference layouts. Three interleaved
+    checkpoint/FP8 serving pairs now pass on each layout, including uncached
+    8K prompt latency, readiness, resident memory and C1/C16 emitted throughput.
+    Transport selection is identical and decode completion logs contain no
+    late graph captures. FP8 remains optional; checkpoint precision remains
+    the default. Repeated
     concurrent serving still changes some responses in both representations;
     the fixed-history checks do not prove all serving histories correct.
     The private checkpoint-driven default and shared per-rank prefill KV
@@ -859,8 +871,8 @@ active admission deferral and active KV paging are separate remaining work.
     and fixed-history state on both reference layouts. Actual two-lane prefill
     matches serial prefill and continuation exactly on both layouts; the
     earlier smaller-chunk gate exercised only the serial path. Native
-    promotion still needs the final
-    interleaved measurements and V4.1 parity gates.
+    promotion still needs V4.1 parity; complete concurrent-history correctness
+    and terminal ownership remain separate open gates.
     The source audit also finds implicit BF16 quantization and duplicate
     matrices in Qwen attention/MTP, shared GLM/GLM Flash DFlash, and the
     GLM Flash launcher's default KDA path. Correct the checkpoint-preserving
