@@ -64,6 +64,9 @@ pub(crate) enum Commands {
     /// Serve the official V4.1 target text path.
     #[command(hide = true)]
     ServeNative(NativeServeArgs),
+    /// Benchmark a running server (its own in-server runner), publish
+    /// results, or run the release smoke matrix.
+    Bench(crate::commands::bench::BenchArgs),
     BenchRdma(BenchRdmaArgs),
     BenchRdmaRing(BenchRdmaRingArgs),
     TransportCapabilities(TransportCapabilitiesArgs),

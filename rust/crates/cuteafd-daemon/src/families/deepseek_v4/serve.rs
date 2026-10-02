@@ -86,9 +86,11 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
         ConsoleHub::disabled(), profile.clone());
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
+    cuteafd_bench::ready(&listener);
     tracing::info!(listen = %args.listen, model = %profile.id, "DeepSeek V4 API is ready");
     tokio::select! {
-        served = axum::serve(listener, router) => served?,
+        served = axum::serve(listener, cuteafd_bench::app(router)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>()) => served?,
         finished = worker => finished??,
     }
     Ok(())

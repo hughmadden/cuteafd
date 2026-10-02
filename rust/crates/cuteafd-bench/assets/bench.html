@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cuteafd bench</title>
+<style>body{margin:0;background:#05070b;color:#e8eef8;font:13px/1.4 ui-monospace,Menlo,Consolas,monospace;padding:20px}
+a{color:#4cc3ff}img{max-width:100%;display:block;margin:12px 0}</style></head>
+<body><h1>cuteafd bench</h1><p id="status">loading…</p><div id="latest"></div>
+<script>
+async function load(){
+  const s = await (await fetch('/v1/bench/status')).json();
+  document.getElementById('status').textContent = s.active ? `BENCHMARKING ${s.active.panel} · ETA ${Math.round(s.active.eta_s)} s` : 'idle';
+  const runs = (await (await fetch('/v1/bench/runs')).json()).runs || [];
+  if (runs.length) document.getElementById('latest').innerHTML = `<img src="/v1/bench/runs/${runs[0].id}/report.svg">`;
+}
+load(); setInterval(load, 5000);
+</script></body></html>
