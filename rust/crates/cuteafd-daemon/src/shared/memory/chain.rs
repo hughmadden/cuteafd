@@ -42,6 +42,8 @@ struct Current {
     /// "everything chained so far" ([`fence_mark`]), and which device marked each.
     fences: Rc<[Fence]>,
     marked: Rc<Cell<[Option<usize>; 2]>>,
+    /// This pass may run device-ordered ([`deferred`]).
+    device: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -64,8 +66,14 @@ pub(crate) struct StageChain<'a> {
     fork: Rc<Cell<Option<usize>>>,
     fences: Rc<[Fence]>,
     marked: Rc<Cell<[Option<usize>; 2]>>,
+    device: Cell<bool>,
 }
 impl<'a> StageChain<'a> {
+    /// Whether the next scoped pass may run device-ordered (with
+    /// [`device_enabled`]); default on.
+    pub fn set_device_order(&self, on: bool) {
+        self.device.set(on);
+    }
     /// A chain for the current device only.
     pub fn new(library: &'a NativeLibrary) -> Result<Self> {
         let device = library.cuda_get_device()?;
@@ -97,13 +105,13 @@ impl<'a> StageChain<'a> {
         }
         Ok(Self { library, events: events.into(), head: Rc::new(Cell::new(None)),
             forks: forks.into(), fork: Rc::new(Cell::new(None)), fences: fences.into(),
-            marked: Rc::new(Cell::new([None; 2])) })
+            marked: Rc::new(Cell::new([None; 2])), device: Cell::new(true) })
     }
     /// An owned handle that can wrap a future borrowing the chain's owner.
     pub fn handle(&self) -> ChainHandle {
         ChainHandle(Current { events: self.events.clone(), head: self.head.clone(),
             forks: self.forks.clone(), fork: self.fork.clone(), fences: self.fences.clone(),
-            marked: self.marked.clone() })
+            marked: self.marked.clone(), device: self.device.get() })
     }
     /// Host wait for everything recorded so far, then forget the head. Call
     /// after the pass (or an aborted pass) before any unscoped consumer.
@@ -219,6 +227,13 @@ pub(crate) fn device_exchange_enabled() -> bool {
     device_setting() > 1
 }
 
+/// `CUTEAFD_V41_DEVICE_LANES=1`: device-ordered passes also while both lanes
+/// are busy (off: a lane runs device-ordered only while the other is idle).
+pub(crate) fn device_with_lanes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("CUTEAFD_V41_DEVICE_LANES").as_deref(), Ok("1" | "on")))
+}
+
 fn device_setting() -> u8 {
     static SETTING: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *SETTING.get_or_init(|| {
@@ -237,7 +252,7 @@ fn device_setting() -> u8 {
 /// Inside a chain scope with [`device_enabled`]: stages that used to wait on
 /// the host for a producer stream join the chain instead.
 pub(crate) fn deferred() -> bool {
-    active() && device_enabled()
+    device_enabled() && CURRENT.with(|c| c.borrow().as_ref().is_some_and(|c| c.device))
 }
 
 pub(crate) struct ChainScope<F> {
