@@ -6,6 +6,7 @@ pub(crate) mod prefix;
 pub(crate) mod serve;
 mod speculate;
 mod expert_rows;
+mod header;
 pub(crate) mod weights;
 
 use anyhow::{ensure, Context, Result};
@@ -269,6 +270,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     let checkpoint = Checkpoint::open(&args.snapshot)?;
     ensure!(checkpoint.missing_shards.is_empty(), "checkpoint shards missing: {:?}", checkpoint.missing_shards);
     let cfg = GlmNextConfig::read(&args.snapshot)?;
+    header::check_kda_inputs(&checkpoint, &cfg, args.layers.unwrap_or(cfg.layers))?;
     // The expert geometry is process-wide and must be fixed before the native
     // library loads (its expert helpers size rows from it).
     let geometry = cuteafd_core::ExpertGeometry::GLM5_FLASH;
