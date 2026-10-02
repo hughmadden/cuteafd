@@ -107,17 +107,22 @@ fn process_start() -> Option<SystemTime> {
 /// Settings from environment variables that change engine behaviour
 /// (`CUTEAFD_*`), excluding identity, paths and secrets.
 pub fn env_settings() -> Vec<Setting> {
-    const IDENTITY: [&str; 12] = ["CUTEAFD_ENGINE_COMMIT", "CUTEAFD_SPARKINFER_COMMIT", "CUTEAFD_RELEASE_VERSION",
+    const IDENTITY: [&str; 16] = ["CUTEAFD_ENGINE_COMMIT", "CUTEAFD_SPARKINFER_COMMIT", "CUTEAFD_RELEASE_VERSION",
         "CUTEAFD_ROLE", "CUTEAFD_CUDA_ARCH", "CUTEAFD_RELEASE_CONFIG_SHA256", "CUTEAFD_CONSOLE_REVISION",
         "CUTEAFD_NATIVE_LIB", "CUTEAFD_CONSOLE_PAGE", "CUTEAFD_TARGET_PLATFORM", "CUTEAFD_IMAGE",
-        "CUTEAFD_GIT_REMOTE"];
+        "CUTEAFD_GIT_REMOTE", "CUTEAFD_PYTHON", "CUTEAFD_SPARK_TP_ROLES", "CUTEAFD_CONSOLE_TEXT", "CUTEAFD_API_KEY"];
+    // Launchers pass these spellings for "the engine's default".
+    let neutral = |v: &str| matches!(v, "" | "auto" | "default" | "false" | "off" | "0");
     let mut out: Vec<Setting> = std::env::vars()
         .filter(|(name, _)| name.starts_with("CUTEAFD_"))
         .filter(|(name, _)| !IDENTITY.contains(&name.as_str()) && !name.starts_with("CUTEAFD_BENCH")
             && !name.starts_with("CUTEAFD_RELEASE_"))
         .filter(|(name, _)| !["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|s| name.contains(s)))
         .filter(|(name, _)| !name.ends_with("_DIR") && !name.ends_with("_PATH") && !name.ends_with("_TRACE"))
-        .map(|(name, value)| Setting { name, value: Some(value), default: None, source: "env".into() })
+        .map(|(name, value)| {
+            let default = neutral(&value).then(|| value.clone());
+            Setting { name, value: Some(value), default, source: "env".into() }
+        })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out

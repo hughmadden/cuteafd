@@ -393,6 +393,8 @@ pub fn failure_banner(doc: &mut Doc, theme: &Theme, x: f64, y: f64, width: f64, 
 
 /// A glitching title: the text with offset red and cyan ghosts (scary mode).
 pub fn title(doc: &mut Doc, theme: &Theme, x: f64, y: f64, size: f64, text: &str, max_width: f64) {
+    // Long model ids shrink (to 70%) before they are cut.
+    let size = size.min((max_width / (0.6 * text.chars().count().max(1) as f64)).max(size * 0.7));
     let text = fit(text, size, max_width);
     if theme.scary {
         doc.text(x - 2.5, y + 0.5, Font::new(size, "#00e5ff").bold().opacity(0.55), &text);
