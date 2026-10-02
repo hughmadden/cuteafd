@@ -853,6 +853,18 @@ active admission deferral and active KV paging are separate remaining work.
     Checkpoint-driven defaults and shared per-rank prefill KV scratch are
     being qualified separately. Native promotion still needs the final
     interleaved measurements and V4.1 parity gates.
+    The source audit also finds implicit BF16 quantization and duplicate
+    matrices in Qwen attention/MTP, shared GLM/GLM Flash DFlash, and the
+    GLM Flash launcher's default KDA path. Correct the checkpoint-preserving
+    defaults, then replace optional dual-format paths with immutable compact
+    consumers across every row shape. GLM target projection selection also
+    quantizes BF16 sources implicitly; mixed source groups need per-projection
+    dispatch and BF16 dense-FFN exports. GLM/GLM Flash native-FP8 head/index
+    operands are widened persistently today: add compact consumers or report
+    the missing format before allocation. GLM Flash KDA source headers and
+    shared DFlash dtype validation are being tightened independently. The
+    audited DeepSeek V4 target/dSpark paths preserve checkpoint weight values;
+    their expanded scale metadata is not a second weight representation.
     Check exactness when arithmetic is preserved,
     readiness, C1/C16 decode and 8K prefill on both reference layouts; include
     every surviving copy and expanded scale layout in admission.
