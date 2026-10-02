@@ -315,10 +315,28 @@ def build(args: argparse.Namespace) -> None:
                       "capacities": capacities}), flush=True)
 
 
-def verify(package: Path) -> dict:
+def verify(package: Path, *, revision: str | None = None, role: str | None = None,
+           input_kind: str | None = None, layout: str | None = None,
+           min_capacity: int | None = None) -> dict:
     manifest = json.loads((package / "manifest.json").read_text())
     if manifest.get("schema") != SCHEMA:
         raise ValueError(f"{package}: not an FP8 expert package")
+    if revision is not None and manifest.get("sparkinfer_revision") != revision:
+        raise ValueError(f"{package}: SparkInfer revision {manifest.get('sparkinfer_revision')} differs from {revision}")
+    expected_role = "spark" if role == "expert" else role
+    if expected_role is not None and manifest.get("role") != expected_role:
+        raise ValueError(f"{package}: role {manifest.get('role')} differs from {expected_role}")
+    layouts = manifest["layouts"]
+    if min_capacity is not None and min_capacity < 1:
+        raise ValueError("minimum capacity must be positive")
+    if layout is not None and layout not in layouts:
+        raise ValueError(f"{package}: no {layout} layout (built: {sorted(layouts)})")
+    for name in ([layout] if layout is not None else layouts):
+        info = layouts[name]
+        if input_kind is not None and info.get("input") != input_kind:
+            raise ValueError(f"{package}/{name}: input {info.get('input')} differs from {input_kind}")
+        if min_capacity is not None and not any(c["capacity"] >= min_capacity for c in info["capacities"]):
+            raise ValueError(f"{package}/{name}: no capacity for {min_capacity} rows")
     files = {str(p.relative_to(package)) for p in package.rglob("*") if p.is_file()} - {"manifest.json"}
     if files != set(manifest["files"]):
         raise ValueError(f"{package}: file set differs from the manifest")
@@ -355,11 +373,17 @@ def main() -> None:
     create.add_argument("--runtime", type=Path, required=True)
     check = commands.add_parser("verify")
     check.add_argument("--package", type=Path, required=True)
+    check.add_argument("--sparkinfer-revision")
+    check.add_argument("--role", choices=("coordinator", "spark", "expert"))
+    check.add_argument("--input", choices=("wire", "bf16"))
+    check.add_argument("--layout")
+    check.add_argument("--min-capacity", type=int)
     args = parser.parse_args()
     if args.command == "build":
         build(args)
     else:
-        manifest = verify(args.package)
+        manifest = verify(args.package, revision=args.sparkinfer_revision, role=args.role,
+                          input_kind=args.input, layout=args.layout, min_capacity=args.min_capacity)
         print(json.dumps({"verified": True, "role": manifest["role"], "geometry": manifest["geometry"],
                           "layouts": sorted(manifest["layouts"])}))
 
