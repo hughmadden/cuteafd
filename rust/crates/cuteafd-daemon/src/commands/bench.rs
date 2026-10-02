@@ -23,6 +23,16 @@ pub(crate) enum BenchAction {
     Publish(PublishArgs),
     /// Release smoke over a matrix of launches (./run.sh per entry).
     Smoke(cuteafd_bench::smoke::SmokeArgs),
+    /// Re-render the exports of a saved report.json (no server needed).
+    Export {
+        /// The report.json to render.
+        #[arg(long)]
+        json: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, value_delimiter = ',', default_value = "svg,png,json")]
+        export: Vec<String>,
+    },
     /// Cancel the server's active run.
     Cancel {
         #[arg(long, default_value = "http://127.0.0.1:8000")]
@@ -78,6 +88,13 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
         }
         Some(BenchAction::Smoke(smoke)) => cuteafd_bench::smoke::run(smoke),
         Some(BenchAction::Cancel { url, api_key }) => cuteafd_bench::cli::cancel(&url, &api_key),
+        Some(BenchAction::Export { json, out, export }) => {
+            let report: cuteafd_bench::report::Report = serde_json::from_str(&std::fs::read_to_string(&json)?)?;
+            for path in cuteafd_bench::cli::write_exports(&report, &out, &export)? {
+                eprintln!("wrote {}", path.display());
+            }
+            Ok(())
+        }
         None => {
             let run = args.run;
             let passes = match &run.passes {

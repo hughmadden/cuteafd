@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 pub mod agentic;
 pub mod common;
 pub mod info;
+pub mod names;
 pub mod quality;
 pub mod reasoning;
 pub mod speed;

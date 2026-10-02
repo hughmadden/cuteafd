@@ -265,14 +265,15 @@ impl Panel for Math {
                 Ok(chat) => (extract_integer(&chat.content), chat.timing.completion_tokens, None),
                 Err(e) => (None, 0, Some(format!("{e:#}"))),
             };
-            rows.push(json!({"question": question, "answer": answer, "given": given, "correct": given == Some(*answer),
+            rows.push(json!({"name": super::names::short_name(question), "question": question, "answer": answer,
+                "given": given, "correct": given == Some(*answer),
                 "tokens": tokens, "error": error}));
         }
         let correct = rows.iter().filter(|r| r["correct"] == true).count();
-        let table_rows = rows.iter().map(|r| vec![r["question"].clone(), r["answer"].clone(), r["given"].clone(),
+        let table_rows = rows.iter().map(|r| vec![r["name"].clone(), r["question"].clone(), r["answer"].clone(), r["given"].clone(),
             json!(if r["correct"] == true { "✓" } else { "✗" }), r["tokens"].clone()]).collect();
         Ok(json!({"rows": rows, "correct": correct, "total": rows.len(),
-            "table": table(&["problem", "answer", "given", "", "tokens"], table_rows)}))
+            "table": table(&["name", "problem", "answer", "given", "", "tokens"], table_rows)}))
     }
 }
 
@@ -355,15 +356,15 @@ impl Panel for IfEval {
             prompt_ok += usize::from(all);
             checks += passed.len();
             checks_ok += passed.iter().filter(|p| p.1).count();
-            rows.push(json!({"prompt": prompt, "passed": all,
+            rows.push(json!({"name": super::names::short_name(prompt), "prompt": prompt, "passed": all,
                 "rules": passed.iter().map(|(n, ok)| json!({"rule": n, "ok": ok})).collect::<Vec<_>>()}));
         }
-        let table_rows = rows.iter().map(|r| vec![r["prompt"].clone(), json!(r["rules"].as_array().map(|rules| rules.iter()
+        let table_rows = rows.iter().map(|r| vec![r["name"].clone(), r["prompt"].clone(), json!(r["rules"].as_array().map(|rules| rules.iter()
             .map(|x| format!("{} {}", if x["ok"] == true { "✓" } else { "✗" }, x["rule"].as_str().unwrap_or("")))
             .collect::<Vec<_>>().join(", ")).unwrap_or_default())]).collect();
         Ok(json!({"rows": rows, "prompt_accuracy": prompt_ok as f64 / items.len() as f64,
             "instruction_accuracy": checks_ok as f64 / checks.max(1) as f64, "prompts": items.len(),
-            "table": table(&["prompt", "instructions"], table_rows)}))
+            "table": table(&["name", "prompt", "instructions"], table_rows)}))
     }
 }
 
@@ -413,8 +414,11 @@ pub fn extract_code(text: &str) -> String {
     text.to_string()
 }
 
-/// Runs `code` + `tests` in a throwaway directory (no network namespace when
-/// unprivileged user namespaces allow it), 10 s limit. Returns (passed, sandbox, output tail).
+/// Runs `code` + `tests` in a throwaway directory with a 10 s limit, 4 GiB of
+/// address space, an empty environment (no inherited secrets) and isolated
+/// Python (`-I`); without a network namespace where unprivileged user
+/// namespaces allow one (containers usually do not). Returns (passed, sandbox
+/// description, output tail).
 pub fn run_python(code: &str, tests: &str) -> (bool, &'static str, String) {
     let Ok(dir) = tempdir() else { return (false, "none", "no temporary directory".into()) };
     let file = dir.join("solution.py");
@@ -422,21 +426,24 @@ pub fn run_python(code: &str, tests: &str) -> (bool, &'static str, String) {
         return (false, "none", "write failed".into());
     }
     let attempt = |isolate: bool| {
+        let script = "ulimit -v 4194304; exec timeout -s KILL 10 python3 -I \"$0\"";
         let mut command = if isolate {
             let mut c = std::process::Command::new("unshare");
-            c.args(["-rn", "timeout", "10", "python3", "-I"]);
+            c.args(["-rn", "sh", "-c", script]);
             c
         } else {
-            let mut c = std::process::Command::new("timeout");
-            c.args(["10", "python3", "-I"]);
+            let mut c = std::process::Command::new("sh");
+            c.args(["-c", script]);
             c
         };
-        command.arg(&file).current_dir(&dir).env_clear().env("PATH", "/usr/local/bin:/usr/bin:/bin").output()
+        command.arg(&file).current_dir(&dir).env_clear().env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("HOME", &dir).stdin(std::process::Stdio::null()).output()
     };
     let (output, sandbox) = match attempt(true) {
-        Ok(o) if !String::from_utf8_lossy(&o.stderr).contains("unshare:") => (o, "subprocess, no network"),
+        Ok(o) if !String::from_utf8_lossy(&o.stderr).contains("unshare:") =>
+            (o, "no network · 10 s · 4 GiB · empty env · temp dir"),
         _ => match attempt(false) {
-            Ok(o) => (o, "subprocess"),
+            Ok(o) => (o, "network NOT isolated (no user namespaces here) · 10 s · 4 GiB · empty env · temp dir"),
             Err(e) => return (false, "none", format!("python3: {e}")),
         },
     };
@@ -473,7 +480,7 @@ impl Panel for Code {
         let results = batched(ctx, bodies, common::concurrency(ctx.info).clamp(1, 4), "problem");
         let mut rows = Vec::new();
         let mut sandbox = "none";
-        for ((name, _, tests), result) in PROBLEMS.iter().zip(results) {
+        for ((name, task, tests), result) in PROBLEMS.iter().zip(results) {
             let (passed, note) = match result {
                 Ok(chat) => {
                     let (passed, kind, tail) = run_python(&extract_code(&chat.content), tests);
@@ -482,13 +489,13 @@ impl Panel for Code {
                 }
                 Err(e) => (false, format!("{e:#}")),
             };
-            rows.push(json!({"problem": name, "passed": passed, "note": note}));
+            rows.push(json!({"problem": name, "name": name, "task": task, "passed": passed, "note": note}));
         }
         let passed = rows.iter().filter(|r| r["passed"] == true).count();
-        let table_rows = rows.iter().map(|r| vec![r["problem"].clone(), json!(if r["passed"] == true { "pass" } else { "fail" }),
-            r["note"].clone()]).collect();
+        let table_rows = rows.iter().map(|r| vec![r["name"].clone(), r["task"].clone(),
+            json!(if r["passed"] == true { "pass" } else { "fail" }), r["note"].clone()]).collect();
         Ok(json!({"rows": rows, "passed": passed, "total": rows.len(), "sandbox": sandbox,
-            "table": table(&["problem", "result", "note"], table_rows)}))
+            "table": table(&["name", "task", "result", "note"], table_rows)}))
     }
 }
 

@@ -59,15 +59,14 @@ pub fn report_svg(report: &Report) -> String {
     let t = view.theme;
     let w = REPORT_WIDTH;
     let ids = shown(report);
-    let mut probe = Doc::new(w, 0.0);
-    let heights: Vec<f64> = ids.iter().map(|id| {
-        let (title, hint) = bodies::panel_title(id);
-        view.framed(&mut probe, 20.0, 0.0, w - 40.0, id, title, hint, bodies::failed(report, id))
-    }).collect();
+    let gap = 14.0;
+    let rows = super::layout::pack(&ids, w - 40.0, gap);
+    let heights: Vec<f64> = rows.iter().map(|row| row.iter()
+        .map(|cell| view.framed_height(cell.width, &cell.id)).fold(0.0, f64::max)).collect();
     let banner = if t.scary { 52.0 } else { 0.0 };
     let header = 124.0;
     let footer = 64.0;
-    let total = header + banner + heights.iter().map(|h| h + 14.0).sum::<f64>() + footer;
+    let total = header + banner + heights.iter().map(|h| h + gap).sum::<f64>() + footer;
     let mut doc = Doc::new(w, total);
     doc.defs(&t.defs());
     doc.rect(0.0, 0.0, w, total, 16.0, t.bg);
@@ -97,10 +96,13 @@ pub fn report_svg(report: &Report) -> String {
         let detail = r.baseline.as_ref().map(bodies::quality_line).unwrap_or_default();
         y += bodies::failure_banner(&mut doc, &t, 20.0, y, w - 40.0, &detail);
     }
-    for (id, height) in ids.iter().zip(&heights) {
-        let (title, hint) = bodies::panel_title(id);
-        view.framed(&mut doc, 20.0, y, w - 40.0, id, title, hint, bodies::failed(report, id));
-        y += height + 14.0;
+    for (row, height) in rows.iter().zip(&heights) {
+        for cell in row {
+            let (title, hint) = bodies::panel_title(&cell.id);
+            view.framed_at(&mut doc, 20.0 + cell.x, y, cell.width, Some(*height), &cell.id, title, hint,
+                bodies::failed(report, &cell.id));
+        }
+        y += height + gap;
     }
     // Footer: build provenance and run identity.
     let b = &r.server.build;

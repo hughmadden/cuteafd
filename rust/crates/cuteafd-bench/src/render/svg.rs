@@ -200,6 +200,11 @@ impl Doc {
         let _ = write!(self.body, r#"<g transform="translate({},{})">"#, n(x), n(y));
     }
 
+    /// Starts a group with a hover tooltip (`<title>`); close with [`Self::end`].
+    pub fn titled(&mut self, tooltip: &str) {
+        let _ = write!(self.body, "<g><title>{}</title>", escape(tooltip));
+    }
+
     pub fn group_attrs(&mut self, attrs: &str) {
         let _ = write!(self.body, "<g {attrs}>");
     }

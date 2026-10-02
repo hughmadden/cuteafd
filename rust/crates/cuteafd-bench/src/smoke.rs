@@ -87,6 +87,7 @@ pub struct Entry {
     /// Runs with nothing else at once (default: deepseek_v41 entries).
     #[serde(default)]
     pub exclusive: Option<bool>,
+    /// A profile name, or `panels:a,b` for those panels alone.
     #[serde(default)]
     pub profile: Option<String>,
 }
@@ -510,7 +511,12 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             std::thread::sleep(Duration::from_millis(500));
         }
         outcome.launch_s = Some(launch.elapsed().as_secs_f64());
-        let options = crate::cli::RunOptions { url, profile: Some(profile.to_string()), panels: None, passes: vec![],
+        // `panels:a,b` runs those panels instead of a profile.
+        let (profile, panels) = match profile.strip_prefix("panels:") {
+            Some(list) => (None, Some(list.split(',').map(str::to_string).collect())),
+            None => (Some(profile.to_string()), None),
+        };
+        let options = crate::cli::RunOptions { url, profile, panels, passes: vec![],
             export: vec!["svg".into(), "card".into(), "json".into()], out: None, root: out_root.to_path_buf(),
             api_key: std::env::var("CUTEAFD_API_KEY").ok(), quiet: true };
         let (report, dir) = crate::cli::run(&options)?;

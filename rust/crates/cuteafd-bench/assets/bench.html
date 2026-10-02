@@ -53,8 +53,15 @@ select { color: var(--ink); background: var(--panel-2); border: 1px solid var(--
 .menu a:hover { background: var(--line); color: var(--ink); }
 
 /* panels */
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 620px), 1fr)); gap: 12px; }
-.grid .wide { grid-column: 1 / -1; }
+.grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; grid-auto-flow: row dense; }
+.grid > .panel { grid-column: span 6; }
+.grid > .span-half { grid-column: span 3; }
+.grid > .span-third { grid-column: span 2; }
+/* Thirds become halves, then everything one column, as the screen narrows. */
+@media (max-width: 1250px) { .grid > .span-third { grid-column: span 3; } }
+@media (max-width: 900px) { .grid > .span-half, .grid > .span-third { grid-column: span 6; } }
+.panel .chart svg { display: block; width: 100%; height: auto; }
+.span-third .panel-head .hint { display: none; }
 .panel.failed { border-color: var(--bad); position: relative; }
 .panel.failed::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 7px; border-radius: 12px 12px 0 0;
   background: repeating-linear-gradient(45deg, #ffb020 0 10px, #120405 10px 20px); }
@@ -261,7 +268,9 @@ function renderPanels() {
     if (host.children[index] !== card) host.insertBefore(card, host.children[index]);
     const meta = info(id);
     const title = id === 'baseline' ? 'Basic card + quick quality' : (meta.title || id);
-    card.classList.toggle('wide', id === 'baseline');
+    const span = meta.span || 'full';
+    card.classList.toggle('span-half', span === 'half');
+    card.classList.toggle('span-third', span === 'third');
     card.classList.toggle('failed', id === 'baseline' && failed(report));
     card.querySelector('h2').textContent = title;
     const state = panelState(id);
@@ -297,14 +306,13 @@ function renderPanels() {
       if (mode === 'chart') {
         const width = Math.max(320, Math.round((chart.clientWidth || card.clientWidth - 28) / 40) * 40);
         const src = `/v1/bench/runs/${report.id}/panel-${id}.svg?bare=${width}&rev=${revs[id] || 0}`;
-        // One image per chart, attached once its first version loaded.
-        const img = chart._img || (chart._img = Object.assign(document.createElement('img'), { alt: `${title} chart` }));
-        if (img.dataset.src !== src) {
-          // Swap only once the new image is ready, so a filling chart never flickers.
-          const next = new Image();
-          next.onload = () => { if (img.dataset.src === src) { img.src = src; if (!img.isConnected) chart.appendChild(img); } };
-          next.src = src;
-          img.dataset.src = src;
+        // Inline SVG (its <title> tooltips show on hover), swapped only once
+        // the new version arrived, so a filling chart never flickers.
+        if (chart.dataset.src !== src) {
+          chart.dataset.src = src;
+          fetch(src).then((r) => r.ok ? r.text() : null).then((text) => {
+            if (text && chart.dataset.src === src) chart.innerHTML = text;
+          }).catch(() => {});
         }
       } else {
         table.innerHTML = tableFor(id);

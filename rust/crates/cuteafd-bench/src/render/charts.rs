@@ -194,16 +194,22 @@ pub fn legend(doc: &mut Doc, t: &Theme, x: f64, y: f64, items: &[(&str, &str)]) 
 /// Horizontal bars: rows of (label, value, color, annotation); returns height.
 pub fn hbars(doc: &mut Doc, t: &Theme, x: f64, y: f64, w: f64, rows: &[(String, f64, &str, String)], unit: &str) -> f64 {
     let max = rows.iter().map(|r| r.1).fold(1e-9f64, f64::max) * 1.1;
-    let label_w = 120.0;
-    let value_w = 170.0;
+    let label_w = (w * 0.26).min(120.0);
+    let narrow = w < 480.0;
+    let value_w = if narrow { 76.0 } else { 170.0 };
     for (i, (label, value, color, note)) in rows.iter().enumerate() {
         let ry = y + 24.0 * i as f64;
+        doc.titled(&format!("{label}: {} {unit}{}", super::rate(*value),
+            if note.is_empty() { String::new() } else { format!(" · {note}") }));
+        let note = if narrow { &String::new() } else { note };
         doc.text(x, ry + 13.0, Font::new(11.5, t.ink2), &fit(label, 11.5, label_w - 8.0));
         let track = w - label_w - value_w;
         doc.rect(x + label_w, ry + 3.0, track, 14.0, 3.0, t.well);
         doc.rect(x + label_w, ry + 3.0, track * (value / max).clamp(0.0, 1.0), 14.0, 3.0, color);
-        doc.spans(x + w, ry + 14.0, 11.5, Anchor::End, &[(&format!("{} {unit}", super::rate(*value)), t.ink, 600),
+        let value_text = if narrow { super::rate(*value) } else { format!("{} {unit}", super::rate(*value)) };
+        doc.spans(x + w, ry + 14.0, 11.5, Anchor::End, &[(&value_text, t.ink, 600),
             (&if note.is_empty() { String::new() } else { format!("  {note}") }, t.muted, 400)]);
+        doc.end();
     }
     24.0 * rows.len() as f64
 }

@@ -167,7 +167,8 @@ impl Panel for Reasoning {
             let results = common::wave_retrying(ctx.client, bodies);
             for (&(l, i), result) in chunk.iter().zip(results) {
                 let (tier, question, answer) = &items[i];
-                let mut row = json!({"level": levels[l].0, "level_index": l, "tier": tier, "question": question,
+                let mut row = json!({"level": levels[l].0, "level_index": l, "tier": tier,
+                    "name": super::names::short_name(question), "question": question,
                     "answer": answer});
                 match result {
                     Ok(timed) => {

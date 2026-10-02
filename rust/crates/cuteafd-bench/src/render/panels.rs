@@ -141,14 +141,21 @@ fn prefix_cache(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
         doc.rect(x, base - total_h, bw, total_h - cached_h, 2.0, t.series[3]);
         doc.rect(x, base - cached_h, bw, cached_h, 2.0, t.series[1]);
         let mut label = seconds(num(turn, "ttft_s").unwrap_or(f64::NAN));
-        if let Some(cold) = num(turn, "cold_ttft_s") {
+        let cold = num(turn, "cold_ttft_s");
+        doc.titled(&format!("turn {}: {} of {} prompt tokens restored, TTFT {label}{}", turn["turn"], cached, prompt,
+            cold.map(|c| format!(", cold {}", seconds(c))).unwrap_or_default()));
+        if let Some(cold) = cold.filter(|_| slot >= 110.0) {
             label.push_str(&format!(" / {}", seconds(cold)));
         }
         doc.text(x + bw / 2.0, base - total_h - 6.0, Font::new(10.0, t.ink).anchor(Anchor::Middle), &label);
         doc.text(x + bw / 2.0, base + 14.0, Font::new(10.0, t.muted).anchor(Anchor::Middle),
-            &format!("turn {} · {:.0}%", turn["turn"], 100.0 * cached / prompt.max(1.0)));
+            &if slot >= 90.0 { format!("turn {} · {:.0}%", turn["turn"], 100.0 * cached / prompt.max(1.0)) }
+                else { format!("{:.0}%", 100.0 * cached / prompt.max(1.0)) });
+        doc.end();
     }
-    doc.text(w, 10.0, Font::new(10.0, t.muted).anchor(Anchor::End), "TTFT / cold TTFT above each turn");
+    if w >= 560.0 {
+        doc.text(w, 10.0, Font::new(10.0, t.muted).anchor(Anchor::End), "TTFT / cold TTFT above each turn");
+    }
     top + h + 30.0
 }
 
@@ -186,7 +193,8 @@ fn needle(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     18.0 + charts::heatmap(doc, t, 0.0, 18.0, w, &xs, &ys, &cell, t.good, t.bad)
 }
 
-/// A score headline and one square per item (green pass, red fail).
+/// A score headline and one named square per item (green pass, red fail);
+/// the full prompt is the item's tooltip.
 #[allow(clippy::too_many_arguments)]
 fn scored(doc: &mut Doc, t: &Theme, v: &Value, w: f64, count: &str, list: &str, label: &str, ok: &str) -> f64 {
     let items = v[list].as_array().cloned().unwrap_or_default();
@@ -195,25 +203,28 @@ fn scored(doc: &mut Doc, t: &Theme, v: &Value, w: f64, count: &str, list: &str, 
     }
     let good = num(v, count).unwrap_or_else(|| items.iter().filter(|i| i[ok] == true).count() as f64);
     let total = items.len() as f64;
-    doc.text(0.0, 40.0, Font::new(36.0, t.series[0]).bold(), &format!("{good:.0}/{total:.0}"));
-    doc.text(0.0, 60.0, Font::new(11.0, t.ink2), &format!("{:.0}%", 100.0 * good / total.max(1.0)));
+    doc.text(0.0, 34.0, Font::new(32.0, t.series[0]).bold(), &format!("{good:.0}/{total:.0}"));
+    doc.text(0.0, 54.0, Font::new(11.0, t.ink2), &format!("{:.0}%", 100.0 * good / total.max(1.0)));
     if let Some(sandbox) = v["sandbox"].as_str() {
-        doc.text(0.0, 76.0, Font::new(10.0, t.muted), &super::svg::fit(&format!("sandbox: {sandbox}"), 10.0, 190.0));
+        doc.text(60.0, 54.0, Font::new(10.0, t.muted), &super::svg::fit(sandbox, 10.0, w - 60.0));
     }
-    let (x0, size, gap) = (200.0, 22.0, 6.0);
-    let per_row = ((w - x0) / (size + 140.0)).floor().max(1.0) as usize;
+    let (size, gap, cell) = (18.0, 6.0, 136.0);
+    let (x0, y0) = if w >= 520.0 { (150.0, 0.0) } else { (0.0, 70.0) };
+    let per_row = ((w - x0 + 6.0) / cell).floor().max(1.0) as usize;
     for (i, item) in items.iter().enumerate() {
-        let (col, row) = (i % per_row, i / per_row);
-        let x = x0 + col as f64 * (size + 140.0);
-        let y = row as f64 * (size + gap);
+        let x = x0 + (i % per_row) as f64 * cell;
+        let y = y0 + (i / per_row) as f64 * (size + gap);
         let pass = item[ok] == true;
+        let full = item[label].as_str().or_else(|| item["task"].as_str()).unwrap_or("");
+        let name = item["name"].as_str().map(str::to_string).unwrap_or_else(|| crate::panels::names::short_name(full));
+        doc.titled(&format!("{} {name}: {full}", if pass { "✓" } else { "✗" }));
         doc.rect(x, y, size, size, 4.0, if pass { t.good } else { t.bad });
-        doc.text(x + size / 2.0, y + 15.0, Font::new(12.0, t.bg).anchor(Anchor::Middle).bold(), if pass { "✓" } else { "✗" });
-        let text = item[label].as_str().unwrap_or("");
-        doc.text(x + size + 6.0, y + 15.0, Font::new(10.5, t.ink2), &super::svg::fit(text, 10.5, 130.0));
+        doc.text(x + size / 2.0, y + 13.5, Font::new(11.0, t.bg).anchor(Anchor::Middle).bold(), if pass { "✓" } else { "✗" });
+        doc.text(x + size + 6.0, y + 13.5, Font::new(10.5, t.ink2), &super::svg::fit(&name, 10.5, cell - size - 10.0));
+        doc.end();
     }
     let rows = items.len().div_ceil(per_row) as f64;
-    (rows * (size + gap)).max(82.0)
+    (y0 + rows * (size + gap)).max(64.0)
 }
 
 fn ifeval(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
@@ -223,18 +234,25 @@ fn ifeval(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     }
     let prompt = num(v, "prompt_accuracy").unwrap_or(0.0);
     let instruction = num(v, "instruction_accuracy").unwrap_or(0.0);
-    doc.text(0.0, 40.0, Font::new(36.0, t.series[0]).bold(), &format!("{:.0}%", 100.0 * prompt));
-    doc.text(0.0, 60.0, Font::new(11.0, t.ink2), "prompt-level strict");
-    doc.text(170.0, 40.0, Font::new(36.0, t.series[1]).bold(), &format!("{:.0}%", 100.0 * instruction));
-    doc.text(170.0, 60.0, Font::new(11.0, t.ink2), "instruction-level");
-    let (x0, size, gap) = (360.0, 18.0, 5.0);
-    let per_row = ((w - x0) / (size + gap)).floor().max(1.0) as usize;
+    doc.text(0.0, 34.0, Font::new(32.0, t.series[0]).bold(), &format!("{:.0}%", 100.0 * prompt));
+    doc.text(0.0, 54.0, Font::new(10.5, t.ink2), "prompt-level");
+    doc.text(130.0, 34.0, Font::new(32.0, t.series[1]).bold(), &format!("{:.0}%", 100.0 * instruction));
+    doc.text(130.0, 54.0, Font::new(10.5, t.ink2), "instruction-level");
+    let (size, gap) = (18.0, 5.0);
+    let (x0, y0) = if w >= 560.0 { (280.0, 6.0) } else { (0.0, 70.0) };
+    let per_row = ((w - x0 + gap) / (size + gap)).floor().max(1.0) as usize;
     for (i, r) in rows.iter().enumerate() {
         let x = x0 + (i % per_row) as f64 * (size + gap);
-        let y = 8.0 + (i / per_row) as f64 * (size + gap);
+        let y = y0 + (i / per_row) as f64 * (size + gap);
+        let prompt = r["prompt"].as_str().unwrap_or("");
+        let name = r["name"].as_str().map(str::to_string).unwrap_or_else(|| crate::panels::names::short_name(prompt));
+        let rules: Vec<String> = r["rules"].as_array().into_iter().flatten().map(|x| format!("{} {}",
+            if x["ok"] == true { "✓" } else { "✗" }, x["rule"].as_str().unwrap_or(""))).collect();
+        doc.titled(&format!("{name}: {prompt} [{}]", rules.join(", ")));
         doc.rect(x, y, size, size, 3.0, if r["passed"] == true { t.good } else { t.bad });
+        doc.end();
     }
-    70.0
+    (y0 + rows.len().div_ceil(per_row) as f64 * (size + gap)).max(64.0)
 }
 
 /// Wilson 68% interval of k successes in n.

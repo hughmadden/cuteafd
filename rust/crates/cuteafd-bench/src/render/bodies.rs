@@ -88,9 +88,22 @@ impl<'a> View<'a> {
     /// A framed panel at x, y; returns its height.
     pub fn framed(&self, doc: &mut Doc, x: f64, y: f64, width: f64, id: &str, title: &str, hint: &str,
         failed: bool) -> f64 {
+        self.framed_at(doc, x, y, width, None, id, title, hint, failed)
+    }
+
+    /// Height a framed panel needs at `width`.
+    pub fn framed_height(&self, width: f64, id: &str) -> f64 {
+        46.0 + self.body(id, width - 32.0).1 + 16.0
+    }
+
+    /// [`Self::framed`], stretched to `height` when given (panels sharing a row).
+    #[allow(clippy::too_many_arguments)]
+    pub fn framed_at(&self, doc: &mut Doc, x: f64, y: f64, width: f64, height: Option<f64>, id: &str, title: &str,
+        hint: &str, failed: bool) -> f64 {
         let t = &self.theme;
         let (body, body_h) = self.body(id, width - 32.0);
-        let height = 46.0 + body_h + 16.0;
+        let height = height.unwrap_or(46.0 + body_h + 16.0);
+        let hint = if width < 560.0 { "" } else { hint };
         doc.frame(x, y, width, height, 12.0, t.panel, if failed { t.bad } else { t.line });
         doc.rect_attrs(x + 12.0, y + 0.5, width - 24.0, 2.0, 1.0, r#"fill="url(#accent)" opacity="0.9""#);
         if failed {

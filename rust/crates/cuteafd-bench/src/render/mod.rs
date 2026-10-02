@@ -7,6 +7,7 @@ pub mod bodies;
 pub mod report;
 pub mod card;
 pub mod charts;
+pub mod layout;
 pub mod panels;
 pub mod png;
 

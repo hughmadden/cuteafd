@@ -185,7 +185,9 @@ impl Bench {
             "estimate_s": if has_baseline { 0.0 } else { crate::baseline::estimate_s(&rates) },
             "done": has_baseline})];
         for panel in panels::catalog() {
+            let (span, min_width) = crate::render::layout::span(panel.id());
             panels.push(json!({"id": panel.id(), "title": panel.title(), "description": panel.description(),
+                "span": span, "min_width": min_width,
                 "estimate_s": panel.estimate_s(&rates, &info), "unavailable": panel.unavailable(&info),
                 "always": panels::ALWAYS.contains(&panel.id())}));
         }
