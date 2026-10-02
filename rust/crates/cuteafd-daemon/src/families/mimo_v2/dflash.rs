@@ -792,13 +792,13 @@ impl crate::families::glm5::dflash::ReplayDrafter for MimoDrafter<'_> {
         self.max_sequences.min(self.slots)
     }
 
-    fn has_fp8(&self) -> bool {
-        false
-    }
-
-    fn set_fp8(&self, _on: bool) {
-        // Shared replay's legacy restore hook is inert. This drafter has one
-        // immutable representation and has_fp8() advertises no toggle arm.
+    fn resident_modes(&self) -> Vec<crate::families::glm5::dflash::ReplayMode> {
+        use crate::families::glm5::dflash::ReplayMode;
+        let name = match self.representation {
+            MimoDraftRepresentation::Bf16Only => "BF16",
+            MimoDraftRepresentation::Fp8Only => "FP8",
+        };
+        vec![ReplayMode { name, legacy_fp8: None }]
     }
 
     fn context(&self, taps: &[u8], first: usize) -> Result<()> {
