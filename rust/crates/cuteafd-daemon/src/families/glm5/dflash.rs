@@ -799,7 +799,10 @@ impl ReplayDrafter for GlmDrafter<'_> {
     fn context(&self, taps: &[u8], first: usize) -> Result<()> {
         let n = taps.len() / (self.cfg.taps.len() * self.cfg.hidden * 2);
         self.put_taps(taps)?;
-        self.update(&(0..n).map(|r| ContextRow { tap_row: r, slot: 0, position: first + r }).collect::<Vec<_>>())
+        self.update(&(0..n).map(|r| ContextRow { tap_row: r, slot: 0, position: first + r }).collect::<Vec<_>>())?;
+        // SAFETY: diagnostic replay owns this stream. Complete the reads of
+        // taps and metadata before the next context call overwrites them.
+        unsafe { self.library.cuda_stream_synchronize(self.stream) }
     }
 
     fn draft_tokens(&self, seqs: &[(usize, u32, usize)], anchor_rows: &[u8], head: *const c_void)

@@ -846,6 +846,9 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
             drafter.put_taps(&taps)?;
             drafter.update(&(0..n).map(|r| dflash::ContextRow { tap_row: r, slot: 0, position: done + r })
                 .collect::<Vec<_>>())?;
+            // SAFETY: the oracle owns the stream; a following chunk reuses
+            // the taps and context metadata read by this update.
+            unsafe { engine.library.cuda_stream_synchronize(engine.stream)? };
             done += n;
         }
         let anchor = tokens[position];
