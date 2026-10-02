@@ -61,7 +61,8 @@ pub use synthetic::{
     SYNTHETIC_EXPERT_KERNEL,
 };
 pub use verbs::{
-    gpu_landing_probe, DeviceLanding, GpuLandingProbe,
+    gpu_landing_probe, DeviceLanding, DeviceWriteTarget, GpuLandingProbe, VerbsHostWriteTarget,
+    VERBS_HOST_WRITE_FLAG_ERROR,
     LocalVerbsExpertConnection, RingBudget, RingReservation,
     serve_protocol_v2_verbs_host_with_executor, serve_synthetic_verbs_host,
     verbs_host_protocol_v2_endpoint_plan, verbs_host_protocol_v2_expert_request_roundtrip,

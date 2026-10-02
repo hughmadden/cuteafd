@@ -28,6 +28,31 @@ impl DeviceLanding {
     }
 }
 
+/// Write mode: the peer RDMA-writes each response's rows into
+/// `[base + plane_offset, + plane_bytes)` and then its request id into the
+/// u64 at `base + flag_offset`; `[base, base + bytes)` is one device range the
+/// session exposes (dma-buf, remote write, no relaxed ordering).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceWriteTarget {
+    pub base: usize,
+    pub bytes: usize,
+    pub plane_offset: usize,
+    pub plane_bytes: usize,
+    pub flag_offset: usize,
+}
+
+/// Exposes `target`'s range on `endpoint` and returns the handshake's view of it.
+pub(super) fn expose(endpoint: &NativeRdmaEndpoint, target: DeviceWriteTarget) -> Result<VerbsHostWriteTarget> {
+    anyhow::ensure!(target.plane_offset + target.plane_bytes <= target.bytes && target.flag_offset + 8 <= target.bytes
+        && target.flag_offset % 8 == 0, "write target ranges exceed the exposed range");
+    let buffer = CuteafdDeviceBuffer { ptr: target.base as *mut c_void, bytes: target.bytes, ..Default::default() };
+    // SAFETY: `SparkExperts::set_write_targets`'s contract keeps the range
+    // allocated while this endpoint (owned by the session) exists.
+    let rkey = unsafe { endpoint.library.rdma_rc_endpoint_expose_device(endpoint.info.handle, Some(buffer))? };
+    Ok(VerbsHostWriteTarget { plane_addr: (target.base + target.plane_offset) as u64, plane_bytes: target.plane_bytes as u64,
+        flag_addr: (target.base + target.flag_offset) as u64, rkey })
+}
+
 /// Registers `landing` on `endpoint` before its receives are posted; false
 /// (with the reason logged) keeps the session on host receives.
 pub(super) fn attach(endpoint: &NativeRdmaEndpoint, landing: DeviceLanding, addr: SocketAddr) -> bool {

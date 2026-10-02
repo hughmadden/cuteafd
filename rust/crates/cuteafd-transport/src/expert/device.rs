@@ -35,6 +35,8 @@ pub mod mailbox {
     pub const SEND_STATE: usize = 192;
     /// u32: the completion sequence the GPU last waited for.
     pub const RECV_STATE: usize = 224;
+    /// u32: write mode, bit r set when rank r flagged a failed response.
+    pub const WRITE_ERROR: usize = 232;
     /// Route ids (u32 [rows * topk]), then gate weights (f32 [rows * topk]).
     pub const ROUTES: usize = 256;
 
@@ -157,6 +159,9 @@ impl Mailbox {
     }
 }
 
+/// Request ids of written waves: this base plus the wave's sequence.
+const WRITTEN_ID_BASE: u64 = 1 << 62;
+
 /// With no announced wave outstanding, the proxy spins this long after its
 /// last wave (back-to-back steps), then yields until [`YIELD_AFTER`], then
 /// parks: an idle server spends no CPU on it.
@@ -181,7 +186,8 @@ impl SparkDeviceLane {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn spawn(peers: Vec<SocketAddr>, executors: Vec<u64>, capacity: u32, config: TcpTransportConfig,
         landing: Vec<DeviceLanding>, cuda_device: i32, mailbox_base: usize, mailbox_bytes: usize, topk: usize,
-        wire_row_bytes: usize, warm: Option<ExpertProtocolV2Request>, mut build: DeviceBuild) -> Result<Self> {
+        wire_row_bytes: usize, warm: Option<ExpertProtocolV2Request>, write: Option<Vec<crate::DeviceWriteTarget>>,
+        mut build: DeviceBuild) -> Result<Self> {
         ensure!(landing.len() == peers.len(), "a device lane needs one landing range per rank");
         ensure!(mailbox_base % 64 == 0 && mailbox_bytes >= mailbox::bytes(capacity as usize, topk, wire_row_bytes),
             "device lane mailbox is misaligned or smaller than {} bytes", mailbox::bytes(capacity as usize, topk,
@@ -207,16 +213,28 @@ impl SparkDeviceLane {
             let setup = (|| -> Result<_> {
                 let mut transport = SparkExperts::new_ranks(&peers, &executors, capacity, config)?;
                 // SAFETY: forwarded from this constructor's contract.
-                unsafe { transport.set_gpu_landing(Some(landing.clone()))? };
+                match &write {
+                    Some(targets) => unsafe { transport.set_write_targets(Some(targets.clone()))? },
+                    None => unsafe { transport.set_gpu_landing(Some(landing.clone()))? },
+                }
                 let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
                 let library = crate::verbs::load_verbs_host_native_library()?;
                 library.cuda_set_device(cuda_device)?;
-                if let Some(request) = &warm {
-                    let wave = transport.dispatch_wave(request)?;
-                    let receipt = runtime.block_on(transport.receive_wave(wave, |_, _, _| Ok(())))?;
-                    ensure!(receipt.landed.count_ones() as usize == transport.world_size(),
-                        "device lane warm-up: ranks {:#b} of {} landed in GPU memory", receipt.landed,
-                        transport.world_size());
+                match (&warm, &write) {
+                    // Sequence 0 in the low bits: no GPU wait expects it.
+                    (Some(request), Some(_)) => {
+                        let mut request = request.clone();
+                        request.header.request_id = WRITTEN_ID_BASE;
+                        transport.post_written(&request)?;
+                    }
+                    (Some(request), None) => {
+                        let wave = transport.dispatch_wave(request)?;
+                        let receipt = runtime.block_on(transport.receive_wave(wave, |_, _, _| Ok(())))?;
+                        ensure!(receipt.landed.count_ones() as usize == transport.world_size(),
+                            "device lane warm-up: ranks {:#b} of {} landed in GPU memory", receipt.landed,
+                            transport.world_size());
+                    }
+                    (None, _) => {}
                 }
                 Ok((transport, runtime, library))
             })();
@@ -229,6 +247,7 @@ impl SparkDeviceLane {
             };
             let _ = ready_tx.send(Ok(transport.world_size()));
             let row_bytes = landing.first().map_or(0, |l| l.bytes / capacity as usize);
+            let written = write.is_some();
             let ready_word = mailbox.word(mailbox::READY);
             let done_word = mailbox.word(mailbox::DONE);
             let mut expected = ready_word.load(Ordering::Acquire);
@@ -278,7 +297,15 @@ impl SparkDeviceLane {
                     ensure!(published == expected.wrapping_add(1),
                         "device wave sequence {published} skipped past {}", expected.wrapping_add(1));
                     let (wave, routes, wire) = mailbox.read()?;
-                    let request = build(wave, routes, wire)?;
+                    let mut request = build(wave, routes, wire)?;
+                    if written {
+                        // The ranks write their rows and then this id (its low 32
+                        // bits are the wave's sequence) into the GPU's flags.
+                        request.header.request_id = WRITTEN_ID_BASE | u64::from(published);
+                        transport.post_written(&request)?;
+                        state.build_post_ns.fetch_add(seen.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        return Ok(());
+                    }
                     let pending = transport.dispatch_wave(&request)?;
                     let posted = Instant::now();
                     let rows = wave.rows as usize;

@@ -1,6 +1,6 @@
 mod registered_response;
 mod landing;
-pub use landing::{gpu_landing_probe, DeviceLanding, GpuLandingProbe};
+pub use landing::{gpu_landing_probe, DeviceLanding, DeviceWriteTarget, GpuLandingProbe};
 use registered_response::{RegisteredResponseFrame, RegisteredResponseRing};
 mod egress;
 mod local;
@@ -1793,6 +1793,8 @@ struct VerbsHostProtocolV2PersistentClientSession {
     /// Zero-copy egress: the shared request buffer and its region on this
     /// endpoint. Declared after `endpoint`, so the registration goes first.
     egress: Option<(Arc<egress::EgressBuffer>, u32)>,
+    /// Responses arrive as RDMA writes into the exposed device range.
+    write_mode: bool,
 }
 
 struct ProtocolV2ResponseChunkAssembler {
@@ -2031,13 +2033,13 @@ impl VerbsHostProtocolV2PersistentClientSession {
         execution_lane: u32,
         cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
     ) -> Result<Self> {
-        Self::connect_impl(addr, config, request, execution_lane, cq_harvester, false, None, false)
+        Self::connect_impl(addr, config, request, execution_lane, cq_harvester, false, None, false, None)
     }
 
     fn connect_local(addr: SocketAddr, config: &TcpTransportConfig,
                      request: &ExpertProtocolV2Request, landing: Option<DeviceLanding>,
-                     egress: Option<&Arc<egress::EgressBuffer>>) -> Result<Self> {
-        let mut session = Self::connect_impl(addr, config, request, 0, None, true, landing, egress.is_some())?;
+                     egress: Option<&Arc<egress::EgressBuffer>>, write: Option<DeviceWriteTarget>) -> Result<Self> {
+        let mut session = Self::connect_impl(addr, config, request, 0, None, true, landing, egress.is_some(), write)?;
         if let Some(buffer) = egress {
             let host = buffer.host();
             // SAFETY: the buffer is pinned host memory kept alive by the Arc
@@ -2054,8 +2056,8 @@ impl VerbsHostProtocolV2PersistentClientSession {
     fn connect_impl(addr: SocketAddr, config: &TcpTransportConfig,
                     request: &ExpertProtocolV2Request, execution_lane: u32,
                     cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
-                    retain_final_response: bool, landing: Option<DeviceLanding>, gathered_sends: bool)
-                    -> Result<Self> {
+                    retain_final_response: bool, landing: Option<DeviceLanding>, gathered_sends: bool,
+                    write: Option<DeviceWriteTarget>) -> Result<Self> {
         verbs_host_preflight()?;
         let native_path = verbs_host_native_library_path().context(
             "native library not found; set CUTEAFD_NATIVE_LIB or build native/libcuteafd_native.so with RDMA",
@@ -2103,6 +2105,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             response_slot_stride_bytes: response_ring.slot_stride_bytes,
             client_endpoint: endpoint.verbs_descriptor("client", &client_host),
             client_native_endpoint: endpoint.native_descriptor(),
+            write_target: write.map(|target| landing::expose(&endpoint, target)).transpose()?,
         };
         write_control(&mut stream, &start)?;
         let ready: VerbsHostProtocolV2PersistentReady = read_control(&mut reader)?;
@@ -2153,10 +2156,12 @@ impl VerbsHostProtocolV2PersistentClientSession {
         endpoint.connect(&ready.server_native_endpoint)?;
         // Before any receive is posted, so every response slot scatters alike.
         let gpu_landing = match landing {
-            Some(landing) => landing::attach(&endpoint, landing, addr),
-            None => false,
+            Some(landing) if start.write_target.is_none() => landing::attach(&endpoint, landing, addr),
+            _ => false,
         };
-        for slot in 0..response_ring.depth {
+        // Write mode: responses are RDMA writes, so no receive is posted.
+        let write_mode = start.write_target.is_some();
+        for slot in (0..response_ring.depth).filter(|_| !write_mode) {
             endpoint.post_recv_at(
                 response_ring.slot_offset(slot),
                 response_ring.slot_capacity_bytes,
@@ -2166,7 +2171,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
         let (response_frame_recycle_tx, response_frame_recycle_rx) = mpsc::channel();
         let (pinned_response_frame_recycle_tx, pinned_response_frame_recycle_rx) = mpsc::channel();
         // Landed payloads are not in the host slot, so there is nothing to retain.
-        let retained_response_ring = if retain_final_response && !gpu_landing {
+        let retained_response_ring = if retain_final_response && !gpu_landing && !write_mode {
             Some(RegisteredResponseRing::new(&endpoint, response_ring)?)
         } else { None };
         Ok(Self {
@@ -2194,6 +2199,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             pinned_response_frame_recycle_rx,
             gpu_landing,
             egress: None,
+            write_mode,
         })
     }
 
@@ -3310,7 +3316,26 @@ struct VerbsHostProtocolV2PersistentStart {
     response_slot_stride_bytes: usize,
     client_endpoint: VerbsHostRcEndpointDescriptor,
     client_native_endpoint: VerbsHostNativeEndpointDescriptor,
+    /// The client's device range for written responses (absent: responses
+    /// are SENDs into its receive ring).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    write_target: Option<VerbsHostWriteTarget>,
 }
+
+/// Where a write-mode server RDMA-writes each response: the partial rows into
+/// `plane_addr` (at most `plane_bytes`), then the request id into `flag_addr`
+/// (bit 63 set when the response could not be written). Both lie in one range
+/// the client exposed with `rkey`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerbsHostWriteTarget {
+    pub plane_addr: u64,
+    pub plane_bytes: u64,
+    pub flag_addr: u64,
+    pub rkey: u32,
+}
+
+/// Bit 63 of a written response flag: the server could not write the rows.
+pub const VERBS_HOST_WRITE_FLAG_ERROR: u64 = 1 << 63;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct VerbsHostProtocolV2PersistentReady {
@@ -3631,6 +3656,19 @@ impl NativeRdmaEndpoint {
     fn post_send_at(&self, offset_bytes: usize, bytes: usize, wr_id: u64) -> Result<()> {
         self.library
             .rdma_rc_endpoint_post_send_at(self.info.handle, offset_bytes, bytes, wr_id)
+    }
+
+    /// Write mode: RDMA-writes `bytes` of the send buffer at `offset_bytes`
+    /// to the client's plane, then `flag` to its flag word (signaled).
+    fn post_write_flagged(&self, target: &VerbsHostWriteTarget, offset_bytes: usize, bytes: usize, flag: u64,
+        wr_id: u64) -> Result<()> {
+        anyhow::ensure!(bytes as u64 <= target.plane_bytes, "written response exceeds the client's plane");
+        // SAFETY: the client exposed these ranges with this rkey for this
+        // connection (handshake) and keeps them while it lives.
+        unsafe {
+            self.library.rdma_rc_endpoint_post_write_flagged(self.info.handle, offset_bytes, bytes, target.plane_addr,
+                target.rkey, flag, target.flag_addr, target.rkey, wr_id)
+        }
     }
 
     fn send_parts_at(
