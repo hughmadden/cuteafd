@@ -45,9 +45,10 @@ pub(crate) struct EngineArgs {
     pub slots: usize,
     #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
-    /// Decode steps of <= 16 rows read E4M3 copies (FP32 128x128 block scales,
-    /// quantized at load) of the GDN and attention in/out projections.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    /// Legacy E4M3 projection conversion request. Currently unsupported: the
+    /// narrow-row consumer requires a second BF16 copy for wider rows.
+    /// Checkpoint BF16 is preserved by default.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub fp8_decode: bool,
     /// Scale rule of the FP8 copies made from BF16 weights at load: amax /
     /// 448, the smallest power of two >= it (pow2), or per block whichever of
@@ -95,9 +96,9 @@ pub(crate) struct EngineArgs {
     /// its experts local) and verifies up to this many drafts per sequence.
     #[arg(long, default_value_t = 0)]
     pub mtp: usize,
-    /// MTP drafts read an E4M3 copy of lm_head (per-row x 128-K scales, made at
-    /// load): half the head's bytes per draft step; verification stays exact.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    /// Legacy separate E4M3 MTP head request. Currently unsupported because it
+    /// duplicates the target head. MTP borrows the checkpoint BF16 head by default.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub mtp_fp8_head: bool,
     #[command(flatten)]
     pub token_io: crate::shared::token_io::TokenIoArgs,
@@ -196,7 +197,63 @@ impl Opened {
     }
 }
 
+impl EngineArgs {
+    fn validate_weight_storage(&self) -> Result<()> {
+        ensure!(!self.fp8_decode,
+            "Qwen --fp8-decode true is unsupported: GDN/attention projections retain both BF16 and FP8 weights; \
+             add compact consumers for prefill and every verification row count before enabling conversion; \
+             use --fp8-decode false to preserve checkpoint BF16");
+        ensure!(!self.mtp_fp8_head,
+            "Qwen --mtp-fp8-head true is unsupported: the private FP8 lm_head duplicates the target's BF16 head; \
+             add one shared head representation for target and MTP before enabling conversion; \
+             use --mtp-fp8-head false to share checkpoint BF16");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_precision_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Command {
+        #[command(flatten)]
+        engine: EngineArgs,
+    }
+
+    fn args(extra: &[&str]) -> EngineArgs {
+        Command::try_parse_from(["qwen", "--snapshot", "/missing/checkpoint", "--native-lib", "/missing/native.so"]
+            .into_iter().chain(extra.iter().copied())).unwrap().engine
+    }
+
+    #[test]
+    fn default_target_and_mtp_keep_checkpoint_weights_without_private_copies() {
+        for extra in [&[][..], &["--mtp", "1"][..], &["--fp8-decode", "false", "--mtp-fp8-head", "false"][..]] {
+            let args = args(extra);
+            assert!(!args.fp8_decode);
+            assert!(!args.mtp_fp8_head);
+            args.validate_weight_storage().unwrap();
+        }
+    }
+
+    #[test]
+    fn duplicate_projection_request_fails_before_checkpoint_or_native_open() {
+        let error = open(&args(&["--fp8-decode", "true"])).err().unwrap().to_string();
+        assert!(error.contains("GDN/attention projections retain both BF16 and FP8"), "{error}");
+        assert!(error.contains("every verification row count"), "{error}");
+    }
+
+    #[test]
+    fn duplicate_head_request_fails_before_checkpoint_or_native_open() {
+        let error = open(&args(&["--mtp", "1", "--mtp-fp8-head", "true"])).err().unwrap().to_string();
+        assert!(error.contains("private FP8 lm_head duplicates"), "{error}");
+        assert!(error.contains("one shared head representation"), "{error}");
+    }
+}
+
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
+    args.validate_weight_storage()?;
     let checkpoint = Checkpoint::open(&args.snapshot)?;
     ensure!(checkpoint.missing_shards.is_empty(), "checkpoint shards missing: {:?}", checkpoint.missing_shards);
     let cfg = Qwen4Config::read(&args.snapshot)?;
