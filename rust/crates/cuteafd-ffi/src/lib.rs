@@ -28,6 +28,8 @@ pub use shared::v41_experts::{
 };
 mod cuda_runtime;
 pub use cuda_runtime::{select_copy_mechanism, CopyMechanism, CudaRuntime};
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 use anyhow::{Context, Result};
 use libloading::{Library, Symbol};
