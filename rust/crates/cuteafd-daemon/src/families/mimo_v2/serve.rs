@@ -173,6 +173,14 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         anyhow::ensure!(engine.has_experts(), "serve-mimo needs --peers (or --local-experts) for the routed experts");
         let spark = args.peers.is_some() && !args.local_experts;
         console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
+        // Every decode/verify shape the scheduler can step (1..=64 rows) is captured before
+        // the server is ready: serving replays them without capturing.
+        let started = std::time::Instant::now();
+        let graphs = engine.capture_decode_graphs(DECODE_ROWS)?;
+        if graphs > 0 {
+            tracing::info!(graphs, rows = DECODE_ROWS, elapsed_ms = started.elapsed().as_millis() as u64,
+                "MiMo decode graphs captured");
+        }
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(()));
         }
@@ -793,7 +801,8 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let [cycles, dflash, dflash_ok, copy, copy_ok] = request.counts;
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
                 active = active.len(), steps, verify_s, draft_s, emit_s, gpu_wait_s = phases[0],
-                experts_s = phases[1], cycles, dflash, dflash_ok, copy, copy_ok, "request complete");
+                experts_s = phases[1], cycles, dflash, dflash_ok, copy, copy_ok, late_graphs = engine.late_captures(),
+                "request complete");
             (steps, verify_s, draft_s, emit_s) = (0, 0.0, 0.0, 0.0);
             if let Some(row) = &request.turn {
                 // The conversation so far: every committed row (the last token is not in it).

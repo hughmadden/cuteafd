@@ -119,6 +119,14 @@ if [[ $family == mimo_v2 ]]; then
   # KV_CACHE: int8 (the engine default: 8-bit full-attention records with FP32 scales per 32
   # dims; SWA rings stay BF16) or bf16.
   [[ -z "$(get KV_CACHE)" ]] || family_args+=(--kv-cache "$(get KV_CACHE)")
+  # DECODE_GRAPHS=on: decode/verify steps replay per-layer CUDA graph segments captured at startup
+  # (default off: neutral against the host-driven Spark exchange, 0.4-1.2 GiB of graphs).
+  case "$(get DECODE_GRAPHS)" in
+    "") ;;
+    on) family_args+=(--decode-graphs true) ;;
+    off) family_args+=(--decode-graphs false) ;;
+    *) echo "DECODE_GRAPHS must be on or off" >&2; exit 2 ;;
+  esac
 fi
 [[ ! $family =~ ^(glm5|qwen4|deepseek_v4)$ || -z "$(get POOL_TOKENS)" ]] || family_args+=(--pool-tokens "$(get POOL_TOKENS)")
 # GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
