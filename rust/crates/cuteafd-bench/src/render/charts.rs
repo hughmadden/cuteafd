@@ -90,6 +90,16 @@ fn nice(min: f64, max: f64) -> (f64, f64) {
     ((min / step).floor() * step, (max / step).ceil() * step)
 }
 
+/// Token counts: 4K, 128K, 1M for powers of two, else [`short`].
+pub fn tokens(v: f64) -> String {
+    let n = v.round() as u64;
+    if n >= 1024 && n % 1024 == 0 {
+        if n >= 1 << 20 && n % (1 << 20) == 0 { format!("{}M", n >> 20) } else { format!("{}K", n / 1024) }
+    } else {
+        short(v)
+    }
+}
+
 /// Compact tick labels: 1.5k, 128K tokens, 0.25.
 pub fn short(v: f64) -> String {
     let a = v.abs();
@@ -143,7 +153,7 @@ impl Plot {
             doc.text(self.x + self.w, self.y + self.h + 30.0, Font::new(10.0, t.muted).anchor(Anchor::End), x_title);
         }
         if !y_title.is_empty() {
-            doc.text(self.x - 34.0, self.y - 8.0, Font::new(10.0, t.muted), y_title);
+            doc.text(self.x - 34.0, self.y - 14.0, Font::new(10.0, t.muted), y_title);
         }
     }
 

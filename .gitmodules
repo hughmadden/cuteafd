@@ -12,3 +12,6 @@
 [submodule "third_party/transformers"]
 	path = third_party/transformers
 	url = https://github.com/malaiwah/transformers.git
+[submodule "third_party/tool-eval-bench"]
+	path = third_party/tool-eval-bench
+	url = https://github.com/SeraphimSerapis/tool-eval-bench.git

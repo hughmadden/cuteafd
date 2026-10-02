@@ -115,3 +115,83 @@ mod tests {
         }
     }
 }
+
+/// A report with synthetic passes of every measurement panel (render work).
+pub fn full_report() -> Report {
+    use serde_json::json;
+    let mut report = report(false);
+    let pass = |id: &str, value: serde_json::Value| PanelResult { id: id.into(), title: id.into(),
+        status: PanelStatus::Done, passes: vec![value], ..PanelResult::default() };
+    let contents = ["code", "prose", "json", "math", "chat", "translation", "summary", "table"];
+    let rows: Vec<_> = contents.iter().enumerate().map(|(i, c)| json!({"content": c, "tok_s": 140.0 + 9.0 * i as f64,
+        "tokens": 256, "ttft_s": 0.12, "acceptance": 0.6 + 0.03 * i as f64})).collect();
+    let levels = ["off", "10", "low 25", "high 50", "xhigh 75", "max 100"];
+    let mut reasoning = Vec::new();
+    for (l, level) in levels.iter().enumerate() {
+        for (k, tier) in ["medium", "medium", "medium", "hard", "hard", "brutal", "aime", "aime"].iter().enumerate() {
+            let tokens = (40.0 * 2f64.powi(l as i32) * (1.0 + k as f64 * 0.4)) as u64;
+            reasoning.push(json!({"level": level, "tier": tier, "correct": (l + k) % 3 != 0 || l > 3,
+                "hit_cap": l == 5 && k == 7, "reasoning_tokens": tokens, "solo_s": tokens as f64 / 180.0}));
+        }
+    }
+    report.panels = vec![
+        pass("decode_content", json!({"rows": rows})),
+        pass("concurrency", json!({"points": ([1, 2, 4, 8, 16].iter().map(|&c| json!({"c": c,
+            "aggregate_tok_s": 187.0 * (c as f64).powf(0.7), "per_request_tok_s": 187.0 / (c as f64).powf(0.3),
+            "ttft_s": 0.1 * c as f64})).collect::<Vec<_>>())})),
+        pass("prefill", json!({"points": ([1024, 2048, 4096, 8192, 16384, 32768, 65536].iter().map(|&l| json!({
+            "target": l, "prompt_tokens": l, "cold_ttft_s": l as f64 / 2400.0 + 0.05, "cold_tok_s": 2400.0 - l as f64 / 100.0,
+            "cached_tokens": l - 256, "cached_ttft_s": 0.11 + l as f64 / 1e6})).collect::<Vec<_>>())})),
+        pass("retained", json!({"points": ([0, 4096, 16384, 65536].iter().map(|&c| json!({"context": c, "prompt_tokens": c + 60,
+            "decode_tok_s": 187.0 - c as f64 / 1000.0})).collect::<Vec<_>>())})),
+        pass("prefix_cache", json!({"turns": (1..=6).map(|t| json!({"turn": t, "prompt_tokens": 1000 + 300 * t,
+            "cached_tokens": if t == 1 { 0 } else { 1000 + 300 * (t - 1) }, "ttft_s": if t == 1 { 0.6 } else { 0.15 },
+            "cold_ttft_s": 0.5 + 0.1 * t as f64})).collect::<Vec<_>>()})),
+        pass("structured", json!({"rows": [{"schema": "person", "valid": true, "tok_s": 150.0, "free_tok_s": 170.0},
+            {"schema": "order", "valid": true, "tok_s": 140.0, "free_tok_s": 168.0},
+            {"schema": "ticket", "valid": false, "tok_s": 120.0, "free_tok_s": 160.0}]})),
+        pass("needle", json!({"cells": ([2048, 8192, 32768, 131072].iter().flat_map(|&l| [0.0, 0.25, 0.5, 0.75, 1.0]
+            .iter().map(move |&d| json!({"length": l, "depth": d, "found": !(l == 131072 && d == 0.5)}))).collect::<Vec<_>>())})),
+        pass("math", json!({"correct": 10, "rows": (0..12).map(|i| json!({"question": format!("problem {i}"),
+            "correct": i % 6 != 5})).collect::<Vec<_>>()})),
+        pass("code", json!({"passed": 9, "sandbox": "subprocess, no network", "rows": (["is_palindrome", "fizzbuzz",
+            "merge_intervals", "roman", "anagram_groups", "longest_unique", "primes_upto", "flatten", "rle", "balanced",
+            "top_k_words", "matrix_spiral"].iter().enumerate().map(|(i, p)| json!({"problem": p, "passed": i % 4 != 3}))
+            .collect::<Vec<_>>())})),
+        pass("ifeval", json!({"prompt_accuracy": 0.85, "instruction_accuracy": 0.9, "rows": (0..20).map(|i|
+            json!({"passed": i % 7 != 0})).collect::<Vec<_>>()})),
+        pass("reasoning_effort", json!({"levels": levels, "rows": reasoning})),
+        pass("agentic", json!({"task": "money", "success": true, "seconds": 182.0, "turns": (1..=7).map(|t| json!({"turn": t,
+            "prompt_tokens": 6000 + 1800 * t, "cached_tokens": if t == 1 { 0 } else { 6000 + 1800 * (t - 1) },
+            "ttft_s": if t == 1 { 2.1 } else { 0.4 }, "decode_tok_s": 120.0, "full_turn_reused": t > 1,
+            "invalid_tool_calls": 0})).collect::<Vec<_>>()})),
+        pass("startup", json!({"phases": [{"name": "engine loaded", "at_s": 98.0}, {"name": "API listening", "at_s": 99.1}],
+            "readiness_s": 99.1, "warmup_s": 14.2})),
+        PanelResult { id: "tool_eval".into(), title: "Tool eval".into(), status: PanelStatus::Done,
+            passes: vec![json!({"standard": 121, "standard_max": 138, "hard": 19, "hard_max": 30, "total": 140, "total_max": 168})],
+            history: vec![json!({"standard": 117, "hard": 21, "total": 138}), json!({"standard": 124, "hard": 17, "total": 141})],
+            ..PanelResult::default() },
+    ];
+    report
+}
+
+#[cfg(test)]
+mod full_tests {
+    #[test]
+    fn every_panel_renders() {
+        let dir = std::env::var_os("CUTEAFD_BENCH_SAMPLE_DIR").map(std::path::PathBuf::from);
+        let report = super::full_report();
+        for panel in &report.panels {
+            let svg = crate::render::report::panel_svg(&report, &panel.id);
+            assert!(!svg.contains("Pass 1"), "{} fell back to the generic body", panel.id);
+            let png = crate::render::png::png(&svg, 1.0).unwrap();
+            if let Some(dir) = &dir {
+                std::fs::write(dir.join(format!("full-{}.png", panel.id)), png).unwrap();
+            }
+        }
+        let svg = crate::render::report::report_svg(&report);
+        if let Some(dir) = &dir {
+            std::fs::write(dir.join("full-report.png"), crate::render::png::png(&svg, 1.0).unwrap()).unwrap();
+        }
+    }
+}

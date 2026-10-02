@@ -98,6 +98,23 @@ RUN python3 /opt/cuteafd/scripts/build/verify-sparkinfer-source.py \
       --lock /opt/cuteafd/third_party/sparkinfer.lock.json \
       --require-no-python-cache
 
+# tool-eval-bench (MIT, pinned submodule) for the benchmark's tool-eval panel,
+# which runs it as a subprocess against the server's own API.
+COPY scripts/build/verify-tool-eval-source.py /opt/cuteafd/scripts/build/verify-tool-eval-source.py
+COPY third_party/tool-eval-bench.lock.json /opt/cuteafd/third_party/tool-eval-bench.lock.json
+COPY third_party/tool-eval-bench /opt/cuteafd/third_party/tool-eval-bench
+RUN if [ "$CUTEAFD_ROLE" = coordinator ]; then \
+      python3 /opt/cuteafd/scripts/build/verify-tool-eval-source.py \
+        --source /opt/cuteafd/third_party/tool-eval-bench \
+        --lock /opt/cuteafd/third_party/tool-eval-bench.lock.json && \
+      revision="$(python3 /opt/cuteafd/scripts/build/verify-tool-eval-source.py \
+        --source /opt/cuteafd/third_party/tool-eval-bench \
+        --lock /opt/cuteafd/third_party/tool-eval-bench.lock.json --print-revision)" && \
+      SETUPTOOLS_SCM_PRETEND_VERSION="0.0.0+g${revision%"${revision#???????}"}" \
+        uv pip install --system --break-system-packages --no-cache /opt/cuteafd/third_party/tool-eval-bench && \
+      uv pip check && tool-eval-bench --help >/dev/null; \
+    else rm -rf /opt/cuteafd/third_party/tool-eval-bench; fi
+
 COPY .cuteafd-release-image/cuteafd /opt/cuteafd/bin/cuteafd
 COPY .cuteafd-release-image/libcuteafd_native.so /opt/cuteafd/lib/libcuteafd_native.so
 COPY .cuteafd-release-image/exl3 /opt/cuteafd/lib/exl3

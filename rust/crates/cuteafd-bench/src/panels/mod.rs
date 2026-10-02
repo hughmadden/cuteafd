@@ -6,10 +6,13 @@ use serde::Serialize;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 
+pub mod agentic;
 pub mod common;
 pub mod info;
 pub mod quality;
+pub mod reasoning;
 pub mod speed;
+pub mod tools;
 
 /// Rates that turn a panel's workload into seconds: the baseline's when it
 /// ran, a conservative guess before.
@@ -116,8 +119,8 @@ pub trait Panel: Send + Sync {
 /// Every panel this build runs, in display order.
 pub fn catalog() -> Vec<&'static dyn Panel> {
     vec![&info::HARDWARE, &info::CONFIGURATION, &speed::DECODE_CONTENT, &speed::CONCURRENCY, &speed::PREFILL,
-        &speed::RETAINED, &speed::PREFIX_CACHE, &quality::STRUCTURED, &quality::NEEDLE, &quality::IFEVAL,
-        &quality::CODE, &quality::MATH]
+        &speed::RETAINED, &speed::PREFIX_CACHE, &agentic::AGENTIC, &quality::STRUCTURED, &quality::NEEDLE, &quality::IFEVAL,
+        &quality::CODE, &quality::MATH, &reasoning::REASONING, &tools::TOOL_EVAL, &info::STARTUP]
 }
 
 pub fn find(id: &str) -> Option<&'static dyn Panel> {

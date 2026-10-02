@@ -19,6 +19,7 @@ pub struct ServerContext {
 
 struct State {
     context: Mutex<ServerContext>,
+    phases: Mutex<Vec<(String, SystemTime)>>,
     started: SystemTime,
     ready: OnceLock<SystemTime>,
     listen: OnceLock<SocketAddr>,
@@ -28,6 +29,7 @@ fn state() -> &'static State {
     static STATE: OnceLock<State> = OnceLock::new();
     STATE.get_or_init(|| State {
         context: Mutex::new(ServerContext::default()),
+        phases: Mutex::new(Vec::new()),
         started: process_start().unwrap_or_else(SystemTime::now),
         ready: OnceLock::new(),
         listen: OnceLock::new(),
@@ -46,8 +48,23 @@ pub fn get() -> ServerContext {
     state().context.lock().map(|c| c.clone()).unwrap_or_default()
 }
 
+/// A named startup milestone (the startup panel's Gantt).
+pub fn phase(name: &str) {
+    if let Ok(mut phases) = state().phases.lock() {
+        phases.push((name.to_string(), SystemTime::now()));
+    }
+}
+
+/// Startup milestones as seconds after process start.
+pub fn phases() -> Vec<(String, f64)> {
+    let start = state().started;
+    state().phases.lock().map(|p| p.iter().map(|(n, t)| (n.clone(),
+        t.duration_since(start).map(|d| d.as_secs_f64()).unwrap_or(0.0))).collect()).unwrap_or_default()
+}
+
 /// The API accepts requests on `listen` from now on.
 pub fn mark_ready(listen: SocketAddr) {
+    phase("API listening");
     let _ = state().ready.set(SystemTime::now());
     let _ = state().listen.set(listen);
 }

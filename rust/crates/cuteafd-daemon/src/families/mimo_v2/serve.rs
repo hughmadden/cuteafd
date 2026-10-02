@@ -97,6 +97,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, draft, prefix));
     ready_rx.await.context("engine failed before it was ready")??;
+    cuteafd_bench::context::phase("engine loaded");
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
         hub, profile.clone());
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;

@@ -376,6 +376,20 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
     if response_format.as_ref().and_then(|v| v.get("type")).and_then(Value::as_str) == Some("regex") {
         body["response_format"] = json!({"type":"text"});
     }
+    // DeepSeek V4.1 takes a numeric effort (1-100, its template's own scale);
+    // the named levels keep the recipe's mapping.
+    let numeric_effort = match body.get("reasoning_effort").filter(|v| v.is_number()) {
+        None => None,
+        Some(value) => match (value.as_u64().filter(|n| (1..=100).contains(n)), &state.profile.encoding) {
+            (Some(n), ModelEncoding::DeepseekV41) => {
+                body["reasoning_effort"] = json!("high");
+                Some(n)
+            }
+            (Some(_), _) => return error(StatusCode::BAD_REQUEST,
+                "a numeric reasoning_effort (1-100) is DeepSeek V4.1's; use a named level"),
+            (None, _) => return error(StatusCode::BAD_REQUEST, "reasoning_effort must be 1-100 or a named level"),
+        },
+    };
     let sampling = match request_target_sampling(&body) {
         Ok(sampling) => sampling,
         Err(message) => return error(StatusCode::BAD_REQUEST, message),
@@ -503,7 +517,12 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
             let rendered = if matches!(state.profile.encoding, ModelEncoding::DeepseekV4) {
                 DeepseekV4Encoding::new().render_conversation(&converted.conversation)
             } else {
-                DeepseekV41Encoding::new().render_conversation(&converted.conversation)
+                let mut rendered = DeepseekV41Encoding::new().render_conversation(&converted.conversation);
+                if let Some(n) = numeric_effort {
+                    rendered.prompt = rendered.prompt.replacen("Reasoning Effort: 75 (range 1-100",
+                        &format!("Reasoning Effort: {n} (range 1-100"), 1);
+                }
+                rendered
             };
             (rendered.prompt, rendered.image_sources,
                 OutputProcessor::Deepseek(StreamProcessor::new(generator, converted.parsing_options)))
@@ -856,6 +875,8 @@ mod tests {
             (json!({"reasoning_effort":"low"}), Some(50)),
             (json!({"reasoning_effort":"high"}), Some(75)),
             (json!({"reasoning_effort":"max"}), Some(100)),
+            (json!({"reasoning_effort":25}), Some(25)),
+            (json!({"reasoning_effort":10}), Some(10)),
             (json!({"reasoning_effort":"none"}), None),
             (json!({"thinking":{"type":"disabled"},"reasoning_effort":"max"}), None),
         ] {

@@ -100,6 +100,7 @@ pub(crate) async fn run(mut args: crate::cli::NativeServeArgs) -> Result<()> {
         .await
         .context("native target startup stopped")?
         .map_err(anyhow::Error::msg)?;
+    cuteafd_bench::context::phase("engine loaded");
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     cuteafd_bench::ready(&listener);
     tracing::info!(%listen,"native V4.1 target API ready");

@@ -44,6 +44,11 @@ impl Client {
         Self { base: base.trim_end_matches('/').to_string(), model: String::new(), agent, token, cancel }
     }
 
+    /// The run's lockout token (subprocesses pass it as their API key).
+    pub fn token(&self) -> Option<&str> {
+        self.token.as_deref()
+    }
+
     pub fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }

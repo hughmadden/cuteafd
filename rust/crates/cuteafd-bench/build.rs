@@ -57,6 +57,7 @@ fn main() {
         commit = value;
     }
     references(Path::new(&manifest));
+    agentic_repo(Path::new(&manifest));
     println!("cargo:rustc-env=CUTEAFD_BUILD_REMOTE={remote}");
     println!("cargo:rustc-env=CUTEAFD_BUILD_COMMIT={commit}");
     println!("cargo:rustc-env=CUTEAFD_BUILD_DIRTY={dirty}");
@@ -78,4 +79,36 @@ fn references(manifest: &Path) {
     out.push_str("];\n");
     let target = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("references.rs");
     std::fs::write(target, out).expect("write references.rs");
+}
+
+/// The agentic panel's fixture repository (scripts/fixtures/agentic-repo) compiled in:
+/// `$OUT_DIR/agentic_repo.rs` lists (relative path, contents).
+fn agentic_repo(manifest: &Path) {
+    let root = manifest.join("../../../scripts/fixtures/agentic-repo");
+    println!("cargo:rerun-if-changed={}", root.display());
+    let mut files = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n != "__pycache__") {
+                    stack.push(path);
+                }
+            } else if path.extension().is_none_or(|e| e != "pyc") {
+                println!("cargo:rerun-if-changed={}", path.display());
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    let mut out = String::from("pub static AGENTIC_REPO: &[(&str, &str)] = &[\n");
+    for file in files {
+        let relative = file.strip_prefix(&root).unwrap_or(&file).display().to_string();
+        out.push_str(&format!("    ({relative:?}, include_str!({:?})),\n", file.display().to_string()));
+    }
+    out.push_str("];\n");
+    let target = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("agentic_repo.rs");
+    std::fs::write(target, out).expect("write agentic_repo.rs");
 }

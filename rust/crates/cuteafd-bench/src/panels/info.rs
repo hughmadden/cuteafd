@@ -34,3 +34,24 @@ impl Panel for ConfigurationPanel {
             "configuration": ctx.info.configuration, "build": ctx.info.build}))
     }
 }
+
+pub struct Startup;
+pub static STARTUP: Startup = Startup;
+
+impl Panel for Startup {
+    fn id(&self) -> &'static str { "startup" }
+    fn title(&self) -> &'static str { "Startup" }
+    fn description(&self) -> &'static str {
+        "When the server came up: process start, engine loaded, API listening, and the first requests' warm-up."
+    }
+    fn estimate_s(&self, _rates: &Rates, _info: &ServerInfo) -> f64 { 0.2 }
+    fn run(&self, ctx: &Ctx<'_>) -> anyhow::Result<Value> {
+        let phases: Vec<Value> = crate::context::phases().into_iter().map(|(name, at)| json!({"name": name, "at_s": at}))
+            .collect();
+        let warmup = ctx.baseline.and_then(|b| b.card.warmup_s);
+        let rows = phases.iter().map(|p| vec![p["name"].clone(), p["at_s"].clone()])
+            .chain(warmup.map(|w| vec![json!("first requests (warm-up)"), json!(w)])).collect();
+        Ok(json!({"phases": phases, "readiness_s": ctx.info.readiness_s, "warmup_s": warmup,
+            "table": super::common::table(&["milestone", "seconds"], rows)}))
+    }
+}
