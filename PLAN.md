@@ -640,6 +640,14 @@ The user chooses release cuts; development fixes below do not cut a release.
         BF16 decode improves the diagnostic fidelity probe; serving defaults
         stay FP8 pending tool/agentic, batch/state and reference-layout gates.
      k. Qwen 3.8 FP8 has no Spark expert package (173 GB, no one-RTX fit).
+     l. Generic-family startup did not enforce the compiled index context
+        extent, and `HOST_CACHE_BYTES=auto` failed byte parsing. GLM, GLM
+        Flash and Qwen now retain the manifest extent and reject unsupported
+        requested contexts before engine allocation, naming the exporter
+        setting. Automatic retained-prefix host budgets account for each
+        family's page/mark slabs and are capped by live host/cgroup memory
+        after headroom; disabled retention or unavailable rank-copy support
+        allocates no host tier. Rank-aware exact host restores remain a gate.
 5. **Spark expert kernels**: MiMo V2.6 Pro TP6 prefill is Spark-bound (~35 of
    ~42 ms per layer); GLM 5.3 verify is bound by distinct expert reads; NVFP4
    W4A16 GB10 prefill (14.3 vs EXL3 9.1 ms/layer TP4). Pro's installed SM121
@@ -654,6 +662,21 @@ The user chooses release cuts; development fixes below do not cut a release.
    the CLI's fixed SM default. Card-specific AOT/ABI guards remain to qualify.
 7. **Phase 6 placement planner** (incl. cold components such as the vision
    encoder on a Spark) and **multimodal input** (official encoders only).
+   **Joint serving capacity policy** (TJ): default C16, with 20 active
+   SWA/front-layer state slots to tolerate a small burst. Request a GPU KV
+   floor of eight times the checkpoint maximum context; report that target
+   and the feasible capacity separately when it cannot fit. Keep checkpoint
+   context, compiled index extent and effective serving context distinct.
+   Budget each physical GPU to 97% of total minus pre-existing non-engine
+   usage, reserving resident weights, all workspace/replay/graph/transport
+   storage, optional drafters, active state and exact-prefix marks before
+   allocating the aligned shared pool. GLM KV is replicated under a head
+   split; MiMo KV heads are partitioned, so aggregate GPU bytes cannot be
+   used as interchangeable capacity. One resolved plan must drive both
+   `cuteafd plan` and runtime startup; preserve explicit benchmark overrides.
+   Retained host-prefix storage has its own bounded budget and exact restore
+   gate; it does not extend active GPU KV capacity. Resource-aware admission
+   deferral and active KV paging/offload are separate remaining work.
 8. **NVFP4 follow-ups**: native per-tensor FP8 decode with static scales.
    **Revisit W4A4 for `nvidia/DeepSeek-V4.1-Flash-NVFP4`** (TJ): V4.1's own
    NVFP4 path keeps the ds41rt 44-slot W4A4 family opt-in because ds41rt

@@ -423,22 +423,23 @@ fn prefix_cache<'e, 'a>(engine: &'e super::engine::Engine<'a>, args: &PrefixArgs
     // The pinned host tier copies through one GPU's copy engine; a head split keeps its
     // (replicated) state on both GPUs, so it keeps device-resident snapshots only.
     let host = if engine.ranks() > 1 {
-        if args.host_cache_bytes > 0 && args.prefix_cache_entries > 0 {
+        if args.host_cache_bytes.enabled() && args.prefix_cache_entries > 0 {
             tracing::warn!("DeepSeek V4 head split: the prefix cache's host tier is off (device-resident snapshots only)");
         }
         None
     } else {
-        args.host_tier(engine.library, family.template(), family.mark_bytes())?
+        args.host_tier(engine.library, family.template(), family.layout(), engine.max_context)?
     };
+    let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();
     let config = PrefixConfig { entries, mark_slots: family.slots(), keep_logits: true,
         min_tokens: args.prefix_cache_min_tokens };
     let cache = PrefixCache::new(layout, config, host)?;
     tracing::info!(entries, mark_slots = family.slots(), mark_bytes = family.mark_bytes(), page_bytes = layout.page_bytes,
-        pages = layout.pages, page_rows = layout.page_rows, host_bytes = args.host_cache_bytes, points = ?args.points(),
+        pages = layout.pages, page_rows = layout.page_rows, host_bytes, points = ?args.points(),
         "DeepSeek V4 prefix cache");
     cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64,
-        &"compressed C4/C128 + index".to_string(), if args.prefix_cache_entries == 0 { 0 } else { args.host_cache_bytes });
+        &"compressed C4/C128 + index".to_string(), host_bytes);
     Ok((family, cache))
 }
 

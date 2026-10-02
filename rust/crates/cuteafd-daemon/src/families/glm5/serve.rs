@@ -382,20 +382,21 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs)
     // The pinned host tier copies through one GPU's copy engine; a head split keeps its
     // (replicated) pages on both GPUs, so it keeps device-resident snapshots only.
     let host = if engine.ranks() > 1 {
-        if args.host_cache_bytes > 0 && args.prefix_cache_entries > 0 {
+        if args.host_cache_bytes.enabled() && args.prefix_cache_entries > 0 {
             tracing::warn!("GLM head split: the prefix cache's host tier is off (device-resident snapshots only)");
         }
         None
     } else {
-        args.host_tier(engine.library, template, 1)?
+        args.host_tier(engine.library, template, family.layout(), engine.max_context)?
     };
+    let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();
     let config = PrefixConfig { entries, mark_slots: 0, keep_logits: true, min_tokens: args.prefix_cache_min_tokens };
     let cache = PrefixCache::new(layout, config, host)?;
-    tracing::info!(entries, page_bytes = layout.page_bytes, pages = layout.pages, host_bytes = args.host_cache_bytes,
+    tracing::info!(entries, page_bytes = layout.page_bytes, pages = layout.pages, host_bytes,
         rule = ?layout.rule, points = ?args.points(), "GLM prefix cache");
     cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64,
-        &"FP8 MLA latent + DSA index".to_string(), if args.prefix_cache_entries == 0 { 0 } else { args.host_cache_bytes });
+        &"FP8 MLA latent + DSA index".to_string(), host_bytes);
     Ok((family, cache))
 }
 

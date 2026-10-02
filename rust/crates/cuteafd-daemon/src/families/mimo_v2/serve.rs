@@ -336,22 +336,23 @@ fn prefix_cache<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs)
     // The pinned host tier copies through one GPU's copy engine; a head split's
     // pages and marks live on two GPUs, so it keeps device-resident snapshots only.
     let host = if engine.ranks() > 1 {
-        if args.host_cache_bytes > 0 && entries > 0 {
+        if args.host_cache_bytes.enabled() && entries > 0 {
             tracing::warn!("MiMo head split: the prefix cache's host tier is off (device-resident snapshots only)");
         }
         None
     } else {
-        args.host_tier(engine.library, engine.kv_layer(0).1, family.mark_bytes())?
+        args.host_tier(engine.library, engine.kv_layer(0).1, family.layout(), engine.max_context)?
     };
+    let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();
     let config = PrefixConfig { entries, mark_slots: family.slots(), keep_logits: true,
         min_tokens: args.prefix_cache_min_tokens };
     let cache = PrefixCache::new(layout, config, host)?;
     tracing::info!(entries, mark_slots = family.slots(), mark_bytes = family.mark_bytes(), page_bytes = layout.page_bytes,
-        pages = layout.pages, host_bytes = args.host_cache_bytes, rule = ?layout.rule, points = ?args.points(),
+        pages = layout.pages, host_bytes, rule = ?layout.rule, points = ?args.points(),
         reach = family.capture_reach(), "MiMo prefix cache");
     cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64,
-        &format!("{:?} full + BF16 SWA rings", engine.kv_cache()), if args.prefix_cache_entries == 0 { 0 } else { args.host_cache_bytes });
+        &format!("{:?} full + BF16 SWA rings", engine.kv_cache()), host_bytes);
     Ok((family, cache))
 }
 
