@@ -156,6 +156,8 @@ rsync "${snapshot_args[@]}" "$repo_root/" "$staging_dir/"
 # The selected complete configuration is part of the slot, even when the
 # caller chose a file other than the repository's default cuteafd.config.
 install -m 0644 "$RELEASE_CONFIG" "$staging_dir/cuteafd.config"
+# The frozen tree has no .git: its identity goes in BUILD_IDENTITY.json for report footers.
+"$repo_root/scripts/build/write-build-identity.sh" "$repo_root" "$staging_dir/BUILD_IDENTITY.json"
 python3 "$staging_dir/scripts/build/verify-sparkinfer-source.py" \
   --source "$staging_dir/third_party/sparkinfer" \
   --lock "$staging_dir/third_party/sparkinfer.lock.json"

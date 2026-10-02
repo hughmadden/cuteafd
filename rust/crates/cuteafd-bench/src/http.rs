@@ -19,6 +19,8 @@ use std::sync::Arc;
 
 /// The benchmark page, compiled in.
 pub const PAGE: &str = include_str!("../assets/bench.html");
+/// The BENCHMARKING banner any page can include (`/bench/banner.js`).
+pub const BANNER: &str = include_str!("../assets/banner.js");
 
 /// Paths that run inference (and so are refused while a benchmark runs).
 fn inference(method: &Method, path: &str) -> bool {
@@ -83,6 +85,11 @@ async fn page() -> Response {
         None => PAGE.to_string(),
     };
     ([(header::CACHE_CONTROL, "no-cache")], axum::response::Html(page)).into_response()
+}
+
+async fn banner() -> Response {
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], BANNER)
+        .into_response()
 }
 
 async fn status(State(bench): State<Arc<Bench>>) -> Json<serde_json::Value> {
@@ -245,6 +252,7 @@ async fn events(State(bench): State<Arc<Bench>>) -> Response {
 pub fn routes(bench: Arc<Bench>) -> Router {
     Router::new()
         .route("/bench", get(page))
+        .route("/bench/banner.js", get(banner))
         .route("/v1/bench/status", get(status))
         .route("/v1/bench/panels", get(panels))
         .route("/v1/bench/profiles", get(profiles))
