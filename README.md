@@ -20,7 +20,15 @@ Sparks) and maximum (2× RTX + 4 or 6 Sparks) hardware. Other reports:
 [`benchmarks/`](benchmarks/README.md).
 
 <!-- results:begin -->
-_Pending the first published run._
+
+#### Qwen 3.8
+
+| Checkpoint | Hardware | C1 code | prose | JSON | 8K prefill | TTFT | Quality | Run |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 (exl3-k4+exl3-k5) | 1× RTX (min) | 115 | 112 | 122 | 6,826 | 1.17 s | ✓ KL 0.034 · top-1 88.5% ✓ lossless spec | [2026-10-02 · f09913484126](benchmarks/qwen4/2026-10-02-smoke-1rtx/report.svg) |
+
+tok/s; C1 decode with thinking off, 8K prefill cold. Quality: logit fidelity against the family golden reference, prefix-cache restore exactness, lossless speculation.
+
 <!-- results:end -->
 
 ## Working on it
