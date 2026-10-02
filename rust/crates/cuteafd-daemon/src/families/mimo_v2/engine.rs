@@ -2547,8 +2547,8 @@ mod terminal_fault_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::{attention_workspace_geometry, expert_capacity, lane_prefill_capacity, scale_operand,
-        MimoAttentionWorkspace, DECODE_ROWS, MIN_LANE_ROWS};
+    use super::{attention_workspace_geometry, expert_capacity, independent_prefill_rows, lane_prefill_capacity,
+        scale_operand, MimoAttentionWorkspace, MimoPlacement, MimoPrefillOutput, DECODE_ROWS, MIN_LANE_ROWS, PAGE_ROWS};
 
     #[test]
     fn fp8_output_scale_operands_match_both_exported_abis() {
