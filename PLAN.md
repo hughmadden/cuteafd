@@ -931,13 +931,18 @@ active admission deferral and active KV paging are separate remaining work.
     Private GLM Flash direct-CLI guards now reject BF16 block inputs before
     native loading instead of silently quantizing them. Actual checkpoint
     headers validate the qualified EXL3-primary/official-FP8-side route;
-    standalone planner diagnostics still need to match this policy.
+    standalone planner diagnostics now match this policy, with named missing
+    BF16 consumers and supported native block-FP8 inputs. The planner does
+    not yet model a secondary FP8 snapshot.
     Private Qwen defaults preserve checkpoint BF16 projections and share the
     target head with MTP. Legacy duplicate-storage options reject before
     native loading until compact all-row/shared-head consumers exist. These
     changes pass composed workspace/script checks; Qwen model quality,
-    readiness and performance gates remain pending. Explicit GLM Flash
-    duplicate-storage options and other persistent FP8 widening remain open.
+    readiness and performance gates remain pending. GLM Flash direct-CLI and
+    launcher guards reject duplicate-storage options before native loading
+    or worker launch; the composed loader, planner and option changes pass
+    workspace/script checks. Compact single-copy KDA/head consumers and other
+    persistent FP8 widening remain open.
     GLM head admission now reads indexed checkpoint headers independently of
     the routed-expert catalog. The
     audited DeepSeek V4 target/dSpark paths preserve checkpoint weight values;
