@@ -347,7 +347,10 @@ fn tool_eval(doc: &mut Doc, t: &Theme, panel: &PanelResult, w: f64) -> f64 {
         let mean = values.iter().sum::<f64>() / values.len().max(1) as f64;
         let color = t.series[i];
         doc.text(x, 12.0, Font::new(10.0, t.muted).spacing(1.4), title);
-        doc.spans(x, 52.0, 38.0, Anchor::Start, &[(&format!("{mean:.1}"), color, 700), (&format!(" /{max:.0}"), t.ink2, 400)]);
+        let text = format!("{mean:.1} /{max:.0}");
+        let size = (col - 20.0) / (0.6 * text.chars().count() as f64);
+        doc.spans(x, 52.0, size.min(38.0), Anchor::Start, &[(&format!("{mean:.1}"), color, 700),
+            (&format!(" /{max:.0}"), t.ink2, 400)]);
         let track = col - 30.0;
         doc.rect(x, 64.0, track, 10.0, 5.0, t.well);
         if let Some((lo, _, hi)) = charts::spread(&values) {
