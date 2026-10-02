@@ -493,9 +493,6 @@ impl<'w, 'a> TargetPass<'w, 'a> {
                             &mut self.lane, &mut self.index)
                     }
                 })?;
-                if crate::shared::memory::chain::deferred() {
-                    crate::shared::memory::chain::fence_mark(self.upload.library(), layer % 2)?;
-                }
                 // No RefCell guard or bank reference survives into this await.
                 let completed = prepared.execute(transport, placement, guard.batch.image_mask()).await?;
                 if cooperative {

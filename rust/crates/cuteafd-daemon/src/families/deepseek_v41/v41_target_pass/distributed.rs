@@ -638,9 +638,6 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                     )
                 })?
             };
-            if crate::shared::memory::chain::deferred() {
-                crate::shared::memory::chain::fence_mark(device.library, layer % 2)?;
-            }
             #[cfg(test)]
             let prepared = if self.trace && std::env::var_os("CUTEAFD_TRACE_FFN").is_some()
                 && std::env::var("CUTEAFD_TRACE_LAYER").ok().map_or(true,
