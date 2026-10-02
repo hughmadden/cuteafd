@@ -110,8 +110,15 @@ async fn share_run_completes_and_locks_out_other_clients() {
             let response = agent.get(&format!("{base3}/v1/bench/runs/{id}/{file}")).call().unwrap();
             assert_eq!(response.status(), 200, "{file}");
         }
-        let status: Value = agent.get(&format!("{base3}/v1/bench/status")).call().unwrap().into_json().unwrap();
-        assert!(status["active"].is_null());
+        // The lock lifts once the progress ticker has joined, shortly after the stored status turns done.
+        let lifted = (0..50).any(|_| {
+            let status: Value = agent.get(&format!("{base3}/v1/bench/status")).call().unwrap().into_json().unwrap();
+            status["active"].is_null() || {
+                std::thread::sleep(Duration::from_millis(100));
+                false
+            }
+        });
+        assert!(lifted, "the run stayed active");
         let runs: Value = agent.get(&format!("{base3}/v1/bench/runs")).call().unwrap().into_json().unwrap();
         assert_eq!(runs["runs"].as_array().unwrap().len(), 1);
     }).await.unwrap();

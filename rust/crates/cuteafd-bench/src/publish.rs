@@ -285,20 +285,20 @@ mod tests {
         older.id = "older".into();
         for r in [&ok, &older] {
             let dir = crate::cli::default_dir(root.path(), r);
-            let dir = if r.id == "older" { dir.with_file_name("2026-10-01-smoke-1rtx-4spark") } else { dir };
+            let dir = if r.id == "older" { dir.with_file_name("2026-10-01-smoke-deepseek-v4-1-flash-1rtx-4spark") } else { dir };
             crate::cli::write_exports(r, &dir, &["json".into(), "svg".into()]).unwrap();
         }
-        let dir = root.path().join("benchmarks/deepseek_v41/2026-10-02-smoke-1rtx-4spark");
+        let dir = root.path().join("benchmarks/deepseek_v41/2026-10-02-smoke-deepseek-v4-1-flash-1rtx-4spark");
         let (readme, index, count) = publish(root.path(), &[dir]).unwrap();
         assert_eq!(count, 2);
         let readme = std::fs::read_to_string(readme).unwrap();
-        assert!(readme.contains("<img src=\"benchmarks/deepseek_v41/2026-10-02-smoke-1rtx-4spark/card.svg\""), "{readme}");
+        assert!(readme.contains("<img src=\"benchmarks/deepseek_v41/2026-10-02-smoke-deepseek-v4-1-flash-1rtx-4spark/card.svg\""), "{readme}");
         // One row per checkpoint × hardware: the newest wins.
         assert_eq!(readme.matches("| DeepSeek-V4.1-Flash (mxfp4) |").count(), 1, "{readme}");
         assert!(super::family_cards(&scan(root.path()).unwrap(), "deepseek_v41").contains("../../benchmarks/"));
         let page = std::fs::read_to_string(root.path().join("docs/models/deepseek_v41.md")).unwrap();
         assert!(page.contains("| v0 | 2026-10-02 | First release | <a href=\"../../benchmarks/"), "{page}");
-        assert!(readme.contains("benchmarks/deepseek_v41/2026-10-02-smoke-1rtx-4spark/report.svg"));
+        assert!(readme.contains("benchmarks/deepseek_v41/2026-10-02-smoke-deepseek-v4-1-flash-1rtx-4spark/report.svg"));
         assert!(readme.ends_with("rest\n"));
         let index = std::fs::read_to_string(index).unwrap();
         let first = index.find("2026-10-02").unwrap();

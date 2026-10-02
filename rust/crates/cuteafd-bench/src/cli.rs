@@ -37,8 +37,23 @@ fn authorize(request: ureq::Request, key: &Option<String>) -> ureq::Request {
 /// `benchmarks/<family>/<date>-<profile>-<hardware>`.
 pub fn default_dir(root: &Path, report: &Report) -> PathBuf {
     let family = report.server.family.clone().unwrap_or_else(|| "unknown".into());
-    root.join("benchmarks").join(family).join(format!("{}-{}-{}", crate::render::date(&report.created),
-        report.profile, report.server.hardware.slug()))
+    root.join("benchmarks").join(family).join(format!("{}-{}-{}-{}", crate::render::date(&report.created),
+        report.profile, model_slug(&report.server.model), report.server.hardware.slug()))
+}
+
+/// The checkpoint's last path segment, lowercase, runs of other characters as one `-`
+/// (two quants of one family on the same hardware and day get separate directories).
+fn model_slug(model: &str) -> String {
+    let name = model.trim_end_matches('/').rsplit('/').next().unwrap_or(model).to_lowercase();
+    let mut slug = String::new();
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.trim_end_matches('-').to_string()
 }
 
 /// Writes the exports of `report` into `dir`.
