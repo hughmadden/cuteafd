@@ -1,6 +1,6 @@
 //! OpenAI-compatible API over the MiMo V2 engine: continuous batching with
-//! one prefill per admitted request and one decode-shaped step for every
-//! active sequence, verifying copy-window drafts.
+//! independent prefill chunks paired when their existing single-lane shapes
+//! fit, and one decode-shaped step for every active sequence, verifying drafts.
 //!
 //! MiMo keeps no recurrent state: full layers write paged records and SWA
 //! layers a 256-slot ring that outlives the 128-token window by more than a
@@ -213,6 +213,7 @@ struct Prefill<'a> {
     plan: cuteafd_engine::prefix::PointPlan,
     /// Chunks prefilled so far.
     chunks: usize,
+    paired_chunks: usize,
     /// The client left mid-prefill: its prefilled rows are parked as a prompt snapshot.
     cancelled: bool,
     placement: super::engine::MimoPlacement,
@@ -518,63 +519,17 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             // A whole-prompt hit brings its first token's logits: nothing to prefill.
             let logits = admitted.after.and_then(|after| after.logits).map(|logits| logits.to_vec());
             let plan = if logits.is_some() { cuteafd_engine::prefix::PointPlan::default() } else { plan };
-            prefills.push(Prefill { job, constraint, tokens, done: resume, resume, plan, chunks: 0, cancelled: false,
+            prefills.push(Prefill { job, constraint, tokens, done: resume, resume, plan, chunks: 0, paired_chunks: 0, cancelled: false,
                 placement: admitted.placement, capacity, slot, logits, first: None, started: Instant::now(), busy: 0.0,
                 phases: [0.0; 2], ticket });
         }
         if prefills.due(!active.is_empty()) {
             // One chunk of each waiting prompt (whole prompts with --decode-share 0).
-            let finished = prefills.round(|p| {
-                if p.done == p.tokens.len() {
-                    return Ok(Chunk::Done);
-                }
-                if p.job.events.is_closed() {
-                    p.cancelled = true;
-                    anyhow::bail!("client went away");
-                }
-                let timer = Instant::now();
-                let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
-                let chunk = &p.tokens[p.done..end];
-                let retain = cache.enabled() && !probe::cold(&p.job.probe);
-                let (result, phases) = isolated_phases(&engine.profile, || engine.submit(|| -> Result<()> {
-                    let start = p.placement.len;
-                    let logits = engine.prefill_device(&mut p.placement, chunk, false, None, None)?;
-                    if end == p.tokens.len() {
-                        // The first token, while this prompt's logits are the workspace's.
-                        let logits = logits.context("prefill produced no logits")?;
-                        let mut batch = SelectBatch::default();
-                        batch.push_next(p.job.sampling, p.constraint.as_mut(), p.placement.len as u64)?;
-                        let selected = selector.select(&logits, &batch)?;
-                        p.first = Some(take(p.constraint.as_mut(), &selected[0])?);
-                        // The prompt snapshot's row (one row, only when snapshots are kept).
-                        p.logits = if retain { Some(logits.row_host(engine.library, 0)?) } else { None };
-                        if probe::wants_first(&p.job.probe) {
-                            probe::device_rows(engine.library, &p.job.probe, &logits, 0, 1, p.tokens.len())?;
-                        }
-                    }
-                    // The chunk's tapped tail becomes the drafter's context.
-                    if let (Some(drafter), Some(slot)) = (drafter, p.slot) {
-                        let n = chunk.len().min(super::dflash::TAP_ROWS);
-                        engine.submit(|| drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot,
-                            position: start + chunk.len() - n + r }).collect::<Vec<_>>()))?;
-                    }
-                    Ok(())
-                }));
-                p.done += chunk.len();
-                add_phases(&mut p.phases, phases);
-                p.busy += timer.elapsed().as_secs_f64();
-                p.ticket.prefill(chunk.len(), p.chunks, p.plan.chunks.len(), timer);
-                result?;
-                // Intermediate snapshot points this chunk reaches (off unless configured).
-                for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
-                    if let Err(error) = cache.capture(family, SnapshotKind::Prompt, &p.tokens[..point], &p.placement,
-                        After::default()) {
-                        tracing::warn!("snapshot point {point} not retained: {error:#}");
-                    }
-                }
-                p.chunks += 1;
-                Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
-            });
+            let finished = prefills.round_pairs(|a, b| {
+                let rows = [a, b].map(|p| p.plan.chunks.get(p.chunks).copied()
+                    .unwrap_or(p.tokens.len()).saturating_sub(p.done));
+                engine.can_prefill_pair(rows) && !a.job.events.is_closed() && !b.job.events.is_closed()
+            }, |batch| prefill_batch(engine, family, cache, selector, batch));
             if engine.is_terminal() {
                 let mut primary = None;
                 for (p, prefilled) in finished {
@@ -613,6 +568,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 let logits = p.logits.clone();
                 if resume < p.tokens.len() {
                     tracing::info!(tokens = p.tokens.len(), cached = resume,
+                        paired_chunks = p.paired_chunks,
                         elapsed_ms = p.started.elapsed().as_millis() as u64, busy_ms = (1e3 * p.busy) as u64,
                         tok_s = (p.tokens.len() - resume) as f64 / p.busy, gpu_wait_ms = (1e3 * p.phases[0]) as u64,
                         experts_ms = (1e3 * p.phases[1]) as u64, "prefill");
@@ -981,4 +937,123 @@ fn plan_drafts(active: &[Active<'_>], drafted: &[Option<super::dflash::Draft>], 
         counts[i] = n;
     }
     counts
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prefill_one(engine: &MimoEngine<'_>, family: &MimoPrefix<'_, '_>,
+    cache: &mut PrefixCache<CudaCopyEngine<'_>>, selector: &mut TokenSelector<'_>, p: &mut Prefill<'_>)
+    -> Result<Chunk> {
+    if p.done == p.tokens.len() {
+        return Ok(Chunk::Done);
+    }
+    if p.job.events.is_closed() {
+        p.cancelled = true;
+        anyhow::bail!("client went away");
+    }
+    let timer = Instant::now();
+    let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
+    let count = end - p.done;
+    let retain = cache.enabled() && !probe::cold(&p.job.probe);
+    let (result, phases) = isolated_phases(&engine.profile, || engine.submit(|| -> Result<()> {
+        let start = p.placement.len;
+        let logits = engine.prefill_device(&mut p.placement, &p.tokens[p.done..end], false, None, None)?;
+        consume_prefill_chunk(engine, selector, p, start, end, logits, retain, None)?;
+        Ok(())
+    }));
+    p.done += count;
+    add_phases(&mut p.phases, phases);
+    p.busy += timer.elapsed().as_secs_f64();
+    p.ticket.prefill(count, p.chunks, p.plan.chunks.len(), timer);
+    result?;
+    complete_prefill_chunk(family, cache, p)
+}
+
+fn complete_prefill_chunk(family: &MimoPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_>>,
+    p: &mut Prefill<'_>) -> Result<Chunk> {
+    // Intermediate snapshot points this chunk reaches (off unless configured).
+    for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
+        if let Err(error) = cache.capture(family, SnapshotKind::Prompt, &p.tokens[..point], &p.placement,
+            After::default()) {
+            tracing::warn!("snapshot point {point} not retained: {error:#}");
+        }
+    }
+    p.chunks += 1;
+    Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consume_prefill_chunk(engine: &MimoEngine<'_>, selector: &mut TokenSelector<'_>, p: &mut Prefill<'_>,
+    start: usize, end: usize, logits: Option<crate::shared::token_io::DeviceLogits>, retain: bool,
+    lane: Option<usize>) -> Result<()> {
+    if end == p.tokens.len() {
+        let logits = logits.context("prefill produced no logits")?;
+        let mut batch = SelectBatch::default();
+        batch.push_next(p.job.sampling, p.constraint.as_mut(), p.placement.len as u64)?;
+        let selected = selector.select(&logits, &batch)?;
+        p.first = Some(take(p.constraint.as_mut(), &selected[0])?);
+        p.logits = if retain { Some(logits.row_host(engine.library, 0)?) } else { None };
+        if probe::wants_first(&p.job.probe) {
+            probe::device_rows(engine.library, &p.job.probe, &logits, 0, 1, p.tokens.len())?;
+        }
+    }
+    if let (Some(drafter), Some(slot)) = (engine.drafter.as_ref(), p.slot) {
+        let count = end - p.done;
+        let n = count.min(super::dflash::TAP_ROWS);
+        let rows = (0..n).map(|r| ContextRow { tap_row: r, slot, position: start + count - n + r })
+            .collect::<Vec<_>>();
+        match lane {
+            Some(lane) => drafter.update_lane(lane, &rows)?,
+            None => drafter.update(&rows)?,
+        }
+    }
+    Ok(())
+}
+
+fn prefill_batch(engine: &MimoEngine<'_>, family: &MimoPrefix<'_, '_>,
+    cache: &mut PrefixCache<CudaCopyEngine<'_>>, selector: &mut TokenSelector<'_>, prompts: &mut [Prefill<'_>])
+    -> [Result<Chunk>; 2] {
+    // Recheck cancellation immediately before submission. A cancelled neighbour
+    // uses the existing independent cleanup; it never cancels the healthy one.
+    if prompts.len() != 2 || prompts.iter().any(|p| p.job.events.is_closed() || p.done == p.tokens.len()) {
+        let first = prefill_one(engine, family, cache, selector, &mut prompts[0]);
+        let second = if prompts.len() == 2 {
+            prefill_one(engine, family, cache, selector, &mut prompts[1])
+        } else { Ok(Chunk::Done) };
+        return [first, second];
+    }
+    let timer = Instant::now();
+    let (a, b) = prompts.split_at_mut(1);
+    let mut pair = [&mut a[0], &mut b[0]];
+    let ends = pair.each_ref().map(|p| p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len()));
+    let starts = pair.each_ref().map(|p| p.placement.len);
+    let counts = [ends[0] - pair[0].done, ends[1] - pair[1].done];
+    let (result, phases) = isolated_phases(&engine.profile, || engine.submit(|| -> Result<()> {
+        let [a, b] = &mut pair;
+        let logits = engine.prefill_pair_device([
+            (&mut a.placement, &a.tokens[a.done..ends[0]]),
+            (&mut b.placement, &b.tokens[b.done..ends[1]]),
+        ])?;
+        // Each head/tap bank remains live until its own consumer has queued.
+        // Context updates reuse scratch in stream order, with explicit drains.
+        for (i, logits) in logits.into_iter().enumerate() {
+            let retain = cache.enabled() && !probe::cold(&pair[i].job.probe);
+            consume_prefill_chunk(engine, selector, pair[i], starts[i], ends[i], logits, retain, Some(i))?;
+        }
+        Ok(())
+    }));
+    // The pair's elapsed host interval includes transport/compute waits. Split
+    // it equally only for additive bookkeeping, not as kernel attribution.
+    let busy = timer.elapsed().as_secs_f64() / 2.0;
+    for (i, p) in pair.into_iter().enumerate() {
+        p.done += counts[i];
+        p.paired_chunks += 1;
+        p.busy += busy;
+        add_phases(&mut p.phases, phases.map(|seconds| seconds / 2.0));
+        p.ticket.prefill(counts[i], p.chunks, p.plan.chunks.len(), timer);
+    }
+    match result {
+        Ok(()) => [complete_prefill_chunk(family, cache, &mut prompts[0]),
+            complete_prefill_chunk(family, cache, &mut prompts[1])],
+        Err(error) => [Err(error), Err(engine.terminal_error())],
+    }
 }

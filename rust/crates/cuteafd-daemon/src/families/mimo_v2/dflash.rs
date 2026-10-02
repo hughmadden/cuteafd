@@ -154,6 +154,13 @@ impl DflashConfig {
         -> Result<MimoDraftRuntimeLayout> {
         Ok(MimoDraftRuntimeLayout::new(self.weight_geometry(), mode, capacity, TAP_ROWS, FP8_ROWS)?)
     }
+
+    /// One additional activation bank; weights and context-update scratch are shared.
+    pub fn prefill_lane_tap_bytes(&self) -> Result<usize> {
+        TAP_ROWS.checked_mul(self.taps.len()).and_then(|n| n.checked_mul(self.hidden))
+            .and_then(|n| n.checked_mul(2)).map(|n| n.max(256))
+            .context("paired prefill tap bank size overflow")
+    }
 }
 
 fn draft_fp8_scratch<'a>(library: &'a NativeLibrary, layout: &MimoDraftRuntimeLayout)
@@ -263,6 +270,7 @@ pub(crate) struct MimoDrafter<'a> {
     layers: Vec<DraftLayer<'a>>,
     /// [TAP_ROWS, taps * hidden] BF16: the last step's tapped rows.
     pub taps: Dev<'a>,
+    first_lane_taps: Option<Dev<'a>>,
     fused: Dev<'a>,
     fused_norm: Dev<'a>,
     context_kv: Dev<'a>,
@@ -498,6 +506,7 @@ impl<'a> MimoDrafter<'a> {
             norm: tensor("norm.weight", &[h])?,
             layers,
             taps: zeroed(TAP_ROWS * taps * 2)?,
+            first_lane_taps: None,
             fused: zeroed(TAP_ROWS * h * 2)?,
             fused_norm: zeroed(TAP_ROWS * h * 2)?,
             context_kv: zeroed(TAP_ROWS * 2 * kv * 2)?,
@@ -523,12 +532,37 @@ impl<'a> MimoDrafter<'a> {
     /// Copies target layer output rows `[first, first + n)` of `hidden`
     /// ([rows, hidden] BF16) into tap rows `0..n` when `layer` is tapped.
     pub fn tap(&self, layer: usize, hidden: *const c_void, first: usize, n: usize) -> Result<()> {
+        self.tap_into(&self.taps, layer, hidden, first, n)
+    }
+
+    /// Called once after admission, while the enclosing engine owns failures.
+    /// The ordinary tap pointer remains stable for existing decode graphs.
+    pub fn prepare_prefill_lanes(&mut self) -> Result<()> {
+        if self.first_lane_taps.is_none() {
+            self.first_lane_taps = Some(DeviceAllocation::new(self.library, self.cfg.prefill_lane_tap_bytes()?)?);
+        }
+        Ok(())
+    }
+
+    pub fn tap_lane(&self, lane: usize, layer: usize, hidden: *const c_void, first: usize, n: usize) -> Result<()> {
+        self.tap_into(self.lane_taps(lane)?, layer, hidden, first, n)
+    }
+
+    fn lane_taps(&self, lane: usize) -> Result<&Dev<'a>> {
+        match lane {
+            0 => self.first_lane_taps.as_ref().context("paired prefill taps were not admitted"),
+            1 => Ok(&self.taps),
+            _ => anyhow::bail!("prefill tap lane {lane} is outside 0..2"),
+        }
+    }
+
+    fn tap_into(&self, taps: &Dev<'_>, layer: usize, hidden: *const c_void, first: usize, n: usize) -> Result<()> {
         let Some(index) = self.tap_index(layer) else { return Ok(()) };
         let h = self.cfg.hidden;
         ensure!(n <= TAP_ROWS, "{n} tapped rows exceed {TAP_ROWS}");
         // SAFETY: `hidden` holds first + n rows; the tap buffer TAP_ROWS rows.
         unsafe {
-            self.library.glm_dflash_tap(hidden.cast::<u8>().add(first * h * 2).cast(), self.taps.buffer.ptr, n, h,
+            self.library.glm_dflash_tap(hidden.cast::<u8>().add(first * h * 2).cast(), taps.buffer.ptr, n, h,
                 self.cfg.taps.len() * h, index * h, self.stream)
         }
     }
@@ -559,6 +593,21 @@ impl<'a> MimoDrafter<'a> {
 
     /// Writes the context K/V of committed tapped rows.
     pub fn update(&self, rows: &[ContextRow]) -> Result<()> {
+        self.update_from(&self.taps, rows)
+    }
+
+    /// Consume independent request banks in lane order. The context projection
+    /// scratch is reused; drain before overwriting its synchronous table uploads.
+    /// No captured graph or persistent target tap pointer changes here.
+    pub fn update_lane(&self, lane: usize, rows: &[ContextRow]) -> Result<()> {
+        let taps = self.lane_taps(lane)?;
+        // SAFETY: the engine owns this stream and both tap banks through its
+        // terminal guard; no pending peer wait remains after paired prefill.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        self.update_from(taps, rows)
+    }
+
+    fn update_from(&self, taps: &Dev<'_>, rows: &[ContextRow]) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -578,7 +627,7 @@ impl<'a> MimoDrafter<'a> {
         let s = self.stream;
         // SAFETY: every buffer holds TAP_ROWS rows of its width; the stream orders the chain.
         unsafe {
-            self.linear(at(&self.taps, first * width * 2), &self.fc, 0,
+            self.linear(at(taps, first * width * 2), &self.fc, 0,
                 self.fused.buffer.ptr, n, width, h)?;
             self.library.glm_dflash_rmsnorm(self.fused.buffer.ptr, self.hidden_norm.buffer.ptr,
                 self.fused_norm.buffer.ptr, n, h, c.eps, s)?;

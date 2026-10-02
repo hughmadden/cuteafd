@@ -236,6 +236,13 @@ pub(super) fn preflight(
                     args.draft_capacity(draft.block)?,
                 )?;
                 additional.extend(reservations.steady);
+                if transport_lanes == 2 && args.prefill_rows >= 2048 && args.mtp == 0
+                    && prefill_output == MimoPrefillOutput::LastRow {
+                    additional.push(MemoryReservation {
+                        name: "draft.prefill_first_lane_taps".into(),
+                        bytes: draft.prefill_lane_tap_bytes()? as u64,
+                    });
+                }
                 draft_packing = reservations.packing;
             }
             if backend == ExpertBackend::Local {
@@ -491,6 +498,15 @@ pub(super) fn transport_lanes(spark: bool) -> Result<usize> {
     }
 }
 
+fn workspace_shapes(rows: usize, lead: bool, spark: bool, lanes: usize, output: MimoPrefillOutput, mtp: usize)
+    -> Vec<(&'static str, bool, usize, bool)> {
+    let mut shapes = vec![("prefill", false, rows, lead), ("decode", true, super::engine::DECODE_ROWS, lead)];
+    if spark && lanes == 2 && rows >= 2048 {
+        shapes.push(("prefill_first_lane", false, rows, lead && mtp == 0 && output == MimoPrefillOutput::LastRow));
+    }
+    shapes
+}
+
 fn workspace_options(
     cfg: &MimoV2Config,
     args: &super::EngineArgs,
@@ -510,15 +526,7 @@ fn workspace_options(
 > {
     use cuteafd_loader::families::mimo_v2::MimoWorkspaceOptions;
     let lead = rank == 0;
-    let mut shapes = vec![
-        ("prefill", false, args.prefill_rows, lead),
-        ("decode", true, super::engine::DECODE_ROWS, lead),
-    ];
-    if spark && transport_lanes == 2 && args.prefill_rows >= 2048 {
-        // The first lead prefill lane has no vocabulary head; only the last
-        // lane publishes logits. Peer allocation keeps tiny lead-only buffers.
-        shapes.push(("prefill_first_lane", false, args.prefill_rows, false));
-    }
+    let shapes = workspace_shapes(args.prefill_rows, lead, spark, transport_lanes, prefill_output, args.mtp);
     shapes
         .into_iter()
         .map(|(name, decode, rows, with_head)| {
@@ -970,6 +978,31 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn independent_prefill_admits_two_lead_heads_and_no_peer_head() {
+        let last = MimoPrefillOutput::LastRow;
+        assert_eq!(workspace_shapes(4096, true, true, 2, last, 0), [
+            ("prefill", false, 4096, true), ("decode", true, 64, true),
+            ("prefill_first_lane", false, 4096, true),
+        ]);
+        assert!(workspace_shapes(4096, false, true, 2, last, 0).iter().all(|shape| !shape.3));
+        assert!(!workspace_shapes(4096, true, true, 2, MimoPrefillOutput::AllRows, 0)[2].3);
+        assert!(!workspace_shapes(4096, true, true, 2, last, 1)[2].3);
+        for (rows, spark, lanes) in [(4096, false, 2), (4096, true, 1), (1024, true, 2)] {
+            assert_eq!(workspace_shapes(rows, true, spark, lanes, last, 0).len(), 2);
+        }
+    }
+
+    #[test]
+    fn paired_tap_bank_admits_only_one_additional_bf16_activation_extent() {
+        let (mut cfg, _) = draft_fixture();
+        cfg.hidden = 4096;
+        cfg.taps = vec![9, 19, 29, 39, 49];
+        assert_eq!(cfg.prefill_lane_tap_bytes().unwrap(), 1024 * 5 * 4096 * 2);
+        cfg.hidden = usize::MAX;
+        assert!(cfg.prefill_lane_tap_bytes().is_err());
+    }
 
     #[test]
     fn failed_pool_report_includes_complete_physical_costs_without_host_capacity() {
