@@ -478,6 +478,9 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                 // this layer rewrites: wait until they ran (the GPU still has that
                 // layer's FFN queued, so it does not idle while this one is queued).
                 crate::shared::memory::chain::fence_wait(device.library, (layer - 1) % 2).await?;
+                // Let the other lane queue its layer too: lanes interleave per layer
+                // as they did when every layer waited on the host.
+                tokio::task::yield_now().await;
             }
             if layer != first {
                 unsafe {
