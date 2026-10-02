@@ -844,6 +844,15 @@ active admission deferral and active KV paging are separate remaining work.
     legacy/no-speculation comparison found divergent concurrent output
     (C1 matched); preserve that evidence, but qualify target quality and
     verifier/cache-state correctness directly on the two single-copy paths.
+    The private FP8 feature now passes original-reference quality, exact
+    prefix restoration, fixed-history repeat/graph/causal-anchor checks and
+    tool serving on both MiMo Pro reference layouts. One warmed serving
+    sample is recorded, not a final performance qualification. Repeated
+    concurrent serving still changes some responses in both representations;
+    the fixed-history checks do not prove all serving histories correct.
+    Checkpoint-driven defaults and shared per-rank prefill KV scratch are
+    being qualified separately. Native promotion still needs the final
+    interleaved measurements and V4.1 parity gates.
     Check exactness when arithmetic is preserved,
     readiness, C1/C16 decode and 8K prefill on both reference layouts; include
     every surviving copy and expanded scale layout in admission.
