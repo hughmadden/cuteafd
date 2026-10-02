@@ -21,6 +21,8 @@ pub struct RunOptions {
     pub root: PathBuf,
     pub api_key: Option<String>,
     pub quiet: bool,
+    /// Cancel the run and fail when it takes longer (a server too slow to finish).
+    pub deadline: Option<Duration>,
 }
 
 fn agent() -> ureq::Agent {
@@ -112,7 +114,13 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
     if !options.quiet {
         eprintln!("run {id} on {base}");
     }
-    let followed = follow(&base, &id, options.quiet);
+    let followed = follow(&base, &id, options.quiet, options.deadline);
+    if let Err(error) = &followed {
+        if error.downcast_ref::<Overdue>().is_some() {
+            let _ = authorize(agent.post(&format!("{base}/v1/bench/runs/{id}/cancel")), &options.api_key).call();
+            return Err(followed.unwrap_err()).with_context(|| format!("run {id} on {base}"));
+        }
+    }
     let served = followed.as_ref().ok().and_then(|_| agent.get(&format!("{base}/v1/bench/runs/{id}")).call().ok())
         .map(|response| response.into_json::<Report>().context("the finished report"));
     let report = match served {
@@ -144,11 +152,18 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
     Ok((report, dir))
 }
 
+/// A followed run passed its deadline.
+#[derive(Debug, thiserror::Error)]
+#[error("the run did not finish within {0} s")]
+struct Overdue(u64);
+
 /// How long a server may refuse connections before a followed run counts as lost.
 const UNREACHABLE: Duration = Duration::from_secs(60);
 
 /// Prints progress lines from the event stream until run `id` finishes.
-fn follow(base: &str, id: &str, quiet: bool) -> Result<()> {
+fn follow(base: &str, id: &str, quiet: bool, deadline: Option<Duration>) -> Result<()> {
+    let started = std::time::Instant::now();
+    let overdue = || deadline.filter(|d| started.elapsed() > *d).map(|d| Overdue(d.as_secs()));
     let events = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(60)).build();
     let mut last_line = String::new();
@@ -165,6 +180,9 @@ fn follow(base: &str, id: &str, quiet: bool) -> Result<()> {
                 if finished(base, id)? {
                     return Ok(());
                 }
+                if let Some(overdue) = overdue() {
+                    return Err(overdue.into());
+                }
                 let since = *unreachable.get_or_insert_with(std::time::Instant::now);
                 if since.elapsed() > UNREACHABLE {
                     bail!("the server has not answered for {} s: {error}", UNREACHABLE.as_secs());
@@ -177,6 +195,9 @@ fn follow(base: &str, id: &str, quiet: bool) -> Result<()> {
             }
         };
         for line in BufReader::new(response.into_reader()).lines() {
+            if let Some(overdue) = overdue() {
+                return Err(overdue.into());
+            }
             let Ok(line) = line else { break };
             let Some(data) = line.strip_prefix("data: ") else { continue };
             let Ok(event) = serde_json::from_str::<Value>(data) else { continue };

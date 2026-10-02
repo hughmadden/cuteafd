@@ -84,6 +84,9 @@ pub struct Entry {
     /// Seconds allowed for the launch to become ready.
     #[serde(default)]
     pub timeout_s: Option<u64>,
+    /// Seconds allowed for the benchmark run once ready (default 900).
+    #[serde(default)]
+    pub run_timeout_s: Option<u64>,
     /// Runs with nothing else at once (default: deepseek_v41 entries).
     #[serde(default)]
     pub exclusive: Option<bool>,
@@ -105,6 +108,7 @@ impl Entry {
             gpus: self.gpus.clone().or_else(|| defaults.gpus.clone()),
             sparks: self.sparks.clone().or_else(|| defaults.sparks.clone()),
             timeout_s: self.timeout_s.or(defaults.timeout_s),
+            run_timeout_s: self.run_timeout_s.or(defaults.run_timeout_s),
             exclusive: self.exclusive.or(defaults.exclusive),
             profile: self.profile.clone().or_else(|| defaults.profile.clone()),
         }
@@ -532,7 +536,8 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         };
         let options = crate::cli::RunOptions { url, profile, panels, passes: vec![],
             export: vec!["svg".into(), "card".into(), "json".into()], out: None, root: out_root.to_path_buf(),
-            api_key: std::env::var("CUTEAFD_API_KEY").ok(), quiet: true };
+            api_key: std::env::var("CUTEAFD_API_KEY").ok(), quiet: true,
+            deadline: Some(Duration::from_secs(entry.run_timeout_s.unwrap_or(900))) };
         let (report, dir) = crate::cli::run(&options)?;
         outcome.dir = Some(dir.display().to_string());
         Ok(report)
