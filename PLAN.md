@@ -628,6 +628,10 @@ The user chooses release cuts; development fixes below do not cut a release.
      i. V4 / V4.1 turn-end prefix-cache restore not byte-exact (reported,
         not gated).
      j. MiMo V2 Flash fidelity is the weakest that passes (KL 0.10, top-1 82%).
+        `73dfbbe` packages opt-in same-pin BF16 expert-input siblings;
+        `bbd9a6b` preflights their capacity and arithmetic contract before launch.
+        BF16 decode improves the diagnostic fidelity probe; serving defaults
+        stay FP8 pending tool/agentic, batch/state and reference-layout gates.
      k. Qwen 3.8 FP8 has no Spark expert package (173 GB, no one-RTX fit).
 5. **Spark expert kernels**: MiMo V2.6 Pro TP6 prefill is Spark-bound (~35 of
    ~42 ms per layer); GLM 5.3 verify is bound by distinct expert reads; NVFP4
