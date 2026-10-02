@@ -19,6 +19,7 @@ use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::families::mimo_v2::{MimoPrefillOutput, MimoV2Config};
 use cuteafd_loader::families::mimo_v2::draft_representation::{MimoDraftCapacity, MimoDraftRepresentation};
 use cuteafd_loader::families::mimo_v2::projection::MimoProjectionRepresentation;
+use cuteafd_loader::families::mimo_v2::weight_policy::{self, MimoDefaultPolicy};
 use cuteafd_loader::plan::checkpoint::Checkpoint;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -96,15 +97,20 @@ pub(crate) struct EngineArgs {
     /// covers every target ring slot). Does not widen a draft batch.
     #[arg(long)]
     pub draft_context_slots: Option<usize>,
-    /// Immutable drafter storage. Default preserves the checkpoint's weights;
-    /// fp8-only explicitly quantizes supported BF16 sources without calibration.
+    /// Default resident-weight policy: the qualified V2.6 Pro checkpoint uses
+    /// its measured single-copy FP8 head/O/embedded drafter. checkpoint keeps
+    /// source formats. Explicit per-weight options take precedence.
+    #[arg(long, value_enum, default_value_t = WeightPolicyArg::Auto)]
+    pub weight_policy: WeightPolicyArg,
+    /// Immutable drafter storage. Default follows --weight-policy;
+    /// fp8-only quantizes supported BF16 sources without calibration.
     #[arg(long, value_enum)]
     pub draft_representation: Option<DraftRepresentationArg>,
     /// Explicit drafter conversion (true: FP8-only, false: BF16-only).
-    /// With no option, preserve the checkpoint's weight format.
+    /// With no option, follow --weight-policy for this checkpoint/drafter.
     #[arg(long, action = clap::ArgAction::Set)]
     pub draft_fp8: Option<bool>,
-    /// Scale rule of the FP8 copies made from BF16 weights at load: amax /
+    /// Scale rule of the FP8 values packed from BF16 weights at load: amax /
     /// 448, the smallest power of two >= it (pow2), or per block whichever of
     /// the two leaves the smaller error (best).
     #[arg(long, value_enum, default_value_t = crate::shared::fp8_linear::Fp8Scales::Amax)]
@@ -135,11 +141,11 @@ pub(crate) struct EngineArgs {
     #[arg(long)]
     pub prefill_w8a16: bool,
     /// Explicit single-copy LM-head conversion: true selects E4M3, false BF16.
-    /// Default preserves the checkpoint format across target/MTP/drafter rows.
+    /// Default follows --weight-policy across target/MTP/drafter rows.
     #[arg(long, action = clap::ArgAction::Set)]
     pub fp8_head: Option<bool>,
     /// Explicit single-copy o_proj conversion: true selects E4M3, false BF16.
-    /// Default preserves the checkpoint format; prefill activations stayBF16.
+    /// Default follows --weight-policy; prefill activations stay BF16.
     #[arg(long, action = clap::ArgAction::Set)]
     pub fp8_o_proj: Option<bool>,
     /// Decode and verify steps replay one captured CUDA graph per layer segment
@@ -162,12 +168,22 @@ pub(crate) struct EngineArgs {
 pub(crate) enum DraftRepresentationArg {
     Bf16Only,
     Fp8Only,
-
+    /// Preserve this drafter's checkpoint format independently of target policy.
+    Checkpoint,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum WeightPolicyArg { Auto, Checkpoint }
 
 impl EngineArgs {
     fn draft_storage(&self) -> Result<MimoDraftRepresentation> {
         match self.draft_representation {
+            Some(DraftRepresentationArg::Checkpoint) => {
+                ensure!(self.draft_fp8.is_none(), "--draft-representation checkpoint conflicts with --draft-fp8; choose one source/conversion policy");
+                // Header resolution selects the source representation before
+                // native loading. The currently supported draft source is BF16.
+                Ok(MimoDraftRepresentation::Bf16Only)
+            }
             Some(DraftRepresentationArg::Fp8Only) => {
                 ensure!(self.draft_fp8 != Some(false), "--draft-representation fp8-only conflicts with --draft-fp8 false; use bf16-only");
                 Ok(MimoDraftRepresentation::Fp8Only)
@@ -212,8 +228,9 @@ mod draft_storage_tests {
     }
 
     #[test]
-    fn absent_weight_conversion_options_preserve_checkpoint_selection() {
+    fn absent_conversion_options_leave_selection_to_metadata_policy() {
         let args = args(&[]);
+        assert_eq!(args.weight_policy, WeightPolicyArg::Auto);
         assert_eq!(args.fp8_head, None);
         assert_eq!(args.fp8_o_proj, None);
         assert_eq!(args.draft_fp8, None);
@@ -295,9 +312,134 @@ mod source_format_tests {
         (args, checkpoint, cfg)
     }
 
+    fn qualified_fixture() -> (tempfile::TempDir, EngineArgs, Checkpoint, MimoV2Config) {
+        let value: serde_json::Value = serde_json::from_str(include_str!("../../../../cuteafd-loader/tests/fixtures/mimo-qualified-pro.json")).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let draft = directory.path().join("dflash");
+        std::fs::create_dir(&draft).unwrap();
+        std::fs::write(draft.join("config.json"), serde_json::to_vec(&value["draft_config"]).unwrap()).unwrap();
+        // A header-only fixture: policy resolution never reads payload or CUDA.
+        let mut header = value["draft_headers"].clone();
+        for tensor in header.as_object_mut().unwrap().values_mut() {
+            tensor["data_offsets"] = serde_json::json!([0,0]);
+        }
+        let bytes = serde_json::to_vec(&header).unwrap();
+        let mut file = (bytes.len() as u64).to_le_bytes().to_vec(); file.extend(bytes);
+        std::fs::write(draft.join("dflash_draft_model.safetensors"), file).unwrap();
+        let mut args = Command::try_parse_from(["mimo", "--snapshot", "/missing", "--native-lib", "/missing.so"])
+            .unwrap().engine;
+        args.snapshot = directory.path().into(); args.draft = Some(directory.path().into());
+        let mut tensors: Vec<_> = value["target_headers"].as_object().unwrap().iter().map(|(name, tensor)| {
+            CheckpointTensor { shard:"header-only.safetensors".into(), meta: SafetensorsTensorMetadata {
+                name:name.clone(), dtype:DType::from_safetensors(tensor["dtype"].as_str().unwrap()),
+                shape:tensor["shape"].as_array().unwrap().iter().map(|n| n.as_u64().unwrap() as usize).collect(),
+                byte_offset:0, byte_length:0,
+            }}
+        }).collect();
+        tensors.sort_by(|a,b| a.meta.name.cmp(&b.meta.name));
+        let cfg = MimoV2Config::from_hf(&value["target_config"]).unwrap();
+        let checkpoint = Checkpoint { snapshot:directory.path().into(), config:value["target_config"].clone(),
+            quantize_config:None, tensors, missing_shards:Vec::new(), shard_bytes:0 };
+        (directory, args, checkpoint, cfg)
+    }
+
+    #[test]
+    fn qualified_default_matches_explicit_fp8_bundle_in_a_renamed_local_copy() {
+        let (_directory, mut args, checkpoint, cfg) = qualified_fixture();
+        let automatic = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
+        assert_eq!(automatic.default_policy, MimoDefaultPolicy::QualifiedProFp8);
+        assert_eq!(automatic.head, MimoProjectionRepresentation::Fp8);
+        assert_eq!(automatic.draft, MimoDraftRepresentation::Fp8Only);
+        assert_eq!(automatic.output.len(), 70);
+        assert!(automatic.output.values().all(|&format| format == MimoProjectionRepresentation::Fp8));
+        args.fp8_head = Some(true); args.fp8_o_proj = Some(true); args.draft_fp8 = Some(true);
+        assert_eq!(resolve_weight_formats(&args, &checkpoint, &cfg).unwrap(), automatic);
+        assert!(validate_resolved_replay(&automatic, true).unwrap_err().to_string().contains("--weight-policy checkpoint"));
+    }
+
+    #[test]
+    fn qualified_default_keeps_explicit_checkpoint_and_bf16_overrides() {
+        let (_directory, mut args, checkpoint, cfg) = qualified_fixture();
+        args.weight_policy = WeightPolicyArg::Checkpoint;
+        let native = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
+        assert_eq!(native.head, MimoProjectionRepresentation::Bf16);
+        assert_eq!(native.draft, MimoDraftRepresentation::Bf16Only);
+        assert!(native.output.values().all(|&format| format == MimoProjectionRepresentation::Bf16));
+        validate_resolved_replay(&native, true).unwrap();
+        args.fp8_head = Some(true);
+        assert_eq!(resolve_weight_formats(&args, &checkpoint, &cfg).unwrap().head, MimoProjectionRepresentation::Fp8);
+        args.weight_policy = WeightPolicyArg::Auto; args.fp8_head = Some(false); args.fp8_o_proj = Some(false);
+        args.draft_representation = Some(DraftRepresentationArg::Bf16Only);
+        let explicit = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
+        assert_eq!((explicit.head, explicit.draft), (MimoProjectionRepresentation::Bf16, MimoDraftRepresentation::Bf16Only));
+        assert!(explicit.output.values().all(|&format| format == MimoProjectionRepresentation::Bf16));
+    }
+
+    #[test]
+    fn external_or_explicit_checkpoint_draft_does_not_inherit_target_conversion() {
+        let (_directory, mut args, checkpoint, cfg) = qualified_fixture();
+        args.draft_representation = Some(DraftRepresentationArg::Checkpoint);
+        assert_eq!(resolve_weight_formats(&args, &checkpoint, &cfg).unwrap().draft, MimoDraftRepresentation::Bf16Only);
+        args.draft_representation = None;
+        let external = tempfile::tempdir().unwrap();
+        for name in ["config.json", "dflash_draft_model.safetensors"] {
+            std::fs::copy(checkpoint.snapshot.join("dflash").join(name), external.path().join(name)).unwrap();
+        }
+        args.draft = Some(external.path().into());
+        let selected = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
+        assert_eq!(selected.head, MimoProjectionRepresentation::Fp8);
+        assert_eq!(selected.draft, MimoDraftRepresentation::Bf16Only);
+    }
+
+    #[test]
+    fn embedded_drafter_alias_keeps_qualified_default_but_mtp_keeps_source() {
+        let (directory, mut args, mut checkpoint, cfg) = qualified_fixture();
+        let alias = directory.path().join("embedded-draft-alias");
+        std::os::unix::fs::symlink(checkpoint.snapshot.join("dflash"), &alias).unwrap();
+        args.draft = Some(alias);
+        args.mtp = 1;
+        for (suffix, shape) in [
+            ("self_attn.o_proj", vec![cfg.hidden, cfg.heads * cfg.v_head_dim]),
+            ("eh_proj", vec![cfg.hidden, 2 * cfg.hidden]),
+            ("enorm", vec![cfg.hidden]), ("hnorm", vec![cfg.hidden]),
+            ("final_layernorm", vec![cfg.hidden]),
+        ] {
+            checkpoint.tensors.push(CheckpointTensor { shard:"header-only.safetensors".into(),
+                meta: SafetensorsTensorMetadata { name:format!("model.mtp.layers.0.{suffix}.weight"),
+                    dtype:DType::Bf16, shape, byte_offset:0, byte_length:0 } });
+        }
+        checkpoint.tensors.sort_by(|a,b| a.meta.name.cmp(&b.meta.name));
+        let selected = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
+        assert_eq!(selected.draft, MimoDraftRepresentation::Fp8Only);
+        assert_eq!(selected.output["model.mtp.layers.0.self_attn.o_proj.weight"], MimoProjectionRepresentation::Bf16);
+        assert_eq!(selected.output.values().filter(|&&format| format == MimoProjectionRepresentation::Fp8).count(), 70);
+    }
+
+    #[test]
+    fn changed_model_config_retains_source_formats_despite_pro_geometry() {
+        let (_directory, args, mut checkpoint, cfg) = qualified_fixture();
+        checkpoint.config["attention_value_scale"] = serde_json::json!(0.5);
+        let selected = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
+        assert_eq!(selected.default_policy, MimoDefaultPolicy::Checkpoint);
+        assert_eq!((selected.head, selected.draft), (MimoProjectionRepresentation::Bf16, MimoDraftRepresentation::Bf16Only));
+        assert!(selected.output.values().all(|&format| format == MimoProjectionRepresentation::Bf16));
+    }
+
+    #[test]
+    fn checkpoint_policy_and_draft_source_selector_are_explicit_cli_options() {
+        let mut args = Command::try_parse_from(["mimo", "--snapshot", "/missing", "--native-lib", "/missing.so",
+            "--weight-policy", "checkpoint", "--draft-representation", "checkpoint"]).unwrap().engine;
+        assert_eq!(args.weight_policy, WeightPolicyArg::Checkpoint);
+        assert_eq!(args.draft_representation, Some(DraftRepresentationArg::Checkpoint));
+        assert_eq!(args.draft_storage().unwrap(), MimoDraftRepresentation::Bf16Only);
+        args.draft_fp8 = Some(true);
+        assert!(args.draft_storage().unwrap_err().to_string().contains("conflicts with --draft-fp8"));
+    }
+
     #[test]
     fn mixed_target_and_mtp_sources_keep_independent_resident_formats() {
-        let (args, checkpoint, cfg) = fixture();
+        let (mut args, checkpoint, cfg) = fixture();
+        args.weight_policy = WeightPolicyArg::Checkpoint;
         let selected = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
         assert_eq!(selected.head, MimoProjectionRepresentation::Bf16);
         assert_eq!(selected.output["model.layers.0.self_attn.o_proj.weight"], MimoProjectionRepresentation::Bf16);
@@ -447,6 +589,7 @@ pub(crate) struct GoldenArgs {
 /// Immutable source-header selections shared by admission and allocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedWeightFormats {
+    pub default_policy: MimoDefaultPolicy,
     pub head: MimoProjectionRepresentation,
     pub output: std::collections::BTreeMap<String, MimoProjectionRepresentation>,
     pub draft: MimoDraftRepresentation,
@@ -456,6 +599,13 @@ impl ResolvedWeightFormats {
     pub fn any_fp8_output(&self) -> bool {
         self.output.values().any(|&format| format == MimoProjectionRepresentation::Fp8)
     }
+}
+
+fn validate_resolved_replay(formats: &ResolvedWeightFormats, replay: bool) -> Result<()> {
+    ensure!(!replay || (formats.head == MimoProjectionRepresentation::Bf16
+        && formats.draft == MimoDraftRepresentation::Bf16Only),
+        "--draft-replay requires separately loaded BF16 head/drafter; use --weight-policy checkpoint or explicit --fp8-head false --draft-representation bf16-only; FP8-only weights have no BF16 fallback");
+    Ok(())
 }
 
 fn projection_source(checkpoint: &Checkpoint, name: &str, fp8: Option<bool>) -> Result<MimoProjectionRepresentation> {
@@ -483,13 +633,19 @@ fn projection_source(checkpoint: &Checkpoint, name: &str, fp8: Option<bool>) -> 
 }
 
 fn resolve_weight_formats(args: &EngineArgs, checkpoint: &Checkpoint, cfg: &MimoV2Config) -> Result<ResolvedWeightFormats> {
-    let head = projection_source(checkpoint, "lm_head.weight", args.fp8_head)?;
+    let default_policy = if args.weight_policy == WeightPolicyArg::Checkpoint {
+        MimoDefaultPolicy::Checkpoint
+    } else { weight_policy::default_policy(checkpoint, cfg) };
+    let default_fp8 = (default_policy == MimoDefaultPolicy::QualifiedProFp8).then_some(true);
+    let head = projection_source(checkpoint, "lm_head.weight", args.fp8_head.or(default_fp8))?;
     let names = (0..args.layers.unwrap_or(cfg.layers).min(cfg.layers))
         .map(|layer| format!("model.layers.{layer}.self_attn.o_proj.weight"))
         .chain((0..args.mtp).map(|layer| format!("model.mtp.layers.{layer}.self_attn.o_proj.weight")));
     let mut output = std::collections::BTreeMap::new();
     for name in names {
-        let selected = projection_source(checkpoint, &name, args.fp8_o_proj)?;
+        // The measured exception covers target O matrices, not unqualified MTP.
+        let default = if name.starts_with("model.layers.") { default_fp8 } else { None };
+        let selected = projection_source(checkpoint, &name, args.fp8_o_proj.or(default))?;
         ensure!(args.split_device.is_none() || name.starts_with("model.mtp.") || selected != MimoProjectionRepresentation::Bf16
             || checkpoint.tensors.iter().find(|t| t.meta.name == name)
                 .is_some_and(|t| t.meta.dtype == cuteafd_core::DType::Bf16),
@@ -517,10 +673,27 @@ fn resolve_weight_formats(args: &EngineArgs, checkpoint: &Checkpoint, cfg: &Mimo
     }
     let native_draft = args.draft.as_deref().map(dflash::drafter_dir)
         .map(|dir| dflash::checkpoint_representation(&dir)).transpose()?;
-    let draft = if args.draft_representation.is_none() && args.draft_fp8.is_none() {
+    let draft = if args.draft_representation == Some(DraftRepresentationArg::Checkpoint) {
+        args.draft_storage()?;
         native_draft.unwrap_or(MimoDraftRepresentation::Bf16Only)
+    } else if args.draft_representation.is_none() && args.draft_fp8.is_none() {
+        let qualified_embedded = if default_fp8.is_some() {
+            args.draft.as_deref().map(dflash::drafter_dir)
+                .filter(|dir| {
+                    let embedded = checkpoint.snapshot.join("dflash");
+                    *dir == embedded || matches!((dir.canonicalize(), embedded.canonicalize()),
+                        (Ok(actual), Ok(expected)) if actual == expected)
+                })
+                .map(|dir| -> Result<bool> {
+                    let config = cuteafd_loader::plan::checkpoint::read_json(&dir.join("config.json"))?;
+                    let headers = cuteafd_loader::read_safetensors_metadata(&dir.join("dflash_draft_model.safetensors"))?;
+                    Ok(weight_policy::qualified_draft(&config, &headers))
+                }).transpose()?.unwrap_or(false)
+        } else { false };
+        if qualified_embedded { MimoDraftRepresentation::Fp8Only }
+        else { native_draft.unwrap_or(MimoDraftRepresentation::Bf16Only) }
     } else { args.draft_storage()? };
-    Ok(ResolvedWeightFormats { head, output, draft })
+    Ok(ResolvedWeightFormats { default_policy, head, output, draft })
 }
 
 pub(crate) struct Opened {
@@ -532,18 +705,28 @@ pub(crate) struct Opened {
 }
 
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
+    open_checked(args, false)
+}
+
+fn open_checked(args: &EngineArgs, bf16_replay: bool) -> Result<Opened> {
     // Validate immutable representation, capacity and kernel alignment before
     // the native module or any device allocation is admitted.
-    let representation = args.draft_storage()?;
-    if let Some(path) = &args.draft {
-        let cfg = dflash::DflashConfig::read(&dflash::drafter_dir(path))?;
-        args.draft_capacity(cfg.block)?;
-        cfg.weight_layout(representation)?;
-    }
+    args.draft_storage()?;
     let checkpoint = Checkpoint::open(&args.snapshot)?;
     ensure!(checkpoint.missing_shards.is_empty(), "checkpoint shards missing: {:?}", checkpoint.missing_shards);
     let cfg = MimoV2Config::read(&args.snapshot)?;
     let weight_formats = resolve_weight_formats(args, &checkpoint, &cfg)?;
+    validate_resolved_replay(&weight_formats, bf16_replay)?;
+    if let Some(path) = &args.draft {
+        let draft = dflash::DflashConfig::read(&dflash::drafter_dir(path))?;
+        args.draft_capacity(draft.block)?;
+        draft.weight_layout(weight_formats.draft)?;
+    }
+    tracing::info!(default_policy = ?weight_formats.default_policy,
+        head = ?weight_formats.head, draft = ?weight_formats.draft,
+        o_fp8_layers = weight_formats.output.values().filter(|&&format| format == MimoProjectionRepresentation::Fp8).count(),
+        o_bf16_layers = weight_formats.output.values().filter(|&&format| format == MimoProjectionRepresentation::Bf16).count(),
+        "selected resident weight formats");
     // The expert geometry is process-wide and must be fixed before the native
     // library loads (its expert helpers size rows from it).
     let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
@@ -931,7 +1114,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
 
 fn golden(args: GoldenArgs) -> Result<()> {
     args.engine.validate_draft_replay(args.draft_replay.is_some())?;
-    let opened = open(&args.engine)?;
+    let opened = open_checked(&args.engine, args.draft_replay.is_some())?;
     ensure!(args.draft_replay.is_none() || opened.weight_formats.head == MimoProjectionRepresentation::Bf16,
         "--draft-replay requires a separately loaded BF16 target head; checkpoint FP8 has no BF16 resident fallback");
     opened.with_engine(&args.engine, |engine| golden_run(&args, &opened, engine))

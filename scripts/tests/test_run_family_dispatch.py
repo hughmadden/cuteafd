@@ -272,8 +272,44 @@ def test_mimo_drafter_precision_preserves_auto_and_forwards_explicit_conversion(
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
     if expected is None:
         assert "--draft-fp8" not in launch
+        assert ("--draft-representation checkpoint" in launch) == (value == "auto")
     else:
         assert f"--draft-fp8 {expected}" in launch
+
+
+@pytest.mark.parametrize("policy, expected", [(None, None), ("auto", None), ("checkpoint", "checkpoint")])
+def test_mimo_weight_policy_is_resolved_by_runtime_and_explicit_checkpoint_is_forwarded(tmp_path, policy, expected):
+    config = {"model_type": "mimo_v2", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    keys = "" if policy is None else f"MIMO_WEIGHT_POLICY={policy}\n"
+    result = _family_launch_result(tmp_path, config, "arbitrary/local-mimo", keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    assert "--fp8-head" not in launch and "--fp8-o-proj" not in launch
+    if expected is None:
+        assert "--weight-policy" not in launch
+    else:
+        assert f"--weight-policy {expected}" in launch
+
+
+@pytest.mark.parametrize("key, option", [("MIMO_FP8_HEAD", "--fp8-head"), ("MIMO_FP8_O_PROJ", "--fp8-o-proj")])
+@pytest.mark.parametrize("value, expected", [("auto", None), ("on", "true"), ("off", "false")])
+def test_mimo_explicit_target_format_overrides_are_forwarded(tmp_path, key, option, value, expected):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    result = _family_launch_result(tmp_path, config, "test/mimo", f"{key}={value}\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    if expected is None:
+        assert option not in launch
+    else:
+        assert f"{option} {expected}" in launch
+
+
+@pytest.mark.parametrize("key", ["MIMO_WEIGHT_POLICY", "MIMO_FP8_HEAD", "MIMO_FP8_O_PROJ"])
+def test_invalid_mimo_weight_policy_rejects_before_services(tmp_path, key):
+    config = {"model_type": "mimo_v2", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    result = _family_launch_result(tmp_path, config, "test/mimo", f"{key}=bogus\n")
+    assert result.returncode != 0
+    assert "must be" in result.stderr and "docker run" not in result.stderr
 
 
 def test_mimo_invalid_drafter_precision_rejects_before_launch(tmp_path):

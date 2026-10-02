@@ -70,8 +70,9 @@ snapshot_of() {
 #   mtp      MiMo V2 Flash, Qwen 3.8: the checkpoint's native MTP layers,
 #            SPECULATOR_DEPTH drafts (default 1)
 #   dspark   DeepSeek V4
-# MiMo and GLM SPECULATOR_FP8=auto/unset preserve checkpoint weights; explicit
-# on quantizes supported drafter weights, off selects BF16. Pre-rename keys
+# MiMo unset selects the measured default only for its qualified Pro metadata;
+# SPECULATOR_FP8=auto preserves that drafter's checkpoint format. GLM auto/unset
+# preserves checkpoint weights. on converts, off selects BF16. Pre-rename keys
 # (DRAFT_MODEL_ID, DFLASH,
 # MTP, DSPARK, DRAFT_FP8) still work for one release.
 speculator="$(get SPECULATOR)"
@@ -93,6 +94,24 @@ esac
 draft_args=()
 family_args=()
 dspark_args=()
+if [[ $family == mimo_v2 ]]; then
+  case "$(get MIMO_WEIGHT_POLICY auto)" in
+    auto) ;; # The runtime and planner share the metadata qualifier.
+    checkpoint) family_args+=(--weight-policy checkpoint) ;;
+    *) echo "MIMO_WEIGHT_POLICY must be auto or checkpoint" >&2; exit 2 ;;
+  esac
+  for projection in HEAD O_PROJ; do
+    mode="$(get "MIMO_FP8_$projection")"
+    option=--fp8-head
+    [[ $projection != O_PROJ ]] || option=--fp8-o-proj
+    case "$mode" in
+      ""|auto) ;;
+      on) family_args+=("$option" true) ;;
+      off) family_args+=("$option" false) ;;
+      *) echo "MIMO_FP8_$projection must be auto, on or off" >&2; exit 2 ;;
+    esac
+  done
+fi
 case "$speculator" in
   dflash2)
     drafter="$(key SPECULATOR_MODEL_ID DRAFT_MODEL_ID)"
@@ -202,8 +221,9 @@ if [[ $serve != serve-dsv4 ]]; then
   [[ -z "$(get FP8_SCALES)" ]] || family_args+=(--fp8-scales "$(get FP8_SCALES)")
   if [[ ${#draft_args[@]} -gt 0 ]]; then
     if [[ $family == mimo_v2 ]]; then
-      case "$(key SPECULATOR_FP8 DRAFT_FP8 auto)" in
-        ""|auto) ;;
+      case "$(key SPECULATOR_FP8 DRAFT_FP8)" in
+        "") ;;
+        auto) family_args+=(--draft-representation checkpoint) ;;
         on) family_args+=(--draft-fp8 true) ;;
         off) family_args+=(--draft-fp8 false) ;;
         *) echo "MiMo SPECULATOR_FP8/DRAFT_FP8 must be auto, on or off" >&2; exit 2 ;;
