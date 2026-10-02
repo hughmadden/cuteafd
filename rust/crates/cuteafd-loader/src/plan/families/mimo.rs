@@ -182,13 +182,14 @@ impl Family for MiMo {
                 Some(Hint {
                     what: format!("sigmoid top-{k} routed experts, no shared expert, MXFP4 (packed E2M1 U8 [N, K/2], \
                         even element low nibble, UE8M0 U8 [N, K/32]): H {h}, I {i}, {e} experts"),
-                    how: format!("Exact family `mimop:fp8` (b12x fp8_moe weights=mxfp4: E2M1 x 2^(s-127) widened \
-                        to BF16, BF16 MMA; packages fp8-mimop tp1 coordinator, tp6/tp2 Spark, \
+                    how: format!("Exact family `mimop:fp8` (b12x fp8_moe weights=mxfp4: E2M1 x 2^(s-127); \
+                        packages fp8-mimop tp1 coordinator, tp6/tp2 Spark, \
                         python/tools/aot/package_fp8_moe_aot.py --geometry mimop [--cross-sm121]). Spark layout TP6 \
                         over six ranks: whole 32-blocks per rank ({widest}/{} rows) zero-padded to {padded}, \
                         {:.1} GiB per rank (TP2xEP3: {:.1} GiB, but a decode step reads all of a row's experts \
-                        that land on one EP group). Missing: an MXFP4 streaming/TMA GEMM route for large \
-                        prefill steps (the grouped GEMV serves every row count).",
+                        that land on one EP group). The SM121 Spark package streams MXFP8 x MXFP4 gate/up \
+                        above 640 live rows; smaller row counts use the grouped route. The down projection \
+                        consumes BF16 SwiGLU output and widens MXFP4 weights for BF16 MMA.",
                         widest - 32, per_rank(padded), per_rank(i / 2) / 3.0),
                 })
             }
