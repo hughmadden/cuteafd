@@ -762,6 +762,11 @@ active admission deferral and active KV paging are separate remaining work.
    gate; it does not extend active GPU KV capacity. Generic admission deferral
    now passes the MiMo pressure/host-restore gate; active KV paging/offload
    remains separate work.
+   MiMo's private runtime admission candidate rejects an impossible one-RTX
+   request before module/weight loading and preserves explicit small-pool
+   outputs. Its two-RTX startup check found that capturing all decode shapes
+   exceeds the provisional runtime reservation. Account for the measured
+   module, head-initialization and graph costs before promoting this planner.
 8. **NVFP4 follow-ups**: native per-tensor FP8 decode with static scales.
    **Revisit W4A4 for `nvidia/DeepSeek-V4.1-Flash-NVFP4`** (TJ): V4.1's own
    NVFP4 path keeps the ds41rt 44-slot W4A4 family opt-in because ds41rt
@@ -824,6 +829,11 @@ active admission deferral and active KV paging are separate remaining work.
     threshold or a standalone rejection criterion. Target verification,
     final-output correctness and cache-state contracts remain mandatory.
     Eliminate wasted duplicate representations whichever precision wins.
+    The private single-copy candidates preserve the one-RTX target golden
+    logits. Their serving comparison first found divergent concurrent output
+    between the unchanged legacy drafter and no speculation (C1 matches).
+    Separate batch-dependent target arithmetic from verifier/state defects
+    using identical token histories before selecting a representation.
     Check exactness when arithmetic is preserved,
     readiness, C1/C16 decode and 8K prefill on both reference layouts; include
     every surviving copy and expanded scale layout in admission.
