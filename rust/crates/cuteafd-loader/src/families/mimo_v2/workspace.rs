@@ -5,6 +5,19 @@ use super::{MimoAttention, MimoKvCache, MimoV2Config};
 use crate::serving_capacity::CacheGeometryError;
 use cuteafd_core::serving_capacity::MemoryReservation;
 
+/// Immutable prefill output contract. Decode/verify always retain every row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MimoPrefillOutput {
+    LastRow,
+    AllRows,
+}
+
+impl MimoPrefillOutput {
+    pub fn logits_rows(self, rows: u64, decode: bool, with_head: bool) -> u64 {
+        if !with_head { 0 } else if decode || self == Self::AllRows { rows } else { 1 }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MimoAttentionWorkspace {
     /// Current engine geometry, including global-width peer/lane buffers.
@@ -25,6 +38,7 @@ pub struct MimoWorkspaceOptions {
     pub pool_pages: u64,
     pub kv_cache: MimoKvCache,
     pub attention: MimoAttentionWorkspace,
+    pub prefill_output: MimoPrefillOutput,
     /// Maximum scratch of every applicable native program at this shape.
     pub native_scratch_bytes: u64,
     pub head_workspace_bytes: u64,
@@ -36,6 +50,8 @@ macro_rules! workspace_buffers {
         pub struct MimoWorkspaceLayout {
             $(pub $field: u64,)+
             pub router_host: u64,
+            /// Shape of the logits allocation and vocabulary-head handle.
+            pub logits_rows: u64,
         }
 
         impl MimoWorkspaceLayout {
@@ -109,7 +125,9 @@ impl MimoWorkspaceLayout {
             as u64;
         let lead_only = |bytes| if options.lead { bytes } else { 256 };
         let page_table_rows = if options.decode { t } else { 1 };
+        let logits_rows = options.prefill_output.logits_rows(t, options.decode, options.with_head);
         let layout = Self {
+            logits_rows,
             h: bytes("MiMo hidden rows", &[t, h, 2])?,
             x: bytes("MiMo normalized rows", &[t, h, 2])?,
             query: bytes(
@@ -141,7 +159,7 @@ impl MimoWorkspaceLayout {
             page_table: bytes("MiMo page table", &[page_table_rows, options.pool_pages, 4])?,
             scratch: options.native_scratch_bytes.max(256),
             logits: if options.with_head {
-                bytes("MiMo logits", &[t, cfg.vocab_size as u64, 4])?
+                bytes("MiMo logits", &[logits_rows, cfg.vocab_size as u64, 4])?
             } else {
                 256
             },
@@ -204,8 +222,51 @@ mod tests {
             pool_pages: 1 << 14,
             kv_cache: MimoKvCache::Int8,
             attention: MimoAttentionWorkspace::Global,
+            prefill_output: MimoPrefillOutput::AllRows,
             native_scratch_bytes: 16 << 20,
             head_workspace_bytes: 32 << 20,
+        }
+    }
+
+    #[test]
+    fn serving_prefill_head_and_allocation_admit_exactly_one_row() {
+        let mut raw = mimo_pro_config();
+        raw["vocab_size"] = serde_json::json!(152576);
+        let cfg = MimoV2Config::from_hf(&raw).unwrap();
+        let full = MimoWorkspaceLayout::new(&cfg, options()).unwrap();
+        let last = MimoWorkspaceLayout::new(&cfg, MimoWorkspaceOptions {
+            prefill_output: MimoPrefillOutput::LastRow, ..options()
+        }).unwrap();
+        assert_eq!((full.logits_rows, last.logits_rows), (4096, 1));
+        assert_eq!(last.logits, 152576 * 4);
+        let saved = 4095 * 152576 * 4;
+        assert_eq!(full.logits - last.logits, saved);
+        assert_eq!(full.device_bytes().unwrap() - last.device_bytes().unwrap(), saved);
+        for ((name, before), (after_name, after)) in full.device_buffers().zip(last.device_buffers()) {
+            assert_eq!(name, after_name);
+            if name != "logits" { assert_eq!(before, after, "{name}"); }
+        }
+        assert_eq!(last.reservations("prefill").iter().map(|r| r.bytes).sum::<u64>(), last.device_bytes().unwrap());
+    }
+
+    #[test]
+    fn last_row_selection_preserves_decode_verify_and_headless_lanes() {
+        for raw in [mimo_flash_config(), mimo_pro_config()] {
+            let cfg = MimoV2Config::from_hf(&raw).unwrap();
+            for rows in [1, 64, 1024, 4096] {
+                for decode in [false, true] {
+                    let full = MimoWorkspaceLayout::new(&cfg, MimoWorkspaceOptions { rows, decode, ..options() }).unwrap();
+                    let last = MimoWorkspaceLayout::new(&cfg, MimoWorkspaceOptions {
+                        rows, decode, prefill_output: MimoPrefillOutput::LastRow, ..options()
+                    }).unwrap();
+                    assert_eq!(last.logits_rows, if decode { rows } else { 1 });
+                    if decode { assert_eq!(full, last); }
+                    let headless = MimoWorkspaceLayout::new(&cfg, MimoWorkspaceOptions {
+                        rows, decode, with_head: false, prefill_output: MimoPrefillOutput::LastRow, ..options()
+                    }).unwrap();
+                    assert_eq!((headless.logits_rows, headless.logits, headless.head_workspace), (0, 256, 256));
+                }
+            }
         }
     }
 

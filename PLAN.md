@@ -548,6 +548,13 @@ startup admission will use. Split peer workspaces and fully split target
 prefill use their assigned attention heads, including INT8 prefill BF16
 shadows; lead decode retains global geometry for unsplit MTP. The change
 passed exact full-model restore, pipeline and continuation checks.
+Serving also admits only the final prefill logits row; diagnostic engines
+retain all rows, and decode/verification keep their full output extent.
+The smaller allocation passes both reference layouts' exact logits/KV checks,
+split-rank cache restores, continuation and serving with speculation on/off.
+Unsupported explicit MiMo head splits now fail before loading, and stream
+cleanup preserves the primary error. Cancelling queued peer waits after a
+failed split-rank submission remains separate open work.
 
 Next: startup must consume the same resolved pool/context/state values before
 loading weights, with actual weight conversions, all lane/workspace shapes,

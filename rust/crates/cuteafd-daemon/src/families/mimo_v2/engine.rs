@@ -39,7 +39,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::families::mimo_v2::{MimoAttention, MimoKvCache, MimoV2Config,
-    MimoAttentionWorkspace, MimoWorkspaceLayout, MimoWorkspaceOptions};
+    MimoAttentionWorkspace, MimoPrefillOutput, MimoWorkspaceLayout, MimoWorkspaceOptions};
 use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -258,6 +258,7 @@ impl Allocator {
 
 struct Workspace<'a> {
     rows: usize,
+    logits_rows: usize,
     h: Dev<'a>,
     x: Dev<'a>,
     query: Dev<'a>,
@@ -347,6 +348,7 @@ pub(crate) struct MimoEngine<'a> {
     pub stream: *mut c_void,
     pub max_context: usize,
     pub prefill_rows: usize,
+    prefill_output: MimoPrefillOutput,
     pub pages: usize,
     pub rings: usize,
     /// Program family of the checkpoint's geometry (`mimo`, `mimop`).
@@ -438,7 +440,8 @@ impl<'a> MimoEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: MimoV2Config,
         weights: MimoWeights<'a>, stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize,
-        rings: usize, embedding: TokenEmbedding<'a>, kv_cache: MimoKvCache) -> Result<Self> {
+        rings: usize, embedding: TokenEmbedding<'a>, kv_cache: MimoKvCache,
+        prefill_output: MimoPrefillOutput) -> Result<Self> {
         let family = cfg.program_family()?;
         // Layers loaded as head-split shares carry half the heads (see `attach_peer`).
         let ranks = if weights.layers.iter().any(|l| l.split) { 2 } else { 1 };
@@ -464,7 +467,8 @@ impl<'a> MimoEngine<'a> {
         }).collect::<Result<Vec<_>>>()?;
         let table = |theta: f64| rope_table(library, cfg.rope_dim, theta, max_context);
         let (cos_sin_full, cos_sin_swa) = (table(cfg.full_rope_theta)?, table(cfg.swa_rope_theta)?);
-        Ok(Self { quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, pages, rings, family, device,
+        Ok(Self { quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_output,
+            pages, rings, family, device,
             split_family, peer: None, exchange: None, kv, cos_sin_full,
             cos_sin_swa, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
             lane_workspace: RefCell::new(None), experts: None,
@@ -673,7 +677,7 @@ impl<'a> MimoEngine<'a> {
         let layout = MimoWorkspaceLayout::new(&self.cfg, MimoWorkspaceOptions {
             rows: t as u64, decode, lead, with_head, spark, max_context: self.max_context as u64,
             pool_pages: self.pages as u64, kv_cache: self.kv_cache,
-            attention, native_scratch_bytes: scratch as u64,
+            attention, prefill_output: self.prefill_output, native_scratch_bytes: scratch as u64,
             head_workspace_bytes: VOCABULARY_HEAD_WORKSPACE as u64,
         })?;
         let size = |bytes| usize::try_from(bytes).context("MiMo workspace size does not fit this process");
@@ -683,6 +687,7 @@ impl<'a> MimoEngine<'a> {
         self.library.copy_h2d(step_slots.buffer, bytes_of(&identity))?;
         Ok(Workspace {
             rows: t,
+            logits_rows: size(layout.logits_rows)?,
             h: self.alloc(size(layout.h)?)?,
             x: self.alloc(size(layout.x)?)?,
             query: self.alloc(size(layout.query)?)?,
@@ -712,7 +717,7 @@ impl<'a> MimoEngine<'a> {
             select: self.alloc(size(layout.select)?)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: if with_head {
-                Some(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, t as u32,
+                Some(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, size(layout.logits_rows)? as u32,
                     self.cfg.vocab_size as u32)? })
             } else {
                 None
@@ -751,6 +756,8 @@ impl<'a> MimoEngine<'a> {
     pub fn prefill_device(&self, placement: &mut MimoPlacement, tokens: &[u32], all_logits: bool,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<DeviceLogits>> {
+        ensure!(!all_logits || self.prefill_output == MimoPrefillOutput::AllRows,
+            "this MiMo engine admits last-row prefill logits; load an AllRows diagnostic engine for all_logits");
         let (t, start) = (tokens.len(), placement.len);
         let lanes = self.lanes_ready() && !all_logits && on_layer.is_none() && forced.is_none()
             && t >= 2 * MIN_LANE_ROWS;
@@ -1006,7 +1013,8 @@ impl<'a> MimoEngine<'a> {
         }
         let workspace = cell.borrow();
         let w = workspace.as_ref().context("workspace")?;
-        ensure!(t <= w.rows && logit_rows <= t && tokens.len() == t, "step exceeds the workspace");
+        ensure!(t <= w.rows && logit_rows <= t && logit_rows <= w.logits_rows && tokens.len() == t,
+            "step exceeds the admitted workspace or logits rows");
         // The head split's second GPU: its workspace of the same shape.
         let peer_workspace = match &self.peer {
             Some(peer) => {
@@ -1158,6 +1166,7 @@ impl<'a> MimoEngine<'a> {
     /// Logits of the last `n` of `t` rows of the final norm's output: the E4M3 head
     /// program for decode steps of up to `FP8_ROWS` rows, the cuBLAS head otherwise.
     fn launch_head(&self, w: &Workspace<'_>, t: usize, n: usize, decode: bool) -> Result<()> {
+        ensure!(n <= t && n <= w.logits_rows, "head exceeds admitted logits rows");
         // SAFETY: the rows start inside the final norm's output.
         let x = unsafe { w.x.buffer.ptr.cast::<u8>().add((t - n) * self.cfg.hidden * 2) }.cast::<c_void>();
         match &self.weights.head_fp8 {

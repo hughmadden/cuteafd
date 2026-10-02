@@ -13,7 +13,7 @@ mod host_gate;
 
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::families::mimo_v2::MimoV2Config;
+use cuteafd_loader::families::mimo_v2::{MimoPrefillOutput, MimoV2Config};
 use cuteafd_loader::plan::checkpoint::Checkpoint;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -253,6 +253,12 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
 impl Opened {
     /// Builds the engine and hands it to `body`.
     pub fn with_engine<T>(&self, args: &EngineArgs, body: impl FnOnce(&engine::MimoEngine<'_>) -> Result<T>) -> Result<T> {
+        self.with_engine_output(args, MimoPrefillOutput::AllRows, body)
+    }
+
+    /// Output storage is fixed before any workspace is admitted or captured.
+    pub fn with_engine_output<T>(&self, args: &EngineArgs, prefill_output: MimoPrefillOutput,
+        body: impl FnOnce(&engine::MimoEngine<'_>) -> Result<T>) -> Result<T> {
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         // An explicit layout is a requirement. Reject a missing head-split
         // export before loading modules, starting streams or allocating weights.
@@ -319,7 +325,7 @@ impl Opened {
             split_gib = format!("{:.2}", peer_bytes as f64 / (1u64 << 30) as f64), "MiMo coordinator weights resident");
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::MimoEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            args.max_context, args.prefill_rows, pages, args.rings, embedding, args.kv_cache.into())?;
+            args.max_context, args.prefill_rows, pages, args.rings, embedding, args.kv_cache.into(), prefill_output)?;
         engine.prefill_w8a8 = !args.prefill_w8a16;
         engine.decode_graphs = args.decode_graphs;
         {
