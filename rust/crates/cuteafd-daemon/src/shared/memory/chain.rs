@@ -166,14 +166,27 @@ pub(crate) fn fence_mark(library: &NativeLibrary, slot: usize) -> Result<()> {
     Ok(())
 }
 
-/// Host wait for fence `slot` (no-op when it was not marked since the last wait).
-pub(crate) fn fence_wait(library: &NativeLibrary, slot: usize) -> Result<()> {
+/// Waits for fence `slot` (no-op when it was not marked since the last wait),
+/// yielding between polls so another lane on this thread keeps running.
+pub(crate) async fn fence_wait(library: &NativeLibrary, slot: usize) -> Result<()> {
     let Some(current) = current() else { return Ok(()) };
     let mut slots = current.marked.get();
     let Some(index) = slots[slot].take() else { return Ok(()) };
     current.marked.set(slots);
-    // SAFETY: recorded by `fence_mark` on this chain's fence stream.
-    unsafe { library.cuda_event_synchronize(current.fences[index].events[slot]) }
+    let fence = current.fences[index];
+    // The fence stream holds only marks, and the next mark is queued after this
+    // wait: the stream is idle exactly when this slot's mark has completed.
+    loop {
+        let previous = library.cuda_get_device()?;
+        library.cuda_set_device(fence.device)?;
+        // SAFETY: the fence stream belongs to this chain.
+        let ready = unsafe { library.cuda_stream_query(fence.stream) };
+        library.cuda_set_device(previous)?;
+        if ready? {
+            return Ok(());
+        }
+        tokio::task::yield_now().await;
+    }
 }
 
 pub(crate) struct ChainHandle(Current);

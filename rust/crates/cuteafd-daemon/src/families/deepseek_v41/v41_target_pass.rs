@@ -403,7 +403,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         for layer in stage.windows() {
             if layer != stage.windows().start && crate::shared::memory::chain::deferred() {
                 // See the distributed pass: the previous layer's attention uploads ran.
-                crate::shared::memory::chain::fence_wait(self.upload.library(), (layer - 1) % 2)?;
+                crate::shared::memory::chain::fence_wait(self.upload.library(), (layer - 1) % 2).await?;
             }
             if layer != stage.windows().start {
                 let prepare_timing = Instant::now();
