@@ -747,8 +747,11 @@ active admission deferral and active KV paging are separate remaining work.
      to RTX-local experts where KL allows (Qwen FP8 local was +0.024: needs
      finer activation scales).
 10. **Resident weight representations** (TJ, 2026-10-02): close loader
-    shortcuts that permanently widen compact checkpoint tensors to BF16,
-    and remove unnecessary BF16/FP8 copies. Audit every target and drafter
+    shortcuts that permanently widen compact checkpoint tensors to BF16.
+    Keep exactly one resident BF16 or FP8 representation per weight set.
+    A duplicate is allowed only when genuinely tiny or justified by an
+    exceptionally large measured performance benefit; name its bytes and
+    measured justification explicitly. Audit every target and drafter
     family; report source dtype, resident dtype/layout, bytes and the consumer
     that requires each copy. Temporary loading buffers and in-kernel
     dequantization are separate from persistent weight storage.
@@ -759,8 +762,9 @@ active admission deferral and active KV paging are separate remaining work.
     generic BF16 operand loader can also widen FP8 o_proj/head sources.
     Cover prefill, decode, batched verify, context updates and graph/replay
     paths before releasing a required representation. Prefer native compact
-    kernels or bounded staging, with one resident weight representation
-    where possible. Do not silently change checkpoint precision to save
+    kernels or bounded staging, selecting the representation at startup.
+    Partially split matrices must not retain overlapping BF16/FP8 rows.
+    Do not silently change checkpoint precision to save
     memory: any added quantization needs its own golden NLL/KL (<=0.005 nat)
     and tool/agentic gates. Check exactness when arithmetic is preserved,
     readiness, C1/C16 decode and 8K prefill on both reference layouts; include
