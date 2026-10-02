@@ -8,6 +8,7 @@ mod speculate;
 mod expert_rows;
 mod header;
 mod precision;
+mod storage;
 pub(crate) mod weights;
 
 use anyhow::{ensure, Context, Result};
@@ -76,11 +77,12 @@ pub(crate) struct EngineArgs {
     /// shared-expert weights (E4M3 with FP32 128x128 block scales).
     #[arg(long)]
     pub fp8_snapshot: Option<PathBuf>,
-    /// FP8 KDA projections for decode rows, quantized per row at load.
+    /// Legacy KDA conversion request. channel/row128 are unsupported until
+    /// all-row consumers can use one resident representation; off preserves BF16.
     #[arg(long, value_enum, default_value = "off")]
     pub kda_fp8: fp8::KdaFp8,
-    /// Decode rows (<= 16) project to the vocabulary through an FP8 copy of the
-    /// LM head (per row x 128-K scales, quantized at load).
+    /// Legacy separate FP8 head request, unsupported until one shared head
+    /// representation covers target and DFlash across every row shape.
     #[arg(long)]
     pub fp8_head: bool,
     /// Numerics gate only: round the KDA projections through NVFP4 (group 16,
@@ -96,10 +98,9 @@ pub(crate) struct EngineArgs {
     pub exl3_window: usize,
     /// Prefill projections that run W8A8 block-FP8 GEMMs (E4M3 activations per
     /// row and 128-K block, FP32 scales): `mla` (q_a|kv_a, q_b, o_proj) and
-    /// `ffn` (dense and shared-expert MLPs) over the FP8 weights, the default
-    /// (the official FP8 release's served numerics; without them those run
-    /// W8A16), `kda-in` / `kda-o` (the KDA in-projection and o_proj, BF16 in the
-    /// release, over their per-row copies; needs --kda-fp8 row128), `all`, or
+    /// `ffn` (dense and shared-expert MLPs) over native FP8 weights, the default
+    /// (without them those run W8A16). `kda-in`, `kda-o` and `all` are
+    /// unsupported until immutable single-copy KDA consumers exist. Use
     /// `none` (MLA and FFN W8A16, KDA BF16).
     #[arg(long, value_enum, value_delimiter = ',', default_value = "mla,ffn")]
     pub fp8_prefill: Vec<Fp8PrefillGroup>,
@@ -306,6 +307,7 @@ impl Opened {
 }
 
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
+    storage::check(args)?;
     let checkpoint = Checkpoint::open(&args.snapshot)?;
     ensure!(checkpoint.missing_shards.is_empty(), "checkpoint shards missing: {:?}", checkpoint.missing_shards);
     let cfg = GlmNextConfig::read(&args.snapshot)?;
