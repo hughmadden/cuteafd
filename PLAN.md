@@ -342,7 +342,9 @@ FP4, most other weights BF16/FP8 as released. Design (study 2026-09-30):
   it reproduces NVIDIA's weights with unquantized activations); scale
   swizzle, when a kernel wants it, runs on the GPU at load
   (`nvfp4_scale.cu`, parameterized); no offline repack.
-- Dense NVFP4/per-tensor-FP8 parts dequantize to BF16 at load.
+- Dense NVFP4/per-tensor-FP8 parts should retain their compact checkpoint
+  representation. Existing load-time BF16 fallbacks are compatibility debt
+  to close under the v1 resident-weight work below.
 - V4.1: its NVFP4 release has exactly the official MXFP4 weights
   (power-of-two scales) → lossless downcast at load onto the existing W4A8
   path; the W4A4 44-slot family stays opt-in (ds41rt measured it slower).
@@ -739,10 +741,29 @@ active admission deferral and active KV paging are separate remaining work.
    - FP8 experts: extend W8A8 (MiMo GB10 gate/up) to the down projection and
      to RTX-local experts where KL allows (Qwen FP8 local was +0.024: needs
      finer activation scales).
-10. **Parked**: Spark-side reduce-scatter ([`work/spark-reduce`](https://github.com/tpurtell/cuteafd/tree/work/spark-reduce),
+10. **Resident weight representations** (TJ, 2026-10-02): close loader
+    shortcuts that permanently widen compact checkpoint tensors to BF16,
+    and remove unnecessary BF16/FP8 copies. Audit every target and drafter
+    family; report source dtype, resident dtype/layout, bytes and the consumer
+    that requires each copy. Temporary loading buffers and in-kernel
+    dequantization are separate from persistent weight storage.
+    MiMo Pro's target QKV and dense FFN already retain checkpoint FP8; its
+    target o_proj, embedding and head are BF16 in the checkpoint. The target
+    keeps additional FP8 o_proj/head copies, and DFlash retains BF16 weights
+    plus FP8 copies with a BF16 fallback above its skinny-row limit. MiMo's
+    generic BF16 operand loader can also widen FP8 o_proj/head sources.
+    Cover prefill, decode, batched verify, context updates and graph/replay
+    paths before releasing a required representation. Prefer native compact
+    kernels or bounded staging, with one resident weight representation
+    where possible. Do not silently change checkpoint precision to save
+    memory: any added quantization needs its own golden NLL/KL (<=0.005 nat)
+    and tool/agentic gates. Check exactness when arithmetic is preserved,
+    readiness, C1/C16 decode and 8K prefill on both reference layouts; include
+    every surviving copy and expanded scale layout in admission.
+11. **Parked**: Spark-side reduce-scatter ([`work/spark-reduce`](https://github.com/tpurtell/cuteafd/tree/work/spark-reduce),
    +3% one rail, +9–12% two rails at 200G); split intake
    ([`work/split-intake`](https://github.com/tpurtell/cuteafd/tree/work/split-intake), slower). Revisit only on new evidence.
-11. **Housekeeping**: prune agent test images on raptor; delete
+12. **Housekeeping**: prune agent test images on raptor; delete
     `~/.cache/cuteafd/builds/{n10-rel,bisect-rel}` on ostrich (root); refresh
     the inherited script-test failure ids in AGENTS.md. The stale fixture and
     sibling-checkout failures are fixed in `37adfc4`; current failing ids are empty.
