@@ -266,7 +266,7 @@ pub fn mimo_capacity_profiles(
 
 #[cfg(test)]
 mod tests {
-    use super::super::MimoAttentionWorkspace;
+    use super::super::{MimoAttentionWorkspace, MimoPrefillOutput};
     use super::*;
     use crate::plan::testing::{mimo_flash_config, mimo_flash_tensors, write_snapshot};
 
@@ -317,6 +317,7 @@ mod tests {
                                     pool_pages: 0,
                                     kv_cache: MimoKvCache::Int8,
                                     attention: MimoAttentionWorkspace::Global,
+                                    prefill_output: MimoPrefillOutput::AllRows,
                                     native_scratch_bytes: 16 << 20,
                                     head_workspace_bytes: 32 << 20,
                                 },
@@ -384,6 +385,53 @@ mod tests {
             .find(|r| r.name == "loading.temporary")
             .unwrap();
         assert_eq!(loading_extra.bytes, 4096 * 8192 * 2);
+    }
+
+    #[test]
+    fn serving_last_row_contract_removes_only_the_lead_prefill_logits() {
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(
+            dir.path(),
+            &mimo_flash_config(),
+            &mimo_flash_tensors(),
+            Some(1),
+        );
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
+        let mut diagnostic = options(2);
+        for rank in &mut diagnostic.ranks {
+            let mut first_lane = rank.workspaces[0].1;
+            first_lane.with_head = false;
+            rank.workspaces
+                .push(("prefill_first_lane".into(), first_lane));
+        }
+        let mut serving = diagnostic.clone();
+        for rank in &mut serving.ranks {
+            for (_, workspace) in &mut rank.workspaces {
+                workspace.prefill_output = MimoPrefillOutput::LastRow;
+            }
+        }
+        let all = mimo_capacity_profiles(&checkpoint, &cfg, weights(2), &diagnostic).unwrap();
+        let last = mimo_capacity_profiles(&checkpoint, &cfg, weights(2), &serving).unwrap();
+        assert_eq!(all.loading, last.loading);
+        assert_eq!(all.steady.host_prefix_bytes, last.steady.host_prefix_bytes);
+        for rank in 0..2 {
+            let before = &all.steady.devices[rank];
+            let after = &last.steady.devices[rank];
+            assert_eq!(before.pool_unit_bytes, after.pool_unit_bytes);
+            let mut changed = 0;
+            for (a, b) in before.reservations.iter().zip(&after.reservations) {
+                assert_eq!(a.name, b.name);
+                if a.bytes != b.bytes {
+                    changed += 1;
+                    assert_eq!(rank, 0);
+                    assert_eq!(a.name, "prefill.logits");
+                    assert_eq!(a.bytes - b.bytes, (4096 - 1) * cfg.vocab_size as u64 * 4);
+                    assert_eq!(b.bytes, cfg.vocab_size as u64 * 4);
+                }
+            }
+            assert_eq!(changed, usize::from(rank == 0));
+        }
     }
 
     #[test]

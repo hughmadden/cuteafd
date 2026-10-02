@@ -3,7 +3,7 @@
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::serving_capacity::MemoryReservation;
 use cuteafd_ffi::programs::Programs;
-use cuteafd_loader::families::mimo_v2::{MimoKvCache, MimoV2Config};
+use cuteafd_loader::families::mimo_v2::{MimoKvCache, MimoPrefillOutput, MimoV2Config};
 
 /// Opaque CUDA module/capture/library bookkeeping is provisionally bounded
 /// separately from the exact tensor allocation contract. It is not a measured
@@ -25,6 +25,7 @@ pub(super) fn preflight(
     programs: &Programs<'_>,
     split_device: Option<i32>,
     serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>,
+    prefill_output: MimoPrefillOutput,
 ) -> Result<Preflight> {
     use cuteafd_core::serving_capacity::{
         admit_device_reservations, resolve_capacity, CapacityPolicy, DeviceMemory,
@@ -93,8 +94,24 @@ pub(super) fn preflight(
         "MiMo provisional runtime reserve",
         &[args.runtime_reserve_mib, 1 << 20],
     )?;
-    let transport_lanes = transport_lanes(args.peers.is_some() && !args.local_experts)?;
-    let spark_ranks = match args.peers.as_deref() {
+    let routed_layers = cfg
+        .dense
+        .iter()
+        .take(layers)
+        .filter(|&&dense| !dense)
+        .count();
+    let backend = expert_backend(
+        routed_layers,
+        args.skip_experts,
+        args.local_experts,
+        args.peers.is_some(),
+    );
+    let transport_lanes = transport_lanes(backend == ExpertBackend::Spark)?;
+    let spark_ranks = match args
+        .peers
+        .as_deref()
+        .filter(|_| backend == ExpertBackend::Spark)
+    {
         Some(peers) => {
             let peers = peers
                 .split(',')
@@ -189,7 +206,7 @@ pub(super) fn preflight(
                     args.draft_fp8,
                 )?);
             }
-            if args.local_experts {
+            if backend == ExpertBackend::Local {
                 additional.extend(local_expert_reservations(opened, args, layers)?);
             }
         }
@@ -202,6 +219,7 @@ pub(super) fn preflight(
             transport_lanes,
             spark_ranks > 0,
             VOCABULARY_HEAD_WORKSPACE as u64,
+            prefill_output,
         )?;
         runtime.push(MimoRankRuntime {
             device: device_id,
@@ -251,9 +269,13 @@ pub(super) fn preflight(
     let capacity = resolve_capacity(policy, &profiles.steady, &memory).with_context(|| {
         format!("MiMo steady admission; complete per-GPU reservation contract {report}")
     })?;
-    let local_expert_budget = capacity.devices[0].reservations.iter()
+    let local_expert_budget = capacity.devices[0]
+        .reservations
+        .iter()
         .filter(|reservation| reservation.name.starts_with("experts.local_"))
-        .try_fold(0u64, |bytes, reservation| bytes.checked_add(reservation.bytes))
+        .try_fold(0u64, |bytes, reservation| {
+            bytes.checked_add(reservation.bytes)
+        })
         .context("MiMo admitted local expert size overflow")?;
     let intake_probe_bytes = if spark_ranks > 0 {
         match std::env::var("CUTEAFD_SPARK_INTAKE").as_deref() {
@@ -378,6 +400,29 @@ pub(super) fn mark_slots(
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpertBackend {
+    None,
+    Skip,
+    Local,
+    Spark,
+}
+
+/// Match `Opened::experts`: unused CLI sources must not reserve their storage.
+fn expert_backend(routed_layers: usize, skip: bool, local: bool, peers: bool) -> ExpertBackend {
+    if routed_layers == 0 {
+        ExpertBackend::None
+    } else if skip {
+        ExpertBackend::Skip
+    } else if local {
+        ExpertBackend::Local
+    } else if peers {
+        ExpertBackend::Spark
+    } else {
+        ExpertBackend::None
+    }
+}
+
 pub(super) fn transport_lanes(spark: bool) -> Result<usize> {
     if !spark {
         return Ok(1);
@@ -398,6 +443,7 @@ fn workspace_options(
     transport_lanes: usize,
     spark: bool,
     head_workspace_bytes: u64,
+    prefill_output: MimoPrefillOutput,
 ) -> Result<
     Vec<(
         String,
@@ -432,6 +478,7 @@ fn workspace_options(
                     attention: super::engine::attention_workspace_geometry(
                         rank, ranks, decode, true,
                     ),
+                    prefill_output,
                     native_scratch_bytes: workspace_native_scratch(
                         cfg,
                         programs,
@@ -824,6 +871,18 @@ pub(super) fn workspace_native_scratch(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reservations_follow_the_executed_expert_backend() {
+        use super::{expert_backend, ExpertBackend};
+        // Dense-only and skip diagnostics allocate neither a local store nor
+        // Spark intake even when inherited launch flags name both sources.
+        assert_eq!(expert_backend(0, false, true, true), ExpertBackend::None);
+        assert_eq!(expert_backend(1, true, true, true), ExpertBackend::Skip);
+        assert_eq!(expert_backend(1, false, true, true), ExpertBackend::Local);
+        assert_eq!(expert_backend(1, false, false, true), ExpertBackend::Spark);
+        assert_eq!(expert_backend(1, false, false, false), ExpertBackend::None);
+    }
+
     use super::*;
 
     #[test]
