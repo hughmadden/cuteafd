@@ -713,7 +713,9 @@ impl<'a> PeerReduction<'a> {
         // wait belongs only to this operation's producer, never another lane.
         let started = tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG)
             .then(std::time::Instant::now);
-        remote_producer.wait().await?;
+        if !crate::shared::memory::chain::deferred() {
+            remote_producer.wait().await?;
+        }
         let producer_us = started.map(|s| s.elapsed().as_micros() as u64);
         self.local_ready.record(local_producer)?;
         let ready = &self.local_ready;

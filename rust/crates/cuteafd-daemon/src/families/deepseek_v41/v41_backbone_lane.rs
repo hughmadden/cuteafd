@@ -350,13 +350,17 @@ impl LaneFfn<'_, '_, '_> {
         let output = complete_ffn(self.phase, async {
             let timing = std::time::Instant::now();
             router.set_local_mode(transport.has_local_layer(input.layer))?;
+            let ring = router.ring_capture();
             let routed = unsafe { if cooperative { router.execute_ffn_cooperative(input, image_mask).await? }
                 else { router.execute_ffn(input, image_mask)? } };
             if transport.has_local_layer(input.layer) {
+                ensure!(!(ring && tracing::enabled!(target: "cuteafd::route_policy", tracing::Level::DEBUG)),
+                    "route policy tracing reads host routes; it is not available with CUTEAFD_V41_DEVICE");
                 routed.validate_request_rows(rows)?;
                 let trace = tracing::enabled!(target: "cuteafd::route_policy", tracing::Level::DEBUG);
                 let mut temporary = Vec::new();
-                let mut captured = if let Some(capture) = route_capture.as_deref_mut() {
+                // Ring-captured routes are read after the pass (`drain_route_ring`).
+                let mut captured = if let Some(capture) = route_capture.as_deref_mut().filter(|_| !ring) {
                     Some(&mut capture[input.layer])
                 } else if trace { Some(&mut temporary) } else { None };
                 if let Some(output) = captured.as_deref_mut() {
@@ -935,6 +939,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub fn trace_stream(&self) -> *mut std::ffi::c_void { self.block.trace_stream() }
     pub fn set_route_capture(&mut self, enabled: bool) {
         self.capture_routes = enabled;
+        self.router.set_ring_capture(enabled);
         if enabled {
             self.query.enable_small_graph_shapes();
             if let Some(sparse)=&mut self.sparse { sparse.enable_small_graph_shapes(); }
@@ -950,6 +955,12 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         }
     }
     pub fn captured_routes(&self) -> &[Vec<[u32; 6]>] { &self.route_capture }
+    /// After a device-ordered pass drained: the ring-captured local layers'
+    /// routes into the capture; returns those layers.
+    pub fn drain_route_ring(&mut self) -> Result<Vec<usize>> {
+        if !self.capture_routes { return Ok(Vec::new()); }
+        self.router.drain_ring(&mut self.route_capture)
+    }
     /// Host FFN stage split of the last captured pass on this lane.
     pub fn captured_ffn_split(&self) -> FfnSplit { self.ffn_split }
     /// Opt-in TP2 attention or projection owners, whose peer transfers are

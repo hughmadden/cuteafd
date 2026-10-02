@@ -335,7 +335,12 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         // Every consumer after the pass (commit, dSpark, logits downloads) is
         // unscoped, so the chained work must be complete before returning.
         let drained = self.chain.as_ref().unwrap().drain();
-        result.and(drained)
+        let result = result.and(drained);
+        if result.is_ok() && crate::shared::memory::chain::device_enabled() {
+            // Device-ordered local layers left their captured routes in the router's ring.
+            self.lane.drain_route_ring()?;
+        }
+        result
     }
     async unsafe fn execute_phase_inner(&mut self, requests: &impl RequestAccess<'a>, batch: &mut RequestBatch,
         transport: &mut NativeTp4Wave<'a>, placement: u64, selected: &[usize],

@@ -147,6 +147,19 @@ impl<'a> Stream<'a> {
     pub(crate) fn drain(&self) -> Result<()> {
         self.device.run(|| unsafe { self.device.library.cuda_stream_synchronize(self.raw) })
     }
+    /// Completes this stream's queued work for later stages: a host wait
+    /// ([`Self::wait`]), or under [`super::chain::deferred`] a chain merge
+    /// (later stages join the chain head; no host wait).
+    pub(crate) async fn complete(&self) -> Result<()> {
+        if super::chain::deferred() {
+            return self.device.run(|| unsafe { super::chain::finish(self.device.library, self.raw) });
+        }
+        self.wait().await
+    }
+    /// Orders this stream after the chain head (no-op outside a chain scope).
+    pub(crate) fn join_chain(&self) -> Result<()> {
+        self.device.run(|| unsafe { super::chain::join(self.device.library, self.raw) })
+    }
     /// Retain queued work through cooperative completion or cancellation drain.
     pub(crate) async fn wait(&self) -> Result<()> {
         struct Drain<'s, 'a> { stream: &'s Stream<'a>, complete: bool }
@@ -196,7 +209,12 @@ impl Drop for Event<'_> {
 }
 
 /// One transfer direction for one lane; stream and event are allocated at startup.
-pub(crate) struct PeerTransfer<'a> { destination: Stream<'a>, ready: Event<'a> }
+pub(crate) struct PeerTransfer<'a> {
+    destination: Stream<'a>,
+    ready: Event<'a>,
+    /// SM copies for device-ordered passes ([`super::chain::deferred`]).
+    sm: Option<cuteafd_ffi::V41PeerCopy<'a>>,
+}
 impl<'a> PeerTransfer<'a> {
     pub fn new(source: Device<'a>, destination: Device<'a>) -> Result<Self> {
         ensure!(std::ptr::eq(source.library, destination.library) && source.id != destination.id,
@@ -205,7 +223,9 @@ impl<'a> PeerTransfer<'a> {
         let stream = Stream::new(destination)?;
         let ready = Event { device: source,
             raw: source.run(|| source.library.cuda_event_create())? };
-        Ok(Self { destination: stream, ready })
+        let sm = super::chain::device_enabled()
+            .then(|| destination.run(|| destination.library.v41_peer_copy())).transpose()?;
+        Ok(Self { destination: stream, ready, sm })
     }
 
     /// # Safety
@@ -245,11 +265,26 @@ impl<'a> PeerTransfer<'a> {
         }
         let mut drain = Drain { stream: &self.destination, complete: false };
         self.ready.device.run(|| unsafe { library.cuda_event_record(self.ready.raw, producer.raw) })?;
+        let deferred = super::chain::deferred();
+        let sm = self.sm.as_ref().filter(|_| deferred);
         self.destination.device.run(|| unsafe {
             library.cuda_stream_wait_event(self.destination.raw, self.ready.raw)?;
-            library.copy_peer_async(destination.buffer, source.buffer, bytes, self.destination.raw)?;
+            match sm {
+                // An SM copy waiting on its event holds no copy-engine queue.
+                Some(sm) => {
+                    // The destination's previous readers precede this write.
+                    super::chain::join(library, self.destination.raw)?;
+                    sm.launch(destination.buffer, source.buffer, bytes, self.destination.raw)?
+                }
+                None => library.copy_peer_async(destination.buffer, source.buffer, bytes, self.destination.raw)?,
+            }
             then(destination.buffer, self.destination.raw)
         })?;
+        if sm.is_some() {
+            self.destination.device.run(|| unsafe { super::chain::finish(library, self.destination.raw) })?;
+            drain.complete = true;
+            return Ok(());
+        }
         while !self.destination.ready()? { tokio::task::yield_now().await; }
         drain.complete = true;
         Ok(())

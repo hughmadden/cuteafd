@@ -78,6 +78,11 @@ impl LoadStream<'_> {
     /// Rebinding requires a completed owner, not a hidden host-thread wait.
     #[track_caller]
     pub(crate) fn require_complete(&self) -> Result<()> {
+        // A device-ordered pass orders every stage after the chain head, so a
+        // rebound owner's next work cannot overtake its previous readers.
+        if chain::deferred() {
+            return Ok(());
+        }
         let caller = std::panic::Location::caller();
         anyhow::ensure!(unsafe { self.library.cuda_stream_query(self.raw)? },
             "cannot rebind an unfinished V4.1 stream ({}:{})", caller.file(), caller.line());

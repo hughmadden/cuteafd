@@ -70,6 +70,23 @@ __global__ void wait_flag(const uint32_t* flag, uint32_t* state) {
   __syncthreads();
 }
 
+// Publishes a host mailbox: `words` descriptor words, then the next sequence
+// (release, system scope) for the host proxy spinning on `flag`. Work earlier
+// on the stream (the D2H copies of the payload) has completed when it runs.
+__global__ void host_signal(uint32_t* flag, uint32_t* send_state, uint32_t* descriptor, uint4 words) {
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    volatile uint32_t* out = descriptor;
+    out[0] = words.x;
+    out[1] = words.y;
+    out[2] = words.z;
+    out[3] = words.w;
+    __threadfence_system();
+    const uint32_t sequence = send_state[0] + 1;
+    send_state[0] = sequence;
+    store_release_sys(flag, sequence);
+  }
+}
+
 __global__ void add_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* out, uint64_t count) {
   const uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
   for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += stride)
@@ -156,7 +173,7 @@ extern "C" int32_t cuteafd_peer_exchange_initialize() {
   // first launch may wait for the device to idle, which a spinning wait never does.
   cudaFuncAttributes attributes{};
   for (const void* kernel : {reinterpret_cast<const void*>(push_signal), reinterpret_cast<const void*>(wait_flag),
-       reinterpret_cast<const void*>(add_bf16)}) {
+       reinterpret_cast<const void*>(add_bf16), reinterpret_cast<const void*>(host_signal)}) {
     const cudaError_t status = cudaFuncGetAttributes(&attributes, kernel);
     if (status != cudaSuccess) return status;
   }
@@ -192,6 +209,14 @@ extern "C" int32_t cuteafd_peer_push_signal(void* destination, const void* sourc
 extern "C" int32_t cuteafd_peer_wait(const uint32_t* flag, uint32_t* recv_state, void* stream) {
   if (!flag || !recv_state || !stream) return cudaErrorInvalidValue;
   wait_flag<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(flag, recv_state);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t cuteafd_host_signal(uint32_t* flag, uint32_t* send_state, uint32_t* descriptor,
+    const uint32_t* words, void* stream) {
+  if (!flag || !send_state || !descriptor || !words || !stream) return cudaErrorInvalidValue;
+  host_signal<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(flag, send_state, descriptor,
+      make_uint4(words[0], words[1], words[2], words[3]));
   return cudaGetLastError();
 }
 
