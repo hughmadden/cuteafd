@@ -607,10 +607,24 @@ steps into `work/p0`; tag `v1.0.0` when the list's top half is done.
    step, KL); bandwidth-bound either way, so expect parity — if so, make W4A4
    decode the default for checkpoints that declare it (one numerics path from
    prefill through verify).
-9. **Parked**: Spark-side reduce-scatter ([`work/spark-reduce`](https://github.com/tpurtell/cuteafd/tree/work/spark-reduce),
+9. **Activation precision policy** (TJ, 2026-10-02): converge on **A8
+   wherever quality holds** (FP8/MXFP8 activations on tensor cores, the speed
+   lever for prefill and wide verify) and **A4 only where the checkpoint
+   declares it** (NVIDIA ModelOpt NVFP4). Every A8 switch is gated on golden
+   NLL/KL (≤0.005 nat) plus a tool-eval/agentic check, per model.
+   - EXL3 × A8: EXL3 trellis experts (V4 Pro, GLM 5.3, GLM Flash, Qwen) run
+     A16 today. brandonmusic had unmerged MXFP8 EXL3 WIP; check upstream b12x
+     first, else build an EXL3 decode-to-FP8 tile path with MXFP8/FP8
+     activations in the fork.
+   - MXFP4 experts (V4.1 already W4A8; MiMo V2.6 Pro W4A16): A8 prefill for
+     MiMo Pro (Spark-bound prefill), and MXFP4 × MXFP8 MMAs for both.
+   - FP8 experts: extend W8A8 (MiMo GB10 gate/up) to the down projection and
+     to RTX-local experts where KL allows (Qwen FP8 local was +0.024: needs
+     finer activation scales).
+10. **Parked**: Spark-side reduce-scatter ([`work/spark-reduce`](https://github.com/tpurtell/cuteafd/tree/work/spark-reduce),
    +3% one rail, +9–12% two rails at 200G); split intake
    ([`work/split-intake`](https://github.com/tpurtell/cuteafd/tree/work/split-intake), slower). Revisit only on new evidence.
-10. **Housekeeping**: prune agent test images on raptor; delete
+11. **Housekeeping**: prune agent test images on raptor; delete
     `~/.cache/cuteafd/builds/{n10-rel,bisect-rel}` on ostrich (root); refresh
     the inherited script-test failure ids in AGENTS.md.
 
