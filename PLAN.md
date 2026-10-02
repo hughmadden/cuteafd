@@ -571,8 +571,12 @@ the remaining per-device budget. Admit weight-loading temporaries separately
 so released staging does not reduce steady capacity. Larger pools and smaller
 benchmark overrides remain explicit launch options. Report hardware shortfall
 and maximum-context feasibility; do not silently change precision or context.
-MiMo Pro's current one-RTX 2M configuration does not fit after mandatory
-workspaces/state; its two-RTX configuration is under qualification. Bounded
+MiMo Pro's checkpoint-preserving one-RTX 2M configuration does not fit after
+mandatory workspaces/state and fails admission before loading. The private
+two-RTX candidate passes physical allocation accounting through all decode
+graph shapes, full draft/masked sampling and bounded host restoration, with
+one shared prefill KV shadow per rank. Grammar ownership and the complete
+serving footprint still need qualification before changing defaults. Bounded
 host storage retains inactive exact prefixes for every supported family;
 active admission deferral and active KV paging are separate remaining work.
 
@@ -850,8 +854,12 @@ active admission deferral and active KV paging are separate remaining work.
     sample is recorded, not a final performance qualification. Repeated
     concurrent serving still changes some responses in both representations;
     the fixed-history checks do not prove all serving histories correct.
-    Checkpoint-driven defaults and shared per-rank prefill KV scratch are
-    being qualified separately. Native promotion still needs the final
+    The private checkpoint-driven default and shared per-rank prefill KV
+    scratch now match explicit BF16 target quality, logits, prefix restoration
+    and fixed-history state on both reference layouts. Actual two-lane prefill
+    matches serial prefill and continuation exactly on both layouts; the
+    earlier smaller-chunk gate exercised only the serial path. Native
+    promotion still needs the final
     interleaved measurements and V4.1 parity gates.
     The source audit also finds implicit BF16 quantization and duplicate
     matrices in Qwen attention/MTP, shared GLM/GLM Flash DFlash, and the
