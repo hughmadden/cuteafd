@@ -7,6 +7,7 @@ pub(crate) mod prefix;
 pub(crate) mod serve;
 pub(crate) mod weights;
 mod split;
+mod teardown;
 #[cfg(test)]
 mod host_gate;
 
@@ -365,17 +366,24 @@ impl Opened {
         }
         let result = body(&engine);
         drop(engine);
-        // SAFETY: the engine that used the streams is gone.
+        // SAFETY: both stream handles were created here and remain owned here.
+        // Cleanup follows engine teardown; queued-wait cancellation is separate.
         unsafe {
-            self.library.cuda_stream_destroy(stream)?;
-            if let Some((device, stream)) = peer_stream {
-                self.library.cuda_set_device(device)?;
-                let destroyed = self.library.cuda_stream_destroy(stream);
-                self.library.cuda_set_device(args.device)?;
-                destroyed?;
-            }
+            teardown::finish(result, peer_stream.is_some(), |step| match step {
+                teardown::CleanupStep::LeadStream => {
+                    self.library.cuda_set_device(args.device)?;
+                    self.library.cuda_stream_destroy(stream).map_err(Into::into)
+                }
+                teardown::CleanupStep::PeerStream => {
+                    if let Some((device, stream)) = peer_stream {
+                        self.library.cuda_set_device(device)?;
+                        self.library.cuda_stream_destroy(stream)?;
+                    }
+                    Ok(())
+                }
+                teardown::CleanupStep::RestoreDevice => self.library.cuda_set_device(args.device).map_err(Into::into),
+            })
         }
-        result
     }
 }
 
