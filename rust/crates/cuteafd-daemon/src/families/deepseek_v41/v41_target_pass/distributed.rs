@@ -300,7 +300,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         let result = unsafe { handle.scope(self.execute_unchained(requests, batch, transport, placement,
             selected, suffix, encoder, greedy)).await };
         let drained = self.chain.as_ref().unwrap().drain();
-        let result = result.and(drained);
+        let result = result.and(drained).and_then(|()| transport.get().check_device());
         if result.is_ok() && self.capture_routes && crate::shared::memory::chain::device_enabled() {
             // Device-ordered local layers left their routes in the routers' rings.
             for gpu in 0..self.lanes.len() {

@@ -30,6 +30,11 @@ pub mod mailbox {
     pub const DONE: usize = 64;
     /// u32 [4]: layer, rows, kind ([`super::DeviceWave::kind`]), top-k.
     pub const DESCRIPTOR: usize = 128;
+    /// u32: the sequence the GPU last published (its own counter, kept in
+    /// host memory so the stream of either GPU can publish).
+    pub const SEND_STATE: usize = 192;
+    /// u32: the completion sequence the GPU last waited for.
+    pub const RECV_STATE: usize = 224;
     /// Route ids (u32 [rows * topk]), then gate weights (f32 [rows * topk]).
     pub const ROUTES: usize = 256;
 
@@ -323,6 +328,7 @@ mod tests {
         assert_eq!(mailbox::wire(capacity, topk) % 256, 0);
         assert_eq!(mailbox::bytes(capacity, topk, wire), mailbox::wire(capacity, topk) + 64 * wire);
         assert!(mailbox::DONE >= mailbox::READY + 64 && mailbox::DESCRIPTOR >= mailbox::DONE + 64);
+        assert!(mailbox::SEND_STATE >= mailbox::DESCRIPTOR + 16 && mailbox::RECV_STATE + 4 <= mailbox::ROUTES);
     }
 
     #[test]

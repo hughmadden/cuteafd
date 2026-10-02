@@ -349,7 +349,10 @@ impl LaneFfn<'_, '_, '_> {
         let ffn_split = &mut self.ffn_split;
         let output = complete_ffn(self.phase, async {
             let timing = std::time::Instant::now();
-            router.set_local_mode(transport.has_local_layer(input.layer))?;
+            // Device waves read the routes on the device like local layers do.
+            let device_wave = !transport.has_local_layer(input.layer) && transport.device_wave(input.layer, rows.len());
+            let tp2_shared_device = transport.has_tp2_shared_layer(input.layer);
+            router.set_local_mode(transport.has_local_layer(input.layer) || device_wave)?;
             let ring = router.ring_capture();
             let routed = unsafe { if cooperative { router.execute_ffn_cooperative(input, image_mask).await? }
                 else { router.execute_ffn(input, image_mask)? } };
@@ -394,6 +397,20 @@ impl LaneFfn<'_, '_, '_> {
                         "native route policy observation");
                 }
                 return result;
+            }
+            if device_wave && tp2_shared_device {
+                let result = unsafe { transport.execute_device_tp2(input, &routed, placement, rows).await };
+                tracing::debug!(target: "cuteafd::timing", layer=input.layer, rows=rows.len(),
+                    enqueue_us=timing.elapsed().as_micros() as u64, "target device experts");
+                return result;
+            }
+            if device_wave {
+                // One GPU: the wave leaves first, the shared expert runs meanwhile.
+                let shared = shared.as_mut().context("decoder shared expert workspace absent")?;
+                let binding = unsafe { transport.device_dispatch(&routed, placement, rows)? };
+                let contribution = unsafe { shared.execute_ffn_cooperative(input).await? };
+                return unsafe { transport.device_collect(binding, contribution.values, routed.rows,
+                    input.values.device_id).await };
             }
             let tp2_shared = transport.has_tp2_shared_layer(input.layer);
             ensure!(shared.is_some() || tp2_shared, "decoder shared TP2 execution required");

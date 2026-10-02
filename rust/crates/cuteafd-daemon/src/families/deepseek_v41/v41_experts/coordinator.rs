@@ -183,6 +183,36 @@ pub(crate) struct NativeTp4Wave<'a> {
     /// Present only for an explicit `TP×EP` topology; legacy transports stay on
     /// the canonical request contract.
     native: Option<ReplicatedGroupPlanner>,
+    /// The device-driven exchange for verification waves (`CUTEAFD_V41_DEVICE=1`).
+    device: Option<DeviceExchange<'a>>,
+}
+
+/// Request metadata the proxy thread stamps on this lane's device waves: the
+/// pass's placement and its rows in block order (identical for every layer).
+#[derive(Default)]
+struct DeviceContext {
+    placement: u64,
+    rows: Vec<cuteafd_transport::ExpertProtocolV2RowDescriptor>,
+}
+
+struct DeviceExchange<'a> {
+    link: crate::shared::spark_intake::SparkDeviceLink<'a>,
+    context: std::sync::Arc<std::sync::Mutex<DeviceContext>>,
+    capacity: usize,
+}
+
+/// A V4.1 Spark request from a device wave (FP8 wire rows, top-6 routes).
+fn device_request(context: &DeviceContext, layer: u32, rows: usize,
+    routes: Vec<cuteafd_transport::ExpertProtocolV2RouteEntry>, wire: bytes::Bytes) -> Result<ExpertProtocolV2Request> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Distinct from the router's ids (which count up from 1).
+    static NEXT: AtomicU64 = AtomicU64::new(1 << 62);
+    ensure!(context.rows.len() == rows, "device wave of {rows} rows for a pass of {}", context.rows.len());
+    let mut request = ExpertProtocolV2Request::new_bytes(NEXT.fetch_add(1, Ordering::Relaxed), context.placement,
+        layer, 5120, cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32, context.rows.clone(), routes, wire)?;
+    request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    cuteafd_transport::expert::BackboneRequest::validate_owned(&request, rows as u32)?;
+    Ok(request)
 }
 impl<'a> NativeTp4Wave<'a> {
     pub(crate) fn spark_world(&self) -> usize { self.transport.world_size() }
@@ -342,7 +372,128 @@ impl<'a> NativeTp4Wave<'a> {
             tp2: None,
             paired: None,
             native,
+            device: None,
         })
+    }
+    /// Connects this lane's device-driven exchange (`capacity` rows per wave,
+    /// on the current GPU, which must be the transport's reduction GPU), for
+    /// legacy TP4 FP8 transports; `layer` is a Spark layer for the warm-up.
+    pub(crate) fn install_device_link(&mut self, peers: &[std::net::SocketAddr], capacity: usize, layer: u32,
+        config: cuteafd_transport::TcpTransportConfig) -> Result<()> {
+        ensure!(self.native.is_none() && self.paired.is_none(),
+            "the device exchange serves the legacy TP contract only");
+        let world = peers.len();
+        let executors = (0..world).map(|rank| cuteafd_transport::expert::v41_spark_executor_id(world, rank))
+            .collect::<Result<Vec<_>>>()?;
+        let warm_context = DeviceContext { placement: 0, rows: (0..capacity as u64).map(|row|
+            cuteafd_transport::ExpertProtocolV2RowDescriptor { row_id: row,
+                source_kind: cuteafd_transport::ExpertV2SourceKind::MtpVerify, source_request_id: 1,
+                token_position: row, route_offset: row as u32 * 6, route_count: 6 }).collect() };
+        let routes = (0..capacity * 6).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
+            row_index: (i / 6) as u32, expert_id: (i % V41_ROUTED_EXPERTS) as u32, gate_weight: 0.0 }).collect();
+        let warm = device_request(&warm_context, layer, capacity, routes, vec![0u8; capacity * 5280].into())?;
+        let context = std::sync::Arc::new(std::sync::Mutex::new(DeviceContext::default()));
+        let shared = std::sync::Arc::clone(&context);
+        let build: cuteafd_transport::expert::DeviceBuild = Box::new(move |wave, routes, wire| {
+            let context = shared.lock().map_err(|_| anyhow::anyhow!("device context poisoned"))?;
+            device_request(&context, wave.layer, wave.rows as usize, routes, wire)
+        });
+        let device = self.library.cuda_get_device()?;
+        let link = crate::shared::spark_intake::SparkDeviceLink::new(self.library, device, peers, &executors,
+            capacity, 6, 5280, V41_PARTIAL_ROW_BYTES as usize,
+            cuteafd_transport::TcpTransportConfig { timing: false, ..config }, Some(warm), build)?;
+        link.initialize_on(1 - device)?;
+        self.device = Some(DeviceExchange { link, context, capacity });
+        Ok(())
+    }
+    /// Whether a remote wave of `rows` goes through the device exchange.
+    pub(crate) fn device_wave(&self, layer: usize, rows: usize) -> bool {
+        self.device.as_ref().is_some_and(|d| rows <= d.capacity)
+            && (self.tp2.is_none() || self.has_tp2_shared_layer(layer)) && crate::shared::memory::chain::deferred()
+    }
+    /// After the pass drained: any device wave's error.
+    pub(crate) fn check_device(&self) -> Result<()> {
+        self.device.as_ref().map_or(Ok(()), |d| d.link.check())
+    }
+    /// Publishes a remote layer's wave from the device: the routes and wire
+    /// rows leave from a stream of the router's GPU once the chain reaches it.
+    ///
+    /// # Safety
+    /// [`Self::device_wave`] holds; the router output finished into the chain
+    /// and stays unchanged until the matching [`Self::device_collect`].
+    pub(crate) unsafe fn device_dispatch(&mut self,
+        routed: &crate::families::deepseek_v41::v41_backbone_router::RouterOutput<'_>,
+        placement: u64, rows: &[crate::families::deepseek_v41::v41_backbone_router::ExpertRow])
+        -> Result<crate::families::deepseek_v41::v41_attention_binding::QueryBinding> {
+        self.ready_rows = None;
+        let binding = routed.validate_request_rows(rows)?;
+        ensure!(!routed.request_nvfp4(), "the device exchange carries FP8 wire rows");
+        let device = self.device.as_ref().context("device exchange absent")?;
+        {
+            let mut context = device.context.lock().map_err(|_| anyhow::anyhow!("device context poisoned"))?;
+            context.placement = placement;
+            context.rows.clear();
+            context.rows.extend(rows.iter().enumerate().map(|(i, r)| cuteafd_transport::ExpertProtocolV2RowDescriptor {
+                row_id: i as u64, source_kind: r.kind, source_request_id: r.request_id, token_position: r.position,
+                route_offset: i as u32 * 6, route_count: 6 }));
+        }
+        let count = routed.rows as usize;
+        let (origin, device_id) = match self.tp2.as_deref() {
+            Some(tp2) => { let s = tp2.stream(routed.ids.device_id as usize); (s.raw, s.device) }
+            None => (self.stream.raw, crate::shared::memory::device::Device { library: self.library,
+                id: self.output.buffer.device_id }),
+        };
+        ensure!(device_id.id == routed.ids.device_id, "device wave origin GPU differs from the router's");
+        device_id.run(|| unsafe {
+            crate::shared::memory::chain::join(self.library, origin)?;
+            device.link.dispatch(routed.layer, count, 0, routed.ids, routed.routing, routed.expert_input, origin)
+        })?;
+        Ok(binding)
+    }
+    /// Waits (on the transport GPU's stream) for the dispatched wave's
+    /// partials, reduces them with `shared` (complete in the chain) and, for a
+    /// block on the other GPU, returns the result there.
+    ///
+    /// # Safety
+    /// Follows this lane's [`Self::device_dispatch`] of `rows` rows.
+    pub(crate) async unsafe fn device_collect(&mut self, binding: crate::families::deepseek_v41::v41_attention_binding::QueryBinding,
+        shared: CuteafdDeviceBuffer, rows: u32, destination: i32) -> Result<NativeFfnOutput<'_>> {
+        let device = self.device.as_ref().context("device exchange absent")?;
+        ensure!(shared.device_id == self.output.buffer.device_id && shared.bytes >= rows as usize * 10240,
+            "device reduction shared input differs");
+        let stream = &self.stream;
+        let mut output = self.output.buffer;
+        output.bytes = rows as usize * 10240;
+        unsafe {
+            crate::shared::memory::chain::join(self.library, stream.raw)?;
+            device.link.collect(stream.raw)?;
+            device.link.reduce(shared.ptr.cast(), output.ptr.cast(), rows as usize, stream.raw)?;
+            crate::shared::memory::chain::finish(self.library, stream.raw)?;
+        }
+        let values = if destination != output.device_id {
+            unsafe { self.tp2.as_mut().context("TP2 return workspace missing")?
+                .return_result(output, destination as usize, rows).await? }
+        } else { output };
+        self.ready_rows = Some(rows);
+        Ok(NativeFfnOutput { values, binding, _owner: std::marker::PhantomData })
+    }
+    /// A remote layer on the device exchange with the TP2 shared expert: the
+    /// wave goes out, both GPUs' shared halves run meanwhile, the transport
+    /// GPU waits for the partials and reduces, all queued without a host wait.
+    ///
+    /// # Safety
+    /// As [`Self::execute_tp2_ffn`]; [`Self::device_wave`] holds.
+    pub(crate) async unsafe fn execute_device_tp2(&mut self,
+        input: &crate::families::deepseek_v41::v41_block::FfnInput<'_>,
+        routed: &crate::families::deepseek_v41::v41_backbone_router::RouterOutput<'_>,
+        placement: u64, rows: &[crate::families::deepseek_v41::v41_backbone_router::ExpertRow])
+        -> Result<NativeFfnOutput<'_>> {
+        let binding = unsafe { self.device_dispatch(routed, placement, rows)? };
+        ensure!(binding == input.binding() && input.layer == routed.layer, "device TP2 input/router identity mismatch");
+        let reduction = self.output.buffer.device_id as usize;
+        let tp2 = self.tp2.as_mut().context("TP2 shared workspace missing")?;
+        let values = unsafe { tp2.execute_shared_on(input.layer, routed.rows, input.values, reduction).await? };
+        unsafe { self.device_collect(binding, values, routed.rows, input.values.device_id).await }
     }
     /// RoCE execution with optional host BF16 shared-expert contribution.
     /// All GPU copies finish before frame storage can be reused, and reduction
