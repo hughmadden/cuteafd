@@ -305,6 +305,8 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct Ticket {
     id: u64,
     done: bool,
+    /// The request sent its finish (EOS, stop or length) to the client.
+    finished: bool,
 }
 
 /// Admit a request: always counted, announced while a console is installed.
@@ -323,7 +325,7 @@ pub(crate) fn admit(prompt: usize, cached: usize, max: usize, grammar: bool, ima
                 rows: cached as u32, started: admit_started, finished: at }));
         }
     }
-    Ticket { id, done: false }
+    Ticket { id, done: false, finished: false }
 }
 
 impl Ticket {
@@ -346,9 +348,13 @@ impl Ticket {
         lifecycle(Event::First { id: self.id, at: Instant::now(), token });
     }
 
-    /// The request left the scheduler: finished normally, or `client_left`.
-    pub fn done(&mut self, client_left: bool, generated: usize) {
-        self.retire(if client_left { "cancelled" } else { "finished" }, generated);
+    /// The request is sending its finish to the client (call before the send).
+    pub fn finishing(&mut self) { self.finished = true; }
+
+    /// The request left the scheduler after `generated` tokens: finished if it
+    /// sent its finish ([`Self::finishing`]), else its client left.
+    pub fn done(&mut self, generated: usize) {
+        self.retire(if self.finished { "finished" } else { "cancelled" }, generated);
     }
 
     /// The client left before the request produced anything.
@@ -493,7 +499,7 @@ mod tests {
 
     #[test]
     fn step_counts_members_without_a_viewer() {
-        let ticket = Ticket { id: 7, done: true };
+        let ticket = Ticket { id: 7, done: true, finished: false };
         let mut step = Step { started: Instant::now(), lane: 0, live: None, text: false, requests: Vec::new(),
             tally: [0; 4] };
         // 5 drafted, 3 verified, 2 accepted (3 emitted); then a plain decode row.
@@ -570,7 +576,7 @@ mod tests {
                     "enabled": true})) });
             requests.retain_mut(|(ticket, generated, max)| {
                 let done = *generated >= *max;
-                if done { ticket.done(false, *generated); }
+                if done { ticket.finishing(); ticket.done(*generated); }
                 !done
             });
         }

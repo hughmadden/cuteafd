@@ -343,7 +343,7 @@ function renderKpis() {
   const ver = rate('verified_drafts', w), pre = rate('prefill_tokens', w), rounds = rate('verification_rounds', w);
   const g = S.gauges, lanes = g.lanes || [];
   const set = (k, v, sub) => { $('#k-' + k).innerHTML = v; $('#ks-' + k).textContent = sub; };
-  set('out', n0(out), Number.isFinite(out / rounds) && rounds > 0 ? `${nf1.format(out / rounds)} per lane round` : 'idle');
+  set('out', n0(out), Number.isFinite(out / rounds) && rounds > 0 ? `${nf1.format(out / rounds)} per ${laneCount() > 1 ? "lane " : ""}round` : 'idle');
   set('acc', n0(acc), ver > 0 ? `${pct(acc, ver)} of verified drafts` : 'no drafts verified');
   set('drf', n0(drf), drf > 0 ? `${pct(ver, drf)} verified by the target` : 'no drafts proposed');
   const pf = g.prefilling;
