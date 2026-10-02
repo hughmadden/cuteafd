@@ -112,9 +112,23 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
     if !options.quiet {
         eprintln!("run {id} on {base}");
     }
-    follow(&base, &id, options.quiet)?;
-    let report: Report = agent.get(&format!("{base}/v1/bench/runs/{id}")).call()?.into_json()
-        .context("the finished report")?;
+    let followed = follow(&base, &id, options.quiet);
+    let served = followed.as_ref().ok().and_then(|_| agent.get(&format!("{base}/v1/bench/runs/{id}")).call().ok())
+        .map(|response| response.into_json::<Report>().context("the finished report"));
+    let report = match served {
+        Some(report) => report?,
+        // The server went away (it exited after or during the run): its history is
+        // on this host when the server runs here (run.sh mounts the store).
+        None => match crate::store::Store::open_read(&crate::store::default_dir()).ok().and_then(|s| s.load(&id).ok().flatten())
+            .filter(|r| !matches!(r.status, RunStatus::Running | RunStatus::Queued)) {
+            Some(report) => {
+                eprintln!("warning: the server at {base} stopped answering; run {id} read from the local store");
+                report
+            }
+            None => return Err(followed.err().unwrap_or_else(|| anyhow::anyhow!("the server stopped answering")))
+                .with_context(|| format!("run {id} on {base}")),
+        },
+    };
     let dir = options.out.clone().unwrap_or_else(|| default_dir(&options.root, &report));
     let written = write_exports(&report, &dir, &options.export)?;
     if !options.quiet {
@@ -130,20 +144,34 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
     Ok((report, dir))
 }
 
+/// How long a server may refuse connections before a followed run counts as lost.
+const UNREACHABLE: Duration = Duration::from_secs(60);
+
 /// Prints progress lines from the event stream until run `id` finishes.
 fn follow(base: &str, id: &str, quiet: bool) -> Result<()> {
     let events = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(60)).build();
     let mut last_line = String::new();
+    let mut unreachable: Option<std::time::Instant> = None;
     loop {
         let response = match events.get(&format!("{base}/v1/bench/events")).call() {
-            Ok(response) => response,
+            Ok(response) => {
+                unreachable = None;
+                response
+            }
             Err(error) => {
-                // A dropped stream: check whether the run ended meanwhile, else reconnect.
+                // A dropped stream: check whether the run ended meanwhile, else reconnect,
+                // giving up once the server has refused connections for a while.
                 if finished(base, id)? {
                     return Ok(());
                 }
-                eprintln!("event stream: {error}; reconnecting");
+                let since = *unreachable.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() > UNREACHABLE {
+                    bail!("the server has not answered for {} s: {error}", UNREACHABLE.as_secs());
+                }
+                if !quiet {
+                    eprintln!("event stream: {error}; reconnecting");
+                }
                 std::thread::sleep(Duration::from_secs(2));
                 continue;
             }

@@ -43,6 +43,14 @@ impl Store {
         Ok(store)
     }
 
+    /// An existing store, read only (another process, often root in a container, owns it).
+    pub fn open_read(dir: &Path) -> Result<Self> {
+        let path = dir.join("bench.sqlite");
+        let connection = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("opening {}", path.display()))?;
+        Ok(Self { connection, path: Some(path) })
+    }
+
     /// A store that forgets everything at exit (no writable directory).
     pub fn memory() -> Result<Self> {
         let store = Self { connection: Connection::open_in_memory()?, path: None };

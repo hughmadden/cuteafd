@@ -549,6 +549,13 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             }
             outcome.build = build.to_string();
             let _ = writeln!(log, "server build {}", report.server.build.label());
+            // A server that died after finishing the run still fails the entry's serving check.
+            let running = Command::new("docker").args(["inspect", "-f", "{{.State.Running}}", &coordinator_name(entry, parallel)])
+                .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
+            if running == Some(false) {
+                outcome.error = Some("the server exited during or after the run (see its coordinator log)".into());
+                let _ = writeln!(log, "warning: the coordinator is not running any more");
+            }
         }
         Err(error) => {
             outcome.error = Some(format!("{error:#}"));
