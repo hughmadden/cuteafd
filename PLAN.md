@@ -601,6 +601,12 @@ steps into `work/p0`; tag `v1.0.0` when the list's top half is done.
    threshold, W4A16 decode rows) to V4.1 if it wins, and make W4A4 the default
    for that checkpoint. Gate: V4.1 golden/KL vs the official FP8 reference,
    8K prefill and C1/C4 vs the current NVFP4 default.
+   **W4A4 decode/verify rows** (TJ): decode rows (1–16, incl. speculative
+   verify) run W4A16 even on W4A4 checkpoints. Measure W4A4 decode with the
+   activation quant fused into the GEMV/MMA prologue on one NVFP4 model (C1
+   step, KL); bandwidth-bound either way, so expect parity — if so, make W4A4
+   decode the default for checkpoints that declare it (one numerics path from
+   prefill through verify).
 9. **Parked**: Spark-side reduce-scatter ([`work/spark-reduce`](https://github.com/tpurtell/cuteafd/tree/work/spark-reduce),
    +3% one rail, +9–12% two rails at 200G); split intake
    ([`work/split-intake`](https://github.com/tpurtell/cuteafd/tree/work/split-intake), slower). Revisit only on new evidence.
