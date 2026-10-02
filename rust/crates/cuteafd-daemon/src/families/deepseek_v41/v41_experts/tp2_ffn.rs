@@ -135,6 +135,10 @@ impl<'a> Wave<'a> {
     pub fn contains(&self, layer: usize) -> bool {
         layer < self.layers
     }
+    /// The lane's stream on GPU `device` (0 or 1).
+    pub(crate) fn stream(&self, device: usize) -> &Stream<'a> {
+        &self.streams[device]
+    }
 
     pub fn contains_shared(&self, layer: usize) -> bool {
         self.shared.contains(layer)

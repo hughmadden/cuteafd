@@ -792,6 +792,10 @@ impl BoundExpertRequest {
     }
 }
 impl RouterOutput<'_> {
+    /// Whether the Spark request carries BF16 rows (NVFP4 experts) instead of FP8 wire rows.
+    pub fn request_nvfp4(&self) -> bool {
+        self.request_nvfp4
+    }
     pub fn validate_request_rows(&self, rows: &[ExpertRow]) -> Result<QueryBinding> {
         let binding = self.binding()?;
         ensure!(

@@ -335,7 +335,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         // Every consumer after the pass (commit, dSpark, logits downloads) is
         // unscoped, so the chained work must be complete before returning.
         let drained = self.chain.as_ref().unwrap().drain();
-        let result = result.and(drained);
+        let result = result.and(drained).and_then(|()| transport.check_device());
         if result.is_ok() && crate::shared::memory::chain::device_enabled() {
             // Device-ordered local layers left their captured routes in the router's ring.
             self.lane.drain_route_ring()?;

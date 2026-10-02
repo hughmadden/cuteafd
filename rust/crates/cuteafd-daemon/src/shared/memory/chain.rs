@@ -128,13 +128,27 @@ pub(crate) fn enabled() -> bool {
 /// transfers become SM copies ordered by device events and the host enqueues
 /// the next stage at once. Off by default; the default path is unchanged.
 pub(crate) fn device_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        let on = matches!(std::env::var("CUTEAFD_V41_DEVICE").as_deref(), Ok("1" | "on" | "true"));
-        if on {
-            tracing::info!("V4.1 device-ordered passes: chained stages enqueue without host waits");
+    device_setting() > 0
+}
+
+/// Whether V4.1 remote verification waves also use the device-driven Spark
+/// exchange (`CUTEAFD_V41_DEVICE=1`; `chain` keeps them on the host path).
+pub(crate) fn device_exchange_enabled() -> bool {
+    device_setting() > 1
+}
+
+fn device_setting() -> u8 {
+    static SETTING: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *SETTING.get_or_init(|| {
+        let setting = match std::env::var("CUTEAFD_V41_DEVICE").as_deref() {
+            Ok("1" | "on" | "true") => 2,
+            Ok("chain") => 1,
+            _ => 0,
+        };
+        if setting > 0 {
+            tracing::info!(exchange = setting > 1, "V4.1 device-ordered passes: chained stages enqueue without host waits");
         }
-        on
+        setting
     })
 }
 

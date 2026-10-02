@@ -772,8 +772,6 @@ pub(crate) struct SparkDeviceLink<'a> {
     lane: cuteafd_transport::expert::SparkDeviceLane,
     intake: SparkIntake<'a>,
     mailbox: HostAllocation<'a>,
-    /// u32 sequences: [0] published waves, [16] waited completions.
-    state: DeviceAllocation<'a>,
     library: &'a NativeLibrary,
     capacity: usize,
     topk: usize,
@@ -795,8 +793,6 @@ impl<'a> SparkDeviceLink<'a> {
             "the device Spark exchange needs GPU landing, but the intake is {} ({})", choice.mode.name(), choice.reason);
         let intake = SparkIntake::new(library, IntakeMode::Gpu, peers.len(), capacity, row_bytes)?;
         let mailbox = HostAllocation::new(library, device_mailbox::bytes(capacity, topk, wire_row_bytes))?;
-        let state = DeviceAllocation::new(library, 128)?;
-        library.copy_h2d(state.buffer, &[0u8; 128])?;
         library.peer_exchange_initialize()?;
         let landing = intake.landing().context("GPU intake planes")?;
         // SAFETY: the mailbox and the intake planes are fields of this link,
@@ -810,7 +806,7 @@ impl<'a> SparkDeviceLink<'a> {
                 warm, build)?
         };
         tracing::info!(ranks = peers.len(), capacity, "device-driven Spark exchange ready (proxy thread, GPU landing)");
-        Ok(Self { lane, intake, mailbox, state, library, capacity, topk, wire_row_bytes })
+        Ok(Self { lane, intake, mailbox, library, capacity, topk, wire_row_bytes })
     }
 
     pub(crate) fn world_size(&self) -> usize {
@@ -845,9 +841,14 @@ impl<'a> SparkDeviceLink<'a> {
         }
     }
 
-    fn state_word(&self, index: usize) -> *mut u32 {
-        // SAFETY: index < 32 words of the 128-byte state allocation.
-        unsafe { self.state.buffer.ptr.cast::<u32>().add(index) }
+    /// Loads the signal/wait kernels on another GPU whose streams will
+    /// dispatch or collect on this link (the sequences live in the mailbox).
+    pub(crate) fn initialize_on(&self, device: i32) -> Result<()> {
+        let previous = self.library.cuda_get_device()?;
+        self.library.cuda_set_device(device)?;
+        let loaded = self.library.peer_exchange_initialize();
+        self.library.cuda_set_device(previous)?;
+        loaded
     }
 
     /// Queues on `stream` the copy of a wave's `rows` x `topk` route ids
@@ -871,7 +872,7 @@ impl<'a> SparkDeviceLink<'a> {
                 route_bytes, stream)?;
             self.library.copy_d2h_host_buffer_async(self.mailbox_at(m::wire(self.capacity, self.topk)), wire,
                 wire_bytes, stream)?;
-            self.library.host_signal(self.mailbox_at(m::READY).ptr.cast(), self.state_word(0),
+            self.library.host_signal(self.mailbox_at(m::READY).ptr.cast(), self.mailbox_at(m::SEND_STATE).ptr.cast(),
                 self.mailbox_at(m::DESCRIPTOR).ptr.cast(), [layer as u32, rows as u32, kind, self.topk as u32], stream)
         }
     }
@@ -884,8 +885,9 @@ impl<'a> SparkDeviceLink<'a> {
     pub(crate) unsafe fn collect(&self, stream: *mut c_void) -> Result<()> {
         use cuteafd_transport::expert::device_mailbox as m;
         // SAFETY: the DONE word is pinned, device-mapped mailbox memory; the
-        // state word lives on the stream's device.
-        unsafe { self.library.peer_wait(self.mailbox_at(m::DONE).ptr.cast(), self.state_word(16), stream) }
+        // state word is pinned mailbox memory too.
+        unsafe { self.library.peer_wait(self.mailbox_at(m::DONE).ptr.cast(), self.mailbox_at(m::RECV_STATE).ptr.cast(),
+            stream) }
     }
 
     /// Queues `output = shared + sum of the rank planes` for `t` rows on
