@@ -479,6 +479,9 @@ host-driven); instead one shared exchange is built and both engines move onto it
   golden NLL / byte-exact greedy vs the host path, prefix-cache restore exactness, quick C1/C4
   A/B on 1 RTX + 4 Sparks and 2 RTX + 4 Sparks, full V4.1 parity before proposing a default;
   the default stays byte-identical while off.
+  MiMo (2026-10-02): decode/verify already run as captured per-layer segments between exchanges
+  (`--decode-graphs`, opt-in): byte-exact, but neutral against the host exchange (the GPU bounds
+  each segment), so D6 for MiMo is capturing those segments back to back.
 
 **Spark-side reduction (measured and parked 2026-10-01, `work/spark-reduce`).**
 TP ranks reduce-scatter their routed partials by rows over an RC mesh between
