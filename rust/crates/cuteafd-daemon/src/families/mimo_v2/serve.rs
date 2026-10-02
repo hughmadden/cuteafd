@@ -467,7 +467,8 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     host = source.host, partial = source.partial, "prefix cache hit");
             }
             let boundaries = cuteafd_engine::prefix::message_boundaries(&tokens, message_start);
-            let plan = if cache.enabled() && !cold {
+            // A cold probe keeps the same chunk plan (identical numerics); it only skips the captures.
+            let plan = if cache.enabled() {
                 cuteafd_engine::prefix::plan_points(resume, tokens.len(), engine.prefill_capacity(), &boundaries,
                     family.capture_reach(), prefix.prefix_cache_min_tokens, prefix.points())
             } else {
@@ -525,7 +526,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 p.ticket.prefill(chunk.len(), p.chunks, p.plan.chunks.len(), timer);
                 result?;
                 // Intermediate snapshot points this chunk reaches (off unless configured).
-                for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks) {
+                for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
                     if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, &p.tokens[..point], &p.placement,
                         After::default()) {
                         tracing::warn!("snapshot point {point} not retained: {error:#}");

@@ -511,7 +511,8 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 tracing::info!(tokens = tokens.len(), resume, kind = ?source.kind, frontier = source.frontier,
                     host = source.host, "prefix cache hit");
             }
-            let plan = if cache.enabled() && !cold {
+            // A cold probe keeps the same chunk plan (identical numerics); it only skips the captures.
+            let plan = if cache.enabled() {
                 cuteafd_engine::prefix::plan_points(resume, tokens.len(), engine.prefill_rows,
                     &crate::shared::prefix::boundaries(&tokens, &markers), family.capture_reach(),
                     prefix.prefix_cache_min_tokens, prefix.points())
@@ -579,7 +580,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 p.ticket.prefill(chunk.len(), p.chunks, p.plan.chunks.len(), timer);
                 result?;
                 // Intermediate snapshot points this chunk ends at (off unless configured).
-                for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks) {
+                for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
                     if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, &p.tokens[..point], &p.placement,
                         After::default()) {
                         tracing::warn!("snapshot point {point} not retained: {error:#}");

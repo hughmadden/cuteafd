@@ -308,32 +308,61 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
         check.summary = "no speculator".into();
         return Ok(());
     };
+    const TOKENS: u64 = 128;
     let text = format!("[{}] {}", nonce(), CONTENT[0].1);
-    let on = run.client.chat(plain(&text, 128), Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))?;
+    let spec = |off: bool| ProbeSpec { cold: true, no_speculation: off, record_rows: TOKENS as usize, top_k: 2,
+        ..ProbeSpec::default() };
+    let on = run.client.chat(plain(&text, TOKENS), Some(spec(false)))?;
     let on_record = probe_of(&on)?;
     if !honoured(on_record) {
         unsupported(check);
         return Ok(());
     }
-    let off = run.client.chat(plain(&text, 128),
-        Some(ProbeSpec { cold: true, no_speculation: true, ..ProbeSpec::default() }))?;
-    let (a, b) = (&on_record.generated, &probe_of(&off)?.generated);
+    let off = run.client.chat(plain(&text, TOKENS), Some(spec(true)))?;
+    let off_record = probe_of(&off)?;
+    let (a, b) = (&on_record.generated, &off_record.generated);
     let same = a.iter().zip(b).take_while(|(x, y)| x == y).count();
     check.set("tokens", a.len() as u64);
     check.set("identical_prefix", same as u64);
     check.set("speculator", speculator.clone());
     check.set("decode_tok_s_on", on.timing.decode_tok_s());
     check.set("decode_tok_s_off", off.timing.decode_tok_s());
+    let rates = format!("({} vs {} tok/s)", crate::render::rate(on.timing.decode_tok_s()),
+        crate::render::rate(off.timing.decode_tok_s()));
     if a == b {
         check.status = CheckStatus::Pass;
-        check.summary = format!("{speculator}: {} greedy tokens identical with drafts on and off ({} vs {} tok/s)",
-            a.len(), crate::render::rate(on.timing.decode_tok_s()), crate::render::rate(off.timing.decode_tok_s()));
+        check.summary = format!("{speculator}: {} greedy tokens identical with drafts on and off {rates}", a.len());
+        return Ok(());
+    }
+    // Verify rows and single-row steps may round differently: a flip where the
+    // top two candidates are within rounding of each other is a tie, not a loss.
+    let position = off_record.prompt_ids.len() + same;
+    let margin = |record: &ProbeRecord| record.rows.iter().find(|r| r.position == position)
+        .and_then(|r| (r.top.len() >= 2).then(|| f64::from(r.top[0].1 - r.top[1].1)));
+    let margins = (margin(off_record), margin(on_record));
+    let tie = match margins {
+        (Some(x), Some(y)) => x.min(y) < TIE_NATS,
+        (Some(x), None) | (None, Some(x)) => x < TIE_NATS,
+        _ => false,
+    };
+    if let Some(m) = margins.0.or(margins.1) {
+        check.set("divergence_margin", m);
+    }
+    if tie {
+        check.status = CheckStatus::Pass;
+        check.summary = format!("{speculator}: identical up to token {same} of {}, then a near-tie flips \
+            (top-two margin {:.3} nats) {rates}", a.len().max(b.len()), margins.0.or(margins.1).unwrap_or(0.0));
     } else {
         check.status = CheckStatus::Fail;
-        check.summary = format!("{speculator}: greedy output diverges at token {same} of {}", a.len().max(b.len()));
+        check.summary = format!("{speculator}: greedy output diverges at token {same} of {}{} {rates}",
+            a.len().max(b.len()), margins.0.or(margins.1).map(|m| format!(" (top-two margin {m:.3} nats)"))
+                .unwrap_or_default());
     }
     Ok(())
 }
+
+/// Top-two log-probability margin under which a greedy flip counts as a tie.
+const TIE_NATS: f64 = 0.05;
 
 fn template(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     let tools = json!([{"type": "function", "function": {"name": "get_weather",

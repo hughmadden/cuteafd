@@ -565,7 +565,8 @@ fn schedule(
                 // Equal chunks, so no lane runs a tiny tail.
                 let remaining = tokens.len() - resume;
                 let limit = remaining.div_ceil(remaining.div_ceil(chunk_limit));
-                if cache.enabled() && !cold {
+                // A cold probe keeps the same chunk plan (identical numerics); it only skips the captures.
+                if cache.enabled() {
                     cuteafd_engine::prefix::plan_points(resume, tokens.len(), limit,
                         &crate::shared::prefix::boundaries(&tokens, &markers), family.capture_reach(),
                         prefix.prefix_cache_min_tokens, prefix.points())
@@ -612,7 +613,7 @@ fn schedule(
                 p.busy += timer.elapsed().as_secs_f64();
                 p.ticket.prefill(rows, p.chunks, p.plan.chunks.len(), timer);
                 // Intermediate snapshot points this chunk ends at (off unless configured).
-                for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks) {
+                for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
                     if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, &p.tokens[..point], &p.placement,
                         After::default()) {
                         tracing::warn!("snapshot point {point} not retained: {error:#}");
