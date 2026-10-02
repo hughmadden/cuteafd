@@ -25,6 +25,7 @@
 //! ([`MimoEngine::decode_layers`]), every 1..=64-row shape captured at startup.
 use super::weights::{MimoLayer, MimoWeights};
 use super::head::BorrowedHead;
+use cuteafd_loader::families::mimo_v2::workspace::MimoPrefillKvShadowPlan;
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
 use crate::shared::launch_grid::Fp8QuantizeGrid;
@@ -272,7 +273,7 @@ struct Workspace<'a> {
     delta: Dev<'a>,
     kv_step: Dev<'a>,
     /// 8-bit KV prefill: BF16 copy of one sequence's full-attention records (`max_context` rows).
-    kv_wide: Dev<'a>,
+    kv_wide: Rc<Dev<'a>>,
     positions: Dev<'a>,
     slots: Dev<'a>,
     step_slots: Dev<'a>,
@@ -310,6 +311,7 @@ pub(crate) struct Peer<'a> {
     cos_sin_swa: Dev<'a>,
     workspace: RefCell<Option<Workspace<'a>>>,
     lane_workspace: RefCell<Option<Workspace<'a>>>,
+    prefill_kv_wide: RefCell<Option<Rc<Dev<'a>>>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     /// Rank 1's decode segments (see [`MimoEngine::decode_layers`]).
     graphs: RefCell<HashMap<GraphKey, GraphExec<'a>>>,
@@ -375,6 +377,7 @@ pub(crate) struct MimoEngine<'a> {
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     /// The first row lane's workspace of a pipelined prefill (no LM head).
     lane_workspace: RefCell<Option<Workspace<'a>>>,
+    prefill_kv_wide: RefCell<Option<Rc<Dev<'a>>>>,
     experts: Option<Experts<'a>>,
     pub expert_input: ExpertInput,
     /// Host time per phase: GPU wait before the expert request, the Spark exchange.
@@ -491,7 +494,7 @@ impl<'a> MimoEngine<'a> {
             pages, rings, family, device,
             split_family, peer: None, exchange: None, kv, cos_sin_full,
             cos_sin_swa, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
-            lane_workspace: RefCell::new(None), experts: None,
+            lane_workspace: RefCell::new(None), prefill_kv_wide: RefCell::new(None), experts: None,
             expert_input: ExpertInput::Fp8,
             profile: RefCell::new([0.0; 2]),
             wave_timing: std::env::var("CUTEAFD_MIMO_WAVE_TIMING").is_ok_and(|v| v == "1"), drafter: None, mtp: None, l2: None, embedding,
@@ -577,7 +580,7 @@ impl<'a> MimoEngine<'a> {
             let table = |theta: f64| rope_table(library, self.cfg.rope_dim, theta, self.max_context);
             Ok(Peer { device, stream, kv, cos_sin_full: table(self.cfg.full_rope_theta)?,
                 cos_sin_swa: table(self.cfg.swa_rope_theta)?, layers, workspace: RefCell::new(None),
-                lane_workspace: RefCell::new(None), decode_workspace: RefCell::new(None), graphs: RefCell::new(HashMap::new()) })
+                lane_workspace: RefCell::new(None), prefill_kv_wide: RefCell::new(None), decode_workspace: RefCell::new(None), graphs: RefCell::new(HashMap::new()) })
         })?;
         self.peer = Some(peer);
         self.exchange = Some(exchange);
@@ -674,6 +677,22 @@ impl<'a> MimoEngine<'a> {
         self.on(rank, || self.workspace_here(rank, t, decode, true))
     }
 
+    /// All consumers use this rank's compute stream. A lane's next widen is
+    /// ordered after the prior attention reads; no transport owns this arena.
+    /// Every workspace retains an Rc, and published storage is never resized.
+    fn shared_prefill_kv_wide(&self, rank: usize, bytes: usize) -> Result<Rc<Dev<'a>>> {
+        let cell = if rank == 0 { &self.prefill_kv_wide }
+            else { &self.peer.as_ref().context("prefill KV shadow peer")?.prefill_kv_wide };
+        let mut owned = cell.borrow_mut();
+        if let Some(arena) = owned.as_ref() {
+            MimoPrefillKvShadowPlan::require_same_extent(arena.buffer.bytes as u64, bytes as u64)?;
+            return Ok(Rc::clone(arena));
+        }
+        let arena = Rc::new(self.alloc(bytes)?);
+        *owned = Some(Rc::clone(&arena));
+        Ok(arena)
+    }
+
     /// `head`: the LM head and its logits (only the first row lane of a
     /// pipelined prefill skips them).
     fn workspace_here(&self, rank: usize, t: usize, decode: bool, head: bool) -> Result<Workspace<'a>> {
@@ -685,12 +704,13 @@ impl<'a> MimoEngine<'a> {
         let spark = lead && matches!(self.experts, Some(Experts::Spark { .. }));
         let attention = attention_workspace_geometry(rank, self.ranks(), decode,
             self.weights.layers.iter().all(|layer| layer.split));
-        let layout = MimoWorkspaceLayout::new(&self.cfg, MimoWorkspaceOptions {
+        let options = MimoWorkspaceOptions {
             rows: t as u64, decode, lead, with_head, spark, max_context: self.max_context as u64,
             pool_pages: self.pages as u64, kv_cache: self.kv_cache,
             attention, prefill_output: self.prefill_output, native_scratch_bytes: scratch,
             head_workspace_bytes: VOCABULARY_HEAD_WORKSPACE as u64,
-        })?;
+        };
+        let layout = MimoWorkspaceLayout::new(&self.cfg, options)?;
         let size = |bytes| usize::try_from(bytes).context("MiMo workspace size does not fit this process");
         let head_workspace = self.alloc(size(layout.head_workspace)?)?;
         let identity: Vec<i64> = (0..t as i64).collect();
@@ -705,7 +725,9 @@ impl<'a> MimoEngine<'a> {
             attn: self.alloc(size(layout.attn)?)?,
             delta: self.alloc(size(layout.delta)?)?,
             kv_step: self.alloc(size(layout.kv_step)?)?,
-            kv_wide: self.alloc(size(layout.kv_wide)?)?,
+            kv_wide: if options.shares_prefill_kv_wide() {
+                self.shared_prefill_kv_wide(rank, size(layout.kv_wide)?)?
+            } else { Rc::new(self.alloc(size(layout.kv_wide)?)?) },
             positions: self.alloc(size(layout.positions)?)?,
             slots: self.alloc(size(layout.slots)?)?,
             step_slots,

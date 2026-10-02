@@ -221,6 +221,7 @@ pub fn mimo_capacity_profiles(
             storage.persistent_unit_bytes,
             storage.pool_metadata_unit_bytes,
         )?;
+        let mut kv_shadow = super::workspace::MimoPrefillKvShadowPlan::default();
         for (name, workspace) in &runtime.workspaces {
             if workspace.max_context != options.max_context_tokens
                 || workspace.lead != (rank == 0)
@@ -238,7 +239,7 @@ pub fn mimo_capacity_profiles(
                     ..*workspace
                 },
             )?;
-            costs.extend(layout.reservations(name));
+            costs.extend(kv_shadow.workspace_reservations(name, &layout, *workspace)?);
             // The allocator uses max(256, pages * table_rows * 4). Reserving
             // the fixed minimum plus its linear term is safe at every pool
             // size, overcounting by at most 256 bytes per workspace.
@@ -249,6 +250,7 @@ pub fn mimo_capacity_profiles(
                 product("MiMo workspace page indices", &[table_rows, 4])?,
             )?;
         }
+        costs.extend(kv_shadow.reservation());
         costs.extend(runtime.additional.iter().cloned());
         costs
             .iter()
@@ -485,7 +487,8 @@ mod tests {
         let fixed_workspace: u64 = profile.devices[0]
             .reservations
             .iter()
-            .filter(|r| r.name.starts_with("prefill.") || r.name.starts_with("decode."))
+            .filter(|r| r.name.starts_with("prefill.") || r.name.starts_with("decode.")
+                || r.name == "state.prefill_kv_wide")
             .map(|r| r.bytes)
             .sum();
         for pages in [0, 1, 2, 7, 64, 4096] {
