@@ -651,6 +651,14 @@ active admission deferral and active KV paging are separate remaining work.
      b. A worker failure mid-stream drops the SSE connection with no error
         event (all families). Fixed in `f3c7505`: one structured error event,
         preserving the backend cause, with no successful terminal event.
+        A private MiMo scheduler follow-up now reports a fatal cause to other
+        accepted active, prefill, KV-deferred and already-queued requests too,
+        while excluding completed responses before fallible context updates.
+        Request-local tokenization/first-token/grammar failures retain their
+        cause. Recipient lifecycle and existing API router tests pass; actual
+        full-model raw-channel/HTTP fault injection remains open. Reserved
+        HTTP image-preparation permits and startup errors are outside this
+        native-request follow-up.
         Private MiMo terminal ownership fixes also cover failures after engine
         creation, including a partially installed peer stream. Focused startup
         tests and real connected-RDMA endpoint faults pass: successful teardown
