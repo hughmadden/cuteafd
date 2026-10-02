@@ -193,9 +193,11 @@ pub(crate) struct GoldenArgs {
     #[arg(long)]
     pub generate: Option<usize>,
     /// Verify-by-replay check: after --prefill tokens, for every kept count k
-    /// in 1..=N, compare the KDA state after one speculative N-row verify
-    /// committing k rows with the state after k serial single-row steps (and
-    /// after a plain N-row verify for k = N); then time spec + commit.
+    /// in 1..=N, require identical kept logits, KDA state, MLA rows and next
+    /// decode when only the rejected suffix of the same N-row verify changes.
+    /// Serial single-row differences are reported separately (kernel geometry
+    /// may reorder floating point). Also check full commit against plain N-row
+    /// verify, then time spec + commit from identical recurrent state.
     #[arg(long)]
     pub replay_check: Option<usize>,
     /// Time verify steps of 1..=N rows per sequence (C sequences, see
