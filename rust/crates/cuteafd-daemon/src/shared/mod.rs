@@ -1,5 +1,6 @@
 //! Code every family uses.
 
+pub(crate) mod console;
 pub(crate) mod constraints;
 pub(crate) mod draft_policy;
 pub(crate) mod experts;

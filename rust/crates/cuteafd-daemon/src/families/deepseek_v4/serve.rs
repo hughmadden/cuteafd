@@ -15,12 +15,13 @@ use super::prefix::Dsv4Prefix;
 use super::{with_engine, EngineArgs};
 use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
 use crate::shared::prefix::{PrefixArgs, Toggle};
+use crate::shared::console;
 use crate::shared::token_io::{DeviceLogits, RowResult, SelectBatch, TokenSelector};
 use crate::shared::prefill_share::{Chunk, DecodeShareArgs};
 use cuteafd_engine::prefix::{After, MarkArena, PointPlan, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
 use anyhow::{Context, Result};
 use cuteafd_api::openai::{
-    ConsoleHub, InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits,
+    InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits,
     NativeRequest, PromptUsage,
 };
 use std::path::Path;
@@ -50,6 +51,8 @@ pub(crate) struct ServeArgs {
     pub decode_share: DecodeShareArgs,
     #[command(flatten)]
     pub prefix: PrefixArgs,
+    #[command(flatten)]
+    pub console: console::ConsoleArgs,
 }
 
 /// "…/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots/<rev>" -> "deepseek-ai/DeepSeek-V4-Flash-0731".
@@ -79,11 +82,12 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let worker_stats = stats.clone();
     let (max_context, speculate_max, decode_share, prefix) =
         (args.max_context as usize, args.speculate_max_sequences, args.decode_share, args.prefix.clone());
+    let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id)));
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_context, speculate_max, decode_share, prefix));
     ready_rx.await.context("engine failed before it was ready")??;
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
-        ConsoleHub::disabled(), profile.clone());
+        hub, profile.clone());
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     tracing::info!(listen = %args.listen, model = %profile.id, "DeepSeek V4 API is ready");
     tokio::select! {
@@ -91,6 +95,45 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         finished = worker => finished??,
     }
     Ok(())
+}
+
+/// What the live console shows for DeepSeek V4 Flash / Pro.
+fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
+    use console::{Color::*, StepGroup};
+    let mut layout = console::Layout::new("deepseek_v4", model.into(), args.engine.snapshot.clone());
+    let sparks = args.engine.peers.split(',').filter(|peer| !peer.is_empty()).count();
+    layout.hardware = console::hardware(1 + usize::from(args.engine.split_device.is_some()), sparks,
+        args.engine.local_expert_layers.is_some());
+    layout.split = args.engine.split_device.map(|_| "head split".into());
+    layout.concurrency = args.engine.max_sequences;
+    layout.eos = eos_token(&args.engine.snapshot).ok().into_iter().collect();
+    if args.engine.dspark {
+        let block = std::fs::read_to_string(args.engine.snapshot.join("config.json")).ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|config| config["dspark_block_size"].as_u64()).unwrap_or(8) as usize;
+        layout.speculator = Some(console::Speculator { name: "dSpark".into(), positions: block.clamp(1, 16),
+            policy: format!("block {block} · ≤ {} sequences", args.speculate_max_sequences) });
+    }
+    layout.steps = vec![
+        StepGroup::new("Decode step", "host clock", &[("round.cycle", "step", Target),
+            ("draft", "dSpark draft", Accepted), ("verify", "verify pass + token selection", Target),
+            ("emit", "accept + stream", Ink)]),
+        StepGroup::new("Verify pass", "host clock, engine phases", &[
+            ("router_sync", "GPU through router + quantizer", Rtx), ("routing", "route packing", Ink),
+            ("experts", "Spark expert exchanges", Spark), ("head", "head + logits", Target)]),
+        StepGroup::admission(false),
+    ];
+    layout
+}
+
+/// What a decode step did, for the console: each sequence's draft and
+/// verified draft rows, and the draft and verify host time.
+#[derive(Default)]
+struct StepShape {
+    drafts: Vec<Vec<u32>>,
+    verified: Vec<usize>,
+    draft_us: f64,
+    verify_us: f64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -167,6 +210,7 @@ struct Prefill<'a> {
     started: Instant,
     /// Seconds in this prompt's chunks.
     busy: f64,
+    ticket: console::Ticket,
 }
 
 /// One admitted request: its placement, stream state and next input token.
@@ -187,6 +231,7 @@ struct Active<'a> {
     generated: usize,
     buffered: usize,
     started: Instant,
+    ticket: console::Ticket,
 }
 
 impl Active<'_> {
@@ -290,13 +335,16 @@ fn speculative_step(
     runtime: &tokio::runtime::Runtime,
     selector: &mut TokenSelector<'_>,
     caching: bool,
+    shape: &mut StepShape,
 ) -> Result<Vec<bool>> {
     let noise = engine.cfg.dspark_noise_token_id as u32;
     let inputs: Vec<u32> = active.iter()
         .flat_map(|a| std::iter::once(a.next).chain(std::iter::repeat_n(noise, block - 1))).collect();
     let requests: Vec<super::engine::DraftRequest<'_>> = active.iter()
         .map(|a| super::engine::DraftRequest { placement: &a.placement, token: a.next }).collect();
+    let timer = Instant::now();
     let drafts = engine.draft(&requests, &inputs)?;
+    shape.draft_us = console::us(timer);
     // Verify no more rows than the request may still produce or hold, and no
     // draft the grammar rejects (it could never be kept).
     let sequences: Vec<Vec<u32>> = active.iter().zip(&drafts).map(|(a, draft)| {
@@ -311,8 +359,12 @@ fn speculative_step(
     let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
     let mut rows: Vec<(&mut Placement, &[u32])> = active.iter_mut().zip(&sequences)
         .map(|(a, tokens)| (&mut a.placement, tokens.as_slice())).collect();
+    let timer = Instant::now();
     let logits = engine.verify_device(&mut rows, transports, runtime)?;
     let selected = select_rows(selector, &logits, active, &sequences, &starts)?;
+    shape.verify_us = console::us(timer);
+    shape.verified = sequences.iter().map(|rows| rows.len() - 1).collect();
+    shape.drafts = drafts;
     let mut offset = 0;
     Ok(active.iter_mut().zip(&sequences).zip(starts).map(|((request, rows), start)| {
         let mut finished = false;
@@ -421,6 +473,7 @@ fn schedule(
                 // Idle: publish the state the server waits in (captures and releases done).
                 cache.tick();
                 publish(stats, requests, generated_total, 0, 0, &cache);
+                console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
                 match receive.blocking_recv() {
                     Some(job) => job,
                     None => return Ok(()),
@@ -453,6 +506,7 @@ fn schedule(
             let capacity = (tokens.len() + job.max_tokens).min(engine.max_context);
             let state = states.pop().expect("checked");
             cache.tick();
+            let admit_started = Instant::now();
             // Lookup, fork of the retained units and restore of the mark (byte-exact).
             let admitted = match cache.admit(&family, &tokens, capacity, true, |units| Placement::new(state, units)) {
                 Ok(admitted) => admitted,
@@ -467,6 +521,8 @@ fn schedule(
                 system_fingerprint: None,
                 prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: resume },
             }));
+            let ticket = console::admit(tokens.len(), resume, job.max_tokens, constraint.is_some(), job.images.len(),
+                admit_started);
             if let Some(source) = admitted.source {
                 tracing::info!(tokens = tokens.len(), resume, kind = ?source.kind, frontier = source.frontier,
                     host = source.host, "prefix cache hit");
@@ -490,7 +546,7 @@ fn schedule(
             };
             prefills.push(Prefill { job, constraint, tokens, resume, plan, chunks: 0, cancelled: false,
                 placement: admitted.placement, capacity, logits, first: None, prompt_row: None,
-                started: Instant::now(), busy: 0.0 });
+                started: Instant::now(), busy: 0.0, ticket });
         }
         if prefills.due(!active.is_empty()) {
             let caching = cache.enabled();
@@ -507,6 +563,7 @@ fn schedule(
                 let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
                 let last = end == p.tokens.len();
                 let chunk = &p.tokens[p.placement.len..end];
+                let rows = chunk.len();
                 let logits = engine.prefill_device(&mut p.placement, chunk, transports, runtime, usize::from(last))?;
                 if last {
                     // The first token, while this prompt's logits are the workspace's.
@@ -520,6 +577,7 @@ fn schedule(
                     p.first = Some(take(p.constraint.as_mut(), &selected[0])?);
                 }
                 p.busy += timer.elapsed().as_secs_f64();
+                p.ticket.prefill(rows, p.chunks, p.plan.chunks.len(), timer);
                 // Intermediate snapshot points this chunk ends at (off unless configured).
                 for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks) {
                     if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, &p.tokens[..point], &p.placement,
@@ -534,6 +592,7 @@ fn schedule(
                 let (placement, resume) = (p.placement.clone(), p.resume);
                 if let Err(error) = &prefilled {
                     if p.cancelled {
+                        p.ticket.cancel();
                         // The client left during the prefill: keep what it computed for a retry.
                         if placement.len > resume {
                             if let Err(error) = cache.park(&family, &p.tokens[..placement.len], &placement) {
@@ -589,13 +648,18 @@ fn schedule(
                 let mut request = Active {
                     decoder, job: p.job, constraint: p.constraint, placement: p.placement, capacity: p.capacity,
                     next: first, history: p.tokens, turn: None, generated: 0, buffered: 0, started: Instant::now(),
+                    ticket: p.ticket,
                 };
                 let emitted = request.emit(first, eos);
+                request.ticket.first(first);
                 retain_prompt(&mut cache, &request.history[..request.placement.len], &request.placement);
                 match emitted {
                     Ok(false) => active.push(request),
                     // Finished at its first token: its turn is its prompt snapshot.
-                    Ok(true) | Err(_) => release(&family, &mut cache, &mut states, &request.placement),
+                    Ok(true) | Err(_) => {
+                        request.ticket.done(emitted.is_err(), request.generated);
+                        release(&family, &mut cache, &mut states, &request.placement)
+                    }
                 }
             }
             prefills.settle(!active.is_empty());
@@ -604,6 +668,10 @@ fn schedule(
             continue;
         }
         let cycle = Instant::now();
+        let mut tally = console::Step::begin(0);
+        let engine_before = tally.live().then(|| engine.profile.borrow().seconds);
+        let before: Vec<usize> = active.iter().map(|a| a.history.len()).collect();
+        let mut shape = StepShape::default();
         let caching = cache.enabled();
         // One decode step over every active sequence; with the drafter and a
         // small batch, each sequence verifies its next token plus a draft.
@@ -611,13 +679,15 @@ fn schedule(
         let speculate = block > 0 && active.len() <= speculate_max
             && active.len() * (block + 1) <= engine.decode_rows;
         let step = if speculate {
-            speculative_step(engine, &mut active, block, eos, transports, runtime, selector, caching)
+            speculative_step(engine, &mut active, block, eos, transports, runtime, selector, caching, &mut shape)
         } else {
             let sequences: Vec<Vec<u32>> = active.iter().map(|a| vec![a.next]).collect();
             let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
             let mut rows: Vec<(&mut Placement, u32)> = active.iter_mut().map(|a| (&mut a.placement, a.next)).collect();
+            let timer = Instant::now();
             engine.decode_device(&mut rows, transports.first_mut(), runtime).and_then(|logits| {
                 let selected = select_rows(selector, &logits, &active, &sequences, &starts)?;
+                shape.verify_us = console::us(timer);
                 Ok(active.iter_mut().zip(&selected).enumerate().map(|(row, (request, selected))| {
                     let token = take(request.constraint.as_mut(), selected);
                     finish_row(request, token, eos, &logits, row, caching, engine.library)
@@ -635,11 +705,24 @@ fn schedule(
                 continue;
             }
         };
+        for (i, request) in active.iter().enumerate() {
+            let proposal = shape.drafts.get(i).map_or(&[][..], Vec::as_slice);
+            tally.member(&request.ticket, proposal, shape.verified.get(i).copied().unwrap_or(0),
+                &request.history[before[i]..], request.constraint.is_some(), finished[i]);
+        }
+        tally.end(|| {
+            let engine_now = engine.profile.borrow().seconds;
+            let phase = |i: usize| engine_before.map_or(f64::NAN, |before| 1e6 * (engine_now[i] - before[i]));
+            let emit = 1e6 * cycle.elapsed().as_secs_f64() - shape.draft_us - shape.verify_us;
+            vec![("draft", shape.draft_us), ("verify", shape.verify_us), ("emit", emit),
+                ("router_sync", phase(0)), ("routing", phase(1)), ("experts", phase(2)), ("head", phase(3))]
+        });
         for index in (0..active.len()).rev() {
             if !finished[index] {
                 continue;
             }
-            let request = active.remove(index);
+            let mut request = active.remove(index);
+            request.ticket.done(request.job.events.is_closed(), request.generated);
             requests += 1;
             generated_total += request.generated as u64;
             let seconds = request.started.elapsed().as_secs_f64();
@@ -657,6 +740,7 @@ fn schedule(
         }
         cache.tick();
         publish(stats, requests, generated_total, active.len(), prefills.len(), &cache);
+        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
 }

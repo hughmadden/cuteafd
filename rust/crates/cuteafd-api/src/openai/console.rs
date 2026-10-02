@@ -22,6 +22,15 @@ use tokio::sync::broadcast;
 
 /// The console page, compiled into the binary so it needs no asset path or CDN.
 pub const PAGE: &str = include_str!("../../assets/console.html");
+/// Shared page shell, palette and chart styles for every built-in page
+/// (`/assets/cuteafd-ui.css`).
+pub const UI_CSS: &str = include_str!("../../assets/cuteafd-ui.css");
+/// Shared page shell, formatting and SVG chart primitives (`/assets/cuteafd-ui.js`, `window.CuteUI`).
+pub const UI_JS: &str = include_str!("../../assets/cuteafd-ui.js");
+/// The header logo for the dark pages (`/assets/cuteafd-logo.svg`).
+pub const LOGO: &str = include_str!("../../../../../assets/brand/cuteafd-logo-color-dark.svg");
+/// The square swift mark, the pages' favicon (`/assets/cuteafd-mark.svg`).
+pub const MARK: &str = include_str!("../../../../../assets/brand/cuteafd-mark-color-dark.svg");
 
 const DISABLED: &str = r#"{"type":"snapshot","disabled":true}"#;
 const STARTING: &str = r#"{"type":"snapshot","starting":true}"#;
@@ -101,6 +110,33 @@ pub(super) async fn page() -> Response {
     ([(header::CACHE_CONTROL, "no-cache")], Html(page)).into_response()
 }
 
+/// A shared UI asset, or for page development the same-named file in the
+/// directory `CUTEAFD_CONSOLE_ASSETS`, re-read on every load.
+async fn asset(name: &str, builtin: &'static str, content_type: &'static str) -> Response {
+    let body = match std::env::var_os("CUTEAFD_CONSOLE_ASSETS") {
+        Some(dir) => tokio::fs::read_to_string(std::path::Path::new(&dir).join(name)).await
+            .unwrap_or_else(|_| builtin.to_string()),
+        None => builtin.to_string(),
+    };
+    ([(header::CONTENT_TYPE, content_type), (header::CACHE_CONTROL, "no-cache")], body).into_response()
+}
+
+pub(super) async fn ui_css() -> Response {
+    asset("cuteafd-ui.css", UI_CSS, "text/css; charset=utf-8").await
+}
+
+pub(super) async fn ui_js() -> Response {
+    asset("cuteafd-ui.js", UI_JS, "text/javascript; charset=utf-8").await
+}
+
+pub(super) async fn logo() -> Response {
+    asset("cuteafd-logo.svg", LOGO, "image/svg+xml").await
+}
+
+pub(super) async fn mark() -> Response {
+    asset("cuteafd-mark.svg", MARK, "image/svg+xml").await
+}
+
 pub(super) async fn snapshot(State(hub): State<Arc<ConsoleHub>>) -> Response {
     (
         [
@@ -152,10 +188,16 @@ mod tests {
     #[test]
     fn page_is_self_contained() {
         assert!(PAGE.contains("/v1/console"));
+        assert!(PAGE.contains("/assets/cuteafd-ui.css") && PAGE.contains("/assets/cuteafd-ui.js"));
+        assert!(UI_JS.contains("window.CuteUI") && UI_JS.contains("/bench"));
         // The console must work on hosts without internet access.
-        for external in ["http://", "https://"] {
-            assert!(!PAGE.contains(&format!("src=\"{external}")), "page loads an external script");
-            assert!(!PAGE.contains(&format!("href=\"{external}")), "page loads an external stylesheet");
+        assert!(LOGO.starts_with("<svg") && MARK.starts_with("<svg") && !LOGO.contains("href="));
+        for text in [PAGE, UI_CSS, UI_JS] {
+            for external in ["http://", "https://"] {
+                assert!(!text.contains(&format!("src=\"{external}")), "page loads an external script");
+                assert!(!text.contains(&format!("href=\"{external}")), "page loads an external stylesheet");
+                assert!(!text.contains(&format!("url({external}")), "page loads an external resource");
+            }
         }
     }
 
