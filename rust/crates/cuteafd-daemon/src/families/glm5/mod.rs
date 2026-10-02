@@ -233,7 +233,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
         .map_err(|g| anyhow::anyhow!("geometry already {g:?}"))?;
     let cfg = GlmDsaConfig::read(&args.snapshot)?;
     if let Some(snapshot) = &args.draft {
-        dflash::check_target_bf16_head(&catalog.tensor("lm_head.weight")?.metadata,
+        dflash::check_snapshot_target_bf16_head(&args.snapshot,
             cfg.hidden, cfg.vocab_size, false)?;
         dflash::check_checkpoint(snapshot, args.draft_fp8, args.draft_context_slots, args.draft_sequences)?;
     }

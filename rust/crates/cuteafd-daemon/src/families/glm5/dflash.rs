@@ -385,6 +385,24 @@ pub(crate) fn check_checkpoint(snapshot: &Path, fp8: Option<bool>, context_slots
 
 /// The only shared head consumer in this tranche reads checkpoint BF16.
 /// Reject compact input/dual-copy target modes before native allocation.
+pub(crate) fn check_snapshot_target_bf16_head(snapshot: &Path, hidden: usize, vocab: usize,
+    explicit_fp8_head: bool) -> Result<()> {
+    // Routed-expert catalogs need not contain coordinator tensors. Resolve the
+    // head through its own index/header contract without reading weight data.
+    let index_path = snapshot.join("model.safetensors.index.json");
+    let shard = if index_path.is_file() {
+        let index = cuteafd_loader::plan::checkpoint::read_json(&index_path)?;
+        index.get("weight_map").and_then(|map| map.get("lm_head.weight"))
+            .and_then(serde_json::Value::as_str)
+            .context("DFlash target index has no lm_head.weight shard")?.to_owned()
+    } else { "model.safetensors".to_owned() };
+    let path = snapshot.join(&shard);
+    let head = read_safetensors_metadata(&path)?.into_iter()
+        .find(|t| t.name == "lm_head.weight")
+        .with_context(|| format!("DFlash target lm_head.weight missing from indexed shard {shard}"))?;
+    check_target_bf16_head(&head, hidden, vocab, explicit_fp8_head)
+}
+
 pub(crate) fn check_target_bf16_head(t: &SafetensorsTensorMetadata, hidden: usize, vocab: usize,
     explicit_fp8_head: bool) -> Result<()> {
     ensure!(!explicit_fp8_head,
@@ -1039,6 +1057,76 @@ pub(crate) fn golden_sequence(dir: &Path, vocab: usize) -> Result<(Vec<u32>, Vec
 #[cfg(test)]
 mod checkpoint_header_tests {
     use super::*;
+
+    struct HeaderSnapshot(std::path::PathBuf);
+    impl Drop for HeaderSnapshot {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    fn expert_only_snapshot() -> HeaderSnapshot {
+        use std::io::Write;
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let root = std::env::var_os("CARGO_TARGET_DIR").map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("target"));
+        let path = root.join("header-test-fixtures").join(format!("dflash-{}-{}", std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        std::fs::create_dir_all(&path).unwrap();
+        let fixture = HeaderSnapshot(path);
+        let config = serde_json::json!({
+            "model_type": "glm_moe_dsa", "quantization_config": {"quant_method": "fp8"},
+            "vocab_size": 16, "hidden_size": 128, "num_hidden_layers": 1,
+            "num_attention_heads": 1, "q_lora_rank": 128, "kv_lora_rank": 128,
+            "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+            "index_n_heads": 1, "index_head_dim": 128, "index_topk": 1,
+            "first_k_dense_replace": 0, "intermediate_size": 128, "n_routed_experts": 1,
+            "num_experts_per_tok": 1, "moe_intermediate_size": 128, "n_shared_experts": 1,
+            "routed_scaling_factor": 1.0, "scoring_func": "sigmoid", "topk_method": "noaux_tc",
+            "rms_norm_eps": 1e-5, "rope_theta": 10000.0,
+        });
+        std::fs::write(fixture.0.join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+        let mut headers = serde_json::Map::new();
+        let mut index = serde_json::Map::new();
+        let mut offset = 0usize;
+        for (name, dtype, shape, bytes) in [
+            ("lm_head.weight".to_owned(), "BF16", vec![16, 128], 4096),
+            ("model.layers.0.mlp.experts.0.gate_proj.weight".into(), "F8_E4M3", vec![128, 128], 16384),
+            ("model.layers.0.mlp.experts.0.up_proj.weight".into(), "F8_E4M3", vec![128, 128], 16384),
+            ("model.layers.0.mlp.experts.0.down_proj.weight".into(), "F8_E4M3", vec![128, 128], 16384),
+            ("model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv".into(), "F32", vec![1, 1], 4),
+            ("model.layers.0.mlp.experts.0.up_proj.weight_scale_inv".into(), "F32", vec![1, 1], 4),
+            ("model.layers.0.mlp.experts.0.down_proj.weight_scale_inv".into(), "F32", vec![1, 1], 4),
+        ] {
+            headers.insert(name.clone(), serde_json::json!({"dtype": dtype, "shape": shape,
+                "data_offsets": [offset, offset + bytes]}));
+            index.insert(name, serde_json::Value::String("weights.safetensors".into()));
+            offset += bytes;
+        }
+        let header = serde_json::to_vec(&headers).unwrap();
+        let mut file = std::fs::File::create(fixture.0.join("weights.safetensors")).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(&header).unwrap();
+        file.set_len((8 + header.len() + offset) as u64).unwrap();
+        std::fs::write(fixture.0.join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({"weight_map": index})).unwrap()).unwrap();
+        fixture
+    }
+
+    #[test]
+    fn target_head_guard_reads_checkpoint_when_actual_expert_catalog_has_no_head() {
+        let fixture = expert_only_snapshot();
+        let catalog = cuteafd_loader::read_expert_catalog(&fixture.0).unwrap();
+        assert!(catalog.fp8().is_some());
+        assert!(catalog.tensors().is_empty());
+        assert!(catalog.tensor("lm_head.weight").is_err());
+        check_snapshot_target_bf16_head(&fixture.0, 128, 16, false).unwrap();
+        assert!(check_snapshot_target_bf16_head(&fixture.0, 128, 16, true).is_err());
+        assert!(check_snapshot_target_bf16_head(&fixture.0, 128, 32, false).is_err());
+        let index_path = fixture.0.join("model.safetensors.index.json");
+        let mut index = cuteafd_loader::plan::checkpoint::read_json(&index_path).unwrap();
+        index["weight_map"]["lm_head.weight"] = "missing.safetensors".into();
+        std::fs::write(index_path, serde_json::to_vec(&index).unwrap()).unwrap();
+        assert!(check_snapshot_target_bf16_head(&fixture.0, 128, 16, false).is_err());
+    }
 
     fn fixture(dtype: DType) -> Checkpoint {
         Checkpoint { data: vec![0x80, 0x3f, 0, 0x40, 0x40, 0x40, 0x80, 0x40],
