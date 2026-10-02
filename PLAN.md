@@ -536,17 +536,18 @@ The user chooses release cuts; development fixes below do not cut a release.
 
 Joint serving capacity is in progress: the pure resolver budgets each physical
 GPU at 97% of total minus existing usage and explicit reservations, preserves
-small pool overrides, and reports the requested eight-checkpoint-context floor
-and its shortfall. `cuteafd plan` now describes canonical target-only cache
+small pool overrides, and reports the common 2,097,152-token target and its
+shortfall. `cuteafd plan` now describes canonical target-only cache
 storage for GLM, GLM Flash, Qwen and MiMo, including replicated versus
 head-partitioned KV, C16 / 20 state slots and exact prefix mark bytes. It does
 not infer a compiled index limit or claim that weight placement alone admits
 the serving configuration. Native MTP costs are available when explicitly
 requested; target-only costs do not include an external drafter.
 MiMo workspace allocation now consumes the same pure size description that
-startup admission will use. It preserves the current global-width geometry,
-including every rank/lane's INT8 prefill BF16 shadow; head-width reduction is
-an independent quality/performance change.
+startup admission will use. Split peer workspaces and fully split target
+prefill use their assigned attention heads, including INT8 prefill BF16
+shadows; lead decode retains global geometry for unsplit MTP. The change
+passed exact full-model restore, pipeline and continuation checks.
 
 Next: startup must consume the same resolved pool/context/state values before
 loading weights, with actual weight conversions, all lane/workspace shapes,
