@@ -429,6 +429,8 @@ impl<'a> NativeTp4Wave<'a> {
         let binding = routed.validate_request_rows(rows)?;
         ensure!(!routed.request_nvfp4(), "the device exchange carries FP8 wire rows");
         let device = self.device.as_ref().context("device exchange absent")?;
+        // Wakes a parked proxy (and surfaces an earlier wave's error).
+        device.link.arm()?;
         {
             let mut context = device.context.lock().map_err(|_| anyhow::anyhow!("device context poisoned"))?;
             context.placement = placement;
