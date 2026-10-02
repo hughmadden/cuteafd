@@ -327,24 +327,19 @@ impl Active<'_> {
 }
 
 /// The prefix cache over `engine` (always present: with zero entries it is the page allocator).
-fn prefix_cache<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs)
+pub(super) fn prefix_cache<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs)
     -> Result<(MimoPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
     let entries = args.prefix_cache_entries;
     let budget = args.prefix_cache_mark_mib << 20;
     let family = MimoPrefix::new(engine, |mark| if entries == 0 { 0 } else { MarkArena::slots_for(1, entries, mark, budget) },
         args.prefix_partial == Toggle::On)?;
-    // The pinned host tier copies through one GPU's copy engine; a head split's
-    // pages and marks live on two GPUs, so it keeps device-resident snapshots only.
-    let host = if engine.ranks() > 1 {
-        if args.host_cache_bytes.enabled() && entries > 0 {
-            tracing::warn!("MiMo head split: the prefix cache's host tier is off (device-resident snapshots only)");
-        }
-        None
-    } else {
-        args.host_tier(engine.library, engine.kv_layer(0).1, family.layout(), engine.max_context)?
-    };
-    let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();
+    // Resolve one aggregate quota for all heads, then retain and register the
+    // full KV pools and positional-mark arenas on their actual owning GPUs.
+    let host = args.host_config(layout, engine.max_context)?.map(|config| {
+        CudaCopyEngine::registered_owned(engine.library, family.host_owners()).map(|copy| (config, copy))
+    }).transpose()?;
+    let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let config = PrefixConfig { entries, mark_slots: family.slots(), keep_logits: true,
         min_tokens: args.prefix_cache_min_tokens };
     let cache = PrefixCache::new(layout, config, host)?;
