@@ -134,6 +134,14 @@ fn lane_prefill_capacity(rows: usize, transport: bool) -> usize {
     if transport && rows >= 2 * MIN_LANE_ROWS { 2 * rows } else { rows }
 }
 
+fn independent_prefill_rows(capacity: usize, lanes: bool, output: MimoPrefillOutput, mtp: bool,
+    rows: [usize; 2]) -> bool {
+    // Larger single-request chunks already split across the old row lanes.
+    // Preserve those exact row partitions instead of silently joining them.
+    lanes && !mtp && output == MimoPrefillOutput::LastRow
+        && rows.into_iter().all(|n| n > 0 && n <= capacity && n < 2 * MIN_LANE_ROWS)
+}
+
 /// Only attention geometry changes under a head split. Rank 1 runs split
 /// target layers exclusively; rank 0 also runs unsplit MTP attention in its
 /// decode workspace. Its prefill workspace never runs MTP, but may run an
@@ -227,6 +235,23 @@ impl MimoPlacement {
 
     pub fn ring_slot(&self, position: usize) -> i64 {
         i64::from(self.ring) * RING_ROWS as i64 + (position % RING_ROWS) as i64
+    }
+
+    fn prefill_tables(&self, rows: usize, max_context: usize) -> Result<StepTables> {
+        let end = self.len.checked_add(rows).context("paired prefill context overflow")?;
+        ensure!(rows > 0 && end <= max_context && self.ring >= 0,
+            "paired prefill exceeds context capacity or has no request ring");
+        let pages = self.pages.get(..end.div_ceil(PAGE_ROWS))
+            .context("paired prefill exceeds the request's admitted pages")?;
+        Ok(StepTables {
+            decode: false,
+            positions: (self.len..end).map(|p| p as i64).collect(),
+            slots: (self.len..end).map(|p| self.slot(p)).collect::<Result<_>>()?,
+            ring_slots: (self.len..end).map(|p| self.ring_slot(p)).collect(),
+            seq_first: vec![0; rows],
+            page_table: pages.iter().map(|&page| page as i32).collect(),
+            table_stride: 0,
+        })
     }
 }
 
@@ -387,7 +412,7 @@ pub(crate) struct MimoEngine<'a> {
     cos_sin_swa: Dev<'a>,
     workspace: RefCell<Option<Workspace<'a>>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
-    /// The first row lane's workspace of a pipelined prefill (no LM head).
+    /// The first prefill lane; serving admits its own last-row head output.
     lane_workspace: RefCell<Option<Workspace<'a>>>,
     prefill_kv_wide: RefCell<Option<Rc<Dev<'a>>>>,
     experts: Option<Experts<'a>>,
@@ -970,6 +995,42 @@ impl<'a> MimoEngine<'a> {
         self.prefill_capacity() > self.prefill_rows
     }
 
+    /// Pairing reuses the admitted Spark lanes for two chunks below 2048 rows,
+    /// preserving each request's existing single-lane arithmetic. Larger chunks
+    /// and MTP engines keep their original path. Attention tables stay separate.
+    pub fn can_prefill_pair(&self, rows: [usize; 2]) -> bool {
+        // MTP keeps its existing route until independent request pairing has
+        // its own hidden-ring/catch-up qualification.
+        independent_prefill_rows(self.prefill_rows, self.lanes_ready(), self.prefill_output, self.mtp.is_some(), rows)
+    }
+
+    pub fn prepare_prefill_pair(&mut self) -> Result<()> {
+        if self.can_prefill_pair([1, 1]) {
+            if let Some(drafter) = &mut self.drafter {
+                drafter.prepare_prefill_lanes()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Two independent prefill chunks. Both output pointers remain valid until
+    /// the next prefill call; consume both before reusing either workspace.
+    /// DFlash taps are separate banks, consumed with `update_lane(0/1)`.
+    pub fn prefill_pair_device(&self, requests: [(&mut MimoPlacement, &[u32]); 2])
+        -> Result<[Option<DeviceLogits>; 2]> {
+        let [(first, first_tokens), (second, second_tokens)] = requests;
+        ensure!(self.can_prefill_pair([first_tokens.len(), second_tokens.len()]),
+            "independent prefill pair exceeds the admitted lanes");
+        ensure!(first.ring != second.ring, "independent prefill requests must own distinct rings");
+        let tables = [first.prefill_tables(first_tokens.len(), self.max_context)?,
+            second.prefill_tables(second_tokens.len(), self.max_context)?];
+        let logits = self.submit(|| self.step_lanes_inner([
+            (&tables[0], first_tokens), (&tables[1], second_tokens)], true))?;
+        first.len += first_tokens.len();
+        second.len += second_tokens.len();
+        Ok(logits)
+    }
+
     /// A prefill step in two row lanes, layer by layer: lane `i` lands its
     /// previous layer's experts, then queues this layer's attention and router
     /// and sends its wave, so the GPU works on one lane while the other's
@@ -977,14 +1038,16 @@ impl<'a> MimoEngine<'a> {
     /// writes its KV before lane 1 reads it at every layer). Returns the last
     /// row's logits.
     fn step_lanes(&self, lanes: [(&StepTables, &[u32]); 2]) -> Result<Option<DeviceLogits>> {
-        self.submit(|| self.step_lanes_inner(lanes))
+        self.submit(|| self.step_lanes_inner(lanes, false).map(|[_, last]| last))
     }
 
-    fn step_lanes_inner(&self, lanes: [(&StepTables, &[u32]); 2]) -> Result<Option<DeviceLogits>> {
+    fn step_lanes_inner(&self, lanes: [(&StepTables, &[u32]); 2], independent: bool)
+        -> Result<[Option<DeviceLogits>; 2]> {
         let Some(Experts::Spark { transport, lane: Some(lane), runtime }) = &self.experts else {
             anyhow::bail!("pipelined prefill needs Spark experts with a lane transport");
         };
-        for (cell, head) in [(&self.lane_workspace, false), (&self.workspace, true)] {
+        let first_head = self.prefill_output == MimoPrefillOutput::LastRow && self.mtp.is_none();
+        for (cell, head) in [(&self.lane_workspace, first_head), (&self.workspace, true)] {
             if cell.borrow().is_none() {
                 *cell.borrow_mut() = Some(self.on(0, || self.workspace_here(0, self.prefill_rows, false, head))?);
             }
@@ -1042,7 +1105,8 @@ impl<'a> MimoEngine<'a> {
         let mut transports = [lane.borrow_mut(), transport.borrow_mut()];
         let mut inflight: [Option<(usize, SentWave)>; 2] = [None, None];
         // After a lane's FFN output is in its `delta`: both GPUs' next input
-        // norms, then the last lane's drafter and MTP taps on rank 0.
+        // norms, then each independent request's drafter taps on rank 0.
+        // Consecutive chunks of one request keep the historical last-lane taps.
         let after_ffn = |i: usize, index: usize| -> Result<()> {
             let weight = match layers.get(index + 1) {
                 Some(next) => next.ptr("input_norm")?,
@@ -1058,14 +1122,20 @@ impl<'a> MimoEngine<'a> {
             }
             self.norm_on(0, w[i], weight, if dense_split { 2 } else { 1 }, rows[i],
                 if dense_split { self.recv(0, ffn) } else { w[i].delta.buffer.ptr })?;
-            if i == 1 {
+            if independent || i == 1 {
                 if let Some(drafter) = &self.drafter {
-                    let n = t[1].min(super::dflash::TAP_ROWS);
-                    drafter.tap(index, w[1].h.buffer.ptr, t[1] - n, n)?;
+                    let n = t[i].min(super::dflash::TAP_ROWS);
+                    if independent {
+                        drafter.tap_lane(i, index, w[i].h.buffer.ptr, t[i] - n, n)?;
+                    } else {
+                        drafter.tap(index, w[i].h.buffer.ptr, t[i] - n, n)?;
+                    }
                 }
-                if let (Some(mtp), true) = (&self.mtp, index + 1 == self.cfg.layers) {
-                    self.mtp_tap(mtp, w[1], lanes[1].0)?;
-                }
+            }
+            // Independent MTP pairing is excluded; preserve the old single-
+            // request path's final-lane hidden ring and catch-up semantics.
+            if let (Some(mtp), true) = (&self.mtp, i == 1 && index + 1 == self.cfg.layers) {
+                self.mtp_tap(mtp, w[1], lanes[1].0)?;
             }
             Ok(())
         };
@@ -1124,12 +1194,14 @@ impl<'a> MimoEngine<'a> {
             if w1.is_some() {
                 self.on(1, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(1)) })?;
             }
-            return Ok(None);
+            return Ok([None, None]);
         }
-        self.launch_head(w[1], t[1], 1, false)?;
-        let vocab = self.cfg.vocab_size;
-        Ok(Some(DeviceLogits { ptr: w[1].logits.buffer.ptr, rows: 1, vocab, stride: vocab, stream: self.stream,
-            greedy: None }))
+        let mut logits = [None, None];
+        for i in if independent { 0..2 } else { 1..2 } {
+            self.launch_head(w[i], t[i], 1, false)?;
+            logits[i] = Some(self.device_logits(w[i], 1, false));
+        }
+        Ok(logits)
     }
 
     /// Appends each sequence's tokens (one for decode, several for a
@@ -2554,5 +2626,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn independent_short_prompts_fit_without_changing_single_prompt_split_threshold() {
+        let last = MimoPrefillOutput::LastRow;
+        for rows in [[1, 1], [17, 1463], [1023, 1025], [1464, 1463], [2047, 1], [2047, 2047]] {
+            assert!(independent_prefill_rows(4096, true, last, false, rows));
+            assert!(!independent_prefill_rows(4096, false, last, false, rows));
+            assert!(!independent_prefill_rows(4096, true, last, true, rows));
+            assert!(!independent_prefill_rows(4096, true, MimoPrefillOutput::AllRows, false, rows));
+        }
+        for rows in [[0, 1463], [1463, 0], [2048, 1], [1, 4096], [4097, 1463], [1463, 8192]] {
+            assert!(!independent_prefill_rows(4096, true, last, false, rows));
+        }
+        assert_eq!(MIN_LANE_ROWS, 1024);
+        assert_eq!(lane_prefill_capacity(1024, true), 1024);
+    }
+
+    #[test]
+    fn independent_tables_preserve_different_cached_frontiers_and_private_write_pages() {
+        // Both own a shared read-only prefix page but append to distinct tail
+        // pages/rings at different cached positions; no packed attention rows.
+        let a = MimoPlacement { pages: vec![3, 7], ring: 2, len: PAGE_ROWS };
+        let b = MimoPlacement { pages: vec![3, 9], ring: 7, len: PAGE_ROWS + 2 };
+        let a_table = a.prefill_tables(3, 128).unwrap();
+        let b_table = b.prefill_tables(1, 128).unwrap();
+        assert_eq!(a_table.positions, [64, 65, 66]);
+        assert_eq!(b_table.positions, [66]);
+        assert_eq!(a_table.slots, [448, 449, 450]);
+        assert_eq!(b_table.slots, [578]);
+        assert_eq!(a_table.page_table, [3, 7]);
+        assert_eq!(b_table.page_table, [3, 9]);
+        assert_eq!(a_table.ring_slots, [576, 577, 578]);
+        assert_eq!(b_table.ring_slots, [1858]);
+        assert_eq!(a_table.seq_first, [0, 0, 0]);
+        assert_eq!(b_table.seq_first, [0]);
+        assert_eq!((a_table.table_stride, b_table.table_stride), (0, 0));
+        assert_eq!((a.len, b.len), (64, 66));
+        assert!(a.prefill_tables(65, 256).is_err(), "unadmitted pages cannot be queued");
+        assert!(b.prefill_tables(1, 66).is_err(), "context overflow cannot be queued");
     }
 }

@@ -315,6 +315,42 @@ mod tests {
     }
 
     #[test]
+    fn independent_prefill_head_adds_exact_output_and_head_workspace_on_lead_only() {
+        let cfg = MimoV2Config::from_hf(&mimo_pro_config()).unwrap();
+        for ranks in [1, 2] {
+            for rank in 0..ranks {
+                for kv_cache in [MimoKvCache::Bf16, MimoKvCache::Int8] {
+                    let before_options = MimoWorkspaceOptions {
+                        lead: rank == 0, with_head: false, spark: rank == 0,
+                        kv_cache, prefill_output: MimoPrefillOutput::LastRow,
+                        attention: if ranks == 2 { MimoAttentionWorkspace::PartitionedHeads { ranks } }
+                            else { MimoAttentionWorkspace::Global }, ..options()
+                    };
+                    let before = MimoWorkspaceLayout::new(&cfg, before_options).unwrap();
+                    let after_options = MimoWorkspaceOptions { with_head: rank == 0, ..before_options };
+                    let after = MimoWorkspaceLayout::new(&cfg, after_options).unwrap();
+                    let extra = if rank == 0 {
+                        cfg.vocab_size as u64 * 4 - 256 + options().head_workspace_bytes - 256
+                    } else { 0 };
+                    assert_eq!(after.device_bytes().unwrap() - before.device_bytes().unwrap(), extra);
+                    assert_eq!(after.logits_rows, u64::from(rank == 0));
+                    for ((name, a), (_, b)) in before.device_buffers().zip(after.device_buffers()) {
+                        if name != "logits" && name != "head_workspace" { assert_eq!(a, b, "{name}"); }
+                    }
+                    let mut shared = MimoPrefillKvShadowPlan::default();
+                    let mut costs = shared.workspace_reservations("first", &after, after_options).unwrap();
+                    costs.extend(shared.workspace_reservations("second", &after, after_options).unwrap());
+                    costs.extend(shared.reservation());
+                    if kv_cache != MimoKvCache::Bf16 {
+                        assert_eq!(costs.iter().filter(|r| r.name == "state.prefill_kv_wide").count(), 1);
+                        assert!(!costs.iter().any(|r| r.name == "first.kv_wide" || r.name == "second.kv_wide"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn pro_global_geometry_requires_full_shadow_extent_and_peer_hidden_rows() {
         let cfg = MimoV2Config::from_hf(&mimo_pro_config()).unwrap();
         let lead = MimoWorkspaceLayout::new(&cfg, options()).unwrap();

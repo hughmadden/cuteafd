@@ -727,6 +727,7 @@ impl Opened {
             if let Some(experts) = self.experts(args, &moe_layers, preflight.local_expert_budget)? {
                 engine.set_experts(experts);
             }
+            engine.prepare_prefill_pair()?;
             if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
                 engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
             }
