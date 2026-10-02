@@ -311,6 +311,7 @@ case "$intake" in auto|gpu|pinned|host) ;; *) echo "SPARK_INTAKE must be auto, g
 console_text="$(get CONSOLE_TEXT off)"
 case "$console_text" in on|off) ;; *) echo "CONSOLE_TEXT must be on or off" >&2; exit 2 ;; esac
 docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network host --ipc host \
+  --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e "CUTEAFD_SPARK_INTAKE=$intake" \
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" \
   -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" \

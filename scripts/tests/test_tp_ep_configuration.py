@@ -369,6 +369,7 @@ source scripts/lib/release-common.sh
 release_die() {{ echo "$*" >&2; exit 1; }}
 release_validate_spark_weight_admission() {{ echo "remote_layers=stub"; }}
 RELEASE_RTX_GPUS="$1"
+repo_root="$PWD"
 coordinator=coordinator
 snapshot_rel=model
 peers=peer-list

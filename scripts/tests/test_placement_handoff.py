@@ -39,6 +39,7 @@ set -euo pipefail
 source scripts/lib/release-common.sh
 release_die() { echo "$*" >&2; exit 1; }
 RELEASE_RTX_GPUS="$1"
+repo_root="$PWD"
 coordinator=coordinator
 snapshot_rel=model
 peers=peer-list
@@ -112,6 +113,7 @@ wip_slot=
                 self.assertEqual(result.returncode,0,result.stderr)
                 self.assertEqual(events[0][0],'docker')
                 self.assertEqual(events[0][1][0],'run')
+                self.assertIn(f'seccomp={ROOT}/docker/seccomp-code-bench.json',events[0][1])
                 self.assertIn('--placement-directory',events[0][1])
                 starts=[args for tool,args in events if tool=='ssh' and '-s' in args]
                 self.assertEqual(len(starts),4)

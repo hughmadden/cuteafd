@@ -534,6 +534,7 @@ if ((topology_explicit)); then
 fi
 [[ -z "$placement_directory" ]] || args+=(--placement-directory "$placement_directory")
 docker run -d --name "$coordinator" --restart no --gpus "$gpu_request" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \
+  --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   -e "CUDA_VISIBLE_DEVICES=$gpu_uuid_csv" \
   -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=${RUST_LOG:-info}" \
   "${rdma_env_args[@]}" \
