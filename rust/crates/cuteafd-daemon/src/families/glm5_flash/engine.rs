@@ -25,6 +25,7 @@
 //! resident layers reloaded as the step walks the layers) or on the Sparks.
 use super::weights::{GlmfLayer, GlmfWeights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
+use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use crate::shared::token_io::{DeviceLogits, EmbedPlacement, TokenEmbedding};
 use anyhow::{ensure, Context, Result};
@@ -367,6 +368,7 @@ impl<'a> DenseNvfp4<'a> {
 }
 
 pub(crate) struct GlmfEngine<'a> {
+    quantize_grid: Fp8QuantizeGrid,
     pub library: &'a NativeLibrary,
     pub programs: &'a Programs<'a>,
     pub cfg: GlmNextConfig,
@@ -475,6 +477,7 @@ impl<'a> GlmfEngine<'a> {
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmNextConfig, weights: GlmfWeights<'a>,
         stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize, slots: usize,
         embedding: TokenEmbedding<'a>) -> Result<Self> {
+        let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         ensure!(cfg.hc_mult == HC && cfg.kv_lora_rank == 512 && cfg.kda_head_dim == 128 && cfg.heads == 64,
             "the glmf programs are built for 4 mHC streams, a 512 latent, 64 MLA heads and 128-wide KDA heads");
@@ -510,7 +513,7 @@ impl<'a> GlmfEngine<'a> {
         let kda_conv = zeroed(kda_layers * slots * 3 * 3 * d * 2)?;
         let kda_replay = zeroed(kda_layers * replay_bytes(cfg.kda_heads, 3 * d))?;
         let pool_logical = zeroed(pool_pages * 4)?;
-        Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, slots, kv, kda_ordinal,
+        Ok(Self { quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, pages, slots, kv, kda_ordinal,
             kda_state, kda_conv, kda_replay, commit_tables: zeroed(3 * DECODE_ROWS * 4)?, drafter: None, index,
             pool_logical, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
             lane_workspaces: RefCell::new(Vec::new()),
@@ -1411,7 +1414,7 @@ impl<'a> GlmfEngine<'a> {
             }
         })?;
         if !matches!(experts, Experts::Local(_)) {
-            let grid = (t * h.div_ceil(256)).div_ceil(8).clamp(1, 4 * 188);
+            let grid = self.quantize_grid.blocks(t, h);
             self.run("expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
                 // SAFETY: the scale rows follow the payload inside each wire row.
                 ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),

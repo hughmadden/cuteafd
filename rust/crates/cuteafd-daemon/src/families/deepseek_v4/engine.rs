@@ -9,6 +9,7 @@ use super::metadata::{self, StepTables, INDEX_PAGE_BYTES, MAIN_PAGE_BYTES};
 use super::pool::{Placement, PoolShape};
 use std::cell::RefCell;
 use super::weights::{LayerWeights, ModelWeights};
+use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use crate::shared::token_io::{DeviceLogits, EmbedPlacement, TokenEmbedding};
 use anyhow::{ensure, Context, Result};
@@ -42,7 +43,7 @@ pub(crate) struct Engine<'a> {
     /// Longest sequence the exported programs' cache extents cover.
     pub max_context: usize,
     pub stream: *mut c_void,
-    pub sms: u32,
+    quantize_grid: Fp8QuantizeGrid,
     pub shape: PoolShape,
     pools: Vec<LayerCache<'a>>,
     rope_window: Dev<'a>,
@@ -180,7 +181,7 @@ pub(crate) struct EngineParts<'a> {
     pub c128_width: usize,
     pub max_context: usize,
     pub stream: *mut c_void,
-    pub sms: u32,
+    pub sms: Option<usize>,
     pub shape: PoolShape,
     pub embedding: TokenEmbedding<'a>,
     pub skip_routed: bool,
@@ -416,6 +417,7 @@ impl<'a> Engine<'a> {
 
     /// Allocates the cache pools and RoPE tables for `parts.shape`.
     pub fn new(parts: EngineParts<'a>) -> Result<Self> {
+        let quantize_grid = Fp8QuantizeGrid::new(parts.library.sm_count()?, parts.sms)?;
         ensure!(parts.embedding.hidden() == parts.cfg.dim, "embedding rows of {} for dim {}", parts.embedding.hidden(),
             parts.cfg.dim);
         // Layers past the backbone are the dSpark stages' window caches.
@@ -451,7 +453,7 @@ impl<'a> Engine<'a> {
             c128_width: parts.c128_width,
             max_context: parts.max_context,
             stream: parts.stream,
-            sms: parts.sms,
+            quantize_grid,
             shape: parts.shape,
             prefill_workspace: RefCell::new(None),
             decode_workspace: RefCell::new(None),
@@ -1334,7 +1336,7 @@ impl<'a> Engine<'a> {
                 w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t as usize, self.cfg.n_routed_experts,
                 self.cfg.n_activated_experts, self.cfg.route_scale as f32, self.stream)?;
         }
-        let grid = (t as usize * h.div_ceil(256)).div_ceil(8).min(4 * self.sms as usize).max(1);
+        let grid = self.quantize_grid.blocks(t as usize, h);
         self.run("expert_input_quant", &[
             ("source_ptr", w.y.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
             // SAFETY: the scale rows follow the payload inside each wire row.

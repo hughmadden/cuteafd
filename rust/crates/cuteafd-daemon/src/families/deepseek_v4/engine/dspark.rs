@@ -183,7 +183,7 @@ impl<'a> Engine<'a> {
                     std::ptr::null_mut(), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, rows,
                     self.cfg.n_routed_experts, self.cfg.n_activated_experts, self.cfg.route_scale as f32, self.stream)?;
             }
-            let grid = (rows * h.div_ceil(256)).div_ceil(8).min(4 * self.sms as usize).max(1);
+            let grid = self.quantize_grid.blocks(rows, h);
             self.run("expert_input_quant", &[
                 ("source_ptr", w.y.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
                 ("scale_rows_ptr", offset(&w.wire, h)), ("scale_mma_ptr", w.dummy.buffer.ptr),

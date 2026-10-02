@@ -318,6 +318,22 @@ pub(crate) struct TransportCapabilitiesArgs {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn dsv4_quantizer_defaults_to_device_geometry_and_keeps_tuning_optional() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-dsv4", "--snapshot", "/model", "--native-lib", "/native.so"];
+        let super::Commands::ServeDsv4(defaults) = super::Cli::try_parse_from(base).unwrap().command else {
+            panic!("expected DeepSeek V4 serving");
+        };
+        assert_eq!(defaults.engine.sms, None);
+        let super::Commands::ServeDsv4(limited) = super::Cli::try_parse_from(
+            base.into_iter().chain(["--sms", "73"])).unwrap().command else {
+            panic!("expected DeepSeek V4 serving");
+        };
+        assert_eq!(limited.engine.sms, Some(73));
+        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--sms", "-1"])).is_err());
+    }
+
+    #[test]
     fn native_host_cache_accepts_auto_and_legacy_byte_counts() {
         use clap::Parser;
         use crate::families::deepseek_v41::v41_native_serve::memory::HostBudget;

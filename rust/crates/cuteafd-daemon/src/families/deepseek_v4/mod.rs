@@ -38,8 +38,9 @@ pub(crate) struct EngineArgs {
     /// drafter stay on --device.
     #[arg(long)]
     pub split_device: Option<i32>,
-    #[arg(long, default_value_t = 188)]
-    pub sms: u32,
+    /// Optional expert-input quantizer SM ceiling (default: this device's SM count).
+    #[arg(long)]
+    pub sms: Option<usize>,
     /// Sequences that can be resident at once (compressor state slots).
     #[arg(long, default_value_t = 8)]
     pub max_sequences: usize,

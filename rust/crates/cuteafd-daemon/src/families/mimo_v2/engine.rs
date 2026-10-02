@@ -26,6 +26,7 @@
 use super::weights::{MimoLayer, MimoWeights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
+use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use crate::shared::token_io::{DeviceLogits, EmbedPlacement, TokenEmbedding};
 use crate::shared::spark_intake::SparkLink;
@@ -310,6 +311,7 @@ fn rope_table<'a>(library: &'a NativeLibrary, dim: usize, theta: f64, max_contex
 }
 
 pub(crate) struct MimoEngine<'a> {
+    quantize_grid: Fp8QuantizeGrid,
     pub library: &'a NativeLibrary,
     pub programs: &'a Programs<'a>,
     pub cfg: MimoV2Config,
@@ -415,6 +417,7 @@ impl<'a> MimoEngine<'a> {
         let share = cfg.head_split(ranks)?;
         let split_family = if ranks > 1 { Some(share.program_family()?) } else { None };
         let device = library.cuda_get_device()?;
+        let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         ensure!(cfg.rope_dim == 64 && cfg.head_dim == 192 && cfg.v_head_dim == 128 && cfg.window <= RING_ROWS - DECODE_ROWS,
             "the mimo programs are built for 192/128 heads, 64 RoPE dims and a window of at most {}",
@@ -433,7 +436,7 @@ impl<'a> MimoEngine<'a> {
         }).collect::<Result<Vec<_>>>()?;
         let table = |theta: f64| rope_table(library, cfg.rope_dim, theta, max_context);
         let (cos_sin_full, cos_sin_swa) = (table(cfg.full_rope_theta)?, table(cfg.swa_rope_theta)?);
-        Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, rings, family, device,
+        Ok(Self { quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, pages, rings, family, device,
             split_family, peer: None, exchange: None, kv, cos_sin_full,
             cos_sin_swa, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
             lane_workspace: RefCell::new(None), experts: None,
@@ -1870,7 +1873,7 @@ impl<'a> MimoEngine<'a> {
                 std::ptr::null(), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t, self.cfg.experts, topk,
                 self.cfg.routed_scale as f32, true, self.stream)?;
         }
-        let grid = (t * h.div_ceil(256)).div_ceil(8).clamp(1, 4 * 188);
+        let grid = self.quantize_grid.blocks(t, h);
         if !bf16_input {
             self.run("mimo_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
                 // SAFETY: the scale rows follow the payload inside each wire row.

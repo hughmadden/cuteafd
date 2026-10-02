@@ -22,6 +22,7 @@
 //! resident layers) or on the Sparks.
 use super::weights::{Qwen4Layer, Qwen4Weights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
+use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use crate::shared::token_io::{DeviceLogits, EmbedPlacement, TokenEmbedding};
 use anyhow::{ensure, Context, Result};
@@ -412,6 +413,7 @@ pub(crate) enum MtpSource {
 }
 
 pub(crate) struct Qwen4Engine<'a> {
+    quantize_grid: Fp8QuantizeGrid,
     pub library: &'a NativeLibrary,
     pub programs: &'a Programs<'a>,
     pub cfg: Qwen4Config,
@@ -508,6 +510,7 @@ impl<'a> Qwen4Engine<'a> {
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: Qwen4Config, weights: Qwen4Weights<'a>,
         ple: Option<super::ple::PleTable<'a>>, stream: *mut c_void, max_context: usize, prefill_rows: usize,
         pages: usize, slots: usize, embedding: TokenEmbedding<'a>) -> Result<Self> {
+        let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         cfg.check_programs()?;
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
@@ -557,7 +560,7 @@ impl<'a> Qwen4Engine<'a> {
             (None, None)
         };
         let pool_logical = zeroed(pool_pages * 4)?;
-        Ok(Self { library, programs, cfg, weights, ple, stream, max_context, prefill_rows, pages, slots, kv, gdn_ord,
+        Ok(Self { quantize_grid, library, programs, cfg, weights, ple, stream, max_context, prefill_rows, pages, slots, kv, gdn_ord,
             gdn_conv, gdn_state, gdn_replay, gdn_layers, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
             commit_tables: zeroed(3 * DECODE_ROWS * 4)?, mtp_kv, mtp_pending,
             last_streams: std::cell::Cell::new((false, 0)), mtp_streams: std::cell::Cell::new((false, 0)), pool_logical,
@@ -1712,7 +1715,7 @@ impl<'a> Qwen4Engine<'a> {
             self.shared(w, layer, rows)?;
         }
         if matches!(experts, Experts::LocalExl3(_) | Experts::Spark { .. }) {
-            let grid = (t * h.div_ceil(256)).div_ceil(8).clamp(1, 4 * 188);
+            let grid = self.quantize_grid.blocks(t, h);
             self.run("qwen4_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
                 // SAFETY: the scale rows follow the payload inside each wire row.
                 ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
