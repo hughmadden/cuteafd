@@ -5,36 +5,85 @@ external documentation to this file, `PLAN.md`, one README and the
 `benchmarks/` index; measurements go in commit messages as short before →
 after tables with conditions.
 
-## Hosts
+## Working method
 
-- `raptor`: coordinator, x86-64, 2× RTX PRO 6000 Blackwell 96 GB (SM120),
-  power-capped at 325 W while TJ is away. Fabric 10.55.0.22 / 10.55.1.22.
-- Sparks (GB10, SM121, ARM64, 121 GiB unified; `nvidia-smi` memory reads
-  N/A, measure with CUDA): ostrich, dodo, emu, kiwi, rhea, moa at
-  10.55.0.1–6. Ranks 0–5 in that order. All six are the pool. TP4 on the
-  first four is the qualified V4.1 default until a six-rank layout wins.
-- Fabric: Sparks have two RoCE ports at 200 Gb/s each on separate
-  subnets (rail A 10.55.0.x, rail B 10.55.1.x); raptor has one 400 Gb/s
-  port carrying both rail subnets. The switch is being raised from 100G to
-  200G. Read rates and states at startup (`rdma link`, sysfs `rate`); do
-  not assume them. Dual rail at 100G caused head-of-line blocking against
-  200+ Gb/s PCIe ingress, so rail use is a measured decision.
-- Passwordless SSH by hostname. Fan-out: `scripts/launch/run-on-hosts.sh`.
-- Root: `agent-sudo --agent-context "why" CMD` (remote human approval).
+- Parallelize: run independent feature work as separate agents in separate
+  git worktrees, one branch per task, on disjoint hardware where the work
+  needs a GPU. Serialize only what shares a GPU or a build cache.
+- Merge fast: once a change is accepted (tests pass, the feature's own
+  measurement clears its bar), commit and merge it into the working branch
+  immediately. Run any remaining measurement afterward and resolve a small
+  delta with a follow-up commit rather than holding the merge open.
+- Measure-first experiments state, before spending hardware time, what the
+  ceiling looks like (a quick estimate or a reference measurement) and a
+  stop bar (what result ends the experiment, in either direction). Chasing
+  a number past its stop bar without a new hypothesis is wasted hardware
+  time.
+- Be frugal with measurement: one launch per arm is enough to decide most
+  things; escalate to interleaved repeated sessions only when a result is
+  genuinely borderline (see Engineering rules for the exact tiers). Don't
+  schedule comparison runs against other engines or forks out of curiosity
+  — scanning prior art for implementation ideas is fine and encouraged, but
+  spend hardware time on this engine's own performance, not on producing a
+  comparison table nobody asked for.
+- Explain warm-up instead of re-running. The first wide batch after a
+  launch is reliably slower (per-token memory-mapped table reads, PyTorch/
+  CUDA first-use workspace allocation, graph capture on first shape): run
+  one untimed warm batch per concurrency level, then judge the warmed
+  numbers. A dip that a known warm-up effect explains does not need a
+  second session.
+- Lock and container hygiene: acquire a hardware lock (see Build and run)
+  only for the duration of the run that needs it, and stop every container
+  you started before releasing the lock. Leave the hardware idle when a
+  task finishes — don't keep a model served, and don't restore serving
+  after a hardware run, just to leave something running. Bring a model up
+  only when a task needs it up.
 
-## Storage
+## Engineering principles
 
-- Every host mounts sparknest at `/mnt/sparknest`; `HF_HOME` is
-  `/mnt/sparknest/hf-home`. Sealed local copies read at NVMe speed; files
-  without a local copy stream over RoCE at ~5 GB/s. Reads never replicate.
-- `nest where hf:ORG/MODEL` shows copies; `nest replicate SEL --hosts
-  @sparks --wait` places them; `nest evict` removes (never the last copy);
-  `nest plan --free` when space is tight. Replicate a model to every rank
-  while working on it, then shrink to one copy or 1/N. Manage space.
-- Each host's `~/.cache/huggingface/hub` is a symlink into `/mnt/sparknest`;
-  containers must mount the resolved hub (run.sh does) or `/mnt/sparknest`.
-- `/mnt/scratch` and `/mnt/models` are slow archive stores (150 MB/s
-  write, 500 MB/s read). Never build on `/mnt/scratch` (NTFS kernel bug).
+- Honor checkpoint numerics with native kernels. Converting a checkpoint's
+  native format into one of the engine's pre-existing internal types
+  (dequantizing NVFP4 or per-tensor FP8 to BF16, running W4A16 instead of a
+  checkpoint's calibrated W4A4) is acceptable only as an interim fallback.
+  The target is a properly optimized native kernel for the format the
+  checkpoint actually ships, and that native path is the default once it
+  measures as at least as good — even when it costs a small amount of
+  nats/KL versus the converted path, if that is the checkpoint's intended,
+  calibrated numerics.
+- Load standard Hugging Face checkpoints directly from their own
+  `config.json`, `quantization_config` and safetensors tensor headers.
+  Derive layout (EXL3 trellis storage, ModelOpt NVFP4, compressed-tensors,
+  FP8 block scales) from the checkpoint itself; a side file produced by our
+  own tooling is read only if present, and only to cross-check agreement
+  with what the checkpoint's own headers say — never required.
+- A checkpoint release that only fits a crippled configuration (a tiny KV
+  pool, or a speed far below what the model should deliver) is not a
+  target: prefer a compatible community quant (EXL3, ModelOpt NVFP4) that
+  fits the hardware comfortably over forcing the official release to fit.
+- Exact prefix-cache restores: restoring from the deepest cached snapshot
+  that is a prefix of an incoming request must produce state
+  byte-identical to having prefilled that prefix from scratch — no
+  approximate reconstruction. Snapshot at prompt end and at turn end so
+  both single-shot and multi-turn agentic traffic hit. Logit or greedy-text
+  differences from floating-point reordering elsewhere (chunk-size changes,
+  kernel route switches) are acceptable; a cache that changes the model's
+  actual state is not.
+- Device-driven exchange: routes, requests and replies move GPU-to-GPU and
+  GPU-to-NIC with no host hop and no idle CPU burn on a request's hot path.
+  The host launches work and waits on it; it does not shuttle bytes between
+  devices or poll in a spin loop that could instead be a device-side flag.
+- Collectives are hand-rolled on our own verbs/RDMA and P2P layers, not
+  NCCL. NCCL is acceptable only as an optional, occasional ceiling
+  measurement to sanity-check a hand-rolled path, never as a dependency of
+  the serving path.
+- One SM120 build serves every supported RTX card (PRO 6000 and 5090) with
+  no detriment to either. AOT exports and kernel launch configuration must
+  not bake in one card's SM count or L2 size; query them at runtime
+  (`cudaDevAttr`) for grid, wave and prefetch sizing, and let the placement
+  planner handle the memory difference between cards.
+- Multimodal input is supported only through a family's officially bundled
+  encoder (the vision/audio tower the checkpoint actually ships). Don't
+  attach a third-party encoder to a text checkpoint opportunistically.
 
 ## Build and run
 
@@ -44,13 +93,17 @@ after tables with conditions.
 - `./wip.sh --slot S --role both` for iteration, `./run.sh --wip S
   --restart` to launch; `./build.sh` and `./run.sh` for
   release images. Slots isolate artifacts, not GPUs or ports: serialize
-  builds and performance runs, one model served at a time.
+  builds and performance runs, one model served at a time per GPU.
+  `~/.cache/cuteafd/{gpu1,sparks}.lock` (flock) are the hardware mutexes;
+  hold one only around the run that needs it and stop its containers before
+  releasing it, so the next task finds a clean device.
 - Submodules are pinned with tree locks (`third_party/*.lock.json`).
   Kernel changes go to `../sparkinfer-glmrt` master, quantizer changes to
   `../GPTQModel` main; push there first, then bump pin and lock here.
-  A SparkInfer bump also needs `scripts/build/build-dev-images.sh` (shared
-  dev images on raptor and every Spark, then `./wip.sh --recreate`);
-  `wip.sh` and `run.sh --wip` refuse a stale dev image and say so.
+  A SparkInfer bump also needs
+  `scripts/build/build-dev-images.sh` (shared dev images on the coordinator
+  and every Spark rank, then `./wip.sh --recreate`); `wip.sh` and `run.sh
+  --wip` refuse a stale dev image and say so.
 - Kernels: CuTe-DSL/Triton AOT exports from the b12x fork are the default;
   hand CUDA only where measured to pay. SM120 and SM121 are both targets.
 - Run CUDA/PyTorch checks inside the matching architecture's container.
@@ -59,7 +112,7 @@ after tables with conditions.
   needed). Script tests: `.venv/bin/python -m pytest -q scripts/tests`
   (`uv venv --python 3.12 .venv` + pytest numpy tokenizers jsonschema pyyaml);
   43 inherited failures remain (work/p0 96edf07), add none.
-- `./build.sh` (release pair, ~15 min coordinator + Spark leg): set
+- `./build.sh` (release pair, coordinator + Spark leg): set
   `CUTEAFD_RELEASE_BUILD_ROOT` and `CUTEAFD_RELEASE_REMOTE_BUILD_DIR` under
   `~/.cache/cuteafd/builds/`, and `CUTEAFD_RELEASE_SPARK_TP_ROLES=` for a
   TP4-only pair. It reads the live checkout while assembling images: edit in
@@ -91,31 +144,15 @@ after tables with conditions.
   feature's own measurement. Changes to shared hot paths (transport, expert
   exchange, native lib, sampler) add a quick V4.1 parity: one launch of the
   candidate (WIP images) vs a baseline measured the same day, C1 + C16 code
-  decode only (~10 min); escalate to 3 interleaved sessions per arm only if a
-  metric is below 0.98 after warm-up (benches run one untimed batch per
+  decode only (~10 min); escalate to 3 interleaved sessions per arm if a
+  metric is below 0.98 after warm-up, and to 6 sessions per arm only if that
+  escalation is still borderline (benches run one untimed batch per
   concurrency level; DeepSeek engram tables and first-use workspaces make the
-  first wide batch after a launch ~10% slow — explain, don't re-run). Full V4.1 parity (3 sessions per arm, all metrics)
-  runs at release cuts only. Release images are built for release cuts, not
-  to verify branches; agentic benches gate with 1–2 short sessions, the full
-  bench runs at release.
-- Published results. The root README holds the only exhaustive table: the
-  basic benchmark profile for every family on its natural-minimum and
-  maximum hardware. Re-run a family's rows after changes that target that
-  family's code (or a shared hot path that plausibly moves it); skip
-  irrelevant changes, staleness is fine. Other profiles run only when TJ
-  asks: their exports (`report.svg` + `report.json` from `cuteafd bench`,
-  the same runner as the dashboard) go to
-  `benchmarks/<family>/<date>-<profile>-<hardware>/` and get a line in
-  `benchmarks/README.md` (per family, newest first: date, profile, hardware,
-  build). Commit them straight on top of `main` or the working branch; no
-  release or branch needed.
-  `cuteafd bench --url URL --profile NAME` runs a profile on a launched
-  server and writes the exports there; `cuteafd bench publish` rebuilds
-  both tables from what is placed. Release prep: `cuteafd bench smoke
-  --matrix FILE` (format: `scripts/bench/release-smoke.example.json`)
-  launches each entry with ./run.sh, runs Release smoke, exports, tears
-  down, resumes per build and runs entries on disjoint hardware side by
-  side under the lock files.
+  first wide batch after a launch ~10% slow — explain, don't re-run). Full
+  V4.1 parity (3 sessions per arm, all metrics) runs at release cuts only.
+  Release images are built for release cuts, not to verify branches;
+  agentic benches gate with 1–2 short sessions, the full bench runs at
+  release.
 - Unsupported is a result, not a crash: `cuteafd plan` names the tensors,
   formats, shapes and the exporter or kernel to add.
 - Load speed is a feature; do not regress readiness time.
@@ -127,8 +164,83 @@ after tables with conditions.
 - Keep weights, build artifacts, benchmark runs and local config out of Git
   (published reports under `benchmarks/` are the exception).
 
+## Results publishing
+
+- The root README holds the only exhaustive table: the basic benchmark
+  profile for every family on its natural-minimum and maximum hardware.
+  Re-run a family's rows after changes that target that family's code (or a
+  shared hot path that plausibly moves it); skip irrelevant changes,
+  staleness is fine.
+- Other profiles run only when specifically requested: their exports
+  (`report.svg` + `report.json` from `cuteafd bench`, the same runner as
+  the dashboard) go to `benchmarks/<family>/<date>-<profile>-<hardware>/`
+  and get a line in `benchmarks/README.md` (per family, newest first: date,
+  profile, hardware, build). Commit them straight on top of `main` or the
+  working branch; no release or branch needed.
+- `cuteafd bench --url URL --profile NAME` runs a profile on a launched
+  server and writes the exports there; `cuteafd bench publish` rebuilds
+  both tables from what is placed. Release prep: `cuteafd bench smoke
+  --matrix FILE` (format: `scripts/bench/release-smoke.example.json`)
+  launches each entry with `./run.sh`, runs Release smoke, exports, tears
+  down, resumes per build and runs entries on disjoint hardware side by
+  side under the lock files.
+
+## Releases
+
+- Tag phase boundaries during development as `p0`, `p1`, …; an official
+  release is tagged `vN.N.N` once its basic benchmark profile has run
+  across the full family × quant × reference-config matrix.
+- The README results table is generated by `cuteafd bench publish` from
+  Release smoke exports, not hand-edited; re-run the smoke matrix before
+  cutting a release if any family's rows are stale against the code being
+  released.
+- A family's `docs/models/<family>.md` changelog gets a new row only when a
+  change that affects that model's output or performance triggered a fresh
+  basic eval for it — not for every release, and not for changes that
+  don't touch that family's path.
+
 ## Git
 
 - Work on `main`. Small commits, push after every green step. Tag phase
   boundaries `p0`, `p1`, … Imperative subjects; performance commits carry
   the measurement table. No attribution trailers.
+
+## This cluster
+
+The rules above apply to any deployment of this engine. This section
+records the specific hardware, network and storage facts for the cluster
+this repository is developed against; a different deployment will have
+different hosts, addresses and paths, but needs the same categories of
+facts recorded somewhere for agents working on it.
+
+### Hosts
+
+- `raptor`: coordinator, x86-64, 2× RTX PRO 6000 Blackwell 96 GB (SM120),
+  power-capped at 325 W during unattended runs. Fabric 10.55.0.22 /
+  10.55.1.22.
+- Sparks (GB10, SM121, ARM64, 121 GiB unified; `nvidia-smi` memory reads
+  N/A, measure with CUDA): ostrich, dodo, emu, kiwi, rhea, moa at
+  10.55.0.1–6. Ranks 0–5 in that order. All six are the pool. TP4 on the
+  first four is the qualified V4.1 default until a six-rank layout wins.
+- Fabric: Sparks have two RoCE ports at 200 Gb/s each on separate
+  subnets (rail A 10.55.0.x, rail B 10.55.1.x); raptor has one 400 Gb/s
+  port carrying both rail subnets. The switch is being raised from 100G to
+  200G. Read rates and states at startup (`rdma link`, sysfs `rate`); do
+  not assume them. Dual rail at 100G caused head-of-line blocking against
+  200+ Gb/s PCIe ingress, so rail use is a measured decision.
+- Passwordless SSH by hostname. Fan-out: `scripts/launch/run-on-hosts.sh`.
+- Root: `agent-sudo --agent-context "why" CMD` (remote human approval).
+
+### Storage
+
+- Every host mounts sparknest at `/mnt/sparknest`; `HF_HOME` is
+  `/mnt/sparknest/hf-home`. Sealed local copies read at NVMe speed; files
+  without a local copy stream over RoCE at ~5 GB/s. Reads never replicate.
+- `nest where hf:ORG/MODEL` shows copies; `nest replicate SEL --hosts
+  @sparks --wait` places them; `nest evict` removes (never the last copy);
+  `nest plan --free` when space is tight. Replicate a model to every rank
+  while working on it, then shrink to one copy or 1/N. Manage space.
+- Each host's `~/.cache/huggingface/hub` is a symlink into `/mnt/sparknest`;
+  containers must mount the resolved hub (`run.sh` does) or `/mnt/sparknest`.
+- `/mnt/scratch` and `/mnt/models` are slow archive stores (150 MB/s
+  write, 500 MB/s read). Never build on `/mnt/scratch` (NTFS kernel bug).
