@@ -1,8 +1,9 @@
 # Working on cuteafd
 
 Read `PLAN.md` first. This file is the standing rules. Code is king: keep
-external documentation to this file, `PLAN.md`, and one README; measurements
-go in commit messages as short before → after tables with conditions.
+external documentation to this file, `PLAN.md`, one README and the
+`benchmarks/` index; measurements go in commit messages as short before →
+after tables with conditions.
 
 ## Hosts
 
@@ -93,6 +94,17 @@ go in commit messages as short before → after tables with conditions.
   runs at release cuts only. Release images are built for release cuts, not
   to verify branches; agentic benches gate with 1–2 short sessions, the full
   bench runs at release.
+- Published results. The root README holds the only exhaustive table: the
+  basic benchmark profile for every family on its natural-minimum and
+  maximum hardware. Re-run a family's rows after changes that target that
+  family's code (or a shared hot path that plausibly moves it); skip
+  irrelevant changes, staleness is fine. Other profiles run only when TJ
+  asks: their exports (`report.svg` + `report.json` from `cuteafd bench`,
+  the same runner as the dashboard) go to
+  `benchmarks/<family>/<date>-<profile>-<hardware>/` and get a line in
+  `benchmarks/README.md` (per family, newest first: date, profile, hardware,
+  build). Commit them straight on top of `main` or the working branch; no
+  release or branch needed.
 - Unsupported is a result, not a crash: `cuteafd plan` names the tensors,
   formats, shapes and the exporter or kernel to add.
 - Load speed is a feature; do not regress readiness time.
@@ -101,7 +113,8 @@ go in commit messages as short before → after tables with conditions.
   allocation; zero steady-state graph captures per request.
 - Rust: typed errors inside crates, `anyhow` at edges, `tracing`, no
   `unsafe` outside FFI and verbs layers, each block with a safety comment.
-- Keep weights, build artifacts, benchmark runs and local config out of Git.
+- Keep weights, build artifacts, benchmark runs and local config out of Git
+  (published reports under `benchmarks/` are the exception).
 
 ## Git
 
