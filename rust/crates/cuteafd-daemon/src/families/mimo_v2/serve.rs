@@ -90,6 +90,8 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     engine_args.rings = engine_args.rings.max(args.max_sequences);
     let (worker_stats, max_sequences) = (stats.clone(), args.max_sequences);
     engine_args.draft_sequences = engine_args.draft_sequences.max(args.max_sequences);
+    engine_args.draft_context_slots = Some(engine_args.draft_context_slots.unwrap_or(engine_args.draft_sequences)
+        .max(engine_args.rings));
     let draft = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed,
         decode_share: args.decode_share };
     let prefix = args.prefix.clone();

@@ -15,6 +15,7 @@ mod host_gate;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::families::mimo_v2::{MimoPrefillOutput, MimoV2Config};
+use cuteafd_loader::families::mimo_v2::draft_representation::{MimoDraftCapacity, MimoDraftRepresentation};
 use cuteafd_loader::plan::checkpoint::Checkpoint;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -77,11 +78,20 @@ pub(crate) struct EngineArgs {
     /// (`model.mtp.layers.*`, 0 = off) after each next token.
     #[arg(long, default_value_t = 0)]
     pub mtp: usize,
-    /// Sequences the drafter keeps a context for and drafts for at once.
+    /// Maximum number of sequences in one draft batch. Context ring slots
+    /// can be larger through --draft-context-slots.
     #[arg(long, default_value_t = 4)]
     pub draft_sequences: usize,
-    /// Draft through E4M3 copies of the drafter's GEMM weights and of the LM
-    /// head (false: BF16; the committed tokens are the same either way).
+    /// Drafter context ring slots (default: --draft-sequences; serving also
+    /// covers every target ring slot). Does not widen a draft batch.
+    #[arg(long)]
+    pub draft_context_slots: Option<usize>,
+    /// Opt-in immutable single-copy drafter storage. The unchanged baseline
+    /// without this option remains private until qualification completes.
+    #[arg(long, value_enum)]
+    pub draft_representation: Option<DraftRepresentationArg>,
+    /// Choose FP8 drafting (false: complete BF16-only storage). The explicit
+    /// single-copy mode also controls head storage and wide-update coverage.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub draft_fp8: bool,
     /// Scale rule of the FP8 copies made from BF16 weights at load: amax /
@@ -136,6 +146,82 @@ pub(crate) struct EngineArgs {
     pub expert_input: engine::ExpertInput,
     #[command(flatten)]
     pub token_io: crate::shared::token_io::TokenIoArgs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum DraftRepresentationArg {
+    Bf16Only,
+    Fp8Only,
+}
+
+impl EngineArgs {
+    fn draft_storage(&self) -> Result<MimoDraftRepresentation> {
+        match self.draft_representation {
+            Some(DraftRepresentationArg::Fp8Only) => {
+                ensure!(self.draft_fp8, "--draft-representation fp8-only conflicts with --draft-fp8 false; use bf16-only");
+                Ok(MimoDraftRepresentation::Fp8Only)
+            }
+            Some(DraftRepresentationArg::Bf16Only) => Ok(MimoDraftRepresentation::Bf16Only),
+            None if !self.draft_fp8 => Ok(MimoDraftRepresentation::Bf16Only),
+            None => Ok(MimoDraftRepresentation::LegacyDual),
+        }
+    }
+
+    fn draft_capacity(&self, block: usize) -> Result<MimoDraftCapacity> {
+        Ok(MimoDraftCapacity::new(self.draft_context_slots.unwrap_or(self.draft_sequences),
+            self.draft_sequences, block)?)
+    }
+
+    fn validate_draft_replay(&self, replay: bool) -> Result<()> {
+        ensure!(!replay || self.draft_storage()? != MimoDraftRepresentation::Fp8Only,
+            "--draft-replay compares complete BF16 weights; load --draft-representation bf16-only separately from the FP8-only candidate");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod draft_storage_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Command {
+        #[command(flatten)]
+        engine: EngineArgs,
+    }
+
+    fn args(extra: &[&str]) -> EngineArgs {
+        Command::try_parse_from(["mimo", "--snapshot", "/missing/checkpoint", "--native-lib", "/missing/native.so"]
+            .into_iter().chain(extra.iter().copied())).unwrap().engine
+    }
+
+    #[test]
+    fn bf16_diagnostics_keep_complete_single_copy_storage() {
+        let args = args(&["--draft-fp8", "false"]);
+        assert_eq!(args.draft_storage().unwrap(), MimoDraftRepresentation::Bf16Only);
+        args.validate_draft_replay(true).unwrap();
+        let args = self::args(&["--draft-representation", "bf16-only"]);
+        assert_eq!(args.draft_storage().unwrap(), MimoDraftRepresentation::Bf16Only);
+        args.validate_draft_replay(true).unwrap();
+    }
+
+    #[test]
+    fn fp8_only_rejects_conflicting_math_before_native_load() {
+        let args = args(&["--draft-representation", "fp8-only", "--draft-fp8", "false"]);
+        assert!(open(&args).err().unwrap().to_string().contains("conflicts with --draft-fp8 false"));
+        let args = self::args(&["--draft-representation", "fp8-only"]);
+        assert_eq!(args.draft_storage().unwrap(), MimoDraftRepresentation::Fp8Only);
+        args.validate_draft_replay(false).unwrap();
+        assert!(args.validate_draft_replay(true).unwrap_err().to_string().contains("bf16-only separately"));
+    }
+
+    #[test]
+    fn context_slots_do_not_widen_the_admitted_draft_batch() {
+        let args = args(&["--draft-representation", "fp8-only", "--draft-context-slots", "20", "--draft-sequences", "16"]);
+        assert_eq!(args.draft_capacity(8).unwrap(), MimoDraftCapacity {
+            context_slots: 20, max_batch_sequences: 16, block_rows: 128,
+        });
+    }
 }
 
 /// `--kv-cache` values.
@@ -242,6 +328,14 @@ pub(crate) struct Opened {
 }
 
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
+    // Validate immutable representation, capacity and kernel alignment before
+    // the native module or any device allocation is admitted.
+    let representation = args.draft_storage()?;
+    if let Some(path) = &args.draft {
+        let cfg = dflash::DflashConfig::read(&dflash::drafter_dir(path))?;
+        args.draft_capacity(cfg.block)?;
+        cfg.weight_layout(representation)?;
+    }
     let checkpoint = Checkpoint::open(&args.snapshot)?;
     ensure!(checkpoint.missing_shards.is_empty(), "checkpoint shards missing: {:?}", checkpoint.missing_shards);
     let cfg = MimoV2Config::read(&args.snapshot)?;
@@ -380,10 +474,19 @@ impl Opened {
             };
             let file = draft_file.context("drafter prefetch")?.join()
                 .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
-            let mut drafter = dflash::MimoDrafter::load(&self.library, dir, file, stream, args.draft_sequences,
-                args.draft_sequences, mask)?;
-            if args.draft_fp8 {
-                drafter.enable_fp8(engine.weights.head.buffer.ptr, args.fp8_scales)?;
+            let capacity = args.draft_capacity(cfg.block)?;
+            let representation = args.draft_storage()?;
+            let mut drafter = dflash::MimoDrafter::load(&self.library, dir, file, stream, capacity.context_slots,
+                capacity.max_batch_sequences, mask, representation, args.fp8_scales)?;
+            if representation == MimoDraftRepresentation::LegacyDual && args.draft_fp8 {
+                if let Err(error) = drafter.enable_fp8(engine.weights.head.buffer.ptr, args.fp8_scales) {
+                    // Packing borrows drafter BF16 matrices AND the target head.
+                    // Failed initialization cannot guarantee stream completion;
+                    // retain all source/destination owners until process teardown.
+                    std::mem::forget(drafter);
+                    std::mem::forget(engine);
+                    return Err(error.context("DFlash legacy initialization owners quarantined"));
+                }
             }
             engine.drafter = Some(drafter);
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash drafter resident");
@@ -546,6 +649,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
 }
 
 fn golden(args: GoldenArgs) -> Result<()> {
+    args.engine.validate_draft_replay(args.draft_replay.is_some())?;
     let opened = open(&args.engine)?;
     opened.with_engine(&args.engine, |engine| golden_run(&args, &opened, engine))
 }
@@ -569,6 +673,9 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
     }
     if let Some(start) = args.draft_replay {
         let drafter = engine.drafter.as_ref().context("--draft-replay needs --draft")?;
+        if args.engine.draft_storage()? == MimoDraftRepresentation::Bf16Only {
+            println!("DFlash replay: immutable BF16-only storage; one BF16 arithmetic arm, no FP8 comparison");
+        }
         let (tokens, greedy) = crate::families::glm5::dflash::golden_sequence(&args.golden, opened.cfg.vocab_size)?;
         let hidden = opened.cfg.hidden;
         let layers: Vec<Vec<u8>> = drafter.cfg.taps.iter()
@@ -879,7 +986,7 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<
     for slot in 1..drafter.slots {
         update(position.saturating_sub(dflash::RING), position, slot)?;
     }
-    for sequences in 1..=drafter.slots {
+    for sequences in 1..=drafter.max_batch_sequences() {
         let seqs: Vec<_> = (0..sequences).map(|slot| dflash::DraftSeq { slot, anchor: tokens[position], position, valid_from: 0 })
             .collect();
         drafter.draft(&seqs, &engine.embedding, engine.weights.head.buffer.ptr)?;
