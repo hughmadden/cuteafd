@@ -342,6 +342,20 @@ impl FamilyModel for MimoModel {
         &self.spec
     }
 
+    fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
+        -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
+        use crate::serving_capacity::{mimo_cache_geometry, CacheGeometryError};
+        let available = match &self.spec.speculator {
+            Some(SpeculatorSpec::NativeMtp { layers }) => *layers,
+            _ => 0,
+        };
+        if options.native_mtp_layers > available {
+            return Err(CacheGeometryError::Unsupported { family: "mimo_v2", what: "requested native MTP stages exceed checkpoint tensors" });
+        }
+        mimo_cache_geometry(&self.cfg, self.cfg.layers, options.coordinator_ranks, options.mimo_kv,
+            options.native_mtp_layers).map(Some)
+    }
+
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
         if role.component == Component::Vision {
             return Err("text-only: serve-mimo does not run the vision and audio towers".into());

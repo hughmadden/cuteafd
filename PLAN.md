@@ -532,6 +532,26 @@ steps into `work/p0`; tag `v1.0.0` when the list's top half is done.
 Current agent integration: `codex/v1`, isolated from the orchestration checkout.
 The user chooses release cuts; development fixes below do not cut a release.
 
+Joint serving capacity is in progress: the pure resolver budgets each physical
+GPU at 97% of total minus existing usage and explicit reservations, preserves
+small pool overrides, and reports the requested eight-checkpoint-context floor
+and its shortfall. `cuteafd plan` now describes canonical target-only cache
+storage for GLM, GLM Flash, Qwen and MiMo, including replicated versus
+head-partitioned KV, C16 / 20 state slots and exact prefix mark bytes. It does
+not infer a compiled index limit or claim that weight placement alone admits
+the serving configuration. Native MTP costs are available when explicitly
+requested; target-only costs do not include an external drafter.
+
+Next: startup must consume the same resolved pool/context/state values before
+loading weights, with actual weight conversions, all lane/workspace shapes,
+native scratch, prefix marks, transport and optional draft allocations in the
+profile. Keep checkpoint maximum and effective compiled context separate.
+MiMo Pro's practical one-RTX 1M / two-RTX 2M pool overrides must permit a
+checkpoint-maximum request where the complete reservations fit; the preferred
+eight-context target remains explicit when infeasible. Bounded host storage
+retains inactive exact prefixes; active admission deferral and active KV
+paging are separate remaining work.
+
 1. **Device-driven Spark exchange, shared by every family** — branch
    [`work/v41-device`](https://github.com/tpurtell/cuteafd/tree/work/v41-device). Today every family does 2–3
    blocking host round trips per MoE layer (router ids D2H + sync, host-built

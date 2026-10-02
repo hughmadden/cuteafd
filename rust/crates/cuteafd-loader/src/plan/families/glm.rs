@@ -61,8 +61,7 @@ impl Family for Glm {
     }
 
     fn open(&self, checkpoint: &Checkpoint) -> Result<Box<dyn FamilyModel>, ConfigError> {
-        let spec = self.spec(checkpoint).map_err(ConfigError::from_anyhow)?;
-        Ok(Box::new(GlmModel { id: self.id, spec }))
+        Ok(Box::new(self.model(checkpoint).map_err(ConfigError::from_anyhow)?))
     }
 
     fn classify(&self, spec: &ModelSpec, name: &str) -> Option<TensorRole> {
@@ -197,9 +196,9 @@ impl Glm {
     /// The spec from the runtime's reader (`GlmDsaConfig` for serve-glm,
     /// `GlmNextConfig` for serve-glmf): layer schedule, MoE and RoPE come from
     /// it; the notes describe the rest of config.json.
-    fn spec(&self, checkpoint: &Checkpoint) -> Result<ModelSpec> {
+    fn model(&self, checkpoint: &Checkpoint) -> Result<GlmModel> {
         let text = checkpoint.text_config();
-        let (layer_specs, moe, mtp) = if self.id == "glm5" {
+        let (layer_specs, moe, mtp, cache_cfg) = if self.id == "glm5" {
             let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
             let layers = (0..cfg.layers)
                 .map(|layer| LayerSpec {
@@ -222,7 +221,8 @@ impl Glm {
                 routed_scaling: Some(cfg.routed_scale),
                 groups: None,
             };
-            (layers, moe, cfg.mtp_layers)
+            let mtp = cfg.mtp_layers;
+            (layers, moe, mtp, GlmCacheConfig::Dsa(cfg))
         } else {
             let cfg = GlmNextConfig::from_hf(&checkpoint.config)?;
             let layers = (0..cfg.layers)
@@ -249,7 +249,7 @@ impl Glm {
                 routed_scaling: Some(cfg.routed_scale),
                 groups: None,
             };
-            (layers, moe, opt_usize_field(text, "num_nextn_predict_layers").unwrap_or(0))
+            (layers, moe, opt_usize_field(text, "num_nextn_predict_layers").unwrap_or(0), GlmCacheConfig::Flash(cfg))
         };
         let layer_types = str_list(text, "layer_types");
         let mut notes = Vec::new();
@@ -309,7 +309,7 @@ impl Glm {
                 "SwiGLU clamp {limit} (gate <= {limit}, |up| <= {limit}) in dense, shared and routed experts"
             ));
         }
-        Ok(ModelSpec {
+        Ok(GlmModel { id: self.id, cache_cfg, spec: ModelSpec {
             family: self.id,
             architecture: self.architecture.into(),
             hidden: usize_field(text, "hidden_size")?,
@@ -320,7 +320,7 @@ impl Glm {
             tables: Vec::new(),
             vision: checkpoint.config.get("vision_config").is_some(),
             notes,
-        })
+        } })
     }
 
 }
@@ -328,6 +328,12 @@ impl Glm {
 struct GlmModel {
     id: &'static str,
     spec: ModelSpec,
+    cache_cfg: GlmCacheConfig,
+}
+
+enum GlmCacheConfig {
+    Dsa(GlmDsaConfig),
+    Flash(GlmNextConfig),
 }
 
 /// serve-glm's decode programs read these as FP8 (E4M3 with FP32 128x128
@@ -404,6 +410,19 @@ impl GlmModel {
 impl FamilyModel for GlmModel {
     fn spec(&self) -> &ModelSpec {
         &self.spec
+    }
+
+    fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
+        -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
+        use crate::serving_capacity::{glm_cache_geometry, glm_flash_cache_geometry, CacheGeometryError};
+        if options.native_mtp_layers > 0 {
+            return Err(CacheGeometryError::Unsupported { family: self.id, what: "native MTP is not executed; reserve DFlash separately" });
+        }
+        match &self.cache_cfg {
+            GlmCacheConfig::Dsa(cfg) => glm_cache_geometry(cfg, cfg.layers, options.coordinator_ranks).map(Some),
+            GlmCacheConfig::Flash(cfg) if options.coordinator_ranks == 1 => glm_flash_cache_geometry(cfg, cfg.layers).map(Some),
+            GlmCacheConfig::Flash(_) => Err(CacheGeometryError::Unsupported { family: self.id, what: "coordinator head split is not implemented" }),
+        }
     }
 
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
