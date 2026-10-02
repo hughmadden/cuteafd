@@ -90,6 +90,8 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     engine_args.rings = engine_args.rings.max(args.max_sequences);
     let (worker_stats, max_sequences) = (stats.clone(), args.max_sequences);
     engine_args.draft_sequences = engine_args.draft_sequences.max(args.max_sequences);
+    engine_args.draft_context_slots = Some(engine_args.draft_context_slots.unwrap_or(engine_args.draft_sequences)
+        .max(engine_args.rings));
     let draft = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed,
         decode_share: args.decode_share };
     let prefix = args.prefix.clone();
@@ -172,7 +174,8 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         }
     };
     let mut ready = Some(ready);
-    let result = opened.with_engine_output(&args, cuteafd_loader::families::mimo_v2::MimoPrefillOutput::LastRow, |engine| {
+    let result = opened.with_engine_reserved(&args, Some((&prefix, max_sequences)),
+        cuteafd_loader::families::mimo_v2::MimoPrefillOutput::LastRow, |engine, host_config| {
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-mimo needs every layer");
         anyhow::ensure!(engine.has_experts(), "serve-mimo needs --peers (or --local-experts) for the routed experts");
         let spark = args.peers.is_some() && !args.local_experts;
@@ -189,7 +192,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
             let _ = ready.send(Ok(()));
         }
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), draft, &prefix,
-            args.token_io.token_select)
+            args.token_io.token_select, host_config)
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
@@ -327,16 +330,23 @@ impl Active<'_> {
 }
 
 /// The prefix cache over `engine` (always present: with zero entries it is the page allocator).
-pub(super) fn prefix_cache<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs)
+pub(super) fn prefix_cache<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs, concurrency: usize)
+    -> Result<(MimoPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
+    prefix_cache_with(engine, args, concurrency, |layout| args.host_config(layout, engine.max_context))
+}
+
+fn prefix_cache_with<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs, concurrency: usize,
+    host_config: impl FnOnce(cuteafd_engine::prefix::FamilyLayout)
+        -> Result<Option<cuteafd_hostcache::config::Config>>)
     -> Result<(MimoPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
     let entries = args.prefix_cache_entries;
-    let budget = args.prefix_cache_mark_mib << 20;
-    let family = MimoPrefix::new(engine, |mark| if entries == 0 { 0 } else { MarkArena::slots_for(1, entries, mark, budget) },
+    let budget = args.prefix_cache_mark_mib.checked_mul(1 << 20).context("MiMo mark budget overflows")?;
+    let family = MimoPrefix::new(engine, |mark| MarkArena::slots_for(concurrency, entries, mark, budget),
         args.prefix_partial == Toggle::On)?;
     let layout = family.layout();
-    // Resolve one aggregate quota for all heads, then retain and register the
-    // full KV pools and positional-mark arenas on their actual owning GPUs.
-    let host = args.host_config(layout, engine.max_context)?.map(|config| {
+    // Serving consumes the quota resolved before loading; diagnostics may
+    // resolve it here. Register all pools/mark arenas on their actual GPUs.
+    let host = host_config(layout)?.map(|config| {
         CudaCopyEngine::registered_owned(engine.library, family.host_owners()).map(|copy| (config, copy))
     }).transpose()?;
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
@@ -364,13 +374,14 @@ fn release(family: &MimoPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'
 #[allow(clippy::too_many_arguments)]
 fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
-    policy: Policy, prefix: &PrefixArgs, select: SelectPlacement) -> Result<()> {
+    policy: Policy, prefix: &PrefixArgs, select: SelectPlacement,
+    host_config: Option<cuteafd_hostcache::config::Config>) -> Result<()> {
     let draft = policy.copy;
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
     let mut cost = dflash_policy::step_cost(&PRO_TP6_STEP_MS, DECODE_ROWS);
     let mut skip = crate::families::glm5::dflash_policy::DraftSkip::default();
-    let (family, mut cache) = prefix_cache(engine, prefix)?;
+    let (family, mut cache) = prefix_cache_with(engine, prefix, max_sequences, |_| Ok(host_config))?;
     // Messages start with `<|im_start|>`: a snapshot right before one is a message boundary.
     let message_start = *QwenEncoding::from_snapshot(snapshot)?.tokens().turn_markers.first()
         .context("the chat template names no message-start token")?;
@@ -666,7 +677,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 }
                 let timer = Instant::now();
                 let drafts = drafter.draft(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
-                    engine.weights.head.buffer.ptr);
+                    engine.head());
                 let ms = timer.elapsed().as_secs_f64() * 1e3;
                 cost.observe_draft(ms);
                 draft_s += ms / 1e3;

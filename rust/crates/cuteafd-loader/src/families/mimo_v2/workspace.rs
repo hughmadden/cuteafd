@@ -44,6 +44,50 @@ pub struct MimoWorkspaceOptions {
     pub head_workspace_bytes: u64,
 }
 
+impl MimoWorkspaceOptions {
+    /// Prefill widens one sequence's compact KV on its rank's compute stream.
+    /// Both lanes may borrow the same arena: the next widen follows every
+    /// earlier attention read on that stream. Decode/BF16 keep private dummies.
+    pub fn shares_prefill_kv_wide(self) -> bool {
+        !self.decode && self.kv_cache != MimoKvCache::Bf16
+    }
+}
+
+/// One physical owner for the identical logical shadow extents of a rank's
+/// prefill workspaces. Construct this independently for each physical GPU.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MimoPrefillKvShadowPlan {
+    bytes: Option<u64>,
+}
+
+impl MimoPrefillKvShadowPlan {
+    pub fn require_same_extent(owned: u64, requested: u64) -> Result<(), CacheGeometryError> {
+        if owned < 256 || owned != requested {
+            return Err(CacheGeometryError::Unsupported {
+                family: "mimo_v2",
+                what: "shared prefill KV shadow extents differ; published storage cannot be resized",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn workspace_reservations(&mut self, name: &str, layout: &MimoWorkspaceLayout,
+        options: MimoWorkspaceOptions) -> Result<Vec<MemoryReservation>, CacheGeometryError> {
+        let mut reservations = layout.reservations(name);
+        if options.shares_prefill_kv_wide() {
+            Self::require_same_extent(self.bytes.unwrap_or(layout.kv_wide), layout.kv_wide)?;
+            self.bytes = Some(layout.kv_wide);
+            let borrowed = format!("{name}.kv_wide");
+            reservations.retain(|r| r.name != borrowed);
+        }
+        Ok(reservations)
+    }
+
+    pub fn reservation(self) -> Option<MemoryReservation> {
+        self.bytes.map(|bytes| MemoryReservation { name: "state.prefill_kv_wide".into(), bytes })
+    }
+}
+
 macro_rules! workspace_buffers {
     ($($field:ident),+ $(,)?) => {
         #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn pro_current_global_geometry_reserves_every_lane_shadow_and_peer_hidden_row() {
+    fn pro_global_geometry_requires_full_shadow_extent_and_peer_hidden_rows() {
         let cfg = MimoV2Config::from_hf(&mimo_pro_config()).unwrap();
         let lead = MimoWorkspaceLayout::new(&cfg, options()).unwrap();
         let peer = MimoWorkspaceLayout::new(
@@ -368,4 +412,49 @@ mod tests {
         );
         assert!(matches!(huge, Err(CacheGeometryError::Overflow(_))));
     }
+
+    #[test]
+    fn prefill_lanes_share_one_rank_shadow_while_decode_keeps_its_dummy() {
+        let cfg = MimoV2Config::from_hf(&mimo_pro_config()).unwrap();
+        for attention in [MimoAttentionWorkspace::Global,
+            MimoAttentionWorkspace::PartitionedHeads { ranks: 2 }] {
+            let opts = MimoWorkspaceOptions { attention, ..options() };
+            let layout = MimoWorkspaceLayout::new(&cfg, opts).unwrap();
+            let decode_opts = MimoWorkspaceOptions { decode: true, rows: 64, ..opts };
+            let decode = MimoWorkspaceLayout::new(&cfg, decode_opts).unwrap();
+            let mut owner = MimoPrefillKvShadowPlan::default();
+            let mut physical = owner.workspace_reservations("prefill", &layout, opts).unwrap();
+            physical.extend(owner.workspace_reservations("lane", &layout, opts).unwrap());
+            physical.extend(owner.workspace_reservations("decode", &decode, decode_opts).unwrap());
+            physical.extend(owner.reservation());
+            let shadow = owner.reservation().unwrap();
+            assert_eq!(shadow.bytes, if matches!(attention, MimoAttentionWorkspace::Global) { 5 << 30 } else { 5 << 29 });
+            assert_eq!(physical.iter().filter(|r| r.name == "state.prefill_kv_wide").count(), 1);
+            assert_eq!(physical.iter().find(|r| r.name == "decode.kv_wide").unwrap().bytes, 256);
+            assert_eq!(physical.iter().map(|r| r.bytes).sum::<u64>(),
+                layout.device_bytes().unwrap() * 2 + decode.device_bytes().unwrap() - shadow.bytes);
+        }
+    }
+
+    #[test]
+    fn shared_shadow_rejects_extent_changes_and_preserves_bf16_owned_dummies() {
+        let cfg = MimoV2Config::from_hf(&mimo_pro_config()).unwrap();
+        let opts = options();
+        let layout = MimoWorkspaceLayout::new(&cfg, opts).unwrap();
+        let changed_opts = MimoWorkspaceOptions { max_context: opts.max_context / 2, ..opts };
+        let changed = MimoWorkspaceLayout::new(&cfg, changed_opts).unwrap();
+        let mut owner = MimoPrefillKvShadowPlan::default();
+        owner.workspace_reservations("prefill", &layout, opts).unwrap();
+        assert!(owner.workspace_reservations("lane", &changed, changed_opts).is_err());
+        assert_eq!(owner.reservation().unwrap().bytes, layout.kv_wide);
+        let opts = MimoWorkspaceOptions { kv_cache: MimoKvCache::Bf16, ..opts };
+        let bf16 = MimoWorkspaceLayout::new(&cfg, opts).unwrap();
+        let mut owner = MimoPrefillKvShadowPlan::default();
+        for name in ["prefill", "lane"] {
+            let reservations = owner.workspace_reservations(name, &bf16, opts).unwrap();
+            assert_eq!(reservations.iter().find(|r| r.name == format!("{name}.kv_wide")).unwrap().bytes, 256);
+        }
+        assert!(owner.reservation().is_none());
+    }
+
 }

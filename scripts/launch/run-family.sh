@@ -70,7 +70,9 @@ snapshot_of() {
 #   mtp      MiMo V2 Flash, Qwen 3.8: the checkpoint's native MTP layers,
 #            SPECULATOR_DEPTH drafts (default 1)
 #   dspark   DeepSeek V4
-# SPECULATOR_FP8=off drafts in BF16. Pre-rename keys (DRAFT_MODEL_ID, DFLASH,
+# MiMo SPECULATOR_FP8=auto/unset preserves checkpoint weights; explicit on
+# quantizes supported drafter weights, off selects BF16. Other families keep
+# their existing default. Pre-rename keys (DRAFT_MODEL_ID, DFLASH,
 # MTP, DSPARK, DRAFT_FP8) still work for one release.
 speculator="$(get SPECULATOR)"
 if [[ -z "$speculator" ]]; then
@@ -181,7 +183,18 @@ fi
 if [[ $serve != serve-dsv4 ]]; then
   [[ -z "$(get L2_PREFETCH)" ]] || family_args+=(--l2-prefetch "$(get L2_PREFETCH)")
   [[ -z "$(get FP8_SCALES)" ]] || family_args+=(--fp8-scales "$(get FP8_SCALES)")
-  if [[ ${#draft_args[@]} -gt 0 && "$(key SPECULATOR_FP8 DRAFT_FP8 on)" == off ]]; then family_args+=(--draft-fp8 false); fi
+  if [[ ${#draft_args[@]} -gt 0 ]]; then
+    if [[ $family == mimo_v2 ]]; then
+      case "$(key SPECULATOR_FP8 DRAFT_FP8 auto)" in
+        ""|auto) ;;
+        on) family_args+=(--draft-fp8 true) ;;
+        off) family_args+=(--draft-fp8 false) ;;
+        *) echo "MiMo SPECULATOR_FP8/DRAFT_FP8 must be auto, on or off" >&2; exit 2 ;;
+      esac
+    elif [[ "$(key SPECULATOR_FP8 DRAFT_FP8 on)" == off ]]; then
+      family_args+=(--draft-fp8 false)
+    fi
+  fi
 fi
 # SERVED_MODEL_ID: the public model id (default: the checkpoint's Hugging Face id).
 served_args=()

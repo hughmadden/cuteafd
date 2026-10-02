@@ -20,8 +20,12 @@ use crate::shared::memory::DeviceAllocation;
 use crate::shared::token_io::TokenEmbedding;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
+use super::head::BorrowedHead;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::{read_safetensors_metadata, SafetensorsTensorMetadata};
+use cuteafd_loader::families::mimo_v2::draft_representation::{
+    MimoDraftCapacity, MimoDraftGeometry, MimoDraftRepresentation, MimoDraftRuntimeLayout, MimoDraftWeightLayout,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -133,6 +137,34 @@ impl DflashConfig {
     fn qkv_width(&self) -> usize {
         (self.heads + 2 * self.kv_heads) * self.head_dim
     }
+
+    fn weight_geometry(&self) -> MimoDraftGeometry {
+        MimoDraftGeometry { hidden: self.hidden as u64,
+            intermediate: self.intermediate as u64, layers: self.layers as u64, heads: self.heads as u64,
+            kv_heads: self.kv_heads as u64, head_dim: self.head_dim as u64, taps: self.taps.len() as u64,
+            vocab: self.vocab as u64, sinks: self.sinks }
+    }
+
+    pub fn weight_layout(&self, mode: MimoDraftRepresentation) -> Result<MimoDraftWeightLayout> {
+        Ok(MimoDraftWeightLayout::new(self.weight_geometry(), mode)?)
+    }
+
+    /// The admission consumer and allocator use the same selected mode/rows.
+    pub fn runtime_layout(&self, mode: MimoDraftRepresentation, capacity: MimoDraftCapacity)
+        -> Result<MimoDraftRuntimeLayout> {
+        Ok(MimoDraftRuntimeLayout::new(self.weight_geometry(), mode, capacity, TAP_ROWS, FP8_ROWS)?)
+    }
+}
+
+fn draft_fp8_scratch<'a>(library: &'a NativeLibrary, layout: &MimoDraftRuntimeLayout)
+    -> Result<Option<Dev<'a>>> {
+    layout.fp8_scratch.as_ref().map(|scratch| {
+        let shapes = scratch.shapes.iter().map(|shape| Ok((
+            usize::try_from(shape.k).context("DFlash scratch K width")?,
+            usize::try_from(shape.n).context("DFlash scratch N width")?,
+        ))).collect::<Result<Vec<_>>>()?;
+        fp8_linear::scratch(library, scratch.rows, &shapes)
+    }).transpose()
 }
 
 /// The drafter directory of a MiMo snapshot (`SNAP/dflash`), or `path` itself.
@@ -140,33 +172,23 @@ pub(crate) fn drafter_dir(path: &Path) -> PathBuf {
     if path.join(WEIGHTS).exists() { path.to_path_buf() } else { path.join("dflash") }
 }
 
-/// The FP8 copies of one draft layer's GEMM weights.
-struct Fp8Layer<'a> {
-    qkv: Fp8Weight<'a>,
-    o: Fp8Weight<'a>,
-    gate_up: Fp8Weight<'a>,
-    down: Fp8Weight<'a>,
-}
-
-/// Every FP8 copy (and of the target's LM head) and the GEMV's scratch.
-struct Fp8Weights<'a> {
-    fc: Fp8Weight<'a>,
-    head: Fp8Weight<'a>,
-    layers: Vec<Fp8Layer<'a>>,
-    workspace: Dev<'a>,
+/// A matrix owns exactly one immutable resident representation.
+enum DraftWeight<'a> {
+    Bf16(Dev<'a>),
+    Fp8(Fp8Weight<'a>),
 }
 
 struct DraftLayer<'a> {
     input_norm: Dev<'a>,
     post_norm: Dev<'a>,
     /// q | k | v rows; the context update reads the k | v rows.
-    qkv: Dev<'a>,
+    qkv: DraftWeight<'a>,
     q_norm: Dev<'a>,
     k_norm: Dev<'a>,
     sinks: Option<Dev<'a>>,
-    o: Dev<'a>,
-    gate_up: Dev<'a>,
-    down: Dev<'a>,
+    o: DraftWeight<'a>,
+    gate_up: DraftWeight<'a>,
+    down: DraftWeight<'a>,
     k_ring: Dev<'a>,
     v_ring: Dev<'a>,
 }
@@ -235,7 +257,7 @@ pub(crate) struct MimoDrafter<'a> {
     /// Ring slots (sequences with a drafter context).
     pub slots: usize,
     max_sequences: usize,
-    fc: Dev<'a>,
+    fc: DraftWeight<'a>,
     hidden_norm: Dev<'a>,
     norm: Dev<'a>,
     layers: Vec<DraftLayer<'a>>,
@@ -251,9 +273,9 @@ pub(crate) struct MimoDrafter<'a> {
     mask_row: Vec<u8>,
     mask_device: Dev<'a>,
     workspace: RefCell<Option<Workspace<'a>>>,
-    fp8: Option<Fp8Weights<'a>>,
-    /// Whether draft steps use `fp8` (a replay toggles it).
-    use_fp8: std::cell::Cell<bool>,
+    representation: MimoDraftRepresentation,
+    fp8_workspace: Option<Dev<'a>>,
+
 }
 
 /// The block rows' mask id: past every table, so the gather takes the mask row.
@@ -283,13 +305,58 @@ struct Checkpoint {
     tensors: HashMap<String, SafetensorsTensorMetadata>,
 }
 
+/// Read only the header before target/native admission. This loader currently
+/// supports BF16 drafter checkpoints; FP8 storage is an explicit load transform.
+pub(crate) fn checkpoint_representation(dir: &Path) -> Result<MimoDraftRepresentation> {
+    let tensors = read_safetensors_metadata(&dir.join(WEIGHTS))?;
+    ensure!(!tensors.is_empty(), "DFlash checkpoint has no tensors");
+    for tensor in tensors {
+        ensure!(tensor.dtype == cuteafd_core::DType::Bf16,
+            "DFlash checkpoint tensor {} has unsupported source {:?}; the drafter loader requires checkpoint BF16, add a native-format reader before selecting this checkpoint",
+            tensor.name, tensor.dtype);
+    }
+    Ok(MimoDraftRepresentation::Bf16Only)
+}
+
 impl Checkpoint {
     fn bytes(&self, name: &str, shape: &[usize]) -> Result<&[u8]> {
         let t = self.tensors.get(name).with_context(|| format!("DFlash checkpoint has no {name}"))?;
-        ensure!(t.shape == shape && t.byte_length as usize == shape.iter().product::<usize>() * 2,
+        let expected = shape.iter().try_fold(2usize, |bytes, dim| bytes.checked_mul(*dim))
+            .with_context(|| format!("{name}: BF16 tensor byte count overflow"))?;
+        ensure!(t.dtype == cuteafd_core::DType::Bf16 && t.shape == shape && t.byte_length as usize == expected,
             "{name}: shape {:?}, expected BF16 {shape:?}", t.shape);
-        let range = t.byte_offset as usize..(t.byte_offset + t.byte_length) as usize;
+        let start = usize::try_from(t.byte_offset).with_context(|| format!("{name}: tensor offset overflow"))?;
+        let end = t.byte_offset.checked_add(t.byte_length).and_then(|end| usize::try_from(end).ok())
+            .with_context(|| format!("{name}: tensor range overflow"))?;
+        let range = start..end;
         self.data.get(range).with_context(|| format!("{name} lies past the file"))
+    }
+
+    /// Check every source header/range before any device weight is allocated.
+    fn validate(&self, c: &DflashConfig) -> Result<()> {
+        let (h, kv, inter) = (c.hidden, c.kv_width(), c.intermediate);
+        self.bytes("fc.weight", &[h, c.taps.len() * h])?;
+        self.bytes("hidden_norm.weight", &[h])?;
+        self.bytes("norm.weight", &[h])?;
+        for l in 0..c.layers {
+            let p = format!("layers.{l}");
+            for norm in ["input_layernorm", "post_attention_layernorm"] {
+                self.bytes(&format!("{p}.{norm}.weight"), &[h])?;
+            }
+            let a = format!("{p}.self_attn");
+            for (projection, rows, cols) in [("q_proj", c.heads * c.head_dim, h),
+                ("k_proj", kv, h), ("v_proj", kv, h), ("o_proj", h, c.heads * c.head_dim)] {
+                self.bytes(&format!("{a}.{projection}.weight"), &[rows, cols])?;
+            }
+            for norm in ["q_norm", "k_norm"] {
+                self.bytes(&format!("{a}.{norm}.weight"), &[c.head_dim])?;
+            }
+            if c.sinks { self.bytes(&format!("{a}.attention_sink_bias"), &[c.heads])?; }
+            for (projection, rows, cols) in [("gate_proj", inter, h), ("up_proj", inter, h), ("down_proj", h, inter)] {
+                self.bytes(&format!("{p}.mlp.{projection}.weight"), &[rows, cols])?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -336,13 +403,20 @@ impl<'a> MimoDrafter<'a> {
     /// [`prefetch`]) and allocates `slots` ring contexts; draft steps take up
     /// to `max_sequences` sequences. `mask_row` is the mask token's embedding.
     pub fn load(library: &'a NativeLibrary, dir: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
-        max_sequences: usize, mask_row: Vec<u8>) -> Result<Self> {
+        max_sequences: usize, mask_row: Vec<u8>, representation: MimoDraftRepresentation,
+        scales: fp8_linear::Fp8Scales) -> Result<Self> {
         let cfg = DflashConfig::read(dir)?;
+        ensure!(matches!(representation, MimoDraftRepresentation::Bf16Only | MimoDraftRepresentation::Fp8Only),
+            "MiMo serving supports only immutable bf16-only or fp8-only drafter storage; historical dual/mixed controls are not production modes");
+        let capacity = MimoDraftCapacity::new(slots, max_sequences, cfg.block)?;
+        let runtime_layout = cfg.runtime_layout(representation, capacity)?;
+        let weight_layout = runtime_layout.weights;
         ensure!(mask_row.len() == cfg.hidden * 2, "mask row of {} bytes", mask_row.len());
         let checkpoint = Checkpoint {
             data: file,
             tensors: read_safetensors_metadata(&dir.join(WEIGHTS))?.into_iter().map(|t| (t.name.clone(), t)).collect(),
         };
+        checkpoint.validate(&cfg)?;
         let upload = |bytes: &[u8]| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, bytes.len().max(256))?;
             library.copy_h2d(allocation.buffer, bytes)?;
@@ -354,6 +428,9 @@ impl<'a> MimoDrafter<'a> {
             Ok(allocation)
         };
         let (h, kv, inter) = (cfg.hidden, cfg.kv_width(), cfg.intermediate);
+        let fp8_workspace = if representation == MimoDraftRepresentation::Fp8Only {
+            draft_fp8_scratch(library, &runtime_layout)?
+        } else { None };
         let tensor = |name: &str, shape: &[usize]| checkpoint.bytes(name, shape).and_then(upload);
         let concat = |parts: &[(&str, usize)], cols: usize| -> Result<Dev<'a>> {
             let total: usize = parts.iter().map(|(_, rows)| rows * cols * 2).sum();
@@ -367,32 +444,56 @@ impl<'a> MimoDrafter<'a> {
             }
             Ok(allocation)
         };
+        let matrix = |source: Dev<'a>, n: usize, k: usize, _context_weight: bool| -> Result<DraftWeight<'a>> {
+            match representation {
+                MimoDraftRepresentation::Bf16Only => Ok(DraftWeight::Bf16(source)),
+                MimoDraftRepresentation::Fp8Only => {
+                    let packed = Fp8Weight::pack(library, source.buffer.ptr, n, k, scales, stream);
+                    // SAFETY: packing reads this live BF16 source on `stream`.
+                    // Drain even on packing failure before the source leaves scope.
+                    let drained = unsafe { library.cuda_stream_synchronize(stream) };
+                    if let Err(error) = drained {
+                        // Packing may still read source or write its result.
+                        // Quarantine both owners; neither follows ordinary Drop.
+                        std::mem::forget(source);
+                        if let Ok(weight) = packed { weight.quarantine(); }
+                        return Err(error.context("DFlash source/destination quarantined after failed packing drain"));
+                    }
+                    let packed = packed?;
+                    drop(source);
+                    Ok(DraftWeight::Fp8(packed))
+                }
+            }
+        };
         let layers = (0..cfg.layers).map(|l| -> Result<DraftLayer<'a>> {
             let p = format!("layers.{l}");
             let a = format!("{p}.self_attn");
             Ok(DraftLayer {
                 input_norm: tensor(&format!("{p}.input_layernorm.weight"), &[h])?,
                 post_norm: tensor(&format!("{p}.post_attention_layernorm.weight"), &[h])?,
-                qkv: concat(&[(&format!("{a}.q_proj.weight"), cfg.heads * cfg.head_dim),
-                    (&format!("{a}.k_proj.weight"), kv), (&format!("{a}.v_proj.weight"), kv)], h)?,
+                qkv: matrix(concat(&[(&format!("{a}.q_proj.weight"), cfg.heads * cfg.head_dim),
+                    (&format!("{a}.k_proj.weight"), kv), (&format!("{a}.v_proj.weight"), kv)], h)?, cfg.qkv_width(), h, true)?,
                 q_norm: tensor(&format!("{a}.q_norm.weight"), &[cfg.head_dim])?,
                 k_norm: tensor(&format!("{a}.k_norm.weight"), &[cfg.head_dim])?,
                 sinks: if cfg.sinks { Some(tensor(&format!("{a}.attention_sink_bias"), &[cfg.heads])?) } else { None },
-                o: tensor(&format!("{a}.o_proj.weight"), &[h, cfg.heads * cfg.head_dim])?,
-                gate_up: concat(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
-                    (&format!("{p}.mlp.up_proj.weight"), inter)], h)?,
-                down: tensor(&format!("{p}.mlp.down_proj.weight"), &[h, inter])?,
+                o: matrix(tensor(&format!("{a}.o_proj.weight"), &[h, cfg.heads * cfg.head_dim])?, h, cfg.heads * cfg.head_dim, false)?,
+                gate_up: matrix(concat(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
+                    (&format!("{p}.mlp.up_proj.weight"), inter)], h)?, 2 * inter, h, false)?,
+                down: matrix(tensor(&format!("{p}.mlp.down_proj.weight"), &[h, inter])?, h, inter, false)?,
                 k_ring: zeroed(slots * RING * kv * 2)?,
                 v_ring: zeroed(slots * RING * kv * 2)?,
             })
         }).collect::<Result<Vec<_>>>()?;
         let taps = cfg.taps.len() * h;
+        tracing::info!(?representation, own_weight_bytes = weight_layout.resident_bytes()?,
+            max_load_staging = weight_layout.max_load_staging, slots, max_sequences,
+            "DFlash immutable weight storage");
         Ok(Self {
             library,
             stream,
             slots,
             max_sequences,
-            fc: tensor("fc.weight", &[h, taps])?,
+            fc: matrix(tensor("fc.weight", &[h, taps])?, h, taps, true)?,
             hidden_norm: tensor("hidden_norm.weight", &[h])?,
             norm: tensor("norm.weight", &[h])?,
             layers,
@@ -405,14 +506,18 @@ impl<'a> MimoDrafter<'a> {
             mask_device: upload(&mask_row)?,
             mask_row,
             workspace: RefCell::new(None),
-            fp8: None,
-            use_fp8: std::cell::Cell::new(false),
+            representation,
+            fp8_workspace,
             cfg,
         })
     }
 
     pub fn tap_index(&self, layer: usize) -> Option<usize> {
         self.cfg.taps.iter().position(|&l| l == layer)
+    }
+
+    pub fn max_batch_sequences(&self) -> usize {
+        self.max_sequences
     }
 
     /// Copies target layer output rows `[first, first + n)` of `hidden`
@@ -428,64 +533,28 @@ impl<'a> MimoDrafter<'a> {
         }
     }
 
-    /// Makes E4M3 copies of every GEMM weight and of the target's LM head
-    /// `head` ([vocab, hidden] BF16) and drafts through them from now on (see
-    /// [`crate::families::glm5::dflash::GlmDrafter::enable_fp8`]).
-    pub fn enable_fp8(&mut self, head: *const c_void, scales: fp8_linear::Fp8Scales) -> Result<()> {
-        let started = std::time::Instant::now();
-        let (library, stream) = (self.library, self.stream);
-        let pack = |w: *const c_void, n: usize, k: usize| Fp8Weight::pack(library, w, n, k, scales, stream);
-        let c = &self.cfg;
-        let (h, inter, attention) = (c.hidden, c.intermediate, c.heads * c.head_dim);
-        let layers = self.layers.iter().map(|l| -> Result<Fp8Layer<'a>> {
-            Ok(Fp8Layer {
-                qkv: pack(l.qkv.buffer.ptr, c.qkv_width(), h)?,
-                o: pack(l.o.buffer.ptr, h, attention)?,
-                gate_up: pack(l.gate_up.buffer.ptr, 2 * inter, h)?,
-                down: pack(l.down.buffer.ptr, h, inter)?,
-            })
-        }).collect::<Result<Vec<_>>>()?;
-        let fc = pack(self.fc.buffer.ptr, h, c.taps.len() * h)?;
-        let head = pack(head, c.vocab, h)?;
-        let mut shapes = vec![(fc.k, fc.n), (head.k, head.n), (h, 2 * c.kv_width())];
-        for l in &layers {
-            for w in [&l.qkv, &l.o, &l.gate_up, &l.down] {
-                shapes.push((w.k, w.n));
-            }
-        }
-        let workspace = fp8_linear::scratch(library, FP8_ROWS, &shapes)?;
-        // SAFETY: the packing kernels ran on this stream.
-        unsafe { library.cuda_stream_synchronize(stream)? };
-        let resident: usize = [&fc, &head].into_iter()
-            .chain(layers.iter().flat_map(|l| [&l.qkv, &l.o, &l.gate_up, &l.down])).map(Fp8Weight::bytes).sum();
-        tracing::info!(gib = resident as f64 / (1u64 << 30) as f64, ?scales, elapsed_ms = started.elapsed().as_millis() as u64,
-            "DFlash drafter FP8 copies (and FP8 LM head) resident");
-        self.fp8 = Some(Fp8Weights { fc, head, layers, workspace });
-        self.use_fp8.set(true);
-        Ok(())
-    }
-
-    /// Drafts through the FP8 copies (when made) or the BF16 weights.
-    pub fn set_fp8(&self, on: bool) {
-        self.use_fp8.set(on && self.fp8.is_some());
-    }
-
-    /// `out` [rows, n] = `x` [rows, k] @ `w`^T: the FP8 copy `w8` (from row
-    /// `first`) for up to [`FP8_ROWS`] rows while FP8 drafting is on, else cuBLAS BF16.
+    /// `out` [rows, n] = `x` [rows, k] @ weight rows `first..first+n`.
+    /// FP8-only storage covers every row count through the native kernel's
+    /// bounded 64-row chunks. There is no resident BF16 fallback.
     ///
     /// # Safety
     /// Pointers are live device buffers of those shapes.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn linear(&self, x: *const c_void, w: *const c_void, w8: Option<(&Fp8Weight<'_>, usize)>, out: *mut c_void,
+    unsafe fn linear(&self, x: *const c_void, weight: &DraftWeight<'_>, first: usize, out: *mut c_void,
         rows: usize, k: usize, n: usize) -> Result<()> {
-        match (self.fp8.as_ref(), w8) {
-            (Some(fp8), Some((w8, first))) if self.use_fp8.get() && rows <= FP8_ROWS => {
-                // SAFETY: the caller's contract; the scratch was sized for FP8_ROWS rows of every shape.
-                unsafe { w8.apply(self.library, x, out, false, rows, first, n, &fp8.workspace, self.stream) }
-            }
-            // SAFETY: the caller's contract.
-            _ => unsafe { self.library.linear_bf16(x, w, out, rows, k, n, self.stream) },
+        let fp8 = match weight { DraftWeight::Fp8(w) => Some(w), _ => None };
+        if let Some(w8) = fp8 {
+            let scratch = self.fp8_workspace.as_ref().context("FP8-only DFlash scratch was not admitted")?;
+            // SAFETY: the caller's contract; scratch covers each native chunk
+            // of all admitted draft and TAP_ROWS context-update shapes.
+            return unsafe { w8.apply(self.library, x, out, false, rows, first, n, scratch, self.stream) };
         }
+        let bf16 = match weight {
+            DraftWeight::Bf16(w) => w,
+            DraftWeight::Fp8(_) => anyhow::bail!("FP8-only DFlash has no BF16 fallback"),
+        };
+        // SAFETY: the selected rows belong to the live BF16 matrix.
+        unsafe { self.library.linear_bf16(x, at(bf16, first * k * 2), out, rows, k, n, self.stream) }
     }
 
     /// Writes the context K/V of committed tapped rows.
@@ -509,15 +578,13 @@ impl<'a> MimoDrafter<'a> {
         let s = self.stream;
         // SAFETY: every buffer holds TAP_ROWS rows of its width; the stream orders the chain.
         unsafe {
-            let fp8 = self.fp8.as_ref();
-            self.linear(at(&self.taps, first * width * 2), self.fc.buffer.ptr, fp8.map(|f| (&f.fc, 0)),
+            self.linear(at(&self.taps, first * width * 2), &self.fc, 0,
                 self.fused.buffer.ptr, n, width, h)?;
             self.library.glm_dflash_rmsnorm(self.fused.buffer.ptr, self.hidden_norm.buffer.ptr,
                 self.fused_norm.buffer.ptr, n, h, c.eps, s)?;
-            for (index, layer) in self.layers.iter().enumerate() {
+            for layer in &self.layers {
                 let q_rows = c.heads * c.head_dim;
-                let kv_rows = at(&layer.qkv, q_rows * h * 2);
-                self.linear(self.fused_norm.buffer.ptr, kv_rows, fp8.map(|f| (&f.layers[index].qkv, q_rows)),
+                self.linear(self.fused_norm.buffer.ptr, &layer.qkv, q_rows,
                     self.context_kv.buffer.ptr, n, h, 2 * kv)?;
                 self.library.mimo_dflash_qk_rope(self.context_kv.buffer.ptr, layer.q_norm.buffer.ptr,
                     layer.k_norm.buffer.ptr, self.context_positions.buffer.ptr, self.context_slots.buffer.ptr,
@@ -570,18 +637,26 @@ impl<'a> MimoDrafter<'a> {
     /// Drafts `block - 1` tokens after each sequence's anchor, its rows
     /// gathered on the device from the target's embedding table (the mask
     /// rows from the trained mask row); `head` is the target's vocabulary head
-    /// [vocab, hidden] BF16.
-    pub fn draft(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>, head: *const c_void)
+    /// in its immutable BF16 or target row-major FP8 representation.
+    pub fn draft(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>, head: BorrowedHead<'_, '_>)
         -> Result<Vec<Draft>> {
-        self.draft_from(sequences, Anchors::Tokens(embedding), head)
+        ensure!(head.hidden == self.cfg.hidden && head.vocab == self.cfg.vocab,
+            "DFlash borrowed target head geometry differs from its checkpoint");
+        self.draft_from(sequences, Anchors::Tokens(embedding), |plan, x, out, rows|
+            head.launch(Some(plan), x, out, rows, self.stream))
     }
 
     /// [`Self::draft`] from the anchors' embedding rows (oracles and replays).
     pub fn draft_rows(&self, sequences: &[DraftSeq], anchor_rows: &[u8], head: *const c_void) -> Result<Vec<Draft>> {
-        self.draft_from(sequences, Anchors::Rows(anchor_rows), head)
+        self.draft_from(sequences, Anchors::Rows(anchor_rows), |plan, x, out, rows| {
+            // SAFETY: ReplayDrafter's caller retains a complete BF16 target
+            // head. FP8-only targets reject that diagnostic before loading.
+            unsafe { plan.launch(x.ptr.cast(), head.cast(), out.ptr.cast(), rows as u32, self.stream) }
+        })
     }
 
-    fn draft_from(&self, sequences: &[DraftSeq], anchors: Anchors<'_>, head: *const c_void) -> Result<Vec<Draft>> {
+    fn draft_from(&self, sequences: &[DraftSeq], anchors: Anchors<'_>,
+        head: impl FnOnce(&VocabularyHead<'_>, CuteafdDeviceBuffer, CuteafdDeviceBuffer, usize) -> Result<()>) -> Result<Vec<Draft>> {
         let c = &self.cfg;
         let (s_count, block, h) = (sequences.len(), c.block, c.hidden);
         let anchors_fit = match anchors {
@@ -632,14 +707,12 @@ impl<'a> MimoDrafter<'a> {
         self.put(&w.tables, bytes_of(&tables))?;
         let (s, l, eps, inter) = (self.stream, self.library, c.eps, c.intermediate);
         let attention_width = c.heads * c.head_dim;
-        let fp8 = self.fp8.as_ref().filter(|_| self.use_fp8.get());
         // SAFETY: every workspace buffer holds `rows` rows of its width and the
         // weights their checkpoint shapes; the stream orders the chain.
         unsafe {
             l.glm_dflash_rmsnorm(w.h.buffer.ptr, self.layers[0].input_norm.buffer.ptr, w.n.buffer.ptr, rows, h, eps, s)?;
             for (index, layer) in self.layers.iter().enumerate() {
-                let f8 = fp8.map(|f| &f.layers[index]);
-                self.linear(w.n.buffer.ptr, layer.qkv.buffer.ptr, f8.map(|f| (&f.qkv, 0)), w.qkv.buffer.ptr, rows, h,
+                self.linear(w.n.buffer.ptr, &layer.qkv, 0, w.qkv.buffer.ptr, rows, h,
                     c.qkv_width())?;
                 l.mimo_dflash_qk_rope(w.qkv.buffer.ptr, layer.q_norm.buffer.ptr, layer.k_norm.buffer.ptr,
                     w.positions.buffer.ptr, std::ptr::null(), w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr, rows,
@@ -649,23 +722,19 @@ impl<'a> MimoDrafter<'a> {
                     at(&w.tables, 2 * s_count * 4), layer.sinks.as_ref().map_or(std::ptr::null(), |t| t.buffer.ptr),
                     w.attn.buffer.ptr, w.attention_workspace.buffer.ptr, s_count, block, c.heads, c.kv_heads, RING,
                     RING + block, c.window, 1.0 / (c.head_dim as f32).sqrt(), s)?;
-                self.linear(w.attn.buffer.ptr, layer.o.buffer.ptr, f8.map(|f| (&f.o, 0)), w.delta.buffer.ptr, rows,
+                self.linear(w.attn.buffer.ptr, &layer.o, 0, w.delta.buffer.ptr, rows,
                     attention_width, h)?;
                 l.mimo_dflash_add_norm(w.h.buffer.ptr, w.delta.buffer.ptr, layer.post_norm.buffer.ptr, w.n.buffer.ptr,
                     rows, h, eps, s)?;
-                self.linear(w.n.buffer.ptr, layer.gate_up.buffer.ptr, f8.map(|f| (&f.gate_up, 0)), w.gate_up.buffer.ptr,
+                self.linear(w.n.buffer.ptr, &layer.gate_up, 0, w.gate_up.buffer.ptr,
                     rows, h, 2 * inter)?;
                 l.glm_dflash_silu_mul(w.gate_up.buffer.ptr, w.act.buffer.ptr, rows, inter, s)?;
-                self.linear(w.act.buffer.ptr, layer.down.buffer.ptr, f8.map(|f| (&f.down, 0)), w.delta.buffer.ptr, rows,
+                self.linear(w.act.buffer.ptr, &layer.down, 0, w.delta.buffer.ptr, rows,
                     inter, h)?;
                 let next = self.layers.get(index + 1).map_or(self.norm.buffer.ptr, |n| n.input_norm.buffer.ptr);
                 l.mimo_dflash_add_norm(w.h.buffer.ptr, w.delta.buffer.ptr, next, w.n.buffer.ptr, rows, h, eps, s)?;
             }
-            match fp8 {
-                Some(f) if rows <= FP8_ROWS => f.head.apply(l, w.n.buffer.ptr, w.logits.buffer.ptr, true, rows, 0,
-                    c.vocab, &f.workspace, s)?,
-                _ => w.head.launch(w.n.buffer.ptr.cast(), head.cast(), w.logits.buffer.ptr.cast(), rows as u32, s)?,
-            }
+            head(&w.head, w.n.buffer, w.logits.buffer, rows)?;
             l.glm_dflash_topk(w.logits.buffer.ptr, w.unary.buffer.ptr, w.candidates.buffer.ptr,
                 w.topk_workspace.buffer.ptr, s_count, block, c.drafts(), c.vocab, s)?;
             l.cuda_stream_synchronize(s)?;
@@ -724,11 +793,12 @@ impl crate::families::glm5::dflash::ReplayDrafter for MimoDrafter<'_> {
     }
 
     fn has_fp8(&self) -> bool {
-        self.fp8.is_some()
+        false
     }
 
-    fn set_fp8(&self, on: bool) {
-        MimoDrafter::set_fp8(self, on);
+    fn set_fp8(&self, _on: bool) {
+        // Shared replay's legacy restore hook is inert. This drafter has one
+        // immutable representation and has_fp8() advertises no toggle arm.
     }
 
     fn context(&self, taps: &[u8], first: usize) -> Result<()> {

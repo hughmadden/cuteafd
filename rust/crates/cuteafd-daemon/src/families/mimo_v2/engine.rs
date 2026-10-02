@@ -24,6 +24,8 @@
 //! captured graph per layer segment between the Spark exchanges
 //! ([`MimoEngine::decode_layers`]), every 1..=64-row shape captured at startup.
 use super::weights::{MimoLayer, MimoWeights};
+use super::head::BorrowedHead;
+use cuteafd_loader::families::mimo_v2::workspace::MimoPrefillKvShadowPlan;
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
 use crate::shared::launch_grid::Fp8QuantizeGrid;
@@ -51,7 +53,7 @@ type Dev<'a> = DeviceAllocation<'a>;
 pub(crate) const PAGE_ROWS: usize = 64;
 pub(crate) const RING_ROWS: usize = 256;
 /// Rows of the decode-route programs (`_m64`).
-pub(crate) const DECODE_ROWS: usize = 64;
+pub(crate) const DECODE_ROWS: usize = cuteafd_loader::families::mimo_v2::decode_graph::MIMO_DECODE_ROWS;
 /// Expert scratch and transport must fit every decode/verify row shape even
 /// when prompts are deliberately processed through a narrower workspace.
 pub(super) fn expert_capacity(prefill_rows: usize) -> usize {
@@ -271,7 +273,7 @@ struct Workspace<'a> {
     delta: Dev<'a>,
     kv_step: Dev<'a>,
     /// 8-bit KV prefill: BF16 copy of one sequence's full-attention records (`max_context` rows).
-    kv_wide: Dev<'a>,
+    kv_wide: Rc<Dev<'a>>,
     positions: Dev<'a>,
     slots: Dev<'a>,
     step_slots: Dev<'a>,
@@ -309,6 +311,7 @@ pub(crate) struct Peer<'a> {
     cos_sin_swa: Dev<'a>,
     workspace: RefCell<Option<Workspace<'a>>>,
     lane_workspace: RefCell<Option<Workspace<'a>>>,
+    prefill_kv_wide: RefCell<Option<Rc<Dev<'a>>>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     /// Rank 1's decode segments (see [`MimoEngine::decode_layers`]).
     graphs: RefCell<HashMap<GraphKey, GraphExec<'a>>>,
@@ -374,6 +377,7 @@ pub(crate) struct MimoEngine<'a> {
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     /// The first row lane's workspace of a pipelined prefill (no LM head).
     lane_workspace: RefCell<Option<Workspace<'a>>>,
+    prefill_kv_wide: RefCell<Option<Rc<Dev<'a>>>>,
     experts: Option<Experts<'a>>,
     pub expert_input: ExpertInput,
     /// Host time per phase: GPU wait before the expert request, the Spark exchange.
@@ -395,6 +399,8 @@ pub(crate) struct MimoEngine<'a> {
     /// row and 128-K block, the official FP8 release's served numerics); false:
     /// W8A16 (bitwise the former BF16 prefill over dequantized weights).
     pub prefill_w8a8: bool,
+    /// Kernel/activation choice over the same immutable FP8 output weight.
+    pub output_fp8_decode: bool,
     /// KV record format of every layer (and the MTP rings).
     kv_cache: MimoKvCache,
     /// Decode and verify steps replay one captured graph per layer segment
@@ -402,6 +408,11 @@ pub(crate) struct MimoEngine<'a> {
     pub decode_graphs: bool,
     /// Rank 0's decode segments, keyed by everything they bake in.
     graphs: RefCell<HashMap<GraphKey, GraphExec<'a>>>,
+    /// Frozen preallocation bound for each physical rank; graph storage has
+    /// its own contract, separate from modules/libraries/constraints.
+    pub(super) graph_storage_plan: Option<cuteafd_loader::families::mimo_v2::decode_graph::MimoDecodeGraphPlan>,
+    pub(super) graph_storage_bound_bytes: Option<Vec<u64>>,
+    graph_storage_observed_bytes: [Cell<u64>;2],
     /// Graphs captured while serving (after [`Self::capture_decode_graphs`]): each is a
     /// shape the startup capture missed.
     late_captures: Cell<usize>,
@@ -422,15 +433,22 @@ fn fp8_scalars(rows: Scalar, decode: bool, fp8: bool) -> Vec<Scalar> {
 }
 
 /// An FP8-only weight's scales: row major for decode programs, K-block major for prefill ones.
-fn scale(name: &str, decode: bool, layer: &MimoLayer<'_>) -> Result<(&'static str, *mut c_void)> {
-    let operand: &'static str = match (name, decode) {
+fn scale_operand(name: &str, decode: bool) -> Result<&'static str> {
+    Ok(match (name, decode) {
         ("w_qkv", true) => "w_qkv_scale",
         ("w_qkv", false) => "w_qkv_kscale",
         ("w_gate_up", true) => "w_gate_up_scale",
         ("w_gate_up", false) => "w_gate_up_kscale",
         ("w_down", true) => "w_down_scale",
-        _ => "w_down_kscale",
-    };
+        ("w_down", false) => "w_down_kscale",
+        ("w_o", true) => "w_o_scale",
+        ("w_o", false) => "w_o_kscale",
+        _ => anyhow::bail!("unknown MiMo FP8 weight {name}: no scale operand is registered"),
+    })
+}
+
+fn scale(name: &str, decode: bool, layer: &MimoLayer<'_>) -> Result<(&'static str, *mut c_void)> {
+    let operand = scale_operand(name, decode)?;
     Ok((operand, layer.ptr(operand)?))
 }
 
@@ -476,12 +494,14 @@ impl<'a> MimoEngine<'a> {
             pages, rings, family, device,
             split_family, peer: None, exchange: None, kv, cos_sin_full,
             cos_sin_swa, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
-            lane_workspace: RefCell::new(None), experts: None,
+            lane_workspace: RefCell::new(None), prefill_kv_wide: RefCell::new(None), experts: None,
             expert_input: ExpertInput::Fp8,
             profile: RefCell::new([0.0; 2]),
             wave_timing: std::env::var("CUTEAFD_MIMO_WAVE_TIMING").is_ok_and(|v| v == "1"), drafter: None, mtp: None, l2: None, embedding,
-            mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20)?, 0)), prefill_w8a8: true, kv_cache,
-            decode_graphs: false, graphs: RefCell::new(HashMap::new()), late_captures: Cell::new(0) })
+            mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20)?, 0)), prefill_w8a8: true,
+            output_fp8_decode: true, kv_cache,
+            decode_graphs: false, graphs: RefCell::new(HashMap::new()), graph_storage_plan: None, graph_storage_bound_bytes: None,
+            graph_storage_observed_bytes: std::array::from_fn(|_| Cell::new(0)), late_captures: Cell::new(0) })
     }
 
     /// Layer `layer`'s KV storage: the paged record pool (full attention; page `p` holds
@@ -560,7 +580,7 @@ impl<'a> MimoEngine<'a> {
             let table = |theta: f64| rope_table(library, self.cfg.rope_dim, theta, self.max_context);
             Ok(Peer { device, stream, kv, cos_sin_full: table(self.cfg.full_rope_theta)?,
                 cos_sin_swa: table(self.cfg.swa_rope_theta)?, layers, workspace: RefCell::new(None),
-                lane_workspace: RefCell::new(None), decode_workspace: RefCell::new(None), graphs: RefCell::new(HashMap::new()) })
+                lane_workspace: RefCell::new(None), prefill_kv_wide: RefCell::new(None), decode_workspace: RefCell::new(None), graphs: RefCell::new(HashMap::new()) })
         })?;
         self.peer = Some(peer);
         self.exchange = Some(exchange);
@@ -613,6 +633,13 @@ impl<'a> MimoEngine<'a> {
         self.experts.is_some()
     }
 
+    /// Borrows the immutable target head, including its exact native layout.
+    /// Every queued head launch is drained while the engine still owns it.
+    pub fn head(&self) -> BorrowedHead<'_, 'a> {
+        BorrowedHead { weight: &self.weights.head, programs: self.programs, family: self.family,
+            hidden: self.cfg.hidden, vocab: self.cfg.vocab_size }
+    }
+
     fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
         DeviceAllocation::new(self.library, bytes.max(256))
     }
@@ -644,47 +671,46 @@ impl<'a> MimoEngine<'a> {
             .with_context(|| format!("{name} with {scalars:?}"))
     }
 
-    fn scratch(&self, name: &str, split: bool) -> Result<usize> {
-        Ok(self.programs.spec(&self.program_name(name, split))?.scratch.get("scratch").copied().unwrap_or(0) as usize)
-    }
-
     /// Rank `rank`'s workspace for steps of up to `t` rows (rank 1 holds the
     /// attention-side buffers only); allocated on that rank's GPU.
     fn workspace(&self, rank: usize, t: usize, decode: bool) -> Result<Workspace<'a>> {
         self.on(rank, || self.workspace_here(rank, t, decode, true))
     }
 
+    /// All consumers use this rank's compute stream. A lane's next widen is
+    /// ordered after the prior attention reads; no transport owns this arena.
+    /// Every workspace retains an Rc, and published storage is never resized.
+    fn shared_prefill_kv_wide(&self, rank: usize, bytes: usize) -> Result<Rc<Dev<'a>>> {
+        let cell = if rank == 0 { &self.prefill_kv_wide }
+            else { &self.peer.as_ref().context("prefill KV shadow peer")?.prefill_kv_wide };
+        let mut owned = cell.borrow_mut();
+        if let Some(arena) = owned.as_ref() {
+            MimoPrefillKvShadowPlan::require_same_extent(arena.buffer.bytes as u64, bytes as u64)?;
+            return Ok(Rc::clone(arena));
+        }
+        let arena = Rc::new(self.alloc(bytes)?);
+        *owned = Some(Rc::clone(&arena));
+        Ok(arena)
+    }
+
     /// `head`: the LM head and its logits (only the first row lane of a
     /// pipelined prefill skips them).
     fn workspace_here(&self, rank: usize, t: usize, decode: bool, head: bool) -> Result<Workspace<'a>> {
         let h = self.cfg.hidden;
-        let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
         let lead = rank == 0;
         let with_head = lead && head;
-        let mut scratch = if lead { self.scratch("mimo_router_scores", false)? } else { 0 };
-        // Whole-model programs (MTP layers on rank 0) and the split share's.
-        let families: &[bool] = match (self.split_family, lead) {
-            (None, _) => &[false],
-            (Some(_), true) => &[false, true],
-            (Some(_), false) => &[true],
-        };
-        for &split in families {
-            let kv = self.kv_cache.program_tag();
-            for name in [format!("mimo_full_producer{kv}_{cap}"), format!("mimo_swa_producer_{cap}"),
-                format!("mimo_full_attention{kv}_{mode}_{cap}"), format!("mimo_swa_attention_{mode}_{cap}"),
-                format!("mimo_ffn_{cap}")] {
-                scratch = scratch.max(self.scratch(&name, split)?);
-            }
-        }
+        let scratch = super::admission::workspace_native_scratch(&self.cfg, self.programs,
+            if self.split_family.is_some() { 2 } else { 1 }, rank, decode, self.kv_cache, self.weights.output_fp8)?;
         let spark = lead && matches!(self.experts, Some(Experts::Spark { .. }));
         let attention = attention_workspace_geometry(rank, self.ranks(), decode,
             self.weights.layers.iter().all(|layer| layer.split));
-        let layout = MimoWorkspaceLayout::new(&self.cfg, MimoWorkspaceOptions {
+        let options = MimoWorkspaceOptions {
             rows: t as u64, decode, lead, with_head, spark, max_context: self.max_context as u64,
             pool_pages: self.pages as u64, kv_cache: self.kv_cache,
-            attention, prefill_output: self.prefill_output, native_scratch_bytes: scratch as u64,
+            attention, prefill_output: self.prefill_output, native_scratch_bytes: scratch,
             head_workspace_bytes: VOCABULARY_HEAD_WORKSPACE as u64,
-        })?;
+        };
+        let layout = MimoWorkspaceLayout::new(&self.cfg, options)?;
         let size = |bytes| usize::try_from(bytes).context("MiMo workspace size does not fit this process");
         let head_workspace = self.alloc(size(layout.head_workspace)?)?;
         let identity: Vec<i64> = (0..t as i64).collect();
@@ -699,7 +725,9 @@ impl<'a> MimoEngine<'a> {
             attn: self.alloc(size(layout.attn)?)?,
             delta: self.alloc(size(layout.delta)?)?,
             kv_step: self.alloc(size(layout.kv_step)?)?,
-            kv_wide: self.alloc(size(layout.kv_wide)?)?,
+            kv_wide: if options.shares_prefill_kv_wide() {
+                self.shared_prefill_kv_wide(rank, size(layout.kv_wide)?)?
+            } else { Rc::new(self.alloc(size(layout.kv_wide)?)?) },
             positions: self.alloc(size(layout.positions)?)?,
             slots: self.alloc(size(layout.slots)?)?,
             step_slots,
@@ -957,13 +985,7 @@ impl<'a> MimoEngine<'a> {
             }
             return Ok(None);
         }
-        // SAFETY: the last row lies inside the final norm's output of lane 1.
-        let x = unsafe { w[1].x.buffer.ptr.cast::<u8>().add((t[1] - 1) * self.cfg.hidden * 2) }.cast::<c_void>();
-        // SAFETY: the final norm's output and the head operands are live buffers of these shapes.
-        unsafe {
-            w[1].head.as_ref().context("LM head")?.launch(x.cast(), self.weights.head.buffer.ptr.cast(),
-                w[1].logits.buffer.ptr.cast(), 1, self.stream)?;
-        }
+        self.launch_head(w[1], t[1], 1, false)?;
         let vocab = self.cfg.vocab_size;
         Ok(Some(DeviceLogits { ptr: w[1].logits.buffer.ptr, rows: 1, vocab, stride: vocab, stream: self.stream,
             greedy: None }))
@@ -1168,23 +1190,12 @@ impl<'a> MimoEngine<'a> {
         Ok(Some(self.device_logits(w, logit_rows, false)))
     }
 
-    /// Logits of the last `n` of `t` rows of the final norm's output: the E4M3 head
-    /// program for decode steps of up to `FP8_ROWS` rows, the cuBLAS head otherwise.
-    fn launch_head(&self, w: &Workspace<'_>, t: usize, n: usize, decode: bool) -> Result<()> {
+    /// Logits of the last `n` of `t` final-norm rows, always through the
+    /// immutable head representation. FP8 partitions rows into16-row launches.
+    fn launch_head(&self, w: &Workspace<'_>, t: usize, n: usize, _decode: bool) -> Result<()> {
         ensure!(n <= t && n <= w.logits_rows, "head exceeds admitted logits rows");
-        // SAFETY: the rows start inside the final norm's output.
-        let x = unsafe { w.x.buffer.ptr.cast::<u8>().add((t - n) * self.cfg.hidden * 2) }.cast::<c_void>();
-        match &self.weights.head_fp8 {
-            Some((q, scale)) if decode && n <= FP8_ROWS as usize => {
-                self.run("mimo_head_fp8", &[("x", x), ("w_fp8", q.buffer.ptr), ("scale", scale.buffer.ptr),
-                    ("logits", w.logits.buffer.ptr)], &[Scalar::I32(n as i32)])
-            }
-            // SAFETY: the final norm's output and the head operands are live buffers of these shapes.
-            _ => unsafe {
-                w.head.as_ref().context("LM head")?.launch(x.cast(), self.weights.head.buffer.ptr.cast(),
-                    w.logits.buffer.ptr.cast(), n as u32, self.stream)
-            },
-        }
+        let x = Self::region(&w.x, (t - n) *self.cfg.hidden *2, n *self.cfg.hidden *2);
+        self.head().launch(w.head.as_ref(), x, w.logits.buffer, n, self.stream)
     }
 
     /// `bytes` at `offset` inside `dev`.
@@ -1451,6 +1462,8 @@ impl<'a> MimoEngine<'a> {
             return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
         }
         if launch {
+            ensure!(self.graph_storage_plan.is_none(),
+                "rank {rank} decode graph {key:?} was not captured during pre-admitted startup");
             self.late_captures.set(self.late_captures.get() + 1);
             tracing::debug!(rank, ?key, "MiMo decode segment captured while serving");
         }
@@ -1473,10 +1486,22 @@ impl<'a> MimoEngine<'a> {
     /// Captures (without running) every decode segment of steps of 1..=`max_rows` rows,
     /// so serving replays them without capturing; returns the graphs captured.
     pub fn capture_decode_graphs(&self, max_rows: usize) -> Result<usize> {
+        self.capture_decode_graphs_observed(max_rows, |_| Ok(()))
+    }
+
+    /// The startup oracle records each completed shape through this same path.
+    fn capture_decode_graphs_observed(&self, max_rows: usize,
+        mut observe: impl FnMut(&str) -> Result<()>) -> Result<usize> {
         if !self.decode_graphs || !self.graphable() {
             return Ok(0);
         }
         let max_rows = max_rows.clamp(1, DECODE_ROWS);
+        let plan = cuteafd_loader::families::mimo_v2::decode_graph::MimoDecodeGraphPlan::new(
+            self.cfg.layers, self.ranks(), max_rows, true)?;
+        let admitted = self.graph_storage_plan.as_ref().context("decode graph geometry was not pre-admitted")?;
+        let bounds = self.graph_storage_bound_bytes.as_ref().context("decode graph storage was not pre-admitted")?;
+        ensure!(bounds.len() == self.ranks() && admitted.segments_per_rank == plan.segments_per_rank
+            && admitted.row_shapes >= max_rows, "decode graph admission has different physical geometry");
         if self.decode_workspace.borrow().is_none() {
             *self.decode_workspace.borrow_mut() = Some(self.workspace(0, DECODE_ROWS, true)?);
         }
@@ -1492,23 +1517,53 @@ impl<'a> MimoEngine<'a> {
             Some(ws) => Some(ws.as_ref().context("peer workspace")?),
             None => None,
         };
+        let free = |rank: usize| self.on(rank, || Ok(self.library.cuda_memory_info()?.0));
+        let free_before_head = free(0)?;
         // The cuBLAS head's first call (handle setup) runs before any capture.
         self.launch_head(w, 1, 1, false)?;
         // SAFETY: the engine owns this stream.
         unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        tracing::info!(bytes = free_before_head.saturating_sub(free(0)?),
+            "MiMo eager vocabulary head initialization outside graph storage");
+        observe("eager-vocabulary-head-initialization")?;
+        let free_before = (0..self.ranks()).map(&free).collect::<Result<Vec<_>>>()?;
         let gather = self.embedding.placement() == EmbedPlacement::Gpu;
-        let free = |rank: usize| self.on(rank, || Ok(self.library.cuda_memory_info()?.0));
-        let free_before = (free(0)?, if self.peer.is_some() { free(1)? } else { 0 });
         let before = self.graphs.borrow().len() + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
+        let mut previous_free = free_before.clone();
         for t in 1..=max_rows {
             let tables = StepTables { decode: true, positions: vec![0; t], slots: Vec::new(), ring_slots: Vec::new(),
                 seq_first: Vec::new(), page_table: Vec::new(), table_stride: self.decode_stride() };
-            self.decode_layers(w, w1, &tables, t, gather, true, false)?;
+            for head in cuteafd_loader::families::mimo_v2::decode_graph::MIMO_DECODE_TAIL_HEAD_VARIANTS {
+                // Partial-row logit requests use a distinct headless tail key.
+                // All preceding layer/peer keys are shared and already captured.
+                self.decode_layers(w, w1, &tables, t, gather, head, false)?;
+            }
+            observe(&format!("decode-graph-row-shape-{t}"))?;
+            for rank in 0..self.ranks() {
+                let now = free(rank)?;
+                let delta = previous_free[rank].saturating_sub(now) as u64;
+                previous_free[rank] = now;
+                let observed = self.graph_storage_observed_bytes[rank].get().checked_add(delta)
+                    .context("decode graph measured storage overflow")?;
+                self.graph_storage_observed_bytes[rank].set(observed);
+                ensure!(observed <= bounds[rank],
+                    "rank {rank} retained decode graph storage {observed} B at {t} rows exceeds the pre-admitted {} B bound",bounds[rank]);
+            }
+        }
+        for rank in 0..self.ranks() {
+            let graphs = if rank == 0 { &self.graphs } else { &self.peer.as_ref().context("peer graphs")?.graphs };
+            let actual = graphs.borrow().keys().filter(|key| key.rows <= max_rows).count();
+            ensure!(actual == plan.executables_per_rank[rank],
+                "rank {rank} captured {actual} decode graphs; admitted geometry expects {}",plan.executables_per_rank[rank]);
+            let delta = free_before[rank].saturating_sub(free(rank)?) as u64;
+            let observed = self.graph_storage_observed_bytes[rank].get();
+            tracing::info!(rank, executables=actual, delta_bytes=delta, observed_bytes=observed, bound_bytes=bounds[rank],
+                "MiMo retained decode graph storage");
         }
         let after = self.graphs.borrow().len() + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
         let mib = |a: usize, b: usize| a.saturating_sub(b) as f64 / (1u64 << 20) as f64;
-        tracing::info!(device_mib = format!("{:.1}", mib(free_before.0, free(0)?)),
-            peer_mib = format!("{:.1}", if self.peer.is_some() { mib(free_before.1, free(1)?) } else { 0.0 }),
+        tracing::info!(device_mib = format!("{:.1}", mib(free_before[0], free(0)?)),
+            peer_mib = format!("{:.1}", if self.peer.is_some() { mib(free_before[1], free(1)?) } else { 0.0 }),
             "MiMo decode graph memory");
         Ok(after - before)
     }
@@ -1847,17 +1902,7 @@ impl<'a> MimoEngine<'a> {
         self.norm(w, stage.final_norm.buffer.ptr, 1, rows)?;
         let Some(members) = members else { return Ok(()) };
         ensure!(members.len() == groups.len(), "a member per drafting group");
-        match &self.weights.head_fp8 {
-            Some((q, scale)) if t <= FP8_ROWS as usize => {
-                self.run("mimo_head_fp8", &[("x", w.x.buffer.ptr), ("w_fp8", q.buffer.ptr), ("scale", scale.buffer.ptr),
-                    ("logits", w.logits.buffer.ptr)], &[rows])?;
-            }
-            // SAFETY: the final norm's output and the head operands are live buffers of these shapes.
-            _ => unsafe {
-                w.head.as_ref().context("LM head")?.launch(w.x.buffer.ptr.cast(), self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(),
-                    t as u32, self.stream)?;
-            },
-        }
+        self.launch_head(w, t, t, true)?;
         let region = |dev: &Dev<'_>, offset: usize, bytes: usize| cuteafd_ffi::CuteafdDeviceBuffer {
             // SAFETY: callers pass offsets inside the allocation.
             ptr: unsafe { dev.buffer.ptr.cast::<u8>().add(offset) }.cast(), bytes, ..dev.buffer };
@@ -1952,6 +1997,14 @@ impl<'a> MimoEngine<'a> {
         if part != 2 {
             return Ok(());
         }
+        if layer.has("w_o_fp8") {
+            let pointers = [("attn", w.attn.buffer.ptr), ("w_o_fp8", layer.ptr("w_o_fp8")?),
+                scale("w_o", decode, layer)?, ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)];
+            // Prefill retains BF16 activations. A8 output activations are a
+            // separate arithmetic/quality gate, independent of QKV/FFN flags.
+            let scalars = [rows, Scalar::I32(if decode && self.output_fp8_decode { FP8_DECODE_ROWS } else { 0 })];
+            return self.run_on(rank, split, &format!("mimo_o_w8_{cap}"), &pointers, &scalars);
+        }
         let mut pointers = vec![("attn", w.attn.buffer.ptr), ("w_o", layer.ptr("w_o")?)];
         if decode {
             pointers.extend([("w_o_fp8", layer.ptr_or("w_o_fp8", "w_o")?), ("w_o_scale", layer.ptr_or("w_o_scale", "w_o")?)]);
@@ -1987,10 +2040,7 @@ impl<'a> MimoEngine<'a> {
             Some(next) => crate::shared::l2_prefetch::operands(&["input_norm", "w_qkv", "sinks", "w_o", "post_norm",
                 "w_router", "w_hilo", "gate.bias", "w_gate_up", "w_down"], |n| next.range(n)),
             None => {
-                let head = match &self.weights.head_fp8 {
-                    Some((q, scale)) => vec![q, scale],
-                    None => vec![&self.weights.head],
-                };
+                let head = self.weights.head.allocations();
                 std::iter::once(&self.weights.norm).chain(head).map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes))
                     .collect()
             }
@@ -2270,8 +2320,24 @@ impl<'a> MimoEngine<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{attention_workspace_geometry, expert_capacity, lane_prefill_capacity,
+    use super::{attention_workspace_geometry, expert_capacity, lane_prefill_capacity, scale_operand,
         MimoAttentionWorkspace, DECODE_ROWS, MIN_LANE_ROWS};
+
+    #[test]
+    fn fp8_output_scale_operands_match_both_exported_abis() {
+        for (decode, expected) in [(true, "w_o_scale"), (false, "w_o_kscale")] {
+            let operands = ["attn", "w_o_fp8", scale_operand("w_o", decode).unwrap(), "out", "scratch"];
+            assert_eq!(operands, ["attn", "w_o_fp8", expected, "out", "scratch"]);
+        }
+        for (weight, row, kmajor) in [("w_qkv", "w_qkv_scale", "w_qkv_kscale"),
+            ("w_gate_up", "w_gate_up_scale", "w_gate_up_kscale"), ("w_down", "w_down_scale", "w_down_kscale")] {
+            assert_eq!(scale_operand(weight, true).unwrap(), row);
+            assert_eq!(scale_operand(weight, false).unwrap(), kmajor);
+        }
+        for decode in [true, false] {
+            assert!(scale_operand("w_unregistered", decode).unwrap_err().to_string().contains("no scale operand"));
+        }
+    }
 
     #[test]
     fn narrow_prefill_expert_storage_covers_every_decode_descriptor_and_native_program() {

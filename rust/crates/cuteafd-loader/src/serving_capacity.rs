@@ -117,6 +117,8 @@ pub enum CacheGeometryError {
     InvalidContext,
     #[error("cache geometry arithmetic overflows: {0}")]
     Overflow(&'static str),
+    #[error("resident tensor {name}: {what}")]
+    ResidentTensor { name: String, what: String },
     #[error("{family} cache geometry unsupported: {what}")]
     Unsupported {
         family: &'static str,
