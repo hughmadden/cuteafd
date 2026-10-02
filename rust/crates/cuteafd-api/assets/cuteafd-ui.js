@@ -46,7 +46,8 @@ const fmt = {
 };
 
 // ---------------------------------------------------------------- page shell
-// Fills `el` (a <header>) with the brand, a slot for page status, the header
+// Fills `el` (a <header>) with the logo (and the favicon when the page has
+// none), a slot for page status, the header
 // facts and the page navigation. Returns {status, meta, extra} slot elements.
 // opts: {page: 'console' | 'bench', subtitle}.
 const PAGES = [
@@ -55,9 +56,15 @@ const PAGES = [
 ];
 function header(el, opts = {}) {
   const page = opts.page || 'console';
-  el.innerHTML = `<div class="brand"><b>CUTEAFD</b><span>${fmt.esc(opts.subtitle || 'Engine console')}</span></div>
-    <span class="slot-status"></span><div class="meta"></div><div class="spacer"></div><span class="slot-extra"></span>
-    <nav class="nav" aria-label="Pages">${PAGES.map((p) => `<a href="${p.href}"${p.primary ? ' class="primary"' : ''}${p.id === page ? ' aria-current="page"' : ''}>${p.label}</a>`).join('')}</nav>`;
+  if (!document.querySelector('link[rel="icon"]')) {
+    const icon = document.createElement('link');
+    Object.assign(icon, { rel: 'icon', type: 'image/svg+xml', href: '/assets/cuteafd-mark.svg' });
+    document.head.appendChild(icon);
+  }
+  el.innerHTML = `<div class="brand"><a href="/" class="logo-link"><img class="logo" src="/assets/cuteafd-logo.svg" alt="cuteafd" width="95" height="26"></a><span>${fmt.esc(opts.subtitle || 'Engine console')}</span></div>
+    <span class="slot-status"></span><div class="meta"></div>
+    <nav class="nav" aria-label="Pages">${PAGES.map((p) => `<a href="${p.href}"${p.primary ? ' class="primary"' : ''}${p.id === page ? ' aria-current="page"' : ''}>${p.label}</a>`).join('')}</nav>
+    <div class="header-extra"><span class="slot-extra"></span></div>`;
   return { status: el.querySelector('.slot-status'), meta: el.querySelector('.meta'), extra: el.querySelector('.slot-extra') };
 }
 // Header facts: [[key, valueHtml, title?]] -> `key <b>value</b>` spans.

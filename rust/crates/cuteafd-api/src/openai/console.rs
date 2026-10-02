@@ -27,6 +27,10 @@ pub const PAGE: &str = include_str!("../../assets/console.html");
 pub const UI_CSS: &str = include_str!("../../assets/cuteafd-ui.css");
 /// Shared page shell, formatting and SVG chart primitives (`/assets/cuteafd-ui.js`, `window.CuteUI`).
 pub const UI_JS: &str = include_str!("../../assets/cuteafd-ui.js");
+/// The header logo for the dark pages (`/assets/cuteafd-logo.svg`).
+pub const LOGO: &str = include_str!("../../../../../assets/brand/cuteafd-logo-color-dark.svg");
+/// The square swift mark, the pages' favicon (`/assets/cuteafd-mark.svg`).
+pub const MARK: &str = include_str!("../../../../../assets/brand/cuteafd-mark-color-dark.svg");
 
 const DISABLED: &str = r#"{"type":"snapshot","disabled":true}"#;
 const STARTING: &str = r#"{"type":"snapshot","starting":true}"#;
@@ -125,6 +129,14 @@ pub(super) async fn ui_js() -> Response {
     asset("cuteafd-ui.js", UI_JS, "text/javascript; charset=utf-8").await
 }
 
+pub(super) async fn logo() -> Response {
+    asset("cuteafd-logo.svg", LOGO, "image/svg+xml").await
+}
+
+pub(super) async fn mark() -> Response {
+    asset("cuteafd-mark.svg", MARK, "image/svg+xml").await
+}
+
 pub(super) async fn snapshot(State(hub): State<Arc<ConsoleHub>>) -> Response {
     (
         [
@@ -179,6 +191,7 @@ mod tests {
         assert!(PAGE.contains("/assets/cuteafd-ui.css") && PAGE.contains("/assets/cuteafd-ui.js"));
         assert!(UI_JS.contains("window.CuteUI") && UI_JS.contains("/bench"));
         // The console must work on hosts without internet access.
+        assert!(LOGO.starts_with("<svg") && MARK.starts_with("<svg") && !LOGO.contains("href="));
         for text in [PAGE, UI_CSS, UI_JS] {
             for external in ["http://", "https://"] {
                 assert!(!text.contains(&format!("src=\"{external}")), "page loads an external script");
