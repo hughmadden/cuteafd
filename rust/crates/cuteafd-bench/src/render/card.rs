@@ -33,7 +33,7 @@ pub fn card_svg(report: &Report) -> String {
     if !quant.is_empty() {
         sub.push(format!("experts {}", quant.join(" ")));
     }
-    sub.push(format!("speculator {}", c.speculator.as_deref().unwrap_or("none")));
+    sub.push(format!("speculator {}", c.speculator_label()));
     doc.text(pad, 182.0, Font::new(15.0, t.ink2), &fit(&sub.join(" · "), 15.0, WIDTH - 2.0 * pad));
     let dim = if t.scary { 0.55 } else { 1.0 };
     let warn = if t.scary { "⚠" } else { "" };

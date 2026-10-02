@@ -228,7 +228,7 @@ impl<'a> View<'a> {
             let items: Vec<String> = c.quant.iter().map(|q| format!("{} · {}", q.group, q.formats.join("+"))).collect();
             y += chips(doc, t, 120.0, y, w - 120.0, &items, t.series[0]) + 6.0;
         }
-        y += row(doc, t, 0.0, y, w, "Speculator", c.speculator.as_deref().unwrap_or("none"));
+        y += row(doc, t, 0.0, y, w, "Speculator", &c.speculator_label());
         y += row(doc, t, 0.0, y, w, "Capacity", &self.report.capacity().line());
         if let Some(layout) = &c.layout {
             y += row(doc, t, 0.0, y, w, "Layout", layout);

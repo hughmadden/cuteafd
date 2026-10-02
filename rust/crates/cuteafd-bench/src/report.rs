@@ -70,10 +70,7 @@ impl ServerInfo {
     /// snapshot path), else the served model name: quants of one model share a
     /// served name but not a checkpoint.
     pub fn checkpoint(&self) -> String {
-        let snapshot = self.configuration.snapshot.as_deref().unwrap_or("");
-        snapshot.split('/').find_map(|part| part.strip_prefix("models--"))
-            .and_then(|repo| repo.split_once("--").map(|(org, name)| format!("{org}/{name}")))
-            .unwrap_or_else(|| self.model.clone())
+        hub_repo(self.configuration.snapshot.as_deref().unwrap_or("")).unwrap_or_else(|| self.model.clone())
     }
 }
 
@@ -322,9 +319,31 @@ impl Setting {
     pub fn chip(&self) -> String {
         match &self.value {
             Some(value) if value == "true" => self.name.clone(),
-            Some(value) => format!("{}={}", self.name, value),
+            Some(value) => format!("{}={}", self.name, hub_repo(value).unwrap_or_else(|| value.clone())),
             None => format!("{}=∅", self.name),
         }
+    }
+}
+
+/// `org/name` for a Hugging Face cache path (`.../models--org--name/snapshots/rev`).
+pub fn hub_repo(path: &str) -> Option<String> {
+    path.split('/').find_map(|part| part.strip_prefix("models--"))
+        .and_then(|repo| repo.split_once("--").map(|(org, name)| format!("{org}/{name}")))
+}
+
+impl Configuration {
+    /// The speculator label with a snapshot revision in it replaced by the repository
+    /// a setting loads it from ("DFlash2 (425aa6…)" → "DFlash2 (incoai/GLM-5.3-DFlash2)").
+    pub fn speculator_label(&self) -> String {
+        let mut label = self.speculator.clone().unwrap_or_else(|| "none".into());
+        for setting in &self.settings {
+            let Some(value) = &setting.value else { continue };
+            let (Some(repo), Some(revision)) = (hub_repo(value), value.rsplit('/').next()) else { continue };
+            if revision.len() >= 7 && label.contains(revision) {
+                label = label.replace(revision, &repo);
+            }
+        }
+        label
     }
 }
 
