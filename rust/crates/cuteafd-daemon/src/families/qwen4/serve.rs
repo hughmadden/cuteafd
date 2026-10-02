@@ -286,6 +286,7 @@ impl Active<'_> {
         if !content.is_empty() || self.buffered > 0 {
             self.send(InferenceChunk::Text { content, content_tokens: self.buffered })?;
         }
+        self.ticket.finishing();
         self.send(InferenceChunk::Finish { finish_reason: finish })?;
         Ok(true)
     }
@@ -639,7 +640,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                             Ok(false) => active.push(request),
                             // Finished at its first token: its turn is its prompt snapshot.
                             Ok(true) | Err(_) => {
-                                request.ticket.done(emitted.is_err(), request.generated);
+                                request.ticket.done(request.generated);
                                 release(&family, &mut cache, &mut free_slots, &request.placement)
                             }
                         }
@@ -852,7 +853,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 continue;
             }
             let mut request = active.remove(index);
-            request.ticket.done(request.job.events.is_closed(), request.generated);
+            request.ticket.done(request.generated);
             requests += 1;
             generated_total += request.generated as u64;
             let seconds = request.started.elapsed().as_secs_f64();
