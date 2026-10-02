@@ -37,7 +37,8 @@ use cuteafd_transport::{
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::families::mimo_v2::{MimoAttention, MimoKvCache, MimoV2Config};
+use cuteafd_loader::families::mimo_v2::{MimoAttention, MimoKvCache, MimoV2Config,
+    MimoAttentionWorkspace, MimoWorkspaceLayout, MimoWorkspaceOptions};
 use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -618,7 +619,7 @@ impl<'a> MimoEngine<'a> {
     /// `head`: the LM head and its logits (only the first row lane of a
     /// pipelined prefill skips them).
     fn workspace_here(&self, rank: usize, t: usize, decode: bool, head: bool) -> Result<Workspace<'a>> {
-        let (h, heads) = (self.cfg.hidden, self.cfg.heads);
+        let h = self.cfg.hidden;
         let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
         let lead = rank == 0;
         let with_head = lead && head;
@@ -637,46 +638,49 @@ impl<'a> MimoEngine<'a> {
                 scratch = scratch.max(self.scratch(&name, split)?);
             }
         }
-        let head_workspace = self.alloc(if with_head { VOCABULARY_HEAD_WORKSPACE } else { 256 })?;
         let spark = lead && matches!(self.experts, Some(Experts::Spark { .. }));
+        let layout = MimoWorkspaceLayout::new(&self.cfg, MimoWorkspaceOptions {
+            rows: t as u64, decode, lead, with_head, spark, max_context: self.max_context as u64,
+            pool_pages: self.pages as u64, kv_cache: self.kv_cache,
+            // Preserve the current allocation route. Head-width reductions
+            // are independently qualified before selecting a partition here.
+            attention: MimoAttentionWorkspace::Global, native_scratch_bytes: scratch as u64,
+            head_workspace_bytes: VOCABULARY_HEAD_WORKSPACE as u64,
+        })?;
+        let size = |bytes| usize::try_from(bytes).context("MiMo workspace size does not fit this process");
+        let head_workspace = self.alloc(size(layout.head_workspace)?)?;
         let identity: Vec<i64> = (0..t as i64).collect();
-        let step_slots = self.alloc(t * 8)?;
+        let step_slots = self.alloc(size(layout.step_slots)?)?;
         self.library.copy_h2d(step_slots.buffer, bytes_of(&identity))?;
-        let record = self.cfg.record_bytes(MimoAttention::Sliding, self.kv_cache)
-            .max(self.cfg.record_bytes(MimoAttention::Full, self.kv_cache));
-        // Rank 1 never runs the router, experts, head or drafters.
-        let lead_only = |bytes: usize| if lead { bytes } else { 256 };
         Ok(Workspace {
             rows: t,
-            h: self.alloc(t * h * 2)?,
-            x: self.alloc(t * h * 2)?,
-            query: self.alloc(t * heads * self.cfg.head_dim * 2)?,
-            attn: self.alloc(t * heads * self.cfg.v_head_dim * 2)?,
-            delta: self.alloc(t * h * 2)?,
-            kv_step: self.alloc(t * record)?,
-            kv_wide: self.alloc(if decode || self.kv_cache == MimoKvCache::Bf16 { 256 } else {
-                self.max_context * self.cfg.record_bytes(MimoAttention::Full, MimoKvCache::Bf16) })?,
-            positions: self.alloc(t * 8)?,
-            slots: self.alloc(t * 8)?,
+            h: self.alloc(size(layout.h)?)?,
+            x: self.alloc(size(layout.x)?)?,
+            query: self.alloc(size(layout.query)?)?,
+            attn: self.alloc(size(layout.attn)?)?,
+            delta: self.alloc(size(layout.delta)?)?,
+            kv_step: self.alloc(size(layout.kv_step)?)?,
+            kv_wide: self.alloc(size(layout.kv_wide)?)?,
+            positions: self.alloc(size(layout.positions)?)?,
+            slots: self.alloc(size(layout.slots)?)?,
             step_slots,
-            ring_slots: self.alloc(t * 8)?,
-            seq_first: self.alloc(t * 4)?,
-            page_table: self.alloc(if decode { t * self.pages * 4 } else { self.pages * 4 })?,
-            scratch: self.alloc(scratch)?,
-            logits: self.alloc(if with_head { t * self.cfg.vocab_size * 4 } else { 256 })?,
-            router_logits: self.alloc(lead_only(t * self.cfg.experts * 4))?,
-            route_ids: self.alloc(lead_only(t * self.cfg.topk * 4))?,
-            route_weights: self.alloc(lead_only(t * self.cfg.topk * 4))?,
-            wire: self.alloc(lead_only(t * (h + h / 32)))?,
+            ring_slots: self.alloc(size(layout.ring_slots)?)?,
+            seq_first: self.alloc(size(layout.seq_first)?)?,
+            page_table: self.alloc(size(layout.page_table)?)?,
+            scratch: self.alloc(size(layout.scratch)?)?,
+            logits: self.alloc(size(layout.logits)?)?,
+            router_logits: self.alloc(size(layout.router_logits)?)?,
+            route_ids: self.alloc(size(layout.route_ids)?)?,
+            route_weights: self.alloc(size(layout.route_weights)?)?,
+            wire: self.alloc(size(layout.wire)?)?,
             zero_plane: {
-                let zero = self.alloc(if spark { t * h * 2 } else { 256 })?;
+                let zero = self.alloc(size(layout.zero_plane)?)?;
                 self.library.cuda_zero_bytes(zero.buffer, zero.buffer.bytes)?;
                 zero
             },
-            router_host: RefCell::new(HostAllocation::new(self.library,
-                if spark { t * (self.cfg.topk * 8 + 2 * h) } else { 256 })?),
-            ids: self.alloc(t * 4)?,
-            select: self.alloc(t * 8)?,
+            router_host: RefCell::new(HostAllocation::new(self.library, size(layout.router_host)?)?),
+            ids: self.alloc(size(layout.ids)?)?,
+            select: self.alloc(size(layout.select)?)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: if with_head {
                 Some(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, t as u32,

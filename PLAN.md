@@ -543,6 +543,10 @@ head-partitioned KV, C16 / 20 state slots and exact prefix mark bytes. It does
 not infer a compiled index limit or claim that weight placement alone admits
 the serving configuration. Native MTP costs are available when explicitly
 requested; target-only costs do not include an external drafter.
+MiMo workspace allocation now consumes the same pure size description that
+startup admission will use. It preserves the current global-width geometry,
+including every rank/lane's INT8 prefill BF16 shadow; head-width reduction is
+an independent quality/performance change.
 
 Next: startup must consume the same resolved pool/context/state values before
 loading weights, with actual weight conversions, all lane/workspace shapes,
