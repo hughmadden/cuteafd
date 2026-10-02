@@ -829,11 +829,14 @@ active admission deferral and active KV paging are separate remaining work.
     threshold or a standalone rejection criterion. Target verification,
     final-output correctness and cache-state contracts remain mandatory.
     Eliminate wasted duplicate representations whichever precision wins.
-    The private single-copy candidates preserve the one-RTX target golden
-    logits. Their serving comparison first found divergent concurrent output
-    between the unchanged legacy drafter and no speculation (C1 matches).
-    Separate batch-dependent target arithmetic from verifier/state defects
-    using identical token histories before selecting a representation.
+    Compare separately loaded BF16-only and FP8-only candidates first
+    (TJ, 2026-10-03), with no dual-resident control or runtime precision
+    switching. Target and drafter share the selected vocabulary head;
+    checkpoint-native FP8 QKV/FFN stay compact in both candidates. Cover
+    wide rows without a second weight representation. The historical
+    legacy/no-speculation comparison found divergent concurrent output
+    (C1 matched); preserve that evidence, but qualify target quality and
+    verifier/cache-state correctness directly on the two single-copy paths.
     Check exactness when arithmetic is preserved,
     readiness, C1/C16 decode and 8K prefill on both reference layouts; include
     every surviving copy and expanded scale layout in admission.
