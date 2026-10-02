@@ -52,7 +52,7 @@ type Dev<'a> = DeviceAllocation<'a>;
 pub(crate) const PAGE_ROWS: usize = 64;
 pub(crate) const RING_ROWS: usize = 256;
 /// Rows of the decode-route programs (`_m64`).
-pub(crate) const DECODE_ROWS: usize = 64;
+pub(crate) const DECODE_ROWS: usize = cuteafd_loader::families::mimo_v2::decode_graph::MIMO_DECODE_ROWS;
 /// Expert scratch and transport must fit every decode/verify row shape even
 /// when prompts are deliberately processed through a narrower workspace.
 pub(super) fn expert_capacity(prefill_rows: usize) -> usize {
@@ -405,6 +405,11 @@ pub(crate) struct MimoEngine<'a> {
     pub decode_graphs: bool,
     /// Rank 0's decode segments, keyed by everything they bake in.
     graphs: RefCell<HashMap<GraphKey, GraphExec<'a>>>,
+    /// Frozen preallocation bound for each physical rank; graph storage has
+    /// its own contract, separate from modules/libraries/constraints.
+    pub(super) graph_storage_plan: Option<cuteafd_loader::families::mimo_v2::decode_graph::MimoDecodeGraphPlan>,
+    pub(super) graph_storage_bound_bytes: Option<Vec<u64>>,
+    graph_storage_observed_bytes: [Cell<u64>;2],
     /// Graphs captured while serving (after [`Self::capture_decode_graphs`]): each is a
     /// shape the startup capture missed.
     late_captures: Cell<usize>,
@@ -485,7 +490,8 @@ impl<'a> MimoEngine<'a> {
             wave_timing: std::env::var("CUTEAFD_MIMO_WAVE_TIMING").is_ok_and(|v| v == "1"), drafter: None, mtp: None, l2: None, embedding,
             mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20)?, 0)), prefill_w8a8: true,
             output_fp8_decode: true, kv_cache,
-            decode_graphs: false, graphs: RefCell::new(HashMap::new()), late_captures: Cell::new(0) })
+            decode_graphs: false, graphs: RefCell::new(HashMap::new()), graph_storage_plan: None, graph_storage_bound_bytes: None,
+            graph_storage_observed_bytes: std::array::from_fn(|_| Cell::new(0)), late_captures: Cell::new(0) })
     }
 
     /// Layer `layer`'s KV storage: the paged record pool (full attention; page `p` holds
@@ -668,7 +674,7 @@ impl<'a> MimoEngine<'a> {
         let lead = rank == 0;
         let with_head = lead && head;
         let scratch = super::admission::workspace_native_scratch(&self.cfg, self.programs,
-            if self.split_family.is_some() { 2 } else { 1 }, rank, decode, self.kv_cache)?;
+            if self.split_family.is_some() { 2 } else { 1 }, rank, decode, self.kv_cache, self.weights.output_fp8)?;
         let spark = lead && matches!(self.experts, Some(Experts::Spark { .. }));
         let attention = attention_workspace_geometry(rank, self.ranks(), decode,
             self.weights.layers.iter().all(|layer| layer.split));
@@ -1427,6 +1433,8 @@ impl<'a> MimoEngine<'a> {
             return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
         }
         if launch {
+            ensure!(self.graph_storage_plan.is_none(),
+                "rank {rank} decode graph {key:?} was not captured during pre-admitted startup");
             self.late_captures.set(self.late_captures.get() + 1);
             tracing::debug!(rank, ?key, "MiMo decode segment captured while serving");
         }
@@ -1449,10 +1457,22 @@ impl<'a> MimoEngine<'a> {
     /// Captures (without running) every decode segment of steps of 1..=`max_rows` rows,
     /// so serving replays them without capturing; returns the graphs captured.
     pub fn capture_decode_graphs(&self, max_rows: usize) -> Result<usize> {
+        self.capture_decode_graphs_observed(max_rows, |_| Ok(()))
+    }
+
+    /// The startup oracle records each completed shape through this same path.
+    fn capture_decode_graphs_observed(&self, max_rows: usize,
+        mut observe: impl FnMut(&str) -> Result<()>) -> Result<usize> {
         if !self.decode_graphs || !self.graphable() {
             return Ok(0);
         }
         let max_rows = max_rows.clamp(1, DECODE_ROWS);
+        let plan = cuteafd_loader::families::mimo_v2::decode_graph::MimoDecodeGraphPlan::new(
+            self.cfg.layers, self.ranks(), max_rows, true)?;
+        let admitted = self.graph_storage_plan.as_ref().context("decode graph geometry was not pre-admitted")?;
+        let bounds = self.graph_storage_bound_bytes.as_ref().context("decode graph storage was not pre-admitted")?;
+        ensure!(bounds.len() == self.ranks() && admitted.segments_per_rank == plan.segments_per_rank
+            && admitted.row_shapes >= max_rows, "decode graph admission has different physical geometry");
         if self.decode_workspace.borrow().is_none() {
             *self.decode_workspace.borrow_mut() = Some(self.workspace(0, DECODE_ROWS, true)?);
         }
@@ -1468,23 +1488,53 @@ impl<'a> MimoEngine<'a> {
             Some(ws) => Some(ws.as_ref().context("peer workspace")?),
             None => None,
         };
+        let free = |rank: usize| self.on(rank, || Ok(self.library.cuda_memory_info()?.0));
+        let free_before_head = free(0)?;
         // The cuBLAS head's first call (handle setup) runs before any capture.
         self.launch_head(w, 1, 1, false)?;
         // SAFETY: the engine owns this stream.
         unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        tracing::info!(bytes = free_before_head.saturating_sub(free(0)?),
+            "MiMo eager vocabulary head initialization outside graph storage");
+        observe("eager-vocabulary-head-initialization")?;
+        let free_before = (0..self.ranks()).map(&free).collect::<Result<Vec<_>>>()?;
         let gather = self.embedding.placement() == EmbedPlacement::Gpu;
-        let free = |rank: usize| self.on(rank, || Ok(self.library.cuda_memory_info()?.0));
-        let free_before = (free(0)?, if self.peer.is_some() { free(1)? } else { 0 });
         let before = self.graphs.borrow().len() + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
+        let mut previous_free = free_before.clone();
         for t in 1..=max_rows {
             let tables = StepTables { decode: true, positions: vec![0; t], slots: Vec::new(), ring_slots: Vec::new(),
                 seq_first: Vec::new(), page_table: Vec::new(), table_stride: self.decode_stride() };
-            self.decode_layers(w, w1, &tables, t, gather, true, false)?;
+            for head in cuteafd_loader::families::mimo_v2::decode_graph::MIMO_DECODE_TAIL_HEAD_VARIANTS {
+                // Partial-row logit requests use a distinct headless tail key.
+                // All preceding layer/peer keys are shared and already captured.
+                self.decode_layers(w, w1, &tables, t, gather, head, false)?;
+            }
+            observe(&format!("decode-graph-row-shape-{t}"))?;
+            for rank in 0..self.ranks() {
+                let now = free(rank)?;
+                let delta = previous_free[rank].saturating_sub(now) as u64;
+                previous_free[rank] = now;
+                let observed = self.graph_storage_observed_bytes[rank].get().checked_add(delta)
+                    .context("decode graph measured storage overflow")?;
+                self.graph_storage_observed_bytes[rank].set(observed);
+                ensure!(observed <= bounds[rank],
+                    "rank {rank} retained decode graph storage {observed} B at {t} rows exceeds the pre-admitted {} B bound",bounds[rank]);
+            }
+        }
+        for rank in 0..self.ranks() {
+            let graphs = if rank == 0 { &self.graphs } else { &self.peer.as_ref().context("peer graphs")?.graphs };
+            let actual = graphs.borrow().keys().filter(|key| key.rows <= max_rows).count();
+            ensure!(actual == plan.executables_per_rank[rank],
+                "rank {rank} captured {actual} decode graphs; admitted geometry expects {}",plan.executables_per_rank[rank]);
+            let delta = free_before[rank].saturating_sub(free(rank)?) as u64;
+            let observed = self.graph_storage_observed_bytes[rank].get();
+            tracing::info!(rank, executables=actual, delta_bytes=delta, observed_bytes=observed, bound_bytes=bounds[rank],
+                "MiMo retained decode graph storage");
         }
         let after = self.graphs.borrow().len() + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
         let mib = |a: usize, b: usize| a.saturating_sub(b) as f64 / (1u64 << 20) as f64;
-        tracing::info!(device_mib = format!("{:.1}", mib(free_before.0, free(0)?)),
-            peer_mib = format!("{:.1}", if self.peer.is_some() { mib(free_before.1, free(1)?) } else { 0.0 }),
+        tracing::info!(device_mib = format!("{:.1}", mib(free_before[0], free(0)?)),
+            peer_mib = format!("{:.1}", if self.peer.is_some() { mib(free_before[1], free(1)?) } else { 0.0 }),
             "MiMo decode graph memory");
         Ok(after - before)
     }

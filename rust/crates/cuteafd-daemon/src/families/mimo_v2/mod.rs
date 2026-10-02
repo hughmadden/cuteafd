@@ -58,11 +58,18 @@ pub(crate) struct EngineArgs {
     pub rings: usize,
     #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
-    /// Provisional per-GPU bound for CUDA modules, captures and library
+    /// Provisional per-GPU bound for CUDA modules, libraries and constraints
     /// bookkeeping beyond named tensor/workspace reservations. This is an
     /// explicit startup bound, not a measured allocation footprint.
     #[arg(long, default_value_t = 1024)]
     pub runtime_reserve_mib: usize,
+    /// Calibrated conservative storage envelope per retained decode graph.
+    /// Different graph composition still needs its own startup memory gate.
+    #[arg(long, default_value_t = (cuteafd_loader::families::mimo_v2::decode_graph::MIMO_GRAPH_EXEC_BOUND_BYTES >> 10) as usize)]
+    pub decode_graph_reserve_kib: usize,
+    /// Separate provisional driver/rounding margin for the graph arena.
+    #[arg(long, default_value_t = (cuteafd_loader::families::mimo_v2::decode_graph::MIMO_GRAPH_DRIVER_MARGIN_BYTES >> 20) as usize)]
+    pub decode_graph_driver_reserve_mib: usize,
     /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family, for MoE layers.
     #[arg(long, conflicts_with = "local_experts")]
     pub peers: Option<String>,
@@ -475,6 +482,8 @@ impl Opened {
         engine.prefill_w8a8 = !args.prefill_w8a16;
         engine.output_fp8_decode = args.fp8_decode;
         engine.decode_graphs = args.decode_graphs;
+        engine.graph_storage_plan = Some(preflight.graph_plan.clone());
+        engine.graph_storage_bound_bytes = Some(preflight.graph_bound_bytes.clone());
         {
             use cuteafd_loader::families::mimo_v2::MimoAttention;
             let kv = args.kv_cache.into();
