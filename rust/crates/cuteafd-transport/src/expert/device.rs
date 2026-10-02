@@ -70,8 +70,17 @@ pub type DeviceBuild =
 /// Where the proxy's state meets the inference thread.
 struct Shared {
     stop: AtomicBool,
-    /// A step was queued: spin instead of parking.
-    armed: AtomicBool,
+    /// Waves the host announced ([`SparkDeviceLane::expect`]); the proxy spins
+    /// while some of them are not completed, and parks otherwise.
+    announced: AtomicU64,
+    /// The proxy is parked (or about to be); `expect` unparks it.
+    parked: AtomicBool,
+    /// When the host last woke a parked proxy (ns since `epoch`), and the
+    /// summed wake latencies (announce to running) and their count.
+    wake_requested: AtomicU64,
+    wake_ns: AtomicU64,
+    wakes: AtomicU64,
+    epoch: Instant,
     /// Waves completed (each published to the GPU, with or without error).
     completed: AtomicU64,
     /// The first error since the last [`SparkDeviceLane::check`].
@@ -89,6 +98,10 @@ pub struct DeviceLaneStats {
     pub build_post_us: f64,
     /// Post until every rank's partials landed, us per wave.
     pub receive_us: f64,
+    /// Times a parked proxy was woken by [`SparkDeviceLane::expect`], and the
+    /// mean latency from the announce until it ran, us.
+    pub wakes: u64,
+    pub wake_us: f64,
 }
 
 pub struct SparkDeviceLane {
@@ -144,8 +157,13 @@ impl Mailbox {
     }
 }
 
-/// How long the proxy keeps spinning after its last wave before it parks.
-const SPIN_AFTER: Duration = Duration::from_millis(50);
+/// With no announced wave outstanding, the proxy spins this long after its
+/// last wave (back-to-back steps), then yields until [`YIELD_AFTER`], then
+/// parks: an idle server spends no CPU on it.
+const SPIN_AFTER: Duration = Duration::from_micros(50);
+const YIELD_AFTER: Duration = Duration::from_micros(500);
+/// A parked proxy still looks for an unannounced wave this often.
+const PARK_GUARD: Duration = Duration::from_millis(100);
 
 impl SparkDeviceLane {
     /// Connects a [`SparkExperts::new_ranks`] transport on a new thread whose
@@ -172,7 +190,12 @@ impl SparkDeviceLane {
             wire_row_bytes };
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
-            armed: AtomicBool::new(false),
+            announced: AtomicU64::new(0),
+            parked: AtomicBool::new(false),
+            wake_requested: AtomicU64::new(0),
+            wake_ns: AtomicU64::new(0),
+            wakes: AtomicU64::new(0),
+            epoch: Instant::now(),
             completed: AtomicU64::new(0),
             error: Mutex::new(None),
             build_post_ns: AtomicU64::new(0),
@@ -214,15 +237,42 @@ impl SparkDeviceLane {
             while !state.stop.load(Ordering::Relaxed) {
                 let published = ready_word.load(Ordering::Acquire);
                 if published == expected {
-                    if state.armed.load(Ordering::Relaxed) || last.elapsed() < SPIN_AFTER {
+                    let outstanding = state.announced.load(Ordering::Acquire) > state.completed.load(Ordering::Acquire);
+                    let idle = last.elapsed();
+                    if outstanding || idle < SPIN_AFTER {
+                        // A step is in flight (or just ended): its next wave
+                        // follows within a layer's time.
                         std::hint::spin_loop();
+                    } else if idle < YIELD_AFTER {
+                        std::thread::yield_now();
                     } else {
-                        std::thread::park_timeout(Duration::from_millis(1));
+                        // Idle: park until the host announces waves (the
+                        // timeout only guards a wave published unannounced).
+                        state.parked.store(true, Ordering::SeqCst);
+                        if state.announced.load(Ordering::SeqCst) <= state.completed.load(Ordering::Acquire)
+                            && ready_word.load(Ordering::Acquire) == expected {
+                            std::thread::park_timeout(PARK_GUARD);
+                        }
+                        if state.parked.swap(false, Ordering::SeqCst) {
+                            // Woken by `expect` (or the guard): count the latency.
+                            let requested = state.wake_requested.swap(0, Ordering::AcqRel);
+                            if requested > 0 {
+                                let now = state.epoch.elapsed().as_nanos() as u64;
+                                let total = state.wake_ns.fetch_add(now.saturating_sub(requested), Ordering::Relaxed)
+                                    + now.saturating_sub(requested);
+                                let wakes = state.wakes.fetch_add(1, Ordering::Relaxed) + 1;
+                                if wakes.is_power_of_two() {
+                                    tracing::info!(wakes, mean_wake_us = total as f64 / 1e3 / wakes as f64,
+                                        last_wake_us = now.saturating_sub(requested) as f64 / 1e3,
+                                        "device lane proxy woke from park");
+                                }
+                            }
+                        }
+                        last = Instant::now();
                     }
                     continue;
                 }
                 let seen = Instant::now();
-                state.armed.store(false, Ordering::Relaxed);
                 fence(Ordering::Acquire);
                 let result = (|| -> Result<()> {
                     ensure!(published == expected.wrapping_add(1),
@@ -271,16 +321,23 @@ impl SparkDeviceLane {
         self.world
     }
 
-    /// Before queuing a step's waves: the proxy spins until it sees the next
-    /// one (it parks after [`SPIN_AFTER`] without waves). Returns the error of
-    /// an earlier wave, if any.
+    /// Returns the error of an earlier wave, if any (before queuing a step).
     pub fn arm(&self) -> Result<()> {
-        self.check()?;
-        self.shared.armed.store(true, Ordering::Relaxed);
-        if let Some(thread) = &self.thread {
-            thread.thread().unpark();
+        self.check()
+    }
+
+    /// Announces `waves` more waves the GPU will publish (call before the
+    /// stream can publish them): the proxy spins until they completed and
+    /// parks once idle, so it burns no CPU between steps.
+    pub fn expect(&self, waves: u64) {
+        self.shared.announced.fetch_add(waves, Ordering::SeqCst);
+        if self.shared.parked.load(Ordering::SeqCst) {
+            let now = self.shared.epoch.elapsed().as_nanos() as u64;
+            let _ = self.shared.wake_requested.compare_exchange(0, now.max(1), Ordering::AcqRel, Ordering::Relaxed);
+            if let Some(thread) = &self.thread {
+                thread.thread().unpark();
+            }
         }
-        Ok(())
     }
 
     /// The first wave error since the last check (its partials are garbage:
@@ -301,7 +358,9 @@ impl SparkDeviceLane {
     pub fn stats(&self) -> DeviceLaneStats {
         let waves = self.completed();
         let per = |ns: &AtomicU64| ns.load(Ordering::Relaxed) as f64 / 1e3 / waves.max(1) as f64;
-        DeviceLaneStats { waves, build_post_us: per(&self.shared.build_post_ns), receive_us: per(&self.shared.receive_ns) }
+        let wakes = self.shared.wakes.load(Ordering::Relaxed);
+        DeviceLaneStats { waves, build_post_us: per(&self.shared.build_post_ns), receive_us: per(&self.shared.receive_ns),
+            wakes, wake_us: self.shared.wake_ns.load(Ordering::Relaxed) as f64 / 1e3 / wakes.max(1) as f64 }
     }
 }
 

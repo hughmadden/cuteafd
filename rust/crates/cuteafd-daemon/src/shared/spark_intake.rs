@@ -760,6 +760,14 @@ pub(crate) fn device_exchange_enabled() -> bool {
     *ENABLED.get_or_init(|| matches!(std::env::var("CUTEAFD_SPARK_DEVICE").as_deref(), Ok("1" | "on" | "true")))
 }
 
+impl Drop for SparkDeviceLink<'_> {
+    fn drop(&mut self) {
+        let stats = self.lane.stats();
+        tracing::info!(waves = stats.waves, build_post_us = stats.build_post_us, receive_us = stats.receive_us,
+            wakes = stats.wakes, wake_us = stats.wake_us, "device-driven Spark exchange closed");
+    }
+}
+
 /// The device-driven Spark exchange (PLAN.md): the engine's stream copies a
 /// wave's routes and wire rows into a pinned mailbox and publishes it
 /// ([`Self::dispatch`]); a proxy thread ([`SparkDeviceLane`]) posts it and
@@ -821,6 +829,12 @@ impl<'a> SparkDeviceLink<'a> {
     /// Before queuing a step's waves; returns an earlier wave's error.
     pub(crate) fn arm(&self) -> Result<()> {
         self.lane.arm()
+    }
+
+    /// Announces `waves` waves the stream will publish (before it can): the
+    /// proxy spins only while announced waves are outstanding.
+    pub(crate) fn expect(&self, waves: u64) {
+        self.lane.expect(waves)
     }
 
     /// After the step's stream drained: an error of any of its waves.
