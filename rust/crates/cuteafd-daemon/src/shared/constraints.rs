@@ -12,8 +12,7 @@ pub(crate) struct Compiler<'a> {
     library: &'a NativeLibrary,
     tokenizer: PathBuf,
     vocab: usize,
-    /// Stop ids the grammar accepts where it may end; the first is the one
-    /// speculation checks.
+    /// Every stop id the grammar accepts where it may end.
     stops: Vec<u32>,
     compiler: Option<CuteafdXGrammarCompiler<'a>>,
     grammars: HashMap<NativeConstraint, Arc<CuteafdXGrammarGrammar<'a>>>,
@@ -45,7 +44,7 @@ impl<'a> Compiler<'a> {
         };
         self.order.retain(|key| key != spec);
         self.order.push_back(spec.clone());
-        Ok(State { matcher: grammar.matcher()?, mask: vec![0; self.vocab.div_ceil(32)], stop: self.stops[0] })
+        Ok(State { matcher: grammar.matcher()?, mask: vec![0; self.vocab.div_ceil(32)], stops: self.stops.clone() })
     }
 }
 
@@ -73,7 +72,7 @@ where
 pub(crate) struct State<'a> {
     matcher: CuteafdXGrammarMatcher<'a>,
     mask: Vec<u32>,
-    stop: u32,
+    stops: Vec<u32>,
 }
 impl State<'_> {
     pub fn mask(&mut self) -> Result<Option<&[u32]>> {
@@ -95,7 +94,7 @@ impl State<'_> {
         ensure!(!input.is_empty(), "grammar proposal has no emitted anchor");
         let mut branch = self.matcher.fork()?;
         for index in 1..input.len() {
-            if input[index] == self.stop || !branch.accept_token(input[index])? {
+            if self.stops.contains(&input[index]) || !branch.accept_token(input[index])? {
                 input.truncate(index);
                 break;
             }
@@ -117,6 +116,7 @@ impl State<'_> {
         let mut needs_mask = false;
         for index in 0..=row {
             if index > 0 {
+                ensure!(!self.stops.contains(&input[index]), "stop token in verification draft");
                 ensure!(branch.accept_token(input[index])?, "illegal verification draft token");
             }
             needs_mask = branch.fill_bitmask(&mut mask)?;
@@ -142,6 +142,7 @@ impl State<'_> {
             // The authoritative state already contains input[0], the emitted
             // anchor. Each later row follows the preceding legal draft token.
             if index > 0 {
+                ensure!(!self.stops.contains(&input[index]), "stop token in verification draft");
                 ensure!(branch.accept_token(input[index])?, "illegal verification draft token");
             }
             branch.fill_bitmask(mask)
@@ -154,7 +155,10 @@ impl State<'_> {
         for index in 0..input.len() {
             // The authoritative state already contains input[0], the emitted
             // anchor. Each later row follows the preceding legal draft token.
-            if index > 0 { ensure!(branch.accept_token(input[index])?, "illegal verification draft token"); }
+            if index > 0 {
+                ensure!(!self.stops.contains(&input[index]), "stop token in verification draft");
+                ensure!(branch.accept_token(input[index])?, "illegal verification draft token");
+            }
             let needs_mask = branch.fill_bitmask(&mut mask)?;
             next.push(scores.select(offset + index, needs_mask.then_some(mask.as_slice()))?);
         }
@@ -178,7 +182,10 @@ impl State<'_> {
         let mut mask = vec![0; self.mask.len()];
         let mut next = Vec::with_capacity(input.len());
         for index in 0..input.len() {
-            if index > 0 { ensure!(branch.accept_token(input[index])?, "illegal verification draft token"); }
+            if index > 0 {
+                ensure!(!self.stops.contains(&input[index]), "stop token in verification draft");
+                ensure!(branch.accept_token(input[index])?, "illegal verification draft token");
+            }
             let needs_mask = branch.fill_bitmask(&mut mask)?;
             next.push(scores.sample(
                 offset + index,
@@ -286,7 +293,7 @@ mod tests {
         let mut matcher = grammar.matcher().unwrap();
         // The committed anchor `{` (token 1) is already in the authoritative state.
         assert!(matcher.accept_token(1).unwrap(), "the anchor must be an allowed token");
-        let mut state = State { matcher, mask: vec![0u32; 1], stop: 6 };
+        let mut state = State { matcher, mask: vec![0u32; 1], stops: vec![6] };
         let before = state.mask().unwrap().map(<[u32]>::to_vec);
 
         // Hypothetical draft prefix: anchor, space, "x", colon.
@@ -338,7 +345,7 @@ mod tests {
         let mut matcher = grammar.matcher().unwrap();
         assert!(matcher.accept_token(7).unwrap(), "free text accepts the anchor");
         assert!(matcher.is_completed().unwrap(), "free text is completable, the case that used to drop drafts");
-        let state = State { matcher, mask: vec![0u32; 1], stop: 6 };
+        let state = State { matcher, mask: vec![0u32; 1], stops: vec![6] };
         let truncated = |proposal: &[u32]| { let mut input = proposal.to_vec(); state.truncate_proposal(&mut input).unwrap(); input };
         assert_eq!(truncated(&[7, 2, 3, 7, 2]), [7, 2, 3, 7, 2], "free-text drafts are all kept");
         assert_eq!(truncated(&[7, 2, 1, 4, 5, 7]), [7, 2, 1, 4, 5], "drafts continue through the tag, then stop after it");
@@ -352,9 +359,70 @@ mod tests {
         // The anchor (the closing brace) is already in the authoritative state.
         for token in [1, 2, 3, 4, 5] { assert!(matcher.accept_token(token).unwrap()); }
         assert!(matcher.is_completed().unwrap());
-        let state = State { matcher, mask: vec![0u32; 1], stop: 6 };
+        let state = State { matcher, mask: vec![0u32; 1], stops: vec![6] };
         let truncated = |proposal: &[u32]| { let mut input = proposal.to_vec(); state.truncate_proposal(&mut input).unwrap(); input };
         assert_eq!(truncated(&[5, 6, 1]), [5], "after the closing brace no draft is verified");
         assert_eq!(truncated(&[5, 1, 2]), [5], "a token past the completed value is rejected");
+    }
+
+    /// A tokenizer can have several EOS/turn-end ids. Accepting any of them
+    /// terminates a private matcher: asking for its next mask then fails the
+    /// worker batch. Keep every compiler stop out of speculative prefixes,
+    /// while allowing the target to emit the stop from the preceding mask.
+    #[test]
+    fn every_compiler_stop_is_truncated_before_verification() {
+        let Some(path) = std::env::var_os("CUTEAFD_NATIVE_LIB") else {
+            eprintln!("skipping: CUTEAFD_NATIVE_LIB is not set");
+            return;
+        };
+        // SAFETY: the test supplies the engine's native library, retained for
+        // the lifetime of every compiler, grammar and matcher below.
+        let library = unsafe { NativeLibrary::load(path).unwrap() };
+        let tokenizer = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../native/tests/fixtures/xgrammar_tiny_tokenizer.json");
+        // Explicit compiler stops override token spelling; token 0 supplies a
+        // second EOS without needing a second fixture or any model weights.
+        let stops = vec![6, 0];
+        let mut compiler = Compiler::with_vocab(&library, tokenizer, 8, stops.clone());
+        let spec = NativeConstraint(serde_json::json!({"type":"structural_tag", "format":{
+            "type":"ds41_json_schema", "strict":true,
+            "json_schema":{"type":"object", "properties":{"x":{"type":"string"}},
+                "required":["x"], "additionalProperties":false}
+        }}).to_string());
+        let mut state = compiler.matcher(&spec).unwrap();
+        let mut sibling = compiler.matcher(&spec).unwrap();
+        state.accept(1).unwrap();
+        sibling.accept(1).unwrap();
+        let before = state.mask().unwrap().map(<[u32]>::to_vec);
+        let sibling_before = sibling.mask().unwrap().map(<[u32]>::to_vec);
+
+        for stop in stops {
+            let mut input = vec![1, 2, 3, 4, 5, stop, 7];
+            state.truncate_proposal(&mut input).unwrap();
+            assert_eq!(input, [1, 2, 3, 4, 5], "stop {stop} must never enter verification");
+            let masks = state.prepare_verification_masks(&input).unwrap();
+            for (row, mask) in masks.iter().enumerate() {
+                assert_eq!(*mask, state.prepare_verification_mask_row(&input, row).unwrap());
+            }
+            let last = masks.last().unwrap().as_ref().unwrap();
+            assert_ne!(last[0] & (1 << stop), 0, "the target can still select stop {stop}");
+
+            // An accidentally untruncated caller is rejected before it can
+            // terminate a branch and call fill_bitmask on it.
+            let untruncated = [1, 2, 3, 4, 5, stop];
+            let error = state.prepare_verification_masks(&untruncated).unwrap_err();
+            assert!(error.to_string().contains("stop token in verification draft"));
+            let error = state.prepare_verification_mask_row(&untruncated, 5).unwrap_err();
+            assert!(error.to_string().contains("stop token in verification draft"));
+            assert_eq!(state.mask().unwrap().map(<[u32]>::to_vec), before,
+                "private branches must not advance the authoritative matcher");
+            assert_eq!(sibling.mask().unwrap().map(<[u32]>::to_vec), sibling_before,
+                "another request's matcher must remain healthy");
+            assert_eq!(sibling.prepare_verification_masks(&[1, 2, 3]).unwrap().len(), 3);
+        }
+
+        for token in [2, 3, 4, 5, 0] { state.accept(token).unwrap(); }
+        // The target's secondary EOS ended this request, not its sibling.
+        for token in [2, 3, 4, 5, 6] { sibling.accept(token).unwrap(); }
     }
 }
