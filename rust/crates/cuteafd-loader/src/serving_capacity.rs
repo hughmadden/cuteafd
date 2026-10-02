@@ -88,9 +88,7 @@ pub fn cache_requirements(
         }
     }
     let checkpoint_max = checkpoint_context_limit(checkpoint)?;
-    let requested_floor = checkpoint_max
-        .map(|tokens| product("requested eight-context KV floor", &[8, tokens]))
-        .transpose()?;
+    let requested_floor = Some(cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
     Ok(Some(CacheRequirements {
         checkpoint_max_context_tokens: checkpoint_max,
         compiled_index_extent_required: matches!(
@@ -669,7 +667,7 @@ mod tests {
         let report = plan(dir.path(), &PlanOptions::default()).unwrap();
         let requirements = report.cache_requirements.as_ref().unwrap();
         assert_eq!(requirements.checkpoint_max_context_tokens, Some(1 << 20));
-        assert_eq!(requirements.requested_kv_floor_tokens, Some(8 << 20));
+        assert_eq!(requirements.requested_kv_floor_tokens, Some(2 << 20));
         assert_eq!(
             (requirements.concurrency, requirements.state_slots),
             (16, 20)
@@ -704,6 +702,6 @@ mod tests {
             .cache_requirements
             .unwrap();
         assert_eq!(absent.checkpoint_max_context_tokens, None);
-        assert_eq!(absent.requested_kv_floor_tokens, None);
+        assert_eq!(absent.requested_kv_floor_tokens, Some(2 << 20));
     }
 }

@@ -655,7 +655,7 @@ pub fn render(report: &PlanReport) -> String {
         } else { "dynamic context extent" };
         let _ = writeln!(out, "context    checkpoint maximum {context}; {capability}");
         let floor = cache.requested_kv_floor_tokens.map_or("unresolved".to_string(), |v| v.to_string());
-        let _ = writeln!(out, "KV target  {floor} tokens (8 checkpoint contexts); C{} with {} state/ring slots",
+        let _ = writeln!(out, "KV target  {floor} tokens (common default pool); C{} with {} state/ring slots",
             cache.concurrency, cache.state_slots);
         for layout in &cache.target_only_layouts {
             let placement = match layout.placement {

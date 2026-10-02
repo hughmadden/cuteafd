@@ -546,11 +546,17 @@ Next: startup must consume the same resolved pool/context/state values before
 loading weights, with actual weight conversions, all lane/workspace shapes,
 native scratch, prefix marks, transport and optional draft allocations in the
 profile. Keep checkpoint maximum and effective compiled context separate.
-MiMo Pro's practical one-RTX 1M / two-RTX 2M pool overrides must permit a
-checkpoint-maximum request where the complete reservations fit; the preferred
-eight-context target remains explicit when infeasible. Bounded host storage
-retains inactive exact prefixes; active admission deferral and active KV
-paging are separate remaining work.
+The common default target is 2,097,152 logical GPU KV tokens for every family,
+including DeepSeek, with C16 and 20 front-state slots. Reserve that pool and
+all steady runtime storage first, then onboard the maximum expert layers from
+the remaining per-device budget. Admit weight-loading temporaries separately
+so released staging does not reduce steady capacity. Larger pools and smaller
+benchmark overrides remain explicit launch options. Report hardware shortfall
+and maximum-context feasibility; do not silently change precision or context.
+MiMo Pro's current one-RTX 2M configuration does not fit after mandatory
+workspaces/state; its two-RTX configuration is under qualification. Bounded
+host storage retains inactive exact prefixes for every supported family;
+active admission deferral and active KV paging are separate remaining work.
 
 1. **Device-driven Spark exchange, shared by every family** — branch
    [`work/v41-device`](https://github.com/tpurtell/cuteafd/tree/work/v41-device). Today every family does 2–3
@@ -683,9 +689,11 @@ paging are separate remaining work.
 7. **Phase 6 placement planner** (incl. cold components such as the vision
    encoder on a Spark) and **multimodal input** (official encoders only).
    **Joint serving capacity policy** (TJ): default C16, with 20 active
-   SWA/front-layer state slots to tolerate a small burst. Request a GPU KV
-   floor of eight times the checkpoint maximum context; report that target
-   and the feasible capacity separately when it cannot fit. Keep checkpoint
+   SWA/front-layer state slots to tolerate a small burst. Target a common
+   2,097,152-token logical GPU KV pool, with bounded host-prefix overflow for
+   fast session resume. Larger pools are requested from the planner at launch.
+   Report the target and feasible capacity separately when it cannot fit.
+   Reserve KV and runtime storage before maximizing expert onboarding. Keep checkpoint
    context, compiled index extent and effective serving context distinct.
    Budget each physical GPU to 97% of total minus pre-existing non-engine
    usage, reserving resident weights, all workspace/replay/graph/transport
