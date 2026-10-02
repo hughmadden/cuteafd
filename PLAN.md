@@ -683,9 +683,12 @@ active admission deferral and active KV paging are separate remaining work.
         ordered reducer removes that component's repeat drift but is too slow
         to promote. Its lower-traffic serial-slice successor now passes the
         captured-input component gate with exact repeat outputs and wins its
-        interleaved component timing. Exporter integration, full-model
-        quality/repeatability and serving performance remain unqualified;
-        prefix-cache or admission changes must not hide this baseline defect.
+        interleaved component timing. Its compiled exports now pass mixed-size
+        graph replay and scratch poisoning. The private full-model candidate
+        repeats logits exactly and passes the existing official-reference
+        golden with slightly lower KL/NLL. Exact prefix continuation and
+        serving performance still need qualification before any native pin or
+        default change; admission changes must not hide this baseline defect.
      j. MiMo V2 Flash fidelity is the weakest that passes (KL 0.10, top-1 82%).
         `73dfbbe` packages opt-in same-pin BF16 expert-input siblings;
         `bbd9a6b` preflights their capacity and arithmetic contract before launch.
