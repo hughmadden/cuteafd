@@ -703,6 +703,14 @@ active admission deferral and active KV paging are separate remaining work.
         Combined host-copy/cancellation changes pass repeated V4.1 parity on
         one and two RTX GPUs; completed and unpolled scopes retain their
         existing explicit-drain behavior.
+     n. Generic families rejected temporarily exhausted KV pools even when
+        an active request would soon release enough pages. A bounded FIFO
+        waiter now returns borrowed state slots, retries after page/reference
+        release, and drops cancelled requests. Impossible admissions still
+        fail. MiMo Pro passes the deliberately tiny-pool full-model gate on
+        one RTX and on two RTX with host-prefix promotion: overlapping
+        completions and complete sampled vocabulary rows match solo runs
+        exactly. Disabling the waiter produces the expected rejection.
 5. **Spark expert kernels**: MiMo V2.6 Pro TP6 prefill is Spark-bound (~35 of
    ~42 ms per layer); GLM 5.3 verify is bound by distinct expert reads; NVFP4
    W4A16 GB10 prefill (14.3 vs EXL3 9.1 ms/layer TP4). Pro's installed SM121
@@ -734,8 +742,9 @@ active admission deferral and active KV paging are separate remaining work.
    used as interchangeable capacity. One resolved plan must drive both
    `cuteafd plan` and runtime startup; preserve explicit benchmark overrides.
    Retained host-prefix storage has its own bounded budget and exact restore
-   gate; it does not extend active GPU KV capacity. Resource-aware admission
-   deferral and active KV paging/offload are separate remaining work.
+   gate; it does not extend active GPU KV capacity. Generic admission deferral
+   now passes the MiMo pressure/host-restore gate; active KV paging/offload
+   remains separate work.
 8. **NVFP4 follow-ups**: native per-tensor FP8 decode with static scales.
    **Revisit W4A4 for `nvidia/DeepSeek-V4.1-Flash-NVFP4`** (TJ): V4.1's own
    NVFP4 path keeps the ds41rt 44-slot W4A4 family opt-in because ds41rt
