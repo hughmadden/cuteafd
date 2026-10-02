@@ -864,7 +864,9 @@ active admission deferral and active KV paging are separate remaining work.
     default (TJ, 2026-10-03), including BF16 drafter O projections and other
     BF16 weights; keep native FP8 compact. Additional weight quantization
     should arrive in a checkpoint. A reasonable calibration-free conversion
-    may be an explicit convenience option, never an implicit loading policy.
+    may be an explicit convenience option. Model-specific defaults require
+    measured quality/performance evidence and explicit approval; MiMo V2.6
+    Pro's approved exception is recorded below.
     Finish evaluating the existing FP8 feature as that optional path. Its
     drafter precision is judged by net emitted tokens/s after target
     verification and actual memory use, including context updates, drafting
@@ -889,8 +891,12 @@ active admission deferral and active KV paging are separate remaining work.
     checkpoint/FP8 serving pairs now pass on each layout, including uncached
     8K prompt latency, readiness, resident memory and C1/C16 emitted throughput.
     Transport selection is identical and decode completion logs contain no
-    late graph captures. FP8 remains optional; checkpoint precision remains
-    the default. Repeated
+    late graph captures. TJ approved the measured single-copy FP8 bundle as
+    the default specifically for MiMo V2.6 Pro (2026-10-03): target O
+    projections, the shared vocabulary head and DFlash weights. Implement
+    that scoped selection with explicit checkpoint/BF16 overrides; preserve
+    checkpoint precision for other models and other tensors. Existing
+    measurements do not automatically qualify a larger KV pool. Repeated
     concurrent serving still changes some responses in both representations;
     the fixed-history checks do not prove all serving histories correct.
     The private checkpoint-driven default and shared per-rank prefill KV
