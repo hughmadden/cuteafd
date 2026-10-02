@@ -542,6 +542,23 @@ steps into `work/p0`; tag `v1.0.0` when the list's top half is done.
    Spark worker loop, then IBGDA (GPU rings the NIC doorbell) to drop the
    proxy. Projection (V4.1, `ae91c6a`): exchange alone C1 +5–7% / C4 +3–6%;
    with whole-step graphs C1 +10–15% / C4 +8–12%.
+   State at 057be61 (WIP, all behind env switches, default byte-identical):
+   decision B (retrofit V4.1; both engines share one device exchange,
+   `SparkDeviceLane`, idle 0.6% of a core, ~5 µs wake). V4 Flash
+   `CUTEAFD_SPARK_DEVICE=1`: decode 13.2 → 13.1 ms, verify 4.7 → 4.5 ms.
+   V4.1 `CUTEAFD_V41_DEVICE=1` (one lane device-ordered): 2 RTX C1 185.5 →
+   192.9 (+4%), C4 flat; 1 RTX +1%; greedy byte-identical with the fixed draft
+   policy. Spark worker host cost ~20 of ~544 µs (GB10 expert kernel ~510 µs:
+   TP6 is the bigger lever); worker now parks after 5 ms idle. Next: test the
+   built-but-unrun GPU-direct receive (`CUTEAFD_SPARK_WRITE=1`, `v41-ab2.sh
+   v41-2rtx-w.config 2rtx-w 0 1 1+write`); fix corruption with both lanes
+   device-ordered (`CUTEAFD_V41_DEVICE_LANES=1`, 0/10 consistent C4); whole-step
+   graphs (D4); recheck head split; full parity. IBGDA is possible
+   (ConnectX-7 fw 28.43/28.45) but needs `PeerMappingOverride=1` on raptor.
+   Gotchas: build with `build-coord.sh`/`build-spark.sh` in
+   `~/.cache/cuteafd/builds/v41-device` (Spark build on moa as root; artifacts
+   relay via raptor); use the fixed draft policy for byte-exact A/B;
+   `chain::settle` must stay a host wait.
 2. **Whole-step graphs** — MiMo's per-layer segments are merged and opt-in
    (`DECODE_GRAPHS=on`, [`work/mimo-graphs`](https://github.com/tpurtell/cuteafd/tree/work/mimo-graphs)); flat today,
    they pay once item 1 removes the host hops. Same for every family.
