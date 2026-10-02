@@ -670,7 +670,10 @@ active admission deferral and active KV paging are separate remaining work.
         prefills: captured inputs and coordinator reduction are exact, while
         Spark expert outputs vary with FP32 atomic arrival order. A private
         ordered reducer removes that component's repeat drift but is too slow
-        to promote. A lower-traffic ordered kernel is awaiting qualification;
+        to promote. Its lower-traffic serial-slice successor now passes the
+        captured-input component gate with exact repeat outputs and wins its
+        interleaved component timing. Exporter integration, full-model
+        quality/repeatability and serving performance remain unqualified;
         prefix-cache or admission changes must not hide this baseline defect.
      j. MiMo V2 Flash fidelity is the weakest that passes (KL 0.10, top-1 82%).
         `73dfbbe` packages opt-in same-pin BF16 expert-input siblings;
