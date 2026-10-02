@@ -10,7 +10,7 @@ pub(crate) mod worker;
 
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::fp8_moe::{Fp8MoeModule, Fp8MoePrefill, Fp8MoeWeights, FP8_MOE_POINTERS};
+use cuteafd_ffi::fp8_moe::{Fp8MoeInfo, Fp8MoeModule, Fp8MoePrefill, Fp8MoeWeights, FP8_MOE_POINTERS};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::formats::fp8_experts::{ExpertFormat, Fp8ExpertTensors, Fp8Projection};
 use std::ffi::c_void;
@@ -19,16 +19,29 @@ use std::path::{Path, PathBuf};
 /// Parallel readers per layer load.
 const READERS: usize = 16;
 
-/// Admit the whole local expert allocation before allocating any weights or
-/// scratch. Callers keep their step and prefix-cache reservation out of `budget`.
-fn resident_admission(layer_bytes: usize, layers: usize, scratch_bytes: usize, budget: usize) -> Result<usize> {
+/// Admit the whole resident expert allocation before allocating any weights or
+/// scratch. Callers keep worker/step and prefix-cache reservations out of `budget`.
+fn resident_admission(layer_bytes: usize, layers: usize, primary_scratch: usize, bf16_scratch: Option<usize>,
+    budget: usize) -> Result<(usize, usize)> {
+    let scratch_bytes = primary_scratch.max(bf16_scratch.unwrap_or(0)).max(256);
     let resident = layer_bytes.checked_mul(layers).context("FP8 resident expert size overflow")?;
     let required = resident.checked_add(scratch_bytes).context("FP8 expert allocation size overflow")?;
     ensure!(required <= budget,
         "FP8 experts need {:.3} GiB resident + {:.3} GiB scratch ({} bytes); budget {:.3} GiB ({} bytes)",
         resident as f64 / (1u64 << 30) as f64, scratch_bytes as f64 / (1u64 << 30) as f64, required,
         budget as f64 / (1u64 << 30) as f64, budget);
-    Ok(resident)
+    Ok((resident, scratch_bytes))
+}
+
+/// Both programs share the same resident slice and scratch arena. Input dtype
+/// and compiled capacities may differ, but the weight layout and arithmetic may not.
+fn validate_bf16_package(main: &Fp8MoeInfo, bf16: &Fp8MoeInfo, capacity: usize) -> Result<usize> {
+    ensure!(!bf16.wire_input && bf16.weights == main.weights && bf16.hidden == main.hidden
+        && bf16.experts == main.experts && bf16.topk == main.topk && bf16.intermediate == main.intermediate
+        && bf16.tp == main.tp && bf16.slice == main.slice && bf16.swiglu_limit == main.swiglu_limit,
+        "{bf16:?} is not the BF16-input form of the primary FP8 package {main:?}");
+    bf16.capacity_for(capacity)
+        .with_context(|| format!("BF16-input FP8 package has no capacity for {capacity} rows"))
 }
 
 /// Environment switch for how FP8 expert packages run prefill row counts:
@@ -205,6 +218,14 @@ impl<'a> Fp8Experts<'a> {
     /// `rank` of `tp`, with scratch for `capacity` rows.
     pub fn load(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
         layers: std::ops::Range<usize>, tp: usize, rank: usize, capacity: usize, budget: usize) -> Result<Self> {
+        Self::load_with_bf16(library, tensors, directory, None, layers, tp, rank, capacity, budget)
+    }
+
+    /// Loads an optional BF16-input sibling over the same weights. Validate
+    /// both packages and admit their maximum scratch before allocating weights.
+    pub fn load_with_bf16(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
+        bf16_directory: Option<&Path>, layers: std::ops::Range<usize>, tp: usize, rank: usize, capacity: usize,
+        budget: usize) -> Result<Self> {
         for layer in layers.clone() {
             tensors.validate_layer(layer)?;
         }
@@ -226,8 +247,21 @@ impl<'a> Fp8Experts<'a> {
             "FP8 package {} ({info:?}) does not serve this checkpoint at TP{tp}", directory.display());
         let top = info.capacity_for(capacity)
             .with_context(|| format!("FP8 package has no capacity for {capacity} rows"))?;
-        let scratch_bytes = module.scratch_bytes(top)?.max(256);
-        resident_admission(Fp8Layer::bytes(tensors, tp)?, layers.len(), scratch_bytes, budget)?;
+        let primary_scratch = module.scratch_bytes(top)?;
+        let bf16_module = bf16_directory.map(|directory| {
+            // SAFETY: a trusted package for the current device; the owner
+            // drains its streams before dropping either module.
+            let bf16 = unsafe { load_module(directory) }
+                .with_context(|| format!("BF16-input FP8 expert package {}", directory.display()))?;
+            let top = validate_bf16_package(&info, bf16.info(), capacity)
+                .with_context(|| format!("incompatible BF16-input FP8 expert package {}", directory.display()))?;
+            let scratch = bf16.scratch_bytes(top)?;
+            Ok::<_, anyhow::Error>((bf16, scratch))
+        }).transpose()?;
+        let (resident_bytes, scratch_bytes) = resident_admission(Fp8Layer::bytes(tensors, tp)?, layers.len(), primary_scratch,
+            bf16_module.as_ref().map(|(_, scratch)| *scratch), budget)?;
+        tracing::info!(resident_bytes, scratch_bytes, budget, bf16_package = ?bf16_directory,
+            "FP8 expert allocation admitted");
         let layers = layers.map(|layer| {
             let started = std::time::Instant::now();
             let loaded = Fp8Layer::load(library, tensors, layer, tp, rank)?;
@@ -236,27 +270,7 @@ impl<'a> Fp8Experts<'a> {
             Ok(loaded)
         }).collect::<Result<Vec<_>>>()?;
         let scratch = DeviceAllocation::new(library, scratch_bytes)?;
-        Ok(Self { layers, scratch, bf16_module: None, module, tp, rank })
-    }
-
-    /// Adds the BF16-input package at `directory` (same geometry and TP
-    /// slice), growing the shared scratch when it needs more.
-    pub fn add_bf16_module(&mut self, library: &'a NativeLibrary, directory: &Path, capacity: usize) -> Result<()> {
-        // SAFETY: a trusted package for the current device; dropped with this object.
-        let module = unsafe { load_module(directory) }
-            .with_context(|| format!("BF16-input FP8 expert package {}", directory.display()))?;
-        let (info, main) = (module.info().clone(), self.module.info());
-        ensure!(!info.wire_input && info.weights == main.weights && info.hidden == main.hidden && info.experts == main.experts
-            && info.topk == main.topk && info.intermediate == main.intermediate && info.tp == main.tp,
-            "{} ({info:?}) is not the BF16-input form of this FP8 package", directory.display());
-        let top = info.capacity_for(capacity)
-            .with_context(|| format!("BF16-input FP8 package has no capacity for {capacity} rows"))?;
-        let bytes = module.scratch_bytes(top)?;
-        if bytes > self.scratch.buffer.bytes {
-            self.scratch = DeviceAllocation::new(library, bytes)?;
-        }
-        self.bf16_module = Some(module);
-        Ok(())
+        Ok(Self { layers, scratch, bf16_module: bf16_module.map(|(module, _)| module), module, tp, rank })
     }
 
     pub fn index_of(&self, layer: usize) -> Result<usize> {
@@ -304,8 +318,9 @@ impl<'a> Fp8Experts<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::resident_admission;
+    use super::{resident_admission, validate_bf16_package};
     use clap::Parser;
+    use cuteafd_ffi::fp8_moe::{Fp8MoeInfo, Fp8MoeWeights};
 
     #[derive(Parser)]
     struct QwenArgs {
@@ -340,16 +355,53 @@ mod tests {
     fn resident_admission_includes_every_layer_and_scratch() {
         let (layer, scratch) = (1_415_589_888, 64 << 20);
         let required = layer * 48 + scratch;
-        assert_eq!(resident_admission(layer, 48, scratch, required).unwrap(), layer * 48);
-        assert!(resident_admission(layer, 48, scratch, required - 1).is_err());
+        assert_eq!(resident_admission(layer, 48, scratch, None, required).unwrap(), (layer * 48, scratch));
+        assert!(resident_admission(layer, 48, scratch, None, required - 1).is_err());
         // An explicit paging window admits only the empty initial window's scratch.
-        assert_eq!(resident_admission(layer, 0, scratch, scratch).unwrap(), 0);
-        assert!(resident_admission(layer, 0, scratch, scratch - 1).is_err());
+        assert_eq!(resident_admission(layer, 0, scratch, None, scratch).unwrap(), (0, scratch));
+        assert!(resident_admission(layer, 0, scratch, None, scratch - 1).is_err());
+    }
+
+    #[test]
+    fn resident_admission_sizes_one_arena_for_both_packages() {
+        let (layer, primary, bf16) = (1024, 512, 2048);
+        let required = layer * 48 + bf16;
+        assert_eq!(resident_admission(layer, 48, primary, Some(bf16), required).unwrap(), (layer * 48, bf16));
+        assert!(resident_admission(layer, 48, primary, Some(bf16), required - 1).is_err());
+        // Sharing requires the maximum, rather than two scratch allocations.
+        assert_eq!(resident_admission(layer, 48, bf16, Some(primary), required).unwrap(), (layer * 48, bf16));
+        assert_eq!(resident_admission(0, 0, 0, Some(0), 256).unwrap(), (0, 256));
+        assert!(resident_admission(0, 0, 0, None, 255).is_err());
     }
 
     #[test]
     fn resident_admission_rejects_overflow() {
-        assert!(resident_admission(usize::MAX, 2, 0, usize::MAX).is_err());
-        assert!(resident_admission(usize::MAX, 1, 1, usize::MAX).is_err());
+        assert!(resident_admission(usize::MAX, 2, 0, None, usize::MAX).is_err());
+        assert!(resident_admission(usize::MAX, 1, 1, None, usize::MAX).is_err());
+        assert!(resident_admission(1, 1, 0, Some(usize::MAX), usize::MAX).is_err());
+    }
+
+    #[test]
+    fn bf16_sibling_must_share_weight_layout_arithmetic_and_capacity() {
+        let primary = Fp8MoeInfo { hidden: 6144, slice: 512, experts: 256, topk: 8, intermediate: 2048, tp: 4,
+            wire_input: true, swiglu_limit: 10.0, capacities: vec![64, 4096], weights: Fp8MoeWeights::Fp8 };
+        let mut bf16 = primary.clone();
+        bf16.wire_input = false;
+        // A sibling may compile different capacities; its own scratch uses its own top.
+        bf16.capacities = vec![128, 8192];
+        assert_eq!(validate_bf16_package(&primary, &bf16, 64).unwrap(), 128);
+        assert_eq!(validate_bf16_package(&primary, &bf16, 4096).unwrap(), 8192);
+        assert!(validate_bf16_package(&primary, &bf16, 8193).is_err());
+        for variant in 0..5 {
+            let mut incompatible = bf16.clone();
+            match variant {
+                0 => incompatible.wire_input = true,
+                1 => incompatible.slice = 640,
+                2 => incompatible.swiglu_limit = f32::INFINITY,
+                3 => incompatible.tp = 2,
+                _ => incompatible.weights = Fp8MoeWeights::Mxfp4,
+            }
+            assert!(validate_bf16_package(&primary, &incompatible, 64).is_err(), "{incompatible:?}");
+        }
     }
 }
