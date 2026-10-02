@@ -895,10 +895,17 @@ active admission deferral and active KV paging are separate remaining work.
     defaults/header guards and shared DFlash single-copy loaders are composed
     with the MiMo changes; workspace and script checks pass. Shared GLM/GLM
     Flash drafter gates pass exact same-shape replay, ring-wrap/tail checks,
-    batch-state isolation and physical weight ownership. GLM uses original
-    conditioned taps; GLM Flash uses labelled synthetic conditioning, so this
-    does not qualify full-target quality or emitted throughput. Its optional
-    FP8 long-context proposal drift still needs actual-conditioned evidence.
+    batch-state isolation and physical weight ownership. Both families now
+    have original-target-conditioned drafter comparisons. GLM Flash's exact
+    four-stream fold and original 64/1097-token anchors pass; the 2305-token
+    wrap case remains an explicitly cyclic state fixture. These component
+    checks do not qualify full-target quality or emitted throughput. Optional
+    FP8 proposal drift is smaller with real conditioning than in the earlier
+    synthetic long-context case; checkpoint BF16 remains the default.
+    GLM target precision admission also passes loader/planner/exporter checks;
+    its compact index-key and BF16 dense consumers still need native gates.
+    GLM Flash's direct CLI fallback without an official FP8 side snapshot
+    still implicitly quantizes EXL3 BF16 coordinator tensors and must be fixed.
     GLM head admission now reads indexed checkpoint headers independently of
     the routed-expert catalog. The
     audited DeepSeek V4 target/dSpark paths preserve checkpoint weight values;
