@@ -575,7 +575,9 @@ The user chooses release cuts; development fixes below do not cut a release.
      and the whole batch fails. Fixed in `f3c7505`: every compiler stop token
      terminates a speculative grammar proposal before another matcher call.
    - MiMo V2.6 Pro: two-lane prefill runs only without the head split, so 8K
-     prefill is slower on 2 RTX (4.79 s) than on 1 RTX (3.18 s).
+     prefill is slower on 2 RTX (4.79 s) than on 1 RTX (3.18 s). Fixed in
+     `bf1a061`: both head-split GPUs pipeline the lanes; both GPUs' KV bytes,
+     final logits and greedy continuation match the serial reference exactly.
    - V4.1 on 1 RTX: startup is serial (Sparks load all 40 layers at ~0.4 GB/s
      each, ~205 s, including 5 the RTX holds; then the coordinator). Start the
      coordinator first, skip RTX-held layers on the Sparks, speed up the Spark
@@ -596,6 +598,8 @@ The user chooses release cuts; development fixes below do not cut a release.
         mid-response. Same grammar/matcher path: stop when the grammar accepts
         the stop token, never fail the batch. Stop-token handling is fixed in
         `f3c7505`; model smoke cards still need their own reruns.
+        GLM Flash tr3 forced-tool serving passes under the required sandbox;
+        `0a441b9` also fixes a narrow-prefill workspace admission failure.
      b. A worker failure mid-stream drops the SSE connection with no error
         event (all families). Fixed in `f3c7505`: one structured error event,
         preserving the backend cause, with no successful terminal event.
@@ -605,6 +609,8 @@ The user chooses release cuts; development fixes below do not cut a release.
         `3010e1c` adds strict GLM Flash rejected-suffix causality, committed
         state and continuation checks. Those checks pass; the remaining
         serial/wide numerical divergence is under investigation, not fixed.
+        `16cf99d` separately makes no-speculation requests skip actual GLM
+        Flash neural drafter forwards; this does not change verify numerics.
      d. Batch invariance: C4 ≠ C1 greedy on V4 Pro, GLM 5.3, GLM 5.3 Flash.
      e. NVFP4 local experts on one RTX (GLM 5.3 Flash, Qwen 3.8): the severe
         slowdown came from implicit bounded paging, not a slow SM120 kernel.
@@ -613,7 +619,8 @@ The user chooses release cuts; development fixes below do not cut a release.
         window. Qwen NVFP4 A/B logits are byte-exact. GLM Flash's local expert
         set does not fit one RTX and now reports the admission failure.
      f. GLM 5.3 Flash and Qwen ignore `RTX_GPUS=2` (no head split), so their
-        max layout is 1 RTX + 4 Sparks.
+        max layout is 1 RTX + 4 Sparks. `7d54499` rejects unsupported explicit
+        two-GPU layouts before launch; real head splits remain open.
      g. Qwen 3.8 EXL3: 84 tok/s with 4 Sparks vs 261 on one RTX alone.
      h. Prefill gets worse with more hardware: V4 Pro min 879 tok/s (9.2 s
         TTFT) vs 2,438 max; MiMo Flash max 2,899 vs min 5,877; MiMo Pro max

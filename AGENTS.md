@@ -112,7 +112,7 @@ after tables with conditions.
   needed). Script tests: `.venv/bin/python -m pytest -q scripts/tests`
   (`uv venv --python 3.12 .venv` + pytest numpy tokenizers jsonschema pyyaml);
   On `codex/v1` (2026-10-02), there are no failing script-test ids:
-  712 tests and 190 subtests pass, with 2 skips. The inherited launcher
+  728 tests and 190 subtests pass, with 2 skips. The inherited launcher
   fixtures now follow the current image pair and positional contracts;
   the semantic-quality source lock no longer requires a sibling checkout.
 - `./build.sh` (release pair, coordinator + Spark leg): set
