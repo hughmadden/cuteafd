@@ -53,232 +53,217 @@ fn range(buffer: CuteafdDeviceBuffer) -> DeviceRange {
     }
 }
 
-/// One CUDA stream with its completion probe: `cuda_stream_wait_event` on the probe followed by
-/// `cuda_stream_query` answers "has this event completed" without blocking and without an
-/// event-query entry point in the FFI. Events complete in issue order on a stream.
-struct StreamState {
+mod regions;
+use regions::Regions;
+use crate::shared::memory::device::Device;
+
+/// One device-owned stream and its nonblocking event probe.
+struct StreamState<'a> {
+    device: Device<'a>,
     raw: *mut c_void,
     probe: *mut c_void,
     pending: VecDeque<(u64, *mut c_void)>,
     probing: Option<u64>,
 }
+impl<'a> StreamState<'a> {
+    fn new(device: Device<'a>) -> Result<Self> {
+        device.run(|| {
+            let raw = device.library.cuda_stream_create()?;
+            let probe = match device.library.cuda_stream_create() {
+                Ok(probe) => probe,
+                Err(error) => {
+                    // SAFETY: this newly-created stream has no submitted work.
+                    let _ = unsafe { device.library.cuda_stream_destroy(raw) };
+                    return Err(error);
+                }
+            };
+            Ok(Self { device, raw, probe, pending: VecDeque::new(), probing: None })
+        })
+    }
+    fn synchronize(&self) -> Result<()> {
+        self.device.run(|| {
+            // SAFETY: this state owns the stream on the selected device.
+            unsafe { self.device.library.cuda_stream_synchronize(self.raw) }
+        })
+    }
+    fn completed(&mut self, id: u64) -> Result<bool> {
+        let Some(&(_, event)) = self.pending.iter().find(|&&(pending, _)| pending == id) else {
+            return Ok(true);
+        };
+        let _device = self.device.enter()?;
+        let library = self.device.library;
+        if self.probing != Some(id) {
+            // SAFETY: both handles belong to this live state and its device.
+            unsafe { library.cuda_stream_wait_event(self.probe, event)?; }
+            self.probing = Some(id);
+        }
+        // SAFETY: the probe is live and its owning device is current.
+        if !unsafe { library.cuda_stream_query(self.probe)? } { return Ok(false); }
+        while let Some(&(pending, event)) = self.pending.front() {
+            // SAFETY: this state's events up through `id` have completed.
+            unsafe { library.cuda_event_destroy(event)?; }
+            self.pending.pop_front();
+            if pending == id { break; }
+        }
+        self.probing = None;
+        Ok(true)
+    }
+}
+impl Drop for StreamState<'_> {
+    fn drop(&mut self) {
+        let result = self.device.run(|| -> Result<()> {
+            // SAFETY: the state owns these streams and events. Drain before
+            // destroying them; stream destruction alone is asynchronous.
+            unsafe {
+                self.device.library.cuda_stream_synchronize(self.raw)?;
+                self.device.library.cuda_stream_synchronize(self.probe)?;
+                for &(_, event) in &self.pending { self.device.library.cuda_event_destroy(event)?; }
+                self.device.library.cuda_stream_destroy(self.probe)?;
+                self.device.library.cuda_stream_destroy(self.raw)?;
+            }
+            Ok(())
+        });
+        if let Err(error) = result { tracing::error!(%error, "destroying host-cache copy stream"); }
+    }
+}
 
 pub(crate) struct CudaCopyEngine<'a> {
     library: &'a NativeLibrary,
     template: CuteafdDeviceBuffer,
+    regions: Option<Regions>,
     chunks: Vec<Option<CuteafdHostBuffer>>,
-    streams: [StreamState; 2],
+    /// Two logical queues, with one physical queue per registered device.
+    streams: Vec<[StreamState<'a>; 2]>,
     next_event: u64,
     started: Instant,
-    /// The CUDA runtime already loaded in the process, when it carries
-    /// `cudaMemcpyBatchAsync` (CUDA ≥ 12.8); `None` selects the merged-1D fallback.
     runtime: Option<CudaRuntime>,
-    /// Engine submissions issued so far, for the `copy_submissions` metric.
     submissions: u64,
-    /// Per-engine scratch for the batch pointer/size arrays, reused across restores so a
-    /// fragmented snapshot costs no allocation churn; grows unbounded with the plan.
     batch_dsts: Vec<*mut c_void>,
     batch_srcs: Vec<*const c_void>,
     batch_sizes: Vec<usize>,
-    /// Per-engine scratch that flips `d2h_many`'s `(device, host)` pairs into the
-    /// `(host, device)` orientation `issue_many` consumes, reused across restores so no
-    /// per-restore reorder allocation is needed.
     ordered: Vec<(HostRange, DeviceRange)>,
+    routed: Vec<(usize, HostRange, CuteafdDeviceBuffer)>,
 }
 
 impl<'a> CudaCopyEngine<'a> {
-    /// `template` supplies the device id and flags every engine buffer carries.
+    /// Legacy single-stream-device mode. Peer-addressed ranges retain their
+    /// existing behavior; registered families select the allocation owner.
     pub fn new(library: &'a NativeLibrary, template: CuteafdDeviceBuffer) -> Result<Self> {
-        let mut streams = Vec::with_capacity(2);
-        for _ in 0..2 {
-            streams.push(StreamState {
-                raw: library.cuda_stream_create()?,
-                probe: library.cuda_stream_create()?,
-                pending: VecDeque::new(),
-                probing: None,
-            });
+        Self::create(library, template, None)
+    }
+    /// Register all live snapshot allocations before serving. Registrations
+    /// carry no ownership: allocations outlive the cache and its queued copies.
+    pub fn registered(library: &'a NativeLibrary, buffers: &[CuteafdDeviceBuffer]) -> Result<Self> {
+        let regions = Regions::new(buffers)?;
+        Self::create(library, buffers[0], Some(regions))
+    }
+    fn create(library: &'a NativeLibrary, template: CuteafdDeviceBuffer, regions: Option<Regions>) -> Result<Self> {
+        let ids = regions.as_ref().map(|r| r.devices.clone()).unwrap_or_else(|| vec![template.device_id]);
+        let mut streams = Vec::with_capacity(ids.len());
+        for id in ids {
+            let device = Device { library, id };
+            streams.push([StreamState::new(device)?, StreamState::new(device)?]);
         }
-        let streams = streams.try_into().ok().expect("two streams");
-        // Probe the already-loaded runtime once; absence or a pre-12.8 runtime is not an
-        // error, it selects the merged-1D fallback the cache's coalescing already feeds.
         let runtime = CudaRuntime::load();
-        // `load()` already applied the version selection, so `Some` always means
-        // batch-capable: the mechanism is fully determined by presence, and the fallback is
-        // `None` (absent or pre-12.8 runtime).
-        let mechanism = match &runtime {
-            Some(_) => CopyMechanism::MemcpyBatch,
-            None => CopyMechanism::Merged1d,
-        };
-        tracing::info!(
-            target: "cuteafd::host_cache",
-            mechanism = mechanism.name(),
+        let mechanism = if runtime.is_some() { CopyMechanism::MemcpyBatch } else { CopyMechanism::Merged1d };
+        tracing::info!(target: "cuteafd::host_cache", mechanism = mechanism.name(), devices = streams.len(),
             runtime_version = runtime.as_ref().map(CudaRuntime::version).unwrap_or(0),
-            "host snapshot cache copy mechanism"
-        );
-        Ok(Self {
-            library,
-            template,
-            chunks: Vec::new(),
-            streams,
-            next_event: 0,
-            started: Instant::now(),
-            runtime,
-            submissions: 0,
-            batch_dsts: Vec::new(),
-            batch_srcs: Vec::new(),
-            batch_sizes: Vec::new(),
-            ordered: Vec::new(),
-        })
+            "host snapshot cache copy mechanism");
+        Ok(Self { library, template, regions, chunks: Vec::new(), streams, next_event: 0,
+            started: Instant::now(), runtime, submissions: 0, batch_dsts: Vec::new(),
+            batch_srcs: Vec::new(), batch_sizes: Vec::new(), ordered: Vec::new(), routed: Vec::new() })
     }
-    fn state(&mut self, stream: Stream) -> &mut StreamState {
-        &mut self.streams[stream as usize]
+    fn resolve_host(chunks: &[Option<CuteafdHostBuffer>], range: HostRange) -> Result<CuteafdHostBuffer> {
+        let chunk = chunks.get(range.chunk as usize).and_then(Option::as_ref).context("host cache chunk released")?;
+        ensure!(range.offset.checked_add(range.bytes).is_some_and(|end| end <= chunk.bytes),
+            "host range outside its chunk");
+        Ok(CuteafdHostBuffer { ptr: chunk.ptr.cast::<u8>().wrapping_add(range.offset).cast(),
+            bytes: range.bytes, flags: chunk.flags })
     }
-    fn device(&self, range: DeviceRange) -> CuteafdDeviceBuffer {
-        CuteafdDeviceBuffer {
-            ptr: range.addr as *mut c_void,
-            bytes: range.bytes,
-            ..self.template
-        }
-    }
-    fn host(&self, range: HostRange) -> Result<CuteafdHostBuffer> {
-        Self::resolve_host(&self.chunks, range)
-    }
-    /// Resolve a `HostRange` against the live chunk table — the single bounds-check every
-    /// copy path goes through.
-    fn resolve_host(
-        chunks: &[Option<CuteafdHostBuffer>],
-        range: HostRange,
-    ) -> Result<CuteafdHostBuffer> {
-        let chunk = chunks
-            .get(range.chunk as usize)
-            .and_then(Option::as_ref)
-            .context("host cache chunk released")?;
-        ensure!(
-            range.offset + range.bytes <= chunk.bytes,
-            "host range outside its chunk"
-        );
-        Ok(CuteafdHostBuffer {
-            ptr: unsafe { chunk.ptr.cast::<u8>().add(range.offset).cast() },
-            bytes: range.bytes,
-            flags: chunk.flags,
-        })
-    }
-    /// Drain a stream (used before releasing device memory a timed-out restore may still write).
+    /// Exceptional cleanup may exceed the cache's normal wait budget. Every
+    /// physical queue is attempted before any storage can be released.
     pub fn synchronize(&mut self, stream: Stream) -> Result<()> {
-        let raw = self.state(stream).raw;
-        unsafe { self.library.cuda_stream_synchronize(raw) }
-    }
-    fn stream_of(&self, event: Event) -> Option<Stream> {
-        [Stream::Store, Stream::Restore].into_iter().find(|&s| {
-            self.streams[s as usize]
-                .pending
-                .iter()
-                .any(|&(id, _)| id == event.0)
-        })
-    }
-
-    /// Issue a whole coalesced copy list: `(host, device)` pairs with `d2h` selecting the
-    /// direction. Every extent is bounds-validated through `host()` before anything is
-    /// submitted, exactly as the 1D path validates a single copy. With a batch-capable runtime
-    /// the list goes to `cudaMemcpyBatchAsync` as one submission through the reused scratch
-    /// arrays; without one (older or absent runtime) the merged extents fall back to 1D
-    /// copies, one submission each.
-    fn issue_many(
-        &mut self,
-        stream: Stream,
-        copies: &[(HostRange, DeviceRange)],
-        d2h: bool,
-    ) -> Result<()> {
-        if copies.is_empty() {
-            return Ok(());
-        }
-        let Some(runtime) = self.runtime.clone() else {
-            for &(host, device) in copies {
-                if d2h {
-                    self.d2h(stream, device, host)?;
-                } else {
-                    self.h2d(stream, host, device)?;
-                }
+        let mut first_error = None;
+        for rank in &self.streams {
+            if let Err(error) = rank[stream as usize].synchronize() {
+                if first_error.is_none() { first_error = Some(error); }
             }
-            return Ok(());
-        };
-        let raw = self.state(stream).raw;
-        self.batch_dsts.clear();
-        self.batch_srcs.clear();
-        self.batch_sizes.clear();
-        self.batch_dsts.reserve(copies.len());
-        self.batch_srcs.reserve(copies.len());
-        self.batch_sizes.reserve(copies.len());
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+    fn issue_many(&mut self, stream: Stream, copies: &[(HostRange, DeviceRange)], d2h: bool) -> Result<()> {
+        self.routed.clear();
+        // Validate the complete plan, including ownership and all host extents,
+        // before the first device receives work.
         for &(host, device) in copies {
             ensure!(host.bytes == device.bytes, "copy length mismatch");
-            // Resolve and bounds-check in the same pass that builds the pointers: every
-            // copy is looked up exactly once, and nothing is submitted until the whole
-            // list has validated.
-            let host = Self::resolve_host(&self.chunks, host)?;
-            let device_ptr = device.addr as *mut c_void;
-            let (dst, src) = if d2h {
-                (host.ptr, device_ptr.cast_const())
-            } else {
-                (device_ptr, host.ptr.cast_const())
-            };
-            self.batch_dsts.push(dst);
-            self.batch_srcs.push(src);
-            self.batch_sizes.push(device.bytes);
+            Self::resolve_host(&self.chunks, host)?;
+            if let Some(regions) = &self.regions {
+                regions.route(host, device, &mut self.routed)?;
+            } else if device.bytes != 0 {
+                self.routed.push((0, host, CuteafdDeviceBuffer { ptr: device.addr as *mut c_void,
+                    bytes: device.bytes, ..self.template }));
+            }
         }
-        unsafe {
-            runtime.memcpy_batch_async(&self.batch_dsts, &self.batch_srcs, &self.batch_sizes, raw)
-        }?;
-        self.submissions += 1;
+        for rank in 0..self.streams.len() {
+            if !self.routed.iter().any(|&(owner, _, _)| owner == rank) { continue; }
+            let state = &self.streams[rank][stream as usize];
+            let _device = state.device.enter()?;
+            self.batch_dsts.clear();
+            self.batch_srcs.clear();
+            self.batch_sizes.clear();
+            for &(_, host, device) in self.routed.iter().filter(|&&(owner, _, _)| owner == rank) {
+                let host = Self::resolve_host(&self.chunks, host)?;
+                if self.runtime.is_some() {
+                    let (dst, src) = if d2h { (host.ptr, device.ptr.cast_const()) }
+                        else { (device.ptr, host.ptr.cast_const()) };
+                    self.batch_dsts.push(dst);
+                    self.batch_srcs.push(src);
+                    self.batch_sizes.push(device.bytes);
+                } else {
+                    // SAFETY: registered extents are live on this stream's
+                    // device; the host allocation remains held until completion.
+                    unsafe {
+                        if d2h { self.library.copy_d2h_host_buffer_async(host, device, device.bytes, state.raw)?; }
+                        else { self.library.copy_host_buffer_h2d_async(device, host, device.bytes, state.raw)?; }
+                    }
+                    self.submissions += 1;
+                }
+            }
+            if let Some(runtime) = &self.runtime {
+                // SAFETY: the entire batch was validated, grouped by device,
+                // and its staging arrays stay live through this submission.
+                unsafe { runtime.memcpy_batch_async(&self.batch_dsts, &self.batch_srcs, &self.batch_sizes, state.raw)?; }
+                self.submissions += 1;
+            }
+        }
         Ok(())
     }
 }
-
 impl PinnedMemory for CudaCopyEngine<'_> {
     fn allocate_chunk(&mut self, bytes: usize) -> Result<HostChunk> {
         let buffer = self.library.alloc_host_buffer(bytes)?;
         self.chunks.push(Some(buffer));
-        Ok(HostChunk {
-            id: (self.chunks.len() - 1) as u32,
-            bytes,
-        })
+        Ok(HostChunk { id: (self.chunks.len() - 1) as u32, bytes })
     }
     fn release_chunk(&mut self, chunk: HostChunk) -> Result<()> {
-        let mut buffer = self
-            .chunks
-            .get_mut(chunk.id as usize)
-            .and_then(Option::take)
+        self.synchronize(Stream::Store)?;
+        self.synchronize(Stream::Restore)?;
+        let mut buffer = self.chunks.get_mut(chunk.id as usize).and_then(Option::take)
             .context("host cache chunk already released")?;
         self.library.free_host_buffer(&mut buffer)
     }
 }
-
 impl CopyEngine for CudaCopyEngine<'_> {
     fn d2h(&mut self, stream: Stream, src: DeviceRange, dst: HostRange) -> Result<()> {
-        ensure!(src.bytes == dst.bytes, "copy length mismatch");
-        let (host, device, raw) = (self.host(dst)?, self.device(src), self.state(stream).raw);
-        unsafe {
-            self.library
-                .copy_d2h_host_buffer_async(host, device, src.bytes, raw)
-        }?;
-        self.submissions += 1;
-        Ok(())
+        self.issue_many(stream, &[(dst, src)], true)
     }
     fn h2d(&mut self, stream: Stream, src: HostRange, dst: DeviceRange) -> Result<()> {
-        ensure!(src.bytes == dst.bytes, "copy length mismatch");
-        let (host, device, raw) = (self.host(src)?, self.device(dst), self.state(stream).raw);
-        unsafe {
-            self.library
-                .copy_host_buffer_h2d_async(device, host, src.bytes, raw)
-        }?;
-        self.submissions += 1;
-        Ok(())
+        self.issue_many(stream, &[(src, dst)], false)
     }
     fn d2h_many(&mut self, stream: Stream, copies: &[(DeviceRange, HostRange)]) -> Result<()> {
-        // Flip into the reused scratch instead of allocating a reorder Vec per call; taken
-        // out for the issue_many call so the engine borrows do not conflict.
         self.ordered.clear();
-        self.ordered
-            .extend(copies.iter().map(|&(device, host)| (host, device)));
+        self.ordered.extend(copies.iter().map(|&(device, host)| (host, device)));
         let ordered = std::mem::take(&mut self.ordered);
         let result = self.issue_many(stream, &ordered, true);
         self.ordered = ordered;
@@ -287,75 +272,53 @@ impl CopyEngine for CudaCopyEngine<'_> {
     fn h2d_many(&mut self, stream: Stream, copies: &[(HostRange, DeviceRange)]) -> Result<()> {
         self.issue_many(stream, copies, false)
     }
-    fn submission_count(&self) -> u64 {
-        self.submissions
-    }
+    fn submission_count(&self) -> u64 { self.submissions }
     fn record(&mut self, stream: Stream) -> Result<Event> {
-        let event = self.library.cuda_event_create()?;
-        let raw = self.state(stream).raw;
-        unsafe { self.library.cuda_event_record(event, raw)? };
         self.next_event += 1;
         let id = self.next_event;
-        self.state(stream).pending.push_back((id, event));
+        for rank in &mut self.streams {
+            let state = &mut rank[stream as usize];
+            let _device = state.device.enter()?;
+            let event = self.library.cuda_event_create()?;
+            // SAFETY: the event and stream belong to the selected device.
+            if let Err(error) = unsafe { self.library.cuda_event_record(event, state.raw) } {
+                // SAFETY: failed recording left no consumer of this new event.
+                let _ = unsafe { self.library.cuda_event_destroy(event) };
+                return Err(error);
+            }
+            state.pending.push_back((id, event));
+        }
         Ok(Event(id))
     }
     fn completed(&mut self, event: Event) -> Result<bool> {
-        let Some(stream) = self.stream_of(event) else {
-            return Ok(true);
-        };
-        let library = self.library;
-        let state = self.state(stream);
-        let &(_, raw_event) = state
-            .pending
-            .iter()
-            .find(|&&(id, _)| id == event.0)
-            .expect("event pending");
-        if state.probing != Some(event.0) {
-            unsafe { library.cuda_stream_wait_event(state.probe, raw_event)? };
-            state.probing = Some(event.0);
-        }
-        if !unsafe { library.cuda_stream_query(state.probe)? } {
-            return Ok(false);
-        }
-        // In-order stream: everything up to and including this event is done.
-        while let Some(&(id, raw)) = state.pending.front() {
-            unsafe { library.cuda_event_destroy(raw)? };
-            state.pending.pop_front();
-            if id == event.0 {
-                break;
+        let mut complete = true;
+        for rank in &mut self.streams {
+            for state in rank {
+                complete &= state.completed(event.0)?;
             }
         }
-        state.probing = None;
-        Ok(true)
+        Ok(complete)
     }
     fn wait(&mut self, event: Event, budget_ns: u64) -> Result<bool> {
         let deadline = self.now_ns().saturating_add(budget_ns);
         loop {
-            if self.completed(event)? {
-                return Ok(true);
-            }
-            // Clip the inter-poll sleep to the remaining budget: a timed-out wait then
-            // overshoots the deadline by at most one probe, not one full sleep quantum.
+            if self.completed(event)? { return Ok(true); }
             let remaining = deadline.saturating_sub(self.now_ns());
-            if remaining == 0 {
-                return Ok(false);
-            }
+            if remaining == 0 { return Ok(false); }
             std::thread::sleep(Duration::from_nanos(remaining.min(20_000)));
         }
     }
-    fn now_ns(&self) -> u64 {
-        self.started.elapsed().as_nanos() as u64
-    }
+    fn release_barrier(&mut self, stream: Stream) -> Result<()> { self.synchronize(stream) }
+    fn now_ns(&self) -> u64 { self.started.elapsed().as_nanos() as u64 }
 }
-
 impl Drop for CudaCopyEngine<'_> {
     fn drop(&mut self) {
-        for state in &mut self.streams {
-            for &(_, event) in &state.pending {
-                let _ = unsafe { self.library.cuda_event_destroy(event) };
-            }
-            let _ = unsafe { self.library.cuda_stream_destroy(state.probe) };
-            let _ = unsafe { self.library.cuda_stream_destroy(state.raw) };
+        let store = self.synchronize(Stream::Store);
+        let restore = self.synchronize(Stream::Restore);
+        if let Err(error) = store.and(restore) {
+            // Keep the pinned allocations held if completion cannot be proved.
+            tracing::error!(%error, "host cache drain failed; retaining pinned copy storage");
+            return;
         }
         for buffer in self.chunks.iter_mut().flatten() {
             let _ = self.library.free_host_buffer(buffer);
@@ -367,6 +330,154 @@ impl Drop for CudaCopyEngine<'_> {
 mod cuda_tests {
     use super::*;
     use crate::shared::memory::device::{Allocation, Device};
+
+    fn queued_rank_release(drop_engine: bool) -> Result<()> {
+        use crate::shared::memory::device::{Event as DeviceEvent, Stream as DeviceStream};
+        use cuteafd_ffi::test_support::CudaStreamGate;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        // SAFETY: all CUDA owners are destroyed before the loaded library.
+        let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let devices = [Device { library: &lib, id: 0 }, Device { library: &lib, id: 1 }];
+        let allocations = devices.map(|device| Allocation::new(device, 4096)).into_iter().collect::<Result<Vec<_>>>()?;
+        let buffers: Vec<_> = allocations.iter().map(|allocation| allocation.buffer).collect();
+        for round in 1..=2u8 {
+            let originals: Vec<_> = (0..2).map(|rank| vec![round * 29 + rank * 47; 4096]).collect();
+            for (allocation, original) in allocations.iter().zip(&originals) {
+                allocation.device.run(|| lib.copy_h2d(allocation.buffer, original))?;
+            }
+            lib.cuda_set_device(0)?;
+            let engine = CudaCopyEngine::registered(&lib, &buffers)?;
+            let config = Config { bytes: 1 << 20, chunk_bytes: 1 << 16, min_tokens: 1,
+                copy_budget_ns: 0, ..Config::default() };
+            let mut cache = HostCache::with_rule(config, Layout::family(4096, 4096, 0), engine,
+                cuteafd_core::prefix::ReuseRule::EXACT,
+                cuteafd_hostcache::snapshot::EvictionOrder::LeastRecent)?;
+            let producer = DeviceStream::new(devices[1])?;
+            // SAFETY: producer outlives its gate; an independent OS thread
+            // releases the callback without scheduler or CUDA progress.
+            let gate = devices[1].run(|| unsafe { CudaStreamGate::new(&lib, producer.raw) })?;
+            let mut ready = DeviceEvent::new(devices[1])?;
+            ready.record(&producer)?;
+            let copy_raw = cache.engine_mut().streams[1][Stream::Store as usize].raw;
+            devices[1].run(|| {
+                // SAFETY: rank1 copy waits for a live rank1 producer event.
+                unsafe { lib.cuda_stream_wait_event(copy_raw, ready.raw) }
+            })?;
+            let half = |buffer: CuteafdDeviceBuffer, offset| DeviceRange {
+                addr: buffer.ptr as u64 + offset, bytes: 2048 };
+            let mut pages: [Vec<DevicePage>; COMPRESSORS] = Default::default();
+            pages[0].push(DevicePage { id: DevicePageId { compressor: 0, page: 0, generation: round as u32 },
+                segments: vec![half(buffers[0], 0), half(buffers[1], 0)] });
+            let snapshot = DeviceSnapshot { meta: SnapshotMeta { kind: cuteafd_hostcache::SnapshotKind::Prompt,
+                tokens: vec![round as u32], end: 1, has_draft: false }, pages,
+                tail: vec![half(buffers[0], 2048), half(buffers[1], 2048)], draft: None, scores: Vec::new() };
+            let StoreOutcome::Issued(ticket) = cache.store(&snapshot, ()) else { anyhow::bail!("queued store was skipped") };
+            let event = cache.engine_mut().record(Stream::Store)?;
+            assert!(!cache.engine_mut().completed(event)?, "rank0 completion hid pending rank1 copies");
+            let release = gate.release_handle();
+            std::thread::scope(|threads| -> Result<()> {
+                let (begin, wait) = std::sync::mpsc::channel();
+                threads.spawn(move || {
+                    let _ = wait.recv_timeout(Duration::from_secs(2));
+                    std::thread::sleep(Duration::from_millis(30));
+                    release.store(true, Ordering::Release);
+                });
+                begin.send(())?;
+                if drop_engine {
+                    drop(cache);
+                } else {
+                    assert_eq!(cache.before_device_evict(Some(ticket)), EvictDecision::DroppedUncached);
+                    assert!(cache.engine_mut().completed(event)?);
+                    // Reuse the source immediately; no extra drain may hide an
+                    // early release at the device-cache eviction boundary.
+                }
+                let done = devices[1].run(|| {
+                    // SAFETY: producer remains live through this assertion.
+                    unsafe { lib.cuda_stream_query(producer.raw) }
+                })?;
+                assert!(done, "copy storage was released before its independent producer completed");
+                assert_eq!(lib.cuda_get_device()?, 0);
+                for allocation in &allocations {
+                    allocation.device.run(|| lib.copy_h2d(allocation.buffer, &[0xee; 4096]))?;
+                }
+                Ok(())
+            })?;
+            drop(gate);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, libcudart.so.13 and two CUDA devices"]
+    fn queued_rank_store_timeout_drains_before_pages_and_marks_are_reused() -> Result<()> {
+        queued_rank_release(false)
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, libcudart.so.13 and two CUDA devices"]
+    fn queued_rank_copy_engine_drop_drains_before_pinned_storage_is_freed() -> Result<()> {
+        queued_rank_release(true)
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB and two CUDA devices"]
+    fn registered_rank_pages_and_marks_restore_exactly_with_reused_storage() -> Result<()> {
+        // SAFETY: all CUDA owners are destroyed before the loaded library.
+        let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let mut allocations = Vec::new();
+        for id in 0..2 {
+            let device = Device { library: &lib, id };
+            allocations.push(Allocation::new(device, 4096)?);
+            allocations.push(Allocation::new(device, 2048)?);
+        }
+        let buffers: Vec<_> = allocations.iter().map(|allocation| allocation.buffer).collect();
+        // No peer-access setup: every host copy must use its owning GPU.
+        for fallback in [false, true] {
+            lib.cuda_set_device(1)?;
+            let mut engine = CudaCopyEngine::registered(&lib, &buffers)?;
+            assert!(engine.runtime.is_some(), "CUDA 13 batch-copy runtime is required for this gate");
+            if fallback { engine.runtime = None; }
+            assert_eq!(lib.cuda_get_device()?, 1);
+            let config = Config { bytes: 1 << 20, chunk_bytes: 1 << 16, min_tokens: 1,
+                ..Config::default() };
+            let mut cache = HostCache::with_rule(config, Layout::family(8192, 4096, 0), engine,
+                cuteafd_core::prefix::ReuseRule::EXACT,
+                cuteafd_hostcache::snapshot::EvictionOrder::LeastRecent)?;
+            for round in 1..=3u32 {
+                let expected: Vec<Vec<u8>> = buffers.iter().enumerate().map(|(index, buffer)| {
+                    (0..buffer.bytes).map(|byte| (byte as u32 * 19 + round * 23 + index as u32 * 61) as u8).collect()
+                }).collect();
+                for (allocation, bytes) in allocations.iter().zip(&expected) {
+                    allocation.device.run(|| lib.copy_h2d(allocation.buffer, bytes))?;
+                }
+                let mut pages: [Vec<DevicePage>; COMPRESSORS] = Default::default();
+                pages[0].push(DevicePage { id: DevicePageId { compressor: 0, page: 0, generation: round },
+                    segments: vec![range(buffers[0]), range(buffers[2])] });
+                let snapshot = DeviceSnapshot { meta: SnapshotMeta { kind: cuteafd_hostcache::SnapshotKind::Prompt,
+                    tokens: vec![round], end: 1, has_draft: false }, pages,
+                    tail: vec![range(buffers[1]), range(buffers[3])], draft: None, scores: Vec::new() };
+                let StoreOutcome::Issued(ticket) = cache.store(&snapshot, ()) else { anyhow::bail!("store was skipped") };
+                assert_ne!(cache.before_device_evict(Some(ticket)), EvictDecision::Held);
+                assert_eq!(lib.cuda_get_device()?, 1);
+                for allocation in &allocations {
+                    allocation.device.run(|| lib.copy_h2d(allocation.buffer, &vec![0; allocation.buffer.bytes]))?;
+                }
+                let hit = cache.lookup(&[round]).context("completed rank snapshot is missing")?;
+                let mut target = RestoreTarget { pages: snapshot.pages.clone(), tail: snapshot.tail.clone(),
+                    draft: None, scores: Vec::new() };
+                target.pages[0][0].id.generation += 100;
+                ensure!(matches!(cache.restore(hit.key, &target), RestoreOutcome::Done { .. }), "restore did not finish");
+                assert_eq!(lib.cuda_get_device()?, 1);
+                for (allocation, expected) in allocations.iter().zip(&expected) {
+                    let mut actual = vec![0; expected.len()];
+                    allocation.device.run(|| lib.copy_d2h(&mut actual, allocation.buffer))?;
+                    assert_eq!(&actual, expected, "rank {} round {round} fallback={fallback}", allocation.device.id);
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and two CUDA devices"]
@@ -532,6 +643,11 @@ impl<'a> HostCacheBinding<'a> {
     pub(super) fn before_evict(&mut self, ticket: Option<StoreTicket>) -> EvictDecision {
         self.cache.before_device_evict(ticket)
     }
+    pub(super) fn release_barrier(&mut self) -> Result<()> {
+        let store = self.cache.engine_mut().synchronize(Stream::Store);
+        let restore = self.cache.engine_mut().synchronize(Stream::Restore);
+        store.and(restore)
+    }
     /// Delegates to [`HostCache::prefill_hold`]; the full contract lives there. The
     /// scheduler's wrapper observes the store stream (`tick`) on every prefill chunk
     /// regardless of `store_pace_ns` before calling this hold.
@@ -625,7 +741,12 @@ impl<'a> HostCacheBinding<'a> {
             RestoreOutcome::Done { .. } => {}
             outcome => {
                 tracing::warn!(target: "cuteafd::host_cache", ?outcome, "host restore did not complete; prefilling");
-                self.cache.engine_mut().synchronize(Stream::Restore)?;
+                if let Err(error) = self.cache.engine_mut().synchronize(Stream::Restore) {
+                    // A failed release barrier must not return pages/arena
+                    // slots while an upload may still write them.
+                    std::mem::forget((sources, tail, rings));
+                    return Err(error);
+                }
                 return Ok(None);
             }
         }

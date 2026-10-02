@@ -130,6 +130,14 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
         if self.arenas.is_empty() { 0 } else { self.slots }
     }
 
+    /// Stable allocations the host snapshot tier may copy. Full pages and
+    /// per-rank SWA/MTP mark arenas are registered on their actual devices;
+    /// the live rings are captured into those arenas before host submission.
+    pub fn host_buffers(&self) -> Vec<CuteafdDeviceBuffer> {
+        self.full.iter().map(|&(_, buffer, _)| buffer)
+            .chain(self.arenas.iter().map(|arena| arena.buffer)).collect()
+    }
+
     /// Zero every state's rows before `len` (a partial restore's empty window).
     fn empty_window(&self, ring: usize, len: usize) -> Result<()> {
         for state in &self.states {

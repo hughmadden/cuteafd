@@ -52,6 +52,9 @@ impl CopyEngine for Shared {
     fn wait(&mut self, event: Event, budget_ns: u64) -> anyhow::Result<bool> {
         self.0.borrow_mut().wait(event, budget_ns)
     }
+    fn release_barrier(&mut self, stream: Stream) -> anyhow::Result<()> {
+        self.0.borrow_mut().release_barrier(stream)
+    }
     fn now_ns(&self) -> u64 {
         self.0.borrow().now_ns()
     }
@@ -632,4 +635,32 @@ fn sessions_fork_from_the_deepest_earlier_turn() {
         fake.forward(&mut p, &longer).unwrap();
         cache.release(&fake, &p.pages).unwrap();
     }
+}
+
+#[test]
+fn failed_store_release_keeps_device_pages_mark_and_host_slabs() {
+    use cuteafd_hostcache::copy::CopyFault;
+    let fake = Fake::new(24, 2, 4);
+    let mut cache = cache(&fake, 2, 1 << 20);
+    fake.mem.borrow_mut().inject(CopyFault::StreamStalls(Stream::Store));
+    let prompt = seq(700, 13);
+    let (_, _, placement) = serve(&mut cache, &fake, 0, &prompt, &[], 20);
+    cache.release(&fake, &placement.pages).unwrap();
+    let free = cache.pool().free();
+    let marks = cache.arena().in_use();
+    let held = cache.stats().host.unwrap().bytes_used;
+    assert!(free < 24 && marks > 0 && held > 0);
+    for _ in 0..2 {
+        assert!(cache.clear(&fake).is_err());
+        assert_eq!(cache.pool().free(), free);
+        assert_eq!(cache.arena().in_use(), marks);
+        assert_eq!(cache.stats().host.unwrap().bytes_used, held);
+    }
+    // The entry was never removed: its exact positional state still restores.
+    let (resume, _, mut restored) = serve(&mut cache, &fake, 1, &prompt, &[], 20);
+    assert_eq!(resume, prompt.len());
+    let mut continuation = prompt;
+    continuation.push(99);
+    fake.forward(&mut restored, &continuation).unwrap();
+    cache.release(&fake, &restored.pages).unwrap();
 }

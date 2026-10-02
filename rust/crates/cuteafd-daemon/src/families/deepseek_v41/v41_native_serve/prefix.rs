@@ -24,6 +24,8 @@ pub(super) struct PrefixCache<'a> {
     images: ImageKeySpace,
     pending: [Option<PendingRetention>; 2],
     host: Option<HostCacheBinding<'a>>,
+    /// Failed copy release barriers retain their source allocations here.
+    quarantined: Vec<Saved<'a>>,
 }
 struct PendingRetention {
     kind: SnapshotKind,
@@ -34,6 +36,19 @@ struct PendingRetention {
     lease: CacheLease,
     draft: bool,
 }
+impl Drop for PrefixCache<'_> {
+    fn drop(&mut self) {
+        if let Some(host) = &mut self.host {
+            if let Err(error) = host.release_barrier() {
+                // The raw device references remain live on a failed CUDA
+                // drain. Keep their owners held even during shutdown.
+                std::mem::forget(std::mem::replace(&mut self.retained, Retention::new(0)));
+                std::mem::forget(std::mem::take(&mut self.quarantined));
+                tracing::error!(%error, "host snapshot shutdown drain failed; retaining device storage");
+            }
+        }
+    }
+}
 impl<'a> PrefixCache<'a> {
     pub fn new(limit: usize) -> Self {
         Self {
@@ -41,6 +56,7 @@ impl<'a> PrefixCache<'a> {
             images: ImageKeySpace::default(),
             pending: [None, None],
             host: None,
+            quarantined: Vec::new(),
         }
     }
     /// Attach the host snapshot cache (`None` keeps every path exactly as before).
@@ -120,7 +136,11 @@ impl<'a> PrefixCache<'a> {
     /// A snapshot leaves the device: let its host copy finish within budget, then drop it.
     fn host_dropped(&mut self, saved: Saved<'a>) {
         if let Some(host) = &mut self.host {
-            host.before_evict(saved.ticket);
+            if host.before_evict(saved.ticket) == cuteafd_hostcache::cache::EvictDecision::Held {
+                self.quarantined.push(saved);
+                tracing::error!("host snapshot copy did not drain; quarantining device snapshot");
+                return;
+            }
         }
         drop(saved);
     }

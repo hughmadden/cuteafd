@@ -100,6 +100,9 @@ pub enum EvictDecision {
     WaitedClean { ns: u64 },
     /// The budget ran out or the copy failed: the snapshot leaves the device uncached.
     DroppedUncached,
+    /// Exceptional draining failed. The device snapshot and host slabs remain
+    /// held; the caller must retain its pages/mark and retry or report failure.
+    Held,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -422,6 +425,7 @@ impl<E: CopyEngine, P> HostCache<E, P> {
                     continue;
                 }
                 PendingKind::Failed => {
+                    if self.engine.release_barrier(Stream::Store).is_err() { break; }
                     let pending = self.pending.remove(index);
                     self.metrics.get_mut().stores_failed += 1;
                     report.failed.push(pending.ticket);
@@ -438,6 +442,7 @@ impl<E: CopyEngine, P> HostCache<E, P> {
                 }
                 Ok(false) => break,
                 Err(_) => {
+                    if self.engine.release_barrier(Stream::Store).is_err() { break; }
                     let pending = self.pending.remove(index);
                     let ticket = pending.ticket;
                     self.release_pending(pending);
@@ -492,6 +497,10 @@ impl<E: CopyEngine, P> HostCache<E, P> {
                     self.pending.insert(index, pending);
                 }
                 StoreIssue::Failed | StoreIssue::Exhausted => {
+                    if self.engine.release_barrier(Stream::Store).is_err() {
+                        self.pending.insert(index, pending);
+                        return EvictDecision::Held;
+                    }
                     self.metrics.get_mut().stores_failed += 1;
                     self.metrics.get_mut().evict_drops_uncached += 1;
                     return EvictDecision::DroppedUncached;
@@ -501,6 +510,7 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         let event = match &self.pending[index].kind {
             PendingKind::Issued { event, .. } => *event,
             _ => {
+                if self.engine.release_barrier(Stream::Store).is_err() { return EvictDecision::Held; }
                 let pending = self.pending.remove(index);
                 self.release_pending(pending);
                 self.metrics.get_mut().stores_failed += 1;
@@ -523,6 +533,9 @@ impl<E: CopyEngine, P> HostCache<E, P> {
             self.commit_pending(pending, now);
             EvictDecision::WaitedClean { ns }
         } else {
+            // The bounded wait expired; correctness still requires completion
+            // before either host slabs or the caller's device pages are reused.
+            if self.engine.release_barrier(Stream::Store).is_err() { return EvictDecision::Held; }
             let pending = self.pending.remove(index);
             self.release_pending(pending);
             self.metrics.get_mut().stores_failed += 1;
@@ -639,7 +652,7 @@ impl<E: CopyEngine, P> HostCache<E, P> {
                 return RestoreOutcome::Failed;
             }
             IssueOutcome::FailedHeld => {
-                self.unpin(key);
+                if self.engine.release_barrier(Stream::Restore).is_ok() { self.unpin(key); }
                 self.metrics.get_mut().restore_timeouts += 1;
                 return RestoreOutcome::TimedOut;
             }
@@ -649,7 +662,9 @@ impl<E: CopyEngine, P> HostCache<E, P> {
             .wait(event, self.config.restore_budget_ns)
             .unwrap_or(false);
         let ns = self.engine.now_ns().saturating_sub(start);
-        self.unpin(key);
+        // A timed-out restore still reads host slabs. Keep its pin if the
+        // exceptional barrier fails; callers must also retain their targets.
+        if completed || self.engine.release_barrier(Stream::Restore).is_ok() { self.unpin(key); }
         self.refresh_gauges();
         if completed {
             if let Some(snapshots) = self.snapshots.as_mut() {
@@ -753,7 +768,9 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         match issue_store_copies(&mut self.engine, snapshots, plan, parts) {
             Ok(()) => match self.engine.record(Stream::Store) {
                 Ok(event) => IssueOutcome::Issued(event),
-                Err(_) => IssueOutcome::FailedHeld,
+                Err(_) => if self.engine.release_barrier(Stream::Store).is_ok() {
+                    IssueOutcome::FailedDrained
+                } else { IssueOutcome::FailedHeld },
             },
             Err(_) => {
                 if self.drain(Stream::Store) {
@@ -772,7 +789,9 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         match issue_restore_copies(&mut self.engine, plan) {
             Ok(()) => match self.engine.record(Stream::Restore) {
                 Ok(event) => IssueOutcome::Issued(event),
-                Err(_) => IssueOutcome::FailedHeld,
+                Err(_) => if self.engine.release_barrier(Stream::Restore).is_ok() {
+                    IssueOutcome::FailedDrained
+                } else { IssueOutcome::FailedHeld },
             },
             Err(_) => {
                 if self.drain(Stream::Restore) {
@@ -784,17 +803,14 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         }
     }
 
-    /// Record an event on `stream` and wait up to the copy budget for the copies already issued
-    /// to drain. `true` when they drained (or nothing was issued); `false` when the wait timed
-    /// out or the event could not be recorded, so the caller must keep the source slabs held.
+    /// Normal event waits remain bounded. Failed/expired cleanup waits use
+    /// the explicit release barrier before returning either kind of storage.
     fn drain(&mut self, stream: Stream) -> bool {
-        match self.engine.record(stream) {
-            Ok(event) => self
-                .engine
-                .wait(event, self.config.copy_budget_ns)
-                .unwrap_or(false),
+        let completed = match self.engine.record(stream) {
+            Ok(event) => self.engine.wait(event, self.config.copy_budget_ns).unwrap_or(false),
             Err(_) => false,
-        }
+        };
+        completed || self.engine.release_barrier(stream).is_ok()
     }
 
     /// Make a completed store resident, drop the payload it replaced, and bring the pool under
