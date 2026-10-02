@@ -34,6 +34,10 @@ use std::ffi::c_void;
 use std::os::unix::fs::FileExt;
 use crate::shared::peer_split::{slice_2d, Axis, RankDevice};
 
+#[cfg(test)]
+#[path = "weights_retirement_tests.rs"]
+mod retirement_tests;
+
 pub(crate) struct MimoLayer<'a> {
     pub attention: MimoAttention,
     pub dense: bool,
@@ -249,11 +253,13 @@ impl<'a> MimoLoader<'a> {
                 })();
                 // SAFETY: all queued sources/destinations are still owned here,
                 // including when a native launch returned an error.
-                if let Err(error) = unsafe { self.library.cuda_stream_synchronize(stream) } {
+                if let Err(drain) = unsafe { self.library.cuda_stream_synchronize(stream) } {
+                    self.library.quarantine_module_after_failed_drain();
                     std::mem::forget(staging);
                     std::mem::forget(values);
                     std::mem::forget(scales);
-                    return Err(error.context("FP8-only projection owners quarantined after failed packing drain"));
+                    return Err(queued.err().unwrap_or_else(|| anyhow::anyhow!("FP8-only projection completion failed"))
+                        .context(format!("FP8-only projection owners and native module quarantined after failed packing drain: {drain}")));
                 }
                 queued?;
                 drop(staging);
@@ -271,11 +277,15 @@ impl<'a> MimoLoader<'a> {
     /// The row-concatenation of 2-D `names` as one BF16 operand.
     fn rows(&self, names: &[String]) -> Result<DeviceAllocation<'a>> {
         let tensors = names.iter().map(|n| self.raw(n).map(|t| (n, t))).collect::<Result<Vec<_>>>()?;
+        ensure!(!tensors.is_empty() && tensors.iter().all(|(_, (_, _, s))| s.len() == 2 && s[0] > 0 && s[1] > 0),
+            "{names:?}: row operands require nonempty two-dimensional tensors");
         let cols = tensors[0].1 .2[1];
-        let rows: usize = tensors.iter().map(|(_, (_, _, shape))| shape[0]).sum();
+        let rows = tensors.iter().try_fold(0usize, |rows, (_, (_, _, shape))| rows.checked_add(shape[0]))
+            .context("row operand height overflow")?;
         ensure!(tensors.iter().all(|(_, (_, _, s))| s.len() == 2 && s[1] == cols), "{names:?} do not share columns");
         let k_blocks = cols.div_ceil(128);
-        let out = DeviceAllocation::new(self.library, rows * cols * 2)?;
+        let bytes = rows.checked_mul(cols).and_then(|n| n.checked_mul(2)).context("row operand storage overflow")?;
+        let out = DeviceAllocation::new(self.library, bytes)?;
         let at = |buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize| CuteafdDeviceBuffer {
             // SAFETY: callers keep offset + bytes inside the allocation.
             ptr: unsafe { buffer.ptr.cast::<u8>().add(offset) }.cast(),
@@ -285,44 +295,62 @@ impl<'a> MimoLoader<'a> {
         let mut row = 0;
         // Uploads the stream still reads; released after the final synchronize.
         let mut staged = Vec::new();
-        for (name, (bytes, dtype, shape)) in &tensors {
-            let dest = |first: usize, count: usize| at(out.buffer, (row + first) * cols * 2, count * cols * 2);
-            match dtype {
-                DType::Bf16 => {
-                    self.library.copy_h2d(dest(0, shape[0]), bytes)?;
-                }
-                DType::F8E4M3 => {
-                    let (scale, scale_dtype, scale_shape) = self.raw(&format!("{name}_scale_inv"))?;
-                    ensure!(scale_dtype == DType::F32, "{name}: block scales must be FP32");
-                    ensure!(scale_shape == [scale_shape[0], k_blocks], "{name}: unexpected scale grid {scale_shape:?}");
-                    // Row blocks: uniform 128, or per 192-row head (128 + 64).
-                    let (block, per_block_rows) = if shape[0].div_ceil(128) == scale_shape[0] {
-                        (shape[0], shape[0].div_ceil(128))
-                    } else {
-                        let head = 192;
-                        ensure!(shape[0] % head == 0 && scale_shape[0] == shape[0] / head * head.div_ceil(128),
-                            "{name}: no block layout maps {} rows onto {} scale rows", shape[0], scale_shape[0]);
-                        (head, head.div_ceil(128))
-                    };
-                    let (w, s) = (self.upload(bytes)?, self.upload(&scale)?);
-                    for chunk in 0..shape[0] / block {
-                        // SAFETY: chunk rows of the FP8 weight, their scale rows and the
-                        // destination rows are live; the stream drains before `w`/`s` drop.
-                        unsafe {
-                            self.library.fp8_block_dequant(
-                                w.buffer.ptr.cast::<u8>().add(chunk * block * cols).cast(),
-                                s.buffer.ptr.cast::<u8>().add(chunk * per_block_rows * k_blocks * 4).cast(),
-                                dest(chunk * block, block).ptr, block, cols, self.stream)?;
+        let queued = (|| -> Result<()> {
+            for (name, (bytes, dtype, shape)) in &tensors {
+                let dest = |first: usize, count: usize| at(out.buffer, (row + first) * cols * 2, count * cols * 2);
+                match dtype {
+                    DType::Bf16 => {
+                        ensure!(bytes.len() == shape[0] * cols * 2, "{name}: BF16 bytes disagree with row shape");
+                        self.library.copy_h2d(dest(0, shape[0]), bytes)?;
+                    }
+                    DType::F8E4M3 => {
+                        ensure!(bytes.len() == shape[0] * cols, "{name}: FP8 bytes disagree with row shape");
+                        let (scale, scale_dtype, scale_shape) = self.raw(&format!("{name}_scale_inv"))?;
+                        ensure!(scale_dtype == DType::F32, "{name}: block scales must be FP32");
+                        ensure!(scale_shape.len() == 2 && scale_shape[1] == k_blocks,
+                            "{name}: unexpected scale grid {scale_shape:?}");
+                        ensure!(scale_shape[0].checked_mul(k_blocks).and_then(|n| n.checked_mul(4)) == Some(scale.len()),
+                            "{name}: FP32 scale bytes disagree with the grid");
+                        // Row blocks: uniform 128, or per 192-row head (128 + 64).
+                        let (block, per_block_rows) = if shape[0].div_ceil(128) == scale_shape[0] {
+                            (shape[0], shape[0].div_ceil(128))
+                        } else {
+                            let head = 192;
+                            ensure!(shape[0] % head == 0 && scale_shape[0] == shape[0] / head * head.div_ceil(128),
+                                "{name}: no block layout maps {} rows onto {} scale rows", shape[0], scale_shape[0]);
+                            (head, head.div_ceil(128))
+                        };
+                        let (w, s) = (self.upload(bytes)?, self.upload(&scale)?);
+                        // Install both owners before the first fallible launch.
+                        staged.push((w, s));
+                        let (w, s) = staged.last().expect("just inserted staging owners");
+                        for chunk in 0..shape[0] / block {
+                            // SAFETY: chunk rows of the FP8 weight, their scale rows and the
+                            // destination rows are live; the stream drains before `w`/`s` drop.
+                            unsafe {
+                                self.library.fp8_block_dequant(
+                                    w.buffer.ptr.cast::<u8>().add(chunk * block * cols).cast(),
+                                    s.buffer.ptr.cast::<u8>().add(chunk * per_block_rows * k_blocks * 4).cast(),
+                                    dest(chunk * block, block).ptr, block, cols, self.stream)?;
+                            }
                         }
                     }
-                    staged.push((w, s));
+                    other => anyhow::bail!("{name}: unsupported coordinator dtype {other:?}"),
                 }
-                other => anyhow::bail!("{name}: unsupported coordinator dtype {other:?}"),
+                row += shape[0];
             }
-            row += shape[0];
+        Ok(())
+        })();
+        // SAFETY: the loader owns this stream and every source/destination,
+        // including after an error while processing a later tensor.
+        if let Err(drain) = unsafe { self.library.cuda_stream_synchronize(self.stream) } {
+            self.library.quarantine_module_after_failed_drain();
+            std::mem::forget(staged);
+            std::mem::forget(out);
+            return Err(queued.err().unwrap_or_else(|| anyhow::anyhow!("row operand completion failed"))
+                .context(format!("row operand owners and native module quarantined after failed drain: {drain}")));
         }
-        // SAFETY: the loader owns this stream.
-        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        queued?;
         drop(staged);
         Ok(out)
     }
@@ -527,21 +555,28 @@ impl<'a> MimoLoader<'a> {
                     let out = whole.take().context("o_proj")?;
                     return Ok(out);
                 }
-                let whole = whole.as_ref().context("o_proj")?;
+                let source_allocation = whole.as_ref().context("o_proj")?;
                 let out = DeviceAllocation::new(self.library, rows * cols * 2)?;
                 let source = CuteafdDeviceBuffer {
                     // SAFETY: column block `rank` of every row lies inside the whole weight.
-                    ptr: unsafe { whole.buffer.ptr.cast::<u8>().add(rank * cols * 2) }.cast(),
-                    bytes: whole.buffer.bytes - rank * cols * 2,
-                    ..whole.buffer
+                    ptr: unsafe { source_allocation.buffer.ptr.cast::<u8>().add(rank * cols * 2) }.cast(),
+                    bytes: source_allocation.buffer.bytes - rank * cols * 2,
+                    ..source_allocation.buffer
                 };
                 // SAFETY: both buffers are live and sized for these pitched spans; peer access to
                 // rank 0 is enabled on every rank (the engine's split setup), drained below.
-                unsafe {
-                    self.library.copy_d2d_2d_async(out.buffer, cols * 2, source, shape[1] * 2, cols * 2, rows, stream)?;
-                }
+                let queued = unsafe {
+                    self.library.copy_d2d_2d_async(out.buffer, cols * 2, source, shape[1] * 2, cols * 2, rows, stream)
+                };
                 // SAFETY: the loader owns this stream; the copy reads `whole`, which drops after.
-                unsafe { self.library.cuda_stream_synchronize(stream)? };
+                if let Err(drain) = unsafe { self.library.cuda_stream_synchronize(stream) } {
+                    self.library.quarantine_module_after_failed_drain();
+                    std::mem::forget(out);
+                    std::mem::forget(whole.take());
+                    return Err(queued.err().unwrap_or_else(|| anyhow::anyhow!("split projection completion failed"))
+                        .context(format!("split projection owners and native module quarantined after failed drain: {drain}")));
+                }
+                queued?;
                 Ok(out)
             })
         }).collect();

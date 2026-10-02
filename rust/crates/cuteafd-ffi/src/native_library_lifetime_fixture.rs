@@ -14,6 +14,10 @@ pub struct Fixture {
 }
 
 impl Fixture {
+    pub fn directory(&self) -> &std::path::Path {
+        self.module.parent().expect("fixture module has a directory")
+    }
+
     pub fn build() -> Result<Self> {
         let root = PathBuf::from(
             std::env::var_os("CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR")
@@ -52,13 +56,20 @@ impl Fixture {
             root.starts_with(&allowed),
             "fixture directory escapes NVMe build root"
         );
-        let directory = root.join(format!(
-            "lifetime-{}-{}",
-            std::process::id(),
-            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
-        ));
-        // create_dir rejects reuse so each test owns a distinct loader object.
-        fs::create_dir(&directory)?;
+        // Container PID namespaces can reuse the same PID on the next run.
+        // Keep all prior evidence and claim a fresh directory atomically.
+        let directory = loop {
+            let directory = root.join(format!(
+                "lifetime-{}-{}",
+                std::process::id(),
+                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::create_dir(&directory) {
+                Ok(()) => break directory,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
         let module = directory.join("liblifetime_fixture.so");
         let status = Command::new("python3")
             .arg(assert_path)
@@ -121,6 +132,16 @@ impl Fixture {
             .lock()
             .unwrap()
             .ensure(library, 64)?;
+        Ok(())
+    }
+
+    pub fn configure_drain_after(&self, library: &NativeLibrary, completed: i32) -> Result<()> {
+        // SAFETY: this export belongs to the CPU-only fixture loaded above.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn(i32)> =
+                library.lib.get(b"fixture_configure_drain_after")?;
+            configure(completed);
+        }
         Ok(())
     }
 
