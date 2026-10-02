@@ -19,6 +19,10 @@ pub struct MimoRankRuntime {
     /// Native modules, captures, peer/Spark receive planes, expert stores and
     /// an optional external drafter. The caller must reserve the selected path.
     pub additional: Vec<MemoryReservation>,
+    /// Reservations live while target weights load, before target KV exists
+    /// (for example loaded CUDA modules). Drafters loaded after target KV
+    /// belong in `additional` instead, unless they also load in this phase.
+    pub loading_additional: Vec<MemoryReservation>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +36,14 @@ pub struct MimoCapacityOptions {
     /// Logical rank order, independent of physical device id order.
     pub ranks: Vec<MimoRankRuntime>,
     pub host_prefix_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MimoCapacityProfiles {
+    /// Fixed-only admission before any target weight allocation.
+    pub loading: Vec<DeviceCosts>,
+    /// Persistent admission, including the selected logical KV pool.
+    pub steady: CapacityProfile,
 }
 
 fn product(label: &'static str, dims: &[u64]) -> Result<u64, CacheGeometryError> {
@@ -57,12 +69,12 @@ fn reserve(costs: &mut Vec<MemoryReservation>, name: &str, bytes: u64) {
 /// This builder intentionally does not invent missing runtime reservations.
 /// The engine obtains native/module/draft/transport costs before it calls this
 /// function, then hands the resulting profile to the shared capacity resolver.
-pub fn mimo_capacity_profile(
+pub fn mimo_capacity_profiles(
     checkpoint: &Checkpoint,
     cfg: &MimoV2Config,
     resident_options: MimoResidentOptions,
     options: &MimoCapacityOptions,
-) -> Result<CapacityProfile, CacheGeometryError> {
+) -> Result<MimoCapacityProfiles, CacheGeometryError> {
     if options.max_context_tokens == 0
         || options.checkpoint_max_context_tokens == 0
         || options.max_context_tokens > options.checkpoint_max_context_tokens
@@ -82,12 +94,40 @@ pub fn mimo_capacity_profile(
         options.kv_cache,
         resident_options.native_mtp_layers,
     )?;
+    let before_kv_state = if resident_options.native_mtp_layers > 0 {
+        // MTP stage rings/hidden history and fixed buffers are allocated in
+        // with_engine before target KV, interleaved with MTP weight loads.
+        // Derive their exact increment from the shared cache description.
+        let target = mimo_cache_geometry(
+            cfg,
+            resident_options.layers,
+            resident_options.coordinator_ranks,
+            options.kv_cache,
+            0,
+        )?;
+        let active = cache.ranks[0]
+            .active_state_per_sequence_bytes
+            .checked_sub(target.ranks[0].active_state_per_sequence_bytes)
+            .ok_or(CacheGeometryError::Overflow("MiMo pre-KV MTP active state"))?;
+        let fixed = cache.ranks[0]
+            .fixed_state_bytes
+            .checked_sub(target.ranks[0].fixed_state_bytes)
+            .ok_or(CacheGeometryError::Overflow("MiMo pre-KV MTP fixed state"))?;
+        add(
+            "MiMo pre-KV MTP state",
+            product("MiMo pre-KV MTP rings", &[options.rings, active])?,
+            fixed,
+        )?
+    } else {
+        0
+    };
     let mark_bytes = cache
         .ranks
         .iter()
         .try_fold(0u64, |n, rank| n.checked_add(rank.retained_mark_bytes))
         .ok_or(CacheGeometryError::Overflow("MiMo aggregate exact mark"))?;
     let mut devices = Vec::with_capacity(options.ranks.len());
+    let mut loading = Vec::with_capacity(options.ranks.len());
     for (rank, runtime) in options.ranks.iter().enumerate() {
         if options.ranks[..rank]
             .iter()
@@ -100,16 +140,34 @@ pub fn mimo_capacity_profile(
             });
         }
         let storage = cache.ranks[rank];
-        let mut costs = resident.ranks[rank].clone();
+        let mut loading_costs = resident.ranks[rank].clone();
         if rank == 0 {
-            // Conservative across startup phases: this extra peak is released
-            // before allocating KV, but cannot be available while loading.
             reserve(
-                &mut costs,
+                &mut loading_costs,
+                "loading.mtp_state_before_target_kv",
+                before_kv_state,
+            );
+            // The loader drains this peak before target KV allocation. It
+            // constrains startup, without reducing the steady KV/expert budget.
+            reserve(
+                &mut loading_costs,
                 "loading.temporary",
                 resident.loading_temporary_rank0_bytes,
             );
         }
+        loading_costs.extend(runtime.loading_additional.iter().cloned());
+        loading_costs
+            .iter()
+            .try_fold(0u64, |n, reservation| n.checked_add(reservation.bytes))
+            .ok_or(CacheGeometryError::Overflow(
+                "MiMo loading phase reservations",
+            ))?;
+        loading.push(DeviceCosts {
+            device: runtime.device,
+            reservations: loading_costs,
+            pool_unit_bytes: 0,
+        });
+        let mut costs = resident.ranks[rank].clone();
         reserve(
             &mut costs,
             "state.active_rings",
@@ -190,16 +248,19 @@ pub fn mimo_capacity_profile(
             pool_unit_bytes: unit_bytes,
         });
     }
-    Ok(CapacityProfile {
-        // MiMo attention consumes dynamic key/page extents; it does not index
-        // the GLM/Qwen MAX_CONTEXT-sized exported attention map.
-        context: ContextLimits {
-            checkpoint_max_tokens: options.checkpoint_max_context_tokens,
-            compiled_index_max_tokens: None,
+    Ok(MimoCapacityProfiles {
+        loading,
+        steady: CapacityProfile {
+            // MiMo attention consumes dynamic key/page extents; it does not index
+            // the GLM/Qwen MAX_CONTEXT-sized exported attention map.
+            context: ContextLimits {
+                checkpoint_max_tokens: options.checkpoint_max_context_tokens,
+                compiled_index_max_tokens: None,
+            },
+            pool_unit_rows: cache.logical_unit_rows,
+            devices,
+            host_prefix_bytes: options.host_prefix_bytes,
         },
-        pool_unit_rows: cache.logical_unit_rows,
-        devices,
-        host_prefix_bytes: options.host_prefix_bytes,
     })
 }
 
@@ -234,6 +295,10 @@ mod tests {
                     // Rank0 need not be physical device0.
                     device: (1 - rank) as u32,
                     additional: vec![MemoryReservation {
+                        name: "native.modules".into(),
+                        bytes: 1 << 20,
+                    }],
+                    loading_additional: vec![MemoryReservation {
                         name: "native.modules".into(),
                         bytes: 1 << 20,
                     }],
@@ -275,7 +340,8 @@ mod tests {
         let checkpoint = Checkpoint::open(dir.path()).unwrap();
         let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
         let options = options(2);
-        let profile = mimo_capacity_profile(&checkpoint, &cfg, weights(2), &options).unwrap();
+        let phases = mimo_capacity_profiles(&checkpoint, &cfg, weights(2), &options).unwrap();
+        let profile = &phases.steady;
         assert_eq!(
             profile.devices.iter().map(|d| d.device).collect::<Vec<_>>(),
             [1, 0]
@@ -307,6 +373,17 @@ mod tests {
         };
         assert_eq!(arena(0), 42 * 128 * 2560);
         assert_eq!(arena(0), arena(1));
+        assert!(profile
+            .devices
+            .iter()
+            .all(|d| d.reservations.iter().all(|r| r.name != "loading.temporary")));
+        assert!(phases.loading.iter().all(|d| d.pool_unit_bytes == 0));
+        let loading_extra = phases.loading[0]
+            .reservations
+            .iter()
+            .find(|r| r.name == "loading.temporary")
+            .unwrap();
+        assert_eq!(loading_extra.bytes, 4096 * 8192 * 2);
     }
 
     #[test]
@@ -321,7 +398,9 @@ mod tests {
         let checkpoint = Checkpoint::open(dir.path()).unwrap();
         let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
         let options = options(1);
-        let profile = mimo_capacity_profile(&checkpoint, &cfg, weights(1), &options).unwrap();
+        let profile = mimo_capacity_profiles(&checkpoint, &cfg, weights(1), &options)
+            .unwrap()
+            .steady;
         let fixed_workspace: u64 = profile.devices[0]
             .reservations
             .iter()
@@ -368,9 +447,89 @@ mod tests {
         let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
         let mut options = options(2);
         options.ranks[1].device = options.ranks[0].device;
-        assert!(mimo_capacity_profile(&checkpoint, &cfg, weights(2), &options).is_err());
+        assert!(mimo_capacity_profiles(&checkpoint, &cfg, weights(2), &options).is_err());
         options.ranks[1].device = 0;
         options.ranks[1].workspaces[0].1.max_context = 1 << 20;
-        assert!(mimo_capacity_profile(&checkpoint, &cfg, weights(2), &options).is_err());
+        assert!(mimo_capacity_profiles(&checkpoint, &cfg, weights(2), &options).is_err());
+    }
+
+    #[test]
+    fn native_mtp_state_is_admitted_while_weights_load_before_target_kv() {
+        use crate::plan::testing::t;
+        let mut tensors = mimo_flash_tensors();
+        let stage: Vec<_> = tensors
+            .iter()
+            .filter_map(|(name, dtype, shape)| {
+                let suffix = name.strip_prefix("model.layers.1.")?;
+                (suffix.starts_with("self_attn.") || suffix.ends_with("layernorm.weight")).then(
+                    || {
+                        (
+                            format!(
+                                "model.mtp.layers.0.{}",
+                                suffix.replace("post_attention_layernorm", "pre_mlp_layernorm")
+                            ),
+                            *dtype,
+                            shape.clone(),
+                        )
+                    },
+                )
+            })
+            .chain(tensors.iter().filter_map(|(name, dtype, shape)| {
+                let suffix = name.strip_prefix("model.layers.0.mlp.")?;
+                Some((
+                    format!("model.mtp.layers.0.mlp.{suffix}"),
+                    *dtype,
+                    shape.clone(),
+                ))
+            }))
+            .collect();
+        tensors.extend(stage);
+        tensors.push(t(
+            "model.mtp.layers.0.eh_proj.weight",
+            "BF16",
+            &[4096, 8192],
+        ));
+        for norm in ["enorm", "hnorm", "final_layernorm"] {
+            tensors.push(t(
+                format!("model.mtp.layers.0.{norm}.weight"),
+                "BF16",
+                &[4096],
+            ));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &mimo_flash_config(), &tensors, Some(1));
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
+        let profiles = mimo_capacity_profiles(
+            &checkpoint,
+            &cfg,
+            MimoResidentOptions {
+                native_mtp_layers: 1,
+                ..weights(2)
+            },
+            &options(2),
+        )
+        .unwrap();
+        let name = "loading.mtp_state_before_target_kv";
+        let state = profiles.loading[0]
+            .reservations
+            .iter()
+            .find(|r| r.name == name)
+            .unwrap();
+        // One unsplit SWA stage, a 256-row hidden history, and the five
+        // fixed hidden buffers plus stage ids/index. All are lead-only.
+        assert_eq!(
+            state.bytes,
+            20 * (256 * 5120 + 256 * 4096 * 2) + 12 * 64 * 4096 + 2 * 64 * 4 + 256
+        );
+        assert!(profiles.loading[1]
+            .reservations
+            .iter()
+            .all(|r| r.name != name));
+        assert!(profiles
+            .steady
+            .devices
+            .iter()
+            .all(|d| d.reservations.iter().all(|r| r.name != name)));
     }
 }
