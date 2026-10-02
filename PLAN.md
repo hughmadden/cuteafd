@@ -162,6 +162,11 @@ API and dashboard: keep ds41rt `native_v41` router; add `/v1/completions`;
 per-family chat templates (deepseek-recipe crates for DeepSeek; minijinja
 over `tokenizer_config.chat_template` as the generic path) with per-family
 tool-call parsers and xgrammar tag grammars; console made model-agnostic.
+Status (2026-10-02): the live console (`/`) is family-neutral: `shared/console` (producer
+`Ticket`/`Step`/`layer_mark`, console thread, wire schema) fed by every serve loop; each family
+declares its header, speculator, micro-step stages and layer classes in a `console::Layout`.
+Shared page shell, palette and SVG chart primitives at `/assets/cuteafd-ui.{css,js}` (also used
+by `/bench`); logo and favicon at `/assets/cuteafd-{logo,mark}.svg`.
 
 ## Execution engines (decided 2026-09-29)
 
