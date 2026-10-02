@@ -178,6 +178,30 @@ def test_expert_input_is_opt_in_and_mimo_only(tmp_path):
     assert "docker run" not in result.stderr
 
 
+@pytest.mark.parametrize("key", ["SPECULATOR_FP8", "DRAFT_FP8"])
+@pytest.mark.parametrize("value, expected", [(None, None), ("", None), ("auto", None),
+                                            ("on", "true"), ("off", "false")])
+def test_mimo_drafter_precision_preserves_auto_and_forwards_explicit_conversion(tmp_path, key, value, expected):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    keys = "SPECULATOR=dflash2\n"
+    if value is not None:
+        keys += f"{key}={value}\n"
+    result = _family_launch_result(tmp_path, config, "test/mimo", keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    if expected is None:
+        assert "--draft-fp8" not in launch
+    else:
+        assert f"--draft-fp8 {expected}" in launch
+
+
+def test_mimo_invalid_drafter_precision_rejects_before_launch(tmp_path):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    result = _family_launch_result(tmp_path, config, "test/mimo", "SPECULATOR=dflash2\nSPECULATOR_FP8=garbage\n")
+    assert result.returncode == 2 and "must be auto, on or off" in result.stderr
+    assert "docker run" not in result.stderr
+
+
 SPLIT_CONFIGS = {
     "qwen4": {"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
                "layer_types": ["linear_attention", "full_attention"]}},
