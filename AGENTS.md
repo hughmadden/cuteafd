@@ -82,6 +82,10 @@ after tables with conditions.
   (1× RTX + the fewest Sparks it fits) and the maximum (2× RTX + 4 or 6
   Sparks, whichever divides the model sensibly). Other layouts need
   correctness gates, not perf tables; the planner's estimates cover them.
+- Until the first official release, be frugal: measure only what a decision
+  needs, one launch per arm, no repeat sessions unless a number is borderline.
+  Release prep runs the "Release smoke" profile (basic card + quick quality,
+  ≤5 min per config including load) per family, quant and reference config.
 - Tiered gates. Merges and features: cargo/script tests (failing ids, not
   counts), golden NLL/byte-exactness on one GPU or loopback, and the
   feature's own measurement. Changes to shared hot paths (transport, expert
