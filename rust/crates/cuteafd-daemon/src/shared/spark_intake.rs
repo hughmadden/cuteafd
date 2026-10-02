@@ -753,6 +753,233 @@ impl<'a> SparkLane<'a> {
     }
 }
 
+/// Whether engines that support it exchange decode/verify waves through the
+/// device-driven [`SparkDeviceLink`] (`CUTEAFD_SPARK_DEVICE=1`; off by default).
+pub(crate) fn device_exchange_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| matches!(std::env::var("CUTEAFD_SPARK_DEVICE").as_deref(), Ok("1" | "on" | "true")))
+}
+
+impl Drop for SparkDeviceLink<'_> {
+    fn drop(&mut self) {
+        let stats = self.lane.stats();
+        tracing::info!(waves = stats.waves, build_post_us = stats.build_post_us, receive_us = stats.receive_us,
+            wakes = stats.wakes, wake_us = stats.wake_us, "device-driven Spark exchange closed");
+    }
+}
+
+/// The device-driven Spark exchange (PLAN.md): the engine's stream copies a
+/// wave's routes and wire rows into a pinned mailbox and publishes it
+/// ([`Self::dispatch`]); a proxy thread ([`SparkDeviceLane`]) posts it and
+/// lands every rank's partials in this link's planes; the stream waits for
+/// the proxy's completion ([`Self::collect`]) and reduces ([`Self::reduce`]).
+/// No host wait, parse or launch sits between a layer's router and its
+/// reduce, so a step's layers can be queued (and captured) back to back.
+pub(crate) struct SparkDeviceLink<'a> {
+    /// Dropped first: joins the proxy before its mailbox and planes go.
+    lane: cuteafd_transport::expert::SparkDeviceLane,
+    intake: SparkIntake<'a>,
+    mailbox: HostAllocation<'a>,
+    /// Write mode (`CUTEAFD_SPARK_WRITE=1`): the ranks RDMA-write their rows
+    /// and completion flags here (planes, then one 64-byte flag line per rank);
+    /// no receive and no host thread is involved in a wave's return.
+    written: Option<DeviceAllocation<'a>>,
+    library: &'a NativeLibrary,
+    capacity: usize,
+    topk: usize,
+    wire_row_bytes: usize,
+    row_bytes: usize,
+    ranks: usize,
+}
+
+/// Write mode: one plane per rank, then one 64-byte line per rank flag.
+fn written_layout(ranks: usize, capacity: usize, row_bytes: usize) -> (usize, usize) {
+    let plane = (capacity * row_bytes).next_multiple_of(256);
+    (plane, ranks * plane)
+}
+
+/// Whether device exchanges have the ranks write their responses
+/// (`CUTEAFD_SPARK_WRITE=1`; needs workers that accept write targets).
+pub(crate) fn written_responses() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("CUTEAFD_SPARK_WRITE").as_deref(), Ok("1" | "on")))
+}
+
+impl<'a> SparkDeviceLink<'a> {
+    /// Connects the proxy's transport (`capacity` rows of `topk` routes and
+    /// `wire_row_bytes` per wave; partial rows of `row_bytes`) on `device`.
+    /// Needs GPU landing (the probed intake mode must be `gpu`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(library: &'a NativeLibrary, device: i32, peers: &[std::net::SocketAddr], executors: &[u64],
+        capacity: usize, topk: usize, wire_row_bytes: usize, row_bytes: usize,
+        config: cuteafd_transport::TcpTransportConfig, warm: Option<cuteafd_transport::ExpertProtocolV2Request>,
+        build: cuteafd_transport::expert::DeviceBuild) -> Result<Self> {
+        use cuteafd_transport::expert::device_mailbox;
+        let choice = choose_mode(library)?;
+        ensure!(choice.mode == IntakeMode::Gpu,
+            "the device Spark exchange needs GPU landing, but the intake is {} ({})", choice.mode.name(), choice.reason);
+        let intake = SparkIntake::new(library, IntakeMode::Gpu, peers.len(), if written_responses() { 1 } else { capacity },
+            row_bytes)?;
+        let mailbox = HostAllocation::new(library, device_mailbox::bytes(capacity, topk, wire_row_bytes))?;
+        library.peer_exchange_initialize()?;
+        let landing = intake.landing().context("GPU intake planes")?;
+        let ranks = peers.len();
+        let (written, targets) = if written_responses() {
+            let (plane, flags) = written_layout(ranks, capacity, row_bytes);
+            let allocation = DeviceAllocation::new(library, flags + ranks * 64)?;
+            library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { ptr: unsafe { allocation.buffer.ptr.cast::<u8>()
+                .add(flags) }.cast(), bytes: ranks * 64, ..allocation.buffer }, &vec![0u8; ranks * 64])?;
+            let targets = (0..ranks).map(|rank| cuteafd_transport::DeviceWriteTarget {
+                base: allocation.buffer.ptr as usize, bytes: allocation.buffer.bytes, plane_offset: rank * plane,
+                plane_bytes: capacity * row_bytes, flag_offset: flags + rank * 64 }).collect();
+            (Some(allocation), Some(targets))
+        } else { (None, None) };
+        // SAFETY: the mailbox and the intake planes are fields of this link,
+        // dropped after the lane (which joins its thread first); the engine
+        // publishes a wave only after it waited for the previous one and
+        // reduced its planes (`dispatch` follows `collect` + `reduce` in
+        // stream order).
+        let lane = unsafe {
+            cuteafd_transport::expert::SparkDeviceLane::spawn(peers.to_vec(), executors.to_vec(), capacity as u32,
+                config, landing, device, mailbox.buffer.ptr as usize, mailbox.buffer.bytes, topk, wire_row_bytes,
+                warm, targets, build)?
+        };
+        tracing::info!(ranks, capacity, written = written.is_some(),
+            "device-driven Spark exchange ready (proxy thread posts; responses land in GPU memory)");
+        Ok(Self { lane, intake, mailbox, written, library, capacity, topk, wire_row_bytes, row_bytes, ranks })
+    }
+
+    pub(crate) fn world_size(&self) -> usize {
+        self.lane.world_size()
+    }
+
+    /// Plane pointers for the compact reducer.
+    pub(crate) fn pointers(&self) -> [*const u16; MAX_INTAKE_RANKS] {
+        match &self.written {
+            Some(allocation) => {
+                let (plane, _) = written_layout(self.ranks, self.capacity, self.row_bytes);
+                let mut pointers = [std::ptr::null::<u16>(); MAX_INTAKE_RANKS];
+                for (rank, slot) in pointers.iter_mut().enumerate().take(self.ranks) {
+                    // SAFETY: rank planes lie inside the written allocation.
+                    *slot = unsafe { allocation.buffer.ptr.cast::<u8>().add(rank * plane) }.cast();
+                }
+                pointers
+            }
+            None => self.intake.pointers(),
+        }
+    }
+
+    /// Before queuing a step's waves; returns an earlier wave's error.
+    pub(crate) fn arm(&self) -> Result<()> {
+        self.lane.arm()
+    }
+
+    /// Announces `waves` waves the stream will publish (before it can): the
+    /// proxy spins only while announced waves are outstanding.
+    pub(crate) fn expect(&self, waves: u64) {
+        self.lane.expect(waves)
+    }
+
+    /// After the step's stream drained: an error of any of its waves.
+    pub(crate) fn check(&self) -> Result<()> {
+        use cuteafd_transport::expert::device_mailbox as m;
+        self.lane.check()?;
+        if self.written.is_some() {
+            // SAFETY: a u32 word of the live pinned mailbox, written by the GPU's waits.
+            let word = unsafe { &*(self.mailbox_at(m::WRITE_ERROR).ptr as *const std::sync::atomic::AtomicU32) };
+            let failed = word.swap(0, std::sync::atomic::Ordering::AcqRel);
+            ensure!(failed == 0, "device Spark exchange: ranks {failed:#b} could not write their responses");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn stats(&self) -> cuteafd_transport::expert::DeviceLaneStats {
+        self.lane.stats()
+    }
+
+    fn mailbox_at(&self, offset: usize) -> CuteafdHostBuffer {
+        CuteafdHostBuffer {
+            // SAFETY: offsets come from `device_mailbox` and lie inside it.
+            ptr: unsafe { self.mailbox.buffer.ptr.cast::<u8>().add(offset) }.cast(),
+            bytes: self.mailbox.buffer.bytes - offset,
+            ..self.mailbox.buffer
+        }
+    }
+
+    /// Loads the signal/wait kernels on another GPU whose streams will
+    /// dispatch or collect on this link (the sequences live in the mailbox).
+    pub(crate) fn initialize_on(&self, device: i32) -> Result<()> {
+        let previous = self.library.cuda_get_device()?;
+        self.library.cuda_set_device(device)?;
+        let loaded = self.library.peer_exchange_initialize();
+        self.library.cuda_set_device(previous)?;
+        loaded
+    }
+
+    /// Queues on `stream` the copy of a wave's `rows` x `topk` route ids
+    /// (u32) and gate weights (f32) and its wire rows into the mailbox, then
+    /// publishes it (layer, rows and `kind` for the proxy's request builder).
+    ///
+    /// # Safety
+    /// `ids`, `weights` and `wire` are live device buffers holding the wave,
+    /// complete in `stream` order; every earlier wave on this link was
+    /// collected and reduced earlier on `stream`.
+    pub(crate) unsafe fn dispatch(&self, layer: usize, rows: usize, kind: u32, ids: CuteafdDeviceBuffer,
+        weights: CuteafdDeviceBuffer, wire: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<()> {
+        use cuteafd_transport::expert::device_mailbox as m;
+        ensure!(rows > 0 && rows <= self.capacity, "a device wave of {rows} rows exceeds the link's {}", self.capacity);
+        let (route_bytes, wire_bytes) = (rows * self.topk * 4, rows * self.wire_row_bytes);
+        // SAFETY: the mailbox ranges hold a full-capacity wave; the caller
+        // vouches for the sources and their ordering.
+        unsafe {
+            self.library.copy_d2h_host_buffer_async(self.mailbox_at(m::ROUTES), ids, route_bytes, stream)?;
+            self.library.copy_d2h_host_buffer_async(self.mailbox_at(m::weights(self.capacity, self.topk)), weights,
+                route_bytes, stream)?;
+            self.library.copy_d2h_host_buffer_async(self.mailbox_at(m::wire(self.capacity, self.topk)), wire,
+                wire_bytes, stream)?;
+            self.library.host_signal(self.mailbox_at(m::READY).ptr.cast(), self.mailbox_at(m::SEND_STATE).ptr.cast(),
+                self.mailbox_at(m::DESCRIPTOR).ptr.cast(), [layer as u32, rows as u32, kind, self.topk as u32], stream)
+        }
+    }
+
+    /// Queues on `stream` the wait for the proxy's completion of the oldest
+    /// published, not yet collected wave (its partials are then in the planes).
+    ///
+    /// # Safety
+    /// A [`Self::dispatch`] for this wait was queued earlier on `stream`.
+    pub(crate) unsafe fn collect(&self, stream: *mut c_void) -> Result<()> {
+        use cuteafd_transport::expert::device_mailbox as m;
+        if let Some(allocation) = &self.written {
+            let (_, flags) = written_layout(self.ranks, self.capacity, self.row_bytes);
+            // SAFETY: the flags lie in the written allocation the ranks write;
+            // the state and error words are pinned, device-mapped mailbox memory.
+            return unsafe {
+                self.library.spark_wait_written(allocation.buffer.ptr.cast::<u8>().add(flags).cast(), self.ranks as u32,
+                    8, self.mailbox_at(m::RECV_STATE).ptr.cast(), self.mailbox_at(m::WRITE_ERROR).ptr.cast(), stream)
+            };
+        }
+        // SAFETY: the DONE word is pinned, device-mapped mailbox memory; the
+        // state word is pinned mailbox memory too.
+        unsafe { self.library.peer_wait(self.mailbox_at(m::DONE).ptr.cast(), self.mailbox_at(m::RECV_STATE).ptr.cast(),
+            stream) }
+    }
+
+    /// Queues `output = shared + sum of the rank planes` for `t` rows on
+    /// `stream` (after [`Self::collect`]).
+    ///
+    /// # Safety
+    /// As [`SparkLink::reduce`].
+    pub(crate) unsafe fn reduce(&self, shared: *const u16, output: *mut u16, t: usize, stream: *mut c_void)
+        -> Result<()> {
+        // SAFETY: the planes hold the collected wave's `t` rows in `stream`
+        // order; the caller vouches for the rest.
+        unsafe {
+            self.library.v41_compact_reducer()?.reduce_planes(self.pointers(), self.world_size() as u32, shared,
+                output, t as u32, stream)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

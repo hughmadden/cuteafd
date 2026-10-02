@@ -13,6 +13,8 @@ mod chunks;
 pub use chunks::V41Tp4ChunkReceiver;
 mod roce;
 pub use roce::{SparkExperts, SparkExpertPending, SparkExpertWave, WaveReceipt};
+mod device;
+pub use device::{mailbox as device_mailbox, DeviceBuild, DeviceLaneStats, DeviceWave, SparkDeviceLane};
 mod lane;
 pub use lane::{LaneBuild, LaneOwnedSink, LaneSink, LaneTimes, SparkExpertLane};
 mod tcp;

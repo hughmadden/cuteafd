@@ -18,6 +18,8 @@ pub(crate) struct LocalTp4Client {
     deadline: Option<Instant>,
     /// Per-rank device ranges response payloads land in (GPU landing).
     landing: Vec<Option<DeviceLanding>>,
+    /// Per-rank write targets: responses are RDMA-written there (write mode).
+    write: Vec<Option<DeviceWriteTarget>>,
     /// Shared registered request buffer (zero-copy egress).
     egress: Option<Arc<super::egress::EgressBuffer>>,
     /// Post the ranks' zero-copy requests one after another (each once the
@@ -46,6 +48,7 @@ impl LocalTp4Client {
             done: Vec::with_capacity(world),
             deadline: None,
             landing: vec![None; world],
+            write: vec![None; world],
             egress: None,
             stagger: false,
         }
@@ -81,6 +84,34 @@ impl LocalTp4Client {
         anyhow::ensure!(landing.len() == self.peers.len(), "one GPU landing entry per rank");
         self.reset();
         self.landing = landing;
+        Ok(())
+    }
+    /// Write mode from the next connection on: each rank's responses are
+    /// RDMA-written into its target (no receives); drops current sessions.
+    pub(crate) fn set_write_targets(&mut self, write: Vec<Option<DeviceWriteTarget>>) -> Result<()> {
+        anyhow::ensure!(write.len() == self.peers.len(), "one write target entry per rank");
+        self.reset();
+        self.write = write;
+        Ok(())
+    }
+    /// Write mode: posts `request` to every rank and returns; the responses
+    /// arrive as RDMA writes (their flags tell the GPU). Send completions are
+    /// reaped as send slots are reused.
+    pub(crate) fn post_written(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
+        anyhow::ensure!(self.deadline.is_none(), "a received wave is pending on this transport");
+        for rank in 0..self.peers.len() {
+            anyhow::ensure!(self.write[rank].is_some(), "rank {rank} has no write target");
+            if self.sessions[rank].as_ref().map(|s| s.fits(request)).transpose()? == Some(false) {
+                self.sessions[rank] = None;
+            }
+            if self.sessions[rank].is_none() {
+                self.sessions[rank] = Some(VerbsHostProtocolV2PersistentClientSession::connect_local(
+                    self.peers[rank], &self.config, request, None, None, self.write[rank])?);
+            }
+            let session = self.sessions[rank].as_mut().unwrap();
+            anyhow::ensure!(session.write_mode, "rank {rank} session is not in write mode");
+            session.post_chunk_request(request, &self.config)?;
+        }
         Ok(())
     }
     /// Ranks whose live session lands payloads in device memory.
@@ -126,6 +157,7 @@ impl LocalTp4Client {
                     request,
                     self.landing[rank],
                     self.egress.as_ref(),
+                    self.write[rank],
                 )?);
             }
             let session = self.sessions[rank].as_mut().unwrap();

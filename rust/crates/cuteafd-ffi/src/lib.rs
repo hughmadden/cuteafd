@@ -3746,6 +3746,38 @@ impl NativeLibrary {
     /// # Safety
     /// The range must be host memory that stays allocated until the endpoint is
     /// destroyed.
+    /// Registers a device range for remote RDMA writes on the endpoint and
+    /// returns its rkey (`None` removes it).
+    ///
+    /// # Safety
+    /// `handle` is a live endpoint; the range stays allocated until removed or
+    /// the endpoint is destroyed.
+    pub unsafe fn rdma_rc_endpoint_expose_device(&self, handle: *mut c_void, device: Option<CuteafdDeviceBuffer>)
+        -> Result<u32> {
+        type ExposeFn = unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut u32) -> CuteafdStatus;
+        let expose: Symbol<ExposeFn> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_expose_device")? };
+        let (ptr, bytes) = device.map_or((std::ptr::null_mut(), 0), |d| (d.ptr, d.bytes));
+        let mut rkey = 0;
+        let status = unsafe { expose(handle, ptr, bytes, &mut rkey) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_expose_device", status)?;
+        Ok(rkey)
+    }
+
+    /// RDMA-writes `bytes` at `offset` of the send buffer to `remote`, then
+    /// `flag_value` to `flag_remote` (signaled with `wr_id`).
+    ///
+    /// # Safety
+    /// `handle` is a live connected endpoint; the remote ranges were exposed
+    /// by the peer with these rkeys and hold the written extents.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn rdma_rc_endpoint_post_write_flagged(&self, handle: *mut c_void, offset: usize, bytes: usize,
+        remote: u64, rkey: u32, flag_value: u64, flag_remote: u64, flag_rkey: u32, wr_id: u64) -> Result<()> {
+        type WriteFn = unsafe extern "C" fn(*mut c_void, usize, usize, u64, u32, u64, u64, u32, u64) -> CuteafdStatus;
+        let write: Symbol<WriteFn> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_post_write_flagged")? };
+        let status = unsafe { write(handle, offset, bytes, remote, rkey, flag_value, flag_remote, flag_rkey, wr_id) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_post_write_flagged", status)
+    }
+
     pub unsafe fn rdma_rc_endpoint_register_region(
         &self,
         handle: *mut c_void,

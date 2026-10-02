@@ -411,6 +411,13 @@ fn worker(
     let roce = spark_transport(&args.peers, capacity, protocol_v2_timing, topology)?;
     let mut transport = NativeTp4Wave::new(&lib, roce, wave_bytes)?;
     if let Some(profile) = &paired_profile { transport.install_paired(profile.clone())?; }
+    if crate::shared::memory::chain::device_exchange_enabled() && paired_profile.is_none() && topology.is_none()
+        && catalog.nvfp4().is_none() && catalog.exl3().is_none() {
+        // Verification waves (up to 80 rows) on the device-driven exchange.
+        transport.install_device_link(&args.peers, 80.min(capacity as usize), 39,
+            cuteafd_transport::TcpTransportConfig { timing: protocol_v2_timing, timeout: Duration::from_secs(120),
+                max_frame_bytes: 64 << 20 })?;
+    }
     let mut prefill_pass = TargetPass::new(
         TargetEmbeddingWave::new(&lib, &table, rows, TargetEmbeddingWave::device_bytes(rows)?)?,
         BackboneLane::new(&weights, capacity, BackboneLane::workspace_bytes(&lib, capacity)?.into_iter().sum())?,

@@ -42,6 +42,8 @@ pub(crate) struct DistributedTargetPass<'w, 'a> {
     /// used for verification passes only.
     chain: Option<crate::shared::memory::chain::StageChain<'a>>,
     verification: bool,
+    /// The next verification pass may run device-ordered (see `set_device_order`).
+    device_order: bool,
     sampled: Option<crate::families::deepseek_v41::v41_target_head::SampledTargetRows>,
     #[cfg(test)]
     trace: bool,
@@ -172,6 +174,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             route_capture: (0..40).map(|_| Vec::with_capacity(4096)).collect(),
             chain,
             verification: false,
+            device_order: true,
             sampled: None,
             #[cfg(test)]
             trace: false,
@@ -212,6 +215,8 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     }
     /// The next `execute` is a verification pass (consumed by that call).
     pub(crate) fn mark_verification(&mut self) { self.verification = true; }
+    /// The next pass may run device-ordered (`CUTEAFD_V41_DEVICE`); reset after it.
+    pub(crate) fn set_device_order(&mut self, on: bool) { self.device_order = on; }
     /// Device-select the rows of a completed non-greedy verification pass.
     /// # Safety
     /// The pass completed with `greedy = false` and its head is unconsumed.
@@ -292,6 +297,9 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         // modes (TP2 attention/query/output, all opt-in) keep host drains.
         let chained = std::mem::replace(&mut self.verification, false)
             && !self.lanes.iter().any(|lane| lane.uses_peer_projection());
+        if let Some(chain) = &self.chain {
+            chain.set_device_order(std::mem::replace(&mut self.device_order, true));
+        }
         let Some(handle) = self.chain.as_ref().filter(|_| chained).map(|chain| chain.handle()) else {
             return unsafe { self.execute_unchained(requests, batch, transport, placement, selected,
                 suffix, encoder, greedy).await };
@@ -300,7 +308,18 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         let result = unsafe { handle.scope(self.execute_unchained(requests, batch, transport, placement,
             selected, suffix, encoder, greedy)).await };
         let drained = self.chain.as_ref().unwrap().drain();
-        result.and(drained)
+        let result = result.and(drained).and_then(|()| transport.get().check_device());
+        if result.is_ok() && self.capture_routes && crate::shared::memory::chain::device_enabled() {
+            // Device-ordered local layers left their routes in the routers' rings.
+            for gpu in 0..self.lanes.len() {
+                let device = self.lanes[gpu].device;
+                let lane = &mut self.lanes[gpu];
+                for layer in device.run(|| lane.get_mut().drain_route_ring())? {
+                    self.route_capture[layer].clone_from(&self.lanes[gpu].captured_routes()[layer]);
+                }
+            }
+        }
+        result
     }
     async unsafe fn execute_unchained(
         &mut self,
@@ -462,6 +481,15 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             }
             let gpu = self.map.attention(layer)?;
             let device = self.lanes[gpu].device;
+            if layer != first && crate::shared::memory::chain::deferred() {
+                // The previous layer's attention stages uploaded from host staging
+                // this layer rewrites: wait until they ran (the GPU still has that
+                // layer's FFN queued, so it does not idle while this one is queued).
+                crate::shared::memory::chain::fence_wait(device.library, (layer - 1) % 2).await?;
+                // Let the other lane queue its layer too: lanes interleave per layer
+                // as they did when every layer waited on the host.
+                tokio::task::yield_now().await;
+            }
             if layer != first {
                 unsafe {
                     self.advance(layer).await?;
@@ -610,6 +638,9 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                     )
                 })?
             };
+            if crate::shared::memory::chain::deferred() {
+                crate::shared::memory::chain::fence_mark(device.library, layer % 2)?;
+            }
             #[cfg(test)]
             let prepared = if self.trace && std::env::var_os("CUTEAFD_TRACE_FFN").is_some()
                 && std::env::var("CUTEAFD_TRACE_LAYER").ok().map_or(true,

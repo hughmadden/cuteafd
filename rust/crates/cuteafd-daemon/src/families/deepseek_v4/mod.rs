@@ -294,6 +294,12 @@ pub(crate) fn with_engine<T>(
         engine.warm_transport(transport, &runtime)?;
     }
     tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
+    if crate::shared::spark_intake::device_exchange_enabled() && !skip {
+        let started = Instant::now();
+        engine.attach_device_link(&peers, &executors,
+            TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 })?;
+        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "decode and verify waves use the device exchange");
+    }
     let result = body(&engine, &mut transports, &runtime);
     if let Err(error) = &result {
         // Teardown may fail after a device fault and would otherwise hide this.
@@ -451,7 +457,11 @@ fn golden_run(
             }
             worst = worst.min(similarity(ours, theirs).0);
         }
-        println!("decode rows: top-1 agreement {:.1}% | worst row cosine {worst:.6}",
+        // FNV-1a over the decode rows' logits bits: equal digests are byte-identical runs.
+        let digest = logits[prefill * vocab..].iter().fold(0xcbf2_9ce4_8422_2325u64, |h, v| {
+            (h ^ u64::from(v.to_bits())).wrapping_mul(0x100_0000_01b3)
+        });
+        println!("decode rows: top-1 agreement {:.1}% | worst row cosine {worst:.6} | logits digest {digest:016x}",
             100.0 * decode_agree as f64 / decode_steps as f64);
     }
     Ok(())

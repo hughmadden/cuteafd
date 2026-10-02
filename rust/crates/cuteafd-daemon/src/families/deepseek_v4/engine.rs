@@ -59,6 +59,9 @@ pub(crate) struct Engine<'a> {
     pub embedding: TokenEmbedding<'a>,
     /// Benchmarks and token gates only: MoE layers run the shared expert alone.
     pub skip_routed: bool,
+    /// The device-driven Spark exchange for decode and verify steps
+    /// (`CUTEAFD_SPARK_DEVICE=1`); without it they use the first transport.
+    pub device_link: Option<crate::shared::spark_intake::SparkDeviceLink<'a>>,
     /// This engine's GPU (rank 0 of a head split).
     pub device: i32,
     /// Program family of one GPU's share under a head split (`dsv4f2`, `dsv4p2`).
@@ -462,6 +465,7 @@ impl<'a> Engine<'a> {
             local: RefCell::new(None),
             embedding: parts.embedding,
             skip_routed: parts.skip_routed,
+            device_link: None,
         })
     }
 
@@ -683,7 +687,9 @@ impl<'a> Engine<'a> {
         transport: Option<&mut SparkLink<'_>>,
         runtime: &tokio::runtime::Runtime,
     ) -> Result<Vec<f32>> {
-        self.decode_device(rows, transport, runtime)?.to_host(self.library)
+        let logits = self.decode_device(rows, transport, runtime)?.to_host(self.library)?;
+        self.check_device()?;
+        Ok(logits)
     }
 
     /// [`Self::decode`] leaving the logits on the device.
@@ -723,7 +729,9 @@ impl<'a> Engine<'a> {
         transports: &mut [SparkLink<'_>],
         runtime: &tokio::runtime::Runtime,
     ) -> Result<Vec<f32>> {
-        self.verify_device(sequences, transports, runtime)?.to_host(self.library)
+        let logits = self.verify_device(sequences, transports, runtime)?.to_host(self.library)?;
+        self.check_device()?;
+        Ok(logits)
     }
 
     /// [`Self::verify`] leaving every row's logits on the device.
@@ -845,11 +853,18 @@ impl<'a> Engine<'a> {
             let (t, rows) = (tables.rows, rows_of(0));
             // Decode waves go to the first transport; its planes are baked into
             // the replayed graphs (they never move).
-            let decode_planes = match transports.first() {
-                Some(transport) => transport.intake.pointers(),
-                None if self.skip_routed || self.local_layers() == self.weights.layers.len() => [std::ptr::null(); 6],
-                None => anyhow::bail!("no transport"),
+            let device = self.device_link.as_ref().filter(|_| !self.skip_routed);
+            if let Some(link) = device {
+                link.arm()?;
+            }
+            let decode_planes = match (device, transports.first()) {
+                (Some(link), _) => link.pointers(),
+                (None, Some(transport)) => transport.intake.pointers(),
+                (None, None) if self.skip_routed || self.local_layers() == self.weights.layers.len() =>
+                    [std::ptr::null(); 6],
+                (None, None) => anyhow::bail!("no transport"),
             };
+            let local_layers = self.local_layers();
             let mut ranks = 0usize;
             for (layer, weights) in self.weights.layers.iter().enumerate() {
                 let previous = ranks;
@@ -869,9 +884,15 @@ impl<'a> Engine<'a> {
                         self.tap(w, lane, layer - 1, t)?;
                     }
                     if w1.is_some() {
-                        self.attention_split(layer, weights, tables, lane, 0, w, rows, cap)
+                        self.attention_split(layer, weights, tables, lane, 0, w, rows, cap)?;
                     } else {
-                        self.attention(layer, weights, tables, lane, w, rows, cap)
+                        self.attention(layer, weights, tables, lane, w, rows, cap)?;
+                    }
+                    // Device exchange: the layer's Spark wave, the shared expert while the
+                    // Sparks compute, and the wait for its partials join the segment.
+                    match device {
+                        Some(link) if layer >= local_layers => self.device_experts(link, layer, t, w, lane, cap),
+                        _ => Ok(()),
                     }
                 };
                 let key = GraphKey {
@@ -883,6 +904,10 @@ impl<'a> Engine<'a> {
                     table_stride: tables.c4_table_stride,
                     previous,
                 };
+                if let Some(link) = device.filter(|_| layer >= local_layers) {
+                    // Announced before the replay can publish it: the proxy spins for it.
+                    link.expect(1);
+                }
                 self.replay_on(0, key, segment)?;
                 if let Some(w1) = w1 {
                     // Rank 1's segments: layer 0 after rank 0's, then each next one before the
@@ -894,7 +919,10 @@ impl<'a> Engine<'a> {
                         self.peer_segment(layer + 1, tables, w1, t, cap)?;
                     }
                 }
-                ranks = self.decode_experts(layer, t, w, lane, cap, transports.first_mut(), runtime)?;
+                ranks = match device {
+                    Some(link) if layer >= local_layers => link.world_size(),
+                    _ => self.decode_experts(layer, t, w, lane, cap, transports.first_mut(), runtime)?,
+                };
                 crate::shared::console::layer_mark(layer);
             }
             // The tail: the last post, its taps and the drafter's KV, then the head.
@@ -1428,17 +1456,50 @@ impl<'a> Engine<'a> {
     /// One Spark request for `rows` wire rows with `topk` routes each.
     fn expert_request(&self, layer: usize, rows: usize, routes: Vec<ExpertProtocolV2RouteEntry>,
         wire: bytes::Bytes, kind: ExpertV2SourceKind) -> Result<ExpertProtocolV2Request> {
-        let topk = self.cfg.n_activated_experts as u32;
-        let mut request = ExpertProtocolV2Request::new_bytes(
-            layer as u64 + 1, 17, layer as u32, self.cfg.dim as u32, ExpertV2Dtype::Fp8E4m3Ue8m0K32,
-            (0..rows as u32).map(|row| ExpertProtocolV2RowDescriptor {
-                row_id: u64::from(row), source_kind: kind, source_request_id: 1,
-                token_position: u64::from(row), route_offset: row * topk, route_count: topk,
-            }).collect(),
-            routes, wire,
-        )?;
-        request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-        Ok(request)
+        spark_request(self.cfg.dim, self.cfg.n_activated_experts, layer, rows, routes, wire, kind)
+    }
+
+    /// A decode unit's Spark layer on the device exchange: the wave goes out
+    /// from the stream, the shared expert runs while the Sparks compute, and
+    /// the stream waits for the partials (the next segment's post reduces).
+    fn device_experts(&self, link: &crate::shared::spark_intake::SparkDeviceLink<'_>, layer: usize, t: usize,
+        w: &Workspace<'_>, lane: &Lane<'_>, cap: usize) -> Result<()> {
+        let (h, topk) = (self.cfg.dim, self.cfg.n_activated_experts);
+        let sized = |dev: &Dev<'_>, bytes: usize| cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..dev.buffer };
+        // SAFETY: routes and wire rows are complete in stream order (the
+        // segment's router ran before); the previous wave on this link was
+        // collected and reduced earlier on the stream.
+        unsafe {
+            link.dispatch(layer, t, DEVICE_DECODE, sized(&w.route_ids, t * topk * 4),
+                sized(&w.route_weights, t * topk * 4), sized(&w.wire, t * (h + h / 32)), self.stream)?;
+        }
+        self.shared_ffn(layer, w, lane, Scalar::I32(t as i32), cap, &self.weights.layers[layer])?;
+        // SAFETY: the dispatch above is this wait's wave.
+        unsafe { link.collect(self.stream) }
+    }
+
+    /// Connects the device-driven exchange for decode/verify steps (see
+    /// [`Self::device_link`]); its transport is warmed with a full wave.
+    pub fn attach_device_link(&mut self, peers: &[std::net::SocketAddr], executors: &[u64],
+        config: cuteafd_transport::TcpTransportConfig) -> Result<()> {
+        let (dim, topk, experts, rows) =
+            (self.cfg.dim, self.cfg.n_activated_experts, self.cfg.n_routed_experts, self.decode_rows);
+        let warm = spark_request(dim, topk, self.cfg.n_layers - 1, rows, (0..rows * topk).map(|i|
+            ExpertProtocolV2RouteEntry { row_index: (i / topk) as u32, expert_id: (i % experts) as u32,
+                gate_weight: 0.0 }).collect(), vec![0u8; rows * (dim + dim / 32)].into(), ExpertV2SourceKind::Decode)?;
+        let build: cuteafd_transport::expert::DeviceBuild = Box::new(move |wave, routes, wire| {
+            let kind = if wave.kind == DEVICE_DECODE { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
+            spark_request(dim, topk, wave.layer as usize, wave.rows as usize, routes, wire, kind)
+        });
+        self.device_link = Some(crate::shared::spark_intake::SparkDeviceLink::new(self.library, self.device, peers,
+            executors, rows, topk, dim + dim / 32, dim * 2, config, Some(warm), build)?);
+        Ok(())
+    }
+
+    /// After a decode/verify step's results were read: the device exchange's
+    /// waves of that step all succeeded (otherwise the step must be discarded).
+    pub fn check_device(&self) -> Result<()> {
+        self.device_link.as_ref().map_or(Ok(()), |link| link.check())
     }
 
     /// Connects every Spark rank and registers full-size buffers with one
@@ -1585,6 +1646,26 @@ impl<'a> Engine<'a> {
                 w.vocab_logits.buffer.ptr.cast::<f32>().add(at * vocab), n as u32, self.stream)
         }
     }
+}
+
+/// [`cuteafd_transport::expert::DeviceWave::kind`] of decode/verify waves.
+const DEVICE_DECODE: u32 = 0;
+
+/// One Spark request for `rows` wire rows (FP8, UE8M0 scales per 32) with
+/// `topk` routes each; the response is compact BF16 partials.
+fn spark_request(dim: usize, topk: usize, layer: usize, rows: usize, routes: Vec<ExpertProtocolV2RouteEntry>,
+    wire: bytes::Bytes, kind: ExpertV2SourceKind) -> Result<ExpertProtocolV2Request> {
+    let topk = topk as u32;
+    let mut request = ExpertProtocolV2Request::new_bytes(
+        layer as u64 + 1, 17, layer as u32, dim as u32, ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+        (0..rows as u32).map(|row| ExpertProtocolV2RowDescriptor {
+            row_id: u64::from(row), source_kind: kind, source_request_id: 1,
+            token_position: u64::from(row), route_offset: row * topk, route_count: topk,
+        }).collect(),
+        routes, wire,
+    )?;
+    request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    Ok(request)
 }
 
 /// A step's logits: downloaded, or left on the device.

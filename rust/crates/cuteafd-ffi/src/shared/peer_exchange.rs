@@ -100,6 +100,37 @@ impl NativeLibrary {
         Ok(())
     }
 
+    /// Publishes a host mailbox on `stream`: writes `words` to `descriptor`,
+    /// then the next sequence to `flag` (see `cuteafd_host_signal`).
+    ///
+    /// # Safety
+    /// `flag` and `descriptor` are live pinned, device-mapped host memory,
+    /// `send_state` (u32 [1]) live memory of the stream's device; the host
+    /// side reads the mailbox only after it sees the sequence.
+    pub unsafe fn host_signal(&self, flag: *mut u32, send_state: *mut u32, descriptor: *mut u32, words: [u32; 4],
+        stream: *mut c_void) -> Result<()> {
+        type F = unsafe extern "C" fn(*mut u32, *mut u32, *mut u32, *const u32, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_host_signal") }?;
+        let status = unsafe { f(flag, send_state, descriptor, words.as_ptr(), stream) };
+        ensure!(status == 0, "host mailbox signal failed with CUDA error {status}");
+        Ok(())
+    }
+
+    /// Write-mode Spark completions on `stream` (see `cuteafd_spark_wait_written`).
+    ///
+    /// # Safety
+    /// `flags` (`ranks` u64 words `stride_words` apart) is device memory the
+    /// NICs write; `state` and `error` are live memory mapped on the stream's
+    /// device; one wave was (or will be) posted per wait.
+    pub unsafe fn spark_wait_written(&self, flags: *const u64, ranks: u32, stride_words: u32, state: *mut u32,
+        error: *mut u32, stream: *mut c_void) -> Result<()> {
+        type F = unsafe extern "C" fn(*const u64, u32, u32, *mut u32, *mut u32, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_spark_wait_written") }?;
+        let status = unsafe { f(flags, ranks, stride_words, state, error, stream) };
+        ensure!(status == 0, "Spark written-completion wait failed with CUDA error {status}");
+        Ok(())
+    }
+
     /// Spins on `stream` until `flag` reaches the next sequence.
     ///
     /// # Safety

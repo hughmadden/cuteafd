@@ -374,6 +374,7 @@ fn speculative_step(
     let timer = Instant::now();
     let logits = engine.verify_device(&mut rows, transports, runtime)?;
     let selected = select_rows(selector, &logits, active, &sequences, &starts)?;
+    engine.check_device()?;
     shape.verify_us = console::us(timer);
     shape.verified = sequences.iter().map(|rows| rows.len() - 1).collect();
     shape.drafts = drafts;
@@ -728,6 +729,7 @@ fn schedule(
             let timer = Instant::now();
             engine.decode_device(&mut rows, transports.first_mut(), runtime).and_then(|logits| {
                 let selected = select_rows(selector, &logits, &active, &sequences, &starts)?;
+                engine.check_device()?;
                 shape.verify_us = console::us(timer);
                 Ok(active.iter_mut().zip(&selected).enumerate().map(|(row, (request, selected))| {
                     let token = take(request.constraint.as_mut(), selected);

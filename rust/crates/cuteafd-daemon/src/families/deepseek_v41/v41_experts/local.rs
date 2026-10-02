@@ -323,6 +323,11 @@ impl<'a> LocalExpertWave<'a> {
         // kernels start immediately and overlap the chained shared expert; only
         // the final reduction, which adds the shared contribution, joins it.
         let launched = (|| -> Result<()> {
+            if crate::shared::memory::chain::deferred() {
+                // Device-ordered passes do not drain the router on the host:
+                // the routed kernels follow it (and the shared expert) in the chain.
+                unsafe { crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?; }
+            }
             match &mut self.backend {
                 Backend::Exl3 { states, .. } => {
                     let state = states
