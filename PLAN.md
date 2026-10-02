@@ -821,11 +821,18 @@ active admission deferral and active KV paging are separate remaining work.
     Partially split matrices must not retain overlapping BF16/FP8 rows.
     Do not silently change target checkpoint precision to save
     memory: added target quantization needs its own golden NLL/KL (<=0.005 nat)
-    and tool/agentic gates. Drafter precision is a performance decision
-    (TJ, 2026-10-03): choose BF16, FP8 or a per-matrix mixture by net emitted
-    tokens/s after target verification and actual memory use. Include context
-    updates, drafting cost and proposal acceptance; do not force 8-bit weights
-    or activations. Drafter proposal KL is diagnostic, not a target-quality
+    and tool/agentic gates. Preserve each checkpoint tensor's precision by
+    default (TJ, 2026-10-03), including BF16 drafter O projections and other
+    BF16 weights; keep native FP8 compact. Additional weight quantization
+    should arrive in a checkpoint. A reasonable calibration-free conversion
+    may be an explicit convenience option, never an implicit loading policy.
+    Finish evaluating the existing FP8 feature as that optional path. Its
+    drafter precision is judged by net emitted tokens/s after target
+    verification and actual memory use, including context updates, drafting
+    cost and proposal acceptance. Focus optimization on kernels and plumbing;
+    use A8 activations where the quality/performance gates support them,
+    independently of the checkpoint's weight precision. Drafter proposal KL
+    is diagnostic, not a target-quality
     threshold or a standalone rejection criterion. Target verification,
     final-output correctness and cache-state contracts remain mandatory.
     Eliminate wasted duplicate representations whichever precision wins.
