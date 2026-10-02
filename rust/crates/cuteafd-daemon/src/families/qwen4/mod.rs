@@ -228,6 +228,7 @@ impl Opened {
     pub fn with_engine<T>(&self, args: &EngineArgs, body: impl FnOnce(&engine::Qwen4Engine<'_>) -> Result<T>)
         -> Result<T> {
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
+        programs.capacities().require_context("qwen4", args.max_context)?;
         programs.load_all()?;
         let stream = self.library.cuda_stream_create()?;
         let started = Instant::now();

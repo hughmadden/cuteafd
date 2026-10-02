@@ -10,7 +10,63 @@ use crate::NativeLibrary;
 use anyhow::{bail, ensure, Context, Result};
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::fmt;
 use std::path::Path;
+
+/// Extents compiled into the coordinator programs. They describe one
+/// sequence's index, not the shared token pool or its physical GPU replicas.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProgramCapacities {
+    pub decode_rows: Option<usize>,
+    pub prefill_rows: Option<usize>,
+    pub max_context: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgramCapacityError {
+    Invalid { field: &'static str },
+    MissingContext { family: &'static str },
+    ContextExceeded { family: &'static str, requested: usize, compiled: usize },
+}
+
+impl fmt::Display for ProgramCapacityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid { field } => write!(f, "program manifest capacities.{field} must be a positive integer that fits usize"),
+            Self::MissingContext { family } => write!(f, "{family}: program manifest lacks capacities.max_context; export matching coordinator programs with an explicit --max-context before loading weights"),
+            Self::ContextExceeded { family, requested, compiled } => write!(f, "{family}: requested context {requested} exceeds compiled index extent {compiled}; export matching coordinator programs with CUTEAFD_DSV4_MAX_CONTEXT={requested} (--max-context {requested}), or lower --max-context to {compiled}"),
+        }
+    }
+}
+
+impl std::error::Error for ProgramCapacityError {}
+
+impl ProgramCapacities {
+    fn from_manifest(manifest: &serde_json::Value) -> std::result::Result<Self, ProgramCapacityError> {
+        let capacities = &manifest["capacities"];
+        let field = |name: &'static str| match capacities.get(name) {
+            None => Ok(None),
+            Some(value) => value.as_u64().and_then(|v| usize::try_from(v).ok()).filter(|&v| v > 0)
+                .map(Some).ok_or(ProgramCapacityError::Invalid { field: name }),
+        };
+        Ok(Self { decode_rows: field("decode_rows")?, prefill_rows: field("prefill_rows")?,
+            max_context: field("max_context")? })
+    }
+
+    /// Indexed families must not send a wider page table than the compiled
+    /// top-k route or its scratch can hold. Check before engine allocations.
+    pub fn require_context(self, family: &'static str, requested: usize)
+        -> std::result::Result<(), ProgramCapacityError> {
+        let compiled = self.max_context.ok_or(ProgramCapacityError::MissingContext { family })?;
+        if requested > compiled {
+            return Err(ProgramCapacityError::ContextExceeded { family, requested, compiled });
+        }
+        if requested == 0 {
+            return Err(ProgramCapacityError::Invalid { field: "requested max_context" });
+        }
+        Ok(())
+    }
+}
 
 #[repr(C)]
 struct ProgramInfo {
@@ -71,6 +127,7 @@ pub struct Programs<'a> {
     load: LoadFn,
     launch: LaunchFn,
     programs: HashMap<String, (u32, ProgramSpec)>,
+    capacities: ProgramCapacities,
 }
 
 impl NativeLibrary {
@@ -100,7 +157,7 @@ impl NativeLibrary {
             };
             programs.insert(name, (index, spec));
         }
-        Ok(Programs { library: self, load, launch, programs })
+        Ok(Programs { library: self, load, launch, programs, capacities: ProgramCapacities::default() })
     }
 }
 
@@ -118,6 +175,7 @@ impl<'a> Programs<'a> {
         };
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let manifest: serde_json::Value = serde_json::from_str(&text)?;
+        self.capacities = ProgramCapacities::from_manifest(&manifest)?;
         let entries = manifest["programs"].as_array().context("manifest has no programs")?;
         ensure!(entries.len() == self.programs.len(), "manifest lists {} programs, the library {}",
             entries.len(), self.programs.len());
@@ -154,6 +212,10 @@ impl<'a> Programs<'a> {
 
     pub fn spec(&self, name: &str) -> Result<&ProgramSpec> {
         Ok(&self.programs.get(name).with_context(|| format!("no DeepSeek V4 program {name}"))?.1)
+    }
+
+    pub fn capacities(&self) -> ProgramCapacities {
+        self.capacities
     }
 
     /// Resolves a program and loads its kernels on the current device.
@@ -225,6 +287,40 @@ mod tests {
         assert_eq!(Scalar::I32(-1).slot(), u64::MAX);
         assert_eq!(Scalar::F32(1.0).slot(), 0x3f80_0000);
         assert_eq!(c_string(b"abc\0def"), "abc");
+    }
+
+    #[test]
+    fn indexed_context_uses_the_manifest_extent_not_the_pool_size() {
+        let manifest = serde_json::json!({"capacities": {
+            "decode_rows": 64, "prefill_rows": 4096, "max_context": 131072
+        }});
+        let limits = ProgramCapacities::from_manifest(&manifest).unwrap();
+        assert_eq!(limits.decode_rows, Some(64));
+        assert_eq!(limits.prefill_rows, Some(4096));
+        for family in ["glm5", "glm5_flash", "qwen4"] {
+            limits.require_context(family, 1).unwrap();
+            limits.require_context(family, 131072).unwrap();
+            let error = limits.require_context(family, 131073).unwrap_err();
+            assert_eq!(error, ProgramCapacityError::ContextExceeded {
+                family, requested: 131073, compiled: 131072,
+            });
+            assert!(error.to_string().contains("CUTEAFD_DSV4_MAX_CONTEXT=131073"));
+        }
+    }
+
+    #[test]
+    fn missing_or_invalid_index_extent_is_unsupported_before_allocation() {
+        for manifest in [serde_json::json!({}), serde_json::json!({"capacities": {"decode_rows": 64}})] {
+            assert_eq!(ProgramCapacities::from_manifest(&manifest).unwrap().require_context("glm5_flash", 1),
+                Err(ProgramCapacityError::MissingContext { family: "glm5_flash" }));
+        }
+        for value in [serde_json::json!(0), serde_json::json!(-1), serde_json::json!(null),
+            serde_json::json!(1.5), serde_json::json!("131072")] {
+            assert_eq!(ProgramCapacities::from_manifest(&serde_json::json!({"capacities": {"max_context": value}})),
+                Err(ProgramCapacityError::Invalid { field: "max_context" }));
+        }
+        assert!(ProgramCapacities { max_context: Some(131072), ..Default::default() }
+            .require_context("qwen4", 0).is_err());
     }
 }
 
