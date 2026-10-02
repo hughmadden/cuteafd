@@ -631,7 +631,12 @@ The user chooses release cuts; development fixes below do not cut a release.
      k. Qwen 3.8 FP8 has no Spark expert package (173 GB, no one-RTX fit).
 5. **Spark expert kernels**: MiMo V2.6 Pro TP6 prefill is Spark-bound (~35 of
    ~42 ms per layer); GLM 5.3 verify is bound by distinct expert reads; NVFP4
-   W4A16 GB10 prefill (14.3 vs EXL3 9.1 ms/layer TP4).
+   W4A16 GB10 prefill (14.3 vs EXL3 9.1 ms/layer TP4). Pro's installed SM121
+   `fp8-mimop/tp6` package at `5b9c135` already streams MXFP8 × MXFP4 gate/up
+   above 640 live rows: the host dispatch and embedded CUDA binary contain
+   the 640-row branch and `QMMA.SF.16832.F32.E4M3.E2M1.E8`. Its down projection
+   still consumes BF16 SwiGLU output and widens MXFP4 weights for BF16 MMAs.
+   Qualify A8 down projection next; do not reimplement the existing gate/up.
 6. **RTX 5090 audit and claim**: hard-coded `4*188` grid clamps and the
    per-tensor FP8 GEMM grid sized for 188 SMs; one SM120 build must serve both.
    `6d4ea7a` derives expert quantizer grids from each engine's GPU and removes
@@ -664,8 +669,11 @@ The user chooses release cuts; development fixes below do not cut a release.
      A16 today. brandonmusic had unmerged MXFP8 EXL3 WIP; check upstream b12x
      first, else build an EXL3 decode-to-FP8 tile path with MXFP8/FP8
      activations in the fork.
-   - MXFP4 experts (V4.1 already W4A8; MiMo V2.6 Pro W4A16): A8 prefill for
-     MiMo Pro (Spark-bound prefill), and MXFP4 × MXFP8 MMAs for both.
+   - MXFP4 experts: V4.1 already W4A8; MiMo V2.6 Pro's SM121 large-row
+     gate/up already uses MXFP8 × MXFP4 above 640 live rows. Extend A8 to Pro's
+     BF16-input down projection, retaining the existing small-row route and
+     checkpoint weights. Gate added activation error separately from the
+     established model/reference floor, then qualify tool/agentic behavior.
    - FP8 experts: extend W8A8 (MiMo GB10 gate/up) to the down projection and
      to RTX-local experts where KL allows (Qwen FP8 local was +0.024: needs
      finer activation scales).
