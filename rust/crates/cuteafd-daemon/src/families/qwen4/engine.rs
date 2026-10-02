@@ -466,6 +466,9 @@ pub(crate) struct Qwen4Engine<'a> {
     pub profile: RefCell<[f64; 2]>,
     graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
     use_graphs: bool,
+    /// Resident local experts have stable weight and scratch pointers, so
+    /// their launches can stay inside the same decode segments.
+    graph_local_experts: bool,
     /// Recorded after a Spark exchange's device-to-host copies: the host
     /// waits on it while the shared expert runs behind it.
     routes_ready: *mut c_void,
@@ -569,6 +572,7 @@ impl<'a> Qwen4Engine<'a> {
             decode_workspace: RefCell::new(None), experts: None, profile: RefCell::new([0.0; 2]),
             graphs: RefCell::new(std::collections::HashMap::new()),
             use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0"),
+            graph_local_experts: matches!(std::env::var("CUTEAFD_QWEN4_EXPERT_GRAPHS").as_deref(), Ok("1")),
             routes_ready: library.cuda_event_create_ordering()?, l2: None, embedding,
             mtp_drafts: zeroed(MTP_DEFERRED_STEPS * DECODE_ROWS * 4)? })
     }
@@ -1450,7 +1454,8 @@ impl<'a> Qwen4Engine<'a> {
 
     /// A decode step as captured segments: segment `i` finishes layer `i - 1`
     /// (its MoE output into the streams) and runs layer `i` up to its routed
-    /// experts, which run (local or on the Sparks) between segments. Every
+    /// experts. Fully resident local FP8/NVFP4 experts finish inside the
+    /// segment; paged experts and Spark exchanges run between segments. Every
     /// post flips the stream buffer: segment 0 flips once (the MLP site),
     /// later layers twice (their attention entry, then the MLP site), and the
     /// final segment once; the parity is the same every step, so replays
@@ -1461,6 +1466,11 @@ impl<'a> Qwen4Engine<'a> {
         // Every layer resident: the last segment ends in the head and the greedy selection.
         let head = layers.len() == self.cfg.layers && logit_rows == t;
         let gather = self.embedding.placement() == EmbedPlacement::Gpu;
+        // Paging can replace weight storage and exchange emulation waits on
+        // the host. Neither may run inside a captured segment.
+        let local_experts_graphed = self.graph_local_experts
+            && matches!(self.experts.as_ref(), Some(Experts::Local(local)) if local.window.is_none())
+            && crate::shared::l2_prefetch::emulated_exchange_us() == 0;
         let mut cur = 0usize;
         for index in 0..=layers.len() {
             let key = GraphKey { segment: index, rows: t, spec: tables.spec, long: tables.long, pool_width: tables.pool_width,
@@ -1498,11 +1508,17 @@ impl<'a> Qwen4Engine<'a> {
                     Qwen4Attention::Full => self.full(w, index, layer, rows, "m64", tables)?,
                 }
                 self.post_pre(w, c, layer, "mlp", rows)?;
-                self.moe_front(w, index, layer, t, rows)
+                self.moe_front(w, index, layer, t, rows)?;
+                if local_experts_graphed {
+                    self.moe_experts(w, index, t, rows, true)?;
+                }
+                Ok(())
             })?;
             cur ^= if index == 0 || index == layers.len() { 1 } else { 0 };
             if index < layers.len() {
-                self.moe_experts(w, index, t, rows, true)?;
+                if !local_experts_graphed {
+                    self.moe_experts(w, index, t, rows, true)?;
+                }
                 crate::shared::console::layer_mark(index);
             }
         }
@@ -1535,6 +1551,7 @@ impl<'a> Qwen4Engine<'a> {
         // SAFETY: the new graph reads and writes persistent engine buffers.
         unsafe { self.library.cuda_graph_launch(exec.0, self.stream)? };
         self.graphs.borrow_mut().insert(key, exec);
+        tracing::debug!(?key, "Qwen decode graph captured");
         Ok(())
     }
 
