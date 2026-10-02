@@ -7,6 +7,7 @@ pub(crate) mod mtp;
 pub(crate) mod prefix;
 pub(crate) mod serve;
 mod serving_owners;
+mod serve_failures;
 pub(crate) mod weights;
 mod head;
 mod split;

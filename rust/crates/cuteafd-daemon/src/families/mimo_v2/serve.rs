@@ -20,6 +20,7 @@ use super::dflash::{ContextRow, DraftSeq};
 use super::mtp::MtpSeq;
 use super::engine::{MimoEngine, MimoPlacement, DECODE_ROWS};
 use super::prefix::MimoPrefix;
+use super::serve_failures::FailureRecipients;
 use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
 use cuteafd_engine::prefix::{After, MarkArena, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
 use crate::families::glm5::dflash_policy::{self, CycleCost, DraftHistory, Group, Shape};
@@ -409,7 +410,10 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
     let (mut verify_s, mut draft_s, mut emit_s) = (0f64, 0f64, 0f64);
     let mut prefills = policy.decode_share.queue::<Prefill<'_>>()?;
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<NativeRequest>::default();
-    loop {
+    let mut failures = FailureRecipients::default();
+    // Keep admitted request owners alive until a fatal cause has reached every
+    // affected client, including requests waiting for prefill or KV admission.
+    let result = (|| -> Result<()> { loop {
         while active.len() + prefills.len() < max_sequences {
             let busy = !active.is_empty() || !prefills.is_empty();
             let job = match kv_waiter.poll(cache.pool().free(), cache.pool().release_epoch(), busy, |job| job.events.is_closed()) {
@@ -433,6 +437,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                     }
                 },
             };
+            failures.watch(&job.events);
             let reject = |job: &NativeRequest, message: String| {
                 let _ = job.events.send(Err(NativeFailure::BadRequest(message)));
             };
@@ -443,7 +448,13 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                     continue;
                 }
             };
-            let tokens = probe::prompt_ids(&job.probe, || Ok(tokenizer.encode_text(&job.prompt, false)?.token_ids))?;
+            let tokens = match probe::prompt_ids(&job.probe, || Ok(tokenizer.encode_text(&job.prompt, false)?.token_ids)) {
+                Ok(tokens) => tokens,
+                Err(error) => {
+                    let _ = job.events.send(Err(NativeFailure::Worker(format!("prompt tokenization: {error:#}"))));
+                    continue;
+                }
+            };
             let cold = probe::cold(&job.probe);
             if tokens.is_empty() || tokens.len() >= engine.max_context {
                 reject(&job, format!("prompt of {} tokens is outside 1..{}", tokens.len(), engine.max_context));
@@ -532,15 +543,18 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             }, |batch| prefill_batch(engine, family, cache, selector, batch));
             if engine.is_terminal() {
                 let mut primary = None;
+                let mut affected = Vec::new();
                 for (p, prefilled) in finished {
-                    let (error, failed) = match prefilled {
-                        Err(error) => (error, true),
-                        Ok(_) => (engine.terminal_error(), false),
-                    };
-                    let _ = p.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
-                    if failed && primary.is_none() { primary = Some(error); }
+                    affected.push(p);
+                    if let Err(error) = prefilled {
+                        if primary.is_none() { primary = Some(error); }
+                    }
                 }
-                return Err(primary.unwrap_or_else(|| engine.terminal_error()));
+                let error = primary.unwrap_or_else(|| engine.terminal_error());
+                for p in affected {
+                    let _ = p.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                }
+                return Err(error);
             }
             for (mut p, prefilled) in finished {
                 let (slot, placement, resume) = (p.slot, p.placement.clone(), p.resume);
@@ -584,6 +598,9 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                     }
                 };
                 engine.mtp_reset(p.placement.ring as usize, p.placement.len);
+                // Construction can fail after moving the request into its active
+                // state. Keep its event sender until that error is reported.
+                let admission_events = p.job.events.clone();
                 let admitted = (|| -> Result<Active<'_>> {
                     let mut request = Active {
                         slot,
@@ -613,12 +630,16 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                     Ok(mut request) => {
                         let token = request.next;
                         let emitted = request.emit(token);
+                        if let Err(error) = &emitted {
+                            let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                        }
                         request.ticket.first(token);
                         retain_prompt(cache, &request.placement);
                         match emitted {
                             Ok(false) => active.push(request),
                             // Finished at its first token: its turn is its prompt snapshot.
                             Ok(true) | Err(_) => {
+                                failures.finished(&request.job.events);
                                 request.ticket.done(request.generated);
                                 release(family, cache, &mut free_rings, &mut free_slots, &request.placement,
                                     request.slot)
@@ -627,6 +648,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                     }
                     Err(error) => {
                         tracing::warn!("admission failed: {error:#}");
+                        let _ = admission_events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                         if engine.is_terminal() { return Err(error); }
                         retain_prompt(cache, &placement);
                         release(family, cache, &mut free_rings, &mut free_slots, &placement, slot);
@@ -673,9 +695,6 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                     Err(error) => {
                         tracing::warn!("DFlash draft failed: {error:#}");
                         if engine.is_terminal() {
-                            for request in &active {
-                                let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
-                            }
                             return Err(error);
                         }
                     }
@@ -711,9 +730,6 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                     Err(error) => {
                         tracing::warn!("MTP draft failed: {error:#}");
                         if engine.is_terminal() {
-                            for request in &active {
-                                let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
-                            }
                             return Err(error);
                         }
                         vec![None; active.len()]
@@ -779,9 +795,6 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             Err(error) => {
                 tracing::warn!("decode step failed: {error:#}");
                 if engine.is_terminal() {
-                    for request in &active {
-                        let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
-                    }
                     return Err(error);
                 }
                 for request in active.drain(..) {
@@ -814,7 +827,8 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                             break;
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                         finished = true;
                         break;
                     }
@@ -850,6 +864,9 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             }
             finished
         }).collect();
+        for (request, &done) in active.iter().zip(&finished) {
+            if done { failures.finished(&request.job.events); }
+        }
         if let Some(drafter) = drafter.filter(|_| !context.is_empty()) {
             engine.submit(|| drafter.update(&context))?;
         }
@@ -895,7 +912,11 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         publish(stats, requests, generated_total, active.len(), prefills.len(), cache);
         console::gauges(|| console::Gauges::prefix_cache(cache, active.len(), prefills.len(), receive.len() + kv_waiter.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
+    } })();
+    if let Err(error) = &result {
+        failures.fail_and_close(error, receive);
     }
+    result
 }
 
 /// Serving statistics for `/v1/stats`.
