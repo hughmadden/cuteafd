@@ -655,8 +655,13 @@ active admission deferral and active KV paging are separate remaining work.
         creation, including a partially installed peer stream. Focused startup
         tests and real connected-RDMA endpoint faults pass: successful teardown
         retires registrations before buffers; failed teardown retains native
-        module and storage ownership. Full SparkLink/model fault qualification,
-        pre-engine loader retirement and shared V4.1 parity remain open.
+        module and storage ownership. Full MiMo two-RTX/TP6 owner faults now
+        pass, including actual pending expert waves, complete SparkLink Drop,
+        failed QP/publication/intake drains and post-target sampler failure.
+        Successful retirement releases owners only after draining; unproved
+        completion retains their storage and native module. HTTP fatal-event,
+        active grammar/host-copy fault coverage, pre-engine loader retirement
+        and shared V4.1 parity remain open.
         A private common FP8 packing fix retains the native module and pinned
         staging after an unprovable drain. Directed CPU module/packing fixtures
         pass for failure retention and normal cleanup; real queued-CUDA loader
@@ -889,9 +894,12 @@ active admission deferral and active KV paging are separate remaining work.
     defaults, then replace optional dual-format paths with immutable compact
     consumers across every row shape. GLM target projection selection also
     quantizes BF16 sources implicitly; mixed source groups need per-projection
-    dispatch and BF16 dense-FFN exports. GLM/GLM Flash native-FP8 head/index
+    dispatch and BF16 dense-FFN exports. GLM target native-FP8 head/index
     operands are widened persistently today: add compact consumers or report
-    the missing format before allocation. Private GLM Flash KDA checkpoint
+    the missing format before allocation. GLM Flash's loaders have similar
+    unsupported-format gaps, but the inspected qualified EXL3 and official
+    FP8 checkpoints store their head, indexer, routers and KDA weights in BF16;
+    those default inputs are not widened. Private GLM Flash KDA checkpoint
     defaults/header guards and shared DFlash single-copy loaders are composed
     with the MiMo changes; workspace and script checks pass. Shared GLM/GLM
     Flash drafter gates pass exact same-shape replay, ring-wrap/tail checks,
