@@ -280,6 +280,10 @@ mod source_format_tests {
             ("model.layers.1.self_attn.o_proj.weight", DType::F8E4M3, vec![128,128]),
             ("model.layers.1.self_attn.o_proj.weight_scale_inv", DType::F32, vec![1,1]),
             ("model.mtp.layers.0.self_attn.o_proj.weight", DType::Bf16, vec![128,128]),
+            ("model.mtp.layers.0.eh_proj.weight", DType::Bf16, vec![128,256]),
+            ("model.mtp.layers.0.enorm.weight", DType::Bf16, vec![128]),
+            ("model.mtp.layers.0.hnorm.weight", DType::Bf16, vec![128]),
+            ("model.mtp.layers.0.final_layernorm.weight", DType::Bf16, vec![128]),
         ] {
             tensors.push(CheckpointTensor { shard:"header-only.safetensors".into(),
                 meta: SafetensorsTensorMetadata { name:name.into(), dtype, shape, byte_offset:0, byte_length:0 } });
@@ -317,6 +321,30 @@ mod source_format_tests {
         let error = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap_err();
         assert!(format!("{error:#}").contains("lm_head.weight"));
         assert!(format!("{error:#}").contains("F16"));
+    }
+
+    #[test]
+    fn mtp_raw_operands_reject_wrong_dtype_shape_and_missing_headers() {
+        for suffix in ["eh_proj", "enorm", "hnorm", "final_layernorm"] {
+            let name = format!("model.mtp.layers.0.{suffix}.weight");
+            for invalid in ["dtype", "shape", "missing"] {
+                let (args, mut checkpoint, cfg) = fixture();
+                let index = checkpoint.tensors.iter().position(|t| t.meta.name == name).unwrap();
+                match invalid {
+                    "dtype" => checkpoint.tensors[index].meta.dtype = DType::F8E4M3,
+                    "shape" => checkpoint.tensors[index].meta.shape = vec![1],
+                    "missing" => { checkpoint.tensors.remove(index); }
+                    _ => unreachable!(),
+                }
+                let error = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap_err();
+                assert!(format!("{error:#}").contains(&name), "{invalid}: {error:#}");
+                // Unused optional MTP tensors never force a target-only load
+                // to reject a checkpoint that it otherwise supports.
+                let mut target_only = args;
+                target_only.mtp = 0;
+                assert!(resolve_weight_formats(&target_only, &checkpoint, &cfg).is_ok());
+            }
+        }
     }
 }
 
@@ -466,6 +494,25 @@ fn resolve_weight_formats(args: &EngineArgs, checkpoint: &Checkpoint, cfg: &Mimo
                 .is_some_and(|t| t.meta.dtype == cuteafd_core::DType::Bf16),
             "{name}: explicit FP8-source to BF16 o_proj conversion under head split needs a native sliced dequant loader; checkpoint-format selection preserves FP8 without this conversion");
         output.insert(name, selected);
+    }
+    // MTP extras are uploaded verbatim into BF16 kernels. Check their source
+    // contract even when memory admission is disabled (e.g. golden/oracle
+    // commands), before loading the native library or allocating any weights.
+    for layer in 0..args.mtp {
+        for (suffix, shape) in [
+            ("eh_proj", vec![cfg.hidden, 2 * cfg.hidden]),
+            ("enorm", vec![cfg.hidden]),
+            ("hnorm", vec![cfg.hidden]),
+            ("final_layernorm", vec![cfg.hidden]),
+        ] {
+            let name = format!("model.mtp.layers.{layer}.{suffix}.weight");
+            let index = checkpoint.tensors.binary_search_by(|t| t.meta.name.cmp(&name))
+                .map_err(|_| anyhow::anyhow!("checkpoint has no {name}"))?;
+            let source = &checkpoint.tensors[index].meta;
+            ensure!(source.dtype == cuteafd_core::DType::Bf16 && source.shape == shape,
+                "{name}: MTP raw operand requires checkpoint BF16 {shape:?}, found {:?} {:?}; add a native-format reader/kernel before using this source",
+                source.dtype, source.shape);
+        }
     }
     let native_draft = args.draft.as_deref().map(dflash::drafter_dir)
         .map(|dir| dflash::checkpoint_representation(&dir)).transpose()?;
