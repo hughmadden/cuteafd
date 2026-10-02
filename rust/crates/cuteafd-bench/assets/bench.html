@@ -297,12 +297,12 @@ function renderPanels() {
       if (mode === 'chart') {
         const width = Math.max(320, Math.round((chart.clientWidth || card.clientWidth - 28) / 40) * 40);
         const src = `/v1/bench/runs/${report.id}/panel-${id}.svg?bare=${width}&rev=${revs[id] || 0}`;
-        let img = chart.querySelector('img');
-        if (!img) { img = document.createElement('img'); img.alt = `${title} chart`; }
+        // One image per chart, attached once its first version loaded.
+        const img = chart._img || (chart._img = Object.assign(document.createElement('img'), { alt: `${title} chart` }));
         if (img.dataset.src !== src) {
           // Swap only once the new image is ready, so a filling chart never flickers.
           const next = new Image();
-          next.onload = () => { img.src = src; if (!img.isConnected) chart.appendChild(img); };
+          next.onload = () => { if (img.dataset.src === src) { img.src = src; if (!img.isConnected) chart.appendChild(img); } };
           next.src = src;
           img.dataset.src = src;
         }
