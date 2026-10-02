@@ -651,6 +651,12 @@ active admission deferral and active KV paging are separate remaining work.
      b. A worker failure mid-stream drops the SSE connection with no error
         event (all families). Fixed in `f3c7505`: one structured error event,
         preserving the backend cause, with no successful terminal event.
+        Private MiMo terminal ownership fixes also cover failures after engine
+        creation, including a partially installed peer stream. Focused startup
+        tests and real connected-RDMA endpoint faults pass: successful teardown
+        retires registrations before buffers; failed teardown retains native
+        module and storage ownership. Full SparkLink/model fault qualification,
+        pre-engine loader retirement and shared V4.1 parity remain open.
      c. Speculation not lossless: V4 Pro EXL3 K2 dSpark diverges at token 4
         (1.95 nat), C4 ≠ C1 at token 15; GLM 5.3 Flash tr3 DFlash2 0.84 nat;
         GLM 5.3 EXL3 0.57 nat. Suspect multi-row verify numerics/state.
