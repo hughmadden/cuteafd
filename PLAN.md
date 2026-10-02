@@ -438,13 +438,47 @@ live there); TP2 drafters are ≤1% on DFlash2 and not built unless the P2P
 probe shows ≤15 µs hops; the win is lane B drafting on GPU1 while lane A
 verifies on GPU0 at C≥2. Benchmark only the natural minimum and maximum
 configs (AGENTS.md); the planner's estimates cover the rest.
-One `ExpertRouter` replaces the six per-family stage/send/land/reduce copies;
-V4.1's `receive_owned` stays untouched. Stages: S0 planner + `plan` (must
+One `ExpertRouter` replaces the six per-family stage/send/land/reduce copies
+and is the device-driven Spark exchange below (V4.1 moves onto it too). Stages: S0 planner + `plan` (must
 reproduce today's layouts), S1 manifest handoff + workers, S2 router in the
 generic engines + GPU1 as expert host, S3 EP subsets (only if a quantized
 model needs them; GLM 5.3 official FP8 is out of scope — EXL3 and NVFP4
 quants cover it), S4 encoder service + multimodal input, S5 coordinator
 range split, S6 eight Sparks.
+
+**Device-driven Spark exchange (decided 2026-10-02, `work/v41-device`).** No engine is
+device-routed toward the Sparks today: every family (V4, GLM, GLM Flash, MiMo, Qwen) downloads
+route ids, weights and wire rows per MoE layer, synchronizes the stream, builds the request on
+the host, posts the RDMA sends, polls the CQ and only then queues the reduce; only RTX-local
+expert layers read device routes (V4 `local.rs`). V4.1 has its own exchange (`NativeTp4Wave`,
+`receive_owned` with per-frame H2D uploads, host ownership planner) plus host waits inside its
+TP2 RTX expert layers (`chain::settle`, peer-copy `wait()`s). Measured on V4.1 (p8, 2 RTX + 4
+Sparks, C1 code, nsys): a ~29 ms verify round keeps some GPU busy only 14.7 ms; the RTX-expert
+layers 0-18 leave ~2.5 ms with both GPUs idle (host hops between attention, routes, TP2 slices,
+peer reduce), the Spark layers ~10.9 ms (21 x ~470 us Spark round trips plus ~1 ms of host
+hops). Decision: retrofit, not a port. V4.1 is not served through the V4 engine (no shared
+attention, cache, encoder, engram or dSpark code; the V4 engine's Spark path is just as
+host-driven); instead one shared exchange is built and both engines move onto it:
+- GPU side: the router's ids, weights and wire rows are copied into a pinned, device-mapped
+  mailbox and a kernel publishes a sequence number (release, system scope); the combine waits on
+  the proxy's completion sequence with an acquire spin (`peer_exchange.cu`'s graph-safe pattern:
+  sequences live in device memory, so replays advance them). Replies land GPU-direct in the
+  intake planes (dma-buf), so a decode/verify step can be queued, and later captured, whole.
+- Host side: one proxy thread per transport (the prefill lane pattern) spins on the mailbox,
+  builds the request from it, posts the sends, polls the CQ, validates, and publishes
+  completion; no inference-thread sync, D2H parse or launch on the critical path. GPU-initiated
+  doorbells (IBGDA via mlx5dv) only if measured to pay over the proxy.
+- Stages: D0 shared component (`shared/spark_intake` + `cuteafd-transport` device lane, native
+  signal/wait kernels); D1 DeepSeek V4 decode/verify on it (opt-in `CUTEAFD_SPARK_DEVICE=1`),
+  measured against the host path; D2 V4.1 Spark layers adopt SparkIntake/GPU landing and the
+  device exchange, ownership choice on the device or precomputed; D3 V4.1 TP2 RTX expert layers
+  without host waits (device-ordered peer copies and reduce); D4 whole-step graph capture
+  (decode/verify), head split re-checked; D5 prefill; D6 other families adopt it. The Spark
+  worker (`shared/experts/service.rs`) is host-driven too (CQ, launch, sync, send): its per-wave
+  host overhead is recorded and a device-driven worker proposed if material. Gates per stage:
+  golden NLL / byte-exact greedy vs the host path, prefix-cache restore exactness, quick C1/C4
+  A/B on 1 RTX + 4 Sparks and 2 RTX + 4 Sparks, full V4.1 parity before proposing a default;
+  the default stays byte-identical while off.
 
 **Spark-side reduction (measured and parked 2026-10-01, `work/spark-reduce`).**
 TP ranks reduce-scatter their routed partials by rows over an RC mesh between
