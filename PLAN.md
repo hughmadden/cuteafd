@@ -665,7 +665,12 @@ active admission deferral and active KV paging are separate remaining work.
         A private common FP8 packing fix retains the native module and pinned
         staging after an unprovable drain. Directed CPU module/packing fixtures
         pass for failure retention and normal cleanup; real queued-CUDA loader
-        unwind still needs its own gate.
+        unwind still needs its own gate. Private MiMo loader fixes now drain
+        row dequantization and pitched projection copies even after a launch
+        or later tensor error, retaining storage and the native module when
+        completion cannot be proved. CPU native fault injection detects all
+        five original failure paths and passes with the fix; real queued-CUDA
+        and peer-copy retirement remain unqualified.
      c. Speculation not lossless: V4 Pro EXL3 K2 dSpark diverges at token 4
         (1.95 nat), C4 ≠ C1 at token 15; GLM 5.3 Flash tr3 DFlash2 0.84 nat;
         GLM 5.3 EXL3 0.57 nat. Suspect multi-row verify numerics/state.
@@ -695,6 +700,13 @@ active admission deferral and active KV paging are separate remaining work.
      h. Prefill gets worse with more hardware: V4 Pro min 879 tok/s (9.2 s
         TTFT) vs 2,438 max; MiMo Flash max 2,899 vs min 5,877; MiMo Pro max
         1,754 vs min 2,741 (two-lane prefill off under the head split).
+        Private MiMo paired prefill now passes full-model checkpoint-mode
+        correctness on one and two RTX with TP6: raw KV, taps, draft context,
+        logits, proposals and fixed continuations match serial execution.
+        Real scheduler/cache cases and cancellation after Spark dispatch also
+        pass without late captures or tracked allocation growth. Optional FP8
+        correctness and clean-binary throughput/latency gates remain pending;
+        HTTP transport and MTP pairing are outside this gate.
      i. V4 / V4.1 turn-end prefix-cache restore not byte-exact (reported,
         not gated). V4 Flash also differs across repeated uncached solo
         prefills: captured inputs and coordinator reduction are exact, while
