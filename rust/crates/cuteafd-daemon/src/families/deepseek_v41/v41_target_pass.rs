@@ -401,6 +401,10 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             }
         }
         for layer in stage.windows() {
+            if layer != stage.windows().start && crate::shared::memory::chain::deferred() {
+                // See the distributed pass: the previous layer's attention uploads ran.
+                crate::shared::memory::chain::fence_wait(self.upload.library(), (layer - 1) % 2)?;
+            }
             if layer != stage.windows().start {
                 let prepare_timing = Instant::now();
                 self.lane.advance()?;
@@ -478,6 +482,9 @@ impl<'w, 'a> TargetPass<'w, 'a> {
                             &mut self.lane, &mut self.index)
                     }
                 })?;
+                if crate::shared::memory::chain::deferred() {
+                    crate::shared::memory::chain::fence_mark(self.upload.library(), layer % 2)?;
+                }
                 // No RefCell guard or bank reference survives into this await.
                 let completed = prepared.execute(transport, placement, guard.batch.image_mask()).await?;
                 if cooperative {
