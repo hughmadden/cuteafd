@@ -152,6 +152,46 @@ def test_glmf_kda_rejects_invalid_conversion_before_launch(tmp_path):
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
+@pytest.mark.parametrize("family", ["glm5", "glm5_flash"])
+@pytest.mark.parametrize("selection, expected", [(None, None), ("auto", None), ("on", "true"), ("off", "false")])
+def test_glm_drafter_quantization_is_explicit(tmp_path, family, selection, expected):
+    config = ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+              if family == "glm5" else SPLIT_CONFIGS["glm5_flash"])
+    model = "test/model" if family == "glm5" else "zai-org/GLM-5.3-Flash"
+    keys = f"SPECULATOR=dflash2\nSPECULATOR_MODEL_ID={model}\n"
+    if selection is not None:
+        keys += f"SPECULATOR_FP8={selection}\n"
+    result = _family_launch_result(tmp_path, config, model, keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
+    if expected is None:
+        assert "--draft-fp8" not in launch
+    else:
+        assert f"--draft-fp8 {expected}" in launch
+
+
+@pytest.mark.parametrize("family", ["glm5", "glm5_flash"])
+def test_glm_drafter_context_slots_and_batch_are_independent(tmp_path, family):
+    config = ({"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+              if family == "glm5" else SPLIT_CONFIGS["glm5_flash"])
+    model = "test/model" if family == "glm5" else "zai-org/GLM-5.3-Flash"
+    result = _family_launch_result(tmp_path, config, model,
+                                  f"SPECULATOR=dflash2\nSPECULATOR_MODEL_ID={model}\n"
+                                  "DRAFT_CONTEXT_SLOTS=20\nDRAFT_SEQUENCES=16\nDRAFT_FP8=on\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
+    for argument in ("--draft-context-slots 20", "--draft-sequences 16", "--draft-fp8 true"):
+        assert argument in launch
+
+
+def test_invalid_glm_drafter_quantization_rejects_before_starting_containers(tmp_path):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "zai-org/GLM-5.3-Flash",
+                                  "SPECULATOR=dflash2\nSPECULATOR_MODEL_ID=zai-org/GLM-5.3-Flash\nSPECULATOR_FP8=bogus\n")
+    assert result.returncode == 2, result.stderr
+    assert "SPECULATOR_FP8 must be auto, on or off" in result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
 @pytest.mark.parametrize("mode", ["bf16", "bf16-decode"])
 @pytest.mark.parametrize("store, geometry, ranks", [("fp8", "mimo", 4), ("mxfp4", "mimop", 6)])
 def test_mimo_expert_input_preflights_every_rank_before_serving(tmp_path, mode, store, geometry, ranks):

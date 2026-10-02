@@ -86,12 +86,15 @@ pub(super) fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
             }
             drafter.put_taps(&taps)?;
             drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot: 0, position: done + r }).collect::<Vec<_>>())?;
+            // SAFETY: the oracle owns the stream; a following chunk reuses
+            // the taps and context metadata read by this update.
+            unsafe { engine.library.cuda_stream_synchronize(engine.stream)? };
             done += n;
         }
         let anchor = tokens[position];
         let timer = Instant::now();
         let draft = drafter.draft_device(&[DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
-            &engine.embedding, engine.weights.head.buffer.ptr)?.remove(0);
+            &engine.embedding, &engine.weights.head)?.remove(0);
         draft_seconds += timer.elapsed().as_secs_f64();
         let reference = &ref_tokens[index * drafts_per..][..drafts_per];
         exact += usize::from(draft.tokens == reference);
@@ -165,7 +168,7 @@ pub(super) fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngine<
         let anchor = sequence[position];
         let timer = Instant::now();
         let draft = drafter.draft_device(&[DraftSeq { slot: 0, anchor, position, valid_from: 0 }], &engine.embedding,
-            engine.weights.head.buffer.ptr)?;
+            &engine.weights.head)?;
         draft_seconds += timer.elapsed().as_secs_f64();
         drafts.push((position, draft.into_iter().next().context("draft")?));
         let logits = engine.verify(&mut [(&mut placement, 1)], &[anchor], None)?.context("decode needs every layer")?;

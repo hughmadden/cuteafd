@@ -70,9 +70,9 @@ snapshot_of() {
 #   mtp      MiMo V2 Flash, Qwen 3.8: the checkpoint's native MTP layers,
 #            SPECULATOR_DEPTH drafts (default 1)
 #   dspark   DeepSeek V4
-# MiMo SPECULATOR_FP8=auto/unset preserves checkpoint weights; explicit on
-# quantizes supported drafter weights, off selects BF16. Other families keep
-# their existing default. Pre-rename keys (DRAFT_MODEL_ID, DFLASH,
+# MiMo and GLM SPECULATOR_FP8=auto/unset preserve checkpoint weights; explicit
+# on quantizes supported drafter weights, off selects BF16. Pre-rename keys
+# (DRAFT_MODEL_ID, DFLASH,
 # MTP, DSPARK, DRAFT_FP8) still work for one release.
 speculator="$(get SPECULATOR)"
 if [[ -z "$speculator" ]]; then
@@ -198,6 +198,15 @@ if [[ $serve != serve-dsv4 ]]; then
         off) family_args+=(--draft-fp8 false) ;;
         *) echo "MiMo SPECULATOR_FP8/DRAFT_FP8 must be auto, on or off" >&2; exit 2 ;;
       esac
+    elif [[ $family == glm5 || $family == glm5_flash ]]; then
+      case "$(key SPECULATOR_FP8 DRAFT_FP8 auto)" in
+        auto) ;; # Preserve BF16 checkpoint weights by default.
+        on) family_args+=(--draft-fp8 true) ;;
+        off) family_args+=(--draft-fp8 false) ;;
+        *) echo "SPECULATOR_FP8 must be auto, on or off" >&2; exit 2 ;;
+      esac
+      [[ -z "$(get DRAFT_CONTEXT_SLOTS)" ]] || family_args+=(--draft-context-slots "$(get DRAFT_CONTEXT_SLOTS)")
+      [[ -z "$(get DRAFT_SEQUENCES)" ]] || family_args+=(--draft-sequences "$(get DRAFT_SEQUENCES)")
     elif [[ "$(key SPECULATOR_FP8 DRAFT_FP8 on)" == off ]]; then
       family_args+=(--draft-fp8 false)
     fi

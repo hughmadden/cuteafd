@@ -107,7 +107,10 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
     engine_args.slots = engine_args.slots.max(args.max_sequences);
-    engine_args.draft_sequences = engine_args.draft_sequences.max(args.max_sequences);
+    if engine_args.draft_context_slots.is_none() {
+        engine_args.draft_context_slots = Some(20.max(engine_args.draft_sequences)
+            .max(args.max_sequences.saturating_mul(5).div_ceil(4)));
+    }
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), args.max_sequences, args.decode_share);
     let policy = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed };
     let prefix = args.prefix.clone();
@@ -700,12 +703,13 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 let seqs: Vec<(usize, DraftSeq)> = active.iter().enumerate()
                     .filter_map(|(i, a)| a.slot.filter(|_| limits[i] > 0).map(|slot|
                         (i, DraftSeq { slot, anchor: a.next, position: a.placement.len, valid_from: a.draft_from })))
+                    .take(drafter.max_batch_sequences())
                     .collect();
                 for &(i, _) in &seqs {
                     active[i].counts[5] += 1;
                 }
                 let drafts = drafter.draft_device(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
-                    engine.weights.head.buffer.ptr);
+                    &engine.weights.head);
                 cost.observe_draft(timer.elapsed().as_secs_f64() * 1e3);
                 let mut out = vec![None; active.len()];
                 match drafts {
