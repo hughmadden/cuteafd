@@ -657,6 +657,10 @@ active admission deferral and active KV paging are separate remaining work.
         retires registrations before buffers; failed teardown retains native
         module and storage ownership. Full SparkLink/model fault qualification,
         pre-engine loader retirement and shared V4.1 parity remain open.
+        A private common FP8 packing fix retains the native module and pinned
+        staging after an unprovable drain. Directed CPU module/packing fixtures
+        pass for failure retention and normal cleanup; real queued-CUDA loader
+        unwind still needs its own gate.
      c. Speculation not lossless: V4 Pro EXL3 K2 dSpark diverges at token 4
         (1.95 nat), C4 ≠ C1 at token 15; GLM 5.3 Flash tr3 DFlash2 0.84 nat;
         GLM 5.3 EXL3 0.57 nat. Suspect multi-row verify numerics/state.
@@ -887,8 +891,16 @@ active admission deferral and active KV paging are separate remaining work.
     quantizes BF16 sources implicitly; mixed source groups need per-projection
     dispatch and BF16 dense-FFN exports. GLM/GLM Flash native-FP8 head/index
     operands are widened persistently today: add compact consumers or report
-    the missing format before allocation. GLM Flash KDA source headers and
-    shared DFlash dtype validation are being tightened independently. The
+    the missing format before allocation. Private GLM Flash KDA checkpoint
+    defaults/header guards and shared DFlash single-copy loaders are composed
+    with the MiMo changes; workspace and script checks pass. Shared GLM/GLM
+    Flash drafter gates pass exact same-shape replay, ring-wrap/tail checks,
+    batch-state isolation and physical weight ownership. GLM uses original
+    conditioned taps; GLM Flash uses labelled synthetic conditioning, so this
+    does not qualify full-target quality or emitted throughput. Its optional
+    FP8 long-context proposal drift still needs actual-conditioned evidence.
+    GLM head admission now reads indexed checkpoint headers independently of
+    the routed-expert catalog. The
     audited DeepSeek V4 target/dSpark paths preserve checkpoint weight values;
     their expanded scale metadata is not a second weight representation.
     Check exactness when arithmetic is preserved,
