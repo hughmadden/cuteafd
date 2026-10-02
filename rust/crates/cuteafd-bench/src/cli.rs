@@ -40,7 +40,7 @@ fn authorize(request: ureq::Request, key: &Option<String>) -> ureq::Request {
 pub fn default_dir(root: &Path, report: &Report) -> PathBuf {
     let family = report.server.family.clone().unwrap_or_else(|| "unknown".into());
     root.join("benchmarks").join(family).join(format!("{}-{}-{}-{}", crate::render::date(&report.created),
-        report.profile, model_slug(&report.server.model), report.server.hardware.slug()))
+        report.profile, model_slug(&report.server.checkpoint()), report.server.hardware.slug()))
 }
 
 /// The checkpoint's last path segment, lowercase, runs of other characters as one `-`

@@ -77,7 +77,7 @@ pub fn report_svg(report: &Report) -> String {
     doc.nested(LOGO, 24.0, 20.0, logo_h * LOGO_ASPECT, logo_h);
     let r = report;
     let x = 24.0;
-    bodies::title(&mut doc, &t, x, 88.0, 22.0, &r.server.model, w - 360.0);
+    bodies::title(&mut doc, &t, x, 88.0, 22.0, &r.server.checkpoint(), w - 360.0);
     let profile = crate::profiles::title_of(&r.profile);
     let sub = format!("{profile} · {} · {}", super::date(&r.created), r.server.hardware.line());
     doc.text(x, 108.0, Font::new(11.5, t.ink2), &fit(&sub, 11.5, w - 300.0));

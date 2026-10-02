@@ -128,7 +128,7 @@ impl<'a> View<'a> {
         let t = &self.theme;
         doc.nested(MARK, x, y - 12.0, 16.0, 16.0);
         let r = self.report;
-        let left = format!("cuteafd bench · {} · {}", r.server.model, r.server.hardware.line());
+        let left = format!("cuteafd bench · {} · {}", r.server.checkpoint(), r.server.hardware.line());
         doc.text(x + 22.0, y, Font::new(10.0, t.muted), &fit(&left, 10.0, width * 0.62));
         let right = format!("build {} · {}", r.server.build.label(), super::date(&r.created));
         doc.text(x + width, y, Font::new(10.0, t.muted).anchor(Anchor::End), &right);

@@ -23,7 +23,7 @@ pub fn card_svg(report: &Report) -> String {
     doc.nested(LOGO, pad, 36.0, 46.0 * LOGO_ASPECT, 46.0);
     doc.text(WIDTH - pad, 62.0, Font::new(13.0, t.muted).anchor(Anchor::End).spacing(1.5),
         &format!("{} · {}", crate::profiles::title_of(&r.profile).to_uppercase(), super::date(&r.created)));
-    bodies::title(&mut doc, &t, pad, 148.0, 40.0, &r.server.model, WIDTH - 2.0 * pad);
+    bodies::title(&mut doc, &t, pad, 148.0, 40.0, &r.server.checkpoint(), WIDTH - 2.0 * pad);
     let c = &r.server.configuration;
     let mut sub = Vec::new();
     if let Some(rev) = &r.server.revision {

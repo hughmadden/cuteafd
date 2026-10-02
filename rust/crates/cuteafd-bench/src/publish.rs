@@ -65,7 +65,8 @@ fn short_hardware(report: &Report) -> String {
 
 /// `GLM-5.3-EXL3-K4-v1 (exl3)`: the checkpoint and its routed-expert format.
 fn checkpoint(report: &Report) -> String {
-    let name = report.server.model.rsplit('/').next().unwrap_or(&report.server.model).to_string();
+    let checkpoint = report.server.checkpoint();
+    let name = checkpoint.rsplit('/').next().unwrap_or(&checkpoint).to_string();
     let experts: Vec<String> = report.server.configuration.quant.iter().filter(|q| q.group.contains("routed"))
         .flat_map(|q| q.formats.clone()).collect();
     if experts.is_empty() { name } else { format!("{name} ({})", experts.join("+")) }
@@ -121,7 +122,7 @@ pub fn results(placed: &[Placed]) -> String {
         for (family, _, class, p) in chunk {
             let r = &p.report;
             out.push_str(&format!("<td width=\"33%\" valign=\"top\"><a href=\"docs/models/{family}.md\"><img src=\"{}\" \
-                alt=\"{} on {}\"></a><br><sub>{} · {} ({})</sub></td>\n", link(&p.dir, "card.svg"), r.server.model,
+                alt=\"{} on {}\"></a><br><sub>{} · {} ({})</sub></td>\n", link(&p.dir, "card.svg"), r.server.checkpoint(),
                 r.server.hardware.line(), family_title(family), short_hardware(r), if *class == 0 { "min" } else { "max" }));
         }
         out.push_str("</tr>\n");
@@ -167,7 +168,7 @@ pub fn index(placed: &[Placed]) -> String {
             let r = &p.report;
             let relative = p.dir.strip_prefix("benchmarks").unwrap_or(&p.dir);
             let mut line = format!("- {} · {} · {} · {} · build {} · [report]({})",
-                crate::render::date(&r.created), crate::profiles::title_of(&r.profile), r.server.model,
+                crate::render::date(&r.created), crate::profiles::title_of(&r.profile), r.server.checkpoint(),
                 r.server.hardware.line(), r.server.build.label(), link(relative, "report.svg"));
             if r.quality_failed() {
                 line.push_str(" · ⚠ quality gate failed");

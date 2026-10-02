@@ -65,6 +65,29 @@ pub struct PlannedPanel {
     pub passes: u32,
 }
 
+impl ServerInfo {
+    /// The checkpoint repository the server loaded (`org/name` from a Hugging Face
+    /// snapshot path), else the served model name: quants of one model share a
+    /// served name but not a checkpoint.
+    pub fn checkpoint(&self) -> String {
+        let snapshot = self.configuration.snapshot.as_deref().unwrap_or("");
+        snapshot.split('/').find_map(|part| part.strip_prefix("models--"))
+            .and_then(|repo| repo.split_once("--").map(|(org, name)| format!("{org}/{name}")))
+            .unwrap_or_else(|| self.model.clone())
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    #[test]
+    fn checkpoint_comes_from_the_snapshot_path() {
+        let mut s = super::ServerInfo { model: "zai-org/GLM-5.3".into(), ..Default::default() };
+        assert_eq!(s.checkpoint(), "zai-org/GLM-5.3");
+        s.configuration.snapshot = Some("/root/.cache/huggingface/hub/models--nvidia--GLM-5.3-NVFP4/snapshots/e3b8".into());
+        assert_eq!(s.checkpoint(), "nvidia/GLM-5.3-NVFP4");
+    }
+}
+
 /// What served the run: model, build, hardware, resolved configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerInfo {
