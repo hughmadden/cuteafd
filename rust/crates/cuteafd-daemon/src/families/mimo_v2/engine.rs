@@ -430,15 +430,22 @@ fn fp8_scalars(rows: Scalar, decode: bool, fp8: bool) -> Vec<Scalar> {
 }
 
 /// An FP8-only weight's scales: row major for decode programs, K-block major for prefill ones.
-fn scale(name: &str, decode: bool, layer: &MimoLayer<'_>) -> Result<(&'static str, *mut c_void)> {
-    let operand: &'static str = match (name, decode) {
+fn scale_operand(name: &str, decode: bool) -> Result<&'static str> {
+    Ok(match (name, decode) {
         ("w_qkv", true) => "w_qkv_scale",
         ("w_qkv", false) => "w_qkv_kscale",
         ("w_gate_up", true) => "w_gate_up_scale",
         ("w_gate_up", false) => "w_gate_up_kscale",
         ("w_down", true) => "w_down_scale",
-        _ => "w_down_kscale",
-    };
+        ("w_down", false) => "w_down_kscale",
+        ("w_o", true) => "w_o_scale",
+        ("w_o", false) => "w_o_kscale",
+        _ => anyhow::bail!("unknown MiMo FP8 weight {name}: no scale operand is registered"),
+    })
+}
+
+fn scale(name: &str, decode: bool, layer: &MimoLayer<'_>) -> Result<(&'static str, *mut c_void)> {
+    let operand = scale_operand(name, decode)?;
     Ok((operand, layer.ptr(operand)?))
 }
 
@@ -2291,8 +2298,24 @@ impl<'a> MimoEngine<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{attention_workspace_geometry, expert_capacity, lane_prefill_capacity,
+    use super::{attention_workspace_geometry, expert_capacity, lane_prefill_capacity, scale_operand,
         MimoAttentionWorkspace, DECODE_ROWS, MIN_LANE_ROWS};
+
+    #[test]
+    fn fp8_output_scale_operands_match_both_exported_abis() {
+        for (decode, expected) in [(true, "w_o_scale"), (false, "w_o_kscale")] {
+            let operands = ["attn", "w_o_fp8", scale_operand("w_o", decode).unwrap(), "out", "scratch"];
+            assert_eq!(operands, ["attn", "w_o_fp8", expected, "out", "scratch"]);
+        }
+        for (weight, row, kmajor) in [("w_qkv", "w_qkv_scale", "w_qkv_kscale"),
+            ("w_gate_up", "w_gate_up_scale", "w_gate_up_kscale"), ("w_down", "w_down_scale", "w_down_kscale")] {
+            assert_eq!(scale_operand(weight, true).unwrap(), row);
+            assert_eq!(scale_operand(weight, false).unwrap(), kmajor);
+        }
+        for decode in [true, false] {
+            assert!(scale_operand("w_unregistered", decode).unwrap_err().to_string().contains("no scale operand"));
+        }
+    }
 
     #[test]
     fn narrow_prefill_expert_storage_covers_every_decode_descriptor_and_native_program() {
