@@ -582,7 +582,31 @@ steps into `work/p0`; tag `v1.0.0` when the list's top half is done.
      turn-end cache check is informational (greedy non-repeat); code sandbox
      lacks network isolation; tool-eval-bench reaches images with the next
      `./build.sh`.
-   - Issues the v0 smoke matrix reports get appended here.
+   - From the v0 Release smoke matrix (10 of 22 cards fail the gate;
+     logs in `~/.cache/cuteafd/builds/v0/kit/smoke-state/`):
+     a. Forced tool calls: GLM 5.3 EXL3 (min, max) crashes the coordinator
+        ("matcher terminated after accepting the stop token"); GLM 5.3 Flash
+        EXL3 max, tr3 4bpw min/max and MiMo V2.6 Pro min/max abort the stream
+        mid-response. Same grammar/matcher path: stop when the grammar accepts
+        the stop token, never fail the batch.
+     b. A worker failure mid-stream drops the SSE connection with no error
+        event (all families).
+     c. Speculation not lossless: V4 Pro EXL3 K2 dSpark diverges at token 4
+        (1.95 nat), C4 ≠ C1 at token 15; GLM 5.3 Flash tr3 DFlash2 0.84 nat;
+        GLM 5.3 EXL3 0.57 nat. Suspect multi-row verify numerics/state.
+     d. Batch invariance: C4 ≠ C1 greedy on V4 Pro, GLM 5.3, GLM 5.3 Flash.
+     e. NVFP4 local experts on one RTX (GLM 5.3 Flash, Qwen 3.8): ~10 s per
+        forward — a slow SM120 fallback.
+     f. GLM 5.3 Flash and Qwen ignore `RTX_GPUS=2` (no head split), so their
+        max layout is 1 RTX + 4 Sparks.
+     g. Qwen 3.8 EXL3: 84 tok/s with 4 Sparks vs 261 on one RTX alone.
+     h. Prefill gets worse with more hardware: V4 Pro min 879 tok/s (9.2 s
+        TTFT) vs 2,438 max; MiMo Flash max 2,899 vs min 5,877; MiMo Pro max
+        1,754 vs min 2,741 (two-lane prefill off under the head split).
+     i. V4 / V4.1 turn-end prefix-cache restore not byte-exact (reported,
+        not gated).
+     j. MiMo V2 Flash fidelity is the weakest that passes (KL 0.10, top-1 82%).
+     k. Qwen 3.8 FP8 has no Spark expert package (173 GB, no one-RTX fit).
 5. **Spark expert kernels**: MiMo V2.6 Pro TP6 prefill is Spark-bound (~35 of
    ~42 ms per layer); GLM 5.3 verify is bound by distinct expert reads; NVFP4
    W4A16 GB10 prefill (14.3 vs EXL3 9.1 ms/layer TP4).
