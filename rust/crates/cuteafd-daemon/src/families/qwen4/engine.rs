@@ -1528,12 +1528,13 @@ impl<'a> Qwen4Engine<'a> {
         unsafe { self.library.cuda_graph_begin_capture(self.stream)? };
         let captured = segment();
         // SAFETY: ends the capture begun above on the same stream.
-        let exec = unsafe { self.library.cuda_graph_end_capture(self.stream) };
+        let exec = unsafe { self.library.cuda_graph_end_capture(self.stream) }
+            .map(|exec| GraphExec(exec, self.library));
         captured?;
         let exec = exec?;
         // SAFETY: the new graph reads and writes persistent engine buffers.
-        unsafe { self.library.cuda_graph_launch(exec, self.stream)? };
-        self.graphs.borrow_mut().insert(key, GraphExec(exec, self.library));
+        unsafe { self.library.cuda_graph_launch(exec.0, self.stream)? };
+        self.graphs.borrow_mut().insert(key, exec);
         Ok(())
     }
 
