@@ -411,7 +411,7 @@ impl<'a> MimoDrafter<'a> {
             Ok(allocation)
         };
         let (h, kv, inter) = (cfg.hidden, cfg.kv_width(), cfg.intermediate);
-        let fp8_workspace = if representation == MimoDraftRepresentation::Fp8Only {
+        let fp8_workspace = if matches!(representation, MimoDraftRepresentation::Fp8Only | MimoDraftRepresentation::Bf16Context) {
             Some(fp8_linear::scratch(library, TAP_ROWS.max(max_sequences * cfg.block), &[
                 (cfg.taps.len() * h, h), (h, cfg.qkv_width()), (h, 2 * kv),
                 (cfg.heads * cfg.head_dim, h), (h, 2 * inter), (inter, h),
@@ -430,11 +430,12 @@ impl<'a> MimoDrafter<'a> {
             }
             Ok(allocation)
         };
-        let matrix = |source: Dev<'a>, n: usize, k: usize| -> Result<DraftWeight<'a>> {
+        let matrix = |source: Dev<'a>, n: usize, k: usize, context_weight: bool| -> Result<DraftWeight<'a>> {
             match representation {
                 MimoDraftRepresentation::Bf16Only => Ok(DraftWeight::Bf16(source)),
                 MimoDraftRepresentation::LegacyDual => Ok(DraftWeight::LegacyDual { bf16: source, fp8: None }),
-                MimoDraftRepresentation::Fp8Only => {
+                MimoDraftRepresentation::Bf16Context if context_weight => Ok(DraftWeight::Bf16(source)),
+                MimoDraftRepresentation::Fp8Only | MimoDraftRepresentation::Bf16Context => {
                     let packed = Fp8Weight::pack(library, source.buffer.ptr, n, k, scales, stream);
                     // SAFETY: packing reads this live BF16 source on `stream`.
                     // Drain even on packing failure before the source leaves scope.
@@ -459,14 +460,14 @@ impl<'a> MimoDrafter<'a> {
                 input_norm: tensor(&format!("{p}.input_layernorm.weight"), &[h])?,
                 post_norm: tensor(&format!("{p}.post_attention_layernorm.weight"), &[h])?,
                 qkv: matrix(concat(&[(&format!("{a}.q_proj.weight"), cfg.heads * cfg.head_dim),
-                    (&format!("{a}.k_proj.weight"), kv), (&format!("{a}.v_proj.weight"), kv)], h)?, cfg.qkv_width(), h)?,
+                    (&format!("{a}.k_proj.weight"), kv), (&format!("{a}.v_proj.weight"), kv)], h)?, cfg.qkv_width(), h, true)?,
                 q_norm: tensor(&format!("{a}.q_norm.weight"), &[cfg.head_dim])?,
                 k_norm: tensor(&format!("{a}.k_norm.weight"), &[cfg.head_dim])?,
                 sinks: if cfg.sinks { Some(tensor(&format!("{a}.attention_sink_bias"), &[cfg.heads])?) } else { None },
-                o: matrix(tensor(&format!("{a}.o_proj.weight"), &[h, cfg.heads * cfg.head_dim])?, h, cfg.heads * cfg.head_dim)?,
+                o: matrix(tensor(&format!("{a}.o_proj.weight"), &[h, cfg.heads * cfg.head_dim])?, h, cfg.heads * cfg.head_dim, false)?,
                 gate_up: matrix(concat(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
-                    (&format!("{p}.mlp.up_proj.weight"), inter)], h)?, 2 * inter, h)?,
-                down: matrix(tensor(&format!("{p}.mlp.down_proj.weight"), &[h, inter])?, h, inter)?,
+                    (&format!("{p}.mlp.up_proj.weight"), inter)], h)?, 2 * inter, h, false)?,
+                down: matrix(tensor(&format!("{p}.mlp.down_proj.weight"), &[h, inter])?, h, inter, false)?,
                 k_ring: zeroed(slots * RING * kv * 2)?,
                 v_ring: zeroed(slots * RING * kv * 2)?,
             })
@@ -480,7 +481,7 @@ impl<'a> MimoDrafter<'a> {
             stream,
             slots,
             max_sequences,
-            fc: matrix(tensor("fc.weight", &[h, taps])?, h, taps)?,
+            fc: matrix(tensor("fc.weight", &[h, taps])?, h, taps, true)?,
             hidden_norm: tensor("hidden_norm.weight", &[h])?,
             norm: tensor("norm.weight", &[h])?,
             layers,

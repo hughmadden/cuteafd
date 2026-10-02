@@ -6,6 +6,9 @@ use thiserror::Error;
 pub enum MimoDraftRepresentation {
     Bf16Only,
     Fp8Only,
+    /// BF16 FC and complete QKV matrices; FP8 o_proj, gate/up and down.
+    /// Every matrix owns one representation and the target head is borrowed.
+    Bf16Context,
     /// Unchanged private qualification baseline, not a single-copy mode.
     LegacyDual,
 }
@@ -127,24 +130,31 @@ impl MimoDraftWeightLayout {
         ];
         let fc = (g.hidden, mul(g.taps, g.hidden)?);
         let uses_fp8 = mode != MimoDraftRepresentation::Bf16Only;
-        let matrix = |(n, k): (u64, u64)| -> Result<(u64, u64, u64), MimoDraftStorageError> {
-            if uses_fp8 && (n % 16 != 0 || k % 128 != 0) {
-                return Err(MimoDraftStorageError::Unsupported(
-                    "packed FP8 matrices require N % 16 == 0 and K % 128 == 0",
-                ));
-            }
-            let values = mul(n, k)?;
-            Ok((
-                mul(values, 2)?.max(256),
-                values.max(256),
-                mul(values / 128, 4)?.max(256),
-            ))
-        };
+        let matrix =
+            |(n, k): (u64, u64), packed: bool| -> Result<(u64, u64, u64), MimoDraftStorageError> {
+                if packed && (n % 16 != 0 || k % 128 != 0) {
+                    return Err(MimoDraftStorageError::Unsupported(
+                        "packed FP8 matrices require N % 16 == 0 and K % 128 == 0",
+                    ));
+                }
+                let values = mul(n, k)?;
+                Ok((
+                    mul(values, 2)?.max(256),
+                    values.max(256),
+                    mul(values / 128, 4)?.max(256),
+                ))
+            };
         let layer = layer_shapes
-            .map(matrix)
             .into_iter()
+            .enumerate()
+            .map(|(index, shape)| {
+                matrix(
+                    shape,
+                    uses_fp8 && !(mode == MimoDraftRepresentation::Bf16Context && index == 0),
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        let fc_bytes = matrix(fc)?;
+        let fc_bytes = matrix(fc, uses_fp8 && mode != MimoDraftRepresentation::Bf16Context)?;
         let own = |index: usize| -> Result<u64, MimoDraftStorageError> {
             let get = |m: &(u64, u64, u64)| match index {
                 0 => m.0,
@@ -152,6 +162,11 @@ impl MimoDraftWeightLayout {
                 _ => m.2,
             };
             add(get(&fc_bytes), mul(g.layers, sum(layer.iter().map(get))?)?)
+        };
+        let context_bf16 = add(fc_bytes.0, mul(g.layers, layer[0].0)?)?;
+        let rest = |index: usize| -> Result<u64, MimoDraftStorageError> {
+            let get = |m: &(u64, u64, u64)| if index == 1 { m.1 } else { m.2 };
+            mul(g.layers, sum(layer[1..].iter().map(get))?)
         };
         let small_per_layer = sum([
             mul(2, mul(g.hidden, 2)?.max(256))?,
@@ -167,31 +182,41 @@ impl MimoDraftWeightLayout {
             mul(3, mul(g.hidden, 2)?.max(256))?,
         )?;
         let (head_fp8_values, head_fp8_scales) = if mode == MimoDraftRepresentation::LegacyDual {
-            let (_, values, scales) = matrix((g.vocab, g.hidden))?;
+            let (_, values, scales) = matrix((g.vocab, g.hidden), true)?;
             (values, scales)
         } else {
             (0, 0)
         };
         Ok(Self {
-            bf16_values: if mode == MimoDraftRepresentation::Fp8Only {
-                0
-            } else {
-                own(0)?
+            bf16_values: match mode {
+                MimoDraftRepresentation::Fp8Only => 0,
+                MimoDraftRepresentation::Bf16Context => context_bf16,
+                _ => own(0)?,
             },
-            fp8_values: if uses_fp8 { own(1)? } else { 0 },
-            fp8_scales: if uses_fp8 { own(2)? } else { 0 },
+            fp8_values: match mode {
+                MimoDraftRepresentation::Bf16Only => 0,
+                MimoDraftRepresentation::Bf16Context => rest(1)?,
+                _ => own(1)?,
+            },
+            fp8_scales: match mode {
+                MimoDraftRepresentation::Bf16Only => 0,
+                MimoDraftRepresentation::Bf16Context => rest(2)?,
+                _ => own(2)?,
+            },
             small_bf16,
             head_fp8_values,
             head_fp8_scales,
-            max_load_staging: if mode == MimoDraftRepresentation::Fp8Only {
-                layer
+            max_load_staging: match mode {
+                MimoDraftRepresentation::Fp8Only => layer
                     .iter()
                     .map(|m| m.0)
                     .chain([fc_bytes.0])
                     .max()
-                    .unwrap_or(0)
-            } else {
-                0
+                    .unwrap_or(0),
+                MimoDraftRepresentation::Bf16Context => {
+                    layer[1..].iter().map(|m| m.0).max().unwrap_or(0)
+                }
+                _ => 0,
             },
         })
     }
@@ -269,6 +294,30 @@ mod tests {
         assert!(MimoDraftCapacity::new(20, 0, 8).is_err());
         assert!(MimoDraftCapacity::new(20, 16, 1).is_err());
         assert!(MimoDraftCapacity::new(2_097_153, 16, 8).is_err());
+    }
+    #[test]
+    fn bf16_context_keeps_one_copy_of_each_complete_matrix() {
+        let layout =
+            MimoDraftWeightLayout::new(pro(), MimoDraftRepresentation::Bf16Context).unwrap();
+        let legacy =
+            MimoDraftWeightLayout::new(pro(), MimoDraftRepresentation::LegacyDual).unwrap();
+        assert_eq!(layout.bf16_values, 1_509_949_440);
+        assert_eq!(layout.fp8_values, 2_013_265_920);
+        assert_eq!(layout.fp8_scales, 62_914_560);
+        assert_eq!(layout.head_fp8_values + layout.head_fp8_scales, 0);
+        assert_eq!(layout.max_load_staging, 402_653_184);
+        assert_eq!(
+            legacy.resident_bytes().unwrap() - layout.resident_bytes().unwrap(),
+            5_771_821_056
+        );
+        let mut geometry = pro();
+        geometry.intermediate = 128;
+        geometry.taps = 32;
+        // A persistent BF16 FC must not be counted again as temporary FP8
+        // packing storage. The only large packed matrix is o_proj here.
+        let layout =
+            MimoDraftWeightLayout::new(geometry, MimoDraftRepresentation::Bf16Context).unwrap();
+        assert_eq!(layout.max_load_staging, 201_326_592);
     }
     #[test]
     fn reject_overflow_and_fp8_alignment_but_preserve_bf16_geometry() {

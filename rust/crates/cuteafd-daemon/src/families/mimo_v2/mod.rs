@@ -152,6 +152,8 @@ pub(crate) struct EngineArgs {
 pub(crate) enum DraftRepresentationArg {
     Bf16Only,
     Fp8Only,
+    /// Preserve BF16 FC and complete QKV; pack only o_proj/gate-up/down.
+    Bf16Context,
 }
 
 impl EngineArgs {
@@ -160,6 +162,10 @@ impl EngineArgs {
             Some(DraftRepresentationArg::Fp8Only) => {
                 ensure!(self.draft_fp8, "--draft-representation fp8-only conflicts with --draft-fp8 false; use bf16-only");
                 Ok(MimoDraftRepresentation::Fp8Only)
+            }
+            Some(DraftRepresentationArg::Bf16Context) => {
+                ensure!(self.draft_fp8, "--draft-representation bf16-context includes FP8 matrices and conflicts with --draft-fp8 false; use bf16-only");
+                Ok(MimoDraftRepresentation::Bf16Context)
             }
             Some(DraftRepresentationArg::Bf16Only) => Ok(MimoDraftRepresentation::Bf16Only),
             None if !self.draft_fp8 => Ok(MimoDraftRepresentation::Bf16Only),
@@ -173,8 +179,8 @@ impl EngineArgs {
     }
 
     fn validate_draft_replay(&self, replay: bool) -> Result<()> {
-        ensure!(!replay || self.draft_storage()? != MimoDraftRepresentation::Fp8Only,
-            "--draft-replay compares complete BF16 weights; load --draft-representation bf16-only separately from the FP8-only candidate");
+        ensure!(!replay || matches!(self.draft_storage()?,MimoDraftRepresentation::Bf16Only | MimoDraftRepresentation::LegacyDual),
+            "--draft-replay compares complete BF16 weights; load --draft-representation bf16-only separately from a candidate with immutable FP8 matrices");
         Ok(())
     }
 }
@@ -221,6 +227,15 @@ mod draft_storage_tests {
         assert_eq!(args.draft_capacity(8).unwrap(), MimoDraftCapacity {
             context_slots: 20, max_batch_sequences: 16, block_rows: 128,
         });
+    }
+    #[test]
+    fn bf16_context_is_immutable_and_requires_its_fp8_matrices() {
+        let args = args(&["--draft-representation","bf16-context"]);
+        assert_eq!(args.draft_storage().unwrap(),MimoDraftRepresentation::Bf16Context);
+        args.validate_draft_replay(false).unwrap();
+        assert!(args.validate_draft_replay(true).unwrap_err().to_string().contains("bf16-only separately"));
+        let args = self::args(&["--draft-representation","bf16-context","--draft-fp8","false"]);
+        assert!(open(&args).err().unwrap().to_string().contains("conflicts with --draft-fp8 false"));
     }
 }
 
