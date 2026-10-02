@@ -199,24 +199,30 @@ budget="$(get SPARK_DEVICE_BUDGET_BYTES 107374182400)"
 gpu="$(get COORDINATOR_GPU 0)"
 # Two coordinator GPUs (RTX_GPUS=auto/2 with COORDINATOR_GPU as V4.1's two-RTX config picks
 # the other card, or an explicit COORDINATOR_GPUS=0,1): families with a
-# head split (MiMo V2.6 Pro, GLM 5.x, DeepSeek V4) split every layer's attention heads and dense /
+# head split (MiMo V2 Flash/Pro, GLM 5.x, DeepSeek V4) split every layer's attention heads and dense /
 # shared-expert MLPs over both by default (COORDINATOR_SPLIT=auto or heads), one hidden
 # all-reduce per layer over peer memory; experts, router, head and drafter stay on the
-# first GPU. COORDINATOR_SPLIT=off serves from the first GPU alone. Families without a
-# split use the first GPU (the serve command logs it for MiMo V2 Flash). The container
-# sees both GPUs in host order. COORDINATOR_SPLIT_GPU names the second GPU when only
+# first GPU. COORDINATOR_SPLIT=off serves from the first GPU alone. Auto selection
+# uses one GPU for checkpoints without a split; an explicit split request fails
+# before containers start. The container sees both GPUs in host order.
+# COORDINATOR_SPLIT_GPU names the second GPU when only
 # COORDINATOR_GPU is set (default the other of 0/1).
+rtx_gpus="$(get RTX_GPUS auto)"
+case "$rtx_gpus" in auto|1|2) ;; *) echo "RTX_GPUS must be auto, 1 or 2" >&2; exit 2 ;; esac
+physical_gpus="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | tr -d ' ' || true)"
 coordinator_gpus="$(get COORDINATOR_GPUS)"
+explicit_coordinator_gpus="$coordinator_gpus"
 if [[ -z "$coordinator_gpus" ]]; then
   coordinator_gpus="$gpu"
-  case "$(get RTX_GPUS auto)" in
+  case "$rtx_gpus" in
     1) ;;
     2|auto)
-      other="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | tr -d ' ' | grep -vx "$gpu" | head -n 1)"
+      other="$(awk -v first="$gpu" '/^[0-9]+$/ && $0 != first {print; exit}' <<<"$physical_gpus")"
       [[ -z "$other" ]] || coordinator_gpus="$gpu,$other" ;;
-    *) echo "RTX_GPUS must be auto, 1 or 2" >&2; exit 2 ;;
   esac
 fi
+[[ "$coordinator_gpus" =~ ^[0-9]+(,[0-9]+)?$ ]] ||
+  { echo "COORDINATOR_GPUS must name one or two GPU indices" >&2; exit 2; }
 IFS=, read -r -a coordinator_gpus <<<"$coordinator_gpus"
 gpu="${coordinator_gpus[0]}"
 split="$(get COORDINATOR_SPLIT auto)"
@@ -227,16 +233,39 @@ if [[ ${#coordinator_gpus[@]} -ge 2 ]]; then
 elif [[ "$split" == heads ]]; then
   second="$(get COORDINATOR_SPLIT_GPU $((1 - gpu)))"
 fi
+explicit_split=0
+if [[ "$rtx_gpus" == 2 || "$explicit_coordinator_gpus" == *,* || "$split" == heads ]]; then
+  explicit_split=1
+fi
+split_hint=""
+case "$family:$model_type" in
+  deepseek_v4:*|glm5:*|mimo_v2:mimo_v2|mimo_v2:mimo_v2_flash) ;;
+  qwen4:*) split_hint="add Qwen head-split GDN/GQA/shared-expert kernels and sharded recurrent/KV state" ;;
+  glm5_flash:*) split_hint="add GLM Flash head-split KDA/MLA/dense/shared-expert kernels and sharded state" ;;
+  mimo_v2:*) split_hint="add MiMo head-split attention/projection kernels for $model_type" ;;
+  *) split_hint="add coordinator head-split kernels for $model_type" ;;
+esac
+if [[ "$split" != off && "$explicit_split" == 1 ]]; then
+  [[ -z "$split_hint" ]] ||
+    { echo "$family ($model_type): two-GPU head split is unsupported; $split_hint; use RTX_GPUS=1 or COORDINATOR_SPLIT=off" >&2; exit 2; }
+  [[ -n "$second" ]] ||
+    { echo "RTX_GPUS=2 requires two physical coordinator GPUs; only GPU $gpu was selected" >&2; exit 2; }
+fi
 gpus="device=$gpu"
 if [[ -n "$second" && "$split" != off ]]; then
+  [[ "$second" =~ ^[0-9]+$ ]] || { echo "COORDINATOR_SPLIT_GPU must be a GPU index" >&2; exit 2; }
   [[ "$second" != "$gpu" ]] || { echo "the second coordinator GPU must differ from the first" >&2; exit 2; }
-  case "$family" in
-    mimo_v2|glm5|deepseek_v4)
-      lower=$((gpu < second ? gpu : second)) upper=$((gpu < second ? second : gpu))
-      gpus="\"device=$lower,$upper\""
-      family_args+=(--device $((gpu == lower ? 0 : 1)) --split-device $((gpu == lower ? 1 : 0))) ;;
-    *) echo "note: $family has no head split; serving from GPU $gpu alone" >&2 ;;
-  esac
+  if [[ -z "$split_hint" ]]; then
+    for selected in "$gpu" "$second"; do
+      grep -qx "$selected" <<<"$physical_gpus" ||
+        { echo "two-GPU head split requires physical GPU $selected, but nvidia-smi did not report it" >&2; exit 2; }
+    done
+    lower=$((gpu < second ? gpu : second)) upper=$((gpu < second ? second : gpu))
+    gpus="\"device=$lower,$upper\""
+    family_args+=(--device $((gpu == lower ? 0 : 1)) --split-device $((gpu == lower ? 1 : 0)))
+  else
+    echo "note: $family ($model_type) has no head split; auto selected GPU $gpu alone" >&2
+  fi
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is
