@@ -189,6 +189,46 @@ pub fn splice(text: &str, begin: &str, end: &str, body: &str) -> Result<String> 
     Ok(format!("{}\n{}\n\n{}", &text[..start], body.trim_end_matches('\n'), &text[stop..]))
 }
 
+/// The release whose changelog row (`| v0 | ... | Basic eval |`) gets the cards
+/// (`CUTEAFD_RELEASE_ROW`, default `v0`).
+fn release_row() -> String {
+    std::env::var("CUTEAFD_RELEASE_ROW").unwrap_or_else(|_| "v0".into())
+}
+
+/// Fills the Basic eval cell of each `docs/models/<family>.md` changelog row of
+/// this release with the family's Release smoke cards.
+fn family_pages(root: &Path, placed: &[Placed]) -> Result<()> {
+    let row = format!("| {} |", release_row());
+    for family in FAMILIES {
+        let path = root.join("docs/models").join(format!("{family}.md"));
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let cards = family_cards(placed, family);
+        if cards.is_empty() {
+            continue;
+        }
+        let mut changed = false;
+        let lines: Vec<String> = text.lines().map(|line| {
+            if !line.starts_with(&row) {
+                return line.to_string();
+            }
+            let cells: Vec<&str> = line.trim_end().trim_end_matches('|').split('|').collect();
+            if cells.len() < 3 {
+                return line.to_string();
+            }
+            changed = true;
+            format!("{}| {cards} |", cells[..cells.len() - 1].join("|"))
+        }).collect();
+        if changed {
+            let mut out = lines.join("\n");
+            if text.ends_with('\n') {
+                out.push('\n');
+            }
+            crate::cli::write_if_changed(&path, &out)?;
+        }
+    }
+    Ok(())
+}
+
 const INDEX_HEADER: &str = "# Benchmarks\n\nReports from `cuteafd bench` (profiles other than the basic one run \
     when asked). Each directory holds `report.svg`, `report.json` and the share card; `cuteafd bench publish` \
     rebuilds this index and the root README's table.\n\n";
@@ -222,6 +262,7 @@ pub fn publish(root: &Path, dirs: &[PathBuf]) -> Result<(PathBuf, PathBuf, usize
     let current = std::fs::read_to_string(&index_path)
         .unwrap_or_else(|_| format!("{INDEX_HEADER}{INDEX_BEGIN}\n{INDEX_END}\n"));
     crate::cli::write_if_changed(&index_path, &splice(&current, INDEX_BEGIN, INDEX_END, &index(&placed))?)?;
+    family_pages(root, &placed)?;
     Ok((readme, index_path, placed.len()))
 }
 
@@ -232,6 +273,9 @@ mod tests {
     #[test]
     fn publish_rebuilds_the_table_and_index() {
         let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("docs/models")).unwrap();
+        std::fs::write(root.path().join("docs/models/deepseek_v41.md"),
+            "## Changelog\n\n| Version | Date | Change | Basic eval |\n| --- | --- | --- | --- |\n| v0 | 2026-10-02 | First release | — |\n").unwrap();
         std::fs::write(root.path().join("README.md"),
             format!("# x\n\n{RESULTS_BEGIN}\n_Pending._\n{RESULTS_END}\n\nrest\n")).unwrap();
         let mut ok = crate::sample::report(false);
@@ -252,6 +296,8 @@ mod tests {
         // One row per checkpoint × hardware: the newest wins.
         assert_eq!(readme.matches("| DeepSeek-V4.1-Flash (mxfp4) |").count(), 1, "{readme}");
         assert!(super::family_cards(&scan(root.path()).unwrap(), "deepseek_v41").contains("../../benchmarks/"));
+        let page = std::fs::read_to_string(root.path().join("docs/models/deepseek_v41.md")).unwrap();
+        assert!(page.contains("| v0 | 2026-10-02 | First release | <a href=\"../../benchmarks/"), "{page}");
         assert!(readme.contains("benchmarks/deepseek_v41/2026-10-02-smoke-1rtx-4spark/report.svg"));
         assert!(readme.ends_with("rest\n"));
         let index = std::fs::read_to_string(index).unwrap();
