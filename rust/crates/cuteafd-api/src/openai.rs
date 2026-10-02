@@ -111,6 +111,7 @@ pub use constraints::NativeConstraint;
 mod images;
 pub mod console;
 pub use console::ConsoleHub;
+pub mod probe;
 #[cfg(test)]
 mod unicode_tests;
 pub use limits::{NativeLimits, MAX_CONTEXT_TOKENS, MAX_OUTPUT_TOKENS};
@@ -149,6 +150,8 @@ pub struct NativeRequest {
     /// DeepSeek engines keep their built-in EOS handling.
     pub stop_token_ids: Vec<u32>,
     pub events: mpsc::UnboundedSender<Result<InferenceChunk, NativeFailure>>,
+    /// Benchmark diagnostics for this request (`probe::HEADER`); `None` for every ordinary client.
+    pub probe: Option<Arc<probe::Probe>>,
 }
 /// Serving statistics the CUDA owner publishes (a JSON object; `null` until the first publish).
 pub type SharedStats = Arc<Mutex<Value>>;
@@ -320,7 +323,8 @@ impl OutputProcessor {
     }
 }
 
-async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> Response {
+async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, Json(mut body): Json<Value>) -> Response {
+    let probe = headers.get(probe::HEADER).and_then(|v| v.to_str().ok()).and_then(|id| probe::registry().claim(id));
     // Families rendered from the checkpoint's own chat template.
     let glm = match &state.profile.encoding {
         ModelEncoding::Glm(encoding) => Some(Templated::Glm(encoding.clone())),
@@ -550,6 +554,7 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> 
         sampling,
         stop_token_ids,
         events,
+        probe,
     };
     permit.send(job);
     // Admission errors must retain their cause and HTTP status, including for

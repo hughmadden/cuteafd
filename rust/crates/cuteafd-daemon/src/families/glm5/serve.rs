@@ -20,6 +20,7 @@ use super::engine::{GlmEngine, GlmPlacement, DECODE_ROWS};
 use super::prefix::GlmPrefix;
 use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
 use crate::shared::prefix::{PrefixArgs, Toggle};
+use crate::shared::probe;
 use cuteafd_engine::prefix::{After, PointPlan, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
 
 /// Most copy-window draft tokens verified per sequence and step.
@@ -236,6 +237,7 @@ impl Active<'_> {
     /// Streams `token` (special tokens stay text for the GLM parser); returns
     /// true when the request is finished.
     fn emit(&mut self, token: u32) -> Result<bool> {
+        crate::shared::probe::token(&self.job.probe, token);
         self.history.push(token);
         self.digest = digest(self.digest, token);
         self.generated += 1;
@@ -423,7 +425,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     continue;
                 }
             };
-            let tokens = tokenizer.encode_text(&job.prompt, false)?.token_ids;
+            let tokens = probe::prompt_ids(&job.probe, || Ok(tokenizer.encode_text(&job.prompt, false)?.token_ids))?;
+            let cold = probe::cold(&job.probe);
             if tokens.is_empty() || tokens.len() >= engine.max_context {
                 reject(&job, format!("prompt of {} tokens is outside 1..{}", tokens.len(), engine.max_context));
                 continue;
@@ -432,7 +435,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             let slot = free_slots.pop();
             cache.tick();
             // Lookup and fork of the retained pages (byte-exact: the pages are the whole state).
-            let admitted = match cache.admit(&family, &tokens, capacity, true, |pages| GlmPlacement { pages, len: 0 }) {
+            let lookup: &[u32] = if cold { &[] } else { &tokens };
+            let admitted = match cache.admit(&family, lookup, capacity, true, |pages| GlmPlacement { pages, len: 0 }) {
                 Ok(admitted) => admitted,
                 Err(error) => {
                     free_slots.extend(slot);
@@ -442,15 +446,33 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             };
             admitted_total += 1;
             let resume = admitted.resume;
+            probe::admitted(&job.probe, "glm5", &tokens, resume);
             let _ = job.events.send(Ok(InferenceChunk::Ready {
                 system_fingerprint: None,
                 prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: resume },
             }));
+            if let Some(from) = probe::scoring(&job.probe) {
+                // Teacher-forced scoring: every row's logits, no generation, nothing retained.
+                let mut placement = admitted.placement;
+                let mut state = (&mut placement, transport.as_deref_mut());
+                let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_capacity(),
+                    DECODE_ROWS, &mut state,
+                    |(placement, transport), chunk, _| engine.prefill_device(placement, chunk,
+                        transport.as_deref_mut().map(|t| (t, runtime))),
+                    |(placement, transport), chunk| engine.verify_device(&mut [(&mut **placement, chunk.len())], chunk,
+                        transport.as_deref_mut().map(|t| (t, runtime)))?.context("scoring needs every layer"));
+                match scored {
+                    Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
+                    Err(error) => { let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}")))); }
+                }
+                release(&family, &mut cache, &mut free_slots, &placement, slot);
+                continue;
+            }
             if let Some(source) = admitted.source {
                 tracing::info!(tokens = tokens.len(), resume, kind = ?source.kind, frontier = source.frontier,
                     host = source.host, partial = source.partial, "prefix cache hit");
             }
-            let plan = if cache.enabled() {
+            let plan = if cache.enabled() && !cold {
                 cuteafd_engine::prefix::plan_points(resume, tokens.len(), engine.prefill_capacity(),
                     &crate::shared::prefix::boundaries(&tokens, &markers), family.capture_reach(),
                     prefix.prefix_cache_min_tokens, prefix.points())
@@ -489,8 +511,11 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     batch.push_next(p.job.sampling, p.constraint.as_mut(), p.placement.len as u64)?;
                     let selected = selector.select(&logits, &batch)?;
                     p.first = Some(take(p.constraint.as_mut(), &selected[0])?);
-                    if cache.enabled() {
+                    if cache.enabled() && !probe::cold(&p.job.probe) {
                         p.logits = Some(logits.row_host(&opened.library, 0)?);
+                    }
+                    if probe::wants_first(&p.job.probe) {
+                        probe::device_rows(&opened.library, &p.job.probe, &logits, 0, 1, p.tokens.len())?;
                     }
                 }
                 // The chunk's tapped tail becomes drafter context before the next step.
@@ -517,7 +542,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 if let Err(error) = &prefilled {
                     if p.cancelled {
                         // The client left during the prefill: keep what it computed for a retry.
-                        if placement.len > resume {
+                        if placement.len > resume && !probe::cold(&p.job.probe) {
                             if let Err(error) = cache.park(&family, &p.tokens[..placement.len], &placement) {
                                 tracing::warn!("parking a cancelled prefill: {error:#}");
                             }
@@ -566,7 +591,12 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     };
                     request.next = match (p.first, &logits) {
                         (Some(first), _) => first,
-                        (None, Some(logits)) => request.select(logits)?,
+                        (None, Some(logits)) => {
+                            if probe::wants_first(&request.job.probe) {
+                                probe::host_row(&request.job.probe, request.prompt_tokens, logits);
+                            }
+                            request.select(logits)?
+                        }
                         (None, None) => anyhow::bail!("prefill produced no first token"),
                     };
                     Ok(request)
@@ -598,8 +628,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         let cycle = Instant::now();
         // Rows each sequence may add after its next token.
         let room = (DECODE_ROWS / active.len()).max(1) - 1;
-        let limits: Vec<usize> = active.iter().map(|a| room.min(a.job.max_tokens - a.generated - 1)
-            .min(a.capacity - a.placement.len - 1)).collect();
+        let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
+            room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1) }).collect();
         // DFlash2 drafts after every next token, then the policy's counts.
         let timer = Instant::now();
         let drafted: Vec<Option<super::dflash::Draft>> = match drafter {
@@ -721,7 +751,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         if done {
                             // A normal finish (the client took the last chunk): the row that
                             // produced the last token follows the turn snapshot.
-                            if retain_turn {
+                            if retain_turn && !probe::cold(&request.job.probe) {
                                 request.turn = logits.row_host(&opened.library, offset + j)
                                     .inspect_err(|error| tracing::warn!("turn logits: {error:#}")).ok();
                             }

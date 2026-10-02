@@ -68,6 +68,7 @@ pub(crate) struct ServeArgs {
 }
 
 pub(crate) use crate::shared::prefix::{PrefixArgs, Toggle};
+use crate::shared::probe;
 
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let snapshot: PathBuf = args.engine.snapshot.clone();
@@ -242,6 +243,7 @@ impl Active<'_> {
     /// Streams `token` (special tokens stay text for the output parser);
     /// returns true when the request is finished.
     fn emit(&mut self, token: u32) -> Result<bool> {
+        probe::token(&self.job.probe, token);
         self.history.push(token);
         self.generated += 1;
         self.buffered += 1;
@@ -360,7 +362,8 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     continue;
                 }
             };
-            let tokens = tokenizer.encode_text(&job.prompt, false)?.token_ids;
+            let tokens = probe::prompt_ids(&job.probe, || Ok(tokenizer.encode_text(&job.prompt, false)?.token_ids))?;
+            let cold = probe::cold(&job.probe);
             if tokens.is_empty() || tokens.len() >= engine.max_context {
                 reject(&job, format!("prompt of {} tokens is outside 1..{}", tokens.len(), engine.max_context));
                 continue;
@@ -373,7 +376,8 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let slot = free_slots.pop();
             cache.tick();
             // Lookup, fork of the retained pages and restore of the mark (byte-exact).
-            let admitted = match cache.admit(&family, &tokens, capacity, true,
+            let lookup: &[u32] = if cold { &[] } else { &tokens };
+            let admitted = match cache.admit(&family, lookup, capacity, true,
                 |pages| MimoPlacement { pages, ring, len: 0 }) {
                 Ok(admitted) => admitted,
                 Err(error) => {
@@ -384,16 +388,32 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 }
             };
             let resume = admitted.resume;
+            probe::admitted(&job.probe, "mimo_v2", &tokens, resume);
             let _ = job.events.send(Ok(InferenceChunk::Ready {
                 system_fingerprint: None,
                 prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: resume },
             }));
+            if let Some(from) = probe::scoring(&job.probe) {
+                // Teacher-forced scoring: every row's logits, no generation, nothing retained.
+                let mut placement = admitted.placement;
+                let scored = probe::score(engine.library, &job.probe, &tokens, from, engine.prefill_capacity(),
+                    DECODE_ROWS, &mut placement,
+                    |placement, chunk, _| engine.prefill_device(placement, chunk, false, None, None),
+                    |placement, chunk| engine.verify_device(&mut [(placement, chunk.len())], chunk, None)?
+                        .context("scoring needs every layer"));
+                match scored {
+                    Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
+                    Err(error) => { let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}")))); }
+                }
+                release(&family, &mut cache, &mut free_rings, &mut free_slots, &placement, slot);
+                continue;
+            }
             if let Some(source) = admitted.source {
                 tracing::info!(tokens = tokens.len(), resume, kind = ?source.kind, frontier = source.frontier,
                     host = source.host, partial = source.partial, "prefix cache hit");
             }
             let boundaries = cuteafd_engine::prefix::message_boundaries(&tokens, message_start);
-            let plan = if cache.enabled() {
+            let plan = if cache.enabled() && !cold {
                 cuteafd_engine::prefix::plan_points(resume, tokens.len(), engine.prefill_capacity(), &boundaries,
                     family.capture_reach(), prefix.prefix_cache_min_tokens, prefix.points())
             } else {
@@ -420,7 +440,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 let timer = Instant::now();
                 let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
                 let chunk = &p.tokens[p.done..end];
-                let retain = cache.enabled();
+                let retain = cache.enabled() && !probe::cold(&p.job.probe);
                 let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
                     let start = p.placement.len;
                     let logits = engine.prefill_device(&mut p.placement, chunk, false, None, None)?;
@@ -433,6 +453,9 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         p.first = Some(take(p.constraint.as_mut(), &selected[0])?);
                         // The prompt snapshot's row (one row, only when snapshots are kept).
                         p.logits = if retain { Some(logits.row_host(engine.library, 0)?) } else { None };
+                        if probe::wants_first(&p.job.probe) {
+                            probe::device_rows(engine.library, &p.job.probe, &logits, 0, 1, p.tokens.len())?;
+                        }
                     }
                     // The chunk's tapped tail becomes the drafter's context.
                     if let (Some(drafter), Some(slot)) = (drafter, p.slot) {
@@ -461,7 +484,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 if let Err(error) = &prefilled {
                     if p.cancelled {
                         // The client left during the prefill: keep what it computed for a retry.
-                        if placement.len > resume {
+                        if placement.len > resume && !probe::cold(&p.job.probe) {
                             if let Err(error) = cache.park(&family, &p.tokens[..placement.len], &placement) {
                                 tracing::warn!("parking a cancelled prefill: {error:#}");
                             }
@@ -510,7 +533,13 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     };
                     request.next = match p.first {
                         Some(token) => token,
-                        None => request.select_host(logits.as_deref().context("no first-token logits")?)?,
+                        None => {
+                            let logits = logits.as_deref().context("no first-token logits")?;
+                            if probe::wants_first(&request.job.probe) {
+                                probe::host_row(&request.job.probe, request.history.len(), logits);
+                            }
+                            request.select_host(logits)?
+                        }
                     };
                     Ok(request)
                 })();
@@ -541,8 +570,8 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let cycle = Instant::now();
         // Rows each sequence may add after its next token.
         let room = (DECODE_ROWS / active.len()).max(1) - 1;
-        let limits: Vec<usize> = active.iter().map(|a| room.min(a.job.max_tokens - a.generated - 1)
-            .min(a.capacity - a.placement.len - 1)).collect();
+        let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else { room.min(a.job.max_tokens - a.generated - 1)
+            .min(a.capacity - a.placement.len - 1) }).collect();
         // DFlash drafts after every next token (sequences with a ring slot),
         // then the adaptive plan's counts.
         let drafted: Vec<Option<super::dflash::Draft>> = match drafter {
@@ -664,7 +693,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 match take(request.constraint.as_mut(), &selected[offset + j]).and_then(|t| Ok((t, request.emit(t)?))) {
                     Ok((token, done)) => {
                         finished = done;
-                        if done && cache.enabled() {
+                        if done && cache.enabled() && !probe::cold(&request.job.probe) {
                             // A normal finish (the client took the last chunk): the row that
                             // produced the last token follows the turn snapshot.
                             request.turn = logits.row_host(engine.library, offset + j).ok();
