@@ -6,6 +6,8 @@ pub(crate) mod mtp;
 pub(crate) mod prefix;
 pub(crate) mod serve;
 pub(crate) mod weights;
+#[cfg(test)]
+mod host_gate;
 
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
