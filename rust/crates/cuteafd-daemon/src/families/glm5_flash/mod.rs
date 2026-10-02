@@ -7,6 +7,7 @@ pub(crate) mod serve;
 mod speculate;
 mod expert_rows;
 mod header;
+mod precision;
 pub(crate) mod weights;
 
 use anyhow::{ensure, Context, Result};
@@ -66,8 +67,9 @@ pub(crate) struct EngineArgs {
     #[arg(long, default_value_t = 12)]
     pub expert_reserve_gib: usize,
     /// Kept for launch scripts: the MLA, dense and shared-expert projections
-    /// are always FP8 (their only copies): the official FP8 release's E4M3
-    /// blocks with --fp8-snapshot, else 128x128 blocks quantized from BF16.
+    /// currently require native FP8 (their only copies), from the primary
+    /// checkpoint or --fp8-snapshot. BF16 sources need a matching exporter;
+    /// this compatibility flag does not permit implicit weight quantization.
     #[arg(long)]
     pub fp8_decode: bool,
     /// The official FP8 checkpoint (zai-org/GLM-5.3-Flash): the MLA, dense and
@@ -307,7 +309,13 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     let checkpoint = Checkpoint::open(&args.snapshot)?;
     ensure!(checkpoint.missing_shards.is_empty(), "checkpoint shards missing: {:?}", checkpoint.missing_shards);
     let cfg = GlmNextConfig::read(&args.snapshot)?;
+    let fp8_checkpoint = args.fp8_snapshot.as_deref().map(Checkpoint::open).transpose()?;
+    if let Some(checkpoint) = &fp8_checkpoint {
+        ensure!(checkpoint.missing_shards.is_empty(), "FP8 checkpoint shards missing: {:?}", checkpoint.missing_shards);
+    }
     header::check_kda_inputs(&checkpoint, &cfg, args.layers.unwrap_or(cfg.layers))?;
+    precision::check_projection_inputs(&checkpoint, fp8_checkpoint.as_ref(), &cfg,
+        args.layers.unwrap_or(cfg.layers))?;
     if let Some(snapshot) = &args.draft {
         let head = checkpoint.tensors.iter().find(|t| t.meta.name == "lm_head.weight")
             .context("DFlash target has no lm_head.weight")?;
@@ -335,7 +343,6 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     // SAFETY: the library is the cuteafd native shim built for this engine.
     let library = unsafe { NativeLibrary::load(&args.native_lib) }?;
     library.cuda_set_device(args.device)?;
-    let fp8_checkpoint = args.fp8_snapshot.as_deref().map(Checkpoint::open).transpose()?;
     Ok(Opened { checkpoint, fp8_checkpoint, cfg, library, experts })
 }
 
