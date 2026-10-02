@@ -7,7 +7,7 @@
 	url = https://github.com/mlc-ai/xgrammar.git
 [submodule "third_party/gptqmodel"]
 	path = third_party/gptqmodel
-	url = git@github.com:tpurtell/GPTQModel.git
+	url = https://github.com/tpurtell/GPTQModel.git
 	branch = main
 [submodule "third_party/transformers"]
 	path = third_party/transformers
