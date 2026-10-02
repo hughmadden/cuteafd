@@ -198,6 +198,33 @@ struct Locks {
 }
 
 impl Locks {
+    /// Takes `names`, waiting in line like every other agent (flock), when
+    /// nothing of ours runs; with entries running, only what is free now.
+    fn take(&mut self, names: &[&'static str], wait: bool) -> Result<bool> {
+        if !wait {
+            return self.try_take(names);
+        }
+        let dir = expand("~/.cache/cuteafd");
+        std::fs::create_dir_all(&dir)?;
+        // sparks.lock before gpu1.lock, the order locked2.sh takes them.
+        let mut ordered: Vec<&'static str> = names.to_vec();
+        ordered.sort_by_key(|n| if *n == "sparks.lock" { 0 } else { 1 });
+        for name in ordered {
+            if self.held.contains_key(name) {
+                continue;
+            }
+            let file = File::options().create(true).append(true).open(dir.join(name))?;
+            file.lock()?;
+            self.held.insert(name, (file, 0));
+        }
+        for name in names {
+            if let Some((_, count)) = self.held.get_mut(name) {
+                *count += 1;
+            }
+        }
+        Ok(true)
+    }
+
     fn try_take(&mut self, names: &[&'static str]) -> Result<bool> {
         let dir = expand("~/.cache/cuteafd");
         std::fs::create_dir_all(&dir)?;
@@ -337,7 +364,10 @@ pub fn run(args: SmokeArgs) -> Result<()> {
             if let Some(index) = queue.iter().position(|e| running.iter().all(|r| disjoint(e, r, &base_of(e)))) {
                 let entry = queue[index].clone();
                 let needed = locks_for(&entry);
-                if locks.try_take(&needed)? {
+                if running.is_empty() {
+                    eprintln!("{}: waiting in line for {needed:?}", entry.name);
+                }
+                if locks.take(&needed, running.is_empty())? {
                     queue.remove(index);
                     running.push(entry.clone());
                     started_one = true;

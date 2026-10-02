@@ -40,6 +40,19 @@ pub fn panel_svg(report: &Report, id: &str) -> String {
     doc.finish()
 }
 
+/// A panel's body alone (no frame, title or footer) `width` wide on a
+/// transparent background: the dashboard's chart view of the panel.
+pub fn panel_body_svg(report: &Report, id: &str, width: f64) -> String {
+    let view = View::new(report);
+    let t = view.theme;
+    let (body, height) = view.body(id, width);
+    let mut doc = Doc::new(width, height + 4.0);
+    doc.defs(&t.defs());
+    doc.raw(&body);
+    bodies::watermark(&mut doc, &t);
+    doc.finish()
+}
+
 /// The whole report: header, failure banner, the panels that ran, footer.
 pub fn report_svg(report: &Report) -> String {
     let view = View::new(report);

@@ -1,15 +1,521 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>cuteafd bench</title>
-<style>body{margin:0;background:#05070b;color:#e8eef8;font:13px/1.4 ui-monospace,Menlo,Consolas,monospace;padding:20px}
-a{color:#4cc3ff}img{max-width:100%;display:block;margin:12px 0}</style></head>
-<body><h1>cuteafd bench</h1><p id="status">loading…</p><div id="latest"></div>
-<script>
-async function load(){
-  const s = await (await fetch('/v1/bench/status')).json();
-  document.getElementById('status').textContent = s.active ? `BENCHMARKING ${s.active.panel} · ETA ${Math.round(s.active.eta_s)} s` : 'idle';
-  const runs = (await (await fetch('/v1/bench/runs')).json()).runs || [];
-  if (runs.length) document.getElementById('latest').innerHTML = `<img src="/v1/bench/runs/${runs[0].id}/report.svg">`;
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CUTEAFD Benchmarks</title>
+<link rel="stylesheet" href="/assets/cuteafd-ui.css">
+<style>
+/* Scary mode: a report whose quality gate failed. */
+body.scary {
+  --bg: #0b0405; --panel: #150709; --panel-2: #1c0a0d; --well: #0e0506; --line: #3a1318; --line-2: #5a1a22;
+  --ink: #ffe9e9; --ink-2: #e3a3a3; --muted: #94595d; --target: #ff3b4e; --accepted: #ffb020; --prefill: #ff7a2f;
+  --spark: #ffd166; --good: #ffb020; --grammar: #ffb020;
+  background: radial-gradient(1200px 500px at 12% -10%, rgba(255,59,78,.10), transparent 60%), var(--bg);
 }
-load(); setInterval(load, 5000);
-</script></body></html>
+body.scary .brand .logo { filter: hue-rotate(150deg) saturate(1.4); animation: glitch 2.6s steps(1) infinite; }
+@keyframes glitch {
+  0%, 86%, 100% { transform: none; filter: hue-rotate(150deg) saturate(1.4); }
+  88% { transform: translate(-3px, 1px) skewX(-8deg); filter: hue-rotate(110deg) drop-shadow(3px 0 #00e5ff) drop-shadow(-3px 0 #ff3b4e); }
+  91% { transform: translate(2px, -1px); clip-path: inset(30% 0 20% 0); }
+  94% { transform: translate(-1px, 0) skewX(6deg); filter: drop-shadow(-2px 0 #00e5ff); }
+}
+@media (prefers-reduced-motion: reduce) { body.scary .brand .logo { animation: none; } }
+.hazard { background: repeating-linear-gradient(45deg, #ffb020 0 14px, #120405 14px 28px); padding: 6px; border-radius: 10px; }
+.failure { display: flex; gap: 16px; align-items: center; background: #140405; border-radius: 6px; padding: 10px 14px;
+  font: 700 15px var(--mono); letter-spacing: .2em; color: #ff3b4e; }
+.failure span { font: 500 12px var(--mono); letter-spacing: 0; color: #ffb020; margin-left: auto; }
+.dim { opacity: .55; }
+
+/* live strip */
+.strip { display: grid; grid-template-columns: auto minmax(140px, 220px) repeat(2, auto) minmax(160px, 1fr) auto auto; gap: 12px;
+  align-items: center; background: var(--panel); border: 1px solid var(--line-2); border-radius: 10px; padding: 8px 12px;
+  font: 12px var(--mono); color: var(--ink-2); }
+.strip b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.strip .pill { font: 700 10.5px var(--mono); letter-spacing: .16em; color: var(--bg); background: linear-gradient(90deg, var(--target), var(--spark));
+  border-radius: 999px; padding: 3px 10px; animation: pulse 1.6s ease-in-out infinite; }
+.strip svg.spark { height: 26px; }
+.progress { height: 8px; border-radius: 4px; background: var(--well); border: 1px solid var(--line); overflow: hidden; }
+.progress span { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--target), var(--spark)); transition: width .6s ease; }
+@media (max-width: 900px) { .strip { grid-template-columns: 1fr 1fr; } }
+
+/* toolbar */
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.toolbar select, .toolbar .btn, dialog input, dialog select { font: 600 11px var(--mono); }
+select { color: var(--ink); background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 7px; padding: 5px 8px; }
+.btn.go { color: var(--bg); background: linear-gradient(90deg, var(--target), var(--accepted)); border-color: transparent; }
+.btn.danger { color: var(--bad); border-color: var(--bad); }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.menu { position: relative; }
+.menu > div { position: absolute; right: 0; top: calc(100% + 4px); z-index: 5; background: var(--panel-2); border: 1px solid var(--line-2);
+  border-radius: 8px; padding: 6px; display: grid; gap: 2px; min-width: 190px; box-shadow: 0 10px 30px rgba(0,0,0,.5); }
+.menu a { color: var(--ink-2); text-decoration: none; font: 12px var(--mono); padding: 5px 8px; border-radius: 5px; }
+.menu a:hover { background: var(--line); color: var(--ink); }
+
+/* panels */
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 620px), 1fr)); gap: 12px; }
+.grid .wide { grid-column: 1 / -1; }
+.panel.failed { border-color: var(--bad); position: relative; }
+.panel.failed::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 7px; border-radius: 12px 12px 0 0;
+  background: repeating-linear-gradient(45deg, #ffb020 0 10px, #120405 10px 20px); }
+.panel .chart img { display: block; width: 100%; height: auto; }
+.panel .state { font: 600 10px var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+.panel .state.done { color: var(--good); } .panel .state.running { color: var(--target); } .panel .state.failed { color: var(--bad); }
+.panel .pbar { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; font: 11px var(--mono); color: var(--ink-2); }
+.panel .desc { font: 12px var(--sans); color: var(--muted); }
+.icon { font: 600 12px var(--mono); padding: 4px 9px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { font: 11px var(--mono); border: 1px solid var(--line-2); border-radius: 999px; padding: 2px 9px; color: var(--ink); background: var(--panel-2); }
+td.l, th.l { text-align: left; } td.wrap { white-space: normal; text-align: left; }
+tr.differs td { color: var(--ink); } tr.differs td:first-child { color: var(--grammar); }
+
+/* run dialog */
+dialog { background: var(--panel); color: var(--ink); border: 1px solid var(--line-2); border-radius: 14px; padding: 0;
+  width: min(880px, 96vw); box-shadow: 0 30px 80px rgba(0,0,0,.6); }
+dialog::backdrop { background: rgba(2,3,6,.72); }
+dialog .head, dialog .foot { display: flex; gap: 10px; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+dialog .foot { border-bottom: 0; border-top: 1px solid var(--line); }
+dialog .body { display: grid; grid-template-columns: 250px 1fr; gap: 14px; padding: 14px 16px; max-height: 65vh; overflow: auto; }
+dialog h3 { margin: 0; font: 600 12px var(--sans); letter-spacing: .14em; text-transform: uppercase; }
+.profiles label { display: grid; grid-template-columns: auto 1fr; gap: 2px 8px; padding: 7px 8px; border-radius: 8px; cursor: pointer; }
+.profiles label:hover { background: var(--panel-2); }
+.profiles input { margin-top: 2px; }
+.profiles small { grid-column: 2; color: var(--muted); font: 11px var(--sans); }
+.picks { display: grid; gap: 4px; }
+.picks label { display: grid; grid-template-columns: auto 1fr auto auto; gap: 10px; align-items: center; padding: 5px 8px;
+  border-radius: 7px; border: 1px solid var(--line); background: var(--well); font: 12px var(--mono); }
+.picks label.off { opacity: .45; }
+.picks input[type=number] { width: 52px; color: var(--ink); background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 5px; padding: 2px 4px; }
+.picks small { color: var(--muted); }
+.eta { font: 600 13px var(--mono); color: var(--ink); }
+.eta small { color: var(--muted); font-weight: 400; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header id="header"></header>
+  <div id="failure" hidden><div class="hazard"><div class="failure">⚠ FIDELITY FAILURE<span id="failure-detail"></span></div></div></div>
+  <div class="strip" id="strip" hidden>
+    <span class="pill">BENCHMARKING</span>
+    <svg class="spark" id="strip-spark"></svg>
+    <span>output <b id="strip-rate">–</b> tok/s</span>
+    <span>active <b id="strip-active">–</b></span>
+    <span><span id="strip-panel">–</span> · <span id="strip-label"></span><div class="progress"><span id="strip-progress"></span></div></span>
+    <span>ETA <b id="strip-eta">–</b></span>
+    <button class="btn danger" id="cancel">CANCEL</button>
+  </div>
+  <div class="toolbar">
+    <button class="btn go" id="open-run">RUN…</button>
+    <select id="runs" aria-label="Report"></select>
+    <label class="btn" for="load-json">LOAD JSON</label><input type="file" id="load-json" accept="application/json,.json" hidden>
+    <span class="spacer"></span>
+    <span class="note" id="run-note"></span>
+    <div class="menu"><button class="btn" id="export-report">EXPORT REPORT ▾</button><div id="export-menu" hidden></div></div>
+  </div>
+  <div class="grid" id="panels"></div>
+  <p class="note">Benchmarks run inside this server and drive its own OpenAI API over loopback. While one runs, requests from
+    other clients get 503 with Retry-After. The baseline (basic card and quick quality) runs once per server and configuration
+    and every later run shares it; its rates set the ETAs. Charts are the same SVGs the exports contain.</p>
+</div>
+
+<dialog id="dialog">
+  <div class="head"><h3>Run benchmarks</h3><span class="spacer"></span><span class="eta" id="dialog-eta"></span></div>
+  <div class="body">
+    <div class="profiles" id="dialog-profiles"></div>
+    <div class="picks" id="dialog-panels"></div>
+  </div>
+  <div class="foot">
+    <button class="btn" id="dialog-save">SAVE AS CUSTOM…</button>
+    <span class="note" id="dialog-note"></span>
+    <span class="spacer"></span>
+    <button class="btn" id="dialog-cancel">CLOSE</button>
+    <button class="btn go" id="dialog-start">START</button>
+  </div>
+</dialog>
+
+<script src="/assets/cuteafd-ui.js"></script>
+<script>
+(() => {
+'use strict';
+const UI = window.CuteUI;
+const { fmt } = UI;
+const $ = (id) => document.getElementById(id);
+const shell = UI.header($('header'), { page: 'bench', subtitle: 'Benchmarks' });
+const store = { get(k) { try { return localStorage.getItem(k); } catch (_) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (_) {} } };
+
+let status = {}, catalog = { panels: [] }, profiles = [], runs = [], report = null, viewing = null;
+let follow = true;              // follow the active run
+const revs = {};                // panel id -> image revision
+const rates = [];               // live output tok/s
+let progress = null;            // last progress event
+
+const secs = (s) => {
+  if (!Number.isFinite(s)) return '–';
+  s = Math.max(0, s);
+  if (s < 60) return `${Math.round(s)} s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${String(Math.round(s % 60)).padStart(2, '0')}s`;
+  return `${Math.floor(s / 3600)}h ${String(Math.floor(s / 60) % 60).padStart(2, '0')}m`;
+};
+const api = async (path, init) => {
+  const response = await fetch(path, init);
+  const text = await response.text();
+  let body = null; try { body = JSON.parse(text); } catch (_) {}
+  if (!response.ok) throw new Error(body?.error?.message || text || response.statusText);
+  return body;
+};
+const failed = (r) => r?.baseline?.quality?.status === 'fail';
+
+// ---------------------------------------------------------------- header and banners
+function renderHeader() {
+  const s = report?.server || {};
+  const active = status.active;
+  shell.status.innerHTML = `<span class="status ${active ? 'live' : ''}"><i></i>${active ? 'BENCHMARKING' : 'IDLE'}</span>`;
+  UI.facts(shell.meta, [
+    ['model', fmt.esc(s.model || status.model || '–')],
+    ['hardware', s.hardware ? fmt.esc(hardwareLine(s.hardware)) : null],
+    ['build', s.build ? UI.build(s.build) : null],
+    ['fingerprint', fmt.esc(report?.fingerprint || status.fingerprint || '–')],
+    ['ready in', Number.isFinite(status.readiness_s) ? secs(status.readiness_s) : null],
+    ['controls', fmt.esc(status.auth || '')],
+  ]);
+  const scary = failed(report);
+  document.body.classList.toggle('scary', scary);
+  $('failure').hidden = !scary;
+  if (scary) {
+    const bad = report.baseline.quality.checks.filter((c) => c.status === 'fail').map((c) => c.title);
+    $('failure-detail').textContent = `failed: ${bad.join(', ')} · every export is watermarked UNVERIFIED`;
+  }
+}
+function hardwareLine(hw) {
+  const used = (hw.gpus || []).filter((g) => g.used);
+  const gpus = used.length ? used : (hw.gpus || []);
+  const name = gpus[0] ? gpus[0].name.replace(/^NVIDIA /, '').replace(/ Blackwell.*/, '') : 'GPU';
+  const sparks = (hw.sparks || []).length;
+  return `${gpus.length}× ${name}${sparks ? ` + ${sparks}× Spark` : ''}`;
+}
+
+// ---------------------------------------------------------------- live strip
+function renderStrip() {
+  const active = status.active;
+  $('strip').hidden = !active;
+  if (!active) return;
+  const p = progress && progress.run === active.id ? progress : null;
+  $('strip-panel').textContent = p?.title || active.panel;
+  $('strip-label').textContent = p?.label || '';
+  $('strip-progress').style.width = `${(100 * (p?.fraction ?? active.fraction ?? 0)).toFixed(1)}%`;
+  $('strip-eta').textContent = secs(p?.eta_s ?? active.eta_s);
+  const live = p?.live || {};
+  $('strip-rate').textContent = Number.isFinite(live.tok_s) ? fmt.n1(live.tok_s) : '–';
+  $('strip-active').textContent = live.active ?? '–';
+  UI.svg.sparkline($('strip-spark'), rates, { color: 'target', height: 26 });
+}
+
+// ---------------------------------------------------------------- panels
+function panelIds() {
+  const ids = ['baseline', 'hardware', 'configuration'];
+  for (const p of catalog.panels) if (!ids.includes(p.id)) ids.push(p.id);
+  for (const p of report?.panels || []) if (!ids.includes(p.id)) ids.push(p.id);
+  return ids;
+}
+function info(id) { return catalog.panels.find((p) => p.id === id) || { id, title: id }; }
+function result(id) { return (report?.panels || []).find((p) => p.id === id); }
+
+function panelState(id) {
+  if (status.active && status.active.panel === id && report && status.active.id === report.id) return 'running';
+  if (id === 'baseline') return report?.baseline ? (report.baseline.quality.status === 'pending' ? 'running' : 'done') : 'not run';
+  if (id === 'hardware' || id === 'configuration') return report ? 'done' : 'not run';
+  const r = result(id);
+  if (!r) return 'not run';
+  return r.status === 'pending' ? 'queued' : r.status;
+}
+function hasData(id) {
+  if (!report) return false;
+  if (id === 'baseline') return !!report.baseline;
+  if (id === 'hardware' || id === 'configuration') return true;
+  return (result(id)?.passes || []).length > 0;
+}
+
+function renderPanels() {
+  const host = $('panels');
+  const ids = panelIds();
+  for (const el of [...host.children]) if (!ids.includes(el.dataset.id)) el.remove();
+  ids.forEach((id, index) => {
+    let card = host.querySelector(`[data-id="${id}"]`);
+    if (!card) {
+      card = document.createElement('section');
+      card.className = 'panel';
+      card.dataset.id = id;
+      card.innerHTML = `<div class="panel-head"><h2></h2><span class="state"></span><span class="hint"></span>
+        <div class="ctl"><button class="btn icon play" title="Run one pass of this panel">▶</button>
+        <span class="seg"><button data-mode="chart">CHART</button><button data-mode="table">TABLE</button></span>
+        <div class="menu"><button class="btn icon exp" title="Export this panel">⤓</button><div hidden></div></div></div></div>
+        <div class="pbar" hidden><div class="progress"><span></span></div><span class="pl"></span></div>
+        <div class="desc"></div><div class="chart"></div><div class="table tablewrap" hidden></div>`;
+      card.querySelector('.play').onclick = () => runPanel(id);
+      card.querySelectorAll('.seg button').forEach((b) => b.onclick = () => { store.set(`bench.mode.${id}`, b.dataset.mode); renderPanels(); });
+      const exp = card.querySelector('.exp');
+      exp.onclick = (e) => { e.stopPropagation(); const m = exp.nextElementSibling; m.hidden = !m.hidden; };
+      host.appendChild(card);
+    }
+    if (host.children[index] !== card) host.insertBefore(card, host.children[index]);
+    const meta = info(id);
+    const title = id === 'baseline' ? 'Basic card + quick quality' : (meta.title || id);
+    card.classList.toggle('wide', id === 'baseline');
+    card.classList.toggle('failed', id === 'baseline' && failed(report));
+    card.querySelector('h2').textContent = title;
+    const state = panelState(id);
+    const st = card.querySelector('.state');
+    st.textContent = state + (result(id)?.passes?.length > 1 ? ` · ${result(id).passes.length} passes` : '');
+    st.className = `state ${state}`;
+    card.querySelector('.hint').textContent = id === 'baseline' && report?.baseline
+      ? `${secs(report.baseline.seconds)} · ${report.baseline.quality ? report.baseline.quality.checks.length : 0} checks`
+      : (Number.isFinite(meta.estimate_s) && meta.estimate_s >= 1 ? `≈ ${secs(meta.estimate_s)} per pass` : '');
+    const busy = !!status.active;
+    card.querySelector('.play').disabled = busy || (meta.unavailable != null);
+    card.querySelector('.play').title = meta.unavailable || (id === 'baseline' ? 'Run the baseline (once per server and configuration)' : 'Run one pass of this panel');
+    const mode = store.get(`bench.mode.${id}`) || 'chart';
+    card.querySelectorAll('.seg button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.mode === mode)));
+    // Progress of the running panel.
+    const pbar = card.querySelector('.pbar');
+    const running = state === 'running' && progress && progress.panel === id;
+    pbar.hidden = !running;
+    if (running) {
+      pbar.querySelector('span').style.width = `${(100 * progress.panel_fraction).toFixed(1)}%`;
+      pbar.querySelector('.pl').textContent = `${progress.label || ''} · ETA ${secs(progress.eta_s)}`;
+    }
+    const desc = card.querySelector('.desc');
+    desc.textContent = hasData(id) ? '' : (meta.unavailable ? `Unavailable: ${meta.unavailable}` : (meta.description || ''));
+    desc.hidden = !desc.textContent;
+    const exportMenu = card.querySelector('.exp + div');
+    exportMenu.innerHTML = report && hasData(id) ? ['svg', 'png'].map((k) =>
+      `<a href="/v1/bench/runs/${report.id}/panel-${id}.${k}" target="_blank" rel="noopener">panel-${id}.${k}</a>`).join('') : '<span class="empty">nothing to export yet</span>';
+    const chart = card.querySelector('.chart'), table = card.querySelector('.table');
+    chart.hidden = mode !== 'chart' || !hasData(id);
+    table.hidden = mode !== 'table' || !hasData(id);
+    if (hasData(id)) {
+      if (mode === 'chart') {
+        const width = Math.max(320, Math.round((chart.clientWidth || card.clientWidth - 28) / 40) * 40);
+        const src = `/v1/bench/runs/${report.id}/panel-${id}.svg?bare=${width}&rev=${revs[id] || 0}`;
+        let img = chart.querySelector('img');
+        if (!img) { img = document.createElement('img'); img.alt = `${title} chart`; }
+        if (img.dataset.src !== src) {
+          // Swap only once the new image is ready, so a filling chart never flickers.
+          const next = new Image();
+          next.onload = () => { img.src = src; if (!img.isConnected) chart.appendChild(img); };
+          next.src = src;
+          img.dataset.src = src;
+        }
+      } else {
+        table.innerHTML = tableFor(id);
+      }
+    }
+  });
+}
+
+const tableHtml = (columns, rows, cls = []) => `<table><thead><tr>${columns.map((c, i) => `<th class="${i === 0 ? 'l' : ''}">${fmt.esc(c)}</th>`).join('')}</tr></thead>
+  <tbody>${rows.map((r, j) => `<tr class="${cls[j] || ''}">${r.map((v, i) => `<td class="${i === 0 ? 'l' : (String(v).length > 40 ? 'wrap' : '')}">${typeof v === 'number' ? fmt.n1(v) : fmt.esc(v ?? '')}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+
+function tableFor(id) {
+  if (id === 'baseline') {
+    const b = report.baseline;
+    const rows = b.card.decode.map((d) => {
+      const r = d.runs[0] || {};
+      return [`C1 decode · ${d.content}`, d.tok_s, r.completion_tokens, r.ttft_s * 1000, r.decode_s];
+    });
+    if (b.card.prefill) { const p = b.card.prefill; rows.push(['8K prefill', p.tok_s, p.prompt_tokens, p.ttft_s * 1000, '']); }
+    const checks = b.quality.checks.map((c) => [c.title, c.status, c.summary, c.seconds]);
+    return tableHtml(['measurement', 'tok/s', 'tokens', 'TTFT ms', 'decode s'], rows)
+      + tableHtml(['check', 'status', 'result', 'seconds'], checks);
+  }
+  if (id === 'hardware') {
+    const hw = report.server.hardware;
+    const gpus = (hw.gpus || []).map((g) => [`GPU ${g.index}${g.used ? '' : ' (not used)'}`, g.name, g.memory_mib ? `${(g.memory_mib / 1024).toFixed(0)} GiB` : '',
+      g.sm_count ?? '', g.power_limit_w ? `${g.power_limit_w.toFixed(0)} / ${(g.power_max_w || 0).toFixed(0)} W` : '', g.pcie || '']);
+    const sparks = (hw.sparks || []).map((s) => [`Spark rank ${s.rank}`, s.name || '', s.address, '', '', '']);
+    const ports = (hw.fabric || []).map((p) => [`${p.device}/${p.port}`, p.active ? 'active' : 'down', `${p.link_gbps} Gb/s`, p.netdev || '', (p.subnets || []).join(' '), p.pcie || '']);
+    return tableHtml(['device', 'model', 'memory', 'SMs', 'power cap', 'PCIe'], [...gpus, ...sparks])
+      + tableHtml(['port', 'state', 'link', 'netdev', 'subnets', 'PCIe'], ports)
+      + `<p class="note">driver ${fmt.esc(hw.driver || '?')} · CUDA ${fmt.esc(hw.cuda || '?')} · ${fmt.esc(hw.rails || '')}</p>`;
+  }
+  if (id === 'configuration') {
+    const c = report.server.configuration;
+    const settings = c.settings || [];
+    const differs = (s) => s.source !== 'default' && s.value !== s.default;
+    const rows = settings.map((s) => [s.name, s.value ?? '∅', s.default ?? '∅', s.source]);
+    return tableHtml(['tensor group', 'formats'], (c.quant || []).map((q) => [q.group, q.formats.join(' + ')]))
+      + tableHtml(['option', 'value', 'default', 'source'], rows, settings.map((s) => differs(s) ? 'differs' : ''));
+  }
+  const r = result(id);
+  return (r.passes || []).map((pass, i) => {
+    if (pass && pass.table) return `<h3 class="label">pass ${i + 1}</h3>` + tableHtml(pass.table.columns, pass.table.rows);
+    const rows = Object.entries(pass || {}).filter(([, v]) => typeof v !== 'object').map(([k, v]) => [k, v]);
+    return `<h3 class="label">pass ${i + 1}</h3>` + tableHtml(['field', 'value'], rows);
+  }).join('') + (r.error ? `<p class="banner">${fmt.esc(r.error)}</p>` : '');
+}
+
+// ---------------------------------------------------------------- runs, exports, import
+function renderRuns() {
+  const select = $('runs');
+  const options = runs.map((r) => `<option value="${r.id}">${fmt.esc(r.created.replace('T', ' ').slice(0, 16))} · ${fmt.esc(r.profile)} · ${fmt.esc(r.status)}${r.quality_failed ? ' · ⚠' : ''}</option>`);
+  select.innerHTML = options.join('') || '<option value="">no runs yet</option>';
+  if (report) select.value = report.id;
+  const menu = $('export-menu');
+  menu.innerHTML = report ? ['report.svg', 'report.png', 'card.png', 'card.svg', 'report.json'].map((f) =>
+    `<a href="/v1/bench/runs/${report.id}/${f}" target="_blank" rel="noopener"${f.endsWith('json') ? ` download="report-${report.id.slice(0, 8)}.json"` : ''}>${f}</a>`).join('') : '<span class="empty">no report</span>';
+  $('run-note').textContent = report ? `${report.profile} · ${report.status}${report.error ? ' · ' + report.error : ''}` : '';
+}
+$('runs').onchange = (e) => { follow = false; load(e.target.value); };
+$('export-report').onclick = (e) => { e.stopPropagation(); $('export-menu').hidden = !$('export-menu').hidden; };
+document.addEventListener('click', () => { $('export-menu').hidden = true; document.querySelectorAll('.exp + div').forEach((m) => m.hidden = true); });
+$('load-json').onchange = async (e) => {
+  const file = e.target.files[0]; if (!file) return;
+  try {
+    const body = await api('/v1/bench/import', { method: 'POST', headers: { 'content-type': 'application/json' }, body: await file.text() });
+    follow = false; await refreshRuns(); await load(body.id);
+  } catch (error) { alert(`Could not load ${file.name}: ${error.message}`); }
+  e.target.value = '';
+};
+$('cancel').onclick = async () => {
+  if (!status.active || !confirm('Cancel the running benchmark?')) return;
+  try { await api(`/v1/bench/runs/${status.active.id}/cancel`, { method: 'POST' }); } catch (error) { alert(error.message); }
+};
+
+async function load(id) {
+  if (!id) return;
+  try { report = await api(`/v1/bench/runs/${id}`); viewing = id; } catch (_) { return; }
+  render();
+}
+async function refreshRuns() { runs = (await api('/v1/bench/runs')).runs || []; renderRuns(); }
+async function refreshCatalog() { catalog = await api('/v1/bench/panels'); }
+function render() { renderHeader(); renderStrip(); renderRuns(); renderPanels(); }
+
+async function start(body) {
+  try {
+    const started = await api('/v1/bench/runs', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    follow = true; viewing = started.id;
+    status = await api('/v1/bench/status');
+    await refreshRuns(); await load(started.id);
+    return true;
+  } catch (error) { alert(`Could not start: ${error.message}`); return false; }
+}
+function runPanel(id) {
+  if (id === 'baseline' || id === 'hardware' || id === 'configuration') return start({ profile: 'share' });
+  return start({ panels: [id] });
+}
+
+// ---------------------------------------------------------------- run dialog
+let choice = { profile: 'share', panels: {}, passes: {} };
+function openDialog() {
+  const host = $('dialog-profiles');
+  host.innerHTML = profiles.map((p) => `<label><input type="radio" name="profile" value="${fmt.esc(p.name)}"${p.name === choice.profile ? ' checked' : ''}>
+    <b>${fmt.esc(p.title)}</b><small>${fmt.esc(p.description || '')}</small></label>`).join('')
+    + `<label><input type="radio" name="profile" value="custom"${choice.profile === 'custom' ? ' checked' : ''}><b>Custom</b><small>Tick panels and passes; save it for later.</small></label>`;
+  host.querySelectorAll('input').forEach((i) => i.onchange = () => pickProfile(i.value));
+  pickProfile(choice.profile);
+  $('dialog').showModal();
+}
+function pickProfile(name) {
+  choice.profile = name;
+  const profile = profiles.find((p) => p.name === name);
+  if (profile) {
+    choice.panels = {}; choice.passes = {};
+    for (const p of profile.panels) { choice.panels[p.id] = true; choice.passes[p.id] = p.passes; }
+  }
+  renderPicks();
+}
+function renderPicks() {
+  const host = $('dialog-panels');
+  host.innerHTML = catalog.panels.map((p) => {
+    const fixed = p.mandatory || p.always;
+    const on = fixed || !!choice.panels[p.id];
+    const passes = choice.passes[p.id] || 1;
+    const est = p.id === 'baseline' ? (p.done ? 'done this server · shared' : `≈ ${secs(p.estimate_s)}`) : `≈ ${secs(p.estimate_s * passes)}`;
+    return `<label class="${p.unavailable ? 'off' : ''}" title="${fmt.esc(p.description || '')}"><input type="checkbox" data-id="${p.id}"${on ? ' checked' : ''}${fixed || p.unavailable ? ' disabled' : ''}>
+      <span>${fmt.esc(p.id === 'baseline' ? 'Basic card + quick quality' : p.title)}${p.mandatory ? ' <small>mandatory</small>' : ''}${p.unavailable ? ` <small>${fmt.esc(p.unavailable)}</small>` : ''}</span>
+      ${fixed ? '<span></span>' : `<input type="number" min="1" max="20" value="${passes}" data-passes="${p.id}" title="passes">`}<small>${est}</small></label>`;
+  }).join('');
+  host.querySelectorAll('input[type=checkbox]').forEach((i) => i.onchange = () => { choice.panels[i.dataset.id] = i.checked; choice.profile = 'custom'; syncProfileRadio(); renderEta(); });
+  host.querySelectorAll('input[type=number]').forEach((i) => i.onchange = () => { choice.passes[i.dataset.passes] = Math.max(1, Math.min(20, +i.value || 1)); choice.profile = 'custom'; syncProfileRadio(); renderPicks(); });
+  renderEta();
+}
+function syncProfileRadio() { const r = document.querySelector(`#dialog-profiles input[value="custom"]`); if (r) r.checked = true; }
+function selected() { return catalog.panels.filter((p) => !p.mandatory && !p.always && choice.panels[p.id]).map((p) => p.id); }
+function renderEta() {
+  const base = catalog.panels.find((p) => p.id === 'baseline');
+  let total = base && !base.done ? base.estimate_s : 0;
+  for (const id of selected()) total += (info(id).estimate_s || 0) * (choice.passes[id] || 1);
+  $('dialog-eta').innerHTML = `≈ ${secs(total)} <small>${catalog.rates?.measured ? 'from this server’s baseline' : 'estimate; the baseline calibrates it'}</small>`;
+}
+$('open-run').onclick = openDialog;
+$('dialog-cancel').onclick = () => $('dialog').close();
+$('dialog-start').onclick = async () => {
+  const passes = Object.fromEntries(selected().map((id) => [id, choice.passes[id] || 1]));
+  const body = choice.profile !== 'custom' && profiles.some((p) => p.name === choice.profile)
+    ? { profile: choice.profile, passes } : { panels: selected(), passes };
+  if (await start(body)) $('dialog').close();
+};
+$('dialog-save').onclick = async () => {
+  const name = prompt('Name of the custom profile:');
+  if (!name) return;
+  const profile = { name, title: name, description: `Custom: ${selected().join(', ') || 'baseline only'}`,
+    panels: selected().map((id) => ({ id, passes: choice.passes[id] || 1 })) };
+  try {
+    await api(`/v1/bench/profiles/${encodeURIComponent(name)}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(profile) });
+    profiles = (await api('/v1/bench/profiles')).profiles; choice.profile = name; openDialog();
+    $('dialog-note').textContent = `saved ${name}`;
+  } catch (error) { alert(error.message); }
+};
+
+// ---------------------------------------------------------------- events
+function connect() {
+  const source = new EventSource('/v1/bench/events');
+  source.onmessage = (message) => {
+    let event; try { event = JSON.parse(message.data); } catch (_) { return; }
+    if (event.type === 'status') {
+      const was = status.active?.id;
+      status = event.status;
+      if (status.active && follow && status.active.id !== viewing) load(status.active.id);
+      if (was && !status.active) { refreshRuns(); refreshCatalog().then(render); }
+      render();
+    } else if (event.type === 'progress') {
+      progress = event;
+      if (status.active) { status.active.panel = event.panel; status.active.eta_s = event.eta_s; status.active.fraction = event.fraction; }
+      if (Number.isFinite(event.live?.tok_s)) { rates.push(event.live.tok_s); if (rates.length > 60) rates.shift(); }
+      renderStrip(); renderPanels();
+    } else if (event.type === 'report') {
+      if (event.run === viewing || (follow && status.active?.id === event.run)) {
+        report = event.report; viewing = report.id;
+        for (const p of report.panels || []) revs[p.id] = (revs[p.id] || 0) + 1;
+        revs.baseline = (revs.baseline || 0) + 1;
+        render();
+      }
+    } else if (event.type === 'partial') {
+      if (event.run === viewing) {
+        revs[event.panel] = (revs[event.panel] || 0) + 1;
+        if (event.panel === 'baseline' && report) report.baseline = event.value;
+        renderPanels(); renderHeader();
+      }
+    }
+  };
+  source.onerror = () => { source.close(); setTimeout(connect, 3000); };
+}
+
+let resizeTimer;
+window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(renderPanels, 200); });
+
+(async () => {
+  try {
+    [status, catalog] = await Promise.all([api('/v1/bench/status'), api('/v1/bench/panels')]);
+    profiles = (await api('/v1/bench/profiles')).profiles || [];
+    await refreshRuns();
+    const wanted = new URLSearchParams(location.search).get('run');
+    await load(wanted || status.active?.id || runs[0]?.id);
+  } catch (error) { console.error(error); }
+  render();
+  connect();
+})();
+})();
+</script>
+</body>
+</html>

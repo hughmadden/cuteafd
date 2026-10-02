@@ -201,9 +201,20 @@ pub fn export(report: &Report, file: &str) -> Option<(&'static str, Vec<u8>)> {
     }
 }
 
-async fn run_file(State(bench): State<Arc<Bench>>, Path((id, file)): Path<(String, String)>) -> Response {
+#[derive(serde::Deserialize, Default)]
+struct FileQuery {
+    /// Panel exports: the body alone at this width (the dashboard's chart view).
+    #[serde(default)]
+    bare: Option<f64>,
+}
+
+async fn run_file(State(bench): State<Arc<Bench>>, Path((id, file)): Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<FileQuery>) -> Response {
     let report = if id == "latest" { bench.latest() } else { bench.report(&id) };
     let Some(report) = report else { return not_found("run") };
+    if let (Some(width), Some(panel)) = (query.bare, file.strip_prefix("panel-").and_then(|f| f.strip_suffix(".svg"))) {
+        return svg(render::report::panel_body_svg(&report, panel, width.clamp(320.0, 2400.0)));
+    }
     if file == "report.json" {
         return ([(header::CONTENT_TYPE, "application/json")], serde_json::to_string_pretty(&report)
             .unwrap_or_default()).into_response();
