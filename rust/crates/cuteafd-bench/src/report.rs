@@ -361,7 +361,7 @@ pub fn short_tokens(v: u64) -> String {
     if v >= 1 << 20 && v % (1 << 20) == 0 {
         return format!("{}M", v >> 20);
     }
-    if v >= 1024 && v % 1024 == 0 {
+    if (1024..1 << 20).contains(&v) && v % 1024 == 0 {
         return format!("{}K", v >> 10);
     }
     match v {
