@@ -18,8 +18,8 @@
 //!
 //! MoE: FP32 router logits, the native softmax top-10 (logits and weights
 //! rounded to BF16 as the reference), the shared expert with its sigmoid
-//! gate, and routed experts on this GPU (FP8 or EXL3 packages, a window of
-//! resident layers) or on the Sparks.
+//! gate, and routed experts on this GPU (FP8/NVFP4 packages fully resident
+//! by default, EXL3 packages with their admitted resident window) or on the Sparks.
 use super::weights::{Qwen4Layer, Qwen4Weights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
@@ -76,13 +76,13 @@ fn gdn_replay_bytes(cfg: &Qwen4Config) -> usize {
     bytes.div_ceil(1024) * 1024
 }
 
-/// Routed experts on this GPU from the TP1 FP8 package: a window of resident
-/// layers, reloaded when a step reaches a layer outside it.
+/// Routed experts on this GPU from the TP1 package. All layers stay resident
+/// unless an explicit diagnostic paging window was requested.
 pub(crate) struct LocalExperts<'a> {
     pub library: &'a NativeLibrary,
     pub tensors: &'a Fp8ExpertTensors,
     pub experts: RefCell<Fp8Experts<'a>>,
-    pub window: usize,
+    pub window: Option<usize>,
     pub loads: RefCell<usize>,
 }
 
@@ -92,7 +92,8 @@ impl LocalExperts<'_> {
         if let Ok(index) = experts.index_of(layer) {
             return Ok(index);
         }
-        if experts.layers.len() >= self.window {
+        let window = self.window.context("local expert layer missing from the admitted resident set")?;
+        if experts.layers.len() >= window {
             experts.layers.remove(0);
         }
         let started = std::time::Instant::now();
@@ -1746,9 +1747,11 @@ impl<'a> Qwen4Engine<'a> {
                     fp8.run(resident, t, w.x.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
                         w.routed.buffer.ptr, self.stream)?;
                 }
-                // The window may drop this layer before the stream drains.
-                // SAFETY: the engine owns this stream.
-                unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+                if local.window.is_some() {
+                    // Diagnostic paging may drop this layer before the stream drains.
+                    // SAFETY: the engine owns this stream.
+                    unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+                }
             }
             Experts::LocalExl3(local) => {
                 self.exchange_window(index, decode, true)?;
@@ -1849,7 +1852,11 @@ impl<'a> Qwen4Engine<'a> {
 
 impl Drop for Qwen4Engine<'_> {
     fn drop(&mut self) {
-        // SAFETY: the engine's stream is drained by its owner before the engine drops.
-        let _ = unsafe { self.library.cuda_event_destroy(self.routes_ready) };
+        // SAFETY: the engine owns this stream and its resident weights. Drain
+        // queued work, including a failed step, before their storage drops.
+        unsafe {
+            let _ = self.library.cuda_stream_synchronize(self.stream);
+            let _ = self.library.cuda_event_destroy(self.routes_ready);
+        }
     }
 }

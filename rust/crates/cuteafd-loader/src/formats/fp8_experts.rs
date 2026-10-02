@@ -192,6 +192,25 @@ impl Fp8ExpertTensors {
         self.tensors.contains_key(&self.name(layer, 0, Fp8Projection::Gate))
     }
 
+    /// Check every requested expert's tensor headers before committing device
+    /// memory to a resident layer set. Some checkpoints have an MTP layer in
+    /// a different format from the backbone; one package cannot run both.
+    pub fn validate_layer(&self, layer: usize) -> Result<()> {
+        for expert in 0..self.shape.experts {
+            for projection in Fp8Projection::ALL {
+                self.check(layer, expert, projection)?;
+                if self.format == ExpertFormat::Nvfp4 {
+                    let weight = self.name(layer, expert, projection);
+                    let name = format!("{}.input_scale", weight.strip_suffix(".weight").unwrap_or(&weight));
+                    let scale = self.located(&name)?;
+                    ensure!(scale.dtype == DType::F32 && scale.bytes == 4,
+                        "{name}: expected one FP32 input scale, found {:?} {:?}", scale.dtype, scale.shape);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn dims(&self, projection: Fp8Projection) -> (usize, usize) {
         let (h, i) = (self.shape.hidden, self.shape.intermediate);
         if projection == Fp8Projection::Down { (h, i) } else { (i, h) }
@@ -417,6 +436,39 @@ mod tests {
 
     fn ranges(tensors: &Fp8ExpertTensors, tp: usize) -> Vec<(usize, usize)> {
         (0..tp).map(|rank| tensors.rank_range(tp, rank).unwrap()).collect()
+    }
+
+    #[test]
+    fn resident_headers_reject_mixed_format_mtp_before_weight_reads() {
+        let mut tensors = catalog(ExpertFormat::Nvfp4, 128);
+        tensors.shape.hidden = 128;
+        tensors.shape.experts = 1;
+        tensors.mtp_layers = true;
+        for projection in Fp8Projection::ALL {
+            let name = tensors.name(3, 0, projection);
+            for (name, dtype, shape, bytes) in [
+                (name.clone(), DType::U8, vec![128, 64], 8192),
+                (format!("{name}_scale"), DType::F8E4M3, vec![128, 8], 1024),
+                (format!("{name}_scale_2"), DType::F32, vec![], 4),
+                (format!("{}.input_scale", name.strip_suffix(".weight").unwrap()), DType::F32, vec![], 4),
+            ] {
+                tensors.tensors.insert(name, Located { shard: "not-read.safetensors".into(), offset: 0,
+                    bytes, dtype, shape });
+            }
+        }
+        tensors.validate_layer(3).unwrap();
+        let gate = tensors.name(3, 0, Fp8Projection::Gate);
+        let input = format!("{}.input_scale", gate.strip_suffix(".weight").unwrap());
+        let scale = tensors.tensors.remove(&input).unwrap();
+        assert!(tensors.validate_layer(3).unwrap_err().to_string().contains(&input));
+        tensors.tensors.insert(input, scale);
+        let mtp = tensors.name(78, 0, Fp8Projection::Gate);
+        tensors.tensors.insert(mtp.clone(), Located { shard: "not-read.safetensors".into(), offset: 0,
+            bytes: 128 * 128, dtype: DType::F8E4M3, shape: vec![128, 128] });
+        let error = tensors.validate_layer(78).unwrap_err().to_string();
+        assert!(error.contains(&mtp) && error.contains("expected packed E2M1 U8"), "{error}");
+        tensors.tensors.remove(&format!("{}_scale", tensors.name(3, 0, Fp8Projection::Down)));
+        assert!(tensors.validate_layer(3).is_err());
     }
 
     #[test]

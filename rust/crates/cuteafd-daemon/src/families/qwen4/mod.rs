@@ -10,7 +10,7 @@ pub(crate) mod serve;
 pub(crate) mod speculate;
 pub(crate) mod weights;
 
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
 use cuteafd_loader::plan::checkpoint::Checkpoint;
@@ -80,9 +80,10 @@ pub(crate) struct EngineArgs {
     /// TP1 FP8 package directory (default `<libdir>/fp8/fp8-qwen4/tp1`).
     #[arg(long)]
     pub fp8_package: Option<PathBuf>,
-    /// FP8 expert layers resident at once with --local-experts (2.4 GiB each).
-    #[arg(long, default_value_t = 16)]
-    pub expert_window: usize,
+    /// Diagnostic paging: keep only N local expert layers resident. By default
+    /// all routed experts stay on the GPU; checkpoints that do not fit need Sparks.
+    #[arg(long, requires = "local_experts")]
+    pub expert_window: Option<usize>,
     /// Most EXL3 expert layers resident at once (the free memory decides first).
     #[arg(long, default_value_t = 48)]
     pub exl3_window: usize,
@@ -271,12 +272,21 @@ impl Opened {
             let directory = args.fp8_package.clone()
                 .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&args.native_lib, 1, tensors.format()));
             let (free, _) = self.library.cuda_memory_info()?;
-            // An empty window: the package and its scratch; layers load on first use.
-            let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, 0..0, 1, 0,
-                args.prefill_rows, free.saturating_sub(args.expert_reserve_gib.min(4) << 30))?;
+            ensure!(args.expert_window != Some(0), "--expert-window must be at least 1");
+            let resident = if args.expert_window.is_some() { 0..0 } else {
+                0..layers + usize::from(args.mtp > 0 && layers == self.cfg.layers)
+            };
+            let started = Instant::now();
+            let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, resident, 1, 0,
+                args.prefill_rows, free.saturating_sub(args.expert_reserve_gib.saturating_mul(1 << 30)))
+                .context("local routed experts must fit with step and prefix-cache reservations; use --peers for Sparks, \
+                    or --expert-window N for diagnostic paging; mixed-format MTP experts need their own native package")?;
+            let loads = experts.layers.len();
+            tracing::info!(layers = loads, window = ?args.expert_window, elapsed_ms = started.elapsed().as_millis() as u64,
+                "Qwen routed experts resident on this GPU");
             return Ok(Some(engine::Experts::Local(engine::LocalExperts {
                 library: &self.library, tensors, experts: std::cell::RefCell::new(experts),
-                window: args.expert_window.max(1), loads: std::cell::RefCell::new(0),
+                window: args.expert_window, loads: std::cell::RefCell::new(loads),
             })));
         }
         if let Some(catalog) = self.experts.as_ref().filter(|c| c.exl3().is_some()) {

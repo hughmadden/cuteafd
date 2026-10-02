@@ -19,6 +19,18 @@ use std::path::{Path, PathBuf};
 /// Parallel readers per layer load.
 const READERS: usize = 16;
 
+/// Admit the whole local expert allocation before allocating any weights or
+/// scratch. Callers keep their step and prefix-cache reservation out of `budget`.
+fn resident_admission(layer_bytes: usize, layers: usize, scratch_bytes: usize, budget: usize) -> Result<usize> {
+    let resident = layer_bytes.checked_mul(layers).context("FP8 resident expert size overflow")?;
+    let required = resident.checked_add(scratch_bytes).context("FP8 expert allocation size overflow")?;
+    ensure!(required <= budget,
+        "FP8 experts need {:.3} GiB resident + {:.3} GiB scratch ({} bytes); budget {:.3} GiB ({} bytes)",
+        resident as f64 / (1u64 << 30) as f64, scratch_bytes as f64 / (1u64 << 30) as f64, required,
+        budget as f64 / (1u64 << 30) as f64, budget);
+    Ok(resident)
+}
+
 /// Environment switch for how FP8 expert packages run prefill row counts:
 /// `auto` (default: FP8 wire rows W8A8, block-scaled E4M3 x E4M3 gate/up; BF16
 /// rows W8A16, exact), `w8a16` (the former programs, weights widened to
@@ -193,6 +205,9 @@ impl<'a> Fp8Experts<'a> {
     /// `rank` of `tp`, with scratch for `capacity` rows.
     pub fn load(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
         layers: std::ops::Range<usize>, tp: usize, rank: usize, capacity: usize, budget: usize) -> Result<Self> {
+        for layer in layers.clone() {
+            tensors.validate_layer(layer)?;
+        }
         // SAFETY: a trusted package for the current device; the owner drains
         // its streams before dropping.
         let module = unsafe { load_module(directory) }
@@ -211,11 +226,8 @@ impl<'a> Fp8Experts<'a> {
             "FP8 package {} ({info:?}) does not serve this checkpoint at TP{tp}", directory.display());
         let top = info.capacity_for(capacity)
             .with_context(|| format!("FP8 package has no capacity for {capacity} rows"))?;
-        let scratch_bytes = module.scratch_bytes(top)?;
-        let resident = Fp8Layer::bytes(tensors, tp)? * layers.len();
-        ensure!(resident + scratch_bytes <= budget,
-            "FP8 experts need {} GiB resident + {} MiB scratch; budget {} GiB", resident >> 30, scratch_bytes >> 20,
-            budget >> 30);
+        let scratch_bytes = module.scratch_bytes(top)?.max(256);
+        resident_admission(Fp8Layer::bytes(tensors, tp)?, layers.len(), scratch_bytes, budget)?;
         let layers = layers.map(|layer| {
             let started = std::time::Instant::now();
             let loaded = Fp8Layer::load(library, tensors, layer, tp, rank)?;
@@ -223,7 +235,7 @@ impl<'a> Fp8Experts<'a> {
                 "FP8 expert layer resident");
             Ok(loaded)
         }).collect::<Result<Vec<_>>>()?;
-        let scratch = DeviceAllocation::new(library, scratch_bytes.max(256))?;
+        let scratch = DeviceAllocation::new(library, scratch_bytes)?;
         Ok(Self { layers, scratch, bf16_module: None, module, tp, rank })
     }
 
@@ -287,5 +299,57 @@ impl<'a> Fp8Experts<'a> {
         let pointers: [*mut c_void; FP8_MOE_POINTERS] =
             [input, ids, weights, w1, s1, w3, s3, w2, s2, out, self.scratch.buffer.ptr];
         module.launch(&pointers, rows, stream)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resident_admission;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct QwenArgs {
+        #[command(flatten)]
+        engine: crate::families::qwen4::EngineArgs,
+    }
+
+    #[derive(Parser)]
+    struct GlmfArgs {
+        #[command(flatten)]
+        engine: crate::families::glm5_flash::EngineArgs,
+    }
+
+    #[test]
+    fn local_expert_paging_requires_an_explicit_diagnostic_window() {
+        let args = ["test", "--snapshot", "/snapshot", "--native-lib", "/native.so", "--local-experts"];
+        let qwen = QwenArgs::try_parse_from(args).unwrap();
+        let glmf = GlmfArgs::try_parse_from(args).unwrap();
+        assert_eq!(qwen.engine.expert_window, None);
+        assert_eq!(glmf.engine.expert_window, None);
+        assert_eq!(qwen.engine.expert_reserve_gib, 12);
+        assert_eq!(glmf.engine.expert_reserve_gib, 12);
+        let paged: Vec<_> = args.into_iter().chain(["--expert-window", "16"]).collect();
+        assert_eq!(QwenArgs::try_parse_from(&paged).unwrap().engine.expert_window, Some(16));
+        assert_eq!(GlmfArgs::try_parse_from(&paged).unwrap().engine.expert_window, Some(16));
+        let no_local = ["test", "--snapshot", "/snapshot", "--native-lib", "/native.so", "--expert-window", "1"];
+        assert!(QwenArgs::try_parse_from(no_local).is_err());
+        assert!(GlmfArgs::try_parse_from(no_local).is_err());
+    }
+
+    #[test]
+    fn resident_admission_includes_every_layer_and_scratch() {
+        let (layer, scratch) = (1_415_589_888, 64 << 20);
+        let required = layer * 48 + scratch;
+        assert_eq!(resident_admission(layer, 48, scratch, required).unwrap(), layer * 48);
+        assert!(resident_admission(layer, 48, scratch, required - 1).is_err());
+        // An explicit paging window admits only the empty initial window's scratch.
+        assert_eq!(resident_admission(layer, 0, scratch, scratch).unwrap(), 0);
+        assert!(resident_admission(layer, 0, scratch, scratch - 1).is_err());
+    }
+
+    #[test]
+    fn resident_admission_rejects_overflow() {
+        assert!(resident_admission(usize::MAX, 2, 0, usize::MAX).is_err());
+        assert!(resident_admission(usize::MAX, 1, 1, usize::MAX).is_err());
     }
 }

@@ -21,8 +21,9 @@
 //!
 //! FFN: dense SwiGLU (clamped at 10), or the MoE: FP32 router logits, the
 //! native sigmoid top-8 select, the shared expert, and routed experts from
-//! the checkpoint's FP8 on this GPU (the `fp8-glmf` TP1 package, a window of
-//! resident layers reloaded as the step walks the layers) or on the Sparks.
+//! the checkpoint's FP8/NVFP4 on this GPU (the TP1 package, all routed layers
+//! resident by default; a paging window only when explicitly requested for
+//! diagnostics) or on the Sparks.
 use super::weights::{GlmfLayer, GlmfWeights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
@@ -69,15 +70,14 @@ pub(crate) const PREFILL_LANES: usize = 2;
 const MIN_LANE_ROWS: usize = 256;
 const HC: usize = 4;
 
-/// Routed experts on this GPU from the TP1 FP8 package: a window of
-/// resident layers, reloaded from the checkpoint when a step reaches a layer
-/// outside it (layer-major prefill loads each layer once per step).
+/// Routed experts on this GPU from the TP1 package. All layers stay resident
+/// unless an explicit diagnostic paging window was requested.
 pub(crate) struct LocalExperts<'a> {
     pub library: &'a NativeLibrary,
     pub tensors: &'a Fp8ExpertTensors,
     pub experts: RefCell<Fp8Experts<'a>>,
-    /// Most layers resident at once.
-    pub window: usize,
+    /// Explicit diagnostic paging; absent for the fully resident serving path.
+    pub window: Option<usize>,
     pub loads: RefCell<usize>,
 }
 
@@ -87,7 +87,8 @@ impl LocalExperts<'_> {
         if let Ok(index) = experts.index_of(layer) {
             return Ok(index);
         }
-        if experts.layers.len() >= self.window {
+        let window = self.window.context("local expert layer missing from the admitted resident set")?;
+        if experts.layers.len() >= window {
             experts.layers.remove(0);
         }
         let started = std::time::Instant::now();
@@ -1501,9 +1502,11 @@ impl<'a> GlmfEngine<'a> {
                     fp8.run(resident, t, w.x.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
                         w.routed.buffer.ptr, self.stream)?;
                 }
-                // The window may drop this layer before the stream drains.
-                // SAFETY: the engine owns this stream.
-                unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+                if local.window.is_some() {
+                    // Diagnostic paging may drop this layer before the stream drains.
+                    // SAFETY: the engine owns this stream.
+                    unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+                }
             }
             Experts::LocalExl3(local) => {
                 shared()?;
@@ -1777,8 +1780,12 @@ impl StepLogits {
 
 impl Drop for GlmfEngine<'_> {
     fn drop(&mut self) {
-        // SAFETY: the engine's stream is drained by its owner before the engine drops.
-        let _ = unsafe { self.library.cuda_event_destroy(self.routes_ready) };
+        // SAFETY: the engine owns this stream and its resident weights. Drain
+        // queued work, including a failed step, before their storage drops.
+        unsafe {
+            let _ = self.library.cuda_stream_synchronize(self.stream);
+            let _ = self.library.cuda_event_destroy(self.routes_ready);
+        }
         if let Some(ops) = self.ops.take() {
             let ops = ops.into_inner();
             for event in ops.pool.into_iter().chain(ops.pending.into_iter().flat_map(|(_, a, b)| [a, b])) {
