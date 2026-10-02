@@ -724,18 +724,32 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
         let long: Vec<u32> = tokens.iter().copied().cycle().take(n).collect();
         let mut allocator = engine::Allocator::new(engine.pages, engine.rings);
         let mut times = Vec::new();
-        for _ in 0..args.bench_prefill {
+        for run in 0..=args.bench_prefill {
             let mut fresh = allocator.admit(n)?;
             let started = Instant::now();
             let mut last = None;
             for chunk in long.chunks(engine.prefill_capacity()) {
                 last = engine.prefill_forced(&mut fresh, chunk, false, None, None)?;
             }
-            times.push(started.elapsed().as_secs_f64());
+            let elapsed = started.elapsed().as_secs_f64();
+            if run == 0 {
+                // The first full shape pays workspace allocation and first-use kernels.
+                // Match the serving benchmark's untimed warm batch per shape.
+                println!("prefill warm-up: {n} tokens in {:.1} ms", 1e3 * elapsed);
+                allocator.release(fresh);
+                continue;
+            }
+            times.push(elapsed);
             // Diagnostics: the first prefill's last-row logits (FP32), e.g. to
             // compare pipelined and serial prefill.
             if let (Ok(path), Some(logits), 1) = (std::env::var("CUTEAFD_MIMO_BENCH_LOGITS"), last, times.len()) {
                 std::fs::write(&path, logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())
+                    .with_context(|| format!("writing {path}"))?;
+            }
+            if let (Ok(path), 1) = (std::env::var("CUTEAFD_MIMO_BENCH_KV"), times.len()) {
+                // Read both ranks only after the timed step. This gate includes every
+                // full-attention record and the SWA rows the next decode can read.
+                std::fs::write(&path, kv_rows(engine, &fresh, 0, n)?)
                     .with_context(|| format!("writing {path}"))?;
             }
             allocator.release(fresh);
@@ -960,23 +974,36 @@ fn prefill_digest(engine: &engine::MimoEngine<'_>, placement: &mut engine::MimoP
 /// SWA layers the ring rows still held), for byte comparison.
 fn kv_rows(engine: &engine::MimoEngine<'_>, placement: &engine::MimoPlacement, from: usize, to: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    for layer in 0..engine.weights.layers.len() {
-        let (attention, buffer, record) = engine.kv_layer(layer);
-        let first = match attention {
-            cuteafd_loader::families::mimo_v2::MimoAttention::Full => from,
-            cuteafd_loader::families::mimo_v2::MimoAttention::Sliding => from.max(to.saturating_sub(engine.cfg.window)),
-        };
-        for position in first..to {
-            let offset = match attention {
-                cuteafd_loader::families::mimo_v2::MimoAttention::Full => placement.slot(position)? as usize * record,
-                cuteafd_loader::families::mimo_v2::MimoAttention::Sliding => placement.ring_slot(position) as usize * record,
-            };
-            ensure!(offset + record <= buffer.bytes, "KV row outside its buffer");
-            let mut bytes = vec![0u8; record];
-            opened_copy(engine, &mut bytes, cuteafd_ffi::CuteafdDeviceBuffer {
-                ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes: record, ..buffer })?;
-            out.extend(bytes);
-        }
+    for rank in 0..engine.ranks() {
+        engine.on(rank, || {
+            // SAFETY: this engine owns the stream of the rank holding these records.
+            // Every head-split wait has its matching push queued before this gate.
+            unsafe { engine.library.cuda_stream_synchronize(engine.stream_of(rank))? };
+            for layer in 0..engine.weights.layers.len() {
+                let (attention, buffer, record) = engine.kv_layer_on(rank, layer);
+                let (mut position, run_rows) = match attention {
+                    cuteafd_loader::families::mimo_v2::MimoAttention::Full => (from, engine::PAGE_ROWS),
+                    cuteafd_loader::families::mimo_v2::MimoAttention::Sliding =>
+                        (from.max(to.saturating_sub(engine.cfg.window)), engine::RING_ROWS),
+                };
+                while position < to {
+                    // A page or ring run is contiguous even when logical pages are not.
+                    let rows = (to - position).min(run_rows - position % run_rows);
+                    let offset = match attention {
+                        cuteafd_loader::families::mimo_v2::MimoAttention::Full => placement.slot(position)? as usize * record,
+                        cuteafd_loader::families::mimo_v2::MimoAttention::Sliding => placement.ring_slot(position) as usize * record,
+                    };
+                    let bytes = rows * record;
+                    ensure!(offset + bytes <= buffer.bytes, "KV rows outside their buffer");
+                    let start = out.len();
+                    out.resize(start + bytes, 0);
+                    engine.library.copy_d2h(&mut out[start..], cuteafd_ffi::CuteafdDeviceBuffer {
+                        ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..buffer })?;
+                    position += rows;
+                }
+            }
+            Ok(())
+        })?;
     }
     Ok(out)
 }
@@ -1055,7 +1082,7 @@ fn prefill_prompt(args: &GoldenArgs, engine: &engine::MimoEngine<'_>, allocator:
     let prompt = &tokens[..args.prefill.unwrap_or(tokens.len()).min(tokens.len())];
     let mut placement = allocator.admit(prompt.len() + extra + engine::DECODE_ROWS)?;
     let mut last = None;
-    for chunk in prompt.chunks(engine.prefill_rows) {
+    for chunk in prompt.chunks(engine.prefill_capacity()) {
         last = engine.prefill_device(&mut placement, chunk, false, None, None)?;
     }
     let last = last.context("the check needs every layer")?.row_host(engine.library, 0)?;
