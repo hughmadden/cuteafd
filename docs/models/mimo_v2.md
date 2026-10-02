@@ -1,0 +1,55 @@
+# MiMo V2 (Flash / V2.6 Pro)
+
+Hybrid full / sliding-window GQA attention with learned sinks, sigmoid top-8
+experts without a shared expert.
+
+## Supported checkpoints / quants
+
+- `XiaomiMiMo/MiMo-V2-Flash` — FP8 128x128-block routed experts
+  (`mimo:fp8`).
+- `XiaomiMiMo/MiMo-V2.6-Pro-RL` — native MXFP4 routed experts
+  (`mimop:fp8`, E2M1 + UE8M0 per 32).
+
+## Engineering summary
+
+- Attention: GQA full attention on some layers, 128-token sliding-window
+  GQA with a learned per-layer sink bias on the rest; sinks are taken on SWA
+  layers only. NeoX RoPE on a partial head width; int8 full-attention KV
+  (FP32 scale per 32 dims) in paged pools, BF16 SWA rings.
+- No shared expert; sigmoid noaux_tc router with `e_score_correction_bias`
+  (FP32 weight on V2 Flash, BF16 on V2.6 Pro).
+- Routed experts: V2 Flash runs `mimo:fp8` (E4M3 + FP32 128x128 scales,
+  Spark TP2/TP4/TP6, coordinator TP1 local); V2.6 Pro runs `mimop:fp8`
+  (MXFP4, Spark TP2/TP6, coordinator TP1 local).
+- Speculator: native MTP layers (SWA attention, dense FFN, `eh_proj`
+  fusion) or a DFlash external drafter — DFlash is the measured-best
+  speculator for V2.6 Pro.
+- V2.6 Pro's `qkv_proj` ships fused and TP-interleaved per checkpoint shard
+  with its own per-shard FP8 scale grid; the loader de-interleaves it.
+- RTX/Spark layouts: head split (KV partitioned, one hidden all-reduce per
+  layer) is the default on 2 RTX for both members of this family — the
+  first family where splitting attention across two GPUs measured as a
+  clear win, since its o_proj and attention weights are unusually large
+  next to the dense path.
+- Prefix cache: merged for both V2 Flash and V2.6 Pro.
+
+## Known limits
+
+- V2.6 Pro's prefill is intake-bound on the Spark-to-coordinator exchange of
+  partial rows at larger TP; Spark-side reduction of partials is a parked
+  experiment (small gain, bandwidth-bound either way).
+- V2.6 Pro's native checkpoint needs all six Sparks to fit its MXFP4 expert
+  footprint; V2 Flash fits a smaller pool.
+
+## Changelog
+
+| Version | Date | Change | Basic eval |
+| --- | --- | --- | --- |
+| v0 | 2026-10-02 | First release | — |
+
+## Additional benchmarks
+
+| Engine version | Date | Profile | Hardware | Report |
+| --- | --- | --- | --- | --- |
+
+_No additional benchmark reports yet._

@@ -1,0 +1,54 @@
+# Qwen 3.8 Flash Next
+
+`qwen4_exp`: Gated DeltaNet (GDN) linear attention with a full-attention
+layer every fourth, a PLE n-gram memory table, and fused expert tensors.
+
+## Supported checkpoints / quants
+
+- `Qwen/Qwen3.8-Flash-Next` official release — FP8 128x128-block routed
+  experts (`qwen4:fp8`).
+- EXL3 K4.25 PLE publications of the same checkpoint (`qwen4:exl3-k45`).
+- NVIDIA ModelOpt NVFP4 — routed experts run W4A16 (`qwen4:nvfp4`).
+
+## Engineering summary
+
+- Attention: Gated DeltaNet linear recurrence on most layers, full GQA with
+  an indexer every fourth layer.
+- Shared expert with a sigmoid gate; hyper-connections (low-rank) mix the
+  residual stream alongside the router.
+- PLE n-gram memory table: a mapped table gathering 16 rows of 160 per token
+  from pinned host RAM (or GPU), with bounded prefetch.
+- Routed experts: 512 experts, top-10, hidden 2560 / intermediate 640, SiLU
+  unclamped, stored as one fused `[experts, ...]` tensor per projection per
+  layer; EXL3 K4/K5, FP8 128x128 blocks, or ModelOpt NVFP4 group-16; a local
+  (RTX-resident, TP1) expert path is supported.
+- Speculator: a native MTP layer (full attention, 512 experts, and a
+  hyper-connection feedback path) exists in the checkpoint but is not yet
+  wired into the plain serve path.
+- RTX/Spark layouts: fits comfortably on one RTX with local experts (~73 GB
+  for the EXL3 or FP8 package); Spark EXL3 runs at TP3 today since the
+  640-wide intermediate does not split evenly across TP4.
+- Prefix cache: merged — 256-row units over the full-attention layers, a
+  combined GDN-state + PLE mark, with n-gram history recomputed from token
+  ids rather than cached.
+
+## Known limits
+
+- FP8 experts have no Spark TP layout yet: 640 is not evenly divisible the
+  way the FP8 MoE kernel currently tiles larger TP degrees, so the Spark
+  path today is EXL3-only.
+- The native MTP drafter's weights are present in the checkpoint but not
+  yet served; CuteAFD verifies copy-window drafts only.
+
+## Changelog
+
+| Version | Date | Change | Basic eval |
+| --- | --- | --- | --- |
+| v0 | 2026-10-02 | First release | — |
+
+## Additional benchmarks
+
+| Engine version | Date | Profile | Hardware | Report |
+| --- | --- | --- | --- | --- |
+
+_No additional benchmark reports yet._
