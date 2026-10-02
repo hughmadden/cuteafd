@@ -529,6 +529,9 @@ Everything after v0 lands as v1. Helpers: read AGENTS.md, then pick the top
 open item; each names its branch (pushed WIP) and the next step. Merge green
 steps into `work/p0`; tag `v1.0.0` when the list's top half is done.
 
+Current agent integration: `codex/v1`, isolated from the orchestration checkout.
+The user chooses release cuts; development fixes below do not cut a release.
+
 1. **Device-driven Spark exchange, shared by every family** — branch
    [`work/v41-device`](https://github.com/tpurtell/cuteafd/tree/work/v41-device). Today every family does 2–3
    blocking host round trips per MoE layer (router ids D2H + sync, host-built
@@ -569,18 +572,21 @@ steps into `work/p0`; tag `v1.0.0` when the list's top half is done.
 4. **Model-specific issues found** (fix in v1, not essential for v0):
    - GLM 5.3 Flash (likely GLM 5.3): a JSON-schema request whose grammar
      accepts the stop token keeps decoding; xgrammar `fill_bitmask` then fails
-     and the whole batch fails.
+     and the whole batch fails. Fixed in `f3c7505`: every compiler stop token
+     terminates a speculative grammar proposal before another matcher call.
    - MiMo V2.6 Pro: two-lane prefill runs only without the head split, so 8K
      prefill is slower on 2 RTX (4.79 s) than on 1 RTX (3.18 s).
    - V4.1 on 1 RTX: startup is serial (Sparks load all 40 layers at ~0.4 GB/s
      each, ~205 s, including 5 the RTX holds; then the coordinator). Start the
      coordinator first, skip RTX-held layers on the Sparks, speed up the Spark
-     layer load. 2 RTX: 108 s.
+     layer load. 2 RTX: 108 s. `be7049f` qualifies coordinator-first auto
+     placement and the worker layer boundary; Spark read throughput remains open.
    - DeepSeek V4 Flash: the native expert format refuses 2 Sparks (min config
      needs 4); V4.1 TP3 fits per `cuteafd plan` but is unqualified.
    - Benchmarks: reasoning-effort panel re-run after the pool back-off fix;
      turn-end cache check is informational (greedy non-repeat); code sandbox
-     lacks network isolation; tool-eval-bench reaches images with the next
+     network isolation is fixed in `fd74aaf` (required network/PID namespaces,
+     unavailable rather than unisolated execution); tool-eval-bench reaches images with the next
      `./build.sh`.
    - From the v0 Release smoke matrix (10 of 22 cards fail the gate;
      logs in `~/.cache/cuteafd/builds/v0/kit/smoke-state/`):
@@ -588,15 +594,24 @@ steps into `work/p0`; tag `v1.0.0` when the list's top half is done.
         ("matcher terminated after accepting the stop token"); GLM 5.3 Flash
         EXL3 max, tr3 4bpw min/max and MiMo V2.6 Pro min/max abort the stream
         mid-response. Same grammar/matcher path: stop when the grammar accepts
-        the stop token, never fail the batch.
+        the stop token, never fail the batch. Stop-token handling is fixed in
+        `f3c7505`; model smoke cards still need their own reruns.
      b. A worker failure mid-stream drops the SSE connection with no error
-        event (all families).
+        event (all families). Fixed in `f3c7505`: one structured error event,
+        preserving the backend cause, with no successful terminal event.
      c. Speculation not lossless: V4 Pro EXL3 K2 dSpark diverges at token 4
         (1.95 nat), C4 ≠ C1 at token 15; GLM 5.3 Flash tr3 DFlash2 0.84 nat;
         GLM 5.3 EXL3 0.57 nat. Suspect multi-row verify numerics/state.
+        `3010e1c` adds strict GLM Flash rejected-suffix causality, committed
+        state and continuation checks. Those checks pass; the remaining
+        serial/wide numerical divergence is under investigation, not fixed.
      d. Batch invariance: C4 ≠ C1 greedy on V4 Pro, GLM 5.3, GLM 5.3 Flash.
-     e. NVFP4 local experts on one RTX (GLM 5.3 Flash, Qwen 3.8): ~10 s per
-        forward — a slow SM120 fallback.
+     e. NVFP4 local experts on one RTX (GLM 5.3 Flash, Qwen 3.8): the severe
+        slowdown came from implicit bounded paging, not a slow SM120 kernel.
+        Fixed in `4c02f2f`: local experts are fully resident by default,
+        admitted with scratch before allocation; paging requires an explicit
+        window. Qwen NVFP4 A/B logits are byte-exact. GLM Flash's local expert
+        set does not fit one RTX and now reports the admission failure.
      f. GLM 5.3 Flash and Qwen ignore `RTX_GPUS=2` (no head split), so their
         max layout is 1 RTX + 4 Sparks.
      g. Qwen 3.8 EXL3: 84 tok/s with 4 Sparks vs 261 on one RTX alone.
@@ -612,6 +627,8 @@ steps into `work/p0`; tag `v1.0.0` when the list's top half is done.
    W4A16 GB10 prefill (14.3 vs EXL3 9.1 ms/layer TP4).
 6. **RTX 5090 audit and claim**: hard-coded `4*188` grid clamps and the
    per-tensor FP8 GEMM grid sized for 188 SMs; one SM120 build must serve both.
+   `6d4ea7a` derives expert quantizer grids from each engine's GPU and removes
+   the CLI's fixed SM default. Card-specific AOT/ABI guards remain to qualify.
 7. **Phase 6 placement planner** (incl. cold components such as the vision
    encoder on a Spark) and **multimodal input** (official encoders only).
 8. **NVFP4 follow-ups**: native per-tensor FP8 decode with static scales.
@@ -650,7 +667,8 @@ steps into `work/p0`; tag `v1.0.0` when the list's top half is done.
    ([`work/split-intake`](https://github.com/tpurtell/cuteafd/tree/work/split-intake), slower). Revisit only on new evidence.
 11. **Housekeeping**: prune agent test images on raptor; delete
     `~/.cache/cuteafd/builds/{n10-rel,bisect-rel}` on ostrich (root); refresh
-    the inherited script-test failure ids in AGENTS.md.
+    the inherited script-test failure ids in AGENTS.md. The stale fixture and
+    sibling-checkout failures are fixed in `37adfc4`; current failing ids are empty.
 
 ## Backlog (lowest priority: only when nothing planned is left)
 
