@@ -48,13 +48,35 @@ impl<'a> Fp8Weight<'a> {
         let packed = DeviceAllocation::new(library, n * k)?;
         let scale = DeviceAllocation::new(library, n * k / 128 * 4)?;
         // SAFETY: `w` is a live [n, k] BF16 weight; the new buffers hold the packed copy.
-        unsafe { library.fp8_w8a16_pack(w, packed.buffer.ptr, scale.buffer.ptr, n, k, scales.code(), stream)? };
+        let launched = unsafe { library.fp8_w8a16_pack(w, packed.buffer.ptr, scale.buffer.ptr, n, k, scales.code(), stream) };
+        if let Err(error) = launched {
+            // SAFETY: source, destination and scale remain live here. A native
+            // launch error may follow queued work; drain before their owners
+            // leave this scope, including the new destination allocations.
+            let drained = unsafe { library.cuda_stream_synchronize(stream) };
+            return match drained {
+                Ok(()) => Err(error),
+                Err(drain) => {
+                    // Completion is unknown. Retain these allocations until
+                    // process teardown rather than running cuda_free on Drop.
+                    std::mem::forget(packed);
+                    std::mem::forget(scale);
+                    Err(error.context(format!("FP8 destinations quarantined after failed drain: {drain}")))
+                }
+            };
+        }
         Ok(Self { packed, scale, n, k })
     }
 
     /// Device bytes of the copy and its scales.
     pub fn bytes(&self) -> usize {
         self.n * self.k + self.n * self.k / 128 * 4
+    }
+
+    /// A failed stream drain cannot prove that queued reads/writes retired.
+    /// Keep the owning allocations live until process teardown.
+    pub fn quarantine(self) {
+        std::mem::forget(self);
     }
 
     /// `out` [rows, n'] = `x` [rows, k] @ rows `first..first + n'` of the

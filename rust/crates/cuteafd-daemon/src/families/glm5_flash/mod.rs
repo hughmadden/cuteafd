@@ -108,13 +108,16 @@ pub(crate) struct EngineArgs {
     /// stream mean after its target layers and drafts on this GPU.
     #[arg(long)]
     pub draft: Option<PathBuf>,
-    /// Sequences the drafter keeps a context for and drafts for at once.
-    #[arg(long, default_value_t = 8)]
+    /// Maximum members of one draft batch, independent of context slots.
+    #[arg(long, default_value_t = 16)]
     pub draft_sequences: usize,
-    /// Draft through E4M3 copies of the drafter's GEMM weights and of the LM
-    /// head (false: BF16; the committed tokens are the same either way).
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    pub draft_fp8: bool,
+    /// Context slots (default max(20, draft_sequences)); target head is shared.
+    #[arg(long)]
+    pub draft_context_slots: Option<usize>,
+    /// Explicit calibration-free E4M3 quantization of own drafter GEMMs.
+    /// Unset/false preserves checkpoint BF16; no dual resident matrices.
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub draft_fp8: Option<bool>,
     /// Scale rule of the FP8 copies made from BF16 weights at load (KDA
     /// projections, LM head, drafter): amax / 448, the smallest power of two
     /// >= it (pow2), or per block whichever of the two leaves the smaller
@@ -128,6 +131,40 @@ pub(crate) struct EngineArgs {
     pub l2: crate::shared::l2_prefetch::L2PrefetchArgs,
     #[command(flatten)]
     pub token_io: crate::shared::token_io::TokenIoArgs,
+}
+
+#[cfg(test)]
+mod draft_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Parse {
+        #[command(flatten)]
+        engine: EngineArgs,
+    }
+
+    #[test]
+    fn drafter_defaults_are_checkpoint_bf16_with_independent_capacities() {
+        let parsed = Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native"])
+            .unwrap().engine;
+        assert_eq!(parsed.draft_fp8, None);
+        assert_eq!(parsed.draft_sequences, 16);
+        assert_eq!(parsed.draft_context_slots.unwrap_or(20.max(parsed.draft_sequences)), 20);
+    }
+
+    #[test]
+    fn explicit_fp8_option_and_context_batch_limits_are_forwarded() {
+        for (value, expected) in [("true", true), ("false", false)] {
+            let parsed = Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+                "--draft-fp8", value, "--draft-context-slots", "20", "--draft-sequences", "16"])
+                .unwrap().engine;
+            assert_eq!(parsed.draft_fp8, Some(expected));
+            assert_eq!((parsed.draft_context_slots, parsed.draft_sequences), (Some(20), 16));
+        }
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--draft-fp8", "auto"]).is_err());
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -269,6 +306,14 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     let checkpoint = Checkpoint::open(&args.snapshot)?;
     ensure!(checkpoint.missing_shards.is_empty(), "checkpoint shards missing: {:?}", checkpoint.missing_shards);
     let cfg = GlmNextConfig::read(&args.snapshot)?;
+    if let Some(snapshot) = &args.draft {
+        let head = checkpoint.tensors.iter().find(|t| t.meta.name == "lm_head.weight")
+            .context("DFlash target has no lm_head.weight")?;
+        crate::families::glm5::dflash::check_target_bf16_head(&head.meta,
+            cfg.hidden, cfg.vocab_size, args.fp8_head)?;
+        crate::families::glm5::dflash::check_checkpoint(snapshot, args.draft_fp8,
+            args.draft_context_slots, args.draft_sequences)?;
+    }
     // The expert geometry is process-wide and must be fixed before the native
     // library loads (its expert helpers size rows from it).
     let geometry = cuteafd_core::ExpertGeometry::GLM5_FLASH;
@@ -332,11 +377,11 @@ impl Opened {
             let mask = engine.embedding.host_rows(&[cfg.mask_token])?;
             let file = crate::families::glm5::dflash::prefetch(snapshot).join()
                 .map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
-            let mut drafter = crate::families::glm5::dflash::GlmDrafter::load(&self.library, snapshot, file, stream,
-                args.draft_sequences, args.draft_sequences, mask, true)?;
-            if args.draft_fp8 {
-                drafter.enable_fp8(engine.weights.head.buffer.ptr, args.fp8_scales)?;
-            }
+            let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation
+                ::from_fp8_option(args.draft_fp8);
+            let drafter = crate::families::glm5::dflash::GlmDrafter::load(&self.library, snapshot, file, stream,
+                args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
+                mask, true, representation, args.fp8_scales)?;
             engine.drafter = Some(drafter);
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash2 drafter resident");
         }

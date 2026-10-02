@@ -52,13 +52,16 @@ pub(crate) struct EngineArgs {
     /// layers and drafts on the coordinator GPU.
     #[arg(long)]
     pub draft: Option<PathBuf>,
-    /// Sequences the drafter keeps a context for and drafts for at once.
+    /// Maximum members of one draft batch, independent of context slots.
     #[arg(long, default_value_t = 16)]
     pub draft_sequences: usize,
-    /// Draft through E4M3 copies of the drafter's GEMM weights and of the LM
-    /// head (false: BF16; the committed tokens are the same either way).
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    pub draft_fp8: bool,
+    /// Context slots (default max(20, draft_sequences)); target head is shared.
+    #[arg(long)]
+    pub draft_context_slots: Option<usize>,
+    /// Explicit calibration-free E4M3 quantization of own drafter GEMMs.
+    /// Unset/false preserves checkpoint BF16; no dual resident matrices.
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub draft_fp8: Option<bool>,
     /// Scale rule of the FP8 copies made from BF16 weights at load: amax /
     /// 448, the smallest power of two >= it (pow2), or per block whichever of
     /// the two leaves the smaller error (best).
@@ -83,6 +86,40 @@ pub(crate) struct EngineArgs {
     pub prefill_w8a16: bool,
     #[command(flatten)]
     pub token_io: crate::shared::token_io::TokenIoArgs,
+}
+
+#[cfg(test)]
+mod draft_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Parse {
+        #[command(flatten)]
+        engine: EngineArgs,
+    }
+
+    #[test]
+    fn drafter_defaults_are_checkpoint_bf16_with_independent_capacities() {
+        let parsed = Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native"])
+            .unwrap().engine;
+        assert_eq!(parsed.draft_fp8, None);
+        assert_eq!(parsed.draft_sequences, 16);
+        assert_eq!(parsed.draft_context_slots.unwrap_or(20.max(parsed.draft_sequences)), 20);
+    }
+
+    #[test]
+    fn explicit_fp8_option_and_context_batch_limits_are_forwarded() {
+        for (value, expected) in [("true", true), ("false", false)] {
+            let parsed = Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+                "--draft-fp8", value, "--draft-context-slots", "20", "--draft-sequences", "16"])
+                .unwrap().engine;
+            assert_eq!(parsed.draft_fp8, Some(expected));
+            assert_eq!((parsed.draft_context_slots, parsed.draft_sequences), (Some(20), 16));
+        }
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--draft-fp8", "auto"]).is_err());
+    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -195,6 +232,11 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     cuteafd_core::set_expert_geometry(catalog.routed_experts().geometry()?)
         .map_err(|g| anyhow::anyhow!("geometry already {g:?}"))?;
     let cfg = GlmDsaConfig::read(&args.snapshot)?;
+    if let Some(snapshot) = &args.draft {
+        dflash::check_target_bf16_head(&catalog.tensor("lm_head.weight")?.metadata,
+            cfg.hidden, cfg.vocab_size, false)?;
+        dflash::check_checkpoint(snapshot, args.draft_fp8, args.draft_context_slots, args.draft_sequences)?;
+    }
     let library = unsafe { NativeLibrary::load(&args.native_lib) }?;
     library.cuda_set_device(args.device)?;
     Ok(Opened { snapshot: args.snapshot.clone(), catalog, cfg, library })
@@ -264,11 +306,11 @@ impl Opened {
             let mask = engine.embedding.host_rows(&[cfg.mask_token])?;
             let file = draft_file.context("drafter prefetch")?.join()
                 .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
-            let mut drafter = dflash::GlmDrafter::load(&self.library, snapshot, file, stream, args.draft_sequences,
-                args.draft_sequences, mask, false)?;
-            if args.draft_fp8 {
-                drafter.enable_fp8(engine.weights.head.buffer.ptr, args.fp8_scales)?;
-            }
+            let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation
+                ::from_fp8_option(args.draft_fp8);
+            let drafter = dflash::GlmDrafter::load(&self.library, snapshot, file, stream,
+                args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
+                mask, false, representation, args.fp8_scales)?;
             engine.drafter = Some(drafter);
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash2 drafter resident");
         }
@@ -532,10 +574,11 @@ fn bench_verify(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
         drafter.update(&(0..n).map(|r| dflash::ContextRow { tap_row: r, slot: 0, position: start - n + r })
             .collect::<Vec<_>>())?;
         println!("drafter step (anchors at position {start}, median of 7):");
-        let mut counts: Vec<usize> = (0..).map(|i| 1usize << i).take_while(|&s| s < drafter.slots)
-            .chain([drafter.slots]).collect();
+        let max_batch = dflash::ReplayDrafter::sequences(drafter);
+        let mut counts: Vec<usize> = (0..).map(|i| 1usize << i).take_while(|&s| s < max_batch)
+            .chain([max_batch]).collect();
         if !args.bench_sequences.is_empty() {
-            ensure!(args.bench_sequences.iter().all(|&s| s >= 1 && s <= drafter.slots), "--bench-sequences past the slots");
+            ensure!(args.bench_sequences.iter().all(|&s| s >= 1 && s <= max_batch), "--bench-sequences past the draft batch capacity");
             counts = args.bench_sequences.clone();
         }
         for sequences in counts {
@@ -544,7 +587,7 @@ fn bench_verify(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
             let mut times = Vec::new();
             for round in 0..9 {
                 let started = Instant::now();
-                let drafts = drafter.draft_device(&seqs, &engine.embedding, engine.weights.head.buffer.ptr)?;
+                let drafts = drafter.draft_device(&seqs, &engine.embedding, &engine.weights.head)?;
                 if round >= 2 {
                     times.push(started.elapsed().as_secs_f64() * 1e3);
                 }
@@ -775,7 +818,7 @@ fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
         let anchor = sequence[position];
         let timer = Instant::now();
         let draft = drafter.draft_device(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
-            &engine.embedding, engine.weights.head.buffer.ptr)?;
+            &engine.embedding, &engine.weights.head)?;
         draft_seconds += timer.elapsed().as_secs_f64();
         drafts.push((position, draft.into_iter().next().context("draft")?));
         let logits = engine.verify(&mut [(&mut placement, 1)], &[anchor], transport.as_deref_mut().map(|t| (t, runtime)),
@@ -854,7 +897,7 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
         let anchor = tokens[position];
         let timer = Instant::now();
         let draft = drafter.draft_device(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
-            &engine.embedding, engine.weights.head.buffer.ptr)?.remove(0);
+            &engine.embedding, &engine.weights.head)?.remove(0);
         draft_seconds += timer.elapsed().as_secs_f64();
         let reference = &ref_tokens[index * drafts_per..][..drafts_per];
         exact += usize::from(draft.tokens == reference);
