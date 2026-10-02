@@ -117,6 +117,18 @@ fn lane_prefill_capacity(rows: usize, transport: bool) -> usize {
     if transport && rows >= 2 * MIN_LANE_ROWS { 2 * rows } else { rows }
 }
 
+/// Only attention geometry changes under a head split. Rank 1 runs split
+/// target layers exclusively; rank 0 also runs unsplit MTP attention in its
+/// decode workspace. Its prefill workspace never runs MTP, but may run an
+/// unsplit target layer, so shrink it only when every target layer is split.
+pub(super) fn attention_workspace_geometry(rank: usize, ranks: usize, decode: bool,
+    all_target_layers_split: bool) -> MimoAttentionWorkspace {
+    match (rank, ranks, decode, all_target_layers_split) {
+        (1, 2, _, _) | (0, 2, false, true) => MimoAttentionWorkspace::PartitionedHeads { ranks: 2 },
+        _ => MimoAttentionWorkspace::Global,
+    }
+}
+
 /// Most rows the FP8 LM head program takes (MmaFp8Gemv's M tile).
 pub(crate) const FP8_ROWS: i32 = 16;
 
@@ -639,12 +651,12 @@ impl<'a> MimoEngine<'a> {
             }
         }
         let spark = lead && matches!(self.experts, Some(Experts::Spark { .. }));
+        let attention = attention_workspace_geometry(rank, self.ranks(), decode,
+            self.weights.layers.iter().all(|layer| layer.split));
         let layout = MimoWorkspaceLayout::new(&self.cfg, MimoWorkspaceOptions {
             rows: t as u64, decode, lead, with_head, spark, max_context: self.max_context as u64,
             pool_pages: self.pages as u64, kv_cache: self.kv_cache,
-            // Preserve the current allocation route. Head-width reductions
-            // are independently qualified before selecting a partition here.
-            attention: MimoAttentionWorkspace::Global, native_scratch_bytes: scratch as u64,
+            attention, native_scratch_bytes: scratch as u64,
             head_workspace_bytes: VOCABULARY_HEAD_WORKSPACE as u64,
         })?;
         let size = |bytes| usize::try_from(bytes).context("MiMo workspace size does not fit this process");
@@ -2227,7 +2239,28 @@ impl<'a> MimoEngine<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{lane_prefill_capacity, MIN_LANE_ROWS};
+    use super::{attention_workspace_geometry, lane_prefill_capacity, MimoAttentionWorkspace, MIN_LANE_ROWS};
+
+    #[test]
+    fn split_prefill_and_peer_workspaces_use_only_their_attention_heads() {
+        let split = MimoAttentionWorkspace::PartitionedHeads { ranks: 2 };
+        assert_eq!(attention_workspace_geometry(0, 2, false, true), split);
+        assert_eq!(attention_workspace_geometry(1, 2, false, true), split);
+        assert_eq!(attention_workspace_geometry(1, 2, true, true), split);
+        // The attached peer always contains split shares, even if a future
+        // target mix still requires global buffers on the leading GPU.
+        assert_eq!(attention_workspace_geometry(1, 2, false, false), split);
+    }
+
+    #[test]
+    fn lead_decode_and_unsplit_target_workspaces_preserve_global_attention() {
+        let global = MimoAttentionWorkspace::Global;
+        // MTP uses rank 0's decode workspace and whole-model programs.
+        assert_eq!(attention_workspace_geometry(0, 2, true, true), global);
+        assert_eq!(attention_workspace_geometry(0, 2, false, false), global);
+        assert_eq!(attention_workspace_geometry(0, 1, false, true), global);
+        assert_eq!(attention_workspace_geometry(0, 1, true, true), global);
+    }
 
     #[test]
     fn advertised_prefill_capacity_accepts_every_prompt_tail() {
