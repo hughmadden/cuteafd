@@ -5,6 +5,7 @@ pub mod qkv;
 pub mod resident;
 pub mod capacity;
 pub mod projection;
+pub mod weight_policy;
 pub mod decode_graph;
 pub mod workspace;
 pub use config::{MimoAttention, MimoKvCache, MimoV2Config};
