@@ -449,6 +449,7 @@ impl<'a> NativeTp4Wave<'a> {
                 id: self.output.buffer.device_id }),
         };
         ensure!(device_id.id == routed.ids.device_id, "device wave origin GPU differs from the router's");
+        device.link.expect(1);
         device_id.run(|| unsafe {
             crate::shared::memory::chain::join(self.library, origin)?;
             device.link.dispatch(routed.layer, count, 0, routed.ids, routed.routing, routed.expert_input, origin)

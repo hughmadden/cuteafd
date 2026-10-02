@@ -902,6 +902,10 @@ impl<'a> Engine<'a> {
                     table_stride: tables.c4_table_stride,
                     previous,
                 };
+                if let Some(link) = device.filter(|_| layer >= local_layers) {
+                    // Announced before the replay can publish it: the proxy spins for it.
+                    link.expect(1);
+                }
                 self.replay_on(0, key, segment)?;
                 if let Some(w1) = w1 {
                     // Rank 1's segments: layer 0 after rank 0's, then each next one before the
