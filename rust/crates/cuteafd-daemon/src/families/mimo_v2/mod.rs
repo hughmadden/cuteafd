@@ -6,6 +6,7 @@ pub(crate) mod engine;
 pub(crate) mod mtp;
 pub(crate) mod prefix;
 pub(crate) mod serve;
+mod serving_owners;
 pub(crate) mod weights;
 mod head;
 mod split;
@@ -526,7 +527,7 @@ pub(crate) struct Opened {
     pub catalog: cuteafd_loader::OfficialV41Catalog,
     pub checkpoint: Checkpoint,
     pub cfg: MimoV2Config,
-    pub library: NativeLibrary,
+    pub library: std::sync::Arc<NativeLibrary>,
     pub weight_formats: ResolvedWeightFormats,
 }
 
@@ -549,7 +550,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     cuteafd_core::set_expert_geometry(catalog.routed_experts().geometry()?)
         .map_err(|g| anyhow::anyhow!("expert geometry already {g:?}"))?;
     // SAFETY: the library is the cuteafd native shim built for this engine.
-    let library = unsafe { NativeLibrary::load(&args.native_lib) }?;
+    let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&args.native_lib) }?);
     library.cuda_set_device(args.device)?;
     Ok(Opened { catalog, checkpoint, cfg, library, weight_formats })
 }
@@ -572,6 +573,14 @@ impl Opened {
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         let split_device = split::requested_device(&self.cfg, args.device, args.split_device,
             |name| programs.spec(name).is_ok())?;
+        if split_device.is_some() {
+            self.library.peer_abort_available().context("MiMo head split needs the terminal-abort native ABI")?;
+        }
+        if args.peers.is_some() && !args.skip_experts && !args.local_experts
+            && self.cfg.dense.iter().take(args.layers.unwrap_or(self.cfg.layers)).any(|&dense| !dense) {
+            self.library.rdma_rc_endpoint_quiesce_available()
+                .context("MiMo Spark terminal ownership needs fallible QP quiescence before allocation")?;
+        }
         if self.weight_formats.head == MimoProjectionRepresentation::Fp8 {
             let name = format!("{}_head_fp8", self.cfg.program_family()?);
             let spec = programs.spec(&name).with_context(|| format!(
@@ -719,9 +728,32 @@ impl Opened {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
         let result = body(&engine, preflight.host_config);
+        let submission_failed = engine.submission_failed();
+        let shutdown = engine.terminal_shutdown();
+        let result = match (result,shutdown) {
+            (Err(primary),Err(cleanup))=> {
+                tracing::error!(error=%format!("{cleanup:#}"),"terminal shutdown also failed; preserving primary body error");
+                Err(primary)
+            }
+            (Ok(_),Err(cleanup))=>Err(cleanup),
+            (result,Ok(()))=>result,
+        };
+        if engine.retain_queued_storage() {
+            // The publisher/drain failed. Keep every device, pinned, graph,
+            // transport and draft owner plus the native module loaded until
+            // process teardown. No sequence counter is rewritten or reset.
+            let terminal = engine.terminal_error();
+            std::mem::forget(engine);
+            std::mem::forget(self.library.clone());
+            if let Err(error) = self.library.cuda_set_device(args.device) {
+                tracing::error!(%error, "restoring device after terminal owner quarantine");
+            }
+            return Err(result.err().unwrap_or(terminal));
+        }
+        let result = body_after_shutdown(result, submission_failed, || engine.terminal_error());
         drop(engine);
         // SAFETY: both stream handles were created here and remain owned here.
-        // Cleanup follows engine teardown; queued-wait cancellation is separate.
+        // All native/transport/copy consumers have drained before engine Drop.
         unsafe {
             teardown::finish(result, peer_stream.is_some(), |step| match step {
                 teardown::CleanupStep::LeadStream => {
@@ -739,6 +771,13 @@ impl Opened {
             })
         }
     }
+}
+
+/// Normal owner retirement closes an engine too. Only a failed submission
+/// invalidates a successful body result; an existing typed primary stays intact.
+pub(super) fn body_after_shutdown<T>(result: Result<T>, submission_failed: bool,
+    terminal_error: impl FnOnce() -> anyhow::Error) -> Result<T> {
+    if submission_failed && result.is_ok() { Err(terminal_error()) } else { result }
 }
 
 impl Opened {
@@ -774,9 +813,13 @@ impl Opened {
         let executors: Vec<u64> = (0..peers.len())
             .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
             .collect::<Result<_>>()?;
-        let link = || crate::shared::spark_intake::SparkLink::new(&self.library, &peers, &executors,
+        let link = || -> Result<crate::shared::spark_intake::SparkLink<'_>> {
+            let mut link=crate::shared::spark_intake::SparkLink::new(&self.library, &peers, &executors,
             u32::try_from(engine::expert_capacity(args.prefill_rows))?, cuteafd_transport::TcpTransportConfig { timing: false,
-                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2);
+                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2)?;
+            link.enable_terminal_ownership(self.library.clone())?;
+            Ok(link)
+        };
         let mut transport = link()?;
         // Pipelined prefill (CUTEAFD_MIMO_PREFILL_LANES, 2 by default; 1 keeps
         // it serial): a second transport carries the first row lane's waves.

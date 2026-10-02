@@ -139,6 +139,18 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
         self.engine.full_kv_owners().into_iter().chain(self.arenas.iter().cloned()).collect()
     }
 
+    /// Component-only positional storage; no attention/model state is claimed.
+    #[cfg(test)]
+    pub(super) fn terminal_fixture(engine: &'e MimoEngine<'a>) -> Result<Self> {
+        let arenas = (0..engine.ranks()).map(|rank| engine.on(rank, || {
+            let device = Device { library: engine.library, id: engine.library.cuda_get_device()? };
+            Allocation::new(device, 4096).map(Rc::new)
+        })).collect::<Result<Vec<_>>>()?;
+        Ok(Self { engine, full: Vec::new(), states: Vec::new(),
+            rank_mark_bytes: vec![4096; engine.ranks()], mark_bytes: 4096 * engine.ranks(),
+            arenas, slots: 1, partial: false })
+    }
+
     /// Zero every state's rows before `len` (a partial restore's empty window).
     fn empty_window(&self, ring: usize, len: usize) -> Result<()> {
         for state in &self.states {
@@ -261,8 +273,7 @@ impl PrefixFamily for MimoPrefix<'_, '_> {
 
     fn drain(&self) -> Result<(), BoxError> {
         for rank in 0..self.engine.ranks() {
-            let device = Device { library: self.engine.library, id: self.engine.kv_layer_on(rank, 0).1.device_id };
-            device.run(|| {
+            self.engine.on(rank, || {
                 // SAFETY: the engine owns this stream on the selected rank.
                 unsafe { self.engine.library.cuda_stream_synchronize(self.engine.stream_of(rank)) }
             })?;
