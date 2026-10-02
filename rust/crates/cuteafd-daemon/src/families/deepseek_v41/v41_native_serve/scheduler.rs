@@ -90,6 +90,7 @@ impl Active<'_> {
     fn emit_one(&mut self, token: u32) -> Result<[Option<InferenceChunk>; 3]> {
         ensure!(!self.job.events.is_closed(), "client disconnected");
         if let Some(constraint) = &mut self.constraint { constraint.accept(token)?; }
+        crate::shared::probe::token(&self.job.probe, token);
         self.anchor = token;
         self.tokens.push(token);
         self.generated += 1;
@@ -115,7 +116,8 @@ impl Active<'_> {
             push(InferenceChunk::Finish { finish_reason: if token == 1 { InferenceFinishReason::Stop }
                 else { InferenceFinishReason::Length } });
             self.finished = true;
-            self.cacheable = true;
+            // A cold benchmark probe leaves nothing behind.
+            self.cacheable = !crate::shared::probe::cold(&self.job.probe);
         }
         Ok(chunks)
     }
@@ -284,7 +286,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     requests.attach_images(lease, crate::families::deepseek_v41::v41_requests::RequestImages::new(images)?)?;
                 }
                 let restore_started = Instant::now();
-                let hit = prefixes.restore(prompt, &image_keys, id, lease, requests, draft.as_deref_mut())?;
+                let hit = if crate::shared::probe::cold(&job.probe) { None }
+                    else { prefixes.restore(prompt, &image_keys, id, lease, requests, draft.as_deref_mut())? };
                 let restore = (restore_started, Instant::now());
                 // Check the declared lifetime budget of every active request,
                 // including the new request, against the actual source pages.
@@ -353,6 +356,11 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                         else { "cuteafd-native-fp4-kv" }.into()),
                     prompt_usage: PromptUsage { prompt_tokens: prompt.len(), prompt_cache_hit_tokens: cached },
                 }))?;
+                match crate::shared::probe::scoring(&job.probe) {
+                    // Teacher-forced scoring needs every prefill row's logits: not on V4.1 yet.
+                    Some(_) => if let Some(probe) = &job.probe { probe.fail("teacher-forced scoring is not available on V4.1") },
+                    None => crate::shared::probe::admitted(&job.probe, "deepseek_v41", &prompt, cached),
+                }
                 console::totals::admitted(prompt.len(), cached);
                 counted = true;
                 console::lifecycle(console::Event::Admit { id, at: restore.0, prompt: prompt.len() as u32,
@@ -369,7 +377,10 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 else { prefill(lib, runtime, first, second, requests, first_transport,
                     second_transport, lease, &prompt, args.prefill_batch_tokens as usize, &job,
                     draft.as_deref_mut(), &mut || prefixes.prefill_hold())? };
-                if cached != prompt.len() {
+                if crate::shared::probe::wants_first(&job.probe) {
+                    crate::shared::probe::host_row(&job.probe, prompt.len(), &scores.logits()?);
+                }
+                if cached != prompt.len() && !crate::shared::probe::cold(&job.probe) {
                   if let Err(error) = prefixes.retain(SnapshotKind::Prompt, &prompt, &image_keys, &scores, id, lease, requests, draft.as_deref_mut()) {
                     tracing::warn!(%error, "prompt prefix was not retained");
                   }
@@ -1196,6 +1207,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     for (&slot, input) in members.iter().zip(&mut inputs) {
         let r = active[slot].as_ref().unwrap();
         if let Some(constraint) = &r.constraint { constraint.truncate_proposal(input)?; }
+        if crate::shared::probe::no_speculation(&r.job.probe) { input.truncate(1); }
     }
     // This path runs only while the other lane is empty.
     if let Some(draft) = draft.as_deref_mut() {

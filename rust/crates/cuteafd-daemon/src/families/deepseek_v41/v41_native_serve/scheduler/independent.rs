@@ -91,6 +91,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
                 for (&slot, input) in members.iter().zip(&mut inputs) {
                     let r = active[slot].as_ref().unwrap();
                     if let Some(constraint) = &r.constraint { constraint.truncate_proposal(input)?; }
+                    if crate::shared::probe::no_speculation(&r.job.probe) { input.truncate(1); }
                 }
                 // Lengths are chosen from this lane's proposals and routes only;
                 // the peer lane's activity selects the shared-regime fit.
