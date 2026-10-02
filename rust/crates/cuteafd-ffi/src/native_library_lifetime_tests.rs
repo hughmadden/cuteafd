@@ -39,6 +39,7 @@ fn failed_drain_marker_retains_module_and_pinned_staging() -> Result<()> {
         .ensure(&library, 64)?;
     library.quarantine_module_after_failed_drain();
     library.quarantine_module_after_failed_drain(); // Repeated caller drains are harmless.
+    assert!(library.is_quarantined_after_failed_drain());
     drop(library);
     assert_eq!(
         fixture.events()?,
@@ -53,6 +54,7 @@ fn failed_drain_marker_retains_module_and_pinned_staging() -> Result<()> {
     // The failure is local to one NativeLibrary, not a global cleanup switch.
     let healthy = Fixture::build()?;
     let library = healthy.load()?;
+    assert!(!library.is_quarantined_after_failed_drain());
     library
         .sync_h2d_staging
         .lock()

@@ -137,20 +137,27 @@ fn split_copy_failure_drains_before_releasing_source_or_destination() -> Result<
 
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
-fn failed_peer_copy_drain_retains_lead_source_but_releases_finished_rank() -> Result<()> {
+fn failed_peer_copy_drain_retains_all_split_outputs_without_calling_free() -> Result<()> {
     let fixture = Fixture::build()?;
     let library = fixture.load()?;
     fixture.configure_pack(&library, 0, 1)?;
     fixture.configure_drain_after(&library, 1)?;
     let checkpoint = checkpoint(&fixture, &[("weight", DType::Bf16, &[8, 256])])?;
     let formats = BTreeMap::new();
+    // A preceding layer's unrelated owners also unwind after a loader error.
+    // Their frees must not synchronize with the failed peer's queued work.
+    let preceding_layer = DeviceAllocation::new(&library, 512)?;
+    let preceding_pin = crate::shared::memory::HostAllocation::new(&library, 512)?;
     let result = loader(&library, &checkpoint, &formats).o_proj("weight", 2);
     assert!(result.is_err());
     drop(result);
+    drop(preceding_layer);
+    drop(preceding_pin);
     drop(library);
     let events = fixture.events()?;
-    assert_eq!((count(&events, 'D'), count(&events, 'C'), count(&events, 'S')), (3, 2, 2), "{events}");
-    assert_eq!(count(&events, 'd'), 1, "only the completed rank is reclaimable: {events}");
+    assert_eq!((count(&events, 'D'), count(&events, 'C'), count(&events, 'S')), (4, 2, 2), "{events}");
+    assert_eq!(count(&events, 'd'), 0,
+        "even a completed rank's cudaFree can synchronize with pending peer work: {events}");
     assert!(!events.contains(['F', 'U']), "{events}");
     assert!(fixture.resident()?);
     Ok(())
@@ -168,11 +175,15 @@ fn successful_loaders_reclaim_storage_and_unload_normally() -> Result<()> {
         } else { checkpoint(&fixture, &[("weight", DType::Bf16, &[8, 256])])? };
         let formats = BTreeMap::new();
         let loader = loader(&library, &checkpoint, &formats);
+        let preceding_layer = DeviceAllocation::new(&library, 512)?;
+        let preceding_pin = crate::shared::memory::HostAllocation::new(&library, 512)?;
         match path {
             0 => drop(loader.rows(&["weight".into()])?),
             1 => drop(loader.o_proj("weight", 2)?),
             _ => drop(loader.fp8_projection("weight", 1, false)?),
         }
+        drop(preceding_layer);
+        drop(preceding_pin);
         drop(library);
         let events = fixture.events()?;
         assert_eq!(count(&events, 'D'), count(&events, 'd'), "{events}");

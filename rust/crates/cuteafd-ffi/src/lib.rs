@@ -1590,14 +1590,22 @@ impl NativeLibrary {
     /// until process teardown after a stream drain failed to prove completion.
     /// Idempotent; normal loads and launches do not take an extra owner.
     ///
-    /// This only protects module code and library-owned staging. The caller
-    /// must separately retain every source, destination, scratch allocation,
+    /// This protects module code and library-owned staging. The daemon's shared
+    /// device/pinned allocation owners also honor the irreversible marker. The
+    /// caller must separately retain other source, destination, scratch owners,
     /// and other native owner that queued work may still use, and abandon the
     /// failed operation. It does not repair arbitrary pre-engine load errors
     /// or make subsequent work safe. Other NativeLibrary instances are not
     /// quarantined.
     pub fn quarantine_module_after_failed_drain(&self) {
         self.quarantine_after_failed_drain.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether native completion was irreversibly left unproved. Allocation
+    /// owners must retain their storage on this path: even an unrelated
+    /// cudaFree can synchronize with another stream's pending peer work.
+    pub fn is_quarantined_after_failed_drain(&self) -> bool {
+        self.quarantine_after_failed_drain.load(Ordering::Relaxed)
     }
 
     pub fn version(&self) -> Result<String> {

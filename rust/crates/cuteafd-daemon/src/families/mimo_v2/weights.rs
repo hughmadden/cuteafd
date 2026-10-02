@@ -548,8 +548,9 @@ impl<'a> MimoLoader<'a> {
             self.upload(bytes)
         })?;
         let mut whole = Some(whole);
-        let out = (0..ranks).map(|rank| {
-            self.on_rank(rank, |stream| {
+        let mut completed = Vec::with_capacity(ranks);
+        for rank in 0..ranks {
+            let operand = self.on_rank(rank, |stream| {
                 if ranks == 1 {
                     // One GPU: the uploaded weight itself.
                     let out = whole.take().context("o_proj")?;
@@ -573,15 +574,21 @@ impl<'a> MimoLoader<'a> {
                     self.library.quarantine_module_after_failed_drain();
                     std::mem::forget(out);
                     std::mem::forget(whole.take());
+                    // cudaFree of a completed rank's independent output can still
+                    // synchronize with this pending peer copy. Retain every split
+                    // output on the unproved path so error return cannot block on
+                    // unrelated allocation destruction.
+                    std::mem::forget(std::mem::take(&mut completed));
                     return Err(queued.err().unwrap_or_else(|| anyhow::anyhow!("split projection completion failed"))
                         .context(format!("split projection owners and native module quarantined after failed drain: {drain}")));
                 }
                 queued?;
                 Ok(out)
-            })
-        }).collect();
+            })?;
+            completed.push(operand);
+        }
         drop(whole);
-        out
+        Ok(completed)
     }
 
     /// The FP8 checkpoint weights `names` concatenated by rows (as
