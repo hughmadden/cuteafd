@@ -116,11 +116,16 @@ impl Family for Glm {
         if component != Component::RoutedExpert && modelopt {
             return Some(Hint {
                 what: format!("{} stored as {} (a ModelOpt release's dense parts)", component.label(), formats.join(", ")),
-                how: "PLAN.md Phase 5 S2: serve-glmf runs NVFP4 dense MLPs natively and quantizes BF16 to \
-                      128x128 FP8 blocks where its programs read FP8; serve-glm prefills per-tensor FP8 MLPs as \
-                      static W8A8 and quantizes BF16 MLA / shared-expert weights to FP8 blocks at load \
-                      (CUTEAFD_GLM_BF16=native: the BF16 programs on the checkpoint's own weights)."
-                    .into(),
+                how: if self.id == "glm5_flash" {
+                    "serve-glmf runs NVFP4 dense MLPs natively. Other MLA and dense/shared block projections \
+                     require checkpoint-native E4M3 with FP32 128x128 scales; add missing BF16 consumers/exporters \
+                     instead of implicit quantization. Native FP8 side inputs may be selected with --fp8-snapshot \
+                     when serving; this single-checkpoint plan does not model that side input.".into()
+                } else {
+                    "PLAN.md Phase 5 S2: serve-glm prefills per-tensor FP8 MLPs as static W8A8 and quantizes BF16 \
+                     MLA / shared-expert weights to FP8 blocks at load (CUTEAFD_GLM_BF16=native: the BF16 programs \
+                     on the checkpoint's own weights).".into()
+                },
             });
         }
         self.component_hint(component)
@@ -370,8 +375,39 @@ impl GlmModel {
         }
     }
 
-    fn glm5_flash(&self, stem: &str, operand: &QuantOperand) -> Result<(), String> {
+    fn glm5_flash(&self, role: &TensorRole, stem: &str, operand: &QuantOperand) -> Result<(), String> {
         let name = leaf(stem);
+        let block_shape = match (&self.cache_cfg, role.layer) {
+            (GlmCacheConfig::Flash(cfg), Some(layer)) => match role.component {
+                Component::Attention if cfg.attention.get(layer) == Some(&GlmNextAttention::Mla) => match name {
+                    "q_a_proj" => Some(vec![cfg.q_lora_rank, cfg.hidden]),
+                    "kv_a_proj_with_mqa" => Some(vec![cfg.kv_lora_rank, cfg.hidden]),
+                    "q_b_proj" => Some(vec![cfg.heads.checked_mul(cfg.qk_nope_dim)
+                        .ok_or_else(|| format!("{stem}: query geometry overflows"))?, cfg.q_lora_rank]),
+                    "o_proj" => Some(vec![cfg.hidden, cfg.heads.checked_mul(cfg.v_head_dim)
+                        .ok_or_else(|| format!("{stem}: output geometry overflows"))?]),
+                    _ => None,
+                },
+                Component::DenseFfn | Component::SharedExpert => {
+                    let inter = if role.component == Component::DenseFfn { cfg.dense_intermediate }
+                        else { cfg.moe_intermediate };
+                    match name {
+                        "gate_proj" | "up_proj" => Some(vec![inter, cfg.hidden]),
+                        "down_proj" => Some(vec![cfg.hidden, inter]),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(shape) = block_shape {
+            return require(fp8_f32_block128(operand) && operand.logical == shape, || format!(
+                "GLMF {name} requires checkpoint-native E4M3 with FP32 128x128 block scales and shape {shape:?}; \
+                 found {}; add a BF16 consumer/exporter instead of implicit quantization, or select native FP8 \
+                 inputs with serve-glmf --fp8-snapshot (a serving remedy not modeled by this single-checkpoint plan)",
+                describe(operand)));
+        }
         match name {
             // `absorbed` splits kv_b_proj into w_uk / w_uv from BF16 rows.
             "kv_b_proj" => bf16(operand, "kv_b_proj (absorbed into w_uk / w_uv)"),
@@ -436,7 +472,7 @@ impl FamilyModel for GlmModel {
             Component::DenseFfn if self.id == "glm5_flash" && operand.is_nvfp4()
                 && operand.scale.as_ref().is_some_and(|s| s.cols == 16) => Ok(()),
             _ if self.id == "glm5" => self.glm5(stem, operand),
-            _ => self.glm5_flash(stem, operand),
+            _ => self.glm5_flash(role, stem, operand),
         }
     }
 
