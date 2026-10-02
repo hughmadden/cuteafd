@@ -347,6 +347,12 @@ impl LaneFfn<'_, '_, '_> {
         let library = self.library;
         let route_capture = &mut self.route_capture;
         let ffn_split = &mut self.ffn_split;
+        if crate::shared::memory::chain::deferred() {
+            // Attention preparation only enqueues its uploads. The pending
+            // attention tail has now joined the chain, so this fence includes
+            // every pinned staging read the next layer may overwrite.
+            crate::shared::memory::chain::fence_mark(library, input.layer % 2)?;
+        }
         let output = complete_ffn(self.phase, async {
             let timing = std::time::Instant::now();
             // Device waves read the routes on the device like local layers do.
