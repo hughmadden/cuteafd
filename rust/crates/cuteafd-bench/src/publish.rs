@@ -122,23 +122,36 @@ fn quality_cell(b: &crate::report::Baseline) -> String {
     }
 }
 
-/// The root README's results: a three-column grid of share cards (each links
-/// to its family page under `docs/models/`), then the same rows as a compact table.
+/// The root README's results: one row per checkpoint (model and quant linking to
+/// its family page, then its minimum and maximum share cards, each linking to the
+/// card SVG), then the same rows as a compact table.
 pub fn results(placed: &[Placed]) -> String {
     let rows = reference_rows(placed);
     if rows.is_empty() {
         return "_Pending the first published run._\n".into();
     }
-    let mut out = String::from("<table>\n");
-    for chunk in rows.chunks(3) {
-        out.push_str("<tr>\n");
-        for (family, _, class, p) in chunk {
-            let r = &p.report;
-            out.push_str(&format!("<td width=\"33%\" valign=\"top\"><a href=\"docs/models/{family}.md\"><img src=\"{}\" \
-                alt=\"{} on {}\"></a><br><sub>{} · {} ({})</sub></td>\n", link(&p.dir, "card.svg"), r.server.checkpoint(),
-                r.server.hardware.line(), family_title(family), short_hardware(r), if *class == 0 { "min" } else { "max" }));
+    // One row per checkpoint: the model and quant (linking to its family page),
+    // then its minimum and maximum cards, each linking to the card itself.
+    let mut out = String::from("<table>\n<tr><th>Model · quant</th><th>Minimum hardware</th><th>Maximum hardware</th></tr>\n");
+    let mut i = 0;
+    while i < rows.len() {
+        let (family, name, _, first) = &rows[i];
+        let mut cells = [None, None];
+        while i < rows.len() && rows[i].0 == *family && rows[i].1 == *name {
+            cells[rows[i].2 as usize] = Some(rows[i].3);
+            i += 1;
         }
-        out.push_str("</tr>\n");
+        let card = |p: Option<&Placed>| p.map_or("<td width=\"40%\" align=\"center\">—</td>".to_string(), |p| {
+            let svg = link(&p.dir, "card.svg");
+            format!("<td width=\"40%\" valign=\"top\"><a href=\"{svg}\"><img src=\"{svg}\" alt=\"{} on {}\"></a>\
+                <br><sub>{}</sub></td>", p.report.server.checkpoint(), p.report.server.hardware.line(),
+                short_hardware(&p.report))
+        });
+        out.push_str(&format!("<tr>\n<td width=\"20%\" valign=\"top\"><a href=\"docs/models/{family}.md\"><b>{}</b></a>\
+            <br><sub>{}</sub><br><sub>{}</sub></td>\n{}\n{}\n</tr>\n", family_title(family),
+            first.report.server.checkpoint(),
+            name.rsplit_once(" (").map_or("", |(_, quant)| quant.trim_end_matches(')')),
+            card(cells[0]), card(cells[1])));
     }
     out.push_str("</table>\n\n");
     out.push_str("| Family | Checkpoint | Hardware | KV / req | C1 code | prose | JSON | 8K prefill | TTFT | Quality | Report |\n");
