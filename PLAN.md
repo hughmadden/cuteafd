@@ -490,6 +490,19 @@ host-driven); instead one shared exchange is built and both engines move onto it
   A/B on 1 RTX + 4 Sparks and 2 RTX + 4 Sparks, full V4.1 parity before proposing a default;
   the default stays byte-identical while off.
 
+Status (2026-10-02, `work/v41-device`, all opt-in): D0 done (`SparkDeviceLane` proxy +
+`cuteafd_host_signal`/`cuteafd_peer_wait`; proxy spins only while announced waves are
+outstanding, parks otherwise: idle 0.6% of a core, wake 5 us). D1 V4 Flash
+(`CUTEAFD_SPARK_DEVICE=1`): top-1 100%, decode 13.2 -> 13.1 ms/tok, 6-row verify 4.7 -> 4.5
+ms/tok. D2+D3 V4.1 (`CUTEAFD_V41_DEVICE=1`: device-ordered verify passes, TP2 layers without host
+waits, staging fences, remote waves on the device exchange; only while the other lane is idle):
+2 RTX + 4 Sparks code C1 185.5 -> 192.9 tok/s, C4 unchanged (old path), greedy byte-identical; 1 RTX
+C1 +1%. Spark worker per 5-6-row wave: kernel ~510 of the ~544 us round trip (GB10 bandwidth,
+~24 experts x 5.9 MB at TP4), host ~20 us: TP6 is the bigger remote lever. Write mode
+(`CUTEAFD_SPARK_WRITE=1`, NIC-written rows + flags, GPU waits; needs this branch's Spark build) is
+built but not yet run. Open: both lanes device-ordered corrupt C4 (`CUTEAFD_V41_DEVICE_LANES=1`,
+cause not found); whole-step graphs (D4); nsys traces of the overlay image came out empty.
+
 **Spark-side reduction (measured and parked 2026-10-01, `work/spark-reduce`).**
 TP ranks reduce-scatter their routed partials by rows over an RC mesh between
 the Sparks (`expertd --reduce-rail`, SEND_WITH_IMM tagged per wave, FP32 sum in
