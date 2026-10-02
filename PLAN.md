@@ -607,8 +607,15 @@ The user chooses release cuts; development fixes below do not cut a release.
         (1.95 nat), C4 ≠ C1 at token 15; GLM 5.3 Flash tr3 DFlash2 0.84 nat;
         GLM 5.3 EXL3 0.57 nat. Suspect multi-row verify numerics/state.
         `3010e1c` adds strict GLM Flash rejected-suffix causality, committed
-        state and continuation checks. Those checks pass; the remaining
-        serial/wide numerical divergence is under investigation, not fixed.
+        state and continuation checks. Those checks pass. The first numerical
+        difference is split-dependent rounding of normalized BF16 MLA partials;
+        EXL3's narrow K128 accumulation adds drift relative to K64 decode.
+        GLM Flash decode retains MLA partials in FP32 and selects the K64 EXL3
+        specialization for 2–16 live rows, admitting its workspace before weights.
+        The full nine-row quality gate passes, with exact rejected-suffix,
+        committed-state and continuation checks. This reduces numerical drift;
+        serial/wide byte equality and C1/C4 batch invariance remain open.
+        The serving lossless panel passes its near-tie criterion, not byte equality.
         `16cf99d` separately makes no-speculation requests skip actual GLM
         Flash neural drafter forwards; this does not change verify numerics.
      d. Batch invariance: C4 ≠ C1 greedy on V4 Pro, GLM 5.3, GLM 5.3 Flash.

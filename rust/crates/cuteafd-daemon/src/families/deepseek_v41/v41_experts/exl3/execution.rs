@@ -8,6 +8,40 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, ffi::c_void, path::{Path, PathBuf}, rc::Rc};
 
+/// Capacity selects the compiled reduction geometry, never the live row count.
+/// GLM Flash's m1/m80 use K64; m16 uses K128 and adds serial/verify drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Exl3RowPolicy {
+    Nearest,
+    GlmFlashK64,
+}
+
+impl Exl3RowPolicy {
+    pub(crate) fn for_geometry(geometry: cuteafd_core::ExpertGeometry) -> Self {
+        if geometry.same_shape(&cuteafd_core::ExpertGeometry::GLM5_FLASH) {
+            Self::GlmFlashK64
+        } else {
+            Self::Nearest
+        }
+    }
+
+    pub(crate) fn active() -> Self { Self::for_geometry(cuteafd_core::expert_geometry()) }
+
+    pub(crate) fn required_capacity(self, live_rows: usize) -> usize {
+        if self == Self::GlmFlashK64 && (2..=16).contains(&live_rows) { 80 } else { live_rows }
+    }
+
+    /// Used by artifact validation and workspace admission before weight reads,
+    /// including a narrow declared maximum that otherwise would only load m16.
+    pub(crate) fn capacities(self, max_live_rows: usize) -> Result<Vec<u32>> {
+        const CAPACITIES: [u32; 6] = [1, 16, 80, 256, 1024, 4096];
+        ensure!((1..=4096).contains(&max_live_rows), "EXL3 live capacity must be 1..4096");
+        let required = max_live_rows.max(self.required_capacity(max_live_rows));
+        let maximum = CAPACITIES.into_iter().find(|&c| c as usize >= required).unwrap();
+        Ok(CAPACITIES.into_iter().filter(|&c| c <= maximum).collect())
+    }
+}
+
 #[derive(Deserialize)]
 struct Buffer {
     bytes: usize,
@@ -719,6 +753,74 @@ mod shared_tests;
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn family_row_policy_admits_every_live_tail() -> Result<()> {
+        use cuteafd_core::ExpertGeometry as G;
+        for geometry in [G::DEEPSEEK_V41, G::DEEPSEEK_V4_FLASH, G::DEEPSEEK_V4_PRO,
+            G::GLM5, G::MIMO_V2_FLASH, G::MIMO_V26_PRO, G::QWEN4] {
+            assert_eq!(Exl3RowPolicy::for_geometry(geometry), Exl3RowPolicy::Nearest);
+        }
+        let glmf = Exl3RowPolicy::for_geometry(G::GLM5_FLASH);
+        assert_eq!(glmf, Exl3RowPolicy::GlmFlashK64);
+        for policy in [glmf, Exl3RowPolicy::Nearest] {
+            assert!(policy.capacities(0).is_err());
+            assert!(policy.capacities(4097).is_err());
+            for maximum in [1, 2, 4, 9, 15, 16, 17, 64, 79, 80, 81, 255, 256,
+                257, 1024, 1536, 2048, 4096] {
+                let preloaded = policy.capacities(maximum)?;
+                assert!(preloaded.windows(2).all(|pair| pair[0] < pair[1]));
+                for live in 1..=maximum {
+                    let selected = preloaded.iter().find(|&&capacity|
+                        capacity as usize >= policy.required_capacity(live)).unwrap();
+                    assert!(*selected as usize >= live, "execution must fit every admitted tail");
+                    if policy == glmf && live <= 16 {
+                        assert!([1, 80].contains(selected), "GLM Flash must retain K64 geometry");
+                    }
+                }
+            }
+        }
+        assert_eq!(glmf.capacities(1)?, vec![1]);
+        Ok(())
+    }
+
+    #[test]
+    fn narrow_glmf_plan_includes_m80_scratch_and_requires_its_artifact() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        for capacity in [1, 16, 80] {
+            let directory = root.path().join(format!("m{capacity}"));
+            std::fs::create_dir(&directory)?;
+            let metadata = serde_json::json!({
+                "schema":"cuteafd.v41-exl3-aot.v1", "output_dtype":"bf16",
+                "sparkinfer_revision":"test", "hidden":16,"intermediate":16,
+                "experts":8,"capacity":capacity,"top_k":2,"bits":[3],
+                "direct":false,"sms":1,"blocks_per_sm":1,
+                "buffers":{
+                    "scratch":{"bytes":capacity*64,"dtype":"float32","allocation":"scratch","zero_on_create":false},
+                    "epoch":{"bytes":16,"dtype":"int32","allocation":"epoch","zero_on_create":true}
+                },
+                "objects":[],"trellis_lut":{"file":"lut","bytes":16,"sha256":"test"}
+            });
+            std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&metadata)?)?;
+        }
+        let directories = |policy: Exl3RowPolicy, rows| -> Result<Vec<PathBuf>> {
+            Ok(policy.capacities(rows)?.iter().map(|c| root.path().join(format!("m{c}"))).collect())
+        };
+        let ordinary = Exl3Workspace::plan(&directories(Exl3RowPolicy::Nearest, 16)?, Exl3InputFormat::Fp8K32)?;
+        for maximum in [2, 4, 9, 16] {
+            let planned = directories(Exl3RowPolicy::GlmFlashK64, maximum)?;
+            // Admission includes the shared arena and private state even though
+            // the transport/input limit stays at the real declared maximum.
+            assert_eq!(Exl3Workspace::plan(&planned, Exl3InputFormat::Fp8K32)?, 8320);
+            assert!(ordinary < 8320);
+        }
+        std::fs::remove_file(root.path().join("m80/v41_exl3.json"))?;
+        assert!(Exl3Workspace::plan(&directories(Exl3RowPolicy::GlmFlashK64, 16)?, Exl3InputFormat::Fp8K32).is_err());
+        assert!(Exl3Workspace::plan(&directories(Exl3RowPolicy::Nearest, 16)?, Exl3InputFormat::Fp8K32).is_ok());
+        Ok(())
+    }
+
     #[test]
     fn paired_manifest_requires_complete_explicit_contract() {
         let original = serde_json::json!({
@@ -747,7 +849,6 @@ mod tests {
         assert!(parse(invalid).native_layout().is_err());
     }
 
-    use super::*;
     use crate::families::deepseek_v41::v41_experts::ExpertLayer;
     use crate::shared::memory::LoadStream;
 

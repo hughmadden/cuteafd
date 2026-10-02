@@ -272,7 +272,8 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
             (f"o_m{rows}", "o", {"max_rows": rows, "fp8_only": mode},
              lambda r=rows, m=mode: glmf.compile_glmf_o_aot(g, max_rows=r, fp8_only=m)),
             (f"sparse_mla_{mode}_m{rows}", "sparse_mla", {"route": mode, "max_rows": rows},
-             lambda m=mode, r=rows: mla.compile_glm_sparse_mla_aot(g, route=m, max_rows=r, name="glmf_sparse_mla")),
+             lambda m=mode, r=rows: mla.compile_glm_sparse_mla_aot(g, route=m, max_rows=r,
+                                      name="glmf_sparse_mla", fp32_partials=m == "decode")),
         ]
         for inter in (g.moe_inter, g.dense_inter):
             out.append((f"ffn_i{inter}_m{rows}", "ffn", {"max_rows": rows, "inter": inter, "fp8_only": mode},
