@@ -28,6 +28,7 @@ use crate::shared::fp8_linear::{self, Fp8Weight};
 use crate::shared::memory::DeviceAllocation;
 use crate::shared::token_io::TokenEmbedding;
 use anyhow::{ensure, Context, Result};
+use cuteafd_core::DType;
 use cuteafd_ffi::programs::{VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::{read_safetensors_metadata, SafetensorsTensorMetadata};
@@ -316,6 +317,7 @@ pub(crate) fn prefetch(snapshot: &Path) -> std::thread::JoinHandle<std::io::Resu
 impl Checkpoint {
     fn bytes(&self, name: &str, shape: &[usize]) -> Result<&[u8]> {
         let t = self.tensors.get(name).with_context(|| format!("DFlash2 checkpoint has no {name}"))?;
+        ensure!(t.dtype == DType::Bf16, "{name}: DFlash2 weights must be BF16, found {:?}", t.dtype);
         ensure!(t.shape == shape && t.byte_length as usize == shape.iter().product::<usize>() * 2,
             "{name}: shape {:?}, expected BF16 {shape:?}", t.shape);
         let range = t.byte_offset as usize..(t.byte_offset + t.byte_length) as usize;
@@ -920,4 +922,40 @@ pub(crate) fn golden_sequence(dir: &Path, vocab: usize) -> Result<(Vec<u32>, Vec
         greedy.push(best);
     }
     Ok((tokens, greedy))
+}
+
+#[cfg(test)]
+mod checkpoint_header_tests {
+    use super::*;
+
+    fn fixture(dtype: DType) -> Checkpoint {
+        Checkpoint { data: vec![0x80, 0x3f, 0, 0x40, 0x40, 0x40, 0x80, 0x40],
+            tensors: HashMap::from([("fc.weight".into(), SafetensorsTensorMetadata {
+                name: "fc.weight".into(), dtype, shape: vec![2, 2], byte_offset: 0, byte_length: 8,
+            })]) }
+    }
+
+    #[test]
+    fn bf16_payload_is_read_without_conversion() {
+        let checkpoint = fixture(DType::Bf16);
+        assert_eq!(checkpoint.bytes("fc.weight", &[2, 2]).unwrap(), checkpoint.data);
+    }
+
+    #[test]
+    fn equal_width_other_dtypes_cannot_be_reinterpreted_as_bf16() {
+        for dtype in [DType::F16, DType::I16] {
+            let checkpoint = fixture(dtype.clone());
+            let error = checkpoint.bytes("fc.weight", &[2, 2]).unwrap_err().to_string();
+            assert!(error.contains("fc.weight") && error.contains("must be BF16"));
+            assert!(error.contains(&format!("{dtype:?}")));
+        }
+    }
+
+    #[test]
+    fn bf16_dtype_does_not_bypass_shape_or_storage_guards() {
+        let mut checkpoint = fixture(DType::Bf16);
+        assert!(checkpoint.bytes("fc.weight", &[4, 1]).is_err());
+        checkpoint.tensors.get_mut("fc.weight").unwrap().byte_length = 6;
+        assert!(checkpoint.bytes("fc.weight", &[2, 2]).is_err());
+    }
 }
