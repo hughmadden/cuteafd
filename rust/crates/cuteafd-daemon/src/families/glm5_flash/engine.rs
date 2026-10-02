@@ -68,6 +68,20 @@ const MAX_RANKS: usize = 6;
 /// lane worth a second exchange per layer.
 pub(crate) const PREFILL_LANES: usize = 2;
 const MIN_LANE_ROWS: usize = 256;
+/// Multi-lane splits must land on MLA page boundaries. A narrow workspace
+/// still accepts a single unpadded tail, but cannot advertise unusable padding.
+fn prefill_lane_capacity(rows: usize) -> usize {
+    rows.max(PREFILL_LANES * (rows / PAGE_ROWS) * PAGE_ROWS)
+}
+
+fn prefill_lane_plan(tokens: usize, rows: usize) -> Result<(usize, usize)> {
+    ensure!(tokens > 0 && tokens <= prefill_lane_capacity(rows),
+        "prefill of {tokens} tokens exceeds the {rows}-row lane workspaces");
+    let lanes = if tokens <= rows && tokens < PREFILL_LANES * MIN_LANE_ROWS { 1 } else { PREFILL_LANES };
+    let per_lane = if lanes == 1 { tokens } else { tokens.div_ceil(lanes).next_multiple_of(PAGE_ROWS) };
+    ensure!(per_lane <= rows, "prefill lane of {per_lane} tokens exceeds {rows} rows");
+    Ok((lanes, per_lane))
+}
 const HC: usize = 4;
 
 /// Routed experts on this GPU from the TP1 package. All layers stay resident
@@ -942,7 +956,7 @@ impl<'a> GlmfEngine<'a> {
     /// Longest chunk one prefill call takes: a lane of `prefill_rows` rows
     /// each when Spark prefill is pipelined.
     pub fn prefill_capacity(&self) -> usize {
-        if self.pipelined() { PREFILL_LANES * self.prefill_rows } else { self.prefill_rows }
+        if self.pipelined() { prefill_lane_capacity(self.prefill_rows) } else { self.prefill_rows }
     }
 
     /// A Spark prefill chunk as up to [`PREFILL_LANES`] lanes of consecutive
@@ -950,10 +964,9 @@ impl<'a> GlmfEngine<'a> {
     fn prefill_lanes(&self, placement: &mut GlmfPlacement, tokens: &[u32], all_logits: bool, device: bool)
         -> Result<Option<StepLogits>> {
         let (start, t) = (placement.len, tokens.len());
-        let lanes = if t >= PREFILL_LANES * MIN_LANE_ROWS { PREFILL_LANES } else { 1 };
+        let (_, per_lane) = prefill_lane_plan(t, self.prefill_rows)?;
         // Lanes split at a multiple of 64 rows (an MLA page), so each lane's
         // pools and pages start where the previous lane's end.
-        let per_lane = t.div_ceil(lanes).next_multiple_of(PAGE_ROWS);
         ensure!(t > 0 && per_lane <= self.prefill_rows && start + t <= self.max_context,
             "prefill of {t} rows at {start} exceeds {} rows per lane or the context", self.prefill_rows);
         if start == 0 {
@@ -1793,5 +1806,39 @@ impl Drop for GlmfEngine<'_> {
                 let _ = unsafe { self.library.cuda_event_destroy(event) };
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod prefill_lane_tests {
+    use super::{prefill_lane_capacity, prefill_lane_plan, PAGE_ROWS, PREFILL_LANES};
+
+    #[test]
+    fn every_advertised_prefill_tail_fits_its_lane_workspaces() {
+        for rows in [1, 63, 64, 65, 96, 127, 128, 255, 256, 511, 512, 1024, 1536, 2047, 2048, 4096] {
+            let capacity = prefill_lane_capacity(rows);
+            for tokens in 1..=capacity {
+                let (lanes, per_lane) = prefill_lane_plan(tokens, rows).unwrap();
+                assert!(lanes <= PREFILL_LANES && per_lane <= rows, "rows={rows}, tokens={tokens}");
+                let starts: Vec<_> = (0..tokens).step_by(per_lane).collect();
+                assert!(starts.len() <= lanes);
+                assert_eq!(starts.iter().map(|&s| per_lane.min(tokens - s)).sum::<usize>(), tokens);
+                assert!(starts.iter().all(|&s| per_lane.min(tokens - s) <= rows));
+                assert!(starts.iter().skip(1).all(|s| s % PAGE_ROWS == 0));
+            }
+            assert!(prefill_lane_plan(capacity + 1, rows).is_err());
+        }
+    }
+
+    #[test]
+    fn narrow_workspace_splits_the_short_tool_prompt() {
+        assert_eq!(prefill_lane_plan(214, 128).unwrap(), (2, 128));
+        assert_eq!(prefill_lane_plan(1, 1).unwrap(), (1, 1));
+        assert!(prefill_lane_plan(0, 128).is_err());
+        assert!(prefill_lane_plan(1, 0).is_err());
+        // Keep the qualified default's lane threshold and advertised width.
+        assert_eq!(prefill_lane_capacity(4096), 8192);
+        assert_eq!(prefill_lane_plan(511, 4096).unwrap(), (1, 511));
+        assert_eq!(prefill_lane_plan(512, 4096).unwrap(), (2, 256));
     }
 }
