@@ -205,6 +205,29 @@ impl<'a> CudaCopyEngine<'a> {
         }
         first_error.map_or(Ok(()), Err)
     }
+
+    /// Component-only queue identities; callers keep this cache alive.
+    #[cfg(test)]
+    pub(crate) fn terminal_fixture_streams(&self) -> Vec<(i32, *mut c_void)> {
+        self.streams.iter().flat_map(|rank| rank.iter().map(|state| (state.device.id, state.raw))).collect()
+    }
+
+    /// Component fixture holds every event until all queues retire.
+    #[cfg(test)]
+    pub(crate) fn terminal_fixture_wait(&self, events: &[(i32, *mut c_void)]) -> Result<()> {
+        for rank in &self.streams {
+            for state in rank {
+                let event = events.iter().find(|&&(device, _)| device == state.device.id)
+                    .context("missing copy-owner fixture event")?.1;
+                state.device.run(|| {
+                    // SAFETY: the test holds this event and every queued owner
+                    // through both compute and copy drainage on this device.
+                    unsafe { self.library.cuda_stream_wait_event(state.raw, event) }
+                })?;
+            }
+        }
+        Ok(())
+    }
     fn issue_many(&mut self, stream: Stream, copies: &[(HostRange, DeviceRange)], d2h: bool) -> Result<()> {
         self.routed.clear();
         // Validate the complete plan, including ownership and all host extents,

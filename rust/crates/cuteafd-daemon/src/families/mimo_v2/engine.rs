@@ -115,6 +115,14 @@ struct SentWave {
     sent: std::time::Instant,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("MiMo head-split submission failed permanently: {cause}; {drain}")]
+pub(crate) struct TerminalStepError {
+    #[source]
+    cause: anyhow::Error,
+    drain: String,
+}
+
 /// Fewest rows per lane of a pipelined prefill: at least the DFlash tap ring
 /// (1024 rows) and the MTP hidden ring, which the last lane alone feeds.
 const MIN_LANE_ROWS: usize = 1024;
@@ -348,6 +356,10 @@ fn rope_table<'a>(library: &'a NativeLibrary, dim: usize, theta: f64, max_contex
 }
 
 pub(crate) struct MimoEngine<'a> {
+    terminal: Cell<crate::shared::peer_split::TerminalState>,
+    /// Closing/draining is also normal retirement. Only a failed submission
+    /// latches this bit, so a caller cannot swallow a terminal execution error.
+    submission_failed: Cell<bool>,
     quantize_grid: Fp8QuantizeGrid,
     pub library: &'a NativeLibrary,
     pub programs: &'a Programs<'a>,
@@ -490,8 +502,9 @@ impl<'a> MimoEngine<'a> {
         }).collect::<Result<Vec<_>>>()?;
         let table = |theta: f64| rope_table(library, cfg.rope_dim, theta, max_context);
         let (cos_sin_full, cos_sin_swa) = (table(cfg.full_rope_theta)?, table(cfg.swa_rope_theta)?);
-        Ok(Self { quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_output,
-            pages, rings, family, device,
+        Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active),
+            submission_failed: Cell::new(false), quantize_grid, library, programs, cfg, weights, stream,
+            max_context, prefill_rows, prefill_output, pages, rings, family, device,
             split_family, peer: None, exchange: None, kv, cos_sin_full,
             cos_sin_swa, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
             lane_workspace: RefCell::new(None), prefill_kv_wide: RefCell::new(None), experts: None,
@@ -561,7 +574,7 @@ impl<'a> MimoEngine<'a> {
             && layers.iter().all(|l| l.split), "attach_peer needs the head-split shares of every loaded layer");
         let library = self.library;
         let rows = self.prefill_rows.max(DECODE_ROWS);
-        let exchange = PeerExchange::new(library, [RankDevice { device: self.device, stream: self.stream },
+        let exchange = PeerExchange::new_abortable(library, [RankDevice { device: self.device, stream: self.stream },
             RankDevice { device, stream }], 8, rows * self.cfg.hidden * 2)?;
         let zeroed = |bytes: usize| -> Result<Rc<Allocation<'a>>> {
             let allocation = Rc::new(Allocation::new(Device { library, id: device }, bytes.max(256))?);
@@ -602,6 +615,130 @@ impl<'a> MimoEngine<'a> {
         let out = body();
         self.library.cuda_set_device(self.device)?;
         out
+    }
+
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.terminal.get() != crate::shared::peer_split::TerminalState::Active
+    }
+
+    pub(super) fn submission_failed(&self) -> bool { self.submission_failed.get() }
+
+    pub(crate) fn retain_queued_storage(&self) -> bool {
+        self.terminal.get() == crate::shared::peer_split::TerminalState::Retained
+    }
+
+    /// A callback-owned copy queue failed after engine compute was drained.
+    /// Escalate ownership only; never reset counters or make an engine reusable.
+    pub(super) fn retain_serving_storage(&self) {
+        self.terminal.set(crate::shared::peer_split::TerminalState::Retained);
+        if let Some(exchange) = &self.exchange { exchange.finish_terminal(false); }
+    }
+
+    pub(crate) fn require_live(&self) -> Result<()> {
+        let state=self.terminal.get();
+        if state!=crate::shared::peer_split::TerminalState::Active {
+            return Err(crate::shared::peer_split::TerminalPeerError::Closed(state).into());
+        }
+        match &self.exchange { Some(exchange) => exchange.require_live(), None => Ok(()) }
+    }
+
+    pub(crate) fn terminal_error(&self) -> anyhow::Error {
+        let state = self.terminal.get();
+        crate::shared::peer_split::TerminalPeerError::Closed(state).into()
+    }
+
+    /// Abort and drain before returning a submission error to a caller that may
+    /// release its pages or tear down the engine. This protects engine-owned
+    /// queues; serving also retains its sampler/prefix/host owners independently.
+    /// A terminal engine can never execute another submission.
+    pub(super) fn submit<T>(&self, body: impl FnOnce() -> Result<T>) -> Result<T> {
+        if let Err(error) = self.require_live() {
+            self.submission_failed.set(true);
+            return Err(error);
+        }
+        let result = body();
+        match result {
+            Err(cause) => {
+                self.submission_failed.set(true);
+                let drain = match self.terminal_shutdown() {
+                    Ok(()) => "queued streams drained; engine cannot be reused".to_string(),
+                    Err(error) => format!("queued owners retained: {error:#}"),
+                };
+                Err(TerminalStepError { cause, drain }.into())
+            }
+            result => result,
+        }
+    }
+
+    /// Close the complete engine before its buffers are released, including
+    /// ordinary one-GPU errors. Never reset a wave before QPs quiesce; never
+    /// release its pinned/landing owners until all compute and copy streams
+    /// drain. Publication failure skips potentially blocked compute drains.
+    pub(crate) fn terminal_shutdown(&self) -> Result<()> {
+        use crate::shared::peer_split::{TerminalPeerError,TerminalState};
+        match self.terminal.get() {
+            TerminalState::Drained=>return Ok(()),
+            TerminalState::Active=>self.terminal.set(TerminalState::Aborting),
+            state=>return Err(TerminalPeerError::Closed(state).into()),
+        }
+        let mut failures=Vec::new();
+        let published=match &self.exchange {
+            Some(exchange)=>match exchange.publish_abort() {
+                Ok(())=>true,
+                Err(error)=>{ failures.push(format!("peer abort publication: {error:#}")); false }
+            },
+            None=>true,
+        };
+        if let Err(error)=self.terminal_links(|link|link.terminal_quiesce()) {
+            failures.push(format!("Spark QP quiescence: {error:#}"));
+        }
+        let mut compute_drained = false;
+        if published {
+            let result=match &self.exchange {
+                Some(exchange)=>exchange.drain_compute(),
+                None=>self.on(0, || {
+                    // SAFETY: the engine retains its stream and every queued
+                    // buffer; one-GPU work has no unmatched peer-wait kernel.
+                    unsafe { self.library.cuda_stream_synchronize(self.stream) }
+                }),
+            };
+            match result {
+                Ok(()) => compute_drained = true,
+                Err(error) => failures.push(format!("compute drainage: {error:#}")),
+            }
+        }
+        if compute_drained {
+            if let Err(error)=self.terminal_links(|link|link.terminal_drain_copies()) {
+                failures.push(format!("Spark upload drainage: {error:#}"));
+            }
+        } else {
+            // A copy stream may wait on a compute event that can no longer
+            // become visible. Do not replace a failed abort/drain with another
+            // blocking synchronization; retain every upload/landing owner.
+            failures.push("Spark upload drainage skipped because compute completion was not proven".into());
+        }
+        if failures.is_empty() {
+            if let Err(error)=self.terminal_links(|link|link.terminal_release()) {
+                failures.push(format!("Spark owner release: {error:#}"));
+            }
+        }
+        let drained=failures.is_empty();
+        self.terminal.set(if drained { TerminalState::Drained } else { TerminalState::Retained });
+        if let Some(exchange)=&self.exchange { exchange.finish_terminal(drained); }
+        if drained { Ok(()) } else { Err(TerminalPeerError::Retain(failures.join("; ")).into()) }
+    }
+
+    fn terminal_links(&self, mut action: impl FnMut(&mut SparkLink<'a>)->Result<()>) -> Result<()> {
+        let mut failures=Vec::new();
+        if let Some(Experts::Spark { transport,lane,.. })=&self.experts {
+            for (index,link) in std::iter::once(transport).chain(lane.iter()).enumerate() {
+                let result=link.try_borrow_mut().map_err(anyhow::Error::from)
+                    .and_then(|mut link|action(&mut link));
+                if let Err(error)=result { failures.push(format!("lane {index}: {error:#}")); }
+            }
+        }
+        ensure!(failures.is_empty(),"{}",failures.join("; "));
+        Ok(())
     }
 
     /// Receive slot `slot` of rank `rank` (null without a head split).
@@ -840,6 +977,10 @@ impl<'a> MimoEngine<'a> {
     /// writes its KV before lane 1 reads it at every layer). Returns the last
     /// row's logits.
     fn step_lanes(&self, lanes: [(&StepTables, &[u32]); 2]) -> Result<Option<DeviceLogits>> {
+        self.submit(|| self.step_lanes_inner(lanes))
+    }
+
+    fn step_lanes_inner(&self, lanes: [(&StepTables, &[u32]); 2]) -> Result<Option<DeviceLogits>> {
         let Some(Experts::Spark { transport, lane: Some(lane), runtime }) = &self.experts else {
             anyhow::bail!("pipelined prefill needs Spark experts with a lane transport");
         };
@@ -1031,6 +1172,12 @@ impl<'a> MimoEngine<'a> {
     }
 
     fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<DeviceLogits>> {
+        self.submit(|| self.step_inner(tables, tokens, logit_rows, on_layer, forced))
+    }
+
+    fn step_inner(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<DeviceLogits>> {
         let (h, t) = (self.cfg.hidden, tables.positions.len());
@@ -1710,6 +1857,10 @@ impl<'a> MimoEngine<'a> {
     /// the earlier stages' drafts there), so the passes queue back to back
     /// and the drafts come back once, at the end.
     pub fn mtp_draft(&self, seqs: &[super::mtp::MtpSeq<'_>], stages: usize) -> Result<Vec<Vec<u32>>> {
+        self.submit(|| self.mtp_draft_inner(seqs, stages))
+    }
+
+    fn mtp_draft_inner(&self, seqs: &[super::mtp::MtpSeq<'_>], stages: usize) -> Result<Vec<Vec<u32>>> {
         use super::mtp::Token;
         let mtp = self.mtp.as_ref().context("no MTP drafter")?;
         let stages = stages.min(mtp.stages.len());
@@ -2317,6 +2468,10 @@ impl<'a> MimoEngine<'a> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "terminal_fault_tests.rs"]
+mod terminal_fault_tests;
 
 #[cfg(test)]
 mod tests {

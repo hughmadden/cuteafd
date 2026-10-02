@@ -3789,6 +3789,22 @@ impl NativeLibrary {
         self.status_to_result("cuteafd_rdma_rc_endpoint_destroy", status)
     }
 
+    /// Metadata-only symbol check; terminal ownership is unavailable on older
+    /// libraries and must be rejected before external landing allocation.
+    pub fn rdma_rc_endpoint_quiesce_available(&self) -> Result<()> {
+        // SAFETY: resolving a function does not invoke it or create CUDA state.
+        let _: Symbol<RdmaRcEndpointDestroyFn> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_quiesce")? };
+        Ok(())
+    }
+
+    pub fn rdma_rc_endpoint_quiesce(&self, handle: *mut c_void) -> Result<()> {
+        // SAFETY: the transport owns the live endpoint; this optional ABI only
+        // destroys its QP and retains every registration and storage owner.
+        let quiesce: Symbol<RdmaRcEndpointDestroyFn> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_quiesce")? };
+        let status = unsafe { quiesce(handle) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_quiesce", status)
+    }
+
     pub fn last_error(&self) -> Result<String> {
         let last_error_fn: Symbol<LastErrorFn> = unsafe { self.lib.get(b"cuteafd_last_error")? };
         let mut buf = vec![0 as c_char; 512];
