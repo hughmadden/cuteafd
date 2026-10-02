@@ -16,6 +16,7 @@ bincode.workspace = true
 bytes.workspace = true
 clap.workspace = true
 cuteafd-api = { path = "../cuteafd-api" }
+cuteafd-bench = { path = "../cuteafd-bench" }
 cuteafd-core = { path = "../cuteafd-core" }
 cuteafd-ffi = { path = "../cuteafd-ffi" }
 cuteafd-hostcache = { path = "../cuteafd-hostcache" }

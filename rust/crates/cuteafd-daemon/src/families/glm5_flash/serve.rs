@@ -27,6 +27,7 @@ use super::engine::{GlmfEngine, GlmfPlacement, DECODE_ROWS};
 use super::prefix::GlmfPrefix;
 use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
 use crate::shared::prefix::{PrefixArgs, Toggle};
+use crate::shared::probe;
 use crate::shared::console;
 use cuteafd_engine::prefix::{After, MarkArena, PointPlan, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
 use crate::families::glm5::dflash::{ContextRow, Draft, DraftSeq, TAP_ROWS};
@@ -114,12 +115,15 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, decode_share, prefix));
     ready_rx.await.context("engine failed before it was ready")??;
+    cuteafd_bench::context::phase("engine loaded");
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
         hub, profile.clone());
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
+    cuteafd_bench::ready(&listener);
     tracing::info!(listen = %args.listen, model = %profile.id, "GLM 5.3 Flash API is ready");
     tokio::select! {
-        served = axum::serve(listener, router) => served?,
+        served = axum::serve(listener, cuteafd_bench::app(router)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>()) => served?,
         finished = worker => finished??,
     }
     Ok(())
@@ -283,6 +287,7 @@ impl Active<'_> {
     /// Streams `token` (special tokens stay text for the GLM parser); returns
     /// true when the request is finished.
     fn emit(&mut self, token: u32) -> Result<bool> {
+        probe::token(&self.job.probe, token);
         self.history.push(token);
         self.digest = digest(self.digest, token);
         self.generated += 1;
@@ -438,7 +443,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     continue;
                 }
             };
-            let tokens = tokenizer.encode_text(&job.prompt, false)?.token_ids;
+            let tokens = probe::prompt_ids(&job.probe, || Ok(tokenizer.encode_text(&job.prompt, false)?.token_ids))?;
+            let cold = probe::cold(&job.probe);
             if tokens.is_empty() || tokens.len() >= engine.max_context {
                 reject(&job, format!("prompt of {} tokens is outside 1..{}", tokens.len(), engine.max_context));
                 continue;
@@ -452,7 +458,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             cache.tick();
             let admit_started = Instant::now();
             // Lookup, fork of the retained units and restore of the KDA mark (byte-exact).
-            let admitted = match cache.admit(&family, &tokens, capacity, true, |units| GlmfPlacement::new(units, kda)) {
+            let lookup: &[u32] = if cold { &[] } else { &tokens };
+            let admitted = match cache.admit(&family, lookup, capacity, true, |units| GlmfPlacement::new(units, kda)) {
                 Ok(admitted) => admitted,
                 Err(error) => {
                     free_kda.push(kda);
@@ -462,16 +469,33 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 }
             };
             let resume = admitted.resume;
+            probe::admitted(&job.probe, "glm5_flash", &tokens, resume);
             let _ = job.events.send(Ok(InferenceChunk::Ready {
                 system_fingerprint: None,
                 prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: resume },
             }));
+            if let Some(from) = probe::scoring(&job.probe) {
+                // Teacher-forced scoring: every row's logits, no generation, nothing retained.
+                let mut placement = admitted.placement;
+                let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_capacity(),
+                    DECODE_ROWS, &mut placement,
+                    |placement, chunk, _| engine.prefill_device(placement, chunk),
+                    |placement, chunk| engine.verify_device(&mut [(placement, chunk.len())], chunk, false)?
+                        .context("scoring needs every layer"));
+                match scored {
+                    Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
+                    Err(error) => { let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}")))); }
+                }
+                release(&family, &mut cache, &mut free_kda, &mut free_slots, &placement, slot);
+                continue;
+            }
             let ticket = console::admit(tokens.len(), resume, job.max_tokens, constraint.is_some(), job.images.len(),
                 admit_started);
             if let Some(source) = admitted.source {
                 tracing::info!(tokens = tokens.len(), resume, kind = ?source.kind, frontier = source.frontier,
                     host = source.host, "prefix cache hit");
             }
+            // A cold probe keeps the same chunk plan (identical numerics); it only skips the captures.
             let plan = if cache.enabled() {
                 cuteafd_engine::prefix::plan_points(resume, tokens.len(), engine.prefill_capacity(),
                     &crate::shared::prefix::boundaries(&tokens, &markers), family.capture_reach(),
@@ -507,8 +531,11 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     if end == p.tokens.len() {
                         // The first token, while this prompt's logits are the workspace's.
                         let logits = logits.context("prefill produced no logits")?;
-                        if caching && p.resume < p.tokens.len() {
+                        if caching && !probe::cold(&p.job.probe) && p.resume < p.tokens.len() {
                             p.prompt_row = Some(logits.row_host(&opened.library, 0)?);
+                        }
+                        if probe::wants_first(&p.job.probe) {
+                            probe::device_rows(&opened.library, &p.job.probe, &logits, 0, 1, p.tokens.len())?;
                         }
                         let mut batch = SelectBatch::default();
                         batch.push_next(p.job.sampling, p.constraint.as_mut(), p.placement.len as u64)?;
@@ -530,7 +557,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 p.ticket.prefill(chunk.len(), p.chunks, p.plan.chunks.len(), timer);
                 result?;
                 // Intermediate snapshot points this chunk ends at (off unless configured).
-                for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks) {
+                for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
                     if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, &p.tokens[..point], &p.placement,
                         After::default()) {
                         tracing::warn!("snapshot point {point} not retained: {error:#}");
@@ -545,7 +572,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     if p.cancelled {
                         p.ticket.cancel();
                         // The client left during the prefill: keep what it computed for a retry.
-                        if placement.len > resume {
+                        if placement.len > resume && !probe::cold(&p.job.probe) {
                             if let Err(error) = cache.park(&family, &p.tokens[..placement.len], &placement) {
                                 tracing::warn!("parking a cancelled prefill: {error:#}");
                             }
@@ -560,7 +587,11 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 // A whole-prompt hit selects from its retained logits; a prefill selected already.
                 let first = match (p.first, p.logits.as_deref()) {
                     (Some(first), _) => Ok(first),
-                    (None, Some(logits)) => select_host(p.constraint.as_mut(), p.job.sampling, logits,
+                    (None, Some(logits)) => select_host({
+                        if probe::wants_first(&p.job.probe) {
+                            probe::host_row(&p.job.probe, p.tokens.len(), logits);
+                        }
+                        p.constraint.as_mut() }, p.job.sampling, logits,
                         p.placement.len as u64),
                     (None, None) => Err(anyhow::anyhow!("prefill produced no logits")),
                 };
@@ -640,8 +671,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let engine_before = tally.live().then(|| *engine.profile.borrow());
         // Rows each sequence may add after its next token.
         let room = (DECODE_ROWS / active.len()).max(1) - 1;
-        let limits: Vec<usize> = active.iter().map(|a| room.min(a.job.max_tokens - a.generated - 1)
-            .min(a.capacity - a.placement.len - 1)).collect();
+        let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
+            room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1) }).collect();
         // DFlash2 drafts after every next token, then the policy's counts.
         let timer = Instant::now();
         let drafted: Vec<Option<Draft>> = match drafter {
@@ -754,10 +785,12 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             for j in 0..rows.len() {
                 // Rows 0..=j are committed; the token row j produces is next.
                 request.placement.len = start + j + 1;
+                probe::decode_row(&opened.library, &request.job.probe, &logits, offset + j, request.generated,
+                    request.history.len());
                 match take(request.constraint.as_mut(), &selected[offset + j]).and_then(|t| Ok((t, request.emit(t)?))) {
                     Ok((token, done)) => {
                         finished = done;
-                        if done && caching {
+                        if done && caching && !probe::cold(&request.job.probe) {
                             // A normal finish (the client took the last chunk): the row that
                             // produced the last token follows the turn snapshot.
                             request.turn = logits.row_host(&opened.library, offset + j).ok();

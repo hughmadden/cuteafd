@@ -236,13 +236,28 @@ if [[ -n "$second" && "$split" != off ]]; then
     *) echo "note: $family has no head split; serving from GPU $gpu alone" >&2 ;;
   esac
 fi
+# INSTANCE names a launch that runs beside others on disjoint hardware
+# (`cuteafd bench smoke` sets it): its coordinator container is
+# cuteafd-coordinator-INSTANCE; empty keeps the one cuteafd-coordinator.
+instance="$(get INSTANCE)"
+[[ -z "$instance" || "$instance" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$ ]] || { echo "INSTANCE must be [A-Za-z0-9_.-]" >&2; exit 2; }
+coordinator_name="cuteafd-coordinator${instance:+-$instance}"
+# SPARK_COUNT=0: the routed experts run on the coordinator GPU (--local-experts;
+# GLM 5.3 Flash, MiMo V2 and Qwen 3.8), the natural minimum for checkpoints
+# that fit one RTX.
+if [[ "$ranks" == 0 ]]; then
+  case "$family" in
+    glm5_flash|mimo_v2|qwen4) family_args+=(--local-experts) ;;
+    *) echo "SPARK_COUNT=0 (local experts) serves GLM 5.3 Flash, MiMo V2 and Qwen 3.8, not $family" >&2; exit 2 ;;
+  esac
+fi
 peers=()
 # --restart removes this launcher's containers (stop.sh's release parser rejects
 # the keys above, e.g. SPECULATOR).
 # One model is served at a time: every expert worker on these hosts goes, whatever
 # its port (a leftover worker of another model holds Spark memory and OOMs the next).
 if [[ "$restart" == 1 ]]; then
-  docker rm -f cuteafd-coordinator >/dev/null 2>&1 || true
+  docker rm -f "$coordinator_name" >/dev/null 2>&1 || true
   for ((rank = 0; rank < ranks; rank++)); do
     host="$(get "SPARK_${rank}_HOST")"
     ssh "$host" 'ids=$(docker ps -aq --filter name=^cuteafd-spark-expert-); [ -z "$ids" ] || docker rm -f $ids >/dev/null 2>&1 || true'
@@ -257,7 +272,7 @@ case "$fp8_prefill" in auto|w8a8|w8a16) ;; *) echo "FP8_EXPERT_PREFILL must be a
 # GB10 CUDA allocations cannot reclaim page cache: drop it on the expert hosts first.
 spark_hosts=()
 for ((rank = 0; rank < ranks; rank++)); do spark_hosts+=(--host "$(get "SPARK_${rank}_HOST")"); done
-nest drop-caches "${spark_hosts[@]}" >/dev/null || echo "warning: could not drop Spark page caches" >&2
+((ranks == 0)) || nest drop-caches "${spark_hosts[@]}" >/dev/null || echo "warning: could not drop Spark page caches" >&2
 for ((rank = 0; rank < ranks; rank++)); do
   host="$(get "SPARK_${rank}_HOST")"
   lane="$(get "SPARK_${rank}_LANE_A")"
@@ -279,6 +294,12 @@ for ((rank = 0; rank < ranks; rank++)); do
   done
 done
 peer_csv="$(IFS=,; echo "${peers[*]}")"
+peer_args=()
+[[ -z "$peer_csv" ]] || peer_args=(--peers "$peer_csv")
+# The in-server benchmark keeps its history (SQLite) on the host; the image
+# name labels its reports.
+bench_dir="$HOME/.cache/cuteafd/bench"
+mkdir -p "$bench_dir"
 # SPARK_INTAKE: how routed partials reach the coordinator GPU (auto, gpu, pinned
 # or host; see rust/crates/cuteafd-daemon/src/shared/spark_intake.rs).
 intake="$(get SPARK_INTAKE auto)"
@@ -287,20 +308,20 @@ case "$intake" in auto|gpu|pinned|host) ;; *) echo "SPARK_INTAKE must be auto, g
 # can reach the API port can then read every session's output).
 console_text="$(get CONSOLE_TEXT off)"
 case "$console_text" in on|off) ;; *) echo "CONSOLE_TEXT must be on or off" >&2; exit 2 ;; esac
-docker run -d --name cuteafd-coordinator --restart no --gpus "$gpus" --network host --ipc host \
+docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network host --ipc host \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e "CUTEAFD_SPARK_INTAKE=$intake" \
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" \
-  -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" \
-  -v "$hub:/root/.cache/huggingface/hub:ro" \
+  -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" \
+  -v "$hub:/root/.cache/huggingface/hub:ro" -v "$bench_dir:/root/.cache/cuteafd/bench" \
   "${trace_args[@]}" "$coordinator_image" cuteafd $serve --snapshot "$snapshot" \
-  --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peer_csv" --listen "$addr" \
+  --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
   --max-sequences "$(get CONCURRENCY 8)" --max-context "$(get MAX_CONTEXT_TOKENS 8192)" \
   --max-output "$(get MAX_OUTPUT_TOKENS 4096)" "${dspark_args[@]}" \
   "${family_args[@]}" "${draft_args[@]}" "${served_args[@]}" >/dev/null
 url="http://127.0.0.1:${addr##*:}"
 until curl -sf "$url/health" >/dev/null; do
-  docker ps -q -f name=cuteafd-coordinator | grep -q . ||
-    { echo "coordinator exited:" >&2; docker logs --tail 30 cuteafd-coordinator >&2; exit 1; }
+  docker ps -q -f "name=^$coordinator_name\$" | grep -q . ||
+    { echo "coordinator exited:" >&2; docker logs --tail 30 "$coordinator_name" >&2; exit 1; }
   sleep 2
 done
 echo "API ready at $url/v1/ ($(curl -s "$url/v1/models" | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"][0]["id"])'))"

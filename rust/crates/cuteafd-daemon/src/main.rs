@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use serde::Serialize;
 use std::process::Command;
 
@@ -27,19 +27,27 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let cli = Cli::parse();
+    let parse = |matches: clap::ArgMatches| -> (Commands, clap::ArgMatches) {
+        match Cli::from_arg_matches(&matches) {
+            Ok(cli) => (cli.command, matches),
+            Err(error) => error.exit(),
+        }
+    };
+    let (command, matches) = parse(Cli::command().get_matches());
     // `serve` and `golden` pick the family and stand for its own command.
-    let command = match cli.command {
+    let (command, matches) = match command {
         Commands::Serve(args) => match commands::family::argv(commands::family::Kind::Serve, args)? {
-            Some(argv) => Cli::parse_from(argv).command,
+            Some(argv) => parse(Cli::command().get_matches_from(argv)),
             None => return Ok(()),
         },
         Commands::Golden(args) => match commands::family::argv(commands::family::Kind::Golden, args)? {
-            Some(argv) => Cli::parse_from(argv).command,
+            Some(argv) => parse(Cli::command().get_matches_from(argv)),
             None => return Ok(()),
         },
-        command => command,
+        command => (command, matches),
     };
+    // A serve command's resolved options, for the server's benchmark reports.
+    commands::bench::capture(&matches);
     match command {
         Commands::Serve(_) | Commands::Golden(_) => unreachable!("resolved to a family command above"),
         Commands::Doctor(args) => run_doctor(args),
@@ -92,6 +100,7 @@ async fn main() -> Result<()> {
         }
         Commands::Expertd(args) => shared::experts::service::run(args).await,
         Commands::ServeNative(args) => families::deepseek_v41::v41_native_serve::run(args).await,
+        Commands::Bench(args) => tokio::task::spawn_blocking(move || commands::bench::run(args)).await?,
         Commands::BenchRdma(args) => run_bench_rdma(args),
         Commands::BenchRdmaRing(args) => run_bench_rdma_ring(args),
         Commands::TransportCapabilities(args) => run_transport_capabilities(args),

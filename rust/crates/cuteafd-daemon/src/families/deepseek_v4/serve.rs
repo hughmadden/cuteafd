@@ -15,6 +15,7 @@ use super::prefix::Dsv4Prefix;
 use super::{with_engine, EngineArgs};
 use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
 use crate::shared::prefix::{PrefixArgs, Toggle};
+use crate::shared::probe;
 use crate::shared::console;
 use crate::shared::token_io::{DeviceLogits, RowResult, SelectBatch, TokenSelector};
 use crate::shared::prefill_share::{Chunk, DecodeShareArgs};
@@ -86,12 +87,15 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_context, speculate_max, decode_share, prefix));
     ready_rx.await.context("engine failed before it was ready")??;
+    cuteafd_bench::context::phase("engine loaded");
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
         hub, profile.clone());
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
+    cuteafd_bench::ready(&listener);
     tracing::info!(listen = %args.listen, model = %profile.id, "DeepSeek V4 API is ready");
     tokio::select! {
-        served = axum::serve(listener, router) => served?,
+        served = axum::serve(listener, cuteafd_bench::app(router)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>()) => served?,
         finished = worker => finished??,
     }
     Ok(())
@@ -245,6 +249,7 @@ impl Active<'_> {
 
     /// Streams `token`; returns true when the request is finished.
     fn emit(&mut self, token: u32, eos: u32) -> Result<bool> {
+        probe::token(&self.job.probe, token);
         self.history.push(token);
         self.generated += 1;
         self.buffered += 1;
@@ -305,10 +310,11 @@ fn select_host(constraint: Option<&mut crate::shared::constraints::State<'_>>,
 /// request finished (normally, or because the client left).
 fn finish_row(request: &mut Active<'_>, token: Result<u32>, eos: u32, logits: &DeviceLogits, row: usize,
     caching: bool, library: &cuteafd_ffi::NativeLibrary) -> bool {
+    probe::decode_row(library, &request.job.probe, logits, row, request.generated, request.history.len());
     match token.and_then(|token| request.emit(token, eos)) {
         Ok(false) => false,
         Ok(true) => {
-            if caching {
+            if caching && !probe::cold(&request.job.probe) {
                 request.turn = logits.row_host(library, row).ok();
             }
             true
@@ -353,7 +359,8 @@ fn speculative_step(
     // Verify no more rows than the request may still produce or hold, and no
     // draft the grammar rejects (it could never be kept).
     let sequences: Vec<Vec<u32>> = active.iter().zip(&drafts).map(|(a, draft)| {
-        let room = (a.job.max_tokens - a.generated).min(a.capacity - a.placement.len - 1);
+        let room = if probe::no_speculation(&a.job.probe) { 1 } else {
+            (a.job.max_tokens - a.generated).min(a.capacity - a.placement.len - 1) };
         let mut rows: Vec<u32> =
             std::iter::once(a.next).chain(draft.iter().copied().take(room.saturating_sub(1).min(block))).collect();
         if let Some(state) = a.constraint.as_ref() {
@@ -503,7 +510,8 @@ fn schedule(
                     continue;
                 }
             };
-            let tokens = tokenizer.encode_text(&job.prompt, false)?.token_ids;
+            let tokens = probe::prompt_ids(&job.probe, || Ok(tokenizer.encode_text(&job.prompt, false)?.token_ids))?;
+            let cold = probe::cold(&job.probe);
             if tokens.is_empty() || tokens.len() >= engine.max_context {
                 reject(&job, format!("prompt of {} tokens is outside 1..{}", tokens.len(), engine.max_context));
                 continue;
@@ -513,7 +521,8 @@ fn schedule(
             cache.tick();
             let admit_started = Instant::now();
             // Lookup, fork of the retained units and restore of the mark (byte-exact).
-            let admitted = match cache.admit(&family, &tokens, capacity, true, |units| Placement::new(state, units)) {
+            let lookup: &[u32] = if cold { &[] } else { &tokens };
+            let admitted = match cache.admit(&family, lookup, capacity, true, |units| Placement::new(state, units)) {
                 Ok(admitted) => admitted,
                 Err(error) => {
                     states.push(state);
@@ -522,10 +531,27 @@ fn schedule(
                 }
             };
             let resume = admitted.resume;
+            probe::admitted(&job.probe, "deepseek_v4", &tokens, resume);
             let _ = job.events.send(Ok(InferenceChunk::Ready {
                 system_fingerprint: None,
                 prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: resume },
             }));
+            if let Some(from) = probe::scoring(&job.probe) {
+                // Teacher-forced scoring: every row's logits, no generation, nothing retained.
+                let mut placement = admitted.placement;
+                let scored = probe::score(&loaded.library, &job.probe, &tokens, from, chunk_limit, engine.decode_rows,
+                    &mut (&mut placement, &mut *transports),
+                    |(placement, transports), chunk, logit| engine.prefill_device(placement, chunk, transports, runtime,
+                        usize::from(logit)),
+                    |(placement, transports), chunk| engine.verify_device(&mut [(&mut **placement, chunk)], transports,
+                        runtime));
+                match scored {
+                    Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
+                    Err(error) => { let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}")))); }
+                }
+                release(&family, &mut cache, &mut states, &placement);
+                continue;
+            }
             let ticket = console::admit(tokens.len(), resume, job.max_tokens, constraint.is_some(), job.images.len(),
                 admit_started);
             if let Some(source) = admitted.source {
@@ -540,6 +566,7 @@ fn schedule(
                 // Equal chunks, so no lane runs a tiny tail.
                 let remaining = tokens.len() - resume;
                 let limit = remaining.div_ceil(remaining.div_ceil(chunk_limit));
+                // A cold probe keeps the same chunk plan (identical numerics); it only skips the captures.
                 if cache.enabled() {
                     cuteafd_engine::prefix::plan_points(resume, tokens.len(), limit,
                         &crate::shared::prefix::boundaries(&tokens, &markers), family.capture_reach(),
@@ -573,8 +600,11 @@ fn schedule(
                 if last {
                     // The first token, while this prompt's logits are the workspace's.
                     let logits = logits.context("prefill produced no logits")?;
-                    if caching {
+                    if caching && !probe::cold(&p.job.probe) {
                         p.prompt_row = Some(logits.row_host(&loaded.library, 0)?);
+                    }
+                    if probe::wants_first(&p.job.probe) {
+                        probe::device_rows(&loaded.library, &p.job.probe, &logits, 0, 1, p.tokens.len())?;
                     }
                     let mut batch = SelectBatch::default();
                     batch.push_next(p.job.sampling, p.constraint.as_mut(), p.placement.len as u64)?;
@@ -584,7 +614,7 @@ fn schedule(
                 p.busy += timer.elapsed().as_secs_f64();
                 p.ticket.prefill(rows, p.chunks, p.plan.chunks.len(), timer);
                 // Intermediate snapshot points this chunk ends at (off unless configured).
-                for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks) {
+                for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
                     if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, &p.tokens[..point], &p.placement,
                         After::default()) {
                         tracing::warn!("snapshot point {point} not retained: {error:#}");
@@ -599,7 +629,7 @@ fn schedule(
                     if p.cancelled {
                         p.ticket.cancel();
                         // The client left during the prefill: keep what it computed for a retry.
-                        if placement.len > resume {
+                        if placement.len > resume && !probe::cold(&p.job.probe) {
                             if let Err(error) = cache.park(&family, &p.tokens[..placement.len], &placement) {
                                 tracing::warn!("parking a cancelled prefill: {error:#}");
                             }
@@ -614,8 +644,12 @@ fn schedule(
                 // A whole-prompt hit selects from its retained logits; a prefill selected already.
                 let first = match (p.first, p.logits.as_deref()) {
                     (Some(first), _) => Ok(first),
-                    (None, Some(logits)) => select_host(p.constraint.as_mut(), p.job.sampling, logits,
-                        p.placement.len as u64),
+                    (None, Some(logits)) => {
+                        if probe::wants_first(&p.job.probe) {
+                            probe::host_row(&p.job.probe, p.tokens.len(), logits);
+                        }
+                        select_host(p.constraint.as_mut(), p.job.sampling, logits, p.placement.len as u64)
+                    }
                     (None, None) => Err(anyhow::anyhow!("prefill produced no logits")),
                 };
                 let first = match first {

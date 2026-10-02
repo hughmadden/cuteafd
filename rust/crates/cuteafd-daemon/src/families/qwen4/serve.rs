@@ -29,6 +29,7 @@ use super::speculate::{self, DraftSeq, DraftTiming, MtpSeq, Verified};
 use super::{open, Opened};
 use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
 use crate::shared::prefix::{PrefixArgs, Toggle};
+use crate::shared::probe;
 use crate::shared::token_io::{RowResult, SelectBatch, SelectPlacement, TokenSelector};
 use cuteafd_engine::prefix::{After, MarkArena, PointPlan, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
 use crate::shared::draft_policy::{Calibration, DraftHistory, Shape};
@@ -112,12 +113,15 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, drafts, eos, decode_share, prefix));
     ready_rx.await.context("engine failed before it was ready")??;
+    cuteafd_bench::context::phase("engine loaded");
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
         hub, profile.clone());
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
+    cuteafd_bench::ready(&listener);
     tracing::info!(listen = %args.listen, model = %profile.id, "Qwen 3.8 Flash Next API is ready");
     tokio::select! {
-        served = axum::serve(listener, router) => served?,
+        served = axum::serve(listener, cuteafd_bench::app(router)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>()) => served?,
         finished = worker => finished??,
     }
     Ok(())
@@ -261,6 +265,7 @@ impl Active<'_> {
     /// Streams `token` (special tokens stay text for the Qwen parser); returns
     /// true when the request is finished.
     fn emit(&mut self, token: u32) -> Result<bool> {
+        probe::token(&self.job.probe, token);
         self.history.push(token);
         self.generated += 1;
         self.buffered += 1;
@@ -451,7 +456,8 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                     continue;
                 }
             };
-            let tokens = tokenizer.encode_text(&job.prompt, false)?.token_ids;
+            let tokens = probe::prompt_ids(&job.probe, || Ok(tokenizer.encode_text(&job.prompt, false)?.token_ids))?;
+            let cold = probe::cold(&job.probe);
             if tokens.is_empty() || tokens.len() >= engine.max_context {
                 reject(&job, format!("prompt of {} tokens is outside 1..{}", tokens.len(), engine.max_context));
                 continue;
@@ -466,7 +472,8 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             // Lookup, fork of the retained units and restore of the state mark (byte-exact), with
             // room for the rows a verify may write past the last kept one.
             let start = history_of(&engine.cfg, &[]);
-            let admitted = match cache.admit(&family, &tokens, (capacity + DECODE_ROWS).min(engine.max_context), true,
+            let lookup: &[u32] = if cold { &[] } else { &tokens };
+            let admitted = match cache.admit(&family, lookup, (capacity + DECODE_ROWS).min(engine.max_context), true,
                 |units| Qwen4Placement::new(units, slot, start.clone())) {
                 Ok(admitted) => admitted,
                 Err(error) => {
@@ -480,16 +487,32 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             let mut placement = admitted.placement;
             // The PLE n-gram context at the restore point is a function of the token ids.
             placement.history = history_of(&engine.cfg, &tokens[..resume]);
+            probe::admitted(&job.probe, "qwen4", &tokens, resume);
             let _ = job.events.send(Ok(InferenceChunk::Ready {
                 system_fingerprint: None,
                 prompt_usage: PromptUsage { prompt_tokens: tokens.len(), prompt_cache_hit_tokens: resume },
             }));
+            if let Some(from) = probe::scoring(&job.probe) {
+                // Teacher-forced scoring: every row's logits, no generation, nothing retained.
+                let scored = probe::score(&opened.library, &job.probe, &tokens, from, engine.prefill_rows, DECODE_ROWS,
+                    &mut placement,
+                    |placement, chunk, logit| engine.prefill_device(placement, chunk, None, None, usize::from(logit)),
+                    |placement, chunk| engine.verify_device(&mut [(placement, chunk)], false)?
+                        .context("scoring needs every layer"));
+                match scored {
+                    Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
+                    Err(error) => { let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}")))); }
+                }
+                release(&family, &mut cache, &mut free_slots, &placement);
+                continue;
+            }
             let ticket = console::admit(tokens.len(), resume, job.max_tokens, constraint.is_some(), job.images.len(),
                 admit_started);
             if let Some(source) = admitted.source {
                 tracing::info!(tokens = tokens.len(), resume, kind = ?source.kind, frontier = source.frontier,
                     host = source.host, "prefix cache hit");
             }
+            // A cold probe keeps the same chunk plan (identical numerics); it only skips the captures.
             let plan = if cache.enabled() {
                 cuteafd_engine::prefix::plan_points(resume, tokens.len(), engine.prefill_rows,
                     &crate::shared::prefix::boundaries(&tokens, &markers), family.capture_reach(),
@@ -535,8 +558,11 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                     if end == p.tokens.len() {
                         // The first token, while this prompt's logits are the workspace's.
                         let logits = logits.context("prefill produced no logits")?;
-                        if caching && p.resume < p.tokens.len() {
+                        if caching && !probe::cold(&p.job.probe) && p.resume < p.tokens.len() {
                             p.prompt_row = Some(logits.row_host(&opened.library, 0)?);
+                        }
+                        if probe::wants_first(&p.job.probe) {
+                            probe::device_rows(&opened.library, &p.job.probe, &logits, 0, 1, p.tokens.len())?;
                         }
                         let mut batch = SelectBatch::default();
                         batch.push_next(p.job.sampling, p.constraint.as_mut(), p.placement.len as u64)?;
@@ -555,7 +581,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 p.ticket.prefill(chunk.len(), p.chunks, p.plan.chunks.len(), timer);
                 result?;
                 // Intermediate snapshot points this chunk ends at (off unless configured).
-                for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks) {
+                for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
                     if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, &p.tokens[..point], &p.placement,
                         After::default()) {
                         tracing::warn!("snapshot point {point} not retained: {error:#}");
@@ -570,7 +596,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                     if p.cancelled {
                         p.ticket.cancel();
                         // The client left during the prefill: keep what it computed for a retry.
-                        if placement.len > resume {
+                        if placement.len > resume && !probe::cold(&p.job.probe) {
                             if let Err(error) = cache.park(&family, &p.tokens[..placement.len], &placement) {
                                 tracing::warn!("parking a cancelled prefill: {error:#}");
                             }
@@ -585,8 +611,12 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 // A whole-prompt hit selects from its retained logits; a prefill selected already.
                 let first = match (p.first, p.logits.as_deref()) {
                     (Some(first), _) => Ok(first),
-                    (None, Some(logits)) => select_host(p.constraint.as_mut(), p.job.sampling, logits,
-                        p.placement.len as u64),
+                    (None, Some(logits)) => {
+                        if probe::wants_first(&p.job.probe) {
+                            probe::host_row(&p.job.probe, p.tokens.len(), logits);
+                        }
+                        select_host(p.constraint.as_mut(), p.job.sampling, logits, p.placement.len as u64)
+                    }
                     (None, None) => Err(anyhow::anyhow!("prefill produced no logits")),
                 };
                 let first = match first {
@@ -664,8 +694,8 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
         let (steps_before, draft_s_before) = (timing.steps, timing.seconds);
         // Each sequence verifies its next token plus its drafts within the decode programs' rows.
         let room = (DECODE_ROWS / active.len()).max(1) - 1;
-        let limits: Vec<usize> = active.iter().map(|a| room.min(a.job.max_tokens - a.generated - 1)
-            .min(a.capacity - a.placement.len - 1)).collect();
+        let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
+            room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1) }).collect();
         let proposals: Vec<Vec<u32>> = match drafts {
             Drafts::None => vec![Vec::new(); active.len()],
             Drafts::Copy => active.iter_mut().zip(&limits).map(|(a, &limit)| {
@@ -767,6 +797,8 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
             for j in 0..rows.len() {
                 // Rows 0..=j are committed; the token row j produces is next.
                 request.placement.len = start + j + 1;
+                probe::decode_row(&opened.library, &request.job.probe, &logits, offset + j, request.generated,
+                    request.history.len());
                 match take(request.constraint.as_mut(), &selected[offset + j]).and_then(|t| {
                     // The token's PLE rows page in during emission, the commit and (MTP)
                     // drafting, before the step that feeds it gathers them.
@@ -776,7 +808,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                     Ok((token, done)) => {
                         last = Some((j + 1, token));
                         finished = done;
-                        if done && caching {
+                        if done && caching && !probe::cold(&request.job.probe) {
                             // A normal finish (the client took the last chunk): the row that
                             // produced the last token follows the turn snapshot.
                             request.turn = logits.row_host(&opened.library, offset + j).ok();

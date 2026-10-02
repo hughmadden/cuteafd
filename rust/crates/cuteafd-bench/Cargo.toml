@@ -1,0 +1,32 @@
+[package]
+name = "cuteafd-bench"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-server benchmark runner: panels driven over the server's own OpenAI API, SVG/PNG/JSON reports, SQLite history"
+
+[dependencies]
+anyhow.workspace = true
+async-stream.workspace = true
+axum.workspace = true
+clap.workspace = true
+cuteafd-api = { path = "../cuteafd-api" }
+cuteafd-loader = { path = "../cuteafd-loader" }
+cuteafd-transport = { path = "../cuteafd-transport" }
+futures.workspace = true
+jsonschema = { version = "=0.18.3", default-features = false, features = ["draft201909", "draft202012"] }
+rusqlite = { version = "=0.37.0", features = ["bundled"] }
+resvg = { version = "0.45", default-features = false, features = ["text"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+ureq = "=2.12.1"
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true

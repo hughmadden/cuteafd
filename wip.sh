@@ -164,6 +164,8 @@ source_revision="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || echo unknow
   source_revision+=" dirty"
 [[ "$(cat "$staging_dir/.cuteafd-source-revision" 2>/dev/null || true)" == "$source_revision" ]] ||
   printf '%s\n' "$source_revision" >"$staging_dir/.cuteafd-source-revision"
+# The frozen tree has no .git: its identity goes in BUILD_IDENTITY.json for report footers.
+"$repo_root/scripts/build/write-build-identity.sh" "$repo_root" "$staging_dir/BUILD_IDENTITY.json"
 python3 "$staging_dir/scripts/build/verify-sparkinfer-source.py" \
   --source "$staging_dir/third_party/sparkinfer" \
   --lock "$staging_dir/third_party/sparkinfer.lock.json"

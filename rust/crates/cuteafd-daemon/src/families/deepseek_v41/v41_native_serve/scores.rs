@@ -35,6 +35,10 @@ impl TokenScores {
         let best = argmax(&bytes, None)?;
         Ok(Self { bytes: bytes.into(), best })
     }
+    /// The row as f32 logits (benchmark probes).
+    pub fn logits(&self) -> Result<Vec<f32>> {
+        row_logits(&self.bytes)
+    }
     pub fn select(&self, mask: Option<&[u32]>) -> Result<u32> {
         match mask {
             None => Ok(self.best),

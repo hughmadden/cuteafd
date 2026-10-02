@@ -9,7 +9,8 @@ pub(super) struct Prepared {
 impl Prepared {
     pub fn new(mut job: NativeRequest, snapshot: &std::path::Path,
         limits: cuteafd_api::openai::NativeLimits) -> Result<Self> {
-        let prompt = cuteafd_loader::encode_tokenizer_text(snapshot, &job.prompt, false)?.token_ids;
+        let prompt = crate::shared::probe::prompt_ids(&job.probe,
+            || Ok(cuteafd_loader::encode_tokenizer_text(snapshot, &job.prompt, false)?.token_ids))?;
         let (prompt, images) = if job.images.is_empty() { (prompt, Vec::new()) } else {
             let expanded = cuteafd_loader::V41VisionPrompt::expand(&prompt,
                 std::mem::take(&mut job.images), limits.context() as usize)?;
@@ -69,7 +70,7 @@ mod tests {
     fn cancelled_pending_request_wakes_admission_without_waiting_for_retirement() {
         let (events, output) = mpsc::unbounded_channel();
         let job = NativeRequest { prompt: String::new(), constraint: None, images: Vec::new(),
-            max_tokens: 1, sampling: Default::default(), stop_token_ids: Vec::new(), events };
+            max_tokens: 1, sampling: Default::default(), stop_token_ids: Vec::new(), events, probe: None };
         let wake = Wake { blocked_at: Some(2), pending: Some(&job) };
         assert!(!wake.ready(2, 16, true));
         drop(output);

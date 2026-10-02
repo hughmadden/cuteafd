@@ -16,6 +16,7 @@ use deepseek_recipe::{
     util::append_delta::AppendDelta,
 };
 use deepseek_recipe_encoding::{v4::dsv4::DeepseekV4Encoding, v4::dsv41::DeepseekV41Encoding, PromptEncoding};
+use deepseek_recipe_core::conversation::ReasoningEffort;
 use cuteafd_core::TargetSamplingParams;
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -111,6 +112,7 @@ pub use constraints::NativeConstraint;
 mod images;
 pub mod console;
 pub use console::ConsoleHub;
+pub mod probe;
 #[cfg(test)]
 mod unicode_tests;
 pub use limits::{NativeLimits, MAX_CONTEXT_TOKENS, MAX_OUTPUT_TOKENS};
@@ -149,6 +151,8 @@ pub struct NativeRequest {
     /// DeepSeek engines keep their built-in EOS handling.
     pub stop_token_ids: Vec<u32>,
     pub events: mpsc::UnboundedSender<Result<InferenceChunk, NativeFailure>>,
+    /// Benchmark diagnostics for this request (`probe::HEADER`); `None` for every ordinary client.
+    pub probe: Option<Arc<probe::Probe>>,
 }
 /// Serving statistics the CUDA owner publishes (a JSON object; `null` until the first publish).
 pub type SharedStats = Arc<Mutex<Value>>;
@@ -324,7 +328,8 @@ impl OutputProcessor {
     }
 }
 
-async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> Response {
+async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, Json(mut body): Json<Value>) -> Response {
+    let probe = headers.get(probe::HEADER).and_then(|v| v.to_str().ok()).and_then(|id| probe::registry().claim(id));
     // Families rendered from the checkpoint's own chat template.
     let glm = match &state.profile.encoding {
         ModelEncoding::Glm(encoding) => Some(Templated::Glm(encoding.clone())),
@@ -374,6 +379,12 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> 
     }
     let sampling = match request_target_sampling(&body) {
         Ok(sampling) => sampling,
+        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+    };
+    // V4.1's checkpoint encoder also takes a numeric budget (1-100), which the
+    // adapter's enum cannot parse: take it out here and apply it after rendering.
+    let v41_budget = match v41_numeric_effort(&mut body, &state.profile.encoding) {
+        Ok(budget) => budget,
         Err(message) => return error(StatusCode::BAD_REQUEST, message),
     };
     // The adapter's `seed` field is `u64`; cuteafd keeps the signed convention,
@@ -499,7 +510,12 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> 
             let rendered = if matches!(state.profile.encoding, ModelEncoding::DeepseekV4) {
                 DeepseekV4Encoding::new().render_conversation(&converted.conversation)
             } else {
-                DeepseekV41Encoding::new().render_conversation(&converted.conversation)
+                let mut rendered = DeepseekV41Encoding::new().render_conversation(&converted.conversation);
+                if converted.conversation.thinking_mode {
+                    let budget = v41_budget.unwrap_or_else(|| v41_effort_budget(converted.conversation.reasoning_effort));
+                    rendered.prompt = v41_set_effort_budget(rendered.prompt, budget);
+                }
+                rendered
             };
             (rendered.prompt, rendered.image_sources,
                 OutputProcessor::Deepseek(StreamProcessor::new(generator, converted.parsing_options)))
@@ -554,6 +570,7 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> 
         sampling,
         stop_token_ids,
         events,
+        probe,
     };
     permit.send(job);
     // Admission errors must retain their cause and HTTP status, including for
@@ -658,6 +675,59 @@ async fn chat(State(state): State<NativeState>, Json(mut body): Json<Value>) -> 
         return error(StatusCode::INTERNAL_SERVER_ERROR, message);
     }
     Json(response).into_response()
+}
+
+/// V4.1 reasoning-effort budgets from the checkpoint's own encoder
+/// (`encoding/encoding.py`: low 25, high 50, xhigh 75, max 100, default high).
+/// The recipe crate renders 50/75/75/100 with 75 by default.
+fn v41_effort_budget(effort: Option<ReasoningEffort>) -> u8 {
+    match effort {
+        Some(ReasoningEffort::Low) => 25,
+        None | Some(ReasoningEffort::High) => 50,
+        Some(ReasoningEffort::Xhigh) => 75,
+        Some(ReasoningEffort::Max) => 100,
+    }
+}
+
+/// Removes an integer `reasoning_effort` (top level or `chat_template_kwargs`)
+/// for V4.1 and returns it; a named level stays for the adapter.
+fn v41_numeric_effort(body: &mut Value, encoding: &ModelEncoding) -> Result<Option<u8>, String> {
+    if !matches!(encoding, ModelEncoding::DeepseekV41) {
+        return Ok(None);
+    }
+    let mut budget = None;
+    let top = body.get("reasoning_effort").cloned();
+    let kwargs = body.get("chat_template_kwargs").and_then(|v| v.get("reasoning_effort")).cloned();
+    for (value, nested) in [(top, false), (kwargs, true)] {
+        let Some(Value::Number(number)) = value else { continue };
+        let Some(number) = number.as_u64().filter(|n| (1..=100).contains(n)) else {
+            return Err("reasoning_effort must be low, high, xhigh, max, none or an integer 1-100".into());
+        };
+        budget.get_or_insert(number as u8);
+        if nested {
+            if let Some(kwargs) = body.get_mut("chat_template_kwargs").and_then(Value::as_object_mut) {
+                kwargs.remove("reasoning_effort");
+            }
+        } else if let Some(object) = body.as_object_mut() {
+            object.remove("reasoning_effort");
+            // A numeric budget asks for thinking, like a named level does.
+            if object.get("thinking").map_or(true, Value::is_null) {
+                object.insert("thinking".into(), json!({"type": "enabled"}));
+            }
+        }
+    }
+    Ok(budget)
+}
+
+/// Rewrites the budget in the rendered `Reasoning Effort: N (range 1-100` prefix.
+fn v41_set_effort_budget(prompt: String, budget: u8) -> String {
+    const PREFIX: &str = "Reasoning Effort: ";
+    let Some(start) = prompt.find(PREFIX).map(|i| i + PREFIX.len()) else { return prompt };
+    let digits = prompt[start..].bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || !prompt[start + digits..].starts_with(" (range 1-100") {
+        return prompt;
+    }
+    format!("{}{budget}{}", &prompt[..start], &prompt[start + digits..])
 }
 
 #[cfg(test)]
@@ -846,11 +916,14 @@ mod tests {
     #[tokio::test]
     async fn thinking_defaults_high_and_honors_explicit_overrides() {
         for (options, score) in [
-            (json!({}), Some(75)),
-            (json!({"thinking":{"type":"enabled"}}), Some(75)),
-            (json!({"reasoning_effort":"low"}), Some(50)),
-            (json!({"reasoning_effort":"high"}), Some(75)),
+            (json!({}), Some(50)),
+            (json!({"thinking":{"type":"enabled"}}), Some(50)),
+            (json!({"reasoning_effort":"low"}), Some(25)),
+            (json!({"reasoning_effort":"high"}), Some(50)),
+            (json!({"reasoning_effort":"xhigh"}), Some(75)),
             (json!({"reasoning_effort":"max"}), Some(100)),
+            (json!({"reasoning_effort":37}), Some(37)),
+            (json!({"chat_template_kwargs":{"reasoning_effort":90}}), Some(90)),
             (json!({"reasoning_effort":"none"}), None),
             (json!({"thinking":{"type":"disabled"},"reasoning_effort":"max"}), None),
         ] {

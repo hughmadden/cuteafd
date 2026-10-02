@@ -56,3 +56,6 @@ native/build-sampling/
 data/*.sqlite-*
 # Local scratch (never /mnt/scratch).
 /.cache/
+
+# Source identity for builds without .git (scripts/build/write-build-identity.sh)
+BUILD_IDENTITY.json
