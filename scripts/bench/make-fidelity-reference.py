@@ -42,7 +42,11 @@ def main() -> None:
     logits = logits.reshape(t, vocab)
     end = min(t, args.start + args.positions)
     snapshot = pathlib.Path(meta.get("snapshot", ""))
-    tokenizer = snapshot / "tokenizer.json"
+    # Goldens run in containers that mount the hub at /root/.cache/huggingface/hub.
+    container_hub = pathlib.Path("/root/.cache/huggingface/hub")
+    local = pathlib.Path.home() / ".cache/huggingface/hub" / snapshot.relative_to(container_hub) \
+        if snapshot.is_relative_to(container_hub) else snapshot
+    tokenizer = local / "tokenizer.json"
     ids, lps, tail, nxt = [], [], [], []
     for p in range(args.start, end):
         # Row p - 1 predicts token p.
@@ -67,7 +71,7 @@ def main() -> None:
             "reference": meta.get("reference", "family golden.py"),
             "experts_snapshot": meta.get("experts_snapshot"),
         },
-        "tokenizer_sha256": hashlib.sha256(tokenizer.read_bytes()).hexdigest() if tokenizer.is_file() else None,
+        "tokenizer_sha256": hashlib.sha256(tokenizer.read_bytes()).hexdigest() if tokenizer.exists() else None,
         "vocab": vocab,
         "tokens": [int(x) for x in tokens[:end]],
         "score_from": args.start,

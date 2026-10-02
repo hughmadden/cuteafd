@@ -714,6 +714,51 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     result
 }
 
+/// A benchmark probe's teacher-forced scoring pass finished: the request
+/// already sent its Finish and is released without a failure.
+#[derive(Debug, thiserror::Error)]
+#[error("teacher-forced scoring finished")]
+pub(crate) struct ScoringDone;
+
+/// Teacher-forced scoring (a benchmark probe): prefill `tokens[..from]`, then
+/// continue in chunks of at most 64 rows with every row's logits, recording the
+/// row that predicts each of `tokens[from..]`. Returns [`ScoringDone`] when done.
+#[allow(clippy::too_many_arguments)]
+fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
+    pass: &mut P, other: &mut P, requests: &mut Requests<'a>, transport: &mut P::Transport,
+    other_transport: &mut P::Transport, lease: crate::families::deepseek_v41::v41_backbone_cache::CacheLease,
+    tokens: &[u32], from: usize, chunk_rows: usize, job: &NativeRequest,
+    mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, hold: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+    let probe = job.probe.as_ref().context("scoring without a probe")?;
+    ensure!(tokens.len() >= 2, "scoring needs at least two tokens");
+    let from = from.clamp(1, tokens.len() - 1);
+    let first = prefill(lib, runtime, pass, other, requests, transport, other_transport, lease, &tokens[..from],
+        chunk_rows, job, draft.as_deref_mut(), hold)?;
+    probe.row(from, &first.logits()?);
+    let mut at = from;
+    for chunk in tokens[from..tokens.len() - 1].chunks(64) {
+        ensure!(!job.events.is_closed(), "client disconnected");
+        let mut batch = requests.prepare(&[RequestTokens { lease, tokens: chunk,
+            image_mask: None, kind: ExpertV2SourceKind::Prefill }])?;
+        let selected: Vec<usize> = (0..chunk.len()).collect();
+        let result = (|| -> Result<Vec<u8>> {
+            let bytes = runtime.block_on(unsafe { pass.prefill_logits(lib, requests, &mut batch, transport,
+                &selected, None) })?;
+            runtime.block_on(pass.commit_prefill(requests, &mut batch, draft.as_deref_mut(), chunk.len() as u32))?;
+            Ok(bytes)
+        })();
+        if result.is_err() { pass.discard(&mut batch)?; }
+        let bytes = result?;
+        ensure!(bytes.len() == chunk.len() * super::v41_native_serve::scores::ROW_BYTES, "scoring logits extent differs");
+        for (j, row) in bytes.chunks_exact(super::v41_native_serve::scores::ROW_BYTES).enumerate() {
+            probe.row(at + j + 1, &TokenScores::new(row.to_vec())?.logits()?);
+        }
+        at += chunk.len();
+    }
+    let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length }));
+    Err(ScoringDone.into())
+}
+
 fn prefill_continuation<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
     pass: &mut P, requests: &mut Requests<'a>, transport: &mut P::Transport,
     lease: crate::families::deepseek_v41::v41_backbone_cache::CacheLease, tokens: &[u32], chunk_rows: usize,

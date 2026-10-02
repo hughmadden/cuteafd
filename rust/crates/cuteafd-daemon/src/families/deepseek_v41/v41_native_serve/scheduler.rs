@@ -356,13 +356,15 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                         else { "cuteafd-native-fp4-kv" }.into()),
                     prompt_usage: PromptUsage { prompt_tokens: prompt.len(), prompt_cache_hit_tokens: cached },
                 }))?;
-                match crate::shared::probe::scoring(&job.probe) {
-                    // Teacher-forced scoring needs every prefill row's logits: not on V4.1 yet.
-                    Some(_) => if let Some(probe) = &job.probe { probe.fail("teacher-forced scoring is not available on V4.1") },
-                    None => crate::shared::probe::admitted(&job.probe, "deepseek_v41", &prompt, cached),
-                }
+                crate::shared::probe::admitted(&job.probe, "deepseek_v41", &prompt, cached);
                 console::totals::admitted(prompt.len(), cached);
                 counted = true;
+                if let Some(from) = crate::shared::probe::scoring(&job.probe) {
+                    P::begin_request(first_transport)?; P::begin_request(second_transport)?;
+                    super::score(lib, runtime, first, second, requests, first_transport, second_transport, lease,
+                        &prompt, from, args.prefill_batch_tokens as usize, &job, draft.as_deref_mut(),
+                        &mut || prefixes.prefill_hold())?;
+                }
                 console::lifecycle(console::Event::Admit { id, at: restore.0, prompt: prompt.len() as u32,
                     cached: cached as u32, max: job.max_tokens as u32, lane: lane as u8,
                     grammar: constraint.is_some(), images: image_count });
@@ -402,6 +404,11 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                         request.finished = true;
                     }
                     active[slot] = Some(request); loads[lane] += 1;
+                }
+                Err(error) if error.downcast_ref::<super::ScoringDone>().is_some() => {
+                    console::totals::retired();
+                    requests.release_if_present(lease)?;
+                    if let Some(draft) = draft.as_deref_mut() { draft.release(id)?; }
                 }
                 Err(error) => {
                     // Other completed requests retain their caches.
@@ -922,8 +929,15 @@ fn use_sampled_terminal(supports_terminal: bool, routable: bool) -> bool {
 /// the CPU because one row has `top_k = 300` would force every greedy and
 /// stochastic peer in the round to download full logits, which contract
 /// §7.1.15 forbids.
+/// Whether a benchmark probe in this round wants decode rows recorded: the
+/// round then takes the whole-round CPU path, which downloads every row.
+pub(super) fn probe_rows_wanted<'a>(active: &[Option<Active<'a>>], members: &[usize]) -> bool {
+    members.iter().any(|&slot| active[slot].as_ref().is_some_and(|request|
+        request.job.probe.as_ref().is_some_and(|p| request.generated < p.spec.record_rows)))
+}
+
 fn round_has_device_rows<'a>(active: &[Option<Active<'a>>], members: &[usize]) -> bool {
-    !members.is_empty()
+    !probe_rows_wanted(active, members) && !members.is_empty()
         && members.iter().any(|&slot| {
             active[slot]
                 .as_ref()
@@ -1223,6 +1237,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     let prepare_us = prepare_start.elapsed().as_micros() as u64;
     let prepared_us = started.elapsed().as_micros() as u64;
     let compact = !tracing::enabled!(target: "cuteafd::logit_trace", tracing::Level::DEBUG)
+        && !probe_rows_wanted(active, members)
         && members.iter().all(|&slot| {
             let request = active[slot].as_ref().unwrap();
             request.constraint.is_none() && request.job.sampling.is_greedy()
@@ -1637,6 +1652,15 @@ fn prepare_commit_lane<'a, C: DraftChain<'a>>(lane: usize,
                 eos=decision.eos, length_limit=decision.length_limit,
                 verify_us,
                 "native draft policy observation");
+        }
+        if let Some(probe) = request.job.probe.as_ref().filter(|p| request.generated < p.spec.record_rows) {
+            // Rows of the tokens this round keeps (the round downloaded every row).
+            for j in 0..decision.accepted_inputs as usize {
+                if request.generated + j >= probe.spec.record_rows || !next.has_row_logits(offset + j) {
+                    break;
+                }
+                probe.row(request.tokens.len() + j, &next.retain(offset + j)?.logits()?);
+            }
         }
         accepted_drafts += decision.accepted_inputs - 1;
         emitted += decision.emitted.len();

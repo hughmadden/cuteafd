@@ -116,6 +116,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
                 let selected: Vec<_> = (0..current.cache()?.positions().len()).collect();
                 let active_borrow = active.borrow();
                 let compact = !tracing::enabled!(target: "cuteafd::logit_trace", tracing::Level::DEBUG)
+                    && !super::probe_rows_wanted(&active_borrow, &members)
                     && members.iter().all(|&slot| {
                         let request = active_borrow[slot].as_ref().unwrap();
                         request.constraint.is_none() && request.job.sampling.is_greedy()
