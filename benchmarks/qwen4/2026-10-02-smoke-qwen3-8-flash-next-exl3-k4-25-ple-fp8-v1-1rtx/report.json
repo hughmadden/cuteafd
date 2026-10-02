@@ -1,0 +1,1012 @@
+{
+  "schema": "cuteafd.bench.report/1",
+  "id": "c8bbccc45ada45f09b74aacf48a4c538",
+  "created": "2026-10-02T06:42:56Z",
+  "finished": "2026-10-02T06:43:25Z",
+  "status": "done",
+  "profile": "smoke",
+  "plan": [
+    {
+      "id": "hardware",
+      "passes": 1
+    },
+    {
+      "id": "configuration",
+      "passes": 1
+    }
+  ],
+  "server": {
+    "model": "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1",
+    "family": "qwen4",
+    "revision": "888306bd3996d6317758c07df50622829259ad17",
+    "build": {
+      "version": "0.1.0",
+      "release": "v0.1.0",
+      "image": "ghcr.io/tpurtell/cuteafd-coordinator:v0.1.0",
+      "remote": null,
+      "commit": "7936046a1a4a0cc1c20a71421125e4a65e71c91b",
+      "dirty": false
+    },
+    "hardware": {
+      "host": "raptor",
+      "gpus": [
+        {
+          "index": 0,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+          "uuid": "GPU-95f8f212-9131-df99-fd53-7535965197d7",
+          "memory_mib": 97887,
+          "power_limit_w": 325.0,
+          "power_max_w": 600.0,
+          "sm_count": 188,
+          "compute_cap": "12.0",
+          "pcie": "Gen5 x16",
+          "used": true
+        }
+      ],
+      "driver": "595.91.07",
+      "cuda": "13.2",
+      "sparks": [],
+      "fabric": [
+        {
+          "device": "mlx5_0",
+          "port": 1,
+          "active": true,
+          "link_gbps": 400.0,
+          "pcie": "32 GT/s x16",
+          "netdev": "enp1s0np0",
+          "subnets": [
+            "10.55.0.0/24",
+            "10.55.1.0/24"
+          ]
+        }
+      ],
+      "rails": "fabric: use 2 rail(s) of [mlx5_0@10.55.0.22/24 400G(eff 400G), mlx5_0@10.55.1.22/24 400G(eff 400G)]: 2 subnets share one 400 Gb/s port; each rail is a subnet of the same link"
+    },
+    "configuration": {
+      "snapshot": "/root/.cache/huggingface/hub/models--wrldsuksgo2mars--Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1/snapshots/888306bd3996d6317758c07df50622829259ad17",
+      "quant": [
+        {
+          "group": "embedding",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "lm head",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "attention",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "indexer",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "hyper connection",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "router",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "shared expert",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "routed expert",
+          "formats": [
+            "exl3-k4",
+            "exl3-k5"
+          ]
+        },
+        {
+          "group": "mapped table",
+          "formats": [
+            "bf16",
+            "fp8-unscaled",
+            "int"
+          ]
+        },
+        {
+          "group": "table projection",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "speculator",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "speculator expert",
+          "formats": [
+            "exl3-k4",
+            "exl3-k5"
+          ]
+        },
+        {
+          "group": "vision",
+          "formats": [
+            "bf16"
+          ]
+        }
+      ],
+      "speculator": "MTP ×3",
+      "layout": "1 RTX · experts on the coordinator",
+      "settings": [
+        {
+          "name": "snapshot",
+          "value": "/root/.cache/huggingface/hub/models--wrldsuksgo2mars--Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1/snapshots/888306bd3996d6317758c07df50622829259ad17",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "native-lib",
+          "value": "/opt/cuteafd/lib/libcuteafd_native.so",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "manifest",
+          "value": "/opt/cuteafd/share/PROGRAMS.json",
+          "default": "/opt/cuteafd/share/PROGRAMS.json",
+          "source": "default"
+        },
+        {
+          "name": "device",
+          "value": "0",
+          "default": "0",
+          "source": "default"
+        },
+        {
+          "name": "max-context",
+          "value": "32768",
+          "default": "65536",
+          "source": "cli"
+        },
+        {
+          "name": "pool-tokens",
+          "value": "32768",
+          "default": "32768",
+          "source": "default"
+        },
+        {
+          "name": "slots",
+          "value": "8",
+          "default": "8",
+          "source": "default"
+        },
+        {
+          "name": "prefill-rows",
+          "value": "4096",
+          "default": "4096",
+          "source": "default"
+        },
+        {
+          "name": "fp8-decode",
+          "value": "true",
+          "default": "true",
+          "source": "default"
+        },
+        {
+          "name": "fp8-scales",
+          "value": "amax",
+          "default": "amax",
+          "source": "default"
+        },
+        {
+          "name": "table-placement",
+          "value": "mapped",
+          "default": "mapped",
+          "source": "default"
+        },
+        {
+          "name": "table-threads",
+          "value": "16",
+          "default": "16",
+          "source": "default"
+        },
+        {
+          "name": "table-cache-mib",
+          "value": "0",
+          "default": "0",
+          "source": "default"
+        },
+        {
+          "name": "table-prefetch",
+          "value": "true",
+          "default": "true",
+          "source": "default"
+        },
+        {
+          "name": "table-warm",
+          "value": "true",
+          "default": "true",
+          "source": "default"
+        },
+        {
+          "name": "table-warm-mib-s",
+          "value": "1024",
+          "default": "1024",
+          "source": "default"
+        },
+        {
+          "name": "local-experts",
+          "value": "true",
+          "default": "false",
+          "source": "cli"
+        },
+        {
+          "name": "shared-only",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "expert-window",
+          "value": "16",
+          "default": "16",
+          "source": "default"
+        },
+        {
+          "name": "exl3-window",
+          "value": "48",
+          "default": "48",
+          "source": "default"
+        },
+        {
+          "name": "expert-reserve-gib",
+          "value": "12",
+          "default": "12",
+          "source": "default"
+        },
+        {
+          "name": "mtp",
+          "value": "3",
+          "default": "0",
+          "source": "cli"
+        },
+        {
+          "name": "mtp-fp8-head",
+          "value": "true",
+          "default": "true",
+          "source": "default"
+        },
+        {
+          "name": "embed-placement",
+          "value": "gpu",
+          "default": "gpu",
+          "source": "default"
+        },
+        {
+          "name": "token-select",
+          "value": "device",
+          "default": "device",
+          "source": "default"
+        },
+        {
+          "name": "listen",
+          "value": "0.0.0.0:8321",
+          "default": "0.0.0.0:8000",
+          "source": "cli"
+        },
+        {
+          "name": "max-output",
+          "value": "4096",
+          "default": "4096",
+          "source": "cli"
+        },
+        {
+          "name": "max-sequences",
+          "value": "8",
+          "default": "4",
+          "source": "cli"
+        },
+        {
+          "name": "no-copy-drafts",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "mtp-fixed",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "decode-share",
+          "value": "0.2",
+          "default": "0.2",
+          "source": "default"
+        },
+        {
+          "name": "prefix-cache-entries",
+          "value": "20",
+          "default": "20",
+          "source": "cli"
+        },
+        {
+          "name": "prefix-cache-mark-mib",
+          "value": "2048",
+          "default": "2048",
+          "source": "default"
+        },
+        {
+          "name": "prefix-cache-min-tokens",
+          "value": "64",
+          "default": "64",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-bytes",
+          "value": "0",
+          "default": "0",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-min-tokens",
+          "value": "512",
+          "default": "512",
+          "source": "default"
+        },
+        {
+          "name": "prefix-point-gap",
+          "value": "0",
+          "default": "0",
+          "source": "default"
+        },
+        {
+          "name": "prefix-point-boundaries",
+          "value": "0",
+          "default": "0",
+          "source": "default"
+        },
+        {
+          "name": "prefix-points-per-request",
+          "value": "4",
+          "default": "4",
+          "source": "default"
+        },
+        {
+          "name": "prefix-partial",
+          "value": "off",
+          "default": "off",
+          "source": "default"
+        },
+        {
+          "name": "console-text",
+          "value": "false",
+          "default": "false",
+          "source": "env"
+        },
+        {
+          "name": "CUTEAFD_FP8_EXPERT_PREFILL",
+          "value": "auto",
+          "default": "auto",
+          "source": "env"
+        },
+        {
+          "name": "CUTEAFD_SPARK_INTAKE",
+          "value": "auto",
+          "default": "auto",
+          "source": "env"
+        }
+      ]
+    },
+    "readiness_s": 6.269986556,
+    "started": "2026-10-02T06:42:48Z"
+  },
+  "fingerprint": "be43adfa775cd845",
+  "baseline": {
+    "fingerprint": "be43adfa775cd845",
+    "run_id": "c8bbccc45ada45f09b74aacf48a4c538",
+    "created": "2026-10-02T06:43:00Z",
+    "card": {
+      "decode": [
+        {
+          "content": "code",
+          "tok_s": 261.4924762925675,
+          "runs": [
+            {
+              "prompt_tokens": 63,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 0.043452913,
+              "total_s": 1.263409183,
+              "decode_s": 1.219920376,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          ],
+          "acceptance": null
+        },
+        {
+          "content": "prose",
+          "tok_s": 167.93392943933037,
+          "runs": [
+            {
+              "prompt_tokens": 63,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 0.045596544,
+              "total_s": 1.945178698,
+              "decode_s": 1.899556576,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          ],
+          "acceptance": null
+        },
+        {
+          "content": "json",
+          "tok_s": 291.30220560149854,
+          "runs": [
+            {
+              "prompt_tokens": 88,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 0.05153585,
+              "total_s": 1.156113888,
+              "decode_s": 1.09508268,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          ],
+          "acceptance": null
+        }
+      ],
+      "prefill": {
+        "prompt_tokens": 7977,
+        "tok_s": 6693.649303766365,
+        "ttft_s": 1.191726611,
+        "runs": [
+          {
+            "prompt_tokens": 7977,
+            "completion_tokens": 1,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "ttft_s": 1.191726611,
+            "total_s": 1.19179237,
+            "decode_s": 0.0,
+            "reasoning_end_s": null,
+            "finish_reason": "length"
+          }
+        ]
+      },
+      "warmup_s": 11.777289956,
+      "capacity": {
+        "kv_tokens": 32768,
+        "kv_pages": 128,
+        "kv_format": "BF16 full-attention + GDN/PLE state",
+        "max_requests": 8,
+        "max_context": 32768,
+        "max_output": 4096,
+        "host_cache_bytes": 0
+      }
+    },
+    "quality": {
+      "status": "pass",
+      "checks": [
+        {
+          "id": "fidelity",
+          "title": "Logit fidelity",
+          "status": "pass",
+          "summary": "KL 0.034 · top-1 88.5% · NLL 3.297 vs 3.338 · 512 tokens vs Qwen 3.8 Flash Next reference",
+          "metrics": {
+            "kl": 0.033695934552013494,
+            "top1": 0.884765625,
+            "nll": 3.296991311816029,
+            "ref_nll": 3.3379509795032334,
+            "positions": 512,
+            "missing": 0,
+            "kl_max": 0.15,
+            "top1_min": 0.8,
+            "reference": "Qwen 3.8 Flash Next"
+          },
+          "seconds": 1.539011381
+        },
+        {
+          "id": "cache_exact",
+          "title": "Prefix-cache restore",
+          "status": "info",
+          "summary": "prompt end: 1565 restored, 2 rows byte-identical · turn end: 1307 restored, 1 rows byte-identical · the turn's greedy text did not reproduce",
+          "metrics": {
+            "prompt_tokens": 1565,
+            "prompt_restored": 1565,
+            "prompt_rows_compared": 2,
+            "turn_tokens": 1307,
+            "turn_restored": 1307,
+            "turn_rows_compared": 1
+          },
+          "seconds": 0.932647281
+        },
+        {
+          "id": "spec_lossless",
+          "title": "Speculation lossless",
+          "status": "pass",
+          "summary": "MTP ×3: 128 greedy tokens identical with drafts on and off (165 vs 88.3 tok/s)",
+          "metrics": {
+            "tokens": 128,
+            "identical_prefix": 128,
+            "speculator": "MTP ×3",
+            "decode_tok_s_on": 165.28439500649657,
+            "decode_tok_s_off": 88.26276362369151
+          },
+          "seconds": 2.285844743
+        },
+        {
+          "id": "template",
+          "title": "Template round trip",
+          "status": "info",
+          "summary": "tool call parsed · reasoning kept · re-render differs at token 301 of 402",
+          "metrics": {
+            "reasoning_chars": 129,
+            "rendered_prefix": 301,
+            "turn_tokens": 402,
+            "cached_tokens": 0
+          },
+          "seconds": 0.650492327
+        },
+        {
+          "id": "c1_c4",
+          "title": "C1 vs C4 divergence",
+          "status": "info",
+          "summary": "4 of 4 concurrent greedy outputs identical to C1 (64 tokens)",
+          "metrics": {
+            "identical": 4
+          },
+          "seconds": 1.10832552
+        }
+      ]
+    },
+    "seconds": 25.033409231
+  },
+  "panels": [
+    {
+      "id": "hardware",
+      "title": "Hardware",
+      "status": "done",
+      "passes": [
+        {
+          "hardware": {
+            "host": "raptor",
+            "gpus": [
+              {
+                "index": 0,
+                "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+                "uuid": "GPU-95f8f212-9131-df99-fd53-7535965197d7",
+                "memory_mib": 97887,
+                "power_limit_w": 325.0,
+                "power_max_w": 600.0,
+                "sm_count": 188,
+                "compute_cap": "12.0",
+                "pcie": "Gen5 x16",
+                "used": true
+              }
+            ],
+            "driver": "595.91.07",
+            "cuda": "13.2",
+            "sparks": [],
+            "fabric": [
+              {
+                "device": "mlx5_0",
+                "port": 1,
+                "active": true,
+                "link_gbps": 400.0,
+                "pcie": "32 GT/s x16",
+                "netdev": "enp1s0np0",
+                "subnets": [
+                  "10.55.0.0/24",
+                  "10.55.1.0/24"
+                ]
+              }
+            ],
+            "rails": "fabric: use 2 rail(s) of [mlx5_0@10.55.0.22/24 400G(eff 400G), mlx5_0@10.55.1.22/24 400G(eff 400G)]: 2 subnets share one 400 Gb/s port; each rail is a subnet of the same link"
+          },
+          "readiness_s": 6.269986556
+        }
+      ],
+      "started": "2026-10-02T06:43:25Z",
+      "finished": "2026-10-02T06:43:25Z",
+      "seconds": 0.000168704,
+      "error": null,
+      "history": []
+    },
+    {
+      "id": "configuration",
+      "title": "Configuration",
+      "status": "done",
+      "passes": [
+        {
+          "model": "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1",
+          "family": "qwen4",
+          "revision": "888306bd3996d6317758c07df50622829259ad17",
+          "configuration": {
+            "snapshot": "/root/.cache/huggingface/hub/models--wrldsuksgo2mars--Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1/snapshots/888306bd3996d6317758c07df50622829259ad17",
+            "quant": [
+              {
+                "group": "embedding",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "lm head",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "attention",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "indexer",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "hyper connection",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "router",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "shared expert",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "routed expert",
+                "formats": [
+                  "exl3-k4",
+                  "exl3-k5"
+                ]
+              },
+              {
+                "group": "mapped table",
+                "formats": [
+                  "bf16",
+                  "fp8-unscaled",
+                  "int"
+                ]
+              },
+              {
+                "group": "table projection",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "speculator",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "speculator expert",
+                "formats": [
+                  "exl3-k4",
+                  "exl3-k5"
+                ]
+              },
+              {
+                "group": "vision",
+                "formats": [
+                  "bf16"
+                ]
+              }
+            ],
+            "speculator": "MTP ×3",
+            "layout": "1 RTX · experts on the coordinator",
+            "settings": [
+              {
+                "name": "snapshot",
+                "value": "/root/.cache/huggingface/hub/models--wrldsuksgo2mars--Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1/snapshots/888306bd3996d6317758c07df50622829259ad17",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "native-lib",
+                "value": "/opt/cuteafd/lib/libcuteafd_native.so",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "manifest",
+                "value": "/opt/cuteafd/share/PROGRAMS.json",
+                "default": "/opt/cuteafd/share/PROGRAMS.json",
+                "source": "default"
+              },
+              {
+                "name": "device",
+                "value": "0",
+                "default": "0",
+                "source": "default"
+              },
+              {
+                "name": "max-context",
+                "value": "32768",
+                "default": "65536",
+                "source": "cli"
+              },
+              {
+                "name": "pool-tokens",
+                "value": "32768",
+                "default": "32768",
+                "source": "default"
+              },
+              {
+                "name": "slots",
+                "value": "8",
+                "default": "8",
+                "source": "default"
+              },
+              {
+                "name": "prefill-rows",
+                "value": "4096",
+                "default": "4096",
+                "source": "default"
+              },
+              {
+                "name": "fp8-decode",
+                "value": "true",
+                "default": "true",
+                "source": "default"
+              },
+              {
+                "name": "fp8-scales",
+                "value": "amax",
+                "default": "amax",
+                "source": "default"
+              },
+              {
+                "name": "table-placement",
+                "value": "mapped",
+                "default": "mapped",
+                "source": "default"
+              },
+              {
+                "name": "table-threads",
+                "value": "16",
+                "default": "16",
+                "source": "default"
+              },
+              {
+                "name": "table-cache-mib",
+                "value": "0",
+                "default": "0",
+                "source": "default"
+              },
+              {
+                "name": "table-prefetch",
+                "value": "true",
+                "default": "true",
+                "source": "default"
+              },
+              {
+                "name": "table-warm",
+                "value": "true",
+                "default": "true",
+                "source": "default"
+              },
+              {
+                "name": "table-warm-mib-s",
+                "value": "1024",
+                "default": "1024",
+                "source": "default"
+              },
+              {
+                "name": "local-experts",
+                "value": "true",
+                "default": "false",
+                "source": "cli"
+              },
+              {
+                "name": "shared-only",
+                "value": "false",
+                "default": "false",
+                "source": "default"
+              },
+              {
+                "name": "expert-window",
+                "value": "16",
+                "default": "16",
+                "source": "default"
+              },
+              {
+                "name": "exl3-window",
+                "value": "48",
+                "default": "48",
+                "source": "default"
+              },
+              {
+                "name": "expert-reserve-gib",
+                "value": "12",
+                "default": "12",
+                "source": "default"
+              },
+              {
+                "name": "mtp",
+                "value": "3",
+                "default": "0",
+                "source": "cli"
+              },
+              {
+                "name": "mtp-fp8-head",
+                "value": "true",
+                "default": "true",
+                "source": "default"
+              },
+              {
+                "name": "embed-placement",
+                "value": "gpu",
+                "default": "gpu",
+                "source": "default"
+              },
+              {
+                "name": "token-select",
+                "value": "device",
+                "default": "device",
+                "source": "default"
+              },
+              {
+                "name": "listen",
+                "value": "0.0.0.0:8321",
+                "default": "0.0.0.0:8000",
+                "source": "cli"
+              },
+              {
+                "name": "max-output",
+                "value": "4096",
+                "default": "4096",
+                "source": "cli"
+              },
+              {
+                "name": "max-sequences",
+                "value": "8",
+                "default": "4",
+                "source": "cli"
+              },
+              {
+                "name": "no-copy-drafts",
+                "value": "false",
+                "default": "false",
+                "source": "default"
+              },
+              {
+                "name": "mtp-fixed",
+                "value": "false",
+                "default": "false",
+                "source": "default"
+              },
+              {
+                "name": "decode-share",
+                "value": "0.2",
+                "default": "0.2",
+                "source": "default"
+              },
+              {
+                "name": "prefix-cache-entries",
+                "value": "20",
+                "default": "20",
+                "source": "cli"
+              },
+              {
+                "name": "prefix-cache-mark-mib",
+                "value": "2048",
+                "default": "2048",
+                "source": "default"
+              },
+              {
+                "name": "prefix-cache-min-tokens",
+                "value": "64",
+                "default": "64",
+                "source": "default"
+              },
+              {
+                "name": "host-cache-bytes",
+                "value": "0",
+                "default": "0",
+                "source": "default"
+              },
+              {
+                "name": "host-cache-min-tokens",
+                "value": "512",
+                "default": "512",
+                "source": "default"
+              },
+              {
+                "name": "prefix-point-gap",
+                "value": "0",
+                "default": "0",
+                "source": "default"
+              },
+              {
+                "name": "prefix-point-boundaries",
+                "value": "0",
+                "default": "0",
+                "source": "default"
+              },
+              {
+                "name": "prefix-points-per-request",
+                "value": "4",
+                "default": "4",
+                "source": "default"
+              },
+              {
+                "name": "prefix-partial",
+                "value": "off",
+                "default": "off",
+                "source": "default"
+              },
+              {
+                "name": "console-text",
+                "value": "false",
+                "default": "false",
+                "source": "env"
+              },
+              {
+                "name": "CUTEAFD_FP8_EXPERT_PREFILL",
+                "value": "auto",
+                "default": "auto",
+                "source": "env"
+              },
+              {
+                "name": "CUTEAFD_SPARK_INTAKE",
+                "value": "auto",
+                "default": "auto",
+                "source": "env"
+              }
+            ]
+          },
+          "build": {
+            "version": "0.1.0",
+            "release": "v0.1.0",
+            "image": "ghcr.io/tpurtell/cuteafd-coordinator:v0.1.0",
+            "remote": null,
+            "commit": "7936046a1a4a0cc1c20a71421125e4a65e71c91b",
+            "dirty": false
+          }
+        }
+      ],
+      "started": "2026-10-02T06:43:25Z",
+      "finished": "2026-10-02T06:43:25Z",
+      "seconds": 0.000314512,
+      "error": null,
+      "history": []
+    }
+  ],
+  "error": null
+}

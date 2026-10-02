@@ -44,7 +44,7 @@ layer every fourth, a PLE n-gram memory table, and fused expert tensors.
 
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
-| v0 | 2026-10-02 | First release | — |
+| v0 | 2026-10-02 | First release | <a href="../../benchmarks/qwen4/2026-10-02-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx/report.svg"><img src="../../benchmarks/qwen4/2026-10-02-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx/card.svg" width="360" alt="Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 (exl3-k4+exl3-k5) (min)"></a> <a href="../../benchmarks/qwen4/2026-10-02-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-4spark/report.svg"><img src="../../benchmarks/qwen4/2026-10-02-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-4spark/card.svg" width="360" alt="Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 (exl3-k4+exl3-k5) (max)"></a> <a href="../../benchmarks/qwen4/2026-10-02-smoke-qwen3-8-flash-next-nvfp4-1rtx-4spark/report.svg"><img src="../../benchmarks/qwen4/2026-10-02-smoke-qwen3-8-flash-next-nvfp4-1rtx-4spark/card.svg" width="360" alt="Qwen3.8-Flash-Next-NVFP4 (nvfp4-g16) (min)"></a> |
 
 ## Additional benchmarks
 

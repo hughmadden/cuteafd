@@ -1,0 +1,1041 @@
+{
+  "schema": "cuteafd.bench.report/1",
+  "id": "9c90e080c69a4a7983e428b639211084",
+  "created": "2026-10-02T07:24:08Z",
+  "finished": "2026-10-02T07:24:37Z",
+  "status": "done",
+  "profile": "smoke",
+  "plan": [
+    {
+      "id": "hardware",
+      "passes": 1
+    },
+    {
+      "id": "configuration",
+      "passes": 1
+    }
+  ],
+  "server": {
+    "model": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1",
+    "family": "glm5_flash",
+    "revision": "0490d2f708b12145f6516555ab066aaeb401cd21",
+    "build": {
+      "version": "0.1.0",
+      "release": "v0.1.0",
+      "image": "ghcr.io/tpurtell/cuteafd-coordinator:v0.1.0",
+      "remote": null,
+      "commit": "7936046a1a4a0cc1c20a71421125e4a65e71c91b",
+      "dirty": false
+    },
+    "hardware": {
+      "host": "raptor",
+      "gpus": [
+        {
+          "index": 0,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+          "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
+          "memory_mib": 97887,
+          "power_limit_w": 325.0,
+          "power_max_w": 600.0,
+          "sm_count": 188,
+          "compute_cap": "12.0",
+          "pcie": "Gen5 x16",
+          "used": true
+        }
+      ],
+      "driver": "595.91.07",
+      "cuda": "13.2",
+      "sparks": [
+        {
+          "address": "10.55.0.1",
+          "name": null,
+          "rank": 0
+        },
+        {
+          "address": "10.55.0.2",
+          "name": null,
+          "rank": 1
+        },
+        {
+          "address": "10.55.0.3",
+          "name": null,
+          "rank": 2
+        },
+        {
+          "address": "10.55.0.4",
+          "name": null,
+          "rank": 3
+        }
+      ],
+      "fabric": [
+        {
+          "device": "mlx5_0",
+          "port": 1,
+          "active": true,
+          "link_gbps": 400.0,
+          "pcie": "32 GT/s x16",
+          "netdev": "enp1s0np0",
+          "subnets": [
+            "10.55.0.0/24",
+            "10.55.1.0/24"
+          ]
+        }
+      ],
+      "rails": "fabric: use 2 rail(s) of [mlx5_0@10.55.0.22/24 400G(eff 400G), mlx5_0@10.55.1.22/24 400G(eff 400G)]: 2 subnets share one 400 Gb/s port; each rail is a subnet of the same link"
+    },
+    "configuration": {
+      "snapshot": "/root/.cache/huggingface/hub/models--wrldsuksgo2mars--GLM-5.3-Flash-EXL3-K3.25-v1/snapshots/0490d2f708b12145f6516555ab066aaeb401cd21",
+      "quant": [
+        {
+          "group": "embedding",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "lm head",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "norm",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "attention",
+          "formats": [
+            "bf16",
+            "f32"
+          ]
+        },
+        {
+          "group": "indexer",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "hyper connection",
+          "formats": [
+            "bf16",
+            "f32"
+          ]
+        },
+        {
+          "group": "router",
+          "formats": [
+            "bf16",
+            "f32"
+          ]
+        },
+        {
+          "group": "shared expert",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "routed expert",
+          "formats": [
+            "exl3-k3",
+            "exl3-k4"
+          ]
+        },
+        {
+          "group": "dense ffn",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "speculator",
+          "formats": [
+            "bf16",
+            "f32"
+          ]
+        },
+        {
+          "group": "speculator expert",
+          "formats": [
+            "exl3-k3"
+          ]
+        },
+        {
+          "group": "vision",
+          "formats": [
+            "bf16"
+          ]
+        }
+      ],
+      "speculator": "DFlash2 (bf582e4eacc1810f76656d1811693ff6c6737d2a)",
+      "layout": "1 RTX · experts TP4 over 4 Sparks",
+      "settings": [
+        {
+          "name": "snapshot",
+          "value": "/root/.cache/huggingface/hub/models--wrldsuksgo2mars--GLM-5.3-Flash-EXL3-K3.25-v1/snapshots/0490d2f708b12145f6516555ab066aaeb401cd21",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "native-lib",
+          "value": "/opt/cuteafd/lib/libcuteafd_native.so",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "manifest",
+          "value": "/opt/cuteafd/share/PROGRAMS.json",
+          "default": "/opt/cuteafd/share/PROGRAMS.json",
+          "source": "default"
+        },
+        {
+          "name": "device",
+          "value": "0",
+          "default": "0",
+          "source": "default"
+        },
+        {
+          "name": "max-context",
+          "value": "32768",
+          "default": "65536",
+          "source": "cli"
+        },
+        {
+          "name": "pool-tokens",
+          "value": "65536",
+          "default": "32768",
+          "source": "cli"
+        },
+        {
+          "name": "slots",
+          "value": "8",
+          "default": "8",
+          "source": "default"
+        },
+        {
+          "name": "prefill-rows",
+          "value": "4096",
+          "default": "4096",
+          "source": "default"
+        },
+        {
+          "name": "peers",
+          "value": "10.55.0.1:19495,10.55.0.2:19495,10.55.0.3:19495,10.55.0.4:19495",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "local-experts",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "expert-window",
+          "value": "6",
+          "default": "6",
+          "source": "default"
+        },
+        {
+          "name": "fp8-decode",
+          "value": "true",
+          "default": "false",
+          "source": "cli"
+        },
+        {
+          "name": "fp8-snapshot",
+          "value": "/root/.cache/huggingface/hub/models--zai-org--GLM-5.3-Flash/snapshots/eb9eb208eb0d988989d07a6a12d0fdeb5f52574a",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "kda-fp8",
+          "value": "row128",
+          "default": "off",
+          "source": "cli"
+        },
+        {
+          "name": "fp8-head",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "full-prefill-logits",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "exl3-window",
+          "value": "64",
+          "default": "64",
+          "source": "default"
+        },
+        {
+          "name": "fp8-prefill",
+          "value": "mla,ffn",
+          "default": "mla,ffn",
+          "source": "default"
+        },
+        {
+          "name": "skip-experts",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "draft",
+          "value": "/root/.cache/huggingface/hub/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/bf582e4eacc1810f76656d1811693ff6c6737d2a",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "draft-sequences",
+          "value": "8",
+          "default": "8",
+          "source": "default"
+        },
+        {
+          "name": "draft-fp8",
+          "value": "true",
+          "default": "true",
+          "source": "default"
+        },
+        {
+          "name": "fp8-scales",
+          "value": "pow2",
+          "default": "pow2",
+          "source": "default"
+        },
+        {
+          "name": "embed-placement",
+          "value": "gpu",
+          "default": "gpu",
+          "source": "default"
+        },
+        {
+          "name": "token-select",
+          "value": "device",
+          "default": "device",
+          "source": "default"
+        },
+        {
+          "name": "listen",
+          "value": "0.0.0.0:8312",
+          "default": "0.0.0.0:8000",
+          "source": "cli"
+        },
+        {
+          "name": "max-output",
+          "value": "4096",
+          "default": "4096",
+          "source": "cli"
+        },
+        {
+          "name": "max-sequences",
+          "value": "8",
+          "default": "4",
+          "source": "cli"
+        },
+        {
+          "name": "no-copy-drafts",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "decode-share",
+          "value": "0.2",
+          "default": "0.2",
+          "source": "default"
+        },
+        {
+          "name": "prefix-cache-entries",
+          "value": "20",
+          "default": "20",
+          "source": "cli"
+        },
+        {
+          "name": "prefix-cache-mark-mib",
+          "value": "2048",
+          "default": "2048",
+          "source": "default"
+        },
+        {
+          "name": "prefix-cache-min-tokens",
+          "value": "64",
+          "default": "64",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-bytes",
+          "value": "0",
+          "default": "0",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-min-tokens",
+          "value": "512",
+          "default": "512",
+          "source": "default"
+        },
+        {
+          "name": "prefix-point-gap",
+          "value": "0",
+          "default": "0",
+          "source": "default"
+        },
+        {
+          "name": "prefix-point-boundaries",
+          "value": "0",
+          "default": "0",
+          "source": "default"
+        },
+        {
+          "name": "prefix-points-per-request",
+          "value": "4",
+          "default": "4",
+          "source": "default"
+        },
+        {
+          "name": "prefix-partial",
+          "value": "off",
+          "default": "off",
+          "source": "default"
+        },
+        {
+          "name": "console-text",
+          "value": "false",
+          "default": "false",
+          "source": "env"
+        },
+        {
+          "name": "CUTEAFD_FP8_EXPERT_PREFILL",
+          "value": "auto",
+          "default": "auto",
+          "source": "env"
+        },
+        {
+          "name": "CUTEAFD_SPARK_INTAKE",
+          "value": "auto",
+          "default": "auto",
+          "source": "env"
+        }
+      ]
+    },
+    "readiness_s": 39.676012077,
+    "started": "2026-10-02T07:23:27Z"
+  },
+  "fingerprint": "46c12ad2e0958dad",
+  "baseline": {
+    "fingerprint": "46c12ad2e0958dad",
+    "run_id": "9c90e080c69a4a7983e428b639211084",
+    "created": "2026-10-02T07:24:09Z",
+    "card": {
+      "decode": [
+        {
+          "content": "code",
+          "tok_s": 117.06325657030897,
+          "runs": [
+            {
+              "prompt_tokens": 63,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 0.117073977,
+              "total_s": 2.842125311,
+              "decode_s": 2.7250224309999997,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          ],
+          "acceptance": null
+        },
+        {
+          "content": "prose",
+          "tok_s": 84.5654199333227,
+          "runs": [
+            {
+              "prompt_tokens": 60,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 0.114946799,
+              "total_s": 3.887205796,
+              "decode_s": 3.772227469,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          ],
+          "acceptance": null
+        },
+        {
+          "content": "json",
+          "tok_s": 156.1848775004869,
+          "runs": [
+            {
+              "prompt_tokens": 87,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 0.117114648,
+              "total_s": 2.159591347,
+              "decode_s": 2.042451261,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          ],
+          "acceptance": null
+        }
+      ],
+      "prefill": {
+        "prompt_tokens": 8061,
+        "tok_s": 2818.0266988596136,
+        "ttft_s": 2.860512288,
+        "runs": [
+          {
+            "prompt_tokens": 8061,
+            "completion_tokens": 1,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "ttft_s": 2.860512288,
+            "total_s": 2.860591517,
+            "decode_s": 0.0,
+            "reasoning_end_s": null,
+            "finish_reason": "length"
+          }
+        ]
+      },
+      "warmup_s": 2.346017781,
+      "capacity": {
+        "kv_tokens": 65536,
+        "kv_pages": 256,
+        "kv_format": "FP8 MLA latent + KDA state",
+        "max_requests": 8,
+        "max_context": 32768,
+        "max_output": 4096,
+        "host_cache_bytes": 0
+      }
+    },
+    "quality": {
+      "status": "fail",
+      "checks": [
+        {
+          "id": "fidelity",
+          "title": "Logit fidelity",
+          "status": "pass",
+          "summary": "KL 0.045 · top-1 86.3% · NLL 3.476 vs 3.454 · 512 tokens vs GLM 5.3 Flash reference",
+          "metrics": {
+            "kl": 0.04499612973586168,
+            "top1": 0.86328125,
+            "nll": 3.475618318080036,
+            "ref_nll": 3.454331268359603,
+            "positions": 512,
+            "missing": 0,
+            "kl_max": 0.15,
+            "top1_min": 0.8,
+            "reference": "GLM 5.3 Flash"
+          },
+          "seconds": 1.760768711
+        },
+        {
+          "id": "cache_exact",
+          "title": "Prefix-cache restore",
+          "status": "info",
+          "summary": "prompt end: 1540 restored, 2 rows byte-identical · turn end: 1284 restored, 1 rows byte-identical · the turn's greedy text did not reproduce",
+          "metrics": {
+            "prompt_tokens": 1540,
+            "prompt_restored": 1540,
+            "prompt_rows_compared": 2,
+            "turn_tokens": 1284,
+            "turn_restored": 1284,
+            "turn_rows_compared": 1
+          },
+          "seconds": 1.348431473
+        },
+        {
+          "id": "spec_lossless",
+          "title": "Speculation lossless",
+          "status": "info",
+          "summary": "DFlash2 (bf582e4eacc1810f76656d1811693ff6c6737d2a): greedy output diverges at token 17 of 128 (top-two margin 0.144 nats) (86.2 vs 67.8 tok/s) · not gated: under 0.5 nats; C4 differs from C1 too",
+          "metrics": {
+            "tokens": 128,
+            "identical_prefix": 17,
+            "speculator": "DFlash2 (bf582e4eacc1810f76656d1811693ff6c6737d2a)",
+            "decode_tok_s_on": 86.19330969647642,
+            "decode_tok_s_off": 67.78705821035136,
+            "divergence_margin": 0.14413827657699585
+          },
+          "seconds": 3.583887517
+        },
+        {
+          "id": "template",
+          "title": "Template round trip",
+          "status": "fail",
+          "summary": "reading the event stream: Error while decoding chunks",
+          "metrics": {},
+          "seconds": 0.615288491
+        },
+        {
+          "id": "c1_c4",
+          "title": "C1 vs C4 divergence",
+          "status": "info",
+          "summary": "0 of 4 identical to C1; first divergence at tokens 45",
+          "metrics": {
+            "identical": 0,
+            "first_divergence": 45
+          },
+          "seconds": 2.315476519
+        }
+      ]
+    },
+    "seconds": 27.80210251
+  },
+  "panels": [
+    {
+      "id": "hardware",
+      "title": "Hardware",
+      "status": "done",
+      "passes": [
+        {
+          "hardware": {
+            "host": "raptor",
+            "gpus": [
+              {
+                "index": 0,
+                "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+                "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
+                "memory_mib": 97887,
+                "power_limit_w": 325.0,
+                "power_max_w": 600.0,
+                "sm_count": 188,
+                "compute_cap": "12.0",
+                "pcie": "Gen5 x16",
+                "used": true
+              }
+            ],
+            "driver": "595.91.07",
+            "cuda": "13.2",
+            "sparks": [
+              {
+                "address": "10.55.0.1",
+                "name": null,
+                "rank": 0
+              },
+              {
+                "address": "10.55.0.2",
+                "name": null,
+                "rank": 1
+              },
+              {
+                "address": "10.55.0.3",
+                "name": null,
+                "rank": 2
+              },
+              {
+                "address": "10.55.0.4",
+                "name": null,
+                "rank": 3
+              }
+            ],
+            "fabric": [
+              {
+                "device": "mlx5_0",
+                "port": 1,
+                "active": true,
+                "link_gbps": 400.0,
+                "pcie": "32 GT/s x16",
+                "netdev": "enp1s0np0",
+                "subnets": [
+                  "10.55.0.0/24",
+                  "10.55.1.0/24"
+                ]
+              }
+            ],
+            "rails": "fabric: use 2 rail(s) of [mlx5_0@10.55.0.22/24 400G(eff 400G), mlx5_0@10.55.1.22/24 400G(eff 400G)]: 2 subnets share one 400 Gb/s port; each rail is a subnet of the same link"
+          },
+          "readiness_s": 39.676012077
+        }
+      ],
+      "started": "2026-10-02T07:24:37Z",
+      "finished": "2026-10-02T07:24:37Z",
+      "seconds": 0.000194863,
+      "error": null,
+      "history": []
+    },
+    {
+      "id": "configuration",
+      "title": "Configuration",
+      "status": "done",
+      "passes": [
+        {
+          "model": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1",
+          "family": "glm5_flash",
+          "revision": "0490d2f708b12145f6516555ab066aaeb401cd21",
+          "configuration": {
+            "snapshot": "/root/.cache/huggingface/hub/models--wrldsuksgo2mars--GLM-5.3-Flash-EXL3-K3.25-v1/snapshots/0490d2f708b12145f6516555ab066aaeb401cd21",
+            "quant": [
+              {
+                "group": "embedding",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "lm head",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "norm",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "attention",
+                "formats": [
+                  "bf16",
+                  "f32"
+                ]
+              },
+              {
+                "group": "indexer",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "hyper connection",
+                "formats": [
+                  "bf16",
+                  "f32"
+                ]
+              },
+              {
+                "group": "router",
+                "formats": [
+                  "bf16",
+                  "f32"
+                ]
+              },
+              {
+                "group": "shared expert",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "routed expert",
+                "formats": [
+                  "exl3-k3",
+                  "exl3-k4"
+                ]
+              },
+              {
+                "group": "dense ffn",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "speculator",
+                "formats": [
+                  "bf16",
+                  "f32"
+                ]
+              },
+              {
+                "group": "speculator expert",
+                "formats": [
+                  "exl3-k3"
+                ]
+              },
+              {
+                "group": "vision",
+                "formats": [
+                  "bf16"
+                ]
+              }
+            ],
+            "speculator": "DFlash2 (bf582e4eacc1810f76656d1811693ff6c6737d2a)",
+            "layout": "1 RTX · experts TP4 over 4 Sparks",
+            "settings": [
+              {
+                "name": "snapshot",
+                "value": "/root/.cache/huggingface/hub/models--wrldsuksgo2mars--GLM-5.3-Flash-EXL3-K3.25-v1/snapshots/0490d2f708b12145f6516555ab066aaeb401cd21",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "native-lib",
+                "value": "/opt/cuteafd/lib/libcuteafd_native.so",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "manifest",
+                "value": "/opt/cuteafd/share/PROGRAMS.json",
+                "default": "/opt/cuteafd/share/PROGRAMS.json",
+                "source": "default"
+              },
+              {
+                "name": "device",
+                "value": "0",
+                "default": "0",
+                "source": "default"
+              },
+              {
+                "name": "max-context",
+                "value": "32768",
+                "default": "65536",
+                "source": "cli"
+              },
+              {
+                "name": "pool-tokens",
+                "value": "65536",
+                "default": "32768",
+                "source": "cli"
+              },
+              {
+                "name": "slots",
+                "value": "8",
+                "default": "8",
+                "source": "default"
+              },
+              {
+                "name": "prefill-rows",
+                "value": "4096",
+                "default": "4096",
+                "source": "default"
+              },
+              {
+                "name": "peers",
+                "value": "10.55.0.1:19495,10.55.0.2:19495,10.55.0.3:19495,10.55.0.4:19495",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "local-experts",
+                "value": "false",
+                "default": "false",
+                "source": "default"
+              },
+              {
+                "name": "expert-window",
+                "value": "6",
+                "default": "6",
+                "source": "default"
+              },
+              {
+                "name": "fp8-decode",
+                "value": "true",
+                "default": "false",
+                "source": "cli"
+              },
+              {
+                "name": "fp8-snapshot",
+                "value": "/root/.cache/huggingface/hub/models--zai-org--GLM-5.3-Flash/snapshots/eb9eb208eb0d988989d07a6a12d0fdeb5f52574a",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "kda-fp8",
+                "value": "row128",
+                "default": "off",
+                "source": "cli"
+              },
+              {
+                "name": "fp8-head",
+                "value": "false",
+                "default": "false",
+                "source": "default"
+              },
+              {
+                "name": "full-prefill-logits",
+                "value": "false",
+                "default": "false",
+                "source": "default"
+              },
+              {
+                "name": "exl3-window",
+                "value": "64",
+                "default": "64",
+                "source": "default"
+              },
+              {
+                "name": "fp8-prefill",
+                "value": "mla,ffn",
+                "default": "mla,ffn",
+                "source": "default"
+              },
+              {
+                "name": "skip-experts",
+                "value": "false",
+                "default": "false",
+                "source": "default"
+              },
+              {
+                "name": "draft",
+                "value": "/root/.cache/huggingface/hub/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/bf582e4eacc1810f76656d1811693ff6c6737d2a",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "draft-sequences",
+                "value": "8",
+                "default": "8",
+                "source": "default"
+              },
+              {
+                "name": "draft-fp8",
+                "value": "true",
+                "default": "true",
+                "source": "default"
+              },
+              {
+                "name": "fp8-scales",
+                "value": "pow2",
+                "default": "pow2",
+                "source": "default"
+              },
+              {
+                "name": "embed-placement",
+                "value": "gpu",
+                "default": "gpu",
+                "source": "default"
+              },
+              {
+                "name": "token-select",
+                "value": "device",
+                "default": "device",
+                "source": "default"
+              },
+              {
+                "name": "listen",
+                "value": "0.0.0.0:8312",
+                "default": "0.0.0.0:8000",
+                "source": "cli"
+              },
+              {
+                "name": "max-output",
+                "value": "4096",
+                "default": "4096",
+                "source": "cli"
+              },
+              {
+                "name": "max-sequences",
+                "value": "8",
+                "default": "4",
+                "source": "cli"
+              },
+              {
+                "name": "no-copy-drafts",
+                "value": "false",
+                "default": "false",
+                "source": "default"
+              },
+              {
+                "name": "decode-share",
+                "value": "0.2",
+                "default": "0.2",
+                "source": "default"
+              },
+              {
+                "name": "prefix-cache-entries",
+                "value": "20",
+                "default": "20",
+                "source": "cli"
+              },
+              {
+                "name": "prefix-cache-mark-mib",
+                "value": "2048",
+                "default": "2048",
+                "source": "default"
+              },
+              {
+                "name": "prefix-cache-min-tokens",
+                "value": "64",
+                "default": "64",
+                "source": "default"
+              },
+              {
+                "name": "host-cache-bytes",
+                "value": "0",
+                "default": "0",
+                "source": "default"
+              },
+              {
+                "name": "host-cache-min-tokens",
+                "value": "512",
+                "default": "512",
+                "source": "default"
+              },
+              {
+                "name": "prefix-point-gap",
+                "value": "0",
+                "default": "0",
+                "source": "default"
+              },
+              {
+                "name": "prefix-point-boundaries",
+                "value": "0",
+                "default": "0",
+                "source": "default"
+              },
+              {
+                "name": "prefix-points-per-request",
+                "value": "4",
+                "default": "4",
+                "source": "default"
+              },
+              {
+                "name": "prefix-partial",
+                "value": "off",
+                "default": "off",
+                "source": "default"
+              },
+              {
+                "name": "console-text",
+                "value": "false",
+                "default": "false",
+                "source": "env"
+              },
+              {
+                "name": "CUTEAFD_FP8_EXPERT_PREFILL",
+                "value": "auto",
+                "default": "auto",
+                "source": "env"
+              },
+              {
+                "name": "CUTEAFD_SPARK_INTAKE",
+                "value": "auto",
+                "default": "auto",
+                "source": "env"
+              }
+            ]
+          },
+          "build": {
+            "version": "0.1.0",
+            "release": "v0.1.0",
+            "image": "ghcr.io/tpurtell/cuteafd-coordinator:v0.1.0",
+            "remote": null,
+            "commit": "7936046a1a4a0cc1c20a71421125e4a65e71c91b",
+            "dirty": false
+          }
+        }
+      ],
+      "started": "2026-10-02T07:24:37Z",
+      "finished": "2026-10-02T07:24:37Z",
+      "seconds": 0.000322906,
+      "error": null,
+      "history": []
+    }
+  ],
+  "error": null
+}

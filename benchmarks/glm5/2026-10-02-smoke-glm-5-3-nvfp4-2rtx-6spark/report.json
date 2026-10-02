@@ -1,0 +1,988 @@
+{
+  "schema": "cuteafd.bench.report/1",
+  "id": "90f45419827c41cc9bf83eb7e9c8612d",
+  "created": "2026-10-02T07:21:33Z",
+  "finished": "2026-10-02T07:22:32Z",
+  "status": "done",
+  "profile": "smoke",
+  "plan": [
+    {
+      "id": "hardware",
+      "passes": 1
+    },
+    {
+      "id": "configuration",
+      "passes": 1
+    }
+  ],
+  "server": {
+    "model": "zai-org/GLM-5.3",
+    "family": "glm5",
+    "revision": "e3b8f9f2fad29727dfa95e766c5cac18ea1414bf",
+    "build": {
+      "version": "0.1.0",
+      "release": "v0.1.0",
+      "image": "ghcr.io/tpurtell/cuteafd-coordinator:v0.1.0",
+      "remote": null,
+      "commit": "7936046a1a4a0cc1c20a71421125e4a65e71c91b",
+      "dirty": false
+    },
+    "hardware": {
+      "host": "raptor",
+      "gpus": [
+        {
+          "index": 0,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+          "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
+          "memory_mib": 97887,
+          "power_limit_w": 325.0,
+          "power_max_w": 600.0,
+          "sm_count": 188,
+          "compute_cap": "12.0",
+          "pcie": "Gen5 x16",
+          "used": true
+        },
+        {
+          "index": 1,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+          "uuid": "GPU-95f8f212-9131-df99-fd53-7535965197d7",
+          "memory_mib": 97887,
+          "power_limit_w": 325.0,
+          "power_max_w": 600.0,
+          "sm_count": 188,
+          "compute_cap": "12.0",
+          "pcie": "Gen5 x16",
+          "used": true
+        }
+      ],
+      "driver": "595.91.07",
+      "cuda": "13.2",
+      "sparks": [
+        {
+          "address": "10.55.0.1",
+          "name": null,
+          "rank": 0
+        },
+        {
+          "address": "10.55.0.2",
+          "name": null,
+          "rank": 1
+        },
+        {
+          "address": "10.55.0.3",
+          "name": null,
+          "rank": 2
+        },
+        {
+          "address": "10.55.0.4",
+          "name": null,
+          "rank": 3
+        },
+        {
+          "address": "10.55.0.5",
+          "name": null,
+          "rank": 4
+        },
+        {
+          "address": "10.55.0.6",
+          "name": null,
+          "rank": 5
+        }
+      ],
+      "fabric": [
+        {
+          "device": "mlx5_0",
+          "port": 1,
+          "active": true,
+          "link_gbps": 400.0,
+          "pcie": "32 GT/s x16",
+          "netdev": "enp1s0np0",
+          "subnets": [
+            "10.55.0.0/24",
+            "10.55.1.0/24"
+          ]
+        }
+      ],
+      "rails": "fabric: use 2 rail(s) of [mlx5_0@10.55.0.22/24 400G(eff 400G), mlx5_0@10.55.1.22/24 400G(eff 400G)]: 2 subnets share one 400 Gb/s port; each rail is a subnet of the same link"
+    },
+    "configuration": {
+      "snapshot": "/root/.cache/huggingface/hub/models--nvidia--GLM-5.3-NVFP4/snapshots/e3b8f9f2fad29727dfa95e766c5cac18ea1414bf",
+      "quant": [
+        {
+          "group": "embedding",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "lm head",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "norm",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "attention",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "indexer",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "router",
+          "formats": [
+            "bf16",
+            "f32"
+          ]
+        },
+        {
+          "group": "shared expert",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "routed expert",
+          "formats": [
+            "nvfp4-g16"
+          ]
+        },
+        {
+          "group": "dense ffn",
+          "formats": [
+            "fp8-tensor/f32"
+          ]
+        },
+        {
+          "group": "speculator",
+          "formats": [
+            "bf16",
+            "f32"
+          ]
+        },
+        {
+          "group": "speculator expert",
+          "formats": [
+            "bf16"
+          ]
+        }
+      ],
+      "speculator": "copy-window drafts",
+      "layout": "2 RTX (head split) · experts TP6 over 6 Sparks",
+      "settings": [
+        {
+          "name": "snapshot",
+          "value": "/root/.cache/huggingface/hub/models--nvidia--GLM-5.3-NVFP4/snapshots/e3b8f9f2fad29727dfa95e766c5cac18ea1414bf",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "native-lib",
+          "value": "/opt/cuteafd/lib/libcuteafd_native.so",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "manifest",
+          "value": "/opt/cuteafd/share/PROGRAMS.json",
+          "default": "/opt/cuteafd/share/PROGRAMS.json",
+          "source": "default"
+        },
+        {
+          "name": "device",
+          "value": "0",
+          "default": "0",
+          "source": "cli"
+        },
+        {
+          "name": "split-device",
+          "value": "1",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "max-context",
+          "value": "32768",
+          "default": "32768",
+          "source": "cli"
+        },
+        {
+          "name": "pool-tokens",
+          "value": "262144",
+          "default": "262144",
+          "source": "default"
+        },
+        {
+          "name": "prefill-rows",
+          "value": "4096",
+          "default": "4096",
+          "source": "default"
+        },
+        {
+          "name": "peers",
+          "value": "10.55.0.1:19461,10.55.0.2:19461,10.55.0.3:19461,10.55.0.4:19461,10.55.0.5:19461,10.55.0.6:19461",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "draft-sequences",
+          "value": "16",
+          "default": "16",
+          "source": "default"
+        },
+        {
+          "name": "draft-fp8",
+          "value": "true",
+          "default": "true",
+          "source": "default"
+        },
+        {
+          "name": "fp8-scales",
+          "value": "amax",
+          "default": "amax",
+          "source": "default"
+        },
+        {
+          "name": "l2-prefetch",
+          "value": "auto",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "full-prefill-logits",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "skip-routed-experts",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "prefill-w8a16",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "embed-placement",
+          "value": "gpu",
+          "default": "gpu",
+          "source": "default"
+        },
+        {
+          "name": "token-select",
+          "value": "device",
+          "default": "device",
+          "source": "default"
+        },
+        {
+          "name": "listen",
+          "value": "0.0.0.0:8310",
+          "default": "0.0.0.0:8000",
+          "source": "cli"
+        },
+        {
+          "name": "max-output",
+          "value": "4096",
+          "default": "4096",
+          "source": "cli"
+        },
+        {
+          "name": "max-sequences",
+          "value": "8",
+          "default": "16",
+          "source": "cli"
+        },
+        {
+          "name": "model-id",
+          "value": "zai-org/GLM-5.3",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "no-copy-drafts",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "decode-share",
+          "value": "0.2",
+          "default": "0.2",
+          "source": "default"
+        },
+        {
+          "name": "prefix-cache-entries",
+          "value": "20",
+          "default": "20",
+          "source": "cli"
+        },
+        {
+          "name": "prefix-cache-mark-mib",
+          "value": "2048",
+          "default": "2048",
+          "source": "default"
+        },
+        {
+          "name": "prefix-cache-min-tokens",
+          "value": "64",
+          "default": "64",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-bytes",
+          "value": "0",
+          "default": "0",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-min-tokens",
+          "value": "512",
+          "default": "512",
+          "source": "default"
+        },
+        {
+          "name": "prefix-point-gap",
+          "value": "0",
+          "default": "0",
+          "source": "default"
+        },
+        {
+          "name": "prefix-point-boundaries",
+          "value": "0",
+          "default": "0",
+          "source": "default"
+        },
+        {
+          "name": "prefix-points-per-request",
+          "value": "4",
+          "default": "4",
+          "source": "default"
+        },
+        {
+          "name": "prefix-partial",
+          "value": "off",
+          "default": "off",
+          "source": "default"
+        },
+        {
+          "name": "console-text",
+          "value": "false",
+          "default": "false",
+          "source": "env"
+        },
+        {
+          "name": "CUTEAFD_FP8_EXPERT_PREFILL",
+          "value": "auto",
+          "default": "auto",
+          "source": "env"
+        },
+        {
+          "name": "CUTEAFD_SPARK_INTAKE",
+          "value": "auto",
+          "default": "auto",
+          "source": "env"
+        }
+      ]
+    },
+    "readiness_s": 34.794822534,
+    "started": "2026-10-02T07:20:56Z"
+  },
+  "fingerprint": "d97910249355ba0f",
+  "baseline": {
+    "fingerprint": "d97910249355ba0f",
+    "run_id": "90f45419827c41cc9bf83eb7e9c8612d",
+    "created": "2026-10-02T07:21:35Z",
+    "card": {
+      "decode": [
+        {
+          "content": "code",
+          "tok_s": 38.78301468591262,
+          "runs": [
+            {
+              "prompt_tokens": 63,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 0.274390311,
+              "total_s": 8.525107426,
+              "decode_s": 8.225250218000001,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          ],
+          "acceptance": null
+        },
+        {
+          "content": "prose",
+          "tok_s": 38.32035261119937,
+          "runs": [
+            {
+              "prompt_tokens": 60,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 0.262916527,
+              "total_s": 8.587507422,
+              "decode_s": 8.324558055,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          ],
+          "acceptance": null
+        },
+        {
+          "content": "json",
+          "tok_s": 40.34371525053685,
+          "runs": [
+            {
+              "prompt_tokens": 87,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 0.306861976,
+              "total_s": 8.213946079,
+              "decode_s": 7.90705561,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          ],
+          "acceptance": null
+        }
+      ],
+      "prefill": {
+        "prompt_tokens": 8051,
+        "tok_s": 2899.495226260219,
+        "ttft_s": 2.776690207,
+        "runs": [
+          {
+            "prompt_tokens": 8051,
+            "completion_tokens": 1,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "ttft_s": 2.776690207,
+            "total_s": 2.776749847,
+            "decode_s": 0.0,
+            "reasoning_end_s": null,
+            "finish_reason": "length"
+          }
+        ]
+      },
+      "warmup_s": 3.382142046,
+      "capacity": {
+        "kv_tokens": 262144,
+        "kv_pages": 4096,
+        "kv_format": "FP8 MLA latent + DSA index",
+        "max_requests": 8,
+        "max_context": 32768,
+        "max_output": 4096,
+        "host_cache_bytes": 0
+      }
+    },
+    "quality": {
+      "status": "pass",
+      "checks": [
+        {
+          "id": "fidelity",
+          "title": "Logit fidelity",
+          "status": "pass",
+          "summary": "KL 0.034 · top-1 88.9% · NLL 3.575 vs 3.554 · 512 tokens vs GLM 5.3 reference",
+          "metrics": {
+            "kl": 0.03427392611868483,
+            "top1": 0.888671875,
+            "nll": 3.5754778225432986,
+            "ref_nll": 3.5537897229134643,
+            "positions": 512,
+            "missing": 0,
+            "kl_max": 0.15,
+            "top1_min": 0.8,
+            "reference": "GLM 5.3"
+          },
+          "seconds": 3.017315561
+        },
+        {
+          "id": "cache_exact",
+          "title": "Prefix-cache restore",
+          "status": "info",
+          "summary": "prompt end: 1540 restored, 2 rows byte-identical · turn end: 1287 restored, 1 rows byte-identical · the turn's greedy text did not reproduce",
+          "metrics": {
+            "prompt_tokens": 1540,
+            "prompt_restored": 1540,
+            "prompt_rows_compared": 2,
+            "turn_tokens": 1287,
+            "turn_restored": 1287,
+            "turn_rows_compared": 1
+          },
+          "seconds": 4.59398089
+        },
+        {
+          "id": "spec_lossless",
+          "title": "Speculation lossless",
+          "status": "info",
+          "summary": "copy-window drafts: greedy output diverges at token 33 of 128 (top-two margin 0.384 nats) (35.8 vs 36.1 tok/s) · not gated: under 0.5 nats; C4 differs from C1 too",
+          "metrics": {
+            "tokens": 128,
+            "identical_prefix": 33,
+            "speculator": "copy-window drafts",
+            "decode_tok_s_on": 35.818846335829,
+            "decode_tok_s_off": 36.06476185293899,
+            "divergence_margin": 0.3838653564453125
+          },
+          "seconds": 7.622773721
+        },
+        {
+          "id": "template",
+          "title": "Template round trip",
+          "status": "info",
+          "summary": "tool call parsed · no reasoning · re-render differs at token 171 of 219",
+          "metrics": {
+            "reasoning_chars": 0,
+            "rendered_prefix": 171,
+            "turn_tokens": 219,
+            "cached_tokens": 0
+          },
+          "seconds": 1.494875572
+        },
+        {
+          "id": "c1_c4",
+          "title": "C1 vs C4 divergence",
+          "status": "info",
+          "summary": "0 of 4 identical to C1; first divergence at tokens 11",
+          "metrics": {
+            "identical": 0,
+            "first_divergence": 11
+          },
+          "seconds": 4.633182399
+        }
+      ]
+    },
+    "seconds": 56.801600855
+  },
+  "panels": [
+    {
+      "id": "hardware",
+      "title": "Hardware",
+      "status": "done",
+      "passes": [
+        {
+          "hardware": {
+            "host": "raptor",
+            "gpus": [
+              {
+                "index": 0,
+                "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+                "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
+                "memory_mib": 97887,
+                "power_limit_w": 325.0,
+                "power_max_w": 600.0,
+                "sm_count": 188,
+                "compute_cap": "12.0",
+                "pcie": "Gen5 x16",
+                "used": true
+              },
+              {
+                "index": 1,
+                "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+                "uuid": "GPU-95f8f212-9131-df99-fd53-7535965197d7",
+                "memory_mib": 97887,
+                "power_limit_w": 325.0,
+                "power_max_w": 600.0,
+                "sm_count": 188,
+                "compute_cap": "12.0",
+                "pcie": "Gen5 x16",
+                "used": true
+              }
+            ],
+            "driver": "595.91.07",
+            "cuda": "13.2",
+            "sparks": [
+              {
+                "address": "10.55.0.1",
+                "name": null,
+                "rank": 0
+              },
+              {
+                "address": "10.55.0.2",
+                "name": null,
+                "rank": 1
+              },
+              {
+                "address": "10.55.0.3",
+                "name": null,
+                "rank": 2
+              },
+              {
+                "address": "10.55.0.4",
+                "name": null,
+                "rank": 3
+              },
+              {
+                "address": "10.55.0.5",
+                "name": null,
+                "rank": 4
+              },
+              {
+                "address": "10.55.0.6",
+                "name": null,
+                "rank": 5
+              }
+            ],
+            "fabric": [
+              {
+                "device": "mlx5_0",
+                "port": 1,
+                "active": true,
+                "link_gbps": 400.0,
+                "pcie": "32 GT/s x16",
+                "netdev": "enp1s0np0",
+                "subnets": [
+                  "10.55.0.0/24",
+                  "10.55.1.0/24"
+                ]
+              }
+            ],
+            "rails": "fabric: use 2 rail(s) of [mlx5_0@10.55.0.22/24 400G(eff 400G), mlx5_0@10.55.1.22/24 400G(eff 400G)]: 2 subnets share one 400 Gb/s port; each rail is a subnet of the same link"
+          },
+          "readiness_s": 34.794822534
+        }
+      ],
+      "started": "2026-10-02T07:22:32Z",
+      "finished": "2026-10-02T07:22:32Z",
+      "seconds": 0.000109384,
+      "error": null,
+      "history": []
+    },
+    {
+      "id": "configuration",
+      "title": "Configuration",
+      "status": "done",
+      "passes": [
+        {
+          "model": "zai-org/GLM-5.3",
+          "family": "glm5",
+          "revision": "e3b8f9f2fad29727dfa95e766c5cac18ea1414bf",
+          "configuration": {
+            "snapshot": "/root/.cache/huggingface/hub/models--nvidia--GLM-5.3-NVFP4/snapshots/e3b8f9f2fad29727dfa95e766c5cac18ea1414bf",
+            "quant": [
+              {
+                "group": "embedding",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "lm head",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "norm",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "attention",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "indexer",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "router",
+                "formats": [
+                  "bf16",
+                  "f32"
+                ]
+              },
+              {
+                "group": "shared expert",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "routed expert",
+                "formats": [
+                  "nvfp4-g16"
+                ]
+              },
+              {
+                "group": "dense ffn",
+                "formats": [
+                  "fp8-tensor/f32"
+                ]
+              },
+              {
+                "group": "speculator",
+                "formats": [
+                  "bf16",
+                  "f32"
+                ]
+              },
+              {
+                "group": "speculator expert",
+                "formats": [
+                  "bf16"
+                ]
+              }
+            ],
+            "speculator": "copy-window drafts",
+            "layout": "2 RTX (head split) · experts TP6 over 6 Sparks",
+            "settings": [
+              {
+                "name": "snapshot",
+                "value": "/root/.cache/huggingface/hub/models--nvidia--GLM-5.3-NVFP4/snapshots/e3b8f9f2fad29727dfa95e766c5cac18ea1414bf",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "native-lib",
+                "value": "/opt/cuteafd/lib/libcuteafd_native.so",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "manifest",
+                "value": "/opt/cuteafd/share/PROGRAMS.json",
+                "default": "/opt/cuteafd/share/PROGRAMS.json",
+                "source": "default"
+              },
+              {
+                "name": "device",
+                "value": "0",
+                "default": "0",
+                "source": "cli"
+              },
+              {
+                "name": "split-device",
+                "value": "1",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "max-context",
+                "value": "32768",
+                "default": "32768",
+                "source": "cli"
+              },
+              {
+                "name": "pool-tokens",
+                "value": "262144",
+                "default": "262144",
+                "source": "default"
+              },
+              {
+                "name": "prefill-rows",
+                "value": "4096",
+                "default": "4096",
+                "source": "default"
+              },
+              {
+                "name": "peers",
+                "value": "10.55.0.1:19461,10.55.0.2:19461,10.55.0.3:19461,10.55.0.4:19461,10.55.0.5:19461,10.55.0.6:19461",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "draft-sequences",
+                "value": "16",
+                "default": "16",
+                "source": "default"
+              },
+              {
+                "name": "draft-fp8",
+                "value": "true",
+                "default": "true",
+                "source": "default"
+              },
+              {
+                "name": "fp8-scales",
+                "value": "amax",
+                "default": "amax",
+                "source": "default"
+              },
+              {
+                "name": "l2-prefetch",
+                "value": "auto",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "full-prefill-logits",
+                "value": "false",
+                "default": "false",
+                "source": "default"
+              },
+              {
+                "name": "skip-routed-experts",
+                "value": "false",
+                "default": "false",
+                "source": "default"
+              },
+              {
+                "name": "prefill-w8a16",
+                "value": "false",
+                "default": "false",
+                "source": "default"
+              },
+              {
+                "name": "embed-placement",
+                "value": "gpu",
+                "default": "gpu",
+                "source": "default"
+              },
+              {
+                "name": "token-select",
+                "value": "device",
+                "default": "device",
+                "source": "default"
+              },
+              {
+                "name": "listen",
+                "value": "0.0.0.0:8310",
+                "default": "0.0.0.0:8000",
+                "source": "cli"
+              },
+              {
+                "name": "max-output",
+                "value": "4096",
+                "default": "4096",
+                "source": "cli"
+              },
+              {
+                "name": "max-sequences",
+                "value": "8",
+                "default": "16",
+                "source": "cli"
+              },
+              {
+                "name": "model-id",
+                "value": "zai-org/GLM-5.3",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "no-copy-drafts",
+                "value": "false",
+                "default": "false",
+                "source": "default"
+              },
+              {
+                "name": "decode-share",
+                "value": "0.2",
+                "default": "0.2",
+                "source": "default"
+              },
+              {
+                "name": "prefix-cache-entries",
+                "value": "20",
+                "default": "20",
+                "source": "cli"
+              },
+              {
+                "name": "prefix-cache-mark-mib",
+                "value": "2048",
+                "default": "2048",
+                "source": "default"
+              },
+              {
+                "name": "prefix-cache-min-tokens",
+                "value": "64",
+                "default": "64",
+                "source": "default"
+              },
+              {
+                "name": "host-cache-bytes",
+                "value": "0",
+                "default": "0",
+                "source": "default"
+              },
+              {
+                "name": "host-cache-min-tokens",
+                "value": "512",
+                "default": "512",
+                "source": "default"
+              },
+              {
+                "name": "prefix-point-gap",
+                "value": "0",
+                "default": "0",
+                "source": "default"
+              },
+              {
+                "name": "prefix-point-boundaries",
+                "value": "0",
+                "default": "0",
+                "source": "default"
+              },
+              {
+                "name": "prefix-points-per-request",
+                "value": "4",
+                "default": "4",
+                "source": "default"
+              },
+              {
+                "name": "prefix-partial",
+                "value": "off",
+                "default": "off",
+                "source": "default"
+              },
+              {
+                "name": "console-text",
+                "value": "false",
+                "default": "false",
+                "source": "env"
+              },
+              {
+                "name": "CUTEAFD_FP8_EXPERT_PREFILL",
+                "value": "auto",
+                "default": "auto",
+                "source": "env"
+              },
+              {
+                "name": "CUTEAFD_SPARK_INTAKE",
+                "value": "auto",
+                "default": "auto",
+                "source": "env"
+              }
+            ]
+          },
+          "build": {
+            "version": "0.1.0",
+            "release": "v0.1.0",
+            "image": "ghcr.io/tpurtell/cuteafd-coordinator:v0.1.0",
+            "remote": null,
+            "commit": "7936046a1a4a0cc1c20a71421125e4a65e71c91b",
+            "dirty": false
+          }
+        }
+      ],
+      "started": "2026-10-02T07:22:32Z",
+      "finished": "2026-10-02T07:22:32Z",
+      "seconds": 0.00014631,
+      "error": null,
+      "history": []
+    }
+  ],
+  "error": null
+}

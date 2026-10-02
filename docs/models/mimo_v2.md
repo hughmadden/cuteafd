@@ -45,7 +45,7 @@ experts without a shared expert.
 
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
-| v0 | 2026-10-02 | First release | — |
+| v0 | 2026-10-02 | First release | <a href="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-flash-1rtx-4spark/report.svg"><img src="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-flash-1rtx-4spark/card.svg" width="360" alt="MiMo-V2-Flash (fp8-block128x128/f32) (min)"></a> <a href="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-flash-2rtx-4spark/report.svg"><img src="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-flash-2rtx-4spark/card.svg" width="360" alt="MiMo-V2-Flash (fp8-block128x128/f32) (max)"></a> <a href="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-6-pro-rl-1rtx-6spark/report.svg"><img src="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-6-pro-rl-1rtx-6spark/card.svg" width="360" alt="MiMo-V2.6-Pro-RL (mxfp4-g32) (min)"></a> <a href="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-6-pro-rl-2rtx-6spark/report.svg"><img src="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-6-pro-rl-2rtx-6spark/card.svg" width="360" alt="MiMo-V2.6-Pro-RL (mxfp4-g32) (max)"></a> |
 
 ## Additional benchmarks
 
