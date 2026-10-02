@@ -704,8 +704,9 @@ active admission deferral and active KV paging are separate remaining work.
         correctness on one and two RTX with TP6: raw KV, taps, draft context,
         logits, proposals and fixed continuations match serial execution.
         Real scheduler/cache cases and cancellation after Spark dispatch also
-        pass without late captures or tracked allocation growth. Optional FP8
-        correctness and clean-binary throughput/latency gates remain pending;
+        pass without late captures or tracked allocation growth. The same
+        full-model matrix also passes with the single-copy FP8 bundle on both
+        layouts. Clean-binary throughput/latency gates remain pending;
         HTTP transport and MTP pairing are outside this gate.
      i. V4 / V4.1 turn-end prefix-cache restore not byte-exact (reported,
         not gated). V4 Flash also differs across repeated uncached solo
