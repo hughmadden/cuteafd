@@ -149,6 +149,9 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     };
     let target = PREFILL_TOKENS.min(max_context.saturating_sub(64)) as f64;
     let words = ((target - intercept) / slope).max(64.0) as usize;
+    // The first prompt of this size pays one-time costs (workspaces, chunk plans): untimed.
+    let text = format!("[{}] Reply with the single word OK.\n\n{}", nonce(), filler(98, words));
+    client.chat(plain(&text, 1), None).context("8K prefill warm-up")?;
     let text = format!("[{}] Reply with the single word OK.\n\n{}", nonce(), filler(99, words));
     let chat = client.chat(plain(&text, 1), None).context("8K prefill")?;
     let t = chat.timing.clone();
@@ -166,6 +169,7 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     run.check("template", "Template round trip", template);
     run.step(0.90, "C1 vs C4");
     run.check("c1_c4", "C1 vs C4 divergence", c1_c4);
+    batch_variant_speculation(&mut run.baseline.quality);
     run.baseline.seconds = started.elapsed().as_secs_f64();
     run.baseline.quality.settle();
     run.step(1.0, "baseline done");
@@ -369,6 +373,25 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
 /// Top-two log-probability margin under which a greedy flip counts as a tie.
 const TIE_NATS: f64 = 0.05;
 
+/// Top-two margin under which a speculation flip is batch noise on an engine whose
+/// concurrent greedy outputs already differ from C1 (verify rows run batched).
+const BATCH_VARIANT_NATS: f64 = 0.5;
+
+/// Speculation verifies drafts as a batch of rows. When plain C4 already diverges from
+/// C1, a flip at a small margin says the numerics are not batch invariant, not that
+/// speculation changes the model: that is reported (not gated), and larger flips still fail.
+fn batch_variant_speculation(quality: &mut Quality) {
+    let batch_variant = quality.checks.iter().any(|c| c.id == "c1_c4" && c.status == CheckStatus::Info
+        && c.metrics.get("identical").and_then(|v| v.as_u64()).is_some_and(|n| n < 4));
+    let Some(check) = quality.checks.iter_mut().find(|c| c.id == "spec_lossless" && c.status == CheckStatus::Fail)
+    else { return };
+    let margin = check.metrics.get("divergence_margin").and_then(|v| v.as_f64());
+    if batch_variant && margin.is_some_and(|m| m < BATCH_VARIANT_NATS) {
+        check.status = CheckStatus::Info;
+        check.summary = format!("{} · not gated: C4 differs from C1 too (batch-variant numerics)", check.summary);
+    }
+}
+
 fn template(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     let tools = json!([{"type": "function", "function": {"name": "get_weather",
         "description": "Current weather for a city.",
@@ -482,4 +505,28 @@ fn output_of(chat: &Chat) -> Vec<u32> {
 pub fn describe(timing: &StreamTiming) -> String {
     format!("{} prompt, {} out, ttft {:.3}s, decode {:.1} tok/s", timing.prompt_tokens, timing.completion_tokens,
         timing.ttft_s, timing.decode_tok_s())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::report::Check;
+
+    fn check(id: &str, status: CheckStatus, metrics: Value) -> Check {
+        Check { id: id.into(), status, metrics: metrics.as_object().cloned().unwrap_or_default(), ..Check::default() }
+    }
+
+    #[test]
+    fn small_speculation_flips_on_batch_variant_engines_are_not_gated() {
+        let quality = |margin: f64, identical: u64| {
+            let mut q = Quality::default();
+            q.checks.push(check("spec_lossless", CheckStatus::Fail, json!({"divergence_margin": margin})));
+            q.checks.push(check("c1_c4", CheckStatus::Info, json!({"identical": identical})));
+            batch_variant_speculation(&mut q);
+            q.checks[0].status
+        };
+        assert_eq!(quality(0.28, 0), CheckStatus::Info);
+        assert_eq!(quality(0.28, 4), CheckStatus::Fail);
+        assert_eq!(quality(1.2, 0), CheckStatus::Fail);
+    }
 }

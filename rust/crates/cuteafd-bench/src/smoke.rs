@@ -451,6 +451,12 @@ fn write_config(entry: &Entry, repo: &Path, configs: &Path, parallel: bool) -> R
     Ok(path)
 }
 
+/// The path of an open log file (Linux: through /proc).
+fn log_path(log: &File) -> std::io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", log.as_raw_fd()))
+}
+
 /// Removes the entry's coordinator and expert containers.
 fn teardown(entry: &Entry, config: &HashMap<String, String>, log: &mut File) {
     let instance = config.get("INSTANCE").filter(|v| !v.is_empty());
@@ -458,6 +464,13 @@ fn teardown(entry: &Entry, config: &HashMap<String, String>, log: &mut File) {
         Some(instance) => format!("cuteafd-coordinator-{instance}"),
         None => "cuteafd-coordinator".into(),
     };
+    // The coordinator's own log goes next to the entry's (failures and warnings outlive the container).
+    if let Ok(path) = log_path(log) {
+        if let Ok(file) = File::create(path.with_extension("coordinator.log")) {
+            let _ = Command::new("docker").args(["logs", &coordinator]).stdout(file.try_clone().map(Stdio::from)
+                .unwrap_or(Stdio::null())).stderr(Stdio::from(file)).status();
+        }
+    }
     let _ = Command::new("docker").args(["rm", "-f", &coordinator]).stdout(Stdio::null()).stderr(Stdio::null()).status();
     let port = config.get("EXPERT_PORT").cloned().unwrap_or_else(|| "19441".into());
     let count: usize = config.get("SPARK_COUNT").and_then(|v| v.parse().ok()).unwrap_or(0);

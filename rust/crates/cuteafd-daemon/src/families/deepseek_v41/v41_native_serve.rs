@@ -721,8 +721,11 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
 #[error("teacher-forced scoring finished")]
 pub(crate) struct ScoringDone;
 
+/// Rows per teacher-forced scoring chunk: the smallest target-head wave capacity.
+const SCORING_ROWS: usize = 48;
+
 /// Teacher-forced scoring (a benchmark probe): prefill `tokens[..from]`, then
-/// continue in chunks of at most 64 rows with every row's logits, recording the
+/// continue in chunks of [`SCORING_ROWS`] rows with every row's logits, recording the
 /// row that predicts each of `tokens[from..]`. Returns [`ScoringDone`] when done.
 #[allow(clippy::too_many_arguments)]
 fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
@@ -737,7 +740,9 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
         chunk_rows, job, draft.as_deref_mut(), hold)?;
     probe.row(from, &first.logits()?);
     let mut at = from;
-    for chunk in tokens[from..tokens.len() - 1].chunks(64) {
+    // Every row of a chunk goes through the target head: at most its wave capacity
+    // (48 rows at dSpark ≤ 5 drafts, 64 above).
+    for chunk in tokens[from..tokens.len() - 1].chunks(SCORING_ROWS) {
         ensure!(!job.events.is_closed(), "client disconnected");
         let mut batch = requests.prepare(&[RequestTokens { lease, tokens: chunk,
             image_mask: None, kind: ExpertV2SourceKind::Prefill }])?;
