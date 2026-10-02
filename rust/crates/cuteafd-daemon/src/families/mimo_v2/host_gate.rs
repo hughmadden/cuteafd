@@ -65,7 +65,7 @@ fn run(args: &Args, engine: &engine::MimoEngine<'_>, tokens: &[u32]) -> Result<(
     ensure!(tokens.len() >= n && capacity <= engine.max_context, "gate tokens/context do not fit");
     let tokens = &tokens[..n];
     ensure!(tokens.iter().all(|&token| (token as usize) < engine.cfg.vocab_size), "out-of-vocabulary gate token");
-    let (family, mut cache) = serve::prefix_cache(engine, &args.prefix)?;
+    let (family, mut cache) = serve::prefix_cache(engine, &args.prefix, 1)?;
     let host = cache.stats().host.context("requested host retention was not enabled")?;
     if let crate::shared::prefix::HostBudget::Bytes(bytes) = args.prefix.host_cache_bytes {
         ensure!(host.quota_bytes == bytes, "explicit host quota changed under the head split");

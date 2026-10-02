@@ -265,12 +265,12 @@ impl Opened {
     /// Output storage is fixed before any workspace is admitted or captured.
     pub fn with_engine_output<T>(&self, args: &EngineArgs, prefill_output: MimoPrefillOutput,
         body: impl FnOnce(&engine::MimoEngine<'_>) -> Result<T>) -> Result<T> {
-        self.with_engine_reserved(args, None, prefill_output, body)
+        self.with_engine_reserved(args, None, prefill_output, |engine, _| body(engine))
     }
 
     pub fn with_engine_reserved<T>(&self, args: &EngineArgs,
         serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>, prefill_output: MimoPrefillOutput,
-        body: impl FnOnce(&engine::MimoEngine<'_>) -> Result<T>) -> Result<T> {
+        body: impl FnOnce(&engine::MimoEngine<'_>, Option<cuteafd_hostcache::config::Config>) -> Result<T>) -> Result<T> {
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         let split_device = split::requested_device(&self.cfg, args.device, args.split_device,
             |name| programs.spec(name).is_ok())?;
@@ -390,13 +390,13 @@ impl Opened {
         }
         let moe_layers = (0..layers).filter(|&l| !self.cfg.dense[l]).collect::<Vec<_>>();
         engine.expert_input = args.expert_input;
-        if let Some(experts) = self.experts(args, &moe_layers)? {
+        if let Some(experts) = self.experts(args, &moe_layers, preflight.local_expert_budget)? {
             engine.set_experts(experts);
         }
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
-        let result = body(&engine);
+        let result = body(&engine, preflight.host_config);
         drop(engine);
         // SAFETY: both stream handles were created here and remain owned here.
         // Cleanup follows engine teardown; queued-wait cancellation is separate.
@@ -422,7 +422,8 @@ impl Opened {
 impl Opened {
     /// The routed-expert source for `moe_layers`: Spark ranks (`--peers`,
     /// warmed with a full-capacity request) or the local TP1 package.
-    fn experts<'s>(&'s self, args: &EngineArgs, moe_layers: &[usize]) -> Result<Option<engine::Experts<'s>>> {
+    fn experts<'s>(&'s self, args: &EngineArgs, moe_layers: &[usize], local_budget: usize)
+        -> Result<Option<engine::Experts<'s>>> {
         if moe_layers.is_empty() {
             return Ok(None);
         }
@@ -433,16 +434,15 @@ impl Opened {
             let tensors = self.catalog.fp8().context("MiMo experts are the checkpoint's FP8 tensors")?;
             let directory = args.fp8_package.clone()
                 .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&args.native_lib, 1, tensors.format()));
-            let (free, _) = self.library.cuda_memory_info()?;
             if let Some(window) = args.expert_window {
                 let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, 0..0, 1, 0,
-                    engine::expert_capacity(args.prefill_rows), free.saturating_sub(4 << 30))?;
+                    engine::expert_capacity(args.prefill_rows), local_budget)?;
                 return Ok(Some(engine::Experts::Streamed { experts: std::cell::RefCell::new(experts), tensors, window }));
             }
             let started = Instant::now();
             let local = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory,
                 moe_layers[0]..moe_layers[moe_layers.len() - 1] + 1, 1, 0, engine::expert_capacity(args.prefill_rows),
-                free.saturating_sub(4 << 30))?;
+                local_budget)?;
             tracing::info!(layers = moe_layers.len(), elapsed_ms = started.elapsed().as_millis() as u64,
                 "MiMo FP8 experts resident on this GPU");
             return Ok(Some(engine::Experts::Local(local)));

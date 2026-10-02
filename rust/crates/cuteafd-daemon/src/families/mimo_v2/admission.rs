@@ -12,6 +12,8 @@ pub(super) struct Preflight {
     pub capacity: cuteafd_core::serving_capacity::ResolvedCapacity,
     pub memory: Vec<cuteafd_core::serving_capacity::DeviceMemory>,
     pub runtime_bound_bytes: u64,
+    pub host_config: Option<cuteafd_hostcache::config::Config>,
+    pub local_expert_budget: usize,
 }
 
 /// Resolve physical reservations before modules, weights, KV or workspaces.
@@ -65,9 +67,9 @@ pub(super) fn preflight(
         Some((prefix, _)) => mark_slots(prefix, concurrency, usize::try_from(mark_bytes)?)? as u64,
         None => 0,
     };
-    // The current branch's multi-rank host-copy path is disabled. Do not size
-    // or instantiate a host tier whose copy engine cannot restore every rank.
-    let host_bytes = match serving.filter(|_| ranks == 1) {
+    // Registered snapshot owners restore every physical rank. The host tier
+    // receives one aggregate logical page/mark and adds no active GPU KV.
+    let host_config = match serving {
         Some((prefix, _)) => {
             let page_bytes = cache
                 .ranks
@@ -82,12 +84,11 @@ pub(super) fn preflight(
                 draft_bytes: 0,
                 rule: cuteafd_engine::prefix::ReuseRule::EXACT,
             };
-            prefix
-                .host_config(layout, args.max_context)?
-                .map_or(0, |config| config.bytes)
+            prefix.host_config(layout, args.max_context)?
         }
-        None => 0,
+        None => None,
     };
+    let host_bytes = host_config.as_ref().map_or(0, |config| config.bytes);
     let runtime_bound_bytes = tensor_bytes(
         "MiMo provisional runtime reserve",
         &[args.runtime_reserve_mib, 1 << 20],
@@ -250,6 +251,10 @@ pub(super) fn preflight(
     let capacity = resolve_capacity(policy, &profiles.steady, &memory).with_context(|| {
         format!("MiMo steady admission; complete per-GPU reservation contract {report}")
     })?;
+    let local_expert_budget = capacity.devices[0].reservations.iter()
+        .filter(|reservation| reservation.name.starts_with("experts.local_"))
+        .try_fold(0u64, |bytes, reservation| bytes.checked_add(reservation.bytes))
+        .context("MiMo admitted local expert size overflow")?;
     let intake_probe_bytes = if spark_ranks > 0 {
         match std::env::var("CUTEAFD_SPARK_INTAKE").as_deref() {
             Err(_) | Ok("auto" | "gpu") => 64 << 20,
@@ -288,6 +293,8 @@ pub(super) fn preflight(
         capacity,
         memory,
         runtime_bound_bytes,
+        host_config,
+        local_expert_budget: usize::try_from(local_expert_budget)?,
     })
 }
 
