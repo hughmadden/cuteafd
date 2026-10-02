@@ -109,6 +109,13 @@ after tables with conditions.
   `benchmarks/README.md` (per family, newest first: date, profile, hardware,
   build). Commit them straight on top of `main` or the working branch; no
   release or branch needed.
+  `cuteafd bench --url URL --profile NAME` runs a profile on a launched
+  server and writes the exports there; `cuteafd bench publish` rebuilds
+  both tables from what is placed. Release prep: `cuteafd bench smoke
+  --matrix FILE` (format: `scripts/bench/release-smoke.example.json`)
+  launches each entry with ./run.sh, runs Release smoke, exports, tears
+  down, resumes per build and runs entries on disjoint hardware side by
+  side under the lock files.
 - Unsupported is a result, not a crash: `cuteafd plan` names the tensors,
   formats, shapes and the exporter or kernel to add.
 - Load speed is a feature; do not regress readiness time.
