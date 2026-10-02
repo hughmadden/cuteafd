@@ -18,7 +18,7 @@ use std::ffi::c_void;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -2031,13 +2031,13 @@ impl VerbsHostProtocolV2PersistentClientSession {
         execution_lane: u32,
         cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
     ) -> Result<Self> {
-        Self::connect_impl(addr, config, request, execution_lane, cq_harvester, false, None, false)
+        Self::connect_impl(addr, config, request, execution_lane, cq_harvester, false, None, false, None)
     }
 
     fn connect_local(addr: SocketAddr, config: &TcpTransportConfig,
                      request: &ExpertProtocolV2Request, landing: Option<DeviceLanding>,
-                     egress: Option<&Arc<egress::EgressBuffer>>) -> Result<Self> {
-        let mut session = Self::connect_impl(addr, config, request, 0, None, true, landing, egress.is_some())?;
+                     egress: Option<&Arc<egress::EgressBuffer>>, terminal_owner: Option<Arc<AtomicBool>>) -> Result<Self> {
+        let mut session = Self::connect_impl(addr, config, request, 0, None, true, landing, egress.is_some(), terminal_owner)?;
         if let Some(buffer) = egress {
             let host = buffer.host();
             // SAFETY: the buffer is pinned host memory kept alive by the Arc
@@ -2054,7 +2054,8 @@ impl VerbsHostProtocolV2PersistentClientSession {
     fn connect_impl(addr: SocketAddr, config: &TcpTransportConfig,
                     request: &ExpertProtocolV2Request, execution_lane: u32,
                     cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
-                    retain_final_response: bool, landing: Option<DeviceLanding>, gathered_sends: bool)
+                    retain_final_response: bool, landing: Option<DeviceLanding>, gathered_sends: bool,
+                    terminal_owner: Option<Arc<AtomicBool>>)
                     -> Result<Self> {
         verbs_host_preflight()?;
         let native_path = verbs_host_native_library_path().context(
@@ -2069,7 +2070,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
         let response_capacity_wire_bytes = response_ring.slot_capacity_bytes;
         let request_registered_span_bytes = request_ring.registered_span_bytes;
         let response_registered_span_bytes = response_ring.registered_span_bytes;
-        let endpoint = if retain_final_response {
+        let mut endpoint = if retain_final_response {
             NativeRdmaEndpoint::create_from_wire_bytes_mapped_for_ring(
                 Arc::clone(&library), "client", request_capacity_wire_bytes,
                 response_capacity_wire_bytes, request_registered_span_bytes,
@@ -2085,6 +2086,9 @@ impl VerbsHostProtocolV2PersistentClientSession {
                 response_registered_span_bytes, next_local_psn("client"),
             )?
         };
+        // Publish the external-owner witness before landing registration or
+        // any fallible bootstrap work can drop this temporary endpoint.
+        endpoint.terminal_owner = terminal_owner;
         let peer = addr.to_string();
         let mut stream = connect_control_stream(&peer, config.timeout)?;
         configure_control_stream(&stream, config.timeout)?;
@@ -3328,6 +3332,7 @@ struct VerbsHostProtocolV2RecvReady {
 struct NativeRdmaEndpoint {
     library: Arc<NativeLibrary>,
     info: CuteafdRdmaRcEndpointInfo,
+    terminal_owner: Option<Arc<AtomicBool>>,
 }
 
 impl NativeRdmaEndpoint {
@@ -3549,7 +3554,7 @@ impl NativeRdmaEndpoint {
                 host_buffer_flags,
             )?
         };
-        Ok(Self { library, info })
+        Ok(Self { library, info, terminal_owner: None })
     }
 
     fn send_buffer_view(&self) -> Result<CuteafdRdmaRcEndpointBufferView> {
@@ -3682,11 +3687,29 @@ impl NativeRdmaEndpoint {
         self.library
             .rdma_rc_endpoint_copy_recv_at(self.info.handle, out, offset_bytes, bytes)
     }
+
+    fn terminal_quiesce(&self) -> Result<()> {
+        let result = self.library.rdma_rc_endpoint_quiesce(self.info.handle);
+        if result.is_err() {
+            if let Some(owner) = &self.terminal_owner { owner.store(true, Ordering::Release); }
+        }
+        result
+    }
 }
 
 impl Drop for NativeRdmaEndpoint {
     fn drop(&mut self) {
         if !self.info.handle.is_null() {
+            if self.terminal_owner.is_some() {
+                if let Err(error) = self.terminal_quiesce() {
+                    // The native endpoint still owns the registered rings;
+                    // the witness keeps external GPU landing owners alive.
+                    // Keep its library loaded while that endpoint is retained.
+                    std::mem::forget(self.library.clone());
+                    tracing::error!(%error,"retaining terminal RDMA endpoint after failed QP destruction");
+                    return;
+                }
+            }
             let _ = self.library.rdma_rc_endpoint_destroy(self.info.handle);
             self.info.handle = std::ptr::null_mut();
         }
