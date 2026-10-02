@@ -87,6 +87,40 @@ __global__ void host_signal(uint32_t* flag, uint32_t* send_state, uint32_t* desc
   }
 }
 
+__device__ __forceinline__ uint64_t load_acquire_sys_u64(const uint64_t* address) {
+  uint64_t value;
+  asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(value) : "l"(address) : "memory");
+  return value;
+}
+
+// Waits for every rank's NIC-written completion flag (low 32 bits = the next
+// sequence of `state`), records ranks that flagged an error, then advances
+// the sequence. One warp; lane r watches rank r.
+__global__ void wait_written(const uint64_t* flags, uint32_t ranks, uint32_t stride_words, uint32_t* state,
+    uint32_t* error) {
+  const uint32_t expected = state[0] + 1;
+  const uint32_t rank = threadIdx.x;
+  if (rank < ranks) {
+    const uint64_t* flag = flags + uint64_t(rank) * stride_words;
+    const uint64_t start = global_ns();
+    uint32_t polls = 0;
+    uint64_t value = load_acquire_sys_u64(flag);
+    while (uint32_t(value) != expected) {
+      if ((++polls & 1023) == 0 && global_ns() - start > kWaitTimeoutNs) {
+        printf("spark wait: rank %u flag %llx, waiting for %u after 60 s\n", rank, (unsigned long long)value, expected);
+        __trap();
+      }
+      value = load_acquire_sys_u64(flag);
+    }
+    if (value >> 63) atomicOr(error, 1u << rank);
+  }
+  __syncwarp();
+  if (threadIdx.x == 0) {
+    __threadfence();
+    state[0] = expected;
+  }
+}
+
 __global__ void add_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* out, uint64_t count) {
   const uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
   for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += stride)
@@ -173,7 +207,8 @@ extern "C" int32_t cuteafd_peer_exchange_initialize() {
   // first launch may wait for the device to idle, which a spinning wait never does.
   cudaFuncAttributes attributes{};
   for (const void* kernel : {reinterpret_cast<const void*>(push_signal), reinterpret_cast<const void*>(wait_flag),
-       reinterpret_cast<const void*>(add_bf16), reinterpret_cast<const void*>(host_signal)}) {
+       reinterpret_cast<const void*>(add_bf16), reinterpret_cast<const void*>(host_signal),
+       reinterpret_cast<const void*>(wait_written)}) {
     const cudaError_t status = cudaFuncGetAttributes(&attributes, kernel);
     if (status != cudaSuccess) return status;
   }
@@ -217,6 +252,13 @@ extern "C" int32_t cuteafd_host_signal(uint32_t* flag, uint32_t* send_state, uin
   if (!flag || !send_state || !descriptor || !words || !stream) return cudaErrorInvalidValue;
   host_signal<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(flag, send_state, descriptor,
       make_uint4(words[0], words[1], words[2], words[3]));
+  return cudaGetLastError();
+}
+
+extern "C" int32_t cuteafd_spark_wait_written(const uint64_t* flags, uint32_t ranks, uint32_t stride_words,
+    uint32_t* state, uint32_t* error, void* stream) {
+  if (!flags || !state || !error || !stream || !ranks || ranks > 32 || !stride_words) return cudaErrorInvalidValue;
+  wait_written<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(flags, ranks, stride_words, state, error);
   return cudaGetLastError();
 }
 

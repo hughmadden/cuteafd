@@ -780,10 +780,29 @@ pub(crate) struct SparkDeviceLink<'a> {
     lane: cuteafd_transport::expert::SparkDeviceLane,
     intake: SparkIntake<'a>,
     mailbox: HostAllocation<'a>,
+    /// Write mode (`CUTEAFD_SPARK_WRITE=1`): the ranks RDMA-write their rows
+    /// and completion flags here (planes, then one 64-byte flag line per rank);
+    /// no receive and no host thread is involved in a wave's return.
+    written: Option<DeviceAllocation<'a>>,
     library: &'a NativeLibrary,
     capacity: usize,
     topk: usize,
     wire_row_bytes: usize,
+    row_bytes: usize,
+    ranks: usize,
+}
+
+/// Write mode: one plane per rank, then one 64-byte line per rank flag.
+fn written_layout(ranks: usize, capacity: usize, row_bytes: usize) -> (usize, usize) {
+    let plane = (capacity * row_bytes).next_multiple_of(256);
+    (plane, ranks * plane)
+}
+
+/// Whether device exchanges have the ranks write their responses
+/// (`CUTEAFD_SPARK_WRITE=1`; needs workers that accept write targets).
+pub(crate) fn written_responses() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("CUTEAFD_SPARK_WRITE").as_deref(), Ok("1" | "on")))
 }
 
 impl<'a> SparkDeviceLink<'a> {
@@ -799,10 +818,22 @@ impl<'a> SparkDeviceLink<'a> {
         let choice = choose_mode(library)?;
         ensure!(choice.mode == IntakeMode::Gpu,
             "the device Spark exchange needs GPU landing, but the intake is {} ({})", choice.mode.name(), choice.reason);
-        let intake = SparkIntake::new(library, IntakeMode::Gpu, peers.len(), capacity, row_bytes)?;
+        let intake = SparkIntake::new(library, IntakeMode::Gpu, peers.len(), if written_responses() { 1 } else { capacity },
+            row_bytes)?;
         let mailbox = HostAllocation::new(library, device_mailbox::bytes(capacity, topk, wire_row_bytes))?;
         library.peer_exchange_initialize()?;
         let landing = intake.landing().context("GPU intake planes")?;
+        let ranks = peers.len();
+        let (written, targets) = if written_responses() {
+            let (plane, flags) = written_layout(ranks, capacity, row_bytes);
+            let allocation = DeviceAllocation::new(library, flags + ranks * 64)?;
+            library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { ptr: unsafe { allocation.buffer.ptr.cast::<u8>()
+                .add(flags) }.cast(), bytes: ranks * 64, ..allocation.buffer }, &vec![0u8; ranks * 64])?;
+            let targets = (0..ranks).map(|rank| cuteafd_transport::DeviceWriteTarget {
+                base: allocation.buffer.ptr as usize, bytes: allocation.buffer.bytes, plane_offset: rank * plane,
+                plane_bytes: capacity * row_bytes, flag_offset: flags + rank * 64 }).collect();
+            (Some(allocation), Some(targets))
+        } else { (None, None) };
         // SAFETY: the mailbox and the intake planes are fields of this link,
         // dropped after the lane (which joins its thread first); the engine
         // publishes a wave only after it waited for the previous one and
@@ -811,10 +842,11 @@ impl<'a> SparkDeviceLink<'a> {
         let lane = unsafe {
             cuteafd_transport::expert::SparkDeviceLane::spawn(peers.to_vec(), executors.to_vec(), capacity as u32,
                 config, landing, device, mailbox.buffer.ptr as usize, mailbox.buffer.bytes, topk, wire_row_bytes,
-                warm, build)?
+                warm, targets, build)?
         };
-        tracing::info!(ranks = peers.len(), capacity, "device-driven Spark exchange ready (proxy thread, GPU landing)");
-        Ok(Self { lane, intake, mailbox, library, capacity, topk, wire_row_bytes })
+        tracing::info!(ranks, capacity, written = written.is_some(),
+            "device-driven Spark exchange ready (proxy thread posts; responses land in GPU memory)");
+        Ok(Self { lane, intake, mailbox, written, library, capacity, topk, wire_row_bytes, row_bytes, ranks })
     }
 
     pub(crate) fn world_size(&self) -> usize {
@@ -823,7 +855,18 @@ impl<'a> SparkDeviceLink<'a> {
 
     /// Plane pointers for the compact reducer.
     pub(crate) fn pointers(&self) -> [*const u16; MAX_INTAKE_RANKS] {
-        self.intake.pointers()
+        match &self.written {
+            Some(allocation) => {
+                let (plane, _) = written_layout(self.ranks, self.capacity, self.row_bytes);
+                let mut pointers = [std::ptr::null::<u16>(); MAX_INTAKE_RANKS];
+                for (rank, slot) in pointers.iter_mut().enumerate().take(self.ranks) {
+                    // SAFETY: rank planes lie inside the written allocation.
+                    *slot = unsafe { allocation.buffer.ptr.cast::<u8>().add(rank * plane) }.cast();
+                }
+                pointers
+            }
+            None => self.intake.pointers(),
+        }
     }
 
     /// Before queuing a step's waves; returns an earlier wave's error.
@@ -839,7 +882,15 @@ impl<'a> SparkDeviceLink<'a> {
 
     /// After the step's stream drained: an error of any of its waves.
     pub(crate) fn check(&self) -> Result<()> {
-        self.lane.check()
+        use cuteafd_transport::expert::device_mailbox as m;
+        self.lane.check()?;
+        if self.written.is_some() {
+            // SAFETY: a u32 word of the live pinned mailbox, written by the GPU's waits.
+            let word = unsafe { &*(self.mailbox_at(m::WRITE_ERROR).ptr as *const std::sync::atomic::AtomicU32) };
+            let failed = word.swap(0, std::sync::atomic::Ordering::AcqRel);
+            ensure!(failed == 0, "device Spark exchange: ranks {failed:#b} could not write their responses");
+        }
+        Ok(())
     }
 
     pub(crate) fn stats(&self) -> cuteafd_transport::expert::DeviceLaneStats {
@@ -898,6 +949,15 @@ impl<'a> SparkDeviceLink<'a> {
     /// A [`Self::dispatch`] for this wait was queued earlier on `stream`.
     pub(crate) unsafe fn collect(&self, stream: *mut c_void) -> Result<()> {
         use cuteafd_transport::expert::device_mailbox as m;
+        if let Some(allocation) = &self.written {
+            let (_, flags) = written_layout(self.ranks, self.capacity, self.row_bytes);
+            // SAFETY: the flags lie in the written allocation the ranks write;
+            // the state and error words are pinned, device-mapped mailbox memory.
+            return unsafe {
+                self.library.spark_wait_written(allocation.buffer.ptr.cast::<u8>().add(flags).cast(), self.ranks as u32,
+                    8, self.mailbox_at(m::RECV_STATE).ptr.cast(), self.mailbox_at(m::WRITE_ERROR).ptr.cast(), stream)
+            };
+        }
         // SAFETY: the DONE word is pinned, device-mapped mailbox memory; the
         // state word is pinned mailbox memory too.
         unsafe { self.library.peer_wait(self.mailbox_at(m::DONE).ptr.cast(), self.mailbox_at(m::RECV_STATE).ptr.cast(),

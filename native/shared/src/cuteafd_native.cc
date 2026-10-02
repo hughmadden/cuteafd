@@ -449,6 +449,13 @@ struct CuteafdRdmaRcEndpointHandle {
   size_t landing_header_bytes = 0;
   // Host ranges sends may gather from (`cuteafd_rdma_rc_endpoint_register_region`).
   std::vector<ibv_mr*> regions;
+  // Device range a peer RDMA-writes into (`cuteafd_rdma_rc_endpoint_expose_device`).
+  ibv_mr* exposed_mr = nullptr;
+  // Registered host words the completion flags of written responses are sent
+  // from (a ring, so a value is never rewritten while its write may be queued).
+  ibv_mr* flag_source_mr = nullptr;
+  uint64_t* flag_source = nullptr;
+  uint32_t flag_cursor = 0;
   uint32_t pending_send_completions = 0;
   uint32_t pending_recv_completions = 0;
   std::chrono::steady_clock::time_point busy_poll_until = {};
@@ -494,6 +501,13 @@ void destroy_rdma_rc_endpoint(CuteafdRdmaRcEndpointHandle* endpoint) {
   if (endpoint->landing_mr != nullptr) {
     ibv_dereg_mr(endpoint->landing_mr);
   }
+  if (endpoint->exposed_mr != nullptr) {
+    ibv_dereg_mr(endpoint->exposed_mr);
+  }
+  if (endpoint->flag_source_mr != nullptr) {
+    ibv_dereg_mr(endpoint->flag_source_mr);
+  }
+  std::free(endpoint->flag_source);
   for (ibv_mr* region : endpoint->regions) {
     ibv_dereg_mr(region);
   }
@@ -3264,11 +3278,13 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv_at(
 namespace {
 // Registers device memory with the NIC through a dma-buf export of its whole
 // allocation (no nvidia-peermem needed); the MR keeps the export alive.
-cuteafd_status_t register_device_dmabuf_current(ibv_pd* pd, void* ptr, size_t bytes, ibv_mr** out);
+cuteafd_status_t register_device_dmabuf_current(ibv_pd* pd, void* ptr, size_t bytes, ibv_mr** out,
+                                                int access);
 
 // The export needs the owning device's context current; sessions may connect
 // on a thread (a prefill lane) that never selected it.
-cuteafd_status_t register_device_dmabuf(ibv_pd* pd, void* ptr, size_t bytes, ibv_mr** out) {
+cuteafd_status_t register_device_dmabuf(ibv_pd* pd, void* ptr, size_t bytes, ibv_mr** out,
+                                        int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_RELAXED_ORDERING) {
   int ordinal = -1;
   if (cuPointerGetAttribute(&ordinal, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
                             reinterpret_cast<CUdeviceptr>(ptr)) != CUDA_SUCCESS || ordinal < 0) {
@@ -3281,7 +3297,7 @@ cuteafd_status_t register_device_dmabuf(ibv_pd* pd, void* ptr, size_t bytes, ibv
   if (ordinal != previous && cudaSetDevice(ordinal) != cudaSuccess) {
     return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "cannot select the GPU landing range's device");
   }
-  const cuteafd_status_t status = register_device_dmabuf_current(pd, ptr, bytes, out);
+  const cuteafd_status_t status = register_device_dmabuf_current(pd, ptr, bytes, out, access);
   const std::string message = g_last_error;
   if (ordinal != previous && previous >= 0) {
     cudaSetDevice(previous);
@@ -3289,7 +3305,8 @@ cuteafd_status_t register_device_dmabuf(ibv_pd* pd, void* ptr, size_t bytes, ibv
   return status == CUTEAFD_STATUS_OK ? ok() : fail(status, message);
 }
 
-cuteafd_status_t register_device_dmabuf_current(ibv_pd* pd, void* ptr, size_t bytes, ibv_mr** out) {
+cuteafd_status_t register_device_dmabuf_current(ibv_pd* pd, void* ptr, size_t bytes, ibv_mr** out,
+                                                int access) {
   CUdeviceptr base = 0;
   size_t size = 0;
   CUresult result = cuMemGetAddressRange(&base, &size, reinterpret_cast<CUdeviceptr>(ptr));
@@ -3309,8 +3326,7 @@ cuteafd_status_t register_device_dmabuf_current(ibv_pd* pd, void* ptr, size_t by
                 "cuMemGetHandleForAddressRange(DMA_BUF_FD) failed (" +
                     std::to_string(static_cast<int>(result)) + ")");
   }
-  ibv_mr* mr = ibv_reg_dmabuf_mr(pd, offset, bytes, reinterpret_cast<uint64_t>(ptr), fd,
-                                 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_RELAXED_ORDERING);
+  ibv_mr* mr = ibv_reg_dmabuf_mr(pd, offset, bytes, reinterpret_cast<uint64_t>(ptr), fd, access);
   const int saved_errno = errno;
   close(fd);
   if (mr == nullptr) {
@@ -3360,6 +3376,107 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_set_recv_landing(
   (void)header_bytes;
   return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
               "GPU landing requires CUTEAFD_ENABLE_RDMA=ON and CUDA");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_expose_device(void* handle, void* device_ptr,
+                                                               size_t bytes, uint32_t* rkey) {
+  if (handle == nullptr || rkey == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint handle or rkey output is null");
+  }
+#if CUTEAFD_NATIVE_ENABLE_RDMA && CUTEAFD_NATIVE_ENABLE_CUDA
+  auto* endpoint = static_cast<CuteafdRdmaRcEndpointHandle*>(handle);
+  if (endpoint->exposed_mr != nullptr) {
+    ibv_dereg_mr(endpoint->exposed_mr);
+    endpoint->exposed_mr = nullptr;
+  }
+  if (device_ptr == nullptr || bytes == 0) {
+    *rkey = 0;
+    return ok();
+  }
+  // No relaxed ordering: a completion flag written after the data must not
+  // become visible before it.
+  ibv_mr* mr = nullptr;
+  const cuteafd_status_t status = register_device_dmabuf(endpoint->pd, device_ptr, bytes, &mr,
+                                                         IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+  if (status != CUTEAFD_STATUS_OK) {
+    return status;
+  }
+  endpoint->exposed_mr = mr;
+  *rkey = mr->rkey;
+  return ok();
+#else
+  (void)device_ptr;
+  (void)bytes;
+  return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "exposing device memory requires RDMA and CUDA");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_post_write_flagged(
+    void* handle, size_t offset_bytes, size_t bytes, uint64_t remote_addr, uint32_t rkey,
+    uint64_t flag_value, uint64_t flag_remote_addr, uint32_t flag_rkey, uint64_t wr_id) {
+  if (handle == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint handle is null");
+  }
+  if (bytes > std::numeric_limits<uint32_t>::max() || remote_addr == 0 || flag_remote_addr == 0) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint write is invalid");
+  }
+#if CUTEAFD_NATIVE_ENABLE_RDMA
+  auto* endpoint = static_cast<CuteafdRdmaRcEndpointHandle*>(handle);
+  if (offset_bytes > endpoint->send_registered_span_bytes ||
+      bytes > endpoint->send_registered_span_bytes - offset_bytes) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint write source exceeds the send buffer");
+  }
+  constexpr uint32_t kFlagSlots = 64;
+  if (endpoint->flag_source == nullptr) {
+    endpoint->flag_source = static_cast<uint64_t*>(std::calloc(kFlagSlots, sizeof(uint64_t)));
+    if (endpoint->flag_source == nullptr) {
+      return fail(CUTEAFD_STATUS_ALLOCATION_FAILED, "RDMA RC flag source allocation failed");
+    }
+    endpoint->flag_source_mr = ibv_reg_mr(endpoint->pd, endpoint->flag_source,
+                                          kFlagSlots * sizeof(uint64_t), IBV_ACCESS_LOCAL_WRITE);
+    if (endpoint->flag_source_mr == nullptr) {
+      return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "ibv_reg_mr failed for the RC flag source");
+    }
+  }
+  uint64_t* flag = endpoint->flag_source + (endpoint->flag_cursor++ % kFlagSlots);
+  *flag = flag_value;
+  ibv_sge data_sge = {};
+  data_sge.addr = reinterpret_cast<uintptr_t>(endpoint->send_buffer + offset_bytes);
+  data_sge.length = static_cast<uint32_t>(bytes);
+  data_sge.lkey = endpoint->send_mr->lkey;
+  ibv_sge flag_sge = {};
+  flag_sge.addr = reinterpret_cast<uintptr_t>(flag);
+  flag_sge.length = sizeof(uint64_t);
+  flag_sge.lkey = endpoint->flag_source_mr->lkey;
+  // The data write, then the flag write: RC executes them in order and the
+  // flag (not relaxed-ordered) lands after the data. Only the flag signals.
+  ibv_send_wr flag_wr = {};
+  flag_wr.wr_id = wr_id;
+  flag_wr.sg_list = &flag_sge;
+  flag_wr.num_sge = 1;
+  flag_wr.opcode = IBV_WR_RDMA_WRITE;
+  flag_wr.send_flags = IBV_SEND_SIGNALED;
+  flag_wr.wr.rdma.remote_addr = flag_remote_addr;
+  flag_wr.wr.rdma.rkey = flag_rkey;
+  ibv_send_wr data_wr = {};
+  data_wr.wr_id = wr_id;
+  data_wr.sg_list = &data_sge;
+  data_wr.num_sge = 1;
+  data_wr.opcode = IBV_WR_RDMA_WRITE;
+  data_wr.wr.rdma.remote_addr = remote_addr;
+  data_wr.wr.rdma.rkey = rkey;
+  data_wr.next = &flag_wr;
+  ibv_send_wr* first = bytes > 0 ? &data_wr : &flag_wr;
+  ibv_send_wr* bad_send = nullptr;
+  if (ibv_post_send(endpoint->qp, first, &bad_send) != 0) {
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "ibv_post_send of a flagged write failed for RC endpoint");
+  }
+  return ok();
+#else
+  (void)offset_bytes; (void)bytes; (void)remote_addr; (void)rkey; (void)flag_value;
+  (void)flag_remote_addr; (void)flag_rkey; (void)wr_id;
+  return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "RDMA RC endpoint write requires CUTEAFD_ENABLE_RDMA=ON");
 #endif
 }
 

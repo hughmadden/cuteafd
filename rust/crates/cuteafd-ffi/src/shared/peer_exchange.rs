@@ -116,6 +116,21 @@ impl NativeLibrary {
         Ok(())
     }
 
+    /// Write-mode Spark completions on `stream` (see `cuteafd_spark_wait_written`).
+    ///
+    /// # Safety
+    /// `flags` (`ranks` u64 words `stride_words` apart) is device memory the
+    /// NICs write; `state` and `error` are live memory mapped on the stream's
+    /// device; one wave was (or will be) posted per wait.
+    pub unsafe fn spark_wait_written(&self, flags: *const u64, ranks: u32, stride_words: u32, state: *mut u32,
+        error: *mut u32, stream: *mut c_void) -> Result<()> {
+        type F = unsafe extern "C" fn(*const u64, u32, u32, *mut u32, *mut u32, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_spark_wait_written") }?;
+        let status = unsafe { f(flags, ranks, stride_words, state, error, stream) };
+        ensure!(status == 0, "Spark written-completion wait failed with CUDA error {status}");
+        Ok(())
+    }
+
     /// Spins on `stream` until `flag` reaches the next sequence.
     ///
     /// # Safety
