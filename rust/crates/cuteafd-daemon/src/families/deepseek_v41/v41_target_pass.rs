@@ -404,6 +404,9 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             if layer != stage.windows().start && crate::shared::memory::chain::deferred() {
                 // See the distributed pass: the previous layer's attention uploads ran.
                 crate::shared::memory::chain::fence_wait(self.upload.library(), (layer - 1) % 2).await?;
+                // Let the other lane queue its layer too: lanes interleave per layer
+                // as they did when every layer waited on the host.
+                tokio::task::yield_now().await;
             }
             if layer != stage.windows().start {
                 let prepare_timing = Instant::now();
