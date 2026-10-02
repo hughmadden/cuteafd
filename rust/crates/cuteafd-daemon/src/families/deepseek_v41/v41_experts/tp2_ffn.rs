@@ -175,7 +175,9 @@ impl<'a> Wave<'a> {
         );
         // Peer DMA is never queued behind an unresolved dependency: settle any
         // chained producer of `values` on the host first.
-        crate::shared::memory::chain::settle(self.streams[0].device.library)?;
+        if !crate::shared::memory::chain::deferred() {
+            crate::shared::memory::chain::settle(self.streams[0].device.library)?;
+        }
         let local = values.device_id as usize;
         let remote = 1 - local;
         let upload = &self.streams[remote];
@@ -231,7 +233,9 @@ impl<'a> Wave<'a> {
         destination: usize, rows: u32) -> Result<CuteafdDeviceBuffer> {
         ensure!(destination < 2 && rows > 0 && rows <= self.capacity
             && source.bytes >= rows as usize * 10240, "invalid TP2 result transfer");
-        crate::shared::memory::chain::settle(self.streams[0].device.library)?;
+        if !crate::shared::memory::chain::deferred() {
+            crate::shared::memory::chain::settle(self.streams[0].device.library)?;
+        }
         let stream = &self.streams[destination];
         let mut output = self.output[destination].buffer;
         output.bytes = rows as usize * 10240;
@@ -301,7 +305,9 @@ impl<'a> Wave<'a> {
         // Do not submit DMA behind an unresolved stream dependency: a blocked
         // copy packet can hold up independent lanes on the shared copy engine.
         // Chained producers of these inputs are settled on the host as well.
-        crate::shared::memory::chain::settle(upload.device.library)?;
+        if !crate::shared::memory::chain::deferred() {
+            crate::shared::memory::chain::settle(upload.device.library)?;
+        }
         if crate::shared::memory::chain::deferred() {
             self.streams[0].join_chain()?;
             self.streams[1].join_chain()?;

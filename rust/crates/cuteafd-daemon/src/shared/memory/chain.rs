@@ -261,10 +261,6 @@ pub(crate) async unsafe fn finish_cooperative(stream: &LoadStream<'_>) -> Result
 /// Host wait for all chained work before a host-synchronous operation (legacy
 /// stream copies do not order with the non-blocking stage streams).
 pub(crate) fn settle(library: &NativeLibrary) -> Result<()> {
-    if deferred() {
-        // The settled transfers are SM copies ordered by the chain events.
-        return Ok(());
-    }
     let Some(current) = current() else { return Ok(()) };
     if let Some(head) = current.head.get() {
         unsafe { library.cuda_event_synchronize(current.events[head].1)?; }
