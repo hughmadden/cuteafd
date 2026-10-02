@@ -644,10 +644,6 @@ impl<'a> MimoEngine<'a> {
             .with_context(|| format!("{name} with {scalars:?}"))
     }
 
-    fn scratch(&self, name: &str, split: bool) -> Result<usize> {
-        Ok(self.programs.spec(&self.program_name(name, split))?.scratch.get("scratch").copied().unwrap_or(0) as usize)
-    }
-
     /// Rank `rank`'s workspace for steps of up to `t` rows (rank 1 holds the
     /// attention-side buffers only); allocated on that rank's GPU.
     fn workspace(&self, rank: usize, t: usize, decode: bool) -> Result<Workspace<'a>> {
@@ -658,31 +654,17 @@ impl<'a> MimoEngine<'a> {
     /// pipelined prefill skips them).
     fn workspace_here(&self, rank: usize, t: usize, decode: bool, head: bool) -> Result<Workspace<'a>> {
         let h = self.cfg.hidden;
-        let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
         let lead = rank == 0;
         let with_head = lead && head;
-        let mut scratch = if lead { self.scratch("mimo_router_scores", false)? } else { 0 };
-        // Whole-model programs (MTP layers on rank 0) and the split share's.
-        let families: &[bool] = match (self.split_family, lead) {
-            (None, _) => &[false],
-            (Some(_), true) => &[false, true],
-            (Some(_), false) => &[true],
-        };
-        for &split in families {
-            let kv = self.kv_cache.program_tag();
-            for name in [format!("mimo_full_producer{kv}_{cap}"), format!("mimo_swa_producer_{cap}"),
-                format!("mimo_full_attention{kv}_{mode}_{cap}"), format!("mimo_swa_attention_{mode}_{cap}"),
-                format!("mimo_ffn_{cap}")] {
-                scratch = scratch.max(self.scratch(&name, split)?);
-            }
-        }
+        let scratch = super::admission::workspace_native_scratch(&self.cfg, self.programs,
+            if self.split_family.is_some() { 2 } else { 1 }, rank, decode, self.kv_cache)?;
         let spark = lead && matches!(self.experts, Some(Experts::Spark { .. }));
         let attention = attention_workspace_geometry(rank, self.ranks(), decode,
             self.weights.layers.iter().all(|layer| layer.split));
         let layout = MimoWorkspaceLayout::new(&self.cfg, MimoWorkspaceOptions {
             rows: t as u64, decode, lead, with_head, spark, max_context: self.max_context as u64,
             pool_pages: self.pages as u64, kv_cache: self.kv_cache,
-            attention, prefill_output: self.prefill_output, native_scratch_bytes: scratch as u64,
+            attention, prefill_output: self.prefill_output, native_scratch_bytes: scratch,
             head_workspace_bytes: VOCABULARY_HEAD_WORKSPACE as u64,
         })?;
         let size = |bytes| usize::try_from(bytes).context("MiMo workspace size does not fit this process");

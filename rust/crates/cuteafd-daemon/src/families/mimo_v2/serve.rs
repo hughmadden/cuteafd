@@ -172,7 +172,8 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         }
     };
     let mut ready = Some(ready);
-    let result = opened.with_engine_output(&args, cuteafd_loader::families::mimo_v2::MimoPrefillOutput::LastRow, |engine| {
+    let result = opened.with_engine_reserved(&args, Some((&prefix, max_sequences)),
+        cuteafd_loader::families::mimo_v2::MimoPrefillOutput::LastRow, |engine| {
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-mimo needs every layer");
         anyhow::ensure!(engine.has_experts(), "serve-mimo needs --peers (or --local-experts) for the routed experts");
         let spark = args.peers.is_some() && !args.local_experts;
@@ -327,11 +328,11 @@ impl Active<'_> {
 }
 
 /// The prefix cache over `engine` (always present: with zero entries it is the page allocator).
-pub(super) fn prefix_cache<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs)
+pub(super) fn prefix_cache<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs, concurrency: usize)
     -> Result<(MimoPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
     let entries = args.prefix_cache_entries;
-    let budget = args.prefix_cache_mark_mib << 20;
-    let family = MimoPrefix::new(engine, |mark| if entries == 0 { 0 } else { MarkArena::slots_for(1, entries, mark, budget) },
+    let budget = args.prefix_cache_mark_mib.checked_mul(1 << 20).context("MiMo mark budget overflows")?;
+    let family = MimoPrefix::new(engine, |mark| MarkArena::slots_for(concurrency, entries, mark, budget),
         args.prefix_partial == Toggle::On)?;
     let layout = family.layout();
     // Resolve one aggregate quota for all heads, then retain and register the
@@ -370,7 +371,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
     let mut cost = dflash_policy::step_cost(&PRO_TP6_STEP_MS, DECODE_ROWS);
     let mut skip = crate::families::glm5::dflash_policy::DraftSkip::default();
-    let (family, mut cache) = prefix_cache(engine, prefix)?;
+    let (family, mut cache) = prefix_cache(engine, prefix, max_sequences)?;
     // Messages start with `<|im_start|>`: a snapshot right before one is a message boundary.
     let message_start = *QwenEncoding::from_snapshot(snapshot)?.tokens().turn_markers.first()
         .context("the chat template names no message-start token")?;

@@ -1,5 +1,6 @@
 //! MiMo V2 (mimo_v2_flash) on the generic engine: weights, the coordinator
 //! programs' layer chain, and the golden comparison command.
+pub(crate) mod admission;
 pub(crate) mod dflash;
 pub(crate) mod engine;
 pub(crate) mod mtp;
@@ -55,6 +56,11 @@ pub(crate) struct EngineArgs {
     pub rings: usize,
     #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
+    /// Provisional per-GPU bound for CUDA modules, captures and library
+    /// bookkeeping beyond named tensor/workspace reservations. This is an
+    /// explicit startup bound, not a measured allocation footprint.
+    #[arg(long, default_value_t = 1024)]
+    pub runtime_reserve_mib: usize,
     /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family, for MoE layers.
     #[arg(long, conflicts_with = "local_experts")]
     pub peers: Option<String>,
@@ -259,16 +265,36 @@ impl Opened {
     /// Output storage is fixed before any workspace is admitted or captured.
     pub fn with_engine_output<T>(&self, args: &EngineArgs, prefill_output: MimoPrefillOutput,
         body: impl FnOnce(&engine::MimoEngine<'_>) -> Result<T>) -> Result<T> {
+        self.with_engine_reserved(args, None, prefill_output, body)
+    }
+
+    pub fn with_engine_reserved<T>(&self, args: &EngineArgs,
+        serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>, prefill_output: MimoPrefillOutput,
+        body: impl FnOnce(&engine::MimoEngine<'_>) -> Result<T>) -> Result<T> {
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
-        // An explicit layout is a requirement. Reject a missing head-split
-        // export before loading modules, starting streams or allocating weights.
         let split_device = split::requested_device(&self.cfg, args.device, args.split_device,
             |name| programs.spec(name).is_ok())?;
-        programs.load_all()?;
+        let preflight = admission::preflight(self, args, &programs, split_device, serving, prefill_output)?;
+        // Module allocation is checked against its provisional bound before
+        // tensors. It does not qualify later capture or constraint demand.
+        for sample in &preflight.memory {
+            crate::shared::peer_split::on_device(&self.library, sample.device as i32, args.device, || {
+                let before = self.library.cuda_memory_info()?.0;
+                programs.load_all()?;
+                let after = self.library.cuda_memory_info()?.0;
+                let module_bytes = before.saturating_sub(after) as u64;
+                ensure!(module_bytes <= preflight.runtime_bound_bytes,
+                    "MiMo GPU {} module load used {} B, exceeding the provisional runtime bound {} B before weights",
+                    sample.device, module_bytes, preflight.runtime_bound_bytes);
+                tracing::info!(device = sample.device, module_bytes, bound_bytes = preflight.runtime_bound_bytes,
+                    "MiMo measured module allocation; capture/constraint bound remains unqualified");
+                Ok(())
+            })?;
+        }
         let draft_dir = args.draft.as_deref().map(dflash::drafter_dir);
         let draft_file = draft_dir.as_deref().map(dflash::prefetch);
         let stream = self.library.cuda_stream_create()?;
-        // The head split's second GPU and its stream (load kernels, then the engine's).
+
         let peer_stream = match split_device {
             Some(device) => {
                 // Peer access both ways first: the loader slices weights over peer copies.
@@ -323,7 +349,7 @@ impl Opened {
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64,
             gib = format!("{:.2}", bytes as f64 / (1u64 << 30) as f64),
             split_gib = format!("{:.2}", peer_bytes as f64 / (1u64 << 30) as f64), "MiMo coordinator weights resident");
-        let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
+        let pages = usize::try_from(preflight.capacity.allocated_gpu_kv_tokens)? / engine::PAGE_ROWS;
         let mut engine = engine::MimoEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages, args.rings, embedding, args.kv_cache.into(), prefill_output)?;
         engine.prefill_w8a8 = !args.prefill_w8a16;
@@ -432,11 +458,7 @@ impl Opened {
         let mut transport = link()?;
         // Pipelined prefill (CUTEAFD_MIMO_PREFILL_LANES, 2 by default; 1 keeps
         // it serial): a second transport carries the first row lane's waves.
-        let lanes = match std::env::var("CUTEAFD_MIMO_PREFILL_LANES").as_deref() {
-            Ok("1") => 1,
-            Ok("2") | Err(_) => 2,
-            Ok(other) => anyhow::bail!("CUTEAFD_MIMO_PREFILL_LANES is 1 or 2, not {other}"),
-        };
+        let lanes = admission::transport_lanes(true)?;
         let mut lane = if lanes == 2 { Some(link()?) } else { None };
         tracing::info!(lanes, "MiMo prefill lanes");
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
