@@ -1111,6 +1111,7 @@ impl<'a> GlmfEngine<'a> {
                     self.pre(w, &w.streams[cur], next, rows)?;
                 }
             }
+            crate::shared::console::layer_mark(index);
         }
         if layers.len() < self.cfg.layers {
             // SAFETY: the engine owns this stream.
@@ -1179,6 +1180,9 @@ impl<'a> GlmfEngine<'a> {
             })?;
             if layers.get(index).is_some_and(|layer| !layer.dense) {
                 self.moe_experts(w, index, &layers[index], t, rows, "m64", true)?;
+            }
+            if index < layers.len() {
+                crate::shared::console::layer_mark(index);
             }
         }
         if layers.len() < self.cfg.layers {

@@ -19,11 +19,15 @@
 //! step's records go to a step buffer first; the attention program reads
 //! in-step keys from it, older keys from the ring, and commits the step to the
 //! ring afterwards.
+//!
+//! Decode and verify steps launch eagerly, or (`--decode-graphs true`) replay one
+//! captured graph per layer segment between the Spark exchanges
+//! ([`MimoEngine::decode_layers`]), every 1..=64-row shape captured at startup.
 use super::weights::{MimoLayer, MimoWeights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
-use crate::shared::token_io::{DeviceLogits, TokenEmbedding};
+use crate::shared::token_io::{DeviceLogits, EmbedPlacement, TokenEmbedding};
 use crate::shared::spark_intake::SparkLink;
 use cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
 use cuteafd_transport::{
@@ -34,7 +38,8 @@ use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WO
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::families::mimo_v2::{MimoAttention, MimoKvCache, MimoV2Config};
 use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ffi::c_void;
 
 type Dev<'a> = DeviceAllocation<'a>;
@@ -91,7 +96,8 @@ pub(crate) enum Experts<'a> {
 
 /// A dispatched Spark wave and its send-side host phases (seconds).
 struct SentWave {
-    wave: cuteafd_transport::expert::SparkExpertWave,
+    /// Taken by [`MimoEngine::spark_receive`].
+    wave: Option<cuteafd_transport::expert::SparkExpertWave>,
     gpu_wait: f64,
     build: f64,
     dispatch: f64,
@@ -130,6 +136,39 @@ struct StepTables {
     /// Prefill: the sequence's pages; decode: one padded row per step row.
     page_table: Vec<i32>,
     table_stride: usize,
+}
+
+/// The previous layer's FFN output a decode segment starts from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Previous {
+    /// Layer 0: the embedded rows.
+    First,
+    /// A dense MLP's output in `delta` (under a head split, plus the other GPU's partial).
+    Dense,
+    /// The Spark ranks' partials in this many intake planes (the segment reduces them).
+    Planes(usize),
+    /// Routed experts run on this GPU (local, streamed or skipped): their sum in `delta`.
+    Delta,
+}
+
+/// Everything a captured decode segment bakes in besides the engine's persistent buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct GraphKey {
+    layer: usize,
+    rows: usize,
+    table_stride: usize,
+    previous: Previous,
+    /// The last segment ends in the LM head and the greedy selection of every row.
+    head: bool,
+}
+
+struct GraphExec<'a>(*mut c_void, &'a NativeLibrary);
+
+impl Drop for GraphExec<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the exec came from end_capture and is destroyed once.
+        let _ = unsafe { self.1.cuda_graph_exec_destroy(self.0) };
+    }
 }
 
 /// A sequence's full-attention pages (from the refcounted pool: full pages may be
@@ -241,6 +280,8 @@ pub(crate) struct Peer<'a> {
     cos_sin_swa: Dev<'a>,
     workspace: RefCell<Option<Workspace<'a>>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
+    /// Rank 1's decode segments (see [`MimoEngine::decode_layers`]).
+    graphs: RefCell<HashMap<GraphKey, GraphExec<'a>>>,
 }
 
 /// Exchange slot of layer `index`'s attention partials (`ffn` false) or its
@@ -319,6 +360,14 @@ pub(crate) struct MimoEngine<'a> {
     pub prefill_w8a8: bool,
     /// KV record format of every layer (and the MTP rings).
     kv_cache: MimoKvCache,
+    /// Decode and verify steps replay one captured graph per layer segment
+    /// between the Spark exchanges ([`Self::decode_layers`]); false: eager launches.
+    pub decode_graphs: bool,
+    /// Rank 0's decode segments, keyed by everything they bake in.
+    graphs: RefCell<HashMap<GraphKey, GraphExec<'a>>>,
+    /// Graphs captured while serving (after [`Self::capture_decode_graphs`]): each is a
+    /// shape the startup capture missed.
+    late_captures: Cell<usize>,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -391,7 +440,8 @@ impl<'a> MimoEngine<'a> {
             expert_input: ExpertInput::Fp8,
             profile: RefCell::new([0.0; 2]),
             wave_timing: std::env::var("CUTEAFD_MIMO_WAVE_TIMING").is_ok_and(|v| v == "1"), drafter: None, mtp: None, l2: None, embedding,
-            mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20)?, 0)), prefill_w8a8: true, kv_cache })
+            mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20)?, 0)), prefill_w8a8: true, kv_cache,
+            decode_graphs: false, graphs: RefCell::new(HashMap::new()), late_captures: Cell::new(0) })
     }
 
     /// Layer `layer`'s KV storage: the paged record pool (full attention; page `p` holds
@@ -455,7 +505,7 @@ impl<'a> MimoEngine<'a> {
             let table = |theta: f64| rope_table(library, self.cfg.rope_dim, theta, self.max_context);
             Ok(Peer { device, stream, kv, cos_sin_full: table(self.cfg.full_rope_theta)?,
                 cos_sin_swa: table(self.cfg.swa_rope_theta)?, layers, workspace: RefCell::new(None),
-                decode_workspace: RefCell::new(None) })
+                decode_workspace: RefCell::new(None), graphs: RefCell::new(HashMap::new()) })
         })?;
         self.peer = Some(peer);
         self.exchange = Some(exchange);
@@ -762,7 +812,7 @@ impl<'a> MimoEngine<'a> {
                     after_ffn(i, index)?;
                 } else {
                     self.moe_front(w[i], layer, t[i], bf16_input)?;
-                    inflight[i] = Some((index, self.spark_send(w[i], index, t[i], false, bf16_input, &mut transports[i])?));
+                    inflight[i] = Some((index, self.spark_send(w[i], index, t[i], false, bf16_input, false, &mut transports[i])?));
                 }
             }
         }
@@ -803,7 +853,9 @@ impl<'a> MimoEngine<'a> {
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<DeviceLogits>> {
         let rows: usize = sequences.iter().map(|(_, n)| n).sum();
         ensure!(rows > 0 && rows <= DECODE_ROWS && tokens.len() == rows, "decode step of {rows} rows");
-        let stride = sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1);
+        // With graphs one stride for every step (they bake it in): the pages of a full context.
+        let floor = if self.decode_graphs { self.decode_stride() } else { 1 };
+        let stride = sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1).max(floor);
         let mut tables = StepTables { decode: true, positions: Vec::new(), slots: Vec::new(), ring_slots: Vec::new(),
             seq_first: Vec::new(), page_table: Vec::new(), table_stride: stride };
         for (placement, count) in sequences.iter() {
@@ -870,6 +922,26 @@ impl<'a> MimoEngine<'a> {
                 self.put(&w.seq_first, &tables.seq_first)?;
                 self.put(&w.page_table, &tables.page_table)
             })?;
+        }
+        if tables.decode && self.decode_graphs && on_layer.is_none() && forced.is_none() && self.graphable() {
+            // The first captured segment gathers the rows from the uploaded ids; the
+            // last runs the head and the greedy selection.
+            let gather = self.embedding.placement() == EmbedPlacement::Gpu;
+            if gather {
+                self.embedding.check(tokens)?;
+                self.put(&w.ids, tokens)?;
+            } else {
+                self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
+            }
+            let head = logit_rows == t;
+            self.decode_layers(w, split.map(|(_, w1)| w1), tables, t, gather, head, true)?;
+            if let Some(mtp) = &self.mtp {
+                self.mtp_tap(mtp, w, tables)?;
+            }
+            if !head {
+                self.launch_head(w, t, logit_rows, true)?;
+            }
+            return Ok(Some(self.device_logits(w, logit_rows, head)));
         }
         self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
         let rows = Scalar::I32(t as i32);
@@ -954,28 +1026,364 @@ impl<'a> MimoEngine<'a> {
                     self.norm_on(1, w1, peer.layers[index + 1].ptr("input_norm")?, 0, rows, w1.delta.buffer.ptr)?;
                 }
             }
+            crate::shared::console::layer_mark(index);
         }
         if layers.len() < self.cfg.layers {
             // SAFETY: the engine owns this stream.
             unsafe { self.library.cuda_stream_synchronize(self.stream)? };
             return Ok(None);
         }
+        self.launch_head(w, t, logit_rows, tables.decode)?;
+        Ok(Some(self.device_logits(w, logit_rows, false)))
+    }
+
+    /// Logits of the last `n` of `t` rows of the final norm's output: the E4M3 head
+    /// program for decode steps of up to `FP8_ROWS` rows, the cuBLAS head otherwise.
+    fn launch_head(&self, w: &Workspace<'_>, t: usize, n: usize, decode: bool) -> Result<()> {
         // SAFETY: the rows start inside the final norm's output.
-        let x = unsafe { w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2) }.cast::<c_void>();
+        let x = unsafe { w.x.buffer.ptr.cast::<u8>().add((t - n) * self.cfg.hidden * 2) }.cast::<c_void>();
         match &self.weights.head_fp8 {
-            Some((q, scale)) if tables.decode && logit_rows <= FP8_ROWS as usize => {
+            Some((q, scale)) if decode && n <= FP8_ROWS as usize => {
                 self.run("mimo_head_fp8", &[("x", x), ("w_fp8", q.buffer.ptr), ("scale", scale.buffer.ptr),
-                    ("logits", w.logits.buffer.ptr)], &[Scalar::I32(logit_rows as i32)])?;
+                    ("logits", w.logits.buffer.ptr)], &[Scalar::I32(n as i32)])
             }
             // SAFETY: the final norm's output and the head operands are live buffers of these shapes.
             _ => unsafe {
-                w.head.as_ref().context("LM head")?.launch(x.cast(), self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(),
-                    logit_rows as u32, self.stream)?;
+                w.head.as_ref().context("LM head")?.launch(x.cast(), self.weights.head.buffer.ptr.cast(),
+                    w.logits.buffer.ptr.cast(), n as u32, self.stream)
             },
         }
+    }
+
+    /// `bytes` at `offset` inside `dev`.
+    fn region(dev: &Dev<'_>, offset: usize, bytes: usize) -> cuteafd_ffi::CuteafdDeviceBuffer {
+        debug_assert!(offset + bytes <= dev.buffer.bytes);
+        cuteafd_ffi::CuteafdDeviceBuffer {
+            // SAFETY: callers pass offsets inside the buffer.
+            ptr: unsafe { dev.buffer.ptr.cast::<u8>().add(offset) }.cast(),
+            bytes,
+            ..dev.buffer
+        }
+    }
+
+    /// Greedy tokens of the first `rows` logits rows into `select` (U32 ids, then U32 statuses).
+    fn select_greedy(&self, w: &Workspace<'_>, rows: usize) -> Result<()> {
         let vocab = self.cfg.vocab_size;
-        Ok(Some(DeviceLogits { ptr: w.logits.buffer.ptr, rows: logit_rows, vocab, stride: vocab, stream: self.stream,
-            greedy: None }))
+        // SAFETY: the logits rows and the select buffer are live buffers of these shapes.
+        unsafe {
+            self.library.cuda_logits_greedy_f32_async(w.logits.buffer.ptr, rows, vocab, vocab, w.select.buffer.ptr,
+                std::ptr::null_mut(), Self::region(&w.select, rows * 4, rows * 4).ptr, self.stream)
+        }
+    }
+
+    /// The first `rows` logits rows as device logits (`greedy`: with their selection
+    /// from [`Self::select_greedy`]).
+    fn device_logits(&self, w: &Workspace<'_>, rows: usize, greedy: bool) -> DeviceLogits {
+        let vocab = self.cfg.vocab_size;
+        DeviceLogits { ptr: w.logits.buffer.ptr, rows, vocab, stride: vocab, stream: self.stream,
+            greedy: greedy.then(|| (w.select.buffer.ptr.cast_const(), Self::region(&w.select, rows * 4, rows * 4).ptr
+                .cast_const())) }
+    }
+
+    /// Pages of a full context: the page-table stride of every decode step (constant,
+    /// so the captured segments serve every sequence length).
+    fn decode_stride(&self) -> usize {
+        self.max_context.div_ceil(PAGE_ROWS).min(self.pages).max(1)
+    }
+
+    /// Decode steps can replay captured segments: every layer resident, and routed
+    /// experts for the MoE layers.
+    fn graphable(&self) -> bool {
+        self.weights.layers.len() == self.cfg.layers
+            && (self.experts.is_some() || self.weights.layers.iter().all(|l| l.dense))
+    }
+
+    /// What decode segment `index` (0..=layers) starts from: the embedded rows, or
+    /// layer `index - 1`'s FFN output.
+    fn previous(&self, index: usize) -> Previous {
+        let Some(before) = index.checked_sub(1) else { return Previous::First };
+        if self.weights.layers[before].dense {
+            return Previous::Dense;
+        }
+        match &self.experts {
+            Some(Experts::Spark { transport, .. }) => Previous::Planes(transport.borrow().world_size()),
+            _ => Previous::Delta,
+        }
+    }
+
+    /// Decode layers as captured graph segments, one per layer plus a tail: segment
+    /// `i` holds layer `i - 1`'s FFN epilogue (the Spark partials' reduce, under a
+    /// head split the FFN exchange) with layer `i`'s input norm, then layer `i`'s
+    /// attention, post-attention norm, and its dense MLP or the MoE front (router,
+    /// top-k, wire rows); the tail ends in the final norm, the LM head and the greedy
+    /// selection. The routed experts run between segments: the host-driven Spark
+    /// exchange (routes and rows down, the request out, partials into the intake
+    /// planes), or this GPU's experts. A device-driven exchange that needs no host
+    /// between segments can capture the same segments back to back as one graph.
+    ///
+    /// Under a head split each segment exchanges with rank 1's segment of the same
+    /// layer (captured on rank 1's stream); rank 1's next segment is queued before
+    /// the host waits in this layer's exchange.
+    ///
+    /// `launch` false only captures the segments (every shape a later step replays
+    /// without capturing; see [`Self::capture_decode_graphs`]).
+    #[allow(clippy::too_many_arguments)]
+    fn decode_layers(&self, w: &Workspace<'_>, w1: Option<&Workspace<'_>>, tables: &StepTables, t: usize,
+        gather: bool, head: bool, launch: bool) -> Result<()> {
+        let layers = &self.weights.layers;
+        let planes = match &self.experts {
+            Some(Experts::Spark { transport, .. }) => transport.borrow().intake.pointers(),
+            _ => [std::ptr::null(); MAX_RANKS],
+        };
+        let bf16_input = matches!(self.experts, Some(Experts::Spark { .. })) && self.expert_input.bf16(true);
+        for index in 0..=layers.len() {
+            let previous = self.previous(index);
+            let last = index == layers.len();
+            let key = GraphKey { layer: index, rows: t, table_stride: tables.table_stride, previous, head: head && last };
+            self.graph(0, key, launch, || self.decode_segment(index, previous, w, w1, tables, t, gather, key.head,
+                planes, bf16_input))?;
+            if let (true, Previous::Planes(_), Some(Experts::Spark { transport, .. })) = (launch, previous, &self.experts) {
+                // The planes are free for the next wave once the stream passes this segment's reduce.
+                transport.borrow().intake.consumed(self.stream)?;
+            }
+            if let Some(w1) = w1 {
+                // Rank 1's segments: layer 0 with rank 0's first, then each next one before
+                // the host waits in this layer's exchange.
+                if index == 0 {
+                    self.peer_segment(0, w1, tables, t, launch)?;
+                }
+                if index + 1 < layers.len() {
+                    self.peer_segment(index + 1, w1, tables, t, launch)?;
+                }
+            }
+            if last || !launch || layers[index].dense {
+                continue;
+            }
+            match self.experts.as_ref() {
+                Some(Experts::Spark { transport, runtime, .. }) => {
+                    let mut transport = transport.borrow_mut();
+                    let mut sent = self.spark_send(w, index, t, true, bf16_input, true, &mut transport)?;
+                    let receive = self.spark_receive(t, &mut transport, runtime, &mut sent)?;
+                    self.wave_line(index, t, &sent, receive, 0.0);
+                }
+                Some(_) => self.moe_run(w, index, t, true)?,
+                None => anyhow::bail!("layer {index} is an MoE layer; pass Spark peers for its routed experts"),
+            }
+            crate::shared::console::layer_mark(index);
+        }
+        Ok(())
+    }
+
+    /// Rank 0's decode segment `index` (see [`Self::decode_layers`]).
+    #[allow(clippy::too_many_arguments)]
+    fn decode_segment(&self, index: usize, previous: Previous, w: &Workspace<'_>, w1: Option<&Workspace<'_>>,
+        tables: &StepTables, t: usize, gather: bool, head: bool, planes: [*const u16; MAX_RANKS], bf16_input: bool)
+        -> Result<()> {
+        let layers = &self.weights.layers;
+        let rows = Scalar::I32(t as i32);
+        let bytes = t * self.cfg.hidden * 2;
+        if index == 0 {
+            if gather {
+                // SAFETY: the step's ids are in `ids` before the replay; `h` holds its rows.
+                unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, 1, std::ptr::null(),
+                    w.h.buffer.ptr, self.stream)? };
+            }
+            if let Some(w1) = w1 {
+                // The embedded rows to the second GPU's residual stream.
+                self.exchange()?.push_to(0, DIRECT, w.h.buffer.ptr, w1.h.buffer.ptr, bytes)?;
+            }
+        }
+        if let Previous::Planes(ranks) = previous {
+            // SAFETY: the decode transport's intake planes, the zero plane and delta are live
+            // [t, h] BF16 buffers; the planes hold the wave's partials once the stream gets here.
+            unsafe {
+                self.library.v41_compact_reducer()?.reduce_planes(planes, ranks as u32, w.zero_plane.buffer.ptr.cast(),
+                    w.delta.buffer.ptr.cast(), t as u32, self.stream)?;
+            }
+        }
+        // h += the previous layer's FFN output; x = this layer's input norm (or the final norm).
+        let weight = match layers.get(index) {
+            Some(layer) => layer.ptr("input_norm")?,
+            None => self.weights.norm.buffer.ptr,
+        };
+        match (previous, index.checked_sub(1), w1.is_some()) {
+            (Previous::First, ..) => self.norm(w, weight, 0, rows)?,
+            // This GPU's dense partial plus rank 1's.
+            (Previous::Dense, Some(before), true) => {
+                let ffn = slot(before, true);
+                self.wait(0, ffn)?;
+                self.norm_on(0, w, weight, 2, rows, self.recv(0, ffn))?;
+            }
+            (Previous::Planes(_) | Previous::Delta, Some(before), true) => {
+                // The routed experts' sum to rank 1 too (it has no layer after the last).
+                if index < layers.len() {
+                    self.push(0, slot(before, true), w.delta.buffer.ptr, bytes)?;
+                }
+                self.norm(w, weight, 1, rows)?;
+            }
+            _ => self.norm(w, weight, 1, rows)?,
+        }
+        if let (Some(drafter), Some(before)) = (&self.drafter, index.checked_sub(1)) {
+            let n = t.min(super::dflash::TAP_ROWS);
+            drafter.tap(before, w.h.buffer.ptr, t - n, n)?;
+        }
+        let Some(layer) = layers.get(index) else {
+            if head {
+                self.launch_head(w, t, t, true)?;
+                self.select_greedy(w, t)?;
+            }
+            return Ok(());
+        };
+        self.attention_on(0, w, self.kv[index].buffer.ptr, layer, rows, "m64", tables)?;
+        if w1.is_some() {
+            let attended = slot(index, false);
+            self.push(0, attended, w.delta.buffer.ptr, bytes)?;
+            self.wait(0, attended)?;
+            self.norm_on(0, w, layer.ptr("post_norm")?, 2, rows, self.recv(0, attended))?;
+        } else {
+            self.norm(w, layer.ptr("post_norm")?, 1, rows)?;
+        }
+        if layer.dense {
+            self.dense_ffn(0, w, layer, rows, "m64", true)?;
+            // Rank 1 takes this partial in its next segment (it has none after the last layer).
+            if w1.is_some() && index + 1 < layers.len() {
+                self.push(0, slot(index, true), w.delta.buffer.ptr, bytes)?;
+            }
+            Ok(())
+        } else {
+            self.moe_front(w, layer, t, bf16_input)?;
+            if matches!(self.experts, Some(Experts::Spark { .. })) {
+                // The wave's routes and rows down to the host inside the segment.
+                self.stage_routes(w, t, bf16_input)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Rank 1's decode segment of layer `index` (the head split's second GPU, see
+    /// [`Self::decode_layers`]): the previous layer's FFN exchange (rank 0's dense
+    /// partial or routed sum in) and this layer's input norm, its heads' attention and
+    /// the attention all-reduce, then its dense partial out.
+    fn peer_segment(&self, index: usize, w1: &Workspace<'_>, tables: &StepTables, t: usize, launch: bool)
+        -> Result<()> {
+        let peer = self.peer.as_ref().context("no head-split peer")?;
+        let previous = match index.checked_sub(1) {
+            None => Previous::First,
+            Some(before) if peer.layers[before].dense => Previous::Dense,
+            Some(_) => Previous::Delta,
+        };
+        let key = GraphKey { layer: index, rows: t, table_stride: tables.table_stride, previous, head: false };
+        self.graph(1, key, launch, || {
+            let rows = Scalar::I32(t as i32);
+            let bytes = t * self.cfg.hidden * 2;
+            let share = &peer.layers[index];
+            match index.checked_sub(1) {
+                None => {
+                    self.wait(1, DIRECT)?;
+                    self.norm_on(1, w1, share.ptr("input_norm")?, 0, rows, w1.delta.buffer.ptr)?;
+                }
+                Some(before) => {
+                    let ffn = slot(before, true);
+                    self.wait(1, ffn)?;
+                    let (deltas, first) = if previous == Previous::Dense { (2, w1.delta.buffer.ptr) }
+                        else { (1, self.recv(1, ffn)) };
+                    self.norm_full(1, w1, share.ptr("input_norm")?, deltas, rows, first, self.recv(1, ffn))?;
+                }
+            }
+            self.attention_on(1, w1, peer.kv[index].buffer.ptr, share, rows, "m64", tables)?;
+            let attended = slot(index, false);
+            self.push(1, attended, w1.delta.buffer.ptr, bytes)?;
+            self.wait(1, attended)?;
+            self.norm_on(1, w1, share.ptr("post_norm")?, 2, rows, self.recv(1, attended))?;
+            if share.dense {
+                self.dense_ffn(1, w1, share, rows, "m64", true)?;
+                self.push(1, slot(index, true), w1.delta.buffer.ptr, bytes)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Launches `segment` on rank `rank`'s stream through the graph captured for `key`,
+    /// capturing it first when `key` is new; `launch` false only captures.
+    fn graph(&self, rank: usize, key: GraphKey, launch: bool, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+        let graphs = match (rank, &self.peer) {
+            (1, Some(peer)) => &peer.graphs,
+            _ => &self.graphs,
+        };
+        let stream = self.stream_of(rank);
+        if let Some(graph) = graphs.borrow().get(&key) {
+            if !launch {
+                return Ok(());
+            }
+            // SAFETY: the graph's pointers are persistent engine buffers of that rank.
+            return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
+        }
+        if launch {
+            self.late_captures.set(self.late_captures.get() + 1);
+            tracing::debug!(rank, ?key, "MiMo decode segment captured while serving");
+        }
+        // SAFETY: capture records launches on that rank's stream; nothing in the
+        // segment synchronizes the host or allocates.
+        self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
+        let captured = segment();
+        // SAFETY: ends the capture begun above on the same stream.
+        let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
+        captured?;
+        let exec = GraphExec(exec?, self.library);
+        if launch {
+            // SAFETY: as for a replay.
+            self.on(rank, || unsafe { self.library.cuda_graph_launch(exec.0, stream) })?;
+        }
+        graphs.borrow_mut().insert(key, exec);
+        Ok(())
+    }
+
+    /// Captures (without running) every decode segment of steps of 1..=`max_rows` rows,
+    /// so serving replays them without capturing; returns the graphs captured.
+    pub fn capture_decode_graphs(&self, max_rows: usize) -> Result<usize> {
+        if !self.decode_graphs || !self.graphable() {
+            return Ok(0);
+        }
+        let max_rows = max_rows.clamp(1, DECODE_ROWS);
+        if self.decode_workspace.borrow().is_none() {
+            *self.decode_workspace.borrow_mut() = Some(self.workspace(0, DECODE_ROWS, true)?);
+        }
+        if let Some(peer) = &self.peer {
+            if peer.decode_workspace.borrow().is_none() {
+                *peer.decode_workspace.borrow_mut() = Some(self.workspace(1, DECODE_ROWS, true)?);
+            }
+        }
+        let workspace = self.decode_workspace.borrow();
+        let w = workspace.as_ref().context("workspace")?;
+        let peer_workspace = self.peer.as_ref().map(|peer| peer.decode_workspace.borrow());
+        let w1 = match &peer_workspace {
+            Some(ws) => Some(ws.as_ref().context("peer workspace")?),
+            None => None,
+        };
+        // The cuBLAS head's first call (handle setup) runs before any capture.
+        self.launch_head(w, 1, 1, false)?;
+        // SAFETY: the engine owns this stream.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        let gather = self.embedding.placement() == EmbedPlacement::Gpu;
+        let free = |rank: usize| self.on(rank, || Ok(self.library.cuda_memory_info()?.0));
+        let free_before = (free(0)?, if self.peer.is_some() { free(1)? } else { 0 });
+        let before = self.graphs.borrow().len() + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
+        for t in 1..=max_rows {
+            let tables = StepTables { decode: true, positions: vec![0; t], slots: Vec::new(), ring_slots: Vec::new(),
+                seq_first: Vec::new(), page_table: Vec::new(), table_stride: self.decode_stride() };
+            self.decode_layers(w, w1, &tables, t, gather, true, false)?;
+        }
+        let after = self.graphs.borrow().len() + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
+        let mib = |a: usize, b: usize| a.saturating_sub(b) as f64 / (1u64 << 20) as f64;
+        tracing::info!(device_mib = format!("{:.1}", mib(free_before.0, free(0)?)),
+            peer_mib = format!("{:.1}", if self.peer.is_some() { mib(free_before.1, free(1)?) } else { 0.0 }),
+            "MiMo decode graph memory");
+        Ok(after - before)
+    }
+
+    /// Decode segments captured while serving (shapes the startup capture missed).
+    pub fn late_captures(&self) -> usize {
+        self.late_captures.get()
     }
 
     /// Queues rank 1's share of layer `index` (the head split's second GPU),
@@ -1474,15 +1882,25 @@ impl<'a> MimoEngine<'a> {
 
     fn moe_local(&self, w: &Workspace<'_>, index: usize, layer: &MimoLayer<'_>, t: usize, decode: bool,
         forward: Option<usize>) -> Result<()> {
-        let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let experts = self.experts.as_ref().with_context(|| format!(
             "layer {index} is an MoE layer: pass Spark --peers serving the fp8 family, or --local-experts \
              (run --layers 1 for the dense layer alone)"))?;
         let bf16_input = matches!(experts, Experts::Spark { .. }) && self.expert_input.bf16(decode);
         self.moe_front(w, layer, t, bf16_input)?;
-        if !matches!(experts, Experts::Spark { .. }) {
-            self.emulated_exchange(index, decode)?;
+        match experts {
+            Experts::Spark { transport, runtime, .. } => {
+                self.spark_moe(w, index, t, decode, bf16_input, &mut transport.borrow_mut(), runtime, forward)
+            }
+            _ => self.moe_run(w, index, t, decode),
         }
+    }
+
+    /// The routed experts on this GPU (local, streamed or skipped) after [`Self::moe_front`],
+    /// their sum into `delta`.
+    fn moe_run(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool) -> Result<()> {
+        let h = self.cfg.hidden;
+        let experts = self.experts.as_ref().context("no routed experts")?;
+        self.emulated_exchange(index, decode)?;
         match experts {
             Experts::Local(local) => {
                 let resident = local.index_of(index)?;
@@ -1521,9 +1939,7 @@ impl<'a> MimoEngine<'a> {
             Experts::Skip => unsafe {
                 self.library.cuda_zero_bytes_async(w.delta.buffer, t * h * 2, self.stream)
             },
-            Experts::Spark { transport, runtime, .. } => {
-                self.spark_moe(w, index, t, decode, bf16_input, &mut transport.borrow_mut(), runtime, forward)
-            }
+            Experts::Spark { .. } => anyhow::bail!("Spark experts run through the exchange"),
         }
     }
 
@@ -1532,13 +1948,14 @@ impl<'a> MimoEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn spark_moe(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, bf16_input: bool,
         transport: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime, forward: Option<usize>) -> Result<()> {
-        let sent = self.spark_send(w, index, t, decode, bf16_input, transport)?;
+        let sent = self.spark_send(w, index, t, decode, bf16_input, false, transport)?;
         self.spark_land(w, index, t, transport, runtime, sent, forward, true)
     }
 
     /// The send half of [`Self::spark_moe`]: routes and wire rows down (the
     /// stream drains first), the request out to every rank.
-    fn spark_send(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, bf16_input: bool,
+    #[allow(clippy::too_many_arguments)]
+    fn spark_send(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, bf16_input: bool, staged: bool,
         transport: &mut SparkLink<'_>) -> Result<SentWave> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
@@ -1546,22 +1963,26 @@ impl<'a> MimoEngine<'a> {
         let (input, dtype) = if bf16_input { (&w.x, ExpertV2Dtype::Bf16) } else { (&w.wire, ExpertV2Dtype::Fp8E4m3Ue8m0K32) };
         let staging = w.router_host.borrow_mut();
         let host = staging.buffer;
-        let at = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
-            // SAFETY: ids, weights and wire rows are consecutive inside the pinned buffer.
-            ptr: unsafe { host.ptr.cast::<u8>().add(offset) }.cast(),
-            bytes: host.bytes - offset,
-            ..host
-        };
+        let at = |offset: usize| Self::staging_at(host, offset);
         let timer = std::time::Instant::now();
         // Prefill rows go straight into the transport's registered egress
         // buffer and out from there to every rank; small waves keep a copy.
         let egress = transport.egress(wire_bytes)?;
         // SAFETY: the pinned regions are large enough; the sync completes them.
         unsafe {
-            self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.stream)?;
-            self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.stream)?;
-            let target = egress.unwrap_or(at(2 * route_bytes));
-            self.library.copy_d2h_host_buffer_async(target, input.buffer, wire_bytes, self.stream)?;
+            // `staged`: a decode segment already queued these copies into the staging
+            // ([`Self::stage_routes`]); only a wave bound for the egress buffer copies again.
+            if !staged {
+                self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.stream)?;
+                self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes,
+                    self.stream)?;
+            }
+            match egress {
+                Some(target) => self.library.copy_d2h_host_buffer_async(target, input.buffer, wire_bytes, self.stream)?,
+                None if !staged => self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), input.buffer,
+                    wire_bytes, self.stream)?,
+                None => {}
+            }
         }
         // In a decode step the L2 prefetch queues behind the copies; the host waits for the copies only.
         match self.l2.as_ref().filter(|_| decode) {
@@ -1598,7 +2019,36 @@ impl<'a> MimoEngine<'a> {
         let build = built.elapsed().as_secs_f64();
         let timer = std::time::Instant::now();
         let wave = transport.dispatch(&request)?;
-        Ok(SentWave { wave, gpu_wait, build, dispatch: timer.elapsed().as_secs_f64(), sent: timer })
+        Ok(SentWave { wave: Some(wave), gpu_wait, build, dispatch: timer.elapsed().as_secs_f64(), sent: timer })
+    }
+
+    /// `offset` bytes into the pinned router staging.
+    fn staging_at(host: cuteafd_ffi::CuteafdHostBuffer, offset: usize) -> cuteafd_ffi::CuteafdHostBuffer {
+        cuteafd_ffi::CuteafdHostBuffer {
+            // SAFETY: ids, weights and wire rows are consecutive inside the pinned buffer.
+            ptr: unsafe { host.ptr.cast::<u8>().add(offset) }.cast(),
+            bytes: host.bytes - offset,
+            ..host
+        }
+    }
+
+    /// Queues a decode wave's routes and expert input rows into the pinned router
+    /// staging, where [`Self::spark_send`] (with `staged`) reads them after its sync.
+    fn stage_routes(&self, w: &Workspace<'_>, t: usize, bf16_input: bool) -> Result<()> {
+        let (h, topk) = (self.cfg.hidden, self.cfg.topk);
+        let (route_bytes, wire_bytes) = (t * topk * 4, if bf16_input { t * h * 2 } else { t * (h + h / 32) });
+        let input = if bf16_input { &w.x } else { &w.wire };
+        let host = w.router_host.borrow().buffer;
+        ensure!(2 * route_bytes + wire_bytes <= host.bytes, "router staging of {} bytes for {t} rows", host.bytes);
+        let at = |offset: usize| Self::staging_at(host, offset);
+        // SAFETY: the pinned regions hold these bytes (checked above); the host reads them
+        // only after the stream passes the copies (spark_send's sync), and the next
+        // segment rewrites them only after the request was built from them.
+        unsafe {
+            self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.stream)?;
+            self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.stream)?;
+            self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), input.buffer, wire_bytes, self.stream)
+        }
     }
 
     /// The land half: receives the wave into the transport's planes and
@@ -1608,10 +2058,8 @@ impl<'a> MimoEngine<'a> {
     fn spark_land(&self, w: &Workspace<'_>, index: usize, t: usize, transport: &mut SparkLink<'_>,
         runtime: &tokio::runtime::Runtime, sent: SentWave, forward: Option<usize>, drain: bool) -> Result<()> {
         let h = self.cfg.hidden;
-        let waited = std::time::Instant::now();
-        runtime.block_on(transport.receive(sent.wave, t, self.stream))?;
-        let receive = waited.elapsed().as_secs_f64();
-        self.profile.borrow_mut()[1] += sent.sent.elapsed().as_secs_f64();
+        let mut sent = sent;
+        let receive = self.spark_receive(t, transport, runtime, &mut sent)?;
         let reduced = std::time::Instant::now();
         // SAFETY: the zero plane and delta are live [t, h] BF16 buffers; the
         // intake planes are ordered after the wave by `receive`.
@@ -1625,11 +2073,27 @@ impl<'a> MimoEngine<'a> {
                 self.library.cuda_stream_synchronize(self.stream)?;
             }
         }
+        self.wave_line(index, t, &sent, receive, reduced.elapsed().as_secs_f64());
+        Ok(())
+    }
+
+    /// Receives `sent`'s wave into the transport's intake planes (the stream is ordered
+    /// after it); returns the host seconds spent receiving.
+    fn spark_receive(&self, t: usize, transport: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime,
+        sent: &mut SentWave) -> Result<f64> {
+        let waited = std::time::Instant::now();
+        let wave = sent.wave.take().context("wave already received")?;
+        runtime.block_on(transport.receive(wave, t, self.stream))?;
+        self.profile.borrow_mut()[1] += sent.sent.elapsed().as_secs_f64();
+        Ok(waited.elapsed().as_secs_f64())
+    }
+
+    /// `CUTEAFD_MIMO_WAVE_TIMING=1`: one line per Spark wave.
+    fn wave_line(&self, index: usize, t: usize, sent: &SentWave, receive: f64, reduce: f64) {
         if self.wave_timing {
             eprintln!("mimo_wave layer={index} rows={t} gpu_wait_ms={:.3} build_ms={:.3} dispatch_ms={:.3} \
                 receive_ms={:.3} reduce_ms={:.3}", sent.gpu_wait * 1e3, sent.build * 1e3, sent.dispatch * 1e3,
-                receive * 1e3, reduced.elapsed().as_secs_f64() * 1e3);
+                receive * 1e3, reduce * 1e3);
         }
-        Ok(())
     }
 }

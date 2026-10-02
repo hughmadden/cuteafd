@@ -152,8 +152,10 @@ fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
         StepGroup::new("Verify pass", "host clock, engine phases", &[
             ("gpu", "GPU until expert exchanges", Rtx), ("experts", "Spark expert exchanges", Spark),
             ("head", "head + logits", Target)]),
+        StepGroup::layers(),
         StepGroup::admission(false),
     ];
+    layout.layers = Some(console::Layers::host_clock());
     layout
 }
 
@@ -176,6 +178,8 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
             let _ = ready.send(Ok(()));
         }
         let ranks = args.peers.as_deref().map(|peers| peers.split(',').count());
+        let spark = matches!(engine.experts(), Some(super::engine::Experts::Spark { .. }));
+        console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), policy, ranks,
             decode_share, &prefix, args.token_io.token_select)
     });

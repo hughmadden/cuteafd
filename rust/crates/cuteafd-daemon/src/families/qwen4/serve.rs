@@ -148,8 +148,10 @@ fn console_layout(args: &ServeArgs, model: &str, drafts: Drafts, eos: &[u32]) ->
             ("emit", "accept + stream", Ink), ("commit", "commit kept rows + MTP stash", Accepted)]),
         StepGroup::new("Verify pass", "host clock, engine phases", &[
             ("gpu", "GPU until expert exchanges", Rtx), ("experts", "expert exchanges", Spark)]),
+        StepGroup::layers(),
         StepGroup::admission(false),
     ];
+    layout.layers = Some(console::Layers::host_clock());
     layout
 }
 
@@ -178,6 +180,8 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-qwen4 needs every layer");
         anyhow::ensure!(engine.experts().is_some(),
             "serve-qwen4 needs --peers (or --local-experts) for the routed experts");
+        let spark = matches!(engine.experts(), Some(super::engine::Experts::Spark { .. }));
+        console::layer_classes(engine.weights.layers.iter().map(|_| console::layer_class(false, spark)).collect());
         if matches!(engine.experts(), Some(super::engine::Experts::SharedOnly)) {
             tracing::warn!("serve-qwen4 --shared-only: replies do not match the model (plumbing and cache gates only)");
         }

@@ -212,7 +212,7 @@ function event(e) {
     }
     case 'round': round(e); break;
     case 'prefill': S.prefill.push(e); break;
-    case 'layers': if (S.config.layers) S.config.layers.class = e.class; break;
+    case 'layers': if (S.config.layers) { S.config.layers.class = e.class; layoutChanged(); } break;
     case 'retire': {
       const r = S.requests.get(e.id);
       if (r) { r.retired = e.t; r.reason = e.reason; r.gen = Math.max(r.gen, e.gen); }
@@ -432,7 +432,8 @@ function layoutChanged() {
   $('#profile').hidden = !L;
   if (L) {
     $('#layers-title').textContent = L.title;
-    $('#layers-legend').innerHTML = L.classes.map(([n, col]) => `<span><i style="background:${tok(col)}"></i>${esc(n)}</span>`).join('') +
+    const used = new Set(L.class && L.class.length ? L.class : L.classes.map((_, i) => i));
+    $('#layers-legend').innerHTML = L.classes.filter((_, i) => used.has(i)).map(([n, col]) => `<span><i style="background:${tok(col)}"></i>${esc(n)}</span>`).join('') +
       '<span><i style="background:var(--ink-2);opacity:.5"></i>60 s median</span>';
   }
   const spec = c.speculator;

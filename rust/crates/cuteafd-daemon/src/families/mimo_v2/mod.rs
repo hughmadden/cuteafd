@@ -112,6 +112,13 @@ pub(crate) struct EngineArgs {
     /// quantized per row and 128-K block at load).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub fp8_o_proj: bool,
+    /// Decode and verify steps replay one captured CUDA graph per layer segment
+    /// between the Spark exchanges (every 1..=64-row shape captured at startup).
+    /// Off by default: with the host-driven exchange the GPU, not the launches,
+    /// bounds each segment (same C1/C4 and step times, +0.4-1.2 GiB of graphs);
+    /// the segments are what a device-driven exchange captures as one step.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, env = "CUTEAFD_MIMO_DECODE_GRAPHS")]
+    pub decode_graphs: bool,
     /// Expert input rows sent to the Spark ranks: FP8 K32 wire rows, BF16
     /// (the ranks load the `fp8-mimo-bf16` package too), or BF16 for decode
     /// steps only.
@@ -167,6 +174,14 @@ pub(crate) struct GoldenArgs {
     /// back), so prefill and decode times are the engine's.
     #[arg(long)]
     pub timing: bool,
+    /// Score the decode steps' logits without the per-layer comparison (decode
+    /// then runs as served: captured graph segments unless --decode-graphs false).
+    #[arg(long, conflicts_with = "timing")]
+    pub decode_nll: bool,
+    /// Capture every decode segment shape (1..=64 rows) first, as serve-mimo does
+    /// before it is ready; reports the time and the graphs captured later anyway.
+    #[arg(long)]
+    pub capture_graphs: bool,
     /// Then time this many prefills of --bench-prefill-tokens tokens (the
     /// golden prompt repeated, in chunks of --prefill-rows) on fresh sequences.
     #[arg(long, default_value_t = 0)]
@@ -310,6 +325,7 @@ impl Opened {
         let mut engine = engine::MimoEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages, args.rings, embedding, args.kv_cache.into())?;
         engine.prefill_w8a8 = !args.prefill_w8a16;
+        engine.decode_graphs = args.decode_graphs;
         {
             use cuteafd_loader::families::mimo_v2::MimoAttention;
             let kv = args.kv_cache.into();
@@ -504,6 +520,19 @@ fn golden(args: GoldenArgs) -> Result<()> {
 }
 
 fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_>) -> Result<()> {
+    if args.capture_graphs {
+        let started = Instant::now();
+        let graphs = engine.capture_decode_graphs(engine::DECODE_ROWS)?;
+        println!("decode graphs: {graphs} captured in {:.2} s", started.elapsed().as_secs_f64());
+    }
+    let result = golden_body(args, opened, engine);
+    if args.capture_graphs {
+        println!("decode graphs captured after startup: {}", engine.late_captures());
+    }
+    result
+}
+
+fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_>) -> Result<()> {
     if let Some(dir) = &args.draft_oracle {
         return draft_oracle(args, opened, engine, dir);
     }
@@ -584,7 +613,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
         let n = chunk.min(prefill - first);
         let mut prefill_compare = |layer: usize, stream: &[u8]| compare(layer, first, stream, &mut worst);
         logits = engine.prefill_forced(&mut placement, &tokens[first..first + n], args.nll,
-            (!args.timing).then_some(&mut prefill_compare as &mut dyn FnMut(usize, &[u8]) -> Result<()>),
+            (!args.timing && !args.decode_nll).then_some(&mut prefill_compare as &mut dyn FnMut(usize, &[u8]) -> Result<()>),
             args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>))?;
         if args.nll {
             prefill_logits.extend(logits.as_deref().unwrap_or_default());
@@ -609,7 +638,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
         let first = position;
         let mut step_compare = |layer: usize, stream: &[u8]| compare(layer, first, stream, &mut decode_worst);
         if let Some(logits) = engine.verify(&mut [(&mut placement, n)], &tokens[position..position + n],
-            (!args.timing).then_some(&mut step_compare as &mut dyn FnMut(usize, &[u8]) -> Result<()>))? {
+            (!args.timing && !args.decode_nll).then_some(&mut step_compare as &mut dyn FnMut(usize, &[u8]) -> Result<()>))? {
             // --timing: step times without the scoring copy of every row's logits.
             if !args.timing {
                 decode_logits.extend(logits);

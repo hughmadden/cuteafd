@@ -56,6 +56,37 @@ pub(crate) struct Layers {
     pub class: Vec<u8>,
 }
 
+impl Layers {
+    /// The per-layer host-clock profile of a generic engine's decode step
+    /// (`console::layer_mark` at each layer's end): class 0 runs its FFN on
+    /// the coordinator (dense or local experts), class 1 on the Sparks.
+    pub fn host_clock() -> Self {
+        Self { title: "Layer profile · last step · host clock".into(), first: 0,
+            classes: vec![("dense".into(), Color::Ink), ("Spark-routed experts".into(), Color::Spark),
+                ("RTX-resident experts".into(), Color::Rtx)],
+            class: Vec::new() }
+    }
+}
+
+/// A generic engine layer's class in [`Layers::host_clock`]: dense, MoE with
+/// its experts on the Sparks, or MoE with its experts on the coordinator.
+pub(crate) fn layer_class(dense: bool, spark: bool) -> u8 {
+    match (dense, spark) {
+        (true, _) => 0,
+        (false, true) => 1,
+        (false, false) => 2,
+    }
+}
+
+impl StepGroup {
+    /// The layer-profile rows of a generic engine's decode step.
+    pub fn layers() -> Self {
+        Self::new("Layers", "host clock, layer end to layer end", &[("layers.sum", "all layers", Color::Target),
+            ("layers.mean.0", "dense layer (mean)", Color::Ink), ("layers.mean.1", "Spark-expert layer (mean)", Color::Spark),
+            ("layers.mean.2", "RTX-expert layer (mean)", Color::Rtx), ("layers.max", "slowest layer", Color::Warn)])
+    }
+}
+
 /// The speculator a family runs; families without one omit it and the page
 /// hides the acceptance panel.
 pub(crate) struct Speculator {
