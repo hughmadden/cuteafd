@@ -402,7 +402,10 @@ impl<'a> NativeTp4Wave<'a> {
         let link = crate::shared::spark_intake::SparkDeviceLink::new(self.library, device, peers, &executors,
             capacity, 6, 5280, V41_PARTIAL_ROW_BYTES as usize,
             cuteafd_transport::TcpTransportConfig { timing: false, ..config }, Some(warm), build)?;
-        link.initialize_on(1 - device)?;
+        // The other RTX publishes waves too when the router runs there.
+        if self.tp2.is_some() {
+            link.initialize_on(1 - device)?;
+        }
         self.device = Some(DeviceExchange { link, context, capacity });
         Ok(())
     }
