@@ -680,7 +680,21 @@ active admission deferral and active KV paging are separate remaining work.
         setting. Automatic retained-prefix host budgets account for each
         family's page/mark slabs and are capped by live host/cgroup memory
         after headroom; disabled retention or unavailable rank-copy support
-        allocates no host tier. Rank-aware exact host restores remain a gate.
+        allocates no host tier. Rank-aware MiMo host restores now pass the
+        full-model two-RTX gate: evict device snapshots, overwrite both ranks'
+        KV/rings/marks, promote from host, then compare restored storage,
+        retained logits, every suffix layer and greedy continuation exactly.
+        Copy engines retain the actual device allocations until all owning
+        streams drain. Host retention is available with an explicit bounded
+        quota; adopting the common default remains part of planner integration.
+     m. Cancelled scoped stage chains could release borrowed staging while
+        queued CUDA work still used it. The scope now drains pending work
+        before dropping its future, preserving the caller GPU and thread-local
+        scope. Actual CUDA cancellation/unwind and immediate reuse checks pass,
+        with the unchanged implementation failing the negative control.
+        Combined host-copy/cancellation changes pass repeated V4.1 parity on
+        one and two RTX GPUs; completed and unpolled scopes retain their
+        existing explicit-drain behavior.
 5. **Spark expert kernels**: MiMo V2.6 Pro TP6 prefill is Spark-bound (~35 of
    ~42 ms per layer); GLM 5.3 verify is bound by distinct expert reads; NVFP4
    W4A16 GB10 prefill (14.3 vs EXL3 9.1 ms/layer TP4). Pro's installed SM121
