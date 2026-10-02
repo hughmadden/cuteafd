@@ -3,7 +3,7 @@
 //! `benchmarks/README.md` index, both rebuilt from the `report.json` files
 //! under `benchmarks/<family>/<date>-<profile>-<hardware>/`.
 use crate::render::{rate, seconds};
-use crate::report::{CheckStatus, HardwareClass, Report};
+use crate::report::{CheckStatus, Report};
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -82,23 +82,36 @@ const FAMILIES: [&str; 6] = ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash"
 /// The newest basic-profile report per family, checkpoint and reference hardware, in
 /// family order, then checkpoint, minimum before maximum.
 fn reference_rows(placed: &[Placed]) -> Vec<(String, String, u8, &Placed)> {
-    let mut rows: BTreeMap<(usize, String, String, u8), &Placed> = BTreeMap::new();
+    // The newest basic-profile report per family, checkpoint and hardware (`placed`
+    // is newest first), on the reference layouts (one or two RTX, Sparks or none).
+    let mut newest: BTreeMap<(usize, String, String, String), &Placed> = BTreeMap::new();
     for p in placed {
         let r = &p.report;
-        if r.baseline.is_none() || !matches!(r.profile.as_str(), "smoke" | "share") {
+        if r.baseline.is_none() || !matches!(r.profile.as_str(), "smoke" | "share")
+            || !(1..=2).contains(&r.server.hardware.used_gpus()) {
             continue;
         }
-        let class = match r.server.hardware.class() {
-            HardwareClass::Minimum => 0,
-            HardwareClass::Maximum => 1,
-            HardwareClass::Other => continue,
-        };
         let family = r.server.family.clone().unwrap_or_else(|| "unknown".into());
         let order = FAMILIES.iter().position(|f| *f == family).unwrap_or(FAMILIES.len());
-        // `placed` is newest first: keep the first of each key.
-        rows.entry((order, family, checkpoint(r), class)).or_insert(p);
+        newest.entry((order, family, checkpoint(r), r.server.hardware.slug())).or_insert(p);
     }
-    rows.into_iter().map(|((_, family, name, class), p)| (family, name, class, p)).collect()
+    // Per checkpoint: the smallest layout is its minimum, the largest its maximum
+    // (a family without a two-RTX split has its maximum on one RTX).
+    let mut groups: BTreeMap<(usize, String, String), Vec<&Placed>> = BTreeMap::new();
+    for ((order, family, name, _), p) in newest {
+        groups.entry((order, family, name)).or_default().push(p);
+    }
+    let size = |p: &Placed| (p.report.server.hardware.used_gpus(), p.report.server.hardware.sparks.len());
+    let mut rows = Vec::new();
+    for ((_, family, name), mut reports) in groups {
+        reports.sort_by_key(|p| size(p));
+        let (first, last) = (reports[0], reports[reports.len() - 1]);
+        rows.push((family.clone(), name.clone(), 0, first));
+        if size(last) != size(first) {
+            rows.push((family, name, 1, last));
+        }
+    }
+    rows
 }
 
 fn quality_cell(b: &crate::report::Baseline) -> String {
