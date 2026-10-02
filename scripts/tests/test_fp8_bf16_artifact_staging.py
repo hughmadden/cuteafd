@@ -17,6 +17,10 @@ spec = importlib.util.spec_from_file_location("fp8_package", TOOL)
 package_tool = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(package_tool)
+preflight_spec = importlib.util.spec_from_file_location("bf16_preflight", REPO / "scripts/launch/preflight-fp8-bf16.py")
+preflight = importlib.util.module_from_spec(preflight_spec)
+assert preflight_spec.loader is not None
+preflight_spec.loader.exec_module(preflight)
 
 
 def write_package(path: Path, *, input_kind="wire", role="spark", revision=REVISION):
@@ -27,7 +31,10 @@ def write_package(path: Path, *, input_kind="wire", role="spark", revision=REVIS
     manifest = {
         "schema": "cuteafd.fp8moe-package.v1", "role": role, "geometry": "mimo",
         "sparkinfer_revision": revision,
-        "layouts": {layout: {"input": input_kind, "capacities": [{"capacity": 80}]}},
+        "compute": [12, 1],
+        "layouts": {layout: {"input": input_kind, "capacities": [{"capacity": 80}],
+                             "weights": "fp8", "hidden": 4096, "experts": 256, "top_k": 8,
+                             "intermediate": 2048, "tp": 4, "slice": 512, "swiglu_limit": 0.0}},
         "files": {str(library.relative_to(path)): {
             "bytes": library.stat().st_size, "sha256": hashlib.sha256(library.read_bytes()).hexdigest()}},
     }
@@ -126,3 +133,46 @@ def test_remote_opt_in_preserves_preceding_optional_arguments(bf16_arg, expected
                              "decoder", *arguments], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == ["tp2;tp6", "mimo:fp8;glm:fp8", expected]
+
+
+def test_preflight_checks_real_package_files_and_matching_native_contract(tmp_path):
+    write_package(tmp_path / "fp8-mimo")
+    write_package(tmp_path / "fp8-mimo-bf16", input_kind="bf16")
+    preflight.verify_sibling(tmp_path, "mimo", "tp4", 64, REVISION, package_tool.verify)
+    library = tmp_path / "fp8-mimo-bf16/tp4/libcuteafd_fp8moe.so"
+    library.write_bytes(b"corrupt library")
+    with pytest.raises(ValueError):
+        preflight.verify_sibling(tmp_path, "mimo", "tp4", 64, REVISION, package_tool.verify)
+
+
+@pytest.mark.parametrize("field, value, error", [
+    ("sparkinfer_revision", "a" * 40, "source pin"),
+    ("compute", [12, 0], "SM121"),
+    ("geometry", "glm", "geometry mimo"),
+    ("role", "coordinator", "Spark SM121"),
+    ("input", "wire", "bf16 tp4"),
+    ("slice", 384, "differs from primary in slice"),
+    ("swiglu_limit", 7.0, "differs from primary in swiglu_limit"),
+    ("capacities", [{"capacity": 16}], "capacity for 64"),
+])
+def test_preflight_rejects_incompatible_sibling_before_cuda(tmp_path, field, value, error):
+    write_package(tmp_path / "fp8-mimo")
+    sibling = write_package(tmp_path / "fp8-mimo-bf16", input_kind="bf16")
+    manifest = json.loads((sibling / "manifest.json").read_text())
+    target = manifest if field in ("sparkinfer_revision", "compute", "geometry", "role") else manifest["layouts"]["tp4"]
+    target[field] = value
+    (sibling / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match=error):
+        preflight.verify_sibling(tmp_path, "mimo", "tp4", 64, REVISION, package_tool.verify)
+
+
+@pytest.mark.parametrize("layout, capacity, revision, error", [
+    ("tp6", 64, REVISION, "wire tp6"),
+    ("tp4", 4096, REVISION, "capacity for 4096"),
+    ("tp4", 64, "unknown", "does not identify"),
+])
+def test_preflight_requires_requested_layout_workspace_and_image_identity(tmp_path, layout, capacity, revision, error):
+    write_package(tmp_path / "fp8-mimo")
+    write_package(tmp_path / "fp8-mimo-bf16", input_kind="bf16")
+    with pytest.raises(ValueError, match=error):
+        preflight.verify_sibling(tmp_path, "mimo", layout, capacity, revision, package_tool.verify)

@@ -130,6 +130,15 @@ if [[ $family == mimo_v2 ]]; then
     *) echo "DECODE_GRAPHS must be on or off" >&2; exit 2 ;;
   esac
 fi
+# EXPERT_INPUT is opt-in for MiMo's Spark exchange; unset preserves image defaults.
+expert_input="$(get EXPERT_INPUT)"
+if [[ -n "$expert_input" ]]; then
+  [[ "$family" == mimo_v2 ]] || { echo "EXPERT_INPUT applies to MiMo checkpoints" >&2; exit 2; }
+  case "$expert_input" in
+    fp8|bf16|bf16-decode) family_args+=(--expert-input "$expert_input") ;;
+    *) echo "EXPERT_INPUT must be fp8, bf16 or bf16-decode" >&2; exit 2 ;;
+  esac
+fi
 [[ ! $family =~ ^(glm5|qwen4|deepseek_v4)$ || -z "$(get POOL_TOKENS)" ]] || family_args+=(--pool-tokens "$(get POOL_TOKENS)")
 # GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
 # from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" quantizes the
@@ -281,6 +290,26 @@ if [[ "$ranks" == 0 ]]; then
     glm5_flash|mimo_v2|qwen4) family_args+=(--local-experts) ;;
     *) echo "SPARK_COUNT=0 (local experts) serves GLM 5.3 Flash, MiMo V2 and Qwen 3.8, not $family" >&2; exit 2 ;;
   esac
+fi
+# Check every selected image before --restart or checkpoint reads. The worker's
+# resident admission validates the sibling for its full 4096-row workspace even
+# when only decode requests use BF16, so this preflight requires the same coverage.
+if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
+  [[ "$ranks" != 0 ]] || { echo "EXPERT_INPUT=$expert_input requires Spark experts" >&2; exit 2; }
+  store_dtype="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("quantization_config", {}).get("store_dtype", "fp8"))' "$root/snapshots/$revision/config.json")"
+  case "$store_dtype" in
+    fp8) expert_geometry=mimo ;;
+    mxfp4) expert_geometry=mimop ;;
+    *) echo "EXPERT_INPUT=$expert_input has no package for store_dtype=$store_dtype" >&2; exit 2 ;;
+  esac
+  printf -v preflight_command '%q ' docker run --rm -i --entrypoint python3 "$spark_image" - "$expert_geometry" "tp$ranks" 4096
+  for ((rank = 0; rank < ranks; rank++)); do
+    host="$(get "SPARK_${rank}_HOST")"
+    if ! ssh "$host" "$preflight_command" < "$repo_root/scripts/launch/preflight-fp8-bf16.py"; then
+      echo "$host cannot serve EXPERT_INPUT=$expert_input; build $expert_geometry:fp8 with CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$expert_geometry (or its WIP equivalent)" >&2
+      exit 2
+    fi
+  done
 fi
 peers=()
 # --restart removes this launcher's containers (stop.sh's release parser rejects

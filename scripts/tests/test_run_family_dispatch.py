@@ -89,13 +89,15 @@ def test_family_table_matches_the_rust_launch_fixtures(tmp_path: Path) -> None:
 
 
 def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys: str,
-                          physical_gpus: tuple[int, ...] = (0, 1)) -> subprocess.CompletedProcess[str]:
+                          physical_gpus: tuple[int, ...] = (0, 1), *, preflight_error: bool = False,
+                          restart: bool = False) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
     that print their argv) and return what it would launch."""
     repo = tmp_path / "repo"
     (repo / "scripts" / "lib").mkdir(parents=True)
     (repo / "scripts" / "launch").mkdir(parents=True)
     shutil.copy(ROOT / "scripts" / "launch" / "run-family.sh", repo / "scripts" / "launch")
+    shutil.copy(ROOT / "scripts" / "launch" / "preflight-fp8-bf16.py", repo / "scripts" / "launch")
     shutil.copy(ROOT / "scripts" / "lib" / "checkpoint-family.py", repo / "scripts" / "lib")
     hf = tmp_path / "hf"
     _snapshot(hf, model, family_config)
@@ -103,6 +105,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     bin_dir.mkdir()
     for tool in ("docker", "ssh", "nest"):
         (bin_dir / tool).write_text('#!/usr/bin/env bash\nprintf "%s " "$(basename "$0")" "$@" >&2; echo >&2\n'
+                                    + ('case "$*" in *"docker run --rm"*"python3"*) exit 2 ;; esac\n'
+                                       if preflight_error and tool == "ssh" else '') +
                                     'case "$*" in *"docker logs"*) echo "worker ready" ;; esac\n')
         (bin_dir / tool).chmod(0o755)
     (bin_dir / "curl").write_text('#!/usr/bin/env bash\nprintf \'%s\\n\' \'{"data":[{"id":"test/model"}]}\'\n')
@@ -113,12 +117,65 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     config = repo / "f.config"
     config.write_text(f"MODEL_ID={model}\nSPARK_COUNT=1\nSPARK_0_HOST=h0\nSPARK_0_LANE_A=10.0.0.1\n{keys}")
     env = {**os.environ, "HF_HOME": str(hf), "PATH": f"{bin_dir}:{os.environ['PATH']}"}
-    return subprocess.run(["bash", str(repo / "scripts" / "launch" / "run-family.sh"), "--config", str(config)],
+    return subprocess.run(["bash", str(repo / "scripts" / "launch" / "run-family.sh"), "--config", str(config),
+                           *(["--restart"] if restart else [])],
                           env=env, capture_output=True, text=True, timeout=30)
 
 
 def _family_launch_lines(tmp_path: Path, family_config: dict, model: str, keys: str) -> str:
     return _family_launch_result(tmp_path, family_config, model, keys).stderr
+
+
+@pytest.mark.parametrize("mode", ["bf16", "bf16-decode"])
+@pytest.mark.parametrize("store, geometry, ranks", [("fp8", "mimo", 4), ("mxfp4", "mimop", 6)])
+def test_mimo_expert_input_preflights_every_rank_before_serving(tmp_path, mode, store, geometry, ranks):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1],
+              "quantization_config": {"store_dtype": store}}
+    keys = f"EXPERT_INPUT={mode}\nSPARK_COUNT={ranks}\nSPARK_EXPERT_DOCKER_INFERENCE=spark:test\n"
+    keys += "".join(f"SPARK_{r}_HOST=h{r}\nSPARK_{r}_LANE_A=10.0.0.{r + 1}\n" for r in range(ranks))
+    result = _family_launch_result(tmp_path, config, "test/mimo", keys)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    checks = [line for line in lines if "docker run --rm -i --entrypoint python3" in line]
+    assert len(checks) == ranks
+    for rank, check in enumerate(checks):
+        assert f"ssh h{rank} " in check and f"- {geometry} tp{ranks} 4096" in check
+    assert max(lines.index(check) for check in checks) < next(i for i, line in enumerate(lines) if "docker run -d" in line)
+    assert f"--expert-input {mode}" in result.stderr
+
+
+def test_mimo_unavailable_bf16_package_keeps_existing_containers(tmp_path):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    result = _family_launch_result(tmp_path, config, "test/mimo",
+                                  "EXPERT_INPUT=bf16-decode\nSPARK_EXPERT_DOCKER_INFERENCE=spark:test\n",
+                                  preflight_error=True, restart=True)
+    assert result.returncode == 2 and "cannot serve EXPERT_INPUT=bf16-decode" in result.stderr
+    assert "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=mimo" in result.stderr
+    assert "docker rm" not in result.stderr and "docker run -d" not in result.stderr
+    assert "nest drop-caches" not in result.stderr
+
+
+@pytest.mark.parametrize("keys, error", [("EXPERT_INPUT=garbage\n", "must be fp8"),
+                                        ("EXPERT_INPUT=bf16-decode\nSPARK_COUNT=0\n", "requires Spark experts")])
+def test_mimo_expert_input_rejects_invalid_modes_before_launch(tmp_path, keys, error):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    result = _family_launch_result(tmp_path, config, "test/mimo", keys)
+    assert result.returncode == 2 and error in result.stderr
+    assert "docker run" not in result.stderr
+
+
+def test_expert_input_is_opt_in_and_mimo_only(tmp_path):
+    config = {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    for mode in ("", "fp8"):
+        text = _family_launch_lines(tmp_path / (mode or "default"), config, "test/mimo",
+                                   f"EXPERT_INPUT={mode}\n")
+        assert "docker run --rm" not in text
+        assert ("--expert-input fp8" in text) == bool(mode)
+    other = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+             "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path / "other", other, "test/glm", "EXPERT_INPUT=bf16-decode\nGLM5_FLASH_FP8_MODEL_ID=off\n")
+    assert result.returncode == 2 and "applies to MiMo" in result.stderr
+    assert "docker run" not in result.stderr
 
 
 SPLIT_CONFIGS = {
