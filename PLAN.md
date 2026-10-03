@@ -499,9 +499,12 @@ at one RTX, 20 at two). The waste is elsewhere:
 1. Idle coordinator memory: the generic families' fixed pools (MiMo 131072,
    GLM 262144, GLM Flash 65536 tokens) leave 48–80 GiB of every GPU unused,
    while V4.1 fills its GPUs with expert layers and KV. Fixed for MiMo
-   (`POOL_TOKENS=auto` through the codex capacity contract: 131072 -> 2,097,152
-   tokens, GPU0 23.0 -> 49.4 GiB, C1/C4/8K prefill unchanged) and planned for
-   GLM 5.3 and GLM 5.3 Flash (`planned_pool_tokens`).
+   (`POOL_TOKENS=auto`, now the run-family default, through the codex capacity
+   contract: 131072 -> 2,097,152 tokens, GPU0 23.0 -> 49.4 GiB, C1/C4/8K prefill
+   unchanged) and GLM 5.3 Flash (default auto via `planned_pool_tokens`: 65536 ->
+   2,097,152 tokens, 44 GiB still free, unchanged speed). GLM 5.3 takes
+   `POOL_TOKENS=auto` (262144 -> 1,292,672 tokens, 65 GiB KV per GPU) but keeps
+   its fixed default until item 5 is bounded (2.9 GiB left on GPU0 after a bench).
 2. Spark page cache: ~10 GiB of the checkpoint stays cached per Spark after
    loading (CUDA free 4.0 of 121.6 GiB on MiMo Pro TP6); the worker's own
    fadvise does not reach sparknest's passthrough pages. Fixed: launchers
@@ -513,6 +516,9 @@ at one RTX, 20 at two). The waste is elsewhere:
    GiB, V4 Flash rank 1 3.80 -> 3.55; V4 Flash prefill logits for 4096 rows
    (2.1 GB) -> 64 rows with chunked golden downloads: GPU0 6.09 -> 4.14 GiB.
    DeepSeek V4 golden output identical; GLM 5.3 golden NLL 2.4686 in both (TP6 + head split; KL 0.03444, top-1 91.54%).
+   GLM 5.3 2 RTX + 6 Sparks, 4 interleaved launches per arm: C1 54.3 vs 55.6
+   (-2.4%, t=-1.6), C4 87.3 vs 88.2 (-1.1%, t=-1.1), 8K prefill TTFT medians
+   3.454-3.58 vs 3.45-3.52 s: within run-to-run noise (C1 spans 50-58 in both).
 5. Graph executables (untracked): GLM 5.3 grows from 0.89 to 2.62 GiB on
    GPU0 over one C1/C4 + prefill bench and keeps rising (graphs per layer x
    exact row count x table width); an auto pool sized with a 0.6 GiB graph
