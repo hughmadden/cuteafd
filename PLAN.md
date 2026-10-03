@@ -463,6 +463,93 @@ model needs them; GLM 5.3 official FP8 is out of scope — EXL3 and NVFP4
 quants cover it), S4 encoder service + multimodal input, S5 coordinator
 range split, S6 eight Sparks.
 
+**Memory audit and planner core (2026-10-03, `work/v1-memory`).** Every
+device, pinned and RDMA allocation now goes through a process-wide ledger
+(`cuteafd_ffi::memory_ledger`: thread-local category scopes, the checkpoint
+tensor and resident format being uploaded; `cuteafd::memory` log reports;
+`scripts/bench/memory-audit.py` tabulates and `--compare`s against the
+planner). One launch per config (codex/v1 tree + ledger, after an 8K prefill,
+a C4 and a C1 request; default pools). GiB per device:
+
+| config | device | weights | emb | drafter | KV | marks | workspace | exchange | experts | runtime | used | free |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| MiMo V2.6 Pro 2 RTX + 6 | GPU0 | 10.72 | 1.75 | 3.21 | 2.36 | 0.77 | 2.49 | 0.38 | | 1.37 | 23.0 | 71.9 |
+| | GPU1 | 9.52 | | | 2.34 | 0.77 | 1.20 | 0.38 | | 1.00 | 15.2 | 79.7 |
+| | Spark (TP6) | | | | | | 0.52 | 1.15 rings | 92.79 | 7.5 OS + 11.0 cache | 117.6 | 4.0 |
+| MiMo V2.6 Pro 1 RTX + 6 | GPU0 | 20.24 | 1.75 | 3.21 | 4.70 | 1.54 | 2.90 | | | 1.23 | 35.6 | 59.4 |
+| GLM 5.3 K4 2 RTX + 6 | GPU0 | 10.48 | 1.77 | 5.88 | 13.18 | | 5.59 | 0.56 | | 1.72 | 39.2 | 55.8 |
+| | GPU1 | 8.49 | | | 13.18 | | 4.22 | 0.56 | | 1.26 | 27.7 | 67.3 |
+| | Spark (TP6) | | | | | | 1.9 | 2.29 rings | 63.45 | 7.7 OS + 7.1 cache | 85.4 | 36.2 |
+| GLM 5.3 K4 1 RTX + 4 | GPU0 | 17.56 | 1.77 | 5.88 | 13.18 | | 6.51 | | | 1.55 | 46.5 | 48.5 |
+| | Spark (TP4) | | | | | | 1.9 | 2.29 rings | 84.59 | 7.7 OS + 3.4 cache | 103.3 | 18.3 |
+| GLM 5.3 Flash 1 RTX + 2 / + 4 | GPU0 | 13.07 | 1.18 | 3.24 | 2.12 | 2.47 | 4.72 | | | 1.24 | 28.0 | 66.9 |
+| | Spark (TP2 / TP4) | | | | | | 0.56 | 0.77 rings | 58.3 / 29.4 | 7.3 OS | 78.1 / 43.6 | 43.6 / 78.0 |
+| V4.1 Flash 2 RTX + 4 | GPU0 / GPU1 | 5.16 / 3.91 | in weights | 0 / 8.12 | 7.34 / 4.90 | 0.1 | 9.48 / 5.70 | | ~67 each (20 layers TP2) | 2.0 / 1.9 | 93.1 / 93.5 | 1.8 / 1.5 |
+| | Spark (TP4) | | | | | | 0.21 | 0.25 rings | 37.35 (20 layers) | 7.3 OS | 50.6 | 71.1 |
+| V4.1 Flash 1 RTX + 4 | GPU0 | 9.29 | in weights | 8.21 | 15.60 | 0.1 | 21.08 | | 33.94 (5 layers) | 2.83 | 93.1 | 1.9 |
+| | Spark (TP4) | | | | | | 0.21 | 0.48 rings | 65.37 (35 layers) | 7.4 OS | 79.2 | 42.4 |
+| V4 Flash 2 RTX + 4 | GPU0 / GPU1 | 5.38 / 3.74 | 0.99 | | 2.08 / 1.96 | 1.0 / 1.0 | 4.14 / 3.55 | 0.25 / 0.31 | 73.47 / 0 | 1.0 / 0.9 | 88.3 / 11.4 | 6.7 / 83.6 |
+| Qwen 3.8 EXL3 1 RTX | GPU0 | 8.21 | 1.18 | | 1.93 | 1.94 | 1.20 | | 62.61 | 1.41 | 78.5 | 16.5 |
+
+Findings, against the suspects: no tensor is resident in two formats in any
+family after codex/v1 (the ledger checks every upload by full tensor name);
+no load-time conversion uploads at source size (GLM NVFP4 was the one case);
+V4.1 Sparks hold only the remote layers (runtime placement handoff: 35 of 40
+at one RTX, 20 at two). The waste is elsewhere:
+1. Idle coordinator memory: the generic families' fixed pools (MiMo 131072,
+   GLM 262144, GLM Flash 65536 tokens) leave 48–80 GiB of every GPU unused,
+   while V4.1 fills its GPUs with expert layers and KV. Fixed for MiMo
+   (`POOL_TOKENS=auto` through the codex capacity contract: 131072 -> 2,097,152
+   tokens, GPU0 23.0 -> 49.4 GiB, C1/C4/8K prefill unchanged) and planned for
+   GLM 5.3 and GLM 5.3 Flash (`planned_pool_tokens`).
+2. Spark page cache: ~10 GiB of the checkpoint stays cached per Spark after
+   loading (CUDA free 4.0 of 121.6 GiB on MiMo Pro TP6); the worker's own
+   fadvise does not reach sparknest's passthrough pages. Fixed: launchers
+   drop Spark caches once every rank is resident (+9.5 GiB CUDA free).
+3. Retained load staging: the copy_h2d pinned buffer stayed at the largest
+   upload (0.45 GiB per Spark on MiMo, 1.77 GiB pinned on raptor for GLM,
+   1.0 for V4 Flash). Fixed: released after loading.
+4. Head-split workspaces sized for all heads: GLM 5.3 6.39/5.02 -> 5.59/4.22
+   GiB, V4 Flash rank 1 3.80 -> 3.55; V4 Flash prefill logits for 4096 rows
+   (2.1 GB) -> 64 rows with chunked golden downloads: GPU0 6.09 -> 4.14 GiB.
+   DeepSeek V4 golden output identical; GLM 5.3 golden NLL 2.4686 in both (TP6 + head split; KL 0.03444, top-1 91.54%).
+5. Graph executables (untracked): GLM 5.3 grows from 0.89 to 2.62 GiB on
+   GPU0 over one C1/C4 + prefill bench and keeps rising (graphs per layer x
+   exact row count x table width); an auto pool sized with a 0.6 GiB graph
+   reserve hit cudaGraphInstantiate OOM and poisoned the context. The planner
+   reserves 3 GiB per GPU for GLM until the cache is bounded (bucket rows or
+   cap entries; MiMo's codex plan bounds its own at 616/566 MiB).
+Inventory for the planner (not fixed; bytes per device):
+- Spark slices padded to the widest 128-row block: MiMo V2.6 Pro TP6 stores
+  384 of 352/320 rows (7.7 GiB on ranks 0-3, 15.5 on 4-5, 62 GiB cluster);
+  GLM 5.3 EXL3 TP6 384 of 341 (~7 GiB/rank); V4.1 TP4 640 of 576 (~3.7 GiB
+  at 20 layers, 6.5 at 35). Uneven whole-block slices (384,384,384,384,256,
+  256) free ranks 4-5 at no speed cost; kernels that run 32-row tails also
+  cut the critical rank's rows 8-10% (MiMo Pro prefill is Spark-bound).
+- sparknestd holds 7.2 GiB RSS on every Spark (host OS total ~13 GiB idle).
+- RDMA rings: 1.15-2.31 GiB per Spark (depth 8 x 8 MiB slots per endpoint)
+  and 6.9 (MiMo) / 13.7 (GLM) GiB pinned on raptor.
+- GLM 5.3 head split replicates the MLA latent KV (13.18 GiB per GPU at 262K
+  tokens) and 1.2 GiB of attention operands plus the indexer on GPU1.
+- V4 Flash/Pro keep RTX-local expert layers on GPU0 only: GPU1 83.6 GiB free.
+- V4.1 one RTX: decode and prefill target passes own complete workspaces
+  (prefill pass 10.5 + backbone lanes 9.0 GiB) ~ three RTX expert layers.
+- MiMo FP8 scales expanded per row twice (row and K-major): ~1 GiB.
+- GLM DFlash2 drafter resident BF16 (5.88 GiB incl. 1.3 GiB buffers; the
+  explicit FP8 representation is ~2.3 GiB smaller).
+Planner core (S0): `cuteafd plan MODEL --layout [--rtx 1|2] [--pool-tokens N]`
+lays every device out (weights by group and resident format, embedding,
+drafter, KV records and state, prefix marks, workspaces, peer exchange,
+runtime and graph allowance, Spark experts with padding, workspace and
+rings) and sizes the pool from the tightest KV-owning GPU; MiMo weights come
+from the codex resident layout, GLM Flash from its FP8-snapshot conversion.
+Per-family costs are calibrated from the ledger (`plan::layout::family_costs`);
+device totals at ready match the ledger within 2% (GLM 5.3 39.10/27.63 vs
+39.18/27.70, MiMo Pro 22.81/14.99 vs 23.03/15.23, GLM Flash 27.55 vs 28.05).
+Engines take admission from it: MiMo (capacity contract, pool 0 = auto),
+GLM 5.3 and GLM 5.3 Flash (`--pool-tokens 0`). Next: V4/V4.1 and Qwen
+geometry in the planner, graph-cache bounds, `placement.json` handoff (S1).
+
 **Device-driven Spark exchange (decided 2026-10-02, `work/v41-device`).** No engine is
 device-routed toward the Sparks today: every family (V4, GLM, GLM Flash, MiMo, Qwen) downloads
 route ids, weights and wire rows per MoE layer, synchronizes the stream, builds the request on
