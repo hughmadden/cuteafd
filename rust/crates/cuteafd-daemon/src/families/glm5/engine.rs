@@ -952,7 +952,7 @@ impl<'a> GlmEngine<'a> {
         experts: &mut Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>, gather: bool, head: bool) -> Result<()> {
         let Some(link) = self.device_link.as_ref().filter(|_| self.skip.is_none() && crate::shared::spark_intake::device_step_graphs())
         else {
-            return self.decode_layers_on(w, w1, tables, t, experts, gather, head, false);
+            return self.decode_layers_on(w, w1, tables, t, experts, gather, head, None);
         };
         // The whole step as one graph per GPU (the device exchange leaves no host
         // work between segments); `layer: usize::MAX` keys a whole step.
@@ -960,20 +960,20 @@ impl<'a> GlmEngine<'a> {
             table_stride: tables.table_stride, previous: Previous::First, head };
         let captured = self.graphs.borrow().contains_key(&key);
         if !captured {
-            // SAFETY: capture records launches on both ranks' streams (thread-local
-            // mode); nothing in the segments synchronizes the host.
-            self.on(0, || unsafe { self.library.cuda_graph_begin_capture(self.stream) })?;
-            if w1.is_some() {
-                self.on(1, || unsafe { self.library.cuda_graph_begin_capture(self.stream_of(1)) })?;
-            }
-            let queued = self.decode_layers_on(w, w1, tables, t, experts, gather, head, true);
-            let first = self.on(0, || unsafe { self.library.cuda_graph_end_capture(self.stream) });
-            let second = w1.map(|_| self.on(1, || unsafe { self.library.cuda_graph_end_capture(self.stream_of(1)) }))
-                .transpose();
-            queued?;
-            self.graphs.borrow_mut().insert(key, GraphExec(first?, self.library));
-            if let Some(second) = second? {
-                self.peer()?.graphs.borrow_mut().insert(key, GraphExec(second, self.library));
+            // One rank at a time (an instantiation is not allowed while the thread
+            // captures): the ranks meet only through the peer exchange's device flags,
+            // so each rank's segments in order are its whole step.
+            for rank in 0..if w1.is_some() { 2 } else { 1 } {
+                let stream = self.stream_of(rank);
+                // SAFETY: capture records launches on this rank's stream (thread-local mode);
+                // nothing in the segments synchronizes the host.
+                self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
+                let queued = self.decode_layers_on(w, w1, tables, t, experts, gather, head, Some(rank));
+                let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
+                queued?;
+                let exec = GraphExec(exec?, self.library);
+                if rank == 1 { self.peer()?.graphs.borrow_mut().insert(key, exec); }
+                else { self.graphs.borrow_mut().insert(key, exec); }
             }
             tracing::debug!(rows = t, table_width = tables.table_width, "GLM decode step captured whole");
         }
@@ -990,12 +990,14 @@ impl<'a> GlmEngine<'a> {
         Ok(())
     }
 
-    /// [`Self::decode_layers`] segment by segment; `direct`: enqueue every segment
-    /// eagerly (into a whole-step capture) instead of through its own graph.
+    /// [`Self::decode_layers`] segment by segment; `capture`: enqueue only that rank's
+    /// segments, eagerly (into its whole-step capture), instead of through their own graphs.
     #[allow(clippy::too_many_arguments)]
     fn decode_layers_on(&self, w: &Workspace<'_>, w1: Option<&Workspace<'_>>, tables: &StepTables, t: usize,
-        experts: &mut Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>, gather: bool, head: bool, direct: bool)
-        -> Result<()> {
+        experts: &mut Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>, gather: bool, head: bool,
+        capture: Option<usize>) -> Result<()> {
+        let direct = capture.is_some();
+        let (rank0, rank1) = (capture.is_none_or(|r| r == 0), capture.is_none_or(|r| r == 1));
         let rows = Scalar::I32(t as i32);
         let layers = &self.weights.layers;
         let bytes = t * self.cfg.hidden * 2;
@@ -1092,8 +1094,8 @@ impl<'a> GlmEngine<'a> {
                     link.expect(1);
                 }
             }
-            if direct { segment()?; } else { self.replay_on(0, key, segment)?; }
-            if let Some(w1) = w1 {
+            if direct { if rank0 { segment()?; } } else { self.replay_on(0, key, segment)?; }
+            if let (Some(w1), true) = (w1, rank1) {
                 // Rank 1's segments: layer 0 with rank 0's first, then each next one before
                 // the host waits in this layer's exchange.
                 if index == 0 {

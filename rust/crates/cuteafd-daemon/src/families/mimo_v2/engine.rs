@@ -373,9 +373,9 @@ pub(crate) struct MimoEngine<'a> {
     /// publishes each wave, waits for its partials and reduces them, with no
     /// host wait between layers.
     device_link: Option<crate::shared::spark_intake::SparkDeviceLink<'a>>,
-    /// Set while a whole decode step is captured: segments enqueue eagerly into
-    /// that capture instead of through their own graphs ([`Self::graph`]).
-    direct_segments: Cell<bool>,
+    /// The rank whose whole decode step is being captured: its segments enqueue
+    /// eagerly into that capture, the other rank's are skipped ([`Self::graph`]).
+    direct_rank: Cell<Option<usize>>,
 }
 
 /// One Spark request: `t` rows of `dtype` input with `topk` routes each, the
@@ -465,7 +465,7 @@ impl<'a> MimoEngine<'a> {
             wave_timing: std::env::var("CUTEAFD_MIMO_WAVE_TIMING").is_ok_and(|v| v == "1"), drafter: None, mtp: None, l2: None, embedding,
             mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20)?, 0)), prefill_w8a8: true, kv_cache,
             decode_graphs: false, graphs: RefCell::new(HashMap::new()), late_captures: Cell::new(0),
-            device_link: None, direct_segments: Cell::new(false) })
+            device_link: None, direct_rank: Cell::new(None) })
     }
 
     /// Layer `layer`'s KV storage: the paged record pool (full attention; page `p` holds
@@ -1167,7 +1167,7 @@ impl<'a> MimoEngine<'a> {
             _ => [std::ptr::null(); MAX_RANKS],
         };
         let bf16_input = matches!(self.experts, Some(Experts::Spark { .. })) && self.expert_input.bf16(true);
-        let direct = self.direct_segments.get();
+        let direct = self.direct_rank.get().is_some();
         if let (true, false, true, Some(link)) =
             (device, direct, crate::shared::spark_intake::device_step_graphs(), &self.device_link) {
             return self.decode_step_graph(link, w, w1, tables, t, gather, head, launch);
@@ -1228,22 +1228,24 @@ impl<'a> MimoEngine<'a> {
             if launch {
                 self.late_captures.set(self.late_captures.get() + 1);
             }
-            // SAFETY: capture records launches on both ranks' streams (thread-local
-            // mode); nothing in the segments synchronizes the host.
-            self.on(0, || unsafe { self.library.cuda_graph_begin_capture(self.stream) })?;
-            if w1.is_some() {
-                self.on(1, || unsafe { self.library.cuda_graph_begin_capture(self.stream_of(1)) })?;
-            }
-            self.direct_segments.set(true);
-            let queued = self.decode_layers(w, w1, tables, t, gather, head, true);
-            self.direct_segments.set(false);
-            let first = self.on(0, || unsafe { self.library.cuda_graph_end_capture(self.stream) });
-            let second = w1.map(|_| self.on(1, || unsafe { self.library.cuda_graph_end_capture(self.stream_of(1)) }))
-                .transpose();
-            queued?;
-            self.graphs.borrow_mut().insert(key, GraphExec(first?, self.library));
-            if let (Some(second), Some(peer)) = (second?, &self.peer) {
-                peer.graphs.borrow_mut().insert(key, GraphExec(second, self.library));
+            // One rank at a time (an instantiation is not allowed while the thread
+            // captures): the ranks meet only through the peer exchange's device flags,
+            // so each rank's segments in order are its whole step.
+            for rank in 0..if w1.is_some() { 2 } else { 1 } {
+                let stream = self.stream_of(rank);
+                // SAFETY: capture records launches on this rank's stream (thread-local mode);
+                // nothing in the segments synchronizes the host.
+                self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
+                self.direct_rank.set(Some(rank));
+                let queued = self.decode_layers(w, w1, tables, t, gather, head, true);
+                self.direct_rank.set(None);
+                let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
+                queued?;
+                let exec = GraphExec(exec?, self.library);
+                match (rank, &self.peer) {
+                    (1, Some(peer)) => { peer.graphs.borrow_mut().insert(key, exec); }
+                    _ => { self.graphs.borrow_mut().insert(key, exec); }
+                }
             }
             tracing::debug!(rows = t, "MiMo decode step captured whole");
         }
@@ -1405,9 +1407,9 @@ impl<'a> MimoEngine<'a> {
             _ => &self.graphs,
         };
         let stream = self.stream_of(rank);
-        if self.direct_segments.get() {
-            // Inside a whole-step capture: the segment's launches join it.
-            return segment();
+        if let Some(capturing) = self.direct_rank.get() {
+            // Inside a whole-step capture of rank `capturing`: its segments join it.
+            return if capturing == rank { segment() } else { Ok(()) };
         }
         if let Some(graph) = graphs.borrow().get(&key) {
             if !launch {
