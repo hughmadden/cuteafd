@@ -7,8 +7,10 @@ experts without a shared expert.
 
 - `XiaomiMiMo/MiMo-V2-Flash` — FP8 128x128-block routed experts
   (`mimo:fp8`).
-- `XiaomiMiMo/MiMo-V2.6-Pro-RL` — native MXFP4 routed experts
-  (`mimop:fp8`, E2M1 + UE8M0 per 32).
+- `XiaomiMiMo/MiMo-V2.6-Pro-MOPD` — native MXFP4 routed experts
+  (`mimop:fp8`, E2M1 + UE8M0 per 32). Supersedes `MiMo-V2.6-Pro-RL`
+  (same architecture, config, tokenizer and tensor layout; Xiaomi's MOPD2
+  pass fixes the RL release's tool-call repetition). RL still loads.
 
 ## Engineering summary
 
@@ -64,6 +66,7 @@ MiMo V2 Flash 1 RTX + 4 Sparks; V2.6 Pro 1 RTX + 6 Sparks. Coordinator VRAM: V2 
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
 | v0 | 2026-10-02 | First release | <a href="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-flash-1rtx-4spark/report.svg"><img src="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-flash-1rtx-4spark/card.svg" width="360" alt="MiMo-V2-Flash (fp8-block128x128/f32) (min)"></a> <a href="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-flash-2rtx-4spark/report.svg"><img src="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-flash-2rtx-4spark/card.svg" width="360" alt="MiMo-V2-Flash (fp8-block128x128/f32) (max)"></a> <a href="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-6-pro-rl-1rtx-6spark/report.svg"><img src="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-6-pro-rl-1rtx-6spark/card.svg" width="360" alt="MiMo-V2.6-Pro-RL (mxfp4-g32) (min)"></a> <a href="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-6-pro-rl-2rtx-6spark/report.svg"><img src="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-6-pro-rl-2rtx-6spark/card.svg" width="360" alt="MiMo-V2.6-Pro-RL (mxfp4-g32) (max)"></a> |
+| v0-mopd | 2026-10-03 | Model-affecting: V2.6 Pro checkpoint `MiMo-V2.6-Pro-RL` → `MiMo-V2.6-Pro-MOPD` (Xiaomi's MOPD2 pass over the RL weights fixes tool-call repetition; architecture, config, tokenizer, chat template and tensor layout unchanged, DFlash drafter retrained). Golden and bench fidelity reference regenerated from MOPD. | — |
 
 ## Additional benchmarks
 
