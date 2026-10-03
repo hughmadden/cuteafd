@@ -771,9 +771,15 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         let mut rows: Vec<(&mut GlmPlacement, usize)> = active.iter_mut().zip(&sequences)
             .map(|(a, s)| (&mut a.placement, s.len())).collect();
         let timer = Instant::now();
-        let step = engine.verify_device(&mut rows, &tokens, transport.as_deref_mut().map(|t| (t, runtime)))
+        let step = engine.arm_device()
+            .and_then(|()| engine.verify_device(&mut rows, &tokens, transport.as_deref_mut().map(|t| (t, runtime))))
             .and_then(|logits| logits.context("decode needs every layer"))
-            .and_then(|logits| Ok((selector.select(&logits, &batch)?, logits)));
+            .and_then(|logits| {
+                let selected = selector.select(&logits, &batch)?;
+                // Device exchange: the step's waves all succeeded (else its rows are garbage).
+                engine.check_device()?;
+                Ok((selected, logits))
+            });
         let (selected, logits) = match step {
             Ok(step) => step,
             Err(error) => {

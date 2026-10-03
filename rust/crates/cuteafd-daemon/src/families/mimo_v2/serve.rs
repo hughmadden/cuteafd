@@ -728,14 +728,18 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             .map(|(a, s)| (&mut a.placement, s.len())).collect();
         steps += 1;
         let timer = Instant::now();
-        let step = engine.verify_device(&mut rows, &tokens, None).and_then(|logits| logits.context("decode needs every layer"))
+        let step = engine.arm_device().and_then(|()| engine.verify_device(&mut rows, &tokens, None))
+            .and_then(|logits| logits.context("decode needs every layer"))
             .and_then(|logits| {
                 // Each row draws at the position after it, masked along its sequence's drafts.
                 let mut batch = SelectBatch::default();
                 for ((a, rows), &start) in active.iter().zip(&sequences).zip(&starts) {
                     batch.push_sequence(a.job.sampling, a.constraint.as_ref(), rows, start as u64 + 1)?;
                 }
-                Ok((selector.select(&logits, &batch)?, logits))
+                let selected = selector.select(&logits, &batch)?;
+                // Device exchange: the step's waves all succeeded (else its rows are garbage).
+                engine.check_device()?;
+                Ok((selected, logits))
             });
         let step_s = timer.elapsed().as_secs_f64();
         verify_s += step_s;

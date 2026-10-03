@@ -853,6 +853,11 @@ impl<'a> SparkDeviceLink<'a> {
         self.lane.world_size()
     }
 
+    /// Most rows one wave carries.
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// Plane pointers for the compact reducer.
     pub(crate) fn pointers(&self) -> [*const u16; MAX_INTAKE_RANKS] {
         match &self.written {

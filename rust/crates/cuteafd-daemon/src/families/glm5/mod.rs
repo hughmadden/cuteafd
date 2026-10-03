@@ -340,6 +340,13 @@ impl Opened {
                 engine.attach_peer_l2(budget)?;
             }
         }
+        if let (true, Some(peers)) = (crate::shared::spark_intake::device_exchange_enabled(), args.peers.as_deref()) {
+            let started = Instant::now();
+            let (peers, executors) = ranks(peers)?;
+            engine.attach_device_link(&peers, &executors, config.clone())?;
+            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,
+                "GLM decode and verify waves use the device exchange");
+        }
         let result = body(&engine, transport.as_mut(), &runtime);
         drop(engine);
         drop(transport);

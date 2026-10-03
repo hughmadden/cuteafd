@@ -270,6 +270,12 @@ pub(crate) struct GlmEngine<'a> {
     /// row and 128-K block, the official FP8 release's served numerics); false:
     /// W8A16 (bitwise the former BF16 prefill over dequantized weights).
     pub prefill_w8a8: bool,
+    /// Decode and verify waves through the device-driven Spark exchange
+    /// (`CUTEAFD_SPARK_DEVICE=1`, [`Self::attach_device_link`]): each MoE
+    /// segment publishes its wave, runs the shared expert and waits for the
+    /// partials on the stream; the next segment reduces them. No host wait
+    /// sits between a step's layers.
+    device_link: Option<crate::shared::spark_intake::SparkDeviceLink<'a>>,
     /// This engine's GPU (rank 0 of a head split).
     pub device: i32,
     /// The head split's second GPU and the exchange between the two.
@@ -325,7 +331,8 @@ impl<'a> GlmEngine<'a> {
             prefill_lanes: configured_lanes(),
             lanes: RefCell::new(Vec::new()), full_prefill_logits: false, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             exchange_host: RefCell::new([0.0; 4]),
-            graphs: RefCell::new(std::collections::HashMap::new()), drafter: None, embedding, prefill_w8a8: true })
+            graphs: RefCell::new(std::collections::HashMap::new()), drafter: None, embedding, prefill_w8a8: true,
+            device_link: None })
     }
 
     /// Every layer's latent record pool (656 B per row, 64-row pages) and, on full-indexer
@@ -948,10 +955,12 @@ impl<'a> GlmEngine<'a> {
         let bytes = t * self.cfg.hidden * 2;
         // The decode transport's intake planes (or the skip intake's); the
         // replayed graphs bake them in.
-        let planes = match (experts.as_ref(), &self.skip) {
-            (_, Some(skip)) => skip.pointers(),
-            (Some((transport, _)), None) => transport.intake.pointers(),
-            (None, None) => [std::ptr::null(); 6],
+        let device = self.device_link.as_ref().filter(|_| self.skip.is_none());
+        let planes = match (experts.as_ref(), &self.skip, device) {
+            (_, Some(skip), _) => skip.pointers(),
+            (_, None, Some(link)) => link.pointers(),
+            (Some((transport, _)), None, None) => transport.intake.pointers(),
+            (None, None, None) => [std::ptr::null(); 6],
         };
         // Previous layer's FFN output: none (first layer), in `delta`, or Spark planes.
         let mut previous = Previous::First;
@@ -1020,11 +1029,23 @@ impl<'a> GlmEngine<'a> {
                     }
                     Ok(())
                 } else {
-                    self.moe_front(w, layer, t)
+                    self.moe_front(w, layer, t)?;
+                    match device {
+                        // The wave leaves, the shared expert runs while the Sparks compute,
+                        // the stream waits for the partials (the next segment reduces).
+                        Some(link) => self.device_moe(link, w, index, layer, t),
+                        None => Ok(()),
+                    }
                 }
             };
             let key = GraphKey { layer: index, rows: t, table_width: tables.table_width,
                 table_stride: tables.table_stride, previous, head: head && layer.is_none() };
+            if let (Some(link), Some(layer)) = (device, layer) {
+                if !layer.dense {
+                    // Announced before the replay can publish it: the proxy spins for it.
+                    link.expect(1);
+                }
+            }
             self.replay_on(0, key, segment)?;
             if let Some(w1) = w1 {
                 // Rank 1's segments: layer 0 with rank 0's first, then each next one before
@@ -1045,6 +1066,7 @@ impl<'a> GlmEngine<'a> {
                 None => break,
                 Some(layer) if layer.dense => Previous::Delta,
                 Some(layer) if self.skip.is_some() => Previous::Planes(self.moe_skip(w, index, layer, t, "m64")?),
+                Some(_) if device.is_some() => Previous::Planes(device.map_or(0, |link| link.world_size())),
                 Some(layer) => {
                     let (transport, runtime) = experts.as_mut()
                         .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
@@ -1177,6 +1199,53 @@ impl<'a> GlmEngine<'a> {
         self.moe_front(w, layer, t)?;
         let ranks = self.moe_exchange(w, index, layer, t, cap, decode, transport, runtime)?;
         self.reduce(transport.intake.pointers(), w, ranks, t)
+    }
+
+    /// A decode MoE layer on the device link, queued on the stream: routes,
+    /// gate weights and wire rows out, the shared expert and the next layer's
+    /// L2 prefetch while the Sparks compute, then the wait for the partials.
+    fn device_moe(&self, link: &crate::shared::spark_intake::SparkDeviceLink<'_>, w: &Workspace<'_>, index: usize,
+        layer: &GlmLayer<'_>, t: usize) -> Result<()> {
+        let (h, topk) = (self.cfg.hidden, self.cfg.topk);
+        let sized = |dev: &Dev<'_>, bytes: usize| cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..dev.buffer };
+        // SAFETY: routes and wire rows are complete in stream order (moe_front); the
+        // previous wave on this link was collected and reduced earlier on the stream.
+        unsafe {
+            link.dispatch(index, t, 0, sized(&w.route_ids, t * topk * 4), sized(&w.route_weights, t * topk * 4),
+                sized(&w.wire, t * (h + h / 32)), self.stream)?;
+        }
+        self.ffn(w, layer, self.cfg.moe_intermediate, "m64", w.shared.buffer.ptr, Scalar::I32(t as i32))?;
+        self.prefetch(index)?;
+        // SAFETY: the dispatch above is this wait's wave.
+        unsafe { link.collect(self.stream) }
+    }
+
+    /// Connects the device-driven exchange for decode and verify steps (see
+    /// [`Self::device_link`]), warmed with a full wave of the first MoE layer.
+    pub fn attach_device_link(&mut self, peers: &[std::net::SocketAddr], executors: &[u64],
+        config: cuteafd_transport::TcpTransportConfig) -> Result<()> {
+        let (h, topk, experts, first) = (self.cfg.hidden, self.cfg.topk, self.cfg.experts, self.cfg.first_moe_layer);
+        let warm = spark_request(first, DECODE_ROWS, h, topk, ExpertV2SourceKind::Decode,
+            (0..DECODE_ROWS * topk).map(|i| ExpertProtocolV2RouteEntry { row_index: (i / topk) as u32,
+                expert_id: (i % experts) as u32, gate_weight: 0.0 }).collect(),
+            vec![0u8; DECODE_ROWS * (h + h / 32)].into())?;
+        let build: cuteafd_transport::expert::DeviceBuild = Box::new(move |wave, routes, wire| {
+            spark_request(wave.layer as usize, wave.rows as usize, h, topk, ExpertV2SourceKind::Decode, routes, wire)
+        });
+        self.device_link = Some(crate::shared::spark_intake::SparkDeviceLink::new(self.library, self.device, peers,
+            executors, DECODE_ROWS, topk, h + h / 32, h * 2, config, Some(warm), build)?);
+        Ok(())
+    }
+
+    /// Before a decode step: an earlier device wave's error.
+    pub fn arm_device(&self) -> Result<()> {
+        self.device_link.as_ref().map_or(Ok(()), |link| link.arm())
+    }
+
+    /// After a decode/verify step's results were read: every device wave of it
+    /// succeeded (otherwise the step must be discarded).
+    pub fn check_device(&self) -> Result<()> {
+        self.device_link.as_ref().map_or(Ok(()), |link| link.check())
     }
 
     /// Router scores, the sigmoid top-k selection and the wire rows (device only).
@@ -1678,7 +1747,14 @@ fn expert_request(staged: &[u8], index: usize, t: usize, h: usize, topk: usize, 
     }).collect();
     let mut wire = vec![0u8; wire_bytes];
     copy_parallel(&mut wire, &staged[2 * route_bytes..2 * route_bytes + wire_bytes]);
-    let mut request = ExpertProtocolV2Request::new(index as u64 + 1, 17, index as u32, h as u32,
+    spark_request(index, t, h, topk, kind, routes, wire.into())
+}
+
+/// One Spark request: `t` FP8 K32 wire rows with `topk` routes each, the
+/// compact BF16 partials back (the host and device exchanges send the same).
+fn spark_request(index: usize, t: usize, h: usize, topk: usize, kind: ExpertV2SourceKind,
+    routes: Vec<ExpertProtocolV2RouteEntry>, wire: bytes::Bytes) -> Result<ExpertProtocolV2Request> {
+    let mut request = ExpertProtocolV2Request::new_bytes(index as u64 + 1, 17, index as u32, h as u32,
         ExpertV2Dtype::Fp8E4m3Ue8m0K32,
         (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
             row_id: u64::from(row), source_kind: kind, source_request_id: 1,

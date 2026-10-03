@@ -368,6 +368,26 @@ pub(crate) struct MimoEngine<'a> {
     /// Graphs captured while serving (after [`Self::capture_decode_graphs`]): each is a
     /// shape the startup capture missed.
     late_captures: Cell<usize>,
+    /// Decode and verify waves through the device-driven Spark exchange
+    /// (`CUTEAFD_SPARK_DEVICE=1`, [`Self::attach_device_link`]): the stream
+    /// publishes each wave, waits for its partials and reduces them, with no
+    /// host wait between layers.
+    device_link: Option<crate::shared::spark_intake::SparkDeviceLink<'a>>,
+}
+
+/// One Spark request: `t` rows of `dtype` input with `topk` routes each, the
+/// compact BF16 partials back (the host and device exchanges send the same).
+#[allow(clippy::too_many_arguments)]
+fn spark_request(h: usize, topk: usize, index: usize, t: usize, kind: ExpertV2SourceKind, dtype: ExpertV2Dtype,
+    routes: Vec<ExpertProtocolV2RouteEntry>, wire: bytes::Bytes) -> Result<ExpertProtocolV2Request> {
+    let mut request = ExpertProtocolV2Request::new_bytes(index as u64 + 1, 17, index as u32, h as u32, dtype,
+        (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
+            row_id: u64::from(row), source_kind: kind, source_request_id: 1,
+            token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32,
+        }).collect(),
+        routes, wire)?;
+    request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    Ok(request)
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -441,7 +461,8 @@ impl<'a> MimoEngine<'a> {
             profile: RefCell::new([0.0; 2]),
             wave_timing: std::env::var("CUTEAFD_MIMO_WAVE_TIMING").is_ok_and(|v| v == "1"), drafter: None, mtp: None, l2: None, embedding,
             mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20)?, 0)), prefill_w8a8: true, kv_cache,
-            decode_graphs: false, graphs: RefCell::new(HashMap::new()), late_captures: Cell::new(0) })
+            decode_graphs: false, graphs: RefCell::new(HashMap::new()), late_captures: Cell::new(0),
+            device_link: None })
     }
 
     /// Layer `layer`'s KV storage: the paged record pool (full attention; page `p` holds
@@ -552,6 +573,11 @@ impl<'a> MimoEngine<'a> {
     /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
     pub fn set_experts(&mut self, experts: Experts<'a>) {
         self.experts = Some(experts);
+    }
+
+    /// Whether the routed experts run on Spark ranks.
+    pub fn has_spark_experts(&self) -> bool {
+        matches!(self.experts, Some(Experts::Spark { .. }))
     }
 
     pub fn has_experts(&self) -> bool {
@@ -1131,8 +1157,10 @@ impl<'a> MimoEngine<'a> {
     fn decode_layers(&self, w: &Workspace<'_>, w1: Option<&Workspace<'_>>, tables: &StepTables, t: usize,
         gather: bool, head: bool, launch: bool) -> Result<()> {
         let layers = &self.weights.layers;
-        let planes = match &self.experts {
-            Some(Experts::Spark { transport, .. }) => transport.borrow().intake.pointers(),
+        let device = self.device_wave(true);
+        let planes = match (&self.experts, &self.device_link) {
+            (Some(Experts::Spark { .. }), Some(link)) if device => link.pointers(),
+            (Some(Experts::Spark { transport, .. }), _) => transport.borrow().intake.pointers(),
             _ => [std::ptr::null(); MAX_RANKS],
         };
         let bf16_input = matches!(self.experts, Some(Experts::Spark { .. })) && self.expert_input.bf16(true);
@@ -1140,9 +1168,14 @@ impl<'a> MimoEngine<'a> {
             let previous = self.previous(index);
             let last = index == layers.len();
             let key = GraphKey { layer: index, rows: t, table_stride: tables.table_stride, previous, head: head && last };
+            if let (true, true, Some(link)) = (launch, device && !last && !layers[index].dense, &self.device_link) {
+                // The segment publishes this layer's wave: announced before the replay can.
+                link.expect(1);
+            }
             self.graph(0, key, launch, || self.decode_segment(index, previous, w, w1, tables, t, gather, key.head,
                 planes, bf16_input))?;
-            if let (true, Previous::Planes(_), Some(Experts::Spark { transport, .. })) = (launch, previous, &self.experts) {
+            if let (true, Previous::Planes(_), Some(Experts::Spark { transport, .. }), false) =
+                (launch, previous, &self.experts, device) {
                 // The planes are free for the next wave once the stream passes this segment's reduce.
                 transport.borrow().intake.consumed(self.stream)?;
             }
@@ -1156,7 +1189,8 @@ impl<'a> MimoEngine<'a> {
                     self.peer_segment(index + 1, w1, tables, t, launch)?;
                 }
             }
-            if last || !launch || layers[index].dense {
+            if last || !launch || layers[index].dense || device {
+                if device && launch && !last { crate::shared::console::layer_mark(index); }
                 continue;
             }
             match self.experts.as_ref() {
@@ -1252,9 +1286,14 @@ impl<'a> MimoEngine<'a> {
             Ok(())
         } else {
             self.moe_front(w, layer, t, bf16_input)?;
-            if matches!(self.experts, Some(Experts::Spark { .. })) {
+            match (&self.experts, &self.device_link) {
+                (Some(Experts::Spark { .. }), Some(link)) if self.device_wave(true) => {
+                    // The wave leaves, the stream waits for its partials (the next segment reduces).
+                    self.device_moe(link, w, index, t, bf16_input)?;
+                }
                 // The wave's routes and rows down to the host inside the segment.
-                self.stage_routes(w, t, bf16_input)?;
+                (Some(Experts::Spark { .. }), _) => self.stage_routes(w, t, bf16_input)?,
+                _ => {}
             }
             Ok(())
         }
@@ -1888,6 +1927,19 @@ impl<'a> MimoEngine<'a> {
         let bf16_input = matches!(experts, Experts::Spark { .. }) && self.expert_input.bf16(decode);
         self.moe_front(w, layer, t, bf16_input)?;
         match experts {
+            Experts::Spark { .. } if self.device_wave(decode) => {
+                let link = self.device_link.as_ref().context("device link")?;
+                // Announced before the stream can publish it: the proxy spins for it.
+                link.expect(1);
+                self.device_moe(link, w, index, t, bf16_input)?;
+                // SAFETY: the zero plane and delta are live [t, h] BF16 buffers; the planes
+                // hold the collected wave in stream order.
+                unsafe { link.reduce(w.zero_plane.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream)?; }
+                match forward {
+                    Some(slot) => self.push(0, slot, w.delta.buffer.ptr, t * self.cfg.hidden * 2),
+                    None => Ok(()),
+                }
+            }
             Experts::Spark { transport, runtime, .. } => {
                 self.spark_moe(w, index, t, decode, bf16_input, &mut transport.borrow_mut(), runtime, forward)
             }
@@ -2007,19 +2059,75 @@ impl<'a> MimoEngine<'a> {
             None => staged[2 * route_bytes..2 * route_bytes + wire_bytes].to_vec().into(),
         };
         drop(staging);
-        let mut request = ExpertProtocolV2Request::new_bytes(index as u64 + 1, 17, index as u32, h as u32, dtype,
-            (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
-                row_id: u64::from(row), source_kind: kind, source_request_id: 1,
-                token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32,
-            }).collect(),
-            routes, wire)?;
-        request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+        let request = spark_request(h, topk, index, t, kind, dtype, routes, wire)?;
         let ranks = transport.world_size();
         ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
         let build = built.elapsed().as_secs_f64();
         let timer = std::time::Instant::now();
         let wave = transport.dispatch(&request)?;
         Ok(SentWave { wave: Some(wave), gpu_wait, build, dispatch: timer.elapsed().as_secs_f64(), sent: timer })
+    }
+
+    /// Whether a step's waves go through the device link (decode-shaped steps
+    /// while one is attached; every decode step fits its capacity).
+    fn device_wave(&self, decode: bool) -> bool {
+        decode && self.device_link.is_some()
+    }
+
+    /// A decode wave on the device link, queued on the stream: routes, gate
+    /// weights and input rows out ([`SparkDeviceLink::dispatch`]), the next
+    /// layer's L2 prefetch while the Sparks compute, then the wait for the
+    /// partials in the link's planes (reduced by the caller or the next segment).
+    ///
+    /// [`SparkDeviceLink::dispatch`]: crate::shared::spark_intake::SparkDeviceLink::dispatch
+    fn device_moe(&self, link: &crate::shared::spark_intake::SparkDeviceLink<'_>, w: &Workspace<'_>, index: usize,
+        t: usize, bf16_input: bool) -> Result<()> {
+        let (h, topk) = (self.cfg.hidden, self.cfg.topk);
+        let (input, wire_bytes) = if bf16_input { (&w.x, t * h * 2) } else { (&w.wire, t * (h + h / 32)) };
+        let sized = |dev: &Dev<'_>, bytes: usize| cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..dev.buffer };
+        // SAFETY: routes and input rows are complete in stream order (moe_front ran on
+        // it); the previous wave on this link was collected and reduced earlier on it.
+        unsafe {
+            link.dispatch(index, t, 0, sized(&w.route_ids, t * topk * 4), sized(&w.route_weights, t * topk * 4),
+                sized(input, wire_bytes), self.stream)?;
+        }
+        if let Some(l2) = &self.l2 {
+            l2.issue(self.library, index, self.stream)?;
+        }
+        // SAFETY: the dispatch above is this wait's wave.
+        unsafe { link.collect(self.stream) }
+    }
+
+    /// Connects the device-driven exchange for decode and verify steps (see
+    /// [`Self::device_link`]) to `peers`, warmed with a full wave of the first
+    /// MoE layer.
+    pub fn attach_device_link(&mut self, peers: &[std::net::SocketAddr], executors: &[u64],
+        config: cuteafd_transport::TcpTransportConfig) -> Result<()> {
+        let (h, topk, experts) = (self.cfg.hidden, self.cfg.topk, self.cfg.experts);
+        let bf16 = self.expert_input.bf16(true);
+        let (dtype, row_bytes) = if bf16 { (ExpertV2Dtype::Bf16, 2 * h) } else { (ExpertV2Dtype::Fp8E4m3Ue8m0K32, h + h / 32) };
+        let first = self.weights.layers.iter().position(|l| !l.dense).context("no MoE layer for the device exchange")?;
+        let warm = spark_request(h, topk, first, DECODE_ROWS, ExpertV2SourceKind::Decode, dtype,
+            (0..DECODE_ROWS * topk).map(|i| ExpertProtocolV2RouteEntry { row_index: (i / topk) as u32,
+                expert_id: (i % experts) as u32, gate_weight: 0.0 }).collect(), vec![0u8; DECODE_ROWS * row_bytes].into())?;
+        let build: cuteafd_transport::expert::DeviceBuild = Box::new(move |wave, routes, wire| {
+            spark_request(h, topk, wave.layer as usize, wave.rows as usize, ExpertV2SourceKind::Decode, dtype, routes, wire)
+        });
+        self.device_link = Some(crate::shared::spark_intake::SparkDeviceLink::new(self.library, self.device, peers,
+            executors, DECODE_ROWS, topk, row_bytes, h * 2, config, Some(warm), build)?);
+        Ok(())
+    }
+
+    /// Before a decode step: an earlier device wave's error. After its results
+    /// were read: [`Self::check_device`].
+    pub fn arm_device(&self) -> Result<()> {
+        self.device_link.as_ref().map_or(Ok(()), |link| link.arm())
+    }
+
+    /// After a decode/verify step's results were read: every device wave of it
+    /// succeeded (otherwise the step must be discarded).
+    pub fn check_device(&self) -> Result<()> {
+        self.device_link.as_ref().map_or(Ok(()), |link| link.check())
     }
 
     /// `offset` bytes into the pinned router staging.

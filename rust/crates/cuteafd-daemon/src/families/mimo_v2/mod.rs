@@ -368,6 +368,18 @@ impl Opened {
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
+        if let (true, Some(peers), true) = (crate::shared::spark_intake::device_exchange_enabled(), args.peers.as_deref(),
+            engine.has_spark_experts()) {
+            let started = Instant::now();
+            let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
+            let executors: Vec<u64> = (0..peers.len())
+                .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
+                .collect::<Result<_>>()?;
+            engine.attach_device_link(&peers, &executors, cuteafd_transport::TcpTransportConfig { timing: false,
+                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 })?;
+            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,
+                "MiMo decode and verify waves use the device exchange");
+        }
         let result = body(&engine);
         drop(engine);
         // SAFETY: the engine that used the streams is gone.
