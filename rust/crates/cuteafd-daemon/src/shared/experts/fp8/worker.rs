@@ -67,7 +67,8 @@ impl<'a> Fp8Worker<'a> {
     }
 
     fn execute(&mut self, request: &BackboneRequest<'_>, executor_id: u64, exchange: &mut HostExpertExchange,
-        destination: Option<CuteafdDeviceBuffer>) -> Result<CuteafdDeviceBuffer> {
+        destination: Option<CuteafdDeviceBuffer>, hidden_view: Option<CuteafdDeviceBuffer>)
+        -> Result<CuteafdDeviceBuffer> {
         ensure!(request.layer() as usize == self.experts.layers[self.layer].layer,
             "request does not match the selected FP8 layer");
         ensure!(executor_id == self.executor_id, "FP8 response executor identity mismatch");
@@ -86,8 +87,20 @@ impl<'a> Fp8Worker<'a> {
         let routes = rows * cuteafd_core::expert_geometry().topk as usize;
         request.copy_routes_into(&mut exchange.ids, &mut exchange.routing)?;
         ensure!(cfg!(target_endian = "little"), "native exchange requires little-endian storage");
-        // Every previous response completed this stream before returning.
-        self.library.copy_h2d(self.inputs[0].buffer, request.hidden())?;
+        // Every previous response completed this stream before returning. The
+        // hidden rows come as a device copy from the mapped request frame when
+        // the transport exposes one, else as a host upload.
+        let hidden_bytes = request.hidden().len();
+        match hidden_view.filter(|view| view.bytes >= hidden_bytes) {
+            // SAFETY: the view is device-visible request storage of at least
+            // `hidden_bytes`, retained by the transport until this request's
+            // response is emitted, which follows the stream synchronize below.
+            Some(view) => unsafe {
+                self.library.copy_d2d_async(self.inputs[0].buffer,
+                    CuteafdDeviceBuffer { bytes: hidden_bytes, ..view }, hidden_bytes, self.stream.raw)?
+            },
+            None => self.library.copy_h2d(self.inputs[0].buffer, request.hidden())?,
+        }
         // SAFETY: plain i32/f32 slices of `routes` elements viewed as bytes.
         unsafe {
             self.library.copy_h2d(self.inputs[1].buffer,
@@ -123,7 +136,7 @@ impl<'a> Fp8Worker<'a> {
     /// The transport exclusively owns a GPU-accessible send slot on this device
     /// and retains it through the response send completion.
     pub(crate) unsafe fn execute_mapped_request(&mut self, request: &BackboneRequest<'_>, executor_id: u64,
-        exchange: &mut HostExpertExchange, slot: CuteafdDeviceBuffer)
+        exchange: &mut HostExpertExchange, slot: CuteafdDeviceBuffer, hidden: Option<CuteafdDeviceBuffer>)
         -> Result<Option<ExpertProtocolV2DeviceResponseRef<'static>>> {
         let prefix = EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
         let bytes = request.plane_bytes()?;
@@ -133,7 +146,7 @@ impl<'a> Fp8Worker<'a> {
         ensure!(!slot.ptr.is_null(), "null FP8 response slot");
         let output = CuteafdDeviceBuffer { ptr: slot.ptr.cast::<u8>().add(prefix).cast(), bytes, ..slot };
         let response = request.response_device(executor_id, output)?;
-        self.execute(request, executor_id, exchange, Some(output))?;
+        self.execute(request, executor_id, exchange, Some(output), hidden)?;
         Ok(Some(response))
     }
 
@@ -144,7 +157,7 @@ impl<'a> Fp8Worker<'a> {
     {
         let chunk_rows = request.response_chunk_rows(max_frame_bytes)?;
         ensure!(row_indices.len() >= chunk_rows as usize, "response row-index scratch is too short");
-        self.execute(request, executor_id, exchange, None)?;
+        self.execute(request, executor_id, exchange, None, None)?;
         let stride = cuteafd_core::expert_geometry().row_bytes() as usize;
         for start in (0..request.rows()).step_by(chunk_rows as usize) {
             let end = start.saturating_add(chunk_rows).min(request.rows());
