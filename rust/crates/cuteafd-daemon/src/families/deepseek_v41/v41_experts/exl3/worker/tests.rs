@@ -141,15 +141,15 @@ fn exl3_worker_mapped_and_chunked_responses_match_reference() -> Result<()> {
             ..alias
         };
         assert!(
-            unsafe { worker.execute_mapped_request(&request, 3, &mut exchange, short)? }.is_none()
+            unsafe { worker.execute_mapped_request(&request, 3, &mut exchange, short, None)? }.is_none()
         );
         assert!(host.bytes_mut().iter().all(|&b| b == 0xa5));
         assert!(
-            unsafe { worker.execute_mapped_request(&request, 2, &mut exchange, alias) }.is_err()
+            unsafe { worker.execute_mapped_request(&request, 2, &mut exchange, alias, None) }.is_err()
         );
         assert!(host.bytes_mut().iter().all(|&b| b == 0xa5));
         let response =
-            unsafe { worker.execute_mapped_request(&request, 3, &mut exchange, alias)? }.unwrap();
+            unsafe { worker.execute_mapped_request(&request, 3, &mut exchange, alias, None)? }.unwrap();
         assert_eq!(response.header.executor_id, 3);
         assert_eq!(response.partial_output_payload.bytes, bytes);
         assert!(host.bytes_mut()[..prefix].iter().all(|&b| b == 0xa5));
@@ -165,7 +165,7 @@ fn exl3_worker_mapped_and_chunked_responses_match_reference() -> Result<()> {
         let frame = owned.encode()?;
         let request = BackboneRequest::parse(&frame, 4096)?;
         assert!(
-            unsafe { worker.execute_mapped_request(&request, 3, &mut exchange, alias)? }.is_none()
+            unsafe { worker.execute_mapped_request(&request, 3, &mut exchange, alias, None)? }.is_none()
         );
         let max_frame =
             cuteafd_transport::EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN + 3 * (10240 + 4);
@@ -305,7 +305,7 @@ fn paired_worker_mapped_and_chunked_match_reference() -> Result<()> {
         let mut host = HostAllocation::new(&lib,prefix+expected.len()+64)?;
         host.bytes_mut().fill(0xa5);
         let alias = lib.cuda_host_buffer_device_alias(host.buffer)?;
-        let response = unsafe { worker.execute_mapped_request(&parsed,rank as u64+1,&mut exchange,alias)? }.context("paired mapped response absent")?;
+        let response = unsafe { worker.execute_mapped_request(&parsed,rank as u64+1,&mut exchange,alias,None)? }.context("paired mapped response absent")?;
         assert_eq!(response.header.flags & V41_EXL3_PAIRED_REQUEST_FLAG,0);
         assert_eq!(&host.bytes_mut()[prefix..prefix+expected.len()], expected.as_slice());
         assert!(host.bytes_mut()[..prefix].iter().all(|&v| v==0xa5));
