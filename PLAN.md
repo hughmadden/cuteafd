@@ -553,8 +553,9 @@ retain all rows, and decode/verification keep their full output extent.
 The smaller allocation passes both reference layouts' exact logits/KV checks,
 split-rank cache restores, continuation and serving with speculation on/off.
 Unsupported explicit MiMo head splits now fail before loading, and stream
-cleanup preserves the primary error. Cancelling queued peer waits after a
-failed split-rank submission remains separate open work.
+cleanup preserves the primary error. Failed split-rank submissions now abort
+queued peer waits; teardown releases owners only after proven retirement and
+retains them when completion is unproved.
 MiMo expert scratch, Spark intake and startup negotiation now admit at least
 the full decode/verify extent even when prefill chunks are smaller. The
 narrow-prefill full-model gate matches physical KV/marks, every layer and
@@ -965,8 +966,16 @@ active admission deferral and active KV paging are separate remaining work.
     Private Qwen defaults preserve checkpoint BF16 projections and share the
     target head with MTP. Legacy duplicate-storage options reject before
     native loading until compact all-row/shared-head consumers exist. These
-    changes pass composed workspace/script checks; Qwen model quality,
-    readiness and performance gates remain pending. GLM Flash direct-CLI and
+    changes pass composed workspace/script checks. The one-RTX local EXL3
+    smoke now matches explicit BF16 settings exactly on a saved 64-token
+    prefill/one-token original-reference probe and actual fixed-width MTP
+    serving. The GLM Flash tr3/official-FP8-side smoke also matches explicit
+    checkpoint settings exactly across the full 1524-token target reference,
+    actual DFlash code serving and a forced tool call on one RTX plus two
+    Sparks. Readiness is recorded; these bounded gates do not qualify all
+    layouts, formats, concurrent histories or emitted throughput. Qwen NVFP4
+    with checkpoint-FP8 MTP experts remains explicitly unsupported without
+    its separate expert package. GLM Flash direct-CLI and
     launcher guards reject duplicate-storage options before native loading
     or worker launch; the composed loader, planner and option changes pass
     workspace/script checks. Compact single-copy KDA/head consumers and other
