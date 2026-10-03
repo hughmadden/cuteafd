@@ -36,6 +36,8 @@ impl Space {
 struct Context {
     scopes: Vec<&'static str>,
     tensor: Option<&'static str>,
+    /// The full checkpoint name behind `tensor` (dual-format detection per tensor).
+    name: Option<&'static str>,
     format: Option<&'static str>,
 }
 
@@ -63,6 +65,8 @@ pub struct Key {
 #[derive(Default)]
 struct State {
     live: HashMap<usize, Live>,
+    /// Non-scale formats each full tensor name was uploaded in, per device.
+    formats: BTreeMap<(i32, &'static str), Vec<&'static str>>,
     totals: BTreeMap<Key, (usize, usize)>,
     peak: BTreeMap<(Space, i32), usize>,
     current: BTreeMap<(Space, i32), usize>,
@@ -107,6 +111,7 @@ pub fn scope(label: &'static str) -> Scope {
     CONTEXT.with(|context| {
         let mut context = context.borrow_mut();
         context.scopes.push(label);
+        context.name = None;
         Scope { depth: context.scopes.len(), tensor: context.tensor.take(), format: context.format.take() }
     })
 }
@@ -122,6 +127,7 @@ impl Drop for Scope {
             let mut context = context.borrow_mut();
             context.scopes.truncate(self.depth.saturating_sub(1));
             context.tensor = self.tensor;
+            context.name = None;
             context.format = self.format;
         });
     }
@@ -131,7 +137,12 @@ impl Drop for Scope {
 /// Cleared by the enclosing [`scope`] when it ends.
 pub fn tensor(name: &str) {
     let stem = intern(&tensor_stem(name));
-    CONTEXT.with(|context| context.borrow_mut().tensor = Some(stem));
+    let full = intern(name);
+    CONTEXT.with(|context| {
+        let mut context = context.borrow_mut();
+        context.tensor = Some(stem);
+        context.name = Some(full);
+    });
 }
 
 /// Format guard: allocations on this thread are tagged with this resident
@@ -149,16 +160,16 @@ impl Drop for Format {
     }
 }
 
-fn current_key(space: Space, device: i32) -> Key {
+fn current_key(space: Space, device: i32) -> (Key, Option<&'static str>) {
     CONTEXT.with(|context| {
         let context = context.borrow();
-        Key {
+        (Key {
             space,
             device,
             scope: context.scopes.last().copied().unwrap_or("other"),
             tensor: context.tensor,
             format: context.format,
-        }
+        }, context.name)
     })
 }
 
@@ -166,8 +177,16 @@ pub(crate) fn record_alloc(space: Space, device: i32, ptr: usize, bytes: usize) 
     if ptr == 0 || bytes == 0 {
         return;
     }
-    let key = current_key(space, device);
+    let (key, name) = current_key(space, device);
     let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
+    if let (Some(name), Some(format)) = (name, key.format) {
+        if !format.ends_with("scale") {
+            let formats = state.formats.entry((device, name)).or_default();
+            if !formats.contains(&format) {
+                formats.push(format);
+            }
+        }
+    }
     let total = state.totals.entry(key).or_default();
     total.0 += bytes;
     total.1 += 1;
@@ -237,6 +256,8 @@ pub struct Row {
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     pub rows: Vec<Row>,
+    /// Full tensor names uploaded in more than one non-scale format, per device.
+    pub duals: Vec<(i32, &'static str, Vec<&'static str>)>,
     pub peak: BTreeMap<(Space, i32), usize>,
 }
 
@@ -263,19 +284,10 @@ impl Snapshot {
         out
     }
 
-    /// Tensor stems resident on one device in more than one format (scale
-    /// companions excluded): the dual-residency check.
+    /// Tensors uploaded to one device in more than one format (scale
+    /// companions excluded): the dual-residency check, by full tensor name.
     pub fn dual_formats(&self) -> Vec<(i32, &'static str, Vec<&'static str>)> {
-        let mut formats: BTreeMap<(i32, &'static str), BTreeMap<&'static str, ()>> = BTreeMap::new();
-        for row in &self.rows {
-            if let (Some(tensor), Some(format)) = (row.key.tensor, row.key.format) {
-                if !format.ends_with("scale") {
-                    formats.entry((row.key.device, tensor)).or_default().insert(format, ());
-                }
-            }
-        }
-        formats.into_iter().filter(|(_, f)| f.len() > 1)
-            .map(|((device, tensor), f)| (device, tensor, f.into_keys().collect())).collect()
+        self.duals.clone()
     }
 }
 
@@ -283,6 +295,8 @@ pub fn snapshot() -> Snapshot {
     let state = state().lock().unwrap_or_else(|e| e.into_inner());
     Snapshot {
         rows: state.totals.iter().map(|(&key, &(bytes, allocations))| Row { key, bytes, allocations }).collect(),
+        duals: state.formats.iter().filter(|(_, f)| f.len() > 1)
+            .map(|(&(device, name), formats)| (device, name, formats.clone())).collect(),
         peak: state.peak.clone(),
     }
 }
@@ -344,7 +358,7 @@ mod tests {
         assert_eq!(scopes["test/weights"], 3010);
         assert_eq!(scopes["other"], 5);
         let dual = snap.dual_formats();
-        assert_eq!(dual, vec![(9, "model.layers.*.self_attn.o_proj.weight", vec!["bf16", "fp8"])]);
+        assert_eq!(dual, vec![(9, "model.layers.3.self_attn.o_proj.weight", vec!["fp8", "bf16"])]);
         for ptr in base..base + 4 {
             record_free(ptr);
         }

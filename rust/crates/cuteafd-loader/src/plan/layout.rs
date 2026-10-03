@@ -131,8 +131,21 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
     let mut waste = Vec::new();
     let mut notes = Vec::new();
 
-    // Coordinator weights.
-    for component in report.components.iter().filter(|c| c.owner == Owner::Rtx && c.status != Status::Unused) {
+    // Coordinator weights: a family's exact resident layout where it has one,
+    // else checkpoint bytes per component under the family's conversions.
+    let exact = resident_layout(family, checkpoint, if split { 2 } else { 1 });
+    if let Some(ranks) = &exact {
+        for (device, rank) in devices.iter_mut().zip(ranks) {
+            for (group, format, bytes) in rank {
+                let category = if group == "embedding" { Category::Embedding } else { Category::Weights };
+                device.items.push(Item::new(category, group.clone(), format.clone(), *bytes, Basis::Exact));
+            }
+        }
+    }
+    let covered = |c: Component| exact.is_some() && !matches!(c, Component::Speculator | Component::SpeculatorExpert
+        | Component::Vision | Component::TableProjection);
+    for component in report.components.iter()
+        .filter(|c| c.owner == Owner::Rtx && c.status != Status::Unused && !covered(c.component)) {
         let (resident, format) = match conversions.iter().find(|c| c.component == component.component) {
             Some(c) => (component.bytes.saturating_sub(c.saved_bytes), c.format.to_string()),
             None => ((component.bytes as f64 * costs.resident_factor) as u64,
@@ -266,4 +279,48 @@ fn load_conversions(family: &str, checkpoint: &super::Checkpoint) -> Vec<Convers
         }
         _ => Vec::new(),
     }
+}
+
+/// Exact per-rank resident weights `(group, format, bytes)` for families
+/// whose loader publishes its resident layout (MiMo: the codex capacity
+/// contract's `MimoResidentLayout`, with the default weight policy).
+fn resident_layout(family: &str, checkpoint: &super::Checkpoint, ranks: usize) -> Option<Vec<Vec<(String, String, u64)>>> {
+    use crate::families::mimo_v2::projection::MimoProjectionRepresentation as R;
+    use crate::families::mimo_v2::resident::{MimoResidentLayout, MimoResidentOptions};
+    use crate::families::mimo_v2::weight_policy::{default_policy, MimoDefaultPolicy};
+    if family != "mimo_v2" {
+        return None;
+    }
+    let cfg = crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config).ok()?;
+    let qualified = default_policy(checkpoint, &cfg) == MimoDefaultPolicy::QualifiedProFp8;
+    let source = |name: &str| checkpoint.tensors.iter().find(|t| t.meta.name == name)
+        .map(|t| if t.meta.dtype == cuteafd_core::DType::Bf16 && !qualified { R::Bf16 } else { R::Fp8 });
+    let output_formats = (0..cfg.layers).filter_map(|layer| {
+        let name = format!("model.layers.{layer}.self_attn.o_proj.weight");
+        source(&name).map(|r| (name, r))
+    }).collect();
+    let options = MimoResidentOptions {
+        layers: cfg.layers,
+        coordinator_ranks: ranks,
+        checkpoint_tp: crate::families::mimo_v2::qkv::checkpoint_tp(&checkpoint.snapshot).ok()?,
+        native_mtp_layers: 0,
+        gpu_embedding: true,
+        head_format: source("lm_head.weight").unwrap_or(R::Bf16),
+        output_formats,
+    };
+    let layout = MimoResidentLayout::new(checkpoint, &cfg, &options).ok()?;
+    Some(layout.ranks.iter().map(|rank| {
+        let mut groups: std::collections::BTreeMap<(String, String), u64> = std::collections::BTreeMap::new();
+        for reservation in rank {
+            let name = reservation.name.as_str();
+            let group = if name.contains("embed") { "embedding" } else if name.starts_with("lm_head") { "lm_head" }
+                else if name.contains("mlp.gate") { "router" } else if name.contains("norm") { "norm" }
+                else if name.contains("gate_up") || name.contains(".down") || name.contains("mlp.") { "dense_ffn" }
+                else { "attention" };
+            let format = if name.ends_with(".fp8") { "fp8" } else if name.ends_with("scale") { "fp8-scale" }
+                else if name.ends_with(".bf16") { "bf16" } else { "native" };
+            *groups.entry((group.to_string(), format.to_string())).or_default() += reservation.bytes;
+        }
+        groups.into_iter().map(|((g, f), b)| (g, f, b)).collect()
+    }).collect())
 }
