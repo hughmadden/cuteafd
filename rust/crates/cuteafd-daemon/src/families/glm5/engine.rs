@@ -1689,15 +1689,24 @@ impl<'a> GlmEngine<'a> {
                 &[rows, Scalar::I32(tables.table_width as i32), Scalar::I32(tables.table_stride as i32)])?;
         }
         // Shared-indexer layers read the previous full layer's `indices`.
-        if !tables.decode && native_mla_prefill() {
+        if let (false, Some(kernel)) = (tables.decode, native_mla_prefill()) {
             let scale = ((self.cfg.qk_nope_head_dim + self.cfg.qk_rope_head_dim) as f32).powf(-0.5);
             // SAFETY: query, cache, indices, lengths and the attention output are
             // live buffers of the step's rows on this rank's stream.
             self.on(rank, || unsafe {
                 self.library.glm_mla_prefill(w.query.buffer.ptr, kv.buffer.ptr, w.indices.buffer.ptr,
                     w.lengths.buffer.ptr, w.attn.buffer.ptr, tables.positions.len(), heads,
-                    self.cfg.index_topk, 656, scale * std::f32::consts::LOG2_E, self.stream_of(rank))
+                    self.cfg.index_topk, 656, scale * std::f32::consts::LOG2_E, kernel, self.stream_of(rank))
             })?;
+            if mla_prefill_check() {
+                // SAFETY: as above; the check synchronizes the stream.
+                let stats = self.on(rank, || unsafe {
+                    self.library.glm_mla_prefill_check(w.query.buffer.ptr, kv.buffer.ptr, w.indices.buffer.ptr,
+                        w.lengths.buffer.ptr, tables.positions.len(), heads, self.cfg.index_topk, 656,
+                        scale * std::f32::consts::LOG2_E, self.stream_of(rank))
+                })?;
+                print_mla_check(index, &stats);
+            }
         } else {
             self.run_on(rank, &Self::program(layer, &format!("glm_sparse_mla_{mode}_{cap}")), &[
                 ("q", w.query.buffer.ptr), ("kv_cache", kv.buffer.ptr), ("indices", w.indices.buffer.ptr),
@@ -1763,11 +1772,38 @@ pub(crate) fn tensor_fp8_prefill() -> bool {
     *TENSOR.get_or_init(|| std::env::var("CUTEAFD_GLM_TENSOR_FP8").map_or(true, |v| v != "block"))
 }
 
-/// Prefill sparse MLA on the native F16 kernel (glm_mla_prefill.cu) unless
-/// CUTEAFD_MLA_PREFILL=b12x selects the b12x program.
-pub(crate) fn native_mla_prefill() -> bool {
-    static NATIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *NATIVE.get_or_init(|| std::env::var("CUTEAFD_MLA_PREFILL").map_or(true, |v| v != "b12x"))
+/// Prefill sparse MLA kernel of glm_mla_prefill.cu (its `kernel` argument), or None for the
+/// b12x program: CUTEAFD_MLA_PREFILL=e4m3-p2 (2, the default: E4M3 query, two-term E4M3 P),
+/// e4m3 (1: one-term P), e4m3-q2 (3: two-term query), e4m3-q2p2 (4), f16 (0: the F16 kernel)
+/// or b12x.
+pub(crate) fn native_mla_prefill() -> Option<i32> {
+    static KERNEL: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+    *KERNEL.get_or_init(|| match std::env::var("CUTEAFD_MLA_PREFILL").as_deref() {
+        Ok("b12x") => None,
+        Ok("f16") => Some(0),
+        Ok("e4m3") => Some(1),
+        Ok("e4m3-p2") | Err(_) => Some(2),
+        Ok("e4m3-q2") => Some(3),
+        Ok("e4m3-q2p2") => Some(4),
+        Ok(other) => {
+            tracing::warn!(value = other, "unknown CUTEAFD_MLA_PREFILL; using e4m3-p2");
+            Some(2)
+        }
+    })
+}
+
+/// CUTEAFD_MLA_PREFILL_CHECK=1: after each prefill MLA, run every native kernel on its inputs and
+/// print their differences from the two-term E4M3 kernel (diagnostics; synchronizes, allocates).
+pub(crate) fn mla_prefill_check() -> bool {
+    static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CHECK.get_or_init(|| std::env::var("CUTEAFD_MLA_PREFILL_CHECK").is_ok_and(|v| v == "1"))
+}
+
+pub(crate) fn print_mla_check(layer: usize, stats: &[[f64; 3]; 5]) {
+    let names = ["f16", "e4m3", "e4m3-p2", "e4m3-q2", "e4m3-q2p2"];
+    println!("mla check layer {layer:2} (vs e4m3-q2p2, rms {:.3e}): {}", stats[4][2], (0..4)
+        .map(|k| format!("{} rel {:.2e} max {:.2e}", names[k], stats[k][0], stats[k][1]))
+        .collect::<Vec<_>>().join(" | "));
 }
 
 /// Prefill lanes: CUTEAFD_GLM_PREFILL_LANES (1 = serial), default [`DEFAULT_LANES`].
