@@ -280,7 +280,11 @@ fn worker(
     ensure!(!args.tp2_query_projection || args.rtx_gpus==2,"--tp2-query-projection requires --rtx-gpus 2");
     ensure!(!args.tp2_attention || args.rtx_gpus==2,"--tp2-attention requires --rtx-gpus 2");
     if args.rtx_gpus == 2 { return distributed::worker(args, receive, ready, stats); }
-    let capacity = prefill_capacity(args.prefill_batch_tokens)?;
+    // Local expert waves need an exported AOT capacity; every other row
+    // buffer follows the live prefill chunk (as the dual-RTX path does: the
+    // FP8 plans keep their full scratch). 2048-row chunks: ~9 GiB less.
+    let aot_capacity = prefill_capacity(args.prefill_batch_tokens)?;
+    let capacity = args.prefill_batch_tokens.max(256);
     let rows = capacity as usize;
     let lib = unsafe { NativeLibrary::load(&args.native_lib)? };
     let catalog = cuteafd_loader::read_official_v41_catalog(
@@ -514,9 +518,9 @@ fn worker(
         use crate::families::deepseek_v41::v41_experts::exl3::Exl3Weights;
         let exl3_directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(&args.native_lib, exl3_tiers, "rtx-tp1");
         let compressed = catalog.exl3().is_some();
-        let per_lane = if compressed { LocalExpertWave::exl3_device_bytes(&exl3_directory, capacity)? }
+        let per_lane = if compressed { LocalExpertWave::exl3_device_bytes(&exl3_directory, aot_capacity)? }
             else {
-                LocalExpertWave::device_bytes_for(&lib, capacity, catalog.nvfp4().is_some())?
+                LocalExpertWave::device_bytes_for(&lib, aot_capacity, catalog.nvfp4().is_some())?
             };
         let budgets = (0..40).map(|layer| {
             let selection = ExpertLayer::BackboneFull { layer };
@@ -550,9 +554,9 @@ fn worker(
             }
             let weights = std::rc::Rc::new(loaded);
             transport.install_local(unsafe { LocalExpertWave::new_exl3(&lib, weights.clone(),
-                &exl3_directory, capacity, per_lane)? })?;
+                &exl3_directory, aot_capacity, per_lane)? })?;
             prefill_transport.install_local(unsafe { LocalExpertWave::new_exl3(&lib, weights,
-                &exl3_directory, capacity, per_lane)? })?;
+                &exl3_directory, aot_capacity, per_lane)? })?;
         } else if plan.layers > 0 {
             let mut loaded = Vec::with_capacity(plan.layers);
             for layer in 0..plan.layers {
@@ -560,8 +564,8 @@ fn worker(
                     budgets[layer].peak_device_bytes()?)?);
             }
             let weights = std::rc::Rc::new(loaded);
-            transport.install_local(LocalExpertWave::new(&lib, weights.clone(), capacity, per_lane)?)?;
-            prefill_transport.install_local(LocalExpertWave::new(&lib, weights, capacity, per_lane)?)?;
+            transport.install_local(LocalExpertWave::new(&lib, weights.clone(), aot_capacity, per_lane)?)?;
+            prefill_transport.install_local(LocalExpertWave::new(&lib, weights, aot_capacity, per_lane)?)?;
         }
         tracing::info!(layers=plan.layers, elapsed_ms=local_started.elapsed().as_millis(),
             "local RTX experts ready");

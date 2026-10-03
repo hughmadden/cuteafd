@@ -36,7 +36,10 @@ pub(crate) const PAGE_ROWS: usize = 64;
 /// tables to a power-of-two width of at least [`MIN_TABLE_WIDTH`] pages (or the
 /// whole context): a bounded set of decode graph shapes, all captured at
 /// startup ([`GlmEngine::warm_decode_graphs`]), so serving never captures.
-pub(crate) const ROW_BUCKETS: [usize; 12] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64];
+/// Exact up to 16 rows (one sequence's verify step: no padding at C1), then
+/// in steps of 4 / 8 (padding a batched step costs ~1% per row on the GPU).
+pub(crate) const ROW_BUCKETS: [usize; 24] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 20, 24, 28, 32, 40,
+    48, 56, 64];
 const MIN_TABLE_WIDTH: usize = 16;
 /// Statuses follow the ids in a decode workspace's `select` buffer at a fixed offset.
 const SELECT_STATUS_OFFSET: usize = DECODE_ROWS * 4;
@@ -760,6 +763,8 @@ impl<'a> GlmEngine<'a> {
     /// the Sparks), so no request captures. Returns the graph count.
     pub fn warm_decode_graphs(&self, mut experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>) -> Result<usize> {
         let started = std::time::Instant::now();
+        let free = |rank: usize| self.on(rank, || self.library.cuda_memory_info().map(|(free, _)| free as i64));
+        let before: Vec<i64> = (0..self.ranks()).map(free).collect::<Result<_>>()?;
         for width in self.table_width_buckets() {
             for bucket in ROW_BUCKETS {
                 let mut tables = StepTables { decode: true, positions: Vec::new(), slots: Vec::new(),
@@ -777,7 +782,8 @@ impl<'a> GlmEngine<'a> {
             self.on(1, || unsafe { self.library.cuda_stream_synchronize(stream) })?;
         }
         let graphs = self.graphs.borrow().len() + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
-        tracing::info!(graphs, widths = ?self.table_width_buckets(), rows = ?ROW_BUCKETS,
+        let bytes: Vec<i64> = (0..self.ranks()).map(|rank| Ok(before[rank] - free(rank)?)).collect::<Result<_>>()?;
+        tracing::info!(graphs, ?bytes, widths = ?self.table_width_buckets(), rows = ?ROW_BUCKETS,
             elapsed_ms = started.elapsed().as_millis() as u64, "GLM decode graphs captured at startup");
         Ok(graphs)
     }
