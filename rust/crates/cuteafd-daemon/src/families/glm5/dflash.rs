@@ -280,11 +280,14 @@ pub(crate) struct ContextRow {
 }
 
 /// The drafted tokens after one anchor and the selector's per-token
-/// features (margin, best probability, entropy, rank among the 16).
+/// features (margin, best probability, entropy, rank among the 16); a dSpark
+/// draft has no selector and carries its confidence head's predicted
+/// acceptance per token instead (empty for DFlash2).
 #[derive(Debug, Clone)]
 pub(crate) struct Draft {
     pub tokens: Vec<u32>,
     pub features: Vec<[f32; 4]>,
+    pub confidence: Vec<f32>,
 }
 
 /// FP32 logits `[rows, vocab]` of BF16 rows `[rows, hidden]` on a stream: `(x, logits, rows, stream)`.
@@ -880,6 +883,7 @@ impl<'a> GlmDrafter<'a> {
                 let n = (i * c.drafts() + j) * 4;
                 [0, 1, 2, 3].map(|k| f32::from_bits(word(&features, n + k)))
             }).collect(),
+            confidence: Vec::new(),
         }).collect())
     }
 
@@ -912,6 +916,10 @@ impl<'a> GlmDrafter<'a> {
 /// What [`replay`] needs of a block drafter (GLM DFlash2, MiMo DFlash).
 pub(crate) trait ReplayDrafter {
     fn block(&self) -> usize;
+    /// Tokens one draft proposes (DFlash: the block's mask rows).
+    fn drafts(&self) -> usize {
+        self.block() - 1
+    }
     /// Sequences a draft step takes (and ring slots).
     fn sequences(&self) -> usize;
     /// Legacy dual-format implementations may retain their diagnostic arms.
@@ -944,7 +952,7 @@ pub(crate) struct ReplayMode {
     pub legacy_fp8: Option<bool>,
 }
 
-fn activate_replay_mode(drafter: &impl ReplayDrafter, mode: ReplayMode) {
+fn activate_replay_mode(drafter: &(impl ReplayDrafter + ?Sized), mode: ReplayMode) {
     if let Some(on) = mode.legacy_fp8 { drafter.set_fp8(on); }
 }
 
@@ -988,10 +996,10 @@ impl ReplayDrafter for GlmDrafter<'_> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn replay(drafter: &impl ReplayDrafter, tokens: &[u32], greedy: &[u32],
+pub(crate) fn replay(drafter: &(impl ReplayDrafter + ?Sized), tokens: &[u32], greedy: &[u32],
     taps: &dyn Fn(usize, usize) -> Result<Vec<u8>>, embed: &dyn Fn(&[u32]) -> Result<Vec<u8>>, head: *const c_void,
     start: usize) -> Result<()> {
-    let (block, drafts) = (drafter.block(), drafter.block() - 1);
+    let (block, drafts) = (drafter.block(), drafter.drafts());
     ensure!(tokens.len() > start + block && greedy.len() >= tokens.len(), "replay needs more than {} tokens", start + block);
     let anchors: Vec<usize> = (start..tokens.len() - block).collect();
     let modes = drafter.resident_modes();

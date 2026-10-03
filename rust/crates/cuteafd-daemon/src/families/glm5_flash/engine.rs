@@ -409,8 +409,8 @@ pub(crate) struct GlmfEngine<'a> {
     kda_replay: Dev<'a>,
     /// `glmf_kda_commit` tables (slot, first row, kept rows per sequence).
     commit_tables: Dev<'a>,
-    /// The DFlash2 drafter: every step taps its target layers.
-    pub drafter: Option<crate::families::glm5::dflash::GlmDrafter<'a>>,
+    /// The drafter (DFlash2 or dSpark): every step taps its target layers.
+    pub drafter: Option<super::dspark::Drafter<'a>>,
     /// L2 prefetch of the next layer's weights during decode exchanges.
     pub l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
     /// Per MLA layer (None for KDA): per-token indexer keys | gates (BF16

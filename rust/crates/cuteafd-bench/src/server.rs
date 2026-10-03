@@ -177,7 +177,8 @@ fn speculator(family: Option<&str>, settings: &[Setting]) -> Option<String> {
     }
     if let Some(draft) = setting(settings, &["draft"]).filter(|v| *v != "false") {
         let name = Path::new(draft).file_name().and_then(|n| n.to_str()).unwrap_or(draft);
-        return Some(if draft == "true" { "draft model".into() } else { format!("DFlash2 ({name})") });
+        let kind = if draft.to_ascii_lowercase().contains("dspark") { "dSpark" } else { "DFlash2" };
+        return Some(if draft == "true" { "draft model".into() } else { format!("{kind} ({name})") });
     }
     let mtp = number(&["mtp"]);
     if mtp > 0 {
@@ -288,6 +289,9 @@ mod tests {
         assert_eq!(speculator(Some("qwen4"), &[s("mtp", "3", Some("0"), "cli")]).as_deref(), Some("MTP ×3"));
         assert_eq!(speculator(Some("glm5"), &[s("draft", "/hf/GLM-5.3-DFlash2", None, "cli")]).as_deref(),
             Some("DFlash2 (GLM-5.3-DFlash2)"));
+        assert_eq!(speculator(Some("glm5_flash"), &[s("draft",
+            "/hf/models--RedHatAI--GLM-5.3-Flash-speculator.dspark-preview/snapshots/1972f1f0", None, "cli")]).as_deref(),
+            Some("dSpark (1972f1f0)"));
         assert_eq!(speculator(Some("qwen4"), &[s("no-copy-drafts", "true", Some("false"), "cli")]), None);
         assert_eq!(speculator(Some("mimo_v2"), &[]), None);
     }

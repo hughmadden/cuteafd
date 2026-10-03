@@ -22,9 +22,21 @@ Attention (KDA), a minority run MLA + DSA.
 - Routed experts: top-8 of 288 sigmoid experts with a SwiGLU clamp of 10;
   FP8 128x128 blocks, EXL3 K3/K4, or ModelOpt NVFP4 group-16. GLM 5.3 Flash
   is the only GLM family with a local (RTX-resident, TP1) expert path.
-- Speculator: the native MTP layer is not run — DFlash2 external drafters
-  verify copy-window drafts, with KDA state backed up and replayed per
-  verify step (there is no free rollback for recurrent state).
+- Speculator: the native MTP layer is not run. External drafters: DFlash2
+  (incoai/GLM-5.3-Flash-DFlash2, the default for every checkpoint) or the
+  RedHat dSpark (`SPECULATOR=dspark`, RedHatAI/GLM-5.3-Flash-speculator.dspark-preview:
+  eight drafts per block, Markov and confidence heads); KDA state is backed
+  up and replayed per verify step (there is no free rollback for recurrent
+  state). DFlash2 vs dSpark, emitted tok/s, C1 / C4 code / agentic C1:
+
+  | checkpoint | layout | DFlash2 | dSpark | no drafter |
+  | --- | --- | --- | --- | --- |
+  | EXL3 K3.25 | 1 RTX + 2 Sparks | 110.8 / 292 / 100.1 | 101.8 / 275 / 76.6 | 60.7 / 192 / 63.4 |
+  | EXL3 K3.25 | 2 RTX + 4 Sparks | 167.4 / 322 / 153.7 | 146.8 / 346 / 100.3 | 82.0 / 287 / 85.9 |
+  | NVIDIA NVFP4 | 1 RTX + 2 Sparks | 87.3 / 231 / 77.7 | 69.1 / 190 / 57.4 | 52.8 / 200 / 54.4 |
+  | NVIDIA NVFP4 | 2 RTX + 4 Sparks | 117.3 / 415 / 131.1 | 118.2 / 347 / 91.3 | 74.8 / 232 / 79.1 |
+  | tr3 4bpw | 1 RTX + 2 Sparks | 99.0 / 212 / 86.8 | 71.4 / 269 / 65.2 | 56.1 / 173 / 58.1 |
+  | tr3 4bpw | 2 RTX + 4 Sparks | 149.6 / 435 / 131.0 | 132.0 / 407 / 87.2 | 78.3 / 280 / 81.5 |
 - Dense NVFP4 MLPs run natively on a ModelOpt release; its per-tensor FP8
   dense MLPs prefill as static W8A8 on their own scales; BF16 attention,
   indexer and shared experts quantize to FP8 blocks at load by default

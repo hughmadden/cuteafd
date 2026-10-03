@@ -57,6 +57,34 @@ pub(crate) fn confidence(history: &DraftHistory, features: &[[f32; 4]]) -> Vec<f
     calibrated_confidence(&rates, features).unwrap_or(rates)
 }
 
+/// Weight of a dSpark confidence head's prediction against the sequence's
+/// history rate, in logit space (`CUTEAFD_DSPARK_HEAD_WEIGHT`, default 0.75).
+fn head_weight() -> f64 {
+    static WEIGHT: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *WEIGHT.get_or_init(|| std::env::var("CUTEAFD_DSPARK_HEAD_WEIGHT").ok().and_then(|v| v.parse().ok())
+        .filter(|w: &f64| (0.0..=1.0).contains(w)).unwrap_or(0.75))
+}
+
+/// Conditional acceptance per position from a dSpark confidence head (the
+/// predicted acceptance of each drafted token given the ones before it),
+/// blended in logit space with the history rate.
+pub(crate) fn head_confidence(history: &DraftHistory, head: &[f32]) -> Vec<f64> {
+    let rates = history.conditional(head.len());
+    let logit = |p: f64| {
+        let p = p.clamp(1e-4, 1.0 - 1e-4);
+        (p / (1.0 - p)).ln()
+    };
+    let w = head_weight();
+    head.iter().zip(rates).map(|(&c, rate)| {
+        let c = f64::from(c);
+        if !c.is_finite() {
+            return rate;
+        }
+        let z = w * logit(c) + (1.0 - w) * logit(rate);
+        1.0 / (1.0 + (-z).exp())
+    }).collect()
+}
+
 /// Table-scale cost of a row whose routes an identical row already reads
 /// (4 identical sequences: 46 ms plain vs 35.6 ms for one).
 const DUPLICATE_ROW_MS: f64 = 3.5;
@@ -77,6 +105,8 @@ pub(crate) struct PlanInput<'h> {
     pub history: &'h DraftHistory,
     /// Selector features of the sequence's DFlash2 draft (None: no draft).
     pub features: Option<&'h [[f32; 4]]>,
+    /// A dSpark draft's confidence head per token (replaces the features).
+    pub confidence: Option<&'h [f32]>,
     /// Most drafts the sequence may verify this step.
     pub limit: usize,
 }
@@ -103,11 +133,18 @@ pub(crate) fn plan_counts(inputs: &[PlanInput<'_>], fixed: Option<usize>, cost: 
             None => members.push(vec![i]),
         }
     }
-    let groups: Vec<Group<'_>> = members.iter().map(|m| Group {
-        history: inputs[m[0]].history,
-        confidence: confidence(inputs[m[0]].history, inputs[m[0]].features.unwrap_or(&[])),
-        room: m.iter().map(|&i| inputs[i].limit).min().unwrap_or(0),
-        members: m.len(),
+    let groups: Vec<Group<'_>> = members.iter().map(|m| {
+        let input = &inputs[m[0]];
+        Group {
+            history: input.history,
+            confidence: match input.confidence {
+                Some(head) => head_confidence(input.history, head),
+                None => confidence(input.history, input.features.unwrap_or(&[])),
+            },
+            room: m.iter().map(|&i| inputs[i].limit).min().unwrap_or(0),
+            members: m.len(),
+            informed: input.confidence.is_some(),
+        }
     }).collect();
     let others: Vec<_> = inputs.iter().filter(|i| i.features.is_none()).map(|i| i.key).collect();
     let distinct = others.iter().collect::<std::collections::HashSet<_>>().len();
@@ -156,6 +193,9 @@ pub(crate) struct Group<'h> {
     /// Most drafts the group may verify.
     pub room: usize,
     pub members: usize,
+    /// The confidence comes from a trained head (dSpark): no cold-start
+    /// minimum and no five-draft reference.
+    pub informed: bool,
 }
 
 /// The draft count of every group (`base`: rows and distinct rows of the
@@ -165,11 +205,12 @@ pub(crate) fn plan(groups: &[Group<'_>], base: (usize, usize), cost: &CycleCost)
     let base = Base { rows: base.0, distinct: base.1 };
     let core: Vec<draft_policy::Group> = groups.iter().map(|g| {
         let confidence = g.confidence[..g.confidence.len().min(g.room)].to_vec();
-        let minimum = if g.history.cold() { START_DRAFTS.min(confidence.len()) } else { 0 };
+        let minimum = if g.history.cold() && !g.informed { START_DRAFTS.min(confidence.len()) } else { 0 };
         draft_policy::Group { confidence, members: g.members, minimum }
     }).collect();
     let (lengths, rate) = draft_policy::allocate(&core, base, Drafter::Block, cost);
-    if groups.len() == 1 && groups[0].members == 1 && base.rows == 0 && !groups[0].history.cold() {
+    if groups.len() == 1 && groups[0].members == 1 && base.rows == 0 && !groups[0].history.cold()
+        && !groups[0].informed {
         // The reference is exactly START_DRAFTS drafts (glmrt prices K5 alone):
         // a reference free to extend past them would equal any longer best
         // plan and cap every warm sequence at five.
@@ -212,7 +253,7 @@ mod tests {
     }
 
     fn group<'h>(history: &'h DraftHistory, rate: f64, members: usize) -> Group<'h> {
-        Group { history, confidence: vec![rate; 7], room: 7, members }
+        Group { history, confidence: vec![rate; 7], room: 7, members, informed: false }
     }
 
     fn warm(proposed: usize, accepted: usize) -> DraftHistory {
@@ -265,6 +306,19 @@ mod tests {
         let ms = |rows, distinct, sequences| cost.cycle_ms(Shape { rows, distinct, sequences }, 0, true);
         assert!((ms(4, 1, 4) - ms(1, 1, 1) - 3.0 * DUPLICATE_ROW_MS).abs() < 1e-9);
         assert!(ms(4, 4, 4) > ms(4, 1, 4) + 20.0);
+    }
+
+    #[test]
+    fn dspark_head_confidence_drives_cold_plans() {
+        let cost = step_cost(&K4_TP4_STEP_MS, 64);
+        let cold = DraftHistory::default();
+        let head = |c: f32| head_confidence(&cold, &[c; 8]);
+        // The head moves the prior (3 in 4) toward its prediction.
+        assert!(head(0.95)[0] > 0.9 && head(0.05)[0] < 0.2);
+        let informed = |c: f32| Group { history: &cold, confidence: head(c), room: 8, members: 1, informed: true };
+        // No five-draft cold start: a confident head verifies more, a doubtful one none.
+        assert_eq!(plan(&[informed(0.05)], (0, 0), &cost), vec![0]);
+        assert!(plan(&[informed(0.97)], (0, 0), &cost)[0] >= 6);
     }
 
     #[test]
