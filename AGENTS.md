@@ -7,6 +7,10 @@ after tables with conditions.
 
 ## Working method
 
+- Waiting costs tokens, sleeping doesn't: start a long run as one background
+  command that blocks until it finishes (a lock wait or a loop sleeping ≥60 s)
+  and let its completion wake you. Don't poll status or tail logs in between;
+  never keep a wait loop alive after you stop needing its result.
 - Parallelize: run independent feature work as separate agents in separate
   git worktrees, one branch per task, on disjoint hardware where the work
   needs a GPU. Serialize only what shares a GPU or a build cache.
@@ -111,10 +115,7 @@ after tables with conditions.
   `CARGO_TARGET_DIR=~/.cache/cuteafd/builds/<task>/target` (no Python
   needed). Script tests: `.venv/bin/python -m pytest -q scripts/tests`
   (`uv venv --python 3.12 .venv` + pytest numpy tokenizers jsonschema pyyaml);
-  On `codex/v1` (2026-10-02), there are no failing script-test ids:
-  763 tests and 190 subtests pass, with 2 skips. The inherited launcher
-  fixtures now follow the current image pair and positional contracts;
-  the semantic-quality source lock no longer requires a sibling checkout.
+  no failing ids since the codex/v1 merge (808 pass); add none.
 - `./build.sh` (release pair, coordinator + Spark leg): set
   `CUTEAFD_RELEASE_BUILD_ROOT` and `CUTEAFD_RELEASE_REMOTE_BUILD_DIR` under
   `~/.cache/cuteafd/builds/`, and `CUTEAFD_RELEASE_SPARK_TP_ROLES=` for a
