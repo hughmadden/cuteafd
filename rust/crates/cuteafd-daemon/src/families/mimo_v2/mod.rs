@@ -348,7 +348,7 @@ mod source_format_tests {
     fn qualified_default_matches_explicit_fp8_bundle_in_a_renamed_local_copy() {
         let (_directory, mut args, checkpoint, cfg) = qualified_fixture();
         let automatic = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
-        assert_eq!(automatic.default_policy, MimoDefaultPolicy::QualifiedProFp8);
+        assert_eq!(automatic.default_policy, MimoDefaultPolicy::Fp8);
         assert_eq!(automatic.head, MimoProjectionRepresentation::Fp8);
         assert_eq!(automatic.draft, MimoDraftRepresentation::Fp8Only);
         assert_eq!(automatic.output.len(), 70);
@@ -389,7 +389,7 @@ mod source_format_tests {
         args.draft = Some(external.path().into());
         let selected = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
         assert_eq!(selected.head, MimoProjectionRepresentation::Fp8);
-        assert_eq!(selected.draft, MimoDraftRepresentation::Bf16Only);
+        assert_eq!(selected.draft, MimoDraftRepresentation::Fp8Only);
     }
 
     #[test]
@@ -412,14 +412,15 @@ mod source_format_tests {
         checkpoint.tensors.sort_by(|a,b| a.meta.name.cmp(&b.meta.name));
         let selected = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
         assert_eq!(selected.draft, MimoDraftRepresentation::Fp8Only);
-        assert_eq!(selected.output["model.mtp.layers.0.self_attn.o_proj.weight"], MimoProjectionRepresentation::Bf16);
-        assert_eq!(selected.output.values().filter(|&&format| format == MimoProjectionRepresentation::Fp8).count(), 70);
+        assert_eq!(selected.output["model.mtp.layers.0.self_attn.o_proj.weight"], MimoProjectionRepresentation::Fp8);
+        assert_eq!(selected.output.values().filter(|&&format| format == MimoProjectionRepresentation::Fp8).count(), 71);
     }
 
     #[test]
-    fn changed_model_config_retains_source_formats_despite_pro_geometry() {
+    fn unaligned_head_retains_source_formats() {
         let (_directory, args, mut checkpoint, cfg) = qualified_fixture();
-        checkpoint.config["attention_value_scale"] = serde_json::json!(0.5);
+        let at = checkpoint.tensors.iter().position(|t| t.meta.name == "lm_head.weight").unwrap();
+        checkpoint.tensors[at].meta.shape[1] = 6100;
         let selected = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
         assert_eq!(selected.default_policy, MimoDefaultPolicy::Checkpoint);
         assert_eq!((selected.head, selected.draft), (MimoProjectionRepresentation::Bf16, MimoDraftRepresentation::Bf16Only));
@@ -637,16 +638,14 @@ fn resolve_weight_formats(args: &EngineArgs, checkpoint: &Checkpoint, cfg: &Mimo
     let default_policy = if args.weight_policy == WeightPolicyArg::Checkpoint {
         MimoDefaultPolicy::Checkpoint
     } else { weight_policy::default_policy(checkpoint, cfg) };
-    let default_fp8 = (default_policy == MimoDefaultPolicy::QualifiedProFp8).then_some(true);
+    let default_fp8 = (default_policy == MimoDefaultPolicy::Fp8).then_some(true);
     let head = projection_source(checkpoint, "lm_head.weight", args.fp8_head.or(default_fp8))?;
     let names = (0..args.layers.unwrap_or(cfg.layers).min(cfg.layers))
         .map(|layer| format!("model.layers.{layer}.self_attn.o_proj.weight"))
         .chain((0..args.mtp).map(|layer| format!("model.mtp.layers.{layer}.self_attn.o_proj.weight")));
     let mut output = std::collections::BTreeMap::new();
     for name in names {
-        // The measured exception covers target O matrices, not unqualified MTP.
-        let default = if name.starts_with("model.layers.") { default_fp8 } else { None };
-        let selected = projection_source(checkpoint, &name, args.fp8_o_proj.or(default))?;
+        let selected = projection_source(checkpoint, &name, args.fp8_o_proj.or(default_fp8))?;
         ensure!(args.split_device.is_none() || name.starts_with("model.mtp.") || selected != MimoProjectionRepresentation::Bf16
             || checkpoint.tensors.iter().find(|t| t.meta.name == name)
                 .is_some_and(|t| t.meta.dtype == cuteafd_core::DType::Bf16),
@@ -678,21 +677,12 @@ fn resolve_weight_formats(args: &EngineArgs, checkpoint: &Checkpoint, cfg: &Mimo
         args.draft_storage()?;
         native_draft.unwrap_or(MimoDraftRepresentation::Bf16Only)
     } else if args.draft_representation.is_none() && args.draft_fp8.is_none() {
-        let qualified_embedded = if default_fp8.is_some() {
-            args.draft.as_deref().map(dflash::drafter_dir)
-                .filter(|dir| {
-                    let embedded = checkpoint.snapshot.join("dflash");
-                    *dir == embedded || matches!((dir.canonicalize(), embedded.canonicalize()),
-                        (Ok(actual), Ok(expected)) if actual == expected)
-                })
-                .map(|dir| -> Result<bool> {
-                    let config = cuteafd_loader::plan::checkpoint::read_json(&dir.join("config.json"))?;
-                    let headers = cuteafd_loader::read_safetensors_metadata(&dir.join("dflash_draft_model.safetensors"))?;
-                    Ok(weight_policy::qualified_draft(&config, &headers))
-                }).transpose()?.unwrap_or(false)
-        } else { false };
-        if qualified_embedded { MimoDraftRepresentation::Fp8Only }
-        else { native_draft.unwrap_or(MimoDraftRepresentation::Bf16Only) }
+        // Drafter precision cannot change committed tokens; FP8 drafts are faster
+        // (measured with the target default above), so BF16 drafters convert.
+        match native_draft.unwrap_or(MimoDraftRepresentation::Bf16Only) {
+            MimoDraftRepresentation::Bf16Only if default_fp8.is_some() => MimoDraftRepresentation::Fp8Only,
+            native => native,
+        }
     } else { args.draft_storage()? };
     Ok(ResolvedWeightFormats { default_policy, head, output, draft })
 }

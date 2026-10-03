@@ -1,21 +1,15 @@
-//! Measured single-copy defaults for the qualified MiMo V2.6 Pro checkpoint.
-//! Signatures identify config/header metadata, not the tensor payload. Local
-//! copies keep the policy regardless of directory names; explicit selections
-//! still take precedence. Other checkpoints retain their source formats.
-use crate::{plan::checkpoint::Checkpoint, SafetensorsTensorMetadata};
-use cuteafd_core::DType;
-use serde_json::Value;
-use sha2::{Digest, Sha256};
+//! Measured single-copy defaults for MiMo checkpoints (2026-10-03, one RTX at
+//! the natural minimum, checkpoint -> FP8): V2 Flash C4 code 108.5 -> 125.1 tok/s,
+//! KL 0.103 -> 0.092; V2.6 Pro C4 71.5 -> 87.3, KL 0.026 -> 0.028. The target head
+//! and attention O projections and a BF16 DFlash drafter convert to E4M3 at
+//! load into their only resident copy; native FP8 QKV/FFN are unchanged.
+//! `--weight-policy checkpoint` and explicit per-weight options take precedence.
+use crate::plan::checkpoint::Checkpoint;
 use super::MimoV2Config;
 use super::projection::{MimoProjectionLayout, MimoProjectionLayoutError, MimoProjectionRepresentation};
 
-const TARGET_CONFIG: &str = "e274f898974f0b13a170e33c5328a82e15e5ce2829ae95ebfc7b23c8ffc8a013";
-const TARGET_HEADERS: &str = "d8bcb52b6c216dca96330d0e36614922659b50a701174ddcdd94b2fbc07cf4fc";
-const DRAFT_CONFIG: &str = "c5327fcee7e0b697f0a2eae787041a3f31ad2ce53ab946a90a0ffe38cf040abb";
-const DRAFT_HEADERS: &str = "0531c3f3ee7db347013884d58270f7065d400613598b1e6ab4915f7aaa2886c7";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MimoDefaultPolicy { Checkpoint, QualifiedProFp8 }
+pub enum MimoDefaultPolicy { Checkpoint, Fp8 }
 
 /// Aggregate physical head/O storage across coordinator ranks; this does not
 /// include other target weights, optional drafters, workspaces or caches.
@@ -48,84 +42,28 @@ pub fn qualified_projection_memory(cfg: &MimoV2Config) -> Result<QualifiedProjec
     })
 }
 
-fn string(hash: &mut Sha256, text: &str) {
-    hash.update((text.len() as u64).to_le_bytes());
-    hash.update(text.as_bytes());
-}
-
-// Numeric values use their IEEE representation, independent of JSON spelling;
-// object keys are sorted so serializer formatting/order never changes identity.
-fn canonical(hash: &mut Sha256, value: &Value) {
-    match value {
-        Value::Null => hash.update(b"0"),
-        Value::Bool(value) => hash.update(if *value { b"t" } else { b"f" }),
-        Value::Number(value) => {
-            hash.update(b"n");
-            hash.update(value.as_f64().expect("JSON number has an f64 representation").to_le_bytes());
-        }
-        Value::String(value) => { hash.update(b"s"); string(hash, value); }
-        Value::Array(values) => {
-            hash.update(b"a"); hash.update((values.len() as u64).to_le_bytes());
-            for value in values { canonical(hash, value); }
-        }
-        Value::Object(values) => {
-            hash.update(b"o"); hash.update((values.len() as u64).to_le_bytes());
-            let mut keys: Vec<_> = values.keys().collect(); keys.sort();
-            for key in keys { string(hash, key); canonical(hash, &values[key]); }
-        }
-    }
-}
-
-fn config_signature(value: &Value) -> String {
-    let mut hash = Sha256::new(); hash.update(b"mimo-qualified-config-v1");
-    canonical(&mut hash, value); format!("{:x}", hash.finalize())
-}
-
-fn header_signature<'a>(headers: impl IntoIterator<Item = &'a SafetensorsTensorMetadata>) -> String {
-    let mut headers: Vec<_> = headers.into_iter().collect();
-    headers.sort_by(|a, b| a.name.cmp(&b.name));
-    let mut hash = Sha256::new(); hash.update(b"mimo-qualified-headers-v1");
-    for header in headers {
-        string(&mut hash, &header.name); string(&mut hash, &format!("{:?}", header.dtype));
-        hash.update((header.shape.len() as u64).to_le_bytes());
-        for &dimension in &header.shape { hash.update((dimension as u64).to_le_bytes()); }
-    }
-    format!("{:x}", hash.finalize())
-}
-
+/// FP8 when every target head/O matrix has a 128-wide K grid (the single-copy
+/// FP8 consumers' layout); otherwise the checkpoint formats.
 pub fn default_policy(checkpoint: &Checkpoint, cfg: &MimoV2Config) -> MimoDefaultPolicy {
-    if (cfg.layers, cfg.hidden, cfg.heads, cfg.full_kv_heads, cfg.swa_kv_heads,
-        cfg.head_dim, cfg.v_head_dim, cfg.experts, cfg.topk, cfg.moe_intermediate, cfg.vocab_size)
-        != (70, 6144, 128, 8, 8, 192, 128, 384, 8, 2048, 152576)
-        || config_signature(&checkpoint.config) != TARGET_CONFIG {
-        return MimoDefaultPolicy::Checkpoint;
-    }
-    let mut selected = Vec::with_capacity(71);
-    for name in std::iter::once("lm_head.weight".to_string())
-        .chain((0..70).map(|layer| format!("model.layers.{layer}.self_attn.o_proj.weight"))) {
+    let names = std::iter::once("lm_head.weight".to_string())
+        .chain((0..cfg.layers).map(|layer| format!("model.layers.{layer}.self_attn.o_proj.weight")));
+    for name in names {
         let Ok(index) = checkpoint.tensors.binary_search_by(|tensor| tensor.meta.name.cmp(&name)) else {
             return MimoDefaultPolicy::Checkpoint;
         };
-        let tensor = &checkpoint.tensors[index].meta;
-        if tensor.dtype != DType::Bf16 { return MimoDefaultPolicy::Checkpoint; }
-        selected.push(tensor);
+        let shape = &checkpoint.tensors[index].meta.shape;
+        if shape.len() != 2 || shape[1] % 128 != 0 { return MimoDefaultPolicy::Checkpoint; }
     }
-    if header_signature(selected) == TARGET_HEADERS {
-        MimoDefaultPolicy::QualifiedProFp8
-    } else { MimoDefaultPolicy::Checkpoint }
-}
-
-/// Only the embedded drafter's exact qualified config and source headers get
-/// the automatic FP8 representation. An external drafter remains independent.
-pub fn qualified_draft(config: &Value, headers: &[SafetensorsTensorMetadata]) -> bool {
-    headers.len() == 63 && headers.iter().all(|tensor| tensor.dtype == DType::Bf16)
-        && config_signature(config) == DRAFT_CONFIG && header_signature(headers) == DRAFT_HEADERS
+    MimoDefaultPolicy::Fp8
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::plan::checkpoint::CheckpointTensor;
+    use crate::SafetensorsTensorMetadata;
+    use cuteafd_core::DType;
+    use serde_json::Value;
 
     pub fn fixture(snapshot: &str) -> (Checkpoint, MimoV2Config, Value, Vec<SafetensorsTensorMetadata>) {
         let value: Value = serde_json::from_str(include_str!("../../../tests/fixtures/mimo-qualified-pro.json")).unwrap();
@@ -145,14 +83,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn qualified_local_copy_keeps_default_without_hf_path_identity() {
+    fn mimo_checkpoints_default_to_fp8_head_and_output() {
         for snapshot in ["/arbitrarily-renamed-local-copy", "/hf/models--XiaomiMiMo--MiMo-V2.6-Pro-RL/snapshots/rev"] {
-            let (checkpoint, cfg, draft, headers) = fixture(snapshot);
-            assert_eq!(default_policy(&checkpoint, &cfg), MimoDefaultPolicy::QualifiedProFp8);
-            assert!(qualified_draft(&draft, &headers));
+            let (checkpoint, cfg, _, _) = fixture(snapshot);
+            assert_eq!(default_policy(&checkpoint, &cfg), MimoDefaultPolicy::Fp8);
             let spec = crate::plan::families::mimo::spec_from(&cfg, &checkpoint);
-            assert!(spec.notes.iter().any(|note| note.contains("qualified MiMo V2.6 Pro default: single-copy FP8")));
-            assert!(spec.notes.iter().any(|note| note.contains("checkpoint source storage") && note.contains("not complete resident-memory admission")));
+            assert!(spec.notes.iter().any(|note| note.contains("default: single-copy FP8")));
         }
     }
 
@@ -166,25 +102,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn same_geometry_with_changed_config_or_source_headers_keeps_checkpoint_formats() {
-        let (mut checkpoint, mut cfg, _, _) = fixture("/local");
-        checkpoint.config["attention_value_scale"] = serde_json::json!(0.5);
+    fn missing_or_unaligned_projection_keeps_checkpoint_formats() {
+        let (mut checkpoint, cfg, _, _) = fixture("/local");
+        let at = checkpoint.tensors.iter().position(|t| t.meta.name == "lm_head.weight").unwrap();
+        checkpoint.tensors[at].meta.shape[1] = 6100;
         assert_eq!(default_policy(&checkpoint, &cfg), MimoDefaultPolicy::Checkpoint);
-        let (mut checkpoint, _, _, _) = fixture("/local");
-        checkpoint.tensors[0].meta.dtype = DType::F8E4M3;
+        checkpoint.tensors.remove(at);
         assert_eq!(default_policy(&checkpoint, &cfg), MimoDefaultPolicy::Checkpoint);
-        let (checkpoint, _, _, _) = fixture("/local");
-        cfg.hidden = 4096;
-        assert_eq!(default_policy(&checkpoint, &cfg), MimoDefaultPolicy::Checkpoint);
-    }
-
-    #[test]
-    fn changed_draft_config_or_header_does_not_inherit_target_policy() {
-        let (_, _, mut draft, mut headers) = fixture("/local");
-        draft["block_size"] = serde_json::json!(16);
-        assert!(!qualified_draft(&draft, &headers));
-        let (_, _, draft, _) = fixture("/local");
-        headers[0].shape[0] += 1;
-        assert!(!qualified_draft(&draft, &headers));
     }
 }

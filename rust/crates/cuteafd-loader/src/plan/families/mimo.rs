@@ -79,8 +79,8 @@ pub fn spec_from(cfg: &MimoV2Config, checkpoint: &Checkpoint) -> ModelSpec {
             CUTEAFD_MIMO_GEOMETRIES={family})"));
     }
     if crate::families::mimo_v2::weight_policy::default_policy(checkpoint, cfg)
-        == crate::families::mimo_v2::weight_policy::MimoDefaultPolicy::QualifiedProFp8 {
-        notes.push("qualified MiMo V2.6 Pro default: single-copy FP8 target head/O and qualified embedded DFlash; native QKV/FFN unchanged. --weight-policy checkpoint keeps source formats; explicit per-weight flags override. Signature checks config/header metadata, not payload integrity.".into());
+        == crate::families::mimo_v2::weight_policy::MimoDefaultPolicy::Fp8 {
+        notes.push("measured MiMo default: single-copy FP8 target head/O and DFlash drafter; native QKV/FFN unchanged. --weight-policy checkpoint keeps source formats; explicit per-weight flags override.".into());
         if let Ok(memory) = crate::families::mimo_v2::weight_policy::qualified_projection_memory(cfg) {
             notes.push(format!("default target head/O across coordinator ranks: checkpoint source {} B ({:.3} GiB), selected FP8 resident {} B ({:.3} GiB), maximum drained packing source {} B ({:.3} GiB); these costs use the runtime projection descriptor and exclude other weights, optional DFlash and runtime state",
                 memory.source_bytes, memory.source_bytes as f64 / GIB,

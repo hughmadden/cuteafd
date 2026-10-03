@@ -122,7 +122,7 @@ pub(crate) struct EngineArgs {
     #[arg(long)]
     pub draft_context_slots: Option<usize>,
     /// Explicit calibration-free E4M3 quantization of own drafter GEMMs.
-    /// Unset/false preserves checkpoint BF16; no dual resident matrices.
+    /// Unset/true: E4M3 single copy (measured faster); false keeps checkpoint BF16.
     #[arg(long, action = clap::ArgAction::Set)]
     pub draft_fp8: Option<bool>,
     /// Scale rule of the FP8 copies made from BF16 weights at load (KDA

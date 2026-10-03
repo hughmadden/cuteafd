@@ -13,7 +13,9 @@ impl GlmDraftRepresentation {
     /// Current DFlash readers support BF16 checkpoint weights. Quantization
     /// is an explicit convenience choice, independent of activation formats.
     pub fn from_fp8_option(fp8: Option<bool>) -> Self {
-        if fp8 == Some(true) { Self::Fp8Only } else { Self::Bf16Only }
+        // Drafter precision cannot change committed tokens; FP8 drafts measured faster
+        // (GLM 5.3, 1 RTX + 4 Sparks: C1 code 41.5 -> 43.9, C4 63.9 -> 71.1 tok/s).
+        if fp8 == Some(false) { Self::Bf16Only } else { Self::Fp8Only }
     }
 
     pub fn name(self) -> &'static str {
@@ -190,7 +192,7 @@ mod tests {
 
     #[test]
     fn checkpoint_default_preserves_bf16_and_quantization_is_explicit() {
-        assert_eq!(GlmDraftRepresentation::from_fp8_option(None), GlmDraftRepresentation::Bf16Only);
+        assert_eq!(GlmDraftRepresentation::from_fp8_option(None), GlmDraftRepresentation::Fp8Only);
         assert_eq!(GlmDraftRepresentation::from_fp8_option(Some(false)), GlmDraftRepresentation::Bf16Only);
         assert_eq!(GlmDraftRepresentation::from_fp8_option(Some(true)), GlmDraftRepresentation::Fp8Only);
     }

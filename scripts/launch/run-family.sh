@@ -70,9 +70,9 @@ snapshot_of() {
 #   mtp      MiMo V2 Flash, Qwen 3.8: the checkpoint's native MTP layers,
 #            SPECULATOR_DEPTH drafts (default 1)
 #   dspark   DeepSeek V4
-# MiMo unset selects the measured default only for its qualified Pro metadata;
+# MiMo unset drafts in single-copy FP8 (the measured family default);
 # SPECULATOR_FP8=auto preserves that drafter's checkpoint format. GLM auto/unset
-# preserves checkpoint weights. on converts, off selects BF16. Pre-rename keys
+# drafts in single-copy FP8. on converts, off selects BF16. Pre-rename keys
 # (DRAFT_MODEL_ID, DFLASH,
 # MTP, DSPARK, DRAFT_FP8) still work for one release.
 speculator="$(get SPECULATOR)"
@@ -241,7 +241,7 @@ if [[ $serve != serve-dsv4 ]]; then
       esac
     elif [[ $family == glm5 || $family == glm5_flash ]]; then
       case "$(key SPECULATOR_FP8 DRAFT_FP8 auto)" in
-        auto) ;; # Preserve BF16 checkpoint weights by default.
+        auto) ;; # The engine default: single-copy FP8 drafter weights.
         on) family_args+=(--draft-fp8 true) ;;
         off) family_args+=(--draft-fp8 false) ;;
         *) echo "SPECULATOR_FP8 must be auto, on or off" >&2; exit 2 ;;
