@@ -2555,6 +2555,15 @@ pub(super) fn graph_capture_watch() {
     if rounds % 512 == 0 {
         let captures = cuteafd_ffi::graph_captures();
         let previous = LAST.swap(captures, Ordering::Relaxed);
-        tracing::info!(rounds, captures = captures - previous, "graph captures in the last 512 verification rounds");
+        static SITES: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
+        let now = cuteafd_ffi::graph_capture_sites();
+        let mut before = SITES.lock().unwrap_or_else(|p| p.into_inner());
+        let mut delta: Vec<_> = now.iter().map(|(site, n)| (site.rsplit('/').next().unwrap_or(site).to_string(),
+            n - before.iter().find(|(s, _)| s == site).map_or(0, |(_, m)| *m))).filter(|(_, n)| *n > 0).collect();
+        delta.sort_by(|a, b| b.1.cmp(&a.1));
+        delta.truncate(6);
+        *before = now;
+        tracing::info!(rounds, captures = captures - previous, sites = ?delta,
+            "graph captures in the last 512 verification rounds");
     }
 }
