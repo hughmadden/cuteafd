@@ -78,10 +78,13 @@ snapshot_of() {
 # (DRAFT_MODEL_ID, DFLASH,
 # MTP, DSPARK, DRAFT_FP8) still work for one release.
 # GLM 5.3 Flash always drafts with an external speculator: the one measured
-# fastest (emitted tok/s, code and agentic sessions) for each checkpoint.
+# fastest (emitted tok/s: C1/C4 code and an agentic reasoning session, 1 RTX +
+# 2 Sparks and 2 RTX + 4 Sparks) for each checkpoint. DFlash2 led on every one
+# measured (2026-10-04: wrldsuksgo2mars EXL3 K3.25, nvidia NVFP4, brandonmusic
+# tr3 4bpw; agentic 1.3-1.5x dSpark); SPECULATOR=dspark selects the RedHat dSpark.
 glm5_flash_speculator() {
   case "$1" in
-    *) echo "dspark RedHatAI/GLM-5.3-Flash-speculator.dspark-preview" ;;
+    *) echo "dflash2 incoai/GLM-5.3-Flash-DFlash2" ;;
   esac
 }
 speculator="$(get SPECULATOR)"
