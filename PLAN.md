@@ -743,7 +743,7 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
    - DeepSeek V4 Flash: the native expert format refuses 2 Sparks (min config
      needs 4); V4.1 TP3 fits per `cuteafd plan` but is unqualified.
    - Benchmarks: reasoning-effort panel re-run after the pool back-off fix;
-     turn-end cache check is informational (greedy non-repeat); the code
+     turn-end cache check gates restores against their snapshot (4i); the code
      sandbox requires user/net/PID namespaces (`fd74aaf`; coordinators run
      with `docker/seccomp-code-bench.json`); tool-eval-bench reaches images
      with the next `./build.sh`.
@@ -780,10 +780,17 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
      h. Prefill gets worse with more hardware: V4 Pro min 879 tok/s (9.2 s
         TTFT) vs 2,438 max; MiMo Flash max 2,899 vs min 5,877; MiMo Pro max
         1,754 vs min 2,741 (two-lane prefill off under the head split).
-     i. V4 / V4.1 turn-end prefix-cache restore not byte-exact (reported,
-        not gated). V4 Flash solo prefill also repeats inexactly: Spark FP32
-        atomic reduction order. An ordered serial-slice reducer passed
-        component gates on a private codex branch; not merged.
+     i. V4 / V4.1 turn-end prefix-cache restores are byte-exact (fixed in the
+        check, `0f65c9b`): the old check compared a restored turn with a cold
+        recompute, and V4 Flash / V4.1 prefill does not repeat bit for bit
+        (Spark FP32 atomic expert reduction at 256+ rows); its turns also
+        ended at EOS with one row to compare. The check now judges each
+        restore against its own snapshot (turn rows, prompt-snapshot
+        reference, decode step after the turn restore) and reports the cold
+        recompute only. Smoke V4 Flash min and V4.1 min: prompt and turn end
+        2 rows byte-identical, cold recompute differs. Deterministic prefill
+        stays open: an ordered serial-slice reducer passed component gates
+        on a private codex branch (Flash TP4 only); not merged.
      j. MiMo V2 Flash fidelity is the weakest that passes (KL 0.10, top-1 82%).
         Opt-in BF16 expert-input Spark packages (`EXPERT_INPUT=bf16`,
         `CUTEAFD_*_FP8_MOE_BF16_FAMILIES=mimo`) improve it; default stays FP8.
