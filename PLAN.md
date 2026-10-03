@@ -534,6 +534,18 @@ steps into `work/p0`; tag `v1.0.0` when the list's top half is done.
 Current agent integration: `codex/v1`, isolated from the orchestration checkout.
 The user chooses release cuts; development fixes below do not cut a release.
 
+Scoped closeout (2026-10-03): integrate the completed memory admission,
+checkpoint-weight policy, loader/terminal ownership, accepted-request errors
+and paired MiMo prefill subitems into `codex/v1`, then stop. The qualified
+MiMo single-copy output consumer is published in SparkInfer and pinned here.
+Host suites and the bounded MiMo, Qwen and GLM Flash gates pass. The user
+explicitly skipped the remaining final V4.1 campaign after two one-RTX A/B
+pairs matched outputs and passed their throughput/capture checks. Full
+three-pair and two-RTX closeout parity are not claimed. The open items below,
+including larger default KV integration, concurrent-history correctness,
+compact GLM target consumers and inherited V4.1 prefill graph eviction, remain
+follow-ups; this closeout does not complete the whole v1 plan or cut a release.
+
 Joint serving capacity is in progress: the pure resolver budgets each physical
 GPU at 97% of total minus existing usage and explicit reservations, preserves
 small pool overrides, and reports the common 2,097,152-token target and its
@@ -938,7 +950,9 @@ active admission deferral and active KV paging are separate remaining work.
     and fixed-history state on both reference layouts. Actual two-lane prefill
     matches serial prefill and continuation exactly on both layouts; the
     earlier smaller-chunk gate exercised only the serial path. Native
-    promotion still needs V4.1 parity. The bounded real scheduler and terminal
+    promotion now includes the published single-copy output consumer; the
+    remaining final V4.1 parity sessions were explicitly skipped at closeout.
+    The bounded real scheduler and terminal
     ownership gates pass; complete concurrent-history correctness remains open.
     The source audit also finds implicit BF16 quantization and duplicate
     matrices in Qwen attention/MTP, shared GLM/GLM Flash DFlash, and the
