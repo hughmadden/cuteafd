@@ -572,7 +572,11 @@ Follow-ups (2026-10-03, measurements pending in `~/.cache/cuteafd/builds/v1-memo
   stays per allocation.
 - Exact Spark slices: FP8/MXFP4/NVFP4 Spark packages also build tp<n>-w<width>
   layouts (ranks own whole 128-row blocks, no zero padding; MiMo V2.6 Pro TP6
-  ranks 4-5 61.9 instead of 92.8 GiB); EXL3 already had them. Shortening the
+  ranks 4-5 61.9 instead of 92.8 GiB); EXL3 already had them. Measured MiMo V2.6
+  Pro 2 RTX + 6 Sparks, exact vs padded: rank 5 free 11.8 -> 43.2 GiB (rank 0
+  unchanged), golden NLL 2.4150 -> 2.4088 (KL 0.0457 -> 0.0445; rank partials
+  partition the rows differently), engine 8K prefill 3095 -> 3002 tok/s, served
+  8K 2684 -> 2725, C1 63.9-69.1 -> 68.5-69.5, C4 102-108 both: neutral. Shortening the
   busiest rank (352/320 rows) needs 32-row K tails in the MXFP4 down projection:
   after `work/mimo-perf` (A8 down) lands on fork master. V4.1 TP4 (576 -> 640)
   goes through the V4.1 packer: not done.
