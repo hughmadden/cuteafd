@@ -926,7 +926,11 @@ impl<'a> SparkDeviceLink<'a> {
         build: cuteafd_transport::expert::DeviceBuild) -> Result<Self> {
         use cuteafd_transport::expert::device_mailbox;
         let choice = choose_mode(library)?;
-        ensure!(choice.mode == IntakeMode::Gpu,
+        // The exchange's verify waves are small: dma-buf landing that works is
+        // enough even where the probe judged it slower than the pinned path
+        // for prefill-sized waves (that choice still holds for the host path).
+        let usable = choice.probe.as_ref().is_some_and(|probe| probe.usable());
+        ensure!(choice.mode == IntakeMode::Gpu || (usable && choice.setting == "auto"),
             "the device Spark exchange needs GPU landing, but the intake is {} ({})", choice.mode.name(), choice.reason);
         let intake = SparkIntake::new(library, IntakeMode::Gpu, peers.len(), if written_responses() { 1 } else { capacity },
             row_bytes)?;
