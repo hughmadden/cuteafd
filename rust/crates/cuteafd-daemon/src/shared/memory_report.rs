@@ -121,3 +121,8 @@ pub(crate) fn release_load_staging(library: &cuteafd_ffi::NativeLibrary) {
         Err(error) => tracing::warn!(%error, "could not release load-time pinned upload staging"),
     }
 }
+
+/// The kernel page cache (`Cached` in /proc/meminfo), bytes.
+pub(crate) fn cached_bytes() -> Option<u64> {
+    meminfo()["Cached"].as_u64()
+}

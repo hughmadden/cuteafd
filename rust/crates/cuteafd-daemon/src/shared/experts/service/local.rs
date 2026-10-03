@@ -54,9 +54,11 @@ pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()>
     // requests stage far smaller rows, so drop it and let them regrow it.
     let released = library.release_sync_h2d_staging()?;
     // CUTEAFD_SPARK_DROP_PAGE_CACHE=0 keeps the checkpoint pages cached.
+    let cached_before = crate::shared::memory_report::cached_bytes();
     let advised = if std::env::var("CUTEAFD_SPARK_DROP_PAGE_CACHE").is_ok_and(|v| v == "0") { 0 }
         else { cuteafd_loader::page_cache::drop_snapshot_pages(&config.snapshot) };
-    tracing::info!(released_bytes = released, page_cache_advised_bytes = advised,
+    tracing::info!(released_bytes = released, page_cache_advised_bytes = advised, cached_before,
+        cached_after = crate::shared::memory_report::cached_bytes(),
         "released load-time pinned upload staging and checkpoint page cache");
     let mut exchange = HostExpertExchange::new(config.capacity)?;
     let mut row_indices = vec![0; config.capacity as usize];
