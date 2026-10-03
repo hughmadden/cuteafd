@@ -649,7 +649,32 @@ impl<'a> GlmfEngine<'a> {
         })?;
         self.peer = Some(peer);
         self.exchange = Some(exchange);
-        Ok(())
+        // Native kernels load lazily on first launch, and a lazy load can wait for the device:
+        // queued a layer ahead, rank 1 would then wait for its own stream, which waits on a
+        // push the host has not queued yet. Load the native MLA prefill on both GPUs now.
+        for rank in 0..2 {
+            self.on(rank, || self.warm_mla_prefill(rank))?;
+        }
+        self.synchronize()
+    }
+
+    /// One masked row of the native MLA prefill on rank `rank` (loads its kernel there).
+    fn warm_mla_prefill(&self, rank: usize) -> Result<()> {
+        let heads = self.cfg.heads / 2;
+        let q = self.alloc(heads * self.cfg.kv_lora_rank * 2)?;
+        let kv = self.alloc(PAGE_ROWS * RECORD_BYTES)?;
+        let indices = self.alloc(SPARSE_TOPK * 4)?;
+        self.library.copy_h2d(indices.buffer, &vec![0xFFu8; SPARSE_TOPK * 4])?;
+        let lengths = self.alloc(4)?;
+        self.library.cuda_zero_bytes(lengths.buffer, 256)?;
+        let out = self.alloc(heads * self.cfg.kv_lora_rank * 2)?;
+        // SAFETY: every buffer above is live and sized for one row of `heads` heads; the
+        // stream drains before they drop.
+        unsafe {
+            self.library.glm_mla_prefill(q.buffer.ptr, kv.buffer.ptr, indices.buffer.ptr, lengths.buffer.ptr,
+                out.buffer.ptr, 1, heads, SPARSE_TOPK, RECORD_BYTES, 1.0, self.stream_of(rank))?;
+            self.library.cuda_stream_synchronize(self.stream_of(rank))
+        }
     }
 
     /// GPUs this engine runs on: 2 under a head split.
