@@ -394,6 +394,12 @@ impl Opened {
                 engine.attach_peer_l2(budget)?;
             }
         }
+        // Every decode graph shape serving replays, captured now (CUTEAFD_GLM_WARM_GRAPHS=0 skips it).
+        if engine.weights.layers.len() == self.cfg.layers
+            && std::env::var("CUTEAFD_GLM_WARM_GRAPHS").map_or(true, |v| v != "0")
+            && (transport.is_some() || args.skip_routed_experts) {
+            engine.warm_decode_graphs(transport.as_mut().map(|t| (t, &runtime)))?;
+        }
         let result = body(&engine, transport.as_mut(), &runtime);
         drop(engine);
         drop(transport);
