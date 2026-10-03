@@ -171,15 +171,17 @@ fi
 [[ ! $family =~ ^(glm5|qwen4|deepseek_v4)$ || -z "$(get POOL_TOKENS)" ]] || family_args+=(--pool-tokens "$(get POOL_TOKENS)")
 # GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
 # from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" requires native
-# FP8 block tensors in the primary checkpoint). KDA's BF16 source weights run as-is by default
-# (GLM5_FLASH_KDA_FP8: unset/auto/off). Legacy row128/channel and the extra
-# FP8 head are unsupported until they have single-copy consumers. Its MLA
-# pools hold POOL_TOKENS tokens (a key every
+# FP8 block tensors in the primary checkpoint, else BF16 ones are quantized to
+# 128x128 blocks at load). KDA's BF16 source weights run as-is by default
+# (GLM5_FLASH_KDA_FP8: unset/auto/off); row128/channel replace the KDA in/out
+# projections with per-row FP8 at load (their only resident copy).
+# GLM5_FLASH_FP8_HEAD=on keeps only a per-row FP8 LM head (target and drafter).
+# Its MLA pools hold POOL_TOKENS tokens (a key every
 # family with a paged KV pool reads). GLM5_FLASH_FP8_PREFILL lists the prefill
 # projections that run W8A8 (E4M3 activations per 128-K block): unset = the
-# engine default mla,ffn (the official FP8 tensors), a list of
-# mla,ffn,kda-in,kda-o / all, or off (MLA/FFN W8A16, KDA BF16). The GLMF_*
-# spellings still work for one release.
+# engine default mla,ffn, a list of mla,ffn,kda-in,kda-o / all (kda-* need
+# GLM5_FLASH_KDA_FP8 row128/channel), or off (every FP8 weight W8A16). The
+# GLMF_* spellings still work for one release.
 if [[ $family == glm5_flash ]]; then
   fp8_model="$(key GLM5_FLASH_FP8_MODEL_ID GLMF_FP8_MODEL_ID zai-org/GLM-5.3-Flash)"
   if [[ "$fp8_model" != off ]]; then
@@ -189,21 +191,22 @@ if [[ $family == glm5_flash ]]; then
   kda_fp8="$(key GLM5_FLASH_KDA_FP8 GLMF_KDA_FP8 auto)"
   case "$kda_fp8" in
     ""|auto|off) kda_fp8=off ;;
-    row128|channel)
-      echo "GLM5_FLASH_KDA_FP8=$kda_fp8 requires duplicate BF16/FP8 weights; single-copy consumers are missing; use off" >&2
-      exit 2 ;;
+    row128|channel) ;;
     *) echo "GLM5_FLASH_KDA_FP8 must be auto, off, row128 or channel" >&2; exit 2 ;;
   esac
   family_args+=(--kda-fp8 "$kda_fp8" --pool-tokens "$(get POOL_TOKENS 65536)")
-  if [[ "$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD off)" == on ]]; then
-    echo "GLM5_FLASH_FP8_HEAD=on duplicates the checkpoint head; a shared single-copy consumer is missing; use off" >&2
-    exit 2
-  fi
+  case "$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD off)" in
+    on) family_args+=(--fp8-head) ;;
+    off|auto|"") ;;
+    *) echo "GLM5_FLASH_FP8_HEAD must be on or off" >&2; exit 2 ;;
+  esac
   fp8_prefill="$(key GLM5_FLASH_FP8_PREFILL GLMF_FP8_PREFILL)"
   case ",$fp8_prefill," in
     *,all,*|*,kda-in,*|*,kda-o,*)
-      echo "GLM5_FLASH_FP8_PREFILL=$fp8_prefill requires duplicate KDA weights; use mla,ffn or off until single-copy consumers exist" >&2
-      exit 2 ;;
+      if [[ $kda_fp8 == off ]]; then
+        echo "GLM5_FLASH_FP8_PREFILL=$fp8_prefill runs KDA W8A8 over FP8 KDA weights; set GLM5_FLASH_KDA_FP8=row128 or channel" >&2
+        exit 2
+      fi ;;
   esac
   case "$fp8_prefill" in
     "") ;;
