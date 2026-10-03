@@ -599,8 +599,7 @@ impl<'a> GlmfLoader<'a> {
         if ranks == 1 {
             return Ok(vec![self.layer(cfg, layer)?]);
         }
-        ensure!(self.kda_nvfp4.is_none() && self.kda_fp8 == super::fp8::KdaFp8::Off,
-            "a head split runs the BF16 KDA projections (no --kda-fp8 or NVFP4 gate)");
+        ensure!(self.kda_nvfp4.is_none(), "the KDA NVFP4 numerics gate runs without a head split");
         ensure!(cfg.heads % ranks == 0 && cfg.kda_heads % ranks == 0, "{} MLA / {} KDA heads do not split over {ranks} \
             GPUs", cfg.heads, cfg.kda_heads);
         let p = format!("{PREFIX}layers.{layer}");
@@ -627,7 +626,47 @@ impl<'a> GlmfLoader<'a> {
                 let w_in: Vec<(String, bool)> = [("q_proj", true), ("k_proj", true), ("v_proj", true),
                     ("f_a_proj", false), ("g_a_proj", false), ("b_proj", true)].iter()
                     .map(|(n, split)| (a(&format!("{n}.weight")), *split)).collect();
-                put(&mut ops, "w_in", self.upload_ranks(self.bf16_parts(&w_in, ranks)?)?);
+                let w_in = self.bf16_parts(&w_in, ranks)?;
+                let (bytes, dtype, shape) = self.raw(&a("o_proj.weight"))?;
+                ensure!(dtype == DType::Bf16 && shape.len() == 2 && shape[1] % ranks == 0,
+                    "{}: a head split slices a BF16 [H, D] o_proj, found {dtype:?} {shape:?}", a("o_proj.weight"));
+                let w_o: Vec<Vec<u8>> = (0..ranks)
+                    .map(|rank| slice_2d(&bytes, shape[0], shape[1], 2, Axis::Cols, rank, ranks)).collect();
+                // FP8 copies of each rank's slices (per row and 128-K block: the same bytes as the
+                // whole weight's copy for Row128).
+                let layout = match self.kda_fp8 {
+                    super::fp8::KdaFp8::Off => None,
+                    super::fp8::KdaFp8::Channel => Some(super::fp8::Layout::Channel),
+                    super::fp8::KdaFp8::Row128 => Some(super::fp8::Layout::Row128),
+                };
+                if let Some(layout) = layout {
+                    let h = cfg.hidden;
+                    for (parts, key, cols) in [(&w_in, "w_in", h), (&w_o, "w_o", shape[1] / ranks)] {
+                        let (mut values, mut scales, mut kmajor) = (Vec::new(), Vec::new(), Vec::new());
+                        for part in parts {
+                            let n = part.len() / 2 / cols;
+                            let (q, s) = super::fp8::quantize(part, n, cols, layout, self.fp8_scales);
+                            let kb = cols / 128;
+                            let mut k = vec![0f32; s.len()];
+                            for row in 0..n {
+                                for b in 0..kb {
+                                    k[b * n + row] = s[row * kb + b];
+                                }
+                            }
+                            values.push(q);
+                            scales.push(f32_bytes(&s));
+                            kmajor.push(f32_bytes(&k));
+                        }
+                        let (fp8, scale, kscale) = if key == "w_in" { ("w_in_fp8", "w_in_scale", "w_in_kscale") }
+                            else { ("w_o_fp8", "w_o_scale", "w_o_kscale") };
+                        put(&mut ops, fp8, self.upload_ranks(values)?);
+                        put(&mut ops, scale, self.upload_ranks(scales)?);
+                        if layout == super::fp8::Layout::Row128 {
+                            put(&mut ops, kscale, self.upload_ranks(kmajor)?);
+                        }
+                    }
+                }
+                put(&mut ops, "w_in", self.upload_ranks(w_in)?);
                 put(&mut ops, "w_fg", self.upload_ranks(self.bf16_parts(&[(a("f_b_proj.weight"), true),
                     (a("g_b_proj.weight"), true)], ranks)?)?);
                 put(&mut ops, "conv_w", self.upload_ranks(self.f32_parts(&["q", "k", "v"]
@@ -635,11 +674,7 @@ impl<'a> GlmfLoader<'a> {
                 put(&mut ops, "a_log", self.upload_ranks(self.f32_parts(&[a("A_log")], ranks)?)?);
                 put(&mut ops, "dt_bias", self.upload_ranks(self.f32_parts(&[a("dt_bias")], ranks)?)?);
                 put(&mut ops, "o_norm", self.replicate(self.one(&a("o_norm.weight"))?)?);
-                let (bytes, dtype, shape) = self.raw(&a("o_proj.weight"))?;
-                ensure!(dtype == DType::Bf16 && shape.len() == 2 && shape[1] % ranks == 0,
-                    "{}: a head split slices a BF16 [H, D] o_proj, found {dtype:?} {shape:?}", a("o_proj.weight"));
-                put(&mut ops, "w_o", self.upload_ranks((0..ranks)
-                    .map(|rank| slice_2d(&bytes, shape[0], shape[1], 2, Axis::Cols, rank, ranks)).collect())?);
+                put(&mut ops, "w_o", self.upload_ranks(w_o)?);
             }
             GlmNextAttention::Mla => {
                 put(&mut ops, "q_a_norm", self.replicate(self.one(&a("q_a_layernorm.weight"))?)?);
