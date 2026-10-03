@@ -1661,20 +1661,21 @@ pub(crate) fn tensor_fp8_prefill() -> bool {
 }
 
 /// Prefill sparse MLA kernel of glm_mla_prefill.cu (its `kernel` argument), or None for the
-/// b12x program: CUTEAFD_MLA_PREFILL=f16 (0), e4m3 (1: E4M3 query and P), e4m3-p2 (2: two-term
-/// P), e4m3-q2 (3: two-term query), e4m3-q2p2 (4) or b12x; default f16.
+/// b12x program: CUTEAFD_MLA_PREFILL=e4m3-p2 (2, the default: E4M3 query, two-term E4M3 P),
+/// e4m3 (1: one-term P), e4m3-q2 (3: two-term query), e4m3-q2p2 (4), f16 (0: the F16 kernel)
+/// or b12x.
 pub(crate) fn native_mla_prefill() -> Option<i32> {
     static KERNEL: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
     *KERNEL.get_or_init(|| match std::env::var("CUTEAFD_MLA_PREFILL").as_deref() {
         Ok("b12x") => None,
+        Ok("f16") => Some(0),
         Ok("e4m3") => Some(1),
-        Ok("e4m3-p2") => Some(2),
+        Ok("e4m3-p2") | Err(_) => Some(2),
         Ok("e4m3-q2") => Some(3),
         Ok("e4m3-q2p2") => Some(4),
-        Ok("f16") | Err(_) => Some(0),
         Ok(other) => {
-            tracing::warn!(value = other, "unknown CUTEAFD_MLA_PREFILL; using f16");
-            Some(0)
+            tracing::warn!(value = other, "unknown CUTEAFD_MLA_PREFILL; using e4m3-p2");
+            Some(2)
         }
     })
 }

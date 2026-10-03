@@ -1,4 +1,4 @@
-// Sparse MLA prefill over FP8 latent records on F16 tensor cores (SM120):
+// Sparse MLA prefill over FP8 latent records on F16 or E4M3 tensor cores (SM120):
 // GLM 5.x (656-byte records: 512 E4M3 codes, 4 FP32 group scales, 64 BF16
 // RoPE dims; 576-wide absorbed query) and GLM 5.3 Flash (528-byte records,
 // no RoPE; 512-wide query).
@@ -411,36 +411,33 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
 
 
 // ---------------------------------------------------------------------------
-// E4M3 tensor-core kernel (the default): QK and PV on mma.m16n8k32.e4m3 (twice
-// the F16 rate on SM120), the records' codes copied as stored (cp.async, no
-// dequantization), RoPE on BF16 tensor cores.
+// E4M3 tensor-core kernel (kernel 2, two-term P, is the engine default): QK and
+// PV on mma.m16n8k32.e4m3 (twice the F16 rate on SM120), the records' codes
+// copied as stored (cp.async, no dequantization), RoPE on BF16 tensor cores.
 //
 // One CTA per (row, 16 * kGroups heads): kGroups head groups of four warps;
 // warp w of a group owns latent channels [128 w, 128 w + 128), exactly one
-// FP32 scale group of every record. Tiles of 32 records, double-buffered:
-// codes [32][512] (16-byte units swizzled by token & 7), group scales [32][4],
-// RoPE rows [32][64] BF16 (swizzled likewise).
+// FP32 scale group of every record. Tiles of 32 records in a ring of three
+// stages released per warp through mbarriers (no CTA barrier per tile: the
+// head groups drift, one's softmax overlapping another's products): codes
+// [32][512] (16-byte units swizzled by token & 7), group scales [32][4], RoPE
+// rows [32][64] BF16 (swizzled likewise), and the next tile's slots.
 //   QK: the query enters as E4M3 scaled per head by a power of two (its
 //   largest latent |q| lands in (224, 448]); kQTerms = 2 adds a second E4M3
 //   term for the remainder (q ~ hi + lo, about 7 significant bits). Warp w's
-//   partial is scaled in FP32 by the head's power of two and each record's
-//   group scale w, then takes its 16 RoPE dims on BF16 tensor cores; the four
-//   partials meet in shared memory and the online softmax runs as in the F16
-//   kernel (FP32, records [8 w, 8 w + 8) per warp).
+//   partial is scaled in FP32 by each record's group scale w, then takes its
+//   16 RoPE dims (BF16 query times the same power of two, exact) on BF16
+//   tensor cores; the four partials meet in shared memory and the online
+//   softmax runs in FP32, each thread on four records of one head.
 //   PV: out[h, c] = sum_t p[h, t] codes[t, c] scale[t, group(c)]: the softmax
-//   warps write P times each group's scales as four E4M3 copies (kPTerms = 2:
-//   hi + lo), each copy scaled by a power of two per tile so the tile's
-//   largest group scale lands in (224, 448]; warp w multiplies its copy by
-//   the codes, read with ldmatrix.trans and byte-permuted into k32 fragments
-//   (the tile's token order inside k is permuted the same way in P), and
-//   folds the power of two into its online-softmax correction.
-// Accumulation is FP32 throughout.
-#ifndef MLA_BACKOFF_NS
-#define MLA_BACKOFF_NS 64
-#endif
-#ifndef MLA_AHEAD
-#define MLA_AHEAD 1
-#endif
+//   threads write P times each group's scales as four E4M3 copies (kPTerms =
+//   2: hi + lo, about 7 significant bits), each copy scaled by a power of two
+//   that only decreases along the row (the largest group scale seen times it
+//   stays at most 448); warp w multiplies its copy by the codes, read with
+//   ldmatrix.trans and byte-permuted into k32 fragments (the tile's record
+//   order inside k is permuted the same way in P), and folds a change of the
+//   power of two into its online-softmax correction.
+// Accumulation is FP32 throughout. The F16 kernel above stays as kernel 0.
 namespace e4m3 {
 
 constexpr int kStages = 3;
@@ -458,6 +455,7 @@ template <int kGroups>
 struct Smem {
   uint64_t full[kStages];   // the stage's tile landed (every thread's copies)
   uint64_t empty[kStages];  // every warp is done with the stage's tile
+  int32_t slots[4][kT];     // the selected slots of tiles i .. i + 3 (ring; copied with tile i - 1)
   float slice_max[kGroups][2][16];  // per head: the tile maxima of its two record halves
   float slice_sum[kGroups][2][16];
   int32_t qexp[kGroups * 16];
@@ -493,7 +491,7 @@ __device__ __forceinline__ bool mbar_try_wait(uint64_t* bar, uint32_t parity) {
 }
 // Backs off between polls so that a waiting warp leaves the issue slots to the warps it waits for.
 __device__ __forceinline__ void mbar_wait(uint64_t* bar, uint32_t parity) {
-  while (!mbar_try_wait(bar, parity)) __nanosleep(MLA_BACKOFF_NS);
+  while (!mbar_try_wait(bar, parity)) __nanosleep(64);
 }
 
 __device__ __forceinline__ void mma_e4m3(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
@@ -519,8 +517,10 @@ template <int kTerms>
 __device__ __forceinline__ void quant2(float a, float b, uint32_t& hi, uint32_t& lo) {
   hi = to_e4m3x2(a, b);
   if (kTerms == 2) {
-    const float2 back = e4m3x2_to_float2(hi);
-    lo = to_e4m3x2(a - back.x, b - back.y);
+    // The remainder in F16 (exact for hi; x rounded to 11 bits, well past lo's 4).
+    const __half2 x = __floats2half2_rn(a, b);
+    const __half2 back(__nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(hi), __NV_E4M3));
+    lo = __nv_cvt_halfraw2_to_fp8x2(__hsub2(x, back), __NV_SATFINITE, __NV_E4M3);
   } else {
     lo = 0;
   }
@@ -557,13 +557,21 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
   const int tiles = (length + kT - 1) / kT;
   const int32_t* sel = indices + int64_t(row) * topk;
 
-  auto slot_of = [&](int e) { return e < length ? __ldg(sel + e) : -1; };
   if (tid == 0) {
     for (int k = 0; k < kStages; ++k) {
       mbar_init(&s.full[k], kThreads);
       mbar_init(&s.empty[k], kThreads / 32);
     }
   }
+  // Tile i's selected slots (8 units of `indices`) into ring entry i % 4 (positions past the
+  // row's length are masked where read).
+  auto load_slots = [&](int i) {
+    if (tid < kT / 4 && i * kT < topk) {
+      cp_async16(smem_addr(&s.slots[i % 4][4 * tid]), sel + i * kT + 4 * tid, true);
+    }
+  };
+  load_slots(0);
+  cp_async_commit();
   // Per-head power of two: the head's largest latent |q| lands in (224, 448].
   for (int h = warp; h < kHeadsCta; h += kThreads / 32) {
     const bf16* qh = q + (int64_t(row) * heads + blockIdx.y * kHeadsCta + h) * kQk;
@@ -572,32 +580,22 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
     for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
     if (lane == 0) s.qexp[h] = m > 0 ? e4m3_exponent(m) : 0;
   }
+  cp_async_wait<0>();
   __syncthreads();
 
-  // Tile i's records into stage i % 3: warp w copies the 32 code units of records w + 16 j
-  // (w + 8 j with two head groups), one per lane, swizzled; then the 8 RoPE units (GLM 5.x)
-  // and the scale unit of every record, one per thread. Masked slots zero-fill. Every thread
-  // arrives on the stage's full barrier once its copies land. Each thread's slots for a tile
-  // are read from `indices` one tile ahead (pre_*).
+  // Tile i's records into stage i % 3, after its slots landed (with tile i - 1): warp w copies
+  // the 32 code units of records w + 16 j (w + 8 j with two head groups), one per lane,
+  // swizzled; then the 8 RoPE units (GLM 5.x) and the scale unit of every record, one per
+  // thread; then tile i + 1's slots. Masked slots zero-fill. Every thread arrives on the
+  // stage's full barrier once its copies land.
   constexpr int kWarps = kThreads / 32, kCodeRounds = kT / kWarps;
   constexpr int kExtra = (kHasRope ? kT * 8 : 0) + kT, kExtraRounds = (kExtra + kThreads - 1) / kThreads;
   const int code_dst = warp * kD + swz(warp, lane) * 16;
-  auto extra_token = [&](int u) { return kHasRope && u < kT * 8 ? u / 8 : u - kExtra + kT; };
-  int pre_code[kCodeRounds], pre_extra[kExtraRounds];
-  auto prefetch = [&](int i) {
-#pragma unroll
-    for (int j = 0; j < kCodeRounds; ++j) pre_code[j] = slot_of(i * kT + warp + kWarps * j);
-#pragma unroll
-    for (int j = 0; j < kExtraRounds; ++j) {
-      const int u = j * kThreads + tid;
-      pre_extra[j] = u < kExtra ? slot_of(i * kT + extra_token(u)) : -1;
-    }
-  };
-  auto load = [&](int i) {
-    uint8_t* stage = smem + (i % kStages) * kStage;
+  auto slot_at = [&](int i, int t) { return i * kT + t < length ? s.slots[i % 4][t] : -1; };
+  auto load = [&](int i, uint8_t* stage) {
 #pragma unroll
     for (int j = 0; j < kCodeRounds; ++j) {
-      const int32_t slot = pre_code[j];
+      const int32_t slot = slot_at(i, warp + kWarps * j);
       cp_async16(smem_addr(stage + code_dst + j * kWarps * kD), kv + int64_t(max(slot, 0)) * rec + lane * 16,
                  slot >= 0);
     }
@@ -606,36 +604,23 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
       const int u = j * kThreads + tid;
       if (u < kExtra) {
         const bool rope_unit = kHasRope && u < kT * 8;
-        const int token = extra_token(u), unit = u % 8;
-        const int32_t slot = pre_extra[j];
+        const int token = rope_unit ? u / 8 : u - kExtra + kT, unit = u % 8;
+        const int32_t slot = slot_at(i, token);
         const int src = rope_unit ? kD + 16 + unit * 16 : kD;
         const int dst = rope_unit ? kStageCodes + token * kRope * 2 + swz(token, unit) * 16
                                   : kStageCodes + (kHasRope ? kStageRope : 0) + token * 16;
         cp_async16(smem_addr(stage + dst), kv + int64_t(max(slot, 0)) * rec + src, slot >= 0);
       }
     }
-    cp_async_arrive(&s.full[i % kStages]);
+    load_slots(i + 1);
   };
   // Softmax ownership: warp w's thread (g, t4) takes head hs = g + 8 (w & 1) and the tile's records
   // t0 + {0, 1, 8, 9} (t0 = 16 (w >> 1) + 2 t4): exactly the four E4M3 P bytes that thread (g, t4)
-  // of every warp holds as A register w (a0..a3) for the PV product. Valid flags one tile ahead.
+  // of every warp holds as A register w (a0..a3) for the PV product.
   const int hs = g + 8 * (cw & 1), t0 = 16 * (cw >> 1) + 2 * t4;
-  auto valid_of = [&](int i) {
-    int v = 0;
-#pragma unroll
-    for (int k = 0; k < 4; ++k) v |= int(slot_of(i * kT + t0 + (k & 1) + 8 * (k >> 1)) >= 0) << k;
-    return v;
-  };
-  int valid_next = 0;
   if (tiles > 0) {
-    prefetch(0);
-    load(0);
-    valid_next = valid_of(0);
-    prefetch(1);
-    if (MLA_AHEAD == 2 && tiles > 1) {
-      load(1);
-      prefetch(2);
-    }
+    load(0, smem);
+    cp_async_arrive(&s.full[0]);
   }
 
   const float qd_lo = pow2(-s.qexp[group * 16 + g]), qd_hi = pow2(-s.qexp[group * 16 + g + 8]);
@@ -695,16 +680,20 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
   // t4][4 registers a0..a3 x 4 bytes]: one 16-byte A fragment per PV thread.
   uint8_t* pbuf = group_bytes;
 
+  int stage_index = 0, phase = 0;  // tile i's stage (i % 3) and its full-barrier parity
   for (int i = 0; i < tiles; ++i) {
-    if (const int j = i + MLA_AHEAD; j < tiles) {
-      if (j >= kStages) mbar_wait(&s.empty[j % kStages], (j / kStages - 1) & 1);
-      load(j);
-      if (j + 1 < tiles) prefetch(j + 1);
+    mbar_wait(&s.full[stage_index], phase);
+    const int next_index = stage_index == kStages - 1 ? 0 : stage_index + 1;
+    if (i + 1 < tiles) {
+      // Tile i + 1 into the stage of tile i - 2 (its slots landed with tile i).
+      if (i + 1 >= kStages) mbar_wait(&s.empty[next_index], phase ^ (next_index != 0));
+      load(i + 1, smem + next_index * kStage);
+      cp_async_arrive(&s.full[next_index]);
     }
-    const int valid = valid_next;
-    if (i + 1 < tiles) valid_next = valid_of(i + 1);
-    mbar_wait(&s.full[i % kStages], (i / kStages) & 1);
-    const uint8_t* stage = smem + (i % kStages) * kStage;
+    int valid = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) valid |= int(slot_at(i, t0 + (k & 1) + 8 * (k >> 1)) >= 0) << k;
+    const uint8_t* stage = smem + stage_index * kStage;
     const uint32_t codes = smem_addr(stage);
     const float* scales = reinterpret_cast<const float*>(stage + kStageCodes + (kHasRope ? kStageRope : 0));
 
@@ -861,7 +850,9 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
       }
     }
     __syncwarp();
-    if (lane == 0) mbar_arrive(&s.empty[i % kStages]);
+    if (lane == 0) mbar_arrive(&s.empty[stage_index]);
+    phase ^= next_index == 0;
+    stage_index = next_index;
   }
   for (int o = 1; o <= 2; o <<= 1) l_own += __shfl_xor_sync(0xffffffffu, l_own, o);
   if (t4 == 0) s.slice_sum[group][cw >> 1][hs] = l_own;
