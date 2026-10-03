@@ -54,7 +54,11 @@ impl Family for DeepSeek {
         } else {
             v41_spec(checkpoint).map_err(ConfigError::from_anyhow)?
         };
-        Ok(Box::new(DeepSeekModel { id: self.id, spec }))
+        let v4_config = if self.id == "deepseek_v4" {
+            Some(DeepseekV4Config::read(&checkpoint.snapshot, dspark_stages(checkpoint))
+                .map_err(ConfigError::from_anyhow)?)
+        } else { None };
+        Ok(Box::new(DeepSeekModel { id: self.id, spec, v4_config, config: checkpoint.config.clone() }))
     }
 
     fn classify(&self, _spec: &ModelSpec, name: &str) -> Option<TensorRole> {
@@ -321,6 +325,8 @@ fn v41_spec(checkpoint: &Checkpoint) -> Result<ModelSpec> {
 struct DeepSeekModel {
     id: &'static str,
     spec: ModelSpec,
+    v4_config: Option<DeepseekV4Config>,
+    config: Value,
 }
 
 /// The routed projection shape `[N, K]` a stem names: w1/w3 (gate/up) are
@@ -378,6 +384,21 @@ impl DeepSeekModel {
 impl FamilyModel for DeepSeekModel {
     fn spec(&self) -> &ModelSpec {
         &self.spec
+    }
+
+    fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
+        -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
+        use crate::serving_capacity::{deepseek_v41_cache_geometry, deepseek_v4_cache_geometry, CacheGeometryError};
+        if let Some(cfg) = &self.v4_config {
+            deepseek_v4_cache_geometry(cfg, options.coordinator_ranks, options.prefill_rows,
+                options.native_mtp_layers).map(Some)
+        } else if options.native_mtp_layers == 0 {
+            deepseek_v41_cache_geometry(&self.config, options.coordinator_ranks).map(Some)
+        } else {
+            Err(CacheGeometryError::Unsupported {
+                family: "deepseek_v41", what: "dSpark state is a separate reservation, not a target cache",
+            })
+        }
     }
 
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {

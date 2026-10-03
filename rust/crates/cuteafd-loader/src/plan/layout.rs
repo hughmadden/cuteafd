@@ -28,7 +28,7 @@ pub struct LayoutOptions {
     pub prefill_rows: u64,
     /// Spark wave capacity in rows (`expertd --capacity`).
     pub spark_capacity_rows: u64,
-    /// Explicit pool tokens; `None` sizes the pool from what is left.
+    /// Explicit pool tokens; `None` or `Some(0)` sizes the pool from what is left.
     pub pool_tokens: Option<u64>,
     /// Upper bound for an automatically sized pool.
     pub target_pool_tokens: u64,
@@ -180,13 +180,32 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
     let conversions = load_conversions(family, checkpoint);
     let costs = family_costs(family);
     let gpus = options.rtx_bytes.len().clamp(1, 2);
-    let split = gpus == 2 && options.head_split;
+    // Qwen currently executes entirely on the first coordinator GPU.
+    let split = gpus == 2 && options.head_split && family != "qwen4";
+    let active_gpus = if family == "qwen4" { 1 } else if split { 2 } else { 1 };
     let mut devices: Vec<DeviceLayout> = options.rtx_bytes.iter().take(gpus).enumerate()
         .map(|(index, &bytes)| DeviceLayout { kind: DeviceKind::Rtx, index: index as u32,
             capacity_bytes: bytes.saturating_sub(options.headroom_bytes), items: Vec::new(), kv_tokens: 0 })
         .collect();
     let mut waste = Vec::new();
     let mut notes = Vec::new();
+    let qualified = matches!(family, "mimo_v2" | "glm5" | "glm5_flash");
+    let allowance_basis = if qualified { Basis::Calibrated } else { Basis::Estimated };
+    if !qualified {
+        notes.push(format!("{family}: workspace/runtime/Spark allowances are unqualified; validate against the allocation ledger before using this layout for admission"));
+    }
+    if family == "qwen4" && gpus == 2 {
+        notes.push("Qwen serves on rtx0; rtx1 is idle and contributes no KV capacity".into());
+    }
+    if family.starts_with("deepseek_v4") {
+        notes.push("DeepSeek RTX expert residency and dSpark workspaces are not calibrated by this layout; the cache geometry describes the target only".into());
+    }
+    if matches!(family, "deepseek_v4" | "deepseek_v41" | "qwen4") {
+        notes.push("Total is incomplete: mapped-table staging, context tables and prefix arenas still need the concrete serving configuration".into());
+    }
+    if family == "deepseek_v41" && split {
+        notes.push("V4.1 source storage follows the 20/20 CED placement; coordinator weight ownership still uses the generic estimate".into());
+    }
 
     // Coordinator weights: a family's exact resident layout where it has one,
     // else checkpoint bytes per component under the family's conversions.
@@ -200,10 +219,12 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
         }
     }
     let covered = |c: Component| (exact.is_some() && !matches!(c, Component::Speculator | Component::SpeculatorExpert
-        | Component::Vision | Component::TableProjection))
+        | Component::Vision | Component::TableProjection | Component::RoutedExpert))
         || (!costs.mtp_resident && matches!(c, Component::Speculator | Component::SpeculatorExpert));
     for component in report.components.iter()
-        .filter(|c| c.owner == Owner::Rtx && c.status != Status::Unused && !covered(c.component)) {
+        .filter(|c| (c.owner == Owner::Rtx
+            || (c.owner == Owner::SparkSliced && report.placement == ExpertPlacement::Local))
+            && c.status != Status::Unused && !covered(c.component)) {
         let (resident, format) = match conversions.iter().find(|c| c.component == component.component) {
             Some(c) => (component.bytes.saturating_sub(c.saved_bytes), c.format.to_string()),
             None => ((component.bytes as f64 * costs.resident_factor) as u64,
@@ -213,6 +234,7 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
             Component::Embedding => Category::Embedding,
             Component::Speculator | Component::SpeculatorExpert => Category::Drafter,
             Component::TableProjection => Category::Tables,
+            Component::RoutedExpert => Category::Experts,
             _ => Category::Weights,
         };
         let group = component.component.label();
@@ -246,42 +268,57 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
     // The drafter lives on the lead GPU (taps and head are there under a head split).
     let drafter = if options.drafter_bytes > 0 { options.drafter_bytes } else { costs.drafter_bytes };
     if drafter > 0 {
-        devices[0].items.push(Item::new(Category::Drafter, "drafter", "", drafter, Basis::Calibrated));
+        devices[0].items.push(Item::new(Category::Drafter, "drafter", "", drafter, allowance_basis));
     }
 
     // Fixed runtime costs.
-    let gpus_now = devices.len();
-    for (index, device) in devices.iter_mut().enumerate() {
+    let gpus_now = active_gpus;
+    for (index, device) in devices.iter_mut().take(active_gpus).enumerate() {
         let role = if gpus_now == 1 { 0 } else if index == 0 { 1 } else { 2 };
         device.items.push(Item::new(Category::Runtime, "context+modules", "", costs.runtime_bytes[role],
-            Basis::Calibrated));
-        device.items.push(Item::new(Category::Runtime, "graph allowance", "", costs.graph_bytes[role], Basis::Calibrated));
+            allowance_basis));
+        device.items.push(Item::new(Category::Runtime, "graph allowance", "", costs.graph_bytes[role], allowance_basis));
         let workspace = costs.workspace_bytes[role] * options.prefill_rows.max(1) / 4096;
-        device.items.push(Item::new(Category::Workspace, "steps", "", workspace, Basis::Calibrated));
+        device.items.push(Item::new(Category::Workspace, "steps", "", workspace, allowance_basis));
         if split {
-            device.items.push(Item::new(Category::Transport, "peer exchange", "", costs.exchange_bytes, Basis::Calibrated));
+            device.items.push(Item::new(Category::Transport, "peer exchange", "", costs.exchange_bytes, allowance_basis));
         }
     }
 
     // KV pool: per-device bytes per logical token from the family geometry.
-    let geometry = model.cache_geometry(CacheOptions { coordinator_ranks: if split { 2 } else { 1 }, ..Default::default() });
+    let geometry = model.cache_geometry(CacheOptions { coordinator_ranks: active_gpus,
+        prefill_rows: options.prefill_rows, ..Default::default() });
     let mut pool_tokens = 0;
     match geometry {
         Ok(Some(geometry)) => {
             let unit = geometry.logical_unit_rows.max(1);
             let per_token: Vec<u64> = (0..devices.len()).map(|d| geometry.ranks.get(d)
                 .map_or(0, |r| (r.persistent_unit_bytes + r.pool_metadata_unit_bytes).div_ceil(unit))).collect();
-            let free: Vec<i64> = devices.iter().map(DeviceLayout::free_bytes).collect();
-            pool_tokens = options.pool_tokens.unwrap_or_else(|| size_pool(&free, &per_token, unit, options.target_pool_tokens));
-            for (device, (rank, &cost)) in devices.iter_mut().zip(geometry.ranks.iter().zip(&per_token)) {
-                device.items.push(Item::new(Category::Kv, "records", "", cost * pool_tokens, Basis::Formula));
+            // Reserve fixed state and marks before sizing records. Otherwise
+            // an automatic pool consumes the bytes those allocations need.
+            for (device, rank) in devices.iter_mut().zip(&geometry.ranks) {
                 device.items.push(Item::new(Category::Kv, "state", "", rank.fixed_state_bytes
-                    + rank.active_state_per_sequence_bytes * (options.concurrency + 2), Basis::Formula));
+                    + rank.active_state_per_sequence_bytes * (options.concurrency + 2)
+                    + rank.speculative_replay_bytes, Basis::Formula));
                 if costs.mark_slots > 0 && rank.retained_mark_bytes > 0 {
                     device.items.push(Item::new(Category::Prefix, "marks", "", rank.retained_mark_bytes * costs.mark_slots,
                         Basis::Formula));
                 }
-                device.kv_tokens = pool_tokens;
+            }
+            let free: Vec<i64> = devices.iter().map(DeviceLayout::free_bytes).collect();
+            pool_tokens = options.pool_tokens.filter(|&tokens| tokens != 0)
+                .unwrap_or_else(|| size_pool(&free, &per_token, unit, options.target_pool_tokens));
+            for (device, &cost) in devices.iter_mut().zip(&per_token) {
+                if cost > 0 {
+                    let units = pool_tokens.div_ceil(unit);
+                    let rank = &geometry.ranks[device.index as usize];
+                    device.items.push(Item::new(Category::Kv, "records", "",
+                        (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes) * units, Basis::Formula));
+                    device.kv_tokens = pool_tokens;
+                }
+                if device.free_bytes() < 0 {
+                    notes.push(format!("{}: requested KV pool exceeds the device budget", device.name()));
+                }
             }
             if geometry.placement == KvPlacement::Replicated && devices.len() == 2 {
                 waste.push(Waste { device: "rtx1".into(), what: "KV records replicated on both GPUs (MLA latent)".into(),
@@ -319,9 +356,9 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
                 .map(|c| c.formats.keys().cloned().collect::<Vec<_>>().join("+")).unwrap_or_default();
             device.items.push(Item::new(Category::Experts, "routed_expert", format, stored, Basis::Exact));
             let workspace = costs.spark_workspace_bytes * options.spark_capacity_rows / 4096;
-            device.items.push(Item::new(Category::Workspace, "expert waves", "", workspace, Basis::Calibrated));
-            device.items.push(Item::new(Category::Transport, "rdma rings", "", costs.spark_ring_bytes, Basis::Calibrated));
-            device.items.push(Item::new(Category::Runtime, "context+modules", "", 512 * MIB, Basis::Calibrated));
+            device.items.push(Item::new(Category::Workspace, "expert waves", "", workspace, allowance_basis));
+            device.items.push(Item::new(Category::Transport, "rdma rings", "", costs.spark_ring_bytes, allowance_basis));
+            device.items.push(Item::new(Category::Runtime, "context+modules", "", 512 * MIB, allowance_basis));
             devices.push(device);
         }
         if !exact && report.spark_rank_share * ranks as f64 > 1.001 {

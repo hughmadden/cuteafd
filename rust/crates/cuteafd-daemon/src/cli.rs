@@ -179,13 +179,13 @@ pub(crate) struct PlanArgs {
     /// workspaces, runtime and Spark buffers.
     #[arg(long)]
     pub(crate) layout: bool,
-    /// Coordinator GPUs for --layout (1 or 2; two split attention heads).
+    /// Coordinator GPUs for --layout (1 or 2; Qwen currently uses only the first).
     #[arg(long, default_value_t = 1)]
     pub(crate) rtx: usize,
     /// Usable GiB per coordinator GPU for --layout.
     #[arg(long, default_value_t = 95.5)]
     pub(crate) rtx_gib: f64,
-    /// Explicit KV pool tokens for --layout (default: sized from what is left).
+    /// Explicit KV pool tokens for --layout (0 or omitted: automatic).
     #[arg(long)]
     pub(crate) pool_tokens: Option<u64>,
     /// External drafter GiB on the last GPU for --layout (DFlash).

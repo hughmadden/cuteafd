@@ -862,3 +862,39 @@ fn layout_places_every_device_and_names_padded_spark_slices() {
     assert_eq!(experts(0) * 2, experts(4) * 3);
     assert!(!layout.waste.iter().any(|w| w.what.contains("padded")), "{:?}", layout.waste);
 }
+
+#[test]
+fn qwen_layout_reserves_recurrent_state_before_auto_pool_and_leaves_peer_idle() {
+    use cuteafd_core::memory_layout::Category;
+    let dir = snapshot(qwen4_config(48), &[]);
+    let options = PlanOptions {
+        layout: Some(layout::LayoutOptions {
+            rtx_bytes: vec![12 << 30, 96 << 30], pool_tokens: Some(0), ..Default::default()
+        }), ..sparks(0)
+    };
+    let report = plan(dir.path(), &options).unwrap();
+    let memory = report.memory_layout.as_ref().unwrap();
+    assert!(memory.pool_tokens > 0);
+    assert_eq!(memory.pool_tokens % 256, 0);
+    assert!(memory.devices[0].free_bytes() >= 0, "{}", memory.render());
+    assert!(memory.devices[0].by_category()[&Category::Kv] > 0);
+    assert_eq!(memory.devices[1].used_bytes(), 0);
+    assert_eq!(memory.devices[1].kv_tokens, 0);
+    let mut implicit = options.clone();
+    implicit.layout.as_mut().unwrap().pool_tokens = None;
+    assert_eq!(plan(dir.path(), &implicit).unwrap().memory_layout.unwrap().pool_tokens, memory.pool_tokens);
+}
+
+#[test]
+fn layout_charges_local_routed_experts_to_the_coordinator() {
+    use cuteafd_core::memory_layout::Category;
+    let dir = qwen_snapshot(4);
+    let report = plan(dir.path(), &PlanOptions {
+        layout: Some(layout::LayoutOptions { pool_tokens: Some(256), ..Default::default() }), ..sparks(0)
+    }).unwrap();
+    let routed = component(&report, Component::RoutedExpert).bytes;
+    assert!(routed > 0);
+    let memory = report.memory_layout.unwrap();
+    assert_eq!(memory.devices[0].by_category()[&Category::Experts], routed);
+    assert_eq!(memory.devices.len(), 1);
+}
