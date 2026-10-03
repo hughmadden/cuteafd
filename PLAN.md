@@ -655,8 +655,12 @@ active admission deferral and active KV paging are separate remaining work.
         accepted active, prefill, KV-deferred and already-queued requests too,
         while excluding completed responses before fallible context updates.
         Request-local tokenization/first-token/grammar failures retain their
-        cause. Recipient lifecycle and existing API router tests pass; actual
-        full-model raw-channel/HTTP fault injection remains open. Reserved
+        cause. Actual two-RTX/TP6 scheduler faults now pass through raw channels
+        and loopback HTTP: active, partially prefilled, KV-deferred and queued
+        requests receive the same primary error exactly once, without successful
+        completion. Already-finished requests remain complete after a real
+        drafter context-update failure. The old-code negative control reproduces
+        the lost errors with the same actual request frontiers. Reserved
         HTTP image-preparation permits and startup errors are outside this
         native-request follow-up.
         Private MiMo terminal ownership fixes also cover failures after engine
@@ -667,18 +671,20 @@ active admission deferral and active KV paging are separate remaining work.
         pass, including actual pending expert waves, complete SparkLink Drop,
         failed QP/publication/intake drains and post-target sampler failure.
         Successful retirement releases owners only after draining; unproved
-        completion retains their storage and native module. HTTP fatal-event,
-        active grammar/host-copy fault coverage, pre-engine loader retirement
-        and shared V4.1 parity remain open.
+        completion retains their storage and native module. Active grammar and
+        host-copy fault coverage and shared V4.1 parity remain open.
         A private common FP8 packing fix retains the native module and pinned
         staging after an unprovable drain. Directed CPU module/packing fixtures
-        pass for failure retention and normal cleanup; real queued-CUDA loader
-        unwind still needs its own gate. Private MiMo loader fixes now drain
+        pass for failure retention and normal cleanup. Private MiMo loader fixes drain
         row dequantization and pitched projection copies even after a launch
         or later tensor error, retaining storage and the native module when
         completion cannot be proved. CPU native fault injection detects all
-        five original failure paths and passes with the fix; real queued-CUDA
-        and peer-copy retirement remain unqualified.
+        five original failure paths and passes with the fix. Nine real queued-CUDA
+        cases now pass, including GPU1 peer work still pending across native-owner
+        Drop and a later missing scale-shard read. The peer gate exposed a blocking
+        free of an earlier GPU0 output; completed split outputs and earlier device
+        and pinned owners now survive an unproved drain. Healthy retirement releases
+        those owners and closes the actual native handle once; quarantine does neither.
      c. Speculation not lossless: V4 Pro EXL3 K2 dSpark diverges at token 4
         (1.95 nat), C4 ≠ C1 at token 15; GLM 5.3 Flash tr3 DFlash2 0.84 nat;
         GLM 5.3 EXL3 0.57 nat. Suspect multi-row verify numerics/state.
@@ -911,9 +917,11 @@ active admission deferral and active KV paging are separate remaining work.
     Transport selection is identical and decode completion logs contain no
     late graph captures. TJ approved the measured single-copy FP8 bundle as
     the default specifically for MiMo V2.6 Pro (2026-10-03): target O
-    projections, the shared vocabulary head and DFlash weights. Implement
-    that scoped selection with explicit checkpoint/BF16 overrides; preserve
-    checkpoint precision for other models and other tensors. Existing
+    projections, the shared vocabulary head and DFlash weights. The scoped
+    selection is implemented with explicit checkpoint/BF16 overrides, preserving
+    checkpoint precision for other models and other tensors. On both reference
+    layouts, the automatic default matches the saved qualified FP8 target logits
+    and explicit-setting DFlash serving output exactly. Existing
     measurements do not automatically qualify a larger KV pool. Repeated
     concurrent serving still changes some responses in both representations;
     the fixed-history checks do not prove all serving histories correct.
@@ -922,8 +930,8 @@ active admission deferral and active KV paging are separate remaining work.
     and fixed-history state on both reference layouts. Actual two-lane prefill
     matches serial prefill and continuation exactly on both layouts; the
     earlier smaller-chunk gate exercised only the serial path. Native
-    promotion still needs V4.1 parity; complete concurrent-history correctness
-    and terminal ownership remain separate open gates.
+    promotion still needs V4.1 parity. The bounded real scheduler and terminal
+    ownership gates pass; complete concurrent-history correctness remains open.
     The source audit also finds implicit BF16 quantization and duplicate
     matrices in Qwen attention/MTP, shared GLM/GLM Flash DFlash, and the
     GLM Flash launcher's default KDA path. Correct the checkpoint-preserving
