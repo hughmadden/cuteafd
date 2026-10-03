@@ -342,9 +342,8 @@ FP4, most other weights BF16/FP8 as released. Design (study 2026-09-30):
   it reproduces NVIDIA's weights with unquantized activations); scale
   swizzle, when a kernel wants it, runs on the GPU at load
   (`nvfp4_scale.cu`, parameterized); no offline repack.
-- Dense NVFP4/per-tensor-FP8 parts should retain their compact checkpoint
-  representation. Existing load-time BF16 fallbacks are compatibility debt
-  to close under the v1 resident-weight work below.
+- Dense NVFP4/per-tensor-FP8 parts dequantize to BF16 at load today;
+  item 10 of the v1 plan replaces that with compact consumers.
 - V4.1: its NVFP4 release has exactly the official MXFP4 weights
   (power-of-two scales) → lossless downcast at load onto the existing W4A8
   path; the W4A4 44-slot family stays opt-in (ds41rt measured it slower).
@@ -530,68 +529,8 @@ local until TJ says to push them. No model license notes: we bundle no weights.
 Everything after v0 lands as v1. Helpers: read AGENTS.md, then pick the top
 open item; each names its branch (pushed WIP) and the next step. Merge green
 steps into `work/p0`; tag `v1.0.0` when the list's top half is done.
-
-Current agent integration: `codex/v1`, isolated from the orchestration checkout.
-The user chooses release cuts; development fixes below do not cut a release.
-
-Scoped closeout (2026-10-03): integrate the completed memory admission,
-checkpoint-weight policy, loader/terminal ownership, accepted-request errors
-and paired MiMo prefill subitems into `codex/v1`, then stop. The qualified
-MiMo single-copy output consumer is published in SparkInfer and pinned here.
-Host suites and the bounded MiMo, Qwen and GLM Flash gates pass. The user
-explicitly skipped the remaining final V4.1 campaign after two one-RTX A/B
-pairs matched outputs and passed their throughput/capture checks. Full
-three-pair and two-RTX closeout parity are not claimed. The open items below,
-including larger default KV integration, concurrent-history correctness,
-compact GLM target consumers and inherited V4.1 prefill graph eviction, remain
-follow-ups; this closeout does not complete the whole v1 plan or cut a release.
-
-Joint serving capacity is in progress: the pure resolver budgets each physical
-GPU at 97% of total minus existing usage and explicit reservations, preserves
-small pool overrides, and reports the common 2,097,152-token target and its
-shortfall. `cuteafd plan` now describes canonical target-only cache
-storage for GLM, GLM Flash, Qwen and MiMo, including replicated versus
-head-partitioned KV, C16 / 20 state slots and exact prefix mark bytes. It does
-not infer a compiled index limit or claim that weight placement alone admits
-the serving configuration. Native MTP costs are available when explicitly
-requested; target-only costs do not include an external drafter.
-MiMo workspace allocation now consumes the same pure size description that
-startup admission will use. Split peer workspaces and fully split target
-prefill use their assigned attention heads, including INT8 prefill BF16
-shadows; lead decode retains global geometry for unsplit MTP. The change
-passed exact full-model restore, pipeline and continuation checks.
-Serving also admits only the final prefill logits row; diagnostic engines
-retain all rows, and decode/verification keep their full output extent.
-The smaller allocation passes both reference layouts' exact logits/KV checks,
-split-rank cache restores, continuation and serving with speculation on/off.
-Unsupported explicit MiMo head splits now fail before loading, and stream
-cleanup preserves the primary error. Failed split-rank submissions now abort
-queued peer waits; teardown releases owners only after proven retirement and
-retains them when completion is unproved.
-MiMo expert scratch, Spark intake and startup negotiation now admit at least
-the full decode/verify extent even when prefill chunks are smaller. The
-narrow-prefill full-model gate matches physical KV/marks, every layer and
-continuation exactly; the old path fails its native capacity guard.
-
-Next: startup must consume the same resolved pool/context/state values before
-loading weights, with actual weight conversions, all lane/workspace shapes,
-native scratch, prefix marks, transport and optional draft allocations in the
-profile. Keep checkpoint maximum and effective compiled context separate.
-The common default target is 2,097,152 logical GPU KV tokens for every family,
-including DeepSeek, with C16 and 20 front-state slots. Reserve that pool and
-all steady runtime storage first, then onboard the maximum expert layers from
-the remaining per-device budget. Admit weight-loading temporaries separately
-so released staging does not reduce steady capacity. Larger pools and smaller
-benchmark overrides remain explicit launch options. Report hardware shortfall
-and maximum-context feasibility; do not silently change precision or context.
-MiMo Pro's checkpoint-preserving one-RTX 2M configuration does not fit after
-mandatory workspaces/state and fails admission before loading. The private
-two-RTX candidate passes physical allocation accounting through all decode
-graph shapes, full draft/masked sampling and bounded host restoration, with
-one shared prefill KV shadow per rank. Grammar ownership and the complete
-serving footprint still need qualification before changing defaults. Bounded
-host storage retains inactive exact prefixes for every supported family;
-active admission deferral and active KV paging are separate remaining work.
+The codex/v1 line (merged 2026-10-03, `work/codex-merge`) closed several
+item-4 bugs and started items 7 and 10; commit messages carry its evidence.
 
 1. **Device-driven Spark exchange, shared by every family** — branch
    [`work/v41-device`](https://github.com/tpurtell/cuteafd/tree/work/v41-device). Today every family does 2–3
@@ -633,223 +572,86 @@ active admission deferral and active KV paging are separate remaining work.
 4. **Model-specific issues found** (fix in v1, not essential for v0):
    - GLM 5.3 Flash (likely GLM 5.3): a JSON-schema request whose grammar
      accepts the stop token keeps decoding; xgrammar `fill_bitmask` then fails
-     and the whole batch fails. Fixed in `f3c7505`: every compiler stop token
-     terminates a speculative grammar proposal before another matcher call.
+     and the whole batch fails. Fixed (`f3c7505`): every stop token ends a
+     speculative grammar proposal.
    - MiMo V2.6 Pro: two-lane prefill runs only without the head split, so 8K
-     prefill is slower on 2 RTX (4.79 s) than on 1 RTX (3.18 s). Fixed in
-     `bf1a061`: both head-split GPUs pipeline the lanes; both GPUs' KV bytes,
-     final logits and greedy continuation match the serial reference exactly.
+     prefill is slower on 2 RTX (4.79 s) than on 1 RTX (3.18 s). Fixed
+     (`bf1a061`): both head-split GPUs pipeline the lanes; short independent
+     requests also pair on the two lanes (`5b191f2`).
    - V4.1 on 1 RTX: startup is serial (Sparks load all 40 layers at ~0.4 GB/s
      each, ~205 s, including 5 the RTX holds; then the coordinator). Start the
      coordinator first, skip RTX-held layers on the Sparks, speed up the Spark
-     layer load. 2 RTX: 108 s. `be7049f` qualifies coordinator-first auto
-     placement and the worker layer boundary; Spark read throughput remains open.
+     layer load. 2 RTX: 108 s. Coordinator-first auto placement on 1 RTX
+     landed (`be7049f`); Spark layer read speed is still open.
    - DeepSeek V4 Flash: the native expert format refuses 2 Sparks (min config
      needs 4); V4.1 TP3 fits per `cuteafd plan` but is unqualified.
    - Benchmarks: reasoning-effort panel re-run after the pool back-off fix;
-     turn-end cache check is informational (greedy non-repeat); code sandbox
-     network isolation is fixed in `fd74aaf` (required network/PID namespaces,
-     unavailable rather than unisolated execution); tool-eval-bench reaches images with the next
-     `./build.sh`.
+     turn-end cache check is informational (greedy non-repeat); the code
+     sandbox requires user/net/PID namespaces (`fd74aaf`; coordinators run
+     with `docker/seccomp-code-bench.json`); tool-eval-bench reaches images
+     with the next `./build.sh`.
    - From the v0 Release smoke matrix (10 of 22 cards fail the gate;
      logs in `~/.cache/cuteafd/builds/v0/kit/smoke-state/`):
      a. Forced tool calls: GLM 5.3 EXL3 (min, max) crashes the coordinator
         ("matcher terminated after accepting the stop token"); GLM 5.3 Flash
         EXL3 max, tr3 4bpw min/max and MiMo V2.6 Pro min/max abort the stream
         mid-response. Same grammar/matcher path: stop when the grammar accepts
-        the stop token, never fail the batch. Stop-token handling is fixed in
-        `f3c7505`; model smoke cards still need their own reruns.
-        GLM Flash tr3 forced-tool serving passes under the required sandbox;
-        `0a441b9` also fixes a narrow-prefill workspace admission failure.
+        the stop token, never fail the batch. Fixed in `f3c7505`; rerun the
+        smoke cards.
      b. A worker failure mid-stream drops the SSE connection with no error
-        event (all families). Fixed in `f3c7505`: one structured error event,
-        preserving the backend cause, with no successful terminal event.
-        A private MiMo scheduler follow-up now reports a fatal cause to other
-        accepted active, prefill, KV-deferred and already-queued requests too,
-        while excluding completed responses before fallible context updates.
-        Request-local tokenization/first-token/grammar failures retain their
-        cause. Actual two-RTX/TP6 scheduler faults now pass through raw channels
-        and loopback HTTP: active, partially prefilled, KV-deferred and queued
-        requests receive the same primary error exactly once, without successful
-        completion. Already-finished requests remain complete after a real
-        drafter context-update failure. The old-code negative control reproduces
-        the lost errors with the same actual request frontiers. Reserved
-        HTTP image-preparation permits and startup errors are outside this
-        native-request follow-up.
-        Private MiMo terminal ownership fixes also cover failures after engine
-        creation, including a partially installed peer stream. Focused startup
-        tests and real connected-RDMA endpoint faults pass: successful teardown
-        retires registrations before buffers; failed teardown retains native
-        module and storage ownership. Full MiMo two-RTX/TP6 owner faults now
-        pass, including actual pending expert waves, complete SparkLink Drop,
-        failed QP/publication/intake drains and post-target sampler failure.
-        Successful retirement releases owners only after draining; unproved
-        completion retains their storage and native module. Active grammar and
-        host-copy fault coverage and shared V4.1 parity remain open.
-        A private common FP8 packing fix retains the native module and pinned
-        staging after an unprovable drain. Directed CPU module/packing fixtures
-        pass for failure retention and normal cleanup. Private MiMo loader fixes drain
-        row dequantization and pitched projection copies even after a launch
-        or later tensor error, retaining storage and the native module when
-        completion cannot be proved. CPU native fault injection detects all
-        five original failure paths and passes with the fix. Nine real queued-CUDA
-        cases now pass, including GPU1 peer work still pending across native-owner
-        Drop and a later missing scale-shard read. The peer gate exposed a blocking
-        free of an earlier GPU0 output; completed split outputs and earlier device
-        and pinned owners now survive an unproved drain. Healthy retirement releases
-        those owners and closes the actual native handle once; quarantine does neither.
+        event (all families). Fixed in `f3c7505` (one structured error event);
+        MiMo reports a fatal cause to every accepted request (`50b2608`) and
+        retains native owners until queued work provably drains.
      c. Speculation not lossless: V4 Pro EXL3 K2 dSpark diverges at token 4
         (1.95 nat), C4 ≠ C1 at token 15; GLM 5.3 Flash tr3 DFlash2 0.84 nat;
         GLM 5.3 EXL3 0.57 nat. Suspect multi-row verify numerics/state.
-        `3010e1c` adds strict GLM Flash rejected-suffix causality, committed
-        state and continuation checks. Those checks pass. The first numerical
-        difference is split-dependent rounding of normalized BF16 MLA partials;
-        EXL3's narrow K128 accumulation adds drift relative to K64 decode.
-        GLM Flash decode retains MLA partials in FP32 and selects the K64 EXL3
-        specialization for 2–16 live rows, admitting its workspace before weights.
-        The full nine-row quality gate passes, with exact rejected-suffix,
-        committed-state and continuation checks. This reduces numerical drift;
-        serial/wide byte equality and C1/C4 batch invariance remain open.
-        The serving lossless panel passes its near-tie criterion, not byte equality.
-        `16cf99d` separately makes no-speculation requests skip actual GLM
-        Flash neural drafter forwards; this does not change verify numerics.
+        GLM Flash: FP32 MLA decode partials + K64 EXL3 for 2–16 rows
+        (`262cf29`) cut serial-vs-verify KL 0.0060 → 0.0041; rejected-suffix
+        causality checks pass. Byte equality and C1/C4 invariance open.
      d. Batch invariance: C4 ≠ C1 greedy on V4 Pro, GLM 5.3, GLM 5.3 Flash.
-     e. NVFP4 local experts on one RTX (GLM 5.3 Flash, Qwen 3.8): the severe
-        slowdown came from implicit bounded paging, not a slow SM120 kernel.
-        Fixed in `4c02f2f`: local experts are fully resident by default,
-        admitted with scratch before allocation; paging requires an explicit
-        window. Qwen NVFP4 A/B logits are byte-exact. GLM Flash's local expert
-        set does not fit one RTX and now reports the admission failure.
+     e. NVFP4 local experts on one RTX: was implicit expert paging, not a
+        slow kernel. Fixed (`4c02f2f`): local experts are resident by
+        default (Qwen NVFP4 decode 21 s → 8.7 ms/step); paging needs an
+        explicit `--expert-window`.
      f. GLM 5.3 Flash and Qwen ignore `RTX_GPUS=2` (no head split), so their
-        max layout is 1 RTX + 4 Sparks. `7d54499` rejects unsupported explicit
-        two-GPU layouts before launch; real head splits remain open.
+        max layout is 1 RTX + 4 Sparks. Explicit two-GPU requests now fail
+        before launch (`7d54499`); real head splits remain open.
      g. Qwen 3.8 EXL3: 84 tok/s with 4 Sparks vs 261 on one RTX alone.
      h. Prefill gets worse with more hardware: V4 Pro min 879 tok/s (9.2 s
         TTFT) vs 2,438 max; MiMo Flash max 2,899 vs min 5,877; MiMo Pro max
         1,754 vs min 2,741 (two-lane prefill off under the head split).
-        Private MiMo paired prefill now passes full-model checkpoint-mode
-        correctness on one and two RTX with TP6: raw KV, taps, draft context,
-        logits, proposals and fixed continuations match serial execution.
-        Real scheduler/cache cases and cancellation after Spark dispatch also
-        pass without late captures or tracked allocation growth. The same
-        full-model matrix also passes with the single-copy FP8 bundle on both
-        layouts. Clean-binary throughput/latency gates now pass three
-        interleaved serial/paired comparisons on each reference layout,
-        preserving C1 outputs and steady graph captures. The measured cohort
-        includes cold request prefills; it is not sustained C16 decode.
-        HTTP transport and MTP pairing are outside this gate.
      i. V4 / V4.1 turn-end prefix-cache restore not byte-exact (reported,
-        not gated). V4 Flash also differs across repeated uncached solo
-        prefills: captured inputs and coordinator reduction are exact, while
-        Spark expert outputs vary with FP32 atomic arrival order. A private
-        ordered reducer removes that component's repeat drift but is too slow
-        to promote. Its lower-traffic serial-slice successor now passes the
-        captured-input component gate with exact repeat outputs and wins its
-        interleaved component timing. Its compiled exports now pass mixed-size
-        graph replay and scratch poisoning. The private full-model candidate
-        repeats logits exactly and passes the existing official-reference
-        golden with slightly lower KL/NLL. Prefix restores across the first
-        physical-page boundary also match logits, paged KV, window/compressor
-        state and continuation exactly on the one-RTX reference layout.
-        Serving performance and parity still need qualification before any
-        native pin or default change; admission changes must not hide this
-        baseline defect.
+        not gated). V4 Flash solo prefill also repeats inexactly: Spark FP32
+        atomic reduction order. An ordered serial-slice reducer passed
+        component gates on a private codex branch; not merged.
      j. MiMo V2 Flash fidelity is the weakest that passes (KL 0.10, top-1 82%).
-        `73dfbbe` packages opt-in same-pin BF16 expert-input siblings;
-        `bbd9a6b` preflights their capacity and arithmetic contract before launch.
-        BF16 decode improves the diagnostic fidelity probe; serving defaults
-        stay FP8 pending tool/agentic, batch/state and reference-layout gates.
+        Opt-in BF16 expert-input Spark packages (`EXPERT_INPUT=bf16`,
+        `CUTEAFD_*_FP8_MOE_BF16_FAMILIES=mimo`) improve it; default stays FP8.
      k. Qwen 3.8 FP8 has no Spark expert package (173 GB, no one-RTX fit).
-     l. Generic-family startup did not enforce the compiled index context
-        extent, and `HOST_CACHE_BYTES=auto` failed byte parsing. GLM, GLM
-        Flash and Qwen now retain the manifest extent and reject unsupported
-        requested contexts before engine allocation, naming the exporter
-        setting. Automatic retained-prefix host budgets account for each
-        family's page/mark slabs and are capped by live host/cgroup memory
-        after headroom; disabled retention or unavailable rank-copy support
-        allocates no host tier. Rank-aware MiMo host restores now pass the
-        full-model two-RTX gate: evict device snapshots, overwrite both ranks'
-        KV/rings/marks, promote from host, then compare restored storage,
-        retained logits, every suffix layer and greedy continuation exactly.
-        Copy engines retain the actual device allocations until all owning
-        streams drain. Host retention is available with an explicit bounded
-        quota; adopting the common default remains part of planner integration.
-     m. Cancelled scoped stage chains could release borrowed staging while
-        queued CUDA work still used it. The scope now drains pending work
-        before dropping its future, preserving the caller GPU and thread-local
-        scope. Actual CUDA cancellation/unwind and immediate reuse checks pass,
-        with the unchanged implementation failing the negative control.
-        Combined host-copy/cancellation changes pass repeated V4.1 parity on
-        one and two RTX GPUs; completed and unpolled scopes retain their
-        existing explicit-drain behavior. Closeout also exposed a separate
-        inherited V4.1 cold-prefill defect: large index-selection and
-        attention-query graph entries are evicted between encoder and replay
-        shapes, causing repeated request-time captures despite warmup. Those
-        sources are unchanged in the current batch. Preserve the failed
-        zero-capture evidence, require zero warmed decode captures and bound
-        candidate prefill captures by the identical-config baseline. Fixing
-        these cache lifetimes remains a follow-up, outside this closeout.
-     n. Generic families rejected temporarily exhausted KV pools even when
-        an active request would soon release enough pages. A bounded FIFO
-        waiter now returns borrowed state slots, retries after page/reference
-        release, and drops cancelled requests. Impossible admissions still
-        fail. MiMo Pro passes the deliberately tiny-pool full-model gate on
-        one RTX and on two RTX with host-prefix promotion: overlapping
-        completions and complete sampled vocabulary rows match solo runs
-        exactly. Disabling the waiter produces the expected rejection.
+     l. Fixed on codex/v1: generic families reject contexts beyond the
+        compiled index extent before allocation; `HOST_CACHE_BYTES=auto`
+        is bounded by live host memory; cancelled stage chains drain before
+        staging is reused; generic KV admission waits (FIFO) under
+        transient pool pressure instead of rejecting.
+     m. V4.1 cold prefill: large index-selection / attention-query graph
+        entries are evicted between encoder and replay shapes, so warm
+        requests still capture graphs. Open.
 5. **Spark expert kernels**: MiMo V2.6 Pro TP6 prefill is Spark-bound (~35 of
    ~42 ms per layer); GLM 5.3 verify is bound by distinct expert reads; NVFP4
-   W4A16 GB10 prefill (14.3 vs EXL3 9.1 ms/layer TP4). Pro's installed SM121
-   `fp8-mimop/tp6` package at `5b9c135` already streams MXFP8 × MXFP4 gate/up
-   above 640 live rows: the host dispatch and embedded CUDA binary contain
-   the 640-row branch and `QMMA.SF.16832.F32.E4M3.E2M1.E8`. Its down projection
-   still consumes BF16 SwiGLU output and widens MXFP4 weights for BF16 MMAs.
-   The first private A8-down candidate fails the full-model added-error gate
-   despite its component speedup; it is not deployed. Improve its accuracy
-   before further performance promotion; retain the existing gate/up.
-   MiMo's short-request C16 serving campaign is dominated by serialized cold
-   prefills; decode already batches active sequences. Evaluate independent
-   requests on the two existing prefill lanes before changing weight precision
-   further. Preserve separate placements, rings, complete drafter taps and
-   both first-token outputs; keep shared KV-widening scratch consumers ordered
-   and drain both expert waves on failure. Gate against serial KV/context and
-   continuation exactness, including mixed cached/uncached prefixes, then
-   measure emitted throughput and per-step active rows on both RTX layouts.
-   A private candidate pairs adjacent 1–2047-row requests without changing
-   their kernel row partitions. Larger chunks and MTP keep the existing
-   path. Queue, placement and memory-admission checks pass in the composed
-   workspace. Full-model exactness passes in checkpoint and single-copy FP8
-   modes on both reference layouts; clean-binary emitted throughput and
-   per-request latency also pass three interleaved comparisons per layout.
+   W4A16 GB10 prefill (14.3 vs EXL3 9.1 ms/layer TP4).
 6. **RTX 5090 audit and claim**: hard-coded `4*188` grid clamps and the
    per-tensor FP8 GEMM grid sized for 188 SMs; one SM120 build must serve both.
-   `6d4ea7a` derives expert quantizer grids from each engine's GPU and removes
-   the CLI's fixed SM default. Card-specific AOT/ABI guards remain to qualify.
+   Expert quantizer grids now come from each engine's GPU (`6d4ea7a`).
 7. **Phase 6 placement planner** (incl. cold components such as the vision
    encoder on a Spark) and **multimodal input** (official encoders only).
-   **Joint serving capacity policy** (TJ): default C16, with 20 active
-   SWA/front-layer state slots to tolerate a small burst. Target a common
-   2,097,152-token logical GPU KV pool, with bounded host-prefix overflow for
-   fast session resume. Larger pools are requested from the planner at launch.
-   Report the target and feasible capacity separately when it cannot fit.
-   Reserve KV and runtime storage before maximizing expert onboarding. Keep checkpoint
-   context, compiled index extent and effective serving context distinct.
-   Budget each physical GPU to 97% of total minus pre-existing non-engine
-   usage, reserving resident weights, all workspace/replay/graph/transport
-   storage, optional drafters, active state and exact-prefix marks before
-   allocating the aligned shared pool. GLM KV is replicated under a head
-   split; MiMo KV heads are partitioned, so aggregate GPU bytes cannot be
-   used as interchangeable capacity. One resolved plan must drive both
-   `cuteafd plan` and runtime startup; preserve explicit benchmark overrides.
-   Retained host-prefix storage has its own bounded budget and exact restore
-   gate; it does not extend active GPU KV capacity. Generic admission deferral
-   now passes the MiMo pressure/host-restore gate; active KV paging/offload
-   remains separate work.
-   MiMo's private runtime admission candidate rejects an impossible one-RTX
-   request before module/weight loading and preserves explicit small-pool
-   outputs. Its two-RTX startup check found that capturing all decode shapes
-   exceeds the provisional runtime reservation. Account for the measured
-   module, head-initialization and graph costs before promoting this planner.
+   **Joint serving capacity** (TJ): default C16 with 20 front-state slots and
+   a common 2,097,152-token GPU KV pool; reserve KV, workspaces, graphs,
+   transport and drafters per physical GPU (97% of total minus existing use)
+   before onboarding expert layers; report shortfall instead of silently
+   shrinking. Pure resolver: `cuteafd-core`/`cuteafd-loader`
+   `serving_capacity`; `cuteafd plan` describes cache storage. MiMo admits
+   its runtime reservations before loading (`mimo_v2/admission.rs`). Next:
+   startup consumes the same resolved plan for every family.
 8. **NVFP4 follow-ups**: native per-tensor FP8 decode with static scales.
    **Revisit W4A4 for `nvidia/DeepSeek-V4.1-Flash-NVFP4`** (TJ): V4.1's own
    NVFP4 path keeps the ds41rt 44-slot W4A4 family opt-in because ds41rt
@@ -876,145 +678,29 @@ active admission deferral and active KV paging are separate remaining work.
      A16 today. brandonmusic had unmerged MXFP8 EXL3 WIP; check upstream b12x
      first, else build an EXL3 decode-to-FP8 tile path with MXFP8/FP8
      activations in the fork.
-   - MXFP4 experts: V4.1 already W4A8; MiMo V2.6 Pro's SM121 large-row
-     gate/up already uses MXFP8 × MXFP4 above 640 live rows. Extend A8 to Pro's
-     BF16-input down projection, retaining the existing small-row route and
-     checkpoint weights. Gate added activation error separately from the
-     established model/reference floor, then qualify tool/agentic behavior.
+   - MXFP4 experts (V4.1 already W4A8; MiMo V2.6 Pro W4A16): A8 prefill for
+     MiMo Pro (Spark-bound prefill), and MXFP4 × MXFP8 MMAs for both.
    - FP8 experts: extend W8A8 (MiMo GB10 gate/up) to the down projection and
      to RTX-local experts where KL allows (Qwen FP8 local was +0.024: needs
      finer activation scales).
-10. **Resident weight representations** (TJ, 2026-10-02): close loader
-    shortcuts that permanently widen compact checkpoint tensors to BF16.
-    Keep exactly one resident BF16 or FP8 representation per weight set.
-    A duplicate is allowed only when genuinely tiny or justified by an
-    exceptionally large measured performance benefit; name its bytes and
-    measured justification explicitly. Audit every target and drafter
-    family; report source dtype, resident dtype/layout, bytes and the consumer
-    that requires each copy. Temporary loading buffers and in-kernel
-    dequantization are separate from persistent weight storage.
-    MiMo Pro's target QKV and dense FFN already retain checkpoint FP8; its
-    target o_proj, embedding and head are BF16 in the checkpoint. The target
-    keeps additional FP8 o_proj/head copies, and DFlash retains BF16 weights
-    plus FP8 copies with a BF16 fallback above its skinny-row limit. MiMo's
-    generic BF16 operand loader can also widen FP8 o_proj/head sources.
-    Cover prefill, decode, batched verify, context updates and graph/replay
-    paths before releasing a required representation. Prefer native compact
-    kernels or bounded staging, selecting the representation at startup.
-    Partially split matrices must not retain overlapping BF16/FP8 rows.
-    Do not silently change target checkpoint precision to save
-    memory: added target quantization needs its own golden NLL/KL (<=0.005 nat)
-    and tool/agentic gates. Preserve each checkpoint tensor's precision by
-    default (TJ, 2026-10-03), including BF16 drafter O projections and other
-    BF16 weights; keep native FP8 compact. Additional weight quantization
-    should arrive in a checkpoint. A reasonable calibration-free conversion
-    may be an explicit convenience option. Model-specific defaults require
-    measured quality/performance evidence and explicit approval; MiMo V2.6
-    Pro's approved exception is recorded below.
-    Finish evaluating the existing FP8 feature as that optional path. Its
-    drafter precision is judged by net emitted tokens/s after target
-    verification and actual memory use, including context updates, drafting
-    cost and proposal acceptance. Focus optimization on kernels and plumbing;
-    use A8 activations where the quality/performance gates support them,
-    independently of the checkpoint's weight precision. Drafter proposal KL
-    is diagnostic, not a target-quality
-    threshold or a standalone rejection criterion. Target verification,
-    final-output correctness and cache-state contracts remain mandatory.
-    Eliminate wasted duplicate representations whichever precision wins.
-    Compare separately loaded BF16-only and FP8-only candidates first
-    (TJ, 2026-10-03), with no dual-resident control or runtime precision
-    switching. Target and drafter share the selected vocabulary head;
-    checkpoint-native FP8 QKV/FFN stay compact in both candidates. Cover
-    wide rows without a second weight representation. The historical
-    legacy/no-speculation comparison found divergent concurrent output
-    (C1 matched); preserve that evidence, but qualify target quality and
-    verifier/cache-state correctness directly on the two single-copy paths.
-    The private FP8 feature now passes original-reference quality, exact
-    prefix restoration, fixed-history repeat/graph/causal-anchor checks and
-    tool serving on both MiMo Pro reference layouts. Three interleaved
-    checkpoint/FP8 serving pairs now pass on each layout, including uncached
-    8K prompt latency, readiness, resident memory and C1/C16 emitted throughput.
-    Transport selection is identical and decode completion logs contain no
-    late graph captures. TJ approved the measured single-copy FP8 bundle as
-    the default specifically for MiMo V2.6 Pro (2026-10-03): target O
-    projections, the shared vocabulary head and DFlash weights. The scoped
-    selection is implemented with explicit checkpoint/BF16 overrides, preserving
-    checkpoint precision for other models and other tensors. On both reference
-    layouts, the automatic default matches the saved qualified FP8 target logits
-    and explicit-setting DFlash serving output exactly. Existing
-    measurements do not automatically qualify a larger KV pool. Repeated
-    concurrent serving still changes some responses in both representations;
-    the fixed-history checks do not prove all serving histories correct.
-    The private checkpoint-driven default and shared per-rank prefill KV
-    scratch now match explicit BF16 target quality, logits, prefix restoration
-    and fixed-history state on both reference layouts. Actual two-lane prefill
-    matches serial prefill and continuation exactly on both layouts; the
-    earlier smaller-chunk gate exercised only the serial path. Native
-    promotion now includes the published single-copy output consumer; the
-    remaining final V4.1 parity sessions were explicitly skipped at closeout.
-    The bounded real scheduler and terminal
-    ownership gates pass; complete concurrent-history correctness remains open.
-    The source audit also finds implicit BF16 quantization and duplicate
-    matrices in Qwen attention/MTP, shared GLM/GLM Flash DFlash, and the
-    GLM Flash launcher's default KDA path. Correct the checkpoint-preserving
-    defaults, then replace optional dual-format paths with immutable compact
-    consumers across every row shape. GLM target projection selection also
-    quantizes BF16 sources implicitly; mixed source groups need per-projection
-    dispatch and BF16 dense-FFN exports. GLM target native-FP8 head/index
-    operands are widened persistently today: add compact consumers or report
-    the missing format before allocation. GLM Flash's loaders have similar
-    unsupported-format gaps, but the inspected qualified EXL3 and official
-    FP8 checkpoints store their head, indexer, routers and KDA weights in BF16;
-    those default inputs are not widened. Private GLM Flash KDA checkpoint
-    defaults/header guards and shared DFlash single-copy loaders are composed
-    with the MiMo changes; workspace and script checks pass. Shared GLM/GLM
-    Flash drafter gates pass exact same-shape replay, ring-wrap/tail checks,
-    batch-state isolation and physical weight ownership. Both families now
-    have original-target-conditioned drafter comparisons. GLM Flash's exact
-    four-stream fold and original 64/1097-token anchors pass; the 2305-token
-    wrap case remains an explicitly cyclic state fixture. These component
-    checks do not qualify full-target quality or emitted throughput. Optional
-    FP8 proposal drift is smaller with real conditioning than in the earlier
-    synthetic long-context case; checkpoint BF16 remains the default.
-    GLM target precision admission also passes loader/planner/exporter checks;
-    its compact index-key and BF16 dense consumers still need native gates.
-    Private GLM Flash direct-CLI guards now reject BF16 block inputs before
-    native loading instead of silently quantizing them. Actual checkpoint
-    headers validate the qualified EXL3-primary/official-FP8-side route;
-    standalone planner diagnostics now match this policy, with named missing
-    BF16 consumers and supported native block-FP8 inputs. The planner does
-    not yet model a secondary FP8 snapshot.
-    Private Qwen defaults preserve checkpoint BF16 projections and share the
-    target head with MTP. Legacy duplicate-storage options reject before
-    native loading until compact all-row/shared-head consumers exist. These
-    changes pass composed workspace/script checks. The one-RTX local EXL3
-    smoke now matches explicit BF16 settings exactly on a saved 64-token
-    prefill/one-token original-reference probe and actual fixed-width MTP
-    serving. The GLM Flash tr3/official-FP8-side smoke also matches explicit
-    checkpoint settings exactly across the full 1524-token target reference,
-    actual DFlash code serving and a forced tool call on one RTX plus two
-    Sparks. Readiness is recorded; these bounded gates do not qualify all
-    layouts, formats, concurrent histories or emitted throughput. Qwen NVFP4
-    with checkpoint-FP8 MTP experts remains explicitly unsupported without
-    its separate expert package. GLM Flash direct-CLI and
-    launcher guards reject duplicate-storage options before native loading
-    or worker launch; the composed loader, planner and option changes pass
-    workspace/script checks. Compact single-copy KDA/head consumers and other
-    persistent FP8 widening remain open.
-    GLM head admission now reads indexed checkpoint headers independently of
-    the routed-expert catalog. The
-    audited DeepSeek V4 target/dSpark paths preserve checkpoint weight values;
-    their expanded scale metadata is not a second weight representation.
-    Check exactness when arithmetic is preserved,
-    readiness, C1/C16 decode and 8K prefill on both reference layouts; include
-    every surviving copy and expanded scale layout in admission.
+10. **Resident weight representations** (TJ, 2026-10-03): one resident
+    BF16 or FP8 representation per weight set; preserve each checkpoint
+    tensor's precision by default; calibration-free conversion only as an
+    explicit option; drafter precision is chosen by emitted tok/s and memory.
+    Landed: MiMo resolves head/O/drafter formats from headers; MiMo V2.6
+    Pro defaults to single-copy FP8 head/O/DFlash (TJ-approved exception;
+    `MIMO_WEIGHT_POLICY=checkpoint` opts out). Dual-copy options now fail
+    before loading until single-copy consumers exist: Qwen
+    `--fp8-decode`/`--mtp-fp8-head`, GLM Flash KDA `row128`/`channel` and
+    FP8 head. GLM/GLM Flash DFlash default to checkpoint BF16; single-copy
+    FP8 is `SPECULATOR_FP8=on`. Open: compact FP8 consumers for Qwen
+    projections and GLM Flash KDA (recover the dual-copy decode speed),
+    GLM target head/index operands, and a measured drafter-precision default.
 11. **Parked**: Spark-side reduce-scatter ([`work/spark-reduce`](https://github.com/tpurtell/cuteafd/tree/work/spark-reduce),
    +3% one rail, +9–12% two rails at 200G); split intake
    ([`work/split-intake`](https://github.com/tpurtell/cuteafd/tree/work/split-intake), slower). Revisit only on new evidence.
 12. **Housekeeping**: prune agent test images on raptor; delete
-    `~/.cache/cuteafd/builds/{n10-rel,bisect-rel}` on ostrich (root); refresh
-    the inherited script-test failure ids in AGENTS.md. The stale fixture and
-    sibling-checkout failures are fixed in `37adfc4`; current failing ids are empty.
+    `~/.cache/cuteafd/builds/{n10-rel,bisect-rel}` on ostrich (root).
 
 ## Backlog (lowest priority: only when nothing planned is left)
 
