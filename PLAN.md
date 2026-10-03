@@ -746,9 +746,12 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
         slow kernel. Fixed (`4c02f2f`): local experts are resident by
         default (Qwen NVFP4 decode 21 s → 8.7 ms/step); paging needs an
         explicit `--expert-window`.
-     f. GLM 5.3 Flash and Qwen ignore `RTX_GPUS=2` (no head split), so their
-        max layout is 1 RTX + 4 Sparks. Explicit two-GPU requests now fail
-        before launch (`7d54499`); real head splits remain open.
+     f. GLM 5.3 Flash has a two-GPU head split (`work/glmf-split`, `glmf2`
+        programs: half the KDA/MLA heads and their state, half the dense /
+        shared-expert intermediate; default with RTX_GPUS=auto/2). 2 vs 1 RTX +
+        4 Sparks: EXL3+DFlash2 C1 code 159 -> 168 tok/s, NVFP4 C1 76 -> 83,
+        8K prefill equal; golden NLL 2.4073 -> 2.4054. Qwen still has none
+        (two-GPU requests serve from the first GPU).
      g. Qwen 3.8 EXL3: 84 tok/s with 4 Sparks vs 261 on one RTX alone.
      h. Prefill gets worse with more hardware: V4 Pro min 879 tok/s (9.2 s
         TTFT) vs 2,438 max; MiMo Flash max 2,899 vs min 5,877; MiMo Pro max
