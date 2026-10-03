@@ -107,7 +107,9 @@ pub(crate) struct EngineArgs {
     /// host at load) INSTEAD of BF16: the one head the target (prefill, verify,
     /// golden rows) and the MTP drafts share, every logits row through
     /// `qwen4_head_fp8` in 16-row spans. Default false: both share the BF16 head.
-    #[arg(long, alias = "fp8-head", default_value_t = false, action = clap::ArgAction::Set)]
+    /// Default true: measured on one RTX (C1 code 196 -> 222 tok/s, KL 0.034 ->
+    /// 0.036, top-1 unchanged 88.5%). --fp8-decode stays off: KL +0.012.
+    #[arg(long, alias = "fp8-head", default_value_t = true, action = clap::ArgAction::Set)]
     pub mtp_fp8_head: bool,
     #[command(flatten)]
     pub token_io: crate::shared::token_io::TokenIoArgs,
@@ -223,11 +225,12 @@ mod weight_representation_tests {
     }
 
     #[test]
-    fn checkpoint_bf16_is_the_default_and_fp8_single_copies_are_options() {
+    fn measured_defaults_fp8_head_bf16_projections_and_options() {
         for extra in [&[][..], &["--mtp", "1"][..]] {
             let parsed = args(extra).unwrap();
-            assert!(!parsed.fp8_decode && !parsed.mtp_fp8_head && !parsed.fp8_prefill_w8a8);
+            assert!(!parsed.fp8_decode && parsed.mtp_fp8_head && !parsed.fp8_prefill_w8a8);
         }
+        assert!(!args(&["--mtp-fp8-head", "false"]).unwrap().mtp_fp8_head);
         let parsed = args(&["--fp8-decode", "true", "--mtp-fp8-head", "true", "--fp8-prefill-w8a8", "true"]).unwrap();
         assert!(parsed.fp8_decode && parsed.mtp_fp8_head && parsed.fp8_prefill_w8a8);
         assert!(args(&["--fp8-head", "true"]).unwrap().mtp_fp8_head);

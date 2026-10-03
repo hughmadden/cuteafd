@@ -126,8 +126,8 @@ def _family_launch_lines(tmp_path: Path, family_config: dict, model: str, keys: 
     return _family_launch_result(tmp_path, family_config, model, keys).stderr
 
 
-@pytest.mark.parametrize("mode,expected", [(None, "off"), ("auto", "off"), ("off", "off")])
-def test_glmf_kda_preserves_checkpoint_bf16(tmp_path, mode, expected):
+@pytest.mark.parametrize("mode,expected", [(None, "row128"), ("auto", "row128"), ("off", "off")])
+def test_glmf_kda_defaults_to_single_copy_fp8(tmp_path, mode, expected):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
@@ -172,7 +172,7 @@ def test_glmf_invalid_fp8_options_fail_before_workers_launch(tmp_path, key, valu
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
     result = _family_launch_result(tmp_path, config, "test/glmf",
-                                  f"GLM5_FLASH_FP8_MODEL_ID=off\n{key}={value}\n")
+                                  f"GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_KDA_FP8=off\n{key}={value}\n")
     assert result.returncode == 2 and message in result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
