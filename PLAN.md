@@ -657,6 +657,30 @@ The full Release smoke matrix (family × quant × natural-minimum and maximum
 hardware) published as the README card grid is the v0 artifact. Images stay
 local until TJ says to push them. No model license notes: we bundle no weights.
 
+## Release v1 scope (decided 2026-10-04)
+
+v1 ships when these are done; everything else below moves to v1.x/v2.
+- **In v1:** device-driven exchange for V4.1 and MiMo V2.6 Pro (default only
+  if it beats the current default and is hang-free; otherwise opt-in);
+  byte-exact prefix-cache restores at turn end for V4 / V4.1; planner core for
+  every family (per-device memory layout + admission; V4, V4.1, Qwen still
+  missing); all Release smoke cards green with MOPD as the MiMo Pro default
+  and a refreshed README; MXFP4 32-row tails; the Spark kernel wins already
+  landed; known-issue notes (NVFP4 local experts on one RTX, Qwen with Sparks).
+- **Cut to v1.x/v2:** whole-step graphs if the exchange isn't stable in time;
+  multimodal input (v2); `placement.json` handoff and cold-component placement;
+  V4.1 NVFP4 W4A4 revisit and W4A4 decode; EXL3 × A8 (an independent SM120
+  implementation is the interesting part — not a port of b12x PR #342, whose
+  ShapleyMcg licence covers re-implementations made with reference to it);
+  parked Spark-side reduce / split intake.
+- **RTX 5090 support: Hugh** (external collaborator). Brief: one SM120 build
+  serves RTX PRO 6000 (188 SMs, 96 GB) and RTX 5090 (170 SMs, 32 GB) with no
+  regression on the 6000; remove SM-count assumptions (hard-coded `4*188` grid
+  clamps; the per-tensor FP8 GEMM grid sized for 188 SMs; any L2-size
+  assumptions); simulate a 5090 on a 6000 via the planner's device inventory
+  (`cuteafd plan MODEL --layout`, 32 GB budget) and validate on real 5090s;
+  start from `work/p0`, branch `work/rtx5090`, follow AGENTS.md.
+
 ## Release v1 — priority plan (2026-10-02)
 
 Everything after v0 lands as v1. Helpers: read AGENTS.md, then pick the top
