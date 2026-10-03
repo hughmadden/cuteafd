@@ -290,28 +290,10 @@ impl Opened {
             gib = format!("{:.2}", bytes as f64 / (1u64 << 30) as f64),
             split_gib = format!("{:.2}", peer_bytes as f64 / (1u64 << 30) as f64), "GLM coordinator weights resident");
         let pool_tokens = if args.pool_tokens == 0 {
-            // The planner's GLM costs stay free on each GPU: step workspaces,
-            // graphs, the drafter (lead) and headroom; records fill the rest.
-            let costs = cuteafd_loader::plan::layout::family_costs("glm5");
-            let per_token = model.layers.iter().map(|l| engine::RECORD_BYTES
-                + if l.full_indexer { engine::INDEX_PAGE_BYTES / engine::PAGE_ROWS } else { 0 }).sum::<usize>() as u64;
-            // The drafter's checkpoint plus its context buffers (~1.3 GiB measured for DFlash2).
-            let draft = args.draft.as_deref().map_or(0, |d| crate::shared::memory_report::safetensors_bytes(d) + (1300 << 20));
-            let headroom = cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes;
-            // Allocated after the pool: step workspaces, the peer exchange, the
-            // drafter (lead) and graph executables (~0.5 GiB measured).
-            let graphs = 512u64 << 20;
-            let split = peer_stream.is_some();
-            let (lead, exchange) = if split { (costs.workspace_bytes[1], costs.exchange_bytes) }
-                else { (costs.workspace_bytes[0], 0) };
-            let mut devices = vec![crate::shared::memory_report::KvDevice { device: args.device, bytes_per_token: per_token,
-                reserve_bytes: lead + exchange + draft + graphs + headroom }];
-            if let Some((device, _)) = peer_stream {
-                devices.push(crate::shared::memory_report::KvDevice { device, bytes_per_token: per_token,
-                    reserve_bytes: costs.workspace_bytes[2] + exchange + graphs + headroom });
-            }
-            usize::try_from(crate::shared::memory_report::auto_pool_tokens(&self.library, &devices,
-                engine::PAGE_ROWS as u64, cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS)?)?
+            // The planner's GLM costs stay free on each GPU; records fill the rest.
+            let devices: Vec<i32> = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d)).collect();
+            crate::shared::memory_report::planned_pool_tokens(&self.library, &args.snapshot, &devices,
+                args.draft.as_deref(), args.prefill_rows, 0)?
         } else {
             args.pool_tokens
         };

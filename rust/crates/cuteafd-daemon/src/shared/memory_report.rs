@@ -164,3 +164,39 @@ pub(crate) fn safetensors_bytes(directory: &std::path::Path) -> u64 {
         .filter(|e| e.path().extension().is_some_and(|x| x == "safetensors"))
         .filter_map(|e| std::fs::metadata(e.path()).ok().map(|m| m.len())).sum()).unwrap_or(0)
 }
+
+/// The planner's automatic KV pool for an engine about to allocate its cache:
+/// each GPU's free memory now, minus what the planner says is still to come
+/// there (step workspaces, peer exchange, drafter, recurrent state, prefix
+/// marks, graph executables, headroom), over the family's records per token.
+/// `devices` lists the KV-owning GPUs, lead first; `drafter` is an external
+/// drafter checkpoint the lead GPU will load.
+pub(crate) fn planned_pool_tokens(library: &cuteafd_ffi::NativeLibrary, snapshot: &std::path::Path, devices: &[i32],
+    drafter: Option<&std::path::Path>, prefill_rows: usize, slots: usize) -> anyhow::Result<usize> {
+    use anyhow::Context;
+    let checkpoint = cuteafd_loader::plan::Checkpoint::open(snapshot)?;
+    let family = cuteafd_loader::plan::family::detect(&checkpoint).context("no family for this checkpoint")?;
+    let model = family.open(&checkpoint).map_err(|e| anyhow::anyhow!("{}", e.0))?;
+    let geometry = model.cache_geometry(cuteafd_loader::serving_capacity::CacheOptions {
+        coordinator_ranks: devices.len(), ..Default::default() })?
+        .with_context(|| format!("{} has no cache geometry for {} GPUs", family.id(), devices.len()))?;
+    let costs = cuteafd_loader::plan::layout::family_costs(family.id());
+    let headroom = cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes;
+    let draft = drafter.map_or(0, |d| safetensors_bytes(d) + (1300 << 20));
+    let unit = geometry.logical_unit_rows.max(1);
+    let split = devices.len() == 2;
+    let kv: Vec<KvDevice> = devices.iter().zip(&geometry.ranks).enumerate().map(|(index, (&device, rank))| {
+        let role = if !split { 0 } else if index == 0 { 1 } else { 2 };
+        let workspace = costs.workspace_bytes[role] * prefill_rows.max(1) as u64 / 4096;
+        let state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * slots as u64;
+        let marks = rank.retained_mark_bytes * costs.mark_slots;
+        KvDevice {
+            device,
+            bytes_per_token: (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes).div_ceil(unit),
+            reserve_bytes: workspace + if split { costs.exchange_bytes } else { 0 } + if index == 0 { draft } else { 0 }
+                + state + marks + costs.graph_bytes[role] + headroom,
+        }
+    }).collect();
+    let tokens = auto_pool_tokens(library, &kv, unit, cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS)?;
+    Ok(usize::try_from(tokens)?)
+}

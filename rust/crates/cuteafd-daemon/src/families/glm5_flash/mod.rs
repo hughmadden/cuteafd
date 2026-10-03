@@ -369,7 +369,14 @@ impl Opened {
         tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64,
             fp8_source = self.fp8_checkpoint.is_some(), kda_fp8 = ?args.kda_fp8, fp8_prefill = ?args.fp8_prefill,
             elapsed_ms = started.elapsed().as_millis() as u64, "GLM 5.3 Flash coordinator weights resident");
-        let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
+        // 0: the planner's automatic pool (free memory after the costs still to come).
+        let pool_tokens = if args.pool_tokens == 0 {
+            crate::shared::memory_report::planned_pool_tokens(&self.library, &args.snapshot, &[args.device],
+                args.draft.as_deref(), args.prefill_rows, args.slots)?
+        } else {
+            args.pool_tokens
+        };
+        let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages, args.slots, embedding)?;
         engine.full_prefill_logits = args.full_prefill_logits;

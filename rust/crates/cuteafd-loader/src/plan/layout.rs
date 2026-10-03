@@ -74,8 +74,11 @@ enum Share {
 /// prefill 4096 rows, after an 8K prefill, a C4 and a C1 request).
 #[derive(Debug, Clone, Copy)]
 pub struct FamilyCosts {
-    /// CUDA context, modules, cuBLAS, graph executables (untracked): one GPU, lead and peer of a head split.
+    /// CUDA context, modules and cuBLAS at ready (untracked): one GPU, lead and peer of a head split.
     pub runtime_bytes: [u64; 3],
+    /// Allowance for decode/verify graph executables captured as traffic arrives
+    /// (keyed by exact row counts and table widths; grows after ready).
+    pub graph_bytes: [u64; 3],
     /// Step workspaces incl. sampler and Spark intake at 4096 prefill rows: one GPU, lead, peer.
     pub workspace_bytes: [u64; 3],
     /// Head-split peer exchange slots on each GPU.
@@ -102,7 +105,8 @@ const fn gib(hundredths: u64) -> u64 {
 
 pub fn family_costs(family: &str) -> FamilyCosts {
     let generic = FamilyCosts {
-        runtime_bytes: [gib(150), gib(150), gib(120)],
+        runtime_bytes: [gib(90), gib(90), gib(85)],
+        graph_bytes: [gib(150), gib(150), gib(150)],
         workspace_bytes: [gib(500), gib(450), gib(300)],
         exchange_bytes: gib(50),
         drafter_bytes: 0,
@@ -116,7 +120,10 @@ pub fn family_costs(family: &str) -> FamilyCosts {
     match family {
         // GLM 5.3 EXL3 K4 + DFlash2 (BF16, 4.58 GiB checkpoint + 1.3 GiB context/buffers).
         "glm5" => FamilyCosts {
-            runtime_bytes: [gib(155), gib(172), gib(126)],
+            // Untracked 0.89 / 0.82 GiB at ready, 2.62 / 2.14 after one decode+prefill
+            // bench and still rising (graphs per layer x exact rows x table width).
+            runtime_bytes: [gib(74), gib(89), gib(82)],
+            graph_bytes: [gib(300), gib(300), gib(300)],
             workspace_bytes: [gib(651), gib(559), gib(422)],
             exchange_bytes: gib(56),
             drafter_bytes: gib(588),
@@ -128,7 +135,8 @@ pub fn family_costs(family: &str) -> FamilyCosts {
         },
         // MiMo V2.6 Pro + embedded DFlash (qualified FP8 bundle); MTP unused.
         "mimo_v2" => FamilyCosts {
-            runtime_bytes: [gib(123), gib(137), gib(100)],
+            runtime_bytes: [gib(100), gib(111), gib(100)],
+            graph_bytes: [gib(50), gib(50), gib(50)],
             workspace_bytes: [gib(290), gib(249), gib(120)],
             exchange_bytes: gib(38),
             drafter_bytes: gib(321),
@@ -140,7 +148,8 @@ pub fn family_costs(family: &str) -> FamilyCosts {
         },
         // GLM 5.3 Flash EXL3 + DFlash2; one GPU (no head split).
         "glm5_flash" => FamilyCosts {
-            runtime_bytes: [gib(124), gib(124), gib(124)],
+            runtime_bytes: [gib(78), gib(78), gib(78)],
+            graph_bytes: [gib(150), gib(150), gib(150)],
             workspace_bytes: [gib(472), gib(472), gib(472)],
             drafter_bytes: gib(324),
             mark_slots: 18,
@@ -243,8 +252,9 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
     let gpus_now = devices.len();
     for (index, device) in devices.iter_mut().enumerate() {
         let role = if gpus_now == 1 { 0 } else if index == 0 { 1 } else { 2 };
-        device.items.push(Item::new(Category::Runtime, "context+modules+graphs", "", costs.runtime_bytes[role],
+        device.items.push(Item::new(Category::Runtime, "context+modules", "", costs.runtime_bytes[role],
             Basis::Calibrated));
+        device.items.push(Item::new(Category::Runtime, "graph allowance", "", costs.graph_bytes[role], Basis::Calibrated));
         let workspace = costs.workspace_bytes[role] * options.prefill_rows.max(1) / 4096;
         device.items.push(Item::new(Category::Workspace, "steps", "", workspace, Basis::Calibrated));
         if split {

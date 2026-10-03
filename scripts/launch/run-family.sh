@@ -162,11 +162,12 @@ if [[ -n "$expert_input" ]]; then
     *) echo "EXPERT_INPUT must be fp8, bf16 or bf16-decode" >&2; exit 2 ;;
   esac
 fi
-# POOL_TOKENS=auto (GLM 5.3, MiMo): the largest pool the GPUs hold after fixed costs (up to 2M tokens).
+# POOL_TOKENS=auto (GLM 5.3, GLM 5.3 Flash, MiMo): the largest pool the GPUs hold after the
+# planner's remaining costs (up to 2M tokens).
 if [[ $family =~ ^(glm5|qwen4|deepseek_v4)$ && -n "$(get POOL_TOKENS)" ]]; then
   pool="$(get POOL_TOKENS)"
   if [[ "$pool" == auto ]]; then
-    [[ $family == glm5 ]] || { echo "POOL_TOKENS=auto is supported for GLM 5.3 and MiMo" >&2; exit 2; }
+    [[ $family == glm5 ]] || { echo "POOL_TOKENS=auto is supported for GLM 5.3, GLM 5.3 Flash and MiMo" >&2; exit 2; }
     pool=0
   fi
   family_args+=(--pool-tokens "$pool")
@@ -196,7 +197,8 @@ if [[ $family == glm5_flash ]]; then
       exit 2 ;;
     *) echo "GLM5_FLASH_KDA_FP8 must be auto, off, row128 or channel" >&2; exit 2 ;;
   esac
-  family_args+=(--kda-fp8 "$kda_fp8" --pool-tokens "$(get POOL_TOKENS 65536)")
+  glmf_pool="$(get POOL_TOKENS 65536)"; [[ "$glmf_pool" != auto ]] || glmf_pool=0
+  family_args+=(--kda-fp8 "$kda_fp8" --pool-tokens "$glmf_pool")
   if [[ "$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD off)" == on ]]; then
     echo "GLM5_FLASH_FP8_HEAD=on duplicates the checkpoint head; a shared single-copy consumer is missing; use off" >&2
     exit 2
