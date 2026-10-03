@@ -7,6 +7,10 @@ after tables with conditions.
 
 ## Working method
 
+- Waiting costs tokens, sleeping doesn't: start a long run as one background
+  command that blocks until it finishes (a lock wait or a loop sleeping ≥60 s)
+  and let its completion wake you. Don't poll status or tail logs in between;
+  never keep a wait loop alive after you stop needing its result.
 - Parallelize: run independent feature work as separate agents in separate
   git worktrees, one branch per task, on disjoint hardware where the work
   needs a GPU. Serialize only what shares a GPU or a build cache.

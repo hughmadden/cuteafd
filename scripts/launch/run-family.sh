@@ -126,6 +126,14 @@ case "$speculator" in
   mtp) family_args+=(--mtp "$(key SPECULATOR_DEPTH MTP 1)") ;;
   dspark) dspark_args=(--dspark) ;;
 esac
+# SPECULATOR_DRAFTS: adaptive (default) or a fixed draft count per cycle
+# (DFlash2 on GLM 5.x, GLM 5.3 Flash and MiMo V2), for policy A/B runs.
+drafts="$(get SPECULATOR_DRAFTS adaptive)"
+if [[ "$drafts" != adaptive ]]; then
+  [[ "$drafts" =~ ^[0-9]+$ && $speculator == dflash2 ]] ||
+    { echo "SPECULATOR_DRAFTS must be adaptive or a draft count, with SPECULATOR=dflash2" >&2; exit 2; }
+  draft_args+=(--draft-fixed "$drafts")
+fi
 # Prefix cache (MiMo, GLM 5.3, GLM 5.3 Flash, Qwen 3.8, DeepSeek V4): PREFIX_CACHE_ENTRIES
 # snapshots per bank (prompts, turns; 0 = off), HOST_CACHE_BYTES of pinned host memory for
 # snapshots the device evicts (e.g. 64GiB; 0 = off). POOL_TOKENS: paged KV tokens shared by
@@ -321,7 +329,7 @@ if [[ -n "$split_opt_in" && "$split" == auto && "$explicit_split" == 0 && -z "$s
 fi
 if [[ "$split" != off && "$explicit_split" == 1 ]]; then
   [[ -z "$split_hint" ]] ||
-    { echo "$family ($model_type): two-GPU head split is unsupported; $split_hint; use RTX_GPUS=1 or COORDINATOR_SPLIT=off" >&2; exit 2; }
+    echo "note: $family ($model_type) has no head split yet ($split_hint); serving from GPU $gpu alone" >&2
   [[ -n "$second" ]] ||
     { echo "RTX_GPUS=2 requires two physical coordinator GPUs; only GPU $gpu was selected" >&2; exit 2; }
 fi
@@ -337,7 +345,7 @@ if [[ -n "$second" && "$split" != off ]]; then
     lower=$((gpu < second ? gpu : second)) upper=$((gpu < second ? second : gpu))
     gpus="\"device=$lower,$upper\""
     family_args+=(--device $((gpu == lower ? 0 : 1)) --split-device $((gpu == lower ? 1 : 0)))
-  else
+  elif [[ "$explicit_split" != 1 ]]; then
     echo "note: $family ($model_type) has no head split; auto selected GPU $gpu alone" >&2
   fi
 fi
