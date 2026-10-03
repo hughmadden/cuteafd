@@ -744,6 +744,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             Ok(rows)
         }).collect::<Result<_>>()?;
         let plan_us = console::us(plan_timer);
+        let draft_heads = &drafted;
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
         let distinct_rows: usize = active.iter().zip(&sequences).map(|(a, rows)| (key(a), rows))
             .collect::<std::collections::HashSet<_>>().iter().map(|(_, rows)| rows.len()).sum();
@@ -830,6 +831,9 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             } else {
                 request.counts[1] += drafted;
                 request.counts[2] += accepted;
+            }
+            if let Some(draft) = draft_heads[i].as_ref().filter(|d| !d.confidence.is_empty()) {
+                request.drafts.observe_head(&draft.confidence);
             }
             if planned[i] > 0 {
                 request.drafts.observe(planned[i], accepted);

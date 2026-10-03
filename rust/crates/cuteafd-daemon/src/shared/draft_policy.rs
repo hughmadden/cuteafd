@@ -33,10 +33,12 @@ const COLD_START_CYCLES: usize = 4;
 const PRIOR_SUCCESSES: usize = 3;
 const PRIOR_TRIALS: usize = 4;
 
-/// A sequence's recent draft outcomes.
+/// A sequence's recent draft outcomes (and, for drafters with a confidence
+/// head, the head's recent logits per position).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DraftHistory {
     outcomes: VecDeque<(usize, usize)>,
+    head: VecDeque<Vec<f64>>,
 }
 
 impl DraftHistory {
@@ -53,6 +55,24 @@ impl DraftHistory {
         while self.outcomes.len() > HISTORY {
             self.outcomes.pop_front();
         }
+    }
+
+    /// Records a draft's confidence-head predictions (one per position).
+    pub fn observe_head(&mut self, confidence: &[f32]) {
+        let logit = |p: f32| {
+            let p = f64::from(p).clamp(1e-4, 1.0 - 1e-4);
+            (p / (1.0 - p)).ln()
+        };
+        self.head.push_back(confidence.iter().map(|&c| logit(c)).collect());
+        while self.head.len() > HISTORY {
+            self.head.pop_front();
+        }
+    }
+
+    /// Mean head logit at `position` (1-based) over the recent drafts.
+    pub fn head_center(&self, position: usize) -> Option<f64> {
+        let values: Vec<f64> = self.head.iter().filter_map(|h| h.get(position - 1).copied()).collect();
+        (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
     }
 
     /// (successes, trials) of `position` (censored after a miss).

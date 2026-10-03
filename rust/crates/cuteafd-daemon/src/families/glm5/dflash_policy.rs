@@ -57,17 +57,19 @@ pub(crate) fn confidence(history: &DraftHistory, features: &[[f32; 4]]) -> Vec<f
     calibrated_confidence(&rates, features).unwrap_or(rates)
 }
 
-/// Weight of a dSpark confidence head's prediction against the sequence's
-/// history rate, in logit space (`CUTEAFD_DSPARK_HEAD_WEIGHT`, default 0.75).
+/// Weight of a dSpark confidence head's deviation from its recent mean
+/// (`CUTEAFD_DSPARK_HEAD_WEIGHT`, default 1).
 fn head_weight() -> f64 {
     static WEIGHT: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *WEIGHT.get_or_init(|| std::env::var("CUTEAFD_DSPARK_HEAD_WEIGHT").ok().and_then(|v| v.parse().ok())
-        .filter(|w: &f64| (0.0..=1.0).contains(w)).unwrap_or(0.75))
+        .filter(|w: &f64| (0.0..=4.0).contains(w)).unwrap_or(1.0))
 }
 
-/// Conditional acceptance per position from a dSpark confidence head (the
-/// predicted acceptance of each drafted token given the ones before it),
-/// blended in logit space with the history rate.
+/// Conditional acceptance per position for a dSpark draft: the sequence's
+/// history rate, moved in logit space by how far this draft's confidence
+/// head sits from the head's recent mean at that position. The head (trained
+/// on sampled acceptance, 1 - TV) under-predicts greedy acceptance, so its
+/// level comes from the history and only its draft-to-draft signal is used.
 pub(crate) fn head_confidence(history: &DraftHistory, head: &[f32]) -> Vec<f64> {
     let rates = history.conditional(head.len());
     let logit = |p: f64| {
@@ -75,13 +77,13 @@ pub(crate) fn head_confidence(history: &DraftHistory, head: &[f32]) -> Vec<f64> 
         (p / (1.0 - p)).ln()
     };
     let w = head_weight();
-    head.iter().zip(rates).map(|(&c, rate)| {
-        let c = f64::from(c);
+    head.iter().zip(rates).enumerate().map(|(k, (&c, rate))| {
+        let c = logit(f64::from(c));
         if !c.is_finite() {
             return rate;
         }
-        let z = w * logit(c) + (1.0 - w) * logit(rate);
-        1.0 / (1.0 + (-z).exp())
+        let shift = history.head_center(k + 1).map_or(0.0, |center| w * (c - center));
+        1.0 / (1.0 + (-(logit(rate) + shift)).exp())
     }).collect()
 }
 
@@ -312,12 +314,18 @@ mod tests {
     fn dspark_head_confidence_drives_cold_plans() {
         let cost = step_cost(&K4_TP4_STEP_MS, 64);
         let cold = DraftHistory::default();
-        let head = |c: f32| head_confidence(&cold, &[c; 8]);
-        // The head moves the prior (3 in 4) toward its prediction.
-        assert!(head(0.95)[0] > 0.9 && head(0.05)[0] < 0.2);
-        let informed = |c: f32| Group { history: &cold, confidence: head(c), room: 8, members: 1, informed: true };
+        let mut seen = DraftHistory::default();
+        for _ in 0..4 {
+            seen.observe_head(&[0.5; 8]);
+        }
+        // Without a head mean the prior (3 in 4) stands; then a draft above
+        // the head's recent mean rates higher, one below it lower.
+        assert!((head_confidence(&cold, &[0.95; 8])[0] - 0.75).abs() < 1e-9);
+        assert!(head_confidence(&seen, &[0.95; 8])[0] > 0.95 && head_confidence(&seen, &[0.05; 8])[0] < 0.3);
+        let informed = |c: f32| Group { history: &seen, confidence: head_confidence(&seen, &[c; 8]), room: 8,
+            members: 1, informed: true };
         // No five-draft cold start: a confident head verifies more, a doubtful one none.
-        assert_eq!(plan(&[informed(0.05)], (0, 0), &cost), vec![0]);
+        assert_eq!(plan(&[informed(0.02)], (0, 0), &cost), vec![0]);
         assert!(plan(&[informed(0.97)], (0, 0), &cost)[0] >= 6);
     }
 
