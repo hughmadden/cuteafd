@@ -851,6 +851,8 @@ fn layout_places_every_device_and_names_padded_spark_slices() {
     assert!(layout.pool_tokens > 0 && layout.pool_tokens <= cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
     assert_eq!(layout.pool_tokens % 64, 0);
     assert!(layout.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).all(|d| d.free_bytes() >= 0));
-    // 2048 over six ranks pads 352/320-row slices to 384: named as waste.
-    assert!(layout.waste.iter().any(|w| w.what.contains("padded")), "{:?}", layout.waste);
+    // 2048 over six ranks: exact whole-block slices (384 x 4, 256 x 2), no padding.
+    let experts = |i: usize| layout.devices[2 + i].by_category()[&Category::Experts];
+    assert_eq!(experts(0) * 2, experts(4) * 3);
+    assert!(!layout.waste.iter().any(|w| w.what.contains("padded")), "{:?}", layout.waste);
 }

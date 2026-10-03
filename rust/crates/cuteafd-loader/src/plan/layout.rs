@@ -99,6 +99,7 @@ pub struct FamilyCosts {
     pub spark_ring_bytes: u64,
 }
 
+
 const fn gib(hundredths: u64) -> u64 {
     hundredths * GIB / 100
 }
@@ -296,7 +297,22 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
         let routed: u64 = report.components.iter().filter(|c| c.owner == Owner::SparkSliced).map(|c| c.bytes).sum();
         let stored = (routed as f64 * report.spark_rank_share) as u64;
         let even = routed / ranks.max(1) as u64;
+        // EXL3 packages and FP8/MXFP4/NVFP4 packages with exact layouts store each
+        // rank's own whole 128-row blocks; other packages (V4.1 native) pad every
+        // rank to the widest slice.
+        let package = report.experts.as_ref().map_or("", |e| e.package.as_str());
+        let intermediate = model.spec().moe.as_ref().map_or(0, |m| m.intermediate);
+        let exact = !package.starts_with("v41") && intermediate % 128 == 0 && intermediate / 128 >= ranks;
+        let rank_bytes = |rank: usize| -> u64 {
+            if !exact {
+                return stored;
+            }
+            let blocks = intermediate / 128;
+            let own = blocks / ranks + usize::from(rank < blocks % ranks);
+            (routed as f64 * (own * 128) as f64 / intermediate as f64) as u64
+        };
         for rank in 0..ranks {
+            let stored = rank_bytes(rank);
             let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: options.spark_bytes,
                 items: Vec::new(), kv_tokens: 0 };
             let format = report.components.iter().find(|c| c.owner == Owner::SparkSliced)
@@ -308,7 +324,7 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
             device.items.push(Item::new(Category::Runtime, "context+modules", "", 512 * MIB, Basis::Calibrated));
             devices.push(device);
         }
-        if report.spark_rank_share * ranks as f64 > 1.001 {
+        if !exact && report.spark_rank_share * ranks as f64 > 1.001 {
             waste.push(Waste { device: format!("spark x{ranks}"), what: format!("routed slices padded to the widest \
                 128-row slice ({:.1}% of the even share) on every rank", 100.0 * (stored - even) as f64 / even as f64),
                 bytes: (stored - even) * ranks as u64 });
