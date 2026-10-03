@@ -485,7 +485,9 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                 // The previous layer's attention stages uploaded from host staging
                 // this layer rewrites: wait until they ran (the GPU still has that
                 // layer's FFN queued, so it does not idle while this one is queued).
-                crate::shared::memory::chain::fence_wait(device.library, (layer - 1) % 2).await?;
+                if crate::shared::memory::chain::staging_fence() {
+                    crate::shared::memory::chain::fence_wait(device.library, (layer - 1) % 2).await?;
+                }
                 // Let the other lane queue its layer too: lanes interleave per layer
                 // as they did when every layer waited on the host.
                 tokio::task::yield_now().await;

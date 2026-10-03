@@ -2,7 +2,7 @@
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
 use crate::families::deepseek_v41::v41_compressor::{IndexBinding, IndexProposal};
 use crate::families::deepseek_v41::v41_index_query::IndexQueryOutput;
-use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::shared::memory::{DeviceAllocation, HostAllocation, LayerStaging, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{
     CuteafdDeviceBuffer, NativeLibrary, V41CandidateBlocks, V41IndexScores, V41IndexTopK,
@@ -82,7 +82,8 @@ pub(crate) struct IndexSelectionWave<'a> {
     stream: LoadStream<'a>,
     buffers: Vec<Rc<DeviceAllocation<'a>>>,
     shared_scratch_busy: Option<Rc<Cell<bool>>>,
-    staging: HostAllocation<'a>,
+    /// Per-layer pinned metadata and lengths (see `LayerStaging`).
+    staging: LayerStaging<'a>,
     capacity: usize,
     score: V41IndexScores<'a>,
     top: V41IndexTopK<'a>,
@@ -141,7 +142,7 @@ impl<'a> IndexSelectionWave<'a> {
                 .map(|n| DeviceAllocation::new(library, n).map(Rc::new))
                 .collect::<Result<_>>()?,
             shared_scratch_busy: None,
-            staging: HostAllocation::new(library, capacity * 56)?,
+            staging: LayerStaging::new(library, capacity * 56, 40)?,
             capacity,
             score: library.v41_index_scores()?,
             top: library.v41_index_topk()?,
@@ -176,7 +177,7 @@ impl<'a> IndexSelectionWave<'a> {
         let busy = Rc::new(Cell::new(false));
         let value = Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? }, buffers,
-            shared_scratch_busy: Some(busy.clone()), staging: HostAllocation::new(library, capacity * 56)?,
+            shared_scratch_busy: Some(busy.clone()), staging: LayerStaging::new(library, capacity * 56, 40)?,
             capacity, score: library.v41_index_scores()?, top: library.v41_index_topk()?,
             candidates: library.v41_candidate_blocks()?, graph: None,
             retained_graphs: VecDeque::new(), retain_decode_graphs: false, ready: None, pending: None, in_flight: false,
@@ -500,7 +501,7 @@ impl<'a> IndexSelectionWave<'a> {
         let tiles = (max_length as usize).div_ceil(width).max(1);
         fingerprint.extend([width, usize::from(use_candidates)]);
         fingerprint.push(if query.layer > 20 { 1 } else { tiles });
-        let staging = self.staging.bytes_mut();
+        let (host, staging) = self.staging.region(query.layer);
         for (i, m) in metadata.iter().enumerate() {
             for (j, value) in m.iter().enumerate() {
                 staging[i * 48 + j * 8..i * 48 + j * 8 + 8].copy_from_slice(&value.to_ne_bytes());
@@ -511,7 +512,6 @@ impl<'a> IndexSelectionWave<'a> {
         if defer {
             self.in_flight = true;
             if let Some(busy) = &self.shared_scratch_busy { busy.set(true); }
-            let host = self.staging.buffer;
             unsafe {
                 crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?;
                 self.stream.library.copy_host_buffer_h2d_async(self.b(0), host, rows * 48, self.stream.raw)?;
@@ -520,8 +520,10 @@ impl<'a> IndexSelectionWave<'a> {
                 self.stream.library.copy_host_buffer_h2d_async(self.b(1), lengths, rows * 8, self.stream.raw)?;
             }
         } else {
-            self.stream.library.copy_h2d(self.b(0), &self.staging.bytes_mut()[..rows * 48])?;
-            self.stream.library.copy_h2d(self.b(1), &self.staging.bytes_mut()[rows * 48..rows * 56])?;
+            let (metadata, lengths) = (self.b(0), self.b(1));
+            let (_, staged) = self.staging.region(query.layer);
+            self.stream.library.copy_h2d(metadata, &staged[..rows * 48])?;
+            self.stream.library.copy_h2d(lengths, &staged[rows * 48..rows * 56])?;
         }
         if self.graph.is_none() {
             unsafe {
