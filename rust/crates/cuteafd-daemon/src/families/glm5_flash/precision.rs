@@ -1,4 +1,6 @@
-//! Header-only checkpoint-native inputs for the existing FP8 block consumers.
+//! Header-only admission of the FP8 block consumers' inputs (MLA, dense and
+//! shared-expert projections): checkpoint E4M3 with FP32 128x128 scales, or
+//! BF16 quantized to those blocks at load (the FP8 copy is the only resident one).
 use cuteafd_core::DType;
 use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
 use cuteafd_loader::plan::checkpoint::Checkpoint;
@@ -7,8 +9,12 @@ use cuteafd_loader::plan::checkpoint::Checkpoint;
 pub(crate) enum ProjectionInputError {
     #[error("GLMF checkpoint has no selected projection tensor {name}")]
     Missing { name: String },
-    #[error("{name}: GLMF {consumer} requires checkpoint {expected:?}, found {actual:?}; add a native consumer/exporter for this source format instead of silently quantizing or widening it (an existing native FP8 checkpoint may be selected with --fp8-snapshot)")]
+    #[error("{name}: GLMF {consumer} reads {expected:?}, found {actual:?}")]
     Dtype { name: String, consumer: &'static str, expected: DType, actual: DType },
+    #[error("{name}: GLMF {consumer} reads checkpoint E4M3 with FP32 128x128 scales or BF16 (quantized to those blocks at load), found {actual:?}; add a consumer for this source format")]
+    Source { name: String, consumer: &'static str, actual: DType },
+    #[error("{name}: GLMF {consumer} quantizes BF16 to 128x128 blocks and needs whole blocks, found {actual:?}")]
+    Blocks { name: String, consumer: &'static str, actual: Vec<usize> },
     #[error("{name}: GLMF {consumer} expected shape {expected:?}, found {actual:?}")]
     Shape { name: String, consumer: &'static str, expected: Vec<usize>, actual: Vec<usize> },
     #[error("{name}: GLMF {consumer} expected {expected} bytes, header declares {actual}")]
@@ -38,9 +44,23 @@ fn require(checkpoint: &Checkpoint, name: String, dtype: DType, shape: Vec<usize
 
 fn block(checkpoint: &Checkpoint, name: String, rows: usize, cols: usize,
     consumer: &'static str) -> Result<(), ProjectionInputError> {
-    require(checkpoint, name.clone(), DType::F8E4M3, vec![rows, cols], 1, consumer)?;
-    require(checkpoint, format!("{name}_scale_inv"), DType::F32,
-        vec![rows.div_ceil(128), cols.div_ceil(128)], 4, consumer)
+    let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.cmp(&name))
+        .map_err(|_| ProjectionInputError::Missing { name: name.clone() })?;
+    match checkpoint.tensors[at].meta.dtype {
+        DType::F8E4M3 => {
+            require(checkpoint, name.clone(), DType::F8E4M3, vec![rows, cols], 1, consumer)?;
+            require(checkpoint, format!("{name}_scale_inv"), DType::F32,
+                vec![rows.div_ceil(128), cols.div_ceil(128)], 4, consumer)
+        }
+        DType::Bf16 => {
+            require(checkpoint, name.clone(), DType::Bf16, vec![rows, cols], 2, consumer)?;
+            if rows % 128 != 0 || cols % 128 != 0 {
+                return Err(ProjectionInputError::Blocks { name, consumer, actual: vec![rows, cols] });
+            }
+            Ok(())
+        }
+        ref actual => Err(ProjectionInputError::Source { name, consumer, actual: actual.clone() }),
+    }
 }
 
 fn scalar(checkpoint: &Checkpoint, name: String) -> Result<(), ProjectionInputError> {
@@ -56,8 +76,8 @@ fn scalar(checkpoint: &Checkpoint, name: String) -> Result<(), ProjectionInputEr
     require(checkpoint, name, DType::F32, shape, 4, "NVFP4 dense MLP")
 }
 
-/// The current MLA and dense/shared FFN block programs consume one native
-/// E4M3 representation. BF16 does not have a matching consumer in this family.
+/// The MLA and dense/shared FFN block programs consume one E4M3
+/// representation: the checkpoint's own blocks, or BF16 quantized at load.
 /// A selected side checkpoint is authoritative, with no fallback to the primary.
 /// Existing ModelOpt packed dense MLPs retain their native NVFP4 route.
 pub(crate) fn check_projection_inputs(primary: &Checkpoint, fp8_source: Option<&Checkpoint>,
@@ -159,13 +179,33 @@ mod tests {
     }
 
     #[test]
-    fn direct_cli_bf16_is_named_unsupported_instead_of_implicitly_quantized() {
+    fn direct_cli_bf16_is_admitted_for_block_quantization_at_load() {
         let (mut checkpoint, cfg) = fixture();
         widen_sources(&mut checkpoint);
+        check_projection_inputs(&checkpoint, None, &cfg, cfg.layers).unwrap();
+    }
+
+    #[test]
+    fn other_source_formats_and_partial_bf16_blocks_are_named() {
+        let (mut checkpoint, cfg) = fixture();
+        widen_sources(&mut checkpoint);
+        let name = "model.language_model.layers.0.mlp.gate_proj.weight";
+        checkpoint.tensors.iter_mut().find(|t| t.meta.name == name).unwrap().meta.dtype = DType::F16;
         let error = check_projection_inputs(&checkpoint, None, &cfg, cfg.layers).unwrap_err();
-        assert!(matches!(error, ProjectionInputError::Dtype { ref name, actual: DType::Bf16, .. }
-            if name == "model.language_model.layers.0.mlp.gate_proj.weight"));
-        assert!(error.to_string().contains("instead of silently quantizing"));
+        assert!(matches!(error, ProjectionInputError::Source { ref name, actual: DType::F16, .. }
+            if name == "model.language_model.layers.0.mlp.gate_proj.weight"), "{error}");
+        let (mut checkpoint, mut cfg) = fixture();
+        widen_sources(&mut checkpoint);
+        cfg.moe_intermediate = 2000;
+        for t in &mut checkpoint.tensors {
+            if t.meta.name.contains("shared_experts") {
+                let s = &mut t.meta.shape;
+                *s = s.iter().map(|&n| if n == 2048 { 2000 } else { n }).collect();
+                t.meta.byte_length = s.iter().map(|&n| n as u64).product::<u64>() * 2;
+            }
+        }
+        assert!(matches!(check_projection_inputs(&checkpoint, None, &cfg, cfg.layers),
+            Err(ProjectionInputError::Blocks { .. })));
     }
 
     #[test]
@@ -174,11 +214,14 @@ mod tests {
         let (native, _) = fixture();
         widen_sources(&mut primary);
         check_projection_inputs(&primary, Some(&native), &cfg, cfg.layers).unwrap();
-        let mut selected = native;
-        widen_sources(&mut selected);
+        // The selected side checkpoint is read even when the primary is native.
+        let (mut selected, _) = fixture();
+        for t in &mut selected.tensors {
+            if t.meta.dtype == DType::F8E4M3 { t.meta.dtype = DType::F16; t.meta.byte_length *= 2; }
+        }
         let (native_primary, _) = fixture();
         assert!(matches!(check_projection_inputs(&native_primary, Some(&selected), &cfg, cfg.layers),
-            Err(ProjectionInputError::Dtype { actual: DType::Bf16, .. })));
+            Err(ProjectionInputError::Source { actual: DType::F16, .. })));
     }
 
     #[test]

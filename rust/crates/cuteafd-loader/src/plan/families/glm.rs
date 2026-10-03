@@ -117,10 +117,9 @@ impl Family for Glm {
             return Some(Hint {
                 what: format!("{} stored as {} (a ModelOpt release's dense parts)", component.label(), formats.join(", ")),
                 how: if self.id == "glm5_flash" {
-                    "serve-glmf runs NVFP4 dense MLPs natively. Other MLA and dense/shared block projections \
-                     require checkpoint-native E4M3 with FP32 128x128 scales; add missing BF16 consumers/exporters \
-                     instead of implicit quantization. Native FP8 side inputs may be selected with --fp8-snapshot \
-                     when serving; this single-checkpoint plan does not model that side input.".into()
+                    "serve-glmf runs NVFP4 dense MLPs natively; MLA and dense/shared block projections run FP8 \
+                     only: the checkpoint's E4M3 with FP32 128x128 scales (or --fp8-snapshot's), else BF16 \
+                     quantized to those blocks at load (the only resident copy).".into()
                 } else {
                     "PLAN.md Phase 5 S2: serve-glm prefills per-tensor FP8 MLPs as static W8A8 and quantizes BF16 \
                      MLA / shared-expert weights to FP8 blocks at load (CUTEAFD_GLM_BF16=native: the BF16 programs \
@@ -402,11 +401,13 @@ impl GlmModel {
             _ => None,
         };
         if let Some(shape) = block_shape {
-            return require(fp8_f32_block128(operand) && operand.logical == shape, || format!(
-                "GLMF {name} requires checkpoint-native E4M3 with FP32 128x128 block scales and shape {shape:?}; \
-                 found {}; add a BF16 consumer/exporter instead of implicit quantization, or select native FP8 \
-                 inputs with serve-glmf --fp8-snapshot (a serving remedy not modeled by this single-checkpoint plan)",
-                describe(operand)));
+            // The FP8 block programs read the checkpoint's E4M3 blocks, or BF16
+            // quantized to 128x128 blocks at load (the only resident copy).
+            let bf16_blocks = operand.is_plain(&[crate::plan::format::Encoding::Bf16])
+                && shape.iter().all(|&n| n % 128 == 0);
+            return require((fp8_f32_block128(operand) || bf16_blocks) && operand.logical == shape, || format!(
+                "GLMF {name} runs FP8 128x128 blocks: checkpoint E4M3 with FP32 128x128 scales, or BF16 \
+                 quantized to blocks at load, shape {shape:?}; found {}", describe(operand)));
         }
         match name {
             // `absorbed` splits kv_b_proj into w_uk / w_uv from BF16 rows.

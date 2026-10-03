@@ -587,7 +587,8 @@ fn bench_verify(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
             let mut times = Vec::new();
             for round in 0..9 {
                 let started = Instant::now();
-                let drafts = drafter.draft_device(&seqs, &engine.embedding, &engine.weights.head)?;
+                let drafts = drafter.draft_device(&seqs, &engine.embedding,
+                    dflash::TargetHead::Bf16(&engine.weights.head))?;
                 if round >= 2 {
                     times.push(started.elapsed().as_secs_f64() * 1e3);
                 }
@@ -818,7 +819,7 @@ fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
         let anchor = sequence[position];
         let timer = Instant::now();
         let draft = drafter.draft_device(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
-            &engine.embedding, &engine.weights.head)?;
+            &engine.embedding, dflash::TargetHead::Bf16(&engine.weights.head))?;
         draft_seconds += timer.elapsed().as_secs_f64();
         drafts.push((position, draft.into_iter().next().context("draft")?));
         let logits = engine.verify(&mut [(&mut placement, 1)], &[anchor], transport.as_deref_mut().map(|t| (t, runtime)),
@@ -897,7 +898,7 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
         let anchor = tokens[position];
         let timer = Instant::now();
         let draft = drafter.draft_device(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
-            &engine.embedding, &engine.weights.head)?.remove(0);
+            &engine.embedding, dflash::TargetHead::Bf16(&engine.weights.head))?.remove(0);
         draft_seconds += timer.elapsed().as_secs_f64();
         let reference = &ref_tokens[index * drafts_per..][..drafts_per];
         exact += usize::from(draft.tokens == reference);
