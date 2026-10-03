@@ -105,6 +105,14 @@ case "$speculator" in
   mtp) family_args+=(--mtp "$(key SPECULATOR_DEPTH MTP 1)") ;;
   dspark) dspark_args=(--dspark) ;;
 esac
+# SPECULATOR_DRAFTS: adaptive (default) or a fixed draft count per cycle
+# (DFlash2 on GLM 5.x, GLM 5.3 Flash and MiMo V2), for policy A/B runs.
+drafts="$(get SPECULATOR_DRAFTS adaptive)"
+if [[ "$drafts" != adaptive ]]; then
+  [[ "$drafts" =~ ^[0-9]+$ && $speculator == dflash2 ]] ||
+    { echo "SPECULATOR_DRAFTS must be adaptive or a draft count, with SPECULATOR=dflash2" >&2; exit 2; }
+  draft_args+=(--draft-fixed "$drafts")
+fi
 # Prefix cache (MiMo, GLM 5.3, GLM 5.3 Flash, Qwen 3.8, DeepSeek V4): PREFIX_CACHE_ENTRIES
 # snapshots per bank (prompts, turns; 0 = off), HOST_CACHE_BYTES of pinned host memory for
 # snapshots the device evicts (e.g. 64GiB; 0 = off). POOL_TOKENS: paged KV tokens shared by
