@@ -422,6 +422,12 @@ for ((rank = 0; rank < ranks; rank++)); do
     sleep 2
   done
 done
+# Loading leaves ~10 GiB of checkpoint pages cached per Spark (sparknest passthrough: the
+# workers' own fadvise cannot reach them), and GB10 CUDA allocations do not reclaim page
+# cache: drop it once every rank is resident. CUTEAFD_SPARK_DROP_PAGE_CACHE=0 keeps it.
+if ((ranks > 0)) && [[ "${CUTEAFD_SPARK_DROP_PAGE_CACHE:-1}" != 0 ]] && command -v nest >/dev/null; then
+  nest drop-caches "${spark_hosts[@]}" >/dev/null || echo "warning: could not drop Spark page caches after loading" >&2
+fi
 peer_csv="$(IFS=,; echo "${peers[*]}")"
 peer_args=()
 [[ -z "$peer_csv" ]] || peer_args=(--peers "$peer_csv")

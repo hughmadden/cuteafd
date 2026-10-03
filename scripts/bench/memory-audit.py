@@ -144,6 +144,9 @@ def main():
     parser.add_argument("logs", nargs="+")
     parser.add_argument("--sequence", type=int)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--compare", help="`cuteafd plan --layout --json` output to compare against")
+    parser.add_argument("--device-map", default="rtx0=0,rtx1=1",
+                        help="planner device=ledger device pairs for the logs given (e.g. spark0=0)")
     args = parser.parse_args()
     results = {}
     for path in args.logs:
@@ -154,6 +157,32 @@ def main():
             print(f"{path}: no memory ledger reports", file=sys.stderr)
             continue
         results[path] = summarize(found[-1])
+    if args.compare:
+        plan = json.load(open(args.compare))["memory_layout"]
+        names = {}
+        for device in plan["devices"]:
+            prefix = "rtx" if device["kind"] == "rtx" else "spark"
+            names[f"{prefix}{device['index']}"] = device
+        mapping = dict(pair.split("=") for pair in args.device_map.split(","))
+        for path, summary in results.items():
+            ledger = {str(d["device"]): d for d in summary["devices"]}
+            for planned, ledger_id in mapping.items():
+                if planned not in names or ledger_id not in ledger:
+                    continue
+                predicted = defaultdict(int)
+                for item in names[planned]["items"]:
+                    predicted[item["category"]] += item["bytes"]
+                measured = ledger[ledger_id]["categories"]
+                print(f"== {path} {planned} (ledger device {ledger_id}): predicted vs measured GiB")
+                total_p = total_m = 0
+                for cat in sorted(set(predicted) | set(measured)):
+                    p_, m_ = predicted.get(cat, 0), measured.get(cat, 0)
+                    total_p += p_; total_m += m_
+                    err = (p_ - m_) / m_ * 100 if m_ else float("nan")
+                    print(f"   {cat:<12} {p_ / GIB:8.2f} {m_ / GIB:8.2f} {err:+7.1f}%")
+                err = (total_p - total_m) / total_m * 100 if total_m else float("nan")
+                print(f"   {'total':<12} {total_p / GIB:8.2f} {total_m / GIB:8.2f} {err:+7.1f}%")
+        return
     if args.json:
         json.dump(results, sys.stdout, indent=1)
         print()
