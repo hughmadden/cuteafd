@@ -785,8 +785,8 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
    Served 8K TTFT with E4M3 MLA + these packages vs v0.1.0 (2026-10-04, one
    launch per arm): max 2.96-2.99 -> 2.49-2.64 s, min 3.08-3.11 -> 2.82-2.91 s;
    C1 code flat (max ~68, min 58-61; text changes with the MLA numerics); C4 is
-   dominated by within-batch greedy divergence (item 4d) in every arm,
-   and the head split only moves the wait from the GPU to the Sparks. GB10's
+   dominated by within-batch greedy divergence (item 4d) in every arm. The
+   head split only moves the wait from the GPU to the Sparks. GB10's
    wave is bound by bytes (FC1 BF16 input gathers per N tile, FC2 partial
    round trip ~2 ms, top-k sum 1.6 ms) and the FC1 rotation, not MMA rate.
    Coordinator GPU-only 8K prefill is 2.7 s, half of it the sparse MLA prefill
