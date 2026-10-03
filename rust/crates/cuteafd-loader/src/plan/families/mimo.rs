@@ -201,8 +201,9 @@ impl Family for MiMo {
                         over six ranks: whole 32-blocks per rank ({widest}/{} rows) zero-padded to {padded}, \
                         {:.1} GiB per rank (TP2xEP3: {:.1} GiB, but a decode step reads all of a row's experts \
                         that land on one EP group). The SM121 Spark package streams MXFP8 x MXFP4 gate/up \
-                        above 640 live rows; smaller row counts use the grouped route. The down projection \
-                        consumes BF16 SwiGLU output and widens MXFP4 weights for BF16 MMA.",
+                        above 640 live rows, and its down projection quantizes the BF16 SwiGLU rows per K32 to \
+                        MXFP8 for block-scaled MXFP8 x MXFP4 MMAs (FP8_EXPERT_PREFILL=w8a16 keeps BF16 down); \
+                        smaller row counts use the grouped route.",
                         widest - 32, per_rank(padded), per_rank(i / 2) / 3.0),
                 })
             }
