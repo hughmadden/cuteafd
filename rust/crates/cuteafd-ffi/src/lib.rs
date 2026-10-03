@@ -36,6 +36,15 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// CUDA graph captures begun through this crate since the process started
+/// (serving should reach zero new captures once warm; see AGENTS.md).
+static GRAPH_CAPTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// CUDA graph captures begun so far (all libraries, all streams).
+pub fn graph_captures() -> u64 {
+    GRAPH_CAPTURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub type CuteafdStatus = c_int;
 
 pub const CUTEAFD_STATUS_OK: CuteafdStatus = 0;
@@ -1805,6 +1814,7 @@ impl NativeLibrary {
         let begin_capture_fn: Symbol<CudaGraphBeginCaptureFn> =
             unsafe { self.lib.get(b"cuteafd_cuda_graph_begin_capture")? };
         let status = unsafe { begin_capture_fn(cuda_stream) };
+        GRAPH_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.status_to_result("cuteafd_cuda_graph_begin_capture", status)
     }
 

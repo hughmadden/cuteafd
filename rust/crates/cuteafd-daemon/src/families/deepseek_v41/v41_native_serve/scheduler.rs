@@ -1310,6 +1310,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         tracing::debug!(target: "cuteafd::cost_model", batch=batch_id, lane,
             requests=members.len(), rows=inputs.iter().map(Vec::len).sum::<usize>(),
             prepared_us, verify_us=executed_us-prepared_us, "verification round cost");
+            graph_capture_watch();
         let (accepted, emitted, emissions, accepted_inputs) = commit_lane(lib, lane, pass, requests,
             active, members, &inputs, &mut batch, &next, draft.as_deref_mut(),
             executed_us-prepared_us, None, retain_enabled)?;
@@ -2541,5 +2542,19 @@ mod sampling_tests {
         assert_eq!(row.output_row, 3);
         // The device never calls logf, so this must be the host f32::ln bits.
         assert_eq!(row.ln_min_p.to_bits(), 0.05f32.ln().to_bits());
+    }
+}
+
+/// Every 512 verification rounds: CUDA graph captures begun since the last
+/// report (a warm server should capture none; AGENTS.md).
+pub(super) fn graph_capture_watch() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ROUNDS: AtomicU64 = AtomicU64::new(0);
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let rounds = ROUNDS.fetch_add(1, Ordering::Relaxed) + 1;
+    if rounds % 512 == 0 {
+        let captures = cuteafd_ffi::graph_captures();
+        let previous = LAST.swap(captures, Ordering::Relaxed);
+        tracing::info!(rounds, captures = captures - previous, "graph captures in the last 512 verification rounds");
     }
 }
