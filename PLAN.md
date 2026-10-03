@@ -551,7 +551,9 @@ rings) and sizes the pool from the tightest KV-owning GPU; MiMo weights come
 from the codex resident layout, GLM Flash from its FP8-snapshot conversion.
 Per-family costs are calibrated from the ledger (`plan::layout::family_costs`);
 device totals at ready match the ledger within 2% (GLM 5.3 39.10/27.63 vs
-39.18/27.70, MiMo Pro 22.81/14.99 vs 23.03/15.23, GLM Flash 27.55 vs 28.05).
+39.18/27.70, MiMo Pro 22.81/14.99 vs 23.03/15.23, GLM Flash 27.55 vs 28.05), and
+on the held-out auto-pool launches (MiMo Pro 49.42/41.86 vs 49.4/41.6, GLM Flash
+50.93 vs 50.7, GLM 5.3 93.04/81.96 vs 92.1/80.6 with its full graph allowance).
 Engines take admission from it: MiMo (capacity contract, pool 0 = auto),
 GLM 5.3 and GLM 5.3 Flash (`--pool-tokens 0`). Next: V4/V4.1 and Qwen
 geometry in the planner, graph-cache bounds, `placement.json` handoff (S1).
