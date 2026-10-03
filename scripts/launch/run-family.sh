@@ -126,6 +126,14 @@ case "$speculator" in
   mtp) family_args+=(--mtp "$(key SPECULATOR_DEPTH MTP 1)") ;;
   dspark) dspark_args=(--dspark) ;;
 esac
+# SPECULATOR_DRAFTS: adaptive (default) or a fixed draft count per cycle
+# (DFlash2 on GLM 5.x, GLM 5.3 Flash and MiMo V2), for policy A/B runs.
+drafts="$(get SPECULATOR_DRAFTS adaptive)"
+if [[ "$drafts" != adaptive ]]; then
+  [[ "$drafts" =~ ^[0-9]+$ && $speculator == dflash2 ]] ||
+    { echo "SPECULATOR_DRAFTS must be adaptive or a draft count, with SPECULATOR=dflash2" >&2; exit 2; }
+  draft_args+=(--draft-fixed "$drafts")
+fi
 # Prefix cache (MiMo, GLM 5.3, GLM 5.3 Flash, Qwen 3.8, DeepSeek V4): PREFIX_CACHE_ENTRIES
 # snapshots per bank (prompts, turns; 0 = off), HOST_CACHE_BYTES of pinned host memory for
 # snapshots the device evicts (e.g. 64GiB; 0 = off). POOL_TOKENS: paged KV tokens shared by
@@ -136,7 +144,11 @@ case $family in
     [[ "$(get HOST_CACHE_BYTES 0)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES)") ;;
 esac
 if [[ $family == mimo_v2 ]]; then
-  family_args+=(--pool-tokens "$(get POOL_TOKENS 131072)")
+  # POOL_TOKENS=auto: the largest pool every GPU admits after all fixed costs (up to 2M tokens).
+  # Default auto (measured 2026-10-03, MiMo V2.6 Pro 2 RTX + 6: 131072 -> 2,097,152 tokens, C1/C4/8K
+  # prefill unchanged); a number pins the pool.
+  mimo_pool="$(get POOL_TOKENS auto)"; [[ "$mimo_pool" != auto ]] || mimo_pool=0
+  family_args+=(--pool-tokens "$mimo_pool")
   # PREFIX_PARTIAL=on: V4.1-style partial reuse (approximate; off = exact restores only).
   family_args+=(--prefix-partial "$(get PREFIX_PARTIAL off)")
   # KV_CACHE: int8 (the engine default: 8-bit full-attention records with FP32 scales per 32
@@ -160,7 +172,16 @@ if [[ -n "$expert_input" ]]; then
     *) echo "EXPERT_INPUT must be fp8, bf16 or bf16-decode" >&2; exit 2 ;;
   esac
 fi
-[[ ! $family =~ ^(glm5|qwen4|deepseek_v4)$ || -z "$(get POOL_TOKENS)" ]] || family_args+=(--pool-tokens "$(get POOL_TOKENS)")
+# POOL_TOKENS=auto (GLM 5.3, GLM 5.3 Flash, MiMo): the largest pool the GPUs hold after the
+# planner's remaining costs (up to 2M tokens).
+if [[ $family =~ ^(glm5|qwen4|deepseek_v4)$ && -n "$(get POOL_TOKENS)" ]]; then
+  pool="$(get POOL_TOKENS)"
+  if [[ "$pool" == auto ]]; then
+    [[ $family == glm5 ]] || { echo "POOL_TOKENS=auto is supported for GLM 5.3, GLM 5.3 Flash and MiMo" >&2; exit 2; }
+    pool=0
+  fi
+  family_args+=(--pool-tokens "$pool")
+fi
 # GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
 # from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" requires native
 # FP8 block tensors in the primary checkpoint). KDA's BF16 source weights run as-is by default
@@ -186,7 +207,9 @@ if [[ $family == glm5_flash ]]; then
       exit 2 ;;
     *) echo "GLM5_FLASH_KDA_FP8 must be auto, off, row128 or channel" >&2; exit 2 ;;
   esac
-  family_args+=(--kda-fp8 "$kda_fp8" --pool-tokens "$(get POOL_TOKENS 65536)")
+  # Default auto (GLM 5.3 Flash 1 RTX + 2: 65536 -> 2,097,152 tokens, 44 GiB still free, speed unchanged).
+  glmf_pool="$(get POOL_TOKENS auto)"; [[ "$glmf_pool" != auto ]] || glmf_pool=0
+  family_args+=(--kda-fp8 "$kda_fp8" --pool-tokens "$glmf_pool")
   if [[ "$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD off)" == on ]]; then
     echo "GLM5_FLASH_FP8_HEAD=on duplicates the checkpoint head; a shared single-copy consumer is missing; use off" >&2
     exit 2
@@ -315,7 +338,7 @@ case "$family:$model_type" in
 esac
 if [[ "$split" != off && "$explicit_split" == 1 ]]; then
   [[ -z "$split_hint" ]] ||
-    { echo "$family ($model_type): two-GPU head split is unsupported; $split_hint; use RTX_GPUS=1 or COORDINATOR_SPLIT=off" >&2; exit 2; }
+    echo "note: $family ($model_type) has no head split yet ($split_hint); serving from GPU $gpu alone" >&2
   [[ -n "$second" ]] ||
     { echo "RTX_GPUS=2 requires two physical coordinator GPUs; only GPU $gpu was selected" >&2; exit 2; }
 fi
@@ -331,7 +354,7 @@ if [[ -n "$second" && "$split" != off ]]; then
     lower=$((gpu < second ? gpu : second)) upper=$((gpu < second ? second : gpu))
     gpus="\"device=$lower,$upper\""
     family_args+=(--device $((gpu == lower ? 0 : 1)) --split-device $((gpu == lower ? 1 : 0)))
-  else
+  elif [[ "$explicit_split" != 1 ]]; then
     echo "note: $family ($model_type) has no head split; auto selected GPU $gpu alone" >&2
   fi
 fi
@@ -412,6 +435,13 @@ for ((rank = 0; rank < ranks; rank++)); do
     sleep 2
   done
 done
+# Loading leaves ~10 GiB of checkpoint pages cached per Spark (sparknest passthrough: the
+# workers' own fadvise cannot reach them), and GB10 CUDA allocations do not reclaim page
+# cache: drop it once every rank is resident. CUTEAFD_SPARK_DROP_PAGE_CACHE=0 keeps it.
+if ((ranks > 0 && ${#spark_hosts[@]} > 0)) && [[ "${CUTEAFD_SPARK_DROP_PAGE_CACHE:-1}" != 0 ]] &&
+   command -v nest >/dev/null; then
+  nest drop-caches "${spark_hosts[@]}" >/dev/null || echo "warning: could not drop Spark page caches after loading" >&2
+fi
 peer_csv="$(IFS=,; echo "${peers[*]}")"
 peer_args=()
 [[ -z "$peer_csv" ]] || peer_args=(--peers "$peer_csv")

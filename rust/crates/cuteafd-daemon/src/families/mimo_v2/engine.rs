@@ -382,6 +382,7 @@ fn lane_slot(index: usize, ffn: bool, lane: usize) -> usize {
 /// cos | sin of position * theta^(-2i/dim) for `max_context` positions, FP32
 /// like the reference's inv_freq, on the current device.
 fn rope_table<'a>(library: &'a NativeLibrary, dim: usize, theta: f64, max_context: usize) -> Result<Dev<'a>> {
+    let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv/rope");
     let inv: Vec<f32> = (0..dim / 2).map(|i| 1.0 / (theta as f32).powf((2 * i) as f32 / dim as f32)).collect();
     let mut values = vec![0f32; max_context * dim];
     for p in 0..max_context {
@@ -519,6 +520,7 @@ impl<'a> MimoEngine<'a> {
         weights: MimoWeights<'a>, stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize,
         rings: usize, embedding: TokenEmbedding<'a>, kv_cache: MimoKvCache,
         prefill_output: MimoPrefillOutput) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let family = cfg.program_family()?;
         // Layers loaded as head-split shares carry half the heads (see `attach_peer`).
         let ranks = if weights.layers.iter().any(|l| l.split) { 2 } else { 1 };
@@ -531,6 +533,7 @@ impl<'a> MimoEngine<'a> {
             "the mimo programs are built for 192/128 heads, 64 RoPE dims and a window of at most {}",
             RING_ROWS - DECODE_ROWS);
         let zeroed = |bytes: usize| -> Result<Rc<Allocation<'a>>> {
+            let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
             let allocation = Rc::new(Allocation::new(Device { library, id: device }, bytes.max(256))?);
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
@@ -612,6 +615,7 @@ impl<'a> MimoEngine<'a> {
     /// peer access both ways, loads the programs there, and allocates its KV
     /// records, RoPE tables and both ends of the exchange.
     pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<MimoLayer<'a>>) -> Result<()> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("peer-split");
         ensure!(self.split_family.is_some() && layers.len() == self.weights.layers.len()
             && layers.iter().all(|l| l.split), "attach_peer needs the head-split shares of every loaded layer");
         let library = self.library;
@@ -861,6 +865,7 @@ impl<'a> MimoEngine<'a> {
     /// ordered after the prior attention reads; no transport owns this arena.
     /// Every workspace retains an Rc, and published storage is never resized.
     fn shared_prefill_kv_wide(&self, rank: usize, bytes: usize) -> Result<Rc<Dev<'a>>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace/kv-shadow");
         let cell = if rank == 0 { &self.prefill_kv_wide }
             else { &self.peer.as_ref().context("prefill KV shadow peer")?.prefill_kv_wide };
         let mut owned = cell.borrow_mut();
@@ -876,6 +881,7 @@ impl<'a> MimoEngine<'a> {
     /// `head`: the LM head and its logits (only the first row lane of a
     /// pipelined prefill skips them).
     fn workspace_here(&self, rank: usize, t: usize, decode: bool, head: bool) -> Result<Workspace<'a>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let h = self.cfg.hidden;
         let lead = rank == 0;
         let with_head = lead && head;

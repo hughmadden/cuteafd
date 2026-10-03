@@ -32,6 +32,17 @@ use std::ffi::c_void;
 type Dev<'a> = DeviceAllocation<'a>;
 
 pub(crate) const PAGE_ROWS: usize = 64;
+/// Decode/verify steps run padded to one of these row counts, and their page
+/// tables to a power-of-two width of at least [`MIN_TABLE_WIDTH`] pages (or the
+/// whole context): a bounded set of decode graph shapes, all captured at
+/// startup ([`GlmEngine::warm_decode_graphs`]), so serving never captures.
+/// Exact up to 16 rows (one sequence's verify step: no padding at C1), then
+/// in steps of 4 / 8 (padding a batched step costs ~1% per row on the GPU).
+pub(crate) const ROW_BUCKETS: [usize; 24] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 20, 24, 28, 32, 40,
+    48, 56, 64];
+const MIN_TABLE_WIDTH: usize = 16;
+/// Statuses follow the ids in a decode workspace's `select` buffer at a fixed offset.
+const SELECT_STATUS_OFFSET: usize = DECODE_ROWS * 4;
 pub(crate) const RECORD_BYTES: usize = 656;
 const RECORD_PAGE_BYTES: usize = PAGE_ROWS * RECORD_BYTES;
 pub(crate) const INDEX_PAGE_BYTES: usize = 8448;
@@ -90,6 +101,9 @@ struct StepTables {
     /// Selected entries per row the sparse MLA reads (every earlier token
     /// below the index top-k; the selection leads each indices row).
     lengths: Vec<i32>,
+    /// Leading rows that are real (the rest pad a decode step to its row
+    /// bucket and write only the scratch page): the Spark exchange sends these.
+    exchange_rows: usize,
 }
 
 /// A sequence's pages (shared by the latent and index caches) and length.
@@ -284,14 +298,16 @@ pub(crate) struct GlmEngine<'a> {
 #[allow(clippy::type_complexity)]
 fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer<'_>], pages: usize, max_context: usize)
     -> Result<(Vec<Dev<'a>>, Vec<Option<Dev<'a>>>, Dev<'a>)> {
+    let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
     let zeroed = |bytes: usize| -> Result<Dev<'a>> {
         let allocation = DeviceAllocation::new(library, bytes.max(256))?;
         library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
         Ok(allocation)
     };
-    let kv = (0..layers.len()).map(|_| zeroed(pages * RECORD_PAGE_BYTES)).collect::<Result<Vec<_>>>()?;
+    // One page past the pool is the scratch page padded decode rows write.
+    let kv = (0..layers.len()).map(|_| zeroed((pages + 1) * RECORD_PAGE_BYTES)).collect::<Result<Vec<_>>>()?;
     let index = layers.iter()
-        .map(|l| l.full_indexer.then(|| zeroed(pages * INDEX_PAGE_BYTES)).transpose())
+        .map(|l| l.full_indexer.then(|| zeroed((pages + 1) * INDEX_PAGE_BYTES)).transpose())
         .collect::<Result<Vec<_>>>()?;
     // cos | sin of position * theta^(-2i/64), FP32 like the reference's inv_freq.
     let dim = cfg.qk_rope_head_dim;
@@ -467,6 +483,7 @@ impl<'a> GlmEngine<'a> {
     }
 
     fn workspace_here(&self, rank: usize, t: usize, decode: bool) -> Result<Workspace<'a>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let (h, heads) = (self.cfg.hidden, self.cfg.heads);
         let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
         let lead = rank == 0;
@@ -476,6 +493,8 @@ impl<'a> GlmEngine<'a> {
         let (moe, dense) = (self.cfg.moe_intermediate, self.cfg.dense_intermediate);
         // A head split's layers (all of them) run its share's programs.
         let (prefix, moe, dense) = if split { ("glm2", moe / 2, dense / 2) } else { ("glm", moe, dense) };
+        // Every layer of a head split runs its share's heads on both GPUs.
+        let heads = if split { heads / 2 } else { heads };
         for name in [format!("glm_index_producer_{cap}"), format!("{prefix}_producer_{cap}"),
             format!("{prefix}_sparse_mla_{mode}_{cap}"), format!("{prefix}_o_{cap}"), format!("{prefix}_ffn_i{moe}_{cap}"),
             format!("{prefix}_ffn_i{dense}_{cap}")] {
@@ -603,6 +622,7 @@ impl<'a> GlmEngine<'a> {
             table_stride: 0,
             cache_lengths: (start..start + t).map(|p| (p + 1) as i32).collect(),
             lengths: (start..start + t).map(|p| (p + 1).min(self.cfg.index_topk) as i32).collect(),
+            exchange_rows: t,
         })
     }
 
@@ -668,29 +688,104 @@ impl<'a> GlmEngine<'a> {
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<DeviceLogits>> {
         let rows: usize = sequences.iter().map(|(_, n)| n).sum();
         ensure!(rows > 0 && rows <= DECODE_ROWS && tokens.len() == rows, "decode step of {rows} rows");
-        let stride = sequences.iter().map(|(p, _)| p.pages.len()).max().unwrap_or(1);
-        let mut tables = StepTables { decode: true, positions: Vec::new(), slots: Vec::new(), page_table: Vec::new(),
-            table_width: 1, table_stride: stride, cache_lengths: Vec::new(), lengths: Vec::new() };
+        let mut needed = 1;
         for (placement, count) in sequences.iter() {
+            ensure!(placement.len + count <= self.max_context, "decode at {} past the context", placement.len + count - 1);
+            needed = needed.max((placement.len + count).div_ceil(PAGE_ROWS));
+        }
+        let width = self.table_width_bucket(needed);
+        let mut tables = StepTables { decode: true, positions: Vec::new(), slots: Vec::new(), page_table: Vec::new(),
+            table_width: width, table_stride: width, cache_lengths: Vec::new(), lengths: Vec::new(), exchange_rows: rows };
+        for (placement, count) in sequences.iter() {
+            let pages = placement.pages.len().min(width);
             for position in placement.len..placement.len + count {
-                ensure!(position < self.max_context, "decode at {position} past the context");
                 tables.positions.push(position as i64);
                 tables.slots.push(placement.slot(position)?);
                 tables.cache_lengths.push((position + 1) as i32);
                 // The index top-k selects every earlier token up to its k,
                 // leading the row: the sparse MLA reads only those.
                 tables.lengths.push((position + 1).min(self.cfg.index_topk) as i32);
-                // Power-of-two widths bound the graphs a growing context captures.
-                tables.table_width = tables.table_width.max((position + 1).div_ceil(PAGE_ROWS).next_power_of_two().min(stride));
-                tables.page_table.extend(placement.table(placement.pages.len()));
-                tables.page_table.extend(std::iter::repeat_n(0, stride - placement.pages.len()));
+                tables.page_table.extend(placement.table(pages));
+                tables.page_table.extend(std::iter::repeat_n(0, width - pages));
             }
         }
-        let logits = self.step(&tables, tokens, rows, experts, on_layer)?;
+        let bucket = Self::row_bucket(rows);
+        self.pad_rows(&mut tables, bucket);
+        let mut padded = tokens.to_vec();
+        padded.resize(bucket, 0);
+        // Padded rows' logits follow the real rows'; only those are returned.
+        let logits = self.step(&tables, &padded, bucket, experts, on_layer)?
+            .map(|logits| DeviceLogits { rows, ..logits });
         for (placement, count) in sequences.iter_mut() {
             placement.len += *count;
         }
         Ok(logits)
+    }
+
+    /// The row bucket a decode step of `rows` rows runs as.
+    pub(crate) fn row_bucket(rows: usize) -> usize {
+        ROW_BUCKETS.iter().copied().find(|&b| b >= rows).unwrap_or(rows)
+    }
+
+    /// The page-table width a decode step whose longest row needs `pages`
+    /// pages runs with: a power of two from [`MIN_TABLE_WIDTH`], capped at the
+    /// context's pages.
+    fn table_width_bucket(&self, pages: usize) -> usize {
+        let cap = self.max_context.div_ceil(PAGE_ROWS).min(self.pages).max(1);
+        pages.max(MIN_TABLE_WIDTH).next_power_of_two().min(cap)
+    }
+
+    /// Every table width [`Self::table_width_bucket`] returns.
+    fn table_width_buckets(&self) -> Vec<usize> {
+        let mut widths: Vec<usize> = (0..usize::BITS).map(|b| 1usize << b)
+            .take_while(|&w| w < 2 * self.max_context.div_ceil(PAGE_ROWS).max(1))
+            .map(|w| self.table_width_bucket(w)).collect();
+        widths.dedup();
+        widths
+    }
+
+    /// Pads a decode step's tables to `bucket` rows: position 0 of the scratch
+    /// page past the pool (its own records and index keys; no sequence reads them).
+    fn pad_rows(&self, tables: &mut StepTables, bucket: usize) {
+        let scratch = self.pages as i32;
+        let width = tables.table_width;
+        while tables.positions.len() < bucket {
+            tables.positions.push(0);
+            tables.slots.push(i64::from(scratch) * PAGE_ROWS as i64);
+            tables.cache_lengths.push(1);
+            tables.lengths.push(1);
+            tables.page_table.extend(std::iter::repeat_n(scratch, width));
+        }
+    }
+
+    /// Captures every decode graph serving can replay: one padded step per
+    /// (row bucket, table width) over the scratch page (one real row goes to
+    /// the Sparks), so no request captures. Returns the graph count.
+    pub fn warm_decode_graphs(&self, mut experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>) -> Result<usize> {
+        let started = std::time::Instant::now();
+        let free = |rank: usize| self.on(rank, || self.library.cuda_memory_info().map(|(free, _)| free as i64));
+        let before: Vec<i64> = (0..self.ranks()).map(free).collect::<Result<_>>()?;
+        for width in self.table_width_buckets() {
+            for bucket in ROW_BUCKETS {
+                let mut tables = StepTables { decode: true, positions: Vec::new(), slots: Vec::new(),
+                    page_table: Vec::new(), table_width: width, table_stride: width, cache_lengths: Vec::new(),
+                    lengths: Vec::new(), exchange_rows: 1 };
+                self.pad_rows(&mut tables, bucket);
+                let experts = experts.as_mut().map(|(link, runtime)| (&mut **link, *runtime));
+                self.step(&tables, &vec![0; bucket], bucket, experts, None)?;
+            }
+        }
+        // SAFETY: both ranks' streams are live; nothing else is queued.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        if self.peer.is_some() {
+            let stream = self.stream_of(1);
+            self.on(1, || unsafe { self.library.cuda_stream_synchronize(stream) })?;
+        }
+        let graphs = self.graphs.borrow().len() + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
+        let bytes: Vec<i64> = (0..self.ranks()).map(|rank| Ok(before[rank] - free(rank)?)).collect::<Result<_>>()?;
+        tracing::info!(graphs, ?bytes, widths = ?self.table_width_buckets(), rows = ?ROW_BUCKETS,
+            elapsed_ms = started.elapsed().as_millis() as u64, "GLM decode graphs captured at startup");
+        Ok(graphs)
     }
 
     fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
@@ -922,7 +1017,7 @@ impl<'a> GlmEngine<'a> {
         // SAFETY: the logits rows and the select buffer (ids, then statuses) are live buffers of these shapes.
         unsafe {
             self.library.cuda_logits_greedy_f32_async(w.logits.buffer.ptr, rows, vocab, vocab, w.select.buffer.ptr,
-                std::ptr::null_mut(), Self::region(&w.select, rows * 4, rows * 4).ptr, self.stream)
+                std::ptr::null_mut(), Self::region(&w.select, SELECT_STATUS_OFFSET, rows * 4).ptr, self.stream)
         }
     }
 
@@ -931,7 +1026,7 @@ impl<'a> GlmEngine<'a> {
     fn device_logits(&self, w: &Workspace<'_>, rows: usize, greedy: bool) -> DeviceLogits {
         let vocab = self.cfg.vocab_size;
         DeviceLogits { ptr: w.logits.buffer.ptr, rows, vocab, stride: vocab, stream: self.stream,
-            greedy: greedy.then(|| (w.select.buffer.ptr.cast_const(), Self::region(&w.select, rows * 4, rows * 4).ptr
+            greedy: greedy.then(|| (w.select.buffer.ptr.cast_const(), Self::region(&w.select, SELECT_STATUS_OFFSET, rows * 4).ptr
                 .cast_const())) }
     }
 
@@ -1047,11 +1142,15 @@ impl<'a> GlmEngine<'a> {
             previous = match layer {
                 None => break,
                 Some(layer) if layer.dense => Previous::Delta,
-                Some(layer) if self.skip.is_some() => Previous::Planes(self.moe_skip(w, index, layer, t, "m64")?),
+                // Only the step's real rows go to the Sparks; padded rows reduce stale
+                // planes into their own (scratch) rows.
+                Some(layer) if self.skip.is_some() => Previous::Planes(self.moe_skip(w, index, layer,
+                    tables.exchange_rows, "m64")?),
                 Some(layer) => {
                     let (transport, runtime) = experts.as_mut()
                         .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
-                    Previous::Planes(self.moe_exchange(w, index, layer, t, "m64", true, transport, runtime)?)
+                    Previous::Planes(self.moe_exchange(w, index, layer, tables.exchange_rows, "m64", true, transport,
+                        runtime)?)
                 }
             };
             crate::shared::console::layer_mark(index);
@@ -1100,12 +1199,12 @@ impl<'a> GlmEngine<'a> {
     }
 
     /// Launches `segment` through a graph captured the first time `key` is seen.
-    fn replay(&self, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+    fn replay(&self, key: GraphKey, segment: impl Fn() -> Result<()>) -> Result<()> {
         self.replay_on(0, key, segment)
     }
 
     /// [`Self::replay`] on rank `rank`'s stream (its own graphs).
-    fn replay_on(&self, rank: usize, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+    fn replay_on(&self, rank: usize, key: GraphKey, segment: impl Fn() -> Result<()>) -> Result<()> {
         let graphs = match (rank, &self.peer) {
             (1, Some(peer)) => &peer.graphs,
             _ => &self.graphs,
@@ -1121,9 +1220,19 @@ impl<'a> GlmEngine<'a> {
         let captured = segment();
         let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
         captured?;
-        let exec = exec?;
-        self.on(rank, || unsafe { self.library.cuda_graph_launch(exec, stream) })?;
-        graphs.borrow_mut().insert(key, GraphExec(exec, self.library));
+        match exec {
+            Ok(exec) => {
+                self.on(rank, || unsafe { self.library.cuda_graph_launch(exec, stream) })?;
+                graphs.borrow_mut().insert(key, GraphExec(exec, self.library));
+            }
+            // An instantiation that fails (out of memory) runs the segment
+            // uncaptured: the step completes and the peer's exchange stays in
+            // step; the next replay of this shape tries again.
+            Err(error) => {
+                tracing::warn!(rank, ?key, %error, "decode graph capture failed; running the segment uncaptured");
+                segment()?;
+            }
+        }
         Ok(())
     }
 

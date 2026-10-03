@@ -113,6 +113,7 @@ impl<'a> Fp8Weight<'a> {
 /// GEMV scratch for up to `rows` rows of every `(k, n)` shape.
 pub(crate) fn scratch<'a>(library: &'a NativeLibrary, rows: usize, shapes: &[(usize, usize)])
     -> Result<DeviceAllocation<'a>> {
+    let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace/fp8-linear");
     let bytes = shapes.iter().map(|&(k, n)| library.fp8_w8a16_workspace(rows, k, n))
         .collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(0);
     DeviceAllocation::new(library, bytes.max(256))

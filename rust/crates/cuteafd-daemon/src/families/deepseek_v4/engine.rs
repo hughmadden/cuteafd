@@ -101,6 +101,9 @@ const SKIPPED_EXPERTS: usize = usize::MAX - 1;
 /// a second Spark exchange per layer.
 pub(crate) const PREFILL_LANES: usize = 2;
 const MIN_LANE_ROWS: usize = 256;
+/// Vocabulary logits rows a workspace holds (every decode/verify row; a prefill
+/// lands at most this many rows at once and downloads longer spans in chunks).
+const LOGIT_ROWS: usize = 64;
 /// Rows of a step whose target taps feed the drafter's main KV: every row of
 /// a decode step, the last window of a prefill lane.
 const TAP_ROWS: usize = metadata::WINDOW;
@@ -341,6 +344,7 @@ impl<'a> Engine<'a> {
     /// allocates its caches, RoPE tables and the exchange (four slots per prefill lane).
     pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<LayerWeights<'a>>, parts: PeerParts)
         -> Result<()> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("peer-split");
         ensure!(self.split_family.is_some() && layers.len() == self.cfg.n_layers && layers.iter().all(|l| l.split),
             "attach_peer needs the head-split shares of every backbone layer");
         let rows = self.prefill_rows.max(self.decode_rows);
@@ -387,6 +391,7 @@ impl<'a> Engine<'a> {
     /// Layer `layer`'s zeroed caches and compressor state on the current device.
     fn pool_layer_for(library: &'a NativeLibrary, cfg: &DeepseekV4Config, shape: PoolShape, layer: usize)
         -> Result<LayerCache<'a>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, bytes.max(256))?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
@@ -417,6 +422,7 @@ impl<'a> Engine<'a> {
 
     /// Allocates the cache pools and RoPE tables for `parts.shape`.
     pub fn new(parts: EngineParts<'a>) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let quantize_grid = Fp8QuantizeGrid::new(parts.library.sm_count()?, parts.sms)?;
         ensure!(parts.embedding.hidden() == parts.cfg.dim, "embedding rows of {} for dim {}", parts.embedding.hidden(),
             parts.cfg.dim);
@@ -476,10 +482,13 @@ impl<'a> Engine<'a> {
     }
 
     fn workspace_here(&self, rank: usize, t: usize, lanes: usize) -> Result<Workspace<'a>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let lead = rank == 0;
         let lead_only = |bytes: usize| if lead { bytes } else { 256 };
         let h = self.cfg.dim;
-        let heads = self.cfg.n_heads;
+        // Rank 1 runs only its head-split share; rank 0 keeps every head for
+        // the unsplit dSpark stages.
+        let heads = if rank == 1 { self.cfg.n_heads / 2 } else { self.cfg.n_heads };
         let (experts, topk) = (self.cfg.n_routed_experts, self.cfg.n_activated_experts);
         let head_workspace = self.alloc(lead_only(cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE))?;
         let mut topk_scratch = 0usize;
@@ -516,7 +525,7 @@ impl<'a> Engine<'a> {
             wire: self.alloc(lead_only(t * (h + h / 32)))?,
             scratch: self.alloc(self.scratch_bytes()?)?,
             dummy: self.zeroed(4096)?,
-            vocab_logits: self.alloc(lead_only(t * self.cfg.vocab_size * 4))?,
+            vocab_logits: self.alloc(lead_only(t.min(LOGIT_ROWS) * self.cfg.vocab_size * 4))?,
             main_x: self.alloc(t.min(TAP_ROWS) * h * 2)?,
             main_work: self.alloc(t.min(TAP_ROWS) * h * 4)?,
             first_tokens: self.alloc(t * 4)?,
@@ -538,6 +547,7 @@ impl<'a> Engine<'a> {
 
     /// Persistent table buffers for up to `rows` rows.
     fn step_buffers(&self, rows: usize) -> Result<StepBuffers<'a>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace/step");
         let ints = |count: usize| self.alloc(count * 4);
         let metadata = |_: usize| -> Result<Vec<Dev<'a>>> { (0..9).map(|_| ints(rows + 2)).collect() };
         Ok(StepBuffers {
@@ -1000,14 +1010,22 @@ impl<'a> Engine<'a> {
             // Rows of this lane inside the last `logit_rows` of the step.
             let wanted = (first + rows).saturating_sub((total - logit_rows).max(first));
             if wanted > 0 && download {
-                self.head_launch(&lane.stream_a, rows, wanted, 0, w)?;
-                let timer = Instant::now();
-                let bytes = self.download(&w.vocab_logits, wanted * self.cfg.vocab_size * 4)?;
-                self.profile.borrow_mut().add(Phase::Head, timer);
-                logits.extend(bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())));
+                // The workspace holds `LOGIT_ROWS` rows: longer spans (golden NLL) land in chunks.
+                let mut done = 0;
+                while done < wanted {
+                    let chunk = (wanted - done).min(LOGIT_ROWS);
+                    // Rows `rows - wanted + done ..+ chunk` are the last `chunk` of the first `end`.
+                    let end = rows - wanted + done + chunk;
+                    self.head_launch(&lane.stream_a, end, chunk, 0, w)?;
+                    let timer = Instant::now();
+                    let bytes = self.download(&w.vocab_logits, chunk * self.cfg.vocab_size * 4)?;
+                    self.profile.borrow_mut().add(Phase::Head, timer);
+                    logits.extend(bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())));
+                    done += chunk;
+                }
             } else if wanted > 0 {
                 // Lanes land their rows one after the other in the logits buffer.
-                let capacity = w.lanes[0].tables.rows;
+                let capacity = w.vocab_logits.buffer.bytes / (self.cfg.vocab_size * 4);
                 ensure!(landed + wanted <= capacity, "{logit_rows} device logit rows exceed the workspace's {capacity}");
                 self.head_launch(&lane.stream_a, rows, wanted, landed, w)?;
                 landed += wanted;

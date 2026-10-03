@@ -42,6 +42,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         let occupied = devices.map(|d| d.run(|| { let (free, total) = lib.cuda_memory_info()?; Ok(total - free) }))
             .into_iter().collect::<Result<Vec<_>>>()?;
         tracing::info!(stage, occupied_bytes=?occupied, "dual RTX startup memory");
+        cuteafd_ffi::memory_ledger::relabel_other(cuteafd_ffi::memory_ledger::intern(&format!("v41/{stage}")));
         Ok(())
     };
     memory_checkpoint("CUDA contexts and peer access")?;
@@ -406,6 +407,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     second.configure_cache_replicas(requests.cache())?;
     if let Some(pool) = target_prefix_pool { requests.install_prefix_pool(pool)?; }
     memory_checkpoint("allocated KV cache")?;
+    crate::shared::memory_report::release_load_staging(&lib);
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests)?;
     scheduler::publish_capacity(&requests, &prefixes);

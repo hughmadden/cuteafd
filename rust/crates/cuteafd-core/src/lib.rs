@@ -16,6 +16,7 @@ pub use dspark_verify::{verify_dspark_greedy, GreedyVerification, MAX_DSPARK_PRO
 mod engram;
 pub mod prefix;
 pub mod serving_capacity;
+pub mod memory_layout;
 pub use engram::{EngramBatch, EngramError, EngramHashes, EngramHistory, EngramPrefillCursor, ENGRAM_LAYERS, ENGRAM_ROWS, ENGRAM_COMPRESSED_VOCAB};
 mod attention_geometry;
 mod constants;
