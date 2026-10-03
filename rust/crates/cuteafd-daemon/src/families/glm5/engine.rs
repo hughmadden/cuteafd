@@ -1586,6 +1586,15 @@ impl<'a> GlmEngine<'a> {
                     w.lengths.buffer.ptr, w.attn.buffer.ptr, tables.positions.len(), heads,
                     self.cfg.index_topk, 656, scale * std::f32::consts::LOG2_E, kernel, self.stream_of(rank))
             })?;
+            if mla_prefill_check() {
+                // SAFETY: as above; the check synchronizes the stream.
+                let stats = self.on(rank, || unsafe {
+                    self.library.glm_mla_prefill_check(w.query.buffer.ptr, kv.buffer.ptr, w.indices.buffer.ptr,
+                        w.lengths.buffer.ptr, tables.positions.len(), heads, self.cfg.index_topk, 656,
+                        scale * std::f32::consts::LOG2_E, self.stream_of(rank))
+                })?;
+                print_mla_check(index, &stats);
+            }
         } else {
             self.run_on(rank, &Self::program(layer, &format!("glm_sparse_mla_{mode}_{cap}")), &[
                 ("q", w.query.buffer.ptr), ("kv_cache", kv.buffer.ptr), ("indices", w.indices.buffer.ptr),
@@ -1668,6 +1677,20 @@ pub(crate) fn native_mla_prefill() -> Option<i32> {
             Some(0)
         }
     })
+}
+
+/// CUTEAFD_MLA_PREFILL_CHECK=1: after each prefill MLA, run every native kernel on its inputs and
+/// print their differences from the two-term E4M3 kernel (diagnostics; synchronizes, allocates).
+pub(crate) fn mla_prefill_check() -> bool {
+    static CHECK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CHECK.get_or_init(|| std::env::var("CUTEAFD_MLA_PREFILL_CHECK").is_ok_and(|v| v == "1"))
+}
+
+pub(crate) fn print_mla_check(layer: usize, stats: &[[f64; 3]; 5]) {
+    let names = ["f16", "e4m3", "e4m3-p2", "e4m3-q2", "e4m3-q2p2"];
+    println!("mla check layer {layer:2} (vs e4m3-q2p2, rms {:.3e}): {}", stats[4][2], (0..4)
+        .map(|k| format!("{} rel {:.2e} max {:.2e}", names[k], stats[k][0], stats[k][1]))
+        .collect::<Vec<_>>().join(" | "));
 }
 
 /// Prefill lanes: CUTEAFD_GLM_PREFILL_LANES (1 = serial), default [`DEFAULT_LANES`].

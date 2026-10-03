@@ -1373,6 +1373,15 @@ impl<'a> GlmfEngine<'a> {
                         scale * std::f32::consts::LOG2_E, kernel, self.stream)
                 }
             })?;
+            if crate::families::glm5::engine::mla_prefill_check() {
+                // SAFETY: as above; the check synchronizes the stream.
+                let stats = unsafe {
+                    self.library.glm_mla_prefill_check(w.query.buffer.ptr, cache, w.indices.buffer.ptr,
+                        w.lengths.buffer.ptr, tables.positions.len(), self.cfg.heads, SPARSE_TOPK, RECORD_BYTES,
+                        scale * std::f32::consts::LOG2_E, self.stream)
+                }?;
+                crate::families::glm5::engine::print_mla_check(index, &stats);
+            }
         } else {
             self.run(&format!("sparse_mla_{mode}_{cap}"), &[("q", w.query.buffer.ptr), ("kv_cache", cache),
                 ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr), ("out", w.latent.buffer.ptr),

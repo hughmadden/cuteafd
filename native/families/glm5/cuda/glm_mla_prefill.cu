@@ -437,10 +437,11 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
 // Accumulation is FP32 throughout.
 namespace e4m3 {
 
-constexpr int kStageCodes = kT * kD;            // 16384
-constexpr int kStageRope = kT * kRope * 2;      // 4096
-constexpr int kStageScales = kT * 16;           // 512
-constexpr int kPartBytes = 16 * kPartStride * 4;  // one warp's FP32 partial scores
+constexpr int kStages = 3;
+constexpr int kStageCodes = kT * kD;        // 16384
+constexpr int kStageRope = kT * kRope * 2;  // 4096
+constexpr int kStageScales = kT * 16;       // 512
+constexpr int kPartBytes = 16 * kT * 4;     // one warp's FP32 partial scores [16][32]
 
 template <bool kHasRope>
 __host__ __device__ constexpr int stage_bytes() {
@@ -449,7 +450,8 @@ __host__ __device__ constexpr int stage_bytes() {
 
 template <int kGroups>
 struct Smem {
-  int32_t slot[4][kT];  // selected slots of tiles i .. i + 3 (ring)
+  uint64_t full[kStages];   // the stage's tile landed (every thread's copies)
+  uint64_t empty[kStages];  // every warp is done with the stage's tile
   float slice_max[kGroups][4][16];
   float slice_sum[kGroups][4][16];
   int32_t qexp[kGroups * 16];
@@ -457,7 +459,30 @@ struct Smem {
 
 template <bool kHasRope, int kGroups>
 __host__ __device__ constexpr int smem_bytes() {
-  return 2 * stage_bytes<kHasRope>() + kGroups * 4 * kPartBytes + int(sizeof(Smem<kGroups>));
+  return kStages * stage_bytes<kHasRope>() + kGroups * 4 * kPartBytes + int(sizeof(Smem<kGroups>));
+}
+
+// Float offset of partial-score pair (row, pair) in a warp's [16][32] block: pairs XOR-swizzled by
+// row so that both the fragment-order stores and the slice reads are conflict-free.
+__device__ __forceinline__ int part_at(int row, int pair) { return row * kT + 2 * (pair ^ ((row & 3) << 2)); }
+
+__device__ __forceinline__ void mbar_init(uint64_t* bar, int count) {
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(smem_addr(bar)), "r"(count));
+}
+__device__ __forceinline__ void mbar_arrive(uint64_t* bar) {
+  asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" ::"r"(smem_addr(bar)) : "memory");
+}
+// Arrives on `bar` once this thread's earlier cp.async copies have landed.
+__device__ __forceinline__ void cp_async_arrive(uint64_t* bar) {
+  asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" ::"r"(smem_addr(bar)) : "memory");
+}
+__device__ __forceinline__ void mbar_wait(uint64_t* bar, uint32_t parity) {
+  asm volatile(
+      "{\n.reg .pred done;\nwait_%=:\n"
+      "mbarrier.try_wait.parity.shared::cta.b64 done, [%0], %1;\n"
+      "@!done bra wait_%=;\n}\n" ::"r"(smem_addr(bar)),
+      "r"(parity)
+      : "memory");
 }
 
 __device__ __forceinline__ void mma_e4m3(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
@@ -509,7 +534,7 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
   constexpr int kQk = kHasRope ? kD + kRope : kD;
   constexpr int kStage = stage_bytes<kHasRope>();
   extern __shared__ __align__(128) uint8_t smem[];
-  uint8_t* part_base = smem + 2 * kStage;  // [kGroups][4 warps][16][kPartStride] FP32; P copies alias it
+  uint8_t* part_base = smem + kStages * kStage;  // [kGroups][4 warps][16][32] FP32; P copies alias it
   Smem<kGroups>& s = *reinterpret_cast<Smem<kGroups>*>(part_base + kGroups * 4 * kPartBytes);
 
   const int row = blockIdx.x, tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
@@ -521,10 +546,12 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
   const int tiles = (length + kT - 1) / kT;
   const int32_t* sel = indices + int64_t(row) * topk;
 
-  auto slot_of = [&](int i, int t) { return i * kT + t < length ? sel[i * kT + t] : -1; };
-  if (tid < kT) {
-    s.slot[0][tid] = slot_of(0, tid);
-    s.slot[1][tid] = slot_of(1, tid);
+  auto slot_of = [&](int e) { return e < length ? __ldg(sel + e) : -1; };
+  if (tid == 0) {
+    for (int k = 0; k < kStages; ++k) {
+      mbar_init(&s.full[k], kThreads);
+      mbar_init(&s.empty[k], kThreads / 32);
+    }
   }
   // Per-head power of two: the head's largest latent |q| lands in (224, 448].
   for (int h = warp; h < kHeadsCta; h += kThreads / 32) {
@@ -536,36 +563,58 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
   }
   __syncthreads();
 
-  // Tile i's records into stage i & 1: warp w copies the 32 code units of records w, w + 16
-  // (kGroups = 4; w + 8 j for 2), one per lane, with the same swizzle; then 8 RoPE units
-  // (GLM 5.x) and the scale unit per record. Masked slots zero-fill.
+  // Tile i's records into stage i % 3: warp w copies the 32 code units of records w + 16 j
+  // (w + 8 j with two head groups), one per lane, swizzled; then the 8 RoPE units (GLM 5.x)
+  // and the scale unit of every record, one per thread. Masked slots zero-fill. Every thread
+  // arrives on the stage's full barrier once its copies land. Each thread's slots for a tile
+  // are read from `indices` one tile ahead (pre_*).
   constexpr int kWarps = kThreads / 32, kCodeRounds = kT / kWarps;
+  constexpr int kExtra = (kHasRope ? kT * 8 : 0) + kT, kExtraRounds = (kExtra + kThreads - 1) / kThreads;
   const int code_dst = warp * kD + swz(warp, lane) * 16;
+  auto extra_token = [&](int u) { return kHasRope && u < kT * 8 ? u / 8 : u - kExtra + kT; };
+  int pre_code[kCodeRounds], pre_extra[kExtraRounds];
+  auto prefetch = [&](int i) {
+#pragma unroll
+    for (int j = 0; j < kCodeRounds; ++j) pre_code[j] = slot_of(i * kT + warp + kWarps * j);
+#pragma unroll
+    for (int j = 0; j < kExtraRounds; ++j) {
+      const int u = j * kThreads + tid;
+      pre_extra[j] = u < kExtra ? slot_of(i * kT + extra_token(u)) : -1;
+    }
+  };
   auto load = [&](int i) {
-    uint8_t* stage = smem + (i & 1) * kStage;
+    uint8_t* stage = smem + (i % kStages) * kStage;
 #pragma unroll
     for (int j = 0; j < kCodeRounds; ++j) {
-      const int32_t slot = s.slot[i % 4][warp + kWarps * j];
+      const int32_t slot = pre_code[j];
       cp_async16(smem_addr(stage + code_dst + j * kWarps * kD), kv + int64_t(max(slot, 0)) * rec + lane * 16,
                  slot >= 0);
     }
-    constexpr int kExtra = (kHasRope ? kT * 8 : 0) + kT;
 #pragma unroll
-    for (int u0 = 0; u0 < kExtra; u0 += kThreads) {
-      const int u = u0 + tid;
+    for (int j = 0; j < kExtraRounds; ++j) {
+      const int u = j * kThreads + tid;
       if (u < kExtra) {
         const bool rope_unit = kHasRope && u < kT * 8;
-        const int token = rope_unit ? u / 8 : u - kExtra + kT, unit = u % 8;
-        const int32_t slot = s.slot[i % 4][token];
+        const int token = extra_token(u), unit = u % 8;
+        const int32_t slot = pre_extra[j];
         const int src = rope_unit ? kD + 16 + unit * 16 : kD;
         const int dst = rope_unit ? kStageCodes + token * kRope * 2 + swz(token, unit) * 16
                                   : kStageCodes + (kHasRope ? kStageRope : 0) + token * 16;
         cp_async16(smem_addr(stage + dst), kv + int64_t(max(slot, 0)) * rec + src, slot >= 0);
       }
     }
-    cp_async_commit();
+    cp_async_arrive(&s.full[i % kStages]);
   };
-  if (tiles > 0) load(0);
+  // This thread's softmax records 8 cw + 2 t4, + 1: valid flags one tile ahead.
+  const int t0 = 8 * cw + 2 * t4;
+  auto valid_of = [&](int i) { return int(slot_of(i * kT + t0) >= 0) | int(slot_of(i * kT + t0 + 1) >= 0) << 1; };
+  int valid_next = 0;
+  if (tiles > 0) {
+    prefetch(0);
+    load(0);
+    valid_next = valid_of(0);
+    prefetch(1);
+  }
 
   const float qd_lo = pow2(-s.qexp[group * 16 + g]), qd_hi = pow2(-s.qexp[group * 16 + g + 8]);
   // A fragments: 16 heads x this warp's 128 latent channels (4 k32 steps), E4M3 x 2^qexp.
@@ -611,23 +660,30 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
 #pragma unroll
   for (int n = 0; n < 16; ++n) acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0;
   float m_lo = -CUDART_INF_F, m_hi = -CUDART_INF_F, l_lo = 0, l_hi = 0;
-  int acc_exp = 0;  // acc holds the output times 2^acc_exp
-  bool acc_set = false;
+  // Powers of two of the four groups' P copies: each only ever decreases (to the largest that keeps
+  // the tile's largest scale times it at most 448), so warp w's acc, held in units of 2^pexp[w],
+  // rarely needs rescaling for it. Identical in every warp.
+  int pexp[4] = {120, 120, 120, 120};
   uint8_t* group_bytes = part_base + group * 4 * kPartBytes;
   float* my_part = reinterpret_cast<float*>(group_bytes + cw * kPartBytes);
   const float* group_part = reinterpret_cast<const float*>(group_bytes);
+  // No CTA barrier per tile: the four head groups drift apart (one's softmax overlaps another's
+  // MMAs), bounded by the stage ring: tile i + 1 is copied into the stage of tile i - 2.
   // P copies (alias the group's partials once they are summed): [4 scale groups][kPTerms][16
   // heads][32 bytes]; record t = 8 b + 2 j + s of the tile sits at byte 8 j + 2 b + s, the
   // k order of the PV fragments.
   uint8_t* pbuf = group_bytes;
 
   for (int i = 0; i < tiles; ++i) {
-    cp_async_wait<0>();
-    __syncthreads();
-    // Stage (i + 1) & 1 and ring slot (i + 2) % 4 were last read by tile i - 1.
-    if (i + 1 < tiles) load(i + 1);
-    const int next_slot = tid < kT ? slot_of(i + 2, tid) : -1;
-    const uint8_t* stage = smem + (i & 1) * kStage;
+    if (i + 1 < tiles) {
+      if (i + 1 >= kStages) mbar_wait(&s.empty[(i + 1) % kStages], ((i + 1) / kStages - 1) & 1);
+      load(i + 1);
+      if (i + 2 < tiles) prefetch(i + 2);
+    }
+    const int valid = valid_next;
+    if (i + 1 < tiles) valid_next = valid_of(i + 1);
+    mbar_wait(&s.full[i % kStages], (i / kStages) & 1);
+    const uint8_t* stage = smem + (i % kStages) * kStage;
     const uint32_t codes = smem_addr(stage);
     const float* scales = reinterpret_cast<const float*>(stage + kStageCodes + (kHasRope ? kStageRope : 0));
 
@@ -670,38 +726,40 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
         mma_bf16(sn[j + 1], ra, b[2], b[3]);
       }
     }
+    // The group's P copies of tile i - 1 (aliasing the partials) are read.
+    group_barrier(group);
 #pragma unroll
     for (int n = 0; n < 4; ++n) {
-      const int t0 = 8 * n + 2 * t4;
-      *reinterpret_cast<float2*>(my_part + g * kPartStride + t0) = make_float2(sn[n][0], sn[n][1]);
-      *reinterpret_cast<float2*>(my_part + (g + 8) * kPartStride + t0) = make_float2(sn[n][2], sn[n][3]);
+      *reinterpret_cast<float2*>(my_part + part_at(g, 4 * n + t4)) = make_float2(sn[n][0], sn[n][1]);
+      *reinterpret_cast<float2*>(my_part + part_at(g + 8, 4 * n + t4)) = make_float2(sn[n][2], sn[n][3]);
     }
     // The tile's largest scale per group -> the P copies' powers of two.
     // (Scales are non-negative: their bits order as unsigned integers.)
-    int pexp[4];
+    int acc_shift = 0;  // pexp[cw] - its value for the previous tiles
     {
       const uint4 sc = *reinterpret_cast<const uint4*>(scales + lane * 4);
       const uint32_t mx[4] = {__reduce_max_sync(0xffffffffu, sc.x), __reduce_max_sync(0xffffffffu, sc.y),
                               __reduce_max_sync(0xffffffffu, sc.z), __reduce_max_sync(0xffffffffu, sc.w)};
 #pragma unroll
       for (int k = 0; k < 4; ++k) {
-        pexp[k] = mx[k] ? e4m3_exponent(__uint_as_float(mx[k])) : (k == cw && acc_set ? acc_exp : 0);
+        const int e = mx[k] ? min(pexp[k], e4m3_exponent(__uint_as_float(mx[k]))) : pexp[k];
+        acc_shift = k == cw ? e - pexp[k] : acc_shift;
+        pexp[k] = e;
       }
     }
     group_barrier(group);
     // Warp cw's slice: records [8 cw, 8 cw + 8), heads g and g + 8, masked, log2 units.
-    const int t0 = 8 * cw + 2 * t4;
     float v[4] = {0, 0, 0, 0};
 #pragma unroll
     for (int w = 0; w < 4; ++w) {
-      const float2 lo = *reinterpret_cast<const float2*>(group_part + (w * 16 + g) * kPartStride + t0);
-      const float2 hi = *reinterpret_cast<const float2*>(group_part + (w * 16 + g + 8) * kPartStride + t0);
+      const float2 lo = *reinterpret_cast<const float2*>(group_part + w * 16 * kT + part_at(g, 4 * cw + t4));
+      const float2 hi = *reinterpret_cast<const float2*>(group_part + w * 16 * kT + part_at(g + 8, 4 * cw + t4));
       v[0] += lo.x;
       v[1] += lo.y;
       v[2] += hi.x;
       v[3] += hi.y;
     }
-    const bool ok0 = s.slot[i % 4][t0] >= 0, ok1 = s.slot[i % 4][t0 + 1] >= 0;
+    const bool ok0 = valid & 1, ok1 = valid & 2;
     v[0] = ok0 ? v[0] * sl_lo : -CUDART_INF_F;
     v[1] = ok1 ? v[1] * sl_lo : -CUDART_INF_F;
     v[2] = ok0 ? v[2] * sl_hi : -CUDART_INF_F;
@@ -753,13 +811,11 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
         }
       }
     }
-    if (acc_set && pexp[cw] != acc_exp) {
-      const float f = pow2(pexp[cw] - acc_exp);
+    if (acc_shift) {
+      const float f = pow2(acc_shift);
       corr_lo *= f;
       corr_hi *= f;
     }
-    acc_exp = pexp[cw];
-    acc_set = true;
     if (!__all_sync(0xffffffffu, corr_lo == 1.0f && corr_hi == 1.0f)) {
 #pragma unroll
       for (int n = 0; n < 16; ++n) {
@@ -797,7 +853,8 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
         }
       }
     }
-    if (tid < kT) s.slot[(i + 2) % 4][tid] = next_slot;
+    __syncwarp();
+    if (lane == 0) mbar_arrive(&s.empty[i % kStages]);
   }
   for (int o = 1; o <= 2; o <<= 1) {
     l_lo += __shfl_xor_sync(0xffffffffu, l_lo, o);
@@ -807,13 +864,14 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
     s.slice_sum[group][cw][g] = l_lo;
     s.slice_sum[group][cw][g + 8] = l_hi;
   }
-  __syncthreads();
+  group_barrier(group);
   l_lo = l_hi = 0;
 #pragma unroll
   for (int w = 0; w < 4; ++w) {
     l_lo += s.slice_sum[group][w][g];
     l_hi += s.slice_sum[group][w][g + 8];
   }
+  const int acc_exp = cw == 0 ? pexp[0] : cw == 1 ? pexp[1] : cw == 2 ? pexp[2] : pexp[3];
   const float down = pow2(-acc_exp);
   const float inv_lo = l_lo > 0 ? down / l_lo : 0.0f, inv_hi = l_hi > 0 ? down / l_hi : 0.0f;
   // acc[2 u] holds channels 16 u' + 4 t4 + {0, 2}, acc[2 u + 1] channels + {1, 3} (u' = 8 cw + u).
@@ -909,4 +967,69 @@ extern "C" int32_t cuteafd_glm_mla_prefill(const void* q, const void* kv, const 
         static_cast<const int32_t*>(lengths), static_cast<bf16*>(out), heads, topk, record_bytes, scale_log2);
   }
   return cudaGetLastError();
+}
+
+namespace {
+
+__global__ void diff_stats(const bf16* __restrict__ a, const bf16* __restrict__ ref, int64_t n, double* stats) {
+  double d2 = 0, r2 = 0, dmax = 0;
+  for (int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x; i < n; i += int64_t(gridDim.x) * blockDim.x) {
+    const double x = __bfloat162float(a[i]), y = __bfloat162float(ref[i]);
+    d2 += (x - y) * (x - y);
+    r2 += y * y;
+    dmax = fmax(dmax, fabs(x - y));
+  }
+  for (int o = 16; o; o >>= 1) {
+    d2 += __shfl_xor_sync(0xffffffffu, d2, o);
+    r2 += __shfl_xor_sync(0xffffffffu, r2, o);
+    dmax = fmax(dmax, __shfl_xor_sync(0xffffffffu, dmax, o));
+  }
+  if (threadIdx.x % 32 == 0) {
+    atomicAdd(&stats[0], d2);
+    atomicAdd(&stats[1], r2);
+    // Non-negative doubles order as their bit patterns.
+    atomicMax(reinterpret_cast<unsigned long long*>(&stats[2]), __double_as_longlong(dmax));
+  }
+}
+
+}  // namespace
+
+// Diagnostics (CUTEAFD_MLA_PREFILL_CHECK): runs every kernel on the same inputs and writes, per
+// kernel k = 0..4, stats[3 k ..] = {relative L2, max abs difference, relative L2 of the output
+// itself (1)} against kernel 4 (two-term E4M3: the closest to exact). Synchronizes the stream;
+// allocates its own buffers.
+extern "C" int32_t cuteafd_glm_mla_prefill_check(const void* q, const void* kv, const void* indices,
+                                                 const void* lengths, int32_t rows, int32_t heads, int32_t topk,
+                                                 int32_t record_bytes, float scale_log2, double* stats,
+                                                 void* stream) {
+  auto s = static_cast<cudaStream_t>(stream);
+  const int64_t n = int64_t(rows) * heads * kD;
+  void *ref = nullptr, *out = nullptr;
+  double* dev = nullptr;
+  cudaError_t e = cudaMalloc(&ref, n * 2);
+  if (e == cudaSuccess) e = cudaMalloc(&out, n * 2);
+  if (e == cudaSuccess) e = cudaMalloc(&dev, 3 * sizeof(double));
+  if (e == cudaSuccess) {
+    e = cudaError_t(cuteafd_glm_mla_prefill(q, kv, indices, lengths, ref, rows, heads, topk, record_bytes, scale_log2,
+                                            4, stream));
+  }
+  for (int k = 0; k < 5 && e == cudaSuccess; ++k) {
+    e = cudaError_t(cuteafd_glm_mla_prefill(q, kv, indices, lengths, out, rows, heads, topk, record_bytes, scale_log2,
+                                            k, stream));
+    double h[3] = {0, 0, 0};
+    if (e == cudaSuccess) e = cudaMemsetAsync(dev, 0, 3 * sizeof(double), s);
+    if (e == cudaSuccess) {
+      diff_stats<<<1024, 256, 0, s>>>(static_cast<const bf16*>(out), static_cast<const bf16*>(ref), n, dev);
+      e = cudaGetLastError();
+    }
+    if (e == cudaSuccess) e = cudaMemcpyAsync(h, dev, sizeof(h), cudaMemcpyDeviceToHost, s);
+    if (e == cudaSuccess) e = cudaStreamSynchronize(s);
+    stats[3 * k] = h[1] > 0 ? sqrt(h[0] / h[1]) : 0;
+    stats[3 * k + 1] = h[2];
+    stats[3 * k + 2] = sqrt(h[1] / double(n));
+  }
+  cudaFree(ref);
+  cudaFree(out);
+  cudaFree(dev);
+  return e;
 }
