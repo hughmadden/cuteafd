@@ -393,6 +393,7 @@ impl<'a> DenseNvfp4<'a> {
     /// Loads the package at `directory` with scratch, ids and weights for `rows` rows.
     pub fn load(library: &'a NativeLibrary, directory: &std::path::Path, cfg: &GlmNextConfig, rows: usize)
         -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights/dense-nvfp4");
         // SAFETY: a trusted package for the current device; the engine drains its
         // stream before dropping it.
         let module = unsafe { cuteafd_ffi::fp8_moe::Fp8MoeModule::load(directory) }
@@ -588,6 +589,7 @@ impl<'a> GlmfEngine<'a> {
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmNextConfig, weights: GlmfWeights<'a>,
         stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize, slots: usize,
         embedding: TokenEmbedding<'a>) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         ensure!(cfg.hc_mult == HC && cfg.kv_lora_rank == 512 && cfg.kda_head_dim == 128 && cfg.heads == 64,
@@ -660,6 +662,7 @@ impl<'a> GlmfEngine<'a> {
 
     /// One masked row of the native MLA prefill on rank `rank` (loads its kernel there).
     fn warm_mla_prefill(&self, rank: usize) -> Result<()> {
+        let Some(kernel) = crate::families::glm5::engine::native_mla_prefill() else { return Ok(()) };
         let heads = self.cfg.heads / 2;
         let q = self.alloc(heads * self.cfg.kv_lora_rank * 2)?;
         let kv = self.alloc(PAGE_ROWS * RECORD_BYTES)?;
@@ -672,7 +675,7 @@ impl<'a> GlmfEngine<'a> {
         // stream drains before they drop.
         unsafe {
             self.library.glm_mla_prefill(q.buffer.ptr, kv.buffer.ptr, indices.buffer.ptr, lengths.buffer.ptr,
-                out.buffer.ptr, 1, heads, SPARSE_TOPK, RECORD_BYTES, 1.0, self.stream_of(rank))?;
+                out.buffer.ptr, 1, heads, SPARSE_TOPK, RECORD_BYTES, 1.0, kernel, self.stream_of(rank))?;
             self.library.cuda_stream_synchronize(self.stream_of(rank))
         }
     }
@@ -964,6 +967,7 @@ impl<'a> GlmfEngine<'a> {
     }
 
     fn workspace_here(&self, rank: usize, t: usize, decode: bool) -> Result<Workspace<'a>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let (h, n, lat) = (self.cfg.hidden, self.cfg.heads, self.cfg.kv_lora_rank);
         let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
         let mut scratch = 0;
@@ -1919,7 +1923,7 @@ impl<'a> GlmfEngine<'a> {
             let kv = caches.kv[index].as_ref().context("MLA trace without a record pool")?;
             std::fs::write(dir.join("mla_kv.bin"), self.download(kv, kv.buffer.bytes)?)?;
         }
-        if !tables.decode && crate::families::glm5::engine::native_mla_prefill() {
+        if let (false, Some(kernel)) = (tables.decode, crate::families::glm5::engine::native_mla_prefill()) {
             let scale = (self.cfg.qk_nope_dim as f32).powf(-0.5);
             let stream = self.stream_of(rank);
             let launch = || self.on(rank, || {
@@ -1928,10 +1932,19 @@ impl<'a> GlmfEngine<'a> {
                 unsafe {
                     self.library.glm_mla_prefill(w.query.buffer.ptr, cache, w.indices.buffer.ptr, w.lengths.buffer.ptr,
                         w.latent.buffer.ptr, tables.positions.len(), heads, SPARSE_TOPK, RECORD_BYTES,
-                        scale * std::f32::consts::LOG2_E, stream)
+                        scale * std::f32::consts::LOG2_E, kernel, stream)
                 }
             });
             if rank == 0 { self.timed("glm_mla_prefill (native)", launch)? } else { launch()? }
+            if rank == 0 && crate::families::glm5::engine::mla_prefill_check() {
+                // SAFETY: as above; the check synchronizes the stream.
+                let stats = unsafe {
+                    self.library.glm_mla_prefill_check(w.query.buffer.ptr, cache, w.indices.buffer.ptr,
+                        w.lengths.buffer.ptr, tables.positions.len(), heads, SPARSE_TOPK, RECORD_BYTES,
+                        scale * std::f32::consts::LOG2_E, self.stream)
+                }?;
+                crate::families::glm5::engine::print_mla_check(index, &stats);
+            }
         } else {
             self.run_on(rank, split, &format!("sparse_mla_{mode}_{cap}"), &[("q", w.query.buffer.ptr), ("kv_cache", cache),
                 ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr), ("out", w.latent.buffer.ptr),

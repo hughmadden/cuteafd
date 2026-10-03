@@ -1,4 +1,4 @@
-//! Sparse MLA prefill on F16 tensor cores (`native/families/glm5/cuda/glm_mla_prefill.cu`):
+//! Sparse MLA prefill on F16 or E4M3 tensor cores (`native/families/glm5/cuda/glm_mla_prefill.cu`):
 //! GLM 5.x 656-byte and GLM 5.3 Flash 528-byte FP8 latent records.
 use crate::NativeLibrary;
 use anyhow::{ensure, Result};
@@ -9,22 +9,44 @@ impl NativeLibrary {
     /// first `lengths[r]` entries of `indices` [rows, topk] (record slots;
     /// negative entries masked) in `kv` (slot * `record_bytes`: 656 with RoPE,
     /// 528 without); `q` [rows, heads, 576 or 512] BF16. `scale_log2` is the
-    /// softmax scale times log2(e).
+    /// softmax scale times log2(e). `kernel`: 0 F16; E4M3 1 (E4M3 query and
+    /// P), 2 (two-term P), 3 (two-term query), 4 (two-term query and P).
     ///
     /// # Safety
     /// Every pointer is live device memory of those shapes on the stream's device.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn glm_mla_prefill(&self, q: *const c_void, kv: *const c_void, indices: *const c_void,
         lengths: *const c_void, out: *mut c_void, rows: usize, heads: usize, topk: usize, record_bytes: usize,
-        scale_log2: f32, stream: *mut c_void) -> Result<()> {
+        scale_log2: f32, kernel: i32, stream: *mut c_void) -> Result<()> {
         type F = unsafe extern "C" fn(*const c_void, *const c_void, *const c_void, *const c_void, *mut c_void, i32, i32,
-            i32, i32, f32, *mut c_void) -> i32;
+            i32, i32, f32, i32, *mut c_void) -> i32;
         let f = *unsafe { self.lib.get::<F>(b"cuteafd_glm_mla_prefill") }?;
         let status = unsafe {
             f(q, kv, indices, lengths, out, i32::try_from(rows)?, i32::try_from(heads)?, i32::try_from(topk)?,
-                i32::try_from(record_bytes)?, scale_log2, stream)
+                i32::try_from(record_bytes)?, scale_log2, kernel, stream)
         };
         ensure!(status == 0, "sparse MLA prefill failed with {status}");
         Ok(())
+    }
+
+    /// Diagnostics: every prefill kernel on the same inputs against kernel 4 (two-term E4M3);
+    /// per kernel 0..=4 [relative L2, max abs difference, RMS of the reference]. Synchronizes.
+    ///
+    /// # Safety
+    /// As [`Self::glm_mla_prefill`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn glm_mla_prefill_check(&self, q: *const c_void, kv: *const c_void, indices: *const c_void,
+        lengths: *const c_void, rows: usize, heads: usize, topk: usize, record_bytes: usize, scale_log2: f32,
+        stream: *mut c_void) -> Result<[[f64; 3]; 5]> {
+        type F = unsafe extern "C" fn(*const c_void, *const c_void, *const c_void, *const c_void, i32, i32, i32, i32,
+            f32, *mut f64, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_glm_mla_prefill_check") }?;
+        let mut stats = [[0f64; 3]; 5];
+        let status = unsafe {
+            f(q, kv, indices, lengths, i32::try_from(rows)?, i32::try_from(heads)?, i32::try_from(topk)?,
+                i32::try_from(record_bytes)?, scale_log2, stats.as_mut_ptr().cast(), stream)
+        };
+        ensure!(status == 0, "sparse MLA prefill check failed with {status}");
+        Ok(stats)
     }
 }

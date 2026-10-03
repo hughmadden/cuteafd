@@ -52,6 +52,7 @@ pub(crate) struct GlmfPrefix<'e, 'a> {
 impl<'e, 'a> GlmfPrefix<'e, 'a> {
     /// The family over `engine`'s buffers with a device arena of `slots(mark_bytes)` marks.
     pub fn new(engine: &'e GlmfEngine<'a>, slots: impl FnOnce(usize) -> usize) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix");
         let paged: Vec<_> = (0..engine.ranks())
             .flat_map(|rank| engine.paged_buffers_on(rank).into_iter().map(move |buffers| (rank, buffers))).collect();
         for (_, [records, keys, pools]) in &paged {

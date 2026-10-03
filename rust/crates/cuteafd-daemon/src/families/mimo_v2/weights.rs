@@ -157,6 +157,7 @@ fn kmajor(row_scales: &[f32], k_blocks: usize) -> Vec<u8> {
 
 impl<'a> MimoLoader<'a> {
     fn tensor(&self, name: &str) -> Result<&CheckpointTensor> {
+        cuteafd_ffi::memory_ledger::tensor(name);
         let at = self.checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
             .map_err(|_| anyhow::anyhow!("checkpoint has no tensor {name}"))?;
         Ok(&self.checkpoint.tensors[at])
@@ -174,6 +175,7 @@ impl<'a> MimoLoader<'a> {
     /// Reads tensor `name`'s bytes into `out[at..]` (one positioned read into the
     /// operand's buffer: no second copy) and returns its byte length, dtype and shape.
     fn read_into(&self, name: &str, out: &mut [u8], at: usize) -> Result<(usize, DType, Vec<usize>)> {
+        cuteafd_ffi::memory_ledger::tensor(name);
         let tensor = self.tensor(name)?;
         let length = tensor.meta.byte_length as usize;
         ensure!(at + length <= out.len(), "{name}: {length} bytes past the operand buffer");
@@ -195,6 +197,7 @@ impl<'a> MimoLoader<'a> {
     #[allow(clippy::type_complexity)]
     fn fp8_projection(&self, name: &str, ranks: usize, kmajor_scale: bool)
         -> Result<Vec<(DeviceAllocation<'a>, DeviceAllocation<'a>, Option<DeviceAllocation<'a>>)>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
         let (bytes, dtype, shape) = self.raw(name)?;
         ensure!(shape.len() == 2 && shape[1] % (ranks *128) == 0,
             "{name}: FP8-only projection requires [N,K] with K divisible by128 per rank");
@@ -276,6 +279,7 @@ impl<'a> MimoLoader<'a> {
 
     /// The row-concatenation of 2-D `names` as one BF16 operand.
     fn rows(&self, names: &[String]) -> Result<DeviceAllocation<'a>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let tensors = names.iter().map(|n| self.raw(n).map(|t| (n, t))).collect::<Result<Vec<_>>>()?;
         ensure!(!tensors.is_empty() && tensors.iter().all(|(_, (_, _, s))| s.len() == 2 && s[0] > 0 && s[1] > 0),
             "{names:?}: row operands require nonempty two-dimensional tensors");
@@ -363,6 +367,7 @@ impl<'a> MimoLoader<'a> {
     /// E4M3 bytes `[N, K]` and FP32 per-row x 128-K scales (each row's
     /// block-grid value; exact), row major and K-block major.
     fn fp8_kmajor(&self, names: &[String]) -> Result<Fp8Copy<'a>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
         let total: u64 = names.iter().map(|n| self.tensor(n).map(|t| t.meta.byte_length)).sum::<Result<u64>>()?;
         crate::shared::memory::staging::with_staging(total as usize, |values| {
             // Per row of the concatenation: its tensor's grid and that grid's block row.
@@ -407,6 +412,7 @@ impl<'a> MimoLoader<'a> {
     /// heads they read), rank `r`'s slices concatenated in tensor order, every row
     /// with its own grid value. Read once.
     fn fp8_kmajor_ranks(&self, names: &[String], ranks: usize) -> Result<Vec<Fp8Copy<'a>>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
         let total: u64 = names.iter().map(|n| self.tensor(n).map(|t| t.meta.byte_length)).sum::<Result<u64>>()?;
         crate::shared::memory::staging::with_staging(total as usize, |values| {
             // Per tensor: its first row in the concatenation and row count; per row: grid and block row.
@@ -460,6 +466,7 @@ impl<'a> MimoLoader<'a> {
     /// same layout at its share's geometry. Read once, one copy per rank.
     fn fused_qkv(&self, cfg: &MimoV2Config, attention: MimoAttention, name: &str, ranks: usize)
         -> Result<Vec<Fp8Copy<'a>>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
         let full = FusedQkvLayout::new(cfg, attention, self.checkpoint_tp)?;
         ensure!(self.checkpoint_tp % ranks == 0, "{name}: checkpoint TP {} does not split over {ranks} GPUs",
             self.checkpoint_tp);
@@ -595,6 +602,7 @@ impl<'a> MimoLoader<'a> {
     /// `fp8_kmajor`), each sliced over `ranks` along `axis` (whole 128-row or
     /// 128-K blocks, so every slice keeps exactly its grid values).
     fn fp8_split(&self, names: &[String], axis: Axis, ranks: usize) -> Result<Vec<Fp8Copy<'a>>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
         if ranks == 1 {
             return Ok(vec![self.fp8_kmajor(names)?]);
         }
@@ -630,6 +638,7 @@ impl<'a> MimoLoader<'a> {
     }
 
     fn one(&self, name: &str) -> Result<DeviceAllocation<'a>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let (bytes, dtype, shape) = self.raw(name)?;
         if shape.len() == 2 && dtype == DType::F8E4M3 {
             return self.rows(&[name.to_string()]);
@@ -639,6 +648,7 @@ impl<'a> MimoLoader<'a> {
 
     /// `[bf16(w); bf16(w - bf16(w))]` of the FP32 router weight.
     fn router_hilo(&self, name: &str) -> Result<DeviceAllocation<'a>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16-hilo");
         let (bytes, dtype, shape) = self.raw(name)?;
         ensure!(dtype == DType::F32 && shape.len() == 2, "{name}: the MiMo router weight is FP32 [E, H]");
         let bf16 = |x: f32| -> u16 {

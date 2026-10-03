@@ -81,6 +81,7 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
     /// The family over `engine`'s buffers with a device arena of `slots(mark_bytes)` marks;
     /// `partial` opts into V4.1-style partial reuse (approximate).
     pub fn new(engine: &'e MimoEngine<'a>, slots: impl FnOnce(usize) -> usize, partial: bool) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix");
         let (mut full, mut states) = (Vec::new(), Vec::new());
         let mut offsets = vec![0usize; engine.ranks()];
         let window = engine.cfg.window;

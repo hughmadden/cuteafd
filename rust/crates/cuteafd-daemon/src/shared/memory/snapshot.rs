@@ -10,6 +10,7 @@ pub(crate) struct SnapshotCopies<'a, T> {
 }
 impl<'a, T> SnapshotCopies<'a, T> {
     pub fn new(library: &'a NativeLibrary) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix/snapshot");
         Ok(Self { stream: LoadStream { library, raw: library.cuda_stream_create()? }, pending: None })
     }
     pub fn ready(&self) -> Result<bool> {
@@ -34,6 +35,7 @@ struct Arena<'a> {
 pub(crate) struct SnapshotPool<'a>(Rc<Arena<'a>>);
 impl<'a> SnapshotPool<'a> {
     pub fn new(library: &'a NativeLibrary, bytes: usize, slots: usize) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix/snapshot");
         ensure!(bytes > 0 && slots > 0, "empty snapshot arena");
         let stride = bytes.checked_add(255).context("snapshot stride overflow")? / 256 * 256;
         let allocation = DeviceAllocation::new(library,
@@ -60,6 +62,7 @@ pub(crate) struct SnapshotStorage<'a> {
 }
 impl<'a> SnapshotStorage<'a> {
     pub fn new(library: &'a NativeLibrary, bytes: usize, pool: Option<&SnapshotPool<'a>>) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix/snapshot");
         if let Some(pool) = pool { return pool.take(bytes); }
         let owned = DeviceAllocation::new(library, bytes)?;
         Ok(Self { buffer: owned.buffer, _owned: Some(owned), pooled: None })

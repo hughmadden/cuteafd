@@ -414,6 +414,7 @@ impl<'a> TargetSamplingWave<'a> {
     /// [`Self::device_bytes`] charges to the head wave.
     pub(crate) fn allocate(library: &'a NativeLibrary, stages: SamplerStages, capacity: usize, vocab: usize)
         -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("sampler");
         ensure!(
             (1..=SAMPLING_MAX_MASK_ROWS).contains(&capacity),
             "sampling capacity must be 1..{SAMPLING_MAX_MASK_ROWS}"

@@ -103,6 +103,7 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
 
 impl<'a> Qwen4Loader<'a> {
     pub fn tensor(&self, name: &str) -> Result<&CheckpointTensor> {
+        cuteafd_ffi::memory_ledger::tensor(name);
         let at = self.checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
             .map_err(|_| anyhow::anyhow!("checkpoint has no tensor {name}"))?;
         Ok(&self.checkpoint.tensors[at])
@@ -125,6 +126,7 @@ impl<'a> Qwen4Loader<'a> {
 
     /// The row-concatenation of BF16 2-D `names` plus `pad_rows` zero rows as one operand.
     fn rows(&self, names: &[String], pad_rows: usize) -> Result<DeviceAllocation<'a>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let tensors = names.iter().map(|n| self.raw(n).map(|t| (n, t))).collect::<Result<Vec<_>>>()?;
         let cols = tensors[0].1 .2[1];
         let rows: usize = tensors.iter().map(|(_, (_, _, shape))| shape[0]).sum::<usize>() + pad_rows;
@@ -147,6 +149,7 @@ impl<'a> Qwen4Loader<'a> {
     }
 
     fn one(&self, name: &str) -> Result<DeviceAllocation<'a>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let (bytes, dtype, _) = self.raw(name)?;
         ensure!(dtype == DType::Bf16, "{name}: coordinator tensors must be BF16, found {dtype:?}");
         self.upload(&bytes)
@@ -154,6 +157,7 @@ impl<'a> Qwen4Loader<'a> {
 
     /// A BF16 tensor widened to FP32.
     fn f32(&self, name: &str) -> Result<DeviceAllocation<'a>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("f32");
         let (bytes, dtype, _) = self.raw(name)?;
         let values = match dtype {
             DType::Bf16 => bf16_to_f32(&bytes),
