@@ -827,3 +827,30 @@ fn formats_count_logical_weights() {
     // q, k, v, o for two layers, plus one sink.
     assert_eq!(total[&Component::Attention], 9);
 }
+
+#[test]
+fn layout_places_every_device_and_names_padded_spark_slices() {
+    use crate::plan::testing::{mimo_pro_config, mimo_pro_tensors, write_snapshot};
+    use cuteafd_core::memory_layout::{Category, DeviceKind};
+    let dir = tempfile::tempdir().unwrap();
+    write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
+    let gib = 1u64 << 30;
+    let options = PlanOptions {
+        layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 * gib, 96 * gib], ..Default::default() }),
+        ..sparks(6)
+    };
+    let report = plan(dir.path(), &options).unwrap();
+    let layout = report.memory_layout.as_ref().expect("layout requested");
+    let rtx = layout.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).count();
+    let spark = layout.devices.iter().filter(|d| d.kind == DeviceKind::Spark).count();
+    assert_eq!((rtx, spark), (2, 6));
+    // Head split: both GPUs hold attention weights; only the lead holds the embedding.
+    assert!(layout.devices[1].by_category().get(&Category::Weights).copied().unwrap_or(0) > 0);
+    assert_eq!(layout.devices[1].by_category().get(&Category::Embedding), None);
+    // The pool fills what the tighter GPU has left, within the target, in whole pages.
+    assert!(layout.pool_tokens > 0 && layout.pool_tokens <= cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
+    assert_eq!(layout.pool_tokens % 64, 0);
+    assert!(layout.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).all(|d| d.free_bytes() >= 0));
+    // 2048 over six ranks pads 352/320-row slices to 384: named as waste.
+    assert!(layout.waste.iter().any(|w| w.what.contains("padded")), "{:?}", layout.waste);
+}

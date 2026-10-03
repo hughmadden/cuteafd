@@ -40,7 +40,9 @@ pub(crate) struct EngineArgs {
     /// Longest sequence (the RoPE table and page tables).
     #[arg(long, default_value_t = 32768)]
     pub max_context: usize,
-    /// Tokens the shared latent/index cache pool holds across sequences.
+    /// Tokens the shared latent/index cache pool holds across sequences; 0
+    /// sizes it from what every GPU has left after weights and the planner's
+    /// workspace, graph and drafter costs (up to the common 2M-token target).
     #[arg(long, default_value_t = 262_144)]
     pub pool_tokens: usize,
     #[arg(long, default_value_t = 4096)]
@@ -287,7 +289,26 @@ impl Opened {
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64,
             gib = format!("{:.2}", bytes as f64 / (1u64 << 30) as f64),
             split_gib = format!("{:.2}", peer_bytes as f64 / (1u64 << 30) as f64), "GLM coordinator weights resident");
-        let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
+        let pool_tokens = if args.pool_tokens == 0 {
+            // The planner's GLM costs stay free on each GPU: step workspaces,
+            // graphs, the drafter (lead) and headroom; records fill the rest.
+            let costs = cuteafd_loader::plan::layout::family_costs("glm5");
+            let per_token = model.layers.iter().map(|l| engine::RECORD_BYTES
+                + if l.full_indexer { engine::INDEX_PAGE_BYTES / engine::PAGE_ROWS } else { 0 }).sum::<usize>() as u64;
+            let draft = args.draft.as_deref().map_or(0, crate::shared::memory_report::safetensors_bytes);
+            let headroom = cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes;
+            let mut devices = vec![crate::shared::memory_report::KvDevice { device: args.device, bytes_per_token: per_token,
+                reserve_bytes: costs.lead_workspace_bytes + costs.graph_bytes + draft + headroom }];
+            if let Some((device, _)) = peer_stream {
+                devices.push(crate::shared::memory_report::KvDevice { device, bytes_per_token: per_token,
+                    reserve_bytes: costs.peer_workspace_bytes + costs.graph_bytes + headroom });
+            }
+            usize::try_from(crate::shared::memory_report::auto_pool_tokens(&self.library, &devices,
+                engine::PAGE_ROWS as u64, cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS)?)?
+        } else {
+            args.pool_tokens
+        };
+        let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages, embedding)?;
         engine.full_prefill_logits = args.full_prefill_logits;

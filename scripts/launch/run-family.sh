@@ -162,7 +162,15 @@ if [[ -n "$expert_input" ]]; then
     *) echo "EXPERT_INPUT must be fp8, bf16 or bf16-decode" >&2; exit 2 ;;
   esac
 fi
-[[ ! $family =~ ^(glm5|qwen4|deepseek_v4)$ || -z "$(get POOL_TOKENS)" ]] || family_args+=(--pool-tokens "$(get POOL_TOKENS)")
+# POOL_TOKENS=auto (GLM 5.3, MiMo): the largest pool the GPUs hold after fixed costs (up to 2M tokens).
+if [[ $family =~ ^(glm5|qwen4|deepseek_v4)$ && -n "$(get POOL_TOKENS)" ]]; then
+  pool="$(get POOL_TOKENS)"
+  if [[ "$pool" == auto ]]; then
+    [[ $family == glm5 ]] || { echo "POOL_TOKENS=auto is supported for GLM 5.3 and MiMo" >&2; exit 2; }
+    pool=0
+  fi
+  family_args+=(--pool-tokens "$pool")
+fi
 # GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
 # from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" requires native
 # FP8 block tensors in the primary checkpoint). KDA's BF16 source weights run as-is by default

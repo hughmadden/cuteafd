@@ -87,7 +87,7 @@ pub struct FamilyCosts {
     pub spark_ring_bytes: u64,
 }
 
-fn family_costs(family: &str) -> FamilyCosts {
+pub fn family_costs(family: &str) -> FamilyCosts {
     // Measured 2026-10-03 on the ledger build (see PLAN.md Phase 6 audit);
     // families without a measurement use the generic row.
     let generic = FamilyCosts {
@@ -228,7 +228,7 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
             device.items.push(Item::new(Category::Runtime, "context+modules", "", 512 * MIB, Basis::Calibrated));
             devices.push(device);
         }
-        if stored > even + 64 * MIB {
+        if report.spark_rank_share * ranks as f64 > 1.001 {
             waste.push(Waste { device: format!("spark x{ranks}"), what: format!("routed slices padded to the widest \
                 128-row slice ({:.1}% of the even share) on every rank", 100.0 * (stored - even) as f64 / even as f64),
                 bytes: (stored - even) * ranks as u64 });

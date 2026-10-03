@@ -126,3 +126,41 @@ pub(crate) fn release_load_staging(library: &cuteafd_ffi::NativeLibrary) {
 pub(crate) fn cached_bytes() -> Option<u64> {
     meminfo()["Cached"].as_u64()
 }
+
+/// One GPU holding KV records: its records per logical token and the bytes
+/// that must stay free there after the pool (workspaces, graphs, drafter,
+/// headroom) — the planner's per-device costs.
+pub(crate) struct KvDevice {
+    pub device: i32,
+    pub bytes_per_token: u64,
+    pub reserve_bytes: u64,
+}
+
+/// The largest pool (whole `unit_rows` units, at most `target` tokens) every
+/// device can hold in its free memory now, after its reserve. Restores the
+/// calling thread's device.
+pub(crate) fn auto_pool_tokens(library: &cuteafd_ffi::NativeLibrary, devices: &[KvDevice], unit_rows: u64,
+    target: u64) -> anyhow::Result<u64> {
+    let current = library.cuda_get_device()?;
+    let mut free = Vec::with_capacity(devices.len());
+    for device in devices {
+        library.cuda_set_device(device.device)?;
+        let sample = library.cuda_memory_info();
+        library.cuda_set_device(current)?;
+        let (available, _) = sample?;
+        free.push(available as i64 - device.reserve_bytes as i64);
+    }
+    let per_token: Vec<u64> = devices.iter().map(|d| d.bytes_per_token).collect();
+    let tokens = cuteafd_core::memory_layout::size_pool(&free, &per_token, unit_rows, target);
+    tracing::info!(tokens, target, ?free, ?per_token, "automatic KV pool from free memory after fixed costs");
+    anyhow::ensure!(tokens >= unit_rows, "no room for a KV pool after fixed costs (free after reserve {free:?} bytes)");
+    Ok(tokens)
+}
+
+/// Bytes of a checkpoint directory's safetensors shards (a drafter's resident
+/// size when it keeps its checkpoint representation).
+pub(crate) fn safetensors_bytes(directory: &std::path::Path) -> u64 {
+    std::fs::read_dir(directory).map(|entries| entries.flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "safetensors"))
+        .filter_map(|e| std::fs::metadata(e.path()).ok().map(|m| m.len())).sum()).unwrap_or(0)
+}
