@@ -36,6 +36,8 @@ pub struct LayoutOptions {
     pub drafter_bytes: u64,
     /// Keep this much of every GPU free for runtime growth.
     pub headroom_bytes: u64,
+    /// Concurrent sequences (state slots = concurrency + 2).
+    pub concurrency: u64,
 }
 
 impl Default for LayoutOptions {
@@ -51,6 +53,7 @@ impl Default for LayoutOptions {
             target_pool_tokens: cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS,
             drafter_bytes: 0,
             headroom_bytes: 2 * GIB,
+            concurrency: 8,
         }
     }
 }
@@ -66,42 +69,86 @@ enum Share {
     Sharded { replicated: f64 },
 }
 
-/// Per-family costs calibrated against the allocation ledger (Phase 6 audit).
+/// Per-family costs calibrated against the allocation ledger (Phase 6 audit,
+/// 2026-10-03: one launch per family at its min and max reference layouts,
+/// prefill 4096 rows, after an 8K prefill, a C4 and a C1 request).
 #[derive(Debug, Clone, Copy)]
 pub struct FamilyCosts {
-    /// CUDA context + loaded modules + cuBLAS per GPU (untracked by the ledger).
-    pub runtime_bytes: u64,
-    /// Lead GPU workspaces at `prefill_rows` rows (all lanes, decode, sampler, intake).
-    pub lead_workspace_bytes: u64,
-    /// Peer GPU workspaces under a head split.
-    pub peer_workspace_bytes: u64,
-    /// Retained decode/verify graph executables per GPU.
-    pub graph_bytes: u64,
+    /// CUDA context, modules, cuBLAS, graph executables (untracked): one GPU, lead and peer of a head split.
+    pub runtime_bytes: [u64; 3],
+    /// Step workspaces incl. sampler and Spark intake at 4096 prefill rows: one GPU, lead, peer.
+    pub workspace_bytes: [u64; 3],
+    /// Head-split peer exchange slots on each GPU.
+    pub exchange_bytes: u64,
+    /// The family's default drafter (weights and its buffers) on the lead GPU.
+    pub drafter_bytes: u64,
+    /// Prefix-cache mark slots resident on the device (per GPU).
+    pub mark_slots: u64,
+    /// Native MTP layers stay resident (false: the default drafter replaces them).
+    pub mtp_resident: bool,
     /// Fraction of attention weights replicated on both GPUs under a head split.
     pub attention_replicated: f64,
     /// Resident bytes per source byte of coordinator weights (load-time conversion).
     pub resident_factor: f64,
-    /// Spark worker workspace + host exchange at 4096 rows.
+    /// Spark worker scratch, workspace and host exchange at 4096 rows.
     pub spark_workspace_bytes: u64,
-    /// RDMA rings per Spark rank (both coordinator endpoints).
+    /// RDMA rings per Spark rank (every coordinator endpoint).
     pub spark_ring_bytes: u64,
 }
 
+const fn gib(hundredths: u64) -> u64 {
+    hundredths * GIB / 100
+}
+
 pub fn family_costs(family: &str) -> FamilyCosts {
-    // Measured 2026-10-03 on the ledger build (see PLAN.md Phase 6 audit);
-    // families without a measurement use the generic row.
     let generic = FamilyCosts {
-        runtime_bytes: 1536 * MIB,
-        lead_workspace_bytes: 6 * GIB,
-        peer_workspace_bytes: 3 * GIB,
-        graph_bytes: 640 * MIB,
+        runtime_bytes: [gib(150), gib(150), gib(120)],
+        workspace_bytes: [gib(500), gib(450), gib(300)],
+        exchange_bytes: gib(50),
+        drafter_bytes: 0,
+        mark_slots: 0,
+        mtp_resident: true,
         attention_replicated: 0.0,
         resident_factor: 1.0,
-        spark_workspace_bytes: 160 * MIB,
-        spark_ring_bytes: 1280 * MIB,
+        spark_workspace_bytes: gib(100),
+        spark_ring_bytes: gib(150),
     };
     match family {
-        "glm5" => FamilyCosts { attention_replicated: 0.10, ..generic },
+        // GLM 5.3 EXL3 K4 + DFlash2 (BF16, 4.58 GiB checkpoint + 1.3 GiB context/buffers).
+        "glm5" => FamilyCosts {
+            runtime_bytes: [gib(155), gib(172), gib(126)],
+            workspace_bytes: [gib(651), gib(559), gib(422)],
+            exchange_bytes: gib(56),
+            drafter_bytes: gib(588),
+            mtp_resident: false,
+            attention_replicated: 0.10,
+            spark_workspace_bytes: gib(190),
+            spark_ring_bytes: gib(231),
+            ..generic
+        },
+        // MiMo V2.6 Pro + embedded DFlash (qualified FP8 bundle); MTP unused.
+        "mimo_v2" => FamilyCosts {
+            runtime_bytes: [gib(123), gib(137), gib(100)],
+            workspace_bytes: [gib(290), gib(249), gib(120)],
+            exchange_bytes: gib(38),
+            drafter_bytes: gib(321),
+            mark_slots: 42,
+            mtp_resident: false,
+            spark_workspace_bytes: gib(51),
+            spark_ring_bytes: gib(117),
+            ..generic
+        },
+        // GLM 5.3 Flash EXL3 + DFlash2; one GPU (no head split).
+        "glm5_flash" => FamilyCosts {
+            runtime_bytes: [gib(124), gib(124), gib(124)],
+            workspace_bytes: [gib(472), gib(472), gib(472)],
+            drafter_bytes: gib(324),
+            mark_slots: 18,
+            mtp_resident: false,
+            spark_workspace_bytes: gib(56),
+            spark_ring_bytes: gib(78),
+            ..generic
+        },
         _ => generic,
     }
 }
@@ -142,8 +189,9 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
             }
         }
     }
-    let covered = |c: Component| exact.is_some() && !matches!(c, Component::Speculator | Component::SpeculatorExpert
-        | Component::Vision | Component::TableProjection);
+    let covered = |c: Component| (exact.is_some() && !matches!(c, Component::Speculator | Component::SpeculatorExpert
+        | Component::Vision | Component::TableProjection))
+        || (!costs.mtp_resident && matches!(c, Component::Speculator | Component::SpeculatorExpert));
     for component in report.components.iter()
         .filter(|c| c.owner == Owner::Rtx && c.status != Status::Unused && !covered(c.component)) {
         let (resident, format) = match conversions.iter().find(|c| c.component == component.component) {
@@ -185,18 +233,23 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
             }
         }
     }
-    if options.drafter_bytes > 0 {
-        let last = devices.len() - 1;
-        devices[last].items.push(Item::new(Category::Drafter, "drafter", "", options.drafter_bytes, Basis::Exact));
+    // The drafter lives on the lead GPU (taps and head are there under a head split).
+    let drafter = if options.drafter_bytes > 0 { options.drafter_bytes } else { costs.drafter_bytes };
+    if drafter > 0 {
+        devices[0].items.push(Item::new(Category::Drafter, "drafter", "", drafter, Basis::Calibrated));
     }
 
     // Fixed runtime costs.
+    let gpus_now = devices.len();
     for (index, device) in devices.iter_mut().enumerate() {
-        device.items.push(Item::new(Category::Runtime, "context+modules", "", costs.runtime_bytes, Basis::Calibrated));
-        let workspace = if index == 0 { costs.lead_workspace_bytes } else { costs.peer_workspace_bytes };
-        let workspace = workspace * options.prefill_rows.max(1) / 4096;
+        let role = if gpus_now == 1 { 0 } else if index == 0 { 1 } else { 2 };
+        device.items.push(Item::new(Category::Runtime, "context+modules+graphs", "", costs.runtime_bytes[role],
+            Basis::Calibrated));
+        let workspace = costs.workspace_bytes[role] * options.prefill_rows.max(1) / 4096;
         device.items.push(Item::new(Category::Workspace, "steps", "", workspace, Basis::Calibrated));
-        device.items.push(Item::new(Category::Runtime, "graphs", "", costs.graph_bytes, Basis::Calibrated));
+        if split {
+            device.items.push(Item::new(Category::Transport, "peer exchange", "", costs.exchange_bytes, Basis::Calibrated));
+        }
     }
 
     // KV pool: per-device bytes per logical token from the family geometry.
@@ -212,7 +265,11 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
             for (device, (rank, &cost)) in devices.iter_mut().zip(geometry.ranks.iter().zip(&per_token)) {
                 device.items.push(Item::new(Category::Kv, "records", "", cost * pool_tokens, Basis::Formula));
                 device.items.push(Item::new(Category::Kv, "state", "", rank.fixed_state_bytes
-                    + rank.active_state_per_sequence_bytes * 20, Basis::Formula));
+                    + rank.active_state_per_sequence_bytes * (options.concurrency + 2), Basis::Formula));
+                if costs.mark_slots > 0 && rank.retained_mark_bytes > 0 {
+                    device.items.push(Item::new(Category::Prefix, "marks", "", rank.retained_mark_bytes * costs.mark_slots,
+                        Basis::Formula));
+                }
                 device.kv_tokens = pool_tokens;
             }
             if geometry.placement == KvPlacement::Replicated && devices.len() == 2 {
@@ -276,6 +333,26 @@ fn load_conversions(family: &str, checkpoint: &super::Checkpoint) -> Vec<Convers
             let output = (bytes(cfg.hidden, o, R::Bf16, 1).saturating_sub(bytes(cfg.hidden, o, R::Fp8, 1))) * cfg.layers as u64;
             vec![Conversion { component: Component::LmHead, saved_bytes: head, format: "fp8-block128" },
                 Conversion { component: Component::Attention, saved_bytes: output, format: "fp8-block128" }]
+        }
+        // GLM 5.3 Flash serves MLA, dense and shared-expert projections as FP8
+        // from the official FP8 release (--fp8-snapshot); a BF16 checkpoint's
+        // copies of them are not loaded. KDA stays as stored.
+        "glm5_flash" => {
+            let bf16 = |c: &crate::plan::checkpoint::CheckpointTensor| c.meta.dtype == cuteafd_core::DType::Bf16;
+            let bytes = |filter: &dyn Fn(&str) -> bool| -> u64 {
+                checkpoint.tensors.iter().filter(|t| bf16(t) && filter(&t.meta.name)).map(|t| t.meta.byte_length).sum()
+            };
+            let mla_layers: std::collections::BTreeSet<String> = checkpoint.tensors.iter()
+                .filter(|t| t.meta.name.ends_with("self_attn.q_a_proj.weight"))
+                .map(|t| t.meta.name.trim_end_matches("q_a_proj.weight").to_string()).collect();
+            let mla = bytes(&|n: &str| mla_layers.iter().any(|p| n.starts_with(p.as_str()))
+                && ["q_a_proj.weight", "kv_a_proj_with_mqa.weight", "q_b_proj.weight", "o_proj.weight"].iter().any(|s| n.ends_with(s)));
+            let shared = bytes(&|n: &str| n.contains("shared_experts.") && n.ends_with("_proj.weight"));
+            let dense = bytes(&|n: &str| n.contains(".mlp.") && !n.contains("experts") && n.ends_with("_proj.weight")
+                && !n.contains(".gate."));
+            vec![Conversion { component: Component::Attention, saved_bytes: mla / 2, format: "bf16+fp8" },
+                Conversion { component: Component::SharedExpert, saved_bytes: shared / 2, format: "fp8" },
+                Conversion { component: Component::DenseFfn, saved_bytes: dense / 2, format: "fp8" }]
         }
         _ => Vec::new(),
     }

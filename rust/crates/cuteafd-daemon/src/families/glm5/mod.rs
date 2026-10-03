@@ -295,13 +295,20 @@ impl Opened {
             let costs = cuteafd_loader::plan::layout::family_costs("glm5");
             let per_token = model.layers.iter().map(|l| engine::RECORD_BYTES
                 + if l.full_indexer { engine::INDEX_PAGE_BYTES / engine::PAGE_ROWS } else { 0 }).sum::<usize>() as u64;
-            let draft = args.draft.as_deref().map_or(0, crate::shared::memory_report::safetensors_bytes);
+            // The drafter's checkpoint plus its context buffers (~1.3 GiB measured for DFlash2).
+            let draft = args.draft.as_deref().map_or(0, |d| crate::shared::memory_report::safetensors_bytes(d) + (1300 << 20));
             let headroom = cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes;
+            // Allocated after the pool: step workspaces, the peer exchange, the
+            // drafter (lead) and graph executables (~0.5 GiB measured).
+            let graphs = 512u64 << 20;
+            let split = peer_stream.is_some();
+            let (lead, exchange) = if split { (costs.workspace_bytes[1], costs.exchange_bytes) }
+                else { (costs.workspace_bytes[0], 0) };
             let mut devices = vec![crate::shared::memory_report::KvDevice { device: args.device, bytes_per_token: per_token,
-                reserve_bytes: costs.lead_workspace_bytes + costs.graph_bytes + draft + headroom }];
+                reserve_bytes: lead + exchange + draft + graphs + headroom }];
             if let Some((device, _)) = peer_stream {
                 devices.push(crate::shared::memory_report::KvDevice { device, bytes_per_token: per_token,
-                    reserve_bytes: costs.peer_workspace_bytes + costs.graph_bytes + headroom });
+                    reserve_bytes: costs.workspace_bytes[2] + exchange + graphs + headroom });
             }
             usize::try_from(crate::shared::memory_report::auto_pool_tokens(&self.library, &devices,
                 engine::PAGE_ROWS as u64, cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS)?)?
