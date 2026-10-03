@@ -3909,6 +3909,13 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_poll_with_timeout(
   };
   const auto initial_busy_deadline =
       std::chrono::steady_clock::now() + kRdmaRcEndpointBusyPollBudget;
+  // The recent-activity busy window never outlasts the caller's wait budget:
+  // a worker sweeping several connections waits on one with a short budget
+  // and must not spin on it for the whole 5 s window while others queue.
+  const auto busy_deadline = std::max(
+      initial_busy_deadline,
+      std::min(endpoint->busy_poll_until,
+               std::chrono::steady_clock::now() + std::chrono::milliseconds(event_poll_timeout_ms)));
   do {
     const cuteafd_status_t status = poll_incomplete_cqs_once();
     if (status != CUTEAFD_STATUS_OK) {
@@ -3919,8 +3926,7 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_poll_with_timeout(
                        "RDMA RC endpoint poll completed after busy poll");
       return ok();
     }
-  } while (std::chrono::steady_clock::now() <
-           std::max(initial_busy_deadline, endpoint->busy_poll_until));
+  } while (std::chrono::steady_clock::now() < busy_deadline);
 
   auto request_notify = [](ibv_cq* cq, const char* cq_name) -> cuteafd_status_t {
     if (ibv_req_notify_cq(cq, 0) != 0) {
