@@ -556,6 +556,23 @@ on the held-out auto-pool launches (MiMo Pro 49.42/41.86 vs 49.4/41.6, GLM Flash
 Engines take admission from it: MiMo (capacity contract, pool 0 = auto),
 GLM 5.3 and GLM 5.3 Flash (`--pool-tokens 0`). Next: V4/V4.1 and Qwen
 geometry in the planner, graph-cache bounds, `placement.json` handoff (S1).
+Follow-ups (2026-10-03, measurements pending in `~/.cache/cuteafd/builds/v1-memory/kit/out`):
+- GLM 5.3 decode graphs bounded: steps pad to row buckets (exact to 16, then
+  20..64) over a scratch page past the pool, page tables to power-of-two widths
+  >= 16 pages; every shape captured at startup (5,688 graphs in 2.0 s on one
+  GPU with the first bucket set); real rows' logits byte-identical to unpadded
+  steps; a failed capture runs its segment uncaptured (keeps the peer exchange
+  in step). GLM's auto pool stays opt-in until graph memory and C1/C4 are in.
+- Exact Spark slices: FP8/MXFP4/NVFP4 Spark packages also build tp<n>-w<width>
+  layouts (ranks own whole 128-row blocks, no zero padding; MiMo V2.6 Pro TP6
+  ranks 4-5 61.9 instead of 92.8 GiB); EXL3 already had them. Shortening the
+  busiest rank (352/320 rows) needs 32-row K tails in the MXFP4 down projection:
+  after `work/mimo-perf` (A8 down) lands on fork master. V4.1 TP4 (576 -> 640)
+  goes through the V4.1 packer: not done.
+- V4.1 one RTX: row buffers at the live 2048-row chunk instead of the 4096 AOT
+  capacity (as on two RTX), reindex selection shares the source's scratch
+  (~10 GiB expected -> one more RTX expert layer). Left: window-wave
+  temporaries (3.5 GiB, per-layer streams) and engram gate sharing (0.6 GiB).
 
 **Device-driven Spark exchange (decided 2026-10-02, `work/v41-device`).** No engine is
 device-routed toward the Sparks today: every family (V4, GLM, GLM Flash, MiMo, Qwen) downloads
