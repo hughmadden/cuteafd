@@ -639,6 +639,22 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
 5. **Spark expert kernels**: MiMo V2.6 Pro TP6 prefill is Spark-bound (~35 of
    ~42 ms per layer); GLM 5.3 verify is bound by distinct expert reads; NVFP4
    W4A16 GB10 prefill (14.3 vs EXL3 9.1 ms/layer TP4).
+   GLM 5.3 (2026-10-03, `work/glm-perf`): 8K prefill is ~3.0 s on min and max
+   alike because both are Spark-bound — worker kernel time per 2752-row wave
+   (3 lanes) is 11.7 ms at TP4 width 512, 11.0 at TP6 width 384, 7.6 at width
+   256, so six Sparks save only ~5% Spark time (the width-384 package runs
+   128-wide tiles; a 192-wide WS tile is on fork `cuteafd/exl3-gb10-bytes`),
+   and the head split only moves the wait from the GPU to the Sparks. GB10's
+   wave is bound by bytes (FC1 BF16 input gathers per N tile, FC2 partial
+   round trip ~2 ms, top-k sum 1.6 ms) and the FC1 rotation, not MMA rate.
+   Coordinator GPU-only 8K prefill is 2.7 s, half of it the sparse MLA prefill
+   kernel (FP8 MMA rework: `work/glm-mla-fp8`). Lanes 2 or 4 lose to 3.
+   Verify layouts (busiest-rank expert reads, uniform routes): TP6 beats
+   TP2xEP3 up to 16 rows (1.50 vs 2.02 expert-equivalents at 1 row, 10.8 vs
+   11.2 at 8) and loses by 1-8% only at 32-64 rows; keep TP6. DFlash2 at max
+   (TP6 + split, code C1): adaptive 66-68 tok/s vs fixed 7/5/3 at 65/62/61;
+   offline trace scoring with the measured TP6 table: adaptive 72.9 vs best
+   fixed 62.7 (oracle 83.3) — the policy is not the limit.
 6. **RTX 5090 audit and claim**: hard-coded `4*188` grid clamps and the
    per-tensor FP8 GEMM grid sized for 188 SMs; one SM120 build must serve both.
    Expert quantizer grids now come from each engine's GPU (`6d4ea7a`).
@@ -675,9 +691,13 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
    declares it** (NVIDIA ModelOpt NVFP4). Every A8 switch is gated on golden
    NLL/KL (≤0.005 nat) plus a tool-eval/agentic check, per model.
    - EXL3 × A8: EXL3 trellis experts (V4 Pro, GLM 5.3, GLM Flash, Qwen) run
-     A16 today. brandonmusic had unmerged MXFP8 EXL3 WIP; check upstream b12x
-     first, else build an EXL3 decode-to-FP8 tile path with MXFP8/FP8
-     activations in the fork.
+     A16 today. Checked 2026-10-03: nothing upstream runs standard (MCG) EXL3
+     with A8 — master's W4A8 trellis decodes only QSRT; brandonmusic's PR #342
+     (MCG->E4M3, SM120 TP4, source-available licence, expert-shared suh) does
+     not fit our checkpoints. GB10 measured full-rate F16 MMA (124.8 TFLOPS,
+     E4M3/INT8 248), and an INT8 A8 prototype (fork `cuteafd/exl3-a8`, local;
+     INT8 weights 0.9-1.6% rel error vs 3.7% for E4M3) saves only ~7% of a
+     GB10 wave: not built. The wave is byte- and rotation-bound (item 5).
    - MXFP4 experts (V4.1 already W4A8; MiMo V2.6 Pro W4A16): A8 prefill for
      MiMo Pro (Spark-bound prefill), and MXFP4 × MXFP8 MMAs for both.
    - FP8 experts: extend W8A8 (MiMo GB10 gate/up) to the down projection and
