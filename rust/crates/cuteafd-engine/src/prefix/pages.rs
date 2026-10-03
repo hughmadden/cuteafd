@@ -47,6 +47,7 @@ pub struct RefPagePool {
     /// Free indices; popped from the end, so a fresh pool hands out 0, 1, 2, ...
     free: Vec<u32>,
     page_rows: usize,
+    release_epoch: u64,
 }
 
 impl RefPagePool {
@@ -58,6 +59,7 @@ impl RefPagePool {
             generation: vec![0; pages as usize],
             free: (0..pages).rev().collect(),
             page_rows,
+            release_epoch: 0,
         }
     }
 
@@ -72,6 +74,12 @@ impl RefPagePool {
     }
     pub fn page_rows(&self) -> usize {
         self.page_rows
+    }
+    /// Progress relevant to admission, including a running placement releasing
+    /// pages still held by an inactive snapshot (those pages become evictable
+    /// without increasing the physical free-page count).
+    pub fn release_epoch(&self) -> u64 {
+        self.release_epoch
     }
     /// Pages a sequence of `tokens` tokens needs (at least one: a placement always has a page).
     pub fn pages_for(&self, tokens: usize) -> usize {
@@ -128,6 +136,9 @@ impl RefPagePool {
                 self.free.push(page);
                 freed.push(FreedPage { index: page, generation });
             }
+        }
+        if !pages.is_empty() {
+            self.release_epoch = self.release_epoch.wrapping_add(1);
         }
         freed
     }

@@ -89,7 +89,12 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let (queue, receive) = mpsc::channel::<NativeRequest>(16);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let (engine_args, worker_stats, max_sequences) = (args.engine.clone(), stats.clone(), args.max_sequences);
+    let mut engine_args = args.engine.clone();
+    if engine_args.draft_context_slots.is_none() {
+        engine_args.draft_context_slots = Some(20.max(engine_args.draft_sequences)
+            .max(args.max_sequences.saturating_mul(5).div_ceil(4)));
+    }
+    let (worker_stats, max_sequences) = (stats.clone(), args.max_sequences);
     let policy = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed,
         decode_share: args.decode_share };
     let prefix = args.prefix.clone();
@@ -382,20 +387,21 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs)
     // The pinned host tier copies through one GPU's copy engine; a head split keeps its
     // (replicated) pages on both GPUs, so it keeps device-resident snapshots only.
     let host = if engine.ranks() > 1 {
-        if args.host_cache_bytes > 0 && args.prefix_cache_entries > 0 {
+        if args.host_cache_bytes.enabled() && args.prefix_cache_entries > 0 {
             tracing::warn!("GLM head split: the prefix cache's host tier is off (device-resident snapshots only)");
         }
         None
     } else {
-        args.host_tier(engine.library, template, 1)?
+        args.host_tier(engine.library, template, family.layout(), engine.max_context)?
     };
+    let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();
     let config = PrefixConfig { entries, mark_slots: 0, keep_logits: true, min_tokens: args.prefix_cache_min_tokens };
     let cache = PrefixCache::new(layout, config, host)?;
-    tracing::info!(entries, page_bytes = layout.page_bytes, pages = layout.pages, host_bytes = args.host_cache_bytes,
+    tracing::info!(entries, page_bytes = layout.page_bytes, pages = layout.pages, host_bytes,
         rule = ?layout.rule, points = ?args.points(), "GLM prefix cache");
     cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64,
-        &"FP8 MLA latent + DSA index".to_string(), if args.prefix_cache_entries == 0 { 0 } else { args.host_cache_bytes });
+        &"FP8 MLA latent + DSA index".to_string(), host_bytes);
     Ok((family, cache))
 }
 
@@ -444,22 +450,30 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     let mut phases = [0f64; 8];
     let mut trace = Trace::open()?;
     let mut prefills = policy.decode_share.queue::<Prefill<'_>>()?;
+    let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<NativeRequest>::default();
     loop {
         while active.len() + prefills.len() < max_sequences {
-            let job = if active.is_empty() && prefills.is_empty() {
-                // Idle: publish the state the server waits in (captures and releases done).
-                cache.tick();
-                publish(stats, requests, generated_total, 0, 0, &cache);
-                console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
-                match receive.blocking_recv() {
-                    Some(job) => job,
-                    None => return Ok(()),
-                }
-            } else {
-                match receive.try_recv() {
-                    Ok(job) => job,
-                    Err(_) => break,
-                }
+            let busy = !active.is_empty() || !prefills.is_empty();
+            let job = match kv_waiter.poll(cache.pool().free(), cache.pool().release_epoch(), busy, |job| job.events.is_closed()) {
+                cuteafd_engine::prefix::AdmissionPoll::Blocked => break,
+                cuteafd_engine::prefix::AdmissionPoll::Ready(job) => job,
+                cuteafd_engine::prefix::AdmissionPoll::Empty => {
+                    if !busy {
+                        // Idle: publish the state the server waits in (captures and releases done).
+                        cache.tick();
+                        publish(stats, requests, generated_total, 0, 0, &cache);
+                        console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
+                        match receive.blocking_recv() {
+                            Some(job) => job,
+                            None => return Ok(()),
+                        }
+                    } else {
+                        match receive.try_recv() {
+                            Ok(job) => job,
+                            Err(_) => break,
+                        }
+                    }
+                },
             };
             let reject = |job: &NativeRequest, message: String| {
                 let _ = job.events.send(Err(NativeFailure::BadRequest(message)));
@@ -487,7 +501,12 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 Ok(admitted) => admitted,
                 Err(error) => {
                     free_slots.extend(slot);
-                    reject(&job, format!("{error:#}"));
+                    // Running requests keep their pages pinned. Delay a request
+                    // that fits alone instead of rejecting transient KV pressure.
+                    match kv_waiter.defer(job, &error, busy, cache.pool().release_epoch()) {
+                        Ok(()) => break,
+                        Err(job) => reject(&job, format!("{error:#}")),
+                    }
                     continue;
                 }
             };
@@ -695,10 +714,11 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 let seqs: Vec<(usize, DraftSeq)> = active.iter().enumerate()
                     .filter_map(|(i, a)| a.slot.map(|slot| (i, DraftSeq { slot, anchor: a.next, position: a.placement.len,
                         valid_from: a.draft_from })))
+                    .take(drafter.max_batch_sequences())
                     .collect();
                 let timer = Instant::now();
                 let drafts = drafter.draft_device(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
-                    engine.weights.head.buffer.ptr);
+                    &engine.weights.head);
                 cost.observe_draft(timer.elapsed().as_secs_f64() * 1e3);
                 let mut out = vec![None; active.len()];
                 match drafts {
@@ -918,7 +938,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         }
         cache.tick();
         publish(stats, requests, generated_total, active.len(), prefills.len(), &cache);
-        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len()));
+        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len() + kv_waiter.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
 }

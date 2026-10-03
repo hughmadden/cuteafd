@@ -86,7 +86,7 @@ fn device_evictions_once_per_eviction_outcome() {
     );
     assert_eq!(cache.metrics().device_evictions, 1);
 
-    // Dropped uncached: the store stream stalls, so the copy never lands.
+    // A stalled stream cannot release either device sources or host slabs.
     let mut cache = default_cache(4 * CHUNK as u64, StoreMode::OnRetain);
     let mut device = Device::new(DEVICE_BYTES);
     let stalled = probe_snapshot(&mut device, 1);
@@ -99,14 +99,17 @@ fn device_evictions_once_per_eviction_outcome() {
     };
     assert_eq!(
         cache.before_device_evict(Some(ticket)),
-        EvictDecision::DroppedUncached
+        EvictDecision::Held
     );
     let metrics = cache.metrics();
     assert_eq!(metrics.device_evictions, 1);
-    assert_eq!(metrics.evict_drops_uncached, 1);
+    assert_eq!(metrics.evict_drops_uncached, 0);
+    assert!(metrics.bytes_used > 0);
     assert!(metrics.device_evictions >= metrics.evict_drops_uncached);
 
     // Budget timeout: the copies are modelled far slower than the copy budget.
+    // The eviction must finish their queued writes before releasing either slab
+    // or source storage, even though the snapshot is no longer retained.
     let slow = CopyModel {
         d2h_bytes_per_ns: 0.001,
         ..CopyModel::default()
@@ -124,6 +127,8 @@ fn device_evictions_once_per_eviction_outcome() {
         cache.before_device_evict(Some(ticket)),
         EvictDecision::DroppedUncached
     );
+    assert_eq!(cache.engine_mut().pending(Stream::Store), 0,
+        "timed-out eviction returned with writes into reusable slabs still queued");
     let metrics = cache.metrics();
     assert_eq!(metrics.device_evictions, 1);
     assert_eq!(metrics.evict_waits, 1);
@@ -205,7 +210,7 @@ fn store_latency_lands_past_the_first_bucket() {
 }
 
 #[test]
-fn failed_store_and_drain_timeout_record_no_latency() {
+fn failed_store_and_exceptional_drain_record_no_latency() {
     // An issue failure: tick reports the ticket failed; no copy ever completed.
     let mut cache = default_cache(4 * CHUNK as u64, StoreMode::OnRetain);
     let mut device = Device::new(DEVICE_BYTES);
@@ -225,8 +230,8 @@ fn failed_store_and_drain_timeout_record_no_latency() {
     assert_eq!(metrics.store_latency_sum_ns, 0);
     assert_eq!(buckets_sum(&metrics), 0);
 
-    // A drain timeout: the mid-plan failure's copies do not drain within the budget, the
-    // slabs stay held, and the failure records no latency either.
+    // Copies exceed the normal budget, then the exceptional barrier drains them.
+    // The failed store still records no successful-store latency.
     let slow = CopyModel {
         d2h_bytes_per_ns: 0.001,
         ..CopyModel::default()
@@ -247,9 +252,11 @@ fn failed_store_and_drain_timeout_record_no_latency() {
     };
     let report = cache.tick();
     assert_eq!(report.failed, vec![ticket]);
+    assert_eq!(cache.engine_mut().inner_mut().pending(Stream::Store), 0);
     let metrics = cache.metrics();
     assert_eq!(metrics.stores_failed, 1);
-    assert_eq!(metrics.store_drain_timeouts, 1);
+    assert_eq!(metrics.store_drain_timeouts, 0);
+    assert_eq!(metrics.bytes_used, 0);
     assert_eq!(metrics.stores_completed, 0);
     assert_eq!(metrics.store_latency_sum_ns, 0);
     assert_eq!(buckets_sum(&metrics), 0);

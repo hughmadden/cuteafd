@@ -18,10 +18,11 @@
 //!
 //! MoE: FP32 router logits, the native softmax top-10 (logits and weights
 //! rounded to BF16 as the reference), the shared expert with its sigmoid
-//! gate, and routed experts on this GPU (FP8 or EXL3 packages, a window of
-//! resident layers) or on the Sparks.
+//! gate, and routed experts on this GPU (FP8/NVFP4 packages fully resident
+//! by default, EXL3 packages with their admitted resident window) or on the Sparks.
 use super::weights::{Qwen4Layer, Qwen4Weights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
+use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use crate::shared::token_io::{DeviceLogits, EmbedPlacement, TokenEmbedding};
 use anyhow::{ensure, Context, Result};
@@ -75,13 +76,13 @@ fn gdn_replay_bytes(cfg: &Qwen4Config) -> usize {
     bytes.div_ceil(1024) * 1024
 }
 
-/// Routed experts on this GPU from the TP1 FP8 package: a window of resident
-/// layers, reloaded when a step reaches a layer outside it.
+/// Routed experts on this GPU from the TP1 package. All layers stay resident
+/// unless an explicit diagnostic paging window was requested.
 pub(crate) struct LocalExperts<'a> {
     pub library: &'a NativeLibrary,
     pub tensors: &'a Fp8ExpertTensors,
     pub experts: RefCell<Fp8Experts<'a>>,
-    pub window: usize,
+    pub window: Option<usize>,
     pub loads: RefCell<usize>,
 }
 
@@ -91,7 +92,8 @@ impl LocalExperts<'_> {
         if let Ok(index) = experts.index_of(layer) {
             return Ok(index);
         }
-        if experts.layers.len() >= self.window {
+        let window = self.window.context("local expert layer missing from the admitted resident set")?;
+        if experts.layers.len() >= window {
             experts.layers.remove(0);
         }
         let started = std::time::Instant::now();
@@ -412,6 +414,7 @@ pub(crate) enum MtpSource {
 }
 
 pub(crate) struct Qwen4Engine<'a> {
+    quantize_grid: Fp8QuantizeGrid,
     pub library: &'a NativeLibrary,
     pub programs: &'a Programs<'a>,
     pub cfg: Qwen4Config,
@@ -508,6 +511,7 @@ impl<'a> Qwen4Engine<'a> {
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: Qwen4Config, weights: Qwen4Weights<'a>,
         ple: Option<super::ple::PleTable<'a>>, stream: *mut c_void, max_context: usize, prefill_rows: usize,
         pages: usize, slots: usize, embedding: TokenEmbedding<'a>) -> Result<Self> {
+        let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         cfg.check_programs()?;
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
@@ -557,7 +561,7 @@ impl<'a> Qwen4Engine<'a> {
             (None, None)
         };
         let pool_logical = zeroed(pool_pages * 4)?;
-        Ok(Self { library, programs, cfg, weights, ple, stream, max_context, prefill_rows, pages, slots, kv, gdn_ord,
+        Ok(Self { quantize_grid, library, programs, cfg, weights, ple, stream, max_context, prefill_rows, pages, slots, kv, gdn_ord,
             gdn_conv, gdn_state, gdn_replay, gdn_layers, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
             commit_tables: zeroed(3 * DECODE_ROWS * 4)?, mtp_kv, mtp_pending,
             last_streams: std::cell::Cell::new((false, 0)), mtp_streams: std::cell::Cell::new((false, 0)), pool_logical,
@@ -571,6 +575,10 @@ impl<'a> Qwen4Engine<'a> {
 
     pub fn set_experts(&mut self, experts: Experts<'a>) {
         self.experts = Some(experts);
+    }
+
+    pub fn captured_graphs(&self) -> usize {
+        self.graphs.borrow().len()
     }
 
     pub fn experts(&self) -> Option<&Experts<'a>> {
@@ -1520,12 +1528,13 @@ impl<'a> Qwen4Engine<'a> {
         unsafe { self.library.cuda_graph_begin_capture(self.stream)? };
         let captured = segment();
         // SAFETY: ends the capture begun above on the same stream.
-        let exec = unsafe { self.library.cuda_graph_end_capture(self.stream) };
+        let exec = unsafe { self.library.cuda_graph_end_capture(self.stream) }
+            .map(|exec| GraphExec(exec, self.library));
         captured?;
         let exec = exec?;
         // SAFETY: the new graph reads and writes persistent engine buffers.
-        unsafe { self.library.cuda_graph_launch(exec, self.stream)? };
-        self.graphs.borrow_mut().insert(key, GraphExec(exec, self.library));
+        unsafe { self.library.cuda_graph_launch(exec.0, self.stream)? };
+        self.graphs.borrow_mut().insert(key, exec);
         Ok(())
     }
 
@@ -1712,7 +1721,7 @@ impl<'a> Qwen4Engine<'a> {
             self.shared(w, layer, rows)?;
         }
         if matches!(experts, Experts::LocalExl3(_) | Experts::Spark { .. }) {
-            let grid = (t * h.div_ceil(256)).div_ceil(8).clamp(1, 4 * 188);
+            let grid = self.quantize_grid.blocks(t, h);
             self.run("qwen4_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
                 // SAFETY: the scale rows follow the payload inside each wire row.
                 ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
@@ -1743,9 +1752,11 @@ impl<'a> Qwen4Engine<'a> {
                     fp8.run(resident, t, w.x.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
                         w.routed.buffer.ptr, self.stream)?;
                 }
-                // The window may drop this layer before the stream drains.
-                // SAFETY: the engine owns this stream.
-                unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+                if local.window.is_some() {
+                    // Diagnostic paging may drop this layer before the stream drains.
+                    // SAFETY: the engine owns this stream.
+                    unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+                }
             }
             Experts::LocalExl3(local) => {
                 self.exchange_window(index, decode, true)?;
@@ -1846,7 +1857,11 @@ impl<'a> Qwen4Engine<'a> {
 
 impl Drop for Qwen4Engine<'_> {
     fn drop(&mut self) {
-        // SAFETY: the engine's stream is drained by its owner before the engine drops.
-        let _ = unsafe { self.library.cuda_event_destroy(self.routes_ready) };
+        // SAFETY: the engine owns this stream and its resident weights. Drain
+        // queued work, including a failed step, before their storage drops.
+        unsafe {
+            let _ = self.library.cuda_stream_synchronize(self.stream);
+            let _ = self.library.cuda_event_destroy(self.routes_ready);
+        }
     }
 }

@@ -447,15 +447,18 @@ impl<E: CopyEngine> PrefixCache<E> {
     /// Drop a device snapshot: its host copy finishes within budget first, then its storage goes
     /// back once the family's queued copies drained.
     fn evict<F: PrefixFamily>(&mut self, family: &F, id: EntryId) -> Result<(), PrefixError> {
-        let Some(entry) = self.entries.remove(&id) else { return Ok(()) };
-        self.retained.bank_mut(entry.kind).remove_exact(&entry.tokens);
+        let Some(entry) = self.entries.get(&id) else { return Ok(()) };
         if let Some(host) = &mut self.host {
             match host.before_device_evict(entry.ticket) {
                 EvictDecision::Clean => {}
                 EvictDecision::WaitedClean { .. } => self.stats.host_evict_waits += 1,
                 EvictDecision::DroppedUncached => self.stats.host_evict_uncached += 1,
+                EvictDecision::Held => return Err(PrefixError::Host(
+                    "host snapshot copy did not drain; retaining device pages and positional mark".into())),
             }
         }
+        let entry = self.entries.remove(&id).expect("checked before release barrier");
+        self.retained.bank_mut(entry.kind).remove_exact(&entry.tokens);
         self.stats.evictions += 1;
         self.release(family, &entry.pages)?;
         self.give_back(family, entry.mark)
@@ -556,13 +559,11 @@ impl<E: CopyEngine> PrefixCache<E> {
         match host.restore(hit.key, &target) {
             RestoreOutcome::Done { .. } => {}
             outcome => {
-                if outcome == RestoreOutcome::TimedOut {
-                    // The copies may still land: wait them out before the storage goes back.
-                    let engine = host.engine_mut();
-                    if let Ok(event) = engine.record(Stream::Restore) {
-                        let _ = engine.wait(event, u64::MAX);
-                    }
-                }
+                // Both timeout and submission errors may leave copies queued.
+                // On barrier failure keep the pool refs/mark allocated and the
+                // host snapshot pinned, instead of handing live targets back.
+                host.engine_mut().release_barrier(Stream::Restore)
+                    .map_err(|error| PrefixError::Host(format!("host restore release barrier: {error:#}")))?;
                 tracing::warn!(target: "cuteafd::prefix", ?outcome, tokens = len, "host restore abandoned; prefilling");
                 self.stats.restore_failures += 1;
                 self.release(family, &pages)?;

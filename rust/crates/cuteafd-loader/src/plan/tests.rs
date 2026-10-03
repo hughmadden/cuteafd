@@ -320,7 +320,9 @@ fn glm5_flash_mixed_exl3_tiers_share_one_package() {
 
 /// A standard exllamav3 GLM 5.3 Flash checkpoint (brandonmusic/GLM-5.3-Flash-
 /// tr3-4bpw): the exllamav3 config block, no storage map, uniform K4 with
-/// `[1]` MCG markers. It runs on the K3/K4 package with an empty K3 tier.
+/// `[1]` MCG markers. Its experts run on the K3/K4 package with an empty K3
+/// tier. Coordinator BF16 block operands still need a native consumer or
+/// serving FP8 side checkpoint; an expert-only fixture does not test completeness.
 #[test]
 fn glm5_flash_standard_exllamav3_checkpoint_is_ready() {
     let mut tensors = vec![t("model.language_model.layers.1.mlp.gate.weight", "BF16", &[288, 4096])];
@@ -344,6 +346,18 @@ fn glm5_flash_standard_exllamav3_checkpoint_is_ready() {
     assert_eq!(report.experts.as_ref().unwrap().package, "glmf:exl3-k34");
     let catalog = crate::read_expert_catalog(dir.path()).unwrap();
     assert_eq!(catalog.exl3().unwrap().decoder_tiers(), &[3, 4]);
+    // The real publication's BF16 coordinator block projection cannot be
+    // silently quantized merely because its EXL3 experts are supported.
+    let mut with_bf16_projection = tensors.clone();
+    with_bf16_projection.push(t("model.language_model.layers.0.mlp.gate_proj.weight", "BF16", &[12288, 4096]));
+    let direct = plan(snapshot(config.clone(), &with_bf16_projection).path(), &sparks(4)).unwrap();
+    assert_eq!(component(&direct, Component::RoutedExpert).status, Status::Ready);
+    assert_eq!(component(&direct, Component::DenseFfn).status, Status::MissingKernel);
+    assert!(!direct.executable(), "{}", render(&direct));
+    let reason = rejected(&direct, Component::DenseFfn).join("\n");
+    assert!(reason.contains("model.language_model.layers.0.mlp.gate_proj")
+        && reason.contains("found bf16") && reason.contains("BF16 consumer/exporter")
+        && reason.contains("--fp8-snapshot") && reason.contains("not modeled"), "{reason}");
     // An unsupported codebook in config.json stays unsupported, by key.
     let mut mul1 = config.clone();
     mul1["quantization_config"]["codebook"] = json!("mul1");
@@ -352,12 +366,69 @@ fn glm5_flash_standard_exllamav3_checkpoint_is_ready() {
     assert!(reason.contains("quantization_config.codebook=\"mul1\": this build runs the MCG codebook only"), "{reason}");
 }
 
+#[test]
+fn glm5_flash_block_projection_policy_distinguishes_mla_dense_and_shared_from_kda() {
+    let tensors = [
+        t("model.language_model.layers.1.self_attn.q_a_proj.weight", "BF16", &[1536, 4096]),
+        t("model.language_model.layers.0.self_attn.o_proj.weight", "BF16", &[4096, 8192]),
+        t("model.language_model.layers.0.mlp.gate_proj.weight", "BF16", &[12288, 4096]),
+        t("model.language_model.layers.1.mlp.shared_experts.down_proj.weight", "BF16", &[4096, 2048]),
+    ];
+    let report = plan(snapshot(glm5_flash_config(2), &tensors).path(), &PlanOptions::default()).unwrap();
+    for which in [Component::Attention, Component::DenseFfn, Component::SharedExpert] {
+        let section = component(&report, which);
+        assert_eq!((section.status, section.rejected), (Status::MissingKernel, 1), "{}", render(&report));
+        assert!(rejected(&report, which)[0].contains("checkpoint-native E4M3"));
+    }
+    // KDA's BF16 o_proj remains supported; it is not an MLA FP8 operand.
+    let attention = component(&report, Component::Attention);
+    assert_eq!(attention.tensors - attention.rejected, 1);
+}
+
+#[test]
+fn glm5_flash_native_block_projections_and_matching_fp32_scales_are_ready() {
+    let mut tensors = Vec::new();
+    for (name, n, k) in [
+        ("model.language_model.layers.1.self_attn.q_a_proj", 1536, 4096),
+        ("model.language_model.layers.1.self_attn.kv_a_proj_with_mqa", 512, 4096),
+        ("model.language_model.layers.1.self_attn.q_b_proj", 16384, 1536),
+        ("model.language_model.layers.1.self_attn.o_proj", 4096, 16384),
+        ("model.language_model.layers.0.mlp.gate_proj", 12288, 4096),
+        ("model.language_model.layers.0.mlp.up_proj", 12288, 4096),
+        ("model.language_model.layers.0.mlp.down_proj", 4096, 12288),
+        ("model.language_model.layers.1.mlp.shared_experts.gate_proj", 2048, 4096),
+        ("model.language_model.layers.1.mlp.shared_experts.up_proj", 2048, 4096),
+        ("model.language_model.layers.1.mlp.shared_experts.down_proj", 4096, 2048),
+    ] { tensors.extend(fp8(name, n, k, None)); }
+    let report = plan(snapshot(glm5_flash_config(2), &tensors).path(), &PlanOptions::default()).unwrap();
+    for which in [Component::Attention, Component::DenseFfn, Component::SharedExpert] {
+        assert_eq!(component(&report, which).status, Status::Ready, "{}", render(&report));
+    }
+}
+
+#[test]
+fn glm5_flash_native_block_projection_rejects_wrong_scale_dtype_grid_or_missing_scale() {
+    let name = "model.language_model.layers.1.self_attn.q_b_proj";
+    for scale in [Some(t(format!("{name}.weight_scale_inv"), "BF16", &[128, 12])),
+                  Some(t(format!("{name}.weight_scale_inv"), "F32", &[127, 12])), None] {
+        let mut tensors = vec![t(format!("{name}.weight"), "F8_E4M3", &[16384, 1536])];
+        tensors.extend(scale);
+        let report = plan(snapshot(glm5_flash_config(2), &tensors).path(), &PlanOptions::default()).unwrap();
+        assert_ne!(component(&report, Component::Attention).status, Status::Ready, "{}", render(&report));
+        assert!(rejected(&report, Component::Attention).iter().any(|reason| reason.contains(name)),
+            "{}", render(&report));
+    }
+}
+
 /// nvidia/GLM-5.3-Flash-NVFP4's shape: ModelOpt NVFP4 routed experts read
 /// from the checkpoint's own hf_quant_config.json; the experts run on the
 /// fp8_moe NVFP4 packages (`glmf:nvfp4`, 16-value slices: TP3 too).
 #[test]
 fn glm5_flash_modelopt_nvfp4_experts_are_ready() {
     let mut tensors = vec![t("model.language_model.layers.1.mlp.gate.weight", "BF16", &[288, 4096])];
+    for (proj, n, k) in [("gate_proj", 12288, 4096), ("up_proj", 12288, 4096), ("down_proj", 4096, 12288)] {
+        tensors.extend(nvfp4(&format!("model.language_model.layers.0.mlp.{proj}"), n, k));
+    }
     for expert in 0..288 {
         for (proj, n, k) in [("gate_proj", 2048, 4096), ("up_proj", 2048, 4096), ("down_proj", 4096, 2048)] {
             tensors.extend(nvfp4(&format!("model.language_model.layers.1.mlp.experts.{expert}.{proj}"), n, k));
@@ -373,6 +444,7 @@ fn glm5_flash_modelopt_nvfp4_experts_are_ready() {
     std::fs::write(dir.path().join("hf_quant_config.json"), serde_json::to_vec(&hf).unwrap()).unwrap();
     let report = plan(dir.path(), &sparks(3)).unwrap();
     assert_eq!(component(&report, Component::RoutedExpert).status, Status::Ready, "{}", render(&report));
+    assert_eq!(component(&report, Component::DenseFfn).status, Status::Ready, "{}", render(&report));
     let contract = report.experts.as_ref().unwrap();
     assert_eq!((contract.package.as_str(), contract.block, contract.spark_worlds.as_slice()),
         ("glmf:nvfp4", 16, &[2, 3, 4, 6][..]));

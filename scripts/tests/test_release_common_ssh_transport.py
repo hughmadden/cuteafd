@@ -26,6 +26,7 @@ checks are the script's own startup behavior, which fails before any call.
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -218,7 +219,7 @@ RUN_STATEMENTS = {
         '|| true; done\n',
     ),
     "expert-launch": (
-        'release_ssh "$host" bash -s -- "$SPARK_EXPERT_DOCKER_INFERENCE" "$remote" "$i"',
+        'remote_args=("$SPARK_EXPERT_DOCKER_INFERENCE" "$remote" "$i"',
         '\nREMOTE\n',
     ),
     "readiness-poll": (
@@ -252,6 +253,7 @@ SPARK_COUNT=2
 topology_explicit=explicit
 spark_tp=2
 spark_ep=2
+wip_slot=
 """
 
 BATCH = ["-o", "BatchMode=yes"]
@@ -272,6 +274,14 @@ def _slice(name: str) -> str:
     if name == "expert-launch":
         body += "wait\n"  # the real statement backgrounds the launch
     return body + "\n"
+
+
+def _remote_payload(call: list[str]) -> list[str]:
+    """Parse the command at OpenSSH's remote-shell boundary, including empties."""
+    command = call[call.index("seed0") + 1:]
+    if len(command) == 1:
+        command = shlex.split(command[0])
+    return command[command.index("--") + 1:]
 
 
 class TestRunShLifecycle:
@@ -387,20 +397,21 @@ class TestRunShLifecycle:
             "seed0",
             "true",
             "k34",
+            "__none__",
         ], call
 
     def test_launch_passes_its_contract_positionally(self, tmp_path):
         """The worker argument contract is positional: an option set change must
-        not shift a single one of the sixteen values the remote script decodes."""
+        not shift a single one of the eighteen values the remote script decodes."""
         result, invocations = self._run(tmp_path, _slice("expert-launch"))
         assert result.returncode == 0, result.stderr
         call = invocations[0]
-        payload = call[call.index("--") + 1:]
-        assert payload[:5] == [
+        payload = _remote_payload(call)
+        assert payload == [
             "cuteafd-spark-expert:v10", "cuteafd-spark-expert-seed0-19441", "0",
-            "4096", "107374182400",
+            "4096", "107374182400", "19441", "hub/models--x--M/snapshots/rev",
+            "fp", "0", "2", "explicit", "2", "2", "", "", "", "info", "__none__",
         ], payload
-        assert len(payload) == 16, f"the launch contract has 16 positionals: {payload}"
 
     def test_empty_optionals_do_not_shift_the_launch_vector(self, tmp_path):
         result, invocations = self._run(
@@ -409,10 +420,10 @@ class TestRunShLifecycle:
             env={"CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP": "/dev/infiniband"},
         )
         assert result.returncode == 0, result.stderr
-        payload = invocations[0]
-        payload = payload[payload.index("--") + 1:]
-        assert payload[-3:] == ["/dev/infiniband", "", ""], payload
-        assert len(payload) == 16, payload
+        payload = _remote_payload(invocations[0])
+        assert payload[13:16] == ["/dev/infiniband", "", ""], payload
+        assert payload[16:] == ["info", "__none__"], payload
+        assert len(payload) == 18, payload
 
 
 
@@ -619,7 +630,6 @@ class TestRuntimeStopConsumer:
             and not line.lstrip().startswith("release_rsh=")
         ]
         assert offenders == [], f"route these through release_ssh: {offenders}"
-
 
 
 

@@ -77,7 +77,7 @@ impl Family for Qwen {
             )],
         };
         let programs = cfg.check_programs().map_err(|e| format!("{e:#}"));
-        Ok(Box::new(QwenModel { spec, programs }))
+        Ok(Box::new(QwenModel { cfg, spec, programs }))
     }
 
     fn classify(&self, _spec: &ModelSpec, name: &str) -> Option<TensorRole> {
@@ -171,6 +171,7 @@ impl Family for Qwen {
 }
 
 struct QwenModel {
+    cfg: Qwen4Config,
     spec: ModelSpec,
     /// `Qwen4Config::check_programs`: the shapes the qwen4 programs are built for.
     programs: Result<(), String>,
@@ -179,6 +180,15 @@ struct QwenModel {
 impl FamilyModel for QwenModel {
     fn spec(&self) -> &ModelSpec {
         &self.spec
+    }
+
+    fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
+        -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
+        use crate::serving_capacity::{qwen_cache_geometry, CacheGeometryError};
+        if options.coordinator_ranks != 1 || options.native_mtp_layers > 1 {
+            return Err(CacheGeometryError::Unsupported { family: "qwen4", what: "only one coordinator and at most one native MTP layer execute" });
+        }
+        qwen_cache_geometry(&self.cfg, self.cfg.layers, options.native_mtp_layers == 1).map(Some)
     }
 
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {

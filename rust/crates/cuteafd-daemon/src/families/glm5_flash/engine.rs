@@ -21,10 +21,12 @@
 //!
 //! FFN: dense SwiGLU (clamped at 10), or the MoE: FP32 router logits, the
 //! native sigmoid top-8 select, the shared expert, and routed experts from
-//! the checkpoint's FP8 on this GPU (the `fp8-glmf` TP1 package, a window of
-//! resident layers reloaded as the step walks the layers) or on the Sparks.
+//! the checkpoint's FP8/NVFP4 on this GPU (the TP1 package, all routed layers
+//! resident by default; a paging window only when explicitly requested for
+//! diagnostics) or on the Sparks.
 use super::weights::{GlmfLayer, GlmfWeights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
+use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use crate::shared::token_io::{DeviceLogits, EmbedPlacement, TokenEmbedding};
 use anyhow::{ensure, Context, Result};
@@ -66,17 +68,31 @@ const MAX_RANKS: usize = 6;
 /// lane worth a second exchange per layer.
 pub(crate) const PREFILL_LANES: usize = 2;
 const MIN_LANE_ROWS: usize = 256;
+
+/// Multi-lane splits must land on MLA page boundaries. A narrow workspace
+/// still accepts a single unpadded tail, but cannot advertise unusable padding.
+fn prefill_lane_capacity(rows: usize) -> usize {
+    rows.max(PREFILL_LANES * (rows / PAGE_ROWS) * PAGE_ROWS)
+}
+
+fn prefill_lane_plan(tokens: usize, rows: usize) -> Result<(usize, usize)> {
+    ensure!(tokens > 0 && tokens <= prefill_lane_capacity(rows),
+        "prefill of {tokens} tokens exceeds the {rows}-row lane workspaces");
+    let lanes = if tokens <= rows && tokens < PREFILL_LANES * MIN_LANE_ROWS { 1 } else { PREFILL_LANES };
+    let per_lane = if lanes == 1 { tokens } else { tokens.div_ceil(lanes).next_multiple_of(PAGE_ROWS) };
+    ensure!(per_lane <= rows, "prefill lane of {per_lane} tokens exceeds {rows} rows");
+    Ok((lanes, per_lane))
+}
 const HC: usize = 4;
 
-/// Routed experts on this GPU from the TP1 FP8 package: a window of
-/// resident layers, reloaded from the checkpoint when a step reaches a layer
-/// outside it (layer-major prefill loads each layer once per step).
+/// Routed experts on this GPU from the TP1 package. All layers stay resident
+/// unless an explicit diagnostic paging window was requested.
 pub(crate) struct LocalExperts<'a> {
     pub library: &'a NativeLibrary,
     pub tensors: &'a Fp8ExpertTensors,
     pub experts: RefCell<Fp8Experts<'a>>,
-    /// Most layers resident at once.
-    pub window: usize,
+    /// Explicit diagnostic paging; absent for the fully resident serving path.
+    pub window: Option<usize>,
     pub loads: RefCell<usize>,
 }
 
@@ -86,7 +102,8 @@ impl LocalExperts<'_> {
         if let Ok(index) = experts.index_of(layer) {
             return Ok(index);
         }
-        if experts.layers.len() >= self.window {
+        let window = self.window.context("local expert layer missing from the admitted resident set")?;
+        if experts.layers.len() >= window {
             experts.layers.remove(0);
         }
         let started = std::time::Instant::now();
@@ -367,6 +384,7 @@ impl<'a> DenseNvfp4<'a> {
 }
 
 pub(crate) struct GlmfEngine<'a> {
+    quantize_grid: Fp8QuantizeGrid,
     pub library: &'a NativeLibrary,
     pub programs: &'a Programs<'a>,
     pub cfg: GlmNextConfig,
@@ -475,6 +493,7 @@ impl<'a> GlmfEngine<'a> {
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmNextConfig, weights: GlmfWeights<'a>,
         stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize, slots: usize,
         embedding: TokenEmbedding<'a>) -> Result<Self> {
+        let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         ensure!(cfg.hc_mult == HC && cfg.kv_lora_rank == 512 && cfg.kda_head_dim == 128 && cfg.heads == 64,
             "the glmf programs are built for 4 mHC streams, a 512 latent, 64 MLA heads and 128-wide KDA heads");
@@ -510,7 +529,7 @@ impl<'a> GlmfEngine<'a> {
         let kda_conv = zeroed(kda_layers * slots * 3 * 3 * d * 2)?;
         let kda_replay = zeroed(kda_layers * replay_bytes(cfg.kda_heads, 3 * d))?;
         let pool_logical = zeroed(pool_pages * 4)?;
-        Ok(Self { library, programs, cfg, weights, stream, max_context, prefill_rows, pages, slots, kv, kda_ordinal,
+        Ok(Self { quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, pages, slots, kv, kda_ordinal,
             kda_state, kda_conv, kda_replay, commit_tables: zeroed(3 * DECODE_ROWS * 4)?, drafter: None, index,
             pool_logical, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
             lane_workspaces: RefCell::new(Vec::new()),
@@ -865,6 +884,7 @@ impl<'a> GlmfEngine<'a> {
     }
 
     fn download(&self, dev: &Dev<'_>, bytes: usize) -> Result<Vec<u8>> {
+        ensure!(bytes <= dev.buffer.bytes, "download of {bytes} bytes exceeds {}-byte buffer", dev.buffer.bytes);
         // SAFETY: the engine owns this stream.
         unsafe { self.library.cuda_stream_synchronize(self.stream)? };
         let mut out = vec![0u8; bytes];
@@ -922,7 +942,7 @@ impl<'a> GlmfEngine<'a> {
         let mut tables = StepTables { page_table: placement.pages.clone(), pool_table: placement.pool_pages.clone(),
             ..Default::default() };
         self.rows(placement, start..start + t, 0, &mut tables)?;
-        let logits = self.step(&tables, tokens, if all_logits { t } else { 1 }, on_layer, forced)?;
+        let logits = self.step(&tables, tokens, if all_logits { t } else { 1 }, on_layer, forced, None)?;
         placement.len += t;
         placement.kda_len = placement.len;
         Ok(logits.map(StepLogits::Device))
@@ -938,7 +958,7 @@ impl<'a> GlmfEngine<'a> {
     /// Longest chunk one prefill call takes: a lane of `prefill_rows` rows
     /// each when Spark prefill is pipelined.
     pub fn prefill_capacity(&self) -> usize {
-        if self.pipelined() { PREFILL_LANES * self.prefill_rows } else { self.prefill_rows }
+        if self.pipelined() { prefill_lane_capacity(self.prefill_rows) } else { self.prefill_rows }
     }
 
     /// A Spark prefill chunk as up to [`PREFILL_LANES`] lanes of consecutive
@@ -946,10 +966,9 @@ impl<'a> GlmfEngine<'a> {
     fn prefill_lanes(&self, placement: &mut GlmfPlacement, tokens: &[u32], all_logits: bool, device: bool)
         -> Result<Option<StepLogits>> {
         let (start, t) = (placement.len, tokens.len());
-        let lanes = if t >= PREFILL_LANES * MIN_LANE_ROWS { PREFILL_LANES } else { 1 };
+        let (_, per_lane) = prefill_lane_plan(t, self.prefill_rows)?;
         // Lanes split at a multiple of 64 rows (an MLA page), so each lane's
         // pools and pages start where the previous lane's end.
-        let per_lane = t.div_ceil(lanes).next_multiple_of(PAGE_ROWS);
         ensure!(t > 0 && per_lane <= self.prefill_rows && start + t <= self.max_context,
             "prefill of {t} rows at {start} exceeds {} rows per lane or the context", self.prefill_rows);
         if start == 0 {
@@ -982,7 +1001,39 @@ impl<'a> GlmfEngine<'a> {
     /// (or verify with [`Self::verify_spec`] and commit what it keeps).
     pub fn verify(&self, sequences: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32],
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<Vec<f32>>> {
-        self.decode_step(sequences, tokens, on_layer, false)?.map(|l| l.to_host(self.library)).transpose()
+        self.decode_step(sequences, tokens, on_layer, false, None)?.map(|l| l.to_host(self.library)).transpose()
+    }
+
+    pub fn verify_trace(&self, sequences: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32],
+        on_layer: &mut dyn FnMut(usize, &[u8]) -> Result<()>, dir: &std::path::Path) -> Result<Option<Vec<f32>>> {
+        self.decode_step(sequences, tokens, Some(on_layer), false, Some(dir))?
+            .map(|l| l.to_host(self.library)).transpose()
+    }
+
+    /// Diagnostic snapshot inside a verify's layer callback. The callback
+    /// already disables graphs and synchronizes the layer's output download.
+    /// Router buffers still belong to this layer, even though mHC has prepared
+    /// the next attention input. Ordinary serving never calls this method.
+    pub fn trace_decode_layer(&self, layer: usize, rows: usize, streams: &[u8], dir: &std::path::Path)
+        -> Result<()> {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join("streams.bin"), streams)?;
+        let workspace = self.decode_workspace.borrow();
+        let w = workspace.as_ref().context("decode trace without a workspace")?;
+        for (name, buffer, bytes) in [("ffn.bin", &w.delta, rows * self.cfg.hidden * 2),
+            ("next_input.bin", &w.x, rows * self.cfg.hidden * 2)] {
+            std::fs::write(dir.join(name), self.download(buffer, bytes)?)?;
+        }
+        if !self.weights.layers[layer].dense {
+            for (name, buffer, bytes) in [("route_ids.bin", &w.route_ids, rows * self.cfg.topk * 4),
+                ("route_weights.bin", &w.route_weights, rows * self.cfg.topk * 4),
+                ("router_logits.bin", &w.router_logits, rows * self.cfg.experts * 4),
+                ("wire.bin", &w.wire, rows * (self.cfg.hidden + self.cfg.hidden / 32)),
+                ("shared.bin", &w.shared, rows * self.cfg.hidden * 2)] {
+                std::fs::write(dir.join(name), self.download(buffer, bytes)?)?;
+            }
+        }
+        Ok(())
     }
 
     /// A speculative verify: as [`Self::verify`], but the KDA state stays at
@@ -992,18 +1043,19 @@ impl<'a> GlmfEngine<'a> {
     /// steps). Placements advance by all rows; callers set the kept length.
     pub fn verify_spec(&self, sequences: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32])
         -> Result<Option<Vec<f32>>> {
-        self.decode_step(sequences, tokens, None, true)?.map(|l| l.to_host(self.library)).transpose()
+        self.decode_step(sequences, tokens, None, true, None)?.map(|l| l.to_host(self.library)).transpose()
     }
 
     /// [`Self::verify`] (`spec`: [`Self::verify_spec`]) leaving every row's
     /// logits on the device, with the decode graph's greedy selection of them.
     pub fn verify_device(&self, sequences: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32], spec: bool)
         -> Result<Option<DeviceLogits>> {
-        self.decode_step(sequences, tokens, None, spec)
+        self.decode_step(sequences, tokens, None, spec, None)
     }
 
     fn decode_step(&self, sequences: &mut [(&mut GlmfPlacement, usize)], tokens: &[u32],
-        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>, spec: bool) -> Result<Option<DeviceLogits>> {
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>, spec: bool,
+        trace: Option<&std::path::Path>) -> Result<Option<DeviceLogits>> {
         let rows: usize = sequences.iter().map(|(_, n)| n).sum();
         ensure!(rows > 0 && rows <= DECODE_ROWS && tokens.len() == rows, "decode step of {rows} rows");
         // Power-of-two strides and widths bound the graphs a growing batch captures.
@@ -1028,7 +1080,7 @@ impl<'a> GlmfEngine<'a> {
             }
         }
         tables.pool_width = tables.pool_width.next_power_of_two().min(pool_stride);
-        let logits = self.step(&tables, tokens, rows, on_layer, None)?;
+        let logits = self.step(&tables, tokens, rows, on_layer, None, trace)?;
         for (placement, count) in sequences.iter_mut() {
             placement.len += *count;
             if !spec {
@@ -1040,7 +1092,7 @@ impl<'a> GlmfEngine<'a> {
 
     fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
-        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<DeviceLogits>> {
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, trace: Option<&std::path::Path>) -> Result<Option<DeviceLogits>> {
         let (h, t) = (self.cfg.hidden, tables.kv_slots.len());
         let (slot, capacity) = if tables.decode { (&self.decode_workspace, DECODE_ROWS) } else { (&self.workspace, self.prefill_rows) };
         if slot.borrow().is_none() {
@@ -1072,13 +1124,41 @@ impl<'a> GlmfEngine<'a> {
         let mut cur = 0usize;
         self.pre(w, &w.streams[cur], &layers[0], rows)?;
         for (index, layer) in layers.iter().enumerate() {
+            if let Some(dir) = trace {
+                let dir = dir.join(format!("layer{index:02}"));
+                std::fs::create_dir_all(&dir)?;
+                for (name, buffer, bytes) in [("attention_input.bin", &w.x, t * h * 2),
+                    ("attention_post.bin", &w.post, t * HC * 4), ("attention_comb.bin", &w.comb, t * HC * HC * 4)] {
+                    std::fs::write(dir.join(name), self.download(buffer, bytes)?)?;
+                }
+            }
             match layer.attention {
                 GlmNextAttention::Kda => self.kda(w, index, layer, rows, cap, tables.spec)?,
-                GlmNextAttention::Mla => self.mla(w, index, layer, rows, cap, tables)?,
+                GlmNextAttention::Mla => self.mla(w, index, layer, rows, cap, tables,
+                    trace.map(|dir| dir.join(format!("layer{index:02}"))).as_deref())?,
+            }
+            if let Some(dir) = trace {
+                let dir = dir.join(format!("layer{index:02}"));
+                std::fs::write(dir.join("attention.bin"), self.download(&w.delta, t * h * 2)?)?;
+                if layer.attention == GlmNextAttention::Kda {
+                    let d = self.cfg.kda_heads * self.cfg.kda_head_dim;
+                    let p = layer.range("w_in").context("KDA trace without in-projection")?.1 / (h * 2);
+                    // Decode KDA AOT layout: BF16 in-projection, f|gate,
+                    // convolved q|k|v, recurrent output and gated-norm output;
+                    // each region is 1024-byte aligned in the pinned manifest.
+                    let bytes: usize = [t * p * 2, t * 4 * d, t * 6 * d, t * 2 * d, t * 2 * d]
+                        .iter().map(|n| n.next_multiple_of(1024)).sum();
+                    std::fs::write(dir.join("kda_scratch.bin"), self.download(&w.scratch, bytes)?)?;
+                    std::fs::write(dir.join("kda_meta.json"), serde_json::to_vec(&serde_json::json!({
+                        "rows": t, "width": d, "in_width": p, "alignment": 1024 }))?)?;
+                }
             }
             // Attention back into the streams, then the FFN site's collapse + norm.
             self.post_pre(w, cur, layer, "ffn", "post_norm", rows, cap)?;
             cur ^= 1;
+            if let Some(dir) = trace {
+                std::fs::write(dir.join(format!("layer{index:02}/ffn_input.bin")), self.download(&w.x, t * h * 2)?)?;
+            }
             if layer.dense {
                 self.ffn(w, layer, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)?;
             } else {
@@ -1169,7 +1249,7 @@ impl<'a> GlmfEngine<'a> {
                 }
                 match layer.attention {
                     GlmNextAttention::Kda => self.kda(w, index, layer, rows, "m64", tables.spec)?,
-                    GlmNextAttention::Mla => self.mla(w, index, layer, rows, "m64", tables)?,
+                    GlmNextAttention::Mla => self.mla(w, index, layer, rows, "m64", tables, None)?,
                 }
                 self.post_pre(w, 0, layer, "ffn", "post_norm", rows, "m64")?;
                 if layer.dense {
@@ -1331,7 +1411,12 @@ impl<'a> GlmfEngine<'a> {
     }
 
     fn mla(&self, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str,
-        tables: &StepTables) -> Result<()> {
+        tables: &StepTables, trace: Option<&std::path::Path>) -> Result<()> {
+        let t = tables.positions.len();
+        // These scratch layouts are diagnostic-only and match the pinned AOT
+        // decode programs. Stop at the first MLA layer; later layers' inputs
+        // already differ and cannot identify the original numerical cause.
+        let trace = trace.filter(|_| tables.decode && index == 3);
         let mode = if tables.decode { "decode" } else { "prefill" };
         let cache = self.kv[index].as_ref().context("MLA layer without a record pool")?.buffer.ptr;
         let (keys, pool_cache) = self.index[index].as_ref().context("MLA layer without an index cache")?;
@@ -1345,6 +1430,19 @@ impl<'a> GlmfEngine<'a> {
         pointers.extend([("w_uk", layer.ptr("w_uk")?), ("kv_cache", cache), ("query", w.query.buffer.ptr),
             ("q_resid", w.q_resid.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
         self.run(&format!("mla_producer_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))?;
+        if let Some(dir) = trace {
+            let qkv_width = self.cfg.q_lora_rank + self.cfg.kv_lora_rank;
+            let q_width = self.cfg.heads * self.cfg.qk_nope_dim;
+            let bytes = (t * qkv_width * 2).next_multiple_of(1024)
+                + (t * q_width * 2).next_multiple_of(1024);
+            for (name, buffer, bytes) in [("mla_producer_scratch.bin", &w.scratch, bytes),
+                ("mla_query.bin", &w.query, t * self.cfg.heads * self.cfg.kv_lora_rank * 2),
+                ("mla_q_resid.bin", &w.q_resid, t * self.cfg.q_lora_rank * 2)] {
+                std::fs::write(dir.join(name), self.download(buffer, bytes)?)?;
+            }
+            std::fs::write(dir.join("mla_meta.json"), serde_json::to_vec(&serde_json::json!({
+                "rows": t, "qkv_width": qkv_width, "q_width": q_width, "alignment": 1024 }))?)?;
+        }
         self.run(&format!("index_producer_{cap}"), &[("x", w.x.buffer.ptr), ("q_resid", w.q_resid.buffer.ptr),
             ("slots", w.kv_slots.buffer.ptr), ("pool_slots", w.pool_slots.buffer.ptr), ("w_iq", layer.ptr("w_iq")?),
             ("w_ik", layer.ptr("w_ik")?), ("k_norm_w", layer.ptr("k_norm_w")?), ("k_norm_b", layer.ptr("k_norm_b")?),
@@ -1362,6 +1460,14 @@ impl<'a> GlmfEngine<'a> {
             ("pool_logical", self.pool_logical.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
             ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr)],
             &[rows, Scalar::I32(tables.page_stride as i32)])?;
+        if let Some(dir) = trace {
+            for (name, buffer, bytes) in [("mla_indices.bin", &w.indices, t * SPARSE_TOPK * 4),
+                ("mla_lengths.bin", &w.lengths, t * 4)] {
+                std::fs::write(dir.join(name), self.download(buffer, bytes)?)?;
+            }
+            let kv = self.kv[index].as_ref().context("MLA trace without a record pool")?;
+            std::fs::write(dir.join("mla_kv.bin"), self.download(kv, kv.buffer.bytes)?)?;
+        }
         if !tables.decode && crate::families::glm5::engine::native_mla_prefill() {
             let scale = (self.cfg.qk_nope_dim as f32).powf(-0.5);
             self.timed("glm_mla_prefill (native)", || {
@@ -1378,10 +1484,21 @@ impl<'a> GlmfEngine<'a> {
                 ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr), ("out", w.latent.buffer.ptr),
                 ("scratch", w.scratch.buffer.ptr)], &[rows])?;
         }
+        if let Some(dir) = trace {
+            std::fs::write(dir.join("mla_latent.bin"), self.download(&w.latent,
+                t * self.cfg.heads * self.cfg.kv_lora_rank * 2)?)?;
+            std::fs::write(dir.join("mla_sparse_scratch.bin"), self.download(&w.scratch,
+                self.scratch("sparse_mla_decode_m64")?)?)?;
+        }
         let pointers = [("attn", w.latent.buffer.ptr), ("w_uv", layer.ptr("w_uv")?),
             ("w_o_fp8", layer.ptr("w_o_fp8")?), ("w_o_scale", layer.ptr("w_o_scale")?),
             ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)];
-        self.run(&format!("o_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))
+        self.run(&format!("o_{cap}"), &pointers, &self.fp8_scalars(rows, decode, fp8))?;
+        if let Some(dir) = trace {
+            std::fs::write(dir.join("mla_values.bin"), self.download(&w.scratch,
+                t * self.cfg.heads * self.cfg.v_head_dim * 2)?)?;
+        }
+        Ok(())
     }
 
     /// Router, shared expert and routed experts; leaves `bf16(routed + shared)` in `delta`.
@@ -1411,7 +1528,7 @@ impl<'a> GlmfEngine<'a> {
             }
         })?;
         if !matches!(experts, Experts::Local(_)) {
-            let grid = (t * h.div_ceil(256)).div_ceil(8).clamp(1, 4 * 188);
+            let grid = self.quantize_grid.blocks(t, h);
             self.run("expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
                 // SAFETY: the scale rows follow the payload inside each wire row.
                 ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
@@ -1498,9 +1615,11 @@ impl<'a> GlmfEngine<'a> {
                     fp8.run(resident, t, w.x.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
                         w.routed.buffer.ptr, self.stream)?;
                 }
-                // The window may drop this layer before the stream drains.
-                // SAFETY: the engine owns this stream.
-                unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+                if local.window.is_some() {
+                    // Diagnostic paging may drop this layer before the stream drains.
+                    // SAFETY: the engine owns this stream.
+                    unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+                }
             }
             Experts::LocalExl3(local) => {
                 shared()?;
@@ -1649,7 +1768,7 @@ impl<'a> GlmfEngine<'a> {
             }
             match weights.attention {
                 GlmNextAttention::Kda => self.kda(w, layer, weights, rows, cap, false)?,
-                GlmNextAttention::Mla => self.mla(w, layer, weights, rows, cap, &lanes[lane].0)?,
+                GlmNextAttention::Mla => self.mla(w, layer, weights, rows, cap, &lanes[lane].0, None)?,
             }
             self.post_pre(w, 0, weights, "ffn", "post_norm", rows, cap)?;
             if weights.dense {
@@ -1774,8 +1893,12 @@ impl StepLogits {
 
 impl Drop for GlmfEngine<'_> {
     fn drop(&mut self) {
-        // SAFETY: the engine's stream is drained by its owner before the engine drops.
-        let _ = unsafe { self.library.cuda_event_destroy(self.routes_ready) };
+        // SAFETY: the engine owns this stream and its resident weights. Drain
+        // queued work, including a failed step, before their storage drops.
+        unsafe {
+            let _ = self.library.cuda_stream_synchronize(self.stream);
+            let _ = self.library.cuda_event_destroy(self.routes_ready);
+        }
         if let Some(ops) = self.ops.take() {
             let ops = ops.into_inner();
             for event in ops.pool.into_iter().chain(ops.pending.into_iter().flat_map(|(_, a, b)| [a, b])) {
@@ -1783,5 +1906,39 @@ impl Drop for GlmfEngine<'_> {
                 let _ = unsafe { self.library.cuda_event_destroy(event) };
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod prefill_lane_tests {
+    use super::{prefill_lane_capacity, prefill_lane_plan, PAGE_ROWS, PREFILL_LANES};
+
+    #[test]
+    fn every_advertised_prefill_tail_fits_its_lane_workspaces() {
+        for rows in [1, 63, 64, 65, 96, 127, 128, 255, 256, 511, 512, 1024, 1536, 2047, 2048, 4096] {
+            let capacity = prefill_lane_capacity(rows);
+            for tokens in 1..=capacity {
+                let (lanes, per_lane) = prefill_lane_plan(tokens, rows).unwrap();
+                assert!(lanes <= PREFILL_LANES && per_lane <= rows, "rows={rows}, tokens={tokens}");
+                let starts: Vec<_> = (0..tokens).step_by(per_lane).collect();
+                assert!(starts.len() <= lanes);
+                assert_eq!(starts.iter().map(|&s| per_lane.min(tokens - s)).sum::<usize>(), tokens);
+                assert!(starts.iter().all(|&s| per_lane.min(tokens - s) <= rows));
+                assert!(starts.iter().skip(1).all(|s| s % PAGE_ROWS == 0));
+            }
+            assert!(prefill_lane_plan(capacity + 1, rows).is_err());
+        }
+    }
+
+    #[test]
+    fn narrow_workspace_splits_the_short_tool_prompt() {
+        assert_eq!(prefill_lane_plan(214, 128).unwrap(), (2, 128));
+        assert_eq!(prefill_lane_plan(1, 1).unwrap(), (1, 1));
+        assert!(prefill_lane_plan(0, 128).is_err());
+        assert!(prefill_lane_plan(1, 0).is_err());
+        // Keep the qualified default's lane threshold and advertised width.
+        assert_eq!(prefill_lane_capacity(4096), 8192);
+        assert_eq!(prefill_lane_plan(511, 4096).unwrap(), (1, 511));
+        assert_eq!(prefill_lane_plan(512, 4096).unwrap(), (2, 256));
     }
 }

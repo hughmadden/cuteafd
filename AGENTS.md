@@ -111,7 +111,10 @@ after tables with conditions.
   `CARGO_TARGET_DIR=~/.cache/cuteafd/builds/<task>/target` (no Python
   needed). Script tests: `.venv/bin/python -m pytest -q scripts/tests`
   (`uv venv --python 3.12 .venv` + pytest numpy tokenizers jsonschema pyyaml);
-  43 inherited failures remain (work/p0 96edf07), add none.
+  On `codex/v1` (2026-10-02), there are no failing script-test ids:
+  763 tests and 190 subtests pass, with 2 skips. The inherited launcher
+  fixtures now follow the current image pair and positional contracts;
+  the semantic-quality source lock no longer requires a sibling checkout.
 - `./build.sh` (release pair, coordinator + Spark leg): set
   `CUTEAFD_RELEASE_BUILD_ROOT` and `CUTEAFD_RELEASE_REMOTE_BUILD_DIR` under
   `~/.cache/cuteafd/builds/`, and `CUTEAFD_RELEASE_SPARK_TP_ROLES=` for a

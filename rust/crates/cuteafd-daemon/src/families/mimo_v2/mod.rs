@@ -1,15 +1,26 @@
 //! MiMo V2 (mimo_v2_flash) on the generic engine: weights, the coordinator
 //! programs' layer chain, and the golden comparison command.
+pub(crate) mod admission;
 pub(crate) mod dflash;
 pub(crate) mod engine;
 pub(crate) mod mtp;
 pub(crate) mod prefix;
 pub(crate) mod serve;
+mod serving_owners;
+mod serve_failures;
 pub(crate) mod weights;
+mod head;
+mod split;
+mod teardown;
+#[cfg(test)]
+mod host_gate;
 
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::families::mimo_v2::MimoV2Config;
+use cuteafd_loader::families::mimo_v2::{MimoPrefillOutput, MimoV2Config};
+use cuteafd_loader::families::mimo_v2::draft_representation::{MimoDraftCapacity, MimoDraftRepresentation};
+use cuteafd_loader::families::mimo_v2::projection::MimoProjectionRepresentation;
+use cuteafd_loader::families::mimo_v2::weight_policy::{self, MimoDefaultPolicy};
 use cuteafd_loader::plan::checkpoint::Checkpoint;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -51,6 +62,18 @@ pub(crate) struct EngineArgs {
     pub rings: usize,
     #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
+    /// Provisional per-GPU bound for CUDA modules, libraries and constraints
+    /// bookkeeping beyond named tensor/workspace reservations. This is an
+    /// explicit startup bound, not a measured allocation footprint.
+    #[arg(long, default_value_t = 1024)]
+    pub runtime_reserve_mib: usize,
+    /// Calibrated conservative storage envelope per retained decode graph.
+    /// Different graph composition still needs its own startup memory gate.
+    #[arg(long, default_value_t = (cuteafd_loader::families::mimo_v2::decode_graph::MIMO_GRAPH_EXEC_BOUND_BYTES >> 10) as usize)]
+    pub decode_graph_reserve_kib: usize,
+    /// Separate provisional driver/rounding margin for the graph arena.
+    #[arg(long, default_value_t = (cuteafd_loader::families::mimo_v2::decode_graph::MIMO_GRAPH_DRIVER_MARGIN_BYTES >> 20) as usize)]
+    pub decode_graph_driver_reserve_mib: usize,
     /// Spark ranks in TP order (HOST:PORT,...) serving the fp8 expert family, for MoE layers.
     #[arg(long, conflicts_with = "local_experts")]
     pub peers: Option<String>,
@@ -67,14 +90,28 @@ pub(crate) struct EngineArgs {
     /// (`model.mtp.layers.*`, 0 = off) after each next token.
     #[arg(long, default_value_t = 0)]
     pub mtp: usize,
-    /// Sequences the drafter keeps a context for and drafts for at once.
+    /// Maximum number of sequences in one draft batch. Context ring slots
+    /// can be larger through --draft-context-slots.
     #[arg(long, default_value_t = 4)]
     pub draft_sequences: usize,
-    /// Draft through E4M3 copies of the drafter's GEMM weights and of the LM
-    /// head (false: BF16; the committed tokens are the same either way).
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    pub draft_fp8: bool,
-    /// Scale rule of the FP8 copies made from BF16 weights at load: amax /
+    /// Drafter context ring slots (default: --draft-sequences; serving also
+    /// covers every target ring slot). Does not widen a draft batch.
+    #[arg(long)]
+    pub draft_context_slots: Option<usize>,
+    /// Default resident-weight policy: the qualified V2.6 Pro checkpoint uses
+    /// its measured single-copy FP8 head/O/embedded drafter. checkpoint keeps
+    /// source formats. Explicit per-weight options take precedence.
+    #[arg(long, value_enum, default_value_t = WeightPolicyArg::Auto)]
+    pub weight_policy: WeightPolicyArg,
+    /// Immutable drafter storage. Default follows --weight-policy;
+    /// fp8-only quantizes supported BF16 sources without calibration.
+    #[arg(long, value_enum)]
+    pub draft_representation: Option<DraftRepresentationArg>,
+    /// Explicit drafter conversion (true: FP8-only, false: BF16-only).
+    /// With no option, follow --weight-policy for this checkpoint/drafter.
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub draft_fp8: Option<bool>,
+    /// Scale rule of the FP8 values packed from BF16 weights at load: amax /
     /// 448, the smallest power of two >= it (pow2), or per block whichever of
     /// the two leaves the smaller error (best).
     #[arg(long, value_enum, default_value_t = crate::shared::fp8_linear::Fp8Scales::Amax)]
@@ -93,10 +130,9 @@ pub(crate) struct EngineArgs {
     /// TP1 FP8 package layout for --local-experts (default `<libdir>/fp8/fp8-mimo/tp1`).
     #[arg(long)]
     pub fp8_package: Option<PathBuf>,
-    /// Decode steps of <= 32 rows read an E4M3 copy of o_proj (with
-    /// --fp8-o-proj). The qkv and dense FFN weights are the checkpoint's FP8
-    /// bytes either way (their only copies): decode rows up to 32 on the FP8
-    /// GEMVs, W8A16 GEMMs above.
+    /// Select the small-row FP8 decode kernel when the resident projection is
+    /// FP8. This does not change its weight representation. The qkv and dense
+    /// FFN weights stay checkpoint FP8 with BF16 activation paths above32rows.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub fp8_decode: bool,
     /// Prefill qkv and dense-FFN projections run W8A16 (the FP8 weights widened
@@ -105,13 +141,14 @@ pub(crate) struct EngineArgs {
     /// FP8 release's served numerics).
     #[arg(long)]
     pub prefill_w8a16: bool,
-    /// Decode steps of <= 16 rows read an E4M3 copy of the LM head (per row x 128-K scales).
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    pub fp8_head: bool,
-    /// With --fp8-decode, also an E4M3 copy of o_proj (BF16 in the checkpoint,
-    /// quantized per row and 128-K block at load).
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    pub fp8_o_proj: bool,
+    /// Explicit single-copy LM-head conversion: true selects E4M3, false BF16.
+    /// Default follows --weight-policy across target/MTP/drafter rows.
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub fp8_head: Option<bool>,
+    /// Explicit single-copy o_proj conversion: true selects E4M3, false BF16.
+    /// Default follows --weight-policy; prefill activations stay BF16.
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub fp8_o_proj: Option<bool>,
     /// Decode and verify steps replay one captured CUDA graph per layer segment
     /// between the Spark exchanges (every 1..=64-row shape captured at startup).
     /// Off by default: with the host-driven exchange the GPU, not the launches,
@@ -126,6 +163,333 @@ pub(crate) struct EngineArgs {
     pub expert_input: engine::ExpertInput,
     #[command(flatten)]
     pub token_io: crate::shared::token_io::TokenIoArgs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum DraftRepresentationArg {
+    Bf16Only,
+    Fp8Only,
+    /// Preserve this drafter's checkpoint format independently of target policy.
+    Checkpoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum WeightPolicyArg { Auto, Checkpoint }
+
+impl EngineArgs {
+    fn draft_storage(&self) -> Result<MimoDraftRepresentation> {
+        match self.draft_representation {
+            Some(DraftRepresentationArg::Checkpoint) => {
+                ensure!(self.draft_fp8.is_none(), "--draft-representation checkpoint conflicts with --draft-fp8; choose one source/conversion policy");
+                // Header resolution selects the source representation before
+                // native loading. The currently supported draft source is BF16.
+                Ok(MimoDraftRepresentation::Bf16Only)
+            }
+            Some(DraftRepresentationArg::Fp8Only) => {
+                ensure!(self.draft_fp8 != Some(false), "--draft-representation fp8-only conflicts with --draft-fp8 false; use bf16-only");
+                Ok(MimoDraftRepresentation::Fp8Only)
+            }
+            Some(DraftRepresentationArg::Bf16Only) => {
+                ensure!(self.draft_fp8 != Some(true), "--draft-representation bf16-only conflicts with --draft-fp8 true; use fp8-only");
+                Ok(MimoDraftRepresentation::Bf16Only)
+            }
+            None if self.draft_fp8 == Some(true) => Ok(MimoDraftRepresentation::Fp8Only),
+            None => Ok(MimoDraftRepresentation::Bf16Only),
+        }
+    }
+
+    fn draft_capacity(&self, block: usize) -> Result<MimoDraftCapacity> {
+        Ok(MimoDraftCapacity::new(self.draft_context_slots.unwrap_or(self.draft_sequences),
+            self.draft_sequences, block)?)
+    }
+
+    fn validate_draft_replay(&self, replay: bool) -> Result<()> {
+        ensure!(!replay || self.draft_storage()? == MimoDraftRepresentation::Bf16Only,
+            "--draft-replay compares complete BF16 weights; load --draft-representation bf16-only separately from a candidate with immutable FP8 matrices");
+        ensure!(!replay || self.fp8_head != Some(true),
+            "--draft-replay requires a separately loaded BF16 target head (--fp8-head false); FP8-only storage has no BF16 fallback");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod draft_storage_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Command {
+        #[command(flatten)]
+        engine: EngineArgs,
+    }
+
+    fn args(extra: &[&str]) -> EngineArgs {
+        Command::try_parse_from(["mimo", "--snapshot", "/missing/checkpoint", "--native-lib", "/missing/native.so"]
+            .into_iter().chain(extra.iter().copied())).unwrap().engine
+    }
+
+    #[test]
+    fn absent_conversion_options_leave_selection_to_metadata_policy() {
+        let args = args(&[]);
+        assert_eq!(args.weight_policy, WeightPolicyArg::Auto);
+        assert_eq!(args.fp8_head, None);
+        assert_eq!(args.fp8_o_proj, None);
+        assert_eq!(args.draft_fp8, None);
+        assert_eq!(args.draft_storage().unwrap(), MimoDraftRepresentation::Bf16Only);
+        let explicit = self::args(&["--draft-fp8", "true", "--fp8-head", "true", "--fp8-o-proj", "false"]);
+        assert_eq!(explicit.draft_storage().unwrap(), MimoDraftRepresentation::Fp8Only);
+        assert_eq!((explicit.fp8_head, explicit.fp8_o_proj), (Some(true), Some(false)));
+    }
+
+    #[test]
+    fn bf16_diagnostics_keep_complete_single_copy_storage() {
+        let args = args(&["--draft-fp8", "false", "--fp8-head", "false"]);
+        assert_eq!(args.draft_storage().unwrap(), MimoDraftRepresentation::Bf16Only);
+        args.validate_draft_replay(true).unwrap();
+        let args = self::args(&["--draft-representation", "bf16-only", "--fp8-head", "false"]);
+        assert_eq!(args.draft_storage().unwrap(), MimoDraftRepresentation::Bf16Only);
+        args.validate_draft_replay(true).unwrap();
+    }
+
+    #[test]
+    fn fp8_only_rejects_conflicting_math_before_native_load() {
+        let args = args(&["--draft-representation", "fp8-only", "--draft-fp8", "false"]);
+        assert!(open(&args).err().unwrap().to_string().contains("conflicts with --draft-fp8 false"));
+        let args = self::args(&["--draft-representation", "fp8-only"]);
+        assert_eq!(args.draft_storage().unwrap(), MimoDraftRepresentation::Fp8Only);
+        args.validate_draft_replay(false).unwrap();
+        assert!(args.validate_draft_replay(true).unwrap_err().to_string().contains("bf16-only separately"));
+    }
+
+    #[test]
+    fn context_slots_do_not_widen_the_admitted_draft_batch() {
+        let args = args(&["--draft-representation", "fp8-only", "--draft-context-slots", "20", "--draft-sequences", "16"]);
+        assert_eq!(args.draft_capacity(8).unwrap(), MimoDraftCapacity {
+            context_slots: 20, max_batch_sequences: 16, block_rows: 128,
+        });
+    }
+
+}
+
+#[cfg(test)]
+mod source_format_tests {
+    use super::*;
+    use clap::Parser;
+    use cuteafd_core::DType;
+    use cuteafd_loader::{SafetensorsTensorMetadata, plan::checkpoint::CheckpointTensor};
+
+    #[derive(Parser)]
+    struct Command { #[command(flatten)] engine: EngineArgs }
+
+    fn fixture() -> (EngineArgs, Checkpoint, MimoV2Config) {
+        let args = Command::try_parse_from(["mimo", "--snapshot", "/missing", "--native-lib", "/missing.so", "--mtp", "1"])
+            .unwrap().engine;
+        let cfg = MimoV2Config::from_hf(&serde_json::json!({
+            "model_type":"mimo_v2", "vocab_size":256, "hidden_size":128,
+            "num_hidden_layers":2, "num_attention_heads":1, "num_key_value_heads":1,
+            "head_dim":128, "v_head_dim":128, "rope_theta":10000.0, "swa_rope_theta":10000.0,
+            "sliding_window":128, "intermediate_size":128, "n_routed_experts":1,
+            "num_experts_per_tok":1, "moe_intermediate_size":128,
+            "hybrid_layer_pattern":[0,1], "moe_layer_freq":[0,1]
+        })).unwrap();
+        let mut tensors = Vec::new();
+        for (name, dtype, shape) in [
+            ("lm_head.weight", DType::Bf16, vec![256,128]),
+            ("model.layers.0.self_attn.o_proj.weight", DType::Bf16, vec![128,128]),
+            ("model.layers.1.self_attn.o_proj.weight", DType::F8E4M3, vec![128,128]),
+            ("model.layers.1.self_attn.o_proj.weight_scale_inv", DType::F32, vec![1,1]),
+            ("model.mtp.layers.0.self_attn.o_proj.weight", DType::Bf16, vec![128,128]),
+            ("model.mtp.layers.0.eh_proj.weight", DType::Bf16, vec![128,256]),
+            ("model.mtp.layers.0.enorm.weight", DType::Bf16, vec![128]),
+            ("model.mtp.layers.0.hnorm.weight", DType::Bf16, vec![128]),
+            ("model.mtp.layers.0.final_layernorm.weight", DType::Bf16, vec![128]),
+        ] {
+            tensors.push(CheckpointTensor { shard:"header-only.safetensors".into(),
+                meta: SafetensorsTensorMetadata { name:name.into(), dtype, shape, byte_offset:0, byte_length:0 } });
+        }
+        tensors.sort_by(|a,b| a.meta.name.cmp(&b.meta.name));
+        let checkpoint = Checkpoint { snapshot:"/missing".into(), config:serde_json::json!({}),
+            quantize_config:None, tensors, missing_shards:Vec::new(), shard_bytes:0 };
+        (args, checkpoint, cfg)
+    }
+
+    fn qualified_fixture() -> (tempfile::TempDir, EngineArgs, Checkpoint, MimoV2Config) {
+        let value: serde_json::Value = serde_json::from_str(include_str!("../../../../cuteafd-loader/tests/fixtures/mimo-qualified-pro.json")).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let draft = directory.path().join("dflash");
+        std::fs::create_dir(&draft).unwrap();
+        std::fs::write(draft.join("config.json"), serde_json::to_vec(&value["draft_config"]).unwrap()).unwrap();
+        // A header-only fixture: policy resolution never reads payload or CUDA.
+        let mut header = value["draft_headers"].clone();
+        for tensor in header.as_object_mut().unwrap().values_mut() {
+            tensor["data_offsets"] = serde_json::json!([0,0]);
+        }
+        let bytes = serde_json::to_vec(&header).unwrap();
+        let mut file = (bytes.len() as u64).to_le_bytes().to_vec(); file.extend(bytes);
+        std::fs::write(draft.join("dflash_draft_model.safetensors"), file).unwrap();
+        let mut args = Command::try_parse_from(["mimo", "--snapshot", "/missing", "--native-lib", "/missing.so"])
+            .unwrap().engine;
+        args.snapshot = directory.path().into(); args.draft = Some(directory.path().into());
+        let mut tensors: Vec<_> = value["target_headers"].as_object().unwrap().iter().map(|(name, tensor)| {
+            CheckpointTensor { shard:"header-only.safetensors".into(), meta: SafetensorsTensorMetadata {
+                name:name.clone(), dtype:DType::from_safetensors(tensor["dtype"].as_str().unwrap()),
+                shape:tensor["shape"].as_array().unwrap().iter().map(|n| n.as_u64().unwrap() as usize).collect(),
+                byte_offset:0, byte_length:0,
+            }}
+        }).collect();
+        tensors.sort_by(|a,b| a.meta.name.cmp(&b.meta.name));
+        let cfg = MimoV2Config::from_hf(&value["target_config"]).unwrap();
+        let checkpoint = Checkpoint { snapshot:directory.path().into(), config:value["target_config"].clone(),
+            quantize_config:None, tensors, missing_shards:Vec::new(), shard_bytes:0 };
+        (directory, args, checkpoint, cfg)
+    }
+
+    #[test]
+    fn qualified_default_matches_explicit_fp8_bundle_in_a_renamed_local_copy() {
+        let (_directory, mut args, checkpoint, cfg) = qualified_fixture();
+        let automatic = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
+        assert_eq!(automatic.default_policy, MimoDefaultPolicy::QualifiedProFp8);
+        assert_eq!(automatic.head, MimoProjectionRepresentation::Fp8);
+        assert_eq!(automatic.draft, MimoDraftRepresentation::Fp8Only);
+        assert_eq!(automatic.output.len(), 70);
+        assert!(automatic.output.values().all(|&format| format == MimoProjectionRepresentation::Fp8));
+        args.fp8_head = Some(true); args.fp8_o_proj = Some(true); args.draft_fp8 = Some(true);
+        assert_eq!(resolve_weight_formats(&args, &checkpoint, &cfg).unwrap(), automatic);
+        assert!(validate_resolved_replay(&automatic, true).unwrap_err().to_string().contains("--weight-policy checkpoint"));
+    }
+
+    #[test]
+    fn qualified_default_keeps_explicit_checkpoint_and_bf16_overrides() {
+        let (_directory, mut args, checkpoint, cfg) = qualified_fixture();
+        args.weight_policy = WeightPolicyArg::Checkpoint;
+        let native = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
+        assert_eq!(native.head, MimoProjectionRepresentation::Bf16);
+        assert_eq!(native.draft, MimoDraftRepresentation::Bf16Only);
+        assert!(native.output.values().all(|&format| format == MimoProjectionRepresentation::Bf16));
+        validate_resolved_replay(&native, true).unwrap();
+        args.fp8_head = Some(true);
+        assert_eq!(resolve_weight_formats(&args, &checkpoint, &cfg).unwrap().head, MimoProjectionRepresentation::Fp8);
+        args.weight_policy = WeightPolicyArg::Auto; args.fp8_head = Some(false); args.fp8_o_proj = Some(false);
+        args.draft_representation = Some(DraftRepresentationArg::Bf16Only);
+        let explicit = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
+        assert_eq!((explicit.head, explicit.draft), (MimoProjectionRepresentation::Bf16, MimoDraftRepresentation::Bf16Only));
+        assert!(explicit.output.values().all(|&format| format == MimoProjectionRepresentation::Bf16));
+    }
+
+    #[test]
+    fn external_or_explicit_checkpoint_draft_does_not_inherit_target_conversion() {
+        let (_directory, mut args, checkpoint, cfg) = qualified_fixture();
+        args.draft_representation = Some(DraftRepresentationArg::Checkpoint);
+        assert_eq!(resolve_weight_formats(&args, &checkpoint, &cfg).unwrap().draft, MimoDraftRepresentation::Bf16Only);
+        args.draft_representation = None;
+        let external = tempfile::tempdir().unwrap();
+        for name in ["config.json", "dflash_draft_model.safetensors"] {
+            std::fs::copy(checkpoint.snapshot.join("dflash").join(name), external.path().join(name)).unwrap();
+        }
+        args.draft = Some(external.path().into());
+        let selected = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
+        assert_eq!(selected.head, MimoProjectionRepresentation::Fp8);
+        assert_eq!(selected.draft, MimoDraftRepresentation::Bf16Only);
+    }
+
+    #[test]
+    fn embedded_drafter_alias_keeps_qualified_default_but_mtp_keeps_source() {
+        let (directory, mut args, mut checkpoint, cfg) = qualified_fixture();
+        let alias = directory.path().join("embedded-draft-alias");
+        std::os::unix::fs::symlink(checkpoint.snapshot.join("dflash"), &alias).unwrap();
+        args.draft = Some(alias);
+        args.mtp = 1;
+        for (suffix, shape) in [
+            ("self_attn.o_proj", vec![cfg.hidden, cfg.heads * cfg.v_head_dim]),
+            ("eh_proj", vec![cfg.hidden, 2 * cfg.hidden]),
+            ("enorm", vec![cfg.hidden]), ("hnorm", vec![cfg.hidden]),
+            ("final_layernorm", vec![cfg.hidden]),
+        ] {
+            checkpoint.tensors.push(CheckpointTensor { shard:"header-only.safetensors".into(),
+                meta: SafetensorsTensorMetadata { name:format!("model.mtp.layers.0.{suffix}.weight"),
+                    dtype:DType::Bf16, shape, byte_offset:0, byte_length:0 } });
+        }
+        checkpoint.tensors.sort_by(|a,b| a.meta.name.cmp(&b.meta.name));
+        let selected = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
+        assert_eq!(selected.draft, MimoDraftRepresentation::Fp8Only);
+        assert_eq!(selected.output["model.mtp.layers.0.self_attn.o_proj.weight"], MimoProjectionRepresentation::Bf16);
+        assert_eq!(selected.output.values().filter(|&&format| format == MimoProjectionRepresentation::Fp8).count(), 70);
+    }
+
+    #[test]
+    fn changed_model_config_retains_source_formats_despite_pro_geometry() {
+        let (_directory, args, mut checkpoint, cfg) = qualified_fixture();
+        checkpoint.config["attention_value_scale"] = serde_json::json!(0.5);
+        let selected = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
+        assert_eq!(selected.default_policy, MimoDefaultPolicy::Checkpoint);
+        assert_eq!((selected.head, selected.draft), (MimoProjectionRepresentation::Bf16, MimoDraftRepresentation::Bf16Only));
+        assert!(selected.output.values().all(|&format| format == MimoProjectionRepresentation::Bf16));
+    }
+
+    #[test]
+    fn checkpoint_policy_and_draft_source_selector_are_explicit_cli_options() {
+        let mut args = Command::try_parse_from(["mimo", "--snapshot", "/missing", "--native-lib", "/missing.so",
+            "--weight-policy", "checkpoint", "--draft-representation", "checkpoint"]).unwrap().engine;
+        assert_eq!(args.weight_policy, WeightPolicyArg::Checkpoint);
+        assert_eq!(args.draft_representation, Some(DraftRepresentationArg::Checkpoint));
+        assert_eq!(args.draft_storage().unwrap(), MimoDraftRepresentation::Bf16Only);
+        args.draft_fp8 = Some(true);
+        assert!(args.draft_storage().unwrap_err().to_string().contains("conflicts with --draft-fp8"));
+    }
+
+    #[test]
+    fn mixed_target_and_mtp_sources_keep_independent_resident_formats() {
+        let (mut args, checkpoint, cfg) = fixture();
+        args.weight_policy = WeightPolicyArg::Checkpoint;
+        let selected = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
+        assert_eq!(selected.head, MimoProjectionRepresentation::Bf16);
+        assert_eq!(selected.output["model.layers.0.self_attn.o_proj.weight"], MimoProjectionRepresentation::Bf16);
+        assert_eq!(selected.output["model.layers.1.self_attn.o_proj.weight"], MimoProjectionRepresentation::Fp8);
+        assert_eq!(selected.output["model.mtp.layers.0.self_attn.o_proj.weight"], MimoProjectionRepresentation::Bf16);
+        assert!(selected.any_fp8_output());
+        assert_eq!(selected.draft, MimoDraftRepresentation::Bf16Only);
+        let mut explicit = args;
+        explicit.fp8_o_proj = Some(true);
+        let selected = resolve_weight_formats(&explicit, &checkpoint, &cfg).unwrap();
+        assert!(selected.output.values().all(|&format| format == MimoProjectionRepresentation::Fp8));
+    }
+
+    #[test]
+    fn unsupported_sources_and_missing_fp8_metadata_are_named_before_native_load() {
+        let (args, mut checkpoint, cfg) = fixture();
+        checkpoint.tensors.retain(|t| !t.meta.name.ends_with("_scale_inv"));
+        let error = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap_err();
+        assert!(error.to_string().contains("model.layers.1.self_attn.o_proj.weight_scale_inv"));
+        let head = checkpoint.tensors.iter_mut().find(|t| t.meta.name == "lm_head.weight").unwrap();
+        head.meta.dtype = DType::F16;
+        let error = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap_err();
+        assert!(format!("{error:#}").contains("lm_head.weight"));
+        assert!(format!("{error:#}").contains("F16"));
+    }
+
+    #[test]
+    fn mtp_raw_operands_reject_wrong_dtype_shape_and_missing_headers() {
+        for suffix in ["eh_proj", "enorm", "hnorm", "final_layernorm"] {
+            let name = format!("model.mtp.layers.0.{suffix}.weight");
+            for invalid in ["dtype", "shape", "missing"] {
+                let (args, mut checkpoint, cfg) = fixture();
+                let index = checkpoint.tensors.iter().position(|t| t.meta.name == name).unwrap();
+                match invalid {
+                    "dtype" => checkpoint.tensors[index].meta.dtype = DType::F8E4M3,
+                    "shape" => checkpoint.tensors[index].meta.shape = vec![1],
+                    "missing" => { checkpoint.tensors.remove(index); }
+                    _ => unreachable!(),
+                }
+                let error = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap_err();
+                assert!(format!("{error:#}").contains(&name), "{invalid}: {error:#}");
+                // Unused optional MTP tensors never force a target-only load
+                // to reject a checkpoint that it otherwise supports.
+                let mut target_only = args;
+                target_only.mtp = 0;
+                assert!(resolve_weight_formats(&target_only, &checkpoint, &cfg).is_ok());
+            }
+        }
+    }
 }
 
 /// `--kv-cache` values.
@@ -223,52 +587,227 @@ pub(crate) struct GoldenArgs {
     pub greedy_digest: Option<usize>,
 }
 
-/// The checkpoint and native library, opened on the calling thread.
+/// Immutable source-header selections shared by admission and allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedWeightFormats {
+    pub default_policy: MimoDefaultPolicy,
+    pub head: MimoProjectionRepresentation,
+    pub output: std::collections::BTreeMap<String, MimoProjectionRepresentation>,
+    pub draft: MimoDraftRepresentation,
+}
+
+impl ResolvedWeightFormats {
+    pub fn any_fp8_output(&self) -> bool {
+        self.output.values().any(|&format| format == MimoProjectionRepresentation::Fp8)
+    }
+}
+
+fn validate_resolved_replay(formats: &ResolvedWeightFormats, replay: bool) -> Result<()> {
+    ensure!(!replay || (formats.head == MimoProjectionRepresentation::Bf16
+        && formats.draft == MimoDraftRepresentation::Bf16Only),
+        "--draft-replay requires separately loaded BF16 head/drafter; use --weight-policy checkpoint or explicit --fp8-head false --draft-representation bf16-only; FP8-only weights have no BF16 fallback");
+    Ok(())
+}
+
+fn projection_source(checkpoint: &Checkpoint, name: &str, fp8: Option<bool>) -> Result<MimoProjectionRepresentation> {
+    let index = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
+        .map_err(|_| anyhow::anyhow!("checkpoint has no {name}"))?;
+    let source = &checkpoint.tensors[index].meta;
+    let selected = MimoProjectionRepresentation::from_source(source.dtype.clone(), fp8)
+        .with_context(|| format!("{name}: cannot select a source-faithful projection"))?;
+    ensure!(source.shape.len() == 2 && source.shape.iter().all(|&n| n > 0),
+        "{name}: projection requires a nonempty [N,K] checkpoint tensor");
+    ensure!(selected != MimoProjectionRepresentation::Fp8 || source.shape[1] %128 == 0,
+        "{name}: selected FP8 representation requires K divisible by128");
+    if source.dtype == cuteafd_core::DType::F8E4M3 {
+        let scale_name = format!("{name}_scale_inv");
+        let index = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(&scale_name))
+            .map_err(|_| anyhow::anyhow!("{name}: FP8 source requires checkpoint tensor {scale_name}"))?;
+        let scale = &checkpoint.tensors[index].meta;
+        ensure!(source.shape[1] %128 == 0 && scale.dtype == cuteafd_core::DType::F32
+            && scale.shape.len() == 2 && scale.shape[1] == source.shape[1] /128,
+            "{name}: FP8 projection needs a supported FP32 block grid in {scale_name}, found {:?} {:?}",
+            scale.dtype, scale.shape);
+        weights::scale_rows(name, source.shape[0], scale.shape[0])?;
+    }
+    Ok(selected)
+}
+
+fn resolve_weight_formats(args: &EngineArgs, checkpoint: &Checkpoint, cfg: &MimoV2Config) -> Result<ResolvedWeightFormats> {
+    let default_policy = if args.weight_policy == WeightPolicyArg::Checkpoint {
+        MimoDefaultPolicy::Checkpoint
+    } else { weight_policy::default_policy(checkpoint, cfg) };
+    let default_fp8 = (default_policy == MimoDefaultPolicy::QualifiedProFp8).then_some(true);
+    let head = projection_source(checkpoint, "lm_head.weight", args.fp8_head.or(default_fp8))?;
+    let names = (0..args.layers.unwrap_or(cfg.layers).min(cfg.layers))
+        .map(|layer| format!("model.layers.{layer}.self_attn.o_proj.weight"))
+        .chain((0..args.mtp).map(|layer| format!("model.mtp.layers.{layer}.self_attn.o_proj.weight")));
+    let mut output = std::collections::BTreeMap::new();
+    for name in names {
+        // The measured exception covers target O matrices, not unqualified MTP.
+        let default = if name.starts_with("model.layers.") { default_fp8 } else { None };
+        let selected = projection_source(checkpoint, &name, args.fp8_o_proj.or(default))?;
+        ensure!(args.split_device.is_none() || name.starts_with("model.mtp.") || selected != MimoProjectionRepresentation::Bf16
+            || checkpoint.tensors.iter().find(|t| t.meta.name == name)
+                .is_some_and(|t| t.meta.dtype == cuteafd_core::DType::Bf16),
+            "{name}: explicit FP8-source to BF16 o_proj conversion under head split needs a native sliced dequant loader; checkpoint-format selection preserves FP8 without this conversion");
+        output.insert(name, selected);
+    }
+    // MTP extras are uploaded verbatim into BF16 kernels. Check their source
+    // contract even when memory admission is disabled (e.g. golden/oracle
+    // commands), before loading the native library or allocating any weights.
+    for layer in 0..args.mtp {
+        for (suffix, shape) in [
+            ("eh_proj", vec![cfg.hidden, 2 * cfg.hidden]),
+            ("enorm", vec![cfg.hidden]),
+            ("hnorm", vec![cfg.hidden]),
+            ("final_layernorm", vec![cfg.hidden]),
+        ] {
+            let name = format!("model.mtp.layers.{layer}.{suffix}.weight");
+            let index = checkpoint.tensors.binary_search_by(|t| t.meta.name.cmp(&name))
+                .map_err(|_| anyhow::anyhow!("checkpoint has no {name}"))?;
+            let source = &checkpoint.tensors[index].meta;
+            ensure!(source.dtype == cuteafd_core::DType::Bf16 && source.shape == shape,
+                "{name}: MTP raw operand requires checkpoint BF16 {shape:?}, found {:?} {:?}; add a native-format reader/kernel before using this source",
+                source.dtype, source.shape);
+        }
+    }
+    let native_draft = args.draft.as_deref().map(dflash::drafter_dir)
+        .map(|dir| dflash::checkpoint_representation(&dir)).transpose()?;
+    let draft = if args.draft_representation == Some(DraftRepresentationArg::Checkpoint) {
+        args.draft_storage()?;
+        native_draft.unwrap_or(MimoDraftRepresentation::Bf16Only)
+    } else if args.draft_representation.is_none() && args.draft_fp8.is_none() {
+        let qualified_embedded = if default_fp8.is_some() {
+            args.draft.as_deref().map(dflash::drafter_dir)
+                .filter(|dir| {
+                    let embedded = checkpoint.snapshot.join("dflash");
+                    *dir == embedded || matches!((dir.canonicalize(), embedded.canonicalize()),
+                        (Ok(actual), Ok(expected)) if actual == expected)
+                })
+                .map(|dir| -> Result<bool> {
+                    let config = cuteafd_loader::plan::checkpoint::read_json(&dir.join("config.json"))?;
+                    let headers = cuteafd_loader::read_safetensors_metadata(&dir.join("dflash_draft_model.safetensors"))?;
+                    Ok(weight_policy::qualified_draft(&config, &headers))
+                }).transpose()?.unwrap_or(false)
+        } else { false };
+        if qualified_embedded { MimoDraftRepresentation::Fp8Only }
+        else { native_draft.unwrap_or(MimoDraftRepresentation::Bf16Only) }
+    } else { args.draft_storage()? };
+    Ok(ResolvedWeightFormats { default_policy, head, output, draft })
+}
+
 pub(crate) struct Opened {
     pub catalog: cuteafd_loader::OfficialV41Catalog,
     pub checkpoint: Checkpoint,
     pub cfg: MimoV2Config,
-    pub library: NativeLibrary,
+    pub library: std::sync::Arc<NativeLibrary>,
+    pub weight_formats: ResolvedWeightFormats,
 }
 
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
+    open_checked(args, false)
+}
+
+fn open_checked(args: &EngineArgs, bf16_replay: bool) -> Result<Opened> {
+    // Validate immutable representation, capacity and kernel alignment before
+    // the native module or any device allocation is admitted.
+    args.draft_storage()?;
     let checkpoint = Checkpoint::open(&args.snapshot)?;
     ensure!(checkpoint.missing_shards.is_empty(), "checkpoint shards missing: {:?}", checkpoint.missing_shards);
     let cfg = MimoV2Config::read(&args.snapshot)?;
+    let weight_formats = resolve_weight_formats(args, &checkpoint, &cfg)?;
+    validate_resolved_replay(&weight_formats, bf16_replay)?;
+    if let Some(path) = &args.draft {
+        let draft = dflash::DflashConfig::read(&dflash::drafter_dir(path))?;
+        args.draft_capacity(draft.block)?;
+        draft.weight_layout(weight_formats.draft)?;
+    }
+    tracing::info!(default_policy = ?weight_formats.default_policy,
+        head = ?weight_formats.head, draft = ?weight_formats.draft,
+        o_fp8_layers = weight_formats.output.values().filter(|&&format| format == MimoProjectionRepresentation::Fp8).count(),
+        o_bf16_layers = weight_formats.output.values().filter(|&&format| format == MimoProjectionRepresentation::Bf16).count(),
+        "selected resident weight formats");
     // The expert geometry is process-wide and must be fixed before the native
     // library loads (its expert helpers size rows from it).
     let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     cuteafd_core::set_expert_geometry(catalog.routed_experts().geometry()?)
         .map_err(|g| anyhow::anyhow!("expert geometry already {g:?}"))?;
     // SAFETY: the library is the cuteafd native shim built for this engine.
-    let library = unsafe { NativeLibrary::load(&args.native_lib) }?;
+    let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&args.native_lib) }?);
     library.cuda_set_device(args.device)?;
-    Ok(Opened { catalog, checkpoint, cfg, library })
+    Ok(Opened { catalog, checkpoint, cfg, library, weight_formats })
 }
 
 impl Opened {
     /// Builds the engine and hands it to `body`.
     pub fn with_engine<T>(&self, args: &EngineArgs, body: impl FnOnce(&engine::MimoEngine<'_>) -> Result<T>) -> Result<T> {
+        self.with_engine_output(args, MimoPrefillOutput::AllRows, body)
+    }
+
+    /// Output storage is fixed before any workspace is admitted or captured.
+    pub fn with_engine_output<T>(&self, args: &EngineArgs, prefill_output: MimoPrefillOutput,
+        body: impl FnOnce(&engine::MimoEngine<'_>) -> Result<T>) -> Result<T> {
+        self.with_engine_reserved(args, None, prefill_output, |engine, _| body(engine))
+    }
+
+    pub fn with_engine_reserved<T>(&self, args: &EngineArgs,
+        serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>, prefill_output: MimoPrefillOutput,
+        body: impl FnOnce(&engine::MimoEngine<'_>, Option<cuteafd_hostcache::config::Config>) -> Result<T>) -> Result<T> {
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
-        programs.load_all()?;
+        let split_device = split::requested_device(&self.cfg, args.device, args.split_device,
+            |name| programs.spec(name).is_ok())?;
+        if split_device.is_some() {
+            self.library.peer_abort_available().context("MiMo head split needs the terminal-abort native ABI")?;
+        }
+        if args.peers.is_some() && !args.skip_experts && !args.local_experts
+            && self.cfg.dense.iter().take(args.layers.unwrap_or(self.cfg.layers)).any(|&dense| !dense) {
+            self.library.rdma_rc_endpoint_quiesce_available()
+                .context("MiMo Spark terminal ownership needs fallible QP quiescence before allocation")?;
+        }
+        if self.weight_formats.head == MimoProjectionRepresentation::Fp8 {
+            let name = format!("{}_head_fp8", self.cfg.program_family()?);
+            let spec = programs.spec(&name).with_context(|| format!(
+                "FP8-only MiMo target head requires {name}; export the16-row head program before loading weights"))?;
+            ensure!(spec.capacity_rows >= head::FP8_HEAD_ROWS as u32 && spec.pointers == ["x", "w_fp8", "scale", "logits"],
+                "{name}: FP8-only head requires capacity16 and x,w_fp8,scale,logits operands");
+        }
+        if self.weight_formats.any_fp8_output() {
+            let mut geometries = vec![self.cfg.program_family()?];
+            if split_device.is_some() { geometries.push(self.cfg.head_split(2)?.program_family()?); }
+            for geometry in geometries {
+                for (cap, scale) in [("m64", "w_o_scale"), ("m4096", "w_o_kscale")] {
+                    let name = format!("{geometry}_o_w8_{cap}");
+                    let spec = programs.spec(&name).with_context(|| format!(
+                        "FP8-only MiMo o_proj requires {name}; export fp8_only output siblings before loading weights"))?;
+                    ensure!(spec.pointers == ["attn", "w_o_fp8", scale, "out", "scratch"],
+                        "{name}: FP8-only output ABI must contain no BF16 w_o operand");
+                }
+            }
+        }
+        let preflight = admission::preflight(self, args, &programs, split_device, serving, prefill_output)?;
+        // Module allocation is checked against its provisional bound before
+        // tensors. It does not qualify later capture or constraint demand.
+        for sample in &preflight.memory {
+            crate::shared::peer_split::on_device(&self.library, sample.device as i32, args.device, || {
+                let before = self.library.cuda_memory_info()?.0;
+                programs.load_all()?;
+                let after = self.library.cuda_memory_info()?.0;
+                let module_bytes = before.saturating_sub(after) as u64;
+                ensure!(module_bytes <= preflight.runtime_bound_bytes,
+                    "MiMo GPU {} module load used {} B, exceeding the provisional runtime bound {} B before weights",
+                    sample.device, module_bytes, preflight.runtime_bound_bytes);
+                tracing::info!(device = sample.device, module_bytes, bound_bytes = preflight.runtime_bound_bytes,
+                    "MiMo measured module allocation; capture/constraint bound remains unqualified");
+                Ok(())
+            })?;
+        }
         let draft_dir = args.draft.as_deref().map(dflash::drafter_dir);
         let draft_file = draft_dir.as_deref().map(dflash::prefetch);
         let stream = self.library.cuda_stream_create()?;
-        // The head split's second GPU and its stream (load kernels, then the engine's).
-        // A head split needs its share's programs (`mimo2`, `mimop2`) in this build;
-        // without them the checkpoint serves from --device.
-        let share = self.cfg.head_split(2).and_then(|share| share.program_family());
-        let split_device = match (args.split_device, &share) {
-            (Some(device), Ok(family)) if programs.spec(&format!("{family}_o_m64")).is_ok() => Some(device),
-            (Some(device), _) => {
-                tracing::info!(device, "no head-split programs for this MiMo geometry; serving from --device alone");
-                None
-            }
-            (None, _) => None,
-        };
+
         let peer_stream = match split_device {
             Some(device) => {
-                ensure!(device != args.device, "--split-device must differ from --device");
                 // Peer access both ways first: the loader slices weights over peer copies.
                 self.library.cuda_enable_peer(device)?;
                 self.library.cuda_set_device(device)?;
@@ -281,8 +820,10 @@ impl Opened {
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::MimoLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
-            checkpoint_tp: cuteafd_loader::families::mimo_v2::checkpoint_tp(&args.snapshot)?, fp8_decode: args.fp8_decode,
-            fp8_head: args.fp8_head, fp8_o_proj: args.fp8_o_proj, fp8_scales: args.fp8_scales, device: args.device,
+            checkpoint_tp: cuteafd_loader::families::mimo_v2::checkpoint_tp(&args.snapshot)?,
+            fp8_head: self.weight_formats.head == MimoProjectionRepresentation::Fp8,
+            output_formats: &self.weight_formats.output,
+            fp8_scales: args.fp8_scales, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream }).collect() };
         let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
             args.token_io.embed_placement, || loader.model(&self.cfg, layers))?;
@@ -316,78 +857,137 @@ impl Opened {
             None
         };
         let bytes: usize = model.layers.iter().map(|l| l.bytes()).sum::<usize>() + model.norm.buffer.bytes
-            + model.head.buffer.bytes + model.head_fp8.as_ref().map_or(0, |(q, s)| q.buffer.bytes + s.buffer.bytes);
+            + model.head.bytes();
         let peer_bytes: usize = shares.iter().flatten().map(|l| l.bytes()).sum();
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64,
             gib = format!("{:.2}", bytes as f64 / (1u64 << 30) as f64),
             split_gib = format!("{:.2}", peer_bytes as f64 / (1u64 << 30) as f64), "MiMo coordinator weights resident");
-        let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
+        let pages = usize::try_from(preflight.capacity.allocated_gpu_kv_tokens)? / engine::PAGE_ROWS;
         let mut engine = engine::MimoEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            args.max_context, args.prefill_rows, pages, args.rings, embedding, args.kv_cache.into())?;
-        engine.prefill_w8a8 = !args.prefill_w8a16;
-        engine.decode_graphs = args.decode_graphs;
-        {
-            use cuteafd_loader::families::mimo_v2::MimoAttention;
-            let kv = args.kv_cache.into();
-            let per_token: usize = self.cfg.attention.iter().take(layers).filter(|a| **a == MimoAttention::Full)
-                .map(|_| self.cfg.record_bytes(MimoAttention::Full, kv)).sum();
-            let ring_bytes: usize = self.cfg.attention.iter().take(layers).filter(|a| **a == MimoAttention::Sliding)
-                .map(|_| self.cfg.record_bytes(MimoAttention::Sliding, kv) * engine::RING_ROWS).sum();
-            tracing::info!(kv_cache = ?args.kv_cache, pool_tokens = pages * engine::PAGE_ROWS,
-                bytes_per_token = per_token, tokens_per_gib = (1usize << 30) / per_token.max(1),
-                ring_mib_per_sequence = format!("{:.2}", ring_bytes as f64 / (1u64 << 20) as f64), "MiMo KV records");
-        }
-        if let Some((device, stream)) = peer_stream {
-            engine.attach_peer(device, stream, shares.pop().context("head-split shares")?)?;
-        }
-        engine.mtp = mtp;
-        if let Some(dir) = &draft_dir {
-            let started = Instant::now();
-            let cfg = dflash::DflashConfig::read(dir)?;
-            ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
-                && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash drafter does not fit this target");
-            let mask = match dflash::mask_embedding(dir, cfg.hidden)? {
-                Some(row) => row,
-                None => engine.embedding.host_rows(&[cfg.mask_token])?,
-            };
-            let file = draft_file.context("drafter prefetch")?.join()
-                .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
-            let mut drafter = dflash::MimoDrafter::load(&self.library, dir, file, stream, args.draft_sequences,
-                args.draft_sequences, mask)?;
-            if args.draft_fp8 {
-                drafter.enable_fp8(engine.weights.head.buffer.ptr, args.fp8_scales)?;
+            args.max_context, args.prefill_rows, pages, args.rings, embedding, args.kv_cache.into(), prefill_output)?;
+        // Once an engine exists, setup and body failures share the same terminal
+        // retirement path. Pre-engine loader ownership is a separate boundary.
+        let result = (|| -> Result<T> {
+            engine.prefill_w8a8 = !args.prefill_w8a16;
+            engine.output_fp8_decode = args.fp8_decode;
+            engine.decode_graphs = args.decode_graphs;
+            engine.graph_storage_plan = Some(preflight.graph_plan.clone());
+            engine.graph_storage_bound_bytes = Some(preflight.graph_bound_bytes.clone());
+            {
+                use cuteafd_loader::families::mimo_v2::MimoAttention;
+                let kv = args.kv_cache.into();
+                let per_token: usize = self.cfg.attention.iter().take(layers).filter(|a| **a == MimoAttention::Full)
+                    .map(|_| self.cfg.record_bytes(MimoAttention::Full, kv)).sum();
+                let ring_bytes: usize = self.cfg.attention.iter().take(layers).filter(|a| **a == MimoAttention::Sliding)
+                    .map(|_| self.cfg.record_bytes(MimoAttention::Sliding, kv) * engine::RING_ROWS).sum();
+                tracing::info!(kv_cache = ?args.kv_cache, pool_tokens = pages * engine::PAGE_ROWS,
+                    bytes_per_token = per_token, tokens_per_gib = (1usize << 30) / per_token.max(1),
+                    ring_mib_per_sequence = format!("{:.2}", ring_bytes as f64 / (1u64 << 20) as f64), "MiMo KV records");
             }
-            engine.drafter = Some(drafter);
-            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash drafter resident");
-        }
-        let moe_layers = (0..layers).filter(|&l| !self.cfg.dense[l]).collect::<Vec<_>>();
-        engine.expert_input = args.expert_input;
-        if let Some(experts) = self.experts(args, &moe_layers)? {
-            engine.set_experts(experts);
-        }
-        if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
-            engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
-        }
-        let result = body(&engine);
-        drop(engine);
-        // SAFETY: the engine that used the streams is gone.
-        unsafe {
-            self.library.cuda_stream_destroy(stream)?;
             if let Some((device, stream)) = peer_stream {
-                self.library.cuda_set_device(device)?;
-                let destroyed = self.library.cuda_stream_destroy(stream);
-                self.library.cuda_set_device(args.device)?;
-                destroyed?;
+                engine.attach_peer(device, stream, shares.pop().context("head-split shares")?)?;
             }
+            engine.mtp = mtp;
+            if let Some(dir) = &draft_dir {
+                let started = Instant::now();
+                let cfg = dflash::DflashConfig::read(dir)?;
+                ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
+                    && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash drafter does not fit this target");
+                let mask = match dflash::mask_embedding(dir, cfg.hidden)? {
+                    Some(row) => row,
+                    None => engine.embedding.host_rows(&[cfg.mask_token])?,
+                };
+                let file = draft_file.context("drafter prefetch")?.join()
+                    .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
+                let capacity = args.draft_capacity(cfg.block)?;
+                let representation = self.weight_formats.draft;
+                let drafter = dflash::MimoDrafter::load(&self.library, dir, file, stream, capacity.context_slots,
+                    capacity.max_batch_sequences, mask, representation, args.fp8_scales)?;
+                engine.drafter = Some(drafter);
+                tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash drafter resident");
+            }
+            let moe_layers = (0..layers).filter(|&l| !self.cfg.dense[l]).collect::<Vec<_>>();
+            engine.expert_input = args.expert_input;
+            if let Some(experts) = self.experts(args, &moe_layers, preflight.local_expert_budget)? {
+                engine.set_experts(experts);
+            }
+            engine.prepare_prefill_pair()?;
+            if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
+                engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
+            }
+            body(&engine, preflight.host_config)
+        })();
+        let submission_failed = engine.submission_failed();
+        let uninstalled_peer = peer_stream.filter(|_| engine.ranks() == 1);
+        let shutdown = teardown::retire_engine(uninstalled_peer.is_some(), || engine.terminal_shutdown(), || {
+            // attach_peer installs its peer/exchange only after initialization
+            // succeeds. Its caller still owns the created peer stream on an
+            // earlier failure, so engine-only drainage cannot certify it.
+            if let Some((device, peer_owned)) = uninstalled_peer {
+                crate::shared::peer_split::on_device(&self.library, device, args.device, || {
+                    // SAFETY: the stream is still owned by this scope; no peer
+                    // wait was submitted before attach_peer installed exchange.
+                    unsafe { self.library.cuda_stream_synchronize(peer_owned)?; }
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        }, || engine.retain_serving_storage());
+        let result = match (result,shutdown) {
+            (Err(primary),Err(cleanup))=> {
+                tracing::error!(error=%format!("{cleanup:#}"),"terminal shutdown also failed; preserving primary body error");
+                Err(primary)
+            }
+            (Ok(_),Err(cleanup))=>Err(cleanup),
+            (result,Ok(()))=>result,
+        };
+        if engine.retain_queued_storage() {
+            // The publisher/drain failed. Keep every device, pinned, graph,
+            // transport and draft owner plus the native module loaded until
+            // process teardown. No sequence counter is rewritten or reset.
+            let terminal = engine.terminal_error();
+            std::mem::forget(engine);
+            std::mem::forget(self.library.clone());
+            if let Err(error) = self.library.cuda_set_device(args.device) {
+                tracing::error!(%error, "restoring device after terminal owner quarantine");
+            }
+            return Err(result.err().unwrap_or(terminal));
         }
-        result
+        let result = body_after_shutdown(result, submission_failed, || engine.terminal_error());
+        drop(engine);
+        // SAFETY: both stream handles were created here and remain owned here.
+        // All native/transport/copy consumers have drained before engine Drop.
+        unsafe {
+            teardown::finish(result, peer_stream.is_some(), |step| match step {
+                teardown::CleanupStep::LeadStream => {
+                    self.library.cuda_set_device(args.device)?;
+                    self.library.cuda_stream_destroy(stream).map_err(Into::into)
+                }
+                teardown::CleanupStep::PeerStream => {
+                    if let Some((device, stream)) = peer_stream {
+                        self.library.cuda_set_device(device)?;
+                        self.library.cuda_stream_destroy(stream)?;
+                    }
+                    Ok(())
+                }
+                teardown::CleanupStep::RestoreDevice => self.library.cuda_set_device(args.device).map_err(Into::into),
+            })
+        }
     }
+}
+
+/// Normal owner retirement closes an engine too. Only a failed submission
+/// invalidates a successful body result; an existing typed primary stays intact.
+pub(super) fn body_after_shutdown<T>(result: Result<T>, submission_failed: bool,
+    terminal_error: impl FnOnce() -> anyhow::Error) -> Result<T> {
+    if submission_failed && result.is_ok() { Err(terminal_error()) } else { result }
 }
 
 impl Opened {
     /// The routed-expert source for `moe_layers`: Spark ranks (`--peers`,
     /// warmed with a full-capacity request) or the local TP1 package.
-    fn experts<'s>(&'s self, args: &EngineArgs, moe_layers: &[usize]) -> Result<Option<engine::Experts<'s>>> {
+    fn experts<'s>(&'s self, args: &EngineArgs, moe_layers: &[usize], local_budget: usize)
+        -> Result<Option<engine::Experts<'s>>> {
         if moe_layers.is_empty() {
             return Ok(None);
         }
@@ -398,16 +998,15 @@ impl Opened {
             let tensors = self.catalog.fp8().context("MiMo experts are the checkpoint's FP8 tensors")?;
             let directory = args.fp8_package.clone()
                 .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&args.native_lib, 1, tensors.format()));
-            let (free, _) = self.library.cuda_memory_info()?;
             if let Some(window) = args.expert_window {
                 let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, 0..0, 1, 0,
-                    args.prefill_rows, free.saturating_sub(4 << 30))?;
+                    engine::expert_capacity(args.prefill_rows), local_budget)?;
                 return Ok(Some(engine::Experts::Streamed { experts: std::cell::RefCell::new(experts), tensors, window }));
             }
             let started = Instant::now();
             let local = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory,
-                moe_layers[0]..moe_layers[moe_layers.len() - 1] + 1, 1, 0, args.prefill_rows,
-                free.saturating_sub(4 << 30))?;
+                moe_layers[0]..moe_layers[moe_layers.len() - 1] + 1, 1, 0, engine::expert_capacity(args.prefill_rows),
+                local_budget)?;
             tracing::info!(layers = moe_layers.len(), elapsed_ms = started.elapsed().as_millis() as u64,
                 "MiMo FP8 experts resident on this GPU");
             return Ok(Some(engine::Experts::Local(local)));
@@ -417,17 +1016,17 @@ impl Opened {
         let executors: Vec<u64> = (0..peers.len())
             .map(|rank| cuteafd_transport::expert::v41_spark_executor_id(peers.len(), rank))
             .collect::<Result<_>>()?;
-        let link = || crate::shared::spark_intake::SparkLink::new(&self.library, &peers, &executors,
-            u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
-                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2);
+        let link = || -> Result<crate::shared::spark_intake::SparkLink<'_>> {
+            let mut link=crate::shared::spark_intake::SparkLink::new(&self.library, &peers, &executors,
+            u32::try_from(engine::expert_capacity(args.prefill_rows))?, cuteafd_transport::TcpTransportConfig { timing: false,
+                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2)?;
+            link.enable_terminal_ownership(self.library.clone())?;
+            Ok(link)
+        };
         let mut transport = link()?;
         // Pipelined prefill (CUTEAFD_MIMO_PREFILL_LANES, 2 by default; 1 keeps
         // it serial): a second transport carries the first row lane's waves.
-        let lanes = match std::env::var("CUTEAFD_MIMO_PREFILL_LANES").as_deref() {
-            Ok("1") => 1,
-            Ok("2") | Err(_) => 2,
-            Ok(other) => anyhow::bail!("CUTEAFD_MIMO_PREFILL_LANES is 1 or 2, not {other}"),
-        };
+        let lanes = admission::transport_lanes(true)?;
         let mut lane = if lanes == 2 { Some(link()?) } else { None };
         tracing::info!(lanes, "MiMo prefill lanes");
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
@@ -455,7 +1054,7 @@ impl Opened {
             request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
             Ok(request)
         };
-        let mut warmups = vec![warm(args.prefill_rows, args.expert_input.bf16(false))?];
+        let mut warmups = vec![warm(engine::expert_capacity(args.prefill_rows), args.expert_input.bf16(false))?];
         if args.expert_input.bf16(true) && !args.expert_input.bf16(false) {
             warmups.push(warm(1, true)?);
         }
@@ -515,7 +1114,10 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
 }
 
 fn golden(args: GoldenArgs) -> Result<()> {
-    let opened = open(&args.engine)?;
+    args.engine.validate_draft_replay(args.draft_replay.is_some())?;
+    let opened = open_checked(&args.engine, args.draft_replay.is_some())?;
+    ensure!(args.draft_replay.is_none() || opened.weight_formats.head == MimoProjectionRepresentation::Bf16,
+        "--draft-replay requires a separately loaded BF16 target head; checkpoint FP8 has no BF16 resident fallback");
     opened.with_engine(&args.engine, |engine| golden_run(&args, &opened, engine))
 }
 
@@ -538,6 +1140,9 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
     }
     if let Some(start) = args.draft_replay {
         let drafter = engine.drafter.as_ref().context("--draft-replay needs --draft")?;
+        if opened.weight_formats.draft == MimoDraftRepresentation::Bf16Only {
+            println!("DFlash replay: immutable BF16-only storage; one BF16 arithmetic arm, no FP8 comparison");
+        }
         let (tokens, greedy) = crate::families::glm5::dflash::golden_sequence(&args.golden, opened.cfg.vocab_size)?;
         let hidden = opened.cfg.hidden;
         let layers: Vec<Vec<u8>> = drafter.cfg.taps.iter()
@@ -553,7 +1158,7 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
             Ok(taps)
         };
         return crate::families::glm5::dflash::replay(drafter, &tokens, &greedy, &taps,
-            &|t| engine.embedding.host_rows(t), engine.weights.head.buffer.ptr, start);
+            &|t| engine.embedding.host_rows(t), engine.weights.head.bf16_ptr()?, start);
     }
     if let Some(dir) = &args.mtp_oracle {
         return mtp_oracle(args, opened, engine, dir);
@@ -724,18 +1329,32 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
         let long: Vec<u32> = tokens.iter().copied().cycle().take(n).collect();
         let mut allocator = engine::Allocator::new(engine.pages, engine.rings);
         let mut times = Vec::new();
-        for _ in 0..args.bench_prefill {
+        for run in 0..=args.bench_prefill {
             let mut fresh = allocator.admit(n)?;
             let started = Instant::now();
             let mut last = None;
             for chunk in long.chunks(engine.prefill_capacity()) {
                 last = engine.prefill_forced(&mut fresh, chunk, false, None, None)?;
             }
-            times.push(started.elapsed().as_secs_f64());
+            let elapsed = started.elapsed().as_secs_f64();
+            if run == 0 {
+                // The first full shape pays workspace allocation and first-use kernels.
+                // Match the serving benchmark's untimed warm batch per shape.
+                println!("prefill warm-up: {n} tokens in {:.1} ms", 1e3 * elapsed);
+                allocator.release(fresh);
+                continue;
+            }
+            times.push(elapsed);
             // Diagnostics: the first prefill's last-row logits (FP32), e.g. to
             // compare pipelined and serial prefill.
             if let (Ok(path), Some(logits), 1) = (std::env::var("CUTEAFD_MIMO_BENCH_LOGITS"), last, times.len()) {
                 std::fs::write(&path, logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())
+                    .with_context(|| format!("writing {path}"))?;
+            }
+            if let (Ok(path), 1) = (std::env::var("CUTEAFD_MIMO_BENCH_KV"), times.len()) {
+                // Read both ranks only after the timed step. This gate includes every
+                // full-attention record and the SWA rows the next decode can read.
+                std::fs::write(&path, kv_rows(engine, &fresh, 0, n)?)
                     .with_context(|| format!("writing {path}"))?;
             }
             allocator.release(fresh);
@@ -791,6 +1410,11 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<
             drafter.put_taps(&taps)?;
             drafter.update(&(0..n).map(|r| dflash::ContextRow { tap_row: r, slot, position: at + r })
                 .collect::<Vec<_>>())?;
+            // This oracle queues consecutive updates without the serving loop's
+            // step drain. Finish the consumers before overwriting their taps,
+            // positions and ring-slot tables on the next chunk or sequence.
+            // SAFETY: the engine owns the drafter's stream and all its buffers.
+            unsafe { opened.library.cuda_stream_synchronize(engine.stream)? };
             at += n;
         }
         Ok(())
@@ -802,7 +1426,7 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<
         let anchor = tokens[position];
         let timer = Instant::now();
         let draft = drafter.draft(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
-            &engine.embedding, engine.weights.head.buffer.ptr)?.remove(0);
+            &engine.embedding, engine.head())?.remove(0);
         draft_seconds += timer.elapsed().as_secs_f64();
         let reference = &ref_tokens[index * drafts_per..][..drafts_per];
         exact += usize::from(draft.tokens == reference);
@@ -834,13 +1458,13 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<
     for slot in 1..drafter.slots {
         update(position.saturating_sub(dflash::RING), position, slot)?;
     }
-    for sequences in 1..=drafter.slots {
+    for sequences in 1..=drafter.max_batch_sequences() {
         let seqs: Vec<_> = (0..sequences).map(|slot| dflash::DraftSeq { slot, anchor: tokens[position], position, valid_from: 0 })
             .collect();
-        drafter.draft(&seqs, &engine.embedding, engine.weights.head.buffer.ptr)?;
+        drafter.draft(&seqs, &engine.embedding, engine.head())?;
         let timer = Instant::now();
         for _ in 0..10 {
-            drafter.draft(&seqs, &engine.embedding, engine.weights.head.buffer.ptr)?;
+            drafter.draft(&seqs, &engine.embedding, engine.head())?;
         }
         let per = timer.elapsed().as_secs_f64() * 1e2;
         let timer = Instant::now();
@@ -960,23 +1584,36 @@ fn prefill_digest(engine: &engine::MimoEngine<'_>, placement: &mut engine::MimoP
 /// SWA layers the ring rows still held), for byte comparison.
 fn kv_rows(engine: &engine::MimoEngine<'_>, placement: &engine::MimoPlacement, from: usize, to: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    for layer in 0..engine.weights.layers.len() {
-        let (attention, buffer, record) = engine.kv_layer(layer);
-        let first = match attention {
-            cuteafd_loader::families::mimo_v2::MimoAttention::Full => from,
-            cuteafd_loader::families::mimo_v2::MimoAttention::Sliding => from.max(to.saturating_sub(engine.cfg.window)),
-        };
-        for position in first..to {
-            let offset = match attention {
-                cuteafd_loader::families::mimo_v2::MimoAttention::Full => placement.slot(position)? as usize * record,
-                cuteafd_loader::families::mimo_v2::MimoAttention::Sliding => placement.ring_slot(position) as usize * record,
-            };
-            ensure!(offset + record <= buffer.bytes, "KV row outside its buffer");
-            let mut bytes = vec![0u8; record];
-            opened_copy(engine, &mut bytes, cuteafd_ffi::CuteafdDeviceBuffer {
-                ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes: record, ..buffer })?;
-            out.extend(bytes);
-        }
+    for rank in 0..engine.ranks() {
+        engine.on(rank, || {
+            // SAFETY: this engine owns the stream of the rank holding these records.
+            // Every head-split wait has its matching push queued before this gate.
+            unsafe { engine.library.cuda_stream_synchronize(engine.stream_of(rank))? };
+            for layer in 0..engine.weights.layers.len() {
+                let (attention, buffer, record) = engine.kv_layer_on(rank, layer);
+                let (mut position, run_rows) = match attention {
+                    cuteafd_loader::families::mimo_v2::MimoAttention::Full => (from, engine::PAGE_ROWS),
+                    cuteafd_loader::families::mimo_v2::MimoAttention::Sliding =>
+                        (from.max(to.saturating_sub(engine.cfg.window)), engine::RING_ROWS),
+                };
+                while position < to {
+                    // A page or ring run is contiguous even when logical pages are not.
+                    let rows = (to - position).min(run_rows - position % run_rows);
+                    let offset = match attention {
+                        cuteafd_loader::families::mimo_v2::MimoAttention::Full => placement.slot(position)? as usize * record,
+                        cuteafd_loader::families::mimo_v2::MimoAttention::Sliding => placement.ring_slot(position) as usize * record,
+                    };
+                    let bytes = rows * record;
+                    ensure!(offset + bytes <= buffer.bytes, "KV rows outside their buffer");
+                    let start = out.len();
+                    out.resize(start + bytes, 0);
+                    engine.library.copy_d2h(&mut out[start..], cuteafd_ffi::CuteafdDeviceBuffer {
+                        ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..buffer })?;
+                    position += rows;
+                }
+            }
+            Ok(())
+        })?;
     }
     Ok(out)
 }
@@ -1014,10 +1651,21 @@ fn resume_check(args: &GoldenArgs, engine: &engine::MimoEngine<'_>, tokens: &[u3
     // The restored rings (SWA and MTP hidden rows) read back exactly as the captured ones.
     family.capture(MarkSlot(1), &b, at).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mark = |slot: u32| -> Result<Vec<u8>> {
-        let range = family.mark_segments(MarkSlot(slot))[0];
-        let mut bytes = vec![0u8; range.bytes];
-        opened_copy(engine, &mut bytes, cuteafd_ffi::CuteafdDeviceBuffer { ptr: range.addr as *mut std::ffi::c_void,
-            bytes: range.bytes, ..engine.kv_layer(0).1 })?;
+        let ranges = family.mark_segments(MarkSlot(slot));
+        ensure!(ranges.len() == engine.ranks(), "a positional mark must cover every MiMo rank");
+        let mut bytes = Vec::with_capacity(family.mark_bytes());
+        for (rank, range) in ranges.into_iter().enumerate() {
+            let template = engine.kv_layer_on(rank, 0).1;
+            let start = bytes.len();
+            bytes.resize(start + range.bytes, 0);
+            crate::shared::memory::device::Device { library: engine.library, id: template.device_id }.run(|| {
+                // SAFETY: this rank owns the stream; retire its capture before reading its mark.
+                unsafe { engine.library.cuda_stream_synchronize(engine.stream_of(rank))?; }
+                engine.library.copy_d2h(&mut bytes[start..], cuteafd_ffi::CuteafdDeviceBuffer {
+                    ptr: range.addr as *mut std::ffi::c_void, bytes: range.bytes, ..template })
+            })?;
+        }
+        ensure!(bytes.len() == family.mark_bytes(), "positional mark byte coverage differs from its layout");
         Ok(bytes)
     };
     let mark_equal = mark(0)? == mark(1)?;
@@ -1055,7 +1703,7 @@ fn prefill_prompt(args: &GoldenArgs, engine: &engine::MimoEngine<'_>, allocator:
     let prompt = &tokens[..args.prefill.unwrap_or(tokens.len()).min(tokens.len())];
     let mut placement = allocator.admit(prompt.len() + extra + engine::DECODE_ROWS)?;
     let mut last = None;
-    for chunk in prompt.chunks(engine.prefill_rows) {
+    for chunk in prompt.chunks(engine.prefill_capacity()) {
         last = engine.prefill_device(&mut placement, chunk, false, None, None)?;
     }
     let last = last.context("the check needs every layer")?.row_host(engine.library, 0)?;

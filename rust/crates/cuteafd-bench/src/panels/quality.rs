@@ -414,43 +414,72 @@ pub fn extract_code(text: &str) -> String {
     text.to_string()
 }
 
-/// Runs `code` + `tests` in a throwaway directory with a 10 s limit, 4 GiB of
-/// address space, an empty environment (no inherited secrets) and isolated
-/// Python (`-I`); without a network namespace where unprivileged user
-/// namespaces allow one (containers usually do not). Returns (passed, sandbox
-/// description, output tail).
+#[derive(Clone, Copy)]
+enum PythonSandbox {
+    UserNamespaces,
+    Bubblewrap,
+}
+
+impl PythonSandbox {
+    fn command(self, dir: &std::path::Path) -> std::process::Command {
+        // The outer timeout also bounds namespace setup. Exiting PID 1 reaps
+        // the namespace's processes; the supervisor kills PID 1 if it dies.
+        let mut command = std::process::Command::new("timeout");
+        command.args(["-s", "KILL", "10"]);
+        match self {
+            Self::UserNamespaces => {
+                command.args(["unshare", "-rnpf", "--kill-child", "--"]);
+            }
+            Self::Bubblewrap => {
+                command.args(["bwrap", "--unshare-user", "--unshare-net", "--unshare-pid",
+                    "--die-with-parent", "--new-session", "--ro-bind", "/", "/", "--bind"]);
+                command.arg(dir).arg(dir).args(["--proc", "/proc", "--"]);
+            }
+        }
+        command.current_dir(dir).env_clear().env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("HOME", dir).stdin(std::process::Stdio::null());
+        command
+    }
+}
+
+fn python_sandbox() -> Option<PythonSandbox> {
+    // Probe with trusted code before executing any model output. Never infer
+    // a setup failure from stderr written by the generated Python program.
+    [PythonSandbox::UserNamespaces, PythonSandbox::Bubblewrap].into_iter()
+        .find(|backend| backend.command(&std::env::temp_dir()).args(["python3", "-I", "-c", "pass"])
+            .output().is_ok_and(|output| output.status.success()))
+}
+
+/// Runs `code` + `tests` in private network/PID namespaces, a throwaway
+/// directory, an empty environment, isolated Python, 10 s and 4 GiB limits.
+/// If isolation cannot be established, generated code is never executed.
 pub fn run_python(code: &str, tests: &str) -> (bool, &'static str, String) {
+    run_python_isolated(code, tests, python_sandbox())
+}
+
+fn run_python_isolated(code: &str, tests: &str, backend: Option<PythonSandbox>)
+    -> (bool, &'static str, String)
+{
+    let Some(backend) = backend else {
+        return (false, "unavailable", "network isolation is unavailable; code was not executed".into());
+    };
     let Ok(dir) = tempdir() else { return (false, "none", "no temporary directory".into()) };
     let file = dir.join("solution.py");
     if std::fs::write(&file, format!("{code}\n\n{tests}\nprint('PASS')\n")).is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
         return (false, "none", "write failed".into());
     }
-    let attempt = |isolate: bool| {
-        let script = "ulimit -v 4194304; exec timeout -s KILL 10 python3 -I \"$0\"";
-        let mut command = if isolate {
-            let mut c = std::process::Command::new("unshare");
-            c.args(["-rn", "sh", "-c", script]);
-            c
-        } else {
-            let mut c = std::process::Command::new("sh");
-            c.args(["-c", script]);
-            c
-        };
-        command.arg(&file).current_dir(&dir).env_clear().env("PATH", "/usr/local/bin:/usr/bin:/bin")
-            .env("HOME", &dir).stdin(std::process::Stdio::null()).output()
-    };
-    let (output, sandbox) = match attempt(true) {
-        Ok(o) if !String::from_utf8_lossy(&o.stderr).contains("unshare:") =>
-            (o, "no network · 10 s · 4 GiB · empty env · temp dir"),
-        _ => match attempt(false) {
-            Ok(o) => (o, "network NOT isolated (no user namespaces here) · 10 s · 4 GiB · empty env · temp dir"),
-            Err(e) => return (false, "none", format!("python3: {e}")),
-        },
-    };
+    let output = backend.command(&dir).args(["sh", "-c",
+        "ulimit -v 4194304; exec python3 -I \"$1\"", "sandbox"]).arg(&file).output();
     let _ = std::fs::remove_dir_all(&dir);
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => return (false, "unavailable", format!("sandbox: {error}")),
+    };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let tail: String = String::from_utf8_lossy(&output.stderr).lines().rev().take(2).collect::<Vec<_>>().join(" | ");
-    (output.status.success() && stdout.contains("PASS"), sandbox, tail)
+    (output.status.success() && stdout.lines().last() == Some("PASS"),
+        "no network · private PIDs · 10 s · 4 GiB · empty env · temp dir", tail)
 }
 
 fn tempdir() -> std::io::Result<std::path::PathBuf> {
@@ -464,11 +493,15 @@ impl Panel for Code {
     fn title(&self) -> &'static str { "Code pass@1" }
     fn description(&self) -> &'static str {
         "Twelve Python functions written with the server's default thinking and tested in a throwaway subprocess \
-         sandbox (no network namespace where available)."
+         sandbox with private network and process namespaces."
     }
     fn unavailable(&self, _info: &ServerInfo) -> Option<String> {
         let ok = std::process::Command::new("python3").arg("--version").output().is_ok_and(|o| o.status.success());
-        (!ok).then(|| "python3 is not available to run the tests".to_string())
+        if !ok {
+            return Some("python3 is not available to run the tests".into());
+        }
+        python_sandbox().is_none().then(||
+            "network isolation is unavailable; code will not be executed".into())
     }
     fn estimate_s(&self, rates: &Rates, _info: &ServerInfo) -> f64 {
         3.0 * rates.seconds(200.0, 1200.0) * 1.2 + 6.0
@@ -532,12 +565,38 @@ mod tests {
 
     #[test]
     fn reference_solutions_pass_in_the_sandbox() {
-        if std::process::Command::new("python3").arg("--version").output().is_err() {
+        if python_sandbox().is_none() {
             return;
         }
         let (ok, _, tail) = run_python("def rle(s):\n    out=''\n    i=0\n    while i<len(s):\n        j=i\n        while j<len(s) and s[j]==s[i]: j+=1\n        out+=s[i]+str(j-i)\n        i=j\n    return out", PROBLEMS[8].2);
         assert!(ok, "{tail}");
         let (bad, _, _) = run_python("def rle(s): return s", PROBLEMS[8].2);
         assert!(!bad);
+    }
+
+    #[test]
+    fn code_is_not_executed_without_network_isolation() {
+        let (passed, sandbox, note) = run_python_isolated("raise RuntimeError('executed')", "", None);
+        assert!(!passed);
+        assert_eq!(sandbox, "unavailable");
+        assert!(note.contains("code was not executed"));
+    }
+
+    #[test]
+    fn sandbox_cannot_connect_to_the_hosts_loopback() {
+        let Some(backend) = python_sandbox() else { return };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let code = format!("import socket\ns = socket.socket()\ns.settimeout(0.2)\nassert s.connect_ex(('127.0.0.1', {port})) != 0");
+        let (passed, _, note) = run_python_isolated(&code, "", Some(backend));
+        assert!(passed, "{note}");
+    }
+
+    #[test]
+    fn program_stderr_cannot_trigger_an_unisolated_retry() {
+        let Some(backend) = python_sandbox() else { return };
+        let code = "import sys\nfrom pathlib import Path\np = Path('ran-once')\nassert not p.exists()\np.write_text('1')\nprint('unshare: model output', file=sys.stderr)";
+        let (passed, _, note) = run_python_isolated(code, "", Some(backend));
+        assert!(passed, "{note}");
     }
 }

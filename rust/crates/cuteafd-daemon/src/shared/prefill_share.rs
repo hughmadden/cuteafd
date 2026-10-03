@@ -121,6 +121,44 @@ impl<P> PrefillQueue<P> {
         out
     }
 
+    /// Opt-in adjacent pairing. The oldest prompt always runs; its immediate
+    /// neighbour joins only when `eligible` accepts both. `chunk` receives one
+    /// or two prompts and returns their independent outcomes (the second is
+    /// ignored for a singleton). No prompt is pulled past an ineligible one.
+    /// A pair consumes one elapsed-time budget, with one chunk per member.
+    pub fn round_pairs(&mut self, eligible: impl Fn(&P, &P) -> bool,
+        mut chunk: impl FnMut(&mut [P]) -> [Result<Chunk>; 2]) -> Vec<(P, Result<()>)> {
+        let started = Instant::now();
+        let whole = self.share == 0.0;
+        let mut out = Vec::new();
+        let mut ran = VecDeque::new();
+        let mut steps = 0;
+        while !self.waiting.is_empty() {
+            if !whole && steps > 0 && started.elapsed().as_secs_f64() >= self.round_s { break; }
+            let mut batch = vec![self.waiting.pop_front().expect("nonempty prefill queue")];
+            if self.waiting.front().is_some_and(|next| eligible(&batch[0], next)) {
+                batch.push(self.waiting.pop_front().expect("eligible adjacent prompt"));
+            }
+            let outcomes = chunk(&mut batch);
+            let mut unfinished = Vec::new();
+            for (prompt, outcome) in batch.into_iter().zip(outcomes) {
+                match outcome {
+                    Ok(Chunk::Done) => out.push((prompt, Ok(()))),
+                    Ok(Chunk::More) if whole => unfinished.push(prompt),
+                    Ok(Chunk::More) => ran.push_back(prompt),
+                    Err(error) => out.push((prompt, Err(error))),
+                }
+            }
+            // Share zero finishes the oldest requests before admitting another
+            // chunk group. Positive share rotates them behind unserved prompts.
+            for prompt in unfinished.into_iter().rev() { self.waiting.push_front(prompt); }
+            steps += 1;
+        }
+        self.waiting.extend(ran);
+        self.last_round = started.elapsed().as_secs_f64();
+        out
+    }
+
     /// After a round: the running requests are owed their share of its time
     /// while prompts still wait.
     pub fn settle(&mut self, decoding: bool) {
@@ -237,5 +275,105 @@ mod tests {
         run(&mut queue, &mut log, 0);
         // Prompt 1 did not run last round, so it goes first.
         assert_eq!(log, vec![0, 1, 0]);
+    }
+
+    fn pair_step(batch: &mut [Prompt], log: &mut Vec<Vec<usize>>) -> [Result<Chunk>; 2] {
+        log.push(batch.iter().map(|p| p.id).collect());
+        let mut outcomes = [Ok(Chunk::Done), Ok(Chunk::Done)];
+        for (p, out) in batch.iter_mut().zip(&mut outcomes) {
+            p.left -= 1;
+            *out = Ok(if p.left == 0 { Chunk::Done } else { Chunk::More });
+        }
+        outcomes
+    }
+
+    #[test]
+    fn pairs_rotate_after_unserved_requests_and_owe_one_round() {
+        let mut queue = PrefillQueue::new(0.2);
+        queue.round_s = 0.0; // One batch per round, without timing sleeps.
+        for id in 0..4 { queue.push(Prompt { id, left: 2 }); }
+        let mut log = Vec::new();
+        assert!(queue.round_pairs(|_, _| true, |batch| pair_step(batch, &mut log)).is_empty());
+        assert_eq!(log, [vec![0, 1]]);
+        assert_eq!(queue.waiting.iter().map(|p| p.id).collect::<Vec<_>>(), [2, 3, 0, 1]);
+        let elapsed = queue.last_round;
+        queue.settle(true);
+        assert_eq!(queue.owed, elapsed * 0.2 / 0.8);
+        assert!(!queue.due(true));
+        queue.stepped(queue.owed);
+        assert!(queue.due(true));
+        queue.round_pairs(|_, _| true, |batch| pair_step(batch, &mut log));
+        assert_eq!(log, [vec![0, 1], vec![2, 3]]);
+    }
+
+    #[test]
+    fn pairing_never_skips_an_ineligible_adjacent_request() {
+        let mut queue = PrefillQueue::new(0.2);
+        for id in 0..4 { queue.push(Prompt { id, left: 1 }); }
+        let mut log = Vec::new();
+        let finished = queue.round_pairs(|a, b| a.id != 1 && b.id != 1,
+            |batch| pair_step(batch, &mut log));
+        assert_eq!(log, [vec![0], vec![1], vec![2, 3]]);
+        assert_eq!(finished.into_iter().map(|(p, result)| { result.unwrap(); p.id }).collect::<Vec<_>>(), [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn paired_failure_does_not_discard_healthy_neighbour_or_repeat_chunk() {
+        let mut queue = PrefillQueue::new(0.2);
+        queue.push(Prompt { id: 0, left: 2 });
+        queue.push(Prompt { id: 1, left: 2 });
+        let mut log = Vec::new();
+        let finished = queue.round_pairs(|_, _| true, |batch| {
+            let mut out = pair_step(batch, &mut log);
+            out[0] = Err(anyhow::anyhow!("client cancelled"));
+            out
+        });
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].0.id, 0);
+        assert!(finished[0].1.is_err());
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.waiting[0].id, 1);
+        assert_eq!(queue.waiting[0].left, 1);
+        let finished = queue.round_pairs(|_, _| true, |batch| pair_step(batch, &mut log));
+        assert_eq!(finished[0].0.id, 1);
+        assert!(finished[0].1.is_ok());
+        assert_eq!(log, [vec![0, 1], vec![1]]);
+    }
+
+    #[test]
+    fn zero_share_finishes_oldest_pair_before_later_requests() {
+        let mut queue = PrefillQueue::new(0.0);
+        for id in 0..3 { queue.push(Prompt { id, left: if id == 2 { 1 } else { 2 } }); }
+        let mut log = Vec::new();
+        let finished = queue.round_pairs(|_, _| true, |batch| pair_step(batch, &mut log));
+        assert_eq!(log, [vec![0, 1], vec![0, 1], vec![2]]);
+        assert_eq!(finished.len(), 3);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn ineligible_pairs_match_original_singleton_rounds() {
+        for share in [0.0, 0.2] {
+            let mut serial = PrefillQueue::new(share);
+            let mut paired = PrefillQueue::new(share);
+            serial.round_s = 0.0;
+            paired.round_s = 0.0;
+            for id in 0..4 {
+                serial.push(Prompt { id, left: id + 1 });
+                paired.push(Prompt { id, left: id + 1 });
+            }
+            while !serial.is_empty() {
+                let mut serial_log = Vec::new();
+                let serial_done = run(&mut serial, &mut serial_log, 0);
+                let mut pair_log = Vec::new();
+                let pair_done = paired.round_pairs(|_, _| false, |batch| pair_step(batch, &mut pair_log))
+                    .into_iter().map(|(p, result)| { result.unwrap(); p.id }).collect::<Vec<_>>();
+                assert_eq!(pair_log.into_iter().flatten().collect::<Vec<_>>(), serial_log);
+                assert_eq!(pair_done, serial_done);
+                assert_eq!(paired.waiting.iter().map(|p| (p.id, p.left)).collect::<Vec<_>>(),
+                    serial.waiting.iter().map(|p| (p.id, p.left)).collect::<Vec<_>>());
+            }
+            assert!(paired.is_empty());
+        }
     }
 }

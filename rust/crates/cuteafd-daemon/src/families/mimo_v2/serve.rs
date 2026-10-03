@@ -1,6 +1,6 @@
 //! OpenAI-compatible API over the MiMo V2 engine: continuous batching with
-//! one prefill per admitted request and one decode-shaped step for every
-//! active sequence, verifying copy-window drafts.
+//! independent prefill chunks paired when their existing single-lane shapes
+//! fit, and one decode-shaped step for every active sequence, verifying drafts.
 //!
 //! MiMo keeps no recurrent state: full layers write paged records and SWA
 //! layers a 256-slot ring that outlives the 128-token window by more than a
@@ -20,6 +20,7 @@ use super::dflash::{ContextRow, DraftSeq};
 use super::mtp::MtpSeq;
 use super::engine::{MimoEngine, MimoPlacement, DECODE_ROWS};
 use super::prefix::MimoPrefix;
+use super::serve_failures::FailureRecipients;
 use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
 use cuteafd_engine::prefix::{After, MarkArena, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
 use crate::families::glm5::dflash_policy::{self, CycleCost, DraftHistory, Group, Shape};
@@ -90,6 +91,8 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     engine_args.rings = engine_args.rings.max(args.max_sequences);
     let (worker_stats, max_sequences) = (stats.clone(), args.max_sequences);
     engine_args.draft_sequences = engine_args.draft_sequences.max(args.max_sequences);
+    engine_args.draft_context_slots = Some(engine_args.draft_context_slots.unwrap_or(engine_args.draft_sequences)
+        .max(engine_args.rings));
     let draft = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed,
         decode_share: args.decode_share };
     let prefix = args.prefix.clone();
@@ -172,7 +175,8 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         }
     };
     let mut ready = Some(ready);
-    let result = opened.with_engine(&args, |engine| {
+    let result = opened.with_engine_reserved(&args, Some((&prefix, max_sequences)),
+        cuteafd_loader::families::mimo_v2::MimoPrefillOutput::LastRow, |engine, host_config| {
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-mimo needs every layer");
         anyhow::ensure!(engine.has_experts(), "serve-mimo needs --peers (or --local-experts) for the routed experts");
         let spark = args.peers.is_some() && !args.local_experts;
@@ -189,7 +193,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
             let _ = ready.send(Ok(()));
         }
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), draft, &prefix,
-            args.token_io.token_select)
+            args.token_io.token_select, host_config)
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
@@ -210,6 +214,7 @@ struct Prefill<'a> {
     plan: cuteafd_engine::prefix::PointPlan,
     /// Chunks prefilled so far.
     chunks: usize,
+    paired_chunks: usize,
     /// The client left mid-prefill: its prefilled rows are parked as a prompt snapshot.
     cancelled: bool,
     placement: super::engine::MimoPlacement,
@@ -235,8 +240,9 @@ struct Active<'a> {
     slot: Option<usize>,
     /// Recent DFlash (proposed, accepted) outcomes for the adaptive plan.
     drafts: DraftHistory,
-    /// Steps, DFlash drafts verified / accepted, copy drafts verified / accepted.
-    counts: [usize; 5],
+    /// Steps, neural drafts verified / accepted, copy drafts verified / accepted,
+    /// and actual neural-drafter calls for this request.
+    counts: [usize; 6],
     /// Current copy-draft length (halved after a fully rejected draft,
     /// doubled after a fully accepted one) and steps left before drafting
     /// resumes once it reached zero.
@@ -326,31 +332,34 @@ impl Active<'_> {
 }
 
 /// The prefix cache over `engine` (always present: with zero entries it is the page allocator).
-fn prefix_cache<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs)
+pub(super) fn prefix_cache<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs, concurrency: usize)
+    -> Result<(MimoPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
+    prefix_cache_with(engine, args, concurrency, |layout| args.host_config(layout, engine.max_context))
+}
+
+fn prefix_cache_with<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs, concurrency: usize,
+    host_config: impl FnOnce(cuteafd_engine::prefix::FamilyLayout)
+        -> Result<Option<cuteafd_hostcache::config::Config>>)
     -> Result<(MimoPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
     let entries = args.prefix_cache_entries;
-    let budget = args.prefix_cache_mark_mib << 20;
-    let family = MimoPrefix::new(engine, |mark| if entries == 0 { 0 } else { MarkArena::slots_for(1, entries, mark, budget) },
+    let budget = args.prefix_cache_mark_mib.checked_mul(1 << 20).context("MiMo mark budget overflows")?;
+    let family = MimoPrefix::new(engine, |mark| MarkArena::slots_for(concurrency, entries, mark, budget),
         args.prefix_partial == Toggle::On)?;
-    // The pinned host tier copies through one GPU's copy engine; a head split's
-    // pages and marks live on two GPUs, so it keeps device-resident snapshots only.
-    let host = if engine.ranks() > 1 {
-        if args.host_cache_bytes > 0 && entries > 0 {
-            tracing::warn!("MiMo head split: the prefix cache's host tier is off (device-resident snapshots only)");
-        }
-        None
-    } else {
-        args.host_tier(engine.library, engine.kv_layer(0).1, family.mark_bytes())?
-    };
     let layout = family.layout();
+    // Serving consumes the quota resolved before loading; diagnostics may
+    // resolve it here. Register all pools/mark arenas on their actual GPUs.
+    let host = host_config(layout)?.map(|config| {
+        CudaCopyEngine::registered_owned(engine.library, family.host_owners()).map(|copy| (config, copy))
+    }).transpose()?;
+    let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let config = PrefixConfig { entries, mark_slots: family.slots(), keep_logits: true,
         min_tokens: args.prefix_cache_min_tokens };
     let cache = PrefixCache::new(layout, config, host)?;
     tracing::info!(entries, mark_slots = family.slots(), mark_bytes = family.mark_bytes(), page_bytes = layout.page_bytes,
-        pages = layout.pages, host_bytes = args.host_cache_bytes, rule = ?layout.rule, points = ?args.points(),
+        pages = layout.pages, host_bytes, rule = ?layout.rule, points = ?args.points(),
         reach = family.capture_reach(), "MiMo prefix cache");
     cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64,
-        &format!("{:?} full + BF16 SWA rings", engine.kv_cache()), if args.prefix_cache_entries == 0 { 0 } else { args.host_cache_bytes });
+        &format!("{:?} full + BF16 SWA rings", engine.kv_cache()), host_bytes);
     Ok((family, cache))
 }
 
@@ -367,13 +376,25 @@ fn release(family: &MimoPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'
 #[allow(clippy::too_many_arguments)]
 fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
-    policy: Policy, prefix: &PrefixArgs, select: SelectPlacement) -> Result<()> {
+    policy: Policy, prefix: &PrefixArgs, select: SelectPlacement,
+    host_config: Option<cuteafd_hostcache::config::Config>) -> Result<()> {
+    let mut owners = super::serving_owners::ServingOwners::new(engine);
+    let (family, cache) = prefix_cache_with(engine, prefix, max_sequences, |_| Ok(host_config))?;
+    owners.prefix(family, cache);
+    owners.selector(TokenSelector::new(engine.library, select, engine.cfg.vocab_size, DECODE_ROWS)?);
+    schedule_inner(engine, opened, snapshot, receive, stats, max_sequences, policy, prefix, &mut owners)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
+    receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
+    policy: Policy, prefix: &PrefixArgs, owners: &mut super::serving_owners::ServingOwners<'_, '_>) -> Result<()> {
     let draft = policy.copy;
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
     let mut cost = dflash_policy::step_cost(&PRO_TP6_STEP_MS, DECODE_ROWS);
     let mut skip = crate::families::glm5::dflash_policy::DraftSkip::default();
-    let (family, mut cache) = prefix_cache(engine, prefix)?;
+    let (family, cache, selector) = owners.parts();
     // Messages start with `<|im_start|>`: a snapshot right before one is a message boundary.
     let message_start = *QwenEncoding::from_snapshot(snapshot)?.tokens().turn_markers.first()
         .context("the chat template names no message-start token")?;
@@ -381,7 +402,6 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let mut grammars = crate::shared::constraints::Compiler::with_vocab(
         &opened.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, QwenEncoding::from_snapshot(snapshot)?.tokens().eos.clone());
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
-    let mut selector = TokenSelector::new(&opened.library, select, engine.cfg.vocab_size, DECODE_ROWS)?;
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
     // Verify steps since the last completed request, and host seconds in
@@ -389,23 +409,35 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let mut steps = 0u64;
     let (mut verify_s, mut draft_s, mut emit_s) = (0f64, 0f64, 0f64);
     let mut prefills = policy.decode_share.queue::<Prefill<'_>>()?;
-    loop {
+    let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<NativeRequest>::default();
+    let mut failures = FailureRecipients::default();
+    // Keep admitted request owners alive until a fatal cause has reached every
+    // affected client, including requests waiting for prefill or KV admission.
+    let result = (|| -> Result<()> { loop {
         while active.len() + prefills.len() < max_sequences {
-            let job = if active.is_empty() && prefills.is_empty() {
-                // Idle: publish the state the server waits in (captures and releases done).
-                cache.tick();
-                publish(stats, requests, generated_total, 0, 0, &cache);
-                console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
-                match receive.blocking_recv() {
-                    Some(job) => job,
-                    None => return Ok(()),
-                }
-            } else {
-                match receive.try_recv() {
-                    Ok(job) => job,
-                    Err(_) => break,
-                }
+            let busy = !active.is_empty() || !prefills.is_empty();
+            let job = match kv_waiter.poll(cache.pool().free(), cache.pool().release_epoch(), busy, |job| job.events.is_closed()) {
+                cuteafd_engine::prefix::AdmissionPoll::Blocked => break,
+                cuteafd_engine::prefix::AdmissionPoll::Ready(job) => job,
+                cuteafd_engine::prefix::AdmissionPoll::Empty => {
+                    if !busy {
+                        // Idle: publish the state the server waits in (captures and releases done).
+                        cache.tick();
+                        publish(stats, requests, generated_total, 0, 0, cache);
+                        console::gauges_now(|| console::Gauges::prefix_cache(cache, 0, 0, 0));
+                        match receive.blocking_recv() {
+                            Some(job) => job,
+                            None => return Ok(()),
+                        }
+                    } else {
+                        match receive.try_recv() {
+                            Ok(job) => job,
+                            Err(_) => break,
+                        }
+                    }
+                },
             };
+            failures.watch(&job.events);
             let reject = |job: &NativeRequest, message: String| {
                 let _ = job.events.send(Err(NativeFailure::BadRequest(message)));
             };
@@ -416,7 +448,13 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     continue;
                 }
             };
-            let tokens = probe::prompt_ids(&job.probe, || Ok(tokenizer.encode_text(&job.prompt, false)?.token_ids))?;
+            let tokens = match probe::prompt_ids(&job.probe, || Ok(tokenizer.encode_text(&job.prompt, false)?.token_ids)) {
+                Ok(tokens) => tokens,
+                Err(error) => {
+                    let _ = job.events.send(Err(NativeFailure::Worker(format!("prompt tokenization: {error:#}"))));
+                    continue;
+                }
+            };
             let cold = probe::cold(&job.probe);
             if tokens.is_empty() || tokens.len() >= engine.max_context {
                 reject(&job, format!("prompt of {} tokens is outside 1..{}", tokens.len(), engine.max_context));
@@ -427,18 +465,26 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 reject(&job, "SWA rings exhausted".into());
                 continue;
             };
-            let slot = free_slots.pop();
+            // Disabled neural drafts need neither a ring slot nor context updates.
+            let slot = if probe::no_speculation(&job.probe) || policy.fixed == Some(0) {
+                None
+            } else { free_slots.pop() };
             cache.tick();
             let admit_started = Instant::now();
             // Lookup, fork of the retained pages and restore of the mark (byte-exact).
             let lookup: &[u32] = if cold { &[] } else { &tokens };
-            let admitted = match cache.admit(&family, lookup, capacity, true,
+            let admitted = match cache.admit(family, lookup, capacity, true,
                 |pages| MimoPlacement { pages, ring, len: 0 }) {
                 Ok(admitted) => admitted,
                 Err(error) => {
                     free_rings.push(ring);
                     free_slots.extend(slot);
-                    reject(&job, format!("{error:#}"));
+                    // Running requests keep their pages pinned. Delay a request
+                    // that fits alone instead of rejecting transient KV pressure.
+                    match kv_waiter.defer(job, &error, busy, cache.pool().release_epoch()) {
+                        Ok(()) => break,
+                        Err(job) => reject(&job, format!("{error:#}")),
+                    }
                     continue;
                 }
             };
@@ -458,9 +504,12 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         .context("scoring needs every layer"));
                 match scored {
                     Ok(_) => { let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })); }
-                    Err(error) => { let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}")))); }
+                    Err(error) => {
+                        let _ = job.events.send(Err(NativeFailure::Worker(format!("scoring: {error:#}"))));
+                        if engine.is_terminal() { return Err(error); }
+                    }
                 }
-                release(&family, &mut cache, &mut free_rings, &mut free_slots, &placement, slot);
+                release(family, cache, &mut free_rings, &mut free_slots, &placement, slot);
                 continue;
             }
             let ticket = console::admit(tokens.len(), resume, job.max_tokens, constraint.is_some(), job.images.len(),
@@ -481,63 +530,32 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             // A whole-prompt hit brings its first token's logits: nothing to prefill.
             let logits = admitted.after.and_then(|after| after.logits).map(|logits| logits.to_vec());
             let plan = if logits.is_some() { cuteafd_engine::prefix::PointPlan::default() } else { plan };
-            prefills.push(Prefill { job, constraint, tokens, done: resume, resume, plan, chunks: 0, cancelled: false,
+            prefills.push(Prefill { job, constraint, tokens, done: resume, resume, plan, chunks: 0, paired_chunks: 0, cancelled: false,
                 placement: admitted.placement, capacity, slot, logits, first: None, started: Instant::now(), busy: 0.0,
                 phases: [0.0; 2], ticket });
         }
         if prefills.due(!active.is_empty()) {
             // One chunk of each waiting prompt (whole prompts with --decode-share 0).
-            let finished = prefills.round(|p| {
-                if p.done == p.tokens.len() {
-                    return Ok(Chunk::Done);
-                }
-                if p.job.events.is_closed() {
-                    p.cancelled = true;
-                    anyhow::bail!("client went away");
-                }
-                let timer = Instant::now();
-                let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
-                let chunk = &p.tokens[p.done..end];
-                let retain = cache.enabled() && !probe::cold(&p.job.probe);
-                let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
-                    let start = p.placement.len;
-                    let logits = engine.prefill_device(&mut p.placement, chunk, false, None, None)?;
-                    if end == p.tokens.len() {
-                        // The first token, while this prompt's logits are the workspace's.
-                        let logits = logits.context("prefill produced no logits")?;
-                        let mut batch = SelectBatch::default();
-                        batch.push_next(p.job.sampling, p.constraint.as_mut(), p.placement.len as u64)?;
-                        let selected = selector.select(&logits, &batch)?;
-                        p.first = Some(take(p.constraint.as_mut(), &selected[0])?);
-                        // The prompt snapshot's row (one row, only when snapshots are kept).
-                        p.logits = if retain { Some(logits.row_host(engine.library, 0)?) } else { None };
-                        if probe::wants_first(&p.job.probe) {
-                            probe::device_rows(engine.library, &p.job.probe, &logits, 0, 1, p.tokens.len())?;
-                        }
-                    }
-                    // The chunk's tapped tail becomes the drafter's context.
-                    if let (Some(drafter), Some(slot)) = (drafter, p.slot) {
-                        let n = chunk.len().min(super::dflash::TAP_ROWS);
-                        drafter.update(&(0..n).map(|r| ContextRow { tap_row: r, slot,
-                            position: start + chunk.len() - n + r }).collect::<Vec<_>>())?;
-                    }
-                    Ok(())
-                });
-                p.done += chunk.len();
-                add_phases(&mut p.phases, phases);
-                p.busy += timer.elapsed().as_secs_f64();
-                p.ticket.prefill(chunk.len(), p.chunks, p.plan.chunks.len(), timer);
-                result?;
-                // Intermediate snapshot points this chunk reaches (off unless configured).
-                for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
-                    if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, &p.tokens[..point], &p.placement,
-                        After::default()) {
-                        tracing::warn!("snapshot point {point} not retained: {error:#}");
+            let finished = prefills.round_pairs(|a, b| {
+                let rows = [a, b].map(|p| p.plan.chunks.get(p.chunks).copied()
+                    .unwrap_or(p.tokens.len()).saturating_sub(p.done));
+                engine.can_prefill_pair(rows) && !a.job.events.is_closed() && !b.job.events.is_closed()
+            }, |batch| prefill_batch(engine, family, cache, selector, batch));
+            if engine.is_terminal() {
+                let mut primary = None;
+                let mut affected = Vec::new();
+                for (p, prefilled) in finished {
+                    affected.push(p);
+                    if let Err(error) = prefilled {
+                        if primary.is_none() { primary = Some(error); }
                     }
                 }
-                p.chunks += 1;
-                Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
-            });
+                let error = primary.unwrap_or_else(|| engine.terminal_error());
+                for p in affected {
+                    let _ = p.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                }
+                return Err(error);
+            }
             for (mut p, prefilled) in finished {
                 let (slot, placement, resume) = (p.slot, p.placement.clone(), p.resume);
                 if let Err(error) = &prefilled {
@@ -545,7 +563,7 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         p.ticket.cancel();
                         // The client left during the prefill: keep what it computed for a retry.
                         if placement.len > resume && !probe::cold(&p.job.probe) {
-                            if let Err(error) = cache.park(&family, &p.tokens[..placement.len], &placement) {
+                            if let Err(error) = cache.park(family, &p.tokens[..placement.len], &placement) {
                                 tracing::warn!("parking a cancelled prefill: {error:#}");
                             }
                         }
@@ -553,17 +571,18 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         tracing::warn!("prefill failed: {error:#}");
                         let _ = p.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                     }
-                    release(&family, &mut cache, &mut free_rings, &mut free_slots, &placement, slot);
+                    release(family, cache, &mut free_rings, &mut free_slots, &placement, slot);
                     continue;
                 }
                 if p.first.is_none() && p.logits.is_none() {
                     tracing::warn!("prefill produced no logits");
-                    release(&family, &mut cache, &mut free_rings, &mut free_slots, &placement, slot);
+                    release(family, cache, &mut free_rings, &mut free_slots, &placement, slot);
                     continue;
                 }
                 let logits = p.logits.clone();
                 if resume < p.tokens.len() {
                     tracing::info!(tokens = p.tokens.len(), cached = resume,
+                        paired_chunks = p.paired_chunks,
                         elapsed_ms = p.started.elapsed().as_millis() as u64, busy_ms = (1e3 * p.busy) as u64,
                         tok_s = (p.tokens.len() - resume) as f64 / p.busy, gpu_wait_ms = (1e3 * p.phases[0]) as u64,
                         experts_ms = (1e3 * p.phases[1]) as u64, "prefill");
@@ -573,17 +592,20 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 let retain_prompt = |cache: &mut PrefixCache<CudaCopyEngine<'_>>, placement: &MimoPlacement| {
                     if let Some(prompt) = &prompt {
                         let after = logits.as_deref().map_or_else(After::default, |l| After::from_logits(l, true));
-                        if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, prompt, placement, after) {
+                        if let Err(error) = cache.capture(family, SnapshotKind::Prompt, prompt, placement, after) {
                             tracing::warn!("prompt snapshot not retained: {error:#}");
                         }
                     }
                 };
                 engine.mtp_reset(p.placement.ring as usize, p.placement.len);
+                // Construction can fail after moving the request into its active
+                // state. Keep its event sender until that error is reported.
+                let admission_events = p.job.events.clone();
                 let admitted = (|| -> Result<Active<'_>> {
                     let mut request = Active {
                         slot,
                         drafts: DraftHistory::default(),
-                        counts: [0; 5],
+                        counts: [0; 6],
                         history: p.tokens,
                         draft_limit: draft,
                         draft_pause: 0,
@@ -608,22 +630,28 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     Ok(mut request) => {
                         let token = request.next;
                         let emitted = request.emit(token);
+                        if let Err(error) = &emitted {
+                            let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                        }
                         request.ticket.first(token);
-                        retain_prompt(&mut cache, &request.placement);
+                        retain_prompt(cache, &request.placement);
                         match emitted {
                             Ok(false) => active.push(request),
                             // Finished at its first token: its turn is its prompt snapshot.
                             Ok(true) | Err(_) => {
+                                failures.finished(&request.job.events);
                                 request.ticket.done(request.generated);
-                                release(&family, &mut cache, &mut free_rings, &mut free_slots, &request.placement,
+                                release(family, cache, &mut free_rings, &mut free_slots, &request.placement,
                                     request.slot)
                             }
                         }
                     }
                     Err(error) => {
                         tracing::warn!("admission failed: {error:#}");
-                        retain_prompt(&mut cache, &placement);
-                        release(&family, &mut cache, &mut free_rings, &mut free_slots, &placement, slot);
+                        let _ = admission_events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                        if engine.is_terminal() { return Err(error); }
+                        retain_prompt(cache, &placement);
+                        release(family, cache, &mut free_rings, &mut free_slots, &placement, slot);
                     }
                 }
             }
@@ -643,14 +671,17 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         // DFlash drafts after every next token (sequences with a ring slot),
         // then the adaptive plan's counts.
         let drafted: Vec<Option<super::dflash::Draft>> = match drafter {
-            Some(drafter) if skip.drafts() && active.iter().any(|a| a.slot.is_some()) => {
+            Some(drafter) if skip.drafts() && active.iter().enumerate().any(|(i, a)| a.slot.is_some() && limits[i] > 0) => {
                 let seqs: Vec<(usize, DraftSeq)> = active.iter().enumerate()
-                    .filter_map(|(i, a)| a.slot.map(|slot| (i, DraftSeq { slot, anchor: a.next, position: a.placement.len,
+                    .filter_map(|(i, a)| a.slot.filter(|_| limits[i] > 0).map(|slot| (i, DraftSeq { slot, anchor: a.next, position: a.placement.len,
                         valid_from: a.draft_from })))
                     .collect();
+                for &(i, _) in &seqs {
+                    active[i].counts[5] += 1;
+                }
                 let timer = Instant::now();
-                let drafts = drafter.draft(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
-                    engine.weights.head.buffer.ptr);
+                let drafts = engine.submit(|| drafter.draft(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
+                    engine.head()));
                 let ms = timer.elapsed().as_secs_f64() * 1e3;
                 cost.observe_draft(ms);
                 draft_s += ms / 1e3;
@@ -661,16 +692,26 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                             out[i] = Some(draft);
                         }
                     }
-                    // Drafts only speed decoding up; the step verifies the next tokens alone.
-                    Err(error) => tracing::warn!("DFlash draft failed: {error:#}"),
+                    Err(error) => {
+                        tracing::warn!("DFlash draft failed: {error:#}");
+                        if engine.is_terminal() {
+                            return Err(error);
+                        }
+                    }
                 }
                 out
             }
             // Native MTP drafts (MiMo V2 Flash; V2.6 Pro prefers DFlash).
-            None if skip.drafts() && engine.mtp.is_some() => {
-                let seqs: Vec<MtpSeq<'_>> = active.iter()
-                    .map(|a| MtpSeq { ring: a.placement.ring as usize, len: a.placement.len, tokens: &a.history })
-                    .collect();
+            None if skip.drafts() && engine.mtp.is_some() && policy.fixed != Some(0)
+                && limits.iter().any(|&limit| limit > 0) => {
+                let indices: Vec<usize> = (0..active.len()).filter(|&i| limits[i] > 0).collect();
+                for &i in &indices {
+                    active[i].counts[5] += 1;
+                }
+                let seqs: Vec<MtpSeq<'_>> = indices.iter().map(|&i| {
+                    let a = &active[i];
+                    MtpSeq { ring: a.placement.ring as usize, len: a.placement.len, tokens: &a.history }
+                }).collect();
                 let stages = engine.mtp.as_ref().map_or(0, |m| m.stages.len());
                 let timer = Instant::now();
                 let drafts = engine.mtp_draft(&seqs, stages);
@@ -678,12 +719,19 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 cost.observe_draft(ms);
                 draft_s += ms / 1e3;
                 match drafts {
-                    Ok(drafts) => drafts.into_iter().map(|tokens| {
-                        let features = vec![[0.0, 1.0, 0.0, 0.0]; tokens.len()];
-                        Some(super::dflash::Draft { tokens, features })
-                    }).collect(),
+                    Ok(drafts) => {
+                        let mut out = vec![None; active.len()];
+                        for (i, tokens) in indices.into_iter().zip(drafts) {
+                            let features = vec![[0.0, 1.0, 0.0, 0.0]; tokens.len()];
+                            out[i] = Some(super::dflash::Draft { tokens, features });
+                        }
+                        out
+                    },
                     Err(error) => {
                         tracing::warn!("MTP draft failed: {error:#}");
+                        if engine.is_terminal() {
+                            return Err(error);
+                        }
                         vec![None; active.len()]
                     }
                 }
@@ -724,19 +772,20 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
         let plan_us = console::us(plan_timer);
         let tokens: Vec<u32> = sequences.iter().flatten().copied().collect();
-        let mut rows: Vec<(&mut MimoPlacement, usize)> = active.iter_mut().zip(&sequences)
-            .map(|(a, s)| (&mut a.placement, s.len())).collect();
         steps += 1;
         let timer = Instant::now();
-        let step = engine.verify_device(&mut rows, &tokens, None).and_then(|logits| logits.context("decode needs every layer"))
-            .and_then(|logits| {
-                // Each row draws at the position after it, masked along its sequence's drafts.
-                let mut batch = SelectBatch::default();
-                for ((a, rows), &start) in active.iter().zip(&sequences).zip(&starts) {
-                    batch.push_sequence(a.job.sampling, a.constraint.as_ref(), rows, start as u64 + 1)?;
-                }
-                Ok((selector.select(&logits, &batch)?, logits))
-            });
+        let step = engine.submit(|| {
+            let mut rows: Vec<(&mut MimoPlacement, usize)> = active.iter_mut().zip(&sequences)
+                .map(|(a, s)| (&mut a.placement, s.len())).collect();
+            let logits = engine.verify_device(&mut rows, &tokens, None)?.context("decode needs every layer")?;
+            drop(rows);
+            // Each row draws at the position after it, masked along its sequence's drafts.
+            let mut batch = SelectBatch::default();
+            for ((a, rows), &start) in active.iter().zip(&sequences).zip(&starts) {
+                batch.push_sequence(a.job.sampling, a.constraint.as_ref(), rows, start as u64 + 1)?;
+            }
+            Ok((selector.select(&logits, &batch)?, logits))
+        });
         let step_s = timer.elapsed().as_secs_f64();
         verify_s += step_s;
         cost.observe_verify(Shape::plain(tokens.len(), sequences.len()), step_s * 1e3);
@@ -745,9 +794,12 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             Ok(step) => step,
             Err(error) => {
                 tracing::warn!("decode step failed: {error:#}");
+                if engine.is_terminal() {
+                    return Err(error);
+                }
                 for request in active.drain(..) {
                     let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
-                    release(&family, &mut cache, &mut free_rings, &mut free_slots, &request.placement, request.slot);
+                    release(family, cache, &mut free_rings, &mut free_slots, &request.placement, request.slot);
                 }
                 continue;
             }
@@ -775,7 +827,8 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                             break;
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                         finished = true;
                         break;
                     }
@@ -811,8 +864,11 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             }
             finished
         }).collect();
-        if let Some(drafter) = drafter {
-            drafter.update(&context)?;
+        for (request, &done) in active.iter().zip(&finished) {
+            if done { failures.finished(&request.job.events); }
+        }
+        if let Some(drafter) = drafter.filter(|_| !context.is_empty()) {
+            engine.submit(|| drafter.update(&context))?;
         }
         emit_s += timer.elapsed().as_secs_f64();
         for (i, request) in active.iter().enumerate() {
@@ -836,27 +892,31 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             generated_total += request.generated as u64;
             let seconds = request.started.elapsed().as_secs_f64();
             let phases = std::mem::take(&mut *engine.profile.borrow_mut());
-            let [cycles, dflash, dflash_ok, copy, copy_ok] = request.counts;
+            let [cycles, dflash, dflash_ok, copy, copy_ok, draft_calls] = request.counts;
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
                 active = active.len(), steps, verify_s, draft_s, emit_s, gpu_wait_s = phases[0],
-                experts_s = phases[1], cycles, dflash, dflash_ok, copy, copy_ok, late_graphs = engine.late_captures(),
+                experts_s = phases[1], cycles, dflash, dflash_ok, copy, copy_ok, draft_calls, late_graphs = engine.late_captures(),
                 "request complete");
             (steps, verify_s, draft_s, emit_s) = (0, 0.0, 0.0, 0.0);
             if let Some(row) = &request.turn {
                 // The conversation so far: every committed row (the last token is not in it).
                 let rows = &request.history[..request.placement.len];
-                if let Err(error) = cache.capture(&family, SnapshotKind::Turn, rows, &request.placement,
+                if let Err(error) = cache.capture(family, SnapshotKind::Turn, rows, &request.placement,
                     After::from_logits(row, true)) {
                     tracing::warn!("turn snapshot not retained: {error:#}");
                 }
             }
-            release(&family, &mut cache, &mut free_rings, &mut free_slots, &request.placement, request.slot);
+            release(family, cache, &mut free_rings, &mut free_slots, &request.placement, request.slot);
         }
         cache.tick();
-        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache);
-        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len()));
+        publish(stats, requests, generated_total, active.len(), prefills.len(), cache);
+        console::gauges(|| console::Gauges::prefix_cache(cache, active.len(), prefills.len(), receive.len() + kv_waiter.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
+    } })();
+    if let Err(error) = &result {
+        failures.fail_and_close(error, receive);
     }
+    result
 }
 
 /// Serving statistics for `/v1/stats`.
@@ -898,4 +958,123 @@ fn plan_drafts(active: &[Active<'_>], drafted: &[Option<super::dflash::Draft>], 
         counts[i] = n;
     }
     counts
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prefill_one(engine: &MimoEngine<'_>, family: &MimoPrefix<'_, '_>,
+    cache: &mut PrefixCache<CudaCopyEngine<'_>>, selector: &mut TokenSelector<'_>, p: &mut Prefill<'_>)
+    -> Result<Chunk> {
+    if p.done == p.tokens.len() {
+        return Ok(Chunk::Done);
+    }
+    if p.job.events.is_closed() {
+        p.cancelled = true;
+        anyhow::bail!("client went away");
+    }
+    let timer = Instant::now();
+    let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
+    let count = end - p.done;
+    let retain = cache.enabled() && !probe::cold(&p.job.probe);
+    let (result, phases) = isolated_phases(&engine.profile, || engine.submit(|| -> Result<()> {
+        let start = p.placement.len;
+        let logits = engine.prefill_device(&mut p.placement, &p.tokens[p.done..end], false, None, None)?;
+        consume_prefill_chunk(engine, selector, p, start, end, logits, retain, None)?;
+        Ok(())
+    }));
+    p.done += count;
+    add_phases(&mut p.phases, phases);
+    p.busy += timer.elapsed().as_secs_f64();
+    p.ticket.prefill(count, p.chunks, p.plan.chunks.len(), timer);
+    result?;
+    complete_prefill_chunk(family, cache, p)
+}
+
+fn complete_prefill_chunk(family: &MimoPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_>>,
+    p: &mut Prefill<'_>) -> Result<Chunk> {
+    // Intermediate snapshot points this chunk reaches (off unless configured).
+    for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
+        if let Err(error) = cache.capture(family, SnapshotKind::Prompt, &p.tokens[..point], &p.placement,
+            After::default()) {
+            tracing::warn!("snapshot point {point} not retained: {error:#}");
+        }
+    }
+    p.chunks += 1;
+    Ok(if p.done == p.tokens.len() { Chunk::Done } else { Chunk::More })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consume_prefill_chunk(engine: &MimoEngine<'_>, selector: &mut TokenSelector<'_>, p: &mut Prefill<'_>,
+    start: usize, end: usize, logits: Option<crate::shared::token_io::DeviceLogits>, retain: bool,
+    lane: Option<usize>) -> Result<()> {
+    if end == p.tokens.len() {
+        let logits = logits.context("prefill produced no logits")?;
+        let mut batch = SelectBatch::default();
+        batch.push_next(p.job.sampling, p.constraint.as_mut(), p.placement.len as u64)?;
+        let selected = selector.select(&logits, &batch)?;
+        p.first = Some(take(p.constraint.as_mut(), &selected[0])?);
+        p.logits = if retain { Some(logits.row_host(engine.library, 0)?) } else { None };
+        if probe::wants_first(&p.job.probe) {
+            probe::device_rows(engine.library, &p.job.probe, &logits, 0, 1, p.tokens.len())?;
+        }
+    }
+    if let (Some(drafter), Some(slot)) = (engine.drafter.as_ref(), p.slot) {
+        let count = end - p.done;
+        let n = count.min(super::dflash::TAP_ROWS);
+        let rows = (0..n).map(|r| ContextRow { tap_row: r, slot, position: start + count - n + r })
+            .collect::<Vec<_>>();
+        match lane {
+            Some(lane) => drafter.update_lane(lane, &rows)?,
+            None => drafter.update(&rows)?,
+        }
+    }
+    Ok(())
+}
+
+fn prefill_batch(engine: &MimoEngine<'_>, family: &MimoPrefix<'_, '_>,
+    cache: &mut PrefixCache<CudaCopyEngine<'_>>, selector: &mut TokenSelector<'_>, prompts: &mut [Prefill<'_>])
+    -> [Result<Chunk>; 2] {
+    // Recheck cancellation immediately before submission. A cancelled neighbour
+    // uses the existing independent cleanup; it never cancels the healthy one.
+    if prompts.len() != 2 || prompts.iter().any(|p| p.job.events.is_closed() || p.done == p.tokens.len()) {
+        let first = prefill_one(engine, family, cache, selector, &mut prompts[0]);
+        let second = if prompts.len() == 2 {
+            prefill_one(engine, family, cache, selector, &mut prompts[1])
+        } else { Ok(Chunk::Done) };
+        return [first, second];
+    }
+    let timer = Instant::now();
+    let (a, b) = prompts.split_at_mut(1);
+    let mut pair = [&mut a[0], &mut b[0]];
+    let ends = pair.each_ref().map(|p| p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len()));
+    let starts = pair.each_ref().map(|p| p.placement.len);
+    let counts = [ends[0] - pair[0].done, ends[1] - pair[1].done];
+    let (result, phases) = isolated_phases(&engine.profile, || engine.submit(|| -> Result<()> {
+        let [a, b] = &mut pair;
+        let logits = engine.prefill_pair_device([
+            (&mut a.placement, &a.tokens[a.done..ends[0]]),
+            (&mut b.placement, &b.tokens[b.done..ends[1]]),
+        ])?;
+        // Each head/tap bank remains live until its own consumer has queued.
+        // Context updates reuse scratch in stream order, with explicit drains.
+        for (i, logits) in logits.into_iter().enumerate() {
+            let retain = cache.enabled() && !probe::cold(&pair[i].job.probe);
+            consume_prefill_chunk(engine, selector, pair[i], starts[i], ends[i], logits, retain, Some(i))?;
+        }
+        Ok(())
+    }));
+    // The pair's elapsed host interval includes transport/compute waits. Split
+    // it equally only for additive bookkeeping, not as kernel attribution.
+    let busy = timer.elapsed().as_secs_f64() / 2.0;
+    for (i, p) in pair.into_iter().enumerate() {
+        p.done += counts[i];
+        p.paired_chunks += 1;
+        p.busy += busy;
+        add_phases(&mut p.phases, phases.map(|seconds| seconds / 2.0));
+        p.ticket.prefill(counts[i], p.chunks, p.plan.chunks.len(), timer);
+    }
+    match result {
+        Ok(()) => [complete_prefill_chunk(family, cache, &mut prompts[0]),
+            complete_prefill_chunk(family, cache, &mut prompts[1])],
+        Err(error) => [Err(error), Err(engine.terminal_error())],
+    }
 }

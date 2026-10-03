@@ -14,22 +14,29 @@
 //! TP-interleaved `qkv_proj` de-interleaved with every key padded to 256
 //! rows, see `FusedQkvLayout`).
 //!
-//! BF16 operands: `w_o` (BF16 in the release; `fp8_decode && fp8_o_proj` adds
-//! an E4M3 copy with per-row x 128-K scales `[N, K/128]` for decode rows), the
-//! norms, sinks and LM head (`fp8_head`: the same per-row quantization for
-//! decode rows); the FP32 router weight (Flash) becomes `w_hilo = [bf16(w);
+//! Head and output projections have one immutable format across row shapes:
+//! checkpoint BF16 or E4M3 by default, with explicit conversion available at
+//! load. FP8 has one value allocation and row/K-major scale metadata, never a
+//! resident BF16 fallback. Norms and sinks remain checkpoint BF16; the FP32
+//! router weight (Flash) becomes `w_hilo = [bf16(w);
 //! bf16(w - bf16(w))]` for the router program's two FP32-accumulated BF16
 //! products, a BF16 one (V2.6 Pro) is `w_router` as stored.
 use crate::shared::memory::DeviceAllocation;
+use super::head::MimoHead;
+use cuteafd_loader::families::mimo_v2::projection::{MimoProjectionLayout, MimoProjectionRepresentation, MIMO_PROJECTION_STAGING_ROWS};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::families::mimo_v2::{FusedQkvLayout, MimoAttention, MimoV2Config};
 use cuteafd_loader::plan::checkpoint::{Checkpoint, CheckpointTensor};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::os::unix::fs::FileExt;
 use crate::shared::peer_split::{slice_2d, Axis, RankDevice};
+
+#[cfg(test)]
+#[path = "weights_retirement_tests.rs"]
+mod retirement_tests;
 
 pub(crate) struct MimoLayer<'a> {
     pub attention: MimoAttention,
@@ -80,9 +87,8 @@ impl MimoLayer<'_> {
 pub(crate) struct MimoWeights<'a> {
     pub layers: Vec<MimoLayer<'a>>,
     pub norm: DeviceAllocation<'a>,
-    pub head: DeviceAllocation<'a>,
-    /// E4M3 LM head and its per-row x 128-K scales (`fp8_head`).
-    pub head_fp8: Option<(DeviceAllocation<'a>, DeviceAllocation<'a>)>,
+    pub head: MimoHead<'a>,
+    pub output_fp8: bool,
 }
 
 pub(crate) struct MimoLoader<'a> {
@@ -91,9 +97,8 @@ pub(crate) struct MimoLoader<'a> {
     pub stream: *mut c_void,
     /// The checkpoint's tensor-parallel degree (fused `qkv_proj` row shards).
     pub checkpoint_tp: usize,
-    pub fp8_decode: bool,
     pub fp8_head: bool,
-    pub fp8_o_proj: bool,
+    pub output_formats: &'a BTreeMap<String, MimoProjectionRepresentation>,
     /// Scale rule of copies quantized from BF16 (o_proj, the LM head).
     pub fp8_scales: crate::shared::fp8_linear::Fp8Scales,
     /// This loader's device (rank 0 of a head split).
@@ -104,7 +109,7 @@ pub(crate) struct MimoLoader<'a> {
 
 /// Scale-grid row of every weight row: uniform 128-row blocks, or per
 /// 192-row head (a 128-row then a 64-row block).
-fn scale_rows(name: &str, rows: usize, grid_rows: usize) -> Result<Vec<usize>> {
+pub(crate) fn scale_rows(name: &str, rows: usize, grid_rows: usize) -> Result<Vec<usize>> {
     if rows.div_ceil(128) == grid_rows {
         return Ok((0..rows).map(|r| r / 128).collect());
     }
@@ -184,31 +189,103 @@ impl<'a> MimoLoader<'a> {
         Ok(allocation)
     }
 
-    /// The row-concatenation of 2-D `names` as one BF16 operand.
-    fn rows(&self, names: &[String]) -> Result<DeviceAllocation<'a>> {
-        Ok(self.rows_fp8(names, false)?.0)
+    /// One FP8 projection per head partition. Checkpoint FP8 values/scales
+    /// remain exact; BF16 checkpoints are quantized through a bounded source
+    /// block. No complete BF16 projection survives this operation.
+    #[allow(clippy::type_complexity)]
+    fn fp8_projection(&self, name: &str, ranks: usize, kmajor_scale: bool)
+        -> Result<Vec<(DeviceAllocation<'a>, DeviceAllocation<'a>, Option<DeviceAllocation<'a>>)>> {
+        let (bytes, dtype, shape) = self.raw(name)?;
+        ensure!(shape.len() == 2 && shape[1] % (ranks *128) == 0,
+            "{name}: FP8-only projection requires [N,K] with K divisible by128 per rank");
+        ensure!(matches!(dtype, DType::Bf16 | DType::F8E4M3),
+            "{name}: FP8-only projection needs BF16 or E4M3 checkpoint values, found {dtype:?}");
+        let (rows, cols) = (shape[0], shape[1] /ranks);
+        let layout = MimoProjectionLayout::new(rows as u64, cols as u64, MimoProjectionRepresentation::Fp8,
+            if kmajor_scale { 2 } else { 1 })?;
+        ensure!(bytes.len() as u64 == layout.values.checked_mul(ranks as u64)
+            .and_then(|n| n.checked_mul(if dtype == DType::Bf16 { 2 } else { 1 })).context("projection source extent overflow")?,
+            "{name}: checkpoint projection bytes disagree with its shape");
+        let grid = if dtype == DType::F8E4M3 {
+            let (bytes, dtype, shape) = self.raw(&format!("{name}_scale_inv"))?;
+            ensure!(dtype == DType::F32 && shape.len() == 2 && shape[1] == cols /128 *ranks,
+                "{name}: FP8-only projection needs checkpoint FP32 block scales");
+            ensure!(bytes.len() == shape[0] *shape[1] *4, "{name}: checkpoint scale bytes disagree with its grid");
+            Some((bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>(),
+                scale_rows(name, rows, shape[0])?))
+        } else { None };
+        (0..ranks).map(|rank| self.on_rank(rank, |stream| {
+            let values = DeviceAllocation::new(self.library, usize::try_from(layout.values)?)?;
+            let scales = DeviceAllocation::new(self.library, rows * (cols /128) *4)?;
+            let region = |buffer: CuteafdDeviceBuffer, offset: usize, count: usize| CuteafdDeviceBuffer {
+                ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes: count, ..buffer
+            };
+            let row_scales = if let Some((grid, grid_rows)) = &grid {
+                let values_host = slice_2d(&bytes, rows, shape[1], 1, Axis::Cols, rank, ranks);
+                self.library.copy_h2d(values.buffer, &values_host)?;
+                let kb = cols /128;
+                let row_scales: Vec<f32> = grid_rows.iter().flat_map(|&r|
+                    grid[r *kb *ranks + rank *kb..r *kb *ranks + (rank +1) *kb].iter().copied()).collect();
+                self.library.copy_h2d(scales.buffer, &f32_bytes(&row_scales))?;
+                row_scales
+            } else {
+                let staging = DeviceAllocation::new(self.library, usize::try_from(layout.max_load_staging)?)?;
+                let queued = (|| -> Result<()> {
+                    let mut block = vec![0u8; staging.buffer.bytes];
+                    for first in (0..rows).step_by(MIMO_PROJECTION_STAGING_ROWS as usize) {
+                        let n = (MIMO_PROJECTION_STAGING_ROWS as usize).min(rows -first);
+                        for r in 0..n {
+                            let offset = ((first +r) *shape[1] +rank *cols) *2;
+                            block[r *cols *2..(r +1) *cols *2].copy_from_slice(&bytes[offset..offset +cols *2]);
+                        }
+                        self.library.copy_h2d(region(staging.buffer, 0, n *cols *2), &block[..n *cols *2])?;
+                        // SAFETY: live source block and checked destinations;
+                        // every block drains before the source buffer is reused.
+                        unsafe {
+                            self.library.fp8_quant_rule(staging.buffer.ptr,
+                                region(values.buffer, first *cols, n *cols).ptr,
+                                region(scales.buffer, first *cols /128 *4, n *cols /128 *4).ptr,
+                                n, cols, true, self.fp8_scales.code(), stream)?;
+                            self.library.cuda_stream_synchronize(stream)?;
+                        }
+                    }
+                    Ok(())
+                })();
+                // SAFETY: all queued sources/destinations are still owned here,
+                // including when a native launch returned an error.
+                if let Err(drain) = unsafe { self.library.cuda_stream_synchronize(stream) } {
+                    self.library.quarantine_module_after_failed_drain();
+                    std::mem::forget(staging);
+                    std::mem::forget(values);
+                    std::mem::forget(scales);
+                    return Err(queued.err().unwrap_or_else(|| anyhow::anyhow!("FP8-only projection completion failed"))
+                        .context(format!("FP8-only projection owners and native module quarantined after failed packing drain: {drain}")));
+                }
+                queued?;
+                drop(staging);
+                if kmajor_scale {
+                    let mut bytes = vec![0u8; scales.buffer.bytes];
+                    self.library.copy_d2h(&mut bytes, scales.buffer)?;
+                    bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
+                } else { Vec::new() }
+            };
+            let kscale = if kmajor_scale { Some(self.upload(&kmajor(&row_scales, cols /128))?) } else { None };
+            Ok((values, scales, kscale))
+        })).collect()
     }
 
-    /// `rows`, and with `fp8` also its E4M3 copy with per-row x 128-K FP32
-    /// scales: FP8 tensors keep their bytes (block grid expanded per row),
-    /// BF16 ones are quantized per row and 128-K block on the GPU. Each
-    /// tensor is read once.
-    #[allow(clippy::type_complexity)]
-    fn rows_fp8(&self, names: &[String], fp8: bool)
-        -> Result<(DeviceAllocation<'a>, Option<(DeviceAllocation<'a>, DeviceAllocation<'a>)>)> {
+    /// The row-concatenation of 2-D `names` as one BF16 operand.
+    fn rows(&self, names: &[String]) -> Result<DeviceAllocation<'a>> {
         let tensors = names.iter().map(|n| self.raw(n).map(|t| (n, t))).collect::<Result<Vec<_>>>()?;
+        ensure!(!tensors.is_empty() && tensors.iter().all(|(_, (_, _, s))| s.len() == 2 && s[0] > 0 && s[1] > 0),
+            "{names:?}: row operands require nonempty two-dimensional tensors");
         let cols = tensors[0].1 .2[1];
-        let rows: usize = tensors.iter().map(|(_, (_, _, shape))| shape[0]).sum();
+        let rows = tensors.iter().try_fold(0usize, |rows, (_, (_, _, shape))| rows.checked_add(shape[0]))
+            .context("row operand height overflow")?;
         ensure!(tensors.iter().all(|(_, (_, _, s))| s.len() == 2 && s[1] == cols), "{names:?} do not share columns");
-        ensure!(!fp8 || cols % 128 == 0, "{names:?}: FP8 copies need K % 128 == 0");
         let k_blocks = cols.div_ceil(128);
-        let out = DeviceAllocation::new(self.library, rows * cols * 2)?;
-        let copy = if fp8 {
-            Some((DeviceAllocation::new(self.library, rows * cols)?,
-                DeviceAllocation::new(self.library, rows * k_blocks * 4)?))
-        } else {
-            None
-        };
+        let bytes = rows.checked_mul(cols).and_then(|n| n.checked_mul(2)).context("row operand storage overflow")?;
+        let out = DeviceAllocation::new(self.library, bytes)?;
         let at = |buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize| CuteafdDeviceBuffer {
             // SAFETY: callers keep offset + bytes inside the allocation.
             ptr: unsafe { buffer.ptr.cast::<u8>().add(offset) }.cast(),
@@ -218,72 +295,64 @@ impl<'a> MimoLoader<'a> {
         let mut row = 0;
         // Uploads the stream still reads; released after the final synchronize.
         let mut staged = Vec::new();
-        for (name, (bytes, dtype, shape)) in &tensors {
-            let dest = |first: usize, count: usize| at(out.buffer, (row + first) * cols * 2, count * cols * 2);
-            match dtype {
-                DType::Bf16 => {
-                    self.library.copy_h2d(dest(0, shape[0]), bytes)?;
-                    if let Some((q, s)) = &copy {
-                        // SAFETY: the BF16 rows and their E4M3 / scale destinations are live;
-                        // the stream drains below.
-                        unsafe {
-                            self.library.fp8_quant_rule(dest(0, shape[0]).ptr,
-                                at(q.buffer, row * cols, shape[0] * cols).ptr,
-                                at(s.buffer, row * k_blocks * 4, shape[0] * k_blocks * 4).ptr, shape[0], cols,
-                                true, self.fp8_scales.code(), self.stream)?;
-                        }
+        let queued = (|| -> Result<()> {
+            for (name, (bytes, dtype, shape)) in &tensors {
+                let dest = |first: usize, count: usize| at(out.buffer, (row + first) * cols * 2, count * cols * 2);
+                match dtype {
+                    DType::Bf16 => {
+                        ensure!(bytes.len() == shape[0] * cols * 2, "{name}: BF16 bytes disagree with row shape");
+                        self.library.copy_h2d(dest(0, shape[0]), bytes)?;
                     }
-                }
-                DType::F8E4M3 => {
-                    let (scale, scale_dtype, scale_shape) = self.raw(&format!("{name}_scale_inv"))?;
-                    ensure!(scale_dtype == DType::F32, "{name}: block scales must be FP32");
-                    ensure!(scale_shape == [scale_shape[0], k_blocks], "{name}: unexpected scale grid {scale_shape:?}");
-                    // Row blocks: uniform 128, or per 192-row head (128 + 64).
-                    let (block, per_block_rows) = if shape[0].div_ceil(128) == scale_shape[0] {
-                        (shape[0], shape[0].div_ceil(128))
-                    } else {
-                        let head = 192;
-                        ensure!(shape[0] % head == 0 && scale_shape[0] == shape[0] / head * head.div_ceil(128),
-                            "{name}: no block layout maps {} rows onto {} scale rows", shape[0], scale_shape[0]);
-                        (head, head.div_ceil(128))
-                    };
-                    let (w, s) = (self.upload(bytes)?, self.upload(&scale)?);
-                    for chunk in 0..shape[0] / block {
-                        // SAFETY: chunk rows of the FP8 weight, their scale rows and the
-                        // destination rows are live; the stream drains before `w`/`s` drop.
-                        unsafe {
-                            self.library.fp8_block_dequant(
-                                w.buffer.ptr.cast::<u8>().add(chunk * block * cols).cast(),
-                                s.buffer.ptr.cast::<u8>().add(chunk * per_block_rows * k_blocks * 4).cast(),
-                                dest(chunk * block, block).ptr, block, cols, self.stream)?;
-                        }
-                    }
-                    if let Some((q, s8)) = &copy {
-                        let grid: Vec<f32> =
-                            scale.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-                        let mut expanded = Vec::with_capacity(shape[0] * k_blocks * 4);
-                        for r in scale_rows(name, shape[0], grid.len() / k_blocks)? {
-                            for v in &grid[r * k_blocks..(r + 1) * k_blocks] {
-                                expanded.extend_from_slice(&v.to_le_bytes());
+                    DType::F8E4M3 => {
+                        ensure!(bytes.len() == shape[0] * cols, "{name}: FP8 bytes disagree with row shape");
+                        let (scale, scale_dtype, scale_shape) = self.raw(&format!("{name}_scale_inv"))?;
+                        ensure!(scale_dtype == DType::F32, "{name}: block scales must be FP32");
+                        ensure!(scale_shape.len() == 2 && scale_shape[1] == k_blocks,
+                            "{name}: unexpected scale grid {scale_shape:?}");
+                        ensure!(scale_shape[0].checked_mul(k_blocks).and_then(|n| n.checked_mul(4)) == Some(scale.len()),
+                            "{name}: FP32 scale bytes disagree with the grid");
+                        // Row blocks: uniform 128, or per 192-row head (128 + 64).
+                        let (block, per_block_rows) = if shape[0].div_ceil(128) == scale_shape[0] {
+                            (shape[0], shape[0].div_ceil(128))
+                        } else {
+                            let head = 192;
+                            ensure!(shape[0] % head == 0 && scale_shape[0] == shape[0] / head * head.div_ceil(128),
+                                "{name}: no block layout maps {} rows onto {} scale rows", shape[0], scale_shape[0]);
+                            (head, head.div_ceil(128))
+                        };
+                        let (w, s) = (self.upload(bytes)?, self.upload(&scale)?);
+                        // Install both owners before the first fallible launch.
+                        staged.push((w, s));
+                        let (w, s) = staged.last().expect("just inserted staging owners");
+                        for chunk in 0..shape[0] / block {
+                            // SAFETY: chunk rows of the FP8 weight, their scale rows and the
+                            // destination rows are live; the stream drains before `w`/`s` drop.
+                            unsafe {
+                                self.library.fp8_block_dequant(
+                                    w.buffer.ptr.cast::<u8>().add(chunk * block * cols).cast(),
+                                    s.buffer.ptr.cast::<u8>().add(chunk * per_block_rows * k_blocks * 4).cast(),
+                                    dest(chunk * block, block).ptr, block, cols, self.stream)?;
                             }
                         }
-                        self.library.copy_h2d(at(s8.buffer, row * k_blocks * 4, expanded.len()), &expanded)?;
-                        // SAFETY: both regions hold these E4M3 rows; ordered on the loader stream.
-                        unsafe {
-                            self.library.copy_d2d_async(at(q.buffer, row * cols, shape[0] * cols), w.buffer,
-                                shape[0] * cols, self.stream)?;
-                        }
                     }
-                    staged.push((w, s));
+                    other => anyhow::bail!("{name}: unsupported coordinator dtype {other:?}"),
                 }
-                other => anyhow::bail!("{name}: unsupported coordinator dtype {other:?}"),
+                row += shape[0];
             }
-            row += shape[0];
+        Ok(())
+        })();
+        // SAFETY: the loader owns this stream and every source/destination,
+        // including after an error while processing a later tensor.
+        if let Err(drain) = unsafe { self.library.cuda_stream_synchronize(self.stream) } {
+            self.library.quarantine_module_after_failed_drain();
+            std::mem::forget(staged);
+            std::mem::forget(out);
+            return Err(queued.err().unwrap_or_else(|| anyhow::anyhow!("row operand completion failed"))
+                .context(format!("row operand owners and native module quarantined after failed drain: {drain}")));
         }
-        // SAFETY: the loader owns this stream.
-        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        queued?;
         drop(staged);
-        Ok((out, copy))
+        Ok(out)
     }
 
     fn has(&self, name: &str) -> bool {
@@ -461,14 +530,11 @@ impl<'a> MimoLoader<'a> {
     }
 
     /// The BF16 o_proj `[H, heads * v_head]` sliced by columns over `ranks`
-    /// (rank `r`'s heads), each with its per-row x 128-K E4M3 copy when `fp8`
-    /// (the same blocks as the whole weight's: slices are whole 128-K blocks).
-    #[allow(clippy::type_complexity)]
-    fn o_proj(&self, name: &str, fp8: bool, ranks: usize)
-        -> Result<Vec<(DeviceAllocation<'a>, Option<(DeviceAllocation<'a>, DeviceAllocation<'a>)>)>> {
+    /// (rank `r`'s heads). The final operands own BF16 values only.
+    fn o_proj(&self, name: &str, ranks: usize) -> Result<Vec<DeviceAllocation<'a>>> {
         let tensor = self.tensor(name)?;
         if ranks == 1 && tensor.meta.dtype != DType::Bf16 {
-            return Ok(vec![self.rows_fp8(&[name.to_string()], fp8)?]);
+            return Ok(vec![self.rows(&[name.to_string()])?]);
         }
         let shape = tensor.meta.shape.clone();
         ensure!(tensor.meta.dtype == DType::Bf16 && shape.len() == 2 && (ranks == 1 || shape[1] % (ranks * 128) == 0),
@@ -482,51 +548,47 @@ impl<'a> MimoLoader<'a> {
             self.upload(bytes)
         })?;
         let mut whole = Some(whole);
-        let out = (0..ranks).map(|rank| {
-            self.on_rank(rank, |stream| {
+        let mut completed = Vec::with_capacity(ranks);
+        for rank in 0..ranks {
+            let operand = self.on_rank(rank, |stream| {
                 if ranks == 1 {
                     // One GPU: the uploaded weight itself.
                     let out = whole.take().context("o_proj")?;
-                    let copy = if fp8 { Some(self.quantize_rows(&out, rows, cols, stream)?) } else { None };
-                    return Ok((out, copy));
+                    return Ok(out);
                 }
-                let whole = whole.as_ref().context("o_proj")?;
+                let source_allocation = whole.as_ref().context("o_proj")?;
                 let out = DeviceAllocation::new(self.library, rows * cols * 2)?;
                 let source = CuteafdDeviceBuffer {
                     // SAFETY: column block `rank` of every row lies inside the whole weight.
-                    ptr: unsafe { whole.buffer.ptr.cast::<u8>().add(rank * cols * 2) }.cast(),
-                    bytes: whole.buffer.bytes - rank * cols * 2,
-                    ..whole.buffer
+                    ptr: unsafe { source_allocation.buffer.ptr.cast::<u8>().add(rank * cols * 2) }.cast(),
+                    bytes: source_allocation.buffer.bytes - rank * cols * 2,
+                    ..source_allocation.buffer
                 };
                 // SAFETY: both buffers are live and sized for these pitched spans; peer access to
                 // rank 0 is enabled on every rank (the engine's split setup), drained below.
-                unsafe {
-                    self.library.copy_d2d_2d_async(out.buffer, cols * 2, source, shape[1] * 2, cols * 2, rows, stream)?;
-                }
-                let copy = if fp8 { Some(self.quantize_rows(&out, rows, cols, stream)?) } else { None };
+                let queued = unsafe {
+                    self.library.copy_d2d_2d_async(out.buffer, cols * 2, source, shape[1] * 2, cols * 2, rows, stream)
+                };
                 // SAFETY: the loader owns this stream; the copy reads `whole`, which drops after.
-                unsafe { self.library.cuda_stream_synchronize(stream)? };
-                Ok((out, copy))
-            })
-        }).collect();
-        drop(whole);
-        out
-    }
-
-    /// The per-row x 128-K E4M3 copy of BF16 `[rows, cols]` on the current device,
-    /// quantized on `stream` and drained.
-    fn quantize_rows(&self, bf16: &DeviceAllocation<'a>, rows: usize, cols: usize, stream: *mut c_void)
-        -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
-        let (q, s) = (DeviceAllocation::new(self.library, rows * cols)?,
-            DeviceAllocation::new(self.library, rows * cols.div_ceil(128) * 4)?);
-        // SAFETY: the BF16 rows and their E4M3 / scale destinations are live on this device;
-        // the stream drains before return.
-        unsafe {
-            self.library.fp8_quant_rule(bf16.buffer.ptr, q.buffer.ptr, s.buffer.ptr, rows, cols, true,
-                self.fp8_scales.code(), stream)?;
-            self.library.cuda_stream_synchronize(stream)?;
+                if let Err(drain) = unsafe { self.library.cuda_stream_synchronize(stream) } {
+                    self.library.quarantine_module_after_failed_drain();
+                    std::mem::forget(out);
+                    std::mem::forget(whole.take());
+                    // cudaFree of a completed rank's independent output can still
+                    // synchronize with this pending peer copy. Retain every split
+                    // output on the unproved path so error return cannot block on
+                    // unrelated allocation destruction.
+                    std::mem::forget(std::mem::take(&mut completed));
+                    return Err(queued.err().unwrap_or_else(|| anyhow::anyhow!("split projection completion failed"))
+                        .context(format!("split projection owners and native module quarantined after failed drain: {drain}")));
+                }
+                queued?;
+                Ok(out)
+            })?;
+            completed.push(operand);
         }
-        Ok((q, s))
+        drop(whole);
+        Ok(completed)
     }
 
     /// The FP8 checkpoint weights `names` concatenated by rows (as
@@ -653,13 +715,22 @@ impl<'a> MimoLoader<'a> {
         for (map, copy) in ops.iter_mut().zip(copies) {
             copy.insert(map, ["w_qkv_fp8", "w_qkv_scale", "w_qkv_kscale"]);
         }
-        // `w_o` (BF16 in the release) plus, for decode rows, its per-row FP8 copy.
-        let o = self.o_proj(&format!("{p}.self_attn.o_proj.weight"), self.fp8_decode && self.fp8_o_proj, ranks)?;
-        for (map, (bf16, copy)) in ops.iter_mut().zip(o) {
-            map.insert("w_o", bf16);
-            if let Some((q, s)) = copy {
+        // Immutable output representation across prefill/decode/verify/MTP.
+        // Activation/kernel choice never requires another resident weight.
+        let name = format!("{p}.self_attn.o_proj.weight");
+        ensure!(self.tensor(&name)?.meta.shape == [cfg.hidden, cfg.heads *cfg.v_head_dim],
+            "{name}: target output projection does not match configured attention geometry");
+        let output_format = self.output_formats.get(&name)
+            .with_context(|| format!("{name}: output weight format was not resolved before loading"))?;
+        if *output_format == MimoProjectionRepresentation::Fp8 {
+            for (map, (q, s, ks)) in ops.iter_mut().zip(self.fp8_projection(&name, ranks, true)?) {
                 map.insert("w_o_fp8", q);
                 map.insert("w_o_scale", s);
+                map.insert("w_o_kscale", ks.context("FP8-only output K-major scales")?);
+            }
+        } else {
+            for (map, bf16) in ops.iter_mut().zip(self.o_proj(&name, ranks)?) {
+                map.insert("w_o", bf16);
             }
         }
         let sinks = match attention {
@@ -696,7 +767,15 @@ impl<'a> MimoLoader<'a> {
     /// other rank's layer shares.
     #[allow(clippy::type_complexity)]
     pub fn model(&self, cfg: &MimoV2Config, layers: usize) -> Result<(MimoWeights<'a>, Vec<Vec<MimoLayer<'a>>>)> {
-        let (head, head_fp8) = self.rows_fp8(&["lm_head.weight".to_string()], self.fp8_head)?;
+        ensure!(self.tensor("lm_head.weight")?.meta.shape == [cfg.vocab_size, cfg.hidden],
+            "lm_head.weight: target head does not match configured [vocab,hidden]");
+        let head = if self.fp8_head {
+            let (values, scales, _) = self.fp8_projection("lm_head.weight", 1, false)?
+                .pop().context("FP8-only target head")?;
+            MimoHead::Fp8 { values, scales }
+        } else {
+            MimoHead::Bf16(self.rows(&["lm_head.weight".to_string()])?)
+        };
         let mut shares: Vec<Vec<MimoLayer<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
         for layer in 0..layers.min(cfg.layers) {
             for (share, part) in shares.iter_mut().zip(self.layer(cfg, layer)?) {
@@ -708,7 +787,7 @@ impl<'a> MimoLoader<'a> {
             layers: shares.next().context("rank 0")?,
             norm: self.one("model.norm.weight")?,
             head,
-            head_fp8,
+            output_fp8: self.output_formats.values().any(|&format| format == MimoProjectionRepresentation::Fp8),
         };
         crate::shared::memory::staging::release_staging();
         Ok((weights, shares.collect()))

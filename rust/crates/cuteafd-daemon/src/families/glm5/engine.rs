@@ -11,6 +11,7 @@
 //! its own workspace and transport ([`GlmEngine::prefill`]): one lane's Spark
 //! wave stays in flight while the other lane's GPU layers run.
 use super::weights::{GlmLayer, GlmWeights};
+use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use crate::shared::token_io::{DeviceLogits, EmbedPlacement, TokenEmbedding};
 use crate::shared::spark_intake::{copy_parallel, IntakeMode, SparkIntake, SparkLane, SparkLink};
@@ -225,6 +226,7 @@ enum StepLogits {
 }
 
 pub(crate) struct GlmEngine<'a> {
+    quantize_grid: Fp8QuantizeGrid,
     pub library: &'a NativeLibrary,
     pub programs: &'a Programs<'a>,
     pub cfg: GlmDsaConfig,
@@ -317,10 +319,11 @@ impl<'a> GlmEngine<'a> {
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmDsaConfig,
         weights: GlmWeights<'a>, stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize,
         embedding: TokenEmbedding<'a>) -> Result<Self> {
+        let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         let (kv, index, cos_sin) = caches(library, &cfg, &weights.layers, pages, max_context)?;
         let device = library.cuda_get_device()?;
-        Ok(Self { device, peer: None, exchange: None, library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
+        Ok(Self { quantize_grid, device, peer: None, exchange: None, library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
             decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
             prefill_lanes: configured_lanes(),
             lanes: RefCell::new(Vec::new()), full_prefill_logits: false, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
@@ -1191,7 +1194,7 @@ impl<'a> GlmEngine<'a> {
                 std::ptr::null(), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t, self.cfg.experts, topk,
                 self.cfg.routed_scale as f32, true, self.stream)?;
         }
-        let grid = (t * h.div_ceil(256)).div_ceil(8).clamp(1, 4 * 188);
+        let grid = self.quantize_grid.blocks(t, h);
         self.run("glm_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
             // SAFETY: the scale rows follow the payload inside each wire row.
             ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),

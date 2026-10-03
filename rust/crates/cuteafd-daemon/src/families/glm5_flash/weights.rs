@@ -2,8 +2,9 @@
 //!
 //! The MLA (`q_a|kv_a`, `q_b`, `o_proj`), dense and shared-expert projections
 //! are FP8 only: the official FP8 release's E4M3 bytes and FP32 128x128 block
-//! scales (`--fp8-snapshot`), else 128x128 blocks quantized from the BF16
-//! checkpoint at load. Every other matrix operand is BF16 (the EXL3
+//! scales (`--fp8-snapshot` or native FP8 in the primary checkpoint).
+//! BF16 block sources are named unsupported until matching consumers exist.
+//! Every other matrix operand is BF16 (the EXL3
 //! publications store the dense tensors in BF16, equal to the official BF16
 //! release; FP8 checkpoint tensors are dequantized on the GPU with their FP32
 //! 128x128 block scales), plus the optional per-row FP8 copies of the KDA
@@ -75,7 +76,7 @@ pub(crate) struct GlmfLoader<'a> {
     pub checkpoint: &'a Checkpoint,
     pub stream: *mut c_void,
     /// The official FP8 release: MLA/dense/shared weights (their only copies,
-    /// 128x128 blocks) come from it when given, else are quantized from BF16.
+    /// 128x128 blocks) come from it when given, else from primary native FP8.
     pub fp8_source: Option<&'a Checkpoint>,
     pub kda_fp8: super::fp8::KdaFp8,
     pub fp8_head: bool,
@@ -183,12 +184,13 @@ impl<'a> GlmfLoader<'a> {
 
     /// The row-concatenation of 2-D `names` as E4M3 bytes and FP32 scales in
     /// `layout`: the FP8 source checkpoint's own blocks when it stores the
-    /// tensors as FP8 (block layout), else quantized from BF16.
+    /// tensors as FP8 (block layout). Only explicitly selected row layouts
+    /// may quantize BF16 sources; block consumers never change source precision.
     fn fp8(&self, names: &[String], layout: super::fp8::Layout) -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
         if layout == super::fp8::Layout::Block {
-            if let Some(copy) = self.fp8_blocks(names)? {
-                return Ok(copy);
-            }
+            return self.fp8_blocks(names)?.with_context(|| format!(
+                "{names:?}: native BF16 GLMF block consumer/exporter is unsupported; \
+                 select checkpoint FP8 inputs with --fp8-snapshot instead of implicit quantization"));
         }
         let (values, scales, _) = self.fp8_host(names, layout)?;
         Ok((self.upload(&values)?, self.upload(&scales)?))
@@ -196,7 +198,7 @@ impl<'a> GlmfLoader<'a> {
 
     /// The FP8 source's own E4M3 blocks and FP32 128x128 grids of `names`
     /// (row-concatenated) on the device, read through this thread's staging
-    /// buffer; None when a part is not an FP8 tensor there (quantized instead).
+    /// buffer; None when a part is not a native FP8 tensor there.
     fn fp8_blocks(&self, names: &[String]) -> Result<Option<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
         let checkpoint = self.fp8_source.unwrap_or(self.checkpoint);
         let find = |name: &str| -> Result<&'a CheckpointTensor> {
@@ -279,7 +281,7 @@ impl<'a> GlmfLoader<'a> {
                     values.extend_from_slice(&bytes);
                     scales.extend_from_slice(&scale);
                 }
-                DType::Bf16 => {
+                DType::Bf16 if layout != Layout::Block => {
                     let (q, s) = quantize(&bytes, shape[0], shape[1], layout, self.fp8_scales);
                     values.extend_from_slice(&q);
                     scales.extend(s.iter().flat_map(|v| v.to_le_bytes()));

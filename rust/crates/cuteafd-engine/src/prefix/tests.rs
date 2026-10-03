@@ -52,6 +52,9 @@ impl CopyEngine for Shared {
     fn wait(&mut self, event: Event, budget_ns: u64) -> anyhow::Result<bool> {
         self.0.borrow_mut().wait(event, budget_ns)
     }
+    fn release_barrier(&mut self, stream: Stream) -> anyhow::Result<()> {
+        self.0.borrow_mut().release_barrier(stream)
+    }
     fn now_ns(&self) -> u64 {
         self.0.borrow().now_ns()
     }
@@ -244,6 +247,86 @@ fn serve(cache: &mut PrefixCache<Shared>, fake: &Fake, ring: usize, prompt: &[u3
 
 fn seq(base: u32, n: usize) -> Vec<u32> {
     (0..n as u32).map(|i| base + i).collect()
+}
+
+#[test]
+fn kv_pressure_delays_a_second_job_and_keeps_active_state_and_host_prefix_exact() {
+    let fake = Fake::new(4, 2, 4);
+    let mut cache = cache(&fake, 2, 1 << 20);
+    let prompt = seq(100, 8);
+    let (_, original, mut first) = serve(&mut cache, &fake, 0, &prompt, &[], 12);
+    fake.mem.borrow_mut().advance(10_000_000);
+    cache.tick();
+    let second_prompt = seq(1000, 8);
+    let error = match cache.admit(&fake, &second_prompt, 12, false,
+        |pages| Placement { pages, ring: 1, len: 0, ring_from: 0 }) {
+        Err(error) => error,
+        Ok(_) => panic!("both three-page requests cannot fit in four pages"),
+    };
+    let mut waiter = DeferredAdmission::default();
+    waiter.defer(second_prompt, &error, true, cache.pool().release_epoch()).unwrap();
+    assert!(matches!(waiter.poll(cache.pool().free(), cache.pool().release_epoch(), true, |_| false), AdmissionPoll::Blocked));
+    // Failed admission may evict inactive snapshots to RAM, but may never
+    // overwrite the running request's page rows or positional ring.
+    let mut longer = original.clone();
+    longer.push(900);
+    fake.forward(&mut first, &longer).unwrap();
+    cache.release(&fake, &first.pages).unwrap();
+    let AdmissionPoll::Ready(second_prompt) = waiter.poll(cache.pool().free(), cache.pool().release_epoch(), false, |_| false) else {
+        panic!("released running request must unblock admission");
+    };
+    let (_, _, second) = serve(&mut cache, &fake, 1, &second_prompt, &[], 12);
+    cache.release(&fake, &second.pages).unwrap();
+    fake.mem.borrow_mut().advance(10_000_000);
+    cache.tick();
+    let admitted = cache.admit(&fake, &original, 12, false,
+        |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 }).unwrap();
+    assert_eq!(admitted.resume, original.len(), "pressure preserves a reusable host prefix");
+    assert!(admitted.source.unwrap().host);
+    let mut restored = admitted.placement;
+    // Every prior KV and ring row is checked before extending the prefix.
+    fake.forward(&mut restored, &longer).unwrap();
+    cache.release(&fake, &restored.pages).unwrap();
+    cache.clear(&fake).unwrap();
+    assert_eq!(cache.pool().free(), 4);
+    assert_eq!(cache.arena().in_use(), 0);
+}
+
+#[test]
+fn completed_retained_pages_unblock_admission_while_another_request_is_running() {
+    let fake = Fake::new(6, 3, 6);
+    let mut cache = cache(&fake, 2, 0);
+    let (_, first_tokens, first) = serve(&mut cache, &fake, 0, &seq(100, 12), &[], 12);
+    let (_, second_tokens, mut second) = serve(&mut cache, &fake, 1, &seq(1000, 8), &[], 8);
+    let third_tokens = seq(2000, 12);
+    let error = match cache.admit(&fake, &third_tokens, 12, false,
+        |pages| Placement { pages, ring: 2, len: 0, ring_from: 0 }) {
+        Err(error) => error,
+        Ok(_) => panic!("three running placements need eight pages, but the arena holds six"),
+    };
+    let mut waiter = DeferredAdmission::default();
+    waiter.defer(third_tokens, &error, true, cache.pool().release_epoch()).unwrap();
+    assert_eq!(cache.pool().free(), 1);
+    // Completion retains all of the first placement's pages. Dropping the
+    // active references makes that snapshot evictable, without freeing any
+    // physical page; the unrelated second request still runs.
+    cache.capture(&fake, SnapshotKind::Turn, &first_tokens, &first, After::default()).unwrap();
+    let free_before = cache.pool().free();
+    cache.release(&fake, &first.pages).unwrap();
+    assert_eq!(cache.pool().free(), free_before);
+    let AdmissionPoll::Ready(third_tokens) = waiter.poll(cache.pool().free(), cache.pool().release_epoch(), true, |_| false) else {
+        panic!("retained completed pages must not stall the FIFO until every other request finishes");
+    };
+    let admitted = cache.admit(&fake, &third_tokens, 12, false,
+        |pages| Placement { pages, ring: 2, len: 0, ring_from: 0 }).unwrap();
+    let mut third = admitted.placement;
+    fake.forward(&mut third, &third_tokens).unwrap();
+    fake.forward(&mut second, &second_tokens).unwrap();
+    cache.release(&fake, &second.pages).unwrap();
+    cache.release(&fake, &third.pages).unwrap();
+    cache.clear(&fake).unwrap();
+    assert_eq!(cache.pool().free(), 6);
+    assert_eq!(cache.arena().in_use(), 0);
 }
 
 #[test]
@@ -632,4 +715,32 @@ fn sessions_fork_from_the_deepest_earlier_turn() {
         fake.forward(&mut p, &longer).unwrap();
         cache.release(&fake, &p.pages).unwrap();
     }
+}
+
+#[test]
+fn failed_store_release_keeps_device_pages_mark_and_host_slabs() {
+    use cuteafd_hostcache::copy::CopyFault;
+    let fake = Fake::new(24, 2, 4);
+    let mut cache = cache(&fake, 2, 1 << 20);
+    fake.mem.borrow_mut().inject(CopyFault::StreamStalls(Stream::Store));
+    let prompt = seq(700, 13);
+    let (_, _, placement) = serve(&mut cache, &fake, 0, &prompt, &[], 20);
+    cache.release(&fake, &placement.pages).unwrap();
+    let free = cache.pool().free();
+    let marks = cache.arena().in_use();
+    let held = cache.stats().host.unwrap().bytes_used;
+    assert!(free < 24 && marks > 0 && held > 0);
+    for _ in 0..2 {
+        assert!(cache.clear(&fake).is_err());
+        assert_eq!(cache.pool().free(), free);
+        assert_eq!(cache.arena().in_use(), marks);
+        assert_eq!(cache.stats().host.unwrap().bytes_used, held);
+    }
+    // The entry was never removed: its exact positional state still restores.
+    let (resume, _, mut restored) = serve(&mut cache, &fake, 1, &prompt, &[], 20);
+    assert_eq!(resume, prompt.len());
+    let mut continuation = prompt;
+    continuation.push(99);
+    fake.forward(&mut restored, &continuation).unwrap();
+    cache.release(&fake, &restored.pages).unwrap();
 }

@@ -239,7 +239,7 @@ fn download(engine: &GlmfEngine<'_>, range: CuteafdDeviceBuffer) -> Result<Vec<u
 
 /// Every paged byte of `placement`'s first `len` rows (records and token keys of each row,
 /// pool keys and scales of each complete pool), MLA layer by layer, in position order.
-fn paged_rows(family: &GlmfPrefix<'_, '_>, placement: &GlmfPlacement, len: usize) -> Result<Vec<u8>> {
+pub(super) fn paged_rows(family: &GlmfPrefix<'_, '_>, placement: &GlmfPlacement, len: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let pools = len / KPOOL;
     for (u, &unit) in placement.units.iter().enumerate().take(len.div_ceil(UNIT_ROWS)) {

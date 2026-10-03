@@ -180,9 +180,10 @@ def mimo_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """MiMo V2 programs, same (stem suffix, op, params, thunk) shape as ``programs``.
     Full-attention producers and attention come in both KV record formats (BF16, int8 ``_kvint8``). qkv and the dense FFN take only the checkpoint's E4M3 weights (per-row x 128-K FP32
     scales): decode rows up to ``fp8_rows`` on the GEMVs, W8A16 above; prefill W8A8
-    (``fp8_rows`` nonzero) or W8A16. o_proj (BF16 in the release): decode programs also
-    take a quantized E4M3 copy, prefill BF16. ``head_fp8``: the LM head over an E4M3 copy
-    for decode rows."""
+    (``fp8_rows`` nonzero) or W8A16. ``o_w8`` takes one E4M3 output weight for
+    every row count, with no BF16 operand; its prefill activation precision is
+    selected by ``fp8_rows``. ``o`` retains the older ABI for BF16 consumers.
+    ``head_fp8`` takes the E4M3 head for up to 16 rows per launch."""
     from b12x.integration.cuteafd import mimo_attention as attn
     from b12x.integration.cuteafd import mimo_ffn as ffn
 
@@ -197,6 +198,8 @@ def mimo_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         out += [
             (f"o_m{rows}", "o", {"max_rows": rows, "fp8": f8},
              lambda r=rows, f=f8: attn.compile_mimo_o_aot(g, max_rows=r, fp8=f)),
+            (f"o_w8_m{rows}", "o", {"max_rows": rows, "fp8_only": mode},
+             lambda r=rows, m=mode: attn.compile_mimo_o_aot(g, max_rows=r, fp8_only=m)),
             (f"ffn_m{rows}", "ffn", {"max_rows": rows, "inter": g.dense_inter, "fp8_only": mode},
              lambda r=rows, m=mode: ffn.compile_mimo_ffn_aot(g, max_rows=r, fp8_only=m)),
         ]
@@ -224,7 +227,7 @@ def mimo_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context
     KV heads, half the dense intermediate): the qkv producers, attention, o_proj (a partial
     over its heads) and dense FFN (a partial over its intermediate); norms, router, expert
     input and the LM head stay the whole model's programs."""
-    keep = ("o_m", "ffn_m", "full_producer_", "swa_producer_", "full_attention_", "swa_attention_")
+    keep = ("o_m", "o_w8_m", "ffn_m", "full_producer_", "swa_producer_", "full_attention_", "swa_attention_")
     return [item for item in mimo_programs(g, decode_rows, prefill_rows, max_context) if item[0].startswith(keep)]
 
 
@@ -272,7 +275,8 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
             (f"o_m{rows}", "o", {"max_rows": rows, "fp8_only": mode},
              lambda r=rows, m=mode: glmf.compile_glmf_o_aot(g, max_rows=r, fp8_only=m)),
             (f"sparse_mla_{mode}_m{rows}", "sparse_mla", {"route": mode, "max_rows": rows},
-             lambda m=mode, r=rows: mla.compile_glm_sparse_mla_aot(g, route=m, max_rows=r, name="glmf_sparse_mla")),
+             lambda m=mode, r=rows: mla.compile_glm_sparse_mla_aot(g, route=m, max_rows=r,
+                                      name="glmf_sparse_mla", fp32_partials=m == "decode")),
         ]
         for inter in (g.moe_inter, g.dense_inter):
             out.append((f"ffn_i{inter}_m{rows}", "ffn", {"max_rows": rows, "inter": inter, "fp8_only": mode},

@@ -5,9 +5,13 @@ pub(crate) mod fp8;
 pub(crate) mod prefix;
 pub(crate) mod serve;
 mod speculate;
+mod expert_rows;
+mod header;
+mod precision;
+mod storage;
 pub(crate) mod weights;
 
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
 use cuteafd_loader::families::glm5_flash::GlmNextConfig;
@@ -55,23 +59,30 @@ pub(crate) struct EngineArgs {
     /// TP1 FP8 package directory (default `<libdir>/fp8/fp8-glmf/tp1`).
     #[arg(long)]
     pub fp8_package: Option<PathBuf>,
-    /// FP8 expert layers resident at once with --local-experts (7.25 GiB each).
-    #[arg(long, default_value_t = 6)]
-    pub expert_window: usize,
+    /// Diagnostic paging: keep only N local expert layers resident. By default
+    /// all routed experts stay on the GPU; checkpoints that do not fit need Sparks.
+    #[arg(long, requires = "local_experts")]
+    pub expert_window: Option<usize>,
+    /// GPU memory (GiB) kept free of local experts for step workspaces and
+    /// prefix-cache state marks. Attention and recurrent pools are already allocated.
+    #[arg(long, default_value_t = 12)]
+    pub expert_reserve_gib: usize,
     /// Kept for launch scripts: the MLA, dense and shared-expert projections
-    /// are always FP8 (their only copies): the official FP8 release's E4M3
-    /// blocks with --fp8-snapshot, else 128x128 blocks quantized from BF16.
+    /// currently require native FP8 (their only copies), from the primary
+    /// checkpoint or --fp8-snapshot. BF16 sources need a matching exporter;
+    /// this compatibility flag does not permit implicit weight quantization.
     #[arg(long)]
     pub fp8_decode: bool,
     /// The official FP8 checkpoint (zai-org/GLM-5.3-Flash): the MLA, dense and
     /// shared-expert weights (E4M3 with FP32 128x128 block scales).
     #[arg(long)]
     pub fp8_snapshot: Option<PathBuf>,
-    /// FP8 KDA projections for decode rows, quantized per row at load.
+    /// Legacy KDA conversion request. channel/row128 are unsupported until
+    /// all-row consumers can use one resident representation; off preserves BF16.
     #[arg(long, value_enum, default_value = "off")]
     pub kda_fp8: fp8::KdaFp8,
-    /// Decode rows (<= 16) project to the vocabulary through an FP8 copy of the
-    /// LM head (per row x 128-K scales, quantized at load).
+    /// Legacy separate FP8 head request, unsupported until one shared head
+    /// representation covers target and DFlash across every row shape.
     #[arg(long)]
     pub fp8_head: bool,
     /// Numerics gate only: round the KDA projections through NVFP4 (group 16,
@@ -87,10 +98,9 @@ pub(crate) struct EngineArgs {
     pub exl3_window: usize,
     /// Prefill projections that run W8A8 block-FP8 GEMMs (E4M3 activations per
     /// row and 128-K block, FP32 scales): `mla` (q_a|kv_a, q_b, o_proj) and
-    /// `ffn` (dense and shared-expert MLPs) over the FP8 weights, the default
-    /// (the official FP8 release's served numerics; without them those run
-    /// W8A16), `kda-in` / `kda-o` (the KDA in-projection and o_proj, BF16 in the
-    /// release, over their per-row copies; needs --kda-fp8 row128), `all`, or
+    /// `ffn` (dense and shared-expert MLPs) over native FP8 weights, the default
+    /// (without them those run W8A16). `kda-in`, `kda-o` and `all` are
+    /// unsupported until immutable single-copy KDA consumers exist. Use
     /// `none` (MLA and FFN W8A16, KDA BF16).
     #[arg(long, value_enum, value_delimiter = ',', default_value = "mla,ffn")]
     pub fp8_prefill: Vec<Fp8PrefillGroup>,
@@ -102,13 +112,16 @@ pub(crate) struct EngineArgs {
     /// stream mean after its target layers and drafts on this GPU.
     #[arg(long)]
     pub draft: Option<PathBuf>,
-    /// Sequences the drafter keeps a context for and drafts for at once.
-    #[arg(long, default_value_t = 8)]
+    /// Maximum members of one draft batch, independent of context slots.
+    #[arg(long, default_value_t = 16)]
     pub draft_sequences: usize,
-    /// Draft through E4M3 copies of the drafter's GEMM weights and of the LM
-    /// head (false: BF16; the committed tokens are the same either way).
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    pub draft_fp8: bool,
+    /// Context slots (default max(20, draft_sequences)); target head is shared.
+    #[arg(long)]
+    pub draft_context_slots: Option<usize>,
+    /// Explicit calibration-free E4M3 quantization of own drafter GEMMs.
+    /// Unset/false preserves checkpoint BF16; no dual resident matrices.
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub draft_fp8: Option<bool>,
     /// Scale rule of the FP8 copies made from BF16 weights at load (KDA
     /// projections, LM head, drafter): amax / 448, the smallest power of two
     /// >= it (pow2), or per block whichever of the two leaves the smaller
@@ -122,6 +135,40 @@ pub(crate) struct EngineArgs {
     pub l2: crate::shared::l2_prefetch::L2PrefetchArgs,
     #[command(flatten)]
     pub token_io: crate::shared::token_io::TokenIoArgs,
+}
+
+#[cfg(test)]
+mod draft_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Parse {
+        #[command(flatten)]
+        engine: EngineArgs,
+    }
+
+    #[test]
+    fn drafter_defaults_are_checkpoint_bf16_with_independent_capacities() {
+        let parsed = Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native"])
+            .unwrap().engine;
+        assert_eq!(parsed.draft_fp8, None);
+        assert_eq!(parsed.draft_sequences, 16);
+        assert_eq!(parsed.draft_context_slots.unwrap_or(20.max(parsed.draft_sequences)), 20);
+    }
+
+    #[test]
+    fn explicit_fp8_option_and_context_batch_limits_are_forwarded() {
+        for (value, expected) in [("true", true), ("false", false)] {
+            let parsed = Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+                "--draft-fp8", value, "--draft-context-slots", "20", "--draft-sequences", "16"])
+                .unwrap().engine;
+            assert_eq!(parsed.draft_fp8, Some(expected));
+            assert_eq!((parsed.draft_context_slots, parsed.draft_sequences), (Some(20), 16));
+        }
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--draft-fp8", "auto"]).is_err());
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -193,11 +240,23 @@ pub(crate) struct GoldenArgs {
     #[arg(long)]
     pub generate: Option<usize>,
     /// Verify-by-replay check: after --prefill tokens, for every kept count k
-    /// in 1..=N, compare the KDA state after one speculative N-row verify
-    /// committing k rows with the state after k serial single-row steps (and
-    /// after a plain N-row verify for k = N); then time spec + commit.
+    /// in 1..=N, require identical kept logits, KDA state, MLA rows and next
+    /// decode when only the rejected suffix of the same N-row verify changes.
+    /// Serial single-row differences are reported separately (kernel geometry
+    /// may reorder floating point). Also check full commit against plain N-row
+    /// verify, then time spec + commit from identical recurrent state.
     #[arg(long)]
     pub replay_check: Option<usize>,
+    /// Isolate one real routed-expert layer with --local-experts: compare a
+    /// fixed first row across m1/m16/m80 packages and require that changing
+    /// later inputs in the same row geometry cannot change it. No backbone
+    /// weights or drafter load; this checks expert compute, not model KL.
+    #[arg(long)]
+    pub expert_row_check: Option<usize>,
+    /// Dump fixed-token serial and --step-rows-wide layer outputs and router
+    /// inputs to this directory, then report their full-vocabulary KL.
+    #[arg(long)]
+    pub geometry_trace: Option<PathBuf>,
     /// Time verify steps of 1..=N rows per sequence (C sequences, see
     /// --bench-sequences) after --prefill tokens: the step cost by rows.
     #[arg(long)]
@@ -248,9 +307,25 @@ impl Opened {
 }
 
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
+    storage::check(args)?;
     let checkpoint = Checkpoint::open(&args.snapshot)?;
     ensure!(checkpoint.missing_shards.is_empty(), "checkpoint shards missing: {:?}", checkpoint.missing_shards);
     let cfg = GlmNextConfig::read(&args.snapshot)?;
+    let fp8_checkpoint = args.fp8_snapshot.as_deref().map(Checkpoint::open).transpose()?;
+    if let Some(checkpoint) = &fp8_checkpoint {
+        ensure!(checkpoint.missing_shards.is_empty(), "FP8 checkpoint shards missing: {:?}", checkpoint.missing_shards);
+    }
+    header::check_kda_inputs(&checkpoint, &cfg, args.layers.unwrap_or(cfg.layers))?;
+    precision::check_projection_inputs(&checkpoint, fp8_checkpoint.as_ref(), &cfg,
+        args.layers.unwrap_or(cfg.layers))?;
+    if let Some(snapshot) = &args.draft {
+        let head = checkpoint.tensors.iter().find(|t| t.meta.name == "lm_head.weight")
+            .context("DFlash target has no lm_head.weight")?;
+        crate::families::glm5::dflash::check_target_bf16_head(&head.meta,
+            cfg.hidden, cfg.vocab_size, args.fp8_head)?;
+        crate::families::glm5::dflash::check_checkpoint(snapshot, args.draft_fp8,
+            args.draft_context_slots, args.draft_sequences)?;
+    }
     // The expert geometry is process-wide and must be fixed before the native
     // library loads (its expert helpers size rows from it).
     let geometry = cuteafd_core::ExpertGeometry::GLM5_FLASH;
@@ -270,7 +345,6 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     // SAFETY: the library is the cuteafd native shim built for this engine.
     let library = unsafe { NativeLibrary::load(&args.native_lib) }?;
     library.cuda_set_device(args.device)?;
-    let fp8_checkpoint = args.fp8_snapshot.as_deref().map(Checkpoint::open).transpose()?;
     Ok(Opened { checkpoint, fp8_checkpoint, cfg, library, experts })
 }
 
@@ -279,6 +353,7 @@ impl Opened {
     pub fn with_engine<T>(&self, args: &EngineArgs, body: impl FnOnce(&engine::GlmfEngine<'_>) -> Result<T>)
         -> Result<T> {
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
+        programs.capacities().require_context("glm5_flash", args.max_context)?;
         programs.load_all()?;
         let stream = self.library.cuda_stream_create()?;
         let started = Instant::now();
@@ -313,11 +388,11 @@ impl Opened {
             let mask = engine.embedding.host_rows(&[cfg.mask_token])?;
             let file = crate::families::glm5::dflash::prefetch(snapshot).join()
                 .map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
-            let mut drafter = crate::families::glm5::dflash::GlmDrafter::load(&self.library, snapshot, file, stream,
-                args.draft_sequences, args.draft_sequences, mask, true)?;
-            if args.draft_fp8 {
-                drafter.enable_fp8(engine.weights.head.buffer.ptr, args.fp8_scales)?;
-            }
+            let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation
+                ::from_fp8_option(args.draft_fp8);
+            let drafter = crate::families::glm5::dflash::GlmDrafter::load(&self.library, snapshot, file, stream,
+                args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
+                mask, true, representation, args.fp8_scales)?;
             engine.drafter = Some(drafter);
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash2 drafter resident");
         }
@@ -349,12 +424,21 @@ impl Opened {
             let directory = args.fp8_package.clone()
                 .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&args.native_lib, 1, tensors.format()));
             let (free, _) = self.library.cuda_memory_info()?;
-            // An empty window: the package and its scratch; layers load on first use.
-            let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, 0..0, 1, 0,
-                args.prefill_rows, free.saturating_sub(4 << 30))?;
+            ensure!(args.expert_window != Some(0), "--expert-window must be at least 1");
+            let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
+            let first = (0..layers).find(|&layer| !self.cfg.dense[layer]).unwrap_or(layers);
+            let resident = if args.expert_window.is_some() { 0..0 } else { first..layers };
+            let started = Instant::now();
+            let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, resident, 1, 0,
+                args.prefill_rows, free.saturating_sub(args.expert_reserve_gib.saturating_mul(1 << 30)))
+                .context("local routed experts must fit with step and prefix-cache reservations; use --peers for Sparks, \
+                    or --expert-window N for diagnostic paging")?;
+            let loads = experts.layers.len();
+            tracing::info!(layers = loads, window = ?args.expert_window, elapsed_ms = started.elapsed().as_millis() as u64,
+                "GLM 5.3 Flash routed experts resident on this GPU");
             return Ok(Some(engine::Experts::Local(engine::LocalExperts {
                 library: &self.library, tensors, experts: std::cell::RefCell::new(experts),
-                window: args.expert_window.max(1), loads: std::cell::RefCell::new(0),
+                window: args.expert_window, loads: std::cell::RefCell::new(loads),
             })));
         }
         if let Some(catalog) = self.experts.as_ref().filter(|c| c.exl3().is_some()) {
@@ -417,6 +501,9 @@ pub(crate) async fn run_golden(mut args: GoldenArgs) -> Result<()> {
 
 fn golden(args: GoldenArgs) -> Result<()> {
     let opened = open(&args.engine)?;
+    if let Some(rows) = args.expert_row_check {
+        return expert_rows::check(&args.engine, &opened, rows);
+    }
     opened.with_engine(&args.engine, |engine| golden_run(&args, &opened, engine))
 }
 
@@ -464,6 +551,9 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
     }
     if let Some(rows) = args.replay_check {
         return speculate::replay_check(args, engine, rows);
+    }
+    if let Some(dir) = &args.geometry_trace {
+        return speculate::geometry_trace(args, engine, dir);
     }
     if let Some(rows) = args.bench_verify {
         return speculate::bench_verify(args, engine, rows);

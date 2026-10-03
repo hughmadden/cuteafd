@@ -123,6 +123,10 @@ pub struct PlanReport {
     /// Why the family's runtime refuses this configuration, when it does.
     pub config_error: Option<String>,
     pub spec: Option<ModelSpec>,
+    /// Canonical target cache storage, separate from the weight-only verdict.
+    /// Complete serving admission also needs actual loaded representations,
+    /// modules/workspaces, prefix marks and optional drafter reservations.
+    pub cache_requirements: Option<crate::serving_capacity::CacheRequirements>,
     pub components: Vec<ComponentPlan>,
     pub unclassified: Vec<String>,
     pub missing_shards: Vec<String>,
@@ -232,6 +236,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         runtime: None,
         config_error: None,
         spec: None,
+        cache_requirements: None,
         components: Vec::new(),
         unclassified: Vec::new(),
         missing_shards: checkpoint.missing_shards.clone(),
@@ -293,6 +298,14 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         }
     };
     let spec = model.spec();
+    match crate::serving_capacity::cache_requirements(model.as_ref(), &checkpoint.config) {
+        Ok(requirements) => report.cache_requirements = requirements,
+        Err(error) => report.hints.push(Hint {
+            what: format!("cache capacity cannot be described: {error}"),
+            how: "Use a positive checkpoint max_position_embeddings and an implemented family cache geometry; \
+                serving admission must resolve actual GPU and workspace reservations before allocating.".into(),
+        }),
+    }
 
     // Classify every tensor, then group each component's tensors by stem: one
     // operand per logical weight, checked against the family's contract.
@@ -634,6 +647,39 @@ pub fn render(report: &PlanReport) -> String {
             };
             let _ = writeln!(out, "total {:<12} {:>9.2} GiB{per}", owner, *bytes as f64 / GIB);
         }
+    }
+    if let Some(cache) = &report.cache_requirements {
+        let context = cache.checkpoint_max_context_tokens.map_or("missing".to_string(), |v| v.to_string());
+        let capability = if cache.compiled_index_extent_required {
+            "serving manifest must provide the compiled index extent"
+        } else { "dynamic context extent" };
+        let _ = writeln!(out, "context    checkpoint maximum {context}; {capability}");
+        let floor = cache.requested_kv_floor_tokens.map_or("unresolved".to_string(), |v| v.to_string());
+        let _ = writeln!(out, "KV target  {floor} tokens (common default pool); C{} with {} state/ring slots",
+            cache.concurrency, cache.state_slots);
+        for layout in &cache.target_only_layouts {
+            let placement = match layout.placement {
+                crate::serving_capacity::KvPlacement::SingleDevice => "one owner",
+                crate::serving_capacity::KvPlacement::Replicated => "replicated KV",
+                crate::serving_capacity::KvPlacement::PartitionedHeads => "partitioned KV heads",
+            };
+            for (rank, cost) in layout.ranks.iter().enumerate() {
+                let bytes_per_token = cost.persistent_unit_bytes as f64 / layout.logical_unit_rows as f64;
+                let state_gib = cost.active_state_per_sequence_bytes as f64 * f64::from(cache.state_slots) / GIB;
+                let pool = cache.requested_kv_floor_tokens.map_or("unresolved".to_string(), |tokens| {
+                    let units = tokens.div_ceil(layout.logical_unit_rows);
+                    format!("{:.2} GiB", units as f64 * cost.persistent_unit_bytes as f64 / GIB)
+                });
+                let _ = writeln!(out, "  {} RTX rank {rank}: {placement}, {bytes_per_token:.0} KV B/token, \
+                    target {pool}, active state {state_gib:.2} GiB, mark {:.2} MiB/slot",
+                    layout.ranks.len(), cost.retained_mark_bytes as f64 / (1u64 << 20) as f64);
+            }
+        }
+        for unavailable in &cache.unavailable_layouts {
+            let _ = writeln!(out, "  {} RTX cache layout: {}", unavailable.coordinator_ranks, unavailable.reason);
+        }
+        let _ = writeln!(out, "  storage costs only: runtime admission must also reserve actual weights, modules, \
+            all workspace shapes, prefix marks, transport and optional drafters against each GPU's live budget");
     }
     if !report.unclassified.is_empty() {
         let _ = writeln!(out, "\nunclassified tensors: {}", report.unclassified.len());

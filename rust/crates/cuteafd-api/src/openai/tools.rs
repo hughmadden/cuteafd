@@ -314,7 +314,9 @@ mod tests {
                     if !valid && !streaming { assert_eq!(response.status(),StatusCode::INTERNAL_SERVER_ERROR,"{name}/{thinking}"); }
                     else { assert_eq!(response.status(),StatusCode::OK,"{name}/{thinking}"); }
                     let bytes = to_bytes(response.into_body(),1<<20).await;
-                    if !valid && streaming { assert!(bytes.is_err(),"{name}/{thinking}"); }
+                    if !valid && streaming {
+                        crate::openai::tests::terminal_sse_error(&bytes.unwrap());
+                    }
                     else { assert!(bytes.is_ok(),"{name}/{thinking}: {bytes:?}"); }
                     worker.await.unwrap();
                 }
