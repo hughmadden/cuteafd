@@ -936,7 +936,8 @@ impl<'a> SparkDeviceLink<'a> {
         let ranks = peers.len();
         let (written, targets) = if written_responses() {
             let (plane, flags) = written_layout(ranks, capacity, row_bytes);
-            let allocation = DeviceAllocation::new(library, flags + ranks * 64)?;
+            // dma-buf export covers the whole allocation, which must be page-sized.
+            let allocation = DeviceAllocation::new(library, (flags + ranks * 64).next_multiple_of(2 << 20))?;
             library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { ptr: unsafe { allocation.buffer.ptr.cast::<u8>()
                 .add(flags) }.cast(), bytes: ranks * 64, ..allocation.buffer }, &vec![0u8; ranks * 64])?;
             let targets = (0..ranks).map(|rank| cuteafd_transport::DeviceWriteTarget {
