@@ -198,6 +198,7 @@ impl<'a> Exl3Worker<'a> {
         executor_id: u64,
         exchange: &mut HostExpertExchange,
         destination: Option<CuteafdDeviceBuffer>,
+        hidden_view: Option<CuteafdDeviceBuffer>,
     ) -> Result<()> {
         ensure!(
             request.layer() as usize == self.first_layer + self.layer,
@@ -231,9 +232,22 @@ impl<'a> Exl3Worker<'a> {
             cfg!(target_endian = "little"),
             "native exchange requires little-endian storage"
         );
-        // Every previous response completed this stream before returning.
-        self.library
-            .copy_h2d(self.inputs[0].buffer, request.hidden())?;
+        // Every previous response completed this stream before returning. The
+        // hidden rows come as a device copy from the mapped request frame when
+        // the transport exposes one (it outlives this request's stream sync
+        // below), else as a host upload.
+        let hidden_bytes = request.hidden().len();
+        ensure!(hidden_bytes <= self.inputs[0].buffer.bytes, "EXL3 request hidden rows exceed the input buffer");
+        match hidden_view.filter(|view| view.bytes >= hidden_bytes) {
+            // SAFETY: the view is device-visible request storage of at least
+            // `hidden_bytes`, retained by the transport until this request's
+            // response is emitted, which follows the stream synchronize below.
+            Some(view) => unsafe {
+                self.library.copy_d2d_async(self.inputs[0].buffer,
+                    CuteafdDeviceBuffer { bytes: hidden_bytes, ..view }, hidden_bytes, self.stream.raw)?
+            },
+            None => self.library.copy_h2d(self.inputs[0].buffer, request.hidden())?,
+        }
         unsafe {
             self.library.copy_h2d(
                 self.inputs[1].buffer,
@@ -323,6 +337,7 @@ impl<'a> Exl3Worker<'a> {
         executor_id: u64,
         exchange: &mut HostExpertExchange,
         slot: CuteafdDeviceBuffer,
+        hidden: Option<CuteafdDeviceBuffer>,
     ) -> Result<Option<ExpertProtocolV2DeviceResponseRef<'static>>> {
         let prefix = EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
         let bytes = request.plane_bytes()?;
@@ -336,7 +351,7 @@ impl<'a> Exl3Worker<'a> {
             ..slot
         };
         let response = request.response_device(executor_id, output)?;
-        self.execute(request, executor_id, exchange, Some(output))?;
+        self.execute(request, executor_id, exchange, Some(output), hidden)?;
         Ok(Some(response))
     }
 
@@ -357,7 +372,7 @@ impl<'a> Exl3Worker<'a> {
             row_indices.len() >= chunk_rows as usize,
             "response row-index scratch is too short"
         );
-        self.execute(request, executor_id, exchange, None)?;
+        self.execute(request, executor_id, exchange, None, None)?;
         let stride = cuteafd_core::expert_geometry().row_bytes() as usize;
         for start in (0..request.rows()).step_by(chunk_rows as usize) {
             let end = start.saturating_add(chunk_rows).min(request.rows());
