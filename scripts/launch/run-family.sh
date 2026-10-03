@@ -174,12 +174,6 @@ if [[ $serve != serve-dsv4 ]]; then
   [[ -z "$(get FP8_SCALES)" ]] || family_args+=(--fp8-scales "$(get FP8_SCALES)")
   if [[ ${#draft_args[@]} -gt 0 && "$(key SPECULATOR_FP8 DRAFT_FP8 on)" == off ]]; then family_args+=(--draft-fp8 false); fi
 fi
-# DRAFT_FIXED=N: a fixed neural draft count per step instead of the adaptive plan
-# (serve-glm, serve-mimo; byte-exact A/B checks).
-if [[ -n "$(get DRAFT_FIXED)" ]]; then
-  [[ $serve =~ ^serve-(glm|mimo)$ ]] || { echo "DRAFT_FIXED applies to GLM 5.3 and MiMo checkpoints" >&2; exit 2; }
-  family_args+=(--draft-fixed "$(get DRAFT_FIXED)")
-fi
 # Opt-in engine switches set in the launching environment reach the coordinator
 # (CUTEAFD_SPARK_DEVICE=1: decode/verify waves on the device-driven Spark exchange).
 switch_args=()
