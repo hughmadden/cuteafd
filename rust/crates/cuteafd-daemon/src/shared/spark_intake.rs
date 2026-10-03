@@ -760,6 +760,13 @@ pub(crate) fn device_exchange_enabled() -> bool {
     *ENABLED.get_or_init(|| matches!(std::env::var("CUTEAFD_SPARK_DEVICE").as_deref(), Ok("1" | "on" | "true")))
 }
 
+/// With the device exchange, decode steps of engines whose segments need no
+/// host work in between replay as one graph per GPU (`CUTEAFD_SPARK_DEVICE_STEP=1`).
+pub(crate) fn device_step_graphs() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| matches!(std::env::var("CUTEAFD_SPARK_DEVICE_STEP").as_deref(), Ok("1" | "on" | "true")))
+}
+
 impl Drop for SparkDeviceLink<'_> {
     fn drop(&mut self) {
         let stats = self.lane.stats();

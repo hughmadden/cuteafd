@@ -373,6 +373,9 @@ pub(crate) struct MimoEngine<'a> {
     /// publishes each wave, waits for its partials and reduces them, with no
     /// host wait between layers.
     device_link: Option<crate::shared::spark_intake::SparkDeviceLink<'a>>,
+    /// Set while a whole decode step is captured: segments enqueue eagerly into
+    /// that capture instead of through their own graphs ([`Self::graph`]).
+    direct_segments: Cell<bool>,
 }
 
 /// One Spark request: `t` rows of `dtype` input with `topk` routes each, the
@@ -462,7 +465,7 @@ impl<'a> MimoEngine<'a> {
             wave_timing: std::env::var("CUTEAFD_MIMO_WAVE_TIMING").is_ok_and(|v| v == "1"), drafter: None, mtp: None, l2: None, embedding,
             mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20)?, 0)), prefill_w8a8: true, kv_cache,
             decode_graphs: false, graphs: RefCell::new(HashMap::new()), late_captures: Cell::new(0),
-            device_link: None })
+            device_link: None, direct_segments: Cell::new(false) })
     }
 
     /// Layer `layer`'s KV storage: the paged record pool (full attention; page `p` holds
@@ -1164,11 +1167,16 @@ impl<'a> MimoEngine<'a> {
             _ => [std::ptr::null(); MAX_RANKS],
         };
         let bf16_input = matches!(self.experts, Some(Experts::Spark { .. })) && self.expert_input.bf16(true);
+        let direct = self.direct_segments.get();
+        if let (true, true, false, true, Some(link)) =
+            (launch, device, direct, crate::shared::spark_intake::device_step_graphs(), &self.device_link) {
+            return self.decode_step_graph(link, w, w1, tables, t, gather, head);
+        }
         for index in 0..=layers.len() {
             let previous = self.previous(index);
             let last = index == layers.len();
             let key = GraphKey { layer: index, rows: t, table_stride: tables.table_stride, previous, head: head && last };
-            if let (true, true, Some(link)) = (launch, device && !last && !layers[index].dense, &self.device_link) {
+            if let (true, true, Some(link)) = (launch && !direct, device && !last && !layers[index].dense, &self.device_link) {
                 // The segment publishes this layer's wave: announced before the replay can.
                 link.expect(1);
             }
@@ -1204,6 +1212,47 @@ impl<'a> MimoEngine<'a> {
                 None => anyhow::bail!("layer {index} is an MoE layer; pass Spark peers for its routed experts"),
             }
             crate::shared::console::layer_mark(index);
+        }
+        Ok(())
+    }
+
+    /// A decode step under the device exchange as one graph per GPU (`CUTEAFD_SPARK_DEVICE_STEP=1`):
+    /// the segments of [`Self::decode_layers`] back to back, captured the first time a shape is seen
+    /// (`layer: usize::MAX` keys a whole step).
+    #[allow(clippy::too_many_arguments)]
+    fn decode_step_graph(&self, link: &crate::shared::spark_intake::SparkDeviceLink<'_>, w: &Workspace<'_>,
+        w1: Option<&Workspace<'_>>, tables: &StepTables, t: usize, gather: bool, head: bool) -> Result<()> {
+        let key = GraphKey { layer: usize::MAX, rows: t, table_stride: tables.table_stride, previous: Previous::First, head };
+        if !self.graphs.borrow().contains_key(&key) {
+            self.late_captures.set(self.late_captures.get() + 1);
+            // SAFETY: capture records launches on both ranks' streams (thread-local
+            // mode); nothing in the segments synchronizes the host.
+            self.on(0, || unsafe { self.library.cuda_graph_begin_capture(self.stream) })?;
+            if w1.is_some() {
+                self.on(1, || unsafe { self.library.cuda_graph_begin_capture(self.stream_of(1)) })?;
+            }
+            self.direct_segments.set(true);
+            let queued = self.decode_layers(w, w1, tables, t, gather, head, true);
+            self.direct_segments.set(false);
+            let first = self.on(0, || unsafe { self.library.cuda_graph_end_capture(self.stream) });
+            let second = w1.map(|_| self.on(1, || unsafe { self.library.cuda_graph_end_capture(self.stream_of(1)) }))
+                .transpose();
+            queued?;
+            self.graphs.borrow_mut().insert(key, GraphExec(first?, self.library));
+            if let (Some(second), Some(peer)) = (second?, &self.peer) {
+                peer.graphs.borrow_mut().insert(key, GraphExec(second, self.library));
+            }
+            tracing::debug!(rows = t, "MiMo decode step captured whole");
+        }
+        let waves = self.weights.layers.iter().filter(|l| !l.dense).count();
+        // Announced before the replay can publish them: the proxy spins for them.
+        link.expect(waves as u64);
+        let graphs = self.graphs.borrow();
+        // SAFETY: the graphs' pointers are persistent engine buffers of each rank.
+        self.on(0, || unsafe { self.library.cuda_graph_launch(graphs[&key].0, self.stream) })?;
+        if let (Some(_), Some(peer)) = (w1, &self.peer) {
+            let peer = peer.graphs.borrow();
+            self.on(1, || unsafe { self.library.cuda_graph_launch(peer[&key].0, self.stream_of(1)) })?;
         }
         Ok(())
     }
@@ -1350,6 +1399,10 @@ impl<'a> MimoEngine<'a> {
             _ => &self.graphs,
         };
         let stream = self.stream_of(rank);
+        if self.direct_segments.get() {
+            // Inside a whole-step capture: the segment's launches join it.
+            return segment();
+        }
         if let Some(graph) = graphs.borrow().get(&key) {
             if !launch {
                 return Ok(());

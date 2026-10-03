@@ -183,7 +183,7 @@ fi
 # Opt-in engine switches set in the launching environment reach the coordinator
 # (CUTEAFD_SPARK_DEVICE=1: decode/verify waves on the device-driven Spark exchange).
 switch_args=()
-for switch_name in CUTEAFD_SPARK_DEVICE CUTEAFD_SPARK_WRITE CUTEAFD_MIMO_DECODE_GRAPHS; do
+for switch_name in CUTEAFD_SPARK_DEVICE CUTEAFD_SPARK_DEVICE_STEP CUTEAFD_SPARK_WRITE CUTEAFD_MIMO_DECODE_GRAPHS; do
   [[ -z "${!switch_name:-}" ]] || switch_args+=(-e "$switch_name=${!switch_name}")
 done
 # SERVED_MODEL_ID: the public model id (default: the checkpoint's Hugging Face id).

@@ -950,6 +950,52 @@ impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn decode_layers(&self, w: &Workspace<'_>, w1: Option<&Workspace<'_>>, tables: &StepTables, t: usize,
         experts: &mut Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>, gather: bool, head: bool) -> Result<()> {
+        let Some(link) = self.device_link.as_ref().filter(|_| self.skip.is_none() && crate::shared::spark_intake::device_step_graphs())
+        else {
+            return self.decode_layers_on(w, w1, tables, t, experts, gather, head, false);
+        };
+        // The whole step as one graph per GPU (the device exchange leaves no host
+        // work between segments); `layer: usize::MAX` keys a whole step.
+        let key = GraphKey { layer: usize::MAX, rows: t, table_width: tables.table_width,
+            table_stride: tables.table_stride, previous: Previous::First, head };
+        let captured = self.graphs.borrow().contains_key(&key);
+        if !captured {
+            // SAFETY: capture records launches on both ranks' streams (thread-local
+            // mode); nothing in the segments synchronizes the host.
+            self.on(0, || unsafe { self.library.cuda_graph_begin_capture(self.stream) })?;
+            if w1.is_some() {
+                self.on(1, || unsafe { self.library.cuda_graph_begin_capture(self.stream_of(1)) })?;
+            }
+            let queued = self.decode_layers_on(w, w1, tables, t, experts, gather, head, true);
+            let first = self.on(0, || unsafe { self.library.cuda_graph_end_capture(self.stream) });
+            let second = w1.map(|_| self.on(1, || unsafe { self.library.cuda_graph_end_capture(self.stream_of(1)) }))
+                .transpose();
+            queued?;
+            self.graphs.borrow_mut().insert(key, GraphExec(first?, self.library));
+            if let Some(second) = second? {
+                self.peer()?.graphs.borrow_mut().insert(key, GraphExec(second, self.library));
+            }
+            tracing::debug!(rows = t, table_width = tables.table_width, "GLM decode step captured whole");
+        }
+        let waves = self.weights.layers.iter().filter(|l| !l.dense).count();
+        // Announced before the replay can publish them: the proxy spins for them.
+        link.expect(waves as u64);
+        let graphs = self.graphs.borrow();
+        // SAFETY: the graphs' pointers are persistent engine buffers of each rank.
+        self.on(0, || unsafe { self.library.cuda_graph_launch(graphs[&key].0, self.stream) })?;
+        if w1.is_some() {
+            let peer = self.peer()?.graphs.borrow();
+            self.on(1, || unsafe { self.library.cuda_graph_launch(peer[&key].0, self.stream_of(1)) })?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::decode_layers`] segment by segment; `direct`: enqueue every segment
+    /// eagerly (into a whole-step capture) instead of through its own graph.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_layers_on(&self, w: &Workspace<'_>, w1: Option<&Workspace<'_>>, tables: &StepTables, t: usize,
+        experts: &mut Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>, gather: bool, head: bool, direct: bool)
+        -> Result<()> {
         let rows = Scalar::I32(t as i32);
         let layers = &self.weights.layers;
         let bytes = t * self.cfg.hidden * 2;
@@ -1040,18 +1086,18 @@ impl<'a> GlmEngine<'a> {
             };
             let key = GraphKey { layer: index, rows: t, table_width: tables.table_width,
                 table_stride: tables.table_stride, previous, head: head && layer.is_none() };
-            if let (Some(link), Some(layer)) = (device, layer) {
+            if let (Some(link), Some(layer), false) = (device, layer, direct) {
                 if !layer.dense {
                     // Announced before the replay can publish it: the proxy spins for it.
                     link.expect(1);
                 }
             }
-            self.replay_on(0, key, segment)?;
+            if direct { segment()?; } else { self.replay_on(0, key, segment)?; }
             if let Some(w1) = w1 {
                 // Rank 1's segments: layer 0 with rank 0's first, then each next one before
                 // the host waits in this layer's exchange.
                 if index == 0 {
-                    self.peer_segment(0, Previous::First, w1, t, tables, bytes)?;
+                    self.peer_segment(0, Previous::First, w1, t, tables, bytes, direct)?;
                 }
                 if let Some(layer) = layer.filter(|_| index + 1 < layers.len()) {
                     let kind = if layer.dense { Previous::Delta } else { Previous::Planes(0) };
@@ -1059,7 +1105,7 @@ impl<'a> GlmEngine<'a> {
                     if let (false, Some(l2)) = (layer.dense, self.peer()?.l2.as_ref()) {
                         self.on(1, || l2.issue(self.library, index, self.stream_of(1)))?;
                     }
-                    self.peer_segment(index + 1, kind, w1, t, tables, bytes)?;
+                    self.peer_segment(index + 1, kind, w1, t, tables, bytes, direct)?;
                 }
             }
             previous = match layer {
@@ -1082,8 +1128,9 @@ impl<'a> GlmEngine<'a> {
     /// the previous layer's FFN exchange (rank 0's dense partial or routed +
     /// shared sum in) and this layer's input norm, its heads' attention and the
     /// attention all-reduce, then its dense partial or shared-expert half out.
+    #[allow(clippy::too_many_arguments)]
     fn peer_segment(&self, index: usize, previous: Previous, w1: &Workspace<'_>, t: usize, tables: &StepTables,
-        bytes: usize) -> Result<()> {
+        bytes: usize, direct: bool) -> Result<()> {
         let peer = self.peer()?;
         let rows = Scalar::I32(t as i32);
         let segment = || -> Result<()> {
@@ -1115,7 +1162,7 @@ impl<'a> GlmEngine<'a> {
         };
         let key = GraphKey { layer: index, rows: t, table_width: tables.table_width, table_stride: tables.table_stride,
             previous, head: false };
-        self.replay_on(1, key, segment)
+        if direct { segment() } else { self.replay_on(1, key, segment) }
     }
 
     /// Launches `segment` through a graph captured the first time `key` is seen.
