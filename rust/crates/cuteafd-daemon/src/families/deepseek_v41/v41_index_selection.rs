@@ -488,7 +488,14 @@ impl<'a> IndexSelectionWave<'a> {
                 "candidate source is unexpected for this layer"
             );
         }
-        let width = (max_length as usize).max(1).div_ceil(8).min(WIDTH / 8) * 8;
+        // Device-ordered passes (`CUTEAFD_V41_DEVICE`) round the tile width up to
+        // 512 candidates: rows already mask positions past their own length, and
+        // a width per 8 compressed tokens re-captured these graphs while serving.
+        let width = if crate::shared::memory::chain::device_enabled() {
+            (max_length as usize).max(1).div_ceil(512).saturating_mul(512).min(WIDTH)
+        } else {
+            (max_length as usize).max(1).div_ceil(8).min(WIDTH / 8) * 8
+        };
         let use_candidates = query.layer > 20 && max_length > WIDTH as u64;
         let tiles = (max_length as usize).div_ceil(width).max(1);
         fingerprint.extend([width, usize::from(use_candidates)]);
