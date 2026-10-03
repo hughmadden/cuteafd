@@ -122,7 +122,9 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
            blocks_per_sm: int | None = None, paired_boundary: str | None = None,
            tile: tuple[int, ...] | None = None, hidden: int = 5120, route_block: int = 8,
            token_major_rotation: bool = False, swiglu_limit: float | None = 10.0,
-           fused_input_rotation: bool = False, warp_specialized: bool = False) -> dict:
+           fused_input_rotation: bool = False, warp_specialized: bool = False,
+           wire_input: bool = False, ws_input_stages: int | None = None,
+           ws_dynamic_tiles: bool = False) -> dict:
     if paired_boundary not in (None, "first", "last"):
         raise ValueError("paired boundary must be first, last, or None")
     if paired_boundary is not None and (intermediate != 640 or len(bits) != 2 or topk != 6
@@ -157,6 +159,20 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
                              or fused_input_rotation or token_major_rotation):
         raise ValueError("warp-specialized prefill requires a disjoint two-tier export with 16+ "
                          "row blocks and brings its own input rotation")
+    # Wire input: the warp-specialized FC1 producers read the E4M3 + UE8M0 K32
+    # wire rows ([H] E4M3 then [H/32] UE8M0 bytes per row) and widen them in
+    # shared memory to the FP16 values the BF16 path gets from the decoded rows
+    # (bit-identical), so the worker skips its BF16 decode pass.
+    if wire_input and (not warp_specialized or hidden % 512):
+        raise ValueError("wire input requires the warp-specialized kernel and hidden % 512 == 0")
+    # Warp-specialized input-row ring depth (bit-identical; latency hiding only).
+    if ws_input_stages is not None and (not warp_specialized or ws_input_stages not in range(2, 7)):
+        raise ValueError("input stages (2..6) apply to the warp-specialized kernel only")
+    # Dynamic tile claims (bit-identical): CTAs take tiles from a counter in the
+    # zero-on-create workspace, so an expert's route blocks start together and
+    # share its weight stream through L2.
+    if ws_dynamic_tiles and not warp_specialized:
+        raise ValueError("dynamic tile claims apply to the warp-specialized kernel only")
     if output_dtype not in ("bf16", "fp32"):
         raise ValueError("EXL3 output must be bf16 or fp32")
     # Disk-loaded B12x executors omit the compiler IR required by export_to_c.
@@ -211,6 +227,12 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
             rotation = {"fused_input_rotation": True}
         if warp_specialized and not direct:
             rotation = {"warp_specialized": True}
+            if wire_input:
+                rotation["input_format"] = "e4m3_k32"
+            if ws_input_stages is not None:
+                rotation["ws_input_stages"] = ws_input_stages
+            if ws_dynamic_tiles:
+                rotation["ws_dynamic_tiles"] = True
         launch = compile_mixed_trellis(**options, direct_topk_routes=direct,
                                       force_blocks_per_sm=blocks_per_sm, **rotation)
     elif len(bits) == 3:
@@ -273,6 +295,12 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         manifest["route_block"] = block_m
     if warp_specialized and not direct:
         manifest["warp_specialized"] = True
+        if wire_input:
+            manifest["input_format"] = "e4m3_k32"
+        if ws_input_stages is not None:
+            manifest["ws_input_stages"] = ws_input_stages
+        if ws_dynamic_tiles:
+            manifest["ws_dynamic_tiles"] = True
     elif fused_input_rotation and not direct:
         manifest["fused_input_rotation"] = True
     elif token_major_rotation and not direct:
@@ -316,6 +344,12 @@ def main() -> None:
                         help="FC1 rotates staged token rows itself (packed 16+ row blocks)")
     parser.add_argument("--warp-specialized", action="store_true",
                         help="Warp-specialized prefill kernels (packed 16+ row blocks)")
+    parser.add_argument("--wire-input", action="store_true",
+                        help="Warp-specialized FC1 reads E4M3 + UE8M0 K32 wire rows (no BF16 decode)")
+    parser.add_argument("--ws-input-stages", type=int, choices=range(2, 7),
+                        help="Warp-specialized input-row ring depth (default: kernel policy)")
+    parser.add_argument("--ws-dynamic-tiles", action="store_true",
+                        help="Warp-specialized CTAs claim tiles from a workspace counter")
     parser.add_argument("--token-major-rotation", action="store_true",
                         help="Rotate each token's input once for all of its routes (packed routes)")
     parser.add_argument("--tile", help="Offline disjoint-layout tile override fc1_k,fc1_n,fc2_k,fc2_n "
@@ -326,7 +360,8 @@ def main() -> None:
            tile=None if args.tile is None else tuple(args.tile.split(",")), hidden=args.hidden,
            route_block=args.route_block, token_major_rotation=args.token_major_rotation,
            fused_input_rotation=args.fused_input_rotation,
-           warp_specialized=args.warp_specialized,
+           warp_specialized=args.warp_specialized, wire_input=args.wire_input,
+           ws_input_stages=args.ws_input_stages, ws_dynamic_tiles=args.ws_dynamic_tiles,
            swiglu_limit=None if args.swiglu_limit.lower() == "none" else float(args.swiglu_limit))
 
 
