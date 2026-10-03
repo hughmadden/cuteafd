@@ -569,4 +569,11 @@ if(CUTEAFD_ENABLE_CUDA)
   target_link_libraries(cuteafd_v41_sampling_selftest PRIVATE cuteafd_native CUDA::cudart)
   add_test(NAME cuteafd_v41_sampling_selftest COMMAND cuteafd_v41_sampling_selftest)
   set_tests_properties(cuteafd_v41_sampling_selftest PROPERTIES SKIP_RETURN_CODE 77)
+  # Sparse MLA prefill kernels (F16, E4M3) against an FP64 reference, determinism and times.
+  add_executable(cuteafd_glm_mla_prefill_selftest tests/glm_mla_prefill_selftest.cu)
+  set_target_properties(cuteafd_glm_mla_prefill_selftest PROPERTIES
+    CUDA_ARCHITECTURES "${CUTEAFD_CUDA_ARCHITECTURES}")
+  target_link_libraries(cuteafd_glm_mla_prefill_selftest PRIVATE cuteafd_native CUDA::cudart)
+  add_test(NAME cuteafd_glm_mla_prefill_selftest COMMAND cuteafd_glm_mla_prefill_selftest 512 656 64 2)
+  add_test(NAME cuteafd_glm_mla_prefill_selftest_528 COMMAND cuteafd_glm_mla_prefill_selftest 512 528 64 2)
 endif()

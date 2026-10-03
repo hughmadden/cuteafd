@@ -1471,7 +1471,7 @@ impl<'a> GlmfEngine<'a> {
             let kv = self.kv[index].as_ref().context("MLA trace without a record pool")?;
             std::fs::write(dir.join("mla_kv.bin"), self.download(kv, kv.buffer.bytes)?)?;
         }
-        if !tables.decode && crate::families::glm5::engine::native_mla_prefill() {
+        if let (false, Some(kernel)) = (tables.decode, crate::families::glm5::engine::native_mla_prefill()) {
             let scale = (self.cfg.qk_nope_dim as f32).powf(-0.5);
             self.timed("glm_mla_prefill (native)", || {
                 // SAFETY: query, record cache, indices, lengths and the latent output
@@ -1479,9 +1479,18 @@ impl<'a> GlmfEngine<'a> {
                 unsafe {
                     self.library.glm_mla_prefill(w.query.buffer.ptr, cache, w.indices.buffer.ptr, w.lengths.buffer.ptr,
                         w.latent.buffer.ptr, tables.positions.len(), self.cfg.heads, SPARSE_TOPK, RECORD_BYTES,
-                        scale * std::f32::consts::LOG2_E, self.stream)
+                        scale * std::f32::consts::LOG2_E, kernel, self.stream)
                 }
             })?;
+            if crate::families::glm5::engine::mla_prefill_check() {
+                // SAFETY: as above; the check synchronizes the stream.
+                let stats = unsafe {
+                    self.library.glm_mla_prefill_check(w.query.buffer.ptr, cache, w.indices.buffer.ptr,
+                        w.lengths.buffer.ptr, tables.positions.len(), self.cfg.heads, SPARSE_TOPK, RECORD_BYTES,
+                        scale * std::f32::consts::LOG2_E, self.stream)
+                }?;
+                crate::families::glm5::engine::print_mla_check(index, &stats);
+            }
         } else {
             self.run(&format!("sparse_mla_{mode}_{cap}"), &[("q", w.query.buffer.ptr), ("kv_cache", cache),
                 ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr), ("out", w.latent.buffer.ptr),
