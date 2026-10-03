@@ -81,7 +81,10 @@ pub(super) fn preflight(
                 .context("MiMo aggregate page bytes")?;
             let layout = cuteafd_engine::prefix::FamilyLayout {
                 page_rows: super::engine::PAGE_ROWS,
-                pages: args.pool_tokens.div_ceil(super::engine::PAGE_ROWS),
+                // An automatic pool is at most the common target; the host tier sizes for that.
+                pages: if args.pool_tokens == 0 {
+                    usize::try_from(cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS)?
+                } else { args.pool_tokens }.div_ceil(super::engine::PAGE_ROWS),
                 page_bytes: usize::try_from(page_bytes)?,
                 mark_bytes: usize::try_from(mark_bytes)?,
                 draft_bytes: 0,
@@ -298,7 +301,8 @@ pub(super) fn preflight(
     let policy = CapacityPolicy {
         concurrency: u32::try_from(concurrency)?,
         max_context_tokens: Some(args.max_context as u64),
-        pool_tokens: Some(args.pool_tokens as u64),
+        // 0: the largest pool every GPU admits after all fixed costs, up to the target.
+        pool_tokens: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         ..CapacityPolicy::default()
     };
     let report = reservation_report(&profiles.steady, &memory, policy)?;

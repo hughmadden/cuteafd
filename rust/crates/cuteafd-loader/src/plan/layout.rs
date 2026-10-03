@@ -117,8 +117,10 @@ fn share_of(family: &str, component: Component) -> Share {
 }
 
 /// Lays out `report` (a `plan` of the checkpoint) on the inventory.
-pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, options: &LayoutOptions) -> MemoryLayout {
+pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &super::Checkpoint,
+    options: &LayoutOptions) -> MemoryLayout {
     let family = report.family.as_deref().unwrap_or("unknown");
+    let conversions = load_conversions(family, checkpoint);
     let costs = family_costs(family);
     let gpus = options.rtx_bytes.len().clamp(1, 2);
     let split = gpus == 2 && options.head_split;
@@ -131,8 +133,11 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, options: &Lay
 
     // Coordinator weights.
     for component in report.components.iter().filter(|c| c.owner == Owner::Rtx && c.status != Status::Unused) {
-        let resident = (component.bytes as f64 * costs.resident_factor) as u64;
-        let format = component.formats.keys().cloned().collect::<Vec<_>>().join("+");
+        let (resident, format) = match conversions.iter().find(|c| c.component == component.component) {
+            Some(c) => (component.bytes.saturating_sub(c.saved_bytes), c.format.to_string()),
+            None => ((component.bytes as f64 * costs.resident_factor) as u64,
+                component.formats.keys().cloned().collect::<Vec<_>>().join("+")),
+        };
         let category = match component.component {
             Component::Embedding => Category::Embedding,
             Component::Speculator | Component::SpeculatorExpert => Category::Drafter,
@@ -230,4 +235,35 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, options: &Lay
         }
     }
     MemoryLayout { devices, pool_tokens, waste, notes }
+}
+
+/// A component the family loader converts at load: bytes saved against the
+/// checkpoint's source storage, and the resident format.
+struct Conversion {
+    component: Component,
+    saved_bytes: u64,
+    format: &'static str,
+}
+
+fn load_conversions(family: &str, checkpoint: &super::Checkpoint) -> Vec<Conversion> {
+    use crate::families::mimo_v2::projection::{MimoProjectionLayout, MimoProjectionRepresentation as R};
+    use crate::families::mimo_v2::weight_policy::{default_policy, MimoDefaultPolicy};
+    match family {
+        // The qualified MiMo V2.6 Pro default stores the head and every target
+        // o_proj as FP8 (one copy), not the checkpoint's BF16.
+        "mimo_v2" => {
+            let Ok(cfg) = crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config) else { return Vec::new() };
+            if default_policy(checkpoint, &cfg) != MimoDefaultPolicy::QualifiedProFp8 {
+                return Vec::new();
+            }
+            let bytes = |rows: usize, cols: usize, r: R, ranks: u64| MimoProjectionLayout::new(rows as u64, cols as u64, r, ranks)
+                .ok().and_then(|l| l.resident_bytes().ok()).unwrap_or(0);
+            let head = bytes(cfg.vocab_size, cfg.hidden, R::Bf16, 1).saturating_sub(bytes(cfg.vocab_size, cfg.hidden, R::Fp8, 1));
+            let o = cfg.heads * cfg.v_head_dim;
+            let output = (bytes(cfg.hidden, o, R::Bf16, 1).saturating_sub(bytes(cfg.hidden, o, R::Fp8, 1))) * cfg.layers as u64;
+            vec![Conversion { component: Component::LmHead, saved_bytes: head, format: "fp8-block128" },
+                Conversion { component: Component::Attention, saved_bytes: output, format: "fp8-block128" }]
+        }
+        _ => Vec::new(),
+    }
 }

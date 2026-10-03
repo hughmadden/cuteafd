@@ -136,7 +136,9 @@ case $family in
     [[ "$(get HOST_CACHE_BYTES 0)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES)") ;;
 esac
 if [[ $family == mimo_v2 ]]; then
-  family_args+=(--pool-tokens "$(get POOL_TOKENS 131072)")
+  # POOL_TOKENS=auto: the largest pool every GPU admits after all fixed costs (up to 2M tokens).
+  mimo_pool="$(get POOL_TOKENS 131072)"; [[ "$mimo_pool" != auto ]] || mimo_pool=0
+  family_args+=(--pool-tokens "$mimo_pool")
   # PREFIX_PARTIAL=on: V4.1-style partial reuse (approximate; off = exact restores only).
   family_args+=(--prefix-partial "$(get PREFIX_PARTIAL off)")
   # KV_CACHE: int8 (the engine default: 8-bit full-attention records with FP32 scales per 32

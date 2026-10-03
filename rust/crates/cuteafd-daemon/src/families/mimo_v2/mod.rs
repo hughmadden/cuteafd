@@ -49,7 +49,9 @@ pub(crate) struct EngineArgs {
     /// Longest sequence (the RoPE tables and page tables).
     #[arg(long, default_value_t = 32768)]
     pub max_context: usize,
-    /// Tokens the full-attention record pool holds across sequences.
+    /// Tokens the full-attention record pool holds across sequences; 0 sizes
+    /// it from what every GPU has left after weights, workspaces, graphs and
+    /// the drafter (capacity admission), up to the common 2M-token target.
     #[arg(long, default_value_t = 131_072)]
     pub pool_tokens: usize,
     /// Full-attention KV record format: int8 (signed bytes with an FP32 scale

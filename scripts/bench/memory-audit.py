@@ -33,6 +33,37 @@ GROUPS = [
 ]
 
 
+def category(scope):
+    """Planner category of a ledger scope (mirrors cuteafd_core::memory_layout::Category::of_scope)."""
+    root = scope.split("/")[0]
+    simple = {"weights": "weights", "embedding": "embedding", "experts": "experts", "local-experts": "experts",
+              "drafter": "drafter", "kv": "kv", "prefix": "prefix", "workspace": "workspace", "sampler": "workspace",
+              "spark-intake": "workspace", "probe": "workspace", "transport": "transport", "peer-split": "transport",
+              "staging": "staging", "mapped-table": "tables", "ple": "tables"}
+    if root in simple:
+        return simple[root]
+    if root == "v41":
+        stage = scope[4:]
+        low = stage.lower()
+        if "draft" in low:
+            return "drafter"
+        if "engram" in low:
+            return "tables"
+        if "weights" in low:
+            return "weights"
+        if low.startswith("kv") or "kv cache" in low:
+            return "kv"
+        if "prefix" in low or "snapshot" in low:
+            return "prefix"
+        if "expert" in low:
+            return "experts"
+        if "transport" in low or "tp2" in low:
+            return "transport"
+        if "workspace" in low or "lane" in low or "vision" in low:
+            return "workspace"
+    return "runtime"
+
+
 def group(stem):
     for pattern, name in GROUPS:
         if stem and re.search(pattern, stem):
@@ -70,6 +101,11 @@ def summarize(report):
         weights[(space, device, group(tensor), fmt or "native")] += nbytes
     for dev in report.get("devices", []):
         entry = dict(dev)
+        cats = defaultdict(int)
+        for scope, nbytes in dev.get("scopes", {}).items():
+            cats[category(scope)] += nbytes
+        cats["runtime"] += max(dev.get("untracked", 0), 0)
+        entry["categories"] = dict(cats)
         entry["weights"] = {f"{g}/{f}": b for (s, d, g, f), b in sorted(weights.items())
                             if s != "pinned" and d == dev["device"]}
         out["devices"].append(entry)
@@ -83,6 +119,8 @@ def render(path, summary):
     for dev in summary["devices"]:
         print(f"device {dev['device']}: used {gib(dev.get('used', 0))} GiB of {gib(dev.get('total', 0))}, "
               f"tracked {gib(dev['tracked'])}, untracked {gib(dev.get('untracked', 0))}, peak tracked {gib(dev['peak'])}")
+        print("   by category: " + ", ".join(f"{c} {n / GIB:.2f}" for c, n in
+                                             sorted(dev["categories"].items(), key=lambda kv: -kv[1])))
         for scope, nbytes in sorted(dev["scopes"].items(), key=lambda kv: -kv[1]):
             print(f"   {scope:<44} {gib(nbytes)}")
         if dev["weights"]:

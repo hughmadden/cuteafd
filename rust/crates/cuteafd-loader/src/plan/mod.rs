@@ -408,7 +408,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
     }
     place(&mut report, options, spec, model.as_ref(), &routed_operands);
     if let Some(layout_options) = &options.layout {
-        report.memory_layout = Some(layout::layout(&report, model.as_ref(), layout_options));
+        report.memory_layout = Some(layout::layout(&report, model.as_ref(), &checkpoint, layout_options));
     }
     if !report.unclassified.is_empty() {
         report.hints.push(Hint {
