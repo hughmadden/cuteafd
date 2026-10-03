@@ -349,6 +349,18 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     // points at state (KV or recurrent rows a verify left behind).
     let noise = RowNoise::between(on_record, off_record, off_record.prompt_ids.len() + same);
     noise.record(check);
+    // And whether one-row decoding is even reproducible: the same request
+    // again without drafts. Rows that differ here are run-to-run
+    // nondeterminism (reduction order), not anything a verify does.
+    let again = run.client.chat(plain(&text, TOKENS), Some(spec(true)))?;
+    let again_record = probe_of(&again)?;
+    let same_again = b.iter().zip(&again_record.generated).take_while(|(x, y)| x == y).count();
+    let repeat = RowNoise::between(again_record, off_record, off_record.prompt_ids.len() + same_again);
+    check.set("repeat_identical_prefix", same_again as u64);
+    check.set("repeat_rows_identical", repeat.identical as u64);
+    check.set("repeat_noise_max", repeat.max);
+    let repeat_note = format!("; drafts off twice: {same_again} of {} tokens identical, {} of {} rows byte-identical, \
+        up to {:.3} nats", b.len(), repeat.identical, repeat.compared, repeat.max);
     // Verify rows and single-row steps may round differently: a flip where the
     // top two candidates are within rounding of each other is a tie, not a loss.
     let position = off_record.prompt_ids.len() + same;
@@ -366,13 +378,13 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     if tie {
         check.status = CheckStatus::Pass;
         check.summary = format!("{speculator}: identical up to token {same} of {}, then a near-tie flips \
-            (top-two margin {:.3} nats) {rates}{}", a.len().max(b.len()), margins.0.or(margins.1).unwrap_or(0.0),
+            (top-two margin {:.3} nats) {rates}{}{repeat_note}", a.len().max(b.len()), margins.0.or(margins.1).unwrap_or(0.0),
             noise.describe());
     } else {
         check.status = CheckStatus::Fail;
-        check.summary = format!("{speculator}: greedy output diverges at token {same} of {}{} {rates}{}",
+        check.summary = format!("{speculator}: greedy output diverges at token {same} of {}{} {rates}{}{}",
             a.len().max(b.len()), margins.0.or(margins.1).map(|m| format!(" (top-two margin {m:.3} nats)"))
-                .unwrap_or_default(), noise.describe());
+                .unwrap_or_default(), noise.describe(), repeat_note);
     }
     Ok(())
 }
