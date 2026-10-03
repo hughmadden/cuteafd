@@ -626,7 +626,7 @@ done
 # Loading leaves checkpoint pages cached on every Spark (sparknest passthrough), and GB10
 # CUDA allocations do not reclaim page cache: drop it once every rank is resident.
 # CUTEAFD_SPARK_DROP_PAGE_CACHE=0 keeps it.
-if [[ "${CUTEAFD_SPARK_DROP_PAGE_CACHE:-1}" != 0 ]] && command -v nest >/dev/null; then
+if ((${#hosts[@]} > 0)) && [[ "${CUTEAFD_SPARK_DROP_PAGE_CACHE:-1}" != 0 ]] && command -v nest >/dev/null; then
   drop_hosts=(); for host in "${hosts[@]}"; do drop_hosts+=(--host "$host"); done
   nest drop-caches "${drop_hosts[@]}" >/dev/null || echo "warning: could not drop Spark page caches after loading" >&2
 fi

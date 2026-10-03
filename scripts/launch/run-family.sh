@@ -145,7 +145,9 @@ case $family in
 esac
 if [[ $family == mimo_v2 ]]; then
   # POOL_TOKENS=auto: the largest pool every GPU admits after all fixed costs (up to 2M tokens).
-  mimo_pool="$(get POOL_TOKENS 131072)"; [[ "$mimo_pool" != auto ]] || mimo_pool=0
+  # Default auto (measured 2026-10-03, MiMo V2.6 Pro 2 RTX + 6: 131072 -> 2,097,152 tokens, C1/C4/8K
+  # prefill unchanged); a number pins the pool.
+  mimo_pool="$(get POOL_TOKENS auto)"; [[ "$mimo_pool" != auto ]] || mimo_pool=0
   family_args+=(--pool-tokens "$mimo_pool")
   # PREFIX_PARTIAL=on: V4.1-style partial reuse (approximate; off = exact restores only).
   family_args+=(--prefix-partial "$(get PREFIX_PARTIAL off)")
@@ -205,7 +207,8 @@ if [[ $family == glm5_flash ]]; then
       exit 2 ;;
     *) echo "GLM5_FLASH_KDA_FP8 must be auto, off, row128 or channel" >&2; exit 2 ;;
   esac
-  glmf_pool="$(get POOL_TOKENS 65536)"; [[ "$glmf_pool" != auto ]] || glmf_pool=0
+  # Default auto (GLM 5.3 Flash 1 RTX + 2: 65536 -> 2,097,152 tokens, 44 GiB still free, speed unchanged).
+  glmf_pool="$(get POOL_TOKENS auto)"; [[ "$glmf_pool" != auto ]] || glmf_pool=0
   family_args+=(--kda-fp8 "$kda_fp8" --pool-tokens "$glmf_pool")
   if [[ "$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD off)" == on ]]; then
     echo "GLM5_FLASH_FP8_HEAD=on duplicates the checkpoint head; a shared single-copy consumer is missing; use off" >&2
@@ -435,7 +438,8 @@ done
 # Loading leaves ~10 GiB of checkpoint pages cached per Spark (sparknest passthrough: the
 # workers' own fadvise cannot reach them), and GB10 CUDA allocations do not reclaim page
 # cache: drop it once every rank is resident. CUTEAFD_SPARK_DROP_PAGE_CACHE=0 keeps it.
-if ((ranks > 0)) && [[ "${CUTEAFD_SPARK_DROP_PAGE_CACHE:-1}" != 0 ]] && command -v nest >/dev/null; then
+if ((ranks > 0 && ${#spark_hosts[@]} > 0)) && [[ "${CUTEAFD_SPARK_DROP_PAGE_CACHE:-1}" != 0 ]] &&
+   command -v nest >/dev/null; then
   nest drop-caches "${spark_hosts[@]}" >/dev/null || echo "warning: could not drop Spark page caches after loading" >&2
 fi
 peer_csv="$(IFS=,; echo "${peers[*]}")"
