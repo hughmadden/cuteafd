@@ -124,8 +124,9 @@ impl<'w, 'a> DistributedTargetHead<'w, 'a> {
         ];
         let normalize = devices[1].own(|| Normalize::new(weights, capacity))?;
         let sampler_bytes = capacity * 129280 * 4 + TargetSamplingWave::device_bytes(capacity, 129280);
-        let vocabulary = DistributedVocabularyWave::new(devices, vocabulary, capacity,
+        let mut vocabulary = DistributedVocabularyWave::new(devices, vocabulary, capacity,
             [budgets[0], budgets[1] - capacity * INPUT_STRIDES.iter().sum::<usize>() - sampler_bytes])?;
+        vocabulary.use_fp8(crate::families::deepseek_v41::v41_tensors::Fp8Head::All)?;
         let sampler = HeadSampler {
             assembled: devices[1].own(|| DeviceAllocation::new(devices[1].library, capacity * 129280 * 4))?,
             wave: devices[1].own(|| TargetSamplingWave::new(devices[1].library, capacity, 129280))?,

@@ -5,6 +5,7 @@ use std::ops::Range;
 pub(crate) struct VocabularyShard<'a> {
     allocation: DeviceAllocation<'a>,
     tokens: Range<usize>,
+    fp8: Option<crate::shared::fp8_linear::Fp8Weight<'a>>,
 }
 impl<'a> VocabularyShard<'a> {
     const VOCAB: usize = 129280;
@@ -42,9 +43,13 @@ impl<'a> VocabularyShard<'a> {
             library.copy_h2d(destination, source)?;
             offset += count;
         }
-        Ok(Self { allocation, tokens })
+        let fp8 = (super::fp8_head() != super::Fp8Head::Off)
+            .then(|| super::pack_fp8(library, allocation.buffer, tokens.len())).transpose()?;
+        Ok(Self { allocation, tokens, fp8 })
     }
     pub fn weight(&self) -> CuteafdDeviceBuffer { self.allocation.buffer }
+    /// The FP8 copy (`CUTEAFD_V41_FP8_HEAD`), when one was packed.
+    pub fn fp8(&self) -> Option<&crate::shared::fp8_linear::Fp8Weight<'a>> { self.fp8.as_ref() }
     pub fn tokens(&self) -> Range<usize> { self.tokens.clone() }
 }
 

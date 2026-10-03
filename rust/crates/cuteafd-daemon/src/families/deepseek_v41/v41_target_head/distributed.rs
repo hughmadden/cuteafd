@@ -13,6 +13,8 @@ struct Rank<'w, 'a> {
     weights: &'w VocabularyShard<'a>,
     capacity: usize,
     graphs: [[Option<*mut c_void>; 128]; 2],
+    /// Scratch of the shard's FP8 copy when this wave projects through it.
+    fp8_scratch: Option<DeviceAllocation<'a>>,
 }
 fn slice(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
     ensure!(offset <= buffer.bytes && bytes <= buffer.bytes - offset, "vocabulary slice exceeds allocation");
@@ -29,7 +31,7 @@ impl<'w, 'a> Rank<'w, 'a> {
             projection, _workspace: workspace, input,
             logits: DeviceAllocation::new(library, capacity * weights.tokens().len() * 4)?,
             candidates: DeviceAllocation::new(library, capacity * 8)?,
-            weights, capacity, graphs: [[None; 128]; 2],
+            weights, capacity, graphs: [[None; 128]; 2], fp8_scratch: None,
         })
     }
     fn candidates(&self, rows: usize) -> Result<(CuteafdDeviceBuffer, CuteafdDeviceBuffer)> {
@@ -39,7 +41,9 @@ impl<'w, 'a> Rank<'w, 'a> {
     unsafe fn enqueue(&self, rows: usize, greedy: bool) -> Result<()> {
         let lib = self.stream.library;
         unsafe {
-            self.projection.launch(self.input.buffer, self.weights.weight(), self.logits.buffer, rows, self.stream.raw)?;
+            crate::families::deepseek_v41::v41_tensors::project_vocabulary(lib, &self.projection, self.weights.weight(),
+                self.weights.fp8().zip(self.fp8_scratch.as_ref()), self.input.buffer, self.logits.buffer, rows,
+                self.stream.raw)?;
             if greedy {
                 let (ids, scores) = self.candidates(rows)?;
                 lib.cuda_logits_argmax_checked_f32_async(self.logits.buffer, ids, scores,
@@ -117,6 +121,18 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
         ensure!((1..=128).contains(&capacity) && (1..129280).contains(&split), "invalid distributed vocabulary geometry");
         Ok([V41VocabularyProjection::WORKSPACE_BYTES + capacity * (10240 + split * 4 + 8),
             V41VocabularyProjection::WORKSPACE_BYTES + capacity * (10240 + (129280 - split) * 4 + 24)])
+    }
+    /// Projects through the shards' FP8 copies when `site` uses them
+    /// (`CUTEAFD_V41_FP8_HEAD`); call before the first execution.
+    pub fn use_fp8(&mut self, site: crate::families::deepseek_v41::v41_tensors::Fp8Head) -> Result<()> {
+        let capacity = self.capacity;
+        for rank in &mut self.ranks {
+            let device = rank.device;
+            let rank = rank.get_mut();
+            rank.fp8_scratch = device.run(|| crate::families::deepseek_v41::v41_tensors::fp8_scratch(device.library,
+                rank.weights.fp8(), capacity, site))?;
+        }
+        Ok(())
     }
     pub fn new(devices: [Device<'a>; 2], weights: [&'w VocabularyShard<'a>; 2],
         capacity: usize, budgets: [usize; 2]) -> Result<Self> {
