@@ -234,6 +234,15 @@ pub(crate) fn device_with_lanes() -> bool {
     *ON.get_or_init(|| matches!(std::env::var("CUTEAFD_V41_DEVICE_LANES").as_deref(), Ok("1" | "on")))
 }
 
+/// `CUTEAFD_V41_STAGING_FENCE=0`: device-ordered passes do not wait for the
+/// previous layer's staged uploads before preparing the next layer (stages
+/// whose pinned staging differs by layer keep one region per layer,
+/// `LayerStaging`), so the host can queue the pass ahead of the GPU.
+pub(crate) fn staging_fence() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("CUTEAFD_V41_STAGING_FENCE").as_deref(), Ok("0" | "off")))
+}
+
 fn device_setting() -> u8 {
     static SETTING: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *SETTING.get_or_init(|| {

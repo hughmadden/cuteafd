@@ -45,6 +45,17 @@ pub fn graph_captures() -> u64 {
     GRAPH_CAPTURES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Captures begun per call site (`file:line` of the begin-capture call).
+static GRAPH_CAPTURE_SITES: Mutex<Vec<(&'static std::panic::Location<'static>, u64)>> = Mutex::new(Vec::new());
+
+/// Captures begun so far by call site, most first.
+pub fn graph_capture_sites() -> Vec<(String, u64)> {
+    let sites = GRAPH_CAPTURE_SITES.lock().unwrap_or_else(|p| p.into_inner());
+    let mut sites: Vec<_> = sites.iter().map(|(l, n)| (format!("{}:{}", l.file(), l.line()), *n)).collect();
+    sites.sort_by(|a, b| b.1.cmp(&a.1));
+    sites
+}
+
 pub type CuteafdStatus = c_int;
 
 pub const CUTEAFD_STATUS_OK: CuteafdStatus = 0;
@@ -1810,7 +1821,16 @@ impl NativeLibrary {
         Ok(out_ms)
     }
 
+    #[track_caller]
     pub unsafe fn cuda_graph_begin_capture(&self, cuda_stream: *mut c_void) -> Result<()> {
+        let site = std::panic::Location::caller();
+        {
+            let mut sites = GRAPH_CAPTURE_SITES.lock().unwrap_or_else(|p| p.into_inner());
+            match sites.iter_mut().find(|(l, _)| std::ptr::eq(*l, site)) {
+                Some((_, n)) => *n += 1,
+                None => sites.push((site, 1)),
+            }
+        }
         let begin_capture_fn: Symbol<CudaGraphBeginCaptureFn> =
             unsafe { self.lib.get(b"cuteafd_cuda_graph_begin_capture")? };
         let status = unsafe { begin_capture_fn(cuda_stream) };
