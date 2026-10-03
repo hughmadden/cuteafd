@@ -309,6 +309,19 @@ mod tests {
     }
 
     #[test]
+    fn dspark_head_confidence_drives_cold_plans() {
+        let cost = step_cost(&K4_TP4_STEP_MS, 64);
+        let cold = DraftHistory::default();
+        let head = |c: f32| head_confidence(&cold, &[c; 8]);
+        // The head moves the prior (3 in 4) toward its prediction.
+        assert!(head(0.95)[0] > 0.9 && head(0.05)[0] < 0.2);
+        let informed = |c: f32| Group { history: &cold, confidence: head(c), room: 8, members: 1, informed: true };
+        // No five-draft cold start: a confident head verifies more, a doubtful one none.
+        assert_eq!(plan(&[informed(0.05)], (0, 0), &cost), vec![0]);
+        assert!(plan(&[informed(0.97)], (0, 0), &cost)[0] >= 6);
+    }
+
+    #[test]
     fn prior_matches_the_single_ratio_model_before_observations() {
         // Before serving observes anything the fit is the table itself (the
         // previous model at ratio 1): 5 ms draft + 0.3 ms host on top.
