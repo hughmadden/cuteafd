@@ -159,6 +159,24 @@ impl Mailbox {
     }
 }
 
+/// Every live lane's state and mailbox (address, bytes), for [`stuck_report`].
+static LANES: Mutex<Vec<(std::sync::Weak<Shared>, usize, usize)>> = Mutex::new(Vec::new());
+
+/// One line per live device lane: announced and completed waves, the first
+/// error, and the mailbox sequences (a stuck device step's report).
+pub fn stuck_report() -> String {
+    let lanes = LANES.lock().unwrap_or_else(|p| p.into_inner());
+    lanes.iter().enumerate().filter_map(|(index, (shared, base, bytes))| {
+        let shared = shared.upgrade()?;
+        let mailbox = Mailbox { base: *base, bytes: *bytes, capacity: 0, topk: 0, wire_row_bytes: 0 };
+        let word = |offset| mailbox.word(offset).load(Ordering::Acquire);
+        Some(format!("lane {index}: announced {} completed {} error {:?}; ready {} done {} send_state {} recv_state {}",
+            shared.announced.load(Ordering::Acquire), shared.completed.load(Ordering::Acquire),
+            shared.error.lock().map(|e| e.clone()).unwrap_or_default(), word(mailbox::READY), word(mailbox::DONE),
+            word(mailbox::SEND_STATE), word(mailbox::RECV_STATE)))
+    }).collect::<Vec<_>>().join(" | ")
+}
+
 /// Request ids of written waves: this base plus the wave's sequence.
 const WRITTEN_ID_BASE: u64 = 1 << 62;
 
@@ -365,6 +383,8 @@ impl SparkDeviceLane {
             }
         })?;
         let world = ready.recv().map_err(|_| anyhow!("device lane thread exited during setup"))??;
+        LANES.lock().unwrap_or_else(|p| p.into_inner())
+            .push((Arc::downgrade(&shared), mailbox.base, mailbox.bytes));
         Ok(Self { shared, thread: Some(thread), world })
     }
 
@@ -404,6 +424,13 @@ impl SparkDeviceLane {
     /// Waves completed since the lane started.
     pub fn completed(&self) -> u64 {
         self.shared.completed.load(Ordering::Acquire)
+    }
+
+    /// One line of this lane's sequences for a stuck-step report.
+    pub fn state(&self) -> String {
+        format!("announced {} completed {} error {:?}", self.shared.announced.load(Ordering::Acquire),
+            self.shared.completed.load(Ordering::Acquire),
+            self.shared.error.lock().map(|e| e.clone()).unwrap_or_default())
     }
 
     pub fn stats(&self) -> DeviceLaneStats {

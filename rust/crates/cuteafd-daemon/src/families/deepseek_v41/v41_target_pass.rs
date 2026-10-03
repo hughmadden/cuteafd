@@ -338,11 +338,14 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         };
         // A cancelled earlier pass may have left chained work queued.
         self.chain.as_ref().unwrap().drain()?;
-        let result = unsafe { handle.scope(self.execute_phase_inner(requests, batch, transport,
-            placement, selected, suffix, encoder, terminal)).await };
+        let result = crate::shared::memory::chain::watchdog(unsafe { handle.scope(self.execute_phase_inner(
+            requests, batch, transport, placement, selected, suffix, encoder, terminal)) }).await;
         // Every consumer after the pass (commit, dSpark, logits downloads) is
         // unscoped, so the chained work must be complete before returning.
-        let drained = self.chain.as_ref().unwrap().drain();
+        let drained = if crate::shared::memory::chain::device_enabled() {
+            self.chain.as_ref().unwrap().drain_bounded(std::time::Duration::from_secs(60)).map_err(|error|
+                error.context(format!("device lanes: {}", cuteafd_transport::expert::device_stuck_report())))
+        } else { self.chain.as_ref().unwrap().drain() };
         let result = result.and(drained).and_then(|()| transport.check_device());
         if result.is_ok() && crate::shared::memory::chain::device_enabled() {
             // Device-ordered local layers left their captured routes in the router's ring.

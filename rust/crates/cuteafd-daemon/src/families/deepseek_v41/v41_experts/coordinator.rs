@@ -414,6 +414,10 @@ impl<'a> NativeTp4Wave<'a> {
         self.device.as_ref().is_some_and(|d| rows <= d.capacity)
             && (self.tp2.is_none() || self.has_tp2_shared_layer(layer)) && crate::shared::memory::chain::deferred()
     }
+    /// The device exchange's sequences (stuck-step reports).
+    pub(crate) fn device_state(&self) -> Option<String> {
+        self.device.as_ref().map(|d| d.link.state())
+    }
     /// After the pass drained: any device wave's error.
     pub(crate) fn check_device(&self) -> Result<()> {
         self.device.as_ref().map_or(Ok(()), |d| d.link.check())

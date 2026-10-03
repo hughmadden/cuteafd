@@ -305,9 +305,12 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                 suffix, encoder, greedy).await };
         };
         self.chain.as_ref().unwrap().drain()?;
-        let result = unsafe { handle.scope(self.execute_unchained(requests, batch, transport, placement,
-            selected, suffix, encoder, greedy)).await };
-        let drained = self.chain.as_ref().unwrap().drain();
+        let result = crate::shared::memory::chain::watchdog(unsafe { handle.scope(self.execute_unchained(
+            requests, batch, transport, placement, selected, suffix, encoder, greedy)) }).await;
+        let drained = if crate::shared::memory::chain::device_enabled() {
+            self.chain.as_ref().unwrap().drain_bounded(std::time::Duration::from_secs(60)).map_err(|error|
+                error.context(format!("device lanes: {}", cuteafd_transport::expert::device_stuck_report())))
+        } else { self.chain.as_ref().unwrap().drain() };
         let result = result.and(drained).and_then(|()| transport.get().check_device());
         if result.is_ok() && self.capture_routes && crate::shared::memory::chain::device_enabled() {
             // Device-ordered local layers left their routes in the routers' rings.

@@ -1007,6 +1007,15 @@ impl<'a> SparkDeviceLink<'a> {
         self.lane.stats()
     }
 
+    /// The lane's and the mailbox's sequences, for a stuck-step report.
+    pub(crate) fn state(&self) -> String {
+        use cuteafd_transport::expert::device_mailbox as m;
+        // SAFETY: u32 words of the live pinned mailbox.
+        let word = |offset| unsafe { std::ptr::read_volatile(self.mailbox_at(offset).ptr as *const u32) };
+        format!("{}; mailbox ready {} done {} send_state {} recv_state {}", self.lane.state(), word(m::READY),
+            word(m::DONE), word(m::SEND_STATE), word(m::RECV_STATE))
+    }
+
     fn mailbox_at(&self, offset: usize) -> CuteafdHostBuffer {
         CuteafdHostBuffer {
             // SAFETY: offsets come from `device_mailbox` and lie inside it.

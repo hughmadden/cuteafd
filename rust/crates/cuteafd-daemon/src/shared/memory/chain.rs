@@ -124,6 +124,31 @@ impl<'a> StageChain<'a> {
         }
         Ok(())
     }
+    /// [`Self::drain`] that gives up after `limit` (device-ordered passes,
+    /// which wait on Spark and peer flags inside the chain): polls the head
+    /// through this device's fence stream instead of blocking in the driver.
+    /// Without fences it is [`Self::drain`].
+    pub fn drain_bounded(&self, limit: std::time::Duration) -> Result<()> {
+        let Some(head) = self.head.get() else { return self.drain() };
+        let (device, event) = self.events[head];
+        let Some(fence) = self.fences.iter().find(|f| f.device == device).copied() else { return self.drain() };
+        let previous = self.library.cuda_get_device()?;
+        self.library.cuda_set_device(device)?;
+        let started = std::time::Instant::now();
+        // SAFETY: the fence stream and head event belong to this chain's device.
+        let result = (|| -> Result<()> {
+            unsafe { self.library.cuda_stream_wait_event(fence.stream, event)?; }
+            loop {
+                if unsafe { self.library.cuda_stream_query(fence.stream)? } { return Ok(()); }
+                anyhow::ensure!(started.elapsed() < limit,
+                    "device-ordered pass did not complete within {limit:?} (a device wait never released)");
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+        })();
+        self.library.cuda_set_device(previous)?;
+        result?;
+        self.drain()
+    }
 }
 impl Drop for StageChain<'_> {
     fn drop(&mut self) {
@@ -261,6 +286,28 @@ fn device_setting() -> u8 {
         }
         setting
     })
+}
+
+/// Device-ordered passes run under this watchdog: a pass still pending after
+/// `CUTEAFD_V41_DEVICE_WATCHDOG_S` (default 60) seconds is a device wait that
+/// never released (draining it would block forever), so the process logs every
+/// device lane's sequences and exits instead of holding the GPUs.
+pub(crate) async fn watchdog<F: Future>(future: F) -> F::Output {
+    if !device_enabled() {
+        return future.await;
+    }
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| std::env::var("CUTEAFD_V41_DEVICE_WATCHDOG_S").ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(60));
+    let mut future = std::pin::pin!(future);
+    tokio::select! {
+        output = &mut future => output,
+        () = tokio::time::sleep(std::time::Duration::from_secs(limit)) => {
+            tracing::error!(limit_s = limit, lanes = %cuteafd_transport::expert::device_stuck_report(),
+                "device-ordered pass stuck: exiting (a device wait never released)");
+            std::process::exit(70);
+        }
+    }
 }
 
 /// Inside a chain scope with [`device_enabled`]: stages that used to wait on
