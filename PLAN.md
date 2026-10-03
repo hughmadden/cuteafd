@@ -577,8 +577,16 @@ Follow-ups (2026-10-03, measurements pending in `~/.cache/cuteafd/builds/v1-memo
   unchanged), golden NLL 2.4150 -> 2.4088 (KL 0.0457 -> 0.0445; rank partials
   partition the rows differently), engine 8K prefill 3095 -> 3002 tok/s, served
   8K 2684 -> 2725, C1 63.9-69.1 -> 68.5-69.5, C4 102-108 both: neutral. Shortening the
-  busiest rank (352/320 rows) needs 32-row K tails in the MXFP4 down projection:
-  after `work/mimo-perf` (A8 down) lands on fork master. V4.1 TP4 (576 -> 640)
+  busiest rank (352/320 rows) needs 32-row tails in three MXFP4 kernels (fork
+  master now has `work/mimo-perf`'s A8 down): the decode GEMV (`GroupedMxfp4Gemv`
+  needs K % (128 x warps) for down), the BF16 stream down (`I % 128`, 128-K
+  weight blocks) and the A8 stream down (128-K blocks via cp.async, u32 scale
+  loads). Gate/up already tiles I in 32 rows (11 vs 12 CTA columns: -8%); down
+  only gains if its last K block is predicated at 32 (TMA zero-fill covers the
+  BF16 route's loads; the A8 route needs predicated cp.async), and scale rows
+  of I/32 = 11 bytes need padding to 12 in the package layout. Expected: busiest
+  rank -5..-8% expert time (MiMo Pro prefill is Spark-bound) and -7.7 GiB on
+  ranks 0-3. V4.1 TP4 (576 -> 640)
   goes through the V4.1 packer: not done.
 - V4.1 one RTX: row buffers at the live 2048-row chunk instead of the 4096 AOT
   capacity (as on two RTX), reindex selection shares the source's scratch:
