@@ -769,7 +769,14 @@ active admission deferral and active KV paging are separate remaining work.
         with the unchanged implementation failing the negative control.
         Combined host-copy/cancellation changes pass repeated V4.1 parity on
         one and two RTX GPUs; completed and unpolled scopes retain their
-        existing explicit-drain behavior.
+        existing explicit-drain behavior. Closeout also exposed a separate
+        inherited V4.1 cold-prefill defect: large index-selection and
+        attention-query graph entries are evicted between encoder and replay
+        shapes, causing repeated request-time captures despite warmup. Those
+        sources are unchanged in the current batch. Preserve the failed
+        zero-capture evidence, require zero warmed decode captures and bound
+        candidate prefill captures by the identical-config baseline. Fixing
+        these cache lifetimes remains a follow-up, outside this closeout.
      n. Generic families rejected temporarily exhausted KV pools even when
         an active request would soon release enough pages. A bounded FIFO
         waiter now returns borrowed state slots, retries after page/reference
