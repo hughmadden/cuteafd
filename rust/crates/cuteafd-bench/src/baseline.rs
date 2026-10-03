@@ -343,6 +343,12 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
         check.summary = format!("{speculator}: {} greedy tokens identical with drafts on and off {rates}", a.len());
         return Ok(());
     }
+    // Evidence for numerics vs state: how far the drafted run's rows already
+    // were from the one-row run's on the identical prefix. A flip within that
+    // noise is rounding; noise that is zero until a point and then grows
+    // points at state (KV or recurrent rows a verify left behind).
+    let noise = RowNoise::between(on_record, off_record, off_record.prompt_ids.len() + same);
+    noise.record(check);
     // Verify rows and single-row steps may round differently: a flip where the
     // top two candidates are within rounding of each other is a tie, not a loss.
     let position = off_record.prompt_ids.len() + same;
@@ -360,14 +366,76 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     if tie {
         check.status = CheckStatus::Pass;
         check.summary = format!("{speculator}: identical up to token {same} of {}, then a near-tie flips \
-            (top-two margin {:.3} nats) {rates}", a.len().max(b.len()), margins.0.or(margins.1).unwrap_or(0.0));
+            (top-two margin {:.3} nats) {rates}{}", a.len().max(b.len()), margins.0.or(margins.1).unwrap_or(0.0),
+            noise.describe());
     } else {
         check.status = CheckStatus::Fail;
-        check.summary = format!("{speculator}: greedy output diverges at token {same} of {}{} {rates}",
+        check.summary = format!("{speculator}: greedy output diverges at token {same} of {}{} {rates}{}",
             a.len().max(b.len()), margins.0.or(margins.1).map(|m| format!(" (top-two margin {m:.3} nats)"))
-                .unwrap_or_default());
+                .unwrap_or_default(), noise.describe());
     }
     Ok(())
+}
+
+/// Per-row difference between two greedy runs' recorded rows over their
+/// identical prefix: the log-probability of the (shared) top token.
+#[derive(Debug, Default, PartialEq)]
+struct RowNoise {
+    compared: usize,
+    identical: usize,
+    max: f64,
+    median: f64,
+    /// Generated-token index of the first row more than 0.01 nats apart.
+    first_over: Option<usize>,
+}
+
+impl RowNoise {
+    /// Rows predicting positions before `end` that both records hold.
+    fn between(a: &ProbeRecord, b: &ProbeRecord, end: usize) -> Self {
+        let start = b.prompt_ids.len();
+        let mut deltas = Vec::new();
+        let mut noise = RowNoise::default();
+        for row in b.rows.iter().filter(|r| r.position < end) {
+            let Some(other) = a.rows.iter().find(|r| r.position == row.position) else { continue };
+            let (Some(x), Some(y)) = (row.top.first(), other.top.first()) else { continue };
+            if x.0 != y.0 {
+                continue;
+            }
+            noise.compared += 1;
+            noise.identical += usize::from(row.hash == other.hash);
+            let delta = f64::from((x.1 - y.1).abs());
+            if delta > 0.01 && noise.first_over.is_none() {
+                noise.first_over = Some(row.position.saturating_sub(start));
+            }
+            deltas.push(delta);
+        }
+        deltas.sort_by(f64::total_cmp);
+        noise.max = deltas.last().copied().unwrap_or(0.0);
+        noise.median = deltas.get(deltas.len() / 2).copied().unwrap_or(0.0);
+        noise
+    }
+
+    fn record(&self, check: &mut Check) {
+        if self.compared == 0 {
+            return;
+        }
+        check.set("prefix_rows_compared", self.compared as u64);
+        check.set("prefix_rows_identical", self.identical as u64);
+        check.set("prefix_noise_max", self.max);
+        check.set("prefix_noise_median", self.median);
+        if let Some(at) = self.first_over {
+            check.set("prefix_noise_first_over_0_01", at as u64);
+        }
+    }
+
+    fn describe(&self) -> String {
+        if self.compared == 0 {
+            return String::new();
+        }
+        format!("; before it {} of {} rows byte-identical, top-token log-prob differs by up to {:.3} nats \
+            (median {:.4}){}", self.identical, self.compared, self.max, self.median,
+            self.first_over.map(|at| format!(", first over 0.01 at token {at}")).unwrap_or_default())
+    }
 }
 
 /// Top-two log-probability margin under which a greedy flip counts as a tie.
@@ -457,20 +525,22 @@ fn template(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
 
 fn c1_c4(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     let text = format!("[{}] {}", nonce(), CONTENT[1].1);
-    let probe = || Some(ProbeSpec { cold: true, ..ProbeSpec::default() });
+    let probe = || Some(ProbeSpec { cold: true, record_rows: 64, top_k: 2, ..ProbeSpec::default() });
     let one = run.client.chat(plain(&text, 64), probe())?;
     let client = run.client.clone();
     let four: Vec<Result<Chat>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..4).map(|_| {
             let client = client.clone();
             let text = text.clone();
-            scope.spawn(move || client.chat(plain(&text, 64), Some(ProbeSpec { cold: true, ..ProbeSpec::default() })))
+            scope.spawn(move || client.chat(plain(&text, 64), probe()))
         }).collect();
         handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("thread panicked")))).collect()
     });
     let reference = output_of(&one);
     let mut identical = 0;
     let mut first_divergence: Option<usize> = None;
+    // Row noise against C1 over the earliest-diverging output's identical prefix.
+    let mut noise = RowNoise::default();
     for chat in &four {
         let chat = chat.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
         let other = output_of(chat);
@@ -478,9 +548,16 @@ fn c1_c4(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
             identical += 1;
         } else {
             let at = reference.iter().zip(&other).take_while(|(a, b)| a == b).count();
+            if first_divergence.is_none_or(|d| at < d) {
+                if let (Some(a), Some(b)) = (chat.probe.as_ref().filter(|r| honoured(r)),
+                    one.probe.as_ref().filter(|r| honoured(r))) {
+                    noise = RowNoise::between(a, b, b.prompt_ids.len() + at);
+                }
+            }
             first_divergence = Some(first_divergence.map_or(at, |d: usize| d.min(at)));
         }
     }
+    noise.record(check);
     check.status = CheckStatus::Info;
     check.set("identical", identical as u64);
     if let Some(at) = first_divergence {
@@ -489,7 +566,7 @@ fn c1_c4(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     let unit = if one.probe.as_ref().is_some_and(honoured) { "tokens" } else { "characters" };
     check.summary = match first_divergence {
         None => format!("4 of 4 concurrent greedy outputs identical to C1 ({} {unit})", reference.len()),
-        Some(at) => format!("{identical} of 4 identical to C1; first divergence at {unit} {at}"),
+        Some(at) => format!("{identical} of 4 identical to C1; first divergence at {unit} {at}{}", noise.describe()),
     };
     Ok(())
 }
@@ -512,6 +589,25 @@ pub fn describe(timing: &StreamTiming) -> String {
 mod tests {
     use super::*;
     use crate::report::Check;
+
+    #[test]
+    fn row_noise_compares_the_shared_top_token_over_the_identical_prefix() {
+        use cuteafd_api::openai::probe::ProbeRow;
+        let row = |position, hash: &str, top: Vec<(u32, f32)>| ProbeRow { position, hash: hash.into(), top,
+            ..ProbeRow::default() };
+        let off = ProbeRecord { prompt_ids: vec![0; 10], rows: vec![row(10, "a", vec![(5, -0.1), (6, -2.0)]),
+            row(11, "b", vec![(7, -0.5), (8, -1.0)]), row(12, "c", vec![(9, -0.2), (1, -3.0)]),
+            row(13, "d", vec![(2, -0.3), (3, -0.4)])], ..ProbeRecord::default() };
+        let on = ProbeRecord { prompt_ids: vec![0; 10], rows: vec![row(10, "a", vec![(5, -0.1), (6, -2.0)]),
+            row(11, "x", vec![(7, -0.505), (8, -1.0)]), row(12, "y", vec![(9, -0.3), (1, -3.0)]),
+            row(13, "z", vec![(3, -0.3), (2, -0.4)])], ..ProbeRecord::default() };
+        // Position 13 is the flip: it is outside the identical prefix.
+        let noise = RowNoise::between(&on, &off, 13);
+        assert_eq!((noise.compared, noise.identical, noise.first_over), (3, 1, Some(2)));
+        assert!((noise.max - 0.1).abs() < 1e-6 && (noise.median - 0.005).abs() < 1e-6, "{noise:?}");
+        assert!(noise.describe().contains("1 of 3 rows byte-identical"));
+        assert_eq!(RowNoise::between(&on, &ProbeRecord::default(), 13).describe(), "");
+    }
 
     fn check(id: &str, status: CheckStatus, metrics: Value) -> Check {
         Check { id: id.into(), status, metrics: metrics.as_object().cloned().unwrap_or_default(), ..Check::default() }
