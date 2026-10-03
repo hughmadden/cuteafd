@@ -224,10 +224,8 @@ def with_width(g, width: int):
     the programs read only ``g.slice``, so the subclass overrides it."""
     from dataclasses import dataclass, fields
 
-    from b12x.integration.cuteafd.fp8_moe import Fp8MoeGeometry
-
     @dataclass(frozen=True)
-    class ExactSlice(Fp8MoeGeometry):
+    class ExactSlice(type(g)):
         width: int = 0
 
         @property
