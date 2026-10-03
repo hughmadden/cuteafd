@@ -478,6 +478,8 @@ impl<'a> GlmEngine<'a> {
         let (moe, dense) = (self.cfg.moe_intermediate, self.cfg.dense_intermediate);
         // A head split's layers (all of them) run its share's programs.
         let (prefix, moe, dense) = if split { ("glm2", moe / 2, dense / 2) } else { ("glm", moe, dense) };
+        // Every layer of a head split runs its share's heads on both GPUs.
+        let heads = if split { heads / 2 } else { heads };
         for name in [format!("glm_index_producer_{cap}"), format!("{prefix}_producer_{cap}"),
             format!("{prefix}_sparse_mla_{mode}_{cap}"), format!("{prefix}_o_{cap}"), format!("{prefix}_ffn_i{moe}_{cap}"),
             format!("{prefix}_ffn_i{dense}_{cap}")] {
