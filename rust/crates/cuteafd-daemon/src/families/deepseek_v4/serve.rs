@@ -20,7 +20,7 @@ use crate::shared::console;
 use crate::shared::token_io::{DeviceLogits, RowResult, SelectBatch, TokenSelector};
 use crate::shared::prefill_share::{Chunk, DecodeShareArgs};
 use cuteafd_engine::prefix::{After, MarkArena, PointPlan, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::{
     InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits,
     NativeRequest, PromptUsage,
@@ -237,6 +237,7 @@ struct Active<'a> {
     turn: Option<Vec<f32>>,
     decoder: cuteafd_loader::StreamingTokenDecoder,
     generated: usize,
+    draft_calls: usize,
     buffered: usize,
     started: Instant,
     ticket: console::Ticket,
@@ -349,13 +350,21 @@ fn speculative_step(
     shape: &mut StepShape,
 ) -> Result<Vec<bool>> {
     let noise = engine.cfg.dspark_noise_token_id as u32;
-    let inputs: Vec<u32> = active.iter()
-        .flat_map(|a| std::iter::once(a.next).chain(std::iter::repeat_n(noise, block - 1))).collect();
-    let requests: Vec<super::engine::DraftRequest<'_>> = active.iter()
-        .map(|a| super::engine::DraftRequest { placement: &a.placement, token: a.next }).collect();
+    let draft_indices: Vec<usize> = active.iter().enumerate()
+        .filter_map(|(i, a)| (!probe::no_speculation(&a.job.probe)).then_some(i)).collect();
+    let inputs: Vec<u32> = draft_indices.iter()
+        .flat_map(|&i| std::iter::once(active[i].next).chain(std::iter::repeat_n(noise, block - 1))).collect();
+    let requests: Vec<super::engine::DraftRequest<'_>> = draft_indices.iter()
+        .map(|&i| super::engine::DraftRequest { placement: &active[i].placement, token: active[i].next }).collect();
     let timer = Instant::now();
-    let drafts = engine.draft(&requests, &inputs)?;
+    let proposed = engine.draft(&requests, &inputs)?;
     shape.draft_us = console::us(timer);
+    ensure!(proposed.len() == draft_indices.len(), "dSpark proposal count differs from participating requests");
+    let mut drafts = vec![Vec::new(); active.len()];
+    for (i, proposal) in draft_indices.into_iter().zip(proposed) {
+        active[i].draft_calls += 1;
+        drafts[i] = proposal;
+    }
     // Verify no more rows than the request may still produce or hold, and no
     // draft the grammar rejects (it could never be kept).
     let sequences: Vec<Vec<u32>> = active.iter().zip(&drafts).map(|(a, draft)| {
@@ -415,22 +424,23 @@ fn prefix_cache<'e, 'a>(engine: &'e super::engine::Engine<'a>, args: &PrefixArgs
     // The pinned host tier copies through one GPU's copy engine; a head split keeps its
     // (replicated) state on both GPUs, so it keeps device-resident snapshots only.
     let host = if engine.ranks() > 1 {
-        if args.host_cache_bytes > 0 && args.prefix_cache_entries > 0 {
+        if args.host_cache_bytes.enabled() && args.prefix_cache_entries > 0 {
             tracing::warn!("DeepSeek V4 head split: the prefix cache's host tier is off (device-resident snapshots only)");
         }
         None
     } else {
-        args.host_tier(engine.library, family.template(), family.mark_bytes())?
+        args.host_tier(engine.library, family.template(), family.layout(), engine.max_context)?
     };
+    let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();
     let config = PrefixConfig { entries, mark_slots: family.slots(), keep_logits: true,
         min_tokens: args.prefix_cache_min_tokens };
     let cache = PrefixCache::new(layout, config, host)?;
     tracing::info!(entries, mark_slots = family.slots(), mark_bytes = family.mark_bytes(), page_bytes = layout.page_bytes,
-        pages = layout.pages, page_rows = layout.page_rows, host_bytes = args.host_cache_bytes, points = ?args.points(),
+        pages = layout.pages, page_rows = layout.page_rows, host_bytes, points = ?args.points(),
         "DeepSeek V4 prefix cache");
     cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64,
-        &"compressed C4/C128 + index".to_string(), if args.prefix_cache_entries == 0 { 0 } else { args.host_cache_bytes });
+        &"compressed C4/C128 + index".to_string(), host_bytes);
     Ok((family, cache))
 }
 
@@ -481,23 +491,31 @@ fn schedule(
     let (mut requests, mut generated_total) = (0u64, 0u64);
     let chunk_limit = engine.prefill_capacity().min(engine.max_context);
     let mut prefills = decode_share.queue::<Prefill<'_>>()?;
+    let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<NativeRequest>::default();
     loop {
         // Admit while sequence slots and decode rows remain.
         while !states.is_empty() && active.len() + prefills.len() < engine.decode_rows {
-            let job = if active.is_empty() && prefills.is_empty() {
-                // Idle: publish the state the server waits in (captures and releases done).
-                cache.tick();
-                publish(stats, requests, generated_total, 0, 0, &cache);
-                console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
-                match receive.blocking_recv() {
-                    Some(job) => job,
-                    None => return Ok(()),
-                }
-            } else {
-                match receive.try_recv() {
-                    Ok(job) => job,
-                    Err(_) => break,
-                }
+            let busy = !active.is_empty() || !prefills.is_empty();
+            let job = match kv_waiter.poll(cache.pool().free(), cache.pool().release_epoch(), busy, |job| job.events.is_closed()) {
+                cuteafd_engine::prefix::AdmissionPoll::Blocked => break,
+                cuteafd_engine::prefix::AdmissionPoll::Ready(job) => job,
+                cuteafd_engine::prefix::AdmissionPoll::Empty => {
+                    if !busy {
+                        // Idle: publish the state the server waits in (captures and releases done).
+                        cache.tick();
+                        publish(stats, requests, generated_total, 0, 0, &cache);
+                        console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
+                        match receive.blocking_recv() {
+                            Some(job) => job,
+                            None => return Ok(()),
+                        }
+                    } else {
+                        match receive.try_recv() {
+                            Ok(job) => job,
+                            Err(_) => break,
+                        }
+                    }
+                },
             };
             let reject = |job: &NativeRequest, message: String| {
                 let _ = job.events.send(Err(NativeFailure::BadRequest(message)));
@@ -529,7 +547,12 @@ fn schedule(
                 Ok(admitted) => admitted,
                 Err(error) => {
                     states.push(state);
-                    reject(&job, format!("{error:#}"));
+                    // Running requests keep their pages pinned. Delay a request
+                    // that fits alone instead of rejecting transient KV pressure.
+                    match kv_waiter.defer(job, &error, busy, cache.pool().release_epoch()) {
+                        Ok(()) => break,
+                        Err(job) => reject(&job, format!("{error:#}")),
+                    }
                     continue;
                 }
             };
@@ -689,7 +712,7 @@ fn schedule(
                 };
                 let mut request = Active {
                     decoder, job: p.job, constraint: p.constraint, placement: p.placement, capacity: p.capacity,
-                    next: first, history: p.tokens, turn: None, generated: 0, buffered: 0, started: Instant::now(),
+                    next: first, history: p.tokens, turn: None, generated: 0, draft_calls: 0, buffered: 0, started: Instant::now(),
                     ticket: p.ticket,
                 };
                 let emitted = request.emit(first, eos);
@@ -719,7 +742,8 @@ fn schedule(
         // small batch, each sequence verifies its next token plus a draft.
         let block = engine.draft_block();
         let speculate = block > 0 && active.len() <= speculate_max
-            && active.len() * (block + 1) <= engine.decode_rows;
+            && active.len() * (block + 1) <= engine.decode_rows
+            && active.iter().any(|a| !probe::no_speculation(&a.job.probe));
         let step = if speculate {
             speculative_step(engine, &mut active, block, eos, transports, runtime, selector, caching, &mut shape)
         } else {
@@ -770,6 +794,7 @@ fn schedule(
             generated_total += request.generated as u64;
             let seconds = request.started.elapsed().as_secs_f64();
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
+                draft_calls = request.draft_calls,
                 active = active.len(), "request complete");
             if let Some(row) = &request.turn {
                 // The conversation so far: every committed row (the last token is not in it).
@@ -783,7 +808,7 @@ fn schedule(
         }
         cache.tick();
         publish(stats, requests, generated_total, active.len(), prefills.len(), &cache);
-        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len()));
+        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len() + kv_waiter.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
 }

@@ -27,7 +27,7 @@ impl StartupPlacement {
     /// acknowledged boundaries survive stop/start of that same container.
     pub fn publish(directory: &Path, rtx_gpus: u32, layers: usize) -> Result<Self> {
         ensure!(
-            (1..=40).contains(&layers),
+            layers <= 40 && (layers > 0 || rtx_gpus == 1),
             "invalid planned RTX expert boundary"
         );
         ensure!(
@@ -37,7 +37,7 @@ impl StartupPlacement {
         fs::create_dir_all(directory)?;
         if let Some(plan) = Self::read_plan(&directory.join("committed.json"))? {
             ensure!(
-                plan.rtx_expert_layers == layers,
+                plan.rtx_expert_layers == layers && plan.rtx_gpus == rtx_gpus,
                 "container restart cannot change acknowledged worker boundary"
             );
             return Ok(Self {
@@ -88,7 +88,8 @@ impl StartupPlacement {
         ensure!(
             plan.version == 1
                 && matches!(plan.rtx_gpus, 1 | 2)
-                && (1..=40).contains(&plan.rtx_expert_layers)
+                && plan.rtx_expert_layers <= 40
+                && (plan.rtx_expert_layers > 0 || plan.rtx_gpus == 1)
                 && plan.spark_first_layer == plan.rtx_expert_layers.min(39)
                 && !plan.nonce.is_empty()
                 && plan.nonce.len() <= 64,
@@ -194,6 +195,31 @@ mod tests {
         fs::write(directory.path().join("ready.json"), bytes)?;
         handoff.wait_ready(Duration::ZERO)?;
         assert_eq!(StartupPlacement::resumed_layers(directory.path())?, Some(9));
+        Ok(())
+    }
+    #[test]
+    fn single_rtx_auto_can_publish_an_all_remote_boundary() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let handoff = StartupPlacement::publish(directory.path(), 1, 0)?;
+        let bytes = fs::read(directory.path().join("plan.json"))?;
+        let plan: Plan = serde_json::from_slice(&bytes)?;
+        assert_eq!((plan.rtx_expert_layers, plan.spark_first_layer), (0, 0));
+        assert!(handoff.wait_ready(Duration::ZERO).is_err());
+        fs::write(directory.path().join("ready.json"), bytes)?;
+        handoff.wait_ready(Duration::ZERO)?;
+        assert_eq!(StartupPlacement::resumed_layers(directory.path())?, Some(0));
+        StartupPlacement::publish(directory.path(), 1, 0)?.wait_ready(Duration::ZERO)?;
+        assert!(StartupPlacement::publish(directory.path(), 2, 0).is_err());
+        assert!(StartupPlacement::publish(directory.path(), 1, 1).is_err());
+        Ok(())
+    }
+    #[test]
+    fn acknowledged_boundary_cannot_change_gpu_count() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let handoff = StartupPlacement::publish(directory.path(), 1, 5)?;
+        fs::copy(directory.path().join("plan.json"), directory.path().join("ready.json"))?;
+        handoff.wait_ready(Duration::ZERO)?;
+        assert!(StartupPlacement::publish(directory.path(), 2, 5).is_err());
         Ok(())
     }
     #[test]

@@ -207,7 +207,7 @@ fn failed_and_held_batches_report_the_right_submissions() {
     assert_eq!(cache.engine_mut().submission_count(), 1);
 
     // A wedged store stream holds the whole batch: every extent is pending and counted, none
-    // lands, and the evict consultation drops the snapshot uncached.
+    // lands, and the evict consultation retains the snapshot storage.
     let mut cache = default_cache(8 * CHUNK as u64, StoreMode::OnRetain);
     let mut device = Device::new(common_hc_5::DEVICE_BYTES);
     let snap = snapshot(&mut device, SnapshotKind::Turn, &tokens(8), 1, false, 1);
@@ -225,7 +225,7 @@ fn failed_and_held_batches_report_the_right_submissions() {
     assert_eq!(cache.engine_mut().submission_count(), 1);
     assert_eq!(
         cache.before_device_evict(Some(ticket)),
-        EvictDecision::DroppedUncached
+        EvictDecision::Held
     );
 }
 

@@ -130,6 +130,7 @@ pub(crate) fn probe_gpu_landing(library: &NativeLibrary) -> Result<GpuLandingPro
 /// Pinned host to device copy rate on the current device, GB/s: eight
 /// 64 MiB copies after one warm-up, on a stream of their own.
 pub(crate) fn probe_h2d(library: &NativeLibrary) -> Result<f64> {
+    let _memory_scope = cuteafd_ffi::memory_ledger::scope("probe");
     const BYTES: usize = 64 << 20;
     let host = HostAllocation::new(library, BYTES)?;
     let device = DeviceAllocation::new(library, BYTES)?;
@@ -276,6 +277,7 @@ pub(crate) struct SparkIntake<'a> {
 impl<'a> SparkIntake<'a> {
     pub(crate) fn new(library: &'a NativeLibrary, mode: IntakeMode, ranks: usize, rows: usize, row_bytes: usize)
         -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
         ensure!((1..=MAX_INTAKE_RANKS).contains(&ranks), "{ranks} Spark ranks exceed the {MAX_INTAKE_RANKS} intake planes");
         let plane_bytes = rows * row_bytes;
         let planes = (0..ranks).map(|_| DeviceAllocation::new(library, plane_bytes.max(256)))
@@ -333,14 +335,16 @@ impl<'a> SparkIntake<'a> {
     /// Before dispatching a wave on this intake's transport: the previous
     /// wave's reduce and uploads are done, and its receive slots are released.
     pub(crate) fn before_dispatch(&self) -> Result<()> {
-        if self.consumed_pending.replace(false) {
+        if self.consumed_pending.get() {
             // SAFETY: the event was recorded on the engine's stream by `consumed`.
             unsafe { self.library.cuda_event_synchronize(self.consumed)? };
+            self.consumed_pending.set(false);
         }
-        if self.copies_pending.replace(false) {
+        if self.copies_pending.get() {
             // SAFETY: recorded after the held slots' uploads; they must finish
             // before the slots go back to the transport.
             unsafe { self.library.cuda_event_synchronize(self.copied)? };
+            self.copies_pending.set(false);
         }
         self.held.lock().map_err(|_| anyhow::anyhow!("intake slots poisoned"))?.clear();
         Ok(())
@@ -388,9 +392,9 @@ impl<'a> SparkIntake<'a> {
             false => {
                 let target = self.upload_stream(plane_bytes, stream);
                 let receipt = transport.receive_wave_owned(wave, |rank, first, payload| {
-                    self.queue_upload(rank, first, &payload, plane_bytes, target)?;
-                    self.held.lock().map_err(|_| anyhow::anyhow!("intake slots poisoned"))?.push((rank, first, payload));
-                    Ok(())
+                    retain_before_enqueue(&self.held, (rank, first, payload), |(rank, first, payload)| {
+                        self.queue_upload(*rank, *first, payload, plane_bytes, target)
+                    })
                 }).await?;
                 self.join_uploads(target, stream, receipt.landed)?;
                 receipt
@@ -481,6 +485,25 @@ impl<'a> SparkIntake<'a> {
         Ok(())
     }
 
+    /// Terminal ownership only: the transport must first quiesce its QPs and
+    /// the engine must drain its compute stream. Drain the independent copy
+    /// stream directly, including uploads whose event publication failed.
+    /// This method deliberately keeps every held payload until all intakes
+    /// and compute streams have drained successfully.
+    pub(crate) fn terminal_drain_copies(&self) -> Result<()> {
+        if self.copy_stream.is_null() { return Ok(()); }
+        // SAFETY: the intake owns the stream; its planes and source owners
+        // remain live throughout terminal quiescence and this synchronization.
+        unsafe { self.library.cuda_stream_synchronize(self.copy_stream) }
+    }
+
+    pub(crate) fn terminal_release_payloads(&self) -> Result<()> {
+        self.held.lock().map_err(|_| anyhow::anyhow!("intake slots poisoned"))?.clear();
+        self.copies_pending.set(false);
+        self.consumed_pending.set(false);
+        Ok(())
+    }
+
     /// Small waves upload on the compute stream itself (a cross-stream wait
     /// costs more than their copies); large ones on the copy stream, so they
     /// overlap the compute stream until the reduce needs them.
@@ -544,6 +567,53 @@ impl<'a> SparkIntake<'a> {
             unsafe { self.library.copy_host_buffer_h2d_async(self.planes[rank].buffer, source, plane_bytes, stream)? };
         }
         Ok(())
+    }
+}
+
+/// Acquiring the ownership store precedes every enqueue. If an enqueue
+/// returns an error after accepting some asynchronous work, its source still
+/// belongs to the intake and can only be released after terminal drainage.
+fn retain_before_enqueue<T>(held: &std::sync::Mutex<Vec<T>>, item: T,
+    enqueue: impl FnOnce(&T) -> Result<()>) -> Result<()> {
+    let mut held = held.lock().map_err(|_| anyhow::anyhow!("intake slots poisoned"))?;
+    held.push(item);
+    enqueue(held.last().expect("item was retained before enqueue"))
+}
+
+#[cfg(test)]
+mod terminal_ownership_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
+
+    struct Owner(Arc<AtomicUsize>);
+    impl Drop for Owner { fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); } }
+
+    #[test]
+    fn failed_enqueue_keeps_its_source_owner() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let held = Mutex::new(Vec::new());
+        assert!(retain_before_enqueue(&held, Owner(drops.clone()), |_| anyhow::bail!("injected enqueue failure")).is_err());
+        assert_eq!(held.lock().unwrap().len(), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        held.lock().unwrap().clear();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_ownership_insertion_never_enqueues() {
+        let held = Arc::new(Mutex::new(Vec::<Owner>::new()));
+        let poison = held.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poison.lock().unwrap();
+            panic!("injected ownership lock failure");
+        }).join();
+        let calls = AtomicUsize::new(0);
+        let drops = Arc::new(AtomicUsize::new(0));
+        assert!(retain_before_enqueue(&held, Owner(drops.clone()), |_| {
+            calls.fetch_add(1, Ordering::SeqCst); Ok(())
+        }).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }
 
@@ -640,9 +710,11 @@ fn log_transfer_plan(mode: IntakeMode, ranks: usize) {
 /// A Spark transport and the intake its waves land in (dropped in that order).
 pub(crate) struct SparkLink<'a> {
     pub(crate) transport: SparkExperts,
-    pub(crate) intake: SparkIntake<'a>,
+    pub(crate) intake: std::rc::Rc<SparkIntake<'a>>,
     /// Bytes of the transport's egress buffer (0: none).
     egress_bytes: usize,
+    terminal_library: Option<Arc<NativeLibrary>>,
+    terminal_released: bool,
 }
 
 impl<'a> SparkLink<'a> {
@@ -650,6 +722,7 @@ impl<'a> SparkLink<'a> {
     /// waves land in an intake of the process-wide [`choose_mode`].
     pub(crate) fn new(library: &'a NativeLibrary, peers: &[std::net::SocketAddr], executors: &[u64], capacity: u32,
         config: cuteafd_transport::TcpTransportConfig, row_bytes: usize) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
         let mode = transport_mode(library, peers.len(), capacity as usize, row_bytes)?;
         let intake = SparkIntake::new(library, mode, peers.len(), capacity as usize, row_bytes)?;
         let mut transport = SparkExperts::new_ranks(peers, executors, capacity, config)?;
@@ -662,7 +735,7 @@ impl<'a> SparkLink<'a> {
         if egress_bytes > 0 {
             transport.enable_egress(egress_bytes, egress_setting() == Egress::Staggered)?;
         }
-        Ok(Self { transport, intake, egress_bytes })
+        Ok(Self { transport, intake: std::rc::Rc::new(intake), egress_bytes, terminal_library: None, terminal_released: false })
     }
 
     /// Where to write a wave's `bytes` of expert input so it goes out
@@ -683,6 +756,28 @@ impl<'a> SparkLink<'a> {
 
     pub(crate) fn world_size(&self) -> usize {
         self.transport.world_size()
+    }
+
+    /// Must precede connection/bootstrap so a temporary failed endpoint can
+    /// retain the same external landing and pinned-upload owners as submit.
+    pub(crate) fn enable_terminal_ownership(&mut self, library: Arc<NativeLibrary>) -> Result<()> {
+        ensure!(std::ptr::eq(library.as_ref(),self.intake.library),"terminal intake must retain its actual native library owner");
+        self.intake.library.rdma_rc_endpoint_quiesce_available()?;
+        self.transport.enable_terminal_ownership()?;
+        self.terminal_library = Some(library);
+        Ok(())
+    }
+
+    pub(crate) fn terminal_quiesce(&mut self) -> Result<()> { self.transport.terminal_quiesce() }
+    pub(crate) fn terminal_drain_copies(&self) -> Result<()> { self.intake.terminal_drain_copies() }
+    pub(crate) fn terminal_release(&mut self) -> Result<()> {
+        // Validate successful QP quiescence before releasing any held source.
+        // Those payloads retain their endpoint registrations until this final
+        // clear, even after the transport drops its drained pending owners.
+        self.transport.terminal_release()?;
+        self.intake.terminal_release_payloads()?;
+        self.terminal_released = true;
+        Ok(())
     }
 
     /// Posts `request` to every rank once the previous wave's planes are free.
@@ -713,6 +808,21 @@ impl<'a> SparkLink<'a> {
                 output, t as u32, stream)?;
         }
         self.intake.consumed(stream)
+    }
+}
+
+impl Drop for SparkLink<'_> {
+    fn drop(&mut self) {
+        if self.transport.terminal_owned() && !self.terminal_released {
+            // Drop may run inside fallible connection or submission scopes,
+            // before the engine regains control. QP quiescence alone cannot
+            // prove the compute stream passed these planes/pinned sources.
+            // Retain the whole intake until process teardown. The transport
+            // separately retains endpoint/library owners if quiescence fails.
+            std::mem::forget(self.intake.clone());
+            if let Some(library)=self.terminal_library.take() { std::mem::forget(library); }
+            tracing::error!("retaining terminal intake whose complete consumer drainage was not proven");
+        }
     }
 }
 

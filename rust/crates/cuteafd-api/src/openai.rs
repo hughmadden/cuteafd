@@ -226,7 +226,7 @@ async fn health(State(state): State<NativeState>) -> StatusCode {
         StatusCode::OK
     }
 }
-fn error(status: StatusCode, message: impl ToString) -> Response {
+fn error_body(message: impl ToString) -> Value {
     // Bound upstream parse/validation details before they reach the response
     // body: serde invalid-type errors echo the full offending string (e.g. a
     // 100 KB string in a wrongly-typed field). Same class as the JsonRejection
@@ -234,11 +234,15 @@ fn error(status: StatusCode, message: impl ToString) -> Response {
     // production serving path (mounted by the daemon) — verified live on the
     // fleet 2026-09-15.
     let message = crate::error::bounded_error_detail(&message.to_string());
-    (
-        status,
-        Json(json!({"error":{"message":message,"type":"native_v41_error"}})),
-    )
-        .into_response()
+    json!({"error":{"message":message,"type":"native_v41_error"}})
+}
+fn error(status: StatusCode, message: impl ToString) -> Response {
+    (status, Json(error_body(message))).into_response()
+}
+fn sse_error(message: impl ToString) -> String {
+    // Keep the HTTP error envelope and bound, with JSON escaping so a worker
+    // message containing newlines cannot inject SSE frames.
+    format!("data: {}\n\n", error_body(message))
 }
 
 static NEXT_TARGET_SEED: AtomicU64 = AtomicU64::new(0);
@@ -629,21 +633,21 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
                 let chunk = match tokio::time::timeout(SSE_KEEPALIVE, chunks.next()).await {
                     Ok(Some(chunk)) => chunk,
                     Ok(None) => break,
-                    Err(_) => { yield Ok(": keepalive\n\n".to_owned()); continue; }
+                    Err(_) => { yield Ok::<String, std::convert::Infallible>(": keepalive\n\n".to_owned()); continue; }
                 };
                 let failed = failure.lock().unwrap().clone();
                 if let Some(message) = failed {
-                    yield Err::<String,std::io::Error>(std::io::Error::other(message)); return;
+                    yield Ok(sse_error(message)); return;
                 }
                 match chunk {
                     Ok(chunk) => {
                         yield Ok(format!("data: {}\n\n",serde_json::to_string(&chunk).unwrap()));
                     },
-                    Err(e) => { yield Err(std::io::Error::other(e.to_string())); return; }
+                    Err(e) => { yield Ok(sse_error(e)); return; }
                 }
             }
             let failed = failure.lock().unwrap().clone();
-            if let Some(message) = failed { yield Err(std::io::Error::other(message)); return; }
+            if let Some(message) = failed { yield Ok(sse_error(message)); return; }
             yield Ok("data: [DONE]\n\n".to_owned());
         };
         return (
@@ -736,6 +740,22 @@ mod tests {
     use tower::ServiceExt;
     fn request(stream: bool) -> axum::http::Request<Body> {
         axum::http::Request::post("/v1/chat/completions").header("content-type","application/json").body(Body::from(json!({"model":MODEL,"messages":[{"role":"user","content":"What is 2 + 2? Answer with just the number."}],"thinking":{"type":"disabled"},"temperature":0,"max_tokens":16,"stream":stream}).to_string())).unwrap()
+    }
+    pub(super) fn terminal_sse_error(bytes: &[u8]) -> Value {
+        let text = std::str::from_utf8(bytes).unwrap();
+        assert!(!text.split("\n\n").any(|frame| frame == "data: [DONE]"),
+            "failed streams must not finish successfully: {text}");
+        let frames: Vec<Value> = text.split("\n\n")
+            .filter_map(|frame| frame.strip_prefix("data: "))
+            .map(|data| serde_json::from_str(data).unwrap()).collect();
+        assert!(!frames.is_empty(), "failed streams must include an error frame: {text}");
+        assert_eq!(frames.iter().filter(|frame| frame.get("error").is_some()).count(), 1);
+        assert!(!frames.iter().any(|frame| frame["choices"].as_array().is_some_and(|choices|
+            choices.iter().any(|choice| !choice["finish_reason"].is_null()))),
+            "failed streams must not emit a success finish chunk: {text}");
+        let last = frames.last().unwrap();
+        assert_eq!(last["error"]["type"], "native_v41_error");
+        last.clone()
     }
     fn strict_schema_body(thinking_disabled: bool, schema: Value) -> Body {
         let mut body = json!({
@@ -1052,7 +1072,9 @@ mod tests {
                 .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap();
             let response = router(tx).oneshot(request).await.unwrap();
             if streaming {
-                assert!(axum::body::to_bytes(response.into_body(), 1024 * 1024).await.is_err());
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                assert_eq!(terminal_sse_error(&bytes)["error"]["message"], "late execution failure");
             } else {
                 assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
                 let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
@@ -1060,6 +1082,69 @@ mod tests {
                 assert_eq!(value["error"]["message"], "late execution failure");
             }
         }
+    }
+    #[tokio::test]
+    async fn late_worker_errors_and_disconnects_end_with_an_error_data_frame() {
+        let escaped = "worker said \"failed\" \\\r\n\ndata: [DONE]\n\nevent: injected\0".to_owned();
+        let oversized = format!("backend detail: {}END_OF_UNBOUNDED_DETAIL", "界\n\"\\".repeat(5000));
+        for message in [None, Some(escaped), Some(oversized)] {
+            let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+            let worker_message = message.clone();
+            let worker = tokio::spawn(async move {
+                let job = rx.recv().await.unwrap();
+                job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
+                    prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).unwrap();
+                job.events.send(Ok(InferenceChunk::Text { content: "Partial output.".into(), content_tokens: 2 })).unwrap();
+                if let Some(message) = worker_message {
+                    job.events.send(Err(NativeFailure::Worker(message))).unwrap();
+                }
+                // Dropping the sender without Finish is also a worker failure.
+            });
+            let response = router(tx).oneshot(request(true)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["content-type"], "text/event-stream");
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            let error = terminal_sse_error(&bytes);
+            let detail = error["error"]["message"].as_str().unwrap();
+            match message {
+                None => assert_eq!(detail, "native worker ended without completion"),
+                Some(message) if message.chars().count() <= 512 => assert_eq!(detail, message),
+                Some(_) => {
+                    assert!(detail.starts_with("backend detail: "));
+                    assert!(detail.ends_with("... (truncated)"));
+                    assert!(detail.chars().count() < 530);
+                    assert!(!detail.contains("END_OF_UNBOUNDED_DETAIL"));
+                    assert!(bytes.len() < 8192, "error detail escaped beyond the response bound");
+                }
+            }
+            worker.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn a_failed_stream_does_not_abort_a_sibling_stream() {
+        let (tx, mut rx) = mpsc::channel::<NativeRequest>(2);
+        let worker = tokio::spawn(async move {
+            let failed = rx.recv().await.unwrap();
+            let healthy = rx.recv().await.unwrap();
+            for job in [&failed, &healthy] {
+                job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
+                    prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).unwrap();
+            }
+            failed.events.send(Err(NativeFailure::Worker("one request failed".into()))).unwrap();
+            healthy.events.send(Ok(InferenceChunk::Text { content: "4".into(), content_tokens: 1 })).unwrap();
+            healthy.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop })).unwrap();
+        });
+        let app = router(tx);
+        let (failed, healthy) = tokio::join!(app.clone().oneshot(request(true)), app.oneshot(request(true)));
+        let failed = axum::body::to_bytes(failed.unwrap().into_body(), 1 << 20);
+        let healthy = axum::body::to_bytes(healthy.unwrap().into_body(), 1 << 20);
+        let (failed, healthy) = tokio::join!(failed, healthy);
+        assert_eq!(terminal_sse_error(&failed.unwrap())["error"]["message"], "one request failed");
+        let healthy = String::from_utf8(healthy.unwrap().to_vec()).unwrap();
+        assert!(healthy.contains("\"content\":\"4\""));
+        assert!(healthy.ends_with("data: [DONE]\n\n"));
+        assert!(!healthy.contains("\"error\""));
+        worker.await.unwrap();
     }
     #[tokio::test]
     async fn worker_error_and_missing_finish_are_not_success() {

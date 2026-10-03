@@ -12,7 +12,7 @@
 //! affects draft quality, never the verified output). The last stage's
 //! mHC head, the shared vocabulary head and the Markov head then pick the
 //! drafts greedily on the device.
-use super::{Dev, Engine, Lane, Workspace, LOCAL_EXPERTS, PREFILL_LANES, TAP_ROWS};
+use super::{Dev, Engine, Lane, Workspace, LOCAL_EXPERTS, TAP_ROWS};
 use crate::families::deepseek_v4::local::LocalLayer;
 use crate::families::deepseek_v4::metadata::WINDOW;
 use crate::families::deepseek_v4::pool::Placement;
@@ -101,12 +101,14 @@ impl<'a> Engine<'a> {
             "draft step of {} requests", requests.len());
         let slot = &self.decode_workspace;
         if slot.borrow().is_none() {
-            *slot.borrow_mut() = Some(self.workspace(self.decode_rows, PREFILL_LANES)?);
+            *slot.borrow_mut() = Some(self.workspace(self.decode_rows, 1)?);
         }
         let workspace = slot.borrow();
         let w = workspace.as_ref().context("workspace")?;
-        // The second decode lane is idle outside prefill-shaped steps.
-        let lane = &w.lanes[1];
+        // Target and draft steps share one stream and the workspace's query,
+        // scratch and logits buffers. Reuse the first lane too: target-only
+        // decoding may have initialized this workspace with just one lane.
+        let lane = w.lanes.first().context("dSpark decode workspace has no lane")?;
         let (mut positions, mut slots) = (Vec::with_capacity(rows), Vec::with_capacity(rows));
         let (mut indices, mut lengths) = (vec![-1i32; rows * WINDOW], Vec::with_capacity(rows));
         for (index, request) in requests.iter().enumerate() {
@@ -183,7 +185,7 @@ impl<'a> Engine<'a> {
                     std::ptr::null_mut(), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, rows,
                     self.cfg.n_routed_experts, self.cfg.n_activated_experts, self.cfg.route_scale as f32, self.stream)?;
             }
-            let grid = (rows * h.div_ceil(256)).div_ceil(8).min(4 * self.sms as usize).max(1);
+            let grid = self.quantize_grid.blocks(rows, h);
             self.run("expert_input_quant", &[
                 ("source_ptr", w.y.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
                 ("scale_rows_ptr", offset(&w.wire, h)), ("scale_mma_ptr", w.dummy.buffer.ptr),

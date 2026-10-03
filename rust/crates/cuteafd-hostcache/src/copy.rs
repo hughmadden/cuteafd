@@ -73,6 +73,14 @@ pub trait CopyEngine: PinnedMemory {
     fn completed(&mut self, event: Event) -> anyhow::Result<bool>;
     /// Block up to `budget_ns`; true if the event completed within the budget.
     fn wait(&mut self, event: Event, budget_ns: u64) -> anyhow::Result<bool>;
+    /// Exceptional release barrier: finish every queued copy before its source
+    /// or destination is reused. Unlike `wait`, this may exceed the normal copy
+    /// budget. An error requires the caller to retain both kinds of storage.
+    fn release_barrier(&mut self, stream: Stream) -> anyhow::Result<()> {
+        let event = self.record(stream)?;
+        if !self.wait(event, u64::MAX)? { bail!("copy release barrier did not complete"); }
+        Ok(())
+    }
     /// The clock every budget is measured against (monotonic; virtual under the stub).
     fn now_ns(&self) -> u64;
 }
@@ -616,6 +624,14 @@ impl CopyEngine for StubCopyEngine {
             self.execute_due();
         }
         Ok(matches!(completion, Some(completion) if self.now_ns >= completion))
+    }
+
+    fn release_barrier(&mut self, stream: Stream) -> anyhow::Result<()> {
+        let index = stream_index(stream);
+        if self.stalled[index] { bail!("copy stream is stalled; storage must remain held"); }
+        self.now_ns = self.now_ns.max(self.last_completion[index]);
+        self.execute_due();
+        Ok(())
     }
 
     fn now_ns(&self) -> u64 {

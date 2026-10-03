@@ -1,7 +1,7 @@
 //! Spark request adapter: preserve the compact BF16 wire response and write
 //! directly into registered send storage when the transport permits it.
 use super::{
-    execution::{Exl3Execution, Exl3InputFormat, Exl3Workspace},
+    execution::{Exl3Execution, Exl3InputFormat, Exl3RowPolicy, Exl3Workspace},
     Exl3Weights,
 };
 use crate::families::deepseek_v41::v41_experts::HostExpertExchange;
@@ -20,6 +20,7 @@ pub(crate) struct Exl3Worker<'a> {
     // Opt-in diagnostics: allocate events once; the default path never records them.
     timing: Option<[crate::shared::memory::device::Event<'a>; 2]>,
     executions: Vec<Exl3Execution<'a>>,
+    row_policy: Exl3RowPolicy,
     capacity: usize,
     inputs: [DeviceAllocation<'a>; 3],
     paired_upload: Option<Vec<i32>>,
@@ -33,13 +34,7 @@ pub(crate) struct Exl3Worker<'a> {
 
 impl<'a> Exl3Worker<'a> {
     fn capacities(capacity: u32) -> Result<Vec<u32>> {
-        let capacities = [1, 16, 80, 256, 1024, 4096];
-        ensure!(
-            (1..=4096).contains(&capacity),
-            "invalid EXL3 worker capacity"
-        );
-        let maximum = capacities.into_iter().find(|&c| c >= capacity).unwrap();
-        Ok(capacities.into_iter().filter(|&c| c <= maximum).collect())
+        Exl3RowPolicy::active().capacities(capacity as usize)
     }
 
     /// Validate every capacity before allocating or reading resident weights.
@@ -110,6 +105,7 @@ impl<'a> Exl3Worker<'a> {
             "EXL3 worker workspace exceeds device budget"
         );
         let mut executions = Vec::new();
+        let row_policy = Exl3RowPolicy::active();
         let capacities = Self::capacities(capacity)?;
         let directories: Vec<_> = capacities.iter().map(|c| directory.join(format!("m{c}"))).collect();
         let arena = Exl3Workspace::new(library, &directories)?;
@@ -166,6 +162,7 @@ impl<'a> Exl3Worker<'a> {
             None
         };
         Ok(Self {
+            row_policy,
             stream,
             timing,
             executions,
@@ -271,7 +268,7 @@ impl<'a> Exl3Worker<'a> {
         let execution = self
             .executions
             .iter_mut()
-            .find(|e| e.capacity() >= request.rows() as usize)
+            .find(|e| e.capacity() >= self.row_policy.required_capacity(request.rows() as usize))
             .context("missing preloaded EXL3 worker capacity")?;
         let output = unsafe {
             if self.ownership_words > 0 {

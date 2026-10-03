@@ -3,6 +3,7 @@
 use super::checkpoint::Checkpoint;
 use super::format::QuantOperand;
 use super::spec::{Component, ModelSpec, TensorRole};
+use crate::serving_capacity::{CacheGeometryError, CacheOptions, FamilyCacheGeometry};
 
 /// Where a family's implementation stands in this build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -53,6 +54,12 @@ pub struct ExpertContract {
 /// tensor contract and the expert placement all derive from it.
 pub trait FamilyModel: Send + Sync {
     fn spec(&self) -> &ModelSpec;
+
+    /// Physical cache records and state from the same parsed configuration as
+    /// the runtime. Weight/workspace admission remains a separate requirement.
+    fn cache_geometry(&self, _options: CacheOptions) -> Result<Option<FamilyCacheGeometry>, CacheGeometryError> {
+        Ok(None)
+    }
 
     /// The tensor contract: whether this build's loaders take `operand` (the
     /// logical weight `stem`) for `role`, and the precise reason when not.

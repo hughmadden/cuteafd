@@ -51,6 +51,16 @@ int32_t cuteafd_host_signal(uint32_t* flag, uint32_t* send_state, uint32_t* desc
 // advances `state`. Traps after 60 s.
 int32_t cuteafd_spark_wait_written(const uint64_t* flags, uint32_t ranks, uint32_t stride_words,
     uint32_t* state, uint32_t* error, void* stream);
+// Optional terminal cancellation. The legacy wait/symbol above is unchanged.
+// Initialize before enqueueing any abortable wait. `aborted` is a separate,
+// zeroed local u32 that outlives every eager/captured wait and is never reset.
+// Cancellation skips a wait without changing its receive sequence. Afterwards
+// the owner must drain all streams, reject reuse, and retain buffers if draining
+// fails. Publish on an independent stream so a blocked wait cannot prevent it.
+int32_t cuteafd_peer_abort_initialize(void);
+int32_t cuteafd_peer_wait_abortable(const uint32_t* flag, uint32_t* recv_state,
+    const uint32_t* aborted, void* stream);
+int32_t cuteafd_peer_abort_publish(uint32_t* aborted, void* independent_stream);
 
 // P2P probe for `cuteafd fabric --p2p`. Runs one measurement between devices
 // `a` and `b` (peer access enabled both ways by the call) and writes the time

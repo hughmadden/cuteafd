@@ -121,6 +121,32 @@ __global__ void wait_written(const uint64_t* flags, uint32_t ranks, uint32_t str
   }
 }
 
+__global__ void wait_flag_abortable(const uint32_t* flag, uint32_t* state, const uint32_t* aborted) {
+  if (threadIdx.x == 0) {
+    const uint32_t expected = state[0] + 1;
+    const uint64_t start = global_ns();
+    uint32_t polls = 0;
+    for (;;) {
+      // The cancellation word is independent of push/wait sequence state.
+      // Every later queued/captured wait also exits once it is published.
+      if (load_acquire_sys(aborted)) break;
+      if (int32_t(load_acquire_sys(flag) - expected) >= 0) {
+        state[0] = expected;
+        break;
+      }
+      if ((++polls & 1023) == 0 && global_ns() - start > kWaitTimeoutNs) {
+        printf("peer_wait_abortable: missing push or terminal abort after 60 s\n");
+        __trap();
+      }
+    }
+  }
+  __syncthreads();
+}
+
+__global__ void publish_abort(uint32_t* aborted) {
+  store_release_sys(aborted, 1);
+}
+
 __global__ void add_bf16(const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* out, uint64_t count) {
   const uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
   for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += stride)
@@ -259,6 +285,29 @@ extern "C" int32_t cuteafd_spark_wait_written(const uint64_t* flags, uint32_t ra
     uint32_t* state, uint32_t* error, void* stream) {
   if (!flags || !state || !error || !stream || !ranks || ranks > 32 || !stride_words) return cudaErrorInvalidValue;
   wait_written<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(flags, ranks, stride_words, state, error);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t cuteafd_peer_abort_initialize() {
+  cudaFuncAttributes attributes{};
+  for (const void* kernel : {reinterpret_cast<const void*>(wait_flag_abortable),
+       reinterpret_cast<const void*>(publish_abort)}) {
+    const cudaError_t status = cudaFuncGetAttributes(&attributes, kernel);
+    if (status != cudaSuccess) return status;
+  }
+  return cudaSuccess;
+}
+
+extern "C" int32_t cuteafd_peer_wait_abortable(const uint32_t* flag, uint32_t* recv_state,
+    const uint32_t* aborted, void* stream) {
+  if (!flag || !recv_state || !aborted || !stream) return cudaErrorInvalidValue;
+  wait_flag_abortable<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(flag, recv_state, aborted);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t cuteafd_peer_abort_publish(uint32_t* aborted, void* independent_stream) {
+  if (!aborted || !independent_stream) return cudaErrorInvalidValue;
+  publish_abort<<<1, 1, 0, static_cast<cudaStream_t>(independent_stream)>>>(aborted);
   return cudaGetLastError();
 }
 

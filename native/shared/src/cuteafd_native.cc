@@ -4263,6 +4263,28 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_post_send_slot_region(
 #endif
 }
 
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_quiesce(void* handle) {
+  if (handle == nullptr) {
+    return ok();
+  }
+#if CUTEAFD_NATIVE_ENABLE_RDMA
+  auto* endpoint = static_cast<CuteafdRdmaRcEndpointHandle*>(handle);
+  if (endpoint->qp != nullptr) {
+    if (ibv_destroy_qp(endpoint->qp) != 0) {
+      return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
+                  "terminal ibv_destroy_qp failed; all registrations and landing owners must remain live");
+    }
+    endpoint->qp = nullptr;
+  }
+  // MRs, rings, registered egress and external landing ranges remain owned
+  // until the caller has also drained every queued CUDA consumer/upload.
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
+              "RDMA RC endpoint quiesce requires CUTEAFD_ENABLE_RDMA=ON");
+#endif
+}
+
 extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_destroy(void* handle) {
   if (handle == nullptr) {
     return ok();

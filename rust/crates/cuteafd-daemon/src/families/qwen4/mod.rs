@@ -10,7 +10,7 @@ pub(crate) mod serve;
 pub(crate) mod speculate;
 pub(crate) mod weights;
 
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
 use cuteafd_loader::plan::checkpoint::Checkpoint;
@@ -45,10 +45,18 @@ pub(crate) struct EngineArgs {
     pub slots: usize,
     #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
-    /// Decode steps of <= 16 rows read E4M3 copies (FP32 128x128 block scales,
-    /// quantized at load) of the GDN and attention in/out projections.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    /// Hold the GDN and attention in/out projections (target and MTP layers)
+    /// as E4M3 with FP32 128x128 block scales, quantized at load, INSTEAD of
+    /// the checkpoint's BF16 (no BF16 copy stays resident): every step shape
+    /// runs the `qwen4_*_w8_*` programs (decode: 16-row GEMV, W8A16 TMA above;
+    /// prefill: W8A16, bitwise BF16 over the dequantized weights, or W8A8 with
+    /// --fp8-prefill-w8a8). Default false: checkpoint BF16.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub fp8_decode: bool,
+    /// With --fp8-decode: prefill programs quantize their activations too
+    /// (E4M3 per row and 128-K block; the GDN in-projection stays W8A16).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, requires = "fp8_decode")]
+    pub fp8_prefill_w8a8: bool,
     /// Scale rule of the FP8 copies made from BF16 weights at load: amax /
     /// 448, the smallest power of two >= it (pow2), or per block whichever of
     /// the two leaves the smaller error (best).
@@ -80,9 +88,10 @@ pub(crate) struct EngineArgs {
     /// TP1 FP8 package directory (default `<libdir>/fp8/fp8-qwen4/tp1`).
     #[arg(long)]
     pub fp8_package: Option<PathBuf>,
-    /// FP8 expert layers resident at once with --local-experts (2.4 GiB each).
-    #[arg(long, default_value_t = 16)]
-    pub expert_window: usize,
+    /// Diagnostic paging: keep only N local expert layers resident. By default
+    /// all routed experts stay on the GPU; checkpoints that do not fit need Sparks.
+    #[arg(long, requires = "local_experts")]
+    pub expert_window: Option<usize>,
     /// Most EXL3 expert layers resident at once (the free memory decides first).
     #[arg(long, default_value_t = 48)]
     pub exl3_window: usize,
@@ -94,9 +103,13 @@ pub(crate) struct EngineArgs {
     /// its experts local) and verifies up to this many drafts per sequence.
     #[arg(long, default_value_t = 0)]
     pub mtp: usize,
-    /// MTP drafts read an E4M3 copy of lm_head (per-row x 128-K scales, made at
-    /// load): half the head's bytes per draft step; verification stays exact.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    /// Hold lm_head as E4M3 with FP32 per-row x 128-K scales (quantized on the
+    /// host at load) INSTEAD of BF16: the one head the target (prefill, verify,
+    /// golden rows) and the MTP drafts share, every logits row through
+    /// `qwen4_head_fp8` in 16-row spans. Default false: both share the BF16 head.
+    /// Default true: measured on one RTX (C1 code 196 -> 222 tok/s, KL 0.034 ->
+    /// 0.036, top-1 unchanged 88.5%). --fp8-decode stays off: KL +0.012.
+    #[arg(long, alias = "fp8-head", default_value_t = true, action = clap::ArgAction::Set)]
     pub mtp_fp8_head: bool,
     #[command(flatten)]
     pub token_io: crate::shared::token_io::TokenIoArgs,
@@ -195,6 +208,45 @@ impl Opened {
     }
 }
 
+#[cfg(test)]
+mod weight_representation_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Command {
+        #[command(flatten)]
+        engine: EngineArgs,
+    }
+
+    fn args(extra: &[&str]) -> std::result::Result<EngineArgs, clap::Error> {
+        Command::try_parse_from(["qwen", "--snapshot", "/missing/checkpoint", "--native-lib", "/missing/native.so"]
+            .into_iter().chain(extra.iter().copied())).map(|c| c.engine)
+    }
+
+    #[test]
+    fn measured_defaults_fp8_head_bf16_projections_and_options() {
+        for extra in [&[][..], &["--mtp", "1"][..]] {
+            let parsed = args(extra).unwrap();
+            assert!(!parsed.fp8_decode && parsed.mtp_fp8_head && !parsed.fp8_prefill_w8a8);
+        }
+        assert!(!args(&["--mtp-fp8-head", "false"]).unwrap().mtp_fp8_head);
+        let parsed = args(&["--fp8-decode", "true", "--mtp-fp8-head", "true", "--fp8-prefill-w8a8", "true"]).unwrap();
+        assert!(parsed.fp8_decode && parsed.mtp_fp8_head && parsed.fp8_prefill_w8a8);
+        assert!(args(&["--fp8-head", "true"]).unwrap().mtp_fp8_head);
+        // The W8A8 switch applies to FP8-only projections only.
+        assert!(args(&["--fp8-prefill-w8a8", "true"]).is_err());
+    }
+
+    #[test]
+    fn fp8_requests_reach_the_checkpoint_instead_of_a_refusal() {
+        for extra in [&["--fp8-decode", "true"][..], &["--mtp", "1", "--mtp-fp8-head", "true"][..]] {
+            let error = open(&args(extra).unwrap()).err().unwrap().to_string();
+            assert!(!error.contains("unsupported"), "{error}");
+        }
+    }
+}
+
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     let checkpoint = Checkpoint::open(&args.snapshot)?;
     ensure!(checkpoint.missing_shards.is_empty(), "checkpoint shards missing: {:?}", checkpoint.missing_shards);
@@ -227,6 +279,21 @@ impl Opened {
     pub fn with_engine<T>(&self, args: &EngineArgs, body: impl FnOnce(&engine::Qwen4Engine<'_>) -> Result<T>)
         -> Result<T> {
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
+        programs.capacities().require_context("qwen4", args.max_context)?;
+        let mut required: Vec<String> = Vec::new();
+        if args.fp8_decode {
+            for cap in ["m64".to_string(), format!("m{}", args.prefill_rows)] {
+                required.extend(["gdn", "attn_producer", "attn_o"].map(|p| format!("qwen4_{p}_w8_{cap}")));
+            }
+        }
+        if args.mtp_fp8_head {
+            required.push("qwen4_head_fp8".into());
+        }
+        for name in &required {
+            programs.spec(name).with_context(|| format!("--fp8-decode / --mtp-fp8-head need the FP8-only program \
+                {name} (export_b12x_dsv4_aot.py qwen4 with the fork's fp8_only Qwen programs); rebuild the native \
+                library or run with checkpoint BF16 (--fp8-decode false --mtp-fp8-head false)"))?;
+        }
         programs.load_all()?;
         let stream = self.library.cuda_stream_create()?;
         let started = Instant::now();
@@ -236,11 +303,24 @@ impl Opened {
         let source = self.embed_source()?;
         let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library, source,
             args.token_io.embed_placement,
-            || loader.model(&self.cfg, layers, args.mtp > 0 && layers == self.cfg.layers, args.mtp_fp8_head))?;
+            || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers, args.mtp > 0 && layers == self.cfg.layers, args.mtp_fp8_head) })?;
         let resident: usize = model.layers.iter().map(weights::Qwen4Layer::bytes).sum::<usize>()
-            + model.mtp.as_ref().map_or(0, weights::MtpWeights::bytes);
-        tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64,
-            elapsed_ms = started.elapsed().as_millis() as u64, "Qwen 3.8 Flash Next coordinator weights resident");
+            + model.mtp.as_ref().map_or(0, weights::MtpWeights::bytes) + model.head.bytes();
+        // One resident representation per selectable weight, as the plan accounts for it.
+        let (projections, head) = model.check_single_residency(args.fp8_decode, args.mtp_fp8_head)?;
+        let selection = cuteafd_loader::families::qwen4::resident::Qwen4Representation {
+            fp8_projections: args.fp8_decode, fp8_head: args.mtp_fp8_head };
+        let plan = cuteafd_loader::families::qwen4::resident::resident_bytes(&self.cfg, layers, model.mtp.is_some(),
+            selection);
+        ensure!(projections == plan.projections && head == plan.head,
+            "selectable weights hold {projections} + {head} B, the plan {} + {} B", plan.projections, plan.head);
+        let gib = |bytes: usize| bytes as f64 / (1u64 << 30) as f64;
+        tracing::info!(layers, gib = gib(resident), elapsed_ms = started.elapsed().as_millis() as u64,
+            projections = if args.fp8_decode { "fp8-only" } else { "bf16" },
+            head = if args.mtp_fp8_head { "fp8-only (shared)" } else { "bf16 (shared)" },
+            projection_gib = gib(projections), head_gib = gib(head),
+            checkpoint_bf16_gib = gib(plan.projections_bf16 + plan.head_bf16),
+            "Qwen 3.8 Flash Next coordinator weights resident (one representation per weight)");
         let ple = match self.cfg.ple_layers.first() {
             Some(&layer) if layer < layers => Some(ple::PleTable::load(&self.library, &self.checkpoint, &self.cfg,
                 layer, args.table_placement, &args.table, args.prefill_rows.max(engine::DECODE_ROWS))?),
@@ -249,6 +329,7 @@ impl Opened {
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::Qwen4Engine::new(&self.library, &programs, self.cfg.clone(), model, ple, stream,
             args.max_context, args.prefill_rows, pages, args.slots, embedding)?;
+        engine.w8a8_prefill = args.fp8_prefill_w8a8;
         if let Some(experts) = self.experts(args, layers)? {
             engine.set_experts(experts);
         }
@@ -271,12 +352,21 @@ impl Opened {
             let directory = args.fp8_package.clone()
                 .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&args.native_lib, 1, tensors.format()));
             let (free, _) = self.library.cuda_memory_info()?;
-            // An empty window: the package and its scratch; layers load on first use.
-            let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, 0..0, 1, 0,
-                args.prefill_rows, free.saturating_sub(args.expert_reserve_gib.min(4) << 30))?;
+            ensure!(args.expert_window != Some(0), "--expert-window must be at least 1");
+            let resident = if args.expert_window.is_some() { 0..0 } else {
+                0..layers + usize::from(args.mtp > 0 && layers == self.cfg.layers)
+            };
+            let started = Instant::now();
+            let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, resident, 1, 0,
+                args.prefill_rows, free.saturating_sub(args.expert_reserve_gib.saturating_mul(1 << 30)))
+                .context("local routed experts must fit with step and prefix-cache reservations; use --peers for Sparks, \
+                    or --expert-window N for diagnostic paging; mixed-format MTP experts need their own native package")?;
+            let loads = experts.layers.len();
+            tracing::info!(layers = loads, window = ?args.expert_window, elapsed_ms = started.elapsed().as_millis() as u64,
+                "Qwen routed experts resident on this GPU");
             return Ok(Some(engine::Experts::Local(engine::LocalExperts {
                 library: &self.library, tensors, experts: std::cell::RefCell::new(experts),
-                window: args.expert_window.max(1), loads: std::cell::RefCell::new(0),
+                window: args.expert_window, loads: std::cell::RefCell::new(loads),
             })));
         }
         if let Some(catalog) = self.experts.as_ref().filter(|c| c.exl3().is_some()) {
@@ -297,6 +387,7 @@ impl Opened {
         let transport = crate::shared::spark_intake::SparkLink::new(&self.library, &peers, &executors,
             u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2)?;
+        crate::shared::memory_report::release_load_staging(&self.library);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport), runtime }))
     }
@@ -392,7 +483,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
     let mut allocator = engine::Allocator::new(engine.pages, engine.slots, cfg);
-    let mut placement = allocator.admit(tokens.len() + args.bench_decode)?;
+    let mut placement = allocator.admit(tokens.len() + args.bench_decode + usize::from(args.bench_decode > 0))?;
     let row = cfg.hidden * 2;
     let stream_row = row * 4;
     let prefill = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
@@ -527,6 +618,13 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
         let mut token = tokens[placement.len.min(tokens.len() - 1)];
         let mut times = Vec::new();
         let mut produced = Vec::new();
+        // Capture the complete decode shape and warm its kernels before timing.
+        let warm = [token];
+        if let Some(logits) = engine.verify(&mut [(&mut placement, &warm[..])], None)? {
+            token = argmax(&logits);
+        }
+        let warm_graphs = engine.captured_graphs();
+        *engine.profile.borrow_mut() = [0.0; 2];
         // FNV-1a over every step's logits bits (bit-identity checks between configs).
         let mut digest = 0xcbf2_9ce4_8422_2325u64;
         for _ in 0..args.bench_decode {
@@ -546,9 +644,10 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
         let profile = engine.profile.borrow();
         let mean = times.iter().sum::<f64>() / times.len() as f64;
         println!("decode bench: {} steps through {layers} layers, median {:.3} ms (mean {:.3}, min {:.3}, max {:.2}); \
-            expert GPU wait {:.1} ms, exchange {:.1} ms total; logits digest {digest:016x}; tokens {:?}", times.len(),
+            expert GPU wait {:.1} ms, exchange {:.1} ms total; logits digest {digest:016x}; tokens {:?}; \
+            graph captures warm {warm_graphs}, timed {}", times.len(),
             1e3 * times[times.len() / 2], 1e3 * mean, 1e3 * times[0], 1e3 * times[times.len() - 1], 1e3 * profile[0],
-            1e3 * profile[1], &produced[..produced.len().min(16)]);
+            1e3 * profile[1], &produced[..produced.len().min(16)], engine.captured_graphs() - warm_graphs);
     }
     let loads = match engine.experts() {
         Some(engine::Experts::Local(local)) => format!(", {} FP8 expert layer loads", local.loads.borrow()),

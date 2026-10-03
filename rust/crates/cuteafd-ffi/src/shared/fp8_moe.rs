@@ -61,8 +61,13 @@ impl Fp8MoeInfo {
         };
         // Slices are the widest rank range, zero-padded to 128 (MXFP4 32-blocks
         // or FP8 128-blocks split unevenly, TP6 of 2048: 384).
-        let sliced = info.slice % 128 == 0 && info.slice * info.tp >= info.intermediate
-            && (info.slice - 128) * info.tp < info.intermediate;
+        // The padded width every rank stores, or (exact layouts) one rank's own
+        // whole 128-row blocks: blocks / tp or one more.
+        let blocks = info.intermediate / 128;
+        let exact = info.intermediate % 128 == 0 && info.tp > 0 && blocks >= info.tp
+            && (info.slice == blocks / info.tp * 128 || info.slice == blocks.div_ceil(info.tp) * 128);
+        let sliced = info.slice % 128 == 0 && info.slice >= 128 && (exact || (info.slice * info.tp >= info.intermediate
+            && (info.slice - 128) * info.tp < info.intermediate));
         ensure!(info.tp > 0 && sliced && info.capacities.windows(2).all(|w| w[0] < w[1]),
             "inconsistent FP8 expert package info {info:?}");
         Ok(info)
@@ -132,6 +137,72 @@ pub struct Fp8MoeModule {
     _owner_thread: PhantomData<Rc<()>>,
 }
 
+/// Allocation metadata from a trusted package's static ABI. Reading this
+/// object never calls `cuteafd_fp8moe_create` or initializes CUDA kernels.
+#[derive(Debug, Clone)]
+pub struct Fp8MoeMetadata {
+    pub info: Fp8MoeInfo,
+    scratch: Vec<usize>,
+}
+
+impl Fp8MoeMetadata {
+    /// Read the same geometry and workspace contract used by `load`, before
+    /// any CUDA state, weights or workspaces are allocated.
+    ///
+    /// # Safety
+    /// Only load trusted generated native code whose info/scratch entry
+    /// points implement the static package ABI.
+    pub unsafe fn read(directory: &Path) -> Result<Self> {
+        let path = directory.join(FP8_MOE_LIBRARY);
+        // SAFETY: the caller supplies trusted native code; no function or
+        // pointer from this library escapes the metadata read.
+        let library = unsafe { Library::new(&path) }
+            .with_context(|| format!("loading metadata from {}", path.display()))?;
+        // SAFETY: the caller's trusted static ABI remains live in `library`.
+        unsafe { Self::from_library(&library) }
+    }
+
+    unsafe fn from_library(library: &Library) -> Result<Self> {
+        // SAFETY: the trusted package exports the documented static ABI;
+        // both functions are called while this library remains live.
+        let (query, scratch_bytes) = unsafe {
+            (*library.get::<unsafe extern "C" fn(*mut u32, u32) -> i32>(b"cuteafd_fp8moe_info")?,
+                *library.get::<Scratch>(b"cuteafd_fp8moe_scratch_bytes")?)
+        };
+        let mut words = [0u32; 16];
+        // SAFETY: the query fills at most sixteen live words.
+        ensure!(unsafe { query(words.as_mut_ptr(), 16) } == 0,
+            "FP8 expert package info query failed");
+        Self::from_words_and_scratch(words, |capacity| {
+            let mut bytes = 0u64;
+            // SAFETY: capacity came from the validated package info and
+            // the scratch query writes exactly one live u64.
+            ensure!(unsafe { scratch_bytes(capacity as u32, &mut bytes) } == 0,
+                "FP8 expert scratch query failed");
+            Ok(bytes)
+        })
+    }
+
+    fn from_words_and_scratch(words: [u32; 16], mut query: impl FnMut(usize) -> Result<u64>) -> Result<Self> {
+        // Validate exactly the runtime's package contract before querying any
+        // workspace extent; this helper does not create CUDA state.
+        let info = Fp8MoeInfo::from_words(words)?;
+        let scratch = info.capacities.iter().map(|&capacity| {
+            usize::try_from(query(capacity)?).context("FP8 expert scratch does not fit this process")
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(Self { info, scratch })
+    }
+
+    /// Scratch for the smallest compiled program holding `rows`.
+    pub fn scratch_for(&self, rows: usize) -> Result<usize> {
+        let capacity = self.info.capacity_for(rows)
+            .with_context(|| format!("FP8 expert package has no capacity for {rows} rows"))?;
+        let index = self.info.capacities.iter().position(|&c| c == capacity)
+            .context("FP8 expert capacity metadata disagrees")?;
+        self.scratch.get(index).copied().context("FP8 expert scratch metadata disagrees")
+    }
+}
+
 impl Fp8MoeModule {
     /// Loads `directory/libcuteafd_fp8moe.so` and every program on the current device.
     ///
@@ -142,21 +213,13 @@ impl Fp8MoeModule {
     pub unsafe fn load(directory: &Path) -> Result<Self> {
         let path = directory.join(FP8_MOE_LIBRARY);
         let library = Library::new(&path).with_context(|| format!("loading {}", path.display()))?;
-        let query = *library.get::<unsafe extern "C" fn(*mut u32, u32) -> i32>(b"cuteafd_fp8moe_info")?;
-        let scratch_bytes = *library.get::<Scratch>(b"cuteafd_fp8moe_scratch_bytes")?;
+        let metadata = Fp8MoeMetadata::from_library(&library)?;
         let create = *library.get::<unsafe extern "C" fn(*mut *mut c_void) -> i32>(b"cuteafd_fp8moe_create")?;
         let launch = *library.get::<Launch>(b"cuteafd_fp8moe_launch")?;
         let destroy = *library.get::<Destroy>(b"cuteafd_fp8moe_destroy")?;
         // Packages built before the W8A16 fallback forms have no options.
         let set_options = library.get::<SetOptions>(b"cuteafd_fp8moe_set_options").ok().map(|f| *f);
-        let mut words = [0u32; 16];
-        ensure!(query(words.as_mut_ptr(), 16) == 0, "FP8 expert package info query failed");
-        let info = Fp8MoeInfo::from_words(words)?;
-        let scratch = info.capacities.iter().map(|&capacity| {
-            let mut bytes = 0u64;
-            ensure!(scratch_bytes(capacity as u32, &mut bytes) == 0, "FP8 expert scratch query failed");
-            Ok(bytes as usize)
-        }).collect::<Result<Vec<_>>>()?;
+        let Fp8MoeMetadata { info, scratch } = metadata;
         let mut context = std::ptr::null_mut();
         let status = create(&mut context);
         ensure!(status == 0, "FP8 expert package initialization failed with CUDA status {status}");
@@ -211,5 +274,50 @@ impl Drop for Fp8MoeModule {
     fn drop(&mut self) {
         // SAFETY: the context came from this library's create and is destroyed once.
         unsafe { (self.destroy)(self.context.as_ptr()) }
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    fn words() -> [u32; 16] {
+        // ABI 2, BF16 input, TP1 MXFP4 with two compiled capacities.
+        [2, 6144, 2048, 256, 8, 2048, 1, 1, 0, 2, 16, 4096, 0, 0, 0, 0]
+    }
+
+    #[test]
+    fn metadata_validates_before_querying_workspace_extents() {
+        let mut invalid = words();
+        invalid[0] = 99;
+        let error = Fp8MoeMetadata::from_words_and_scratch(invalid, |_| {
+            panic!("invalid ABI must not query a workspace")
+        }).unwrap_err();
+        assert!(error.to_string().contains("unsupported FP8 expert package ABI"));
+    }
+
+    #[test]
+    fn metadata_queries_every_program_and_selects_the_smallest_fitting_one() {
+        let mut queried = Vec::new();
+        let metadata = Fp8MoeMetadata::from_words_and_scratch(words(), |capacity| {
+            queried.push(capacity);
+            Ok((capacity * 1024) as u64)
+        }).unwrap();
+        assert_eq!(queried, [16, 4096]);
+        assert_eq!(metadata.info.weights, Fp8MoeWeights::Mxfp4);
+        assert_eq!(metadata.scratch_for(1).unwrap(), 16 * 1024);
+        assert_eq!(metadata.scratch_for(16).unwrap(), 16 * 1024);
+        assert_eq!(metadata.scratch_for(17).unwrap(), 4096 * 1024);
+        assert_eq!(metadata.scratch_for(4096).unwrap(), 4096 * 1024);
+        assert!(metadata.scratch_for(4097).is_err());
+    }
+
+    #[test]
+    fn metadata_propagates_a_missing_workspace_extent() {
+        let error = Fp8MoeMetadata::from_words_and_scratch(words(), |capacity| {
+            ensure!(capacity != 4096, "missing prefill workspace extent");
+            Ok(0)
+        }).unwrap_err();
+        assert!(error.to_string().contains("missing prefill workspace extent"));
     }
 }

@@ -16,21 +16,25 @@
 //! the device. Drafts only steer speculation; the verify step keeps output
 //! identical to plain greedy decoding.
 //!
-//! FP8 drafting ([`GlmDrafter::enable_fp8`], on by default in the serve and
-//! golden commands, `--draft-fp8 off` keeps BF16): E4M3 copies of every GEMM
-//! weight and of the target's LM head (FP32 scales per output row and
-//! 128-wide K block, made at load) run the draft and small context updates
-//! through the W8A16 tensor-core GEMV (`fp8_gemv.cu`) up to [`FP8_ROWS`]
-//! rows; larger updates (prefill tails) keep cuBLAS BF16. The committed
-//! tokens do not change: the target verifies every draft. After Hugh
-//! Madden's glm53f-afd FP8 drafter (MIT, v1.1.0 16de2a6).
+//! The checkpoint BF16 GEMMs stay BF16 by default. Explicit FP8 convenience
+//! quantization selects one E4M3 representation at load, with FP32 scales
+//! per output row and 128-wide K block. The existing W8A16 kernel covers
+//! every draft/context row count; no BF16 fallback or packed head copy is
+//! retained. Both modes borrow the target's one resident head
+//! ([`TargetHead`]): its BF16 matrix, or its own launcher (GLM 5.3 Flash's
+//! FP8-only head). The target verifies every proposal. After Hugh Madden's
+//! glm53f-afd (MIT, v1.1.0 16de2a6).
 use crate::shared::fp8_linear::{self, Fp8Weight};
 use crate::shared::memory::DeviceAllocation;
 use crate::shared::token_io::TokenEmbedding;
 use anyhow::{ensure, Context, Result};
+use cuteafd_core::DType;
 use cuteafd_ffi::programs::{VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::{read_safetensors_metadata, SafetensorsTensorMetadata};
+use cuteafd_loader::families::glm5::draft_representation::{
+    GlmDraftCapacity, GlmDraftGeometry, GlmDraftRepresentation, GlmDraftRuntimeLayout,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -42,9 +46,8 @@ type Dev<'a> = DeviceAllocation<'a>;
 pub(crate) const RING: usize = 2048;
 /// Tapped rows one target step keeps (a prefill chunk's tail, or a verify step).
 pub(crate) const TAP_ROWS: usize = RING;
-/// Most rows a GEMM runs on the FP8 copies (the GEMV reads the weights once
-/// per 64 rows: cuBLAS BF16 wins on prefill-sized updates). A GLM 5.3 draft
-/// step of 16 sequences (128 rows) is 16.1 ms BF16, 8-9 ms FP8.
+/// Historical skinny-row limit, kept for the older MiMo compatibility path.
+/// Immutable GLM drafters use the arbitrary-row native W8A16 entrypoint.
 pub(crate) const FP8_ROWS: usize = 128;
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -151,41 +154,72 @@ impl DflashConfig {
     fn conv_width(&self) -> usize {
         4 * self.hidden / self.group
     }
+
+    fn tensor_shapes(&self) -> Vec<(String, Vec<usize>)> {
+        let (h, kv, inter) = (self.hidden, self.kv_width(), self.intermediate);
+        let mut shapes = vec![
+            ("fc.weight".into(), vec![h, self.taps.len() * h]),
+            ("hidden_norm.weight".into(), vec![h]),
+            ("norm.weight".into(), vec![h]),
+            ("candidate_selector.hidden_projection.weight".into(), vec![self.rank, h]),
+            ("candidate_selector.predecessor_codebook".into(), vec![self.vocab, self.rank]),
+            ("candidate_selector.successor_codebook".into(), vec![self.vocab, self.rank]),
+        ];
+        for l in 0..self.layers {
+            let p = format!("layers.{l}");
+            let a = format!("{p}.self_attn");
+            shapes.extend([
+                (format!("{p}.input_layernorm.weight"), vec![h]),
+                (format!("{p}.post_attention_layernorm.weight"), vec![h]),
+                (format!("{p}.attention_conv.kernel_projection.weight"), vec![self.conv_width(), h]),
+                (format!("{p}.attention_conv.base_kernel"), vec![2, 2, h]),
+                (format!("{p}.mlp_conv.kernel_projection.weight"), vec![self.conv_width(), h]),
+                (format!("{p}.mlp_conv.base_kernel"), vec![2, 2, h]),
+                (format!("{a}.q_proj.weight"), vec![self.heads * self.head_dim, h]),
+                (format!("{a}.k_proj.weight"), vec![kv, h]),
+                (format!("{a}.v_proj.weight"), vec![kv, h]),
+                (format!("{a}.q_norm.weight"), vec![self.head_dim]),
+                (format!("{a}.k_norm.weight"), vec![self.head_dim]),
+                (format!("{a}.o_proj.weight"), vec![h, self.heads * self.head_dim]),
+                (format!("{p}.mlp.gate_proj.weight"), vec![inter, h]),
+                (format!("{p}.mlp.up_proj.weight"), vec![inter, h]),
+                (format!("{p}.mlp.down_proj.weight"), vec![h, inter]),
+            ]);
+        }
+        shapes
+    }
+
+    pub(crate) fn runtime_layout(&self, mode: GlmDraftRepresentation, capacity: GlmDraftCapacity)
+        -> Result<GlmDraftRuntimeLayout> {
+        Ok(GlmDraftRuntimeLayout::new(GlmDraftGeometry {
+            hidden: self.hidden as u64, intermediate: self.intermediate as u64, layers: self.layers as u64,
+            heads: self.heads as u64, kv_heads: self.kv_heads as u64, head_dim: self.head_dim as u64,
+            taps: self.taps.len() as u64, vocab: self.vocab as u64, conv_group: self.group as u64,
+            selector_rank: self.rank as u64,
+        }, mode, capacity, TAP_ROWS)?)
+    }
 }
 
-/// The FP8 copies of one draft layer's GEMM weights.
-struct Fp8Layer<'a> {
-    attn_conv: Fp8Weight<'a>,
-    qkv: Fp8Weight<'a>,
-    o: Fp8Weight<'a>,
-    mlp_conv: Fp8Weight<'a>,
-    gate_up: Fp8Weight<'a>,
-    down: Fp8Weight<'a>,
-}
-
-/// Every FP8 copy and the GEMV's scratch.
-struct Fp8Weights<'a> {
-    fc: Fp8Weight<'a>,
-    projection: Fp8Weight<'a>,
-    head: Fp8Weight<'a>,
-    layers: Vec<Fp8Layer<'a>>,
-    workspace: Dev<'a>,
+/// Exactly one immutable resident representation of a GEMM.
+enum DraftWeight<'a> {
+    Bf16(Dev<'a>),
+    Fp8(Fp8Weight<'a>),
 }
 
 struct DraftLayer<'a> {
     input_norm: Dev<'a>,
     post_norm: Dev<'a>,
-    attn_conv: Dev<'a>,
+    attn_conv: DraftWeight<'a>,
     attn_base: Dev<'a>,
-    mlp_conv: Dev<'a>,
+    mlp_conv: DraftWeight<'a>,
     mlp_base: Dev<'a>,
     /// q | k | v rows; the context update reads the k | v rows.
-    qkv: Dev<'a>,
+    qkv: DraftWeight<'a>,
     q_norm: Dev<'a>,
     k_norm: Dev<'a>,
-    o: Dev<'a>,
-    gate_up: Dev<'a>,
-    down: Dev<'a>,
+    o: DraftWeight<'a>,
+    gate_up: DraftWeight<'a>,
+    down: DraftWeight<'a>,
     k_ring: Dev<'a>,
     v_ring: Dev<'a>,
 }
@@ -253,6 +287,25 @@ pub(crate) struct Draft {
     pub features: Vec<[f32; 4]>,
 }
 
+/// FP32 logits `[rows, vocab]` of BF16 rows `[rows, hidden]` on a stream: `(x, logits, rows, stream)`.
+pub(crate) type HeadLaunch<'h> = Box<dyn Fn(*const c_void, *mut f32, usize, *mut c_void) -> Result<()> + 'h>;
+
+/// The target's vocabulary head a draft step borrows: its only resident copy,
+/// never duplicated or repacked by the drafter.
+pub(crate) enum TargetHead<'h> {
+    /// The target's checkpoint BF16 `[vocab, hidden]`.
+    Bf16(&'h Dev<'h>),
+    /// A target-owned launcher over another representation (GLM 5.3 Flash's
+    /// FP8-only head in 16-row spans); the drafter's head workspace is unused.
+    Launch(HeadLaunch<'h>),
+}
+
+/// A resolved [`TargetHead`] inside a draft step.
+enum HeadCall<'h> {
+    Bf16(*const c_void),
+    Launch(&'h HeadLaunch<'h>),
+}
+
 /// Where a draft step's input rows come from.
 #[derive(Clone, Copy)]
 enum DraftInput<'r, 'e> {
@@ -269,10 +322,10 @@ pub(crate) struct GlmDrafter<'a> {
     /// Ring slots (sequences with a drafter context).
     pub slots: usize,
     max_sequences: usize,
-    fc: Dev<'a>,
+    fc: DraftWeight<'a>,
     hidden_norm: Dev<'a>,
     norm: Dev<'a>,
-    projection: Dev<'a>,
+    projection: DraftWeight<'a>,
     predecessor: Dev<'a>,
     successor: Dev<'a>,
     layers: Vec<DraftLayer<'a>>,
@@ -287,9 +340,8 @@ pub(crate) struct GlmDrafter<'a> {
     /// The mask token's embedding row.
     mask_row: Vec<u8>,
     workspace: RefCell<Option<Workspace<'a>>>,
-    fp8: Option<Fp8Weights<'a>>,
-    /// Whether draft steps use `fp8` (a replay toggles it).
-    use_fp8: std::cell::Cell<bool>,
+    representation: GlmDraftRepresentation,
+    fp8_workspace: Option<Dev<'a>>,
 }
 
 fn at(dev: &Dev<'_>, bytes: usize) -> *mut c_void {
@@ -316,27 +368,122 @@ pub(crate) fn prefetch(snapshot: &Path) -> std::thread::JoinHandle<std::io::Resu
 impl Checkpoint {
     fn bytes(&self, name: &str, shape: &[usize]) -> Result<&[u8]> {
         let t = self.tensors.get(name).with_context(|| format!("DFlash2 checkpoint has no {name}"))?;
-        ensure!(t.shape == shape && t.byte_length as usize == shape.iter().product::<usize>() * 2,
+        ensure!(t.dtype == DType::Bf16, "{name}: DFlash2 weights must be BF16, found {:?}", t.dtype);
+        let bytes = shape.iter().try_fold(2usize, |n, &d| n.checked_mul(d))
+            .with_context(|| format!("{name}: BF16 tensor byte count overflow"))?;
+        ensure!(t.shape == shape && usize::try_from(t.byte_length)? == bytes,
             "{name}: shape {:?}, expected BF16 {shape:?}", t.shape);
-        let range = t.byte_offset as usize..(t.byte_offset + t.byte_length) as usize;
+        let first = usize::try_from(t.byte_offset)?;
+        let end = first.checked_add(bytes).with_context(|| format!("{name}: tensor range overflow"))?;
+        let range = first..end;
         self.data.get(range).with_context(|| format!("{name} lies past the file"))
+    }
+
+    /// Validate every owned tensor before the first drafter device allocation.
+    /// Native FP8 checkpoint input needs a direct fragment packer/exporter;
+    /// the BF16 convenience quantizer does not implicitly widen those values.
+    fn validate(&self, cfg: &DflashConfig) -> Result<()> {
+        for (name, shape) in cfg.tensor_shapes() {
+            self.bytes(&name, &shape)?;
+        }
+        Ok(())
     }
 }
 
+/// Header-only admission before native modules or target/drafter allocation.
+pub(crate) fn check_checkpoint(snapshot: &Path, fp8: Option<bool>, context_slots: Option<usize>,
+    max_batch_sequences: usize) -> Result<()> {
+    let cfg = DflashConfig::read(snapshot)?;
+    let mode = GlmDraftRepresentation::from_fp8_option(fp8);
+    let capacity = GlmDraftCapacity::new(context_slots.unwrap_or(20.max(max_batch_sequences)),
+        max_batch_sequences, cfg.block)?;
+    cfg.runtime_layout(mode, capacity)?;
+    let path = snapshot.join("model.safetensors");
+    let tensors: HashMap<_, _> = read_safetensors_metadata(&path)?.into_iter().map(|t| (t.name.clone(), t)).collect();
+    let file_bytes = std::fs::metadata(&path)?.len();
+    check_checkpoint_headers(&cfg, &tensors, file_bytes)
+}
+
+/// The only shared head consumer in this tranche reads checkpoint BF16.
+/// Reject compact input/dual-copy target modes before native allocation.
+pub(crate) fn check_snapshot_target_bf16_head(snapshot: &Path, hidden: usize, vocab: usize,
+    explicit_fp8_head: bool) -> Result<()> {
+    // Routed-expert catalogs need not contain coordinator tensors. Resolve the
+    // head through its own index/header contract without reading weight data.
+    let index_path = snapshot.join("model.safetensors.index.json");
+    let shard = if index_path.is_file() {
+        let index = cuteafd_loader::plan::checkpoint::read_json(&index_path)?;
+        index.get("weight_map").and_then(|map| map.get("lm_head.weight"))
+            .and_then(serde_json::Value::as_str)
+            .context("DFlash target index has no lm_head.weight shard")?.to_owned()
+    } else { "model.safetensors".to_owned() };
+    let path = snapshot.join(&shard);
+    let head = read_safetensors_metadata(&path)?.into_iter()
+        .find(|t| t.name == "lm_head.weight")
+        .with_context(|| format!("DFlash target lm_head.weight missing from indexed shard {shard}"))?;
+    check_target_bf16_head(&head, hidden, vocab, explicit_fp8_head)
+}
+
+pub(crate) fn check_target_bf16_head(t: &SafetensorsTensorMetadata, hidden: usize, vocab: usize,
+    explicit_fp8_head: bool) -> Result<()> {
+    ensure!(!explicit_fp8_head,
+        "{}: --fp8-head with this DFlash target is unsupported: its head has no shared FP8 launcher; \
+         retaining a BF16 head beside an FP8 target copy is not supported", t.name);
+    check_target_head_source(t, hidden, vocab)
+}
+
+/// The checkpoint head the target loads (BF16, or quantized from it to the
+/// target's one FP8 head) and the drafter borrows: BF16 `[vocab, hidden]`.
+pub(crate) fn check_target_head_source(t: &SafetensorsTensorMetadata, hidden: usize, vocab: usize) -> Result<()> {
+    ensure!(t.dtype == DType::Bf16,
+        "{}: shared DFlash head requires checkpoint BF16, found {:?}; add a source-native compact \
+         target/drafter head consumer instead of widening or copying the checkpoint", t.name, t.dtype);
+    let bytes = vocab.checked_mul(hidden).and_then(|n| n.checked_mul(2))
+        .context("DFlash borrowed BF16 head byte count overflow")?;
+    ensure!(t.shape == [vocab, hidden] && t.byte_length == bytes as u64,
+        "{}: shared BF16 head shape {:?}/{} bytes, expected [{vocab}, {hidden}]/{bytes} bytes",
+        t.name, t.shape, t.byte_length);
+    Ok(())
+}
+
+fn check_checkpoint_headers(cfg: &DflashConfig, tensors: &HashMap<String, SafetensorsTensorMetadata>,
+    file_bytes: u64) -> Result<()> {
+    for (name, shape) in cfg.tensor_shapes() {
+        let t = tensors.get(&name).with_context(|| format!("DFlash2 checkpoint has no {name}"))?;
+        ensure!(t.dtype == DType::Bf16,
+            "{name}: DFlash2 checkpoint must be BF16, found {:?}; source-native FP8 requires \
+             a direct fragment packer, other value types are unsupported", t.dtype);
+        let bytes = shape.iter().try_fold(2u64, |n, &d| n.checked_mul(d as u64))
+            .with_context(|| format!("{name}: BF16 tensor byte count overflow"))?;
+        ensure!(t.shape == shape && t.byte_length == bytes,
+            "{name}: shape {:?}/{} bytes, expected BF16 {shape:?}/{bytes} bytes", t.shape, t.byte_length);
+        let end = t.byte_offset.checked_add(t.byte_length).with_context(|| format!("{name}: tensor range overflow"))?;
+        ensure!(end <= file_bytes, "{name} lies past the DFlash2 checkpoint file");
+    }
+    Ok(())
+}
+
 impl<'a> GlmDrafter<'a> {
+    pub fn max_batch_sequences(&self) -> usize { self.max_sequences }
     /// Loads the drafter's weights from `file` (its safetensors bytes, see
     /// [`prefetch`]) and allocates `slots` ring contexts; draft steps take up
     /// to `max_sequences` sequences. `mask_row` is the target embedding of
     /// the mask token.
     #[allow(clippy::too_many_arguments)]
     pub fn load(library: &'a NativeLibrary, snapshot: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
-        max_sequences: usize, mask_row: Vec<u8>, row_window: bool) -> Result<Self> {
+        max_sequences: usize, mask_row: Vec<u8>, row_window: bool, representation: GlmDraftRepresentation,
+        scales: fp8_linear::Fp8Scales) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let cfg = DflashConfig { row_window, ..DflashConfig::read(snapshot)? };
+        let capacity = GlmDraftCapacity::new(slots, max_sequences, cfg.block)?;
+        let layout = cfg.runtime_layout(representation, capacity)?;
+        ensure!(mask_row.len() == cfg.hidden * 2, "DFlash BF16 mask row has wrong hidden width");
         let path = snapshot.join("model.safetensors");
         let checkpoint = Checkpoint {
             data: file,
             tensors: read_safetensors_metadata(&path)?.into_iter().map(|t| (t.name.clone(), t)).collect(),
         };
+        checkpoint.validate(&cfg)?;
         let upload = |bytes: &[u8]| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, bytes.len().max(256))?;
             library.copy_h2d(allocation.buffer, bytes)?;
@@ -348,6 +495,11 @@ impl<'a> GlmDrafter<'a> {
             Ok(allocation)
         };
         let (h, kv, inter) = (cfg.hidden, cfg.kv_width(), cfg.intermediate);
+        let fp8_workspace = layout.fp8_scratch.as_ref().map(|scratch| {
+            let shapes: Vec<_> = scratch.shapes.iter().map(|shape|
+                Ok((usize::try_from(shape.k)?, usize::try_from(shape.n)?))).collect::<Result<_>>()?;
+            fp8_linear::scratch(library, scratch.rows, &shapes)
+        }).transpose()?;
         let tensor = |name: &str, shape: &[usize]| checkpoint.bytes(name, shape).and_then(upload);
         let concat = |parts: &[(&str, usize)], cols: usize| -> Result<Dev<'a>> {
             let total: usize = parts.iter().map(|(_, rows)| rows * cols * 2).sum();
@@ -361,38 +513,65 @@ impl<'a> GlmDrafter<'a> {
             }
             Ok(allocation)
         };
+        let matrix = |source: Dev<'a>, n: usize, k: usize| -> Result<DraftWeight<'a>> {
+            match representation {
+                GlmDraftRepresentation::Bf16Only => Ok(DraftWeight::Bf16(source)),
+                GlmDraftRepresentation::Fp8Only => {
+                    let packed = Fp8Weight::pack(library, source.buffer.ptr, n, k, scales, stream);
+                    // SAFETY: source and any packed result are still live.
+                    // Drain packing even after a launch error before Drop.
+                    if let Err(error) = unsafe { library.cuda_stream_synchronize(stream) } {
+                        // These quarantines retain allocations only. Complete
+                        // family terminal teardown must also retain the native
+                        // library/module owner until queued work has retired.
+                        std::mem::forget(source);
+                        if let Ok(weight) = packed { weight.quarantine(); }
+                        return Err(error.context("DFlash packing owners quarantined after failed drain"));
+                    }
+                    let packed = packed?;
+                    drop(source);
+                    Ok(DraftWeight::Fp8(packed))
+                }
+            }
+        };
         let layers = (0..cfg.layers).map(|l| -> Result<DraftLayer<'a>> {
             let p = format!("layers.{l}");
             let a = format!("{p}.self_attn");
             Ok(DraftLayer {
                 input_norm: tensor(&format!("{p}.input_layernorm.weight"), &[h])?,
                 post_norm: tensor(&format!("{p}.post_attention_layernorm.weight"), &[h])?,
-                attn_conv: tensor(&format!("{p}.attention_conv.kernel_projection.weight"), &[cfg.conv_width(), h])?,
+                attn_conv: matrix(tensor(&format!("{p}.attention_conv.kernel_projection.weight"), &[cfg.conv_width(), h])?,
+                    cfg.conv_width(), h)?,
                 attn_base: tensor(&format!("{p}.attention_conv.base_kernel"), &[2, 2, h])?,
-                mlp_conv: tensor(&format!("{p}.mlp_conv.kernel_projection.weight"), &[cfg.conv_width(), h])?,
+                mlp_conv: matrix(tensor(&format!("{p}.mlp_conv.kernel_projection.weight"), &[cfg.conv_width(), h])?,
+                    cfg.conv_width(), h)?,
                 mlp_base: tensor(&format!("{p}.mlp_conv.base_kernel"), &[2, 2, h])?,
-                qkv: concat(&[(&format!("{a}.q_proj.weight"), cfg.heads * cfg.head_dim),
-                    (&format!("{a}.k_proj.weight"), kv), (&format!("{a}.v_proj.weight"), kv)], h)?,
+                qkv: matrix(concat(&[(&format!("{a}.q_proj.weight"), cfg.heads * cfg.head_dim),
+                    (&format!("{a}.k_proj.weight"), kv), (&format!("{a}.v_proj.weight"), kv)], h)?, cfg.qkv_width(), h)?,
                 q_norm: tensor(&format!("{a}.q_norm.weight"), &[cfg.head_dim])?,
                 k_norm: tensor(&format!("{a}.k_norm.weight"), &[cfg.head_dim])?,
-                o: tensor(&format!("{a}.o_proj.weight"), &[h, cfg.heads * cfg.head_dim])?,
-                gate_up: concat(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
-                    (&format!("{p}.mlp.up_proj.weight"), inter)], h)?,
-                down: tensor(&format!("{p}.mlp.down_proj.weight"), &[h, inter])?,
+                o: matrix(tensor(&format!("{a}.o_proj.weight"), &[h, cfg.heads * cfg.head_dim])?,
+                    h, cfg.heads * cfg.head_dim)?,
+                gate_up: matrix(concat(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
+                    (&format!("{p}.mlp.up_proj.weight"), inter)], h)?, 2 * inter, h)?,
+                down: matrix(tensor(&format!("{p}.mlp.down_proj.weight"), &[h, inter])?, h, inter)?,
                 k_ring: zeroed(slots * RING * kv * 2)?,
                 v_ring: zeroed(slots * RING * kv * 2)?,
             })
         }).collect::<Result<Vec<_>>>()?;
         let taps = cfg.taps.len() * h;
+        tracing::info!(?representation, context_slots = slots, max_batch_sequences = max_sequences,
+            own_weight_bytes = layout.weights.resident_bytes()?, max_load_staging = layout.weights.max_load_staging,
+            "DFlash single-copy storage admitted; vocabulary head borrowed from target");
         Ok(Self {
             library,
             stream,
             slots,
             max_sequences,
-            fc: tensor("fc.weight", &[h, taps])?,
+            fc: matrix(tensor("fc.weight", &[h, taps])?, h, taps)?,
             hidden_norm: tensor("hidden_norm.weight", &[h])?,
             norm: tensor("norm.weight", &[h])?,
-            projection: tensor("candidate_selector.hidden_projection.weight", &[cfg.rank, h])?,
+            projection: matrix(tensor("candidate_selector.hidden_projection.weight", &[cfg.rank, h])?, cfg.rank, h)?,
             predecessor: tensor("candidate_selector.predecessor_codebook", &[cfg.vocab, cfg.rank])?,
             successor: tensor("candidate_selector.successor_codebook", &[cfg.vocab, cfg.rank])?,
             layers,
@@ -404,74 +583,32 @@ impl<'a> GlmDrafter<'a> {
             context_slots: zeroed(TAP_ROWS * 4)?,
             mask_row,
             workspace: RefCell::new(None),
-            fp8: None,
-            use_fp8: std::cell::Cell::new(false),
+            representation,
+            fp8_workspace,
             cfg,
         })
     }
 
-    /// Makes E4M3 copies of every GEMM weight and of the target's LM head
-    /// `head` ([vocab, hidden] BF16), with scales `amax / 448` per output row
-    /// and 128-wide K block (or `scales`' other rules),
-    /// and drafts through them from now on.
-    pub fn enable_fp8(&mut self, head: *const c_void, scales: fp8_linear::Fp8Scales) -> Result<()> {
-        let started = std::time::Instant::now();
-        let (library, stream) = (self.library, self.stream);
-        let pack = |w: *const c_void, n: usize, k: usize| Fp8Weight::pack(library, w, n, k, scales, stream);
-        let c = &self.cfg;
-        let (h, inter, conv, attention) = (c.hidden, c.intermediate, c.conv_width(), c.heads * c.head_dim);
-        let layers = self.layers.iter().map(|l| -> Result<Fp8Layer<'a>> {
-            Ok(Fp8Layer {
-                attn_conv: pack(l.attn_conv.buffer.ptr, conv, h)?,
-                qkv: pack(l.qkv.buffer.ptr, c.qkv_width(), h)?,
-                o: pack(l.o.buffer.ptr, h, attention)?,
-                mlp_conv: pack(l.mlp_conv.buffer.ptr, conv, h)?,
-                gate_up: pack(l.gate_up.buffer.ptr, 2 * inter, h)?,
-                down: pack(l.down.buffer.ptr, h, inter)?,
-            })
-        }).collect::<Result<Vec<_>>>()?;
-        let fc = pack(self.fc.buffer.ptr, h, c.taps.len() * h)?;
-        let projection = pack(self.projection.buffer.ptr, c.rank, h)?;
-        let head = pack(head, c.vocab, h)?;
-        let mut shapes = vec![(fc.k, fc.n), (projection.k, projection.n), (head.k, head.n), (h, 2 * c.kv_width())];
-        for l in &layers {
-            for w in [&l.attn_conv, &l.qkv, &l.o, &l.mlp_conv, &l.gate_up, &l.down] {
-                shapes.push((w.k, w.n));
-            }
-        }
-        let workspace = fp8_linear::scratch(library, FP8_ROWS, &shapes)?;
-        // SAFETY: the packing kernels ran on this stream.
-        unsafe { library.cuda_stream_synchronize(stream)? };
-        let resident: usize = [&fc, &projection, &head].into_iter()
-            .chain(layers.iter().flat_map(|l| [&l.attn_conv, &l.qkv, &l.o, &l.mlp_conv, &l.gate_up, &l.down]))
-            .map(Fp8Weight::bytes).sum();
-        tracing::info!(gib = resident as f64 / (1u64 << 30) as f64, ?scales, elapsed_ms = started.elapsed().as_millis() as u64,
-            "DFlash2 drafter FP8 copies (and FP8 LM head) resident");
-        self.fp8 = Some(Fp8Weights { fc, projection, head, layers, workspace });
-        self.use_fp8.set(true);
-        Ok(())
-    }
-
-    /// Drafts through the FP8 copies (when made) or the BF16 weights.
-    pub fn set_fp8(&self, on: bool) {
-        self.use_fp8.set(on && self.fp8.is_some());
-    }
-
-    /// `out` [rows, n] = `x` [rows, k] @ `w`^T: the FP8 copy `w8` for up to
-    /// [`FP8_ROWS`] rows while FP8 drafting is on, else cuBLAS BF16.
+    /// `out` [rows,n] = `x` [rows,k] @ selected weight rows. This loaded
+    /// matrix owns one representation for every row count.
     ///
     /// # Safety
-    /// Pointers are live device buffers of those shapes.
+    /// Input/output pointers hold the documented shapes on this stream.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn linear(&self, x: *const c_void, w: *const c_void, w8: Option<(&Fp8Weight<'_>, usize)>, out: *mut c_void,
+    unsafe fn linear(&self, x: *const c_void, weight: &DraftWeight<'_>, first: usize, out: *mut c_void,
         rows: usize, k: usize, n: usize) -> Result<()> {
-        match (self.fp8.as_ref(), w8) {
-            (Some(fp8), Some((w8, first))) if self.use_fp8.get() && rows <= FP8_ROWS => {
-                // SAFETY: the caller's contract; the scratch was sized for FP8_ROWS rows of every shape.
-                unsafe { w8.apply(self.library, x, out, false, rows, first, n, &fp8.workspace, self.stream) }
+        match weight {
+            DraftWeight::Bf16(w) => {
+                // SAFETY: source rows first..first+n lie in this matrix;
+                // the caller supplies its selected width and live output.
+                unsafe { self.library.linear_bf16(x, at(w, first * k * 2), out, rows, k, n, self.stream) }
             }
-            // SAFETY: the caller's contract.
-            _ => unsafe { self.library.linear_bf16(x, w, out, rows, k, n, self.stream) },
+            DraftWeight::Fp8(w) => {
+                let scratch = self.fp8_workspace.as_ref().context("FP8 DFlash scratch was not admitted")?;
+                // SAFETY: scratch covers every selected matrix and up to
+                // max(TAP_ROWS, max_batch_sequences*block) input rows.
+                unsafe { w.apply(self.library, x, out, false, rows, first, n, scratch, self.stream) }
+            }
         }
     }
 
@@ -539,15 +676,13 @@ impl<'a> GlmDrafter<'a> {
         let s = self.stream;
         // SAFETY: every buffer holds TAP_ROWS rows of its width; the stream orders the chain.
         unsafe {
-            let fp8 = self.fp8.as_ref();
-            self.linear(at(&self.taps, first * width * 2), self.fc.buffer.ptr, fp8.map(|f| (&f.fc, 0)),
+            self.linear(at(&self.taps, first * width * 2), &self.fc, 0,
                 self.fused.buffer.ptr, n, width, h)?;
             self.library.glm_dflash_rmsnorm(self.fused.buffer.ptr, self.hidden_norm.buffer.ptr,
                 self.fused_norm.buffer.ptr, n, h, self.cfg.eps, s)?;
-            for (index, layer) in self.layers.iter().enumerate() {
+            for layer in &self.layers {
                 let q_rows = self.cfg.heads * self.cfg.head_dim;
-                let kv_rows = at(&layer.qkv, q_rows * h * 2);
-                self.linear(self.fused_norm.buffer.ptr, kv_rows, fp8.map(|f| (&f.layers[index].qkv, q_rows)),
+                self.linear(self.fused_norm.buffer.ptr, &layer.qkv, q_rows,
                     self.context_kv.buffer.ptr, n, h, 2 * kv)?;
                 self.library.glm_dflash_qk_rope(self.context_kv.buffer.ptr, layer.q_norm.buffer.ptr,
                     layer.k_norm.buffer.ptr, self.context_positions.buffer.ptr, self.context_slots.buffer.ptr,
@@ -564,6 +699,7 @@ impl<'a> GlmDrafter<'a> {
     }
 
     fn workspace(&self, sequences: usize) -> Result<Workspace<'a>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter/workspace");
         let c = &self.cfg;
         let rows = sequences * c.block;
         let drafted = sequences * c.drafts();
@@ -604,21 +740,37 @@ impl<'a> GlmDrafter<'a> {
     }
 
     /// Drafts `block - 1` tokens after each sequence's anchor. `anchor_rows`
-    /// holds the anchors' embedding rows; `head` is the target's vocabulary
-    /// head [vocab, hidden] BF16.
-    pub fn draft(&self, sequences: &[DraftSeq], anchor_rows: &[u8], head: *const c_void) -> Result<Vec<Draft>> {
-        self.draft_from(sequences, DraftInput::Rows(anchor_rows), head)
+    /// holds the anchors' embedding rows; `head` is the target's vocabulary head.
+    pub fn draft(&self, sequences: &[DraftSeq], anchor_rows: &[u8], head: TargetHead<'_>) -> Result<Vec<Draft>> {
+        self.draft_from(sequences, DraftInput::Rows(anchor_rows), self.head_call(&head)?)
     }
 
     /// [`Self::draft`] with the block's input rows gathered from the target's
     /// embedding table by token id: each anchor, then the mask token (the
     /// drafter's mask row is that table row).
-    pub fn draft_device(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>, head: *const c_void)
+    pub fn draft_device(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>, head: TargetHead<'_>)
         -> Result<Vec<Draft>> {
-        self.draft_from(sequences, DraftInput::Table(embedding), head)
+        self.draft_from(sequences, DraftInput::Table(embedding), self.head_call(&head)?)
     }
 
-    fn draft_from(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: *const c_void) -> Result<Vec<Draft>> {
+    fn head_call<'h>(&self, head: &'h TargetHead<'h>) -> Result<HeadCall<'h>> {
+        Ok(match head {
+            TargetHead::Bf16(owner) => HeadCall::Bf16(self.borrowed_head(owner)?),
+            TargetHead::Launch(launch) => HeadCall::Launch(launch),
+        })
+    }
+
+    fn borrowed_head(&self, owner: &Dev<'_>) -> Result<*const c_void> {
+        let bytes = self.cfg.vocab.checked_mul(self.cfg.hidden).and_then(|n| n.checked_mul(2))
+            .context("DFlash borrowed BF16 head byte count overflow")?;
+        ensure!(!owner.buffer.ptr.is_null() && owner.buffer.bytes == bytes,
+            "DFlash requires the target-owned BF16 head [{}, {}] ({bytes} bytes); compact target-head \
+             consumer is unsupported, no private head copy will be allocated", self.cfg.vocab, self.cfg.hidden);
+        Ok(owner.buffer.ptr)
+    }
+
+    fn draft_from(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: HeadCall<'_>) -> Result<Vec<Draft>> {
+        ensure!(!matches!(head, HeadCall::Bf16(p) if p.is_null()), "DFlash has no borrowed target head");
         let c = &self.cfg;
         let (s_count, block, h) = (sequences.len(), c.block, c.hidden);
         let rows_ok = match input {
@@ -667,18 +819,16 @@ impl<'a> GlmDrafter<'a> {
         let (s, l) = (self.stream, self.library);
         let (eps, group, inter) = (c.eps, c.group, c.intermediate);
         let attention_width = c.heads * c.head_dim;
-        let fp8 = self.fp8.as_ref().filter(|_| self.use_fp8.get());
         // SAFETY: every workspace buffer holds `rows` rows of its width and the
         // weights their checkpoint shapes; the stream orders the chain.
         unsafe {
             l.glm_dflash_rmsnorm(w.h.buffer.ptr, self.layers[0].input_norm.buffer.ptr, w.n.buffer.ptr, rows, h, eps, s)?;
             for (index, layer) in self.layers.iter().enumerate() {
-                let f8 = fp8.map(|f| &f.layers[index]);
-                self.linear(w.n.buffer.ptr, layer.attn_conv.buffer.ptr, f8.map(|f| (&f.attn_conv, 0)), w.dynamic.buffer.ptr,
+                self.linear(w.n.buffer.ptr, &layer.attn_conv, 0, w.dynamic.buffer.ptr,
                     rows, h, c.conv_width())?;
                 l.glm_dflash_conv(w.n.buffer.ptr, w.dynamic.buffer.ptr, layer.attn_base.buffer.ptr, w.conv.buffer.ptr,
                     rows, block, h, group, s)?;
-                self.linear(w.conv.buffer.ptr, layer.qkv.buffer.ptr, f8.map(|f| (&f.qkv, 0)), w.qkv.buffer.ptr, rows, h,
+                self.linear(w.conv.buffer.ptr, &layer.qkv, 0, w.qkv.buffer.ptr, rows, h,
                     c.qkv_width())?;
                 l.glm_dflash_qk_rope(w.qkv.buffer.ptr, layer.q_norm.buffer.ptr, layer.k_norm.buffer.ptr,
                     w.positions.buffer.ptr, std::ptr::null(), w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr, rows,
@@ -687,31 +837,31 @@ impl<'a> GlmDrafter<'a> {
                     layer.v_ring.buffer.ptr, w.tables.buffer.ptr, at(&w.tables, s_count * 4), at(&w.tables, 2 * s_count * 4),
                     w.attn.buffer.ptr, w.attention_workspace.buffer.ptr, s_count, block, c.heads, c.kv_heads, RING,
                     RING + block, if c.row_window { c.window } else { 0 }, 1.0 / (c.head_dim as f32).sqrt(), s)?;
-                self.linear(w.attn.buffer.ptr, layer.o.buffer.ptr, f8.map(|f| (&f.o, 0)), w.delta.buffer.ptr, rows,
+                self.linear(w.attn.buffer.ptr, &layer.o, 0, w.delta.buffer.ptr, rows,
                     attention_width, h)?;
                 l.glm_dflash_conv_residual_norm(w.delta.buffer.ptr, w.dynamic.buffer.ptr, layer.attn_base.buffer.ptr,
                     w.h.buffer.ptr, layer.post_norm.buffer.ptr, w.h.buffer.ptr, w.n.buffer.ptr, rows, block, h, group, eps, s)?;
-                self.linear(w.n.buffer.ptr, layer.mlp_conv.buffer.ptr, f8.map(|f| (&f.mlp_conv, 0)), w.dynamic.buffer.ptr,
+                self.linear(w.n.buffer.ptr, &layer.mlp_conv, 0, w.dynamic.buffer.ptr,
                     rows, h, c.conv_width())?;
                 l.glm_dflash_conv(w.n.buffer.ptr, w.dynamic.buffer.ptr, layer.mlp_base.buffer.ptr, w.conv.buffer.ptr,
                     rows, block, h, group, s)?;
-                self.linear(w.conv.buffer.ptr, layer.gate_up.buffer.ptr, f8.map(|f| (&f.gate_up, 0)), w.gate_up.buffer.ptr,
+                self.linear(w.conv.buffer.ptr, &layer.gate_up, 0, w.gate_up.buffer.ptr,
                     rows, h, 2 * inter)?;
                 l.glm_dflash_silu_mul(w.gate_up.buffer.ptr, w.act.buffer.ptr, rows, inter, s)?;
-                self.linear(w.act.buffer.ptr, layer.down.buffer.ptr, f8.map(|f| (&f.down, 0)), w.delta.buffer.ptr, rows,
+                self.linear(w.act.buffer.ptr, &layer.down, 0, w.delta.buffer.ptr, rows,
                     inter, h)?;
                 let next = self.layers.get(index + 1).map_or(self.norm.buffer.ptr, |n| n.input_norm.buffer.ptr);
                 l.glm_dflash_conv_residual_norm(w.delta.buffer.ptr, w.dynamic.buffer.ptr, layer.mlp_base.buffer.ptr,
                     w.h.buffer.ptr, next, w.h.buffer.ptr, w.n.buffer.ptr, rows, block, h, group, eps, s)?;
             }
-            match fp8 {
-                Some(f) if rows <= FP8_ROWS => f.head.apply(l, w.n.buffer.ptr, w.logits.buffer.ptr, true, rows, 0,
-                    c.vocab, &f.workspace, s)?,
-                _ => super::launch_head(l, &w.head, w.n.buffer.ptr, head, w.logits.buffer.ptr.cast(), rows, h, c.vocab, s)?,
+            match &head {
+                HeadCall::Bf16(weight) => super::launch_head(l, &w.head, w.n.buffer.ptr, *weight,
+                    w.logits.buffer.ptr.cast(), rows, h, c.vocab, s)?,
+                HeadCall::Launch(launch) => launch(w.n.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), rows, s)?,
             }
             l.glm_dflash_topk(w.logits.buffer.ptr, w.unary.buffer.ptr, w.candidates.buffer.ptr,
                 w.topk_workspace.buffer.ptr, s_count, block, c.drafts(), c.vocab, s)?;
-            self.linear(w.n.buffer.ptr, self.projection.buffer.ptr, fp8.map(|f| (&f.projection, 0)),
+            self.linear(w.n.buffer.ptr, &self.projection, 0,
                 w.projected.buffer.ptr, rows, h, c.rank)?;
             l.glm_dflash_select(self.predecessor.buffer.ptr, self.successor.buffer.ptr, w.projected.buffer.ptr,
                 w.candidates.buffer.ptr, w.unary.buffer.ptr, w.anchors.buffer.ptr, w.tokens.buffer.ptr,
@@ -752,8 +902,8 @@ impl<'a> GlmDrafter<'a> {
 /// Teacher-forced drafter replay on a golden sequence (after Hugh Madden's
 /// glm53f-afd draft_record / draft_replay): the drafter's context follows
 /// the golden taps one row at a time and it drafts after every token from
-/// `start` on, once through the BF16 weights and once through the FP8
-/// copies (when made). Prints, per mode, the drafts accepted as a prefix of
+/// `start` on through the actual immutable resident mode. Legacy dual-copy
+/// implementors retain their diagnostic modes. Prints the drafts accepted as a prefix of
 /// the text and of the target's greedy picks (`greedy[p]`: the argmax of
 /// the golden logits after token p; a draft past a miss of the text is not
 /// scored against them), the first draft's greedy agreement and the draft
@@ -764,8 +914,19 @@ pub(crate) trait ReplayDrafter {
     fn block(&self) -> usize;
     /// Sequences a draft step takes (and ring slots).
     fn sequences(&self) -> usize;
-    fn has_fp8(&self) -> bool;
-    fn set_fp8(&self, on: bool);
+    /// Legacy dual-format implementations may retain their diagnostic arms.
+    fn has_fp8(&self) -> bool { false }
+    fn set_fp8(&self, _on: bool) {}
+    /// New immutable implementations report one resident arithmetic mode,
+    /// without asking replay to switch precision or weight storage.
+    fn resident_modes(&self) -> Vec<ReplayMode> {
+        if self.has_fp8() {
+            vec![ReplayMode { name: "BF16", legacy_fp8: Some(false) },
+                ReplayMode { name: "FP8", legacy_fp8: Some(true) }]
+        } else {
+            vec![ReplayMode { name: "BF16", legacy_fp8: None }]
+        }
+    }
     /// Ring context of slot 0 from tap rows [n, taps * hidden] at positions `first..first + n`.
     fn context(&self, taps: &[u8], first: usize) -> Result<()>;
     /// Draft tokens after each (slot, anchor, position).
@@ -777,6 +938,16 @@ pub(crate) trait ReplayDrafter {
     fn last_hidden(&self, sequences: usize) -> Result<Vec<u8>>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReplayMode {
+    pub name: &'static str,
+    pub legacy_fp8: Option<bool>,
+}
+
+fn activate_replay_mode(drafter: &impl ReplayDrafter, mode: ReplayMode) {
+    if let Some(on) = mode.legacy_fp8 { drafter.set_fp8(on); }
+}
+
 impl ReplayDrafter for GlmDrafter<'_> {
     fn block(&self) -> usize {
         self.cfg.block
@@ -786,24 +957,25 @@ impl ReplayDrafter for GlmDrafter<'_> {
         self.max_sequences.min(self.slots)
     }
 
-    fn has_fp8(&self) -> bool {
-        self.fp8.is_some()
-    }
-
-    fn set_fp8(&self, on: bool) {
-        GlmDrafter::set_fp8(self, on);
+    fn resident_modes(&self) -> Vec<ReplayMode> {
+        vec![ReplayMode { name: self.representation.name(), legacy_fp8: None }]
     }
 
     fn context(&self, taps: &[u8], first: usize) -> Result<()> {
         let n = taps.len() / (self.cfg.taps.len() * self.cfg.hidden * 2);
         self.put_taps(taps)?;
-        self.update(&(0..n).map(|r| ContextRow { tap_row: r, slot: 0, position: first + r }).collect::<Vec<_>>())
+        self.update(&(0..n).map(|r| ContextRow { tap_row: r, slot: 0, position: first + r }).collect::<Vec<_>>())?;
+        // SAFETY: diagnostic replay owns this stream. Complete the reads of
+        // taps and metadata before the next context call overwrites them.
+        unsafe { self.library.cuda_stream_synchronize(self.stream) }
     }
 
     fn draft_tokens(&self, seqs: &[(usize, u32, usize)], anchor_rows: &[u8], head: *const c_void)
         -> Result<Vec<Vec<u32>>> {
         let seqs: Vec<DraftSeq> = seqs.iter().map(|&(slot, anchor, position)| DraftSeq { slot, anchor, position, valid_from: 0 }).collect();
-        Ok(self.draft(&seqs, anchor_rows, head)?.into_iter().map(|d| d.tokens).collect())
+        // Replay's caller keeps the target BF16 head owner live throughout.
+        Ok(self.draft_from(&seqs, DraftInput::Rows(anchor_rows), HeadCall::Bf16(head))?.into_iter()
+            .map(|d| d.tokens).collect())
     }
 
     fn tap_rows(&self) -> usize {
@@ -822,12 +994,12 @@ pub(crate) fn replay(drafter: &impl ReplayDrafter, tokens: &[u32], greedy: &[u32
     let (block, drafts) = (drafter.block(), drafter.block() - 1);
     ensure!(tokens.len() > start + block && greedy.len() >= tokens.len(), "replay needs more than {} tokens", start + block);
     let anchors: Vec<usize> = (start..tokens.len() - block).collect();
-    let modes: Vec<bool> = if drafter.has_fp8() { vec![false, true] } else { vec![false] };
+    let modes = drafter.resident_modes();
     let mut outputs: Vec<Vec<Vec<u32>>> = Vec::new();
     // Final-norm rows of the first 64 anchors per mode.
     let mut hidden: Vec<Vec<Vec<f32>>> = Vec::new();
-    for &fp8 in &modes {
-        drafter.set_fp8(fp8);
+    for &mode in &modes {
+        activate_replay_mode(drafter, mode);
         let (mut done, mut seconds) = (0usize, Vec::with_capacity(anchors.len()));
         let mut out = Vec::with_capacity(anchors.len());
         let mut rows_seen = Vec::new();
@@ -858,7 +1030,7 @@ pub(crate) fn replay(drafter: &impl ReplayDrafter, tokens: &[u32], greedy: &[u32
         seconds.sort_by(f64::total_cmp);
         let n = anchors.len() as f64;
         println!("draft replay {}: {} anchors, accepted vs text {:.3}, vs greedy {:.3} of {drafts}, first draft = \
-            greedy {:.1}%, draft median {:.3} ms (p10 {:.3}, p90 {:.3})", if fp8 { "FP8 " } else { "BF16" },
+            greedy {:.1}%, draft median {:.3} ms (p10 {:.3}, p90 {:.3})", mode.name,
             anchors.len(), text as f64 / n, greedy_ok as f64 / n, 100.0 * first as f64 / n,
             1e3 * seconds[seconds.len() / 2], 1e3 * seconds[seconds.len() / 10], 1e3 * seconds[seconds.len() * 9 / 10]);
         outputs.push(out);
@@ -880,7 +1052,7 @@ pub(crate) fn replay(drafter: &impl ReplayDrafter, tokens: &[u32], greedy: &[u32
             times.sort_by(f64::total_cmp);
             line += &format!(" {count}: {:.2}", 1e3 * times[times.len() / 2]);
         }
-        println!("draft replay {} step ms by sequences (median of 7):{line}", if fp8 { "FP8 " } else { "BF16" });
+        println!("draft replay {} step ms by sequences (median of 7):{line}", mode.name);
     }
     if let [bf16, fp8] = &outputs[..] {
         let same = bf16.iter().zip(fp8).filter(|(a, b)| a == b).count();
@@ -895,7 +1067,7 @@ pub(crate) fn replay(drafter: &impl ReplayDrafter, tokens: &[u32], greedy: &[u32
             worst final-norm cosine over the first {} anchors {worst:.6}", bf16.len(), 100.0 * same as f64 / bf16.len() as f64,
             prefix as f64 / bf16.len() as f64, hidden[0].len());
     }
-    drafter.set_fp8(true);
+    if modes.iter().any(|mode| mode.legacy_fp8.is_some()) { drafter.set_fp8(true); }
     Ok(())
 }
 
@@ -920,4 +1092,232 @@ pub(crate) fn golden_sequence(dir: &Path, vocab: usize) -> Result<(Vec<u32>, Vec
         greedy.push(best);
     }
     Ok((tokens, greedy))
+}
+
+#[cfg(test)]
+mod checkpoint_header_tests {
+    use super::*;
+
+    struct HeaderSnapshot(std::path::PathBuf);
+    impl Drop for HeaderSnapshot {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    fn expert_only_snapshot() -> HeaderSnapshot {
+        use std::io::Write;
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let root = std::env::var_os("CARGO_TARGET_DIR").map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("target"));
+        let path = root.join("header-test-fixtures").join(format!("dflash-{}-{}", std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        std::fs::create_dir_all(&path).unwrap();
+        let fixture = HeaderSnapshot(path);
+        let config = serde_json::json!({
+            "model_type": "glm_moe_dsa", "quantization_config": {"quant_method": "fp8"},
+            "vocab_size": 16, "hidden_size": 128, "num_hidden_layers": 1,
+            "num_attention_heads": 1, "q_lora_rank": 128, "kv_lora_rank": 128,
+            "qk_nope_head_dim": 128, "qk_rope_head_dim": 64, "v_head_dim": 128,
+            "index_n_heads": 1, "index_head_dim": 128, "index_topk": 1,
+            "first_k_dense_replace": 0, "intermediate_size": 128, "n_routed_experts": 1,
+            "num_experts_per_tok": 1, "moe_intermediate_size": 128, "n_shared_experts": 1,
+            "routed_scaling_factor": 1.0, "scoring_func": "sigmoid", "topk_method": "noaux_tc",
+            "rms_norm_eps": 1e-5, "rope_theta": 10000.0,
+        });
+        std::fs::write(fixture.0.join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+        let mut headers = serde_json::Map::new();
+        let mut index = serde_json::Map::new();
+        let mut offset = 0usize;
+        for (name, dtype, shape, bytes) in [
+            ("lm_head.weight".to_owned(), "BF16", vec![16, 128], 4096),
+            ("model.layers.0.mlp.experts.0.gate_proj.weight".into(), "F8_E4M3", vec![128, 128], 16384),
+            ("model.layers.0.mlp.experts.0.up_proj.weight".into(), "F8_E4M3", vec![128, 128], 16384),
+            ("model.layers.0.mlp.experts.0.down_proj.weight".into(), "F8_E4M3", vec![128, 128], 16384),
+            ("model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv".into(), "F32", vec![1, 1], 4),
+            ("model.layers.0.mlp.experts.0.up_proj.weight_scale_inv".into(), "F32", vec![1, 1], 4),
+            ("model.layers.0.mlp.experts.0.down_proj.weight_scale_inv".into(), "F32", vec![1, 1], 4),
+        ] {
+            headers.insert(name.clone(), serde_json::json!({"dtype": dtype, "shape": shape,
+                "data_offsets": [offset, offset + bytes]}));
+            index.insert(name, serde_json::Value::String("weights.safetensors".into()));
+            offset += bytes;
+        }
+        let header = serde_json::to_vec(&headers).unwrap();
+        let mut file = std::fs::File::create(fixture.0.join("weights.safetensors")).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(&header).unwrap();
+        file.set_len((8 + header.len() + offset) as u64).unwrap();
+        std::fs::write(fixture.0.join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({"weight_map": index})).unwrap()).unwrap();
+        fixture
+    }
+
+    #[test]
+    fn target_head_guard_reads_checkpoint_when_actual_expert_catalog_has_no_head() {
+        let fixture = expert_only_snapshot();
+        let catalog = cuteafd_loader::read_expert_catalog(&fixture.0).unwrap();
+        assert!(catalog.fp8().is_some());
+        assert!(catalog.tensors().is_empty());
+        assert!(catalog.tensor("lm_head.weight").is_err());
+        check_snapshot_target_bf16_head(&fixture.0, 128, 16, false).unwrap();
+        assert!(check_snapshot_target_bf16_head(&fixture.0, 128, 16, true).is_err());
+        assert!(check_snapshot_target_bf16_head(&fixture.0, 128, 32, false).is_err());
+        let index_path = fixture.0.join("model.safetensors.index.json");
+        let mut index = cuteafd_loader::plan::checkpoint::read_json(&index_path).unwrap();
+        index["weight_map"]["lm_head.weight"] = "missing.safetensors".into();
+        std::fs::write(index_path, serde_json::to_vec(&index).unwrap()).unwrap();
+        assert!(check_snapshot_target_bf16_head(&fixture.0, 128, 16, false).is_err());
+    }
+
+    fn fixture(dtype: DType) -> Checkpoint {
+        Checkpoint { data: vec![0x80, 0x3f, 0, 0x40, 0x40, 0x40, 0x80, 0x40],
+            tensors: HashMap::from([("fc.weight".into(), SafetensorsTensorMetadata {
+                name: "fc.weight".into(), dtype, shape: vec![2, 2], byte_offset: 0, byte_length: 8,
+            })]) }
+    }
+
+    #[test]
+    fn bf16_payload_is_read_without_conversion() {
+        let checkpoint = fixture(DType::Bf16);
+        assert_eq!(checkpoint.bytes("fc.weight", &[2, 2]).unwrap(), checkpoint.data);
+    }
+
+    #[test]
+    fn equal_width_other_dtypes_cannot_be_reinterpreted_as_bf16() {
+        for dtype in [DType::F16, DType::I16] {
+            let checkpoint = fixture(dtype.clone());
+            let error = checkpoint.bytes("fc.weight", &[2, 2]).unwrap_err().to_string();
+            assert!(error.contains("fc.weight") && error.contains("must be BF16"));
+            assert!(error.contains(&format!("{dtype:?}")));
+        }
+    }
+
+    #[test]
+    fn bf16_dtype_does_not_bypass_shape_or_storage_guards() {
+        let mut checkpoint = fixture(DType::Bf16);
+        assert!(checkpoint.bytes("fc.weight", &[4, 1]).is_err());
+        checkpoint.tensors.get_mut("fc.weight").unwrap().byte_length = 6;
+        assert!(checkpoint.bytes("fc.weight", &[2, 2]).is_err());
+    }
+
+    fn small_config() -> DflashConfig {
+        DflashConfig { hidden: 128, intermediate: 128, layers: 2, heads: 1, kv_heads: 1, head_dim: 128,
+            eps: 1e-6, theta: 10000., block: 8, group: 16, mask_token: 0, rank: 256,
+            taps: vec![0], vocab: 16, window: RING, row_window: false }
+    }
+
+    fn complete_headers(cfg: &DflashConfig) -> (HashMap<String, SafetensorsTensorMetadata>, u64) {
+        let mut end = 0u64;
+        let tensors = cfg.tensor_shapes().into_iter().map(|(name, shape)| {
+            let bytes = shape.iter().product::<usize>() as u64 * 2;
+            let tensor = SafetensorsTensorMetadata { name: name.clone(), dtype: DType::Bf16,
+                shape, byte_offset: end, byte_length: bytes };
+            end += bytes;
+            (name, tensor)
+        }).collect();
+        (tensors, end)
+    }
+
+    #[test]
+    fn all_checkpoint_headers_are_validated_without_device_allocation() {
+        let cfg = small_config();
+        let (mut tensors, file_bytes) = complete_headers(&cfg);
+        check_checkpoint_headers(&cfg, &tensors, file_bytes).unwrap();
+        let name = "layers.1.self_attn.o_proj.weight";
+        tensors.get_mut(name).unwrap().dtype = DType::F8E4M3;
+        let error = check_checkpoint_headers(&cfg, &tensors, file_bytes).unwrap_err().to_string();
+        assert!(error.contains(name) && error.contains("source-native FP8"));
+    }
+
+    #[test]
+    fn later_checkpoint_shape_missing_and_truncated_inputs_are_named() {
+        let cfg = small_config();
+        let (mut tensors, file_bytes) = complete_headers(&cfg);
+        let name = "layers.1.mlp.down_proj.weight";
+        tensors.get_mut(name).unwrap().shape = vec![64, 256];
+        let error = check_checkpoint_headers(&cfg, &tensors, file_bytes).unwrap_err().to_string();
+        assert!(error.contains(name) && error.contains("shape"));
+        let (mut tensors, file_bytes) = complete_headers(&cfg);
+        tensors.remove(name);
+        assert!(check_checkpoint_headers(&cfg, &tensors, file_bytes).unwrap_err().to_string().contains(name));
+        let (tensors, file_bytes) = complete_headers(&cfg);
+        assert!(check_checkpoint_headers(&cfg, &tensors, file_bytes - 1).unwrap_err().to_string().contains("past"));
+    }
+
+    #[test]
+    fn shared_target_head_preserves_source_bf16_and_rejects_dual_or_compact_input() {
+        let mut head = SafetensorsTensorMetadata { name: "lm_head.weight".into(), dtype: DType::Bf16,
+            shape: vec![16, 128], byte_offset: 0, byte_length: 4096 };
+        check_target_bf16_head(&head, 128, 16, false).unwrap();
+        let error = check_target_bf16_head(&head, 128, 16, true).unwrap_err().to_string();
+        assert!(error.contains("lm_head.weight") && error.contains("--fp8-head") && error.contains("unsupported"));
+        head.dtype = DType::F8E4M3;
+        head.byte_length = 2048;
+        let error = check_target_bf16_head(&head, 128, 16, false).unwrap_err().to_string();
+        assert!(error.contains("source-native compact") && error.contains("lm_head.weight"));
+        head.dtype = DType::Bf16;
+        head.byte_length = 4096;
+        head.shape = vec![128, 16];
+        assert!(check_target_bf16_head(&head, 128, 16, false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod replay_mode_tests {
+    use super::*;
+
+    struct Probe {
+        immutable: Option<GlmDraftRepresentation>,
+        setters: RefCell<Vec<bool>>,
+    }
+
+    impl ReplayDrafter for Probe {
+        fn block(&self) -> usize { 8 }
+        fn sequences(&self) -> usize { 16 }
+        fn has_fp8(&self) -> bool { self.immutable.is_none() }
+        fn set_fp8(&self, on: bool) { self.setters.borrow_mut().push(on); }
+        fn resident_modes(&self) -> Vec<ReplayMode> {
+            match self.immutable {
+                Some(mode) => vec![ReplayMode { name: mode.name(), legacy_fp8: None }],
+                None => vec![ReplayMode { name: "BF16", legacy_fp8: Some(false) },
+                    ReplayMode { name: "FP8", legacy_fp8: Some(true) }],
+            }
+        }
+        fn context(&self, _: &[u8], _: usize) -> Result<()> { unreachable!() }
+        fn draft_tokens(&self, _: &[(usize, u32, usize)], _: &[u8], _: *const c_void)
+            -> Result<Vec<Vec<u32>>> { unreachable!() }
+        fn tap_rows(&self) -> usize { TAP_ROWS }
+        fn last_hidden(&self, _: usize) -> Result<Vec<u8>> { unreachable!() }
+    }
+
+    struct LegacyProbe(RefCell<Vec<bool>>);
+    impl ReplayDrafter for LegacyProbe {
+        fn block(&self) -> usize { 8 }
+        fn sequences(&self) -> usize { 16 }
+        fn has_fp8(&self) -> bool { true }
+        fn set_fp8(&self, on: bool) { self.0.borrow_mut().push(on); }
+        // resident_modes deliberately uses the unchanged default trait seam.
+        fn context(&self, _: &[u8], _: usize) -> Result<()> { unreachable!() }
+        fn draft_tokens(&self, _: &[(usize, u32, usize)], _: &[u8], _: *const c_void)
+            -> Result<Vec<Vec<u32>>> { unreachable!() }
+        fn tap_rows(&self) -> usize { TAP_ROWS }
+        fn last_hidden(&self, _: usize) -> Result<Vec<u8>> { unreachable!() }
+    }
+
+    #[test]
+    fn immutable_fp8_replay_reports_actual_mode_and_never_calls_a_setter() {
+        let p = Probe { immutable: Some(GlmDraftRepresentation::Fp8Only), setters: RefCell::new(Vec::new()) };
+        let modes = p.resident_modes();
+        assert_eq!(modes, [ReplayMode { name: "FP8", legacy_fp8: None }]);
+        for mode in modes { activate_replay_mode(&p, mode); }
+        assert!(p.setters.borrow().is_empty());
+    }
+
+    #[test]
+    fn legacy_replay_modes_keep_existing_arithmetic_selection() {
+        let p = LegacyProbe(RefCell::new(Vec::new()));
+        let modes = p.resident_modes();
+        assert_eq!(modes.iter().map(|m| m.name).collect::<Vec<_>>(), ["BF16", "FP8"]);
+        for mode in modes { activate_replay_mode(&p, mode); }
+        assert_eq!(*p.0.borrow(), [false, true]);
+    }
 }

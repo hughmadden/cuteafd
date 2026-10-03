@@ -78,6 +78,19 @@ pub fn spec_from(cfg: &MimoV2Config, checkpoint: &Checkpoint) -> ModelSpec {
         notes.push(format!("coordinator programs: family {family} (CUTEAFD_ENABLE_MIMO_AOT, \
             CUTEAFD_MIMO_GEOMETRIES={family})"));
     }
+    if crate::families::mimo_v2::weight_policy::default_policy(checkpoint, cfg)
+        == crate::families::mimo_v2::weight_policy::MimoDefaultPolicy::Fp8 {
+        notes.push("measured MiMo default: single-copy FP8 target head/O and DFlash drafter; native QKV/FFN unchanged. --weight-policy checkpoint keeps source formats; explicit per-weight flags override.".into());
+        if let Ok(memory) = crate::families::mimo_v2::weight_policy::qualified_projection_memory(cfg) {
+            notes.push(format!("default target head/O across coordinator ranks: checkpoint source {} B ({:.3} GiB), selected FP8 resident {} B ({:.3} GiB), maximum drained packing source {} B ({:.3} GiB); these costs use the runtime projection descriptor and exclude other weights, optional DFlash and runtime state",
+                memory.source_bytes, memory.source_bytes as f64 / GIB,
+                memory.resident_bytes, memory.resident_bytes as f64 / GIB,
+                memory.max_load_staging, memory.max_load_staging as f64 / GIB));
+        }
+    } else {
+        notes.push("default resident formats follow checkpoint tensors; explicit single-copy head/O/drafter conversions remain configurable".into());
+    }
+    notes.push("component bytes, owner totals and weight-only placement budgets below describe checkpoint source storage; they are not complete resident-memory admission. Runtime admission counts selected representations, loading phases, optional DFlash, caches and workspaces separately".into());
     ModelSpec {
         family: "mimo_v2",
         architecture: checkpoint.architectures().first().cloned().unwrap_or_default(),
@@ -182,13 +195,15 @@ impl Family for MiMo {
                 Some(Hint {
                     what: format!("sigmoid top-{k} routed experts, no shared expert, MXFP4 (packed E2M1 U8 [N, K/2], \
                         even element low nibble, UE8M0 U8 [N, K/32]): H {h}, I {i}, {e} experts"),
-                    how: format!("Exact family `mimop:fp8` (b12x fp8_moe weights=mxfp4: E2M1 x 2^(s-127) widened \
-                        to BF16, BF16 MMA; packages fp8-mimop tp1 coordinator, tp6/tp2 Spark, \
+                    how: format!("Exact family `mimop:fp8` (b12x fp8_moe weights=mxfp4: E2M1 x 2^(s-127); \
+                        packages fp8-mimop tp1 coordinator, tp6/tp2 Spark, \
                         python/tools/aot/package_fp8_moe_aot.py --geometry mimop [--cross-sm121]). Spark layout TP6 \
                         over six ranks: whole 32-blocks per rank ({widest}/{} rows) zero-padded to {padded}, \
                         {:.1} GiB per rank (TP2xEP3: {:.1} GiB, but a decode step reads all of a row's experts \
-                        that land on one EP group). Missing: an MXFP4 streaming/TMA GEMM route for large \
-                        prefill steps (the grouped GEMV serves every row count).",
+                        that land on one EP group). The SM121 Spark package streams MXFP8 x MXFP4 gate/up \
+                        above 640 live rows, and its down projection quantizes the BF16 SwiGLU rows per K32 to \
+                        MXFP8 for block-scaled MXFP8 x MXFP4 MMAs (FP8_EXPERT_PREFILL=w8a16 keeps BF16 down); \
+                        smaller row counts use the grouped route.",
                         widest - 32, per_rank(padded), per_rank(i / 2) / 3.0),
                 })
             }
@@ -339,6 +354,20 @@ impl MimoModel {
 impl FamilyModel for MimoModel {
     fn spec(&self) -> &ModelSpec {
         &self.spec
+    }
+
+    fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
+        -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
+        use crate::serving_capacity::{mimo_cache_geometry, CacheGeometryError};
+        let available = match &self.spec.speculator {
+            Some(SpeculatorSpec::NativeMtp { layers }) => *layers,
+            _ => 0,
+        };
+        if options.native_mtp_layers > available {
+            return Err(CacheGeometryError::Unsupported { family: "mimo_v2", what: "requested native MTP stages exceed checkpoint tensors" });
+        }
+        mimo_cache_geometry(&self.cfg, self.cfg.layers, options.coordinator_ranks, options.mimo_kv,
+            options.native_mtp_layers).map(Some)
     }
 
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {

@@ -27,14 +27,25 @@ pub use shared::v41_experts::{
     v41_pack_intermediate_supported, v41_rank_count_supported,
 };
 mod cuda_runtime;
+pub mod memory_ledger;
 pub use cuda_runtime::{select_copy_mechanism, CopyMechanism, CudaRuntime};
+#[cfg(feature = "test-support")]
+pub mod test_support;
+#[cfg(all(target_os = "linux", any(test, feature = "test-support")))]
+#[doc(hidden)]
+pub mod native_library_lifetime_fixture;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "native_library_lifetime_tests.rs"]
+mod native_library_lifetime;
 
 use anyhow::{Context, Result};
 use libloading::{Library, Symbol};
 use std::ffi::{CStr, CString};
+use std::mem::ManuallyDrop;
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// CUDA graph captures begun through this crate since the process started
 /// (serving should reach zero new captures once warm; see AGENTS.md).
@@ -1184,7 +1195,8 @@ type XGrammarMatcherIsCompletedFn = unsafe extern "C" fn(
 ) -> CuteafdStatus;
 
 pub struct NativeLibrary {
-    lib: Library,
+    lib: ManuallyDrop<Library>,
+    quarantine_after_failed_drain: AtomicBool,
     sync_h2d_staging: Mutex<SyncH2DStagingBuffer>,
     rdma_rc_endpoint_try_poll_fn: RdmaRcEndpointTryPollFn,
 }
@@ -1483,7 +1495,17 @@ impl Drop for CuteafdNcclComm {
     }
 }
 
+/// RC endpoint send/recv spans are allocated natively (pinned or malloc'd and
+/// registered); the ledger keys them by endpoint handle.
+fn record_rdma_rings(handle: *mut c_void, bytes: usize) {
+    let _scope = memory_ledger::scope("transport/rdma-rings");
+    memory_ledger::record_alloc(memory_ledger::Space::Pinned, -1, handle as usize, bytes);
+}
+
 struct SyncH2DStagingBuffer {
+    // Released explicitly by NativeLibrary while its module is loaded. Do not
+    // add an automatic release here: failed-drain quarantine retains this raw
+    // pinned allocation even after the Rust wrapper is dropped.
     buffer: CuteafdHostBuffer,
 }
 
@@ -1506,6 +1528,7 @@ impl SyncH2DStagingBuffer {
                     .context("freeing undersized synchronous H2D pinned staging buffer")?;
                 self.buffer = CuteafdHostBuffer::default();
             }
+            let _scope = memory_ledger::scope("staging/sync-h2d");
             self.buffer = library
                 .alloc_host_buffer(bytes)
                 .context("allocating reusable synchronous H2D pinned staging buffer")?;
@@ -1532,6 +1555,7 @@ impl SyncH2DStagingBuffer {
             return;
         }
         if let Ok(free_fn) = unsafe { lib.get::<FreeHostBufferFn>(b"cuteafd_free_host_buffer") } {
+            memory_ledger::record_free(self.buffer.ptr as usize);
             let _ = unsafe { free_fn(&mut self.buffer) };
         }
         self.buffer = CuteafdHostBuffer::default();
@@ -1540,9 +1564,19 @@ impl SyncH2DStagingBuffer {
 
 impl Drop for NativeLibrary {
     fn drop(&mut self) {
+        if self.quarantine_after_failed_drain.load(Ordering::Relaxed) {
+            // A queued kernel may still execute code from this module. The
+            // staging wrapper has no Drop: retaining its raw allocation also
+            // avoids releasing pinned memory while completion is unknown.
+            return;
+        }
         if let Ok(staging) = self.sync_h2d_staging.get_mut() {
             staging.release_with_library(&self.lib);
         }
+        // SAFETY: this is the sole normal-path owner of the module. Staging
+        // was released while its free function was still loaded; quarantine
+        // deliberately bypasses both releases.
+        unsafe { ManuallyDrop::drop(&mut self.lib) };
     }
 }
 
@@ -1575,10 +1609,33 @@ impl NativeLibrary {
             unsafe { *lib.get::<RdmaRcEndpointTryPollFn>(b"cuteafd_rdma_rc_endpoint_try_poll")? };
         sync_expert_hidden(&lib)?;
         Ok(Self {
-            lib,
+            lib: ManuallyDrop::new(lib),
+            quarantine_after_failed_drain: AtomicBool::new(false),
             sync_h2d_staging: Mutex::new(SyncH2DStagingBuffer::default()),
             rdma_rc_endpoint_try_poll_fn,
         })
+    }
+
+    /// Irreversibly retain this module and its reusable pinned H2D staging
+    /// until process teardown after a stream drain failed to prove completion.
+    /// Idempotent; normal loads and launches do not take an extra owner.
+    ///
+    /// This protects module code and library-owned staging. The daemon's shared
+    /// device/pinned allocation owners also honor the irreversible marker. The
+    /// caller must separately retain other source, destination, scratch owners,
+    /// and other native owner that queued work may still use, and abandon the
+    /// failed operation. It does not repair arbitrary pre-engine load errors
+    /// or make subsequent work safe. Other NativeLibrary instances are not
+    /// quarantined.
+    pub fn quarantine_module_after_failed_drain(&self) {
+        self.quarantine_after_failed_drain.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether native completion was irreversibly left unproved. Allocation
+    /// owners must retain their storage on this path: even an unrelated
+    /// cudaFree can synchronize with another stream's pending peer work.
+    pub fn is_quarantined_after_failed_drain(&self) -> bool {
+        self.quarantine_after_failed_drain.load(Ordering::Relaxed)
     }
 
     pub fn version(&self) -> Result<String> {
@@ -1600,6 +1657,7 @@ impl NativeLibrary {
         let mut buffer = CuteafdHostBuffer::default();
         let status = unsafe { alloc_fn(bytes, &mut buffer) };
         self.status_to_result("cuteafd_alloc_host_buffer", status)?;
+        memory_ledger::record_alloc(memory_ledger::Space::Pinned, -1, buffer.ptr as usize, buffer.bytes);
         Ok(buffer)
     }
 
@@ -1620,6 +1678,7 @@ impl NativeLibrary {
 
     pub fn free_host_buffer(&self, buffer: &mut CuteafdHostBuffer) -> Result<()> {
         let free_fn: Symbol<FreeHostBufferFn> = unsafe { self.lib.get(b"cuteafd_free_host_buffer")? };
+        memory_ledger::record_free(buffer.ptr as usize);
         let status = unsafe { free_fn(buffer) };
         self.status_to_result("cuteafd_free_host_buffer", status)
     }
@@ -1699,6 +1758,7 @@ impl NativeLibrary {
         let mut buffer = CuteafdDeviceBuffer::default();
         let status = unsafe { alloc_fn(bytes, &mut buffer) };
         self.status_to_result("cuteafd_alloc_device_buffer", status)?;
+        memory_ledger::record_alloc(memory_ledger::Space::Device, buffer.device_id, buffer.ptr as usize, buffer.bytes);
         Ok(buffer)
     }
 
@@ -1708,12 +1768,14 @@ impl NativeLibrary {
         let mut buffer = CuteafdDeviceBuffer::default();
         let status = unsafe { alloc_fn(bytes, &mut buffer) };
         self.status_to_result("cuteafd_alloc_managed_device_buffer", status)?;
+        memory_ledger::record_alloc(memory_ledger::Space::Managed, buffer.device_id, buffer.ptr as usize, buffer.bytes);
         Ok(buffer)
     }
 
     pub fn free_device_buffer(&self, buffer: &mut CuteafdDeviceBuffer) -> Result<()> {
         let free_fn: Symbol<FreeDeviceBufferFn> =
             unsafe { self.lib.get(b"cuteafd_free_device_buffer")? };
+        memory_ledger::record_free(buffer.ptr as usize);
         let status = unsafe { free_fn(buffer) };
         self.status_to_result("cuteafd_free_device_buffer", status)
     }
@@ -2087,6 +2149,25 @@ impl NativeLibrary {
         let copy_fn: Symbol<CopyD2HFn> = unsafe { self.lib.get(b"cuteafd_copy_d2h")? };
         let status = unsafe { copy_fn(dst.as_mut_ptr().cast(), src, dst.len()) };
         self.status_to_result("cuteafd_copy_d2h", status)
+    }
+
+    /// Frees the pinned staging buffer [`Self::copy_h2d`] grows to its largest
+    /// upload. Loaders call this once their weights are resident: the buffer
+    /// otherwise stays pinned for the life of the process (on GB10 it is the
+    /// same unified memory the experts live in). Later copies reallocate it.
+    pub fn release_sync_h2d_staging(&self) -> Result<usize> {
+        let mut staging = self
+            .sync_h2d_staging
+            .lock()
+            .map_err(|_| anyhow::anyhow!("synchronous H2D pinned staging lock is poisoned"))?;
+        if staging.buffer.ptr.is_null() {
+            return Ok(0);
+        }
+        let bytes = staging.buffer.bytes;
+        self.free_host_buffer(&mut staging.buffer)
+            .context("freeing synchronous H2D pinned staging buffer")?;
+        staging.buffer = CuteafdHostBuffer::default();
+        Ok(bytes)
     }
 
     #[cfg(test)]
@@ -3422,6 +3503,7 @@ impl NativeLibrary {
             )
         };
         self.status_to_result("cuteafd_rdma_rc_endpoint_create", status)?;
+        record_rdma_rings(info.handle, send_registered_span_bytes + recv_registered_span_bytes);
         Ok(info)
     }
 
@@ -3459,6 +3541,7 @@ impl NativeLibrary {
             )
         };
         self.status_to_result("cuteafd_rdma_rc_endpoint_create_with_buffer_flags", status)?;
+        record_rdma_rings(info.handle, send_registered_span_bytes + recv_registered_span_bytes);
         Ok(info)
     }
 
@@ -3503,6 +3586,7 @@ impl NativeLibrary {
             "cuteafd_rdma_rc_endpoint_create_on_device_with_buffer_flags",
             status,
         )?;
+        record_rdma_rings(info.handle, send_registered_span_bytes + recv_registered_span_bytes);
         Ok(info)
     }
 
@@ -3845,8 +3929,25 @@ impl NativeLibrary {
     pub fn rdma_rc_endpoint_destroy(&self, handle: *mut c_void) -> Result<()> {
         let destroy_fn: Symbol<RdmaRcEndpointDestroyFn> =
             unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_destroy")? };
+        memory_ledger::record_free(handle as usize);
         let status = unsafe { destroy_fn(handle) };
         self.status_to_result("cuteafd_rdma_rc_endpoint_destroy", status)
+    }
+
+    /// Metadata-only symbol check; terminal ownership is unavailable on older
+    /// libraries and must be rejected before external landing allocation.
+    pub fn rdma_rc_endpoint_quiesce_available(&self) -> Result<()> {
+        // SAFETY: resolving a function does not invoke it or create CUDA state.
+        let _: Symbol<RdmaRcEndpointDestroyFn> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_quiesce")? };
+        Ok(())
+    }
+
+    pub fn rdma_rc_endpoint_quiesce(&self, handle: *mut c_void) -> Result<()> {
+        // SAFETY: the transport owns the live endpoint; this optional ABI only
+        // destroys its QP and retains every registration and storage owner.
+        let quiesce: Symbol<RdmaRcEndpointDestroyFn> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_quiesce")? };
+        let status = unsafe { quiesce(handle) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_quiesce", status)
     }
 
     pub fn last_error(&self) -> Result<String> {

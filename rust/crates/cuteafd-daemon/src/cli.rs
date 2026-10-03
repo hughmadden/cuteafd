@@ -175,6 +175,22 @@ pub(crate) struct PlanArgs {
     /// Exit non-zero unless every part is servable.
     #[arg(long, default_value_t = false)]
     pub(crate) require_ready: bool,
+    /// Lay out each device's memory: weights by group and format, KV pool,
+    /// workspaces, runtime and Spark buffers.
+    #[arg(long)]
+    pub(crate) layout: bool,
+    /// Coordinator GPUs for --layout (1 or 2; two split attention heads).
+    #[arg(long, default_value_t = 1)]
+    pub(crate) rtx: usize,
+    /// Usable GiB per coordinator GPU for --layout.
+    #[arg(long, default_value_t = 95.5)]
+    pub(crate) rtx_gib: f64,
+    /// Explicit KV pool tokens for --layout (default: sized from what is left).
+    #[arg(long)]
+    pub(crate) pool_tokens: Option<u64>,
+    /// External drafter GiB on the last GPU for --layout (DFlash).
+    #[arg(long, default_value_t = 0.0)]
+    pub(crate) drafter_gib: f64,
 }
 
 #[derive(Debug, Args)]
@@ -317,6 +333,22 @@ pub(crate) struct TransportCapabilitiesArgs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dsv4_quantizer_defaults_to_device_geometry_and_keeps_tuning_optional() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-dsv4", "--snapshot", "/model", "--native-lib", "/native.so"];
+        let super::Commands::ServeDsv4(defaults) = super::Cli::try_parse_from(base).unwrap().command else {
+            panic!("expected DeepSeek V4 serving");
+        };
+        assert_eq!(defaults.engine.sms, None);
+        let super::Commands::ServeDsv4(limited) = super::Cli::try_parse_from(
+            base.into_iter().chain(["--sms", "73"])).unwrap().command else {
+            panic!("expected DeepSeek V4 serving");
+        };
+        assert_eq!(limited.engine.sms, Some(73));
+        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--sms", "-1"])).is_err());
+    }
+
     #[test]
     fn native_host_cache_accepts_auto_and_legacy_byte_counts() {
         use clap::Parser;

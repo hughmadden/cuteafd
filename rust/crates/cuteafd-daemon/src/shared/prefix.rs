@@ -2,8 +2,12 @@
 //! (`cuteafd_engine::prefix` does the work; each family implements `PrefixFamily`).
 use crate::families::deepseek_v41::v41_native_serve::prefix::CudaCopyEngine;
 use anyhow::Result;
-use cuteafd_engine::prefix::PointPolicy;
+use cuteafd_engine::prefix::{FamilyLayout, PointPolicy};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
+
+#[path = "prefix/budget.rs"]
+mod budget;
+pub(crate) use budget::HostBudget;
 
 /// The prefix cache's knobs.
 #[derive(Debug, Clone, clap::Args)]
@@ -19,9 +23,13 @@ pub(crate) struct PrefixArgs {
     /// Shortest prompt or turn worth a snapshot.
     #[arg(long, default_value_t = 64)]
     pub prefix_cache_min_tokens: usize,
-    /// Pinned host memory for snapshots the device evicts (e.g. 64GiB; 0 = off).
-    #[arg(long, env = "CUTEAFD_HOST_CACHE_BYTES", default_value = "0", value_parser = parse_bytes)]
-    pub host_cache_bytes: u64,
+    /// Pinned retained-prefix memory: auto sizes both banks within available host RAM,
+    /// a byte count fixes the quota (e.g. 64GiB), and 0 disables the host tier.
+    #[arg(long, env = "CUTEAFD_HOST_CACHE_BYTES", default_value = "0")]
+    pub host_cache_bytes: HostBudget,
+    /// RAM kept outside an automatic pinned prefix pool, at least 10% of total RAM.
+    #[arg(long, default_value = "8GiB", value_parser = parse_bytes)]
+    pub host_cache_headroom_bytes: u64,
     /// Shortest snapshot the host tier keeps.
     #[arg(long, default_value_t = 512)]
     pub host_cache_min_tokens: u32,
@@ -55,20 +63,48 @@ impl PrefixArgs {
             per_request: self.prefix_points_per_request }
     }
 
-    /// The pinned host tier's config and copy engine (`template`: any device buffer of the
-    /// engine), or None when the cache or the tier is off.
-    pub fn host_tier<'a>(&self, library: &'a NativeLibrary, template: CuteafdDeviceBuffer, mark_bytes: usize)
-        -> Result<Option<(cuteafd_hostcache::config::Config, CudaCopyEngine<'a>)>> {
-        if self.prefix_cache_entries == 0 || self.host_cache_bytes == 0 {
+    /// Resolve the host quota once, before pinned allocation. Call only when
+    /// this family's copy engine can restore every rank's snapshot exactly.
+    /// Host prefix bytes are not active device KV capacity.
+    pub fn host_config(&self, layout: FamilyLayout, max_context: usize)
+        -> Result<Option<cuteafd_hostcache::config::Config>> {
+        if self.prefix_cache_entries == 0 || !self.host_cache_bytes.enabled() {
+            return Ok(None);
+        }
+        let chunk = (256u64 << 20).max(layout.page_bytes as u64)
+            .max(layout.mark_bytes as u64).max(layout.draft_bytes as u64);
+        let bytes = match self.host_cache_bytes {
+            HostBudget::Bytes(bytes) => bytes,
+            HostBudget::Auto => {
+                let memory = budget::host_memory()?;
+                let required = budget::retained_bytes(layout, self.prefix_cache_entries, max_context, chunk)?;
+                let bytes = budget::automatic_bytes(required, chunk, memory, self.host_cache_headroom_bytes);
+                tracing::info!(required_bytes = required, resolved_bytes = bytes, available_bytes = memory.available,
+                    total_bytes = memory.total, headroom_bytes = self.host_cache_headroom_bytes,
+                    "automatic retained-prefix host budget (does not add active KV capacity)");
+                bytes
+            }
+        };
+        if bytes == 0 {
             return Ok(None);
         }
         let config = cuteafd_hostcache::config::Config {
-            bytes: self.host_cache_bytes,
-            chunk_bytes: (256u64 << 20).max(mark_bytes as u64).min(self.host_cache_bytes),
+            bytes,
+            chunk_bytes: chunk.min(bytes),
             min_tokens: self.host_cache_min_tokens,
+            max_tokens: u32::try_from(max_context)?,
             ..Default::default()
         };
-        Ok(Some((config, CudaCopyEngine::new(library, template)?)))
+        config.validate()?;
+        Ok(Some(config))
+    }
+
+    /// Single-device copy engine for the resolved retained-prefix budget.
+    pub fn host_tier<'a>(&self, library: &'a NativeLibrary, template: CuteafdDeviceBuffer,
+        layout: FamilyLayout, max_context: usize)
+        -> Result<Option<(cuteafd_hostcache::config::Config, CudaCopyEngine<'a>)>> {
+        self.host_config(layout, max_context)?.map(|config|
+            CudaCopyEngine::new(library, template).map(|engine| (config, engine))).transpose()
     }
 }
 
@@ -103,8 +139,8 @@ pub(crate) fn parse_bytes(text: &str) -> std::result::Result<u64, String> {
         other => return Err(format!("unknown byte unit {other:?}")),
     };
     let value: f64 = number.parse().map_err(|e| format!("{text:?}: {e}"))?;
-    if !(value >= 0.0) {
-        return Err(format!("{text:?} is negative"));
+    if !value.is_finite() || value < 0.0 || value * scale >= u64::MAX as f64 {
+        return Err(format!("{text:?} is not a finite nonnegative byte count that fits u64"));
     }
     Ok((value * scale) as u64)
 }
@@ -130,7 +166,7 @@ mod tests {
     #[test]
     fn prefix_knobs_default_on_with_the_host_tier_off() {
         let cli = Cli::parse_from(["serve"]);
-        assert_eq!((cli.prefix.prefix_cache_entries, cli.prefix.host_cache_bytes), (20, 0));
+        assert_eq!((cli.prefix.prefix_cache_entries, cli.prefix.host_cache_bytes), (20, HostBudget::Bytes(0)));
         assert_eq!(cli.prefix.prefix_partial, Toggle::Off);
         assert_eq!(cli.prefix.points(), PointPolicy { gap: 0, boundaries: 0, per_request: 4 });
         let cli = Cli::parse_from(["serve", "--prefix-partial", "on", "--prefix-point-gap", "8192",
@@ -138,10 +174,26 @@ mod tests {
         assert_eq!(cli.prefix.points(), PointPolicy { gap: 8192, boundaries: 2, per_request: 4 });
         assert_eq!(cli.prefix.prefix_partial, Toggle::On);
         let cli = Cli::parse_from(["serve", "--prefix-cache-entries", "0", "--host-cache-bytes", "64GiB"]);
-        assert_eq!((cli.prefix.prefix_cache_entries, cli.prefix.host_cache_bytes), (0, 64 << 30));
+        assert_eq!((cli.prefix.prefix_cache_entries, cli.prefix.host_cache_bytes), (0, HostBudget::Bytes(64 << 30)));
         assert_eq!(parse_bytes("512MiB"), Ok(512 << 20));
         assert_eq!(parse_bytes("1.5GB"), Ok(1_500_000_000));
         assert_eq!(parse_bytes("123"), Ok(123));
         assert!(parse_bytes("12 parsecs").is_err() && parse_bytes("-1").is_err());
+        assert!(parse_bytes("NaN").is_err() && parse_bytes("inf").is_err());
+    }
+
+    #[test]
+    fn auto_parses_and_disabled_retention_does_not_resolve_or_allocate() {
+        let cli = Cli::try_parse_from(["serve", "--host-cache-bytes", "auto", "--prefix-cache-entries", "0"])
+            .unwrap();
+        assert_eq!(cli.prefix.host_cache_bytes, HostBudget::Auto);
+        let invalid = FamilyLayout { page_rows: 0, pages: 0, page_bytes: 0, mark_bytes: 0,
+            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT };
+        assert!(cli.prefix.host_config(invalid, 0).unwrap().is_none());
+        let cli = Cli::parse_from(["serve", "--host-cache-bytes", "64GiB"]);
+        let layout = FamilyLayout { page_rows: 64, pages: 1024, page_bytes: 65536, mark_bytes: 4096,
+            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT };
+        let config = cli.prefix.host_config(layout, 32768).unwrap().unwrap();
+        assert_eq!((config.bytes, config.max_tokens), (64 << 30, 32768));
     }
 }

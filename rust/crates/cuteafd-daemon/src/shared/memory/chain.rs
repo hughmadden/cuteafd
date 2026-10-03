@@ -108,10 +108,11 @@ impl<'a> StageChain<'a> {
             marked: Rc::new(Cell::new([None; 2])), device: Cell::new(true) })
     }
     /// An owned handle that can wrap a future borrowing the chain's owner.
-    pub fn handle(&self) -> ChainHandle {
-        ChainHandle(Current { events: self.events.clone(), head: self.head.clone(),
+    pub fn handle(&self) -> ChainHandle<'a> {
+        ChainHandle { library: self.library, current: Current {
+            events: self.events.clone(), head: self.head.clone(),
             forks: self.forks.clone(), fork: self.fork.clone(), fences: self.fences.clone(),
-            marked: self.marked.clone(), device: self.device.get() })
+            marked: self.marked.clone(), device: self.device.get() } }
     }
     /// Host wait for everything recorded so far, then forget the head. Call
     /// after the pass (or an aborted pass) before any unscoped consumer.
@@ -197,11 +198,15 @@ pub(crate) async fn fence_wait(library: &NativeLibrary, slot: usize) -> Result<(
     }
 }
 
-pub(crate) struct ChainHandle(Current);
-impl ChainHandle {
-    /// Poll `future` with this chain installed as the current scope.
-    pub fn scope<F: Future>(self, future: F) -> ChainScope<F> {
-        ChainScope { current: self.0, future }
+pub(crate) struct ChainHandle<'a> {
+    library: &'a NativeLibrary,
+    current: Current,
+}
+impl<'a> ChainHandle<'a> {
+    /// Poll `future` with this chain installed as the current scope. Cancellation
+    /// drains its recorded work before the future releases borrowed storage.
+    pub fn scope<F: Future>(self, future: F) -> ChainScope<'a, F> {
+        ChainScope { library: self.library, current: self.current, future, drain_on_drop: false }
     }
 }
 
@@ -264,22 +269,51 @@ pub(crate) fn deferred() -> bool {
     device_enabled() && CURRENT.with(|c| c.borrow().as_ref().is_some_and(|c| c.device))
 }
 
-pub(crate) struct ChainScope<F> {
+pub(crate) struct ChainScope<'a, F> {
+    library: &'a NativeLibrary,
     current: Current,
     future: F,
+    drain_on_drop: bool,
 }
-impl<F: Future> Future for ChainScope<F> {
+impl<F: Future> Future for ChainScope<'_, F> {
     type Output = F::Output;
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<F::Output> {
-        // The future is never moved after pinning; only borrowed in place.
+        // SAFETY: the future is never moved after pinning; only borrowed in place.
         let this = unsafe { self.get_unchecked_mut() };
+        // Arm before polling so a panic also drains before future-owned staging
+        // is dropped. Unpolled scopes have not submitted any work.
+        this.drain_on_drop = true;
         let previous = CURRENT.with(|c| c.replace(Some(this.current.clone())));
         struct Restore(Option<Current>);
         impl Drop for Restore {
             fn drop(&mut self) { let previous = self.0.take(); CURRENT.with(|c| *c.borrow_mut() = previous); }
         }
         let _restore = Restore(previous);
-        unsafe { Pin::new_unchecked(&mut this.future) }.poll(context)
+        // SAFETY: `future` remains pinned with its containing scope.
+        let result = unsafe { Pin::new_unchecked(&mut this.future) }.poll(context);
+        if result.is_ready() {
+            // The target-pass wrapper performs its existing fallible drain.
+            this.drain_on_drop = false;
+        }
+        result
+    }
+}
+impl<F> Drop for ChainScope<'_, F> {
+    fn drop(&mut self) {
+        if !self.drain_on_drop { return; }
+        self.current.fork.set(None);
+        if let Some(head) = self.current.head.replace(None) {
+            // SAFETY: the pass retains the chain's events and library. All
+            // recorded producers are already submitted (the Spark proxy runs
+            // independently), so draining needs no progress from this future.
+            // CUDA permits event synchronization from another current device;
+            // this leaves the caller's device and thread-local scope unchanged.
+            if let Err(error) = unsafe { self.library.cuda_event_synchronize(self.current.events[head].1) } {
+                tracing::error!(%error, "draining cancelled target stage chain");
+            }
+        }
+        // Field destruction follows this body. Inner stream guards still drain
+        // submissions not yet recorded in the chain before releasing their owners.
     }
 }
 
@@ -372,4 +406,194 @@ pub(crate) fn settle(library: &NativeLibrary) -> Result<()> {
         unsafe { library.cuda_event_synchronize(current.events[head].1)?; }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::memory::{HostAllocation, device::{Allocation, Device, Stream}};
+    use cuteafd_ffi::test_support::CudaStreamGate;
+    use std::sync::atomic::Ordering;
+    use std::task::Waker;
+    use std::time::Duration;
+
+    /// Models staging returned to a pool by an inner future's destructor. It
+    /// must already be reusable when that destructor starts, not just after the
+    /// surrounding pass owner eventually drops or starts another execution.
+    struct ReuseStaging<'s, 'a> {
+        staging: &'s mut HostAllocation<'a>,
+        final_stream: &'s Stream<'a>,
+        observed: Rc<Cell<Option<(bool, i32)>>>,
+    }
+    impl Drop for ReuseStaging<'_, '_> {
+        fn drop(&mut self) {
+            let device = self.final_stream.device;
+            let current = device.library.cuda_get_device().unwrap();
+            // SAFETY: the borrowed stream outlives this staging lease.
+            let ready = device.run(|| unsafe {
+                device.library.cuda_stream_query(self.final_stream.raw)
+            }).unwrap();
+            self.observed.set(Some((ready, current)));
+            // On the broken implementation, record the premature release
+            // without introducing a test-side race with the pending DMA.
+            if ready { self.staging.bytes_mut().fill(0xee); }
+        }
+    }
+
+    fn queued_reuse(device_ids: &[i32], unwind: bool) -> Result<()> {
+        const BYTES: usize = 4096;
+        // SAFETY: the explicitly selected native library is retained by every
+        // allocation, stream and chain until their destruction.
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        library.cuda_set_device(0)?;
+        let mut staging = HostAllocation::new(&library, BYTES)?;
+        let mut landing = device_ids.iter().map(|_| HostAllocation::new(&library, BYTES))
+            .collect::<Result<Vec<_>>>()?;
+        let devices = device_ids.iter().map(|&id| Device { library: &library, id }).collect::<Vec<_>>();
+        let output = devices.iter().map(|&device| Allocation::new(device, BYTES)).collect::<Result<Vec<_>>>()?;
+        let streams = devices.iter().map(|&device| Stream::new(device)).collect::<Result<Vec<_>>>()?;
+        let chain = StageChain::on_devices(&library, device_ids)?;
+        let mut context = Context::from_waker(Waker::noop());
+        let addresses = (staging.buffer.ptr, output.iter().map(|v| v.buffer.ptr).collect::<Vec<_>>());
+
+        for seed in [37u8, 149] {
+            staging.bytes_mut().fill(seed);
+            for target in &mut landing { target.bytes_mut().fill(0); }
+            // SAFETY: this stream remains live until after the gate is released
+            // and drained; an independent OS thread supplies the release.
+            let gate = unsafe { CudaStreamGate::new(&library, streams[0].raw)? };
+            let release = gate.release_handle();
+            let observed = Rc::new(Cell::new(None));
+            let lease = ReuseStaging { staging: &mut staging, final_stream: streams.last().unwrap(),
+                observed: observed.clone() };
+            let work = async {
+                for ((stream, allocation), target) in streams.iter().zip(&output).zip(&landing) {
+                    stream.device.run(|| {
+                        // SAFETY: pinned source/destination and device storage
+                        // are retained across cancellation; each stage joins its
+                        // predecessor before copying and records after its D2H.
+                        unsafe {
+                            join(&library, stream.raw)?;
+                            library.copy_host_buffer_h2d_async(allocation.buffer, lease.staging.buffer, BYTES, stream.raw)?;
+                            library.copy_d2h_host_buffer_async(target.buffer, allocation.buffer, BYTES, stream.raw)?;
+                            finish(&library, stream.raw)
+                        }
+                    })?;
+                }
+                std::future::pending::<()>().await;
+                drop(lease);
+                Ok::<_, anyhow::Error>(())
+            };
+            let future = Box::pin(chain.handle().scope(work));
+            std::thread::scope(|threads| -> Result<()> {
+                let (begin_release, wait_for_drop) = std::sync::mpsc::channel();
+                let release = release.clone();
+                threads.spawn(move || {
+                    // The timeout also releases the gate if setup/assertions
+                    // fail before announcing cancellation.
+                    let _ = wait_for_drop.recv_timeout(Duration::from_secs(2));
+                    std::thread::sleep(Duration::from_millis(30));
+                    release.store(true, Ordering::Release);
+                });
+                let mut future = future;
+                assert!(future.as_mut().poll(&mut context).is_pending());
+                assert!(!active(), "poll leaked the chain scope");
+                assert_eq!(library.cuda_get_device()?, 0);
+                begin_release.send(())?;
+                if unwind {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        let _future = future;
+                        panic!("exercise scoped future destruction while unwinding");
+                    }));
+                    assert!(result.is_err());
+                } else {
+                    drop(future);
+                }
+                // The lease's destructor executes before thread::scope joins
+                // its release thread, so that join cannot mask a missing drain.
+                assert_eq!(observed.get(), Some((true, 0)), "staging was released before the GPU chain completed");
+                Ok(())
+            })?;
+            assert!(chain.head.get().is_none());
+            assert!(chain.fork.get().is_none());
+            assert!(!active());
+            assert_eq!(library.cuda_get_device()?, 0);
+            assert!(staging.bytes().iter().all(|&v| v == 0xee));
+            for target in &landing { assert!(target.bytes().iter().all(|&v| v == seed)); }
+            assert_eq!(staging.buffer.ptr, addresses.0);
+            assert_eq!(output.iter().map(|v| v.buffer.ptr).collect::<Vec<_>>(), addresses.1);
+            // Deliberately do not call chain.drain(): the next iteration reuses
+            // the same host/device storage immediately after cancellation.
+            drop(gate);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, libcudart.so.13 and one CUDA device"]
+    fn cancelled_stage_chain_drains_before_staging_reuse() -> Result<()> {
+        queued_reuse(&[0], false)
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, libcudart.so.13 and two CUDA devices"]
+    fn cancelled_cross_device_stage_chain_drains_before_staging_reuse() -> Result<()> {
+        queued_reuse(&[0, 1], false)
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, libcudart.so.13 and one CUDA device"]
+    fn unwinding_stage_chain_drains_before_staging_reuse() -> Result<()> {
+        queued_reuse(&[0], true)
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB, libcudart.so.13 and one CUDA device"]
+    fn completed_and_unpolled_stage_scopes_leave_the_explicit_drain() -> Result<()> {
+        // SAFETY: all native owners are destroyed before the library.
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        library.cuda_set_device(0)?;
+        let device = Device { library: &library, id: 0 };
+        let mut source = HostAllocation::new(&library, 4096)?;
+        let target = Allocation::new(device, 4096)?;
+        let output = HostAllocation::new(&library, 4096)?;
+        let stream = Stream::new(device)?;
+        let chain = StageChain::new(&library)?;
+        source.bytes_mut().fill(81);
+        // SAFETY: the gate is released and drained before the stream drops.
+        let gate = unsafe { CudaStreamGate::new(&library, stream.raw)? };
+        let release = gate.release_handle();
+        std::thread::scope(|threads| -> Result<()> {
+            let (begin_release, wait_for_check) = std::sync::mpsc::channel();
+            let worker_release = release.clone();
+            threads.spawn(move || {
+                let _ = wait_for_check.recv_timeout(Duration::from_secs(2));
+                worker_release.store(true, Ordering::Release);
+            });
+            let mut work = Box::pin(chain.handle().scope(async {
+                // SAFETY: all buffers and the stream remain live until the
+                // explicit drain below, including the normal Ready path.
+                unsafe {
+                    join(&library, stream.raw)?;
+                    library.copy_host_buffer_h2d_async(target.buffer, source.buffer, 4096, stream.raw)?;
+                    library.copy_d2h_host_buffer_async(output.buffer, target.buffer, 4096, stream.raw)?;
+                    finish(&library, stream.raw)
+                }
+            }));
+            let mut context = Context::from_waker(Waker::noop());
+            match work.as_mut().poll(&mut context) {
+                Poll::Ready(result) => result?,
+                Poll::Pending => anyhow::bail!("submission unexpectedly suspended"),
+            }
+            drop(work);
+            drop(chain.handle().scope(std::future::pending::<()>()));
+            assert!(!release.load(Ordering::Acquire), "normal/unpolled drop waited for queued work");
+            assert!(chain.head.get().is_some(), "normal/unpolled drop consumed the explicit drain");
+            assert!(!active());
+            begin_release.send(())?;
+            chain.drain()?;
+            assert!(output.bytes().iter().all(|&value| value == 81));
+            Ok(())
+        })
+    }
 }

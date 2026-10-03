@@ -162,6 +162,16 @@ impl SparkExperts {
         self.clients.reset();
     }
 
+    /// Opt-in owner contract for a terminal engine. Error paths retain pending
+    /// slots instead of resetting them before queued CUDA consumers drain.
+    pub fn enable_terminal_ownership(&mut self) -> Result<()> {
+        self.clients.enable_terminal_ownership()
+    }
+    pub fn terminal_owned(&self) -> bool { self.clients.terminal_owned() }
+    pub fn terminal_released(&self) -> bool { self.clients.terminal_released() }
+    pub fn terminal_quiesce(&mut self) -> Result<()> { self.clients.terminal_quiesce() }
+    pub fn terminal_release(&mut self) -> Result<()> { self.clients.terminal_release() }
+
     /// Receive each rank's response payloads straight into its device range
     /// (`planes[rank]`, registered with the NIC over dma-buf) from the next
     /// connection on; `None` returns to pinned host receives. A rank whose

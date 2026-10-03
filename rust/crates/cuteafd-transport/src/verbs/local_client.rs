@@ -25,6 +25,12 @@ pub(crate) struct LocalTp4Client {
     /// Post the ranks' zero-copy requests one after another (each once the
     /// previous rank's send completed) rather than all at once.
     stagger: bool,
+    /// Optional terminal contract. A failed temporary/persistent endpoint
+    /// publishes into this witness before its external landing owner drops.
+    terminal_owner: Option<Arc<AtomicBool>>,
+    terminal_failed: bool,
+    terminal_quiesced: bool,
+    terminal_released: bool,
 }
 impl LocalTp4Client {
     pub(crate) fn new(peers: [SocketAddr; 4], config: TcpTransportConfig) -> Self {
@@ -51,6 +57,10 @@ impl LocalTp4Client {
             write: vec![None; world],
             egress: None,
             stagger: false,
+            terminal_owner: None,
+            terminal_failed: false,
+            terminal_quiesced: false,
+            terminal_released: false,
         }
     }
     /// Allocates the shared request buffer (`bytes`, pinned and device-mapped)
@@ -106,7 +116,7 @@ impl LocalTp4Client {
             }
             if self.sessions[rank].is_none() {
                 self.sessions[rank] = Some(VerbsHostProtocolV2PersistentClientSession::connect_local(
-                    self.peers[rank], &self.config, request, None, None, self.write[rank])?);
+                    self.peers[rank], &self.config, request, None, None, self.write[rank], self.terminal_owner.clone())?);
             }
             let session = self.sessions[rank].as_mut().unwrap();
             anyhow::ensure!(session.write_mode, "rank {rank} session is not in write mode");
@@ -119,6 +129,15 @@ impl LocalTp4Client {
         self.sessions.iter().map(|s| s.as_ref().is_some_and(|s| s.gpu_landing)).collect()
     }
     pub(crate) fn reset(&mut self) {
+        if self.terminal_owner.is_some() {
+            // submit's terminal path first quiesces every QP, then drains
+            // compute/uploads; resetting here would release queued owners.
+            self.terminal_failed = true;
+            return;
+        }
+        self.reset_storage();
+    }
+    fn reset_storage(&mut self) {
         // Drop queued payloads before sessions unregister their receive rings.
         self.chunks = None;
         self.done.clear();
@@ -131,6 +150,8 @@ impl LocalTp4Client {
         self.deadline = None;
     }
     pub(crate) fn dispatch(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
+        anyhow::ensure!(!self.terminal_failed && !self.terminal_quiesced,
+            "terminal-owned Spark transport cannot be reused after failure or quiescence");
         anyhow::ensure!(self.deadline.is_none(), "local TP4 request already pending");
         let result = self.post(request);
         if result.is_err() {
@@ -148,6 +169,8 @@ impl LocalTp4Client {
                 .transpose()?
                 == Some(false)
             {
+                anyhow::ensure!(self.terminal_owner.is_none(),
+                    "terminal-owned Spark request exceeds its prewarmed session capacity; reconnect is unsupported");
                 self.sessions[rank] = None;
             }
             if self.sessions[rank].is_none() {
@@ -158,6 +181,7 @@ impl LocalTp4Client {
                     self.landing[rank],
                     self.egress.as_ref(),
                     self.write[rank],
+                    self.terminal_owner.clone(),
                 )?);
             }
             let session = self.sessions[rank].as_mut().unwrap();
@@ -190,6 +214,42 @@ impl LocalTp4Client {
                 .checked_add(self.config.timeout)
                 .context("local TP4 deadline overflow")?,
         );
+        Ok(())
+    }
+
+    pub(crate) fn enable_terminal_ownership(&mut self) -> Result<()> {
+        anyhow::ensure!(self.sessions.iter().all(Option::is_none) && self.deadline.is_none(),
+            "terminal Spark ownership must precede connection/bootstrap");
+        self.terminal_owner = Some(Arc::new(AtomicBool::new(false)));
+        Ok(())
+    }
+
+    pub(crate) fn terminal_owned(&self) -> bool { self.terminal_owner.is_some() }
+    pub(crate) fn terminal_retained(&self) -> bool {
+        self.terminal_owner.as_ref().is_some_and(|owner|owner.load(Ordering::Acquire))
+    }
+    pub(crate) fn terminal_released(&self) -> bool { self.terminal_released }
+
+    /// Stop every QP before changing any pending/chunk/registration owner.
+    /// A failure preserves the complete collection, including successful ranks.
+    pub(crate) fn terminal_quiesce(&mut self) -> Result<()> {
+        anyhow::ensure!(self.terminal_owner.is_some(),"transport has no terminal owner contract");
+        self.terminal_failed = true;
+        let result=quiesce_all(&self.sessions, |session|session.endpoint.terminal_quiesce());
+        if result.is_err() || self.terminal_retained() {
+            self.terminal_owner.as_ref().unwrap().store(true,Ordering::Release);
+            return Err(result.err().unwrap_or_else(||anyhow::anyhow!("a temporary Spark endpoint requires owner retention")));
+        }
+        self.terminal_quiesced = true;
+        Ok(())
+    }
+
+    /// Called only after every compute/copy consumer has drained successfully.
+    pub(crate) fn terminal_release(&mut self) -> Result<()> {
+        anyhow::ensure!(self.terminal_quiesced && !self.terminal_retained(),
+            "Spark pending owners cannot be released before successful terminal quiescence");
+        self.reset_storage();
+        self.terminal_released = true;
         Ok(())
     }
     pub(crate) fn poll<F>(&mut self, mut sink: F) -> Result<bool>
@@ -228,6 +288,64 @@ impl LocalTp4Client {
         self.chunks = None;
         self.deadline = None;
         Ok(true)
+    }
+}
+
+fn quiesce_all<T>(owners: &[Option<T>], mut quiesce: impl FnMut(&T)->Result<()>) -> Result<()> {
+    let mut failures=Vec::new();
+    for (rank,owner) in owners.iter().enumerate() {
+        if let Some(owner)=owner {
+            if let Err(error)=quiesce(owner) { failures.push(format!("rank {rank}: {error:#}")); }
+        }
+    }
+    anyhow::ensure!(failures.is_empty(),"terminal QP quiescence failed; all owners retained: {}",failures.join("; "));
+    Ok(())
+}
+
+impl Drop for LocalTp4Client {
+    fn drop(&mut self) {
+        if self.terminal_owned() && !self.terminal_released {
+            if let Err(error)=self.terminal_quiesce() {
+                // Keep native registrations, retained chunks, external egress
+                // owners and their library loaded. SparkLink also retains its
+                // external GPU landing/queued-upload owner via the witness.
+                std::mem::forget(std::mem::take(&mut self.sessions));
+                std::mem::forget(std::mem::take(&mut self.pending));
+                std::mem::forget(self.chunks.take());
+                std::mem::forget(std::mem::take(&mut self.done));
+                std::mem::forget(self.egress.take());
+                tracing::error!(%error,"retaining terminal Spark client owners");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    struct Owners { registered: Arc<AtomicUsize>, landing: Arc<AtomicUsize> }
+    impl Drop for Owners { fn drop(&mut self) {
+        self.registered.fetch_add(1,Ordering::SeqCst);
+        self.landing.fetch_add(1,Ordering::SeqCst);
+    } }
+
+    #[test]
+    fn failed_qp_quiescence_retains_registered_and_external_landing_owners() {
+        let registered=Arc::new(AtomicUsize::new(0));
+        let landing=Arc::new(AtomicUsize::new(0));
+        let owners=(0..2).map(|_|Some(Owners { registered:registered.clone(),landing:landing.clone() })).collect::<Vec<_>>();
+        let mut attempted=0;
+        let result=quiesce_all(&owners, |_| { attempted+=1;
+            if attempted==1 { anyhow::bail!("injected ibv_destroy_qp failure"); } Ok(()) });
+        assert!(result.is_err());
+        assert_eq!(attempted,2);
+        assert_eq!(registered.load(Ordering::SeqCst),0);
+        assert_eq!(landing.load(Ordering::SeqCst),0);
+        assert!(owners.iter().all(Option::is_some));
+        drop(owners);
+        assert_eq!(registered.load(Ordering::SeqCst),2);
+        assert_eq!(landing.load(Ordering::SeqCst),2);
     }
 }
 

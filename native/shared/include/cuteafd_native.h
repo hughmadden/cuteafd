@@ -539,6 +539,9 @@ cuteafd_status_t cuteafd_rdma_rc_endpoint_post_send_slot_region(
     void* handle, size_t slot_offset, size_t slot_bytes, uint32_t region, size_t region_offset,
     size_t region_bytes, uint64_t wr_id);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_destroy(void* handle);
+// Stop all QP DMA without releasing registrations or any host/device landing
+// storage. Success is idempotent; failure leaves all ownership unchanged.
+cuteafd_status_t cuteafd_rdma_rc_endpoint_quiesce(void* handle);
 
 cuteafd_status_t cuteafd_cuda_rmsnorm_f32(const float* x, const float* weight, float* out,
                                       int rows, int hidden, float eps);

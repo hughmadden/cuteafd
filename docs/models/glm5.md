@@ -37,6 +37,22 @@ a top-8 sigmoid router, and a DFlash2 draft speculator.
 - Prefix cache: merged — page-only state (no host-tier compaction yet; a
   stand-in tail covers that path).
 
+## Default precision (single residency)
+
+Every weight has one resident format. Precision is chosen by measurement:
+FP8 converts at load into the only copy where it is faster and the golden
+stays within ~0.005 nat KL/NLL; drafters run FP8 whenever emitted tok/s is
+higher (they cannot change the output). Measured 2026-10-03, natural minimum,
+one warm launch per arm, `CONCURRENCY=4`, code tok/s (C4 aggregate), golden
+512 tokens.
+
+| Arm | C1 | C4 | 8K prefill | KL · top-1 · NLL |
+| --- | ---: | ---: | ---: | --- |
+| checkpoint (BF16 DFlash2) | 41.5 | 63.9 | 2,609 | 0.022 · 90.2% · 3.548 |
+| **FP8 DFlash2 (default)** | 43.9 | 71.1 | 2,627 | 0.022 · 90.2% · 3.548 |
+
+GLM 5.3 EXL3 K4, 1 RTX + 4 Sparks. `SPECULATOR_FP8=off` keeps the BF16 drafter.
+
 ## Known limits
 
 - The official FP8 checkpoint's KV pool is small at full context; run EXL3

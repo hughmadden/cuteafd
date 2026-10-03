@@ -70,7 +70,10 @@ snapshot_of() {
 #   mtp      MiMo V2 Flash, Qwen 3.8: the checkpoint's native MTP layers,
 #            SPECULATOR_DEPTH drafts (default 1)
 #   dspark   DeepSeek V4
-# SPECULATOR_FP8=off drafts in BF16. Pre-rename keys (DRAFT_MODEL_ID, DFLASH,
+# MiMo unset drafts in single-copy FP8 (the measured family default);
+# SPECULATOR_FP8=auto preserves that drafter's checkpoint format. GLM auto/unset
+# drafts in single-copy FP8. on converts, off selects BF16. Pre-rename keys
+# (DRAFT_MODEL_ID, DFLASH,
 # MTP, DSPARK, DRAFT_FP8) still work for one release.
 speculator="$(get SPECULATOR)"
 if [[ -z "$speculator" ]]; then
@@ -91,6 +94,24 @@ esac
 draft_args=()
 family_args=()
 dspark_args=()
+if [[ $family == mimo_v2 ]]; then
+  case "$(get MIMO_WEIGHT_POLICY auto)" in
+    auto) ;; # The runtime and planner share the metadata qualifier.
+    checkpoint) family_args+=(--weight-policy checkpoint) ;;
+    *) echo "MIMO_WEIGHT_POLICY must be auto or checkpoint" >&2; exit 2 ;;
+  esac
+  for projection in HEAD O_PROJ; do
+    mode="$(get "MIMO_FP8_$projection")"
+    option=--fp8-head
+    [[ $projection != O_PROJ ]] || option=--fp8-o-proj
+    case "$mode" in
+      ""|auto) ;;
+      on) family_args+=("$option" true) ;;
+      off) family_args+=("$option" false) ;;
+      *) echo "MIMO_FP8_$projection must be auto, on or off" >&2; exit 2 ;;
+    esac
+  done
+fi
 case "$speculator" in
   dflash2)
     drafter="$(key SPECULATOR_MODEL_ID DRAFT_MODEL_ID)"
@@ -123,7 +144,11 @@ case $family in
     [[ "$(get HOST_CACHE_BYTES 0)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES)") ;;
 esac
 if [[ $family == mimo_v2 ]]; then
-  family_args+=(--pool-tokens "$(get POOL_TOKENS 131072)")
+  # POOL_TOKENS=auto: the largest pool every GPU admits after all fixed costs (up to 2M tokens).
+  # Default auto (measured 2026-10-03, MiMo V2.6 Pro 2 RTX + 6: 131072 -> 2,097,152 tokens, C1/C4/8K
+  # prefill unchanged); a number pins the pool.
+  mimo_pool="$(get POOL_TOKENS auto)"; [[ "$mimo_pool" != auto ]] || mimo_pool=0
+  family_args+=(--pool-tokens "$mimo_pool")
   # PREFIX_PARTIAL=on: V4.1-style partial reuse (approximate; off = exact restores only).
   family_args+=(--prefix-partial "$(get PREFIX_PARTIAL off)")
   # KV_CACHE: int8 (the engine default: 8-bit full-attention records with FP32 scales per 32
@@ -138,26 +163,83 @@ if [[ $family == mimo_v2 ]]; then
     *) echo "DECODE_GRAPHS must be on or off" >&2; exit 2 ;;
   esac
 fi
-[[ ! $family =~ ^(glm5|qwen4|deepseek_v4)$ || -z "$(get POOL_TOKENS)" ]] || family_args+=(--pool-tokens "$(get POOL_TOKENS)")
+# EXPERT_INPUT is opt-in for MiMo's Spark exchange; unset preserves image defaults.
+expert_input="$(get EXPERT_INPUT)"
+if [[ -n "$expert_input" ]]; then
+  [[ "$family" == mimo_v2 ]] || { echo "EXPERT_INPUT applies to MiMo checkpoints" >&2; exit 2; }
+  case "$expert_input" in
+    fp8|bf16|bf16-decode) family_args+=(--expert-input "$expert_input") ;;
+    *) echo "EXPERT_INPUT must be fp8, bf16 or bf16-decode" >&2; exit 2 ;;
+  esac
+fi
+# Qwen 3.8: QWEN_FP8_DECODE=on|off converts the GDN/attention projections to one
+# resident E4M3 copy; QWEN_FP8_HEAD=on|off does the same for the head target and
+# MTP share. Unset keeps the engine defaults.
+if [[ $family == qwen4 ]]; then
+  for key in FP8_DECODE:--fp8-decode FP8_HEAD:--mtp-fp8-head; do
+    mode="$(get "QWEN_${key%%:*}")"
+    case "$mode" in
+      "") ;;
+      on) family_args+=("${key#*:}" true) ;;
+      off) family_args+=("${key#*:}" false) ;;
+      *) echo "QWEN_${key%%:*} must be on or off" >&2; exit 2 ;;
+    esac
+  done
+fi
+# POOL_TOKENS=auto (GLM 5.3, GLM 5.3 Flash, MiMo): the largest pool the GPUs hold after the
+# planner's remaining costs (up to 2M tokens).
+# GLM 5.3 defaults to auto (bounded decode graphs captured at startup: 262144 -> 1,292,672 tokens on
+# 2 RTX + 6 Sparks, C1/C4/8K prefill unchanged); Qwen and DeepSeek V4 keep their engine defaults.
+glm_default=""; [[ $family != glm5 ]] || glm_default=auto
+if [[ $family =~ ^(glm5|qwen4|deepseek_v4)$ && -n "$(get POOL_TOKENS "$glm_default")" ]]; then
+  pool="$(get POOL_TOKENS "$glm_default")"
+  if [[ "$pool" == auto ]]; then
+    [[ $family == glm5 ]] || { echo "POOL_TOKENS=auto is supported for GLM 5.3, GLM 5.3 Flash and MiMo" >&2; exit 2; }
+    pool=0
+  fi
+  family_args+=(--pool-tokens "$pool")
+fi
 # GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
-# from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" quantizes the
-# BF16 checkpoint's at load); KDA projections get per-row FP8 decode copies
-# (GLM5_FLASH_KDA_FP8: row128, channel or off) and optionally an FP8 LM head
-# (GLM5_FLASH_FP8_HEAD=on); its MLA pools hold POOL_TOKENS tokens (a key every
+# from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" requires native
+# FP8 block tensors in the primary checkpoint, else BF16 ones are quantized to
+# 128x128 blocks at load). GLM5_FLASH_KDA_FP8 (unset/auto = row128, channel, off)
+# replaces the KDA in/out projections with per-row FP8 at load (their only
+# resident copy); off keeps the checkpoint BF16. GLM5_FLASH_FP8_HEAD (default on)
+# keeps only a per-row FP8 LM head (target and drafter); off keeps BF16.
+# Its MLA pools hold POOL_TOKENS tokens (a key every
 # family with a paged KV pool reads). GLM5_FLASH_FP8_PREFILL lists the prefill
 # projections that run W8A8 (E4M3 activations per 128-K block): unset = the
-# engine default mla,ffn (the official FP8 tensors), a list of
-# mla,ffn,kda-in,kda-o / all, or off (MLA/FFN W8A16, KDA BF16). The GLMF_*
-# spellings still work for one release.
+# engine default mla,ffn, a list of mla,ffn,kda-in,kda-o / all (kda-* need
+# GLM5_FLASH_KDA_FP8 row128/channel), or off (every FP8 weight W8A16). The
+# GLMF_* spellings still work for one release.
 if [[ $family == glm5_flash ]]; then
   fp8_model="$(key GLM5_FLASH_FP8_MODEL_ID GLMF_FP8_MODEL_ID zai-org/GLM-5.3-Flash)"
   if [[ "$fp8_model" != off ]]; then
     fp8_snapshot="$(snapshot_of "$fp8_model" "$(key GLM5_FLASH_FP8_MODEL_REVISION GLMF_FP8_MODEL_REVISION)")" || exit 1
     family_args+=(--fp8-decode --fp8-snapshot "$fp8_snapshot")
   fi
-  family_args+=(--kda-fp8 "$(key GLM5_FLASH_KDA_FP8 GLMF_KDA_FP8 row128)" --pool-tokens "$(get POOL_TOKENS 65536)")
-  [[ "$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD off)" != on ]] || family_args+=(--fp8-head)
+  kda_fp8="$(key GLM5_FLASH_KDA_FP8 GLMF_KDA_FP8 auto)"
+  case "$kda_fp8" in
+    ""|auto) kda_fp8=row128 ;;
+    off|row128|channel) ;;
+    *) echo "GLM5_FLASH_KDA_FP8 must be auto, off, row128 or channel" >&2; exit 2 ;;
+  esac
+  # Default auto (GLM 5.3 Flash 1 RTX + 2: 65536 -> 2,097,152 tokens, 44 GiB still free, speed unchanged).
+  glmf_pool="$(get POOL_TOKENS auto)"; [[ "$glmf_pool" != auto ]] || glmf_pool=0
+  family_args+=(--kda-fp8 "$kda_fp8" --pool-tokens "$glmf_pool")
+  case "$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD on)" in
+    on|auto|"") family_args+=(--fp8-head true) ;;
+    off) family_args+=(--fp8-head false) ;;
+    *) echo "GLM5_FLASH_FP8_HEAD must be on or off" >&2; exit 2 ;;
+  esac
   fp8_prefill="$(key GLM5_FLASH_FP8_PREFILL GLMF_FP8_PREFILL)"
+  case ",$fp8_prefill," in
+    *,all,*|*,kda-in,*|*,kda-o,*)
+      if [[ $kda_fp8 == off ]]; then
+        echo "GLM5_FLASH_FP8_PREFILL=$fp8_prefill runs KDA W8A8 over FP8 KDA weights; set GLM5_FLASH_KDA_FP8=row128 or channel" >&2
+        exit 2
+      fi ;;
+  esac
   case "$fp8_prefill" in
     "") ;;
     off) family_args+=(--fp8-prefill none) ;;
@@ -180,7 +262,28 @@ fi
 if [[ $serve != serve-dsv4 ]]; then
   [[ -z "$(get L2_PREFETCH)" ]] || family_args+=(--l2-prefetch "$(get L2_PREFETCH)")
   [[ -z "$(get FP8_SCALES)" ]] || family_args+=(--fp8-scales "$(get FP8_SCALES)")
-  if [[ ${#draft_args[@]} -gt 0 && "$(key SPECULATOR_FP8 DRAFT_FP8 on)" == off ]]; then family_args+=(--draft-fp8 false); fi
+  if [[ ${#draft_args[@]} -gt 0 ]]; then
+    if [[ $family == mimo_v2 ]]; then
+      case "$(key SPECULATOR_FP8 DRAFT_FP8)" in
+        "") ;;
+        auto) family_args+=(--draft-representation checkpoint) ;;
+        on) family_args+=(--draft-fp8 true) ;;
+        off) family_args+=(--draft-fp8 false) ;;
+        *) echo "MiMo SPECULATOR_FP8/DRAFT_FP8 must be auto, on or off" >&2; exit 2 ;;
+      esac
+    elif [[ $family == glm5 || $family == glm5_flash ]]; then
+      case "$(key SPECULATOR_FP8 DRAFT_FP8 auto)" in
+        auto) ;; # The engine default: single-copy FP8 drafter weights.
+        on) family_args+=(--draft-fp8 true) ;;
+        off) family_args+=(--draft-fp8 false) ;;
+        *) echo "SPECULATOR_FP8 must be auto, on or off" >&2; exit 2 ;;
+      esac
+      [[ -z "$(get DRAFT_CONTEXT_SLOTS)" ]] || family_args+=(--draft-context-slots "$(get DRAFT_CONTEXT_SLOTS)")
+      [[ -z "$(get DRAFT_SEQUENCES)" ]] || family_args+=(--draft-sequences "$(get DRAFT_SEQUENCES)")
+    elif [[ "$(key SPECULATOR_FP8 DRAFT_FP8 on)" == off ]]; then
+      family_args+=(--draft-fp8 false)
+    fi
+  fi
 fi
 # SERVED_MODEL_ID: the public model id (default: the checkpoint's Hugging Face id).
 served_args=()
@@ -207,24 +310,30 @@ budget="$(get SPARK_DEVICE_BUDGET_BYTES 107374182400)"
 gpu="$(get COORDINATOR_GPU 0)"
 # Two coordinator GPUs (RTX_GPUS=auto/2 with COORDINATOR_GPU as V4.1's two-RTX config picks
 # the other card, or an explicit COORDINATOR_GPUS=0,1): families with a
-# head split (MiMo V2.6 Pro, GLM 5.x, DeepSeek V4) split every layer's attention heads and dense /
+# head split (MiMo V2 Flash/Pro, GLM 5.x, DeepSeek V4) split every layer's attention heads and dense /
 # shared-expert MLPs over both by default (COORDINATOR_SPLIT=auto or heads), one hidden
 # all-reduce per layer over peer memory; experts, router, head and drafter stay on the
-# first GPU. COORDINATOR_SPLIT=off serves from the first GPU alone. Families without a
-# split use the first GPU (the serve command logs it for MiMo V2 Flash). The container
-# sees both GPUs in host order. COORDINATOR_SPLIT_GPU names the second GPU when only
+# first GPU. COORDINATOR_SPLIT=off serves from the first GPU alone. Auto selection
+# uses one GPU for checkpoints without a split; an explicit split request fails
+# before containers start. The container sees both GPUs in host order.
+# COORDINATOR_SPLIT_GPU names the second GPU when only
 # COORDINATOR_GPU is set (default the other of 0/1).
+rtx_gpus="$(get RTX_GPUS auto)"
+case "$rtx_gpus" in auto|1|2) ;; *) echo "RTX_GPUS must be auto, 1 or 2" >&2; exit 2 ;; esac
+physical_gpus="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | tr -d ' ' || true)"
 coordinator_gpus="$(get COORDINATOR_GPUS)"
+explicit_coordinator_gpus="$coordinator_gpus"
 if [[ -z "$coordinator_gpus" ]]; then
   coordinator_gpus="$gpu"
-  case "$(get RTX_GPUS auto)" in
+  case "$rtx_gpus" in
     1) ;;
     2|auto)
-      other="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | tr -d ' ' | grep -vx "$gpu" | head -n 1)"
+      other="$(awk -v first="$gpu" '/^[0-9]+$/ && $0 != first {print; exit}' <<<"$physical_gpus")"
       [[ -z "$other" ]] || coordinator_gpus="$gpu,$other" ;;
-    *) echo "RTX_GPUS must be auto, 1 or 2" >&2; exit 2 ;;
   esac
 fi
+[[ "$coordinator_gpus" =~ ^[0-9]+(,[0-9]+)?$ ]] ||
+  { echo "COORDINATOR_GPUS must name one or two GPU indices" >&2; exit 2; }
 IFS=, read -r -a coordinator_gpus <<<"$coordinator_gpus"
 gpu="${coordinator_gpus[0]}"
 split="$(get COORDINATOR_SPLIT auto)"
@@ -235,16 +344,39 @@ if [[ ${#coordinator_gpus[@]} -ge 2 ]]; then
 elif [[ "$split" == heads ]]; then
   second="$(get COORDINATOR_SPLIT_GPU $((1 - gpu)))"
 fi
+explicit_split=0
+if [[ "$rtx_gpus" == 2 || "$explicit_coordinator_gpus" == *,* || "$split" == heads ]]; then
+  explicit_split=1
+fi
+split_hint=""
+case "$family:$model_type" in
+  deepseek_v4:*|glm5:*|mimo_v2:mimo_v2|mimo_v2:mimo_v2_flash) ;;
+  qwen4:*) split_hint="add Qwen head-split GDN/GQA/shared-expert kernels and sharded recurrent/KV state" ;;
+  glm5_flash:*) split_hint="add GLM Flash head-split KDA/MLA/dense/shared-expert kernels and sharded state" ;;
+  mimo_v2:*) split_hint="add MiMo head-split attention/projection kernels for $model_type" ;;
+  *) split_hint="add coordinator head-split kernels for $model_type" ;;
+esac
+if [[ "$split" != off && "$explicit_split" == 1 ]]; then
+  [[ -z "$split_hint" ]] ||
+    echo "note: $family ($model_type) has no head split yet ($split_hint); serving from GPU $gpu alone" >&2
+  [[ -n "$second" ]] ||
+    { echo "RTX_GPUS=2 requires two physical coordinator GPUs; only GPU $gpu was selected" >&2; exit 2; }
+fi
 gpus="device=$gpu"
 if [[ -n "$second" && "$split" != off ]]; then
+  [[ "$second" =~ ^[0-9]+$ ]] || { echo "COORDINATOR_SPLIT_GPU must be a GPU index" >&2; exit 2; }
   [[ "$second" != "$gpu" ]] || { echo "the second coordinator GPU must differ from the first" >&2; exit 2; }
-  case "$family" in
-    mimo_v2|glm5|deepseek_v4)
-      lower=$((gpu < second ? gpu : second)) upper=$((gpu < second ? second : gpu))
-      gpus="\"device=$lower,$upper\""
-      family_args+=(--device $((gpu == lower ? 0 : 1)) --split-device $((gpu == lower ? 1 : 0))) ;;
-    *) echo "note: $family has no head split; serving from GPU $gpu alone" >&2 ;;
-  esac
+  if [[ -z "$split_hint" ]]; then
+    for selected in "$gpu" "$second"; do
+      grep -qx "$selected" <<<"$physical_gpus" ||
+        { echo "two-GPU head split requires physical GPU $selected, but nvidia-smi did not report it" >&2; exit 2; }
+    done
+    lower=$((gpu < second ? gpu : second)) upper=$((gpu < second ? second : gpu))
+    gpus="\"device=$lower,$upper\""
+    family_args+=(--device $((gpu == lower ? 0 : 1)) --split-device $((gpu == lower ? 1 : 0)))
+  elif [[ "$explicit_split" != 1 ]]; then
+    echo "note: $family ($model_type) has no head split; auto selected GPU $gpu alone" >&2
+  fi
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is
@@ -260,6 +392,26 @@ if [[ "$ranks" == 0 ]]; then
     glm5_flash|mimo_v2|qwen4) family_args+=(--local-experts) ;;
     *) echo "SPARK_COUNT=0 (local experts) serves GLM 5.3 Flash, MiMo V2 and Qwen 3.8, not $family" >&2; exit 2 ;;
   esac
+fi
+# Check every selected image before --restart or checkpoint reads. The worker's
+# resident admission validates the sibling for its full 4096-row workspace even
+# when only decode requests use BF16, so this preflight requires the same coverage.
+if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
+  [[ "$ranks" != 0 ]] || { echo "EXPERT_INPUT=$expert_input requires Spark experts" >&2; exit 2; }
+  store_dtype="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("quantization_config", {}).get("store_dtype", "fp8"))' "$root/snapshots/$revision/config.json")"
+  case "$store_dtype" in
+    fp8) expert_geometry=mimo ;;
+    mxfp4) expert_geometry=mimop ;;
+    *) echo "EXPERT_INPUT=$expert_input has no package for store_dtype=$store_dtype" >&2; exit 2 ;;
+  esac
+  printf -v preflight_command '%q ' docker run --rm -i --entrypoint python3 "$spark_image" - "$expert_geometry" "tp$ranks" 4096
+  for ((rank = 0; rank < ranks; rank++)); do
+    host="$(get "SPARK_${rank}_HOST")"
+    if ! ssh "$host" "$preflight_command" < "$repo_root/scripts/launch/preflight-fp8-bf16.py"; then
+      echo "$host cannot serve EXPERT_INPUT=$expert_input; build $expert_geometry:fp8 with CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$expert_geometry (or its WIP equivalent)" >&2
+      exit 2
+    fi
+  done
 fi
 peers=()
 # --restart removes this launcher's containers (stop.sh's release parser rejects
@@ -303,6 +455,13 @@ for ((rank = 0; rank < ranks; rank++)); do
     sleep 2
   done
 done
+# Loading leaves ~10 GiB of checkpoint pages cached per Spark (sparknest passthrough: the
+# workers' own fadvise cannot reach them), and GB10 CUDA allocations do not reclaim page
+# cache: drop it once every rank is resident. CUTEAFD_SPARK_DROP_PAGE_CACHE=0 keeps it.
+if ((ranks > 0 && ${#spark_hosts[@]} > 0)) && [[ "${CUTEAFD_SPARK_DROP_PAGE_CACHE:-1}" != 0 ]] &&
+   command -v nest >/dev/null; then
+  nest drop-caches "${spark_hosts[@]}" >/dev/null || echo "warning: could not drop Spark page caches after loading" >&2
+fi
 peer_csv="$(IFS=,; echo "${peers[*]}")"
 peer_args=()
 [[ -z "$peer_csv" ]] || peer_args=(--peers "$peer_csv")
@@ -319,6 +478,7 @@ case "$intake" in auto|gpu|pinned|host) ;; *) echo "SPARK_INTAKE must be auto, g
 console_text="$(get CONSOLE_TEXT off)"
 case "$console_text" in on|off) ;; *) echo "CONSOLE_TEXT must be on or off" >&2; exit 2 ;; esac
 docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network host --ipc host \
+  --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e "CUTEAFD_SPARK_INTAKE=$intake" \
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" \
   -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" \

@@ -1,5 +1,6 @@
 pub mod families;
 pub mod formats;
+pub mod serving_capacity;
 pub use families::deepseek_v41::engram_pipeline::{EngramPipeline, EngramRequestTokens, EngramWave};
 pub use families::deepseek_v41::engram_gather::{
     EngramGatherer, EngramGatherLease, EngramGatherPoll, EngramGatherTicket, EngramGatherTiming,
@@ -36,6 +37,7 @@ mod snapshot;
 mod tensors;
 mod tokenizer;
 pub mod plan;
+pub mod page_cache;
 
 pub use formats::attention_format::{
     native_deepseek_v4_attention_tensor_specs, validate_native_deepseek_v4_attention_catalog,

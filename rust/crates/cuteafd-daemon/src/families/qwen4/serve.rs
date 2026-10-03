@@ -375,16 +375,17 @@ fn prefix_cache<'e, 'a>(engine: &'e Qwen4Engine<'a>, args: &PrefixArgs, lanes: u
     let budget = args.prefix_cache_mark_mib << 20;
     anyhow::ensure!(args.prefix_partial == Toggle::Off, "Qwen 3.8 Flash Next restores exact snapshots only (GDN state)");
     let family = Qwen4Prefix::new(engine, |mark| if entries == 0 { 0 } else { MarkArena::slots_for(lanes, entries, mark, budget) })?;
-    let host = args.host_tier(engine.library, family.template(), family.mark_bytes())?;
+    let host = args.host_tier(engine.library, family.template(), family.layout(), engine.max_context)?;
+    let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();
     let config = PrefixConfig { entries, mark_slots: family.slots(), keep_logits: true,
         min_tokens: args.prefix_cache_min_tokens };
     let cache = PrefixCache::new(layout, config, host)?;
     tracing::info!(entries, mark_slots = family.slots(), mark_bytes = family.mark_bytes(), page_bytes = layout.page_bytes,
-        pages = layout.pages, page_rows = layout.page_rows, host_bytes = args.host_cache_bytes, points = ?args.points(),
+        pages = layout.pages, page_rows = layout.page_rows, host_bytes, points = ?args.points(),
         "Qwen 3.8 Flash Next prefix cache");
     cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64,
-        &"BF16 full-attention + GDN/PLE state".to_string(), if args.prefix_cache_entries == 0 { 0 } else { args.host_cache_bytes });
+        &"BF16 full-attention + GDN/PLE state".to_string(), host_bytes);
     Ok((family, cache))
 }
 
@@ -431,22 +432,30 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
     let mut calibration = Calibration::default();
     let mut trace = Trace::open()?;
     let mut prefills = decode_share.queue::<Prefill<'_>>()?;
+    let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<NativeRequest>::default();
     loop {
         while active.len() + prefills.len() < max_sequences {
-            let job = if active.is_empty() && prefills.is_empty() {
-                // Idle: publish the state the server waits in (captures and releases done).
-                cache.tick();
-                publish(stats, requests, generated_total, 0, 0, &cache);
-                console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
-                match receive.blocking_recv() {
-                    Some(job) => job,
-                    None => return Ok(()),
-                }
-            } else {
-                match receive.try_recv() {
-                    Ok(job) => job,
-                    Err(_) => break,
-                }
+            let busy = !active.is_empty() || !prefills.is_empty();
+            let job = match kv_waiter.poll(cache.pool().free(), cache.pool().release_epoch(), busy, |job| job.events.is_closed()) {
+                cuteafd_engine::prefix::AdmissionPoll::Blocked => break,
+                cuteafd_engine::prefix::AdmissionPoll::Ready(job) => job,
+                cuteafd_engine::prefix::AdmissionPoll::Empty => {
+                    if !busy {
+                        // Idle: publish the state the server waits in (captures and releases done).
+                        cache.tick();
+                        publish(stats, requests, generated_total, 0, 0, &cache);
+                        console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
+                        match receive.blocking_recv() {
+                            Some(job) => job,
+                            None => return Ok(()),
+                        }
+                    } else {
+                        match receive.try_recv() {
+                            Ok(job) => job,
+                            Err(_) => break,
+                        }
+                    }
+                },
             };
             let reject = |job: &NativeRequest, message: String| {
                 let _ = job.events.send(Err(NativeFailure::BadRequest(message)));
@@ -480,7 +489,12 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
                 Ok(admitted) => admitted,
                 Err(error) => {
                     free_slots.push(slot);
-                    reject(&job, format!("{error:#}"));
+                    // Running requests keep their pages pinned. Delay a request
+                    // that fits alone instead of rejecting transient KV pressure.
+                    match kv_waiter.defer(job, &error, busy, cache.pool().release_epoch()) {
+                        Ok(()) => break,
+                        Err(job) => reject(&job, format!("{error:#}")),
+                    }
                     continue;
                 }
             };
@@ -911,7 +925,7 @@ fn schedule(engine: &Qwen4Engine<'_>, opened: &Opened, snapshot: &std::path::Pat
         }
         cache.tick();
         publish(stats, requests, generated_total, active.len(), prefills.len(), &cache);
-        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len()));
+        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len() + kv_waiter.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
 }

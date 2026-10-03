@@ -40,7 +40,9 @@ pub(crate) struct EngineArgs {
     /// Longest sequence (the RoPE table and page tables).
     #[arg(long, default_value_t = 32768)]
     pub max_context: usize,
-    /// Tokens the shared latent/index cache pool holds across sequences.
+    /// Tokens the shared latent/index cache pool holds across sequences; 0
+    /// sizes it from what every GPU has left after weights and the planner's
+    /// workspace, graph and drafter costs (up to the common 2M-token target).
     #[arg(long, default_value_t = 262_144)]
     pub pool_tokens: usize,
     #[arg(long, default_value_t = 4096)]
@@ -52,13 +54,16 @@ pub(crate) struct EngineArgs {
     /// layers and drafts on the coordinator GPU.
     #[arg(long)]
     pub draft: Option<PathBuf>,
-    /// Sequences the drafter keeps a context for and drafts for at once.
+    /// Maximum members of one draft batch, independent of context slots.
     #[arg(long, default_value_t = 16)]
     pub draft_sequences: usize,
-    /// Draft through E4M3 copies of the drafter's GEMM weights and of the LM
-    /// head (false: BF16; the committed tokens are the same either way).
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    pub draft_fp8: bool,
+    /// Context slots (default max(20, draft_sequences)); target head is shared.
+    #[arg(long)]
+    pub draft_context_slots: Option<usize>,
+    /// Explicit calibration-free E4M3 quantization of own drafter GEMMs.
+    /// Unset/true: E4M3 single copy (measured faster); false keeps checkpoint BF16.
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub draft_fp8: Option<bool>,
     /// Scale rule of the FP8 copies made from BF16 weights at load: amax /
     /// 448, the smallest power of two >= it (pow2), or per block whichever of
     /// the two leaves the smaller error (best).
@@ -83,6 +88,40 @@ pub(crate) struct EngineArgs {
     pub prefill_w8a16: bool,
     #[command(flatten)]
     pub token_io: crate::shared::token_io::TokenIoArgs,
+}
+
+#[cfg(test)]
+mod draft_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Parse {
+        #[command(flatten)]
+        engine: EngineArgs,
+    }
+
+    #[test]
+    fn drafter_defaults_are_checkpoint_bf16_with_independent_capacities() {
+        let parsed = Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native"])
+            .unwrap().engine;
+        assert_eq!(parsed.draft_fp8, None);
+        assert_eq!(parsed.draft_sequences, 16);
+        assert_eq!(parsed.draft_context_slots.unwrap_or(20.max(parsed.draft_sequences)), 20);
+    }
+
+    #[test]
+    fn explicit_fp8_option_and_context_batch_limits_are_forwarded() {
+        for (value, expected) in [("true", true), ("false", false)] {
+            let parsed = Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+                "--draft-fp8", value, "--draft-context-slots", "20", "--draft-sequences", "16"])
+                .unwrap().engine;
+            assert_eq!(parsed.draft_fp8, Some(expected));
+            assert_eq!((parsed.draft_context_slots, parsed.draft_sequences), (Some(20), 16));
+        }
+        assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--draft-fp8", "auto"]).is_err());
+    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -195,6 +234,11 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     cuteafd_core::set_expert_geometry(catalog.routed_experts().geometry()?)
         .map_err(|g| anyhow::anyhow!("geometry already {g:?}"))?;
     let cfg = GlmDsaConfig::read(&args.snapshot)?;
+    if let Some(snapshot) = &args.draft {
+        dflash::check_snapshot_target_bf16_head(&args.snapshot,
+            cfg.hidden, cfg.vocab_size, false)?;
+        dflash::check_checkpoint(snapshot, args.draft_fp8, args.draft_context_slots, args.draft_sequences)?;
+    }
     let library = unsafe { NativeLibrary::load(&args.native_lib) }?;
     library.cuda_set_device(args.device)?;
     Ok(Opened { snapshot: args.snapshot.clone(), catalog, cfg, library })
@@ -207,6 +251,7 @@ impl Opened {
         body: impl FnOnce(&engine::GlmEngine<'_>, Option<&mut SparkLink<'_>>, &tokio::runtime::Runtime) -> Result<T>)
         -> Result<T> {
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
+        programs.capacities().require_context("glm5", args.max_context)?;
         programs.load_all()?;
         let stream = self.library.cuda_stream_create()?;
         // The head split's second GPU and its stream (load kernels, then the engine's).
@@ -237,14 +282,22 @@ impl Opened {
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
                 .collect() };
         let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
-            args.token_io.embed_placement, || loader.model(&self.cfg, layers))?;
+            args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers) })?;
         let bytes: usize = model.layers.iter().map(|l| l.bytes()).sum::<usize>() + model.norm.buffer.bytes
             + model.head.buffer.bytes;
         let peer_bytes: usize = shares.iter().flatten().map(|l| l.bytes()).sum();
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64,
             gib = format!("{:.2}", bytes as f64 / (1u64 << 30) as f64),
             split_gib = format!("{:.2}", peer_bytes as f64 / (1u64 << 30) as f64), "GLM coordinator weights resident");
-        let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
+        let pool_tokens = if args.pool_tokens == 0 {
+            // The planner's GLM costs stay free on each GPU; records fill the rest.
+            let devices: Vec<i32> = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d)).collect();
+            crate::shared::memory_report::planned_pool_tokens(&self.library, &args.snapshot, &devices,
+                args.draft.as_deref(), args.prefill_rows, 0)?
+        } else {
+            args.pool_tokens
+        };
+        let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages, embedding)?;
         engine.full_prefill_logits = args.full_prefill_logits;
@@ -263,11 +316,11 @@ impl Opened {
             let mask = engine.embedding.host_rows(&[cfg.mask_token])?;
             let file = draft_file.context("drafter prefetch")?.join()
                 .map_err(|_| anyhow::anyhow!("drafter prefetch panicked"))??;
-            let mut drafter = dflash::GlmDrafter::load(&self.library, snapshot, file, stream, args.draft_sequences,
-                args.draft_sequences, mask, false)?;
-            if args.draft_fp8 {
-                drafter.enable_fp8(engine.weights.head.buffer.ptr, args.fp8_scales)?;
-            }
+            let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation
+                ::from_fp8_option(args.draft_fp8);
+            let drafter = dflash::GlmDrafter::load(&self.library, snapshot, file, stream,
+                args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
+                mask, false, representation, args.fp8_scales)?;
             engine.drafter = Some(drafter);
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash2 drafter resident");
         }
@@ -281,6 +334,7 @@ impl Opened {
         let config = cuteafd_transport::TcpTransportConfig { timing: false,
             timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 };
         let row_bytes = self.cfg.hidden * 2;
+        crate::shared::memory_report::release_load_staging(&self.library);
         let mut transport = args.peers.as_deref().map(|peers| -> Result<SparkLink<'_>> {
             let (peers, executors) = ranks(peers)?;
             SparkLink::new(&self.library, &peers, &executors, 4096, config.clone(), row_bytes)
@@ -339,6 +393,12 @@ impl Opened {
             if engine.ranks() > 1 {
                 engine.attach_peer_l2(budget)?;
             }
+        }
+        // Every decode graph shape serving replays, captured now (CUTEAFD_GLM_WARM_GRAPHS=0 skips it).
+        if engine.weights.layers.len() == self.cfg.layers
+            && std::env::var("CUTEAFD_GLM_WARM_GRAPHS").map_or(true, |v| v != "0")
+            && (transport.is_some() || args.skip_routed_experts) {
+            engine.warm_decode_graphs(transport.as_mut().map(|t| (t, &runtime)))?;
         }
         let result = body(&engine, transport.as_mut(), &runtime);
         drop(engine);
@@ -531,10 +591,11 @@ fn bench_verify(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
         drafter.update(&(0..n).map(|r| dflash::ContextRow { tap_row: r, slot: 0, position: start - n + r })
             .collect::<Vec<_>>())?;
         println!("drafter step (anchors at position {start}, median of 7):");
-        let mut counts: Vec<usize> = (0..).map(|i| 1usize << i).take_while(|&s| s < drafter.slots)
-            .chain([drafter.slots]).collect();
+        let max_batch = dflash::ReplayDrafter::sequences(drafter);
+        let mut counts: Vec<usize> = (0..).map(|i| 1usize << i).take_while(|&s| s < max_batch)
+            .chain([max_batch]).collect();
         if !args.bench_sequences.is_empty() {
-            ensure!(args.bench_sequences.iter().all(|&s| s >= 1 && s <= drafter.slots), "--bench-sequences past the slots");
+            ensure!(args.bench_sequences.iter().all(|&s| s >= 1 && s <= max_batch), "--bench-sequences past the draft batch capacity");
             counts = args.bench_sequences.clone();
         }
         for sequences in counts {
@@ -543,7 +604,8 @@ fn bench_verify(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
             let mut times = Vec::new();
             for round in 0..9 {
                 let started = Instant::now();
-                let drafts = drafter.draft_device(&seqs, &engine.embedding, engine.weights.head.buffer.ptr)?;
+                let drafts = drafter.draft_device(&seqs, &engine.embedding,
+                    dflash::TargetHead::Bf16(&engine.weights.head))?;
                 if round >= 2 {
                     times.push(started.elapsed().as_secs_f64() * 1e3);
                 }
@@ -774,7 +836,7 @@ fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
         let anchor = sequence[position];
         let timer = Instant::now();
         let draft = drafter.draft_device(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
-            &engine.embedding, engine.weights.head.buffer.ptr)?;
+            &engine.embedding, dflash::TargetHead::Bf16(&engine.weights.head))?;
         draft_seconds += timer.elapsed().as_secs_f64();
         drafts.push((position, draft.into_iter().next().context("draft")?));
         let logits = engine.verify(&mut [(&mut placement, 1)], &[anchor], transport.as_deref_mut().map(|t| (t, runtime)),
@@ -845,12 +907,15 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
             drafter.put_taps(&taps)?;
             drafter.update(&(0..n).map(|r| dflash::ContextRow { tap_row: r, slot: 0, position: done + r })
                 .collect::<Vec<_>>())?;
+            // SAFETY: the oracle owns the stream; a following chunk reuses
+            // the taps and context metadata read by this update.
+            unsafe { engine.library.cuda_stream_synchronize(engine.stream)? };
             done += n;
         }
         let anchor = tokens[position];
         let timer = Instant::now();
         let draft = drafter.draft_device(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
-            &engine.embedding, engine.weights.head.buffer.ptr)?.remove(0);
+            &engine.embedding, dflash::TargetHead::Bf16(&engine.weights.head))?.remove(0);
         draft_seconds += timer.elapsed().as_secs_f64();
         let reference = &ref_tokens[index * drafts_per..][..drafts_per];
         exact += usize::from(draft.tokens == reference);

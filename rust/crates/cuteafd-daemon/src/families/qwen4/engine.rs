@@ -18,10 +18,11 @@
 //!
 //! MoE: FP32 router logits, the native softmax top-10 (logits and weights
 //! rounded to BF16 as the reference), the shared expert with its sigmoid
-//! gate, and routed experts on this GPU (FP8 or EXL3 packages, a window of
-//! resident layers) or on the Sparks.
-use super::weights::{Qwen4Layer, Qwen4Weights};
+//! gate, and routed experts on this GPU (FP8/NVFP4 packages fully resident
+//! by default, EXL3 packages with their admitted resident window) or on the Sparks.
+use super::weights::{Qwen4Head, Qwen4Layer, Qwen4Weights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
+use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use crate::shared::token_io::{DeviceLogits, EmbedPlacement, TokenEmbedding};
 use anyhow::{ensure, Context, Result};
@@ -59,8 +60,14 @@ pub(crate) const UNIT_PAGES: usize = BLOCK;
 pub(crate) const UNIT_ROWS: usize = POOL_PAGE_TOKENS;
 /// Rows of the PLE conv state ((taps - 1) x dilation).
 const PLE_STATE_ROWS: usize = 9;
-/// Most rows the E4M3 draft head (`qwen4_head_fp8`) takes.
-const FP8_HEAD_ROWS: usize = 16;
+/// Most rows one launch of the E4M3 head (`qwen4_head_fp8`) takes; wider
+/// logits calls run it in spans of this many rows.
+pub(crate) const FP8_HEAD_ROWS: usize = 16;
+
+/// `(first row, rows)` spans of at most [`FP8_HEAD_ROWS`] covering `rows` logits rows.
+pub(crate) fn fp8_head_spans(rows: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..rows).step_by(FP8_HEAD_ROWS).map(move |first| (first, FP8_HEAD_ROWS.min(rows - first)))
+}
 /// Rows a speculative step records per GDN layer (the fork's `REPLAY_ROWS`).
 pub(crate) const REPLAY_ROWS: usize = 64;
 /// Target rows a sequence may hold for its MTP canonical history before the
@@ -75,13 +82,13 @@ fn gdn_replay_bytes(cfg: &Qwen4Config) -> usize {
     bytes.div_ceil(1024) * 1024
 }
 
-/// Routed experts on this GPU from the TP1 FP8 package: a window of resident
-/// layers, reloaded when a step reaches a layer outside it.
+/// Routed experts on this GPU from the TP1 package. All layers stay resident
+/// unless an explicit diagnostic paging window was requested.
 pub(crate) struct LocalExperts<'a> {
     pub library: &'a NativeLibrary,
     pub tensors: &'a Fp8ExpertTensors,
     pub experts: RefCell<Fp8Experts<'a>>,
-    pub window: usize,
+    pub window: Option<usize>,
     pub loads: RefCell<usize>,
 }
 
@@ -91,7 +98,8 @@ impl LocalExperts<'_> {
         if let Ok(index) = experts.index_of(layer) {
             return Ok(index);
         }
-        if experts.layers.len() >= self.window {
+        let window = self.window.context("local expert layer missing from the admitted resident set")?;
+        if experts.layers.len() >= window {
             experts.layers.remove(0);
         }
         let started = std::time::Instant::now();
@@ -243,6 +251,20 @@ fn ngram_history(eos: u32, ngram_size: usize, tokens: &[u32]) -> NgramHistory {
 #[cfg(test)]
 mod tests {
     use cuteafd_loader::families::qwen4::NgramHasher;
+
+    #[test]
+    fn fp8_head_spans_cover_every_logits_row_once() {
+        for rows in 1..=4096 {
+            let mut next = 0;
+            for (first, n) in super::fp8_head_spans(rows) {
+                assert_eq!(first, next);
+                assert!((1..=super::FP8_HEAD_ROWS).contains(&n));
+                next += n;
+            }
+            assert_eq!(next, rows);
+        }
+        assert_eq!(super::fp8_head_spans(0).count(), 0);
+    }
 
     #[test]
     fn history_after_tokens_is_what_the_hash_leaves() {
@@ -412,6 +434,7 @@ pub(crate) enum MtpSource {
 }
 
 pub(crate) struct Qwen4Engine<'a> {
+    quantize_grid: Fp8QuantizeGrid,
     pub library: &'a NativeLibrary,
     pub programs: &'a Programs<'a>,
     pub cfg: Qwen4Config,
@@ -463,6 +486,9 @@ pub(crate) struct Qwen4Engine<'a> {
     pub profile: RefCell<[f64; 2]>,
     graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
     use_graphs: bool,
+    /// Prefill programs over FP8-only projections quantize their activations
+    /// (W8A8, `fp8_rows` 1) instead of W8A16 (`--fp8-prefill-w8a8`).
+    pub w8a8_prefill: bool,
     /// Recorded after a Spark exchange's device-to-host copies: the host
     /// waits on it while the shared expert runs behind it.
     routes_ready: *mut c_void,
@@ -508,6 +534,8 @@ impl<'a> Qwen4Engine<'a> {
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: Qwen4Config, weights: Qwen4Weights<'a>,
         ple: Option<super::ple::PleTable<'a>>, stream: *mut c_void, max_context: usize, prefill_rows: usize,
         pages: usize, slots: usize, embedding: TokenEmbedding<'a>) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
+        let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         cfg.check_programs()?;
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
@@ -557,14 +585,14 @@ impl<'a> Qwen4Engine<'a> {
             (None, None)
         };
         let pool_logical = zeroed(pool_pages * 4)?;
-        Ok(Self { library, programs, cfg, weights, ple, stream, max_context, prefill_rows, pages, slots, kv, gdn_ord,
+        Ok(Self { quantize_grid, library, programs, cfg, weights, ple, stream, max_context, prefill_rows, pages, slots, kv, gdn_ord,
             gdn_conv, gdn_state, gdn_replay, gdn_layers, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
             commit_tables: zeroed(3 * DECODE_ROWS * 4)?, mtp_kv, mtp_pending,
             last_streams: std::cell::Cell::new((false, 0)), mtp_streams: std::cell::Cell::new((false, 0)), pool_logical,
             pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages, workspace: RefCell::new(None),
             decode_workspace: RefCell::new(None), experts: None, profile: RefCell::new([0.0; 2]),
             graphs: RefCell::new(std::collections::HashMap::new()),
-            use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0"),
+            use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0"), w8a8_prefill: false,
             routes_ready: library.cuda_event_create_ordering()?, l2: None, embedding,
             mtp_drafts: zeroed(MTP_DEFERRED_STEPS * DECODE_ROWS * 4)? })
     }
@@ -573,13 +601,17 @@ impl<'a> Qwen4Engine<'a> {
         self.experts = Some(experts);
     }
 
+    pub fn captured_graphs(&self) -> usize {
+        self.graphs.borrow().len()
+    }
+
     pub fn experts(&self) -> Option<&Experts<'a>> {
         self.experts.as_ref()
     }
 
     /// Per MoE layer, the weights a decode step reads after its routed
     /// experts, in read order: the next layer's attention site, attention
-    /// (the E4M3 copies where the decode programs read them), MLP site,
+    /// (the E4M3 weights and scales of FP8-only projections), MLP site,
     /// router and shared expert; after the last layer the mixer and LM head.
     pub fn decode_read_order(&self) -> Vec<Vec<crate::shared::l2_prefetch::Range>> {
         let layers = &self.weights.layers;
@@ -594,7 +626,7 @@ impl<'a> Qwen4Engine<'a> {
                     .copied().collect();
                 crate::shared::l2_prefetch::operands(&names, |n| next.range(n))
             }
-            None => self.weights.mixer.iter().chain([&self.weights.head])
+            None => self.weights.mixer.iter().chain(self.weights.head.allocations())
                 .map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes)).collect(),
         }).collect()
     }
@@ -730,13 +762,15 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     fn workspace(&self, t: usize, decode: bool, logit_rows: usize) -> Result<Workspace<'a>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let h = self.cfg.hidden;
         let cap = if decode { "m64" } else { "m4096" };
         let ple = if self.ple.as_ref().is_some_and(|p| p.fp8) { "qwen4_ple_fp8" } else { "qwen4_ple_bf16" };
         let mut scratch = 0;
         for name in ["qwen4_hc_pre".to_string(), "qwen4_hc_post_pre".into(), "qwen4_head".into(),
             "qwen4_shared".into(), ple.into(), "qwen4_mtp_feedback".into(), format!("qwen4_gdn_{cap}"),
-            format!("qwen4_attn_producer_{cap}"),
+            format!("qwen4_attn_producer_{cap}"), format!("qwen4_gdn_w8_{cap}"),
+            format!("qwen4_attn_producer_w8_{cap}"), format!("qwen4_attn_o_w8_{cap}"),
             format!("qwen4_sparse_gqa_{cap}"), format!("qwen4_attn_o_{cap}")] {
             if let Ok(bytes) = self.scratch(&name) {
                 scratch = usize::max(scratch, bytes);
@@ -1241,16 +1275,8 @@ impl<'a> Qwen4Engine<'a> {
         }
         let n = heads.len();
         ensure!(n <= DECODE_ROWS, "{n} MTP head rows");
-        match &mtp.head_fp8 {
-            Some((q, scale)) if n <= FP8_HEAD_ROWS => self.run("qwen4_head_fp8", &[("x", w.delta.buffer.ptr),
-                ("w_fp8", q.buffer.ptr), ("scale", scale.buffer.ptr), ("logits", w.logits.buffer.ptr)],
-                &[Scalar::I32(n as i32)])?,
-            // SAFETY: the gathered rows, the shared head and the logits are live buffers of these shapes.
-            _ => unsafe {
-                w.head.launch(w.delta.buffer.ptr.cast(), self.weights.head.buffer.ptr.cast(),
-                    w.logits.buffer.ptr.cast(), n as u32, self.stream)?;
-            },
-        }
+        // The target's head (one representation shared with the drafts).
+        self.logits(w, w.delta.buffer.ptr, n)?;
         // SAFETY: the logits and the argmax outputs are live buffers of these shapes.
         unsafe {
             self.library.cuda_logits_argmax_checked_f32_async(
@@ -1401,10 +1427,35 @@ impl<'a> Qwen4Engine<'a> {
         self.run("qwen4_head", &[("streams", streams.buffer.ptr), ("norm", norm.buffer.ptr),
             ("w_down", down.buffer.ptr), ("w_up", up.buffer.ptr), ("out", w.x.buffer.ptr),
             ("scratch", w.scratch.buffer.ptr)], &[rows])?;
-        // SAFETY: the head's input and operands are live buffers of these shapes.
-        unsafe {
-            w.head.launch(w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2).cast(),
-                self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), logit_rows as u32, self.stream)
+        ensure!(logit_rows <= t, "{logit_rows} logits rows of a {t}-row step");
+        // SAFETY: row t - logit_rows of the [t, H] mixer output lies inside `x`.
+        let x = unsafe { w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2) }.cast();
+        self.logits(w, x, logit_rows)
+    }
+
+    /// FP32 logits of `rows` BF16 head inputs at `x` (rows of `[*, H]`) into the
+    /// workspace's logits rows, through the one resident LM head: the BF16 head
+    /// GEMM, or the E4M3 `qwen4_head_fp8` in spans of 16 rows.
+    fn logits(&self, w: &Workspace<'_>, x: *mut c_void, rows: usize) -> Result<()> {
+        let (h, vocab) = (self.cfg.hidden, self.cfg.vocab_size);
+        ensure!(rows <= w.logit_rows, "{rows} logits rows exceed the workspace's {}", w.logit_rows);
+        if rows == 0 {
+            return Ok(());
+        }
+        match &self.weights.head {
+            // SAFETY: `x` holds `rows` head inputs; the head and the logits rows are live buffers of these shapes.
+            Qwen4Head::Bf16(head) => unsafe {
+                w.head.launch(x.cast(), head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), rows as u32, self.stream)
+            },
+            Qwen4Head::Fp8 { values, scales } => {
+                for (first, n) in fp8_head_spans(rows) {
+                    let input = x.cast::<u8>().wrapping_add(first * h * 2).cast();
+                    let out = Self::region(&w.logits, first * vocab * 4, n * vocab * 4).ptr;
+                    self.run("qwen4_head_fp8", &[("x", input), ("w_fp8", values.buffer.ptr),
+                        ("scale", scales.buffer.ptr), ("logits", out)], &[Scalar::I32(n as i32)])?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1520,12 +1571,13 @@ impl<'a> Qwen4Engine<'a> {
         unsafe { self.library.cuda_graph_begin_capture(self.stream)? };
         let captured = segment();
         // SAFETY: ends the capture begun above on the same stream.
-        let exec = unsafe { self.library.cuda_graph_end_capture(self.stream) };
+        let exec = unsafe { self.library.cuda_graph_end_capture(self.stream) }
+            .map(|exec| GraphExec(exec, self.library));
         captured?;
         let exec = exec?;
         // SAFETY: the new graph reads and writes persistent engine buffers.
-        unsafe { self.library.cuda_graph_launch(exec, self.stream)? };
-        self.graphs.borrow_mut().insert(key, GraphExec(exec, self.library));
+        unsafe { self.library.cuda_graph_launch(exec.0, self.stream)? };
+        self.graphs.borrow_mut().insert(key, exec);
         Ok(())
     }
 
@@ -1604,25 +1656,46 @@ impl<'a> Qwen4Engine<'a> {
             ("replay", replay.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows, Scalar::I32(i32::from(spec))])
     }
 
-    /// Decode-shaped steps use the E4M3 programs when the layer carries E4M3 copies.
-    fn fp8(&self, layer: &Qwen4Layer<'_>, cap: &str) -> bool {
-        cap == "m64" && layer.has("w_in_fp8")
+    /// Layers whose projections are held FP8-only (`--fp8-decode`) take the
+    /// `_w8` programs in every step shape; the prefill programs then add the
+    /// W8A8 switch (`fp8_rows`).
+    fn w8(layer: &Qwen4Layer<'_>) -> bool {
+        layer.has("w_in_fp8")
+    }
+
+    /// The step scalars of a program over `layer`'s projections: `rows`,
+    /// plus `fp8_rows` for FP8-only prefill programs.
+    fn w8_scalars(&self, layer: &Qwen4Layer<'_>, rows: Scalar, cap: &str) -> Vec<Scalar> {
+        let mut scalars = vec![rows];
+        if Self::w8(layer) && cap != "m64" {
+            scalars.push(Scalar::I32(i32::from(self.w8a8_prefill)));
+        }
+        scalars
+    }
+
+    /// `name`'s BF16 operand, or with FP8-only projections its E4M3 values and scales.
+    fn projection(layer: &Qwen4Layer<'_>, name: &'static str) -> Result<Vec<(&'static str, *mut c_void)>> {
+        if Self::w8(layer) {
+            let (q, s) = cuteafd_loader::families::qwen4::resident::fp8_operands(name).context("projection")?;
+            Ok(vec![(q, layer.ptr(q)?), (s, layer.ptr(s)?)])
+        } else {
+            Ok(vec![(name, layer.ptr(name)?)])
+        }
+    }
+
+    fn program(layer: &Qwen4Layer<'_>, stem: &str, cap: &str) -> String {
+        if Self::w8(layer) { format!("qwen4_{stem}_w8_{cap}") } else { format!("qwen4_{stem}_{cap}") }
     }
 
     fn gdn(&self, w: &Workspace<'_>, index: usize, layer: &Qwen4Layer<'_>, rows: Scalar, cap: &str, spec: bool)
         -> Result<()> {
         let ord = self.gdn_ord[index].context("GDN layer without a state pool")?;
         let [conv, state, replay] = self.gdn_pools(ord)?;
-        let mut pointers = vec![("x", w.x.buffer.ptr), ("w_in", layer.ptr("w_in")?)];
-        let fp8 = self.fp8(layer, cap);
-        if fp8 {
-            pointers.extend([("w_in_fp8", layer.ptr("w_in_fp8")?), ("w_in_scale", layer.ptr("w_in_scale")?)]);
-        }
+        let mut pointers = vec![("x", w.x.buffer.ptr)];
+        pointers.extend(Self::projection(layer, "w_in")?);
         pointers.extend([("conv_w", layer.ptr("conv_w")?), ("a_log", layer.ptr("a_log")?),
-            ("dt_bias", layer.ptr("dt_bias")?), ("norm_w", layer.ptr("norm_w")?), ("w_out", layer.ptr("w_out")?)]);
-        if fp8 {
-            pointers.extend([("w_out_fp8", layer.ptr("w_out_fp8")?), ("w_out_scale", layer.ptr("w_out_scale")?)]);
-        }
+            ("dt_bias", layer.ptr("dt_bias")?), ("norm_w", layer.ptr("norm_w")?)]);
+        pointers.extend(Self::projection(layer, "w_out")?);
         pointers.extend([("conv_state", conv), ("state", state), ("slots", w.slots.buffer.ptr),
             ("seq_first", w.seq_first.buffer.ptr), ("out", w.delta.buffer.ptr)]);
         // Decode capacities record speculative replay inputs (spec) or advance the state.
@@ -1631,12 +1704,12 @@ impl<'a> Qwen4Engine<'a> {
             pointers.push(("replay", replay));
         }
         pointers.push(("scratch", w.scratch.buffer.ptr));
-        let name = if fp8 { format!("qwen4_gdn_fp8_{cap}") } else { format!("qwen4_gdn_{cap}") };
+        let name = Self::program(layer, "gdn", cap);
         if decode {
             self.run(&name, &pointers, &[rows, Scalar::I32(i32::from(spec))])
         } else {
             ensure!(!spec, "speculative steps take the decode programs");
-            self.run(&name, &pointers, &[rows])
+            self.run(&name, &pointers, &self.w8_scalars(layer, rows, cap))
         }
     }
 
@@ -1652,19 +1725,15 @@ impl<'a> Qwen4Engine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn attend(&self, w: &Workspace<'_>, layer: &Qwen4Layer<'_>, cache: *mut c_void, keys: *mut c_void,
         blocks: *mut c_void, rows: Scalar, cap: &str, tables: &StepTables) -> Result<()> {
-        let fp8 = self.fp8(layer, cap);
-        let mut pointers = vec![("x", w.x.buffer.ptr), ("w_in", layer.ptr("w_in")?)];
-        if fp8 {
-            pointers.extend([("w_in_fp8", layer.ptr("w_in_fp8")?), ("w_in_scale", layer.ptr("w_in_scale")?)]);
-        }
+        let mut pointers = vec![("x", w.x.buffer.ptr)];
+        pointers.extend(Self::projection(layer, "w_in")?);
         pointers.extend([("q_norm", layer.ptr("q_norm")?), ("k_norm", layer.ptr("k_norm")?),
             ("iq_norm", layer.ptr("iq_norm")?), ("ik_norm", layer.ptr("ik_norm")?),
             ("positions", w.positions.buffer.ptr), ("kv_slots", w.kv_slots.buffer.ptr),
             ("pool_slots", w.pool_slots.buffer.ptr), ("kv_cache", cache), ("token_keys", keys),
             ("index_cache", blocks), ("query", w.query.buffer.ptr), ("gate", w.gate.buffer.ptr),
             ("index_q", w.index_q.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
-        let name = if fp8 { format!("qwen4_attn_producer_fp8_{cap}") } else { format!("qwen4_attn_producer_{cap}") };
-        self.run(&name, &pointers, &[rows])?;
+        self.run(&Self::program(layer, "attn_producer", cap), &pointers, &self.w8_scalars(layer, rows, cap))?;
         if tables.long {
             self.run(&format!("qwen4_index_topk_{cap}"), &[("index_q", w.index_q.buffer.ptr),
                 ("positions", w.positions.buffer.ptr), ("index_cache", blocks),
@@ -1677,13 +1746,10 @@ impl<'a> Qwen4Engine<'a> {
             ("positions", w.positions.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
             ("indices", w.indices.buffer.ptr), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
             &[rows, Scalar::I32(tables.page_width as i32), Scalar::I32(tables.page_stride as i32)])?;
-        let mut pointers = vec![("attn", w.attn.buffer.ptr), ("gate", w.gate.buffer.ptr), ("w_o", layer.ptr("w_o")?)];
-        if fp8 {
-            pointers.extend([("w_o_fp8", layer.ptr("w_o_fp8")?), ("w_o_scale", layer.ptr("w_o_scale")?)]);
-        }
+        let mut pointers = vec![("attn", w.attn.buffer.ptr), ("gate", w.gate.buffer.ptr)];
+        pointers.extend(Self::projection(layer, "w_o")?);
         pointers.extend([("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
-        let name = if fp8 { format!("qwen4_attn_o_fp8_{cap}") } else { format!("qwen4_attn_o_{cap}") };
-        self.run(&name, &pointers, &[rows])
+        self.run(&Self::program(layer, "attn_o", cap), &pointers, &self.w8_scalars(layer, rows, cap))
     }
 
     /// Router, shared expert and routed experts; leaves `bf16(routed + shared)` in `delta`.
@@ -1712,7 +1778,7 @@ impl<'a> Qwen4Engine<'a> {
             self.shared(w, layer, rows)?;
         }
         if matches!(experts, Experts::LocalExl3(_) | Experts::Spark { .. }) {
-            let grid = (t * h.div_ceil(256)).div_ceil(8).clamp(1, 4 * 188);
+            let grid = self.quantize_grid.blocks(t, h);
             self.run("qwen4_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
                 // SAFETY: the scale rows follow the payload inside each wire row.
                 ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
@@ -1743,9 +1809,11 @@ impl<'a> Qwen4Engine<'a> {
                     fp8.run(resident, t, w.x.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
                         w.routed.buffer.ptr, self.stream)?;
                 }
-                // The window may drop this layer before the stream drains.
-                // SAFETY: the engine owns this stream.
-                unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+                if local.window.is_some() {
+                    // Diagnostic paging may drop this layer before the stream drains.
+                    // SAFETY: the engine owns this stream.
+                    unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+                }
             }
             Experts::LocalExl3(local) => {
                 self.exchange_window(index, decode, true)?;
@@ -1846,7 +1914,11 @@ impl<'a> Qwen4Engine<'a> {
 
 impl Drop for Qwen4Engine<'_> {
     fn drop(&mut self) {
-        // SAFETY: the engine's stream is drained by its owner before the engine drops.
-        let _ = unsafe { self.library.cuda_event_destroy(self.routes_ready) };
+        // SAFETY: the engine owns this stream and its resident weights. Drain
+        // queued work, including a failed step, before their storage drops.
+        unsafe {
+            let _ = self.library.cuda_stream_synchronize(self.stream);
+            let _ = self.library.cuda_event_destroy(self.routes_ready);
+        }
     }
 }

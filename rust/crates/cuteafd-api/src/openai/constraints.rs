@@ -122,7 +122,12 @@ mod tests {
             let request = Request::post("/v1/chat/completions").header("content-type","application/json")
                 .body(Body::from(body.to_string())).unwrap();
             let response = router(send).oneshot(request).await.unwrap();
-            if streaming { assert!(to_bytes(response.into_body(), 1<<20).await.is_err()); }
+            if streaming {
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = to_bytes(response.into_body(), 1<<20).await.unwrap();
+                let error = crate::openai::tests::terminal_sse_error(&bytes);
+                assert!(error["error"]["message"].as_str().unwrap().contains("does not satisfy"));
+            }
             else { assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR); }
             worker.await.unwrap();
         }

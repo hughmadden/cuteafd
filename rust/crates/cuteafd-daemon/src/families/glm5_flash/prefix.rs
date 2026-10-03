@@ -48,6 +48,7 @@ pub(crate) struct GlmfPrefix<'e, 'a> {
 impl<'e, 'a> GlmfPrefix<'e, 'a> {
     /// The family over `engine`'s buffers with a device arena of `slots(mark_bytes)` marks.
     pub fn new(engine: &'e GlmfEngine<'a>, slots: impl FnOnce(usize) -> usize) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix");
         let paged = engine.paged_buffers();
         for [records, keys, pools] in &paged {
             ensure!(records.bytes >= engine.pages * PAGE_ROWS * RECORD_BYTES && keys.bytes >= engine.pages * PAGE_ROWS * KEY_BYTES
@@ -239,7 +240,7 @@ fn download(engine: &GlmfEngine<'_>, range: CuteafdDeviceBuffer) -> Result<Vec<u
 
 /// Every paged byte of `placement`'s first `len` rows (records and token keys of each row,
 /// pool keys and scales of each complete pool), MLA layer by layer, in position order.
-fn paged_rows(family: &GlmfPrefix<'_, '_>, placement: &GlmfPlacement, len: usize) -> Result<Vec<u8>> {
+pub(super) fn paged_rows(family: &GlmfPrefix<'_, '_>, placement: &GlmfPlacement, len: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let pools = len / KPOOL;
     for (u, &unit) in placement.units.iter().enumerate().take(len.div_ceil(UNIT_ROWS)) {

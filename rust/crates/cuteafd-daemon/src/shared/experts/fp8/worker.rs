@@ -34,6 +34,7 @@ impl<'a> Fp8Worker<'a> {
     }
 
     pub(crate) fn new(library: &'a NativeLibrary, experts: Rc<Fp8Experts<'a>>, capacity: u32) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/workspace");
         let geometry = cuteafd_core::expert_geometry();
         let (hidden, topk, capacity) = (geometry.hidden as usize, geometry.topk as usize, capacity as usize);
         ensure!(!experts.layers.is_empty(), "FP8 worker has no layers");
