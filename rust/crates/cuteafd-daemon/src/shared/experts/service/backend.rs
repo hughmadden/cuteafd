@@ -101,9 +101,9 @@ impl<'w, 'a> Execution<'w, 'a> {
                 execution.execute_mapped_request(request, executor_id, exchange, slot, hidden)
             }
             Self::Exl3(execution) => {
-                execution.execute_mapped_request(request, executor_id, exchange, slot)
+                execution.execute_mapped_request(request, executor_id, exchange, slot, hidden)
             }
-            Self::Fp8(execution) => execution.execute_mapped_request(request, executor_id, exchange, slot),
+            Self::Fp8(execution) => execution.execute_mapped_request(request, executor_id, exchange, slot, hidden),
         }
     }
     pub(super) fn execute_host_chunks<F>(
