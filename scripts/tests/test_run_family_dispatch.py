@@ -332,14 +332,14 @@ SPLIT_CONFIGS = {
 
 @pytest.mark.parametrize("checkpoint", ["qwen4", "glm5_flash"])
 @pytest.mark.parametrize("keys", ["RTX_GPUS=2\n", "COORDINATOR_GPUS=0,1\n", "COORDINATOR_SPLIT=heads\n"])
-def test_explicit_split_rejects_missing_checkpoint_kernels_before_launch(
+def test_explicit_split_without_kernels_serves_from_the_first_gpu(
         tmp_path: Path, checkpoint: str, keys: str) -> None:
     model = "zai-org/GLM-5.3-Flash" if checkpoint == "glm5_flash" else "test/model"
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS[checkpoint], model, keys)
-    assert result.returncode == 2, result.stderr
-    assert "two-GPU head split is unsupported" in result.stderr
-    assert "kernels" in result.stderr and "COORDINATOR_SPLIT=off" in result.stderr
-    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+    assert result.returncode == 0, result.stderr
+    assert "has no head split yet" in result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
+    assert "device=0" in launch and "--split-device" not in launch
 
 
 @pytest.mark.parametrize("checkpoint", ["qwen4", "glm5_flash"])
