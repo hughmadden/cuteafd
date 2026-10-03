@@ -289,7 +289,9 @@ impl Active<'_> {
         self.digest = digest(self.digest, token);
         self.generated += 1;
         self.buffered += 1;
-        let stop = self.job.stop_token_ids.contains(&token);
+        // A grammar that accepted one of its stop tokens has ended the request.
+        let stop = self.job.stop_token_ids.contains(&token)
+            || self.constraint.as_ref().is_some_and(|state| state.terminated());
         if !stop {
             if let Some(content) = self.decoder.step(token)? {
                 self.send(InferenceChunk::Text { content, content_tokens: self.buffered })?;
@@ -645,6 +647,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         }
                     }
                 };
+                let job_events = p.job.events.clone();
                 let admitted = (|| -> Result<Active<'_>> {
                     let mut request = Active {
                         id: p.id,
@@ -679,10 +682,13 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         let emitted = request.emit(token);
                         request.ticket.first(token);
                         retain_prompt(&mut cache, &request.placement);
-                        match emitted {
+                        match &emitted {
                             Ok(false) => active.push(request),
                             // Finished at its first token: its turn is its prompt snapshot.
                             Ok(true) | Err(_) => {
+                                if let Err(error) = &emitted {
+                                    let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                                }
                                 request.ticket.done(request.generated);
                                 release(&family, &mut cache, &mut free_slots, &request.placement, request.slot)
                             }
@@ -690,6 +696,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     }
                     Err(error) => {
                         tracing::warn!("admission failed: {error:#}");
+                        let _ = job_events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                         retain_prompt(&mut cache, &placement);
                         release(&family, &mut cache, &mut free_slots, &placement, slot);
                     }
@@ -774,6 +781,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             }
             Ok(rows)
         }).collect::<Result<_>>()?;
+        let mut poisoned: Vec<Option<String>> = vec![None; sequences.len()];
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
         let distinct_rows: usize = active.iter().zip(&sequences).map(|(a, rows)| (key(a), rows))
             .collect::<std::collections::HashSet<_>>().iter().map(|(_, rows)| rows.len()).sum();
@@ -783,8 +791,9 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         // Each row draws at the position after it, masked along its sequence's drafts.
         let timer = Instant::now();
         let mut batch = SelectBatch::default();
-        for ((a, rows), &start) in active.iter().zip(&sequences).zip(&starts) {
-            batch.push_sequence(a.job.sampling, a.constraint.as_ref(), rows, start as u64 + 1)?;
+        for (i, ((a, rows), &start)) in active.iter().zip(&sequences).zip(&starts).enumerate() {
+            // A grammar failure fails that sequence alone, after the step.
+            poisoned[i] = batch.push_sequence_isolated(a.job.sampling, a.constraint.as_ref(), rows, start as u64 + 1);
         }
         phases[2] += timer.elapsed().as_secs_f64();
         cycle_host += timer.elapsed().as_secs_f64();
@@ -820,6 +829,11 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         let retain_turn = cache.enabled();
         let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(starts).enumerate()
             .map(|(i, ((request, rows), start))| {
+            if let Some(error) = poisoned[i].take() {
+                let _ = request.job.events.send(Err(NativeFailure::Worker(error)));
+                offset += rows.len();
+                return true;
+            }
             let mut finished = false;
             for j in 0..rows.len() {
                 // Rows 0..=j are committed; the token row j produces is next.
@@ -841,7 +855,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                             break;
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                         finished = true;
                         break;
                     }
