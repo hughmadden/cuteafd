@@ -559,20 +559,33 @@ geometry in the planner, graph-cache bounds, `placement.json` handoff (S1).
 Follow-ups (2026-10-03, measurements pending in `~/.cache/cuteafd/builds/v1-memory/kit/out`):
 - GLM 5.3 decode graphs bounded: steps pad to row buckets (exact to 16, then
   20..64) over a scratch page past the pool, page tables to power-of-two widths
-  >= 16 pages; every shape captured at startup (5,688 graphs in 2.0 s on one
-  GPU with the first bucket set); real rows' logits byte-identical to unpadded
-  steps; a failed capture runs its segment uncaptured (keeps the peer exchange
-  in step). GLM's auto pool stays opt-in until graph memory and C1/C4 are in.
+  >= 16 pages; every shape captured at startup (2 RTX + 6 Sparks: 22,608
+  graphs, 1.96 / 1.80 GiB per GPU, 5.8 s); real rows' logits byte-identical to
+  unpadded steps; a failed capture runs its segment uncaptured (keeps the peer
+  exchange in step). Measured vs base (2 launches each, 4 batches): C1 54.5 vs
+  51.8 tok/s (no per-request captures), C4 85.8 vs 84.2, 8K prefill unchanged;
+  untracked memory now flat after startup. GLM 5.3 POOL_TOKENS defaults to auto:
+  262144 -> 1,292,672 tokens (65 GiB KV per GPU), 2.7 GiB left on GPU0 after the
+  bench, C1 53.3 / C4 85.1 / prefill 2853 tok/s.
+- V4.1 quick parity for the ledger (1 RTX + 4 Sparks, code, warm): C1 155.7 ->
+  154.7, C16 1049.6 -> 1054.8, 8K prefill 6160 -> 6331 tok/s: no cost; tagging
+  stays per allocation.
 - Exact Spark slices: FP8/MXFP4/NVFP4 Spark packages also build tp<n>-w<width>
   layouts (ranks own whole 128-row blocks, no zero padding; MiMo V2.6 Pro TP6
-  ranks 4-5 61.9 instead of 92.8 GiB); EXL3 already had them. Shortening the
+  ranks 4-5 61.9 instead of 92.8 GiB); EXL3 already had them. Measured MiMo V2.6
+  Pro 2 RTX + 6 Sparks, exact vs padded: rank 5 free 11.8 -> 43.2 GiB (rank 0
+  unchanged), golden NLL 2.4150 -> 2.4088 (KL 0.0457 -> 0.0445; rank partials
+  partition the rows differently), engine 8K prefill 3095 -> 3002 tok/s, served
+  8K 2684 -> 2725, C1 63.9-69.1 -> 68.5-69.5, C4 102-108 both: neutral. Shortening the
   busiest rank (352/320 rows) needs 32-row K tails in the MXFP4 down projection:
   after `work/mimo-perf` (A8 down) lands on fork master. V4.1 TP4 (576 -> 640)
   goes through the V4.1 packer: not done.
 - V4.1 one RTX: row buffers at the live 2048-row chunk instead of the 4096 AOT
-  capacity (as on two RTX), reindex selection shares the source's scratch
-  (~10 GiB expected -> one more RTX expert layer). Left: window-wave
-  temporaries (3.5 GiB, per-layer streams) and engram gate sharing (0.6 GiB).
+  capacity (as on two RTX), reindex selection shares the source's scratch:
+  workspaces 21.08 -> 11.01 GiB, RTX expert layers 5 -> 6 (6.0 GiB still free),
+  C1 154.7 -> 159.1, C16 1054.8 -> 1086.3, 8K prefill 6331 -> 6326 tok/s. Left:
+  window-wave temporaries (3.5 GiB, per-layer streams; would make 7 layers) and
+  engram gate sharing (0.6 GiB).
 
 **Device-driven Spark exchange (decided 2026-10-02, `work/v41-device`).** No engine is
 device-routed toward the Sparks today: every family (V4, GLM, GLM Flash, MiMo, Qwen) downloads
@@ -760,7 +773,11 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
    wave is bound by bytes (FC1 BF16 input gathers per N tile, FC2 partial
    round trip ~2 ms, top-k sum 1.6 ms) and the FC1 rotation, not MMA rate.
    Coordinator GPU-only 8K prefill is 2.7 s, half of it the sparse MLA prefill
-   kernel (FP8 MMA rework: `work/glm-mla-fp8`). Lanes 2 or 4 lose to 3.
+   kernel. E4M3 MLA prefill (`work/glm-mla-fp8`, merged, default e4m3-p2;
+   real-expert TP4 gate: KL vs golden 0.0364 -> 0.0379, NLL 2.4680 -> 2.4717,
+   deterministic) cuts the GPU-only 8K prefill 2.89 -> 2.57 s, but 8K with
+   Sparks stays 2.95 s (GPU wait 2.11 -> 1.45 s, Spark wait up): the GB10
+   wave is the bound. Lanes 2 or 4 lose to 3.
    Verify layouts (busiest-rank expert reads, uniform routes): TP6 beats
    TP2xEP3 up to 16 rows (1.50 vs 2.02 expert-equivalents at 1 row, 10.8 vs
    11.2 at 8) and loses by 1-8% only at 32-64 rows; keep TP6. DFlash2 at max
