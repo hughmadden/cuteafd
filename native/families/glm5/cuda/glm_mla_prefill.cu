@@ -435,6 +435,12 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
 //   (the tile's token order inside k is permuted the same way in P), and
 //   folds the power of two into its online-softmax correction.
 // Accumulation is FP32 throughout.
+#ifndef MLA_BACKOFF_NS
+#define MLA_BACKOFF_NS 64
+#endif
+#ifndef MLA_AHEAD
+#define MLA_AHEAD 1
+#endif
 namespace e4m3 {
 
 constexpr int kStages = 3;
@@ -452,8 +458,8 @@ template <int kGroups>
 struct Smem {
   uint64_t full[kStages];   // the stage's tile landed (every thread's copies)
   uint64_t empty[kStages];  // every warp is done with the stage's tile
-  float slice_max[kGroups][4][16];
-  float slice_sum[kGroups][4][16];
+  float slice_max[kGroups][2][16];  // per head: the tile maxima of its two record halves
+  float slice_sum[kGroups][2][16];
   int32_t qexp[kGroups * 16];
 };
 
@@ -476,13 +482,18 @@ __device__ __forceinline__ void mbar_arrive(uint64_t* bar) {
 __device__ __forceinline__ void cp_async_arrive(uint64_t* bar) {
   asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" ::"r"(smem_addr(bar)) : "memory");
 }
-__device__ __forceinline__ void mbar_wait(uint64_t* bar, uint32_t parity) {
+__device__ __forceinline__ bool mbar_try_wait(uint64_t* bar, uint32_t parity) {
+  uint32_t done;
   asm volatile(
-      "{\n.reg .pred done;\nwait_%=:\n"
-      "mbarrier.try_wait.parity.shared::cta.b64 done, [%0], %1;\n"
-      "@!done bra wait_%=;\n}\n" ::"r"(smem_addr(bar)),
-      "r"(parity)
+      "{\n.reg .pred p;\nmbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\nselp.u32 %0, 1, 0, p;\n}\n"
+      : "=r"(done)
+      : "r"(smem_addr(bar)), "r"(parity)
       : "memory");
+  return done;
+}
+// Backs off between polls so that a waiting warp leaves the issue slots to the warps it waits for.
+__device__ __forceinline__ void mbar_wait(uint64_t* bar, uint32_t parity) {
+  while (!mbar_try_wait(bar, parity)) __nanosleep(MLA_BACKOFF_NS);
 }
 
 __device__ __forceinline__ void mma_e4m3(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
@@ -605,15 +616,26 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
     }
     cp_async_arrive(&s.full[i % kStages]);
   };
-  // This thread's softmax records 8 cw + 2 t4, + 1: valid flags one tile ahead.
-  const int t0 = 8 * cw + 2 * t4;
-  auto valid_of = [&](int i) { return int(slot_of(i * kT + t0) >= 0) | int(slot_of(i * kT + t0 + 1) >= 0) << 1; };
+  // Softmax ownership: warp w's thread (g, t4) takes head hs = g + 8 (w & 1) and the tile's records
+  // t0 + {0, 1, 8, 9} (t0 = 16 (w >> 1) + 2 t4): exactly the four E4M3 P bytes that thread (g, t4)
+  // of every warp holds as A register w (a0..a3) for the PV product. Valid flags one tile ahead.
+  const int hs = g + 8 * (cw & 1), t0 = 16 * (cw >> 1) + 2 * t4;
+  auto valid_of = [&](int i) {
+    int v = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) v |= int(slot_of(i * kT + t0 + (k & 1) + 8 * (k >> 1)) >= 0) << k;
+    return v;
+  };
   int valid_next = 0;
   if (tiles > 0) {
     prefetch(0);
     load(0);
     valid_next = valid_of(0);
     prefetch(1);
+    if (MLA_AHEAD == 2 && tiles > 1) {
+      load(1);
+      prefetch(2);
+    }
   }
 
   const float qd_lo = pow2(-s.qexp[group * 16 + g]), qd_hi = pow2(-s.qexp[group * 16 + g + 8]);
@@ -659,7 +681,7 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
   float acc[16][4];
 #pragma unroll
   for (int n = 0; n < 16; ++n) acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0;
-  float m_lo = -CUDART_INF_F, m_hi = -CUDART_INF_F, l_lo = 0, l_hi = 0;
+  float m_lo = -CUDART_INF_F, m_hi = -CUDART_INF_F, l_own = 0;
   // Powers of two of the four groups' P copies: each only ever decreases (to the largest that keeps
   // the tile's largest scale times it at most 448), so warp w's acc, held in units of 2^pexp[w],
   // rarely needs rescaling for it. Identical in every warp.
@@ -669,16 +691,15 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
   const float* group_part = reinterpret_cast<const float*>(group_bytes);
   // No CTA barrier per tile: the four head groups drift apart (one's softmax overlaps another's
   // MMAs), bounded by the stage ring: tile i + 1 is copied into the stage of tile i - 2.
-  // P copies (alias the group's partials once they are summed): [4 scale groups][kPTerms][16
-  // heads][32 bytes]; record t = 8 b + 2 j + s of the tile sits at byte 8 j + 2 b + s, the
-  // k order of the PV fragments.
+  // P copies (alias the group's partials once they are summed): [4 scale groups][kPTerms][8 g][4
+  // t4][4 registers a0..a3 x 4 bytes]: one 16-byte A fragment per PV thread.
   uint8_t* pbuf = group_bytes;
 
   for (int i = 0; i < tiles; ++i) {
-    if (i + 1 < tiles) {
-      if (i + 1 >= kStages) mbar_wait(&s.empty[(i + 1) % kStages], ((i + 1) / kStages - 1) & 1);
-      load(i + 1);
-      if (i + 2 < tiles) prefetch(i + 2);
+    if (const int j = i + MLA_AHEAD; j < tiles) {
+      if (j >= kStages) mbar_wait(&s.empty[j % kStages], (j / kStages - 1) & 1);
+      load(j);
+      if (j + 1 < tiles) prefetch(j + 1);
     }
     const int valid = valid_next;
     if (i + 1 < tiles) valid_next = valid_of(i + 1);
@@ -748,67 +769,54 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
       }
     }
     group_barrier(group);
-    // Warp cw's slice: records [8 cw, 8 cw + 8), heads g and g + 8, masked, log2 units.
+    // This thread's four scores (head hs, records t0 + {0, 1, 8, 9}), masked, log2 units.
     float v[4] = {0, 0, 0, 0};
 #pragma unroll
     for (int w = 0; w < 4; ++w) {
-      const float2 lo = *reinterpret_cast<const float2*>(group_part + w * 16 * kT + part_at(g, 4 * cw + t4));
-      const float2 hi = *reinterpret_cast<const float2*>(group_part + w * 16 * kT + part_at(g + 8, 4 * cw + t4));
-      v[0] += lo.x;
-      v[1] += lo.y;
-      v[2] += hi.x;
-      v[3] += hi.y;
+      const float2 x = *reinterpret_cast<const float2*>(group_part + w * 16 * kT + part_at(hs, t0 / 2));
+      const float2 y = *reinterpret_cast<const float2*>(group_part + w * 16 * kT + part_at(hs, t0 / 2 + 4));
+      v[0] += x.x;
+      v[1] += x.y;
+      v[2] += y.x;
+      v[3] += y.y;
     }
-    const bool ok0 = valid & 1, ok1 = valid & 2;
-    v[0] = ok0 ? v[0] * sl_lo : -CUDART_INF_F;
-    v[1] = ok1 ? v[1] * sl_lo : -CUDART_INF_F;
-    v[2] = ok0 ? v[2] * sl_hi : -CUDART_INF_F;
-    v[3] = ok1 ? v[3] * sl_hi : -CUDART_INF_F;
-    float smax_lo = fmaxf(v[0], v[1]), smax_hi = fmaxf(v[2], v[3]);
-    for (int o = 1; o <= 2; o <<= 1) {
-      smax_lo = fmaxf(smax_lo, __shfl_xor_sync(0xffffffffu, smax_lo, o));
-      smax_hi = fmaxf(smax_hi, __shfl_xor_sync(0xffffffffu, smax_hi, o));
-    }
-    if (t4 == 0) {
-      s.slice_max[group][cw][g] = smax_lo;
-      s.slice_max[group][cw][g + 8] = smax_hi;
-    }
-    group_barrier(group);
-    float tmax_lo = s.slice_max[group][0][g], tmax_hi = s.slice_max[group][0][g + 8];
+    const float sl = cw & 1 ? sl_hi : sl_lo;
 #pragma unroll
-    for (int w = 1; w < 4; ++w) {
-      tmax_lo = fmaxf(tmax_lo, s.slice_max[group][w][g]);
-      tmax_hi = fmaxf(tmax_hi, s.slice_max[group][w][g + 8]);
-    }
+    for (int k = 0; k < 4; ++k) v[k] = valid >> k & 1 ? v[k] * sl : -CUDART_INF_F;
+    float smax = fmaxf(fmaxf(v[0], v[1]), fmaxf(v[2], v[3]));
+    for (int o = 1; o <= 2; o <<= 1) smax = fmaxf(smax, __shfl_xor_sync(0xffffffffu, smax, o));
+    if (t4 == 0) s.slice_max[group][cw >> 1][hs] = smax;
+    group_barrier(group);
+    const float tmax_lo = fmaxf(s.slice_max[group][0][g], s.slice_max[group][1][g]);
+    const float tmax_hi = fmaxf(s.slice_max[group][0][g + 8], s.slice_max[group][1][g + 8]);
     const float mn_lo = fmaxf(m_lo, tmax_lo), mn_hi = fmaxf(m_hi, tmax_hi);
     float corr_lo = mn_lo == -CUDART_INF_F ? 1.0f : exp2f(m_lo - mn_lo);
     float corr_hi = mn_hi == -CUDART_INF_F ? 1.0f : exp2f(m_hi - mn_hi);
     m_lo = mn_lo;
     m_hi = mn_hi;
-    const float e0 = mn_lo == -CUDART_INF_F ? 0.0f : exp2f(v[0] - mn_lo);
-    const float e1 = mn_lo == -CUDART_INF_F ? 0.0f : exp2f(v[1] - mn_lo);
-    const float e2 = mn_hi == -CUDART_INF_F ? 0.0f : exp2f(v[2] - mn_hi);
-    const float e3 = mn_hi == -CUDART_INF_F ? 0.0f : exp2f(v[3] - mn_hi);
-    l_lo = l_lo * corr_lo + e0 + e1;
-    l_hi = l_hi * corr_hi + e2 + e3;
-    // P times each group's scales (and its power of two) as E4M3 copies.
+    const float mn = cw & 1 ? mn_hi : mn_lo;
+    float e[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) e[k] = mn == -CUDART_INF_F ? 0.0f : exp2f(v[k] - mn);
+    l_own = l_own * (cw & 1 ? corr_hi : corr_lo) + (e[0] + e[1]) + (e[2] + e[3]);
+    // P times each group's scales (and its power of two) as E4M3 copies: register cw of the
+    // A fragments.
     {
       const float4 sa = *reinterpret_cast<const float4*>(scales + t0 * 4);
       const float4 sb = *reinterpret_cast<const float4*>(scales + (t0 + 1) * 4);
+      const float4 sc = *reinterpret_cast<const float4*>(scales + (t0 + 8) * 4);
+      const float4 sd = *reinterpret_cast<const float4*>(scales + (t0 + 9) * 4);
       const float s0[4] = {sa.x, sa.y, sa.z, sa.w}, s1[4] = {sb.x, sb.y, sb.z, sb.w};
+      const float s2[4] = {sc.x, sc.y, sc.z, sc.w}, s3[4] = {sd.x, sd.y, sd.z, sd.w};
 #pragma unroll
       for (int k = 0; k < 4; ++k) {
-        const float f = pow2(pexp[k]), f0 = s0[k] * f, f1 = s1[k] * f;
-        uint32_t hi_lo, lo_lo, hi_hi, lo_hi;
-        quant2<kPTerms>(e0 * f0, e1 * f1, hi_lo, lo_lo);
-        quant2<kPTerms>(e2 * f0, e3 * f1, hi_hi, lo_hi);
-        uint8_t* p = pbuf + (k * kPTerms * 16 + g) * 32 + 8 * t4 + 2 * cw;
-        *reinterpret_cast<uint16_t*>(p) = uint16_t(hi_lo);
-        *reinterpret_cast<uint16_t*>(p + 8 * 32) = uint16_t(hi_hi);
-        if (kPTerms == 2) {
-          *reinterpret_cast<uint16_t*>(p + 16 * 32) = uint16_t(lo_lo);
-          *reinterpret_cast<uint16_t*>(p + 24 * 32) = uint16_t(lo_hi);
-        }
+        const float f = pow2(pexp[k]);
+        uint32_t h01, l01, h89, l89;
+        quant2<kPTerms>(e[0] * (s0[k] * f), e[1] * (s1[k] * f), h01, l01);
+        quant2<kPTerms>(e[2] * (s2[k] * f), e[3] * (s3[k] * f), h89, l89);
+        uint8_t* p = pbuf + k * kPTerms * 512 + (g * 4 + t4) * 16 + 4 * cw;
+        *reinterpret_cast<uint32_t*>(p) = h01 | h89 << 16;
+        if (kPTerms == 2) *reinterpret_cast<uint32_t*>(p + 512) = l01 | l89 << 16;
       }
     }
     if (acc_shift) {
@@ -830,12 +838,11 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
       uint32_t pa[kPTerms][4];
 #pragma unroll
       for (int pt = 0; pt < kPTerms; ++pt) {
-        const uint8_t* p = pbuf + ((cw * kPTerms + pt) * 16 + g) * 32 + 8 * t4;
-        const uint2 lo = *reinterpret_cast<const uint2*>(p), hi = *reinterpret_cast<const uint2*>(p + 8 * 32);
-        pa[pt][0] = lo.x;
-        pa[pt][1] = hi.x;
-        pa[pt][2] = lo.y;
-        pa[pt][3] = hi.y;
+        const uint4 a = *reinterpret_cast<const uint4*>(pbuf + (cw * kPTerms + pt) * 512 + (g * 4 + t4) * 16);
+        pa[pt][0] = a.x;
+        pa[pt][1] = a.y;
+        pa[pt][2] = a.z;
+        pa[pt][3] = a.w;
       }
       const int token = 8 * mi + r8;
 #pragma unroll
@@ -856,21 +863,11 @@ mla_prefill_kernel(const bf16* __restrict__ q, const uint8_t* __restrict__ kv, c
     __syncwarp();
     if (lane == 0) mbar_arrive(&s.empty[i % kStages]);
   }
-  for (int o = 1; o <= 2; o <<= 1) {
-    l_lo += __shfl_xor_sync(0xffffffffu, l_lo, o);
-    l_hi += __shfl_xor_sync(0xffffffffu, l_hi, o);
-  }
-  if (t4 == 0) {
-    s.slice_sum[group][cw][g] = l_lo;
-    s.slice_sum[group][cw][g + 8] = l_hi;
-  }
+  for (int o = 1; o <= 2; o <<= 1) l_own += __shfl_xor_sync(0xffffffffu, l_own, o);
+  if (t4 == 0) s.slice_sum[group][cw >> 1][hs] = l_own;
   group_barrier(group);
-  l_lo = l_hi = 0;
-#pragma unroll
-  for (int w = 0; w < 4; ++w) {
-    l_lo += s.slice_sum[group][w][g];
-    l_hi += s.slice_sum[group][w][g + 8];
-  }
+  const float l_lo = s.slice_sum[group][0][g] + s.slice_sum[group][1][g];
+  const float l_hi = s.slice_sum[group][0][g + 8] + s.slice_sum[group][1][g + 8];
   const int acc_exp = cw == 0 ? pexp[0] : cw == 1 ? pexp[1] : cw == 2 ? pexp[2] : pexp[3];
   const float down = pow2(-acc_exp);
   const float inv_lo = l_lo > 0 ? down / l_lo : 0.0f, inv_hi = l_hi > 0 ? down / l_hi : 0.0f;
