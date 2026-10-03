@@ -821,20 +821,27 @@ impl<'a> GlmfEngine<'a> {
         Ok(())
     }
 
-    /// Every KDA layer's recurrent then conv state of `slot` (host copy; checks), rank by rank.
+    /// Every KDA layer's recurrent then conv state of `slot` (host copy; checks): the FP32
+    /// recurrent state first (rank by rank under a head split), then the BF16 conv state.
     pub fn slot_state(&self, slot: i32) -> Result<Vec<u8>> {
         let slot = usize::try_from(slot)?;
         ensure!(slot < self.slots, "KDA slot {slot} out of range");
         self.synchronize()?;
-        let mut out = Vec::new();
+        let (mut state, mut conv) = (Vec::new(), Vec::new());
         for rank in 0..self.ranks() {
-            for region in self.slot_regions_on(rank, slot) {
-                let mut bytes = vec![0u8; region.bytes];
-                self.on(rank, || self.library.copy_d2h(&mut bytes, region))?;
-                out.extend(bytes);
+            let regions = self.slot_regions_on(rank, slot);
+            // `slot_regions_on`: every layer's recurrent region, then every layer's conv region.
+            let (recurrent, window) = regions.split_at(regions.len() / 2);
+            for (out, regions) in [(&mut state, recurrent), (&mut conv, window)] {
+                for &region in regions {
+                    let mut bytes = vec![0u8; region.bytes];
+                    self.on(rank, || self.library.copy_d2h(&mut bytes, region))?;
+                    out.extend(bytes);
+                }
             }
         }
-        Ok(out)
+        state.extend(conv);
+        Ok(state)
     }
 
     /// After a speculative verify step (`verify_spec`): applies each
