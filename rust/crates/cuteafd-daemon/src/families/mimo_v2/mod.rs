@@ -1024,7 +1024,7 @@ impl Opened {
             Ok(link)
         };
         let mut transport = link()?;
-        // Pipelined prefill (CUTEAFD_MIMO_PREFILL_LANES, 1 keeps it serial):
+        // Pipelined prefill (CUTEAFD_MIMO_PREFILL_LANES, 3 by default, 1 keeps it serial):
         // one more transport per earlier row lane.
         let lanes = admission::transport_lanes(true)?;
         let mut lane_links = (1..lanes).map(|_| link()).collect::<Result<Vec<_>>>()?;

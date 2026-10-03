@@ -493,8 +493,10 @@ pub(super) fn transport_lanes(spark: bool) -> Result<usize> {
     }
     match std::env::var("CUTEAFD_MIMO_PREFILL_LANES").as_deref() {
         Ok("1") => Ok(1),
-        Ok("2") | Err(_) => Ok(2),
-        Ok("3") => Ok(3),
+        Ok("2") => Ok(2),
+        // Three lanes: 1 RTX 8K prefill 2951 -> 2745 ms, 2 RTX equal, C4 code
+        // 219 -> 247 tok/s (MiMo V2.6 Pro TP6).
+        Ok("3") | Err(_) => Ok(3),
         Ok("4") => Ok(4),
         Ok(other) => anyhow::bail!("CUTEAFD_MIMO_PREFILL_LANES is 1, 2, 3 or 4, not {other}"),
     }
