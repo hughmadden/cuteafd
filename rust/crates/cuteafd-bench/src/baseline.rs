@@ -242,10 +242,18 @@ fn compare_rows(a: &ProbeRecord, b: &ProbeRecord) -> (usize, Vec<usize>) {
     (compared, differ)
 }
 
-/// Restore exactness: a whole-prompt hit on a prompt-end snapshot and on a
-/// turn-end snapshot, then one decode step on the restored state, compared
-/// byte for byte with the same rows computed without a restore (same
-/// chunking, drafts off).
+/// Restore exactness, against the state each snapshot was taken from (drafts off, same chunking).
+///
+/// Prompt end: a prompt computed and retained, then asked again (a whole hit): its rows must equal
+/// the first request's.
+///
+/// Turn end: a 24-token turn records its own rows; the same prompt asked for one token more is a
+/// whole hit on that prompt snapshot, so its 25 rows come from the restored prompt state and plain
+/// decode steps and must equal the turn's; then the turn's tokens again are a whole hit on the turn
+/// snapshot, whose rows (the retained logits, then a decode step on the restored state) must equal
+/// the reference's at those positions. Neither side recomputes a prefill: a cold recompute is
+/// reported, not gated, because prefill kernels with unordered reductions (Spark FP32 atomics) are
+/// not bit-reproducible run to run, which is a property of the kernels, not of the cache.
 fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     if run.setting("prefix-cache-entries").is_some_and(|v| v == "0") {
         check.status = CheckStatus::Skipped;
@@ -262,53 +270,132 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
         return Ok(());
     }
     let restored = probed(client, plain(&text, 2), rows(2))?;
-    let (prompt_compared, prompt_differ) = compare_rows(&first, &restored);
-    let prompt_hit = restored.cached_tokens == restored.prompt_ids.len() && !restored.prompt_ids.is_empty();
-    // Turn end: a finished turn, the same turn recomputed cold one token further,
-    // then the turn's tokens again (a whole hit on the turn snapshot).
-    // Long enough to clear the cache's minimum snapshot size and several units.
-    let turn_text = format!("[{}] Here are some notes.\n\n{}\n\nList five rivers of Europe, one per line.", nonce(),
-        filler(57, 900));
-    let turn = probed(client, plain(&turn_text, 24), ProbeSpec { no_speculation: true, ..ProbeSpec::default() })?;
-    let reference = probed(client, plain(&turn_text, 25),
-        ProbeSpec { cold: true, ..rows(25) })?;
-    let reproducible = reference.generated.len() > turn.generated.len()
-        && reference.generated[..turn.generated.len()] == turn.generated[..];
+    // Turn end. Long enough to clear the cache's minimum snapshot size and several units; the
+    // answer runs past 25 tokens, so the turn ends at its length limit and the turn snapshot is
+    // followed by a decode step.
+    let turn_text = format!("[{}] Here are some notes.\n\n{}\n\nCount from one to forty in words, separated by commas.",
+        nonce(), filler(57, 900));
+    let turn = probed(client, plain(&turn_text, TURN_TOKENS as u64), rows(TURN_TOKENS))?;
+    let reference = probed(client, plain(&turn_text, TURN_TOKENS as u64 + 1), rows(TURN_TOKENS + 1))?;
     let mut ids = turn.prompt_ids.clone();
     ids.extend(&turn.generated[..turn.generated.len().saturating_sub(1)]);
-    let again = probed(client, plain("cache probe", 2), ProbeSpec { prompt_ids: Some(ids.clone()), ..rows(2) })?;
-    let (turn_compared, turn_differ) = compare_rows(&reference, &again);
-    let turn_hit = again.cached_tokens == ids.len();
-    let decode_rows = first.rows.len() >= 2 && restored.rows.len() >= 2;
+    let again = probed(client, plain("cache probe", 2), ProbeSpec { prompt_ids: Some(ids), ..rows(2) })?;
+    let cold = probed(client, plain(&turn_text, 1), ProbeSpec { cold: true, ..rows(1) })?;
+    let verdict = Restores::judge(&first, &restored, &turn, &reference, &again, &cold);
     check.set("prompt_tokens", restored.prompt_ids.len() as u64);
     check.set("prompt_restored", restored.cached_tokens as u64);
-    check.set("prompt_rows_compared", prompt_compared as u64);
-    check.set("turn_tokens", ids.len() as u64);
+    check.set("prompt_rows_compared", verdict.prompt.compared as u64);
+    check.set("turn_tokens", again.prompt_ids.len() as u64);
     check.set("turn_restored", again.cached_tokens as u64);
-    check.set("turn_rows_compared", turn_compared as u64);
-    let describe = |hit: bool, restored: usize, total: usize, compared: usize, differ: &[usize]| if !hit {
-        format!("no whole restore ({restored}/{total})")
-    } else if !differ.is_empty() {
-        format!("{total} restored, rows DIFFER at {differ:?}")
-    } else {
-        format!("{total} restored, {compared} rows byte-identical")
-    };
-    check.summary = format!("prompt end: {} · turn end: {}{}",
-        describe(prompt_hit, restored.cached_tokens, restored.prompt_ids.len(), prompt_compared, &prompt_differ),
-        describe(turn_hit, again.cached_tokens, ids.len(), turn_compared, &turn_differ),
-        if decode_rows { "" } else { " (no decode rows recorded: first rows only)" });
-    let failed = (prompt_hit && !prompt_differ.is_empty()) || (turn_hit && reproducible && !turn_differ.is_empty());
-    check.status = if failed {
-        CheckStatus::Fail
-    } else if prompt_hit && turn_hit && decode_rows && prompt_compared >= 2 && turn_compared >= 2 {
-        CheckStatus::Pass
-    } else {
-        CheckStatus::Info
-    };
-    if !reproducible && turn_hit {
-        check.summary.push_str(" · the turn's greedy text did not reproduce");
-    }
+    check.set("turn_rows_compared", verdict.turn.compared as u64);
+    check.set("turn_prompt_rows_compared", verdict.turn_prompt.compared as u64);
+    check.set("cold_rows_identical", u64::from(verdict.cold_identical == Some(true)));
+    check.status = verdict.status();
+    check.summary = verdict.summary();
     Ok(())
+}
+
+/// Generated tokens of the turn-end case's turn.
+const TURN_TOKENS: usize = 24;
+
+/// One restore compared with the rows it must reproduce.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Restore {
+    /// The request restored its whole prompt from a snapshot.
+    hit: bool,
+    restored: usize,
+    tokens: usize,
+    compared: usize,
+    differ: Vec<usize>,
+}
+
+impl Restore {
+    /// `restored`'s rows against `source`'s at every position both hold.
+    fn of(source: &ProbeRecord, restored: &ProbeRecord) -> Self {
+        let (compared, differ) = compare_rows(source, restored);
+        Self { hit: !restored.prompt_ids.is_empty() && restored.cached_tokens == restored.prompt_ids.len(),
+            restored: restored.cached_tokens, tokens: restored.prompt_ids.len(), compared, differ }
+    }
+
+    fn failed(&self) -> bool {
+        self.hit && !self.differ.is_empty()
+    }
+
+    fn exact(&self, rows: usize) -> bool {
+        self.hit && self.differ.is_empty() && self.compared >= rows
+    }
+
+    fn describe(&self) -> String {
+        if !self.hit {
+            format!("no whole restore ({}/{})", self.restored, self.tokens)
+        } else if !self.differ.is_empty() {
+            format!("{} restored, rows DIFFER at {:?}", self.tokens, self.differ)
+        } else {
+            format!("{} restored, {} rows byte-identical", self.tokens, self.compared)
+        }
+    }
+}
+
+/// The prefix-cache check's verdict.
+#[derive(Debug)]
+struct Restores {
+    prompt: Restore,
+    /// The turn's prompt asked for one token more, from its prompt snapshot, against the turn.
+    turn_prompt: Restore,
+    /// The turn's tokens from the turn snapshot, against that reference.
+    turn: Restore,
+    /// The reference emitted the turn's tokens first.
+    reproduced: bool,
+    /// Whether a cold recompute of the turn's prompt gave the turn's first row bit for bit.
+    cold_identical: Option<bool>,
+}
+
+impl Restores {
+    fn judge(first: &ProbeRecord, restored: &ProbeRecord, turn: &ProbeRecord, reference: &ProbeRecord,
+        again: &ProbeRecord, cold: &ProbeRecord) -> Self {
+        let (compared, differ) = compare_rows(turn, cold);
+        let turn_prompt = Restore::of(turn, reference);
+        // Without a prompt restore the reference recomputed the prefill: only the turn's own
+        // (retained) row is a fair comparison then.
+        let turn_source = if turn_prompt.hit { reference } else { turn };
+        Self {
+            prompt: Restore::of(first, restored),
+            turn: Restore::of(turn_source, again),
+            turn_prompt,
+            reproduced: !turn.generated.is_empty() && reference.generated.starts_with(&turn.generated),
+            cold_identical: (compared > 0).then_some(differ.is_empty()),
+        }
+    }
+
+    fn status(&self) -> CheckStatus {
+        if self.prompt.failed() || self.turn_prompt.failed() || self.turn.failed()
+            || (self.turn_prompt.hit && !self.reproduced) {
+            CheckStatus::Fail
+        } else if self.prompt.exact(2) && self.turn_prompt.exact(2) && self.turn.exact(2) {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Info
+        }
+    }
+
+    fn summary(&self) -> String {
+        let mut summary = format!("prompt end: {} · turn end: {}", self.prompt.describe(), self.turn.describe());
+        if !self.turn_prompt.hit || self.turn_prompt.failed() {
+            summary.push_str(&format!(" · turn's prompt: {}", self.turn_prompt.describe()));
+        }
+        if self.turn_prompt.hit && !self.reproduced {
+            summary.push_str(" · the turn's greedy text did not reproduce from its prompt snapshot");
+        }
+        if self.prompt.compared < 2 || self.turn.compared < 2 {
+            summary.push_str(" (no decode rows recorded after a restore)");
+        }
+        match self.cold_identical {
+            Some(true) => summary.push_str(" · cold recompute identical"),
+            Some(false) => summary.push_str(" · cold recompute differs (prefill not bit-reproducible; not a cache defect)"),
+            None => {}
+        }
+        summary
+    }
 }
 
 fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
@@ -619,6 +706,65 @@ mod tests {
         assert!((noise.max - 0.1).abs() < 1e-6 && (noise.median - 0.005).abs() < 1e-6, "{noise:?}");
         assert!(noise.describe().contains("1 of 3 rows byte-identical"));
         assert_eq!(RowNoise::between(&on, &ProbeRecord::default(), 13).describe(), "");
+    }
+
+    /// A record of `prompt` prompt ids with `cached` restored, rows `(position, hash)` and `generated`.
+    fn record(prompt: usize, cached: usize, rows: &[(usize, &str)], generated: &[u32]) -> ProbeRecord {
+        use cuteafd_api::openai::probe::ProbeRow;
+        ProbeRecord { engine: Some("test".into()), prompt_ids: vec![1; prompt], cached_tokens: cached,
+            rows: rows.iter().map(|&(position, hash)| ProbeRow { position, hash: hash.into(), ..ProbeRow::default() })
+                .collect(),
+            generated: generated.to_vec(), ..ProbeRecord::default() }
+    }
+
+    /// Prompt end at 100 (rows 100, 101); a 3-token turn at 50 (rows 50..53), its reference (one
+    /// token more, rows 50..54), the turn's tokens again from the turn snapshot (rows 52, 53) and a
+    /// cold recompute (row 50).
+    fn restores(reference_cached: usize, reference_rows: &[(usize, &str)], again_rows: &[(usize, &str)],
+        cold_row: &str) -> Restores {
+        let first = record(100, 0, &[(100, "p0"), (101, "p1")], &[7, 8]);
+        let restored = record(100, 100, &[(100, "p0"), (101, "p1")], &[7, 8]);
+        let turn = record(50, 0, &[(50, "t0"), (51, "t1"), (52, "t2")], &[4, 5, 6]);
+        let reference = record(50, reference_cached, reference_rows, &[4, 5, 6, 9]);
+        let again = record(52, 52, again_rows, &[6, 9]);
+        let cold = record(50, 0, &[(50, cold_row)], &[4]);
+        Restores::judge(&first, &restored, &turn, &reference, &again, &cold)
+    }
+
+    const REFERENCE: [(usize, &str); 4] = [(50, "t0"), (51, "t1"), (52, "t2"), (53, "t3")];
+
+    #[test]
+    fn turn_end_restores_compare_with_their_snapshot_not_a_cold_recompute() {
+        // A cold prefill that rounds differently (Spark FP32 atomics) is reported, not a failure.
+        let verdict = restores(50, &REFERENCE, &[(52, "t2"), (53, "t3")], "cold");
+        assert_eq!(verdict.status(), CheckStatus::Pass, "{verdict:?}");
+        assert_eq!((verdict.turn.compared, verdict.turn_prompt.compared), (2, 3));
+        assert!(verdict.summary().contains("turn end: 52 restored, 2 rows byte-identical"), "{}", verdict.summary());
+        assert!(verdict.summary().contains("cold recompute differs"), "{}", verdict.summary());
+        assert!(restores(50, &REFERENCE, &[(52, "t2"), (53, "t3")], "t0").summary().contains("cold recompute identical"));
+    }
+
+    #[test]
+    fn turn_end_state_that_restores_inexactly_fails() {
+        // The retained row is right but the decode step on the restored state is not.
+        let verdict = restores(50, &REFERENCE, &[(52, "t2"), (53, "bad")], "t0");
+        assert_eq!(verdict.status(), CheckStatus::Fail);
+        assert!(verdict.summary().contains("rows DIFFER at [53]"), "{}", verdict.summary());
+        // The turn's prompt restored inexactly: its decode rows differ from the turn's own.
+        let verdict = restores(50, &[(50, "t0"), (51, "x"), (52, "y"), (53, "z")], &[(52, "y"), (53, "z")], "t0");
+        assert_eq!(verdict.status(), CheckStatus::Fail);
+        assert!(verdict.summary().contains("turn's prompt: 50 restored, rows DIFFER at [51, 52]"), "{}", verdict.summary());
+    }
+
+    #[test]
+    fn without_a_prompt_restore_the_turn_compares_with_its_own_row() {
+        // The reference recomputed its prefill (no hit) and rounded differently: the turn snapshot
+        // is judged on the row the turn itself produced, and the check stays informational.
+        let verdict = restores(0, &[(50, "c0"), (51, "c1"), (52, "c2"), (53, "c3")], &[(52, "t2"), (53, "t3")], "c0");
+        assert_eq!(verdict.status(), CheckStatus::Info, "{verdict:?}");
+        assert_eq!((verdict.turn.compared, verdict.turn.differ.len()), (1, 0));
+        let verdict = restores(0, &[(50, "c0")], &[(52, "bad"), (53, "t3")], "c0");
+        assert_eq!(verdict.status(), CheckStatus::Fail);
     }
 
     fn check(id: &str, status: CheckStatus, metrics: Value) -> Check {
