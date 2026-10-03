@@ -175,7 +175,7 @@ pub(super) fn preflight(
                 bytes: tensor_bytes(
                     "MiMo peer receive slots",
                     &[
-                        8,
+                        4 * transport_lanes.max(2),
                         args.prefill_rows.max(super::engine::DECODE_ROWS),
                         cfg.hidden,
                         2,
@@ -236,7 +236,7 @@ pub(super) fn preflight(
                     args.draft_capacity(draft.block)?,
                 )?;
                 additional.extend(reservations.steady);
-                if transport_lanes == 2 && args.prefill_rows >= 2048 && args.mtp == 0
+                if transport_lanes >= 2 && args.prefill_rows >= 2048 && args.mtp == 0
                     && prefill_output == MimoPrefillOutput::LastRow {
                     additional.push(MemoryReservation {
                         name: "draft.prefill_first_lane_taps".into(),
@@ -494,15 +494,20 @@ pub(super) fn transport_lanes(spark: bool) -> Result<usize> {
     match std::env::var("CUTEAFD_MIMO_PREFILL_LANES").as_deref() {
         Ok("1") => Ok(1),
         Ok("2") | Err(_) => Ok(2),
-        Ok(other) => anyhow::bail!("CUTEAFD_MIMO_PREFILL_LANES is 1 or 2, not {other}"),
+        Ok("3") => Ok(3),
+        Ok("4") => Ok(4),
+        Ok(other) => anyhow::bail!("CUTEAFD_MIMO_PREFILL_LANES is 1, 2, 3 or 4, not {other}"),
     }
 }
 
 fn workspace_shapes(rows: usize, lead: bool, spark: bool, lanes: usize, output: MimoPrefillOutput, mtp: usize)
     -> Vec<(&'static str, bool, usize, bool)> {
     let mut shapes = vec![("prefill", false, rows, lead), ("decode", true, super::engine::DECODE_ROWS, lead)];
-    if spark && lanes == 2 && rows >= 2048 {
+    if spark && lanes >= 2 && rows >= 2048 {
         shapes.push(("prefill_first_lane", false, rows, lead && mtp == 0 && output == MimoPrefillOutput::LastRow));
+        for name in ["prefill_second_lane", "prefill_third_lane"].into_iter().take(lanes - 2) {
+            shapes.push((name, false, rows, false));
+        }
     }
     shapes
 }

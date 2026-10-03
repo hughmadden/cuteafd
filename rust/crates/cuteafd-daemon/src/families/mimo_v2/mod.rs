@@ -1024,10 +1024,10 @@ impl Opened {
             Ok(link)
         };
         let mut transport = link()?;
-        // Pipelined prefill (CUTEAFD_MIMO_PREFILL_LANES, 2 by default; 1 keeps
-        // it serial): a second transport carries the first row lane's waves.
+        // Pipelined prefill (CUTEAFD_MIMO_PREFILL_LANES, 1 keeps it serial):
+        // one more transport per earlier row lane.
         let lanes = admission::transport_lanes(true)?;
-        let mut lane = if lanes == 2 { Some(link()?) } else { None };
+        let mut lane_links = (1..lanes).map(|_| link()).collect::<Result<Vec<_>>>()?;
         tracing::info!(lanes, "MiMo prefill lanes");
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         // Connect every rank and register full-size buffers now: the first
@@ -1065,7 +1065,7 @@ impl Opened {
                 transport.receive(wave, request.header.row_count as usize, warm_stream).await
             })?;
         }
-        if let Some(lane) = lane.as_mut() {
+        for lane in &mut lane_links {
             runtime.block_on(async {
                 let wave = lane.dispatch(&warmups[0])?;
                 lane.receive(wave, warmups[0].header.row_count as usize, warm_stream).await
@@ -1078,7 +1078,7 @@ impl Opened {
         }
         tracing::info!(ranks = peers.len(), elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
         Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport),
-            lane: lane.map(std::cell::RefCell::new), runtime }))
+            lanes: lane_links.into_iter().map(std::cell::RefCell::new).collect(), runtime }))
     }
 }
 
