@@ -443,6 +443,9 @@ impl Opened {
         }
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::GLM_DEFAULT)? {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
+            if engine.ranks() > 1 {
+                engine.attach_peer_l2(budget)?;
+            }
         }
         let result = body(&engine);
         drop(engine);

@@ -474,6 +474,8 @@ pub(crate) struct GlmfPeer<'a> {
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     lane_workspaces: RefCell<Vec<Workspace<'a>>>,
     graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
+    /// L2 prefetch of its next layer's weights while it waits for rank 0's expert exchange.
+    l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
 }
 
 /// Exchange slot of layer `index`, lane `lane`: its attention partials (`ffn` false) or its
@@ -643,7 +645,7 @@ impl<'a> GlmfEngine<'a> {
                 self.caches.kda_heads)?;
             Ok(GlmfPeer { device, stream, layers, caches, workspace: RefCell::new(None),
                 decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
-                graphs: RefCell::new(std::collections::HashMap::new()) })
+                graphs: RefCell::new(std::collections::HashMap::new()), l2: None })
         })?;
         self.peer = Some(peer);
         self.exchange = Some(exchange);
@@ -1627,6 +1629,10 @@ impl<'a> GlmfEngine<'a> {
                     self.peer_segment(0, w1, t, tables)?;
                 }
                 if index + 1 < layers.len() {
+                    // Rank 1's next weights into L2 while it waits for this layer's exchange.
+                    if let (false, Some(l2)) = (layers[index].dense, self.peer()?.l2.as_ref()) {
+                        self.on(1, || l2.issue(self.library, index, self.stream_of(1)))?;
+                    }
                     self.peer_segment(index + 1, w1, t, tables)?;
                 }
             }
@@ -1964,7 +1970,24 @@ impl<'a> GlmfEngine<'a> {
     /// attention (E4M3 copies where the decode programs read them), FFN site,
     /// router and shared expert; after the last layer the final norm and head.
     pub fn decode_read_order(&self) -> Vec<Vec<crate::shared::l2_prefetch::Range>> {
-        let layers = &self.weights.layers;
+        self.decode_read_order_on(0)
+    }
+
+    /// Rank 1's L2 prefetch (its shares of the next layer's weights) with `budget` bytes per
+    /// layer, issued before each of its decode segments that waits on an expert exchange.
+    pub fn attach_peer_l2(&mut self, budget: usize) -> Result<()> {
+        let order = self.decode_read_order_on(1);
+        let l2 = self.on(1, || crate::shared::l2_prefetch::L2Prefetch::new(self.library, budget, &order))?;
+        self.peer.as_mut().context("no head-split peer")?.l2 = Some(l2);
+        Ok(())
+    }
+
+    /// [`Self::decode_read_order`] of rank `rank`'s shares (rank 1 reads no head).
+    fn decode_read_order_on(&self, rank: usize) -> Vec<Vec<crate::shared::l2_prefetch::Range>> {
+        let layers = match (rank, &self.peer) {
+            (1, Some(peer)) => &peer.layers,
+            _ => &self.weights.layers,
+        };
         (0..layers.len()).map(|i| match layers.get(i + 1) {
             Some(next) => {
                 let attention: &[&str] = match next.attention {
@@ -1979,6 +2002,7 @@ impl<'a> GlmfEngine<'a> {
                     .copied().collect();
                 crate::shared::l2_prefetch::operands(&names, |n| next.range(n))
             }
+            None if rank == 1 => Vec::new(),
             None => {
                 let head = match &self.weights.head_fp8 {
                     Some((q, scale)) => vec![q, scale],
