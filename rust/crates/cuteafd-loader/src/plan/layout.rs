@@ -345,11 +345,11 @@ fn load_conversions(family: &str, checkpoint: &super::Checkpoint) -> Vec<Convers
     use crate::families::mimo_v2::projection::{MimoProjectionLayout, MimoProjectionRepresentation as R};
     use crate::families::mimo_v2::weight_policy::{default_policy, MimoDefaultPolicy};
     match family {
-        // The qualified MiMo V2.6 Pro default stores the head and every target
-        // o_proj as FP8 (one copy), not the checkpoint's BF16.
+        // The measured MiMo default stores the head and every target o_proj
+        // as FP8 (one copy), not the checkpoint's BF16.
         "mimo_v2" => {
             let Ok(cfg) = crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config) else { return Vec::new() };
-            if default_policy(checkpoint, &cfg) != MimoDefaultPolicy::QualifiedProFp8 {
+            if default_policy(checkpoint, &cfg) != MimoDefaultPolicy::Fp8 {
                 return Vec::new();
             }
             let bytes = |rows: usize, cols: usize, r: R, ranks: u64| MimoProjectionLayout::new(rows as u64, cols as u64, r, ranks)
@@ -362,7 +362,8 @@ fn load_conversions(family: &str, checkpoint: &super::Checkpoint) -> Vec<Convers
         }
         // GLM 5.3 Flash serves MLA, dense and shared-expert projections as FP8
         // from the official FP8 release (--fp8-snapshot); a BF16 checkpoint's
-        // copies of them are not loaded. KDA stays as stored.
+        // copies of them are not loaded. KDA in/out projections and the head
+        // default to one per-row FP8 copy (--kda-fp8 row128, --fp8-head).
         "glm5_flash" => {
             let bf16 = |c: &crate::plan::checkpoint::CheckpointTensor| c.meta.dtype == cuteafd_core::DType::Bf16;
             let bytes = |filter: &dyn Fn(&str) -> bool| -> u64 {
@@ -376,9 +377,22 @@ fn load_conversions(family: &str, checkpoint: &super::Checkpoint) -> Vec<Convers
             let shared = bytes(&|n: &str| n.contains("shared_experts.") && n.ends_with("_proj.weight"));
             let dense = bytes(&|n: &str| n.contains(".mlp.") && !n.contains("experts") && n.ends_with("_proj.weight")
                 && !n.contains(".gate."));
-            vec![Conversion { component: Component::Attention, saved_bytes: mla / 2, format: "bf16+fp8" },
+            let kda = bytes(&|n: &str| !mla_layers.iter().any(|p| n.starts_with(p.as_str())) && n.contains(".self_attn.")
+                && ["q_proj.weight", "k_proj.weight", "v_proj.weight", "f_a_proj.weight", "g_a_proj.weight",
+                    "b_proj.weight", "o_proj.weight"].iter().any(|s| n.ends_with(s)));
+            let head = bytes(&|n: &str| n == "lm_head.weight");
+            vec![Conversion { component: Component::Attention, saved_bytes: (mla + kda) / 2, format: "bf16+fp8" },
+                Conversion { component: Component::LmHead, saved_bytes: head / 2, format: "fp8-row128" },
                 Conversion { component: Component::SharedExpert, saved_bytes: shared / 2, format: "fp8" },
                 Conversion { component: Component::DenseFfn, saved_bytes: dense / 2, format: "fp8" }]
+        }
+        // Qwen 3.8: target and MTP share one per-row FP8 head (--mtp-fp8-head).
+        "qwen4" => {
+            let head: u64 = checkpoint.tensors.iter()
+                .filter(|t| t.meta.name.ends_with("lm_head.weight") && t.meta.dtype == cuteafd_core::DType::Bf16)
+                .map(|t| t.meta.byte_length).sum();
+            if head == 0 { Vec::new() }
+            else { vec![Conversion { component: Component::LmHead, saved_bytes: head / 2, format: "fp8-row128" }] }
         }
         _ => Vec::new(),
     }
@@ -395,7 +409,7 @@ fn resident_layout(family: &str, checkpoint: &super::Checkpoint, ranks: usize) -
         return None;
     }
     let cfg = crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config).ok()?;
-    let qualified = default_policy(checkpoint, &cfg) == MimoDefaultPolicy::QualifiedProFp8;
+    let qualified = default_policy(checkpoint, &cfg) == MimoDefaultPolicy::Fp8;
     let source = |name: &str| checkpoint.tensors.iter().find(|t| t.meta.name == name)
         .map(|t| if t.meta.dtype == cuteafd_core::DType::Bf16 && !qualified { R::Bf16 } else { R::Fp8 });
     let output_formats = (0..cfg.layers).filter_map(|layer| {

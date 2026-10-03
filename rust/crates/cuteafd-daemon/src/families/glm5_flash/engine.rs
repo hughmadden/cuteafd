@@ -35,6 +35,8 @@
 //! layer ahead of rank 0's expert exchange.
 use super::weights::{GlmfLayer, GlmfWeights};
 use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
+use super::head::GlmfHead;
+use crate::families::glm5::dflash::TargetHead;
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
@@ -987,10 +989,13 @@ impl<'a> GlmfEngine<'a> {
             // The head split's share programs.
             for name in [format!("kda_{cap}"), format!("mla_producer_{cap}"), format!("sparse_mla_{mode}_{cap}"),
                 format!("o_{cap}"), format!("ffn_i{}_{cap}", self.cfg.moe_intermediate / 2),
-                format!("ffn_i{}_{cap}", self.cfg.dense_intermediate / 2)] {
-                let spec = self.programs.spec(&format!("glmf2_{name}"))?;
+                format!("ffn_i{}_{cap}", self.cfg.dense_intermediate / 2), format!("kda_w8_{cap}")] {
+                let Ok(spec) = self.programs.spec(&format!("glmf2_{name}")) else { continue };
                 scratch = scratch.max(spec.scratch.get("scratch").copied().unwrap_or(0) as usize);
             }
+        }
+        if self.weights.layers.iter().any(|layer| layer.has("w_in_fp8")) {
+            scratch = scratch.max(self.scratch(&format!("kda_w8_{cap}"))?);
         }
         let topk_scratch = self.scratch(&format!("index_topk_{mode}_{cap}"))?;
         let pools = self.cfg.index_topk / KPOOL;
@@ -1522,7 +1527,8 @@ impl<'a> GlmfEngine<'a> {
                 std::fs::write(dir.join("attention.bin"), self.download(&w.delta, t * h * 2)?)?;
                 if layer.attention == GlmNextAttention::Kda {
                     let d = self.caches.kda_heads * self.cfg.kda_head_dim;
-                    let p = layer.range("w_in").context("KDA trace without in-projection")?.1 / (h * 2);
+                    // The in-projection's output width (q|k|v, f_a, g_a, b), whatever its weight format.
+                    let p = 3 * d + 2 * self.cfg.kda_head_dim + self.caches.kda_heads;
                     // Decode KDA AOT layout: BF16 in-projection, f|gate,
                     // convolved q|k|v, recurrent output and gated-norm output;
                     // each region is 1024-byte aligned in the pinned manifest.
@@ -1694,19 +1700,36 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// The vocabulary projection of the last `logit_rows` normalized rows into
-    /// `w.logits`: the FP8 head for up to 16 decode rows (--fp8-head), else BF16.
-    fn logits(&self, w: &Workspace<'_>, t: usize, logit_rows: usize, decode: bool) -> Result<()> {
+    /// `w.logits` through the one resident head: BF16, or the FP8 head
+    /// (--fp8-head) in 16-row spans for every row count.
+    fn logits(&self, w: &Workspace<'_>, t: usize, logit_rows: usize, _decode: bool) -> Result<()> {
         let h = self.cfg.hidden;
         // SAFETY: rows t - logit_rows.. of the normalized rows lie inside `w.x`.
         let x = unsafe { w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2) }.cast::<c_void>();
-        if let (Some((q, scale)), true) = (&self.weights.head_fp8, decode && logit_rows <= FP8_ROWS as usize) {
-            return self.run("head_fp8", &[("x", x), ("w_fp8", q.buffer.ptr), ("scale", scale.buffer.ptr),
-                ("logits", w.logits.buffer.ptr)], &[Scalar::I32(logit_rows as i32)]);
+        match &self.weights.head {
+            GlmfHead::Fp8 { .. } => self.timed("glmf_head_fp8", || {
+                // SAFETY: `x` holds `logit_rows` normalized rows and `w.logits` their
+                // FP32 logits (the workspace's logit capacity); the engine stream orders them.
+                unsafe { self.weights.head.launch_fp8(self.programs, x, w.logits.buffer.ptr.cast(), logit_rows, h,
+                    self.cfg.vocab_size, self.stream) }
+            }),
+            // SAFETY: the head's input and operands are live buffers of these shapes.
+            GlmfHead::Bf16(head) => unsafe {
+                w.head.as_ref().context("LM head")?.launch(x.cast(), head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), logit_rows as u32,
+                    self.stream)
+            },
         }
-        // SAFETY: the head's input and operands are live buffers of these shapes.
-        unsafe {
-            w.head.as_ref().context("LM head")?.launch(x.cast(), self.weights.head.buffer.ptr.cast(), w.logits.buffer.ptr.cast(), logit_rows as u32,
-                self.stream)
+    }
+
+    /// The target head as the DFlash drafter borrows it (the same resident copy).
+    pub fn draft_head(&self) -> TargetHead<'_> {
+        match &self.weights.head {
+            GlmfHead::Bf16(head) => TargetHead::Bf16(head),
+            fp8 @ GlmfHead::Fp8 { .. } => TargetHead::Launch(Box::new(move |x, logits, rows, stream| {
+                // SAFETY: the drafter passes its live normalized rows and logits
+                // workspace for `rows` rows, on the stream it launches the head on.
+                unsafe { fp8.launch_fp8(self.programs, x, logits, rows, self.cfg.hidden, self.cfg.vocab_size, stream) }
+            })),
         }
     }
 
@@ -1794,8 +1817,11 @@ impl<'a> GlmfEngine<'a> {
         let conv_state = at(&caches.kda_conv, self.slots * 3 * 3 * d * 2);
         let state = at(&caches.kda_state, self.slots * d * self.cfg.kda_head_dim * 4);
         let replay = at(&caches.kda_replay, replay_bytes(caches.kda_heads, 3 * d));
-        let mut pointers = vec![("x", w.x.buffer.ptr), ("w_in", layer.ptr("w_in")?)];
         let decode = cap == "m64";
+        if layer.has("w_in_fp8") {
+            return self.kda_w8(rank, w, layer, rows, cap, spec, [conv_state, state, replay]);
+        }
+        let mut pointers = vec![("x", w.x.buffer.ptr), ("w_in", layer.ptr("w_in")?)];
         // Decode programs read per-row scales [N, K/128]; prefill ones K-block major.
         let (in_scale, o_scale) = if decode { ("w_in_scale", "w_o_scale") } else { ("w_in_kscale", "w_o_kscale") };
         pointers.extend([("w_in_fp8", layer.ptr_or("w_in_fp8", "w_in")?), (in_scale, layer.ptr_or(in_scale, "w_in")?)]);
@@ -1817,6 +1843,30 @@ impl<'a> GlmfEngine<'a> {
         }
         pointers.push(("scratch", w.scratch.buffer.ptr));
         self.run_on(rank, layer.split, &format!("kda_{cap}"), &pointers, &scalars)
+    }
+
+    /// KDA over the layer's only (FP8, per-row x 128-K, K-major scales) in/out
+    /// projections: `kda_w8_{cap}`. Decode rows up to 16 run the FP8 GEMV, wider
+    /// verify steps W8A16; prefill runs W8A8 on the `--fp8-prefill kda-*` bits, else W8A16.
+    #[allow(clippy::too_many_arguments)]
+    fn kda_w8(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str, spec: bool,
+        [conv_state, state, replay]: [*mut c_void; 3]) -> Result<()> {
+        let decode = cap == "m64";
+        let mut pointers = vec![("x", w.x.buffer.ptr), ("w_in_fp8", layer.ptr("w_in_fp8")?),
+            ("w_in_kscale", layer.ptr("w_in_kscale")?), ("w_fg", layer.ptr("w_fg")?), ("conv_w", layer.ptr("conv_w")?),
+            ("a_log", layer.ptr("a_log")?), ("dt_bias", layer.ptr("dt_bias")?), ("o_norm", layer.ptr("o_norm")?),
+            ("w_o_fp8", layer.ptr("w_o_fp8")?), ("w_o_kscale", layer.ptr("w_o_kscale")?), ("conv_state", conv_state),
+            ("state", state), ("slots", w.kda_slots.buffer.ptr), ("seq_first", w.seq_first.buffer.ptr),
+            ("out", w.delta.buffer.ptr)];
+        let mut scalars = vec![rows, Scalar::I32(if decode { FP8_ROWS } else { self.fp8_prefill.kda_bits })];
+        if decode {
+            pointers.push(("replay", replay));
+            scalars.push(Scalar::I32(i32::from(spec)));
+        } else {
+            ensure!(!spec, "speculative steps are decode-shaped");
+        }
+        pointers.push(("scratch", w.scratch.buffer.ptr));
+        self.run_on(rank, layer.split, &format!("kda_w8_{cap}"), &pointers, &scalars)
     }
 
     /// `[rows, fp8]`: the decode programs' `fp8_rows` (16 when the layer has
@@ -2036,6 +2086,8 @@ impl<'a> GlmfEngine<'a> {
         (0..layers.len()).map(|i| match layers.get(i + 1) {
             Some(next) => {
                 let attention: &[&str] = match next.attention {
+                    GlmNextAttention::Kda if next.has("w_in_fp8") => &["w_in_fp8", "w_in_kscale", "w_fg", "conv_w",
+                        "a_log", "dt_bias", "o_norm", "w_o_fp8", "w_o_kscale"],
                     GlmNextAttention::Kda => &["w_in", "w_fg", "conv_w", "a_log", "dt_bias", "o_norm", "w_o"],
                     GlmNextAttention::Mla => &["w_qkv_a_fp8", "w_qkv_a_scale", "q_a_norm", "kv_a_norm", "w_q_b_fp8",
                         "w_q_b_scale", "w_iq", "w_ik", "k_norm_w", "k_norm_b", "ape", "w_uk", "w_uv", "w_o_fp8",
@@ -2049,12 +2101,8 @@ impl<'a> GlmfEngine<'a> {
             }
             None if rank == 1 => Vec::new(),
             None => {
-                let head = match &self.weights.head_fp8 {
-                    Some((q, scale)) => vec![q, scale],
-                    None => vec![&self.weights.head],
-                };
-                std::iter::once(&self.weights.norm).chain(head).map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes))
-                    .collect()
+                std::iter::once(&self.weights.norm).chain(self.weights.head.allocations())
+                    .map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes)).collect()
             }
         }).collect()
     }

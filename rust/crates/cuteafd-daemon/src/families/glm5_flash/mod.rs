@@ -7,8 +7,8 @@ pub(crate) mod serve;
 mod speculate;
 mod expert_rows;
 mod header;
+pub(crate) mod head;
 mod precision;
-mod storage;
 pub(crate) mod weights;
 
 use anyhow::{ensure, Context, Result};
@@ -74,22 +74,30 @@ pub(crate) struct EngineArgs {
     #[arg(long, default_value_t = 12)]
     pub expert_reserve_gib: usize,
     /// Kept for launch scripts: the MLA, dense and shared-expert projections
-    /// currently require native FP8 (their only copies), from the primary
-    /// checkpoint or --fp8-snapshot. BF16 sources need a matching exporter;
-    /// this compatibility flag does not permit implicit weight quantization.
+    /// are always FP8 (their only copies): the official FP8 release's E4M3
+    /// blocks with --fp8-snapshot (or native FP8 in the primary checkpoint),
+    /// else 128x128 blocks quantized from BF16 at load.
     #[arg(long)]
     pub fp8_decode: bool,
     /// The official FP8 checkpoint (zai-org/GLM-5.3-Flash): the MLA, dense and
     /// shared-expert weights (E4M3 with FP32 128x128 block scales).
     #[arg(long)]
     pub fp8_snapshot: Option<PathBuf>,
-    /// Legacy KDA conversion request. channel/row128 are unsupported until
-    /// all-row consumers can use one resident representation; off preserves BF16.
-    #[arg(long, value_enum, default_value = "off")]
+    /// KDA in/out projections: the checkpoint's BF16 (off), or E4M3 quantized
+    /// per row x 128-K block (row128) or per row (channel) at load, then the
+    /// only resident copy: decode rows up to 16 on the FP8 GEMV, wider verify
+    /// steps and prefill W8A16 (W8A8 with --fp8-prefill kda-in/kda-o).
+    /// Default row128: measured faster (1 RTX + 2 Sparks, with the FP8 head and
+    /// drafter: C4 code 113.8 -> 131.8 tok/s, KL 0.046 -> 0.044, NLL 3.481 -> 3.470,
+    /// top-1 89.1% -> 85.7%); off keeps checkpoint BF16.
+    #[arg(long, value_enum, default_value = "row128")]
     pub kda_fp8: fp8::KdaFp8,
-    /// Legacy separate FP8 head request, unsupported until one shared head
-    /// representation covers target and DFlash across every row shape.
-    #[arg(long)]
+    /// Keep only an E4M3 LM head (per row x 128-K scales, quantized at load):
+    /// every logits call (target, verify, prefill, DFlash drafts) runs the FP8
+    /// head program in 16-row spans; no BF16 head stays resident.
+    /// Default on (measured with --kda-fp8 row128 above); false keeps BF16.
+    #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true",
+        action = clap::ArgAction::Set)]
     pub fp8_head: bool,
     /// Numerics gate only: round the KDA projections through NVFP4 (group 16,
     /// E4M3 scales) at load and run them as BF16: `rtn` (amax/6) or `search`.
@@ -104,10 +112,10 @@ pub(crate) struct EngineArgs {
     pub exl3_window: usize,
     /// Prefill projections that run W8A8 block-FP8 GEMMs (E4M3 activations per
     /// row and 128-K block, FP32 scales): `mla` (q_a|kv_a, q_b, o_proj) and
-    /// `ffn` (dense and shared-expert MLPs) over native FP8 weights, the default
-    /// (without them those run W8A16). `kda-in`, `kda-o` and `all` are
-    /// unsupported until immutable single-copy KDA consumers exist. Use
-    /// `none` (MLA and FFN W8A16, KDA BF16).
+    /// `ffn` (dense and shared-expert MLPs) over their FP8 weights, the default
+    /// (without them those run W8A16), `kda-in` / `kda-o` (the KDA in-projection
+    /// and o_proj over their per-row FP8 weights; needs --kda-fp8 row128 or
+    /// channel), `all`, or `none` (every FP8 weight W8A16, BF16 KDA BF16).
     #[arg(long, value_enum, value_delimiter = ',', default_value = "mla,ffn")]
     pub fp8_prefill: Vec<Fp8PrefillGroup>,
     /// Profiling only: MoE layers run the router, the expert wire rows and the
@@ -125,7 +133,7 @@ pub(crate) struct EngineArgs {
     #[arg(long)]
     pub draft_context_slots: Option<usize>,
     /// Explicit calibration-free E4M3 quantization of own drafter GEMMs.
-    /// Unset/false preserves checkpoint BF16; no dual resident matrices.
+    /// Unset/true: E4M3 single copy (measured faster); false keeps checkpoint BF16.
     #[arg(long, action = clap::ArgAction::Set)]
     pub draft_fp8: Option<bool>,
     /// Scale rule of the FP8 copies made from BF16 weights at load (KDA
@@ -174,6 +182,33 @@ mod draft_cli_tests {
         }
         assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
             "--draft-fp8", "auto"]).is_err());
+    }
+    fn parse(extra: &[&str]) -> EngineArgs {
+        Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native"].into_iter()
+            .chain(extra.iter().copied())).unwrap().engine
+    }
+
+    #[test]
+    fn single_copy_fp8_options_are_accepted() {
+        for extra in [&[][..], &["--kda-fp8", "row128"][..], &["--kda-fp8", "channel"][..], &["--fp8-head"][..],
+            &["--kda-fp8", "row128", "--fp8-prefill", "kda-in,kda-o"][..], &["--fp8-prefill", "all"][..],
+            &["--kda-fp8", "channel", "--fp8-prefill", "all", "--fp8-head"][..], &["--fp8-prefill", "none"][..]] {
+            check_options(&parse(extra)).unwrap();
+        }
+    }
+
+    #[test]
+    fn kda_w8a8_prefill_needs_fp8_kda_weights() {
+        let defaults = parse(&[]);
+        assert_eq!((defaults.kda_fp8, defaults.fp8_head), (fp8::KdaFp8::Row128, true));
+        check_options(&parse(&["--fp8-prefill", "kda-in"])).unwrap();
+        for extra in [&["--kda-fp8", "off", "--fp8-prefill", "kda-in"][..],
+            &["--kda-fp8", "off", "--fp8-prefill", "mla,kda-o"][..], &["--kda-fp8", "off", "--fp8-prefill", "kda-o"][..]] {
+            let error = check_options(&parse(extra)).unwrap_err().to_string();
+            assert!(error.contains("--kda-fp8 row128 or channel"), "{error}");
+        }
+        assert!(check_options(&parse(&["--fp8-prefill", "none,mla"])).is_err());
+        assert!(check_options(&parse(&["--kda-fp8", "row128", "--kda-nvfp4-gate", "rtn"])).is_err());
     }
 }
 
@@ -300,6 +335,18 @@ pub(crate) struct GoldenArgs {
     pub token_check: Option<usize>,
 }
 
+/// Option combinations rejected before any checkpoint or native work.
+fn check_options(args: &EngineArgs) -> Result<()> {
+    let kda_prefill = args.fp8_prefill.iter().any(|g| matches!(g, Fp8PrefillGroup::KdaIn | Fp8PrefillGroup::KdaO));
+    ensure!(!kda_prefill || args.kda_fp8 != fp8::KdaFp8::Off,
+        "--fp8-prefill kda-in/kda-o run over FP8 KDA weights; add --kda-fp8 row128 or channel");
+    ensure!(!args.fp8_prefill.contains(&Fp8PrefillGroup::None) || args.fp8_prefill.len() == 1,
+        "--fp8-prefill none takes no other group");
+    ensure!(args.kda_nvfp4_gate.is_none() || args.kda_fp8 == fp8::KdaFp8::Off,
+        "--kda-nvfp4-gate rounds the BF16 KDA projections; it takes --kda-fp8 off");
+    Ok(())
+}
+
 /// The checkpoint and native library, opened on the calling thread.
 pub(crate) struct Opened {
     pub checkpoint: Checkpoint,
@@ -317,7 +364,7 @@ impl Opened {
 }
 
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
-    storage::check(args)?;
+    check_options(args)?;
     let checkpoint = Checkpoint::open(&args.snapshot)?;
     ensure!(checkpoint.missing_shards.is_empty(), "checkpoint shards missing: {:?}", checkpoint.missing_shards);
     let cfg = GlmNextConfig::read(&args.snapshot)?;
@@ -331,8 +378,8 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     if let Some(snapshot) = &args.draft {
         let head = checkpoint.tensors.iter().find(|t| t.meta.name == "lm_head.weight")
             .context("DFlash target has no lm_head.weight")?;
-        crate::families::glm5::dflash::check_target_bf16_head(&head.meta,
-            cfg.hidden, cfg.vocab_size, args.fp8_head)?;
+        // The drafter borrows the target's one head: BF16, or the FP8 head made from it.
+        crate::families::glm5::dflash::check_target_head_source(&head.meta, cfg.hidden, cfg.vocab_size)?;
         crate::families::glm5::dflash::check_checkpoint(snapshot, args.draft_fp8,
             args.draft_context_slots, args.draft_sequences)?;
     }
@@ -364,6 +411,18 @@ impl Opened {
         -> Result<T> {
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("glm5_flash", args.max_context)?;
+        // The single-copy FP8 consumers of the selected representations, before any weight loads.
+        let mut needed = Vec::new();
+        if args.kda_fp8 != fp8::KdaFp8::Off {
+            needed.extend(["glmf_kda_w8_m64", "glmf_kda_w8_m4096"]);
+        }
+        if args.fp8_head {
+            needed.push("glmf_head_fp8");
+        }
+        for name in needed {
+            programs.spec(name).with_context(|| format!("--kda-fp8/--fp8-head keep only FP8 weights and need \
+                program {name}; this native library predates it"))?;
+        }
         programs.load_all()?;
         let stream = self.library.cuda_stream_create()?;
         // The head split's second GPU and its stream; a head split needs its share's programs
@@ -403,10 +462,15 @@ impl Opened {
             })?;
         let resident: usize = model.layers.iter().map(weights::GlmfLayer::bytes).sum();
         let peer_resident: usize = shares.iter().flatten().map(weights::GlmfLayer::bytes).sum();
+        let single = model.check_single_residency(args.kda_fp8, args.fp8_head)?;
+        let mib = |bytes: usize| bytes as f64 / (1u64 << 20) as f64;
         tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64,
             split_gib = peer_resident as f64 / (1u64 << 30) as f64,
             fp8_source = self.fp8_checkpoint.is_some(), kda_fp8 = ?args.kda_fp8, fp8_prefill = ?args.fp8_prefill,
-            elapsed_ms = started.elapsed().as_millis() as u64, "GLM 5.3 Flash coordinator weights resident");
+            kda_bf16_mib = mib(single.kda_bf16), kda_fp8_mib = mib(single.kda_fp8),
+            head = model.head.name(), head_mib = mib(single.head_bf16 + single.head_fp8),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "GLM 5.3 Flash coordinator weights resident (one copy each)");
         // 0: the planner's automatic pool (free memory after the costs still to come).
         let pool_tokens = if args.pool_tokens == 0 {
             crate::shared::memory_report::planned_pool_tokens(&self.library, &args.snapshot, &[args.device],
@@ -422,13 +486,12 @@ impl Opened {
             tracing::info!(device = args.device, split_device = device, "GLM 5.3 Flash head split over two GPUs");
         }
         engine.full_prefill_logits = args.full_prefill_logits;
-        ensure!(!args.fp8_prefill.contains(&Fp8PrefillGroup::None) || args.fp8_prefill.len() == 1,
-            "--fp8-prefill none takes no other group");
         let group = |g: Fp8PrefillGroup| args.fp8_prefill.iter().any(|&x| x == g || x == Fp8PrefillGroup::All);
+        // `all`: every group with FP8 weights (BF16 KDA has none to run W8A8 over).
+        let kda = args.kda_fp8 != fp8::KdaFp8::Off;
         engine.fp8_prefill = engine::Fp8Prefill { mla: group(Fp8PrefillGroup::Mla), ffn: group(Fp8PrefillGroup::Ffn),
-            kda_bits: i32::from(group(Fp8PrefillGroup::KdaIn)) | (i32::from(group(Fp8PrefillGroup::KdaO)) << 1) };
-        ensure!(engine.fp8_prefill.kda_bits == 0 || args.kda_fp8 == fp8::KdaFp8::Row128,
-            "--fp8-prefill kda reads the per-row FP8 copies --kda-fp8 row128 loads");
+            kda_bits: i32::from(kda && group(Fp8PrefillGroup::KdaIn))
+                | (i32::from(kda && group(Fp8PrefillGroup::KdaO)) << 1) };
         if let Some(snapshot) = &args.draft {
             let started = Instant::now();
             let cfg = crate::families::glm5::dflash::DflashConfig::read(snapshot)?;

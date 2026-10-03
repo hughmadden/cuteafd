@@ -79,8 +79,8 @@ pub fn spec_from(cfg: &MimoV2Config, checkpoint: &Checkpoint) -> ModelSpec {
             CUTEAFD_MIMO_GEOMETRIES={family})"));
     }
     if crate::families::mimo_v2::weight_policy::default_policy(checkpoint, cfg)
-        == crate::families::mimo_v2::weight_policy::MimoDefaultPolicy::QualifiedProFp8 {
-        notes.push("qualified MiMo V2.6 Pro default: single-copy FP8 target head/O and qualified embedded DFlash; native QKV/FFN unchanged. --weight-policy checkpoint keeps source formats; explicit per-weight flags override. Signature checks config/header metadata, not payload integrity.".into());
+        == crate::families::mimo_v2::weight_policy::MimoDefaultPolicy::Fp8 {
+        notes.push("measured MiMo default: single-copy FP8 target head/O and DFlash drafter; native QKV/FFN unchanged. --weight-policy checkpoint keeps source formats; explicit per-weight flags override.".into());
         if let Ok(memory) = crate::families::mimo_v2::weight_policy::qualified_projection_memory(cfg) {
             notes.push(format!("default target head/O across coordinator ranks: checkpoint source {} B ({:.3} GiB), selected FP8 resident {} B ({:.3} GiB), maximum drained packing source {} B ({:.3} GiB); these costs use the runtime projection descriptor and exclude other weights, optional DFlash and runtime state",
                 memory.source_bytes, memory.source_bytes as f64 / GIB,
@@ -201,8 +201,9 @@ impl Family for MiMo {
                         over six ranks: whole 32-blocks per rank ({widest}/{} rows) zero-padded to {padded}, \
                         {:.1} GiB per rank (TP2xEP3: {:.1} GiB, but a decode step reads all of a row's experts \
                         that land on one EP group). The SM121 Spark package streams MXFP8 x MXFP4 gate/up \
-                        above 640 live rows; smaller row counts use the grouped route. The down projection \
-                        consumes BF16 SwiGLU output and widens MXFP4 weights for BF16 MMA.",
+                        above 640 live rows, and its down projection quantizes the BF16 SwiGLU rows per K32 to \
+                        MXFP8 for block-scaled MXFP8 x MXFP4 MMAs (FP8_EXPERT_PREFILL=w8a16 keeps BF16 down); \
+                        smaller row counts use the grouped route.",
                         widest - 32, per_rank(padded), per_rank(i / 2) / 3.0),
                 })
             }

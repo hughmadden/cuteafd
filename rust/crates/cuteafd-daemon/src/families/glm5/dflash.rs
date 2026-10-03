@@ -20,8 +20,10 @@
 //! quantization selects one E4M3 representation at load, with FP32 scales
 //! per output row and 128-wide K block. The existing W8A16 kernel covers
 //! every draft/context row count; no BF16 fallback or packed head copy is
-//! retained. Both modes borrow the target's BF16 head. The target verifies
-//! every proposal. After Hugh Madden's glm53f-afd (MIT, v1.1.0 16de2a6).
+//! retained. Both modes borrow the target's one resident head
+//! ([`TargetHead`]): its BF16 matrix, or its own launcher (GLM 5.3 Flash's
+//! FP8-only head). The target verifies every proposal. After Hugh Madden's
+//! glm53f-afd (MIT, v1.1.0 16de2a6).
 use crate::shared::fp8_linear::{self, Fp8Weight};
 use crate::shared::memory::DeviceAllocation;
 use crate::shared::token_io::TokenEmbedding;
@@ -285,6 +287,25 @@ pub(crate) struct Draft {
     pub features: Vec<[f32; 4]>,
 }
 
+/// FP32 logits `[rows, vocab]` of BF16 rows `[rows, hidden]` on a stream: `(x, logits, rows, stream)`.
+pub(crate) type HeadLaunch<'h> = Box<dyn Fn(*const c_void, *mut f32, usize, *mut c_void) -> Result<()> + 'h>;
+
+/// The target's vocabulary head a draft step borrows: its only resident copy,
+/// never duplicated or repacked by the drafter.
+pub(crate) enum TargetHead<'h> {
+    /// The target's checkpoint BF16 `[vocab, hidden]`.
+    Bf16(&'h Dev<'h>),
+    /// A target-owned launcher over another representation (GLM 5.3 Flash's
+    /// FP8-only head in 16-row spans); the drafter's head workspace is unused.
+    Launch(HeadLaunch<'h>),
+}
+
+/// A resolved [`TargetHead`] inside a draft step.
+enum HeadCall<'h> {
+    Bf16(*const c_void),
+    Launch(&'h HeadLaunch<'h>),
+}
+
 /// Where a draft step's input rows come from.
 #[derive(Clone, Copy)]
 enum DraftInput<'r, 'e> {
@@ -406,8 +427,14 @@ pub(crate) fn check_snapshot_target_bf16_head(snapshot: &Path, hidden: usize, vo
 pub(crate) fn check_target_bf16_head(t: &SafetensorsTensorMetadata, hidden: usize, vocab: usize,
     explicit_fp8_head: bool) -> Result<()> {
     ensure!(!explicit_fp8_head,
-        "{}: --fp8-head with DFlash is unsupported: add one compact target/drafter head consumer; \
+        "{}: --fp8-head with this DFlash target is unsupported: its head has no shared FP8 launcher; \
          retaining a BF16 head beside an FP8 target copy is not supported", t.name);
+    check_target_head_source(t, hidden, vocab)
+}
+
+/// The checkpoint head the target loads (BF16, or quantized from it to the
+/// target's one FP8 head) and the drafter borrows: BF16 `[vocab, hidden]`.
+pub(crate) fn check_target_head_source(t: &SafetensorsTensorMetadata, hidden: usize, vocab: usize) -> Result<()> {
     ensure!(t.dtype == DType::Bf16,
         "{}: shared DFlash head requires checkpoint BF16, found {:?}; add a source-native compact \
          target/drafter head consumer instead of widening or copying the checkpoint", t.name, t.dtype);
@@ -713,18 +740,24 @@ impl<'a> GlmDrafter<'a> {
     }
 
     /// Drafts `block - 1` tokens after each sequence's anchor. `anchor_rows`
-    /// holds the anchors' embedding rows; `head` is the target's vocabulary
-    /// head [vocab, hidden] BF16.
-    pub fn draft(&self, sequences: &[DraftSeq], anchor_rows: &[u8], head: &Dev<'_>) -> Result<Vec<Draft>> {
-        self.draft_from(sequences, DraftInput::Rows(anchor_rows), self.borrowed_head(head)?)
+    /// holds the anchors' embedding rows; `head` is the target's vocabulary head.
+    pub fn draft(&self, sequences: &[DraftSeq], anchor_rows: &[u8], head: TargetHead<'_>) -> Result<Vec<Draft>> {
+        self.draft_from(sequences, DraftInput::Rows(anchor_rows), self.head_call(&head)?)
     }
 
     /// [`Self::draft`] with the block's input rows gathered from the target's
     /// embedding table by token id: each anchor, then the mask token (the
     /// drafter's mask row is that table row).
-    pub fn draft_device(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>, head: &Dev<'_>)
+    pub fn draft_device(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>, head: TargetHead<'_>)
         -> Result<Vec<Draft>> {
-        self.draft_from(sequences, DraftInput::Table(embedding), self.borrowed_head(head)?)
+        self.draft_from(sequences, DraftInput::Table(embedding), self.head_call(&head)?)
+    }
+
+    fn head_call<'h>(&self, head: &'h TargetHead<'h>) -> Result<HeadCall<'h>> {
+        Ok(match head {
+            TargetHead::Bf16(owner) => HeadCall::Bf16(self.borrowed_head(owner)?),
+            TargetHead::Launch(launch) => HeadCall::Launch(launch),
+        })
     }
 
     fn borrowed_head(&self, owner: &Dev<'_>) -> Result<*const c_void> {
@@ -736,8 +769,8 @@ impl<'a> GlmDrafter<'a> {
         Ok(owner.buffer.ptr)
     }
 
-    fn draft_from(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: *const c_void) -> Result<Vec<Draft>> {
-        ensure!(!head.is_null(), "DFlash has no borrowed target BF16 head; add a compact head consumer");
+    fn draft_from(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: HeadCall<'_>) -> Result<Vec<Draft>> {
+        ensure!(!matches!(head, HeadCall::Bf16(p) if p.is_null()), "DFlash has no borrowed target head");
         let c = &self.cfg;
         let (s_count, block, h) = (sequences.len(), c.block, c.hidden);
         let rows_ok = match input {
@@ -821,7 +854,11 @@ impl<'a> GlmDrafter<'a> {
                 l.glm_dflash_conv_residual_norm(w.delta.buffer.ptr, w.dynamic.buffer.ptr, layer.mlp_base.buffer.ptr,
                     w.h.buffer.ptr, next, w.h.buffer.ptr, w.n.buffer.ptr, rows, block, h, group, eps, s)?;
             }
-            super::launch_head(l, &w.head, w.n.buffer.ptr, head, w.logits.buffer.ptr.cast(), rows, h, c.vocab, s)?;
+            match &head {
+                HeadCall::Bf16(weight) => super::launch_head(l, &w.head, w.n.buffer.ptr, *weight,
+                    w.logits.buffer.ptr.cast(), rows, h, c.vocab, s)?,
+                HeadCall::Launch(launch) => launch(w.n.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), rows, s)?,
+            }
             l.glm_dflash_topk(w.logits.buffer.ptr, w.unary.buffer.ptr, w.candidates.buffer.ptr,
                 w.topk_workspace.buffer.ptr, s_count, block, c.drafts(), c.vocab, s)?;
             self.linear(w.n.buffer.ptr, &self.projection, 0,
@@ -937,7 +974,8 @@ impl ReplayDrafter for GlmDrafter<'_> {
         -> Result<Vec<Vec<u32>>> {
         let seqs: Vec<DraftSeq> = seqs.iter().map(|&(slot, anchor, position)| DraftSeq { slot, anchor, position, valid_from: 0 }).collect();
         // Replay's caller keeps the target BF16 head owner live throughout.
-        Ok(self.draft_from(&seqs, DraftInput::Rows(anchor_rows), head)?.into_iter().map(|d| d.tokens).collect())
+        Ok(self.draft_from(&seqs, DraftInput::Rows(anchor_rows), HeadCall::Bf16(head))?.into_iter()
+            .map(|d| d.tokens).collect())
     }
 
     fn tap_rows(&self) -> usize {

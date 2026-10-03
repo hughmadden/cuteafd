@@ -126,8 +126,8 @@ def _family_launch_lines(tmp_path: Path, family_config: dict, model: str, keys: 
     return _family_launch_result(tmp_path, family_config, model, keys).stderr
 
 
-@pytest.mark.parametrize("mode,expected", [(None, "off"), ("auto", "off"), ("off", "off")])
-def test_glmf_kda_preserves_checkpoint_bf16(tmp_path, mode, expected):
+@pytest.mark.parametrize("mode,expected", [(None, "row128"), ("auto", "row128"), ("off", "off")])
+def test_glmf_kda_defaults_to_single_copy_fp8(tmp_path, mode, expected):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
@@ -141,19 +141,39 @@ def test_glmf_kda_preserves_checkpoint_bf16(tmp_path, mode, expected):
     assert launch.count("--kda-fp8") == 1
 
 
-@pytest.mark.parametrize("key,value", [
-    ("GLM5_FLASH_KDA_FP8", "row128"), ("GLMF_KDA_FP8", "channel"),
-    ("GLM5_FLASH_FP8_HEAD", "on"), ("GLMF_FP8_HEAD", "on"),
-    ("GLM5_FLASH_FP8_PREFILL", "all"), ("GLMF_FP8_PREFILL", "mla,kda-in"),
-    ("GLM5_FLASH_FP8_PREFILL", "kda-o,ffn"),
+@pytest.mark.parametrize("keys,expected", [
+    ("GLM5_FLASH_KDA_FP8=row128\n", ["--kda-fp8 row128"]),
+    ("GLMF_KDA_FP8=channel\n", ["--kda-fp8 channel"]),
+    ("GLM5_FLASH_FP8_HEAD=on\n", ["--fp8-head"]),
+    ("GLMF_FP8_HEAD=on\n", ["--fp8-head"]),
+    ("GLM5_FLASH_KDA_FP8=row128\nGLM5_FLASH_FP8_PREFILL=all\n", ["--fp8-prefill all"]),
+    ("GLMF_KDA_FP8=row128\nGLMF_FP8_PREFILL=mla,kda-in\n", ["--fp8-prefill mla,kda-in"]),
+    ("GLM5_FLASH_KDA_FP8=channel\nGLM5_FLASH_FP8_PREFILL=kda-o,ffn\n", ["--fp8-prefill kda-o,ffn"]),
 ])
-def test_glmf_duplicate_storage_options_fail_before_workers_launch(tmp_path, key, value):
+def test_glmf_single_copy_fp8_options_are_forwarded(tmp_path, keys, expected):
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
+              "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    result = _family_launch_result(tmp_path, config, "test/glmf", f"GLM5_FLASH_FP8_MODEL_ID=off\n{keys}")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    for option in expected:
+        assert option in launch, launch
+
+
+@pytest.mark.parametrize("key,value,message", [
+    ("GLM5_FLASH_FP8_PREFILL", "all", "GLM5_FLASH_KDA_FP8=row128"),
+    ("GLMF_FP8_PREFILL", "mla,kda-in", "GLM5_FLASH_KDA_FP8=row128"),
+    ("GLM5_FLASH_FP8_PREFILL", "kda-o,ffn", "GLM5_FLASH_KDA_FP8=row128"),
+    ("GLM5_FLASH_FP8_HEAD", "maybe", "GLM5_FLASH_FP8_HEAD must be"),
+])
+def test_glmf_invalid_fp8_options_fail_before_workers_launch(tmp_path, key, value, message):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
     result = _family_launch_result(tmp_path, config, "test/glmf",
-                                  f"GLM5_FLASH_FP8_MODEL_ID=off\n{key}={value}\n")
-    assert result.returncode == 2 and "single-copy" in result.stderr
+                                  f"GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_KDA_FP8=off\n{key}={value}\n")
+    assert result.returncode == 2 and message in result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 

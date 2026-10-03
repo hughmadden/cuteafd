@@ -45,11 +45,18 @@ pub(crate) struct EngineArgs {
     pub slots: usize,
     #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
-    /// Legacy E4M3 projection conversion request. Currently unsupported: the
-    /// narrow-row consumer requires a second BF16 copy for wider rows.
-    /// Checkpoint BF16 is preserved by default.
+    /// Hold the GDN and attention in/out projections (target and MTP layers)
+    /// as E4M3 with FP32 128x128 block scales, quantized at load, INSTEAD of
+    /// the checkpoint's BF16 (no BF16 copy stays resident): every step shape
+    /// runs the `qwen4_*_w8_*` programs (decode: 16-row GEMV, W8A16 TMA above;
+    /// prefill: W8A16, bitwise BF16 over the dequantized weights, or W8A8 with
+    /// --fp8-prefill-w8a8). Default false: checkpoint BF16.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub fp8_decode: bool,
+    /// With --fp8-decode: prefill programs quantize their activations too
+    /// (E4M3 per row and 128-K block; the GDN in-projection stays W8A16).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, requires = "fp8_decode")]
+    pub fp8_prefill_w8a8: bool,
     /// Scale rule of the FP8 copies made from BF16 weights at load: amax /
     /// 448, the smallest power of two >= it (pow2), or per block whichever of
     /// the two leaves the smaller error (best).
@@ -96,9 +103,13 @@ pub(crate) struct EngineArgs {
     /// its experts local) and verifies up to this many drafts per sequence.
     #[arg(long, default_value_t = 0)]
     pub mtp: usize,
-    /// Legacy separate E4M3 MTP head request. Currently unsupported because it
-    /// duplicates the target head. MTP borrows the checkpoint BF16 head by default.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    /// Hold lm_head as E4M3 with FP32 per-row x 128-K scales (quantized on the
+    /// host at load) INSTEAD of BF16: the one head the target (prefill, verify,
+    /// golden rows) and the MTP drafts share, every logits row through
+    /// `qwen4_head_fp8` in 16-row spans. Default false: both share the BF16 head.
+    /// Default true: measured on one RTX (C1 code 196 -> 222 tok/s, KL 0.034 ->
+    /// 0.036, top-1 unchanged 88.5%). --fp8-decode stays off: KL +0.012.
+    #[arg(long, alias = "fp8-head", default_value_t = true, action = clap::ArgAction::Set)]
     pub mtp_fp8_head: bool,
     #[command(flatten)]
     pub token_io: crate::shared::token_io::TokenIoArgs,
@@ -197,22 +208,8 @@ impl Opened {
     }
 }
 
-impl EngineArgs {
-    fn validate_weight_storage(&self) -> Result<()> {
-        ensure!(!self.fp8_decode,
-            "Qwen --fp8-decode true is unsupported: GDN/attention projections retain both BF16 and FP8 weights; \
-             add compact consumers for prefill and every verification row count before enabling conversion; \
-             use --fp8-decode false to preserve checkpoint BF16");
-        ensure!(!self.mtp_fp8_head,
-            "Qwen --mtp-fp8-head true is unsupported: the private FP8 lm_head duplicates the target's BF16 head; \
-             add one shared head representation for target and MTP before enabling conversion; \
-             use --mtp-fp8-head false to share checkpoint BF16");
-        Ok(())
-    }
-}
-
 #[cfg(test)]
-mod checkpoint_precision_tests {
+mod weight_representation_tests {
     use super::*;
     use clap::Parser;
 
@@ -222,38 +219,35 @@ mod checkpoint_precision_tests {
         engine: EngineArgs,
     }
 
-    fn args(extra: &[&str]) -> EngineArgs {
+    fn args(extra: &[&str]) -> std::result::Result<EngineArgs, clap::Error> {
         Command::try_parse_from(["qwen", "--snapshot", "/missing/checkpoint", "--native-lib", "/missing/native.so"]
-            .into_iter().chain(extra.iter().copied())).unwrap().engine
+            .into_iter().chain(extra.iter().copied())).map(|c| c.engine)
     }
 
     #[test]
-    fn default_target_and_mtp_keep_checkpoint_weights_without_private_copies() {
-        for extra in [&[][..], &["--mtp", "1"][..], &["--fp8-decode", "false", "--mtp-fp8-head", "false"][..]] {
-            let args = args(extra);
-            assert!(!args.fp8_decode);
-            assert!(!args.mtp_fp8_head);
-            args.validate_weight_storage().unwrap();
+    fn measured_defaults_fp8_head_bf16_projections_and_options() {
+        for extra in [&[][..], &["--mtp", "1"][..]] {
+            let parsed = args(extra).unwrap();
+            assert!(!parsed.fp8_decode && parsed.mtp_fp8_head && !parsed.fp8_prefill_w8a8);
         }
+        assert!(!args(&["--mtp-fp8-head", "false"]).unwrap().mtp_fp8_head);
+        let parsed = args(&["--fp8-decode", "true", "--mtp-fp8-head", "true", "--fp8-prefill-w8a8", "true"]).unwrap();
+        assert!(parsed.fp8_decode && parsed.mtp_fp8_head && parsed.fp8_prefill_w8a8);
+        assert!(args(&["--fp8-head", "true"]).unwrap().mtp_fp8_head);
+        // The W8A8 switch applies to FP8-only projections only.
+        assert!(args(&["--fp8-prefill-w8a8", "true"]).is_err());
     }
 
     #[test]
-    fn duplicate_projection_request_fails_before_checkpoint_or_native_open() {
-        let error = open(&args(&["--fp8-decode", "true"])).err().unwrap().to_string();
-        assert!(error.contains("GDN/attention projections retain both BF16 and FP8"), "{error}");
-        assert!(error.contains("every verification row count"), "{error}");
-    }
-
-    #[test]
-    fn duplicate_head_request_fails_before_checkpoint_or_native_open() {
-        let error = open(&args(&["--mtp", "1", "--mtp-fp8-head", "true"])).err().unwrap().to_string();
-        assert!(error.contains("private FP8 lm_head duplicates"), "{error}");
-        assert!(error.contains("one shared head representation"), "{error}");
+    fn fp8_requests_reach_the_checkpoint_instead_of_a_refusal() {
+        for extra in [&["--fp8-decode", "true"][..], &["--mtp", "1", "--mtp-fp8-head", "true"][..]] {
+            let error = open(&args(extra).unwrap()).err().unwrap().to_string();
+            assert!(!error.contains("unsupported"), "{error}");
+        }
     }
 }
 
 pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
-    args.validate_weight_storage()?;
     let checkpoint = Checkpoint::open(&args.snapshot)?;
     ensure!(checkpoint.missing_shards.is_empty(), "checkpoint shards missing: {:?}", checkpoint.missing_shards);
     let cfg = Qwen4Config::read(&args.snapshot)?;
@@ -286,6 +280,20 @@ impl Opened {
         -> Result<T> {
         let programs = self.library.programs()?.with_manifest(&args.manifest)?;
         programs.capacities().require_context("qwen4", args.max_context)?;
+        let mut required: Vec<String> = Vec::new();
+        if args.fp8_decode {
+            for cap in ["m64".to_string(), format!("m{}", args.prefill_rows)] {
+                required.extend(["gdn", "attn_producer", "attn_o"].map(|p| format!("qwen4_{p}_w8_{cap}")));
+            }
+        }
+        if args.mtp_fp8_head {
+            required.push("qwen4_head_fp8".into());
+        }
+        for name in &required {
+            programs.spec(name).with_context(|| format!("--fp8-decode / --mtp-fp8-head need the FP8-only program \
+                {name} (export_b12x_dsv4_aot.py qwen4 with the fork's fp8_only Qwen programs); rebuild the native \
+                library or run with checkpoint BF16 (--fp8-decode false --mtp-fp8-head false)"))?;
+        }
         programs.load_all()?;
         let stream = self.library.cuda_stream_create()?;
         let started = Instant::now();
@@ -297,9 +305,22 @@ impl Opened {
             args.token_io.embed_placement,
             || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers, args.mtp > 0 && layers == self.cfg.layers, args.mtp_fp8_head) })?;
         let resident: usize = model.layers.iter().map(weights::Qwen4Layer::bytes).sum::<usize>()
-            + model.mtp.as_ref().map_or(0, weights::MtpWeights::bytes);
-        tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64,
-            elapsed_ms = started.elapsed().as_millis() as u64, "Qwen 3.8 Flash Next coordinator weights resident");
+            + model.mtp.as_ref().map_or(0, weights::MtpWeights::bytes) + model.head.bytes();
+        // One resident representation per selectable weight, as the plan accounts for it.
+        let (projections, head) = model.check_single_residency(args.fp8_decode, args.mtp_fp8_head)?;
+        let selection = cuteafd_loader::families::qwen4::resident::Qwen4Representation {
+            fp8_projections: args.fp8_decode, fp8_head: args.mtp_fp8_head };
+        let plan = cuteafd_loader::families::qwen4::resident::resident_bytes(&self.cfg, layers, model.mtp.is_some(),
+            selection);
+        ensure!(projections == plan.projections && head == plan.head,
+            "selectable weights hold {projections} + {head} B, the plan {} + {} B", plan.projections, plan.head);
+        let gib = |bytes: usize| bytes as f64 / (1u64 << 30) as f64;
+        tracing::info!(layers, gib = gib(resident), elapsed_ms = started.elapsed().as_millis() as u64,
+            projections = if args.fp8_decode { "fp8-only" } else { "bf16" },
+            head = if args.mtp_fp8_head { "fp8-only (shared)" } else { "bf16 (shared)" },
+            projection_gib = gib(projections), head_gib = gib(head),
+            checkpoint_bf16_gib = gib(plan.projections_bf16 + plan.head_bf16),
+            "Qwen 3.8 Flash Next coordinator weights resident (one representation per weight)");
         let ple = match self.cfg.ple_layers.first() {
             Some(&layer) if layer < layers => Some(ple::PleTable::load(&self.library, &self.checkpoint, &self.cfg,
                 layer, args.table_placement, &args.table, args.prefill_rows.max(engine::DECODE_ROWS))?),
@@ -308,6 +329,7 @@ impl Opened {
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::Qwen4Engine::new(&self.library, &programs, self.cfg.clone(), model, ple, stream,
             args.max_context, args.prefill_rows, pages, args.slots, embedding)?;
+        engine.w8a8_prefill = args.fp8_prefill_w8a8;
         if let Some(experts) = self.experts(args, layers)? {
             engine.set_experts(experts);
         }

@@ -572,9 +572,21 @@ Follow-ups (2026-10-03, measurements pending in `~/.cache/cuteafd/builds/v1-memo
   stays per allocation.
 - Exact Spark slices: FP8/MXFP4/NVFP4 Spark packages also build tp<n>-w<width>
   layouts (ranks own whole 128-row blocks, no zero padding; MiMo V2.6 Pro TP6
-  ranks 4-5 61.9 instead of 92.8 GiB); EXL3 already had them. Shortening the
-  busiest rank (352/320 rows) needs 32-row K tails in the MXFP4 down projection:
-  after `work/mimo-perf` (A8 down) lands on fork master. V4.1 TP4 (576 -> 640)
+  ranks 4-5 61.9 instead of 92.8 GiB); EXL3 already had them. Measured MiMo V2.6
+  Pro 2 RTX + 6 Sparks, exact vs padded: rank 5 free 11.8 -> 43.2 GiB (rank 0
+  unchanged), golden NLL 2.4150 -> 2.4088 (KL 0.0457 -> 0.0445; rank partials
+  partition the rows differently), engine 8K prefill 3095 -> 3002 tok/s, served
+  8K 2684 -> 2725, C1 63.9-69.1 -> 68.5-69.5, C4 102-108 both: neutral. Shortening the
+  busiest rank (352/320 rows) needs 32-row tails in three MXFP4 kernels (fork
+  master now has `work/mimo-perf`'s A8 down): the decode GEMV (`GroupedMxfp4Gemv`
+  needs K % (128 x warps) for down), the BF16 stream down (`I % 128`, 128-K
+  weight blocks) and the A8 stream down (128-K blocks via cp.async, u32 scale
+  loads). Gate/up already tiles I in 32 rows (11 vs 12 CTA columns: -8%); down
+  only gains if its last K block is predicated at 32 (TMA zero-fill covers the
+  BF16 route's loads; the A8 route needs predicated cp.async), and scale rows
+  of I/32 = 11 bytes need padding to 12 in the package layout. Expected: busiest
+  rank -5..-8% expert time (MiMo Pro prefill is Spark-bound) and -7.7 GiB on
+  ranks 0-3. V4.1 TP4 (576 -> 640)
   goes through the V4.1 packer: not done.
 - V4.1 one RTX: row buffers at the live 2048-row chunk instead of the 4096 AOT
   capacity (as on two RTX), reindex selection shares the source's scratch:
@@ -769,7 +781,11 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
    wave is bound by bytes (FC1 BF16 input gathers per N tile, FC2 partial
    round trip ~2 ms, top-k sum 1.6 ms) and the FC1 rotation, not MMA rate.
    Coordinator GPU-only 8K prefill is 2.7 s, half of it the sparse MLA prefill
-   kernel (FP8 MMA rework: `work/glm-mla-fp8`). Lanes 2 or 4 lose to 3.
+   kernel. E4M3 MLA prefill (`work/glm-mla-fp8`, merged, default e4m3-p2;
+   real-expert TP4 gate: KL vs golden 0.0364 -> 0.0379, NLL 2.4680 -> 2.4717,
+   deterministic) cuts the GPU-only 8K prefill 2.89 -> 2.57 s, but 8K with
+   Sparks stays 2.95 s (GPU wait 2.11 -> 1.45 s, Spark wait up): the GB10
+   wave is the bound. Lanes 2 or 4 lose to 3.
    Verify layouts (busiest-rank expert reads, uniform routes): TP6 beats
    TP2xEP3 up to 16 rows (1.50 vs 2.02 expert-equivalents at 1 row, 10.8 vs
    11.2 at 8) and loses by 1-8% only at 32-64 rows; keep TP6. DFlash2 at max

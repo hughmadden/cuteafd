@@ -71,10 +71,14 @@ impl Family for Qwen {
                 vec![MappedTableSpec { name: "ple-ngram".into(), layers: cfg.ple_layers.clone() }]
             },
             vision: checkpoint.config.get("vision_config").is_some(),
-            notes: vec![format!(
-                "hyper-connections {} (low rank {}), indexer budget {}",
-                cfg.hc_count, cfg.hc_lowrank, cfg.index_budget
-            )],
+            notes: {
+                let mut notes = vec![format!(
+                    "hyper-connections {} (low rank {}), indexer budget {}",
+                    cfg.hc_count, cfg.hc_lowrank, cfg.index_budget
+                )];
+                notes.extend(representation_notes(&cfg));
+                notes
+            },
         };
         let programs = cfg.check_programs().map_err(|e| format!("{e:#}"));
         Ok(Box::new(QwenModel { cfg, spec, programs }))
@@ -168,6 +172,29 @@ impl Family for Qwen {
         };
         Some(Hint { what, how })
     }
+}
+
+const GIB: f64 = (1u64 << 30) as f64;
+
+/// The selectable resident representations (serve-qwen4 `--fp8-decode`, `--mtp-fp8-head`):
+/// one format per weight, never BF16 plus an FP8 copy.
+fn representation_notes(cfg: &Qwen4Config) -> Vec<String> {
+    use crate::families::qwen4::resident::{resident_bytes, Qwen4Representation};
+
+    let mtp = cfg.mtp_layers > 0;
+    let all = resident_bytes(cfg, cfg.layers, mtp, Qwen4Representation { fp8_projections: true, fp8_head: true });
+    let gib = |bytes: usize| bytes as f64 / GIB;
+    vec![
+        format!("GDN/attention in-out projections ({} layers{}): checkpoint BF16 {:.2} GiB resident by default; \
+            --fp8-decode true holds them as E4M3 + FP32 128x128 block scales only ({:.2} GiB; qwen4_*_w8 programs: \
+            16-row GEMV, W8A16 above and in prefill, --fp8-prefill-w8a8 for E4M3 activations), converting one \
+            BF16 matrix at a time (<= {:.0} MiB device staging)",
+            cfg.layers, if mtp { " + MTP" } else { "" }, gib(all.projections_bf16), gib(all.projections_fp8),
+            all.max_device_staging as f64 / (1u64 << 20) as f64),
+        format!("lm_head (shared by target and MTP drafts): BF16 {:.2} GiB by default; --mtp-fp8-head true holds \
+            one E4M3 head with per-row x 128-K scales ({:.2} GiB, quantized on the host) and runs every logits \
+            row through qwen4_head_fp8 in 16-row spans", gib(all.head_bf16), gib(all.head_fp8)),
+    ]
 }
 
 struct QwenModel {
