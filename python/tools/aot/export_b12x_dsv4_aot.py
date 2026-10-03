@@ -332,6 +332,18 @@ def qwen4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         (f"attn_o_fp8_m{rows}", "attn_o", {"max_rows": rows, "fp8": True},
          lambda: attn.compile_qwen4_attn_o_aot(g, max_rows=rows, fp8=True)),
     ]
+    # Single-copy FP8 projections (serve-qwen4 --fp8-decode): the GDN in/out and attention
+    # in/o weights as E4M3 + FP32 128x128 block scales only. Decode: 16-row GEMV, W8A16 above;
+    # prefill: ``fp8_rows`` 0 W8A16, nonzero W8A8 (the GDN in-projection stays W8A16).
+    for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
+        out += [
+            (f"gdn_w8_m{rows}", "gdn", {"max_rows": rows, "fp8_only": mode},
+             lambda r=rows, m=mode: qwen4_gdn.compile_qwen4_gdn_aot(g, max_rows=r, fp8_only=m)),
+            (f"attn_producer_w8_m{rows}", "attn_producer", {"max_rows": rows, "fp8_only": mode},
+             lambda r=rows, m=mode: attn.compile_qwen4_attn_producer_aot(g, max_rows=r, fp8_only=m)),
+            (f"attn_o_w8_m{rows}", "attn_o", {"max_rows": rows, "fp8_only": mode},
+             lambda r=rows, m=mode: attn.compile_qwen4_attn_o_aot(g, max_rows=r, fp8_only=m)),
+        ]
     return out
 
 
