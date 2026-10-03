@@ -559,10 +559,17 @@ geometry in the planner, graph-cache bounds, `placement.json` handoff (S1).
 Follow-ups (2026-10-03, measurements pending in `~/.cache/cuteafd/builds/v1-memory/kit/out`):
 - GLM 5.3 decode graphs bounded: steps pad to row buckets (exact to 16, then
   20..64) over a scratch page past the pool, page tables to power-of-two widths
-  >= 16 pages; every shape captured at startup (5,688 graphs in 2.0 s on one
-  GPU with the first bucket set); real rows' logits byte-identical to unpadded
-  steps; a failed capture runs its segment uncaptured (keeps the peer exchange
-  in step). GLM's auto pool stays opt-in until graph memory and C1/C4 are in.
+  >= 16 pages; every shape captured at startup (2 RTX + 6 Sparks: 22,608
+  graphs, 1.96 / 1.80 GiB per GPU, 5.8 s); real rows' logits byte-identical to
+  unpadded steps; a failed capture runs its segment uncaptured (keeps the peer
+  exchange in step). Measured vs base (2 launches each, 4 batches): C1 54.5 vs
+  51.8 tok/s (no per-request captures), C4 85.8 vs 84.2, 8K prefill unchanged;
+  untracked memory now flat after startup. GLM 5.3 POOL_TOKENS defaults to auto:
+  262144 -> 1,292,672 tokens (65 GiB KV per GPU), 2.7 GiB left on GPU0 after the
+  bench, C1 53.3 / C4 85.1 / prefill 2853 tok/s.
+- V4.1 quick parity for the ledger (1 RTX + 4 Sparks, code, warm): C1 155.7 ->
+  154.7, C16 1049.6 -> 1054.8, 8K prefill 6160 -> 6331 tok/s: no cost; tagging
+  stays per allocation.
 - Exact Spark slices: FP8/MXFP4/NVFP4 Spark packages also build tp<n>-w<width>
   layouts (ranks own whole 128-row blocks, no zero padding; MiMo V2.6 Pro TP6
   ranks 4-5 61.9 instead of 92.8 GiB); EXL3 already had them. Shortening the
@@ -570,9 +577,11 @@ Follow-ups (2026-10-03, measurements pending in `~/.cache/cuteafd/builds/v1-memo
   after `work/mimo-perf` (A8 down) lands on fork master. V4.1 TP4 (576 -> 640)
   goes through the V4.1 packer: not done.
 - V4.1 one RTX: row buffers at the live 2048-row chunk instead of the 4096 AOT
-  capacity (as on two RTX), reindex selection shares the source's scratch
-  (~10 GiB expected -> one more RTX expert layer). Left: window-wave
-  temporaries (3.5 GiB, per-layer streams) and engram gate sharing (0.6 GiB).
+  capacity (as on two RTX), reindex selection shares the source's scratch:
+  workspaces 21.08 -> 11.01 GiB, RTX expert layers 5 -> 6 (6.0 GiB still free),
+  C1 154.7 -> 159.1, C16 1054.8 -> 1086.3, 8K prefill 6331 -> 6326 tok/s. Left:
+  window-wave temporaries (3.5 GiB, per-layer streams; would make 7 layers) and
+  engram gate sharing (0.6 GiB).
 
 **Device-driven Spark exchange (decided 2026-10-02, `work/v41-device`).** No engine is
 device-routed toward the Sparks today: every family (V4, GLM, GLM Flash, MiMo, Qwen) downloads
