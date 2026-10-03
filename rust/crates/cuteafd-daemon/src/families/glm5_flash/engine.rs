@@ -1362,7 +1362,7 @@ impl<'a> GlmfEngine<'a> {
             ("pool_logical", self.pool_logical.buffer.ptr), ("page_table", w.page_table.buffer.ptr),
             ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr)],
             &[rows, Scalar::I32(tables.page_stride as i32)])?;
-        if !tables.decode && crate::families::glm5::engine::native_mla_prefill() {
+        if let (false, Some(kernel)) = (tables.decode, crate::families::glm5::engine::native_mla_prefill()) {
             let scale = (self.cfg.qk_nope_dim as f32).powf(-0.5);
             self.timed("glm_mla_prefill (native)", || {
                 // SAFETY: query, record cache, indices, lengths and the latent output
@@ -1370,7 +1370,7 @@ impl<'a> GlmfEngine<'a> {
                 unsafe {
                     self.library.glm_mla_prefill(w.query.buffer.ptr, cache, w.indices.buffer.ptr, w.lengths.buffer.ptr,
                         w.latent.buffer.ptr, tables.positions.len(), self.cfg.heads, SPARSE_TOPK, RECORD_BYTES,
-                        scale * std::f32::consts::LOG2_E, self.stream)
+                        scale * std::f32::consts::LOG2_E, kernel, self.stream)
                 }
             })?;
         } else {

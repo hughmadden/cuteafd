@@ -1577,14 +1577,14 @@ impl<'a> GlmEngine<'a> {
                 &[rows, Scalar::I32(tables.table_width as i32), Scalar::I32(tables.table_stride as i32)])?;
         }
         // Shared-indexer layers read the previous full layer's `indices`.
-        if !tables.decode && native_mla_prefill() {
+        if let (false, Some(kernel)) = (tables.decode, native_mla_prefill()) {
             let scale = ((self.cfg.qk_nope_head_dim + self.cfg.qk_rope_head_dim) as f32).powf(-0.5);
             // SAFETY: query, cache, indices, lengths and the attention output are
             // live buffers of the step's rows on this rank's stream.
             self.on(rank, || unsafe {
                 self.library.glm_mla_prefill(w.query.buffer.ptr, kv.buffer.ptr, w.indices.buffer.ptr,
                     w.lengths.buffer.ptr, w.attn.buffer.ptr, tables.positions.len(), heads,
-                    self.cfg.index_topk, 656, scale * std::f32::consts::LOG2_E, self.stream_of(rank))
+                    self.cfg.index_topk, 656, scale * std::f32::consts::LOG2_E, kernel, self.stream_of(rank))
             })?;
         } else {
             self.run_on(rank, &Self::program(layer, &format!("glm_sparse_mla_{mode}_{cap}")), &[
@@ -1651,11 +1651,23 @@ pub(crate) fn tensor_fp8_prefill() -> bool {
     *TENSOR.get_or_init(|| std::env::var("CUTEAFD_GLM_TENSOR_FP8").map_or(true, |v| v != "block"))
 }
 
-/// Prefill sparse MLA on the native F16 kernel (glm_mla_prefill.cu) unless
-/// CUTEAFD_MLA_PREFILL=b12x selects the b12x program.
-pub(crate) fn native_mla_prefill() -> bool {
-    static NATIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *NATIVE.get_or_init(|| std::env::var("CUTEAFD_MLA_PREFILL").map_or(true, |v| v != "b12x"))
+/// Prefill sparse MLA kernel of glm_mla_prefill.cu (its `kernel` argument), or None for the
+/// b12x program: CUTEAFD_MLA_PREFILL=f16 (0), e4m3 (1: E4M3 query and P), e4m3-p2 (2: two-term
+/// P), e4m3-q2 (3: two-term query), e4m3-q2p2 (4) or b12x; default f16.
+pub(crate) fn native_mla_prefill() -> Option<i32> {
+    static KERNEL: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+    *KERNEL.get_or_init(|| match std::env::var("CUTEAFD_MLA_PREFILL").as_deref() {
+        Ok("b12x") => None,
+        Ok("e4m3") => Some(1),
+        Ok("e4m3-p2") => Some(2),
+        Ok("e4m3-q2") => Some(3),
+        Ok("e4m3-q2p2") => Some(4),
+        Ok("f16") | Err(_) => Some(0),
+        Ok(other) => {
+            tracing::warn!(value = other, "unknown CUTEAFD_MLA_PREFILL; using f16");
+            Some(0)
+        }
+    })
 }
 
 /// Prefill lanes: CUTEAFD_GLM_PREFILL_LANES (1 = serial), default [`DEFAULT_LANES`].

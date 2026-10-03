@@ -161,6 +161,10 @@ pub(crate) struct GoldenArgs {
     /// Score every prefill row's logits against the golden (mean NLL, top-1).
     #[arg(long)]
     pub nll: bool,
+    /// With --nll: also write tokens.bin and every prefill row's logits.bin (F32) to this
+    /// directory, a golden for A/B runs between builds or numerics (with --skip-experts).
+    #[arg(long, hide = true)]
+    pub save_logits: Option<PathBuf>,
     /// Decode steps compare logits only (no per-layer downloads; graphs run).
     #[arg(long)]
     pub logits_only: bool,
@@ -665,6 +669,11 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         _ => String::new(),
     };
     println!("prefill: {prefill} tokens through {layers} layers in {prefill_seconds:.2} s{loads}");
+    if let (Some(dir), Some(logits), true) = (&args.save_logits, &logits, args.nll) {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join("tokens.bin"), tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>())?;
+        std::fs::write(dir.join("logits.bin"), logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+    }
     if let (Some(logits), false) = (&logits, args.golden.join("logits.bin").exists()) {
         if args.nll {
             // No golden logits (a token file alone): the engine's NLL of the text and a digest
