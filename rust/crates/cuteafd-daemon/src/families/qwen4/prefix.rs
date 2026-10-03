@@ -52,6 +52,7 @@ pub(crate) struct Qwen4Prefix<'e, 'a> {
 impl<'e, 'a> Qwen4Prefix<'e, 'a> {
     /// The family over `engine`'s buffers with a device arena of `slots(mark_bytes)` marks.
     pub fn new(engine: &'e Qwen4Engine<'a>, slots: impl FnOnce(usize) -> usize) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix");
         let paged = engine.paged_buffers();
         ensure!(!paged.is_empty(), "Qwen 3.8 Flash Next without a full-attention layer");
         for [records, keys, pools] in &paged {

@@ -99,10 +99,10 @@ pub(crate) enum Experts<'a> {
     /// outputs are not the model's).
     Skip,
     /// Spark ranks serving the `fp8` family over RoCE.
-    /// `lane`: a second transport to the same ranks for the first row lane of
-    /// a pipelined prefill ([`MimoEngine::prefill_capacity`]); `None` keeps
-    /// prefill serial.
-    Spark { transport: RefCell<SparkLink<'a>>, lane: Option<RefCell<SparkLink<'a>>>, runtime: tokio::runtime::Runtime },
+    /// `lanes`: further transports to the same ranks for the earlier row lanes
+    /// of a pipelined prefill ([`MimoEngine::prefill_capacity`]; `transport`
+    /// carries the last lane); empty keeps prefill serial.
+    Spark { transport: RefCell<SparkLink<'a>>, lanes: Vec<RefCell<SparkLink<'a>>>, runtime: tokio::runtime::Runtime },
 }
 
 /// A dispatched Spark wave and its send-side host phases (seconds).
@@ -130,8 +130,23 @@ const MIN_LANE_ROWS: usize = 1024;
 /// A serving chunk may end at any row, including a short prompt tail. Do not
 /// advertise twice the workspace when a tail larger than one workspace could
 /// still be too short for the two-lane path's tap window.
-fn lane_prefill_capacity(rows: usize, transport: bool) -> usize {
-    if transport && rows >= 2 * MIN_LANE_ROWS { 2 * rows } else { rows }
+fn lane_prefill_capacity(rows: usize, lanes: usize) -> usize {
+    if lanes >= 2 && rows >= 2 * MIN_LANE_ROWS { lanes * rows } else { rows }
+}
+
+/// Row lanes of a `t`-row pipelined prefill step with `lanes` transports of
+/// `rows`-row workspaces: as many as keep every lane at least
+/// [`MIN_LANE_ROWS`] (and enough that none exceeds `rows`); 1 is serial.
+fn prefill_lane_count(t: usize, rows: usize, lanes: usize) -> usize {
+    if lanes < 2 || t < 2 * MIN_LANE_ROWS {
+        return 1;
+    }
+    let mut n = (t / MIN_LANE_ROWS).min(lanes).max(2);
+    // The engine splits ceil(t / n) rows per lane; the last one keeps the rest.
+    while n > 2 && n > t.div_ceil(rows) && t - (n - 1) * t.div_ceil(n) < MIN_LANE_ROWS {
+        n -= 1;
+    }
+    n
 }
 
 fn independent_prefill_rows(capacity: usize, lanes: bool, output: MimoPrefillOutput, mtp: bool,
@@ -343,7 +358,8 @@ pub(crate) struct Peer<'a> {
     cos_sin_full: Dev<'a>,
     cos_sin_swa: Dev<'a>,
     workspace: RefCell<Option<Workspace<'a>>>,
-    lane_workspace: RefCell<Option<Workspace<'a>>>,
+    /// The earlier prefill lanes' workspaces (see [`MimoEngine::step_lanes`]).
+    lane_workspaces: RefCell<Vec<Workspace<'a>>>,
     prefill_kv_wide: RefCell<Option<Rc<Dev<'a>>>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     /// Rank 1's decode segments (see [`MimoEngine::decode_layers`]).
@@ -366,6 +382,7 @@ fn lane_slot(index: usize, ffn: bool, lane: usize) -> usize {
 /// cos | sin of position * theta^(-2i/dim) for `max_context` positions, FP32
 /// like the reference's inv_freq, on the current device.
 fn rope_table<'a>(library: &'a NativeLibrary, dim: usize, theta: f64, max_context: usize) -> Result<Dev<'a>> {
+    let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv/rope");
     let inv: Vec<f32> = (0..dim / 2).map(|i| 1.0 / (theta as f32).powf((2 * i) as f32 / dim as f32)).collect();
     let mut values = vec![0f32; max_context * dim];
     for p in 0..max_context {
@@ -412,8 +429,9 @@ pub(crate) struct MimoEngine<'a> {
     cos_sin_swa: Dev<'a>,
     workspace: RefCell<Option<Workspace<'a>>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
-    /// The first prefill lane; serving admits its own last-row head output.
-    lane_workspace: RefCell<Option<Workspace<'a>>>,
+    /// The earlier prefill lanes (the last one uses `workspace`); the first
+    /// admits its own last-row head output for independent request pairs.
+    lane_workspaces: RefCell<Vec<Workspace<'a>>>,
     prefill_kv_wide: RefCell<Option<Rc<Dev<'a>>>>,
     experts: Option<Experts<'a>>,
     pub expert_input: ExpertInput,
@@ -502,6 +520,7 @@ impl<'a> MimoEngine<'a> {
         weights: MimoWeights<'a>, stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize,
         rings: usize, embedding: TokenEmbedding<'a>, kv_cache: MimoKvCache,
         prefill_output: MimoPrefillOutput) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let family = cfg.program_family()?;
         // Layers loaded as head-split shares carry half the heads (see `attach_peer`).
         let ranks = if weights.layers.iter().any(|l| l.split) { 2 } else { 1 };
@@ -514,6 +533,7 @@ impl<'a> MimoEngine<'a> {
             "the mimo programs are built for 192/128 heads, 64 RoPE dims and a window of at most {}",
             RING_ROWS - DECODE_ROWS);
         let zeroed = |bytes: usize| -> Result<Rc<Allocation<'a>>> {
+            let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
             let allocation = Rc::new(Allocation::new(Device { library, id: device }, bytes.max(256))?);
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
@@ -532,7 +552,7 @@ impl<'a> MimoEngine<'a> {
             max_context, prefill_rows, prefill_output, pages, rings, family, device,
             split_family, peer: None, exchange: None, kv, cos_sin_full,
             cos_sin_swa, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
-            lane_workspace: RefCell::new(None), prefill_kv_wide: RefCell::new(None), experts: None,
+            lane_workspaces: RefCell::new(Vec::new()), prefill_kv_wide: RefCell::new(None), experts: None,
             expert_input: ExpertInput::Fp8,
             profile: RefCell::new([0.0; 2]),
             wave_timing: std::env::var("CUTEAFD_MIMO_WAVE_TIMING").is_ok_and(|v| v == "1"), drafter: None, mtp: None, l2: None, embedding,
@@ -595,12 +615,14 @@ impl<'a> MimoEngine<'a> {
     /// peer access both ways, loads the programs there, and allocates its KV
     /// records, RoPE tables and both ends of the exchange.
     pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<MimoLayer<'a>>) -> Result<()> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("peer-split");
         ensure!(self.split_family.is_some() && layers.len() == self.weights.layers.len()
             && layers.iter().all(|l| l.split), "attach_peer needs the head-split shares of every loaded layer");
         let library = self.library;
         let rows = self.prefill_rows.max(DECODE_ROWS);
         let exchange = PeerExchange::new_abortable(library, [RankDevice { device: self.device, stream: self.stream },
-            RankDevice { device, stream }], 8, rows * self.cfg.hidden * 2)?;
+            RankDevice { device, stream }], 4 * super::admission::transport_lanes(true)?.max(2),
+            rows * self.cfg.hidden * 2)?;
         let zeroed = |bytes: usize| -> Result<Rc<Allocation<'a>>> {
             let allocation = Rc::new(Allocation::new(Device { library, id: device }, bytes.max(256))?);
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
@@ -618,7 +640,7 @@ impl<'a> MimoEngine<'a> {
             let table = |theta: f64| rope_table(library, self.cfg.rope_dim, theta, self.max_context);
             Ok(Peer { device, stream, kv, cos_sin_full: table(self.cfg.full_rope_theta)?,
                 cos_sin_swa: table(self.cfg.swa_rope_theta)?, layers, workspace: RefCell::new(None),
-                lane_workspace: RefCell::new(None), prefill_kv_wide: RefCell::new(None), decode_workspace: RefCell::new(None), graphs: RefCell::new(HashMap::new()) })
+                lane_workspaces: RefCell::new(Vec::new()), prefill_kv_wide: RefCell::new(None), decode_workspace: RefCell::new(None), graphs: RefCell::new(HashMap::new()) })
         })?;
         self.peer = Some(peer);
         self.exchange = Some(exchange);
@@ -755,8 +777,8 @@ impl<'a> MimoEngine<'a> {
 
     fn terminal_links(&self, mut action: impl FnMut(&mut SparkLink<'a>)->Result<()>) -> Result<()> {
         let mut failures=Vec::new();
-        if let Some(Experts::Spark { transport,lane,.. })=&self.experts {
-            for (index,link) in std::iter::once(transport).chain(lane.iter()).enumerate() {
+        if let Some(Experts::Spark { transport,lanes,.. })=&self.experts {
+            for (index,link) in std::iter::once(transport).chain(lanes.iter()).enumerate() {
                 let result=link.try_borrow_mut().map_err(anyhow::Error::from)
                     .and_then(|mut link|action(&mut link));
                 if let Err(error)=result { failures.push(format!("lane {index}: {error:#}")); }
@@ -843,6 +865,7 @@ impl<'a> MimoEngine<'a> {
     /// ordered after the prior attention reads; no transport owns this arena.
     /// Every workspace retains an Rc, and published storage is never resized.
     fn shared_prefill_kv_wide(&self, rank: usize, bytes: usize) -> Result<Rc<Dev<'a>>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace/kv-shadow");
         let cell = if rank == 0 { &self.prefill_kv_wide }
             else { &self.peer.as_ref().context("prefill KV shadow peer")?.prefill_kv_wide };
         let mut owned = cell.borrow_mut();
@@ -858,6 +881,7 @@ impl<'a> MimoEngine<'a> {
     /// `head`: the LM head and its logits (only the first row lane of a
     /// pipelined prefill skips them).
     fn workspace_here(&self, rank: usize, t: usize, decode: bool, head: bool) -> Result<Workspace<'a>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let h = self.cfg.hidden;
         let lead = rank == 0;
         let with_head = lead && head;
@@ -954,9 +978,12 @@ impl<'a> MimoEngine<'a> {
         ensure!(!all_logits || self.prefill_output == MimoPrefillOutput::AllRows,
             "this MiMo engine admits last-row prefill logits; load an AllRows diagnostic engine for all_logits");
         let (t, start) = (tokens.len(), placement.len);
-        let lanes = self.lanes_ready() && !all_logits && on_layer.is_none() && forced.is_none()
-            && t >= 2 * MIN_LANE_ROWS;
-        let limit = if lanes { 2 * self.prefill_rows } else { self.prefill_rows };
+        let lanes = if self.lanes_ready() && !all_logits && on_layer.is_none() && forced.is_none() {
+            prefill_lane_count(t, self.prefill_rows, self.transport_lanes())
+        } else {
+            1
+        };
+        let limit = lanes * self.prefill_rows;
         ensure!(t > 0 && t <= limit && start + t <= self.max_context, "prefill of {t} rows at {start}");
         let used = (start + t).div_ceil(PAGE_ROWS);
         let tables = |first: usize, end: usize| -> Result<StepTables> {
@@ -970,11 +997,14 @@ impl<'a> MimoEngine<'a> {
                 table_stride: 0,
             })
         };
-        let logits = if lanes {
-            // Two row lanes, each as a consecutive chunk would see the cache.
-            let split = t.div_ceil(2);
-            let (first, second) = (tables(start, start + split)?, tables(start + split, start + t)?);
-            self.step_lanes([(&first, &tokens[..split]), (&second, &tokens[split..])])?
+        let logits = if lanes > 1 {
+            // Row lanes, each as a consecutive chunk would see the cache.
+            let split = t.div_ceil(lanes);
+            let bounds: Vec<(usize, usize)> = (0..lanes).map(|i| (i * split, ((i + 1) * split).min(t))).collect();
+            let lane_tables = bounds.iter().map(|&(a, b)| tables(start + a, start + b)).collect::<Result<Vec<_>>>()?;
+            let steps: Vec<(&StepTables, &[u32])> = lane_tables.iter().zip(&bounds)
+                .map(|(tables, &(a, b))| (tables, &tokens[a..b])).collect();
+            self.step_lanes(&steps)?
         } else {
             self.step(&tables(start, start + t)?, tokens, if all_logits { t } else { 1 }, on_layer, forced)?
         };
@@ -982,11 +1012,18 @@ impl<'a> MimoEngine<'a> {
         Ok(logits)
     }
 
-    /// Rows one prefill step takes: twice the programs' rows when prefill
-    /// runs pipelined in two row lanes ([`Self::step_lanes`]).
+    /// Rows one prefill step takes: the programs' rows per lane when prefill
+    /// runs pipelined in row lanes ([`Self::step_lanes`]).
     pub fn prefill_capacity(&self) -> usize {
-        lane_prefill_capacity(self.prefill_rows,
-            matches!(&self.experts, Some(Experts::Spark { lane: Some(_), .. })))
+        lane_prefill_capacity(self.prefill_rows, self.transport_lanes())
+    }
+
+    /// Spark transports, one per prefill row lane (1: serial prefill).
+    fn transport_lanes(&self) -> usize {
+        match &self.experts {
+            Some(Experts::Spark { lanes, .. }) => 1 + lanes.len(),
+            _ => 1,
+        }
     }
 
     /// Pipelined prefill is available with a second Spark lane transport,
@@ -1024,8 +1061,10 @@ impl<'a> MimoEngine<'a> {
         ensure!(first.ring != second.ring, "independent prefill requests must own distinct rings");
         let tables = [first.prefill_tables(first_tokens.len(), self.max_context)?,
             second.prefill_tables(second_tokens.len(), self.max_context)?];
-        let logits = self.submit(|| self.step_lanes_inner([
+        let logits = self.submit(|| self.step_lanes_inner(&[
             (&tables[0], first_tokens), (&tables[1], second_tokens)], true))?;
+        let logits: [Option<DeviceLogits>; 2] = logits.try_into()
+            .map_err(|_| anyhow::anyhow!("an independent prefill pair returns two outputs"))?;
         first.len += first_tokens.len();
         second.len += second_tokens.len();
         Ok(logits)
@@ -1037,26 +1076,34 @@ impl<'a> MimoEngine<'a> {
     /// wave is out. Each lane is exactly a consecutive prefill chunk (lane 0
     /// writes its KV before lane 1 reads it at every layer). Returns the last
     /// row's logits.
-    fn step_lanes(&self, lanes: [(&StepTables, &[u32]); 2]) -> Result<Option<DeviceLogits>> {
-        self.submit(|| self.step_lanes_inner(lanes, false).map(|[_, last]| last))
+    fn step_lanes(&self, lanes: &[(&StepTables, &[u32])]) -> Result<Option<DeviceLogits>> {
+        self.submit(|| self.step_lanes_inner(lanes, false).map(|mut logits| logits.pop().flatten()))
     }
 
-    fn step_lanes_inner(&self, lanes: [(&StepTables, &[u32]); 2], independent: bool)
-        -> Result<[Option<DeviceLogits>; 2]> {
-        let Some(Experts::Spark { transport, lane: Some(lane), runtime }) = &self.experts else {
-            anyhow::bail!("pipelined prefill needs Spark experts with a lane transport");
+    fn step_lanes_inner(&self, lanes: &[(&StepTables, &[u32])], independent: bool)
+        -> Result<Vec<Option<DeviceLogits>>> {
+        let Some(Experts::Spark { transport, lanes: links, runtime }) = &self.experts else {
+            anyhow::bail!("pipelined prefill needs Spark experts with lane transports");
         };
+        let n = lanes.len();
+        ensure!(n >= 2 && n <= links.len() + 1, "{n} prefill lanes need {} lane transports", n.saturating_sub(1));
+        let last = n - 1;
+        // The first earlier lane admits a last-row head for independent pairs.
         let first_head = self.prefill_output == MimoPrefillOutput::LastRow && self.mtp.is_none();
-        for (cell, head) in [(&self.lane_workspace, first_head), (&self.workspace, true)] {
-            if cell.borrow().is_none() {
-                *cell.borrow_mut() = Some(self.on(0, || self.workspace_here(0, self.prefill_rows, false, head))?);
-            }
+        while self.lane_workspaces.borrow().len() < last {
+            let head = first_head && self.lane_workspaces.borrow().is_empty();
+            let workspace = self.on(0, || self.workspace_here(0, self.prefill_rows, false, head))?;
+            self.lane_workspaces.borrow_mut().push(workspace);
         }
-        let (first, second) = (self.lane_workspace.borrow(), self.workspace.borrow());
-        let w = [first.as_ref().context("lane workspace")?, second.as_ref().context("workspace")?];
-        let t = [lanes[0].1.len(), lanes[1].1.len()];
-        ensure!(t[0] <= w[0].rows && t[1] <= w[1].rows, "prefill lanes exceed their workspaces");
-        let rows = t.map(|t| Scalar::I32(t as i32));
+        if self.workspace.borrow().is_none() {
+            *self.workspace.borrow_mut() = Some(self.on(0, || self.workspace_here(0, self.prefill_rows, false, true))?);
+        }
+        let (earlier, main) = (self.lane_workspaces.borrow(), self.workspace.borrow());
+        let w: Vec<&Workspace<'_>> = earlier[..last].iter()
+            .chain(std::iter::once(main.as_ref().context("workspace")?)).collect();
+        let t: Vec<usize> = lanes.iter().map(|lane| lane.1.len()).collect();
+        ensure!(t.iter().zip(&w).all(|(&t, w)| t <= w.rows), "prefill lanes exceed their workspaces");
+        let rows: Vec<Scalar> = t.iter().map(|&t| Scalar::I32(t as i32)).collect();
         // SAFETY: the engine owns this stream; the previous step must be done reading the tables.
         unsafe { self.library.cuda_stream_synchronize(self.stream)? };
         for (i, (tables, tokens)) in lanes.iter().enumerate() {
@@ -1069,21 +1116,23 @@ impl<'a> MimoEngine<'a> {
         }
         let peer_workspaces = match &self.peer {
             Some(peer) => {
-                for cell in [&peer.lane_workspace, &peer.workspace] {
-                    if cell.borrow().is_none() {
-                        *cell.borrow_mut() = Some(self.workspace(1, self.prefill_rows, false)?);
-                    }
+                while peer.lane_workspaces.borrow().len() < last {
+                    let workspace = self.workspace(1, self.prefill_rows, false)?;
+                    peer.lane_workspaces.borrow_mut().push(workspace);
                 }
-                Some((peer.lane_workspace.borrow(), peer.workspace.borrow()))
+                if peer.workspace.borrow().is_none() {
+                    *peer.workspace.borrow_mut() = Some(self.workspace(1, self.prefill_rows, false)?);
+                }
+                Some((peer.lane_workspaces.borrow(), peer.workspace.borrow()))
             }
             None => None,
         };
-        let w1 = match &peer_workspaces {
-            Some((first, second)) => Some([
-                first.as_ref().context("peer lane workspace")?, second.as_ref().context("peer workspace")?,
-            ]),
+        let w1: Option<Vec<&Workspace<'_>>> = match &peer_workspaces {
+            Some((earlier, main)) => Some(earlier[..last].iter()
+                .chain(std::iter::once(main.as_ref().context("peer workspace")?)).collect()),
             None => None,
         };
+        let w1 = w1.as_deref();
         if let Some(peers) = w1 {
             // SAFETY: the peer stream belongs to this engine; all previous waits have
             // matching pushes, and its old tables must drain before being overwritten.
@@ -1102,8 +1151,9 @@ impl<'a> MimoEngine<'a> {
         }
         let layers = &self.weights.layers;
         let bf16_input = self.expert_input.bf16(false);
-        let mut transports = [lane.borrow_mut(), transport.borrow_mut()];
-        let mut inflight: [Option<(usize, SentWave)>; 2] = [None, None];
+        let mut transports: Vec<_> = links[..last].iter().map(RefCell::borrow_mut)
+            .chain(std::iter::once(transport.borrow_mut())).collect();
+        let mut inflight: Vec<Option<(usize, SentWave)>> = (0..n).map(|_| None).collect();
         // After a lane's FFN output is in its `delta`: both GPUs' next input
         // norms, then each independent request's drafter taps on rank 0.
         // Consecutive chunks of one request keep the historical last-lane taps.
@@ -1122,7 +1172,7 @@ impl<'a> MimoEngine<'a> {
             }
             self.norm_on(0, w[i], weight, if dense_split { 2 } else { 1 }, rows[i],
                 if dense_split { self.recv(0, ffn) } else { w[i].delta.buffer.ptr })?;
-            if independent || i == 1 {
+            if independent || i == last {
                 if let Some(drafter) = &self.drafter {
                     let n = t[i].min(super::dflash::TAP_ROWS);
                     if independent {
@@ -1134,16 +1184,16 @@ impl<'a> MimoEngine<'a> {
             }
             // Independent MTP pairing is excluded; preserve the old single-
             // request path's final-lane hidden ring and catch-up semantics.
-            if let (Some(mtp), true) = (&self.mtp, i == 1 && index + 1 == self.cfg.layers) {
-                self.mtp_tap(mtp, w[1], lanes[1].0)?;
+            if let (Some(mtp), true) = (&self.mtp, i == last && index + 1 == self.cfg.layers) {
+                self.mtp_tap(mtp, w[last], lanes[last].0)?;
             }
             Ok(())
         };
-        for i in 0..2 {
+        for i in 0..n {
             self.norm(w[i], layers[0].ptr("input_norm")?, 0, rows[i])?;
         }
         for (index, layer) in layers.iter().enumerate() {
-            for i in 0..2 {
+            for i in 0..n {
                 if let Some((previous, sent)) = inflight[i].take() {
                     let forward = (w1.is_some() && previous + 1 < layers.len())
                         .then_some(lane_slot(previous, true, i));
@@ -1180,7 +1230,7 @@ impl<'a> MimoEngine<'a> {
                 }
             }
         }
-        for i in 0..2 {
+        for i in 0..n {
             if let Some((previous, sent)) = inflight[i].take() {
                 let forward = (w1.is_some() && previous + 1 < layers.len())
                     .then_some(lane_slot(previous, true, i));
@@ -1194,10 +1244,10 @@ impl<'a> MimoEngine<'a> {
             if w1.is_some() {
                 self.on(1, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(1)) })?;
             }
-            return Ok([None, None]);
+            return Ok((0..n).map(|_| None).collect());
         }
-        let mut logits = [None, None];
-        for i in if independent { 0..2 } else { 1..2 } {
+        let mut logits: Vec<Option<DeviceLogits>> = (0..n).map(|_| None).collect();
+        for i in if independent { 0..n } else { last..n } {
             self.launch_head(w[i], t[i], 1, false)?;
             logits[i] = Some(self.device_logits(w[i], 1, false));
         }
@@ -2547,7 +2597,7 @@ mod terminal_fault_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::{attention_workspace_geometry, expert_capacity, independent_prefill_rows, lane_prefill_capacity,
+    use super::{attention_workspace_geometry, expert_capacity, independent_prefill_rows, lane_prefill_capacity, prefill_lane_count,
         scale_operand, MimoAttentionWorkspace, MimoPlacement, MimoPrefillOutput, DECODE_ROWS, MIN_LANE_ROWS, PAGE_ROWS};
 
     #[test]
@@ -2614,15 +2664,23 @@ mod tests {
     #[test]
     fn advertised_prefill_capacity_accepts_every_prompt_tail() {
         for rows in [1, 512, 1024, 1536, 2047, 2048, 4096] {
-            assert_eq!(lane_prefill_capacity(rows, false), rows);
-            let capacity = lane_prefill_capacity(rows, true);
-            for tokens in 1..=capacity {
-                if tokens > rows {
-                    assert!(tokens >= 2 * MIN_LANE_ROWS,
-                        "{tokens}-row tail exceeds its {rows}-row workspace but cannot use lanes");
-                    let first = tokens.div_ceil(2);
-                    assert!(first <= rows && tokens - first <= rows);
-                    assert!(tokens - first >= MIN_LANE_ROWS);
+            assert_eq!(lane_prefill_capacity(rows, 1), rows);
+            for lanes in 2..=4 {
+                let capacity = lane_prefill_capacity(rows, lanes);
+                for tokens in 1..=capacity {
+                    let n = prefill_lane_count(tokens, rows, lanes);
+                    assert!((1..=lanes).contains(&n));
+                    if tokens > rows {
+                        assert!(n >= 2, "{tokens}-row tail exceeds its {rows}-row workspace but cannot use lanes");
+                    }
+                    if n > 1 {
+                        // The engine's split: every lane fits its workspace and keeps the tap window.
+                        let split = tokens.div_ceil(n);
+                        for i in 0..n {
+                            let lane = ((i + 1) * split).min(tokens) - i * split;
+                            assert!(lane <= rows && lane >= MIN_LANE_ROWS, "{tokens} rows, {n} lanes of {rows}: {lane}");
+                        }
+                    }
                 }
             }
         }
@@ -2641,7 +2699,7 @@ mod tests {
             assert!(!independent_prefill_rows(4096, true, last, false, rows));
         }
         assert_eq!(MIN_LANE_ROWS, 1024);
-        assert_eq!(lane_prefill_capacity(1024, true), 1024);
+        assert_eq!(lane_prefill_capacity(1024, 2), 1024);
     }
 
     #[test]

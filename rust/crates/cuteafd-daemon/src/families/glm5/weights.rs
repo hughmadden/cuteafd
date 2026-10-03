@@ -95,6 +95,7 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
 
 impl<'a> GlmLoader<'a> {
     fn raw(&self, name: &str) -> Result<(Vec<u8>, DType, Vec<usize>)> {
+        cuteafd_ffi::memory_ledger::tensor(name);
         let tensor = self.catalog.tensor(name)?;
         let mut bytes = vec![0u8; tensor.metadata.byte_length as usize];
         std::fs::File::open(self.catalog.snapshot().join(&tensor.shard))?
@@ -112,6 +113,7 @@ impl<'a> GlmLoader<'a> {
     /// The row-concatenation of 2-D `names` as one BF16 operand (FP8 parts
     /// dequantized on the GPU with their FP32 block scales).
     fn rows(&self, names: &[String]) -> Result<DeviceAllocation<'a>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let tensors = names.iter().map(|n| self.raw(n).map(|t| (n, t))).collect::<Result<Vec<_>>>()?;
         let cols = tensors[0].1 .2[1];
         let rows: usize = tensors.iter().map(|(_, (_, _, shape))| shape[0]).sum();
@@ -150,6 +152,7 @@ impl<'a> GlmLoader<'a> {
     /// Reads tensor `name`'s bytes into `out[at..]` (one positioned read into the
     /// operand's buffer: no second copy) and returns its byte length, dtype and shape.
     fn read_into(&self, name: &str, out: &mut [u8], at: usize) -> Result<(usize, DType, Vec<usize>)> {
+        cuteafd_ffi::memory_ledger::tensor(name);
         let tensor = self.catalog.tensor(name)?;
         let length = tensor.metadata.byte_length as usize;
         ensure!(at + length <= out.len(), "{name}: {length} bytes past the operand buffer");
@@ -165,6 +168,7 @@ impl<'a> GlmLoader<'a> {
     /// whole number of 128-row blocks), N and K.
     fn with_fp8<T>(&self, names: &[String], body: impl FnOnce(&[u8], Vec<f32>, usize, usize) -> Result<T>)
         -> Result<T> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
         // BF16 parts need room for their padded rows while they quantize in place.
         let total: u64 = names.iter().map(|n| self.catalog.tensor(n).map(|t| t.metadata.byte_length))
             .sum::<Result<u64>>()? + 128 * 8192 * 2;
@@ -248,6 +252,7 @@ impl<'a> GlmLoader<'a> {
 
     /// E4M3 `[N, K]` and the FP32 block grid of `names` on the device.
     fn fp8(&self, names: &[String]) -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
         self.with_fp8(names, |values, grid, _, _| Ok((self.upload(values)?, self.upload(&f32_bytes(&grid))?)))
     }
 
@@ -259,6 +264,7 @@ impl<'a> GlmLoader<'a> {
     #[allow(clippy::type_complexity)]
     fn kv_b(&self, cfg: &GlmDsaConfig, prefix: &str, ranks: usize)
         -> Result<Vec<((DeviceAllocation<'a>, DeviceAllocation<'a>), (DeviceAllocation<'a>, DeviceAllocation<'a>))>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
         let (heads, d, v, c) = (cfg.heads, cfg.qk_nope_head_dim, cfg.v_head_dim, cfg.kv_lora_rank);
         self.with_fp8(&[format!("{prefix}.self_attn.kv_b_proj.weight")], |kv_b, grid, rows, cols| {
         ensure!(rows == heads * (d + v) && cols == c && d % 64 == 0 && c % 128 == 0,
@@ -352,6 +358,7 @@ impl<'a> GlmLoader<'a> {
     /// rank `r` takes part `r` of every concatenated weight's rows (so a head- or
     /// intermediate-split `gate | up` stays gate rows then up rows), or of the columns.
     fn bf16_split(&self, names: &[String], axis: Axis, ranks: usize) -> Result<Vec<DeviceAllocation<'a>>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         if ranks == 1 {
             return Ok(vec![self.upload(&self.bf16_rows(names)?.0)?]);
         }
@@ -373,6 +380,7 @@ impl<'a> GlmLoader<'a> {
     /// its heads.
     fn kv_b_bf16(&self, cfg: &GlmDsaConfig, prefix: &str, ranks: usize)
         -> Result<Vec<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let (heads, d, v, c) = (cfg.heads, cfg.qk_nope_head_dim, cfg.v_head_dim, cfg.kv_lora_rank);
         let (kv_b, rows, cols) = self.bf16_rows(&[format!("{prefix}.self_attn.kv_b_proj.weight")])?;
         ensure!(rows == heads * (d + v) && cols == c && heads % ranks == 0,
@@ -399,6 +407,7 @@ impl<'a> GlmLoader<'a> {
     }
 
     fn one(&self, name: &str) -> Result<DeviceAllocation<'a>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let (bytes, dtype, shape) = self.raw(name)?;
         if shape.len() == 2 && dtype == DType::F8E4M3 {
             return self.rows(&[name.to_string()]);
@@ -425,6 +434,7 @@ impl<'a> GlmLoader<'a> {
     /// the matching part of the FP32 128x128 grid. Rows-sliced weights read once.
     fn fp8_split(&self, names: &[String], axis: Axis, ranks: usize)
         -> Result<Vec<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
         if ranks == 1 {
             return Ok(vec![self.fp8(names)?]);
         }
@@ -473,6 +483,7 @@ impl<'a> GlmLoader<'a> {
     /// once to rank 0 and each rank's columns are a pitched device copy from it
     /// (over peer memory for rank 1); the grid's column blocks are sliced on the host.
     fn fp8_cols(&self, name: &str, ranks: usize) -> Result<Vec<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
         let (whole, grid, rows, cols) = self.with_fp8(&[name.to_string()], |values, grid, rows, cols| {
             ensure!(rows % 128 == 0 && cols % (128 * ranks) == 0,
                 "{name}: [{rows}, {cols}] does not split into whole 128-K blocks over {ranks} GPUs");

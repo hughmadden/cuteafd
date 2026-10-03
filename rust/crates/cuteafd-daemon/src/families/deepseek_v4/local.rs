@@ -98,6 +98,7 @@ impl<'a> LocalExperts<'a> {
         budget: usize,
         stream: *mut c_void,
     ) -> Result<Option<Self>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("local-experts");
         let shape = *catalog.routed_experts();
         let backbone = backbone.start.max(shape.first_layer)..backbone.end.min(shape.layers);
         if backbone.is_empty() && draft_stages == 0 {
@@ -186,6 +187,7 @@ impl<'a> LocalExperts<'a> {
         max_rows: usize,
         budget: usize,
     ) -> Result<Option<Self>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("local-experts");
         let shape = *catalog.routed_experts();
         let directories: Vec<_> = capacities.iter().map(|c| directory.join(format!("m{c}"))).collect();
         if let Some(missing) = directories.iter().find(|d| !d.join("v41_exl3.json").is_file()) {

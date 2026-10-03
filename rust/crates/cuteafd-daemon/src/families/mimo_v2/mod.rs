@@ -49,7 +49,9 @@ pub(crate) struct EngineArgs {
     /// Longest sequence (the RoPE tables and page tables).
     #[arg(long, default_value_t = 32768)]
     pub max_context: usize,
-    /// Tokens the full-attention record pool holds across sequences.
+    /// Tokens the full-attention record pool holds across sequences; 0 sizes
+    /// it from what every GPU has left after weights, workspaces, graphs and
+    /// the drafter (capacity admission), up to the common 2M-token target.
     #[arg(long, default_value_t = 131_072)]
     pub pool_tokens: usize,
     /// Full-attention KV record format: int8 (signed bytes with an FP32 scale
@@ -816,7 +818,7 @@ impl Opened {
             fp8_scales: args.fp8_scales, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream }).collect() };
         let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
-            args.token_io.embed_placement, || loader.model(&self.cfg, layers))?;
+            args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers) })?;
         let mtp = if args.mtp > 0 {
             let started = Instant::now();
             let available = self.checkpoint.tensors.iter()
@@ -1013,11 +1015,12 @@ impl Opened {
             link.enable_terminal_ownership(self.library.clone())?;
             Ok(link)
         };
+        crate::shared::memory_report::release_load_staging(&self.library);
         let mut transport = link()?;
-        // Pipelined prefill (CUTEAFD_MIMO_PREFILL_LANES, 2 by default; 1 keeps
-        // it serial): a second transport carries the first row lane's waves.
+        // Pipelined prefill (CUTEAFD_MIMO_PREFILL_LANES, 3 by default, 1 keeps it serial):
+        // one more transport per earlier row lane.
         let lanes = admission::transport_lanes(true)?;
-        let mut lane = if lanes == 2 { Some(link()?) } else { None };
+        let mut lane_links = (1..lanes).map(|_| link()).collect::<Result<Vec<_>>>()?;
         tracing::info!(lanes, "MiMo prefill lanes");
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         // Connect every rank and register full-size buffers now: the first
@@ -1055,7 +1058,7 @@ impl Opened {
                 transport.receive(wave, request.header.row_count as usize, warm_stream).await
             })?;
         }
-        if let Some(lane) = lane.as_mut() {
+        for lane in &mut lane_links {
             runtime.block_on(async {
                 let wave = lane.dispatch(&warmups[0])?;
                 lane.receive(wave, warmups[0].header.row_count as usize, warm_stream).await
@@ -1068,7 +1071,7 @@ impl Opened {
         }
         tracing::info!(ranks = peers.len(), elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
         Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport),
-            lane: lane.map(std::cell::RefCell::new), runtime }))
+            lanes: lane_links.into_iter().map(std::cell::RefCell::new).collect(), runtime }))
     }
 }
 

@@ -149,6 +149,7 @@ fn kmajor_scales(scales: &[u8], n: usize, kb: usize) -> Vec<u8> {
 
 impl<'a> GlmfLoader<'a> {
     fn tensor(&self, name: &str) -> Result<&CheckpointTensor> {
+        cuteafd_ffi::memory_ledger::tensor(name);
         let at = self.checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
             .map_err(|_| anyhow::anyhow!("checkpoint has no tensor {name}"))?;
         Ok(&self.checkpoint.tensors[at])
@@ -167,6 +168,7 @@ impl<'a> GlmfLoader<'a> {
     /// (see the module docstring); false when the checkpoint stores it otherwise.
     fn nvfp4_dense(&self, cfg: &GlmNextConfig, mlp: &str, ops: &mut HashMap<&'static str, DeviceAllocation<'a>>)
         -> Result<bool> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("nvfp4");
         if self.tensor(&format!("{mlp}.gate_proj.weight"))?.meta.dtype != DType::U8 {
             return Ok(false);
         }
@@ -199,6 +201,7 @@ impl<'a> GlmfLoader<'a> {
 
     /// The row-concatenation of 2-D `names` as one BF16 operand (FP8 blocks dequantized).
     fn rows(&self, names: &[String]) -> Result<DeviceAllocation<'a>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let tensors = names.iter().map(|n| self.raw(n).map(|t| (n, t))).collect::<Result<Vec<_>>>()?;
         let cols = tensors[0].1 .2[1];
         let rows: usize = tensors.iter().map(|(_, (_, _, shape))| shape[0]).sum();
@@ -240,6 +243,7 @@ impl<'a> GlmfLoader<'a> {
     /// tensors as FP8 (block layout), else quantized from BF16 at load (the
     /// FP8 copy is the only resident one).
     fn fp8(&self, names: &[String], layout: super::fp8::Layout) -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
         if layout == super::fp8::Layout::Block {
             if let Some(copy) = self.fp8_blocks(names)? {
                 return Ok(copy);
@@ -253,6 +257,7 @@ impl<'a> GlmfLoader<'a> {
     /// (row-concatenated) on the device, read through this thread's staging
     /// buffer; None when a part is not an FP8 tensor there (quantized instead).
     fn fp8_blocks(&self, names: &[String]) -> Result<Option<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
         let checkpoint = self.fp8_source.unwrap_or(self.checkpoint);
         let find = |name: &str| -> Result<&'a CheckpointTensor> {
             let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
@@ -292,6 +297,7 @@ impl<'a> GlmfLoader<'a> {
     /// prefill programs both read: (values, K-major scales).
     fn fp8_rows_kmajor(&self, names: &[String], layout: super::fp8::Layout)
         -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("fp8");
         ensure!(layout != super::fp8::Layout::Block, "{names:?}: K-major scales are per-row scales");
         let (values, scales, cols) = self.fp8_host(names, layout)?;
         Ok((self.upload(&values)?, self.upload(&kmajor_scales(&scales, values.len() / cols, cols / 128))?))
@@ -341,6 +347,7 @@ impl<'a> GlmfLoader<'a> {
     }
 
     fn one(&self, name: &str) -> Result<DeviceAllocation<'a>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let (bytes, dtype, shape) = self.raw(name)?;
         if shape.len() == 2 && dtype == DType::F8E4M3 {
             return self.rows(&[name.to_string()]);
@@ -350,6 +357,7 @@ impl<'a> GlmfLoader<'a> {
 
     /// A BF16 (or FP32) tensor widened to FP32.
     fn f32(&self, names: &[String]) -> Result<DeviceAllocation<'a>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("f32");
         let mut values = Vec::new();
         for name in names {
             let (bytes, dtype, _) = self.raw(name)?;
@@ -365,6 +373,7 @@ impl<'a> GlmfLoader<'a> {
     /// `kv_b_proj [N*(nope+v), 512]` -> `w_uk [N, 512, nope]` (key rows transposed per head)
     /// and `w_uv [N, v, 512]`.
     fn absorbed(&self, cfg: &GlmNextConfig, name: &str) -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let (bytes, dtype, shape) = self.raw(name)?;
         let (n, nope, v, lat) = (cfg.heads, cfg.qk_nope_dim, cfg.v_head_dim, cfg.kv_lora_rank);
         ensure!(dtype == DType::Bf16 && shape == [n * (nope + v), lat], "{name}: expected BF16 [{}, {lat}]",

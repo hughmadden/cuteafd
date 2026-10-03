@@ -454,3 +454,19 @@ def test_deepseek_v4_launches_with_the_prefix_cache_keys(tmp_path: Path) -> None
     launch = [l for l in default.splitlines() if "cuteafd serve-dsv4" in l]
     assert "--prefix-cache-entries 20" in launch[0]
     assert "--host-cache-bytes" not in launch[0] and "--pool-tokens" not in launch[0]
+
+
+
+def test_glmf_pool_defaults_to_the_planned_pool(tmp_path: Path) -> None:
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    for keys, flag in (("", "--pool-tokens 0"), ("POOL_TOKENS=auto\n", "--pool-tokens 0"),
+                       ("POOL_TOKENS=65536\n", "--pool-tokens 65536")):
+        result = _family_launch_result(tmp_path / str(len(keys)), config, "test/glmf",
+                                       "GLM5_FLASH_FP8_MODEL_ID=off\n" + keys)
+        assert result.returncode == 0, result.stderr
+        launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+        assert flag in launch, launch
+    bad = _family_launch_lines(tmp_path / "dsv4", {"model_type": "deepseek_v4"},
+                               "deepseek-ai/DeepSeek-V4-Flash-0731", "POOL_TOKENS=auto\n")
+    assert "POOL_TOKENS=auto is supported" in bad

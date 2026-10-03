@@ -144,7 +144,11 @@ case $family in
     [[ "$(get HOST_CACHE_BYTES 0)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES)") ;;
 esac
 if [[ $family == mimo_v2 ]]; then
-  family_args+=(--pool-tokens "$(get POOL_TOKENS 131072)")
+  # POOL_TOKENS=auto: the largest pool every GPU admits after all fixed costs (up to 2M tokens).
+  # Default auto (measured 2026-10-03, MiMo V2.6 Pro 2 RTX + 6: 131072 -> 2,097,152 tokens, C1/C4/8K
+  # prefill unchanged); a number pins the pool.
+  mimo_pool="$(get POOL_TOKENS auto)"; [[ "$mimo_pool" != auto ]] || mimo_pool=0
+  family_args+=(--pool-tokens "$mimo_pool")
   # PREFIX_PARTIAL=on: V4.1-style partial reuse (approximate; off = exact restores only).
   family_args+=(--prefix-partial "$(get PREFIX_PARTIAL off)")
   # KV_CACHE: int8 (the engine default: 8-bit full-attention records with FP32 scales per 32
@@ -182,7 +186,19 @@ if [[ $family == qwen4 ]]; then
     esac
   done
 fi
-[[ ! $family =~ ^(glm5|qwen4|deepseek_v4)$ || -z "$(get POOL_TOKENS)" ]] || family_args+=(--pool-tokens "$(get POOL_TOKENS)")
+# POOL_TOKENS=auto (GLM 5.3, GLM 5.3 Flash, MiMo): the largest pool the GPUs hold after the
+# planner's remaining costs (up to 2M tokens).
+# GLM 5.3 defaults to auto (bounded decode graphs captured at startup: 262144 -> 1,292,672 tokens on
+# 2 RTX + 6 Sparks, C1/C4/8K prefill unchanged); Qwen and DeepSeek V4 keep their engine defaults.
+glm_default=""; [[ $family != glm5 ]] || glm_default=auto
+if [[ $family =~ ^(glm5|qwen4|deepseek_v4)$ && -n "$(get POOL_TOKENS "$glm_default")" ]]; then
+  pool="$(get POOL_TOKENS "$glm_default")"
+  if [[ "$pool" == auto ]]; then
+    [[ $family == glm5 ]] || { echo "POOL_TOKENS=auto is supported for GLM 5.3, GLM 5.3 Flash and MiMo" >&2; exit 2; }
+    pool=0
+  fi
+  family_args+=(--pool-tokens "$pool")
+fi
 # GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
 # from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" requires native
 # FP8 block tensors in the primary checkpoint, else BF16 ones are quantized to
@@ -208,7 +224,9 @@ if [[ $family == glm5_flash ]]; then
     off|row128|channel) ;;
     *) echo "GLM5_FLASH_KDA_FP8 must be auto, off, row128 or channel" >&2; exit 2 ;;
   esac
-  family_args+=(--kda-fp8 "$kda_fp8" --pool-tokens "$(get POOL_TOKENS 65536)")
+  # Default auto (GLM 5.3 Flash 1 RTX + 2: 65536 -> 2,097,152 tokens, 44 GiB still free, speed unchanged).
+  glmf_pool="$(get POOL_TOKENS auto)"; [[ "$glmf_pool" != auto ]] || glmf_pool=0
+  family_args+=(--kda-fp8 "$kda_fp8" --pool-tokens "$glmf_pool")
   case "$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD on)" in
     on|auto|"") family_args+=(--fp8-head true) ;;
     off) family_args+=(--fp8-head false) ;;
@@ -437,6 +455,13 @@ for ((rank = 0; rank < ranks; rank++)); do
     sleep 2
   done
 done
+# Loading leaves ~10 GiB of checkpoint pages cached per Spark (sparknest passthrough: the
+# workers' own fadvise cannot reach them), and GB10 CUDA allocations do not reclaim page
+# cache: drop it once every rank is resident. CUTEAFD_SPARK_DROP_PAGE_CACHE=0 keeps it.
+if ((ranks > 0 && ${#spark_hosts[@]} > 0)) && [[ "${CUTEAFD_SPARK_DROP_PAGE_CACHE:-1}" != 0 ]] &&
+   command -v nest >/dev/null; then
+  nest drop-caches "${spark_hosts[@]}" >/dev/null || echo "warning: could not drop Spark page caches after loading" >&2
+fi
 peer_csv="$(IFS=,; echo "${peers[*]}")"
 peer_args=()
 [[ -z "$peer_csv" ]] || peer_args=(--peers "$peer_csv")

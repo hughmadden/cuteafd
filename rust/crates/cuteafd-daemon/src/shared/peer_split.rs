@@ -136,6 +136,7 @@ impl<'a> PeerExchange<'a> {
         slots: usize,
         slot_bytes: usize,
     ) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("peer-split");
         ensure!(
             ranks[0].device != ranks[1].device && slots > 0 && slot_bytes % 16 == 0,
             "a head split exchanges between two GPUs in 16-byte rows"
@@ -172,6 +173,7 @@ impl<'a> PeerExchange<'a> {
         slots: usize,
         slot_bytes: usize,
     ) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("peer-split");
         library.peer_abort_available()?;
         let mut exchange = Self::new(library, ranks, slots, slot_bytes)?;
         let side = |rank: usize| {

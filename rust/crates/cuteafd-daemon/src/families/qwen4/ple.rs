@@ -67,6 +67,7 @@ impl<'a> PleTable<'a> {
     /// `max_rows`: the most token rows one step gathers (mapped placement).
     pub fn load(library: &'a NativeLibrary, checkpoint: &Checkpoint, cfg: &Qwen4Config, layer: usize,
         placement: TablePlacement, args: &MappedTableArgs, max_rows: usize) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("ple");
         let threads = args.threads;
         let loader = super::weights::Qwen4Loader { library, checkpoint, fp8_decode: false,
             fp8_scales: crate::shared::fp8_linear::Fp8Scales::Amax, stream: std::ptr::null_mut() };

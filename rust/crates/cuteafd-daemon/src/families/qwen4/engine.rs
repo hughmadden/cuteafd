@@ -534,6 +534,7 @@ impl<'a> Qwen4Engine<'a> {
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: Qwen4Config, weights: Qwen4Weights<'a>,
         ple: Option<super::ple::PleTable<'a>>, stream: *mut c_void, max_context: usize, prefill_rows: usize,
         pages: usize, slots: usize, embedding: TokenEmbedding<'a>) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         cfg.check_programs()?;
@@ -761,6 +762,7 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     fn workspace(&self, t: usize, decode: bool, logit_rows: usize) -> Result<Workspace<'a>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let h = self.cfg.hidden;
         let cap = if decode { "m64" } else { "m4096" };
         let ple = if self.ple.as_ref().is_some_and(|p| p.fp8) { "qwen4_ple_fp8" } else { "qwen4_ple_bf16" };

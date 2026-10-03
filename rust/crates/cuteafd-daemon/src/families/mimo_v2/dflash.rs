@@ -413,6 +413,7 @@ impl<'a> MimoDrafter<'a> {
     pub fn load(library: &'a NativeLibrary, dir: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
         max_sequences: usize, mask_row: Vec<u8>, representation: MimoDraftRepresentation,
         scales: fp8_linear::Fp8Scales) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let cfg = DflashConfig::read(dir)?;
         ensure!(matches!(representation, MimoDraftRepresentation::Bf16Only | MimoDraftRepresentation::Fp8Only),
             "MiMo serving supports only immutable bf16-only or fp8-only drafter storage; historical dual/mixed controls are not production modes");
@@ -538,6 +539,7 @@ impl<'a> MimoDrafter<'a> {
     /// Called once after admission, while the enclosing engine owns failures.
     /// The ordinary tap pointer remains stable for existing decode graphs.
     pub fn prepare_prefill_lanes(&mut self) -> Result<()> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter/workspace");
         if self.first_lane_taps.is_none() {
             self.first_lane_taps = Some(DeviceAllocation::new(self.library, self.cfg.prefill_lane_tap_bytes()?)?);
         }
@@ -650,6 +652,7 @@ impl<'a> MimoDrafter<'a> {
     }
 
     fn workspace(&self, sequences: usize) -> Result<Workspace<'a>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter/workspace");
         let c = &self.cfg;
         let rows = sequences * c.block;
         let drafted = sequences * c.drafts();

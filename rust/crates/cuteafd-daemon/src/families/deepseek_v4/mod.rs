@@ -231,7 +231,7 @@ pub(crate) fn with_engine<T>(
             .collect(),
     };
     let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&loaded.library,
-        embed_source(&loaded.catalog, loaded.cfg.dim)?, args.token_io.embed_placement, || loader.model(&loaded.cfg))?;
+        embed_source(&loaded.catalog, loaded.cfg.dim)?, args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&loaded.cfg) })?;
     tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 coordinator weights resident");
     let max_context = caps["max_context"].as_u64().context("manifest max_context")? as usize;
     let shape = pool::PoolShape::new(
@@ -288,6 +288,7 @@ pub(crate) fn with_engine<T>(
         TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
         loaded.cfg.dim * 2))
         .collect::<Result<Vec<_>>>()?;
+    crate::shared::memory_report::release_load_staging(&loaded.library);
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let started = Instant::now();
     for transport in &mut transports {

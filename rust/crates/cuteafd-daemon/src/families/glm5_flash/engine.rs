@@ -365,6 +365,7 @@ impl<'a> DenseNvfp4<'a> {
     /// Loads the package at `directory` with scratch, ids and weights for `rows` rows.
     pub fn load(library: &'a NativeLibrary, directory: &std::path::Path, cfg: &GlmNextConfig, rows: usize)
         -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights/dense-nvfp4");
         // SAFETY: a trusted package for the current device; the engine drains its
         // stream before dropping it.
         let module = unsafe { cuteafd_ffi::fp8_moe::Fp8MoeModule::load(directory) }
@@ -495,6 +496,7 @@ impl<'a> GlmfEngine<'a> {
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmNextConfig, weights: GlmfWeights<'a>,
         stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize, slots: usize,
         embedding: TokenEmbedding<'a>) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         ensure!(cfg.hc_mult == HC && cfg.kv_lora_rank == 512 && cfg.kda_head_dim == 128 && cfg.heads == 64,
@@ -750,6 +752,7 @@ impl<'a> GlmfEngine<'a> {
     }
 
     fn workspace(&self, t: usize, decode: bool) -> Result<Workspace<'a>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let (h, n, lat) = (self.cfg.hidden, self.cfg.heads, self.cfg.kv_lora_rank);
         let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
         let mut scratch = 0;
@@ -1517,7 +1520,7 @@ impl<'a> GlmfEngine<'a> {
             let kv = self.kv[index].as_ref().context("MLA trace without a record pool")?;
             std::fs::write(dir.join("mla_kv.bin"), self.download(kv, kv.buffer.bytes)?)?;
         }
-        if !tables.decode && crate::families::glm5::engine::native_mla_prefill() {
+        if let (false, Some(kernel)) = (tables.decode, crate::families::glm5::engine::native_mla_prefill()) {
             let scale = (self.cfg.qk_nope_dim as f32).powf(-0.5);
             self.timed("glm_mla_prefill (native)", || {
                 // SAFETY: query, record cache, indices, lengths and the latent output
@@ -1525,9 +1528,18 @@ impl<'a> GlmfEngine<'a> {
                 unsafe {
                     self.library.glm_mla_prefill(w.query.buffer.ptr, cache, w.indices.buffer.ptr, w.lengths.buffer.ptr,
                         w.latent.buffer.ptr, tables.positions.len(), self.cfg.heads, SPARSE_TOPK, RECORD_BYTES,
-                        scale * std::f32::consts::LOG2_E, self.stream)
+                        scale * std::f32::consts::LOG2_E, kernel, self.stream)
                 }
             })?;
+            if crate::families::glm5::engine::mla_prefill_check() {
+                // SAFETY: as above; the check synchronizes the stream.
+                let stats = unsafe {
+                    self.library.glm_mla_prefill_check(w.query.buffer.ptr, cache, w.indices.buffer.ptr,
+                        w.lengths.buffer.ptr, tables.positions.len(), self.cfg.heads, SPARSE_TOPK, RECORD_BYTES,
+                        scale * std::f32::consts::LOG2_E, self.stream)
+                }?;
+                crate::families::glm5::engine::print_mla_check(index, &stats);
+            }
         } else {
             self.run(&format!("sparse_mla_{mode}_{cap}"), &[("q", w.query.buffer.ptr), ("kv_cache", cache),
                 ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr), ("out", w.latent.buffer.ptr),

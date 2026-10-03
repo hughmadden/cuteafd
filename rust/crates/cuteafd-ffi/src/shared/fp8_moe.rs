@@ -61,8 +61,13 @@ impl Fp8MoeInfo {
         };
         // Slices are the widest rank range, zero-padded to 128 (MXFP4 32-blocks
         // or FP8 128-blocks split unevenly, TP6 of 2048: 384).
-        let sliced = info.slice % 128 == 0 && info.slice * info.tp >= info.intermediate
-            && (info.slice - 128) * info.tp < info.intermediate;
+        // The padded width every rank stores, or (exact layouts) one rank's own
+        // whole 128-row blocks: blocks / tp or one more.
+        let blocks = info.intermediate / 128;
+        let exact = info.intermediate % 128 == 0 && info.tp > 0 && blocks >= info.tp
+            && (info.slice == blocks / info.tp * 128 || info.slice == blocks.div_ceil(info.tp) * 128);
+        let sliced = info.slice % 128 == 0 && info.slice >= 128 && (exact || (info.slice * info.tp >= info.intermediate
+            && (info.slice - 128) * info.tp < info.intermediate));
         ensure!(info.tp > 0 && sliced && info.capacities.windows(2).all(|w| w[0] < w[1]),
             "inconsistent FP8 expert package info {info:?}");
         Ok(info)
