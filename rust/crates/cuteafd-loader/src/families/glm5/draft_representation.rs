@@ -1,5 +1,6 @@
 //! Immutable GLM/GLM Flash DFlash storage and its device-loading contract.
-//! The target owns the BF16 vocabulary head; the drafter never copies it.
+//! The target owns its one vocabulary head (BF16, or GLM 5.3 Flash's FP8-only
+//! head with --fp8-head); the drafter borrows it and never copies it.
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

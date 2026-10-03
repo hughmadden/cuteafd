@@ -255,8 +255,10 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     # MLA, dense and shared-expert projections take only E4M3 weights with 128x128 scales
     # (the official FP8 release's): decode rows up to ``fp8_rows`` on the GEMV, W8A16
     # above; prefill W8A8 when ``fp8_rows`` is nonzero, else W8A16. KDA projections (BF16
-    # in the release) keep BF16 plus optional per-row FP8 copies: decode programs read the
-    # copies behind ``fp8_rows``, prefill programs run block-FP8 GEMMs on its bits.
+    # in the release) run ``kda_m*`` over BF16 (the FP8 operands of those programs are the
+    # retired dual-copy ABI), or ``kda_w8_m*`` over E4M3 only (per-row x 128-K scales,
+    # K-block major, quantized at load): decode rows up to ``fp8_rows`` on the GEMV, W8A16
+    # above; prefill W8A8 on ``fp8_rows`` bits (1 in-projection, 2 o_proj), else W8A16.
     for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
         f8 = True if mode == "decode" else "prefill"
         # Prefill mHC mixes run on TF32 tensor cores (split FP32 fn) from 384 rows.
@@ -270,6 +272,8 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
              lambda r=rows, rt=route: mhc.compile_dsv4_mhc_post_pre_aot(mg, max_rows=r, route=rt)),
             (f"kda_m{rows}", "kda", {"max_rows": rows, "fp8": f8},
              lambda r=rows, f=f8: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8=f)),
+            (f"kda_w8_m{rows}", "kda", {"max_rows": rows, "fp8_only": mode},
+             lambda r=rows, m=mode: glmf.compile_glmf_kda_aot(g, max_rows=r, fp8_only=m)),
             (f"mla_producer_m{rows}", "mla_producer", {"max_rows": rows, "fp8_only": mode},
              lambda r=rows, m=mode: glmf.compile_glmf_mla_producer_aot(g, max_rows=r, fp8_only=m)),
             (f"o_m{rows}", "o", {"max_rows": rows, "fp8_only": mode},

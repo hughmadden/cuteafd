@@ -2,13 +2,16 @@
 //!
 //! The MLA (`q_a|kv_a`, `q_b`, `o_proj`), dense and shared-expert projections
 //! are FP8 only: the official FP8 release's E4M3 bytes and FP32 128x128 block
-//! scales (`--fp8-snapshot` or native FP8 in the primary checkpoint).
-//! BF16 block sources are named unsupported until matching consumers exist.
+//! scales (`--fp8-snapshot` or native FP8 in the primary checkpoint), else
+//! 128x128 blocks quantized from BF16 at load (the BF16 is never resident).
 //! Every other matrix operand is BF16 (the EXL3
 //! publications store the dense tensors in BF16, equal to the official BF16
 //! release; FP8 checkpoint tensors are dequantized on the GPU with their FP32
-//! 128x128 block scales), plus the optional per-row FP8 copies of the KDA
-//! projections and the LM head.
+//! 128x128 block scales), except where an FP8 representation is selected
+//! instead: the KDA in/out projections (`--kda-fp8 row128|channel`: E4M3 with
+//! per-row x 128-K scales stored K-block major, `w_in_fp8`/`w_in_kscale`,
+//! `w_o_fp8`/`w_o_kscale`, no BF16 `w_in`/`w_o`) and the LM head
+//! (`--fp8-head`, [`super::head::GlmfHead::Fp8`]). One resident copy each.
 //! Packing (see the glmf program docstrings): KDA `w_in = [q; k; v; f_a; g_a;
 //! b]`, `w_fg = [f_b; g_b]`, `conv_w` FP32 `[3D, 4]`; MLA `w_qkv_a = [q_a;
 //! kv_a]`, `kv_b` split per head into `w_uk [N, 512, 256]` (transposed key
@@ -66,9 +69,47 @@ impl GlmfLayer<'_> {
 pub(crate) struct GlmfWeights<'a> {
     pub layers: Vec<GlmfLayer<'a>>,
     pub norm: DeviceAllocation<'a>,
-    pub head: DeviceAllocation<'a>,
-    /// E4M3 LM head with per-row x 128-K scales, for decode rows (--fp8-head).
-    pub head_fp8: Option<(DeviceAllocation<'a>, DeviceAllocation<'a>)>,
+    /// The one resident vocabulary head (BF16, or FP8 with --fp8-head).
+    pub head: super::head::GlmfHead<'a>,
+}
+
+/// Resident bytes by representation of the weights with a selectable precision.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Residency {
+    pub kda_bf16: usize,
+    pub kda_fp8: usize,
+    pub head_bf16: usize,
+    pub head_fp8: usize,
+}
+
+impl GlmfWeights<'_> {
+    pub fn residency(&self) -> Residency {
+        let mut r = Residency::default();
+        for layer in self.layers.iter().filter(|l| l.attention == GlmNextAttention::Kda) {
+            r.kda_bf16 += ["w_in", "w_o"].iter().filter_map(|n| layer.range(n)).map(|(_, b)| b).sum::<usize>();
+            r.kda_fp8 += ["w_in_fp8", "w_in_kscale", "w_o_fp8", "w_o_kscale"].iter()
+                .filter_map(|n| layer.range(n)).map(|(_, b)| b).sum::<usize>();
+        }
+        match &self.head {
+            super::head::GlmfHead::Bf16(w) => r.head_bf16 = w.buffer.bytes,
+            head => r.head_fp8 = head.bytes(),
+        }
+        r
+    }
+
+    /// Single residency: no KDA layer and no head holds both a BF16 and an FP8
+    /// copy, and the selected representation is the one resident.
+    pub fn check_single_residency(&self, kda_fp8: super::fp8::KdaFp8, fp8_head: bool) -> Result<Residency> {
+        for (index, layer) in self.layers.iter().enumerate().filter(|(_, l)| l.attention == GlmNextAttention::Kda) {
+            let (bf16, fp8) = (layer.has("w_in") || layer.has("w_o"), layer.has("w_in_fp8") || layer.has("w_o_fp8"));
+            ensure!(!(bf16 && fp8), "KDA layer {index} holds BF16 and FP8 in/out projections");
+            ensure!(fp8 == (kda_fp8 != super::fp8::KdaFp8::Off),
+                "KDA layer {index}: --kda-fp8 {kda_fp8:?} but {} projections are resident", if fp8 { "FP8" } else { "BF16" });
+        }
+        ensure!(matches!(self.head, super::head::GlmfHead::Fp8 { .. }) == fp8_head,
+            "--fp8-head {fp8_head} but the resident head is {}", self.head.name());
+        Ok(self.residency())
+    }
 }
 
 pub(crate) struct GlmfLoader<'a> {
@@ -92,6 +133,18 @@ fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// FP32 scales `[n, kb]` (little-endian bytes) transposed to `[kb, n]`.
+fn kmajor_scales(scales: &[u8], n: usize, kb: usize) -> Vec<u8> {
+    assert_eq!(scales.len(), n * kb * 4);
+    let mut kmajor = vec![0u8; scales.len()];
+    for row in 0..n {
+        for b in 0..kb {
+            kmajor[(b * n + row) * 4..][..4].copy_from_slice(&scales[(row * kb + b) * 4..][..4]);
+        }
+    }
+    kmajor
 }
 
 impl<'a> GlmfLoader<'a> {
@@ -184,13 +237,13 @@ impl<'a> GlmfLoader<'a> {
 
     /// The row-concatenation of 2-D `names` as E4M3 bytes and FP32 scales in
     /// `layout`: the FP8 source checkpoint's own blocks when it stores the
-    /// tensors as FP8 (block layout). Only explicitly selected row layouts
-    /// may quantize BF16 sources; block consumers never change source precision.
+    /// tensors as FP8 (block layout), else quantized from BF16 at load (the
+    /// FP8 copy is the only resident one).
     fn fp8(&self, names: &[String], layout: super::fp8::Layout) -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
         if layout == super::fp8::Layout::Block {
-            return self.fp8_blocks(names)?.with_context(|| format!(
-                "{names:?}: native BF16 GLMF block consumer/exporter is unsupported; \
-                 select checkpoint FP8 inputs with --fp8-snapshot instead of implicit quantization"));
+            if let Some(copy) = self.fp8_blocks(names)? {
+                return Ok(copy);
+            }
         }
         let (values, scales, _) = self.fp8_host(names, layout)?;
         Ok((self.upload(&values)?, self.upload(&scales)?))
@@ -198,7 +251,7 @@ impl<'a> GlmfLoader<'a> {
 
     /// The FP8 source's own E4M3 blocks and FP32 128x128 grids of `names`
     /// (row-concatenated) on the device, read through this thread's staging
-    /// buffer; None when a part is not a native FP8 tensor there.
+    /// buffer; None when a part is not an FP8 tensor there (quantized instead).
     fn fp8_blocks(&self, names: &[String]) -> Result<Option<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
         let checkpoint = self.fp8_source.unwrap_or(self.checkpoint);
         let find = |name: &str| -> Result<&'a CheckpointTensor> {
@@ -234,19 +287,14 @@ impl<'a> GlmfLoader<'a> {
         })
     }
 
-    /// Per-row FP8 copy of `names` (Row128) plus its scales K-block major
-    /// (`[K/128, N]`, the prefill GEMMs' layout): (values, row scales, K-major scales).
-    fn fp8_rows_kmajor(&self, names: &[String])
-        -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>, DeviceAllocation<'a>)> {
-        let (values, scales, cols) = self.fp8_host(names, super::fp8::Layout::Row128)?;
-        let (kb, n) = (cols / 128, values.len() / cols);
-        let mut kmajor = vec![0u8; scales.len()];
-        for row in 0..n {
-            for b in 0..kb {
-                kmajor[(b * n + row) * 4..][..4].copy_from_slice(&scales[(row * kb + b) * 4..][..4]);
-            }
-        }
-        Ok((self.upload(&values)?, self.upload(&scales)?, self.upload(&kmajor)?))
+    /// Per-row FP8 `names` (`layout` Row128 or Channel) with its scales stored
+    /// K-block major (`[K/128, N]`), the one layout the `kda_w8` decode and
+    /// prefill programs both read: (values, K-major scales).
+    fn fp8_rows_kmajor(&self, names: &[String], layout: super::fp8::Layout)
+        -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
+        ensure!(layout != super::fp8::Layout::Block, "{names:?}: K-major scales are per-row scales");
+        let (values, scales, cols) = self.fp8_host(names, layout)?;
+        Ok((self.upload(&values)?, self.upload(&kmajor_scales(&scales, values.len() / cols, cols / 128))?))
     }
 
     /// Host bytes of [`Self::fp8`]: E4M3 values, FP32 scales, and the column count.
@@ -281,7 +329,7 @@ impl<'a> GlmfLoader<'a> {
                     values.extend_from_slice(&bytes);
                     scales.extend_from_slice(&scale);
                 }
-                DType::Bf16 if layout != Layout::Block => {
+                DType::Bf16 => {
                     let (q, s) = quantize(&bytes, shape[0], shape[1], layout, self.fp8_scales);
                     values.extend_from_slice(&q);
                     scales.extend(s.iter().flat_map(|v| v.to_le_bytes()));
@@ -367,25 +415,17 @@ impl<'a> GlmfLoader<'a> {
                     super::fp8::KdaFp8::Channel => Some(super::fp8::Layout::Channel),
                     super::fp8::KdaFp8::Row128 => Some(super::fp8::Layout::Row128),
                 };
-                if kda_layout == Some(super::fp8::Layout::Row128) {
-                    // Per-row copies also serve the block-FP8 prefill GEMMs (K-major scales).
-                    let (q, s, k) = self.fp8_rows_kmajor(&w_in)?;
+                if let Some(layout) = kda_layout {
+                    // The FP8 in/out projections are the only resident copies (no BF16
+                    // `w_in`/`w_o`); one K-major scale copy serves decode and prefill.
+                    ensure!(self.kda_nvfp4.is_none(), "the KDA NVFP4 gate rounds BF16 projections; use --kda-fp8 off");
+                    let (q, k) = self.fp8_rows_kmajor(&w_in, layout)?;
                     ops.insert("w_in_fp8", q);
-                    ops.insert("w_in_scale", s);
                     ops.insert("w_in_kscale", k);
-                    let (q, s, k) = self.fp8_rows_kmajor(&[a("o_proj.weight")])?;
+                    let (q, k) = self.fp8_rows_kmajor(&[a("o_proj.weight")], layout)?;
                     ops.insert("w_o_fp8", q);
-                    ops.insert("w_o_scale", s);
                     ops.insert("w_o_kscale", k);
-                } else if let Some(layout) = kda_layout {
-                    let (q, s) = self.fp8(&w_in, layout)?;
-                    ops.insert("w_in_fp8", q);
-                    ops.insert("w_in_scale", s);
-                    let (q, s) = self.fp8(&[a("o_proj.weight")], layout)?;
-                    ops.insert("w_o_fp8", q);
-                    ops.insert("w_o_scale", s);
-                }
-                if let Some(search) = self.kda_nvfp4 {
+                } else if let Some(search) = self.kda_nvfp4 {
                     let mut bytes = Vec::new();
                     for name in w_in.iter().chain([a("o_proj.weight")].iter()) {
                         let (raw, dtype, shape) = self.raw(name)?;
@@ -407,11 +447,13 @@ impl<'a> GlmfLoader<'a> {
                 ops.insert("a_log", self.f32(&[a("A_log")])?);
                 ops.insert("dt_bias", self.f32(&[a("dt_bias")])?);
                 ops.insert("o_norm", self.one(&a("o_norm.weight"))?);
-                let w_o = match ops.remove("w_o_nvfp4") {
-                    Some(rounded) => rounded,
-                    None => self.one(&a("o_proj.weight"))?,
-                };
-                ops.insert("w_o", w_o);
+                if kda_layout.is_none() {
+                    let w_o = match ops.remove("w_o_nvfp4") {
+                        Some(rounded) => rounded,
+                        None => self.one(&a("o_proj.weight"))?,
+                    };
+                    ops.insert("w_o", w_o);
+                }
             }
             GlmNextAttention::Mla => {
                 ops.insert("q_a_norm", self.one(&a("q_a_layernorm.weight"))?);
@@ -460,14 +502,26 @@ impl<'a> GlmfLoader<'a> {
         let weights = GlmfWeights {
             layers: (0..layers.min(cfg.layers)).map(|l| self.layer(cfg, l)).collect::<Result<_>>()?,
             norm: self.one(&format!("{PREFIX}norm.weight"))?,
-            head: self.one("lm_head.weight")?,
-            head_fp8: if self.fp8_head {
-                Some(self.fp8(&["lm_head.weight".to_string()], super::fp8::Layout::Row128)?)
+            head: if self.fp8_head {
+                let (values, scales) = self.fp8(&["lm_head.weight".to_string()], super::fp8::Layout::Row128)?;
+                super::head::GlmfHead::Fp8 { values, scales }
             } else {
-                None
+                super::head::GlmfHead::Bf16(self.one("lm_head.weight")?)
             },
         };
         crate::shared::memory::staging::release_staging();
         Ok(weights)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn kmajor_scales_transpose_row_blocks() {
+        let rows: Vec<f32> = (0..6).map(|i| i as f32).collect(); // [n=3, kb=2]
+        let bytes: Vec<u8> = rows.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let out: Vec<f32> = super::kmajor_scales(&bytes, 3, 2).chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        assert_eq!(out, [0.0, 2.0, 4.0, 1.0, 3.0, 5.0]);
     }
 }
