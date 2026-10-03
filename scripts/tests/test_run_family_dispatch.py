@@ -152,3 +152,30 @@ def test_deepseek_v4_launches_with_the_prefix_cache_keys(tmp_path: Path) -> None
     launch = [l for l in default.splitlines() if "cuteafd serve-dsv4" in l]
     assert "--prefix-cache-entries 20" in launch[0]
     assert "--host-cache-bytes" not in launch[0] and "--pool-tokens" not in launch[0]
+
+
+def test_glm_flash_drafts_with_its_default_speculator(tmp_path: Path) -> None:
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    model = "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1"
+    drafter = "RedHatAI/GLM-5.3-Flash-speculator.dspark-preview"
+    keys = "GLM5_FLASH_FP8_MODEL_ID=off\n"
+
+    def launch(sub: str, extra: str, drafters: tuple[str, ...] = (drafter,)) -> tuple[str, list[str]]:
+        hf = tmp_path / sub / "hf"
+        for name in drafters:
+            _snapshot(hf, name, {"speculators_model_type": "dspark"})
+        text = _family_launch_lines(tmp_path / sub, config, model, keys + extra)
+        return text, [l for l in text.splitlines() if "cuteafd serve-glmf" in l]
+
+    text, lines = launch("a", "")
+    assert lines and f"--draft /root/.cache/huggingface/hub/models--{drafter.replace('/', '--')}/snapshots/abc" \
+        in lines[0], text
+    assert "drafts with dspark" in text
+    text, lines = launch("b", "SPECULATOR=off\n")
+    assert lines and "--draft" not in lines[0], text
+    text, lines = launch("c", "SPECULATOR=dflash2\nSPECULATOR_MODEL_ID=incoai/GLM-5.3-Flash-DFlash2\n",
+                         ("incoai/GLM-5.3-Flash-DFlash2",))
+    assert lines and "models--incoai--GLM-5.3-Flash-DFlash2" in lines[0], text
+    text, lines = launch("d", "", ())
+    assert not lines and "hf download " + drafter in text

@@ -62,48 +62,65 @@ snapshot_of() {
   [[ -d "$dir/snapshots/$rev" ]] || { echo "missing snapshot $id@$rev" >&2; return 1; }
   printf '%s' "/root/.cache/huggingface/hub/models--${id//\//--}/snapshots/$rev"
 }
-# SPECULATOR picks the drafter (default off):
+# SPECULATOR picks the drafter (default off; GLM 5.3 Flash: its checkpoint's
+# measured best, see glm5_flash_speculator below):
 #   dflash2  GLM 5.x / GLM 5.3 Flash: the DFlash2 checkpoint SPECULATOR_MODEL_ID
 #            (e.g. incoai/GLM-5.3-DFlash2, incoai/GLM-5.3-Flash-DFlash2);
 #            MiMo V2.6 Pro: the snapshot's own dflash/ drafter unless
 #            SPECULATOR_MODEL_ID names one (V2.6 Pro needs SPARK_COUNT=6)
 #   mtp      MiMo V2 Flash, Qwen 3.8: the checkpoint's native MTP layers,
 #            SPECULATOR_DEPTH drafts (default 1)
-#   dspark   DeepSeek V4
+#   dspark   DeepSeek V4 (its own drafter); GLM 5.3 Flash: the dSpark
+#            checkpoint SPECULATOR_MODEL_ID (RedHatAI/GLM-5.3-Flash-speculator.dspark-preview)
 # SPECULATOR_FP8=off drafts in BF16. Pre-rename keys (DRAFT_MODEL_ID, DFLASH,
 # MTP, DSPARK, DRAFT_FP8) still work for one release.
+# GLM 5.3 Flash always drafts with an external speculator: the one measured
+# fastest (emitted tok/s, code and agentic sessions) for each checkpoint.
+glm5_flash_speculator() {
+  case "$1" in
+    *) echo "dspark RedHatAI/GLM-5.3-Flash-speculator.dspark-preview" ;;
+  esac
+}
 speculator="$(get SPECULATOR)"
+default_drafter=""
 if [[ -z "$speculator" ]]; then
   if [[ -n "$(get DRAFT_MODEL_ID)" || "$(get DFLASH off)" == on ]]; then speculator=dflash2
   elif [[ "$(get MTP 0)" != 0 ]]; then speculator=mtp
   elif [[ $family == deepseek_v4 && "$(get DSPARK off)" == on ]]; then speculator=dspark
   else speculator=off; fi
   [[ $speculator == off ]] || echo "warning: DRAFT_MODEL_ID/DFLASH/MTP/DSPARK are deprecated; use SPECULATOR=$speculator" >&2
+  if [[ $speculator == off && $family == glm5_flash ]]; then
+    read -r speculator default_drafter <<<"$(glm5_flash_speculator "$model")"
+    echo "note: GLM 5.3 Flash drafts with $speculator ($default_drafter) for $model; SPECULATOR=off disables it" >&2
+  fi
 fi
 case "$family:$speculator" in
   qwen4:mtp)
     # The MTP layer's experts run on the coordinator: only with local experts (SPARK_COUNT=0).
     [[ "$(get SPARK_COUNT 4)" == 0 ]] ||
       { echo "SPECULATOR=mtp for Qwen needs SPARK_COUNT=0 (local experts); the Spark ranks do not serve the MTP layer's experts" >&2; exit 2; } ;;
-  *:off|glm5:dflash2|glm5_flash:dflash2|mimo_v2:dflash2|mimo_v2:mtp|deepseek_v4:dspark) ;;
+  *:off|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|deepseek_v4:dspark) ;;
   *) echo "SPECULATOR=$speculator does not apply to $family" >&2; exit 2 ;;
 esac
 draft_args=()
 family_args=()
 dspark_args=()
 case "$speculator" in
-  dflash2)
+  dflash2|dspark)
     drafter="$(key SPECULATOR_MODEL_ID DRAFT_MODEL_ID)"
-    if [[ -n "$drafter" ]]; then
-      draft_snapshot="$(snapshot_of "$drafter" "$(key SPECULATOR_MODEL_REVISION DRAFT_MODEL_REVISION)")" || exit 1
+    [[ -n "$drafter" ]] || drafter="$default_drafter"
+    if [[ $speculator == dspark && $family == deepseek_v4 ]]; then
+      dspark_args=(--dspark)
+    elif [[ -n "$drafter" ]]; then
+      draft_snapshot="$(snapshot_of "$drafter" "$(key SPECULATOR_MODEL_REVISION DRAFT_MODEL_REVISION)")" ||
+        { [[ -z "$default_drafter" ]] || echo "download it (hf download $drafter) or set SPECULATOR=off" >&2; exit 1; }
       draft_args=(--draft "$draft_snapshot")
     elif [[ $family == mimo_v2 ]]; then
       draft_args=(--draft "$snapshot")
     else
-      echo "SPECULATOR=dflash2 needs SPECULATOR_MODEL_ID (a DFlash2 checkpoint)" >&2; exit 2
+      echo "SPECULATOR=$speculator needs SPECULATOR_MODEL_ID (a ${speculator/dflash2/DFlash2} checkpoint)" >&2; exit 2
     fi ;;
   mtp) family_args+=(--mtp "$(key SPECULATOR_DEPTH MTP 1)") ;;
-  dspark) dspark_args=(--dspark) ;;
 esac
 # Prefix cache (MiMo, GLM 5.3, GLM 5.3 Flash, Qwen 3.8, DeepSeek V4): PREFIX_CACHE_ENTRIES
 # snapshots per bank (prompts, turns; 0 = off), HOST_CACHE_BYTES of pinned host memory for

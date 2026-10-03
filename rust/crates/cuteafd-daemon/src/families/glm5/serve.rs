@@ -721,7 +721,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         let key = |a: &Active<'_>| (a.placement.len, a.digest);
         let inputs: Vec<dflash_policy::PlanInput<'_>> = active.iter().enumerate().map(|(i, a)| dflash_policy::PlanInput {
             key: key(a), history: &a.drafts, features: drafted[i].as_ref().map(|d| d.features.as_slice()),
-            limit: limits[i],
+            confidence: None, limit: limits[i],
         }).collect();
         let planned = dflash_policy::plan_counts(&inputs, policy.fixed, &cost);
         drop(inputs);

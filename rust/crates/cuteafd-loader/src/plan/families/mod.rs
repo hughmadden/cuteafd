@@ -1,5 +1,6 @@
 pub mod deepseek;
 pub mod dflash;
+pub mod dspark;
 pub mod glm;
 pub mod mimo;
 pub mod qwen;

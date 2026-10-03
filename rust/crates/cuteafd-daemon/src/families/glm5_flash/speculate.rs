@@ -58,17 +58,20 @@ fn prefill_with_taps(engine: &GlmfEngine<'_>, placement: &mut GlmfPlacement, tok
 pub(super) fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngine<'_>, dir: &std::path::Path)
     -> Result<()> {
     let drafter = engine.drafter.as_ref().context("--draft-oracle needs --draft")?;
-    let (hidden, block, drafts_per) = (opened.cfg.hidden, drafter.cfg.block, drafter.cfg.drafts());
+    let (hidden, block, drafts_per) = (opened.cfg.hidden, drafter.block(), drafter.drafts());
+    let dspark = matches!(drafter, super::dspark::Drafter::Dspark(_));
     let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?)?;
     let positions: Vec<usize> = meta["positions"].as_array().context("positions")?.iter()
         .map(|p| p.as_u64().map(|p| p as usize).context("position")).collect::<Result<_>>()?;
     let words = |name: &str| -> Result<Vec<u32>> {
         Ok(std::fs::read(dir.join(name))?.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect())
     };
-    let (ref_tokens, ref_features) = (words("drafts.bin")?, words("features.bin")?);
+    let ref_tokens = words("drafts.bin")?;
+    // DFlash2: selector features [N, 7, 4]; dSpark: confidence [N, 8].
+    let ref_features = words(if dspark { "confidence.bin" } else { "features.bin" })?;
     let ref_hidden = bf16s(&std::fs::read(dir.join("hidden.bin"))?);
     let tokens = tokens(args)?;
-    let layers: Vec<Vec<u8>> = drafter.cfg.taps.iter()
+    let layers: Vec<Vec<u8>> = drafter.taps().iter()
         .map(|l| std::fs::read(args.golden.join(format!("layer{l:02}.bin")))).collect::<std::io::Result<_>>()?;
     let row = hidden * 2;
     let width = layers.len() * row;
@@ -99,7 +102,16 @@ pub(super) fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
         matched += draft.tokens.iter().zip(reference).take_while(|(a, b)| a == b).count();
         let (cosine, _) = similarity(&bf16s(&drafter.last_hidden(1)?), &ref_hidden[index * block * hidden..][..block * hidden]);
         worst = worst.min(cosine);
-        if draft.tokens[0] == reference[0] {
+        if dspark {
+            // Confidence of the rows whose previous token agrees (the Markov embedding is the same).
+            for k in 0..drafts_per {
+                if k > 0 && draft.tokens[k - 1] != reference[k - 1] {
+                    break;
+                }
+                let theirs = f32::from_bits(ref_features[index * drafts_per + k]);
+                feature_error = feature_error.max(f64::from((draft.confidence[k] - theirs).abs()));
+            }
+        } else if draft.tokens[0] == reference[0] {
             let theirs = f32::from_bits(ref_features[index * drafts_per * 4]);
             feature_error = feature_error.max(f64::from((draft.features[0][0] - theirs).abs()));
         }
@@ -108,9 +120,10 @@ pub(super) fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
         }
     }
     let n = positions.len();
-    println!("draft oracle: {n} anchors, identical drafts {exact}/{n}, first draft {first}/{n}, matching prefix \
-        {:.2} of {drafts_per}, worst final-norm cosine {worst:.6}, first-margin max error {feature_error:.4}, \
-        {:.2} ms/draft", matched as f64 / n as f64, draft_seconds * 1e3 / n as f64);
+    println!("draft oracle ({}): {n} anchors, identical drafts {exact}/{n}, first draft {first}/{n}, matching prefix \
+        {:.2} of {drafts_per}, worst final-norm cosine {worst:.6}, {} max error {feature_error:.4}, {:.2} ms/draft",
+        drafter.name(), matched as f64 / n as f64, if dspark { "confidence" } else { "first-margin" },
+        draft_seconds * 1e3 / n as f64);
     Ok(())
 }
 
@@ -119,7 +132,7 @@ pub(super) fn draft_replay(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
     let drafter = engine.drafter.as_ref().context("--draft-replay needs --draft")?;
     let (tokens, greedy) = crate::families::glm5::dflash::golden_sequence(&args.golden, opened.cfg.vocab_size)?;
     let hidden = opened.cfg.hidden;
-    let layers: Vec<Vec<u8>> = drafter.cfg.taps.iter()
+    let layers: Vec<Vec<u8>> = drafter.taps().iter()
         .map(|l| std::fs::read(args.golden.join(format!("layer{l:02}.bin")))).collect::<std::io::Result<_>>()?;
     let row = hidden * 2;
     let taps = |first: usize, n: usize| -> Result<Vec<u8>> {
@@ -132,7 +145,7 @@ pub(super) fn draft_replay(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
         }
         Ok(taps)
     };
-    crate::families::glm5::dflash::replay(drafter, &tokens, &greedy, &taps, &|t| engine.embedding.host_rows(t),
+    crate::families::glm5::dflash::replay(drafter.replay(), &tokens, &greedy, &taps, &|t| engine.embedding.host_rows(t),
         engine.weights.head.buffer.ptr, start)
 }
 
@@ -175,7 +188,7 @@ pub(super) fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngine<
         }
     }
     let seconds = started.elapsed().as_secs_f64();
-    let block = drafter.cfg.drafts();
+    let block = drafter.drafts();
     let mut histogram = vec![0usize; block + 1];
     let mut first_rank = [0usize; 16];
     for (position, draft) in &drafts {

@@ -138,9 +138,10 @@ impl Family for Glm {
                  the recurrence.".to_string(),
             ),
             ("glm5_flash", Component::Speculator) | ("glm5_flash", Component::SpeculatorExpert) => (
-                "native MTP layer 45 (not run); DFlash2 drafter incoai/GLM-5.3-Flash-DFlash2".to_string(),
-                "serve-glmf verifies copy-window drafts only. KDA state needs a rollback for any \
-                 speculator: serve-glmf backs it up per verify and replays kept rows (glmf/serve.rs).".to_string(),
+                "native MTP layer 45 (not run); external drafters: dSpark \
+                 RedHatAI/GLM-5.3-Flash-speculator.dspark-preview, DFlash2 incoai/GLM-5.3-Flash-DFlash2".to_string(),
+                "serve-glmf --draft SNAP drafts with either (run-family picks each checkpoint's measured best); \
+                 KDA state rolls back by verify-by-replay of the kept rows (families/glm5_flash).".to_string(),
             ),
             ("glm5_flash", Component::Indexer) => (
                 "DSA indexer over 4-token key pools".to_string(),

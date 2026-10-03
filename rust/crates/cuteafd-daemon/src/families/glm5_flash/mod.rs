@@ -1,5 +1,6 @@
 //! GLM 5.3 Flash (glm5_next) on the generic engine: weights, the coordinator
 //! programs' layer chain, and the golden comparison command.
+pub(crate) mod dspark;
 pub(crate) mod engine;
 pub(crate) mod fp8;
 pub(crate) mod prefix;
@@ -98,7 +99,9 @@ pub(crate) struct EngineArgs {
     /// shared expert; the routed experts contribute nothing.
     #[arg(long, hide = true)]
     pub skip_experts: bool,
-    /// DFlash2 drafter snapshot (incoai/GLM-5.3-Flash-DFlash2): taps the mHC
+    /// Drafter snapshot: a dSpark checkpoint
+    /// (RedHatAI/GLM-5.3-Flash-speculator.dspark-preview) or DFlash2
+    /// (incoai/GLM-5.3-Flash-DFlash2), told apart by its config; taps the mHC
     /// stream mean after its target layers and drafts on this GPU.
     #[arg(long)]
     pub draft: Option<PathBuf>,
@@ -307,19 +310,14 @@ impl Opened {
             "--fp8-prefill kda reads the per-row FP8 copies --kda-fp8 row128 loads");
         if let Some(snapshot) = &args.draft {
             let started = Instant::now();
-            let cfg = crate::families::glm5::dflash::DflashConfig::read(snapshot)?;
-            ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
-                && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash2 drafter does not fit this target");
-            let mask = engine.embedding.host_rows(&[cfg.mask_token])?;
-            let file = crate::families::glm5::dflash::prefetch(snapshot).join()
-                .map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
-            let mut drafter = crate::families::glm5::dflash::GlmDrafter::load(&self.library, snapshot, file, stream,
-                args.draft_sequences, args.draft_sequences, mask, true)?;
+            let mut drafter = dspark::Drafter::load(&self.library, snapshot, stream, args.draft_sequences,
+                &engine.embedding, self.cfg.hidden, self.cfg.vocab_size, self.cfg.layers)?;
             if args.draft_fp8 {
                 drafter.enable_fp8(engine.weights.head.buffer.ptr, args.fp8_scales)?;
             }
+            let name = drafter.name();
             engine.drafter = Some(drafter);
-            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash2 drafter resident");
+            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "{name} drafter resident");
         }
         if engine.weights.layers.iter().any(|layer| layer.has("nvfp4_w1")) {
             let directory = crate::shared::experts::fp8::dense_package_directory(&args.native_lib, "glmfdense");
