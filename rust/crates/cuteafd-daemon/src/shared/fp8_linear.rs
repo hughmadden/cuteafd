@@ -49,7 +49,6 @@ impl<'a> Fp8Weight<'a> {
     /// retains its source owner if completion cannot be proved).
     pub fn pack(library: &'a NativeLibrary, w: *const c_void, n: usize, k: usize, scales: Fp8Scales,
         stream: *mut c_void) -> Result<Self> {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights/fp8-pack");
         ensure!(n % 16 == 0 && k % 128 == 0, "FP8 copy of [{n}, {k}]: needs n % 16 == 0 and k % 128 == 0");
         let packed = DeviceAllocation::new(library, n * k)?;
         let scale = DeviceAllocation::new(library, n * k / 128 * 4)?;

@@ -516,6 +516,7 @@ impl<'a> MimoEngine<'a> {
             "the mimo programs are built for 192/128 heads, 64 RoPE dims and a window of at most {}",
             RING_ROWS - DECODE_ROWS);
         let zeroed = |bytes: usize| -> Result<Rc<Allocation<'a>>> {
+            let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
             let allocation = Rc::new(Allocation::new(Device { library, id: device }, bytes.max(256))?);
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
