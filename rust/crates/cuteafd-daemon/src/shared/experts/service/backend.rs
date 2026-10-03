@@ -159,6 +159,7 @@ pub(super) fn load_fp8<'a>(
     tensors.slice(config.world)?;
     let directory = config.fp8_package.clone()
         .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&config.library, config.world, tensors.format()));
+    let (directory, slicing) = crate::shared::experts::fp8::exact_layout(&directory, tensors, config.world, config.rank);
     let layers = config.resident_layers(catalog.routed_experts().layers)?;
     let workspace = Fp8Worker::workspace_bytes(config.capacity as usize);
     let budget = config.device_budget.checked_sub(workspace).context("FP8 worker workspace exceeds the budget")?;
@@ -171,7 +172,10 @@ pub(super) fn load_fp8<'a>(
     if let Some(bf16) = bf16 {
         tracing::info!(package = %bf16.display(), "FP8 experts also take BF16 rows");
     }
-    let resident: usize = experts.layers.len() * crate::shared::experts::fp8::Fp8Layer::bytes(tensors, config.world)?;
+    tracing::info!(rank = config.rank, ?slicing, width = tensors.rank_width(config.world, config.rank, slicing)?,
+        "FP8 expert slice layout");
+    let resident: usize = experts.layers.len()
+        * crate::shared::experts::fp8::Fp8Layer::bytes_for(tensors, config.world, config.rank, slicing)?;
     let remaining = config.device_budget.saturating_sub(resident);
     Ok((Weights::Fp8(Rc::new(experts)), remaining))
 }

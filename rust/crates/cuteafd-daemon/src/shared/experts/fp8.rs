@@ -12,7 +12,7 @@ use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::fp8_moe::{Fp8MoeInfo, Fp8MoeModule, Fp8MoePrefill, Fp8MoeWeights, FP8_MOE_POINTERS};
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::formats::fp8_experts::{ExpertFormat, Fp8ExpertTensors, Fp8Projection};
+use cuteafd_loader::formats::fp8_experts::{ExpertFormat, Fp8ExpertTensors, Fp8Projection, Slicing};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
@@ -120,6 +120,28 @@ pub(crate) fn nvfp4_activations() -> Nvfp4Activations {
     }
 }
 
+/// Exact slices: a package that also holds `tp<n>-w<width>` layouts (ranks
+/// owning whole 128-row blocks, each stored at its own width) serves rank
+/// `rank` from its width's layout when every rank's width is packaged (all
+/// ranks decide alike). Otherwise the padded `tp<n>` layout.
+/// CUTEAFD_FP8_EXACT_SLICES=0 keeps the padded layout.
+pub(crate) fn exact_layout(directory: &Path, tensors: &Fp8ExpertTensors, tp: usize, rank: usize)
+    -> (PathBuf, Slicing) {
+    let padded = (directory.to_path_buf(), Slicing::Padded);
+    if std::env::var("CUTEAFD_FP8_EXACT_SLICES").is_ok_and(|v| v == "0") || tp < 2 {
+        return padded;
+    }
+    let (Some(package), Some(layout)) = (directory.parent(), directory.file_name().and_then(|n| n.to_str())) else {
+        return padded;
+    };
+    let exact = Slicing::Blocks(128);
+    let dir_of = |r: usize| tensors.rank_width(tp, r, exact).ok().map(|w| package.join(format!("{layout}-w{w}")));
+    match (0..tp).map(dir_of).collect::<Option<Vec<_>>>() {
+        Some(dirs) if dirs.iter().all(|d| d.is_dir()) => (dirs[rank].clone(), exact),
+        _ => padded,
+    }
+}
+
 /// The BF16-input sibling of an FP8 package directory:
 /// `.../fp8-<family>/tp<n>` -> `.../fp8-<family>-bf16/tp<n>`.
 pub(crate) fn bf16_sibling(directory: &Path) -> Option<PathBuf> {
@@ -140,23 +162,33 @@ pub(crate) struct Fp8Layer<'a> {
 impl<'a> Fp8Layer<'a> {
     /// Device bytes of one layer's slice.
     pub fn bytes(tensors: &Fp8ExpertTensors, tp: usize) -> Result<usize> {
+        Self::bytes_for(tensors, tp, 0, Slicing::Padded)
+    }
+
+    /// Device bytes of rank `rank`'s slice of one layer under `slicing`.
+    pub fn bytes_for(tensors: &Fp8ExpertTensors, tp: usize, rank: usize, slicing: Slicing) -> Result<usize> {
         let experts = tensors.shape().experts;
         Fp8Projection::ALL.iter().try_fold(0usize, |total, &p| {
-            let (w, _) = tensors.slice_bytes(p, tp)?;
-            Ok(total + experts * w + tensors.scale_region_bytes(p, tp)?)
+            let (w, _) = tensors.slice_bytes_with(p, tp, rank, slicing)?;
+            Ok(total + experts * w + tensors.scale_region_bytes_with(p, tp, rank, slicing)?)
         })
     }
 
     pub fn load(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, layer: usize, tp: usize, rank: usize)
         -> Result<Self> {
+        Self::load_with(library, tensors, layer, tp, rank, Slicing::Padded)
+    }
+
+    pub fn load_with(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, layer: usize, tp: usize, rank: usize,
+        slicing: Slicing) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
         ensure!(tensors.has_layer(layer), "layer {layer} has no routed FP8 experts");
         let experts = tensors.shape().experts;
         let mut regions = Vec::with_capacity(6);
         for projection in Fp8Projection::ALL {
-            let (w_bytes, s_bytes) = tensors.slice_bytes(projection, tp)?;
+            let (w_bytes, s_bytes) = tensors.slice_bytes_with(projection, tp, rank, slicing)?;
             let mut weights = vec![0u8; experts * w_bytes];
-            let mut scales = vec![0u8; tensors.scale_region_bytes(projection, tp)?];
+            let mut scales = vec![0u8; tensors.scale_region_bytes_with(projection, tp, rank, slicing)?];
             // NVFP4: the experts' FP32 alphas, then their input scales, follow the scale grids.
             let (grids, scalars) = scales.split_at_mut(experts * s_bytes);
             let nvfp4 = !scalars.is_empty();
@@ -172,7 +204,7 @@ impl<'a> Fp8Layer<'a> {
                 let handles: Vec<_> = jobs.chunks_mut(per).map(|chunk| scope.spawn(move || -> Result<()> {
                     let mut staging = Vec::new();
                     for (expert, w, s, (alpha, input)) in chunk.iter_mut() {
-                        tensors.read_slice(layer, *expert, projection, tp, rank, w, s, &mut staging)?;
+                        tensors.read_slice_with(layer, *expert, projection, tp, rank, slicing, w, s, &mut staging)?;
                         if nvfp4 {
                             alpha.copy_from_slice(&tensors.read_alpha(layer, *expert, projection)?.to_le_bytes());
                             input.copy_from_slice(&tensors.read_input_scale(layer, *expert, projection)?.to_le_bytes());
@@ -229,6 +261,11 @@ impl<'a> Fp8Experts<'a> {
         bf16_directory: Option<&Path>, layers: std::ops::Range<usize>, tp: usize, rank: usize, capacity: usize,
         budget: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
+        // `tp<n>-w<width>` layouts store each rank's own whole 128-row blocks (see `exact_layout`).
+        let slicing = match directory.file_name().and_then(|n| n.to_str()).and_then(|n| n.split_once("-w")) {
+            Some(_) => Slicing::Blocks(128),
+            None => Slicing::Padded,
+        };
         for layer in layers.clone() {
             tensors.validate_layer(layer)?;
         }
@@ -246,7 +283,7 @@ impl<'a> Fp8Experts<'a> {
         };
         ensure!(info.hidden == shape.hidden && info.experts == shape.experts && info.topk == shape.topk
             && info.intermediate == shape.intermediate && info.tp == tp && info.weights == weights
-            && info.slice == tensors.slice(tp)?,
+            && info.slice == tensors.rank_width(tp, rank, slicing)?,
             "FP8 package {} ({info:?}) does not serve this checkpoint at TP{tp}", directory.display());
         let top = info.capacity_for(capacity)
             .with_context(|| format!("FP8 package has no capacity for {capacity} rows"))?;
@@ -261,13 +298,14 @@ impl<'a> Fp8Experts<'a> {
             let scratch = bf16.scratch_bytes(top)?;
             Ok::<_, anyhow::Error>((bf16, scratch))
         }).transpose()?;
-        let (resident_bytes, scratch_bytes) = resident_admission(Fp8Layer::bytes(tensors, tp)?, layers.len(), primary_scratch,
+        let (resident_bytes, scratch_bytes) = resident_admission(Fp8Layer::bytes_for(tensors, tp, rank, slicing)?,
+            layers.len(), primary_scratch,
             bf16_module.as_ref().map(|(_, scratch)| *scratch), budget)?;
         tracing::info!(resident_bytes, scratch_bytes, budget, bf16_package = ?bf16_directory,
             "FP8 expert allocation admitted");
         let layers = layers.map(|layer| {
             let started = std::time::Instant::now();
-            let loaded = Fp8Layer::load(library, tensors, layer, tp, rank)?;
+            let loaded = Fp8Layer::load_with(library, tensors, layer, tp, rank, slicing)?;
             tracing::info!(layer, tp, rank, elapsed_ms = started.elapsed().as_millis() as u64,
                 "FP8 expert layer resident");
             Ok(loaded)
