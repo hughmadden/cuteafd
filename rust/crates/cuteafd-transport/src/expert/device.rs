@@ -209,6 +209,9 @@ impl SparkDeviceLane {
         });
         let (ready_tx, ready) = std::sync::mpsc::channel::<Result<usize>>();
         let state = Arc::clone(&shared);
+        // A wave whose partials do not all arrive within this fails (and resets
+        // the connections) instead of leaving the stream waiting forever.
+        let wave_timeout = config.timeout;
         let thread = std::thread::Builder::new().name("spark-device-lane".into()).spawn(move || {
             let setup = (|| -> Result<_> {
                 let mut transport = SparkExperts::new_ranks(&peers, &executors, capacity, config)?;
@@ -309,7 +312,10 @@ impl SparkDeviceLane {
                     let pending = transport.dispatch_wave(&request)?;
                     let posted = Instant::now();
                     let rows = wave.rows as usize;
-                    runtime.block_on(transport.receive_wave(pending, |rank, first, payload| {
+                    let mut landed_ranks = 0u64;
+                    let received = runtime.block_on(async { tokio::time::timeout(wave_timeout,
+                        transport.receive_wave(pending, |rank, first, payload| {
+                        landed_ranks |= 1 << rank;
                         // A rank that could not register its plane: copy its
                         // rows there (synchronously; a fallback, not the plan).
                         let at = first as usize * row_bytes;
@@ -320,7 +326,12 @@ impl SparkDeviceLane {
                             ptr: (plane.ptr + at) as *mut std::ffi::c_void, bytes: payload.len(), ..Default::default()
                         };
                         library.copy_h2d(target, payload)
-                    }))?;
+                    })).await });
+                    match received {
+                        Ok(receipt) => { receipt?; }
+                        Err(_) => anyhow::bail!("device wave (layer {}, {} rows) timed out after {:?}; copied ranks {:#b}",
+                            wave.layer, wave.rows, wave_timeout, landed_ranks),
+                    }
                     let finished = Instant::now();
                     state.build_post_ns.fetch_add((posted - seen).as_nanos() as u64, Ordering::Relaxed);
                     state.receive_ns.fetch_add((finished - posted).as_nanos() as u64, Ordering::Relaxed);
