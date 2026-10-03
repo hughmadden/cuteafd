@@ -13,6 +13,7 @@ mod families {
 }
 #[path = "../src/shared"]
 mod shared {
+    pub(crate) mod fp8_linear;
     pub(crate) mod memory;
 }
 use families::deepseek_v41::{v41_attention_query, v41_hc, v41_tensors};
