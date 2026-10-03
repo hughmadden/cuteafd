@@ -175,6 +175,22 @@ pub(crate) struct PlanArgs {
     /// Exit non-zero unless every part is servable.
     #[arg(long, default_value_t = false)]
     pub(crate) require_ready: bool,
+    /// Lay out each device's memory: weights by group and format, KV pool,
+    /// workspaces, runtime and Spark buffers.
+    #[arg(long)]
+    pub(crate) layout: bool,
+    /// Coordinator GPUs for --layout (1 or 2; two split attention heads).
+    #[arg(long, default_value_t = 1)]
+    pub(crate) rtx: usize,
+    /// Usable GiB per coordinator GPU for --layout.
+    #[arg(long, default_value_t = 95.5)]
+    pub(crate) rtx_gib: f64,
+    /// Explicit KV pool tokens for --layout (default: sized from what is left).
+    #[arg(long)]
+    pub(crate) pool_tokens: Option<u64>,
+    /// External drafter GiB on the last GPU for --layout (DFlash).
+    #[arg(long, default_value_t = 0.0)]
+    pub(crate) drafter_gib: f64,
 }
 
 #[derive(Debug, Args)]

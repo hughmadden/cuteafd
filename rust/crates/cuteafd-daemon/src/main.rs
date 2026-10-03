@@ -48,6 +48,14 @@ async fn main() -> Result<()> {
     };
     // A serve command's resolved options, for the server's benchmark reports.
     commands::bench::capture(&matches);
+    // Memory ledger reports for the long-running roles (device use by category).
+    match &command {
+        Commands::Expertd(_) => shared::memory_report::monitor("expertd", std::time::Duration::from_secs(10)),
+        Commands::ServeNative(_) | Commands::ServeMimo(_) | Commands::ServeQwen4(_) | Commands::ServeGlmf(_)
+        | Commands::ServeGlm(_) | Commands::ServeDsv4(_) =>
+            shared::memory_report::monitor("coordinator", std::time::Duration::from_secs(10)),
+        _ => {}
+    }
     match command {
         Commands::Serve(_) | Commands::Golden(_) => unreachable!("resolved to a family command above"),
         Commands::Doctor(args) => run_doctor(args),

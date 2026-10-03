@@ -37,6 +37,7 @@ pub(crate) struct GlmPrefix<'e, 'a> {
 
 impl<'e, 'a> GlmPrefix<'e, 'a> {
     pub fn new(engine: &'e GlmEngine<'a>, partial: bool) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix");
         let paged = (0..engine.ranks())
             .flat_map(|rank| engine.paged_buffers_on(rank).into_iter().map(move |(records, index)| (rank, records, index)))
             .collect();

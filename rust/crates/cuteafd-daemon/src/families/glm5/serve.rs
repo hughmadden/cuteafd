@@ -725,7 +725,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     .collect();
                 let timer = Instant::now();
                 let drafts = drafter.draft_device(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
-                    &engine.weights.head);
+                    super::dflash::TargetHead::Bf16(&engine.weights.head));
                 cost.observe_draft(timer.elapsed().as_secs_f64() * 1e3);
                 let mut out = vec![None; active.len()];
                 match drafts {

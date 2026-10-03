@@ -31,7 +31,7 @@ class PlacementHandoffTest(unittest.TestCase):
         block=source[source.index('placement_directory='):source.index('api_url=')]
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); (root/'plan').write_text(json.dumps(plan))
-            for name in ['docker','ssh']:
+            for name in ['docker','ssh','nest']:
                 path=root/name;path.write_text(STUB);path.chmod(0o755)
             env=dict(os.environ,PATH=str(root)+os.pathsep+os.environ['PATH'],EVENTS=str(root/'events'),PLAN=str(root/'plan'))
             setup=r'''
@@ -146,6 +146,16 @@ wip_slot=
         result,events=self.run_startup(2,dict(version=1,rtx_gpus=2,nonce='fresh',rtx_expert_layers=40,spark_first_layer=39),spark_count=0)
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertFalse(any(tool=='ssh' for tool,_ in events))
+        # No hosts: never `nest drop-caches` without --host (that drops every host's cache).
+        self.assertFalse(any(tool=='nest' for tool,_ in events))
+
+    def test_spark_launch_drops_only_its_hosts_page_caches(self):
+        result,events=self.run_startup(2,dict(version=1,rtx_gpus=2,nonce='fresh',rtx_expert_layers=20,spark_first_layer=20))
+        self.assertEqual(result.returncode,0,result.stderr)
+        drops=[args for tool,args in events if tool=='nest']
+        self.assertEqual(len(drops),1,events)
+        self.assertEqual(drops[0][0],'drop-caches')
+        self.assertTrue(all(a=='--host' for a in drops[0][1::2]),drops)
 
     def test_cli_tp2_overrides_and_invalid_config(self):
         source=(ROOT/'run.sh').read_text()

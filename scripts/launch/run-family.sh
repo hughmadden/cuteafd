@@ -70,9 +70,9 @@ snapshot_of() {
 #   mtp      MiMo V2 Flash, Qwen 3.8: the checkpoint's native MTP layers,
 #            SPECULATOR_DEPTH drafts (default 1)
 #   dspark   DeepSeek V4
-# MiMo unset selects the measured default only for its qualified Pro metadata;
+# MiMo unset drafts in single-copy FP8 (the measured family default);
 # SPECULATOR_FP8=auto preserves that drafter's checkpoint format. GLM auto/unset
-# preserves checkpoint weights. on converts, off selects BF16. Pre-rename keys
+# drafts in single-copy FP8. on converts, off selects BF16. Pre-rename keys
 # (DRAFT_MODEL_ID, DFLASH,
 # MTP, DSPARK, DRAFT_FP8) still work for one release.
 speculator="$(get SPECULATOR)"
@@ -144,7 +144,11 @@ case $family in
     [[ "$(get HOST_CACHE_BYTES 0)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES)") ;;
 esac
 if [[ $family == mimo_v2 ]]; then
-  family_args+=(--pool-tokens "$(get POOL_TOKENS 131072)")
+  # POOL_TOKENS=auto: the largest pool every GPU admits after all fixed costs (up to 2M tokens).
+  # Default auto (measured 2026-10-03, MiMo V2.6 Pro 2 RTX + 6: 131072 -> 2,097,152 tokens, C1/C4/8K
+  # prefill unchanged); a number pins the pool.
+  mimo_pool="$(get POOL_TOKENS auto)"; [[ "$mimo_pool" != auto ]] || mimo_pool=0
+  family_args+=(--pool-tokens "$mimo_pool")
   # PREFIX_PARTIAL=on: V4.1-style partial reuse (approximate; off = exact restores only).
   family_args+=(--prefix-partial "$(get PREFIX_PARTIAL off)")
   # KV_CACHE: int8 (the engine default: 8-bit full-attention records with FP32 scales per 32
@@ -168,18 +172,46 @@ if [[ -n "$expert_input" ]]; then
     *) echo "EXPERT_INPUT must be fp8, bf16 or bf16-decode" >&2; exit 2 ;;
   esac
 fi
-[[ ! $family =~ ^(glm5|qwen4|deepseek_v4)$ || -z "$(get POOL_TOKENS)" ]] || family_args+=(--pool-tokens "$(get POOL_TOKENS)")
+# Qwen 3.8: QWEN_FP8_DECODE=on|off converts the GDN/attention projections to one
+# resident E4M3 copy; QWEN_FP8_HEAD=on|off does the same for the head target and
+# MTP share. Unset keeps the engine defaults.
+if [[ $family == qwen4 ]]; then
+  for key in FP8_DECODE:--fp8-decode FP8_HEAD:--mtp-fp8-head; do
+    mode="$(get "QWEN_${key%%:*}")"
+    case "$mode" in
+      "") ;;
+      on) family_args+=("${key#*:}" true) ;;
+      off) family_args+=("${key#*:}" false) ;;
+      *) echo "QWEN_${key%%:*} must be on or off" >&2; exit 2 ;;
+    esac
+  done
+fi
+# POOL_TOKENS=auto (GLM 5.3, GLM 5.3 Flash, MiMo): the largest pool the GPUs hold after the
+# planner's remaining costs (up to 2M tokens).
+# GLM 5.3 defaults to auto (bounded decode graphs captured at startup: 262144 -> 1,292,672 tokens on
+# 2 RTX + 6 Sparks, C1/C4/8K prefill unchanged); Qwen and DeepSeek V4 keep their engine defaults.
+glm_default=""; [[ $family != glm5 ]] || glm_default=auto
+if [[ $family =~ ^(glm5|qwen4|deepseek_v4)$ && -n "$(get POOL_TOKENS "$glm_default")" ]]; then
+  pool="$(get POOL_TOKENS "$glm_default")"
+  if [[ "$pool" == auto ]]; then
+    [[ $family == glm5 ]] || { echo "POOL_TOKENS=auto is supported for GLM 5.3, GLM 5.3 Flash and MiMo" >&2; exit 2; }
+    pool=0
+  fi
+  family_args+=(--pool-tokens "$pool")
+fi
 # GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
 # from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" requires native
-# FP8 block tensors in the primary checkpoint). KDA's BF16 source weights run as-is by default
-# (GLM5_FLASH_KDA_FP8: unset/auto/off). Legacy row128/channel and the extra
-# FP8 head are unsupported until they have single-copy consumers. Its MLA
-# pools hold POOL_TOKENS tokens (a key every
+# FP8 block tensors in the primary checkpoint, else BF16 ones are quantized to
+# 128x128 blocks at load). GLM5_FLASH_KDA_FP8 (unset/auto = row128, channel, off)
+# replaces the KDA in/out projections with per-row FP8 at load (their only
+# resident copy); off keeps the checkpoint BF16. GLM5_FLASH_FP8_HEAD (default on)
+# keeps only a per-row FP8 LM head (target and drafter); off keeps BF16.
+# Its MLA pools hold POOL_TOKENS tokens (a key every
 # family with a paged KV pool reads). GLM5_FLASH_FP8_PREFILL lists the prefill
 # projections that run W8A8 (E4M3 activations per 128-K block): unset = the
-# engine default mla,ffn (the official FP8 tensors), a list of
-# mla,ffn,kda-in,kda-o / all, or off (MLA/FFN W8A16, KDA BF16). The GLMF_*
-# spellings still work for one release.
+# engine default mla,ffn, a list of mla,ffn,kda-in,kda-o / all (kda-* need
+# GLM5_FLASH_KDA_FP8 row128/channel), or off (every FP8 weight W8A16). The
+# GLMF_* spellings still work for one release.
 if [[ $family == glm5_flash ]]; then
   fp8_model="$(key GLM5_FLASH_FP8_MODEL_ID GLMF_FP8_MODEL_ID zai-org/GLM-5.3-Flash)"
   if [[ "$fp8_model" != off ]]; then
@@ -188,22 +220,25 @@ if [[ $family == glm5_flash ]]; then
   fi
   kda_fp8="$(key GLM5_FLASH_KDA_FP8 GLMF_KDA_FP8 auto)"
   case "$kda_fp8" in
-    ""|auto|off) kda_fp8=off ;;
-    row128|channel)
-      echo "GLM5_FLASH_KDA_FP8=$kda_fp8 requires duplicate BF16/FP8 weights; single-copy consumers are missing; use off" >&2
-      exit 2 ;;
+    ""|auto) kda_fp8=row128 ;;
+    off|row128|channel) ;;
     *) echo "GLM5_FLASH_KDA_FP8 must be auto, off, row128 or channel" >&2; exit 2 ;;
   esac
-  family_args+=(--kda-fp8 "$kda_fp8" --pool-tokens "$(get POOL_TOKENS 65536)")
-  if [[ "$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD off)" == on ]]; then
-    echo "GLM5_FLASH_FP8_HEAD=on duplicates the checkpoint head; a shared single-copy consumer is missing; use off" >&2
-    exit 2
-  fi
+  # Default auto (GLM 5.3 Flash 1 RTX + 2: 65536 -> 2,097,152 tokens, 44 GiB still free, speed unchanged).
+  glmf_pool="$(get POOL_TOKENS auto)"; [[ "$glmf_pool" != auto ]] || glmf_pool=0
+  family_args+=(--kda-fp8 "$kda_fp8" --pool-tokens "$glmf_pool")
+  case "$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD on)" in
+    on|auto|"") family_args+=(--fp8-head true) ;;
+    off) family_args+=(--fp8-head false) ;;
+    *) echo "GLM5_FLASH_FP8_HEAD must be on or off" >&2; exit 2 ;;
+  esac
   fp8_prefill="$(key GLM5_FLASH_FP8_PREFILL GLMF_FP8_PREFILL)"
   case ",$fp8_prefill," in
     *,all,*|*,kda-in,*|*,kda-o,*)
-      echo "GLM5_FLASH_FP8_PREFILL=$fp8_prefill requires duplicate KDA weights; use mla,ffn or off until single-copy consumers exist" >&2
-      exit 2 ;;
+      if [[ $kda_fp8 == off ]]; then
+        echo "GLM5_FLASH_FP8_PREFILL=$fp8_prefill runs KDA W8A8 over FP8 KDA weights; set GLM5_FLASH_KDA_FP8=row128 or channel" >&2
+        exit 2
+      fi ;;
   esac
   case "$fp8_prefill" in
     "") ;;
@@ -238,7 +273,7 @@ if [[ $serve != serve-dsv4 ]]; then
       esac
     elif [[ $family == glm5 || $family == glm5_flash ]]; then
       case "$(key SPECULATOR_FP8 DRAFT_FP8 auto)" in
-        auto) ;; # Preserve BF16 checkpoint weights by default.
+        auto) ;; # The engine default: single-copy FP8 drafter weights.
         on) family_args+=(--draft-fp8 true) ;;
         off) family_args+=(--draft-fp8 false) ;;
         *) echo "SPECULATOR_FP8 must be auto, on or off" >&2; exit 2 ;;
@@ -323,7 +358,7 @@ case "$family:$model_type" in
 esac
 if [[ "$split" != off && "$explicit_split" == 1 ]]; then
   [[ -z "$split_hint" ]] ||
-    { echo "$family ($model_type): two-GPU head split is unsupported; $split_hint; use RTX_GPUS=1 or COORDINATOR_SPLIT=off" >&2; exit 2; }
+    echo "note: $family ($model_type) has no head split yet ($split_hint); serving from GPU $gpu alone" >&2
   [[ -n "$second" ]] ||
     { echo "RTX_GPUS=2 requires two physical coordinator GPUs; only GPU $gpu was selected" >&2; exit 2; }
 fi
@@ -339,7 +374,7 @@ if [[ -n "$second" && "$split" != off ]]; then
     lower=$((gpu < second ? gpu : second)) upper=$((gpu < second ? second : gpu))
     gpus="\"device=$lower,$upper\""
     family_args+=(--device $((gpu == lower ? 0 : 1)) --split-device $((gpu == lower ? 1 : 0)))
-  else
+  elif [[ "$explicit_split" != 1 ]]; then
     echo "note: $family ($model_type) has no head split; auto selected GPU $gpu alone" >&2
   fi
 fi
@@ -420,6 +455,13 @@ for ((rank = 0; rank < ranks; rank++)); do
     sleep 2
   done
 done
+# Loading leaves ~10 GiB of checkpoint pages cached per Spark (sparknest passthrough: the
+# workers' own fadvise cannot reach them), and GB10 CUDA allocations do not reclaim page
+# cache: drop it once every rank is resident. CUTEAFD_SPARK_DROP_PAGE_CACHE=0 keeps it.
+if ((ranks > 0 && ${#spark_hosts[@]} > 0)) && [[ "${CUTEAFD_SPARK_DROP_PAGE_CACHE:-1}" != 0 ]] &&
+   command -v nest >/dev/null; then
+  nest drop-caches "${spark_hosts[@]}" >/dev/null || echo "warning: could not drop Spark page caches after loading" >&2
+fi
 peer_csv="$(IFS=,; echo "${peers[*]}")"
 peer_args=()
 [[ -z "$peer_csv" ]] || peer_args=(--peers "$peer_csv")

@@ -111,6 +111,7 @@ impl<'a> TokenEmbedding<'a> {
     /// thread while `during` (the caller's weight load) runs on this one.
     pub fn load<T>(library: &'a NativeLibrary, source: EmbedSource, placement: EmbedPlacement,
         during: impl FnOnce() -> Result<T>) -> Result<(Self, T)> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("embedding");
         let file = std::fs::File::open(&source.path).with_context(|| format!("opening {}", source.path.display()))?;
         if placement == EmbedPlacement::Host {
             return Ok((Self { library, source, file, table: None }, during()?));
@@ -283,6 +284,7 @@ impl<'a> TokenEmbedding<'a> {
 /// pinned 64 MiB chunks (runs on the loader thread).
 fn fill_table(library: &NativeLibrary, device: i32, file: &std::fs::File, source: &EmbedSource, address: usize)
     -> Result<()> {
+    let _memory_scope = cuteafd_ffi::memory_ledger::scope("embedding");
     library.cuda_set_device(device)?;
     let chunk = 64usize << 20;
     let mut staging = HostAllocation::new(library, chunk)?;

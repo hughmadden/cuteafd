@@ -49,7 +49,9 @@ pub(crate) struct EngineArgs {
     /// Longest sequence (the RoPE tables and page tables).
     #[arg(long, default_value_t = 32768)]
     pub max_context: usize,
-    /// Tokens the full-attention record pool holds across sequences.
+    /// Tokens the full-attention record pool holds across sequences; 0 sizes
+    /// it from what every GPU has left after weights, workspaces, graphs and
+    /// the drafter (capacity admission), up to the common 2M-token target.
     #[arg(long, default_value_t = 131_072)]
     pub pool_tokens: usize,
     /// Full-attention KV record format: int8 (signed bytes with an FP32 scale
@@ -348,7 +350,7 @@ mod source_format_tests {
     fn qualified_default_matches_explicit_fp8_bundle_in_a_renamed_local_copy() {
         let (_directory, mut args, checkpoint, cfg) = qualified_fixture();
         let automatic = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
-        assert_eq!(automatic.default_policy, MimoDefaultPolicy::QualifiedProFp8);
+        assert_eq!(automatic.default_policy, MimoDefaultPolicy::Fp8);
         assert_eq!(automatic.head, MimoProjectionRepresentation::Fp8);
         assert_eq!(automatic.draft, MimoDraftRepresentation::Fp8Only);
         assert_eq!(automatic.output.len(), 70);
@@ -389,7 +391,7 @@ mod source_format_tests {
         args.draft = Some(external.path().into());
         let selected = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
         assert_eq!(selected.head, MimoProjectionRepresentation::Fp8);
-        assert_eq!(selected.draft, MimoDraftRepresentation::Bf16Only);
+        assert_eq!(selected.draft, MimoDraftRepresentation::Fp8Only);
     }
 
     #[test]
@@ -412,14 +414,15 @@ mod source_format_tests {
         checkpoint.tensors.sort_by(|a,b| a.meta.name.cmp(&b.meta.name));
         let selected = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
         assert_eq!(selected.draft, MimoDraftRepresentation::Fp8Only);
-        assert_eq!(selected.output["model.mtp.layers.0.self_attn.o_proj.weight"], MimoProjectionRepresentation::Bf16);
-        assert_eq!(selected.output.values().filter(|&&format| format == MimoProjectionRepresentation::Fp8).count(), 70);
+        assert_eq!(selected.output["model.mtp.layers.0.self_attn.o_proj.weight"], MimoProjectionRepresentation::Fp8);
+        assert_eq!(selected.output.values().filter(|&&format| format == MimoProjectionRepresentation::Fp8).count(), 71);
     }
 
     #[test]
-    fn changed_model_config_retains_source_formats_despite_pro_geometry() {
+    fn unaligned_head_retains_source_formats() {
         let (_directory, args, mut checkpoint, cfg) = qualified_fixture();
-        checkpoint.config["attention_value_scale"] = serde_json::json!(0.5);
+        let at = checkpoint.tensors.iter().position(|t| t.meta.name == "lm_head.weight").unwrap();
+        checkpoint.tensors[at].meta.shape[1] = 6100;
         let selected = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
         assert_eq!(selected.default_policy, MimoDefaultPolicy::Checkpoint);
         assert_eq!((selected.head, selected.draft), (MimoProjectionRepresentation::Bf16, MimoDraftRepresentation::Bf16Only));
@@ -637,16 +640,14 @@ fn resolve_weight_formats(args: &EngineArgs, checkpoint: &Checkpoint, cfg: &Mimo
     let default_policy = if args.weight_policy == WeightPolicyArg::Checkpoint {
         MimoDefaultPolicy::Checkpoint
     } else { weight_policy::default_policy(checkpoint, cfg) };
-    let default_fp8 = (default_policy == MimoDefaultPolicy::QualifiedProFp8).then_some(true);
+    let default_fp8 = (default_policy == MimoDefaultPolicy::Fp8).then_some(true);
     let head = projection_source(checkpoint, "lm_head.weight", args.fp8_head.or(default_fp8))?;
     let names = (0..args.layers.unwrap_or(cfg.layers).min(cfg.layers))
         .map(|layer| format!("model.layers.{layer}.self_attn.o_proj.weight"))
         .chain((0..args.mtp).map(|layer| format!("model.mtp.layers.{layer}.self_attn.o_proj.weight")));
     let mut output = std::collections::BTreeMap::new();
     for name in names {
-        // The measured exception covers target O matrices, not unqualified MTP.
-        let default = if name.starts_with("model.layers.") { default_fp8 } else { None };
-        let selected = projection_source(checkpoint, &name, args.fp8_o_proj.or(default))?;
+        let selected = projection_source(checkpoint, &name, args.fp8_o_proj.or(default_fp8))?;
         ensure!(args.split_device.is_none() || name.starts_with("model.mtp.") || selected != MimoProjectionRepresentation::Bf16
             || checkpoint.tensors.iter().find(|t| t.meta.name == name)
                 .is_some_and(|t| t.meta.dtype == cuteafd_core::DType::Bf16),
@@ -678,21 +679,12 @@ fn resolve_weight_formats(args: &EngineArgs, checkpoint: &Checkpoint, cfg: &Mimo
         args.draft_storage()?;
         native_draft.unwrap_or(MimoDraftRepresentation::Bf16Only)
     } else if args.draft_representation.is_none() && args.draft_fp8.is_none() {
-        let qualified_embedded = if default_fp8.is_some() {
-            args.draft.as_deref().map(dflash::drafter_dir)
-                .filter(|dir| {
-                    let embedded = checkpoint.snapshot.join("dflash");
-                    *dir == embedded || matches!((dir.canonicalize(), embedded.canonicalize()),
-                        (Ok(actual), Ok(expected)) if actual == expected)
-                })
-                .map(|dir| -> Result<bool> {
-                    let config = cuteafd_loader::plan::checkpoint::read_json(&dir.join("config.json"))?;
-                    let headers = cuteafd_loader::read_safetensors_metadata(&dir.join("dflash_draft_model.safetensors"))?;
-                    Ok(weight_policy::qualified_draft(&config, &headers))
-                }).transpose()?.unwrap_or(false)
-        } else { false };
-        if qualified_embedded { MimoDraftRepresentation::Fp8Only }
-        else { native_draft.unwrap_or(MimoDraftRepresentation::Bf16Only) }
+        // Drafter precision cannot change committed tokens; FP8 drafts are faster
+        // (measured with the target default above), so BF16 drafters convert.
+        match native_draft.unwrap_or(MimoDraftRepresentation::Bf16Only) {
+            MimoDraftRepresentation::Bf16Only if default_fp8.is_some() => MimoDraftRepresentation::Fp8Only,
+            native => native,
+        }
     } else { args.draft_storage()? };
     Ok(ResolvedWeightFormats { default_policy, head, output, draft })
 }
@@ -826,7 +818,7 @@ impl Opened {
             fp8_scales: args.fp8_scales, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream }).collect() };
         let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
-            args.token_io.embed_placement, || loader.model(&self.cfg, layers))?;
+            args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers) })?;
         let mtp = if args.mtp > 0 {
             let started = Instant::now();
             let available = self.checkpoint.tensors.iter()
@@ -1023,11 +1015,12 @@ impl Opened {
             link.enable_terminal_ownership(self.library.clone())?;
             Ok(link)
         };
+        crate::shared::memory_report::release_load_staging(&self.library);
         let mut transport = link()?;
-        // Pipelined prefill (CUTEAFD_MIMO_PREFILL_LANES, 2 by default; 1 keeps
-        // it serial): a second transport carries the first row lane's waves.
+        // Pipelined prefill (CUTEAFD_MIMO_PREFILL_LANES, 3 by default, 1 keeps it serial):
+        // one more transport per earlier row lane.
         let lanes = admission::transport_lanes(true)?;
-        let mut lane = if lanes == 2 { Some(link()?) } else { None };
+        let mut lane_links = (1..lanes).map(|_| link()).collect::<Result<Vec<_>>>()?;
         tracing::info!(lanes, "MiMo prefill lanes");
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         // Connect every rank and register full-size buffers now: the first
@@ -1065,7 +1058,7 @@ impl Opened {
                 transport.receive(wave, request.header.row_count as usize, warm_stream).await
             })?;
         }
-        if let Some(lane) = lane.as_mut() {
+        for lane in &mut lane_links {
             runtime.block_on(async {
                 let wave = lane.dispatch(&warmups[0])?;
                 lane.receive(wave, warmups[0].header.row_count as usize, warm_stream).await
@@ -1078,7 +1071,7 @@ impl Opened {
         }
         tracing::info!(ranks = peers.len(), elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
         Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport),
-            lane: lane.map(std::cell::RefCell::new), runtime }))
+            lanes: lane_links.into_iter().map(std::cell::RefCell::new).collect(), runtime }))
     }
 }
 

@@ -321,8 +321,7 @@ fn glm5_flash_mixed_exl3_tiers_share_one_package() {
 /// A standard exllamav3 GLM 5.3 Flash checkpoint (brandonmusic/GLM-5.3-Flash-
 /// tr3-4bpw): the exllamav3 config block, no storage map, uniform K4 with
 /// `[1]` MCG markers. Its experts run on the K3/K4 package with an empty K3
-/// tier. Coordinator BF16 block operands still need a native consumer or
-/// serving FP8 side checkpoint; an expert-only fixture does not test completeness.
+/// tier; its BF16 coordinator block projections are quantized to FP8 blocks at load.
 #[test]
 fn glm5_flash_standard_exllamav3_checkpoint_is_ready() {
     let mut tensors = vec![t("model.language_model.layers.1.mlp.gate.weight", "BF16", &[288, 4096])];
@@ -346,18 +345,13 @@ fn glm5_flash_standard_exllamav3_checkpoint_is_ready() {
     assert_eq!(report.experts.as_ref().unwrap().package, "glmf:exl3-k34");
     let catalog = crate::read_expert_catalog(dir.path()).unwrap();
     assert_eq!(catalog.exl3().unwrap().decoder_tiers(), &[3, 4]);
-    // The real publication's BF16 coordinator block projection cannot be
-    // silently quantized merely because its EXL3 experts are supported.
+    // The real publication's BF16 coordinator block projections run FP8 blocks
+    // quantized at load (one resident copy).
     let mut with_bf16_projection = tensors.clone();
     with_bf16_projection.push(t("model.language_model.layers.0.mlp.gate_proj.weight", "BF16", &[12288, 4096]));
     let direct = plan(snapshot(config.clone(), &with_bf16_projection).path(), &sparks(4)).unwrap();
     assert_eq!(component(&direct, Component::RoutedExpert).status, Status::Ready);
-    assert_eq!(component(&direct, Component::DenseFfn).status, Status::MissingKernel);
-    assert!(!direct.executable(), "{}", render(&direct));
-    let reason = rejected(&direct, Component::DenseFfn).join("\n");
-    assert!(reason.contains("model.language_model.layers.0.mlp.gate_proj")
-        && reason.contains("found bf16") && reason.contains("BF16 consumer/exporter")
-        && reason.contains("--fp8-snapshot") && reason.contains("not modeled"), "{reason}");
+    assert_eq!(component(&direct, Component::DenseFfn).status, Status::Ready, "{}", render(&direct));
     // An unsupported codebook in config.json stays unsupported, by key.
     let mut mul1 = config.clone();
     mul1["quantization_config"]["codebook"] = json!("mul1");
@@ -368,6 +362,7 @@ fn glm5_flash_standard_exllamav3_checkpoint_is_ready() {
 
 #[test]
 fn glm5_flash_block_projection_policy_distinguishes_mla_dense_and_shared_from_kda() {
+    // BF16 MLA, dense and shared projections are quantized to FP8 blocks at load.
     let tensors = [
         t("model.language_model.layers.1.self_attn.q_a_proj.weight", "BF16", &[1536, 4096]),
         t("model.language_model.layers.0.self_attn.o_proj.weight", "BF16", &[4096, 8192]),
@@ -376,11 +371,22 @@ fn glm5_flash_block_projection_policy_distinguishes_mla_dense_and_shared_from_kd
     ];
     let report = plan(snapshot(glm5_flash_config(2), &tensors).path(), &PlanOptions::default()).unwrap();
     for which in [Component::Attention, Component::DenseFfn, Component::SharedExpert] {
+        assert_eq!(component(&report, which).status, Status::Ready, "{}", render(&report));
+    }
+    // Another source format, or the wrong geometry, names the block consumer; KDA's
+    // BF16 o_proj is not an MLA FP8 operand and stays supported.
+    let tensors = [
+        t("model.language_model.layers.1.self_attn.q_a_proj.weight", "F16", &[1536, 4096]),
+        t("model.language_model.layers.0.self_attn.o_proj.weight", "BF16", &[4096, 8192]),
+        t("model.language_model.layers.0.mlp.gate_proj.weight", "BF16", &[4096, 12288]),
+        t("model.language_model.layers.1.mlp.shared_experts.down_proj.weight", "F16", &[4096, 2048]),
+    ];
+    let report = plan(snapshot(glm5_flash_config(2), &tensors).path(), &PlanOptions::default()).unwrap();
+    for which in [Component::Attention, Component::DenseFfn, Component::SharedExpert] {
         let section = component(&report, which);
         assert_eq!((section.status, section.rejected), (Status::MissingKernel, 1), "{}", render(&report));
-        assert!(rejected(&report, which)[0].contains("checkpoint-native E4M3"));
+        assert!(rejected(&report, which)[0].contains("runs FP8 128x128 blocks"));
     }
-    // KDA's BF16 o_proj remains supported; it is not an MLA FP8 operand.
     let attention = component(&report, Component::Attention);
     assert_eq!(attention.tensors - attention.rejected, 1);
 }
@@ -826,4 +832,33 @@ fn formats_count_logical_weights() {
         report.components.iter().map(|c| (c.component, c.formats.values().sum())).collect();
     // q, k, v, o for two layers, plus one sink.
     assert_eq!(total[&Component::Attention], 9);
+}
+
+#[test]
+fn layout_places_every_device_and_names_padded_spark_slices() {
+    use crate::plan::testing::{mimo_pro_config, mimo_pro_tensors, write_snapshot};
+    use cuteafd_core::memory_layout::{Category, DeviceKind};
+    let dir = tempfile::tempdir().unwrap();
+    write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
+    let gib = 1u64 << 30;
+    let options = PlanOptions {
+        layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 * gib, 96 * gib], ..Default::default() }),
+        ..sparks(6)
+    };
+    let report = plan(dir.path(), &options).unwrap();
+    let layout = report.memory_layout.as_ref().expect("layout requested");
+    let rtx = layout.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).count();
+    let spark = layout.devices.iter().filter(|d| d.kind == DeviceKind::Spark).count();
+    assert_eq!((rtx, spark), (2, 6));
+    // Head split: both GPUs hold attention weights; only the lead holds the embedding.
+    assert!(layout.devices[1].by_category().get(&Category::Weights).copied().unwrap_or(0) > 0);
+    assert_eq!(layout.devices[1].by_category().get(&Category::Embedding), None);
+    // The pool fills what the tighter GPU has left, within the target, in whole pages.
+    assert!(layout.pool_tokens > 0 && layout.pool_tokens <= cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
+    assert_eq!(layout.pool_tokens % 64, 0);
+    assert!(layout.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).all(|d| d.free_bytes() >= 0));
+    // 2048 over six ranks: exact whole-block slices (384 x 4, 256 x 2), no padding.
+    let experts = |i: usize| layout.devices[2 + i].by_category()[&Category::Experts];
+    assert_eq!(experts(0) * 2, experts(4) * 3);
+    assert!(!layout.waste.iter().any(|w| w.what.contains("padded")), "{:?}", layout.waste);
 }

@@ -40,7 +40,9 @@ pub(crate) struct EngineArgs {
     /// Longest sequence (the RoPE table and page tables).
     #[arg(long, default_value_t = 32768)]
     pub max_context: usize,
-    /// Tokens the shared latent/index cache pool holds across sequences.
+    /// Tokens the shared latent/index cache pool holds across sequences; 0
+    /// sizes it from what every GPU has left after weights and the planner's
+    /// workspace, graph and drafter costs (up to the common 2M-token target).
     #[arg(long, default_value_t = 262_144)]
     pub pool_tokens: usize,
     #[arg(long, default_value_t = 4096)]
@@ -59,7 +61,7 @@ pub(crate) struct EngineArgs {
     #[arg(long)]
     pub draft_context_slots: Option<usize>,
     /// Explicit calibration-free E4M3 quantization of own drafter GEMMs.
-    /// Unset/false preserves checkpoint BF16; no dual resident matrices.
+    /// Unset/true: E4M3 single copy (measured faster); false keeps checkpoint BF16.
     #[arg(long, action = clap::ArgAction::Set)]
     pub draft_fp8: Option<bool>,
     /// Scale rule of the FP8 copies made from BF16 weights at load: amax /
@@ -280,14 +282,22 @@ impl Opened {
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
                 .collect() };
         let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
-            args.token_io.embed_placement, || loader.model(&self.cfg, layers))?;
+            args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers) })?;
         let bytes: usize = model.layers.iter().map(|l| l.bytes()).sum::<usize>() + model.norm.buffer.bytes
             + model.head.buffer.bytes;
         let peer_bytes: usize = shares.iter().flatten().map(|l| l.bytes()).sum();
         tracing::info!(layers, elapsed_ms = started.elapsed().as_millis() as u64,
             gib = format!("{:.2}", bytes as f64 / (1u64 << 30) as f64),
             split_gib = format!("{:.2}", peer_bytes as f64 / (1u64 << 30) as f64), "GLM coordinator weights resident");
-        let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
+        let pool_tokens = if args.pool_tokens == 0 {
+            // The planner's GLM costs stay free on each GPU; records fill the rest.
+            let devices: Vec<i32> = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d)).collect();
+            crate::shared::memory_report::planned_pool_tokens(&self.library, &args.snapshot, &devices,
+                args.draft.as_deref(), args.prefill_rows, 0)?
+        } else {
+            args.pool_tokens
+        };
+        let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages, embedding)?;
         engine.full_prefill_logits = args.full_prefill_logits;
@@ -324,6 +334,7 @@ impl Opened {
         let config = cuteafd_transport::TcpTransportConfig { timing: false,
             timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 };
         let row_bytes = self.cfg.hidden * 2;
+        crate::shared::memory_report::release_load_staging(&self.library);
         let mut transport = args.peers.as_deref().map(|peers| -> Result<SparkLink<'_>> {
             let (peers, executors) = ranks(peers)?;
             SparkLink::new(&self.library, &peers, &executors, 4096, config.clone(), row_bytes)
@@ -382,6 +393,12 @@ impl Opened {
             if engine.ranks() > 1 {
                 engine.attach_peer_l2(budget)?;
             }
+        }
+        // Every decode graph shape serving replays, captured now (CUTEAFD_GLM_WARM_GRAPHS=0 skips it).
+        if engine.weights.layers.len() == self.cfg.layers
+            && std::env::var("CUTEAFD_GLM_WARM_GRAPHS").map_or(true, |v| v != "0")
+            && (transport.is_some() || args.skip_routed_experts) {
+            engine.warm_decode_graphs(transport.as_mut().map(|t| (t, &runtime)))?;
         }
         let result = body(&engine, transport.as_mut(), &runtime);
         drop(engine);
@@ -587,7 +604,8 @@ fn bench_verify(args: &GoldenArgs, engine: &engine::GlmEngine<'_>,
             let mut times = Vec::new();
             for round in 0..9 {
                 let started = Instant::now();
-                let drafts = drafter.draft_device(&seqs, &engine.embedding, &engine.weights.head)?;
+                let drafts = drafter.draft_device(&seqs, &engine.embedding,
+                    dflash::TargetHead::Bf16(&engine.weights.head))?;
                 if round >= 2 {
                     times.push(started.elapsed().as_secs_f64() * 1e3);
                 }
@@ -818,7 +836,7 @@ fn draft_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>,
         let anchor = sequence[position];
         let timer = Instant::now();
         let draft = drafter.draft_device(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
-            &engine.embedding, &engine.weights.head)?;
+            &engine.embedding, dflash::TargetHead::Bf16(&engine.weights.head))?;
         draft_seconds += timer.elapsed().as_secs_f64();
         drafts.push((position, draft.into_iter().next().context("draft")?));
         let logits = engine.verify(&mut [(&mut placement, 1)], &[anchor], transport.as_deref_mut().map(|t| (t, runtime)),
@@ -897,7 +915,7 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'
         let anchor = tokens[position];
         let timer = Instant::now();
         let draft = drafter.draft_device(&[dflash::DraftSeq { slot: 0, anchor, position, valid_from: 0 }],
-            &engine.embedding, &engine.weights.head)?.remove(0);
+            &engine.embedding, dflash::TargetHead::Bf16(&engine.weights.head))?.remove(0);
         draft_seconds += timer.elapsed().as_secs_f64();
         let reference = &ref_tokens[index * drafts_per..][..drafts_per];
         exact += usize::from(draft.tokens == reference);
