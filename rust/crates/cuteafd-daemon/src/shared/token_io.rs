@@ -384,6 +384,25 @@ impl SelectBatch {
         Ok(())
     }
 
+    /// [`Self::push_sequence`] that fails one sequence, never the batch: on a
+    /// grammar error its rows go unmasked (the step still runs for its
+    /// siblings) and the error comes back for the caller to send to that
+    /// request instead of committing its rows.
+    pub fn push_sequence_isolated(&mut self, sampling: TargetSamplingParams,
+        constraint: Option<&crate::shared::constraints::State<'_>>, input: &[u32], first_position: u64)
+        -> Option<String> {
+        let rows = self.rows.len();
+        match self.push_sequence(sampling, constraint, input, first_position) {
+            Ok(()) => None,
+            Err(error) => {
+                tracing::warn!("request grammar failed: {error:#}");
+                self.rows.truncate(rows);
+                self.push_sequence(sampling, None, input, first_position).expect("unmasked rows cannot fail");
+                Some(format!("request grammar: {error:#}"))
+            }
+        }
+    }
+
     /// A single row (a prefill's last row) under the grammar's current mask.
     pub fn push_next(&mut self, sampling: TargetSamplingParams,
         constraint: Option<&mut crate::shared::constraints::State<'_>>, position: u64) -> Result<()> {
