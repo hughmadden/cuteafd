@@ -324,6 +324,7 @@ impl Opened {
         let config = cuteafd_transport::TcpTransportConfig { timing: false,
             timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 };
         let row_bytes = self.cfg.hidden * 2;
+        crate::shared::memory_report::release_load_staging(&self.library);
         let mut transport = args.peers.as_deref().map(|peers| -> Result<SparkLink<'_>> {
             let (peers, executors) = ranks(peers)?;
             SparkLink::new(&self.library, &peers, &executors, 4096, config.clone(), row_bytes)

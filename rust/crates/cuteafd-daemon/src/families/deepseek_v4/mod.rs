@@ -288,6 +288,7 @@ pub(crate) fn with_engine<T>(
         TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
         loaded.cfg.dim * 2))
         .collect::<Result<Vec<_>>>()?;
+    crate::shared::memory_report::release_load_staging(&loaded.library);
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let started = Instant::now();
     for transport in &mut transports {

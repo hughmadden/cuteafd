@@ -1023,6 +1023,7 @@ impl Opened {
             link.enable_terminal_ownership(self.library.clone())?;
             Ok(link)
         };
+        crate::shared::memory_report::release_load_staging(&self.library);
         let mut transport = link()?;
         // Pipelined prefill (CUTEAFD_MIMO_PREFILL_LANES, 2 by default; 1 keeps
         // it serial): a second transport carries the first row lane's waves.

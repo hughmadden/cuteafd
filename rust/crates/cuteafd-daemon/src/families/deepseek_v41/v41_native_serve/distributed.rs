@@ -407,6 +407,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     second.configure_cache_replicas(requests.cache())?;
     if let Some(pool) = target_prefix_pool { requests.install_prefix_pool(pool)?; }
     memory_checkpoint("allocated KV cache")?;
+    crate::shared::memory_report::release_load_staging(&lib);
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests)?;
     scheduler::publish_capacity(&requests, &prefixes);

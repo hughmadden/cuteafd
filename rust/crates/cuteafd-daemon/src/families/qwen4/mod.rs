@@ -365,6 +365,7 @@ impl Opened {
         let transport = crate::shared::spark_intake::SparkLink::new(&self.library, &peers, &executors,
             u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2)?;
+        crate::shared::memory_report::release_load_staging(&self.library);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport), runtime }))
     }
