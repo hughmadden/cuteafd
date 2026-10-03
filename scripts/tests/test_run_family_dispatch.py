@@ -330,7 +330,7 @@ SPLIT_CONFIGS = {
 }
 
 
-@pytest.mark.parametrize("checkpoint", ["qwen4", "glm5_flash"])
+@pytest.mark.parametrize("checkpoint", ["qwen4"])
 @pytest.mark.parametrize("keys", ["RTX_GPUS=2\n", "COORDINATOR_GPUS=0,1\n", "COORDINATOR_SPLIT=heads\n"])
 def test_explicit_split_rejects_missing_checkpoint_kernels_before_launch(
         tmp_path: Path, checkpoint: str, keys: str) -> None:
@@ -342,7 +342,7 @@ def test_explicit_split_rejects_missing_checkpoint_kernels_before_launch(
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
-@pytest.mark.parametrize("checkpoint", ["qwen4", "glm5_flash"])
+@pytest.mark.parametrize("checkpoint", ["qwen4"])
 def test_auto_keeps_unsupported_checkpoint_on_one_gpu(tmp_path: Path, checkpoint: str) -> None:
     model = "zai-org/GLM-5.3-Flash" if checkpoint == "glm5_flash" else "test/model"
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS[checkpoint], model, "")
@@ -358,6 +358,14 @@ def test_split_off_explicitly_uses_the_first_gpu(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
     assert "device=1" in launch and "--split-device" not in launch
+
+
+@pytest.mark.parametrize("keys", ["RTX_GPUS=2\n", "COORDINATOR_GPUS=1,0\n", "COORDINATOR_SPLIT=heads\n"])
+def test_glm_flash_explicit_split_passes_both_gpus(tmp_path: Path, keys: str) -> None:
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "zai-org/GLM-5.3-Flash", keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
+    assert "--split-device" in launch and "device=0,1" in launch
 
 
 @pytest.mark.parametrize("checkpoint", ["mimo_flash", "mimo_pro"])

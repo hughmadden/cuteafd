@@ -31,6 +31,12 @@ pub(crate) struct EngineArgs {
     pub manifest: PathBuf,
     #[arg(long, default_value_t = 0)]
     pub device: i32,
+    /// Second GPU of a two-GPU head split: each GPU runs half the KDA and MLA heads (its
+    /// KDA state) and half the dense and shared-expert intermediate; mHC, the MLA latent
+    /// records and the DSA indexer are replicated; the partial sums meet over peer memory.
+    /// Router, routed experts, LM head and drafter stay on --device.
+    #[arg(long)]
+    pub split_device: Option<i32>,
     /// Run only the first N layers (layers 0-2 are the dense ones).
     #[arg(long)]
     pub layers: Option<usize>,
@@ -356,22 +362,51 @@ impl Opened {
         programs.capacities().require_context("glm5_flash", args.max_context)?;
         programs.load_all()?;
         let stream = self.library.cuda_stream_create()?;
+        // The head split's second GPU and its stream; a head split needs its share's programs
+        // (`glmf2`) in this build.
+        let split_device = match args.split_device {
+            Some(device) if programs.spec("glmf2_kda_m64").is_ok() => Some(device),
+            Some(device) => {
+                tracing::info!(device, "no head-split programs (glmf2) in this build; serving from --device alone");
+                None
+            }
+            None => None,
+        };
+        let peer_stream = match split_device {
+            Some(device) => {
+                ensure!(device != args.device, "--split-device must differ from --device");
+                self.library.cuda_enable_peer(device)?;
+                self.library.cuda_set_device(device)?;
+                let stream = self.library.cuda_enable_peer(args.device).and_then(|()| self.library.cuda_stream_create());
+                self.library.cuda_set_device(args.device)?;
+                Some((device, stream?))
+            }
+            None => None,
+        };
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::GlmfLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
             fp8_source: self.fp8_checkpoint.as_ref(), kda_fp8: args.kda_fp8,
             fp8_head: args.fp8_head, kda_nvfp4: args.kda_nvfp4_gate.as_deref().map(|mode| mode == "search"),
-            fp8_scales: args.fp8_scales };
+            fp8_scales: args.fp8_scales, device: args.device,
+            peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
+                .collect() };
         let source = self.embed_source()?;
-        let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library, source,
+        let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, source,
             args.token_io.embed_placement, || loader.model(&self.cfg, layers))?;
         let resident: usize = model.layers.iter().map(weights::GlmfLayer::bytes).sum();
+        let peer_resident: usize = shares.iter().flatten().map(weights::GlmfLayer::bytes).sum();
         tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64,
+            split_gib = peer_resident as f64 / (1u64 << 30) as f64,
             fp8_source = self.fp8_checkpoint.is_some(), kda_fp8 = ?args.kda_fp8, fp8_prefill = ?args.fp8_prefill,
             elapsed_ms = started.elapsed().as_millis() as u64, "GLM 5.3 Flash coordinator weights resident");
         let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages, args.slots, embedding)?;
+        if let Some((device, peer_stream)) = peer_stream {
+            engine.attach_peer(device, peer_stream, shares.pop().context("head-split shares")?)?;
+            tracing::info!(device = args.device, split_device = device, "GLM 5.3 Flash head split over two GPUs");
+        }
         engine.full_prefill_logits = args.full_prefill_logits;
         ensure!(!args.fp8_prefill.contains(&Fp8PrefillGroup::None) || args.fp8_prefill.len() == 1,
             "--fp8-prefill none takes no other group");
@@ -411,8 +446,13 @@ impl Opened {
         }
         let result = body(&engine);
         drop(engine);
-        // SAFETY: the engine that used the stream is gone.
+        // SAFETY: the engine that used the streams is gone.
         unsafe { self.library.cuda_stream_destroy(stream)? };
+        if let Some((device, peer_stream)) = peer_stream {
+            crate::shared::peer_split::on_device(&self.library, device, args.device,
+                // SAFETY: as above.
+                || unsafe { self.library.cuda_stream_destroy(peer_stream) })?;
+        }
         result
     }
 

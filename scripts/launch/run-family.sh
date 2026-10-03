@@ -267,12 +267,14 @@ budget="$(get SPARK_DEVICE_BUDGET_BYTES 107374182400)"
 gpu="$(get COORDINATOR_GPU 0)"
 # Two coordinator GPUs (RTX_GPUS=auto/2 with COORDINATOR_GPU as V4.1's two-RTX config picks
 # the other card, or an explicit COORDINATOR_GPUS=0,1): families with a
-# head split (MiMo V2 Flash/Pro, GLM 5.x, DeepSeek V4) split every layer's attention heads and dense /
-# shared-expert MLPs over both by default (COORDINATOR_SPLIT=auto or heads), one hidden
-# all-reduce per layer over peer memory; experts, router, head and drafter stay on the
-# first GPU. COORDINATOR_SPLIT=off serves from the first GPU alone. Auto selection
-# uses one GPU for checkpoints without a split; an explicit split request fails
-# before containers start. The container sees both GPUs in host order.
+# head split (MiMo V2 Flash/Pro, GLM 5.x, GLM 5.3 Flash, DeepSeek V4) split every layer's
+# attention heads and dense / shared-expert MLPs over both by default (COORDINATOR_SPLIT=auto
+# or heads), one hidden all-reduce per layer over peer memory; experts, router, head and
+# drafter stay on the first GPU. COORDINATOR_SPLIT=off serves from the first GPU alone. Auto
+# selection uses one GPU for checkpoints without a split and for splits that are opt-in
+# (`split_opt_in`: measured not to pay at the reference layouts); an explicit split request
+# (RTX_GPUS=2, COORDINATOR_GPUS=a,b or COORDINATOR_SPLIT=heads) fails before containers
+# start when the checkpoint has none. The container sees both GPUs in host order.
 # COORDINATOR_SPLIT_GPU names the second GPU when only
 # COORDINATOR_GPU is set (default the other of 0/1).
 rtx_gpus="$(get RTX_GPUS auto)"
@@ -306,13 +308,17 @@ if [[ "$rtx_gpus" == 2 || "$explicit_coordinator_gpus" == *,* || "$split" == hea
   explicit_split=1
 fi
 split_hint=""
+split_opt_in=""
 case "$family:$model_type" in
-  deepseek_v4:*|glm5:*|mimo_v2:mimo_v2|mimo_v2:mimo_v2_flash) ;;
+  deepseek_v4:*|glm5:*|glm5_flash:*|mimo_v2:mimo_v2|mimo_v2:mimo_v2_flash) ;;
   qwen4:*) split_hint="add Qwen head-split GDN/GQA/shared-expert kernels and sharded recurrent/KV state" ;;
-  glm5_flash:*) split_hint="add GLM Flash head-split KDA/MLA/dense/shared-expert kernels and sharded state" ;;
   mimo_v2:*) split_hint="add MiMo head-split attention/projection kernels for $model_type" ;;
   *) split_hint="add coordinator head-split kernels for $model_type" ;;
 esac
+if [[ -n "$split_opt_in" && "$split" == auto && "$explicit_split" == 0 && -z "$split_hint" ]]; then
+  echo "note: $family head split is opt-in ($split_opt_in); auto selected GPU $gpu alone" >&2
+  second=""
+fi
 if [[ "$split" != off && "$explicit_split" == 1 ]]; then
   [[ -z "$split_hint" ]] ||
     { echo "$family ($model_type): two-GPU head split is unsupported; $split_hint; use RTX_GPUS=1 or COORDINATOR_SPLIT=off" >&2; exit 2; }

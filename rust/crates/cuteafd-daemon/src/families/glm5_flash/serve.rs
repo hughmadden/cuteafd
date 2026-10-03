@@ -137,7 +137,9 @@ fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
     use console::{Color::*, StepGroup};
     let mut layout = console::Layout::new("glm5_flash", model.into(), args.engine.snapshot.clone());
     let sparks = args.engine.peers.as_deref().map_or(0, |peers| peers.split(',').count());
-    layout.hardware = console::hardware(1, sparks, args.engine.local_experts);
+    layout.hardware = console::hardware(1 + usize::from(args.engine.split_device.is_some()), sparks,
+        args.engine.local_experts);
+    layout.split = args.engine.split_device.map(|_| "head split".into());
     layout.concurrency = args.max_sequences.min(DECODE_ROWS);
     let copy = if args.no_copy_drafts { "" } else { " · copy windows" };
     let policy = args.draft_fixed.map_or_else(|| "adaptive".to_string(), |n| format!("fixed {n}"));
@@ -358,7 +360,16 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, lanes: us
     anyhow::ensure!(args.prefix_partial == Toggle::Off, "GLM 5.3 Flash restores exact snapshots only (KDA state)");
     let family = GlmfPrefix::new(engine, |mark| if entries == 0 { 0 } else { MarkArena::slots_for(lanes, entries, mark, budget) })?;
     let template = engine.paged_buffers().first().map(|b| b[0]).context("GLM 5.3 Flash has no MLA layer")?;
-    let host = args.host_tier(engine.library, template, family.layout(), engine.max_context)?;
+    // The pinned host tier copies through one GPU's copy engine; a head split keeps its pages
+    // and marks on both GPUs, so it keeps device-resident snapshots only.
+    let host = if engine.ranks() > 1 {
+        if args.host_cache_bytes.enabled() && entries > 0 {
+            tracing::warn!("GLM 5.3 Flash head split: the prefix cache's host tier is off (device-resident snapshots only)");
+        }
+        None
+    } else {
+        args.host_tier(engine.library, template, family.layout(), engine.max_context)?
+    };
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();
     let config = PrefixConfig { entries, mark_slots: family.slots(), keep_logits: true,

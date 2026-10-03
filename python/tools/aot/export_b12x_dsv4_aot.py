@@ -285,6 +285,18 @@ def glmf_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     return out
 
 
+def glmf_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
+    """One GPU's share of a two-GPU GLM 5.3 Flash head split (``g`` the half geometry: half the
+    MLA and KDA heads, half the dense and shared-expert intermediates): KDA (its heads'
+    in-projection rows, conv, recurrence and state, a partial o_proj) and its verify-by-replay
+    commit, the MLA producer (the replicated latent record, its heads' queries), sparse MLA,
+    W_UV + o_proj (a partial over its heads) and the dense / shared-expert MLPs (partials over
+    their intermediate slices); mHC, the DSA indexer, router, expert input and head stay the
+    whole model's programs."""
+    keep = ("kda_m", "kda_commit", "mla_producer_m", "o_m", "sparse_mla_", "ffn_i")
+    return [item for item in glmf_programs(g, decode_rows, prefill_rows, max_context) if item[0].startswith(keep)]
+
+
 def qwen4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """Qwen 3.8 Flash Next programs, same (stem suffix, op, params, thunk) shape as ``programs``.
     Hyper-connection, head, MoE-front and PLE programs serve any row count (their
@@ -343,7 +355,8 @@ def main() -> None:
                              "its two-GPU head split), glm (GLM 5.x), "
                              "glm2 (GLM 5.x, one GPU of a two-GPU head split), mimo (MiMo V2 Flash), mimop (MiMo V2.6 Pro), "
                              "mimop2 (V2.6 Pro, one GPU of a two-GPU head split), "
-                             "glmf (GLM 5.3 Flash), qwen4 (Qwen 3.8 Flash Next)")
+                             "glmf (GLM 5.3 Flash), glmf2 (GLM 5.3 Flash, one GPU of a two-GPU head split), "
+                             "qwen4 (Qwen 3.8 Flash Next)")
     parser.add_argument("--decode-rows", type=int, default=64)
     parser.add_argument("--prefill-rows", type=int, default=4096)
     parser.add_argument("--max-context", type=int, default=131072)
@@ -358,9 +371,9 @@ def main() -> None:
 
     geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "glmf", "qwen4") for name in geometries):
-        raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, glmf and/or "
-                         "qwen4")
+                                          "mimop2", "glmf", "glmf2", "qwen4") for name in geometries):
+        raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, glmf, glmf2 "
+                         "and/or qwen4")
     props = torch.cuda.get_device_properties(0)
     if (props.major, props.minor) != (12, 0):
         raise SystemExit("coordinator programs export on SM120")
@@ -393,6 +406,11 @@ def main() -> None:
         # intermediate).
         glm2 = dataclasses.replace(GLM53, name="glm53_tp2", heads=GLM53.heads // 2, dense_inter=GLM53.dense_inter // 2,
                                    moe_inter=GLM53.moe_inter // 2)
+        # glmf2: GLM 5.3 Flash split over two GPUs by heads (32 MLA and 32 KDA heads each; dense
+        # and shared MLPs by intermediate).
+        glmf2 = dataclasses.replace(GLM53_FLASH, name="glm53_flash_tp2", heads=GLM53_FLASH.heads // 2,
+                                    kda_heads=GLM53_FLASH.kda_heads // 2, dense_inter=GLM53_FLASH.dense_inter // 2,
+                                    moe_inter=GLM53_FLASH.moe_inter // 2)
         # flash2 / pro2: DeepSeek V4 split over two GPUs by heads (and wo groups; the shared
         # expert by intermediate).
         dsv4_half = {n: dataclasses.replace(base, name=f"{base.name}_tp2", heads=base.heads // 2,
@@ -400,14 +418,14 @@ def main() -> None:
                      for n, base in (("flash2", FLASH), ("pro2", PRO))}
         g = {"flash": FLASH, "flash2": dsv4_half["flash2"], "pro": PRO, "pro2": dsv4_half["pro2"], "glm": GLM53,
              "glm2": glm2, "mimo": MIMO_V2_FLASH, "mimop": MIMO_V26_PRO,
-             "mimo2": mimo2, "mimop2": mimop2, "glmf": GLM53_FLASH, "qwen4": QWEN38_FLASH_NEXT}[name]
+             "mimo2": mimo2, "mimop2": mimop2, "glmf": GLM53_FLASH, "glmf2": glmf2, "qwen4": QWEN38_FLASH_NEXT}[name]
         family = {"flash": "dsv4f", "flash2": "dsv4f2", "pro": "dsv4p", "pro2": "dsv4p2", "glm": "glm", "glm2": "glm2", "mimo": "mimo", "mimop": "mimop",
-                  "mimo2": "mimo2", "mimop2": "mimop2", "glmf": "glmf", "qwen4": "qwen4"}[name]
+                  "mimo2": "mimo2", "mimop2": "mimop2", "glmf": "glmf", "glmf2": "glmf2", "qwen4": "qwen4"}[name]
         manifest["families"][family] = {k: v for k, v in vars(g).items()}
         make = {"flash2": head_split_programs, "pro2": head_split_programs, "glm": glm_programs,
                 "glm2": glm_head_split_programs, "mimo": mimo_programs, "mimop": mimo_programs,
                 "mimo2": mimo_head_split_programs, "mimop2": mimo_head_split_programs,
-                "glmf": glmf_programs,
+                "glmf": glmf_programs, "glmf2": glmf_head_split_programs,
                 "qwen4": qwen4_programs}.get(name, programs)
         work += [(family, *item) for item in make(g, args.decode_rows, args.prefill_rows, args.max_context)]
     for family, suffix, op, params, thunk in work:
