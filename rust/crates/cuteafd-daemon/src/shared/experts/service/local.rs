@@ -154,18 +154,16 @@ pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()>
         layers = weights.len(),
         "native local RoCE expert worker ready"
     );
-    // The loop spins only while requests keep arriving: within a decode step a
-    // rank's next request follows within a layer's time, and steps follow
-    // each other within a few milliseconds, so `idle_spin` after the last
-    // request covers both. Then it yields until `idle_yield`, and then waits on
-    // the endpoints' QP completion events (`ibv_req_notify_cq` + completion
-    // channel) in `idle_wait` windows, one connection per pass in rotation
-    // (every pass still sweeps every connection with a non-blocking poll, so a
-    // request on another connection waits at most one window per connection):
-    // an idle worker burns no CPU. Any request or admission resets the timer.
-    let idle_spin = Duration::from_millis(5);
-    let idle_yield = Duration::from_millis(20);
-    let idle_wait = Duration::from_millis(10);
+    // Requests arrive back-to-back while serving, so the loop spins: it is the
+    // wakeup path and this is the GPU owner thread. A quiet connection switches
+    // to the endpoint's QP completion event wait (`ibv_req_notify_cq` +
+    // completion-channel poll, which still busy-polls briefly) with an
+    // `idle_wait` upper bound. One wait covers one endpoint, so while idle the
+    // loop blocks on one connection per pass and rotates; the pass itself still
+    // sweeps every connection with a non-blocking poll, which bounds pickup to
+    // one wait window. Any request or admission resets the idle timer.
+    let idle_spin = Duration::from_secs(30);
+    let idle_wait = Duration::from_millis(100);
     let mut last_activity = Instant::now();
     let mut idle_cursor = 0usize;
     // One steady-state memory observation per admission event: after the owned
@@ -204,7 +202,7 @@ pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()>
         }
         let waiting = !progressed
             && !connections.is_empty()
-            && last_activity.elapsed() >= idle_yield;
+            && last_activity.elapsed() >= idle_spin;
         let wait_index = waiting.then(|| idle_cursor % connections.len());
         let mut index = 0;
         while index < connections.len() {
@@ -299,8 +297,6 @@ pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()>
         }
         if waiting {
             idle_cursor = idle_cursor.wrapping_add(1);
-        } else if last_activity.elapsed() >= idle_spin && !progressed {
-            std::thread::yield_now();
         } else {
             std::hint::spin_loop();
         }
