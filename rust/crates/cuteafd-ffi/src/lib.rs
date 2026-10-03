@@ -27,6 +27,7 @@ pub use shared::v41_experts::{
     v41_pack_intermediate_supported, v41_rank_count_supported,
 };
 mod cuda_runtime;
+pub mod memory_ledger;
 pub use cuda_runtime::{select_copy_mechanism, CopyMechanism, CudaRuntime};
 #[cfg(feature = "test-support")]
 pub mod test_support;
@@ -1474,6 +1475,13 @@ impl Drop for CuteafdNcclComm {
     }
 }
 
+/// RC endpoint send/recv spans are allocated natively (pinned or malloc'd and
+/// registered); the ledger keys them by endpoint handle.
+fn record_rdma_rings(handle: *mut c_void, bytes: usize) {
+    let _scope = memory_ledger::scope("transport/rdma-rings");
+    memory_ledger::record_alloc(memory_ledger::Space::Pinned, -1, handle as usize, bytes);
+}
+
 struct SyncH2DStagingBuffer {
     // Released explicitly by NativeLibrary while its module is loaded. Do not
     // add an automatic release here: failed-drain quarantine retains this raw
@@ -1500,6 +1508,7 @@ impl SyncH2DStagingBuffer {
                     .context("freeing undersized synchronous H2D pinned staging buffer")?;
                 self.buffer = CuteafdHostBuffer::default();
             }
+            let _scope = memory_ledger::scope("staging/sync-h2d");
             self.buffer = library
                 .alloc_host_buffer(bytes)
                 .context("allocating reusable synchronous H2D pinned staging buffer")?;
@@ -1526,6 +1535,7 @@ impl SyncH2DStagingBuffer {
             return;
         }
         if let Ok(free_fn) = unsafe { lib.get::<FreeHostBufferFn>(b"cuteafd_free_host_buffer") } {
+            memory_ledger::record_free(self.buffer.ptr as usize);
             let _ = unsafe { free_fn(&mut self.buffer) };
         }
         self.buffer = CuteafdHostBuffer::default();
@@ -1627,6 +1637,7 @@ impl NativeLibrary {
         let mut buffer = CuteafdHostBuffer::default();
         let status = unsafe { alloc_fn(bytes, &mut buffer) };
         self.status_to_result("cuteafd_alloc_host_buffer", status)?;
+        memory_ledger::record_alloc(memory_ledger::Space::Pinned, -1, buffer.ptr as usize, buffer.bytes);
         Ok(buffer)
     }
 
@@ -1647,6 +1658,7 @@ impl NativeLibrary {
 
     pub fn free_host_buffer(&self, buffer: &mut CuteafdHostBuffer) -> Result<()> {
         let free_fn: Symbol<FreeHostBufferFn> = unsafe { self.lib.get(b"cuteafd_free_host_buffer")? };
+        memory_ledger::record_free(buffer.ptr as usize);
         let status = unsafe { free_fn(buffer) };
         self.status_to_result("cuteafd_free_host_buffer", status)
     }
@@ -1726,6 +1738,7 @@ impl NativeLibrary {
         let mut buffer = CuteafdDeviceBuffer::default();
         let status = unsafe { alloc_fn(bytes, &mut buffer) };
         self.status_to_result("cuteafd_alloc_device_buffer", status)?;
+        memory_ledger::record_alloc(memory_ledger::Space::Device, buffer.device_id, buffer.ptr as usize, buffer.bytes);
         Ok(buffer)
     }
 
@@ -1735,12 +1748,14 @@ impl NativeLibrary {
         let mut buffer = CuteafdDeviceBuffer::default();
         let status = unsafe { alloc_fn(bytes, &mut buffer) };
         self.status_to_result("cuteafd_alloc_managed_device_buffer", status)?;
+        memory_ledger::record_alloc(memory_ledger::Space::Managed, buffer.device_id, buffer.ptr as usize, buffer.bytes);
         Ok(buffer)
     }
 
     pub fn free_device_buffer(&self, buffer: &mut CuteafdDeviceBuffer) -> Result<()> {
         let free_fn: Symbol<FreeDeviceBufferFn> =
             unsafe { self.lib.get(b"cuteafd_free_device_buffer")? };
+        memory_ledger::record_free(buffer.ptr as usize);
         let status = unsafe { free_fn(buffer) };
         self.status_to_result("cuteafd_free_device_buffer", status)
     }
@@ -2104,6 +2119,25 @@ impl NativeLibrary {
         let copy_fn: Symbol<CopyD2HFn> = unsafe { self.lib.get(b"cuteafd_copy_d2h")? };
         let status = unsafe { copy_fn(dst.as_mut_ptr().cast(), src, dst.len()) };
         self.status_to_result("cuteafd_copy_d2h", status)
+    }
+
+    /// Frees the pinned staging buffer [`Self::copy_h2d`] grows to its largest
+    /// upload. Loaders call this once their weights are resident: the buffer
+    /// otherwise stays pinned for the life of the process (on GB10 it is the
+    /// same unified memory the experts live in). Later copies reallocate it.
+    pub fn release_sync_h2d_staging(&self) -> Result<usize> {
+        let mut staging = self
+            .sync_h2d_staging
+            .lock()
+            .map_err(|_| anyhow::anyhow!("synchronous H2D pinned staging lock is poisoned"))?;
+        if staging.buffer.ptr.is_null() {
+            return Ok(0);
+        }
+        let bytes = staging.buffer.bytes;
+        self.free_host_buffer(&mut staging.buffer)
+            .context("freeing synchronous H2D pinned staging buffer")?;
+        staging.buffer = CuteafdHostBuffer::default();
+        Ok(bytes)
     }
 
     #[cfg(test)]
@@ -3439,6 +3473,7 @@ impl NativeLibrary {
             )
         };
         self.status_to_result("cuteafd_rdma_rc_endpoint_create", status)?;
+        record_rdma_rings(info.handle, send_registered_span_bytes + recv_registered_span_bytes);
         Ok(info)
     }
 
@@ -3476,6 +3511,7 @@ impl NativeLibrary {
             )
         };
         self.status_to_result("cuteafd_rdma_rc_endpoint_create_with_buffer_flags", status)?;
+        record_rdma_rings(info.handle, send_registered_span_bytes + recv_registered_span_bytes);
         Ok(info)
     }
 
@@ -3520,6 +3556,7 @@ impl NativeLibrary {
             "cuteafd_rdma_rc_endpoint_create_on_device_with_buffer_flags",
             status,
         )?;
+        record_rdma_rings(info.handle, send_registered_span_bytes + recv_registered_span_bytes);
         Ok(info)
     }
 
@@ -3830,6 +3867,7 @@ impl NativeLibrary {
     pub fn rdma_rc_endpoint_destroy(&self, handle: *mut c_void) -> Result<()> {
         let destroy_fn: Symbol<RdmaRcEndpointDestroyFn> =
             unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_destroy")? };
+        memory_ledger::record_free(handle as usize);
         let status = unsafe { destroy_fn(handle) };
         self.status_to_result("cuteafd_rdma_rc_endpoint_destroy", status)
     }

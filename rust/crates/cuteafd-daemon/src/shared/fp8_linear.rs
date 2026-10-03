@@ -49,6 +49,7 @@ impl<'a> Fp8Weight<'a> {
     /// retains its source owner if completion cannot be proved).
     pub fn pack(library: &'a NativeLibrary, w: *const c_void, n: usize, k: usize, scales: Fp8Scales,
         stream: *mut c_void) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights/fp8-pack");
         ensure!(n % 16 == 0 && k % 128 == 0, "FP8 copy of [{n}, {k}]: needs n % 16 == 0 and k % 128 == 0");
         let packed = DeviceAllocation::new(library, n * k)?;
         let scale = DeviceAllocation::new(library, n * k / 128 * 4)?;
@@ -113,6 +114,7 @@ impl<'a> Fp8Weight<'a> {
 /// GEMV scratch for up to `rows` rows of every `(k, n)` shape.
 pub(crate) fn scratch<'a>(library: &'a NativeLibrary, rows: usize, shapes: &[(usize, usize)])
     -> Result<DeviceAllocation<'a>> {
+    let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace/fp8-linear");
     let bytes = shapes.iter().map(|&(k, n)| library.fp8_w8a16_workspace(rows, k, n))
         .collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(0);
     DeviceAllocation::new(library, bytes.max(256))

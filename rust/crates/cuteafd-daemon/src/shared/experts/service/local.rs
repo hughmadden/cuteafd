@@ -41,8 +41,14 @@ pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()>
         "invalid native frame budget"
     );
     let library = unsafe { NativeLibrary::load(&config.library) }?;
-    let (weights, remaining) = load_weights(&library, &catalog, &config)?;
-    let mut execution = weights.execution(&library, &config, remaining)?;
+    let (weights, remaining) = {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
+        load_weights(&library, &catalog, &config)?
+    };
+    let mut execution = {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/workspace");
+        weights.execution(&library, &config, remaining)?
+    };
     let mut exchange = HostExpertExchange::new(config.capacity)?;
     let mut row_indices = vec![0; config.capacity as usize];
     // Transport benchmarks only: answer each request with its response slot

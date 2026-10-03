@@ -364,7 +364,7 @@ impl Opened {
             fp8_scales: args.fp8_scales };
         let source = self.embed_source()?;
         let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library, source,
-            args.token_io.embed_placement, || loader.model(&self.cfg, layers))?;
+            args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers) })?;
         let resident: usize = model.layers.iter().map(weights::GlmfLayer::bytes).sum();
         tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64,
             fp8_source = self.fp8_checkpoint.is_some(), kda_fp8 = ?args.kda_fp8, fp8_prefill = ?args.fp8_prefill,

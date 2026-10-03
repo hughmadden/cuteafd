@@ -826,7 +826,7 @@ impl Opened {
             fp8_scales: args.fp8_scales, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream }).collect() };
         let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
-            args.token_io.embed_placement, || loader.model(&self.cfg, layers))?;
+            args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers) })?;
         let mtp = if args.mtp > 0 {
             let started = Instant::now();
             let available = self.checkpoint.tensors.iter()

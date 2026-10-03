@@ -130,6 +130,7 @@ pub(crate) fn probe_gpu_landing(library: &NativeLibrary) -> Result<GpuLandingPro
 /// Pinned host to device copy rate on the current device, GB/s: eight
 /// 64 MiB copies after one warm-up, on a stream of their own.
 pub(crate) fn probe_h2d(library: &NativeLibrary) -> Result<f64> {
+    let _memory_scope = cuteafd_ffi::memory_ledger::scope("probe");
     const BYTES: usize = 64 << 20;
     let host = HostAllocation::new(library, BYTES)?;
     let device = DeviceAllocation::new(library, BYTES)?;
@@ -276,6 +277,7 @@ pub(crate) struct SparkIntake<'a> {
 impl<'a> SparkIntake<'a> {
     pub(crate) fn new(library: &'a NativeLibrary, mode: IntakeMode, ranks: usize, rows: usize, row_bytes: usize)
         -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
         ensure!((1..=MAX_INTAKE_RANKS).contains(&ranks), "{ranks} Spark ranks exceed the {MAX_INTAKE_RANKS} intake planes");
         let plane_bytes = rows * row_bytes;
         let planes = (0..ranks).map(|_| DeviceAllocation::new(library, plane_bytes.max(256)))
@@ -720,6 +722,7 @@ impl<'a> SparkLink<'a> {
     /// waves land in an intake of the process-wide [`choose_mode`].
     pub(crate) fn new(library: &'a NativeLibrary, peers: &[std::net::SocketAddr], executors: &[u64], capacity: u32,
         config: cuteafd_transport::TcpTransportConfig, row_bytes: usize) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
         let mode = transport_mode(library, peers.len(), capacity as usize, row_bytes)?;
         let intake = SparkIntake::new(library, mode, peers.len(), capacity as usize, row_bytes)?;
         let mut transport = SparkExperts::new_ranks(peers, executors, capacity, config)?;

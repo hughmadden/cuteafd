@@ -163,6 +163,7 @@ fn share(operand: &str) -> Share {
 
 impl<'a> WeightLoader<'a, '_> {
     fn read(&self, names: &[String]) -> Result<Vec<u8>> {
+        cuteafd_ffi::memory_ledger::tensor(names.first().map_or("", String::as_str));
         let mut bytes = Vec::new();
         for name in names {
             let tensor = self.catalog.tensor(name)?;
@@ -182,6 +183,7 @@ impl<'a> WeightLoader<'a, '_> {
     }
 
     pub fn tensor(&self, name: &str) -> Result<DeviceAllocation<'a>> {
+        cuteafd_ffi::memory_ledger::tensor(name);
         self.upload(&self.read(&[name.to_string()])?)
     }
 

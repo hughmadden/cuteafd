@@ -295,7 +295,7 @@ impl Opened {
         let source = self.embed_source()?;
         let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library, source,
             args.token_io.embed_placement,
-            || loader.model(&self.cfg, layers, args.mtp > 0 && layers == self.cfg.layers, args.mtp_fp8_head))?;
+            || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers, args.mtp > 0 && layers == self.cfg.layers, args.mtp_fp8_head) })?;
         let resident: usize = model.layers.iter().map(weights::Qwen4Layer::bytes).sum::<usize>()
             + model.mtp.as_ref().map_or(0, weights::MtpWeights::bytes);
         tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64,

@@ -149,6 +149,7 @@ impl<'a> Fp8Layer<'a> {
 
     pub fn load(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, layer: usize, tp: usize, rank: usize)
         -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
         ensure!(tensors.has_layer(layer), "layer {layer} has no routed FP8 experts");
         let experts = tensors.shape().experts;
         let mut regions = Vec::with_capacity(6);
@@ -218,6 +219,7 @@ impl<'a> Fp8Experts<'a> {
     /// `rank` of `tp`, with scratch for `capacity` rows.
     pub fn load(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
         layers: std::ops::Range<usize>, tp: usize, rank: usize, capacity: usize, budget: usize) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
         Self::load_with_bf16(library, tensors, directory, None, layers, tp, rank, capacity, budget)
     }
 
@@ -226,6 +228,7 @@ impl<'a> Fp8Experts<'a> {
     pub fn load_with_bf16(library: &'a NativeLibrary, tensors: &Fp8ExpertTensors, directory: &Path,
         bf16_directory: Option<&Path>, layers: std::ops::Range<usize>, tp: usize, rank: usize, capacity: usize,
         budget: usize) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
         for layer in layers.clone() {
             tensors.validate_layer(layer)?;
         }

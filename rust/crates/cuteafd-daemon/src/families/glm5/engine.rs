@@ -284,6 +284,7 @@ pub(crate) struct GlmEngine<'a> {
 #[allow(clippy::type_complexity)]
 fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer<'_>], pages: usize, max_context: usize)
     -> Result<(Vec<Dev<'a>>, Vec<Option<Dev<'a>>>, Dev<'a>)> {
+    let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
     let zeroed = |bytes: usize| -> Result<Dev<'a>> {
         let allocation = DeviceAllocation::new(library, bytes.max(256))?;
         library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
@@ -467,6 +468,7 @@ impl<'a> GlmEngine<'a> {
     }
 
     fn workspace_here(&self, rank: usize, t: usize, decode: bool) -> Result<Workspace<'a>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let (h, heads) = (self.cfg.hidden, self.cfg.heads);
         let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
         let lead = rank == 0;

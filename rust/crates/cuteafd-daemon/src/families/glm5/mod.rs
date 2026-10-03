@@ -280,7 +280,7 @@ impl Opened {
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
                 .collect() };
         let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
-            args.token_io.embed_placement, || loader.model(&self.cfg, layers))?;
+            args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers) })?;
         let bytes: usize = model.layers.iter().map(|l| l.bytes()).sum::<usize>() + model.norm.buffer.bytes
             + model.head.buffer.bytes;
         let peer_bytes: usize = shares.iter().flatten().map(|l| l.bytes()).sum();

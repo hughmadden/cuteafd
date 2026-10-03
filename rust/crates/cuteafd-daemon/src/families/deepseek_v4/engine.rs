@@ -341,6 +341,7 @@ impl<'a> Engine<'a> {
     /// allocates its caches, RoPE tables and the exchange (four slots per prefill lane).
     pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<LayerWeights<'a>>, parts: PeerParts)
         -> Result<()> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("peer-split");
         ensure!(self.split_family.is_some() && layers.len() == self.cfg.n_layers && layers.iter().all(|l| l.split),
             "attach_peer needs the head-split shares of every backbone layer");
         let rows = self.prefill_rows.max(self.decode_rows);
@@ -387,6 +388,7 @@ impl<'a> Engine<'a> {
     /// Layer `layer`'s zeroed caches and compressor state on the current device.
     fn pool_layer_for(library: &'a NativeLibrary, cfg: &DeepseekV4Config, shape: PoolShape, layer: usize)
         -> Result<LayerCache<'a>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
             let allocation = DeviceAllocation::new(library, bytes.max(256))?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
@@ -417,6 +419,7 @@ impl<'a> Engine<'a> {
 
     /// Allocates the cache pools and RoPE tables for `parts.shape`.
     pub fn new(parts: EngineParts<'a>) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let quantize_grid = Fp8QuantizeGrid::new(parts.library.sm_count()?, parts.sms)?;
         ensure!(parts.embedding.hidden() == parts.cfg.dim, "embedding rows of {} for dim {}", parts.embedding.hidden(),
             parts.cfg.dim);
@@ -476,6 +479,7 @@ impl<'a> Engine<'a> {
     }
 
     fn workspace_here(&self, rank: usize, t: usize, lanes: usize) -> Result<Workspace<'a>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let lead = rank == 0;
         let lead_only = |bytes: usize| if lead { bytes } else { 256 };
         let h = self.cfg.dim;
@@ -538,6 +542,7 @@ impl<'a> Engine<'a> {
 
     /// Persistent table buffers for up to `rows` rows.
     fn step_buffers(&self, rows: usize) -> Result<StepBuffers<'a>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace/step");
         let ints = |count: usize| self.alloc(count * 4);
         let metadata = |_: usize| -> Result<Vec<Dev<'a>>> { (0..9).map(|_| ints(rows + 2)).collect() };
         Ok(StepBuffers {
