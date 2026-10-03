@@ -88,6 +88,7 @@ fn layer_buffers(engine: &Engine<'_>) -> Result<Vec<LayerBuffers>> {
 impl<'e, 'a> Dsv4Prefix<'e, 'a> {
     /// The family over `engine`'s buffers with a device arena of `slots(mark_bytes)` marks.
     pub fn new(engine: &'e Engine<'a>, slots: impl FnOnce(usize) -> usize) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix");
         let layers = layer_buffers(engine)?;
         let shape = engine.shape;
         for layer in &layers {

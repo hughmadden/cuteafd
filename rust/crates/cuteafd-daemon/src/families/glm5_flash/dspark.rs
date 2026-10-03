@@ -20,12 +20,15 @@
 //!
 //! The embedding and LM head are the target's (the checkpoint's copies are
 //! the official GLM 5.3 Flash tensors bit for bit, as in every GLM 5.3 Flash
-//! quant). FP8 drafting (`--draft-fp8`, default on) runs the GEMMs and the LM
-//! head through E4M3 copies like the DFlash2 drafter
-//! ([`crate::families::glm5::dflash`]). Drafts only steer speculation: the
+//! quant), borrowed as the target keeps them ([`TargetHead`]: BF16, or its
+//! FP8-only head). The GEMM weights are resident once, BF16 or (default) E4M3
+//! packed at load, like the DFlash2 drafter ([`crate::families::glm5::dflash`]).
+//! Drafts only steer speculation: the
 //! verify step keeps output identical to plain greedy decoding.
 //! python/reference/families/glm5_flash/dspark/reference.py is the oracle.
-use crate::families::glm5::dflash::{ContextRow, Draft, DraftSeq, ReplayDrafter, FP8_ROWS, RING, TAP_ROWS};
+use crate::families::glm5::dflash::{ContextRow, Draft, DraftSeq, HeadLaunch, ReplayDrafter, ReplayMode, TargetHead, RING,
+    TAP_ROWS};
+use cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation;
 use crate::shared::fp8_linear::{self, Fp8Weight};
 use crate::shared::memory::DeviceAllocation;
 use crate::shared::token_io::TokenEmbedding;
@@ -33,7 +36,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::read_safetensors_metadata;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::Path;
@@ -168,30 +171,22 @@ impl DsparkConfig {
     }
 }
 
-struct Fp8Layer<'a> {
-    qkv: Fp8Weight<'a>,
-    o: Fp8Weight<'a>,
-    gate_up: Fp8Weight<'a>,
-    down: Fp8Weight<'a>,
-}
-
-struct Fp8Weights<'a> {
-    fc: Fp8Weight<'a>,
-    head: Fp8Weight<'a>,
-    layers: Vec<Fp8Layer<'a>>,
-    workspace: Dev<'a>,
+/// Exactly one resident representation of a GEMM weight.
+enum Weight<'a> {
+    Bf16(Dev<'a>),
+    Fp8(Fp8Weight<'a>),
 }
 
 struct DraftLayer<'a> {
     input_norm: Dev<'a>,
     post_norm: Dev<'a>,
     /// q | k | v rows; the context update reads the k | v rows.
-    qkv: Dev<'a>,
+    qkv: Weight<'a>,
     q_norm: Dev<'a>,
     k_norm: Dev<'a>,
-    o: Dev<'a>,
-    gate_up: Dev<'a>,
-    down: Dev<'a>,
+    o: Weight<'a>,
+    gate_up: Weight<'a>,
+    down: Weight<'a>,
     k_ring: Dev<'a>,
     v_ring: Dev<'a>,
 }
@@ -221,6 +216,13 @@ struct Workspace<'a> {
     _head_workspace: Dev<'a>,
 }
 
+/// The target head inside a draft step.
+#[derive(Clone, Copy)]
+enum HeadRef<'h> {
+    Bf16(*const c_void),
+    Launch(&'h HeadLaunch<'h>),
+}
+
 #[derive(Clone, Copy)]
 enum DraftInput<'r, 'e> {
     Rows(&'r [u8]),
@@ -231,6 +233,39 @@ enum DraftInput<'r, 'e> {
 /// of the target's embedding and LM head).
 fn wanted(name: &str) -> bool {
     name != "embed_tokens.weight" && name != "lm_head.weight"
+}
+
+/// Header-only admission before any native allocation: the config fits the
+/// target and every tensor the drafter reads is BF16 of its shape.
+pub(crate) fn check_checkpoint(snapshot: &Path, hidden: usize, vocab: usize, layers: usize) -> Result<()> {
+    let cfg = DsparkConfig::read(snapshot)?;
+    ensure!(cfg.hidden == hidden && cfg.vocab == vocab && cfg.taps.iter().all(|&l| l < layers),
+        "the dSpark drafter (hidden {}, vocab {}, taps {:?}) does not fit this target", cfg.hidden, cfg.vocab,
+        cfg.taps);
+    let tensors: HashMap<String, (cuteafd_core::DType, Vec<usize>)> =
+        read_safetensors_metadata(&snapshot.join("model.safetensors"))?.into_iter()
+            .map(|t| (t.name, (t.dtype, t.shape))).collect();
+    let (h, kv, inter) = (cfg.hidden, cfg.kv_width(), cfg.intermediate);
+    let mut wanted = vec![("fc.weight".to_string(), vec![h, cfg.taps.len() * h]), ("hidden_norm.weight".into(), vec![h]),
+        ("norm.weight".into(), vec![h]), ("markov_head.markov_w1.weight".into(), vec![cfg.vocab, cfg.rank]),
+        ("markov_head.markov_w2.weight".into(), vec![cfg.vocab, cfg.rank]),
+        ("confidence_head.proj.weight".into(), vec![1, h + cfg.rank]), ("confidence_head.proj.bias".into(), vec![1])];
+    for l in 0..cfg.layers {
+        let (p, a) = (format!("layers.{l}"), format!("layers.{l}.self_attn"));
+        wanted.extend([(format!("{p}.input_layernorm.weight"), vec![h]),
+            (format!("{p}.post_attention_layernorm.weight"), vec![h]),
+            (format!("{a}.q_proj.weight"), vec![cfg.q_width(), h]), (format!("{a}.k_proj.weight"), vec![kv, h]),
+            (format!("{a}.v_proj.weight"), vec![kv, h]), (format!("{a}.o_proj.weight"), vec![h, cfg.q_width()]),
+            (format!("{a}.q_norm.weight"), vec![cfg.head_dim]), (format!("{a}.k_norm.weight"), vec![cfg.head_dim]),
+            (format!("{p}.mlp.gate_proj.weight"), vec![inter, h]), (format!("{p}.mlp.up_proj.weight"), vec![inter, h]),
+            (format!("{p}.mlp.down_proj.weight"), vec![h, inter])]);
+    }
+    for (name, shape) in wanted {
+        let (dtype, found) = tensors.get(&name).with_context(|| format!("dSpark checkpoint has no {name}"))?;
+        ensure!(*dtype == cuteafd_core::DType::Bf16 && *found == shape,
+            "dSpark {name}: {dtype:?} {found:?}, expected BF16 {shape:?}");
+    }
+    Ok(())
 }
 
 /// Reads the drafter's tensors on a thread (while the target loads).
@@ -253,7 +288,7 @@ pub(crate) struct DsparkDrafter<'a> {
     stream: *mut c_void,
     pub slots: usize,
     max_sequences: usize,
-    fc: Dev<'a>,
+    fc: Weight<'a>,
     hidden_norm: Dev<'a>,
     norm: Dev<'a>,
     markov_w1: Dev<'a>,
@@ -272,8 +307,9 @@ pub(crate) struct DsparkDrafter<'a> {
     context_slots: Dev<'a>,
     mask_row: Vec<u8>,
     workspace: RefCell<Option<Workspace<'a>>>,
-    fp8: Option<Fp8Weights<'a>>,
-    use_fp8: Cell<bool>,
+    representation: GlmDraftRepresentation,
+    /// GEMV scratch of the FP8 representation (every context/draft row count).
+    fp8_workspace: Option<Dev<'a>>,
 }
 
 fn at(dev: &Dev<'_>, bytes: usize) -> *mut c_void {
@@ -290,8 +326,11 @@ impl<'a> DsparkDrafter<'a> {
     /// Uploads the drafter's tensors (see [`prefetch`]) and allocates `slots`
     /// ring contexts; draft steps take up to `max_sequences` sequences.
     /// `mask_row` is the target embedding of the mask token.
+    #[allow(clippy::too_many_arguments)]
     pub fn load(library: &'a NativeLibrary, snapshot: &Path, tensors: HashMap<String, Vec<u8>>, stream: *mut c_void,
-        slots: usize, max_sequences: usize, mask_row: Vec<u8>) -> Result<Self> {
+        slots: usize, max_sequences: usize, mask_row: Vec<u8>, representation: GlmDraftRepresentation,
+        scales: fp8_linear::Fp8Scales) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let cfg = DsparkConfig::read(snapshot)?;
         ensure!((1..=MAX_SEQUENCES).contains(&max_sequences), "dSpark drafts take 1..={MAX_SEQUENCES} sequences");
         let path = snapshot.join("model.safetensors");
@@ -314,6 +353,23 @@ impl<'a> DsparkDrafter<'a> {
         };
         let (h, kv, inter) = (cfg.hidden, cfg.kv_width(), cfg.intermediate);
         let tensor = |name: &str, shape: &[usize]| bytes(name, shape).and_then(upload);
+        let matrix = |source: Dev<'a>, n: usize, k: usize| -> Result<Weight<'a>> {
+            match representation {
+                GlmDraftRepresentation::Bf16Only => Ok(Weight::Bf16(source)),
+                GlmDraftRepresentation::Fp8Only => {
+                    let packed = Fp8Weight::pack(library, source.buffer.ptr, n, k, scales, stream);
+                    // SAFETY: the packing kernel reads `source`: drain it before the source drops.
+                    if let Err(error) = unsafe { library.cuda_stream_synchronize(stream) } {
+                        std::mem::forget(source);
+                        if let Ok(weight) = packed { weight.quarantine(); }
+                        return Err(error.context("dSpark packing owners quarantined after a failed drain"));
+                    }
+                    let packed = packed?;
+                    drop(source);
+                    Ok(Weight::Fp8(packed))
+                }
+            }
+        };
         let concat = |parts: &[(&str, usize)], cols: usize| -> Result<Dev<'a>> {
             let total: usize = parts.iter().map(|(_, rows)| rows * cols * 2).sum();
             let allocation = DeviceAllocation::new(library, total)?;
@@ -332,19 +388,27 @@ impl<'a> DsparkDrafter<'a> {
             Ok(DraftLayer {
                 input_norm: tensor(&format!("{p}.input_layernorm.weight"), &[h])?,
                 post_norm: tensor(&format!("{p}.post_attention_layernorm.weight"), &[h])?,
-                qkv: concat(&[(&format!("{a}.q_proj.weight"), cfg.q_width()), (&format!("{a}.k_proj.weight"), kv),
-                    (&format!("{a}.v_proj.weight"), kv)], h)?,
+                qkv: matrix(concat(&[(&format!("{a}.q_proj.weight"), cfg.q_width()), (&format!("{a}.k_proj.weight"), kv),
+                    (&format!("{a}.v_proj.weight"), kv)], h)?, cfg.qkv_width(), h)?,
                 q_norm: tensor(&format!("{a}.q_norm.weight"), &[cfg.head_dim])?,
                 k_norm: tensor(&format!("{a}.k_norm.weight"), &[cfg.head_dim])?,
-                o: tensor(&format!("{a}.o_proj.weight"), &[h, cfg.q_width()])?,
-                gate_up: concat(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
-                    (&format!("{p}.mlp.up_proj.weight"), inter)], h)?,
-                down: tensor(&format!("{p}.mlp.down_proj.weight"), &[h, inter])?,
+                o: matrix(tensor(&format!("{a}.o_proj.weight"), &[h, cfg.q_width()])?, h, cfg.q_width())?,
+                gate_up: matrix(concat(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
+                    (&format!("{p}.mlp.up_proj.weight"), inter)], h)?, 2 * inter, h)?,
+                down: matrix(tensor(&format!("{p}.mlp.down_proj.weight"), &[h, inter])?, h, inter)?,
                 k_ring: zeroed(slots * RING * kv * 2)?,
                 v_ring: zeroed(slots * RING * kv * 2)?,
             })
         }).collect::<Result<Vec<_>>>()?;
         let taps = cfg.taps.len() * h;
+        let fp8_workspace = match representation {
+            GlmDraftRepresentation::Bf16Only => None,
+            GlmDraftRepresentation::Fp8Only => {
+                let shapes = [(taps, h), (h, cfg.qkv_width()), (h, 2 * kv), (cfg.q_width(), h), (h, 2 * inter),
+                    (inter, h)];
+                Some(fp8_linear::scratch(library, TAP_ROWS.max(max_sequences * cfg.block), &shapes)?)
+            }
+        };
         let markov_w2 = tensor("markov_head.markov_w2.weight", &[cfg.vocab, cfg.rank])?;
         let markov_norms = DeviceAllocation::new(library, cfg.vocab * 4)?;
         // SAFETY: both buffers hold `vocab` rows; the stream orders the kernel before any draft.
@@ -355,7 +419,7 @@ impl<'a> DsparkDrafter<'a> {
             stream,
             slots,
             max_sequences,
-            fc: tensor("fc.weight", &[h, taps])?,
+            fc: matrix(tensor("fc.weight", &[h, taps])?, h, taps)?,
             hidden_norm: tensor("hidden_norm.weight", &[h])?,
             norm: tensor("norm.weight", &[h])?,
             markov_w1: tensor("markov_head.markov_w1.weight", &[cfg.vocab, cfg.rank])?,
@@ -372,66 +436,27 @@ impl<'a> DsparkDrafter<'a> {
             context_slots: zeroed(TAP_ROWS * 4)?,
             mask_row,
             workspace: RefCell::new(None),
-            fp8: None,
-            use_fp8: Cell::new(false),
+            representation,
+            fp8_workspace,
             cfg,
         })
     }
 
-    /// Makes E4M3 copies of every GEMM weight and of the target's LM head
-    /// `head` ([vocab, hidden] BF16) and drafts through them from now on.
-    pub fn enable_fp8(&mut self, head: *const c_void, scales: fp8_linear::Fp8Scales) -> Result<()> {
-        let started = std::time::Instant::now();
-        let (library, stream) = (self.library, self.stream);
-        let pack = |w: *const c_void, n: usize, k: usize| Fp8Weight::pack(library, w, n, k, scales, stream);
-        let c = &self.cfg;
-        let (h, inter) = (c.hidden, c.intermediate);
-        let layers = self.layers.iter().map(|l| -> Result<Fp8Layer<'a>> {
-            Ok(Fp8Layer {
-                qkv: pack(l.qkv.buffer.ptr, c.qkv_width(), h)?,
-                o: pack(l.o.buffer.ptr, h, c.q_width())?,
-                gate_up: pack(l.gate_up.buffer.ptr, 2 * inter, h)?,
-                down: pack(l.down.buffer.ptr, h, inter)?,
-            })
-        }).collect::<Result<Vec<_>>>()?;
-        let fc = pack(self.fc.buffer.ptr, h, c.taps.len() * h)?;
-        let head = pack(head, c.vocab, h)?;
-        let mut shapes = vec![(fc.k, fc.n), (head.k, head.n), (h, 2 * c.kv_width())];
-        for l in &layers {
-            for w in [&l.qkv, &l.o, &l.gate_up, &l.down] {
-                shapes.push((w.k, w.n));
-            }
-        }
-        let workspace = fp8_linear::scratch(library, FP8_ROWS, &shapes)?;
-        // SAFETY: the packing kernels ran on this stream.
-        unsafe { library.cuda_stream_synchronize(stream)? };
-        let resident: usize = [&fc, &head].into_iter()
-            .chain(layers.iter().flat_map(|l| [&l.qkv, &l.o, &l.gate_up, &l.down]))
-            .map(Fp8Weight::bytes).sum();
-        tracing::info!(gib = resident as f64 / (1u64 << 30) as f64, ?scales, elapsed_ms = started.elapsed().as_millis() as u64,
-            "dSpark drafter FP8 copies (and FP8 LM head) resident");
-        self.fp8 = Some(Fp8Weights { fc, head, layers, workspace });
-        self.use_fp8.set(true);
-        Ok(())
-    }
-
-    /// Drafts through the FP8 copies (when made) or the BF16 weights.
-    pub fn set_fp8(&self, on: bool) {
-        self.use_fp8.set(on && self.fp8.is_some());
-    }
-
+    /// `out` [rows, n] = `x` [rows, k] @ rows `first..first + n` of `weight`^T.
+    ///
     /// # Safety
     /// Pointers are live device buffers of those shapes.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn linear(&self, x: *const c_void, w: *const c_void, w8: Option<(&Fp8Weight<'_>, usize)>, out: *mut c_void,
-        rows: usize, k: usize, n: usize) -> Result<()> {
-        match (self.fp8.as_ref(), w8) {
-            (Some(fp8), Some((w8, first))) if self.use_fp8.get() && rows <= FP8_ROWS => {
-                // SAFETY: the caller's contract; the scratch was sized for FP8_ROWS rows of every shape.
-                unsafe { w8.apply(self.library, x, out, false, rows, first, n, &fp8.workspace, self.stream) }
+    unsafe fn linear(&self, x: *const c_void, weight: &Weight<'_>, first: usize, out: *mut c_void, rows: usize,
+        k: usize, n: usize) -> Result<()> {
+        match weight {
+            // SAFETY: rows first..first + n lie in the matrix; the caller's contract.
+            Weight::Bf16(w) => unsafe { self.library.linear_bf16(x, at(w, first * k * 2), out, rows, k, n, self.stream) },
+            Weight::Fp8(w) => {
+                let scratch = self.fp8_workspace.as_ref().context("FP8 dSpark scratch was not admitted")?;
+                // SAFETY: the scratch covers every shape for up to max(TAP_ROWS, sequences x block) rows.
+                unsafe { w.apply(self.library, x, out, false, rows, first, n, scratch, self.stream) }
             }
-            // SAFETY: the caller's contract.
-            _ => unsafe { self.library.linear_bf16(x, w, out, rows, k, n, self.stream) },
         }
     }
 
@@ -475,15 +500,12 @@ impl<'a> DsparkDrafter<'a> {
         let s = self.stream;
         // SAFETY: every buffer holds TAP_ROWS rows of its width; the stream orders the chain.
         unsafe {
-            let fp8 = self.fp8.as_ref();
-            self.linear(at(&self.taps, first * width * 2), self.fc.buffer.ptr, fp8.map(|f| (&f.fc, 0)),
-                self.fused.buffer.ptr, n, width, h)?;
+            self.linear(at(&self.taps, first * width * 2), &self.fc, 0, self.fused.buffer.ptr, n, width, h)?;
             self.library.glm_dflash_rmsnorm(self.fused.buffer.ptr, self.hidden_norm.buffer.ptr,
                 self.fused_norm.buffer.ptr, n, h, self.cfg.eps, s)?;
             let q_rows = self.cfg.q_width();
-            for (index, layer) in self.layers.iter().enumerate() {
-                self.linear(self.fused_norm.buffer.ptr, at(&layer.qkv, q_rows * h * 2),
-                    fp8.map(|f| (&f.layers[index].qkv, q_rows)), self.context_kv.buffer.ptr, n, h, 2 * kv)?;
+            for layer in &self.layers {
+                self.linear(self.fused_norm.buffer.ptr, &layer.qkv, q_rows, self.context_kv.buffer.ptr, n, h, 2 * kv)?;
                 self.library.glmf_dspark_qk_rope(self.context_kv.buffer.ptr, layer.q_norm.buffer.ptr,
                     layer.k_norm.buffer.ptr, self.context_positions.buffer.ptr, self.context_slots.buffer.ptr,
                     std::ptr::null_mut(), layer.k_ring.buffer.ptr, layer.v_ring.buffer.ptr, n, 0, self.cfg.kv_heads,
@@ -532,20 +554,27 @@ impl<'a> DsparkDrafter<'a> {
         })
     }
 
-    /// Drafts `block` tokens after each sequence's anchor (anchor embedding
-    /// rows on the host); `head` is the target's vocabulary head.
-    pub fn draft(&self, sequences: &[DraftSeq], anchor_rows: &[u8], head: *const c_void) -> Result<Vec<Draft>> {
-        self.draft_from(sequences, DraftInput::Rows(anchor_rows), head)
+    fn head_ref<'h>(&self, head: &'h TargetHead<'h>) -> Result<HeadRef<'h>> {
+        Ok(match head {
+            TargetHead::Bf16(owner) => {
+                ensure!(owner.buffer.bytes == self.cfg.vocab * self.cfg.hidden * 2,
+                    "dSpark borrows the target BF16 head [{}, {}]", self.cfg.vocab, self.cfg.hidden);
+                HeadRef::Bf16(owner.buffer.ptr)
+            }
+            TargetHead::Launch(launch) => HeadRef::Launch(launch),
+        })
     }
 
     /// [`Self::draft`] with the block's input rows gathered on the device
     /// from the target's embedding table.
-    pub fn draft_device(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>, head: *const c_void)
+    pub fn draft_device(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>, head: TargetHead<'_>)
         -> Result<Vec<Draft>> {
-        self.draft_from(sequences, DraftInput::Table(embedding), head)
+        self.draft_from(sequences, DraftInput::Table(embedding), self.head_ref(&head)?)
     }
 
-    fn draft_from(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: *const c_void) -> Result<Vec<Draft>> {
+    fn draft_from(&self, sequences: &[DraftSeq], input: DraftInput<'_, '_>, head: HeadRef<'_>)
+        -> Result<Vec<Draft>> {
+        ensure!(!matches!(head, HeadRef::Bf16(p) if p.is_null()), "dSpark has no borrowed target head");
         let c = &self.cfg;
         let (s_count, block, h) = (sequences.len(), c.block, c.hidden);
         let rows_ok = match input {
@@ -593,15 +622,12 @@ impl<'a> DsparkDrafter<'a> {
         self.put(&w.anchors, bytes_of(&anchors))?;
         let (s, l) = (self.stream, self.library);
         let (eps, inter) = (c.eps, c.intermediate);
-        let fp8 = self.fp8.as_ref().filter(|_| self.use_fp8.get());
         // SAFETY: every workspace buffer holds `rows` rows of its width and the
         // weights their checkpoint shapes; the stream orders the chain.
         unsafe {
             l.glm_dflash_rmsnorm(w.h.buffer.ptr, self.layers[0].input_norm.buffer.ptr, w.n.buffer.ptr, rows, h, eps, s)?;
             for (index, layer) in self.layers.iter().enumerate() {
-                let f8 = fp8.map(|f| &f.layers[index]);
-                self.linear(w.n.buffer.ptr, layer.qkv.buffer.ptr, f8.map(|f| (&f.qkv, 0)), w.qkv.buffer.ptr, rows, h,
-                    c.qkv_width())?;
+                self.linear(w.n.buffer.ptr, &layer.qkv, 0, w.qkv.buffer.ptr, rows, h, c.qkv_width())?;
                 l.glmf_dspark_qk_rope(w.qkv.buffer.ptr, layer.q_norm.buffer.ptr, layer.k_norm.buffer.ptr,
                     w.positions.buffer.ptr, std::ptr::null(), w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr, rows,
                     c.heads, c.kv_heads, c.theta, eps, s)?;
@@ -609,24 +635,20 @@ impl<'a> DsparkDrafter<'a> {
                     layer.v_ring.buffer.ptr, w.tables.buffer.ptr, at(&w.tables, s_count * 4), at(&w.tables, 2 * s_count * 4),
                     w.attn.buffer.ptr, w.attention_workspace.buffer.ptr, s_count, block, c.heads, c.kv_heads, RING,
                     RING + block, c.causal, 1.0 / (c.head_dim as f32).sqrt(), s)?;
-                self.linear(w.attn.buffer.ptr, layer.o.buffer.ptr, f8.map(|f| (&f.o, 0)), w.delta.buffer.ptr, rows,
-                    c.q_width(), h)?;
+                self.linear(w.attn.buffer.ptr, &layer.o, 0, w.delta.buffer.ptr, rows, c.q_width(), h)?;
                 l.glmf_dspark_add_rmsnorm(w.h.buffer.ptr, w.delta.buffer.ptr, layer.post_norm.buffer.ptr,
                     w.h.buffer.ptr, w.n.buffer.ptr, rows, h, eps, s)?;
-                self.linear(w.n.buffer.ptr, layer.gate_up.buffer.ptr, f8.map(|f| (&f.gate_up, 0)), w.gate_up.buffer.ptr,
-                    rows, h, 2 * inter)?;
+                self.linear(w.n.buffer.ptr, &layer.gate_up, 0, w.gate_up.buffer.ptr, rows, h, 2 * inter)?;
                 l.glm_dflash_silu_mul(w.gate_up.buffer.ptr, w.act.buffer.ptr, rows, inter, s)?;
-                self.linear(w.act.buffer.ptr, layer.down.buffer.ptr, f8.map(|f| (&f.down, 0)), w.delta.buffer.ptr, rows,
-                    inter, h)?;
+                self.linear(w.act.buffer.ptr, &layer.down, 0, w.delta.buffer.ptr, rows, inter, h)?;
                 let next = self.layers.get(index + 1).map_or(self.norm.buffer.ptr, |n| n.input_norm.buffer.ptr);
                 l.glmf_dspark_add_rmsnorm(w.h.buffer.ptr, w.delta.buffer.ptr, next, w.h.buffer.ptr, w.n.buffer.ptr,
                     rows, h, eps, s)?;
             }
-            match fp8 {
-                Some(f) if rows <= FP8_ROWS => f.head.apply(l, w.n.buffer.ptr, w.logits.buffer.ptr, true, rows, 0,
-                    c.vocab, &f.workspace, s)?,
-                _ => crate::families::glm5::launch_head(l, &w.head, w.n.buffer.ptr, head, w.logits.buffer.ptr.cast(),
-                    rows, h, c.vocab, s)?,
+            match head {
+                HeadRef::Bf16(weight) => crate::families::glm5::launch_head(l, &w.head, w.n.buffer.ptr,
+                    weight, w.logits.buffer.ptr.cast(), rows, h, c.vocab, s)?,
+                HeadRef::Launch(launch) => launch(w.n.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), rows, s)?,
             }
             l.glmf_dspark_markov(w.logits.buffer.ptr, self.markov_w1.buffer.ptr, self.markov_w2.buffer.ptr,
                 self.markov_norms.buffer.ptr, w.anchors.buffer.ptr, w.tokens.buffer.ptr, w.markov_workspace.buffer.ptr, s_count, block, c.vocab,
@@ -677,12 +699,8 @@ impl ReplayDrafter for DsparkDrafter<'_> {
         self.max_sequences.min(self.slots)
     }
 
-    fn has_fp8(&self) -> bool {
-        self.fp8.is_some()
-    }
-
-    fn set_fp8(&self, on: bool) {
-        DsparkDrafter::set_fp8(self, on);
+    fn resident_modes(&self) -> Vec<ReplayMode> {
+        vec![ReplayMode { name: self.representation.name(), legacy_fp8: None }]
     }
 
     fn context(&self, taps: &[u8], first: usize) -> Result<()> {
@@ -694,7 +712,9 @@ impl ReplayDrafter for DsparkDrafter<'_> {
     fn draft_tokens(&self, seqs: &[(usize, u32, usize)], anchor_rows: &[u8], head: *const c_void)
         -> Result<Vec<Vec<u32>>> {
         let seqs: Vec<DraftSeq> = seqs.iter().map(|&(slot, anchor, position)| DraftSeq { slot, anchor, position, valid_from: 0 }).collect();
-        Ok(self.draft(&seqs, anchor_rows, head)?.into_iter().map(|d| d.tokens).collect())
+        // Replay's caller keeps the target BF16 head live throughout.
+        Ok(self.draft_from(&seqs, DraftInput::Rows(anchor_rows), HeadRef::Bf16(head))?.into_iter()
+            .map(|d| d.tokens).collect())
     }
 
     fn tap_rows(&self) -> usize {
@@ -715,18 +735,20 @@ pub(crate) enum Drafter<'a> {
 
 impl<'a> Drafter<'a> {
     /// Loads the drafter `snapshot` names (dSpark when its config says so,
-    /// else DFlash2) for a target of `hidden` x `vocab` with `layers` layers.
+    /// else DFlash2) for a target of `hidden` x `vocab` with `layers` layers:
+    /// `slots` ring contexts, draft steps of up to `sequences` sequences.
     #[allow(clippy::too_many_arguments)]
-    pub fn load(library: &'a NativeLibrary, snapshot: &Path, stream: *mut c_void, sequences: usize,
-        embedding: &TokenEmbedding<'_>, hidden: usize, vocab: usize, layers: usize) -> Result<Self> {
+    pub fn load(library: &'a NativeLibrary, snapshot: &Path, stream: *mut c_void, slots: usize, sequences: usize,
+        embedding: &TokenEmbedding<'_>, hidden: usize, vocab: usize, layers: usize,
+        representation: GlmDraftRepresentation, scales: fp8_linear::Fp8Scales) -> Result<Self> {
         if is_dspark(snapshot) {
             let cfg = DsparkConfig::read(snapshot)?;
             ensure!(cfg.hidden == hidden && cfg.vocab == vocab && cfg.taps.iter().all(|&l| l < layers),
                 "the dSpark drafter does not fit this target");
             let mask = embedding.host_rows(&[cfg.mask_token])?;
             let tensors = prefetch(snapshot).join().map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
-            return Ok(Self::Dspark(DsparkDrafter::load(library, snapshot, tensors, stream, sequences,
-                sequences.min(MAX_SEQUENCES), mask)?));
+            return Ok(Self::Dspark(DsparkDrafter::load(library, snapshot, tensors, stream, slots,
+                sequences.min(MAX_SEQUENCES), mask, representation, scales)?));
         }
         let cfg = crate::families::glm5::dflash::DflashConfig::read(snapshot)?;
         ensure!(cfg.hidden == hidden && cfg.vocab == vocab && cfg.taps.iter().all(|&l| l < layers),
@@ -734,8 +756,8 @@ impl<'a> Drafter<'a> {
         let mask = embedding.host_rows(&[cfg.mask_token])?;
         let file = crate::families::glm5::dflash::prefetch(snapshot).join()
             .map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
-        Ok(Self::Dflash2(crate::families::glm5::dflash::GlmDrafter::load(library, snapshot, file, stream, sequences,
-            sequences, mask, true)?))
+        Ok(Self::Dflash2(crate::families::glm5::dflash::GlmDrafter::load(library, snapshot, file, stream, slots,
+            sequences, mask, true, representation, scales)?))
     }
 
     pub fn name(&self) -> &'static str {
@@ -745,10 +767,11 @@ impl<'a> Drafter<'a> {
         }
     }
 
-    pub fn enable_fp8(&mut self, head: *const c_void, scales: fp8_linear::Fp8Scales) -> Result<()> {
+    /// Most sequences one draft step takes.
+    pub fn max_batch_sequences(&self) -> usize {
         match self {
-            Self::Dflash2(d) => d.enable_fp8(head, scales),
-            Self::Dspark(d) => d.enable_fp8(head, scales),
+            Self::Dflash2(d) => d.max_batch_sequences(),
+            Self::Dspark(d) => d.max_sequences,
         }
     }
 
@@ -803,7 +826,7 @@ impl<'a> Drafter<'a> {
         }
     }
 
-    pub fn draft_device(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>, head: *const c_void)
+    pub fn draft_device(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>, head: TargetHead<'_>)
         -> Result<Vec<Draft>> {
         match self {
             Self::Dflash2(d) => d.draft_device(sequences, embedding, head),

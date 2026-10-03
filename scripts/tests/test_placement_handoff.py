@@ -9,9 +9,12 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 
 STUB = r'''#!/usr/bin/env python3
-import json,os,sys
+import json,os,sys,shlex
 from pathlib import Path
 args=sys.argv[1:]; tool=Path(sys.argv[0]).name
+# SSH receives a shell command string; decode its quoted worker argv.
+if tool=='ssh' and args and args[-1].startswith('bash -s -- '):
+ args=args[:-1]+shlex.split(args[-1])
 with open(os.environ['EVENTS'],'a') as f:f.write(json.dumps([tool,args])+'\n')
 if tool=='docker':
  if args[0]=='inspect':print('running')
@@ -23,12 +26,12 @@ else:
 '''
 
 class PlacementHandoffTest(unittest.TestCase):
-    def run_startup(self, gpus, plan, options=(), spark_count=4):
+    def run_startup(self, gpus, plan, options=(), spark_count=4, local_layers="auto"):
         source=(ROOT/'run.sh').read_text()
         block=source[source.index('placement_directory='):source.index('api_url=')]
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); (root/'plan').write_text(json.dumps(plan))
-            for name in ['docker','ssh']:
+            for name in ['docker','ssh','nest']:
                 path=root/name;path.write_text(STUB);path.chmod(0o755)
             env=dict(os.environ,PATH=str(root)+os.pathsep+os.environ['PATH'],EVENTS=str(root/'events'),PLAN=str(root/'plan'))
             setup=r'''
@@ -36,6 +39,7 @@ set -euo pipefail
 source scripts/lib/release-common.sh
 release_die() { echo "$*" >&2; exit 1; }
 RELEASE_RTX_GPUS="$1"
+repo_root="$PWD"
 coordinator=coordinator
 snapshot_rel=model
 peers=peer-list
@@ -77,8 +81,10 @@ hosts=(a b c d)
 EXPERT_PORT=19441
 expert_capacity=4096
 spark_first_layer=0
+wip_layout=
+wip_slot=
 '''
-            setup+=f'\nSPARK_COUNT={spark_count}\nhosts=("${{hosts[@]:0:SPARK_COUNT}}")\n'
+            setup+=f'\nRTX_EXPERT_LAYERS={local_layers}\nSPARK_COUNT={spark_count}\nhosts=("${{hosts[@]:0:SPARK_COUNT}}")\n'
             # Legacy geometry: release_spark_tp defaults to SPARK_COUNT and
             # release_spark_ep to 1 when no explicit topology is configured.
             setup+=f'spark_tp={spark_count}\n'
@@ -107,11 +113,12 @@ spark_first_layer=0
                 self.assertEqual(result.returncode,0,result.stderr)
                 self.assertEqual(events[0][0],'docker')
                 self.assertEqual(events[0][1][0],'run')
+                self.assertIn(f'seccomp={ROOT}/docker/seccomp-code-bench.json',events[0][1])
                 self.assertIn('--placement-directory',events[0][1])
                 starts=[args for tool,args in events if tool=='ssh' and '-s' in args]
                 self.assertEqual(len(starts),4)
                 tails=[self.worker_tail(args) for args in starts]
-                self.assertTrue(all(len(tail)==16 for tail in tails),tails)
+                self.assertTrue(all(len(tail)==18 for tail in tails),tails)
                 # first_layer, world, then the legacy topology tail.
                 self.assertTrue(all(tail[8]==str(min(layers,39)) and tail[9]=='4' for tail in tails))
                 self.assertTrue(all(tail[10:13]==['0','4','1'] for tail in tails))
@@ -122,7 +129,7 @@ spark_first_layer=0
                 self.assertGreater(ack[0],max(ready))
 
     def test_compact_starts_exactly_two_workers_and_passes_ceiling(self):
-        result,events=self.run_startup(1,{},spark_count=2)
+        result,events=self.run_startup(1,dict(version=1,rtx_gpus=1,nonce="fresh",rtx_expert_layers=0,spark_first_layer=0),spark_count=2)
         self.assertEqual(result.returncode,0,result.stderr)
         starts=[args for tool,args in events if tool=='ssh' and '-s' in args]
         self.assertEqual(len(starts),2)
@@ -139,6 +146,16 @@ spark_first_layer=0
         result,events=self.run_startup(2,dict(version=1,rtx_gpus=2,nonce='fresh',rtx_expert_layers=40,spark_first_layer=39),spark_count=0)
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertFalse(any(tool=='ssh' for tool,_ in events))
+        # No hosts: never `nest drop-caches` without --host (that drops every host's cache).
+        self.assertFalse(any(tool=='nest' for tool,_ in events))
+
+    def test_spark_launch_drops_only_its_hosts_page_caches(self):
+        result,events=self.run_startup(2,dict(version=1,rtx_gpus=2,nonce='fresh',rtx_expert_layers=20,spark_first_layer=20))
+        self.assertEqual(result.returncode,0,result.stderr)
+        drops=[args for tool,args in events if tool=='nest']
+        self.assertEqual(len(drops),1,events)
+        self.assertEqual(drops[0][0],'drop-caches')
+        self.assertTrue(all(a=='--host' for a in drops[0][1::2]),drops)
 
     def test_cli_tp2_overrides_and_invalid_config(self):
         source=(ROOT/'run.sh').read_text()
@@ -176,13 +193,52 @@ spark_first_layer=0
         self.assertIn('invalid coordinator placement plan',result.stderr)
         self.assertFalse(any(tool=='ssh' for tool,_ in events))
 
-    def test_single_keeps_worker_first_startup_without_handoff(self):
-        result,events=self.run_startup(1,{})
+    def test_single_all_remote_keeps_worker_first_startup_without_handoff(self):
+        result,events=self.run_startup(1,{},local_layers="0")
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual(events[0][0],'ssh')
         runs=[args for tool,args in events if tool=='docker' and args[0]=='run']
         self.assertEqual(len(runs),1)
         self.assertNotIn('--placement-directory',runs[0])
         self.assertFalse(any(tool=='docker' and args[0]=='exec' for tool,args in events))
+
+    def test_single_auto_publishes_live_boundary_before_workers(self):
+        # Auto may resolve to no local experts under a small memory ceiling,
+        # or keep any number of layers. Workers must use the actual plan.
+        for layers in [0,5,39,40]:
+            with self.subTest(layers=layers):
+                result,events=self.run_startup(1,dict(version=1,rtx_gpus=1,nonce='fresh',
+                    rtx_expert_layers=layers,spark_first_layer=min(layers,39)))
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(events[0][0],'docker')
+                self.assertEqual(events[0][1][0],'run')
+                self.assertIn('--placement-directory',events[0][1])
+                starts=[args for tool,args in events if tool=='ssh' and '-s' in args]
+                self.assertEqual(len(starts),4)
+                self.assertTrue(all(self.worker_tail(args)[8]==str(min(layers,39)) for args in starts))
+                ack=[i for i,(tool,args) in enumerate(events) if tool=='docker'
+                    and args[:3]==['exec','coordinator','sh']]
+                ready=[i for i,(tool,args) in enumerate(events) if tool=='ssh'
+                    and any('timeout 1' in a for a in args)]
+                self.assertEqual(len(ack),1)
+                self.assertEqual(len(ready),4)
+                self.assertGreater(ack[0],max(ready))
+
+    def test_single_explicit_boundary_is_handed_off_without_topology_flags(self):
+        for layers in [1,5,40]:
+            with self.subTest(layers=layers):
+                result,events=self.run_startup(1,dict(version=1,rtx_gpus=1,nonce='fresh',
+                    rtx_expert_layers=layers,spark_first_layer=min(layers,39)),local_layers=str(layers))
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(events[0][0],'docker')
+                starts=[args for tool,args in events if tool=='ssh' and '-s' in args]
+                self.assertTrue(all(self.worker_tail(args)[8]==str(min(layers,39)) for args in starts))
+
+    def test_explicit_boundary_must_match_the_requested_count(self):
+        result,events=self.run_startup(1,dict(version=1,rtx_gpus=1,nonce='fresh',
+            rtx_expert_layers=4,spark_first_layer=4),local_layers='5')
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('invalid coordinator placement plan',result.stderr)
+        self.assertFalse(any(tool=='ssh' for tool,_ in events))
 
 if __name__=='__main__':unittest.main()

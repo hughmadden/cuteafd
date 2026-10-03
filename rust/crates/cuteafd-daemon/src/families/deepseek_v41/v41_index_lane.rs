@@ -52,7 +52,9 @@ impl<'w, 'a> IndexLane<'w, 'a> {
         Ok([
             IndexQueryWave::device_bytes(library, capacity)?,
             IndexSelectionWave::device_bytes(capacity as usize)?,
-            IndexSelectionWave::device_bytes(capacity as usize)?,
+            // The reindex wave shares the source's scores and top-k scratch
+            // (they run one after the other in a lane), as the placed lanes do.
+            IndexSelectionWave::shared_device_bytes(capacity as usize)?,
         ])
     }
     pub fn new(weights: &'w IndexLaneWeights<'a>, capacity: u32, budget: usize) -> Result<Self> {
@@ -78,9 +80,9 @@ impl<'w, 'a> IndexLane<'w, 'a> {
         ensure!(first < LAYERS.len(), "GPU has no index producers");
         let query = weights.weights[first].wave(capacity, bytes[0])?;
         let mut source = IndexSelectionWave::new(weights.library, capacity as usize, bytes[1])?;
-        let reindex = if bytes[2] == 0 { None } else if device.is_some() {
+        let reindex = if bytes[2] == 0 { None } else {
             Some(IndexSelectionWave::sharing_scratch(&mut source, bytes[2])?)
-        } else { Some(IndexSelectionWave::new(weights.library, capacity as usize, bytes[2])?) };
+        };
         Ok(Self {
             weights, query, source, reindex,
             next: first,

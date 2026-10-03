@@ -172,6 +172,7 @@ impl State {
                 self.prune_stored();
             }
             EvictDecision::DroppedUncached => self.model.abort(pending.key),
+            EvictDecision::Held => panic!("non-stalling schedule failed its release barrier"),
             EvictDecision::Clean => panic!("a pending ticket was clean"),
         }
         assert!(
@@ -298,6 +299,7 @@ impl State {
                     self.model.evict_to(self.evict_quota);
                 }
                 EvictDecision::DroppedUncached => self.model.abort(pending.key),
+                EvictDecision::Held => panic!("non-stalling schedule failed its release barrier"),
                 EvictDecision::Clean => {}
             }
             assert!(

@@ -107,7 +107,10 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
     engine_args.slots = engine_args.slots.max(args.max_sequences);
-    engine_args.draft_sequences = engine_args.draft_sequences.max(args.max_sequences);
+    if engine_args.draft_context_slots.is_none() {
+        engine_args.draft_context_slots = Some(20.max(engine_args.draft_sequences)
+            .max(args.max_sequences.saturating_mul(5).div_ceil(4)));
+    }
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), args.max_sequences, args.decode_share);
     let policy = Policy { copy: if args.no_copy_drafts { 0 } else { COPY_DRAFT }, fixed: args.draft_fixed };
     let prefix = args.prefix.clone();
@@ -236,8 +239,9 @@ struct Active<'a> {
     drafts: DraftHistory,
     /// Hash of `history` (identical sequences share it).
     digest: u64,
-    /// Steps, DFlash2 drafts verified and accepted, copy drafts verified and accepted.
-    counts: [usize; 5],
+    /// Steps, DFlash2 drafts verified/accepted, copy drafts verified/accepted,
+    /// and actual neural drafter forward calls for this sequence.
+    counts: [usize; 6],
     constraint: Option<crate::shared::constraints::State<'a>>,
     placement: GlmfPlacement,
     /// First position the DFlash2 drafter's context holds for this sequence
@@ -356,16 +360,17 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, lanes: us
     anyhow::ensure!(args.prefix_partial == Toggle::Off, "GLM 5.3 Flash restores exact snapshots only (KDA state)");
     let family = GlmfPrefix::new(engine, |mark| if entries == 0 { 0 } else { MarkArena::slots_for(lanes, entries, mark, budget) })?;
     let template = engine.paged_buffers().first().map(|b| b[0]).context("GLM 5.3 Flash has no MLA layer")?;
-    let host = args.host_tier(engine.library, template, family.mark_bytes())?;
+    let host = args.host_tier(engine.library, template, family.layout(), engine.max_context)?;
+    let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();
     let config = PrefixConfig { entries, mark_slots: family.slots(), keep_logits: true,
         min_tokens: args.prefix_cache_min_tokens };
     let cache = PrefixCache::new(layout, config, host)?;
     tracing::info!(entries, mark_slots = family.slots(), mark_bytes = family.mark_bytes(), page_bytes = layout.page_bytes,
-        pages = layout.pages, page_rows = layout.page_rows, host_bytes = args.host_cache_bytes, points = ?args.points(),
+        pages = layout.pages, page_rows = layout.page_rows, host_bytes, points = ?args.points(),
         "GLM 5.3 Flash prefix cache");
     cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64,
-        &"FP8 MLA latent + KDA state".to_string(), if args.prefix_cache_entries == 0 { 0 } else { args.host_cache_bytes });
+        &"FP8 MLA latent + KDA state".to_string(), host_bytes);
     Ok((family, cache))
 }
 
@@ -420,22 +425,30 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     // (engine step + commit) and selecting/streaming tokens.
     let (mut steps, mut draft_s, mut verify_s, mut emit_s) = (0u64, 0f64, 0f64, 0f64);
     let mut prefills = decode_share.queue::<Prefill<'_>>()?;
+    let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<NativeRequest>::default();
     loop {
         while active.len() + prefills.len() < max_sequences {
-            let job = if active.is_empty() && prefills.is_empty() {
-                // Idle: publish the state the server waits in (captures and releases done).
-                cache.tick();
-                publish(stats, requests, generated_total, 0, 0, &cache);
-                console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
-                match receive.blocking_recv() {
-                    Some(job) => job,
-                    None => return Ok(()),
-                }
-            } else {
-                match receive.try_recv() {
-                    Ok(job) => job,
-                    Err(_) => break,
-                }
+            let busy = !active.is_empty() || !prefills.is_empty();
+            let job = match kv_waiter.poll(cache.pool().free(), cache.pool().release_epoch(), busy, |job| job.events.is_closed()) {
+                cuteafd_engine::prefix::AdmissionPoll::Blocked => break,
+                cuteafd_engine::prefix::AdmissionPoll::Ready(job) => job,
+                cuteafd_engine::prefix::AdmissionPoll::Empty => {
+                    if !busy {
+                        // Idle: publish the state the server waits in (captures and releases done).
+                        cache.tick();
+                        publish(stats, requests, generated_total, 0, 0, &cache);
+                        console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
+                        match receive.blocking_recv() {
+                            Some(job) => job,
+                            None => return Ok(()),
+                        }
+                    } else {
+                        match receive.try_recv() {
+                            Ok(job) => job,
+                            Err(_) => break,
+                        }
+                    }
+                },
             };
             let reject = |job: &NativeRequest, message: String| {
                 let _ = job.events.send(Err(NativeFailure::BadRequest(message)));
@@ -458,7 +471,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 reject(&job, "KDA state slots exhausted".into());
                 continue;
             };
-            let slot = free_slots.pop();
+            // Disabled neural drafts need neither a ring slot nor context updates.
+            let slot = if probe::no_speculation(&job.probe) || policy.fixed == Some(0) {
+                None
+            } else { free_slots.pop() };
             cache.tick();
             let admit_started = Instant::now();
             // Lookup, fork of the retained units and restore of the KDA mark (byte-exact).
@@ -468,7 +484,12 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 Err(error) => {
                     free_kda.push(kda);
                     free_slots.extend(slot);
-                    reject(&job, format!("{error:#}"));
+                    // Running requests keep their pages pinned. Delay a request
+                    // that fits alone instead of rejecting transient KV pressure.
+                    match kv_waiter.defer(job, &error, busy, cache.pool().release_epoch()) {
+                        Ok(()) => break,
+                        Err(job) => reject(&job, format!("{error:#}")),
+                    }
                     continue;
                 }
             };
@@ -632,7 +653,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         draft_pause: 0,
                         slot,
                         drafts: DraftHistory::default(),
-                        counts: [0; 5],
+                        counts: [0; 6],
                         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?,
                         job: p.job, constraint: p.constraint, placement: p.placement, draft_from: resume, turn: None,
                         capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(),
@@ -680,13 +701,17 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         // DFlash2 drafts after every next token, then the policy's counts.
         let timer = Instant::now();
         let drafted: Vec<Option<Draft>> = match drafter {
-            Some(drafter) if skip.drafts() && active.iter().any(|a| a.slot.is_some()) => {
+            Some(drafter) if skip.drafts() && active.iter().enumerate().any(|(i, a)| a.slot.is_some() && limits[i] > 0) => {
                 let seqs: Vec<(usize, DraftSeq)> = active.iter().enumerate()
-                    .filter_map(|(i, a)| a.slot.map(|slot| (i, DraftSeq { slot, anchor: a.next, position: a.placement.len,
-                        valid_from: a.draft_from })))
+                    .filter_map(|(i, a)| a.slot.filter(|_| limits[i] > 0).map(|slot|
+                        (i, DraftSeq { slot, anchor: a.next, position: a.placement.len, valid_from: a.draft_from })))
+                    .take(drafter.max_batch_sequences())
                     .collect();
+                for &(i, _) in &seqs {
+                    active[i].counts[5] += 1;
+                }
                 let drafts = drafter.draft_device(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
-                    engine.weights.head.buffer.ptr);
+                    engine.draft_head());
                 cost.observe_draft(timer.elapsed().as_secs_f64() * 1e3);
                 let mut out = vec![None; active.len()];
                 match drafts {
@@ -881,9 +906,9 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             generated_total += request.generated as u64;
             let seconds = request.started.elapsed().as_secs_f64();
             let phases = std::mem::take(&mut *engine.profile.borrow_mut());
-            let [steps_seen, dflash, dflash_ok, copy, copy_ok] = request.counts;
+            let [steps_seen, dflash, dflash_ok, copy, copy_ok, draft_calls] = request.counts;
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
-                active = active.len(), steps = steps_seen, all_steps = steps, dflash, dflash_ok, copy, copy_ok,
+                active = active.len(), steps = steps_seen, all_steps = steps, dflash, dflash_ok, copy, copy_ok, draft_calls,
                 draft_s, verify_s, emit_s, gpu_wait_s = phases[0], experts_s = phases[1], head_s = phases[2],
                 "request complete");
             (steps, draft_s, verify_s, emit_s) = (0, 0.0, 0.0, 0.0);
@@ -899,7 +924,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         }
         cache.tick();
         publish(stats, requests, generated_total, active.len(), prefills.len(), &cache);
-        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len()));
+        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len() + kv_waiter.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
 }

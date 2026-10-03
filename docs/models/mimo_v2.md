@@ -33,6 +33,24 @@ experts without a shared expert.
   next to the dense path.
 - Prefix cache: merged for both V2 Flash and V2.6 Pro.
 
+## Default precision (single residency)
+
+Every weight has one resident format. Precision is chosen by measurement:
+FP8 converts at load into the only copy where it is faster and the golden
+stays within ~0.005 nat KL/NLL; drafters run FP8 whenever emitted tok/s is
+higher (they cannot change the output). Measured 2026-10-03, natural minimum,
+one warm launch per arm, `CONCURRENCY=4`, code tok/s (C4 aggregate), golden
+512 tokens.
+
+| Arm | C1 | C4 | 8K prefill | KL · top-1 · NLL |
+| --- | ---: | ---: | ---: | --- |
+| V2 Flash checkpoint | 69.4 | 108.5 | 5,864 | 0.103 · 82.6% · 4.313 |
+| **V2 Flash FP8 head + o_proj (default)** | 72.6 | 125.1 | 5,548 | 0.092 · 83.2% · 4.308 |
+| V2.6 Pro checkpoint | 55.1 | 71.5 | 2,352 | 0.026 · 86.7% · 3.379 |
+| **V2.6 Pro FP8 head + o_proj + DFlash (default)** | 58.0 | 87.3 | 2,656 | 0.028 · 86.5% · 3.368 |
+
+MiMo V2 Flash 1 RTX + 4 Sparks; V2.6 Pro 1 RTX + 6 Sparks. Coordinator VRAM: V2 Flash 16.4 → 14.2 GB; V2.6 Pro 46.0 → 36.4 GB (v0 dual copy 59.9 GB). `MIMO_WEIGHT_POLICY=checkpoint` keeps source formats; `MIMO_FP8_HEAD`/`MIMO_FP8_O_PROJ`/`SPECULATOR_FP8` override.
+
 ## Known limits
 
 - V2.6 Pro's prefill is intake-bound on the Spark-to-coordinator exchange of

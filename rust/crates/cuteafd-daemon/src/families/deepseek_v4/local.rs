@@ -7,7 +7,7 @@
 //! coordinator's `exl3-<family>-k<tiers>/rtx-tp1` package instead.
 use crate::families::deepseek_v41::v41_experts::exl3::{
     aot_layout_directory,
-    execution::{Exl3Execution, Exl3InputFormat, Exl3Workspace},
+    execution::{Exl3Execution, Exl3InputFormat, Exl3RowPolicy, Exl3Workspace},
     Exl3Weights,
 };
 use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights};
@@ -49,6 +49,7 @@ enum Backend<'a> {
     /// stages `0..stages` first, then backbone layers `first..first + layers`.
     Exl3 {
         executions: Vec<Exl3Execution<'a>>,
+        row_policy: Exl3RowPolicy,
         stages: usize,
         first: usize,
         layers: usize,
@@ -97,6 +98,7 @@ impl<'a> LocalExperts<'a> {
         budget: usize,
         stream: *mut c_void,
     ) -> Result<Option<Self>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("local-experts");
         let shape = *catalog.routed_experts();
         let backbone = backbone.start.max(shape.first_layer)..backbone.end.min(shape.layers);
         if backbone.is_empty() && draft_stages == 0 {
@@ -106,7 +108,11 @@ impl<'a> LocalExperts<'a> {
             .chain(CAPACITIES.iter().copied().find(|&c| c as usize >= max_rows)).collect();
         if let Some(manifest) = catalog.exl3() {
             let directory = aot_layout_directory(native_lib, manifest.decoder_tiers(), "rtx-tp1");
-            return Self::load_exl3(library, catalog, &directory, &capacities, draft_stages, backbone, max_rows, budget);
+            let row_policy = Exl3RowPolicy::active();
+            let capacities = if row_policy == Exl3RowPolicy::GlmFlashK64 {
+                row_policy.capacities(max_rows)?
+            } else { capacities };
+            return Self::load_exl3(library, catalog, &directory, &capacities, row_policy, draft_stages, backbone, max_rows, budget);
         }
         let mut states = Vec::new();
         let mut scratch_bytes = 0usize;
@@ -175,11 +181,13 @@ impl<'a> LocalExperts<'a> {
         catalog: &OfficialV41Catalog,
         directory: &Path,
         capacities: &[u32],
+        row_policy: Exl3RowPolicy,
         draft_stages: usize,
         backbone: std::ops::Range<usize>,
         max_rows: usize,
         budget: usize,
     ) -> Result<Option<Self>> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("local-experts");
         let shape = *catalog.routed_experts();
         let directories: Vec<_> = capacities.iter().map(|c| directory.join(format!("m{c}"))).collect();
         if let Some(missing) = directories.iter().find(|d| !d.join("v41_exl3.json").is_file()) {
@@ -232,7 +240,7 @@ impl<'a> LocalExperts<'a> {
             executions.push(execution);
         }
         Ok(Some(Self {
-            backend: Backend::Exl3 { executions, stages: draft_stages, first: backbone.start, layers },
+            backend: Backend::Exl3 { executions, row_policy, stages: draft_stages, first: backbone.start, layers },
             reducer: library.v41_local_expert_reducer()?,
             output: DeviceAllocation::new(library, output_bytes)?,
             topk: shape.topk,
@@ -274,13 +282,13 @@ impl<'a> LocalExperts<'a> {
     ) -> Result<()> {
         let (first, layers, stages, states) = match &mut self.backend {
             Backend::Native { first, layers, stages, states, .. } => (*first, layers, stages, states),
-            Backend::Exl3 { executions, stages, first, layers } => {
+            Backend::Exl3 { executions, row_policy, stages, first, layers } => {
                 let index = match layer {
                     LocalLayer::Stage(n) if n < *stages => n,
                     LocalLayer::Backbone(n) if (*first..*first + *layers).contains(&n) => *stages + n - *first,
                     _ => anyhow::bail!("local expert layer {layer:?} is not resident"),
                 };
-                let execution = executions.iter_mut().find(|e| e.capacity() >= rows)
+                let execution = executions.iter_mut().find(|e| e.capacity() >= row_policy.required_capacity(rows))
                     .context("no local EXL3 capacity for this many rows")?;
                 let buffer = |ptr: *mut c_void, bytes: usize| CuteafdDeviceBuffer {
                     ptr, bytes, device_id: self.device, ..Default::default()

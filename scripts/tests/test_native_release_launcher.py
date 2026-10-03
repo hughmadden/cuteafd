@@ -342,13 +342,16 @@ class V10BuildTargetTest(unittest.TestCase):
 
 
     def test_all_examples_use_the_promoted_pair(self) -> None:
+        config = ROOT / "cuteafd.config"
+        coordinator = self.config_value(config, "COORDINATOR_DOCKER_INFERENCE")
+        spark = self.config_value(config, "SPARK_EXPERT_DOCKER_INFERENCE")
         examples = sorted((ROOT / "examples" / "configs").glob("*.config"))
         self.assertTrue(examples, "the example directory must not be empty")
         for path in examples:
             with self.subTest(example=path.name):
                 text = path.read_text()
-                self.assertIn("COORDINATOR_DOCKER_INFERENCE=ghcr.io/tpurtell/cuteafd-coordinator:v11", text)
-                self.assertIn("SPARK_EXPERT_DOCKER_INFERENCE=ghcr.io/tpurtell/cuteafd-spark-expert:v11", text)
+                self.assertIn(f"COORDINATOR_DOCKER_INFERENCE={coordinator}", text)
+                self.assertIn(f"SPARK_EXPERT_DOCKER_INFERENCE={spark}", text)
 
 
 class V11ReleaseBuildTargetTest(unittest.TestCase):

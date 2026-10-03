@@ -210,6 +210,44 @@ extern "C" int32_t cuteafd_fp8moe_launch(void* context, uint32_t capacity, void*
 """
 
 
+def exact_widths(intermediate: int, tp: int) -> list[int]:
+    """Stored widths of TP ranks owning whole 128-row blocks exactly (TP6 of
+    2048: 384, 384, 384, 384, 256, 256), as the worker's exact layouts expect."""
+    blocks = intermediate // 128
+    if intermediate % 128 or blocks < tp:
+        return []
+    return [(blocks // tp + (rank < blocks % tp)) * 128 for rank in range(tp)]
+
+
+def with_width(g, width: int):
+    """``g`` compiled for a stored slice of ``width`` rows (an exact layout):
+    the programs read only ``g.slice``, so the subclass overrides it."""
+    from dataclasses import dataclass, fields
+
+    @dataclass(frozen=True)
+    class ExactSlice(type(g)):
+        width: int = 0
+
+        @property
+        def slice(self) -> int:  # noqa: D401 - overrides the padded width
+            return self.width
+
+    values = {f.name: getattr(g, f.name) for f in fields(g)}
+    return ExactSlice(**values, width=int(width))
+
+
+def layout_geometry(base, layout: str):
+    """``tp<n>`` (padded) or ``tp<n>-w<width>`` (exact) -> (tp, geometry)."""
+    tp_part, _, width = layout.partition("-w")
+    tp = int(tp_part.removeprefix("tp"))
+    g = base.with_tp(tp)
+    if width:
+        if int(width) not in exact_widths(base.intermediate, tp):
+            raise SystemExit(f"{layout}: no rank of TP{tp} owns {width} rows of {base.intermediate} exactly")
+        g = with_width(g, int(width))
+    return tp, g
+
+
 def info_words(g, capacities: list[int], wire: bool) -> list[int]:
     limit = struct.unpack("<I", struct.pack("<f", float(g.swiglu_limit)))[0]
     words = [ABI[g.kind], g.hidden, g.slice, g.experts, g.top_k, g.intermediate, g.tp, 7 if wire else 1, limit,
@@ -257,6 +295,13 @@ def build(args: argparse.Namespace) -> None:
         if not layouts:
             raise SystemExit(f"{args.geometry}: intermediate {base.intermediate} has no default {args.role} "
                              "TP layout of whole 128-row blocks; pass --layouts")
+    if args.exact_slices:
+        # Exact layouts beside each padded TP layout whose ranks would store padding.
+        for layout in list(layouts):
+            tp = int(layout.partition("-w")[0].removeprefix("tp"))
+            widths = sorted(set(exact_widths(base.intermediate, tp)), reverse=True)
+            if tp > 1 and widths and base.with_tp(tp).slice * tp > base.intermediate:
+                layouts += [f"tp{tp}-w{w}" for w in widths if f"tp{tp}-w{w}" not in layouts]
     wire = (args.input or ROLE_INPUT[args.role]) == "wire"
     if args.output.exists():
         raise SystemExit(f"{args.output} exists; remove it or choose another --output")
@@ -267,8 +312,7 @@ def build(args: argparse.Namespace) -> None:
     with tempfile.TemporaryDirectory(prefix=".fp8moe-package-", dir=args.output.parent) as temporary:
         stage = Path(temporary)
         for layout in layouts:
-            tp = int(layout.removeprefix("tp"))
-            g = base.with_tp(tp)
+            tp, g = layout_geometry(base, layout)
             raw = args.build_dir / args.geometry / layout
             if raw.exists():
                 shutil.rmtree(raw)
@@ -278,7 +322,8 @@ def build(args: argparse.Namespace) -> None:
             forms = [(c, "auto") for c in capacities]
             forms += [(c, form) for c in capacities for form in prefill_forms(g, c, wire)]
             for capacity, form in forms:
-                stem = f"fp8moe_{args.geometry}_{layout}_m{capacity}{'' if form == 'auto' else '_' + form}"
+                stem = (f"fp8moe_{args.geometry}_{layout.replace('-', '_')}_m{capacity}"
+                        f"{'' if form == 'auto' else '_' + form}")
                 with exportable_compilation():
                     program = compile_fp8_moe_aot(g, route="auto", max_rows=capacity, wire=wire, prefill=form)
                 program.export_to_c(str(raw), stem, "cuteafd_" + stem)
@@ -315,10 +360,28 @@ def build(args: argparse.Namespace) -> None:
                       "capacities": capacities}), flush=True)
 
 
-def verify(package: Path) -> dict:
+def verify(package: Path, *, revision: str | None = None, role: str | None = None,
+           input_kind: str | None = None, layout: str | None = None,
+           min_capacity: int | None = None) -> dict:
     manifest = json.loads((package / "manifest.json").read_text())
     if manifest.get("schema") != SCHEMA:
         raise ValueError(f"{package}: not an FP8 expert package")
+    if revision is not None and manifest.get("sparkinfer_revision") != revision:
+        raise ValueError(f"{package}: SparkInfer revision {manifest.get('sparkinfer_revision')} differs from {revision}")
+    expected_role = "spark" if role == "expert" else role
+    if expected_role is not None and manifest.get("role") != expected_role:
+        raise ValueError(f"{package}: role {manifest.get('role')} differs from {expected_role}")
+    layouts = manifest["layouts"]
+    if min_capacity is not None and min_capacity < 1:
+        raise ValueError("minimum capacity must be positive")
+    if layout is not None and layout not in layouts:
+        raise ValueError(f"{package}: no {layout} layout (built: {sorted(layouts)})")
+    for name in ([layout] if layout is not None else layouts):
+        info = layouts[name]
+        if input_kind is not None and info.get("input") != input_kind:
+            raise ValueError(f"{package}/{name}: input {info.get('input')} differs from {input_kind}")
+        if min_capacity is not None and not any(c["capacity"] >= min_capacity for c in info["capacities"]):
+            raise ValueError(f"{package}/{name}: no capacity for {min_capacity} rows")
     files = {str(p.relative_to(package)) for p in package.rglob("*") if p.is_file()} - {"manifest.json"}
     if files != set(manifest["files"]):
         raise ValueError(f"{package}: file set differs from the manifest")
@@ -344,6 +407,9 @@ def main() -> None:
     create.add_argument("--layouts", help="comma list (default: tp4,tp2,tp6 where they split for spark, "
                         "tp1 for coordinator)")
     create.add_argument("--capacities", default="1,16,80,256,1024,4096")
+    create.add_argument("--exact-slices", action="store_true",
+                        help="also build tp<n>-w<width> layouts: ranks own whole 128-row blocks, each stored at its "
+                        "own width (no zero padding; the worker prefers them when every width is present)")
     create.add_argument("--input", choices=("wire", "bf16"),
                         help="expert input rows (default: wire for spark, bf16 for coordinator)")
     create.add_argument("--cross-sm121", action="store_true", help="build a Spark package on an SM120 host")
@@ -355,11 +421,17 @@ def main() -> None:
     create.add_argument("--runtime", type=Path, required=True)
     check = commands.add_parser("verify")
     check.add_argument("--package", type=Path, required=True)
+    check.add_argument("--sparkinfer-revision")
+    check.add_argument("--role", choices=("coordinator", "spark", "expert"))
+    check.add_argument("--input", choices=("wire", "bf16"))
+    check.add_argument("--layout")
+    check.add_argument("--min-capacity", type=int)
     args = parser.parse_args()
     if args.command == "build":
         build(args)
     else:
-        manifest = verify(args.package)
+        manifest = verify(args.package, revision=args.sparkinfer_revision, role=args.role,
+                          input_kind=args.input, layout=args.layout, min_capacity=args.min_capacity)
         print(json.dumps({"verified": True, "role": manifest["role"], "geometry": manifest["geometry"],
                           "layouts": sorted(manifest["layouts"])}))
 

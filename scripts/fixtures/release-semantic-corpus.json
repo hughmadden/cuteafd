@@ -5,6 +5,11 @@
     "python/tools/bench_real_full_mtp_acceptance.py": "ae462a12aaaa9d0af98a5f0b7df0720355ff18c8dfbdf8a15ecc147aebde05da",
     "python/tools/bench_real_full_repeat_decode.py": "567cbadc5555817426633328b1e448dc21303fb013a039f8e5d54ae20c6f4aca"
   },
+  "quality_function_sha256": {
+    "_python_block": "9f0e159f6ce54ee9a3fabafdd4c1222c5e9fbaabda1c47ecb88dc4f6bd9ec564",
+    "_structured_json_content": "031bc6353472a3da5b1bf143caa551f153de88717d7222d8469ed80291dadeb2",
+    "validate_case_content": "fdc4a1c10ee2956bd7c9ca3a7af55be33edee7845d3816cc89105ecad05398c2"
+  },
   "quality_contract": "glmrt-semantic-decode-contract-v3",
   "weighted_case_ids": [
     "code",

@@ -18,17 +18,17 @@ def test_preserved_release_corpus_and_quality_contract():
     assert reasoning['thinking'] == 'enabled' and reasoning['reasoning_effort'] == 'high'
     assert corpus['orchid']['requested_repetitions'] == 100
 
-    source_root = ROOT.parent / 'glmrt-release'
     assert corpus['source_repository'] == 'glmrt-release'
-    for relative, digest in corpus['source_files'].items():
-        assert hashlib.sha256((source_root / relative).read_bytes()).hexdigest() == digest
-
-    original = ast.parse((source_root / 'python/tools/bench_real_full_mtp_acceptance.py').read_text())
-    preserved = ast.parse((ROOT / 'scripts/release_semantic_quality.py').read_text())
-    original_functions = {node.name: node for node in original.body if isinstance(node, ast.FunctionDef)}
-    for node in preserved.body:
-        if isinstance(node, ast.FunctionDef):
-            assert ast.dump(node) == ast.dump(original_functions[node.name])
+    # These function hashes were verified against the archived source files
+    # above. A clean checkout must not require a sibling legacy repository.
+    source = (ROOT / 'scripts/release_semantic_quality.py').read_text()
+    functions = {
+        node.name: ast.get_source_segment(source, node)
+        for node in ast.parse(source).body if isinstance(node, ast.FunctionDef)
+    }
+    assert functions.keys() == corpus['quality_function_sha256'].keys()
+    for name, digest in corpus['quality_function_sha256'].items():
+        assert hashlib.sha256(functions[name].encode()).hexdigest() == digest
 
     validate = runpy.run_path(str(ROOT / 'scripts/release_semantic_quality.py'))['validate_case_content']
     assert validate('math', '240 × 0.75 × 1.08 = 194.40')['quality_contract_passed']

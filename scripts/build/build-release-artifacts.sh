@@ -80,6 +80,18 @@ fi
 # validated by native/cmake/shared/expert_families.cmake. Empty keeps the V4.1 image.
 # Both builds take the same list; CMake keeps the entries for its architecture.
 expert_families="${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}"
+# Optional Spark siblings retain unquantized BF16 expert inputs. Empty keeps
+# the existing artifact set; requesting one also requires its main FP8 family.
+bf16_families="${CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES:-}"
+IFS=';' read -ra bf16_family_list <<<"$bf16_families"
+for bf16_family in "${bf16_family_list[@]}"; do
+  case "$bf16_family" in
+    mimo|mimop|glm|glmf|qwen4) ;;
+    *) echo "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES: unknown family $bf16_family" >&2; exit 2 ;;
+  esac
+  [[ ";$expert_families;" == *";$bf16_family:fp8;"* ]] ||
+    { echo "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_family needs $bf16_family:fp8 in CUTEAFD_RELEASE_EXPERT_FAMILIES" >&2; exit 2; }
+done
 # v7 ships both EXL3 decoder families by default: the uniform K=2 raw
 # publication family (2,3) and the staged K3.25 family (3,4). Paired TP4
 # builds remain single-family and stay on the v5 (3,4) family.
@@ -176,6 +188,7 @@ cmake \
   -DCUTEAFD_ENABLE_V41_EXPERT_AOT=ON \
   -DCUTEAFD_SPARK_TP_ROLES="$spark_tp_roles" \
   -DCUTEAFD_EXPERT_FAMILIES="$expert_families" \
+  -DCUTEAFD_FP8_MOE_BF16_FAMILIES="$bf16_families" \
   -DCUTEAFD_ENABLE_V41_NVFP4_AOT="${CUTEAFD_RELEASE_NVFP4_AOT:-ON}" \
   -DCUTEAFD_ENABLE_EXL3_PACKAGES=ON \
   -DCUTEAFD_V41_EXL3_BIT_FAMILIES="$exl3_bit_families" \
@@ -234,6 +247,7 @@ done
 # Exact FP8 expert packages (FAMILY:fp8 entries) ship as fp8/fp8-FAMILY; the
 # directory always exists so the release image can COPY it.
 mkdir -p "$output_dir/fp8"
+fp8_revision="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["revision"])' "$build_root/source/third_party/sparkinfer.lock.json")"
 for release_family in "${release_family_list[@]}"; do
   case "$release_family" in
     *:fp8) release_package="fp8-${release_family%%:*}" ;;
@@ -247,11 +261,20 @@ for release_family in "${release_family_list[@]}"; do
   mkdir -p "$output_dir/fp8"
   # A FAMILY:nvfp4 entry also builds the default W4A4 sibling (fp8_moe.cmake).
   release_packages=("$release_package")
+  # Stage only requested siblings; discard an older slot's opt-in after opt-out.
+  if [[ "$role" == expert && "$release_family" == *:fp8 ]]; then
+    rm -rf "$output_dir/fp8/${release_package}-bf16"
+    [[ ";$bf16_families;" != *";${release_family%%:*};"* ]] ||
+      release_packages+=("${release_package}-bf16")
+  fi
   [[ "$release_family" == *:nvfp4 ]] && release_packages+=("${release_package}a4")
   for release_package in "${release_packages[@]}"; do
     rm -rf "$output_dir/fp8/$release_package"
     cp -a "$build_root/native/fp8/$release_package" "$output_dir/fp8/$release_package"
-    python3 "$build_root/source/python/tools/aot/package_fp8_moe_aot.py" verify --package "$output_dir/fp8/$release_package"
+    fp8_input_args=()
+    [[ "$release_package" != *-bf16 ]] || fp8_input_args=(--input bf16)
+    python3 "$build_root/source/python/tools/aot/package_fp8_moe_aot.py" verify \
+      --package "$output_dir/fp8/$release_package" --sparkinfer-revision "$fp8_revision" --role "$role" "${fp8_input_args[@]}"
   done
 done
 install -m 0644 "$build_root/native/v41_experts/v41_experts.json" "$output_dir/V41_EXPERT_AOT.json"

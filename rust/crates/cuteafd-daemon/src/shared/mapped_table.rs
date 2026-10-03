@@ -77,6 +77,7 @@ pub(crate) struct PinnedRowRing<'a> {
 
 impl<'a> PinnedRowRing<'a> {
     pub fn new(library: &'a NativeLibrary, slot_bytes: usize, slots: usize) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("mapped-table");
         ensure!(slot_bytes > 0 && slots > 0, "an empty pinned row ring");
         let slots = (0..slots)
             .map(|_| -> Result<RingSlot<'a>> {
@@ -181,6 +182,7 @@ impl<'a> MappedTableDevice<'a> {
     /// `max_rows` bounds one step's gather (the ring slot size).
     pub fn new(library: &'a NativeLibrary, name: &'static str, table: MappedTable, args: &MappedTableArgs,
         max_rows: usize) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("mapped-table");
         let row_bytes = table.row_bytes();
         let prefetcher = if args.prefetch {
             // Prefill chunks and every decode row's next token; a row spans at most two pages.

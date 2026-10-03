@@ -243,11 +243,12 @@ fn before_device_evict_waits_or_drops() {
     };
     assert_eq!(
         cache.before_device_evict(Some(ticket)),
-        EvictDecision::DroppedUncached
+        EvictDecision::Held
     );
-    assert_eq!(cache.metrics().stores_failed, 1);
-    assert_eq!(cache.metrics().evict_drops_uncached, 1);
-    assert_eq!(cache.metrics().bytes_used, 0);
+    assert_eq!(cache.metrics().stores_failed, 0);
+    assert_eq!(cache.metrics().evict_drops_uncached, 0);
+    assert!(cache.metrics().bytes_used > 0);
+    assert!(cache.tick().failed.is_empty());
 }
 
 #[test]
@@ -503,7 +504,7 @@ fn fail_after_cache(
 }
 
 /// A mid-plan issue failure must drain the copies already issued before the plan's slabs are
-/// released; when the drain times out the slabs stay held so no later store reuses them.
+/// released; an exceptional barrier finishes slow copies and holds genuinely stalled copies.
 #[test]
 fn a_mid_plan_issue_failure_drains_before_releasing_slabs() {
     // Fast copies: the already-issued copy drains within the budget, so the plan is released.
@@ -520,7 +521,7 @@ fn a_mid_plan_issue_failure_drains_before_releasing_slabs() {
     assert_eq!(cache.metrics().store_drain_timeouts, 0);
     assert_eq!(cache.metrics().bytes_used, 0);
 
-    // Slow copies and a tiny budget: the drain times out, so the plan's slabs stay held.
+    // Slow copies exceed the ordinary budget, but the release barrier drains them.
     let slow = CopyModel {
         d2h_bytes_per_ns: 0.001,
         h2d_bytes_per_ns: 25.0,
@@ -533,13 +534,25 @@ fn a_mid_plan_issue_failure_drains_before_releasing_slabs() {
     let StoreOutcome::Issued(ticket) = cache.store(&snap, 1) else {
         panic!("expected an issued store");
     };
-    let held = cache.metrics().bytes_used;
-    assert!(held > 0);
+    assert_eq!(cache.engine_mut().inner_mut().pending(Stream::Store), 0);
+    assert_eq!(cache.metrics().bytes_used, 0);
     let report = cache.tick();
     assert_eq!(report.failed, vec![ticket]);
     assert_eq!(cache.metrics().stores_failed, 1);
+    assert_eq!(cache.metrics().store_drain_timeouts, 0);
+
+    // A stalled stream cannot prove completion: neither tier may reuse its storage.
+    let mut cache = fail_after_cache(4 * CHUNK as u64, slow, 1, 1_000);
+    write_snapshot(cache.engine_mut().inner_mut(), &snap);
+    cache.engine_mut().inner_mut().inject(CopyFault::StreamStalls(Stream::Store));
+    let StoreOutcome::Issued(ticket) = cache.store(&snap, 1) else {
+        panic!("expected an issued store");
+    };
+    let held = cache.metrics().bytes_used;
+    assert!(held > 0);
+    assert!(cache.tick().failed.is_empty());
+    assert_eq!(cache.before_device_evict(Some(ticket)), EvictDecision::Held);
     assert_eq!(cache.metrics().store_drain_timeouts, 1);
-    // The slabs stay held after the copy completes: no later store can reuse them.
     cache.engine_mut().inner_mut().advance(1_000_000_000);
     assert_eq!(cache.metrics().bytes_used, held);
 }
@@ -767,6 +780,7 @@ proptest! {
                                 model.abort(key);
                                 planned.remove(&key);
                             }
+                            EvictDecision::Held => panic!("non-stalling schedule failed its release barrier"),
                             EvictDecision::Clean => {
                                 prop_assert!(false, "a pending ticket was clean");
                             }
@@ -816,6 +830,7 @@ proptest! {
                     model.evict_to(evict_quota);
                 }
                 EvictDecision::DroppedUncached => model.abort(key),
+                EvictDecision::Held => panic!("non-stalling schedule failed its release barrier"),
                 EvictDecision::Clean => {}
             }
             planned.remove(&key);

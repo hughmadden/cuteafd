@@ -34,6 +34,11 @@ impl<'a> DeviceAllocation<'a> {
 }
 impl Drop for DeviceAllocation<'_> {
     fn drop(&mut self) {
+        if self.library.is_quarantined_after_failed_drain() {
+            // cudaFree may synchronize with unproved work on another stream.
+            // Retain this allocation until process teardown on that path.
+            return;
+        }
         if let Err(error) = self.library.free_device_buffer(&mut self.buffer) {
             tracing::error!(%error, "freeing V4.1 device allocation");
         }
@@ -65,6 +70,11 @@ impl<'a> HostAllocation<'a> {
 }
 impl Drop for HostAllocation<'_> {
     fn drop(&mut self) {
+        if self.library.is_quarantined_after_failed_drain() {
+            // Pinned storage can still feed queued copies. Its irreversible
+            // quarantine keeps it alive until process teardown.
+            return;
+        }
         if let Err(error) = self.library.free_host_buffer(&mut self.buffer) {
             tracing::error!(%error, "freeing V4.1 pinned staging");
         }

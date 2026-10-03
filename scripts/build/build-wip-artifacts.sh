@@ -47,6 +47,18 @@ fi
 # validated by native/cmake/shared/expert_families.cmake. Empty keeps the V4.1 image.
 # Both builds take the same list; CMake keeps the entries for its architecture.
 expert_families="${CUTEAFD_WIP_EXPERT_FAMILIES:-}"
+# Optional Spark siblings retain unquantized BF16 expert inputs. Empty keeps
+# the existing artifact set; requesting one also requires its main FP8 family.
+bf16_families="${CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES:-}"
+IFS=';' read -ra bf16_family_list <<<"$bf16_families"
+for bf16_family in "${bf16_family_list[@]}"; do
+  case "$bf16_family" in
+    mimo|mimop|glm|glmf|qwen4) ;;
+    *) echo "CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES: unknown family $bf16_family" >&2; exit 2 ;;
+  esac
+  [[ ";$expert_families;" == *";$bf16_family:fp8;"* ]] ||
+    { echo "CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_family needs $bf16_family:fp8 in CUTEAFD_WIP_EXPERT_FAMILIES" >&2; exit 2; }
+done
 # Official-only WIP builds may skip the EXL3 quantization AOT entirely. The
 # default stays ON so every existing slot and script is byte-compatible; the
 # native expert path does not require the EXL3 package.
@@ -116,6 +128,7 @@ cmake \
   -DCUTEAFD_ENABLE_V41_EXPERT_AOT=ON \
   -DCUTEAFD_SPARK_TP_ROLES="$spark_tp_roles" \
   -DCUTEAFD_EXPERT_FAMILIES="$expert_families" \
+  -DCUTEAFD_FP8_MOE_BF16_FAMILIES="$bf16_families" \
   -DCUTEAFD_ENABLE_V41_NVFP4_AOT="$nvfp4_aot" \
   -DCUTEAFD_ENABLE_EXL3_PACKAGES="$exl3_aot" \
   -DCUTEAFD_V41_EXL3_BITS="${CUTEAFD_WIP_EXL3_BITS:-2;3}" \
@@ -169,6 +182,7 @@ if [[ "$exl3_aot" == ON ]]; then
 fi
 # Exact FP8 expert packages (FAMILY:fp8 entries) ship as fp8/fp8-FAMILY.
 IFS=';' read -ra wip_fp8_list <<<"$expert_families"
+fp8_revision="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["revision"])' "$source_dir/third_party/sparkinfer.lock.json")"
 for wip_family in "${wip_fp8_list[@]}"; do
   case "$wip_family" in
     *:fp8) wip_package="fp8-${wip_family%%:*}" ;;
@@ -179,11 +193,20 @@ for wip_family in "${wip_fp8_list[@]}"; do
   mkdir -p "$output_dir/fp8"
   # A FAMILY:nvfp4 entry also builds the default W4A4 sibling (fp8_moe.cmake).
   wip_packages=("$wip_package")
+  # Stage only requested siblings; discard an older slot's opt-in after opt-out.
+  if [[ "$role" == expert && "$wip_family" == *:fp8 ]]; then
+    rm -rf "$output_dir/fp8/${wip_package}-bf16"
+    [[ ";$bf16_families;" != *";${wip_family%%:*};"* ]] ||
+      wip_packages+=("${wip_package}-bf16")
+  fi
   [[ "$wip_family" == *:nvfp4 ]] && wip_packages+=("${wip_package}a4")
   for wip_package in "${wip_packages[@]}"; do
     rm -rf "$output_dir/fp8/$wip_package"
     cp -a "$build_dir/native/fp8/$wip_package" "$output_dir/fp8/$wip_package"
-    python3 "$source_dir/python/tools/aot/package_fp8_moe_aot.py" verify --package "$output_dir/fp8/$wip_package"
+    fp8_input_args=()
+    [[ "$wip_package" != *-bf16 ]] || fp8_input_args=(--input bf16)
+    python3 "$source_dir/python/tools/aot/package_fp8_moe_aot.py" verify \
+      --package "$output_dir/fp8/$wip_package" --sparkinfer-revision "$fp8_revision" --role "$role" "${fp8_input_args[@]}"
   done
 done
 install -m 0644 "$build_dir/native/v41_experts/v41_experts.json" "$output_dir/V41_EXPERT_AOT.json"

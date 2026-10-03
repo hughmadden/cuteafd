@@ -32,6 +32,23 @@ layer every fourth, a PLE n-gram memory table, and fused expert tensors.
   combined GDN-state + PLE mark, with n-gram history recomputed from token
   ids rather than cached.
 
+## Default precision (single residency)
+
+Every weight has one resident format. Precision is chosen by measurement:
+FP8 converts at load into the only copy where it is faster and the golden
+stays within ~0.005 nat KL/NLL; drafters run FP8 whenever emitted tok/s is
+higher (they cannot change the output). Measured 2026-10-03, natural minimum,
+one warm launch per arm, `CONCURRENCY=4`, code tok/s (C4 aggregate), golden
+512 tokens.
+
+| Arm | C1 | C4 | 8K prefill | KL · top-1 · NLL |
+| --- | ---: | ---: | ---: | --- |
+| checkpoint (BF16 projections, head) | 196 | 439 | 6,146 | 0.034 · 88.5% · 3.297 |
+| **FP8 head (default)** | 222 | 441 | 6,100 | 0.036 · 88.5% · 3.300 |
+| FP8 head + FP8 GDN/attention projections | 247 | 489 | 6,177 | 0.046 · 86.7% · 3.360 |
+
+Qwen 3.8 Flash Next EXL3 K4.25, 1 RTX, MTP 3. FP8 projections fail the KL gate (+0.012) and stay opt-in (`QWEN_FP8_DECODE=on`); `QWEN_FP8_HEAD=off` keeps BF16.
+
 ## Known limits
 
 - FP8 experts have no Spark TP layout yet: 640 is not evenly divisible the

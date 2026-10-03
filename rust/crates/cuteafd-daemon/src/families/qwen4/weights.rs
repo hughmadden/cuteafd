@@ -14,6 +14,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::plan::checkpoint::{Checkpoint, CheckpointTensor};
+use cuteafd_loader::families::qwen4::resident::{self, fp8_operands, BF16_PROJECTION_OPERANDS};
 use cuteafd_loader::families::qwen4::{Qwen4Attention, Qwen4Config};
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -45,15 +46,88 @@ impl Qwen4Layer<'_> {
     pub fn bytes(&self) -> usize {
         self.operands.values().map(|a| a.buffer.bytes).sum()
     }
+
+    /// Bytes of the selectable projections, after checking that each is held in
+    /// exactly one representation: BF16 only, or (`fp8`) E4M3 + scales only.
+    pub fn check_single_residency(&self, fp8: bool) -> Result<usize> {
+        let names: Vec<&str> = self.operands.keys().copied().collect();
+        projection_residency(&names, fp8)?;
+        Ok(BF16_PROJECTION_OPERANDS.iter().flat_map(|&name| {
+            let (q, s) = fp8_operands(name).expect("projection operand");
+            [name, q, s]
+        }).filter_map(|name| self.operands.get(name)).map(|a| a.buffer.bytes).sum())
+    }
+}
+
+/// Checks a layer's operand names: every selectable projection present in
+/// exactly one representation (BF16, or with `fp8` its E4M3 values and scales).
+pub(crate) fn projection_residency(names: &[&str], fp8: bool) -> Result<()> {
+    let has = |n: &str| names.contains(&n);
+    let mut found = 0;
+    for name in BF16_PROJECTION_OPERANDS {
+        let (q, s) = fp8_operands(name).expect("projection operand");
+        let (bf16, fp8_pair) = (has(name), has(q) && has(s));
+        ensure!(!(bf16 && (has(q) || has(s))), "{name} is resident as BF16 and as E4M3 ({q}/{s})");
+        ensure!(has(q) == has(s), "{q} and {s} must be resident together");
+        if fp8 {
+            ensure!(!bf16, "--fp8-decode holds {name} as E4M3 only, but its BF16 copy is resident");
+        } else {
+            ensure!(!fp8_pair, "{name} is BF16 by default, but an E4M3 copy ({q}) is resident");
+        }
+        found += usize::from(bf16 || fp8_pair);
+    }
+    ensure!(found == 2, "a layer holds two selectable projections, found {found} in {names:?}");
+    Ok(())
+}
+
+/// The LM head, shared by the target and the MTP drafts: exactly one resident
+/// representation (the checkpoint's BF16, or an E4M3 copy with FP32 per-row x
+/// 128-K scales made at load, run through `qwen4_head_fp8` in 16-row spans).
+pub(crate) enum Qwen4Head<'a> {
+    Bf16(DeviceAllocation<'a>),
+    Fp8 { values: DeviceAllocation<'a>, scales: DeviceAllocation<'a> },
+}
+
+impl Qwen4Head<'_> {
+    pub fn allocations(&self) -> Vec<&DeviceAllocation<'_>> {
+        match self {
+            Self::Bf16(w) => vec![w],
+            Self::Fp8 { values, scales } => vec![values, scales],
+        }
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.allocations().iter().map(|a| a.buffer.bytes).sum()
+    }
+
+    pub fn is_fp8(&self) -> bool {
+        matches!(self, Self::Fp8 { .. })
+    }
 }
 
 pub(crate) struct Qwen4Weights<'a> {
     pub layers: Vec<Qwen4Layer<'a>>,
     /// The final hyper-connection mixer: norm, w_down, w_up.
     pub mixer: [DeviceAllocation<'a>; 3],
-    pub head: DeviceAllocation<'a>,
+    pub head: Qwen4Head<'a>,
     /// The native MTP layer (`mtp.*`), when loaded.
     pub mtp: Option<MtpWeights<'a>>,
+}
+
+impl Qwen4Weights<'_> {
+    /// Every layer (target and MTP) with its projections in the representation
+    /// `fp8` selects and no other, and the head likewise: device bytes of the
+    /// selectable weights as loaded (projections, head).
+    pub fn check_single_residency(&self, fp8_projections: bool, fp8_head: bool) -> Result<(usize, usize)> {
+        let mut projections = 0;
+        for (index, layer) in self.layers.iter().chain(self.mtp.as_ref().map(|m| &m.layer)).enumerate() {
+            let which = if index < self.layers.len() { format!("layer {index}") } else { "the MTP layer".into() };
+            projections += layer.check_single_residency(fp8_projections).context(which)?;
+        }
+        ensure!(self.head.is_fp8() == fp8_head, "the LM head is {} but {} was selected",
+            if self.head.is_fp8() { "FP8" } else { "BF16" }, if fp8_head { "FP8" } else { "BF16" });
+        Ok((projections, self.head.bytes()))
+    }
 }
 
 /// Qwen's MTP drafter (vLLM `Qwen4ExpMultiTokenPredictor`): one full-attention
@@ -67,11 +141,9 @@ pub(crate) struct MtpWeights<'a> {
     pub norm_embed: DeviceAllocation<'a>,
     pub fc_hidden: DeviceAllocation<'a>,
     pub fc_embed: DeviceAllocation<'a>,
-    /// `mtp.hyper_connection_mixer`: norm, w_down, w_up.
+    /// `mtp.hyper_connection_mixer`: norm, w_down, w_up. The drafts read the
+    /// target's head ([`Qwen4Weights::head`]).
     pub mixer: [DeviceAllocation<'a>; 3],
-    /// The drafts' E4M3 copy of the shared `lm_head` (per-row x 128-K FP32
-    /// scales) and its scales; the target keeps the BF16 head.
-    pub head_fp8: Option<(DeviceAllocation<'a>, DeviceAllocation<'a>)>,
 }
 
 impl MtpWeights<'_> {
@@ -85,10 +157,11 @@ impl MtpWeights<'_> {
 pub(crate) struct Qwen4Loader<'a> {
     pub library: &'a NativeLibrary,
     pub checkpoint: &'a Checkpoint,
-    /// Also keep E4M3 copies (FP32 128x128 block scales) of the large GDN and
-    /// attention projections for the decode programs (`*_fp8_m64`).
+    /// Hold the GDN and attention in/out projections as E4M3 with FP32 128x128
+    /// block scales only (the `qwen4_*_w8_*` programs); the BF16 source is
+    /// device staging, freed once its copy is made.
     pub fp8_decode: bool,
-    /// Scale rule of the E4M3 copies (decode projections, MTP draft head).
+    /// Scale rule of the E4M3 copies (projections, head).
     pub fp8_scales: crate::shared::fp8_linear::Fp8Scales,
     pub stream: *mut c_void,
 }
@@ -103,6 +176,7 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
 
 impl<'a> Qwen4Loader<'a> {
     pub fn tensor(&self, name: &str) -> Result<&CheckpointTensor> {
+        cuteafd_ffi::memory_ledger::tensor(name);
         let at = self.checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
             .map_err(|_| anyhow::anyhow!("checkpoint has no tensor {name}"))?;
         Ok(&self.checkpoint.tensors[at])
@@ -125,6 +199,7 @@ impl<'a> Qwen4Loader<'a> {
 
     /// The row-concatenation of BF16 2-D `names` plus `pad_rows` zero rows as one operand.
     fn rows(&self, names: &[String], pad_rows: usize) -> Result<DeviceAllocation<'a>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let tensors = names.iter().map(|n| self.raw(n).map(|t| (n, t))).collect::<Result<Vec<_>>>()?;
         let cols = tensors[0].1 .2[1];
         let rows: usize = tensors.iter().map(|(_, (_, _, shape))| shape[0]).sum::<usize>() + pad_rows;
@@ -147,6 +222,7 @@ impl<'a> Qwen4Loader<'a> {
     }
 
     fn one(&self, name: &str) -> Result<DeviceAllocation<'a>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let (bytes, dtype, _) = self.raw(name)?;
         ensure!(dtype == DType::Bf16, "{name}: coordinator tensors must be BF16, found {dtype:?}");
         self.upload(&bytes)
@@ -154,6 +230,7 @@ impl<'a> Qwen4Loader<'a> {
 
     /// A BF16 tensor widened to FP32.
     fn f32(&self, name: &str) -> Result<DeviceAllocation<'a>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("f32");
         let (bytes, dtype, _) = self.raw(name)?;
         let values = match dtype {
             DType::Bf16 => bf16_to_f32(&bytes),
@@ -225,32 +302,35 @@ impl<'a> Qwen4Loader<'a> {
             ops.insert("ple.conv_w", self.f32(&e("conv1d.weight"))?);
         }
         if self.fp8_decode {
-            let (first, second): (&'static str, &'static str) = match attention {
-                Qwen4Attention::Gdn => ("w_in", "w_out"),
-                Qwen4Attention::Full => ("w_in", "w_o"),
-            };
-            for name in [first, second] {
-                let (rows, cols) = match (attention, name) {
-                    (Qwen4Attention::Gdn, "w_in") => (cfg.gdn_conv_width() + cfg.gdn_value_width() + 2 * cfg.gdn_value_heads, cfg.hidden),
-                    (Qwen4Attention::Gdn, _) => (cfg.hidden, cfg.gdn_value_width()),
-                    (Qwen4Attention::Full, "w_in") => (cfg.attn_in_width(), cfg.hidden),
-                    (Qwen4Attention::Full, _) => (cfg.hidden, cfg.heads * cfg.head_dim),
-                };
-                let weight = ops.get(name).context("projection to quantize")?.buffer.ptr;
+            // One representation per weight: each BF16 projection is staging for its E4M3
+            // copy and is freed once the conversion has drained.
+            for projection in resident::layer_projections(cfg, attention, None) {
+                let (rows, cols) = (projection.rows, projection.cols);
+                let staging = ops.remove(projection.operand).context("projection to quantize")?;
+                ensure!(staging.buffer.bytes == resident::bf16_bytes(rows, cols),
+                    "{p} {}: BF16 [{rows}, {cols}] expected", projection.operand);
                 let q = DeviceAllocation::new(self.library, rows * cols)?;
-                let scale = DeviceAllocation::new(self.library, rows.div_ceil(128) * cols.div_ceil(128) * 4)?;
-                // SAFETY: the BF16 weight, the E4M3 copy and the scales are live device
-                // buffers of these shapes; the stream drains before they are used.
-                unsafe {
-                    self.library.fp8_quant_rule(weight, q.buffer.ptr, scale.buffer.ptr, rows, cols, false,
-                        self.fp8_scales.code(), self.stream)?;
-                    self.library.cuda_stream_synchronize(self.stream)?;
-                }
-                let (fp8, scales): (&'static str, &'static str) = match name {
-                    "w_in" => ("w_in_fp8", "w_in_scale"),
-                    "w_out" => ("w_out_fp8", "w_out_scale"),
-                    _ => ("w_o_fp8", "w_o_scale"),
+                let scale = DeviceAllocation::new(self.library, resident::fp8_block_scale_bytes(rows, cols))?;
+                // SAFETY: the BF16 staging weight, the E4M3 copy and the scales are live
+                // device buffers of these shapes; the stream drains before the staging
+                // buffer drops (on error the drain result decides, as below).
+                let launched = unsafe {
+                    self.library.fp8_quant_rule(staging.buffer.ptr, q.buffer.ptr, scale.buffer.ptr, rows, cols,
+                        false, self.fp8_scales.code(), self.stream)
                 };
+                // SAFETY: drains the conversion before its source and destinations can drop.
+                let drained = unsafe { self.library.cuda_stream_synchronize(self.stream) };
+                if let Err(drain) = drained {
+                    // Completion unknown: keep every buffer the conversion touches.
+                    self.library.quarantine_module_after_failed_drain();
+                    std::mem::forget(staging);
+                    std::mem::forget(q);
+                    std::mem::forget(scale);
+                    return Err(drain.context("FP8 projection conversion did not drain; buffers quarantined"));
+                }
+                launched?;
+                drop(staging);
+                let (fp8, scales) = resident::fp8_operands(projection.operand).context("projection operand")?;
                 ops.insert(fp8, q);
                 ops.insert(scales, scale);
             }
@@ -258,28 +338,30 @@ impl<'a> Qwen4Loader<'a> {
         Ok(Qwen4Layer { attention, operands: ops })
     }
 
-    /// Layers `0..layers` (all of them unless the caller stops early), and the
-    /// MTP layer with `mtp` (with an E4M3 draft head when `fp8_head`).
+    /// Layers `0..layers` (all of them unless the caller stops early), the MTP
+    /// layer with `mtp`, and the head shared by both: the checkpoint's BF16, or
+    /// with `fp8_head` only an E4M3 copy (quantized on the host; the BF16 head
+    /// never reaches the device).
     pub fn model(&self, cfg: &Qwen4Config, layers: usize, mtp: bool, fp8_head: bool) -> Result<Qwen4Weights<'a>> {
         let (head, dtype, shape) = self.raw("lm_head.weight")?;
         ensure!(dtype == DType::Bf16 && shape == [cfg.vocab_size, cfg.hidden], "lm_head must be BF16 [vocab, hidden]");
-        let mtp = if mtp {
-            let mut weights = self.mtp(cfg)?;
-            if fp8_head {
-                let started = std::time::Instant::now();
-                let (q, scales) = crate::families::glm5_flash::fp8::quantize(&head, cfg.vocab_size, cfg.hidden,
-                    crate::families::glm5_flash::fp8::Layout::Row128, self.fp8_scales);
-                weights.head_fp8 = Some((self.upload(&q)?, self.upload(&f32_bytes(&scales))?));
-                tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "MTP draft head quantized to E4M3");
-            }
-            Some(weights)
+        let head = if fp8_head {
+            let started = std::time::Instant::now();
+            let (q, scales) = crate::families::glm5_flash::fp8::quantize(&head, cfg.vocab_size, cfg.hidden,
+                crate::families::glm5_flash::fp8::Layout::Row128, self.fp8_scales);
+            drop(head);
+            let head = Qwen4Head::Fp8 { values: self.upload(&q)?, scales: self.upload(&f32_bytes(&scales))? };
+            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,
+                "LM head (target and MTP) quantized to E4M3; no BF16 head is resident");
+            head
         } else {
-            None
+            Qwen4Head::Bf16(self.upload(&head)?)
         };
+        let mtp = if mtp { Some(self.mtp(cfg)?) } else { None };
         Ok(Qwen4Weights {
             layers: (0..layers.min(cfg.layers)).map(|l| self.layer(cfg, l)).collect::<Result<_>>()?,
             mixer: self.hc(&format!("{PREFIX}hyper_connection_mixer"), false)?,
-            head: self.upload(&head)?,
+            head,
             mtp,
         })
     }
@@ -294,7 +376,29 @@ impl<'a> Qwen4Loader<'a> {
             fc_hidden: self.one("mtp.fc_hidden.weight")?,
             fc_embed: self.one("mtp.fc_embedding.weight")?,
             mixer: self.hc("mtp.hyper_connection_mixer", false)?,
-            head_fp8: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::projection_residency;
+
+    #[test]
+    fn a_projection_is_resident_in_exactly_one_representation() {
+        projection_residency(&["w_in", "w_out", "conv_w"], false).unwrap();
+        projection_residency(&["w_in", "w_o", "q_norm"], false).unwrap();
+        projection_residency(&["w_in_fp8", "w_in_scale", "w_out_fp8", "w_out_scale"], true).unwrap();
+        projection_residency(&["w_in_fp8", "w_in_scale", "w_o_fp8", "w_o_scale"], true).unwrap();
+        // Dual copies (the old decode-only E4M3 route) are refused either way.
+        for fp8 in [false, true] {
+            let error = projection_residency(&["w_in", "w_in_fp8", "w_in_scale", "w_o", "w_o_fp8", "w_o_scale"], fp8)
+                .unwrap_err().to_string();
+            assert!(error.contains("BF16 and as E4M3"), "{error}");
+        }
+        assert!(projection_residency(&["w_in", "w_out"], true).is_err());
+        assert!(projection_residency(&["w_in_fp8", "w_in_scale", "w_o_fp8", "w_o_scale"], false).is_err());
+        assert!(projection_residency(&["w_in_fp8", "w_out_fp8", "w_out_scale"], true).is_err());
+        assert!(projection_residency(&["w_in"], false).is_err());
     }
 }
