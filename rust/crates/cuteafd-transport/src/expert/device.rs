@@ -256,11 +256,23 @@ impl SparkDeviceLane {
             let mut expected = ready_word.load(Ordering::Acquire);
             done_word.store(expected, Ordering::Release);
             let mut last = Instant::now();
+            let mut stalled_logged = false;
             while !state.stop.load(Ordering::Relaxed) {
                 let published = ready_word.load(Ordering::Acquire);
                 if published == expected {
                     let outstanding = state.announced.load(Ordering::Acquire) > state.completed.load(Ordering::Acquire);
                     let idle = last.elapsed();
+                    if outstanding && idle > Duration::from_secs(5) && !stalled_logged {
+                        // An announced wave the GPU has not published: report the
+                        // sequences once (a wedged step, not a slow one).
+                        stalled_logged = true;
+                        let word = |offset| mailbox.word(offset).load(Ordering::Acquire);
+                        tracing::error!(announced = state.announced.load(Ordering::Acquire),
+                            completed = state.completed.load(Ordering::Acquire), expected, ready = published,
+                            done = word(mailbox::DONE), send_state = word(mailbox::SEND_STATE),
+                            recv_state = word(mailbox::RECV_STATE), idle_ms = idle.as_millis() as u64,
+                            "device lane: an announced wave has not been published for 5 s");
+                    }
                     if outstanding || idle < SPIN_AFTER {
                         // A step is in flight (or just ended): its next wave
                         // follows within a layer's time.
@@ -295,6 +307,7 @@ impl SparkDeviceLane {
                     continue;
                 }
                 let seen = Instant::now();
+                stalled_logged = false;
                 fence(Ordering::Acquire);
                 let result = (|| -> Result<()> {
                     ensure!(published == expected.wrapping_add(1),
