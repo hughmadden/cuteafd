@@ -168,6 +168,20 @@ if [[ -n "$expert_input" ]]; then
     *) echo "EXPERT_INPUT must be fp8, bf16 or bf16-decode" >&2; exit 2 ;;
   esac
 fi
+# Qwen 3.8: QWEN_FP8_DECODE=on|off converts the GDN/attention projections to one
+# resident E4M3 copy; QWEN_FP8_HEAD=on|off does the same for the head target and
+# MTP share. Unset keeps the engine defaults.
+if [[ $family == qwen4 ]]; then
+  for key in FP8_DECODE:--fp8-decode FP8_HEAD:--mtp-fp8-head; do
+    mode="$(get "QWEN_${key%%:*}")"
+    case "$mode" in
+      "") ;;
+      on) family_args+=("${key#*:}" true) ;;
+      off) family_args+=("${key#*:}" false) ;;
+      *) echo "QWEN_${key%%:*} must be on or off" >&2; exit 2 ;;
+    esac
+  done
+fi
 [[ ! $family =~ ^(glm5|qwen4|deepseek_v4)$ || -z "$(get POOL_TOKENS)" ]] || family_args+=(--pool-tokens "$(get POOL_TOKENS)")
 # GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
 # from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" requires native
