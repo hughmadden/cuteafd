@@ -258,6 +258,8 @@ pub(crate) struct DsparkDrafter<'a> {
     norm: Dev<'a>,
     markov_w1: Dev<'a>,
     markov_w2: Dev<'a>,
+    /// Row norms of `markov_w2` (FP32): the exact pruning bound of the Markov argmax.
+    markov_norms: Dev<'a>,
     confidence_w: Dev<'a>,
     confidence_b: Dev<'a>,
     layers: Vec<DraftLayer<'a>>,
@@ -343,6 +345,11 @@ impl<'a> DsparkDrafter<'a> {
             })
         }).collect::<Result<Vec<_>>>()?;
         let taps = cfg.taps.len() * h;
+        let markov_w2 = tensor("markov_head.markov_w2.weight", &[cfg.vocab, cfg.rank])?;
+        let markov_norms = DeviceAllocation::new(library, cfg.vocab * 4)?;
+        // SAFETY: both buffers hold `vocab` rows; the stream orders the kernel before any draft.
+        unsafe { library.glmf_dspark_markov_norms(markov_w2.buffer.ptr, markov_norms.buffer.ptr, cfg.vocab, cfg.rank,
+            stream)? };
         Ok(Self {
             library,
             stream,
@@ -352,7 +359,8 @@ impl<'a> DsparkDrafter<'a> {
             hidden_norm: tensor("hidden_norm.weight", &[h])?,
             norm: tensor("norm.weight", &[h])?,
             markov_w1: tensor("markov_head.markov_w1.weight", &[cfg.vocab, cfg.rank])?,
-            markov_w2: tensor("markov_head.markov_w2.weight", &[cfg.vocab, cfg.rank])?,
+            markov_w2,
+            markov_norms,
             confidence_w: tensor("confidence_head.proj.weight", &[1, h + cfg.rank])?,
             confidence_b: tensor("confidence_head.proj.bias", &[1])?,
             layers,
@@ -516,7 +524,7 @@ impl<'a> DsparkDrafter<'a> {
             tables: alloc(3 * sequences * 4)?,
             attention_workspace: alloc(self.library.glmf_dspark_attention_workspace(sequences, c.kv_heads,
                 RING + c.block)?)?,
-            markov_workspace: alloc(self.library.glmf_dspark_markov_workspace(sequences)?)?,
+            markov_workspace: alloc(self.library.glmf_dspark_markov_workspace(sequences, c.block)?)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
                 rows as u32, c.vocab as u32)? },
@@ -621,7 +629,7 @@ impl<'a> DsparkDrafter<'a> {
                     rows, h, c.vocab, s)?,
             }
             l.glmf_dspark_markov(w.logits.buffer.ptr, self.markov_w1.buffer.ptr, self.markov_w2.buffer.ptr,
-                w.anchors.buffer.ptr, w.tokens.buffer.ptr, w.markov_workspace.buffer.ptr, s_count, block, c.vocab,
+                self.markov_norms.buffer.ptr, w.anchors.buffer.ptr, w.tokens.buffer.ptr, w.markov_workspace.buffer.ptr, s_count, block, c.vocab,
                 c.rank, s)?;
             l.glmf_dspark_confidence(w.n.buffer.ptr, self.markov_w1.buffer.ptr, self.confidence_w.buffer.ptr,
                 self.confidence_b.buffer.ptr, w.anchors.buffer.ptr, w.tokens.buffer.ptr, w.confidence.buffer.ptr,

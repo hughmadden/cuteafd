@@ -72,25 +72,36 @@ impl NativeLibrary {
     }
 
     /// Workspace bytes [`Self::glmf_dspark_markov`] needs.
-    pub fn glmf_dspark_markov_workspace(&self, sequences: usize) -> Result<usize> {
-        type F = unsafe extern "C" fn(i32) -> u64;
+    pub fn glmf_dspark_markov_workspace(&self, sequences: usize, block: usize) -> Result<usize> {
+        type F = unsafe extern "C" fn(i32, i32) -> u64;
         let f = *unsafe { self.lib.get::<F>(b"cuteafd_glmf_dspark_markov_workspace") }?;
-        Ok(usize::try_from(unsafe { f(i(sequences)?) })?)
+        Ok(usize::try_from(unsafe { f(i(sequences)?, i(block)?) })?)
+    }
+
+    /// `norms` [vocab] F32 = row norms of the Markov projection `w2` (BF16 [vocab, rank]).
+    ///
+    /// # Safety
+    /// As [`Self::glmf_dspark_qk_rope`].
+    pub unsafe fn glmf_dspark_markov_norms(&self, w2: P, norms: M, vocab: usize, rank: usize, stream: M) -> Result<()> {
+        type F = unsafe extern "C" fn(P, M, i32, i32, M) -> i32;
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_glmf_dspark_markov_norms") }?;
+        check(unsafe { f(w2, norms, i(vocab)?, i(rank)?, stream) }, "Markov norms")
     }
 
     /// Greedy drafts [sequences, block] U32 from head `logits` [sequences *
-    /// block, vocab] FP32 plus the Markov bias (`w1`, `w2` BF16 [vocab, 256]);
-    /// step 0 conditions on `anchors` [sequences] U32. At most 32 sequences.
+    /// block, vocab] FP32 plus the Markov bias (`w1`, `w2` BF16 [vocab, 256],
+    /// `norms` from [`Self::glmf_dspark_markov_norms`]); step 0 conditions on
+    /// `anchors` [sequences] U32. At most 32 sequences.
     ///
     /// # Safety
     /// As [`Self::glmf_dspark_qk_rope`].
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn glmf_dspark_markov(&self, logits: P, w1: P, w2: P, anchors: P, drafts: M, workspace: M,
+    pub unsafe fn glmf_dspark_markov(&self, logits: P, w1: P, w2: P, norms: P, anchors: P, drafts: M, workspace: M,
         sequences: usize, block: usize, vocab: usize, rank: usize, stream: M) -> Result<()> {
-        type F = unsafe extern "C" fn(P, P, P, P, M, M, i32, i32, i32, i32, M) -> i32;
+        type F = unsafe extern "C" fn(P, P, P, P, P, M, M, i32, i32, i32, i32, M) -> i32;
         let f = *unsafe { self.lib.get::<F>(b"cuteafd_glmf_dspark_markov") }?;
         check(unsafe {
-            f(logits, w1, w2, anchors, drafts, workspace, i(sequences)?, i(block)?, i(vocab)?, i(rank)?, stream)
+            f(logits, w1, w2, norms, anchors, drafts, workspace, i(sequences)?, i(block)?, i(vocab)?, i(rank)?, stream)
         }, "Markov drafts")
     }
 
