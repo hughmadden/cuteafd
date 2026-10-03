@@ -781,7 +781,11 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
    256, so six Sparks save only ~5% Spark time (the width-384 package ran
    128-wide tiles). Fork f6bb38bc (dynamic tile claims, FP8 wire input,
    192-wide TP6 tiles; bit-identical) cuts live waves to 11.24 / 9.87 / 7.05
-   ms and Spark busy per 8K to 2.62 s (TP4) / 2.30 s (TP6); still Spark-bound,
+   ms and Spark busy per 8K to 2.62 s (TP4) / 2.30 s (TP6); still Spark-bound.
+   Served 8K TTFT with E4M3 MLA + these packages vs v0.1.0 (2026-10-04, one
+   launch per arm): max 2.96-2.99 -> 2.49-2.64 s, min 3.08-3.11 -> 2.82-2.91 s;
+   C1 code flat (max ~68, min 58-61; text changes with the MLA numerics); C4 is
+   dominated by within-batch greedy divergence (item 4d) in every arm,
    and the head split only moves the wait from the GPU to the Sparks. GB10's
    wave is bound by bytes (FC1 BF16 input gathers per N tile, FC2 partial
    round trip ~2 ms, top-k sum 1.6 ms) and the FC1 rotation, not MMA rate.
