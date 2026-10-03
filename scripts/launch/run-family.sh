@@ -174,6 +174,18 @@ if [[ $serve != serve-dsv4 ]]; then
   [[ -z "$(get FP8_SCALES)" ]] || family_args+=(--fp8-scales "$(get FP8_SCALES)")
   if [[ ${#draft_args[@]} -gt 0 && "$(key SPECULATOR_FP8 DRAFT_FP8 on)" == off ]]; then family_args+=(--draft-fp8 false); fi
 fi
+# DRAFT_FIXED=N: a fixed neural draft count per step instead of the adaptive plan
+# (serve-glm, serve-mimo; byte-exact A/B checks).
+if [[ -n "$(get DRAFT_FIXED)" ]]; then
+  [[ $serve =~ ^serve-(glm|mimo)$ ]] || { echo "DRAFT_FIXED applies to GLM 5.3 and MiMo checkpoints" >&2; exit 2; }
+  family_args+=(--draft-fixed "$(get DRAFT_FIXED)")
+fi
+# Opt-in engine switches set in the launching environment reach the coordinator
+# (CUTEAFD_SPARK_DEVICE=1: decode/verify waves on the device-driven Spark exchange).
+switch_args=()
+for switch_name in CUTEAFD_SPARK_DEVICE CUTEAFD_SPARK_WRITE CUTEAFD_MIMO_DECODE_GRAPHS; do
+  [[ -z "${!switch_name:-}" ]] || switch_args+=(-e "$switch_name=${!switch_name}")
+done
 # SERVED_MODEL_ID: the public model id (default: the checkpoint's Hugging Face id).
 served_args=()
 served="$(get SERVED_MODEL_ID)"
@@ -313,7 +325,7 @@ case "$console_text" in on|off) ;; *) echo "CONSOLE_TEXT must be on or off" >&2;
 docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network host --ipc host \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e "CUTEAFD_SPARK_INTAKE=$intake" \
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" \
-  -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" \
+  -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" "${switch_args[@]}" \
   -v "$hub:/root/.cache/huggingface/hub:ro" -v "$bench_dir:/root/.cache/cuteafd/bench" \
   "${trace_args[@]}" "$coordinator_image" cuteafd $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
