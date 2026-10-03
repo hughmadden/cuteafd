@@ -1168,9 +1168,9 @@ impl<'a> MimoEngine<'a> {
         };
         let bf16_input = matches!(self.experts, Some(Experts::Spark { .. })) && self.expert_input.bf16(true);
         let direct = self.direct_segments.get();
-        if let (true, true, false, true, Some(link)) =
-            (launch, device, direct, crate::shared::spark_intake::device_step_graphs(), &self.device_link) {
-            return self.decode_step_graph(link, w, w1, tables, t, gather, head);
+        if let (true, false, true, Some(link)) =
+            (device, direct, crate::shared::spark_intake::device_step_graphs(), &self.device_link) {
+            return self.decode_step_graph(link, w, w1, tables, t, gather, head, launch);
         }
         for index in 0..=layers.len() {
             let previous = self.previous(index);
@@ -1218,13 +1218,16 @@ impl<'a> MimoEngine<'a> {
 
     /// A decode step under the device exchange as one graph per GPU (`CUTEAFD_SPARK_DEVICE_STEP=1`):
     /// the segments of [`Self::decode_layers`] back to back, captured the first time a shape is seen
-    /// (`layer: usize::MAX` keys a whole step).
+    /// (`layer: usize::MAX` keys a whole step; no per-segment graphs). `launch` false only captures
+    /// ([`Self::capture_decode_graphs`]).
     #[allow(clippy::too_many_arguments)]
     fn decode_step_graph(&self, link: &crate::shared::spark_intake::SparkDeviceLink<'_>, w: &Workspace<'_>,
-        w1: Option<&Workspace<'_>>, tables: &StepTables, t: usize, gather: bool, head: bool) -> Result<()> {
+        w1: Option<&Workspace<'_>>, tables: &StepTables, t: usize, gather: bool, head: bool, launch: bool) -> Result<()> {
         let key = GraphKey { layer: usize::MAX, rows: t, table_stride: tables.table_stride, previous: Previous::First, head };
         if !self.graphs.borrow().contains_key(&key) {
-            self.late_captures.set(self.late_captures.get() + 1);
+            if launch {
+                self.late_captures.set(self.late_captures.get() + 1);
+            }
             // SAFETY: capture records launches on both ranks' streams (thread-local
             // mode); nothing in the segments synchronizes the host.
             self.on(0, || unsafe { self.library.cuda_graph_begin_capture(self.stream) })?;
@@ -1243,6 +1246,9 @@ impl<'a> MimoEngine<'a> {
                 peer.graphs.borrow_mut().insert(key, GraphExec(second, self.library));
             }
             tracing::debug!(rows = t, "MiMo decode step captured whole");
+        }
+        if !launch {
+            return Ok(());
         }
         let waves = self.weights.layers.iter().filter(|l| !l.dense).count();
         // Announced before the replay can publish them: the proxy spins for them.
