@@ -12,6 +12,17 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
         placement: ExpertPlacement::from_spark_ranks(args.spark_ranks),
         spark_budget_bytes: budget_bytes("--spark-budget-gib", args.spark_budget_gib)?,
         coordinator_budget_bytes: budget_bytes("--coordinator-budget-gib", args.coordinator_budget_gib)?,
+        layout: args.layout.then(|| -> Result<_, PlanError> {
+            if !(1..=2).contains(&args.rtx) {
+                return Err(PlanError::InvalidOption { option: "--rtx", reason: "1 or 2 coordinator GPUs".into() });
+            }
+            Ok(cuteafd_loader::plan::layout::LayoutOptions {
+                rtx_bytes: vec![budget_bytes("--rtx-gib", args.rtx_gib)?; args.rtx],
+                pool_tokens: args.pool_tokens,
+                drafter_bytes: if args.drafter_gib > 0.0 { budget_bytes("--drafter-gib", args.drafter_gib)? } else { 0 },
+                ..Default::default()
+            })
+        }).transpose()?,
     };
     options.validate()?;
     Ok(options)
@@ -47,6 +58,9 @@ pub(crate) fn run_plan(args: PlanArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print!("{}", render(&report));
+        if let Some(layout) = &report.memory_layout {
+            print!("\nmemory layout (planner)\n{}", layout.render());
+        }
     }
     if args.require_ready && !report.executable() {
         anyhow::bail!("{} is not servable by this build", args.model);
@@ -70,6 +84,11 @@ mod tests {
             coordinator_budget_gib: 80.0,
             json: true,
             require_ready,
+            layout: true,
+            rtx: 2,
+            rtx_gib: 95.5,
+            pool_tokens: None,
+            drafter_gib: 0.0,
         }
     }
 

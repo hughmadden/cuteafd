@@ -6,6 +6,7 @@ pub mod families;
 pub mod family;
 pub mod format;
 pub mod launch;
+pub mod layout;
 pub mod names;
 pub mod spec;
 #[doc(hidden)]
@@ -150,6 +151,9 @@ pub struct PlanReport {
     /// Where the expert service read the routed EXL3 storage layout from.
     pub expert_storage: Option<crate::formats::exl3_storage::Exl3StorageSource>,
     pub hints: Vec<Hint>,
+    /// Per-device memory layout, when requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_layout: Option<cuteafd_core::memory_layout::MemoryLayout>,
 }
 
 impl PlanReport {
@@ -164,7 +168,7 @@ impl PlanReport {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PlanOptions {
     pub placement: ExpertPlacement,
     /// Routed-expert bytes one Spark rank may hold (weights only).
@@ -172,6 +176,8 @@ pub struct PlanOptions {
     /// Weight bytes the coordinator GPU may hold (its own tensors, plus every
     /// routed expert in the local-only placement).
     pub coordinator_budget_bytes: u64,
+    /// Also lay out every device's memory (`plan --layout`).
+    pub layout: Option<layout::LayoutOptions>,
 }
 
 impl Default for PlanOptions {
@@ -180,6 +186,7 @@ impl Default for PlanOptions {
             placement: ExpertPlacement::Sparks { ranks: 4 },
             spark_budget_bytes: 100 << 30,
             coordinator_budget_bytes: 80 << 30,
+            layout: None,
         }
     }
 }
@@ -251,6 +258,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         launch: launch::describe(&checkpoint.config).ok(),
         expert_storage: None,
         hints: Vec::new(),
+        memory_layout: None,
     };
     // ModelOpt exports describe what they quantized; each weight's tensors
     // must agree with that description.
@@ -399,6 +407,9 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
         });
     }
     place(&mut report, options, spec, model.as_ref(), &routed_operands);
+    if let Some(layout_options) = &options.layout {
+        report.memory_layout = Some(layout::layout(&report, model.as_ref(), layout_options));
+    }
     if !report.unclassified.is_empty() {
         report.hints.push(Hint {
             what: format!("{} tensors match no {} rule", report.unclassified.len(), family.id()),
