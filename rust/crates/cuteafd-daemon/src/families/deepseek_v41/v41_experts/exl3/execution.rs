@@ -89,8 +89,19 @@ struct Manifest {
     paired_boundary: Option<String>,
     descriptor_rows: Option<usize>,
     native_info_version: Option<u32>,
+    /// `e4m3_k32`: the core reads E4M3 + UE8M0 K32 wire rows itself (no
+    /// BF16 decode pass); absent or `bf16`: BF16 rows.
+    #[serde(default)]
+    input_format: Option<String>,
 }
 impl Manifest {
+    fn wire_input(&self) -> Result<bool> {
+        match self.input_format.as_deref() {
+            None | Some("bf16") => Ok(false),
+            Some("e4m3_k32") => Ok(true),
+            Some(other) => anyhow::bail!("unknown EXL3 input format {other}"),
+        }
+    }
     fn native_layout(&self) -> Result<V41Exl3Layout> {
         match self.paired_boundary.as_deref() {
             None => {
@@ -117,7 +128,7 @@ impl Manifest {
                     .context("EXL3 workspace budget overflow")?;
             }
         }
-        if format == Exl3InputFormat::Fp8K32 {
+        if format == Exl3InputFormat::Fp8K32 && !self.wire_input()? {
             bytes = bytes
                 .checked_add(
                     self.capacity
@@ -253,6 +264,8 @@ pub(crate) struct Exl3Execution<'a> {
     kernel: V41Exl3Kernel,
     routes: Option<V41Exl3Routes>,
     wire: Option<(cuteafd_ffi::V41Exl3Wire<'a>, DeviceAllocation<'a>)>,
+    /// Inputs arrive as wire rows (decoded by `wire`, or read by the core).
+    wire_rows: bool,
     _storage: Vec<DeviceAllocation<'a>>,
     _shared_workspace: Option<Rc<Exl3Workspace<'a>>>,
     // Keep every prebound pointer alive through the last graph replay.
@@ -325,6 +338,9 @@ impl<'a> Exl3Execution<'a> {
     ) -> Result<Self> {
         let meta: Manifest =
             serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
+        let core_reads_wire = meta.wire_input()?;
+        ensure!(!core_reads_wire || format == Exl3InputFormat::Fp8K32,
+            "EXL3 wire-input export requires FP8 K32 expert inputs");
         let lock: serde_json::Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../../third_party/sparkinfer.lock.json"
@@ -578,7 +594,7 @@ impl<'a> Exl3Execution<'a> {
                 path.parent().unwrap().join("libv41_exl3_routes.so"),
             )?)
         };
-        let wire = if format == Exl3InputFormat::Fp8K32 {
+        let wire = if format == Exl3InputFormat::Fp8K32 && !core_reads_wire {
             // The router's hidden-wide wire row is replicated across TP ranks;
             // only intermediate expert weights are sliced. Local RTX TP1/TP2
             // therefore use the same decoder as Spark TP4.
@@ -593,6 +609,7 @@ impl<'a> Exl3Execution<'a> {
             kernel,
             routes,
             wire,
+            wire_rows: format == Exl3InputFormat::Fp8K32,
             _storage: storage,
             _shared_workspace: shared,
             _weights: weights,
@@ -693,7 +710,7 @@ impl<'a> Exl3Execution<'a> {
             "EXL3 execution on wrong device"
         );
         for (buffer, bytes) in inputs.iter().zip([
-            rows * if self.wire.is_some() { self.hidden + self.hidden / 32 } else { self.hidden * 2 },
+            rows * if self.wire_rows { self.hidden + self.hidden / 32 } else { self.hidden * 2 },
             rows * self.topk * 4,
             rows * self.topk * 4,
         ]) {

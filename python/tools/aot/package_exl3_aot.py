@@ -104,6 +104,8 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             raise ValueError(f'EXL3 variant fused input rotation mismatch: {directory}')
         if variant.get('warp_specialized', False) != meta.get('warp_specialized', False):
             raise ValueError(f'EXL3 variant warp specialization mismatch: {directory}')
+        if variant.get('input_format', 'bf16') != meta.get('input_format', 'bf16'):
+            raise ValueError(f'EXL3 variant input format mismatch: {directory}')
         if variant.get('token_major_rotation', False) != meta.get('token_major_rotation', False):
             raise ValueError(f'EXL3 variant input rotation mismatch: {directory}')
         if meta['capacity'] in overrides and meta.get('blocks_per_sm') != overrides[meta['capacity']]:
@@ -342,6 +344,57 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> boo
     return capacity >= 256
 
 
+# Warp-specialized tile (fc1_k, fc1_n, fc2_k, fc2_n) of widths that are odd
+# multiples of 128 and multiples of 192 (GLM 5.3 TP6 width 384).
+TILE_384 = (64, 192, 64, 256)
+
+
+def wire_input(geometry: str, role: str, width: int, capacity: int) -> bool:
+    """Whether a warp-specialized export reads the FP8 E4M3 + UE8M0 K32 wire
+    rows itself (the worker then skips its BF16 decode pass and FC1 gathers
+    half the bytes). Bit-identical. One of the GLM 5.3 GB10 changes below.
+    GB10 (dodo), GLM 5.3 K4/K5 tiers, layer 40 slices, random top-8 routes,
+    kernel + top-k sum, median of 3 interleaved runs, ms (m2752 / m4096), all
+    bit-identical to the static cooperative-order exports, run-to-run exact:
+    width 512 14.50 / 15.42 -> 11.07 / 14.33; 384 11.88 / 14.89 -> 9.70 / 13.11
+    (with the 192-wide tile); 256 9.04 / 10.15 -> 7.34 / 9.36. Four input
+    stages instead of three lose 0.2-0.8 ms at every width on K4/K5. Measured on
+    GLM 5.3 only: GLM 5.3 Flash and V4 Pro keep the former exports until measured.
+    """
+    return geometry == 'glm' and warp_specialized(geometry, role, width, capacity)
+
+
+def ws_input_stages(geometry: str, role: str, width: int, capacity: int) -> int | None:
+    """Input-row ring depth of the Spark warp-specialized exports: GB10 gathers
+    the routed rows from LPDDR5X at high latency, and four stages (the ring the
+    weight ring of 256-wide 4-bit tiles leaves room for) hide it; with K4/K5
+    tiers three stages measure faster than four (see `wire_input`). Bit-identical.
+    """
+    return 3 if geometry == 'glm' and warp_specialized(geometry, role, width, capacity) else None
+
+
+def ws_dynamic_tiles(geometry: str, role: str, width: int, capacity: int) -> bool:
+    """Whether Spark warp-specialized exports claim tiles dynamically. With the
+    static round-robin an expert's route blocks start on different CTAs at
+    different times and each streams the expert's weights from LPDDR5X (ncu,
+    width 512 m2752: FC1 fills 1761 MB of LPDDR5X for 805 MB of weights).
+    Bit-identical; the largest of the GLM 5.3 GB10 gains (see `wire_input`).
+    """
+    return geometry == 'glm' and warp_specialized(geometry, role, width, capacity)
+
+
+def ws_tile(geometry: str, role: str, width: int, capacity: int) -> tuple[int, ...] | None:
+    """Warp-specialized tile for widths that are odd multiples of 128, which
+    the B12x policy gives 128-wide tiles on both stages (four consumer warps).
+    Bit-identical (the N tiling does not change any accumulation). Width 384
+    (GLM 5.3 TP6 ranks 0-3) takes 192-wide FC1 tiles: m4096 14.89 -> 12.8 ms.
+    """
+    if (geometry != 'glm' or not warp_specialized(geometry, role, width, capacity)
+            or width % 256 != 128 or width % 192):
+        return None
+    return TILE_384
+
+
 def package_name(geometry: str, bits: list[int]) -> str:
     """Package directory for one tier family; mirrors the daemon's resolver."""
     tag = ''.join(map(str, bits))
@@ -536,6 +589,14 @@ def build(args: argparse.Namespace) -> None:
                     options['route_block'] = block
                 if ws:
                     options['warp_specialized'] = True
+                    if wire_input(geometry, args.role, width, capacity):
+                        options['wire_input'] = True
+                    if (stages := ws_input_stages(geometry, args.role, width, capacity)) is not None:
+                        options['ws_input_stages'] = stages
+                    if ws_dynamic_tiles(geometry, args.role, width, capacity):
+                        options['ws_dynamic_tiles'] = True
+                    if (policy_tile := ws_tile(geometry, args.role, width, capacity)) is not None:
+                        options['tile'] = policy_tile
                 elif tile is None and fused_input_rotation(geometry, args.role, width, capacity):
                     options['fused_input_rotation'] = True
                 elif token_major_rotation(geometry, capacity):
@@ -581,6 +642,8 @@ def build(args: argparse.Namespace) -> None:
                         variant['fused_input_rotation'] = True
                     if meta.get('warp_specialized'):
                         variant['warp_specialized'] = True
+                    if 'input_format' in meta:
+                        variant['input_format'] = meta['input_format']
                     variants.append(variant)
                     if paired:
                         variants[-1]['paired_boundary'] = meta['paired_boundary']

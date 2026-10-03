@@ -775,8 +775,10 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
    GLM 5.3 (2026-10-03, `work/glm-perf`): 8K prefill is ~3.0 s on min and max
    alike because both are Spark-bound — worker kernel time per 2752-row wave
    (3 lanes) is 11.7 ms at TP4 width 512, 11.0 at TP6 width 384, 7.6 at width
-   256, so six Sparks save only ~5% Spark time (the width-384 package runs
-   128-wide tiles; a 192-wide WS tile is on fork `cuteafd/exl3-gb10-bytes`),
+   256, so six Sparks save only ~5% Spark time (the width-384 package ran
+   128-wide tiles). Fork f6bb38bc (dynamic tile claims, FP8 wire input,
+   192-wide TP6 tiles; bit-identical) cuts live waves to 11.24 / 9.87 / 7.05
+   ms and Spark busy per 8K to 2.62 s (TP4) / 2.30 s (TP6); still Spark-bound,
    and the head split only moves the wait from the GPU to the Sparks. GB10's
    wave is bound by bytes (FC1 BF16 input gathers per N tile, FC2 partial
    round trip ~2 ms, top-k sum 1.6 ms) and the FC1 rotation, not MMA rate.

@@ -508,8 +508,8 @@ pub(crate) struct GlmfEngine<'a> {
     /// The head split's second GPU and the exchange between the two.
     peer: Option<GlmfPeer<'a>>,
     exchange: Option<PeerExchange<'a>>,
-    /// The DFlash2 drafter: every step taps its target layers.
-    pub drafter: Option<crate::families::glm5::dflash::GlmDrafter<'a>>,
+    /// The drafter (DFlash2 or dSpark): every step taps its target layers.
+    pub drafter: Option<super::dspark::Drafter<'a>>,
     /// L2 prefetch of the next layer's weights during decode exchanges.
     pub l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
     /// Host copy of the caches' pool-page map (a shared pool page sits at the same logical

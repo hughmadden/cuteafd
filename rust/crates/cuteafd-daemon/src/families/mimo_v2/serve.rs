@@ -967,6 +967,7 @@ fn plan_drafts(active: &[Active<'_>], drafted: &[Option<super::dflash::Draft>], 
         confidence: active[i].drafts.conditional(width(i)),
         room: limits[i],
         members: 1,
+        informed: false,
     }).collect();
     let others = active.len() - indices.len();
     for (&i, n) in indices.iter().zip(dflash_policy::plan(&groups, (others, others), cost)) {

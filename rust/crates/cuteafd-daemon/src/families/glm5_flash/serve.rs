@@ -143,15 +143,17 @@ fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
     layout.concurrency = args.max_sequences.min(DECODE_ROWS);
     let copy = if args.no_copy_drafts { "" } else { " · copy windows" };
     let policy = args.draft_fixed.map_or_else(|| "adaptive".to_string(), |n| format!("fixed {n}"));
-    layout.speculator = match (&args.engine.draft, args.no_copy_drafts) {
-        (Some(_), _) => Some(console::Speculator { name: "DFlash2".into(), positions: 8, policy: policy + copy }),
+    let drafter = args.engine.draft.as_deref()
+        .map(|snapshot| if super::dspark::is_dspark(snapshot) { "dSpark" } else { "DFlash2" });
+    layout.speculator = match (drafter, args.no_copy_drafts) {
+        (Some(name), _) => Some(console::Speculator { name: name.into(), positions: 8, policy: policy + copy }),
         (None, false) => Some(console::Speculator { name: "Copy window".into(), positions: COPY_DRAFT,
             policy: "adaptive length".into() }),
         (None, true) => None,
     };
     layout.steps = vec![
         StepGroup::new("Decode step", "host clock", &[("round.cycle", "step", Target),
-            ("draft", "DFlash2 draft", Accepted), ("plan", "draft plan + copy windows", Ink),
+            ("draft", "block draft", Accepted), ("plan", "draft plan + copy windows", Ink),
             ("verify", "verify pass + token selection", Target), ("emit", "accept + stream", Ink),
             ("commit", "KDA commit + drafter context", Accepted)]),
         StepGroup::new("Verify pass", "host clock, engine phases", &[
@@ -420,7 +422,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         &opened.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, engine.cfg.eos.clone());
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
     let drafter = engine.drafter.as_ref();
-    let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
+    let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots()).rev().collect());
     // The TP2 table also prices TP4 as served (its observed ratio settles the
     // level); TP6 scales the Spark share by its widest slice against TP4's.
     let table = match ranks {
@@ -737,7 +739,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         }
                     }
                     // Drafts only speed decoding up; the step verifies the next tokens alone.
-                    Err(error) => tracing::warn!("DFlash2 draft failed: {error:#}"),
+                    Err(error) => tracing::warn!("{} draft failed: {error:#}", drafter.name()),
                 }
                 out
             }
@@ -749,6 +751,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let key = |a: &Active<'_>| (a.placement.len, a.digest);
         let inputs: Vec<dflash_policy::PlanInput<'_>> = active.iter().enumerate().map(|(i, a)| dflash_policy::PlanInput {
             key: key(a), history: &a.drafts, features: drafted[i].as_ref().map(|d| d.features.as_slice()),
+            confidence: drafted[i].as_ref().map(|d| d.confidence.as_slice()).filter(|c| !c.is_empty()),
             limit: limits[i],
         }).collect();
         let plan_timer = Instant::now();
