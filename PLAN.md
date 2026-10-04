@@ -715,29 +715,37 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
    Spark worker loop, then IBGDA (GPU rings the NIC doorbell) to drop the
    proxy. Projection (V4.1, `ae91c6a`): exchange alone C1 +5–7% / C4 +3–6%;
    with whole-step graphs C1 +10–15% / C4 +8–12%.
-   State at 057be61 (WIP, all behind env switches, default byte-identical):
-   decision B (retrofit V4.1; both engines share one device exchange,
-   `SparkDeviceLane`, idle 0.6% of a core, ~5 µs wake). V4 Flash
-   `CUTEAFD_SPARK_DEVICE=1`: decode 13.2 → 13.1 ms, verify 4.7 → 4.5 ms.
-   V4.1 `CUTEAFD_V41_DEVICE=1` (one lane device-ordered): 2 RTX C1 185.5 →
-   192.9 (+4%), C4 flat; 1 RTX +1%; greedy byte-identical with the fixed draft
-   policy. Spark worker host cost ~20 of ~544 µs (GB10 expert kernel ~510 µs:
-   TP6 is the bigger lever); worker now parks after 5 ms idle. Next: test the
-   built-but-unrun GPU-direct receive (`CUTEAFD_SPARK_WRITE=1`, `v41-ab2.sh
-   v41-2rtx-w.config 2rtx-w 0 1 1+write`); fix corruption with both lanes
-   device-ordered (`CUTEAFD_V41_DEVICE_LANES=1`, 0/10 consistent C4); whole-step
-   graphs (D4); recheck head split; full parity. IBGDA is possible
-   (ConnectX-7 fw 28.43/28.45) but needs `PeerMappingOverride=1` on raptor.
-   Gotchas: build with `build-coord.sh`/`build-spark.sh` in
-   `~/.cache/cuteafd/builds/v41-device` (Spark build on moa as root; artifacts
-   relay via raptor); use the fixed draft policy for byte-exact A/B;
-   `chain::settle` must stay a host wait.
+   State (2026-10-04, merged into work/p0 at db9ed89; all opt-in, default unchanged
+   except the single-RTX head keeping one graph per verify width): `SparkDeviceLane`
+   proxy, V4 `CUTEAFD_SPARK_DEVICE=1`, V4.1 `CUTEAFD_V41_DEVICE=1` (device-ordered
+   verify passes: chained SM handoff between RTX, chained split head, engram uploads
+   in the chain, per-layer staging, 60 s watchdog that logs lane sequences and exits).
+   Both lanes device-ordered are consistent now (codex's attention-staging fence).
+   Spark worker idle loop that waited on one connection (aa507bd) stalled device
+   waves: reverted. Code case, warm, 325 W, one launch per arm: 2 RTX + 4 Sparks
+   C1 190.4/192.4 → 194.6/194.1 (+1.5%), C4 flat; 1 RTX C1 −1%, C4 +0.5%: the
+   exchange alone does not pay enough to be default. MiMo V2.6 Pro and GLM 5.3 on
+   the exchange (+ whole-step decode graphs, `work/device-mimo-glm`): no gain
+   (MiMo host C1 80.4/81.5 vs device step 77.0/79.8; GLM ~65 both) — their
+   segments are GPU-bound. Write mode (`CUTEAFD_SPARK_WRITE=1`) launches but the
+   pass sticks on the written flags (open). The remaining V4.1 lever is whole-step
+   capture; blockers in order: index-selection shape vs context length, per-request
+   pointer fingerprints (sparse/index), host-built per-layer metadata (one per-pass
+   arena would remove it), 1-RTX GPU landing at 3.6 GB/s after weights load.
+   FP8 draft head (`CUTEAFD_V41_FP8_HEAD=draft`, E4M3 copy, W8A16 GEMV 882 → 416
+   µs per 129280-row head): parity, 3 interleaved sessions per arm, base → fp8d:
+   2 RTX C1 183.6 → 186.4 (1.016), C4 489.0 → 512.0 (1.047), C16 1413.7 → 1442.2
+   (1.020), weighted decode 0.997; 1 RTX C1 1.014, C4 1.039, C16 1.087, decode
+   1.012. Proposed as the default (outputs unchanged; drafts only). Kit:
+   `~/.cache/cuteafd/builds/v41-device` (STATUS.md, build-coord.sh/build-spark.sh,
+   v41-ab3.sh, v41-c4.sh, run-parity.sh).
 2. **Whole-step graphs** — MiMo's per-layer segments are merged and opt-in
    (`DECODE_GRAPHS=on`, [`work/mimo-graphs`](https://github.com/tpurtell/cuteafd/tree/work/mimo-graphs)); flat today,
    they pay once item 1 removes the host hops. Same for every family.
 3. **V4.1 step wins** (from the critical-path note): device-side draft
-   acceptance (~0.8 ms host gap per round, up to +3%); FP8 target and draft
-   heads (2 × ~450 µs per round); one host thread serves both lanes (26–43% of
+   acceptance (~0.8 ms host gap per round, up to +3%); FP8 target head
+   (draft head done, see item 1; the target head changes outputs and needs a
+   quality gate); one host thread serves both lanes (26–43% of
    wall time in CUDA calls) — item 1 removes most of it.
 4. **Model-specific issues found** (fix in v1, not essential for v0):
    - GLM 5.3 Flash (likely GLM 5.3): a JSON-schema request whose grammar
