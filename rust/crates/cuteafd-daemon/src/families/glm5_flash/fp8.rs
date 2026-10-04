@@ -264,4 +264,31 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn row128_head_slices_keep_whole_weight_quantization() {
+        use crate::shared::peer_split::{slice_2d, Axis};
+
+        // Non-block-aligned N, as in the packed split KDA input, and distinct
+        // scales on either side of a 128-K boundary.
+        let (n, k) = (34, 512);
+        let bytes: Vec<u8> = (0..n * k).flat_map(|i| {
+            let x = ((i * 37 % 101) as f32 - 50.0) * (1 + i / 128) as f32 * 0.01;
+            ((x.to_bits() >> 16) as u16).to_le_bytes()
+        }).collect();
+        for rule in [Fp8Scales::Amax, Fp8Scales::Pow2, Fp8Scales::Best] {
+            let (whole, scales) = quantize(&bytes, n, k, Layout::Row128, rule);
+            let scale_bytes: Vec<u8> = scales.iter().flat_map(|s| s.to_le_bytes()).collect();
+            for axis in [Axis::Rows, Axis::Cols] {
+                for rank in 0..2 {
+                    let (rn, rk) = match axis { Axis::Rows => (n / 2, k), Axis::Cols => (n, k / 2) };
+                    let part = slice_2d(&bytes, n, k, 2, axis, rank, 2);
+                    let (q, s) = quantize(&part, rn, rk, Layout::Row128, rule);
+                    assert_eq!(q, slice_2d(&whole, n, k, 1, axis, rank, 2));
+                    let actual: Vec<u8> = s.iter().flat_map(|s| s.to_le_bytes()).collect();
+                    assert_eq!(actual, slice_2d(&scale_bytes, n, k / 128, 4, axis, rank, 2));
+                }
+            }
+        }
+    }
 }
