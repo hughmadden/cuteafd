@@ -717,11 +717,12 @@ v1 ships when these are done; everything else below moves to v1.x/v2.
 
 Changes since v0.1.0 touch every model family. The `release/v1` candidate
 uses local `cuteafd-coordinator:v1.0.0-rc1` and
-`cuteafd-spark-expert:v1.0.0-rc1` images. The full family × quant ×
-natural-minimum/maximum Release smoke matrix must complete before review;
-`CUTEAFD_RELEASE_ROW=v1 cuteafd bench publish` fills the pending family
-changelog rows and refreshes the README grid. These rows make no claim of
-passing qualification. TJ explicitly deferred V4.1 parity to the next
+`cuteafd-spark-expert:v1.0.0-rc1` images. The family × quant ×
+natural-minimum/maximum Release smoke matrix attempted all 28 cards (27 passing).
+`CUTEAFD_RELEASE_ROW=v1 cuteafd bench publish` generated the family changelog
+cards and README grid from RC1 exports; the benchmark index retains historical
+reports. Qualification and blockers are recorded below. TJ explicitly
+deferred V4.1 parity to the next
 release; this candidate also skips `bench-ab`. Claude reviews the candidate,
 then TJ approves tagging and publishing images.
 
@@ -754,6 +755,82 @@ scope's MXFP4 32-row tails are outside this candidate: the implementation
 on `work/mxfp4-tails` is unmerged and its strict distributed-oracle and
 unchanged-NLL gates remain open. Existing exact Spark slices and A8 down
 projection do not close that item.
+
+### v1 candidate qualification (RC1, 2026-10-04 UTC)
+
+`release/v1` prepares local `cuteafd-coordinator:v1.0.0-rc1` and
+`cuteafd-spark-expert:v1.0.0-rc1` images from runtime source
+`57d51b0fecfb9e501bf0e658c4a7a47ab325037b`, based on `work/p0`
+`371d3a713f1686bd028766a344beb5f8aa81e700`. SparkInfer remains pinned at
+`f6bb38bc56fdcd695791c1ebf91d0dbf133cd599` with its verified tree lock.
+Coordinator image ID: `80086e9035e87d9eebda88582e5930d99d0039b52230a80254726f444fd31969`.
+Spark image ID (all six ranks): `3ae622568eddeb4e6fe9aa3fa807465cd32f619e9e617ab43ab8e4482793c627`.
+The first Spark export exhausted CUDA memory under unbounded Ninja concurrency;
+RC1 rebuilt successfully with `CUTEAFD_RELEASE_NATIVE_BUILD_JOBS=1`.
+
+Cargo check passed; workspace tests: 1424 passed, 170 ignored, no failures.
+Scripts: 927 passed, 2 skipped, 193 subtests passed, no failing IDs. CPU
+checks cover the source/build-script changes; subsequent changes publish docs
+and reports only. V4.1 parity and `bench-ab` were skipped at TJ's direction.
+No tag, main merge or registry image publication is part of this preparation.
+
+The Release smoke matrix attempted all 28 cards: **27/28 pass**. Each
+entry had a 600 s readiness limit and a 300 s benchmark limit, with at most
+two entries on disjoint hardware. Each successful card used one warm launch.
+Three initial setup failures were corrected: GLM Flash NVFP4 requires the
+official FP8 companion, and its two-Spark entry must explicitly map rhea/moa
+in both the launcher configuration and scheduling declaration. The initial
+host mismatch collided with V4 Flash minimum workers. Only those three
+invalid attempts were repeated; their original logs are retained.
+
+| Model · quant | Minimum gate | Maximum gate |
+| --- | --- | --- |
+| V4.1 Flash · MXFP4 | PASS | PASS |
+| V4.1 Flash · NVFP4 | PASS | PASS |
+| V4 Flash · MXFP4 | PASS | PASS |
+| V4 Pro · EXL3 K2 | PASS | PASS |
+| GLM 5.3 · EXL3 K4 | PASS | PASS |
+| GLM 5.3 · NVFP4 | PASS | PASS |
+| GLM Flash · EXL3 K3.25 | PASS | PASS |
+| GLM Flash · EXL3 tr3 4bpw | PASS | PASS |
+| GLM Flash · FP8 | PASS | PASS |
+| GLM Flash · NVFP4 | PASS | PASS |
+| MiMo V2 Flash · FP8 | PASS | PASS |
+| MiMo V2.6 Pro MOPD · MXFP4 | PASS | PASS |
+| Qwen 3.8 · EXL3 K4.25 | PASS | PASS |
+| Qwen 3.8 · NVFP4 | FAIL | PASS |
+
+Qwen NVFP4 minimum (one RTX, local MTP3) fails launch: its MTP experts are
+E4M3 `[640, 2560]`, while the NVFP4 backbone loader expects packed E2M1
+`[640, 1280]`. It needs a separate FP8 MTP expert load/execution path.
+The Spark maximum passes with speculation off; Qwen has no two-RTX head split,
+so its maximum actually serves on one RTX plus four Sparks. The failed
+minimum has no benchmark export; the generated README shows the available
+NVFP4 Spark card, and this table records the required minimum's failure.
+
+GLM 5.3 official FP8 remains outside PLAN's release scope (six-Spark serving
+budget); Qwen official FP8 has no Spark package and is omitted as authorized.
+V4 Flash minimum is native TP2 on two Sparks. GLM Flash FP8 minimum needs
+four Sparks; its NVFP4 minimum uses two. MiMo Pro uses MOPD, replacing RL.
+Both local and Spark NVFP4 packages, exact slices, MiMo A8 down projection,
+GLM Flash KDA/head programs and Qwen MTP programs are included in RC1.
+
+**Release blockers:** the failed Qwen NVFP4 minimum violates the all-green
+matrix criterion, and scoped MXFP4 32-row tails remain absent from this
+candidate with correctness gates open. Claude must resolve these or obtain
+an explicit scope decision before TJ approves tagging/publishing.
+
+Historical v0-to-RC smoke measurements are in the publication commit body.
+They are descriptive, not matched A/B: checkpoint, placement and speculation
+changes are identified there. V4.1 maximum and Qwen EXL3 minimum show sizeable
+C1 drops in these single sessions. GLM Flash NVFP4 maximum also shows a large
+prefill drop while moving from one RTX with copy-window drafts to the two-RTX
+head split with DFlash2 and FP8 companion projections. These need review;
+this preparation makes no performance-parity claim. V4.1 parity remains
+deferred as directed.
+Logs, matrix, placement snapshots and the full measurement table are retained
+under `~/.cache/cuteafd/builds/release-v1/kit/`; gate logs are under
+`~/.cache/cuteafd/builds/release-v1-gates/`.
 
 ## Release v1 — priority plan (2026-10-02)
 

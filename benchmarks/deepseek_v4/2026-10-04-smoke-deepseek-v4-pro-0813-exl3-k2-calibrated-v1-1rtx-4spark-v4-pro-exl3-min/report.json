@@ -1,0 +1,899 @@
+{
+  "schema": "cuteafd.bench.report/1",
+  "id": "6a0fe84491c44cf4bcd016db4434273c",
+  "created": "2026-10-04T14:31:31Z",
+  "finished": "2026-10-04T14:32:24Z",
+  "status": "done",
+  "profile": "smoke",
+  "plan": [
+    {
+      "id": "hardware",
+      "passes": 1
+    },
+    {
+      "id": "configuration",
+      "passes": 1
+    }
+  ],
+  "server": {
+    "model": "wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1",
+    "family": "deepseek_v4",
+    "revision": "7a63f24905223aff19212d65226be708950823ac",
+    "build": {
+      "version": "0.1.0",
+      "release": "v1.0.0-rc1",
+      "image": "cuteafd-coordinator:v1.0.0-rc1",
+      "remote": null,
+      "commit": "57d51b0fecfb9e501bf0e658c4a7a47ab325037b",
+      "dirty": false
+    },
+    "hardware": {
+      "host": "raptor",
+      "gpus": [
+        {
+          "index": 0,
+          "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+          "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
+          "memory_mib": 97887,
+          "power_limit_w": 325.0,
+          "power_max_w": 600.0,
+          "sm_count": 188,
+          "compute_cap": "12.0",
+          "pcie": "Gen5 x16",
+          "used": true
+        }
+      ],
+      "driver": "595.91.07",
+      "cuda": "13.2",
+      "sparks": [
+        {
+          "address": "10.55.0.1",
+          "name": null,
+          "rank": 0
+        },
+        {
+          "address": "10.55.0.2",
+          "name": null,
+          "rank": 1
+        },
+        {
+          "address": "10.55.0.3",
+          "name": null,
+          "rank": 2
+        },
+        {
+          "address": "10.55.0.4",
+          "name": null,
+          "rank": 3
+        }
+      ],
+      "fabric": [
+        {
+          "device": "mlx5_0",
+          "port": 1,
+          "active": true,
+          "link_gbps": 400.0,
+          "pcie": "32 GT/s x16",
+          "netdev": "enp1s0np0",
+          "subnets": [
+            "10.55.0.0/24",
+            "10.55.1.0/24"
+          ]
+        }
+      ],
+      "rails": "fabric: use 2 rail(s) of [mlx5_0@10.55.0.22/24 400G(eff 400G), mlx5_0@10.55.1.22/24 400G(eff 400G)]: 2 subnets share one 400 Gb/s port; each rail is a subnet of the same link"
+    },
+    "configuration": {
+      "snapshot": "/root/.cache/huggingface/hub/models--wrldsuksgo2mars--DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1/snapshots/7a63f24905223aff19212d65226be708950823ac",
+      "quant": [
+        {
+          "group": "embedding",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "lm head",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "norm",
+          "formats": [
+            "bf16"
+          ]
+        },
+        {
+          "group": "attention",
+          "formats": [
+            "bf16",
+            "f32",
+            "fp8-block128x128/ue8m0"
+          ]
+        },
+        {
+          "group": "indexer",
+          "formats": [
+            "bf16",
+            "fp8-block128x128/ue8m0"
+          ]
+        },
+        {
+          "group": "compressor",
+          "formats": [
+            "bf16",
+            "f32"
+          ]
+        },
+        {
+          "group": "hyper connection",
+          "formats": [
+            "f32"
+          ]
+        },
+        {
+          "group": "router",
+          "formats": [
+            "bf16",
+            "int"
+          ]
+        },
+        {
+          "group": "shared expert",
+          "formats": [
+            "fp8-block128x128/ue8m0"
+          ]
+        },
+        {
+          "group": "routed expert",
+          "formats": [
+            "exl3-k2"
+          ]
+        },
+        {
+          "group": "speculator",
+          "formats": [
+            "bf16",
+            "f32",
+            "fp8-block128x128/ue8m0"
+          ]
+        },
+        {
+          "group": "speculator expert",
+          "formats": [
+            "exl3-k2"
+          ]
+        }
+      ],
+      "speculator": "dSpark",
+      "layout": "1 RTX · experts TP4 over 4 Sparks",
+      "settings": [
+        {
+          "name": "snapshot",
+          "value": "/root/.cache/huggingface/hub/models--wrldsuksgo2mars--DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1/snapshots/7a63f24905223aff19212d65226be708950823ac",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "peers",
+          "value": "10.55.0.1:19472,10.55.0.2:19472,10.55.0.3:19472,10.55.0.4:19472",
+          "default": "",
+          "source": "cli"
+        },
+        {
+          "name": "native-lib",
+          "value": "/opt/cuteafd/lib/libcuteafd_native.so",
+          "default": null,
+          "source": "cli"
+        },
+        {
+          "name": "manifest",
+          "value": "/opt/cuteafd/share/PROGRAMS.json",
+          "default": "/opt/cuteafd/share/PROGRAMS.json",
+          "source": "default"
+        },
+        {
+          "name": "device",
+          "value": "0",
+          "default": "0",
+          "source": "default"
+        },
+        {
+          "name": "max-sequences",
+          "value": "8",
+          "default": "8",
+          "source": "cli"
+        },
+        {
+          "name": "pool-tokens",
+          "value": "262144",
+          "default": "262144",
+          "source": "default"
+        },
+        {
+          "name": "dspark",
+          "value": "true",
+          "default": "false",
+          "source": "cli"
+        },
+        {
+          "name": "reserve-gib",
+          "value": "10",
+          "default": "10",
+          "source": "default"
+        },
+        {
+          "name": "skip-routed-experts",
+          "value": "false",
+          "default": "false",
+          "source": "default"
+        },
+        {
+          "name": "embed-placement",
+          "value": "gpu",
+          "default": "gpu",
+          "source": "default"
+        },
+        {
+          "name": "token-select",
+          "value": "device",
+          "default": "device",
+          "source": "default"
+        },
+        {
+          "name": "listen",
+          "value": "0.0.0.0:8305",
+          "default": "0.0.0.0:8000",
+          "source": "cli"
+        },
+        {
+          "name": "max-context",
+          "value": "32768",
+          "default": "8192",
+          "source": "cli"
+        },
+        {
+          "name": "max-output",
+          "value": "4096",
+          "default": "4096",
+          "source": "cli"
+        },
+        {
+          "name": "speculate-max-sequences",
+          "value": "10",
+          "default": "10",
+          "source": "default"
+        },
+        {
+          "name": "decode-share",
+          "value": "0.2",
+          "default": "0.2",
+          "source": "default"
+        },
+        {
+          "name": "prefix-cache-entries",
+          "value": "20",
+          "default": "20",
+          "source": "cli"
+        },
+        {
+          "name": "prefix-cache-mark-mib",
+          "value": "2048",
+          "default": "2048",
+          "source": "default"
+        },
+        {
+          "name": "prefix-cache-min-tokens",
+          "value": "64",
+          "default": "64",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-bytes",
+          "value": "0",
+          "default": "0",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-headroom-bytes",
+          "value": "8GiB",
+          "default": "8GiB",
+          "source": "default"
+        },
+        {
+          "name": "host-cache-min-tokens",
+          "value": "512",
+          "default": "512",
+          "source": "default"
+        },
+        {
+          "name": "prefix-point-gap",
+          "value": "0",
+          "default": "0",
+          "source": "default"
+        },
+        {
+          "name": "prefix-point-boundaries",
+          "value": "0",
+          "default": "0",
+          "source": "default"
+        },
+        {
+          "name": "prefix-points-per-request",
+          "value": "4",
+          "default": "4",
+          "source": "default"
+        },
+        {
+          "name": "prefix-partial",
+          "value": "off",
+          "default": "off",
+          "source": "default"
+        },
+        {
+          "name": "console-text",
+          "value": "false",
+          "default": "false",
+          "source": "env"
+        },
+        {
+          "name": "CUTEAFD_FP8_EXPERT_PREFILL",
+          "value": "auto",
+          "default": "auto",
+          "source": "env"
+        },
+        {
+          "name": "CUTEAFD_SPARK_INTAKE",
+          "value": "auto",
+          "default": "auto",
+          "source": "env"
+        }
+      ]
+    },
+    "readiness_s": 45.830238184,
+    "started": "2026-10-04T14:30:44Z"
+  },
+  "fingerprint": "ce9a500f7a0359ae",
+  "baseline": {
+    "fingerprint": "ce9a500f7a0359ae",
+    "run_id": "6a0fe84491c44cf4bcd016db4434273c",
+    "created": "2026-10-04T14:31:33Z",
+    "card": {
+      "decode": [
+        {
+          "content": "code",
+          "tok_s": 69.92841077631508,
+          "runs": [
+            {
+              "prompt_tokens": 54,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 0.185179684,
+              "total_s": 4.747020967,
+              "decode_s": 4.561808233,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          ],
+          "acceptance": null
+        },
+        {
+          "content": "prose",
+          "tok_s": 33.325277074703195,
+          "runs": [
+            {
+              "prompt_tokens": 49,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 0.182471896,
+              "total_s": 9.754821371,
+              "decode_s": 9.572313511,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          ],
+          "acceptance": null
+        },
+        {
+          "content": "json",
+          "tok_s": 80.7106590838316,
+          "runs": [
+            {
+              "prompt_tokens": 79,
+              "completion_tokens": 320,
+              "cached_tokens": 0,
+              "reasoning_tokens": 0,
+              "ttft_s": 0.220287812,
+              "total_s": 4.172696737,
+              "decode_s": 3.952389977,
+              "reasoning_end_s": null,
+              "finish_reason": "length"
+            }
+          ],
+          "acceptance": null
+        }
+      ],
+      "prefill": {
+        "prompt_tokens": 8098,
+        "tok_s": 2134.192686126936,
+        "ttft_s": 3.79440903,
+        "runs": [
+          {
+            "prompt_tokens": 8098,
+            "completion_tokens": 1,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "ttft_s": 3.79440903,
+            "total_s": 3.794458735,
+            "decode_s": 0.0,
+            "reasoning_end_s": null,
+            "finish_reason": "length"
+          }
+        ]
+      },
+      "warmup_s": 2.137010537,
+      "capacity": {
+        "kv_tokens": 264192,
+        "kv_pages": 1032,
+        "kv_format": "compressed C4/C128 + index",
+        "max_requests": 8,
+        "max_context": 32768,
+        "max_output": 4096,
+        "host_cache_bytes": 0
+      }
+    },
+    "quality": {
+      "status": "pass",
+      "checks": [
+        {
+          "id": "fidelity",
+          "title": "Logit fidelity",
+          "status": "skipped",
+          "summary": "no fidelity reference for wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1",
+          "metrics": {},
+          "seconds": 0.011977252
+        },
+        {
+          "id": "cache_exact",
+          "title": "Prefix-cache restore",
+          "status": "pass",
+          "summary": "prompt end: 1475 restored, 2 rows byte-identical · turn end: 1233 restored, 2 rows byte-identical · cold recompute identical",
+          "metrics": {
+            "prompt_tokens": 1475,
+            "prompt_restored": 1475,
+            "prompt_rows_compared": 2,
+            "turn_tokens": 1233,
+            "turn_restored": 1233,
+            "turn_rows_compared": 2,
+            "turn_prompt_rows_compared": 24,
+            "cold_rows_identical": 1
+          },
+          "seconds": 4.009506867
+        },
+        {
+          "id": "spec_lossless",
+          "title": "Speculation lossless",
+          "status": "info",
+          "summary": "dSpark: greedy output diverges at token 32 of 128 (top-two margin 0.058 nats) (76.7 vs 30.2 tok/s); before it 1 of 32 rows byte-identical, top-token log-prob differs by up to 0.104 nats (median 0.0000), first over 0.01 at token 3; drafts off twice: 128 of 128 tokens identical, 128 of 128 rows byte-identical, up to 0.000 nats · not gated: verify rounding (plain decode repeats exactly, drafted rows already differed before the flip)",
+          "metrics": {
+            "tokens": 128,
+            "identical_prefix": 32,
+            "speculator": "dSpark",
+            "decode_tok_s_on": 76.66985686520117,
+            "decode_tok_s_off": 30.228394831038173,
+            "prefix_rows_compared": 32,
+            "prefix_rows_identical": 1,
+            "prefix_noise_max": 0.10400709509849548,
+            "prefix_noise_median": 0.00001025522215059027,
+            "prefix_noise_first_over_0_01": 3,
+            "repeat_identical_prefix": 128,
+            "repeat_rows_identical": 128,
+            "repeat_noise_max": 0.0,
+            "divergence_margin": 0.0579833984375
+          },
+          "seconds": 10.644606419
+        },
+        {
+          "id": "template",
+          "title": "Template round trip",
+          "status": "info",
+          "summary": "tool call parsed · no reasoning · re-render differs at token 317 of 362",
+          "metrics": {
+            "reasoning_chars": 0,
+            "rendered_prefix": 317,
+            "turn_tokens": 362,
+            "cached_tokens": 316
+          },
+          "seconds": 1.674788837
+        },
+        {
+          "id": "c1_c4",
+          "title": "C1 vs C4 divergence",
+          "status": "info",
+          "summary": "0 of 4 identical to C1; first divergence at tokens 15; before it 1 of 15 rows byte-identical, top-token log-prob differs by up to 0.439 nats (median 0.0140), first over 0.01 at token 1",
+          "metrics": {
+            "prefix_rows_compared": 15,
+            "prefix_rows_identical": 1,
+            "prefix_noise_max": 0.43933922052383423,
+            "prefix_noise_median": 0.013982074335217476,
+            "prefix_noise_first_over_0_01": 1,
+            "identical": 0,
+            "first_divergence": 15
+          },
+          "seconds": 5.544237671
+        }
+      ]
+    },
+    "seconds": 50.459384456
+  },
+  "panels": [
+    {
+      "id": "hardware",
+      "title": "Hardware",
+      "status": "done",
+      "passes": [
+        {
+          "hardware": {
+            "host": "raptor",
+            "gpus": [
+              {
+                "index": 0,
+                "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+                "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
+                "memory_mib": 97887,
+                "power_limit_w": 325.0,
+                "power_max_w": 600.0,
+                "sm_count": 188,
+                "compute_cap": "12.0",
+                "pcie": "Gen5 x16",
+                "used": true
+              }
+            ],
+            "driver": "595.91.07",
+            "cuda": "13.2",
+            "sparks": [
+              {
+                "address": "10.55.0.1",
+                "name": null,
+                "rank": 0
+              },
+              {
+                "address": "10.55.0.2",
+                "name": null,
+                "rank": 1
+              },
+              {
+                "address": "10.55.0.3",
+                "name": null,
+                "rank": 2
+              },
+              {
+                "address": "10.55.0.4",
+                "name": null,
+                "rank": 3
+              }
+            ],
+            "fabric": [
+              {
+                "device": "mlx5_0",
+                "port": 1,
+                "active": true,
+                "link_gbps": 400.0,
+                "pcie": "32 GT/s x16",
+                "netdev": "enp1s0np0",
+                "subnets": [
+                  "10.55.0.0/24",
+                  "10.55.1.0/24"
+                ]
+              }
+            ],
+            "rails": "fabric: use 2 rail(s) of [mlx5_0@10.55.0.22/24 400G(eff 400G), mlx5_0@10.55.1.22/24 400G(eff 400G)]: 2 subnets share one 400 Gb/s port; each rail is a subnet of the same link"
+          },
+          "readiness_s": 45.830238184
+        }
+      ],
+      "started": "2026-10-04T14:32:24Z",
+      "finished": "2026-10-04T14:32:24Z",
+      "seconds": 0.000181152,
+      "error": null,
+      "history": []
+    },
+    {
+      "id": "configuration",
+      "title": "Configuration",
+      "status": "done",
+      "passes": [
+        {
+          "model": "wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1",
+          "family": "deepseek_v4",
+          "revision": "7a63f24905223aff19212d65226be708950823ac",
+          "configuration": {
+            "snapshot": "/root/.cache/huggingface/hub/models--wrldsuksgo2mars--DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1/snapshots/7a63f24905223aff19212d65226be708950823ac",
+            "quant": [
+              {
+                "group": "embedding",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "lm head",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "norm",
+                "formats": [
+                  "bf16"
+                ]
+              },
+              {
+                "group": "attention",
+                "formats": [
+                  "bf16",
+                  "f32",
+                  "fp8-block128x128/ue8m0"
+                ]
+              },
+              {
+                "group": "indexer",
+                "formats": [
+                  "bf16",
+                  "fp8-block128x128/ue8m0"
+                ]
+              },
+              {
+                "group": "compressor",
+                "formats": [
+                  "bf16",
+                  "f32"
+                ]
+              },
+              {
+                "group": "hyper connection",
+                "formats": [
+                  "f32"
+                ]
+              },
+              {
+                "group": "router",
+                "formats": [
+                  "bf16",
+                  "int"
+                ]
+              },
+              {
+                "group": "shared expert",
+                "formats": [
+                  "fp8-block128x128/ue8m0"
+                ]
+              },
+              {
+                "group": "routed expert",
+                "formats": [
+                  "exl3-k2"
+                ]
+              },
+              {
+                "group": "speculator",
+                "formats": [
+                  "bf16",
+                  "f32",
+                  "fp8-block128x128/ue8m0"
+                ]
+              },
+              {
+                "group": "speculator expert",
+                "formats": [
+                  "exl3-k2"
+                ]
+              }
+            ],
+            "speculator": "dSpark",
+            "layout": "1 RTX · experts TP4 over 4 Sparks",
+            "settings": [
+              {
+                "name": "snapshot",
+                "value": "/root/.cache/huggingface/hub/models--wrldsuksgo2mars--DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1/snapshots/7a63f24905223aff19212d65226be708950823ac",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "peers",
+                "value": "10.55.0.1:19472,10.55.0.2:19472,10.55.0.3:19472,10.55.0.4:19472",
+                "default": "",
+                "source": "cli"
+              },
+              {
+                "name": "native-lib",
+                "value": "/opt/cuteafd/lib/libcuteafd_native.so",
+                "default": null,
+                "source": "cli"
+              },
+              {
+                "name": "manifest",
+                "value": "/opt/cuteafd/share/PROGRAMS.json",
+                "default": "/opt/cuteafd/share/PROGRAMS.json",
+                "source": "default"
+              },
+              {
+                "name": "device",
+                "value": "0",
+                "default": "0",
+                "source": "default"
+              },
+              {
+                "name": "max-sequences",
+                "value": "8",
+                "default": "8",
+                "source": "cli"
+              },
+              {
+                "name": "pool-tokens",
+                "value": "262144",
+                "default": "262144",
+                "source": "default"
+              },
+              {
+                "name": "dspark",
+                "value": "true",
+                "default": "false",
+                "source": "cli"
+              },
+              {
+                "name": "reserve-gib",
+                "value": "10",
+                "default": "10",
+                "source": "default"
+              },
+              {
+                "name": "skip-routed-experts",
+                "value": "false",
+                "default": "false",
+                "source": "default"
+              },
+              {
+                "name": "embed-placement",
+                "value": "gpu",
+                "default": "gpu",
+                "source": "default"
+              },
+              {
+                "name": "token-select",
+                "value": "device",
+                "default": "device",
+                "source": "default"
+              },
+              {
+                "name": "listen",
+                "value": "0.0.0.0:8305",
+                "default": "0.0.0.0:8000",
+                "source": "cli"
+              },
+              {
+                "name": "max-context",
+                "value": "32768",
+                "default": "8192",
+                "source": "cli"
+              },
+              {
+                "name": "max-output",
+                "value": "4096",
+                "default": "4096",
+                "source": "cli"
+              },
+              {
+                "name": "speculate-max-sequences",
+                "value": "10",
+                "default": "10",
+                "source": "default"
+              },
+              {
+                "name": "decode-share",
+                "value": "0.2",
+                "default": "0.2",
+                "source": "default"
+              },
+              {
+                "name": "prefix-cache-entries",
+                "value": "20",
+                "default": "20",
+                "source": "cli"
+              },
+              {
+                "name": "prefix-cache-mark-mib",
+                "value": "2048",
+                "default": "2048",
+                "source": "default"
+              },
+              {
+                "name": "prefix-cache-min-tokens",
+                "value": "64",
+                "default": "64",
+                "source": "default"
+              },
+              {
+                "name": "host-cache-bytes",
+                "value": "0",
+                "default": "0",
+                "source": "default"
+              },
+              {
+                "name": "host-cache-headroom-bytes",
+                "value": "8GiB",
+                "default": "8GiB",
+                "source": "default"
+              },
+              {
+                "name": "host-cache-min-tokens",
+                "value": "512",
+                "default": "512",
+                "source": "default"
+              },
+              {
+                "name": "prefix-point-gap",
+                "value": "0",
+                "default": "0",
+                "source": "default"
+              },
+              {
+                "name": "prefix-point-boundaries",
+                "value": "0",
+                "default": "0",
+                "source": "default"
+              },
+              {
+                "name": "prefix-points-per-request",
+                "value": "4",
+                "default": "4",
+                "source": "default"
+              },
+              {
+                "name": "prefix-partial",
+                "value": "off",
+                "default": "off",
+                "source": "default"
+              },
+              {
+                "name": "console-text",
+                "value": "false",
+                "default": "false",
+                "source": "env"
+              },
+              {
+                "name": "CUTEAFD_FP8_EXPERT_PREFILL",
+                "value": "auto",
+                "default": "auto",
+                "source": "env"
+              },
+              {
+                "name": "CUTEAFD_SPARK_INTAKE",
+                "value": "auto",
+                "default": "auto",
+                "source": "env"
+              }
+            ]
+          },
+          "build": {
+            "version": "0.1.0",
+            "release": "v1.0.0-rc1",
+            "image": "cuteafd-coordinator:v1.0.0-rc1",
+            "remote": null,
+            "commit": "57d51b0fecfb9e501bf0e658c4a7a47ab325037b",
+            "dirty": false
+          }
+        }
+      ],
+      "started": "2026-10-04T14:32:24Z",
+      "finished": "2026-10-04T14:32:24Z",
+      "seconds": 0.000161403,
+      "error": null,
+      "history": []
+    }
+  ],
+  "error": null
+}
