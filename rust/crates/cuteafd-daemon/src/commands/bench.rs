@@ -106,7 +106,7 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
                 None => Vec::new(),
             };
             let options = cuteafd_bench::cli::RunOptions { url: run.url, profile: run.profile, panels: run.panels,
-                passes, export: run.export, out: run.out, root: run.root, api_key: run.api_key, quiet: false, deadline: None };
+                passes, export: run.export, out: run.out, label: None, root: run.root, api_key: run.api_key, quiet: false, deadline: None };
             let (report, dir) = cuteafd_bench::cli::run(&options)?;
             println!("{}", dir.display());
             if report.quality_failed() {
