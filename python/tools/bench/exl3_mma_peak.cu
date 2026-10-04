@@ -18,9 +18,17 @@ constexpr int chains = 8;
 template<int kind> __global__ void mma_peak(float* output) {
     float accum[chains][4] = {};
     int integer[chains][4] = {};
+    // Distinct seeds preserve eight independent dependency chains in SASS.
+    #pragma unroll
+    for (int c = 0; c < chains; ++c)
+        for (int j = 0; j < 4; ++j) {
+            accum[c][j] = float(c + 1) * 0.0001f;
+            integer[c][j] = kind == 5 ? c + 1 : 0x10001000 + c * 0x00010001;
+        }
     // Finite small values for F16/BF16/FP8; bounded signed-byte INT8 inputs.
     unsigned a = kind == 1 ? 0x38003800 : 0x14001400;
     if constexpr (kind >= 3) a = 0x01010101;
+    #pragma unroll 1
     for (int it = 0; it < iterations; ++it) {
         #pragma unroll
         for (int c = 0; c < chains; ++c) {
