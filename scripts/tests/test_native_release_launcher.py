@@ -32,6 +32,7 @@ class NativeReleaseLauncherTest(unittest.TestCase):
         source = (ROOT / 'build.sh').read_text()
         block = source.split('echo "== building Spark development and inference images natively on $seed_host =="', 1)[1]
         invocation, remote = block.split("<<'REMOTE'", 1)
+        invocation = invocation.split('  local phase="$1"\n', 1)[1]
         preamble = remote.split('cd "$remote_dir"', 1)[0]
         # The optional source manifest and the optional V41 expert roles are
         # both carried behind non-empty sentinels. An empty earlier value must
@@ -45,10 +46,14 @@ class NativeReleaseLauncherTest(unittest.TestCase):
         ):
             with self.subTest(digest=digest, roles=roles):
                 harness = f'''set -euo pipefail
-# build.sh routes every remote step through release_ssh (host is its first
-# argument); emulating it by re-running the joined command string locally is what
-# reproduces OpenSSH's behaviour of collapsing an empty argument.
-release_ssh() {{ shift 1; bash -c "$*"; }}
+# The timed SSH leg joins arguments just as OpenSSH does. Preserve the
+# empty-argument elision regression while testing the new export phase fields.
+timeout() {{ shift 1; "$@"; }}
+ssh() {{ shift 1; bash -c "$*"; }}
+release_ssh_opts=()
+export_timeout=60
+export_container=fixture-export
+phase=export
 seed_host=fixture
 remote_dir=/fixture
 SPARK_EXPERT_DOCKER_DEV=dev
@@ -71,6 +76,7 @@ spark_tp_roles={shlex.quote(roles)}
         source = (ROOT / 'build.sh').read_text()
         block = source.split('echo "== building Spark development and inference images natively on $seed_host =="', 1)[1]
         invocation, remote = block.split("<<'REMOTE'", 1)
+        invocation = invocation.split('  local phase="$1"\n', 1)[1]
         preamble = remote.split('cd "$remote_dir"', 1)[0]
         # An ssh config path chosen for the build must reach ssh as its own argv
         # element and must never be re-spelled inside the command string the remote
@@ -105,6 +111,10 @@ spark_tp_roles={shlex.quote(roles)}
             harness = f'''set -euo pipefail
 source scripts/lib/release-common.sh
 export CUTEAFD_RELEASE_SSH_CONFIG={shlex.quote(str(config))}
+release_configure_ssh_transport
+export_timeout=60
+export_container=fixture-export
+phase=export
 seed_host=fixture
 remote_dir=/fixture
 SPARK_EXPERT_DOCKER_DEV=dev

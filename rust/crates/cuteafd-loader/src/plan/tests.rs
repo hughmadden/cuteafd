@@ -967,3 +967,71 @@ fn layout_charges_local_routed_experts_to_the_coordinator() {
     assert!(memory.devices[0].by_category()[&Category::Experts] > routed);
     assert_eq!(memory.devices.len(), 1);
 }
+
+#[test]
+fn preferred_qwen_experts_require_room_for_serving_and_keep_explicit_layouts() {
+    use cuteafd_core::memory_layout::Category;
+    let dir = qwen_snapshot(4);
+    let ample = PlanOptions {
+        layout: Some(layout::LayoutOptions { pool_tokens: Some(32768), ..Default::default() }),
+        ..sparks(4)
+    };
+    assert_eq!(plan_preferred(dir.path(), &PlanOptions::default()).unwrap().placement, ExpertPlacement::Local);
+    let preferred = plan_preferred(dir.path(), &ample).unwrap();
+    assert_eq!(preferred.placement, ExpertPlacement::Local, "{}", render(&preferred));
+    let memory = preferred.memory_layout.as_ref().unwrap();
+    assert!(memory.devices[0].by_category()[&Category::Experts] >
+        component(&preferred, Component::RoutedExpert).bytes);
+    assert!(memory.devices.iter().all(|d| d.free_bytes() >= 0));
+    let explicit_local = plan(dir.path(), &PlanOptions {
+        placement: ExpertPlacement::Local, ..ample.clone()
+    }).unwrap();
+    assert_eq!(memory.devices[0].by_category(),
+        explicit_local.memory_layout.as_ref().unwrap().devices[0].by_category());
+    let unused_peer = PlanOptions {
+        layout: Some(layout::LayoutOptions {
+            rtx_bytes: vec![96 << 30, 1 << 30], pool_tokens: Some(32768), ..Default::default()
+        }),
+        ..ample.clone()
+    };
+    assert_eq!(plan_preferred(dir.path(), &unused_peer).unwrap().placement, ExpertPlacement::Local);
+    // Explicit --spark-ranks keeps the requested topology, even when local fits.
+    assert_eq!(plan(dir.path(), &ample).unwrap().placement, ExpertPlacement::Sparks { ranks: 4 });
+    let tight = PlanOptions {
+        layout: Some(layout::LayoutOptions { rtx_bytes: vec![12 << 30], ..Default::default() }),
+        ..ample.clone()
+    };
+    assert_eq!(plan_preferred(dir.path(), &tight).unwrap().placement, ExpertPlacement::Sparks { ranks: 4 });
+    // Weight-only fit is insufficient when a pinned KV pool overruns the GPU.
+    let oversized_pool = PlanOptions {
+        layout: Some(layout::LayoutOptions { pool_tokens: Some(1 << 40), ..Default::default() }),
+        ..ample
+    };
+    assert_eq!(plan_preferred(dir.path(), &oversized_pool).unwrap().placement, ExpertPlacement::Sparks { ranks: 4 });
+    let unsupported = qwen_snapshot(3);
+    assert_eq!(plan_preferred(unsupported.path(), &sparks(4)).unwrap().placement, ExpertPlacement::Sparks { ranks: 4 });
+}
+
+#[test]
+fn local_qwen_memory_layout_charges_experts_to_the_lead_gpu() {
+    use cuteafd_core::memory_layout::Category;
+    let dir = qwen_snapshot(4);
+    let report = plan(dir.path(), &PlanOptions {
+        layout: Some(layout::LayoutOptions {
+            rtx_bytes: vec![96 << 30, 96 << 30], pool_tokens: Some(32768), ..Default::default()
+        }),
+        ..sparks(0)
+    }).unwrap();
+    let layout = report.memory_layout.as_ref().unwrap();
+    assert!(layout.devices[0].by_category()[&Category::Experts] >
+        component(&report, Component::RoutedExpert).bytes);
+    assert!(!layout.devices[1].by_category().contains_key(&Category::Experts));
+    assert!(layout.devices[1].items.is_empty());
+    assert_eq!(layout.devices[1].kv_tokens, 0);
+    assert!(!layout.notes.iter().any(|n| n.contains("only one coordinator")));
+    let one = plan(dir.path(), &PlanOptions {
+        layout: Some(layout::LayoutOptions { pool_tokens: Some(32768), ..Default::default() }),
+        ..sparks(0)
+    }).unwrap();
+    assert_eq!(layout.devices[0].by_category(), one.memory_layout.as_ref().unwrap().devices[0].by_category());
+}

@@ -90,7 +90,10 @@ def test_family_table_matches_the_rust_launch_fixtures(tmp_path: Path) -> None:
 
 def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys: str,
                           physical_gpus: tuple[int, ...] = (0, 1), *, preflight_error: bool = False,
-                          restart: bool = False) -> subprocess.CompletedProcess[str]:
+                          restart: bool = False, preferred_ranks: int | None = None,
+                          gpu_free_mib: int = 97000, container_pids: tuple[int, ...] = (),
+                          gpu_allocations: tuple[tuple[int, int], ...] = (),
+                          previous_peers: str | None = None) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
     that print their argv) and return what it would launch."""
     repo = tmp_path / "repo"
@@ -99,6 +102,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     shutil.copy(ROOT / "scripts" / "launch" / "run-family.sh", repo / "scripts" / "launch")
     shutil.copy(ROOT / "scripts" / "launch" / "preflight-fp8-bf16.py", repo / "scripts" / "launch")
     shutil.copy(ROOT / "scripts" / "lib" / "checkpoint-family.py", repo / "scripts" / "lib")
+    shutil.copy(ROOT / "scripts" / "lib" / "release-common.sh", repo / "scripts" / "lib")
     hf = tmp_path / "hf"
     _snapshot(hf, model, family_config)
     bin_dir = tmp_path / "bin"
@@ -107,12 +111,23 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         (bin_dir / tool).write_text('#!/usr/bin/env bash\nprintf "%s " "$(basename "$0")" "$@" >&2; echo >&2\n'
                                     + ('case "$*" in *"docker run --rm"*"python3"*) exit 2 ;; esac\n'
                                        if preflight_error and tool == "ssh" else '') +
-                                    'case "$*" in *"docker logs"*) echo "worker ready" ;; esac\n')
+                                    'case "$*" in *"docker logs"*) echo "worker ready" ;; esac\n' +
+                                    (f"case \"$*\" in *\"cuteafd plan\"*) echo '{{\"spark_ranks\":{preferred_ranks}}}' ;; esac\n"
+                                     if tool == "docker" and preferred_ranks is not None else '') +
+                                    ("case \"$*\" in top*) printf '%s\\n' PID " +
+                                     " ".join(map(str, container_pids)) + " ;; esac\n"
+                                     if tool == "docker" and container_pids else '') +
+                                    (f"case \"$*\" in inspect*) echo '[\"serve-qwen4\",\"--peers\",\"{previous_peers}\"]' ;; esac\n"
+                                     if tool == "docker" and previous_peers is not None else ''))
         (bin_dir / tool).chmod(0o755)
     (bin_dir / "curl").write_text('#!/usr/bin/env bash\nprintf \'%s\\n\' \'{"data":[{"id":"test/model"}]}\'\n')
     (bin_dir / "curl").chmod(0o755)
     (bin_dir / "nvidia-smi").write_text("#!/usr/bin/env bash\nprintf '%s\\n' " +
-                                         " ".join(map(str, physical_gpus)) + "\n")
+                                         " ".join(map(str, physical_gpus)) + "\n" if preferred_ranks is None else
+                                         '#!/usr/bin/env bash\ncase "$*" in *memory.free*) echo ' + str(gpu_free_mib) +
+                                         ' ;; *query-compute-apps*) printf \'%s\\n\' ' +
+                                         " ".join(f"'{pid}, {mib}'" for pid, mib in gpu_allocations) +
+                                         ' ;; *) echo 0; echo 1 ;; esac\n')
     (bin_dir / "nvidia-smi").chmod(0o755)
     config = repo / "f.config"
     config.write_text(f"MODEL_ID={model}\nSPARK_COUNT=1\nSPARK_0_HOST=h0\nSPARK_0_LANE_A=10.0.0.1\n{keys}")
@@ -126,8 +141,27 @@ def _family_launch_lines(tmp_path: Path, family_config: dict, model: str, keys: 
     return _family_launch_result(tmp_path, family_config, model, keys).stderr
 
 
-@pytest.mark.parametrize("mode,expected", [(None, "row128"), ("auto", "row128"), ("off", "off")])
-def test_glmf_kda_defaults_to_single_copy_fp8(tmp_path, mode, expected):
+@pytest.mark.parametrize("value", [None, "auto", "0", "5"])
+def test_deepseek_v4_honors_explicit_local_expert_limit(tmp_path, value):
+    keys = "" if value is None else f"RTX_EXPERT_LAYERS={value}\n"
+    result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"}, "test/dsv4", keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-dsv4" in line)
+    if value in (None, "auto"):
+        assert "--local-expert-layers" not in launch
+    else:
+        assert f"--local-expert-layers {value}" in launch
+
+
+def test_deepseek_v4_rejects_invalid_local_limit_before_launch(tmp_path):
+    result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"}, "test/dsv4",
+                                  "RTX_EXPERT_LAYERS=-1\n")
+    assert result.returncode == 2 and "RTX_EXPERT_LAYERS must be" in result.stderr
+    assert "docker run" not in result.stderr and "nest drop-caches" not in result.stderr
+
+
+@pytest.mark.parametrize("mode,expected", [(None, "off"), ("auto", "off"), ("off", "off"), ("row128", "row128")])
+def test_glmf_kda_defaults_to_checkpoint_bf16(tmp_path, mode, expected):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
@@ -139,13 +173,15 @@ def test_glmf_kda_defaults_to_single_copy_fp8(tmp_path, mode, expected):
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     assert f"--kda-fp8 {expected}" in launch
     assert launch.count("--kda-fp8") == 1
+    # The LM head stays BF16 unless GLM5_FLASH_FP8_HEAD=on.
+    assert "--fp8-head false" in launch
 
 
 @pytest.mark.parametrize("keys,expected", [
     ("GLM5_FLASH_KDA_FP8=row128\n", ["--kda-fp8 row128"]),
     ("GLMF_KDA_FP8=channel\n", ["--kda-fp8 channel"]),
-    ("GLM5_FLASH_FP8_HEAD=on\n", ["--fp8-head"]),
-    ("GLMF_FP8_HEAD=on\n", ["--fp8-head"]),
+    ("GLM5_FLASH_FP8_HEAD=on\n", ["--fp8-head true"]),
+    ("GLMF_FP8_HEAD=on\n", ["--fp8-head true"]),
     ("GLM5_FLASH_KDA_FP8=row128\nGLM5_FLASH_FP8_PREFILL=all\n", ["--fp8-prefill all"]),
     ("GLMF_KDA_FP8=row128\nGLMF_FP8_PREFILL=mla,kda-in\n", ["--fp8-prefill mla,kda-in"]),
     ("GLM5_FLASH_KDA_FP8=channel\nGLM5_FLASH_FP8_PREFILL=kda-o,ffn\n", ["--fp8-prefill kda-o,ffn"]),
@@ -341,7 +377,7 @@ def test_mimo_invalid_drafter_precision_rejects_before_launch(tmp_path):
 
 SPLIT_CONFIGS = {
     "qwen4": {"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
-               "layer_types": ["linear_attention", "full_attention"]}},
+               "mtp_num_hidden_layers": 1, "layer_types": ["linear_attention", "full_attention"]}},
     "glm5_flash": {"model_type": "glm5_next", "num_hidden_layers": 2,
                    "mlp_layer_types": ["sparse"] * 2,
                    "layer_types": ["linear_attention", "deepseek_sparse_attention"]},
@@ -501,7 +537,134 @@ def test_glmf_pool_defaults_to_the_planned_pool(tmp_path: Path) -> None:
         assert result.returncode == 0, result.stderr
         launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
         assert flag in launch, launch
-    bad = _family_launch_lines(tmp_path / "dsv4", {"model_type": "deepseek_v4"},
+    dsv4 = _family_launch_lines(tmp_path / "dsv4", {"model_type": "deepseek_v4"},
                                "deepseek-ai/DeepSeek-V4-Flash-0731", "POOL_TOKENS=auto\n")
-    assert "cuteafd serve-dsv4" in bad
-    assert "--pool-tokens 0" in bad
+    assert "cuteafd serve-dsv4" in dsv4
+    assert "--pool-tokens 0" in dsv4
+
+
+def test_family_config_reads_share_the_stop_key_grammar() -> None:
+    import re
+
+    launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
+    # Include old spellings read by key(), plus the two generated projection loops.
+    keys = set(re.findall(r'\bget ([A-Z][A-Z_0-9]+)', launcher))
+    for new, old in re.findall(r'\bkey ([A-Z][A-Z_0-9]+) ([A-Z][A-Z_0-9]+)', launcher):
+        if new != "NEW":
+            keys.update((new, old))
+    keys.update(("MIMO_FP8_HEAD", "MIMO_FP8_O_PROJ", "QWEN_FP8_DECODE", "QWEN_FP8_HEAD"))
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1"; shift; for key; do release_known_key "$key" || exit 1; done',
+         "bash", str(ROOT / "scripts/lib/release-common.sh"), *sorted(keys)],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert 'release_known_key "$key"' in launcher
+
+
+def test_family_launcher_rejects_unknown_keys_before_launching(tmp_path: Path) -> None:
+    result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
+                                            "moe_layer_freq": [0, 1]}, "test/mimo", "SPECULATOR_TYPO=off\n")
+    assert result.returncode != 0
+    assert "unknown configuration key: SPECULATOR_TYPO" in result.stderr
+    assert "docker " not in result.stderr
+
+
+@pytest.mark.parametrize("backend,preferred,local", [("auto", 0, True), ("auto", 4, False),
+                                                     ("spark", 0, False), ("local", 4, True)])
+def test_qwen_preferred_experts_use_the_planner_before_launch(tmp_path: Path, backend: str,
+                                                             preferred: int, local: bool) -> None:
+    result = _family_launch_result(tmp_path, {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}}, "test/model",
+                                  f"EXPERT_BACKEND={backend}\n", preferred_ranks=preferred)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert ("--local-experts" in launch) == local
+    assert ("--peers" in launch) != local
+    assert ("--mtp 3" in launch) == local
+    if local:
+        assert "expertd-native" not in result.stderr
+
+
+def test_qwen_preferred_local_allows_native_mtp(tmp_path: Path) -> None:
+    result = _family_launch_result(tmp_path, {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}}, "test/model",
+                                  "SPECULATOR=mtp\nSPECULATOR_DEPTH=3\n", preferred_ranks=0)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert "--mtp 3" in launch and "--local-experts" in launch
+
+
+@pytest.mark.parametrize("keys,depth", [("", 3), ("SPECULATOR=mtp\n", 3),
+                                      ("SPECULATOR_DEPTH=2\n", 2), ("MTP=2\n", 2),
+                                      ("SPECULATOR=off\n", None), ("MTP=0\n", None)])
+def test_qwen_local_mtp_default_preserves_overrides(tmp_path: Path, keys: str, depth: int | None) -> None:
+    result = _family_launch_result(tmp_path, {**SPLIT_CONFIGS["qwen4"],
+                                            "quantization_config": {"quant_method": "exl3"}},
+                                  "test/model", "EXPERT_BACKEND=local\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert "--local-experts" in launch
+    if depth is None:
+        assert "--mtp " not in launch
+    else:
+        assert f"--mtp {depth}" in launch
+
+
+def test_qwen_spark_mtp_reports_the_missing_expert_layer(tmp_path: Path) -> None:
+    result = _family_launch_result(tmp_path, {**SPLIT_CONFIGS["qwen4"],
+                                            "quantization_config": {"quant_method": "exl3"}},
+                                  "test/model", "EXPERT_BACKEND=spark\nSPECULATOR=mtp\n")
+    assert result.returncode == 2
+    assert "Spark ranks do not serve the MTP layer's experts" in result.stderr
+    assert "expertd-native" not in result.stderr
+
+
+@pytest.mark.parametrize("method,mtp_layers", [("exl3", 0), ("exl3", 2), ("fp8", 1), ("nvfp4", 1)])
+def test_qwen_local_unqualified_mtp_keeps_the_existing_default(tmp_path: Path, method: str, mtp_layers: int) -> None:
+    config = {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": method},
+              "text_config": {**SPLIT_CONFIGS["qwen4"]["text_config"], "mtp_num_hidden_layers": mtp_layers}}
+    result = _family_launch_result(tmp_path, config, "test/model", "EXPERT_BACKEND=local\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert "--local-experts" in launch and "--mtp " not in launch
+
+
+@pytest.mark.parametrize("method", ["fp8", "nvfp4"])
+def test_qwen_unqualified_explicit_mtp_keeps_the_existing_depth(tmp_path: Path, method: str) -> None:
+    config = {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": method}}
+    result = _family_launch_result(tmp_path, config, "test/model", "EXPERT_BACKEND=local\nSPECULATOR=mtp\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert "--local-experts" in launch and "--mtp 1" in launch
+
+
+@pytest.mark.parametrize("restart,admitted_gib", [(False, 12000 / 1024), (True, 96000 / 1024)])
+def test_qwen_restart_admission_credits_only_its_own_gpu_memory(tmp_path: Path, restart: bool,
+                                                              admitted_gib: float) -> None:
+    result = _family_launch_result(tmp_path, {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}},
+                                  "test/model", "INSTANCE=own\n", preferred_ranks=0, restart=restart,
+                                  gpu_free_mib=12000, container_pids=(123,),
+                                  gpu_allocations=((123, 84000), (456, 2000)))
+    assert result.returncode == 0, result.stderr
+    preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    assert f"--rtx-gib {admitted_gib}" in preflight
+
+
+def test_qwen_other_formats_skip_the_local_qualification_preflight(tmp_path: Path) -> None:
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",
+                                  "", preferred_ranks=0)
+    assert result.returncode == 0, result.stderr
+    assert "cuteafd plan" not in result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert "--peers" in launch and "--local-experts" not in launch
+
+
+@pytest.mark.parametrize("previous_peers,cleanup", [(None, False), ("10.0.0.1:19555", True),
+                                                   ("10.0.0.9:19555", False)])
+def test_qwen_local_restart_releases_only_its_previous_workers(tmp_path: Path, previous_peers: str | None,
+                                                             cleanup: bool) -> None:
+    result = _family_launch_result(tmp_path, {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}},
+                                  "test/model", "INSTANCE=own\n", preferred_ranks=0, restart=True,
+                                  previous_peers=previous_peers)
+    assert result.returncode == 0, result.stderr
+    assert ("docker rm -f cuteafd-spark-expert-h0-19555" in result.stderr) == cleanup
+    assert "filter name=^cuteafd-spark-expert-" not in result.stderr

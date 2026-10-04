@@ -621,7 +621,7 @@ impl<'a> MimoEngine<'a> {
         let library = self.library;
         let rows = self.prefill_rows.max(DECODE_ROWS);
         let exchange = PeerExchange::new_abortable(library, [RankDevice { device: self.device, stream: self.stream },
-            RankDevice { device, stream }], 4 * super::admission::transport_lanes(true)?.max(2),
+            RankDevice { device, stream }], 4 * super::admission::transport_lanes(true, &self.cfg)?.max(2),
             rows * self.cfg.hidden * 2)?;
         let zeroed = |bytes: usize| -> Result<Rc<Allocation<'a>>> {
             let allocation = Rc::new(Allocation::new(Device { library, id: device }, bytes.max(256))?);

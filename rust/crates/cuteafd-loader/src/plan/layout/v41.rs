@@ -15,7 +15,8 @@ pub fn native_expert_bytes(experts: u64, hidden: u64, intermediate: u64) -> u64 
 
 /// Default backbone/dSpark weights, without routed backbone experts. Vision
 /// remains BF16 on RTX0. Target embedding lives on RTX0, target normalization
-/// on the decoder (RTX1 under CED), and vocabulary is evenly partitioned.
+/// on the decoder (RTX1 under CED), and vocabulary is evenly partitioned
+/// in the default single-copy FP8 representation.
 /// dSpark weights stay on the decoder; default experts are full copies there.
 /// Unsupported native format changes return None instead of an exact claim.
 pub fn resident_weights(checkpoint: &Checkpoint, ranks: usize, dspark: bool)
@@ -28,6 +29,7 @@ pub fn resident_weights(checkpoint: &Checkpoint, ranks: usize, dspark: bool)
         return None;
     }
     let decoder = ranks - 1;
+    let head_mode = std::env::var("CUTEAFD_V41_FP8_HEAD").unwrap_or_default();
     let mut totals: Vec<BTreeMap<(Category, String, String), u64>> = vec![BTreeMap::new(); ranks];
     let mut add = |rank: usize, category, group: &str, format: &str, bytes: u64| {
         *totals[rank].entry((category, group.into(), format.into())).or_default() += bytes;
@@ -49,7 +51,8 @@ pub fn resident_weights(checkpoint: &Checkpoint, ranks: usize, dspark: bool)
             continue;
         }
         if name == "head.weight" {
-            for rank in 0..ranks { add(rank, Category::Weights, "lm_head", &format, bytes / ranks as u64); }
+            let (resident, head_format) = vocabulary_bytes(bytes / ranks as u64, &head_mode);
+            for rank in 0..ranks { add(rank, Category::Weights, "lm_head", head_format, resident); }
             continue;
         }
         if name == "embed.weight" { add(0, Category::Embedding, "embedding", &format, bytes); continue; }
@@ -91,6 +94,17 @@ pub fn resident_weights(checkpoint: &Checkpoint, ranks: usize, dspark: bool)
     }
     Some(totals.into_iter().map(|rank| rank.into_iter().map(|((category, group, format), bytes)|
         Item::new(category, group, format, bytes, Basis::Formula)).collect()).collect())
+}
+
+// Mirror the vocabulary packer: one E4M3 value and FP32 scales per 128-K
+// block. Draft-only retains the BF16 target; all mode releases it after packing.
+fn vocabulary_bytes(source: u64, mode: &str) -> (u64, &'static str) {
+    let packed = source / 2 + source / 64;
+    match mode {
+        "off" | "0" | "bf16" => (source, "bf16"),
+        "draft" => (source + packed, "bf16+fp8-row128"),
+        _ => (packed, "fp8-row128"),
+    }
 }
 
 /// Target snapshots always live on RTX0, even with partitioned live caches.
@@ -136,6 +150,17 @@ mod tests {
     }
 
     #[test]
+    fn vocabulary_counts_single_fp8_copy_and_explicit_overrides() {
+        let source = 129280 * 5120 * 2;
+        let packed = 129280 * (5120 + 40 * 4);
+        assert_eq!(vocabulary_bytes(source, ""), (packed, "fp8-row128"));
+        assert_eq!(vocabulary_bytes(source, "all"), (packed, "fp8-row128"));
+        assert_eq!(vocabulary_bytes(source, "off"), (source, "bf16"));
+        assert_eq!(vocabulary_bytes(source, "draft"), (source + packed, "bf16+fp8-row128"));
+        assert_eq!(vocabulary_bytes(source / 2, "all").0 * 2, packed);
+    }
+
+    #[test]
     fn resident_weights_match_ced_and_discard_transient_shared_scales() {
         use crate::plan::checkpoint::CheckpointTensor;
         use crate::SafetensorsTensorMetadata;
@@ -160,8 +185,8 @@ mod tests {
         let single = resident_weights(&checkpoint, 1, false).unwrap();
         let dual = resident_weights(&checkpoint, 2, false).unwrap();
         let sum = |items: &[Item]| items.iter().map(|i| i.bytes).sum::<u64>();
-        assert_eq!(sum(&single[0]), 200 + 200 + 20 + 3300 + 6600 + 3300 + 100);
-        assert_eq!(sum(&dual[0]), 200 + 100 + 3300 + 1650);
-        assert_eq!(sum(&dual[1]), 100 + 20 + 6600 + 1650);
+        assert_eq!(sum(&single[0]), 200 + 103 + 20 + 3300 + 6600 + 3300 + 100);
+        assert_eq!(sum(&dual[0]), 200 + 51 + 3300 + 1650);
+        assert_eq!(sum(&dual[1]), 51 + 20 + 6600 + 1650);
     }
 }

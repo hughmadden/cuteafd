@@ -88,16 +88,18 @@ pub(crate) struct EngineArgs {
     /// per row x 128-K block (row128) or per row (channel) at load, then the
     /// only resident copy: decode rows up to 16 on the FP8 GEMV, wider verify
     /// steps and prefill W8A16 (W8A8 with --fp8-prefill kda-in/kda-o).
-    /// Default row128: measured faster (1 RTX + 2 Sparks, with the FP8 head and
-    /// drafter: C4 code 113.8 -> 131.8 tok/s, KL 0.046 -> 0.044, NLL 3.481 -> 3.470,
-    /// top-1 89.1% -> 85.7%); off keeps checkpoint BF16.
-    #[arg(long, value_enum, default_value = "row128")]
+    /// Default off (the checkpoint's BF16, one copy). row128 is faster (1 RTX + 2
+    /// Sparks, with the FP8 head and drafter: C4 code 113.8 -> 131.8 tok/s) but costs
+    /// 3.4 points top-1 (89.1% -> 85.7%) and doubles verify-vs-decode rounding
+    /// (6-row replay check: KL 0.0056 -> 0.0121 nat), enough to flip greedy
+    /// output under speculation; opt-in.
+    #[arg(long, value_enum, default_value = "off")]
     pub kda_fp8: fp8::KdaFp8,
     /// Keep only an E4M3 LM head (per row x 128-K scales, quantized at load):
     /// every logits call (target, verify, prefill, DFlash drafts) runs the FP8
     /// head program in 16-row spans; no BF16 head stays resident.
-    /// Default on (measured with --kda-fp8 row128 above); false keeps BF16.
-    #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true",
+    /// Default off (BF16 head, one copy); opt-in with the FP8 KDA projections above.
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true",
         action = clap::ArgAction::Set)]
     pub fp8_head: bool,
     /// Numerics gate only: round the KDA projections through NVFP4 (group 16,
@@ -203,8 +205,8 @@ mod draft_cli_tests {
     #[test]
     fn kda_w8a8_prefill_needs_fp8_kda_weights() {
         let defaults = parse(&[]);
-        assert_eq!((defaults.kda_fp8, defaults.fp8_head), (fp8::KdaFp8::Row128, true));
-        check_options(&parse(&["--fp8-prefill", "kda-in"])).unwrap();
+        assert_eq!((defaults.kda_fp8, defaults.fp8_head, defaults.draft_fp8), (fp8::KdaFp8::Off, false, None));
+        check_options(&parse(&["--kda-fp8", "row128", "--fp8-prefill", "kda-in"])).unwrap();
         for extra in [&["--kda-fp8", "off", "--fp8-prefill", "kda-in"][..],
             &["--kda-fp8", "off", "--fp8-prefill", "mla,kda-o"][..], &["--kda-fp8", "off", "--fp8-prefill", "kda-o"][..]] {
             let error = check_options(&parse(extra)).unwrap_err().to_string();

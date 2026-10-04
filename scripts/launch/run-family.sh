@@ -7,6 +7,7 @@
 # Containers use run.sh's names, so ./stop.sh stops them.
 set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$repo_root/scripts/lib/release-common.sh"
 config="$repo_root/cuteafd.config"
 restart=0
 family=""
@@ -21,9 +22,14 @@ done
 # Plain KEY=VALUE lines; the launch reads only the keys below.
 declare -A cfg
 while IFS='=' read -r key value; do
-  [[ "$key" =~ ^[A-Z_0-9]+$ ]] && cfg[$key]="$value"
+  release_known_key "$key" || release_die "unknown configuration key: $key"
+  cfg[$key]="$value"
 done < <(grep -E '^[A-Z_0-9]+=' "$config")
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
+# Validate the name before it is used to identify allocations during admission.
+instance="$(get INSTANCE)"
+[[ -z "$instance" || "$instance" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$ ]] || { echo "INSTANCE must be [A-Za-z0-9_.-]" >&2; exit 2; }
+coordinator_name="cuteafd-coordinator${instance:+-$instance}"
 # key NEW OLD [DEFAULT]: a renamed key; the pre-rename spelling works for one
 # release with a warning.
 key() {
@@ -53,6 +59,53 @@ case "$family" in
   qwen4) serve=serve-qwen4 ;;
   *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2 and Qwen 3.8 checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
 esac
+# EXPERT_BACKEND=auto prefers qualified local experts when the planner admits
+# their weights plus serving reservations on the selected GPU. SPARK_COUNT is
+# the fallback topology; EXPERT_BACKEND=spark explicitly keeps it.
+ranks="$(get SPARK_COUNT 4)"
+configured_ranks="$ranks"
+backend="$(get EXPERT_BACKEND auto)"
+case "$backend" in
+  auto|spark) ;;
+  local) ranks=0 ;;
+  *) echo "EXPERT_BACKEND must be auto, local or spark" >&2; exit 2 ;;
+esac
+qwen_exl3=0
+qwen_mtp=0
+if [[ "$family" == qwen4 ]]; then
+  qwen_features="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); q=c.get("quantization_config", {}); print(int(q.get("quant_method", q.get("method")) == "exl3"), c.get("text_config", c).get("mtp_num_hidden_layers", 0))' "$root/snapshots/$revision/config.json")"
+  read -r qwen_exl3 qwen_mtp <<<"$qwen_features"
+fi
+if [[ "$qwen_exl3" == 1 && "$backend" == auto && "$ranks" != 0 ]]; then
+  selected="$(get COORDINATOR_GPUS "$(get COORDINATOR_GPU 0)")"; selected="${selected%%,*}"
+  free_mib="$(nvidia-smi --id="$selected" --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' || true)"
+  if [[ "$free_mib" =~ ^[0-9]+$ ]]; then
+    if [[ "$restart" == 1 ]]; then
+      # --restart will release this container's allocations after validation.
+      # Credit only its host PIDs on this GPU, never another launch's memory.
+      own_pids="$(docker top "$coordinator_name" -eo pid 2>/dev/null | tail -n +2 || true)"
+      if [[ -n "$own_pids" ]]; then
+        own_mib="$(nvidia-smi --id="$selected" --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null \
+          | python3 -c 'import csv,sys; p=set(sys.argv[1].split()); print(sum(int(r[1].strip()) for r in csv.reader(sys.stdin) if len(r)==2 and r[0].strip() in p and r[1].strip().isdigit()))' "$own_pids" || true)"
+        [[ "$own_mib" =~ ^[0-9]+$ ]] && free_mib=$((free_mib + own_mib))
+      fi
+    fi
+    free_gib="$(python3 -c 'import sys; print(int(sys.argv[1])/1024)' "$free_mib")"
+    pool="$(get POOL_TOKENS 32768)"
+    if [[ "$pool" =~ ^[1-9][0-9]*$ ]]; then
+      # CPU-only preflight reads checkpoint headers in the selected serving image.
+      # Older images that do not qualify auto placement keep the Spark fallback.
+      preferred="$(docker run --rm --network none -v "$hub:/root/.cache/huggingface/hub:ro" \
+        "$(get COORDINATOR_DOCKER_INFERENCE)" cuteafd plan "$snapshot" --json --layout \
+        --rtx 1 --rtx-gib "$free_gib" --coordinator-budget-gib "$free_gib" --pool-tokens "$pool" \
+        | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["spark_ranks"])' 2>/dev/null || true)"
+      if [[ "$preferred" == 0 ]]; then
+        echo "note: Qwen EXL3 auto selected resident local experts on GPU $selected; EXPERT_BACKEND=spark forces Spark ranks" >&2
+        ranks=0
+      fi
+    fi
+  fi
+fi
 layer_args="--first-layer $first_layer"
 [[ "$last_layer" == -1 ]] || layer_args+=" --last-layer $last_layer"
 # Snapshot of a model id (and optional revision) inside the containers.
@@ -62,14 +115,14 @@ snapshot_of() {
   [[ -d "$dir/snapshots/$rev" ]] || { echo "missing snapshot $id@$rev" >&2; return 1; }
   printf '%s' "/root/.cache/huggingface/hub/models--${id//\//--}/snapshots/$rev"
 }
-# SPECULATOR picks the drafter (default off; GLM 5.3 Flash: its checkpoint's
-# measured best, see glm5_flash_speculator below):
+# SPECULATOR picks the drafter (Qwen local EXL3: MTP3; GLM 5.3 Flash: its
+# checkpoint's measured best, see glm5_flash_speculator below; otherwise off):
 #   dflash2  GLM 5.x / GLM 5.3 Flash: the DFlash2 checkpoint SPECULATOR_MODEL_ID
 #            (e.g. incoai/GLM-5.3-DFlash2, incoai/GLM-5.3-Flash-DFlash2);
 #            MiMo V2.6 Pro: the snapshot's own dflash/ drafter unless
 #            SPECULATOR_MODEL_ID names one (V2.6 Pro needs SPARK_COUNT=6)
 #   mtp      MiMo V2 Flash, Qwen 3.8: the checkpoint's native MTP layers,
-#            SPECULATOR_DEPTH drafts (default 1)
+#            SPECULATOR_DEPTH drafts (qualified local Qwen default 3; otherwise 1)
 #   dspark   DeepSeek V4 (its own drafter); GLM 5.3 Flash: the dSpark
 #            checkpoint SPECULATOR_MODEL_ID (RedHatAI/GLM-5.3-Flash-speculator.dspark-preview)
 # MiMo unset drafts in single-copy FP8 (the measured family default);
@@ -105,11 +158,18 @@ if [[ -z "$speculator" ]]; then
       speculator=off default_drafter=""
     fi
   fi
+  # Only the resident EXL3 path is qualified. Spark workers serve backbone
+  # layers, not mtp.layers.0; other expert formats keep their opt-in status.
+  # An explicit SPECULATOR=off or legacy MTP=0 disables the family default.
+  if [[ $speculator == off && $qwen_exl3 == 1 && $qwen_mtp == 1 && $ranks == 0 && -z ${cfg[MTP]+set} ]]; then
+    speculator=mtp
+    echo "note: Qwen local EXL3 drafts with native MTP (default depth 3); SPECULATOR=off disables it" >&2
+  fi
 fi
 case "$family:$speculator" in
   qwen4:mtp)
     # The MTP layer's experts run on the coordinator: only with local experts (SPARK_COUNT=0).
-    [[ "$(get SPARK_COUNT 4)" == 0 ]] ||
+    [[ "$ranks" == 0 ]] ||
       { echo "SPECULATOR=mtp for Qwen needs SPARK_COUNT=0 (local experts); the Spark ranks do not serve the MTP layer's experts" >&2; exit 2; } ;;
   *:off|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|deepseek_v4:dspark) ;;
   *) echo "SPECULATOR=$speculator does not apply to $family" >&2; exit 2 ;;
@@ -150,7 +210,10 @@ case "$speculator" in
     else
       echo "SPECULATOR=$speculator needs SPECULATOR_MODEL_ID (a ${speculator/dflash2/DFlash2} checkpoint)" >&2; exit 2
     fi ;;
-  mtp) family_args+=(--mtp "$(key SPECULATOR_DEPTH MTP 1)") ;;
+  mtp)
+    mtp_depth=1
+    [[ $qwen_exl3 != 1 || $qwen_mtp != 1 || $ranks != 0 ]] || mtp_depth=3
+    family_args+=(--mtp "$(key SPECULATOR_DEPTH MTP "$mtp_depth")") ;;
 esac
 # SPECULATOR_DRAFTS: adaptive (default) or a fixed draft count per cycle
 # (DFlash2 on GLM 5.x, GLM 5.3 Flash and MiMo V2; dSpark on GLM 5.3 Flash), for policy A/B runs.
@@ -227,10 +290,11 @@ fi
 # GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
 # from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" requires native
 # FP8 block tensors in the primary checkpoint, else BF16 ones are quantized to
-# 128x128 blocks at load). GLM5_FLASH_KDA_FP8 (unset/auto = row128, channel, off)
-# replaces the KDA in/out projections with per-row FP8 at load (their only
-# resident copy); off keeps the checkpoint BF16. GLM5_FLASH_FP8_HEAD (default on)
-# keeps only a per-row FP8 LM head (target and drafter); off keeps BF16.
+# 128x128 blocks at load). GLM5_FLASH_KDA_FP8 (unset/auto/off = the checkpoint's
+# BF16, one copy; row128 or channel) opts into per-row FP8 KDA in/out projections
+# (their only resident copy: faster, but -3.4 points top-1 and twice the verify
+# rounding). GLM5_FLASH_FP8_HEAD (default off) opts into a per-row FP8 LM head
+# (target and drafter); the DFlash2 drafter stays FP8 by default.
 # Its MLA pools hold POOL_TOKENS tokens (a key every
 # family with a paged KV pool reads). GLM5_FLASH_FP8_PREFILL lists the prefill
 # projections that run W8A8 (E4M3 activations per 128-K block): unset = the
@@ -245,16 +309,16 @@ if [[ $family == glm5_flash ]]; then
   fi
   kda_fp8="$(key GLM5_FLASH_KDA_FP8 GLMF_KDA_FP8 auto)"
   case "$kda_fp8" in
-    ""|auto) kda_fp8=row128 ;;
+    ""|auto) kda_fp8=off ;;
     off|row128|channel) ;;
     *) echo "GLM5_FLASH_KDA_FP8 must be auto, off, row128 or channel" >&2; exit 2 ;;
   esac
   # Default auto (GLM 5.3 Flash 1 RTX + 2: 65536 -> 2,097,152 tokens, 44 GiB still free, speed unchanged).
   glmf_pool="$(get POOL_TOKENS auto)"; [[ "$glmf_pool" != auto ]] || glmf_pool=0
   family_args+=(--kda-fp8 "$kda_fp8" --pool-tokens "$glmf_pool")
-  case "$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD on)" in
-    on|auto|"") family_args+=(--fp8-head true) ;;
-    off) family_args+=(--fp8-head false) ;;
+  case "$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD off)" in
+    on) family_args+=(--fp8-head true) ;;
+    off|auto|"") family_args+=(--fp8-head false) ;;
     *) echo "GLM5_FLASH_FP8_HEAD must be on or off" >&2; exit 2 ;;
   esac
   fp8_prefill="$(key GLM5_FLASH_FP8_PREFILL GLMF_FP8_PREFILL)"
@@ -280,6 +344,16 @@ fi
 # prefill (the engine's default 0.2; 0 prefills whole prompts before the next
 # step). Keys left unset pass nothing (images older than the options run).
 [[ -z "$(get DECODE_SHARE)" ]] || family_args+=(--decode-share "$(get DECODE_SHARE)")
+# DeepSeek V4 keeps complete expert layers local while memory permits. Honor
+# an explicit limit; zero leaves the backbone experts on the Sparks.
+if [[ $serve == serve-dsv4 ]]; then
+  local_layers="$(get RTX_EXPERT_LAYERS auto)"
+  case "$local_layers" in
+    ""|auto) ;;
+    *[!0-9]*) echo "RTX_EXPERT_LAYERS must be auto or a nonnegative integer" >&2; exit 2 ;;
+    *) family_args+=(--local-expert-layers "$local_layers") ;;
+  esac
+fi
 # GLM, GLM Flash, MiMo, Qwen: L2_PREFETCH (off, auto = 3/4 of the L2, or MiB;
 # unset: auto for GLM 5.3 and GLM 5.3 Flash, off for MiMo and Qwen) pulls the
 # next layer's weights into L2 during each one-lane decode step's Spark exchange; FP8_SCALES (amax, pow2, best) is the scale rule of the FP8
@@ -330,7 +404,6 @@ fi
 spark_image="$(get SPARK_EXPERT_DOCKER_INFERENCE)"
 port="$(get EXPERT_PORT 19441)"
 addr="$(get ADDR 0.0.0.0:8000)"
-ranks="$(get SPARK_COUNT 4)"
 budget="$(get SPARK_DEVICE_BUDGET_BYTES 107374182400)"
 gpu="$(get COORDINATOR_GPU 0)"
 # Two coordinator GPUs (RTX_GPUS=auto/2 with COORDINATOR_GPU as V4.1's two-RTX config picks
@@ -412,9 +485,6 @@ fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is
 # cuteafd-coordinator-INSTANCE; empty keeps the one cuteafd-coordinator.
-instance="$(get INSTANCE)"
-[[ -z "$instance" || "$instance" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$ ]] || { echo "INSTANCE must be [A-Za-z0-9_.-]" >&2; exit 2; }
-coordinator_name="cuteafd-coordinator${instance:+-$instance}"
 # SPARK_COUNT=0: the routed experts run on the coordinator GPU (--local-experts;
 # GLM 5.3 Flash, MiMo V2 and Qwen 3.8), the natural minimum for checkpoints
 # that fit one RTX.
@@ -445,12 +515,30 @@ if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
   done
 fi
 peers=()
-# --restart removes this launcher's containers (stop.sh's release parser rejects
-# the keys above, e.g. SPECULATOR).
+# --restart removes this launcher's containers; stop.sh accepts the same keys.
 # One model is served at a time: every expert worker on these hosts goes, whatever
 # its port (a leftover worker of another model holds Spark memory and OOMs the next).
 if [[ "$restart" == 1 ]]; then
+  previous_csv=""
+  if [[ "$ranks" == 0 && "$configured_ranks" != 0 ]]; then
+    # Switching to local experts must release this coordinator's old workers.
+    # A new local launch must not stop another instance's Spark workers.
+    previous_csv="$(docker inspect --format '{{json .Config.Cmd}}' "$coordinator_name" 2>/dev/null \
+      | python3 -c 'import json,sys; c=json.load(sys.stdin); print(c[c.index("--peers")+1])' 2>/dev/null || true)"
+  fi
   docker rm -f "$coordinator_name" >/dev/null 2>&1 || true
+  if [[ -n "$previous_csv" ]]; then
+    IFS=, read -r -a previous_peers <<<"$previous_csv"
+    for ((rank = 0; rank < configured_ranks; rank++)); do
+      host="$(get "SPARK_${rank}_HOST")"; lane="$(get "SPARK_${rank}_LANE_A")"
+      for peer in "${previous_peers[@]}"; do
+        old_port="${peer##*:}"
+        if [[ "${peer%:*}" == "$lane" && "$old_port" =~ ^[0-9]+$ ]]; then
+          ssh "$host" "docker rm -f cuteafd-spark-expert-$host-$old_port >/dev/null 2>&1 || true"
+        fi
+      done
+    done
+  fi
   for ((rank = 0; rank < ranks; rank++)); do
     host="$(get "SPARK_${rank}_HOST")"
     ssh "$host" 'ids=$(docker ps -aq --filter name=^cuteafd-spark-expert-); [ -z "$ids" ] || docker rm -f $ids >/dev/null 2>&1 || true'

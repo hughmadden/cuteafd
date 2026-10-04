@@ -129,6 +129,16 @@ class StopHarness(unittest.TestCase):
 
 
 class StopHostScopeTest(StopHarness):
+    def test_mimo_dflash_config_stops_every_named_host(self):
+        config = write_config(self.root / "mimo.config", SIX_HOSTS, spark_count=6,
+                              extra="SPECULATOR=dflash2\n"
+                                    "SPECULATOR_MODEL_ID=test/drafter\n"
+                                    "SPECULATOR_FP8=auto\nPOOL_TOKENS=auto\n"
+                                    "COORDINATOR_SPLIT=head\nMIMO_FP8_HEAD=on")
+        result, lines, _ = self.run_stop("--config", str(config))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(set(self.hosts(lines))), sorted(SIX_HOSTS))
+
     def test_all_named_hosts_stop_even_when_spark_count_is_smaller(self):
         """Six hosts named, SPARK_COUNT=4: all six are cleaned."""
         config = write_config(self.root / "six-hosts-count4.config",

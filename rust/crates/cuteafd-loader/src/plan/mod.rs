@@ -539,6 +539,52 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
     report.experts = contract;
 }
 
+/// Select a measured faster local layout when it fits a serving reservation.
+/// Explicit placements use `plan` instead. Qualification is intentionally narrow:
+/// Qwen EXL3 K4/K5 has resident TP1 experts; other formats retain their placement.
+pub fn plan_preferred(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanError> {
+    let fallback = plan(snapshot, options)?;
+    if fallback.family.as_deref() != Some("qwen4")
+        || fallback.experts.as_ref().is_none_or(|e| e.package != "qwen4:exl3-k45" || e.local.is_err()) {
+        return Ok(fallback);
+    }
+    // The runtime reserves 12 GiB before loading resident experts (4096-row
+    // logits, two lane workspaces, recurrent/prefix state and graph growth).
+    // Reserve the optional native MTP weights too, even when drafting is off.
+    let mtp: u64 = fallback.components.iter()
+        .filter(|c| matches!(c.component, Component::Speculator | Component::SpeculatorExpert))
+        .map(|c| c.bytes).sum();
+    let mut layout = options.layout.clone().unwrap_or_else(|| layout::LayoutOptions {
+        // The coordinator budget is weight-only; the default inventory is
+        // the same 95.5 GiB RTX used by `plan --layout`.
+        pool_tokens: Some(32_768),
+        ..Default::default()
+    });
+    layout.head_split = false;
+    // The layout already charges native MTP weights and expert arenas.
+    // Keep the weight-only admission reserve without duplicating them as
+    // an external drafter in the per-device layout.
+    let capacity = layout.rtx_bytes.first().copied().unwrap_or(options.coordinator_budget_bytes);
+    let local_options = PlanOptions {
+        placement: ExpertPlacement::Local,
+        coordinator_budget_bytes: options.coordinator_budget_bytes.min(capacity.saturating_sub(12 << 30).saturating_sub(mtp)),
+        layout: Some(layout),
+        ..options.clone()
+    };
+    if local_options.coordinator_budget_bytes == 0 { return Ok(fallback); }
+    let mut local = plan(snapshot, &local_options)?;
+    if !local.executable() || local.memory_layout.as_ref().is_none_or(|l| l.pool_tokens == 0
+        || l.devices.iter().any(|d| d.free_bytes() < 0)) {
+        return Ok(fallback);
+    }
+    local.hints.push(Hint {
+        what: "Qwen EXL3: prefer resident local experts (qualified faster than Spark TP4)".into(),
+        how: "Explicit --spark-ranks selects a Spark layout; launcher EXPERT_BACKEND=spark overrides auto.".into(),
+    });
+    if options.layout.is_none() { local.memory_layout = None; }
+    Ok(local)
+}
+
 /// Human-readable report.
 pub fn render(report: &PlanReport) -> String {
     use std::fmt::Write;

@@ -18,6 +18,9 @@ pub struct RunOptions {
     pub export: Vec<String>,
     /// Output directory; `None`: `benchmarks/<family>/<date>-<profile>-<hardware>/` under `root`.
     pub out: Option<PathBuf>,
+    /// Appended to the default directory name (a smoke card's name), so runs of
+    /// one checkpoint on the same hardware and day do not overwrite each other.
+    pub label: Option<String>,
     pub root: PathBuf,
     pub api_key: Option<String>,
     pub quiet: bool,
@@ -41,6 +44,18 @@ pub fn default_dir(root: &Path, report: &Report) -> PathBuf {
     let family = report.server.family.clone().unwrap_or_else(|| "unknown".into());
     root.join("benchmarks").join(family).join(format!("{}-{}-{}-{}", crate::render::date(&report.created),
         report.profile, model_slug(&report.server.checkpoint()), report.server.hardware.slug()))
+}
+
+/// [`default_dir`] with `-<label>` appended (slugged) when a label is given.
+pub fn labeled_dir(root: &Path, report: &Report, label: Option<&str>) -> PathBuf {
+    let dir = default_dir(root, report);
+    match label.map(model_slug).filter(|l| !l.is_empty()) {
+        Some(label) => {
+            let name = format!("{}-{label}", dir.file_name().map(|n| n.to_string_lossy()).unwrap_or_default());
+            dir.with_file_name(name)
+        }
+        None => dir,
+    }
 }
 
 /// The checkpoint's last path segment, lowercase, runs of other characters as one `-`
@@ -137,7 +152,7 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
                 .with_context(|| format!("run {id} on {base}")),
         },
     };
-    let dir = options.out.clone().unwrap_or_else(|| default_dir(&options.root, &report));
+    let dir = options.out.clone().unwrap_or_else(|| labeled_dir(&options.root, &report, options.label.as_deref()));
     let written = write_exports(&report, &dir, &options.export)?;
     if !options.quiet {
         for path in &written {
@@ -256,4 +271,20 @@ pub fn write_if_changed(path: &Path, text: &str) -> Result<bool> {
     let mut file = std::fs::File::create(path).with_context(|| format!("writing {}", path.display()))?;
     file.write_all(text.as_bytes())?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_label_keeps_two_cards_of_one_checkpoint_apart() {
+        let report = crate::sample::report(false);
+        let root = std::path::Path::new("/r");
+        let base = super::default_dir(root, &report);
+        let a = super::labeled_dir(root, &report, Some("glm53f-exl3-min"));
+        let b = super::labeled_dir(root, &report, Some("glm53f-bf16kda-c8"));
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), base.parent());
+        assert!(a.file_name().unwrap().to_string_lossy().ends_with("-glm53f-exl3-min"));
+        assert_eq!(super::labeled_dir(root, &report, None), base);
+    }
 }

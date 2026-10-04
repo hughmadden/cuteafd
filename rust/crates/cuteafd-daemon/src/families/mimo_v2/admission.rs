@@ -134,7 +134,7 @@ pub(super) fn preflight(
         .iter()
         .map(|costs| costs.iter().map(|r| r.bytes).sum::<u64>())
         .collect::<Vec<_>>();
-    let transport_lanes = transport_lanes(backend == ExpertBackend::Spark)?;
+    let transport_lanes = transport_lanes(backend == ExpertBackend::Spark, cfg)?;
     let spark_ranks = match args
         .peers
         .as_deref()
@@ -491,18 +491,29 @@ fn expert_backend(routed_layers: usize, skip: bool, local: bool, peers: bool) ->
     }
 }
 
-pub(super) fn transport_lanes(spark: bool) -> Result<usize> {
+pub(super) fn transport_lanes(spark: bool, cfg: &MimoV2Config) -> Result<usize> {
     if !spark {
         return Ok(1);
     }
-    match std::env::var("CUTEAFD_MIMO_PREFILL_LANES").as_deref() {
-        Ok("1") => Ok(1),
-        Ok("2") => Ok(2),
+    let configured = std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok();
+    resolve_transport_lanes(spark, cfg.program_family()?, configured.as_deref())
+}
+
+fn resolve_transport_lanes(spark: bool, family: &str, configured: Option<&str>) -> Result<usize> {
+    if !spark {
+        return Ok(1);
+    }
+    match configured {
+        Some("1") => Ok(1),
+        Some("2") => Ok(2),
         // Three lanes: 1 RTX 8K prefill 2951 -> 2745 ms, 2 RTX equal, C4 code
         // 219 -> 247 tok/s (MiMo V2.6 Pro TP6).
-        Ok("3") | Err(_) => Ok(3),
-        Ok("4") => Ok(4),
-        Ok(other) => anyhow::bail!("CUTEAFD_MIMO_PREFILL_LANES is 1, 2, 3 or 4, not {other}"),
+        Some("3") => Ok(3),
+        Some("4") => Ok(4),
+        // Flash TP4 prefill is faster with two larger waves; the Pro TP6
+        // measurement above does not apply to its smaller expert geometry.
+        None => Ok(if matches!(family, "mimo" | "mimo2") { 2 } else { 3 }),
+        Some(other) => anyhow::bail!("CUTEAFD_MIMO_PREFILL_LANES is 1, 2, 3 or 4, not {other}"),
     }
 }
 
@@ -976,6 +987,19 @@ pub(super) fn workspace_native_scratch(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prefill_lane_defaults_follow_family_and_preserve_explicit_overrides() {
+        for (family, default) in [("mimo", 2), ("mimo2", 2), ("mimop", 3), ("mimop2", 3)] {
+            assert_eq!(super::resolve_transport_lanes(true, family, None).unwrap(), default);
+            for lanes in 1..=4 {
+                let configured = lanes.to_string();
+                assert_eq!(super::resolve_transport_lanes(true, family, Some(&configured)).unwrap(), lanes);
+            }
+            assert!(super::resolve_transport_lanes(true, family, Some("5")).is_err());
+            assert_eq!(super::resolve_transport_lanes(false, family, Some("5")).unwrap(), 1);
+        }
+    }
+
     #[test]
     fn reservations_follow_the_executed_expert_backend() {
         use super::{expert_backend, ExpertBackend};

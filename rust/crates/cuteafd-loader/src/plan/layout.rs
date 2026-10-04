@@ -725,7 +725,8 @@ fn load_conversions(family: &str, checkpoint: &super::Checkpoint) -> Vec<Convers
         // GLM 5.3 Flash serves MLA, dense and shared-expert projections as FP8
         // from the official FP8 release (--fp8-snapshot); a BF16 checkpoint's
         // copies of them are not loaded. KDA in/out projections and the head
-        // default to one per-row FP8 copy (--kda-fp8 row128, --fp8-head).
+        // stay the checkpoint's BF16 by default (FP8 copies are opt-in:
+        // --kda-fp8 row128, --fp8-head), so only the MLA half converts.
         "glm5_flash" => {
             let bf16 = |c: &crate::plan::checkpoint::CheckpointTensor| c.meta.dtype == cuteafd_core::DType::Bf16;
             let bytes = |filter: &dyn Fn(&str) -> bool| -> u64 {
@@ -739,22 +740,9 @@ fn load_conversions(family: &str, checkpoint: &super::Checkpoint) -> Vec<Convers
             let shared = bytes(&|n: &str| n.contains("shared_experts.") && n.ends_with("_proj.weight"));
             let dense = bytes(&|n: &str| n.contains(".mlp.") && !n.contains("experts") && n.ends_with("_proj.weight")
                 && !n.contains(".gate."));
-            let kda = bytes(&|n: &str| !mla_layers.iter().any(|p| n.starts_with(p.as_str())) && n.contains(".self_attn.")
-                && ["q_proj.weight", "k_proj.weight", "v_proj.weight", "f_a_proj.weight", "g_a_proj.weight",
-                    "b_proj.weight", "o_proj.weight"].iter().any(|s| n.ends_with(s)));
-            let head = bytes(&|n: &str| n == "lm_head.weight");
-            vec![Conversion { component: Component::Attention, saved_bytes: (mla + kda) / 2, format: "bf16+fp8" },
-                Conversion { component: Component::LmHead, saved_bytes: head / 2, format: "fp8-row128" },
+            vec![Conversion { component: Component::Attention, saved_bytes: mla / 2, format: "bf16+fp8" },
                 Conversion { component: Component::SharedExpert, saved_bytes: shared / 2, format: "fp8" },
                 Conversion { component: Component::DenseFfn, saved_bytes: dense / 2, format: "fp8" }]
-        }
-        // Qwen 3.8: target and MTP share one per-row FP8 head (--mtp-fp8-head).
-        "qwen4" => {
-            let head: u64 = checkpoint.tensors.iter()
-                .filter(|t| t.meta.name.ends_with("lm_head.weight") && t.meta.dtype == cuteafd_core::DType::Bf16)
-                .map(|t| t.meta.byte_length).sum();
-            if head == 0 { Vec::new() }
-            else { vec![Conversion { component: Component::LmHead, saved_bytes: head / 2, format: "fp8-row128" }] }
         }
         _ => Vec::new(),
     }

@@ -82,7 +82,7 @@ impl<'a> TargetHeadWeights<'a> {
             .map(|n| DeviceAllocation::new(self.library, n * capacity))
             .collect::<Result<Vec<_>>>()?;
         ensure!(
-            head.weight()?.device_id == buffers[0].buffer.device_id
+            head.device_id() == buffers[0].buffer.device_id
                 && self.norm.get("norm.weight")?.device_id == buffers[0].buffer.device_id,
             "target head weight device differs"
         );
@@ -199,7 +199,7 @@ impl TargetHeadWave<'_, '_> {
                 self.stream.raw,
             )?;
             crate::families::deepseek_v41::v41_tensors::project_vocabulary(self.stream.library, &self.projection,
-                self.head.weight()?, self.head.fp8().zip(self.fp8_scratch.as_ref()), self.b(3), self.b(4), rows,
+                self.head.weight(), self.head.fp8().zip(self.fp8_scratch.as_ref()), self.b(3), self.b(4), rows,
                 self.stream.raw)?;
             Ok(())
         }

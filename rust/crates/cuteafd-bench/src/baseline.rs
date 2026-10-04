@@ -190,7 +190,7 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
         check.summary = format!("the reference needs {} tokens of context", tokens.len());
         return Ok(());
     }
-    let spec = ProbeSpec { prompt_ids: Some(tokens), score_from: Some(reference.score_from), top_k: 1,
+    let spec = ProbeSpec { prompt_ids: Some(tokens), score_from: Some(reference.score_from), top_k: reference.top_k,
         want: reference.want(), cold: true, ..ProbeSpec::default() };
     let chat = run.client.chat(plain("fidelity probe", 1), Some(spec))?;
     let record = probe_of(&chat)?;
@@ -211,6 +211,9 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     check.set("kl_max", reference.expect.kl_max);
     check.set("top1_min", reference.expect.top1_min);
     check.set("reference", reference.name.clone());
+    // Preserve the teacher-forced rows so two weight policies can be compared
+    // on the same positions, including top-1 flips hidden by aggregate scores.
+    check.set("probe", serde_json::to_value(record)?);
     let ok = f.missing == 0 && f.non_finite == 0 && f.kl <= reference.expect.kl_max
         && f.top1 >= reference.expect.top1_min;
     check.status = if ok { CheckStatus::Pass } else { CheckStatus::Fail };
@@ -462,18 +465,41 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     if let Some(m) = margins.0.or(margins.1) {
         check.set("divergence_margin", m);
     }
-    if tie {
-        check.status = CheckStatus::Pass;
-        check.summary = format!("{speculator}: identical up to token {same} of {}, then a near-tie flips \
+    let decode_repeats = same_again == b.len() && again_record.generated.len() == b.len()
+        && repeat.identical == repeat.compared;
+    check.status = flip_verdict(tie, decode_repeats, &noise);
+    check.summary = if tie {
+        format!("{speculator}: identical up to token {same} of {}, then a near-tie flips \
             (top-two margin {:.3} nats) {rates}{}{repeat_note}", a.len().max(b.len()), margins.0.or(margins.1).unwrap_or(0.0),
-            noise.describe());
+            noise.describe())
     } else {
-        check.status = CheckStatus::Fail;
-        check.summary = format!("{speculator}: greedy output diverges at token {same} of {}{} {rates}{}{}",
+        format!("{speculator}: greedy output diverges at token {same} of {}{} {rates}{}{}{}",
             a.len().max(b.len()), margins.0.or(margins.1).map(|m| format!(" (top-two margin {m:.3} nats)"))
-                .unwrap_or_default(), noise.describe(), repeat_note);
-    }
+                .unwrap_or_default(), noise.describe(), repeat_note,
+            if check.status == CheckStatus::Info { " · not gated: verify rounding (plain decode repeats exactly, \
+                drafted rows already differed before the flip)" } else { "" })
+    };
     Ok(())
+}
+
+/// The lossless verdict for a drafts-on vs drafts-off flip.
+///
+/// A near tie passes. Otherwise the flip is verify rounding, reported but not
+/// gated, when plain decoding is deterministic (`decode_repeats`: the
+/// drafts-off rerun reproduced every token and row byte for byte) and the
+/// drafted rows already differed from one-row decode before the flip (verify
+/// steps round differently from single rows). It fails when plain decoding
+/// does not repeat (the comparison proves nothing) or when the rows were
+/// byte-identical up to the flip (a sudden change points at state, not
+/// rounding).
+fn flip_verdict(tie: bool, decode_repeats: bool, noise: &RowNoise) -> CheckStatus {
+    if tie {
+        CheckStatus::Pass
+    } else if decode_repeats && noise.compared > 0 && noise.identical < noise.compared {
+        CheckStatus::Info
+    } else {
+        CheckStatus::Fail
+    }
 }
 
 /// Per-row difference between two greedy runs' recorded rows over their
@@ -769,6 +795,21 @@ mod tests {
 
     fn check(id: &str, status: CheckStatus, metrics: Value) -> Check {
         Check { id: id.into(), status, metrics: metrics.as_object().cloned().unwrap_or_default(), ..Check::default() }
+    }
+
+    #[test]
+    fn a_flip_after_verify_rounding_is_informational_only_when_decode_repeats() {
+        let noise = |compared, identical| RowNoise { compared, identical, max: 0.1, median: 0.01, first_over: None };
+        // A near tie passes whatever else holds.
+        assert_eq!(flip_verdict(true, false, &noise(0, 0)), CheckStatus::Pass);
+        // Deterministic decode, and drafted rows differed before the flip: rounding.
+        assert_eq!(flip_verdict(false, true, &noise(30, 2)), CheckStatus::Info);
+        // Plain decode does not repeat: the comparison proves nothing.
+        assert_eq!(flip_verdict(false, false, &noise(30, 2)), CheckStatus::Fail);
+        // Byte-identical rows up to a large flip: state, not rounding.
+        assert_eq!(flip_verdict(false, true, &noise(30, 30)), CheckStatus::Fail);
+        // A flip at the first token leaves no pre-flip evidence.
+        assert_eq!(flip_verdict(false, true, &noise(0, 0)), CheckStatus::Fail);
     }
 
     #[test]

@@ -80,9 +80,9 @@ Sparks) and maximum (2× RTX + 4 or 6 Sparks) hardware. Other reports:
 <td width="40%" valign="top"><a href="benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-flash-2rtx-4spark/card.svg"><img src="benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-flash-2rtx-4spark/card.svg" alt="XiaomiMiMo/MiMo-V2-Flash on 2× RTX PRO 6000 @ 325 W + 4× DGX Spark"></a><br><sub>2× RTX + 4× Spark</sub></td>
 </tr>
 <tr>
-<td width="20%" valign="top"><a href="docs/models/mimo_v2.md"><b>MiMo V2</b></a><br><sub>XiaomiMiMo/MiMo-V2.6-Pro-RL</sub><br><sub>mxfp4-g32</sub></td>
-<td width="40%" valign="top"><a href="benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-6-pro-rl-1rtx-6spark/card.svg"><img src="benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-6-pro-rl-1rtx-6spark/card.svg" alt="XiaomiMiMo/MiMo-V2.6-Pro-RL on 1× RTX PRO 6000 @ 325 W + 6× DGX Spark"></a><br><sub>1× RTX + 6× Spark</sub></td>
-<td width="40%" valign="top"><a href="benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-6-pro-rl-2rtx-6spark/card.svg"><img src="benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-6-pro-rl-2rtx-6spark/card.svg" alt="XiaomiMiMo/MiMo-V2.6-Pro-RL on 2× RTX PRO 6000 @ 325 W + 6× DGX Spark"></a><br><sub>2× RTX + 6× Spark</sub></td>
+<td width="20%" valign="top"><a href="docs/models/mimo_v2.md"><b>MiMo V2</b></a><br><sub>XiaomiMiMo/MiMo-V2.6-Pro-MOPD</sub><br><sub>mxfp4-g32</sub></td>
+<td width="40%" valign="top"><a href="benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-1rtx-6spark/card.svg"><img src="benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-1rtx-6spark/card.svg" alt="XiaomiMiMo/MiMo-V2.6-Pro-MOPD on 1× RTX PRO 6000 @ 325 W + 6× DGX Spark"></a><br><sub>1× RTX + 6× Spark</sub></td>
+<td width="40%" valign="top"><a href="benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-2rtx-6spark/card.svg"><img src="benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-2rtx-6spark/card.svg" alt="XiaomiMiMo/MiMo-V2.6-Pro-MOPD on 2× RTX PRO 6000 @ 325 W + 6× DGX Spark"></a><br><sub>2× RTX + 6× Spark</sub></td>
 </tr>
 <tr>
 <td width="20%" valign="top"><a href="docs/models/qwen4.md"><b>Qwen 3.8</b></a><br><sub>wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1</sub><br><sub>exl3-k4+exl3-k5</sub></td>
@@ -115,8 +115,8 @@ Sparks) and maximum (2× RTX + 4 or 6 Sparks) hardware. Other reports:
 | [GLM 5.3 Flash](docs/models/glm5_flash.md) | GLM-5.3-Flash-tr3-4bpw (exl3-k4) | 1× RTX + 4× Spark (max) | 64K tok / 8 req | 95.9 | 90.8 | 148 | 2,889 | 2.79 s | ⚠ **FAILED** failed: Speculation lossless, Template round trip | [2026-10-02 · v0.1.0](benchmarks/glm5_flash/2026-10-02-smoke-glm-5-3-flash-tr3-4bpw-1rtx-4spark/report.svg) |
 | [MiMo V2](docs/models/mimo_v2.md) | MiMo-V2-Flash (fp8-block128x128/f32) | 1× RTX + 4× Spark (min) | 128K tok / 8 req | 70.9 | 58.6 | 75.0 | 5,877 | 1.37 s | ✓ KL 0.103 · top-1 82.6% ✓ lossless spec | [2026-10-02 · v0.1.0](benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-flash-1rtx-4spark/report.svg) |
 | [MiMo V2](docs/models/mimo_v2.md) | MiMo-V2-Flash (fp8-block128x128/f32) | 2× RTX + 4× Spark (max) | 128K tok / 8 req | 74.2 | 60.2 | 89.0 | 2,899 | 2.78 s | ✓ KL 0.105 · top-1 81.8% ✓ lossless spec | [2026-10-02 · v0.1.0](benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-flash-2rtx-4spark/report.svg) |
-| [MiMo V2](docs/models/mimo_v2.md) | MiMo-V2.6-Pro-RL (mxfp4-g32) | 1× RTX + 6× Spark (min) | 128K tok / 8 req | 61.9 | 37.9 | 76.8 | 2,741 | 2.94 s | ⚠ **FAILED** failed: Template round trip | [2026-10-02 · v0.1.0](benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-6-pro-rl-1rtx-6spark/report.svg) |
-| [MiMo V2](docs/models/mimo_v2.md) | MiMo-V2.6-Pro-RL (mxfp4-g32) | 2× RTX + 6× Spark (max) | 128K tok / 8 req | 71.1 | 41.0 | 84.4 | 1,754 | 4.59 s | ⚠ **FAILED** failed: Template round trip | [2026-10-02 · v0.1.0](benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-6-pro-rl-2rtx-6spark/report.svg) |
+| [MiMo V2](docs/models/mimo_v2.md) | MiMo-V2.6-Pro-MOPD (mxfp4-g32) | 1× RTX + 6× Spark (min) | 2M tok / 8 req | 62.6 | 35.3 | 75.0 | 2,935 | 2.74 s | ✓ KL 0.020 · top-1 90.2% ✓ lossless spec | [2026-10-04 · mopd-319ccdb](benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-1rtx-6spark/report.svg) |
+| [MiMo V2](docs/models/mimo_v2.md) | MiMo-V2.6-Pro-MOPD (mxfp4-g32) | 2× RTX + 6× Spark (max) | 2M tok / 8 req | 67.9 | 42.5 | 85.2 | 3,267 | 2.47 s | ✓ KL 0.025 · top-1 88.3% ✓ lossless spec | [2026-10-04 · mopd-319ccdb](benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-2rtx-6spark/report.svg) |
 | [Qwen 3.8](docs/models/qwen4.md) | Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 (exl3-k4+exl3-k5) | 1× RTX (min) | 32K tok / 8 req | 261 | 168 | 291 | 6,694 | 1.19 s | ✓ KL 0.034 · top-1 88.5% ✓ lossless spec | [2026-10-02 · v0.1.0](benchmarks/qwen4/2026-10-02-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx/report.svg) |
 | [Qwen 3.8](docs/models/qwen4.md) | Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 (exl3-k4+exl3-k5) | 1× RTX + 4× Spark (max) | 32K tok / 8 req | 84.4 | 84.4 | 89.5 | 4,200 | 1.90 s | ✓ KL 0.032 · top-1 88.7% ✓ lossless spec | [2026-10-02 · v0.1.0](benchmarks/qwen4/2026-10-02-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-4spark/report.svg) |
 | [Qwen 3.8](docs/models/qwen4.md) | Qwen3.8-Flash-Next-NVFP4 (nvfp4-g16) | 1× RTX + 4× Spark (min) | 32K tok / 8 req | 81.8 | 79.3 | 87.4 | 3,590 | 2.21 s | ✓ KL 0.051 · top-1 86.1% ✓ lossless spec | [2026-10-02 · v0.1.0](benchmarks/qwen4/2026-10-02-smoke-qwen3-8-flash-next-nvfp4-1rtx-4spark/report.svg) |
@@ -167,6 +167,15 @@ cache layout works.
    `ghcr.io/tpurtell/cuteafd-spark-expert:v0.1.0` on each Spark; `docker pull`
    them on those hosts first (`./run.sh` does not pull). `./wip.sh --slot S --role both`
    plus `./run.sh --wip S --restart` is the faster loop while iterating.
+
+V4.1 uses one shared BF16 vocabulary head for the target and dSpark by
+default. In current WIP builds, `CUTEAFD_V41_FP8_HEAD=all` packs one E4M3
+head (or one shard per GPU), shares it across target and draft projections,
+and releases BF16 once packing completes. `off` selects BF16. The
+experimental `draft` mode adds FP8 for dSpark while retaining BF16 for the
+target, using dual residency.
+The target-head quality result was accepted, but single-copy `all` did not
+clear the required C1 speedup on dual RTX, so BF16 remains the default.
 
 ## Working on it
 
