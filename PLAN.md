@@ -988,6 +988,26 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
      No repeated timing sessions/tool promotion gate: the numerics failure
      already rejects a default change. The 8192-row component gain above
      is not the deployed 4096-row chunk geometry.
+     Flash K3.25 TP4 (2 RTX + 4 GB10, 1524 golden positions): warmed 8K
+     prefill **1143.8 → 1319.2 ms** (7162 → 6210 tok/s, 0.867×), with
+     identical worker timing instrumentation in both arms. NLL
+     **2.403478 → 2.401349**, KL(golden||engine) **0.060147 → 0.061111**,
+     golden top-1 **89.70% → 89.30%**; direct KL **0.027835 nat**, direct
+     top-1 92.32%: **quality and speed fail**. Flash local layers have
+     NLL **2.411133 → 2.405122**, golden KL **0.060437 → 0.059411**,
+     golden top-1 **88.98% → 88.71%**, direct KL **0.024644 nat**, direct
+     top-1 92.98%: **quality fails**. That local full-model quality run
+     used `--exl3-window 1` to fit one RTX; paging time is not a performance
+     result. Local performance is the resident-layer table above.
+     Flash's actual L20 request waves on ostrich (six measured 4096-row
+     chunks after the two warm-up chunks) were **10.050 → 11.645 ms** GPU
+     median; these use model inputs rather than the component's seeded ones.
+     Golden KL here includes the checkpoint's existing quantization error;
+     the 0.005-nat switch gate is applied to incremental golden NLL/KL and
+     direct KL(A16||A8). No tool/agentic promotion gates were attempted after
+     these numerics failures. Cargo workspace check/test and scripts
+     (907 passed, two skipped, no failing IDs) passed; default V4.1 parity
+     was not re-run (no native library, transport or sampler source changes).
      Results live under `~/.cache/cuteafd/builds/exl3-a8/`; no default change.
    - MXFP4 experts (V4.1 already W4A8; MiMo V2.6 Pro W4A16): A8 prefill for
      MiMo Pro (Spark-bound prefill), and MXFP4 × MXFP8 MMAs for both.
