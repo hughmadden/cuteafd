@@ -513,6 +513,12 @@ fn output_rows(rows: usize, rank: usize) -> (usize, usize) {
     if rank == 0 { (0, first) } else { (first, rows - first) }
 }
 
+/// Preserve the full FFN's arithmetic route even when each GPU owns fewer rows.
+fn ffn_row_fp8_rows(total_rows: usize, decode: bool, prefill_fp8: bool) -> i32 {
+    if decode { if total_rows <= FP8_ROWS as usize { FP8_ROWS } else { 0 } }
+        else { i32::from(prefill_fp8) }
+}
+
 pub(crate) struct GlmfEngine<'a> {
     quantize_grid: Fp8QuantizeGrid,
     pub library: &'a NativeLibrary,
@@ -572,6 +578,7 @@ pub(crate) struct GlmfEngine<'a> {
     pub kda_fp32_partials: bool,
     pub kda_output_shard: bool,
     pub kda_prefill_expanded: bool,
+    pub split_ffn_rows: bool,
     /// The token embedding table (resident on this GPU or read from its shard).
     pub embedding: TokenEmbedding<'a>,
 }
@@ -647,7 +654,7 @@ impl<'a> GlmfEngine<'a> {
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
             fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
             kda_output_shard: false,
-            kda_prefill_expanded: false, l2: None, embedding })
+            kda_prefill_expanded: false, split_ffn_rows: false, l2: None, embedding })
     }
 
     /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
@@ -1507,19 +1514,43 @@ impl<'a> GlmfEngine<'a> {
         Ok(w.sum.buffer.ptr)
     }
 
-    /// Rank 0's side of layer `index`'s FFN exchange (lane `lane`): its FFN output in `delta`
-    /// (its dense partial, or the routed + shared-half sum) out unless this is the last of
-    /// `layers` (rank 1 stops there), rank 1's dense partial or shared-expert half in, their
-    /// sum into `sum`. Without a head split, `delta` itself.
+    /// Rank 0's FFN exchange of unit (`index`, `lane`). Intermediate-split outputs
+    /// are summed; token-row outputs are joined without arithmetic (the shared
+    /// rows already met before Spark reduce). Rank 1 stops after the last layer.
     fn meet_ffn(&self, w: &Workspace<'_>, index: usize, lane: usize, layers: usize, t: usize) -> Result<*mut c_void> {
         let Some(exchange) = &self.exchange else { return Ok(w.delta.buffer.ptr) };
         let (h, slot) = (self.cfg.hidden, slot(index, true, lane));
+        if self.split_ffn_rows && self.weights.layers[index].split {
+            let dense = self.weights.layers[index].dense;
+            if index + 1 < layers {
+                let rows = if dense { output_rows(t, 0).1 } else { t };
+                exchange.push(0, slot, w.delta.buffer.ptr, rows * h * 2)?;
+            }
+            if dense {
+                self.join_ffn_rows(0, w.delta.buffer.ptr, slot, t, w.sum.buffer.ptr)?;
+                return Ok(w.sum.buffer.ptr);
+            }
+            // spark_land consumed the owned shared rows and produced the full
+            // FFN result. Its peer flag must be consumed exactly once.
+            return Ok(w.delta.buffer.ptr);
+        }
         if index + 1 < layers {
             exchange.push(0, slot, w.delta.buffer.ptr, t * h * 2)?;
         }
         exchange.wait(0, slot)?;
         exchange.add(0, w.delta.buffer.ptr, exchange.recv(0, slot)?, w.sum.buffer.ptr, t * h)?;
         Ok(w.sum.buffer.ptr)
+    }
+
+    /// Join completed FFN rows in rank order, with no additional arithmetic.
+    fn join_ffn_rows(&self, rank: usize, local: *mut c_void, slot: usize, t: usize, out: *mut c_void)
+        -> Result<()> {
+        let exchange = self.exchange()?;
+        exchange.wait(rank, slot)?;
+        let remote = exchange.recv(rank, slot)?;
+        let (a, b) = if rank == 0 { (local, remote) } else { (remote, local) };
+        self.run_on(rank, true, "join_rows", &[("a", a), ("b", b), ("out", out)],
+            &[Scalar::I32(t.div_ceil(2) as i32), Scalar::I32((t / 2) as i32)])
     }
 
     /// Rank 1's FFN output buffer of `layer`: its dense partial (`delta`; zero rows when rank
@@ -1569,20 +1600,37 @@ impl<'a> GlmfEngine<'a> {
             (true, false) => self.ffn_on(1, w1, layer, self.cfg.dense_intermediate, cap, out, rows)?,
             (false, _) => self.ffn_on(1, w1, layer, self.cfg.moe_intermediate, cap, out, rows)?,
         }
-        exchange.push(1, slot(index, true, lane), out, t * h * 2)
+        let sent_rows = if self.split_ffn_rows && layer.split { output_rows(t, 1).1 } else { t };
+        // A zero-owned suffix still publishes its flag, keeping graph replay
+        // sequences paired with rank 0's wait.
+        exchange.push(1, slot(index, true, lane), out, sent_rows * h * 2)
     }
 
-    /// Rank 1's FFN exchange of unit (`index`, `lane`): rank 0's dense partial or routed +
-    /// shared sum in, summed with its own half in rank 0's operand order, then the next
-    /// layer's attention-site collapse (nothing after the last layer).
+    /// Rank 1's FFN exchange of unit (`index`, `lane`), then the next attention
+    /// collapse. Token-row dense outputs concatenate; Spark FFNs receive rank
+    /// 0's completed result directly. No work follows the last layer.
     fn peer_post(&self, index: usize, lane: usize, w1: &Workspace<'_>, t: usize, cap: &str) -> Result<()> {
         let (peer, exchange) = (self.peer()?, self.exchange()?);
         let Some(next) = peer.layers.get(index + 1) else { return Ok(()) };
         let ffn = slot(index, true, lane);
-        exchange.wait(1, ffn)?;
-        exchange.add(1, exchange.recv(1, ffn)?, Self::peer_ffn_out(w1, &peer.layers[index]), w1.sum.buffer.ptr,
-            t * self.cfg.hidden)?;
-        self.post_pre_on(1, w1, w1.sum.buffer.ptr, 1, next, "attn", "input_norm", Scalar::I32(t as i32), cap)
+        let layer = &peer.layers[index];
+        let out = if self.split_ffn_rows && layer.split {
+            if layer.dense {
+                self.join_ffn_rows(1, w1.delta.buffer.ptr, ffn, t, w1.sum.buffer.ptr)?;
+                w1.sum.buffer.ptr
+            } else {
+                exchange.wait(1, ffn)?;
+                // Rank 0 published the completed shared+routed result. The
+                // receive slot stays live through post_pre before parity reuse.
+                exchange.recv(1, ffn)?
+            }
+        } else {
+            exchange.wait(1, ffn)?;
+            exchange.add(1, exchange.recv(1, ffn)?, Self::peer_ffn_out(w1, layer), w1.sum.buffer.ptr,
+                t * self.cfg.hidden)?;
+            w1.sum.buffer.ptr
+        };
+        self.post_pre_on(1, w1, out, 1, next, "attn", "input_norm", Scalar::I32(t as i32), cap)
     }
 
     /// Rank 1's decode segment of layer `index` (see [`Self::decode_graphed`]): the previous
@@ -2024,8 +2072,8 @@ impl<'a> GlmfEngine<'a> {
         self.ffn_on(0, w, layer, inter, cap, out, rows)
     }
 
-    /// [`Self::ffn`] on rank `rank`: a head-split layer runs its half of the intermediate (a
-    /// partial sum); a ModelOpt NVFP4 dense MLP runs whole on rank 0.
+    /// [`Self::ffn`] on rank `rank`: a head split owns either half the intermediate
+    /// or completed token rows. A ModelOpt NVFP4 dense MLP runs whole on rank 0.
     #[allow(clippy::too_many_arguments)]
     fn ffn_on(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, inter: usize, cap: &str, out: *mut c_void,
         rows: Scalar) -> Result<()> {
@@ -2044,13 +2092,26 @@ impl<'a> GlmfEngine<'a> {
             });
         }
         let decode = cap == "m64";
-        let pointers = [("x", w.x.buffer.ptr), ("w_gate_up_fp8", layer.ptr("w_gate_up_fp8")?),
+        let row_shard = self.split_ffn_rows && layer.split;
+        let (x, rows, fp8_rows) = if row_shard {
+            let Scalar::I32(total) = rows else { anyhow::bail!("row count scalar") };
+            let total = usize::try_from(total)?;
+            let (start, owned) = output_rows(total, rank);
+            if owned == 0 { return Ok(()); }
+            (w.x.buffer.ptr.wrapping_byte_add(start * self.cfg.hidden * 2), Scalar::I32(owned as i32),
+                ffn_row_fp8_rows(total, decode, self.fp8_prefill.ffn))
+        } else {
+            (w.x.buffer.ptr, rows, match (decode, self.fp8_prefill.ffn) {
+                (true, _) => FP8_ROWS, (false, enabled) => i32::from(enabled) })
+        };
+        let pointers = [("x", x), ("w_gate_up_fp8", layer.ptr("w_gate_up_fp8")?),
             ("w_gate_up_scale", layer.ptr("w_gate_up_scale")?), ("w_down_fp8", layer.ptr("w_down_fp8")?),
             ("w_down_scale", layer.ptr("w_down_scale")?), ("out", out), ("scratch", w.scratch.buffer.ptr)];
         // FP8-only weights: decode rows up to `fp8_rows` on the GEMV; prefill W8A8 or W8A16.
-        let inter = inter / if layer.split { 2 } else { 1 };
-        self.run_on(rank, layer.split, &format!("ffn_i{inter}_{cap}"), &pointers,
-            &self.fp8_scalars(rows, decode, decode || self.fp8_prefill.ffn))
+        let split = layer.split && !row_shard;
+        let inter = inter / if split { 2 } else { 1 };
+        self.run_on(rank, split, &format!("ffn_i{inter}_{cap}"), &pointers,
+            &[rows, Scalar::I32(fp8_rows)])
     }
 
     /// Layer `index`'s MLA on rank `rank` (a head split: the replicated latent record and DSA
@@ -2317,7 +2378,7 @@ impl<'a> GlmfEngine<'a> {
                 let mut transports = transports.borrow_mut();
                 let transport = transports.first_mut().context("no Spark transport")?;
                 let wave = self.spark_dispatch(w, index, t, decode, transport, shared)?;
-                return runtime.block_on(self.spark_land(w, t, transport, wave));
+                return runtime.block_on(self.spark_land(w, index, 0, t, transport, wave));
             }
         }
         self.run("add", &[("a", w.routed.buffer.ptr), ("b", w.shared.buffer.ptr), ("out", w.delta.buffer.ptr)], &[rows])
@@ -2374,16 +2435,25 @@ impl<'a> GlmfEngine<'a> {
 
     /// Receives `wave`'s BF16 rank partials into its transport's intake planes
     /// and sums them with the shared expert into `delta`.
-    async fn spark_land(&self, w: &Workspace<'_>, t: usize, transport: &mut SparkLink<'_>, wave: SparkExpertWave)
+    async fn spark_land(&self, w: &Workspace<'_>, index: usize, lane: usize, t: usize,
+        transport: &mut SparkLink<'_>, wave: SparkExpertWave)
         -> Result<()> {
         let ranks = transport.world_size();
         ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
+        let shared = if self.split_ffn_rows && self.weights.layers[index].split {
+            // The owned shared outputs must meet before the unchanged expert
+            // reducer reads its one shared plane. This includes the last layer.
+            // w.sum's attention input was consumed before FFN execution; the
+            // joined rows remain live until this stream finishes reduce.
+            self.join_ffn_rows(0, w.shared.buffer.ptr, slot(index, true, lane), t, w.sum.buffer.ptr)?;
+            w.sum.buffer.ptr
+        } else { w.shared.buffer.ptr };
         let timer = std::time::Instant::now();
         transport.receive(wave, t, self.stream).await?;
         self.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
         // SAFETY: the shared-expert plane and `delta` are live [t, h] BF16
         // buffers; the planes are ordered after the wave by `receive`.
-        unsafe { transport.reduce(w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream) }
+        unsafe { transport.reduce(shared.cast(), w.delta.buffer.ptr.cast(), t, self.stream) }
     }
 
     /// Pipelined Spark prefill of consecutive-row lanes of one sequence (each
@@ -2511,7 +2581,8 @@ impl<'a> GlmfEngine<'a> {
                     peer_next(unit)?;
                     if let Some((previous, wave)) = inflight.take() {
                         let t = lanes[previous.1].0.kv_slots.len();
-                        self.spark_land(&workspaces[previous.1], t, &mut transports[previous.1], wave).await?;
+                        self.spark_land(&workspaces[previous.1], previous.0, previous.1, t,
+                            &mut transports[previous.1], wave).await?;
                         post(previous)?;
                     }
                     inflight = Some((unit, wave));
@@ -2521,7 +2592,8 @@ impl<'a> GlmfEngine<'a> {
                 if next.is_none_or(|(_, next_lane)| next_lane == lane) {
                     if let Some((current, wave)) = inflight.take() {
                         let t = lanes[current.1].0.kv_slots.len();
-                        self.spark_land(&workspaces[current.1], t, &mut transports[current.1], wave).await?;
+                        self.spark_land(&workspaces[current.1], current.0, current.1, t,
+                            &mut transports[current.1], wave).await?;
                         post(current)?;
                     }
                 }
@@ -2611,6 +2683,23 @@ impl Drop for GlmfEngine<'_> {
 #[cfg(test)]
 mod prefill_lane_tests {
     use super::{prefill_lane_capacity, prefill_lane_plan, PAGE_ROWS, PREFILL_LANES};
+
+    #[test]
+    fn token_row_ffns_keep_the_global_decode_and_prefill_precision_route() {
+        for (rows, fp8_rows) in [(1, 16), (16, 16), (17, 0), (22, 0), (63, 0), (64, 0)] {
+            assert_eq!(super::ffn_row_fp8_rows(rows, true, false), fp8_rows);
+            assert_eq!(super::ffn_row_fp8_rows(rows, true, true), fp8_rows);
+            let (start, owned) = super::output_rows(rows, 1);
+            assert_eq!(start + owned, rows);
+        }
+        // Global 17/22-row decode must retain TMA even though each owned
+        // projection is at most 16 rows. Prefill keeps its explicit A8 option.
+        for rows in [1, 22, 63, 64, 512, 513, 4096] {
+            assert_eq!(super::ffn_row_fp8_rows(rows, false, true), 1);
+            assert_eq!(super::ffn_row_fp8_rows(rows, false, false), 0);
+        }
+        assert_eq!(super::output_rows(1, 1).1, 0);
+    }
 
     #[test]
     fn output_token_rows_cover_odd_batches_and_zero_owned_rank() {
