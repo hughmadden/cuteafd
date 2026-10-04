@@ -99,6 +99,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     shutil.copy(ROOT / "scripts" / "launch" / "run-family.sh", repo / "scripts" / "launch")
     shutil.copy(ROOT / "scripts" / "launch" / "preflight-fp8-bf16.py", repo / "scripts" / "launch")
     shutil.copy(ROOT / "scripts" / "lib" / "checkpoint-family.py", repo / "scripts" / "lib")
+    shutil.copy(ROOT / "scripts" / "lib" / "release-common.sh", repo / "scripts" / "lib")
     hf = tmp_path / "hf"
     _snapshot(hf, model, family_config)
     bin_dir = tmp_path / "bin"
@@ -506,3 +507,30 @@ def test_glmf_pool_defaults_to_the_planned_pool(tmp_path: Path) -> None:
     bad = _family_launch_lines(tmp_path / "dsv4", {"model_type": "deepseek_v4"},
                                "deepseek-ai/DeepSeek-V4-Flash-0731", "POOL_TOKENS=auto\n")
     assert "POOL_TOKENS=auto is supported" in bad
+
+
+def test_family_config_reads_share_the_stop_key_grammar() -> None:
+    import re
+
+    launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
+    # Include old spellings read by key(), plus the two generated projection loops.
+    keys = set(re.findall(r'\bget ([A-Z][A-Z_0-9]+)', launcher))
+    for new, old in re.findall(r'\bkey ([A-Z][A-Z_0-9]+) ([A-Z][A-Z_0-9]+)', launcher):
+        if new != "NEW":
+            keys.update((new, old))
+    keys.update(("MIMO_FP8_HEAD", "MIMO_FP8_O_PROJ", "QWEN_FP8_DECODE", "QWEN_FP8_HEAD"))
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1"; shift; for key; do release_known_key "$key" || exit 1; done',
+         "bash", str(ROOT / "scripts/lib/release-common.sh"), *sorted(keys)],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert 'release_known_key "$key"' in launcher
+
+
+def test_family_launcher_rejects_unknown_keys_before_launching(tmp_path: Path) -> None:
+    result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
+                                            "moe_layer_freq": [0, 1]}, "test/mimo", "SPECULATOR_TYPO=off\n")
+    assert result.returncode != 0
+    assert "unknown configuration key: SPECULATOR_TYPO" in result.stderr
+    assert "docker " not in result.stderr

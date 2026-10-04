@@ -7,6 +7,7 @@
 # Containers use run.sh's names, so ./stop.sh stops them.
 set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$repo_root/scripts/lib/release-common.sh"
 config="$repo_root/cuteafd.config"
 restart=0
 family=""
@@ -21,7 +22,8 @@ done
 # Plain KEY=VALUE lines; the launch reads only the keys below.
 declare -A cfg
 while IFS='=' read -r key value; do
-  [[ "$key" =~ ^[A-Z_0-9]+$ ]] && cfg[$key]="$value"
+  release_known_key "$key" || release_die "unknown configuration key: $key"
+  cfg[$key]="$value"
 done < <(grep -E '^[A-Z_0-9]+=' "$config")
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
 # key NEW OLD [DEFAULT]: a renamed key; the pre-rename spelling works for one
@@ -447,8 +449,7 @@ if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
   done
 fi
 peers=()
-# --restart removes this launcher's containers (stop.sh's release parser rejects
-# the keys above, e.g. SPECULATOR).
+# --restart removes this launcher's containers; stop.sh accepts the same keys.
 # One model is served at a time: every expert worker on these hosts goes, whatever
 # its port (a leftover worker of another model holds Spark memory and OOMs the next).
 if [[ "$restart" == 1 ]]; then
