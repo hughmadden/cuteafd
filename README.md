@@ -147,10 +147,15 @@ cache layout works.
 
 1. `cuteafd plan MODEL` (any Hugging Face model id or local snapshot
    directory) reports what the checkpoint needs — tensors, formats, shapes,
-   and which kernels are missing — before you touch a GPU.
+   and which kernels are missing — before you touch a GPU. Add `--layout
+   --rtx 1|2 --pool-tokens 0` for per-device weights, cache admission,
+   workspaces and Spark ranks. V4 Flash/Pro workspace formulas use the
+   matching image manifest (`--workspace-manifest PROGRAMS.json`).
 2. Pick or adapt a config under [`examples/configs/`](examples/configs/) or
    edit `cuteafd.config` for your own topology (coordinator GPUs, Spark
-   ranks, TP/EP layout).
+   ranks, TP/EP layout). `POOL_TOKENS=auto` selects planner admission for
+   V4, V4.1 and Qwen; the engine spelling is `--pool-tokens 0`. V4.1 keeps
+   its existing pool policy when this option is omitted.
 3. `./run.sh` launches the release images named in the config,
    `ghcr.io/tpurtell/cuteafd-coordinator:v0.1.0` on the RTX host and
    `ghcr.io/tpurtell/cuteafd-spark-expert:v0.1.0` on each Spark; `docker pull`
