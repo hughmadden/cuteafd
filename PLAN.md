@@ -750,8 +750,10 @@ Open limits are recorded in `docs/models/`: numerical batch invariance and
 byte-identical speculative output, V4 Pro fidelity reference, split FP8
 GLM Flash promotion, V4.1 short FP8 replies and graph recapture, MiMo Flash
 scaling/fidelity, native small-row NVFP4 W4A4, and Qwen Spark MTP/FP8. The
-scope's MXFP4 32-row tails still need implementation and qualification;
-exact Spark slices and A8 down projection alone do not close that item.
+scope's MXFP4 32-row tails are outside this candidate: the implementation
+on `work/mxfp4-tails` is unmerged and its strict distributed-oracle and
+unchanged-NLL gates remain open. Existing exact Spark slices and A8 down
+projection do not close that item.
 
 ## Release v1 — priority plan (2026-10-02)
 
@@ -825,8 +827,10 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
      coordinator first, skip RTX-held layers on the Sparks, speed up the Spark
      layer load. 2 RTX: 108 s. Coordinator-first auto placement on 1 RTX
      landed (`be7049f`); Spark layer read speed is still open.
-   - DeepSeek V4 Flash: the native expert format refuses 2 Sparks (min config
-     needs 4); V4.1 TP3 fits per `cuteafd plan` but is unqualified.
+   - DeepSeek V4 Flash: the v0 native expert format refused 2 Sparks. Native
+     TP2 now uses legacy expert requests (`e4a8055`) and is ledger-qualified
+     (`443dc7a`); the v1 minimum uses two Sparks. V4.1 TP3 fits per
+     `cuteafd plan` but is unqualified.
    - Benchmarks: reasoning-effort panel re-run after the pool back-off fix;
      turn-end cache check gates restores against their snapshot (4i); the code
      sandbox requires user/net/PID namespaces (`fd74aaf`; coordinators run

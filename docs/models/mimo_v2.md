@@ -65,9 +65,10 @@ MiMo V2 Flash 1 RTX + 4 Sparks; V2.6 Pro 1 RTX + 6 Sparks. Coordinator VRAM: V2 
 - V2 Flash fidelity is near the smoke threshold (KL about 0.10, top-1 about
   82%). BF16 expert-input Spark packages are opt-in (`EXPERT_INPUT=bf16`)
   and must be included in the image before use.
-- Exact Spark slices remove zero padding, but MXFP4 32-row down-projection
-  tails remain a follow-up; larger padded slices can still cost memory and
-  expert-wave time.
+- Exact Spark slices remove zero padding. The v1 scope's MXFP4 32-row
+  down-projection tails are implemented on the unmerged `work/mxfp4-tails`
+  branch; distributed-oracle and unchanged-NLL gates remain open. Larger
+  padded slices can still cost memory and expert-wave time.
 - Batch-invariant prefill and verify are deferred; a speculation-lossless
   smoke result permits proven numerical rounding, not a state mismatch.
 

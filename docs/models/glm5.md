@@ -55,8 +55,10 @@ GLM 5.3 EXL3 K4, 1 RTX + 4 Sparks. `SPECULATOR_FP8=off` keeps the BF16 drafter.
 
 ## Known limits
 
-- The official FP8 checkpoint's KV pool is small at full context; run EXL3
-  or NVFP4 for serious context lengths.
+- Official FP8 is outside the v1 release scope: its routed expert weights
+  exceed the six-Spark serving budget. EXL3 and NVFP4 cover this family in
+  the release matrix.
+
 - No local (RTX-only) expert path — GLM 5.3 always needs at least one Spark
   rank.
 - Speculative verify and plain decode, and C1/C4 greedy outputs, can differ.
