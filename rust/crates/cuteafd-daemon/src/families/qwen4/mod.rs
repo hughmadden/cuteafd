@@ -2,6 +2,7 @@
 //! n-gram table, the coordinator programs' layer chain, and the golden
 //! comparison command.
 pub(crate) mod engine;
+mod admission;
 mod mtp_golden;
 pub(crate) mod mtp_policy;
 pub(crate) mod ple;
@@ -37,9 +38,12 @@ pub(crate) struct EngineArgs {
     /// Longest sequence (the exported index top-k covers the manifest's max_context).
     #[arg(long, default_value_t = 65_536)]
     pub max_context: usize,
-    /// Tokens the K/V record pools hold across sequences.
+    /// Tokens the K/V record pools hold across sequences (0: planner admission).
     #[arg(long, default_value_t = 32_768)]
     pub pool_tokens: usize,
+    /// Concrete serving prefix arena reservation; filled before engine loading.
+    #[arg(skip)]
+    pub planner_prefix_bytes: Option<u64>,
     /// Sequences with GDN/PLE state (about 115 MiB each).
     #[arg(long, default_value_t = 8)]
     pub slots: usize,
@@ -326,11 +330,26 @@ impl Opened {
                 layer, args.table_placement, &args.table, args.prefill_rows.max(engine::DECODE_ROWS))?),
             _ => None,
         };
-        let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
+        // Establish expert residency and transport first in automatic mode so
+        // the pool cannot consume memory that those owners will need later.
+        let admitted_experts = if args.pool_tokens == 0 {
+            let experts = self.experts(args, layers)?;
+            if let Some(engine::Experts::LocalExl3(local)) = &experts {
+                local.ensure(0, stream)?;
+                let expected = local.window.min(layers);
+                ensure!(local.resident.borrow().as_ref().is_some_and(|(_, r)| r.layers() == expected),
+                    "Qwen automatic KV admission requires the complete requested EXL3 expert window to fit");
+            }
+            Some(experts)
+        } else { None };
+        let pool_tokens = if args.pool_tokens == 0 {
+            admission::pool_tokens(&self.library, args, &self.cfg, layers, model.mtp.is_some())?
+        } else { args.pool_tokens };
+        let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::Qwen4Engine::new(&self.library, &programs, self.cfg.clone(), model, ple, stream,
             args.max_context, args.prefill_rows, pages, args.slots, embedding)?;
         engine.w8a8_prefill = args.fp8_prefill_w8a8;
-        if let Some(experts) = self.experts(args, layers)? {
+        if let Some(experts) = match admitted_experts { Some(experts) => experts, None => self.experts(args, layers)? } {
             engine.set_experts(experts);
         }
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {

@@ -165,7 +165,7 @@ enum Drafts {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
+fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: tokio::sync::oneshot::Sender<Result<()>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     draft: Drafts, eos: Vec<u32>, decode_share: DecodeShareArgs, prefix: PrefixArgs) -> Result<()> {
     let opened = match open(&args) {
@@ -175,6 +175,14 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
             return Ok(());
         }
     };
+    if args.pool_tokens == 0 {
+        let geometry = cuteafd_loader::serving_capacity::qwen_cache_geometry(&opened.cfg,
+            opened.cfg.layers, args.mtp > 0)?;
+        let mark = geometry.ranks[0].retained_mark_bytes as usize;
+        let slots = MarkArena::slots_for(max_sequences, prefix.prefix_cache_entries, mark,
+            prefix.prefix_cache_mark_mib << 20);
+        args.planner_prefix_bytes = Some(slots as u64 * mark as u64);
+    }
     let mut ready = Some(ready);
     let result = opened.with_engine(&args, |engine| {
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-qwen4 needs every layer");

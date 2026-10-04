@@ -129,7 +129,7 @@ pub(crate) struct LocalExl3<'a> {
 }
 
 impl LocalExl3<'_> {
-    fn ensure(&self, layer: usize, stream: *mut c_void) -> Result<()> {
+    pub(super) fn ensure(&self, layer: usize, stream: *mut c_void) -> Result<()> {
         if self.resident.borrow().as_ref().is_some_and(|(range, _)| range.contains(&layer) || layer == self.layers) {
             ensure!(layer < self.layers || self.mtp, "MTP experts are not loaded");
             return Ok(());

@@ -10,6 +10,9 @@
 //!   per-row x 128-K scales (`[V, H/128]`), run in 16-row `qwen4_head_fp8` spans.
 use super::{Qwen4Attention, Qwen4Config};
 
+mod checkpoint;
+pub use checkpoint::{checkpoint_resident_bytes, Qwen4CheckpointResident};
+
 /// The projection representations a serve configuration selects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Qwen4Representation {
