@@ -246,6 +246,7 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
     let prefill_rows = if options.prefill_rows > 0 { options.prefill_rows }
         else if family == "deepseek_v41" { 2048 }
         else { workspace_manifest.as_ref().and_then(|m| m["capacities"]["prefill_rows"].as_u64()).unwrap_or(4096) };
+    let decode_rows = workspace_manifest.as_ref().and_then(|m| m["capacities"]["decode_rows"].as_u64()).unwrap_or(64);
     let concurrency = if options.concurrency > 0 { options.concurrency } else if family == "deepseek_v41" { 16 } else { 8 };
     let context_tokens = if options.context_tokens > 0 { options.context_tokens }
         else if family == "deepseek_v4" { workspace_manifest.as_ref().and_then(|m| m["capacities"]["max_context"].as_u64()).unwrap_or(131072) }
@@ -256,9 +257,11 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
     // Qwen currently executes entirely on the first coordinator GPU.
     let split = gpus == 2 && options.head_split && family != "qwen4";
     let active_gpus = if family == "qwen4" { 1 } else if split { 2 } else { 1 };
+    let automatic = options.pool_tokens.unwrap_or(0) == 0;
     let mut devices: Vec<DeviceLayout> = options.rtx_bytes.iter().take(gpus).enumerate()
         .map(|(index, &bytes)| DeviceLayout { kind: DeviceKind::Rtx, index: index as u32,
-            capacity_bytes: bytes.saturating_sub(if matches!(family, "deepseek_v4" | "deepseek_v41" | "qwen4") { options.headroom_bytes.max(3 * GIB) } else { options.headroom_bytes }), items: Vec::new(), kv_tokens: 0 })
+            capacity_bytes: (if family == "deepseek_v41" && automatic { (bytes as u128 * 97 / 100) as u64 } else { bytes })
+                .saturating_sub(if matches!(family, "deepseek_v4" | "deepseek_v41" | "qwen4") { options.headroom_bytes.max(3 * GIB) } else { options.headroom_bytes }), items: Vec::new(), kv_tokens: 0 })
         .collect();
     let mut waste = Vec::new();
     let mut notes = Vec::new();
@@ -379,8 +382,8 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
             let manifest = workspace_manifest.as_ref()?;
             let cfg = crate::families::deepseek_v4::DeepseekV4Config::read(&checkpoint.snapshot, cache_native_layers).ok()?;
             let id = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
-            let scratch = crate::serving_capacity::deepseek_v4_workspace_scratch(manifest, id, prefill_rows, 64).ok()?;
-            crate::serving_capacity::deepseek_v4_workspace_geometry(&cfg, prefill_rows, 64,
+            let scratch = crate::serving_capacity::deepseek_v4_workspace_scratch(manifest, id, prefill_rows, decode_rows).ok()?;
+            crate::serving_capacity::deepseek_v4_workspace_geometry(&cfg, prefill_rows, decode_rows,
                 context_tokens, active_gpus, scratch).ok()
         })()
     } else { None };
@@ -417,7 +420,11 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
         let workspace_basis = if v4_workspace.is_some() { Basis::Formula } else { allowance_basis };
         device.items.push(Item::new(Category::Workspace, "steps", "", workspace, workspace_basis));
         if split {
-            device.items.push(Item::new(Category::Transport, "peer exchange", "", costs.exchange_bytes, allowance_basis));
+            let exact_peer = if family == "deepseek_v4" {
+                crate::serving_capacity::deepseek_v4_peer_exchange_bytes(model.spec().hidden as u64, prefill_rows, decode_rows).ok()
+            } else { None };
+            device.items.push(Item::new(Category::Transport, "peer exchange", "", exact_peer.unwrap_or(costs.exchange_bytes),
+                if exact_peer.is_some() { Basis::Formula } else { allowance_basis }));
         }
     }
 
@@ -479,7 +486,7 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
         Ok(Some(mut geometry)) => {
             for rank in &mut geometry.ranks {
                 rank.pool_metadata_unit_bytes += match family {
-                    "deepseek_v4" => (2 * prefill_rows + 64) * 4,
+                    "deepseek_v4" => (2 * prefill_rows + decode_rows) * 4,
                     "qwen4" => (1 + 64) * 5 * 4,
                     _ => 0,
                 };
@@ -496,8 +503,9 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
             // Reserve fixed state and marks before sizing records. Otherwise
             // an automatic pool consumes the bytes those allocations need.
             for (device, rank) in devices.iter_mut().zip(&geometry.ranks) {
+                let state_slots = options.state_slots.unwrap_or(if matches!(family, "qwen4" | "deepseek_v4" | "deepseek_v41") { concurrency } else { concurrency + 2 });
                 device.items.push(Item::new(Category::Kv, "state", "", rank.fixed_state_bytes
-                    + rank.active_state_per_sequence_bytes * options.state_slots.unwrap_or(if matches!(family, "qwen4" | "deepseek_v4") { concurrency } else { concurrency + 2 })
+                    + (rank.active_state_per_sequence_bytes + if family == "deepseek_v4" { rank.pool_metadata_unit_bytes } else { 0 }) * state_slots
                     + rank.speculative_replay_bytes + rank.context_table_bytes_per_token * context_tokens, Basis::Formula));
                 if family != "deepseek_v41" && marks > 0 && rank.retained_mark_bytes > 0 {
                     device.items.push(Item::new(Category::Prefix, "marks", "", rank.retained_mark_bytes * marks,
@@ -505,10 +513,11 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
                 }
             }
             if family == "deepseek_v41" {
-                let prefixes = v41::prefix_bytes(20, native_layers > 0, active_gpus);
+                let prefixes = v41::prefix_arena_bytes(marks, native_layers > 0, active_gpus);
+                let retained_turns = marks.saturating_sub(2) / 2;
                 for (device, &bytes) in devices.iter_mut().zip(&prefixes) {
                     device.items.push(Item::new(Category::Prefix, "snapshot arenas", "", bytes, Basis::Formula));
-                    device.items.push(Item::new(Category::Kv, "active and retained COW tails", "", geometry.ranks[device.index as usize].persistent_unit_bytes * (concurrency + 40), Basis::Formula));
+                    device.items.push(Item::new(Category::Kv, "active and retained COW tails", "", geometry.ranks[device.index as usize].persistent_unit_bytes * (concurrency + 2 * retained_turns), Basis::Formula));
                 }
                 if native_layers > 0 {
                     devices[active_gpus - 1].items.push(Item::new(Category::Drafter, "dSpark window state", "", v41::dspark_cache_bytes(concurrency, prefill_rows), Basis::Formula));

@@ -96,8 +96,12 @@ pub fn resident_weights(checkpoint: &Checkpoint, ranks: usize, dspark: bool)
 /// Target snapshots always live on RTX0, even with partitioned live caches.
 /// dSpark snapshots follow its decoder-owned windows (RTX1 under CED).
 pub fn prefix_bytes(entries: u64, dspark: bool, ranks: usize) -> Vec<u64> {
-    let mut bytes = vec![0; ranks];
     let slots = if entries == 0 { 0 } else { 2 * entries + 2 };
+    prefix_arena_bytes(slots, dspark, ranks)
+}
+
+pub fn prefix_arena_bytes(slots: u64, dspark: bool, ranks: usize) -> Vec<u64> {
+    let mut bytes = vec![0; ranks];
     let target = (40 * (128 * 528 + 8) + 4 * 4096u64).div_ceil(256) * 256;
     bytes[0] = slots * target;
     if dspark { bytes[ranks - 1] += slots * 3 * 128 * 528; }

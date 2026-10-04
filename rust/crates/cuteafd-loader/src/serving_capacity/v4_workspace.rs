@@ -6,6 +6,12 @@ use crate::families::deepseek_v4::DeepseekV4Config;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Four peer slots per each of the two prefill lanes, plus release flags.
+pub fn deepseek_v4_peer_exchange_bytes(hidden: u64, prefill_rows: u64, decode_rows: u64)
+    -> Result<u64, CacheGeometryError> {
+    sum("V4 peer exchange", &[product("V4 peer slots", &[8, prefill_rows.max(decode_rows), hidden, 2])?, 256])
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct V4WorkspaceScratch {
     /// Largest non-index-topk scratch across the entire loaded manifest.

@@ -266,10 +266,19 @@ pub(crate) fn with_engine<T>(
             &loaded.manifest, loaded.family, prefill_rows as u64, decode_rows as u64)?;
         let workspace = cuteafd_loader::serving_capacity::deepseek_v4_workspace_geometry(
             &cache_cfg, prefill_rows as u64, decode_rows as u64, max_context as u64, devices.len(), scratch)?;
+        let peer = if devices.len() == 2 {
+            cuteafd_loader::serving_capacity::deepseek_v4_peer_exchange_bytes(
+                loaded.cfg.dim as u64, prefill_rows as u64, decode_rows as u64)?
+        } else { 0 };
+        let intake = if args.skip_routed_experts { 0 } else {
+            engine::PREFILL_LANES as u64 * args.peers.split(',').filter(|p| !p.is_empty()).count() as u64
+                * 4096 * loaded.cfg.dim as u64 * 2
+        };
         let shape = admission::Shape { sequences: args.max_sequences, prefill_rows, decode_rows, max_context,
             reserve_bytes: (args.reserve_gib as u64) << 30,
             prefix_bytes: geometry.ranks.iter().map(|r| r.retained_mark_bytes * slots as u64).collect(),
-            workspace_bytes: Some(workspace.iter().map(|r| r.fixed_device_bytes).collect()) };
+            workspace_bytes: Some(workspace.iter().enumerate().map(|(rank, r)|
+                r.fixed_device_bytes + if rank == 0 { intake } else { 0 }).collect()), peer_bytes: peer };
         // Preserve the pre-existing placement policy: caches and peer slots
         // are live before local loading, while the single reserve covers its
         // future workspace and runtime. Full admission follows this selection.
@@ -277,13 +286,17 @@ pub(crate) fn with_engine<T>(
         let legacy_state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * args.max_sequences as u64
             + rank.context_table_bytes_per_token * max_context as u64;
         let legacy_pool = rank.persistent_unit_bytes * 262_144u64.div_ceil(geometry.logical_unit_rows);
-        let peer = if devices.len() == 2 { cuteafd_loader::plan::layout::family_costs("deepseek_v4").exchange_bytes } else { 0 };
         let expert_budget = usize::try_from(memory[0].baseline_free_bytes.saturating_sub(
             legacy_state + legacy_pool + peer + shape.prefix_bytes.iter().sum::<u64>() + shape.reserve_bytes))?;
         let stages = if args.dspark { cache_stages } else { 0 };
         let local = if args.skip_routed_experts { local::LocalPlan { layers: 0, peak_bytes: 0 } }
             else { local::plan(&loaded.library, &args.native_lib, &loaded.catalog, stages,
                 args.local_expert_layers.unwrap_or(usize::MAX), prefill_rows.max(decode_rows), expert_budget)? };
+        if let Some(requested) = args.local_expert_layers.filter(|_| !args.skip_routed_experts) {
+            let routed = loaded.catalog.routed_experts();
+            ensure!(local.layers == requested.min(routed.layers).saturating_sub(routed.first_layer),
+                "V4 automatic admission cannot fit the requested RTX expert layers; lower --local-expert-layers");
+        }
         let profile = admission::profile(&geometry, &memory, &shape, local.peak_bytes as u64)?;
         let capacity = admission::resolve(&profile, &memory, args.max_sequences)?;
         tracing::info!(pool_tokens = capacity.allocated_gpu_kv_tokens, local_layers = local.layers,

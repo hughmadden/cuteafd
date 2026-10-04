@@ -913,6 +913,24 @@ class BuildScopeTest(unittest.TestCase):
         self.assertIn('if [[ -n "$placement_directory" ]]; then', release)
         self.assertNotIn("((RELEASE_RTX_GPUS == 2)); then\n  docker exec \"$coordinator\" sh -c 'cp", release)
 
+    def test_native_pool_policy_changes_fingerprint_and_preserves_omitted_policy(self) -> None:
+        expression = next(line for line in (ROOT / "run.sh").read_text().splitlines()
+                          if line.startswith('fingerprint="'))
+        hashes = []
+        for setting in (None, "", "auto", "1024"):
+            environment = os.environ.copy()
+            environment.pop("POOL_TOKENS", None)
+            if setting is not None:
+                environment["POOL_TOKENS"] = setting
+            result = subprocess.run(
+                ["bash", "-c", 'release_hosts_csv() { echo a,b,c,d; }\n' + expression
+                 + '\nprintf "%s\n" "$fingerprint"'], text=True, capture_output=True, env=environment,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            hashes.append(result.stdout.strip())
+        self.assertEqual(hashes[0], hashes[1])
+        self.assertEqual(len(set(hashes)), 3)
+
     def test_run_sh_image_diagnostics_name_the_reference_and_host(self) -> None:
         release = (ROOT / "run.sh").read_text()
         # A missing coordinator image is a naming problem, not a build problem:

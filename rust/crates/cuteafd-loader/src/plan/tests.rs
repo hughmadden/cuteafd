@@ -886,6 +886,33 @@ fn qwen_layout_reserves_recurrent_state_before_auto_pool_and_leaves_peer_idle() 
 }
 
 #[test]
+fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
+    use cuteafd_core::memory_layout::Category;
+    let mut config = v41_config();
+    let text = &mut config["text_config"];
+    text["num_hidden_layers"] = json!(40);
+    text["head_dim"] = json!(512);
+    text["qk_rope_head_dim"] = json!(64);
+    text["sliding_window"] = json!(128);
+    text["kv_source_layer_ids"] = json!([2, 8, 14, 20]);
+    text["compress_ratios"] = json!((0..40).map(|l| if l < 2 { 0 } else if l < 20 { 2 } else { 1 }).collect::<Vec<_>>());
+    let dir = snapshot(config, &[t("embed.weight", "BF16", &[128, 5120])]);
+    let mut options = sparks(4);
+    options.layout = Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30], pool_tokens: Some(0),
+        prefix_slots: Some(0), native_mtp_layers: 0, ..Default::default() });
+    let automatic = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    assert_eq!(automatic.devices[0].capacity_bytes, (96u64 << 30) * 97 / 100 - (3 << 30));
+    assert_eq!(automatic.devices[0].by_category().get(&Category::Prefix).copied().unwrap_or(0), 0);
+    let state = automatic.devices[0].items.iter().find(|i| i.group == "state").unwrap().bytes;
+    let cache = crate::serving_capacity::deepseek_v41_cache_geometry(&serde_json::from_reader::<_, Value>(
+        std::fs::File::open(dir.path().join("config.json")).unwrap()).unwrap(), 1).unwrap();
+    assert_eq!(state, cache.ranks[0].active_state_per_sequence_bytes * 16);
+    options.layout.as_mut().unwrap().pool_tokens = Some(512);
+    let explicit = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    assert_eq!(explicit.devices[0].capacity_bytes, (96u64 << 30) - (3 << 30));
+}
+
+#[test]
 fn layout_charges_local_routed_experts_to_the_coordinator() {
     use cuteafd_core::memory_layout::Category;
     let dir = qwen_snapshot(4);

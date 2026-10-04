@@ -12,6 +12,7 @@ pub(crate) struct Shape {
     pub reserve_bytes: u64,
     pub prefix_bytes: Vec<u64>,
     pub workspace_bytes: Option<Vec<u64>>,
+    pub peer_bytes: u64,
 }
 
 /// Modules and weights already appear in each sample's non-engine usage.
@@ -47,7 +48,7 @@ pub(crate) fn profile(geometry: &FamilyCacheGeometry, memory: &[DeviceMemory], s
             reservation("future graphs", costs.graph_bytes[role]),
             reservation("workspace and headroom reserve", headroom),
         ];
-        if memory.len() == 2 { reservations.push(reservation("peer exchange", costs.exchange_bytes)); }
+        if memory.len() == 2 { reservations.push(reservation("peer exchange", shape.peer_bytes)); }
         if rank == 0 { reservations.push(reservation("RTX experts and loading peak", local_bytes)); }
         let pool_unit_bytes = cache.persistent_unit_bytes.checked_add(cache.pool_metadata_unit_bytes)
             .and_then(|n| n.checked_add(table_bytes)).context("V4 pool unit overflow")?;
@@ -79,7 +80,7 @@ mod tests {
         let memory: Vec<_> = [0, 7].into_iter().map(|device| DeviceMemory { device,
             total_bytes: 96 << 30, baseline_free_bytes: 16 << 30 }).collect();
         let shape = Shape { sequences: 8, prefill_rows: 4096, decode_rows: 64, max_context: 262144,
-            reserve_bytes: 3 << 30, prefix_bytes: vec![0, 8 << 30], workspace_bytes: None };
+            reserve_bytes: 3 << 30, prefix_bytes: vec![0, 8 << 30], workspace_bytes: None, peer_bytes: 1 << 28 };
         let profile = profile(&geometry, &memory, &shape, 1 << 30).unwrap();
         assert_eq!(profile.devices[0].pool_unit_bytes, (1 << 20) + (8192 + 64) * 4);
         let resolved = resolve(&profile, &memory, 8).unwrap();

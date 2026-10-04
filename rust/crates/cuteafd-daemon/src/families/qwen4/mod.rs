@@ -334,8 +334,12 @@ impl Opened {
         // lazy first-use load; reserve the exact loader plan before sizing KV.
         let mut future_expert_bytes = 0;
         let admitted_experts = if args.pool_tokens == 0 {
+            ensure!(args.shared_only || self.fp8().is_none() || args.expert_window.is_none(),
+                "Qwen automatic KV admission does not support diagnostic --expert-window paging; use a fixed pool or Sparks");
             let experts = self.experts(args, layers)?;
             if let Some(engine::Experts::LocalExl3(local)) = &experts {
+                ensure!(local.window >= layers,
+                    "Qwen automatic KV admission requires all EXL3 backbone experts resident; use --exl3-window at least {layers}, a fixed pool, or Sparks");
                 let expected = local.window.min(layers);
                 let plan = crate::families::deepseek_v4::local::plan(&self.library, &local.native_lib,
                     local.catalog, usize::from(local.mtp), expected, local.max_rows, local.budget)?;
