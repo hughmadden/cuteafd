@@ -557,6 +557,11 @@ pub(crate) struct NativeServeArgs {
     #[arg(long)]
     pub kv_pool_size: Option<crate::families::deepseek_v41::v41_native_serve::memory::ByteSize>,
 
+    /// Aggregate logical KV tokens; 0 selects planner admission. Omit to keep
+    /// the existing V4.1 pool policy. Cannot be combined with --kv-pool-size.
+    #[arg(long, conflicts_with = "kv_pool_size")]
+    pub pool_tokens: Option<u64>,
+
     /// Total device occupancy ceiling (% or B/MB/GB/MiB/GiB); sizes KV after fixed allocations.
     #[arg(long)]
     pub memory_reservation: Option<crate::families::deepseek_v41::v41_native_serve::memory::Reservation>,

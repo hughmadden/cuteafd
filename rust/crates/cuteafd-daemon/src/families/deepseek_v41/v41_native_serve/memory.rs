@@ -14,6 +14,37 @@ const GROUP_BYTES: usize = 5 * 256 * (68 + cuteafd_ffi::V41Kv::COMPRESSED_ROW_BY
 // Kept outside the eagerly allocated cache; this is not a CUDA process quota.
 pub(super) const RUNTIME_HEADROOM: usize = 2 * 1024 * 1024 * 1024;
 
+/// Resolve the planner's token budget after fixed owners are live (or charged
+/// to a synthetic free-memory sample for deferred TP2 experts). The byte plan
+/// is then passed to the existing allocator, which verifies its own formula.
+pub(super) fn planned_pool_size(args: &crate::cli::NativeServeArgs,
+    memory: &[(usize, usize)]) -> Result<Option<ByteSize>> {
+    let Some(requested) = args.pool_tokens else { return Ok(args.kv_pool_size); };
+    let automatic = requested == 0;
+    let target = if automatic { 14 * 1_048_576 }
+        else { requested };
+    let config: serde_json::Value = serde_json::from_reader(std::fs::File::open(args.snapshot.join("config.json"))?)?;
+    let available: Vec<u64> = memory.iter().enumerate().map(|(gpu, &(free, total))| {
+        ensure!(total > 0 && free <= total, "invalid GPU {gpu} memory information");
+        let policy_ceiling = args.memory_reservation.map(|r| r.bytes(total)).transpose()?.unwrap_or(total);
+        let ceiling = if automatic { policy_ceiling.min((total as u128 * 97 / 100) as usize) }
+            else { policy_ceiling };
+        // Keep >=3 GiB even after deferred local expert placement consumes
+        // its allowed budget. Existing explicit/non-planner paths are intact.
+        let runtime = if automatic { 3usize << 30 } else if memory.len() == 1 { RUNTIME_HEADROOM }
+            else { distributed::RUNTIME_HEADROOM };
+        Ok(ceiling.checked_sub(total - free).and_then(|n| n.checked_sub(runtime))
+            .with_context(|| format!("GPU {gpu} planner leaves no room after fixed owners and runtime reserve"))? as u64)
+    }).collect::<Result<_>>()?;
+    let groups = cuteafd_loader::serving_capacity::deepseek_v41_pool_groups(&config,
+        args.concurrency as u64, args.prefix_cache_entries as u64, &available, target, automatic, args.tp2_attention)?;
+    let bytes = usize::try_from(groups)?.checked_mul(GROUP_BYTES).context("planner KV byte overflow")?;
+    tracing::info!(requested_pool_tokens=requested, admitted_pool_tokens=groups.saturating_sub(
+        args.concurrency as u64 + 2 * args.prefix_cache_entries as u64) * 512,
+        groups, global_bytes=bytes, ?available, "V4.1 planner source-pool admission");
+    Ok(Some(ByteSize(bytes)))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ByteSize(pub usize);
 #[derive(Clone, Copy, Debug)]
@@ -217,6 +248,58 @@ impl PoolPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn planner_is_opt_in_and_explicit_pool_sizes_remain_strict() -> Result<()> {
+        use clap::{Args, FromArgMatches};
+        let parse = |extra: &[&str]| -> Result<crate::cli::NativeServeArgs> {
+            let mut values = vec!["fixture", "--snapshot", "/missing", "--native-lib", "/missing",
+                "--peers", "127.0.0.1:9000,127.0.0.1:9001,127.0.0.1:9002,127.0.0.1:9003"];
+            values.extend(extra);
+            let matches = crate::cli::NativeServeArgs::augment_args(clap::Command::new("fixture"))
+                .try_get_matches_from(values)?;
+            Ok(crate::cli::NativeServeArgs::from_arg_matches(&matches)?)
+        };
+        let unchanged = parse(&[])?;
+        assert!(unchanged.pool_tokens.is_none());
+        assert!(planned_pool_size(&unchanged, &[])?.is_none());
+        let exact = parse(&["--kv-pool-size", "1GiB"])?;
+        assert_eq!(planned_pool_size(&exact, &[])?.unwrap().0, 1 << 30);
+        assert!(parse(&["--kv-pool-size", "1GiB", "--pool-tokens", "0"]).is_err());
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("config.json"), include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+            "/../cuteafd-loader/src/families/deepseek_v41/official-v41-config.json")))?;
+        let mut auto = parse(&["--pool-tokens", "0"])?;
+        auto.snapshot = directory.path().to_owned();
+        let full = planned_pool_size(&auto, &[(96 << 30, 96 << 30)])?.unwrap();
+        assert_eq!(full.0 / GROUP_BYTES, 14 * 2048 + 16 + 40);
+        let limited = planned_pool_size(&auto, &[(6 << 30, 96 << 30)])?.unwrap();
+        assert!(limited.0 < full.0);
+        auto.pool_tokens = Some(14 * 1_048_576);
+        assert!(planned_pool_size(&auto, &[(6 << 30, 96 << 30)]).is_err());
+        Ok(())
+    }
+    #[test]
+    fn planner_cache_formula_matches_allocator_and_replica_owners() -> Result<()> {
+        use crate::families::deepseek_v41::v41_backbone_cache::CachePlacement;
+        let config: serde_json::Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+            "/../cuteafd-loader/src/families/deepseek_v41/official-v41-config.json")))?;
+        for slots in [1, 16] {
+            for groups in [2 * slots + 40, 4152, 32768] {
+                let pages = [groups, groups, groups, groups * 2];
+                let single = cuteafd_loader::serving_capacity::deepseek_v41_cache_bytes(&config, 1,
+                    slots as u64, groups as u64, false)?;
+                assert_eq!(single, vec![BackboneCache::device_bytes(slots, pages)? as u64]);
+                for replicated in [false, true] {
+                    let actual = if replicated { BackboneCache::replicated_device_bytes(CachePlacement::encoder_decoder(), slots, pages)? }
+                        else { BackboneCache::distributed_device_bytes(CachePlacement::encoder_decoder(), slots, pages)? };
+                    let predicted = cuteafd_loader::serving_capacity::deepseek_v41_cache_bytes(&config, 2,
+                        slots as u64, groups as u64, replicated)?;
+                    assert_eq!(predicted, actual.map(|b| b as u64).to_vec());
+                }
+            }
+        }
+        Ok(())
+    }
     #[test]
     fn sizes_and_reservations_validate_units_and_overflow() {
         for (value, bytes) in [

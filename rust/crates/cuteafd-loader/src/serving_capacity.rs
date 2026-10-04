@@ -10,7 +10,11 @@ use serde_json::Value;
 use thiserror::Error;
 
 mod deepseek;
-pub use deepseek::{deepseek_v41_cache_geometry, deepseek_v4_cache_geometry};
+#[cfg(test)]
+#[path = "plan/layout/v41.rs"]
+mod v41_layout_tests;
+pub use deepseek::{deepseek_v41_cache_bytes, deepseek_v41_cache_geometry, deepseek_v41_pool_groups,
+    deepseek_v4_cache_geometry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

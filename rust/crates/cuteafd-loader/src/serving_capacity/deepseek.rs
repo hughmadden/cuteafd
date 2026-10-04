@@ -162,6 +162,70 @@ pub fn deepseek_v41_cache_geometry(
     })
 }
 
+/// Exact target cache allocation, including bounded source page tables. Owners
+/// and records match `BackboneCache`; the geometry above reserves maximum
+/// tables so it remains independent of the selected pool.
+pub fn deepseek_v41_cache_bytes(config: &Value, ranks: usize, slots: u64, groups: u64,
+    replicated: bool) -> Result<Vec<u64>, CacheGeometryError> {
+    deepseek_v41_cache_geometry(config, ranks)?;
+    if !(1..=16).contains(&slots) || !(1..=131_072).contains(&groups)
+        || replicated && ranks != 2 {
+        return Err(CacheGeometryError::Unsupported { family: "deepseek_v41",
+            what: "active slots, source pool groups or replicated cache placement" });
+    }
+    let rank = |windows: u64, c2: u64, c1: u64| -> Result<u64, CacheGeometryError> {
+        sum("V4.1 target cache", &[
+            product("V4.1 source records", &[(c2 + 2 * c1), groups, 256 * 356])?,
+            product("V4.1 window state", &[windows, slots, 128 * 528 + 8])?,
+            product("V4.1 C2 source tables", &[c2, slots, groups.min(4096) * 4 + 8])?,
+            product("V4.1 C1 source tables", &[c1, slots, (2 * groups).min(4096) * 4 + 8])?,
+            product("V4.1 compressor carry", &[c2, slots, 4096])?,
+        ])
+    };
+    if ranks == 1 { Ok(vec![rank(40, 3, 1)?]) }
+    else if replicated {
+        // Replica payloads contain KV only; index keys and compressor carry
+        // remain on the source owner. Replica tables follow the source tables.
+        let peer_c1 = groups * 2 * 256 * 288 + slots * ((2 * groups).min(4096) * 4 + 8);
+        let peer_c2 = 3 * (groups * 256 * 288 + slots * (groups.min(4096) * 4 + 8));
+        Ok(vec![rank(40, 3, 0)? + peer_c1, rank(40, 0, 1)? + peer_c2])
+    } else { Ok(vec![rank(20, 3, 0)?, rank(20, 0, 1)?]) }
+}
+
+/// Resolve a shared source pool from residual per-device budgets, after all
+/// fixed owners and runtime headroom have been reserved. Admission adds active
+/// and retained copy-on-write tails to the requested logical capacity. An
+/// explicit token request must fit; auto may reduce aggregate capacity.
+pub fn deepseek_v41_pool_groups(config: &Value, slots: u64, retained_turns: u64,
+    available: &[u64], tokens: u64, automatic: bool, replicated: bool)
+    -> Result<u64, CacheGeometryError> {
+    if retained_turns > 128 || tokens == 0 {
+        return Err(CacheGeometryError::Unsupported { family: "deepseek_v41",
+            what: "retained turn limit or target pool tokens" });
+    }
+    let minimum = product("V4.1 private tails", &[2, slots + retained_turns])?;
+    let desired = tokens.div_ceil(512).checked_add(slots + 2 * retained_turns)
+        .ok_or(CacheGeometryError::Overflow("V4.1 source groups"))?.max(minimum);
+    let fits = |groups| -> Result<bool, CacheGeometryError> {
+        Ok(deepseek_v41_cache_bytes(config, available.len(), slots, groups, replicated)?
+            .iter().zip(available).all(|(used, free)| used <= free))
+    };
+    if desired > 131_072 || !fits(minimum)? {
+        return Err(CacheGeometryError::Unsupported { family: "deepseek_v41",
+            what: "source pool exceeds physical capacity or minimum admission budget" });
+    }
+    let (mut low, mut high) = (minimum, desired);
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        if fits(mid)? { low = mid; } else { high = mid - 1; }
+    }
+    if !automatic && low != desired {
+        return Err(CacheGeometryError::Unsupported { family: "deepseek_v41",
+            what: "requested source pool does not fit the per-device memory budget" });
+    }
+    Ok(low)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +329,27 @@ mod tests {
             Err(CacheGeometryError::Unsupported { .. })
         ));
         assert!(deepseek_v41_cache_geometry(&config, 3).is_err());
+    }
+
+    #[test]
+    fn v41_exact_tables_and_pool_admission_use_the_tighter_owner() {
+        let config: Value = serde_json::from_str(include_str!(
+            "../families/deepseek_v41/official-v41-config.json")).unwrap();
+        let groups = 4096 + 16 + 40;
+        let exact = deepseek_v41_cache_bytes(&config, 2, 16, groups, false).unwrap();
+        let single = deepseek_v41_cache_bytes(&config, 1, 16, groups, false).unwrap();
+        assert_eq!(single[0], exact.iter().sum::<u64>());
+        let geometry = deepseek_v41_cache_geometry(&config, 2).unwrap();
+        for (bytes, rank) in exact.iter().zip(&geometry.ranks) {
+            assert_eq!(*bytes, groups * rank.persistent_unit_bytes + 16 * rank.active_state_per_sequence_bytes);
+        }
+        assert_eq!(deepseek_v41_pool_groups(&config, 16, 20, &exact, 2 << 20, true, false).unwrap(), groups);
+        let mut short = exact.clone();
+        short[1] -= 1;
+        assert_eq!(deepseek_v41_pool_groups(&config, 16, 20, &short, 2 << 20, true, false).unwrap(), groups - 1);
+        assert!(deepseek_v41_pool_groups(&config, 16, 20, &short, 2 << 20, false, false).is_err());
+        assert!(deepseek_v41_pool_groups(&config, 16, 20, &[0, 0], 2 << 20, true, false).is_err());
+        let small = deepseek_v41_cache_bytes(&config, 1, 16, 72, false).unwrap()[0];
+        assert_eq!(small, 72 * 455680 + 16 * (40 * 67592 + 3 * (72 * 4 + 8 + 4096) + 144 * 4 + 8));
     }
 }
