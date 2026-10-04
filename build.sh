@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
+source "$repo_root/scripts/lib/release-export-locks.sh"
 bf16_families="${CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES:-}"
 bf16_family_pattern='^(mimo|mimop|glm|glmf|qwen4)(;(mimo|mimop|glm|glmf|qwen4))*$'
 [[ -z "$bf16_families" || "$bf16_families" =~ $bf16_family_pattern ]] ||
@@ -24,7 +25,11 @@ the mode with SPARK_TP/SPARK_EP. The x86_64 coordinator image needs no Spark rol
 Set CUTEAFD_RELEASE_SPARK_TP_ROLES to an explicit subset (for example tp6, or empty
 for the historical TP4-only shard) for a bounded topology A/B or a legacy rebuild.
 --dry-run validates the configuration, host set and role plan without touching
-Docker, SSH, submodules or any image.
+Docker, SSH, submodules, hardware locks or any image.
+GPU exports take sparks.lock then gpu1.lock on the coordinator, including the
+remote Spark export. CUTEAFD_RELEASE_LOCK_TIMEOUT_SECONDS bounds each lock wait
+(default 1200); CUTEAFD_RELEASE_EXPORT_TIMEOUT_SECONDS bounds each export
+(default 7200). Containers are removed before releasing the locks.
 Set CUTEAFD_RELEASE_SSH_CONFIG to an ssh config file that every remote step should
 use (default empty: stock OpenSSH resolution, so a build host's ~/.ssh/config keeps
 working, with BatchMode forced either way). Pass /dev/null to discard a system
@@ -261,6 +266,13 @@ prepare_pinned_source_dependencies() {
 
 prepare_pinned_source_dependencies
 
+release_need flock
+release_need timeout
+export_timeout="${CUTEAFD_RELEASE_EXPORT_TIMEOUT_SECONDS:-7200}"
+[[ "$export_timeout" =~ ^[1-9][0-9]*$ ]] || release_die "CUTEAFD_RELEASE_EXPORT_TIMEOUT_SECONDS must be positive seconds"
+# Unique names let timeout/signal cleanup remove only this build's containers.
+export_container="cuteafd-release-export-$(hostname)-$$"
+
 docker info >/dev/null 2>&1 || release_die "local Docker daemon is unavailable"
 detected_engine_commit="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || true)"
 engine_source_dirty=0
@@ -466,7 +478,8 @@ mkdir -p "$release_source_parent"
 release_source_dir="$(mktemp -d "$release_source_parent/coordinator-source.XXXXXXXX")"
 trap 'rm -rf "$release_source_dir"' EXIT
 "$repo_root/scripts/build/stage-release-source.sh" "$repo_root" "$release_source_dir"
-docker run --rm \
+release_with_export_locks "" "$export_container-coordinator" \
+  timeout "$export_timeout" docker run --rm --name "$export_container-coordinator" \
   --gpus device=0 \
   --ipc=host \
   --ulimit memlock=-1:-1 \
@@ -548,13 +561,16 @@ verify_remote_source_manifest
 # step, not part of what the remote shell receives.
 release_prepare_build_root "$seed_host" "$remote_dir"
 echo "== building Spark development and inference images natively on $seed_host =="
-release_ssh "$seed_host" bash -s -- \
+build_spark_release_leg() {
+  local phase="$1"
+  timeout "$export_timeout" ssh "${release_ssh_opts[@]}" "$seed_host" bash -s -- \
   "$remote_dir" "$SPARK_EXPERT_DOCKER_DEV" "$SPARK_EXPERT_DOCKER_INFERENCE" \
   "$engine_commit" "$sparkinfer_commit" "$release_version" \
   "$EXL3_PAIRED_TP4" "${source_manifest_sha256:-__legacy__}" "$(r="${spark_tp_roles//;/,}"; echo "${r:-__legacy__}")" \
   "${release_build_root:-__legacy__}" \
   "$(f="${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}"; f="${f//;/,}"; echo "${f:-__legacy__}")" \
-  "$(f="${bf16_families//;/,}"; echo "${f:-__legacy__}")" <<'REMOTE'
+  "$(f="${bf16_families//;/,}"; echo "${f:-__legacy__}")" \
+  "$phase" "$export_container-expert" <<'REMOTE'
 set -euo pipefail
 remote_dir="$1"
 dev_image="$2"
@@ -600,6 +616,9 @@ if [[ -n "$source_manifest_sha256" ]]; then
   )
 fi
 cd "$remote_dir"
+phase="${13:?}"
+export_container="${14:?}"
+if [[ "$phase" == dev ]]; then
 python3 scripts/build/verify-sparkinfer-source.py \
   --source third_party/sparkinfer \
   --lock third_party/sparkinfer.lock.json \
@@ -611,8 +630,10 @@ docker build \
   --build-arg CUTEAFD_SPARKINFER_COMMIT="$sparkinfer_commit" \
   -f docker/Dockerfile.dev \
   -t "$dev_image" .
+fi
+if [[ "$phase" == export ]]; then
 mkdir -p .cuteafd-release-image
-docker run --rm \
+docker run --rm --name "$export_container" \
   --gpus all \
   --ipc=host \
   --ulimit memlock=-1:-1 \
@@ -625,6 +646,8 @@ docker run --rm \
   -v "$remote_dir/.cuteafd-release-image:/output" \
   "$dev_image" \
   /source/scripts/build/build-release-artifacts.sh /source expert 121 /output
+fi
+if [[ "$phase" == image ]]; then
 docker build \
   "${release_source_label_args[@]}" \
   --build-arg CUTEAFD_ROLE=expert \
@@ -635,7 +658,12 @@ docker build \
   --build-arg CUTEAFD_SPARK_TP_ROLES="$spark_tp_roles" \
   -f docker/Dockerfile.release \
   -t "$inference_image" .
+fi
 REMOTE
+}
+build_spark_release_leg dev
+release_with_export_locks "$seed_host" "$export_container-expert" build_spark_release_leg export
+build_spark_release_leg image
 verify_remote_source_manifest
 
 echo "== exporting release binaries =="
