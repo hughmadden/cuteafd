@@ -39,6 +39,19 @@ def compare(before: dict, after: dict) -> dict:
     for field in ("model", "revision", "hardware", "build"):
         if before["server"][field] != after["server"][field]:
             raise ValueError(f"comparison changes server {field}")
+    configs = []
+    modes = []
+    for report in (before, after):
+        config = dict(report["server"]["configuration"])
+        settings = config["settings"]
+        modes.append(next((s["value"] for s in settings if s["name"] == "CUTEAFD_V41_FP8_HEAD"), "off"))
+        config["settings"] = sorted((s for s in settings if s["name"] != "CUTEAFD_V41_FP8_HEAD"),
+                                    key=lambda s: s["name"])
+        configs.append(config)
+    if modes[0] not in ("off", "0", "false") or modes[1] not in ("all", "1", "on"):
+        raise ValueError("comparison must use BF16/off followed by FP8/all")
+    if configs[0] != configs[1]:
+        raise ValueError("comparison changes configuration beyond the head policy")
     a, b = fidelity(before), fidelity(after)
     if a["reference"] != b["reference"] or a["probe"]["prompt_ids"] != b["probe"]["prompt_ids"]:
         raise ValueError("comparison changes reference or prompt ids")
