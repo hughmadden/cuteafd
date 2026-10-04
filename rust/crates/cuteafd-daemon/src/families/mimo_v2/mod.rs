@@ -1292,7 +1292,7 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
         }
         let scored = tokens.len().saturating_sub(first + 1).min(rows).max(1) as f64;
         println!("{label} logits: top-1 agreement {:.1}% over {rows} rows | next-token accuracy engine {:.1}% \
-            golden {:.1}% | mean NLL {:.4} | mean KL(golden||engine) {:.5}", 100.0 * agree as f64 / rows as f64,
+            golden {:.1}% | mean NLL {:.8} | mean KL(golden||engine) {:.8}", 100.0 * agree as f64 / rows as f64,
             100.0 * next_ok as f64 / scored, 100.0 * golden_next as f64 / scored, nll / scored, kl / rows as f64);
         Ok(())
     };

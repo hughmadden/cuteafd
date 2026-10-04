@@ -151,7 +151,7 @@ pub(super) fn load_fp8<'a>(
 ) -> Result<(Weights<'a>, usize)> {
     let tensors = catalog.fp8().context("FP8 residency requires the checkpoint's FP8 experts")?;
     // FP8 slices are whole 128-row blocks (TP2/TP4 of 2048); MXFP4 slices are
-    // whole 32-blocks padded to 128 (MiMo V2.6 Pro: TP6, TP2), NVFP4 ones whole
+    // whole K32 blocks (opt-in exact tails; otherwise K128 widths), NVFP4 ones whole
     // 16-blocks padded to 128 (TP3 as well). `slice` checks it; the package
     // directory has a layout per built world.
     ensure!(config.topology.is_none() && matches!(config.world, 2 | 3 | 4 | 6),
