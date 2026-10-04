@@ -703,7 +703,8 @@ v1 ships when these are done; everything else below moves to v1.x/v2.
   multimodal input (v2); `placement.json` handoff and cold-component placement;
   V4.1 NVFP4 W4A4 revisit and W4A4 decode;
   **re-evaluate EXL3 A8 defaults per checkpoint (and uncapped RTX)**:
-  the SM120/SM121 INT8 path ships as an opt-in experiment; promotion needs
+  the SM120/SM121 INT8 path is available on `work/exl3-a8` as an opt-in
+  experiment; promotion needs
   checkpoint-specific quality, prefill and tool gates;
   parked Spark-side reduce / split intake.
 - **RTX 5090 support: Hugh** (external collaborator). Brief: one SM120 build
@@ -977,7 +978,7 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
      each architecture, including BF16/wire rows, unequal tiles, mutation
      and zero rows. Actual Spark waves missed the projected 2–5% gain;
      fusion/quantization overhead appears to outweigh faster INT8 MMA.
-     Full-model native runs use 4096-row chunks, one untimed 8K warm-up and
+     Full-model native runs use 4096-row capacity per lane, one untimed 8K warm-up and
      three timed prefills in one launch per arm, with identical images,
      settings and golden tokens. Qwen local K4.25 (1634 golden positions):
      8K prefill **1212.2 → 1187.7 ms** (6758 → 6897 tok/s, indicative 1.021×,
@@ -1002,12 +1003,36 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
      Flash's actual L20 request waves on ostrich (six measured 4096-row
      chunks after the two warm-up chunks) were **10.050 → 11.645 ms** GPU
      median; these use model inputs rather than the component's seeded ones.
+     GLM K4 TP6 (2 RTX + all six GB10s, 1524 golden positions): NLL
+     **2.459485 → 2.473897** (delta **+0.014411 nat**), golden KL
+     **0.035599 → 0.037412**, golden top-1 **91.40% → 91.27%**;
+     direct KL **0.029761 nat**, direct top-1 92.45%: **quality fails**.
+     Its native three-lane 8K prefill splits into 2752 + 2752 + 2688 row
+     waves. Real L40 width384 waves on ostrich, six measured 2752-row waves
+     after warm-up, were **10.035 → 11.270 ms** GPU median. Whole 8K
+     medians were **3024.6 → 2862.8 ms**, but individual runs were
+     A16 [2530, 3025, 3075] / A8 [2841, 2863, 3118] ms and mean Spark
+     wait rose **1659.3 → 1763.2 ms**. The spread does not establish a stable
+     speed gain; do not promote from the median. No repeats after the
+     decisive numerics failure. GLM was rechecked once with the current
+     `v1.0.0-rc1` native base (fork `f6bb38bc`), restoring valid A16 NLL.
+     The first pair on an older `v1c` native base (fork `31c7d166`) had
+     A16 NLL 10.4876 and is excluded, preserved as `glm-tp6-invalid-v1c`.
+     Candidate Rust and EXL3 A16/A8 packages are from the same source in
+     each arm; packages use fork `55e10b10`. Flash/Qwen native bases were
+     their qualified `glmf-fp8-recheck` / `planner-v1-qwen-merge` images.
      Golden KL here includes the checkpoint's existing quantization error;
      the 0.005-nat switch gate is applied to incremental golden NLL/KL and
      direct KL(A16||A8). No tool/agentic promotion gates were attempted after
      these numerics failures. Cargo workspace check/test and scripts
      (907 passed, two skipped, no failing IDs) passed; default V4.1 parity
      was not re-run (no native library, transport or sampler source changes).
+     Follow-up: reduce INT8 activation/weight requantization drift before
+     seeking default changes, then re-run checkpoint-specific quality/tool
+     gates and stable timing, including uncapped RTX. FP8 is not qualified
+     by these INT8 results. All task containers/workers were stopped; GLM
+     replicas were shrunk to one complete copy on dodo (raptor's prior
+     partial copy retained).
      Results live under `~/.cache/cuteafd/builds/exl3-a8/`; no default change.
    - MXFP4 experts (V4.1 already W4A8; MiMo V2.6 Pro W4A16): A8 prefill for
      MiMo Pro (Spark-bound prefill), and MXFP4 × MXFP8 MMAs for both.
