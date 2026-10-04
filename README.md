@@ -25,17 +25,29 @@ format.
 - Own your intelligence: your weights, your hardware, your rate limits (none),
   agentic coding at full speed on a machine you control, not a shared tenant.
 
+## v1.0.0 changes since v0.1.0
+
+- MiMo Pro uses the MOPD checkpoint. Single-copy FP8 defaults cover the V4.1
+  vocabulary head, MiMo head/o_proj/drafter, GLM drafters, GLM Flash per-layout
+  projections and Qwen head.
+- Qwen gains local experts and MTP3, including mixed NVFP4 backbone / FP8 MTP.
+  GLM Flash gains a two-RTX head split and DFlash2 on every layout.
+- MiMo Pro prefill gains lanes under head split, A8 down projection and exact
+  Spark slices; GLM 5.3 gains FP8 MLA prefill and faster Spark kernels.
+- Tool-call grammar fixes, automatic KV pools and planner core, a live console
+  for every family, and the benchmark dashboard. Device-driven exchange ships
+  opt-in. MXFP4 32-row tails and V4.1 exact slices move to v1.x.
+
 ## Models
 
 Basic benchmark profile per family on its natural-minimum (1× RTX + fewest
 Sparks) and maximum (2× RTX + 4 or 6 Sparks) hardware. Other reports:
 [`benchmarks/`](benchmarks/README.md).
 
-RC2 preparation: all 28 required smoke cards pass, including Qwen NVFP4
-with resident local MTP3 on one RTX. The grid contains four refreshed RC2
-cards and 24 retained RC1 cards. MXFP4 32-row tails remain a release blocker. See
-[qualification and release blockers](PLAN.md#v1-regression-follow-up-rc2-2026-10-05)
-and [changes since v0](PLAN.md#v1-candidate-changelog-preparation-2026-10-04).
+All 28 required release-prep smoke cards pass, including Qwen NVFP4 with
+resident local MTP3 on one RTX. The grid contains four refreshed RC2 cards
+and 24 retained RC1 cards. See [qualification and known limits](PLAN.md#v1-regression-follow-up-rc2-2026-10-05)
+and the [release scope](PLAN.md#release-v1-scope-decided-2026-10-04).
 
 <!-- results:begin -->
 <table>

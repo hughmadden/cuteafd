@@ -684,7 +684,7 @@ v1 ships when these are done; everything else below moves to v1.x/v2.
   byte-exact prefix-cache restores at turn end for V4 / V4.1; planner core for
   every family (per-device memory layout + admission); all Release smoke
   cards green with MOPD as the MiMo Pro default
-  and a refreshed README; MXFP4 32-row tails; the Spark kernel wins already
+  and a refreshed README; the Spark kernel wins already
   landed; known-issue notes (NVFP4 local experts on one RTX, Qwen with Sparks).
 - **Status 2026-10-04:** the device exchange is merged opt-in and hang-free
   (`CUTEAFD_V41_DEVICE=1`; +1.5% C1 on 2 RTX, flat elsewhere; MiMo/GLM
@@ -698,6 +698,9 @@ v1 ships when these are done; everything else below moves to v1.x/v2.
   defaults to `all`; prior notes incorrectly said BF16. The release-prep
   matched dual-RTX ABAB recheck does not reproduce the historical C1 drop,
   so RC2 retains that FP8 default. `draft` retains dual residency.
+- **Cut to v1.x:** MXFP4 32-row tails and V4.1 exact Spark slices measured
+  flat; their opt-in implementations remain on `work/mxfp4-tails` and
+  `work/v41-exact`. Neither blocks v1.0.0.
 - **Cut to v1.x/v2:** whole-step graphs (D4: context-length-dependent index
   graphs, per-request pointers in graph keys, host-built per-layer metadata,
   warm re-captures) and device-side draft acceptance; deterministic
