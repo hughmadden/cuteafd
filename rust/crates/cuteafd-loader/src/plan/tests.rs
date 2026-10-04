@@ -678,8 +678,7 @@ fn glm_and_qwen_patterns_follow_their_runtime_readers() {
     assert_eq!(spec.layers[0].rope, Some(spec::RopeSpec { dims: 64, theta: 8e6 }));
 }
 
-#[test]
-fn deepseek_v4_plan_reads_the_runtime_config_source() {
+fn v4_snapshot() -> tempfile::TempDir {
     // serve-dsv4 reads inference/config.json when the snapshot has one; so does the plan.
     let hf = json!({"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4"});
     let mut ratios = vec![0, 0];
@@ -693,9 +692,25 @@ fn deepseek_v4_plan_reads_the_runtime_config_source() {
         "index_topk": 512, "hc_mult": 4, "hc_sinkhorn_iters": 20, "compress_rope_theta": 160000,
         "compress_ratios": ratios[1..].to_vec()
     });
-    let dir = snapshot(hf, &[t("embed.weight", "BF16", &[64, 4096])]);
+    let mut tensors = vec![t("embed.weight", "BF16", &[64, 4096])];
+    for layer in 0..4 {
+        for expert in 0..256 {
+            for (projection, rows, cols) in [("w1", 2048, 4096), ("w2", 4096, 2048), ("w3", 2048, 4096)] {
+                let name = format!("layers.{layer}.ffn.experts.{expert}.{projection}");
+                tensors.push(t(format!("{name}.weight"), "I8", &[rows, cols / 2]));
+                tensors.push(t(format!("{name}.scale"), "F8_E8M0", &[rows, cols / 32]));
+            }
+        }
+    }
+    let dir = snapshot(hf, &tensors);
     std::fs::create_dir_all(dir.path().join("inference")).unwrap();
     std::fs::write(dir.path().join("inference/config.json"), serde_json::to_vec(&args).unwrap()).unwrap();
+    dir
+}
+
+#[test]
+fn deepseek_v4_plan_reads_the_runtime_config_source() {
+    let dir = v4_snapshot();
     let report = plan(dir.path(), &sparks(4)).unwrap();
     let spec = report.spec.as_ref().expect("planned from inference/config.json");
     let cfg = crate::families::deepseek_v4::DeepseekV4Config::read(dir.path(), 0).unwrap();
@@ -705,6 +720,24 @@ fn deepseek_v4_plan_reads_the_runtime_config_source() {
     }).collect();
     assert_eq!(ratios, cfg.compress_ratios);
     assert_eq!(spec.layers[1].rope, Some(spec::RopeSpec { dims: 64, theta: 160000.0 }));
+}
+
+#[test]
+fn v4_explicit_pool_reduces_expert_placement_while_auto_preserves_legacy_policy() {
+    let dir = v4_snapshot();
+    let experts = |pool, local_expert_layers| {
+        let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
+            rtx_bytes: vec![24 << 30], pool_tokens: Some(pool), local_expert_layers,
+            ..Default::default()
+        }), ..sparks(2) }).unwrap();
+        report.memory_layout.unwrap().devices[0].items.iter()
+            .filter(|i| i.group == "resident routed layers").map(|i| i.bytes).sum::<u64>()
+    };
+    let legacy = experts(262144, None);
+    assert!(legacy > 0);
+    assert_eq!(experts(0, None), legacy);
+    assert!(experts(16 * 1024 * 1024, None) < legacy);
+    assert_eq!(experts(262144, Some(2)), experts(16 * 1024 * 1024, Some(2)));
 }
 
 #[test]

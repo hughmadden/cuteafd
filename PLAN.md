@@ -558,8 +558,8 @@ GLM 5.3 and GLM 5.3 Flash (`--pool-tokens 0`). V4 Flash/Pro, V4.1 Flash
 and Qwen 3.8 Flash Next now describe compressed/sparse KV, recurrent state,
 mapped-table staging, prefix arenas, RTX expert arenas, native drafters,
 workspaces and Spark ranks, with opt-in runtime admission on pool 0.
-Qwen local EXL3 K4.25 and V4.1 native TP4 natural-minimum layouts are
-ledger-qualified after 8K prefill and C4; other configurations remain
+V4 Flash native TP2, V4.1 native TP4 and Qwen local EXL3 K4.25 natural-minimum
+layouts are ledger-qualified after 8K prefill and C4; other configurations remain
 estimates. Serving defaults are unchanged, including the omitted V4.1 pool
 path. Next: graph-cache bounds and `placement.json` handoff (S1).
 Follow-ups (2026-10-03, measurements pending in `~/.cache/cuteafd/builds/v1-memory/kit/out`):

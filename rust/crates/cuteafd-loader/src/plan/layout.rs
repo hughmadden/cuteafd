@@ -272,6 +272,11 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
         && native_layers > 0 && options.local_expert_layers.is_none();
     let package = report.experts.as_ref().map(|e| e.package.as_str());
     let reference = reference_gpu && match family {
+        "deepseek_v4" => matches!(report.placement, ExpertPlacement::Sparks { ranks: 2 })
+            && package == Some("dsv4f:mxfp4 (expertd-native)")
+            && model.spec().hidden == 4096 && model.spec().layers.len() == 43
+            && workspace_manifest.is_some() && prefill_rows == 4096 && concurrency == 8
+            && matches!(options.prefix_slots, None | Some(42)) && context_tokens == 32768,
         "deepseek_v41" => matches!(report.placement, ExpertPlacement::Sparks { ranks: 4 })
             && model.spec().hidden == 5120 && model.spec().layers.len() == 40
             && package == Some("v41:mxfp4 (expertd-native)") && prefill_rows == 2048
@@ -483,7 +488,10 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
             let role = if active_gpus == 1 { 0 } else { 1 };
             let workspaces: u64 = devices[0].items.iter().filter(|i| i.group == "steps").map(|i| i.bytes).sum();
             let already = devices[0].used_bytes().saturating_sub(workspaces + costs.graph_bytes[role]);
-            let legacy = cache.ranks[0].persistent_unit_bytes * 262144u64.div_ceil(cache.logical_unit_rows);
+            // Auto retains the runtime's legacy expert-placement policy.
+            // A positive pool is allocated before experts by the legacy loader.
+            let placement_pool = if automatic { 262144 } else { options.pool_tokens.unwrap_or(262144) };
+            let legacy = cache.ranks[0].persistent_unit_bytes * placement_pool.div_ceil(cache.logical_unit_rows);
             let expert_workspace = exl3_workspace.unwrap_or(160 * MIB * prefill_rows / 4096);
             let reserve = state + legacy + slots * mark_bytes + 10 * GIB + expert_workspace;
             local_layers = (options.rtx_bytes[0].saturating_sub(already + reserve) / layer_bytes)
