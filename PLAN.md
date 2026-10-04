@@ -680,7 +680,16 @@ v1 ships when these are done; everything else below moves to v1.x/v2.
   missing); all Release smoke cards green with MOPD as the MiMo Pro default
   and a refreshed README; MXFP4 32-row tails; the Spark kernel wins already
   landed; known-issue notes (NVFP4 local experts on one RTX, Qwen with Sparks).
-- **Cut to v1.x/v2:** whole-step graphs if the exchange isn't stable in time;
+- **Status 2026-10-04:** the device exchange is merged opt-in and hang-free
+  (`CUTEAFD_V41_DEVICE=1`; +1.5% C1 on 2 RTX, flat elsewhere; MiMo/GLM
+  adoption on `work/device-mimo-glm` gains nothing — their segments are
+  GPU-bound). It ships opt-in in v1. Turn-end prefix restores proved exact
+  (the check was wrong; fixed). V4.1 FP8 vocabulary head: single-copy gate
+  in progress.
+- **Cut to v1.x/v2:** whole-step graphs (D4: context-length-dependent index
+  graphs, per-request pointers in graph keys, host-built per-layer metadata,
+  warm re-captures) and device-side draft acceptance; deterministic
+  (batch-invariant) prefill and verify;
   multimodal input (v2); `placement.json` handoff and cold-component placement;
   V4.1 NVFP4 W4A4 revisit and W4A4 decode; EXL3 × A8 (an independent SM120
   implementation is the interesting part — not a port of b12x PR #342, whose
