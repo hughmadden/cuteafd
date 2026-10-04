@@ -554,8 +554,14 @@ device totals at ready match the ledger within 2% (GLM 5.3 39.10/27.63 vs
 on the held-out auto-pool launches (MiMo Pro 49.42/41.86 vs 49.4/41.6, GLM Flash
 50.93 vs 50.7, GLM 5.3 93.04/81.96 vs 92.1/80.6 with its full graph allowance).
 Engines take admission from it: MiMo (capacity contract, pool 0 = auto),
-GLM 5.3 and GLM 5.3 Flash (`--pool-tokens 0`). Next: V4/V4.1 and Qwen
-geometry in the planner, graph-cache bounds, `placement.json` handoff (S1).
+GLM 5.3 and GLM 5.3 Flash (`--pool-tokens 0`). V4 Flash/Pro, V4.1 Flash
+and Qwen 3.8 Flash Next now describe compressed/sparse KV, recurrent state,
+mapped-table staging, prefix arenas, RTX expert arenas, native drafters,
+workspaces and Spark ranks, with opt-in runtime admission on pool 0.
+Qwen local EXL3 K4.25 and V4.1 native TP4 natural-minimum layouts are
+ledger-qualified after 8K prefill and C4; other configurations remain
+estimates. Serving defaults are unchanged, including the omitted V4.1 pool
+path. Next: graph-cache bounds and `placement.json` handoff (S1).
 Follow-ups (2026-10-03, measurements pending in `~/.cache/cuteafd/builds/v1-memory/kit/out`):
 - GLM 5.3 decode graphs bounded: steps pad to row buckets (exact to 16, then
   20..64) over a scratch page past the pool, page tables to power-of-two widths
@@ -676,8 +682,8 @@ v1 ships when these are done; everything else below moves to v1.x/v2.
 - **In v1:** device-driven exchange for V4.1 and MiMo V2.6 Pro (default only
   if it beats the current default and is hang-free; otherwise opt-in);
   byte-exact prefix-cache restores at turn end for V4 / V4.1; planner core for
-  every family (per-device memory layout + admission; V4, V4.1, Qwen still
-  missing); all Release smoke cards green with MOPD as the MiMo Pro default
+  every family (per-device memory layout + admission); all Release smoke
+  cards green with MOPD as the MiMo Pro default
   and a refreshed README; MXFP4 32-row tails; the Spark kernel wins already
   landed; known-issue notes (NVFP4 local experts on one RTX, Qwen with Sparks).
 - **Status 2026-10-04:** the device exchange is merged opt-in and hang-free

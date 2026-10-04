@@ -153,6 +153,8 @@ cache layout works.
    matching image manifest (`--workspace-manifest PROGRAMS.json`). The
    image also supplies EXL3 allocation manifests; when exporting metadata,
    keep their `exl3/` tree alongside `PROGRAMS.json`.
+   Qwen local EXL3 K4.25 and V4.1 native TP4 layouts are calibrated on one
+   RTX PRO 6000 after 8K prefill and C4; unmeasured layouts stay estimates.
 2. Pick or adapt a config under [`examples/configs/`](examples/configs/) or
    edit `cuteafd.config` for your own topology (coordinator GPUs, Spark
    ranks, TP/EP layout). `POOL_TOKENS=auto` selects planner admission for
