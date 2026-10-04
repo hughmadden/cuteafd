@@ -1,0 +1,1139 @@
+{
+  "schema": "cuteafd.glmf-fp8-recheck.v1",
+  "date": "2026-10-04",
+  "conditions": {
+    "engine_commit": "45955d81bfa6d0f266b60fad5bf9c7a2a9651f61",
+    "kernel_commit": "f6bb38bc56fdcd695791c1ebf91d0dbf133cd599",
+    "benchmark_only_change": "Opt-in CUTEAFD_BENCH_NONCE_SEED; no serving or kernel source edits",
+    "nonce_seed": "glmf-fp8-recheck",
+    "checkpoint": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1",
+    "checkpoint_revision": "0490d2f708b12145f6516555ab066aaeb401cd21",
+    "drafter": "incoai/GLM-5.3-Flash-DFlash2",
+    "arms": {
+      "D": {
+        "GLM5_FLASH_KDA_FP8": "off",
+        "GLM5_FLASH_FP8_HEAD": "off",
+        "SPECULATOR_FP8": "on"
+      },
+      "F": {
+        "GLM5_FLASH_KDA_FP8": "row128",
+        "GLM5_FLASH_FP8_HEAD": "on",
+        "SPECULATOR_FP8": "on"
+      }
+    },
+    "layouts": {
+      "min": {
+        "rtx": 1,
+        "sparks": [
+          "rhea",
+          "moa"
+        ],
+        "order": [
+          "D",
+          "F",
+          "D",
+          "F",
+          "D",
+          "F"
+        ]
+      },
+      "max": {
+        "rtx": 2,
+        "sparks": [
+          "ostrich",
+          "dodo",
+          "emu",
+          "kiwi"
+        ],
+        "head_split": true,
+        "order": [
+          "D",
+          "F"
+        ]
+      }
+    },
+    "conditions": {
+      "rtx_power_w": 325,
+      "concurrency_limit": 8,
+      "max_context": 32768,
+      "max_output": 4096,
+      "pool_tokens": "current auto default",
+      "fp8_prefill": "current default mla,ffn",
+      "code": "release corpus, thinking off, fixed nonce, C1/C4, one warm batch per concurrency, one measured batch per launch, emitted tok/s",
+      "prefill": "cold prompt targeted to 8192 chat tokens; one sizing request, one untimed warm request at the calibrated exact shape, two timed requests per launch",
+      "agentic": "one 4-turn money-task recording, seed 0, replay identical histories per launch, temperature 0, reasoning high, thinking enabled, 2048 tokens/turn, reasoning echoed; timing-only replay",
+      "code_max_tokens": 320
+    },
+    "quality": "current bench fidelity (512 fixed golden positions) and current spec_lossless rule, once per arm/layout",
+    "decision_rule": {
+      "max_top1_drop_points": 1.0,
+      "kl_nll": "not worse",
+      "speed": "at least 5% C4 or agentic emitted tok/s improvement",
+      "decision_owner": "Claude",
+      "change_defaults": false
+    },
+    "benchmark_harness_commit": "0d6809d",
+    "fixed_speculation_prompt_nonce": "glmf-fp8-recheck-0000000010",
+    "provenance_note": "One compilation of each architecture\u2019s serving code and pinned native artifacts; coordinator rebuilt once with the benchmark-only nonce hook before the measured cohort. Compiled artifact hashes identify the same build used by every arm.",
+    "prior_projection": {
+      "source_commit": "c5f87be",
+      "c4_tps_D": 118.3,
+      "c4_tps_F": 131.8,
+      "c4_ratio": 1.1141166525781911,
+      "note": "Historical one-launch ceiling only; not mixed into this study."
+    },
+    "quality_nonce_seed_location": "The bench CLI submits the run to the server; CUTEAFD_BENCH_NONCE_SEED=glmf-fp8-recheck in the measured coordinator image makes all original quality probes deterministic.",
+    "agentic_recording_sha256": "e4359ac9c2addc9b03d9892876a5713acaafc18576430185c9de8d9635e0c8dc",
+    "agentic_recording_success": 1.0,
+    "drafter_revision": "bf582e4eacc1810f76656d1811693ff6c6737d2a",
+    "invalid_attempts": [
+      "Initial minimum D launch: EXL3 overlay installed at an unused path, corrected before measurements"
+    ],
+    "additional_quality_confirmations": {
+      "reason": "Two unnecessary minimum-layout quality-only repeats after mistakenly treating the bench CLI as the executor. The benchmark runs inside the server, where the fixed seed was already present. Publish the original once-per-arm/layout reports.",
+      "results": {
+        "D": {
+          "quality_values_reproduced_exactly_excluding_timing": true,
+          "included_in_speed_statistics": false
+        },
+        "F": {
+          "quality_values_reproduced_exactly_excluding_timing": true,
+          "included_in_speed_statistics": false
+        }
+      }
+    }
+  },
+  "compiled_artifact_sha256": {
+    "coordinator_binary": "521da99684a4034c36a2b0d3567c4d852d2de6d90287443982e7d2037458ed4b",
+    "coordinator_native": "37ee17939c63cba8127e75b0cc3c8ff54f495eff2c0b0d2f0323ff5d9ee0f824",
+    "spark_binary": "fd32e44587fef82f04414391ab6f34a82681ed211fcf92c378fba1061112c7a6",
+    "spark_native": "46ee417ccfa444f551ae41f36d2049f8abe6e1d2e562a9e1e390510fb163e09f"
+  },
+  "reference_sha256": "03ba4f69e28afdea0ce8d71617dfe2679d6f8007a3564780d157e824cb42e4e2",
+  "semantic_corpus_sha256": "4bac31b8c02a2bb8445bbf9f14b1c9f26a1e26a494cc4e11eeb626907deaf475",
+  "gate_results": {
+    "cargo_check_workspace": "pass",
+    "cargo_test_workspace": "pass",
+    "cargo_failing_ids": [],
+    "script_tests": "pass",
+    "script_failing_ids": [],
+    "script_passed": 874,
+    "script_skipped": 2,
+    "script_subtests_passed": 190,
+    "rust_passed": 1405,
+    "rust_ignored": 170
+  },
+  "measurements": {
+    "min": {
+      "D": {
+        "launches": [
+          {
+            "launch": "min-D-1",
+            "readiness_s": 50.0,
+            "c1_tps": 101.91300345532768,
+            "c4_tps": 164.15158335516372,
+            "prefill_tps": 5048.006946848725,
+            "prefill_ttft_s": 1.6230400974745862,
+            "prompt_tokens": [
+              8192,
+              8192
+            ],
+            "agentic_decode_tps": 127.77442494160363,
+            "agentic_wall_s": 8.694710190990008,
+            "agentic_validity": 1.0,
+            "agentic_success": null,
+            "agentic_mode": "replay",
+            "agentic_turns": 4,
+            "agentic_reasoning_chars": 862,
+            "runtime_startup": [
+              "cuteafd::families::glm5_flash: GLM 5.3 Flash coordinator weights resident (one copy each) layers=45 gib=11.88919997215271 split_gib=0.0 fp8_source=true kda_fp8=Off fp8_prefill=[Mla, Ffn] kda_bf16_mib=8789.0 kda_fp8_mib=0.0 head=\"BF16\" head_mib=1210.0 elapsed_ms=15908",
+              "cuteafd::shared::memory_report: automatic KV pool from free memory after fixed costs tokens=2097152 target=2097152 free=[69523723607] per_token=[11804]",
+              "cuteafd::shared::spark_intake: Spark transfer plan: every rank on the first coordinator rail ranks=2 intake=\"gpu\" egress=Staggered coordinator_rails=mlx5_0@10.55.0.22 400G, mlx5_0@10.55.1.22 400G"
+            ],
+            "agentic_completion_tokens_by_turn": [
+              28,
+              505,
+              15,
+              6
+            ],
+            "agentic_decode_tps_by_turn": [
+              170.66688129467738,
+              84.72117871350625,
+              147.534582224022,
+              108.01426765918526
+            ]
+          },
+          {
+            "launch": "min-D-2",
+            "readiness_s": 41.0,
+            "c1_tps": 100.09708169680414,
+            "c4_tps": 158.7745914973158,
+            "prefill_tps": 5141.234893212915,
+            "prefill_ttft_s": 1.5933995854575187,
+            "prompt_tokens": [
+              8192,
+              8192
+            ],
+            "agentic_decode_tps": 127.48031590644244,
+            "agentic_wall_s": 8.338536557042971,
+            "agentic_validity": 1.0,
+            "agentic_success": null,
+            "agentic_mode": "replay",
+            "agentic_turns": 4,
+            "agentic_reasoning_chars": 973,
+            "runtime_startup": [
+              "cuteafd::families::glm5_flash: GLM 5.3 Flash coordinator weights resident (one copy each) layers=45 gib=11.88919997215271 split_gib=0.0 fp8_source=true kda_fp8=Off fp8_prefill=[Mla, Ffn] kda_bf16_mib=8789.0 kda_fp8_mib=0.0 head=\"BF16\" head_mib=1210.0 elapsed_ms=7866",
+              "cuteafd::shared::memory_report: automatic KV pool from free memory after fixed costs tokens=2097152 target=2097152 free=[69523723607] per_token=[11804]",
+              "cuteafd::shared::spark_intake: Spark transfer plan: every rank on the first coordinator rail ranks=2 intake=\"gpu\" egress=Staggered coordinator_rails=mlx5_0@10.55.0.22 400G, mlx5_0@10.55.1.22 400G"
+            ],
+            "agentic_completion_tokens_by_turn": [
+              28,
+              482,
+              15,
+              6
+            ],
+            "agentic_decode_tps_by_turn": [
+              155.58697975207505,
+              86.25315469827139,
+              150.41515773678412,
+              104.54547407610076
+            ]
+          },
+          {
+            "launch": "min-D-3",
+            "readiness_s": 41.0,
+            "c1_tps": 102.04563005909527,
+            "c4_tps": 159.36534981877875,
+            "prefill_tps": 5189.2881950047395,
+            "prefill_ttft_s": 1.5786394710303284,
+            "prompt_tokens": [
+              8192,
+              8192
+            ],
+            "agentic_decode_tps": 127.60952234082089,
+            "agentic_wall_s": 8.929039552109316,
+            "agentic_validity": 1.0,
+            "agentic_success": null,
+            "agentic_mode": "replay",
+            "agentic_turns": 4,
+            "agentic_reasoning_chars": 1010,
+            "runtime_startup": [
+              "cuteafd::families::glm5_flash: GLM 5.3 Flash coordinator weights resident (one copy each) layers=45 gib=11.88919997215271 split_gib=0.0 fp8_source=true kda_fp8=Off fp8_prefill=[Mla, Ffn] kda_bf16_mib=8789.0 kda_fp8_mib=0.0 head=\"BF16\" head_mib=1210.0 elapsed_ms=9500",
+              "cuteafd::shared::memory_report: automatic KV pool from free memory after fixed costs tokens=2097152 target=2097152 free=[69523723607] per_token=[11804]",
+              "cuteafd::shared::spark_intake: Spark transfer plan: every rank on the first coordinator rail ranks=2 intake=\"gpu\" egress=Staggered coordinator_rails=mlx5_0@10.55.0.22 400G, mlx5_0@10.55.1.22 400G"
+            ],
+            "agentic_completion_tokens_by_turn": [
+              28,
+              540,
+              15,
+              6
+            ],
+            "agentic_decode_tps_by_turn": [
+              162.5367836507088,
+              87.21498204719909,
+              150.8450370305435,
+              104.3740076510983
+            ]
+          }
+        ],
+        "summary": {
+          "readiness_s": {
+            "median": 41.0,
+            "min": 41.0,
+            "max": 50.0,
+            "samples": [
+              50.0,
+              41.0,
+              41.0
+            ]
+          },
+          "c1_tps": {
+            "median": 101.91300345532768,
+            "min": 100.09708169680414,
+            "max": 102.04563005909527,
+            "samples": [
+              101.91300345532768,
+              100.09708169680414,
+              102.04563005909527
+            ]
+          },
+          "c4_tps": {
+            "median": 159.36534981877875,
+            "min": 158.7745914973158,
+            "max": 164.15158335516372,
+            "samples": [
+              164.15158335516372,
+              158.7745914973158,
+              159.36534981877875
+            ]
+          },
+          "prefill_tps": {
+            "median": 5141.234893212915,
+            "min": 5048.006946848725,
+            "max": 5189.2881950047395,
+            "samples": [
+              5048.006946848725,
+              5141.234893212915,
+              5189.2881950047395
+            ]
+          },
+          "prefill_ttft_s": {
+            "median": 1.5933995854575187,
+            "min": 1.5786394710303284,
+            "max": 1.6230400974745862,
+            "samples": [
+              1.6230400974745862,
+              1.5933995854575187,
+              1.5786394710303284
+            ]
+          },
+          "agentic_decode_tps": {
+            "median": 127.60952234082089,
+            "min": 127.48031590644244,
+            "max": 127.77442494160363,
+            "samples": [
+              127.77442494160363,
+              127.48031590644244,
+              127.60952234082089
+            ]
+          },
+          "agentic_wall_s": {
+            "median": 8.694710190990008,
+            "min": 8.338536557042971,
+            "max": 8.929039552109316,
+            "samples": [
+              8.694710190990008,
+              8.338536557042971,
+              8.929039552109316
+            ]
+          }
+        },
+        "quality": {
+          "status": "pass",
+          "checks": [
+            {
+              "id": "fidelity",
+              "title": "Logit fidelity",
+              "status": "pass",
+              "summary": "KL 0.043 \u00b7 top-1 87.1% \u00b7 NLL 3.473 vs 3.454 \u00b7 512 tokens vs GLM 5.3 Flash reference",
+              "metrics": {
+                "kl": 0.042884028184212025,
+                "top1": 0.87109375,
+                "nll": 3.4732841650710142,
+                "ref_nll": 3.454331268359603,
+                "positions": 512,
+                "missing": 0,
+                "kl_max": 0.15,
+                "top1_min": 0.8,
+                "reference": "GLM 5.3 Flash"
+              },
+              "seconds": 2.269342839
+            },
+            {
+              "id": "cache_exact",
+              "title": "Prefix-cache restore",
+              "status": "pass",
+              "summary": "prompt end: 1546 restored, 2 rows byte-identical \u00b7 turn end: 1303 restored, 2 rows byte-identical \u00b7 cold recompute identical",
+              "metrics": {
+                "prompt_tokens": 1546,
+                "prompt_restored": 1546,
+                "prompt_rows_compared": 2,
+                "turn_tokens": 1303,
+                "turn_restored": 1303,
+                "turn_rows_compared": 2,
+                "turn_prompt_rows_compared": 24,
+                "cold_rows_identical": 1
+              },
+              "seconds": 2.630983497
+            },
+            {
+              "id": "spec_lossless",
+              "title": "Speculation lossless",
+              "status": "info",
+              "summary": "DFlash2 (bf582e4eacc1810f76656d1811693ff6c6737d2a): greedy output diverges at token 122 of 128 (top-two margin 0.263 nats) (73.8 vs 47.9 tok/s); before it 1 of 122 rows byte-identical, top-token log-prob differs by up to 0.494 nats (median 0.0011), first over 0.01 at token 1; drafts off twice: 128 of 128 tokens identical, 128 of 128 rows byte-identical, up to 0.000 nats \u00b7 not gated: verify rounding (plain decode repeats exactly, drafted rows already differed before the flip)",
+              "metrics": {
+                "tokens": 128,
+                "identical_prefix": 122,
+                "speculator": "DFlash2 (bf582e4eacc1810f76656d1811693ff6c6737d2a)",
+                "decode_tok_s_on": 73.81659335779973,
+                "decode_tok_s_off": 47.85964992299339,
+                "prefix_rows_compared": 122,
+                "prefix_rows_identical": 1,
+                "prefix_noise_max": 0.4941911995410919,
+                "prefix_noise_median": 0.0011330386623740196,
+                "prefix_noise_first_over_0_01": 1,
+                "repeat_identical_prefix": 128,
+                "repeat_rows_identical": 128,
+                "repeat_noise_max": 0.0,
+                "divergence_margin": 0.26302146911621094
+              },
+              "seconds": 7.594437258
+            },
+            {
+              "id": "template",
+              "title": "Template round trip",
+              "status": "info",
+              "summary": "tool call parsed \u00b7 no reasoning \u00b7 re-render differs at token 171 of 224",
+              "metrics": {
+                "reasoning_chars": 0,
+                "rendered_prefix": 171,
+                "turn_tokens": 224,
+                "cached_tokens": 0
+              },
+              "seconds": 0.950483007
+            },
+            {
+              "id": "c1_c4",
+              "title": "C1 vs C4 divergence",
+              "status": "info",
+              "summary": "0 of 4 identical to C1; first divergence at tokens 22; before it 1 of 22 rows byte-identical, top-token log-prob differs by up to 0.556 nats (median 0.0567), first over 0.01 at token 2",
+              "metrics": {
+                "prefix_rows_compared": 22,
+                "prefix_rows_identical": 1,
+                "prefix_noise_max": 0.556207537651062,
+                "prefix_noise_median": 0.05669760704040527,
+                "prefix_noise_first_over_0_01": 2,
+                "identical": 0,
+                "first_divergence": 22
+              },
+              "seconds": 3.993772254
+            }
+          ]
+        },
+        "quality_export": "benchmarks/glm5_flash/2026-10-04-fp8-recheck-d-1rtx-2spark/report.json"
+      },
+      "F": {
+        "launches": [
+          {
+            "launch": "min-F-1",
+            "readiness_s": 59.0,
+            "c1_tps": 111.2721591646248,
+            "c4_tps": 156.12959247508874,
+            "prefill_tps": 5105.089448545235,
+            "prefill_ttft_s": 1.6046745130443014,
+            "prompt_tokens": [
+              8192,
+              8192
+            ],
+            "agentic_decode_tps": 132.82228239581076,
+            "agentic_wall_s": 11.491580246016383,
+            "agentic_validity": 1.0,
+            "agentic_success": null,
+            "agentic_mode": "replay",
+            "agentic_turns": 4,
+            "agentic_reasoning_chars": 2241,
+            "runtime_startup": [
+              "cuteafd::families::glm5_flash: GLM 5.3 Flash coordinator weights resident (one copy each) layers=45 gib=7.7318055629730225 split_gib=0.0 fp8_source=true kda_fp8=Row128 fp8_prefill=[Mla, Ffn] kda_bf16_mib=0.0 kda_fp8_mib=4531.828125 head=\"FP8\" head_mib=623.90625 elapsed_ms=26692",
+              "cuteafd::shared::memory_report: automatic KV pool from free memory after fixed costs tokens=2097152 target=2097152 free=[74594637143] per_token=[11804]",
+              "cuteafd::shared::spark_intake: Spark transfer plan: every rank on the first coordinator rail ranks=2 intake=\"gpu\" egress=Staggered coordinator_rails=mlx5_0@10.55.0.22 400G, mlx5_0@10.55.1.22 400G"
+            ],
+            "agentic_completion_tokens_by_turn": [
+              28,
+              798,
+              15,
+              6
+            ],
+            "agentic_decode_tps_by_turn": [
+              184.5684304340719,
+              90.79221205528383,
+              160.25912886845177,
+              105.38543592316975
+            ]
+          },
+          {
+            "launch": "min-F-2",
+            "readiness_s": 39.0,
+            "c1_tps": 110.60256445442401,
+            "c4_tps": 172.42227206983046,
+            "prefill_tps": 5137.275442574324,
+            "prefill_ttft_s": 1.5946209550602362,
+            "prompt_tokens": [
+              8192,
+              8192
+            ],
+            "agentic_decode_tps": 132.37558727752875,
+            "agentic_wall_s": 8.796750723966397,
+            "agentic_validity": 1.0,
+            "agentic_success": null,
+            "agentic_mode": "replay",
+            "agentic_turns": 4,
+            "agentic_reasoning_chars": 1537,
+            "runtime_startup": [
+              "cuteafd::families::glm5_flash: GLM 5.3 Flash coordinator weights resident (one copy each) layers=45 gib=7.7318055629730225 split_gib=0.0 fp8_source=true kda_fp8=Row128 fp8_prefill=[Mla, Ffn] kda_bf16_mib=0.0 kda_fp8_mib=4531.828125 head=\"FP8\" head_mib=623.90625 elapsed_ms=7144",
+              "cuteafd::shared::memory_report: automatic KV pool from free memory after fixed costs tokens=2097152 target=2097152 free=[74594637143] per_token=[11804]",
+              "cuteafd::shared::spark_intake: Spark transfer plan: every rank on the first coordinator rail ranks=2 intake=\"gpu\" egress=Staggered coordinator_rails=mlx5_0@10.55.0.22 400G, mlx5_0@10.55.1.22 400G"
+            ],
+            "agentic_completion_tokens_by_turn": [
+              28,
+              558,
+              15,
+              6
+            ],
+            "agentic_decode_tps_by_turn": [
+              179.06164062366682,
+              91.503751327255,
+              159.16416241007155,
+              105.58701214498595
+            ]
+          },
+          {
+            "launch": "min-F-3",
+            "readiness_s": 43.0,
+            "c1_tps": 111.11140800685338,
+            "c4_tps": 176.1497102229585,
+            "prefill_tps": 5146.475195918103,
+            "prefill_ttft_s": 1.5917694460367784,
+            "prompt_tokens": [
+              8192,
+              8192
+            ],
+            "agentic_decode_tps": 132.61377569586588,
+            "agentic_wall_s": 11.47224330692552,
+            "agentic_validity": 1.0,
+            "agentic_success": null,
+            "agentic_mode": "replay",
+            "agentic_turns": 4,
+            "agentic_reasoning_chars": 2241,
+            "runtime_startup": [
+              "cuteafd::families::glm5_flash: GLM 5.3 Flash coordinator weights resident (one copy each) layers=45 gib=7.7318055629730225 split_gib=0.0 fp8_source=true kda_fp8=Row128 fp8_prefill=[Mla, Ffn] kda_bf16_mib=0.0 kda_fp8_mib=4531.828125 head=\"FP8\" head_mib=623.90625 elapsed_ms=10406",
+              "cuteafd::shared::memory_report: automatic KV pool from free memory after fixed costs tokens=2097152 target=2097152 free=[74594637143] per_token=[11804]",
+              "cuteafd::shared::spark_intake: Spark transfer plan: every rank on the first coordinator rail ranks=2 intake=\"gpu\" egress=Staggered coordinator_rails=mlx5_0@10.55.0.22 400G, mlx5_0@10.55.1.22 400G"
+            ],
+            "agentic_completion_tokens_by_turn": [
+              28,
+              798,
+              15,
+              6
+            ],
+            "agentic_decode_tps_by_turn": [
+              184.44256347560466,
+              90.87747625473912,
+              160.52520355254032,
+              104.70234783919146
+            ]
+          }
+        ],
+        "summary": {
+          "readiness_s": {
+            "median": 43.0,
+            "min": 39.0,
+            "max": 59.0,
+            "samples": [
+              59.0,
+              39.0,
+              43.0
+            ]
+          },
+          "c1_tps": {
+            "median": 111.11140800685338,
+            "min": 110.60256445442401,
+            "max": 111.2721591646248,
+            "samples": [
+              111.2721591646248,
+              110.60256445442401,
+              111.11140800685338
+            ]
+          },
+          "c4_tps": {
+            "median": 172.42227206983046,
+            "min": 156.12959247508874,
+            "max": 176.1497102229585,
+            "samples": [
+              156.12959247508874,
+              172.42227206983046,
+              176.1497102229585
+            ]
+          },
+          "prefill_tps": {
+            "median": 5137.275442574324,
+            "min": 5105.089448545235,
+            "max": 5146.475195918103,
+            "samples": [
+              5105.089448545235,
+              5137.275442574324,
+              5146.475195918103
+            ]
+          },
+          "prefill_ttft_s": {
+            "median": 1.5946209550602362,
+            "min": 1.5917694460367784,
+            "max": 1.6046745130443014,
+            "samples": [
+              1.6046745130443014,
+              1.5946209550602362,
+              1.5917694460367784
+            ]
+          },
+          "agentic_decode_tps": {
+            "median": 132.61377569586588,
+            "min": 132.37558727752875,
+            "max": 132.82228239581076,
+            "samples": [
+              132.82228239581076,
+              132.37558727752875,
+              132.61377569586588
+            ]
+          },
+          "agentic_wall_s": {
+            "median": 11.47224330692552,
+            "min": 8.796750723966397,
+            "max": 11.491580246016383,
+            "samples": [
+              11.491580246016383,
+              8.796750723966397,
+              11.47224330692552
+            ]
+          }
+        },
+        "quality": {
+          "status": "pass",
+          "checks": [
+            {
+              "id": "fidelity",
+              "title": "Logit fidelity",
+              "status": "pass",
+              "summary": "KL 0.042 \u00b7 top-1 86.5% \u00b7 NLL 3.470 vs 3.454 \u00b7 512 tokens vs GLM 5.3 Flash reference",
+              "metrics": {
+                "kl": 0.04231076312107575,
+                "top1": 0.865234375,
+                "nll": 3.4696562515534595,
+                "ref_nll": 3.454331268359603,
+                "positions": 512,
+                "missing": 0,
+                "kl_max": 0.15,
+                "top1_min": 0.8,
+                "reference": "GLM 5.3 Flash"
+              },
+              "seconds": 2.318816613
+            },
+            {
+              "id": "cache_exact",
+              "title": "Prefix-cache restore",
+              "status": "pass",
+              "summary": "prompt end: 1546 restored, 2 rows byte-identical \u00b7 turn end: 1303 restored, 2 rows byte-identical \u00b7 cold recompute identical",
+              "metrics": {
+                "prompt_tokens": 1546,
+                "prompt_restored": 1546,
+                "prompt_rows_compared": 2,
+                "turn_tokens": 1303,
+                "turn_restored": 1303,
+                "turn_rows_compared": 2,
+                "turn_prompt_rows_compared": 24,
+                "cold_rows_identical": 1
+              },
+              "seconds": 2.481195322
+            },
+            {
+              "id": "spec_lossless",
+              "title": "Speculation lossless",
+              "status": "pass",
+              "summary": "DFlash2 (bf582e4eacc1810f76656d1811693ff6c6737d2a): identical up to token 101 of 128, then a near-tie flips (top-two margin 0.454 nats) (78.4 vs 55.7 tok/s); before it 1 of 101 rows byte-identical, top-token log-prob differs by up to 0.411 nats (median 0.0014), first over 0.01 at token 1; drafts off twice: 128 of 128 tokens identical, 128 of 128 rows byte-identical, up to 0.000 nats",
+              "metrics": {
+                "tokens": 128,
+                "identical_prefix": 101,
+                "speculator": "DFlash2 (bf582e4eacc1810f76656d1811693ff6c6737d2a)",
+                "decode_tok_s_on": 78.39222702675356,
+                "decode_tok_s_off": 55.74360981768184,
+                "prefix_rows_compared": 101,
+                "prefix_rows_identical": 1,
+                "prefix_noise_max": 0.4110445380210877,
+                "prefix_noise_median": 0.0013857395388185978,
+                "prefix_noise_first_over_0_01": 1,
+                "repeat_identical_prefix": 128,
+                "repeat_rows_identical": 128,
+                "repeat_noise_max": 0.0,
+                "divergence_margin": 0.45364952087402344
+              },
+              "seconds": 6.753978249
+            },
+            {
+              "id": "template",
+              "title": "Template round trip",
+              "status": "info",
+              "summary": "tool call parsed \u00b7 no reasoning \u00b7 re-render differs at token 171 of 224",
+              "metrics": {
+                "reasoning_chars": 0,
+                "rendered_prefix": 171,
+                "turn_tokens": 224,
+                "cached_tokens": 0
+              },
+              "seconds": 0.926207598
+            },
+            {
+              "id": "c1_c4",
+              "title": "C1 vs C4 divergence",
+              "status": "info",
+              "summary": "0 of 4 identical to C1; first divergence at tokens 23; before it 1 of 23 rows byte-identical, top-token log-prob differs by up to 0.271 nats (median 0.0162), first over 0.01 at token 2",
+              "metrics": {
+                "prefix_rows_compared": 23,
+                "prefix_rows_identical": 1,
+                "prefix_noise_max": 0.2710154056549072,
+                "prefix_noise_median": 0.016216576099395752,
+                "prefix_noise_first_over_0_01": 2,
+                "identical": 0,
+                "first_divergence": 23
+              },
+              "seconds": 3.733381874
+            }
+          ]
+        },
+        "quality_export": "benchmarks/glm5_flash/2026-10-04-fp8-recheck-f-1rtx-2spark/report.json"
+      }
+    },
+    "max": {
+      "D": {
+        "launches": [
+          {
+            "launch": "max-D-1",
+            "readiness_s": 53.0,
+            "c1_tps": 157.5956720387642,
+            "c4_tps": 283.1552109226433,
+            "prefill_tps": 6767.387226640986,
+            "prefill_ttft_s": 1.2105153584852815,
+            "prompt_tokens": [
+              8192,
+              8192
+            ],
+            "agentic_decode_tps": 202.01607242434466,
+            "agentic_wall_s": 4.777890111203305,
+            "agentic_validity": 1.0,
+            "agentic_success": null,
+            "agentic_mode": "replay",
+            "agentic_turns": 4,
+            "agentic_reasoning_chars": 770,
+            "runtime_startup": [
+              "cuteafd::families::glm5_flash: GLM 5.3 Flash coordinator weights resident (one copy each) layers=45 gib=6.209805250167847 split_gib=6.1174750328063965 fp8_source=true kda_fp8=Off fp8_prefill=[Mla, Ffn] kda_bf16_mib=4428.5 kda_fp8_mib=0.0 head=\"BF16\" head_mib=1210.0 elapsed_ms=11514",
+              "cuteafd::shared::memory_report: automatic KV pool from free memory after fixed costs tokens=2097152 target=2097152 free=[75603367255] per_token=[11804]",
+              "cuteafd::shared::spark_intake: Spark transfer plan: every rank on the first coordinator rail ranks=4 intake=\"gpu\" egress=Staggered coordinator_rails=mlx5_0@10.55.0.22 400G, mlx5_0@10.55.1.22 400G"
+            ],
+            "agentic_completion_tokens_by_turn": [
+              28,
+              447,
+              15,
+              6
+            ],
+            "agentic_decode_tps_by_turn": [
+              254.0236235839054,
+              143.0664096505132,
+              241.51158348560617,
+              162.52056136308315
+            ]
+          }
+        ],
+        "summary": {
+          "readiness_s": {
+            "median": 53.0,
+            "min": 53.0,
+            "max": 53.0,
+            "samples": [
+              53.0
+            ]
+          },
+          "c1_tps": {
+            "median": 157.5956720387642,
+            "min": 157.5956720387642,
+            "max": 157.5956720387642,
+            "samples": [
+              157.5956720387642
+            ]
+          },
+          "c4_tps": {
+            "median": 283.1552109226433,
+            "min": 283.1552109226433,
+            "max": 283.1552109226433,
+            "samples": [
+              283.1552109226433
+            ]
+          },
+          "prefill_tps": {
+            "median": 6767.387226640986,
+            "min": 6767.387226640986,
+            "max": 6767.387226640986,
+            "samples": [
+              6767.387226640986
+            ]
+          },
+          "prefill_ttft_s": {
+            "median": 1.2105153584852815,
+            "min": 1.2105153584852815,
+            "max": 1.2105153584852815,
+            "samples": [
+              1.2105153584852815
+            ]
+          },
+          "agentic_decode_tps": {
+            "median": 202.01607242434466,
+            "min": 202.01607242434466,
+            "max": 202.01607242434466,
+            "samples": [
+              202.01607242434466
+            ]
+          },
+          "agentic_wall_s": {
+            "median": 4.777890111203305,
+            "min": 4.777890111203305,
+            "max": 4.777890111203305,
+            "samples": [
+              4.777890111203305
+            ]
+          }
+        },
+        "quality": {
+          "status": "pass",
+          "checks": [
+            {
+              "id": "fidelity",
+              "title": "Logit fidelity",
+              "status": "pass",
+              "summary": "KL 0.045 \u00b7 top-1 88.5% \u00b7 NLL 3.474 vs 3.454 \u00b7 512 tokens vs GLM 5.3 Flash reference",
+              "metrics": {
+                "kl": 0.045075576825378945,
+                "top1": 0.884765625,
+                "nll": 3.4740988139893334,
+                "ref_nll": 3.454331268359603,
+                "positions": 512,
+                "missing": 0,
+                "kl_max": 0.15,
+                "top1_min": 0.8,
+                "reference": "GLM 5.3 Flash"
+              },
+              "seconds": 1.831161617
+            },
+            {
+              "id": "cache_exact",
+              "title": "Prefix-cache restore",
+              "status": "pass",
+              "summary": "prompt end: 1546 restored, 2 rows byte-identical \u00b7 turn end: 1303 restored, 2 rows byte-identical \u00b7 cold recompute identical",
+              "metrics": {
+                "prompt_tokens": 1546,
+                "prompt_restored": 1546,
+                "prompt_rows_compared": 2,
+                "turn_tokens": 1303,
+                "turn_restored": 1303,
+                "turn_rows_compared": 2,
+                "turn_prompt_rows_compared": 24,
+                "cold_rows_identical": 1
+              },
+              "seconds": 1.613205204
+            },
+            {
+              "id": "spec_lossless",
+              "title": "Speculation lossless",
+              "status": "info",
+              "summary": "DFlash2 (bf582e4eacc1810f76656d1811693ff6c6737d2a): greedy output diverges at token 3 of 128 (top-two margin 1.103 nats) (85.3 vs 72.1 tok/s); before it 1 of 3 rows byte-identical, top-token log-prob differs by up to 0.040 nats (median 0.0000), first over 0.01 at token 1; drafts off twice: 128 of 128 tokens identical, 128 of 128 rows byte-identical, up to 0.000 nats \u00b7 not gated: verify rounding (plain decode repeats exactly, drafted rows already differed before the flip)",
+              "metrics": {
+                "tokens": 128,
+                "identical_prefix": 3,
+                "speculator": "DFlash2 (bf582e4eacc1810f76656d1811693ff6c6737d2a)",
+                "decode_tok_s_on": 85.25211150130643,
+                "decode_tok_s_off": 72.12181671508036,
+                "prefix_rows_compared": 3,
+                "prefix_rows_identical": 1,
+                "prefix_noise_max": 0.03960990905761719,
+                "prefix_noise_median": 1.2221498764120042e-06,
+                "prefix_noise_first_over_0_01": 1,
+                "repeat_identical_prefix": 128,
+                "repeat_rows_identical": 128,
+                "repeat_noise_max": 0.0,
+                "divergence_margin": 1.1031494140625
+              },
+              "seconds": 5.362745901
+            },
+            {
+              "id": "template",
+              "title": "Template round trip",
+              "status": "info",
+              "summary": "tool call parsed \u00b7 no reasoning \u00b7 re-render differs at token 171 of 224",
+              "metrics": {
+                "reasoning_chars": 0,
+                "rendered_prefix": 171,
+                "turn_tokens": 224,
+                "cached_tokens": 0
+              },
+              "seconds": 0.705263947
+            },
+            {
+              "id": "c1_c4",
+              "title": "C1 vs C4 divergence",
+              "status": "info",
+              "summary": "0 of 4 identical to C1; first divergence at tokens 10; before it 1 of 10 rows byte-identical, top-token log-prob differs by up to 0.135 nats (median 0.0154), first over 0.01 at token 2",
+              "metrics": {
+                "prefix_rows_compared": 10,
+                "prefix_rows_identical": 1,
+                "prefix_noise_max": 0.13506577908992767,
+                "prefix_noise_median": 0.0153704434633255,
+                "prefix_noise_first_over_0_01": 2,
+                "identical": 0,
+                "first_divergence": 10
+              },
+              "seconds": 2.786736021
+            }
+          ]
+        },
+        "quality_export": "benchmarks/glm5_flash/2026-10-04-fp8-recheck-d-2rtx-4spark/report.json"
+      },
+      "F": {
+        "launches": [
+          {
+            "launch": "max-F-1",
+            "readiness_s": 50.0,
+            "c1_tps": 172.12796783802318,
+            "c4_tps": 255.6988768283426,
+            "prefill_tps": 5113.106656856269,
+            "prefill_ttft_s": 1.6290028665098362,
+            "prompt_tokens": [
+              8192,
+              8192
+            ],
+            "agentic_decode_tps": 209.35900749794072,
+            "agentic_wall_s": 7.336332732229494,
+            "agentic_validity": 1.0,
+            "agentic_success": null,
+            "agentic_mode": "replay",
+            "agentic_turns": 4,
+            "agentic_reasoning_chars": 1665,
+            "runtime_startup": [
+              "cuteafd::families::glm5_flash: GLM 5.3 Flash coordinator weights resident (one copy each) layers=45 gib=4.115025281906128 split_gib=4.022695064544678 fp8_source=true kda_fp8=Row128 fp8_prefill=[Mla, Ffn] kda_bf16_mib=0.0 kda_fp8_mib=2283.4453125 head=\"FP8\" head_mib=623.90625 elapsed_ms=9379",
+              "cuteafd::shared::memory_report: automatic KV pool from free memory after fixed costs tokens=2097152 target=2097152 free=[78499534167] per_token=[11804]",
+              "cuteafd::shared::spark_intake: Spark transfer plan: every rank on the first coordinator rail ranks=4 intake=\"gpu\" egress=Staggered coordinator_rails=mlx5_0@10.55.0.22 400G, mlx5_0@10.55.1.22 400G"
+            ],
+            "agentic_completion_tokens_by_turn": [
+              28,
+              807,
+              15,
+              6
+            ],
+            "agentic_decode_tps_by_turn": [
+              283.78971387448064,
+              141.2490544921587,
+              247.3859829528695,
+              171.33203204301194
+            ]
+          }
+        ],
+        "summary": {
+          "readiness_s": {
+            "median": 50.0,
+            "min": 50.0,
+            "max": 50.0,
+            "samples": [
+              50.0
+            ]
+          },
+          "c1_tps": {
+            "median": 172.12796783802318,
+            "min": 172.12796783802318,
+            "max": 172.12796783802318,
+            "samples": [
+              172.12796783802318
+            ]
+          },
+          "c4_tps": {
+            "median": 255.6988768283426,
+            "min": 255.6988768283426,
+            "max": 255.6988768283426,
+            "samples": [
+              255.6988768283426
+            ]
+          },
+          "prefill_tps": {
+            "median": 5113.106656856269,
+            "min": 5113.106656856269,
+            "max": 5113.106656856269,
+            "samples": [
+              5113.106656856269
+            ]
+          },
+          "prefill_ttft_s": {
+            "median": 1.6290028665098362,
+            "min": 1.6290028665098362,
+            "max": 1.6290028665098362,
+            "samples": [
+              1.6290028665098362
+            ]
+          },
+          "agentic_decode_tps": {
+            "median": 209.35900749794072,
+            "min": 209.35900749794072,
+            "max": 209.35900749794072,
+            "samples": [
+              209.35900749794072
+            ]
+          },
+          "agentic_wall_s": {
+            "median": 7.336332732229494,
+            "min": 7.336332732229494,
+            "max": 7.336332732229494,
+            "samples": [
+              7.336332732229494
+            ]
+          }
+        },
+        "quality": {
+          "status": "pass",
+          "checks": [
+            {
+              "id": "fidelity",
+              "title": "Logit fidelity",
+              "status": "pass",
+              "summary": "KL 0.048 \u00b7 top-1 86.9% \u00b7 NLL 3.471 vs 3.454 \u00b7 512 tokens vs GLM 5.3 Flash reference",
+              "metrics": {
+                "kl": 0.04780237269863861,
+                "top1": 0.869140625,
+                "nll": 3.4708225847907617,
+                "ref_nll": 3.454331268359603,
+                "positions": 512,
+                "missing": 0,
+                "kl_max": 0.15,
+                "top1_min": 0.8,
+                "reference": "GLM 5.3 Flash"
+              },
+              "seconds": 1.823095629
+            },
+            {
+              "id": "cache_exact",
+              "title": "Prefix-cache restore",
+              "status": "pass",
+              "summary": "prompt end: 1546 restored, 2 rows byte-identical \u00b7 turn end: 1303 restored, 2 rows byte-identical \u00b7 cold recompute identical",
+              "metrics": {
+                "prompt_tokens": 1546,
+                "prompt_restored": 1546,
+                "prompt_rows_compared": 2,
+                "turn_tokens": 1303,
+                "turn_restored": 1303,
+                "turn_rows_compared": 2,
+                "turn_prompt_rows_compared": 24,
+                "cold_rows_identical": 1
+              },
+              "seconds": 1.5500079329999998
+            },
+            {
+              "id": "spec_lossless",
+              "title": "Speculation lossless",
+              "status": "info",
+              "summary": "DFlash2 (bf582e4eacc1810f76656d1811693ff6c6737d2a): greedy output diverges at token 109 of 128 (top-two margin 0.657 nats) (106 vs 78.6 tok/s); before it 1 of 109 rows byte-identical, top-token log-prob differs by up to 0.420 nats (median 0.0010), first over 0.01 at token 3; drafts off twice: 128 of 128 tokens identical, 128 of 128 rows byte-identical, up to 0.000 nats \u00b7 not gated: verify rounding (plain decode repeats exactly, drafted rows already differed before the flip)",
+              "metrics": {
+                "tokens": 128,
+                "identical_prefix": 109,
+                "speculator": "DFlash2 (bf582e4eacc1810f76656d1811693ff6c6737d2a)",
+                "decode_tok_s_on": 105.69683028105992,
+                "decode_tok_s_off": 78.6448566776782,
+                "prefix_rows_compared": 109,
+                "prefix_rows_identical": 1,
+                "prefix_noise_max": 0.42007994651794434,
+                "prefix_noise_median": 0.0010060891509056091,
+                "prefix_noise_first_over_0_01": 3,
+                "repeat_identical_prefix": 128,
+                "repeat_rows_identical": 128,
+                "repeat_noise_max": 0.0,
+                "divergence_margin": 0.6570835709571838
+              },
+              "seconds": 4.771876517
+            },
+            {
+              "id": "template",
+              "title": "Template round trip",
+              "status": "info",
+              "summary": "tool call parsed \u00b7 no reasoning \u00b7 re-render differs at token 171 of 224",
+              "metrics": {
+                "reasoning_chars": 0,
+                "rendered_prefix": 171,
+                "turn_tokens": 224,
+                "cached_tokens": 0
+              },
+              "seconds": 0.685822991
+            },
+            {
+              "id": "c1_c4",
+              "title": "C1 vs C4 divergence",
+              "status": "info",
+              "summary": "0 of 4 identical to C1; first divergence at tokens 11; before it 1 of 11 rows byte-identical, top-token log-prob differs by up to 0.597 nats (median 0.0506), first over 0.01 at token 2",
+              "metrics": {
+                "prefix_rows_compared": 11,
+                "prefix_rows_identical": 1,
+                "prefix_noise_max": 0.5970345735549927,
+                "prefix_noise_median": 0.050562918186187744,
+                "prefix_noise_first_over_0_01": 2,
+                "identical": 0,
+                "first_divergence": 11
+              },
+              "seconds": 2.619650151
+            }
+          ]
+        },
+        "quality_export": "benchmarks/glm5_flash/2026-10-04-fp8-recheck-f-2rtx-4spark/report.json"
+      }
+    }
+  },
+  "comparison": {
+    "min": {
+      "top1_drop_percentage_points": 0.5859375,
+      "f_kl_minus_d": -0.0005732650631362773,
+      "f_nll_minus_d": -0.0036279135175547594,
+      "quality_relative_bar_pass": true,
+      "median_change_percent": {
+        "readiness_s": 4.878048780487809,
+        "c1_tps": 9.025741799041075,
+        "c4_tps": 8.193074759286944,
+        "prefill_tps": -0.07701361094818449,
+        "prefill_ttft_s": 0.07665180874054656,
+        "agentic_decode_tps": 3.921535997666048,
+        "agentic_wall_s": 31.945091382272437
+      },
+      "speed_bar_pass": true,
+      "speculation_lossless_current_verdict": {
+        "D": "info",
+        "F": "pass"
+      }
+    },
+    "max": {
+      "top1_drop_percentage_points": 1.5625,
+      "f_kl_minus_d": 0.002726795873259663,
+      "f_nll_minus_d": -0.003276229198571734,
+      "quality_relative_bar_pass": false,
+      "median_change_percent": {
+        "readiness_s": -5.660377358490565,
+        "c1_tps": 9.221253103755567,
+        "c4_tps": -9.696566771572368,
+        "prefill_tps": -24.444893049305005,
+        "prefill_ttft_s": 34.57102011065836,
+        "agentic_decode_tps": 3.634827162747656,
+        "agentic_wall_s": 53.54754005386382
+      },
+      "speed_bar_pass": false,
+      "speculation_lossless_current_verdict": {
+        "D": "info",
+        "F": "info"
+      }
+    }
+  },
+  "recommendation": {
+    "arm": "D",
+    "decision_owner": "Claude",
+    "defaults_changed": false,
+    "basis": "Use the three interleaved minimum-layout launches for the speed decision; maximum has one launch per arm and is descriptive. Require the relative quality bar on both layouts.",
+    "reason": "Minimum F passes the relative quality bar and improves median C4 by 8.2%. Maximum F loses 1.56 percentage points of top-1, increases KL, and is 9.7% slower at C4; recommend D globally. No defaults changed."
+  },
+  "limitations": [
+    "512 teacher-forced positions; KL is the existing top-k plus tail approximation, not dense full-vocabulary KL.",
+    "Current spec_lossless pass/info is the current near-tie/verify-rounding rule, not proof of byte-identical speculative decoding.",
+    "Agentic timing replays one common four-turn reasoning-enabled history, not independent end-to-end task success per arm.",
+    "Agentic primary metric is the script median per-turn emitted decode tok/s, then the median across launches. Session wall time and output lengths remain variable.",
+    "C4 code emits different continuations, uses the same fixed prompts and cap, and is timed after one warm batch. Objective code content checks were not used.",
+    "Maximum-layout speed has one sample per arm; readiness includes launch and worker startup.",
+    "No shared serving/native hot path changes, so V4.1 parity was not run."
+  ],
+  "cleanup": {
+    "own_coordinator_and_spark_workers_stopped": true,
+    "temporary_model_copies_removed": [
+      "ostrich",
+      "dodo",
+      "emu",
+      "kiwi"
+    ],
+    "preexisting_model_copies_preserved": [
+      "rhea",
+      "moa"
+    ]
+  }
+}
