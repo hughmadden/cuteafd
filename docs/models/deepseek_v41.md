@@ -37,7 +37,10 @@ change is checked against its parity numbers before merging.
   retains one E4M3 weight plus FP32 scales per row and 128-wide K block,
   shared by target and dSpark; dual RTX partitions this weight by vocabulary
   rows. BF16 is released after packing drains. `off` keeps BF16; `draft`
-  retains both formats and remains experimental.
+  retains both formats and remains experimental. Single-copy `all` matches
+  the accepted quality result but missed the required C1 speedup on dual RTX
+  and short-response parity on both layouts. It remains opt-in and BF16
+  stays the default.
 - Optional vision tower (MoonViT-style) when the checkpoint carries
   `vision_config`.
 
