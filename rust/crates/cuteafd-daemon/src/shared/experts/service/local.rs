@@ -19,7 +19,7 @@ impl Drop for Admission {
     }
 }
 
-pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()> {
+pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result<()> {
     ensure!(
         config.rank < config.world && matches!(config.world, 2 | 3 | 4 | 6),
         "native rank must be below the launched Spark world"
@@ -32,6 +32,8 @@ pub(super) fn run(config: NativeExpertServiceConfig, listen: &str) -> Result<()>
     // library loads, so its helpers and every wire size agree with it.
     let catalog = cuteafd_loader::read_expert_catalog(&config.snapshot)?;
     let geometry = catalog.routed_experts().geometry()?;
+    config.native_spark_tp2 = config.world == 2 && geometry.family() == Some("dsv4f")
+        && catalog.exl3().is_none() && catalog.nvfp4().is_none() && catalog.fp8().is_none();
     cuteafd_core::set_expert_geometry(geometry).map_err(|fixed| {
         anyhow::anyhow!("expert geometry is already {fixed:?}; the checkpoint needs {geometry:?}")
     })?;

@@ -42,6 +42,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         device_budget: args.device_budget_bytes,
         max_frame_bytes: args.max_frame_bytes,
         topology,
+        native_spark_tp2: false,
     };
     tokio::task::spawn_blocking(move || local::run(config, &args.listen))
         .await
@@ -65,6 +66,9 @@ pub(crate) struct NativeExpertServiceConfig {
     /// Explicit replicated `TP×EP` topology; `None` keeps the legacy world 2/4
     /// behavior (EXL3 compact may still select a TP2 RTX pair).
     pub topology: Option<SparkTopology>,
+    /// Native Flash's TP2 kernel uses the Spark shard role with legacy wire
+    /// requests. Set only after catalog validation, never from a CLI override.
+    native_spark_tp2: bool,
 }
 
 fn load_weights<'a>(
@@ -449,6 +453,7 @@ mod tests {
             device_budget: 1 << 40,
             max_frame_bytes: 64 << 20,
             topology,
+            native_spark_tp2: false,
         }
     }
 
@@ -516,6 +521,19 @@ mod tests {
             config(3, 2, Some(tp3ep1)).selection(2).unwrap(),
             ExpertLayer::BackboneReplicatedTp { layer: 2, rank: 2, world: 3 }
         );
+    }
+
+    #[test]
+    fn flash_native_tp2_selects_spark_role_without_changing_wire_protocol() {
+        for rank in 0..2 {
+            let mut flash = config(2, rank, None);
+            flash.native_spark_tp2 = true;
+            let layer = flash.selection(7).unwrap();
+            assert_eq!(layer, ExpertLayer::BackboneReplicatedTp { layer: 7, rank, world: 2 });
+            assert_eq!(layer.role(), crate::shared::spark_topology::SPARK_TP2_ROLE);
+            assert!(flash.topology.is_none());
+            assert_eq!(flash.native_group().unwrap(), None);
+        }
     }
 
     /// A compressed shard must never be routable to the native expert family:
@@ -696,10 +714,9 @@ mod tests {
 
 /// Reject an explicit topology before any weight allocation: it is defined only
 /// for the official native checkpoint, its rank count must match `--world`, and
-/// every rank must be inside the topology. The legacy world 2/4 rules are kept
-/// exactly (two ranks still require EXL3). The implicit world additionally
-/// admits three ranks; both the two- and three-rank implicit groups are
-/// EXL3-only, so a native three-rank launch must carry its explicit topology.
+/// every rank must be inside the topology. Legacy V4.1 native TP4/EXL3
+/// selection is preserved. Native V4 Flash TP2 selects its Spark shard while
+/// keeping the generic coordinator's legacy request protocol.
 fn validate_topology(config: &NativeExpertServiceConfig, catalog: &OfficialV41Catalog) -> Result<()> {
     if let Some(topology) = config.topology {
         crate::shared::spark_topology::require_native(Some(topology), catalog)?;
@@ -719,14 +736,13 @@ fn validate_topology(config: &NativeExpertServiceConfig, catalog: &OfficialV41Ca
         "implicit Spark world must be 2, 3, 4 or 6 with rank below world; \
          an explicit TP x EP topology must pass --spark-tp/--spark-ep"
     );
-    // The three-rank compact group is the single-RTX EXL3 profile only: a
-    // native three-rank layout has to carry its explicit topology, which keeps
-    // it on the native shard family instead of an EXL3 substitution (and vice
-    // versa).
+    // Native FP4 Flash has a distinct TP2 shard. Other native FP4 layouts
+    // continue to require the explicit ownership-aware topology outside TP4.
     ensure!(
-        config.world == 4 || catalog.exl3().is_some() || (matches!(config.world, 2 | 6) && catalog.fp8().is_some()),
-        "a two, three or six rank implicit Spark group requires EXL3 experts; \
-         a native group must pass --spark-tp/--spark-ep"
+        config.world == 4 || catalog.exl3().is_some() || config.native_spark_tp2
+            || (matches!(config.world, 2 | 6) && catalog.fp8().is_some()),
+        "this implicit Spark group requires EXL3/FP8 experts or native V4 Flash TP2; \
+         other native groups must pass --spark-tp/--spark-ep"
     );
     Ok(())
 }
@@ -755,6 +771,7 @@ impl NativeExpertServiceConfig {
     fn selection(&self, layer: usize) -> Result<ExpertLayer> {
         let Some(topology) = self.topology else {
             return Ok(match self.world {
+                2 if self.native_spark_tp2 => ExpertLayer::BackboneReplicatedTp { layer, rank: self.rank, world: 2 },
                 2 => ExpertLayer::BackboneTp2 { layer, rank: self.rank },
                 // Admission above admits world 3 only for an EXL3 checkpoint, so
                 // this can never resolve to the native FP8 shard family.

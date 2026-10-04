@@ -126,15 +126,6 @@ def _family_launch_lines(tmp_path: Path, family_config: dict, model: str, keys: 
     return _family_launch_result(tmp_path, family_config, model, keys).stderr
 
 
-@pytest.mark.parametrize("quant_method,explicit", [("mxfp4", True), ("exl3", False)])
-def test_v4_two_spark_workers_select_native_shard_only(tmp_path, quant_method, explicit):
-    config = {"model_type": "deepseek_v4", "quantization_config": {"quant_method": quant_method}}
-    lines = _family_launch_lines(tmp_path, config, "test/v4", "SPARK_COUNT=2\nSPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\n")
-    workers = [line for line in lines.splitlines() if "cuteafd expertd-native" in line]
-    assert len(workers) == 2
-    assert all(("--spark-tp 2 --spark-ep 1" in line) == explicit for line in workers)
-
-
 @pytest.mark.parametrize("mode,expected", [(None, "row128"), ("auto", "row128"), ("off", "off")])
 def test_glmf_kda_defaults_to_single_copy_fp8(tmp_path, mode, expected):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,

@@ -445,13 +445,6 @@ if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
   done
 fi
 peers=()
-# Native V4 Flash's two-rank shard is the Spark TP2 role. The legacy
-# implicit TP2 role is reserved for EXL3/RTX shards and cannot load it.
-worker_topology=""
-if [[ "$family" == deepseek_v4 && "$ranks" == 2 ]]; then
-  quant_method="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("quantization_config", {}).get("quant_method", ""))' "$root/snapshots/$revision/config.json")"
-  [[ "$quant_method" == exl3 ]] || worker_topology="--spark-tp 2 --spark-ep 1"
-fi
 # --restart removes this launcher's containers (stop.sh's release parser rejects
 # the keys above, e.g. SPECULATOR).
 # One model is served at a time: every expert worker on these hosts goes, whatever
@@ -481,7 +474,7 @@ for ((rank = 0; rank < ranks; rank++)); do
     --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill \
     -v \$(readlink -f \$HOME/.cache/huggingface/hub):/root/.cache/huggingface/hub:ro '$spark_image' \
     cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
-    --rank $rank --world $ranks --capacity 4096 --device-budget-bytes $budget $layer_args $worker_topology \
+    --rank $rank --world $ranks --capacity 4096 --device-budget-bytes $budget $layer_args \
     --listen 0.0.0.0:$port >/dev/null" &
 done
 wait
