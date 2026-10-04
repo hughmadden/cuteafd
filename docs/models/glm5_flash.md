@@ -62,12 +62,21 @@ one warm launch per arm, `CONCURRENCY=4`, code tok/s (C4 aggregate), golden
 | Arm | C1 | C4 | 8K prefill | KL · top-1 · NLL |
 | --- | ---: | ---: | ---: | --- |
 | checkpoint (BF16 KDA, head, drafter) | 72.3 | 113.8 | 2,319 | 0.046 · 89.1% · 3.481 |
-| FP8 drafter | 77.1 | 118.3 | 2,666 | 0.046 · 89.1% · 3.481 |
+| **FP8 drafter (default)** | 77.1 | 118.3 | 2,666 | 0.046 · 89.1% · 3.481 |
 | FP8 KDA row128 + drafter | 69.9 | 113.5 | 4,764 | 0.043 · 86.9% · 3.474 |
 | FP8 head + drafter | 70.4 | 121.6 | 2,972 | 0.047 · 87.9% · 3.476 |
-| **FP8 KDA row128 + head + drafter (default)** | 77.6 | 131.8 | 2,191 | 0.044 · 85.7% · 3.470 |
+| FP8 KDA row128 + head + drafter | 77.6 | 131.8 | 2,191 | 0.044 · 85.7% · 3.470 |
 
-GLM 5.3 Flash EXL3 K3.25, 1 RTX + 2 Sparks. KL and NLL improve; top-1 drops 3.4 points (near-tie flips). KDA 13.14 GiB dual → 4.43 GiB, head 1.79 → 0.61 GiB. `GLM5_FLASH_KDA_FP8=off`, `GLM5_FLASH_FP8_HEAD=off`, `SPECULATOR_FP8=off` keep BF16.
+GLM 5.3 Flash EXL3 K3.25, 1 RTX + 2 Sparks. The default keeps the checkpoint's
+BF16 KDA projections and LM head (one copy each) and runs the DFlash2 drafter
+FP8. FP8 KDA + head is faster at C4 (131.8 vs 118.3) and saves memory (KDA
+4.43 vs 8.79 GiB single copy, head 0.61 vs 1.79 GiB) but costs 3.4 points top-1
+and doubles verify-vs-decode rounding (glmf-golden `--replay-check 6`, local
+EXL3 experts: kept-row KL vs serial steps 0.0121 vs 0.0056 nat, max recurrent
+state delta 0.37 vs 0.12; commit and rejected-suffix causality exact in both),
+which flipped greedy output under speculation by 1.03 nats in the release
+smoke. Opt in with `GLM5_FLASH_KDA_FP8=row128` and `GLM5_FLASH_FP8_HEAD=on`;
+`SPECULATOR_FP8=off` keeps the drafter BF16.
 
 ## Known limits
 

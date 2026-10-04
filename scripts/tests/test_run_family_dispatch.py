@@ -126,8 +126,8 @@ def _family_launch_lines(tmp_path: Path, family_config: dict, model: str, keys: 
     return _family_launch_result(tmp_path, family_config, model, keys).stderr
 
 
-@pytest.mark.parametrize("mode,expected", [(None, "row128"), ("auto", "row128"), ("off", "off")])
-def test_glmf_kda_defaults_to_single_copy_fp8(tmp_path, mode, expected):
+@pytest.mark.parametrize("mode,expected", [(None, "off"), ("auto", "off"), ("off", "off"), ("row128", "row128")])
+def test_glmf_kda_defaults_to_checkpoint_bf16(tmp_path, mode, expected):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
@@ -139,13 +139,15 @@ def test_glmf_kda_defaults_to_single_copy_fp8(tmp_path, mode, expected):
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     assert f"--kda-fp8 {expected}" in launch
     assert launch.count("--kda-fp8") == 1
+    # The LM head stays BF16 unless GLM5_FLASH_FP8_HEAD=on.
+    assert "--fp8-head false" in launch
 
 
 @pytest.mark.parametrize("keys,expected", [
     ("GLM5_FLASH_KDA_FP8=row128\n", ["--kda-fp8 row128"]),
     ("GLMF_KDA_FP8=channel\n", ["--kda-fp8 channel"]),
-    ("GLM5_FLASH_FP8_HEAD=on\n", ["--fp8-head"]),
-    ("GLMF_FP8_HEAD=on\n", ["--fp8-head"]),
+    ("GLM5_FLASH_FP8_HEAD=on\n", ["--fp8-head true"]),
+    ("GLMF_FP8_HEAD=on\n", ["--fp8-head true"]),
     ("GLM5_FLASH_KDA_FP8=row128\nGLM5_FLASH_FP8_PREFILL=all\n", ["--fp8-prefill all"]),
     ("GLMF_KDA_FP8=row128\nGLMF_FP8_PREFILL=mla,kda-in\n", ["--fp8-prefill mla,kda-in"]),
     ("GLM5_FLASH_KDA_FP8=channel\nGLM5_FLASH_FP8_PREFILL=kda-o,ffn\n", ["--fp8-prefill kda-o,ffn"]),

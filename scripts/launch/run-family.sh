@@ -228,10 +228,11 @@ fi
 # GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
 # from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" requires native
 # FP8 block tensors in the primary checkpoint, else BF16 ones are quantized to
-# 128x128 blocks at load). GLM5_FLASH_KDA_FP8 (unset/auto = row128, channel, off)
-# replaces the KDA in/out projections with per-row FP8 at load (their only
-# resident copy); off keeps the checkpoint BF16. GLM5_FLASH_FP8_HEAD (default on)
-# keeps only a per-row FP8 LM head (target and drafter); off keeps BF16.
+# 128x128 blocks at load). GLM5_FLASH_KDA_FP8 (unset/auto/off = the checkpoint's
+# BF16, one copy; row128 or channel) opts into per-row FP8 KDA in/out projections
+# (their only resident copy: faster, but -3.4 points top-1 and twice the verify
+# rounding). GLM5_FLASH_FP8_HEAD (default off) opts into a per-row FP8 LM head
+# (target and drafter); the DFlash2 drafter stays FP8 by default.
 # Its MLA pools hold POOL_TOKENS tokens (a key every
 # family with a paged KV pool reads). GLM5_FLASH_FP8_PREFILL lists the prefill
 # projections that run W8A8 (E4M3 activations per 128-K block): unset = the
@@ -246,16 +247,16 @@ if [[ $family == glm5_flash ]]; then
   fi
   kda_fp8="$(key GLM5_FLASH_KDA_FP8 GLMF_KDA_FP8 auto)"
   case "$kda_fp8" in
-    ""|auto) kda_fp8=row128 ;;
+    ""|auto) kda_fp8=off ;;
     off|row128|channel) ;;
     *) echo "GLM5_FLASH_KDA_FP8 must be auto, off, row128 or channel" >&2; exit 2 ;;
   esac
   # Default auto (GLM 5.3 Flash 1 RTX + 2: 65536 -> 2,097,152 tokens, 44 GiB still free, speed unchanged).
   glmf_pool="$(get POOL_TOKENS auto)"; [[ "$glmf_pool" != auto ]] || glmf_pool=0
   family_args+=(--kda-fp8 "$kda_fp8" --pool-tokens "$glmf_pool")
-  case "$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD on)" in
-    on|auto|"") family_args+=(--fp8-head true) ;;
-    off) family_args+=(--fp8-head false) ;;
+  case "$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD off)" in
+    on) family_args+=(--fp8-head true) ;;
+    off|auto|"") family_args+=(--fp8-head false) ;;
     *) echo "GLM5_FLASH_FP8_HEAD must be on or off" >&2; exit 2 ;;
   esac
   fp8_prefill="$(key GLM5_FLASH_FP8_PREFILL GLMF_FP8_PREFILL)"
