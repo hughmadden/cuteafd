@@ -47,6 +47,26 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// CUDA graph captures begun through this crate since the process started
+/// (serving should reach zero new captures once warm; see AGENTS.md).
+static GRAPH_CAPTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// CUDA graph captures begun so far (all libraries, all streams).
+pub fn graph_captures() -> u64 {
+    GRAPH_CAPTURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Captures begun per call site (`file:line` of the begin-capture call).
+static GRAPH_CAPTURE_SITES: Mutex<Vec<(&'static std::panic::Location<'static>, u64)>> = Mutex::new(Vec::new());
+
+/// Captures begun so far by call site, most first.
+pub fn graph_capture_sites() -> Vec<(String, u64)> {
+    let sites = GRAPH_CAPTURE_SITES.lock().unwrap_or_else(|p| p.into_inner());
+    let mut sites: Vec<_> = sites.iter().map(|(l, n)| (format!("{}:{}", l.file(), l.line()), *n)).collect();
+    sites.sort_by(|a, b| b.1.cmp(&a.1));
+    sites
+}
+
 pub type CuteafdStatus = c_int;
 
 pub const CUTEAFD_STATUS_OK: CuteafdStatus = 0;
@@ -1863,10 +1883,20 @@ impl NativeLibrary {
         Ok(out_ms)
     }
 
+    #[track_caller]
     pub unsafe fn cuda_graph_begin_capture(&self, cuda_stream: *mut c_void) -> Result<()> {
+        let site = std::panic::Location::caller();
+        {
+            let mut sites = GRAPH_CAPTURE_SITES.lock().unwrap_or_else(|p| p.into_inner());
+            match sites.iter_mut().find(|(l, _)| std::ptr::eq(*l, site)) {
+                Some((_, n)) => *n += 1,
+                None => sites.push((site, 1)),
+            }
+        }
         let begin_capture_fn: Symbol<CudaGraphBeginCaptureFn> =
             unsafe { self.lib.get(b"cuteafd_cuda_graph_begin_capture")? };
         let status = unsafe { begin_capture_fn(cuda_stream) };
+        GRAPH_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.status_to_result("cuteafd_cuda_graph_begin_capture", status)
     }
 
@@ -3830,6 +3860,38 @@ impl NativeLibrary {
     /// # Safety
     /// The range must be host memory that stays allocated until the endpoint is
     /// destroyed.
+    /// Registers a device range for remote RDMA writes on the endpoint and
+    /// returns its rkey (`None` removes it).
+    ///
+    /// # Safety
+    /// `handle` is a live endpoint; the range stays allocated until removed or
+    /// the endpoint is destroyed.
+    pub unsafe fn rdma_rc_endpoint_expose_device(&self, handle: *mut c_void, device: Option<CuteafdDeviceBuffer>)
+        -> Result<u32> {
+        type ExposeFn = unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut u32) -> CuteafdStatus;
+        let expose: Symbol<ExposeFn> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_expose_device")? };
+        let (ptr, bytes) = device.map_or((std::ptr::null_mut(), 0), |d| (d.ptr, d.bytes));
+        let mut rkey = 0;
+        let status = unsafe { expose(handle, ptr, bytes, &mut rkey) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_expose_device", status)?;
+        Ok(rkey)
+    }
+
+    /// RDMA-writes `bytes` at `offset` of the send buffer to `remote`, then
+    /// `flag_value` to `flag_remote` (signaled with `wr_id`).
+    ///
+    /// # Safety
+    /// `handle` is a live connected endpoint; the remote ranges were exposed
+    /// by the peer with these rkeys and hold the written extents.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn rdma_rc_endpoint_post_write_flagged(&self, handle: *mut c_void, offset: usize, bytes: usize,
+        remote: u64, rkey: u32, flag_value: u64, flag_remote: u64, flag_rkey: u32, wr_id: u64) -> Result<()> {
+        type WriteFn = unsafe extern "C" fn(*mut c_void, usize, usize, u64, u32, u64, u64, u32, u64) -> CuteafdStatus;
+        let write: Symbol<WriteFn> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_post_write_flagged")? };
+        let status = unsafe { write(handle, offset, bytes, remote, rkey, flag_value, flag_remote, flag_rkey, wr_id) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_post_write_flagged", status)
+    }
+
     pub unsafe fn rdma_rc_endpoint_register_region(
         &self,
         handle: *mut c_void,

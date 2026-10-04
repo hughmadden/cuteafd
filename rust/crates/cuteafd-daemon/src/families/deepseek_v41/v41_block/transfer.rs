@@ -8,6 +8,9 @@ use crate::shared::memory::device::{Device, Stream};
 pub(crate) struct BlockTransfer<'a> {
     source: Device<'a>,
     destination: Stream<'a>,
+    /// Device-ordered passes (`CUTEAFD_V41_DEVICE`): an SM copy on the
+    /// destination GPU ordered by the stage chain, with no host wait.
+    sm: Option<cuteafd_ffi::V41PeerCopy<'a>>,
 }
 impl<'a> BlockTransfer<'a> {
     pub fn new(source: Device<'a>, destination: Device<'a>) -> Result<Self> {
@@ -17,9 +20,12 @@ impl<'a> BlockTransfer<'a> {
         );
         source.run(|| source.library.cuda_enable_peer(destination.id))?;
         destination.run(|| destination.library.cuda_enable_peer(source.id))?;
+        let sm = crate::shared::memory::chain::device_enabled()
+            .then(|| destination.run(|| destination.library.v41_peer_copy())).transpose()?;
         Ok(Self {
             source,
             destination: Stream::new(destination)?,
+            sm,
         })
     }
     /// # Safety
@@ -41,6 +47,17 @@ impl<'a> BlockTransfer<'a> {
             "block transfer devices or extents differ"
         );
         let device = self.destination.device;
+        if let Some(sm) = self.sm.as_ref().filter(|_| crate::shared::memory::chain::deferred()) {
+            // The SM copy follows the chain head (the producers on the source
+            // GPU) on the device and becomes the new head: no host wait.
+            return device.run(|| unsafe {
+                crate::shared::memory::chain::join(device.library, self.destination.raw)?;
+                for (source, destination) in sources.into_iter().zip(destinations) {
+                    sm.launch(destination, source, source.bytes, self.destination.raw)?;
+                }
+                crate::shared::memory::chain::finish(device.library, self.destination.raw)
+            });
+        }
         // Peer DMA never waits on an unresolved event; settle chained producers.
         crate::shared::memory::chain::settle(device.library)?;
         let queued = device.run(|| {

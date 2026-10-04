@@ -10,7 +10,9 @@ use cuteafd_loader::{
 
 pub(crate) struct EngramDeviceRows<'a> {
     stream: LoadStream<'a>,
-    staging: HostAllocation<'a>,
+    /// One region per engram layer (layers 1 and 14) while passes may run
+    /// device-ordered, so the second upload cannot overwrite queued bytes.
+    staging: crate::shared::memory::LayerStaging<'a>,
     weights: DeviceAllocation<'a>,
     scales: DeviceAllocation<'a>,
     embeddings: DeviceAllocation<'a>,
@@ -100,7 +102,7 @@ impl<'a> EngramDeviceRows<'a> {
                 library,
                 raw: library.cuda_stream_create()?,
             },
-            staging: HostAllocation::new(library, capacity * (24 * (256 + 8) + 1))?,
+            staging: crate::shared::memory::LayerStaging::new(library, capacity * (24 * (256 + 8) + 1), 2)?,
             weights: DeviceAllocation::new(library, capacity * 24 * 256)?,
             scales: DeviceAllocation::new(library, capacity * 24 * 8)?,
             embeddings: DeviceAllocation::new(library, capacity * 24 * 512)?,
@@ -182,16 +184,22 @@ impl<'a> EngramDeviceRows<'a> {
             "invalid gathered engram storage"
         );
         let mut offset = 0;
+        let (staging, staged) = self.staging.region(gathered.layer_index);
         for bytes in [gathered.weights, gathered.scales, gathered.text_mask] {
-            self.staging.bytes_mut()[offset..offset + bytes.len()].copy_from_slice(bytes);
+            staged[offset..offset + bytes.len()].copy_from_slice(bytes);
             offset += bytes.len();
         }
+        let deferred = crate::shared::memory::chain::deferred();
         let launched = (|| -> Result<()> {
+            if deferred {
+                // The previous gate's readers of these device rows precede the copy.
+                unsafe { crate::shared::memory::chain::join(self.library, self.stream.raw)?; }
+            }
             let mut offset = 0;
             let (weights, scales) = self.gathered_buffers(gathered);
             for (destination, bytes) in [(weights, gathered.weights.len()),
                 (scales, gathered.scales.len()), (self.text_mask.buffer, gathered.text_mask.len())] {
-                let mut host = self.staging.buffer;
+                let mut host = staging;
                 host.ptr = unsafe { host.ptr.cast::<u8>().add(offset).cast() }; host.bytes = bytes;
                 unsafe { self.library.copy_host_buffer_h2d_async(destination, host, bytes, self.stream.raw)?; }
                 offset += bytes;
@@ -199,7 +207,12 @@ impl<'a> EngramDeviceRows<'a> {
             unsafe { self.dequantize(gathered) }
         })();
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
-        self.stream.wait().await?;
+        if deferred {
+            // The gate joins the chain head, which now follows this upload.
+            unsafe { crate::shared::memory::chain::finish(self.library, self.stream.raw)?; }
+        } else {
+            self.stream.wait().await?;
+        }
         self.ready = Some((gathered.rows, gathered.layer_index));
         self.view()
     }

@@ -40,8 +40,20 @@ pub(crate) struct Wave<'a> {
     routed: ExpertWave<'a>,
     output: [Allocation<'a>; 2],
     add: V41Bf16Add<'a>,
+    /// SM peer copies per destination GPU for device-ordered passes.
+    sm: [Option<cuteafd_ffi::V41PeerCopy<'a>>; 2],
     layers: usize,
     capacity: u32,
+}
+/// Copies `bytes` from `source` (the other GPU) into `destination` on
+/// `stream`: an SM copy ordered by events under a device-ordered pass (no
+/// copy-engine queue held behind an event), else a copy-engine peer copy.
+unsafe fn peer_copy(stream: &Stream<'_>, sm: Option<&cuteafd_ffi::V41PeerCopy<'_>>, destination: CuteafdDeviceBuffer,
+    source: CuteafdDeviceBuffer, bytes: usize) -> Result<()> {
+    match sm.filter(|_| crate::shared::memory::chain::deferred()) {
+        Some(sm) => unsafe { sm.launch(destination, source, bytes, stream.raw) },
+        None => unsafe { stream.device.library.copy_peer_async(destination, source, bytes, stream.raw) },
+    }
 }
 impl<'a> Wave<'a> {
     pub fn exl3_device_bytes(directory: &std::path::Path, library: &cuteafd_ffi::NativeLibrary,
@@ -112,12 +124,20 @@ impl<'a> Wave<'a> {
                 Allocation::new(devices[1], capacity as usize * 10240)?,
             ],
             add: devices[0].library.v41_bf16_add()?,
+            sm: [0, 1].map(|rank| crate::shared::memory::chain::device_enabled()
+                .then(|| devices[rank].run(|| devices[rank].library.v41_peer_copy())).transpose())
+                .into_iter().collect::<Result<Vec<_>>>()?.try_into()
+                .map_err(|_| anyhow::anyhow!("two TP2 peer copiers"))?,
             layers,
             capacity,
         })
     }
     pub fn contains(&self, layer: usize) -> bool {
         layer < self.layers
+    }
+    /// The lane's stream on GPU `device` (0 or 1).
+    pub(crate) fn stream(&self, device: usize) -> &Stream<'a> {
+        &self.streams[device]
     }
 
     pub fn contains_shared(&self, layer: usize) -> bool {
@@ -155,7 +175,9 @@ impl<'a> Wave<'a> {
         );
         // Peer DMA is never queued behind an unresolved dependency: settle any
         // chained producer of `values` on the host first.
-        crate::shared::memory::chain::settle(self.streams[0].device.library)?;
+        if !crate::shared::memory::chain::deferred() {
+            crate::shared::memory::chain::settle(self.streams[0].device.library)?;
+        }
         let local = values.device_id as usize;
         let remote = 1 - local;
         let upload = &self.streams[remote];
@@ -176,14 +198,16 @@ impl<'a> Wave<'a> {
             stream: upload,
             complete: false,
         };
-        upload.wait().await?;
+        if crate::shared::memory::chain::deferred() {
+            // Both GPUs' streams follow the input's producers (the chain head).
+            self.streams[0].join_chain()?;
+            self.streams[1].join_chain()?;
+        } else {
+            upload.wait().await?;
+        }
         let peer = self.peers[remote].values.buffer;
-        upload.device.run(|| unsafe {
-            upload
-                .device
-                .library
-                .copy_peer_async(peer, values, rows as usize * 10240, upload.raw)
-        })?;
+        let sm = self.sm[remote].as_ref();
+        upload.device.run(|| unsafe { peer_copy(upload, sm, peer, values, rows as usize * 10240) })?;
         let mut inputs = [values; 2];
         inputs[remote] = peer;
         let output = unsafe {
@@ -209,14 +233,20 @@ impl<'a> Wave<'a> {
         destination: usize, rows: u32) -> Result<CuteafdDeviceBuffer> {
         ensure!(destination < 2 && rows > 0 && rows <= self.capacity
             && source.bytes >= rows as usize * 10240, "invalid TP2 result transfer");
-        crate::shared::memory::chain::settle(self.streams[0].device.library)?;
+        if !crate::shared::memory::chain::deferred() {
+            crate::shared::memory::chain::settle(self.streams[0].device.library)?;
+        }
         let stream = &self.streams[destination];
         let mut output = self.output[destination].buffer;
         output.bytes = rows as usize * 10240;
+        let sm = self.sm[destination].as_ref();
         let queued = stream.device.run(|| unsafe {
-            stream.device.library.copy_peer_async(output, source, output.bytes, stream.raw)
+            if crate::shared::memory::chain::deferred() {
+                crate::shared::memory::chain::join(stream.device.library, stream.raw)?;
+            }
+            peer_copy(stream, sm, output, source, output.bytes)
         });
-        let drained = stream.wait().await;
+        let drained = stream.complete().await;
         queued.and(drained)?;
         Ok(output)
     }
@@ -275,19 +305,20 @@ impl<'a> Wave<'a> {
         // Do not submit DMA behind an unresolved stream dependency: a blocked
         // copy packet can hold up independent lanes on the shared copy engine.
         // Chained producers of these inputs are settled on the host as well.
-        crate::shared::memory::chain::settle(upload.device.library)?;
-        upload.wait().await?;
+        if !crate::shared::memory::chain::deferred() {
+            crate::shared::memory::chain::settle(upload.device.library)?;
+        }
+        if crate::shared::memory::chain::deferred() {
+            self.streams[0].join_chain()?;
+            self.streams[1].join_chain()?;
+        } else {
+            upload.wait().await?;
+        }
         let peer = self.peers[remote].buffers();
+        let sm = self.sm[remote].as_ref();
         upload.device.run(|| {
             for ((source, destination), width) in inputs.into_iter().zip(peer).zip(widths) {
-                unsafe {
-                    upload.device.library.copy_peer_async(
-                        destination,
-                        source,
-                        rows as usize * width,
-                        upload.raw,
-                    )?;
-                }
+                unsafe { peer_copy(upload, sm, destination, source, rows as usize * width)?; }
             }
             Ok(())
         })?;
@@ -326,10 +357,14 @@ impl<'a> Wave<'a> {
         let stream = &self.streams[local];
         let output = self.output[local].buffer;
         let queued = stream.device.run(|| unsafe {
+            // Deferred: the routed and shared sums were merged into the chain head.
+            if crate::shared::memory::chain::deferred() {
+                crate::shared::memory::chain::join(stream.device.library, stream.raw)?;
+            }
             self.add
                 .launch(routed, shared, output, rows as usize * 5120, stream.raw)
         });
-        let drained = stream.wait().await;
+        let drained = stream.complete().await;
         queued.and(drained)?;
         let mut result = output;
         result.bytes = rows as usize * 10240;

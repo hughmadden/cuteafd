@@ -379,6 +379,13 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         })?;
         if let Some(profile) = &paired_profile { transport.install_paired(profile.clone())?; }
         transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), expert_layers, capacity)?)?;
+        if crate::shared::memory::chain::device_exchange_enabled() && paired_profile.is_none() && topology.is_none()
+            && format == crate::families::deepseek_v41::v41_experts::ExpertFormat::Native {
+            // Verification waves (up to 80 rows) on the device-driven exchange.
+            devices[1].run(|| transport.get_mut().install_device_link(&args.peers, 80.min(capacity as usize), 39,
+                cuteafd_transport::TcpTransportConfig { timing, timeout: Duration::from_secs(120),
+                    max_frame_bytes: 64 << 20 }))?;
+        }
         Ok::<_, anyhow::Error>(transport)
     };
     let mut transport = make_transport()?;

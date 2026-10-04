@@ -492,6 +492,17 @@ cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv_at(void* handle, size_t offs
 // host-only receives. Applies to receives posted afterwards.
 cuteafd_status_t cuteafd_rdma_rc_endpoint_set_recv_landing(void* handle, void* device_ptr,
                                                        size_t bytes, size_t header_bytes);
+// Registers [device_ptr, device_ptr + bytes) for remote RDMA writes on this
+// endpoint (dma-buf, no relaxed ordering) and returns its rkey; a null range
+// removes the registration.
+cuteafd_status_t cuteafd_rdma_rc_endpoint_expose_device(void* handle, void* device_ptr, size_t bytes,
+                                                    uint32_t* rkey);
+// RDMA-writes `bytes` at `offset_bytes` of the send buffer to `remote_addr`
+// (unsignaled), then the 8-byte `flag_value` to `flag_remote_addr` (signaled
+// with `wr_id`); the flag lands after the data. `bytes` may be 0 (flag only).
+cuteafd_status_t cuteafd_rdma_rc_endpoint_post_write_flagged(
+    void* handle, size_t offset_bytes, size_t bytes, uint64_t remote_addr, uint32_t rkey,
+    uint64_t flag_value, uint64_t flag_remote_addr, uint32_t flag_rkey, uint64_t wr_id);
 cuteafd_status_t cuteafd_rdma_gpu_landing_probe(const char* device_name, uint32_t port_num,
                                             size_t bytes, uint32_t iterations,
                                             cuteafd_rdma_gpu_landing_probe_t* out);

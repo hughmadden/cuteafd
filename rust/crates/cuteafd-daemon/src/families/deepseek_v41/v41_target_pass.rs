@@ -130,8 +130,12 @@ pub(crate) struct TargetPass<'w, 'a> {
     sampled: Option<SampledTargetRows>,
     /// Device-side stage ordering for this pass owner (see `v41_memory::chain`).
     chain: Option<crate::shared::memory::chain::StageChain<'a>>,
+    /// The next verification pass may run device-ordered (see `set_device_order`).
+    device_order: bool,
 }
 impl<'w, 'a> TargetPass<'w, 'a> {
+    /// The next pass may run device-ordered (`CUTEAFD_V41_DEVICE`); reset after it.
+    pub(crate) fn set_device_order(&mut self, on: bool) { self.device_order = on; }
     pub fn set_route_capture(&mut self, enabled: bool) {
         self.lane.set_route_capture(enabled);
         if enabled { self.index.enable_small_graph_shapes(); }
@@ -178,6 +182,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             state: State::Idle,
             sampled: None,
             chain,
+            device_order: true,
         })
     }
     /// # Safety
@@ -324,18 +329,29 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         // Prefill, encoder and replay passes keep host-drained stages: their
         // many-row paths publish KV and encoder state through host-ordered copies.
         let verification = matches!(terminal, HeadTerminal::Greedy | HeadTerminal::Sampled { .. });
+        if let Some(chain) = &self.chain {
+            chain.set_device_order(std::mem::replace(&mut self.device_order, true));
+        }
         let Some(handle) = self.chain.as_ref().filter(|_| verification).map(|chain| chain.handle()) else {
             return unsafe { self.execute_phase_inner(requests, batch, transport, placement, selected,
                 suffix, encoder, terminal).await };
         };
         // A cancelled earlier pass may have left chained work queued.
         self.chain.as_ref().unwrap().drain()?;
-        let result = unsafe { handle.scope(self.execute_phase_inner(requests, batch, transport,
-            placement, selected, suffix, encoder, terminal)).await };
+        let result = crate::shared::memory::chain::watchdog(unsafe { handle.scope(self.execute_phase_inner(
+            requests, batch, transport, placement, selected, suffix, encoder, terminal)) }).await;
         // Every consumer after the pass (commit, dSpark, logits downloads) is
         // unscoped, so the chained work must be complete before returning.
-        let drained = self.chain.as_ref().unwrap().drain();
-        result.and(drained)
+        let drained = if crate::shared::memory::chain::device_enabled() {
+            self.chain.as_ref().unwrap().drain_bounded(std::time::Duration::from_secs(60)).map_err(|error|
+                error.context(format!("device lanes: {}", cuteafd_transport::expert::device_stuck_report())))
+        } else { self.chain.as_ref().unwrap().drain() };
+        let result = result.and(drained).and_then(|()| transport.check_device());
+        if result.is_ok() && crate::shared::memory::chain::device_enabled() {
+            // Device-ordered local layers left their captured routes in the router's ring.
+            self.lane.drain_route_ring()?;
+        }
+        result
     }
     async unsafe fn execute_phase_inner(&mut self, requests: &impl RequestAccess<'a>, batch: &mut RequestBatch,
         transport: &mut NativeTp4Wave<'a>, placement: u64, selected: &[usize],
@@ -396,6 +412,15 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             }
         }
         for layer in stage.windows() {
+            if layer != stage.windows().start && crate::shared::memory::chain::deferred() {
+                // See the distributed pass: the previous layer's attention uploads ran.
+                if crate::shared::memory::chain::staging_fence() {
+                    crate::shared::memory::chain::fence_wait(self.upload.library(), (layer - 1) % 2).await?;
+                }
+                // Let the other lane queue its layer too: lanes interleave per layer
+                // as they did when every layer waited on the host.
+                tokio::task::yield_now().await;
+            }
             if layer != stage.windows().start {
                 let prepare_timing = Instant::now();
                 self.lane.advance()?;

@@ -111,6 +111,9 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
                 "independent verifier issued");
             let operation: Result<()> = async {
                 pass.set_route_capture(capture_routes)?;
+                // Device-ordered passes only while the other lane is idle (two
+                // busy lanes interleave on host waits; see PLAN.md).
+                pass.set_device_order(!shared || crate::shared::memory::chain::device_with_lanes());
                 let current = batch.as_mut().unwrap();
                 let batch_id = current.cache()?.identity();
                 let selected: Vec<_> = (0..current.cache()?.positions().len()).collect();
@@ -152,6 +155,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lane: usize, lib
                 tracing::debug!(target: "cuteafd::cost_model", batch=batch_id, lane, round_id,
                     requests=members.len(), rows=selected.len(), prepared_us, verify_us,
                     "verification round cost");
+                super::graph_capture_watch();
                 let retain_enabled = prefixes.borrow().turn_bank_enabled();
                 let mut decision = prepare_commit_lane(lane, &requests.borrow(),
                     &active.borrow(), &members, &inputs, &next, draft.borrow().as_deref(),

@@ -80,6 +80,32 @@ impl Drop for HostAllocation<'_> {
         }
     }
 }
+/// Pinned staging with one region per layer while V4.1 passes may run
+/// device-ordered (`chain::device_enabled`), else one region: each layer's
+/// queued uploads then read their own bytes, so the host can queue later
+/// layers before earlier uploads ran (no staging fence).
+pub(crate) struct LayerStaging<'a> {
+    allocation: HostAllocation<'a>,
+    region: usize,
+    regions: usize,
+}
+impl<'a> LayerStaging<'a> {
+    pub(crate) fn new(library: &'a NativeLibrary, region: usize, layers: usize) -> Result<Self> {
+        let regions = if chain::device_enabled() { layers.max(1) } else { 1 };
+        Ok(Self { allocation: HostAllocation::new(library, region.max(1) * regions)?, region: region.max(1), regions })
+    }
+    /// Layer `layer`'s region: its host buffer and bytes.
+    pub(crate) fn region(&mut self, layer: usize) -> (CuteafdHostBuffer, &mut [u8]) {
+        let start = (layer % self.regions) * self.region;
+        let buffer = CuteafdHostBuffer {
+            // SAFETY: the region lies inside the allocation.
+            ptr: unsafe { self.allocation.buffer.ptr.cast::<u8>().add(start) }.cast(),
+            bytes: self.region, ..self.allocation.buffer
+        };
+        (buffer, &mut self.allocation.bytes_mut()[start..start + self.region])
+    }
+    pub(crate) fn region_bytes(&self) -> usize { self.region }
+}
 pub(crate) struct LoadStream<'a> {
     pub(crate) library: &'a NativeLibrary,
     pub(crate) raw: *mut c_void,
@@ -88,6 +114,11 @@ impl LoadStream<'_> {
     /// Rebinding requires a completed owner, not a hidden host-thread wait.
     #[track_caller]
     pub(crate) fn require_complete(&self) -> Result<()> {
+        // A device-ordered pass orders every stage after the chain head, so a
+        // rebound owner's next work cannot overtake its previous readers.
+        if chain::deferred() {
+            return Ok(());
+        }
         let caller = std::panic::Location::caller();
         anyhow::ensure!(unsafe { self.library.cuda_stream_query(self.raw)? },
             "cannot rebind an unfinished V4.1 stream ({}:{})", caller.file(), caller.line());

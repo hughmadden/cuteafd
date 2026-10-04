@@ -428,6 +428,7 @@ impl LocalVerbsExpertConnection {
         let response_send_view = self.response_send_view;
         let response_frame = &mut self.response_frame;
         let response_copy_stream = &mut self.response_copy_stream;
+        let write_target = self.start.write_target;
         let mut request_recv_sequence = self.request_recv_sequence;
         let mut response_send_sequence = self.response_send_sequence;
         let mut response_send_in_flight = self.response_send_in_flight;
@@ -522,6 +523,23 @@ impl LocalVerbsExpertConnection {
                 let response_send_offset = response_ring.slot_offset(response_send_sequence);
                 let encode_started = timing_enabled.then(Instant::now);
                 let response_wire_bytes_for_chunk = match response {
+                    ProtocolV2ExecutorResponseRef::Host(response) if write_target.is_some() => {
+                        // Write mode: the rows go from the send slot to the client's plane.
+                        let target = write_target.expect("write target checked above");
+                        let bytes = response.partial_output_payload.len();
+                        let slot = mapped_ring_slot(response_send_view, response_ring, response_send_sequence as u64)?;
+                        anyhow::ensure!(bytes <= slot.capacity_bytes, "written response exceeds its send slot");
+                        // SAFETY: the slot lies in this endpoint's mapped send ring and
+                        // its previous send completed (the in-flight check above).
+                        unsafe { std::ptr::copy_nonoverlapping(response.partial_output_payload.as_ptr(), slot.host_ptr,
+                            bytes); }
+                        let flag = written_flag(request_id, response_has_more || response.row_indices.is_some());
+                        let send_started = timing_enabled.then(Instant::now);
+                        endpoint.post_write_flagged(&target, response_send_offset, if flag & VERBS_HOST_WRITE_FLAG_ERROR != 0
+                            { 0 } else { bytes }, flag, VERBS_HOST_SEND_WR_ID + response_send_slot as u64)?;
+                        send_ms += elapsed_ms_optional(send_started);
+                        bytes
+                    }
                     ProtocolV2ExecutorResponseRef::Host(response) => {
                         let response_prefix =
                             response_frame.encode_borrowed_response_prefix(&response)?;
@@ -598,11 +616,21 @@ impl LocalVerbsExpertConnection {
                                 library.cuda_stream_synchronize(copy_stream)?;
                             }
                         }
-                        endpoint.post_send_at(
-                            response_send_offset,
-                            wire_bytes,
-                            VERBS_HOST_SEND_WR_ID + response_send_slot as u64,
-                        )?;
+                        match write_target {
+                            Some(target) => {
+                                // Write mode: rows to the client's plane, then the flag.
+                                let flag = written_flag(request_id, response_has_more);
+                                endpoint.post_write_flagged(&target, response_send_offset + response_prefix.len(),
+                                    if flag & VERBS_HOST_WRITE_FLAG_ERROR != 0 { 0 } else {
+                                        response.partial_output_payload.bytes },
+                                    flag, VERBS_HOST_SEND_WR_ID + response_send_slot as u64)?;
+                            }
+                            None => endpoint.post_send_at(
+                                response_send_offset,
+                                wire_bytes,
+                                VERBS_HOST_SEND_WR_ID + response_send_slot as u64,
+                            )?,
+                        }
                         send_ms += elapsed_ms_optional(send_started);
                         wire_bytes
                     }
@@ -661,6 +689,13 @@ impl LocalVerbsExpertConnection {
         self.response_send_in_flight = response_send_in_flight;
         result.map(|()| true)
     }
+}
+
+/// The flag a write-mode response publishes: its request id, with
+/// [`VERBS_HOST_WRITE_FLAG_ERROR`] when its rows could not be written whole
+/// (a chunked or row-indexed response has no plane layout).
+fn written_flag(request_id: u64, unwritable: bool) -> u64 {
+    (request_id & !VERBS_HOST_WRITE_FLAG_ERROR) | if unwritable { VERBS_HOST_WRITE_FLAG_ERROR } else { 0 }
 }
 
 #[cfg(test)]

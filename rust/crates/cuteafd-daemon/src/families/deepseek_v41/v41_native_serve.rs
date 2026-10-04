@@ -576,6 +576,14 @@ fn worker(
     if let Some(handoff) = placement_handoff {
         handoff.wait_ready(Duration::from_secs(900))?;
     }
+    if crate::shared::memory::chain::device_exchange_enabled() && paired_profile.is_none() && topology.is_none()
+        && catalog.nvfp4().is_none() && catalog.exl3().is_none() && local_layers < 40 {
+        // Verification waves (up to 80 rows) on the device-driven exchange; it
+        // connects (and warms) the workers, so only once they are serving.
+        transport.install_device_link(&args.peers, 80.min(capacity as usize), 39,
+            cuteafd_transport::TcpTransportConfig { timing: protocol_v2_timing, timeout: Duration::from_secs(120),
+                max_frame_bytes: 64 << 20 })?;
+    }
     let (free, total) = lib.cuda_memory_info()?;
     let occupied = total - free;
     if compact {

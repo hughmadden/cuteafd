@@ -77,6 +77,9 @@ pub(crate) struct EngramGate<'weights, 'library> {
     embeddings: DeviceAllocation<'library>,
     text_mask: DeviceAllocation<'library>,
     graph: Option<(*mut std::ffi::c_void, usize)>,
+    /// Device-ordered passes keep other row counts' graphs here (a cold row
+    /// count captures with a host wait).
+    retained: Vec<(*mut std::ffi::c_void, usize)>,
     projected: DeviceAllocation<'library>,
     scratch: DeviceAllocation<'library>,
     alpha: DeviceAllocation<'library>,
@@ -143,6 +146,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
             embeddings: DeviceAllocation::new(weights.library, capacity * 24 * 512)?,
             text_mask: DeviceAllocation::new(weights.library, capacity)?,
             graph: None,
+            retained: Vec::new(),
             projected: DeviceAllocation::new(weights.library, projected_bytes)?,
             scratch: DeviceAllocation::new(weights.library, scratch_bytes)?,
             alpha: DeviceAllocation::new(weights.library, 4)?,
@@ -348,8 +352,17 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
     pub async unsafe fn execute_into_cooperative(&mut self, residual: CuteafdDeviceBuffer,
         gathered: &EngramDeviceView) -> Result<()> {
         self.ready_rows = None;
+        if crate::shared::memory::chain::device_enabled()
+            && self.graph.as_ref().is_some_and(|(_, rows)| *rows != gathered.rows) {
+            // Swap in a retained graph of this row count (or none), keeping the active one.
+            let found = self.retained.iter().position(|(_, rows)| *rows == gathered.rows)
+                .map(|index| self.retained.swap_remove(index));
+            if let Some(active) = std::mem::replace(&mut self.graph, found) {
+                self.retained.push(active);
+            }
+        }
         let cold = self.graph.as_ref().is_none_or(|(_, rows)| *rows != gathered.rows);
-        if cold { self.clear_graph()?; }
+        if cold && self.graph.is_some() { self.clear_active_graph()?; }
         let launched = (|| unsafe {
             crate::shared::memory::chain::join(self.weights.library, self.stream.raw)?;
             self.enqueue_inputs(residual, gathered)?;
@@ -397,13 +410,20 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         eprintln!("PASS queued Engram gate {}: exact gate/residual parity, pending cancellation={cancelled}, reuse", self.layer());
         Ok(())
     }
-    pub fn clear_graph(&mut self) -> Result<()> {
+    fn clear_active_graph(&mut self) -> Result<()> {
         self.ready_rows = None;
         self.stream.require_complete()?;
         if let Some((graph, _)) = self.graph.take() {
             unsafe {
                 self.weights.library.cuda_graph_exec_destroy(graph)?;
             }
+        }
+        Ok(())
+    }
+    pub fn clear_graph(&mut self) -> Result<()> {
+        self.clear_active_graph()?;
+        for (graph, _) in self.retained.drain(..) {
+            unsafe { self.weights.library.cuda_graph_exec_destroy(graph)?; }
         }
         Ok(())
     }
@@ -429,7 +449,7 @@ impl Drop for EngramGate<'_, '_> {
         if let Err(error) = self.synchronize() {
             tracing::error!(%error, "draining native engram residual gate");
         }
-        if let Some((graph, _)) = self.graph.take() {
+        for (graph, _) in self.graph.take().into_iter().chain(self.retained.drain(..)) {
             if let Err(error) = unsafe { self.weights.library.cuda_graph_exec_destroy(graph) } {
                 tracing::error!(%error, "destroying native engram graph");
             }

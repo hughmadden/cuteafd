@@ -3,7 +3,7 @@ use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
 use crate::families::deepseek_v41::v41_attention_query::AttentionQueryOutput;
 use crate::families::deepseek_v41::v41_compressor::IndexProposal;
 use crate::families::deepseek_v41::v41_index_selection::IndexSelectionOutput;
-use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
+use crate::shared::memory::{DeviceAllocation, HostAllocation, LayerStaging, LoadStream};
 use crate::families::deepseek_v41::v41_window::WindowProposal;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{
@@ -62,11 +62,13 @@ pub(crate) struct LocalSparseAttentionWave<'a,const HEADS:usize> {
     output: DeviceAllocation<'a>,
     split_scratch: DeviceAllocation<'a>,
     descriptors: DeviceAllocation<'a>,
-    descriptor_staging: HostAllocation<'a>,
+    /// Per-layer pinned staging (see `LayerStaging`): metadata, descriptors
+    /// and replay begins differ by layer and may still be queued.
+    descriptor_staging: LayerStaging<'a>,
     replay_begins: DeviceAllocation<'a>,
     metadata: DeviceAllocation<'a>,
-    staging: HostAllocation<'a>,
-    replay_staging: HostAllocation<'a>,
+    staging: LayerStaging<'a>,
+    replay_staging: LayerStaging<'a>,
     capacity: usize,
     batch_rows: usize,
     // Batched keys retain row count and stable wave/selection/sink storage;
@@ -132,11 +134,11 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
                 V41SparseAttention::split_scratch_bytes(capacity.min(48), 10)?/64*HEADS,
             )?,
             descriptors: DeviceAllocation::new(library, V41SparseAttention::batch_descriptor_bytes(capacity.min(48))?)?,
-            descriptor_staging: HostAllocation::new(library, V41SparseAttention::batch_descriptor_bytes(capacity.min(48))?)?,
+            descriptor_staging: LayerStaging::new(library, V41SparseAttention::batch_descriptor_bytes(capacity.min(48))?, 40)?,
             replay_begins: DeviceAllocation::new(library, capacity * 8)?,
             metadata: DeviceAllocation::new(library, capacity * 80)?,
-            staging: HostAllocation::new(library, capacity * 80)?,
-            replay_staging: HostAllocation::new(library, capacity * 8)?,
+            staging: LayerStaging::new(library, capacity * 80, 40)?,
+            replay_staging: LayerStaging::new(library, capacity * 8, 40)?,
             capacity,
             batch_rows: capacity.min(48),
             graphs: std::array::from_fn(|_| VecDeque::new()),
@@ -157,7 +159,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         let scratch = DeviceAllocation::new(library, V41SparseAttention::split_scratch_bytes(rows, 10)?/64*HEADS)?;
         let bytes = V41SparseAttention::batch_descriptor_bytes(rows)?;
         let descriptors = DeviceAllocation::new(library, bytes)?;
-        let staging = HostAllocation::new(library, bytes)?;
+        let staging = LayerStaging::new(library, bytes, 40)?;
         let additional_device_bytes = scratch.buffer.bytes + descriptors.buffer.bytes
             - self.split_scratch.buffer.bytes - self.descriptors.buffer.bytes;
         self.split_scratch = scratch;
@@ -586,9 +588,10 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             let batch = self.kernel.prepare_batch(self.query.buffer, sink, self.metadata.buffer,
                 selected, &bindings, self.output.buffer, self.descriptors.buffer,
                 self.replay_begins.buffer, self.split_scratch.buffer)?;
-            self.descriptor_staging.bytes_mut()[..batch.bytes().len()].copy_from_slice(batch.bytes());
+            let (host, bytes) = self.descriptor_staging.region(layer);
+            bytes[..batch.bytes().len()].copy_from_slice(batch.bytes());
             unsafe { self.stream.library.copy_host_buffer_h2d_async(self.descriptors.buffer,
-                self.descriptor_staging.buffer, batch.bytes().len(), self.stream.raw)?; }
+                host, batch.bytes().len(), self.stream.raw)?; }
             // The kernel reads current descriptors rather than capturing external
             // cache pointers or request row counts. Selection is lane-owned and
             // stable; still include its address to guard any future owner change.
@@ -596,26 +599,28 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
                 selected.map_or(0, |buffer| buffer.ptr as usize), batch.backend_key()];
             Some(batch)
         } else { None };
+        let (host, bytes) = self.staging.region(layer);
         for (i, m) in metadata.into_iter().enumerate() {
-            self.staging.bytes_mut()[i * 8..i * 8 + 8].copy_from_slice(&m.to_ne_bytes());
+            bytes[i * 8..i * 8 + 8].copy_from_slice(&m.to_ne_bytes());
         }
         unsafe {
             self.stream.library.copy_host_buffer_h2d_async(
-                self.metadata.buffer, self.staging.buffer, rows * 80, self.stream.raw,
+                self.metadata.buffer, host, rows * 80, self.stream.raw,
             )?;
         }
         if HEADS==32 || batch.is_some() || requests.iter().any(|r| r.window.cache.begin != 0) {
             let mut row = 0;
+            let (host, bytes) = self.replay_staging.region(layer);
             for request in requests {
                 for _ in request.positions {
-                    self.replay_staging.bytes_mut()[row * 8..row * 8 + 8]
+                    bytes[row * 8..row * 8 + 8]
                         .copy_from_slice(&request.window.cache.begin.to_ne_bytes());
                     row += 1;
                 }
             }
             unsafe {
                 self.stream.library.copy_host_buffer_h2d_async(
-                    self.replay_begins.buffer, self.replay_staging.buffer, rows * 8, self.stream.raw,
+                    self.replay_begins.buffer, host, rows * 8, self.stream.raw,
                 )?;
             }
         }

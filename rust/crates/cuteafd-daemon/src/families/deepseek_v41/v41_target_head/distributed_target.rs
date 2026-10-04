@@ -33,6 +33,28 @@ impl<'w, 'a> Normalize<'w, 'a> {
                 5120, 1e-20, self.stream.raw)
         }
     }
+    /// Device-ordered form of [`Self::execute`] for a warm row count: row copies
+    /// and the captured norm follow the chain head and become it.
+    unsafe fn execute_chained(&mut self, block: &BlockOutput<'_>, selected: &[usize]) -> Result<()> {
+        let rows = selected.len();
+        let graph = self.graphs[rows - 1].context("chained target norm needs a warm shape")?;
+        let lib = self.weights.library;
+        unsafe {
+            crate::shared::memory::chain::join(lib, self.stream.raw)?;
+            let mut first = 0;
+            while first < rows {
+                let mut count = 1;
+                while first + count < rows && selected[first + count] == selected[first] + count { count += 1; }
+                for (i, source, stride) in [(0, block.residual, 40960), (1, block.pre, 16)] {
+                    lib.copy_d2d_async(part(self.buffers[i].buffer, first * stride, count * stride)?,
+                        part(source, selected[first] * stride, count * stride)?, count * stride, self.stream.raw)?;
+                }
+                first += count;
+            }
+            lib.cuda_graph_launch(graph, self.stream.raw)?;
+            crate::shared::memory::chain::finish(lib, self.stream.raw)
+        }
+    }
     async unsafe fn execute(&mut self, block: &BlockOutput<'_>, selected: &[usize]) -> Result<()> {
         let rows = selected.len();
         let queued = (|| -> Result<()> { unsafe {
@@ -124,8 +146,9 @@ impl<'w, 'a> DistributedTargetHead<'w, 'a> {
         ];
         let normalize = devices[1].own(|| Normalize::new(weights, capacity))?;
         let sampler_bytes = capacity * 129280 * 4 + TargetSamplingWave::device_bytes(capacity, 129280);
-        let vocabulary = DistributedVocabularyWave::new(devices, vocabulary, capacity,
+        let mut vocabulary = DistributedVocabularyWave::new(devices, vocabulary, capacity,
             [budgets[0], budgets[1] - capacity * INPUT_STRIDES.iter().sum::<usize>() - sampler_bytes])?;
+        vocabulary.use_fp8(crate::families::deepseek_v41::v41_tensors::Fp8Head::All)?;
         let sampler = HeadSampler {
             assembled: devices[1].own(|| DeviceAllocation::new(devices[1].library, capacity * 129280 * 4))?,
             wave: devices[1].own(|| TargetSamplingWave::new(devices[1].library, capacity, 129280))?,
@@ -157,13 +180,23 @@ impl<'w, 'a> DistributedTargetHead<'w, 'a> {
             && block.residual.bytes == block.tokens.len() * 40960 && block.pre.bytes == block.tokens.len() * 16
             && block.residual.device_id == device.id && block.pre.device_id == device.id,
             "distributed target head block or selected rows differ");
-        // The TP2 vocabulary projection moves rows between GPUs with host-ordered
-        // copies; settle a chained final layer first (one wait per pass).
-        crate::shared::memory::chain::settle(device.library)?;
-        device.future(unsafe { self.normalize.get_mut().execute(block, selected) }).await?;
-        let normalized = self.normalize.buffers[3].buffer;
-        unsafe { self.vocabulary.execute(normalized, selected.len()).await?; }
         let rows = selected.len();
+        let normalized = self.normalize.buffers[3].buffer;
+        let chained = greedy && crate::shared::memory::chain::deferred()
+            && self.normalize.graphs[rows - 1].is_some() && self.vocabulary.warm_greedy(rows);
+        if chained {
+            // Device-ordered pass, warm shapes: norm, both vocabulary halves and
+            // the merge follow the chain; the download below is the one wait.
+            device.run(|| unsafe { self.normalize.get_mut().execute_chained(block, selected) })?;
+            unsafe { self.vocabulary.execute_chained(normalized, rows)?; }
+            self.download.join_chain()?;
+        } else {
+            // The TP2 vocabulary projection moves rows between GPUs with host-ordered
+            // copies; settle a chained final layer first (one wait per pass).
+            crate::shared::memory::chain::settle(device.library)?;
+            device.future(unsafe { self.normalize.get_mut().execute(block, selected) }).await?;
+            unsafe { self.vocabulary.execute(normalized, selected.len()).await?; }
+        }
         if greedy {
             let (ids, scores) = self.vocabulary.greedy()?;
             let host = self.staging.bytes_mut();

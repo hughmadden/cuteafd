@@ -347,16 +347,29 @@ impl LaneFfn<'_, '_, '_> {
         let library = self.library;
         let route_capture = &mut self.route_capture;
         let ffn_split = &mut self.ffn_split;
+        if crate::shared::memory::chain::deferred() {
+            // Attention preparation only enqueues its uploads. The pending
+            // attention tail has now joined the chain, so this fence includes
+            // every pinned staging read the next layer may overwrite.
+            crate::shared::memory::chain::fence_mark(library, input.layer % 2)?;
+        }
         let output = complete_ffn(self.phase, async {
             let timing = std::time::Instant::now();
-            router.set_local_mode(transport.has_local_layer(input.layer))?;
+            // Device waves read the routes on the device like local layers do.
+            let device_wave = !transport.has_local_layer(input.layer) && transport.device_wave(input.layer, rows.len());
+            let tp2_shared_device = transport.has_tp2_shared_layer(input.layer);
+            router.set_local_mode(transport.has_local_layer(input.layer) || device_wave)?;
+            let ring = router.ring_capture();
             let routed = unsafe { if cooperative { router.execute_ffn_cooperative(input, image_mask).await? }
                 else { router.execute_ffn(input, image_mask)? } };
             if transport.has_local_layer(input.layer) {
+                ensure!(!(ring && tracing::enabled!(target: "cuteafd::route_policy", tracing::Level::DEBUG)),
+                    "route policy tracing reads host routes; it is not available with CUTEAFD_V41_DEVICE");
                 routed.validate_request_rows(rows)?;
                 let trace = tracing::enabled!(target: "cuteafd::route_policy", tracing::Level::DEBUG);
                 let mut temporary = Vec::new();
-                let mut captured = if let Some(capture) = route_capture.as_deref_mut() {
+                // Ring-captured routes are read after the pass (`drain_route_ring`).
+                let mut captured = if let Some(capture) = route_capture.as_deref_mut().filter(|_| !ring) {
                     Some(&mut capture[input.layer])
                 } else if trace { Some(&mut temporary) } else { None };
                 if let Some(output) = captured.as_deref_mut() {
@@ -390,6 +403,20 @@ impl LaneFfn<'_, '_, '_> {
                         "native route policy observation");
                 }
                 return result;
+            }
+            if device_wave && tp2_shared_device {
+                let result = unsafe { transport.execute_device_tp2(input, &routed, placement, rows).await };
+                tracing::debug!(target: "cuteafd::timing", layer=input.layer, rows=rows.len(),
+                    enqueue_us=timing.elapsed().as_micros() as u64, "target device experts");
+                return result;
+            }
+            if device_wave {
+                // One GPU: the wave leaves first, the shared expert runs meanwhile.
+                let shared = shared.as_mut().context("decoder shared expert workspace absent")?;
+                let binding = unsafe { transport.device_dispatch(&routed, placement, rows)? };
+                let contribution = unsafe { shared.execute_ffn_cooperative(input).await? };
+                return unsafe { transport.device_collect(binding, contribution.values, routed.rows,
+                    input.values.device_id).await };
             }
             let tp2_shared = transport.has_tp2_shared_layer(input.layer);
             ensure!(shared.is_some() || tp2_shared, "decoder shared TP2 execution required");
@@ -935,6 +962,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub fn trace_stream(&self) -> *mut std::ffi::c_void { self.block.trace_stream() }
     pub fn set_route_capture(&mut self, enabled: bool) {
         self.capture_routes = enabled;
+        self.router.set_ring_capture(enabled);
         if enabled {
             self.query.enable_small_graph_shapes();
             if let Some(sparse)=&mut self.sparse { sparse.enable_small_graph_shapes(); }
@@ -950,6 +978,12 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         }
     }
     pub fn captured_routes(&self) -> &[Vec<[u32; 6]>] { &self.route_capture }
+    /// After a device-ordered pass drained: the ring-captured local layers'
+    /// routes into the capture; returns those layers.
+    pub fn drain_route_ring(&mut self) -> Result<Vec<usize>> {
+        if !self.capture_routes { return Ok(Vec::new()); }
+        self.router.drain_ring(&mut self.route_capture)
+    }
     /// Host FFN stage split of the last captured pass on this lane.
     pub fn captured_ffn_split(&self) -> FfnSplit { self.ffn_split }
     /// Opt-in TP2 attention or projection owners, whose peer transfers are

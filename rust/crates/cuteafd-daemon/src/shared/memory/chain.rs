@@ -38,6 +38,19 @@ struct Current {
     /// later producers read are complete, before its remaining work.
     forks: Rc<[(i32, *mut c_void)]>,
     fork: Rc<Cell<Option<usize>>>,
+    /// Device-ordered passes: per device a stream and two events marking
+    /// "everything chained so far" ([`fence_mark`]), and which device marked each.
+    fences: Rc<[Fence]>,
+    marked: Rc<Cell<[Option<usize>; 2]>>,
+    /// This pass may run device-ordered ([`deferred`]).
+    device: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Fence {
+    device: i32,
+    stream: *mut c_void,
+    events: [*mut c_void; 2],
 }
 
 thread_local! {
@@ -51,8 +64,16 @@ pub(crate) struct StageChain<'a> {
     head: Rc<Cell<Option<usize>>>,
     forks: Rc<[(i32, *mut c_void)]>,
     fork: Rc<Cell<Option<usize>>>,
+    fences: Rc<[Fence]>,
+    marked: Rc<Cell<[Option<usize>; 2]>>,
+    device: Cell<bool>,
 }
 impl<'a> StageChain<'a> {
+    /// Whether the next scoped pass may run device-ordered (with
+    /// [`device_enabled`]); default on.
+    pub fn set_device_order(&self, on: bool) {
+        self.device.set(on);
+    }
     /// A chain for the current device only.
     pub fn new(library: &'a NativeLibrary) -> Result<Self> {
         let device = library.cuda_get_device()?;
@@ -63,36 +84,70 @@ impl<'a> StageChain<'a> {
         let previous = library.cuda_get_device()?;
         let mut events = Vec::with_capacity(devices.len());
         let mut forks = Vec::with_capacity(devices.len());
+        let mut fences = Vec::with_capacity(devices.len());
         let created = (|| -> Result<()> {
             for &device in devices {
                 library.cuda_set_device(device)?;
                 events.push((device, library.cuda_event_create_ordering()?));
                 forks.push((device, library.cuda_event_create_ordering()?));
+                if device_enabled() {
+                    fences.push(Fence { device, stream: library.cuda_stream_create()?,
+                        events: [library.cuda_event_create_ordering()?, library.cuda_event_create_ordering()?] });
+                }
             }
             Ok(())
         })();
         library.cuda_set_device(previous)?;
         if let Err(error) = created {
             for &(_, event) in events.iter().chain(&forks) { let _ = unsafe { library.cuda_event_destroy(event) }; }
+            destroy_fences(library, &fences);
             return Err(error);
         }
         Ok(Self { library, events: events.into(), head: Rc::new(Cell::new(None)),
-            forks: forks.into(), fork: Rc::new(Cell::new(None)) })
+            forks: forks.into(), fork: Rc::new(Cell::new(None)), fences: fences.into(),
+            marked: Rc::new(Cell::new([None; 2])), device: Cell::new(true) })
     }
     /// An owned handle that can wrap a future borrowing the chain's owner.
     pub fn handle(&self) -> ChainHandle<'a> {
         ChainHandle { library: self.library, current: Current {
             events: self.events.clone(), head: self.head.clone(),
-            forks: self.forks.clone(), fork: self.fork.clone() } }
+            forks: self.forks.clone(), fork: self.fork.clone(), fences: self.fences.clone(),
+            marked: self.marked.clone(), device: self.device.get() } }
     }
     /// Host wait for everything recorded so far, then forget the head. Call
     /// after the pass (or an aborted pass) before any unscoped consumer.
     pub fn drain(&self) -> Result<()> {
         self.fork.set(None);
+        self.marked.set([None; 2]);
         if let Some(head) = self.head.replace(None) {
             unsafe { self.library.cuda_event_synchronize(self.events[head].1)?; }
         }
         Ok(())
+    }
+    /// [`Self::drain`] that gives up after `limit` (device-ordered passes,
+    /// which wait on Spark and peer flags inside the chain): polls the head
+    /// through this device's fence stream instead of blocking in the driver.
+    /// Without fences it is [`Self::drain`].
+    pub fn drain_bounded(&self, limit: std::time::Duration) -> Result<()> {
+        let Some(head) = self.head.get() else { return self.drain() };
+        let (device, event) = self.events[head];
+        let Some(fence) = self.fences.iter().find(|f| f.device == device).copied() else { return self.drain() };
+        let previous = self.library.cuda_get_device()?;
+        self.library.cuda_set_device(device)?;
+        let started = std::time::Instant::now();
+        // SAFETY: the fence stream and head event belong to this chain's device.
+        let result = (|| -> Result<()> {
+            unsafe { self.library.cuda_stream_wait_event(fence.stream, event)?; }
+            loop {
+                if unsafe { self.library.cuda_stream_query(fence.stream)? } { return Ok(()); }
+                anyhow::ensure!(started.elapsed() < limit,
+                    "device-ordered pass did not complete within {limit:?} (a device wait never released)");
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+        })();
+        self.library.cuda_set_device(previous)?;
+        result?;
+        self.drain()
     }
 }
 impl Drop for StageChain<'_> {
@@ -105,6 +160,66 @@ impl Drop for StageChain<'_> {
                 tracing::error!(%error, "destroying target stage chain event");
             }
         }
+        destroy_fences(self.library, &self.fences);
+    }
+}
+
+fn destroy_fences(library: &NativeLibrary, fences: &[Fence]) {
+    for fence in fences {
+        // SAFETY: created by this chain; drained before destruction.
+        unsafe {
+            let _ = library.cuda_stream_synchronize(fence.stream);
+            let _ = library.cuda_stream_destroy(fence.stream);
+            for event in fence.events { let _ = library.cuda_event_destroy(event); }
+        }
+    }
+}
+
+/// Device-ordered passes: marks fence `slot` (0 or 1) at the current chain
+/// head, without a host wait. A later [`fence_wait`] returns once every
+/// stage chained before the mark has completed, so host staging those stages
+/// uploaded from may be rewritten.
+pub(crate) fn fence_mark(library: &NativeLibrary, slot: usize) -> Result<()> {
+    let Some(current) = current() else { return Ok(()) };
+    let Some(head) = current.head.get() else { return Ok(()) };
+    let fence = current.fences.iter().position(|f| f.device == current.events[head].0)
+        .map(|i| (i, current.fences[i]));
+    let Some((index, fence)) = fence else { return Ok(()) };
+    let previous = library.cuda_get_device()?;
+    library.cuda_set_device(fence.device)?;
+    // SAFETY: the fence stream and events belong to this chain's device.
+    let marked = unsafe {
+        library.cuda_stream_wait_event(fence.stream, current.events[head].1)
+            .and_then(|()| library.cuda_event_record(fence.events[slot], fence.stream))
+    };
+    library.cuda_set_device(previous)?;
+    marked?;
+    let mut slots = current.marked.get();
+    slots[slot] = Some(index);
+    current.marked.set(slots);
+    Ok(())
+}
+
+/// Waits for fence `slot` (no-op when it was not marked since the last wait),
+/// yielding between polls so another lane on this thread keeps running.
+pub(crate) async fn fence_wait(library: &NativeLibrary, slot: usize) -> Result<()> {
+    let Some(current) = current() else { return Ok(()) };
+    let mut slots = current.marked.get();
+    let Some(index) = slots[slot].take() else { return Ok(()) };
+    current.marked.set(slots);
+    let fence = current.fences[index];
+    // The fence stream holds only marks, and the next mark is queued after this
+    // wait: the stream is idle exactly when this slot's mark has completed.
+    loop {
+        let previous = library.cuda_get_device()?;
+        library.cuda_set_device(fence.device)?;
+        // SAFETY: the fence stream belongs to this chain.
+        let ready = unsafe { library.cuda_stream_query(fence.stream) };
+        library.cuda_set_device(previous)?;
+        if ready? {
+            return Ok(());
+        }
+        tokio::task::yield_now().await;
     }
 }
 
@@ -125,6 +240,80 @@ impl<'a> ChainHandle<'a> {
 pub(crate) fn enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("CUTEAFD_STAGE_CHAIN").map_or(true, |v| v != "0"))
+}
+
+/// Whether chained V4.1 passes also drop the host waits that only kept
+/// copy-engine transfers from queuing behind unresolved events
+/// (`CUTEAFD_V41_DEVICE=1`, PLAN.md device-driven exchange, stage D3): peer
+/// transfers become SM copies ordered by device events and the host enqueues
+/// the next stage at once. Off by default; the default path is unchanged.
+pub(crate) fn device_enabled() -> bool {
+    device_setting() > 0
+}
+
+/// Whether V4.1 remote verification waves also use the device-driven Spark
+/// exchange (`CUTEAFD_V41_DEVICE=1`; `chain` keeps them on the host path).
+pub(crate) fn device_exchange_enabled() -> bool {
+    device_setting() > 1
+}
+
+/// `CUTEAFD_V41_DEVICE_LANES=1`: device-ordered passes also while both lanes
+/// are busy (off: a lane runs device-ordered only while the other is idle).
+pub(crate) fn device_with_lanes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| matches!(std::env::var("CUTEAFD_V41_DEVICE_LANES").as_deref(), Ok("1" | "on")))
+}
+
+/// `CUTEAFD_V41_STAGING_FENCE=0`: device-ordered passes do not wait for the
+/// previous layer's staged uploads before preparing the next layer (stages
+/// whose pinned staging differs by layer keep one region per layer,
+/// `LayerStaging`), so the host can queue the pass ahead of the GPU.
+pub(crate) fn staging_fence() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("CUTEAFD_V41_STAGING_FENCE").as_deref(), Ok("0" | "off")))
+}
+
+fn device_setting() -> u8 {
+    static SETTING: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *SETTING.get_or_init(|| {
+        let setting = match std::env::var("CUTEAFD_V41_DEVICE").as_deref() {
+            Ok("1" | "on" | "true") => 2,
+            Ok("chain") => 1,
+            _ => 0,
+        };
+        if setting > 0 {
+            tracing::info!(exchange = setting > 1, "V4.1 device-ordered passes: chained stages enqueue without host waits");
+        }
+        setting
+    })
+}
+
+/// Device-ordered passes run under this watchdog: a pass still pending after
+/// `CUTEAFD_V41_DEVICE_WATCHDOG_S` (default 60) seconds is a device wait that
+/// never released (draining it would block forever), so the process logs every
+/// device lane's sequences and exits instead of holding the GPUs.
+pub(crate) async fn watchdog<F: Future>(future: F) -> F::Output {
+    if !device_enabled() {
+        return future.await;
+    }
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| std::env::var("CUTEAFD_V41_DEVICE_WATCHDOG_S").ok()
+        .and_then(|v| v.parse().ok()).unwrap_or(60));
+    let mut future = std::pin::pin!(future);
+    tokio::select! {
+        output = &mut future => output,
+        () = tokio::time::sleep(std::time::Duration::from_secs(limit)) => {
+            tracing::error!(limit_s = limit, lanes = %cuteafd_transport::expert::device_stuck_report(),
+                "device-ordered pass stuck: exiting (a device wait never released)");
+            std::process::exit(70);
+        }
+    }
+}
+
+/// Inside a chain scope with [`device_enabled`]: stages that used to wait on
+/// the host for a producer stream join the chain instead.
+pub(crate) fn deferred() -> bool {
+    device_enabled() && CURRENT.with(|c| c.borrow().as_ref().is_some_and(|c| c.device))
 }
 
 pub(crate) struct ChainScope<'a, F> {

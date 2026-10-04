@@ -98,7 +98,9 @@ impl<'a> TargetHeadWeights<'a> {
             weights: self,
             head,
             capacity,
-            graph: None,
+            graphs: vec![None; capacity],
+            fp8_scratch: crate::families::deepseek_v41::v41_tensors::fp8_scratch(self.library, head.fp8(), capacity,
+                crate::families::deepseek_v41::v41_tensors::Fp8Head::All)?,
             ready: None,
             origin: None,
             selected: Vec::new(),
@@ -135,7 +137,11 @@ pub(crate) struct TargetHeadWave<'w, 'a> {
     weights: &'w TargetHeadWeights<'a>,
     head: &'w VocabularyHead<'a>,
     capacity: usize,
-    graph: Option<(*mut c_void, usize)>,
+    /// Captured head graphs by row count (index rows - 1), kept while serving:
+    /// verification widths vary round to round.
+    graphs: Vec<Option<*mut c_void>>,
+    /// Scratch of the FP8 head copy when the target head projects through it.
+    fp8_scratch: Option<DeviceAllocation<'a>>,
     ready: Option<usize>,
     origin: Option<QueryBinding>,
     selected: Vec<usize>,
@@ -192,13 +198,9 @@ impl TargetHeadWave<'_, '_> {
                 1e-20,
                 self.stream.raw,
             )?;
-            self.projection.launch(
-                self.b(3),
-                self.head.weight()?,
-                self.b(4),
-                rows,
-                self.stream.raw,
-            )?;
+            crate::families::deepseek_v41::v41_tensors::project_vocabulary(self.stream.library, &self.projection,
+                self.head.weight()?, self.head.fp8().zip(self.fp8_scratch.as_ref()), self.b(3), self.b(4), rows,
+                self.stream.raw)?;
             Ok(())
         }
     }
@@ -216,7 +218,7 @@ impl TargetHeadWave<'_, '_> {
     /// Same initialized-input contract as execute; capture drains its warmup.
     pub unsafe fn capture(&mut self, rows: usize) -> Result<()> {
         self.invalidate();
-        ensure!(self.graph.is_none(), "target head graph already captured");
+        ensure!(self.graph(rows).is_none(), "target head graph already captured");
         unsafe {
             self.execute(rows)?;
         }
@@ -224,6 +226,8 @@ impl TargetHeadWave<'_, '_> {
     }
     unsafe fn capture_ready(&mut self, rows: usize) -> Result<()> {
         self.invalidate();
+        ensure!((1..=self.capacity).contains(&rows) && self.graph(rows).is_none(),
+            "target head graph for {rows} rows already captured or out of range");
         unsafe {
             self.stream
                 .library
@@ -233,7 +237,7 @@ impl TargetHeadWave<'_, '_> {
         let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
         match (launched, captured) {
             (Ok(()), Ok(graph)) => {
-                self.graph = Some((graph, rows));
+                self.graphs[rows - 1] = Some(graph);
                 Ok(())
             }
             (Err(e), Ok(graph)) => {
@@ -249,8 +253,7 @@ impl TargetHeadWave<'_, '_> {
     /// Same inputs as execute; live row count must match the captured graph.
     pub unsafe fn replay(&mut self, rows: usize) -> Result<TargetLogits<'_>> {
         self.validate(rows)?;
-        let (graph, count) = self.graph.context("target head graph missing")?;
-        ensure!(rows == count, "target head captured rows differ");
+        let graph = self.graph(rows).context("target head graph missing")?;
         let launched = unsafe {
             self.stream
                 .library
@@ -328,8 +331,7 @@ impl TargetHeadWave<'_, '_> {
         Ok(())
     }
     unsafe fn capture_block_head(&mut self, rows: usize) -> Result<()> {
-        if self.graph.as_ref().is_none_or(|(_, n)| *n != rows) {
-            self.clear_graph()?;
+        if self.graph(rows).is_none() {
             unsafe { self.capture(rows)?; }
         }
         Ok(())
@@ -340,7 +342,6 @@ impl TargetHeadWave<'_, '_> {
         let launched = unsafe { self.enqueue(rows) };
         let drained = self.stream.wait().await;
         launched.and(drained)?;
-        self.clear_graph()?;
         unsafe { self.capture_ready(rows) }
     }
     fn publish_block(&mut self, block: &BlockOutput<'_>, selected: &[usize]) {
@@ -364,11 +365,11 @@ impl TargetHeadWave<'_, '_> {
         -> Result<TargetLogits<'_>> {
         unsafe { self.copy_block(block, selected)?; }
         // Warmup and replay consume input copies on this same stream.
-        if self.graph.as_ref().is_none_or(|(_, n)| *n != selected.len()) {
+        if self.graph(selected.len()).is_none() {
             unsafe { self.prepare_head_cooperative(selected.len()).await?; }
         }
         self.invalidate();
-        let graph = self.graph.context("target head graph missing")?.0;
+        let graph = self.graph(selected.len()).context("target head graph missing")?;
         let launched = unsafe { self.stream.library.cuda_graph_launch(graph, self.stream.raw) };
         let drained = self.stream.wait().await;
         launched.and(drained)?;
@@ -380,12 +381,12 @@ impl TargetHeadWave<'_, '_> {
         selected: &[usize], cooperative: bool) -> Result<()> {
         unsafe { self.copy_block(block, selected)?; }
         let rows = selected.len();
-        if self.graph.as_ref().is_none_or(|(_, n)| *n != rows) {
+        if self.graph(rows).is_none() {
             if cooperative { unsafe { self.prepare_head_cooperative(rows).await?; } }
             else { self.synchronize()?; unsafe { self.capture_block_head(rows)?; } }
         }
         self.invalidate();
-        let graph = self.graph.context("target head graph missing")?.0;
+        let graph = self.graph(rows).context("target head graph missing")?;
         let logits = Self::slice(self.b(4), 0, rows * STRIDES[4])?;
         let indices = Self::slice(self.b(5), 0, rows * 4)?;
         let scores = Self::slice(self.b(6), 0, rows * 4)?;
@@ -435,12 +436,12 @@ impl TargetHeadWave<'_, '_> {
         );
         unsafe { self.copy_block(block, selected)?; }
         let rows = selected.len();
-        if self.graph.as_ref().is_none_or(|(_, n)| *n != rows) {
+        if self.graph(rows).is_none() {
             if cooperative { unsafe { self.prepare_head_cooperative(rows).await?; } }
             else { self.synchronize()?; unsafe { self.capture_block_head(rows)?; } }
         }
         self.invalidate();
-        let graph = self.graph.context("target head graph missing")?.0;
+        let graph = self.graph(rows).context("target head graph missing")?;
         let logits = Self::slice(self.b(4), 0, rows * STRIDES[4])?;
         let staged = self
             .sampling
@@ -506,10 +507,13 @@ impl TargetHeadWave<'_, '_> {
         // The head remains exclusively borrowed through transfer completion.
         unsafe { self.download.rows(logits, STRIDES[4], rows).await }
     }
+    fn graph(&self, rows: usize) -> Option<*mut c_void> {
+        rows.checked_sub(1).and_then(|i| self.graphs.get(i).copied().flatten())
+    }
     pub fn clear_graph(&mut self) -> Result<()> {
         self.invalidate();
         self.stream.require_complete()?;
-        if let Some((graph, _)) = self.graph.take() {
+        for graph in self.graphs.iter_mut().filter_map(Option::take) {
             unsafe {
                 self.stream.library.cuda_graph_exec_destroy(graph)?;
             }

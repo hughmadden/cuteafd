@@ -33,9 +33,11 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         ensure!(weights.tensor("mtp.2.norm.weight")?.device_id == devices[1].id,
             "draft terminal weights must reside on rank 1");
         let head_bytes = DistributedVocabularyWave::device_bytes(capacity * weights.draft_width, shards[0].tokens().end)?;
+        let mut head = DistributedVocabularyWave::new(devices, shards, capacity * weights.draft_width, head_bytes)?;
+        head.use_fp8(crate::families::deepseek_v41::v41_tensors::Fp8Head::Draft)?;
         Ok(Self {
             terminal: devices[1].own(|| weights.terminal_storage(None, capacity, required[1] - head_bytes[1]))?,
-            head: DistributedVocabularyWave::new(devices, shards, capacity * weights.draft_width, head_bytes)?,
+            head,
             graphs: [[[None; 16]; 2]; 2], ready: None, pending: None,
         })
     }

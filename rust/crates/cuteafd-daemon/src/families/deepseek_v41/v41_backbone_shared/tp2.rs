@@ -64,7 +64,9 @@ impl<'a> Wave<'a> {
         }
         let local = &drain.ranks[destination];
         let remote = &drain.ranks[1-destination];
-        remote.stream.wait().await?;
+        if !crate::shared::memory::chain::deferred() {
+            remote.stream.wait().await?;
+        }
         self.ready[destination].record(&local.stream)?;
         let ready = &self.ready[destination];
         let output = &mut self.output[destination];
