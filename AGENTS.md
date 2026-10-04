@@ -123,8 +123,10 @@ after tables with conditions.
 - `./build.sh` (release pair, coordinator + Spark leg): set
   `CUTEAFD_RELEASE_BUILD_ROOT` and `CUTEAFD_RELEASE_REMOTE_BUILD_DIR` under
   `~/.cache/cuteafd/builds/`, and `CUTEAFD_RELEASE_SPARK_TP_ROLES=` for a
-  TP4-only pair. It reads the live checkout while assembling images: edit in
-  a git worktree until it finishes. Crates download from crates.io each build
+  TP4-only pair. Git worktrees are supported: the compiler gets a copy without Git metadata
+  after host-side submodule verification. Image assembly still reads the live
+  checkout: keep that checkout unchanged and edit in another worktree until
+  the build finishes. Crates download from crates.io each build
   and can crawl while the WAN is busy; it is slow, not stuck.
 - Iterate with `./wip.sh --slot S` then `./run.sh --wip S --restart`; A/B two
   checkouts with `scripts/bench/bench-ab.py`. `cuteafd plan MODEL` (any HF id or

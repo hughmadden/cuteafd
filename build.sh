@@ -67,7 +67,9 @@ EXL3 K4.25):
 Images are labelled with the checkout's Git revision (HEAD), even when the
 tree has local changes. Dirty checkouts still get an automatic source manifest
 under .cuteafd-release/ so local and remote inventories can be verified; keep
-source files unchanged during the build. CUTEAFD_RELEASE_SOURCE_MANIFEST can
+source files unchanged during the build, including when building from a Git
+worktree. The compiler receives a copy without Git metadata after host-side
+submodule verification; Docker image assembly still reads the live checkout. CUTEAFD_RELEASE_SOURCE_MANIFEST can
 supply an existing manifest. Source archives without .git must provide
 CUTEAFD_RELEASE_ENGINE_REVISION (a 40-hex Git revision).
 EOF
@@ -456,6 +458,14 @@ docker build \
 echo "== compiling coordinator release artifacts in GPU-enabled development container =="
 mkdir -p "$artifact_dir"
 release_prepare_build_root "" "$repo_root"
+# Git worktree submodule gitfiles refer outside /source. Verify them on the host
+# above, then give the compiler a clean copy whose tree locks remain authoritative.
+release_source_parent="${release_build_root:-$HOME/.cache/cuteafd/builds/release-source}"
+python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$release_source_parent"
+mkdir -p "$release_source_parent"
+release_source_dir="$(mktemp -d "$release_source_parent/coordinator-source.XXXXXXXX")"
+trap 'rm -rf "$release_source_dir"' EXIT
+"$repo_root/scripts/build/stage-release-source.sh" "$repo_root" "$release_source_dir"
 docker run --rm \
   --gpus device=0 \
   --ipc=host \
@@ -470,10 +480,12 @@ docker run --rm \
   -e "CUTEAFD_RELEASE_GLMF_AOT=${CUTEAFD_RELEASE_GLMF_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_QWEN4_AOT=${CUTEAFD_RELEASE_QWEN4_AOT:-OFF}" \
   ${release_build_root_args[@]+"${release_build_root_args[@]}"} \
-  -v "$repo_root:/source:ro" \
+  -v "$release_source_dir:/source:ro" \
   -v "$artifact_dir:/output" \
   "$COORDINATOR_DOCKER_DEV" \
   /source/scripts/build/build-release-artifacts.sh /source coordinator 120 /output
+rm -rf "$release_source_dir"
+trap - EXIT
 
 echo "== building coordinator inference image: $COORDINATOR_DOCKER_INFERENCE =="
 docker build \
