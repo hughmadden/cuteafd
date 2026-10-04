@@ -33,18 +33,18 @@ class NativeReleaseLauncherTest(unittest.TestCase):
         block = source.split('echo "== building Spark development and inference images natively on $seed_host =="', 1)[1]
         invocation, remote = block.split("<<'REMOTE'", 1)
         invocation = invocation.split('  local phase="$1"\n', 1)[1]
-        preamble = remote.split('cd "$remote_dir"', 1)[0]
+        preamble = remote.split('if [[ "$phase" == dev ]]', 1)[0].replace('cd "$remote_dir"', ':')
         # The optional source manifest and the optional V41 expert roles are
         # both carried behind non-empty sentinels. An empty earlier value must
         # not shift a later one, because OpenSSH joins argv into one command
         # string and does not preserve an empty argument.
-        for digest, roles, expected in (
-            ('', '', ['on', '', '']),
-            ('a' * 64, '', ['on', 'a' * 64, '']),
-            ('', 'tp2', ['on', '', 'tp2']),
-            ('a' * 64, 'tp2;tp3', ['on', 'a' * 64, 'tp2;tp3']),
+        for digest, roles, jobs, expected in (
+            ('', '', '', ['on', '', '', '']),
+            ('a' * 64, '', '1', ['on', 'a' * 64, '', '1']),
+            ('', 'tp2', '2', ['on', '', 'tp2', '2']),
+            ('a' * 64, 'tp2;tp3', '4', ['on', 'a' * 64, 'tp2;tp3', '4']),
         ):
-            with self.subTest(digest=digest, roles=roles):
+            with self.subTest(digest=digest, roles=roles, jobs=jobs):
                 harness = f'''set -euo pipefail
 # The timed SSH leg joins arguments just as OpenSSH does. Preserve the
 # empty-argument elision regression while testing the new export phase fields.
@@ -62,11 +62,13 @@ engine_commit=engine
 sparkinfer_commit=fork
 release_version=v5
 EXL3_PAIRED_TP4=on
+bf16_families=
 source_manifest_sha256={shlex.quote(digest)}
 spark_tp_roles={shlex.quote(roles)}
+native_build_jobs={shlex.quote(jobs)}
 '''
                 harness += invocation + "<<'REMOTE'" + preamble
-                harness += 'printf "%s\\n" "$exl3_paired_tp4" "$source_manifest_sha256" "$spark_tp_roles"\nREMOTE\n'
+                harness += 'printf "%s\\n" "$exl3_paired_tp4" "$source_manifest_sha256" "$spark_tp_roles" "$native_build_jobs"\nREMOTE\n'
                 result = subprocess.run(['bash', '-c', harness],
                                         cwd=ROOT, text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -123,6 +125,7 @@ engine_commit=engine
 sparkinfer_commit=fork
 release_version=v5
 EXL3_PAIRED_TP4=on
+bf16_families=
 source_manifest_sha256=
 spark_tp_roles=
 '''
