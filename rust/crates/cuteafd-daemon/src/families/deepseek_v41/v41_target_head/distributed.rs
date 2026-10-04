@@ -27,7 +27,7 @@ impl<'w, 'a> Rank<'w, 'a> {
         let workspace = DeviceAllocation::new(library, V41VocabularyProjection::WORKSPACE_BYTES)?;
         let projection = unsafe { library.v41_vocabulary_shard(workspace.buffer, weights.tokens().len())? };
         let input = DeviceAllocation::new(library, capacity * 10240)?;
-        ensure!(input.buffer.device_id == weights.weight().device_id, "vocabulary rank weight device differs");
+        ensure!(input.buffer.device_id == weights.device_id(), "vocabulary rank weight device differs");
         Ok(Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             projection, _workspace: workspace, input,
@@ -452,7 +452,7 @@ mod tests {
             let mut references = Vec::new();
             for source in [input.buffer, other_input.buffer] {
                 devices[1].run(|| unsafe {
-                    projection.launch(source, full.weight()?, full_logits.buffer, rows, full_stream.raw)
+                    projection.launch(source, full.weight().context("BF16 reference head required")?, full_logits.buffer, rows, full_stream.raw)
                 })?;
                 full_stream.drain()?;
                 let mut expected = vec![0u8; rows * 129280 * 4];

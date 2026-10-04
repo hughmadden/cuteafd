@@ -158,13 +158,12 @@ cache layout works.
    plus `./run.sh --wip S --restart` is the faster loop while iterating.
 
 V4.1 uses one shared BF16 vocabulary head for the target and dSpark by
-default. In WIP builds, `CUTEAFD_V41_FP8_HEAD=draft` adds an FP8 copy for
-the draft head while retaining BF16 for the target: this opt-in uses dual
-residency and does not meet the single-residency rule. `all` also projects
-the target through FP8 and changes its logits; it currently retains both
-representations too. `all` failed the golden top-1 gate and remains
-experimental. Neither mode is the default. `off` explicitly selects the
-shared BF16 head.
+default. `CUTEAFD_V41_FP8_HEAD=all` packs one E4M3 head (or one shard per
+GPU), shares it across target and draft projections, and releases BF16 once
+packing completes. `off` selects BF16. The experimental `draft` mode adds
+FP8 for dSpark while retaining BF16 for the target, using dual residency.
+The accepted target-head quality result permits `all` promotion only after
+its performance and parity gates pass.
 
 ## Working on it
 

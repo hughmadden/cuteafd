@@ -33,6 +33,11 @@ change is checked against its parity numbers before merging.
   4 Sparks. V4.1 keeps the coordinator layer-range split by default — the
   measured head-split hop cost on this fabric does not clear the bar its
   attention weights would need to win (see `PLAN.md` Phase 6).
+- Vocabulary head: shared BF16 by default. `CUTEAFD_V41_FP8_HEAD=all`
+  retains one E4M3 weight plus FP32 scales per row and 128-wide K block,
+  shared by target and dSpark; dual RTX partitions this weight by vocabulary
+  rows. BF16 is released after packing drains. `off` keeps BF16; `draft`
+  retains both formats and remains experimental.
 - Optional vision tower (MoonViT-style) when the checkpoint carries
   `vision_config`.
 

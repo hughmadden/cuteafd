@@ -3,7 +3,8 @@ use super::*;
 use std::ops::Range;
 
 pub(crate) struct VocabularyShard<'a> {
-    allocation: DeviceAllocation<'a>,
+    allocation: Option<DeviceAllocation<'a>>,
+    device_id: i32,
     tokens: Range<usize>,
     fp8: Option<crate::shared::fp8_linear::Fp8Weight<'a>>,
 }
@@ -14,9 +15,18 @@ impl<'a> VocabularyShard<'a> {
     pub fn device_bytes(catalog: &OfficialV41Catalog, tokens: Range<usize>) -> Result<usize> {
         ensure!(tokens.start < tokens.end && tokens.end <= Self::VOCAB,
             "invalid vocabulary shard token range");
-        ensure!(VocabularyHead::plan(catalog)? == Self::VOCAB * Self::ROW_BYTES,
+        ensure!(NativeRtxTensors::plan(catalog, &["head.weight".into()])? == Self::VOCAB * Self::ROW_BYTES,
             "unexpected vocabulary checkpoint geometry");
         Ok(tokens.len() * Self::ROW_BYTES)
+    }
+
+    /// Peak GPU allocation while packing. Final residency is smaller in `all`.
+    pub fn load_bytes(catalog: &OfficialV41Catalog, tokens: Range<usize>) -> Result<usize> {
+        let source = Self::device_bytes(catalog, tokens)?;
+        Ok(Self::peak_bytes(source, super::fp8_head()))
+    }
+    fn peak_bytes(source: usize, mode: super::Fp8Head) -> usize {
+        source + if mode == super::Fp8Head::Off { 0 } else { source / 2 + source / 64 }
     }
 
     /// The caller scopes construction/destruction to the owning GPU. Admission
@@ -24,7 +34,7 @@ impl<'a> VocabularyShard<'a> {
     pub fn load(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         tokens: Range<usize>, budget: usize, staging_bytes: usize) -> Result<Self> {
         let bytes = Self::device_bytes(catalog, tokens.clone())?;
-        ensure!(bytes <= budget, "vocabulary shard exceeds device budget");
+        ensure!(Self::load_bytes(catalog, tokens.clone())? <= budget, "vocabulary shard peak load exceeds device budget");
         ensure!((1..=64 * 1024 * 1024).contains(&staging_bytes),
             "vocabulary pinned staging must be 1 byte through 64 MiB");
         let reader = catalog.coordinator_tensor_reader("head.weight")?;
@@ -37,17 +47,26 @@ impl<'a> VocabularyShard<'a> {
             let source = &mut staging.bytes_mut()[..count];
             reader.read_into((source_start + offset) as u64, source)?;
             let destination = CuteafdDeviceBuffer {
+                // SAFETY: offset/count stay inside the admitted source allocation.
                 ptr: unsafe { allocation.buffer.ptr.cast::<u8>().add(offset).cast() },
                 bytes: count, ..allocation.buffer
             };
             library.copy_h2d(destination, source)?;
             offset += count;
         }
-        let fp8 = (super::fp8_head() != super::Fp8Head::Off)
-            .then(|| super::pack_fp8(library, allocation.buffer, tokens.len())).transpose()?;
-        Ok(Self { allocation, tokens, fp8 })
+        let device_id = allocation.buffer.device_id;
+        let (allocation, fp8) = if super::fp8_head() == super::Fp8Head::Off {
+            (Some(allocation), None)
+        } else {
+            let (source, packed) = super::pack_fp8(library, allocation, tokens.len())?;
+            (source, Some(packed))
+        };
+        tracing::info!(device_id, rows = tokens.len(), bf16_bytes = allocation.as_ref().map_or(0, |a| a.buffer.bytes),
+            fp8_bytes = fp8.as_ref().map_or(0, |w| w.bytes()), "V4.1 vocabulary residency");
+        Ok(Self { allocation, device_id, tokens, fp8 })
     }
-    pub fn weight(&self) -> CuteafdDeviceBuffer { self.allocation.buffer }
+    pub fn weight(&self) -> Option<CuteafdDeviceBuffer> { self.allocation.as_ref().map(|a| a.buffer) }
+    pub fn device_id(&self) -> i32 { self.device_id }
     /// The FP8 copy (`CUTEAFD_V41_FP8_HEAD`), when one was packed.
     pub fn fp8(&self) -> Option<&crate::shared::fp8_linear::Fp8Weight<'a>> { self.fp8.as_ref() }
     pub fn tokens(&self) -> Range<usize> { self.tokens.clone() }
@@ -57,6 +76,15 @@ impl<'a> VocabularyShard<'a> {
 mod tests {
     use super::*;
     use crate::shared::memory::device::Device;
+
+    #[test]
+    fn vocabulary_pack_admits_source_and_destinations() {
+        let source = 129280 * 10240;
+        assert_eq!(VocabularyShard::peak_bytes(source, Fp8Head::Off), source);
+        for mode in [Fp8Head::Draft, Fp8Head::All] {
+            assert_eq!(VocabularyShard::peak_bytes(source, mode), source + 129280 * (5120 + 160));
+        }
+    }
 
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and two CUDA GPUs"]
@@ -75,14 +103,14 @@ mod tests {
             assert!(device.run(|| VocabularyShard::load(&lib, &catalog, tokens.clone(), bytes - 1, 7 << 20)).is_err());
             let shard = device.own(|| VocabularyShard::load(&lib, &catalog, tokens.clone(), bytes, 7 << 20))?;
             assert_eq!(shard.tokens(), tokens);
-            assert_eq!(shard.weight().bytes, bytes);
+            assert_eq!(shard.weight().context("test requires BF16 head")?.bytes, bytes);
             let mut expected = vec![0u8; 7 << 20];
             let mut actual = vec![0u8; expected.len()];
             for offset in (0..bytes).step_by(expected.len()) {
                 let count = expected.len().min(bytes - offset);
                 reader.read_into((tokens.start * VocabularyShard::ROW_BYTES + offset) as u64,
                     &mut expected[..count])?;
-                let buffer = shard.weight();
+                let buffer = shard.weight().context("test requires BF16 head")?;
                 let source = CuteafdDeviceBuffer {
                     ptr: unsafe { buffer.ptr.cast::<u8>().add(offset).cast() }, bytes: count, ..buffer
                 };
