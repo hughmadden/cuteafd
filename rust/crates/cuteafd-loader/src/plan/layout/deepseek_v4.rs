@@ -15,9 +15,9 @@ pub(super) fn resident_weights(checkpoint: &Checkpoint, ranks: usize) -> Option<
         if role.component == Component::Other { continue; }
         let mut bytes = tensor.meta.byte_length;
         let block_scale = name.ends_with(".scale") && !name.contains("main_proj");
-        let format = if block_scale { bytes *= 512; "fp8-mma-scale" }
-            else if name.ends_with("tid2eid") { bytes /= 2; "i32" }
-            else { "native" };
+        let format = if block_scale { bytes *= 512; "fp8-mma-scale".into() }
+            else if name.ends_with("tid2eid") { bytes /= 2; "i32".into() }
+            else { format!("{:?}", tensor.meta.dtype).to_ascii_lowercase() };
         let shared = name.starts_with("layers.") && !name.contains("ffn.gate.");
         let sharded = shared && ["attn.wq_b.", "attn.attn_sink", "attn.wo_a.", "attn.wo_b.",
             "ffn.shared_experts.w1.", "ffn.shared_experts.w2.", "ffn.shared_experts.w3."]

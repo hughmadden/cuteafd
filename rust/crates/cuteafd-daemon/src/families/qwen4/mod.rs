@@ -330,20 +330,25 @@ impl Opened {
                 layer, args.table_placement, &args.table, args.prefill_rows.max(engine::DECODE_ROWS))?),
             _ => None,
         };
-        // Establish expert residency and transport first in automatic mode so
-        // the pool cannot consume memory that those owners will need later.
+        // Establish expert ownership before admission. EXL3 keeps its existing
+        // lazy first-use load; reserve the exact loader plan before sizing KV.
+        let mut future_expert_bytes = 0;
         let admitted_experts = if args.pool_tokens == 0 {
             let experts = self.experts(args, layers)?;
             if let Some(engine::Experts::LocalExl3(local)) = &experts {
-                local.ensure(0, stream)?;
                 let expected = local.window.min(layers);
-                ensure!(local.resident.borrow().as_ref().is_some_and(|(_, r)| r.layers() == expected),
+                let plan = crate::families::deepseek_v4::local::plan(&self.library, &local.native_lib,
+                    local.catalog, usize::from(local.mtp), expected, local.max_rows, local.budget)?;
+                ensure!(plan.layers == expected,
                     "Qwen automatic KV admission requires the complete requested EXL3 expert window to fit");
+                future_expert_bytes = u64::try_from(plan.peak_bytes)?;
+                tracing::info!(layers=plan.layers, peak_bytes=plan.peak_bytes,
+                    "Qwen planner reserved the lazy EXL3 expert window");
             }
             Some(experts)
         } else { None };
         let pool_tokens = if args.pool_tokens == 0 {
-            admission::pool_tokens(&self.library, args, &self.cfg, layers, model.mtp.is_some())?
+            admission::pool_tokens(&self.library, args, &self.cfg, layers, model.mtp.is_some(), future_expert_bytes)?
         } else { args.pool_tokens };
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::Qwen4Engine::new(&self.library, &programs, self.cfg.clone(), model, ple, stream,

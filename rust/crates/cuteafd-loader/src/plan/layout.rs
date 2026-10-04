@@ -226,11 +226,19 @@ fn share_of(family: &str, component: Component) -> Share {
 pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &super::Checkpoint,
     options: &LayoutOptions) -> MemoryLayout {
     let family = report.family.as_deref().unwrap_or("unknown");
-    let native_layers = options.native_mtp_layers.min(match model.spec().speculator.as_ref() {
+    let discovered_native_layers = match model.spec().speculator.as_ref() {
         Some(super::spec::SpeculatorSpec::Dspark { stages, .. }) => *stages,
         Some(super::spec::SpeculatorSpec::NativeMtp { layers }) => *layers,
         None => 0,
-    });
+    };
+    let native_layers = if family == "qwen4" && report.placement != ExpertPlacement::Local {
+        0 // Spark ranks do not serve Qwen's MTP experts.
+    } else if family == "deepseek_v4" && options.native_mtp_layers > 0 {
+        discovered_native_layers
+    } else { options.native_mtp_layers.min(discovered_native_layers) };
+    // V4 always loads all checkpoint stages and their caches; --dspark only
+    // changes expert residency and whether the scheduler drafts with them.
+    let cache_native_layers = if family == "deepseek_v4" { discovered_native_layers } else { native_layers };
     let workspace_manifest = options.workspace_manifest.as_deref().or_else(|| {
         let path = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
         path.is_file().then_some(path)
@@ -344,12 +352,21 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
             devices[0].items.push(Item::new(Category::Experts, "native MTP experts", "native", native_experts, Basis::Exact));
         }
     }
+    let exl3_workspace = expert_workspace(report, model, options.workspace_manifest.as_deref(), prefill_rows);
+    if exl3_workspace.is_none() && report.experts.as_ref().is_some_and(|e| e.package.contains("exl3"))
+        && (family == "deepseek_v4" || (family == "qwen4" && report.placement == ExpertPlacement::Local)) {
+        notes.push("Local EXL3 workspace allowance is estimated without matching rtx-tp1/m*/v41_exl3.json capacity manifests; images bundle them, or export the exl3 tree alongside PROGRAMS.json".into());
+    }
+    if family == "qwen4" && report.placement != ExpertPlacement::Local && options.native_mtp_layers > 0 {
+        notes.push("Qwen Spark layouts omit native MTP: Spark ranks do not serve its draft expert layer".into());
+    }
     if family == "qwen4" && report.placement == ExpertPlacement::Local
         && report.experts.as_ref().is_some_and(|e| e.package.contains("exl3")) {
         // The EXL3 window retains its shared capacity arenas in addition to
         // checkpoint trellis bytes (1.15 GiB in the reference allocation ledger).
         devices[0].items.push(Item::new(Category::Experts, "local EXL3 workspace", "",
-            gib(115) * prefill_rows / 4096, allowance_basis));
+            exl3_workspace.unwrap_or(gib(115) * prefill_rows / 4096),
+            if exl3_workspace.is_some() { Basis::Formula } else { allowance_basis }));
     }
     // The drafter lives on the lead GPU (taps and head are there under a head split).
     let drafter = if options.drafter_bytes > 0 { options.drafter_bytes } else { costs.drafter_bytes };
@@ -360,7 +377,7 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
     let v4_workspace = if family == "deepseek_v4" {
         (|| {
             let manifest = workspace_manifest.as_ref()?;
-            let cfg = crate::families::deepseek_v4::DeepseekV4Config::read(&checkpoint.snapshot, options.native_mtp_layers).ok()?;
+            let cfg = crate::families::deepseek_v4::DeepseekV4Config::read(&checkpoint.snapshot, cache_native_layers).ok()?;
             let id = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
             let scratch = crate::serving_capacity::deepseek_v4_workspace_scratch(manifest, id, prefill_rows, 64).ok()?;
             crate::serving_capacity::deepseek_v4_workspace_geometry(&cfg, prefill_rows, 64,
@@ -421,7 +438,7 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
     }
     if family == "deepseek_v4" && options.local_expert_layers.is_none() && layer_bytes > 0 {
         if let Ok(Some(cache)) = model.cache_geometry(CacheOptions { coordinator_ranks: active_gpus,
-            native_mtp_layers: native_layers, prefill_rows: prefill_rows, ..Default::default() }) {
+            native_mtp_layers: cache_native_layers, prefill_rows: prefill_rows, ..Default::default() }) {
             let mark_bytes: u64 = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum();
             let slots = options.prefix_slots.unwrap_or(42.min(2 * GIB / mark_bytes.max(1)).max(2 * concurrency + 2));
             let state = cache.ranks[0].active_state_per_sequence_bytes * options.state_slots.unwrap_or(concurrency)
@@ -430,7 +447,8 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
             let workspaces: u64 = devices[0].items.iter().filter(|i| i.group == "steps").map(|i| i.bytes).sum();
             let already = devices[0].used_bytes().saturating_sub(workspaces + costs.graph_bytes[role]);
             let legacy = cache.ranks[0].persistent_unit_bytes * 262144u64.div_ceil(cache.logical_unit_rows);
-            let reserve = state + legacy + slots * mark_bytes + 10 * GIB + 160 * MIB;
+            let expert_workspace = exl3_workspace.unwrap_or(160 * MIB * prefill_rows / 4096);
+            let reserve = state + legacy + slots * mark_bytes + 10 * GIB + expert_workspace;
             local_layers = (options.rtx_bytes[0].saturating_sub(already + reserve) / layer_bytes)
                 .min(model.spec().layers.len() as u64) as usize;
         }
@@ -447,12 +465,14 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
     }
 
     if family == "deepseek_v4" && local_bytes + draft_experts > 0 {
-        devices[0].items.push(Item::new(Category::Experts, "local expert workspace", "", 160 * MIB * prefill_rows / 4096, Basis::Estimated));
+        devices[0].items.push(Item::new(Category::Experts, "local expert workspace", "",
+            exl3_workspace.unwrap_or(160 * MIB * prefill_rows / 4096),
+            if exl3_workspace.is_some() { Basis::Formula } else { Basis::Estimated }));
     }
 
     // KV pool: per-device bytes per logical token from the family geometry.
     let geometry = model.cache_geometry(CacheOptions { coordinator_ranks: active_gpus,
-        native_mtp_layers: if family == "deepseek_v4" || family == "qwen4" { native_layers } else { 0 },
+        native_mtp_layers: if family == "deepseek_v4" || family == "qwen4" { cache_native_layers } else { 0 },
         prefill_rows: prefill_rows, ..Default::default() });
     let mut pool_tokens = 0;
     match geometry {
@@ -574,6 +594,38 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
         }
     }
     MemoryLayout { devices, pool_tokens, waste, notes }
+}
+
+/// Local EXL3 arenas from the same capacity manifests used by the loader.
+/// An exported PROGRAMS.json can have its expert JSON tree alongside it;
+/// in an image the standard tree lives in ../lib/exl3 instead.
+fn expert_workspace(report: &PlanReport, model: &dyn super::FamilyModel,
+    manifest: Option<&std::path::Path>, rows: u64) -> Option<u64> {
+    let tiers = report.experts.as_ref()?.package.rsplit(':').next()?.strip_prefix("exl3-k")?;
+    let family = match report.family.as_deref()? {
+        "qwen4" => "qwen4",
+        "deepseek_v4" if model.spec().hidden == 4096 => "dsv4f",
+        "deepseek_v4" => "dsv4p",
+        _ => return None,
+    };
+    let parent = manifest.unwrap_or(std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json")).parent()?;
+    let stem = format!("exl3-{family}-k{tiers}");
+    let root = [parent.join("exl3").join(&stem), parent.join("../lib/exl3").join(&stem)]
+        .into_iter().find(|p| p.join("rtx-tp1/m4096/v41_exl3.json").is_file())?;
+    let maximum = if family.starts_with("dsv4") { rows.max(64) } else { rows.max(1) };
+    const CAPACITIES: [u64; 6] = [1, 16, 80, 256, 1024, 4096];
+    if maximum > 4096 { return None; }
+    let manifests = CAPACITIES.into_iter().filter(|&n| n <= maximum)
+        .chain(CAPACITIES.into_iter().find(|&n| n >= maximum))
+        .map(|capacity| serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(root.join(format!("rtx-tp1/m{capacity}/v41_exl3.json"))).ok()?).ok())
+        .collect::<Option<Vec<_>>>()?;
+    let moe = model.spec().moe.as_ref()?;
+    if manifests.iter().any(|m| m["hidden"].as_u64() != Some(model.spec().hidden as u64)
+        || m["intermediate"].as_u64() != Some(moe.intermediate as u64)
+        || m["experts"].as_u64() != Some(moe.experts as u64)) { return None; }
+    crate::serving_capacity::exl3_workspace_bytes(&manifests, true).ok()?
+        .checked_add(maximum * model.spec().hidden as u64 * 2)
 }
 
 /// A component the family loader converts at load: bytes saved against the

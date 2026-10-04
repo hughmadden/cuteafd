@@ -1,4 +1,4 @@
-//! Qwen automatic KV admission after weights, PLE and experts are resident.
+//! Qwen automatic KV admission after weights/PLE and exact expert ownership are established.
 use super::EngineArgs;
 use anyhow::Result;
 use cuteafd_ffi::NativeLibrary;
@@ -6,13 +6,13 @@ use cuteafd_loader::families::qwen4::Qwen4Config;
 use cuteafd_loader::serving_capacity::qwen_cache_geometry;
 
 pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, cfg: &Qwen4Config,
-    layers: usize, mtp: bool) -> Result<usize> {
+    layers: usize, mtp: bool, future_expert_bytes: u64) -> Result<usize> {
     let geometry = qwen_cache_geometry(cfg, layers, mtp)?;
     let rank = &geometry.ranks[0];
     let costs = cuteafd_loader::plan::layout::family_costs("qwen4");
     let unit = geometry.logical_unit_rows;
     let marks = args.planner_prefix_bytes.unwrap_or(rank.retained_mark_bytes * costs.mark_slots);
-    let reserve = costs.workspace_bytes[0] * args.prefill_rows.max(1) as u64 / 4096
+    let reserve = future_expert_bytes + costs.workspace_bytes[0] * args.prefill_rows.max(1) as u64 / 4096
         + costs.graph_bytes[0]
         + rank.active_state_per_sequence_bytes * args.slots as u64
         + rank.fixed_state_bytes + rank.speculative_replay_bytes + marks

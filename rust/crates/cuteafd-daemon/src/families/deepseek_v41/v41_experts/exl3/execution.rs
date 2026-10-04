@@ -167,17 +167,13 @@ impl<'a> Exl3Workspace<'a> {
     }
     /// Total allocation payload for all specializations sharing one lane arena.
     pub(crate) fn plan(directories: &[PathBuf], format: Exl3InputFormat) -> Result<usize> {
-        let mut bytes = Self::layout(directories)?.values().try_fold(0usize, |n, spec|
-            n.checked_add(spec.0).context("EXL3 shared workspace overflow"))?;
-        for directory in directories {
-            let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
-            let shared = meta.buffers.iter().filter(|(name, spec)| **name == spec.allocation && !spec.zero_on_create)
-                .map(|(_, spec)| spec.bytes.max(16)).sum::<usize>();
-            bytes = bytes.checked_add(meta.workspace_bytes(format)? - shared)
-                .context("EXL3 shared workspace overflow")?;
-        }
-        Ok(bytes)
+        let manifests = directories.iter().map(|directory| -> Result<serde_json::Value> {
+            Ok(serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?)
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(usize::try_from(cuteafd_loader::serving_capacity::exl3_workspace_bytes(&manifests,
+            format == Exl3InputFormat::Fp8K32)?)?)
     }
+
     pub(crate) fn new(library: &'a NativeLibrary, directories: &[PathBuf]) -> Result<Rc<Self>> {
         let mut allocations = BTreeMap::new();
         let mut dtypes = BTreeMap::new();
