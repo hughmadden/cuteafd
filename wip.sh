@@ -152,7 +152,7 @@ snapshot_args=(
   --exclude .pytest_cache/ --exclude .ruff_cache/ --exclude __pycache__/
   --exclude '*.pyc' --exclude '*.pyo' --exclude .cuteafd-cache/
   --exclude .cuteafd-release/ --exclude .cuteafd-release-image/
-  --exclude .cuteafd-wip/ --exclude dist/ --exclude rust/target/
+  --exclude .cuteafd-wip --exclude dist/ --exclude rust/target/
   --exclude 'native/build*/'
   --filter 'P .cuteafd-source-revision'
 )
@@ -526,18 +526,26 @@ fi
 CONTAINER
 fi
 
+# wip-slot-readiness:start
+# A fresh role-only build succeeds with its own artifacts. Clones still require
+# the retained counterpart, and a both-role build must prove the complete pair.
+if [[ "$role" != expert || -n "$from_slot" ]]; then
 docker exec -i "$coordinator_container" bash -s -- "$slot" <<'CONTAINER'
 set -euo pipefail
 slot="$1"
 test -s "/wip/slots/$slot/coordinator/FINGERPRINT"
 test -s "/wip/slots/$slot/coordinator/workspace/cuteafd.config"
 CONTAINER
+fi
+if [[ "$role" != coordinator || -n "$from_slot" ]]; then
 ssh -o BatchMode=yes "$seed_host" docker exec -i "$spark_container" bash -s -- "$slot" <<'CONTAINER'
 set -euo pipefail
 slot="$1"
 test -s "/wip/slots/$slot/spark-expert/FINGERPRINT"
 test -s "/wip/slots/$slot/spark-expert/workspace/cuteafd.config"
 CONTAINER
+fi
+# wip-slot-readiness:end
 
 distribute_expert_slot() {
   ssh -o BatchMode=yes "$seed_host" \
@@ -572,4 +580,8 @@ distribute_expert_slot() {
 }
 
 distribute_expert_slot
-echo "WIP slot '$slot' is ready. Launch it with: ./run.sh --wip '$slot' --restart"
+if [[ "$role" == both || -n "$from_slot" ]]; then
+  echo "WIP slot '$slot' is ready. Launch it with: ./run.sh --wip '$slot' --restart"
+else
+  echo "WIP slot '$slot': $role artifacts built. Build the other role before launching a new slot."
+fi

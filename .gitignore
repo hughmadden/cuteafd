@@ -45,7 +45,7 @@ reports/phase0_artifacts/smoke/
 # commit their manifests and hashes, not raw activation rows.
 reports/quantization/router-replay-inputs/*.bf16
 reports/quantization/router-replay-inputs/*.bin
-.cuteafd-wip/
+.cuteafd-wip
 run-agent.sh
 native/build-nvfp4-share/
 runs/

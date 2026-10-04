@@ -15,6 +15,6 @@ rsync -a --delete --delete-excluded \
   --exclude .pytest_cache/ --exclude .ruff_cache/ --exclude __pycache__/ \
   --exclude '*.pyc' --exclude '*.pyo' --exclude .cuteafd-cache/ \
   --exclude .cuteafd-release/ --exclude .cuteafd-release-image/ \
-  --exclude .cuteafd-wip/ --exclude dist/ --exclude rust/target/ \
+  --exclude .cuteafd-wip --exclude dist/ --exclude rust/target/ \
   --exclude 'native/build*/' \
   "$source_dir/" "$staging_dir/"
