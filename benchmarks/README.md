@@ -17,6 +17,7 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## DeepSeek V4.1
 
+- 2026-10-04 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash · 2× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v1.0.0-rc2 · [report](deepseek_v41/2026-10-05-smoke-deepseek-v4-1-flash-2rtx-4spark-rc2/report.svg)
 - 2026-10-04 · Release smoke · nvidia/DeepSeek-V4.1-Flash-NVFP4 · 2× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v1.0.0-rc1 · [report](deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-nvfp4-2rtx-4spark-v41-flash-nvfp4-max/report.svg)
 - 2026-10-04 · Release smoke · nvidia/DeepSeek-V4.1-Flash-NVFP4 · 1× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v1.0.0-rc1 · [report](deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-nvfp4-1rtx-4spark-v41-flash-nvfp4-min/report.svg)
 - 2026-10-04 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash · 2× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v1.0.0-rc1 · [report](deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-2rtx-4spark-v41-flash-max/report.svg)
@@ -37,6 +38,7 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## GLM 5.3 Flash
 
+- 2026-10-04 · Release smoke · nvidia/GLM-5.3-Flash-NVFP4 · 2× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v1.0.0-rc2 · [report](glm5_flash/2026-10-05-smoke-glm-5-3-flash-nvfp4-2rtx-4spark-rc2/report.svg)
 - 2026-10-04 · Release smoke · nvidia/GLM-5.3-Flash-NVFP4 · 2× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v1.0.0-rc1 · [report](glm5_flash/2026-10-04-smoke-glm-5-3-flash-nvfp4-2rtx-4spark-glm53f-nvfp4-max/report.svg)
 - 2026-10-04 · Release smoke · nvidia/GLM-5.3-Flash-NVFP4 · 1× RTX PRO 6000 @ 325 W + 2× DGX Spark · build v1.0.0-rc1 · [report](glm5_flash/2026-10-04-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-min/report.svg)
 - 2026-10-04 · Release smoke · brandonmusic/GLM-5.3-Flash-tr3-4bpw · 2× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v1.0.0-rc1 · [report](glm5_flash/2026-10-04-smoke-glm-5-3-flash-tr3-4bpw-2rtx-4spark-glm53f-tr3-max/report.svg)
@@ -68,6 +70,8 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## Qwen 3.8
 
+- 2026-10-04 · Release smoke · nvidia/Qwen3.8-Flash-Next-NVFP4 · 1× RTX PRO 6000 @ 325 W · build v1.0.0-rc2 · [report](qwen4/2026-10-05-smoke-qwen3-8-flash-next-nvfp4-1rtx-rc2/report.svg)
+- 2026-10-04 · Release smoke · wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 · 1× RTX PRO 6000 @ 325 W · build v1.0.0-rc2 · [report](qwen4/2026-10-05-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-rc2/report.svg)
 - 2026-10-04 · Release smoke · nvidia/Qwen3.8-Flash-Next-NVFP4 · 1× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v1.0.0-rc1 · [report](qwen4/2026-10-04-smoke-qwen3-8-flash-next-nvfp4-1rtx-4spark-qwen38-nvfp4-max/report.svg)
 - 2026-10-04 · Release smoke · wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 · 1× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v1.0.0-rc1 · [report](qwen4/2026-10-04-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-4spark-qwen38-exl3-max/report.svg)
 - 2026-10-04 · Release smoke · wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 · 1× RTX PRO 6000 @ 325 W · build v1.0.0-rc1 · [report](qwen4/2026-10-04-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-qwen38-exl3-min/report.svg)

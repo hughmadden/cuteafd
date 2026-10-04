@@ -31,10 +31,10 @@ Basic benchmark profile per family on its natural-minimum (1× RTX + fewest
 Sparks) and maximum (2× RTX + 4 or 6 Sparks) hardware. Other reports:
 [`benchmarks/`](benchmarks/README.md).
 
-RC1 preparation: 27/28 required smoke cards pass. The Qwen NVFP4 local
-MTP3 minimum failed launch and has no card; its displayed Spark card is the
-available maximum layout. The grid contains RC1 exports only. See
-[qualification and release blockers](PLAN.md#v1-candidate-qualification-rc1-2026-10-04-utc)
+RC2 preparation: all 28 required smoke cards pass, including Qwen NVFP4
+with resident local MTP3 on one RTX. The grid contains four refreshed RC2
+cards and 24 retained RC1 cards. MXFP4 32-row tails remain a release blocker. See
+[qualification and release blockers](PLAN.md#v1-regression-follow-up-rc2-2026-10-05)
 and [changes since v0](PLAN.md#v1-candidate-changelog-preparation-2026-10-04).
 
 <!-- results:begin -->
@@ -43,7 +43,7 @@ and [changes since v0](PLAN.md#v1-candidate-changelog-preparation-2026-10-04).
 <tr>
 <td width="20%" valign="top"><a href="docs/models/deepseek_v41.md"><b>DeepSeek V4.1</b></a><br><sub>deepseek-ai/DeepSeek-V4.1-Flash</sub><br><sub>mxfp4-g32</sub></td>
 <td width="40%" valign="top"><a href="benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-1rtx-4spark-v41-flash-min/card.svg"><img src="benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-1rtx-4spark-v41-flash-min/card.svg" alt="deepseek-ai/DeepSeek-V4.1-Flash on 1× RTX PRO 6000 @ 325 W + 4× DGX Spark"></a><br><sub>1× RTX + 4× Spark</sub></td>
-<td width="40%" valign="top"><a href="benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-2rtx-4spark-v41-flash-max/card.svg"><img src="benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-2rtx-4spark-v41-flash-max/card.svg" alt="deepseek-ai/DeepSeek-V4.1-Flash on 2× RTX PRO 6000 @ 325 W + 4× DGX Spark"></a><br><sub>2× RTX + 4× Spark</sub></td>
+<td width="40%" valign="top"><a href="benchmarks/deepseek_v41/2026-10-05-smoke-deepseek-v4-1-flash-2rtx-4spark-rc2/card.svg"><img src="benchmarks/deepseek_v41/2026-10-05-smoke-deepseek-v4-1-flash-2rtx-4spark-rc2/card.svg" alt="deepseek-ai/DeepSeek-V4.1-Flash on 2× RTX PRO 6000 @ 325 W + 4× DGX Spark"></a><br><sub>2× RTX + 4× Spark</sub></td>
 </tr>
 <tr>
 <td width="20%" valign="top"><a href="docs/models/deepseek_v41.md"><b>DeepSeek V4.1</b></a><br><sub>nvidia/DeepSeek-V4.1-Flash-NVFP4</sub><br><sub>nvfp4-g16</sub></td>
@@ -83,7 +83,7 @@ and [changes since v0](PLAN.md#v1-candidate-changelog-preparation-2026-10-04).
 <tr>
 <td width="20%" valign="top"><a href="docs/models/glm5_flash.md"><b>GLM 5.3 Flash</b></a><br><sub>nvidia/GLM-5.3-Flash-NVFP4</sub><br><sub>nvfp4-g16</sub></td>
 <td width="40%" valign="top"><a href="benchmarks/glm5_flash/2026-10-04-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-min/card.svg"><img src="benchmarks/glm5_flash/2026-10-04-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-min/card.svg" alt="nvidia/GLM-5.3-Flash-NVFP4 on 1× RTX PRO 6000 @ 325 W + 2× DGX Spark"></a><br><sub>1× RTX + 2× Spark</sub></td>
-<td width="40%" valign="top"><a href="benchmarks/glm5_flash/2026-10-04-smoke-glm-5-3-flash-nvfp4-2rtx-4spark-glm53f-nvfp4-max/card.svg"><img src="benchmarks/glm5_flash/2026-10-04-smoke-glm-5-3-flash-nvfp4-2rtx-4spark-glm53f-nvfp4-max/card.svg" alt="nvidia/GLM-5.3-Flash-NVFP4 on 2× RTX PRO 6000 @ 325 W + 4× DGX Spark"></a><br><sub>2× RTX + 4× Spark</sub></td>
+<td width="40%" valign="top"><a href="benchmarks/glm5_flash/2026-10-05-smoke-glm-5-3-flash-nvfp4-2rtx-4spark-rc2/card.svg"><img src="benchmarks/glm5_flash/2026-10-05-smoke-glm-5-3-flash-nvfp4-2rtx-4spark-rc2/card.svg" alt="nvidia/GLM-5.3-Flash-NVFP4 on 2× RTX PRO 6000 @ 325 W + 4× DGX Spark"></a><br><sub>2× RTX + 4× Spark</sub></td>
 </tr>
 <tr>
 <td width="20%" valign="top"><a href="docs/models/glm5_flash.md"><b>GLM 5.3 Flash</b></a><br><sub>brandonmusic/GLM-5.3-Flash-tr3-4bpw</sub><br><sub>exl3-k4</sub></td>
@@ -102,20 +102,20 @@ and [changes since v0](PLAN.md#v1-candidate-changelog-preparation-2026-10-04).
 </tr>
 <tr>
 <td width="20%" valign="top"><a href="docs/models/qwen4.md"><b>Qwen 3.8</b></a><br><sub>wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1</sub><br><sub>exl3-k4+exl3-k5</sub></td>
-<td width="40%" valign="top"><a href="benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-qwen38-exl3-min/card.svg"><img src="benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-qwen38-exl3-min/card.svg" alt="wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 on 1× RTX PRO 6000 @ 325 W"></a><br><sub>1× RTX</sub></td>
+<td width="40%" valign="top"><a href="benchmarks/qwen4/2026-10-05-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-rc2/card.svg"><img src="benchmarks/qwen4/2026-10-05-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-rc2/card.svg" alt="wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 on 1× RTX PRO 6000 @ 325 W"></a><br><sub>1× RTX</sub></td>
 <td width="40%" valign="top"><a href="benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-4spark-qwen38-exl3-max/card.svg"><img src="benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-4spark-qwen38-exl3-max/card.svg" alt="wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 on 1× RTX PRO 6000 @ 325 W + 4× DGX Spark"></a><br><sub>1× RTX + 4× Spark</sub></td>
 </tr>
 <tr>
 <td width="20%" valign="top"><a href="docs/models/qwen4.md"><b>Qwen 3.8</b></a><br><sub>nvidia/Qwen3.8-Flash-Next-NVFP4</sub><br><sub>nvfp4-g16</sub></td>
+<td width="40%" valign="top"><a href="benchmarks/qwen4/2026-10-05-smoke-qwen3-8-flash-next-nvfp4-1rtx-rc2/card.svg"><img src="benchmarks/qwen4/2026-10-05-smoke-qwen3-8-flash-next-nvfp4-1rtx-rc2/card.svg" alt="nvidia/Qwen3.8-Flash-Next-NVFP4 on 1× RTX PRO 6000 @ 325 W"></a><br><sub>1× RTX</sub></td>
 <td width="40%" valign="top"><a href="benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-nvfp4-1rtx-4spark-qwen38-nvfp4-max/card.svg"><img src="benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-nvfp4-1rtx-4spark-qwen38-nvfp4-max/card.svg" alt="nvidia/Qwen3.8-Flash-Next-NVFP4 on 1× RTX PRO 6000 @ 325 W + 4× DGX Spark"></a><br><sub>1× RTX + 4× Spark</sub></td>
-<td width="40%" align="center">—</td>
 </tr>
 </table>
 
 | Family | Checkpoint | Hardware | KV / req | C1 code | prose | JSON | 8K prefill | TTFT | Quality | Report |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
 | [DeepSeek V4.1](docs/models/deepseek_v41.md) | DeepSeek-V4.1-Flash (mxfp4-g32) | 1× RTX + 4× Spark (min) | 18.8M tok / 16 req | 129 | 77.7 | 147 | 4,809 | 1.69 s | ✓ KL 0.017 · top-1 90.8% ✓ exact cache ✓ lossless spec | [2026-10-04 · v1.0.0-rc1](benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-1rtx-4spark-v41-flash-min/report.svg) |
-| [DeepSeek V4.1](docs/models/deepseek_v41.md) | DeepSeek-V4.1-Flash (mxfp4-g32) | 2× RTX + 4× Spark (max) | 14.7M tok / 16 req | 161 | 83.4 | 177 | 5,921 | 1.38 s | ✓ KL 0.018 · top-1 90.8% ✓ exact cache ✓ lossless spec | [2026-10-04 · v1.0.0-rc1](benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-2rtx-4spark-v41-flash-max/report.svg) |
+| [DeepSeek V4.1](docs/models/deepseek_v41.md) | DeepSeek-V4.1-Flash (mxfp4-g32) | 2× RTX + 4× Spark (max) | 14.7M tok / 16 req | 169 | 89.0 | 184 | 7,411 | 1.09 s | ✓ KL 0.018 · top-1 90.8% ✓ exact cache | [2026-10-04 · v1.0.0-rc2](benchmarks/deepseek_v41/2026-10-05-smoke-deepseek-v4-1-flash-2rtx-4spark-rc2/report.svg) |
 | [DeepSeek V4.1](docs/models/deepseek_v41.md) | DeepSeek-V4.1-Flash-NVFP4 (nvfp4-g16) | 1× RTX + 4× Spark (min) | 18.8M tok / 16 req | 113 | 69.2 | 128 | 4,308 | 1.89 s | ✓ KL 0.034 · top-1 88.3% ✓ exact cache | [2026-10-04 · v1.0.0-rc1](benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-nvfp4-1rtx-4spark-v41-flash-nvfp4-min/report.svg) |
 | [DeepSeek V4.1](docs/models/deepseek_v41.md) | DeepSeek-V4.1-Flash-NVFP4 (nvfp4-g16) | 2× RTX + 4× Spark (max) | 14.7M tok / 16 req | 117 | 72.4 | 147 | 5,368 | 1.51 s | ✓ KL 0.037 · top-1 87.5% ✓ exact cache | [2026-10-04 · v1.0.0-rc1](benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-nvfp4-2rtx-4spark-v41-flash-nvfp4-max/report.svg) |
 | [DeepSeek V4](docs/models/deepseek_v4.md) | DeepSeek-V4-Flash-0731 (mxfp4-g32) | 1× RTX + 2× Spark (min) | 258K tok / 8 req | 151 | 69.9 | 157 | 4,275 | 1.90 s | ✓ KL 0.012 · top-1 92.0% ✓ exact cache ✓ lossless spec | [2026-10-04 · v1.0.0-rc1](benchmarks/deepseek_v4/2026-10-04-smoke-deepseek-v4-flash-0731-1rtx-2spark-v4-flash-min/report.svg) |
@@ -131,16 +131,17 @@ and [changes since v0](PLAN.md#v1-candidate-changelog-preparation-2026-10-04).
 | [GLM 5.3 Flash](docs/models/glm5_flash.md) | GLM-5.3-Flash-EXL3-K3.25-v1 (exl3-k3+exl3-k4) | 1× RTX + 2× Spark (min) | 2M tok / 8 req | 83.1 | 65.5 | 110 | 4,898 | 1.65 s | ✓ KL 0.042 · top-1 86.5% ✓ exact cache | [2026-10-04 · v1.0.0-rc1](benchmarks/glm5_flash/2026-10-04-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-min/report.svg) |
 | [GLM 5.3 Flash](docs/models/glm5_flash.md) | GLM-5.3-Flash-EXL3-K3.25-v1 (exl3-k3+exl3-k4) | 2× RTX + 4× Spark (max) | 2M tok / 8 req | 120 | 92.3 | 159 | 2,946 | 2.74 s | ✓ KL 0.045 · top-1 88.5% ✓ exact cache | [2026-10-04 · v1.0.0-rc1](benchmarks/glm5_flash/2026-10-04-smoke-glm-5-3-flash-exl3-k3-25-v1-2rtx-4spark-glm53f-exl3-max/report.svg) |
 | [GLM 5.3 Flash](docs/models/glm5_flash.md) | GLM-5.3-Flash-NVFP4 (nvfp4-g16) | 1× RTX + 2× Spark (min) | 2M tok / 8 req | 67.4 | 57.4 | 76.9 | 5,060 | 1.59 s | ✓ KL 0.040 · top-1 87.3% ✓ exact cache | [2026-10-04 · v1.0.0-rc1](benchmarks/glm5_flash/2026-10-04-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-min/report.svg) |
-| [GLM 5.3 Flash](docs/models/glm5_flash.md) | GLM-5.3-Flash-NVFP4 (nvfp4-g16) | 2× RTX + 4× Spark (max) | 2M tok / 8 req | 104 | 75.7 | 120 | 3,161 | 2.55 s | ✓ KL 0.039 · top-1 87.3% ✓ exact cache ✓ lossless spec | [2026-10-04 · v1.0.0-rc1](benchmarks/glm5_flash/2026-10-04-smoke-glm-5-3-flash-nvfp4-2rtx-4spark-glm53f-nvfp4-max/report.svg) |
+| [GLM 5.3 Flash](docs/models/glm5_flash.md) | GLM-5.3-Flash-NVFP4 (nvfp4-g16) | 2× RTX + 4× Spark (max) | 2M tok / 8 req | 115 | 85.1 | 129 | 7,239 | 1.11 s | ✓ KL 0.039 · top-1 87.3% ✓ exact cache ✓ lossless spec | [2026-10-04 · v1.0.0-rc2](benchmarks/glm5_flash/2026-10-05-smoke-glm-5-3-flash-nvfp4-2rtx-4spark-rc2/report.svg) |
 | [GLM 5.3 Flash](docs/models/glm5_flash.md) | GLM-5.3-Flash-tr3-4bpw (exl3-k4) | 1× RTX + 2× Spark (min) | 2M tok / 8 req | 71.8 | 57.4 | 83.8 | 4,615 | 1.74 s | ✓ KL 0.037 · top-1 87.5% ✓ exact cache | [2026-10-04 · v1.0.0-rc1](benchmarks/glm5_flash/2026-10-04-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-min/report.svg) |
 | [GLM 5.3 Flash](docs/models/glm5_flash.md) | GLM-5.3-Flash-tr3-4bpw (exl3-k4) | 2× RTX + 4× Spark (max) | 2M tok / 8 req | 111 | 90.9 | 126 | 5,159 | 1.56 s | ✓ KL 0.036 · top-1 87.3% ✓ exact cache ✓ lossless spec | [2026-10-04 · v1.0.0-rc1](benchmarks/glm5_flash/2026-10-04-smoke-glm-5-3-flash-tr3-4bpw-2rtx-4spark-glm53f-tr3-max/report.svg) |
 | [MiMo V2](docs/models/mimo_v2.md) | MiMo-V2-Flash (fp8-block128x128/f32) | 1× RTX + 4× Spark (min) | 2M tok / 8 req | 71.2 | 55.0 | 89.0 | 6,618 | 1.22 s | ✓ KL 0.092 · top-1 83.2% ✓ exact cache ✓ lossless spec | [2026-10-04 · v1.0.0-rc1](benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-flash-1rtx-4spark-mimo-flash-min/report.svg) |
 | [MiMo V2](docs/models/mimo_v2.md) | MiMo-V2-Flash (fp8-block128x128/f32) | 2× RTX + 4× Spark (max) | 2M tok / 8 req | 72.7 | 61.0 | 93.0 | 6,951 | 1.16 s | ✓ KL 0.096 · top-1 82.6% ✓ exact cache ✓ lossless spec | [2026-10-04 · v1.0.0-rc1](benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-flash-2rtx-4spark-mimo-flash-max/report.svg) |
 | [MiMo V2](docs/models/mimo_v2.md) | MiMo-V2.6-Pro-MOPD (mxfp4-g32) | 1× RTX + 6× Spark (min) | 2M tok / 8 req | 50.0 | 37.1 | 76.7 | 2,631 | 3.06 s | ✓ KL 0.020 · top-1 90.2% ✓ exact cache ✓ lossless spec | [2026-10-04 · v1.0.0-rc1](benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-1rtx-6spark-mimo-pro-min/report.svg) |
 | [MiMo V2](docs/models/mimo_v2.md) | MiMo-V2.6-Pro-MOPD (mxfp4-g32) | 2× RTX + 6× Spark (max) | 2M tok / 8 req | 71.7 | 41.0 | 86.9 | 3,470 | 2.32 s | ✓ KL 0.025 · top-1 88.3% ✓ exact cache ✓ lossless spec | [2026-10-04 · v1.0.0-rc1](benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-2rtx-6spark-mimo-pro-max/report.svg) |
-| [Qwen 3.8](docs/models/qwen4.md) | Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 (exl3-k4+exl3-k5) | 1× RTX (min) | 32K tok / 8 req | 221 | 147 | 249 | 6,501 | 1.22 s | ✓ KL 0.036 · top-1 88.5% ✓ exact cache ✓ lossless spec | [2026-10-04 · v1.0.0-rc1](benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-qwen38-exl3-min/report.svg) |
+| [Qwen 3.8](docs/models/qwen4.md) | Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 (exl3-k4+exl3-k5) | 1× RTX (min) | 32K tok / 8 req | 231 | 151 | 247 | 6,560 | 1.22 s | ✓ KL 0.036 · top-1 88.5% ✓ exact cache ✓ lossless spec | [2026-10-04 · v1.0.0-rc2](benchmarks/qwen4/2026-10-05-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-rc2/report.svg) |
 | [Qwen 3.8](docs/models/qwen4.md) | Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 (exl3-k4+exl3-k5) | 1× RTX + 4× Spark (max) | 32K tok / 8 req | 79.0 | 78.8 | 85.4 | 4,392 | 1.82 s | ✓ KL 0.035 · top-1 87.3% ✓ exact cache ✓ lossless spec | [2026-10-04 · v1.0.0-rc1](benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-4spark-qwen38-exl3-max/report.svg) |
-| [Qwen 3.8](docs/models/qwen4.md) | Qwen3.8-Flash-Next-NVFP4 (nvfp4-g16) | 1× RTX + 4× Spark (min) | 32K tok / 8 req | 78.3 | 76.6 | 85.2 | 3,655 | 2.18 s | ✓ KL 0.053 · top-1 84.6% ✓ exact cache ✓ lossless spec | [2026-10-04 · v1.0.0-rc1](benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-nvfp4-1rtx-4spark-qwen38-nvfp4-max/report.svg) |
+| [Qwen 3.8](docs/models/qwen4.md) | Qwen3.8-Flash-Next-NVFP4 (nvfp4-g16) | 1× RTX (min) | 32K tok / 8 req | 231 | 159 | 267 | 9,108 | 876 ms | ✓ KL 0.048 · top-1 85.9% ✓ exact cache ✓ lossless spec | [2026-10-04 · v1.0.0-rc2](benchmarks/qwen4/2026-10-05-smoke-qwen3-8-flash-next-nvfp4-1rtx-rc2/report.svg) |
+| [Qwen 3.8](docs/models/qwen4.md) | Qwen3.8-Flash-Next-NVFP4 (nvfp4-g16) | 1× RTX + 4× Spark (max) | 32K tok / 8 req | 78.3 | 76.6 | 85.2 | 3,655 | 2.18 s | ✓ KL 0.053 · top-1 84.6% ✓ exact cache ✓ lossless spec | [2026-10-04 · v1.0.0-rc1](benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-nvfp4-1rtx-4spark-qwen38-nvfp4-max/report.svg) |
 
 tok/s; C1 decode with thinking off, 8K prefill cold. Quality: logit fidelity against the family golden reference, prefix-cache restore exactness, lossless speculation.
 

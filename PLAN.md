@@ -845,6 +845,26 @@ MTP3 enabled; the lossless check matches all 128 greedy tokens and prefix
 restores remain byte-exact. Spark MTP still requires a worker protocol/package
 extension and is explicitly unsupported; the Spark card keeps MTP off.
 
+The four requested Release smoke refreshes pass on clean runtime source
+`01e7a8c5f9eb31fe35ce5726e3b719677c95ced5`: V4.1 Flash maximum, GLM Flash
+NVFP4 maximum, Qwen EXL3 minimum and Qwen NVFP4 minimum. The published cohort
+is **28/28 passing cards**, comprising these four RC2 exports and 24 retained
+RC1 exports. This is not a rerun of the full matrix. Local untagged images:
+coordinator `f6206446caa8f97b2d19b8e0b72996361b522849bf737e114f5a49a63890b9bd`;
+Spark `261af7fa3ee0862d998e0c48e2d8a2b6d05034d0666e29406f6686c2d7f72c9d`
+on ostrich, dodo, emu and kiwi. Both architectures rebuild the matching Rust
+binary; the SparkInfer pin and tree lock remain unchanged at `f6bb38b`.
+Cargo check and workspace tests pass (1425 passed, 170 ignored); script
+tests pass (927 plus 193 subtests, two skipped), with no failing IDs.
+
+All four new cards pass golden fidelity and byte-exact snapshot restores.
+Qwen EXL3 and NVFP4 each match all 128 greedy tokens with MTP3 on/off.
+The V4.1 smoke speculation verdict is informational: drafted and plain output
+diverge at token 49 through verify rounding, while plain decode repeats
+exactly. GLM's verdict passes its near-tie tolerance, but is not byte-identical
+after token 27. Existing batch/verify numerical-invariance limitations remain;
+the smoke pass does not claim byte-identical output across those paths.
+
 V4.1 maximum uses the existing shared FP8 vocabulary head. Matched v0/RC1
 ABAB controls do not reproduce the historical long-code C1 regression.
 Qwen EXL3 matched BF16 ABAB also passes parity. Its historical default-speed
