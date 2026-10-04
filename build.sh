@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
 source "$repo_root/scripts/lib/release-export-locks.sh"
+case "${CUTEAFD_RELEASE_EXL3_ACTIVATIONS:-a16}" in a16|a8) ;; *) release_die "CUTEAFD_RELEASE_EXL3_ACTIVATIONS must be a16 or a8" ;; esac
 bf16_families="${CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES:-}"
 bf16_family_pattern='^(mimo|mimop|glm|glmf|qwen4)(;(mimo|mimop|glm|glmf|qwen4))*$'
 [[ -z "$bf16_families" || "$bf16_families" =~ $bf16_family_pattern ]] ||
@@ -59,6 +60,8 @@ packages to both images, each keeping its architecture's entries.
 CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES (e.g. mimo, or mimo;glm) adds optional
 BF16-input Spark siblings for the requested FAMILY:fp8 packages. It does not
 change serving precision defaults. Empty builds the existing artifact set.
+Set CUTEAFD_RELEASE_EXL3_ACTIVATIONS=a8 to add INT8 prefill siblings for GLM,
+GLM Flash and Qwen EXL3 packages; EXL3_ACTIVATIONS=a8 opts in when launching.
 CUTEAFD_RELEASE_MIMO_GEOMETRIES picks the MiMo program geometries (default
 mimo,mimo2,mimop,mimop2: V2 Flash, V2.6 Pro and their two-GPU head splits). p7's set, everything scripts/launch/run-family.sh
 serves (V4 Pro EXL3 K2, GLM 5.3 EXL3 K4 and FP8, GLM 5.3 Flash, MiMo V2 Flash
@@ -485,6 +488,7 @@ release_with_export_locks "" "$export_container-coordinator" \
   --ulimit memlock=-1:-1 \
   -e CUDA_VISIBLE_DEVICES=0 \
   -e NVIDIA_VISIBLE_DEVICES=0 \
+  -e "CUTEAFD_RELEASE_EXL3_ACTIVATIONS=${CUTEAFD_RELEASE_EXL3_ACTIVATIONS:-a16}" \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}" \
   -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families" \
   -e "CUTEAFD_RELEASE_GLM_AOT=${CUTEAFD_RELEASE_GLM_AOT:-OFF}" \
@@ -570,7 +574,7 @@ build_spark_release_leg() {
   "${release_build_root:-__legacy__}" \
   "$(f="${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}"; f="${f//;/,}"; echo "${f:-__legacy__}")" \
   "$(f="${bf16_families//;/,}"; echo "${f:-__legacy__}")" \
-  "$phase" "$export_container-expert" <<'REMOTE'
+  "$phase" "$export_container-expert" "${CUTEAFD_RELEASE_EXL3_ACTIVATIONS:-a16}" <<'REMOTE'
 set -euo pipefail
 remote_dir="$1"
 dev_image="$2"
@@ -618,6 +622,7 @@ fi
 cd "$remote_dir"
 phase="${13:?}"
 export_container="${14:?}"
+exl3_activations="${15:-a16}"
 if [[ "$phase" == dev ]]; then
 python3 scripts/build/verify-sparkinfer-source.py \
   --source third_party/sparkinfer \
@@ -637,6 +642,7 @@ docker run --rm --name "$export_container" \
   --gpus all \
   --ipc=host \
   --ulimit memlock=-1:-1 \
+  -e "CUTEAFD_RELEASE_EXL3_ACTIVATIONS=$exl3_activations" \
   -e "CUTEAFD_RELEASE_EXL3_PAIRED_TP4=$exl3_paired_tp4" \
   -e "CUTEAFD_RELEASE_SPARK_TP_ROLES=$spark_tp_roles" \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=$expert_families" \

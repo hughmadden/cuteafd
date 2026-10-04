@@ -7,7 +7,7 @@
 //! coordinator's `exl3-<family>-k<tiers>/rtx-tp1` package instead.
 use crate::families::deepseek_v41::v41_experts::exl3::{
     aot_layout_directory,
-    execution::{Exl3Execution, Exl3InputFormat, Exl3RowPolicy, Exl3Workspace},
+    execution::{activation_directory, Exl3Execution, Exl3InputFormat, Exl3RowPolicy, Exl3Workspace},
     Exl3Weights,
 };
 use crate::families::deepseek_v41::v41_experts::{ExpertLayer, ExpertWeights};
@@ -82,7 +82,7 @@ pub(crate) fn plan(library: &NativeLibrary, native_lib: &Path, catalog: &Officia
         .chain(CAPACITIES.iter().copied().find(|&c| c as usize >= max_rows)).collect();
     let workspace = if let Some(manifest) = catalog.exl3() {
         let directory = aot_layout_directory(native_lib, manifest.decoder_tiers(), "rtx-tp1");
-        let directories: Vec<_> = capacities.iter().map(|c| directory.join(format!("m{c}"))).collect();
+        let directories: Vec<_> = capacities.iter().map(|&c| activation_directory(&directory, c)).collect::<Result<Vec<_>>>()?;
         if directories.iter().any(|d| !d.join("v41_exl3.json").is_file()) { return Ok(empty()); }
         Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32)? + max_rows * shape.hidden * 2
     } else {
@@ -242,7 +242,7 @@ impl<'a> LocalExperts<'a> {
     ) -> Result<Option<Self>> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("local-experts");
         let shape = *catalog.routed_experts();
-        let directories: Vec<_> = capacities.iter().map(|c| directory.join(format!("m{c}"))).collect();
+        let directories: Vec<_> = capacities.iter().map(|&c| activation_directory(&directory, c)).collect::<Result<Vec<_>>>()?;
         if let Some(missing) = directories.iter().find(|d| !d.join("v41_exl3.json").is_file()) {
             tracing::warn!(package = %missing.display(), "no coordinator EXL3 package for this geometry; \
                 build with CUTEAFD_*_EXPERT_FAMILIES=<family>:exl3-k<tiers> to keep layers local");

@@ -682,10 +682,13 @@ fn expert_workspace(report: &PlanReport, model: &dyn super::FamilyModel, checkpo
     let maximum = if family.starts_with("dsv4") { rows.max(64) } else { rows.max(1) };
     const CAPACITIES: [u64; 6] = [1, 16, 80, 256, 1024, 4096];
     if maximum > 4096 { return None; }
+    let activations = std::env::var("EXL3_ACTIVATIONS").unwrap_or_else(|_| "a16".into());
+    if !matches!(activations.as_str(), "a16" | "a8") { return None; }
     let manifests = CAPACITIES.into_iter().filter(|&n| n <= maximum)
         .chain(CAPACITIES.into_iter().find(|&n| n >= maximum))
         .map(|capacity| serde_json::from_slice::<serde_json::Value>(
-            &std::fs::read(root.join(format!("rtx-tp1/m{capacity}/v41_exl3.json"))).ok()?).ok())
+            &std::fs::read(root.join(format!("rtx-tp1/m{capacity}{}/v41_exl3.json",
+                if activations == "a8" && capacity >= 256 { "-a8" } else { "" }))).ok()?).ok())
         .collect::<Option<Vec<_>>>()?;
     let moe = model.spec().moe.as_ref()?;
     if manifests.iter().any(|m| m["hidden"].as_u64() != Some(model.spec().hidden as u64)

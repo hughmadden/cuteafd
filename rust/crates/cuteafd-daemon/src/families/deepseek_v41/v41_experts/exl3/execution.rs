@@ -8,6 +8,31 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, ffi::c_void, path::{Path, PathBuf}, rc::Rc};
 
+/// Select the opt-in prefill program before workspace admission. Decode and
+/// verification capacities retain their qualified A16 programs.
+pub(crate) fn activation_directory(directory: &Path, capacity: u32) -> Result<PathBuf> {
+    let activations = std::env::var("EXL3_ACTIVATIONS").unwrap_or_else(|_| "a16".into());
+    selected_activation_directory(directory, capacity, &activations)
+}
+
+fn selected_activation_directory(directory: &Path, capacity: u32, activations: &str) -> Result<PathBuf> {
+    ensure!(matches!(activations, "a16" | "a8"), "EXL3_ACTIVATIONS must be a16 or a8");
+    let suffix = if activations == "a8" && capacity >= 256 { "-a8" } else { "" };
+    let selected = directory.join(format!("m{capacity}{suffix}"));
+    if !suffix.is_empty() {
+        ensure!(selected.join("v41_exl3.json").is_file(),
+            "EXL3 A8 prefill program missing at {}; build with CUTEAFD_*_EXL3_ACTIVATIONS=a8", selected.display());
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(selected.join("v41_exl3.json"))?)?;
+        ensure!(manifest["activations"] == "a8" && manifest["capacity"].as_u64() == Some(capacity.into()),
+            "EXL3 A8 prefill manifest precision/capacity mismatch at {}", selected.display());
+        ensure!(manifest["warp_specialized"] == true && manifest["route_block"] == 64
+            && manifest["direct"] == false && manifest["paired_boundary"].is_null()
+            && manifest["bits"].as_array().is_some_and(|bits| bits.len() == 2),
+            "EXL3 A8 requires disjoint two-tier warp-specialized 64-row packed prefill at {}", selected.display());
+    }
+    Ok(selected)
+}
+
 /// Capacity selects the compiled reduction geometry, never the live row count.
 /// GLM Flash's m1/m80 use K64; m16 uses K128 and adds serial/verify drift.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -767,6 +792,27 @@ mod shared_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a8_selection_preserves_decode_and_requires_precise_prefill_artifacts() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        for capacity in [1, 16, 80] {
+            assert_eq!(selected_activation_directory(root.path(), capacity, "a8")?,
+                root.path().join(format!("m{capacity}")));
+        }
+        assert_eq!(selected_activation_directory(root.path(), 4096, "a16")?, root.path().join("m4096"));
+        assert!(selected_activation_directory(root.path(), 4096, "a8").is_err());
+        assert!(selected_activation_directory(root.path(), 1, "auto").is_err());
+        let a8 = root.path().join("m4096-a8");
+        std::fs::create_dir(&a8)?;
+        std::fs::write(a8.join("v41_exl3.json"), br#"{"capacity":4096,"activations":"a16"}"#)?;
+        assert!(selected_activation_directory(root.path(), 4096, "a8").is_err());
+        std::fs::write(a8.join("v41_exl3.json"), br#"{"capacity":4096,"activations":"a8"}"#)?;
+        assert!(selected_activation_directory(root.path(), 4096, "a8").is_err());
+        std::fs::write(a8.join("v41_exl3.json"), br#"{"capacity":4096,"activations":"a8","warp_specialized":true,"route_block":64,"direct":false,"bits":[3,4]}"#)?;
+        assert_eq!(selected_activation_directory(root.path(), 4096, "a8")?, a8);
+        Ok(())
+    }
 
     #[test]
     fn family_row_policy_admits_every_live_tail() -> Result<()> {

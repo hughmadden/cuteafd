@@ -1,7 +1,7 @@
 //! Spark request adapter: preserve the compact BF16 wire response and write
 //! directly into registered send storage when the transport permits it.
 use super::{
-    execution::{Exl3Execution, Exl3InputFormat, Exl3RowPolicy, Exl3Workspace},
+    execution::{activation_directory, Exl3Execution, Exl3InputFormat, Exl3RowPolicy, Exl3Workspace},
     Exl3Weights,
 };
 use crate::families::deepseek_v41::v41_experts::HostExpertExchange;
@@ -44,7 +44,7 @@ impl<'a> Exl3Worker<'a> {
         ensure!(rank < 6, "EXL3 worker rank must be 0..5");
         let mut selected = None;
         for c in Self::capacities(capacity)? {
-            let layout = Exl3Execution::artifact_layout(&directory.join(format!("m{c}")))?;
+            let layout = Exl3Execution::artifact_layout(&activation_directory(directory, c)?)?;
             ensure!(selected.is_none_or(|previous| previous == layout), "EXL3 capacity artifacts disagree on partition");
             ensure!(layout == V41Exl3Layout::Disjoint || layout == if rank % 2 == 0 {
                 V41Exl3Layout::PairedLast
@@ -67,7 +67,7 @@ impl<'a> Exl3Worker<'a> {
 
     pub(crate) fn plan(directory: &Path, capacity: u32) -> Result<usize> {
         let directories: Vec<_> = Self::capacities(capacity)?.into_iter()
-            .map(|c| directory.join(format!("m{c}"))).collect();
+            .map(|c| activation_directory(directory, c)).collect::<Result<Vec<_>>>()?;
         let ownership_bytes = Exl3Execution::ownership_bytes(&directories[0])?;
         Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32)?
             .checked_add(capacity as usize * (Self::wire_row_bytes() + Self::topk() * 8))
@@ -107,14 +107,14 @@ impl<'a> Exl3Worker<'a> {
         let mut executions = Vec::new();
         let row_policy = Exl3RowPolicy::active();
         let capacities = Self::capacities(capacity)?;
-        let directories: Vec<_> = capacities.iter().map(|c| directory.join(format!("m{c}"))).collect();
+        let directories: Vec<_> = capacities.iter().map(|&c| activation_directory(directory, c)).collect::<Result<Vec<_>>>()?;
         let arena = Exl3Workspace::new(library, &directories)?;
         for c in capacities {
             let execution = unsafe {
                 Exl3Execution::with_shared_workspace(
                     library,
                     weights.clone(),
-                    &directory.join(format!("m{c}")),
+                    &activation_directory(directory, c)?,
                     Exl3InputFormat::Fp8K32,
                     Some(arena.clone()),
                 )?

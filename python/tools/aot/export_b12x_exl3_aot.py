@@ -124,7 +124,13 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
            token_major_rotation: bool = False, swiglu_limit: float | None = 10.0,
            fused_input_rotation: bool = False, warp_specialized: bool = False,
            wire_input: bool = False, ws_input_stages: int | None = None,
-           ws_dynamic_tiles: bool = False) -> dict:
+           ws_dynamic_tiles: bool = False, activations: str = "a16") -> dict:
+    if activations not in ("a16", "a8"):
+        raise ValueError("EXL3 activations must be a16 or a8")
+    if activations == "a8" and (paired_boundary is not None or len(bits) != 2 or capacity < 256):
+        raise ValueError("EXL3 A8 is opt-in two-tier disjoint prefill (capacity >=256)")
+    if activations == "a8" and (not warp_specialized or route_block != 64):
+        raise ValueError("EXL3 A8 requires warp-specialized 64-row packed blocks")
     if paired_boundary not in (None, "first", "last"):
         raise ValueError("paired boundary must be first, last, or None")
     if paired_boundary is not None and (intermediate != 640 or len(bits) != 2 or topk != 6
@@ -207,6 +213,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         direct = routing == "direct"
     if direct and len(bits) != 2:
         raise ValueError("three/four-tier export requires packed routing")
+    if activations == "a8" and direct:
+        raise ValueError("EXL3 A8 requires packed routing")
     block_m = 8 if direct else route_block
     route_slots = capacity * topk if direct else route_pack_capacity(capacity * topk, block_m, experts, topk=topk)[1]
     route_blocks = route_slots if direct else (route_slots + block_m - 1) // block_m
@@ -233,6 +241,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
                 rotation["ws_input_stages"] = ws_input_stages
             if ws_dynamic_tiles:
                 rotation["ws_dynamic_tiles"] = True
+        if activations == "a8":
+            rotation["activations"] = "a8"
         launch = compile_mixed_trellis(**options, direct_topk_routes=direct,
                                       force_blocks_per_sm=blocks_per_sm, **rotation)
     elif len(bits) == 3:
@@ -290,6 +300,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         "trellis_lut": {"file": "trellis_lut.bin", "bytes": len(lut_bytes),
             "sha256": hashlib.sha256(lut_bytes).hexdigest()},
         "native_execution_verified": False}
+    if activations == "a8":
+        manifest["activations"] = "a8"
     if block_m != 8:
         # Recorded only when it differs, so 8-row manifests stay byte-identical.
         manifest["route_block"] = block_m
@@ -344,6 +356,8 @@ def main() -> None:
                         help="FC1 rotates staged token rows itself (packed 16+ row blocks)")
     parser.add_argument("--warp-specialized", action="store_true",
                         help="Warp-specialized prefill kernels (packed 16+ row blocks)")
+    parser.add_argument("--activations", choices=("a16", "a8"), default="a16",
+                        help="Opt-in INT8 activation/weight MMA for prefill")
     parser.add_argument("--wire-input", action="store_true",
                         help="Warp-specialized FC1 reads E4M3 + UE8M0 K32 wire rows (no BF16 decode)")
     parser.add_argument("--ws-input-stages", type=int, choices=range(2, 7),
@@ -362,6 +376,7 @@ def main() -> None:
            fused_input_rotation=args.fused_input_rotation,
            warp_specialized=args.warp_specialized, wire_input=args.wire_input,
            ws_input_stages=args.ws_input_stages, ws_dynamic_tiles=args.ws_dynamic_tiles,
+           activations=args.activations,
            swiglu_limit=None if args.swiglu_limit.lower() == "none" else float(args.swiglu_limit))
 
 

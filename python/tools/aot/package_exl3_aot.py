@@ -104,6 +104,15 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             raise ValueError(f'EXL3 variant fused input rotation mismatch: {directory}')
         if variant.get('warp_specialized', False) != meta.get('warp_specialized', False):
             raise ValueError(f'EXL3 variant warp specialization mismatch: {directory}')
+        if variant.get('activations', 'a16') != meta.get('activations', 'a16'):
+            raise ValueError(f'EXL3 variant activation precision mismatch: {directory}')
+        if meta.get('activations', 'a16') == 'a8':
+            if (variant['capacity'] < 256 or len(variant['bits']) != 2
+                    or not directory.endswith('-a8') or meta.get('direct') or paired
+                    or not meta.get('warp_specialized') or meta.get('route_block') != 64):
+                raise ValueError(f'EXL3 A8 variant must be disjoint packed prefill: {directory}')
+        elif meta.get('activations', 'a16') != 'a16' or directory.endswith('-a8'):
+            raise ValueError(f'invalid EXL3 activation precision: {directory}')
         if variant.get('input_format', 'bf16') != meta.get('input_format', 'bf16'):
             raise ValueError(f'EXL3 variant input format mismatch: {directory}')
         if variant.get('token_major_rotation', False) != meta.get('token_major_rotation', False):
@@ -146,6 +155,13 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
         for capacity in requested_capacities:
             if not any(v['directory'] == f'{layout}/m{capacity}' for v in manifest['variants']):
                 raise ValueError(f'EXL3 package is missing requested layout {layout}/m{capacity}')
+    if manifest.get('activation_variants') == 'a8':
+        for variant in manifest['variants']:
+            if variant['capacity'] >= 256 and variant.get('activations', 'a16') == 'a16':
+                if variant['directory'] + '-a8' not in seen:
+                    raise ValueError(f"EXL3 package is missing requested A8 prefill {variant['directory']}-a8")
+    elif manifest.get('activation_variants', 'a16') != 'a16':
+        raise ValueError('invalid EXL3 activation variant contract')
     return manifest
 
 
@@ -531,6 +547,9 @@ def build(args: argparse.Namespace) -> None:
     paired = getattr(args, 'paired_tp4', False)
     geometry = getattr(args, 'geometry', 'v41')
     hidden = GEOMETRIES[geometry][0]
+    if (getattr(args, 'activations', 'a16') == 'a8'
+            and geometry in ('glm', 'glmf', 'qwen4') and len(args.bits) != 2):
+        raise ValueError('EXL3 A8 requires two decoder tiers; use --activations a16 for three/four tiers')
     if paired and (args.role != 'spark' or len(args.bits) != 2 or geometry != 'v41'):
         raise ValueError('paired TP4 package requires V4.1 Spark role and two tiers')
     capacities = sorted(set(int(v) for v in args.capacities.split(',')))
@@ -566,15 +585,22 @@ def build(args: argparse.Namespace) -> None:
         stage = Path(temporary)
         variants = []
         for profile, width, experts, topk, dtype, destinations in profiles:
-            for capacity in capacities:
+            selections = [(c, a) for c in capacities for a in
+                          (('a16', 'a8') if getattr(args, 'activations', 'a16') == 'a8'
+                           and c >= 256 and geometry in ('glm', 'glmf', 'qwen4')
+                           else ('a16',))]
+            for capacity, activations in selections:
                 tile = tiles.get(profile, {}).get(capacity)
                 # Content-keyed: an override changes the compiled geometry, so it
                 # must never land in (or be read from) the policy-keyed export.
                 # Without an override the path is what every existing build used.
                 profile_dir = (args.build_dir / profile if tile is None else
                                args.build_dir / f"{profile}+tile{'-'.join(map(str, tile))}")
-                raw = profile_dir / f'm{capacity}'  # one capacity, one directory
+                suffix = '-a8' if activations == 'a8' else ''
+                raw = profile_dir / f'm{capacity}{suffix}'  # one capacity, one directory
                 options = {'paired_boundary': profile.removeprefix('paired-')} if paired else {}
+                if activations == 'a8':
+                    options['activations'] = 'a8'
                 if capacity in overrides:
                     options['blocks_per_sm'] = overrides[capacity]
                 if tile is not None:
@@ -582,20 +608,20 @@ def build(args: argparse.Namespace) -> None:
                 if geometry != 'v41':
                     options['hidden'] = hidden
                 block = route_block(geometry, capacity)
-                ws = tile is None and warp_specialized(geometry, args.role, width, capacity)
+                ws = activations == 'a8' or (tile is None and warp_specialized(geometry, args.role, width, capacity))
                 if ws:
                     block = 64
                 if block != 8:
                     options['route_block'] = block
                 if ws:
                     options['warp_specialized'] = True
-                    if wire_input(geometry, args.role, width, capacity):
+                    if (activations == 'a8' and args.role == 'spark') or wire_input(geometry, args.role, width, capacity):
                         options['wire_input'] = True
                     if (stages := ws_input_stages(geometry, args.role, width, capacity)) is not None:
                         options['ws_input_stages'] = stages
                     if ws_dynamic_tiles(geometry, args.role, width, capacity):
                         options['ws_dynamic_tiles'] = True
-                    if (policy_tile := ws_tile(geometry, args.role, width, capacity)) is not None:
+                    if tile is None and (policy_tile := ws_tile(geometry, args.role, width, capacity)) is not None:
                         options['tile'] = policy_tile
                 elif tile is None and fused_input_rotation(geometry, args.role, width, capacity):
                     options['fused_input_rotation'] = True
@@ -603,7 +629,7 @@ def build(args: argparse.Namespace) -> None:
                     options['token_major_rotation'] = True
                 if (limit := swiglu_limit(geometry)) != 10.0:
                     options['swiglu_limit'] = limit
-                meta = export(raw, width, experts, capacity, tuple(args.bits), 'auto', topk, dtype, **options)
+                meta = export(raw, width, experts, capacity, tuple(args.bits), 'packed' if activations == 'a8' else 'auto', topk, dtype, **options)
                 core = raw / 'libcuteafd_exl3.so'
                 subprocess.run([args.cxx, '-shared', '-fPIC', '-std=c++17',
                     f'-I{args.cuda_include}', str(raw / 'v41_exl3_bridge.cc'),
@@ -620,13 +646,15 @@ def build(args: argparse.Namespace) -> None:
                         '-o', str(routes / 'libv41_exl3_routes.so')], check=True)
                     runtime_files += ['routes/v41_exl3_routes.json', 'routes/libv41_exl3_routes.so']
                 for destination in destinations:
-                    directory = f'{destination}/m{capacity}'
+                    directory = f'{destination}/m{capacity}{suffix}'
                     for name in runtime_files:
                         target = stage / directory / name
                         target.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(raw / name, target)
                     variant = {'directory': directory, **{key: meta[key] for key in
                         ('capacity', 'intermediate', 'experts', 'top_k', 'output_dtype', 'bits', 'blocks_per_sm')}}
+                    if activations == 'a8':
+                        variant['activations'] = 'a8'
                     if 'tile' in meta:
                         # What the compiler actually resolved, always: the pinned
                         # policy varies per capacity (m16 is the known special case),
@@ -658,6 +686,8 @@ def build(args: argparse.Namespace) -> None:
                     'variants': variants, 'files': files,
                     'runtime': {'library': 'libcute_dsl_runtime.so', 'sha256': digest(args.runtime),
                                 'provider': 'installed nvidia-cutlass-dsl CUDA runtime; release entrypoint sets its library path'}}
+        if getattr(args, 'activations', 'a16') == 'a8' and geometry in ('glm', 'glmf', 'qwen4'):
+            manifest['activation_variants'] = 'a8'
         if paired:
             manifest['paired_tp4'] = True
         if geometry != 'v41':
@@ -691,6 +721,8 @@ def main() -> None:
     create.add_argument('--profile', action='append', default=[],
                         help='Build only these profiles (repeatable), for bring-up; '
                              'a release package builds every profile of its role')
+    create.add_argument('--activations', choices=('a16', 'a8'), default='a16',
+                        help='a8 adds separate INT8 prefill variants for GLM/GLM Flash/Qwen; decode stays A16')
     create.add_argument('--paired-tp4', action='store_true', help='Export explicit paired H128 ownership kernels for all four Spark ranks')
     create.add_argument('--residency', action='append', default=[], metavar='CAPACITY=BLOCKS',
                         help='Explicit paired-package blocks/SM override; repeat per capacity (for example 80=2). B12X validates resources.')
