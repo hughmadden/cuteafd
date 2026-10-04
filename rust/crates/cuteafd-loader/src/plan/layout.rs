@@ -90,9 +90,8 @@ enum Share {
     Sharded { replicated: f64 },
 }
 
-/// Per-family costs calibrated against the allocation ledger (Phase 6 audit,
-/// 2026-10-03: one launch per family at its min and max reference layouts,
-/// prefill 4096 rows, after an 8K prefill, a C4 and a C1 request).
+/// Runtime allowances checked against allocation ledgers after 8K prefill,
+/// C4 and C1. The layout marks only measured reference configurations calibrated.
 #[derive(Debug, Clone, Copy)]
 pub struct FamilyCosts {
     /// CUDA context, modules and cuBLAS at ready (untracked): one GPU, lead and peer of a head split.
@@ -118,6 +117,8 @@ pub struct FamilyCosts {
     pub spark_workspace_bytes: u64,
     /// RDMA rings per Spark rank (every coordinator endpoint).
     pub spark_ring_bytes: u64,
+    /// Host memory charged by CUDA on GB10 after checkpoint caches are dropped.
+    pub spark_host_bytes: u64,
 }
 
 
@@ -138,6 +139,7 @@ pub fn family_costs(family: &str) -> FamilyCosts {
         resident_factor: 1.0,
         spark_workspace_bytes: gib(100),
         spark_ring_bytes: gib(150),
+        spark_host_bytes: 13 * GIB,
     };
     match family {
         // GLM 5.3 EXL3 K4 + DFlash2 (BF16, 4.58 GiB checkpoint + 1.3 GiB context/buffers).
@@ -197,6 +199,7 @@ pub fn family_costs(family: &str) -> FamilyCosts {
             mark_slots: 42,
             spark_workspace_bytes: gib(21),
             spark_ring_bytes: gib(48),
+            spark_host_bytes: 9 * GIB,
             ..generic
         },
         "qwen4" => FamilyCosts {
@@ -265,10 +268,28 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
         .collect();
     let mut waste = Vec::new();
     let mut notes = Vec::new();
-    let qualified = matches!(family, "mimo_v2" | "glm5" | "glm5_flash");
+    let reference_gpu = gpus == 1 && (94 * GIB..=96 * GIB).contains(&options.rtx_bytes[0])
+        && native_layers > 0 && options.local_expert_layers.is_none();
+    let package = report.experts.as_ref().map(|e| e.package.as_str());
+    let reference = reference_gpu && match family {
+        "deepseek_v41" => matches!(report.placement, ExpertPlacement::Sparks { ranks: 4 })
+            && model.spec().hidden == 5120 && model.spec().layers.len() == 40
+            && package == Some("v41:mxfp4 (expertd-native)") && prefill_rows == 2048
+            && concurrency == 16 && matches!(options.prefix_slots, None | Some(42))
+            && matches!(context_tokens, 0 | 1_048_576),
+        "qwen4" => report.placement == ExpertPlacement::Local && package == Some("qwen4:exl3-k45")
+            && model.spec().hidden == 2560 && model.spec().layers.len() == 48
+            && prefill_rows == 4096 && concurrency == 8 && matches!(options.prefix_slots, None | Some(18))
+            && matches!(context_tokens, 0 | 32768),
+        _ => false,
+    };
+    let qualified = reference || matches!(family, "mimo_v2" | "glm5" | "glm5_flash");
     let allowance_basis = if qualified { Basis::Calibrated } else { Basis::Estimated };
     if !qualified {
         notes.push(format!("{family}: workspace/runtime/Spark allowances are unqualified; validate against the allocation ledger before using this layout for admission"));
+    }
+    if reference {
+        notes.push("Runtime allowances calibrated at the natural-minimum reference layout after an 8K prefill and C4 decode; other layouts remain estimates".into());
     }
     if family == "qwen4" && gpus == 2 {
         notes.push("Qwen serves on rtx0; rtx1 is idle and contributes no KV capacity".into());
@@ -280,6 +301,9 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
     // Coordinator weights: a family's exact resident layout where it has one,
     // else checkpoint bytes per component under the family's conversions.
     let v41_weights = if family == "deepseek_v41" { v41::resident_weights(checkpoint, active_gpus, native_layers > 0) } else { None };
+    let qwen_exl3 = if family == "qwen4" && report.placement == ExpertPlacement::Local {
+        qwen_exl3_arenas(checkpoint, native_layers > 0)
+    } else { None };
     if let Some(ranks) = &v41_weights {
         for (device, items) in devices.iter_mut().zip(ranks) { device.items.extend(items.iter().cloned()); }
     }
@@ -298,6 +322,7 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
         }
     }
     let covered = |c: Component| (v41_weights.is_some() && !matches!(c, Component::RoutedExpert | Component::MappedTable))
+        || (qwen_exl3.is_some() && matches!(c, Component::RoutedExpert | Component::SpeculatorExpert))
         || (family.starts_with("deepseek_v4") && exact.is_some() && c == Component::Speculator)
         || (family == "qwen4" && exact.is_some() && matches!(c, Component::Speculator | Component::TableProjection))
         || (exact.is_some() && !matches!(c, Component::Speculator | Component::SpeculatorExpert
@@ -348,7 +373,12 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
             }
         }
     }
-    if family == "qwen4" && native_layers > 0 && report.placement == ExpertPlacement::Local {
+    if let Some((backbone, draft)) = qwen_exl3 {
+        devices[0].items.push(Item::new(Category::Experts, "routed expert arenas", "exl3", backbone, Basis::Formula));
+        if draft > 0 {
+            devices[0].items.push(Item::new(Category::Experts, "native MTP expert arena", "exl3", draft, Basis::Formula));
+        }
+    } else if family == "qwen4" && native_layers > 0 && report.placement == ExpertPlacement::Local {
         let native_experts: u64 = report.components.iter().filter(|c| c.component == Component::SpeculatorExpert && c.status == Status::Unused)
             .map(|c| c.bytes).sum();
         if native_experts > 0 {
@@ -582,10 +612,11 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
             let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: options.spark_bytes,
                 items: Vec::new(), kv_tokens: 0 };
             if matches!(family, "deepseek_v4" | "deepseek_v41" | "qwen4") {
-                // A GB10 CUDA sample includes host OS and sparknestd. The
-                // supplied Spark inventory is usable memory after this reserve.
+                // Recover physical memory from the legacy usable inventory
+                // (13 GiB excluded), then charge the family's observed host
+                // footprint separately from expert allocations.
                 device.capacity_bytes += 13 * GIB;
-                device.items.push(Item::new(Category::Reserved, "host OS+sparknestd", "", 13 * GIB, Basis::Calibrated));
+                device.items.push(Item::new(Category::Reserved, "host OS+sparknestd", "", costs.spark_host_bytes, allowance_basis));
             }
             let format = report.components.iter().find(|c| c.owner == Owner::SparkSliced)
                 .map(|c| c.formats.keys().cloned().collect::<Vec<_>>().join("+")).unwrap_or_default();
@@ -603,6 +634,21 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
         }
     }
     MemoryLayout { devices, pool_tokens, waste, notes }
+}
+
+fn qwen_exl3_arenas(checkpoint: &super::Checkpoint, mtp: bool) -> Option<(u64, u64)> {
+    use crate::V41Exl3Layer;
+    let catalog = crate::read_expert_catalog(&checkpoint.snapshot).ok()?;
+    let shape = catalog.routed_experts();
+    let manifest = catalog.exl3()?;
+    let bytes = |layer| -> Option<u64> {
+        u64::try_from(manifest.residency(layer, 1, 0).ok()?.device_arena_layout().ok()?.1).ok()
+    };
+    let backbone = (shape.first_layer..shape.layers).try_fold(0u64,
+        |total, layer| total.checked_add(bytes(V41Exl3Layer::Backbone(layer))?))?;
+    let draft = (0..if mtp { shape.draft_stages.min(1) } else { 0 }).try_fold(0u64,
+        |total, stage| total.checked_add(bytes(V41Exl3Layer::Dspark(stage))?))?;
+    Some((backbone, draft))
 }
 
 /// Local EXL3 arenas from the same capacity manifests used by the loader.

@@ -923,9 +923,13 @@ fn layout_charges_local_routed_experts_to_the_coordinator() {
     assert!(routed > 0);
     let memory = report.memory_layout.unwrap();
     let expert_weights: u64 = memory.devices[0].items.iter()
-        .filter(|item| item.category == Category::Experts && item.group == Component::RoutedExpert.label())
+        .filter(|item| item.category == Category::Experts && item.group == "routed expert arenas")
         .map(|item| item.bytes).sum();
-    assert_eq!(expert_weights, routed);
+    assert!(expert_weights >= routed);
+    assert_eq!(expert_weights % (2 * 1024 * 1024), 0);
+    // Tier-specific rotations, maps and arena padding add a small overhead;
+    // charge them without duplicating the trellis payload itself.
+    assert!(expert_weights - routed < routed / 50);
     // Resident EXL3 execution arenas also consume the coordinator budget.
     assert!(memory.devices[0].by_category()[&Category::Experts] > routed);
     assert_eq!(memory.devices.len(), 1);

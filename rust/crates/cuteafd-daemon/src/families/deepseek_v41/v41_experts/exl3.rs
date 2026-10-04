@@ -63,16 +63,7 @@ struct WeightBuffer { buffer: CuteafdDeviceBuffer }
 /// One explicitly sized allocation avoids independent CUDA allocation padding
 /// for every projection/rotation table. All kernel pointers remain 256B aligned.
 fn arena_layout(plan: &V41Exl3Residency) -> Result<(Vec<usize>, usize)> {
-    let mut bytes = 0usize;
-    let mut offsets = Vec::with_capacity(plan.buffers.len());
-    for buffer in &plan.buffers {
-        bytes = bytes.checked_add(255).context("EXL3 arena alignment overflow")? & !255;
-        offsets.push(bytes);
-        bytes = bytes.checked_add(buffer.bytes.max(16)).context("EXL3 arena size overflow")?;
-    }
-    let page = 2 * 1024 * 1024;
-    bytes = bytes.checked_add(page-1).context("EXL3 arena page alignment overflow")? / page * page;
-    Ok((offsets, bytes))
+    Ok(plan.device_arena_layout()?)
 }
 
 fn layout(catalog: &OfficialV41Catalog, layer: ExpertLayer, partition: V41Exl3Partition) -> Result<V41Exl3Residency> {
