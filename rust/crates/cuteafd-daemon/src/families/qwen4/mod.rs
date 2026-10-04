@@ -381,19 +381,33 @@ impl Opened {
                 .unwrap_or_else(|| crate::shared::experts::fp8::package_directory(&args.native_lib, 1, tensors.format()));
             let (free, _) = self.library.cuda_memory_info()?;
             ensure!(args.expert_window != Some(0), "--expert-window must be at least 1");
+            let mtp = args.mtp > 0 && layers == self.cfg.layers;
+            let mixed_mtp = mtp && tensors.layer_format(layers)? != tensors.format();
             let resident = if args.expert_window.is_some() { 0..0 } else {
-                0..layers + usize::from(args.mtp > 0 && layers == self.cfg.layers)
+                0..layers + usize::from(mtp && !mixed_mtp)
             };
             let started = Instant::now();
             let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, tensors, &directory, resident, 1, 0,
                 args.prefill_rows, free.saturating_sub(args.expert_reserve_gib.saturating_mul(1 << 30)))
                 .context("local routed experts must fit with step and prefix-cache reservations; use --peers for Sparks, \
-                    or --expert-window N for diagnostic paging; mixed-format MTP experts need their own native package")?;
-            let loads = experts.layers.len();
+                    or --expert-window N for diagnostic paging")?;
+            // The backbone and draft each own exactly one weight representation.
+            // Re-query free memory after the target allocation so the second
+            // package admits both its weights and scratch against the remaining budget.
+            let mtp_experts = if mixed_mtp {
+                let draft = tensors.for_layer(layers)?;
+                let directory = crate::shared::experts::fp8::package_directory(&args.native_lib, 1, draft.format());
+                let (free, _) = self.library.cuda_memory_info()?;
+                Some(crate::shared::experts::fp8::Fp8Experts::load(&self.library, &draft, &directory,
+                    layers..layers + 1, 1, 0, args.prefill_rows,
+                    free.saturating_sub(args.expert_reserve_gib.saturating_mul(1 << 30)))
+                    .context("loading the separate resident Qwen MTP expert package")?)
+            } else { None };
+            let loads = experts.layers.len() + mtp_experts.as_ref().map_or(0, |e| e.layers.len());
             tracing::info!(layers = loads, window = ?args.expert_window, elapsed_ms = started.elapsed().as_millis() as u64,
                 "Qwen routed experts resident on this GPU");
             return Ok(Some(engine::Experts::Local(engine::LocalExperts {
-                library: &self.library, tensors, experts: std::cell::RefCell::new(experts),
+                library: &self.library, tensors, experts: std::cell::RefCell::new(experts), mtp_experts,
                 window: args.expert_window, loads: std::cell::RefCell::new(loads),
             })));
         }
