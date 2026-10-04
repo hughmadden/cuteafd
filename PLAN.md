@@ -684,8 +684,12 @@ v1 ships when these are done; everything else below moves to v1.x/v2.
   (`CUTEAFD_V41_DEVICE=1`; +1.5% C1 on 2 RTX, flat elsewhere; MiMo/GLM
   adoption on `work/device-mimo-glm` gains nothing — their segments are
   GPU-bound). It ships opt-in in v1. Turn-end prefix restores proved exact
-  (the check was wrong; fixed). V4.1 FP8 vocabulary head: single-copy gate
-  in progress.
+  (the check was wrong; fixed). V4.1 FP8 vocabulary head: Claude accepted the
+  target-head quality result (KL +0.000534 nat, NLL unchanged in practice,
+  golden top-1 472 → 465 / 512). `all` now uses one shared FP8 residency;
+  promotion requires C1/C4 ≥ 1.02 and other parity ≥ 0.98 on both layouts.
+  The single-copy gate missed C1 on dual RTX after the borderline recheck;
+  BF16 stays default and `all` stays opt-in. `draft` retains dual residency.
 - **Cut to v1.x/v2:** whole-step graphs (D4: context-length-dependent index
   graphs, per-request pointers in graph keys, host-built per-layer metadata,
   warm re-captures) and device-side draft acceptance; deterministic
@@ -745,7 +749,11 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
    µs per 129280-row head): parity, 3 interleaved sessions per arm, base → fp8d:
    2 RTX C1 183.6 → 186.4 (1.016), C4 489.0 → 512.0 (1.047), C16 1413.7 → 1442.2
    (1.020), weighted decode 0.997; 1 RTX C1 1.014, C4 1.039, C16 1.087, decode
-   1.012. Proposed as the default (outputs unchanged; drafts only). Kit:
+   1.012. Remains opt-in: the BF16 target head stays resident beside the FP8
+   draft copy, so this mode violates single residency. Claude accepted the
+   `all` quality result on `work/v41-fp8head`; its new single-copy residency
+   missed the dual-RTX C1 performance gate, so BF16 stays default.
+   Kit:
    `~/.cache/cuteafd/builds/v41-device` (STATUS.md, build-coord.sh/build-spark.sh,
    v41-ab3.sh, v41-c4.sh, run-parity.sh).
 2. **Whole-step graphs** — MiMo's per-layer segments are merged and opt-in
@@ -753,9 +761,10 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
    they pay once item 1 removes the host hops. Same for every family.
 3. **V4.1 step wins** (from the critical-path note): device-side draft
    acceptance (~0.8 ms host gap per round, up to +3%); FP8 target head
-   (draft head done, see item 1; the target head changes outputs and needs a
-   quality gate); one host thread serves both lanes (26–43% of
-   wall time in CUDA calls) — item 1 removes most of it.
+   (draft head done, see item 1; `all` quality accepted by Claude,
+   single-copy opt-in, dual-RTX C1 speedup below promotion bar); one host
+   thread serves both lanes
+   (26–43% of wall time in CUDA calls) — item 1 removes most of it.
 4. **Model-specific issues found** (fix in v1, not essential for v0):
    - GLM 5.3 Flash (likely GLM 5.3): a JSON-schema request whose grammar
      accepts the stop token keeps decoding; xgrammar `fill_bitmask` then fails
@@ -923,6 +932,11 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
     FP8 is `SPECULATOR_FP8=on`. Open: compact FP8 consumers for Qwen
     projections and GLM Flash KDA (recover the dual-copy decode speed),
     GLM target head/index operands, and a measured drafter-precision default.
+    V4.1 `all` now releases BF16 and shares a single FP8 vocabulary head
+    across target and dSpark. Claude accepted its target-head quality;
+    dual-RTX C1 missed the promotion bar, so BF16 stays default. `draft`
+    retains dual residency
+    and its earlier parity does not qualify a target-head conversion.
 11. **Parked**: Spark-side reduce-scatter ([`work/spark-reduce`](https://github.com/tpurtell/cuteafd/tree/work/spark-reduce),
    +3% one rail, +9–12% two rails at 200G); split intake
    ([`work/split-intake`](https://github.com/tpurtell/cuteafd/tree/work/split-intake), slower). Revisit only on new evidence.

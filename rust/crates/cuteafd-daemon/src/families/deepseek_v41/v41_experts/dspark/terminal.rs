@@ -63,7 +63,7 @@ impl<'library> DsparkWeights<'library> {
         let library = self.library;
         self.tensor("mtp.2.norm.weight")?;
         let local_head = head.map(|weights| -> Result<_> {
-            weights.weight()?;
+            ensure!(weights.device_id() == library.cuda_get_device()?, "dSpark head device differs");
             let workspace = DeviceAllocation::new(library, V41VocabularyProjection::WORKSPACE_BYTES)?;
             let kernel = unsafe { library.v41_vocabulary_head(workspace.buffer)? };
             let fp8_scratch = crate::families::deepseek_v41::v41_tensors::fp8_scratch(library, weights.fp8(),
@@ -240,7 +240,7 @@ impl DsparkTerminal<'_, '_> {
         unsafe {
             self.enqueue_normalize_on(requests, stream)?;
             crate::families::deepseek_v41::v41_tensors::project_vocabulary(self.stream.library, &head.kernel,
-                head.weights.weight()?, head.weights.fp8().zip(head.fp8_scratch.as_ref()), self.normalized.buffer,
+                head.weights.weight(), head.weights.fp8().zip(head.fp8_scratch.as_ref()), self.normalized.buffer,
                 self.shared_logits.buffer, requests * self.width, stream)?;
             self.enqueue_sampling_on(requests, stream)
         }

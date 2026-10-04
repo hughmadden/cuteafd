@@ -157,6 +157,15 @@ cache layout works.
    them on those hosts first (`./run.sh` does not pull). `./wip.sh --slot S --role both`
    plus `./run.sh --wip S --restart` is the faster loop while iterating.
 
+V4.1 uses one shared BF16 vocabulary head for the target and dSpark by
+default. In current WIP builds, `CUTEAFD_V41_FP8_HEAD=all` packs one E4M3
+head (or one shard per GPU), shares it across target and draft projections,
+and releases BF16 once packing completes. `off` selects BF16. The
+experimental `draft` mode adds FP8 for dSpark while retaining BF16 for the
+target, using dual residency.
+The target-head quality result was accepted, but single-copy `all` did not
+clear the required C1 speedup on dual RTX, so BF16 remains the default.
+
 ## Working on it
 
 [`AGENTS.md`](AGENTS.md) is the standing guide for agents and collaborators

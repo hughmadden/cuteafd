@@ -190,7 +190,7 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
         check.summary = format!("the reference needs {} tokens of context", tokens.len());
         return Ok(());
     }
-    let spec = ProbeSpec { prompt_ids: Some(tokens), score_from: Some(reference.score_from), top_k: 1,
+    let spec = ProbeSpec { prompt_ids: Some(tokens), score_from: Some(reference.score_from), top_k: reference.top_k,
         want: reference.want(), cold: true, ..ProbeSpec::default() };
     let chat = run.client.chat(plain("fidelity probe", 1), Some(spec))?;
     let record = probe_of(&chat)?;
@@ -211,6 +211,9 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     check.set("kl_max", reference.expect.kl_max);
     check.set("top1_min", reference.expect.top1_min);
     check.set("reference", reference.name.clone());
+    // Preserve the teacher-forced rows so two weight policies can be compared
+    // on the same positions, including top-1 flips hidden by aggregate scores.
+    check.set("probe", serde_json::to_value(record)?);
     let ok = f.missing == 0 && f.non_finite == 0 && f.kl <= reference.expect.kl_max
         && f.top1 >= reference.expect.top1_min;
     check.status = if ok { CheckStatus::Pass } else { CheckStatus::Fail };
