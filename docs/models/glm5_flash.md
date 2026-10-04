@@ -44,39 +44,54 @@ Attention (KDA), a minority run MLA + DSA.
 - KV format: FP8 MLA latent record on the MLA+DSA layers; a recurrent FP32
   state per KDA layer plus short-convolution state.
 - RTX/Spark layouts: scales from 1 RTX with local experts up through
-  multi-Spark TP for the full checkpoint; head split is not this family's
-  default today (DFlash2 and KDA state rollback dominate the latency
-  budget).
+  multi-Spark TP for the full checkpoint. `RTX_GPUS=auto/2` selects the
+  two-GPU head split when both coordinator GPUs are available;
+  `RTX_GPUS=1` or `COORDINATOR_SPLIT=off` serves from one GPU.
 - Prefix cache: merged — 256-row units (4 MLA pages plus the pool page) and
   a KDA recurrent-state mark at the commit point (`kda_len`).
 
 ## Default precision (single residency)
 
-Every weight has one resident format. Precision is chosen by measurement:
-FP8 converts at load into the only copy where it is faster and the golden
-stays within ~0.005 nat KL/NLL; drafters run FP8 whenever emitted tok/s is
-higher (they cannot change the output). Measured 2026-10-03, natural minimum,
-one warm launch per arm, `CONCURRENCY=4`, code tok/s (C4 aggregate), golden
-512 tokens.
+Every weight has one resident format. The launcher resolves precision after
+it chooses the serving layout: with one coordinator GPU,
+`GLM5_FLASH_KDA_FP8=auto` (including unset) selects `row128` and
+`GLM5_FLASH_FP8_HEAD=auto` selects `on`; with the two-GPU head split they
+select `off` (BF16 KDA and head). Explicit `off/row128/channel` KDA and
+`on/off` head settings always win, including the deprecated `GLMF_*` keys;
+current names take precedence over deprecated names. The DFlash2 drafter
+defaults to FP8 on both layouts; `SPECULATOR_FP8=off` keeps it BF16.
 
-| Arm | C1 | C4 | 8K prefill | KL · top-1 · NLL |
-| --- | ---: | ---: | ---: | --- |
-| checkpoint (BF16 KDA, head, drafter) | 72.3 | 113.8 | 2,319 | 0.046 · 89.1% · 3.481 |
-| **FP8 drafter (default)** | 77.1 | 118.3 | 2,666 | 0.046 · 89.1% · 3.481 |
-| FP8 KDA row128 + drafter | 69.9 | 113.5 | 4,764 | 0.043 · 86.9% · 3.474 |
-| FP8 head + drafter | 70.4 | 121.6 | 2,972 | 0.047 · 87.9% · 3.476 |
-| FP8 KDA row128 + head + drafter | 77.6 | 131.8 | 2,191 | 0.044 · 85.7% · 3.470 |
+Matched recheck, 2026-10-04: GLM 5.3 Flash EXL3 K3.25, RTX PRO 6000 at
+325 W, fixed code prompts/nonces, one warm batch per concurrency, 512
+identical teacher-forced golden positions (reference NLL 3.45433). D uses
+BF16 KDA/head + FP8 drafter; F uses FP8 row128 KDA/head/drafter. Rates are
+emitted tok/s; C4 is aggregate. Agentic timing replays one common four-turn
+reasoning-enabled history and reports median per-turn decode rate.
 
-GLM 5.3 Flash EXL3 K3.25, 1 RTX + 2 Sparks. The default keeps the checkpoint's
-BF16 KDA projections and LM head (one copy each) and runs the DFlash2 drafter
-FP8. FP8 KDA + head is faster at C4 (131.8 vs 118.3) and saves memory (KDA
-4.43 vs 8.79 GiB single copy, head 0.61 vs 1.79 GiB) but costs 3.4 points top-1
-and doubles verify-vs-decode rounding (glmf-golden `--replay-check 6`, local
-EXL3 experts: kept-row KL vs serial steps 0.0121 vs 0.0056 nat, max recurrent
-state delta 0.37 vs 0.12; commit and rejected-suffix causality exact in both),
-which flipped greedy output under speculation by 1.03 nats in the release
-smoke. Opt in with `GLM5_FLASH_KDA_FP8=row128` and `GLM5_FLASH_FP8_HEAD=on`;
-`SPECULATOR_FP8=off` keeps the drafter BF16.
+1 RTX + 2 Sparks, medians of three interleaved launches per arm:
+
+| Arm | C1 | C4 | 8K prefill | Agentic | Top-1 | KL | NLL |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| D | 101.9 | 159.4 | 5,141 | 127.6 | 87.11% | 0.04288 | 3.47328 |
+| **F (default)** | **111.1** | **172.4** | **5,137** | **132.6** | 86.52% | 0.04231 | 3.46966 |
+
+F gains 9.0% C1, 8.2% C4 and 3.9% agentic decode, with 0.59 points less
+top-1 and better KL/NLL. Readiness medians were 41 → 43 s (worker and
+container startup included).
+
+2 RTX + 4 Sparks, head split, one warm launch per arm:
+
+| Arm | C1 | C4 | 8K prefill | Agentic | Top-1 | KL | NLL |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **D (default)** | **157.6** | **283.2** | **6,767** | **202.0** | 88.48% | 0.04508 | 3.47410 |
+| F (opt-in) | 172.1 | 255.7 | 5,113 | 209.4 | 86.91% | 0.04780 | 3.47082 |
+
+F gains 9.2% C1 but loses 9.7% C4 and 24.4% prefill, loses 1.56 top-1
+points and worsens KL. It fails the promotion bar under the head split.
+Readiness was 53 → 50 s. Both arms/layouts pass fidelity and exact
+prefix-cache restores; the speculation check permits verify rounding and
+does not establish byte-identical speculative output. See the
+[full comparison and conditions](../../benchmarks/glm5_flash/2026-10-04-fp8-recheck/comparison.json).
 
 ## Known limits
 

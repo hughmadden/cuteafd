@@ -287,54 +287,6 @@ if [[ $family =~ ^(glm5|qwen4|deepseek_v4)$ && -n "$(get POOL_TOKENS "$glm_defau
   fi
   family_args+=(--pool-tokens "$pool")
 fi
-# GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
-# from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" requires native
-# FP8 block tensors in the primary checkpoint, else BF16 ones are quantized to
-# 128x128 blocks at load). GLM5_FLASH_KDA_FP8 (unset/auto/off = the checkpoint's
-# BF16, one copy; row128 or channel) opts into per-row FP8 KDA in/out projections
-# (their only resident copy: faster, but -3.4 points top-1 and twice the verify
-# rounding). GLM5_FLASH_FP8_HEAD (default off) opts into a per-row FP8 LM head
-# (target and drafter); the DFlash2 drafter stays FP8 by default.
-# Its MLA pools hold POOL_TOKENS tokens (a key every
-# family with a paged KV pool reads). GLM5_FLASH_FP8_PREFILL lists the prefill
-# projections that run W8A8 (E4M3 activations per 128-K block): unset = the
-# engine default mla,ffn, a list of mla,ffn,kda-in,kda-o / all (kda-* need
-# GLM5_FLASH_KDA_FP8 row128/channel), or off (every FP8 weight W8A16). The
-# GLMF_* spellings still work for one release.
-if [[ $family == glm5_flash ]]; then
-  fp8_model="$(key GLM5_FLASH_FP8_MODEL_ID GLMF_FP8_MODEL_ID zai-org/GLM-5.3-Flash)"
-  if [[ "$fp8_model" != off ]]; then
-    fp8_snapshot="$(snapshot_of "$fp8_model" "$(key GLM5_FLASH_FP8_MODEL_REVISION GLMF_FP8_MODEL_REVISION)")" || exit 1
-    family_args+=(--fp8-decode --fp8-snapshot "$fp8_snapshot")
-  fi
-  kda_fp8="$(key GLM5_FLASH_KDA_FP8 GLMF_KDA_FP8 auto)"
-  case "$kda_fp8" in
-    ""|auto) kda_fp8=off ;;
-    off|row128|channel) ;;
-    *) echo "GLM5_FLASH_KDA_FP8 must be auto, off, row128 or channel" >&2; exit 2 ;;
-  esac
-  # Default auto (GLM 5.3 Flash 1 RTX + 2: 65536 -> 2,097,152 tokens, 44 GiB still free, speed unchanged).
-  glmf_pool="$(get POOL_TOKENS auto)"; [[ "$glmf_pool" != auto ]] || glmf_pool=0
-  family_args+=(--kda-fp8 "$kda_fp8" --pool-tokens "$glmf_pool")
-  case "$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD off)" in
-    on) family_args+=(--fp8-head true) ;;
-    off|auto|"") family_args+=(--fp8-head false) ;;
-    *) echo "GLM5_FLASH_FP8_HEAD must be on or off" >&2; exit 2 ;;
-  esac
-  fp8_prefill="$(key GLM5_FLASH_FP8_PREFILL GLMF_FP8_PREFILL)"
-  case ",$fp8_prefill," in
-    *,all,*|*,kda-in,*|*,kda-o,*)
-      if [[ $kda_fp8 == off ]]; then
-        echo "GLM5_FLASH_FP8_PREFILL=$fp8_prefill runs KDA W8A8 over FP8 KDA weights; set GLM5_FLASH_KDA_FP8=row128 or channel" >&2
-        exit 2
-      fi ;;
-  esac
-  case "$fp8_prefill" in
-    "") ;;
-    off) family_args+=(--fp8-prefill none) ;;
-    *) family_args+=(--fp8-prefill "$fp8_prefill") ;;
-  esac
-fi
 # COPY_DRAFTS=off: decode without copy-window drafts (serve-glm, serve-glmf, serve-mimo, serve-qwen4).
 if [[ "$(get COPY_DRAFTS on)" == off ]]; then
   [[ $serve != serve-dsv4 ]] || { echo "COPY_DRAFTS applies to GLM, MiMo and Qwen checkpoints" >&2; exit 2; }
@@ -467,6 +419,7 @@ if [[ "$split" != off && "$explicit_split" == 1 ]]; then
     { echo "RTX_GPUS=2 requires two physical coordinator GPUs; only GPU $gpu was selected" >&2; exit 2; }
 fi
 gpus="device=$gpu"
+head_split=0
 if [[ -n "$second" && "$split" != off ]]; then
   [[ "$second" =~ ^[0-9]+$ ]] || { echo "COORDINATOR_SPLIT_GPU must be a GPU index" >&2; exit 2; }
   [[ "$second" != "$gpu" ]] || { echo "the second coordinator GPU must differ from the first" >&2; exit 2; }
@@ -477,10 +430,63 @@ if [[ -n "$second" && "$split" != off ]]; then
     done
     lower=$((gpu < second ? gpu : second)) upper=$((gpu < second ? second : gpu))
     gpus="\"device=$lower,$upper\""
+    head_split=1
     family_args+=(--device $((gpu == lower ? 0 : 1)) --split-device $((gpu == lower ? 1 : 0)))
   elif [[ "$explicit_split" != 1 ]]; then
     echo "note: $family ($model_type) has no head split; auto selected GPU $gpu alone" >&2
   fi
+fi
+# GLM 5.3 Flash: the MLA, dense and shared-expert projections are FP8 only,
+# from the official FP8 release (GLM5_FLASH_FP8_MODEL_ID; "off" requires native
+# FP8 block tensors in the primary checkpoint, else BF16 ones are quantized to
+# 128x128 blocks at load). Resolve precision after the serving split: one GPU
+# defaults to row128 KDA and an FP8 head; a two-GPU head split keeps BF16 KDA
+# and head. Explicit current or legacy keys override either layout default.
+# Each weight has one resident copy; the DFlash2 drafter stays FP8 by default.
+# Its MLA pools hold POOL_TOKENS tokens (a key every
+# family with a paged KV pool reads). GLM5_FLASH_FP8_PREFILL lists the prefill
+# projections that run W8A8 (E4M3 activations per 128-K block): unset = the
+# engine default mla,ffn, a list of mla,ffn,kda-in,kda-o / all (kda-* need
+# GLM5_FLASH_KDA_FP8 row128/channel), or off (every FP8 weight W8A16). The
+# GLMF_* spellings still work for one release.
+if [[ $family == glm5_flash ]]; then
+  fp8_model="$(key GLM5_FLASH_FP8_MODEL_ID GLMF_FP8_MODEL_ID zai-org/GLM-5.3-Flash)"
+  if [[ "$fp8_model" != off ]]; then
+    fp8_snapshot="$(snapshot_of "$fp8_model" "$(key GLM5_FLASH_FP8_MODEL_REVISION GLMF_FP8_MODEL_REVISION)")" || exit 1
+    family_args+=(--fp8-decode --fp8-snapshot "$fp8_snapshot")
+  fi
+  kda_fp8="$(key GLM5_FLASH_KDA_FP8 GLMF_KDA_FP8 auto)"
+  case "$kda_fp8" in
+    ""|auto) kda_fp8=row128; [[ $head_split == 0 ]] || kda_fp8=off ;;
+    off|row128|channel) ;;
+    *) echo "GLM5_FLASH_KDA_FP8 must be auto, off, row128 or channel" >&2; exit 2 ;;
+  esac
+  # Default auto (GLM 5.3 Flash 1 RTX + 2: 65536 -> 2,097,152 tokens, 44 GiB still free, speed unchanged).
+  glmf_pool="$(get POOL_TOKENS auto)"; [[ "$glmf_pool" != auto ]] || glmf_pool=0
+  family_args+=(--kda-fp8 "$kda_fp8" --pool-tokens "$glmf_pool")
+  fp8_head="$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD auto)"
+  case "$fp8_head" in
+    ""|auto) fp8_head=on; [[ $head_split == 0 ]] || fp8_head=off ;;
+    on|off) ;;
+    *) echo "GLM5_FLASH_FP8_HEAD must be auto, on or off" >&2; exit 2 ;;
+  esac
+  case "$fp8_head" in
+    on) family_args+=(--fp8-head true) ;;
+    off) family_args+=(--fp8-head false) ;;
+  esac
+  fp8_prefill="$(key GLM5_FLASH_FP8_PREFILL GLMF_FP8_PREFILL)"
+  case ",$fp8_prefill," in
+    *,all,*|*,kda-in,*|*,kda-o,*)
+      if [[ $kda_fp8 == off ]]; then
+        echo "GLM5_FLASH_FP8_PREFILL=$fp8_prefill runs KDA W8A8 over FP8 KDA weights; set GLM5_FLASH_KDA_FP8=row128 or channel" >&2
+        exit 2
+      fi ;;
+  esac
+  case "$fp8_prefill" in
+    "") ;;
+    off) family_args+=(--fp8-prefill none) ;;
+    *) family_args+=(--fp8-prefill "$fp8_prefill") ;;
+  esac
 fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is

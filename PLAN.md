@@ -957,13 +957,17 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
     explicit option; drafter precision is chosen by emitted tok/s and memory.
     Landed: MiMo resolves head/O/drafter formats from headers; MiMo V2.6
     Pro defaults to single-copy FP8 head/O/DFlash (TJ-approved exception;
-    `MIMO_WEIGHT_POLICY=checkpoint` opts out). Dual-copy options now fail
-    before loading until single-copy consumers exist: Qwen
-    `--fp8-decode`/`--mtp-fp8-head`, GLM Flash KDA `row128`/`channel` and
-    FP8 head. GLM/GLM Flash DFlash default to checkpoint BF16; single-copy
-    FP8 is `SPECULATOR_FP8=on`. Open: compact FP8 consumers for Qwen
-    projections and GLM Flash KDA (recover the dual-copy decode speed),
-    GLM target head/index operands, and a measured drafter-precision default.
+    `MIMO_WEIGHT_POLICY=checkpoint` opts out). Qwen and GLM Flash now have
+    compact single-copy FP8 consumers; GLM/GLM Flash DFlash defaults to FP8
+    (`SPECULATOR_FP8=off` retains checkpoint BF16).
+    **GLM Flash precision recheck (2026-10-04, Claude decision):** resolve
+    launcher defaults after the actual coordinator split is selected.
+    One serving GPU uses row128 FP8 KDA and an FP8 head; two-GPU head split
+    uses BF16 KDA/head. Explicit current or deprecated precision keys win
+    independently. The matched EXL3 K3.25 recheck clears the single-GPU
+    quality/C4 bars; FP8 under the split misses both, so remains opt-in.
+    Conditions and both tables: `docs/models/glm5_flash.md` and
+    `benchmarks/glm5_flash/2026-10-04-fp8-recheck/comparison.json`.
     V4.1 `all` now releases BF16 and shares a single FP8 vocabulary head
     across target and dSpark. Claude accepted its target-head quality;
     dual-RTX C1 missed the promotion bar, so BF16 stays default. `draft`
