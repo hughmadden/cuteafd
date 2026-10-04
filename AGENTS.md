@@ -7,6 +7,10 @@ after tables with conditions.
 
 ## Working method
 
+- Disk: builds live on raptor's root NVMe and fill it fast (1.4 TB of
+  `builds/` once filled the disk and crashed runs). When a task finishes,
+  delete its Cargo `target*` directories and release staging; keep sources,
+  logs and results. Check `df -h /` before large builds.
 - Lock order: when a run needs both locks, take `sparks.lock` first, then
   `gpu1.lock` (as `~/.cache/cuteafd/builds/tp2/locked2.sh` does); never hold
   one while waiting on the other in the opposite order — that deadlocks the
