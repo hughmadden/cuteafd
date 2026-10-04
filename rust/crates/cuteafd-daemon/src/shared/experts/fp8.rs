@@ -121,7 +121,7 @@ pub(crate) fn nvfp4_activations() -> Nvfp4Activations {
 }
 
 /// Exact slices: a package that also holds `tp<n>-w<width>` layouts (ranks
-/// owning whole 128-row blocks, each stored at its own width) serves rank
+/// owning whole 128-row blocks, or opt-in MXFP4 K32 blocks) serves rank
 /// `rank` from its width's layout when every rank's width is packaged (all
 /// ranks decide alike). Otherwise the padded `tp<n>` layout.
 /// CUTEAFD_FP8_EXACT_SLICES=0 keeps the padded layout.

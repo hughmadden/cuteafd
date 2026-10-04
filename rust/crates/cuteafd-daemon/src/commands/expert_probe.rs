@@ -254,7 +254,7 @@ fn report(what: &str, exl3: bool, actual: &[f32], expected: &[f32], remote: Dura
         cosine > 0.9999 && rel_l2 < 0.01
     };
     println!(
-        "{} {what}{}: cosine {cosine:.6} rel_l2 {rel_l2:.2e} remote {:.2} ms oracle {:.1} s",
+        "{} {what}{}: cosine {cosine:.9} rel_l2 {rel_l2:.2e} remote {:.2} ms oracle {:.1} s",
         if pass { "PASS" } else { "FAIL" },
         if exl3 { " exl3" } else { "" },
         remote.as_secs_f64() * 1e3,
