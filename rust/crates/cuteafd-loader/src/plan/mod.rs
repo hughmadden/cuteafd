@@ -178,6 +178,8 @@ pub struct PlanOptions {
     pub coordinator_budget_bytes: u64,
     /// Also lay out every device's memory (`plan --layout`).
     pub layout: Option<layout::LayoutOptions>,
+    /// Describe an opt-in package built with CUTEAFD_V41_EXACT_SPARK_SLICES=ON.
+    pub v41_exact_slices: bool,
 }
 
 impl Default for PlanOptions {
@@ -187,6 +189,7 @@ impl Default for PlanOptions {
             spark_budget_bytes: 100 << 30,
             coordinator_budget_bytes: 80 << 30,
             layout: None,
+            v41_exact_slices: false,
         }
     }
 }
@@ -469,6 +472,12 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
         let share = |ranks: usize| -> Option<f64> {
             let contract = contract.as_ref()?;
             let i = intermediate?;
+            // Native V4.1 MXFP4 has exact 576-row TP4 tails. EXL3
+            // uses its own whole-block packages; do not change that contract.
+            if options.v41_exact_slices && spec.family == "deepseek_v41" && spec.hidden == 5120
+                && i == 2304 && contract.package == "v41:mxfp4 (expertd-native)" && ranks == 4 {
+                return Some(1.0 / ranks as f64);
+            }
             experts::stored_slice(i, contract.block, ranks).map(|slice| slice as f64 / i as f64)
         };
         let fits_on = |ranks: usize| share(ranks).is_some_and(|s| routed as f64 * s <= options.spark_budget_bytes as f64);

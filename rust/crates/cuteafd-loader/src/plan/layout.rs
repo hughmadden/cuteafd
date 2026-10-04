@@ -298,7 +298,8 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
         let stored = (routed as f64 * report.spark_rank_share) as u64;
         let even = routed / ranks.max(1) as u64;
         // EXL3 packages and FP8/MXFP4/NVFP4 packages with exact layouts store each
-        // rank's own whole 128-row blocks; other packages (V4.1 native) pad every
+        // rank's own whole 128-row blocks; V4.1 MXFP4 TP4 stores exact
+        // 576-row slices when requested. Other packages pad every
         // rank to the widest slice.
         let package = report.experts.as_ref().map_or("", |e| e.package.as_str());
         let intermediate = model.spec().moe.as_ref().map_or(0, |m| m.intermediate);
@@ -317,7 +318,13 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
                 items: Vec::new(), kv_tokens: 0 };
             let format = report.components.iter().find(|c| c.owner == Owner::SparkSliced)
                 .map(|c| c.formats.keys().cloned().collect::<Vec<_>>().join("+")).unwrap_or_default();
-            device.items.push(Item::new(Category::Experts, "routed_expert", format, stored, Basis::Exact));
+            let label = if package == "v41:mxfp4 (expertd-native)" && ranks == 4
+                && model.spec().hidden == 5120 && intermediate == 2304 && report.spark_rank_share == 0.25 {
+                "routed_expert (576 rows/rank; exact)"
+            } else {
+                "routed_expert"
+            };
+            device.items.push(Item::new(Category::Experts, label, format, stored, Basis::Exact));
             let workspace = costs.spark_workspace_bytes * options.spark_capacity_rows / 4096;
             device.items.push(Item::new(Category::Workspace, "expert waves", "", workspace, Basis::Calibrated));
             device.items.push(Item::new(Category::Transport, "rdma rings", "", costs.spark_ring_bytes, Basis::Calibrated));

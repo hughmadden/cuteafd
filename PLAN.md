@@ -586,8 +586,14 @@ Follow-ups (2026-10-03, measurements pending in `~/.cache/cuteafd/builds/v1-memo
   BF16 route's loads; the A8 route needs predicated cp.async), and scale rows
   of I/32 = 11 bytes need padding to 12 in the package layout. Expected: busiest
   rank -5..-8% expert time (MiMo Pro prefill is Spark-bound) and -7.7 GiB on
-  ranks 0-3. V4.1 TP4 (576 -> 640)
-  goes through the V4.1 packer: not done.
+  ranks 0-3. V4.1 TP4 exact 576-row packages are implemented through its own packer
+  and N128/K128 staging with N64/K64 tails, opt-in pending C16 parity. Build
+  with `CUTEAFD_WIP_V41_EXACT_SPARK_SLICES=ON` (release spelling:
+  `CUTEAFD_RELEASE_V41_EXACT_SPARK_SLICES=ON`); describe that package with
+  `cuteafd plan MODEL --layout --v41-exact-slices`. The padded default stays
+  qualified; exact storage passes real-layer oracle, golden NLL and byte-exact
+  cache gates, but misses the combined quick C16 performance bar. An
+  intermittent smoke `spec_lossless` failure also remains to investigate.
 - V4.1 one RTX: row buffers at the live 2048-row chunk instead of the 4096 AOT
   capacity (as on two RTX), reindex selection shares the source's scratch:
   workspaces 21.08 -> 11.01 GiB, RTX expert layers 5 -> 6 (6.0 GiB still free),

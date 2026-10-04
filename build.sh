@@ -464,6 +464,7 @@ docker run --rm \
   -e NVIDIA_VISIBLE_DEVICES=0 \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}" \
   -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families" \
+  -e "CUTEAFD_RELEASE_V41_EXACT_SPARK_SLICES=${CUTEAFD_RELEASE_V41_EXACT_SPARK_SLICES:-OFF}" \
   -e "CUTEAFD_RELEASE_GLM_AOT=${CUTEAFD_RELEASE_GLM_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_MIMO_AOT=${CUTEAFD_RELEASE_MIMO_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_MIMO_GEOMETRIES=${CUTEAFD_RELEASE_MIMO_GEOMETRIES:-mimo,mimo2,mimop,mimop2}" \
@@ -542,7 +543,8 @@ release_ssh "$seed_host" bash -s -- \
   "$EXL3_PAIRED_TP4" "${source_manifest_sha256:-__legacy__}" "$(r="${spark_tp_roles//;/,}"; echo "${r:-__legacy__}")" \
   "${release_build_root:-__legacy__}" \
   "$(f="${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}"; f="${f//;/,}"; echo "${f:-__legacy__}")" \
-  "$(f="${bf16_families//;/,}"; echo "${f:-__legacy__}")" <<'REMOTE'
+  "$(f="${bf16_families//;/,}"; echo "${f:-__legacy__}")" \
+  "${CUTEAFD_RELEASE_V41_EXACT_SPARK_SLICES:-OFF}" <<'REMOTE'
 set -euo pipefail
 remote_dir="$1"
 dev_image="$2"
@@ -568,6 +570,7 @@ expert_families="${11-__legacy__}"
 expert_families="${expert_families//,/;}"
 # Optional BF16-input siblings travel with a sentinel and the same comma encoding.
 bf16_families="${12-__legacy__}"
+v41_exact_slices="${13-OFF}"
 [[ "$bf16_families" != "__legacy__" ]] || bf16_families=
 bf16_families="${bf16_families//,/;}"
 [[ "$source_manifest_sha256" != "__legacy__" ]] || source_manifest_sha256=
@@ -606,6 +609,7 @@ docker run --rm \
   --ulimit memlock=-1:-1 \
   -e "CUTEAFD_RELEASE_EXL3_PAIRED_TP4=$exl3_paired_tp4" \
   -e "CUTEAFD_RELEASE_SPARK_TP_ROLES=$spark_tp_roles" \
+  -e "CUTEAFD_RELEASE_V41_EXACT_SPARK_SLICES=$v41_exact_slices" \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=$expert_families" \
   -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families" \
   ${release_build_root_args[@]+"${release_build_root_args[@]}"} \

@@ -179,6 +179,9 @@ pub(crate) struct PlanArgs {
     /// workspaces, runtime and Spark buffers.
     #[arg(long)]
     pub(crate) layout: bool,
+    /// Describe experimental V4.1 TP4 packages built with exact Spark slices.
+    #[arg(long)]
+    pub(crate) v41_exact_slices: bool,
     /// Coordinator GPUs for --layout (1 or 2; two split attention heads).
     #[arg(long, default_value_t = 1)]
     pub(crate) rtx: usize,

@@ -104,6 +104,37 @@ fn deepseek_v41_components_formats_and_placement() {
 }
 
 #[test]
+fn v41_tp4_mxfp4_layout_has_no_resident_padding() {
+    let snapshot = snapshot(v41_config(), &[
+        t("layers.0.ffn.experts.0.w1.weight", "I8", &[2304, 2560]),
+        t("layers.0.ffn.experts.0.w1.scale", "F8_E8M0", &[2304, 160]),
+    ]);
+    let mut options = sparks(4);
+    options.layout = Some(super::layout::LayoutOptions::default());
+    options.v41_exact_slices = true;
+    let report = plan(snapshot.path(), &options).unwrap();
+    assert_eq!(report.spark_rank_share, 0.25);
+    let layout = report.memory_layout.as_ref().unwrap();
+    let ranks: Vec<_> = layout.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark).collect();
+    assert_eq!(ranks.len(), 4);
+    let source = report.components.iter().find(|c| c.owner == Owner::SparkSliced).unwrap().bytes;
+    for rank in ranks {
+        let expert = rank.items.iter().find(|i| i.category == cuteafd_core::memory_layout::Category::Experts).unwrap();
+        assert_eq!(expert.bytes, source / 4);
+        assert!(expert.group.contains("576 rows/rank; exact"));
+    }
+    assert!(!layout.waste.iter().any(|w| w.what.contains("routed slices padded")));
+    // The qualified padded default stays unchanged until the performance gate wins.
+    options.v41_exact_slices = false;
+    let padded = plan(snapshot.path(), &options).unwrap();
+    assert_eq!(padded.spark_rank_share, 640.0 / 2304.0);
+    assert!(padded.memory_layout.unwrap().waste.iter().any(|w| w.what.contains("routed slices padded")));
+    // Aligned TP2 retains its existing pack contract.
+    let tp2 = plan(snapshot.path(), &sparks(2)).unwrap();
+    assert_eq!(tp2.spark_rank_share, 0.5);
+}
+
+#[test]
 fn v41_rejects_an_unsupported_expert_format_with_a_hint() {
     let dir = snapshot(
         v41_config(),

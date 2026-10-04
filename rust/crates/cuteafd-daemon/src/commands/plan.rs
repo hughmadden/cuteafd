@@ -10,6 +10,7 @@ use crate::cli::PlanArgs;
 fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     let options = PlanOptions {
         placement: ExpertPlacement::from_spark_ranks(args.spark_ranks),
+        v41_exact_slices: args.v41_exact_slices,
         spark_budget_bytes: budget_bytes("--spark-budget-gib", args.spark_budget_gib)?,
         coordinator_budget_bytes: budget_bytes("--coordinator-budget-gib", args.coordinator_budget_gib)?,
         layout: args.layout.then(|| -> Result<_, PlanError> {
@@ -85,6 +86,7 @@ mod tests {
             json: true,
             require_ready,
             layout: true,
+            v41_exact_slices: false,
             rtx: 2,
             rtx_gib: 95.5,
             pool_tokens: None,
