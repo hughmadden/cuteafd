@@ -91,7 +91,7 @@ pub(crate) struct VocabularyHead<'library> {
 
 /// E4M3 vocabulary heads (`CUTEAFD_V41_FP8_HEAD`): `draft` projects only the
 /// dSpark draft head through an FP8 copy (outputs unchanged, acceptance may
-/// move), `all` the target head too; off by default. Copies use per-row x
+/// move), `all` (default) both heads from one FP8 copy; `off` keeps BF16. Copies use per-row x
 /// 128-K FP32 scales (`fp8_linear`, the better of amax and power-of-two per
 /// block) and the W8A16 tensor-core GEMV. `all` releases BF16 after packing;
 /// `draft` retains BF16 for target projections.
@@ -101,11 +101,11 @@ pub(crate) fn fp8_head() -> Fp8Head {
     static MODE: std::sync::OnceLock<Fp8Head> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
         let mode = match std::env::var("CUTEAFD_V41_FP8_HEAD").as_deref() {
+            Ok("off" | "0" | "bf16") => Fp8Head::Off,
             Ok("draft") => Fp8Head::Draft,
-            Ok("all" | "1" | "on") => Fp8Head::All,
-            _ => Fp8Head::Off,
+            _ => Fp8Head::All,
         };
-        if mode != Fp8Head::Off { tracing::info!(?mode, "V4.1 FP8 vocabulary heads"); }
+        tracing::info!(?mode, "V4.1 vocabulary heads");
         mode
     })
 }
