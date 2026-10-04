@@ -1,9 +1,10 @@
 # Working on cuteafd
 
 Read `PLAN.md` first. This file is the standing rules. Code is king: keep
-external documentation to this file, `PLAN.md`, one README and the
-`benchmarks/` index; measurements go in commit messages as short before →
-after tables with conditions.
+external documentation to this file, `PLAN.md`, `USING_AGENTS.md` (how the
+orchestrator, Claude subagents and Codex split and run the work), one README
+and the `benchmarks/` index; measurements go in commit messages as short
+before → after tables with conditions.
 
 ## Working method
 
