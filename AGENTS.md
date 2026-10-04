@@ -7,6 +7,10 @@ after tables with conditions.
 
 ## Working method
 
+- Lock order: when a run needs both locks, take `sparks.lock` first, then
+  `gpu1.lock` (as `~/.cache/cuteafd/builds/tp2/locked2.sh` does); never hold
+  one while waiting on the other in the opposite order — that deadlocks the
+  cluster. Every lock wait and run has a timeout.
 - Waiting costs tokens, sleeping doesn't: start a long run as one background
   command that blocks until it finishes (a lock wait or a loop sleeping ≥60 s)
   and let its completion wake you. Don't poll status or tail logs in between;
