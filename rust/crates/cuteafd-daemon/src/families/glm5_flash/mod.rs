@@ -38,6 +38,9 @@ pub(crate) struct EngineArgs {
     /// Router, routed experts, LM head and drafter stay on --device.
     #[arg(long)]
     pub split_device: Option<i32>,
+    /// Join both shared-expert halves before the routed-expert reduction (Spark head split only).
+    #[arg(long, env = "CUTEAFD_GLMF_SPLIT_SHARED_FIRST", default_value_t = false)]
+    pub split_shared_first: bool,
     /// Run only the first N layers (layers 0-2 are the dense ones).
     #[arg(long)]
     pub layers: Option<usize>,
@@ -247,6 +250,30 @@ mod draft_cli_tests {
         assert_eq!(engine::output_shard_reserve(4096, 4096), 134_217_728);
         assert_eq!(engine::output_shard_reserve(32, 4096), 2_097_152);
     }
+
+    #[test]
+    fn shared_first_requires_distinct_split_devices_and_real_spark_experts() {
+        assert!(!parse(&[]).split_shared_first);
+        for extra in [
+            &["--split-shared-first"][..],
+            &["--split-shared-first", "--peers", "127.0.0.1:3000"][..],
+            &["--split-shared-first", "--split-device", "1"][..],
+            &["--split-shared-first", "--split-device", "0", "--peers", "127.0.0.1:3000"][..],
+            &["--split-shared-first", "--split-device", "1", "--peers", ""][..],
+            &["--split-shared-first", "--split-device", "1", "--peers", "127.0.0.1:3000", "--skip-experts"][..],
+            &["--split-shared-first", "--split-device", "1", "--local-experts"][..],
+        ] {
+            let error = check_options(&parse(extra)).unwrap_err().to_string();
+            assert!(error.contains("--split-shared-first requires"), "{error}");
+        }
+        let enabled = parse(&["--split-shared-first", "--split-device", "1", "--peers", "127.0.0.1:3000"]);
+        check_options(&enabled).unwrap();
+        assert!(enabled.split_shared_first);
+        // Existing flat, split and diagnostic expert modes keep their option contract.
+        for extra in [&["--split-device", "1"][..], &["--skip-experts"][..], &["--local-experts"][..]] {
+            check_options(&parse(extra)).unwrap();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -374,6 +401,10 @@ pub(crate) struct GoldenArgs {
 
 /// Option combinations rejected before any checkpoint or native work.
 fn check_options(args: &EngineArgs) -> Result<()> {
+    ensure!(!args.split_shared_first || (args.split_device.is_some_and(|peer| peer != args.device)
+        && args.peers.as_deref().is_some_and(|peers| !peers.trim().is_empty())
+        && !args.local_experts && !args.skip_experts),
+        "--split-shared-first requires distinct --device/--split-device and Spark --peers without local/skipped experts");
     let precise = args.kda_fp32_partials || args.kda_output_shard;
     ensure!(!(precise || args.kda_prefill_expanded) ||
         (args.split_device.is_some() && args.kda_fp8 != fp8::KdaFp8::Off),
@@ -558,6 +589,7 @@ impl Opened {
         engine.kda_fp32_partials = args.kda_fp32_partials;
         engine.kda_output_shard = args.kda_output_shard;
         engine.kda_prefill_expanded = args.kda_prefill_expanded;
+        engine.split_shared_first = args.split_shared_first;
         if let Some((device, peer_stream)) = peer_stream {
             engine.attach_peer(device, peer_stream, shares.pop().context("head-split shares")?)?;
             tracing::info!(device = args.device, split_device = device, "GLM 5.3 Flash head split over two GPUs");
