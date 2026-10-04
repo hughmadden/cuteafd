@@ -33,21 +33,20 @@ change is checked against its parity numbers before merging.
   4 Sparks. V4.1 keeps the coordinator layer-range split by default — the
   measured head-split hop cost on this fabric does not clear the bar its
   attention weights would need to win (see `PLAN.md` Phase 6).
-- Vocabulary head: BF16 stays the default after the single-copy FP8 gate
-  missed the dual-RTX C1 promotion bar. `CUTEAFD_V41_FP8_HEAD=all` uses one
+- Vocabulary head: RC1 and RC2 default to `CUTEAFD_V41_FP8_HEAD=all`, one
   shared E4M3 copy for target and dSpark (FP32 scales per row and 128-wide K
-  block), partitioned by vocabulary rows on dual RTX, and releases BF16
-  after packing. `off` keeps BF16; `draft` retains both formats. Target-head
-  quality was accepted (golden KL +0.000534 nat, practically unchanged NLL,
-  top-1 472 → 465 of 512); the opt-in modes do not qualify a default change.
+  block), partitioned by vocabulary rows on dual RTX. BF16 is released after
+  packing. `off` keeps BF16; `draft` retains both formats. Earlier release
+  notes incorrectly described BF16 as the default. The matched two-RTX
+  v0/RC1 ABAB recheck did not reproduce the historical C1 regression.
 - Optional vision tower (MoonViT-style) when the checkpoint carries
   `vision_config`.
 
 ## Known limits
 
-- The opt-in FP8 vocabulary head regressed the 32-token "hello" reply to
-  0.93× / 0.92× on 1 / 2 RTX in its earlier comparison. BF16 remains the
-  default; FP8 needs a new performance gate before promotion.
+- The FP8 vocabulary head regressed short "hello" replies in its earlier
+  comparison. The release C1 recheck covers the two-RTX code workload;
+  it does not close the separate short-reply limitation.
 - Prompt and turn-end prefix restores are byte-exact against their own
   snapshots. Cold prefill can differ because Spark FP32 atomic expert
   reductions are arrival-ordered at 256+ rows; batch-invariant prefill and
@@ -65,7 +64,7 @@ change is checked against its parity numbers before merging.
 
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
-| v1 | 2026-10-04 | Coordinator-first loading and smaller one-RTX workspaces; opt-in device exchange and shared single-copy FP8 head; exact turn-end restore check. BF16 head remains default. | <a href="../../benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-1rtx-4spark-v41-flash-min/report.svg"><img src="../../benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-1rtx-4spark-v41-flash-min/card.svg" width="360" alt="DeepSeek-V4.1-Flash (mxfp4-g32) (min)"></a> <a href="../../benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-2rtx-4spark-v41-flash-max/report.svg"><img src="../../benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-2rtx-4spark-v41-flash-max/card.svg" width="360" alt="DeepSeek-V4.1-Flash (mxfp4-g32) (max)"></a> <a href="../../benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-nvfp4-1rtx-4spark-v41-flash-nvfp4-min/report.svg"><img src="../../benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-nvfp4-1rtx-4spark-v41-flash-nvfp4-min/card.svg" width="360" alt="DeepSeek-V4.1-Flash-NVFP4 (nvfp4-g16) (min)"></a> <a href="../../benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-nvfp4-2rtx-4spark-v41-flash-nvfp4-max/report.svg"><img src="../../benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-nvfp4-2rtx-4spark-v41-flash-nvfp4-max/card.svg" width="360" alt="DeepSeek-V4.1-Flash-NVFP4 (nvfp4-g16) (max)"></a> |
+| v1 | 2026-10-04 | Coordinator-first loading and smaller one-RTX workspaces; opt-in device exchange and default shared single-copy FP8 head; exact turn-end restore check; matched dual-RTX C1 requalification. | <a href="../../benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-1rtx-4spark-v41-flash-min/report.svg"><img src="../../benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-1rtx-4spark-v41-flash-min/card.svg" width="360" alt="DeepSeek-V4.1-Flash (mxfp4-g32) (min)"></a> <a href="../../benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-2rtx-4spark-v41-flash-max/report.svg"><img src="../../benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-2rtx-4spark-v41-flash-max/card.svg" width="360" alt="DeepSeek-V4.1-Flash (mxfp4-g32) (max)"></a> <a href="../../benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-nvfp4-1rtx-4spark-v41-flash-nvfp4-min/report.svg"><img src="../../benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-nvfp4-1rtx-4spark-v41-flash-nvfp4-min/card.svg" width="360" alt="DeepSeek-V4.1-Flash-NVFP4 (nvfp4-g16) (min)"></a> <a href="../../benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-nvfp4-2rtx-4spark-v41-flash-nvfp4-max/report.svg"><img src="../../benchmarks/deepseek_v41/2026-10-04-smoke-deepseek-v4-1-flash-nvfp4-2rtx-4spark-v41-flash-nvfp4-max/card.svg" width="360" alt="DeepSeek-V4.1-Flash-NVFP4 (nvfp4-g16) (max)"></a> |
 | v0 | 2026-10-02 | First release | <a href="../../benchmarks/deepseek_v41/2026-10-02-smoke-deepseek-v4-1-flash-1rtx-4spark/report.svg"><img src="../../benchmarks/deepseek_v41/2026-10-02-smoke-deepseek-v4-1-flash-1rtx-4spark/card.svg" width="360" alt="DeepSeek-V4.1-Flash (mxfp4-g32) (min)"></a> <a href="../../benchmarks/deepseek_v41/2026-10-02-smoke-deepseek-v4-1-flash-2rtx-4spark/report.svg"><img src="../../benchmarks/deepseek_v41/2026-10-02-smoke-deepseek-v4-1-flash-2rtx-4spark/card.svg" width="360" alt="DeepSeek-V4.1-Flash (mxfp4-g32) (max)"></a> |
 
 ## Additional benchmarks

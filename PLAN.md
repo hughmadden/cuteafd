@@ -694,8 +694,10 @@ v1 ships when these are done; everything else below moves to v1.x/v2.
   target-head quality result (KL +0.000534 nat, NLL unchanged in practice,
   golden top-1 472 → 465 / 512). `all` now uses one shared FP8 residency;
   promotion requires C1/C4 ≥ 1.02 and other parity ≥ 0.98 on both layouts.
-  The single-copy gate missed C1 on dual RTX after the borderline recheck;
-  BF16 stays default and `all` stays opt-in. `draft` retains dual residency.
+  The earlier single-copy gate missed C1 on dual RTX. RC1 code nevertheless
+  defaults to `all`; prior notes incorrectly said BF16. The release-prep
+  matched dual-RTX ABAB recheck does not reproduce the historical C1 drop,
+  so RC2 retains that FP8 default. `draft` retains dual residency.
 - **Cut to v1.x/v2:** whole-step graphs (D4: context-length-dependent index
   graphs, per-request pointers in graph keys, host-built per-layer metadata,
   warm re-captures) and device-side draft acceptance; deterministic
@@ -730,8 +732,8 @@ then TJ approves tagging and publishing images.
   errors, drained cancellation/staging lifetimes, bounded host cache and
   generic KV admission; family memory layouts and opt-in automatic admission.
 - DeepSeek V4.1: coordinator-first loading, smaller one-RTX workspaces,
-  per-width head graphs, opt-in device exchange and single-copy FP8 vocabulary
-  head; BF16 head remains default. V4 / V4.1 turn-end restore checks now
+  per-width head graphs, opt-in device exchange and default single-copy FP8
+  vocabulary head. V4 / V4.1 turn-end restore checks now
   compare each restored state to its own byte-exact snapshot.
 - DeepSeek V4: qualified native Flash TP2 with legacy requests and exact
   local-expert placement overrides; compressed-cache/drafter memory planning.
@@ -831,6 +833,40 @@ deferred as directed.
 Logs, matrix, placement snapshots and the full measurement table are retained
 under `~/.cache/cuteafd/builds/release-v1/kit/`; gate logs are under
 `~/.cache/cuteafd/builds/release-v1-gates/`.
+
+### v1 regression follow-up (RC2, 2026-10-05)
+
+The RC1 qualification above is historical. RC2 adds mixed-format local Qwen
+experts: routed layers remain in the resident NVFP4 TP1 package, while the
+MTP layer owns a separate resident FP8 TP1 package and prefill scratch. The
+loader detects the MTP format from tensor headers, admits each package before
+allocation, and keeps one copy of each layer. Golden NLL is unchanged with
+MTP3 enabled; the lossless check matches all 128 greedy tokens and prefix
+restores remain byte-exact. Spark MTP still requires a worker protocol/package
+extension and is explicitly unsupported; the Spark card keeps MTP off.
+
+V4.1 maximum uses the existing shared FP8 vocabulary head. Matched v0/RC1
+ABAB controls do not reproduce the historical long-code C1 regression.
+Qwen EXL3 matched BF16 ABAB also passes parity. Its historical default-speed
+difference includes v0's decode-only FP8 projections with dual residency;
+RC1 switched to BF16 projections to meet the single-copy precision gate.
+Single-copy FP8 projections still miss that gate and remain opt-in. Restoring
+the old default speed is not claimed by the same-precision comparison.
+
+GLM Flash's old smoke warm-up could leave a measured prefill lane or its
+expert accesses cold. Matched comparisons now record fixed prompt hashes and
+zero cached tokens; smoke primes complete chunks plus the exact measured
+prompt before timing an ordinary request, including normal cache retention.
+The split loader also accepts BF16 block projections from the selected
+checkpoint, quantizing before aligned slicing exactly as the unsplit loader
+does. This makes `GLM5_FLASH_FP8_MODEL_ID=off` valid with NVFP4 head split;
+the companion and precision defaults remain unchanged.
+
+Measurements and conditions belong in the follow-up commit messages. Task
+logs, reproducible configs and exports are under
+`~/.cache/cuteafd/builds/release-rcfix/`. No release tag, image tag or registry
+push is authorized by this follow-up. Scoped MXFP4 32-row tails remain
+unmerged and unqualified; this work does not close that release blocker.
 
 ## Release v1 — priority plan (2026-10-02)
 

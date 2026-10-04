@@ -1804,7 +1804,7 @@ impl<'a> Qwen4Engine<'a> {
                 self.exchange_window(index, decode, true)?;
                 let target;
                 let fp8 = if let Some(draft) = local.mtp_experts.as_ref()
-                    .filter(|draft| draft.index_of(index).is_ok()) {
+                    .filter(|draft| draft.layers.iter().any(|layer| layer.layer == index)) {
                     draft
                 } else {
                     local.index_of(index)?;

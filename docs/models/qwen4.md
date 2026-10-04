@@ -77,12 +77,17 @@ prefix-cache restore checks must pass.
   fallback) keeps native MTP off, and explicit `SPECULATOR=mtp` reports the
   missing expert layer before launching. Whether MTP wins with Sparks remains
   unmeasured until that layer is supported.
+- The historical local EXL3 C1 difference includes the change from v0
+  decode-only FP8 projections with dual residency to BF16 projections.
+  Matched BF16 ABAB passes parity. Single-copy FP8 projections remain
+  opt-in because their golden NLL/KL misses the precision gate.
 - The automatic MTP default is qualified for local EXL3. Other expert formats
   retain explicit speculation settings.
-- The NVFP4 checkpoint carries FP8 MTP expert weights. Local NVFP4 plus
-  explicit MTP3 fails native-package admission: the loader expects packed
-  E2M1 `[640, 1280]` but finds E4M3 `[640, 2560]`. A separate FP8 MTP expert
-  load/execution path is required; the v1 minimum card fails this launch gate.
+- Local NVFP4 supports explicit `SPECULATOR=mtp`, `SPECULATOR_DEPTH=3`.
+  Routed layers use the NVFP4 TP1 package; the MTP layer uses the FP8 TP1
+  package. Both stay resident, with one copy per layer and separately
+  admitted prefill scratch. This fixes the RC1 minimum-card launch failure.
+  The automatic MTP default remains limited to EXL3.
 - Local MTP verify and plain decode can differ at low-margin greedy
   positions, and C1/C4 outputs can differ. The current gate accepts proven
   verify rounding; byte-identical speculation and batch invariance are open.
@@ -92,7 +97,7 @@ prefix-cache restore checks must pass.
 - One-RTX NVFP4 local experts must fit resident weight and serving
   reservations. Implicit paging was removed; `--expert-window` explicitly
   enables the slower paging fallback. The local automatic MTP default is
-  qualified for EXL3, not NVFP4.
+  enabled for EXL3; NVFP4 uses explicit MTP settings.
 - NVFP4 decode/verify uses W4A16; native W4A4 for these small-row shapes is
   deferred.
 
@@ -100,7 +105,7 @@ prefix-cache restore checks must pass.
 
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
-| v1 | 2026-10-04 | Automatic resident local EXL3 placement and native MTP3 with a shared FP8 head; memory admission; resident local NVFP4 experts with explicit paging fallback. | <a href="../../benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-qwen38-exl3-min/report.svg"><img src="../../benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-qwen38-exl3-min/card.svg" width="360" alt="Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 (exl3-k4+exl3-k5) (min)"></a> <a href="../../benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-4spark-qwen38-exl3-max/report.svg"><img src="../../benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-4spark-qwen38-exl3-max/card.svg" width="360" alt="Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 (exl3-k4+exl3-k5) (max)"></a> <a href="../../benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-nvfp4-1rtx-4spark-qwen38-nvfp4-max/report.svg"><img src="../../benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-nvfp4-1rtx-4spark-qwen38-nvfp4-max/card.svg" width="360" alt="Qwen3.8-Flash-Next-NVFP4 (nvfp4-g16) (min)"></a> |
+| v1 | 2026-10-04 | Automatic resident local EXL3 placement and native MTP3 with a shared FP8 head; memory admission; resident mixed NVFP4/FP8 local experts for NVFP4 MTP3, with explicit paging fallback. | <a href="../../benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-qwen38-exl3-min/report.svg"><img src="../../benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-qwen38-exl3-min/card.svg" width="360" alt="Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 (exl3-k4+exl3-k5) (min)"></a> <a href="../../benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-4spark-qwen38-exl3-max/report.svg"><img src="../../benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-4spark-qwen38-exl3-max/card.svg" width="360" alt="Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 (exl3-k4+exl3-k5) (max)"></a> <a href="../../benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-nvfp4-1rtx-4spark-qwen38-nvfp4-max/report.svg"><img src="../../benchmarks/qwen4/2026-10-04-smoke-qwen3-8-flash-next-nvfp4-1rtx-4spark-qwen38-nvfp4-max/card.svg" width="360" alt="Qwen3.8-Flash-Next-NVFP4 (nvfp4-g16) (min)"></a> |
 | v0 | 2026-10-02 | First release | <a href="../../benchmarks/qwen4/2026-10-02-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx/report.svg"><img src="../../benchmarks/qwen4/2026-10-02-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx/card.svg" width="360" alt="Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 (exl3-k4+exl3-k5) (min)"></a> <a href="../../benchmarks/qwen4/2026-10-02-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-4spark/report.svg"><img src="../../benchmarks/qwen4/2026-10-02-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-4spark/card.svg" width="360" alt="Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 (exl3-k4+exl3-k5) (max)"></a> <a href="../../benchmarks/qwen4/2026-10-02-smoke-qwen3-8-flash-next-nvfp4-1rtx-4spark/report.svg"><img src="../../benchmarks/qwen4/2026-10-02-smoke-qwen3-8-flash-next-nvfp4-1rtx-4spark/card.svg" width="360" alt="Qwen3.8-Flash-Next-NVFP4 (nvfp4-g16) (min)"></a> |
 
 ## Additional benchmarks
