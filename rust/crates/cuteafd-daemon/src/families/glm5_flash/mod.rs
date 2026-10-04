@@ -818,13 +818,21 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
         let mut allocator = engine::Allocator::new(engine.pages, engine.slots);
         let _held = allocator.admit(tokens.len() + args.bench_decode)?;
         let mut times = Vec::new();
-        for _ in 0..args.bench_prefill {
+        for round in 0..=args.bench_prefill {
+            if round == 1 {
+                *engine.profile.borrow_mut() = [0.0; 3];
+                engine.op_profile()?;
+            }
             let mut fresh = allocator.admit(n)?;
             let started = Instant::now();
             for chunk in long.chunks(engine.prefill_capacity()) {
                 engine.prefill(&mut fresh, chunk, None)?;
             }
-            times.push(started.elapsed().as_secs_f64());
+            if round == 0 {
+                println!("prefill bench warm-up: {n} tokens, round 0 excluded from timing and phase averages");
+            } else {
+                times.push(started.elapsed().as_secs_f64());
+            }
             allocator.release(fresh);
         }
         times.sort_by(f64::total_cmp);

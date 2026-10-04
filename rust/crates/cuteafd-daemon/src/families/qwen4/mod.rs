@@ -140,6 +140,10 @@ pub(crate) struct GoldenArgs {
     /// Score every prefill row's logits against the golden (mean NLL, top-1).
     #[arg(long)]
     pub nll: bool,
+    /// With --nll: write tokens.bin and every prefill row's logits.bin (F32)
+    /// for full-vocabulary A/B numerics checks.
+    #[arg(long, hide = true, requires = "nll")]
+    pub save_logits: Option<PathBuf>,
     /// After the comparison, time this many greedy single-row decode steps.
     #[arg(long, default_value_t = 0)]
     pub bench_decode: usize,
@@ -627,13 +631,20 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
         let n = args.bench_prefill_tokens.unwrap_or(prefill.min(engine.prefill_rows));
         let long: Vec<u32> = tokens.iter().copied().cycle().take(n).collect();
         let mut times = Vec::new();
-        for _ in 0..args.bench_prefill {
+        for round in 0..=args.bench_prefill {
+            if round == 1 {
+                *engine.profile.borrow_mut() = [0.0; 2];
+            }
             let mut fresh = allocator.admit(n)?;
             let started = Instant::now();
             for chunk in long.chunks(engine.prefill_rows) {
                 engine.prefill(&mut fresh, chunk)?;
             }
-            times.push(started.elapsed().as_secs_f64());
+            if round == 0 {
+                println!("prefill bench warm-up: {n} tokens, round 0 excluded from timing and phase averages");
+            } else {
+                times.push(started.elapsed().as_secs_f64());
+            }
             allocator.release(fresh);
         }
         times.sort_by(f64::total_cmp);
@@ -683,6 +694,14 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
         _ => String::new(),
     };
     println!("prefill: {prefill} tokens through {layers} layers in {prefill_seconds:.2} s{loads}");
+    if let Some(dir) = &args.save_logits {
+        let rows = logits.as_ref().context("--save-logits needs every layer's prefill logits")?;
+        let expected = prefill.checked_mul(vocab).context("prefill logits size overflow")?;
+        ensure!(rows.len() == expected, "--save-logits expected {expected} logits, got {}", rows.len());
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join("tokens.bin"), tokens[..prefill].iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>())?;
+        std::fs::write(dir.join("logits.bin"), rows.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+    }
     if let Some(logits) = logits {
         let golden = golden_logits()?;
         if args.nll {
@@ -692,6 +711,8 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
                 golden {:.1}% | mean NLL engine {:.4} golden {:.4}", 100.0 * agree as f64 / prefill as f64,
                 100.0 * next_ok as f64 / scored.max(1) as f64, 100.0 * golden_next as f64 / scored.max(1) as f64,
                 nll / scored.max(1) as f64, golden_nll / scored.max(1) as f64);
+            println!("prefill logits: mean KL(golden||engine) {:.5}",
+                crate::families::glm5_flash::mean_kl(&logits, &golden, 0, vocab));
         }
         let logits = &logits[logits.len() - vocab..];
         let last = &golden[(prefill - 1) * vocab..][..vocab];

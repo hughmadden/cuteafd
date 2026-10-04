@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, ffi::c_void, path::{Path, PathBuf}, rc::Rc};
 
 /// Select the opt-in prefill program before workspace admission. Decode and
-/// verification capacities retain their qualified A16 programs.
+/// verification capacities (<=80) retain their qualified A16 programs.
 pub(crate) fn activation_directory(directory: &Path, capacity: u32) -> Result<PathBuf> {
     let activations = std::env::var("EXL3_ACTIVATIONS").unwrap_or_else(|_| "a16".into());
     selected_activation_directory(directory, capacity, &activations)
