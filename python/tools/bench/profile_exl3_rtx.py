@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Profile resident SM120 EXL3 expert layers using the coordinator tile policy.
+"""Profile resident SM120/SM121 EXL3 expert layers using the export tile policy.
 
-Run inside the coordinator development container with the pinned fork on
+Run inside the matching architecture development container with the pinned fork on
 PYTHONPATH. Inputs and unique top-k routes are seeded synthetic data; weights
 and all rotation/scale vectors come from the supplied MCG checkpoint. This
 measures a layer, not model TTFT or accuracy. No policy or default is changed.
@@ -90,7 +90,47 @@ def install_phase_clock(address):
         cls._measurement_addr = address
 
 
-def load_weights(snapshot, layer, hidden, width, experts, bits):
+def install_cooperative_diagnostic(kind):
+    """Install a measurement-only decode or MMA elision with invalid numerics.
+
+    This changes scheduling/register pressure and exposes overlap; its delta is
+    a sensitivity measurement, not an additive fraction of production time.
+    The measurement specialization never enters an executable cache.
+    """
+    import cutlass.cute as cute
+    from cutlass.base_dsl import dsl_user_op
+    from b12x.moe._shared.kernels.w4a16.kernel import W4A16GemmKernel
+    compile_hits = []
+
+    @dsl_user_op
+    def mark(*, loc=None, ip=None):
+        compile_hits.append(1)
+
+    @cute.jit
+    def elided(self, frag, win_a, win_b, trellis_lut_addr, bits):
+        mark()
+        frag[0, 0] = win_a
+        frag[0, 1] = win_b
+        frag[1, 0] = win_a
+        frag[1, 1] = win_b
+
+    @cute.jit
+    def no_mma(self, d0, d1, d2, d3, a0, a1, a2, a3, b0, b1):
+        mark()
+        return d0, d1, d2, d3
+
+    if kind == "nodecode":
+        W4A16GemmKernel._scaled_dequant_b_fragment_trellis256_bits = elided
+    else:
+        # Unused decode and operand loads may also disappear. This is a
+        # combined consumer-path elision, never an isolated math-time fraction.
+        W4A16GemmKernel._mma_m16n8k16_f32 = no_mma
+        W4A16GemmKernel._mma_rhs_fragments_as_mma_a_m16n8k16_f32 = no_mma
+    return compile_hits
+
+
+def load_weights(snapshot, layer, hidden, width, experts, bits, *, start=0, full_width=None):
+    full_width = full_width or width
     import torch
     from safetensors import safe_open
     from b12x.moe.fused_moe.trellis import (
@@ -120,12 +160,23 @@ def load_weights(snapshot, layer, hidden, width, experts, bits):
                     if value.numel() != 1 or (int(value.item()) & 0xffffffff) != 0xcbac1fed:
                         raise ValueError(f"unsupported MCG marker: {name}")
                 else:
-                    raw[expert, projection, field] = value.cuda()
+                    if field == "trellis":
+                        expected = ((full_width // 16, hidden // 16, value.shape[-1])
+                                    if projection == "down_proj" else
+                                    (hidden // 16, full_width // 16, value.shape[-1]))
+                        if tuple(value.shape) != expected:
+                            raise ValueError(f"unexpected checkpoint shape: {name}: {value.shape}")
+                        value = (value[start // 16:(start + width) // 16] if projection == "down_proj"
+                                 else value[:, start // 16:(start + width) // 16])
+                    elif ((projection == "down_proj" and field == "suh") or
+                          (projection != "down_proj" and field == "svh")):
+                        value = value[start:start + width]
+                    raw[expert, projection, field] = value.contiguous().cuda()
 
     tier_bits = {(e, p): raw[e, p, "trellis"].shape[-1] // 16
                  for e in range(experts) for p in projections}
-    if set(tier_bits.values()) != set(bits):
-        raise ValueError(f"checkpoint tiers {set(tier_bits.values())} != {bits}")
+    if not set(tier_bits.values()).issubset(bits):
+        raise ValueError(f"checkpoint tiers {set(tier_bits.values())} outside supported {bits}")
     def rotation(projection, field):
         return torch.stack([raw[e, projection, field] for e in range(experts)])
     tiers = []
@@ -168,10 +219,16 @@ def load_weights(snapshot, layer, hidden, width, experts, bits):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot", type=Path, required=True)
-    parser.add_argument("--geometry", choices=("qwen4", "glmf"), required=True)
+    parser.add_argument("--geometry", choices=("qwen4", "glmf", "glm"), required=True)
+    parser.add_argument("--role", choices=("coordinator", "spark"), default="coordinator")
+    parser.add_argument("--width", type=int, help="Spark intermediate slice width (H128 blocks)")
+    parser.add_argument("--start", type=int, default=0, help="Spark intermediate slice offset")
+    parser.add_argument("--steady-ms", type=int, default=1000, help="sustained graph warm-up before timing")
+    parser.add_argument("--diagnostic", choices=("nomma", "nodecode", "norot"), help="invalid-numerics ablation")
     parser.add_argument("--layer", type=int, required=True)
     parser.add_argument("--rows", type=int, nargs="+", default=[2048, 4096, 8192])
     parser.add_argument("--replays", type=int, default=20)
+    parser.add_argument("--kernel-times", action="store_true", help="collect a separate CUDA-only Torch profiler trace after timing")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-graph", action="store_true", help="trace graph replays instead of eager launches")
     parser.add_argument("--profile-replays", type=int, default=1, help="launches per profiler range (1..64)")
@@ -184,10 +241,16 @@ def main():
         parser.error("use at least three replays and 2048..8192 rows")
     if not 1 <= args.profile_replays <= 64 or ((args.profile_graph or args.profile_replays != 1) and not args.profile):
         parser.error("profiling options require --profile and 1..64 profile replays")
-    if args.phase_clock:
+    if args.kernel_times and args.profile:
+        parser.error("kernel-times cannot be combined with an external profiler range")
+    if args.phase_clock or args.diagnostic:
         os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
         os.environ["B12X_COMPILE_MEMORY_CACHE"] = "0"
 
+    if os.environ.get("B12X_WS_EXP") or os.environ.get("B12X_WS_A8"):
+        parser.error("use --diagnostic for ablations; baseline must not inherit WS experiment/A8 knobs")
+    if args.diagnostic:
+        os.environ["B12X_WS_EXP"] = args.diagnostic
     import torch
     from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
     from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
@@ -199,13 +262,29 @@ def main():
     import package_exl3_aot as policy
 
     props = torch.cuda.get_device_properties(0)
-    if (props.major, props.minor) != (12, 0):
-        raise ValueError(f"requires SM120, got {props.name}")
-    hidden, width, experts, topk = policy.GEOMETRIES[args.geometry]
-    bits = (4, 5) if args.geometry == "qwen4" else (3, 4)
+    expected_cc = (12, 0) if args.role == "coordinator" else (12, 1)
+    if (props.major, props.minor) != expected_cc:
+        raise ValueError(f"requires {expected_cc}, got {props.name}")
+    if args.phase_clock and args.role != "coordinator":
+        parser.error("phase clocks instrument only the cooperative coordinator kernel")
+    decode_compile_hits = None
+    if args.diagnostic and args.role == "coordinator":
+        if args.diagnostic not in ("nodecode", "nomma"):
+            parser.error("coordinator supports nodecode/nomma; WS norot requires Spark role")
+        decode_compile_hits = install_cooperative_diagnostic(args.diagnostic)
+    hidden, full_width, experts, topk = policy.GEOMETRIES[args.geometry]
+    width = full_width if args.width is None else args.width
+    if (width % 128 or args.start % 128 or width <= 0 or args.start < 0 or
+            args.start + width > full_width or
+            (args.role == "coordinator" and (args.start or width != full_width))):
+        parser.error("slice must be whole H128 blocks inside the intermediate; coordinator uses full width")
+    bits = (4, 5) if args.geometry in ("qwen4", "glm") else (3, 4)
+    output_dtype = "fp32" if args.role == "coordinator" else "bf16"
     started = time.monotonic()
-    prepared = load_weights(args.snapshot, args.layer, hidden, width, experts, bits)
-    record = dict(geometry=args.geometry, snapshot=str(args.snapshot), layer=args.layer,
+    if args.diagnostic == "norot" and policy.wire_input(args.geometry, args.role, width, args.rows[0]):
+        parser.error("norot does not elide the FP8 wire rotation; use a dedicated wire-rotation probe")
+    prepared = load_weights(args.snapshot, args.layer, hidden, width, experts, bits, start=args.start, full_width=full_width)
+    record = dict(role=args.role, output_dtype=output_dtype, width=width, start=args.start, diagnostic=args.diagnostic, geometry=args.geometry, snapshot=str(args.snapshot), layer=args.layer,
                   measurement_script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                   sparkinfer_revision=_pinned_sparkinfer.REVISION,
                   sparkinfer_tree_sha256=_pinned_sparkinfer.LOCK_DATA["source_tree_sha256"],
@@ -213,7 +292,7 @@ def main():
                       for tier in prepared.tiers for v in (tier.w13, tier.w2)),
                   gpu=props.name, sms=props.multi_processor_count,
                   torch=torch.__version__, cuda=torch.version.cuda,
-                  weights_seconds=time.monotonic() - started, results=[])
+                  weights_seconds=time.monotonic() - started, cuda_mem_free_total=list(torch.cuda.mem_get_info()), results=[])
     print(json.dumps({k: v for k, v in record.items() if k != "results"}), flush=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     for rows in args.rows:
@@ -222,9 +301,12 @@ def main():
             phase_clock = torch.zeros((props.multi_processor_count * 2, 5),
                                       dtype=torch.int64, device="cuda")
             install_phase_clock(phase_clock.data_ptr())
-        block = policy.route_block(args.geometry, rows)
+        ws = policy.warp_specialized(args.geometry, args.role, width, rows)
+        wire_input = policy.wire_input(args.geometry, args.role, width, rows)
+        block = 64 if ws else policy.route_block(args.geometry, rows)
         tile = _projection_mixed_tile_config(None, hidden_size=hidden,
             intermediate_size=width, token_count=rows, direct_topk_routes=False)
+        tile = policy.ws_tile(args.geometry, args.role, width, rows) or tile
         slots = route_pack_capacity(rows * topk, block, experts, topk=topk)[1]
         launch = compile_mixed_trellis(
             size_m=rows, hidden_size=hidden, intermediate_size=width,
@@ -233,11 +315,16 @@ def main():
             sms=props.multi_processor_count, max_shared_mem=props.shared_memory_per_block_optin,
             force_tile_config=tile, tier0_bits=bits[0], tier1_bits=bits[1],
             trellis_codebook="mcg", swiglu_limit=policy.swiglu_limit(args.geometry),
-            moe_block_size=block, rotation_input_dtype="bf16", full_rotation_output_dtype="bf16",
+            moe_block_size=block, rotation_input_dtype="bf16", full_rotation_output_dtype=output_dtype,
             route_ids_dtype=torch.int32, direct_topk_routes=False,
-            token_major_rotation=policy.token_major_rotation(args.geometry, rows),
-            fused_input_rotation=policy.fused_input_rotation(args.geometry, "coordinator", width, rows),
-            warp_specialized=policy.warp_specialized(args.geometry, "coordinator", width, rows))
+            token_major_rotation=not ws and policy.token_major_rotation(args.geometry, rows),
+            fused_input_rotation=policy.fused_input_rotation(args.geometry, args.role, width, rows),
+            warp_specialized=ws,
+            input_format="e4m3_k32" if wire_input else "bf16",
+            ws_input_stages=policy.ws_input_stages(args.geometry, args.role, width, rows),
+            ws_dynamic_tiles=policy.ws_dynamic_tiles(args.geometry, args.role, width, rows))
+        if decode_compile_hits is not None and not decode_compile_hits:
+            raise RuntimeError("cooperative elision did not reach this compiled kernel; discard the diagnostic")
         buffers = make_mixed_trellis_buffers(launch, device=torch.device("cuda", 0),
                                             sms=props.multi_processor_count)
         binding = bind_mixed_trellis(*prepared.tiers, prepared.global_to_combined,
@@ -245,6 +332,11 @@ def main():
             gate_experts=prepared.gate_counts, up_experts=prepared.up_counts)
         generator = torch.Generator(device="cpu").manual_seed(7 + rows)
         x = torch.randn(rows, hidden, generator=generator).to(torch.bfloat16).cuda()
+        if wire_input:
+            groups = x.float().view(rows, hidden // 32, 32)
+            exponent = torch.ceil(torch.log2(groups.abs().amax(-1).clamp_min(2.0 ** -100) / 448)).clamp(-127, 127)
+            quantized = (groups / torch.exp2(exponent)[..., None]).to(torch.float8_e4m3fn)
+            x = torch.cat((quantized.view(torch.uint8).view(rows, hidden), (exponent + 127).to(torch.uint8)), 1).contiguous()
         ids = torch.stack([torch.randperm(experts, generator=generator)[:topk]
                            for _ in range(rows)]).to(torch.int32).cuda()
         weights = torch.softmax(torch.randn(rows, topk, generator=generator), 1).cuda()
@@ -270,9 +362,17 @@ def main():
                     replay_allocations=replay_allocations,
                     stable_pointers=all(getattr(buffers, name).data_ptr() == ptr
                                         for name, ptr in pointers.items()))
-        if not gate["finite"] or not gate["replay_equal"] or gate["replay_allocations"] or not gate["stable_pointers"]:
+        if (gate["replay_allocations"] or not gate["stable_pointers"] or
+                (not args.diagnostic and (not gate["finite"] or not gate["replay_equal"]))):
             raise RuntimeError(f"graph correctness gate failed: {gate}")
-        samples, phase_samples = [], []
+        # Keep the GPU occupied long enough to settle clocks before sampling.
+        warm_until = time.monotonic() + max(0, args.steady_ms) / 1000
+        while time.monotonic() < warm_until:
+            for _ in range(16):
+                graph.replay()
+            torch.cuda.synchronize()
+        print(json.dumps(dict(rows=rows, timing_start_unix=time.time())), flush=True)
+        samples, phase_samples, sample_times = [], [], []
         if args.profile:
             torch.cuda.cudart().cudaProfilerStart()
             torch.cuda.nvtx.range_push(f"{args.geometry}/layer{args.layer}/rows{rows}")
@@ -299,15 +399,29 @@ def main():
                 timed_graph.replay()
                 end.synchronize()
                 samples.append(begin.elapsed_time(end))
+                sample_times.append(time.time())
                 if phase_clock is not None:
                     phase_samples.append(phase_clock.cpu())
+        kernel_times = None
+        if args.kernel_times:
+            from torch.profiler import profile, ProfilerActivity
+            with profile(activities=[ProfilerActivity.CUDA]) as trace:
+                for _ in range(10):
+                    graph.replay()
+                torch.cuda.synchronize()
+            kernel_times = {}
+            for event in trace.events():
+                if event.device_type.name == "CUDA":
+                    duration = event.device_time if hasattr(event, "device_time") else event.cuda_time
+                    kernel_times[event.name] = kernel_times.get(event.name, 0) + duration / 10000
         gate["final_replay_equal"] = bool(torch.equal(reference, output))
-        if not gate["final_replay_equal"]:
+        if not args.diagnostic and not gate["final_replay_equal"]:
             raise RuntimeError(f"repeated replay changed the output: {gate}")
-        result = dict(rows=rows, block=block, tile=list(tile),
+        result = dict(rows=rows, block=block, tile=list(tile), warp_specialized=ws, wire_input=wire_input, sample_times_unix=sample_times,
+                      profiled_kernel_times_ms=kernel_times,
                       timing_method="device_graph_event_nodes" if samples else None,
                       blocks_per_sm=launch.blocks_per_sm,
-                      token_major_rotation=policy.token_major_rotation(args.geometry, rows),
+                      token_major_rotation=not ws and policy.token_major_rotation(args.geometry, rows),
                       graph_gate=gate, samples_ms=samples,
                       median_ms=statistics.median(samples) if samples else None)
         if phase_clock is not None:

@@ -7,6 +7,7 @@ repo=$(cd "$(dirname "$0")/../.." && pwd)
 build_root=${CUTEAFD_EXL3_PROFILE_BUILD_ROOT:-$HOME/.cache/cuteafd/builds/exl3-a8-rtx}
 image=${CUTEAFD_EXL3_PROFILE_IMAGE:-cuteafd-coordinator-dev:latest}
 gpu=${CUTEAFD_EXL3_PROFILE_GPU:-1}
+ncu_options=()
 mode=${1:?expected peak, timing, phases, ncu or nsys}
 shift
 case "$mode" in peak|timing|phases|ncu|nsys) ;; *) exit 2 ;; esac
@@ -38,10 +39,10 @@ else
     phases) command+=(--phase-clock) ;;
     ncu)
       command+=(--profile)
-      command=(ncu --profile-from-start off --replay-mode application --clock-control none
+      ncu_options=(--profile-from-start off --clock-control none --cache-control none
         --section SpeedOfLight --section ComputeWorkloadAnalysis --section InstructionStats --section WarpStateStats
         --section SourceCounters --section MemoryWorkloadAnalysis_Tables
-        --force-overwrite -o "/w/$geometry-ncu" "${command[@]}") ;;
+        --force-overwrite -o "$build_root/$geometry-ncu") ;;
     nsys)
       command+=(--profile)
       command=(nsys profile --sample=none --cpuctxsw=none --trace=cuda,nvtx --cuda-graph-trace=node
@@ -59,25 +60,43 @@ while true; do
   exec 8>&- 9>&-
 done
 name="cuteafd-exl3-rtx-$BASHPID"
-trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+monitor=0
+cleanup() {
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  if [[ $monitor != 0 ]]; then
+    kill "$monitor" 2>/dev/null || true
+    wait "$monitor" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
 rdma link
 for rate in /sys/class/infiniband/*/ports/*/rate; do echo "$rate: $(cat "$rate")"; done
 nvidia-smi --query-gpu=index,power.limit,clocks.sm,clocks.mem,temperature.gpu,memory.used --format=csv
-capabilities=()
-launcher=(docker)
+# GPU clock and power samples include warm-up and the marked measurement range.
+nvidia-smi -i "$gpu" --query-gpu=timestamp,power.draw,power.limit,clocks.sm,clocks.mem,temperature.gpu,utilization.gpu,clocks_event_reasons.sw_power_cap,clocks_event_reasons.hw_thermal_slowdown \
+  --format=csv -lms 50 > "$build_root/${geometry:-peak}-$mode-telemetry.csv" &
+monitor=$!
+container=(docker run --rm --name "$name" --gpus "device=$gpu" --workdir /w
+  -e PYTHONDONTWRITEBYTECODE=1 -e "PYTHONPATH=$repo/third_party/sparkinfer"
+  -e "CUTEAFD_SPARKINFER_SOURCE_DIR=$repo/third_party/sparkinfer"
+  -e "CUTEAFD_SPARKINFER_LOCK_FILE=$repo/third_party/sparkinfer.lock.json"
+  -e B12X_COMPILE_CACHE_DIR=/w/cache/b12x -e CUDA_CACHE_PATH=/w/cache/cuda
+  -e TRITON_CACHE_DIR=/w/cache/triton -e TMPDIR=/w/tmp
+  -v "$(dirname "$repo"):$(dirname "$repo"):ro" -v "$build_root:/w"
+  -v "$build_root/cache:/root/.cache" -v /mnt/sparknest:/mnt/sparknest:ro)
 if [[ $mode == ncu ]]; then
-  capabilities=(--cap-add SYS_ADMIN)
-  launcher=(agent-sudo --agent-context "Run Nsight Compute with profiling-counter access in a temporary SM120 container; no host settings change" docker)
+  # Attach with the approved host NCU; the target and its injection libraries
+  # run inside the architecture container. No host driver settings change.
+  "${container[@]}" -d --network host --cap-add SYS_ADMIN \
+    --entrypoint /usr/local/cuda/bin/ncu \
+    -v /opt/nvidia/nsight-compute:/opt/nvidia/nsight-compute:ro "$image" \
+    --mode launch --port 50340 --max-connections 1 "${command[@]}"
+  timeout --signal=TERM --kill-after=30 1200 agent-sudo -n \
+    --agent-context "Collect EXL3 SM120 hardware counters by attaching to an isolated CUDA container target" \
+    /usr/local/cuda/bin/ncu --mode attach --hostname 127.0.0.1 \
+    --port 50340 --max-connections 1 "${ncu_options[@]}"
+
+else
+  timeout --signal=TERM --kill-after=30 1200 "${container[@]}" \
+    --entrypoint "${command[0]}" "$image" "${command[@]:1}"
 fi
-# NCU needs the profiler capability in its container on hosts with restricted
-# counters. No host driver settings are changed. No workers or servers start.
-timeout --signal=TERM --kill-after=30 1200 "${launcher[@]}" run --rm --name "$name" \
-  --gpus device=1 "${capabilities[@]}" --workdir /w --entrypoint "${command[0]}" \
-  -e PYTHONDONTWRITEBYTECODE=1 -e "PYTHONPATH=$repo/third_party/sparkinfer" \
-  -e "CUTEAFD_SPARKINFER_SOURCE_DIR=$repo/third_party/sparkinfer" \
-  -e "CUTEAFD_SPARKINFER_LOCK_FILE=$repo/third_party/sparkinfer.lock.json" \
-  -e B12X_COMPILE_CACHE_DIR=/w/cache/b12x -e CUDA_CACHE_PATH=/w/cache/cuda \
-  -e TRITON_CACHE_DIR=/w/cache/triton -e TMPDIR=/w/tmp \
-  -v "$(dirname "$repo"):$(dirname "$repo"):ro" -v "$build_root:/w" \
-  -v "$build_root/cache:/root/.cache" -v /mnt/sparknest:/mnt/sparknest:ro \
-  "$image" "${command[@]:1}"
