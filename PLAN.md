@@ -905,6 +905,11 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
      E4M3/INT8 248), and an INT8 A8 prototype (fork `cuteafd/exl3-a8`, local;
      INT8 weights 0.9-1.6% rel error vs 3.7% for E4M3) saves only ~7% of a
      GB10 wave: not built. The wave is byte- and rotation-bound (item 5).
+     SM120 measurement branch `work/exl3-a8-rtx`: pinned real-weight local
+     layer probes and an independent-chain MMA ceiling benchmark are ready.
+     The 15% gain gate remains unqualified: Nsight Compute approvals expired,
+     and repeated 8K GPU kernel durations varied substantially. No A8 port
+     or default change; collect counters and resolve timing variance first.
    - MXFP4 experts (V4.1 already W4A8; MiMo V2.6 Pro W4A16): A8 prefill for
      MiMo Pro (Spark-bound prefill), and MXFP4 × MXFP8 MMAs for both.
    - FP8 experts: extend W8A8 (MiMo GB10 gate/up) to the down projection and
