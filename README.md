@@ -157,6 +157,14 @@ cache layout works.
    them on those hosts first (`./run.sh` does not pull). `./wip.sh --slot S --role both`
    plus `./run.sh --wip S --restart` is the faster loop while iterating.
 
+V4.1 uses one shared BF16 vocabulary head for the target and dSpark by
+default. In WIP builds, `CUTEAFD_V41_FP8_HEAD=draft` adds an FP8 copy for
+the draft head while retaining BF16 for the target: this opt-in uses dual
+residency and does not meet the single-residency rule. `all` also projects
+the target through FP8 and changes its logits; it currently retains both
+representations too. Neither mode is the default. `off` explicitly selects
+the shared BF16 head.
+
 ## Working on it
 
 [`AGENTS.md`](AGENTS.md) is the standing guide for agents and collaborators
