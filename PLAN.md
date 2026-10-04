@@ -718,6 +718,35 @@ v1 ships when these are done; everything else below moves to v1.x/v2.
   (`cuteafd plan MODEL --layout`, 32 GB budget) and validate on real 5090s;
   start from `work/p0`, branch `work/rtx5090`, follow AGENTS.md.
 
+### v1.0.0 publication (2026-10-05)
+
+TJ approved tagging v1.0.0, advancing `main` and `work/p0`, and publishing
+both versioned and `latest` images. The runtime pair is built from clean
+`release/v1.0.0` source `d5705aa6249d7d7c303895056dea7e5542dcd6a6`,
+with universal Spark TP2/TP3/TP4/TP6 coverage and the unchanged SparkInfer
+`f6bb38bc56fdcd695791c1ebf91d0dbf133cd599` pin and tree lock. The tag also
+includes the deployment/documentation update naming the v1.0.0 image pair.
+
+The final images passed serial Release spot-smokes for V4.1 Flash maximum,
+Qwen NVFP4 minimum with resident mixed-format MTP3, and GLM Flash NVFP4
+maximum. Every entry held the hardware locks, had bounded launch/benchmark
+timeouts, and stopped its coordinator and workers before releasing locks.
+A clean V4.1 smoke remained below the historical RC2 card, so matched
+RC2/final ABAB controls used the same two RTX GPUs at 325 W, four Sparks,
+configuration and fixed 320-token C1 code prompt. All four outputs were
+byte-identical and the final images did not regress. The accompanying
+nonced smoke prefill requests also ran at similar rates in both images;
+this does not explain the shared shortfall against the historical card.
+Measurements and conditions are in the publication commit and annotated tag.
+
+The 28/28 preparation cohort is retained; these three spot-smokes do
+not rerun the whole matrix. Golden fidelity and byte-exact cache restores
+pass on the final images. Known speculative/batch rounding limits, Qwen
+EXL3's documented default-speed gap and unsupported Spark MTP remain.
+MXFP4 tails and V4.1 exact slices stay deferred to v1.x. Runtime defaults
+are unchanged by publication. Logs and reproducible configs are retained
+under `~/.cache/cuteafd/builds/v1-publish/`.
+
 ### v1 candidate changelog (preparation, 2026-10-04)
 
 Changes since v0.1.0 touch every model family. The `release/v1` candidate

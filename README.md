@@ -197,19 +197,16 @@ cache layout works.
    V4, V4.1 and Qwen; the engine spelling is `--pool-tokens 0`. V4.1 keeps
    its existing pool policy when this option is omitted.
 3. `./run.sh` launches the release images named in the config,
-   `ghcr.io/tpurtell/cuteafd-coordinator:v0.1.0` on the RTX host and
-   `ghcr.io/tpurtell/cuteafd-spark-expert:v0.1.0` on each Spark; `docker pull`
+   `ghcr.io/tpurtell/cuteafd-coordinator:v1.0.0` on the RTX host and
+   `ghcr.io/tpurtell/cuteafd-spark-expert:v1.0.0` on each Spark; `docker pull`
    them on those hosts first (`./run.sh` does not pull). `./wip.sh --slot S --role both`
    plus `./run.sh --wip S --restart` is the faster loop while iterating.
 
-V4.1 uses one shared BF16 vocabulary head for the target and dSpark by
-default. In current WIP builds, `CUTEAFD_V41_FP8_HEAD=all` packs one E4M3
-head (or one shard per GPU), shares it across target and draft projections,
-and releases BF16 once packing completes. `off` selects BF16. The
-experimental `draft` mode adds FP8 for dSpark while retaining BF16 for the
-target, using dual residency.
-The target-head quality result was accepted, but single-copy `all` did not
-clear the required C1 speedup on dual RTX, so BF16 remains the default.
+V4.1 defaults to `CUTEAFD_V41_FP8_HEAD=all`: one E4M3 vocabulary head
+(or one shard per GPU) shared by target and dSpark, with BF16 released after
+packing. `off` selects BF16; experimental `draft` retains BF16 for the target
+and adds FP8 for dSpark. The accepted target-head quality gate and matched RC2
+controls support the release default.
 
 ## Working on it
 
