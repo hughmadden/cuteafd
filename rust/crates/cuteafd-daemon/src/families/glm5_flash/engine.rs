@@ -503,10 +503,6 @@ fn slot(index: usize, ffn: bool, lane: usize) -> usize {
     4 * lane + 2 * (index % 2) + usize::from(ffn)
 }
 
-fn shared_first_ffn(enabled: bool, split: bool, dense: bool) -> bool {
-    enabled && split && !dense
-}
-
 fn norm_slot(output_slot: usize) -> usize {
     4 * PREFILL_LANES + (output_slot / 4) * 2 + (output_slot % 4) / 2
 }
@@ -576,8 +572,6 @@ pub(crate) struct GlmfEngine<'a> {
     pub kda_fp32_partials: bool,
     pub kda_output_shard: bool,
     pub kda_prefill_expanded: bool,
-    /// Opt-in Spark split: join shared halves before the routed-expert reduction.
-    pub split_shared_first: bool,
     /// The token embedding table (resident on this GPU or read from its shard).
     pub embedding: TokenEmbedding<'a>,
 }
@@ -653,7 +647,7 @@ impl<'a> GlmfEngine<'a> {
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
             fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
             kda_output_shard: false,
-            kda_prefill_expanded: false, split_shared_first: false, l2: None, embedding })
+            kda_prefill_expanded: false, l2: None, embedding })
     }
 
     /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
@@ -1523,12 +1517,6 @@ impl<'a> GlmfEngine<'a> {
         if index + 1 < layers {
             exchange.push(0, slot, w.delta.buffer.ptr, t * h * 2)?;
         }
-        let layer = &self.weights.layers[index];
-        if shared_first_ffn(self.split_shared_first, layer.split, layer.dense) {
-            // spark_land already consumed the peer's shared-half flag and reduced
-            // against both halves. The returned delta is complete on both ranks.
-            return Ok(w.delta.buffer.ptr);
-        }
         exchange.wait(0, slot)?;
         exchange.add(0, w.delta.buffer.ptr, exchange.recv(0, slot)?, w.sum.buffer.ptr, t * h)?;
         Ok(w.sum.buffer.ptr)
@@ -1592,17 +1580,9 @@ impl<'a> GlmfEngine<'a> {
         let Some(next) = peer.layers.get(index + 1) else { return Ok(()) };
         let ffn = slot(index, true, lane);
         exchange.wait(1, ffn)?;
-        let layer = &peer.layers[index];
-        let out = if shared_first_ffn(self.split_shared_first, layer.split, layer.dense) {
-            // Rank 0 published the completed MoE output. The receive slot stays
-            // live through post_pre before the same-parity next exchange.
-            exchange.recv(1, ffn)?
-        } else {
-            exchange.add(1, exchange.recv(1, ffn)?, Self::peer_ffn_out(w1, &peer.layers[index]), w1.sum.buffer.ptr,
-                t * self.cfg.hidden)?;
-            w1.sum.buffer.ptr
-        };
-        self.post_pre_on(1, w1, out, 1, next, "attn", "input_norm", Scalar::I32(t as i32), cap)
+        exchange.add(1, exchange.recv(1, ffn)?, Self::peer_ffn_out(w1, &peer.layers[index]), w1.sum.buffer.ptr,
+            t * self.cfg.hidden)?;
+        self.post_pre_on(1, w1, w1.sum.buffer.ptr, 1, next, "attn", "input_norm", Scalar::I32(t as i32), cap)
     }
 
     /// Rank 1's decode segment of layer `index` (see [`Self::decode_graphed`]): the previous
@@ -2337,7 +2317,7 @@ impl<'a> GlmfEngine<'a> {
                 let mut transports = transports.borrow_mut();
                 let transport = transports.first_mut().context("no Spark transport")?;
                 let wave = self.spark_dispatch(w, index, t, decode, transport, shared)?;
-                return runtime.block_on(self.spark_land(w, index, 0, t, transport, wave));
+                return runtime.block_on(self.spark_land(w, t, transport, wave));
             }
         }
         self.run("add", &[("a", w.routed.buffer.ptr), ("b", w.shared.buffer.ptr), ("out", w.delta.buffer.ptr)], &[rows])
@@ -2394,31 +2374,16 @@ impl<'a> GlmfEngine<'a> {
 
     /// Receives `wave`'s BF16 rank partials into its transport's intake planes
     /// and sums them with the shared expert into `delta`.
-    async fn spark_land(&self, w: &Workspace<'_>, index: usize, lane: usize, t: usize,
-        transport: &mut SparkLink<'_>, wave: SparkExpertWave)
+    async fn spark_land(&self, w: &Workspace<'_>, t: usize, transport: &mut SparkLink<'_>, wave: SparkExpertWave)
         -> Result<()> {
         let ranks = transport.world_size();
         ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
-        let layer = &self.weights.layers[index];
-        let shared = if shared_first_ffn(self.split_shared_first, layer.split, layer.dense) {
-            let exchange = self.exchange()?;
-            let slot = slot(index, true, lane);
-            // Rank 1 pushes its shared half before waiting for our completed
-            // FFN delta. Consume that flag exactly once here, including the last
-            // layer; meet_ffn must not wait again. Attention post_pre has finished
-            // reading w.sum, and this lane cannot reuse it until reduce completes.
-            exchange.wait(0, slot)?;
-            exchange.add(0, w.shared.buffer.ptr, exchange.recv(0, slot)?, w.sum.buffer.ptr, t * self.cfg.hidden)?;
-            w.sum.buffer.ptr
-        } else {
-            w.shared.buffer.ptr
-        };
         let timer = std::time::Instant::now();
         transport.receive(wave, t, self.stream).await?;
         self.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
         // SAFETY: the shared-expert plane and `delta` are live [t, h] BF16
         // buffers; the planes are ordered after the wave by `receive`.
-        unsafe { transport.reduce(shared.cast(), w.delta.buffer.ptr.cast(), t, self.stream) }
+        unsafe { transport.reduce(w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream) }
     }
 
     /// Pipelined Spark prefill of consecutive-row lanes of one sequence (each
@@ -2546,8 +2511,7 @@ impl<'a> GlmfEngine<'a> {
                     peer_next(unit)?;
                     if let Some((previous, wave)) = inflight.take() {
                         let t = lanes[previous.1].0.kv_slots.len();
-                        self.spark_land(&workspaces[previous.1], previous.0, previous.1, t,
-                            &mut transports[previous.1], wave).await?;
+                        self.spark_land(&workspaces[previous.1], t, &mut transports[previous.1], wave).await?;
                         post(previous)?;
                     }
                     inflight = Some((unit, wave));
@@ -2557,8 +2521,7 @@ impl<'a> GlmfEngine<'a> {
                 if next.is_none_or(|(_, next_lane)| next_lane == lane) {
                     if let Some((current, wave)) = inflight.take() {
                         let t = lanes[current.1].0.kv_slots.len();
-                        self.spark_land(&workspaces[current.1], current.0, current.1, t,
-                            &mut transports[current.1], wave).await?;
+                        self.spark_land(&workspaces[current.1], t, &mut transports[current.1], wave).await?;
                         post(current)?;
                     }
                 }
@@ -2648,22 +2611,6 @@ impl Drop for GlmfEngine<'_> {
 #[cfg(test)]
 mod prefill_lane_tests {
     use super::{prefill_lane_capacity, prefill_lane_plan, PAGE_ROWS, PREFILL_LANES};
-
-    #[test]
-    fn shared_first_keeps_dense_and_unsplit_ffn_partials_on_the_existing_path() {
-        // Dense layers still consume their flag in meet_ffn; opted-in MoE
-        // layers consume it earlier in spark_land. Both ranks use this choice.
-        for (enabled, split, dense, expected) in [
-            (false, true, false, false),
-            (false, true, true, false),
-            (true, false, false, false),
-            (true, false, true, false),
-            (true, true, true, false),
-            (true, true, false, true),
-        ] {
-            assert_eq!(super::shared_first_ffn(enabled, split, dense), expected);
-        }
-    }
 
     #[test]
     fn output_token_rows_cover_odd_batches_and_zero_owned_rank() {
