@@ -11,6 +11,11 @@ after tables with conditions.
   `builds/` once filled the disk and crashed runs). When a task finishes,
   delete its Cargo `target*` directories and release staging; keep sources,
   logs and results. Check `df -h /` before large builds.
+- Profiling with root: run Nsight Compute directly as
+  `agent-sudo -n --agent-context "<why>" /usr/local/cuda/bin/ncu <args> <program>`
+  with the full command line visible. Never put ncu (or anything else) under
+  sudo inside a wrapper script or interpreter (`sudo python …`, `sudo bash …`):
+  the approver can't see what it runs and will flag or deny it.
 - Lock order: when a run needs both locks, take `sparks.lock` first, then
   `gpu1.lock` (as `~/.cache/cuteafd/builds/tp2/locked2.sh` does); never hold
   one while waiting on the other in the opposite order — that deadlocks the
