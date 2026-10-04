@@ -24,6 +24,12 @@ while IFS='=' read -r key value; do
   [[ "$key" =~ ^[A-Z_0-9]+$ ]] && cfg[$key]="$value"
 done < <(grep -E '^[A-Z_0-9]+=' "$config")
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
+# Exact 32-row MXFP4 slices stay opt-in. Forward the same partition switches
+# to every rank and the coordinator's planner, including remote Docker runs.
+mxfp4_tails="$(get MXFP4_TAILS "${CUTEAFD_MXFP4_TAILS:-0}")"
+fp8_exact_slices="$(get FP8_EXACT_SLICES "${CUTEAFD_FP8_EXACT_SLICES:-1}")"
+case "$mxfp4_tails" in 0|1) ;; *) echo "MXFP4_TAILS must be 0 or 1" >&2; exit 2 ;; esac
+case "$fp8_exact_slices" in 0|1) ;; *) echo "FP8_EXACT_SLICES must be 0 or 1" >&2; exit 2 ;; esac
 # key NEW OLD [DEFAULT]: a renamed key; the pre-rename spelling works for one
 # release with a warning.
 key() {
@@ -473,6 +479,7 @@ for ((rank = 0; rank < ranks; rank++)); do
   peers+=("$lane:$port")
   ssh "$host" "docker run -d --name cuteafd-spark-expert-$host-$port --restart no --gpus all --network host \
     --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill \
+    -e CUTEAFD_MXFP4_TAILS=$mxfp4_tails -e CUTEAFD_FP8_EXACT_SLICES=$fp8_exact_slices \
     -v \$(readlink -f \$HOME/.cache/huggingface/hub):/root/.cache/huggingface/hub:ro '$spark_image' \
     cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
     --rank $rank --world $ranks --capacity 4096 --device-budget-bytes $budget $layer_args \
@@ -514,6 +521,7 @@ docker run -d --name "$coordinator_name" --restart no --gpus "$gpus" --network h
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info -e "CUTEAFD_SPARK_INTAKE=$intake" \
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)" \
   -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_IMAGE=$coordinator_image" \
+  -e "CUTEAFD_MXFP4_TAILS=$mxfp4_tails" -e "CUTEAFD_FP8_EXACT_SLICES=$fp8_exact_slices" \
   -v "$hub:/root/.cache/huggingface/hub:ro" -v "$bench_dir:/root/.cache/cuteafd/bench" \
   "${trace_args[@]}" "$coordinator_image" cuteafd $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \

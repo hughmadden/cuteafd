@@ -90,7 +90,7 @@ def test_family_table_matches_the_rust_launch_fixtures(tmp_path: Path) -> None:
 
 def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys: str,
                           physical_gpus: tuple[int, ...] = (0, 1), *, preflight_error: bool = False,
-                          restart: bool = False) -> subprocess.CompletedProcess[str]:
+                          restart: bool = False, extra_env: dict | None = None) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
     that print their argv) and return what it would launch."""
     repo = tmp_path / "repo"
@@ -104,7 +104,9 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     for tool in ("docker", "ssh", "nest"):
-        (bin_dir / tool).write_text('#!/usr/bin/env bash\nprintf "%s " "$(basename "$0")" "$@" >&2; echo >&2\n'
+        # Emit one complete command per write: the six Spark launches run in
+        # parallel, so separate token writes can interleave in captured stderr.
+        (bin_dir / tool).write_text('#!/usr/bin/env bash\nprintf -v invocation "%s " "$(basename "$0")" "$@"\nprintf "%s\\n" "$invocation" >&2\n'
                                     + ('case "$*" in *"docker run --rm"*"python3"*) exit 2 ;; esac\n'
                                        if preflight_error and tool == "ssh" else '') +
                                     'case "$*" in *"docker logs"*) echo "worker ready" ;; esac\n')
@@ -116,7 +118,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     (bin_dir / "nvidia-smi").chmod(0o755)
     config = repo / "f.config"
     config.write_text(f"MODEL_ID={model}\nSPARK_COUNT=1\nSPARK_0_HOST=h0\nSPARK_0_LANE_A=10.0.0.1\n{keys}")
-    env = {**os.environ, "HF_HOME": str(hf), "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    env = {**os.environ, "HF_HOME": str(hf), "PATH": f"{bin_dir}:{os.environ['PATH']}", **(extra_env or {})}
     return subprocess.run(["bash", str(repo / "scripts" / "launch" / "run-family.sh"), "--config", str(config),
                            *(["--restart"] if restart else [])],
                           env=env, capture_output=True, text=True, timeout=30)
@@ -243,6 +245,34 @@ def test_mimo_expert_input_preflights_every_rank_before_serving(tmp_path, mode, 
         assert f"ssh h{rank} " in check and f"- {geometry} tp{ranks} 4096" in check
     assert max(lines.index(check) for check in checks) < next(i for i, line in enumerate(lines) if "docker run -d" in line)
     assert f"--expert-input {mode}" in result.stderr
+
+
+@pytest.mark.parametrize("tails,exact", [("0", "1"), ("1", "1"), ("1", "0")])
+@pytest.mark.parametrize("source", ["config", "environment"])
+def test_mxfp4_partition_switches_reach_every_worker_and_the_planner(tmp_path, tails, exact, source):
+    config = {"model_type": "mimo_v2", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    keys = "SPARK_COUNT=6\n" + "".join(
+        f"SPARK_{r}_HOST=h{r}\nSPARK_{r}_LANE_A=10.0.0.{r + 1}\n" for r in range(6))
+    if source == "config":
+        keys += f"MXFP4_TAILS={tails}\nFP8_EXACT_SLICES={exact}\n"
+        env = {}
+    else:
+        env = {"CUTEAFD_MXFP4_TAILS": tails, "CUTEAFD_FP8_EXACT_SLICES": exact}
+    result = _family_launch_result(tmp_path, config, "test/mimo", keys, extra_env=env)
+    assert result.returncode == 0, result.stderr
+    launches = [line for line in result.stderr.splitlines() if "docker run -d" in line]
+    assert len(launches) == 7
+    for line in launches:
+        assert f"-e CUTEAFD_MXFP4_TAILS={tails}" in line
+        assert f"-e CUTEAFD_FP8_EXACT_SLICES={exact}" in line
+
+
+@pytest.mark.parametrize("key", ["MXFP4_TAILS", "FP8_EXACT_SLICES"])
+def test_invalid_mxfp4_partition_switch_rejects_before_services(tmp_path, key):
+    config = {"model_type": "mimo_v2", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]}
+    result = _family_launch_result(tmp_path, config, "test/mimo", f"{key}=bogus\n", restart=True)
+    assert result.returncode == 2 and f"{key} must be 0 or 1" in result.stderr
+    assert "docker run" not in result.stderr and "docker rm" not in result.stderr
 
 
 def test_mimo_unavailable_bf16_package_keeps_existing_containers(tmp_path):

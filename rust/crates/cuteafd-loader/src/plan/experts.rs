@@ -63,6 +63,39 @@ pub fn stored_slice(intermediate: usize, block: usize, tp: usize) -> Option<usiz
         .then(|| ((intermediate / block).div_ceil(tp) * block).div_ceil(128) * 128)
 }
 
+/// The qualified 128-row layout stays the default. Mixed package contracts
+/// cannot claim the MXFP4-only layout, and the padded-layout override wins.
+pub(super) fn mxfp4_tails_enabled(package: &str) -> bool {
+    package == "mimop:fp8 (MXFP4)"
+        && std::env::var("CUTEAFD_MXFP4_TAILS").is_ok_and(|v| v == "1")
+        && !std::env::var("CUTEAFD_FP8_EXACT_SLICES").is_ok_and(|v| v == "0")
+}
+
+/// Count stored down-scale rows, including only experts actually present in
+/// the checkpoint. Sparse checkpoint fixtures must not inherit the model's
+/// nominal layer and expert counts.
+pub(super) fn mxfp4_down_scale_rows(checkpoint: &super::Checkpoint) -> u64 {
+    checkpoint.tensors.iter().filter(|t| t.meta.name.contains(".mlp.experts.")
+        && t.meta.name.ends_with(".down_proj.weight_scale") && t.meta.shape.len() == 2)
+        .map(|t| t.meta.shape[0] as u64).sum()
+}
+
+/// Exact resident bytes of a 32-row MXFP4 slice. Weight and source-scale
+/// bytes scale with the true width; only the down-scale row stride rounds
+/// up to a u32. Integer arithmetic preserves byte-exact admission at limits.
+pub(super) fn mxfp4_tail_bytes(routed: u64, intermediate: usize, tp: usize, rank: usize,
+    down_scale_rows: u64) -> Option<(usize, u64)> {
+    if tp == 0 || rank >= tp || intermediate % 32 != 0 || intermediate / 32 < tp {
+        return None;
+    }
+    let blocks = intermediate / 32;
+    let width = (blocks / tp + usize::from(rank < blocks % tp)) * 32;
+    let padding = (width / 32).div_ceil(4) * 4 - width / 32;
+    let bytes = routed as u128 * width as u128 / intermediate as u128
+        + down_scale_rows as u128 * padding as u128;
+    Some((width, u64::try_from(bytes).ok()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,5 +115,28 @@ mod tests {
         assert_eq!(nvfp4_spark_worlds(640), [2, 3, 4, 6]);
         assert_eq!(stored_slice(640, 16, 6), Some(128));
         assert_eq!(stored_slice(2048, 16, 6), Some(384));
+    }
+
+    #[test]
+    fn mxfp4_tails_count_exact_weight_and_padded_scale_bytes() {
+        let (hidden, intermediate, experts, layers) = (6144u64, 2048usize, 384u64, 69u64);
+        let down_rows = hidden * experts * layers;
+        let routed = down_rows * intermediate as u64 * 3 * 17 / 32;
+        let widths = [352, 352, 352, 352, 320, 320];
+        let mut cluster = 0;
+        for (rank, width) in widths.into_iter().enumerate() {
+            let (actual_width, bytes) = mxfp4_tail_bytes(routed, intermediate, 6, rank, down_rows).unwrap();
+            let projection_weights = down_rows * width as u64 / 2;
+            let gate_scales = down_rows * width as u64 / 32;
+            let down_scales = down_rows * 12;
+            assert_eq!(actual_width, width);
+            assert_eq!(bytes, 3 * projection_weights + 2 * gate_scales + down_scales);
+            cluster += bytes;
+        }
+        assert_eq!(cluster, routed + down_rows * 8);
+        assert_eq!(mxfp4_tail_bytes(routed, intermediate, 2, 0, down_rows).unwrap().1, routed / 2);
+        for (i, tp, rank) in [(2047, 6, 0), (128, 6, 0), (2048, 0, 0), (2048, 6, 6)] {
+            assert!(mxfp4_tail_bytes(routed, i, tp, rank, down_rows).is_none());
+        }
     }
 }

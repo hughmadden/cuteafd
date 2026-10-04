@@ -127,19 +127,54 @@ pub(crate) fn nvfp4_activations() -> Nvfp4Activations {
 /// CUTEAFD_FP8_EXACT_SLICES=0 keeps the padded layout.
 pub(crate) fn exact_layout(directory: &Path, tensors: &Fp8ExpertTensors, tp: usize, rank: usize)
     -> (PathBuf, Slicing) {
+    exact_layout_with(directory, tensors, tp, rank,
+        !std::env::var("CUTEAFD_FP8_EXACT_SLICES").is_ok_and(|v| v == "0"),
+        std::env::var("CUTEAFD_MXFP4_TAILS").is_ok_and(|v| v == "1"))
+}
+
+fn exact_layout_with(directory: &Path, tensors: &Fp8ExpertTensors, tp: usize, rank: usize,
+    exact_enabled: bool, tails_enabled: bool) -> (PathBuf, Slicing) {
     let padded = (directory.to_path_buf(), Slicing::Padded);
-    if std::env::var("CUTEAFD_FP8_EXACT_SLICES").is_ok_and(|v| v == "0") || tp < 2 {
+    if !exact_enabled || tp < 2 || rank >= tp {
         return padded;
     }
     let (Some(package), Some(layout)) = (directory.parent(), directory.file_name().and_then(|n| n.to_str())) else {
         return padded;
     };
-    let exact = Slicing::Blocks(128);
-    let dir_of = |r: usize| tensors.rank_width(tp, r, exact).ok().map(|w| package.join(format!("{layout}-w{w}")));
-    match (0..tp).map(dir_of).collect::<Option<Vec<_>>>() {
-        Some(dirs) if dirs.iter().all(|d| d.is_dir()) => (dirs[rank].clone(), exact),
-        _ => padded,
+    // The 32-row package remains opt-in until its GPU and model gates pass.
+    let candidates = if tensors.format() == ExpertFormat::Mxfp4 && tails_enabled { vec![32, 128] }
+        else { vec![128] };
+    // If the image advertises a BF16-input sibling, every selected width must
+    // be present in it too. A mixed old/new package set falls back as a group.
+    let has_bf16 = bf16_sibling(directory).and_then(|d| d.parent().map(Path::to_path_buf))
+        .is_some_and(|p| p.is_dir());
+    for block in candidates {
+        let exact = Slicing::Blocks(block);
+        let dirs: Option<Vec<_>> = (0..tp).map(|r| tensors.rank_width(tp, r, exact).ok()
+            .map(|w| package.join(format!("{layout}-w{w}")))).collect();
+        if let Some(dirs) = dirs.filter(|dirs| dirs.iter().all(|d| d.is_dir()
+            && (!has_bf16 || bf16_sibling(d).is_some_and(|s| s.is_dir())))) {
+            return (dirs[rank].clone(), exact);
+        }
     }
+    padded
+}
+
+/// Resolve the resident slicing before loading a library or allocating. An
+/// explicit exact-layout path must describe this rank's true stored width.
+fn layout_slicing(directory: &Path, tensors: &Fp8ExpertTensors, tp: usize, rank: usize) -> Result<Slicing> {
+    let Some((layout, width)) = directory.file_name().and_then(|n| n.to_str()).and_then(|n| n.split_once("-w")) else {
+        return Ok(Slicing::Padded);
+    };
+    ensure!(layout == format!("tp{tp}"), "{} does not serve TP{tp}", directory.display());
+    let width = width.parse::<usize>().context("invalid exact FP8 package width")?;
+    for block in if tensors.format() == ExpertFormat::Mxfp4 { vec![128, 32] } else { vec![128] } {
+        let slicing = Slicing::Blocks(block);
+        if tensors.rank_width(tp, rank, slicing).ok() == Some(width) {
+            return Ok(slicing);
+        }
+    }
+    anyhow::bail!("{} does not store rank {rank}'s exact width of TP{tp}", directory.display())
 }
 
 /// The BF16-input sibling of an FP8 package directory:
@@ -261,11 +296,7 @@ impl<'a> Fp8Experts<'a> {
         bf16_directory: Option<&Path>, layers: std::ops::Range<usize>, tp: usize, rank: usize, capacity: usize,
         budget: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
-        // `tp<n>-w<width>` layouts store each rank's own whole 128-row blocks (see `exact_layout`).
-        let slicing = match directory.file_name().and_then(|n| n.to_str()).and_then(|n| n.split_once("-w")) {
-            Some(_) => Slicing::Blocks(128),
-            None => Slicing::Padded,
-        };
+        let slicing = layout_slicing(directory, tensors, tp, rank)?;
         for layer in layers.clone() {
             tensors.validate_layer(layer)?;
         }
@@ -359,7 +390,7 @@ impl<'a> Fp8Experts<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resident_admission, validate_bf16_package};
+    use super::{exact_layout_with, layout_slicing, resident_admission, validate_bf16_package};
     use clap::Parser;
     use cuteafd_ffi::fp8_moe::{Fp8MoeInfo, Fp8MoeWeights};
 
@@ -443,6 +474,84 @@ mod tests {
                 _ => incompatible.weights = Fp8MoeWeights::Mxfp4,
             }
             assert!(validate_bf16_package(&primary, &incompatible, 64).is_err(), "{incompatible:?}");
+        }
+        // A tail package and its older 128-row sibling cannot share weights.
+        let mut tail = primary.clone();
+        tail.weights = Fp8MoeWeights::Mxfp4;
+        tail.tp = 6;
+        tail.slice = 352;
+        let mut sibling = tail.clone();
+        sibling.wire_input = false;
+        assert_eq!(validate_bf16_package(&tail, &sibling, 4096).unwrap(), 4096);
+        sibling.slice = 384;
+        assert!(validate_bf16_package(&tail, &sibling, 4096).is_err());
+    }
+
+    fn tail_catalog(dir: &std::path::Path) -> cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors {
+        use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
+        use cuteafd_loader::RoutedExpertShape;
+        use cuteafd_loader::plan::testing::{mimo_pro_config, mimo_pro_tensors, write_snapshot};
+        write_snapshot(dir, &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
+        Fp8ExpertTensors::read(dir, RoutedExpertShape { hidden: 6144, intermediate: 2048,
+            experts: 384, topk: 8, first_layer: 1, layers: 2, draft_stages: 0, draft_experts: 0 }).unwrap()
+    }
+
+    #[test]
+    fn tail_selection_requires_every_width_and_preserves_opt_out() {
+        use cuteafd_loader::formats::fp8_experts::Slicing;
+        let dir = tempfile::tempdir().unwrap();
+        let tensors = tail_catalog(dir.path());
+        let package = dir.path().join("fp8-mimop");
+        for width in [256, 384, 352] {
+            std::fs::create_dir_all(package.join(format!("tp6-w{width}"))).unwrap();
+        }
+        let padded = package.join("tp6");
+        // A missing narrower layout means every rank stays on the older partition.
+        for rank in 0..6 {
+            let (path, slicing) = exact_layout_with(&padded, &tensors, 6, rank, true, true);
+            assert_eq!(path, package.join(format!("tp6-w{}", if rank < 4 { 384 } else { 256 })));
+            assert_eq!(slicing, Slicing::Blocks(128));
+        }
+        std::fs::create_dir_all(package.join("tp6-w320")).unwrap();
+        for rank in 0..6 {
+            let (path, slicing) = exact_layout_with(&padded, &tensors, 6, rank, true, true);
+            assert_eq!(path, package.join(format!("tp6-w{}", if rank < 4 { 352 } else { 320 })));
+            assert_eq!(slicing, Slicing::Blocks(32));
+            assert_eq!(layout_slicing(&path, &tensors, 6, rank).unwrap(), slicing);
+            assert_eq!(exact_layout_with(&padded, &tensors, 6, rank, false, true), (padded.clone(), Slicing::Padded));
+            assert_eq!(exact_layout_with(&padded, &tensors, 6, rank, true, false).1, Slicing::Blocks(128));
+        }
+        assert!(layout_slicing(&package.join("tp6-w320"), &tensors, 6, 0).is_err());
+        assert!(layout_slicing(&package.join("tp6-wbad"), &tensors, 6, 0).is_err());
+        assert!(layout_slicing(&package.join("tp2-w352"), &tensors, 6, 0).is_err());
+        assert!(layout_slicing(&package.join("tp6-w352"), &tensors, 6, 6).is_err());
+    }
+
+    #[test]
+    fn tail_selection_keeps_wire_and_bf16_packages_on_one_partition() {
+        use cuteafd_loader::formats::fp8_experts::Slicing;
+        let dir = tempfile::tempdir().unwrap();
+        let tensors = tail_catalog(dir.path());
+        let package = dir.path().join("fp8-mimop");
+        let sibling = dir.path().join("fp8-mimop-bf16");
+        for width in [256, 384, 352, 320] {
+            std::fs::create_dir_all(package.join(format!("tp6-w{width}"))).unwrap();
+        }
+        for width in [256, 384, 352] {
+            std::fs::create_dir_all(sibling.join(format!("tp6-w{width}"))).unwrap();
+        }
+        let padded = package.join("tp6");
+        for rank in 0..6 {
+            assert_eq!(exact_layout_with(&padded, &tensors, 6, rank, true, true).1, Slicing::Blocks(128));
+        }
+        std::fs::create_dir_all(sibling.join("tp6-w320")).unwrap();
+        for rank in 0..6 {
+            assert_eq!(exact_layout_with(&padded, &tensors, 6, rank, true, true).1, Slicing::Blocks(32));
+        }
+        std::fs::remove_dir(package.join("tp6-w320")).unwrap();
+        std::fs::remove_dir(sibling.join("tp6-w256")).unwrap();
+        for rank in 0..6 {
+            assert_eq!(exact_layout_with(&padded, &tensors, 6, rank, true, true).1, Slicing::Padded);
         }
     }
 }

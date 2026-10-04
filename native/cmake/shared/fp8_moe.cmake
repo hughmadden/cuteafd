@@ -20,6 +20,7 @@ else()
   message(FATAL_ERROR "FP8 expert packages require a single native SM120 or SM121 target")
 endif()
 set(CUTEAFD_FP8_MOE_CAPACITIES "1,16,80,256,1024,4096" CACHE STRING "FP8 expert package capacities")
+option(CUTEAFD_ENABLE_MXFP4_TAILS "Build opt-in MXFP4 32-row exact Spark layouts" OFF)
 # Spark builds may add fp8-FAMILY-bf16 beside each package: the same slices
 # taking BF16 rows instead of FP8 K32 wire rows (the ranks then accept both;
 # the coordinator chooses per step, e.g. serve-mimo --expert-input).
@@ -58,6 +59,9 @@ or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, W4A16 or W4A4 large-row steps)")
   set(exact_slices "")
   if(CUTEAFD_FP8_MOE_ROLE STREQUAL "spark")
     set(exact_slices "--exact-slices")
+    if(CUTEAFD_ENABLE_MXFP4_TAILS AND geometry STREQUAL "mimop")
+      list(APPEND exact_slices "--mxfp4-tails")
+    endif()
   endif()
   set(stamp "${CMAKE_CURRENT_BINARY_DIR}/fp8_moe_${geometry}.stamp")
   file(GENERATE OUTPUT "${stamp}" CONTENT "role=${CUTEAFD_FP8_MOE_ROLE}|capacities=${CUTEAFD_FP8_MOE_CAPACITIES}|${exact_slices}\n")

@@ -3,6 +3,8 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
+mxfp4_tails="${CUTEAFD_WIP_MXFP4_TAILS:-OFF}"
+case "$mxfp4_tails" in ON|OFF) ;; *) release_die "CUTEAFD_WIP_MXFP4_TAILS must be ON or OFF" ;; esac
 bf16_families="${CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES:-}"
 bf16_family_pattern='^(mimo|mimop|glm|glmf|qwen4)(;(mimo|mimop|glm|glmf|qwen4))*$'
 [[ -z "$bf16_families" || "$bf16_families" =~ $bf16_family_pattern ]] ||
@@ -23,6 +25,8 @@ CUTEAFD_WIP_SPARK_TP_ROLES=tp2;tp3;tp6 overrides that selection. The default
 configuration builds no extra role and keeps the historical Spark TP4 shard.
 Set CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=mimo to add BF16-input Spark siblings
 for selected FAMILY:fp8 packages. This does not change serving defaults.
+Set CUTEAFD_WIP_MXFP4_TAILS=ON to add 32-row mimop Spark layouts;
+CUTEAFD_MXFP4_TAILS=1 selects them at runtime.
 --dry-run prints the resolved hosts, role plan and build invocations without
 touching Docker, SSH or any container.
 
@@ -461,6 +465,7 @@ build_coordinator() {
     -e "CUTEAFD_WIP_QWEN4_AOT=${CUTEAFD_WIP_QWEN4_AOT:-OFF}" \
     -e "CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}" \
     -e "CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families" \
+    -e "CUTEAFD_WIP_MXFP4_TAILS=$mxfp4_tails" \
     "$coordinator_container" \
     /wip/source/scripts/build/build-wip-artifacts.sh \
     /wip/source coordinator 120 /wip/build/coordinator /wip/output/coordinator
@@ -478,7 +483,7 @@ build_expert() {
   # The role list and build-scope opt-ins travel inside a single quoted remote
   # command so a `tp2;tp3` value is never split by the remote shell.
   ssh -o BatchMode=yes "$seed_host" \
-    "docker exec -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' '$spark_container' /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
+    "docker exec -e 'CUTEAFD_WIP_SPARK_TP_ROLES=$wip_spark_tp_roles' -e 'CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_EXPERT_FAMILIES:-}' -e 'CUTEAFD_WIP_FP8_MOE_BF16_FAMILIES=$bf16_families' -e 'CUTEAFD_WIP_MXFP4_TAILS=$mxfp4_tails' -e 'CUTEAFD_WIP_EXL3_AOT=${CUTEAFD_WIP_EXL3_AOT:-ON}' -e 'CUTEAFD_WIP_NVFP4_AOT=${CUTEAFD_WIP_NVFP4_AOT:-ON}' '$spark_container' /wip/source/scripts/build/build-wip-artifacts.sh /wip/source expert 121 /wip/build/expert /wip/output/expert"
   ssh -o BatchMode=yes "$seed_host" docker exec "$spark_container" \
     /wip/source/scripts/build/finalize-wip-slot.sh \
     /wip/source spark-expert "$slot" /wip/output/expert \

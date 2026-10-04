@@ -28,8 +28,8 @@ Library ABI (``native/shared/include/cuteafd_fp8_moe.h``)::
         UE8M0 per 32) or 3 (NVFP4: packed E2M1 + E4M3 per 16, each scale operand
         followed by the experts' FP32 weight_scale_2 and input_scale) or 4 (NVFP4,
         W4A4 stream route above the GEMV: the checkpoint's static input_scale
-        quantizes the activations, block-scaled FP4 MMAs); packed FP4 slices are
-        zero-padded to a 128-aligned width, [1] hidden, [2] slice, [3] experts, [4] top-k,
+        quantizes the activations, block-scaled FP4 MMAs); exact MXFP4 slices
+        may be 32-aligned (down scale rows padded to four bytes), [1] hidden, [2] slice, [3] experts, [4] top-k,
         [5] intermediate, [6] tp, [7] input dtype (7 = FP8 K32 wire rows, 1 = BF16 rows),
         [8] SwiGLU limit (FP32 bits, 0 = none), [9] capacities n, [10..] capacities
     int32_t cuteafd_fp8moe_scratch_bytes(uint32_t capacity, uint64_t* bytes);
@@ -210,13 +210,15 @@ extern "C" int32_t cuteafd_fp8moe_launch(void* context, uint32_t capacity, void*
 """
 
 
-def exact_widths(intermediate: int, tp: int) -> list[int]:
-    """Stored widths of TP ranks owning whole 128-row blocks exactly (TP6 of
-    2048: 384, 384, 384, 384, 256, 256), as the worker's exact layouts expect."""
-    blocks = intermediate // 128
-    if intermediate % 128 or blocks < tp:
+def exact_widths(intermediate: int, tp: int, block: int = 128) -> list[int]:
+    """Exact widths of ranks owning whole blocks: TP6 of 2048 uses
+    384/256 at 128 rows, or MXFP4's 352/320 at 32 rows."""
+    if tp <= 0 or block not in (32, 128) or intermediate <= 0 or intermediate % block:
         return []
-    return [(blocks // tp + (rank < blocks % tp)) * 128 for rank in range(tp)]
+    blocks = intermediate // block
+    if blocks < tp:
+        return []
+    return [(blocks // tp + (rank < blocks % tp)) * block for rank in range(tp)]
 
 
 def with_width(g, width: int):
@@ -242,10 +244,31 @@ def layout_geometry(base, layout: str):
     tp = int(tp_part.removeprefix("tp"))
     g = base.with_tp(tp)
     if width:
-        if int(width) not in exact_widths(base.intermediate, tp):
+        if int(width) not in (exact_widths(base.intermediate, tp) +
+                              (exact_widths(base.intermediate, tp, 32) if base.weights == "mxfp4" else [])):
             raise SystemExit(f"{layout}: no rank of TP{tp} owns {width} rows of {base.intermediate} exactly")
         g = with_width(g, int(width))
     return tp, g
+
+
+def package_layouts(base, layouts: list[str], *, exact_slices: bool = False,
+                    mxfp4_tails: bool = False) -> list[str]:
+    """Add all distinct rank widths beside each requested padded layout."""
+    if mxfp4_tails and (base.weights != "mxfp4" or not exact_slices):
+        raise SystemExit("--mxfp4-tails requires MXFP4 geometry and --exact-slices")
+    result = list(dict.fromkeys(layouts))
+    for layout in layouts:
+        tp, _ = layout_geometry(base, layout)
+        if not exact_slices or tp < 2 or base.with_tp(tp).slice * tp <= base.intermediate:
+            continue
+        widths = exact_widths(base.intermediate, tp)
+        if mxfp4_tails:
+            widths += exact_widths(base.intermediate, tp, 32)
+        for width in sorted(set(widths), reverse=True):
+            name = f"tp{tp}-w{width}"
+            if name not in result:
+                result.append(name)
+    return result
 
 
 def info_words(g, capacities: list[int], wire: bool) -> list[int]:
@@ -295,13 +318,7 @@ def build(args: argparse.Namespace) -> None:
         if not layouts:
             raise SystemExit(f"{args.geometry}: intermediate {base.intermediate} has no default {args.role} "
                              "TP layout of whole 128-row blocks; pass --layouts")
-    if args.exact_slices:
-        # Exact layouts beside each padded TP layout whose ranks would store padding.
-        for layout in list(layouts):
-            tp = int(layout.partition("-w")[0].removeprefix("tp"))
-            widths = sorted(set(exact_widths(base.intermediate, tp)), reverse=True)
-            if tp > 1 and widths and base.with_tp(tp).slice * tp > base.intermediate:
-                layouts += [f"tp{tp}-w{w}" for w in widths if f"tp{tp}-w{w}" not in layouts]
+    layouts = package_layouts(base, layouts, exact_slices=args.exact_slices, mxfp4_tails=args.mxfp4_tails)
     wire = (args.input or ROLE_INPUT[args.role]) == "wire"
     if args.output.exists():
         raise SystemExit(f"{args.output} exists; remove it or choose another --output")
@@ -410,6 +427,9 @@ def main() -> None:
     create.add_argument("--exact-slices", action="store_true",
                         help="also build tp<n>-w<width> layouts: ranks own whole 128-row blocks, each stored at its "
                         "own width (no zero padding; the worker prefers them when every width is present)")
+    create.add_argument("--mxfp4-tails", action="store_true",
+                        help="with --exact-slices, also build MXFP4 layouts owning 32-row blocks; "
+                        "enable at runtime with CUTEAFD_MXFP4_TAILS=1 only after qualification")
     create.add_argument("--input", choices=("wire", "bf16"),
                         help="expert input rows (default: wire for spark, bf16 for coordinator)")
     create.add_argument("--cross-sm121", action="store_true", help="build a Spark package on an SM120 host")

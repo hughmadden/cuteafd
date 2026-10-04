@@ -127,7 +127,7 @@ pub enum Slicing {
     /// Ranks own whole format blocks as evenly as possible; every rank stores
     /// the widest rank's width, zero-padded to 128 (one program per world).
     Padded,
-    /// Ranks own whole `g`-row blocks (`g` a multiple of 128) and store
+    /// Ranks own whole `g`-row blocks (32 for MXFP4 tails, otherwise a multiple of 128) and store
     /// exactly their own rows (a program per distinct width): no padding.
     Blocks(usize),
 }
@@ -280,7 +280,9 @@ impl Fp8ExpertTensors {
         let Slicing::Blocks(g) = slicing else { return self.rank_range(tp, rank) };
         ensure!(rank < tp, "rank {rank} of TP{tp}");
         let i = self.shape.intermediate;
-        ensure!(g > 0 && g % self.block() == 0 && g % 128 == 0 && i % g == 0 && i / g >= tp,
+        ensure!(g > 0 && g % self.block() == 0
+            && (g % 128 == 0 || (self.format == ExpertFormat::Mxfp4 && g == 32))
+            && i % g == 0 && i / g >= tp,
             "intermediate {i} does not split into whole {g}-row blocks over {tp} ranks");
         let blocks = i / g;
         let (base, extra) = (blocks / tp, blocks % tp);
@@ -295,7 +297,12 @@ impl Fp8ExpertTensors {
         let slice = self.rank_width(tp, rank, slicing)?;
         let (rows, cols) = if projection == Fp8Projection::Down { (rows, slice) } else { (slice, cols) };
         if self.format.packed_fp4() {
-            return Ok((rows * cols / 2, rows * cols / self.format.group()));
+            let scale_cols = if self.format == ExpertFormat::Mxfp4 && projection == Fp8Projection::Down {
+                (cols / 32).div_ceil(4) * 4
+            } else {
+                cols / self.format.group()
+            };
+            return Ok((rows * cols / 2, rows * scale_cols));
         }
         Ok((rows * cols, rows.div_ceil(128) * cols.div_ceil(128) * 4))
     }
@@ -341,7 +348,12 @@ impl Fp8ExpertTensors {
         let slice = self.slice(tp)?;
         let (rows, cols) = if projection == Fp8Projection::Down { (rows, slice) } else { (slice, cols) };
         if self.format.packed_fp4() {
-            return Ok((rows * cols / 2, rows * cols / self.format.group()));
+            let scale_cols = if self.format == ExpertFormat::Mxfp4 && projection == Fp8Projection::Down {
+                (cols / 32).div_ceil(4) * 4
+            } else {
+                cols / self.format.group()
+            };
+            return Ok((rows * cols / 2, rows * scale_cols));
         }
         Ok((rows * cols, rows.div_ceil(128) * cols.div_ceil(128) * 4))
     }
@@ -402,7 +414,10 @@ impl Fp8ExpertTensors {
             for (located, file, out, per) in [(w, &w_file, &mut *weight, 2usize), (s, &s_file, &mut *scale, group)] {
                 staging.resize(located.bytes as usize, 0);
                 file.read_exact_at(staging, located.offset).with_context(|| format!("reading {name}"))?;
-                let (row_in, row_out, take) = (cols / per, slice / per, len / per);
+                let row_out = if per == 32 && self.format == ExpertFormat::Mxfp4 {
+                    (slice / per).div_ceil(4) * 4
+                } else { slice / per };
+                let (row_in, take) = (cols / per, len / per);
                 for (row, out) in out.chunks_exact_mut(row_out).enumerate().take(rows) {
                     out[..take].copy_from_slice(&staging[row * row_in + first / per..][..take]);
                 }
@@ -589,4 +604,57 @@ mod tests {
         assert_eq!((w, s), (6144 * 256 / 2, 6144 * 256 / 32));
         assert!(tensors.rank_range_with(6, 0, Slicing::Blocks(96)).is_err());
     }
+
+    #[test]
+    fn mxfp4_tail_slices_pad_only_scale_rows() {
+        let tensors = catalog(ExpertFormat::Mxfp4, 2048);
+        let tails = Slicing::Blocks(32);
+        let widths: Vec<_> = (0..6).map(|r| tensors.rank_width(6, r, tails).unwrap()).collect();
+        assert_eq!(widths, [352, 352, 352, 352, 320, 320]);
+        assert_eq!((0..6).map(|r| tensors.rank_range_with(6, r, tails).unwrap()).collect::<Vec<_>>(),
+            [(0, 352), (352, 352), (704, 352), (1056, 352), (1408, 320), (1728, 320)]);
+        for rank in 0..6 {
+            let width = widths[rank];
+            assert_eq!(tensors.slice_bytes_with(Fp8Projection::Down, 6, rank, tails).unwrap(),
+                (6144 * width / 2, 6144 * 12));
+            assert_eq!(tensors.slice_bytes_with(Fp8Projection::Gate, 6, rank, tails).unwrap(),
+                (width * 6144 / 2, width * 192));
+        }
+        for format in [ExpertFormat::Fp8Block128, ExpertFormat::Nvfp4] {
+            assert!(catalog(format, 2048).rank_width(6, 0, tails).is_err());
+        }
+    }
+
+    #[test]
+    fn mxfp4_tail_reads_keep_rows_and_scale_padding_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tensors = catalog(ExpertFormat::Mxfp4, 2048);
+        tensors.snapshot = dir.path().to_path_buf();
+        tensors.shape.hidden = 128;
+        let name = tensors.name(3, 0, Fp8Projection::Down);
+        let weight: Vec<u8> = (0..128 * 1024).map(|i| ((i / 1024 + i % 1024) % 251) as u8).collect();
+        let scale: Vec<u8> = (0..128 * 64).map(|i| (i / 64 + i % 64) as u8).collect();
+        std::fs::write(dir.path().join("weights"), &weight).unwrap();
+        std::fs::write(dir.path().join("scales"), &scale).unwrap();
+        tensors.tensors.insert(name.clone(), Located { shard: "weights".into(), offset: 0,
+            bytes: weight.len() as u64, dtype: DType::U8, shape: vec![128, 1024] });
+        tensors.tensors.insert(format!("{name}_scale"), Located { shard: "scales".into(), offset: 0,
+            bytes: scale.len() as u64, dtype: DType::U8, shape: vec![128, 64] });
+        for rank in 0..6 {
+            let slicing = Slicing::Blocks(32);
+            let (first, width) = tensors.rank_range_with(6, rank, slicing).unwrap();
+            let (w_bytes, s_bytes) = tensors.slice_bytes_with(Fp8Projection::Down, 6, rank, slicing).unwrap();
+            let (mut w, mut s) = (vec![255; w_bytes], vec![255; s_bytes]);
+            tensors.read_slice_with(3, 0, Fp8Projection::Down, 6, rank, slicing,
+                &mut w, &mut s, &mut Vec::new()).unwrap();
+            for row in 0..128 {
+                assert_eq!(&w[row * width / 2..(row + 1) * width / 2],
+                    &weight[row * 1024 + first / 2..row * 1024 + (first + width) / 2]);
+                assert_eq!(&s[row * 12..row * 12 + width / 32],
+                    &scale[row * 64 + first / 32..row * 64 + (first + width) / 32]);
+                assert!(s[row * 12 + width / 32..(row + 1) * 12].iter().all(|&v| v == 0));
+            }
+        }
+    }
+
 }

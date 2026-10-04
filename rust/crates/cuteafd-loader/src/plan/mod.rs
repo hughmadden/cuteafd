@@ -406,7 +406,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
             rejections,
         });
     }
-    place(&mut report, options, spec, model.as_ref(), &routed_operands);
+    place(&mut report, options, spec, model.as_ref(), &routed_operands, &checkpoint);
     if let Some(layout_options) = &options.layout {
         report.memory_layout = Some(layout::layout(&report, model.as_ref(), &checkpoint, layout_options));
     }
@@ -434,7 +434,7 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
 /// memory: the widest Spark rank against the Spark budget, the coordinator's
 /// own tensors (plus every expert, local-only) against its budget.
 fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model: &dyn FamilyModel,
-    routed_operands: &BTreeMap<String, QuantOperand>) {
+    routed_operands: &BTreeMap<String, QuantOperand>, checkpoint: &Checkpoint) {
     let bytes_of = |owner: Owner| -> u64 {
         report.components.iter().filter(|c| c.owner == owner).map(|c| c.bytes).sum()
     };
@@ -466,12 +466,18 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
     let gib = |bytes: f64| bytes / GIB;
     let coordinator = options.coordinator_budget_bytes as f64;
     if routed > 0 {
-        let share = |ranks: usize| -> Option<f64> {
+        let rank_bytes = |ranks: usize| -> Option<u64> {
             let contract = contract.as_ref()?;
             let i = intermediate?;
-            experts::stored_slice(i, contract.block, ranks).map(|slice| slice as f64 / i as f64)
+            if experts::mxfp4_tails_enabled(&contract.package) {
+                return experts::mxfp4_tail_bytes(routed, i, ranks, 0,
+                    experts::mxfp4_down_scale_rows(checkpoint)).map(|(_, bytes)| bytes);
+            }
+            experts::stored_slice(i, contract.block, ranks)
+                .and_then(|slice| u64::try_from(routed as u128 * slice as u128 / i as u128).ok())
         };
-        let fits_on = |ranks: usize| share(ranks).is_some_and(|s| routed as f64 * s <= options.spark_budget_bytes as f64);
+        let share = |ranks: usize| rank_bytes(ranks).map(|bytes| bytes as f64 / routed as f64);
+        let fits_on = |ranks: usize| rank_bytes(ranks).is_some_and(|bytes| bytes <= options.spark_budget_bytes);
         report.min_spark_ranks = contract.as_ref().and_then(|c| c.spark_worlds.iter().copied().find(|&r| fits_on(r)));
         let advice = match report.min_spark_ranks {
             Some(ranks) => format!("Use {ranks} Spark ranks (--spark-ranks {ranks})"),

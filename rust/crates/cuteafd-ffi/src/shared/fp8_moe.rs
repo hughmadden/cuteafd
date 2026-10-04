@@ -34,7 +34,7 @@ pub struct Fp8MoeInfo {
     pub wire_input: bool,
     pub swiglu_limit: f32,
     pub capacities: Vec<usize>,
-    /// The weight format; packed FP4 slices are zero-padded to 128.
+    /// The weight format; exact MXFP4 layouts also admit whole 32-row blocks.
     pub weights: Fp8MoeWeights,
 }
 
@@ -68,7 +68,13 @@ impl Fp8MoeInfo {
             && (info.slice == blocks / info.tp * 128 || info.slice == blocks.div_ceil(info.tp) * 128);
         let sliced = info.slice % 128 == 0 && info.slice >= 128 && (exact || (info.slice * info.tp >= info.intermediate
             && (info.slice - 128) * info.tp < info.intermediate));
-        ensure!(info.tp > 0 && sliced && info.capacities.windows(2).all(|w| w[0] < w[1]),
+        // Exact MXFP4 layouts may own K32 tails. Their scale rows are padded
+        // to u32 words; weights and activations retain the reported width.
+        let mx_blocks = info.intermediate / 32;
+        let tails = info.weights == Fp8MoeWeights::Mxfp4 && info.intermediate % 32 == 0
+            && info.tp > 0 && mx_blocks >= info.tp
+            && (info.slice == mx_blocks / info.tp * 32 || info.slice == mx_blocks.div_ceil(info.tp) * 32);
+        ensure!(info.tp > 0 && (sliced || tails) && info.capacities.windows(2).all(|w| w[0] < w[1]),
             "inconsistent FP8 expert package info {info:?}");
         Ok(info)
     }
@@ -320,4 +326,25 @@ mod metadata_tests {
         }).unwrap_err();
         assert!(error.to_string().contains("missing prefill workspace extent"));
     }
+
+    #[test]
+    fn metadata_admits_balanced_mxfp4_tails_only() {
+        for width in [320, 352] {
+            let mut header = words();
+            header[2] = width;
+            header[6] = 6;
+            assert_eq!(Fp8MoeInfo::from_words(header).unwrap().slice, width as usize);
+            for abi in [1, 3, 4] {
+                header[0] = abi;
+                assert!(Fp8MoeInfo::from_words(header).is_err());
+            }
+        }
+        for width in [0, 304, 336, 368] {
+            let mut header = words();
+            header[2] = width;
+            header[6] = 6;
+            assert!(Fp8MoeInfo::from_words(header).is_err());
+        }
+    }
+
 }

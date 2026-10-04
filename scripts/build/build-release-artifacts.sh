@@ -80,6 +80,8 @@ fi
 # validated by native/cmake/shared/expert_families.cmake. Empty keeps the V4.1 image.
 # Both builds take the same list; CMake keeps the entries for its architecture.
 expert_families="${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}"
+mxfp4_tails="${CUTEAFD_RELEASE_MXFP4_TAILS:-OFF}"
+case "$mxfp4_tails" in ON|OFF) ;; *) echo "CUTEAFD_RELEASE_MXFP4_TAILS must be ON or OFF" >&2; exit 2 ;; esac
 # Optional Spark siblings retain unquantized BF16 expert inputs. Empty keeps
 # the existing artifact set; requesting one also requires its main FP8 family.
 bf16_families="${CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES:-}"
@@ -189,6 +191,7 @@ cmake \
   -DCUTEAFD_SPARK_TP_ROLES="$spark_tp_roles" \
   -DCUTEAFD_EXPERT_FAMILIES="$expert_families" \
   -DCUTEAFD_FP8_MOE_BF16_FAMILIES="$bf16_families" \
+  -DCUTEAFD_ENABLE_MXFP4_TAILS="$mxfp4_tails" \
   -DCUTEAFD_ENABLE_V41_NVFP4_AOT="${CUTEAFD_RELEASE_NVFP4_AOT:-ON}" \
   -DCUTEAFD_ENABLE_EXL3_PACKAGES=ON \
   -DCUTEAFD_V41_EXL3_BIT_FAMILIES="$exl3_bit_families" \

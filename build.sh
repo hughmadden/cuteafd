@@ -3,6 +3,8 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
+mxfp4_tails="${CUTEAFD_RELEASE_MXFP4_TAILS:-OFF}"
+case "$mxfp4_tails" in ON|OFF) ;; *) release_die "CUTEAFD_RELEASE_MXFP4_TAILS must be ON or OFF" ;; esac
 bf16_families="${CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES:-}"
 bf16_family_pattern='^(mimo|mimop|glm|glmf|qwen4)(;(mimo|mimop|glm|glmf|qwen4))*$'
 [[ -z "$bf16_families" || "$bf16_families" =~ $bf16_family_pattern ]] ||
@@ -54,6 +56,8 @@ packages to both images, each keeping its architecture's entries.
 CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES (e.g. mimo, or mimo;glm) adds optional
 BF16-input Spark siblings for the requested FAMILY:fp8 packages. It does not
 change serving precision defaults. Empty builds the existing artifact set.
+CUTEAFD_RELEASE_MXFP4_TAILS=ON adds 32-row mimop Spark layouts;
+CUTEAFD_MXFP4_TAILS=1 selects them at runtime.
 CUTEAFD_RELEASE_MIMO_GEOMETRIES picks the MiMo program geometries (default
 mimo,mimo2,mimop,mimop2: V2 Flash, V2.6 Pro and their two-GPU head splits). p7's set, everything scripts/launch/run-family.sh
 serves (V4 Pro EXL3 K2, GLM 5.3 EXL3 K4 and FP8, GLM 5.3 Flash, MiMo V2 Flash
@@ -464,6 +468,7 @@ docker run --rm \
   -e NVIDIA_VISIBLE_DEVICES=0 \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}" \
   -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families" \
+  -e "CUTEAFD_RELEASE_MXFP4_TAILS=$mxfp4_tails" \
   -e "CUTEAFD_RELEASE_GLM_AOT=${CUTEAFD_RELEASE_GLM_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_MIMO_AOT=${CUTEAFD_RELEASE_MIMO_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_MIMO_GEOMETRIES=${CUTEAFD_RELEASE_MIMO_GEOMETRIES:-mimo,mimo2,mimop,mimop2}" \
@@ -542,7 +547,7 @@ release_ssh "$seed_host" bash -s -- \
   "$EXL3_PAIRED_TP4" "${source_manifest_sha256:-__legacy__}" "$(r="${spark_tp_roles//;/,}"; echo "${r:-__legacy__}")" \
   "${release_build_root:-__legacy__}" \
   "$(f="${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}"; f="${f//;/,}"; echo "${f:-__legacy__}")" \
-  "$(f="${bf16_families//;/,}"; echo "${f:-__legacy__}")" <<'REMOTE'
+  "$(f="${bf16_families//;/,}"; echo "${f:-__legacy__}")" "${mxfp4_tails:-OFF}" <<'REMOTE'
 set -euo pipefail
 remote_dir="$1"
 dev_image="$2"
@@ -570,6 +575,8 @@ expert_families="${expert_families//,/;}"
 bf16_families="${12-__legacy__}"
 [[ "$bf16_families" != "__legacy__" ]] || bf16_families=
 bf16_families="${bf16_families//,/;}"
+mxfp4_tails="${13-OFF}"
+case "$mxfp4_tails" in ON|OFF) ;; *) echo "MXFP4 tails must be ON or OFF" >&2; exit 2 ;; esac
 [[ "$source_manifest_sha256" != "__legacy__" ]] || source_manifest_sha256=
 [[ "$spark_tp_roles" != "__legacy__" ]] || spark_tp_roles=
 [[ "$release_build_root" != "__legacy__" ]] || release_build_root=
@@ -608,6 +615,7 @@ docker run --rm \
   -e "CUTEAFD_RELEASE_SPARK_TP_ROLES=$spark_tp_roles" \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=$expert_families" \
   -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families" \
+  -e "CUTEAFD_RELEASE_MXFP4_TAILS=$mxfp4_tails" \
   ${release_build_root_args[@]+"${release_build_root_args[@]}"} \
   -v "$remote_dir:/source:ro" \
   -v "$remote_dir/.cuteafd-release-image:/output" \

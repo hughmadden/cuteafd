@@ -301,16 +301,31 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
         // rank's own whole 128-row blocks; other packages (V4.1 native) pad every
         // rank to the widest slice.
         let package = report.experts.as_ref().map_or("", |e| e.package.as_str());
-        let intermediate = model.spec().moe.as_ref().map_or(0, |m| m.intermediate);
-        let exact = !package.starts_with("v41") && intermediate % 128 == 0 && intermediate / 128 >= ranks;
+        let spec = model.spec();
+        let intermediate = spec.moe.as_ref().map_or(0, |m| m.intermediate);
+        let tails = super::experts::mxfp4_tails_enabled(package);
+        let block = if tails { 32 } else { 128 };
+        let exact = !std::env::var("CUTEAFD_FP8_EXACT_SLICES").is_ok_and(|v| v == "0")
+            && !package.starts_with("v41") && intermediate % block == 0 && intermediate / block >= ranks;
         let rank_bytes = |rank: usize| -> u64 {
             if !exact {
                 return stored;
             }
-            let blocks = intermediate / 128;
+            let blocks = intermediate / block;
             let own = blocks / ranks + usize::from(rank < blocks % ranks);
-            (routed as f64 * (own * 128) as f64 / intermediate as f64) as u64
+            let width = own * block;
+            if tails {
+                return super::experts::mxfp4_tail_bytes(routed, intermediate, ranks, rank,
+                    super::experts::mxfp4_down_scale_rows(checkpoint)).map_or(stored, |(_, bytes)| bytes);
+            }
+            (routed as u128 * width as u128 / intermediate as u128) as u64
         };
+        if tails && exact {
+            let blocks = intermediate / block;
+            let widths: Vec<_> = (0..ranks).map(|r| (blocks / ranks + usize::from(r < blocks % ranks)) * block).collect();
+            notes.push(format!("opt-in MXFP4 32-row tails: per-rank widths {widths:?}; \
+                requires all tp{ranks}-w<width> package layouts, down scale rows padded to u32"));
+        }
         for rank in 0..ranks {
             let stored = rank_bytes(rank);
             let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: options.spark_bytes,

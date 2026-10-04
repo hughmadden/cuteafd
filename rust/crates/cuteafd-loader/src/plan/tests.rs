@@ -862,3 +862,43 @@ fn layout_places_every_device_and_names_padded_spark_slices() {
     assert_eq!(experts(0) * 2, experts(4) * 3);
     assert!(!layout.waste.iter().any(|w| w.what.contains("padded")), "{:?}", layout.waste);
 }
+
+#[test]
+fn mxfp4_tail_layout_and_admission_use_checkpoint_bytes() {
+    // Isolate process-wide layout switches from the other planner tests.
+    if std::env::var("CUTEAFD_TEST_MXFP4_TAIL_LAYOUT").is_err() {
+        for exact in ["1", "0"] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "plan::tests::mxfp4_tail_layout_and_admission_use_checkpoint_bytes", "--nocapture"])
+                .env("CUTEAFD_TEST_MXFP4_TAIL_LAYOUT", "1").env("CUTEAFD_MXFP4_TAILS", "1")
+                .env("CUTEAFD_FP8_EXACT_SLICES", exact).status().unwrap();
+            assert!(status.success(), "exact-slices={exact}");
+        }
+        return;
+    }
+    use cuteafd_core::memory_layout::{Category, DeviceKind};
+    let dir = snapshot_tp(mimo_pro_config(), &mimo_pro_tensors(), Some(8));
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    // The fixture holds one routed layer/expert, although its config says 384.
+    assert_eq!(experts::mxfp4_down_scale_rows(&checkpoint), 6144);
+    let tails = std::env::var("CUTEAFD_FP8_EXACT_SLICES").unwrap() == "1";
+    let bytes = |width: u64| 3 * 6144 * width / 2 + 2 * 6144 * width / 32 + 6144 * 12;
+    let widest = bytes(if tails { 352 } else { 384 });
+    let options = PlanOptions { spark_budget_bytes: widest, layout: Some(layout::LayoutOptions::default()),
+        ..sparks(6) };
+    let report = plan(dir.path(), &options).unwrap();
+    assert!(report.fits && report.executable(), "{}", render(&report));
+    let routed = component(&report, Component::RoutedExpert).bytes;
+    assert!((report.spark_rank_share - widest as f64 / routed as f64).abs() < 1e-12);
+    let memory = report.memory_layout.unwrap();
+    let actual: Vec<_> = memory.devices.iter().filter(|d| d.kind == DeviceKind::Spark)
+        .map(|d| d.by_category()[&Category::Experts]).collect();
+    let widths = if tails { [352, 352, 352, 352, 320, 320] } else { [384; 6] };
+    assert_eq!(actual, widths.map(bytes));
+    if tails {
+        assert_eq!(actual.iter().sum::<u64>(), routed + 6144 * 8);
+        assert!(memory.notes.iter().any(|n| n.contains("[352, 352, 352, 352, 320, 320]")));
+    }
+    let too_small = PlanOptions { spark_budget_bytes: widest - 1, ..options };
+    assert!(!plan(dir.path(), &too_small).unwrap().fits);
+}
