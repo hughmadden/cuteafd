@@ -26,9 +26,13 @@ pub(crate) fn profile(geometry: &FamilyCacheGeometry, memory: &[DeviceMemory], s
     for (rank, (cache, sample)) in geometry.ranks.iter().zip(memory).enumerate() {
         let role = if memory.len() == 1 { 0 } else if rank == 0 { 1 } else { 2 };
         let reservation = |name: &str, bytes| MemoryReservation { name: name.into(), bytes };
+        let table_bytes = (shape.prefill_rows as u64 * super::engine::PREFILL_LANES as u64
+            + shape.decode_rows as u64).checked_mul(4).context("V4 pool lane table overflow")?;
         let state = cache.active_state_per_sequence_bytes.checked_mul(shape.sequences as u64)
             .and_then(|n| n.checked_add(cache.fixed_state_bytes))
-            .and_then(|n| n.checked_add(cache.speculative_replay_bytes)).context("V4 state overflow")?;
+            .and_then(|n| n.checked_add(cache.speculative_replay_bytes))
+            .and_then(|n| table_bytes.checked_mul(shape.sequences as u64).and_then(|tables| n.checked_add(tables)))
+            .context("V4 state overflow")?;
         let context = cache.context_table_bytes_per_token.checked_mul(shape.max_context as u64)
             .context("V4 context tables overflow")?;
         let mut reservations = vec![
@@ -41,8 +45,6 @@ pub(crate) fn profile(geometry: &FamilyCacheGeometry, memory: &[DeviceMemory], s
         ];
         if memory.len() == 2 { reservations.push(reservation("peer exchange", costs.exchange_bytes)); }
         if rank == 0 { reservations.push(reservation("RTX experts and loading peak", local_bytes)); }
-        let table_bytes = (shape.prefill_rows as u64 * super::engine::PREFILL_LANES as u64
-            + shape.decode_rows as u64).checked_mul(4).context("V4 pool lane table overflow")?;
         let pool_unit_bytes = cache.persistent_unit_bytes.checked_add(cache.pool_metadata_unit_bytes)
             .and_then(|n| n.checked_add(table_bytes)).context("V4 pool unit overflow")?;
         devices.push(DeviceCosts { device: sample.device, reservations, pool_unit_bytes });
