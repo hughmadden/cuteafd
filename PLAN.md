@@ -958,8 +958,11 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
      | Target / checkpoint / layer / rows | A16 ms → A8 ms | A16/A8 |
      |---|---:|---:|
      | GB10 GLM K4 L40, TP6 width384, 2752 | 9.829 → 11.197 | 0.878 |
+     | GB10 GLM K4 L40, TP6 width384, 4096 | 13.583 → 15.397 | 0.882 |
      | GB10 GLM K4 L40, TP6 width256, 2752 | 7.439 → 7.575 | 0.982 |
+     | GB10 GLM K4 L40, TP6 width256, 4096 | 9.892 → 10.118 | 0.978 |
      | GB10 Flash K3.25 L20, TP4 width512, 2752 | 8.553 → 8.787 | 0.973 |
+     | GB10 Flash K3.25 L20, TP4 width512, 4096 | 9.632 → 11.122 | 0.866 |
      | RTX Qwen K4.25 L20, 4096 | 5.931 → 5.984 | 0.991 |
      | RTX Qwen K4.25 L20, 8192 | 10.942 → 10.181 | 1.075 |
      | RTX Flash K3.25 L20, 4096 | 13.954 → 14.023 | 0.995 |
@@ -974,6 +977,17 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
      each architecture, including BF16/wire rows, unequal tiles, mutation
      and zero rows. Actual Spark waves missed the projected 2–5% gain;
      fusion/quantization overhead appears to outweigh faster INT8 MMA.
+     Full-model native runs use 4096-row chunks, one untimed 8K warm-up and
+     three timed prefills in one launch per arm, with identical images,
+     settings and golden tokens. Qwen local K4.25 (1634 golden positions):
+     8K prefill **1212.2 → 1187.7 ms** (6758 → 6897 tok/s, indicative 1.021×,
+     RTX 325 W); NLL **2.247774 → 2.244403**, KL(golden||engine)
+     **0.046084 → 0.044223**, golden top-1 **90.70% → 90.39%**.
+     **Quality fails:** KL(A16||A8) **0.023631 nat** exceeds 0.005; direct
+     top-1 agreement is 93.82%. Lower golden NLL does not erase that drift.
+     No repeated timing sessions/tool promotion gate: the numerics failure
+     already rejects a default change. The 8192-row component gain above
+     is not the deployed 4096-row chunk geometry.
      Results live under `~/.cache/cuteafd/builds/exl3-a8/`; no default change.
    - MXFP4 experts (V4.1 already W4A8; MiMo V2.6 Pro W4A16): A8 prefill for
      MiMo Pro (Spark-bound prefill), and MXFP4 × MXFP8 MMAs for both.
