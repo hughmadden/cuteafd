@@ -160,9 +160,10 @@ pub(crate) struct PlanArgs {
     #[arg(long)]
     pub(crate) hf_home: Option<PathBuf>,
     /// Spark ranks sharing the routed experts: 2, 3, 4 or 6, or 0 to place
-    /// every routed expert on the coordinator GPU (local-only).
-    #[arg(long, default_value_t = 4)]
-    pub(crate) spark_ranks: usize,
+    /// every routed expert on the coordinator GPU (local-only). Unset prefers
+    /// qualified local experts when serving reservations fit; otherwise 4.
+    #[arg(long)]
+    pub(crate) spark_ranks: Option<usize>,
     /// Routed-expert weight budget per Spark rank, GiB.
     #[arg(long, default_value_t = 100.0)]
     pub(crate) spark_budget_gib: f64,

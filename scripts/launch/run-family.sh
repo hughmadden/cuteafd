@@ -26,6 +26,10 @@ while IFS='=' read -r key value; do
   cfg[$key]="$value"
 done < <(grep -E '^[A-Z_0-9]+=' "$config")
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
+# Validate the name before it is used to identify allocations during admission.
+instance="$(get INSTANCE)"
+[[ -z "$instance" || "$instance" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$ ]] || { echo "INSTANCE must be [A-Za-z0-9_.-]" >&2; exit 2; }
+coordinator_name="cuteafd-coordinator${instance:+-$instance}"
 # key NEW OLD [DEFAULT]: a renamed key; the pre-rename spelling works for one
 # release with a warning.
 key() {
@@ -55,6 +59,51 @@ case "$family" in
   qwen4) serve=serve-qwen4 ;;
   *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2 and Qwen 3.8 checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
 esac
+# EXPERT_BACKEND=auto prefers qualified local experts when the planner admits
+# their weights plus serving reservations on the selected GPU. SPARK_COUNT is
+# the fallback topology; EXPERT_BACKEND=spark explicitly keeps it.
+ranks="$(get SPARK_COUNT 4)"
+configured_ranks="$ranks"
+backend="$(get EXPERT_BACKEND auto)"
+case "$backend" in
+  auto|spark) ;;
+  local) ranks=0 ;;
+  *) echo "EXPERT_BACKEND must be auto, local or spark" >&2; exit 2 ;;
+esac
+qwen_exl3=0
+if [[ "$family" == qwen4 ]]; then
+  qwen_exl3="$(python3 -c 'import json,sys; q=json.load(open(sys.argv[1])).get("quantization_config", {}); print(int(q.get("quant_method", q.get("method")) == "exl3"))' "$root/snapshots/$revision/config.json")"
+fi
+if [[ "$qwen_exl3" == 1 && "$backend" == auto && "$ranks" != 0 ]]; then
+  selected="$(get COORDINATOR_GPUS "$(get COORDINATOR_GPU 0)")"; selected="${selected%%,*}"
+  free_mib="$(nvidia-smi --id="$selected" --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | tr -d ' ' || true)"
+  if [[ "$free_mib" =~ ^[0-9]+$ ]]; then
+    if [[ "$restart" == 1 ]]; then
+      # --restart will release this container's allocations after validation.
+      # Credit only its host PIDs on this GPU, never another launch's memory.
+      own_pids="$(docker top "$coordinator_name" -eo pid 2>/dev/null | tail -n +2 || true)"
+      if [[ -n "$own_pids" ]]; then
+        own_mib="$(nvidia-smi --id="$selected" --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null \
+          | python3 -c 'import csv,sys; p=set(sys.argv[1].split()); print(sum(int(r[1].strip()) for r in csv.reader(sys.stdin) if len(r)==2 and r[0].strip() in p and r[1].strip().isdigit()))' "$own_pids" || true)"
+        [[ "$own_mib" =~ ^[0-9]+$ ]] && free_mib=$((free_mib + own_mib))
+      fi
+    fi
+    free_gib="$(python3 -c 'import sys; print(int(sys.argv[1])/1024)' "$free_mib")"
+    pool="$(get POOL_TOKENS 32768)"
+    if [[ "$pool" =~ ^[1-9][0-9]*$ ]]; then
+      # CPU-only preflight reads checkpoint headers in the selected serving image.
+      # Older images that do not qualify auto placement keep the Spark fallback.
+      preferred="$(docker run --rm --network none -v "$hub:/root/.cache/huggingface/hub:ro" \
+        "$(get COORDINATOR_DOCKER_INFERENCE)" cuteafd plan "$snapshot" --json --layout \
+        --rtx 1 --rtx-gib "$free_gib" --coordinator-budget-gib "$free_gib" --pool-tokens "$pool" \
+        | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["spark_ranks"])' 2>/dev/null || true)"
+      if [[ "$preferred" == 0 ]]; then
+        echo "note: Qwen EXL3 auto selected resident local experts on GPU $selected; EXPERT_BACKEND=spark forces Spark ranks" >&2
+        ranks=0
+      fi
+    fi
+  fi
+fi
 layer_args="--first-layer $first_layer"
 [[ "$last_layer" == -1 ]] || layer_args+=" --last-layer $last_layer"
 # Snapshot of a model id (and optional revision) inside the containers.
@@ -111,7 +160,7 @@ fi
 case "$family:$speculator" in
   qwen4:mtp)
     # The MTP layer's experts run on the coordinator: only with local experts (SPARK_COUNT=0).
-    [[ "$(get SPARK_COUNT 4)" == 0 ]] ||
+    [[ "$ranks" == 0 ]] ||
       { echo "SPECULATOR=mtp for Qwen needs SPARK_COUNT=0 (local experts); the Spark ranks do not serve the MTP layer's experts" >&2; exit 2; } ;;
   *:off|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|deepseek_v4:dspark) ;;
   *) echo "SPECULATOR=$speculator does not apply to $family" >&2; exit 2 ;;
@@ -284,6 +333,16 @@ fi
 # prefill (the engine's default 0.2; 0 prefills whole prompts before the next
 # step). Keys left unset pass nothing (images older than the options run).
 [[ -z "$(get DECODE_SHARE)" ]] || family_args+=(--decode-share "$(get DECODE_SHARE)")
+# DeepSeek V4 keeps complete expert layers local while memory permits. Honor
+# an explicit limit; zero leaves the backbone experts on the Sparks.
+if [[ $serve == serve-dsv4 ]]; then
+  local_layers="$(get RTX_EXPERT_LAYERS auto)"
+  case "$local_layers" in
+    ""|auto) ;;
+    *[!0-9]*) echo "RTX_EXPERT_LAYERS must be auto or a nonnegative integer" >&2; exit 2 ;;
+    *) family_args+=(--local-expert-layers "$local_layers") ;;
+  esac
+fi
 # GLM, GLM Flash, MiMo, Qwen: L2_PREFETCH (off, auto = 3/4 of the L2, or MiB;
 # unset: auto for GLM 5.3 and GLM 5.3 Flash, off for MiMo and Qwen) pulls the
 # next layer's weights into L2 during each one-lane decode step's Spark exchange; FP8_SCALES (amax, pow2, best) is the scale rule of the FP8
@@ -334,7 +393,6 @@ fi
 spark_image="$(get SPARK_EXPERT_DOCKER_INFERENCE)"
 port="$(get EXPERT_PORT 19441)"
 addr="$(get ADDR 0.0.0.0:8000)"
-ranks="$(get SPARK_COUNT 4)"
 budget="$(get SPARK_DEVICE_BUDGET_BYTES 107374182400)"
 gpu="$(get COORDINATOR_GPU 0)"
 # Two coordinator GPUs (RTX_GPUS=auto/2 with COORDINATOR_GPU as V4.1's two-RTX config picks
@@ -416,9 +474,6 @@ fi
 # INSTANCE names a launch that runs beside others on disjoint hardware
 # (`cuteafd bench smoke` sets it): its coordinator container is
 # cuteafd-coordinator-INSTANCE; empty keeps the one cuteafd-coordinator.
-instance="$(get INSTANCE)"
-[[ -z "$instance" || "$instance" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$ ]] || { echo "INSTANCE must be [A-Za-z0-9_.-]" >&2; exit 2; }
-coordinator_name="cuteafd-coordinator${instance:+-$instance}"
 # SPARK_COUNT=0: the routed experts run on the coordinator GPU (--local-experts;
 # GLM 5.3 Flash, MiMo V2 and Qwen 3.8), the natural minimum for checkpoints
 # that fit one RTX.
@@ -453,7 +508,26 @@ peers=()
 # One model is served at a time: every expert worker on these hosts goes, whatever
 # its port (a leftover worker of another model holds Spark memory and OOMs the next).
 if [[ "$restart" == 1 ]]; then
+  previous_csv=""
+  if [[ "$ranks" == 0 && "$configured_ranks" != 0 ]]; then
+    # Switching to local experts must release this coordinator's old workers.
+    # A new local launch must not stop another instance's Spark workers.
+    previous_csv="$(docker inspect --format '{{json .Config.Cmd}}' "$coordinator_name" 2>/dev/null \
+      | python3 -c 'import json,sys; c=json.load(sys.stdin); print(c[c.index("--peers")+1])' 2>/dev/null || true)"
+  fi
   docker rm -f "$coordinator_name" >/dev/null 2>&1 || true
+  if [[ -n "$previous_csv" ]]; then
+    IFS=, read -r -a previous_peers <<<"$previous_csv"
+    for ((rank = 0; rank < configured_ranks; rank++)); do
+      host="$(get "SPARK_${rank}_HOST")"; lane="$(get "SPARK_${rank}_LANE_A")"
+      for peer in "${previous_peers[@]}"; do
+        old_port="${peer##*:}"
+        if [[ "${peer%:*}" == "$lane" && "$old_port" =~ ^[0-9]+$ ]]; then
+          ssh "$host" "docker rm -f cuteafd-spark-expert-$host-$old_port >/dev/null 2>&1 || true"
+        fi
+      done
+    done
+  fi
   for ((rank = 0; rank < ranks; rank++)); do
     host="$(get "SPARK_${rank}_HOST")"
     ssh "$host" 'ids=$(docker ps -aq --filter name=^cuteafd-spark-expert-); [ -z "$ids" ] || docker rm -f $ids >/dev/null 2>&1 || true'

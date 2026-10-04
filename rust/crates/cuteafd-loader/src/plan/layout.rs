@@ -180,7 +180,8 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
     let conversions = load_conversions(family, checkpoint);
     let costs = family_costs(family);
     let gpus = options.rtx_bytes.len().clamp(1, 2);
-    let split = gpus == 2 && options.head_split;
+    // Qwen executes on one GPU even when the inventory names two.
+    let split = gpus == 2 && options.head_split && family != "qwen4";
     let mut devices: Vec<DeviceLayout> = options.rtx_bytes.iter().take(gpus).enumerate()
         .map(|(index, &bytes)| DeviceLayout { kind: DeviceKind::Rtx, index: index as u32,
             capacity_bytes: bytes.saturating_sub(options.headroom_bytes), items: Vec::new(), kv_tokens: 0 })
@@ -243,6 +244,13 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
             }
         }
     }
+    if report.placement == ExpertPlacement::Local {
+        let routed = report.components.iter().filter(|c| c.owner == Owner::SparkSliced && c.status != Status::Unused);
+        for component in routed {
+            devices[0].items.push(Item::new(Category::Experts, component.component.label(),
+                component.formats.keys().cloned().collect::<Vec<_>>().join("+"), component.bytes, Basis::Exact));
+        }
+    }
     // The drafter lives on the lead GPU (taps and head are there under a head split).
     let drafter = if options.drafter_bytes > 0 { options.drafter_bytes } else { costs.drafter_bytes };
     if drafter > 0 {
@@ -250,9 +258,10 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
     }
 
     // Fixed runtime costs.
-    let gpus_now = devices.len();
     for (index, device) in devices.iter_mut().enumerate() {
-        let role = if gpus_now == 1 { 0 } else if index == 0 { 1 } else { 2 };
+        // An inventory entry is not an executing device without a head split.
+        if !split && index > 0 { continue; }
+        let role = if !split { 0 } else if index == 0 { 1 } else { 2 };
         device.items.push(Item::new(Category::Runtime, "context+modules", "", costs.runtime_bytes[role],
             Basis::Calibrated));
         device.items.push(Item::new(Category::Runtime, "graph allowance", "", costs.graph_bytes[role], Basis::Calibrated));
@@ -381,14 +390,6 @@ fn load_conversions(family: &str, checkpoint: &super::Checkpoint) -> Vec<Convers
             vec![Conversion { component: Component::Attention, saved_bytes: mla / 2, format: "bf16+fp8" },
                 Conversion { component: Component::SharedExpert, saved_bytes: shared / 2, format: "fp8" },
                 Conversion { component: Component::DenseFfn, saved_bytes: dense / 2, format: "fp8" }]
-        }
-        // Qwen 3.8: target and MTP share one per-row FP8 head (--mtp-fp8-head).
-        "qwen4" => {
-            let head: u64 = checkpoint.tensors.iter()
-                .filter(|t| t.meta.name.ends_with("lm_head.weight") && t.meta.dtype == cuteafd_core::DType::Bf16)
-                .map(|t| t.meta.byte_length).sum();
-            if head == 0 { Vec::new() }
-            else { vec![Conversion { component: Component::LmHead, saved_bytes: head / 2, format: "fp8-row128" }] }
         }
         _ => Vec::new(),
     }

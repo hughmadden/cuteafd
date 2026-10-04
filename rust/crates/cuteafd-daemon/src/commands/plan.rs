@@ -1,6 +1,6 @@
 //! `cuteafd plan`: inspect a checkpoint and report what this build can serve.
 use anyhow::{Context, Result};
-use cuteafd_loader::plan::{budget_bytes, plan, render, ExpertPlacement, PlanError, PlanOptions};
+use cuteafd_loader::plan::{budget_bytes, plan, plan_preferred, render, ExpertPlacement, PlanError, PlanOptions};
 use cuteafd_loader::{default_hf_home, resolve_snapshot_at_revision};
 use std::path::PathBuf;
 
@@ -9,7 +9,7 @@ use crate::cli::PlanArgs;
 /// The planning options `args` name, validated before any checkpoint is read.
 fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     let options = PlanOptions {
-        placement: ExpertPlacement::from_spark_ranks(args.spark_ranks),
+        placement: ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(4)),
         spark_budget_bytes: budget_bytes("--spark-budget-gib", args.spark_budget_gib)?,
         coordinator_budget_bytes: budget_bytes("--coordinator-budget-gib", args.coordinator_budget_gib)?,
         layout: args.layout.then(|| -> Result<_, PlanError> {
@@ -53,7 +53,8 @@ pub(crate) fn run_plan(args: PlanArgs) -> Result<()> {
             .snapshot_path
             .with_context(|| format!("no snapshot of {} under {}", args.model, hf_home.display()))?
     };
-    let report = plan(&snapshot, &options)?;
+    let report = if args.spark_ranks.is_some() { plan(&snapshot, &options)? }
+        else { plan_preferred(&snapshot, &options)? };
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -79,7 +80,7 @@ mod tests {
             model: model.display().to_string(),
             revision: None,
             hf_home: None,
-            spark_ranks,
+            spark_ranks: Some(spark_ranks),
             spark_budget_gib: 100.0,
             coordinator_budget_gib: 80.0,
             json: true,

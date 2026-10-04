@@ -816,9 +816,32 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
         8K prefill equal; golden NLL 2.4073 -> 2.4054. Qwen still has none
         (two-GPU requests serve from the first GPU).
      g. Qwen 3.8 EXL3: 84 tok/s with 4 Sparks vs 261 on one RTX alone.
+        Resolved placement (`21201b6`, `120f4e7`, `5ff0602`): qualify the
+        supported EXL3 K4.25 package for resident local experts when weights,
+        serving reservations, MTP and the requested KV pool fit the selected
+        GPU. The planner includes resident experts and leaves unused GPUs
+        empty; the launcher checks live available memory before choosing.
+        `EXPERT_BACKEND=spark/local` preserves explicit placement. The old
+        comparison also changed native MTP depth; matched backend-only runs
+        still favor local experts. Real CPU launcher admission also selects
+        local with explicit MTP; MTP remains opt-in. Existing C1/C4 and
+        low-margin MTP greedy divergence remain open.
      h. Prefill gets worse with more hardware: V4 Pro min 879 tok/s (9.2 s
         TTFT) vs 2,438 max; MiMo Flash max 2,899 vs min 5,877; MiMo Pro max
         1,754 vs min 2,741 (two-lane prefill off under the head split).
+        Refreshed on `adfd821`: V4 Pro's large historical gap no longer
+        reproduces; maximum remains faster. The launcher now honors explicit
+        `RTX_EXPERT_LAYERS` (`a181a6a`). Remote-only backbone experts miss the
+        declared TTFT improvement bar and give mixed decode results, so keep
+        automatic placement. Golden fidelity is still unavailable; existing
+        speculation and C1/C4 divergence remain open.
+        MiMo Flash already uses the shared multi-lane head-split fix. Its
+        inherited three-lane default was qualified for Pro; two lanes improve
+        Flash prefill on both reference layouts and pass matched C1 with
+        byte-identical output (`75bfb91`). Keep Pro at three lanes and preserve
+        explicit overrides. Flash's maximum still trails its improved minimum:
+        head split overhead remains open. Measurements and conditions are in
+        the scale-anomalies commits; no shared native or exchange kernel edits.
      i. V4 / V4.1 turn-end prefix-cache restores are byte-exact (fixed in the
         check, `0f65c9b`): the old check compared a restored turn with a cold
         recompute, and V4 Flash / V4.1 prefill does not repeat bit for bit
