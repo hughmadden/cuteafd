@@ -701,9 +701,10 @@ v1 ships when these are done; everything else below moves to v1.x/v2.
   warm re-captures) and device-side draft acceptance; deterministic
   (batch-invariant) prefill and verify;
   multimodal input (v2); `placement.json` handoff and cold-component placement;
-  V4.1 NVFP4 W4A4 revisit and W4A4 decode; EXL3 × A8 (an independent SM120
-  implementation is the interesting part — not a port of b12x PR #342, whose
-  ShapleyMcg licence covers re-implementations made with reference to it);
+  V4.1 NVFP4 W4A4 revisit and W4A4 decode;
+  **re-evaluate EXL3 A8 defaults per checkpoint (and uncapped RTX)**:
+  the SM120/SM121 INT8 path ships as an opt-in experiment; promotion needs
+  checkpoint-specific quality, prefill and tool gates;
   parked Spark-side reduce / split intake.
 - **RTX 5090 support: Hugh** (external collaborator). Brief: one SM120 build
   serves RTX PRO 6000 (188 SMs, 96 GB) and RTX 5090 (170 SMs, 32 GB) with no
@@ -938,14 +939,42 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
    lever for prefill and wide verify) and **A4 only where the checkpoint
    declares it** (NVIDIA ModelOpt NVFP4). Every A8 switch is gated on golden
    NLL/KL (≤0.005 nat) plus a tool-eval/agentic check, per model.
-   - EXL3 × A8: EXL3 trellis experts (V4 Pro, GLM 5.3, GLM Flash, Qwen) run
-     A16 today. Checked 2026-10-03: nothing upstream runs standard (MCG) EXL3
-     with A8 — master's W4A8 trellis decodes only QSRT; brandonmusic's PR #342
-     (MCG->E4M3, SM120 TP4, source-available licence, expert-shared suh) does
-     not fit our checkpoints. GB10 measured full-rate F16 MMA (124.8 TFLOPS,
-     E4M3/INT8 248), and an INT8 A8 prototype (fork `cuteafd/exl3-a8`, local;
-     INT8 weights 0.9-1.6% rel error vs 3.7% for E4M3) saves only ~7% of a
-     GB10 wave: not built. The wave is byte- and rotation-bound (item 5).
+   - EXL3 × A8 (2026-10-04, `work/exl3-a8`): built an opt-in INT8 path
+     for MCG trellises on SM120 local layers and SM121 wire-row waves.
+     Fork master `55e10b10` fixes the FC1 BF16/FC2 packed-loader dispatch,
+     decodes trellis weights to INT8, quantizes rotated activations per H128
+     block and fuses FC2 input quantization into FC1's SwiGLU/rotation output.
+     INT8 payload and FP32 scales reuse the admitted FP16-sized row storage.
+     A16 remains default. Build with `CUTEAFD_WIP_EXL3_ACTIVATIONS=a8` (or
+     `CUTEAFD_RELEASE_EXL3_ACTIVATIONS=a8`), then launch with
+     `EXL3_ACTIVATIONS=a8`; packages contain separate m256/m1024/m4096 A8
+     siblings. Capacities <=80 stay A16; wider verify uses the selected
+     capacity policy. Unsupported/missing opt-in packages fail before load.
+     This qualification covers GLM K4 TP6, Flash K3.25 TP4/local and Qwen
+     K4.25 local; other EXL3 families require their own qualification/export.
+     Real checkpoint layer components, seeded routes/inputs, ten-second RTX
+     / five-second Spark warm-up, seven interleaved graph-event samples:
+
+     | Target / checkpoint / layer / rows | A16 ms → A8 ms | A16/A8 |
+     |---|---:|---:|
+     | GB10 GLM K4 L40, TP6 width384, 2752 | 9.829 → 11.197 | 0.878 |
+     | GB10 GLM K4 L40, TP6 width256, 2752 | 7.439 → 7.575 | 0.982 |
+     | GB10 Flash K3.25 L20, TP4 width512, 2752 | 8.553 → 8.787 | 0.973 |
+     | RTX Qwen K4.25 L20, 4096 | 5.931 → 5.984 | 0.991 |
+     | RTX Qwen K4.25 L20, 8192 | 10.942 → 10.181 | 1.075 |
+     | RTX Flash K3.25 L20, 4096 | 13.954 → 14.023 | 0.995 |
+     | RTX Flash K3.25 L20, 8192 | 26.251 → 26.108 | 1.005 |
+
+     RTX PRO 6000 GPU1 was capped at 325 W (software power throttling).
+     These are single-layer/slice measurements, not whole-model 8K prefill.
+     Layer output relative error was 1.69–1.79%, cosine >0.99984; graph
+     pointers stayed stable, replay allocations/drift were zero. Short packed
+     A16 component arms were byte-equal (the deployed short auto-direct path
+     is outside this comparison). All five focused kernel tests passed on
+     each architecture, including BF16/wire rows, unequal tiles, mutation
+     and zero rows. Actual Spark waves missed the projected 2–5% gain;
+     fusion/quantization overhead appears to outweigh faster INT8 MMA.
+     Results live under `~/.cache/cuteafd/builds/exl3-a8/`; no default change.
    - MXFP4 experts (V4.1 already W4A8; MiMo V2.6 Pro W4A16): A8 prefill for
      MiMo Pro (Spark-bound prefill), and MXFP4 × MXFP8 MMAs for both.
    - FP8 experts: extend W8A8 (MiMo GB10 gate/up) to the down projection and
