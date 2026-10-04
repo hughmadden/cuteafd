@@ -160,21 +160,71 @@ def test_deepseek_v4_rejects_invalid_local_limit_before_launch(tmp_path):
     assert "docker run" not in result.stderr and "nest drop-caches" not in result.stderr
 
 
-@pytest.mark.parametrize("mode,expected", [(None, "off"), ("auto", "off"), ("off", "off"), ("row128", "row128")])
-def test_glmf_kda_defaults_to_checkpoint_bf16(tmp_path, mode, expected):
-    config = {"model_type": "glm5_next", "num_hidden_layers": 2,
-              "mlp_layer_types": ["sparse"] * 2,
-              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
-    keys = "GLM5_FLASH_FP8_MODEL_ID=off\n"
-    if mode is not None:
-        keys += f"GLM5_FLASH_KDA_FP8={mode}\n"
-    result = _family_launch_result(tmp_path, config, "test/glmf", keys)
+@pytest.mark.parametrize("layout,physical_gpus,split", [
+    ("RTX_GPUS=1\n", (0, 1), False),
+    ("RTX_GPUS=auto\n", (0,), False),
+    ("COORDINATOR_GPUS=1\n", (0, 1), False),
+    ("COORDINATOR_GPUS=0,1\nCOORDINATOR_SPLIT=off\n", (0, 1), False),
+    ("RTX_GPUS=auto\n", (0, 1), True),
+    ("RTX_GPUS=2\n", (0, 1), True),
+    ("COORDINATOR_GPUS=1,0\n", (0, 1), True),
+    ("RTX_GPUS=1\nCOORDINATOR_SPLIT=heads\n", (0, 1), True),
+])
+@pytest.mark.parametrize("precision", ["", "GLM5_FLASH_KDA_FP8=auto\nGLM5_FLASH_FP8_HEAD=auto\n",
+                                        "GLMF_KDA_FP8=auto\nGLMF_FP8_HEAD=auto\n"])
+def test_glmf_precision_defaults_follow_serving_split(tmp_path, layout, physical_gpus, split, precision):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\n" + layout + precision,
+                                  physical_gpus=physical_gpus)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
-    assert f"--kda-fp8 {expected}" in launch
-    assert launch.count("--kda-fp8") == 1
-    # The LM head stays BF16 unless GLM5_FLASH_FP8_HEAD=on.
-    assert "--fp8-head false" in launch
+    assert ("--split-device" in launch) == split
+    assert f"--kda-fp8 {'off' if split else 'row128'}" in launch
+    assert f"--fp8-head {'false' if split else 'true'}" in launch
+    assert launch.count("--kda-fp8") == launch.count("--fp8-head") == 1
+
+
+@pytest.mark.parametrize("layout", ["RTX_GPUS=1\n", "RTX_GPUS=2\n"])
+@pytest.mark.parametrize("prefix", ["GLM5_FLASH", "GLMF"])
+@pytest.mark.parametrize("kda,head", [("off", "off"), ("row128", "on"), ("channel", "off")])
+def test_glmf_explicit_precision_wins_on_either_layout(tmp_path, layout, prefix, kda, head):
+    # Current names also take precedence over conflicting deprecated names.
+    keys = "GLMF_KDA_FP8=channel\nGLMF_FP8_HEAD=on\n" if prefix == "GLM5_FLASH" else ""
+    keys += f"{prefix}_KDA_FP8={kda}\n{prefix}_FP8_HEAD={head}\n"
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\n" + layout + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert f"--kda-fp8 {kda}" in launch
+    assert f"--fp8-head {'true' if head == 'on' else 'false'}" in launch
+    assert launch.count("--kda-fp8") == launch.count("--fp8-head") == 1
+
+
+@pytest.mark.parametrize("layout,keys,kda,head", [
+    ("RTX_GPUS=1\n", "GLM5_FLASH_KDA_FP8=off\n", "off", "true"),
+    ("RTX_GPUS=1\n", "GLM5_FLASH_FP8_HEAD=off\n", "row128", "false"),
+    ("RTX_GPUS=2\n", "GLM5_FLASH_KDA_FP8=row128\n", "row128", "false"),
+    ("RTX_GPUS=2\n", "GLM5_FLASH_FP8_HEAD=on\n", "off", "true"),
+])
+def test_glmf_precision_overrides_are_independent(tmp_path, layout, keys, kda, head):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\n" + layout + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert f"--kda-fp8 {kda}" in launch
+    assert f"--fp8-head {head}" in launch
+
+
+@pytest.mark.parametrize("layout,accepted", [("RTX_GPUS=1\n", True), ("RTX_GPUS=2\n", False)])
+def test_glmf_kda_prefill_validation_uses_resolved_precision(tmp_path, layout, accepted):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
+                                  "GLM5_FLASH_FP8_MODEL_ID=off\nGLM5_FLASH_FP8_PREFILL=all\n" + layout)
+    assert result.returncode == (0 if accepted else 2), result.stderr
+    if accepted:
+        assert "--fp8-prefill all" in result.stderr
+    else:
+        assert "GLM5_FLASH_KDA_FP8=row128 or channel" in result.stderr
+        assert "docker run" not in result.stderr
 
 
 @pytest.mark.parametrize("keys,expected", [

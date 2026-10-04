@@ -25,6 +25,11 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## GLM 5.3 Flash
 
+- 2026-10-04 · FP8 defaults recheck · EXL3 K3.25 · 1× RTX + 2× Spark / 2× RTX + 4× Spark (head split) · build 45955d8 + benchmark hook 0d6809d · [comparison and recommendation](glm5_flash/2026-10-04-fp8-recheck/comparison.json)
+- 2026-10-04 · FP8 recheck arm D (Release smoke quality) · wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1 · 2× RTX PRO 6000 @ 325 W + 4× DGX Spark (head split) · build 45955d8 + benchmark hook 0d6809d · [report](glm5_flash/2026-10-04-fp8-recheck-d-2rtx-4spark/report.svg)
+- 2026-10-04 · FP8 recheck arm F (Release smoke quality) · wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1 · 2× RTX PRO 6000 @ 325 W + 4× DGX Spark (head split) · build 45955d8 + benchmark hook 0d6809d · [report](glm5_flash/2026-10-04-fp8-recheck-f-2rtx-4spark/report.svg)
+- 2026-10-04 · FP8 recheck arm D (Release smoke quality) · wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1 · 1× RTX PRO 6000 @ 325 W + 2× DGX Spark · build 45955d8 + benchmark hook 0d6809d · [report](glm5_flash/2026-10-04-fp8-recheck-d-1rtx-2spark/report.svg)
+- 2026-10-04 · FP8 recheck arm F (Release smoke quality) · wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1 · 1× RTX PRO 6000 @ 325 W + 2× DGX Spark · build 45955d8 + benchmark hook 0d6809d · [report](glm5_flash/2026-10-04-fp8-recheck-f-1rtx-2spark/report.svg)
 - 2026-10-02 · Release smoke · brandonmusic/GLM-5.3-Flash-tr3-4bpw · 1× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v0.1.0 · [report](glm5_flash/2026-10-02-smoke-glm-5-3-flash-tr3-4bpw-1rtx-4spark/report.svg) · ⚠ quality gate failed
 - 2026-10-02 · Release smoke · brandonmusic/GLM-5.3-Flash-tr3-4bpw · 1× RTX PRO 6000 @ 325 W + 2× DGX Spark · build v0.1.0 · [report](glm5_flash/2026-10-02-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark/report.svg) · ⚠ quality gate failed
 - 2026-10-02 · Release smoke · nvidia/GLM-5.3-Flash-NVFP4 · 1× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v0.1.0 · [report](glm5_flash/2026-10-02-smoke-glm-5-3-flash-nvfp4-1rtx-4spark/report.svg)

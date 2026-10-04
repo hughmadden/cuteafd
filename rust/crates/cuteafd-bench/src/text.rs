@@ -3,6 +3,16 @@
 
 /// A short unique tag for one request.
 pub fn nonce() -> String {
+    // A fixed seed lets independent fresh servers run the same benchmark
+    // prompts. The sequence still keeps unrelated probes from sharing a cache
+    // prefix. Ordinary runs retain random nonces.
+    if let Ok(seed) = std::env::var("CUTEAFD_BENCH_NONCE_SEED") {
+        if !seed.is_empty() {
+            static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let index = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return format!("{seed}-{index:010}");
+        }
+    }
     uuid::Uuid::new_v4().simple().to_string()[..10].to_string()
 }
 

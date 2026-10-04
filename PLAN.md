@@ -957,13 +957,36 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
     explicit option; drafter precision is chosen by emitted tok/s and memory.
     Landed: MiMo resolves head/O/drafter formats from headers; MiMo V2.6
     Pro defaults to single-copy FP8 head/O/DFlash (TJ-approved exception;
-    `MIMO_WEIGHT_POLICY=checkpoint` opts out). Dual-copy options now fail
-    before loading until single-copy consumers exist: Qwen
-    `--fp8-decode`/`--mtp-fp8-head`, GLM Flash KDA `row128`/`channel` and
-    FP8 head. GLM/GLM Flash DFlash default to checkpoint BF16; single-copy
-    FP8 is `SPECULATOR_FP8=on`. Open: compact FP8 consumers for Qwen
-    projections and GLM Flash KDA (recover the dual-copy decode speed),
-    GLM target head/index operands, and a measured drafter-precision default.
+    `MIMO_WEIGHT_POLICY=checkpoint` opts out). Qwen and GLM Flash now have
+    compact single-copy FP8 consumers; GLM/GLM Flash DFlash defaults to FP8
+    (`SPECULATOR_FP8=off` retains checkpoint BF16).
+    **GLM Flash precision recheck (2026-10-04, Claude decision):** resolve
+    launcher defaults after the actual coordinator split is selected.
+    One serving GPU uses row128 FP8 KDA and an FP8 head; two-GPU head split
+    uses BF16 KDA/head. Explicit current or deprecated precision keys win
+    independently. The matched EXL3 K3.25 recheck clears the single-GPU
+    quality/C4 bars; FP8 under the split misses both, so remains opt-in.
+    Conditions and both tables: `docs/models/glm5_flash.md` and
+    `benchmarks/glm5_flash/2026-10-04-fp8-recheck/comparison.json`.
+    **Split regression audit (same recheck, no new hardware run):** the
+    FP8 arm's warm and two timed 8K requests have essentially constant
+    coordinator GPU wait while expert wait rises on each request. Its warm
+    prefill is faster than BF16; the timed aggregate loss is dominated by
+    Spark expert wait, not evidence of an equally large KDA compute loss.
+    Both arms use the same prefill shape. Split KDA directly consumes FP8
+    weights (`glmf2_kda_w8_m4096`); the generated library loads on every CUDA
+    device. No BF16 re-conversion or replicated full-head KDA work found.
+    All 238 KDA projection tensors in the primary EXL3 and official FP8
+    companion snapshots are byte-identical before conversion. Column
+    slicing of KDA O preserves the 128-K scale-block boundaries. Split
+    attention partials still round to BF16 before the peer sum: interaction
+    with FP8 quantization is a plausible, unproven contributor to top-1
+    loss. Worker logs show no explanatory timeout/stall; per-request route
+    distributions and Spark clock/thermal samples were not recorded.
+    No clear fix qualified: keep split FP8 opt-in. Next discriminating
+    measurement is one matched D/F launch with identical 8K token IDs,
+    worker timing/route distributions and Spark clocks, plus KDA/head
+    precision ablation if quality remains below the split promotion bar.
     V4.1 `all` now releases BF16 and shares a single FP8 vocabulary head
     across target and dSpark. Claude accepted its target-head quality;
     dual-RTX C1 missed the promotion bar, so BF16 stays default. `draft`
