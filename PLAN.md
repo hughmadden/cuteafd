@@ -824,8 +824,11 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
         `EXPERT_BACKEND=spark/local` preserves explicit placement. The old
         comparison also changed native MTP depth; matched backend-only runs
         still favor local experts. Real CPU launcher admission also selects
-        local with explicit MTP; MTP remains opt-in. Existing C1/C4 and
-        low-margin MTP greedy divergence remain open.
+        local with explicit MTP. Qualified local EXL3 now defaults to native
+        MTP3 with one FP8 head shared by target and drafts; explicit settings
+        retain precedence. Spark MTP is unsupported (workers serve backbone
+        experts only). C1/C4 and low-margin verify rounding still differ;
+        the current lossless gate permits proven rounding, never a state bug.
      h. Prefill gets worse with more hardware: V4 Pro min 879 tok/s (9.2 s
         TTFT) vs 2,438 max; MiMo Flash max 2,899 vs min 5,877; MiMo Pro max
         1,754 vs min 2,741 (two-lane prefill off under the head split).
