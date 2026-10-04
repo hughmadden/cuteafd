@@ -162,8 +162,9 @@ default. In WIP builds, `CUTEAFD_V41_FP8_HEAD=draft` adds an FP8 copy for
 the draft head while retaining BF16 for the target: this opt-in uses dual
 residency and does not meet the single-residency rule. `all` also projects
 the target through FP8 and changes its logits; it currently retains both
-representations too. Neither mode is the default. `off` explicitly selects
-the shared BF16 head.
+representations too. `all` failed the golden top-1 gate and remains
+experimental. Neither mode is the default. `off` explicitly selects the
+shared BF16 head.
 
 ## Working on it
 
