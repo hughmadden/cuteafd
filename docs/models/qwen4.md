@@ -22,12 +22,13 @@ layer every fourth, a PLE n-gram memory table, and fused expert tensors.
   unclamped, stored as one fused `[experts, ...]` tensor per projection per
   layer; EXL3 K4/K5, FP8 128x128 blocks, or ModelOpt NVFP4 group-16; a local
   (RTX-resident, TP1) expert path is supported.
-- Speculator: a native MTP layer (full attention, 512 experts, and a
-  hyper-connection feedback path) exists in the checkpoint but is not yet
-  wired into the plain serve path.
+- Speculator: native MTP (full attention, 512 experts, and a hyper-connection
+  feedback path). The launcher defaults to MTP3 with resident local EXL3
+  experts; `SPECULATOR=off` disables it and `SPECULATOR_DEPTH` overrides the
+  depth. The policy adapts the number of drafts to concurrency and acceptance.
 - RTX/Spark layouts: fits comfortably on one RTX with local experts (~73 GB
-  for the EXL3 or FP8 package); Spark EXL3 runs at TP3 today since the
-  640-wide intermediate does not split evenly across TP4.
+  for the EXL3 or FP8 package); Spark EXL3 supports TP4 using uneven
+  intermediate slices for the 640-wide experts.
 - Prefix cache: merged — 256-row units over the full-attention layers, a
   combined GDN-state + PLE mark, with n-gram history recomputed from token
   ids rather than cached.
@@ -36,10 +37,10 @@ layer every fourth, a PLE n-gram memory table, and fused expert tensors.
 
 Every weight has one resident format. Precision is chosen by measurement:
 FP8 converts at load into the only copy where it is faster and the golden
-stays within ~0.005 nat KL/NLL; drafters run FP8 whenever emitted tok/s is
-higher (they cannot change the output). Measured 2026-10-03, natural minimum,
-one warm launch per arm, `CONCURRENCY=4`, code tok/s (C4 aggregate), golden
-512 tokens.
+stays within ~0.005 nat KL/NLL; drafters run FP8 when delivered tok/s is
+higher and the speculation-lossless gate passes. Measured 2026-10-03,
+natural minimum, one warm launch per arm, `CONCURRENCY=4`, code tok/s
+(C4 aggregate), golden 512 tokens.
 
 | Arm | C1 | C4 | 8K prefill | KL · top-1 · NLL |
 | --- | ---: | ---: | ---: | --- |
@@ -47,15 +48,36 @@ one warm launch per arm, `CONCURRENCY=4`, code tok/s (C4 aggregate), golden
 | **FP8 head (default)** | 222 | 441 | 6,100 | 0.036 · 88.5% · 3.300 |
 | FP8 head + FP8 GDN/attention projections | 247 | 489 | 6,177 | 0.046 · 86.7% · 3.360 |
 
-Qwen 3.8 Flash Next EXL3 K4.25, 1 RTX, MTP 3. FP8 projections fail the KL gate (+0.012) and stay opt-in (`QWEN_FP8_DECODE=on`); `QWEN_FP8_HEAD=off` keeps BF16.
+Qwen 3.8 Flash Next EXL3 K4.25, 1 RTX, MTP 3. FP8 projections fail the KL gate (+0.012) and stay opt-in (`QWEN_FP8_DECODE=on`); `QWEN_FP8_HEAD=off` keeps BF16. The target and MTP share the same head; enabling MTP adds no second vocabulary-head copy.
+
+## Default speculation and placement
+
+`EXPERT_BACKEND=auto` prefers resident local EXL3 experts when the planner
+admits the weights, MTP, serving reservations and requested KV pool. After
+local admission, an unset `SPECULATOR` selects native MTP at depth 3. Explicit
+`EXPERT_BACKEND=local` uses the same speculation default. `MTP=0` retains the
+legacy opt-out; explicit depth settings retain their meaning.
+
+The default is selected by delivered C1/C4 code and reasoning-on agentic
+tok/s, with C16 and 8K prefill measured alongside. Native MTP also prefills
+its own attention state. Release smoke uses
+the current speculation-lossless rule: a greedy flip is informational when
+plain decode repeats every token and row exactly and verify rows already
+differed before the flip. A sudden state change still fails. Golden NLL and
+prefix-cache restore checks must pass.
 
 ## Known limits
 
 - FP8 experts have no Spark TP layout yet: 640 is not evenly divisible the
   way the FP8 MoE kernel currently tiles larger TP degrees, so the Spark
   path today is EXL3-only.
-- The native MTP drafter's weights are present in the checkpoint but not
-  yet served; CuteAFD verifies copy-window drafts only.
+- Spark workers serve backbone expert layers only; `mtp.layers.0.mlp.experts`
+  has no Spark execution path. `EXPERT_BACKEND=spark` (or an automatic Spark
+  fallback) keeps native MTP off, and explicit `SPECULATOR=mtp` reports the
+  missing expert layer before launching. Whether MTP wins with Sparks remains
+  unmeasured until that layer is supported.
+- The automatic MTP default is qualified for local EXL3. Other expert formats
+  retain explicit speculation settings.
 
 ## Changelog
 

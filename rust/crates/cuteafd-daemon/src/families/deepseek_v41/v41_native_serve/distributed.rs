@@ -339,11 +339,14 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         reserved_memory[gpu].0 = reserved_memory[gpu].0.checked_sub(deferred)
             .context("minimum TP2 placement leaves no cache memory")?;
     }
+    args.kv_pool_size = memory::planned_pool_size(&args, &reserved_memory)?;
     let reserved_pool = memory::distributed::PoolPlan::with_replication(map, args.concurrency as usize,
         args.max_context_tokens as usize, args.prefix_cache_entries as usize, snapshot_bytes,
         args.kv_pool_size, args.memory_reservation, reserved_memory,args.tp2_attention)?;
     let expert_budget = std::array::from_fn(|gpu|
-        prefix_peak[minimum_expert_layers-1][gpu] + reserved_pool.unused_bytes[gpu]);
+        prefix_peak[minimum_expert_layers-1][gpu] + if args.pool_tokens == Some(0) {
+            reserved_pool.unused_bytes[gpu].saturating_sub((3usize << 30) - memory::distributed::RUNTIME_HEADROOM)
+        } else { reserved_pool.unused_bytes[gpu] });
     let expert_layers = memory::distributed::expert_layers_with_minimum(args.rtx_expert_layers,
         &prefix_peak, expert_budget, minimum_expert_layers)?;
     let rank_budgets = prefix_peak[expert_layers-1];

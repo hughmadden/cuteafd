@@ -28,6 +28,7 @@ Command-line values override cuteafd.config for this launch.
   --concurrency N               active requests, 1..16 (default 16)
   --http-queue-depth N          buffered jobs and maximum extra waiters (default concurrency)
   --http-queue-wait-ms N        queue-space wait budget (default 25000)
+  --pool-tokens auto|N         planner KV admission (opt-in; 0 means auto)
   --kv-pool-size SIZE           exact KV/index pool, e.g. 22.5GB
   --host-cache-bytes auto|SIZE  pinned RAM cache; 0 disables (default auto)
   --memory-reservation SIZE     total GPU ceiling, e.g. 90% or 80GiB
@@ -77,6 +78,7 @@ while [[ $# -gt 0 ]]; do
     --rtx-expert-layers) overrides[RTX_EXPERT_LAYERS]="${2:?$1 requires auto or N}"; shift 2 ;;
     --concurrency) overrides[CONCURRENCY]="${2:?$1 requires N}"; shift 2 ;;
     --host-cache-bytes) overrides[HOST_CACHE_BYTES]="${2:?$1 requires auto or SIZE}"; shift 2 ;;
+    --pool-tokens) overrides[POOL_TOKENS]="${2:?$1 requires auto or N}"; shift 2 ;;
     --kv-pool-size) overrides[KV_POOL_SIZE]="${2:?$1 requires SIZE}"; shift 2 ;;
     --memory-reservation) overrides[MEMORY_RESERVATION]="${2:?$1 requires SIZE}"; shift 2 ;;
     --prefix-cache-entries) overrides[PREFIX_CACHE_ENTRIES]="${2:?$1 requires N}"; shift 2 ;;
@@ -422,7 +424,7 @@ else
   for lane in "${lanes[@]}"; do peer_addresses+=("$lane:$EXPERT_PORT"); done
   peers="$(IFS=,; echo "${peer_addresses[*]}")"
 fi
-fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "$KV_POOL_SIZE" "$MEMORY_RESERVATION" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "$DSPARK" "$DSPARK_DRAFT_POLICY" "${dspark_draft_limit:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "$SPARK_DEVICE_BUDGET_BYTES" "$spark_first_layer" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "$spark_exl3_identity" "spark-topology=${spark_tp}x${spark_ep}:explicit=${topology_explicit}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
+fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$MEMORY_RESERVATION" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "$DSPARK" "$DSPARK_DRAFT_POLICY" "${dspark_draft_limit:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "$SPARK_DEVICE_BUDGET_BYTES" "$spark_first_layer" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "$spark_exl3_identity" "spark-topology=${spark_tp}x${spark_ep}:explicit=${topology_explicit}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
 spark_prefix="$RELEASE_SPARK_CONTAINER_PREFIX"
 
 if ((dry_run)); then
@@ -518,6 +520,10 @@ args+=(--http-queue-depth "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" --http-queue-wait-
 [[ "$RTX_EXPERT_LAYERS" == auto ]] || args+=(--rtx-expert-layers "$RTX_EXPERT_LAYERS")
 [[ "$HOST_CACHE_BYTES" == 0 ]] || args+=(--host-cache-bytes "$HOST_CACHE_BYTES")
 [[ -z "$KV_POOL_SIZE" ]] || args+=(--kv-pool-size "$KV_POOL_SIZE")
+if [[ -n "${POOL_TOKENS:-}" ]]; then
+  planner_tokens="$POOL_TOKENS"; [[ "$planner_tokens" != auto ]] || planner_tokens=0
+  args+=(--pool-tokens "$planner_tokens")
+fi
 [[ -z "$MEMORY_RESERVATION" ]] || args+=(--memory-reservation "$MEMORY_RESERVATION")
 [[ "$DSPARK" != on ]] || args+=(--dspark)
 [[ "$DSPARK" != on || "$DSPARK_DRAFT_POLICY" != full ]] || args+=(--dspark-fixed)

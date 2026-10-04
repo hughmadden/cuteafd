@@ -377,7 +377,7 @@ def test_mimo_invalid_drafter_precision_rejects_before_launch(tmp_path):
 
 SPLIT_CONFIGS = {
     "qwen4": {"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
-               "layer_types": ["linear_attention", "full_attention"]}},
+               "mtp_num_hidden_layers": 1, "layer_types": ["linear_attention", "full_attention"]}},
     "glm5_flash": {"model_type": "glm5_next", "num_hidden_layers": 2,
                    "mlp_layer_types": ["sparse"] * 2,
                    "layer_types": ["linear_attention", "deepseek_sparse_attention"]},
@@ -537,9 +537,10 @@ def test_glmf_pool_defaults_to_the_planned_pool(tmp_path: Path) -> None:
         assert result.returncode == 0, result.stderr
         launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
         assert flag in launch, launch
-    bad = _family_launch_lines(tmp_path / "dsv4", {"model_type": "deepseek_v4"},
+    dsv4 = _family_launch_lines(tmp_path / "dsv4", {"model_type": "deepseek_v4"},
                                "deepseek-ai/DeepSeek-V4-Flash-0731", "POOL_TOKENS=auto\n")
-    assert "POOL_TOKENS=auto is supported" in bad
+    assert "cuteafd serve-dsv4" in dsv4
+    assert "--pool-tokens 0" in dsv4
 
 
 def test_family_config_reads_share_the_stop_key_grammar() -> None:
@@ -579,6 +580,7 @@ def test_qwen_preferred_experts_use_the_planner_before_launch(tmp_path: Path, ba
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
     assert ("--local-experts" in launch) == local
     assert ("--peers" in launch) != local
+    assert ("--mtp 3" in launch) == local
     if local:
         assert "expertd-native" not in result.stderr
 
@@ -589,6 +591,50 @@ def test_qwen_preferred_local_allows_native_mtp(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
     assert "--mtp 3" in launch and "--local-experts" in launch
+
+
+@pytest.mark.parametrize("keys,depth", [("", 3), ("SPECULATOR=mtp\n", 3),
+                                      ("SPECULATOR_DEPTH=2\n", 2), ("MTP=2\n", 2),
+                                      ("SPECULATOR=off\n", None), ("MTP=0\n", None)])
+def test_qwen_local_mtp_default_preserves_overrides(tmp_path: Path, keys: str, depth: int | None) -> None:
+    result = _family_launch_result(tmp_path, {**SPLIT_CONFIGS["qwen4"],
+                                            "quantization_config": {"quant_method": "exl3"}},
+                                  "test/model", "EXPERT_BACKEND=local\n" + keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert "--local-experts" in launch
+    if depth is None:
+        assert "--mtp " not in launch
+    else:
+        assert f"--mtp {depth}" in launch
+
+
+def test_qwen_spark_mtp_reports_the_missing_expert_layer(tmp_path: Path) -> None:
+    result = _family_launch_result(tmp_path, {**SPLIT_CONFIGS["qwen4"],
+                                            "quantization_config": {"quant_method": "exl3"}},
+                                  "test/model", "EXPERT_BACKEND=spark\nSPECULATOR=mtp\n")
+    assert result.returncode == 2
+    assert "Spark ranks do not serve the MTP layer's experts" in result.stderr
+    assert "expertd-native" not in result.stderr
+
+
+@pytest.mark.parametrize("method,mtp_layers", [("exl3", 0), ("exl3", 2), ("fp8", 1), ("nvfp4", 1)])
+def test_qwen_local_unqualified_mtp_keeps_the_existing_default(tmp_path: Path, method: str, mtp_layers: int) -> None:
+    config = {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": method},
+              "text_config": {**SPLIT_CONFIGS["qwen4"]["text_config"], "mtp_num_hidden_layers": mtp_layers}}
+    result = _family_launch_result(tmp_path, config, "test/model", "EXPERT_BACKEND=local\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert "--local-experts" in launch and "--mtp " not in launch
+
+
+@pytest.mark.parametrize("method", ["fp8", "nvfp4"])
+def test_qwen_unqualified_explicit_mtp_keeps_the_existing_depth(tmp_path: Path, method: str) -> None:
+    config = {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": method}}
+    result = _family_launch_result(tmp_path, config, "test/model", "EXPERT_BACKEND=local\nSPECULATOR=mtp\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    assert "--local-experts" in launch and "--mtp 1" in launch
 
 
 @pytest.mark.parametrize("restart,admitted_gib", [(False, 12000 / 1024), (True, 96000 / 1024)])

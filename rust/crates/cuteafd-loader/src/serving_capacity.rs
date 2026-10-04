@@ -9,12 +9,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod deepseek;
+mod exl3_workspace;
+pub use exl3_workspace::exl3_workspace_bytes;
+mod v4_workspace;
+pub use v4_workspace::{deepseek_v4_peer_exchange_bytes, deepseek_v4_workspace_geometry, deepseek_v4_workspace_scratch, V4WorkspaceRank, V4WorkspaceScratch};
+pub use deepseek::{deepseek_v41_cache_bytes, deepseek_v41_cache_geometry, deepseek_v41_pool_groups,
+    deepseek_v4_cache_geometry};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KvPlacement {
     SingleDevice,
     Replicated,
     PartitionedHeads,
+    PartitionedLayers,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +45,8 @@ pub struct CacheOptions {
     pub coordinator_ranks: usize,
     pub native_mtp_layers: usize,
     pub mimo_kv: MimoKvCache,
+    /// DeepSeek V4's window ring holds one prefill chunk plus its window.
+    pub prefill_rows: u64,
 }
 
 impl Default for CacheOptions {
@@ -44,6 +55,7 @@ impl Default for CacheOptions {
             coordinator_ranks: 1,
             native_mtp_layers: 0,
             mimo_kv: MimoKvCache::Int8,
+            prefill_rows: 4096,
         }
     }
 }
@@ -93,7 +105,7 @@ pub fn cache_requirements(
         checkpoint_max_context_tokens: checkpoint_max,
         compiled_index_extent_required: matches!(
             model.spec().family,
-            "glm5" | "glm5_flash" | "qwen4"
+            "glm5" | "glm5_flash" | "qwen4" | "deepseek_v4"
         ),
         requested_kv_floor_tokens: requested_floor,
         concurrency: 16,

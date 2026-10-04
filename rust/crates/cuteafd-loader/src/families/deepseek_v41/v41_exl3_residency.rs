@@ -44,6 +44,23 @@ pub struct V41Exl3Residency {
 }
 
 impl V41Exl3Residency {
+    /// Pointer offsets and payload for the single CUDA arena used by loading.
+    /// Rotation vectors are resident once per decoder tier; these buffers also
+    /// include descriptors and unit maps absent from checkpoint tensor totals.
+    pub fn device_arena_layout(&self) -> std::result::Result<(Vec<usize>, usize), crate::serving_capacity::CacheGeometryError> {
+        use crate::serving_capacity::CacheGeometryError::Overflow;
+        let mut bytes = 0usize;
+        let mut offsets = Vec::with_capacity(self.buffers.len());
+        for buffer in &self.buffers {
+            bytes = bytes.checked_add(255).ok_or(Overflow("EXL3 arena alignment"))? & !255;
+            offsets.push(bytes);
+            bytes = bytes.checked_add(buffer.bytes.max(16)).ok_or(Overflow("EXL3 arena payload"))?;
+        }
+        let page = 2 * 1024 * 1024;
+        bytes = bytes.checked_add(page - 1).ok_or(Overflow("EXL3 arena pages"))? / page * page;
+        Ok((offsets, bytes))
+    }
+
     /// Device payload budget, excluding allocator alignment and execution scratch.
     pub fn bytes(&self) -> usize {
         self.buffers.iter().map(|b| b.bytes.max(16)).sum()
@@ -305,6 +322,22 @@ mod tests {
     use super::*;
     use crate::{OfficialV41Config, V41Exl3Projection, OFFICIAL_V41_MODEL_ID};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn device_arena_preserves_pointer_alignment_and_bounds() {
+        let mut plan = fixture(&[4, 5]).residency(V41Exl3Layer::Backbone(0), 1, 0).unwrap();
+        let (offsets, bytes) = plan.device_arena_layout().unwrap();
+        assert_eq!(bytes % (2 * 1024 * 1024), 0);
+        let mut end = 0;
+        for (&offset, buffer) in offsets.iter().zip(&plan.buffers) {
+            assert_eq!(offset % 256, 0);
+            assert!(offset >= end && offset - end < 256);
+            end = offset + buffer.bytes.max(16);
+        }
+        assert!(bytes >= end && bytes - end < 2 * 1024 * 1024);
+        plan.buffers[0].bytes = usize::MAX;
+        assert!(plan.device_arena_layout().is_err());
+    }
 
     fn fixture(tiers: &[usize]) -> V41Exl3Manifest {
         let config = OfficialV41Config::from_json(

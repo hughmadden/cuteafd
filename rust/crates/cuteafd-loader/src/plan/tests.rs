@@ -678,8 +678,7 @@ fn glm_and_qwen_patterns_follow_their_runtime_readers() {
     assert_eq!(spec.layers[0].rope, Some(spec::RopeSpec { dims: 64, theta: 8e6 }));
 }
 
-#[test]
-fn deepseek_v4_plan_reads_the_runtime_config_source() {
+fn v4_snapshot() -> tempfile::TempDir {
     // serve-dsv4 reads inference/config.json when the snapshot has one; so does the plan.
     let hf = json!({"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4"});
     let mut ratios = vec![0, 0];
@@ -693,9 +692,25 @@ fn deepseek_v4_plan_reads_the_runtime_config_source() {
         "index_topk": 512, "hc_mult": 4, "hc_sinkhorn_iters": 20, "compress_rope_theta": 160000,
         "compress_ratios": ratios[1..].to_vec()
     });
-    let dir = snapshot(hf, &[t("embed.weight", "BF16", &[64, 4096])]);
+    let mut tensors = vec![t("embed.weight", "BF16", &[64, 4096])];
+    for layer in 0..4 {
+        for expert in 0..256 {
+            for (projection, rows, cols) in [("w1", 2048, 4096), ("w2", 4096, 2048), ("w3", 2048, 4096)] {
+                let name = format!("layers.{layer}.ffn.experts.{expert}.{projection}");
+                tensors.push(t(format!("{name}.weight"), "I8", &[rows, cols / 2]));
+                tensors.push(t(format!("{name}.scale"), "F8_E8M0", &[rows, cols / 32]));
+            }
+        }
+    }
+    let dir = snapshot(hf, &tensors);
     std::fs::create_dir_all(dir.path().join("inference")).unwrap();
     std::fs::write(dir.path().join("inference/config.json"), serde_json::to_vec(&args).unwrap()).unwrap();
+    dir
+}
+
+#[test]
+fn deepseek_v4_plan_reads_the_runtime_config_source() {
+    let dir = v4_snapshot();
     let report = plan(dir.path(), &sparks(4)).unwrap();
     let spec = report.spec.as_ref().expect("planned from inference/config.json");
     let cfg = crate::families::deepseek_v4::DeepseekV4Config::read(dir.path(), 0).unwrap();
@@ -705,6 +720,24 @@ fn deepseek_v4_plan_reads_the_runtime_config_source() {
     }).collect();
     assert_eq!(ratios, cfg.compress_ratios);
     assert_eq!(spec.layers[1].rope, Some(spec::RopeSpec { dims: 64, theta: 160000.0 }));
+}
+
+#[test]
+fn v4_explicit_pool_reduces_expert_placement_while_auto_preserves_legacy_policy() {
+    let dir = v4_snapshot();
+    let experts = |pool, local_expert_layers| {
+        let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
+            rtx_bytes: vec![24 << 30], pool_tokens: Some(pool), local_expert_layers,
+            ..Default::default()
+        }), ..sparks(2) }).unwrap();
+        report.memory_layout.unwrap().devices[0].items.iter()
+            .filter(|i| i.group == "resident routed layers").map(|i| i.bytes).sum::<u64>()
+    };
+    let legacy = experts(262144, None);
+    assert!(legacy > 0);
+    assert_eq!(experts(0, None), legacy);
+    assert!(experts(16 * 1024 * 1024, None) < legacy);
+    assert_eq!(experts(262144, Some(2)), experts(16 * 1024 * 1024, Some(2)));
 }
 
 #[test]
@@ -864,6 +897,78 @@ fn layout_places_every_device_and_names_padded_spark_slices() {
 }
 
 #[test]
+fn qwen_layout_reserves_recurrent_state_before_auto_pool_and_leaves_peer_idle() {
+    use cuteafd_core::memory_layout::Category;
+    let dir = snapshot(qwen4_config(48), &[]);
+    let options = PlanOptions {
+        layout: Some(layout::LayoutOptions {
+            rtx_bytes: vec![12 << 30, 96 << 30], pool_tokens: Some(0), ..Default::default()
+        }), ..sparks(0)
+    };
+    let report = plan(dir.path(), &options).unwrap();
+    let memory = report.memory_layout.as_ref().unwrap();
+    assert!(memory.pool_tokens > 0);
+    assert_eq!(memory.pool_tokens % 256, 0);
+    assert!(memory.devices[0].free_bytes() >= 0, "{}", memory.render());
+    assert!(memory.devices[0].by_category()[&Category::Kv] > 0);
+    assert_eq!(memory.devices[1].used_bytes(), 0);
+    assert_eq!(memory.devices[1].kv_tokens, 0);
+    let mut implicit = options.clone();
+    implicit.layout.as_mut().unwrap().pool_tokens = None;
+    assert_eq!(plan(dir.path(), &implicit).unwrap().memory_layout.unwrap().pool_tokens, memory.pool_tokens);
+}
+
+#[test]
+fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
+    use cuteafd_core::memory_layout::Category;
+    let mut config = v41_config();
+    let text = &mut config["text_config"];
+    text["num_hidden_layers"] = json!(40);
+    text["head_dim"] = json!(512);
+    text["qk_rope_head_dim"] = json!(64);
+    text["sliding_window"] = json!(128);
+    text["kv_source_layer_ids"] = json!([2, 8, 14, 20]);
+    text["compress_ratios"] = json!((0..40).map(|l| if l < 2 { 0 } else if l < 20 { 2 } else { 1 }).collect::<Vec<_>>());
+    let dir = snapshot(config, &[t("embed.weight", "BF16", &[128, 5120])]);
+    let mut options = sparks(4);
+    options.layout = Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30], pool_tokens: Some(0),
+        prefix_slots: Some(0), native_mtp_layers: 0, ..Default::default() });
+    let automatic = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    assert_eq!(automatic.devices[0].capacity_bytes, (96u64 << 30) * 97 / 100 - (3 << 30));
+    assert_eq!(automatic.devices[0].by_category().get(&Category::Prefix).copied().unwrap_or(0), 0);
+    let state = automatic.devices[0].items.iter().find(|i| i.group == "state").unwrap().bytes;
+    let cache = crate::serving_capacity::deepseek_v41_cache_geometry(&serde_json::from_reader::<_, Value>(
+        std::fs::File::open(dir.path().join("config.json")).unwrap()).unwrap(), 1).unwrap();
+    assert_eq!(state, cache.ranks[0].active_state_per_sequence_bytes * 16);
+    options.layout.as_mut().unwrap().pool_tokens = Some(512);
+    let explicit = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    assert_eq!(explicit.devices[0].capacity_bytes, (96u64 << 30) - (3 << 30));
+}
+
+#[test]
+fn layout_charges_local_routed_experts_to_the_coordinator() {
+    use cuteafd_core::memory_layout::Category;
+    let dir = qwen_snapshot(4);
+    let report = plan(dir.path(), &PlanOptions {
+        layout: Some(layout::LayoutOptions { pool_tokens: Some(256), ..Default::default() }), ..sparks(0)
+    }).unwrap();
+    let routed = component(&report, Component::RoutedExpert).bytes;
+    assert!(routed > 0);
+    let memory = report.memory_layout.unwrap();
+    let expert_weights: u64 = memory.devices[0].items.iter()
+        .filter(|item| item.category == Category::Experts && item.group == "routed expert arenas")
+        .map(|item| item.bytes).sum();
+    assert!(expert_weights >= routed);
+    assert_eq!(expert_weights % (2 * 1024 * 1024), 0);
+    // Tier-specific rotations, maps and arena padding add a small overhead;
+    // charge them without duplicating the trellis payload itself.
+    assert!(expert_weights - routed < routed / 50);
+    // Resident EXL3 execution arenas also consume the coordinator budget.
+    assert!(memory.devices[0].by_category()[&Category::Experts] > routed);
+    assert_eq!(memory.devices.len(), 1);
+}
+
+#[test]
 fn preferred_qwen_experts_require_room_for_serving_and_keep_explicit_layouts() {
     use cuteafd_core::memory_layout::Category;
     let dir = qwen_snapshot(4);
@@ -875,9 +980,14 @@ fn preferred_qwen_experts_require_room_for_serving_and_keep_explicit_layouts() {
     let preferred = plan_preferred(dir.path(), &ample).unwrap();
     assert_eq!(preferred.placement, ExpertPlacement::Local, "{}", render(&preferred));
     let memory = preferred.memory_layout.as_ref().unwrap();
-    assert_eq!(memory.devices[0].by_category()[&Category::Experts],
+    assert!(memory.devices[0].by_category()[&Category::Experts] >
         component(&preferred, Component::RoutedExpert).bytes);
     assert!(memory.devices.iter().all(|d| d.free_bytes() >= 0));
+    let explicit_local = plan(dir.path(), &PlanOptions {
+        placement: ExpertPlacement::Local, ..ample.clone()
+    }).unwrap();
+    assert_eq!(memory.devices[0].by_category(),
+        explicit_local.memory_layout.as_ref().unwrap().devices[0].by_category());
     let unused_peer = PlanOptions {
         layout: Some(layout::LayoutOptions {
             rtx_bytes: vec![96 << 30, 1 << 30], pool_tokens: Some(32768), ..Default::default()
@@ -913,7 +1023,7 @@ fn local_qwen_memory_layout_charges_experts_to_the_lead_gpu() {
         ..sparks(0)
     }).unwrap();
     let layout = report.memory_layout.as_ref().unwrap();
-    assert_eq!(layout.devices[0].by_category()[&Category::Experts],
+    assert!(layout.devices[0].by_category()[&Category::Experts] >
         component(&report, Component::RoutedExpert).bytes);
     assert!(!layout.devices[1].by_category().contains_key(&Category::Experts));
     assert!(layout.devices[1].items.is_empty());

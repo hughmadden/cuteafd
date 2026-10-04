@@ -446,6 +446,22 @@ SPARK_COUNT={spark_count}
         # three optional RDMA env values.
         self.assertTrue(all(args[-8] == "0" for tool, args in events if tool == "ssh" and "-s" in args))
 
+    def test_planner_pool_is_forwarded_only_when_selected(self) -> None:
+        for setting, expected in [("", None), ("auto", "0"), ("123456", "123456")]:
+            with self.subTest(setting=setting):
+                result, events = self.run_startup(
+                    gpus=2,
+                    plan=dict(version=1, rtx_gpus=2, nonce="fresh", rtx_expert_layers=20, spark_first_layer=20),
+                    topology_explicit=0, spark_tp=4, spark_ep=1, spark_count=4,
+                    hosts=["a", "b", "c", "d"], extra_setup=f"POOL_TOKENS={setting}\n",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                coordinator = next(args for tool, args in events if tool == "docker" and args[0] == "run")
+                if expected is None:
+                    self.assertNotIn("--pool-tokens", coordinator)
+                else:
+                    self.assertEqual(coordinator[coordinator.index("--pool-tokens") + 1], expected)
+
     def test_explicit_topology_reaches_coordinator_and_every_worker(self) -> None:
         result, events = self.run_startup(
             gpus=2,
@@ -896,6 +912,24 @@ class BuildScopeTest(unittest.TestCase):
         # The boundary acknowledgement must not be gated on the RTX count alone.
         self.assertIn('if [[ -n "$placement_directory" ]]; then', release)
         self.assertNotIn("((RELEASE_RTX_GPUS == 2)); then\n  docker exec \"$coordinator\" sh -c 'cp", release)
+
+    def test_native_pool_policy_changes_fingerprint_and_preserves_omitted_policy(self) -> None:
+        expression = next(line for line in (ROOT / "run.sh").read_text().splitlines()
+                          if line.startswith('fingerprint="'))
+        hashes = []
+        for setting in (None, "", "auto", "1024"):
+            environment = os.environ.copy()
+            environment.pop("POOL_TOKENS", None)
+            if setting is not None:
+                environment["POOL_TOKENS"] = setting
+            result = subprocess.run(
+                ["bash", "-c", 'release_hosts_csv() { echo a,b,c,d; }\n' + expression
+                 + '\nprintf "%s\n" "$fingerprint"'], text=True, capture_output=True, env=environment,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            hashes.append(result.stdout.strip())
+        self.assertEqual(hashes[0], hashes[1])
+        self.assertEqual(len(set(hashes)), 3)
 
     def test_run_sh_image_diagnostics_name_the_reference_and_host(self) -> None:
         release = (ROOT / "run.sh").read_text()

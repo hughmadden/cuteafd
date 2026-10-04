@@ -2,6 +2,7 @@
 //! n-gram table, the coordinator programs' layer chain, and the golden
 //! comparison command.
 pub(crate) mod engine;
+mod admission;
 mod mtp_golden;
 pub(crate) mod mtp_policy;
 pub(crate) mod ple;
@@ -37,9 +38,12 @@ pub(crate) struct EngineArgs {
     /// Longest sequence (the exported index top-k covers the manifest's max_context).
     #[arg(long, default_value_t = 65_536)]
     pub max_context: usize,
-    /// Tokens the K/V record pools hold across sequences.
+    /// Tokens the K/V record pools hold across sequences (0: planner admission).
     #[arg(long, default_value_t = 32_768)]
     pub pool_tokens: usize,
+    /// Concrete serving prefix arena reservation; filled before engine loading.
+    #[arg(skip)]
+    pub planner_prefix_bytes: Option<u64>,
     /// Sequences with GDN/PLE state (about 115 MiB each).
     #[arg(long, default_value_t = 8)]
     pub slots: usize,
@@ -326,11 +330,35 @@ impl Opened {
                 layer, args.table_placement, &args.table, args.prefill_rows.max(engine::DECODE_ROWS))?),
             _ => None,
         };
-        let pages = args.pool_tokens.div_ceil(engine::PAGE_ROWS);
+        // Establish expert ownership before admission. EXL3 keeps its existing
+        // lazy first-use load; reserve the exact loader plan before sizing KV.
+        let mut future_expert_bytes = 0;
+        let admitted_experts = if args.pool_tokens == 0 {
+            ensure!(args.shared_only || self.fp8().is_none() || args.expert_window.is_none(),
+                "Qwen automatic KV admission does not support diagnostic --expert-window paging; use a fixed pool or Sparks");
+            let experts = self.experts(args, layers)?;
+            if let Some(engine::Experts::LocalExl3(local)) = &experts {
+                ensure!(local.window >= layers,
+                    "Qwen automatic KV admission requires all EXL3 backbone experts resident; use --exl3-window at least {layers}, a fixed pool, or Sparks");
+                let expected = local.window.min(layers);
+                let plan = crate::families::deepseek_v4::local::plan(&self.library, &local.native_lib,
+                    local.catalog, usize::from(local.mtp), expected, local.max_rows, local.budget)?;
+                ensure!(plan.layers == expected,
+                    "Qwen automatic KV admission requires the complete requested EXL3 expert window to fit");
+                future_expert_bytes = u64::try_from(plan.peak_bytes)?;
+                tracing::info!(layers=plan.layers, peak_bytes=plan.peak_bytes,
+                    "Qwen planner reserved the lazy EXL3 expert window");
+            }
+            Some(experts)
+        } else { None };
+        let pool_tokens = if args.pool_tokens == 0 {
+            admission::pool_tokens(&self.library, args, &self.cfg, layers, model.mtp.is_some(), future_expert_bytes)?
+        } else { args.pool_tokens };
+        let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::Qwen4Engine::new(&self.library, &programs, self.cfg.clone(), model, ple, stream,
             args.max_context, args.prefill_rows, pages, args.slots, embedding)?;
         engine.w8a8_prefill = args.fp8_prefill_w8a8;
-        if let Some(experts) = self.experts(args, layers)? {
+        if let Some(experts) = match admitted_experts { Some(experts) => experts, None => self.experts(args, layers)? } {
             engine.set_experts(experts);
         }
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {

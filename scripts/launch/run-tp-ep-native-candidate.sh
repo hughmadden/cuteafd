@@ -482,6 +482,10 @@ coordinator_argv() {
   [[ "$RTX_EXPERT_LAYERS" == auto ]] || args+=(--rtx-expert-layers "$RTX_EXPERT_LAYERS")
   [[ "$HOST_CACHE_BYTES" == 0 ]] || args+=(--host-cache-bytes "$HOST_CACHE_BYTES")
   [[ -z "$KV_POOL_SIZE" ]] || args+=(--kv-pool-size "$KV_POOL_SIZE")
+  if [[ -n "${POOL_TOKENS:-}" ]]; then
+    planner_tokens="$POOL_TOKENS"; [[ "$planner_tokens" != auto ]] || planner_tokens=0
+    args+=(--pool-tokens "$planner_tokens")
+  fi
   [[ -z "$MEMORY_RESERVATION" ]] || args+=(--memory-reservation "$MEMORY_RESERVATION")
   [[ "$DSPARK" != on ]] || args+=(--dspark --dspark-draft-limit "$dspark_draft_limit")
   [[ "$TP2_ATTENTION" != on ]] || args+=(--tp2-attention)

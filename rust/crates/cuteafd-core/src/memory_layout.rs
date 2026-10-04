@@ -111,6 +111,8 @@ pub enum Basis {
     Formula,
     /// A per-family constant calibrated against the allocation ledger.
     Calibrated,
+    /// An unqualified allowance; must be measured before driving admission.
+    Estimated,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

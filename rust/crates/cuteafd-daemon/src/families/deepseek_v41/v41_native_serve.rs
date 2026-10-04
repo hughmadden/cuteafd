@@ -63,12 +63,16 @@ pub(crate) async fn run(mut args: crate::cli::NativeServeArgs) -> Result<()> {
         "two or three Spark peers require the single-RTX, non-paired EXL3 profile"
     );
     if compact {
+        ensure!(args.pool_tokens.is_none(), "planner pool admission is not qualified for the compact 32 GiB profile");
         compact_budget(&mut args.memory_reservation, &mut args.kv_pool_size)?;
         if args.prefill_batch_tokens > 256 {
             tracing::info!(requested=args.prefill_batch_tokens, effective=256,
                 "compact 32 GiB profile limits prefill workspace capacity");
             args.prefill_batch_tokens = 256;
         }
+    }
+    if args.pool_tokens == Some(0) && args.memory_reservation.is_none() {
+        args.memory_reservation = Some("97%".parse()?);
     }
     args.host_cache_config()?;
     let listen = args.listen.clone();
@@ -256,7 +260,7 @@ fn spark_transport(
 }
 
 fn worker(
-    args: crate::cli::NativeServeArgs,
+    mut args: crate::cli::NativeServeArgs,
     mut receive: mpsc::Receiver<NativeRequest>,
     ready: &mut Option<oneshot::Sender<std::result::Result<(), String>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
@@ -497,6 +501,7 @@ fn worker(
             other => other,
         }
     } else { args.memory_reservation };
+    args.kv_pool_size = memory::planned_pool_size(&args, &[(free, total)])?;
     let pool = memory::PoolPlan::new(args.concurrency as usize, args.max_context_tokens as usize,
         args.prefix_cache_entries as usize, snapshot_bytes, args.kv_pool_size, reservation, free, total)?;
     tracing::info!(retained_turn_limit=args.prefix_cache_entries, prompt_snapshot_limit=args.prefix_cache_entries, source_pages=?pool.pages, global_bytes=pool.global_bytes,
@@ -528,6 +533,8 @@ fn worker(
             else { ExpertWeights::plan(&lib, &catalog, selection) }
         }).collect::<Result<Vec<_>>>()?;
         let (free, total) = lib.cuda_memory_info()?;
+        let free = if args.pool_tokens == Some(0) { free.saturating_sub((3usize << 30) - memory::RUNTIME_HEADROOM) }
+            else { free };
         let plan = memory::LocalLayerPlan::new(args.rtx_expert_layers, &budgets,
             per_lane.checked_mul(2).context("local lane budget overflow")?, free, total, pool.reservation_bytes)?;
         local_layers = plan.layers;

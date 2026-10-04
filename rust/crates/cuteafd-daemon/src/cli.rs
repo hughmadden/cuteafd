@@ -180,18 +180,39 @@ pub(crate) struct PlanArgs {
     /// workspaces, runtime and Spark buffers.
     #[arg(long)]
     pub(crate) layout: bool,
-    /// Coordinator GPUs for --layout (1 or 2; two split attention heads).
+    /// Coordinator GPUs for --layout (1 or 2; Qwen currently uses only the first).
     #[arg(long, default_value_t = 1)]
     pub(crate) rtx: usize,
     /// Usable GiB per coordinator GPU for --layout.
     #[arg(long, default_value_t = 95.5)]
     pub(crate) rtx_gib: f64,
-    /// Explicit KV pool tokens for --layout (default: sized from what is left).
+    /// Explicit KV pool tokens for --layout (0 or omitted: automatic).
     #[arg(long)]
     pub(crate) pool_tokens: Option<u64>,
     /// External drafter GiB on the last GPU for --layout (DFlash).
     #[arg(long, default_value_t = 0.0)]
     pub(crate) drafter_gib: f64,
+    /// Routed backbone expert layers resident on RTX (DeepSeek).
+    #[arg(long)]
+    pub(crate) local_expert_layers: Option<usize>,
+    /// Compiled maximum context for table and workspace reservations (0: family/image default).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) context_tokens: u64,
+    /// Prefill workspace capacity for --layout (0: family/image default).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) prefill_rows: u64,
+    /// Concurrent sequences for --layout (0: family default).
+    #[arg(long, default_value_t = 0)]
+    pub(crate) concurrency: u64,
+    /// Prefix mark arena slots (0 disables marks).
+    #[arg(long)]
+    pub(crate) prefix_slots: Option<u64>,
+    /// Native drafter stages, 0 disables the native drafter.
+    #[arg(long, default_value_t = 3)]
+    pub(crate) native_mtp_layers: usize,
+    /// Matching image PROGRAMS.json for exact V4 Flash/Pro workspaces.
+    #[arg(long)]
+    pub(crate) workspace_manifest: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -557,6 +578,11 @@ pub(crate) struct NativeServeArgs {
     /// Exact global KV/index byte budget (B/MB/GB/MiB/GiB), rounded down to page groups.
     #[arg(long)]
     pub kv_pool_size: Option<crate::families::deepseek_v41::v41_native_serve::memory::ByteSize>,
+
+    /// Aggregate logical KV tokens; 0 selects planner admission. Omit to keep
+    /// the existing V4.1 pool policy. Cannot be combined with --kv-pool-size.
+    #[arg(long, conflicts_with = "kv_pool_size")]
+    pub pool_tokens: Option<u64>,
 
     /// Total device occupancy ceiling (% or B/MB/GB/MiB/GiB); sizes KV after fixed allocations.
     #[arg(long)]

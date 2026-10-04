@@ -296,6 +296,7 @@ release_load_config() {
   COORDINATOR_GPU_UUID=
   COORDINATOR_GPU_PCI_BUS_ID=
   COORDINATOR_GPU_HEADROOM_GIB=8
+  POOL_TOKENS=
   KV_POOL_TOKENS=
   KV_POOL_SIZE=
   HOST_CACHE_BYTES=auto
@@ -400,6 +401,8 @@ release_load_config() {
     release_die "SPARK_REDUCTION_MIN_ROWS must be a positive integer"
   [[ "$EXPERT_PORT" =~ ^[0-9]+$ ]] && ((EXPERT_PORT >= 1 && EXPERT_PORT <= 65535)) || release_die "EXPERT_PORT must be in 1..65535"
   [[ "$COORDINATOR_GPU_HEADROOM_GIB" =~ ^[0-9]+([.][0-9]+)?$ ]] || release_die "COORDINATOR_GPU_HEADROOM_GIB must be non-negative"
+  [[ -z "$POOL_TOKENS" || "$POOL_TOKENS" == auto || "$POOL_TOKENS" =~ ^[0-9]+$ ]] || release_die "POOL_TOKENS must be auto or a non-negative integer"
+  [[ -z "$POOL_TOKENS" || -z "$KV_POOL_SIZE" ]] || release_die "POOL_TOKENS conflicts with KV_POOL_SIZE"
   for release_integer_name in KV_POOL_TOKENS MAX_CONTEXT_TOKENS MAX_OUTPUT_TOKENS; do
     value="${!release_integer_name}"
     [[ -z "$value" || "$value" =~ ^[1-9][0-9]*$ ]] || release_die "$release_integer_name must be a positive integer"

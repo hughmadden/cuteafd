@@ -561,7 +561,9 @@ pub fn plan_preferred(snapshot: &Path, options: &PlanOptions) -> Result<PlanRepo
         ..Default::default()
     });
     layout.head_split = false;
-    layout.drafter_bytes = layout.drafter_bytes.max(mtp);
+    // The layout already charges native MTP weights and expert arenas.
+    // Keep the weight-only admission reserve without duplicating them as
+    // an external drafter in the per-device layout.
     let capacity = layout.rtx_bytes.first().copied().unwrap_or(options.coordinator_budget_bytes);
     let local_options = PlanOptions {
         placement: ExpertPlacement::Local,
@@ -717,6 +719,7 @@ pub fn render(report: &PlanReport) -> String {
                 crate::serving_capacity::KvPlacement::SingleDevice => "one owner",
                 crate::serving_capacity::KvPlacement::Replicated => "replicated KV",
                 crate::serving_capacity::KvPlacement::PartitionedHeads => "partitioned KV heads",
+                crate::serving_capacity::KvPlacement::PartitionedLayers => "partitioned KV layers/sources",
             };
             for (rank, cost) in layout.ranks.iter().enumerate() {
                 let bytes_per_token = cost.persistent_unit_bytes as f64 / layout.logical_unit_rows as f64;

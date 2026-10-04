@@ -71,8 +71,10 @@ case "$backend" in
   *) echo "EXPERT_BACKEND must be auto, local or spark" >&2; exit 2 ;;
 esac
 qwen_exl3=0
+qwen_mtp=0
 if [[ "$family" == qwen4 ]]; then
-  qwen_exl3="$(python3 -c 'import json,sys; q=json.load(open(sys.argv[1])).get("quantization_config", {}); print(int(q.get("quant_method", q.get("method")) == "exl3"))' "$root/snapshots/$revision/config.json")"
+  qwen_features="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); q=c.get("quantization_config", {}); print(int(q.get("quant_method", q.get("method")) == "exl3"), c.get("text_config", c).get("mtp_num_hidden_layers", 0))' "$root/snapshots/$revision/config.json")"
+  read -r qwen_exl3 qwen_mtp <<<"$qwen_features"
 fi
 if [[ "$qwen_exl3" == 1 && "$backend" == auto && "$ranks" != 0 ]]; then
   selected="$(get COORDINATOR_GPUS "$(get COORDINATOR_GPU 0)")"; selected="${selected%%,*}"
@@ -113,14 +115,14 @@ snapshot_of() {
   [[ -d "$dir/snapshots/$rev" ]] || { echo "missing snapshot $id@$rev" >&2; return 1; }
   printf '%s' "/root/.cache/huggingface/hub/models--${id//\//--}/snapshots/$rev"
 }
-# SPECULATOR picks the drafter (default off; GLM 5.3 Flash: its checkpoint's
-# measured best, see glm5_flash_speculator below):
+# SPECULATOR picks the drafter (Qwen local EXL3: MTP3; GLM 5.3 Flash: its
+# checkpoint's measured best, see glm5_flash_speculator below; otherwise off):
 #   dflash2  GLM 5.x / GLM 5.3 Flash: the DFlash2 checkpoint SPECULATOR_MODEL_ID
 #            (e.g. incoai/GLM-5.3-DFlash2, incoai/GLM-5.3-Flash-DFlash2);
 #            MiMo V2.6 Pro: the snapshot's own dflash/ drafter unless
 #            SPECULATOR_MODEL_ID names one (V2.6 Pro needs SPARK_COUNT=6)
 #   mtp      MiMo V2 Flash, Qwen 3.8: the checkpoint's native MTP layers,
-#            SPECULATOR_DEPTH drafts (default 1)
+#            SPECULATOR_DEPTH drafts (qualified local Qwen default 3; otherwise 1)
 #   dspark   DeepSeek V4 (its own drafter); GLM 5.3 Flash: the dSpark
 #            checkpoint SPECULATOR_MODEL_ID (RedHatAI/GLM-5.3-Flash-speculator.dspark-preview)
 # MiMo unset drafts in single-copy FP8 (the measured family default);
@@ -155,6 +157,13 @@ if [[ -z "$speculator" ]]; then
         "(hf download $default_drafter); serving without a drafter" >&2
       speculator=off default_drafter=""
     fi
+  fi
+  # Only the resident EXL3 path is qualified. Spark workers serve backbone
+  # layers, not mtp.layers.0; other expert formats keep their opt-in status.
+  # An explicit SPECULATOR=off or legacy MTP=0 disables the family default.
+  if [[ $speculator == off && $qwen_exl3 == 1 && $qwen_mtp == 1 && $ranks == 0 && -z ${cfg[MTP]+set} ]]; then
+    speculator=mtp
+    echo "note: Qwen local EXL3 drafts with native MTP (default depth 3); SPECULATOR=off disables it" >&2
   fi
 fi
 case "$family:$speculator" in
@@ -201,7 +210,10 @@ case "$speculator" in
     else
       echo "SPECULATOR=$speculator needs SPECULATOR_MODEL_ID (a ${speculator/dflash2/DFlash2} checkpoint)" >&2; exit 2
     fi ;;
-  mtp) family_args+=(--mtp "$(key SPECULATOR_DEPTH MTP 1)") ;;
+  mtp)
+    mtp_depth=1
+    [[ $qwen_exl3 != 1 || $qwen_mtp != 1 || $ranks != 0 ]] || mtp_depth=3
+    family_args+=(--mtp "$(key SPECULATOR_DEPTH MTP "$mtp_depth")") ;;
 esac
 # SPECULATOR_DRAFTS: adaptive (default) or a fixed draft count per cycle
 # (DFlash2 on GLM 5.x, GLM 5.3 Flash and MiMo V2; dSpark on GLM 5.3 Flash), for policy A/B runs.
@@ -263,7 +275,7 @@ if [[ $family == qwen4 ]]; then
     esac
   done
 fi
-# POOL_TOKENS=auto (GLM 5.3, GLM 5.3 Flash, MiMo): the largest pool the GPUs hold after the
+# POOL_TOKENS=auto (GLM 5.3, GLM 5.3 Flash, MiMo, Qwen, DeepSeek V4): the largest pool the GPUs hold after the
 # planner's remaining costs (up to 2M tokens).
 # GLM 5.3 defaults to auto (bounded decode graphs captured at startup: 262144 -> 1,292,672 tokens on
 # 2 RTX + 6 Sparks, C1/C4/8K prefill unchanged); Qwen and DeepSeek V4 keep their engine defaults.
@@ -271,7 +283,6 @@ glm_default=""; [[ $family != glm5 ]] || glm_default=auto
 if [[ $family =~ ^(glm5|qwen4|deepseek_v4)$ && -n "$(get POOL_TOKENS "$glm_default")" ]]; then
   pool="$(get POOL_TOKENS "$glm_default")"
   if [[ "$pool" == auto ]]; then
-    [[ $family == glm5 ]] || { echo "POOL_TOKENS=auto is supported for GLM 5.3, GLM 5.3 Flash and MiMo" >&2; exit 2; }
     pool=0
   fi
   family_args+=(--pool-tokens "$pool")
