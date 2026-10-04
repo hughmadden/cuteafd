@@ -237,6 +237,66 @@ fn step(
 mod tests {
     use super::*;
 
+    fn config(pro: bool) -> DeepseekV4Config {
+        DeepseekV4Config::from_model_args(
+            &serde_json::json!({
+                "vocab_size": 129280, "dim": if pro {7168} else {4096},
+                "moe_inter_dim": if pro {3072} else {2048}, "n_layers": 1,
+                "n_heads": if pro {128} else {64}, "n_routed_experts": if pro {384} else {256},
+                "n_shared_experts": 1, "n_activated_experts": 6, "score_func": "sqrtsoftplus",
+                "route_scale": 1.5, "swiglu_limit": 10.0, "q_lora_rank": 1024,
+                "head_dim": 512, "rope_head_dim": 64, "o_groups": 8, "o_lora_rank": 1024,
+                "window_size": 128, "original_seq_len": 65536, "rope_theta": 10000,
+                "rope_factor": 16, "beta_fast": 32, "beta_slow": 1, "index_n_heads": 64,
+                "index_head_dim": 128, "index_topk": 512, "hc_mult": 4,
+                "hc_sinkhorn_iters": 20, "compress_rope_theta": 160000, "compress_ratios": [4],
+                "dspark_target_layer_ids": [0, 0, 0]
+            }),
+            0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pro_workspace_tracks_wider_heads_and_hidden_without_flash_constants() {
+        // Sum of the engine's allocations, at 128K compiled context, 4096
+        // prefill rows x2 lanes, 64 decode rows and 1032 physical pool units.
+        let scratch = V4WorkspaceScratch {
+            shared_bytes: 490_734_592,
+            index_topk_bytes: 558_007_296,
+        };
+        let flash =
+            deepseek_v4_workspace_geometry(&config(false), 4096, 64, 131072, 2, scratch).unwrap();
+        assert_eq!(flash[0].device_bytes(1032).unwrap(), 3_597_309_872);
+        assert_eq!(flash[1].device_bytes(1032).unwrap(), 3_228_071_856);
+        assert_eq!(flash[0].pool_unit_device_bytes, (4096 * 2 + 64) * 4);
+        let pro = deepseek_v4_workspace_geometry(
+            &config(true),
+            4096,
+            64,
+            131072,
+            2,
+            V4WorkspaceScratch {
+                index_topk_bytes: 574_784_512,
+                ..scratch
+            },
+        )
+        .unwrap();
+        assert_eq!(pro[0].device_bytes(1032).unwrap(), 4_734_070_704);
+        assert_eq!(pro[1].device_bytes(1032).unwrap(), 4_076_894_128);
+        assert_eq!(
+            pro[0].device_bytes(1033).unwrap() - pro[0].device_bytes(1032).unwrap(),
+            pro[0].pool_unit_device_bytes
+        );
+        // The table floors are still exact for a custom one-row manifest.
+        let tiny =
+            deepseek_v4_workspace_geometry(&config(false), 1, 1, 128, 1, scratch).unwrap()[0];
+        assert_eq!(
+            tiny.device_bytes(1).unwrap() - tiny.fixed_device_bytes,
+            3 * 256
+        );
+    }
+
     #[test]
     fn scratch_matches_global_arena_and_selected_family_topk() {
         let manifest = serde_json::json!({"programs": [
