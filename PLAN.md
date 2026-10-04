@@ -987,6 +987,18 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
     measurement is one matched D/F launch with identical 8K token IDs,
     worker timing/route distributions and Spark clocks, plus KDA/head
     precision ablation if quality remains below the split promotion bar.
+    **Fresh split profiling:** a warmed matched launch per arm did not
+    reproduce the large prefill/C4 losses, while the golden quality delta
+    reproduced exactly. Nsight timelines confirm half-head FP8 KDA on both
+    GPUs, with unchanged peer traffic and synchronization counts. W8A16
+    KDA projection compute is locally slower at wide prefill and verification
+    shapes. Row128 head slices preserve whole-weight payloads and scales
+    byte for byte. KDA-only/head-only ablations localize most extra KL to
+    KDA. Golden scoring uses a one-token prefix and 64-row verification
+    chunks, so the half-head GEMV tuning and chunked-recurrence window do
+    not explain that delta. KDA partial rounding is being tested independently;
+    MLA and dense/shared FFN partials also round before the peer sum.
+    Measurements and conditions are recorded in the profiling audit commit.
     V4.1 `all` now releases BF16 and shares a single FP8 vocabulary head
     across target and dSpark. Claude accepted its target-head quality;
     dual-RTX C1 missed the promotion bar, so BF16 stays default. `draft`
