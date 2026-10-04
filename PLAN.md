@@ -60,7 +60,7 @@ Extend (new families; kernels largely exist in b12x already):
 | --- | --- | --- |
 | zai-org/GLM-5.3-Flash, brandonmusic/GLM-5.3-Flash-tr3-4bpw | glm5_flash | hybrid KDA linear attention (34) + DSA MLA (11), mHC, EXL3 tr3 |
 | XiaomiMiMo/MiMo-V2-Flash | mimo_v2 | GQA full + SWA with sink, no shared expert, FP8 |
-| XiaomiMiMo/MiMo-V2.6-Pro-RL | mimo_v2 | 70 layers, 128 heads, mxfp4 store dtype, dflash dir |
+| XiaomiMiMo/MiMo-V2.6-Pro-MOPD | mimo_v2 | 70 layers, 128 heads, mxfp4 store dtype, dflash dir |
 | Qwen/Qwen3.8-Flash-Next (+ EXL3 K4.25 PLE variants) | qwen4 | GDN linear attention, n-gram memory tables, PLE, MTP; `../qflashrt` has a single-device port |
 
 Speculation: one best speculator per family (native MTP/nextn, dSpark,

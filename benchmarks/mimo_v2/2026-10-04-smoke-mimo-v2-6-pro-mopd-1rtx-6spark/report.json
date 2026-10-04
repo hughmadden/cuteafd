@@ -1,8 +1,8 @@
 {
   "schema": "cuteafd.bench.report/1",
-  "id": "93a5e265122349a3a3199d86b2e55c41",
-  "created": "2026-10-02T07:41:01Z",
-  "finished": "2026-10-02T07:41:51Z",
+  "id": "0ea828b932594b8b97f8331463757699",
+  "created": "2026-10-04T04:57:23Z",
+  "finished": "2026-10-04T04:58:15Z",
   "status": "done",
   "profile": "smoke",
   "plan": [
@@ -16,15 +16,15 @@
     }
   ],
   "server": {
-    "model": "XiaomiMiMo/MiMo-V2.6-Pro-RL",
+    "model": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD",
     "family": "mimo_v2",
-    "revision": "73875d00b30a89ef8cc353a0b60b0e9f9561952d",
+    "revision": "adea8e2c5373181e5a973fa1ecb343cb31af214b",
     "build": {
       "version": "0.1.0",
-      "release": "v0.1.0",
-      "image": "ghcr.io/tpurtell/cuteafd-coordinator:v0.1.0",
+      "release": "mopd-319ccdb",
+      "image": "cuteafd-coordinator:mopd-319ccdb",
       "remote": null,
-      "commit": "7936046a1a4a0cc1c20a71421125e4a65e71c91b",
+      "commit": "319ccdb083d90159c026a015c48f98ca51b5ae73",
       "dirty": false
     },
     "hardware": {
@@ -34,18 +34,6 @@
           "index": 0,
           "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
           "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
-          "memory_mib": 97887,
-          "power_limit_w": 325.0,
-          "power_max_w": 600.0,
-          "sm_count": 188,
-          "compute_cap": "12.0",
-          "pcie": "Gen5 x16",
-          "used": true
-        },
-        {
-          "index": 1,
-          "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
-          "uuid": "GPU-95f8f212-9131-df99-fd53-7535965197d7",
           "memory_mib": 97887,
           "power_limit_w": 325.0,
           "power_max_w": 600.0,
@@ -106,7 +94,7 @@
       "rails": "fabric: use 2 rail(s) of [mlx5_0@10.55.0.22/24 400G(eff 400G), mlx5_0@10.55.1.22/24 400G(eff 400G)]: 2 subnets share one 400 Gb/s port; each rail is a subnet of the same link"
     },
     "configuration": {
-      "snapshot": "/root/.cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.6-Pro-RL/snapshots/73875d00b30a89ef8cc353a0b60b0e9f9561952d",
+      "snapshot": "/root/.cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.6-Pro-MOPD/snapshots/adea8e2c5373181e5a973fa1ecb343cb31af214b",
       "quant": [
         {
           "group": "embedding",
@@ -167,12 +155,12 @@
           ]
         }
       ],
-      "speculator": "DFlash2 (73875d00b30a89ef8cc353a0b60b0e9f9561952d)",
-      "layout": "2 RTX (head split) · experts TP6 over 6 Sparks",
+      "speculator": "DFlash2 (adea8e2c5373181e5a973fa1ecb343cb31af214b)",
+      "layout": "1 RTX · experts TP6 over 6 Sparks",
       "settings": [
         {
           "name": "snapshot",
-          "value": "/root/.cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.6-Pro-RL/snapshots/73875d00b30a89ef8cc353a0b60b0e9f9561952d",
+          "value": "/root/.cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.6-Pro-MOPD/snapshots/adea8e2c5373181e5a973fa1ecb343cb31af214b",
           "default": null,
           "source": "cli"
         },
@@ -192,13 +180,7 @@
           "name": "device",
           "value": "0",
           "default": "0",
-          "source": "cli"
-        },
-        {
-          "name": "split-device",
-          "value": "1",
-          "default": null,
-          "source": "cli"
+          "source": "default"
         },
         {
           "name": "max-context",
@@ -208,7 +190,7 @@
         },
         {
           "name": "pool-tokens",
-          "value": "131072",
+          "value": "0",
           "default": "131072",
           "source": "cli"
         },
@@ -231,6 +213,24 @@
           "source": "default"
         },
         {
+          "name": "runtime-reserve-mib",
+          "value": "1024",
+          "default": "1024",
+          "source": "default"
+        },
+        {
+          "name": "decode-graph-reserve-kib",
+          "value": "192",
+          "default": "192",
+          "source": "default"
+        },
+        {
+          "name": "decode-graph-driver-reserve-mib",
+          "value": "64",
+          "default": "64",
+          "source": "default"
+        },
+        {
           "name": "peers",
           "value": "10.55.0.1:19482,10.55.0.2:19482,10.55.0.3:19482,10.55.0.4:19482,10.55.0.5:19482,10.55.0.6:19482",
           "default": null,
@@ -244,7 +244,7 @@
         },
         {
           "name": "draft",
-          "value": "/root/.cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.6-Pro-RL/snapshots/73875d00b30a89ef8cc353a0b60b0e9f9561952d",
+          "value": "/root/.cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.6-Pro-MOPD/snapshots/adea8e2c5373181e5a973fa1ecb343cb31af214b",
           "default": null,
           "source": "cli"
         },
@@ -261,9 +261,9 @@
           "source": "default"
         },
         {
-          "name": "draft-fp8",
-          "value": "true",
-          "default": "true",
+          "name": "weight-policy",
+          "value": "auto",
+          "default": "auto",
           "source": "default"
         },
         {
@@ -288,18 +288,6 @@
           "name": "prefill-w8a16",
           "value": "false",
           "default": "false",
-          "source": "default"
-        },
-        {
-          "name": "fp8-head",
-          "value": "true",
-          "default": "true",
-          "source": "default"
-        },
-        {
-          "name": "fp8-o-proj",
-          "value": "true",
-          "default": "true",
           "source": "default"
         },
         {
@@ -328,7 +316,7 @@
         },
         {
           "name": "listen",
-          "value": "0.0.0.0:8320",
+          "value": "0.0.0.0:8319",
           "default": "0.0.0.0:8000",
           "source": "cli"
         },
@@ -381,6 +369,12 @@
           "source": "default"
         },
         {
+          "name": "host-cache-headroom-bytes",
+          "value": "8GiB",
+          "default": "8GiB",
+          "source": "default"
+        },
+        {
           "name": "host-cache-min-tokens",
           "value": "512",
           "default": "512",
@@ -430,28 +424,28 @@
         }
       ]
     },
-    "readiness_s": 13.48642844,
-    "started": "2026-10-02T07:40:46Z"
+    "readiness_s": 26.328633848,
+    "started": "2026-10-04T04:56:56Z"
   },
-  "fingerprint": "75f18db6afc7e708",
+  "fingerprint": "2fda76eba172b110",
   "baseline": {
-    "fingerprint": "75f18db6afc7e708",
-    "run_id": "93a5e265122349a3a3199d86b2e55c41",
-    "created": "2026-10-02T07:41:02Z",
+    "fingerprint": "2fda76eba172b110",
+    "run_id": "0ea828b932594b8b97f8331463757699",
+    "created": "2026-10-04T04:57:25Z",
     "card": {
       "decode": [
         {
           "content": "code",
-          "tok_s": 71.12241464329077,
+          "tok_s": 62.63336268880506,
           "runs": [
             {
-              "prompt_tokens": 59,
+              "prompt_tokens": 60,
               "completion_tokens": 320,
               "cached_tokens": 0,
               "reasoning_tokens": 0,
-              "ttft_s": 0.261052651,
-              "total_s": 4.746307393,
-              "decode_s": 4.485224547,
+              "ttft_s": 0.286380973,
+              "total_s": 5.379545431,
+              "decode_s": 5.093132259,
               "reasoning_end_s": null,
               "finish_reason": "length"
             }
@@ -460,16 +454,16 @@
         },
         {
           "content": "prose",
-          "tok_s": 41.0198310322976,
+          "tok_s": 35.26158389617179,
           "runs": [
             {
-              "prompt_tokens": 57,
+              "prompt_tokens": 59,
               "completion_tokens": 320,
               "cached_tokens": 0,
               "reasoning_tokens": 0,
-              "ttft_s": 0.256303933,
-              "total_s": 8.033061659,
-              "decode_s": 7.776726329000001,
+              "ttft_s": 0.281954234,
+              "total_s": 9.32866958,
+              "decode_s": 9.046672462,
               "reasoning_end_s": null,
               "finish_reason": "length"
             }
@@ -478,16 +472,16 @@
         },
         {
           "content": "json",
-          "tok_s": 84.39897786784358,
+          "tok_s": 75.03204725759002,
           "runs": [
             {
-              "prompt_tokens": 86,
+              "prompt_tokens": 87,
               "completion_tokens": 320,
               "cached_tokens": 0,
               "reasoning_tokens": 0,
-              "ttft_s": 0.313899875,
-              "total_s": 4.093595706,
-              "decode_s": 3.779666627,
+              "ttft_s": 0.331877485,
+              "total_s": 4.583445786,
+              "decode_s": 4.251516674,
               "reasoning_end_s": null,
               "finish_reason": "length"
             }
@@ -497,26 +491,26 @@
       ],
       "prefill": {
         "prompt_tokens": 8050,
-        "tok_s": 1754.05403565489,
-        "ttft_s": 4.589368307,
+        "tok_s": 2934.8540186949876,
+        "ttft_s": 2.742896222,
         "runs": [
           {
             "prompt_tokens": 8050,
             "completion_tokens": 1,
             "cached_tokens": 0,
             "reasoning_tokens": 0,
-            "ttft_s": 4.589368307,
-            "total_s": 4.589436639,
+            "ttft_s": 2.742896222,
+            "total_s": 2.742947479,
             "decode_s": 0.0,
             "reasoning_end_s": null,
             "finish_reason": "length"
           }
         ]
       },
-      "warmup_s": 2.855492063,
+      "warmup_s": 3.267898189,
       "capacity": {
-        "kv_tokens": 131072,
-        "kv_pages": 2048,
+        "kv_tokens": 2097152,
+        "kv_pages": 32768,
         "kv_format": "Int8 full + BF16 SWA rings",
         "max_requests": 8,
         "max_context": 32768,
@@ -525,62 +519,67 @@
       }
     },
     "quality": {
-      "status": "fail",
+      "status": "pass",
       "checks": [
         {
           "id": "fidelity",
           "title": "Logit fidelity",
           "status": "pass",
-          "summary": "KL 0.027 · top-1 88.3% · NLL 3.388 vs 3.350 · 512 tokens vs MiMo V2.6 Pro reference",
+          "summary": "KL 0.020 · top-1 90.2% · NLL 3.334 vs 3.366 · 512 tokens vs MiMo V2.6 Pro reference",
           "metrics": {
-            "kl": 0.02684374768921969,
-            "top1": 0.8828125,
-            "nll": 3.388370839137377,
-            "ref_nll": 3.3501571532589978,
+            "kl": 0.01988587272658041,
+            "top1": 0.90234375,
+            "nll": 3.334326174556008,
+            "ref_nll": 3.365624708206134,
             "positions": 512,
             "missing": 0,
             "kl_max": 0.15,
             "top1_min": 0.8,
             "reference": "MiMo V2.6 Pro"
           },
-          "seconds": 3.004832608
+          "seconds": 3.103881328
         },
         {
           "id": "cache_exact",
           "title": "Prefix-cache restore",
           "status": "info",
-          "summary": "prompt end: 1537 restored, 2 rows byte-identical · turn end: 1282 restored, 1 rows byte-identical · the turn's greedy text did not reproduce",
+          "summary": "prompt end: 1539 restored, 2 rows byte-identical · turn end: 1285 restored, 1 rows byte-identical · the turn's greedy text did not reproduce",
           "metrics": {
-            "prompt_tokens": 1537,
-            "prompt_restored": 1537,
+            "prompt_tokens": 1539,
+            "prompt_restored": 1539,
             "prompt_rows_compared": 2,
-            "turn_tokens": 1282,
-            "turn_restored": 1282,
+            "turn_tokens": 1285,
+            "turn_restored": 1285,
             "turn_rows_compared": 1
           },
-          "seconds": 4.096806773
+          "seconds": 4.402339275
         },
         {
           "id": "spec_lossless",
           "title": "Speculation lossless",
           "status": "pass",
-          "summary": "DFlash2 (73875d00b30a89ef8cc353a0b60b0e9f9561952d): 128 greedy tokens identical with drafts on and off (53.6 vs 36.7 tok/s)",
+          "summary": "DFlash2 (adea8e2c5373181e5a973fa1ecb343cb31af214b): 128 greedy tokens identical with drafts on and off (47.7 vs 30.3 tok/s)",
           "metrics": {
             "tokens": 128,
             "identical_prefix": 128,
-            "speculator": "DFlash2 (73875d00b30a89ef8cc353a0b60b0e9f9561952d)",
-            "decode_tok_s_on": 53.648477704950025,
-            "decode_tok_s_off": 36.691388735986514
+            "speculator": "DFlash2 (adea8e2c5373181e5a973fa1ecb343cb31af214b)",
+            "decode_tok_s_on": 47.67705140895647,
+            "decode_tok_s_off": 30.256317011364825
           },
-          "seconds": 6.372368067
+          "seconds": 7.439574705
         },
         {
           "id": "template",
           "title": "Template round trip",
-          "status": "fail",
-          "summary": "reading the event stream: Error while decoding chunks",
-          "metrics": {},
-          "seconds": 1.252602938
+          "status": "info",
+          "summary": "tool call parsed · reasoning kept · re-render differs at token 95 of 172",
+          "metrics": {
+            "reasoning_chars": 36,
+            "rendered_prefix": 95,
+            "turn_tokens": 172,
+            "cached_tokens": 0
+          },
+          "seconds": 1.923450651
         },
         {
           "id": "c1_c4",
@@ -590,11 +589,11 @@
           "metrics": {
             "identical": 4
           },
-          "seconds": 4.73128339
+          "seconds": 4.809940905
         }
       ]
     },
-    "seconds": 48.392245823
+    "seconds": 50.209186336
   },
   "panels": [
     {
@@ -610,18 +609,6 @@
                 "index": 0,
                 "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
                 "uuid": "GPU-fe5b6dd0-a77c-c8fb-6360-e1b9d9918ac0",
-                "memory_mib": 97887,
-                "power_limit_w": 325.0,
-                "power_max_w": 600.0,
-                "sm_count": 188,
-                "compute_cap": "12.0",
-                "pcie": "Gen5 x16",
-                "used": true
-              },
-              {
-                "index": 1,
-                "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
-                "uuid": "GPU-95f8f212-9131-df99-fd53-7535965197d7",
                 "memory_mib": 97887,
                 "power_limit_w": 325.0,
                 "power_max_w": 600.0,
@@ -681,12 +668,12 @@
             ],
             "rails": "fabric: use 2 rail(s) of [mlx5_0@10.55.0.22/24 400G(eff 400G), mlx5_0@10.55.1.22/24 400G(eff 400G)]: 2 subnets share one 400 Gb/s port; each rail is a subnet of the same link"
           },
-          "readiness_s": 13.48642844
+          "readiness_s": 26.328633848
         }
       ],
-      "started": "2026-10-02T07:41:51Z",
-      "finished": "2026-10-02T07:41:51Z",
-      "seconds": 0.000202845,
+      "started": "2026-10-04T04:58:15Z",
+      "finished": "2026-10-04T04:58:15Z",
+      "seconds": 0.000121973,
       "error": null,
       "history": []
     },
@@ -696,11 +683,11 @@
       "status": "done",
       "passes": [
         {
-          "model": "XiaomiMiMo/MiMo-V2.6-Pro-RL",
+          "model": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD",
           "family": "mimo_v2",
-          "revision": "73875d00b30a89ef8cc353a0b60b0e9f9561952d",
+          "revision": "adea8e2c5373181e5a973fa1ecb343cb31af214b",
           "configuration": {
-            "snapshot": "/root/.cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.6-Pro-RL/snapshots/73875d00b30a89ef8cc353a0b60b0e9f9561952d",
+            "snapshot": "/root/.cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.6-Pro-MOPD/snapshots/adea8e2c5373181e5a973fa1ecb343cb31af214b",
             "quant": [
               {
                 "group": "embedding",
@@ -761,12 +748,12 @@
                 ]
               }
             ],
-            "speculator": "DFlash2 (73875d00b30a89ef8cc353a0b60b0e9f9561952d)",
-            "layout": "2 RTX (head split) · experts TP6 over 6 Sparks",
+            "speculator": "DFlash2 (adea8e2c5373181e5a973fa1ecb343cb31af214b)",
+            "layout": "1 RTX · experts TP6 over 6 Sparks",
             "settings": [
               {
                 "name": "snapshot",
-                "value": "/root/.cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.6-Pro-RL/snapshots/73875d00b30a89ef8cc353a0b60b0e9f9561952d",
+                "value": "/root/.cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.6-Pro-MOPD/snapshots/adea8e2c5373181e5a973fa1ecb343cb31af214b",
                 "default": null,
                 "source": "cli"
               },
@@ -786,13 +773,7 @@
                 "name": "device",
                 "value": "0",
                 "default": "0",
-                "source": "cli"
-              },
-              {
-                "name": "split-device",
-                "value": "1",
-                "default": null,
-                "source": "cli"
+                "source": "default"
               },
               {
                 "name": "max-context",
@@ -802,7 +783,7 @@
               },
               {
                 "name": "pool-tokens",
-                "value": "131072",
+                "value": "0",
                 "default": "131072",
                 "source": "cli"
               },
@@ -825,6 +806,24 @@
                 "source": "default"
               },
               {
+                "name": "runtime-reserve-mib",
+                "value": "1024",
+                "default": "1024",
+                "source": "default"
+              },
+              {
+                "name": "decode-graph-reserve-kib",
+                "value": "192",
+                "default": "192",
+                "source": "default"
+              },
+              {
+                "name": "decode-graph-driver-reserve-mib",
+                "value": "64",
+                "default": "64",
+                "source": "default"
+              },
+              {
                 "name": "peers",
                 "value": "10.55.0.1:19482,10.55.0.2:19482,10.55.0.3:19482,10.55.0.4:19482,10.55.0.5:19482,10.55.0.6:19482",
                 "default": null,
@@ -838,7 +837,7 @@
               },
               {
                 "name": "draft",
-                "value": "/root/.cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.6-Pro-RL/snapshots/73875d00b30a89ef8cc353a0b60b0e9f9561952d",
+                "value": "/root/.cache/huggingface/hub/models--XiaomiMiMo--MiMo-V2.6-Pro-MOPD/snapshots/adea8e2c5373181e5a973fa1ecb343cb31af214b",
                 "default": null,
                 "source": "cli"
               },
@@ -855,9 +854,9 @@
                 "source": "default"
               },
               {
-                "name": "draft-fp8",
-                "value": "true",
-                "default": "true",
+                "name": "weight-policy",
+                "value": "auto",
+                "default": "auto",
                 "source": "default"
               },
               {
@@ -882,18 +881,6 @@
                 "name": "prefill-w8a16",
                 "value": "false",
                 "default": "false",
-                "source": "default"
-              },
-              {
-                "name": "fp8-head",
-                "value": "true",
-                "default": "true",
-                "source": "default"
-              },
-              {
-                "name": "fp8-o-proj",
-                "value": "true",
-                "default": "true",
                 "source": "default"
               },
               {
@@ -922,7 +909,7 @@
               },
               {
                 "name": "listen",
-                "value": "0.0.0.0:8320",
+                "value": "0.0.0.0:8319",
                 "default": "0.0.0.0:8000",
                 "source": "cli"
               },
@@ -972,6 +959,12 @@
                 "name": "host-cache-bytes",
                 "value": "0",
                 "default": "0",
+                "source": "default"
+              },
+              {
+                "name": "host-cache-headroom-bytes",
+                "value": "8GiB",
+                "default": "8GiB",
                 "source": "default"
               },
               {
@@ -1026,17 +1019,17 @@
           },
           "build": {
             "version": "0.1.0",
-            "release": "v0.1.0",
-            "image": "ghcr.io/tpurtell/cuteafd-coordinator:v0.1.0",
+            "release": "mopd-319ccdb",
+            "image": "cuteafd-coordinator:mopd-319ccdb",
             "remote": null,
-            "commit": "7936046a1a4a0cc1c20a71421125e4a65e71c91b",
+            "commit": "319ccdb083d90159c026a015c48f98ca51b5ae73",
             "dirty": false
           }
         }
       ],
-      "started": "2026-10-02T07:41:51Z",
-      "finished": "2026-10-02T07:41:51Z",
-      "seconds": 0.000257498,
+      "started": "2026-10-04T04:58:15Z",
+      "finished": "2026-10-04T04:58:15Z",
+      "seconds": 0.000306601,
       "error": null,
       "history": []
     }
