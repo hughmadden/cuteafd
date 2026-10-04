@@ -251,8 +251,13 @@ pub(crate) fn with_engine<T>(
                     total_bytes: total as u64, baseline_free_bytes: free as u64 })
             })).collect::<Result<Vec<_>>>()?;
         let cache_stages = model.dspark.as_ref().map_or(0, |d| d.stages.len());
+        // The loader's legacy config requests one nextn stage, but a dSpark
+        // checkpoint loads all three concrete stages. Describe those actual
+        // cache owners rather than the caller's nextn configuration.
+        let mut cache_cfg = loaded.cfg.clone();
+        cache_cfg.n_mtp_layers = cache_stages;
         let geometry = cuteafd_loader::serving_capacity::deepseek_v4_cache_geometry(
-            &loaded.cfg, devices.len(), prefill_rows as u64, cache_stages)?;
+            &cache_cfg, devices.len(), prefill_rows as u64, cache_stages)?;
         let mark = geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum::<u64>();
         let slots = prefix.filter(|p| p.prefix_cache_entries > 0).map_or(0, |p|
             cuteafd_engine::prefix::MarkArena::slots_for(args.max_sequences, p.prefix_cache_entries,
