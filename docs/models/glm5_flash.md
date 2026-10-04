@@ -98,11 +98,24 @@ does not establish byte-identical speculative output. See the
 - Running BF16 attention natively (`CUTEAFD_GLM_BF16=native`) costs a
   meaningful coordinator-step slowdown versus the default FP8-block path;
   use it only when the extra precision is worth it.
+- FP8 KDA/head under the two-GPU head split misses the C4, prefill and
+  top-1/KL promotion bars. BF16 KDA/head stays the split default; explicit
+  FP8 remains opt-in. The Spark-wait and split-rounding contributions need
+  a matched follow-up before any promotion.
+- Speculative verify is not byte-identical to plain decode, and C1/C4
+  greedy outputs can differ. Prefix-cache restores and rejected-suffix
+  causality pass; batch-invariant prefill and verify are deferred.
+- One-RTX NVFP4 local experts must fit resident weight and serving
+  reservations. Implicit expert paging was removed; `--expert-window` is
+  an explicit fallback with a substantial latency cost.
+- NVFP4 decode/verify uses W4A16; native W4A4 for these small-row shapes is
+  deferred.
 
 ## Changelog
 
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
+| v1 | 2026-10-04 | Two-RTX head split and DFlash2 for all quants; single-copy FP8 drafter; FP8 KDA/head on one GPU and BF16 under the split; stop-token grammar completion; resident local NVFP4 experts. | Pending v1.0.0-rc1 Release smoke; cards populated by `cuteafd bench publish`. |
 | v0 | 2026-10-02 | First release | <a href="../../benchmarks/glm5_flash/2026-10-02-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-02-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark/card.svg" width="360" alt="GLM-5.3-Flash-EXL3-K3.25-v1 (exl3-k3+exl3-k4) (min)"></a> <a href="../../benchmarks/glm5_flash/2026-10-02-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-4spark/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-02-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-4spark/card.svg" width="360" alt="GLM-5.3-Flash-EXL3-K3.25-v1 (exl3-k3+exl3-k4) (max)"></a> <a href="../../benchmarks/glm5_flash/2026-10-02-smoke-glm-5-3-flash-nvfp4-1rtx-4spark/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-02-smoke-glm-5-3-flash-nvfp4-1rtx-4spark/card.svg" width="360" alt="GLM-5.3-Flash-NVFP4 (nvfp4-g16) (min)"></a> <a href="../../benchmarks/glm5_flash/2026-10-02-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-02-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark/card.svg" width="360" alt="GLM-5.3-Flash-tr3-4bpw (exl3-k4) (min)"></a> <a href="../../benchmarks/glm5_flash/2026-10-02-smoke-glm-5-3-flash-tr3-4bpw-1rtx-4spark/report.svg"><img src="../../benchmarks/glm5_flash/2026-10-02-smoke-glm-5-3-flash-tr3-4bpw-1rtx-4spark/card.svg" width="360" alt="GLM-5.3-Flash-tr3-4bpw (exl3-k4) (max)"></a> |
 
 ## Additional benchmarks

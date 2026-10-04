@@ -59,11 +59,19 @@ GLM 5.3 EXL3 K4, 1 RTX + 4 Sparks. `SPECULATOR_FP8=off` keeps the BF16 drafter.
   or NVFP4 for serious context lengths.
 - No local (RTX-only) expert path — GLM 5.3 always needs at least one Spark
   rank.
+- Speculative verify and plain decode, and C1/C4 greedy outputs, can differ.
+  The current smoke gate permits verified numerical rounding; it does not
+  establish byte-identical speculative output or batch invariance.
+- Prefill remains Spark-bound at both reference layouts; additional RTX
+  head-split capacity does not remove the expert-wave bottleneck.
+- NVFP4 decode/verify uses W4A16; native W4A4 for these small-row shapes is
+  deferred.
 
 ## Changelog
 
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
+| v1 | 2026-10-04 | E4M3 MLA prefill, Spark EXL3 wave scheduling and TP6 tiles; bounded decode graphs and automatic KV pool; FP8 DFlash2; stop-token grammar completion. | Pending v1.0.0-rc1 Release smoke; cards populated by `cuteafd bench publish`. |
 | v0 | 2026-10-02 | First release | <a href="../../benchmarks/glm5/2026-10-02-smoke-glm-5-3-exl3-k4-v1-1rtx-4spark/report.svg"><img src="../../benchmarks/glm5/2026-10-02-smoke-glm-5-3-exl3-k4-v1-1rtx-4spark/card.svg" width="360" alt="GLM-5.3-EXL3-K4-v1 (exl3-k4) (min)"></a> <a href="../../benchmarks/glm5/2026-10-02-smoke-glm-5-3-exl3-k4-v1-2rtx-6spark/report.svg"><img src="../../benchmarks/glm5/2026-10-02-smoke-glm-5-3-exl3-k4-v1-2rtx-6spark/card.svg" width="360" alt="GLM-5.3-EXL3-K4-v1 (exl3-k4) (max)"></a> <a href="../../benchmarks/glm5/2026-10-02-smoke-glm-5-3-nvfp4-1rtx-6spark/report.svg"><img src="../../benchmarks/glm5/2026-10-02-smoke-glm-5-3-nvfp4-1rtx-6spark/card.svg" width="360" alt="GLM-5.3-NVFP4 (nvfp4-g16) (min)"></a> <a href="../../benchmarks/glm5/2026-10-02-smoke-glm-5-3-nvfp4-2rtx-6spark/report.svg"><img src="../../benchmarks/glm5/2026-10-02-smoke-glm-5-3-nvfp4-2rtx-6spark/card.svg" width="360" alt="GLM-5.3-NVFP4 (nvfp4-g16) (max)"></a> |
 
 ## Additional benchmarks

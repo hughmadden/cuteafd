@@ -60,11 +60,22 @@ MiMo V2 Flash 1 RTX + 4 Sparks; V2.6 Pro 1 RTX + 6 Sparks. Coordinator VRAM: V2 
   experiment (small gain, bandwidth-bound either way).
 - V2.6 Pro's native checkpoint needs all six Sparks to fit its MXFP4 expert
   footprint; V2 Flash fits a smaller pool.
+- V2 Flash's maximum layout still prefills more slowly than its natural
+  minimum after the two-lane improvement; head-split overhead remains open.
+- V2 Flash fidelity is near the smoke threshold (KL about 0.10, top-1 about
+  82%). BF16 expert-input Spark packages are opt-in (`EXPERT_INPUT=bf16`)
+  and must be included in the image before use.
+- Exact Spark slices remove zero padding, but MXFP4 32-row down-projection
+  tails remain a follow-up; larger padded slices can still cost memory and
+  expert-wave time.
+- Batch-invariant prefill and verify are deferred; a speculation-lossless
+  smoke result permits proven numerical rounding, not a state mismatch.
 
 ## Changelog
 
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
+| v1 | 2026-10-04 | V2.6 Pro MOPD checkpoint and DFlash; native A8 MXFP4 down projection and exact Spark slices; single-copy FP8 head/O/drafter; pipelined head-split prefill; Flash two-lane default. | Pending v1.0.0-rc1 Release smoke; cards populated by `cuteafd bench publish`. |
 | v0 | 2026-10-02 | First release | <a href="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-flash-1rtx-4spark/report.svg"><img src="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-flash-1rtx-4spark/card.svg" width="360" alt="MiMo-V2-Flash (fp8-block128x128/f32) (min)"></a> <a href="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-flash-2rtx-4spark/report.svg"><img src="../../benchmarks/mimo_v2/2026-10-02-smoke-mimo-v2-flash-2rtx-4spark/card.svg" width="360" alt="MiMo-V2-Flash (fp8-block128x128/f32) (max)"></a> |
 | v0-mopd | 2026-10-04 | Model-affecting: V2.6 Pro checkpoint `MiMo-V2.6-Pro-RL` → `MiMo-V2.6-Pro-MOPD` (Xiaomi's MOPD2 pass over the RL weights fixes tool-call repetition; architecture, config, tokenizer, chat template and tensor layout unchanged, DFlash drafter retrained). Golden and bench fidelity reference regenerated from MOPD. | <a href="../../benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-1rtx-6spark/report.svg"><img src="../../benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-1rtx-6spark/card.svg" width="360" alt="MiMo-V2.6-Pro-MOPD (mxfp4-g32) (min)"></a> <a href="../../benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-2rtx-6spark/report.svg"><img src="../../benchmarks/mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-2rtx-6spark/card.svg" width="360" alt="MiMo-V2.6-Pro-MOPD (mxfp4-g32) (max)"></a> |
 

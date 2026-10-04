@@ -713,6 +713,46 @@ v1 ships when these are done; everything else below moves to v1.x/v2.
   (`cuteafd plan MODEL --layout`, 32 GB budget) and validate on real 5090s;
   start from `work/p0`, branch `work/rtx5090`, follow AGENTS.md.
 
+### v1 candidate changelog (preparation, 2026-10-04)
+
+Changes since v0.1.0 touch every model family. The `release/v1` candidate
+uses local `cuteafd-coordinator:v1.0.0-rc1` and
+`cuteafd-spark-expert:v1.0.0-rc1` images. The full family × quant ×
+natural-minimum/maximum Release smoke matrix must complete before review;
+`CUTEAFD_RELEASE_ROW=v1 cuteafd bench publish` fills the pending family
+changelog rows and refreshes the README grid. These rows make no claim of
+passing qualification. TJ explicitly deferred V4.1 parity to the next
+release; this candidate also skips `bench-ab`. Claude reviews the candidate,
+then TJ approves tagging and publishing images.
+
+- Shared runtime: stop-token grammar completion and structured stream
+  errors, drained cancellation/staging lifetimes, bounded host cache and
+  generic KV admission; family memory layouts and opt-in automatic admission.
+- DeepSeek V4.1: coordinator-first loading, smaller one-RTX workspaces,
+  per-width head graphs, opt-in device exchange and single-copy FP8 vocabulary
+  head; BF16 head remains default. V4 / V4.1 turn-end restore checks now
+  compare each restored state to its own byte-exact snapshot.
+- DeepSeek V4: qualified native Flash TP2 with legacy requests and exact
+  local-expert placement overrides; compressed-cache/drafter memory planning.
+- GLM 5.3: E4M3 MLA prefill, improved Spark EXL3 wave scheduling and TP6
+  tiles, bounded decode graphs, automatic KV pool and FP8 DFlash2.
+- GLM 5.3 Flash: default two-RTX head split, DFlash2 for all quants, FP8
+  drafter and layout-dependent KDA/head precision (FP8 on one GPU; BF16 with
+  the split).
+- MiMo: Pro MOPD replaces RL, native A8 MXFP4 down projection, exact Spark
+  slices, single-copy FP8 head/O/DFlash, pipelined head-split prefill; Flash
+  defaults to two lanes while Pro retains three.
+- Qwen: resident EXL3 placement with local MTP3 and one shared FP8 vocabulary
+  head; Spark MTP and Spark FP8 remain unsupported. NVFP4 local experts are
+  resident by default; paging requires an explicit expert window.
+
+Open limits are recorded in `docs/models/`: numerical batch invariance and
+byte-identical speculative output, V4 Pro fidelity reference, split FP8
+GLM Flash promotion, V4.1 short FP8 replies and graph recapture, MiMo Flash
+scaling/fidelity, native small-row NVFP4 W4A4, and Qwen Spark MTP/FP8. The
+scope's MXFP4 32-row tails still need implementation and qualification;
+exact Spark slices and A8 down projection alone do not close that item.
+
 ## Release v1 — priority plan (2026-10-02)
 
 Everything after v0 lands as v1. Helpers: read AGENTS.md, then pick the top

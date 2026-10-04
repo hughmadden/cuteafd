@@ -38,13 +38,20 @@ checked against.
 - V4 Pro's EXL3 prefill is Spark-compute bound; TP6 raises decode but
   coordinator intake of partial rows is the current prefill bottleneck on
   some layouts (see `PLAN.md` Spark-side reduction notes).
-- V4 Pro's dSpark speculator needs Spark-side MTP experts to run; V4 Flash
-  has the full dSpark path today.
+- V4 Pro's golden fidelity reference remains unavailable. Its speculative
+  and plain greedy outputs, and C1/C4 greedy outputs, can differ; verify
+  rounding and batch invariance remain open.
+- V4 Flash prompt and turn-end prefix restores are byte-exact against their
+  own snapshots; cold prefill can differ through arrival-ordered Spark FP32
+  atomic reductions. Deterministic prefill and verify are deferred.
+- V4 Flash's native TP2 layout is qualified with legacy expert requests;
+  the opt-in device exchange does not support that wire geometry.
 
 ## Changelog
 
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
+| v1 | 2026-10-04 | Qualify native Flash TP2 on legacy expert requests; honor explicit local-expert placement; compressed-cache and drafter admission; exact turn-end restore check. | Pending v1.0.0-rc1 Release smoke; cards populated by `cuteafd bench publish`. |
 | v0 | 2026-10-02 | First release | <a href="../../benchmarks/deepseek_v4/2026-10-02-smoke-deepseek-v4-flash-0731-1rtx-4spark/report.svg"><img src="../../benchmarks/deepseek_v4/2026-10-02-smoke-deepseek-v4-flash-0731-1rtx-4spark/card.svg" width="360" alt="DeepSeek-V4-Flash-0731 (mxfp4-g32) (min)"></a> <a href="../../benchmarks/deepseek_v4/2026-10-02-smoke-deepseek-v4-flash-0731-2rtx-4spark/report.svg"><img src="../../benchmarks/deepseek_v4/2026-10-02-smoke-deepseek-v4-flash-0731-2rtx-4spark/card.svg" width="360" alt="DeepSeek-V4-Flash-0731 (mxfp4-g32) (max)"></a> <a href="../../benchmarks/deepseek_v4/2026-10-02-smoke-deepseek-v4-pro-0813-exl3-k2-calibrated-v1-1rtx-4spark/report.svg"><img src="../../benchmarks/deepseek_v4/2026-10-02-smoke-deepseek-v4-pro-0813-exl3-k2-calibrated-v1-1rtx-4spark/card.svg" width="360" alt="DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1 (exl3-k2) (min)"></a> <a href="../../benchmarks/deepseek_v4/2026-10-02-smoke-deepseek-v4-pro-0813-exl3-k2-calibrated-v1-2rtx-6spark/report.svg"><img src="../../benchmarks/deepseek_v4/2026-10-02-smoke-deepseek-v4-pro-0813-exl3-k2-calibrated-v1-2rtx-6spark/card.svg" width="360" alt="DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1 (exl3-k2) (max)"></a> |
 
 ## Additional benchmarks
