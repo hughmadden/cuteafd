@@ -6,11 +6,13 @@ PYTHONPATH. Inputs and unique top-k routes are seeded synthetic data; weights
 and all rotation/scale vectors come from the supplied MCG checkpoint. This
 measures a layer, not model TTFT or accuracy. No policy or default is changed.
 Use --profile with ncu --profile-from-start off or nsys --capture-range=cudaProfilerApi.
+For --profile-graph, add nsys --cuda-graph-trace=node to expose kernel durations.
 """
 from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -171,11 +173,17 @@ def main():
     parser.add_argument("--rows", type=int, nargs="+", default=[2048, 4096, 8192])
     parser.add_argument("--replays", type=int, default=20)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--profile-graph", action="store_true", help="trace graph replays instead of eager launches")
+    parser.add_argument("--profile-replays", type=int, default=1, help="launches per profiler range (1..64)")
     parser.add_argument("--phase-clock", action="store_true", help="instrument existing phase boundaries")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if len(args.rows) != len(set(args.rows)):
+        parser.error("row geometries must be unique")
     if args.replays < 3 or any(m < 2048 or m > 8192 for m in args.rows):
         parser.error("use at least three replays and 2048..8192 rows")
+    if not 1 <= args.profile_replays <= 64 or ((args.profile_graph or args.profile_replays != 1) and not args.profile):
+        parser.error("profiling options require --profile and 1..64 profile replays")
     if args.phase_clock:
         os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
         os.environ["B12X_COMPILE_MEMORY_CACHE"] = "0"
@@ -198,8 +206,11 @@ def main():
     started = time.monotonic()
     prepared = load_weights(args.snapshot, args.layer, hidden, width, experts, bits)
     record = dict(geometry=args.geometry, snapshot=str(args.snapshot), layer=args.layer,
+                  measurement_script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                   sparkinfer_revision=_pinned_sparkinfer.REVISION,
                   sparkinfer_tree_sha256=_pinned_sparkinfer.LOCK_DATA["source_tree_sha256"],
+                  trellis_weight_bytes=sum(v.numel() * v.element_size()
+                      for tier in prepared.tiers for v in (tier.w13, tier.w2)),
                   gpu=props.name, sms=props.multi_processor_count,
                   torch=torch.__version__, cuda=torch.version.cuda,
                   weights_seconds=time.monotonic() - started, results=[])
@@ -261,41 +272,62 @@ def main():
                                         for name, ptr in pointers.items()))
         if not gate["finite"] or not gate["replay_equal"] or gate["replay_allocations"] or not gate["stable_pointers"]:
             raise RuntimeError(f"graph correctness gate failed: {gate}")
-        samples = []
+        samples, phase_samples = [], []
         if args.profile:
             torch.cuda.cudart().cudaProfilerStart()
             torch.cuda.nvtx.range_push(f"{args.geometry}/layer{args.layer}/rows{rows}")
-            # Eager launches let NCU profile the cooperative kernel independently.
-            run()
+            # Default eager launches let NCU inspect the cooperative kernel;
+            # graph bursts are useful for Nsight Systems timing diagnostics.
+            for _ in range(args.profile_replays):
+                if args.profile_graph:
+                    graph.replay()
+                else:
+                    run()
             torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
             torch.cuda.cudart().cudaProfilerStop()
         else:
-            for _ in range(args.replays):
-                begin, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+            # Device event nodes bracket the replay inside one graph launch,
+            # excluding host submission gaps between separately recorded events.
+            begin, end = (torch.cuda.Event(enable_timing=True, external=True) for _ in range(2))
+            timed_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(timed_graph):
                 begin.record()
-                graph.replay()
+                run()
                 end.record()
+            for _ in range(args.replays):
+                timed_graph.replay()
                 end.synchronize()
                 samples.append(begin.elapsed_time(end))
+                if phase_clock is not None:
+                    phase_samples.append(phase_clock.cpu())
+        gate["final_replay_equal"] = bool(torch.equal(reference, output))
+        if not gate["final_replay_equal"]:
+            raise RuntimeError(f"repeated replay changed the output: {gate}")
         result = dict(rows=rows, block=block, tile=list(tile),
+                      timing_method="device_graph_event_nodes" if samples else None,
                       blocks_per_sm=launch.blocks_per_sm,
                       token_major_rotation=policy.token_major_rotation(args.geometry, rows),
                       graph_gate=gate, samples_ms=samples,
                       median_ms=statistics.median(samples) if samples else None)
         if phase_clock is not None:
-            clocks = phase_clock.cpu()
-            live = clocks[clocks[:, 0] > 0]
-            boundaries = [int(live[:, 0].min()), *[int(live[:, j].max()) for j in range(1, 5)]]
-            if any(b <= a for a, b in zip(boundaries, boundaries[1:])):
-                raise RuntimeError(f"nonmonotonic phase clocks: {boundaries}")
+            phases = []
+            for clocks in phase_samples or [phase_clock.cpu()]:
+                live = clocks[clocks[:, 0] > 0]
+                boundaries = [int(live[:, 0].min()), *[int(live[:, j].max()) for j in range(1, 5)]]
+                if any(b <= a for a, b in zip(boundaries, boundaries[1:])):
+                    raise RuntimeError(f"nonmonotonic phase clocks: {boundaries}")
+                phases.append([(b - a) / 1e6 for a, b in zip(boundaries, boundaries[1:])])
             result["instrumented_phases_ms"] = dict(zip(
                 ("input_rotation", "fc1_decode_mma", "swiglu_rotation", "fc2_decode_mma"),
-                [(b - a) / 1e6 for a, b in zip(boundaries, boundaries[1:])]))
+                [statistics.median(p[j] for p in phases) for j in range(4)]))
+            result["instrumented_phase_samples_ms"] = phases
             result["instrumented_ctas"] = len(live)
         record["results"].append(result)
         args.output.write_text(json.dumps(record, indent=2) + "\n")
         print(json.dumps(result), flush=True)
+        if not args.profile:
+            del timed_graph, begin, end
         del graph, buffers, binding, output, reference
 
 

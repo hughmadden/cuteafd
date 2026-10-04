@@ -38,13 +38,13 @@ else
     phases) command+=(--phase-clock) ;;
     ncu)
       command+=(--profile)
-      command=(ncu --profile-from-start off --replay-mode application
-        --section SpeedOfLight --section InstructionStats --section WarpStateStats
+      command=(ncu --profile-from-start off --replay-mode application --clock-control none
+        --section SpeedOfLight --section ComputeWorkloadAnalysis --section InstructionStats --section WarpStateStats
         --section SourceCounters --section MemoryWorkloadAnalysis_Tables
         --force-overwrite -o "/w/$geometry-ncu" "${command[@]}") ;;
     nsys)
       command+=(--profile)
-      command=(nsys profile --sample=none --cpuctxsw=none --trace=cuda,nvtx
+      command=(nsys profile --sample=none --cpuctxsw=none --trace=cuda,nvtx --cuda-graph-trace=node
         --capture-range=cudaProfilerApi --capture-range-end=repeat
         -f true -o "/w/$geometry-nsys" "${command[@]}") ;;
   esac
