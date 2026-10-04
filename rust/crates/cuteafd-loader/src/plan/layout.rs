@@ -352,7 +352,7 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
             devices[0].items.push(Item::new(Category::Experts, "native MTP experts", "native", native_experts, Basis::Exact));
         }
     }
-    let exl3_workspace = expert_workspace(report, model, options.workspace_manifest.as_deref(), prefill_rows);
+    let exl3_workspace = expert_workspace(report, model, checkpoint, options.workspace_manifest.as_deref(), prefill_rows);
     if exl3_workspace.is_none() && report.experts.as_ref().is_some_and(|e| e.package.contains("exl3"))
         && (family == "deepseek_v4" || (family == "qwen4" && report.placement == ExpertPlacement::Local)) {
         notes.push("Local EXL3 workspace allowance is estimated without matching rtx-tp1/m*/v41_exl3.json capacity manifests; images bundle them, or export the exl3 tree alongside PROGRAMS.json".into());
@@ -599,9 +599,13 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
 /// Local EXL3 arenas from the same capacity manifests used by the loader.
 /// An exported PROGRAMS.json can have its expert JSON tree alongside it;
 /// in an image the standard tree lives in ../lib/exl3 instead.
-fn expert_workspace(report: &PlanReport, model: &dyn super::FamilyModel,
+fn expert_workspace(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &super::Checkpoint,
     manifest: Option<&std::path::Path>, rows: u64) -> Option<u64> {
-    let tiers = report.experts.as_ref()?.package.rsplit(':').next()?.strip_prefix("exl3-k")?;
+    if !report.experts.as_ref()?.package.contains("exl3") { return None; }
+    // Display labels name the checkpoint tier; the decoder can include an
+    // adjacent tier too (Pro K2 uses its k23 package). Read the catalog contract.
+    let catalog = crate::read_expert_catalog(&checkpoint.snapshot).ok()?;
+    let tiers = catalog.exl3()?.decoder_tiers().iter().map(usize::to_string).collect::<String>();
     let family = match report.family.as_deref()? {
         "qwen4" => "qwen4",
         "deepseek_v4" if model.spec().hidden == 4096 => "dsv4f",
