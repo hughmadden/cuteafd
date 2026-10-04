@@ -576,17 +576,23 @@ Follow-ups (2026-10-03, measurements pending in `~/.cache/cuteafd/builds/v1-memo
   Pro 2 RTX + 6 Sparks, exact vs padded: rank 5 free 11.8 -> 43.2 GiB (rank 0
   unchanged), golden NLL 2.4150 -> 2.4088 (KL 0.0457 -> 0.0445; rank partials
   partition the rows differently), engine 8K prefill 3095 -> 3002 tok/s, served
-  8K 2684 -> 2725, C1 63.9-69.1 -> 68.5-69.5, C4 102-108 both: neutral. Shortening the
-  busiest rank (352/320 rows) needs 32-row tails in three MXFP4 kernels (fork
-  master now has `work/mimo-perf`'s A8 down): the decode GEMV (`GroupedMxfp4Gemv`
-  needs K % (128 x warps) for down), the BF16 stream down (`I % 128`, 128-K
-  weight blocks) and the A8 stream down (128-K blocks via cp.async, u32 scale
-  loads). Gate/up already tiles I in 32 rows (11 vs 12 CTA columns: -8%); down
-  only gains if its last K block is predicated at 32 (TMA zero-fill covers the
-  BF16 route's loads; the A8 route needs predicated cp.async), and scale rows
-  of I/32 = 11 bytes need padding to 12 in the package layout. Expected: busiest
-  rank -5..-8% expert time (MiMo Pro prefill is Spark-bound) and -7.7 GiB on
-  ranks 0-3. V4.1 TP4 (576 -> 640)
+  8K 2684 -> 2725, C1 63.9-69.1 -> 68.5-69.5, C4 102-108 both: neutral.
+  MXFP4 now has opt-in 32-row tails in all three Spark kernels: decode
+  GEMV, BF16 stream down and A8 MXFP8xMXFP4 stream down. Fork master carries
+  the kernels; package generation, loading and planner admission support
+  352/352/352/352/320/320 rows, with down-scale rows padded to 12 bytes.
+  Build with `CUTEAFD_WIP_MXFP4_TAILS=ON` or
+  `CUTEAFD_RELEASE_MXFP4_TAILS=ON`; select with `CUTEAFD_MXFP4_TAILS=1`.
+  Missing wire/BF16 widths fall back together. Native SM121 tests and real
+  MiMo layer comparisons against identical padded coefficients pass, including
+  graph replay, poisoned padding and independent checkpoint references.
+  Full-engine quality gates remain open: the strict expert-probe floor also
+  fails on the baseline (its full-width oracle has different BF16 rounding
+  and omits streaming MXFP8 activation quantization), and golden NLL changes
+  with the new partition. The busiest-rank timing falls below the forecast;
+  warmed 8K prefill is effectively flat. Measurements and conditions are in
+  the branch commits. Defaults remain unchanged pending review.
+  V4.1 TP4 (576 -> 640)
   goes through the V4.1 packer: not done.
 - V4.1 one RTX: row buffers at the live 2048-row chunk instead of the 4096 AOT
   capacity (as on two RTX), reindex selection shares the source's scratch:
@@ -685,7 +691,9 @@ v1 ships when these are done; everything else below moves to v1.x/v2.
   adoption on `work/device-mimo-glm` gains nothing — their segments are
   GPU-bound). It ships opt-in in v1. Turn-end prefix restores proved exact
   (the check was wrong; fixed). V4.1 FP8 vocabulary head: single-copy gate
-  in progress.
+  in progress. MXFP4 32-row tails are implemented; native Spark tests pass,
+  while distributed oracle and unchanged-NLL gates remain open. They remain
+  opt-in pending review.
 - **Cut to v1.x/v2:** whole-step graphs (D4: context-length-dependent index
   graphs, per-request pointers in graph keys, host-built per-layer metadata,
   warm re-captures) and device-side draft acceptance; deterministic
