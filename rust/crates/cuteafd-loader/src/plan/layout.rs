@@ -258,9 +258,10 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
     }
 
     // Fixed runtime costs.
-    let gpus_now = devices.len();
     for (index, device) in devices.iter_mut().enumerate() {
-        let role = if gpus_now == 1 { 0 } else if index == 0 { 1 } else { 2 };
+        // An inventory entry is not an executing device without a head split.
+        if !split && index > 0 { continue; }
+        let role = if !split { 0 } else if index == 0 { 1 } else { 2 };
         device.items.push(Item::new(Category::Runtime, "context+modules", "", costs.runtime_bytes[role],
             Basis::Calibrated));
         device.items.push(Item::new(Category::Runtime, "graph allowance", "", costs.graph_bytes[role], Basis::Calibrated));

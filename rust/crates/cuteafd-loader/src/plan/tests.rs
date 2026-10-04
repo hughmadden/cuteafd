@@ -878,6 +878,13 @@ fn preferred_qwen_experts_require_room_for_serving_and_keep_explicit_layouts() {
     assert_eq!(memory.devices[0].by_category()[&Category::Experts],
         component(&preferred, Component::RoutedExpert).bytes);
     assert!(memory.devices.iter().all(|d| d.free_bytes() >= 0));
+    let unused_peer = PlanOptions {
+        layout: Some(layout::LayoutOptions {
+            rtx_bytes: vec![96 << 30, 1 << 30], pool_tokens: Some(32768), ..Default::default()
+        }),
+        ..ample.clone()
+    };
+    assert_eq!(plan_preferred(dir.path(), &unused_peer).unwrap().placement, ExpertPlacement::Local);
     // Explicit --spark-ranks keeps the requested topology, even when local fits.
     assert_eq!(plan(dir.path(), &ample).unwrap().placement, ExpertPlacement::Sparks { ranks: 4 });
     let tight = PlanOptions {
@@ -909,5 +916,12 @@ fn local_qwen_memory_layout_charges_experts_to_the_lead_gpu() {
     assert_eq!(layout.devices[0].by_category()[&Category::Experts],
         component(&report, Component::RoutedExpert).bytes);
     assert!(!layout.devices[1].by_category().contains_key(&Category::Experts));
+    assert!(layout.devices[1].items.is_empty());
+    assert_eq!(layout.devices[1].kv_tokens, 0);
     assert!(!layout.notes.iter().any(|n| n.contains("only one coordinator")));
+    let one = plan(dir.path(), &PlanOptions {
+        layout: Some(layout::LayoutOptions { pool_tokens: Some(32768), ..Default::default() }),
+        ..sparks(0)
+    }).unwrap();
+    assert_eq!(layout.devices[0].by_category(), one.memory_layout.as_ref().unwrap().devices[0].by_category());
 }
