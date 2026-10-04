@@ -185,7 +185,7 @@ fn family_symbol(name: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Per-rank intermediate extents the native packer accepts: a multiple of 32
-/// so the K/32 UE8M0 scale axis is exact (V4.1 TP4 576 is storage-padded to 640).
+/// so the K/32 UE8M0 scale axis is exact (V4.1 TP4 stores its exact 576 rows).
 pub fn v41_pack_intermediate_supported(intermediate: u32) -> bool {
     intermediate > 0 && intermediate % 32 == 0 && intermediate <= 8192
 }
@@ -200,8 +200,8 @@ pub fn v41_rank_count_supported(ranks: u32) -> bool {
 
 /// Expected `(experts, logical, kernel, topk)` for one `(family, role)` pair
 /// under the process geometry. Each role is one tensor-parallel slice of the
-/// routed experts; kernels store it padded to 128, and the NVFP4 Spark TP4
-/// family also accepts the exact extent. Roles 0 and 4 are the dSpark draft
+/// routed experts. Native V4.1 TP4 and NVFP4 accept exact extents; other
+/// packages retain 128-aligned storage. Roles 0 and 4 are the dSpark draft
 /// experts (128 experts, top-3), whose shape does not follow the target model.
 fn expected_expert_geometry(
     geometry: cuteafd_core::ExpertGeometry,
@@ -222,7 +222,10 @@ fn expected_expert_geometry(
     };
     let logical = geometry.slice(tp).filter(|value| value % 32 == 0)?;
     let padded = logical.div_ceil(128) * 128;
-    let kernel = if nvfp4 && kernel_intermediate == logical { logical } else { padded };
+    let exact = nvfp4 || (geometry == cuteafd_core::ExpertGeometry::DEEPSEEK_V41 && role == 1);
+    // Accept the historical padded artifact too, so storage arms can share one
+    // executable. ExpertWeights checks that the packer agrees with this width.
+    let kernel = if exact && kernel_intermediate == logical { logical } else { padded };
     Some((geometry.experts, logical, kernel, geometry.topk))
 }
 
@@ -930,8 +933,10 @@ mod tests {
         // unknown role id both fail closed instead of matching by accident.
         assert_eq!(expected_expert_geometry(V41, true, 7, 384), None);
         assert_eq!(expected_expert_geometry(V41, false, 9, 384), None);
-        // Historical Spark TP4 padding and RTX TP2 role semantics are unchanged.
+        // Exact TP4 and the historical padded control share the same role.
+        assert_eq!(expected_expert_geometry(V41, false, 1, 576), Some((384, 576, 576, 6)));
         assert_eq!(expected_expert_geometry(V41, false, 1, 640), Some((384, 576, 640, 6)));
+        assert_eq!(expected_expert_geometry(V41, false, 1, 577), Some((384, 576, 640, 6)));
         assert_eq!(expected_expert_geometry(V41, false, 3, 1152), Some((384, 1152, 1152, 6)));
         // Unknown or cross-family pairs still fail closed.
         // A role-7 artifact with a 768 kernel cannot match the 384 expectation.

@@ -145,7 +145,9 @@ class Native:
                     (3, 384, 5120, 1152, 1152, 6, capacity, 7) if tp2 else
                     (0, 128, 5120, 2304, 2304, 3, capacity, 1)
                     if coordinator else (2, 384, 5120, 2304, 2304, 6, capacity, 7)
-                    if full_backbone else (1, 384, 5120, 576, 640, 6, capacity, 7))
+                    if full_backbone else (1, 384, 5120, 576, info.kernel_intermediate, 6, capacity, 7))
+        if info.role == 1:
+            assert info.kernel_intermediate in (576, 640), info.kernel_intermediate
         assert (
             info.abi_version,
             info.role,
@@ -157,6 +159,10 @@ class Native:
             info.capacity_rows,
             info.input_dtype,
         ) == (info.abi_version, *expected)
+        packed_sizes = (L * 4)()
+        check(lib.cuteafd_expert_packed_sizes(info.logical_intermediate, packed_sizes))
+        matrix = info.hidden_size * info.kernel_intermediate
+        assert list(packed_sizes) == [matrix, matrix // 16, matrix // 2, matrix // 32], "packer/AOT storage mismatch"
         assert info.abi_version in (2, 3)
         self.token_accumulation = info.abi_version == 3
         if self.token_accumulation:

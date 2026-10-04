@@ -12,6 +12,8 @@ import _pinned_sparkinfer
 from b12x.moe.fused_moe._impl import (
     _logical_weight_to_w4a8_rp_inplace as pack_weight,
     _e8m0_scale_to_w4a8_sfb_inplace as pack_scale,
+    _logical_weight_to_w4a8_n64_inplace as pack_exact_weight,
+    _e8m0_scale_to_w4a8_n64_sfb_inplace as pack_exact_scale,
 )
 
 
@@ -38,12 +40,20 @@ def main():
                            for s in shapes]
                 sizes = (C.c_uint64 * 4)()
                 assert lib.cuteafd_expert_packed_sizes(n, sizes) == 0
-                expected = [
-                    pack_weight(torch.cat([source[1], source[0]], 1), size_k=h, size_n=2*n, gated_half_rows=n),
-                    pack_scale(torch.cat([source[4], source[3]], 1), weight_E=1, rows=2*n, k_dim=h, gated_half_rows=n),
-                    pack_weight(source[2].clone(), size_k=n, size_n=h),
-                    pack_scale(source[5].clone(), weight_E=1, rows=h, k_dim=n),
-                ]
+                if n == 576 and sizes[0] == n * h:
+                    expected = [
+                        pack_exact_weight(torch.cat([source[1], source[0]], 1), size_k=h, size_n=2*n, group_rows=n),
+                        pack_exact_scale(torch.cat([source[4], source[3]], 1), weight_E=1, rows=2*n, k_dim=h, group_rows=n),
+                        pack_exact_weight(source[2].clone(), size_k=n, size_n=h),
+                        pack_exact_scale(source[5].clone(), weight_E=1, rows=h, k_dim=n),
+                    ]
+                else:
+                    expected = [
+                        pack_weight(torch.cat([source[1], source[0]], 1), size_k=h, size_n=2*n, gated_half_rows=n),
+                        pack_scale(torch.cat([source[4], source[3]], 1), weight_E=1, rows=2*n, k_dim=h, gated_half_rows=n),
+                        pack_weight(source[2].clone(), size_k=n, size_n=h),
+                        pack_scale(source[5].clone(), weight_E=1, rows=h, k_dim=n),
+                    ]
                 output = [torch.full((size + 32,), 205, device="cuda", dtype=torch.uint8) for size in sizes]
                 assert lib.cuteafd_pack_expert_async(
                     (ptr * 6)(*[s.data_ptr() for s in source]),

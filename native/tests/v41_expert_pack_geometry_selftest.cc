@@ -1,46 +1,6 @@
-// Exact host-reference check for the native expert packer across EVERY native
-// geometry, including the padded TP4 shard and the TP4 four-rank band partition.
-//
-// The packer is a plain CUDA representation transform, so this runs on any
-// supported device (SM120 RTX included) and does not need the SM121 AOT export.
-//
-// Two independent properties are proven per geometry:
-//
-// 1. Value fidelity. The device output is compared BYTE FOR BYTE against a host
-//    reference that is a direct port of the device `pack<Gated,Scales>` index
-//    math, over that geometry's own sliced inputs.
-// 2. Storage padding and partition. The packed layout is swizzled, so the
-//    padded region is decoded back to (source row, source K word) with the same
-//    index math instead of being treated as dense rows:
-//      * N-axis planes (W13 payload slot 0, S13 scales slot 1) are gated: the
-//        logical row is `half_row = plane_row - kernel_intermediate` for the
-//        gate half, and padded words are exactly `half_row >= intermediate`.
-//      * K-axis planes (W2 payload slot 2, S2 scales slot 3) are non-gated: the
-//        K word is `col`, and padded words are exactly `col >= intermediate/d`.
-//    Padded words must be zero AND the padded word count must equal the exact
-//    arithmetic total, so a silently truncated region fails too.
-// 3. The four 576-wide band cases (`band4/0..3`, offsets 0/576/1152/1728) are
-//    the TP4 four-rank logical partition. Each packed word is re-decoded and
-//    checked against the band's own source word, marked in the un-padded global
-//    layout, and the union of all four bands must cover the full logical extent
-//    exactly once with no word claimed twice: `2 * 2304 * 640` W13 words (the up
-//    half then the gate half) and `5120 * 288` W2 words. No per-rank slab is
-//    concatenated to a full pack: the partition is asserted in logical
-//    coordinates, because the swizzle tile origin is rank-local.
-//
-// Cases (name: per-rank logical intermediate, source offset of this rank's band):
-//   tp6      384   offset 0
-//   tp3      768   offset 0
-//   tp2      1152  offset 0
-//   tp4      576   offset 0      (pads to 640; the production Spark TP4 shard)
-//   full     2304  offset 0
-//   band4/0  576   offset 0
-//   band4/1  576   offset 576
-//   band4/2  576   offset 1152
-//   band4/3  576   offset 1728
-//
-// Requires a CUDA device; exits 77 (ctest SKIP) when none is present, or 1 when
-// CUTEAFD_REQUIRE_CUDA is set (so a scheduled gate cannot pass by skipping).
+// Byte-exact native expert packing for every role and all four TP4 bands.
+// Exact TP4 reference scatters source coordinates into resident tiles and
+// verifies the four rank bands cover the full logical weights exactly once.
 #include "cuteafd_experts.h"
 
 #include <cuda_runtime.h>
@@ -170,194 +130,40 @@ std::vector<uint8_t> band_cols(const std::vector<uint8_t>& full, uint32_t rows,
   return out;
 }
 
-// Flat payload word index -> (local row in the 256-row tile, K word) exactly as
-// the device derives them for the 4-byte payload path.
-struct PayloadCoord {
-  uint32_t row;
-  uint32_t word;
-};
-
-// K-relative word inside a tile: `k32*4 + (combined & 3)`; the caller adds
-// `kt*16` for the full packed column.
-uint32_t tile_word(uint32_t idx) {
-  const uint32_t combined = (idx >> 2) & 31;
-  const uint32_t k32 = idx >> 10;
-  return k32 * 4 + (combined & 3);
-}
-
-PayloadCoord payload_coord(uint32_t idx) {
-  const uint32_t n8i = idx & 3;
-  const uint32_t combined = (idx >> 2) & 31;
-  const uint32_t n8c = (idx >> 7) & 7;
-  return PayloadCoord{n8c * 32 + n8i * 8 + (combined >> 2), tile_word(idx)};
-}
-
-// Mark the un-padded logical W13 words this rank's packed output proves it owns
-// and verify each against the band's own source word. `covered` is indexed by
-// the global logical word id; a second write or a missing word is a partition
-// failure.
-void claim_w13(const uint32_t* packed, const uint32_t* w3, const uint32_t* w1,
-               uint32_t intermediate, uint32_t offset,
-               std::vector<uint8_t>& covered) {
-  const uint32_t kernel_intermediate = (intermediate + 127) / 128 * 128;
-  const uint32_t n_tiles = (2 * kernel_intermediate + 255) / 256;
-  const uint32_t k_tiles = (kHidden + 127) / 128;
-  const uint32_t words_per_row = kHidden / 8;
-  for (uint32_t nt = 0; nt < n_tiles; ++nt)
-    for (uint32_t kt = 0; kt < k_tiles; ++kt)
-      for (uint32_t idx = 0; idx < 4096; ++idx) {
-        const PayloadCoord coord = payload_coord(idx);
-        const uint32_t plane_row = nt * 256 + coord.row;
-        const uint32_t col = kt * 16 + coord.word;
-        const bool gate = plane_row >= kernel_intermediate;
-        const uint32_t half_row = gate ? plane_row - kernel_intermediate : plane_row;
-        if (half_row >= intermediate) continue;  // padded N row
-        if (col >= words_per_row) continue;      // K tail (never occurs at 384/576/etc.)
-        // The logical W13 matrix is [2*intermediate, hidden]: the up half (W3)
-        // occupies rows [0, intermediate) and the gate half (W1) rows
-        // [intermediate, 2*intermediate). The destination's plane rows [0,640)
-        // are W3 and [640,1280) are W1, so the halves must stay separate here or
-        // the two logical halves collide in the coverage map.
-        const uint32_t global_row =
-            (gate ? kFullIntermediate : 0) + offset + half_row;
-        require(global_row < 2 * kFullIntermediate,
-                "W13 band maps past the official intermediate");
-        const uint32_t global_word = global_row * words_per_row + col;
-        require(global_word < covered.size(), "W13 coverage index out of range");
-        require(covered[global_word] == 0, "W13 word claimed twice");
-        const uint32_t expected = (gate ? w1 : w3)[uint64_t(half_row) * words_per_row + col];
-        require(packed[(nt * k_tiles + kt) * 4096 + idx] == expected,
-                "W13 packed word does not match its band source");
-        covered[global_word] = 1;
+// Independent inverse map: scatter logical source words into exact resident
+// tiles and prove there are neither collisions nor unused slots.
+std::vector<uint8_t> exact_reference(bool gated, bool scales,
+    const uint8_t* first, const uint8_t* second, uint64_t bytes) {
+  constexpr uint32_t intermediate = 576;
+  const uint32_t n = gated ? intermediate : kHidden;
+  const uint32_t k = gated ? kHidden : intermediate;
+  const uint32_t divisor = scales ? 32 : 8;
+  std::vector<uint8_t> output(bytes);
+  std::vector<uint8_t> covered(bytes / (scales ? 1 : 4), 0);
+  for (uint32_t half = 0; half < (gated ? 2u : 1u); ++half)
+    for (uint32_t row = 0; row < n; ++row)
+      for (uint32_t col = 0; col < k / divisor; ++col) {
+        uint64_t dest;
+        const uint32_t rows = gated && row / 128 == 4 ? 64 : 128;
+        const uint32_t cols = !gated && col / (128 / divisor) == 4 ? 2 : 4;
+        const uint64_t base = uint64_t(half) * n * (k / divisor) + uint64_t(row / 128) * 128 * (k / divisor);
+        if (scales) {
+          dest = base + (gated ? (col / 4) * rows * 4 : (col / 4) * 512)
+                 + (row % 128) * (gated ? 4 : cols) + col % 4;
+        } else {
+          dest = base + (col / 4) * rows * 4 + (row % 128 / 32) * 128
+                 + (row % 8) * 16 + (col % 4) * 4 + (row % 32 / 8);
+        }
+        require(dest < covered.size() && !covered[dest], "exact pack is not a bijection");
+        covered[dest] = 1;
+        const uint8_t* source = half ? second : first;
+        const size_t size = scales ? 1 : 4;
+        std::memcpy(output.data() + dest * size, source + (uint64_t(row) * (k / divisor) + col) * size, size);
       }
+  for (auto value : covered) require(value == 1, "exact pack has holes");
+  return output;
 }
 
-// Same for the W2 down-projection: the K axis is the local intermediate, so the
-// padded words are `col >= intermediate/8`, and `row` is the HIDDEN row.
-void claim_w2(const uint32_t* packed, const uint32_t* w2, uint32_t intermediate,
-              uint32_t offset, std::vector<uint8_t>& covered) {
-  const uint32_t kernel_intermediate = (intermediate + 127) / 128 * 128;
-  const uint32_t n_tiles = (kHidden + 255) / 256;
-  const uint32_t k_tiles = (kernel_intermediate + 127) / 128;
-  const uint32_t local_k_words = intermediate / 8;
-  const uint32_t full_k_words = kFullIntermediate / 8;
-  for (uint32_t nt = 0; nt < n_tiles; ++nt)
-    for (uint32_t kt = 0; kt < k_tiles; ++kt)
-      for (uint32_t idx = 0; idx < 4096; ++idx) {
-        const PayloadCoord coord = payload_coord(idx);
-        const uint32_t col = kt * 16 + coord.word;
-        if (col >= local_k_words) continue;  // padded K word
-        const uint32_t hidden_row = nt * 256 + coord.row;
-        require(hidden_row < kHidden, "W2 band maps past the hidden size");
-        const uint32_t global_k = offset / 8 + col;
-        require(global_k < full_k_words, "W2 band maps past the intermediate");
-        const uint32_t global_word = hidden_row * full_k_words + global_k;
-        require(global_word < covered.size(), "W2 coverage index out of range");
-        require(covered[global_word] == 0, "W2 word claimed twice");
-        const uint32_t expected = w2[uint64_t(hidden_row) * local_k_words + col];
-        require(packed[(nt * k_tiles + kt) * 4096 + idx] == expected,
-                "W2 packed word does not match its band source");
-        covered[global_word] = 1;
-      }
-}
-
-// Exact padded-word totals for a 576 -> 640 extent, in packed coordinates.
-struct PadCounts {
-  long expected[4];
-};
-
-PadCounts expected_pad_counts(uint32_t intermediate, uint32_t kernel_intermediate) {
-  const uint32_t pad_rows = kernel_intermediate - intermediate;
-  PadCounts counts{};
-  counts.expected[0] = 2L * pad_rows * (kHidden / 8);    // W13 payload N pad
-  counts.expected[1] = 2L * pad_rows * (kHidden / 32);   // S13 scales N pad
-  counts.expected[2] = long(kHidden) * (pad_rows / 8);   // W2 payload K pad
-  counts.expected[3] = long(kHidden) * (pad_rows / 32);  // S2 scales K pad
-  return counts;
-}
-
-// Decode every destination word, count the padded words and how many are not
-// zero, and require both the exact count and all-zero contents. Slots 0/1 pad on
-// the N axis (half_row); slots 2/3 pad on the K axis (col).
-void check_padding(const std::array<std::vector<uint8_t>, 4>& actual,
-                   uint32_t intermediate, uint32_t kernel_intermediate,
-                   const std::string& name) {
-  const PadCounts expected = expected_pad_counts(intermediate, kernel_intermediate);
-  const uint32_t k_tiles = (kHidden + 127) / 128;
-  const uint32_t gated_n_tiles = (2 * kernel_intermediate + 255) / 256;
-  const uint32_t down_n_tiles = (kHidden + 255) / 256;
-  const uint32_t down_k_tiles = (kernel_intermediate + 127) / 128;
-  const uint32_t local_k_words = intermediate / 8;
-  const uint32_t local_k_scale_words = intermediate / 32;
-  long pad_words[4] = {0, 0, 0, 0};
-  long pad_nonzero[4] = {0, 0, 0, 0};
-
-  {
-    const uint32_t* w = reinterpret_cast<const uint32_t*>(actual[0].data());
-    for (uint32_t nt = 0; nt < gated_n_tiles; ++nt)
-      for (uint32_t kt = 0; kt < k_tiles; ++kt)
-        for (uint32_t idx = 0; idx < 4096; ++idx) {
-          const PayloadCoord coord = payload_coord(idx);
-          const uint32_t plane_row = nt * 256 + coord.row;
-          const uint32_t half_row =
-              plane_row >= kernel_intermediate ? plane_row - kernel_intermediate : plane_row;
-          if (half_row < intermediate) continue;
-          ++pad_words[0];
-          if (w[(nt * k_tiles + kt) * 4096 + idx] != 0) ++pad_nonzero[0];
-        }
-  }
-  {
-    const uint8_t* w = actual[1].data();
-    for (uint32_t nt = 0; nt < gated_n_tiles; ++nt)
-      for (uint32_t kt = 0; kt < k_tiles; ++kt)
-        for (uint32_t idx = 0; idx < 1024; ++idx) {
-          const uint32_t plane_row = nt * 256 + idx / 4;
-          const uint32_t half_row =
-              plane_row >= kernel_intermediate ? plane_row - kernel_intermediate : plane_row;
-          if (half_row < intermediate) continue;
-          ++pad_words[1];
-          if (w[(nt * k_tiles + kt) * 1024 + idx] != 0) ++pad_nonzero[1];
-        }
-  }
-  {
-    const uint32_t* w = reinterpret_cast<const uint32_t*>(actual[2].data());
-    for (uint32_t nt = 0; nt < down_n_tiles; ++nt)
-      for (uint32_t kt = 0; kt < down_k_tiles; ++kt)
-        for (uint32_t idx = 0; idx < 4096; ++idx) {
-          const uint32_t combined = (idx >> 2) & 31;
-          const uint32_t k32 = idx >> 10;
-          const uint32_t col = kt * 16 + k32 * 4 + (combined & 3);
-          if (col < local_k_words) continue;
-          ++pad_words[2];
-          if (w[(nt * down_k_tiles + kt) * 4096 + idx] != 0) ++pad_nonzero[2];
-        }
-  }
-  {
-    const uint8_t* w = actual[3].data();
-    for (uint32_t nt = 0; nt < down_n_tiles; ++nt)
-      for (uint32_t kt = 0; kt < down_k_tiles; ++kt)
-        for (uint32_t idx = 0; idx < 1024; ++idx) {
-          const uint32_t col = kt * 4 + idx % 4;
-          if (col < local_k_scale_words) continue;
-          ++pad_words[3];
-          if (w[(nt * down_k_tiles + kt) * 1024 + idx] != 0) ++pad_nonzero[3];
-        }
-  }
-
-  require(pad_nonzero[0] == 0 && pad_nonzero[1] == 0 && pad_nonzero[2] == 0 &&
-              pad_nonzero[3] == 0,
-          name + ": padded storage is not zero (payload " +
-              std::to_string(pad_nonzero[0]) + ", scale " + std::to_string(pad_nonzero[1]) +
-              ", W2 " + std::to_string(pad_nonzero[2]) + ", S2 " +
-              std::to_string(pad_nonzero[3]) + ")");
-  require(pad_words[0] == expected.expected[0] && pad_words[1] == expected.expected[1] &&
-              pad_words[2] == expected.expected[2] && pad_words[3] == expected.expected[3],
-          name + ": padded word counts differ from the exact extent arithmetic");
-  std::printf("%-8s intermediate=%-4u kernel=%-4u pad words W13=%ld S13=%ld W2=%ld S2=%ld "
-              "(all zero)\n",
-              name.c_str(), intermediate, kernel_intermediate, pad_words[0],
-              pad_words[1], pad_words[2], pad_words[3]);
-}
 }  // namespace
 
 int main() {
@@ -420,7 +226,7 @@ int main() {
             name + ": pack launch failed");
     check_cuda(cudaStreamSynchronize(nullptr), "synchronize");
 
-    const uint32_t kernel_intermediate = (intermediate + 127) / 128 * 128;
+    const uint32_t kernel_intermediate = static_cast<uint32_t>(sizes[0] / kHidden);
     std::vector<uint8_t> expected_w13 = reference_pack(
         /*gated=*/true, /*scales=*/false, w3.data(), w1.data(), intermediate,
         kHidden, kernel_intermediate, sizes[0] / 4);
@@ -433,6 +239,14 @@ int main() {
     std::vector<uint8_t> expected_s2 = reference_pack(
         /*gated=*/false, /*scales=*/true, s2.data(), nullptr, kHidden,
         intermediate, 0, sizes[3]);
+    if (intermediate == 576 && kernel_intermediate == 576) {
+      require(sizes[0] == 2 * weight_bytes && sizes[1] == 2 * scale_bytes &&
+              sizes[2] == weight_bytes && sizes[3] == scale_bytes, "TP4 must store exact planes");
+      expected_w13 = exact_reference(true, false, w3.data(), w1.data(), sizes[0]);
+      expected_s13 = exact_reference(true, true, s3.data(), s1.data(), sizes[1]);
+      expected_w2 = exact_reference(false, false, w2.data(), nullptr, sizes[2]);
+      expected_s2 = exact_reference(false, true, s2.data(), nullptr, sizes[3]);
+    }
     const std::vector<uint8_t>* expected[4] = {&expected_w13, &expected_s13,
                                                &expected_w2, &expected_s2};
 
@@ -452,30 +266,31 @@ int main() {
       check_cuda(cudaFree(destinations[i]), "cudaFree destination");
     }
 
-    if (kernel_intermediate != intermediate) {
-      require(intermediate == 576 && kernel_intermediate == 640,
-              name + ": unexpected padded extent");
-      check_padding(actual, intermediate, kernel_intermediate, name);
-    } else {
-      std::printf("%-8s intermediate=%-4u kernel=%-4u w13=%llu s13=%llu w2=%llu s2=%llu\n",
-                  name.c_str(), intermediate, kernel_intermediate,
-                  static_cast<unsigned long long>(sizes[0]),
-                  static_cast<unsigned long long>(sizes[1]),
-                  static_cast<unsigned long long>(sizes[2]),
-                  static_cast<unsigned long long>(sizes[3]));
-    }
+    std::printf("%-8s intermediate=%-4u kernel=%-4u w13=%llu s13=%llu w2=%llu s2=%llu\n",
+                name.c_str(), intermediate, kernel_intermediate,
+                static_cast<unsigned long long>(sizes[0]),
+                static_cast<unsigned long long>(sizes[1]),
+                static_cast<unsigned long long>(sizes[2]),
+                static_cast<unsigned long long>(sizes[3]));
 
     // TP4 four-rank logical partition: the four 576-wide bands must claim every
     // un-padded global word exactly once, and each packed word must equal the
     // band's own source word.
     if (name.rfind("band4/", 0) == 0) {
-      claim_w13(reinterpret_cast<const uint32_t*>(actual[0].data()),
-                reinterpret_cast<const uint32_t*>(w3.data()),
-                reinterpret_cast<const uint32_t*>(w1.data()), intermediate, item.offset,
-                w13_covered);
-      claim_w2(reinterpret_cast<const uint32_t*>(actual[2].data()),
-               reinterpret_cast<const uint32_t*>(w2.data()), intermediate, item.offset,
-               w2_covered);
+      // Source coordinates are the inverse of exact_reference's bijection.
+      for (uint32_t half = 0; half < 2; ++half)
+        for (uint32_t row = 0; row < intermediate; ++row)
+          for (uint32_t col = 0; col < kHidden / 8; ++col) {
+            const auto index = (uint64_t(half) * kFullIntermediate + item.offset + row) * (kHidden / 8) + col;
+            require(!w13_covered[index], "TP4 W13 overlaps");
+            w13_covered[index] = 1;
+          }
+      for (uint32_t row = 0; row < kHidden; ++row)
+        for (uint32_t col = 0; col < intermediate / 8; ++col) {
+          const auto index = uint64_t(row) * (kFullIntermediate / 8) + item.offset / 8 + col;
+          require(!w2_covered[index], "TP4 W2 overlaps");
+          w2_covered[index] = 1;
+        }
     }
   }
 
@@ -489,7 +304,7 @@ int main() {
   std::printf("band4 partition: %zu W13 + %zu W2 words covered exactly once\n",
               w13_covered.size(), w2_covered.size());
 
-  std::printf("v41 expert pack geometry selftest: ok (%zu geometries, incl. padded 576->640)\n",
+  std::printf("v41 expert pack geometry selftest: ok (%zu geometries, incl. TP4 storage contract)\n",
               sizeof(kCases) / sizeof(kCases[0]));
   return 0;
 }

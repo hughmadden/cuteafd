@@ -12,6 +12,7 @@ option(CUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT "Build full RTX backbone expert kerne
 option(CUTEAFD_ENABLE_V41_TP2_EXPERT_AOT "Build dual RTX TP2 encoder expert kernels" OFF)
 option(CUTEAFD_V41_TP2_COMPACT_EXPERIMENT "Use experimental native compact TP2 experts at capacities 1/16" OFF)
 option(CUTEAFD_V41_SPARK_COMPACT_EXPERIMENT "Use experimental compact Spark experts through two live rows" OFF)
+option(CUTEAFD_V41_EXACT_SPARK_SLICES "Build experimental exact 576-row V4.1 TP4 expert storage" OFF)
 # Opt-in replicated-group Spark TP2/TP3 expert shards. Empty (the default)
 # compiles/links no new object or symbol, so every release default behaves
 # exactly as the historical Spark TP4 shard. Set to a semicolon list of
@@ -374,6 +375,8 @@ if(CUTEAFD_ENABLE_EXL3_PACKAGES)
   include(cmake/shared/exl3.cmake)
 endif()
 add_library(cuteafd_native SHARED ${CUTEAFD_NATIVE_SOURCES})
+target_compile_definitions(cuteafd_native PRIVATE
+  CUTEAFD_V41_EXACT_SPARK_SLICES=$<BOOL:${CUTEAFD_V41_EXACT_SPARK_SLICES}>)
 if(CUTEAFD_ENABLE_EXL3_PACKAGES)
   add_dependencies(cuteafd_native cuteafd_v41_exl3_export)
 endif()
@@ -523,8 +526,8 @@ if(CUTEAFD_ENABLE_CUDA)
   add_test(NAME cuteafd_v41_expert_pack_tp3_selftest
     COMMAND cuteafd_v41_expert_pack_tp3_selftest)
   set_tests_properties(cuteafd_v41_expert_pack_tp3_selftest PROPERTIES SKIP_RETURN_CODE 77)
-  # Geometry-driven packer check: every native extent, including the padded TP4
-  # 576 -> 640 storage, in one parameterized device test.
+  # Geometry-driven packer check: every native extent, including exact TP4
+  # TP4 padded or opt-in exact 576-row storage, in one parameterized device test.
   add_executable(cuteafd_v41_expert_pack_geometry_selftest
     tests/v41_expert_pack_geometry_selftest.cc)
   target_link_libraries(cuteafd_v41_expert_pack_geometry_selftest PRIVATE cuteafd_native CUDA::cudart)

@@ -4,6 +4,11 @@
 
 namespace {
 
+#ifndef CUTEAFD_V41_EXACT_SPARK_SLICES
+#define CUTEAFD_V41_EXACT_SPARK_SLICES 0
+#endif
+constexpr bool kExactTp4Storage = CUTEAFD_V41_EXACT_SPARK_SLICES != 0;
+
 // N256/K128 lane-major representation consumed by b12x W4A8.
 template<bool Gated, bool Scales>
 __global__ void pack(const uint8_t* first, const uint8_t* second, uint8_t* output,
@@ -42,6 +47,61 @@ __global__ void pack(const uint8_t* first, const uint8_t* second, uint8_t* outpu
   }
 }
 
+// Exact TP4 layout used by both grouped slices and the compact N64-tail path.
+// FC1 stores each projection in N128 tiles (last tile N64); FC2 stores
+// N128/K128 tiles (last K tile K64). No resident payload or scale padding.
+template<bool Gated, bool Scales>
+__global__ void pack_tp4_exact(const uint8_t* first, const uint8_t* second,
+    uint8_t* output, uint32_t hidden, uint64_t count) {
+  constexpr uint32_t intermediate = 576;
+  constexpr uint32_t divisor = Scales ? 32 : 8;
+  for (uint64_t index = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < count; index += uint64_t(gridDim.x) * blockDim.x) {
+    const uint8_t* source = first;
+    uint32_t row, col;
+    if constexpr (Gated) {
+      const uint64_t half = uint64_t(intermediate) * (hidden / divisor);
+      uint64_t local = index;
+      if (local >= half) { local -= half; source = second; }
+      const uint32_t tile = local / (128 * (hidden / divisor));
+      local %= 128 * (hidden / divisor);
+      const uint32_t rows = tile == 4 ? 64 : 128;
+      if constexpr (Scales) {
+        const uint32_t kt = local / (rows * 4);
+        local %= rows * 4;
+        row = tile * 128 + local / 4;
+        col = kt * 4 + local % 4;
+      } else {
+        const uint32_t kb = local / (rows * 4);
+        local %= rows * 4;
+        const uint32_t chunk = local / 128;
+        const uint32_t lane_word = local % 128;
+        row = tile * 128 + chunk * 32 + (lane_word % 4) * 8 + lane_word / 16;
+        col = kb * 4 + (lane_word / 4) % 4;
+      }
+    } else {
+      const uint32_t nt = index / (128 * (intermediate / divisor));
+      uint32_t local = index % (128 * (intermediate / divisor));
+      if constexpr (Scales) {
+        const uint32_t kt = local / 512;
+        local %= 512;
+        const uint32_t cols = kt == 4 ? 2 : 4;
+        row = nt * 128 + local / cols;
+        col = kt * 4 + local % cols;
+      } else {
+        const uint32_t kb = local / 512;
+        local %= 512;
+        row = nt * 128 + (local / 128) * 32 + (local % 4) * 8 + (local % 128) / 16;
+        col = kb * 4 + (local / 4) % 4;
+      }
+    }
+    const uint32_t k = Gated ? hidden : intermediate;
+    if constexpr (Scales) output[index] = source[uint64_t(row) * (k / divisor) + col];
+    else reinterpret_cast<uint32_t*>(output)[index] =
+        reinterpret_cast<const uint32_t*>(source)[uint64_t(row) * (k / divisor) + col];
+  }
+}
+
 bool overlaps(const void* a, uint64_t an, const void* b, uint64_t bn) {
   const auto av = reinterpret_cast<uintptr_t>(a), bv = reinterpret_cast<uintptr_t>(b);
   return av <= bv ? bv - av < an : av - bv < bn;
@@ -51,11 +111,12 @@ bool overlaps(const void* a, uint64_t an, const void* b, uint64_t bn) {
 extern "C" int32_t cuteafd_expert_packed_sizes(uint32_t intermediate,
     uint64_t bytes[4]) {
   // Per-rank intermediate extents are multiples of 32 so the K/32 scale axis is
-  // exact; the 128 padding below is storage-only (V4.1 TP4 576 -> 640).
+  // exact. Opt-in TP4 uses its exact N64-tail representation; other geometries
+  // retain the N256/K128 pack contract.
   const uint64_t hidden = cuteafd_expert_hidden();
   if (!bytes || !intermediate || intermediate % 32 != 0 || intermediate > 8192)
     return cudaErrorInvalidValue;
-  const uint64_t padded = (intermediate + 127) / 128 * 128;
+  const uint64_t padded = kExactTp4Storage && intermediate == 576 && hidden == 5120 ? intermediate : (intermediate + 127) / 128 * 128;
   bytes[0] = padded * hidden;
   bytes[1] = padded * hidden / 16;
   bytes[2] = hidden * padded / 2;
@@ -85,6 +146,19 @@ extern "C" int32_t cuteafd_pack_expert_async(const uint8_t* const sources[6],
   }
   const uint32_t padded = (intermediate + 127) / 128 * 128;
   auto cuda_stream = static_cast<cudaStream_t>(stream);
+  if (kExactTp4Storage && intermediate == 576 && hidden == 5120) {
+    pack_tp4_exact<true, false><<<256, 256, 0, cuda_stream>>>(sources[1], sources[0], destinations[0], hidden, sizes[0] / 4);
+    auto status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    pack_tp4_exact<true, true><<<256, 256, 0, cuda_stream>>>(sources[4], sources[3], destinations[1], hidden, sizes[1]);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    pack_tp4_exact<false, false><<<256, 256, 0, cuda_stream>>>(sources[2], nullptr, destinations[2], hidden, sizes[2] / 4);
+    status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    pack_tp4_exact<false, true><<<256, 256, 0, cuda_stream>>>(sources[5], nullptr, destinations[3], hidden, sizes[3]);
+    return cudaGetLastError();
+  }
   // First half is up (W3), second half gate (W1), padded independently.
   pack<true, false><<<256, 256, 0, cuda_stream>>>(sources[1], sources[0], destinations[0],
       intermediate, hidden, padded, sizes[0] / 4);

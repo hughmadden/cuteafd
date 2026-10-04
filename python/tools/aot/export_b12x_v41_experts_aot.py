@@ -239,7 +239,9 @@ SPARK_ROLES = ("spark", "spark_tp2", "spark_tp3", "spark_tp6")
 SPARK_TP_DEGREES = {"spark": 4, "spark_tp2": 2, "spark_tp3": 3, "spark_tp6": 6}
 
 
-def export(output_dir: Path, role: str, rows: tuple[int, ...], input_format: str = "bf16", compact_live_rows: int | None = None) -> None:
+def export(output_dir: Path, role: str, rows: tuple[int, ...], input_format: str = "bf16", compact_live_rows: int | None = None, *, exact_v41_slices: bool = False) -> None:
+    if exact_v41_slices and (role != "spark" or input_format != "fp8_k32"):
+        raise ValueError("exact V4.1 storage requires FP8 Spark TP4 slices")
     if input_format not in ("bf16", "fp8_k32") or (role not in SPARK_ROLES and input_format != "bf16"):
         raise ValueError("FP8 K32 input is supported only for Spark backbone experts")
     if role in ("spark_tp2", "spark_tp3", "spark_tp6") and input_format != "fp8_k32":
@@ -264,7 +266,8 @@ def export(output_dir: Path, role: str, rows: tuple[int, ...], input_format: str
         export_slices(output_dir, rows, widths, atomic_min_capacity=256,
                       role=role, standard_names=True,
                       compact_max_capacity=16 if compact else None,
-                      compact_live_rows=compact_live_rows if compact else None)
+                      compact_live_rows=compact_live_rows if compact else None,
+                      exact_v41_slices=exact_v41_slices)
         return
     # Export requires compiler IR, which executable-only cache entries omit.
     os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
@@ -417,6 +420,7 @@ def main() -> None:
     parser.add_argument("--rows", default="1,16,80,256,1024,4096")
     parser.add_argument("--input-format", choices=("bf16", "fp8_k32"), default="bf16")
     parser.add_argument("--compact-live-rows", type=int, help="Experimental Spark live-row compact cutoff")
+    parser.add_argument("--exact-v41-slices", action="store_true", help="Experimental exact 576-row Spark TP4 storage")
     args = parser.parse_args()
     rows = tuple(int(value) for value in args.rows.split(","))
     if (
@@ -425,7 +429,7 @@ def main() -> None:
         or any(value < 1 or value > 4096 for value in rows)
     ):
         parser.error("--rows must contain distinct positive capacities up to 4096")
-    export(args.output_dir, args.role, rows, args.input_format, args.compact_live_rows)
+    export(args.output_dir, args.role, rows, args.input_format, args.compact_live_rows, exact_v41_slices=args.exact_v41_slices)
 
 
 if __name__ == "__main__":

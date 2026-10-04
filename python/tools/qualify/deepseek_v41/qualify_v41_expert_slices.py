@@ -10,6 +10,7 @@ import sys as _sys
 from pathlib import Path as _Path
 _sys.path[:0] = [str(_Path(__file__).resolve().parents[2] / _d) for _d in ("lib",)]  # sibling tool dirs
 
+import ctypes as C
 import json, hashlib, statistics, time
 from pathlib import Path
 from contextlib import ExitStack
@@ -117,7 +118,10 @@ def main():
     index = json.loads((snapshot / "model.safetensors.index.json").read_text())[
         "weight_map"
     ]
-    sizes = [3276800, 204800, 1638400, 102400]
+    packed_sizes = (C.c_uint64 * 4)()
+    check(lib.cuteafd_expert_packed_sizes(576, packed_sizes))
+    sizes = list(packed_sizes)
+    exact_storage = sizes[0] == 576 * 5120
     weights = [
         torch.empty((384, size), device="cuda", dtype=torch.uint8) for size in sizes
     ]
@@ -236,7 +240,7 @@ def main():
                 ]
                 rv = from_dlpack(reduced, assumed_align=16)
                 fn = cute.compile(
-                    V41FusedSliceKernel(width, grouped=True),
+                    V41FusedSliceKernel(width, grouped=True, exact_storage=exact_storage),
                     *args,
                     cutlass.Int32(80),
                     current_cuda_stream(),

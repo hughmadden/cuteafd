@@ -285,6 +285,12 @@ impl<'a> ExpertWeights<'a> {
         );
         let experts = info.experts as usize;
         let packer = library.v41_expert_packer(info.logical_intermediate)?;
+        let matrix = u64::from(info.hidden_size) * u64::from(info.kernel_intermediate);
+        ensure!(
+            packer.packed_bytes() == [matrix, matrix / 16, matrix / 2, matrix / 32],
+            "native expert packer/AOT storage mismatch: logical {} rows, kernel {} rows, packed {:?}; rebuild the expert package and native library together",
+            info.logical_intermediate, info.kernel_intermediate, packer.packed_bytes()
+        );
         let strides = packer.packed_bytes().map(usize::try_from);
         let mut sizes = [0usize; 4];
         for (size, stride) in sizes.iter_mut().zip(strides) {

@@ -14,12 +14,13 @@ uint32_t cuteafd_expert_hidden(void);
  * Logical intermediate must be 2304 (full RTX / coordinator), 1152 (RTX TP2 or
  * Spark TP2), 768 (Spark TP3), 576 (backbone TP4), or 384 (pure Spark TP6).
  * Every accepted extent is a multiple of 32 so the K/32 UE8M0 scale axis is
- * exact; storage is padded up to 128 along the packed axis (TP4 576 -> 640; the
- * others, including TP6 384, are already aligned).
+ * exact. CUTEAFD_V41_EXACT_SPARK_SLICES=ON builds TP4 with exact N128/K128
+ * tiles and N64/K64 tails. Default TP4 retains padded 640-row N256/K128
+ * storage; the other native roles retain their aligned N256/K128 tiles.
  * Sources are contiguous official bytes: W1, W3, W2, S1, S3, S2.
  * Destinations are distinct, 16-byte aligned device allocations with the sizes
  * returned below; source and destination storage must not overlap.
- * Representation-only transform preserves FP4/E8M0 bytes and zero-pads tails;
+ * Representation-only transform preserves FP4/E8M0 bytes;
  * caller owns all buffers and stream ordering through completion. */
 int32_t cuteafd_expert_packed_sizes(uint32_t intermediate, uint64_t bytes[4]);
 int32_t cuteafd_pack_expert_async(const uint8_t* const sources[6],

@@ -24,7 +24,7 @@ import _pinned_sparkinfer
 
 # Plan-time expert placement roles. Geometry, SM guard and native role id are
 # properties of the role, never of the live row count. `spark` is the historical
-# TP4 shard (576 padded to 640 storage); `spark_tp2`/`spark_tp3`/`spark_tp6` are
+# TP4 shard (640 rows by default; opt-in exact 576-row N64-tail storage); `spark_tp2`/`spark_tp3`/`spark_tp6` are
 # the replicated-group shards and are already 128-aligned. These pure tables are
 # the authoritative source for the export geometry and are covered by a CPU-only
 # test that needs neither torch nor CUDA.
@@ -74,8 +74,12 @@ ROLE_TP_DEGREE = {"spark": 4, "spark_tp2": 2, "spark_tp3": 3, "spark_tp6": 6,
                   "rtx_backbone": 1, "rtx_tp2": 2}
 
 
-def role_geometry(family, role):
+def role_geometry(family, role, *, exact_v41_slices=False):
     """(experts, intermediate, kernel_intermediate, topk) for one family role."""
+    if exact_v41_slices:
+        if family != "v41" or role != "spark":
+            raise ValueError("exact V4.1 storage requires the V4.1 Spark TP4 role")
+        return (384, 576, 576, 6)
     if family == "v41":
         return ROLE_GEOMETRY[role]
     shape = FAMILY_GEOMETRY[family]
@@ -86,7 +90,7 @@ def role_geometry(family, role):
     return shape["experts"], intermediate, (intermediate + 127) // 128 * 128, shape["topk"]
 
 
-def export(output, capacities, width, atomic_min_capacity=None, role="spark", *, standard_names=False, compact_max_capacity=None, compact_live_rows=None, family="v41"):
+def export(output, capacities, width, atomic_min_capacity=None, role="spark", *, standard_names=False, compact_max_capacity=None, compact_live_rows=None, family="v41", exact_v41_slices=False):
     import torch
     import cutlass
     import cutlass.cute as cute
@@ -117,7 +121,8 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
     # The role fixes the Spark TP degree at plan time and it is baked into this
     # AOT artifact; live rows are never part of the compile key.
     spark_tp_degree = SPARK_TP_DEGREE.get(role)
-    experts, intermediate, kernel_intermediate, topk = role_geometry(family, role)
+    experts, intermediate, kernel_intermediate, topk = role_geometry(family, role, exact_v41_slices=exact_v41_slices)
+    exact_storage = exact_v41_slices
     hidden = FAMILY_GEOMETRY[family]["hidden"]
     wire = hidden + hidden // 32  # FP8 E4M3 row, then one UE8M0 scale per 32 values
     if family != "v41" and (compact_max_capacity is not None or role == "spark_tp3"):
@@ -138,6 +143,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         role=role,
         family=family,
         spark_tp_degree=spark_tp_degree,
+        exact_storage=exact_storage,
         input_format="bf16" if coordinator else "fp8_k32",
         sparkinfer_revision=_pinned_sparkinfer.REVISION,
         capability=[props.major, props.minor],
@@ -204,11 +210,11 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         pipeline = (V41DraftSlicePipeline(capacity, selected_width, props.multi_processor_count)
                     if coordinator else V41SlicePipeline(capacity, selected_width, atomic_tokens=atomic,
                                                experts=experts, topk=topk, intermediate=intermediate,
-                                               hidden=hidden))
+                                               hidden=hidden, exact_storage=exact_storage))
         if compact:
             from b12x.moe._shared.kernels.v41_compact_pipeline import V41HybridPipeline
             pipeline = V41HybridPipeline(capacity, selected_width, props.multi_processor_count,
-                intermediate=intermediate, cutoff=min(capacity, compact_live_rows))
+                intermediate=intermediate, cutoff=min(capacity, compact_live_rows), exact_storage=exact_storage)
         if coordinator:
             args.insert(0, make_fake_tensor(cutlass.BFloat16, (capacity, 5120), (5120, 1), assumed_align=16))
         compiled = cute.compile(
@@ -406,6 +412,7 @@ if __name__ == "__main__":
     parser.add_argument("--atomic-min-capacity", type=int, choices=[256, 1024, 4096],
                         help="Use ABI 3 direct FP32 token accumulation at these larger capacities")
     parser.add_argument("--standard-names", action="store_true")
+    parser.add_argument("--exact-v41-slices", action="store_true", help="Experimental exact 576-row Spark TP4 storage")
     parser.add_argument("--compact-max-capacity", type=int, help="Experimental Spark/TP2 hybrid specialization up to this capacity")
     parser.add_argument("--compact-live-rows", type=int, help="Live-row cutoff within hybrid capacity; defaults to Spark 2 / RTX 8")
     args = parser.parse_args()
@@ -432,4 +439,4 @@ if __name__ == "__main__":
         parser.error(str(error))
     export(args.output_dir, capacities, width, args.atomic_min_capacity, args.role,
            standard_names=args.standard_names, compact_max_capacity=args.compact_max_capacity, compact_live_rows=args.compact_live_rows,
-           family=args.geometry)
+           family=args.geometry, exact_v41_slices=args.exact_v41_slices)
