@@ -19,6 +19,13 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
             Ok(cuteafd_loader::plan::layout::LayoutOptions {
                 rtx_bytes: vec![budget_bytes("--rtx-gib", args.rtx_gib)?; args.rtx],
                 pool_tokens: args.pool_tokens,
+                local_expert_layers: args.local_expert_layers,
+                context_tokens: args.context_tokens,
+                prefill_rows: args.prefill_rows,
+                concurrency: args.concurrency,
+                prefix_slots: args.prefix_slots,
+                native_mtp_layers: args.native_mtp_layers,
+                workspace_manifest: args.workspace_manifest.clone(),
                 drafter_bytes: if args.drafter_gib > 0.0 { budget_bytes("--drafter-gib", args.drafter_gib)? } else { 0 },
                 ..Default::default()
             })
@@ -89,6 +96,13 @@ mod tests {
             rtx_gib: 95.5,
             pool_tokens: None,
             drafter_gib: 0.0,
+            local_expert_layers: None,
+            context_tokens: 262144,
+            prefill_rows: 4096,
+            concurrency: 8,
+            prefix_slots: None,
+            native_mtp_layers: 3,
+            workspace_manifest: None,
         }
     }
 

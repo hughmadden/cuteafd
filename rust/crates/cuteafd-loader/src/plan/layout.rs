@@ -11,6 +11,9 @@ use super::{Component, ExpertPlacement, Owner, PlanReport, Status};
 use crate::serving_capacity::{CacheOptions, KvPlacement};
 use cuteafd_core::memory_layout::{size_pool, Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout, Waste};
 
+mod deepseek_v4;
+mod v41;
+
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
 
@@ -38,6 +41,18 @@ pub struct LayoutOptions {
     pub headroom_bytes: u64,
     /// Concurrent sequences (state slots = concurrency + 2).
     pub concurrency: u64,
+    /// Exact engine slots when they differ from concurrency + 2.
+    pub state_slots: Option<u64>,
+    /// Prefix mark arena slots; absent selects the family policy.
+    pub prefix_slots: Option<u64>,
+    /// Compiled context extent (RoPE and index workspaces).
+    pub context_tokens: u64,
+    /// Resident native drafter stages (zero disables optional native MTP).
+    pub native_mtp_layers: usize,
+    /// Whole routed backbone layers resident on the coordinator.
+    pub local_expert_layers: Option<usize>,
+    /// Matching image's PROGRAMS.json for exact V4 workspace geometry.
+    pub workspace_manifest: Option<std::path::PathBuf>,
 }
 
 impl Default for LayoutOptions {
@@ -47,13 +62,19 @@ impl Default for LayoutOptions {
             // 121.7 GiB GB10 minus the host OS and sparknestd measured idle (~13 GiB).
             spark_bytes: 108 * GIB,
             head_split: true,
-            prefill_rows: 4096,
+            prefill_rows: 0,
             spark_capacity_rows: 4096,
             pool_tokens: None,
             target_pool_tokens: cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS,
             drafter_bytes: 0,
             headroom_bytes: 2 * GIB,
-            concurrency: 8,
+            concurrency: 0,
+            state_slots: None,
+            prefix_slots: None,
+            context_tokens: 0,
+            native_mtp_layers: 3,
+            local_expert_layers: None,
+            workspace_manifest: None,
         }
     }
 }
@@ -159,6 +180,34 @@ pub fn family_costs(family: &str) -> FamilyCosts {
             spark_ring_bytes: gib(78),
             ..generic
         },
+        "deepseek_v4" => FamilyCosts {
+            runtime_bytes: [gib(65), gib(60), gib(60)],
+            graph_bytes: [gib(35), gib(40), gib(25)],
+            workspace_bytes: [gib(480), gib(414), gib(355)],
+            exchange_bytes: gib(31),
+            mark_slots: 18,
+            spark_workspace_bytes: gib(35),
+            spark_ring_bytes: gib(52),
+            ..generic
+        },
+        "deepseek_v41" => FamilyCosts {
+            runtime_bytes: [gib(133), gib(100), gib(100)],
+            graph_bytes: [gib(150), gib(100), gib(90)],
+            workspace_bytes: [gib(1101), gib(948), gib(570)],
+            mark_slots: 42,
+            spark_workspace_bytes: gib(21),
+            spark_ring_bytes: gib(48),
+            ..generic
+        },
+        "qwen4" => FamilyCosts {
+            runtime_bytes: [gib(91), gib(91), 0],
+            graph_bytes: [gib(50), gib(50), 0],
+            workspace_bytes: [gib(120), gib(120), 0],
+            mark_slots: 18,
+            spark_workspace_bytes: gib(56),
+            spark_ring_bytes: gib(78),
+            ..generic
+        },
         _ => generic,
     }
 }
@@ -177,6 +226,22 @@ fn share_of(family: &str, component: Component) -> Share {
 pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &super::Checkpoint,
     options: &LayoutOptions) -> MemoryLayout {
     let family = report.family.as_deref().unwrap_or("unknown");
+    let native_layers = options.native_mtp_layers.min(match model.spec().speculator.as_ref() {
+        Some(super::spec::SpeculatorSpec::Dspark { stages, .. }) => *stages,
+        Some(super::spec::SpeculatorSpec::NativeMtp { layers }) => *layers,
+        None => 0,
+    });
+    let workspace_manifest = options.workspace_manifest.as_deref().or_else(|| {
+        let path = std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json");
+        path.is_file().then_some(path)
+    }).and_then(|path| std::fs::read(path).ok()).and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let prefill_rows = if options.prefill_rows > 0 { options.prefill_rows }
+        else if family == "deepseek_v41" { 2048 }
+        else { workspace_manifest.as_ref().and_then(|m| m["capacities"]["prefill_rows"].as_u64()).unwrap_or(4096) };
+    let concurrency = if options.concurrency > 0 { options.concurrency } else if family == "deepseek_v41" { 16 } else { 8 };
+    let context_tokens = if options.context_tokens > 0 { options.context_tokens }
+        else if family == "deepseek_v4" { workspace_manifest.as_ref().and_then(|m| m["capacities"]["max_context"].as_u64()).unwrap_or(131072) }
+        else { 0 };
     let conversions = load_conversions(family, checkpoint);
     let costs = family_costs(family);
     let gpus = options.rtx_bytes.len().clamp(1, 2);
@@ -185,7 +250,7 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
     let active_gpus = if family == "qwen4" { 1 } else if split { 2 } else { 1 };
     let mut devices: Vec<DeviceLayout> = options.rtx_bytes.iter().take(gpus).enumerate()
         .map(|(index, &bytes)| DeviceLayout { kind: DeviceKind::Rtx, index: index as u32,
-            capacity_bytes: bytes.saturating_sub(options.headroom_bytes), items: Vec::new(), kv_tokens: 0 })
+            capacity_bytes: bytes.saturating_sub(if matches!(family, "deepseek_v4" | "deepseek_v41" | "qwen4") { options.headroom_bytes.max(3 * GIB) } else { options.headroom_bytes }), items: Vec::new(), kv_tokens: 0 })
         .collect();
     let mut waste = Vec::new();
     let mut notes = Vec::new();
@@ -197,29 +262,36 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
     if family == "qwen4" && gpus == 2 {
         notes.push("Qwen serves on rtx0; rtx1 is idle and contributes no KV capacity".into());
     }
-    if family.starts_with("deepseek_v4") {
-        notes.push("DeepSeek RTX expert residency and dSpark workspaces are not calibrated by this layout; the cache geometry describes the target only".into());
-    }
-    if matches!(family, "deepseek_v4" | "deepseek_v41" | "qwen4") {
-        notes.push("Total is incomplete: mapped-table staging, context tables and prefix arenas still need the concrete serving configuration".into());
-    }
-    if family == "deepseek_v41" && split {
-        notes.push("V4.1 source storage follows the 20/20 CED placement; coordinator weight ownership still uses the generic estimate".into());
-    }
+
+    let mapped: u64 = report.components.iter().filter(|c| c.component == Component::MappedTable).map(|c| c.bytes).sum();
+    if mapped > 0 { notes.push(format!("host-mapped table backing: {:.2} GiB (device budget includes staging only)", mapped as f64 / GIB as f64)); }
 
     // Coordinator weights: a family's exact resident layout where it has one,
     // else checkpoint bytes per component under the family's conversions.
-    let exact = resident_layout(family, checkpoint, if split { 2 } else { 1 });
+    let v41_weights = if family == "deepseek_v41" { v41::resident_weights(checkpoint, active_gpus, native_layers > 0) } else { None };
+    if let Some(ranks) = &v41_weights {
+        for (device, items) in devices.iter_mut().zip(ranks) { device.items.extend(items.iter().cloned()); }
+    }
+    let exact = resident_layout(family, checkpoint, if split { 2 } else { 1 }, native_layers > 0);
     if let Some(ranks) = &exact {
         for (device, rank) in devices.iter_mut().zip(ranks) {
             for (group, format, bytes) in rank {
-                let category = if group == "embedding" { Category::Embedding } else { Category::Weights };
+                let category = match group.as_str() {
+                    "embedding" => Category::Embedding,
+                    "speculator" | "speculator_expert" => Category::Drafter,
+                    "table_projection" => Category::Tables,
+                    _ => Category::Weights,
+                };
                 device.items.push(Item::new(category, group.clone(), format.clone(), *bytes, Basis::Exact));
             }
         }
     }
-    let covered = |c: Component| (exact.is_some() && !matches!(c, Component::Speculator | Component::SpeculatorExpert
-        | Component::Vision | Component::TableProjection | Component::RoutedExpert))
+    let covered = |c: Component| (v41_weights.is_some() && !matches!(c, Component::RoutedExpert | Component::MappedTable))
+        || (family.starts_with("deepseek_v4") && exact.is_some() && c == Component::Speculator)
+        || (family == "qwen4" && exact.is_some() && matches!(c, Component::Speculator | Component::TableProjection))
+        || (exact.is_some() && !matches!(c, Component::Speculator | Component::SpeculatorExpert
+        | Component::Vision | Component::TableProjection | Component::RoutedExpert)
+            && !(family.starts_with("deepseek_v4") && matches!(c, Component::Speculator | Component::SpeculatorExpert)))
         || (!costs.mtp_resident && matches!(c, Component::Speculator | Component::SpeculatorExpert));
     for component in report.components.iter()
         .filter(|c| (c.owner == Owner::Rtx
@@ -265,10 +337,31 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
             }
         }
     }
+    if family == "qwen4" && native_layers > 0 && report.placement == ExpertPlacement::Local {
+        let native_experts: u64 = report.components.iter().filter(|c| c.component == Component::SpeculatorExpert && c.status == Status::Unused)
+            .map(|c| c.bytes).sum();
+        if native_experts > 0 {
+            devices[0].items.push(Item::new(Category::Experts, "native MTP experts", "native", native_experts, Basis::Exact));
+        }
+    }
     // The drafter lives on the lead GPU (taps and head are there under a head split).
     let drafter = if options.drafter_bytes > 0 { options.drafter_bytes } else { costs.drafter_bytes };
     if drafter > 0 {
         devices[0].items.push(Item::new(Category::Drafter, "drafter", "", drafter, allowance_basis));
+    }
+
+    let v4_workspace = if family == "deepseek_v4" {
+        (|| {
+            let manifest = workspace_manifest.as_ref()?;
+            let cfg = crate::families::deepseek_v4::DeepseekV4Config::read(&checkpoint.snapshot, options.native_mtp_layers).ok()?;
+            let id = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
+            let scratch = crate::serving_capacity::deepseek_v4_workspace_scratch(manifest, id, prefill_rows, 64).ok()?;
+            crate::serving_capacity::deepseek_v4_workspace_geometry(&cfg, prefill_rows, 64,
+                context_tokens, active_gpus, scratch).ok()
+        })()
+    } else { None };
+    if family == "deepseek_v4" && v4_workspace.is_none() {
+        notes.push("V4 workspace allowance is estimated without a matching PROGRAMS.json; use --workspace-manifest for Flash/Pro allocation geometry".into());
     }
 
     // Fixed runtime costs.
@@ -278,19 +371,89 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
         device.items.push(Item::new(Category::Runtime, "context+modules", "", costs.runtime_bytes[role],
             allowance_basis));
         device.items.push(Item::new(Category::Runtime, "graph allowance", "", costs.graph_bytes[role], allowance_basis));
-        let workspace = costs.workspace_bytes[role] * options.prefill_rows.max(1) / 4096;
-        device.items.push(Item::new(Category::Workspace, "steps", "", workspace, allowance_basis));
+        let workspace = v4_workspace.as_ref().and_then(|ranks| ranks.get(index)).map_or_else(
+            || costs.workspace_bytes[role] * prefill_rows.max(1) / if family == "deepseek_v41" { 2048 } else { 4096 },
+            |rank| rank.fixed_device_bytes);
+        if family == "deepseek_v4" {
+            // --reserve-gib 10 covers the future workspace and graph budget;
+            // admission keeps the unused remainder, with a 3 GiB floor.
+            let headroom = (10 * GIB).saturating_sub(workspace + costs.graph_bytes[role])
+                .max(options.headroom_bytes).max(3 * GIB);
+            device.capacity_bytes = options.rtx_bytes[index].saturating_sub(headroom);
+        }
+        let workspace_basis = if v4_workspace.is_some() { Basis::Formula } else { allowance_basis };
+        device.items.push(Item::new(Category::Workspace, "steps", "", workspace, workspace_basis));
         if split {
             device.items.push(Item::new(Category::Transport, "peer exchange", "", costs.exchange_bytes, allowance_basis));
         }
     }
 
+    // Resident V4.1 layers are taken out of Spark slices; V4 retains the complete
+    // target on Sparks even when RTX also holds a layer. Experts are charged
+    // before the KV pool. Explicit placement is reproducible on any inventory.
+    let routed_bytes: u64 = report.components.iter().filter(|c| c.component == Component::RoutedExpert)
+        .map(|c| c.bytes).sum();
+    let layer_bytes = routed_bytes / model.spec().layers.len().max(1) as u64;
+    let mut local_layers = if family.starts_with("deepseek_v4") {
+        options.local_expert_layers.unwrap_or(0).min(model.spec().layers.len())
+    } else { 0 };
+    let draft_experts: u64 = if family == "deepseek_v4" && native_layers > 0 {
+        report.components.iter().filter(|c| c.component == Component::SpeculatorExpert).map(|c| c.bytes).sum()
+    } else { 0 };
+    if draft_experts > 0 {
+        devices[0].items.push(Item::new(Category::Experts, "dSpark stage experts", "native", draft_experts, Basis::Exact));
+    }
+    if family == "deepseek_v4" && options.local_expert_layers.is_none() && layer_bytes > 0 {
+        if let Ok(Some(cache)) = model.cache_geometry(CacheOptions { coordinator_ranks: active_gpus,
+            native_mtp_layers: native_layers, prefill_rows: prefill_rows, ..Default::default() }) {
+            let mark_bytes: u64 = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum();
+            let slots = options.prefix_slots.unwrap_or(42.min(2 * GIB / mark_bytes.max(1)).max(2 * concurrency + 2));
+            let state = cache.ranks[0].active_state_per_sequence_bytes * options.state_slots.unwrap_or(concurrency)
+                + cache.ranks[0].fixed_state_bytes + cache.ranks[0].context_table_bytes_per_token * context_tokens;
+            let role = if active_gpus == 1 { 0 } else { 1 };
+            let workspaces: u64 = devices[0].items.iter().filter(|i| i.group == "steps").map(|i| i.bytes).sum();
+            let already = devices[0].used_bytes().saturating_sub(workspaces + costs.graph_bytes[role]);
+            let legacy = cache.ranks[0].persistent_unit_bytes * 262144u64.div_ceil(cache.logical_unit_rows);
+            let reserve = state + legacy + slots * mark_bytes + 10 * GIB + 160 * MIB;
+            local_layers = (options.rtx_bytes[0].saturating_sub(already + reserve) / layer_bytes)
+                .min(model.spec().layers.len() as u64) as usize;
+        }
+    }
+    let mut local_bytes = layer_bytes * local_layers as u64;
+    if local_bytes > 0 && !matches!(report.placement, ExpertPlacement::Local) {
+        if family == "deepseek_v41" && gpus == 2 {
+            for device in devices.iter_mut().take(2) {
+                device.items.push(Item::new(Category::Experts, "resident routed layers", "native-tp2", local_bytes / 2, Basis::Formula));
+            }
+        } else {
+            devices[0].items.push(Item::new(Category::Experts, "resident routed layers", "native", local_bytes, Basis::Exact));
+        }
+    }
+
+    if family == "deepseek_v4" && local_bytes + draft_experts > 0 {
+        devices[0].items.push(Item::new(Category::Experts, "local expert workspace", "", 160 * MIB * prefill_rows / 4096, Basis::Estimated));
+    }
+
     // KV pool: per-device bytes per logical token from the family geometry.
     let geometry = model.cache_geometry(CacheOptions { coordinator_ranks: active_gpus,
-        prefill_rows: options.prefill_rows, ..Default::default() });
+        native_mtp_layers: if family == "deepseek_v4" || family == "qwen4" { native_layers } else { 0 },
+        prefill_rows: prefill_rows, ..Default::default() });
     let mut pool_tokens = 0;
     match geometry {
-        Ok(Some(geometry)) => {
+        Ok(Some(mut geometry)) => {
+            for rank in &mut geometry.ranks {
+                rank.pool_metadata_unit_bytes += match family {
+                    "deepseek_v4" => (2 * prefill_rows + 64) * 4,
+                    "qwen4" => (1 + 64) * 5 * 4,
+                    _ => 0,
+                };
+            }
+            let marks = options.prefix_slots.unwrap_or_else(|| {
+                if matches!(family, "deepseek_v4" | "qwen4") {
+                    let bytes: u64 = geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum();
+                    42.min((2 * GIB) / bytes.max(1)).max(2 * concurrency + 2)
+                } else { costs.mark_slots }
+            });
             let unit = geometry.logical_unit_rows.max(1);
             let per_token: Vec<u64> = (0..devices.len()).map(|d| geometry.ranks.get(d)
                 .map_or(0, |r| (r.persistent_unit_bytes + r.pool_metadata_unit_bytes).div_ceil(unit))).collect();
@@ -298,16 +461,26 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
             // an automatic pool consumes the bytes those allocations need.
             for (device, rank) in devices.iter_mut().zip(&geometry.ranks) {
                 device.items.push(Item::new(Category::Kv, "state", "", rank.fixed_state_bytes
-                    + rank.active_state_per_sequence_bytes * (options.concurrency + 2)
-                    + rank.speculative_replay_bytes, Basis::Formula));
-                if costs.mark_slots > 0 && rank.retained_mark_bytes > 0 {
-                    device.items.push(Item::new(Category::Prefix, "marks", "", rank.retained_mark_bytes * costs.mark_slots,
+                    + rank.active_state_per_sequence_bytes * options.state_slots.unwrap_or(if matches!(family, "qwen4" | "deepseek_v4") { concurrency } else { concurrency + 2 })
+                    + rank.speculative_replay_bytes + rank.context_table_bytes_per_token * context_tokens, Basis::Formula));
+                if family != "deepseek_v41" && marks > 0 && rank.retained_mark_bytes > 0 {
+                    device.items.push(Item::new(Category::Prefix, "marks", "", rank.retained_mark_bytes * marks,
                         Basis::Formula));
+                }
+            }
+            if family == "deepseek_v41" {
+                let prefixes = v41::prefix_bytes(20, native_layers > 0, active_gpus);
+                for (device, &bytes) in devices.iter_mut().zip(&prefixes) {
+                    device.items.push(Item::new(Category::Prefix, "snapshot arenas", "", bytes, Basis::Formula));
+                    device.items.push(Item::new(Category::Kv, "active and retained COW tails", "", geometry.ranks[device.index as usize].persistent_unit_bytes * (concurrency + 40), Basis::Formula));
+                }
+                if native_layers > 0 {
+                    devices[active_gpus - 1].items.push(Item::new(Category::Drafter, "dSpark window state", "", v41::dspark_cache_bytes(concurrency, prefill_rows), Basis::Formula));
                 }
             }
             let free: Vec<i64> = devices.iter().map(DeviceLayout::free_bytes).collect();
             pool_tokens = options.pool_tokens.filter(|&tokens| tokens != 0)
-                .unwrap_or_else(|| size_pool(&free, &per_token, unit, options.target_pool_tokens));
+                .unwrap_or_else(|| size_pool(&free, &per_token, unit, if family == "deepseek_v41" { v41::DEFAULT_POOL_TOKENS } else { options.target_pool_tokens }));
             for (device, &cost) in devices.iter_mut().zip(&per_token) {
                 if cost > 0 {
                     let units = pool_tokens.div_ceil(unit);
@@ -329,9 +502,20 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
         Err(error) => notes.push(format!("{family}: cache geometry: {error}")),
     }
 
+    if family == "deepseek_v41" && options.local_expert_layers.is_none() && layer_bytes > 0 {
+        let per_gpu = if active_gpus == 2 { layer_bytes / 2 } else { layer_bytes };
+        let room = devices.iter().take(active_gpus).map(|d| d.free_bytes().max(0) as u64).min().unwrap_or(0);
+        local_layers = (room.saturating_sub(512 * MIB) / per_gpu).min(model.spec().layers.len() as u64) as usize;
+        local_bytes = layer_bytes * local_layers as u64;
+        for device in devices.iter_mut().take(active_gpus) {
+            device.items.push(Item::new(Category::Experts, "resident routed layers", "native", per_gpu * local_layers as u64 + 256 * MIB, Basis::Formula));
+        }
+    }
+    if local_layers > 0 { notes.push(format!("{local_layers} routed backbone layers resident on RTX")); }
+
     // Spark ranks.
     if let ExpertPlacement::Sparks { ranks } = report.placement {
-        let routed: u64 = report.components.iter().filter(|c| c.owner == Owner::SparkSliced).map(|c| c.bytes).sum();
+        let routed: u64 = report.components.iter().filter(|c| c.owner == Owner::SparkSliced && c.component != Component::SpeculatorExpert).map(|c| c.bytes).sum::<u64>().saturating_sub(if family == "deepseek_v41" { local_bytes } else { 0 });
         let stored = (routed as f64 * report.spark_rank_share) as u64;
         let even = routed / ranks.max(1) as u64;
         // EXL3 packages and FP8/MXFP4/NVFP4 packages with exact layouts store each
@@ -352,6 +536,12 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
             let stored = rank_bytes(rank);
             let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: options.spark_bytes,
                 items: Vec::new(), kv_tokens: 0 };
+            if matches!(family, "deepseek_v4" | "deepseek_v41" | "qwen4") {
+                // A GB10 CUDA sample includes host OS and sparknestd. The
+                // supplied Spark inventory is usable memory after this reserve.
+                device.capacity_bytes += 13 * GIB;
+                device.items.push(Item::new(Category::Reserved, "host OS+sparknestd", "", 13 * GIB, Basis::Calibrated));
+            }
             let format = report.components.iter().find(|c| c.owner == Owner::SparkSliced)
                 .map(|c| c.formats.keys().cloned().collect::<Vec<_>>().join("+")).unwrap_or_default();
             device.items.push(Item::new(Category::Experts, "routed_expert", format, stored, Basis::Exact));
@@ -438,10 +628,26 @@ fn load_conversions(family: &str, checkpoint: &super::Checkpoint) -> Vec<Convers
 /// Exact per-rank resident weights `(group, format, bytes)` for families
 /// whose loader publishes its resident layout (MiMo: the codex capacity
 /// contract's `MimoResidentLayout`, with the default weight policy).
-fn resident_layout(family: &str, checkpoint: &super::Checkpoint, ranks: usize) -> Option<Vec<Vec<(String, String, u64)>>> {
+fn resident_layout(family: &str, checkpoint: &super::Checkpoint, ranks: usize, mtp: bool) -> Option<Vec<Vec<(String, String, u64)>>> {
     use crate::families::mimo_v2::projection::MimoProjectionRepresentation as R;
     use crate::families::mimo_v2::resident::{MimoResidentLayout, MimoResidentOptions};
     use crate::families::mimo_v2::weight_policy::{default_policy, MimoDefaultPolicy};
+    if family == "qwen4" {
+        use crate::families::qwen4::{Qwen4Config, resident::{checkpoint_resident_bytes, Qwen4Representation}};
+        let cfg = Qwen4Config::from_hf(&checkpoint.config).ok()?;
+        let mtp = mtp && cfg.mtp_layers > 0;
+        let bytes = checkpoint_resident_bytes(checkpoint, &cfg, cfg.layers, mtp,
+            Qwen4Representation { fp8_projections: false, fp8_head: true }).ok()?;
+        return Some(vec![vec![
+            ("target incl PLE projections".into(), "bf16+f32".into(), bytes.target_bytes),
+            ("embedding".into(), "bf16".into(), bytes.embedding_bytes),
+            ("lm_head".into(), "fp8-row128".into(), bytes.head_bytes),
+            ("speculator".into(), "bf16+f32".into(), bytes.mtp_bytes),
+        ]]);
+    }
+    if family == "deepseek_v4" {
+        return deepseek_v4::resident_weights(checkpoint, ranks);
+    }
     if family != "mimo_v2" {
         return None;
     }

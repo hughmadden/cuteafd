@@ -10,9 +10,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 mod deepseek;
-#[cfg(test)]
-#[path = "plan/layout/v41.rs"]
-mod v41_layout_tests;
+mod v4_workspace;
+pub use v4_workspace::{deepseek_v4_workspace_geometry, deepseek_v4_workspace_scratch, V4WorkspaceRank, V4WorkspaceScratch};
 pub use deepseek::{deepseek_v41_cache_bytes, deepseek_v41_cache_geometry, deepseek_v41_pool_groups,
     deepseek_v4_cache_geometry};
 

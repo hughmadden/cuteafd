@@ -11,6 +11,7 @@ pub(crate) struct Shape {
     pub max_context: usize,
     pub reserve_bytes: u64,
     pub prefix_bytes: Vec<u64>,
+    pub workspace_bytes: Option<Vec<u64>>,
 }
 
 /// Modules and weights already appear in each sample's non-engine usage.
@@ -35,13 +36,16 @@ pub(crate) fn profile(geometry: &FamilyCacheGeometry, memory: &[DeviceMemory], s
             .context("V4 state overflow")?;
         let context = cache.context_table_bytes_per_token.checked_mul(shape.max_context as u64)
             .context("V4 context tables overflow")?;
+        let workspace = shape.workspace_bytes.as_ref().and_then(|ranks| ranks.get(rank)).copied()
+            .unwrap_or(costs.workspace_bytes[role] * shape.prefill_rows as u64 / 4096);
+        let headroom = shape.reserve_bytes.saturating_sub(workspace + costs.graph_bytes[role]).max(3 << 30);
         let mut reservations = vec![
             reservation("active window/compressor state and partial units", state),
             reservation("RoPE context tables", context),
             reservation("prefix mark arena", shape.prefix_bytes[rank]),
-            reservation("workspaces", costs.workspace_bytes[role] * shape.prefill_rows as u64 / 4096),
+            reservation("workspaces", workspace),
             reservation("future graphs", costs.graph_bytes[role]),
-            reservation("workspace and headroom reserve", shape.reserve_bytes.max(3 << 30)),
+            reservation("workspace and headroom reserve", headroom),
         ];
         if memory.len() == 2 { reservations.push(reservation("peer exchange", costs.exchange_bytes)); }
         if rank == 0 { reservations.push(reservation("RTX experts and loading peak", local_bytes)); }
@@ -75,7 +79,7 @@ mod tests {
         let memory: Vec<_> = [0, 7].into_iter().map(|device| DeviceMemory { device,
             total_bytes: 96 << 30, baseline_free_bytes: 16 << 30 }).collect();
         let shape = Shape { sequences: 8, prefill_rows: 4096, decode_rows: 64, max_context: 262144,
-            reserve_bytes: 3 << 30, prefix_bytes: vec![0, 8 << 30] };
+            reserve_bytes: 3 << 30, prefix_bytes: vec![0, 8 << 30], workspace_bytes: None };
         let profile = profile(&geometry, &memory, &shape, 1 << 30).unwrap();
         assert_eq!(profile.devices[0].pool_unit_bytes, (1 << 20) + (8192 + 64) * 4);
         let resolved = resolve(&profile, &memory, 8).unwrap();

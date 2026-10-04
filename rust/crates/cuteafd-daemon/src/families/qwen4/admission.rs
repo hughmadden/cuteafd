@@ -16,7 +16,7 @@ pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, cfg: &Qwen
         + costs.graph_bytes[0]
         + rank.active_state_per_sequence_bytes * args.slots as u64
         + rank.fixed_state_bytes + rank.speculative_replay_bytes + marks
-        + cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes;
+        + cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes.max(3 << 30);
     // Prefill owns one page table and decode owns 64, each with four record
     // page ids plus one pool page id per 256-token allocation unit.
     let context_tables_per_unit = (1 + super::engine::DECODE_ROWS as u64) * 5 * 4;

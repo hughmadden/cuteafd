@@ -262,16 +262,24 @@ pub(crate) fn with_engine<T>(
         let slots = prefix.filter(|p| p.prefix_cache_entries > 0).map_or(0, |p|
             cuteafd_engine::prefix::MarkArena::slots_for(args.max_sequences, p.prefix_cache_entries,
                 mark as usize, p.prefix_cache_mark_mib << 20));
+        let scratch = cuteafd_loader::serving_capacity::deepseek_v4_workspace_scratch(
+            &loaded.manifest, loaded.family, prefill_rows as u64, decode_rows as u64)?;
+        let workspace = cuteafd_loader::serving_capacity::deepseek_v4_workspace_geometry(
+            &cache_cfg, prefill_rows as u64, decode_rows as u64, max_context as u64, devices.len(), scratch)?;
         let shape = admission::Shape { sequences: args.max_sequences, prefill_rows, decode_rows, max_context,
             reserve_bytes: (args.reserve_gib as u64) << 30,
-            prefix_bytes: geometry.ranks.iter().map(|r| r.retained_mark_bytes * slots as u64).collect() };
-        let fixed = admission::profile(&geometry, &memory, &shape, 0)?;
-        let lead = cuteafd_core::serving_capacity::admit_device_reservations(100, memory[0],
-            &fixed.devices[0].reservations)?;
-        // Freeze today's automatic expert placement using its historical KV
-        // target first. The automatic KV pool receives only the remaining bytes.
-        let legacy_pool = fixed.devices[0].pool_unit_bytes * 262_144u64.div_ceil(fixed.pool_unit_rows);
-        let expert_budget = usize::try_from(lead.unused_budget_bytes.saturating_sub(legacy_pool))?;
+            prefix_bytes: geometry.ranks.iter().map(|r| r.retained_mark_bytes * slots as u64).collect(),
+            workspace_bytes: Some(workspace.iter().map(|r| r.fixed_device_bytes).collect()) };
+        // Preserve the pre-existing placement policy: caches and peer slots
+        // are live before local loading, while the single reserve covers its
+        // future workspace and runtime. Full admission follows this selection.
+        let rank = &geometry.ranks[0];
+        let legacy_state = rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * args.max_sequences as u64
+            + rank.context_table_bytes_per_token * max_context as u64;
+        let legacy_pool = rank.persistent_unit_bytes * 262_144u64.div_ceil(geometry.logical_unit_rows);
+        let peer = if devices.len() == 2 { cuteafd_loader::plan::layout::family_costs("deepseek_v4").exchange_bytes } else { 0 };
+        let expert_budget = usize::try_from(memory[0].baseline_free_bytes.saturating_sub(
+            legacy_state + legacy_pool + peer + shape.prefix_bytes.iter().sum::<u64>() + shape.reserve_bytes))?;
         let stages = if args.dspark { cache_stages } else { 0 };
         let local = if args.skip_routed_experts { local::LocalPlan { layers: 0, peak_bytes: 0 } }
             else { local::plan(&loaded.library, &args.native_lib, &loaded.catalog, stages,

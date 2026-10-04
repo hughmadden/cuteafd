@@ -446,6 +446,22 @@ SPARK_COUNT={spark_count}
         # three optional RDMA env values.
         self.assertTrue(all(args[-8] == "0" for tool, args in events if tool == "ssh" and "-s" in args))
 
+    def test_planner_pool_is_forwarded_only_when_selected(self) -> None:
+        for setting, expected in [("", None), ("auto", "0"), ("123456", "123456")]:
+            with self.subTest(setting=setting):
+                result, events = self.run_startup(
+                    gpus=2,
+                    plan=dict(version=1, rtx_gpus=2, nonce="fresh", rtx_expert_layers=20, spark_first_layer=20),
+                    topology_explicit=0, spark_tp=4, spark_ep=1, spark_count=4,
+                    hosts=["a", "b", "c", "d"], extra_setup=f"POOL_TOKENS={setting}\n",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                coordinator = next(args for tool, args in events if tool == "docker" and args[0] == "run")
+                if expected is None:
+                    self.assertNotIn("--pool-tokens", coordinator)
+                else:
+                    self.assertEqual(coordinator[coordinator.index("--pool-tokens") + 1], expected)
+
     def test_explicit_topology_reaches_coordinator_and_every_worker(self) -> None:
         result, events = self.run_startup(
             gpus=2,

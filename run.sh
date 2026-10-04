@@ -28,6 +28,7 @@ Command-line values override cuteafd.config for this launch.
   --concurrency N               active requests, 1..16 (default 16)
   --http-queue-depth N          buffered jobs and maximum extra waiters (default concurrency)
   --http-queue-wait-ms N        queue-space wait budget (default 25000)
+  --pool-tokens auto|N         planner KV admission (opt-in; 0 means auto)
   --kv-pool-size SIZE           exact KV/index pool, e.g. 22.5GB
   --host-cache-bytes auto|SIZE  pinned RAM cache; 0 disables (default auto)
   --memory-reservation SIZE     total GPU ceiling, e.g. 90% or 80GiB
@@ -77,6 +78,7 @@ while [[ $# -gt 0 ]]; do
     --rtx-expert-layers) overrides[RTX_EXPERT_LAYERS]="${2:?$1 requires auto or N}"; shift 2 ;;
     --concurrency) overrides[CONCURRENCY]="${2:?$1 requires N}"; shift 2 ;;
     --host-cache-bytes) overrides[HOST_CACHE_BYTES]="${2:?$1 requires auto or SIZE}"; shift 2 ;;
+    --pool-tokens) overrides[POOL_TOKENS]="${2:?$1 requires auto or N}"; shift 2 ;;
     --kv-pool-size) overrides[KV_POOL_SIZE]="${2:?$1 requires SIZE}"; shift 2 ;;
     --memory-reservation) overrides[MEMORY_RESERVATION]="${2:?$1 requires SIZE}"; shift 2 ;;
     --prefix-cache-entries) overrides[PREFIX_CACHE_ENTRIES]="${2:?$1 requires N}"; shift 2 ;;
@@ -518,6 +520,10 @@ args+=(--http-queue-depth "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" --http-queue-wait-
 [[ "$RTX_EXPERT_LAYERS" == auto ]] || args+=(--rtx-expert-layers "$RTX_EXPERT_LAYERS")
 [[ "$HOST_CACHE_BYTES" == 0 ]] || args+=(--host-cache-bytes "$HOST_CACHE_BYTES")
 [[ -z "$KV_POOL_SIZE" ]] || args+=(--kv-pool-size "$KV_POOL_SIZE")
+if [[ -n "${POOL_TOKENS:-}" ]]; then
+  planner_tokens="$POOL_TOKENS"; [[ "$planner_tokens" != auto ]] || planner_tokens=0
+  args+=(--pool-tokens "$planner_tokens")
+fi
 [[ -z "$MEMORY_RESERVATION" ]] || args+=(--memory-reservation "$MEMORY_RESERVATION")
 [[ "$DSPARK" != on ]] || args+=(--dspark)
 [[ "$DSPARK" != on || "$DSPARK_DRAFT_POLICY" != full ]] || args+=(--dspark-fixed)

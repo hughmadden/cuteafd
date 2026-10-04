@@ -503,4 +503,5 @@ def test_glmf_pool_defaults_to_the_planned_pool(tmp_path: Path) -> None:
         assert flag in launch, launch
     bad = _family_launch_lines(tmp_path / "dsv4", {"model_type": "deepseek_v4"},
                                "deepseek-ai/DeepSeek-V4-Flash-0731", "POOL_TOKENS=auto\n")
-    assert "POOL_TOKENS=auto is supported" in bad
+    assert "cuteafd serve-dsv4" in bad
+    assert "--pool-tokens 0" in bad

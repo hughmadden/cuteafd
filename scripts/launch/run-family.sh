@@ -212,7 +212,7 @@ if [[ $family == qwen4 ]]; then
     esac
   done
 fi
-# POOL_TOKENS=auto (GLM 5.3, GLM 5.3 Flash, MiMo): the largest pool the GPUs hold after the
+# POOL_TOKENS=auto (GLM 5.3, GLM 5.3 Flash, MiMo, Qwen, DeepSeek V4): the largest pool the GPUs hold after the
 # planner's remaining costs (up to 2M tokens).
 # GLM 5.3 defaults to auto (bounded decode graphs captured at startup: 262144 -> 1,292,672 tokens on
 # 2 RTX + 6 Sparks, C1/C4/8K prefill unchanged); Qwen and DeepSeek V4 keep their engine defaults.
@@ -220,7 +220,6 @@ glm_default=""; [[ $family != glm5 ]] || glm_default=auto
 if [[ $family =~ ^(glm5|qwen4|deepseek_v4)$ && -n "$(get POOL_TOKENS "$glm_default")" ]]; then
   pool="$(get POOL_TOKENS "$glm_default")"
   if [[ "$pool" == auto ]]; then
-    [[ $family == glm5 ]] || { echo "POOL_TOKENS=auto is supported for GLM 5.3, GLM 5.3 Flash and MiMo" >&2; exit 2; }
     pool=0
   fi
   family_args+=(--pool-tokens "$pool")
