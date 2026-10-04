@@ -168,7 +168,7 @@ fn serve_loop(
         let mark = Dsv4Prefix::mark_bytes_of(engine)?;
         Ok(mark_slots(engine, &prefix, mark) * mark)
     };
-    let result = with_engine(&loaded, &args, arena, |engine, transports, runtime| {
+    let result = with_engine(&loaded, &args, Some(&prefix), arena, |engine, transports, runtime| {
         if engine.skip_routed {
             tracing::warn!("serve-dsv4 --skip-routed-experts: replies do not match the model (plumbing and cache gates only)");
         }

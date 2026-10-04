@@ -65,6 +65,59 @@ pub(crate) struct LocalExperts<'a> {
     device: i32,
 }
 
+/// Admission for complete local layers, using the same package and weight
+/// plans as loading. Peak includes the transient device staging of the last
+/// layer; the KV pool must leave those bytes available during onboarding.
+pub(crate) struct LocalPlan {
+    pub layers: usize,
+    pub peak_bytes: usize,
+}
+
+pub(crate) fn plan(library: &NativeLibrary, native_lib: &Path, catalog: &OfficialV41Catalog,
+    draft_stages: usize, max_layers: usize, max_rows: usize, budget: usize) -> Result<LocalPlan> {
+    let shape = *catalog.routed_experts();
+    let empty = || LocalPlan { layers: 0, peak_bytes: 0 };
+    if max_layers <= shape.first_layer && draft_stages == 0 { return Ok(empty()); }
+    let capacities: Vec<u32> = CAPACITIES.iter().copied().filter(|&c| c as usize <= max_rows.max(1))
+        .chain(CAPACITIES.iter().copied().find(|&c| c as usize >= max_rows)).collect();
+    let workspace = if let Some(manifest) = catalog.exl3() {
+        let directory = aot_layout_directory(native_lib, manifest.decoder_tiers(), "rtx-tp1");
+        let directories: Vec<_> = capacities.iter().map(|c| directory.join(format!("m{c}"))).collect();
+        if directories.iter().any(|d| !d.join("v41_exl3.json").is_file()) { return Ok(empty()); }
+        Exl3Workspace::plan(&directories, Exl3InputFormat::Fp8K32)? + max_rows * shape.hidden * 2
+    } else {
+        let mut scratch = 0;
+        for capacity in capacities {
+            let Ok(kernel) = library.v41_local_expert_kernel(capacity) else { return Ok(empty()); };
+            scratch = scratch.max(usize::try_from(kernel.info().scratch_bytes)?);
+        }
+        scratch + max_rows * (shape.hidden * 2 + shape.topk * 8)
+    };
+    let weight_plan = |layer| -> Result<_> {
+        if catalog.exl3().is_some() { Exl3Weights::plan(catalog, layer) }
+        else { ExpertWeights::plan(library, catalog, layer) }
+    };
+    let (mut resident, mut peak) = (workspace, workspace);
+    for stage in 0..draft_stages {
+        let selection = if catalog.exl3().is_some() { ExpertLayer::Dspark { stage } }
+            else { ExpertLayer::BackboneFull { layer: shape.layers + stage } };
+        let weights = weight_plan(selection)?;
+        peak = peak.max(resident.checked_add(weights.peak_device_bytes()?).context("local expert peak overflow")?);
+        ensure!(peak <= budget, "dSpark stage {stage} experts need {peak} bytes, budget is {budget}");
+        resident = resident.checked_add(weights.resident_bytes).context("local expert resident overflow")?;
+    }
+    let mut layers = 0;
+    for layer in shape.first_layer..max_layers.min(shape.layers) {
+        let weights = weight_plan(ExpertLayer::BackboneFull { layer })?;
+        let next_peak = peak.max(resident.checked_add(weights.peak_device_bytes()?).context("local expert peak overflow")?);
+        if next_peak > budget { break; }
+        peak = next_peak;
+        resident = resident.checked_add(weights.resident_bytes).context("local expert resident overflow")?;
+        layers += 1;
+    }
+    Ok(if layers == 0 && draft_stages == 0 { empty() } else { LocalPlan { layers, peak_bytes: peak } })
+}
+
 impl<'a> LocalExperts<'a> {
     /// Loads the first `draft_stages` dSpark stages, then backbone layers from
     /// the model's first routed layer while they fit in `budget` bytes
