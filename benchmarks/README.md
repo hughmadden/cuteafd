@@ -33,8 +33,8 @@ Reports from `cuteafd bench` (profiles other than the basic one run when asked).
 
 ## MiMo V2
 
-- 2026-10-02 · Release smoke · XiaomiMiMo/MiMo-V2.6-Pro-RL · 2× RTX PRO 6000 @ 325 W + 6× DGX Spark · build v0.1.0 · [report](mimo_v2/2026-10-02-smoke-mimo-v2-6-pro-rl-2rtx-6spark/report.svg) · ⚠ quality gate failed
-- 2026-10-02 · Release smoke · XiaomiMiMo/MiMo-V2.6-Pro-RL · 1× RTX PRO 6000 @ 325 W + 6× DGX Spark · build v0.1.0 · [report](mimo_v2/2026-10-02-smoke-mimo-v2-6-pro-rl-1rtx-6spark/report.svg) · ⚠ quality gate failed
+- 2026-10-04 · Release smoke · XiaomiMiMo/MiMo-V2.6-Pro-MOPD · 2× RTX PRO 6000 @ 325 W + 6× DGX Spark · build mopd-319ccdb · [report](mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-2rtx-6spark/report.svg)
+- 2026-10-04 · Release smoke · XiaomiMiMo/MiMo-V2.6-Pro-MOPD · 1× RTX PRO 6000 @ 325 W + 6× DGX Spark · build mopd-319ccdb · [report](mimo_v2/2026-10-04-smoke-mimo-v2-6-pro-mopd-1rtx-6spark/report.svg)
 - 2026-10-02 · Release smoke · XiaomiMiMo/MiMo-V2-Flash · 2× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v0.1.0 · [report](mimo_v2/2026-10-02-smoke-mimo-v2-flash-2rtx-4spark/report.svg)
 - 2026-10-02 · Release smoke · XiaomiMiMo/MiMo-V2-Flash · 1× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v0.1.0 · [report](mimo_v2/2026-10-02-smoke-mimo-v2-flash-1rtx-4spark/report.svg)
 
