@@ -20,7 +20,15 @@
 //! NVFP4, layers 0-2) stays NVFP4: `nvfp4_w{1,3,2}` packed E2M1 and
 //! `nvfp4_s{1,3,2}` its E4M3 scales then FP32 weight_scale_2 and input_scale,
 //! the one-expert layout of the `fp8-glmfdense-nvfp4` package.
+//!
+//! Two-GPU head split ([`GlmfLoader::peers`]): rank `r` takes KDA heads and MLA heads
+//! `r * N / 2 ..` (their in-projection, conv, gate, decay and state rows, q_b rows, W_UK / W_UV
+//! heads and o_proj columns) and the matching half of the dense and shared-expert intermediate;
+//! every rank the mHC weights, norms, the replicated low-rank KDA gates (`f_a`, `g_a`), the MLA
+//! latent projection (`q_a | kv_a`) and the DSA indexer; rank 0 the router. A ModelOpt NVFP4
+//! dense MLP stays whole on rank 0 (its package has no half geometry).
 use crate::shared::memory::DeviceAllocation;
+use crate::shared::peer_split::{slice_2d, Axis, RankDevice};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
@@ -35,6 +43,8 @@ pub(crate) const PREFIX: &str = "model.language_model.";
 pub(crate) struct GlmfLayer<'a> {
     pub attention: GlmNextAttention,
     pub dense: bool,
+    /// One GPU's share of a head split: it runs the split (`glmf2`) programs.
+    pub split: bool,
     operands: HashMap<&'static str, DeviceAllocation<'a>>,
 }
 
@@ -125,6 +135,10 @@ pub(crate) struct GlmfLoader<'a> {
     pub kda_nvfp4: Option<bool>,
     /// Scale rule of copies quantized from BF16.
     pub fp8_scales: crate::shared::fp8_linear::Fp8Scales,
+    /// This loader's device (rank 0 of a head split).
+    pub device: i32,
+    /// The other GPU of a head split (rank 1), if any.
+    pub peers: Vec<RankDevice>,
 }
 
 fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
@@ -373,6 +387,12 @@ impl<'a> GlmfLoader<'a> {
     /// `kv_b_proj [N*(nope+v), 512]` -> `w_uk [N, 512, nope]` (key rows transposed per head)
     /// and `w_uv [N, v, 512]`.
     fn absorbed(&self, cfg: &GlmNextConfig, name: &str) -> Result<(DeviceAllocation<'a>, DeviceAllocation<'a>)> {
+        let (uk, uv) = self.absorbed_host(cfg, name)?;
+        Ok((self.upload(&uk)?, self.upload(&uv)?))
+    }
+
+    /// [`Self::absorbed`]'s host bytes.
+    fn absorbed_host(&self, cfg: &GlmNextConfig, name: &str) -> Result<(Vec<u8>, Vec<u8>)> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
         let (bytes, dtype, shape) = self.raw(name)?;
         let (n, nope, v, lat) = (cfg.heads, cfg.qk_nope_dim, cfg.v_head_dim, cfg.kv_lora_rank);
@@ -395,7 +415,7 @@ impl<'a> GlmfLoader<'a> {
                 uv.extend_from_slice(&bytes[(base + nope + r) * lat * 2..(base + nope + r + 1) * lat * 2]);
             }
         }
-        Ok((self.upload(&uk)?, self.upload(&uv)?))
+        Ok((uk, uv))
     }
 
     pub fn layer(&self, cfg: &GlmNextConfig, layer: usize) -> Result<GlmfLayer<'a>> {
@@ -503,13 +523,267 @@ impl<'a> GlmfLoader<'a> {
             ops.insert("gate", self.one(&format!("{p}.mlp.gate.weight"))?);
             ops.insert("gate.bias", self.f32(&[format!("{p}.mlp.gate.e_score_correction_bias")])?);
         }
-        Ok(GlmfLayer { attention, dense, operands: ops })
+        Ok(GlmfLayer { attention, dense, split: false, operands: ops })
     }
 
-    /// Layers `0..layers` (all of them unless the caller stops early).
-    pub fn model(&self, cfg: &GlmNextConfig, layers: usize) -> Result<GlmfWeights<'a>> {
+    /// GPUs of the head split this loader fills (1: no split).
+    pub fn ranks(&self) -> usize {
+        1 + self.peers.len()
+    }
+
+    /// Runs `body` with rank `rank`'s device current.
+    fn on_rank<T>(&self, rank: usize, body: impl FnOnce() -> Result<T>) -> Result<T> {
+        if rank == 0 {
+            return body();
+        }
+        let peer = self.peers.get(rank - 1).with_context(|| format!("no rank {rank}"))?;
+        crate::shared::peer_split::on_device(self.library, peer.device, self.device, body)
+    }
+
+    /// `first` (on rank 0) and a device copy of it on every other rank (peer access to rank 0
+    /// is enabled by the split setup).
+    fn replicate(&self, first: DeviceAllocation<'a>) -> Result<Vec<DeviceAllocation<'a>>> {
+        let mut out = vec![first];
+        for (rank, peer) in self.peers.iter().enumerate() {
+            let source = out[0].buffer;
+            out.push(self.on_rank(rank + 1, || {
+                let copy = DeviceAllocation::new(self.library, source.bytes)?;
+                // SAFETY: both allocations hold `source.bytes`; the peer stream drains before return.
+                unsafe {
+                    self.library.copy_d2d_async(copy.buffer, source, source.bytes, peer.stream)?;
+                    self.library.cuda_stream_synchronize(peer.stream)?;
+                }
+                Ok(copy)
+            })?);
+        }
+        Ok(out)
+    }
+
+    /// Per rank its host bytes uploaded on that rank's GPU.
+    fn upload_ranks(&self, parts: Vec<Vec<u8>>) -> Result<Vec<DeviceAllocation<'a>>> {
+        parts.into_iter().enumerate().map(|(rank, bytes)| self.on_rank(rank, || self.upload(&bytes))).collect()
+    }
+
+    /// The row-concatenation of BF16 matrices `parts`, each either split into `ranks`
+    /// contiguous row blocks (`true`: rank `r` takes block `r`) or whole on every rank.
+    fn bf16_parts(&self, parts: &[(String, bool)], ranks: usize) -> Result<Vec<Vec<u8>>> {
+        let mut out = vec![Vec::new(); ranks];
+        for (name, split) in parts {
+            let (bytes, dtype, shape) = self.raw(name)?;
+            ensure!(dtype == DType::Bf16 && shape.len() == 2, "{name}: a head split slices BF16 matrices, found \
+                {dtype:?} {shape:?}");
+            ensure!(!split || shape[0] % ranks == 0, "{name}: {} rows do not split over {ranks} GPUs", shape[0]);
+            for (rank, share) in out.iter_mut().enumerate() {
+                share.extend_from_slice(if *split { &bytes[rank * bytes.len() / ranks..(rank + 1) * bytes.len() / ranks] }
+                    else { &bytes[..] });
+            }
+        }
+        Ok(out)
+    }
+
+    /// BF16 / FP32 tensors `names` widened to FP32, each split into `ranks` contiguous
+    /// blocks along its first dimension; per rank its blocks back to back.
+    fn f32_parts(&self, names: &[String], ranks: usize) -> Result<Vec<Vec<u8>>> {
+        let mut out = vec![Vec::new(); ranks];
+        for name in names {
+            let (bytes, dtype, _) = self.raw(name)?;
+            let values = match dtype {
+                DType::Bf16 => bf16_to_f32(&bytes),
+                DType::F32 => bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect(),
+                other => anyhow::bail!("{name}: expected BF16 or FP32, found {other:?}"),
+            };
+            ensure!(values.len() % ranks == 0, "{name}: {} values do not split over {ranks} GPUs", values.len());
+            let share = values.len() / ranks;
+            for (rank, part) in out.iter_mut().enumerate() {
+                part.extend(f32_bytes(&values[rank * share..(rank + 1) * share]));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The FP8 source's E4M3 bytes and FP32 128x128 grid of the 2-D `name`: values, grid, rows, cols.
+    fn fp8_block_host(&self, name: &str) -> Result<(Vec<u8>, Vec<u8>, usize, usize)> {
+        let checkpoint = self.fp8_source.unwrap_or(self.checkpoint);
+        let read = |name: &str| -> Result<(Vec<u8>, DType, Vec<usize>)> {
+            let at = checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name))
+                .map_err(|_| anyhow::anyhow!("FP8 checkpoint has no tensor {name}"))?;
+            let tensor = &checkpoint.tensors[at];
+            let mut bytes = vec![0u8; tensor.meta.byte_length as usize];
+            std::fs::File::open(checkpoint.snapshot.join(&tensor.shard))?
+                .read_exact_at(&mut bytes, tensor.meta.byte_offset).with_context(|| format!("reading {name}"))?;
+            Ok((bytes, tensor.meta.dtype.clone(), tensor.meta.shape.clone()))
+        };
+        let (values, dtype, shape) = read(name)?;
+        ensure!(dtype == DType::F8E4M3 && shape.len() == 2, "{name}: native BF16 GLMF block consumer/exporter is \
+            unsupported; select checkpoint FP8 inputs with --fp8-snapshot (found {dtype:?} {shape:?})");
+        let (grid, grid_dtype, grid_shape) = read(&format!("{name}_scale_inv"))?;
+        ensure!(grid_dtype == DType::F32 && shape[0] % 128 == 0 && shape[1] % 128 == 0
+            && grid_shape == [shape[0] / 128, shape[1] / 128],
+            "{name}: expected FP32 128x128 block scales, found {grid_dtype:?} {grid_shape:?}");
+        Ok((values, grid, shape[0], shape[1]))
+    }
+
+    /// The FP8 blocks of `names` concatenated by rows, sliced over `ranks` along `axis` in
+    /// whole 128-row / 128-K blocks: per rank its E4M3 bytes and its part of the FP32 grid.
+    fn fp8_split(&self, names: &[String], axis: Axis, ranks: usize)
+        -> Result<Vec<(DeviceAllocation<'a>, DeviceAllocation<'a>)>> {
+        ensure!(axis == Axis::Rows || names.len() == 1, "{names:?}: concatenated weights split by rows");
+        let (mut values, mut grids) = (vec![Vec::new(); ranks], vec![Vec::new(); ranks]);
+        for name in names {
+            let (v, g, rows, cols) = self.fp8_block_host(name)?;
+            let along = if axis == Axis::Rows { rows } else { cols };
+            ensure!(along % (128 * ranks) == 0, "{name}: [{rows}, {cols}] does not split into whole 128 blocks over \
+                {ranks} GPUs");
+            for rank in 0..ranks {
+                values[rank].extend(slice_2d(&v, rows, cols, 1, axis, rank, ranks));
+                grids[rank].extend(slice_2d(&g, rows / 128, cols / 128, 4, axis, rank, ranks));
+            }
+        }
+        values.into_iter().zip(grids).enumerate()
+            .map(|(rank, (v, g))| self.on_rank(rank, || Ok((self.upload(&v)?, self.upload(&g)?)))).collect()
+    }
+
+    /// Layer `layer`, one share per rank of this loader's head split (see the module
+    /// docstring); without a split, [`Self::layer`] alone.
+    pub fn layer_shares(&self, cfg: &GlmNextConfig, layer: usize) -> Result<Vec<GlmfLayer<'a>>> {
+        let ranks = self.ranks();
+        if ranks == 1 {
+            return Ok(vec![self.layer(cfg, layer)?]);
+        }
+        ensure!(self.kda_nvfp4.is_none(), "the KDA NVFP4 numerics gate runs without a head split");
+        ensure!(cfg.heads % ranks == 0 && cfg.kda_heads % ranks == 0, "{} MLA / {} KDA heads do not split over {ranks} \
+            GPUs", cfg.heads, cfg.kda_heads);
+        let p = format!("{PREFIX}layers.{layer}");
+        let attention = cfg.attention[layer];
+        let dense = cfg.dense[layer];
+        let mut ops: Vec<HashMap<&'static str, DeviceAllocation<'a>>> = (0..ranks).map(|_| HashMap::new()).collect();
+        let put = |ops: &mut Vec<HashMap<&'static str, DeviceAllocation<'a>>>, key: &'static str,
+            parts: Vec<DeviceAllocation<'a>>| {
+            for (map, part) in ops.iter_mut().zip(parts) {
+                map.insert(key, part);
+            }
+        };
+        for (site, keys) in [("attn", ["attn.fn", "attn.scale", "attn.base"]), ("ffn", ["ffn.fn", "ffn.scale", "ffn.base"])] {
+            for (key, suffix) in keys.into_iter().zip(["fn", "scale", "base"]) {
+                put(&mut ops, key, self.replicate(self.f32(&[format!("{p}.hc_{site}_{suffix}")])?)?);
+            }
+        }
+        put(&mut ops, "input_norm", self.replicate(self.one(&format!("{p}.input_layernorm.weight"))?)?);
+        put(&mut ops, "post_norm", self.replicate(self.one(&format!("{p}.post_attention_layernorm.weight"))?)?);
+        let a = |name: &str| format!("{p}.self_attn.{name}");
+        match attention {
+            GlmNextAttention::Kda => {
+                // [q; k; v; f_a; g_a; b]: q, k, v and b by head, the low-rank f_a and g_a whole.
+                let w_in: Vec<(String, bool)> = [("q_proj", true), ("k_proj", true), ("v_proj", true),
+                    ("f_a_proj", false), ("g_a_proj", false), ("b_proj", true)].iter()
+                    .map(|(n, split)| (a(&format!("{n}.weight")), *split)).collect();
+                let w_in = self.bf16_parts(&w_in, ranks)?;
+                let (bytes, dtype, shape) = self.raw(&a("o_proj.weight"))?;
+                ensure!(dtype == DType::Bf16 && shape.len() == 2 && shape[1] % ranks == 0,
+                    "{}: a head split slices a BF16 [H, D] o_proj, found {dtype:?} {shape:?}", a("o_proj.weight"));
+                let w_o: Vec<Vec<u8>> = (0..ranks)
+                    .map(|rank| slice_2d(&bytes, shape[0], shape[1], 2, Axis::Cols, rank, ranks)).collect();
+                // Single-copy FP8 (--kda-fp8): each rank's slices quantized per row and 128-K block
+                // (Row128: the same bytes as the whole weight's copy) with K-major scales; no BF16.
+                let layout = match self.kda_fp8 {
+                    super::fp8::KdaFp8::Off => None,
+                    super::fp8::KdaFp8::Channel => Some(super::fp8::Layout::Channel),
+                    super::fp8::KdaFp8::Row128 => Some(super::fp8::Layout::Row128),
+                };
+                if let Some(layout) = layout {
+                    let h = cfg.hidden;
+                    for (parts, key, cols) in [(&w_in, "w_in", h), (&w_o, "w_o", shape[1] / ranks)] {
+                        let (mut values, mut kmajor) = (Vec::new(), Vec::new());
+                        for part in parts {
+                            let n = part.len() / 2 / cols;
+                            let (q, s) = super::fp8::quantize(part, n, cols, layout, self.fp8_scales);
+                            let kb = cols / 128;
+                            let mut k = vec![0f32; s.len()];
+                            for row in 0..n {
+                                for b in 0..kb {
+                                    k[b * n + row] = s[row * kb + b];
+                                }
+                            }
+                            values.push(q);
+                            kmajor.push(f32_bytes(&k));
+                        }
+                        let (fp8, kscale) = if key == "w_in" { ("w_in_fp8", "w_in_kscale") } else { ("w_o_fp8", "w_o_kscale") };
+                        put(&mut ops, fp8, self.upload_ranks(values)?);
+                        put(&mut ops, kscale, self.upload_ranks(kmajor)?);
+                    }
+                } else {
+                    put(&mut ops, "w_in", self.upload_ranks(w_in)?);
+                }
+                put(&mut ops, "w_fg", self.upload_ranks(self.bf16_parts(&[(a("f_b_proj.weight"), true),
+                    (a("g_b_proj.weight"), true)], ranks)?)?);
+                put(&mut ops, "conv_w", self.upload_ranks(self.f32_parts(&["q", "k", "v"]
+                    .map(|n| a(&format!("{n}_conv1d.weight"))), ranks)?)?);
+                put(&mut ops, "a_log", self.upload_ranks(self.f32_parts(&[a("A_log")], ranks)?)?);
+                put(&mut ops, "dt_bias", self.upload_ranks(self.f32_parts(&[a("dt_bias")], ranks)?)?);
+                put(&mut ops, "o_norm", self.replicate(self.one(&a("o_norm.weight"))?)?);
+                if layout.is_none() {
+                    put(&mut ops, "w_o", self.upload_ranks(w_o)?);
+                }
+            }
+            GlmNextAttention::Mla => {
+                put(&mut ops, "q_a_norm", self.replicate(self.one(&a("q_a_layernorm.weight"))?)?);
+                put(&mut ops, "kv_a_norm", self.replicate(self.one(&a("kv_a_layernorm.weight"))?)?);
+                // W_UK / W_UV are head-major: rank r takes heads r * N / ranks ..
+                let (uk, uv) = self.absorbed_host(cfg, &a("kv_b_proj.weight"))?;
+                let part = |bytes: &[u8], rank: usize| bytes[rank * bytes.len() / ranks..(rank + 1) * bytes.len() / ranks]
+                    .to_vec();
+                put(&mut ops, "w_uk", self.upload_ranks((0..ranks).map(|r| part(&uk, r)).collect())?);
+                put(&mut ops, "w_uv", self.upload_ranks((0..ranks).map(|r| part(&uv, r)).collect())?);
+                let (q, s) = self.fp8(&[a("q_a_proj.weight"), a("kv_a_proj_with_mqa.weight")], super::fp8::Layout::Block)?;
+                put(&mut ops, "w_qkv_a_fp8", self.replicate(q)?);
+                put(&mut ops, "w_qkv_a_scale", self.replicate(s)?);
+                let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&[a("q_b_proj.weight")], Axis::Rows, ranks)?.into_iter().unzip();
+                put(&mut ops, "w_q_b_fp8", q);
+                put(&mut ops, "w_q_b_scale", s);
+                let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&[a("o_proj.weight")], Axis::Cols, ranks)?.into_iter().unzip();
+                put(&mut ops, "w_o_fp8", q);
+                put(&mut ops, "w_o_scale", s);
+                let i = |name: &str| a(&format!("indexer.{name}"));
+                put(&mut ops, "w_iq", self.replicate(self.one(&i("wq_b.weight"))?)?);
+                put(&mut ops, "w_ik", self.replicate(self.rows(&[i("wk.weight"), i("weights_proj.weight"),
+                    i("index_kpool_compress_gate")])?)?);
+                put(&mut ops, "k_norm_w", self.replicate(self.one(&i("k_norm.weight"))?)?);
+                put(&mut ops, "k_norm_b", self.replicate(self.one(&i("k_norm.bias"))?)?);
+                put(&mut ops, "ape", self.replicate(self.one(&i("index_kpool_compress_ape"))?)?);
+            }
+        }
+        let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
+        // A ModelOpt NVFP4 dense MLP runs whole on rank 0 (rank 1 adds a zero partial).
+        if !(dense && self.nvfp4_dense(cfg, &mlp, &mut ops[0])?) {
+            let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&[format!("{mlp}.gate_proj.weight"),
+                format!("{mlp}.up_proj.weight")], Axis::Rows, ranks)?.into_iter().unzip();
+            put(&mut ops, "w_gate_up_fp8", q);
+            put(&mut ops, "w_gate_up_scale", s);
+            let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&[format!("{mlp}.down_proj.weight")], Axis::Cols, ranks)?
+                .into_iter().unzip();
+            put(&mut ops, "w_down_fp8", q);
+            put(&mut ops, "w_down_scale", s);
+        }
+        if !dense {
+            ops[0].insert("gate", self.one(&format!("{p}.mlp.gate.weight"))?);
+            ops[0].insert("gate.bias", self.f32(&[format!("{p}.mlp.gate.e_score_correction_bias")])?);
+        }
+        Ok(ops.into_iter().map(|operands| GlmfLayer { attention, dense, split: true, operands }).collect())
+    }
+
+    /// Layers `0..layers` (all of them unless the caller stops early): rank 0's weights (its
+    /// layer shares, the norm and head) and with a head split the other rank's layer shares.
+    #[allow(clippy::type_complexity)]
+    pub fn model(&self, cfg: &GlmNextConfig, layers: usize) -> Result<(GlmfWeights<'a>, Vec<Vec<GlmfLayer<'a>>>)> {
+        let mut shares: Vec<Vec<GlmfLayer<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
+        for layer in 0..layers.min(cfg.layers) {
+            for (share, part) in shares.iter_mut().zip(self.layer_shares(cfg, layer)?) {
+                share.push(part);
+            }
+        }
+        let mut shares = shares.into_iter();
         let weights = GlmfWeights {
-            layers: (0..layers.min(cfg.layers)).map(|l| self.layer(cfg, l)).collect::<Result<_>>()?,
+            layers: shares.next().context("rank 0")?,
             norm: self.one(&format!("{PREFIX}norm.weight"))?,
             head: if self.fp8_head {
                 let (values, scales) = self.fp8(&["lm_head.weight".to_string()], super::fp8::Layout::Row128)?;
@@ -519,7 +793,7 @@ impl<'a> GlmfLoader<'a> {
             },
         };
         crate::shared::memory::staging::release_staging();
-        Ok(weights)
+        Ok((weights, shares.collect()))
     }
 }
 

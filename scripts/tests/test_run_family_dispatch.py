@@ -350,7 +350,7 @@ SPLIT_CONFIGS = {
 }
 
 
-@pytest.mark.parametrize("checkpoint", ["qwen4", "glm5_flash"])
+@pytest.mark.parametrize("checkpoint", ["qwen4"])
 @pytest.mark.parametrize("keys", ["RTX_GPUS=2\n", "COORDINATOR_GPUS=0,1\n", "COORDINATOR_SPLIT=heads\n"])
 def test_explicit_split_without_kernels_serves_from_the_first_gpu(
         tmp_path: Path, checkpoint: str, keys: str) -> None:
@@ -362,7 +362,7 @@ def test_explicit_split_without_kernels_serves_from_the_first_gpu(
     assert "device=0" in launch and "--split-device" not in launch
 
 
-@pytest.mark.parametrize("checkpoint", ["qwen4", "glm5_flash"])
+@pytest.mark.parametrize("checkpoint", ["qwen4"])
 def test_auto_keeps_unsupported_checkpoint_on_one_gpu(tmp_path: Path, checkpoint: str) -> None:
     model = "zai-org/GLM-5.3-Flash" if checkpoint == "glm5_flash" else "test/model"
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS[checkpoint], model, "")
@@ -378,6 +378,14 @@ def test_split_off_explicitly_uses_the_first_gpu(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
     assert "device=1" in launch and "--split-device" not in launch
+
+
+@pytest.mark.parametrize("keys", ["RTX_GPUS=2\n", "COORDINATOR_GPUS=1,0\n", "COORDINATOR_SPLIT=heads\n"])
+def test_glm_flash_explicit_split_passes_both_gpus(tmp_path: Path, keys: str) -> None:
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "zai-org/GLM-5.3-Flash", keys)
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
+    assert "--split-device" in launch and "device=0,1" in launch
 
 
 @pytest.mark.parametrize("checkpoint", ["mimo_flash", "mimo_pro"])
@@ -455,6 +463,32 @@ def test_deepseek_v4_launches_with_the_prefix_cache_keys(tmp_path: Path) -> None
     assert "--prefix-cache-entries 20" in launch[0]
     assert "--host-cache-bytes" not in launch[0] and "--pool-tokens" not in launch[0]
 
+
+def test_glm_flash_drafts_with_its_default_speculator(tmp_path: Path) -> None:
+    config = {"model_type": "glm5_next", "num_hidden_layers": 2, "mlp_layer_types": ["sparse"] * 2,
+              "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
+    model = "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1"
+    default = "incoai/GLM-5.3-Flash-DFlash2"
+    dspark = "RedHatAI/GLM-5.3-Flash-speculator.dspark-preview"
+    keys = "GLM5_FLASH_FP8_MODEL_ID=off\n"
+
+    def launch(sub: str, extra: str, drafters: tuple[str, ...] = (default, dspark)) -> tuple[str, list[str]]:
+        hf = tmp_path / sub / "hf"
+        for name in drafters:
+            _snapshot(hf, name, {"speculators_model_type": "dspark"} if name == dspark else {})
+        text = _family_launch_lines(tmp_path / sub, config, model, keys + extra)
+        return text, [l for l in text.splitlines() if "cuteafd serve-glmf" in l]
+
+    snap = lambda name: f"--draft /root/.cache/huggingface/hub/models--{name.replace('/', '--')}/snapshots/abc"
+    text, lines = launch("a", "")
+    assert lines and snap(default) in lines[0], text
+    assert "drafts with dflash2" in text
+    text, lines = launch("b", "SPECULATOR=off\n")
+    assert lines and "--draft" not in lines[0], text
+    text, lines = launch("c", f"SPECULATOR=dspark\nSPECULATOR_MODEL_ID={dspark}\n")
+    assert lines and snap(dspark) in lines[0], text
+    text, lines = launch("d", "", ())
+    assert lines and "--draft" not in lines[0] and "hf download " + default in text, text
 
 
 def test_glmf_pool_defaults_to_the_planned_pool(tmp_path: Path) -> None:

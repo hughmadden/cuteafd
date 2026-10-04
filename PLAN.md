@@ -670,6 +670,30 @@ The full Release smoke matrix (family × quant × natural-minimum and maximum
 hardware) published as the README card grid is the v0 artifact. Images stay
 local until TJ says to push them. No model license notes: we bundle no weights.
 
+## Release v1 scope (decided 2026-10-04)
+
+v1 ships when these are done; everything else below moves to v1.x/v2.
+- **In v1:** device-driven exchange for V4.1 and MiMo V2.6 Pro (default only
+  if it beats the current default and is hang-free; otherwise opt-in);
+  byte-exact prefix-cache restores at turn end for V4 / V4.1; planner core for
+  every family (per-device memory layout + admission; V4, V4.1, Qwen still
+  missing); all Release smoke cards green with MOPD as the MiMo Pro default
+  and a refreshed README; MXFP4 32-row tails; the Spark kernel wins already
+  landed; known-issue notes (NVFP4 local experts on one RTX, Qwen with Sparks).
+- **Cut to v1.x/v2:** whole-step graphs if the exchange isn't stable in time;
+  multimodal input (v2); `placement.json` handoff and cold-component placement;
+  V4.1 NVFP4 W4A4 revisit and W4A4 decode; EXL3 × A8 (an independent SM120
+  implementation is the interesting part — not a port of b12x PR #342, whose
+  ShapleyMcg licence covers re-implementations made with reference to it);
+  parked Spark-side reduce / split intake.
+- **RTX 5090 support: Hugh** (external collaborator). Brief: one SM120 build
+  serves RTX PRO 6000 (188 SMs, 96 GB) and RTX 5090 (170 SMs, 32 GB) with no
+  regression on the 6000; remove SM-count assumptions (hard-coded `4*188` grid
+  clamps; the per-tensor FP8 GEMM grid sized for 188 SMs; any L2-size
+  assumptions); simulate a 5090 on a 6000 via the planner's device inventory
+  (`cuteafd plan MODEL --layout`, 32 GB budget) and validate on real 5090s;
+  start from `work/p0`, branch `work/rtx5090`, follow AGENTS.md.
+
 ## Release v1 — priority plan (2026-10-02)
 
 Everything after v0 lands as v1. Helpers: read AGENTS.md, then pick the top
@@ -732,7 +756,7 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
    - DeepSeek V4 Flash: the native expert format refuses 2 Sparks (min config
      needs 4); V4.1 TP3 fits per `cuteafd plan` but is unqualified.
    - Benchmarks: reasoning-effort panel re-run after the pool back-off fix;
-     turn-end cache check is informational (greedy non-repeat); the code
+     turn-end cache check gates restores against their snapshot (4i); the code
      sandbox requires user/net/PID namespaces (`fd74aaf`; coordinators run
      with `docker/seccomp-code-bench.json`); tool-eval-bench reaches images
      with the next `./build.sh`.
@@ -759,17 +783,27 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
         slow kernel. Fixed (`4c02f2f`): local experts are resident by
         default (Qwen NVFP4 decode 21 s → 8.7 ms/step); paging needs an
         explicit `--expert-window`.
-     f. GLM 5.3 Flash and Qwen ignore `RTX_GPUS=2` (no head split), so their
-        max layout is 1 RTX + 4 Sparks. Explicit two-GPU requests now fail
-        before launch (`7d54499`); real head splits remain open.
+     f. GLM 5.3 Flash has a two-GPU head split (`work/glmf-split`, `glmf2`
+        programs: half the KDA/MLA heads and their state, half the dense /
+        shared-expert intermediate; default with RTX_GPUS=auto/2). 2 vs 1 RTX +
+        4 Sparks: EXL3+DFlash2 C1 code 159 -> 168 tok/s, NVFP4 C1 76 -> 83,
+        8K prefill equal; golden NLL 2.4073 -> 2.4054. Qwen still has none
+        (two-GPU requests serve from the first GPU).
      g. Qwen 3.8 EXL3: 84 tok/s with 4 Sparks vs 261 on one RTX alone.
      h. Prefill gets worse with more hardware: V4 Pro min 879 tok/s (9.2 s
         TTFT) vs 2,438 max; MiMo Flash max 2,899 vs min 5,877; MiMo Pro max
         1,754 vs min 2,741 (two-lane prefill off under the head split).
-     i. V4 / V4.1 turn-end prefix-cache restore not byte-exact (reported,
-        not gated). V4 Flash solo prefill also repeats inexactly: Spark FP32
-        atomic reduction order. An ordered serial-slice reducer passed
-        component gates on a private codex branch; not merged.
+     i. V4 / V4.1 turn-end prefix-cache restores are byte-exact (fixed in the
+        check, `0f65c9b`): the old check compared a restored turn with a cold
+        recompute, and V4 Flash / V4.1 prefill does not repeat bit for bit
+        (Spark FP32 atomic expert reduction at 256+ rows); its turns also
+        ended at EOS with one row to compare. The check now judges each
+        restore against its own snapshot (turn rows, prompt-snapshot
+        reference, decode step after the turn restore) and reports the cold
+        recompute only. Smoke V4 Flash min and V4.1 min: prompt and turn end
+        2 rows byte-identical, cold recompute differs. Deterministic prefill
+        stays open: an ordered serial-slice reducer passed component gates
+        on a private codex branch (Flash TP4 only); not merged.
      j. MiMo V2 Flash fidelity is the weakest that passes (KL 0.10, top-1 82%).
         Opt-in BF16 expert-input Spark packages (`EXPERT_INPUT=bf16`,
         `CUTEAFD_*_FP8_MOE_BF16_FAMILIES=mimo`) improve it; default stays FP8.
@@ -788,9 +822,15 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
    GLM 5.3 (2026-10-03, `work/glm-perf`): 8K prefill is ~3.0 s on min and max
    alike because both are Spark-bound — worker kernel time per 2752-row wave
    (3 lanes) is 11.7 ms at TP4 width 512, 11.0 at TP6 width 384, 7.6 at width
-   256, so six Sparks save only ~5% Spark time (the width-384 package runs
-   128-wide tiles; a 192-wide WS tile is on fork `cuteafd/exl3-gb10-bytes`),
-   and the head split only moves the wait from the GPU to the Sparks. GB10's
+   256, so six Sparks save only ~5% Spark time (the width-384 package ran
+   128-wide tiles). Fork f6bb38bc (dynamic tile claims, FP8 wire input,
+   192-wide TP6 tiles; bit-identical) cuts live waves to 11.24 / 9.87 / 7.05
+   ms and Spark busy per 8K to 2.62 s (TP4) / 2.30 s (TP6); still Spark-bound.
+   Served 8K TTFT with E4M3 MLA + these packages vs v0.1.0 (2026-10-04, one
+   launch per arm): max 2.96-2.99 -> 2.49-2.64 s, min 3.08-3.11 -> 2.82-2.91 s;
+   C1 code flat (max ~68, min 58-61; text changes with the MLA numerics); C4 is
+   dominated by within-batch greedy divergence (item 4d) in every arm. The
+   head split only moves the wait from the GPU to the Sparks. GB10's
    wave is bound by bytes (FC1 BF16 input gathers per N tile, FC2 partial
    round trip ~2 ms, top-k sum 1.6 ms) and the FC1 rotation, not MMA rate.
    Coordinator GPU-only 8K prefill is 2.7 s, half of it the sparse MLA prefill

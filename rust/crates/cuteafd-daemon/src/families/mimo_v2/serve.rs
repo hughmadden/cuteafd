@@ -303,7 +303,9 @@ impl Active<'_> {
         self.history.push(token);
         self.generated += 1;
         self.buffered += 1;
-        let stop = self.job.stop_token_ids.contains(&token);
+        // A grammar that accepted one of its stop tokens has ended the request.
+        let stop = self.job.stop_token_ids.contains(&token)
+            || self.constraint.as_ref().is_some_and(|state| state.terminated());
         if !stop {
             if let Some(content) = self.decoder.step(token)? {
                 self.send(InferenceChunk::Text { content, content_tokens: self.buffered })?;
@@ -601,6 +603,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 // Construction can fail after moving the request into its active
                 // state. Keep its event sender until that error is reported.
                 let admission_events = p.job.events.clone();
+                let job_events = p.job.events.clone();
                 let admitted = (|| -> Result<Active<'_>> {
                     let mut request = Active {
                         slot,
@@ -635,10 +638,13 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                         }
                         request.ticket.first(token);
                         retain_prompt(cache, &request.placement);
-                        match emitted {
+                        match &emitted {
                             Ok(false) => active.push(request),
                             // Finished at its first token: its turn is its prompt snapshot.
                             Ok(true) | Err(_) => {
+                                if let Err(error) = &emitted {
+                                    let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                                }
                                 failures.finished(&request.job.events);
                                 request.ticket.done(request.generated);
                                 release(family, cache, &mut free_rings, &mut free_slots, &request.placement,
@@ -648,6 +654,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                     }
                     Err(error) => {
                         tracing::warn!("admission failed: {error:#}");
+                        let _ = job_events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                         let _ = admission_events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                         if engine.is_terminal() { return Err(error); }
                         retain_prompt(cache, &placement);
@@ -774,6 +781,9 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         let tokens: Vec<u32> = sequences.iter().flatten().copied().collect();
         steps += 1;
         let timer = Instant::now();
+        // A sequence whose grammar fails is failed alone after the step; an
+        // error inside `submit` would end the engine.
+        let mut poisoned: Vec<Option<String>> = vec![None; active.len()];
         let step = engine.submit(|| {
             let mut rows: Vec<(&mut MimoPlacement, usize)> = active.iter_mut().zip(&sequences)
                 .map(|(a, s)| (&mut a.placement, s.len())).collect();
@@ -781,8 +791,8 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             drop(rows);
             // Each row draws at the position after it, masked along its sequence's drafts.
             let mut batch = SelectBatch::default();
-            for ((a, rows), &start) in active.iter().zip(&sequences).zip(&starts) {
-                batch.push_sequence(a.job.sampling, a.constraint.as_ref(), rows, start as u64 + 1)?;
+            for (i, ((a, rows), &start)) in active.iter().zip(&sequences).zip(&starts).enumerate() {
+                poisoned[i] = batch.push_sequence_isolated(a.job.sampling, a.constraint.as_ref(), rows, start as u64 + 1);
             }
             Ok((selector.select(&logits, &batch)?, logits))
         });
@@ -809,6 +819,11 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         let before: Vec<usize> = active.iter().map(|a| a.history.len()).collect();
         let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(&starts).enumerate()
             .map(|(i, ((request, rows), &start))| {
+            if let Some(error) = poisoned[i].take() {
+                let _ = request.job.events.send(Err(NativeFailure::Worker(error)));
+                offset += rows.len();
+                return true;
+            }
             let mut finished = false;
             for j in 0..rows.len() {
                 // Rows 0..=j are committed; the token row j produces is next.
@@ -952,6 +967,7 @@ fn plan_drafts(active: &[Active<'_>], drafted: &[Option<super::dflash::Draft>], 
         confidence: active[i].drafts.conditional(width(i)),
         room: limits[i],
         members: 1,
+        informed: false,
     }).collect();
     let others = active.len() - indices.len();
     for (&i, n) in indices.iter().zip(dflash_policy::plan(&groups, (others, others), cost)) {

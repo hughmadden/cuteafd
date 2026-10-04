@@ -1,5 +1,6 @@
 //! GLM 5.3 Flash (glm5_next) on the generic engine: weights, the coordinator
 //! programs' layer chain, and the golden comparison command.
+pub(crate) mod dspark;
 pub(crate) mod engine;
 pub(crate) mod fp8;
 pub(crate) mod prefix;
@@ -31,6 +32,12 @@ pub(crate) struct EngineArgs {
     pub manifest: PathBuf,
     #[arg(long, default_value_t = 0)]
     pub device: i32,
+    /// Second GPU of a two-GPU head split: each GPU runs half the KDA and MLA heads (its
+    /// KDA state) and half the dense and shared-expert intermediate; mHC, the MLA latent
+    /// records and the DSA indexer are replicated; the partial sums meet over peer memory.
+    /// Router, routed experts, LM head and drafter stay on --device.
+    #[arg(long)]
+    pub split_device: Option<i32>,
     /// Run only the first N layers (layers 0-2 are the dense ones).
     #[arg(long)]
     pub layers: Option<usize>,
@@ -116,7 +123,9 @@ pub(crate) struct EngineArgs {
     /// shared expert; the routed experts contribute nothing.
     #[arg(long, hide = true)]
     pub skip_experts: bool,
-    /// DFlash2 drafter snapshot (incoai/GLM-5.3-Flash-DFlash2): taps the mHC
+    /// Drafter snapshot: a dSpark checkpoint
+    /// (RedHatAI/GLM-5.3-Flash-speculator.dspark-preview) or DFlash2
+    /// (incoai/GLM-5.3-Flash-DFlash2), told apart by its config; taps the mHC
     /// stream mean after its target layers and drafts on this GPU.
     #[arg(long)]
     pub draft: Option<PathBuf>,
@@ -374,8 +383,12 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
             .context("DFlash target has no lm_head.weight")?;
         // The drafter borrows the target's one head: BF16, or the FP8 head made from it.
         crate::families::glm5::dflash::check_target_head_source(&head.meta, cfg.hidden, cfg.vocab_size)?;
-        crate::families::glm5::dflash::check_checkpoint(snapshot, args.draft_fp8,
-            args.draft_context_slots, args.draft_sequences)?;
+        if dspark::is_dspark(snapshot) {
+            dspark::check_checkpoint(snapshot, cfg.hidden, cfg.vocab_size, cfg.layers)?;
+        } else {
+            crate::families::glm5::dflash::check_checkpoint(snapshot, args.draft_fp8,
+                args.draft_context_slots, args.draft_sequences)?;
+        }
     }
     // The expert geometry is process-wide and must be fixed before the native
     // library loads (its expert helpers size rows from it).
@@ -419,19 +432,47 @@ impl Opened {
         }
         programs.load_all()?;
         let stream = self.library.cuda_stream_create()?;
+        // The head split's second GPU and its stream; a head split needs its share's programs
+        // (`glmf2`) in this build.
+        let split_device = match args.split_device {
+            Some(device) if programs.spec("glmf2_kda_m64").is_ok() => Some(device),
+            Some(device) => {
+                tracing::info!(device, "no head-split programs (glmf2) in this build; serving from --device alone");
+                None
+            }
+            None => None,
+        };
+        let peer_stream = match split_device {
+            Some(device) => {
+                ensure!(device != args.device, "--split-device must differ from --device");
+                self.library.cuda_enable_peer(device)?;
+                self.library.cuda_set_device(device)?;
+                let stream = self.library.cuda_enable_peer(args.device).and_then(|()| self.library.cuda_stream_create());
+                self.library.cuda_set_device(args.device)?;
+                Some((device, stream?))
+            }
+            None => None,
+        };
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::GlmfLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
             fp8_source: self.fp8_checkpoint.as_ref(), kda_fp8: args.kda_fp8,
             fp8_head: args.fp8_head, kda_nvfp4: args.kda_nvfp4_gate.as_deref().map(|mode| mode == "search"),
-            fp8_scales: args.fp8_scales };
+            fp8_scales: args.fp8_scales, device: args.device,
+            peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
+                .collect() };
         let source = self.embed_source()?;
-        let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library, source,
-            args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers) })?;
+        let (embedding, (model, mut shares)) = crate::shared::token_io::TokenEmbedding::load(&self.library, source,
+            args.token_io.embed_placement, || {
+                let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+                loader.model(&self.cfg, layers)
+            })?;
         let resident: usize = model.layers.iter().map(weights::GlmfLayer::bytes).sum();
+        let peer_resident: usize = shares.iter().flatten().map(weights::GlmfLayer::bytes).sum();
         let single = model.check_single_residency(args.kda_fp8, args.fp8_head)?;
         let mib = |bytes: usize| bytes as f64 / (1u64 << 20) as f64;
         tracing::info!(layers, gib = resident as f64 / (1u64 << 30) as f64,
+            split_gib = peer_resident as f64 / (1u64 << 30) as f64,
             fp8_source = self.fp8_checkpoint.is_some(), kda_fp8 = ?args.kda_fp8, fp8_prefill = ?args.fp8_prefill,
             kda_bf16_mib = mib(single.kda_bf16), kda_fp8_mib = mib(single.kda_fp8),
             head = model.head.name(), head_mib = mib(single.head_bf16 + single.head_fp8),
@@ -447,6 +488,10 @@ impl Opened {
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages, args.slots, embedding)?;
+        if let Some((device, peer_stream)) = peer_stream {
+            engine.attach_peer(device, peer_stream, shares.pop().context("head-split shares")?)?;
+            tracing::info!(device = args.device, split_device = device, "GLM 5.3 Flash head split over two GPUs");
+        }
         engine.full_prefill_logits = args.full_prefill_logits;
         let group = |g: Fp8PrefillGroup| args.fp8_prefill.iter().any(|&x| x == g || x == Fp8PrefillGroup::All);
         // `all`: every group with FP8 weights (BF16 KDA has none to run W8A8 over).
@@ -456,19 +501,15 @@ impl Opened {
                 | (i32::from(kda && group(Fp8PrefillGroup::KdaO)) << 1) };
         if let Some(snapshot) = &args.draft {
             let started = Instant::now();
-            let cfg = crate::families::glm5::dflash::DflashConfig::read(snapshot)?;
-            ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
-                && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash2 drafter does not fit this target");
-            let mask = engine.embedding.host_rows(&[cfg.mask_token])?;
-            let file = crate::families::glm5::dflash::prefetch(snapshot).join()
-                .map_err(|_| anyhow::anyhow!("drafter read panicked"))??;
             let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation
                 ::from_fp8_option(args.draft_fp8);
-            let drafter = crate::families::glm5::dflash::GlmDrafter::load(&self.library, snapshot, file, stream,
+            let drafter = dspark::Drafter::load(&self.library, snapshot, stream,
                 args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
-                mask, true, representation, args.fp8_scales)?;
+                &engine.embedding, self.cfg.hidden, self.cfg.vocab_size, self.cfg.layers, representation,
+                args.fp8_scales)?;
+            let name = drafter.name();
             engine.drafter = Some(drafter);
-            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash2 drafter resident");
+            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "{name} drafter resident");
         }
         if engine.weights.layers.iter().any(|layer| layer.has("nvfp4_w1")) {
             let directory = crate::shared::experts::fp8::dense_package_directory(&args.native_lib, "glmfdense");
@@ -482,11 +523,19 @@ impl Opened {
         }
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::GLM_DEFAULT)? {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
+            if engine.ranks() > 1 {
+                engine.attach_peer_l2(budget)?;
+            }
         }
         let result = body(&engine);
         drop(engine);
-        // SAFETY: the engine that used the stream is gone.
+        // SAFETY: the engine that used the streams is gone.
         unsafe { self.library.cuda_stream_destroy(stream)? };
+        if let Some((device, peer_stream)) = peer_stream {
+            crate::shared::peer_split::on_device(&self.library, device, args.device,
+                // SAFETY: as above.
+                || unsafe { self.library.cuda_stream_destroy(peer_stream) })?;
+        }
         result
     }
 

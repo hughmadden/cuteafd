@@ -59,3 +59,4 @@ data/*.sqlite-*
 
 # Source identity for builds without .git (scripts/build/write-build-identity.sh)
 BUILD_IDENTITY.json
+.venv

@@ -20,7 +20,10 @@
 //! sequence drafts cold with `valid_from` at the restore point.
 //!
 //! Every copy is enqueued on the engine stream, in order with the forward passes, and `drain`
-//! synchronizes it.
+//! synchronizes it. Under a head split both GPUs hold identical copies of the paged state (the
+//! replicated MLA projection and indexer write them) and each its own KDA heads' state: page
+//! copies run on each GPU's stream, a mark holds both GPUs' halves (an arena per GPU), and the
+//! host tier is off.
 use super::engine::{GlmfEngine, GlmfPlacement, KPOOL, PAGE_ROWS, RECORD_BYTES, UNIT_PAGES, UNIT_ROWS};
 use crate::shared::memory::DeviceAllocation;
 use crate::shared::prefix::view;
@@ -38,10 +41,11 @@ const POOL_PAGE_BYTES: usize = PAGE_ROWS * (POOL_KEY_BYTES + 4);
 
 pub(crate) struct GlmfPrefix<'e, 'a> {
     engine: &'e GlmfEngine<'a>,
-    /// Per MLA layer: records, token keys, pool keys.
-    paged: Vec<[CuteafdDeviceBuffer; 3]>,
+    /// Per rank and MLA layer: records, token keys, pool keys.
+    paged: Vec<(usize, [CuteafdDeviceBuffer; 3])>,
     mark_bytes: usize,
-    arena: Option<DeviceAllocation<'a>>,
+    /// Per rank: its part of every mark (its KDA heads' state) and the arena of those parts.
+    arenas: Vec<(usize, Option<DeviceAllocation<'a>>)>,
     slots: usize,
 }
 
@@ -49,15 +53,22 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
     /// The family over `engine`'s buffers with a device arena of `slots(mark_bytes)` marks.
     pub fn new(engine: &'e GlmfEngine<'a>, slots: impl FnOnce(usize) -> usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix");
-        let paged = engine.paged_buffers();
-        for [records, keys, pools] in &paged {
+        let paged: Vec<_> = (0..engine.ranks())
+            .flat_map(|rank| engine.paged_buffers_on(rank).into_iter().map(move |buffers| (rank, buffers))).collect();
+        for (_, [records, keys, pools]) in &paged {
             ensure!(records.bytes >= engine.pages * PAGE_ROWS * RECORD_BYTES && keys.bytes >= engine.pages * PAGE_ROWS * KEY_BYTES
                 && pools.bytes >= engine.pool_pages * POOL_PAGE_BYTES, "MLA cache buffers smaller than the units");
         }
-        let mark_bytes: usize = engine.slot_regions(0).iter().map(|r| r.bytes).sum();
+        let parts: Vec<usize> = (0..engine.ranks())
+            .map(|rank| engine.slot_regions_on(rank, 0).iter().map(|r| r.bytes).sum()).collect();
+        let mark_bytes = parts.iter().sum();
         let slots = slots(mark_bytes);
-        let arena = if slots > 0 { Some(DeviceAllocation::new(engine.library, slots * mark_bytes)?) } else { None };
-        Ok(Self { engine, paged, mark_bytes, arena, slots })
+        let arenas = parts.into_iter().enumerate().map(|(rank, part)| -> Result<_> {
+            let arena = if slots > 0 { Some(engine.on(rank, || DeviceAllocation::new(engine.library, slots * part))?) }
+                else { None };
+            Ok((part, arena))
+        }).collect::<Result<_>>()?;
+        Ok(Self { engine, paged, mark_bytes, arenas, slots })
     }
 
     pub fn mark_bytes(&self) -> usize {
@@ -69,22 +80,26 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
     }
 
     pub fn slots(&self) -> usize {
-        if self.arena.is_some() { self.slots } else { 0 }
+        if self.arenas.iter().all(|(_, arena)| arena.is_some()) { self.slots } else { 0 }
     }
 
-    fn copy(&self, dst: CuteafdDeviceBuffer, src: CuteafdDeviceBuffer) -> Result<()> {
+    /// A copy on rank `rank`'s stream.
+    fn copy(&self, rank: usize, dst: CuteafdDeviceBuffer, src: CuteafdDeviceBuffer) -> Result<()> {
         debug_assert_eq!(dst.bytes, src.bytes);
-        // SAFETY: both views lie inside live engine allocations (checked by `view`); the copy is
-        // ordered on the engine stream with every forward pass that reads or writes them.
-        unsafe { self.engine.library.copy_d2d_async(dst, src, src.bytes, self.engine.stream) }
+        // SAFETY: both views lie inside live engine allocations of that rank's GPU (checked by
+        // `view`); the copy is ordered on its stream with every forward pass that reads or
+        // writes them.
+        self.engine.on(rank, || unsafe {
+            self.engine.library.copy_d2d_async(dst, src, src.bytes, self.engine.stream_of(rank))
+        })
     }
 
-    /// The device ranges of one unit, per MLA layer: records, token keys, pool keys.
-    fn unit_ranges(&self, unit: u32) -> Result<Vec<CuteafdDeviceBuffer>> {
+    /// The device ranges of one unit on rank `rank`, per MLA layer: records, token keys, pool keys.
+    fn unit_ranges_on(&self, rank: usize, unit: u32) -> Result<Vec<CuteafdDeviceBuffer>> {
         let unit = unit as usize;
         let rows = UNIT_PAGES * PAGE_ROWS;
         let mut out = Vec::with_capacity(3 * self.paged.len());
-        for &[records, keys, pools] in &self.paged {
+        for &(_, [records, keys, pools]) in self.paged.iter().filter(|(r, _)| *r == rank) {
             out.push(view(records, unit * rows * RECORD_BYTES, rows * RECORD_BYTES)?);
             out.push(view(keys, unit * rows * KEY_BYTES, rows * KEY_BYTES)?);
             out.push(view(pools, unit * POOL_PAGE_BYTES, POOL_PAGE_BYTES)?);
@@ -92,22 +107,40 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
         Ok(out)
     }
 
-    /// Copy every KDA layer's state of KDA slot `kda` to or from mark `slot`.
-    fn move_mark(&self, slot: MarkSlot, kda: i32, capture: bool) -> Result<()> {
-        let arena = self.arena.as_ref().map(|a| a.buffer).ok_or_else(|| anyhow::anyhow!("no mark arena"))?;
+    /// Mark `slot`'s part on each rank: (rank, its arena range).
+    fn mark_parts(&self, slot: MarkSlot) -> Result<Vec<(usize, CuteafdDeviceBuffer)>> {
         ensure!((slot.0 as usize) < self.slots, "mark slot {} of {}", slot.0, self.slots);
+        self.arenas.iter().enumerate().map(|(rank, (part, arena))| {
+            let arena = arena.as_ref().map(|a| a.buffer).ok_or_else(|| anyhow::anyhow!("no mark arena"))?;
+            Ok((rank, view(arena, slot.0 as usize * part, *part)?))
+        }).collect()
+    }
+
+    /// Copy every KDA layer's state of KDA slot `kda` to or from mark `slot` (each rank its heads).
+    fn move_mark(&self, slot: MarkSlot, kda: i32, capture: bool) -> Result<()> {
         ensure!(kda >= 0 && (kda as usize) < self.engine.slots, "KDA slot {kda} of {}", self.engine.slots);
-        let mut offset = slot.0 as usize * self.mark_bytes;
-        for region in self.engine.slot_regions(kda as usize) {
-            let mark = view(arena, offset, region.bytes)?;
-            if capture {
-                self.copy(mark, region)?;
-            } else {
-                self.copy(region, mark)?;
+        for (rank, part) in self.mark_parts(slot)? {
+            let mut offset = 0;
+            for region in self.engine.slot_regions_on(rank, kda as usize) {
+                let mark = view(part, offset, region.bytes)?;
+                if capture {
+                    self.copy(rank, mark, region)?;
+                } else {
+                    self.copy(rank, region, mark)?;
+                }
+                offset += region.bytes;
             }
-            offset += region.bytes;
         }
         Ok(())
+    }
+
+    /// Mark `slot`'s bytes, rank by rank (checks).
+    fn mark_host(&self, slot: MarkSlot) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        for (rank, part) in self.mark_parts(slot)? {
+            out.extend(download(self.engine, rank, part)?);
+        }
+        Ok(out)
     }
 }
 
@@ -158,36 +191,36 @@ impl PrefixFamily for GlmfPrefix<'_, '_> {
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
         let rows = UNIT_PAGES * PAGE_ROWS;
         let pools = copy.rows / KPOOL;
-        for &[records, keys, pool_keys] in &self.paged {
+        for &(rank, [records, keys, pool_keys]) in &self.paged {
             for (buffer, row) in [(records, RECORD_BYTES), (keys, KEY_BYTES)] {
-                self.copy(view(buffer, copy.to as usize * rows * row, copy.rows * row)?,
+                self.copy(rank, view(buffer, copy.to as usize * rows * row, copy.rows * row)?,
                     view(buffer, copy.from as usize * rows * row, copy.rows * row)?)?;
             }
             // The complete pools: their E4M3 keys, then their scales.
             if pools > 0 {
                 let (from, to) = (copy.from as usize * POOL_PAGE_BYTES, copy.to as usize * POOL_PAGE_BYTES);
-                self.copy(view(pool_keys, to, pools * POOL_KEY_BYTES)?, view(pool_keys, from, pools * POOL_KEY_BYTES)?)?;
-                self.copy(view(pool_keys, to + POOL_SCALES, pools * 4)?, view(pool_keys, from + POOL_SCALES, pools * 4)?)?;
+                self.copy(rank, view(pool_keys, to, pools * POOL_KEY_BYTES)?,
+                    view(pool_keys, from, pools * POOL_KEY_BYTES)?)?;
+                self.copy(rank, view(pool_keys, to + POOL_SCALES, pools * 4)?,
+                    view(pool_keys, from + POOL_SCALES, pools * 4)?)?;
             }
         }
         Ok(())
     }
 
     fn drain(&self) -> Result<(), BoxError> {
-        // SAFETY: the engine owns this stream.
-        Ok(unsafe { self.engine.library.cuda_stream_synchronize(self.engine.stream) }?)
+        Ok(self.engine.synchronize()?)
     }
 
+    /// The host tier's ranges (rank 0's: a head split runs without the host tier).
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
-        self.unit_ranges(page).unwrap_or_default().into_iter()
+        self.unit_ranges_on(0, page).unwrap_or_default().into_iter()
             .map(|b| DeviceRange { addr: b.ptr as u64, bytes: b.bytes }).collect()
     }
 
     fn mark_segments(&self, slot: MarkSlot) -> Vec<DeviceRange> {
-        self.arena.as_ref().map_or_else(Vec::new, |arena| vec![DeviceRange {
-            addr: arena.buffer.ptr as u64 + (slot.0 as usize * self.mark_bytes) as u64,
-            bytes: self.mark_bytes,
-        }])
+        self.mark_parts(slot).unwrap_or_default().into_iter()
+            .map(|(_, b)| DeviceRange { addr: b.ptr as u64, bytes: b.bytes }).collect()
     }
 }
 
@@ -230,11 +263,11 @@ pub(crate) fn prefill_digest(engine: &GlmfEngine<'_>, placement: &mut GlmfPlacem
     Ok(SuffixRun { layers: hashers.iter().map(Hasher::finish).collect(), logits: logit_hash.finish(), argmax, last })
 }
 
-fn download(engine: &GlmfEngine<'_>, range: CuteafdDeviceBuffer) -> Result<Vec<u8>> {
-    // SAFETY: the engine owns this stream; draining it retires every write to `range`.
-    unsafe { engine.library.cuda_stream_synchronize(engine.stream)? };
+/// `range` of rank `rank`'s GPU, after every stream drained (retiring every write to it).
+fn download(engine: &GlmfEngine<'_>, rank: usize, range: CuteafdDeviceBuffer) -> Result<Vec<u8>> {
+    engine.synchronize()?;
     let mut bytes = vec![0u8; range.bytes];
-    engine.library.copy_d2h(&mut bytes, range)?;
+    engine.on(rank, || engine.library.copy_d2h(&mut bytes, range))?;
     Ok(bytes)
 }
 
@@ -246,12 +279,14 @@ pub(super) fn paged_rows(family: &GlmfPrefix<'_, '_>, placement: &GlmfPlacement,
     for (u, &unit) in placement.units.iter().enumerate().take(len.div_ceil(UNIT_ROWS)) {
         let rows = (len - u * UNIT_ROWS).min(UNIT_ROWS);
         let unit_pools = (pools.saturating_sub(u * PAGE_ROWS)).min(PAGE_ROWS);
-        for ranges in family.unit_ranges(unit)?.chunks_exact(3) {
-            out.extend_from_slice(&download(family.engine, ranges[0])?[..rows * RECORD_BYTES]);
-            out.extend_from_slice(&download(family.engine, ranges[1])?[..rows * KEY_BYTES]);
-            let page = download(family.engine, ranges[2])?;
-            out.extend_from_slice(&page[..unit_pools * POOL_KEY_BYTES]);
-            out.extend_from_slice(&page[POOL_SCALES..POOL_SCALES + unit_pools * 4]);
+        for rank in 0..family.engine.ranks() {
+            for ranges in family.unit_ranges_on(rank, unit)?.chunks_exact(3) {
+                out.extend_from_slice(&download(family.engine, rank, ranges[0])?[..rows * RECORD_BYTES]);
+                out.extend_from_slice(&download(family.engine, rank, ranges[1])?[..rows * KEY_BYTES]);
+                let page = download(family.engine, rank, ranges[2])?;
+                out.extend_from_slice(&page[..unit_pools * POOL_KEY_BYTES]);
+                out.extend_from_slice(&page[POOL_SCALES..POOL_SCALES + unit_pools * 4]);
+            }
         }
     }
     Ok(out)
@@ -305,12 +340,7 @@ pub(crate) fn resume_check(engine: &GlmfEngine<'_>, tokens: &[u32], at: usize, n
     let restore_ms = started.elapsed().as_secs_f64() * 1e3;
     // The restored KDA state reads back exactly as the captured one.
     family.capture(MarkSlot(1), &b, at).map_err(err)?;
-    let mark = |slot: u32| -> Result<Vec<u8>> {
-        let range = family.mark_segments(MarkSlot(slot))[0];
-        download(engine, CuteafdDeviceBuffer { ptr: range.addr as *mut std::ffi::c_void, bytes: range.bytes,
-            ..family.paged[0][0] })
-    };
-    let mark_equal = mark(0)? == mark(1)?;
+    let mark_equal = family.mark_host(MarkSlot(0))? == family.mark_host(MarkSlot(1))?;
     // The state at P (every paged row and the KDA state): what a restore must reproduce.
     let state_at = paged_rows(&family, &a, at)? == paged_rows(&family, &b, at)?
         && engine.slot_state(a.slot)? == engine.slot_state(b.slot)?;

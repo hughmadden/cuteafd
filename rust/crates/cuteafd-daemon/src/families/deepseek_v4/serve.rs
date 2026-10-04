@@ -254,13 +254,15 @@ impl Active<'_> {
         self.history.push(token);
         self.generated += 1;
         self.buffered += 1;
-        if token != eos {
+        // A grammar that accepted its stop token has ended the request.
+        let stop = token == eos || self.constraint.as_ref().is_some_and(|state| state.terminated());
+        if !stop {
             if let Some(content) = self.decoder.step(token)? {
                 self.send(InferenceChunk::Text { content, content_tokens: self.buffered })?;
                 self.buffered = 0;
             }
         }
-        let finish = if token == eos {
+        let finish = if stop {
             Some(InferenceFinishReason::Stop)
         } else if self.generated >= self.job.max_tokens || self.placement.len + 1 >= self.capacity {
             Some(InferenceFinishReason::Length)
@@ -320,18 +322,23 @@ fn finish_row(request: &mut Active<'_>, token: Result<u32>, eos: u32, logits: &D
             }
             true
         }
-        Err(_) => true,
+        Err(error) => {
+            // The request fails alone, with its cause on the stream.
+            let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+            true
+        }
     }
 }
 
-/// Each row draws at the position after it, masked along its sequence's drafts.
+/// Each row draws at the position after it, masked along its sequence's
+/// drafts. A sequence whose grammar fails gets its error (and unmasked rows):
+/// it fails alone, never the batch.
 fn select_rows(selector: &mut TokenSelector<'_>, logits: &crate::shared::token_io::DeviceLogits, active: &[Active<'_>],
-    sequences: &[Vec<u32>], starts: &[usize]) -> Result<Vec<RowResult>> {
+    sequences: &[Vec<u32>], starts: &[usize]) -> Result<(Vec<RowResult>, Vec<Option<String>>)> {
     let mut batch = SelectBatch::default();
-    for ((a, rows), &start) in active.iter().zip(sequences).zip(starts) {
-        batch.push_sequence(a.job.sampling, a.constraint.as_ref(), rows, start as u64 + 1)?;
-    }
-    selector.select(logits, &batch)
+    let poisoned = active.iter().zip(sequences).zip(starts).map(|((a, rows), &start)|
+        batch.push_sequence_isolated(a.job.sampling, a.constraint.as_ref(), rows, start as u64 + 1)).collect();
+    Ok((selector.select(logits, &batch)?, poisoned))
 }
 
 /// Drafts after every active sequence's next token, verifies `[next, drafts]`
@@ -382,13 +389,18 @@ fn speculative_step(
         .map(|(a, tokens)| (&mut a.placement, tokens.as_slice())).collect();
     let timer = Instant::now();
     let logits = engine.verify_device(&mut rows, transports, runtime)?;
-    let selected = select_rows(selector, &logits, active, &sequences, &starts)?;
+    let (selected, mut poisoned) = select_rows(selector, &logits, active, &sequences, &starts)?;
     engine.check_device()?;
     shape.verify_us = console::us(timer);
     shape.verified = sequences.iter().map(|rows| rows.len() - 1).collect();
     shape.drafts = drafts;
     let mut offset = 0;
-    Ok(active.iter_mut().zip(&sequences).zip(starts).map(|((request, rows), start)| {
+    Ok(active.iter_mut().zip(&sequences).zip(starts).enumerate().map(|(i, ((request, rows), start))| {
+        if let Some(error) = poisoned[i].take() {
+            offset += rows.len();
+            return finish_row(request, Err(anyhow::anyhow!(error)), eos, &logits, offset - rows.len(), caching,
+                engine.library);
+        }
         let mut finished = false;
         for (j, _) in rows.iter().enumerate() {
             // Rows 0..=j are committed; the token row j produces is next.
@@ -705,6 +717,7 @@ fn schedule(
                     Ok(decoder) => decoder,
                     Err(error) => {
                         tracing::warn!("admission failed: {error:#}");
+                        let _ = p.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                         retain_prompt(&mut cache, &p.tokens, &placement);
                         release(&family, &mut cache, &mut states, &placement);
                         continue;
@@ -718,10 +731,13 @@ fn schedule(
                 let emitted = request.emit(first, eos);
                 request.ticket.first(first);
                 retain_prompt(&mut cache, &request.history[..request.placement.len], &request.placement);
-                match emitted {
+                match &emitted {
                     Ok(false) => active.push(request),
                     // Finished at its first token: its turn is its prompt snapshot.
                     Ok(true) | Err(_) => {
+                        if let Err(error) = &emitted {
+                            let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                        }
                         request.ticket.done(request.generated);
                         release(&family, &mut cache, &mut states, &request.placement)
                     }
@@ -752,11 +768,14 @@ fn schedule(
             let mut rows: Vec<(&mut Placement, u32)> = active.iter_mut().map(|a| (&mut a.placement, a.next)).collect();
             let timer = Instant::now();
             engine.decode_device(&mut rows, transports.first_mut(), runtime).and_then(|logits| {
-                let selected = select_rows(selector, &logits, &active, &sequences, &starts)?;
+                let (selected, mut poisoned) = select_rows(selector, &logits, &active, &sequences, &starts)?;
                 engine.check_device()?;
                 shape.verify_us = console::us(timer);
                 Ok(active.iter_mut().zip(&selected).enumerate().map(|(row, (request, selected))| {
-                    let token = take(request.constraint.as_mut(), selected);
+                    let token = match poisoned[row].take() {
+                        Some(error) => Err(anyhow::anyhow!(error)),
+                        None => take(request.constraint.as_mut(), selected),
+                    };
                     finish_row(request, token, eos, &logits, row, caching, engine.library)
                 }).collect::<Vec<bool>>())
             })

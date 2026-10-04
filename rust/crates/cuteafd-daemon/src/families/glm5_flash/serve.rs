@@ -137,19 +137,23 @@ fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
     use console::{Color::*, StepGroup};
     let mut layout = console::Layout::new("glm5_flash", model.into(), args.engine.snapshot.clone());
     let sparks = args.engine.peers.as_deref().map_or(0, |peers| peers.split(',').count());
-    layout.hardware = console::hardware(1, sparks, args.engine.local_experts);
+    layout.hardware = console::hardware(1 + usize::from(args.engine.split_device.is_some()), sparks,
+        args.engine.local_experts);
+    layout.split = args.engine.split_device.map(|_| "head split".into());
     layout.concurrency = args.max_sequences.min(DECODE_ROWS);
     let copy = if args.no_copy_drafts { "" } else { " · copy windows" };
     let policy = args.draft_fixed.map_or_else(|| "adaptive".to_string(), |n| format!("fixed {n}"));
-    layout.speculator = match (&args.engine.draft, args.no_copy_drafts) {
-        (Some(_), _) => Some(console::Speculator { name: "DFlash2".into(), positions: 8, policy: policy + copy }),
+    let drafter = args.engine.draft.as_deref()
+        .map(|snapshot| if super::dspark::is_dspark(snapshot) { "dSpark" } else { "DFlash2" });
+    layout.speculator = match (drafter, args.no_copy_drafts) {
+        (Some(name), _) => Some(console::Speculator { name: name.into(), positions: 8, policy: policy + copy }),
         (None, false) => Some(console::Speculator { name: "Copy window".into(), positions: COPY_DRAFT,
             policy: "adaptive length".into() }),
         (None, true) => None,
     };
     layout.steps = vec![
         StepGroup::new("Decode step", "host clock", &[("round.cycle", "step", Target),
-            ("draft", "DFlash2 draft", Accepted), ("plan", "draft plan + copy windows", Ink),
+            ("draft", "block draft", Accepted), ("plan", "draft plan + copy windows", Ink),
             ("verify", "verify pass + token selection", Target), ("emit", "accept + stream", Ink),
             ("commit", "KDA commit + drafter context", Accepted)]),
         StepGroup::new("Verify pass", "host clock, engine phases", &[
@@ -296,7 +300,9 @@ impl Active<'_> {
         self.digest = digest(self.digest, token);
         self.generated += 1;
         self.buffered += 1;
-        let stop = self.job.stop_token_ids.contains(&token);
+        // A grammar that accepted one of its stop tokens has ended the request.
+        let stop = self.job.stop_token_ids.contains(&token)
+            || self.constraint.as_ref().is_some_and(|state| state.terminated());
         if !stop {
             if let Some(content) = self.decoder.step(token)? {
                 self.send(InferenceChunk::Text { content, content_tokens: self.buffered })?;
@@ -358,7 +364,16 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, lanes: us
     anyhow::ensure!(args.prefix_partial == Toggle::Off, "GLM 5.3 Flash restores exact snapshots only (KDA state)");
     let family = GlmfPrefix::new(engine, |mark| if entries == 0 { 0 } else { MarkArena::slots_for(lanes, entries, mark, budget) })?;
     let template = engine.paged_buffers().first().map(|b| b[0]).context("GLM 5.3 Flash has no MLA layer")?;
-    let host = args.host_tier(engine.library, template, family.layout(), engine.max_context)?;
+    // The pinned host tier copies through one GPU's copy engine; a head split keeps its pages
+    // and marks on both GPUs, so it keeps device-resident snapshots only.
+    let host = if engine.ranks() > 1 {
+        if args.host_cache_bytes.enabled() && entries > 0 {
+            tracing::warn!("GLM 5.3 Flash head split: the prefix cache's host tier is off (device-resident snapshots only)");
+        }
+        None
+    } else {
+        args.host_tier(engine.library, template, family.layout(), engine.max_context)?
+    };
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();
     let config = PrefixConfig { entries, mark_slots: family.slots(), keep_logits: true,
@@ -407,7 +422,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         &opened.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, engine.cfg.eos.clone());
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
     let drafter = engine.drafter.as_ref();
-    let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
+    let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots()).rev().collect());
     // The TP2 table also prices TP4 as served (its observed ratio settles the
     // level); TP6 scales the Spark share by its widest slice against TP4's.
     let table = match ranks {
@@ -643,6 +658,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         }
                     }
                 };
+                let job_events = p.job.events.clone();
                 let admitted = (|| -> Result<Active<'_>> {
                     let mut request = Active {
                         digest: p.tokens.iter().fold(DIGEST_SEED, |d, &t| digest(d, t)),
@@ -666,10 +682,13 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         let emitted = request.emit(token);
                         request.ticket.first(token);
                         retain_prompt(&mut cache, &request.placement);
-                        match emitted {
+                        match &emitted {
                             Ok(false) => active.push(request),
                             // Finished at its first token: its turn is its prompt snapshot.
                             Ok(true) | Err(_) => {
+                                if let Err(error) = &emitted {
+                                    let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
+                                }
                                 request.ticket.done(request.generated);
                                 release(&family, &mut cache, &mut free_kda, &mut free_slots, &request.placement,
                                     request.slot)
@@ -678,6 +697,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     }
                     Err(error) => {
                         tracing::warn!("admission failed: {error:#}");
+                        let _ = job_events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                         retain_prompt(&mut cache, &placement);
                         release(&family, &mut cache, &mut free_kda, &mut free_slots, &placement, slot);
                     }
@@ -719,7 +739,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         }
                     }
                     // Drafts only speed decoding up; the step verifies the next tokens alone.
-                    Err(error) => tracing::warn!("DFlash2 draft failed: {error:#}"),
+                    Err(error) => tracing::warn!("{} draft failed: {error:#}", drafter.name()),
                 }
                 out
             }
@@ -731,6 +751,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let key = |a: &Active<'_>| (a.placement.len, a.digest);
         let inputs: Vec<dflash_policy::PlanInput<'_>> = active.iter().enumerate().map(|(i, a)| dflash_policy::PlanInput {
             key: key(a), history: &a.drafts, features: drafted[i].as_ref().map(|d| d.features.as_slice()),
+            confidence: drafted[i].as_ref().map(|d| d.confidence.as_slice()).filter(|c| !c.is_empty()),
             limit: limits[i],
         }).collect();
         let plan_timer = Instant::now();
@@ -765,6 +786,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             }
             Ok(rows)
         }).collect::<Result<_>>()?;
+        let mut poisoned: Vec<Option<String>> = vec![None; sequences.len()];
         let plan_us = console::us(plan_timer);
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
         let distinct_rows: usize = active.iter().zip(&sequences).map(|(a, rows)| (key(a), rows))
@@ -780,8 +802,9 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             .and_then(|logits| {
                 // Each row draws at the position after it, masked along its sequence's drafts.
                 let mut batch = SelectBatch::default();
-                for ((a, rows), &start) in active.iter().zip(&sequences).zip(&starts) {
-                    batch.push_sequence(a.job.sampling, a.constraint.as_ref(), rows, start as u64 + 1)?;
+                for (i, ((a, rows), &start)) in active.iter().zip(&sequences).zip(&starts).enumerate() {
+                    // A grammar failure fails that sequence alone, after the step.
+                    poisoned[i] = batch.push_sequence_isolated(a.job.sampling, a.constraint.as_ref(), rows, start as u64 + 1);
                 }
                 Ok((selector.select(&logits, &batch)?, logits))
             });
@@ -808,6 +831,11 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         let before: Vec<usize> = active.iter().map(|a| a.history.len()).collect();
         let finished: Vec<bool> = active.iter_mut().zip(&sequences).zip(starts).enumerate()
             .map(|(i, ((request, rows), start))| {
+            if let Some(error) = poisoned[i].take() {
+                let _ = request.job.events.send(Err(NativeFailure::Worker(error)));
+                offset += rows.len();
+                return true;
+            }
             let mut finished = false;
             for j in 0..rows.len() {
                 // Rows 0..=j are committed; the token row j produces is next.
@@ -826,7 +854,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                             break;
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                         finished = true;
                         break;
                     }

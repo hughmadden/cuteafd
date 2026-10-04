@@ -15,6 +15,7 @@ parser.add_argument('--case', choices=['counting','code','code-reasoning','topic
 parser.add_argument('--nonce', help='Use the same prompt nonce for controlled comparisons; defaults to a fresh UUID')
 parser.add_argument('--max-tokens', type=int, help='Override the corpus output budget for both arms of a controlled comparison')
 parser.add_argument('--allow-cold', action='store_true', help='Do not require prefix-cache hits (engines without a prefix cache)')
+parser.add_argument('--no-output-checks', action='store_true', help='Time responses whose content checks fail (speculator A/B runs: verify-width near-ties change greedy text between arms and batch shapes)')
 parser.add_argument('--distinct-prompts', action='store_true', help='Give each concurrent request its own nonce (requests stop sharing routes); implies --allow-cold')
 args=parser.parse_args()
 if args.repeats < 1 or any(c < 1 or c > 16 for c in args.concurrency):
@@ -32,6 +33,8 @@ if args.max_tokens is not None:
  definition=dict(definition,max_tokens=args.max_tokens)
 prompt=f"{args.prompt_label or args.label} {args.nonce if args.nonce is not None else uuid.uuid4().hex}. {definition['prompt']}"
 def validate(result):
+ if args.no_output_checks:
+  return {'response_nonempty':bool(result['text'].strip()),'objective_checks_passed':None,'prose_quality_assessed':False}
  if args.case=='counting':
   assert [x.strip() for x in result['text'].split(',')]==[str(x) for x in range(1,201)],'counting sequence was incorrect'
   return {'response_nonempty':True,'objective_checks':{'counting_sequence':{'passed':True}},'objective_checks_passed':True,'prose_quality_assessed':False}
