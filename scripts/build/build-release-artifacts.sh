@@ -246,6 +246,18 @@ for release_family in "${release_family_list[@]}"; do
 done
 # Exact FP8 expert packages (FAMILY:fp8 entries) ship as fp8/fp8-FAMILY; the
 # directory always exists so the release image can COPY it.
+# CMake automatically builds the TP1 FP8 MTP sibling for local Qwen NVFP4.
+# Stage it on the coordinator without requesting an unsupported Spark layout.
+if [[ "$role" == coordinator ]]; then
+  for release_family in "${release_family_list[@]}"; do
+    case "$release_family" in
+      qwen4:nvfp4|qwen4:nvfp4a4)
+        release_family_list+=(qwen4:fp8)
+        break
+        ;;
+    esac
+  done
+fi
 mkdir -p "$output_dir/fp8"
 fp8_revision="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["revision"])' "$build_root/source/third_party/sparkinfer.lock.json")"
 for release_family in "${release_family_list[@]}"; do
