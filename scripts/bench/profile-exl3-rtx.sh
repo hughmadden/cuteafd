@@ -11,8 +11,8 @@ mode=${1:?expected peak, timing, phases, ncu or nsys}
 shift
 case "$mode" in peak|timing|phases|ncu|nsys) ;; *) exit 2 ;; esac
 [[ $gpu == 1 ]] || { echo 'This runner holds gpu1.lock and requires GPU 1.' >&2; exit 2; }
-python3 "$repo/scripts/build/assert-build-filesystem.py" "$build_root"
-mkdir -p "$build_root/cache"
+python3 "$repo/scripts/build/assert-build-filesystem.py" "$build_root" "$build_root/cache" "$build_root/tmp"
+mkdir -p "$build_root/cache" "$build_root/tmp"
 build_root=$(cd "$build_root" && pwd)
 
 if [[ $mode == peak ]]; then
@@ -20,7 +20,7 @@ if [[ $mode == peak ]]; then
   # The real workspace path and its git metadata must both be visible inside
   # the container: submodule gitdirs in a worktree are relative to that path.
   flock "$HOME/.cache/cuteafd/build.lock" timeout --kill-after=30 180 \
-    docker run --rm --entrypoint nvcc \
+    docker run --rm --entrypoint nvcc -e TMPDIR=/w/tmp \
       -v "$repo:$repo:ro" -v "$build_root:/w" "$image" \
       -O3 -std=c++17 -gencode arch=compute_120,code=sm_120 -lineinfo \
       -o /w/mma_peak "$repo/python/tools/bench/exl3_mma_peak.cu"
@@ -64,16 +64,20 @@ rdma link
 for rate in /sys/class/infiniband/*/ports/*/rate; do echo "$rate: $(cat "$rate")"; done
 nvidia-smi --query-gpu=index,power.limit,clocks.sm,clocks.mem,temperature.gpu,memory.used --format=csv
 capabilities=()
-if [[ $mode == ncu ]]; then capabilities=(--cap-add SYS_ADMIN); fi
+launcher=(docker)
+if [[ $mode == ncu ]]; then
+  capabilities=(--cap-add SYS_ADMIN)
+  launcher=(agent-sudo --agent-context "Run Nsight Compute with profiling-counter access in a temporary SM120 container; no host settings change" docker)
+fi
 # NCU needs the profiler capability in its container on hosts with restricted
 # counters. No host driver settings are changed. No workers or servers start.
-timeout --signal=TERM --kill-after=30 1200 docker run --rm --name "$name" \
-  --gpus device=1 "${capabilities[@]}" --entrypoint bash \
+timeout --signal=TERM --kill-after=30 1200 "${launcher[@]}" run --rm --name "$name" \
+  --gpus device=1 "${capabilities[@]}" --workdir /w --entrypoint "${command[0]}" \
   -e PYTHONDONTWRITEBYTECODE=1 -e "PYTHONPATH=$repo/third_party/sparkinfer" \
   -e "CUTEAFD_SPARKINFER_SOURCE_DIR=$repo/third_party/sparkinfer" \
   -e "CUTEAFD_SPARKINFER_LOCK_FILE=$repo/third_party/sparkinfer.lock.json" \
   -e B12X_COMPILE_CACHE_DIR=/w/cache/b12x -e CUDA_CACHE_PATH=/w/cache/cuda \
-  -e TRITON_CACHE_DIR=/w/cache/triton \
+  -e TRITON_CACHE_DIR=/w/cache/triton -e TMPDIR=/w/tmp \
   -v "$(dirname "$repo"):$(dirname "$repo"):ro" -v "$build_root:/w" \
   -v "$build_root/cache:/root/.cache" -v /mnt/sparknest:/mnt/sparknest:ro \
-  "$image" -c 'cd /w; exec "$@"' bash "${command[@]}"
+  "$image" "${command[@]:1}"
