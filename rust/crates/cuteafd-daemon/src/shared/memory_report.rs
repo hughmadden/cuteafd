@@ -173,6 +173,13 @@ pub(crate) fn safetensors_bytes(directory: &std::path::Path) -> u64 {
 /// drafter checkpoint the lead GPU will load.
 pub(crate) fn planned_pool_tokens(library: &cuteafd_ffi::NativeLibrary, snapshot: &std::path::Path, devices: &[i32],
     drafter: Option<&std::path::Path>, prefill_rows: usize, slots: usize) -> anyhow::Result<usize> {
+    planned_pool_tokens_with_extra(library, snapshot, devices, drafter, prefill_rows, slots, 0)
+}
+
+/// Reserve a family's optional buffers before admitting its automatic KV pool.
+pub(crate) fn planned_pool_tokens_with_extra(library: &cuteafd_ffi::NativeLibrary, snapshot: &std::path::Path,
+    devices: &[i32], drafter: Option<&std::path::Path>, prefill_rows: usize, slots: usize,
+    extra_reserve_bytes: u64) -> anyhow::Result<usize> {
     use anyhow::Context;
     let checkpoint = cuteafd_loader::plan::Checkpoint::open(snapshot)?;
     let family = cuteafd_loader::plan::family::detect(&checkpoint).context("no family for this checkpoint")?;
@@ -194,7 +201,7 @@ pub(crate) fn planned_pool_tokens(library: &cuteafd_ffi::NativeLibrary, snapshot
             device,
             bytes_per_token: (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes).div_ceil(unit),
             reserve_bytes: workspace + if split { costs.exchange_bytes } else { 0 } + if index == 0 { draft } else { 0 }
-                + state + marks + costs.graph_bytes[role] + headroom,
+                + state + marks + costs.graph_bytes[role] + headroom + extra_reserve_bytes,
         }
     }).collect();
     let tokens = auto_pool_tokens(library, &kv, unit, cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS)?;

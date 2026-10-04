@@ -298,7 +298,37 @@ def glmf_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context
     their intermediate slices); mHC, the DSA indexer, router, expert input and head stay the
     whole model's programs."""
     keep = ("kda_m", "kda_w8_m", "kda_commit", "mla_producer_m", "o_m", "sparse_mla_", "ffn_i")
-    return [item for item in glmf_programs(g, decode_rows, prefill_rows, max_context) if item[0].startswith(keep)]
+    from b12x.integration.cuteafd import glmf
+
+    programs = [item for item in glmf_programs(g, decode_rows, prefill_rows, max_context) if item[0].startswith(keep)]
+    programs.append(("add_fp32", "add_fp32", {}, lambda: glmf.compile_glmf_add_fp32_aot(g)))
+    programs.append(("join_heads", "join", {"half_width": g.kda_width},
+                     lambda: glmf.compile_glmf_join_aot(g.kda_width)))
+    programs.append(("join_rows", "join_rows", {"width": g.hidden},
+                     lambda: glmf.compile_glmf_join_rows_aot(g.hidden)))
+    for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
+        programs.append((f"kda_w8_norm_m{rows}", "kda", {"max_rows": rows, "fp8_only": mode, "output_kind": "norm"},
+                         lambda r=rows, m=mode: glmf.compile_glmf_kda_aot(
+                             g, max_rows=r, fp8_only=m, output_kind="norm")))
+        programs.append((f"kda_output_rows_m{rows}", "kda_output_rows", {"max_rows": rows, "fp8_only": mode},
+                         lambda r=rows, m=mode: glmf.compile_glmf_kda_output_rows_aot(
+                             g, max_rows=r, fp8_only=m)))
+        for suffix, dtype in (("f32", "float32"),):
+            programs.append((f"kda_w8_{suffix}_m{rows}", "kda", {"max_rows": rows, "fp8_only": mode, "output_dtype": dtype},
+                             lambda r=rows, m=mode, d=dtype: glmf.compile_glmf_kda_aot(
+                                 g, max_rows=r, fp8_only=m, output_dtype=d)))
+    for suffix, dtype in (("", "bfloat16"), ("_f32", "float32")):
+        programs.append((f"kda_w8{suffix}_expanded_m{prefill_rows}", "kda",
+                         {"max_rows": prefill_rows, "fp8_only": "prefill", "output_dtype": dtype, "prefill_expanded": True},
+                         lambda d=dtype: glmf.compile_glmf_kda_aot(
+                             g, max_rows=prefill_rows, fp8_only="prefill", output_dtype=d, prefill_expanded=True)))
+    programs.extend([
+        (f"kda_w8_norm_expanded_m{prefill_rows}", "kda", {"max_rows": prefill_rows, "output_kind": "norm", "prefill_expanded": True},
+         lambda: glmf.compile_glmf_kda_aot(g, max_rows=prefill_rows, fp8_only="prefill", output_kind="norm", prefill_expanded=True)),
+        (f"kda_output_rows_expanded_m{prefill_rows}", "kda_output_rows", {"max_rows": prefill_rows, "prefill_expanded": True},
+         lambda: glmf.compile_glmf_kda_output_rows_aot(g, max_rows=prefill_rows, fp8_only="prefill", prefill_expanded=True)),
+    ])
+    return programs
 
 
 def qwen4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):

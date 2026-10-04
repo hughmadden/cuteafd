@@ -95,6 +95,15 @@ pub(crate) struct EngineArgs {
     /// output under speculation; opt-in.
     #[arg(long, value_enum, default_value = "off")]
     pub kda_fp8: fp8::KdaFp8,
+    /// Keep FP8 KDA output partials in FP32 until the two-GPU sum.
+    #[arg(long, env = "CUTEAFD_GLMF_KDA_FP32_PARTIALS", default_value_t = false)]
+    pub kda_fp32_partials: bool,
+    /// Split KDA output token rows after sharing BF16 heads; round each output once.
+    #[arg(long, env = "CUTEAFD_GLMF_KDA_OUTPUT_SHARD", default_value_t = false, conflicts_with = "kda_fp32_partials")]
+    pub kda_output_shard: bool,
+    /// Expand W8A16 prefill weights once in existing scratch.
+    #[arg(long, env = "CUTEAFD_GLMF_KDA_PREFILL_EXPANDED", default_value_t = false)]
+    pub kda_prefill_expanded: bool,
     /// Keep only an E4M3 LM head (per row x 128-K scales, quantized at load):
     /// every logits call (target, verify, prefill, DFlash drafts) runs the FP8
     /// head program in 16-row spans; no BF16 head stays resident.
@@ -214,6 +223,29 @@ mod draft_cli_tests {
         }
         assert!(check_options(&parse(&["--fp8-prefill", "none,mla"])).is_err());
         assert!(check_options(&parse(&["--kda-fp8", "row128", "--kda-nvfp4-gate", "rtn"])).is_err());
+    }
+
+    #[test]
+    fn precise_kda_partials_need_compatible_split_programs() {
+        let defaults = parse(&[]);
+        assert!(!defaults.kda_fp32_partials && !defaults.kda_output_shard && !defaults.kda_prefill_expanded);
+        for option in ["--kda-fp32-partials", "--kda-output-shard", "--kda-prefill-expanded"] {
+            assert!(check_options(&parse(&[option])).is_err());
+            assert!(check_options(&parse(&["--kda-fp8", "row128", option])).is_err());
+            check_options(&parse(&["--split-device", "1", "--kda-fp8", "row128", option])).unwrap();
+        }
+        for option in ["--kda-fp32-partials", "--kda-output-shard"] {
+            for group in ["kda-o", "all"] {
+                assert!(check_options(&parse(&["--split-device", "1", "--kda-fp8", "row128",
+                    option, "--fp8-prefill", group])).is_err());
+            }
+        }
+        check_options(&parse(&["--split-device", "1", "--kda-fp8", "row128", "--kda-fp32-partials",
+            "--kda-prefill-expanded", "--fp8-prefill", "kda-in"])).unwrap();
+        assert_eq!(engine::fp32_partial_reserve(4096, 4096), 369_623_040);
+        assert_eq!(engine::fp32_partial_reserve(32, 4096), 6_291_456);
+        assert_eq!(engine::output_shard_reserve(4096, 4096), 134_217_728);
+        assert_eq!(engine::output_shard_reserve(32, 4096), 2_097_152);
     }
 }
 
@@ -342,6 +374,13 @@ pub(crate) struct GoldenArgs {
 
 /// Option combinations rejected before any checkpoint or native work.
 fn check_options(args: &EngineArgs) -> Result<()> {
+    let precise = args.kda_fp32_partials || args.kda_output_shard;
+    ensure!(!(precise || args.kda_prefill_expanded) ||
+        (args.split_device.is_some() && args.kda_fp8 != fp8::KdaFp8::Off),
+        "KDA partial/expanded options require --split-device and --kda-fp8 row128 or channel");
+    ensure!(!precise || !args.fp8_prefill.iter().any(|g|
+        matches!(g, Fp8PrefillGroup::KdaO | Fp8PrefillGroup::All)),
+        "KDA precise partials require W8A16 output (--fp8-prefill kda-o/all is unsupported)");
     let kda_prefill = args.fp8_prefill.iter().any(|g| matches!(g, Fp8PrefillGroup::KdaIn | Fp8PrefillGroup::KdaO));
     ensure!(!kda_prefill || args.kda_fp8 != fp8::KdaFp8::Off,
         "--fp8-prefill kda-in/kda-o run over FP8 KDA weights; add --kda-fp8 row128 or channel");
@@ -428,6 +467,24 @@ impl Opened {
         if args.fp8_head {
             needed.push("glmf_head_fp8");
         }
+        if args.kda_fp32_partials {
+            needed.extend(["glmf2_kda_w8_f32_m64", "glmf2_kda_w8_f32_m4096"]);
+            needed.push("glmf2_add_fp32");
+        }
+        if args.kda_output_shard {
+            ensure!(self.cfg.kda_heads * self.cfg.kda_head_dim == 2 * self.cfg.hidden && self.cfg.hidden % 2 == 0,
+                "KDA output sharding needs KDA width=2*hidden and even hidden, got heads={} head_dim={} hidden={}",
+                self.cfg.kda_heads, self.cfg.kda_head_dim, self.cfg.hidden);
+            needed.extend(["glmf2_kda_w8_norm_m64", "glmf2_kda_w8_norm_m4096",
+                "glmf2_kda_output_rows_m64", "glmf2_kda_output_rows_m4096",
+                "glmf2_join_heads", "glmf2_join_rows"]);
+        }
+        if args.kda_prefill_expanded {
+            needed.push(if args.kda_output_shard { "glmf2_kda_w8_norm_expanded_m4096" }
+                else if args.kda_fp32_partials { "glmf2_kda_w8_f32_expanded_m4096" }
+                else { "glmf2_kda_w8_expanded_m4096" });
+            if args.kda_output_shard { needed.push("glmf2_kda_output_rows_expanded_m4096"); }
+        }
         for name in needed {
             programs.spec(name).with_context(|| format!("--kda-fp8/--fp8-head keep only FP8 weights and need \
                 program {name}; this native library predates it"))?;
@@ -444,6 +501,9 @@ impl Opened {
             }
             None => None,
         };
+        ensure!(!(args.kda_fp32_partials || args.kda_output_shard || args.kda_prefill_expanded)
+            || split_device.is_some(),
+            "KDA partial/expanded options require native head-split programs (missing glmf2_kda_m64)");
         let peer_stream = match split_device {
             Some(device) => {
                 ensure!(device != args.device, "--split-device must differ from --device");
@@ -458,7 +518,7 @@ impl Opened {
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::GlmfLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
-            fp8_source: self.fp8_checkpoint.as_ref(), kda_fp8: args.kda_fp8, kda_output_shard: false,
+            fp8_source: self.fp8_checkpoint.as_ref(), kda_fp8: args.kda_fp8, kda_output_shard: args.kda_output_shard,
             fp8_head: args.fp8_head, kda_nvfp4: args.kda_nvfp4_gate.as_deref().map(|mode| mode == "search"),
             fp8_scales: args.fp8_scales, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
@@ -482,14 +542,22 @@ impl Opened {
             "GLM 5.3 Flash coordinator weights resident (one copy each)");
         // 0: the planner's automatic pool (free memory after the costs still to come).
         let pool_tokens = if args.pool_tokens == 0 {
-            crate::shared::memory_report::planned_pool_tokens(&self.library, &args.snapshot, &[args.device],
-                args.draft.as_deref(), args.prefill_rows, args.slots)?
+            crate::shared::memory_report::planned_pool_tokens_with_extra(&self.library, &args.snapshot,
+                &if args.kda_fp32_partials || args.kda_output_shard { vec![args.device, args.split_device.context("precise head split")?] }
+                    else { vec![args.device] },
+                args.draft.as_deref(), args.prefill_rows, args.slots,
+                if args.kda_output_shard { engine::output_shard_reserve(args.prefill_rows, self.cfg.hidden) }
+                    else { engine::partial_reserve(args.prefill_rows, self.cfg.hidden,
+                        if args.kda_fp32_partials { 4 } else { 2 }) })?
         } else {
             args.pool_tokens
         };
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages, args.slots, embedding)?;
+        engine.kda_fp32_partials = args.kda_fp32_partials;
+        engine.kda_output_shard = args.kda_output_shard;
+        engine.kda_prefill_expanded = args.kda_prefill_expanded;
         if let Some((device, peer_stream)) = peer_stream {
             engine.attach_peer(device, peer_stream, shares.pop().context("head-split shares")?)?;
             tracing::info!(device = args.device, split_device = device, "GLM 5.3 Flash head split over two GPUs");

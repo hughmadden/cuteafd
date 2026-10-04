@@ -334,6 +334,21 @@ impl Allocator {
     }
 }
 
+/// Extra per-GPU storage: all peer receive slots and every retained workspace's delta.
+pub(crate) fn fp32_partial_reserve(prefill_rows: usize, hidden: usize) -> u64 {
+    partial_reserve(prefill_rows, hidden, 4)
+}
+
+pub(crate) fn partial_reserve(prefill_rows: usize, hidden: usize, bytes: usize) -> u64 {
+    (((4 * PREFILL_LANES + PREFILL_LANES + 1) * prefill_rows.max(DECODE_ROWS) + DECODE_ROWS)
+        * hidden * bytes.saturating_sub(2)) as u64
+}
+
+/// Four additional parity/lane slots hold normalized heads until the peer consumes them.
+pub(crate) fn output_shard_reserve(prefill_rows: usize, hidden: usize) -> u64 {
+    (2 * PREFILL_LANES * prefill_rows.max(DECODE_ROWS) * hidden * 2) as u64
+}
+
 struct Workspace<'a> {
     rows: usize,
     /// Zero rows: rank 1's partial of a dense MLP rank 0 runs whole (ModelOpt NVFP4).
@@ -488,6 +503,16 @@ fn slot(index: usize, ffn: bool, lane: usize) -> usize {
     4 * lane + 2 * (index % 2) + usize::from(ffn)
 }
 
+fn norm_slot(output_slot: usize) -> usize {
+    4 * PREFILL_LANES + (output_slot / 4) * 2 + (output_slot % 4) / 2
+}
+
+/// Output token rows: rank 0 owns the leading ceil half, rank 1 the remaining rows.
+fn output_rows(rows: usize, rank: usize) -> (usize, usize) {
+    let first = rows.div_ceil(2);
+    if rank == 0 { (0, first) } else { (first, rows - first) }
+}
+
 pub(crate) struct GlmfEngine<'a> {
     quantize_grid: Fp8QuantizeGrid,
     pub library: &'a NativeLibrary,
@@ -544,6 +569,9 @@ pub(crate) struct GlmfEngine<'a> {
     ops: Option<RefCell<OpTimes>>,
     /// Prefill projections that run block-FP8 GEMMs (the layers need FP8 copies).
     pub fp8_prefill: Fp8Prefill,
+    pub kda_fp32_partials: bool,
+    pub kda_output_shard: bool,
+    pub kda_prefill_expanded: bool,
     /// The token embedding table (resident on this GPU or read from its shard).
     pub embedding: TokenEmbedding<'a>,
 }
@@ -617,7 +645,9 @@ impl<'a> GlmfEngine<'a> {
             subset_lanes: std::env::var("CUTEAFD_GLMF_PREFILL_LANES").is_ok_and(|v| v == "subset"),
             full_prefill_logits: false, routes_ready: library.cuda_event_create_ordering()?,
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
-            fp8_prefill: Fp8Prefill::default(), l2: None, embedding })
+            fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
+            kda_output_shard: false,
+            kda_prefill_expanded: false, l2: None, embedding })
     }
 
     /// Serves MoE layers from `experts` (without, the engine stops at the first MoE layer).
@@ -642,7 +672,8 @@ impl<'a> GlmfEngine<'a> {
             "attach_peer needs the head-split shares of every loaded layer");
         let rows = self.prefill_rows.max(DECODE_ROWS);
         let exchange = PeerExchange::new(self.library, [RankDevice { device: self.device, stream: self.stream },
-            RankDevice { device, stream }], 4 * PREFILL_LANES, rows * self.cfg.hidden * 2)?;
+            RankDevice { device, stream }], if self.kda_output_shard { 6 } else { 4 } * PREFILL_LANES,
+            rows * self.cfg.hidden * self.partial_bytes())?;
         let peer = exchange.on(1, || -> Result<GlmfPeer<'a>> {
             self.programs.load_all()?;
             let caches = Caches::new(self.library, &self.cfg, &layers, self.pages, self.pool_pages, self.slots,
@@ -997,6 +1028,19 @@ impl<'a> GlmfEngine<'a> {
         if self.weights.layers.iter().any(|layer| layer.has("w_in_fp8")) {
             scratch = scratch.max(self.scratch(&format!("kda_w8_{cap}"))?);
         }
+        if self.kda_fp32_partials || self.kda_output_shard || self.kda_prefill_expanded {
+            let dtype = if self.kda_output_shard { "_norm" } else if self.kda_fp32_partials { "_f32" } else { "" };
+            let expanded = if self.kda_prefill_expanded && !decode { "_expanded" } else { "" };
+            let spec = self.programs.spec(&format!("glmf2_kda_w8{dtype}{expanded}_{cap}"))?;
+            // Joined head activations occupy a fixed tail after the program's
+            // scratch and stay live through the output token-row projection.
+            let output = if self.kda_output_shard { t * h * 4 } else { 0 };
+            scratch = scratch.max(spec.scratch.get("scratch").copied().unwrap_or(0) as usize + output);
+            if self.kda_output_shard {
+                let spec = self.programs.spec(&format!("glmf2_kda_output_rows{expanded}_{cap}"))?;
+                scratch = scratch.max(spec.scratch.get("scratch").copied().unwrap_or(0) as usize + output);
+            }
+        }
         let topk_scratch = self.scratch(&format!("index_topk_{mode}_{cap}"))?;
         let pools = self.cfg.index_topk / KPOOL;
         let table_rows = if decode { t } else { 1 };
@@ -1015,7 +1059,7 @@ impl<'a> GlmfEngine<'a> {
             post: self.alloc(t * HC * 4)?,
             comb: self.alloc(t * HC * HC * 4)?,
             x: self.alloc(t * h * 2)?,
-            delta: self.alloc(t * h * 2)?,
+            delta: self.alloc(t * h * self.partial_bytes())?,
             shared: self.alloc(t * h * 2)?,
             routed: self.alloc(t * h * 2)?,
             query: self.alloc(t * n * lat * 2)?,
@@ -1381,14 +1425,85 @@ impl<'a> GlmfEngine<'a> {
         Ok(Some(PeerWorkspaces::One(slot.borrow())))
     }
 
-    /// Rank 0's side of an attention all-reduce on exchange slot `slot`: its partial (`delta`)
-    /// out, rank 1's in, their sum into `sum`. Without a head split, `delta` itself.
-    fn meet_attention(&self, w: &Workspace<'_>, slot: usize, t: usize) -> Result<*mut c_void> {
-        let Some(exchange) = &self.exchange else { return Ok(w.delta.buffer.ptr) };
+    fn precise_attention(&self, layer: &GlmfLayer<'_>) -> bool {
+        self.kda_fp32_partials && layer.split &&
+            layer.attention == GlmNextAttention::Kda && layer.has("w_in_fp8")
+    }
+
+    fn output_shard_attention(&self, layer: &GlmfLayer<'_>) -> bool {
+        self.kda_output_shard && layer.split &&
+            layer.attention == GlmNextAttention::Kda && layer.has("w_in_fp8")
+    }
+
+    fn partial_bytes(&self) -> usize {
+        if self.kda_fp32_partials { 4 } else { 2 }
+    }
+
+    fn full_kda_norm(&self, w: &Workspace<'_>) -> *mut c_void {
+        w.scratch.buffer.ptr.wrapping_byte_add(w.scratch.buffer.bytes - w.rows * self.cfg.hidden * 4)
+    }
+
+    /// Share the missing heads only for each rank's output token rows, project
+    /// those rows with the full K reduction, then share the finished rows.
+    /// Separate slots keep norm inputs live through both joins. Each token is
+    /// projected once and each output is rounded once.
+    fn complete_output_shard(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>,
+        output_slot: usize, t: usize, cap: &str) -> Result<*mut c_void> {
+        let exchange = self.exchange()?;
         let h = self.cfg.hidden;
-        exchange.push(0, slot, w.delta.buffer.ptr, t * h * 2)?;
-        exchange.wait(0, slot)?;
-        exchange.add(0, w.delta.buffer.ptr, exchange.recv(0, slot)?, w.sum.buffer.ptr, t * h)?;
+        let (first, owned) = output_rows(t, rank);
+        let sent_first = if rank == 0 { owned } else { 0 };
+        let heads_slot = norm_slot(output_slot);
+        exchange.push(rank, heads_slot, w.delta.buffer.ptr.wrapping_byte_add(sent_first * h * 2),
+            (t - owned) * h * 2)?;
+        exchange.wait(rank, heads_slot)?;
+        let peer_norm = exchange.recv(rank, heads_slot)?;
+        let norm = w.delta.buffer.ptr.wrapping_byte_add(first * h * 2);
+        let (a, b) = if rank == 0 { (norm, peer_norm) } else { (peer_norm, norm) };
+        let full = self.full_kda_norm(w);
+        let expanded = if self.kda_prefill_expanded && cap != "m64" { "_expanded" } else { "" };
+        if owned != 0 {
+            self.run_on(rank, true, "join_heads", &[("a", a), ("b", b), ("out", full)],
+                &[Scalar::I32(owned as i32)])?;
+            // Select the projection route from the global batch width, so a
+            // 64-row verification split into 32 + 32 retains the full-head TMA math.
+            self.run_on(rank, true, &format!("kda_output_rows{expanded}_{cap}"),
+                &[("x", full), ("w_fp8", layer.ptr("w_o_fp8")?),
+                ("w_kscale", layer.ptr("w_o_kscale")?), ("out", w.delta.buffer.ptr),
+                ("scratch", w.scratch.buffer.ptr)],
+                &[Scalar::I32(owned as i32), Scalar::I32(t as i32)])?;
+        }
+        // Zero-owned ranks still publish: both peers advance each slot's sequence.
+        exchange.push(rank, output_slot, w.delta.buffer.ptr, owned * h * 2)?;
+        exchange.wait(rank, output_slot)?;
+        let peer_output = exchange.recv(rank, output_slot)?;
+        let (a, b) = if rank == 0 { (w.delta.buffer.ptr, peer_output) } else { (peer_output, w.delta.buffer.ptr) };
+        self.run_on(rank, true, "join_rows",
+            &[("a", a), ("b", b), ("out", w.sum.buffer.ptr)],
+            &[Scalar::I32(t.div_ceil(2) as i32), Scalar::I32((t / 2) as i32)])?;
+        Ok(w.sum.buffer.ptr)
+    }
+
+    /// Rank 0's attention partial out, rank 1's in, their sum into `sum`.
+    /// Without a head split, returns `delta` itself.
+    fn meet_attention(&self, w: &Workspace<'_>, slot: usize, t: usize, layer: &GlmfLayer<'_>, cap: &str) -> Result<*mut c_void> {
+        let Some(exchange) = &self.exchange else { return Ok(w.delta.buffer.ptr) };
+        let (h, precise) = (self.cfg.hidden, self.precise_attention(layer));
+        if self.output_shard_attention(layer) {
+            return self.complete_output_shard(0, w, layer, slot, t, cap);
+        } else if precise {
+            // Both FP32 copies overlap. Sum in rank order on both GPUs and
+            // round once, preserving the unsplit projection's output precision.
+            exchange.push(0, slot, w.delta.buffer.ptr, t * h * 4)?;
+            exchange.wait(0, slot)?;
+            self.run_on(0, true, "add_fp32",
+                &[("a", w.delta.buffer.ptr), ("b", exchange.recv(0, slot)?),
+                ("out", w.sum.buffer.ptr)], &[Scalar::I32(t as i32)])?;
+        } else {
+            exchange.push(0, slot, w.delta.buffer.ptr, t * h * 2)?;
+            exchange.wait(0, slot)?;
+            exchange.add(0, w.delta.buffer.ptr, exchange.recv(0, slot)?, w.sum.buffer.ptr, t * h)?;
+        }
         Ok(w.sum.buffer.ptr)
     }
 
@@ -1432,10 +1547,22 @@ impl<'a> GlmfEngine<'a> {
         }
         self.attention(1, w1, index, layer, rows, cap, tables, None)?;
         let attended = slot(index, false, lane);
-        exchange.push(1, attended, w1.delta.buffer.ptr, t * h * 2)?;
-        exchange.wait(1, attended)?;
-        exchange.add(1, exchange.recv(1, attended)?, w1.delta.buffer.ptr, w1.sum.buffer.ptr, t * h)?;
-        self.post_pre_on(1, w1, w1.sum.buffer.ptr, 0, layer, "ffn", "post_norm", rows, cap)?;
+        let precise = self.precise_attention(layer);
+        let sum = if self.output_shard_attention(layer) {
+            self.complete_output_shard(1, w1, layer, attended, t, cap)?
+        } else {
+            exchange.push(1, attended, w1.delta.buffer.ptr, t * h * if precise { 4 } else { 2 })?;
+            exchange.wait(1, attended)?;
+            if precise {
+                self.run_on(1, true, "add_fp32",
+                    &[("a", exchange.recv(1, attended)?), ("b", w1.delta.buffer.ptr),
+                    ("out", w1.sum.buffer.ptr)], &[rows])?;
+            } else {
+                exchange.add(1, exchange.recv(1, attended)?, w1.delta.buffer.ptr, w1.sum.buffer.ptr, t * h)?;
+            }
+            w1.sum.buffer.ptr
+        };
+        self.post_pre_on(1, w1, sum, 0, layer, "ffn", "post_norm", rows, cap)?;
         let out = Self::peer_ffn_out(w1, layer);
         match (layer.dense, out == w1.zero.buffer.ptr) {
             (true, true) => {}
@@ -1524,7 +1651,12 @@ impl<'a> GlmfEngine<'a> {
                 trace.map(|dir| dir.join(format!("layer{index:02}"))).as_deref())?;
             if let Some(dir) = trace {
                 let dir = dir.join(format!("layer{index:02}"));
-                std::fs::write(dir.join("attention.bin"), self.download(&w.delta, t * h * 2)?)?;
+                let dtype = if self.precise_attention(layer) { "float32" } else { "bfloat16" };
+                std::fs::write(dir.join("attention.bin"), self.download(&w.delta,
+                    t * h * if dtype == "float32" { 4 } else { 2 })?)?;
+                std::fs::write(dir.join("attention_meta.json"), serde_json::to_vec(&serde_json::json!({
+                    "rows": t, "hidden": h, "dtype": dtype,
+                    "kind": if self.output_shard_attention(layer) { "normalized_heads" } else { "projection" } }))?)?;
                 if layer.attention == GlmNextAttention::Kda {
                     let d = self.caches.kda_heads * self.cfg.kda_head_dim;
                     // The in-projection's output width (q|k|v, f_a, g_a, b), whatever its weight format.
@@ -1541,7 +1673,7 @@ impl<'a> GlmfEngine<'a> {
             }
             // Attention back into the streams (a head split: the two partials' sum), then the
             // FFN site's collapse + norm.
-            let attended = self.meet_attention(w, slot(index, false, 0), t)?;
+            let attended = self.meet_attention(w, slot(index, false, 0), t, layer, cap)?;
             self.post_pre_on(0, w, attended, cur, layer, "ffn", "post_norm", rows, cap)?;
             cur ^= 1;
             if let Some(w1) = w1 {
@@ -1656,7 +1788,7 @@ impl<'a> GlmfEngine<'a> {
                     tap()?;
                 }
                 self.attention(0, w, index, layer, rows, "m64", tables, None)?;
-                let attended = self.meet_attention(w, slot(index, false, 0), t)?;
+                let attended = self.meet_attention(w, slot(index, false, 0), t, layer, "m64")?;
                 self.post_pre_on(0, w, attended, 0, layer, "ffn", "post_norm", rows, "m64")?;
                 if layer.dense {
                     self.ffn(w, layer, self.cfg.dense_intermediate, "m64", w.delta.buffer.ptr, rows)
@@ -1846,7 +1978,7 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// KDA over the layer's only (FP8, per-row x 128-K, K-major scales) in/out
-    /// projections: `kda_w8_{cap}`. Decode rows up to 16 run the FP8 GEMV, wider
+    /// projections: `kda_w8_{cap}`. Decode rows up to 32 on half heads (16 on full heads) run the FP8 GEMV, wider
     /// verify steps W8A16; prefill runs W8A8 on the `--fp8-prefill kda-*` bits, else W8A16.
     #[allow(clippy::too_many_arguments)]
     fn kda_w8(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str, spec: bool,
@@ -1858,7 +1990,9 @@ impl<'a> GlmfEngine<'a> {
             ("w_o_fp8", layer.ptr("w_o_fp8")?), ("w_o_kscale", layer.ptr("w_o_kscale")?), ("conv_state", conv_state),
             ("state", state), ("slots", w.kda_slots.buffer.ptr), ("seq_first", w.seq_first.buffer.ptr),
             ("out", w.delta.buffer.ptr)];
-        let mut scalars = vec![rows, Scalar::I32(if decode { FP8_ROWS } else { self.fp8_prefill.kda_bits })];
+        let mut scalars = vec![rows, Scalar::I32(if decode {
+            if layer.split { 32 } else { FP8_ROWS }
+        } else { self.fp8_prefill.kda_bits })];
         if decode {
             pointers.push(("replay", replay));
             scalars.push(Scalar::I32(i32::from(spec)));
@@ -1866,7 +2000,11 @@ impl<'a> GlmfEngine<'a> {
             ensure!(!spec, "speculative steps are decode-shaped");
         }
         pointers.push(("scratch", w.scratch.buffer.ptr));
-        self.run_on(rank, layer.split, &format!("kda_w8_{cap}"), &pointers, &scalars)
+        let dtype = if self.output_shard_attention(layer) { "_norm" }
+            else if self.precise_attention(layer) { "_f32" } else { "" };
+        let expanded = if self.kda_prefill_expanded && cap != "m64" { "_expanded" } else { "" };
+        let name = format!("kda_w8{dtype}{expanded}_{cap}");
+        self.run_on(rank, layer.split, &name, &pointers, &scalars)
     }
 
     /// `[rows, fp8]`: the decode programs' `fp8_rows` (16 when the layer has
@@ -2327,7 +2465,7 @@ impl<'a> GlmfEngine<'a> {
                 self.pre(w, &w.streams[0], weights, rows)?;
             }
             self.attention(0, w, layer, weights, rows, cap, &lanes[lane].0, None)?;
-            let attended = self.meet_attention(w, slot(layer, false, lane), t)?;
+            let attended = self.meet_attention(w, slot(layer, false, lane), t, weights, "m4096")?;
             self.post_pre_on(0, w, attended, 0, weights, "ffn", "post_norm", rows, cap)?;
             if weights.dense {
                 self.ffn(w, weights, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)
@@ -2473,6 +2611,40 @@ impl Drop for GlmfEngine<'_> {
 #[cfg(test)]
 mod prefill_lane_tests {
     use super::{prefill_lane_capacity, prefill_lane_plan, PAGE_ROWS, PREFILL_LANES};
+
+    #[test]
+    fn output_token_rows_cover_odd_batches_and_zero_owned_rank() {
+        for rows in [1, 22, 63, 64, 512, 513, 4096] {
+            let lead = super::output_rows(rows, 0);
+            let peer = super::output_rows(rows, 1);
+            assert_eq!(lead.0, 0);
+            assert_eq!(peer.0, lead.1);
+            assert_eq!(lead.1 + peer.1, rows);
+            // Norm rows sent + completed output rows equal the original
+            // BF16 partial's bytes, even for an odd or one-token batch.
+            for (_, owned) in [lead, peer] {
+                assert_eq!((rows - owned) * 4096 * 2 + owned * 4096 * 2, rows * 4096 * 2);
+            }
+        }
+        assert_eq!(super::output_rows(1, 1), (1, 0));
+    }
+
+    #[test]
+    fn output_shard_norm_slots_isolate_both_lanes_and_layer_parities() {
+        let mut heads = std::collections::BTreeSet::new();
+        let mut existing = std::collections::BTreeSet::new();
+        for lane in 0..PREFILL_LANES {
+            for layer in 0..2 {
+                existing.insert(super::slot(layer, false, lane));
+                existing.insert(super::slot(layer, true, lane));
+                let slot = super::norm_slot(super::slot(layer, false, lane));
+                assert_eq!(slot, super::norm_slot(super::slot(layer + 2, false, lane)));
+                assert!(heads.insert(slot));
+            }
+        }
+        assert!(heads.is_disjoint(&existing));
+        assert_eq!(heads, (8..12).collect());
+    }
 
     #[test]
     fn every_advertised_prefill_tail_fits_its_lane_workspaces() {
