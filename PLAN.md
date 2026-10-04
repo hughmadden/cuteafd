@@ -968,6 +968,25 @@ item-4 bugs and started items 7 and 10; commit messages carry its evidence.
     quality/C4 bars; FP8 under the split misses both, so remains opt-in.
     Conditions and both tables: `docs/models/glm5_flash.md` and
     `benchmarks/glm5_flash/2026-10-04-fp8-recheck/comparison.json`.
+    **Split regression audit (same recheck, no new hardware run):** the
+    FP8 arm's warm and two timed 8K requests have essentially constant
+    coordinator GPU wait while expert wait rises on each request. Its warm
+    prefill is faster than BF16; the timed aggregate loss is dominated by
+    Spark expert wait, not evidence of an equally large KDA compute loss.
+    Both arms use the same prefill shape. Split KDA directly consumes FP8
+    weights (`glmf2_kda_w8_m4096`); the generated library loads on every CUDA
+    device. No BF16 re-conversion or replicated full-head KDA work found.
+    All 238 KDA projection tensors in the primary EXL3 and official FP8
+    companion snapshots are byte-identical before conversion. Column
+    slicing of KDA O preserves the 128-K scale-block boundaries. Split
+    attention partials still round to BF16 before the peer sum: interaction
+    with FP8 quantization is a plausible, unproven contributor to top-1
+    loss. Worker logs show no explanatory timeout/stall; per-request route
+    distributions and Spark clock/thermal samples were not recorded.
+    No clear fix qualified: keep split FP8 opt-in. Next discriminating
+    measurement is one matched D/F launch with identical 8K token IDs,
+    worker timing/route distributions and Spark clocks, plus KDA/head
+    precision ablation if quality remains below the split promotion bar.
     V4.1 `all` now releases BF16 and shares a single FP8 vocabulary head
     across target and dSpark. Claude accepted its target-head quality;
     dual-RTX C1 missed the promotion bar, so BF16 stays default. `draft`
