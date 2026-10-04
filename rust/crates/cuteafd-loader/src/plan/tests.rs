@@ -895,6 +895,11 @@ fn layout_charges_local_routed_experts_to_the_coordinator() {
     let routed = component(&report, Component::RoutedExpert).bytes;
     assert!(routed > 0);
     let memory = report.memory_layout.unwrap();
-    assert_eq!(memory.devices[0].by_category()[&Category::Experts], routed);
+    let expert_weights: u64 = memory.devices[0].items.iter()
+        .filter(|item| item.category == Category::Experts && item.group == Component::RoutedExpert.label())
+        .map(|item| item.bytes).sum();
+    assert_eq!(expert_weights, routed);
+    // Resident EXL3 execution arenas also consume the coordinator budget.
+    assert!(memory.devices[0].by_category()[&Category::Experts] > routed);
     assert_eq!(memory.devices.len(), 1);
 }

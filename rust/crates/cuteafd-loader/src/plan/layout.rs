@@ -344,6 +344,13 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
             devices[0].items.push(Item::new(Category::Experts, "native MTP experts", "native", native_experts, Basis::Exact));
         }
     }
+    if family == "qwen4" && report.placement == ExpertPlacement::Local
+        && report.experts.as_ref().is_some_and(|e| e.package.contains("exl3")) {
+        // The EXL3 window retains its shared capacity arenas in addition to
+        // checkpoint trellis bytes (1.15 GiB in the reference allocation ledger).
+        devices[0].items.push(Item::new(Category::Experts, "local EXL3 workspace", "",
+            gib(115) * prefill_rows / 4096, allowance_basis));
+    }
     // The drafter lives on the lead GPU (taps and head are there under a head split).
     let drafter = if options.drafter_bytes > 0 { options.drafter_bytes } else { costs.drafter_bytes };
     if drafter > 0 {
@@ -374,6 +381,15 @@ pub fn layout(report: &PlanReport, model: &dyn super::FamilyModel, checkpoint: &
         let workspace = v4_workspace.as_ref().and_then(|ranks| ranks.get(index)).map_or_else(
             || costs.workspace_bytes[role] * prefill_rows.max(1) / if family == "deepseek_v41" { 2048 } else { 4096 },
             |rank| rank.fixed_device_bytes);
+        // V4 keeps one 4096-row intake plane per Spark and prefill lane.
+        // Decode reuses lane zero; every plane belongs to the lead GPU.
+        let intake = if family == "deepseek_v4" && index == 0 {
+            match report.placement {
+                ExpertPlacement::Sparks { ranks } => 2 * ranks as u64 * 4096 * model.spec().hidden as u64 * 2,
+                _ => 0,
+            }
+        } else { 0 };
+        let workspace = workspace + intake;
         if family == "deepseek_v4" {
             // --reserve-gib 10 covers the future workspace and graph budget;
             // admission keeps the unused remainder, with a 3 GiB floor.
