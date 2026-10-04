@@ -281,6 +281,16 @@ fi
 # prefill (the engine's default 0.2; 0 prefills whole prompts before the next
 # step). Keys left unset pass nothing (images older than the options run).
 [[ -z "$(get DECODE_SHARE)" ]] || family_args+=(--decode-share "$(get DECODE_SHARE)")
+# DeepSeek V4 keeps complete expert layers local while memory permits. Honor
+# an explicit limit; zero leaves the backbone experts on the Sparks.
+if [[ $serve == serve-dsv4 ]]; then
+  local_layers="$(get RTX_EXPERT_LAYERS auto)"
+  case "$local_layers" in
+    ""|auto) ;;
+    *[!0-9]*) echo "RTX_EXPERT_LAYERS must be auto or a nonnegative integer" >&2; exit 2 ;;
+    *) family_args+=(--local-expert-layers "$local_layers") ;;
+  esac
+fi
 # GLM, GLM Flash, MiMo, Qwen: L2_PREFETCH (off, auto = 3/4 of the L2, or MiB;
 # unset: auto for GLM 5.3 and GLM 5.3 Flash, off for MiMo and Qwen) pulls the
 # next layer's weights into L2 during each one-lane decode step's Spark exchange; FP8_SCALES (amax, pow2, best) is the scale rule of the FP8
