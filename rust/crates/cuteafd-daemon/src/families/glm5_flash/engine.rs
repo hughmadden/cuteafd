@@ -349,6 +349,19 @@ pub(crate) fn output_shard_reserve(prefill_rows: usize, hidden: usize) -> u64 {
     (2 * PREFILL_LANES * prefill_rows.max(DECODE_ROWS) * hidden * 2) as u64
 }
 
+/// MLA values are twice as wide as KDA heads. Odd capacities need one extra
+/// half-row in each uniform peer slot, in addition to the four new norm slots.
+pub(crate) fn mla_output_shard_reserve(prefill_rows: usize, hidden: usize, half_width: usize) -> u64 {
+    let rows = prefill_rows.max(DECODE_ROWS);
+    let base = rows * hidden * 2;
+    let bytes = base.max(rows.div_ceil(2) * half_width * 2);
+    (2 * PREFILL_LANES * base + 6 * PREFILL_LANES * (bytes - base)) as u64
+}
+
+fn joined_output_capacity(capacity: usize, hidden: usize, mla_width: usize) -> usize {
+    (capacity * hidden * 4).max(capacity.div_ceil(2) * mla_width * 2)
+}
+
 struct Workspace<'a> {
     rows: usize,
     /// Zero rows: rank 1's partial of a dense MLP rank 0 runs whole (ModelOpt NVFP4).
@@ -571,6 +584,7 @@ pub(crate) struct GlmfEngine<'a> {
     pub fp8_prefill: Fp8Prefill,
     pub kda_fp32_partials: bool,
     pub kda_output_shard: bool,
+    pub split_mla_rows: bool,
     pub kda_prefill_expanded: bool,
     /// The token embedding table (resident on this GPU or read from its shard).
     pub embedding: TokenEmbedding<'a>,
@@ -647,6 +661,7 @@ impl<'a> GlmfEngine<'a> {
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
             fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
             kda_output_shard: false,
+            split_mla_rows: false,
             kda_prefill_expanded: false, l2: None, embedding })
     }
 
@@ -672,8 +687,10 @@ impl<'a> GlmfEngine<'a> {
             "attach_peer needs the head-split shares of every loaded layer");
         let rows = self.prefill_rows.max(DECODE_ROWS);
         let exchange = PeerExchange::new(self.library, [RankDevice { device: self.device, stream: self.stream },
-            RankDevice { device, stream }], if self.kda_output_shard { 6 } else { 4 } * PREFILL_LANES,
-            rows * self.cfg.hidden * self.partial_bytes())?;
+            RankDevice { device, stream }], if self.kda_output_shard || self.split_mla_rows { 6 } else { 4 } * PREFILL_LANES,
+            (rows * self.cfg.hidden * self.partial_bytes()).max(if self.split_mla_rows {
+                rows.div_ceil(2) * self.cfg.heads * self.cfg.v_head_dim
+            } else { 0 }))?;
         let peer = exchange.on(1, || -> Result<GlmfPeer<'a>> {
             self.programs.load_all()?;
             let caches = Caches::new(self.library, &self.cfg, &layers, self.pages, self.pool_pages, self.slots,
@@ -1034,12 +1051,17 @@ impl<'a> GlmfEngine<'a> {
             let spec = self.programs.spec(&format!("glmf2_kda_w8{dtype}{expanded}_{cap}"))?;
             // Joined head activations occupy a fixed tail after the program's
             // scratch and stay live through the output token-row projection.
-            let output = if self.kda_output_shard { t * h * 4 } else { 0 };
+            let output = if self.kda_output_shard { self.joined_output_bytes(t) } else { 0 };
             scratch = scratch.max(spec.scratch.get("scratch").copied().unwrap_or(0) as usize + output);
             if self.kda_output_shard {
                 let spec = self.programs.spec(&format!("glmf2_kda_output_rows{expanded}_{cap}"))?;
                 scratch = scratch.max(spec.scratch.get("scratch").copied().unwrap_or(0) as usize + output);
             }
+        }
+        if self.split_mla_rows {
+            let spec = self.programs.spec(&format!("glmf2_mla_output_rows_{cap}"))?;
+            scratch = scratch.max(spec.scratch.get("scratch").copied().unwrap_or(0) as usize
+                + self.joined_output_bytes(t));
         }
         let topk_scratch = self.scratch(&format!("index_topk_{mode}_{cap}"))?;
         let pools = self.cfg.index_topk / KPOOL;
@@ -1431,16 +1453,23 @@ impl<'a> GlmfEngine<'a> {
     }
 
     fn output_shard_attention(&self, layer: &GlmfLayer<'_>) -> bool {
-        self.kda_output_shard && layer.split &&
-            layer.attention == GlmNextAttention::Kda && layer.has("w_in_fp8")
+        layer.split && match layer.attention {
+            GlmNextAttention::Kda => self.kda_output_shard && layer.has("w_in_fp8"),
+            GlmNextAttention::Mla => self.split_mla_rows,
+        }
     }
 
     fn partial_bytes(&self) -> usize {
         if self.kda_fp32_partials { 4 } else { 2 }
     }
 
+    fn joined_output_bytes(&self, capacity: usize) -> usize {
+        joined_output_capacity(capacity, self.cfg.hidden,
+            if self.split_mla_rows { self.cfg.heads * self.cfg.v_head_dim } else { 0 })
+    }
+
     fn full_kda_norm(&self, w: &Workspace<'_>) -> *mut c_void {
-        w.scratch.buffer.ptr.wrapping_byte_add(w.scratch.buffer.bytes - w.rows * self.cfg.hidden * 4)
+        w.scratch.buffer.ptr.wrapping_byte_add(w.scratch.buffer.bytes - self.joined_output_bytes(w.rows))
     }
 
     /// Share the missing heads only for each rank's output token rows, project
@@ -1451,27 +1480,41 @@ impl<'a> GlmfEngine<'a> {
         output_slot: usize, t: usize, cap: &str) -> Result<*mut c_void> {
         let exchange = self.exchange()?;
         let h = self.cfg.hidden;
+        let mla = layer.attention == GlmNextAttention::Mla;
+        let half_width = if mla { self.cfg.heads * self.cfg.v_head_dim / 2 } else { h };
+        // Sparse MLA has consumed query; reuse its larger buffer for local UV
+        // values. KDA normalized heads remain in delta until their peer joins.
+        let local = if mla { w.query.buffer.ptr } else { w.delta.buffer.ptr };
         let (first, owned) = output_rows(t, rank);
         let sent_first = if rank == 0 { owned } else { 0 };
         let heads_slot = norm_slot(output_slot);
-        exchange.push(rank, heads_slot, w.delta.buffer.ptr.wrapping_byte_add(sent_first * h * 2),
-            (t - owned) * h * 2)?;
+        exchange.push(rank, heads_slot, local.wrapping_byte_add(sent_first * half_width * 2),
+            (t - owned) * half_width * 2)?;
         exchange.wait(rank, heads_slot)?;
         let peer_norm = exchange.recv(rank, heads_slot)?;
-        let norm = w.delta.buffer.ptr.wrapping_byte_add(first * h * 2);
+        let norm = local.wrapping_byte_add(first * half_width * 2);
         let (a, b) = if rank == 0 { (norm, peer_norm) } else { (peer_norm, norm) };
         let full = self.full_kda_norm(w);
         let expanded = if self.kda_prefill_expanded && cap != "m64" { "_expanded" } else { "" };
         if owned != 0 {
-            self.run_on(rank, true, "join_heads", &[("a", a), ("b", b), ("out", full)],
+            self.run_on(rank, true, if mla { "join_mla_heads" } else { "join_heads" }, &[("a", a), ("b", b), ("out", full)],
                 &[Scalar::I32(owned as i32)])?;
             // Select the projection route from the global batch width, so a
             // 64-row verification split into 32 + 32 retains the full-head TMA math.
-            self.run_on(rank, true, &format!("kda_output_rows{expanded}_{cap}"),
+            if mla {
+                self.run_on(rank, true, &format!("mla_output_rows_{cap}"),
+                    &[("x", full), ("w_fp8", layer.ptr("w_o_fp8")?),
+                    ("w_scale", layer.ptr("w_o_scale")?), ("out", w.delta.buffer.ptr),
+                    ("scratch", w.scratch.buffer.ptr)],
+                    &[Scalar::I32(owned as i32), Scalar::I32(t as i32),
+                        Scalar::I32(if cap == "m64" { FP8_ROWS } else { i32::from(self.fp8_prefill.mla) })])?;
+            } else {
+                self.run_on(rank, true, &format!("kda_output_rows{expanded}_{cap}"),
                 &[("x", full), ("w_fp8", layer.ptr("w_o_fp8")?),
                 ("w_kscale", layer.ptr("w_o_kscale")?), ("out", w.delta.buffer.ptr),
                 ("scratch", w.scratch.buffer.ptr)],
                 &[Scalar::I32(owned as i32), Scalar::I32(t as i32)])?;
+            }
         }
         // Zero-owned ranks still publish: both peers advance each slot's sequence.
         exchange.push(rank, output_slot, w.delta.buffer.ptr, owned * h * 2)?;
@@ -1652,11 +1695,13 @@ impl<'a> GlmfEngine<'a> {
             if let Some(dir) = trace {
                 let dir = dir.join(format!("layer{index:02}"));
                 let dtype = if self.precise_attention(layer) { "float32" } else { "bfloat16" };
-                std::fs::write(dir.join("attention.bin"), self.download(&w.delta,
-                    t * h * if dtype == "float32" { 4 } else { 2 })?)?;
+                let mla_values = self.split_mla_rows && layer.attention == GlmNextAttention::Mla;
+                let width = if mla_values { self.cfg.heads * self.cfg.v_head_dim / 2 } else { h };
+                std::fs::write(dir.join("attention.bin"), self.download(if mla_values { &w.query } else { &w.delta },
+                    t * width * if dtype == "float32" { 4 } else { 2 })?)?;
                 std::fs::write(dir.join("attention_meta.json"), serde_json::to_vec(&serde_json::json!({
-                    "rows": t, "hidden": h, "dtype": dtype,
-                    "kind": if self.output_shard_attention(layer) { "normalized_heads" } else { "projection" } }))?)?;
+                    "rows": t, "hidden": h, "width": width, "dtype": dtype,
+                    "kind": if mla_values { "mla_values" } else if self.output_shard_attention(layer) { "normalized_heads" } else { "projection" } }))?)?;
                 if layer.attention == GlmNextAttention::Kda {
                     let d = self.caches.kda_heads * self.cfg.kda_head_dim;
                     // The in-projection's output width (q|k|v, f_a, g_a, b), whatever its weight format.
@@ -2151,6 +2196,15 @@ impl<'a> GlmfEngine<'a> {
             std::fs::write(dir.join("mla_sparse_scratch.bin"), self.download(&w.scratch,
                 self.scratch("sparse_mla_decode_m64")?)?)?;
         }
+        if self.split_mla_rows && split {
+            // Query is no longer read after sparse MLA. Its full-geometry
+            // allocation holds every local UV-expanded value until peer joins.
+            ensure!(t * heads * self.cfg.v_head_dim * 2 <= w.query.buffer.bytes,
+                "MLA values exceed the reusable query workspace");
+            return self.run_on(rank, true, &format!("mla_values_{cap}"),
+                &[("attn", w.latent.buffer.ptr), ("w_uv", layer.ptr("w_uv")?),
+                ("out", w.query.buffer.ptr)], &[rows]);
+        }
         let pointers = [("attn", w.latent.buffer.ptr), ("w_uv", layer.ptr("w_uv")?),
             ("w_o_fp8", layer.ptr("w_o_fp8")?), ("w_o_scale", layer.ptr("w_o_scale")?),
             ("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)];
@@ -2611,6 +2665,21 @@ impl Drop for GlmfEngine<'_> {
 #[cfg(test)]
 mod prefill_lane_tests {
     use super::{prefill_lane_capacity, prefill_lane_plan, PAGE_ROWS, PREFILL_LANES};
+
+    #[test]
+    fn joined_mla_values_fit_at_a_capacity_fixed_tail_for_both_token_owners() {
+        for capacity in [1_usize, 22, 63, 64, 65, 512, 513, 4096] {
+            let bytes = super::joined_output_capacity(capacity, 4096, 16384);
+            assert_eq!(bytes, capacity.div_ceil(2) * 16384 * 2);
+            for rows in 1..=capacity {
+                for rank in 0..2 {
+                    let (_, owned) = super::output_rows(rows, rank);
+                    assert!(owned * 16384 * 2 <= bytes);
+                }
+            }
+            assert_eq!(super::joined_output_capacity(capacity, 4096, 0), capacity * 4096 * 4);
+        }
+    }
 
     #[test]
     fn output_token_rows_cover_odd_batches_and_zero_owned_rank() {

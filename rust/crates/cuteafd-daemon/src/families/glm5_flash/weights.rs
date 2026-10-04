@@ -135,6 +135,8 @@ pub(crate) struct GlmfLoader<'a> {
     pub kda_fp8: super::fp8::KdaFp8,
     /// Replicate FP8 KDA output weights for token-row sharding; requires two GPUs and FP8 KDA.
     pub kda_output_shard: bool,
+    /// Replicate the native MLA output weight; project complete owned token rows.
+    pub split_mla_rows: bool,
     pub fp8_head: bool,
     /// Numerics gate only: KDA projections rounded through NVFP4 (Some(search)) and kept in BF16.
     pub kda_nvfp4: Option<bool>,
@@ -781,9 +783,16 @@ impl<'a> GlmfLoader<'a> {
                 let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&[a("q_b_proj.weight")], Axis::Rows, ranks)?.into_iter().unzip();
                 put(&mut ops, "w_q_b_fp8", q);
                 put(&mut ops, "w_q_b_scale", s);
-                let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&[a("o_proj.weight")], Axis::Cols, ranks)?.into_iter().unzip();
-                put(&mut ops, "w_o_fp8", q);
-                put(&mut ops, "w_o_scale", s);
+                if self.split_mla_rows {
+                    ensure!(ranks == 2, "MLA output token rows require two coordinator ranks");
+                    let (q, s) = self.fp8(&[a("o_proj.weight")], super::fp8::Layout::Block)?;
+                    put(&mut ops, "w_o_fp8", self.replicate(q)?);
+                    put(&mut ops, "w_o_scale", self.replicate(s)?);
+                } else {
+                    let (q, s): (Vec<_>, Vec<_>) = self.fp8_split(&[a("o_proj.weight")], Axis::Cols, ranks)?.into_iter().unzip();
+                    put(&mut ops, "w_o_fp8", q);
+                    put(&mut ops, "w_o_scale", s);
+                }
                 let i = |name: &str| a(&format!("indexer.{name}"));
                 put(&mut ops, "w_iq", self.replicate(self.one(&i("wq_b.weight"))?)?);
                 put(&mut ops, "w_ik", self.replicate(self.rows(&[i("wk.weight"), i("weights_proj.weight"),
