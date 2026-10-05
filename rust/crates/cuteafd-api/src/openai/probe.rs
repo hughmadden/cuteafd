@@ -38,6 +38,10 @@ pub struct ProbeSpec {
     /// Decode-shaped scoring width, bounded by the family's verify capacity.
     #[serde(default)]
     pub verify_rows: Option<usize>,
+    /// Scoring kernel shape: `decode` or `prefill`. When absent, retain the
+    /// family's legacy path (V4.1 prefill-shaped, other families decode-shaped).
+    #[serde(default)]
+    pub score_path: Option<String>,
     /// New server-local directory for streamed full-vocabulary F32 log-probs.
     /// Each row is a safetensors `log_probs` tensor; `manifest.jsonl` identifies
     /// its predicted-token position, vocabulary size and file. Existing paths
@@ -89,6 +93,9 @@ pub struct ProbeRecord {
     pub cold: bool,
     pub no_speculation: bool,
     pub scored: usize,
+    /// The scoring path actually selected by the engine, not just requested.
+    #[serde(default)]
+    pub score_path: Option<String>,
     pub error: Option<String>,
 }
 
@@ -157,6 +164,10 @@ impl Probe {
 
     pub fn record(&self) -> ProbeRecord {
         self.record.lock().map(|r| r.clone()).unwrap_or_default()
+    }
+
+    pub fn selected_score_path(&self, path: &str) {
+        self.with(|r| r.score_path = Some(path.to_owned()));
     }
 
     /// The scoring request's rows: positions `from..len` of the prompt.
@@ -345,10 +356,17 @@ mod tests {
     fn probe_options_are_backward_compatible_and_round_trip() {
         let legacy: ProbeSpec = serde_json::from_str("{}").unwrap();
         assert!(legacy.dump_rows.is_none() && legacy.verify_rows.is_none());
-        let configured: ProbeSpec = serde_json::from_value(serde_json::json!({ "dump_rows": "arm", "verify_rows": 5 })).unwrap();
+        assert!(legacy.score_path.is_none());
+        let configured: ProbeSpec = serde_json::from_value(serde_json::json!({ "dump_rows": "arm", "verify_rows": 5, "score_path": "decode" })).unwrap();
         assert_eq!(configured.dump_rows.as_deref(), Some(std::path::Path::new("arm")));
         assert_eq!(configured.verify_rows, Some(5));
-        assert_eq!(serde_json::to_value(configured).unwrap()["verify_rows"], 5);
+        assert_eq!(configured.score_path.as_deref(), Some("decode"));
+        let serialized = serde_json::to_value(configured).unwrap();
+        assert_eq!(serialized["verify_rows"], 5);
+        assert_eq!(serialized["score_path"], "decode");
+        let probe = Probe::new(ProbeSpec::default());
+        probe.selected_score_path("prefill");
+        assert_eq!(probe.record().score_path.as_deref(), Some("prefill"));
     }
 
     #[test]

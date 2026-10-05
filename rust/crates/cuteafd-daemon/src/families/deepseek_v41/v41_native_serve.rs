@@ -758,9 +758,50 @@ pub(crate) struct ScoringDone;
 /// Rows per teacher-forced scoring chunk: the smallest target-head wave capacity.
 const SCORING_ROWS: usize = 48;
 
-/// Teacher-forced scoring (a benchmark probe): prefill `tokens[..from]`, then
-/// continue in chunks of [`SCORING_ROWS`] rows with every row's logits, recording the
-/// row that predicts each of `tokens[from..]`. Returns [`ScoringDone`] when done.
+#[derive(Debug)]
+struct ScoringPlan {
+    path: crate::shared::probe::ScorePath,
+    rows: usize,
+}
+
+impl ScoringPlan {
+    fn new(spec: &cuteafd_api::openai::probe::ProbeSpec) -> Result<Self> {
+        use crate::shared::probe::ScorePath;
+        let path = ScorePath::parse(spec.score_path.as_deref(), ScorePath::Prefill)?;
+        let rows = match path {
+            ScorePath::Prefill => {
+                ensure!(spec.verify_rows.is_none(), "probe verify_rows requires score_path=decode for deepseek_v41");
+                SCORING_ROWS
+            }
+            ScorePath::Decode => {
+                let rows = spec.verify_rows.unwrap_or(8);
+                ensure!((1..=SCORING_ROWS).contains(&rows),
+                    "unsupported probe verify_rows={rows} for deepseek_v41; supports 1..={SCORING_ROWS}");
+                rows
+            }
+        };
+        Ok(Self { path, rows })
+    }
+
+    fn steps(&self, from: usize, len: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
+        let rows = self.rows;
+        (from..len - 1).step_by(rows).map(move |start| start..(start + rows).min(len - 1))
+    }
+
+    fn source_kind(&self, rows: usize) -> ExpertV2SourceKind {
+        use crate::shared::probe::ScorePath;
+        match self.path {
+            ScorePath::Prefill => ExpertV2SourceKind::Prefill,
+            ScorePath::Decode if rows == 1 => ExpertV2SourceKind::Decode,
+            ScorePath::Decode => ExpertV2SourceKind::MtpVerify,
+        }
+    }
+}
+
+/// Teacher-forced scoring: prefill the prefix, then record rows from the
+/// explicitly selected decode-shaped verification or legacy prefill-shaped
+/// continuation. The first row comes from prefix prefill in either path.
+/// Returns [`ScoringDone`] when done.
 #[allow(clippy::too_many_arguments)]
 fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
     pass: &mut P, other: &mut P, requests: &mut Requests<'a>, transport: &mut P::Transport,
@@ -768,37 +809,113 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
     tokens: &[u32], from: usize, chunk_rows: usize, job: &NativeRequest,
     mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, hold: &mut dyn FnMut() -> Result<()>) -> Result<()> {
     let probe = job.probe.as_ref().context("scoring without a probe")?;
-    ensure!(probe.spec.verify_rows.is_none(),
-        "unsupported probe verify_rows for deepseek_v41: scoring currently uses prefill-shaped chunks, not decode-shaped verify");
+    let plan = ScoringPlan::new(&probe.spec)?;
     ensure!(tokens.len() >= 2, "scoring needs at least two tokens");
+    probe.selected_score_path(plan.path.name());
     let from = from.clamp(1, tokens.len() - 1);
     let first = prefill(lib, runtime, pass, other, requests, transport, other_transport, lease, &tokens[..from],
         chunk_rows, job, draft.as_deref_mut(), hold)?;
     probe.row(from, &first.logits()?);
-    let mut at = from;
-    // Every row of a chunk goes through the target head: at most its wave capacity
-    // (48 rows at dSpark ≤ 5 drafts, 64 above).
-    for chunk in tokens[from..tokens.len() - 1].chunks(SCORING_ROWS) {
+    for step in plan.steps(from, tokens.len()) {
         ensure!(!job.events.is_closed(), "client disconnected");
+        let chunk = &tokens[step.clone()];
         let mut batch = requests.prepare(&[RequestTokens { lease, tokens: chunk,
-            image_mask: None, kind: ExpertV2SourceKind::Prefill }])?;
+            image_mask: None, kind: plan.source_kind(chunk.len()) }])?;
         let selected: Vec<usize> = (0..chunk.len()).collect();
         let result = (|| -> Result<Vec<u8>> {
-            let bytes = runtime.block_on(unsafe { pass.prefill_logits(lib, requests, &mut batch, transport,
-                &selected, None) })?;
-            runtime.block_on(pass.commit_prefill(requests, &mut batch, draft.as_deref_mut(), chunk.len() as u32))?;
+            let bytes = match plan.path {
+                crate::shared::probe::ScorePath::Prefill => {
+                    // SAFETY: this request owns the batch; both passes and its
+                    // cache/storage remain live through synchronous completion.
+                    runtime.block_on(unsafe { pass.prefill_logits(lib, requests, &mut batch, transport,
+                        &selected, None) })?
+                }
+                crate::shared::probe::ScorePath::Decode => runtime.block_on(async {
+                    // SAFETY: the teacher-forced batch is a full-phase verify
+                    // on this lease. No other lane accesses its state; the
+                    // future and logits download complete before commit/release.
+                    unsafe { pass.execute_shared(&std::cell::RefCell::new(&mut *requests), &mut batch,
+                        transport, 0, &selected).await?; }
+                    pass.download_logits(&batch, &selected).await
+                })?,
+            };
+            ensure!(bytes.len() == chunk.len() * scores::ROW_BYTES, "scoring logits extent differs");
+            // Scoring never proposes drafts. Retain the legacy draft/cache
+            // commit for calibration, but verify commits only teacher-forced rows.
+            let scoring_draft = if plan.path == crate::shared::probe::ScorePath::Prefill { draft.as_deref_mut() } else { None };
+            runtime.block_on(pass.commit_prefill::<C>(requests, &mut batch, scoring_draft, chunk.len() as u32))?;
             Ok(bytes)
         })();
         if result.is_err() { pass.discard(&mut batch)?; }
         let bytes = result?;
-        ensure!(bytes.len() == chunk.len() * super::v41_native_serve::scores::ROW_BYTES, "scoring logits extent differs");
-        for (j, row) in bytes.chunks_exact(super::v41_native_serve::scores::ROW_BYTES).enumerate() {
-            probe.row(at + j + 1, &TokenScores::new(row.to_vec())?.logits()?);
+        for (j, row) in bytes.chunks_exact(scores::ROW_BYTES).enumerate() {
+            probe.row(step.start + j + 1, &TokenScores::new(row.to_vec())?.logits()?);
         }
-        at += chunk.len();
     }
     let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length }));
     Err(ScoringDone.into())
+}
+
+#[cfg(test)]
+mod scoring_tests {
+    use super::*;
+    use crate::shared::probe::ScorePath;
+    use cuteafd_api::openai::probe::{Probe, ProbeSpec};
+
+    #[test]
+    fn scoring_path_is_explicit_and_legacy_default_is_unchanged() {
+        let legacy = ScoringPlan::new(&ProbeSpec::default()).unwrap();
+        assert_eq!(legacy.path, ScorePath::Prefill);
+        assert_eq!(legacy.rows, 48);
+        assert_eq!(legacy.source_kind(1), ExpertV2SourceKind::Prefill);
+        assert_eq!(legacy.steps(3, 101).collect::<Vec<_>>(), vec![3..51, 51..99, 99..100]);
+        let decode = ScoringPlan::new(&ProbeSpec { score_path: Some("decode".into()), ..ProbeSpec::default() }).unwrap();
+        assert_eq!(decode.rows, 8);
+        assert_eq!(decode.source_kind(1), ExpertV2SourceKind::Decode);
+        assert_eq!(decode.source_kind(8), ExpertV2SourceKind::MtpVerify);
+        let prefill = ScoringPlan::new(&ProbeSpec { score_path: Some("prefill".into()), ..ProbeSpec::default() }).unwrap();
+        assert_eq!(prefill.rows, legacy.rows);
+    }
+
+    #[test]
+    fn scoring_plan_rejects_unknown_paths_and_unsupported_widths() {
+        for path in [None, Some("prefill"), Some("other"), Some("")] {
+            assert!(ScoringPlan::new(&ProbeSpec { score_path: path.map(str::to_owned), verify_rows: Some(1),
+                ..ProbeSpec::default() }).is_err());
+        }
+        for rows in [0, SCORING_ROWS + 1, usize::MAX] {
+            assert!(ScoringPlan::new(&ProbeSpec { score_path: Some("decode".into()), verify_rows: Some(rows),
+                ..ProbeSpec::default() }).is_err());
+        }
+    }
+
+    #[test]
+    fn teacher_forced_verify_windows_predict_each_position_once() {
+        for width in [1, 3, 8, SCORING_ROWS] {
+            for (from, len) in [(1, 2), (3, 14), (7, 111)] {
+                let spec = ProbeSpec { score_path: Some("decode".into()), verify_rows: Some(width),
+                    score_from: Some(from), ..ProbeSpec::default() };
+                let plan = ScoringPlan::new(&spec).unwrap();
+                let probe = Probe::new(spec);
+                probe.selected_score_path(plan.path.name());
+                probe.row(from, &[1.0, 0.0]); // Prefix prefill's final row.
+                let steps: Vec<_> = plan.steps(from, len).collect();
+                for step in steps {
+                    assert!(!step.is_empty() && step.len() <= width);
+                    assert_eq!(plan.source_kind(step.len()), if step.len() == 1 {
+                        ExpertV2SourceKind::Decode
+                    } else { ExpertV2SourceKind::MtpVerify });
+                    for input_position in step {
+                        probe.row(input_position + 1, &[1.0, 0.0]);
+                    }
+                }
+                let record = probe.record();
+                assert_eq!(record.score_path.as_deref(), Some("decode"));
+                assert_eq!(record.scored, len - from);
+                assert_eq!(record.rows.iter().map(|row| row.position).collect::<Vec<_>>(), (from..len).collect::<Vec<_>>());
+            }
+        }
+    }
 }
 
 fn prefill_continuation<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,

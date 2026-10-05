@@ -87,6 +87,27 @@ pub(crate) fn device_rows(library: &NativeLibrary, probe: &ProbeRef, logits: &De
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScorePath {
+    Decode,
+    Prefill,
+}
+
+impl ScorePath {
+    pub(crate) fn parse(requested: Option<&str>, default: Self) -> Result<Self> {
+        match requested {
+            None => Ok(default),
+            Some("decode") => Ok(Self::Decode),
+            Some("prefill") => Ok(Self::Prefill),
+            Some(other) => anyhow::bail!("unsupported probe score_path={other:?}; expected decode or prefill"),
+        }
+    }
+
+    pub(crate) fn name(self) -> &'static str {
+        match self { Self::Decode => "decode", Self::Prefill => "prefill" }
+    }
+}
+
 pub(crate) fn verify_rows(probe: &ProbeRef) -> Option<usize> {
     probe.as_ref().and_then(|p| p.spec.verify_rows)
 }
@@ -113,6 +134,9 @@ pub(crate) fn score<S>(library: &NativeLibrary, probe: &ProbeRef, tokens: &[u32]
     mut verify: impl FnMut(&mut S, &[u32]) -> Result<DeviceLogits>) -> Result<usize> {
     anyhow::ensure!(tokens.len() >= 2, "scoring needs at least two tokens");
     let verify_rows = scoring_width(verify_capacity, requested_verify_rows)?;
+    let path = ScorePath::parse(probe.as_ref().and_then(|p| p.spec.score_path.as_deref()), ScorePath::Decode)?;
+    anyhow::ensure!(path == ScorePath::Decode, "unsupported prefill-shaped probe scoring for this family");
+    if let Some(probe) = probe { probe.selected_score_path(path.name()); }
     let from = from.clamp(1, tokens.len() - 1);
     let mut done = 0;
     let mut scored = 0;
@@ -143,6 +167,16 @@ pub(crate) fn score<S>(library: &NativeLibrary, probe: &ProbeRef, tokens: &[u32]
 mod tests {
     use super::*;
     use cuteafd_api::openai::probe::ProbeSpec;
+
+    #[test]
+    fn scoring_path_parser_keeps_family_defaults_and_rejects_unknown_paths() {
+        for default in [ScorePath::Decode, ScorePath::Prefill] {
+            assert_eq!(ScorePath::parse(None, default).unwrap(), default);
+            assert_eq!(ScorePath::parse(Some("decode"), default).unwrap(), ScorePath::Decode);
+            assert_eq!(ScorePath::parse(Some("prefill"), default).unwrap(), ScorePath::Prefill);
+            assert!(ScorePath::parse(Some("other"), default).is_err());
+        }
+    }
 
     #[test]
     fn scoring_width_defaults_and_override_bounds() {
