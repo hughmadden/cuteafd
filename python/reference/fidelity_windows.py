@@ -7,6 +7,7 @@ import gc
 import hashlib
 import json
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -15,6 +16,25 @@ import numpy as np
 
 SET_SCHEMA = "cuteafd.fidelity.set/1"
 MAX_TOKENS = 16384
+
+
+def validate_public_text(text: str, *, scored_text: bool = False) -> None:
+    """Reject publication blockers without changing text or blocking public fabric names."""
+    credentials = re.compile(
+        r"\bhf_[A-Za-z0-9]{20,}\b|\bgh[pousr]_[A-Za-z0-9]{20,}\b"
+        r"|\bgithub_pat_[A-Za-z0-9_]{20,}\b|\bsk-[A-Za-z0-9_-]{20,}\b"
+        r"|-----BEGIN (?:[A-Z0-9 ]*PRIVATE KEY|OPENSSH PRIVATE KEY)-----"
+        r"|\b(?:api[_-]?key|access[_-]?token|authorization|password|secret)"
+        r"\s*[=:]\s*[\"']?[A-Za-z0-9_+/.-]{20,}", re.I)
+    if credentials.search(text):
+        raise ValueError("credential or private-key publication blocker")
+    if re.search(r"\b(?:tj|tpurtell)\b", text, re.I):
+        raise ValueError("personal-data publication blocker")
+    for address in re.findall(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", text):
+        domain = address.rsplit("@", 1)[1].lower()
+        reserved = domain in ("example.com", "example.org", "example.net") or domain.endswith(".example")
+        if not (scored_text and reserved):
+            raise ValueError("email publication blocker")
 
 
 def rss_bytes() -> int:
