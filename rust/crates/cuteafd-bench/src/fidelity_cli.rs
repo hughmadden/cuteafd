@@ -284,6 +284,24 @@ mod tests {
     }
 
     #[test]
+    fn glm_flash_publication_default_matches_only_the_served_checkpoint() {
+        let model = "zai-org/GLM-5.3-Flash";
+        let full = parse(&["--tier", "full"]);
+        assert_eq!(dataset_source(&full, model).unwrap(),
+            Some((crate::fidelity_dataset::REPOSITORY, crate::fidelity_dataset::GLMF_REVISION,
+                crate::fidelity_dataset::GLMF_CONFIG)));
+        assert_eq!(dataset_source(&parse(&[]), model).unwrap(), None);
+        for local_flag in ["--reference", "--rows"] {
+            assert_eq!(dataset_source(&parse(&["--tier", "full", local_flag, "local"]), model).unwrap(), None);
+        }
+        for other in ["zai-org/GLM-5.3-Flash-BF16", "zai-org/GLM-5.3", "other/GLM-5.3-Flash"] {
+            assert!(dataset_source(&full, other).is_err());
+        }
+        assert!(dataset_source(&parse(&["--tier", "full", "--dataset", "other/repo"]), model).is_err());
+        assert!(dataset_source(&parse(&["--tier", "full", "--dataset-config", "other-config"]), model).is_err());
+    }
+
+    #[test]
     fn explicit_repo_and_revision_override_only_the_dataset_source() {
         let args = parse(&["--tier", "full", "--dataset", "other/repo", "--dataset-revision", "1111111111111111111111111111111111111111"]);
         assert_eq!(dataset_source(&args, "deepseek-ai/DeepSeek-V4.1-Flash").unwrap(), Some(("other/repo", "1111111111111111111111111111111111111111", crate::fidelity_dataset::CONFIG)));

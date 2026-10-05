@@ -10,11 +10,14 @@ pub const REVISION: &str = "01a0948a62a478a0a9355dd5b57fe4a49bc6cca0";
 pub const CONFIG: &str = "deepseek_v41-v2_20261005";
 pub const FLASH_REVISION: &str = "5db25a78dc2708df991df43b36636562e522a3b0";
 pub const FLASH_CONFIG: &str = "mimo_v2-v2_20261005_flash_mopd";
+pub const GLMF_REVISION: &str = "a7e7d1b4d82329acebe54ca88dc71d47d0d2056d";
+pub const GLMF_CONFIG: &str = "glm5_flash-v2_20261005_bf16root";
 
 pub fn default_publication(model: &str) -> Option<(&'static str, &'static str)> {
     match model {
         "deepseek-ai/DeepSeek-V4.1-Flash" => Some((REVISION, CONFIG)),
         "XiaomiMiMo/MiMo-V2.6-Flash-MOPD" => Some((FLASH_REVISION, FLASH_CONFIG)),
+        "zai-org/GLM-5.3-Flash" => Some((GLMF_REVISION, GLMF_CONFIG)),
         _ => None,
     }
 }
