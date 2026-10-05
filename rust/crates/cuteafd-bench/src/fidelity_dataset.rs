@@ -228,6 +228,34 @@ mod tests {
     }
 
     #[test]
+    fn cache_checksums_and_unqualified_panels_fail_closed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let commit = "a".repeat(40);
+        let root = temporary.path().join("owner--repo").join(&commit);
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        let manifest = b"{}";
+        std::fs::write(root.join("config/manifest.json"), manifest).unwrap();
+        let index = json!({"schema":"cuteafd.fidelity.configs/1","configs":[{
+            "name":"config","path":"config/manifest.json","sha256":"bad checksum"}]});
+        std::fs::write(root.join("configs.json"), serde_json::to_vec(&index).unwrap()).unwrap();
+        let error = download(&ureq::Agent::new(),temporary.path(),"owner/repo",&commit,"config").unwrap_err();
+        assert!(error.to_string().contains("cached dataset checksum differs"));
+        assert!(download(&ureq::Agent::new(),temporary.path(),"owner/repo","main","config").is_err());
+        let panel = json!({"set_sha256":"set","windows":[]});
+        let qualification = json!({"set_sha256":"set","qualifies":false});
+        let p = serde_json::to_vec(&panel).unwrap();
+        let q = serde_json::to_vec(&qualification).unwrap();
+        std::fs::write(root.join("windows.json"), &p).unwrap();
+        std::fs::write(root.join("qualification.json"), &q).unwrap();
+        let manifest = json!({"schema":"cuteafd.fidelity.dataset/1","top_k":1024,
+            "kind":"reference-top1024-plus-tail","set_sha256":"set",
+            "windows_sha256":digest(&p),"qualification_sha256":digest(&q)});
+        assert!(load(&root,&manifest).unwrap_err().to_string().contains("unqualified"));
+        std::fs::write(root.join("windows.json"), b"corrupt").unwrap();
+        assert!(load(&root,&manifest).unwrap_err().to_string().contains("checksum"));
+    }
+
+    #[test]
     fn identities_and_tensor_bounds_fail_closed() {
         assert!(revision("0123456789abcdef0123456789abcdef01234567"));
         assert!(!revision("main")); assert!(!revision(&"g".repeat(40)));
