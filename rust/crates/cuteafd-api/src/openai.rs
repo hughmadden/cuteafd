@@ -376,7 +376,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
             return error(StatusCode::BAD_REQUEST, message);
         }
         if !p.spec.media.is_empty() && (!state.profile.capabilities.vision || state.profile.media_preparer.is_none()
-            || !matches!(state.profile.encoding, ModelEncoding::DeepseekV4)) {
+            || matches!(state.profile.encoding, ModelEncoding::DeepseekV41)) {
             p.fail("probe media requires a loaded encoder");
             return error(StatusCode::BAD_REQUEST, "probe media requires a loaded encoder");
         }
@@ -551,9 +551,12 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
             let options = glm5::GlmPromptOptions { thinking,
                 tool_names: converted.conversation.tools.iter().map(|tool| tool.name.clone()).collect(),
                 tool_choice, response_format };
-            let prompt = match encoding.render(&raw, &options) {
-                Ok(prompt) => prompt,
-                Err(message) => return error(StatusCode::BAD_REQUEST, message),
+            // Native probe ids already contain image rows, irrespective of chat template.
+            let prompt = if expanded_media_probe { String::new() } else {
+                match encoding.render(&raw, &options) {
+                    Ok(prompt) => prompt,
+                    Err(message) => return error(StatusCode::BAD_REQUEST, message),
+                }
             };
             let parser = glm5::GlmOutputParser::new(glm5::GlmParserOptions { thinking,
                 tools: tools_declared.then(|| converted.conversation.tools.clone()),
@@ -569,9 +572,12 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, 
             let options = qwen4::QwenPromptOptions { thinking,
                 tool_names: converted.conversation.tools.iter().map(|tool| tool.name.clone()).collect(),
                 tool_choice, response_format };
-            let prompt = match encoding.render(&raw, &options) {
-                Ok(prompt) => prompt,
-                Err(message) => return error(StatusCode::BAD_REQUEST, message),
+            // Native probe ids already contain image rows, irrespective of chat template.
+            let prompt = if expanded_media_probe { String::new() } else {
+                match encoding.render(&raw, &options) {
+                    Ok(prompt) => prompt,
+                    Err(message) => return error(StatusCode::BAD_REQUEST, message),
+                }
             };
             let parser = qwen4::QwenOutputParser::new(qwen4::QwenParserOptions { thinking,
                 tools: tools_declared.then(|| converted.conversation.tools.clone()),
@@ -998,26 +1004,80 @@ mod tests {
         let url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
         let image = preparer.prepare(&[media::MediaSource { url: url.clone(), low: false }]).unwrap().images.remove(0);
         let key: String = image.key.0.iter().map(|v| format!("{v:02x}")).collect();
-        let (id, _) = probe::registry().register(probe::ProbeSpec { prompt_ids: Some(vec![1; image.tokens + 2]),
+        let spec = probe::ProbeSpec { prompt_ids: Some(vec![1; image.tokens + 2]),
             media: vec![probe::ProbeMedia { start: 1, len: image.tokens, kind: "image".into(), key,
                 grid: [image.grid.t, image.grid.h, image.grid.w], fixture: None,
-                image_url: Some(probe::ProbeImageUrl { url, detail: None }) }], ..Default::default() });
+                image_url: Some(probe::ProbeImageUrl { url, detail: None }) }], ..Default::default() };
+        for encoding in [ModelEncoding::DeepseekV4,
+            ModelEncoding::Qwen(Arc::new(qwen4::fixtures::encoding())),
+            ModelEncoding::Glm(Arc::new(glm5::fixtures::encoding()))] {
+            let image = image.clone();
+            let (id, _) = probe::registry().register(spec.clone());
+            let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+            let worker = tokio::spawn(async move {
+                let job = rx.recv().await.unwrap();
+                assert!(job.prompt.is_empty() && job.images.is_empty());
+                assert_eq!(job.media.len(), 1); assert_eq!(job.media[0].key, image.key);
+                job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
+                    prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).unwrap();
+                job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })).unwrap();
+            });
+            let profile = ModelProfile::new(MODEL, encoding).with_loaded_vision(preparer.clone());
+            let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+                std::time::Duration::from_secs(1), ConsoleHub::disabled(), profile);
+            let body = json!({"model":MODEL,"messages":[{"role":"user","content":"probe"}],"max_tokens":1});
+            let response = app.oneshot(axum::http::Request::post("/v1/chat/completions").header(probe::HEADER, id)
+                .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+            let status = response.status();
+            if status != StatusCode::OK {
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                worker.abort();
+                panic!("expanded media rejected: {status}: {}", String::from_utf8_lossy(&bytes));
+            }
+            worker.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CUTEAFD_TEST_MEDIA_REQUEST and CUTEAFD_TEST_MEDIA_SNAPSHOT"]
+    async fn replay_native_media_probe_request_without_gpu() {
+        use cuteafd_loader::media::{EncoderId, ImageFamily, ProcessorConfig};
+        let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_TEST_MEDIA_SNAPSHOT").unwrap());
+        let request: Value = serde_json::from_slice(&std::fs::read(
+            std::env::var_os("CUTEAFD_TEST_MEDIA_REQUEST").unwrap()).unwrap()).unwrap();
+        let spec: probe::ProbeSpec = serde_json::from_value(request["spec"].clone()).unwrap();
+        spec.validate_media().unwrap();
+        let expected = spec.clone();
+        let (id, _) = probe::registry().register(spec);
+        let preparer = Arc::new(media::MediaPreparer::new(ProcessorConfig::from_snapshot(&snapshot,
+            ImageFamily::Mimo).unwrap(), EncoderId([1; 32]), media::ImageUrlFetch::Off, 1).unwrap());
+        let profile = ModelProfile::new(request["body"]["model"].as_str().unwrap(),
+            ModelEncoding::Qwen(Arc::new(qwen4::QwenEncoding::from_snapshot(&snapshot).unwrap())))
+            .with_loaded_vision(preparer);
         let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
         let worker = tokio::spawn(async move {
             let job = rx.recv().await.unwrap();
             assert!(job.prompt.is_empty() && job.images.is_empty());
-            assert_eq!(job.media.len(), 1); assert_eq!(job.media[0].key, image.key);
+            assert_eq!(job.probe.as_ref().unwrap().spec.prompt_ids, expected.prompt_ids);
+            assert_eq!(job.media.len(), expected.media.len());
+            for (image, span) in job.media.iter().zip(&expected.media) {
+                assert_eq!([image.grid.t, image.grid.h, image.grid.w], span.grid);
+                assert_eq!(image.tokens, span.len);
+            }
             job.events.send(Ok(InferenceChunk::Ready { system_fingerprint: None,
                 prompt_usage: PromptUsage { prompt_tokens: 1, prompt_cache_hit_tokens: 0 } })).unwrap();
             job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length })).unwrap();
         });
-        let profile = ModelProfile::new(MODEL, ModelEncoding::DeepseekV4).with_loaded_vision(preparer);
         let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
             std::time::Duration::from_secs(1), ConsoleHub::disabled(), profile);
-        let body = json!({"model":MODEL,"messages":[{"role":"user","content":"probe"}],"max_tokens":1});
         let response = app.oneshot(axum::http::Request::post("/v1/chat/completions").header(probe::HEADER, id)
-            .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+            .header("content-type", "application/json").body(Body::from(request["body"].to_string())).unwrap()).await.unwrap();
+        let status = response.status();
+        if status != StatusCode::OK {
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            worker.abort();
+            panic!("replayed media rejected: {status}: {}", String::from_utf8_lossy(&bytes));
+        }
         worker.await.unwrap();
     }
 
