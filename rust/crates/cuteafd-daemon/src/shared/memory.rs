@@ -65,6 +65,7 @@ impl<'a> HostAllocation<'a> {
     }
     /// Read-only view of the same pinned bytes; readers must have joined.
     pub(crate) fn bytes(&self) -> &[u8] {
+        // SAFETY: this owner holds the allocation, and its mutable view requires an exclusive borrow.
         unsafe { std::slice::from_raw_parts(self.buffer.ptr.cast::<u8>(), self.buffer.bytes) }
     }
 }
@@ -80,6 +81,40 @@ impl Drop for HostAllocation<'_> {
         }
     }
 }
+/// Where the token embedding table lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum EmbedPlacement {
+    /// A BF16 copy on the coordinator GPU.
+    Gpu,
+    /// One pinned mapped host copy, gathered without a host hop.
+    Host,
+}
+
+/// One immutable weight allocation, either device-local or mapped pinned RAM.
+/// Both expose a stable device pointer; host placement never allocates a GPU copy.
+pub(crate) enum ResidentWeight<'a> {
+    Device(DeviceAllocation<'a>),
+    Host { storage: HostAllocation<'a>, alias: CuteafdDeviceBuffer },
+}
+impl<'a> ResidentWeight<'a> {
+    pub(crate) fn new(library: &'a NativeLibrary, bytes: usize, host: bool) -> Result<Self> {
+        if host {
+            let storage = HostAllocation::new(library, bytes)?;
+            let alias = library.cuda_host_buffer_device_alias(storage.buffer)?;
+            Ok(Self::Host { storage, alias })
+        } else {
+            Ok(Self::Device(DeviceAllocation::new(library, bytes)?))
+        }
+    }
+    pub(crate) fn buffer(&self) -> CuteafdDeviceBuffer {
+        match self { Self::Device(a) => a.buffer, Self::Host { alias, .. } => *alias }
+    }
+    pub(crate) fn is_host(&self) -> bool { matches!(self, Self::Host { .. }) }
+    pub(crate) fn device_bytes(&self) -> usize {
+        if self.is_host() { 0 } else { self.buffer().bytes }
+    }
+}
+
 /// Pinned staging with one region per layer while V4.1 passes may run
 /// device-ordered (`chain::device_enabled`), else one region: each layer's
 /// queued uploads then read their own bytes, so the host can queue later

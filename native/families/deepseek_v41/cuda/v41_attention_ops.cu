@@ -241,10 +241,22 @@ __global__ void embed_kernel(const __nv_bfloat16* table, const int32_t* tokens,
   const int32_t seed=tokens[request];
   const bool ok=seed>=0 && seed<129280;
   const int32_t token=Draft && row%Width!=0?128799:seed;
-  for(int col=threadIdx.x;col<5120;col+=256) {
-    const auto value=ok?table[uint64_t(token)*5120+col]:__float2bfloat16_rn(0);
-    #pragma unroll
-    for(int hc=0;hc<4;++hc)residual[row*20480+uint64_t(hc)*5120+col]=value;
+  // Mapped host rows pay PCIe latency per load round: copy eight BF16s at
+  // once when aligned, keeping the ABI's two-byte-aligned fallback exact.
+  if((reinterpret_cast<uintptr_t>(table)|reinterpret_cast<uintptr_t>(residual))%16==0) {
+    const auto* source=reinterpret_cast<const uint4*>(table)+uint64_t(ok?token:0)*640;
+    auto* destination=reinterpret_cast<uint4*>(residual)+row*2560;
+    for(int col=threadIdx.x;col<640;col+=256) {
+      const uint4 value=ok?__ldg(source+col):make_uint4(0,0,0,0);
+      #pragma unroll
+      for(int hc=0;hc<4;++hc)destination[uint64_t(hc)*640+col]=value;
+    }
+  } else {
+    for(int col=threadIdx.x;col<5120;col+=256) {
+      const auto value=ok?table[uint64_t(token)*5120+col]:__float2bfloat16_rn(0);
+      #pragma unroll
+      for(int hc=0;hc<4;++hc)residual[row*20480+uint64_t(hc)*5120+col]=value;
+    }
   }
   if(threadIdx.x<4)pre[row*4+threadIdx.x]=ok && threadIdx.x==0?1.0f:0.0f;
 }

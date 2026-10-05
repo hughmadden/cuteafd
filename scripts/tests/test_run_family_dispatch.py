@@ -50,7 +50,10 @@ def test_glm_flash_config_goes_to_run_family(tmp_path: Path) -> None:
     assert result.stdout == f"run-family --config {repo / 'glmf.config'} --family glm5_flash --restart\n"
     # DeepSeek V4.1 options do not apply to other families.
     result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--concurrency", "4")
-    assert result.returncode != 0 and "take only --config and --restart" in result.stderr
+    assert result.returncode != 0 and "take --config, --restart and --embedding-placement" in result.stderr
+    result = _run(repo, hf, "--config", str(repo / "glmf.config"), "--embedding-placement", "host")
+    assert result.returncode == 0, result.stderr
+    assert "--embedding-placement host" in result.stdout
 
 
 def test_family_table_names_every_launchable_family() -> None:

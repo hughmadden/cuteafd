@@ -923,6 +923,43 @@ fn layout_places_every_device_and_names_padded_spark_slices() {
 }
 
 #[test]
+fn host_embedding_removes_only_the_lead_copy_before_pool_admission() {
+    use crate::plan::testing::{mimo_pro_config, mimo_pro_tensors, write_snapshot};
+    use cuteafd_core::memory_layout::Category;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = mimo_pro_config();
+    config["tie_word_embeddings"] = json!(false);
+    write_snapshot(dir.path(), &config, &mimo_pro_tensors(), Some(8));
+    let mut options = PlanOptions {
+        layout: Some(layout::LayoutOptions { rtx_bytes: vec![24 << 30, 96 << 30], ..Default::default() }),
+        ..sparks(6)
+    };
+    let probe = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    let bytes = probe.devices[0].by_category()[&Category::Embedding];
+    assert!(bytes > 0);
+    // Leave only one table's worth of KV room, below this small fixture's target cap.
+    options.layout.as_mut().unwrap().rtx_bytes[0] =
+        probe.devices[0].used_bytes()
+            - probe.devices[0].items.iter().filter(|i| i.category == Category::Kv && i.group == "records").map(|i| i.bytes).sum::<u64>()
+            + bytes + options.layout.as_ref().unwrap().headroom_bytes;
+    let gpu = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    assert_eq!(gpu.devices[1].by_category().get(&Category::Embedding), None);
+    options.layout.as_mut().unwrap().host_embedding = true;
+    let report = plan(dir.path(), &options).unwrap();
+    let host = report.memory_layout.unwrap();
+    assert!(!host.devices.iter().any(|d| d.by_category().contains_key(&Category::Embedding)));
+    assert!(host.pool_tokens > gpu.pool_tokens, "host={} GPU={}", host.pool_tokens, gpu.pool_tokens);
+    assert_eq!(host.devices[1].by_category().get(&Category::Weights), gpu.devices[1].by_category().get(&Category::Weights));
+    assert!(host.notes.iter().any(|n| n.contains(&format!("{bytes} device bytes freed"))));
+    config["tie_word_embeddings"] = json!(true);
+    write_snapshot(dir.path(), &config, &mimo_pro_tensors(), Some(8));
+    let tied = plan(dir.path(), &options).unwrap();
+    assert!(!tied.fits);
+    assert!(tied.hints.iter().any(|h| h.what.contains("tie_word_embeddings")));
+    assert_eq!(tied.memory_layout.unwrap().devices[0].by_category()[&Category::Embedding], bytes);
+}
+
+#[test]
 fn qwen_layout_reserves_recurrent_state_before_auto_pool_and_leaves_peer_idle() {
     use cuteafd_core::memory_layout::Category;
     let dir = snapshot(qwen4_config(48), &[]);
