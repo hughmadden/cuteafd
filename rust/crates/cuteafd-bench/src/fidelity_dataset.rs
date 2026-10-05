@@ -12,12 +12,35 @@ pub const FLASH_REVISION: &str = "5db25a78dc2708df991df43b36636562e522a3b0";
 pub const FLASH_CONFIG: &str = "mimo_v2-v2_20261005_flash_mopd";
 pub const GLMF_REVISION: &str = "a7e7d1b4d82329acebe54ca88dc71d47d0d2056d";
 pub const GLMF_CONFIG: &str = "glm5_flash-v2_20261005_bf16root";
+pub const QWEN_REVISION: &str = "3e0ccef6cff461baf39ba838627edd93cb687be4";
+pub const QWEN_CONFIG: &str = "qwen4-v2_20261005_fp8";
+
+fn base_model(model: &str) -> Option<&'static str> {
+    // Served IDs may retain the HF namespace or its cache-directory spelling.
+    let name = model.rsplit('/').next()?.rsplit("--").next()?;
+    for base in ["Qwen3.8-Flash-Next", "GLM-5.3-Flash"] {
+        if name == base || name.strip_prefix(base).is_some_and(|suffix|
+            suffix.starts_with('-') && !suffix.to_ascii_lowercase().contains("speculator")
+                && !suffix.to_ascii_lowercase().contains("dflash")) {
+            return Some(base);
+        }
+    }
+    None
+}
+
+pub fn same_base_checkpoint(reference: &str, served: &str) -> bool {
+    base_model(reference).is_some_and(|base| base_model(served) == Some(base))
+}
 
 pub fn default_publication(model: &str) -> Option<(&'static str, &'static str)> {
+    match base_model(model) {
+        Some("Qwen3.8-Flash-Next") => return Some((QWEN_REVISION, QWEN_CONFIG)),
+        Some("GLM-5.3-Flash") => return Some((GLMF_REVISION, GLMF_CONFIG)),
+        _ => {},
+    }
     match model {
         "deepseek-ai/DeepSeek-V4.1-Flash" => Some((REVISION, CONFIG)),
         "XiaomiMiMo/MiMo-V2.6-Flash-MOPD" => Some((FLASH_REVISION, FLASH_CONFIG)),
-        "zai-org/GLM-5.3-Flash" => Some((GLMF_REVISION, GLMF_CONFIG)),
         _ => None,
     }
 }

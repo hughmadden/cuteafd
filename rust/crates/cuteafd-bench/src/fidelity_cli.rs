@@ -106,6 +106,15 @@ fn dataset_source<'a>(args: &'a RunArgs, model: &str) -> Result<Option<(&'a str,
     Ok(Some((repo, commit, config)))
 }
 
+fn validate_served_reference(reference: &Reference, model: &str, dataset: bool) -> Result<()> {
+    let model_level = dataset && crate::fidelity_dataset::same_base_checkpoint(&reference.checkpoint, model);
+    ensure!(model_level || reference.models.iter().any(|pattern| crate::reference::glob(pattern, model)),
+        "reference does not match served model");
+    ensure!(model_level || reference.windows.is_empty() || reference.checkpoint == model,
+        "reference checkpoint differs from served checkpoint");
+    Ok(())
+}
+
 fn request(agent: &ureq::Agent, url: &str, key: &Option<String>, body: &Value) -> Result<Value> {
     let mut request = agent.post(url);
     if let Some(key) = key { request = request.set("authorization", &format!("Bearer {key}")); }
@@ -138,8 +147,7 @@ pub fn run(args: &RunArgs) -> Result<Run> {
         let digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&r)?));
         (r, digest, None)
     };
-    ensure!(reference.models.iter().any(|pattern| crate::reference::glob(pattern, model)), "reference does not match served model");
-    ensure!(reference.windows.is_empty() || reference.checkpoint == model, "reference checkpoint differs from served checkpoint");
+    validate_served_reference(&reference, model, dataset_identity.is_some())?;
     let windows = reference.selected_windows(args.tier == "full")?;
     let media_payloads: Vec<_> = windows.iter().map(|window| {
         if window.media.is_empty() { return Ok(Vec::new()); }
@@ -294,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn glm_flash_publication_default_matches_only_the_served_checkpoint() {
+    fn glm_flash_publication_default_matches_the_base_and_quants() {
         let model = "zai-org/GLM-5.3-Flash";
         let full = parse(&["--tier", "full"]);
         assert_eq!(dataset_source(&full, model).unwrap(),
@@ -304,11 +312,53 @@ mod tests {
         for local_flag in ["--reference", "--rows"] {
             assert_eq!(dataset_source(&parse(&["--tier", "full", local_flag, "local"]), model).unwrap(), None);
         }
-        for other in ["zai-org/GLM-5.3-Flash-BF16", "zai-org/GLM-5.3", "other/GLM-5.3-Flash"] {
+        for quant in ["zai-org/GLM-5.3-Flash-BF16", "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1",
+            "wrldsuksgo2mars--GLM-5.3-Flash-EXL3-K3.25-v1"] {
+            assert_eq!(dataset_source(&full, quant).unwrap(), dataset_source(&full, model).unwrap());
+        }
+        for other in ["zai-org/GLM-5.3", "zai-org/GLM-5.3-Flashlight", "RedHatAI/GLM-5.3-Flash-speculator.dspark-preview"] {
             assert!(dataset_source(&full, other).is_err());
         }
         assert!(dataset_source(&parse(&["--tier", "full", "--dataset", "other/repo"]), model).is_err());
         assert!(dataset_source(&parse(&["--tier", "full", "--dataset-config", "other-config"]), model).is_err());
+    }
+
+    #[test]
+    fn qwen_publication_default_matches_the_base_and_quants() {
+        let model = "Qwen/Qwen3.8-Flash-Next-FP8";
+        let full = parse(&["--tier", "full"]);
+        assert_eq!(dataset_source(&full, model).unwrap(),
+            Some((crate::fidelity_dataset::REPOSITORY, crate::fidelity_dataset::QWEN_REVISION,
+                crate::fidelity_dataset::QWEN_CONFIG)));
+        assert_eq!(dataset_source(&parse(&[]), model).unwrap(), None);
+        for local_flag in ["--reference", "--rows"] {
+            assert_eq!(dataset_source(&parse(&["--tier", "full", local_flag, "local"]), model).unwrap(), None);
+        }
+        for quant in ["Qwen/Qwen3.8-Flash-Next", "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1",
+            "wrldsuksgo2mars--Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1"] {
+            assert_eq!(dataset_source(&full, quant).unwrap(), dataset_source(&full, model).unwrap());
+        }
+        for other in ["Qwen/Qwen3.8-Flash", "Qwen/Qwen3.8-Flash-NextGen", "Qwen/Qwen3.8-Flash-Next-speculator"] {
+            assert!(dataset_source(&full, other).is_err());
+        }
+        assert!(dataset_source(&parse(&["--tier", "full", "--dataset", "other/repo"]), model).is_err());
+        assert!(dataset_source(&parse(&["--tier", "full", "--dataset-config", "other-config"]), model).is_err());
+    }
+
+    #[test]
+    fn published_model_level_reference_accepts_quants_but_local_sources_remain_exact() {
+        let qwen: Reference = serde_json::from_value(json!({"name":"test", "models":["Qwen/Qwen3.8-Flash-Next-FP8"],
+            "checkpoint":"Qwen/Qwen3.8-Flash-Next-FP8", "vocab":248320,
+            "expect":{"top1_min":0.94,"kl_max":0.04}})).unwrap();
+        let quant = "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1";
+        assert!(validate_served_reference(&qwen, quant, true).is_ok());
+        assert!(validate_served_reference(&qwen, quant, false).is_err());
+        assert!(validate_served_reference(&qwen, "zai-org/GLM-5.3-Flash", true).is_err());
+        let glm: Reference = serde_json::from_value(json!({"name":"test", "models":["zai-org/GLM-5.3-Flash"],
+            "checkpoint":"zai-org/GLM-5.3-Flash", "vocab":154880,
+            "expect":{"top1_min":0.93,"kl_max":0.05}})).unwrap();
+        assert!(validate_served_reference(&glm, "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1", true).is_ok());
+        assert!(validate_served_reference(&glm, quant, true).is_err());
     }
 
     #[test]
