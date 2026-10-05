@@ -27,15 +27,15 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let parse = |matches: clap::ArgMatches| -> (Commands, clap::ArgMatches, Option<f64>) {
+    let parse = |matches: clap::ArgMatches| {
         match Cli::from_arg_matches(&matches) {
-            Ok(cli) => (cli.command, matches, cli.coordinator_gpu_budget_gib),
+            Ok(cli) => (cli.command, matches, cli.coordinator_gpu_budget_gib, cli.vision, cli.audio),
             Err(error) => error.exit(),
         }
     };
-    let (command, matches, initial_budget) = parse(Cli::command().get_matches());
+    let (command, matches, initial_budget, initial_vision, initial_audio) = parse(Cli::command().get_matches());
     // `serve` and `golden` pick the family and stand for its own command.
-    let (command, matches, family_budget) = match command {
+    let (mut command, matches, family_budget, family_vision, family_audio) = match command {
         Commands::Serve(args) => match commands::family::argv(commands::family::Kind::Serve, args)? {
             Some(argv) => parse(Cli::command().get_matches_from(argv)),
             None => return Ok(()),
@@ -44,8 +44,13 @@ async fn main() -> Result<()> {
             Some(argv) => parse(Cli::command().get_matches_from(argv)),
             None => return Ok(()),
         },
-        command => (command, matches, initial_budget),
+        command => (command, matches, initial_budget, initial_vision, initial_audio),
     };
+    let vision = family_vision.or(initial_vision).unwrap_or(cuteafd_loader::plan::MediaMode::Auto);
+    let audio = family_audio.or(initial_audio).unwrap_or(cuteafd_loader::plan::MediaMode::Off);
+    if let Commands::Plan(args) = &mut command { args.vision = vision; args.audio = audio; }
+    cuteafd_api::openai::set_media_input_policy(vision != cuteafd_loader::plan::MediaMode::Off,
+        audio != cuteafd_loader::plan::MediaMode::Off);
     let coordinator_budget_gib = family_budget.or(initial_budget);
     if let Some(gib) = coordinator_budget_gib {
         anyhow::ensure!(matches!(&command, Commands::ServeNative(_) | Commands::ServeMimo(_)

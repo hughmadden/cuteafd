@@ -17,6 +17,22 @@ const IMAGE_BYTES: usize = 32 << 20;
 const TOTAL_BYTES: usize = 64 << 20;
 pub(super) const BODY_BYTES: usize = 96 << 20;
 
+pub(super) fn guard_content(body: &serde_json::Value, loaded: super::MediaCapabilities) -> Result<(), &'static str> {
+    for message in body.get("messages").and_then(serde_json::Value::as_array).into_iter().flatten() {
+        for part in message.get("content").and_then(serde_json::Value::as_array).into_iter().flatten() {
+            match part.get("type").and_then(serde_json::Value::as_str) {
+                Some("image_url" | "image" | "input_image") if !loaded.vision =>
+                    return Err("this deployment has no image input; launch with VISION=auto"),
+                Some("input_audio" | "audio") if !loaded.audio =>
+                    return Err("this deployment has no audio input; launch with AUDIO=auto"),
+                Some("video" | "video_url" | "input_video") => return Err("video input is not supported"),
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub(super) struct ImageDecoder {
     agent: ureq::Agent,
@@ -358,5 +374,49 @@ mod tests {
             StatusCode::OK
         );
         worker.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+    use crate::openai::*;
+    use axum::{body::{to_bytes, Body}, http::Request};
+    use serde_json::json;
+    use tokio::sync::mpsc;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn unavailable_media_is_rejected_before_rendering_for_every_family() {
+        let profiles = [
+            ModelProfile::new("deepseek-v4", ModelEncoding::DeepseekV4),
+            ModelProfile::new("glm5", ModelEncoding::Glm(Arc::new(chat::glm5::fixtures::encoding()))),
+            ModelProfile::new("glm5_flash", ModelEncoding::Glm(Arc::new(chat::glm5::fixtures::encoding()))),
+            ModelProfile::new("qwen4", ModelEncoding::Qwen(Arc::new(chat::qwen4::fixtures::encoding()))),
+            ModelProfile::new("mimo_v2", ModelEncoding::Qwen(Arc::new(chat::qwen4::fixtures::encoding()))),
+        ];
+        for profile in profiles {
+            let (queue, mut receive) = mpsc::channel(1);
+            let app = router_for_model(queue, NativeLimits::default(), Arc::new(std::sync::Mutex::new(serde_json::Value::Null)),
+                Duration::from_secs(1), ConsoleHub::disabled(), profile.clone());
+            for kind in ["image_url", "input_audio", "video_url"] {
+                let body = json!({"model":profile.id,"messages":[{"role":"user","content":[{"type":kind}]}]});
+                let response = app.clone().oneshot(Request::post("/v1/chat/completions")
+                    .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+                assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST, "{} {kind}", profile.id);
+                let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+                let message = String::from_utf8(bytes.to_vec()).unwrap();
+                assert!(message.contains(if kind == "image_url" { "VISION=auto" } else if kind == "input_audio" { "AUDIO=auto" } else { "video" }));
+                assert!(receive.try_recv().is_err());
+            }
+            let response = app.oneshot(Request::get("/v1/models").body(Body::empty()).unwrap()).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+            assert_eq!(body["data"][0]["capabilities"], json!({"vision":false,"audio":false}));
+        }
+        let v41 = ModelProfile::default();
+        assert!(v41.capabilities.vision);
+        assert!(!v41.capabilities.audio);
+        assert!(guard_content(&json!({"messages":[{"content":[{"type":"image_url"}]}]}), v41.capabilities).is_ok());
+        assert!(guard_content(&json!({"messages":[{"content":[{"type":"input_audio"}]}]}), v41.capabilities).is_err());
     }
 }

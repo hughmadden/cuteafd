@@ -147,7 +147,7 @@ impl Family for MiMo {
     fn optional(&self, component: Component) -> bool {
         // Text serving runs without the MTP layers (serve-mimo --mtp runs them)
         // and without the vision and audio towers.
-        matches!(component, Component::Speculator | Component::Vision)
+        matches!(component, Component::Speculator | Component::Vision | Component::Audio)
     }
     fn classify(&self, _spec: &ModelSpec, name: &str) -> Option<TensorRole> {
         use Component::*;
@@ -160,9 +160,10 @@ impl Family for MiMo {
         if let Some((layer, _)) = indexed(name, "model.mtp.layers.") {
             return Some(TensorRole::layer(Speculator, layer));
         }
-        if name.starts_with("visual.") || name.starts_with("model.visual.") || name.starts_with("audio")
-            || name.starts_with("speech_") || name.starts_with("model.audio")
-        {
+        if name.starts_with("audio") || name.starts_with("speech_") || name.starts_with("model.audio") {
+            return Some(TensorRole::new(Audio));
+        }
+        if name.starts_with("visual.") || name.starts_with("model.visual.") {
             return Some(TensorRole::new(Vision));
         }
         let (layer, rest) = indexed(name, "model.layers.")?;
@@ -377,7 +378,7 @@ impl FamilyModel for MimoModel {
     }
 
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
-        if role.component == Component::Vision {
+        if matches!(role.component, Component::Vision | Component::Audio) {
             return Err("text-only: serve-mimo does not run the vision and audio towers".into());
         }
         let family = self.programs.clone()?;

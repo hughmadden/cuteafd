@@ -9,6 +9,8 @@ use crate::cli::PlanArgs;
 /// The planning options `args` name, validated before any checkpoint is read.
 fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     let options = PlanOptions {
+        vision: args.vision,
+        audio: args.audio,
         placement: ExpertPlacement::from_spark_ranks(args.spark_ranks.unwrap_or(4)),
         spark_budget_bytes: budget_bytes("--spark-budget-gib", args.spark_budget_gib)?,
         coordinator_budget_bytes: budget_bytes("--coordinator-budget-gib", args.coordinator_budget_gib)?
@@ -86,6 +88,8 @@ mod tests {
 
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
+            vision: cuteafd_loader::plan::MediaMode::Auto,
+            audio: cuteafd_loader::plan::MediaMode::Off,
             model: model.display().to_string(),
             embedding_placement: crate::shared::token_io::EmbedPlacement::Gpu,
             revision: None,
@@ -108,6 +112,15 @@ mod tests {
             native_mtp_layers: 3,
             workspace_manifest: None,
         }
+    }
+
+    #[test]
+    fn media_modes_parse_on_every_command_and_invalid_modes_fail() {
+        use clap::Parser;
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--vision", "off", "--audio", "auto"]).unwrap();
+        assert_eq!(cli.vision, Some(cuteafd_loader::plan::MediaMode::Off));
+        assert_eq!(cli.audio, Some(cuteafd_loader::plan::MediaMode::Auto));
+        assert!(crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--vision", "bad"]).is_err());
     }
 
     #[test]

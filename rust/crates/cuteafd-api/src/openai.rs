@@ -61,9 +61,24 @@ impl ModelEncoding {
     }
 }
 
+/// Availability is explicit so a template can never stand in for an encoder.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct MediaCapabilities {
+    pub vision: bool,
+    pub audio: bool,
+}
+
+static MEDIA_INPUT_POLICY: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+/// Restrict inputs according to launcher policy; enabling never creates a capability.
+pub fn set_media_input_policy(vision: bool, audio: bool) {
+    let _ = MEDIA_INPUT_POLICY.set((vision, audio));
+}
+
 /// The served model's public id, prompt encoding and EOS token ids.
 #[derive(Debug, Clone)]
 pub struct ModelProfile {
+    /// Loaded encoder capabilities, not checkpoint metadata or requested placement.
+    pub capabilities: MediaCapabilities,
     pub id: String,
     pub encoding: ModelEncoding,
     /// Token ids that end generation. Requests carry these (plus any
@@ -75,7 +90,8 @@ impl ModelProfile {
     /// A profile whose EOS ids come from `encoding`.
     pub fn new(id: impl Into<String>, encoding: ModelEncoding) -> Self {
         let eos_token_ids = encoding.eos_token_ids();
-        Self { id: id.into(), encoding, eos_token_ids }
+        let capabilities = MediaCapabilities { vision: matches!(encoding, ModelEncoding::DeepseekV41), audio: false };
+        Self { id: id.into(), encoding, eos_token_ids, capabilities }
     }
 
     /// Token ids that end generation for one request.
@@ -186,6 +202,11 @@ pub fn router_with_console(queue: mpsc::Sender<NativeRequest>, limits: NativeLim
 /// The serving router for `profile` (its model id and prompt encoding).
 pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits,
     stats: SharedStats, wait: std::time::Duration, console: Arc<ConsoleHub>, profile: ModelProfile) -> Router {
+    let mut profile = profile;
+    if let Some(&(vision, audio)) = MEDIA_INPUT_POLICY.get() {
+        profile.capabilities.vision &= vision;
+        profile.capabilities.audio &= audio;
+    }
     let admission = admission::Admission::new(queue.max_capacity(), wait);
     let images = images::ImageDecoder::new(queue.max_capacity());
     let console_routes = Router::new()
@@ -217,7 +238,7 @@ async fn stats_route(State(state): State<NativeState>) -> Json<Value> {
 async fn models(State(state): State<NativeState>) -> Json<Value> {
     let owner = state.profile.id.split_once('/').map_or("cuteafd", |(owner, _)| owner);
     Json(json!({"object":"list","data":[{"id":state.profile.id,"object":"model","owned_by":owner,
-        "max_context_tokens":state.limits.context(),"max_output_tokens":state.limits.output()}]}))
+        "capabilities":state.profile.capabilities,"max_context_tokens":state.limits.context(),"max_output_tokens":state.limits.output()}]}))
 }
 async fn health(State(state): State<NativeState>) -> StatusCode {
     if state.queue.is_closed() {
@@ -333,6 +354,9 @@ impl OutputProcessor {
 }
 
 async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap, Json(mut body): Json<Value>) -> Response {
+    if let Err(message) = images::guard_content(&body, state.profile.capabilities) {
+        return error(StatusCode::BAD_REQUEST, message);
+    }
     let probe = headers.get(probe::HEADER).and_then(|v| v.to_str().ok()).and_then(|id| probe::registry().claim(id));
     // Families rendered from the checkpoint's own chat template.
     let glm = match &state.profile.encoding {

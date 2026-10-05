@@ -21,6 +21,18 @@ pub use family::{ConfigError, ExpertContract, Family, FamilyModel, Hint, Runtime
 pub use format::{Encoding, Malformed, QuantOperand, RowTiling, ScaleEncoding};
 pub use spec::{AttentionKind, Component, FfnKind, ModelSpec, TensorRole};
 
+/// Requested policy; never implies that an encoder has actually been loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaMode { Auto, Off }
+impl std::str::FromStr for MediaMode {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value { "auto" => Ok(Self::Auto), "off" => Ok(Self::Off),
+            _ => Err("media mode must be auto or off".into()) }
+    }
+}
+
 const GIB: f64 = (1u64 << 30) as f64;
 /// Rejected tensors kept per component (the count covers the rest).
 const REJECTIONS_KEPT: usize = 8;
@@ -55,6 +67,8 @@ pub enum Status {
     Planned,
     /// Optional for serving and not executed by this build (e.g. a speculator).
     Unused,
+    /// Explicitly disabled by the deployment.
+    Disabled,
 }
 
 /// A tensor (group) the family's loaders would not take, and why.
@@ -114,6 +128,9 @@ pub enum PlanError {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanReport {
+    pub vision: MediaMode,
+    pub audio: MediaMode,
+    pub disabled_media_bytes: u64,
     pub snapshot: String,
     pub family: Option<String>,
     pub architectures: Vec<String>,
@@ -162,7 +179,7 @@ impl PlanReport {
             && self.config_error.is_none()
             && self.missing_shards.is_empty()
             && self.unclassified.is_empty()
-            && self.components.iter().all(|c| matches!(c.status, Status::Ready | Status::Unused))
+            && self.components.iter().all(|c| matches!(c.status, Status::Ready | Status::Unused | Status::Disabled))
             && self.placement_supported
             && self.fits
     }
@@ -170,6 +187,8 @@ impl PlanReport {
 
 #[derive(Debug, Clone)]
 pub struct PlanOptions {
+    pub vision: MediaMode,
+    pub audio: MediaMode,
     pub placement: ExpertPlacement,
     /// Routed-expert bytes one Spark rank may hold (weights only).
     pub spark_budget_bytes: u64,
@@ -183,6 +202,8 @@ pub struct PlanOptions {
 impl Default for PlanOptions {
     fn default() -> Self {
         Self {
+            vision: MediaMode::Auto,
+            audio: MediaMode::Off,
             placement: ExpertPlacement::Sparks { ranks: 4 },
             spark_budget_bytes: 100 << 30,
             coordinator_budget_bytes: 80 << 30,
@@ -236,6 +257,9 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
     let checkpoint = Checkpoint::open(snapshot)
         .map_err(|error| error.context(format!("reading checkpoint at {}", snapshot.display())))?;
     let mut report = PlanReport {
+        vision: options.vision,
+        audio: options.audio,
+        disabled_media_bytes: 0,
         snapshot: snapshot.display().to_string(),
         family: None,
         architectures: checkpoint.architectures(),
@@ -370,13 +394,15 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
             rejections.insert(0, Rejection { tensor: "routed experts (read_expert_catalog)".into(), reason: error.clone() });
             rejections.truncate(REJECTIONS_KEPT);
         }
-        let status = match family.runtime() {
+        let disabled = (*component == Component::Vision && options.vision == MediaMode::Off)
+            || (*component == Component::Audio && options.audio == MediaMode::Off);
+        let status = if disabled { Status::Disabled } else { match family.runtime() {
             RuntimeStatus::Planned => Status::Planned,
             RuntimeStatus::Serving if rejected == 0 => Status::Ready,
             RuntimeStatus::Serving if family.optional(*component) => Status::Unused,
             RuntimeStatus::Serving => Status::MissingKernel,
-        };
-        if !matches!(status, Status::Ready | Status::Unused) && hinted.insert(*component) {
+        }};
+        if !matches!(status, Status::Ready | Status::Unused | Status::Disabled) && hinted.insert(*component) {
             if let Some(first) = rejections.first() {
                 report.hints.push(Hint {
                     what: format!("{}: {rejected} of {} weights not executable, e.g. {}: {}", component.label(),
@@ -393,7 +419,9 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
                 }
             }
         }
-        let bytes: u64 = tensors.iter().map(|t| t.meta.byte_length).sum();
+        let source_bytes: u64 = tensors.iter().map(|t| t.meta.byte_length).sum();
+        if disabled { report.disabled_media_bytes += source_bytes; }
+        let bytes = if disabled { 0 } else { source_bytes };
         let owner = owner_for(*component);
         report.components.push(ComponentPlan {
             component: *component,
@@ -608,6 +636,7 @@ pub fn plan_preferred(snapshot: &Path, options: &PlanOptions) -> Result<PlanRepo
 pub fn render(report: &PlanReport) -> String {
     use std::fmt::Write;
     let mut out = String::new();
+    if report.disabled_media_bytes > 0 { out.push_str(&format!("media disabled: {} bytes saved\n", report.disabled_media_bytes)); }
     let _ = writeln!(out, "snapshot   {}", report.snapshot);
     let _ = writeln!(out, "arch       {}", report.architectures.join(", "));
     if let Some(quantization) = &report.quantization {
@@ -686,6 +715,7 @@ pub fn render(report: &PlanReport) -> String {
                 Status::MissingKernel => "MISSING",
                 Status::Planned => "planned",
                 Status::Unused => "unused",
+                Status::Disabled => "disabled",
             };
             let _ = writeln!(
                 out,

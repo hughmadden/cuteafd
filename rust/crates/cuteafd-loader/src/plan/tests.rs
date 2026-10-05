@@ -1125,3 +1125,17 @@ fn local_qwen_memory_layout_charges_experts_to_the_lead_gpu() {
     }).unwrap();
     assert_eq!(layout.devices[0].by_category(), one.memory_layout.as_ref().unwrap().devices[0].by_category());
 }
+
+#[test]
+fn media_off_is_disabled_and_saves_checkpoint_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = mimo_flash_config();
+    let mut tensors = mimo_flash_tensors();
+    tensors.push(("visual.patch_embed.proj.weight".into(), "BF16".into(), vec![1280, 3, 2, 16, 16]));
+    write_snapshot(dir.path(), &config, &tensors, None);
+    let report = plan(dir.path(), &PlanOptions { vision: MediaMode::Off, ..Default::default() }).unwrap();
+    let vision = report.components.iter().find(|c| c.component == Component::Vision).unwrap();
+    assert_eq!(vision.status, Status::Disabled);
+    assert_eq!(vision.bytes, 0);
+    assert!(report.disabled_media_bytes > 0);
+}

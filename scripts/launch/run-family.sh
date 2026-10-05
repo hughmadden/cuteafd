@@ -29,6 +29,10 @@ while IFS='=' read -r key value; do
 done < <(grep -E '^[A-Z_0-9]+=' "$config")
 [[ -z "$embedding_override" ]] || cfg[EMBEDDING]="$embedding_override"
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
+vision="$(get VISION auto)"
+audio="$(get AUDIO off)"
+case "$vision" in auto|off) ;; *) release_die "VISION must be auto or off" ;; esac
+case "$audio" in auto|off) ;; *) release_die "AUDIO must be auto or off" ;; esac
 coordinator_budget="$(get COORDINATOR_GPU_BUDGET_GIB)"
 release_validate_coordinator_gpu_budget "$coordinator_budget"
 coordinator_budget_args=()
@@ -122,7 +126,7 @@ if [[ "$qwen_exl3" == 1 && "$backend" == auto && "$ranks" != 0 ]]; then
       # CPU-only preflight reads checkpoint headers in the selected serving image.
       # Older images that do not qualify auto placement keep the Spark fallback.
       preferred="$(docker run --rm --network none -v "$hub:/root/.cache/huggingface/hub:ro" \
-        "$(get COORDINATOR_DOCKER_INFERENCE)" cuteafd plan "$snapshot" --json --layout \
+        "$(get COORDINATOR_DOCKER_INFERENCE)" cuteafd plan "$snapshot" --vision "$vision" --audio "$audio" --json --layout \
         --rtx 1 --rtx-gib "$free_gib" --coordinator-budget-gib "$free_gib" --pool-tokens "$pool" \
         | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["spark_ranks"])' 2>/dev/null || true)"
       if [[ "$preferred" == 0 ]]; then
@@ -209,6 +213,7 @@ draft_args=()
 embedding="$(get EMBEDDING gpu)"
 case "$embedding" in host|gpu) ;; *) echo "EMBEDDING must be host or gpu" >&2; exit 2 ;; esac
 family_args=(--embedding-placement "$embedding")
+family_args+=(--vision "$vision" --audio "$audio")
 dspark_args=()
 if [[ $family == mimo_v2 ]]; then
   case "$(get MIMO_WEIGHT_POLICY auto)" in
