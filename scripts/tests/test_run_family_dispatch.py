@@ -91,7 +91,8 @@ def test_family_table_matches_the_rust_launch_fixtures(tmp_path: Path) -> None:
 def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys: str,
                           physical_gpus: tuple[int, ...] = (0, 1), *, preflight_error: bool = False,
                           restart: bool = False, preferred_ranks: int | None = None,
-                          gpu_free_mib: int = 97000, container_pids: tuple[int, ...] = (),
+                          gpu_free_mib: int = 97000, gpu_total_mib: int = 98304,
+                          container_pids: tuple[int, ...] = (),
                           gpu_allocations: tuple[tuple[int, int], ...] = (),
                           previous_peers: str | None = None) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
@@ -125,6 +126,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     (bin_dir / "nvidia-smi").write_text("#!/usr/bin/env bash\nprintf '%s\\n' " +
                                          " ".join(map(str, physical_gpus)) + "\n" if preferred_ranks is None else
                                          '#!/usr/bin/env bash\ncase "$*" in *memory.free*) echo ' + str(gpu_free_mib) +
+                                         ' ;; *memory.total*) echo ' + str(gpu_total_mib) +
                                          ' ;; *query-compute-apps*) printf \'%s\\n\' ' +
                                          " ".join(f"'{pid}, {mib}'" for pid, mib in gpu_allocations) +
                                          ' ;; *) echo 0; echo 1 ;; esac\n')
@@ -620,6 +622,52 @@ def test_glmf_pool_defaults_to_the_planned_pool(tmp_path: Path) -> None:
                                "deepseek-ai/DeepSeek-V4-Flash-0731", "POOL_TOKENS=auto\n")
     assert "cuteafd serve-dsv4" in dsv4
     assert "--pool-tokens 0" in dsv4
+
+
+@pytest.mark.parametrize("family_config", [*SPLIT_CONFIGS.values(),
+    {"model_type": "deepseek_v4"},
+    {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}])
+def test_coordinator_gpu_budget_is_forwarded_only_to_the_coordinator(tmp_path, family_config):
+    model = "zai-org/GLM-5.3-Flash" if family_config.get("model_type") == "glm5_next" else "test/model"
+    result = _family_launch_result(tmp_path, family_config, model,
+                                  "COORDINATOR_GPU_BUDGET_GIB=32.5\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "--coordinator-gpu-budget-gib" in line)
+    assert "cuteafd --coordinator-gpu-budget-gib 32.5 serve-" in launch
+    for line in result.stderr.splitlines():
+        if "expertd-native" in line:
+            assert "--coordinator-gpu-budget-gib" not in line
+
+
+@pytest.mark.parametrize("budget", ["0", "-1", "NaN", "inf", "32GiB", "0.0000000000001", "9999999999999999999999"])
+def test_coordinator_gpu_budget_rejects_invalid_values_before_side_effects(tmp_path, budget):
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",
+                                  f"COORDINATOR_GPU_BUDGET_GIB={budget}\n")
+    assert result.returncode != 0
+    assert "COORDINATOR_GPU_BUDGET_GIB must be" in result.stderr
+    assert "docker " not in result.stderr and "ssh " not in result.stderr and "nest " not in result.stderr
+
+
+def test_qwen_backend_preflight_charges_physical_usage_against_the_ceiling(tmp_path):
+    result = _family_launch_result(tmp_path,
+        {**SPLIT_CONFIGS["qwen4"], "quantization_config": {"quant_method": "exl3"}}, "test/model",
+        "COORDINATOR_GPU_BUDGET_GIB=32\n", preferred_ranks=4,
+        gpu_free_mib=90 * 1024, gpu_total_mib=96 * 1024)
+    assert result.returncode == 0, result.stderr
+    preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    assert "--rtx-gib 26.0" in preflight and "--coordinator-budget-gib 26.0" in preflight
+    launch = next(line for line in result.stderr.splitlines() if "serve-qwen4" in line)
+    assert "--coordinator-gpu-budget-gib 32" in launch and "--peers" in launch
+
+
+def test_budget_key_is_accepted_for_cleanup_and_native_launchers(tmp_path):
+    config = tmp_path / "budget.config"
+    config.write_text("COORDINATOR_GPU_BUDGET_GIB=32\n")
+    result = subprocess.run(["bash", "-c", 'source "$1"; release_load_config "$2" stop; printf "%s" "$COORDINATOR_GPU_BUDGET_GIB"',
+        "bash", str(ROOT / "scripts/lib/release-common.sh"), str(config)], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0 and result.stdout == "32", result.stderr
+    for file in ("run.sh", "scripts/launch/run-tp-ep-native-candidate.sh"):
+        assert 'args+=(--coordinator-gpu-budget-gib "$COORDINATOR_GPU_BUDGET_GIB")' in (ROOT / file).read_text()
 
 
 def test_family_config_reads_share_the_stop_key_grammar() -> None:

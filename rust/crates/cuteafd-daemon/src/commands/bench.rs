@@ -124,7 +124,7 @@ fn family_of(command: &str) -> Option<&'static str> {
 
 /// Records a serve command's resolved options (value, default, source) for
 /// the benchmark; other commands record nothing.
-pub(crate) fn capture(matches: &ArgMatches) {
+pub(crate) fn capture(matches: &ArgMatches, coordinator_budget_gib: Option<f64>) {
     let Some((name, sub)) = matches.subcommand() else { return };
     let Some(family) = family_of(name) else { return };
     let command = crate::cli::Cli::command();
@@ -133,7 +133,7 @@ pub(crate) fn capture(matches: &ArgMatches) {
     let mut snapshot = None;
     for arg in definition.get_arguments() {
         let id = arg.get_id().as_str();
-        if matches!(id, "help" | "version") {
+        if matches!(id, "help" | "version" | "coordinator_gpu_budget_gib") {
             continue;
         }
         let value = sub.get_raw(id).map(|values| values.map(|v| v.to_string_lossy().into_owned())
@@ -164,6 +164,12 @@ pub(crate) fn capture(matches: &ArgMatches) {
         settings.push(Setting { name, value, default: (!defaults.is_empty()).then(|| defaults.join(",")),
             source: source.to_string() });
     }
+    // Global options are not in the unbuilt family definition. Pass the
+    // resolved ceiling explicitly so generic serve's reparse retains it too.
+    if let Some(gib) = coordinator_budget_gib {
+        settings.push(Setting { name: "coordinator-gpu-budget-gib".into(), value: Some(gib.to_string()),
+            default: None, source: "cli".into() });
+    }
     settings.extend(cuteafd_bench::context::env_settings());
     cuteafd_bench::context::set(cuteafd_bench::context::ServerContext { command: name.to_string(),
         family: Some(family.to_string()), snapshot, settings });
@@ -176,16 +182,20 @@ mod tests {
 
     #[test]
     fn serve_options_are_captured_with_defaults_and_sources() {
-        let argv = ["cuteafd", "serve-qwen4", "--snapshot", "/hub/models--Qwen--Q/snapshots/abc", "--native-lib",
+        let argv = ["cuteafd", "--coordinator-gpu-budget-gib", "32", "serve-qwen4", "--snapshot", "/hub/models--Qwen--Q/snapshots/abc", "--native-lib",
             "/opt/lib.so", "--max-sequences", "2"];
         let matches = crate::cli::Cli::command().try_get_matches_from(argv).unwrap();
-        crate::cli::Cli::from_arg_matches(&matches).unwrap();
-        capture(&matches);
+        let cli = crate::cli::Cli::from_arg_matches(&matches).unwrap();
+        capture(&matches, cli.coordinator_gpu_budget_gib);
         let context = cuteafd_bench::context::get();
         assert_eq!(context.family.as_deref(), Some("qwen4"));
         assert_eq!(context.snapshot.as_deref(), Some(std::path::Path::new("/hub/models--Qwen--Q/snapshots/abc")));
         let find = |name: &str| context.settings.iter().find(|s| s.name == name).cloned()
             .unwrap_or_else(|| panic!("{name} missing"));
+        let budget = find("coordinator-gpu-budget-gib");
+        assert_eq!((budget.value.as_deref(), budget.default.as_deref(), budget.source.as_str()),
+            (Some("32"), None, "cli"));
+        assert_eq!(context.settings.iter().filter(|s| s.name == budget.name).count(), 1);
         let sequences = find("max-sequences");
         assert_eq!((sequences.value.as_deref(), sequences.default.as_deref(), sequences.source.as_str()),
             (Some("2"), Some("4"), "cli"));

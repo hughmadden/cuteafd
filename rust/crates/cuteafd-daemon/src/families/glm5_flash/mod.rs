@@ -480,10 +480,33 @@ impl Opened {
             head = model.head.name(), head_mib = mib(single.head_bf16 + single.head_fp8),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "GLM 5.3 Flash coordinator weights resident (one copy each)");
-        // 0: the planner's automatic pool (free memory after the costs still to come).
-        let pool_tokens = if args.pool_tokens == 0 {
-            crate::shared::memory_report::planned_pool_tokens(&self.library, &args.snapshot, &[args.device],
-                args.draft.as_deref(), args.prefill_rows, args.slots)?
+        let budgeted = cuteafd_ffi::coordinator_gpu_budget().is_some();
+        // With a ceiling, establish local expert ownership before KV spends
+        // the remaining budget. Lazy EXL3 owners reserve their loader peak.
+        let mut future_expert_bytes = 0;
+        let admitted_experts = if budgeted {
+            ensure!(args.expert_window.is_none(),
+                "coordinator GPU budget admission requires resident experts, not diagnostic --expert-window paging");
+            let experts = self.experts(args)?;
+            if let Some(engine::Experts::LocalExl3(local)) = &experts {
+                ensure!(local.window >= layers,
+                    "coordinator GPU budget admission requires all EXL3 layers resident; increase --exl3-window or use Sparks");
+                let plan = crate::families::deepseek_v4::local::plan(&self.library, &local.native_lib,
+                    local.catalog, 0, layers, local.max_rows, local.budget)?;
+                let expected = layers.saturating_sub(local.catalog.routed_experts().first_layer);
+                ensure!(plan.layers == expected, "coordinator GPU budget cannot fit the requested EXL3 expert window");
+                future_expert_bytes = plan.peak_bytes as u64;
+            }
+            Some(experts)
+        } else { None };
+        // 0: automatic; budgeted fixed pools retain their requested size and
+        // refuse before allocation if the future storage would not fit.
+        let pool_tokens = if args.pool_tokens == 0 || budgeted {
+            let devices: Vec<i32> = std::iter::once(args.device)
+                .chain(if budgeted { peer_stream.map(|(d, _)| d) } else { None }).collect();
+            crate::shared::memory_report::planned_pool_tokens(&self.library, &args.snapshot, &devices,
+                args.draft.as_deref(), args.prefill_rows, args.slots,
+                (args.pool_tokens > 0).then_some(args.pool_tokens as u64), future_expert_bytes)?
         } else {
             args.pool_tokens
         };
@@ -519,7 +542,7 @@ impl Opened {
             tracing::info!(package = %directory.display(), "NVFP4 dense MLPs on their own package");
         }
         if (0..layers).any(|l| !self.cfg.dense[l]) {
-            if let Some(experts) = self.experts(args)? {
+            if let Some(experts) = match admitted_experts { Some(experts) => experts, None => self.experts(args)? } {
                 engine.set_experts(experts);
             }
         }

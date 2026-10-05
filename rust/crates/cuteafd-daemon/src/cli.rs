@@ -7,6 +7,10 @@ pub(crate) const DEFAULT_REAL_FULL_MAX_CONTEXT_TOKENS: usize = 128 * 1024;
 #[derive(Debug, Parser)]
 #[command(name = "cuteafd", about = "CUTEAFD phase0 runtime CLI")]
 pub(crate) struct Cli {
+    /// Logical GiB ceiling per coordinator GPU (weights, KV, workspaces,
+    /// graphs and drafts); leaves physical GPU capacity/SM/L2 unchanged.
+    #[arg(long, global = true)]
+    pub(crate) coordinator_gpu_budget_gib: Option<f64>,
     #[command(subcommand)]
     pub(crate) command: Commands,
 }
@@ -184,7 +188,7 @@ pub(crate) struct PlanArgs {
     #[arg(long, default_value_t = 1)]
     pub(crate) rtx: usize,
     /// Usable GiB per coordinator GPU for --layout.
-    #[arg(long, default_value_t = 95.5)]
+    #[arg(long = "rtx-budget-gib", alias = "rtx-gib", default_value_t = 95.5, requires = "layout")]
     pub(crate) rtx_gib: f64,
     /// Explicit KV pool tokens for --layout (0 or omitted: automatic).
     #[arg(long)]

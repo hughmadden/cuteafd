@@ -61,6 +61,49 @@ pub struct DeviceMemory {
     pub baseline_free_bytes: u64,
 }
 
+/// A logical per-device ceiling, not an allocation occupying unused VRAM.
+/// Existing usage (including other processes and CUDA runtime/graphs) is
+/// charged against the smaller of the physical device and this ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuMemoryBudget(pub u64);
+
+impl GpuMemoryBudget {
+    pub fn from_gib(gib: f64) -> Result<Self, CapacityError> {
+        let bytes = gib * (1u64 << 30) as f64;
+        if !gib.is_finite() || bytes < 1.0 || bytes >= u64::MAX as f64 {
+            return Err(CapacityError::Invalid("GPU budget GiB must be finite, positive and representable"));
+        }
+        Ok(Self(bytes as u64))
+    }
+
+    pub fn apply(self, memory: DeviceMemory) -> Result<DeviceMemory, CapacityError> {
+        if self.0 == 0 || memory.total_bytes == 0 || memory.baseline_free_bytes > memory.total_bytes {
+            return Err(CapacityError::Invalid("invalid GPU budget or physical memory sample"));
+        }
+        let used = memory.total_bytes - memory.baseline_free_bytes;
+        let budget = self.0.min(memory.total_bytes);
+        if used > budget {
+            return Err(CapacityError::GpuBudgetExceeded { device: memory.device, required: used,
+                budget, shortfall: used - budget });
+        }
+        Ok(DeviceMemory { total_bytes: budget, baseline_free_bytes: budget - used, ..memory })
+    }
+
+    pub fn admit(self, memory: DeviceMemory, additional: u64) -> Result<(), CapacityError> {
+        if self.0 == 0 || memory.total_bytes == 0 || memory.baseline_free_bytes > memory.total_bytes {
+            return Err(CapacityError::Invalid("invalid GPU budget or physical memory sample"));
+        }
+        let used = memory.total_bytes - memory.baseline_free_bytes;
+        let required = used.checked_add(additional).ok_or(CapacityError::Overflow("GPU allocation budget"))?;
+        let budget = self.0.min(memory.total_bytes);
+        if required > budget {
+            return Err(CapacityError::GpuBudgetExceeded { device: memory.device, required,
+                budget, shortfall: required - budget });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryReservation {
     pub name: String,
@@ -126,6 +169,8 @@ pub struct ResolvedCapacity {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum CapacityError {
+    #[error("GPU {device} coordinator memory budget shortfall: need {required} bytes, budget {budget} bytes, shortfall {shortfall} bytes; weights, KV, workspaces, graphs and drafters must fit (reduce the pool/placement or raise the budget)")]
+    GpuBudgetExceeded { device: u32, required: u64, budget: u64, shortfall: u64 },
     #[error("invalid capacity input: {0}")]
     Invalid(&'static str),
     #[error("capacity arithmetic overflows: {0}")]
@@ -360,6 +405,43 @@ mod tests {
             devices,
             host_prefix_bytes: 0,
         }
+    }
+
+    #[test]
+    fn logical_budget_charges_existing_usage_and_never_enlarges_a_gpu() {
+        let cap = GpuMemoryBudget::from_gib(32.0).unwrap();
+        let sample = cap.apply(hardware(7, 5 * GIB)).unwrap();
+        assert_eq!((sample.device, sample.total_bytes, sample.baseline_free_bytes), (7, 32 * GIB, 27 * GIB));
+        cap.admit(hardware(7, 5 * GIB), 27 * GIB).unwrap();
+        assert!(matches!(cap.admit(hardware(7, 5 * GIB), 28 * GIB),
+            Err(CapacityError::GpuBudgetExceeded { device: 7, shortfall: GIB, .. })));
+        assert_eq!(GpuMemoryBudget(128 * GIB).apply(hardware(0, 5 * GIB)).unwrap(), hardware(0, 5 * GIB));
+        assert_eq!(cap.apply(cap.apply(hardware(0, 5 * GIB)).unwrap()).unwrap().baseline_free_bytes, 27 * GIB);
+        let error = cap.apply(hardware(0, 33 * GIB)).unwrap_err().to_string();
+        assert!(error.contains("shortfall 1073741824 bytes"), "{error}");
+    }
+
+    #[test]
+    fn budget_validation_and_joint_pool_reservations_are_cpu_only() {
+        for gib in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e-12, 1e30] {
+            assert!(GpuMemoryBudget::from_gib(gib).is_err(), "{gib}");
+        }
+        assert_eq!(GpuMemoryBudget::from_gib(0.5).unwrap().0, GIB / 2);
+        let cap = GpuMemoryBudget(32 * GIB);
+        let p = profile(vec![DeviceCosts { device: 3, pool_unit_bytes: GIB,
+            reservations: [("weights", 8), ("workspace", 3), ("graphs", 2), ("draft", 4)]
+                .into_iter().map(|(name, gib)| MemoryReservation { name: name.into(), bytes: gib * GIB }).collect() }]);
+        let sample = cap.apply(hardware(3, 2 * GIB)).unwrap();
+        let policy = CapacityPolicy { gpu_occupancy_percent: 100, ..Default::default() };
+        let result = resolve_capacity(policy, &p, &[sample]).unwrap();
+        assert_eq!(result.allocated_gpu_kv_tokens, 13 * 64);
+        assert_eq!(result.devices[0].reserved_bytes, 17 * GIB);
+        assert!(matches!(resolve_capacity(CapacityPolicy { pool_tokens: Some(14 * 64), ..policy }, &p, &[sample]),
+            Err(CapacityError::PoolExceeded { .. })));
+        let peer = cap.apply(hardware(9, 12 * GIB)).unwrap();
+        let replicated = profile(vec![p.devices[0].clone(), DeviceCosts { device: 9, ..p.devices[0].clone() }]);
+        let result = resolve_capacity(policy, &replicated, &[sample, peer]).unwrap();
+        assert_eq!(result.allocated_gpu_kv_tokens, 3 * 64);
     }
 
     #[test]

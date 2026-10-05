@@ -333,7 +333,8 @@ impl Opened {
         // Establish expert ownership before admission. EXL3 keeps its existing
         // lazy first-use load; reserve the exact loader plan before sizing KV.
         let mut future_expert_bytes = 0;
-        let admitted_experts = if args.pool_tokens == 0 {
+        let budget_admission = args.pool_tokens == 0 || cuteafd_ffi::coordinator_gpu_budget().is_some();
+        let admitted_experts = if budget_admission {
             ensure!(args.shared_only || self.fp8().is_none() || args.expert_window.is_none(),
                 "Qwen automatic KV admission does not support diagnostic --expert-window paging; use a fixed pool or Sparks");
             let experts = self.experts(args, layers, stream)?;
@@ -351,7 +352,7 @@ impl Opened {
             }
             Some(experts)
         } else { None };
-        let pool_tokens = if args.pool_tokens == 0 {
+        let pool_tokens = if budget_admission {
             admission::pool_tokens(&self.library, args, &self.cfg, layers, model.mtp.is_some(), future_expert_bytes)?
         } else { args.pool_tokens };
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);

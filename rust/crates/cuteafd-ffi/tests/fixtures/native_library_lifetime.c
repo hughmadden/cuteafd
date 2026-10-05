@@ -8,6 +8,20 @@
 struct host_buffer { void *ptr; size_t bytes; uint64_t flags; };
 static char *event_path;
 static int pack_status, drain_status, drain_calls, drain_after, current_device;
+static size_t memory_total[8], memory_used[8], graph_bytes;
+
+void fixture_configure_memory(int device, size_t total, size_t used, size_t graph) {
+    memory_total[device] = total;
+    memory_used[device] = used;
+    graph_bytes = graph;
+}
+
+int cuteafd_cuda_get_device(int *device) { *device = current_device; return 0; }
+int cuteafd_cuda_memory_info(size_t *free_bytes, size_t *total) {
+    *total = memory_total[current_device];
+    *free_bytes = *total - memory_used[current_device];
+    return 0;
+}
 
 static void event(char value) {
     FILE *file = fopen(event_path, "a");
@@ -67,14 +81,47 @@ int cuteafd_alloc_device_buffer(size_t bytes, struct device_buffer *out) {
     out->bytes = bytes;
     out->device_id = current_device;
     out->flags = 1;
+    memory_used[current_device] += bytes;
     event('D');
     return 0;
 }
 
 int cuteafd_free_device_buffer(struct device_buffer *buffer) {
     event('d');
+    if (buffer->flags == 1) memory_used[buffer->device_id] -= buffer->bytes;
     free(buffer->ptr);
     memset(buffer, 0, sizeof(*buffer));
+    return 0;
+}
+
+int cuteafd_alloc_managed_device_buffer(size_t bytes, struct device_buffer *out) {
+    // Host-resident managed pages deliberately do not reduce physical free.
+    out->ptr = malloc(bytes);
+    if (!out->ptr) return 1;
+    out->bytes = bytes;
+    out->device_id = current_device;
+    out->flags = 2;
+    event('D');
+    return 0;
+}
+
+struct graph_exec { int device; size_t bytes; };
+int cuteafd_cuda_graph_end_capture(void *stream, void **out) {
+    (void)stream;
+    struct graph_exec *graph = malloc(sizeof(*graph));
+    if (!graph) return 1;
+    graph->device = current_device;
+    graph->bytes = graph_bytes;
+    memory_used[current_device] += graph_bytes;
+    *out = graph;
+    event('G');
+    return 0;
+}
+int cuteafd_cuda_graph_exec_destroy(void *handle) {
+    struct graph_exec *graph = handle;
+    memory_used[graph->device] -= graph->bytes;
+    free(graph);
+    event('g');
     return 0;
 }
 
