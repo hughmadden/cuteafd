@@ -688,6 +688,10 @@ file in the commit. Our gates and policies still decide, and we don't
 benchmark against his engines. Agent branches are listed with each item.
 
 Policy decisions:
+- **Fidelity set:** the current check scores one 512-token PLAN.md passage
+  (±1.4-point top-1 standard error, no code or tool calls). A redesigned
+  agentic-coding set (draft `docs/fidelity-design.md`) replaces it before
+  any precision default changes on the new bar.
 - **Precision bar:** a lossy default (FP8 KDA/head, A8, …) must keep golden
   top-1 within ~0.5 point of the checkpoint-precision arm (GLM Flash ~89%
   is the floor TJ accepts) and KL within 0.005 nat of it. Hugh's BF16
@@ -739,10 +743,11 @@ Work, in priority order:
    without `nest` (PLAT-5), `/health` 503 on expert failure, an optional
    API key, keyed bench controls (PLAT-6, #1 FR-G.15), malformed tool calls
    returned as content (#1 FR-G.14).
-6. **GLM Flash:** compact pooled-key index cache (#1 FR-G.3, ~half the KV),
+6. **GLM Flash (owned by Hugh, 2026-10-05; we only finish `work/glmf-split-fp8`
+   and run V4.1 parity for his shared-code PRs):** compact pooled-key index cache (#1 FR-G.3, ~half the KV),
    four prefill lanes and two decode lanes (FR-G.8, G.11), BF16 KDA state
    and row-independent kernels for exact speculation (FR-G.2, G.6), the GB10
-   EXL3 decode schedule (FR-G.7) — port from glm53f-afd.
+   EXL3 decode schedule (FR-G.7), 32 GB plan, API items, teacher gate.
 7. **MiMo:** decode expert rows and the 16-stream scheduler (#3 FR-M.7/8),
    copy windows (FR-M.10), the RAM snapshot tier (FR-M.9) — port from
    mimo26f-afd.
