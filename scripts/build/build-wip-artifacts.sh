@@ -158,6 +158,14 @@ printf '%s' "$wip_current_fingerprint" >"$wip_fingerprint_marker"
 
 install -m 0755 "$CARGO_TARGET_DIR/release/cuteafd" "$output_dir/cuteafd"
 install -m 0755 "$build_dir/native/libcuteafd_native.so" "$output_dir/libcuteafd_native.so"
+# The coordinator program manifest (DeepSeek V4, GLM, GLM Flash, MiMo, Qwen; an empty table
+# when none was built), as the release images carry it at /opt/cuteafd/share/PROGRAMS.json:
+# run-family.sh --wip serves those families from it.
+if [[ -s "$build_dir/native/dsv4_programs/dsv4_programs.json" ]]; then
+  install -m 0644 "$build_dir/native/dsv4_programs/dsv4_programs.json" "$output_dir/PROGRAMS.json"
+else
+  printf '%s\n' '{"schema":1,"programs":[]}' >"$output_dir/PROGRAMS.json"
+fi
 # The EXL3 package is only built and installed when the opt-in is ON. An
 # official-only WIP build (CUTEAFD_WIP_EXL3_AOT=OFF) has no exl3/ directory and
 # the native launch path never references one.
@@ -226,6 +234,6 @@ else
 fi
 (
   cd "$output_dir"
-  sha256sum cuteafd libcuteafd_native.so V41_EXPERT_AOT.json V41_EXPERT_TP_AOT.json V41_FP8_AOT.json >ARTIFACT_SHA256SUMS
+  sha256sum cuteafd libcuteafd_native.so V41_EXPERT_AOT.json V41_EXPERT_TP_AOT.json V41_FP8_AOT.json PROGRAMS.json >ARTIFACT_SHA256SUMS
   sha256sum -c ARTIFACT_SHA256SUMS
 )
