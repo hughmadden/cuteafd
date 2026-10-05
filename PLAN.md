@@ -743,7 +743,10 @@ Work, in priority order:
    balance (#2 FR-D.4), per-Spark free-memory guard and page-cache drop
    without `nest` (PLAT-5), `/health` 503 on expert failure, an optional
    API key, keyed bench controls (PLAT-6, #1 FR-G.15), malformed tool calls
-   returned as content (#1 FR-G.14).
+   returned as content (#1 FR-G.14). Readiness bug (2026-10-05, fidelity
+   agent): `/v1/models` reports ready before the Spark experts finish
+   loading on the V4.1 launch path; readiness must wait for every expert
+   rank.
 6. **GLM Flash (owned by Hugh, 2026-10-05; we only finish `work/glmf-split-fp8`
    and run V4.1 parity for his shared-code PRs):** compact pooled-key index cache (#1 FR-G.3, ~half the KV),
    four prefill lanes and two decode lanes (FR-G.8, G.11), BF16 KDA state
